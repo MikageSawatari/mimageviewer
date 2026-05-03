@@ -32,6 +32,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <vector>
@@ -365,15 +366,25 @@ private:
             if (current_cmd.empty()) {
                 current_cmd = "-";
             }
+            const UINT dispatch_msg = main_dispatch_msg_.load(std::memory_order_acquire);
+            const uintptr_t dispatch_hwnd = main_dispatch_hwnd_.load(std::memory_order_acquire);
+            const ULONGLONG dispatch_started =
+                main_dispatch_started_tick_.load(std::memory_order_acquire);
+            const ULONGLONG dispatch_in_ms =
+                dispatch_started == 0 ? 0 : now - dispatch_started;
 
             if (queue_size_known) {
                 std::fprintf(stderr,
                              "[BRIDGE main heartbeat] state=%s in_state_ms=%llu current_cmd=%s "
+                             "dispatch_msg=0x%X dispatch_hwnd=0x%llx dispatch_in_ms=%llu "
                              "reader_state=%s reader_in_state_ms=%llu queue_size=%zu "
                              "cmds_received=%llu cmds_processed=%llu\n",
                              bridge_main_state_name(main_state),
                              static_cast<unsigned long long>(now - main_entered),
                              current_cmd.c_str(),
+                             dispatch_msg,
+                             static_cast<unsigned long long>(dispatch_hwnd),
+                             static_cast<unsigned long long>(dispatch_in_ms),
                              bridge_reader_state_name(reader_state),
                              static_cast<unsigned long long>(now - reader_entered),
                              queue_size,
@@ -384,11 +395,15 @@ private:
             } else {
                 std::fprintf(stderr,
                              "[BRIDGE main heartbeat] state=%s in_state_ms=%llu current_cmd=%s "
+                             "dispatch_msg=0x%X dispatch_hwnd=0x%llx dispatch_in_ms=%llu "
                              "reader_state=%s reader_in_state_ms=%llu queue_size=<locked> "
                              "cmds_received=%llu cmds_processed=%llu\n",
                              bridge_main_state_name(main_state),
                              static_cast<unsigned long long>(now - main_entered),
                              current_cmd.c_str(),
+                             dispatch_msg,
+                             static_cast<unsigned long long>(dispatch_hwnd),
+                             static_cast<unsigned long long>(dispatch_in_ms),
                              bridge_reader_state_name(reader_state),
                              static_cast<unsigned long long>(now - reader_entered),
                              static_cast<unsigned long long>(
@@ -410,7 +425,15 @@ private:
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
                 ::TranslateMessage(&msg);
                 const ULONGLONG dispatch_started = GetTickCount64();
+                main_dispatch_msg_.store(msg.message, std::memory_order_release);
+                main_dispatch_hwnd_.store(
+                    reinterpret_cast<uintptr_t>(msg.hwnd),
+                    std::memory_order_release);
+                main_dispatch_started_tick_.store(dispatch_started, std::memory_order_release);
                 ::DispatchMessageW(&msg);
+                main_dispatch_started_tick_.store(0, std::memory_order_release);
+                main_dispatch_hwnd_.store(0, std::memory_order_release);
+                main_dispatch_msg_.store(0, std::memory_order_release);
                 const ULONGLONG dispatch_elapsed = GetTickCount64() - dispatch_started;
                 if (dispatch_elapsed >= 100 && msg.message != WM_NCLBUTTONDOWN) {
                     std::fprintf(stderr,
@@ -1091,6 +1114,7 @@ private:
             loaders.reserve(processing_order_.size());
             for (uint64_t slot_id : processing_order_) {
                 if (PluginLoader* loader = loader_at_unlocked(slot_id)) {
+                    if (loader->is_editor_quarantined()) continue;
                     loaders.push_back(loader);
                 }
             }
@@ -1109,6 +1133,7 @@ private:
             for (uint64_t slot_id : ordered_slots_top_to_bottom) {
                 PluginLoader* loader = loader_at_unlocked(slot_id);
                 if (!loader) continue;
+                if (loader->is_editor_quarantined()) continue;
                 HWND hwnd = reinterpret_cast<HWND>(loader->gui_container_hwnd());
                 if (hwnd && IsWindow(hwnd)) {
                     hwnds.push_back(hwnd);
@@ -1170,6 +1195,7 @@ private:
             for (uint64_t slot_id : ordered_slots_top_to_bottom) {
                 PluginLoader* loader = loader_at_unlocked(slot_id);
                 if (!loader) continue;
+                if (loader->is_editor_quarantined()) continue;
                 HWND hwnd = reinterpret_cast<HWND>(loader->gui_container_hwnd());
                 if (!hwnd || !IsWindow(hwnd)) continue;
 
@@ -1553,6 +1579,9 @@ private:
     std::atomic<ULONGLONG> reader_state_entered_tick_{0};
     std::atomic<uint64_t> reader_cmds_received_{0};
     std::atomic<uint64_t> main_cmds_processed_{0};
+    std::atomic<UINT> main_dispatch_msg_{0};
+    std::atomic<uintptr_t> main_dispatch_hwnd_{0};
+    std::atomic<ULONGLONG> main_dispatch_started_tick_{0};
     std::mutex state_mutex_;
     std::string current_cmd_;
 
@@ -1588,14 +1617,51 @@ private:
 
 }  // namespace miv
 
+static DWORD parse_parent_pid_arg(int argc, char** argv) {
+    for (int i = 1; i + 1 < argc; ++i) {
+        if (std::strcmp(argv[i], "--parent-pid") == 0) {
+            char* end = nullptr;
+            unsigned long value = std::strtoul(argv[i + 1], &end, 10);
+            if (end && *end == '\0' && value != 0) {
+                return static_cast<DWORD>(value);
+            }
+        }
+    }
+    return 0;
+}
+
+static void start_parent_watchdog(DWORD parent_pid) {
+    if (parent_pid == 0) {
+        return;
+    }
+    HANDLE parent = OpenProcess(SYNCHRONIZE, FALSE, parent_pid);
+    if (!parent) {
+        std::fprintf(stderr,
+                     "[BRIDGE] parent watchdog: OpenProcess failed pid=%lu err=%lu\n",
+                     static_cast<unsigned long>(parent_pid),
+                     GetLastError());
+        std::fflush(stderr);
+        return;
+    }
+    std::thread([parent, parent_pid]() {
+        DWORD wait_result = WaitForSingleObject(parent, INFINITE);
+        std::fprintf(stderr,
+                     "[BRIDGE] parent watchdog: parent exited pid=%lu wait=%lu, exiting bridge\n",
+                     static_cast<unsigned long>(parent_pid),
+                     wait_result);
+        std::fflush(stderr);
+        CloseHandle(parent);
+        ExitProcess(0);
+    }).detach();
+}
+
 int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
     // bridge プロセスを Per-Monitor v2 DPI Aware に設定する。
     // これがないと GetDpiForSystem / GetDpiForWindow がプライマリ DPI ではなく
     // 96 を返してしまい、setContentScaleFactor で正しい scale を伝えられない。
     // VST3 GUI を任意のスレッドで attached する前に必ずプロセス全体に設定する必要がある。
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    start_parent_watchdog(parse_parent_pid_arg(argc, argv));
     miv::Bridge bridge;
     return bridge.run();
 }

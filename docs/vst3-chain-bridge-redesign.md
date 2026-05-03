@@ -176,6 +176,16 @@ Design rules:
   queue_size=... cmds_received=... cmds_processed=...`. This is intentionally
   produced by a separate watchdog thread so it keeps logging even if the bridge
   main thread is blocked inside a plugin callback or IPC handler.
+- Bridge main heartbeat also reports the current `DispatchMessageW` message,
+  HWND, and elapsed dispatch time while the main thread is pumping messages.
+  This is required because some plugins create hidden main-thread windows even
+  after editor HWND ownership moved to per-slot GUI threads.
+- Chain-wide owner, visibility, and z-order batches skip quarantined editor
+  slots. Once an editor helper is abandoned, the bridge must not keep touching
+  that slot's HWND from chain-level operations.
+- The Rust parent process passes its PID to the bridge. A bridge-side watchdog
+  waits on that process handle and calls `ExitProcess` if mIV dies, preventing
+  plugin editor windows from surviving a forced parent-process termination.
 - Void GUI mutations stay asynchronous. During a native editor move/resize
   modal loop, thread messages may not be drained until the drag ends, so
   `set_user_resizing`, visibility/topmost/owner changes, app-active updates,

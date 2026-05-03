@@ -293,6 +293,9 @@ impl Bridge {
     {
         let mut command = Command::new(exe_path);
         command
+            .arg("--parent-pid")
+            .arg(std::process::id().to_string());
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());

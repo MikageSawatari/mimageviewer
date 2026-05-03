@@ -141,6 +141,9 @@ public:
     /// Relay mIV app activation to the bridge-owned plugin surface.
     void set_gui_app_active(bool active);
     void* gui_container_hwnd() const;
+    bool is_editor_quarantined() const {
+        return editor_quarantined_.load(std::memory_order_acquire);
+    }
     /// Helpers for chain-level batched show/hide and z-order updates.
     void set_gui_surface_visible_state(bool visible);
     bool gui_surface_should_show();

@@ -179,6 +179,8 @@ impl Bridge {
         F: Fn(String) + Send + 'static,
     {
         let mut child = Command::new(exe_path)
+            .arg("--parent-pid")
+            .arg(std::process::id().to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
