@@ -1170,9 +1170,10 @@ mIV now does the same two defensive things:
 - `src/video/audio.rs` no longer treats `raw_pending` overflow as a permanent
   kill-switch for the whole seek generation. When the pre-VST queue exceeds the
   30s safety cap, the pump clears the backlog, zeros queued-audio accounting,
-  and re-anchors the same seek generation at the current audio frame. This keeps
-  playback recoverable for old AVI/DivX files whose audio decode briefly outruns
-  video after a seek.
+  resets the active VST chain, and re-anchors the same seek generation at the
+  current audio frame. This keeps playback recoverable for old AVI/DivX files
+  whose audio decode briefly outruns video after a seek without leaking old VST
+  delay-line tails into the new anchor.
 
 The remaining structural improvement is optional back-pressure on `audio_rx`
 while `raw_pending` is above a soft cap. Keep that as a follow-up if high-water

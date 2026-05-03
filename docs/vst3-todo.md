@@ -171,6 +171,7 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 - 検証: HW D3D11VA H264 動画で `raw_pending high water` ログが頻発するか観察
 - 2026-05-03: AVI/DivX 互換の最小対策として、overflow 時に同一 seek 世代を恒久
   drop せず、raw queue を clear して現在 audio frame に re-anchor する処理を実装。
+  re-anchor 時は active VST chain も reset して旧 delay-line tail を抑止する。
   `audio_rx` soft-cap back-pressure は引き続き follow-up。
 
 ### シーク後の post-seek pre-roll discard [P3, Codex P2-3, 2026-05-01]

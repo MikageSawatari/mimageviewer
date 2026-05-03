@@ -627,6 +627,12 @@ fn run_pump(
                 if pump_anchor_target_secs.is_none() {
                     pump_anchor_target_secs = frame_seek_target_secs.or(Some(frame_pts_secs));
                 }
+                #[cfg(windows)]
+                if let Some(b) = &dsp_bridge {
+                    if b.is_enabled() && b.active_slot_count() > 0 {
+                        b.reset_plugins_sync();
+                    }
+                }
                 safety_limiter.reset();
                 activated = false;
             } else if raw_total_secs > RAW_WARNING_SECS {

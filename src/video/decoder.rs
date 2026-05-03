@@ -30,6 +30,8 @@ fn frame_best_effort_timestamp(raw: *const ffmpeg_the_third::ffi::AVFrame) -> Op
     if raw.is_null() {
         return None;
     }
+    // SAFETY: callers pass a raw pointer obtained from a live FFmpeg frame.
+    // We only read the timestamp field and do not retain the pointer.
     let ts = unsafe { (*raw).best_effort_timestamp };
     if ts == ffmpeg_the_third::ffi::AV_NOPTS_VALUE {
         None
@@ -39,15 +41,15 @@ fn frame_best_effort_timestamp(raw: *const ffmpeg_the_third::ffi::AVFrame) -> Op
 }
 
 fn video_frame_timestamp(frame: &ffmpeg_the_third::util::frame::Video) -> Option<i64> {
-    // SAFETY: We only read FFmpeg's timestamp field from a live frame borrowed
-    // by the decode loop; the frame remains valid for this call.
+    // SAFETY: ffmpeg-the-third exposes the raw AVFrame pointer through an
+    // unsafe method; the frame is borrowed and alive for this call.
     let raw = unsafe { frame.as_ptr() };
     frame_best_effort_timestamp(raw).or_else(|| frame.pts())
 }
 
 fn audio_frame_timestamp(frame: &ffmpeg_the_third::util::frame::audio::Audio) -> Option<i64> {
-    // SAFETY: We only read FFmpeg's timestamp field from a live frame borrowed
-    // by the decode loop; the frame remains valid for this call.
+    // SAFETY: ffmpeg-the-third exposes the raw AVFrame pointer through an
+    // unsafe method; the frame is borrowed and alive for this call.
     let raw = unsafe { frame.as_ptr() };
     frame_best_effort_timestamp(raw).or_else(|| frame.pts())
 }
