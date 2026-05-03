@@ -1012,12 +1012,10 @@ impl DspBridge {
                     if visible {
                         self.sync_existing_gui_owner_to_current_viewport();
                     }
-                    gui::set_window_visible(hwnd, visible);
                     self.send_slot_gui_visible(idx, visible);
                     // 現在の topmost desired state を反映
                     let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
                     if visible {
-                        gui::set_window_topmost(hwnd, topmost);
                         self.send_slot_gui_topmost(idx, topmost);
                     }
                     let mut inner2 = self.inner.lock().unwrap();
@@ -1153,7 +1151,6 @@ impl DspBridge {
         // (= フルスクリーン中に作った HWND にも TOPMOST が必ず付く、Codex P3 対応)。
         if visible {
             let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
-            gui::set_window_topmost(hwnd, topmost);
             self.send_slot_gui_topmost(idx, topmost);
         }
         Ok(())
@@ -1174,7 +1171,6 @@ impl DspBridge {
             }
         };
         if hwnd != 0 {
-            gui::set_window_visible(hwnd, false);
             self.send_slot_gui_visible(idx, false);
         }
     }
@@ -1196,7 +1192,6 @@ impl DspBridge {
             }
         };
         if hwnd != 0 {
-            gui::set_window_visible(hwnd, false);
             self.send_slot_gui_visible(idx, false);
         }
     }
@@ -1240,7 +1235,12 @@ impl DspBridge {
             let snapshot = if target_hwnds.is_empty() {
                 Vec::new()
             } else {
-                gui::snapshot_z_order(&target_hwnds)
+                let snapshot = gui::snapshot_z_order(&target_hwnds);
+                if snapshot.is_empty() {
+                    target_hwnds.clone()
+                } else {
+                    snapshot
+                }
             };
             let n = {
                 let mut inner = self.inner.lock().unwrap();
@@ -1258,9 +1258,6 @@ impl DspBridge {
                         }
                     }
                 }
-            }
-            for hwnd in &hide_hwnds {
-                gui::set_window_visible(*hwnd, false);
             }
             if !snapshot.is_empty() {
                 self.send_chain_visible(&snapshot, false, false);
@@ -1344,7 +1341,6 @@ impl DspBridge {
             }
             if !restore_order.is_empty() {
                 let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
-                gui::show_windows_in_z_order(&restore_order, topmost);
                 self.send_chain_visible(&restore_order, true, topmost);
             }
         }
@@ -1389,12 +1385,9 @@ impl DspBridge {
         // 前面順を走査し、target_hwnds に該当するものだけ拾う)。
         let ordered_top_to_bottom = gui::snapshot_z_order(&target_hwnds);
 
-        // TOPMOST 切替後に bottom-to-top で SetWindowPos して元順序を復元。
-        // bottom-to-top 順に呼ぶと、最後に呼んだ HWND が一番上に来るので、
-        // ユーザーが見ていた順序がそのまま再現される。
-        for hwnd in ordered_top_to_bottom.iter().rev() {
-            gui::set_window_topmost(*hwnd, topmost);
-        }
+        // TOPMOST 切替と z-order 復元は bridge 側に一括依頼する。Rust 側で
+        // editor HWND を直接 ShowWindow/SetWindowPos すると、owner 変更 IPC と
+        // 表示順序が前後して main viewport が持ち上がることがある。
         self.send_chain_z_order(&ordered_top_to_bottom, topmost);
     }
 
@@ -1411,12 +1404,6 @@ impl DspBridge {
                 .map(|s| s.gui_hwnd)
                 .collect()
         };
-        if !target_hwnds.is_empty() {
-            let ordered_top_to_bottom = gui::snapshot_z_order(&target_hwnds);
-            for hwnd in ordered_top_to_bottom.iter().rev() {
-                gui::set_window_topmost(*hwnd, effective_topmost);
-            }
-        }
         if !target_hwnds.is_empty() {
             let ordered_top_to_bottom = gui::snapshot_z_order(&target_hwnds);
             self.send_chain_z_order(&ordered_top_to_bottom, effective_topmost);
