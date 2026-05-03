@@ -96,6 +96,101 @@ processes. Scanner/probe can continue to spawn a short-lived bridge process.
   works without those hooks, and removing them avoids log storms during GUI
   show/hide and tooltip activity.
 
+## Per-Plugin GUI Thread Follow-Up
+
+The 2026-05 drag diagnostics show that the one-process chain bridge still has a
+GUI hot spot: all attached editors share the bridge main STA thread. A visible
+editor drag can therefore compete with hidden-but-attached plugin timers, paint
+messages, tooltip/popup traffic, and private plugin messages from the rest of
+the chain. Recent logs show `editor drag END ... max_gap_ms=250..296` even after
+the editor owner is detached during drag, which points at message-pump
+contention rather than owner z-order reconciliation.
+
+Keep the chain bridge process and audio IPC unchanged, but move editor GUI work
+to one STA thread per plugin slot:
+
+```text
+mimageviewer-vst3-host.exe
+  bridge main/control thread
+    stdin command queue
+    chain state, loader list, z-order batching
+    latency polling / events
+  audio thread
+    input -> loader[0] -> loader[1] -> ... -> output
+  gui thread slot 0 (STA)
+    createView / attached / removed / onSize
+    editor HWND message pump
+  gui thread slot 1 (STA)
+    createView / attached / removed / onSize
+    editor HWND message pump
+  ...
+```
+
+Design rules:
+
+- `PluginLoader` remains the owner of the VST3 component, processor, controller,
+  state, and editor metadata. Audio processing stays serialized on the bridge
+  audio thread as it is today.
+- Every VST3 editor call (`createView`, `setFrame`, `attached`, `removed`,
+  `getSize`, `onSize`, `setContentScaleFactor`) runs on that slot's GUI thread.
+  This preserves VST3's STA-style editor expectations while isolating editor
+  message queues.
+- Each slot GUI thread calls `OleInitialize` at start and `OleUninitialize` at
+  exit. `CoInitializeEx(COINIT_APARTMENTTHREADED)` alone is not enough for
+  plugin editor features that use OLE services such as context menus,
+  clipboard, drag-and-drop, or file dialogs.
+- `CreateWindowExW` for the bridge-owned editor container also runs on the slot
+  GUI thread. The thread that creates the HWND owns its WndProc/message queue;
+  creating the HWND on the bridge main thread would keep drag/paint traffic on
+  the old hot spot and defeat the refactor.
+- Bridge control commands may synchronously marshal short GUI operations to the
+  slot GUI thread when a reply is required (`query_gui_size`, first `show_gui`).
+  Fire-and-forget operations (`set_gui_visible`, `set_gui_topmost`,
+  `set_gui_app_active`, `notify_host_resize`) are posted and coalesced where
+  possible.
+- Do not use raw cross-thread `SendMessage` from the bridge main/control thread
+  to a slot GUI thread. Use `PostMessage` plus a completion object, or
+  `SendMessageTimeout` with a short timeout if a Win32 message is unavoidable.
+  Slot GUI threads must report back to the bridge asynchronously so plugin
+  callbacks such as `IPlugFrame::resizeView` cannot form a deadlock cycle.
+- The bridge main thread may keep chain-level ordering state, but it must not
+  directly call `IPlugView` methods. If it needs HWND information for z-order
+  batching, it reads a small thread-safe snapshot from each slot.
+- Hidden prewarm remains enabled: editors are still attached during chain load
+  with `visible=false`. The refactor should remove ongoing hidden-editor
+  contention without reintroducing lazy-attach first-show stalls.
+- `query_state` / `restore_state` currently use the bridge audio-thread fence to
+  avoid racing VST3 `process`. Keep that ownership explicit during the GUI
+  thread refactor. If a plugin proves to require GUI-thread state I/O, add a
+  stop-processing fence before marshalling state I/O to the slot GUI thread.
+- Probe/scanner paths are unaffected because they do not create editor views and
+  therefore do not start per-slot GUI threads.
+- Drag diagnostics stay in place for validation. A good result is drag
+  `max_gap_ms` dropping from the current 250-300ms range to ordinary frame-scale
+  jitter, with no return of Alt+Tab white windows, white flicker, or thumbnail
+  foreground stealing.
+
+Implementation phases:
+
+1. Add a small per-slot `GuiThread` helper in the C++ bridge. It owns an
+   Ole-initialized STA, a Win32 message loop, a command queue, and the editor
+   HWND created on that thread. Include `gui_tid` in the first logs so thread
+   placement can be verified immediately.
+2. Move `PluginLoader` GUI methods behind the helper, leaving non-GUI load,
+   process, latency, and state methods on their current threads.
+3. Replace direct chain-wide GUI mutation with snapshot reads plus posted
+   per-slot commands. Keep `BeginDeferWindowPos` only for HWND operations that
+   do not call back into `IPlugView`; otherwise marshal to the owning slot.
+4. Update diagnostics to include `gui_tid` in editor create/drag/show logs so
+   validation can prove that different plugins are no longer sharing one GUI
+   thread.
+5. Rebuild `vendor/vst3-host/mimageviewer-vst3-host.exe`, clear the extracted
+   APPDATA bridge cache, and validate with the same multi-plugin drag scenario.
+
+Future work: add a lightweight heartbeat per slot GUI thread. If a slot does
+not advance for several seconds, the bridge can log the frozen slot/plugin name
+while other plugin editor threads keep running.
+
 ## Control Message Size
 
 Plugin state snapshots can be several megabytes for analyzer/limiter plugins.

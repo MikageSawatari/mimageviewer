@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -25,6 +26,7 @@ namespace miv {
 
 class HostApplication;
 class ComponentHandler;
+class PluginGuiThread;
 
 struct LoadedPluginInfo {
     std::string plugin_name;
@@ -138,10 +140,10 @@ public:
     void set_gui_owner(void* owner_hwnd);
     /// Relay mIV app activation to the bridge-owned plugin surface.
     void set_gui_app_active(bool active);
-    void* gui_container_hwnd() const { return view_container_hwnd_; }
+    void* gui_container_hwnd();
     /// Helpers for chain-level batched show/hide and z-order updates.
     void set_gui_surface_visible_state(bool visible);
-    bool gui_surface_should_show() const;
+    bool gui_surface_should_show();
     bool gui_surface_target_rect(int32_t& x_out, int32_t& y_out,
                                  int32_t& width_out, int32_t& height_out);
     void refresh_gui_surface_now();
@@ -172,6 +174,8 @@ public:
     bool restore_state(const std::vector<uint8_t>& bytes);
 
 private:
+    PluginGuiThread& gui_thread();
+    bool is_gui_thread() const;
     void refresh_gui_surface(void* container_hwnd);
 
     Steinberg::IPtr<HostApplication> host_app_;
@@ -187,10 +191,12 @@ private:
     bool view_attached_ = false;
     void* view_host_hwnd_ = nullptr;
     void* view_container_hwnd_ = nullptr;
+    std::atomic<void*> view_container_hwnd_snapshot_{nullptr};
     bool gui_surface_visible_ = false;
     bool gui_app_active_ = true;
     uint32_t last_gui_width_ = 0;
     uint32_t last_gui_height_ = 0;
+    std::unique_ptr<PluginGuiThread> gui_thread_;
 
     uint32_t sample_rate_ = 0;
     uint32_t block_size_ = 0;

@@ -261,3 +261,10 @@ current direction is one bridge process per VST3 chain, so mIV remains isolated
 from plugin crashes while all plugin editors and audio processing share one
 bridge process. See [vst3-chain-bridge-redesign.md](vst3-chain-bridge-redesign.md)
 for the migration plan and protocol shape.
+
+Follow-up: the chain bridge keeps one audio/control process, but plugin editors
+should no longer share one bridge GUI thread. Drag diagnostics after the
+Bitwig-style owner/z-order refactor still show 250-300ms editor message gaps,
+so the next GUI architecture is one STA editor/message-pump thread per plugin
+slot inside the same bridge process. The detailed design lives in
+[vst3-chain-bridge-redesign.md](vst3-chain-bridge-redesign.md).

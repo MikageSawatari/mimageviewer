@@ -6,11 +6,20 @@
 #include "plugin_loader.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <cstdio>
 #include <cstdint>
+#include <functional>
+#include <future>
+#include <mutex>
+#include <thread>
+#include <type_traits>
 #include <vector>
 
 #include <windows.h>
+#include <ole2.h>
 #include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
 
 namespace {
@@ -189,7 +198,8 @@ HWND create_bridge_view_container(const miv::GuiWindowOptions& options, miv::Plu
         blog("bridge view container create failed err=%lu", GetLastError());
         return nullptr;
     }
-    blog("bridge editor window created hwnd=0x%llx owner=0x%llx pos=%d,%d client=%ux%u outer=%dx%d",
+    blog("bridge editor window created gui_tid=%lu hwnd=0x%llx owner=0x%llx pos=%d,%d client=%ux%u outer=%dx%d",
+         GetCurrentThreadId(),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container)),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(owner_hwnd)),
          x,
@@ -219,6 +229,178 @@ namespace miv {
 
 using namespace Steinberg;
 
+namespace {
+constexpr UINT kPluginGuiThreadTaskMsg = WM_APP + 0x4D1;
+}
+
+class PluginGuiThread {
+public:
+    PluginGuiThread() = default;
+    ~PluginGuiThread() {
+        shutdown();
+    }
+
+    PluginGuiThread(const PluginGuiThread&) = delete;
+    PluginGuiThread& operator=(const PluginGuiThread&) = delete;
+
+    bool is_current_thread() const {
+        DWORD tid = thread_id_.load(std::memory_order_acquire);
+        return tid != 0 && tid == GetCurrentThreadId();
+    }
+
+    template <typename Fn>
+    auto invoke_sync(Fn&& fn) -> decltype(fn()) {
+        using R = decltype(fn());
+        if (is_current_thread()) {
+            return fn();
+        }
+
+        ensure_started();
+        auto task = std::make_shared<std::packaged_task<R()>>(std::forward<Fn>(fn));
+        auto future = task->get_future();
+        post_task([task]() {
+            (*task)();
+        });
+        if constexpr (std::is_void_v<R>) {
+            future.get();
+        } else {
+            return future.get();
+        }
+    }
+
+    void post_async(std::function<void()> fn) {
+        if (is_current_thread()) {
+            fn();
+            return;
+        }
+        ensure_started();
+        post_task(std::move(fn));
+    }
+
+private:
+    void ensure_started() {
+        if (running_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        std::unique_lock<std::mutex> lk(start_mutex_);
+        if (running_.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        ready_ = false;
+        thread_ = std::thread([this]() {
+            thread_main();
+        });
+        start_cv_.wait(lk, [this]() {
+            return ready_;
+        });
+    }
+
+    void post_task(std::function<void()> fn) {
+        {
+            std::lock_guard<std::mutex> lk(queue_mutex_);
+            tasks_.push_back(std::move(fn));
+        }
+        DWORD tid = thread_id_.load(std::memory_order_acquire);
+        if (tid != 0) {
+            PostThreadMessageW(tid, kPluginGuiThreadTaskMsg, 0, 0);
+        }
+    }
+
+    void drain_tasks() {
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::lock_guard<std::mutex> lk(queue_mutex_);
+                if (tasks_.empty()) {
+                    break;
+                }
+                task = std::move(tasks_.front());
+                tasks_.pop_front();
+            }
+            task();
+        }
+    }
+
+    void thread_main() {
+        thread_id_.store(GetCurrentThreadId(), std::memory_order_release);
+        running_.store(true, std::memory_order_release);
+        HRESULT ole_hr = OleInitialize(nullptr);
+        const bool ole_ok = SUCCEEDED(ole_hr);
+        if (FAILED(ole_hr)) {
+            blog("plugin GUI thread OleInitialize failed tid=%lu hr=0x%lx",
+                 GetCurrentThreadId(),
+                 static_cast<unsigned long>(ole_hr));
+        }
+
+        MSG msg{};
+        PeekMessageW(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+        {
+            std::lock_guard<std::mutex> lk(start_mutex_);
+            ready_ = true;
+        }
+        start_cv_.notify_all();
+
+        blog("plugin GUI thread start gui_tid=%lu", GetCurrentThreadId());
+        while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+            if (msg.message == kPluginGuiThreadTaskMsg) {
+                drain_tasks();
+                continue;
+            }
+            TranslateMessage(&msg);
+            const ULONGLONG dispatch_started = GetTickCount64();
+            DispatchMessageW(&msg);
+            const ULONGLONG dispatch_elapsed = GetTickCount64() - dispatch_started;
+            if (dispatch_elapsed >= 100 && msg.message != WM_NCLBUTTONDOWN) {
+                blog("slow plugin GUI DispatchMessageW gui_tid=%lu msg=0x%X hwnd=0x%llx elapsed_ms=%llu",
+                     GetCurrentThreadId(),
+                     msg.message,
+                     static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(msg.hwnd)),
+                     static_cast<unsigned long long>(dispatch_elapsed));
+            }
+        }
+        drain_tasks();
+
+        running_.store(false, std::memory_order_release);
+        thread_id_.store(0, std::memory_order_release);
+        if (ole_ok) {
+            OleUninitialize();
+        }
+        blog("plugin GUI thread exit gui_tid=%lu", GetCurrentThreadId());
+    }
+
+    void shutdown() {
+        DWORD tid = thread_id_.load(std::memory_order_acquire);
+        if (tid == 0) {
+            if (thread_.joinable() && thread_.get_id() != std::this_thread::get_id()) {
+                thread_.join();
+            }
+            return;
+        }
+        if (tid == GetCurrentThreadId()) {
+            PostThreadMessageW(tid, WM_QUIT, 0, 0);
+            if (thread_.joinable()) {
+                thread_.detach();
+            }
+            return;
+        }
+        PostThreadMessageW(tid, WM_QUIT, 0, 0);
+        if (thread_.joinable()) {
+            thread_.join();
+        }
+    }
+
+    std::thread thread_;
+    std::atomic<DWORD> thread_id_{0};
+    std::atomic<bool> running_{false};
+    std::mutex start_mutex_;
+    std::condition_variable start_cv_;
+    bool ready_ = false;
+    std::mutex queue_mutex_;
+    std::deque<std::function<void()>> tasks_;
+};
+
 PluginLoader::PluginLoader() {
     host_app_ = owned(new HostApplication);
     component_handler_ = owned(new ComponentHandler);
@@ -227,6 +409,17 @@ PluginLoader::PluginLoader() {
 
 PluginLoader::~PluginLoader() {
     unload();
+}
+
+PluginGuiThread& PluginLoader::gui_thread() {
+    if (!gui_thread_) {
+        gui_thread_ = std::make_unique<PluginGuiThread>();
+    }
+    return *gui_thread_;
+}
+
+bool PluginLoader::is_gui_thread() const {
+    return gui_thread_ && gui_thread_->is_current_thread();
 }
 
 bool PluginLoader::probe(const std::string& plugin_path,
@@ -594,6 +787,12 @@ bool PluginLoader::process_block(const float* input, float* output, uint32_t num
 }
 
 bool PluginLoader::get_gui_size(uint32_t& width_out, uint32_t& height_out) {
+    if (!is_gui_thread()) {
+        return gui_thread().invoke_sync([&]() -> bool {
+            return get_gui_size(width_out, height_out);
+        });
+    }
+
     // 既存 view_ から純粋に getSize する (= scale 設定を変更しない)。
     // 既に show_gui で setContentScaleFactor 済みであれば、その scale 込みの
     // 物理ピクセル値を返す。
@@ -618,6 +817,12 @@ bool PluginLoader::get_gui_size(uint32_t& width_out, uint32_t& height_out) {
 
 bool PluginLoader::query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint32_t& height_out,
                                           bool& resizable_out) {
+    if (!is_gui_thread()) {
+        return gui_thread().invoke_sync([&]() -> bool {
+            return query_gui_size_at_dpi(dpi, width_out, height_out, resizable_out);
+        });
+    }
+
     // 一時 view を作り、指定 DPI の scale を伝えてから getSize → 破棄。
     // ホストウィンドウを作る前に正しいサイズと resizable 属性を知るためのクエリ用。
     if (!controller_) return false;
@@ -645,7 +850,14 @@ bool PluginLoader::query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint
 }
 
 bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::string& error_out) {
-    blog("show_gui start owner=0x%llx visible=%d",
+    if (!is_gui_thread()) {
+        return gui_thread().invoke_sync([&]() -> bool {
+            return show_gui(options, visible, error_out);
+        });
+    }
+
+    blog("show_gui start gui_tid=%lu owner=0x%llx visible=%d",
+         GetCurrentThreadId(),
          (unsigned long long)options.owner_hwnd,
          visible ? 1 : 0);
     if (!controller_) {
@@ -706,7 +918,8 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
     }
 
     plug_frame_->set_host_hwnd(attach_hwnd);
-    blog("show_gui: attached(hwnd, HWND) editor=0x%llx",
+    blog("show_gui: attached(hwnd, HWND) gui_tid=%lu editor=0x%llx",
+         GetCurrentThreadId(),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(attach_hwnd)));
     if (view_->attached(attach_hwnd, Steinberg::kPlatformTypeHWND) != Steinberg::kResultOk) {
         error_out = "attached() failed";
@@ -720,6 +933,7 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
     view_attached_ = true;
     view_host_hwnd_ = options.owner_hwnd;
     view_container_hwnd_ = attach_hwnd;
+    view_container_hwnd_snapshot_.store(attach_hwnd, std::memory_order_release);
     blog("show_gui: attached ok");
 
     // attached 後に推奨サイズで onSize を呼んで「このサイズで描画して」と通知する。
@@ -768,6 +982,16 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
 }
 
 void PluginLoader::set_user_resizing(bool active) {
+    if (!is_gui_thread()) {
+        if (!gui_thread_) {
+            return;
+        }
+        gui_thread().invoke_sync([&]() {
+            set_user_resizing(active);
+        });
+        return;
+    }
+
     if (plug_frame_) {
         plug_frame_->set_user_resizing(active);
     }
@@ -799,10 +1023,29 @@ void PluginLoader::refresh_gui_surface(void* container_hwnd_ptr) {
 }
 
 void PluginLoader::set_gui_surface_visible_state(bool visible) {
+    if (!is_gui_thread()) {
+        if (!gui_thread_) {
+            return;
+        }
+        gui_thread().invoke_sync([&]() {
+            set_gui_surface_visible_state(visible);
+        });
+        return;
+    }
+
     gui_surface_visible_ = visible;
 }
 
-bool PluginLoader::gui_surface_should_show() const {
+bool PluginLoader::gui_surface_should_show() {
+    if (!is_gui_thread()) {
+        if (!gui_thread_) {
+            return false;
+        }
+        return gui_thread().invoke_sync([&]() -> bool {
+            return gui_surface_should_show();
+        });
+    }
+
     return gui_surface_visible_ && gui_app_active_;
 }
 
@@ -810,6 +1053,20 @@ bool PluginLoader::gui_surface_target_rect(int32_t& x_out,
                                            int32_t& y_out,
                                            int32_t& width_out,
                                            int32_t& height_out) {
+    if (!is_gui_thread()) {
+        HWND hwnd = reinterpret_cast<HWND>(
+            view_container_hwnd_snapshot_.load(std::memory_order_acquire));
+        RECT rect{};
+        if (!hwnd || !IsWindow(hwnd) || !GetWindowRect(hwnd, &rect)) {
+            return false;
+        }
+        x_out = rect.left;
+        y_out = rect.top;
+        width_out = std::max<LONG>(1, rect.right - rect.left);
+        height_out = std::max<LONG>(1, rect.bottom - rect.top);
+        return true;
+    }
+
     RECT rect{};
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (!container_hwnd || !IsWindow(container_hwnd) || !GetWindowRect(container_hwnd, &rect)) {
@@ -823,10 +1080,34 @@ bool PluginLoader::gui_surface_target_rect(int32_t& x_out,
 }
 
 void PluginLoader::refresh_gui_surface_now() {
+    if (!is_gui_thread()) {
+        if (!gui_thread_) {
+            return;
+        }
+        gui_thread().invoke_sync([&]() {
+            refresh_gui_surface_now();
+        });
+        return;
+    }
+
     refresh_gui_surface(view_container_hwnd_);
 }
 
+void* PluginLoader::gui_container_hwnd() {
+    return view_container_hwnd_snapshot_.load(std::memory_order_acquire);
+}
+
 void PluginLoader::set_gui_visible(bool visible) {
+    if (!is_gui_thread()) {
+        if (!gui_thread_) {
+            return;
+        }
+        gui_thread().invoke_sync([&]() {
+            set_gui_visible(visible);
+        });
+        return;
+    }
+
     gui_surface_visible_ = visible;
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd)) {
@@ -843,6 +1124,16 @@ void PluginLoader::set_gui_visible(bool visible) {
 }
 
 void PluginLoader::set_gui_topmost(bool topmost) {
+    if (!is_gui_thread()) {
+        if (!gui_thread_) {
+            return;
+        }
+        gui_thread().invoke_sync([&]() {
+            set_gui_topmost(topmost);
+        });
+        return;
+    }
+
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd)) {
         SetWindowPos(container_hwnd,
@@ -861,6 +1152,16 @@ void PluginLoader::set_gui_topmost(bool topmost) {
 }
 
 void PluginLoader::set_gui_owner(void* owner_hwnd) {
+    if (!is_gui_thread()) {
+        if (!gui_thread_) {
+            return;
+        }
+        gui_thread().invoke_sync([&]() {
+            set_gui_owner(owner_hwnd);
+        });
+        return;
+    }
+
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     HWND new_owner = reinterpret_cast<HWND>(owner_hwnd);
     if (!container_hwnd || !IsWindow(container_hwnd) || !new_owner || !IsWindow(new_owner)) {
@@ -889,6 +1190,16 @@ void PluginLoader::set_gui_owner(void* owner_hwnd) {
 }
 
 void PluginLoader::set_gui_app_active(bool active) {
+    if (!is_gui_thread()) {
+        if (!gui_thread_) {
+            return;
+        }
+        gui_thread().invoke_sync([&]() {
+            set_gui_app_active(active);
+        });
+        return;
+    }
+
     gui_app_active_ = active;
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd)) {
@@ -923,6 +1234,13 @@ void PluginLoader::set_gui_app_active(bool active) {
 }
 
 void PluginLoader::handle_editor_window_size() {
+    if (!is_gui_thread()) {
+        gui_thread().invoke_sync([&]() {
+            handle_editor_window_size();
+        });
+        return;
+    }
+
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (!view_attached_ || !view_ || !container_hwnd || !IsWindow(container_hwnd)) {
         return;
@@ -949,6 +1267,13 @@ void PluginLoader::handle_editor_window_size() {
 }
 
 void PluginLoader::handle_editor_drag_start() {
+    if (!is_gui_thread()) {
+        gui_thread().invoke_sync([&]() {
+            handle_editor_drag_start();
+        });
+        return;
+    }
+
     editor_drag_active_ = true;
     editor_drag_started_ms_ = GetTickCount64();
     editor_drag_last_tick_ms_ = editor_drag_started_ms_;
@@ -979,7 +1304,8 @@ void PluginLoader::handle_editor_drag_start() {
     } else {
         editor_drag_restore_owner_hwnd_ = nullptr;
     }
-    blog("editor drag START plugin=\"%s\" hwnd=0x%llx owner=0x%llx tick=%llu",
+    blog("editor drag START gui_tid=%lu plugin=\"%s\" hwnd=0x%llx owner=0x%llx tick=%llu",
+         GetCurrentThreadId(),
          plugin_name_.empty() ? "(unknown)" : plugin_name_.c_str(),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(old_owner)),
@@ -987,6 +1313,13 @@ void PluginLoader::handle_editor_drag_start() {
 }
 
 void PluginLoader::handle_editor_drag_tick(uint32_t msg) {
+    if (!is_gui_thread()) {
+        gui_thread().invoke_sync([&]() {
+            handle_editor_drag_tick(msg);
+        });
+        return;
+    }
+
     if (!editor_drag_active_) {
         return;
     }
@@ -1015,6 +1348,13 @@ void PluginLoader::handle_editor_drag_tick(uint32_t msg) {
 }
 
 void PluginLoader::handle_editor_drag_end() {
+    if (!is_gui_thread()) {
+        gui_thread().invoke_sync([&]() {
+            handle_editor_drag_end();
+        });
+        return;
+    }
+
     if (!editor_drag_active_) {
         return;
     }
@@ -1033,7 +1373,8 @@ void PluginLoader::handle_editor_drag_end() {
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
                          SWP_NOOWNERZORDER);
     }
-    blog("editor drag END plugin=\"%s\" hwnd=0x%llx elapsed_ms=%llu move=%u size=%u windowpos=%u max_gap_ms=%u",
+    blog("editor drag END gui_tid=%lu plugin=\"%s\" hwnd=0x%llx elapsed_ms=%llu move=%u size=%u windowpos=%u max_gap_ms=%u",
+         GetCurrentThreadId(),
          plugin_name_.empty() ? "(unknown)" : plugin_name_.c_str(),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
          static_cast<unsigned long long>(elapsed),
@@ -1064,6 +1405,16 @@ bool PluginLoader::poll_latency_change(uint32_t& new_latency_out) {
 }
 
 void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
+    if (!is_gui_thread()) {
+        if (!gui_thread_) {
+            return;
+        }
+        gui_thread().invoke_sync([&]() {
+            notify_host_resize(width, height);
+        });
+        return;
+    }
+
     if (!view_attached_ || !view_) return;
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd) && width > 0 && height > 0) {
@@ -1100,6 +1451,17 @@ void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
 }
 
 void PluginLoader::hide_gui() {
+    if (!is_gui_thread()) {
+        if (!gui_thread_) {
+            return;
+        }
+        gui_thread_->invoke_sync([&]() {
+            hide_gui();
+        });
+        gui_thread_.reset();
+        return;
+    }
+
     if (view_attached_ && view_) {
         view_->removed();
         view_->setFrame(nullptr);
@@ -1111,6 +1473,7 @@ void PluginLoader::hide_gui() {
     view_attached_ = false;
     view_host_hwnd_ = nullptr;
     view_container_hwnd_ = nullptr;
+    view_container_hwnd_snapshot_.store(nullptr, std::memory_order_release);
     gui_surface_visible_ = false;
     gui_app_active_ = true;
     last_gui_width_ = 0;
