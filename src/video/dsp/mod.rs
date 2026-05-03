@@ -603,6 +603,8 @@ impl DspBridge {
         let (plugin_name, latency_samples) = loop {
             let now = std::time::Instant::now();
             if now >= load_deadline {
+                drop(_sync_guard);
+                self.disable();
                 return Err(format!("plugin load timed out: {plugin_path}"));
             }
             match bridge_arc.recv_timeout(load_deadline - now) {
@@ -612,10 +614,24 @@ impl DspBridge {
                     slot_id: got_slot,
                 }) if got_slot == slot_id => break (plugin_name, latency_samples),
                 Ok(Event::Error { detail }) => {
+                    let bridge_poisoned = detail.contains("timeout")
+                        || detail.contains("timed out")
+                        || detail.contains("quarantined");
+                    drop(_sync_guard);
+                    if bridge_poisoned {
+                        crate::logger::log(format!(
+                            "[VST3] disabling bridge for this session after plugin load error: {detail}"
+                        ));
+                        self.disable();
+                    }
                     return Err(format!("プラグインロード失敗: {detail}"));
                 }
                 Ok(_) => continue,
-                Err(e) => return Err(format!("recv: {e}")),
+                Err(e) => {
+                    drop(_sync_guard);
+                    self.disable();
+                    return Err(format!("recv: {e}"));
+                }
             }
         };
         if bypass {
@@ -687,6 +703,16 @@ impl DspBridge {
                 "[VST3 GUI] hidden prewarm failed for '{}': {e}",
                 plugin_path
             ));
+            if e.contains("timeout") || e.contains("timed out") || e.contains("quarantined") {
+                crate::logger::log(format!(
+                    "[VST3] disabling bridge for this session after GUI prewarm failure in '{}'",
+                    plugin_path
+                ));
+                self.disable();
+                return Err(format!(
+                    "hidden prewarm failed; VST3 bridge disabled for this session: {e}"
+                ));
+            }
         }
         Ok(idx)
     }

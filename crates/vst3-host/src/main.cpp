@@ -52,6 +52,50 @@
 
 namespace miv {
 
+enum class BridgeMainState : int {
+    Starting = 0,
+    Idle,
+    PumpingMessages,
+    PollingLatency,
+    WaitingCmdQueue,
+    ProcessingCmd,
+    ShuttingDown,
+    Stopped,
+};
+
+enum class BridgeReaderState : int {
+    Starting = 0,
+    WaitingRead,
+    Queueing,
+    Eof,
+    Stopped,
+};
+
+static const char* bridge_main_state_name(int state) {
+    switch (static_cast<BridgeMainState>(state)) {
+    case BridgeMainState::Starting: return "Starting";
+    case BridgeMainState::Idle: return "Idle";
+    case BridgeMainState::PumpingMessages: return "PumpingMessages";
+    case BridgeMainState::PollingLatency: return "PollingLatency";
+    case BridgeMainState::WaitingCmdQueue: return "WaitingCmdQueue";
+    case BridgeMainState::ProcessingCmd: return "ProcessingCmd";
+    case BridgeMainState::ShuttingDown: return "ShuttingDown";
+    case BridgeMainState::Stopped: return "Stopped";
+    default: return "Unknown";
+    }
+}
+
+static const char* bridge_reader_state_name(int state) {
+    switch (static_cast<BridgeReaderState>(state)) {
+    case BridgeReaderState::Starting: return "Starting";
+    case BridgeReaderState::WaitingRead: return "WaitingRead";
+    case BridgeReaderState::Queueing: return "Queueing";
+    case BridgeReaderState::Eof: return "Eof";
+    case BridgeReaderState::Stopped: return "Stopped";
+    default: return "Unknown";
+    }
+}
+
 // stdin/stdout を binary モードに切り替える (Windows では \r\n 変換を抑止)。
 static void setup_streams() {
     _setmode(_fileno(stdin), _O_BINARY);
@@ -208,26 +252,41 @@ public:
 
         // stdin pump を別スレッドに分離。読んだコマンドはキューに投入する。
         running_ = true;
+        enter_main_state(BridgeMainState::Starting);
+        enter_reader_state(BridgeReaderState::Starting);
+        std::thread watchdog_thread(&Bridge::watchdog_loop, this);
         std::thread stdin_thread([this]() {
             std::string msg;
-            while (read_message(msg)) {
+            enter_reader_state(BridgeReaderState::WaitingRead);
+            while (running_ && read_message(msg)) {
+                reader_cmds_received_.fetch_add(1, std::memory_order_relaxed);
+                enter_reader_state(BridgeReaderState::Queueing);
                 {
                     std::lock_guard<std::mutex> lk(cmd_mutex_);
                     cmd_queue_.push_back(std::move(msg));
                 }
                 cmd_cv_.notify_all();
                 msg.clear();
+                enter_reader_state(BridgeReaderState::WaitingRead);
             }
+            enter_reader_state(BridgeReaderState::Eof);
             // EOF: 親が stdin を閉じた → graceful shutdown
             {
                 std::lock_guard<std::mutex> lk(cmd_mutex_);
                 running_ = false;
             }
             cmd_cv_.notify_all();
+            enter_reader_state(BridgeReaderState::Stopped);
         });
 
         // メインスレッド: メッセージポンプ + コマンド処理ループ
         run_gui_loop();
+        enter_main_state(BridgeMainState::ShuttingDown);
+        running_ = false;
+        cmd_cv_.notify_all();
+        if (watchdog_thread.joinable()) {
+            watchdog_thread.join();
+        }
 
         if (audio_thread_.joinable()) {
             audio_running_ = false;
@@ -262,9 +321,90 @@ public:
     }
 
 private:
+    void enter_main_state(BridgeMainState state) {
+        main_state_entered_tick_.store(GetTickCount64(), std::memory_order_release);
+        main_state_.store(static_cast<int>(state), std::memory_order_release);
+    }
+
+    void enter_reader_state(BridgeReaderState state) {
+        reader_state_entered_tick_.store(GetTickCount64(), std::memory_order_release);
+        reader_state_.store(static_cast<int>(state), std::memory_order_release);
+    }
+
+    void set_current_cmd(std::string cmd) {
+        std::lock_guard<std::mutex> lk(state_mutex_);
+        current_cmd_ = std::move(cmd);
+    }
+
+    void watchdog_loop() {
+        while (running_) {
+            ::Sleep(1000);
+            const ULONGLONG now = GetTickCount64();
+            const int main_state = main_state_.load(std::memory_order_acquire);
+            const int reader_state = reader_state_.load(std::memory_order_acquire);
+            const ULONGLONG main_entered =
+                main_state_entered_tick_.load(std::memory_order_acquire);
+            const ULONGLONG reader_entered =
+                reader_state_entered_tick_.load(std::memory_order_acquire);
+
+            size_t queue_size = 0;
+            bool queue_size_known = false;
+            if (cmd_mutex_.try_lock()) {
+                queue_size = cmd_queue_.size();
+                cmd_mutex_.unlock();
+                queue_size_known = true;
+            }
+
+            std::string current_cmd;
+            if (state_mutex_.try_lock()) {
+                current_cmd = current_cmd_;
+                state_mutex_.unlock();
+            } else {
+                current_cmd = "<locked>";
+            }
+            if (current_cmd.empty()) {
+                current_cmd = "-";
+            }
+
+            if (queue_size_known) {
+                std::fprintf(stderr,
+                             "[BRIDGE main heartbeat] state=%s in_state_ms=%llu current_cmd=%s "
+                             "reader_state=%s reader_in_state_ms=%llu queue_size=%zu "
+                             "cmds_received=%llu cmds_processed=%llu\n",
+                             bridge_main_state_name(main_state),
+                             static_cast<unsigned long long>(now - main_entered),
+                             current_cmd.c_str(),
+                             bridge_reader_state_name(reader_state),
+                             static_cast<unsigned long long>(now - reader_entered),
+                             queue_size,
+                             static_cast<unsigned long long>(
+                                 reader_cmds_received_.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(
+                                 main_cmds_processed_.load(std::memory_order_relaxed)));
+            } else {
+                std::fprintf(stderr,
+                             "[BRIDGE main heartbeat] state=%s in_state_ms=%llu current_cmd=%s "
+                             "reader_state=%s reader_in_state_ms=%llu queue_size=<locked> "
+                             "cmds_received=%llu cmds_processed=%llu\n",
+                             bridge_main_state_name(main_state),
+                             static_cast<unsigned long long>(now - main_entered),
+                             current_cmd.c_str(),
+                             bridge_reader_state_name(reader_state),
+                             static_cast<unsigned long long>(now - reader_entered),
+                             static_cast<unsigned long long>(
+                                 reader_cmds_received_.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(
+                                 main_cmds_processed_.load(std::memory_order_relaxed)));
+            }
+            std::fflush(stderr);
+        }
+    }
+
     // ── メインループ: メッセージポンプ + コマンドキュー処理 ──
     void run_gui_loop() {
+        enter_main_state(BridgeMainState::Idle);
         while (running_) {
+            enter_main_state(BridgeMainState::PumpingMessages);
             // 1) Win32 メッセージを全消化
             MSG msg;
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
@@ -285,6 +425,7 @@ private:
             // VST3 では UI でモード切替等が起きると plugin が IComponentHandler::
             // restartComponent(kLatencyChanged) を呼ぶ。ComponentHandler が flag を立て、
             // ここで polling して親プロセス (mIV) に通知する。
+            enter_main_state(BridgeMainState::PollingLatency);
             size_t slot_id = 0;
             for (PluginLoader* loader : all_loaders()) {
                 uint32_t new_latency = 0;
@@ -297,6 +438,7 @@ private:
                 ++slot_id;
             }
             // 3) コマンドキューを 1 件処理
+            enter_main_state(BridgeMainState::WaitingCmdQueue);
             std::string cmd_msg;
             {
                 std::unique_lock<std::mutex> lk(cmd_mutex_);
@@ -317,10 +459,17 @@ private:
                     }
                 }
             }
-            if (!handle_message(cmd_msg)) {
+            set_current_cmd(extract_string_field(cmd_msg, "cmd"));
+            enter_main_state(BridgeMainState::ProcessingCmd);
+            const bool keep_running = handle_message(cmd_msg);
+            main_cmds_processed_.fetch_add(1, std::memory_order_relaxed);
+            set_current_cmd({});
+            if (!keep_running) {
                 running_ = false;
             }
+            enter_main_state(BridgeMainState::Idle);
         }
+        enter_main_state(BridgeMainState::Stopped);
     }
 
     // 単純な JSON 解析: { "cmd": "<value>", ... } から cmd を取り出す。
@@ -1396,6 +1545,16 @@ private:
     std::condition_variable cmd_cv_;
     std::deque<std::string> cmd_queue_;
     std::atomic<bool> running_{false};
+
+    // watchdog diagnostics for bridge main/reader stalls
+    std::atomic<int> main_state_{static_cast<int>(BridgeMainState::Starting)};
+    std::atomic<int> reader_state_{static_cast<int>(BridgeReaderState::Starting)};
+    std::atomic<ULONGLONG> main_state_entered_tick_{0};
+    std::atomic<ULONGLONG> reader_state_entered_tick_{0};
+    std::atomic<uint64_t> reader_cmds_received_{0};
+    std::atomic<uint64_t> main_cmds_processed_{0};
+    std::mutex state_mutex_;
+    std::string current_cmd_;
 
     // audio
     std::thread audio_thread_;

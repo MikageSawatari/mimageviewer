@@ -129,6 +129,13 @@ fn run_vst3_startup_load(
                 "vst3 startup add_plugin {} failed: {e} (このプラグインのみスキップ)",
                 entry.path
             ));
+            if !bridge.is_enabled() {
+                crate::logger::log(
+                    "[VST3 startup] stopped because the bridge was disabled after a plugin timeout"
+                        .to_string(),
+                );
+                break;
+            }
         } else {
             crate::logger::log(format!(
                 "[VST3 startup] loaded {}/{}: {}",

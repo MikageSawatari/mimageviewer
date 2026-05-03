@@ -154,8 +154,9 @@ Design rules:
   blocking chain initialization or the control IPC thread indefinitely.
 - A slot that times out in an editor operation is quarantined. Its stuck GUI
   helper is abandoned for the lifetime of the bridge process, future GUI
-  commands for that slot become no-ops, and the rest of the chain continues to
-  load and run. We intentionally do not use `TerminateThread`; a plugin that
+  commands for that slot become no-ops, and the rest of the chain may continue
+  only while the bridge control thread keeps accepting IPC. We intentionally do
+  not use `TerminateThread`; a plugin that
   never returns from `attached()` is leaked until bridge process exit rather
   than risking heap or DLL state corruption.
 - Startup loading also uses bounded waits and logs both the Rust-side
@@ -163,6 +164,16 @@ Design rules:
   line. If a plugin blocks before it can emit `loaded`, the startup worker times
   out instead of waiting forever, and the log identifies the plugin path that was
   in flight.
+- If an editor prewarm timeout leaves the bridge control thread unable to accept
+  the next `add_plugin`, mIV disables the VST3 bridge for the rest of the
+  session and stops startup loading. Playback must not keep a partially poisoned
+  bridge in the active DSP path; the user can remove the bad plugin or restart
+  to try the chain again.
+- The bridge emits a watchdog heartbeat while it is running:
+  `[BRIDGE main heartbeat] state=... current_cmd=... reader_state=...
+  queue_size=... cmds_received=... cmds_processed=...`. This is intentionally
+  produced by a separate watchdog thread so it keeps logging even if the bridge
+  main thread is blocked inside a plugin callback or IPC handler.
 - Void GUI mutations stay asynchronous. During a native editor move/resize
   modal loop, thread messages may not be drained until the drag ends, so
   `set_user_resizing`, visibility/topmost/owner changes, app-active updates,
