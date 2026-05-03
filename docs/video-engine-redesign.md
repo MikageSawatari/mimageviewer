@@ -1221,3 +1221,9 @@ event now distinguishes output fields (`audio_rate`, `audio_channels`) from
 decoder input fields (`audio_input_rate`, `audio_input_channels`,
 `audio_input_layout`, `audio_input_format`) and records whether the stereo
 request was sent/effective.
+
+The FFmpeg 7.1 build used by the Windows bundle does not expose that decoder
+request for WMA Pro (`Option not found`), so mIV also has a narrow fast path for
+the actual sample: planar f32 multichannel input at the output sample rate is
+folded down directly to packed stereo in Rust. That bypasses swresample's
+5.1-to-stereo matrix path while preserving the stereo-only cpal/VST contract.

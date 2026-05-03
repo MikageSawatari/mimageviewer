@@ -531,8 +531,11 @@ fn run_decoder(
                             let input_layout_desc = in_layout.description();
                             let input_format = format!("{in_fmt:?}");
                             let decoder_stereo_effective = input_channels <= 2;
+                            let fast_downmix =
+                                FastDownmixPlanarF32::new(in_fmt, &in_layout, in_rate, out_rate);
+                            let fast_downmix_enabled = fast_downmix.is_some();
                             crate::logger::log(format!(
-                                "audio setup: codec={audio_codec_name} container_layout=\"{container_layout_desc}\" container_channels={container_channels} decoder_layout=\"{input_layout_desc}\" decoder_channels={input_channels} in_fmt={input_format} in_rate={in_rate} out_layout=stereo out_rate={out_rate} request_stereo={stereo_request_sent} request_effective={decoder_stereo_effective}"
+                                "audio setup: codec={audio_codec_name} container_layout=\"{container_layout_desc}\" container_channels={container_channels} decoder_layout=\"{input_layout_desc}\" decoder_channels={input_channels} in_fmt={input_format} in_rate={in_rate} out_layout=stereo out_rate={out_rate} request_stereo={stereo_request_sent} request_effective={decoder_stereo_effective} fast_downmix={fast_downmix_enabled}"
                             ));
                             match ResampleContext::get2(
                                 in_fmt, in_layout, in_rate, out_fmt, out_layout, out_rate,
@@ -547,6 +550,7 @@ fn run_decoder(
                                     output_channels: 2,
                                     decoder_stereo_requested: stereo_request_sent,
                                     decoder_stereo_effective,
+                                    fast_downmix,
                                     time_base_num: tb.numerator() as f64,
                                     time_base_den: tb.denominator() as f64,
                                     decoder: dec,
@@ -680,6 +684,7 @@ fn run_decoder(
             audio_input_format,
             audio_decoder_stereo_requested,
             audio_decoder_stereo_effective,
+            audio_fast_downmix,
         ) = audio_setup
             .as_ref()
             .map(|a| {
@@ -693,6 +698,7 @@ fn run_decoder(
                     a.input_format.clone(),
                     a.decoder_stereo_requested,
                     a.decoder_stereo_effective,
+                    a.fast_downmix.is_some(),
                 )
             })
             .unwrap_or_else(|| {
@@ -704,6 +710,7 @@ fn run_decoder(
                     0,
                     "none".to_string(),
                     "none".to_string(),
+                    false,
                     false,
                     false,
                 )
@@ -764,6 +771,10 @@ fn run_decoder(
                 (
                     "audio_decoder_stereo_effective",
                     serde_json::Value::from(audio_decoder_stereo_effective),
+                ),
+                (
+                    "audio_fast_downmix",
+                    serde_json::Value::from(audio_fast_downmix),
                 ),
             ],
         );
@@ -1948,51 +1959,58 @@ fn emit_audio_frame(
 
     let pts = audio_frame_timestamp(frame).unwrap_or(0);
     let mut pts_secs = (pts as f64) * setup.time_base_num / setup.time_base_den;
-    let (_, guessed_frame_stereo) = normalize_audio_input_layout(frame.ch_layout());
-    if guessed_frame_stereo {
-        frame.set_ch_layout(ffmpeg::ChannelLayout::STEREO);
-    }
-    let mut resampled = Audio::empty();
-    if let Err(e) = setup.resampler.run(frame, &mut resampled) {
-        crate::logger::log(format!("swr resample: {e}"));
-        return true; // 1 frame 失敗は致命的でない
-    }
-    // 1 plane (packed) の f32 を取り出す。
-    //
-    // ⚠️ **`data(0)` は使わない**。`data(0)` が返すスライスは
-    // ffmpeg-the-third の `linesize[0]` ベースで、SIMD アラインメント
-    // のため **実サンプル数より大きいバイト列を返す**。
-    // `chunks_exact(4)` で f32 化すると末尾のパディング
-    // (未初期化メモリ or 0) も f32 として再生してしまい、
-    // 強い "ブチブチ" ノイズの原因になる。
-    //
-    // door_player と同じく `(*frame.as_ptr()).data[0]` を直接 `*const f32`
-    // としてキャストし、要素数 = `samples * channels` (= 実サンプル数)
-    // を指定して `from_raw_parts` でスライス化する。これにより
-    // FFmpeg の linesize パディングを完全にスキップできる。
-    //
-    // SAFETY:
-    //   - resampled は packed format (Sample::F32(Type::Packed))
-    //   - data[0] は frame の生存中有効
-    //   - samples * channels * sizeof(f32) バイトは確実にアロケート済み
-    //   - resampler.run() の出力なので i32 オーバーフローは起きない
     const CHANNELS: usize = 2;
-    let nb_samples = resampled.samples();
-    if nb_samples == 0 {
-        // 解像度の都合等で 0 サンプルが返ることがある (resample のラグ)。
-        // raw pointer dereference を避けて早期 return。
-        return true;
-    }
-    // ランタイム不変条件チェック (Codex P3): resampler の出力が
-    // 期待通り f32 packed であること。デバッグ時に format/layout
-    // を取り違えていれば即座に panic で気付ける。
-    debug_assert_eq!(resampled.format(), Sample::F32(SampleType::Packed));
-    debug_assert!(resampled.is_packed());
-    let element_count = nb_samples * CHANNELS;
-    let mut samples: Vec<f32> = unsafe {
-        let raw_ptr = (*resampled.as_ptr()).data[0] as *const f32;
-        debug_assert!(!raw_ptr.is_null());
-        std::slice::from_raw_parts(raw_ptr, element_count).to_vec()
+    let mut samples: Vec<f32> = if let Some(downmix) = &setup.fast_downmix {
+        match downmix.run(frame) {
+            Some(samples) => samples,
+            None => return true,
+        }
+    } else {
+        let (_, guessed_frame_stereo) = normalize_audio_input_layout(frame.ch_layout());
+        if guessed_frame_stereo {
+            frame.set_ch_layout(ffmpeg::ChannelLayout::STEREO);
+        }
+        let mut resampled = Audio::empty();
+        if let Err(e) = setup.resampler.run(frame, &mut resampled) {
+            crate::logger::log(format!("swr resample: {e}"));
+            return true; // 1 frame 失敗は致命的でない
+        }
+        // 1 plane (packed) の f32 を取り出す。
+        //
+        // ⚠️ **`data(0)` は使わない**。`data(0)` が返すスライスは
+        // ffmpeg-the-third の `linesize[0]` ベースで、SIMD アラインメント
+        // のため **実サンプル数より大きいバイト列を返す**。
+        // `chunks_exact(4)` で f32 化すると末尾のパディング
+        // (未初期化メモリ or 0) も f32 として再生してしまい、
+        // 強い "ブチブチ" ノイズの原因になる。
+        //
+        // door_player と同じく `(*frame.as_ptr()).data[0]` を直接 `*const f32`
+        // としてキャストし、要素数 = `samples * channels` (= 実サンプル数)
+        // を指定して `from_raw_parts` でスライス化する。これにより
+        // FFmpeg の linesize パディングを完全にスキップできる。
+        //
+        // SAFETY:
+        //   - resampled は packed format (Sample::F32(Type::Packed))
+        //   - data[0] は frame の生存中有効
+        //   - samples * channels * sizeof(f32) バイトは確実にアロケート済み
+        //   - resampler.run() の出力なので i32 オーバーフローは起きない
+        let nb_samples = resampled.samples();
+        if nb_samples == 0 {
+            // 解像度の都合等で 0 サンプルが返ることがある (resample のラグ)。
+            // raw pointer dereference を避けて早期 return。
+            return true;
+        }
+        // ランタイム不変条件チェック (Codex P3): resampler の出力が
+        // 期待通り f32 packed であること。デバッグ時に format/layout
+        // を取り違えていれば即座に panic で気付ける。
+        debug_assert_eq!(resampled.format(), Sample::F32(SampleType::Packed));
+        debug_assert!(resampled.is_packed());
+        let element_count = nb_samples * CHANNELS;
+        unsafe {
+            let raw_ptr = (*resampled.as_ptr()).data[0] as *const f32;
+            debug_assert!(!raw_ptr.is_null());
+            std::slice::from_raw_parts(raw_ptr, element_count).to_vec()
+        }
     };
 
     // post-seek preroll の trim:
@@ -2073,31 +2091,138 @@ fn request_stereo_audio_decoder_output(
     input_channels: u32,
     input_layout_desc: &str,
 ) -> bool {
-    use ffmpeg_the_third::option::Settable;
-
     // mIV の audio output / VST chain は stereo 固定なので、multichannel decoder には
     // 可能なら最初から stereo 出力を要求する。WMA Pro 5.1ch などで、重い
     // 6ch decode + swresample downmix 経路を避けるための互換ワークアラウンド。
+    let _ = ctx;
     if input_channels <= 2 {
         return false;
     }
 
-    let result = ctx
-        .set_str("request_ch_layout", "stereo")
-        .or_else(|_| ctx.set_str("request_channel_layout", "stereo"));
-    match result {
-        Ok(()) => {
-            crate::logger::log(format!(
-                "audio decoder stereo request: codec={codec_name} input_layout=\"{input_layout_desc}\" input_channels={input_channels}"
-            ));
-            true
+    crate::logger::log(format!(
+        "audio decoder stereo request unavailable: codec={codec_name} input_layout=\"{input_layout_desc}\" input_channels={input_channels}"
+    ));
+    false
+}
+
+#[derive(Clone, Debug)]
+struct FastDownmixPlanarF32 {
+    channels: usize,
+    fl: Option<usize>,
+    fr: Option<usize>,
+    fc: Option<usize>,
+    lfe: Option<usize>,
+    sl: Option<usize>,
+    sr: Option<usize>,
+    bl: Option<usize>,
+    br: Option<usize>,
+}
+
+impl FastDownmixPlanarF32 {
+    fn new(
+        input_format: ffmpeg_the_third::format::sample::Sample,
+        input_layout: &ffmpeg_the_third::ChannelLayout<'_>,
+        input_rate: u32,
+        output_rate: u32,
+    ) -> Option<Self> {
+        use ffmpeg::format::sample::{Sample, Type as SampleType};
+        use ffmpeg_the_third as ffmpeg;
+
+        let channels = input_layout.channels() as usize;
+        if input_format != Sample::F32(SampleType::Planar)
+            || channels <= 2
+            || channels > 8
+            || input_rate != output_rate
+        {
+            return None;
         }
-        Err(e) => {
-            crate::logger::log(format!(
-                "audio decoder stereo request failed: codec={codec_name} input_layout=\"{input_layout_desc}\" input_channels={input_channels} err={e}"
-            ));
-            false
+
+        let mut this = Self {
+            channels,
+            fl: input_layout.index_from_string("FL").map(|v| v as usize),
+            fr: input_layout.index_from_string("FR").map(|v| v as usize),
+            fc: input_layout.index_from_string("FC").map(|v| v as usize),
+            lfe: input_layout.index_from_string("LFE").map(|v| v as usize),
+            sl: input_layout.index_from_string("SL").map(|v| v as usize),
+            sr: input_layout.index_from_string("SR").map(|v| v as usize),
+            bl: input_layout.index_from_string("BL").map(|v| v as usize),
+            br: input_layout.index_from_string("BR").map(|v| v as usize),
+        };
+
+        if this.fl.is_none() && channels >= 2 {
+            this.fl = Some(0);
+            this.fr = Some(1);
         }
+        if this.fc.is_none() && channels >= 3 {
+            this.fc = Some(2);
+        }
+        if this.lfe.is_none() && channels >= 4 {
+            this.lfe = Some(3);
+        }
+        if this.sl.is_none() && this.bl.is_none() && channels >= 6 {
+            this.sl = Some(4);
+            this.sr = Some(5);
+        }
+
+        crate::logger::log(format!(
+            "audio fast downmix enabled: layout=\"{}\" channels={} map={:?}",
+            input_layout.description(),
+            channels,
+            this
+        ));
+        Some(this)
+    }
+
+    fn run(&self, frame: &ffmpeg_the_third::util::frame::audio::Audio) -> Option<Vec<f32>> {
+        let nb_samples = frame.samples();
+        if nb_samples == 0 {
+            return None;
+        }
+
+        let planes = self.planes(frame)?;
+        let mut out = Vec::with_capacity(nb_samples * 2);
+        for i in 0..nb_samples {
+            let fl = self.sample(&planes, self.fl, i);
+            let fr = self.sample(&planes, self.fr, i);
+            let fc = self.sample(&planes, self.fc, i);
+            let lfe = self.sample(&planes, self.lfe, i);
+            let ls = self.sample(&planes, self.sl.or(self.bl), i);
+            let rs = self.sample(&planes, self.sr.or(self.br), i);
+
+            // Conservative ITU-style stereo fold-down. The final scale keeps
+            // WMA Pro 5.1 material from clipping before the optional VST limiter.
+            out.push((fl + 0.707_106_77 * fc + 0.707_106_77 * ls + 0.5 * lfe) * 0.75);
+            out.push((fr + 0.707_106_77 * fc + 0.707_106_77 * rs + 0.5 * lfe) * 0.75);
+        }
+        Some(out)
+    }
+
+    fn planes<'a>(
+        &self,
+        frame: &'a ffmpeg_the_third::util::frame::audio::Audio,
+    ) -> Option<Vec<&'a [f32]>> {
+        let nb_samples = frame.samples();
+        let mut planes = Vec::with_capacity(self.channels);
+        unsafe {
+            let av = frame.as_ptr();
+            for ch in 0..self.channels {
+                let ptr = (*av).data[ch] as *const f32;
+                if ptr.is_null() {
+                    return None;
+                }
+                planes.push(std::slice::from_raw_parts(ptr, nb_samples));
+            }
+        }
+        Some(planes)
+    }
+
+    #[inline]
+    fn sample(&self, planes: &[&[f32]], channel: Option<usize>, index: usize) -> f32 {
+        channel
+            .and_then(|ch| planes.get(ch))
+            .and_then(|plane| plane.get(index))
+            .copied()
+            .unwrap_or(0.0)
     }
 }
 
@@ -2111,6 +2236,7 @@ struct AudioSetup {
     output_channels: u32,
     decoder_stereo_requested: bool,
     decoder_stereo_effective: bool,
+    fast_downmix: Option<FastDownmixPlanarF32>,
     time_base_num: f64,
     time_base_den: f64,
     decoder: ffmpeg_the_third::decoder::Audio,
