@@ -129,6 +129,12 @@ public:
     /// Relay mIV app activation to the bridge-owned plugin surface.
     void set_gui_app_active(bool active);
     void* gui_container_hwnd() const { return view_container_hwnd_; }
+    /// Helpers for chain-level batched show/hide and z-order updates.
+    void set_gui_surface_visible_state(bool visible);
+    bool gui_surface_should_show() const;
+    bool gui_surface_target_rect(int32_t& x_out, int32_t& y_out,
+                                 int32_t& width_out, int32_t& height_out);
+    void refresh_gui_surface_now();
     /// GUI を外す。HWND 自体は呼び出し側が破棄する。
     void hide_gui();
 

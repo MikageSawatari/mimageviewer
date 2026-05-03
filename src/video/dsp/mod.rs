@@ -853,6 +853,38 @@ impl DspBridge {
         }
     }
 
+    fn send_chain_visible(&self, ordered_top_to_bottom: &[u64], visible: bool, topmost: bool) {
+        let commands: Vec<(Arc<Bridge>, Vec<u64>)> = {
+            let inner = self.inner.lock().unwrap();
+            let mut out: Vec<(Arc<Bridge>, Vec<u64>)> = Vec::new();
+            for hwnd in ordered_top_to_bottom {
+                let Some(slot) = inner.slots.iter().find(|s| s.gui_hwnd == *hwnd) else {
+                    continue;
+                };
+                if let Some((_, slots)) = out.iter_mut().find(|(b, _)| Arc::ptr_eq(b, &slot.bridge))
+                {
+                    slots.push(slot.slot_id);
+                } else {
+                    out.push((slot.bridge.clone(), vec![slot.slot_id]));
+                }
+            }
+            out
+        };
+        for (bridge, slots) in commands {
+            let ordered_slots = slots
+                .iter()
+                .map(|slot| slot.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = bridge.send_value(&serde_json::json!({
+                "cmd": "set_chain_visible",
+                "visible": if visible { 1 } else { 0 },
+                "topmost": if topmost { 1 } else { 0 },
+                "ordered_slots": ordered_slots,
+            }));
+        }
+    }
+
     fn prewarm_slot_gui(&self, idx: usize) -> Result<(), String> {
         self.ensure_slot_gui_attached(idx, false, false)
     }
@@ -1112,11 +1144,26 @@ impl DspBridge {
             };
             let n = {
                 let mut inner = self.inner.lock().unwrap();
-                inner.last_z_order_snapshot = snapshot;
+                inner.last_z_order_snapshot = snapshot.clone();
                 inner.slots.len()
             };
-            for idx in 0..n {
-                self.hide_slot_gui(idx);
+            let mut hide_hwnds = Vec::new();
+            {
+                let mut inner = self.inner.lock().unwrap();
+                for idx in 0..n {
+                    if let Some(slot) = inner.slots.get_mut(idx) {
+                        if slot.gui_hwnd != 0 && slot.gui_visible {
+                            hide_hwnds.push(slot.gui_hwnd);
+                            slot.gui_visible = false;
+                        }
+                    }
+                }
+            }
+            for hwnd in &hide_hwnds {
+                gui::set_window_visible(*hwnd, false);
+            }
+            if !snapshot.is_empty() {
+                self.send_chain_visible(&snapshot, false, false);
             }
         } else {
             // ── show 経路: 全 SW_SHOWNA → snapshot 順序で z-order 復元 ──
@@ -1132,7 +1179,6 @@ impl DspBridge {
                 inner.slots.len()
             };
             let mut shown_hwnds: Vec<u64> = Vec::with_capacity(n);
-            let mut shown_indices: Vec<usize> = Vec::with_capacity(n);
             for idx in 0..n {
                 let action = {
                     let mut inner = self.inner.lock().unwrap();
@@ -1158,17 +1204,21 @@ impl DspBridge {
                     ShowAction::Skip => {}
                     ShowAction::BatchExisting(hwnd) => {
                         shown_hwnds.push(hwnd);
-                        shown_indices.push(idx);
                     }
                     ShowAction::Create => {
-                        let _ = self.show_slot_gui(idx);
+                        let _ = self.ensure_slot_gui_attached(idx, false, true);
                         let hwnd = {
-                            let inner = self.inner.lock().unwrap();
-                            inner.slots.get(idx).map(|s| s.gui_hwnd).unwrap_or(0)
+                            let mut inner = self.inner.lock().unwrap();
+                            if let Some(slot) = inner.slots.get_mut(idx) {
+                                slot.gui_visible = true;
+                                slot.user_hidden = false;
+                                slot.gui_hwnd
+                            } else {
+                                0
+                            }
                         };
                         if hwnd != 0 {
                             shown_hwnds.push(hwnd);
-                            shown_indices.push(idx);
                         }
                     }
                 }
@@ -1193,10 +1243,7 @@ impl DspBridge {
             if !restore_order.is_empty() {
                 let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
                 gui::show_windows_in_z_order(&restore_order, topmost);
-                self.send_chain_z_order(&restore_order, topmost);
-                for idx in shown_indices {
-                    self.send_slot_gui_visible(idx, true);
-                }
+                self.send_chain_visible(&restore_order, true, topmost);
             }
         }
     }

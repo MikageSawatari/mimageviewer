@@ -586,6 +586,13 @@ private:
             apply_chain_z_order(ordered_slots, topmost);
             return true;
         }
+        if (cmd == "set_chain_visible") {
+            auto ordered_slots = parse_u64_list(extract_string_field(msg, "ordered_slots"));
+            const bool visible = extract_number_field(msg, "visible") != 0;
+            const bool topmost = extract_number_field(msg, "topmost") != 0;
+            apply_chain_visible(ordered_slots, visible, topmost);
+            return true;
+        }
         if (cmd == "set_bypass") {
             uint64_t slot = extract_number_field(msg, "slot_id");
             {
@@ -912,6 +919,142 @@ private:
             batch = next;
         }
         EndDeferWindowPos(batch);
+    }
+
+    struct ChainVisibleEntry {
+        PluginLoader* loader = nullptr;
+        HWND hwnd = nullptr;
+        bool show = false;
+        bool has_rect = false;
+        int32_t x = 0;
+        int32_t y = 0;
+        int32_t width = 1;
+        int32_t height = 1;
+    };
+
+    void apply_chain_visible(const std::vector<uint64_t>& ordered_slots_top_to_bottom,
+                             bool visible,
+                             bool topmost) {
+        std::vector<ChainVisibleEntry> entries;
+        {
+            std::lock_guard<std::mutex> lk(loaders_mutex_);
+            entries.reserve(ordered_slots_top_to_bottom.size());
+            for (uint64_t slot_id : ordered_slots_top_to_bottom) {
+                PluginLoader* loader = loader_at_unlocked(slot_id);
+                if (!loader) continue;
+                HWND hwnd = reinterpret_cast<HWND>(loader->gui_container_hwnd());
+                if (!hwnd || !IsWindow(hwnd)) continue;
+
+                loader->set_gui_surface_visible_state(visible);
+
+                ChainVisibleEntry entry{};
+                entry.loader = loader;
+                entry.hwnd = hwnd;
+                entry.show = loader->gui_surface_should_show();
+                if (entry.show) {
+                    entry.has_rect = loader->gui_surface_target_rect(entry.x,
+                                                                     entry.y,
+                                                                     entry.width,
+                                                                     entry.height);
+                }
+                entries.push_back(entry);
+            }
+        }
+        if (entries.empty()) return;
+
+        HDWP batch = BeginDeferWindowPos(static_cast<int>(entries.size()));
+        if (!batch) {
+            for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+                apply_visible_entry_fallback(*it, topmost);
+            }
+            refresh_visible_entries(entries);
+            return;
+        }
+
+        HWND insert_after = topmost ? HWND_TOPMOST : HWND_NOTOPMOST;
+        for (auto it = entries.rbegin(); it != entries.rend(); ++it) {
+            UINT flags = SWP_NOACTIVATE;
+            int x = 0;
+            int y = 0;
+            int width = 0;
+            int height = 0;
+            HWND after = insert_after;
+            if (it->show) {
+                flags |= SWP_SHOWWINDOW;
+                if (it->has_rect) {
+                    x = it->x;
+                    y = it->y;
+                    width = it->width;
+                    height = it->height;
+                } else {
+                    flags |= SWP_NOMOVE | SWP_NOSIZE;
+                }
+            } else {
+                flags |= SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE;
+                after = HWND_NOTOPMOST;
+            }
+
+            HDWP next = DeferWindowPos(batch,
+                                       it->hwnd,
+                                       after,
+                                       x,
+                                       y,
+                                       width,
+                                       height,
+                                       flags);
+            if (!next) {
+                EndDeferWindowPos(batch);
+                for (auto fallback = entries.rbegin(); fallback != entries.rend(); ++fallback) {
+                    apply_visible_entry_fallback(*fallback, topmost);
+                }
+                refresh_visible_entries(entries);
+                return;
+            }
+            batch = next;
+        }
+        EndDeferWindowPos(batch);
+        refresh_visible_entries(entries);
+    }
+
+    static void apply_visible_entry_fallback(const ChainVisibleEntry& entry, bool topmost) {
+        if (entry.show) {
+            UINT flags = SWP_NOACTIVATE | SWP_SHOWWINDOW;
+            int x = 0;
+            int y = 0;
+            int width = 0;
+            int height = 0;
+            if (entry.has_rect) {
+                x = entry.x;
+                y = entry.y;
+                width = entry.width;
+                height = entry.height;
+            } else {
+                flags |= SWP_NOMOVE | SWP_NOSIZE;
+            }
+            SetWindowPos(entry.hwnd,
+                         topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
+                         x,
+                         y,
+                         width,
+                         height,
+                         flags);
+        } else {
+            SetWindowPos(entry.hwnd,
+                         HWND_NOTOPMOST,
+                         0,
+                         0,
+                         0,
+                         0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW);
+        }
+    }
+
+    static void refresh_visible_entries(const std::vector<ChainVisibleEntry>& entries) {
+        for (const ChainVisibleEntry& entry : entries) {
+            if (entry.show && entry.loader) {
+                entry.loader->refresh_gui_surface_now();
+            }
+        }
     }
 
     void audio_loop(uint32_t max_block_size) {

@@ -1196,6 +1196,33 @@ void PluginLoader::refresh_gui_surface(void* container_hwnd_ptr) {
                  RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME);
 }
 
+void PluginLoader::set_gui_surface_visible_state(bool visible) {
+    gui_surface_visible_ = visible;
+}
+
+bool PluginLoader::gui_surface_should_show() const {
+    return gui_surface_visible_ && gui_app_active_;
+}
+
+bool PluginLoader::gui_surface_target_rect(int32_t& x_out,
+                                           int32_t& y_out,
+                                           int32_t& width_out,
+                                           int32_t& height_out) {
+    RECT rect{};
+    if (!host_client_rect_on_screen(reinterpret_cast<HWND>(view_host_hwnd_), rect)) {
+        return false;
+    }
+    x_out = rect.left;
+    y_out = rect.top;
+    width_out = std::max<LONG>(1, rect.right - rect.left);
+    height_out = std::max<LONG>(1, rect.bottom - rect.top);
+    return true;
+}
+
+void PluginLoader::refresh_gui_surface_now() {
+    refresh_gui_surface(view_container_hwnd_);
+}
+
 void PluginLoader::set_gui_visible(bool visible) {
     gui_surface_visible_ = visible;
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
