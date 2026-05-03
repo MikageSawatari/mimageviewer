@@ -38,7 +38,9 @@ which avoids accidentally toggling play/pause when the user's intent is to move
 focus away from a plugin editor. If a key event is delivered to the main
 viewport instead of the fullscreen viewport during this handoff, mIV forwards
 the fullscreen shortcut keys through the same fullscreen key handler before the
-main-grid shortcut gate can discard them.
+main-grid shortcut gate can discard them. The VST3 manager panel itself is not
+treated as a modal dialog for fullscreen media shortcuts, so video keys still
+work while the panel is open.
 The handoff check stores the previous frame's Win32 foreground HWND and compares
 that value against the clicked fullscreen HWND rather than only trusting
 `viewport().focused`, because cross-process owner windows can keep egui's focus

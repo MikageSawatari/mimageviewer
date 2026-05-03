@@ -3046,6 +3046,28 @@ impl App {
             || self.delete_pending.is_some()
     }
 
+    /// フルスクリーンのキー入力を止める必要があるモーダルダイアログ。
+    ///
+    /// VST3 manager は fullscreen viewport 内の操作パネルなので、開いたままでも
+    /// W / Enter / 矢印などの動画ショートカットは使えるようにする。
+    pub(crate) fn any_modal_dialog_open_for_fullscreen_keys(&self) -> bool {
+        self.show_stats_dialog
+            || self.show_favorites_editor
+            || self.show_tag_editor
+            || self.show_fav_add_dialog
+            || self.show_open_folder_dialog
+            || self.show_preferences
+            || self.show_cache_manager
+            || self.show_delete_confirm
+            || self.show_rotation_reset_confirm
+            || self.show_pdf_password_dialog
+            || self.show_about_dialog
+            || self.show_update_dialog
+            || self.slot_save_dialog.is_some()
+            || self.context_menu_idx.is_some()
+            || self.delete_pending.is_some()
+    }
+
     /// ユーザー視点でのカレントフォルダ。変換済みアーカイブを開いているときは
     /// 元 (7z/LZH) のパスを返す。通常時は `current_folder` と同じ。
     /// BS / Ctrl+↑↓ / タイトルバー / アドレスバー表示で使うこと。

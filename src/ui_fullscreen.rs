@@ -1939,7 +1939,7 @@ impl App {
         }
         // モーダルダイアログ表示中はキー入力を奪わない
         // (テキスト入力やダイアログ内の Enter/Esc 処理を優先)
-        if self.any_dialog_open() {
+        if self.any_modal_dialog_open_for_fullscreen_keys() {
             return action;
         }
 
