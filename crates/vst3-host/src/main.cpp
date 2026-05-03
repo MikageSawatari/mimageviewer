@@ -269,7 +269,17 @@ private:
             MSG msg;
             while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
                 ::TranslateMessage(&msg);
+                const ULONGLONG dispatch_started = GetTickCount64();
                 ::DispatchMessageW(&msg);
+                const ULONGLONG dispatch_elapsed = GetTickCount64() - dispatch_started;
+                if (dispatch_elapsed >= 12) {
+                    std::fprintf(stderr,
+                                 "[BRIDGE] slow DispatchMessageW msg=0x%X hwnd=0x%llx elapsed_ms=%llu\n",
+                                 msg.message,
+                                 static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(msg.hwnd)),
+                                 static_cast<unsigned long long>(dispatch_elapsed));
+                    std::fflush(stderr);
+                }
             }
             // 2) latency_changed 検出 (= プラグインが kLatencyChanged を発火していないか)
             // VST3 では UI でモード切替等が起きると plugin が IComponentHandler::

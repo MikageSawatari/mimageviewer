@@ -66,8 +66,22 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
     }
     if (msg == WM_SIZE && wparam != SIZE_MINIMIZED) {
         if (loader) {
+            loader->handle_editor_drag_tick(msg);
             loader->handle_editor_window_size();
         }
+    }
+    if (msg == WM_ENTERSIZEMOVE) {
+        if (loader) {
+            loader->handle_editor_drag_start();
+        }
+    }
+    if (msg == WM_EXITSIZEMOVE) {
+        if (loader) {
+            loader->handle_editor_drag_end();
+        }
+    }
+    if ((msg == WM_MOVE || msg == WM_MOVING || msg == WM_WINDOWPOSCHANGED) && loader) {
+        loader->handle_editor_drag_tick(msg);
     }
     if (msg == WM_WINDOWPOSCHANGING) {
         auto* wp = reinterpret_cast<WINDOWPOS*>(lparam);
@@ -375,6 +389,7 @@ bool PluginLoader::load(const std::string& plugin_path,
             }
 
             info_out.plugin_name = info.name();
+            plugin_name_ = info_out.plugin_name;
             break;
         }
     }
@@ -931,6 +946,67 @@ void PluginLoader::handle_editor_window_size() {
                              static_cast<Steinberg::int32>(width),
                              static_cast<Steinberg::int32>(height)};
     view_->onSize(&rect);
+}
+
+void PluginLoader::handle_editor_drag_start() {
+    editor_drag_active_ = true;
+    editor_drag_started_ms_ = GetTickCount64();
+    editor_drag_last_tick_ms_ = editor_drag_started_ms_;
+    editor_drag_move_count_ = 0;
+    editor_drag_size_count_ = 0;
+    editor_drag_windowpos_count_ = 0;
+    editor_drag_max_gap_ms_ = 0;
+    HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
+    blog("editor drag START plugin=\"%s\" hwnd=0x%llx tick=%llu",
+         plugin_name_.empty() ? "(unknown)" : plugin_name_.c_str(),
+         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
+         static_cast<unsigned long long>(editor_drag_started_ms_));
+}
+
+void PluginLoader::handle_editor_drag_tick(uint32_t msg) {
+    if (!editor_drag_active_) {
+        return;
+    }
+    const uint64_t now = GetTickCount64();
+    if (editor_drag_last_tick_ms_ != 0 && now >= editor_drag_last_tick_ms_) {
+        const uint64_t gap = now - editor_drag_last_tick_ms_;
+        if (gap > editor_drag_max_gap_ms_) {
+            editor_drag_max_gap_ms_ = static_cast<uint32_t>(std::min<uint64_t>(gap, UINT32_MAX));
+        }
+    }
+    editor_drag_last_tick_ms_ = now;
+    switch (msg) {
+        case WM_MOVE:
+        case WM_MOVING:
+            ++editor_drag_move_count_;
+            break;
+        case WM_SIZE:
+            ++editor_drag_size_count_;
+            break;
+        case WM_WINDOWPOSCHANGED:
+            ++editor_drag_windowpos_count_;
+            break;
+        default:
+            break;
+    }
+}
+
+void PluginLoader::handle_editor_drag_end() {
+    if (!editor_drag_active_) {
+        return;
+    }
+    const uint64_t now = GetTickCount64();
+    const uint64_t elapsed = now >= editor_drag_started_ms_ ? now - editor_drag_started_ms_ : 0;
+    HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
+    blog("editor drag END plugin=\"%s\" hwnd=0x%llx elapsed_ms=%llu move=%u size=%u windowpos=%u max_gap_ms=%u",
+         plugin_name_.empty() ? "(unknown)" : plugin_name_.c_str(),
+         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
+         static_cast<unsigned long long>(elapsed),
+         editor_drag_move_count_,
+         editor_drag_size_count_,
+         editor_drag_windowpos_count_,
+         editor_drag_max_gap_ms_);
+    editor_drag_active_ = false;
 }
 
 bool PluginLoader::poll_latency_change(uint32_t& new_latency_out) {

@@ -146,6 +146,9 @@ public:
                                  int32_t& width_out, int32_t& height_out);
     void refresh_gui_surface_now();
     void handle_editor_window_size();
+    void handle_editor_drag_start();
+    void handle_editor_drag_tick(uint32_t msg);
+    void handle_editor_drag_end();
     /// GUI を外す。HWND 自体は呼び出し側が破棄する。
     void hide_gui();
 
@@ -180,6 +183,7 @@ private:
     Steinberg::IPtr<Steinberg::Vst::IAudioProcessor> processor_;
     Steinberg::IPtr<Steinberg::Vst::IEditController> controller_;
     Steinberg::IPtr<Steinberg::IPlugView> view_;
+    std::string plugin_name_;
     bool view_attached_ = false;
     void* view_host_hwnd_ = nullptr;
     void* view_container_hwnd_ = nullptr;
@@ -192,6 +196,14 @@ private:
     uint32_t block_size_ = 0;
     uint32_t cached_latency_samples_ = 0;
     bool active_ = false;
+
+    bool editor_drag_active_ = false;
+    uint64_t editor_drag_started_ms_ = 0;
+    uint64_t editor_drag_last_tick_ms_ = 0;
+    uint32_t editor_drag_move_count_ = 0;
+    uint32_t editor_drag_size_count_ = 0;
+    uint32_t editor_drag_windowpos_count_ = 0;
+    uint32_t editor_drag_max_gap_ms_ = 0;
 
     // bus 数 (load 時に取得)。Pro-Q 4 等のサイドチェイン入力プラグインは
     // num_in_buses_ = 2 になる。ProcessData::numInputs はこの値と一致する必要がある。
