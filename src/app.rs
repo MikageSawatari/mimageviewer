@@ -10441,6 +10441,7 @@ impl App {
             // The normal per-frame fullscreen-state watcher also hides VST
             // editors, but doing it here keeps bridge-owned plugin surfaces
             // from lingering for a frame after the fullscreen viewport closes.
+            self.dsp_bridge.set_existing_guis_owner_to_main();
             self.dsp_bridge.set_all_guis_visible(false);
             self.dsp_bridge.set_all_guis_topmost(false);
             self.show_vst3_manager = false;
@@ -13355,6 +13356,7 @@ impl eframe::App for App {
                 if !is_fs {
                     // フルスクリーン解除 → VST 関連 UI を全部畳む。
                     // 動画 compact の設定値は保持し、次に VST を開いた時に復元する。
+                    self.dsp_bridge.set_existing_guis_owner_to_main();
                     self.dsp_bridge.set_all_guis_visible(false);
                     self.show_vst3_manager = false;
                     if self.settings.vst3_gui_visible {

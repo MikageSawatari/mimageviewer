@@ -212,13 +212,29 @@ impl DspBridge {
     /// foreground viewport を優先し、取れない場合だけ main HWND に戻す。
     #[cfg(windows)]
     fn current_gui_owner_hwnd(&self) -> u64 {
+        use windows::Win32::Foundation::POINT;
         use windows::Win32::System::Threading::GetCurrentProcessId;
         use windows::Win32::UI::WindowsAndMessaging::{
-            GetForegroundWindow, GetWindowThreadProcessId,
+            GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
+            WindowFromPoint,
         };
 
         let fallback = self.main_hwnd.load(Ordering::Acquire);
         unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_ok() {
+                let hovered = WindowFromPoint(pt);
+                if !hovered.0.is_null() {
+                    let root = GetAncestor(hovered, GA_ROOT);
+                    let owner = if root.0.is_null() { hovered } else { root };
+                    let mut owner_pid = 0_u32;
+                    let _ = GetWindowThreadProcessId(owner, Some(&mut owner_pid));
+                    if owner_pid == GetCurrentProcessId() {
+                        return owner.0 as u64;
+                    }
+                }
+            }
+
             let hwnd = GetForegroundWindow();
             if hwnd.0.is_null() {
                 return fallback;
@@ -237,8 +253,7 @@ impl DspBridge {
         self.main_hwnd.load(Ordering::Acquire)
     }
 
-    fn sync_existing_gui_owner_to_current_viewport(&self) {
-        let owner_hwnd = self.current_gui_owner_hwnd();
+    fn sync_existing_gui_owner(&self, owner_hwnd: u64) {
         if owner_hwnd == 0 {
             return;
         }
@@ -259,6 +274,14 @@ impl DspBridge {
                 ));
             }
         }
+    }
+
+    fn sync_existing_gui_owner_to_current_viewport(&self) {
+        self.sync_existing_gui_owner(self.current_gui_owner_hwnd());
+    }
+
+    pub fn set_existing_guis_owner_to_main(&self) {
+        self.sync_existing_gui_owner(self.main_hwnd.load(Ordering::Acquire));
     }
 
     /// audio output の sample_rate (= cpal 出力レート)。0 = 未設定。UI で
