@@ -27,17 +27,18 @@ use std::sync::{Arc, Mutex};
 
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    COLOR_WINDOW, ClientToScreen, GetMonitorInfoW, HBRUSH, MONITOR_DEFAULTTONEAREST, MONITORINFO,
-    MonitorFromRect,
+    BeginPaint, COLOR_WINDOW, ClientToScreen, EndPaint, GetMonitorInfoW, HBRUSH,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, PAINTSTRUCT,
 };
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    IDC_ARROW, IsIconic, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SW_SHOW,
+    IDC_ARROW, IsIconic, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SC_CLOSE, SW_SHOW,
     SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow,
     SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_CLOSE,
-    WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOVE, WM_PARENTNOTIFY, WM_SIZE, WNDCLASSEXW,
-    WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOVE, WM_PAINT, WM_PARENTNOTIFY, WM_SIZE,
+    WM_SYSCOMMAND, WNDCLASSEXW, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW,
+    WS_THICKFRAME,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -202,6 +203,14 @@ struct ThreadState {
 
 unsafe impl Send for ThreadState {}
 
+fn notify_user_close_for_thread() {
+    let tx_opt: Option<Sender<()>> =
+        THREAD_STATE.with(|s| s.borrow().as_ref().and_then(|st| st.close_tx.clone()));
+    if let Some(tx) = tx_opt {
+        let _ = tx.send(());
+    }
+}
+
 extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
@@ -217,14 +226,20 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
-            WM_CLOSE => {
-                // ユーザーが × を押した。メインスレッドに通知し、
-                // メインスレッドからの Cmd::Close を待つ (= ここでは破棄しない)。
-                let tx_opt: Option<Sender<()>> =
-                    THREAD_STATE.with(|s| s.borrow().as_ref().and_then(|st| st.close_tx.clone()));
-                if let Some(tx) = tx_opt {
-                    let _ = tx.send(());
+            WM_SYSCOMMAND => {
+                if (wparam.0 as u32 & 0xFFF0) == SC_CLOSE {
+                    notify_user_close_for_thread();
+                    return LRESULT(0);
                 }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_CLOSE => {
+                // Some plugins send a bare WM_CLOSE while creating/showing
+                // their editor. Treat only SC_CLOSE as a user close request.
+                crate::logger::log(format!(
+                    "[VST3 GUI] ignored bare WM_CLOSE hwnd=0x{:x}",
+                    hwnd.0 as usize
+                ));
                 LRESULT(0)
             }
             WM_SIZE | WM_MOVE => {
@@ -286,10 +301,29 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_ERASEBKGND => {
-                // The bridge-owned editor surface covers the entire client
-                // area. Suppress background erase so a move/resize does not
-                // flash a white client edge while the surface follows.
-                LRESULT(1)
+                let has_editor_surface = THREAD_STATE.with(|s| {
+                    s.borrow()
+                        .as_ref()
+                        .and_then(|st| st.bridge_container_hwnd)
+                        .is_some()
+                });
+                if has_editor_surface {
+                    // The bridge-owned editor surface covers the entire
+                    // client area. Suppress background erase so a move/resize
+                    // does not flash a white client edge while it follows.
+                    LRESULT(1)
+                } else {
+                    DefWindowProcW(hwnd, msg, wparam, lparam)
+                }
+            }
+            WM_PAINT => {
+                // The host window is only a frame for the bridge-owned editor
+                // surface. Validate paint requests without drawing a white
+                // client background.
+                let mut ps = PAINTSTRUCT::default();
+                let _ = BeginPaint(hwnd, &mut ps);
+                let _ = EndPaint(hwnd, &ps);
+                LRESULT(0)
             }
             WM_DESTROY => {
                 PostQuitMessage(0);
