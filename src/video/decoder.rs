@@ -54,6 +54,28 @@ fn audio_frame_timestamp(frame: &ffmpeg_the_third::util::frame::audio::Audio) ->
     frame_best_effort_timestamp(raw).or_else(|| frame.pts())
 }
 
+fn sane_video_rate(rate: ffmpeg_the_third::Rational) -> Option<(i32, i32)> {
+    if rate.numerator() > 0 && rate.denominator() > 0 {
+        Some((rate.numerator(), rate.denominator()))
+    } else {
+        None
+    }
+}
+
+fn selected_video_rate(
+    avg_rate: ffmpeg_the_third::Rational,
+    stream_rate: ffmpeg_the_third::Rational,
+) -> Option<(i32, i32)> {
+    sane_video_rate(avg_rate).or_else(|| sane_video_rate(stream_rate))
+}
+
+fn force_software_decode_for_stable_playback(codec_id: ffmpeg_the_third::codec::Id) -> bool {
+    matches!(
+        codec_id,
+        ffmpeg_the_third::codec::Id::WMV3 | ffmpeg_the_third::codec::Id::VC1
+    )
+}
+
 fn packet_timestamp(packet: &ffmpeg_the_third::Packet) -> Option<i64> {
     packet.pts().or_else(|| packet.dts())
 }
@@ -385,28 +407,17 @@ fn run_decoder(
     let video_stream_idx = video_stream.index();
     let video_time_base = video_stream.time_base();
     let video_params = video_stream.parameters();
-    let video_avg_fps = {
-        let r = video_stream.avg_frame_rate();
-        let d = r.denominator();
-        if d == 0 {
-            0.0
-        } else {
-            r.numerator() as f64 / d as f64
-        }
+    let (video_fps_num, video_fps_den) =
+        selected_video_rate(video_stream.avg_frame_rate(), video_stream.rate())
+            .map(|(n, d)| (n as u32, d as u32))
+            .unwrap_or((0u32, 0u32));
+    let video_avg_fps = if video_fps_num == 0 || video_fps_den == 0 {
+        0.0
+    } else {
+        video_fps_num as f64 / video_fps_den as f64
     };
     // VPP ContentDesc に渡す raw 分数 (= num/den のまま渡すことで丸め誤差を排除)。
     // 0 の場合は VPP 側で 60/1 にフォールバックされる。
-    let (video_fps_num, video_fps_den) = {
-        let r = video_stream.avg_frame_rate();
-        let n = r.numerator();
-        let d = r.denominator();
-        if n <= 0 || d <= 0 {
-            (0u32, 0u32)
-        } else {
-            (n as u32, d as u32)
-        }
-    };
-
     let video_params_owned = match clone_codec_parameters(&video_params) {
         Ok(p) => p,
         Err(e) => {
@@ -425,7 +436,14 @@ fn run_decoder(
     // 出力は av_hwframe_transfer_data で CPU readback する旧経路。
     let codec_id = video_params_owned.id();
     let stream_codec_name = codec_id.name().to_string();
-    let opened_video_result = if hw_decode_requested {
+    let force_sw_decode = force_software_decode_for_stable_playback(codec_id);
+    if hw_decode_requested && force_sw_decode {
+        crate::logger::log(format!(
+            "HW: disabled D3D11VA for codec={stream_codec_name} reason=stable_playback_legacy_wmv_vc1"
+        ));
+    }
+    let effective_hw_decode_requested = hw_decode_requested && !force_sw_decode;
+    let opened_video_result = if effective_hw_decode_requested {
         #[cfg(windows)]
         {
             open_video_decoder_with_candidates(
@@ -620,7 +638,7 @@ fn run_decoder(
     let _ = info_tx.send(Ok(info));
 
     crate::logger::log(format!(
-        "video decoder: codec={stream_codec_name} decoder={video_decoder_name} hw_requested={hw_decode_requested} d3d11va_supported={} hw_active_initially={hw_active_initially} gpu_path={gpu_path_active} d3d11va_config={}",
+        "video decoder: codec={stream_codec_name} decoder={video_decoder_name} hw_requested={hw_decode_requested} hw_effective={effective_hw_decode_requested} d3d11va_supported={} hw_active_initially={hw_active_initially} gpu_path={gpu_path_active} d3d11va_config={}",
         hw_probe.d3d11va_supported, hw_probe.d3d11va_config
     ));
 
@@ -2571,7 +2589,10 @@ fn try_gpu_blit_path(
 
 #[cfg(test)]
 mod decoder_candidate_tests {
-    use super::{DecoderChoice, normalize_audio_input_layout, preferred_video_decoders};
+    use super::{
+        DecoderChoice, force_software_decode_for_stable_playback, normalize_audio_input_layout,
+        preferred_video_decoders, selected_video_rate,
+    };
     use ffmpeg_the_third::ChannelLayout;
     use ffmpeg_the_third::codec::Id;
 
@@ -2631,5 +2652,22 @@ mod decoder_candidate_tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].choice, DecoderChoice::Default);
         assert!(candidates[0].allow_sw_fallback);
+    }
+
+    #[test]
+    fn wmv3_and_vc1_force_software_decode_for_stability() {
+        assert!(force_software_decode_for_stable_playback(Id::WMV3));
+        assert!(force_software_decode_for_stable_playback(Id::VC1));
+        assert!(!force_software_decode_for_stable_playback(Id::H264));
+        assert!(!force_software_decode_for_stable_playback(Id::HEVC));
+    }
+
+    #[test]
+    fn video_rate_falls_back_to_stream_rate_when_average_is_missing() {
+        let rate = selected_video_rate(
+            ffmpeg_the_third::Rational(0, 0),
+            ffmpeg_the_third::Rational(24, 1),
+        );
+        assert_eq!(rate, Some((24, 1)));
     }
 }
