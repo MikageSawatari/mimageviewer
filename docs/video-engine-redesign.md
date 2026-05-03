@@ -1271,3 +1271,16 @@ Follow-up diagnostics for remaining visual hitch reports:
   root input, fullscreen viewport, menus/dialogs, toolbar/input, search bars,
   grid, and post-grid costs. Use this together with `video/display_miss` to
   distinguish decoder/pacing drops from UI-thread repaint stalls.
+
+## Phase 9.K: Audio clock callback-rate cap follow-up (2026-05-03)
+
+The Phase 9.A wall-rate cap originally allowed each continuous audio-clock
+update to advance by `wall_dt + 5ms`. That fixed long wall-clock extrapolation
+catch-up, but it also made the tolerance callback-rate dependent: on short
+WASAPI/cpal periods the extra 5ms could be granted many times per second, so
+the audio master clock advanced at roughly 1.3x-1.4x real time and video paced
+to that faster clock.
+
+The cap is now expressed as a small rate multiplier (`wall_dt * 1.02`) instead
+of a fixed per-callback slack. This preserves a little scheduling tolerance
+without letting short audio callbacks accumulate extra clock time.

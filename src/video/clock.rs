@@ -263,11 +263,13 @@ impl AvClock {
     /// で正確化済 (= bookkeeping バグ自体が消えた)。理論的には cap 不要だが、
     /// **buffer 非空での stream pre-fill burst** (= pump thread が `stream.play()`
     /// より先に samples を push してしまうケース) では、callback が wall より速く
-    /// 連続 pop して `real_consumed` が wall 進行を超える可能性が残る (Codex P? 指摘)。
+    /// 連続 pop して `real_consumed` が wall 進行を超える可能性が残る。
+    /// 2026-05-03 の実機ログでは、旧式の固定 5ms slack が短周期 callback ごとに
+    /// 再付与され、audio master が約 1.39x で進むケースが確認された。
     ///
     /// そのため cap は **defensive safety net** として保持する:
     /// - 通常動作では `pts_secs - prev.pts_secs ≈ wall_dt` で cap 無効
-    /// - pre-fill burst 等の異常系で `wall_dt + 5ms` を超える進行を頭打ち
+    /// - pre-fill burst 等の異常系で `wall_dt * 1.02` を超える進行を頭打ち
     /// - コスト: 1 atomic load + Instant::now + 比較 ≈ 数十 ns (RT 影響無視できる)
     ///
     /// 実機 perf-log smoke で「pace/wall ≈ 1.0 (= cap 無発動)」を確認できた段階で、
@@ -283,11 +285,16 @@ impl AvClock {
         // wall-rate cap: defensive safety net (詳細は doc コメント参照)。
         let capped = if matches!(prev.source, ClockSource::Audio) {
             // 前回 anchor が Audio source = 連続的 audio update。wall 経過量で cap。
+            //
+            // 旧実装は `wall_dt + 5ms` を許容していたが、WASAPI/cpal callback が
+            // 小さい間隔で続く環境では、その 5ms が callback ごとに積み上がって
+            // audio master clock が 1.3x 以上で進むことがあった。許容は固定値ではなく
+            // wall 経過に対する小さい倍率にして、短周期 callback でも累積しないようにする。
             let wall_dt = wall
                 .saturating_duration_since(prev.wall_at_anchor)
                 .as_secs_f64();
-            const JITTER_TOLERANCE_SECS: f64 = 0.005;
-            let max_advance = wall_dt + JITTER_TOLERANCE_SECS;
+            const MAX_AUDIO_CLOCK_RATE: f64 = 1.02;
+            let max_advance = wall_dt * MAX_AUDIO_CLOCK_RATE;
             (pts_secs - prev.pts_secs).min(max_advance).max(0.0) + prev.pts_secs
         } else {
             // 前回 Wall/Frozen → audio 起動直後 / seek 直後の起点。cap 無効化
