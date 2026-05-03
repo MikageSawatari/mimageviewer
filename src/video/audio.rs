@@ -469,6 +469,10 @@ fn run_pump(
     // 旧 10 秒では H264 HW decode の 1-2 秒 Buffering で頻繁に overflow していた。
     const RAW_WARNING_SECS: f64 = 15.0;
     const RAW_OVERFLOW_SECS: f64 = 30.0;
+    // Explicit seek/open targets should not build a multi-second pre-VST
+    // backlog. If they do, the audio master clock advances only as that
+    // backlog drains and video playback looks artificially slow.
+    const RAW_SEEK_SOFT_CAP_SECS: f64 = 2.0;
     // ── 自律 refill tick (Codex 助言、2026-05-01) ──
     // `recv_timeout` の値。audio_rx が空でも pump をこの間隔で起こし、processed を
     // raw_pending から自律補充する。cpal の典型的な callback 間隔 (10ms) より短く取り、
@@ -513,6 +517,7 @@ fn run_pump(
     // Fast で Buffering→Playing 入場時に anchor が keyframe_pts に巻き戻り、
     // notify_seek_completed(target) で立てた anchor が上書きされていた。
     let mut pump_anchor_target_secs: Option<f64> = None;
+    let mut seek_soft_reanchor_serial: Option<u64> = None;
     let mut last_warning_at: Option<std::time::Instant> = None;
 
     while !cancel.load(Ordering::Acquire) {
@@ -560,6 +565,7 @@ fn run_pump(
                 // None フォールバック: 失敗 seek / 初期 open など、target が無い場合は
                 // BufferReady で audible_pts をそのまま使う。
                 pump_anchor_target_secs = frame.seek_target_secs;
+                seek_soft_reanchor_serial = None;
                 activated = false; // 再度 audio master を試す
             }
 
@@ -571,7 +577,8 @@ fn run_pump(
             // ── raw_pending に積む + seek serial 切替を 1 lock で処理 ──
             let frame_pts_secs = frame.pts_secs;
             let frame_seek_target_secs = frame.seek_target_secs;
-            let mut reanchored_after_overflow = false;
+            let mut raw_reanchor_reason: Option<&'static str> = None;
+            let mut raw_reanchor_threshold_secs = RAW_OVERFLOW_SECS;
             let raw_total_secs = {
                 let mut buf = buffer.lock().unwrap();
 
@@ -598,34 +605,66 @@ fn run_pump(
                 let raw_secs: f64 = buf.raw_pending.iter().map(|f| f.duration_secs).sum::<f64>()
                     + frame.duration_secs;
 
-                if raw_secs > RAW_OVERFLOW_SECS {
+                let seek_soft_reanchor = frame_seek_target_secs.is_some()
+                    && seek_soft_reanchor_serial != Some(frame_seek_serial)
+                    && raw_secs > RAW_SEEK_SOFT_CAP_SECS;
+                let raw_overflow = raw_secs > RAW_OVERFLOW_SECS;
+
+                if raw_overflow || seek_soft_reanchor {
                     buf.processed.clear();
                     buf.drain_offset_in_first = 0;
                     buf.raw_pending.clear();
                     buf.next_pts_secs = frame_pts_secs;
                     buf.raw_pending.push_back(frame);
                     publish_buffer_secs(&buf, &clock);
-                    reanchored_after_overflow = true;
+                    if raw_overflow {
+                        raw_reanchor_reason = Some("overflow");
+                        raw_reanchor_threshold_secs = RAW_OVERFLOW_SECS;
+                    } else {
+                        raw_reanchor_reason = Some("seek soft cap");
+                        raw_reanchor_threshold_secs = RAW_SEEK_SOFT_CAP_SECS;
+                    }
                 } else {
                     buf.raw_pending.push_back(frame);
+                    if frame_seek_target_secs.is_some()
+                        && seek_soft_reanchor_serial == Some(frame_seek_serial)
+                        && raw_secs > RAW_SEEK_SOFT_CAP_SECS
+                    {
+                        let mut capped_raw_secs = raw_secs;
+                        while capped_raw_secs > RAW_SEEK_SOFT_CAP_SECS {
+                            let Some(dropped) = buf.raw_pending.pop_front() else {
+                                break;
+                            };
+                            capped_raw_secs -= dropped.duration_secs;
+                        }
+                        if buf.processed.is_empty() && buf.drain_offset_in_first == 0 {
+                            if let Some(front) = buf.raw_pending.front() {
+                                buf.next_pts_secs = front.pts_secs;
+                            }
+                        }
+                        publish_buffer_secs(&buf, &clock);
+                    }
                 }
                 raw_secs
             };
 
             // ── overflow / warning 通知 ──
-            if reanchored_after_overflow {
+            if let Some(raw_reanchor_reason) = raw_reanchor_reason {
                 // Newer behavior: keep this seek generation alive. Clear the
                 // queued backlog and treat the current frame as the new audio
                 // anchor, which lets old AVI/DivX files recover after seek.
                 crate::logger::log(format!(
-                    "[audio-pump] raw_pending overflow ({:.1}s > {:.1}s threshold) at \
-                     seek_serial={frame_seek_serial}: re-anchor at {:.3}s",
-                    raw_total_secs, RAW_OVERFLOW_SECS, frame_pts_secs,
+                    "[audio-pump] raw_pending {raw_reanchor_reason} ({:.1}s > {:.1}s threshold) \
+                     at seek_serial={frame_seek_serial}: re-anchor at {:.3}s",
+                    raw_total_secs, raw_reanchor_threshold_secs, frame_pts_secs,
                 ));
                 clock.zero_audio_tx_queued_secs();
                 seek_target_secs = Some(frame_pts_secs);
                 if pump_anchor_target_secs.is_none() {
                     pump_anchor_target_secs = frame_seek_target_secs.or(Some(frame_pts_secs));
+                }
+                if raw_reanchor_reason == "seek soft cap" {
+                    seek_soft_reanchor_serial = Some(frame_seek_serial);
                 }
                 #[cfg(windows)]
                 if let Some(b) = &dsp_bridge {

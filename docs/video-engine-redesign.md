@@ -1179,6 +1179,15 @@ The remaining structural improvement is optional back-pressure on `audio_rx`
 while `raw_pending` is above a soft cap. Keep that as a follow-up if high-water
 logs remain frequent on normal files.
 
+2026-05-03 follow-up: explicit seek/open targets now apply that soft cap during
+the affected seek generation. If pre-VST `raw_pending` exceeds 2 seconds, the
+pump re-anchors once at the current audio frame, clears the old backlog, resets
+the VST chain, and then keeps trimming the oldest raw frames so the pump-local
+raw queue stays near the cap. This avoids blocking demux/video packet flow while
+preventing old WMV/WMA and similar files from accumulating 7-9 seconds of raw
+audio after seek, which previously made the audio master clock advance below
+real time and forced video pacing to stutter.
+
 ## Phase 9.I: WMV/ASF frame-rate metadata fallback (2026-05-03)
 
 Some ASF/WMV files report `avg_frame_rate=0/0` while still carrying a usable
