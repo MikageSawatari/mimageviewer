@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <cstdio>
@@ -14,6 +15,7 @@
 #include <functional>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -231,6 +233,9 @@ using namespace Steinberg;
 
 namespace {
 constexpr UINT kPluginGuiThreadTaskMsg = WM_APP + 0x4D1;
+constexpr auto kGuiQueryTimeout = std::chrono::milliseconds(2000);
+constexpr auto kGuiShowTimeout = std::chrono::milliseconds(3000);
+constexpr auto kGuiMutationTimeout = std::chrono::milliseconds(1000);
 }
 
 class PluginGuiThread {
@@ -249,8 +254,11 @@ public:
     }
 
     template <typename Fn>
-    auto invoke_sync(Fn&& fn) -> decltype(fn()) {
+    auto invoke_sync_for(std::chrono::milliseconds timeout,
+                         const char* label,
+                         Fn&& fn) -> std::optional<decltype(fn())> {
         using R = decltype(fn());
+        static_assert(!std::is_void_v<R>, "use invoke_void_sync_for for void tasks");
         if (is_current_thread()) {
             return fn();
         }
@@ -261,11 +269,39 @@ public:
         post_task([task]() {
             (*task)();
         });
-        if constexpr (std::is_void_v<R>) {
-            future.get();
-        } else {
-            return future.get();
+        if (future.wait_for(timeout) != std::future_status::ready) {
+            blog("plugin GUI task timeout label=%s gui_tid=%lu timeout_ms=%llu",
+                 label ? label : "(unknown)",
+                 thread_id_.load(std::memory_order_acquire),
+                 static_cast<unsigned long long>(timeout.count()));
+            return std::nullopt;
         }
+        return future.get();
+    }
+
+    bool invoke_void_sync_for(std::chrono::milliseconds timeout,
+                              const char* label,
+                              std::function<void()> fn) {
+        if (is_current_thread()) {
+            fn();
+            return true;
+        }
+
+        ensure_started();
+        auto task = std::make_shared<std::packaged_task<void()>>(std::move(fn));
+        auto future = task->get_future();
+        post_task([task]() {
+            (*task)();
+        });
+        if (future.wait_for(timeout) != std::future_status::ready) {
+            blog("plugin GUI task timeout label=%s gui_tid=%lu timeout_ms=%llu",
+                 label ? label : "(unknown)",
+                 thread_id_.load(std::memory_order_acquire),
+                 static_cast<unsigned long long>(timeout.count()));
+            return false;
+        }
+        future.get();
+        return true;
     }
 
     void post_async(std::function<void()> fn) {
@@ -401,6 +437,18 @@ private:
     std::deque<std::function<void()>> tasks_;
 };
 
+struct GuiSizeQueryResult {
+    bool ok = false;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool resizable = false;
+};
+
+struct GuiShowResult {
+    bool ok = false;
+    std::string error;
+};
+
 PluginLoader::PluginLoader() {
     host_app_ = owned(new HostApplication);
     component_handler_ = owned(new ComponentHandler);
@@ -411,6 +459,8 @@ PluginLoader::~PluginLoader() {
     unload();
 }
 
+// The bridge/control thread owns lazy creation. GUI-thread callers should only
+// reach this after the helper already exists.
 PluginGuiThread& PluginLoader::gui_thread() {
     if (!gui_thread_) {
         gui_thread_ = std::make_unique<PluginGuiThread>();
@@ -788,9 +838,17 @@ bool PluginLoader::process_block(const float* input, float* output, uint32_t num
 
 bool PluginLoader::get_gui_size(uint32_t& width_out, uint32_t& height_out) {
     if (!is_gui_thread()) {
-        return gui_thread().invoke_sync([&]() -> bool {
-            return get_gui_size(width_out, height_out);
+        auto result = gui_thread().invoke_sync_for(kGuiQueryTimeout, "get_gui_size", [this]() {
+            GuiSizeQueryResult out{};
+            out.ok = get_gui_size(out.width, out.height);
+            return out;
         });
+        if (!result || !result->ok) {
+            return false;
+        }
+        width_out = result->width;
+        height_out = result->height;
+        return true;
     }
 
     // 既存 view_ から純粋に getSize する (= scale 設定を変更しない)。
@@ -818,9 +876,18 @@ bool PluginLoader::get_gui_size(uint32_t& width_out, uint32_t& height_out) {
 bool PluginLoader::query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint32_t& height_out,
                                           bool& resizable_out) {
     if (!is_gui_thread()) {
-        return gui_thread().invoke_sync([&]() -> bool {
-            return query_gui_size_at_dpi(dpi, width_out, height_out, resizable_out);
+        auto result = gui_thread().invoke_sync_for(kGuiQueryTimeout, "query_gui_size_at_dpi", [this, dpi]() {
+            GuiSizeQueryResult out{};
+            out.ok = query_gui_size_at_dpi(dpi, out.width, out.height, out.resizable);
+            return out;
         });
+        if (!result || !result->ok) {
+            return false;
+        }
+        width_out = result->width;
+        height_out = result->height;
+        resizable_out = result->resizable;
+        return true;
     }
 
     // 一時 view を作り、指定 DPI の scale を伝えてから getSize → 破棄。
@@ -851,9 +918,19 @@ bool PluginLoader::query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint
 
 bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::string& error_out) {
     if (!is_gui_thread()) {
-        return gui_thread().invoke_sync([&]() -> bool {
-            return show_gui(options, visible, error_out);
-        });
+        GuiWindowOptions options_copy = options;
+        auto result = gui_thread().invoke_sync_for(
+            kGuiShowTimeout, "show_gui", [this, options_copy, visible]() mutable {
+                GuiShowResult out{};
+                out.ok = show_gui(options_copy, visible, out.error);
+                return out;
+            });
+        if (!result) {
+            error_out = "show_gui timed out";
+            return false;
+        }
+        error_out = result->error;
+        return result->ok;
     }
 
     blog("show_gui start gui_tid=%lu owner=0x%llx visible=%d",
@@ -986,7 +1063,7 @@ void PluginLoader::set_user_resizing(bool active) {
         if (!gui_thread_) {
             return;
         }
-        gui_thread().invoke_sync([&]() {
+        gui_thread().post_async([this, active]() {
             set_user_resizing(active);
         });
         return;
@@ -1027,7 +1104,7 @@ void PluginLoader::set_gui_surface_visible_state(bool visible) {
         if (!gui_thread_) {
             return;
         }
-        gui_thread().invoke_sync([&]() {
+        gui_thread().post_async([this, visible]() {
             set_gui_surface_visible_state(visible);
         });
         return;
@@ -1041,9 +1118,10 @@ bool PluginLoader::gui_surface_should_show() {
         if (!gui_thread_) {
             return false;
         }
-        return gui_thread().invoke_sync([&]() -> bool {
+        auto result = gui_thread().invoke_sync_for(kGuiQueryTimeout, "gui_surface_should_show", [this]() {
             return gui_surface_should_show();
         });
+        return result.value_or(false);
     }
 
     return gui_surface_visible_ && gui_app_active_;
@@ -1084,7 +1162,7 @@ void PluginLoader::refresh_gui_surface_now() {
         if (!gui_thread_) {
             return;
         }
-        gui_thread().invoke_sync([&]() {
+        gui_thread().post_async([this]() {
             refresh_gui_surface_now();
         });
         return;
@@ -1093,7 +1171,7 @@ void PluginLoader::refresh_gui_surface_now() {
     refresh_gui_surface(view_container_hwnd_);
 }
 
-void* PluginLoader::gui_container_hwnd() {
+void* PluginLoader::gui_container_hwnd() const {
     return view_container_hwnd_snapshot_.load(std::memory_order_acquire);
 }
 
@@ -1102,7 +1180,7 @@ void PluginLoader::set_gui_visible(bool visible) {
         if (!gui_thread_) {
             return;
         }
-        gui_thread().invoke_sync([&]() {
+        gui_thread().post_async([this, visible]() {
             set_gui_visible(visible);
         });
         return;
@@ -1128,7 +1206,7 @@ void PluginLoader::set_gui_topmost(bool topmost) {
         if (!gui_thread_) {
             return;
         }
-        gui_thread().invoke_sync([&]() {
+        gui_thread().post_async([this, topmost]() {
             set_gui_topmost(topmost);
         });
         return;
@@ -1156,7 +1234,7 @@ void PluginLoader::set_gui_owner(void* owner_hwnd) {
         if (!gui_thread_) {
             return;
         }
-        gui_thread().invoke_sync([&]() {
+        gui_thread().post_async([this, owner_hwnd]() {
             set_gui_owner(owner_hwnd);
         });
         return;
@@ -1194,7 +1272,7 @@ void PluginLoader::set_gui_app_active(bool active) {
         if (!gui_thread_) {
             return;
         }
-        gui_thread().invoke_sync([&]() {
+        gui_thread().post_async([this, active]() {
             set_gui_app_active(active);
         });
         return;
@@ -1235,7 +1313,10 @@ void PluginLoader::set_gui_app_active(bool active) {
 
 void PluginLoader::handle_editor_window_size() {
     if (!is_gui_thread()) {
-        gui_thread().invoke_sync([&]() {
+        if (!gui_thread_) {
+            return;
+        }
+        gui_thread().post_async([this]() {
             handle_editor_window_size();
         });
         return;
@@ -1268,7 +1349,10 @@ void PluginLoader::handle_editor_window_size() {
 
 void PluginLoader::handle_editor_drag_start() {
     if (!is_gui_thread()) {
-        gui_thread().invoke_sync([&]() {
+        if (!gui_thread_) {
+            return;
+        }
+        gui_thread().post_async([this]() {
             handle_editor_drag_start();
         });
         return;
@@ -1314,7 +1398,10 @@ void PluginLoader::handle_editor_drag_start() {
 
 void PluginLoader::handle_editor_drag_tick(uint32_t msg) {
     if (!is_gui_thread()) {
-        gui_thread().invoke_sync([&]() {
+        if (!gui_thread_) {
+            return;
+        }
+        gui_thread().post_async([this, msg]() {
             handle_editor_drag_tick(msg);
         });
         return;
@@ -1349,7 +1436,10 @@ void PluginLoader::handle_editor_drag_tick(uint32_t msg) {
 
 void PluginLoader::handle_editor_drag_end() {
     if (!is_gui_thread()) {
-        gui_thread().invoke_sync([&]() {
+        if (!gui_thread_) {
+            return;
+        }
+        gui_thread().post_async([this]() {
             handle_editor_drag_end();
         });
         return;
@@ -1409,7 +1499,7 @@ void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
         if (!gui_thread_) {
             return;
         }
-        gui_thread().invoke_sync([&]() {
+        gui_thread().post_async([this, width, height]() {
             notify_host_resize(width, height);
         });
         return;
@@ -1455,10 +1545,12 @@ void PluginLoader::hide_gui() {
         if (!gui_thread_) {
             return;
         }
-        gui_thread_->invoke_sync([&]() {
+        bool completed = gui_thread_->invoke_void_sync_for(kGuiMutationTimeout, "hide_gui", [this]() {
             hide_gui();
         });
-        gui_thread_.reset();
+        if (completed) {
+            gui_thread_.reset();
+        }
         return;
     }
 

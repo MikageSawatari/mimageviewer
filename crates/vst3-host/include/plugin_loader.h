@@ -140,7 +140,7 @@ public:
     void set_gui_owner(void* owner_hwnd);
     /// Relay mIV app activation to the bridge-owned plugin surface.
     void set_gui_app_active(bool active);
-    void* gui_container_hwnd();
+    void* gui_container_hwnd() const;
     /// Helpers for chain-level batched show/hide and z-order updates.
     void set_gui_surface_visible_state(bool visible);
     bool gui_surface_should_show();

@@ -148,6 +148,15 @@ Design rules:
   Fire-and-forget operations (`set_gui_visible`, `set_gui_topmost`,
   `set_gui_app_active`, `notify_host_resize`) are posted and coalesced where
   possible.
+- Synchronous GUI marshals are bounded. If a plugin blocks inside editor
+  `attached`, `getSize`, or another required reply path, the bridge logs a
+  `plugin GUI task timeout ... gui_tid=...` line and returns an error instead of
+  blocking chain initialization or the control IPC thread indefinitely.
+- Void GUI mutations stay asynchronous. During a native editor move/resize
+  modal loop, thread messages may not be drained until the drag ends, so
+  `set_user_resizing`, visibility/topmost/owner changes, app-active updates,
+  resize notifications, and drag diagnostics must not wait on the slot GUI
+  thread.
 - Do not use raw cross-thread `SendMessage` from the bridge main/control thread
   to a slot GUI thread. Use `PostMessage` plus a completion object, or
   `SendMessageTimeout` with a short timeout if a Win32 message is unavoidable.
