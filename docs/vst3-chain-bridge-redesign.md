@@ -191,7 +191,10 @@ Design rules:
   batching, it reads a small thread-safe snapshot from each slot.
 - Hidden prewarm remains enabled: editors are still attached during chain load
   with `visible=false`. The refactor should remove ongoing hidden-editor
-  contention without reintroducing lazy-attach first-show stalls.
+  contention without reintroducing lazy-attach first-show stalls. Compatibility
+  exceptions are allowed for plugins that are known to work in normal DAWs but
+  hang during mIV hidden prewarm; SSL Meter Pro currently skips hidden prewarm
+  and uses visible attach when the user opens the VST panel.
 - `query_state` / `restore_state` currently use the bridge audio-thread fence to
   avoid racing VST3 `process`. Keep that ownership explicit during the GUI
   thread refactor. If a plugin proves to require GUI-thread state I/O, add a

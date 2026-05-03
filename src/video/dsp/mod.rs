@@ -1032,7 +1032,27 @@ impl DspBridge {
     }
 
     fn prewarm_slot_gui(&self, idx: usize) -> Result<(), String> {
+        if let Some(reason) = self.slot_visible_attach_required_reason(idx) {
+            crate::logger::log(format!(
+                "[VST3 GUI] hidden prewarm skipped for slot {idx}: {reason}"
+            ));
+            return Ok(());
+        }
         self.ensure_slot_gui_attached(idx, false, false)
+    }
+
+    fn slot_visible_attach_required_reason(&self, idx: usize) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        let slot = inner.slots.get(idx)?;
+        let name = slot.plugin_name.as_deref().unwrap_or_default();
+        let key = format!("{} {}", slot.plugin_path, name).to_ascii_lowercase();
+        if key.contains("ssl meter pro") {
+            return Some(
+                "SSL Meter Pro is compatible with visible editor attach, but hangs during hidden prewarm in mIV"
+                    .to_string(),
+            );
+        }
+        None
     }
 
     pub fn show_slot_gui(&self, idx: usize) -> Result<(), String> {
@@ -1355,7 +1375,9 @@ impl DspBridge {
                         shown_hwnds.push(hwnd);
                     }
                     ShowAction::Create => {
-                        let _ = self.ensure_slot_gui_attached(idx, false, true);
+                        let needs_visible_attach =
+                            self.slot_visible_attach_required_reason(idx).is_some();
+                        let _ = self.ensure_slot_gui_attached(idx, needs_visible_attach, true);
                         let hwnd = {
                             let mut inner = self.inner.lock().unwrap();
                             if let Some(slot) = inner.slots.get_mut(idx) {
