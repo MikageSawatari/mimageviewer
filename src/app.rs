@@ -10436,6 +10436,18 @@ impl App {
     pub(crate) fn close_fullscreen(&mut self) {
         // フルスクリーン解除前に動画再生位置を保存 (drop で消える前に)
         self.save_all_video_resume_positions();
+        #[cfg(windows)]
+        if self.show_vst3_manager || self.settings.vst3_gui_visible {
+            // The normal per-frame fullscreen-state watcher also hides VST
+            // editors, but doing it here keeps bridge-owned plugin surfaces
+            // from lingering for a frame after the fullscreen viewport closes.
+            self.dsp_bridge.set_all_guis_visible(false);
+            self.show_vst3_manager = false;
+            if self.settings.vst3_gui_visible {
+                self.settings.vst3_gui_visible = false;
+                self.settings.save();
+            }
+        }
         // Phase 8.B': 動画ピン留めが変更されていたら現在フォルダを再ロードして
         // グリッドサムネに反映 (= ピンの WebP がグリッド表示に出る)。
         if std::mem::take(&mut self.video_thumb_overrides_dirty) {

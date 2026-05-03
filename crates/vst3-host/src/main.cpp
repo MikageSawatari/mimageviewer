@@ -541,15 +541,19 @@ private:
                 return true;
             }
             uint32_t w = 0, h = 0;
+            const uint64_t container_hwnd =
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(loader->gui_container_hwnd()));
             if (loader->get_gui_size(w, h)) {
                 std::string reply = "{\"event\":\"gui_attached\",\"width\":" +
                                     std::to_string(w) + ",\"height\":" +
                                     std::to_string(h) +
-                                    ",\"slot_id\":" + std::to_string(slot_id) + "}";
+                                    ",\"slot_id\":" + std::to_string(slot_id) +
+                                    ",\"container_hwnd\":" + std::to_string(container_hwnd) + "}";
                 write_message(reply);
             } else {
                 std::string reply = "{\"event\":\"gui_attached\",\"width\":0,\"height\":0,\"slot_id\":" +
-                                    std::to_string(slot_id) + "}";
+                                    std::to_string(slot_id) +
+                                    ",\"container_hwnd\":" + std::to_string(container_hwnd) + "}";
                 write_message(reply);
             }
             return true;

@@ -202,6 +202,8 @@ pub enum Event {
         height: u32,
         #[serde(default)]
         slot_id: u64,
+        #[serde(default)]
+        container_hwnd: u64,
     },
     GuiDetached,
     /// プラグインの推奨 GUI サイズ (query_gui_size の応答)。
