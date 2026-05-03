@@ -12707,6 +12707,7 @@ impl App {
 
     pub(crate) fn poll_video(&mut self, ctx: &egui::Context) {
         let mut next_repaint: Option<std::time::Duration> = None;
+        let mut request_repaint_now = false;
         // 5 秒ごとに動画再生位置を settings に書き戻す (drop 漏れ救済)。
         let now = std::time::Instant::now();
         let do_save = self
@@ -12719,15 +12720,17 @@ impl App {
             if let FsCacheEntry::Video { player, .. } = entry {
                 player.set_loop_enabled(loop_enabled);
                 if let Some(d) = player.tick(ctx) {
-                    let d = if player.is_playing() {
-                        d.min(std::time::Duration::from_millis(16))
+                    if player.is_playing() && d <= std::time::Duration::from_millis(20) {
+                        // request_repaint_after(16ms) can wake one timer tick late on 60fps
+                        // playback. Request the repaint directly so the event loop can catch
+                        // the next vsync instead of turning a full buffer into display misses.
+                        request_repaint_now = true;
                     } else {
-                        d
-                    };
-                    next_repaint = Some(match next_repaint {
-                        Some(prev) => prev.min(d),
-                        None => d,
-                    });
+                        next_repaint = Some(match next_repaint {
+                            Some(prev) => prev.min(d),
+                            None => d,
+                        });
+                    }
                 }
                 if do_save {
                     let path_key = crate::adjustment_db::normalize_path(player.path());
@@ -12746,7 +12749,9 @@ impl App {
                 );
             }
         }
-        if let Some(d) = next_repaint {
+        if request_repaint_now {
+            ctx.request_repaint();
+        } else if let Some(d) = next_repaint {
             ctx.request_repaint_after(d);
         }
     }

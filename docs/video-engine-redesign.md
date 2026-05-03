@@ -1343,3 +1343,11 @@ which causes AV drift after W-key seek-to-start. Video still clears the override
 for video-only playback via the fallback anchor, but audio-bearing playback now
 waits for `fill_output` to call `clear_seek_target_override` when it actually
 publishes post-seek audio.
+
+2026-05-04 follow-up: after sync was stable, remaining red perf-graph ticks were
+mostly UI display misses rather than decoder drops (`decoder_skips=0` with a
+full render buffer). For 60fps playback, `request_repaint_after(16ms)` can wake
+one OS timer tick late and miss a vsync. While a video is playing and the next
+frame is due within one frame interval, mIV now requests an immediate repaint so
+egui/winit can schedule the next vsync directly. Paused and long-delay states
+still use delayed repaint requests.
