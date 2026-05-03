@@ -505,13 +505,20 @@ BridgeEditorWindows create_bridge_view_container(const miv::GuiWindowOptions& op
     UINT dpi = owner_hwnd ? GetDpiForWindow(owner_hwnd) : GetDpiForSystem();
     if (dpi == 0) dpi = 96;
     const int title_h = std::max(28, MulDiv(34, static_cast<int>(dpi), 96));
-    RECT outer{0,
-               0,
-               static_cast<LONG>(std::max<uint32_t>(1, options.width)),
-               static_cast<LONG>(std::max<uint32_t>(1, options.height)) + title_h};
-    AdjustWindowRectExForDpi(&outer, style, FALSE, ex_style, dpi);
-    const int width = std::max<LONG>(1, outer.right - outer.left);
-    const int height = std::max<LONG>(1, outer.bottom - outer.top);
+    int width = 0;
+    int height = 0;
+    if (options.has_initial_size && options.outer_width > 0 && options.outer_height > 0) {
+        width = static_cast<int>(std::max<uint32_t>(1, options.outer_width));
+        height = static_cast<int>(std::max<uint32_t>(1, options.outer_height));
+    } else {
+        RECT outer{0,
+                   0,
+                   static_cast<LONG>(std::max<uint32_t>(1, options.width)),
+                   static_cast<LONG>(std::max<uint32_t>(1, options.height)) + title_h};
+        AdjustWindowRectExForDpi(&outer, style, FALSE, ex_style, dpi);
+        width = std::max<LONG>(1, outer.right - outer.left);
+        height = std::max<LONG>(1, outer.bottom - outer.top);
+    }
     const int x = options.has_initial_pos ? options.x : CW_USEDEFAULT;
     const int y = options.has_initial_pos ? options.y : CW_USEDEFAULT;
     std::wstring title = utf8_to_wide(options.title);
@@ -550,7 +557,7 @@ BridgeEditorWindows create_bridge_view_container(const miv::GuiWindowOptions& op
     }
     layout_editor_child(container, plugin_host);
     apply_dark_editor_chrome(container);
-    blog("bridge editor window created gui_tid=%lu frame=0x%llx child=0x%llx owner=0x%llx pos=%d,%d client=%ux%u outer=%dx%d title_h=%d",
+    blog("bridge editor window created gui_tid=%lu frame=0x%llx child=0x%llx owner=0x%llx pos=%d,%d client=%ux%u outer=%dx%d title_h=%d restored_outer=%d",
          GetCurrentThreadId(),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container)),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(plugin_host)),
@@ -561,7 +568,8 @@ BridgeEditorWindows create_bridge_view_container(const miv::GuiWindowOptions& op
          options.height,
          width,
          height,
-         title_h);
+         title_h,
+         options.has_initial_size ? 1 : 0);
     return {container, plugin_host};
 }
 
@@ -1510,7 +1518,30 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
     // attached 後に推奨サイズで onSize を呼んで「このサイズで描画して」と通知する。
     // これも描画開始トリガとして必要なプラグインが多い。
     Steinberg::ViewRect rect{};
-    if (view_->getSize(&rect) == Steinberg::kResultOk) {
+    if (options.has_initial_size) {
+        if (HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
+            container_hwnd && IsWindow(container_hwnd)) {
+            layout_editor_child(container_hwnd, reinterpret_cast<HWND>(view_plugin_host_hwnd_));
+        }
+        HWND plugin_hwnd = reinterpret_cast<HWND>(view_plugin_host_hwnd_);
+        RECT client{};
+        if (plugin_hwnd && IsWindow(plugin_hwnd) && GetClientRect(plugin_hwnd, &client)) {
+            const uint32_t width = static_cast<uint32_t>(std::max<LONG>(1, client.right - client.left));
+            const uint32_t height = static_cast<uint32_t>(std::max<LONG>(1, client.bottom - client.top));
+            Steinberg::ViewRect restored_rect{0,
+                                              0,
+                                              static_cast<Steinberg::int32>(width),
+                                              static_cast<Steinberg::int32>(height)};
+            view_->onSize(&restored_rect);
+            last_gui_width_ = width;
+            last_gui_height_ = height;
+            blog("show_gui: onSize restored host size=%ux%u", width, height);
+        } else {
+            last_gui_width_ = 0;
+            last_gui_height_ = 0;
+            blog("show_gui: restored-size onSize failed");
+        }
+    } else if (view_->getSize(&rect) == Steinberg::kResultOk) {
         const int preferred_w = std::max<Steinberg::int32>(1, rect.right - rect.left);
         const int preferred_h = std::max<Steinberg::int32>(1, rect.bottom - rect.top);
         blog("show_gui: getSize=%dx%d, resize container, onSize", preferred_w, preferred_h);

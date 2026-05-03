@@ -195,6 +195,10 @@ pub(crate) struct PluginSlot {
     /// this session bridge surface move notifications are sent without the
     /// normal throttle so D3D editors do not visibly lag behind the host.
     pub gui_resize_session_active: bool,
+    /// Initial host-window outer size restored from settings. Used only before
+    /// the editor window is created; once `gui_hwnd != 0`, the HWND rect is the
+    /// source of truth.
+    pub desired_window_size: Option<(u32, u32)>,
 }
 
 impl DspBridge {
@@ -577,6 +581,7 @@ impl DspBridge {
         user_hidden: bool,
         initial_state: Option<&str>,
         initial_window_pos: Option<(i32, i32)>,
+        initial_window_size: Option<(u32, u32)>,
     ) -> Result<usize, String> {
         // enable 状態チェック (Mutex を保持しない)
         if !self.is_enabled() {
@@ -718,6 +723,7 @@ impl DspBridge {
             user_hidden,
             auto_bypassed_for_latency: false,
             desired_window_pos: initial_window_pos,
+            desired_window_size: initial_window_size,
             gui_host: None,
             gui_close_signal: None,
             gui_resize_signal: None,
@@ -1165,9 +1171,13 @@ impl DspBridge {
         // ─ Step 2: ホストウィンドウを spawn (resizable に応じてサイズ変更可否を切替) ─
         // 初期位置は slot に保持されている `desired_window_pos` を使う (= settings から
         // 復元した値、または前回終了時の値)。None なら OS 既定 (= 中央付近) で開く。
-        let initial_pos = {
+        let (initial_pos, initial_size) = {
             let inner = self.inner.lock().unwrap();
-            inner.slots.get(idx).and_then(|s| s.desired_window_pos)
+            inner
+                .slots
+                .get(idx)
+                .map(|s| (s.desired_window_pos, s.desired_window_size))
+                .unwrap_or((None, None))
         };
         let owner_hwnd = self.current_gui_owner_hwnd();
         if owner_hwnd == 0 {
@@ -1187,6 +1197,9 @@ impl DspBridge {
                 "has_initial_pos": if initial_pos.is_some() { 1 } else { 0 },
                 "x": initial_pos.map(|p| p.0).unwrap_or(0),
                 "y": initial_pos.map(|p| p.1).unwrap_or(0),
+                "has_initial_size": if initial_size.is_some() { 1 } else { 0 },
+                "outer_width": initial_size.map(|s| s.0).unwrap_or(0),
+                "outer_height": initial_size.map(|s| s.1).unwrap_or(0),
                 "title": plugin_name,
             }))
             .map_err(|e| format!("send ShowGui: {e}"))?;

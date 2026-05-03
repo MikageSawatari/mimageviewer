@@ -55,6 +55,9 @@ struct GuiWindowOptions {
     bool has_initial_pos = false;
     int32_t x = 0;
     int32_t y = 0;
+    bool has_initial_size = false;
+    uint32_t outer_width = 0;
+    uint32_t outer_height = 0;
     std::string title;
 };
 

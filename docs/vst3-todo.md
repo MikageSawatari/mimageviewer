@@ -392,5 +392,10 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
   been added, and the manager panel keeps placeholder rows from
   `settings.vst3_plugins` while the bridge is rebuilding. This avoids all-GUI
   hidden loads and prevents the plugin list from growing one row at a time.
+- Follow-up fix (2026-05-03): restored `gui_size` is now passed into the first
+  editor attach path as the saved host outer size. The bridge uses that restored
+  outer size instead of immediately resizing back to `IPlugView::getSize()`,
+  which preserves editor sizes for plugins such as The Snail that do not store
+  their editor size in the plugin state chunk.
 - Follow-up: add a small rename UI for slot names. Phase 1 keeps existing names
   on overwrite and gives empty slots default names such as `Slot 1`.

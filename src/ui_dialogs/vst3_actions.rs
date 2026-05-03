@@ -243,6 +243,7 @@ impl App {
                         entry.user_hidden,
                         entry.state.as_deref(),
                         entry.gui_pos,
+                        entry.gui_size,
                     ) {
                         crate::logger::log(format!(
                             "vst3 chain-rebuild add_plugin {} failed: {e}",

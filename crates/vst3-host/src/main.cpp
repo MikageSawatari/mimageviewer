@@ -792,6 +792,9 @@ private:
             options.has_initial_pos = extract_number_field(msg, "has_initial_pos") != 0;
             options.x = static_cast<int32_t>(extract_i64_field(msg, "x"));
             options.y = static_cast<int32_t>(extract_i64_field(msg, "y"));
+            options.has_initial_size = extract_number_field(msg, "has_initial_size") != 0;
+            options.outer_width = static_cast<uint32_t>(extract_number_field(msg, "outer_width"));
+            options.outer_height = static_cast<uint32_t>(extract_number_field(msg, "outer_height"));
             options.title = extract_string_field(msg, "title");
             const bool visible = extract_number_field(msg, "visible") != 0;
             std::string err;

@@ -233,6 +233,10 @@ settings.json に以下を保存する:
   GUI visibility only after all plugins have been added, and the manager panel
   uses `vst3_plugins` as disabled placeholder rows while the bridge rebuilds so
   the plugin list count stays stable.
+  A later 2026-05-03 follow-up also feeds saved `gui_size` into the initial
+  editor attach path as the host outer size. The bridge skips the immediate
+  `getSize()` resize-back in that case, so plugins that do not persist editor
+  size internally still reopen at the saved size.
 
 bridge プロトコル拡張 (= Phase 0b に追加):
 
