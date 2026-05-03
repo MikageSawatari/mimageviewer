@@ -26,6 +26,36 @@ use crossbeam_channel::{Receiver, Sender, bounded};
 
 use super::clock::AvClock;
 
+fn frame_best_effort_timestamp(raw: *const ffmpeg_the_third::ffi::AVFrame) -> Option<i64> {
+    if raw.is_null() {
+        return None;
+    }
+    let ts = unsafe { (*raw).best_effort_timestamp };
+    if ts == ffmpeg_the_third::ffi::AV_NOPTS_VALUE {
+        None
+    } else {
+        Some(ts)
+    }
+}
+
+fn video_frame_timestamp(frame: &ffmpeg_the_third::util::frame::Video) -> Option<i64> {
+    // SAFETY: We only read FFmpeg's timestamp field from a live frame borrowed
+    // by the decode loop; the frame remains valid for this call.
+    let raw = unsafe { frame.as_ptr() };
+    frame_best_effort_timestamp(raw).or_else(|| frame.pts())
+}
+
+fn audio_frame_timestamp(frame: &ffmpeg_the_third::util::frame::audio::Audio) -> Option<i64> {
+    // SAFETY: We only read FFmpeg's timestamp field from a live frame borrowed
+    // by the decode loop; the frame remains valid for this call.
+    let raw = unsafe { frame.as_ptr() };
+    frame_best_effort_timestamp(raw).or_else(|| frame.pts())
+}
+
+fn packet_timestamp(packet: &ffmpeg_the_third::Packet) -> Option<i64> {
+    packet.pts().or_else(|| packet.dts())
+}
+
 /// Phase B (3-thread split): demux thread から video decode thread に流すメッセージ。
 ///
 /// Phase A で audio decode を分離した後も、demux と video decode は同じスレッドで
@@ -1144,7 +1174,7 @@ fn run_video_decode(
                 break 'outer;
             }
             let decode_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
-            let pts = frame.pts().unwrap_or(0);
+            let pts = video_frame_timestamp(&frame).unwrap_or(0);
             let pts_secs = (pts as f64) * video_tb_num / video_tb_den;
             // post-seek preroll: target 前のフレームは描画しない
             if let Some(min) = drop_before_secs {
@@ -1771,7 +1801,7 @@ fn run_audio_decode(
                 // (packet boundary 上では target を跨ぐもののみデコードして
                 //  drop_before_secs の sample-level trim 経路で正確に切り出す。)
                 if let Some(min) = drop_before_secs {
-                    let pkt_pts = packet.pts().unwrap_or(i64::MIN);
+                    let pkt_pts = packet_timestamp(&packet).unwrap_or(i64::MIN);
                     if pkt_pts != i64::MIN {
                         let pkt_pts_secs =
                             (pkt_pts as f64) * setup.time_base_num / setup.time_base_den;
@@ -1825,7 +1855,7 @@ fn emit_audio_frame(
     use ffmpeg::util::frame::audio::Audio;
     use ffmpeg_the_third as ffmpeg;
 
-    let pts = frame.pts().unwrap_or(0);
+    let pts = audio_frame_timestamp(frame).unwrap_or(0);
     let mut pts_secs = (pts as f64) * setup.time_base_num / setup.time_base_den;
     let (_, guessed_frame_stereo) = normalize_audio_input_layout(frame.ch_layout());
     if guessed_frame_stereo {

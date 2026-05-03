@@ -513,10 +513,6 @@ fn run_pump(
     // Fast で Buffering→Playing 入場時に anchor が keyframe_pts に巻き戻り、
     // notify_seek_completed(target) で立てた anchor が上書きされていた。
     let mut pump_anchor_target_secs: Option<f64> = None;
-    // このシーク世代について overflow fallback (= wall master) に切り替わったか。
-    // `Some(serial)` なら fill_output / pump とも処理を停止する。
-    // 新 seek 世代で None にリセット (= 再度 audio master を試す)。
-    let mut overflow_for_serial: Option<u64> = None;
     let mut last_warning_at: Option<std::time::Instant> = None;
 
     while !cancel.load(Ordering::Acquire) {
@@ -554,8 +550,7 @@ fn run_pump(
                 }
                 last_seen_seek_serial = frame_seek_serial;
                 seen_valid_audio_frame = true;
-                // 新 seek 世代: overflow / target / activate を全 reset
-                overflow_for_serial = None;
+                // 新 seek 世代: target / activate を reset
                 safety_limiter.reset();
                 // PDC trim 用 seek_target は frame.pts_secs (= Fast では keyframe_pts、
                 // Precise では target ぴったり)。詳細は seek_target_secs の宣言コメント参照。
@@ -573,14 +568,10 @@ fn run_pump(
                 break 'intake;
             }
 
-            // ── overflow 中はその世代について no-op (Codex P1-2 反映) ──
-            // 既に overflow_for_serial に切り替わっている世代は frame を捨てる。
-            // pump は demux/audio_decode を詰まらせないために consume だけする。
-            if overflow_for_serial == Some(frame_seek_serial) {
-                break 'intake;
-            }
-
             // ── raw_pending に積む + seek serial 切替を 1 lock で処理 ──
+            let frame_pts_secs = frame.pts_secs;
+            let frame_seek_target_secs = frame.seek_target_secs;
+            let mut reanchored_after_overflow = false;
             let raw_total_secs = {
                 let mut buf = buffer.lock().unwrap();
 
@@ -607,40 +598,37 @@ fn run_pump(
                 let raw_secs: f64 = buf.raw_pending.iter().map(|f| f.duration_secs).sum::<f64>()
                     + frame.duration_secs;
 
-                if raw_secs <= RAW_OVERFLOW_SECS {
-                    buf.raw_pending.push_back(frame);
-                }
-                // else: 後続の overflow_alerted で対応
-                raw_secs
-            };
-
-            // ── overflow / warning 通知 (Codex P1-1: silent drop しない、P1-2 改: soft fallback) ──
-            if raw_total_secs > RAW_OVERFLOW_SECS {
-                // **soft fallback** (= Codex P1-2 修正): その seek 世代では consume only。
-                // 旧版は `clock.mark_audio_inactive()` + `AudioInactive` emit で恒久 fallback
-                // にしていたが、`AudioInactive` は EngineActor の `has_audio` を **永久に**
-                // false にする想定 (= デバイス起動失敗 用)。一時 fallback と混ぜると次 seek で
-                // has_audio が戻らず Buffering→Playing の latch 判定が壊れる。
-                //
-                // 新版: queue を clear + overflow_for_serial を set するだけ。
-                // - processed が空なので fill_output drain なし → set_audio_pts が呼ばれない
-                //   → AvClock の Audio 世代 anchor は更新されず wall extrapolation で進む
-                //   (= 自然に wall fallback)
-                // - 新 seek 世代で overflow_for_serial = None に reset (= 再 audio master 試行)
-                crate::logger::log(format!(
-                    "[audio-pump] raw_pending overflow ({:.1}s > {:.1}s threshold) at \
-                     seek_serial={frame_seek_serial}: soft fallback (clear queue, skip serial)",
-                    raw_total_secs, RAW_OVERFLOW_SECS,
-                ));
-                {
-                    let mut buf = buffer.lock().unwrap();
+                if raw_secs > RAW_OVERFLOW_SECS {
                     buf.processed.clear();
                     buf.drain_offset_in_first = 0;
                     buf.raw_pending.clear();
+                    buf.next_pts_secs = frame_pts_secs;
+                    buf.raw_pending.push_back(frame);
                     publish_buffer_secs(&buf, &clock);
+                    reanchored_after_overflow = true;
+                } else {
+                    buf.raw_pending.push_back(frame);
                 }
-                overflow_for_serial = Some(frame_seek_serial);
-                break 'intake;
+                raw_secs
+            };
+
+            // ── overflow / warning 通知 ──
+            if reanchored_after_overflow {
+                // Newer behavior: keep this seek generation alive. Clear the
+                // queued backlog and treat the current frame as the new audio
+                // anchor, which lets old AVI/DivX files recover after seek.
+                crate::logger::log(format!(
+                    "[audio-pump] raw_pending overflow ({:.1}s > {:.1}s threshold) at \
+                     seek_serial={frame_seek_serial}: re-anchor at {:.3}s",
+                    raw_total_secs, RAW_OVERFLOW_SECS, frame_pts_secs,
+                ));
+                clock.zero_audio_tx_queued_secs();
+                seek_target_secs = Some(frame_pts_secs);
+                if pump_anchor_target_secs.is_none() {
+                    pump_anchor_target_secs = frame_seek_target_secs.or(Some(frame_pts_secs));
+                }
+                safety_limiter.reset();
+                activated = false;
             } else if raw_total_secs > RAW_WARNING_SECS {
                 // warning: 5秒に 1 度ログ。長時間 Buffering の診断用。
                 let now = std::time::Instant::now();
@@ -693,7 +681,6 @@ fn run_pump(
         }
 
         // ── raw → VST process → processed loop ──
-        // (overflow_for_serial 中は raw_pending が既に clear 済みなので refill loop は no-op)
         // mutex を持たずに VST process_block を呼ぶ (Codex P2-B):
         // 1. lock → pop raw_pending → unlock
         // 2. process_block (no lock)

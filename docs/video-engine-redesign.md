@@ -1153,3 +1153,27 @@ Phase 5.1–5.6 のいずれも:
 
 **着手順序**: Phase 5.1 〜 5.7 の動画関連を全て完了してから本タスクに入る。
 動画と無関係なので独立してレビュー可能。
+
+## Phase 9.H: AVI/DivX timestamp compatibility (2026-05-03)
+
+Some older AVI files produced by Nandub / DivX-style encoders expose MPEG-4
+Part 2 video packets with missing PTS (`AV_NOPTS_VALUE`) and only DTS. They may
+also set `divx_packed=true`. VLC tolerates this by deriving presentation timing
+from FFmpeg's best-effort timestamps and by recovering when audio decode runs
+far ahead during seek preroll.
+
+mIV now does the same two defensive things:
+
+- `src/video/decoder.rs` reads `AVFrame.best_effort_timestamp` before falling
+  back to `frame.pts()`, for both video and audio frames. Audio packet preroll
+  trim also falls back from packet PTS to DTS.
+- `src/video/audio.rs` no longer treats `raw_pending` overflow as a permanent
+  kill-switch for the whole seek generation. When the pre-VST queue exceeds the
+  30s safety cap, the pump clears the backlog, zeros queued-audio accounting,
+  and re-anchors the same seek generation at the current audio frame. This keeps
+  playback recoverable for old AVI/DivX files whose audio decode briefly outruns
+  video after a seek.
+
+The remaining structural improvement is optional back-pressure on `audio_rx`
+while `raw_pending` is above a soft cap. Keep that as a follow-up if high-water
+logs remain frequent on normal files.
