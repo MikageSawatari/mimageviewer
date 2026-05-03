@@ -236,6 +236,7 @@ constexpr UINT kPluginGuiThreadTaskMsg = WM_APP + 0x4D1;
 constexpr auto kGuiQueryTimeout = std::chrono::milliseconds(2000);
 constexpr auto kGuiShowTimeout = std::chrono::milliseconds(3000);
 constexpr auto kGuiMutationTimeout = std::chrono::milliseconds(1000);
+constexpr DWORD kGuiShutdownTimeoutMs = 2000;
 }
 
 class PluginGuiThread {
@@ -251,6 +252,10 @@ public:
     bool is_current_thread() const {
         DWORD tid = thread_id_.load(std::memory_order_acquire);
         return tid != 0 && tid == GetCurrentThreadId();
+    }
+
+    DWORD thread_id() const {
+        return thread_id_.load(std::memory_order_acquire);
     }
 
     template <typename Fn>
@@ -423,6 +428,26 @@ private:
         }
         PostThreadMessageW(tid, WM_QUIT, 0, 0);
         if (thread_.joinable()) {
+            HANDLE native = thread_.native_handle();
+            DWORD wait_result = WaitForSingleObject(native, kGuiShutdownTimeoutMs);
+            if (wait_result == WAIT_TIMEOUT) {
+                blog("plugin GUI thread shutdown: timed out waiting %lums, detaching gui_tid=%lu",
+                     static_cast<unsigned long>(kGuiShutdownTimeoutMs),
+                     tid);
+                thread_.detach();
+                thread_id_.store(0, std::memory_order_release);
+                running_.store(false, std::memory_order_release);
+                return;
+            }
+            if (wait_result == WAIT_FAILED) {
+                blog("plugin GUI thread shutdown: WaitForSingleObject failed gui_tid=%lu err=%lu",
+                     tid,
+                     GetLastError());
+                thread_.detach();
+                thread_id_.store(0, std::memory_order_release);
+                running_.store(false, std::memory_order_release);
+                return;
+            }
             thread_.join();
         }
     }
@@ -470,6 +495,29 @@ PluginGuiThread& PluginLoader::gui_thread() {
 
 bool PluginLoader::is_gui_thread() const {
     return gui_thread_ && gui_thread_->is_current_thread();
+}
+
+void PluginLoader::quarantine_editor(const char* reason) {
+    bool was_quarantined = editor_quarantined_.exchange(true, std::memory_order_acq_rel);
+    if (!was_quarantined) {
+        blog("plugin editor quarantined plugin=\"%s\" reason=%s gui_tid=%lu",
+             plugin_name_.empty() ? "(unknown)" : plugin_name_.c_str(),
+             reason ? reason : "(unknown)",
+             gui_thread_ ? gui_thread_->thread_id() : 0);
+    }
+}
+
+void PluginLoader::abandon_gui_thread(const char* reason) {
+    if (!gui_thread_) {
+        return;
+    }
+    DWORD tid = gui_thread_->thread_id();
+    PluginGuiThread* abandoned = gui_thread_.release();
+    blog("plugin GUI thread abandoned plugin=\"%s\" reason=%s gui_tid=%lu helper=0x%llx",
+         plugin_name_.empty() ? "(unknown)" : plugin_name_.c_str(),
+         reason ? reason : "(unknown)",
+         tid,
+         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(abandoned)));
 }
 
 bool PluginLoader::probe(const std::string& plugin_path,
@@ -837,6 +885,9 @@ bool PluginLoader::process_block(const float* input, float* output, uint32_t num
 }
 
 bool PluginLoader::get_gui_size(uint32_t& width_out, uint32_t& height_out) {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return false;
+    }
     if (!is_gui_thread()) {
         auto result = gui_thread().invoke_sync_for(kGuiQueryTimeout, "get_gui_size", [this]() {
             GuiSizeQueryResult out{};
@@ -844,6 +895,10 @@ bool PluginLoader::get_gui_size(uint32_t& width_out, uint32_t& height_out) {
             return out;
         });
         if (!result || !result->ok) {
+            if (!result) {
+                quarantine_editor("get_gui_size timeout");
+                abandon_gui_thread("get_gui_size timeout");
+            }
             return false;
         }
         width_out = result->width;
@@ -875,6 +930,9 @@ bool PluginLoader::get_gui_size(uint32_t& width_out, uint32_t& height_out) {
 
 bool PluginLoader::query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint32_t& height_out,
                                           bool& resizable_out) {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return false;
+    }
     if (!is_gui_thread()) {
         auto result = gui_thread().invoke_sync_for(kGuiQueryTimeout, "query_gui_size_at_dpi", [this, dpi]() {
             GuiSizeQueryResult out{};
@@ -882,6 +940,10 @@ bool PluginLoader::query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint
             return out;
         });
         if (!result || !result->ok) {
+            if (!result) {
+                quarantine_editor("query_gui_size_at_dpi timeout");
+                abandon_gui_thread("query_gui_size_at_dpi timeout");
+            }
             return false;
         }
         width_out = result->width;
@@ -917,6 +979,10 @@ bool PluginLoader::query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint
 }
 
 bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::string& error_out) {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        error_out = "editor quarantined after a previous GUI timeout";
+        return false;
+    }
     if (!is_gui_thread()) {
         GuiWindowOptions options_copy = options;
         auto result = gui_thread().invoke_sync_for(
@@ -926,7 +992,9 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
                 return out;
             });
         if (!result) {
-            error_out = "show_gui timed out";
+            quarantine_editor("show_gui timeout");
+            abandon_gui_thread("show_gui timeout");
+            error_out = "show_gui timed out (slot GUI thread stuck in plugin editor attach)";
             return false;
         }
         error_out = result->error;
@@ -1059,6 +1127,9 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
 }
 
 void PluginLoader::set_user_resizing(bool active) {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return;
+    }
     if (!is_gui_thread()) {
         if (!gui_thread_) {
             return;
@@ -1100,6 +1171,9 @@ void PluginLoader::refresh_gui_surface(void* container_hwnd_ptr) {
 }
 
 void PluginLoader::set_gui_surface_visible_state(bool visible) {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return;
+    }
     if (!is_gui_thread()) {
         if (!gui_thread_) {
             return;
@@ -1114,6 +1188,9 @@ void PluginLoader::set_gui_surface_visible_state(bool visible) {
 }
 
 bool PluginLoader::gui_surface_should_show() {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return false;
+    }
     if (!is_gui_thread()) {
         if (!gui_thread_) {
             return false;
@@ -1131,6 +1208,9 @@ bool PluginLoader::gui_surface_target_rect(int32_t& x_out,
                                            int32_t& y_out,
                                            int32_t& width_out,
                                            int32_t& height_out) {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return false;
+    }
     if (!is_gui_thread()) {
         HWND hwnd = reinterpret_cast<HWND>(
             view_container_hwnd_snapshot_.load(std::memory_order_acquire));
@@ -1158,6 +1238,9 @@ bool PluginLoader::gui_surface_target_rect(int32_t& x_out,
 }
 
 void PluginLoader::refresh_gui_surface_now() {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return;
+    }
     if (!is_gui_thread()) {
         if (!gui_thread_) {
             return;
@@ -1176,6 +1259,9 @@ void* PluginLoader::gui_container_hwnd() const {
 }
 
 void PluginLoader::set_gui_visible(bool visible) {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return;
+    }
     if (!is_gui_thread()) {
         if (!gui_thread_) {
             return;
@@ -1202,6 +1288,9 @@ void PluginLoader::set_gui_visible(bool visible) {
 }
 
 void PluginLoader::set_gui_topmost(bool topmost) {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return;
+    }
     if (!is_gui_thread()) {
         if (!gui_thread_) {
             return;
@@ -1230,6 +1319,9 @@ void PluginLoader::set_gui_topmost(bool topmost) {
 }
 
 void PluginLoader::set_gui_owner(void* owner_hwnd) {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return;
+    }
     if (!is_gui_thread()) {
         if (!gui_thread_) {
             return;
@@ -1268,6 +1360,9 @@ void PluginLoader::set_gui_owner(void* owner_hwnd) {
 }
 
 void PluginLoader::set_gui_app_active(bool active) {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return;
+    }
     if (!is_gui_thread()) {
         if (!gui_thread_) {
             return;
@@ -1312,6 +1407,9 @@ void PluginLoader::set_gui_app_active(bool active) {
 }
 
 void PluginLoader::handle_editor_window_size() {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return;
+    }
     if (!is_gui_thread()) {
         if (!gui_thread_) {
             return;
@@ -1348,6 +1446,9 @@ void PluginLoader::handle_editor_window_size() {
 }
 
 void PluginLoader::handle_editor_drag_start() {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return;
+    }
     if (!is_gui_thread()) {
         if (!gui_thread_) {
             return;
@@ -1397,6 +1498,9 @@ void PluginLoader::handle_editor_drag_start() {
 }
 
 void PluginLoader::handle_editor_drag_tick(uint32_t msg) {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return;
+    }
     if (!is_gui_thread()) {
         if (!gui_thread_) {
             return;
@@ -1435,6 +1539,9 @@ void PluginLoader::handle_editor_drag_tick(uint32_t msg) {
 }
 
 void PluginLoader::handle_editor_drag_end() {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return;
+    }
     if (!is_gui_thread()) {
         if (!gui_thread_) {
             return;
@@ -1495,6 +1602,9 @@ bool PluginLoader::poll_latency_change(uint32_t& new_latency_out) {
 }
 
 void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
+    if (editor_quarantined_.load(std::memory_order_acquire) && !is_gui_thread()) {
+        return;
+    }
     if (!is_gui_thread()) {
         if (!gui_thread_) {
             return;
@@ -1542,6 +1652,17 @@ void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
 
 void PluginLoader::hide_gui() {
     if (!is_gui_thread()) {
+        if (editor_quarantined_.load(std::memory_order_acquire)) {
+            abandon_gui_thread("hide_gui quarantined");
+            view_host_hwnd_ = nullptr;
+            view_container_hwnd_ = nullptr;
+            view_container_hwnd_snapshot_.store(nullptr, std::memory_order_release);
+            gui_surface_visible_ = false;
+            gui_app_active_ = true;
+            last_gui_width_ = 0;
+            last_gui_height_ = 0;
+            return;
+        }
         if (!gui_thread_) {
             return;
         }

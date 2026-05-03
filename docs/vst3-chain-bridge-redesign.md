@@ -152,6 +152,12 @@ Design rules:
   `attached`, `getSize`, or another required reply path, the bridge logs a
   `plugin GUI task timeout ... gui_tid=...` line and returns an error instead of
   blocking chain initialization or the control IPC thread indefinitely.
+- A slot that times out in an editor operation is quarantined. Its stuck GUI
+  helper is abandoned for the lifetime of the bridge process, future GUI
+  commands for that slot become no-ops, and the rest of the chain continues to
+  load and run. We intentionally do not use `TerminateThread`; a plugin that
+  never returns from `attached()` is leaked until bridge process exit rather
+  than risking heap or DLL state corruption.
 - Startup loading also uses bounded waits and logs both the Rust-side
   `[VST3 startup] loading ...` line and the bridge-side `add_plugin start ...`
   line. If a plugin blocks before it can emit `loaded`, the startup worker times

@@ -176,6 +176,8 @@ public:
 private:
     PluginGuiThread& gui_thread();
     bool is_gui_thread() const;
+    void quarantine_editor(const char* reason);
+    void abandon_gui_thread(const char* reason);
     void refresh_gui_surface(void* container_hwnd);
 
     Steinberg::IPtr<HostApplication> host_app_;
@@ -197,6 +199,7 @@ private:
     uint32_t last_gui_width_ = 0;
     uint32_t last_gui_height_ = 0;
     std::unique_ptr<PluginGuiThread> gui_thread_;
+    std::atomic<bool> editor_quarantined_{false};
 
     uint32_t sample_rate_ = 0;
     uint32_t block_size_ = 0;
