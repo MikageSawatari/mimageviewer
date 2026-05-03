@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cmath>
 #include <deque>
 #include <cstdio>
 #include <cstdint>
@@ -178,9 +179,20 @@ void draw_editor_chrome(HWND hwnd, miv::PluginLoader* loader) {
     const int cx = (power_rect.left + power_rect.right) / 2;
     const int cy = (power_rect.top + power_rect.bottom) / 2 + 1;
     const int r = std::max<int>(5, (power_rect.bottom - power_rect.top) / 2 - 7);
-    Arc(hdc, cx - r, cy - r, cx + r, cy + r, cx + r, cy - r / 2, cx - r, cy - r / 2);
-    MoveToEx(hdc, cx, power_rect.top + 6, nullptr);
-    LineTo(hdc, cx, cy - 1);
+    POINT ring_points[25]{};
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr double kStartDeg = 225.0;
+    constexpr double kSweepDeg = 270.0;
+    for (int i = 0; i < 25; ++i) {
+        const double t = static_cast<double>(i) / 24.0;
+        const double deg = kStartDeg - (kSweepDeg * t);
+        const double rad = deg * kPi / 180.0;
+        ring_points[i].x = cx + static_cast<LONG>(std::lround(std::cos(rad) * r));
+        ring_points[i].y = cy + static_cast<LONG>(std::lround(std::sin(rad) * r));
+    }
+    Polyline(hdc, ring_points, 25);
+    MoveToEx(hdc, cx, cy - r - 5, nullptr);
+    LineTo(hdc, cx, cy - r / 3);
     SelectObject(hdc, old_brush);
     SelectObject(hdc, old_power_pen);
     DeleteObject(power_pen);
