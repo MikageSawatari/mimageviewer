@@ -43,8 +43,8 @@ mimageviewer-vst3-host.exe
 ```
 
 Rust still owns settings, slot order, bypass flags, user-hidden state, and GUI
-host HWNDs. The C++ bridge owns the VST3 objects and the bridge-owned plugin
-surface HWNDs.
+window placement. The C++ bridge owns the VST3 objects and the framed plugin
+editor HWNDs.
 
 ## Protocol Shape
 
@@ -81,10 +81,11 @@ processes. Scanner/probe can continue to spawn a short-lived bridge process.
 
 ## GUI Semantics
 
-- Each plugin still has a Rust host HWND so existing window placement,
-  persistence, and user-hidden behavior can be preserved.
-- Each `PluginLoader` may create a bridge-owned top-level surface, but all
-  surfaces live in the same bridge process.
+- Each plugin editor is now a bridge-owned top-level window with its own title
+  bar and resize frame. The window is owned by the mIV main HWND, matching the
+  Bitwig-style structure where the plugin host process owns the whole editor.
+- Rust stores the returned editor HWND for placement, z-order, visibility, and
+  user-hidden behavior. There is no separate Rust-side per-slot host window.
 - The bridge can apply z-order/topmost changes to all surfaces in one internal
   batch. Rust no longer sends one topmost/visible command per process.
 - App deactivation never hides plugin surfaces. It only drops topmost. Explicit

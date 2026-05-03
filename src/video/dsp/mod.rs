@@ -19,7 +19,7 @@ pub mod extract;
 pub mod gui;
 pub mod scanner;
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -106,6 +106,8 @@ pub struct DspBridge {
     /// 設定される (= 全 slot 同一)。UI で latency を ms 表示する際に使う。
     /// 0 = 未設定 (= プラグイン未追加状態)。
     sample_rate: AtomicU32,
+    /// mIV main HWND. Bridge-owned VST editor windows use this as their owner.
+    main_hwnd: AtomicU64,
 }
 
 struct DspBridgeInner {
@@ -198,7 +200,12 @@ impl DspBridge {
             gui_app_active_effective: AtomicBool::new(true),
             gui_app_inactive_since: Mutex::new(None),
             sample_rate: AtomicU32::new(0),
+            main_hwnd: AtomicU64::new(0),
         })
+    }
+
+    pub fn set_main_hwnd(&self, hwnd: u64) {
+        self.main_hwnd.store(hwnd, Ordering::Release);
     }
 
     /// audio output の sample_rate (= cpal 出力レート)。0 = 未設定。UI で
@@ -997,54 +1004,47 @@ impl DspBridge {
             let inner = self.inner.lock().unwrap();
             inner.slots.get(idx).and_then(|s| s.desired_window_pos)
         };
-        let gui_host = gui::GuiHost::spawn();
-        let reply = gui_host
-            .show(
-                &plugin_name,
-                pref_w,
-                pref_h,
-                resizable,
-                initial_pos,
-                visible,
-            )
-            .map_err(|e| format!("create gui window: {e}"))?;
-        if reply.hwnd_u64 == 0 {
-            return Err("HWND not returned".to_string());
+        let owner_hwnd = self.main_hwnd.load(Ordering::Acquire);
+        if owner_hwnd == 0 {
+            return Err("main HWND not ready".to_string());
         }
-        let hwnd = reply.hwnd_u64;
 
         // ─ Step 3: bridge に attach 命令 (Mutex 外、bridge_arc 経由) ─
         bridge_arc
             .send_value(&serde_json::json!({
                 "cmd": "show_gui",
                 "slot_id": slot_id,
-                "hwnd": hwnd,
+                "owner_hwnd": owner_hwnd,
                 "visible": if visible { 1 } else { 0 },
+                "width": pref_w,
+                "height": pref_h,
+                "resizable": if resizable { 1 } else { 0 },
+                "has_initial_pos": if initial_pos.is_some() { 1 } else { 0 },
+                "x": initial_pos.map(|p| p.0).unwrap_or(0),
+                "y": initial_pos.map(|p| p.1).unwrap_or(0),
+                "title": plugin_name,
             }))
             .map_err(|e| format!("send ShowGui: {e}"))?;
+        let mut hwnd = 0_u64;
         match bridge_arc.recv() {
             Ok(Event::GuiAttached {
-                width,
-                height,
+                width: _,
+                height: _,
                 slot_id: got_slot,
                 container_hwnd,
             }) if got_slot == slot_id => {
-                if container_hwnd != 0 {
-                    gui_host.set_bridge_container_hwnd(container_hwnd);
-                }
-                if width > 0 && height > 0 && (width != pref_w || height != pref_h) {
-                    gui::resize_window_client(hwnd, width, height);
+                hwnd = container_hwnd;
+                if hwnd == 0 {
+                    return Err("bridge did not return editor HWND".to_string());
                 }
             }
             Ok(Event::Error { detail }) => {
-                gui_host.close();
                 return Err(format!("gui attach: {detail}"));
             }
             Ok(other) => {
                 crate::logger::log(format!("vst3 attach: unexpected {other:?}"));
             }
             Err(e) => {
-                gui_host.close();
                 return Err(format!("attach recv: {e}"));
             }
         }
@@ -1060,13 +1060,13 @@ impl DspBridge {
             if clear_user_hidden {
                 slot.user_hidden = false;
             }
-            slot.gui_host = Some(gui_host);
-            slot.gui_close_signal = Some(reply.close_signal);
-            slot.gui_resize_signal = Some(reply.resize_signal);
+            slot.gui_host = None;
+            slot.gui_close_signal = None;
+            slot.gui_resize_signal = None;
             slot.pending_resize_notify = None;
             slot.last_resize_notify = None;
-            slot.gui_resize_session_signal = Some(reply.resize_session_signal);
-            slot.gui_app_active_signal = Some(reply.app_active_signal);
+            slot.gui_resize_session_signal = None;
+            slot.gui_app_active_signal = None;
             slot.gui_resize_session_active = false;
         }
         drop(inner);

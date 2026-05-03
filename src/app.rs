@@ -13226,6 +13226,8 @@ impl eframe::App for App {
                 if let RawWindowHandle::Win32(h) = wh.as_raw() {
                     let hwnd_raw = h.hwnd.get();
                     self.main_hwnd = Some(hwnd_raw);
+                    #[cfg(windows)]
+                    self.dsp_bridge.set_main_hwnd(hwnd_raw as u64);
                     crate::logger::log(format!("tray: captured main HWND = {hwnd_raw:#x}"));
                     // アクティベーションリスナーに placement_slot を共有するため、
                     // ここでスロットを作成しておく (sync_tray_with_settings での遅延作成と

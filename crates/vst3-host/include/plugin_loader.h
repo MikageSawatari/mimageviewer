@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -45,6 +46,17 @@ struct PluginProbeInfo {
 struct PluginMouseHookEntry {
     uint32_t thread_id = 0;
     void* hook = nullptr;
+};
+
+struct GuiWindowOptions {
+    void* owner_hwnd = nullptr;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool resizable = true;
+    bool has_initial_pos = false;
+    int32_t x = 0;
+    int32_t y = 0;
+    std::string title;
 };
 
 class PluginLoader {
@@ -119,7 +131,7 @@ public:
     bool query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint32_t& height_out,
                                 bool& resizable_out);
     /// 指定 HWND にプラグイン GUI をアタッチする。失敗時は false。
-    bool show_gui(void* hwnd, bool visible, std::string& error_out);
+    bool show_gui(const GuiWindowOptions& options, bool visible, std::string& error_out);
     /// Already-attached GUI surface visibility toggle. Keeps the VST3 view
     /// attached and only hides/shows the bridge-owned top-level surface.
     void set_gui_visible(bool visible);
@@ -135,6 +147,7 @@ public:
     bool gui_surface_target_rect(int32_t& x_out, int32_t& y_out,
                                  int32_t& width_out, int32_t& height_out);
     void refresh_gui_surface_now();
+    void handle_editor_window_size();
     /// GUI を外す。HWND 自体は呼び出し側が破棄する。
     void hide_gui();
 

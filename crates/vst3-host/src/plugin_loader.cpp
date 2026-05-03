@@ -35,7 +35,46 @@ constexpr UINT_PTR kPluginChildFocusSubclassId = 0x4D495653534C4D50ull;  // "MIV
 HWND g_plugin_mouse_hook_host_hwnd = nullptr;
 constexpr const wchar_t* kBridgeViewContainerClass = L"MivVst3BridgeViewContainer";
 
+std::wstring utf8_to_wide(const std::string& text) {
+    if (text.empty()) {
+        return L"VST3 Plugin";
+    }
+    int needed = MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, nullptr, 0);
+    if (needed <= 1) {
+        return L"VST3 Plugin";
+    }
+    std::wstring out(static_cast<size_t>(needed - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, text.c_str(), -1, out.data(), needed);
+    return out;
+}
+
 LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (msg == WM_NCCREATE) {
+        auto* cs = reinterpret_cast<CREATESTRUCTW*>(lparam);
+        if (cs) {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
+        }
+    }
+    auto* loader = reinterpret_cast<miv::PluginLoader*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (msg == WM_CLOSE) {
+        if (loader) {
+            loader->set_gui_surface_visible_state(false);
+        }
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    }
+    if (msg == WM_SYSCOMMAND && ((wparam & 0xFFF0) == SC_CLOSE)) {
+        if (loader) {
+            loader->set_gui_surface_visible_state(false);
+        }
+        ShowWindow(hwnd, SW_HIDE);
+        return 0;
+    }
+    if (msg == WM_SIZE && wparam != SIZE_MINIMIZED) {
+        if (loader) {
+            loader->handle_editor_window_size();
+        }
+    }
     if (msg == WM_WINDOWPOSCHANGING) {
         auto* wp = reinterpret_cast<WINDOWPOS*>(lparam);
         if (wp && ((wp->flags & SWP_NOMOVE) == 0 || (wp->flags & SWP_NOSIZE) == 0)) {
@@ -106,38 +145,50 @@ bool host_client_rect_on_screen(HWND host_hwnd, RECT& out_rect) {
     return true;
 }
 
-HWND create_bridge_view_container(HWND host_hwnd) {
-    if (!host_hwnd || !IsWindow(host_hwnd) || !ensure_bridge_view_container_class()) {
+HWND create_bridge_view_container(const miv::GuiWindowOptions& options, miv::PluginLoader* loader) {
+    HWND owner_hwnd = reinterpret_cast<HWND>(options.owner_hwnd);
+    if (!ensure_bridge_view_container_class()) {
         return nullptr;
     }
-    RECT rect{};
-    if (!host_client_rect_on_screen(host_hwnd, rect)) {
-        blog("bridge view container cannot resolve host client rect err=%lu", GetLastError());
-        return nullptr;
-    }
-    const int width = std::max<LONG>(1, rect.right - rect.left);
-    const int height = std::max<LONG>(1, rect.bottom - rect.top);
-    HWND container = CreateWindowExW(WS_EX_TOOLWINDOW,
+    const DWORD style = WS_POPUP | WS_CAPTION |
+                        (options.resizable ? WS_THICKFRAME : 0) |
+                        WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
+    const DWORD ex_style = WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE;
+    UINT dpi = owner_hwnd ? GetDpiForWindow(owner_hwnd) : GetDpiForSystem();
+    if (dpi == 0) dpi = 96;
+    RECT outer{0,
+               0,
+               static_cast<LONG>(std::max<uint32_t>(1, options.width)),
+               static_cast<LONG>(std::max<uint32_t>(1, options.height))};
+    AdjustWindowRectExForDpi(&outer, style, FALSE, ex_style, dpi);
+    const int width = std::max<LONG>(1, outer.right - outer.left);
+    const int height = std::max<LONG>(1, outer.bottom - outer.top);
+    const int x = options.has_initial_pos ? options.x : CW_USEDEFAULT;
+    const int y = options.has_initial_pos ? options.y : CW_USEDEFAULT;
+    std::wstring title = utf8_to_wide(options.title);
+    HWND container = CreateWindowExW(ex_style,
                                      kBridgeViewContainerClass,
-                                     L"",
-                                     WS_POPUP | WS_CLIPCHILDREN | WS_CLIPSIBLINGS,
-                                     rect.left,
-                                     rect.top,
+                                     title.c_str(),
+                                     style,
+                                     x,
+                                     y,
                                      width,
                                      height,
-                                     host_hwnd,
+                                     owner_hwnd,
                                      nullptr,
                                      GetModuleHandleW(nullptr),
-                                     nullptr);
+                                     loader);
     if (!container) {
         blog("bridge view container create failed err=%lu", GetLastError());
         return nullptr;
     }
-    blog("bridge top-level view container created hwnd=0x%llx owner=0x%llx pos=%ld,%ld size=%dx%d",
+    blog("bridge editor window created hwnd=0x%llx owner=0x%llx pos=%d,%d client=%ux%u outer=%dx%d",
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container)),
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(host_hwnd)),
-         rect.left,
-         rect.top,
+         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(owner_hwnd)),
+         x,
+         y,
+         options.width,
+         options.height,
          width,
          height);
     return container;
@@ -1067,8 +1118,10 @@ void PluginLoader::remove_child_focus_hooks() {
     child_focus_hook_hwnds_.clear();
 }
 
-bool PluginLoader::show_gui(void* hwnd, bool visible, std::string& error_out) {
-    blog("show_gui start hwnd=0x%llx visible=%d", (unsigned long long)hwnd, visible ? 1 : 0);
+bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::string& error_out) {
+    blog("show_gui start owner=0x%llx visible=%d",
+         (unsigned long long)options.owner_hwnd,
+         visible ? 1 : 0);
     if (!controller_) {
         error_out = "controller not available";
         return false;
@@ -1097,7 +1150,6 @@ bool PluginLoader::show_gui(void* hwnd, bool visible, std::string& error_out) {
     blog("show_gui: setFrame");
     // attached より **前に** setFrame を呼ぶ。Pro-Q 4 等多くのプラグインは
     // frame が無いと描画開始しない (= 真っ白でハング)。
-    plug_frame_->set_host_hwnd(hwnd);
     view_->setFrame(plug_frame_);
 
     // DPI scale をプラグインに伝える。これが無いとプラグインは "100% 想定" で
@@ -1105,7 +1157,11 @@ bool PluginLoader::show_gui(void* hwnd, bool visible, std::string& error_out) {
     // (Pro-Q 4 で「右下しか見えない」現象の原因)。
     Steinberg::FUnknownPtr<Steinberg::IPlugViewContentScaleSupport> css(view_);
     if (css) {
-        UINT dpi = GetDpiForWindow(reinterpret_cast<HWND>(hwnd));
+        UINT dpi = 0;
+        HWND owner_hwnd = reinterpret_cast<HWND>(options.owner_hwnd);
+        if (owner_hwnd) {
+            dpi = GetDpiForWindow(owner_hwnd);
+        }
         if (dpi == 0) dpi = GetDpiForSystem();
         if (dpi == 0) dpi = 96;
         float factor = static_cast<float>(dpi) / 96.0f;
@@ -1115,19 +1171,20 @@ bool PluginLoader::show_gui(void* hwnd, bool visible, std::string& error_out) {
         blog("show_gui: plugin does not implement IPlugViewContentScaleSupport");
     }
 
-    HWND host_hwnd = reinterpret_cast<HWND>(hwnd);
-    HWND attach_hwnd = create_bridge_view_container(host_hwnd);
+    HWND attach_hwnd = create_bridge_view_container(options, this);
     if (!attach_hwnd) {
-        attach_hwnd = host_hwnd;
-        blog("show_gui: using host hwnd directly because bridge container is unavailable");
+        error_out = "failed to create editor window";
+        view_->setFrame(nullptr);
+        view_ = nullptr;
+        return false;
     }
 
-    blog("show_gui: attached(hwnd, HWND) attach=0x%llx host=0x%llx",
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(attach_hwnd)),
-         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(host_hwnd)));
+    plug_frame_->set_host_hwnd(attach_hwnd);
+    blog("show_gui: attached(hwnd, HWND) editor=0x%llx",
+         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(attach_hwnd)));
     if (view_->attached(attach_hwnd, Steinberg::kPlatformTypeHWND) != Steinberg::kResultOk) {
         error_out = "attached() failed";
-        if (attach_hwnd != host_hwnd && IsWindow(attach_hwnd)) {
+        if (IsWindow(attach_hwnd)) {
             DestroyWindow(attach_hwnd);
         }
         view_->setFrame(nullptr);
@@ -1135,8 +1192,8 @@ bool PluginLoader::show_gui(void* hwnd, bool visible, std::string& error_out) {
         return false;
     }
     view_attached_ = true;
-    view_host_hwnd_ = hwnd;
-    view_container_hwnd_ = attach_hwnd != host_hwnd ? attach_hwnd : nullptr;
+    view_host_hwnd_ = options.owner_hwnd;
+    view_container_hwnd_ = attach_hwnd;
     blog("show_gui: attached ok");
 
     // attached 後に推奨サイズで onSize を呼んで「このサイズで描画して」と通知する。
@@ -1148,12 +1205,18 @@ bool PluginLoader::show_gui(void* hwnd, bool visible, std::string& error_out) {
         blog("show_gui: getSize=%dx%d, resize container, onSize", preferred_w, preferred_h);
         if (HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
             container_hwnd && IsWindow(container_hwnd)) {
+            RECT outer{0, 0, preferred_w, preferred_h};
+            DWORD style = static_cast<DWORD>(GetWindowLongPtrW(container_hwnd, GWL_STYLE));
+            DWORD ex_style = static_cast<DWORD>(GetWindowLongPtrW(container_hwnd, GWL_EXSTYLE));
+            UINT dpi = GetDpiForWindow(container_hwnd);
+            if (dpi == 0) dpi = 96;
+            AdjustWindowRectExForDpi(&outer, style, FALSE, ex_style, dpi);
             SetWindowPos(container_hwnd,
                          nullptr,
                          0,
                          0,
-                         preferred_w,
-                         preferred_h,
+                         outer.right - outer.left,
+                         outer.bottom - outer.top,
                          SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
         view_->onSize(&rect);
@@ -1165,7 +1228,7 @@ bool PluginLoader::show_gui(void* hwnd, bool visible, std::string& error_out) {
         last_gui_height_ = 0;
         blog("show_gui: getSize failed");
     }
-    install_child_focus_hooks(hwnd);
+    install_child_focus_hooks(attach_hwnd);
     gui_surface_visible_ = visible;
     gui_app_active_ = true;
     if (HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
@@ -1223,7 +1286,8 @@ bool PluginLoader::gui_surface_target_rect(int32_t& x_out,
                                            int32_t& width_out,
                                            int32_t& height_out) {
     RECT rect{};
-    if (!host_client_rect_on_screen(reinterpret_cast<HWND>(view_host_hwnd_), rect)) {
+    HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
+    if (!container_hwnd || !IsWindow(container_hwnd) || !GetWindowRect(container_hwnd, &rect)) {
         return false;
     }
     x_out = rect.left;
@@ -1241,18 +1305,6 @@ void PluginLoader::set_gui_visible(bool visible) {
     gui_surface_visible_ = visible;
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd)) {
-        if (visible && gui_app_active_) {
-            RECT rect{};
-            if (host_client_rect_on_screen(reinterpret_cast<HWND>(view_host_hwnd_), rect)) {
-                SetWindowPos(container_hwnd,
-                             nullptr,
-                             rect.left,
-                             rect.top,
-                             std::max<LONG>(1, rect.right - rect.left),
-                             std::max<LONG>(1, rect.bottom - rect.top),
-                             SWP_NOZORDER | SWP_NOACTIVATE);
-            }
-        }
         ShowWindow(container_hwnd, (visible && gui_app_active_) ? SW_SHOWNA : SW_HIDE);
         if (visible && gui_app_active_) {
             refresh_gui_surface(container_hwnd);
@@ -1288,16 +1340,6 @@ void PluginLoader::set_gui_app_active(bool active) {
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd)) {
         if (gui_surface_visible_ && gui_app_active_) {
-            RECT rect{};
-            if (host_client_rect_on_screen(reinterpret_cast<HWND>(view_host_hwnd_), rect)) {
-                SetWindowPos(container_hwnd,
-                             nullptr,
-                             rect.left,
-                             rect.top,
-                             std::max<LONG>(1, rect.right - rect.left),
-                             std::max<LONG>(1, rect.bottom - rect.top),
-                             SWP_NOZORDER | SWP_NOACTIVATE);
-            }
             ShowWindow(container_hwnd, SW_SHOWNA);
             refresh_gui_surface(container_hwnd);
         } else if (gui_surface_visible_) {
@@ -1327,6 +1369,32 @@ void PluginLoader::set_gui_app_active(bool active) {
     blog("set_gui_app_active: no bridge surface active=%d", active ? 1 : 0);
 }
 
+void PluginLoader::handle_editor_window_size() {
+    HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
+    if (!view_attached_ || !view_ || !container_hwnd || !IsWindow(container_hwnd)) {
+        return;
+    }
+    RECT client{};
+    if (!GetClientRect(container_hwnd, &client)) {
+        return;
+    }
+    const uint32_t width = static_cast<uint32_t>(std::max<LONG>(1, client.right - client.left));
+    const uint32_t height = static_cast<uint32_t>(std::max<LONG>(1, client.bottom - client.top));
+    if (width == last_gui_width_ && height == last_gui_height_) {
+        return;
+    }
+    last_gui_width_ = width;
+    last_gui_height_ = height;
+    if (plug_frame_) {
+        plug_frame_->mark_user_resize();
+    }
+    Steinberg::ViewRect rect{0,
+                             0,
+                             static_cast<Steinberg::int32>(width),
+                             static_cast<Steinberg::int32>(height)};
+    view_->onSize(&rect);
+}
+
 bool PluginLoader::poll_latency_change(uint32_t& new_latency_out) {
     if (!component_handler_ || !processor_) {
         return false;
@@ -1348,37 +1416,20 @@ bool PluginLoader::poll_latency_change(uint32_t& new_latency_out) {
 void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
     if (!view_attached_ || !view_) return;
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
-    if (container_hwnd && IsWindow(container_hwnd)) {
-        RECT rect{};
-        if (host_client_rect_on_screen(reinterpret_cast<HWND>(view_host_hwnd_), rect)) {
-            const int target_width = std::max<LONG>(1, rect.right - rect.left);
-            const int target_height = std::max<LONG>(1, rect.bottom - rect.top);
-            if (target_width != static_cast<int>(width) ||
-                target_height != static_cast<int>(height)) {
-                blog("notify_host_resize: requested=%ux%u host_client=%dx%d",
-                     width,
-                     height,
-                     target_width,
-                     target_height);
-            }
-            SetWindowPos(container_hwnd,
-                         nullptr,
-                         rect.left,
-                         rect.top,
-                         target_width,
-                         target_height,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
-            // Move-only updates do not call IPlugView::onSize below. Nudge
-            // D3D-backed editors so their swapchain presents at the new
-            // desktop position instead of leaving stale pixels behind until
-            // their next internal repaint.
-            RedrawWindow(container_hwnd,
-                         nullptr,
-                         nullptr,
-                         RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
-        } else {
-            blog("notify_host_resize: skipped bridge surface move; host rect unavailable");
-        }
+    if (container_hwnd && IsWindow(container_hwnd) && width > 0 && height > 0) {
+        RECT outer{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+        DWORD style = static_cast<DWORD>(GetWindowLongPtrW(container_hwnd, GWL_STYLE));
+        DWORD ex_style = static_cast<DWORD>(GetWindowLongPtrW(container_hwnd, GWL_EXSTYLE));
+        UINT dpi = GetDpiForWindow(container_hwnd);
+        if (dpi == 0) dpi = 96;
+        AdjustWindowRectExForDpi(&outer, style, FALSE, ex_style, dpi);
+        SetWindowPos(container_hwnd,
+                     nullptr,
+                     0,
+                     0,
+                     outer.right - outer.left,
+                     outer.bottom - outer.top,
+                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
     }
     const bool size_changed = width != last_gui_width_ || height != last_gui_height_;
     if (!size_changed) {

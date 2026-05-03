@@ -344,6 +344,27 @@ private:
         return v;
     }
 
+    static int64_t extract_i64_field(const std::string& json, const std::string& key) {
+        std::string needle = "\"" + key + "\"";
+        auto pos = json.find(needle);
+        if (pos == std::string::npos) return 0;
+        pos = json.find(':', pos);
+        if (pos == std::string::npos) return 0;
+        ++pos;
+        while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t')) ++pos;
+        bool neg = false;
+        if (pos < json.size() && json[pos] == '-') {
+            neg = true;
+            ++pos;
+        }
+        int64_t v = 0;
+        while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
+            v = v * 10 + (json[pos] - '0');
+            ++pos;
+        }
+        return neg ? -v : v;
+    }
+
     static std::vector<uint64_t> parse_u64_list(const std::string& text) {
         std::vector<uint64_t> out;
         uint64_t value = 0;
@@ -529,14 +550,22 @@ private:
                 send_event_error("show_gui: no plugin loaded");
                 return true;
             }
-            uint64_t hwnd_u = extract_number_field(msg, "hwnd");
-            if (hwnd_u == 0) {
-                send_event_error("show_gui: hwnd missing");
+            GuiWindowOptions options;
+            options.owner_hwnd = reinterpret_cast<void*>(extract_number_field(msg, "owner_hwnd"));
+            if (!options.owner_hwnd) {
+                send_event_error("show_gui: owner_hwnd missing");
                 return true;
             }
+            options.width = static_cast<uint32_t>(extract_number_field(msg, "width"));
+            options.height = static_cast<uint32_t>(extract_number_field(msg, "height"));
+            options.resizable = extract_number_field(msg, "resizable") != 0;
+            options.has_initial_pos = extract_number_field(msg, "has_initial_pos") != 0;
+            options.x = static_cast<int32_t>(extract_i64_field(msg, "x"));
+            options.y = static_cast<int32_t>(extract_i64_field(msg, "y"));
+            options.title = extract_string_field(msg, "title");
             const bool visible = extract_number_field(msg, "visible") != 0;
             std::string err;
-            if (!loader->show_gui(reinterpret_cast<void*>(hwnd_u), visible, err)) {
+            if (!loader->show_gui(options, visible, err)) {
                 send_event_error("show_gui: " + err);
                 return true;
             }
