@@ -1629,6 +1629,8 @@ impl DspBridge {
                     close_targets.push(idx);
                     continue;
                 }
+                // One UI frame naturally coalesces repeated native-titlebar clicks
+                // for the same slot into a single toggle target.
                 if bridge_bypass_toggle_slot_ids.contains(&slot.slot_id) {
                     bypass_toggle_targets.push((idx, slot.plugin_path.clone(), !slot.bypass));
                 }
@@ -1903,8 +1905,13 @@ impl DspBridge {
                     if let Some(s) = inner.slots.get_mut(idx) {
                         s.bypass = true; // refuse: 維持
                         s.auto_bypassed_for_latency = true;
+                        bridge_update = Some((s.bridge.clone(), s.slot_id, true));
                     }
                     self.recalc_active_count(&inner);
+                    drop(inner);
+                    if let Some((bridge, slot_id, bypass)) = bridge_update {
+                        let _ = bridge.set_bypass_slot(slot_id, bypass);
+                    }
                     return;
                 }
             }
