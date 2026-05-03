@@ -1231,8 +1231,20 @@ preserving the stereo-only cpal/VST contract.
 The perf log records per-audio-frame diagnostics (`path`, `decode_wait_ms`,
 `convert_ms`, `send_wait_ms`, `total_ms`) so WMA Pro and similar files can be
 split into decoder, downmix/resample, and queue-backpressure costs.
+
+## Phase 9.J: Synthesized monotonic audio PTS for broken decoder output (2026-05-03)
+
 Some ASF/WMA Pro streams emit decoded audio frames whose raw PTS repeatedly
-falls back to `0` between correctly timestamped packet-leading frames. The
-audio decode worker therefore keeps a monotonic synthetic PTS cursor per seek
-generation and uses it whenever a decoded frame timestamp would move backward;
-perf events expose both `raw_pts` and `pts_synthesized` for verification.
+falls back to `0` between correctly timestamped packet-leading frames. In the
+observed WMA Pro 5.1 sample, most decoded audio frames needed synthetic PTS;
+without that, the audio master clock repeatedly re-anchored backward and video
+pacing collapsed to roughly 0.4x real time even though decode/downmix work was
+fast.
+
+The audio decode worker now keeps a monotonic synthetic PTS cursor per seek
+generation. It still trusts valid raw timestamps, but when a decoded frame
+timestamp would move backward it assigns the next cursor timestamp and advances
+the cursor by the frame duration. This is intentionally generic, not WMA Pro
+specific, so other decoders that intermittently drop frame timestamps can use
+the same recovery path. Perf events expose both `raw_pts` and
+`pts_synthesized` for verification.
