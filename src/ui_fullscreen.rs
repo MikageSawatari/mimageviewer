@@ -61,42 +61,54 @@ struct NativeFocusClaim {
 }
 
 #[cfg(windows)]
-fn claim_native_window_under_cursor_focus() -> NativeFocusClaim {
+struct NativeFocusTarget {
+    foreground_hwnd: usize,
+    target_hwnd: usize,
+}
+
+#[cfg(windows)]
+fn native_window_under_cursor_focus_target() -> NativeFocusTarget {
     use windows::Win32::Foundation::POINT;
-    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-    use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
     use windows::Win32::UI::WindowsAndMessaging::{
-        GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
-        SetForegroundWindow, WindowFromPoint,
+        GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, WindowFromPoint,
     };
 
     unsafe {
         let mut pt = POINT::default();
         if GetCursorPos(&mut pt).is_err() {
-            return NativeFocusClaim {
-                foreground_hwnd: 0,
-                post_foreground_hwnd: 0,
+            return NativeFocusTarget {
+                foreground_hwnd: GetForegroundWindow().0 as usize,
                 target_hwnd: 0,
-                set_foreground_ok: false,
-                attach_thread_input_ok: false,
-                set_active_ok: false,
-                set_focus_ok: false,
             };
         }
         let hovered = WindowFromPoint(pt);
+        let foreground = GetForegroundWindow();
         if hovered.0.is_null() {
-            return NativeFocusClaim {
-                foreground_hwnd: 0,
-                post_foreground_hwnd: 0,
+            return NativeFocusTarget {
+                foreground_hwnd: foreground.0 as usize,
                 target_hwnd: 0,
-                set_foreground_ok: false,
-                attach_thread_input_ok: false,
-                set_active_ok: false,
-                set_focus_ok: false,
             };
         }
         let root = GetAncestor(hovered, GA_ROOT);
         let target = if root.0.is_null() { hovered } else { root };
+        NativeFocusTarget {
+            foreground_hwnd: foreground.0 as usize,
+            target_hwnd: target.0 as usize,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn claim_native_window_focus(target_hwnd: usize) -> NativeFocusClaim {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
+    };
+
+    unsafe {
+        let target = HWND(target_hwnd as *mut std::ffi::c_void);
         let foreground = GetForegroundWindow();
         let this_tid = GetCurrentThreadId();
         let foreground_tid = if !foreground.0.is_null() {
@@ -138,11 +150,25 @@ struct NativeFocusClaim {
 }
 
 #[cfg(not(windows))]
-fn claim_native_window_under_cursor_focus() -> NativeFocusClaim {
+struct NativeFocusTarget {
+    foreground_hwnd: usize,
+    target_hwnd: usize,
+}
+
+#[cfg(not(windows))]
+fn native_window_under_cursor_focus_target() -> NativeFocusTarget {
+    NativeFocusTarget {
+        foreground_hwnd: 0,
+        target_hwnd: 0,
+    }
+}
+
+#[cfg(not(windows))]
+fn claim_native_window_focus(target_hwnd: usize) -> NativeFocusClaim {
     NativeFocusClaim {
         foreground_hwnd: 0,
         post_foreground_hwnd: 0,
-        target_hwnd: 0,
+        target_hwnd,
         set_foreground_ok: false,
         attach_thread_input_ok: false,
         set_active_ok: false,
@@ -2492,30 +2518,64 @@ impl App {
             (primary_event && in_fullscreen, focused)
         });
         if fullscreen_primary_event {
-            let focus = claim_native_window_under_cursor_focus();
+            let target = native_window_under_cursor_focus_target();
             let previous_foreign_foreground = prev_foreground_hwnd != 0
-                && focus.target_hwnd != 0
-                && prev_foreground_hwnd != focus.target_hwnd;
+                && target.target_hwnd != 0
+                && prev_foreground_hwnd != target.target_hwnd;
+            let current_foreign_foreground = target.foreground_hwnd != 0
+                && target.target_hwnd != 0
+                && target.foreground_hwnd != target.target_hwnd;
             let vst_gui_visible =
                 cfg!(windows) && self.settings.vst3_enabled && self.settings.vst3_gui_visible;
             let focus_restore_click = previous_foreign_foreground || vst_gui_visible;
-            crate::logger::log(format!(
-                "[fs-focus] prev_foreground=0x{:x} foreground=0x{:x} post_foreground=0x{:x} fullscreen=0x{:x} prev_foreign={} vst_gui_visible={} viewport_focused={} suppress={} set_foreground={} attach_thread_input={} set_active={} set_focus={}",
-                prev_foreground_hwnd,
-                focus.foreground_hwnd,
-                focus.post_foreground_hwnd,
-                focus.target_hwnd,
-                previous_foreign_foreground,
-                vst_gui_visible,
-                viewport_focused,
-                focus_restore_click,
-                focus.set_foreground_ok,
-                focus.attach_thread_input_ok,
-                focus.set_active_ok,
-                focus.set_focus_ok
-            ));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            let should_claim_native_focus =
+                focus_restore_click && (previous_foreign_foreground || current_foreign_foreground);
+            let claim_debounced = self
+                .fs_last_native_focus_claim_at
+                .map(|t| t.elapsed() < std::time::Duration::from_millis(100))
+                .unwrap_or(false);
+            let focus = if should_claim_native_focus && !claim_debounced {
+                self.fs_last_native_focus_claim_at = Some(std::time::Instant::now());
+                claim_native_window_focus(target.target_hwnd)
+            } else {
+                NativeFocusClaim {
+                    foreground_hwnd: target.foreground_hwnd,
+                    post_foreground_hwnd: target.foreground_hwnd,
+                    target_hwnd: target.target_hwnd,
+                    set_foreground_ok: false,
+                    attach_thread_input_ok: false,
+                    set_active_ok: false,
+                    set_focus_ok: false,
+                }
+            };
+            if previous_foreign_foreground
+                || current_foreign_foreground
+                || should_claim_native_focus
+                || claim_debounced
+            {
+                crate::logger::log(format!(
+                    "[fs-focus] prev_foreground=0x{:x} foreground=0x{:x} post_foreground=0x{:x} fullscreen=0x{:x} prev_foreign={} current_foreign={} vst_gui_visible={} viewport_focused={} suppress={} native_claim={} claim_debounced={} set_foreground={} attach_thread_input={} set_active={} set_focus={}",
+                    prev_foreground_hwnd,
+                    focus.foreground_hwnd,
+                    focus.post_foreground_hwnd,
+                    focus.target_hwnd,
+                    previous_foreign_foreground,
+                    current_foreign_foreground,
+                    vst_gui_visible,
+                    viewport_focused,
+                    focus_restore_click,
+                    should_claim_native_focus && !claim_debounced,
+                    claim_debounced,
+                    focus.set_foreground_ok,
+                    focus.attach_thread_input_ok,
+                    focus.set_active_ok,
+                    focus.set_focus_ok
+                ));
+            }
             if focus_restore_click {
+                if should_claim_native_focus && !claim_debounced {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
                 self.fs_focus_regained_at = Some(std::time::Instant::now());
                 self.fs_suppress_primary_until_release = true;
                 return (0, false);

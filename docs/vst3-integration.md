@@ -46,6 +46,12 @@ that value against the clicked fullscreen HWND rather than only trusting
 `viewport().focused`, because cross-process owner windows can keep egui's focus
   flag true and a click can activate fullscreen before the click handler observes
   the foreground window.
+The native Win32 focus call is only made when the previous/current foreground
+state shows that fullscreen actually needs to reclaim focus, and the call is
+rate-limited. Plain fullscreen clicks where `GetForegroundWindow()` already
+matches the fullscreen HWND must not call `SetForegroundWindow`/`SetFocus`,
+because repeated no-op focus calls can briefly stall the Windows input queue and
+show up as simultaneous audio/video hitches.
 
 ## Editor chrome resize rules (2026-05)
 
