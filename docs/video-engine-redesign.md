@@ -1182,25 +1182,26 @@ mIV now does the same two defensive things:
 - `src/video/decoder.rs` reads `AVFrame.best_effort_timestamp` before falling
   back to `frame.pts()`, for both video and audio frames. Audio packet preroll
   trim also falls back from packet PTS to DTS.
-- `src/video/audio.rs` no longer treats `raw_pending` overflow as a permanent
-  kill-switch for the whole seek generation. When the pre-VST queue exceeds the
-  30s safety cap, the pump clears the backlog, zeros queued-audio accounting,
-  resets the active VST chain, and re-anchors the same seek generation at the
-  current audio frame. This keeps playback recoverable for old AVI/DivX files
-  whose audio decode briefly outruns video after a seek without leaking old VST
-  delay-line tails into the new anchor.
-
-The remaining structural improvement is optional back-pressure on `audio_rx`
-while `raw_pending` is high. Keep that as a follow-up if high-water logs remain
-frequent on normal files.
+- `src/video/audio.rs` no longer treats `raw_pending` growth as a reason to
+  discard earlier audio and re-anchor at the newest decoded frame. Instead, when
+  the pre-VST queue reaches the back-pressure threshold, the pump temporarily
+  stops reading `audio_rx`. The bounded decoder/pump and demux/audio queues then
+  slow demux naturally while preserving the audio order from the seek target.
+  The threshold is state-sensitive: playback uses a tight steady-state cap,
+  while Loading/Seeking/Buffering allow a larger preroll window so audio
+  back-pressure does not block the single demux thread before post-seek video
+  packets arrive.
 
 2026-05-03 follow-up: an earlier 2s seek-local soft cap was removed after real
 seek-to-start testing. The cap re-anchored at the newest decoded audio frame
 once `raw_pending` crossed 2s, which skipped the first ~2s of audio after W-key
 seek-to-start and caused audible A/V offset. The WMA/WMV slow-clock issue that
 motivated the soft cap is now handled by the synthesized monotonic audio PTS
-cursor (Phase 9.J) and the callback-rate wall cap (Phase 9.K), so only the 30s
-overflow recovery remains.
+cursor (Phase 9.J) and the callback-rate wall cap (Phase 9.K). 2026-05-04
+follow-up: the remaining 30s overflow re-anchor was also removed after AV1 60fps
+testing showed it could be reached during normal demux catch-up, causing W-key
+seek-to-start to jump to 30s/60s/90s audio chunks and then silence. Audio now
+uses bounded-channel back-pressure rather than destructive recovery.
 
 ## Phase 9.I: WMV/ASF frame-rate metadata fallback (2026-05-03)
 
@@ -1283,3 +1284,62 @@ to that faster clock.
 The cap is now expressed as a small rate multiplier (`wall_dt * 1.02`) instead
 of a fixed per-callback slack. This preserves a little scheduling tolerance
 without letting short audio callbacks accumulate extra clock time.
+
+## Phase 9.L: 60fps video pacing sleep granularity (2026-05-04)
+
+AV1 60fps playback exposed a demux back-pressure pattern where `video_pkt_tx`
+stayed full and the demux thread blocked while sending video packets. Because
+demux is the single source for both audio and video packets, video back-pressure
+also starved audio packets and produced visible frame misses plus audio gaps.
+
+The video decoder pacing loop now uses a 1ms sleep for short "still ahead of
+clock" waits instead of the previous 5ms sleep. At 60fps, one frame is only
+16.7ms, so a 5ms sleep can overshoot a large fraction of a frame and reduce the
+effective compressed-packet consumption cadence.
+
+2026-05-04 follow-up: 1ms pacing was not enough for some AV1 60fps files. The
+video packet channel still stayed full, so the demux thread blocked on video
+send and starved audio packets. The demuxer now has a bounded compressed-video
+overflow queue (64MiB) in front of `video_pkt_tx`. When the video packet channel
+is full, demux stores video packets in that local compressed queue and continues
+reading later audio packets from the same `AVFormatContext`; once video decode
+catches up, the queued video packets are drained back to `video_pkt_tx` in
+order. If the overflow queue reaches its bound, demux falls back to blocking on
+oldest queued video packets to avoid unbounded memory growth.
+
+Queued video and audio packets carry the seek serial. A seek clears the
+demux-side video overflow queue before sending `Flush`, and each decode thread
+drops packets whose serial no longer matches the local serial most recently
+established by `Flush`. The first implementation only compared against that
+local serial to preserve channel ordering during normal playback and seek
+transitions. Later shallow-channel fixes below extend this to the live clock
+serial as well, because stale compressed packets can otherwise keep a decoder
+busy while audio has already moved to the new timeline.
+
+2026-05-04 follow-up: audio must treat the clock's live seek serial as
+authoritative. Audio is the master clock, so if a seek happens while old audio
+packets are still queued ahead of the ordered `Flush`, playing those old packets
+advances the clock at the wrong timeline position. The audio worker now drops
+packet/frame output whenever `clock.current_seek_serial()` has already advanced
+beyond the packet/decoder serial, and `audio_tx` sends use short timeout slices
+so a blocked old frame can be abandoned promptly when a seek arrives.
+
+2026-05-04 follow-up: a short-lived experiment reduced the direct audio/video
+packet channels from 256 packets to 32 packets so `Flush` markers could reach
+the decoders sooner. Real 60fps AV1 files showed the opposite failure mode:
+32 packets is less than a second of compressed data, so `audio_pkt_tx` and
+`video_pkt_tx` filled immediately, demux blocked, and fullscreen stayed in
+"preparing" until a manual seek cleared the state. The direct queues are back to
+256 packets for burst absorption. Stale cleanup is handled by serial checks
+instead: audio and video both drop packets when the live seek serial has already
+advanced, so old timeline data can be skipped without starving demux during
+normal resume and 60fps playback.
+
+2026-05-04 follow-up: for audio-active playback, video frames no longer clear a
+seek override. High-rate files can have several seconds of decoded audio queued
+behind the pump; clearing the override from the first target video frame starts
+the visual clock before the first audible post-seek samples reach the output,
+which causes AV drift after W-key seek-to-start. Video still clears the override
+for video-only playback via the fallback anchor, but audio-bearing playback now
+waits for `fill_output` to call `clear_seek_target_override` when it actually
+publishes post-seek audio.

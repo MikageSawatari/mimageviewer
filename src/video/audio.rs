@@ -90,8 +90,8 @@ struct ProcessedChunk {
 
 /// 共有 ring buffer (Mutex 保護)。**raw / processed 2 段構造** (Codex 助言 2026-05)。
 ///
-/// - `raw_pending`: pump が積む pre-VST AudioFrame queue (cap = 30 秒)。Buffering 中も
-///   pump が back-pressure せずに処理を続けられるようにするためのバッファ。
+/// - `raw_pending`: pump が積む pre-VST AudioFrame queue。数秒を超えたら
+///   audio_rx intake を止め、bounded channel 経由で demux へ back-pressure を返す。
 /// - `processed`: post-VST chunk queue (cap = 0.10 秒 audible 相当)。fill_output が drain。
 ///   ここの長さが **EQ latency = ユーザーの設定変更が音に届くまでの時間**。
 ///
@@ -107,7 +107,8 @@ struct AudioBuffer {
     drain_offset_in_first: usize,
     /// pre-VST raw AudioFrame queue。pump が積む。VST process は `pump_drain_raw_to_processed`
     /// で「processed が cap 未満の間だけ」実行される。
-    /// cap = `RAW_OVERFLOW_SECS` 相当 (= 30 秒)。超過は overflow 回復で再 anchor する。
+    /// cap = `RAW_BACKPRESSURE_SECS` 相当。超過時は pump が audio_rx intake を一時停止し、
+    /// bounded channel 経由で demux に back-pressure を返す。
     raw_pending: std::collections::VecDeque<AudioFrame>,
     /// processed の **次に出力されるサンプルの input PTS (秒)**。
     /// 通常は `processed.front().audible_pts_secs + drain_offset/samples_per_sec` だが、
@@ -418,7 +419,7 @@ fn boost_audio_pump_priority() {
 /// **動作**:
 /// 1. audio_rx から `AudioFrame` を受信 (timeout 付き、自律 refill のため)
 /// 2. seek serial 切替時は VST plugin sync reset (= 既存挙動)
-/// 3. raw_pending に push (= cap=30秒 を超えたら overflow)
+/// 3. raw_pending に push。raw が数秒を超えたら audio_rx intake を一時停止する。
 /// 4. processed が cap (= 0.10秒) 未満の間、raw → VST process → processed をループ
 /// 5. processed の post-VST audible 秒数で BufferReady emit (= raw を**含めない**)
 ///
@@ -457,30 +458,15 @@ fn run_pump(
     // ── BufferReady 閾値 ──
     // Buffering → Playing の遷移トリガ (level event)。
     const READY_THRESHOLD_SECS: f64 = 0.10;
-    // ── raw_pending overflow / warning ──
-    // pump back-pressure を完全に避けるため raw 側は大きく持つが、安全網として上限。
-    // 30 秒で overflow (= soft fallback)、15 秒で warning ログ。
-    //
-    // **値の根拠** (= 2026-05-01 ユーザー報告 H264 HW decode の overflow 多発で改訂):
-    // engine_state gate active 中 (= Buffering) は fill_output が非 drain なので
-    // pump は raw_pending に積み続ける。audio decoder の生成速度は ~23x real-time なので、
-    // Buffering 1 秒あたり 23 秒分の raw が積まれる。AV1 long GOP の 5 秒級 Buffering でも
-    // 余裕で収まるよう 30 秒に拡張。memory cost = 30 * 96000 * 4 byte = ~11 MB (許容)。
-    // 旧 10 秒では H264 HW decode の 1-2 秒 Buffering で頻繁に overflow していた。
+    // ── raw_pending back-pressure / warning ──
+    // 以前は 30 秒を超えたら最新フレームで再 anchor していたが、video packet overflow
+    // queue 導入後は demux が audio を大きく先読みできるため、通常の seek/open でも
+    // 30 秒 overflow に到達し、曲頭を捨てる副作用が出た。現在は raw が数秒を超えたら
+    // audio_rx intake を止め、audio_tx/audio_pkt_tx の bounded queue を通じて demux に
+    // 自然な back-pressure を返す。音声は捨てず、先頭から順に消化する。
     const RAW_WARNING_SECS: f64 = 15.0;
-    const RAW_OVERFLOW_SECS: f64 = 30.0;
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum RawReanchorReason {
-        Overflow,
-    }
-
-    impl RawReanchorReason {
-        fn label(self) -> &'static str {
-            match self {
-                Self::Overflow => "overflow",
-            }
-        }
-    }
+    const RAW_BACKPRESSURE_PLAYING_SECS: f64 = 5.0;
+    const RAW_BACKPRESSURE_PREROLL_SECS: f64 = 5.0;
     // ── 自律 refill tick (Codex 助言、2026-05-01) ──
     // `recv_timeout` の値。audio_rx が空でも pump をこの間隔で起こし、processed を
     // raw_pending から自律補充する。cpal の典型的な callback 間隔 (10ms) より短く取り、
@@ -529,13 +515,29 @@ fn run_pump(
 
     while !cancel.load(Ordering::Acquire) {
         // ── frame 受信 (timeout 付き、Codex 助言): audio_rx 到着を待たず自律 refill ──
-        let frame_opt: Option<AudioFrame> = crossbeam_channel::select! {
-            recv(shutdown_rx) -> _ => return,
-            recv(rx) -> msg => match msg {
-                Ok(f) => Some(f),
-                Err(_) => break,
-            },
-            default(std::time::Duration::from_millis(REFILL_TICK_MS)) => None,
+        let raw_backpressure_secs = if engine_state.load(Ordering::Acquire) == state_code::PLAYING {
+            RAW_BACKPRESSURE_PLAYING_SECS
+        } else {
+            // The demux/decode packet queues are intentionally shallow now, so
+            // Loading/Seeking/Buffering should not let audio run far ahead of
+            // video. Use the same non-destructive back-pressure cap as playing.
+            RAW_BACKPRESSURE_PREROLL_SECS
+        };
+        let pause_audio_intake = clock.audio_raw_pending_secs() >= raw_backpressure_secs;
+        let frame_opt: Option<AudioFrame> = if pause_audio_intake {
+            crossbeam_channel::select! {
+                recv(shutdown_rx) -> _ => return,
+                default(std::time::Duration::from_millis(REFILL_TICK_MS)) => None,
+            }
+        } else {
+            crossbeam_channel::select! {
+                recv(shutdown_rx) -> _ => return,
+                recv(rx) -> msg => match msg {
+                    Ok(f) => Some(f),
+                    Err(_) => break,
+                },
+                default(std::time::Duration::from_millis(REFILL_TICK_MS)) => None,
+            }
         };
 
         // ── frame intake (Some の場合のみ): seek serial 検出、raw_pending push ──
@@ -581,10 +583,6 @@ fn run_pump(
             }
 
             // ── raw_pending に積む + seek serial 切替を 1 lock で処理 ──
-            let frame_pts_secs = frame.pts_secs;
-            let frame_seek_target_secs = frame.seek_target_secs;
-            let mut raw_reanchor_reason: Option<RawReanchorReason> = None;
-            let mut raw_reanchor_threshold_secs = RAW_OVERFLOW_SECS;
             let raw_total_secs = {
                 let mut buf = buffer.lock().unwrap();
 
@@ -611,50 +609,12 @@ fn run_pump(
                 let raw_secs: f64 = buf.raw_pending.iter().map(|f| f.duration_secs).sum::<f64>()
                     + frame.duration_secs;
 
-                let raw_overflow = raw_secs > RAW_OVERFLOW_SECS;
-
-                if raw_overflow {
-                    buf.processed.clear();
-                    buf.drain_offset_in_first = 0;
-                    buf.raw_pending.clear();
-                    buf.next_pts_secs = frame_pts_secs;
-                    buf.raw_pending.push_back(frame);
-                    publish_buffer_secs(&buf, &clock);
-                    raw_reanchor_reason = Some(RawReanchorReason::Overflow);
-                    raw_reanchor_threshold_secs = RAW_OVERFLOW_SECS;
-                } else {
-                    buf.raw_pending.push_back(frame);
-                }
+                buf.raw_pending.push_back(frame);
                 raw_secs
             };
 
             // ── overflow / warning 通知 ──
-            if let Some(raw_reanchor_reason) = raw_reanchor_reason {
-                // Newer behavior: keep this seek generation alive. Clear the
-                // queued backlog and treat the current frame as the new audio
-                // anchor, which lets old AVI/DivX files recover after seek.
-                crate::logger::log(format!(
-                    "[audio-pump] raw_pending {} ({:.1}s > {:.1}s threshold) \
-                     at seek_serial={frame_seek_serial}: re-anchor at {:.3}s",
-                    raw_reanchor_reason.label(),
-                    raw_total_secs,
-                    raw_reanchor_threshold_secs,
-                    frame_pts_secs,
-                ));
-                clock.zero_audio_tx_queued_secs();
-                seek_target_secs = Some(frame_pts_secs);
-                if pump_anchor_target_secs.is_none() {
-                    pump_anchor_target_secs = frame_seek_target_secs.or(Some(frame_pts_secs));
-                }
-                #[cfg(windows)]
-                if let Some(b) = &dsp_bridge {
-                    if b.is_enabled() && b.active_slot_count() > 0 {
-                        b.reset_plugins_sync();
-                    }
-                }
-                safety_limiter.reset();
-                activated = false;
-            } else if raw_total_secs > RAW_WARNING_SECS {
+            if raw_total_secs > RAW_WARNING_SECS {
                 // warning: 5秒に 1 度ログ。長時間 Buffering の診断用。
                 let now = std::time::Instant::now();
                 let should_log = match last_warning_at {

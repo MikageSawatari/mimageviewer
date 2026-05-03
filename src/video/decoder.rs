@@ -18,6 +18,7 @@
 //! 2 系・4 系では `ChannelLayout` 周りの API が変わっているので、
 //! `cargo check` で型エラーが出たらそこを最初に疑うこと。
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,6 +26,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crossbeam_channel::{Receiver, Sender, bounded};
 
 use super::clock::AvClock;
+
+const AUDIO_PACKET_QUEUE_CAP: usize = 256;
+const VIDEO_PACKET_QUEUE_CAP: usize = 256;
+const VIDEO_PACKET_OVERFLOW_MAX_BYTES: usize = 64 * 1024 * 1024;
+const DEMUX_PACKET_SEND_WAIT_WARN_MS: f64 = 20.0;
+const VIDEO_PACING_SLEEP_MS: u64 = 1;
+
+fn sleep_video_pacing() {
+    std::thread::sleep(std::time::Duration::from_millis(VIDEO_PACING_SLEEP_MS));
+}
 
 fn frame_best_effort_timestamp(raw: *const ffmpeg_the_third::ffi::AVFrame) -> Option<i64> {
     if raw.is_null() {
@@ -82,14 +93,18 @@ fn packet_timestamp(packet: &ffmpeg_the_third::Packet) -> Option<i64> {
 /// スレッドにして video decode と並行動作させる。
 ///
 /// `Flush` と `Eof` は `AudioWorkerMsg` と同じセマンティクスで、順序保証は channel
-/// が担保する。`Packet` には `seek_serial` を含めず、video decode thread 側が
-/// `Flush` を受領した時点で `current_seek_serial` を更新する (= 順序保証で十分、
-/// Mutex 不要)。
+/// が担保する。`Packet` には `seek_serial` を含める。video decode thread は `Flush`
+/// 受領でローカル serial を更新しつつ、clock の live serial が先に進んだ場合も古い
+/// packet を捨てる。direct queue は shallow に保ち、Flush を古い packet の後ろへ
+/// 深く埋めない設計にしているため、live serial drop でも大きな seek gap を作らない。
 enum VideoWorkerMsg {
     /// avformat から取り出した未デコード動画 packet。video decode thread が
     /// `send_packet` → `receive_frame` → (GPU blit / swscale) → pacing →
     /// `video_tx.try_send` を行う。
-    Packet(ffmpeg_the_third::Packet),
+    Packet {
+        serial: u64,
+        packet: ffmpeg_the_third::Packet,
+    },
     /// シーク完了通知。video decode thread はこれを受けて自分の avcodec デコーダ
     /// を `flush()` し、`current_seek_serial` を更新する。
     ///
@@ -118,6 +133,101 @@ enum VideoWorkerMsg {
     Eof,
 }
 
+struct QueuedVideoPacket {
+    serial: u64,
+    packet: ffmpeg_the_third::Packet,
+    pts_secs: Option<f64>,
+    size_bytes: usize,
+}
+
+fn emit_demux_packet_send_wait(
+    stream: &'static str,
+    wait_ms: f64,
+    queue_len_before: usize,
+    queue_cap: usize,
+    packet_pts: Option<f64>,
+    seek_serial: u64,
+) {
+    crate::logger::log(format!(
+        "[demux] {stream} packet send waited {wait_ms:.1}ms queue_len_before={queue_len_before}/{queue_cap} pts={}",
+        packet_pts
+            .map(|pts| format!("{pts:.3}"))
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "demux",
+            "packet_send_wait",
+            None,
+            0,
+            &[
+                ("stream", serde_json::Value::from(stream)),
+                ("wait_ms", serde_json::Value::from(wait_ms)),
+                (
+                    "queue_len_before",
+                    serde_json::Value::from(queue_len_before as i64),
+                ),
+                ("queue_cap", serde_json::Value::from(queue_cap as i64)),
+                (
+                    "packet_pts",
+                    packet_pts
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                ("seek_serial", serde_json::Value::from(seek_serial as i64)),
+            ],
+        );
+    }
+}
+
+fn emit_video_packet_overflow_queued(
+    pending_packets: usize,
+    pending_bytes: usize,
+    queue_len_before: usize,
+    packet_pts: Option<f64>,
+    seek_serial: u64,
+) {
+    crate::logger::log(format!(
+        "[demux] video packet overflow queued pending={pending_packets} bytes={pending_bytes} queue_len_before={queue_len_before}/{VIDEO_PACKET_QUEUE_CAP} pts={}",
+        packet_pts
+            .map(|pts| format!("{pts:.3}"))
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "demux",
+            "video_packet_overflow_queued",
+            None,
+            0,
+            &[
+                (
+                    "pending_packets",
+                    serde_json::Value::from(pending_packets as i64),
+                ),
+                (
+                    "pending_bytes",
+                    serde_json::Value::from(pending_bytes as i64),
+                ),
+                (
+                    "queue_len_before",
+                    serde_json::Value::from(queue_len_before as i64),
+                ),
+                (
+                    "queue_cap",
+                    serde_json::Value::from(VIDEO_PACKET_QUEUE_CAP as i64),
+                ),
+                (
+                    "packet_pts",
+                    packet_pts
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                ("seek_serial", serde_json::Value::from(seek_serial as i64)),
+            ],
+        );
+    }
+}
+
 // HwDevice (= AVBufferRef のラッパー) を別スレッドに move するため Send を実装する。
 // FFmpeg の av_buffer_ref / av_buffer_unref は内部で atomic refcount を使っているので、
 // 異なるスレッドからの ref/unref は安全 (Sync は不要 = 1 thread が排他所有する形で使う)。
@@ -133,17 +243,24 @@ unsafe impl Send for HwDevice {}
 /// `video_tx` (bounded=24) が空 → UI 側 `buf 0/24` が頻発していた。
 ///
 /// Phase A では音声 decode を独立スレッドに切り出し、demux 側は `Packet` を
-/// `audio_pkt_tx` に enqueue するだけにする。`audio_pkt_tx` (bounded=64) が満杯に
+/// `audio_pkt_tx` に enqueue するだけにする。`audio_pkt_tx` (small bounded queue) が満杯に
 /// なっても demux スレッドが一時停止するだけで、video decode は別経路でそのまま
 /// 進行する (Phase B で demux も video decode から分離予定)。
 ///
 /// `Flush` / `Eof` は順序保証のため packet と同じ channel に enqueue する
 /// (Mutex + 別チャネルだと「Flush 通知より後に届いた packet が前世代として
 /// decode される」race が起きる)。
+///
+/// ただし seek 要求後、Flush marker が bounded queue の奥に滞留している間に旧世代の
+/// audio packet を再生してしまうと、master clock 自体が旧位置で進む。audio worker は
+/// packet/frame 送出時に live seek serial も確認し、Flush 到達前でも旧世代の音を捨てる。
 enum AudioWorkerMsg {
     /// avformat から取り出した未デコード音声 packet。audio decode thread が
     /// `send_packet` → `receive_frame` → resample → `audio_tx.send` を行う。
-    Packet(ffmpeg_the_third::Packet),
+    Packet {
+        serial: u64,
+        packet: ffmpeg_the_third::Packet,
+    },
     /// シーク完了通知。audio decode thread はこれを受けたら自分の avcodec デコーダ
     /// を `flush()` する。
     ///
@@ -785,13 +902,14 @@ fn run_decoder(
     // これにより `audio_tx` (bounded=32) が満杯でも demux/video decode は止まらず、
     // `video_tx` (bounded=24) が枯渇しなくなる (旧構造の "buf 0/24" 振動の解消)。
     //
-    // 容量 256: ~5 秒分の音声 packet (= 約 50 packets/sec × 5s) を吸収可能。
-    // VST3 PDC が 2.0 秒近辺の場合に audio chain が starve しないよう、
-    // demux horizon を pace_lead (0.60s) + packet queue (5s) ≒ 5.6s まで広げる
-    // (= Codex 助言、2026-05-01)。compressed audio packet なのでメモリは軽い
-    // (= 数 KB/packet × 256 ≒ 数百 KB)。
+    // Keep this packet queue shallow. Audio prefill belongs in AudioBuffer
+    // raw_pending; a deep packet queue delays ordered Flush markers after
+    // resume/seek and can let old compressed audio run before the new timeline.
     let audio_stream_idx_for_demux: Option<usize> = audio_setup.as_ref().map(|a| a.stream_idx);
-    let (audio_pkt_tx, audio_pkt_rx) = bounded::<AudioWorkerMsg>(256);
+    let audio_time_base_for_demux: Option<(f64, f64)> = audio_setup
+        .as_ref()
+        .map(|a| (a.time_base_num, a.time_base_den));
+    let (audio_pkt_tx, audio_pkt_rx) = bounded::<AudioWorkerMsg>(AUDIO_PACKET_QUEUE_CAP);
     // audio decode thread の JoinHandle。run_decoder 終了時に
     // `drop(audio_pkt_tx)` → channel disconnect → audio thread exit を経由して join する。
     // `audio_setup` は ここで consume される (= 以降 demux からは触らない)。
@@ -825,14 +943,12 @@ fn run_decoder(
     // 飢餓状態に)。Phase B では demux thread が `input.packets()` ループを単独で
     // 回し、video packet を `video_pkt_tx` に enqueue するだけに専念する。
     //
-    // 容量 256: 60fps で ~4.3 秒分、120fps で ~2.1 秒分の video packet を吸収可能。
-    // VST3 PDC 2.0 秒近辺で video pacing が wait に入っているとき、demux が
-    // video_pkt_tx full で止まると audio packet も止まる構造だったため拡大
-    // (= Codex 助言、2026-05-01)。compressed video packet なので decoded frame queue を
-    // 増やすより遥かに軽い (= 数 KB-数十 KB/packet × 256 ≒ 数 MB)。
+    // Keep the direct video channel shallow so seek Flush markers reach the
+    // decoder quickly. Sustained compressed-video burst absorption is handled
+    // by the demux-side bounded overflow queue.
     let video_tb_num = video_time_base.numerator() as f64;
     let video_tb_den = video_time_base.denominator() as f64;
-    let (video_pkt_tx, video_pkt_rx) = bounded::<VideoWorkerMsg>(256);
+    let (video_pkt_tx, video_pkt_rx) = bounded::<VideoWorkerMsg>(VIDEO_PACKET_QUEUE_CAP);
     let video_decode_handle: std::thread::JoinHandle<()> = {
         let clock_v = clock.clone();
         let cancel_v = cancel.clone();
@@ -876,9 +992,45 @@ fn run_decoder(
 
     // ── デコードループ (demux thread) ──
 
+    let mut pending_video_packets: VecDeque<QueuedVideoPacket> = VecDeque::new();
+    let mut pending_video_packet_bytes: usize = 0;
+    let mut next_video_overflow_log_bytes: usize = 0;
+
     'outer: loop {
         if cancel.load(Ordering::Acquire) {
             break;
+        }
+
+        while let Some(queued) = pending_video_packets.pop_front() {
+            let QueuedVideoPacket {
+                serial,
+                packet,
+                pts_secs,
+                size_bytes,
+            } = queued;
+            match video_pkt_tx.try_send(VideoWorkerMsg::Packet { serial, packet }) {
+                Ok(()) => {
+                    pending_video_packet_bytes =
+                        pending_video_packet_bytes.saturating_sub(size_bytes);
+                    if pending_video_packets.is_empty() {
+                        next_video_overflow_log_bytes = 0;
+                    }
+                }
+                Err(crossbeam_channel::TrySendError::Full(VideoWorkerMsg::Packet {
+                    serial,
+                    packet,
+                })) => {
+                    pending_video_packets.push_front(QueuedVideoPacket {
+                        serial,
+                        packet,
+                        pts_secs,
+                        size_bytes,
+                    });
+                    break;
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => break 'outer,
+                Err(crossbeam_channel::TrySendError::Full(_)) => unreachable!(),
+            }
         }
 
         // シーク要求を確認
@@ -1037,6 +1189,35 @@ fn run_decoder(
             // video_pkt_tx は drop されない (video decode thread が生きている間ずっと
             // 受信可能)。send は blocking なので順序保証されるが、cancel 中は
             // disconnect になる可能性がある (= video decode thread 終了後)。
+            if !pending_video_packets.is_empty() {
+                crate::logger::log(format!(
+                    "[demux] discarded {} queued video packets ({} bytes) for seek serial={serial}",
+                    pending_video_packets.len(),
+                    pending_video_packet_bytes
+                ));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "demux",
+                        "video_packet_overflow_discarded",
+                        None,
+                        0,
+                        &[
+                            (
+                                "pending_packets",
+                                serde_json::Value::from(pending_video_packets.len() as i64),
+                            ),
+                            (
+                                "pending_bytes",
+                                serde_json::Value::from(pending_video_packet_bytes as i64),
+                            ),
+                            ("seek_serial", serde_json::Value::from(serial as i64)),
+                        ],
+                    );
+                }
+                pending_video_packets.clear();
+                pending_video_packet_bytes = 0;
+                next_video_overflow_log_bytes = 0;
+            }
             if video_pkt_tx
                 .send(VideoWorkerMsg::Flush {
                     serial,
@@ -1100,11 +1281,93 @@ fn run_decoder(
                 // すべて video decode thread 側に移管。
                 //
                 // `send` (blocking) を使う理由: 順序保証 channel に enqueue するので、
-                // 直前の Flush marker と packet の到着順が逆転しない。bounded(64) が
+                // 直前の Flush marker と packet の到着順が逆転しない。bounded queue が
                 // 満杯なら demux 側を一時 stall させて逆圧をかけるのが正しい。
-                if video_pkt_tx.send(VideoWorkerMsg::Packet(packet)).is_err() {
+                let packet_pts =
+                    packet_timestamp(&packet).map(|pts| (pts as f64) * video_tb_num / video_tb_den);
+                let packet_size = packet.size();
+                let seek_serial = clock.current_seek_serial();
+                let queue_len_before = video_pkt_tx.len();
+                if !pending_video_packets.is_empty() || video_pkt_tx.is_full() {
+                    while pending_video_packet_bytes.saturating_add(packet_size)
+                        > VIDEO_PACKET_OVERFLOW_MAX_BYTES
+                    {
+                        let Some(queued) = pending_video_packets.pop_front() else {
+                            break;
+                        };
+                        let QueuedVideoPacket {
+                            serial,
+                            packet,
+                            pts_secs,
+                            size_bytes,
+                        } = queued;
+                        let send_t0 = std::time::Instant::now();
+                        if video_pkt_tx
+                            .send(VideoWorkerMsg::Packet { serial, packet })
+                            .is_err()
+                        {
+                            break 'outer;
+                        }
+                        pending_video_packet_bytes =
+                            pending_video_packet_bytes.saturating_sub(size_bytes);
+                        let wait_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
+                        if wait_ms >= DEMUX_PACKET_SEND_WAIT_WARN_MS {
+                            emit_demux_packet_send_wait(
+                                "video",
+                                wait_ms,
+                                queue_len_before,
+                                VIDEO_PACKET_QUEUE_CAP,
+                                pts_secs,
+                                serial,
+                            );
+                        }
+                    }
+                    let queued_bytes = pending_video_packet_bytes.saturating_add(packet_size);
+                    if queued_bytes <= VIDEO_PACKET_OVERFLOW_MAX_BYTES {
+                        let should_log = pending_video_packets.is_empty()
+                            || queued_bytes >= next_video_overflow_log_bytes;
+                        pending_video_packet_bytes = queued_bytes;
+                        pending_video_packets.push_back(QueuedVideoPacket {
+                            serial: seek_serial,
+                            packet,
+                            pts_secs: packet_pts,
+                            size_bytes: packet_size,
+                        });
+                        if should_log {
+                            emit_video_packet_overflow_queued(
+                                pending_video_packets.len(),
+                                pending_video_packet_bytes,
+                                queue_len_before,
+                                packet_pts,
+                                seek_serial,
+                            );
+                            next_video_overflow_log_bytes =
+                                pending_video_packet_bytes.saturating_add(8 * 1024 * 1024);
+                        }
+                        break;
+                    }
+                }
+                let send_t0 = std::time::Instant::now();
+                if video_pkt_tx
+                    .send(VideoWorkerMsg::Packet {
+                        serial: seek_serial,
+                        packet,
+                    })
+                    .is_err()
+                {
                     // video decode thread が既に終了している → 自分も exit。
                     break 'outer;
+                }
+                let wait_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
+                if wait_ms >= DEMUX_PACKET_SEND_WAIT_WARN_MS {
+                    emit_demux_packet_send_wait(
+                        "video",
+                        wait_ms,
+                        queue_len_before,
+                        VIDEO_PACKET_QUEUE_CAP,
+                        packet_pts,
+                        seek_serial,
+                    );
                 }
                 break; // 1 パケット消費したらループ先頭でシークチェック
             } else if let Some(audio_idx) = audio_stream_idx_for_demux {
@@ -1115,21 +1378,48 @@ fn run_decoder(
                     // `trim_before_secs` を audio thread が `drop_before_secs` として保持)。
                     //
                     // `send` (blocking) を使う理由: 順序保証 channel に enqueue するので、
-                    // 直前の Flush marker と packet の到着順が逆転しない。bounded(64) が
+                    // 直前の Flush marker と packet の到着順が逆転しない。bounded queue が
                     // 満杯なら demux 側を一時 stall させて逆圧をかけるのが正しい
                     // (audio_pkt_rx 側が止まっているのに packet を取り続けると memory が
                     // 無制限に膨らむ)。stall 中も cancel は反映可能 (recv 側 disconnect で
                     // SendError → 'outer break)。
-                    if audio_pkt_tx.send(AudioWorkerMsg::Packet(packet)).is_err() {
+                    let packet_pts = audio_time_base_for_demux.and_then(|(tb_num, tb_den)| {
+                        packet_timestamp(&packet).map(|pts| (pts as f64) * tb_num / tb_den)
+                    });
+                    let seek_serial = clock.current_seek_serial();
+                    let queue_len_before = audio_pkt_tx.len();
+                    let send_t0 = std::time::Instant::now();
+                    if audio_pkt_tx
+                        .send(AudioWorkerMsg::Packet {
+                            serial: seek_serial,
+                            packet,
+                        })
+                        .is_err()
+                    {
                         // audio decode thread が既に終了している (= disconnect)。
                         // VideoPlayer の shutdown 経路 → 自分も exit。
                         break 'outer;
+                    }
+                    let wait_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
+                    if wait_ms >= DEMUX_PACKET_SEND_WAIT_WARN_MS {
+                        emit_demux_packet_send_wait(
+                            "audio",
+                            wait_ms,
+                            queue_len_before,
+                            AUDIO_PACKET_QUEUE_CAP,
+                            packet_pts,
+                            seek_serial,
+                        );
                     }
                     break; // 1 パケット消費したらループ先頭でシークチェック
                 }
             }
         }
         if !got_packet {
+            if !pending_video_packets.is_empty() {
+                sleep_video_pacing();
+                continue;
+            }
             // EOF or demux stall。先に seek 要求をチェック (race で EOF flag 立てる
             // 前に新シークが来ていれば即通常ループに戻る)。
             if clock.peek_seek_request_pending() {
@@ -1185,7 +1475,7 @@ fn run_decoder(
 ///
 /// 呼び出し元 (= demux thread) は動画 packet を `video_pkt_tx` に enqueue する
 /// だけで、`video_tx` (bounded=24) が満杯のときも自スレッドはブロックしない
-/// (= drop してカウンタ加算)。`video_pkt_rx` (bounded=64) は demux ↔ video decode
+/// (= drop してカウンタ加算)。`video_pkt_rx` (small bounded queue) は demux ↔ video decode
 /// の逆圧経路として機能する。
 ///
 /// シーク時は demux 側が `VideoWorkerMsg::Flush { serial, seek_target_secs,
@@ -1262,7 +1552,38 @@ fn run_video_decode(
                 // 何もせず次の Packet/Flush/disconnect を待つ。
                 continue;
             }
-            VideoWorkerMsg::Packet(p) => p,
+            VideoWorkerMsg::Packet { serial, packet } => {
+                let live_seek_serial = clock.current_seek_serial();
+                if serial != current_seek_serial || serial != live_seek_serial {
+                    if crate::perf::is_enabled() {
+                        let reason = if serial != live_seek_serial {
+                            "live_seek_advanced"
+                        } else {
+                            "decoder_serial_mismatch"
+                        };
+                        crate::perf::event(
+                            "video",
+                            "stale_packet_drop",
+                            None,
+                            0,
+                            &[
+                                ("reason", serde_json::Value::from(reason)),
+                                ("packet_serial", serde_json::Value::from(serial as i64)),
+                                (
+                                    "decoder_serial",
+                                    serde_json::Value::from(current_seek_serial as i64),
+                                ),
+                                (
+                                    "live_serial",
+                                    serde_json::Value::from(live_seek_serial as i64),
+                                ),
+                            ],
+                        );
+                    }
+                    continue;
+                }
+                packet
+            }
         };
 
         let send_t0 = std::time::Instant::now();
@@ -1406,7 +1727,7 @@ fn run_video_decode(
                                 }
                                 let ahead = pts_secs - clock.video_pacing_now_secs();
                                 if !post_seek_frame_sent && video_tx.is_full() {
-                                    std::thread::sleep(std::time::Duration::from_millis(5));
+                                    sleep_video_pacing();
                                     continue;
                                 }
                                 // Phase 9.E (2026-04-30 fixup): post-seek 1 枚目は
@@ -1442,7 +1763,9 @@ fn run_video_decode(
                                 // 表示不可、という構造的スタッターを起こす。
                                 //
                                 // VIDEO_QUEUE_LEAD_CAP_SECS で安全側 0.60s に cap する
-                                // (= 60fps で 36 frames 相当、queue 48 frames に余裕あり)。
+                                // (= 60fps で 36 frames 相当)。compressed-packet bursts are
+                                // absorbed by the demux-side overflow queue rather than by this
+                                // direct control/packet channel.
                                 // 非 Windows では VST3 機能なし → pdc_latency=0 = 既存動作。
                                 const VIDEO_QUEUE_LEAD_CAP_SECS: f64 = 0.60;
                                 #[cfg(windows)]
@@ -1467,7 +1790,7 @@ fn run_video_decode(
                                 if in_audio_escape && ahead < SEEK_BURST_LEAD_MAX_SECS {
                                     break;
                                 }
-                                std::thread::sleep(std::time::Duration::from_millis(5));
+                                sleep_video_pacing();
                             }
                             if new_seek_pending {
                                 // Phase B: 新世代 seek 受信時は次の recv() に戻る。
@@ -1695,7 +2018,7 @@ fn run_video_decode(
                 }
                 let ahead = pts_secs - clock.video_pacing_now_secs();
                 if !post_seek_frame_sent && video_tx.is_full() {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    sleep_video_pacing();
                     continue;
                 }
                 // Phase 9.E: post-seek 1 枚目は audio_buf 不問で必ず送出
@@ -1733,7 +2056,7 @@ fn run_video_decode(
                 if in_audio_escape && ahead < SEEK_BURST_LEAD_MAX_SECS {
                     break;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                sleep_video_pacing();
             }
             if new_seek_pending {
                 continue 'outer;
@@ -1805,7 +2128,7 @@ fn run_video_decode(
 ///
 /// 呼び出し元 (= demux + video decode thread) は音声 packet を `audio_pkt_tx` に
 /// enqueue するだけで、`audio_tx` (bounded=32) が満杯のときも自スレッドはブロック
-/// しない。`audio_pkt_rx` (bounded=64) は両 thread 間の逆圧経路として機能する。
+/// しない。`audio_pkt_rx` (small bounded queue) は両 thread 間の逆圧経路として機能する。
 ///
 /// シーク時は呼び出し元が `AudioWorkerMsg::Flush { serial, seek_target_secs,
 /// trim_before_secs }` を送る。この thread は `Flush` 受領で内部 decoder を
@@ -1899,7 +2222,38 @@ fn run_audio_decode(
                 // EOF 後 decoder を flush して次回の Packet/Flush に備える。
                 setup.decoder.flush();
             }
-            AudioWorkerMsg::Packet(packet) => {
+            AudioWorkerMsg::Packet { serial, packet } => {
+                let live_seek_serial = clock.current_seek_serial();
+                if serial != current_seek_serial || serial != live_seek_serial {
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "audio",
+                            "stale_packet_drop",
+                            None,
+                            0,
+                            &[
+                                ("packet_serial", serde_json::Value::from(serial as i64)),
+                                (
+                                    "decoder_serial",
+                                    serde_json::Value::from(current_seek_serial as i64),
+                                ),
+                                (
+                                    "live_serial",
+                                    serde_json::Value::from(live_seek_serial as i64),
+                                ),
+                                (
+                                    "reason",
+                                    serde_json::Value::from(if serial != live_seek_serial {
+                                        "live_seek_advanced"
+                                    } else {
+                                        "decoder_serial_mismatch"
+                                    }),
+                                ),
+                            ],
+                        );
+                    }
+                    continue;
+                }
                 // Phase 8.E: post-seek audio preroll を packet 段階で **decode せず**
                 // 切り捨てる。avformat は seek backward 後 keyframe 直前から packets
                 // を返すため、音声 stream は target から数百 ms 前の packets が連続
@@ -1931,6 +2285,28 @@ fn run_audio_decode(
                 while setup.decoder.receive_frame(&mut frame).is_ok() {
                     if cancel.load(Ordering::Acquire) {
                         break 'outer;
+                    }
+                    if clock.current_seek_serial() != current_seek_serial {
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "audio",
+                                "stale_frame_drop",
+                                None,
+                                0,
+                                &[
+                                    (
+                                        "decoder_serial",
+                                        serde_json::Value::from(current_seek_serial as i64),
+                                    ),
+                                    (
+                                        "live_serial",
+                                        serde_json::Value::from(clock.current_seek_serial() as i64),
+                                    ),
+                                    ("reason", serde_json::Value::from("live_seek_advanced")),
+                                ],
+                            );
+                        }
+                        break;
                     }
                     if !emit_audio_frame(
                         &mut setup,
@@ -2073,6 +2449,32 @@ fn emit_audio_frame(
     let frame_sample_pairs = samples.len() / CHANNELS;
     let duration_secs = frame_sample_pairs as f64 / setup.out_rate as f64;
     *next_audio_pts_secs = Some(pts_secs + duration_secs);
+    if clock.current_seek_serial() != current_seek_serial {
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "audio",
+                "stale_frame_drop",
+                None,
+                0,
+                &[
+                    ("pts", serde_json::Value::from(pts_secs)),
+                    (
+                        "decoder_serial",
+                        serde_json::Value::from(current_seek_serial as i64),
+                    ),
+                    (
+                        "live_serial",
+                        serde_json::Value::from(clock.current_seek_serial() as i64),
+                    ),
+                    (
+                        "reason",
+                        serde_json::Value::from("pre_send_live_seek_advanced"),
+                    ),
+                ],
+            );
+        }
+        return true;
+    }
     let frame_out = AudioFrame {
         samples,
         pts_secs,
@@ -2084,9 +2486,48 @@ fn emit_audio_frame(
     // 競合しないよう順序を保つ。失敗時はロールバック。
     clock.add_audio_tx_queued_secs(duration_secs);
     let send_t0 = std::time::Instant::now();
-    if audio_tx.send(frame_out).is_err() {
-        clock.add_audio_tx_queued_secs(-duration_secs);
-        return false;
+    let mut pending_frame = Some(frame_out);
+    loop {
+        if clock.current_seek_serial() != current_seek_serial {
+            clock.add_audio_tx_queued_secs(-duration_secs);
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "audio",
+                    "stale_frame_drop",
+                    None,
+                    0,
+                    &[
+                        ("pts", serde_json::Value::from(pts_secs)),
+                        (
+                            "decoder_serial",
+                            serde_json::Value::from(current_seek_serial as i64),
+                        ),
+                        (
+                            "live_serial",
+                            serde_json::Value::from(clock.current_seek_serial() as i64),
+                        ),
+                        (
+                            "reason",
+                            serde_json::Value::from("send_wait_live_seek_advanced"),
+                        ),
+                    ],
+                );
+            }
+            return true;
+        }
+        let frame = pending_frame
+            .take()
+            .expect("pending audio frame should exist before send_timeout");
+        match audio_tx.send_timeout(frame, std::time::Duration::from_millis(2)) {
+            Ok(()) => break,
+            Err(crossbeam_channel::SendTimeoutError::Timeout(frame)) => {
+                pending_frame = Some(frame);
+            }
+            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                clock.add_audio_tx_queued_secs(-duration_secs);
+                return false;
+            }
+        }
     }
     let send_wait_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
     if crate::perf::is_enabled() {

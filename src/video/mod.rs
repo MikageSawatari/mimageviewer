@@ -702,8 +702,8 @@ impl VideoPlayer {
                 continue;
             }
             // post-seek 第一フレームは override target で now が凍結するため
-            // pts チェックを免除して強制表示する (= UI が表示することで
-            // clear_seek_target_override が呼ばれ、override がやっと外れる)。
+            // pts チェックを免除して強制表示する。audio active 時の override 解除は
+            // fill_output が実際に post-seek 音声を出した時点で行う。
             // is_seeking() を再確認 (audio が間に override をクリアした場合の stale 防止)。
             let force_display_seek = seek_in_flight_for_display
                 && latest_renderable.is_none()
@@ -782,11 +782,23 @@ impl VideoPlayer {
                     let now_for_clear = self.clock.now_secs();
                     if clock::pts_clears_seek_override(pts, now_for_clear) {
                         if self.clock.is_audio_active() {
-                            self.clock.set_audio_pts(pts);
+                            if self.clock.is_seeking() && crate::perf::is_enabled() {
+                                crate::perf::event(
+                                    "video",
+                                    "seek_override_wait_audio_gpu",
+                                    None,
+                                    0,
+                                    &[
+                                        ("frame_pts", serde_json::Value::from(pts)),
+                                        ("now", serde_json::Value::from(now_for_clear)),
+                                        ("frame_serial", serde_json::Value::from(serial as i64)),
+                                    ],
+                                );
+                            }
                         } else {
                             self.clock.set_fallback_anchor(pts);
+                            self.clock.clear_seek_target_override(serial);
                         }
-                        self.clock.clear_seek_target_override(serial);
                     } else if self.clock.is_seeking() && crate::perf::is_enabled() {
                         // override 中で frame pts < target - 0.75 (= preroll 不足で
                         // 解除条件を満たさない経路) を perflog から特定するための診断。
@@ -823,18 +835,31 @@ impl VideoPlayer {
                     // 入れて「シークが物理的に成功した」ときだけ通常クロックに戻す。
                     let now_after = self.clock.now_secs();
                     if clock::pts_clears_seek_override(frame.pts_secs, now_after) {
-                        // post-seek フリッカー対策: override クリア前に anchor を「今 = frame.pts」
-                        // に巻き戻す。これをしないと clear 直後に notify_seek_completed 時点の
-                        // 古い anchor + 経過 wall でクロックが一気に進み、続くフレームが pts
-                        // ジャンプ表示 (= ちらつき) になる。audio あり時は set_audio_pts の
-                        // 単調性ガード経由で安全。audio path 任せにすると pause / 末尾近傍 etc.
-                        // で override が永久残留するケースがあるので UI 側でも明示 clear する。
+                        // Audio-active playback must let fill_output clear the override only
+                        // when the first audible post-seek samples actually reach the output.
+                        // Clearing from video here starts the visual clock before audio is ready
+                        // and produces AV drift on high-rate files with deep audio queues.
                         if self.clock.is_audio_active() {
-                            self.clock.set_audio_pts(frame.pts_secs);
+                            if self.clock.is_seeking() && crate::perf::is_enabled() {
+                                crate::perf::event(
+                                    "video",
+                                    "seek_override_wait_audio_cpu",
+                                    None,
+                                    0,
+                                    &[
+                                        ("frame_pts", serde_json::Value::from(frame.pts_secs)),
+                                        ("now", serde_json::Value::from(now_after)),
+                                        (
+                                            "frame_serial",
+                                            serde_json::Value::from(frame.seek_serial as i64),
+                                        ),
+                                    ],
+                                );
+                            }
                         } else {
                             self.clock.set_fallback_anchor(frame.pts_secs);
+                            self.clock.clear_seek_target_override(frame.seek_serial);
                         }
-                        self.clock.clear_seek_target_override(frame.seek_serial);
                     } else if self.clock.is_seeking() && crate::perf::is_enabled() {
                         // CPU 経路の同診断 (GPU 経路と分けて経路別の発火頻度を追える)。
                         crate::perf::event(
