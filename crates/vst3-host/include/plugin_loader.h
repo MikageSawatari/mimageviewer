@@ -198,6 +198,7 @@ private:
     bool active_ = false;
 
     bool editor_drag_active_ = false;
+    void* editor_drag_restore_owner_hwnd_ = nullptr;
     uint64_t editor_drag_started_ms_ = 0;
     uint64_t editor_drag_last_tick_ms_ = 0;
     uint32_t editor_drag_move_count_ = 0;

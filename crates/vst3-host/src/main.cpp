@@ -272,7 +272,7 @@ private:
                 const ULONGLONG dispatch_started = GetTickCount64();
                 ::DispatchMessageW(&msg);
                 const ULONGLONG dispatch_elapsed = GetTickCount64() - dispatch_started;
-                if (dispatch_elapsed >= 12) {
+                if (dispatch_elapsed >= 100 && msg.message != WM_NCLBUTTONDOWN) {
                     std::fprintf(stderr,
                                  "[BRIDGE] slow DispatchMessageW msg=0x%X hwnd=0x%llx elapsed_ms=%llu\n",
                                  msg.message,

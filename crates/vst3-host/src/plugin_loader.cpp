@@ -957,9 +957,32 @@ void PluginLoader::handle_editor_drag_start() {
     editor_drag_windowpos_count_ = 0;
     editor_drag_max_gap_ms_ = 0;
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
-    blog("editor drag START plugin=\"%s\" hwnd=0x%llx tick=%llu",
+    HWND old_owner = nullptr;
+    if (container_hwnd && IsWindow(container_hwnd)) {
+        old_owner = reinterpret_cast<HWND>(GetWindowLongPtrW(container_hwnd, GWLP_HWNDPARENT));
+        editor_drag_restore_owner_hwnd_ = old_owner;
+        if (old_owner) {
+            // During the native move/resize modal loop, a cross-process owner
+            // relationship can make Windows repeatedly reconcile z-order with
+            // the owner viewport. Detach only for the drag; the editor remains
+            // a tool window and we restore the owner when the drag ends.
+            SetWindowLongPtrW(container_hwnd, GWLP_HWNDPARENT, 0);
+            SetWindowPos(container_hwnd,
+                         nullptr,
+                         0,
+                         0,
+                         0,
+                         0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                             SWP_NOOWNERZORDER);
+        }
+    } else {
+        editor_drag_restore_owner_hwnd_ = nullptr;
+    }
+    blog("editor drag START plugin=\"%s\" hwnd=0x%llx owner=0x%llx tick=%llu",
          plugin_name_.empty() ? "(unknown)" : plugin_name_.c_str(),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
+         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(old_owner)),
          static_cast<unsigned long long>(editor_drag_started_ms_));
 }
 
@@ -998,6 +1021,18 @@ void PluginLoader::handle_editor_drag_end() {
     const uint64_t now = GetTickCount64();
     const uint64_t elapsed = now >= editor_drag_started_ms_ ? now - editor_drag_started_ms_ : 0;
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
+    HWND restore_owner = reinterpret_cast<HWND>(editor_drag_restore_owner_hwnd_);
+    if (container_hwnd && IsWindow(container_hwnd) && restore_owner && IsWindow(restore_owner)) {
+        SetWindowLongPtrW(container_hwnd, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(restore_owner));
+        SetWindowPos(container_hwnd,
+                     nullptr,
+                     0,
+                     0,
+                     0,
+                     0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE |
+                         SWP_NOOWNERZORDER);
+    }
     blog("editor drag END plugin=\"%s\" hwnd=0x%llx elapsed_ms=%llu move=%u size=%u windowpos=%u max_gap_ms=%u",
          plugin_name_.empty() ? "(unknown)" : plugin_name_.c_str(),
          static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(container_hwnd)),
@@ -1007,6 +1042,7 @@ void PluginLoader::handle_editor_drag_end() {
          editor_drag_windowpos_count_,
          editor_drag_max_gap_ms_);
     editor_drag_active_ = false;
+    editor_drag_restore_owner_hwnd_ = nullptr;
 }
 
 bool PluginLoader::poll_latency_change(uint32_t& new_latency_out) {
