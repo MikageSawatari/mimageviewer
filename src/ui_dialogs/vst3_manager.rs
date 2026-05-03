@@ -33,6 +33,46 @@
 use crate::app::App;
 use crate::video::dsp::{DspState, SlotState};
 
+fn vst3_gui_visibility_button(ui: &mut egui::Ui, visible: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(28.0, 22.0), egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let bg = if response.is_pointer_button_down_on() {
+            egui::Color32::from_rgb(72, 72, 72)
+        } else if response.hovered() {
+            egui::Color32::from_rgb(56, 56, 56)
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        if bg != egui::Color32::TRANSPARENT {
+            painter.rect_filled(rect, 3.0, bg);
+        }
+
+        let icon_color = if visible {
+            egui::Color32::from_rgb(245, 132, 28)
+        } else {
+            egui::Color32::from_gray(118)
+        };
+        let icon_fill = if visible {
+            egui::Color32::from_rgba_unmultiplied(245, 132, 28, 34)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(118, 118, 118, 20)
+        };
+        let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(15.0, 12.0));
+        painter.rect_filled(icon_rect, 2.0, icon_fill);
+        painter.rect_stroke(
+            icon_rect,
+            2.0,
+            egui::Stroke::new(1.8, icon_color),
+            egui::StrokeKind::Inside,
+        );
+    }
+    response
+}
+
 impl App {
     pub(crate) fn show_vst3_manager(&mut self, ctx: &egui::Context) {
         if !self.show_vst3_manager {
@@ -221,22 +261,13 @@ impl App {
                         ui.with_layout(
                             egui::Layout::right_to_left(egui::Align::Center),
                             |ui| {
+                                let gui_button = vst3_gui_visibility_button(ui, slot.gui_visible);
                                 if slot.gui_visible {
-                                    if ui
-                                        .small_button("GUI ×")
-                                        .on_hover_text("プラグイン GUI を閉じる")
-                                        .clicked()
-                                    {
-                                        clicked_hide_gui =
-                                            Some((idx, slot.plugin_path.clone()));
+                                    if gui_button.on_hover_text("プラグイン GUI を閉じる").clicked() {
+                                        clicked_hide_gui = Some((idx, slot.plugin_path.clone()));
                                     }
-                                } else if ui
-                                    .small_button("GUI")
-                                    .on_hover_text("プラグイン GUI を表示")
-                                    .clicked()
-                                {
-                                    clicked_show_gui =
-                                        Some((idx, slot.plugin_path.clone()));
+                                } else if gui_button.on_hover_text("プラグイン GUI を表示").clicked() {
+                                    clicked_show_gui = Some((idx, slot.plugin_path.clone()));
                                 }
                                 // ── latency 表示 (= プラグインが報告した遅延) ──
                                 // bypass=true や Loaded 以外なら表示しない (= 影響しない)

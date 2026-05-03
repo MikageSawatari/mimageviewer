@@ -208,7 +208,9 @@ settings.json に以下を保存する:
 - `state`: プラグイン側の現在状態 (= EQ カーブ等)。
   bridge から `query_state` コマンドで取得し、settings 保存時に更新。
   読み込み時に bridge へ `restore_state` で復元。
-- `user_hidden`: ユーザーが個別に閉じた GUI を、全体表示で再表示しないためのフラグ
+- `user_hidden`: ユーザーが個別に閉じた GUI を、全体表示で再表示しないためのフラグ。
+  再生中 VST3 パネルでは個別 GUI の表示状態を Bitwig 風の小さなウィンドウ枠アイコンで示し、
+  表示中はオレンジ、非表示は灰色で描画する。
 - `window_rect`: plugin GUI の位置とサイズ
 - `vst3_gui_visible`: 再生中パネルからの全体表示状態
 
