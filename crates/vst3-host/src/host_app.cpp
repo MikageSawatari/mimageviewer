@@ -137,6 +137,18 @@ tresult PLUGIN_API PlugFrame::resizeView(Steinberg::IPlugView* view,
             suppressed = true;
         }
     }
+    if (suppressed || w <= 0 || h <= 0) {
+        std::fprintf(stderr,
+                     "[BRIDGE] resizeView: rect=(%d,%d,%d,%d) size=%dx%d suppressed=%d user_resizing=%d\n",
+                     newSize->left,
+                     newSize->top,
+                     newSize->right,
+                     newSize->bottom,
+                     w,
+                     h,
+                     suppressed ? 1 : 0,
+                     user_resizing_ ? 1 : 0);
+    }
     if (host_hwnd_ && w > 0 && h > 0 && !suppressed) {
         HWND hwnd = reinterpret_cast<HWND>(host_hwnd_);
         UINT dpi = GetDpiForWindow(hwnd);
