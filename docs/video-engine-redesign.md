@@ -1191,17 +1191,16 @@ mIV now does the same two defensive things:
   delay-line tails into the new anchor.
 
 The remaining structural improvement is optional back-pressure on `audio_rx`
-while `raw_pending` is above a soft cap. Keep that as a follow-up if high-water
-logs remain frequent on normal files.
+while `raw_pending` is high. Keep that as a follow-up if high-water logs remain
+frequent on normal files.
 
-2026-05-03 follow-up: explicit seek/open targets now apply that soft cap during
-the affected seek generation. If pre-VST `raw_pending` exceeds 2 seconds, the
-pump re-anchors once at the current audio frame, clears the old backlog, resets
-the VST chain, and then keeps trimming the oldest raw frames so the pump-local
-raw queue stays near the cap. This avoids blocking demux/video packet flow while
-preventing old WMV/WMA and similar files from accumulating 7-9 seconds of raw
-audio after seek, which previously made the audio master clock advance below
-real time and forced video pacing to stutter.
+2026-05-03 follow-up: an earlier 2s seek-local soft cap was removed after real
+seek-to-start testing. The cap re-anchored at the newest decoded audio frame
+once `raw_pending` crossed 2s, which skipped the first ~2s of audio after W-key
+seek-to-start and caused audible A/V offset. The WMA/WMV slow-clock issue that
+motivated the soft cap is now handled by the synthesized monotonic audio PTS
+cursor (Phase 9.J) and the callback-rate wall cap (Phase 9.K), so only the 30s
+overflow recovery remains.
 
 ## Phase 9.I: WMV/ASF frame-rate metadata fallback (2026-05-03)
 
