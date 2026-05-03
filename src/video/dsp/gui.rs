@@ -40,7 +40,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS,
     WM_ACTIVATEAPP, WM_CLOSE, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOVE, WM_PAINT,
     WM_PARENTNOTIFY, WM_SIZE, WM_SYSCOMMAND, WM_WINDOWPOSCHANGING, WNDCLASSEXW, WS_CLIPCHILDREN,
-    WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW,
+    WS_THICKFRAME,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -766,7 +767,15 @@ fn create_window(
         // ポップアップメニューがフォーカスを取れない)。
         // 既定は **TOPMOST 無し**で作成し、フルスクリーン動画再生時のみ動的に
         // SetWindowPos(HWND_TOPMOST) で持ち上げる (= `set_window_topmost` ヘルパー)。
-        let ex_style = WINDOW_EX_STYLE(0);
+        //
+        // VST GUI host は操作用の補助窓なので Alt+Tab には出さない。実際の
+        // plugin surface は bridge 側 top-level にあるため、host 側は DWM の
+        // redirection bitmap も不要。もし plugin 相性問題が出た場合は
+        // MIV_VST_USE_REDIRECTION_BITMAP=1 で redirection bitmap を戻せる。
+        let mut ex_style = WS_EX_TOOLWINDOW;
+        if std::env::var_os("MIV_VST_USE_REDIRECTION_BITMAP").is_none() {
+            ex_style |= WS_EX_NOREDIRECTIONBITMAP;
+        }
         // ウィンドウスタイル:
         // - WS_OVERLAPPEDWINDOW = OVERLAPPED|CAPTION|SYSMENU|THICKFRAME|MIN/MAXBOX
         // - resizable=false の場合は WS_THICKFRAME (= リサイズ枠) を抜く。プラグインが
