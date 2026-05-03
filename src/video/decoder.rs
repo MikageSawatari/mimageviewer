@@ -2248,7 +2248,10 @@ impl FastDownmixToStereo {
         layout: &ffmpeg_the_third::ChannelLayout<'_>,
         channels: usize,
     ) -> Vec<DownmixEntry> {
-        const HEADROOM: f32 = 0.75;
+        // Keep multichannel fold-down below the limiter in dense 5.1/7.1
+        // material. This is intentionally conservative; users can still raise
+        // gain downstream, while clipping before VST/CPAL is much harder to fix.
+        const HEADROOM: f32 = 0.6;
 
         let mut entries = Vec::new();
         for plane in 0..channels {
