@@ -152,6 +152,11 @@ Design rules:
   `attached`, `getSize`, or another required reply path, the bridge logs a
   `plugin GUI task timeout ... gui_tid=...` line and returns an error instead of
   blocking chain initialization or the control IPC thread indefinitely.
+- Startup loading also uses bounded waits and logs both the Rust-side
+  `[VST3 startup] loading ...` line and the bridge-side `add_plugin start ...`
+  line. If a plugin blocks before it can emit `loaded`, the startup worker times
+  out instead of waiting forever, and the log identifies the plugin path that was
+  in flight.
 - Void GUI mutations stay asynchronous. During a native editor move/resize
   modal loop, thread messages may not be drained until the drag ends, so
   `set_user_resizing`, visibility/topmost/owner changes, app-active updates,

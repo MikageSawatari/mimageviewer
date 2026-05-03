@@ -110,6 +110,12 @@ fn run_vst3_startup_load(
         if let Ok(mut p) = progress.lock() {
             *p = format!("VST3 プラグインを初期化中… ({}/{})", idx + 1, total);
         }
+        crate::logger::log(format!(
+            "[VST3 startup] loading {}/{}: {}",
+            idx + 1,
+            total,
+            entry.path
+        ));
         if let Err(e) = bridge.add_plugin(
             &entry.path,
             sample_rate,
@@ -121,6 +127,13 @@ fn run_vst3_startup_load(
         ) {
             crate::logger::log(format!(
                 "vst3 startup add_plugin {} failed: {e} (このプラグインのみスキップ)",
+                entry.path
+            ));
+        } else {
+            crate::logger::log(format!(
+                "[VST3 startup] loaded {}/{}: {}",
+                idx + 1,
+                total,
                 entry.path
             ));
         }

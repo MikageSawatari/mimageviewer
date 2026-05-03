@@ -873,6 +873,8 @@ private:
             send_event_error("add_plugin: chain is not open");
             return true;
         }
+        std::fprintf(stderr, "[BRIDGE] add_plugin start path=\"%s\"\n", plugin_path.c_str());
+        std::fflush(stderr);
         uint64_t requested_slot = extract_number_field(msg, "slot_id");
         size_t slot_id = 0;
         {
@@ -893,6 +895,11 @@ private:
             send_event_error("add_plugin: load failed: " + err);
             return true;
         }
+        std::fprintf(stderr,
+                     "[BRIDGE] add_plugin load ok slot=%zu name=\"%s\"\n",
+                     slot_id,
+                     info.plugin_name.c_str());
+        std::fflush(stderr);
 
         std::string init_state = extract_string_field(msg, "state");
         if (!init_state.empty()) {

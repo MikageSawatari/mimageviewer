@@ -599,8 +599,13 @@ impl DspBridge {
         }
 
         // loaded イベントを待つ (= bridge は state 復元 + setActive 完了後に Loaded を返す)
+        let load_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         let (plugin_name, latency_samples) = loop {
-            match bridge_arc.recv() {
+            let now = std::time::Instant::now();
+            if now >= load_deadline {
+                return Err(format!("plugin load timed out: {plugin_path}"));
+            }
+            match bridge_arc.recv_timeout(load_deadline - now) {
                 Ok(Event::Loaded {
                     plugin_name,
                     latency_samples,
@@ -1056,23 +1061,24 @@ impl DspBridge {
                 "slot_id": slot_id,
             }))
             .map_err(|e| format!("send QueryGuiSize: {e}"))?;
-        let (pref_w, pref_h, resizable) = match bridge_arc.recv() {
-            Ok(Event::GuiSize {
-                width,
-                height,
-                resizable,
-            }) => (width, height, resizable),
-            Ok(other) => {
-                crate::logger::log(format!(
-                    "vst3 query_gui_size: unexpected {other:?}, fallback 1200x800"
-                ));
-                (1200, 800, true)
-            }
-            Err(e) => {
-                crate::logger::log(format!("vst3 query_gui_size: {e}, fallback 1200x800"));
-                (1200, 800, true)
-            }
-        };
+        let (pref_w, pref_h, resizable) =
+            match bridge_arc.recv_timeout(std::time::Duration::from_secs(6)) {
+                Ok(Event::GuiSize {
+                    width,
+                    height,
+                    resizable,
+                }) => (width, height, resizable),
+                Ok(other) => {
+                    crate::logger::log(format!(
+                        "vst3 query_gui_size: unexpected {other:?}, fallback 1200x800"
+                    ));
+                    (1200, 800, true)
+                }
+                Err(e) => {
+                    crate::logger::log(format!("vst3 query_gui_size: {e}, fallback 1200x800"));
+                    (1200, 800, true)
+                }
+            };
 
         // ─ Step 2: ホストウィンドウを spawn (resizable に応じてサイズ変更可否を切替) ─
         // 初期位置は slot に保持されている `desired_window_pos` を使う (= settings から
@@ -1103,7 +1109,7 @@ impl DspBridge {
             }))
             .map_err(|e| format!("send ShowGui: {e}"))?;
         let mut hwnd = 0_u64;
-        match bridge_arc.recv() {
+        match bridge_arc.recv_timeout(std::time::Duration::from_secs(6)) {
             Ok(Event::GuiAttached {
                 width: _,
                 height: _,
