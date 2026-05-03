@@ -1210,3 +1210,14 @@ WMV3/VC-1 continue to follow the user's global hardware decode setting. A
 software decode (`decode_path=sw`, `hw_effective=false`), so the remaining
 issue is tracked as audio/VST raw backlog after seek rather than a D3D11VA
 decoder problem.
+
+2026-05-03 follow-up: ASF/WMV files with WMA Pro 5.1ch audio can be bottlenecked
+by the stereo-only output path: FFmpeg decodes six planar float channels and
+then swresample downmixes to packed stereo for cpal/VST. Because mIV always
+outputs stereo, multichannel audio decoders now receive a best-effort
+`request_ch_layout=stereo` before `avcodec_open2`. If the decoder honors it,
+swresample only has to do the remaining format/rate conversion. The open perf
+event now distinguishes output fields (`audio_rate`, `audio_channels`) from
+decoder input fields (`audio_input_rate`, `audio_input_channels`,
+`audio_input_layout`, `audio_input_format`) and records whether the stereo
+request was sent/effective.

@@ -496,51 +496,77 @@ fn run_decoder(
             let tb = audio_stream.time_base();
             let params = audio_stream.parameters();
             match ffmpeg::codec::context::Context::from_parameters(params) {
-                Ok(ctx) => match ctx.decoder().audio() {
-                    Ok(mut dec) => {
-                        let in_fmt = dec.format();
-                        let in_rate = dec.rate();
-                        // FFmpeg 7.x API: channel_layout → ch_layout, get → get2
-                        let (in_layout, guessed_stereo) = {
-                            let raw_in_layout = dec.ch_layout();
-                            normalize_audio_input_layout(raw_in_layout)
-                        };
-                        if guessed_stereo {
-                            crate::logger::log(
+                Ok(mut ctx) => {
+                    let audio_codec_id = ctx.id();
+                    let audio_codec_name = audio_codec_id.name().to_string();
+                    let (container_channels, container_layout_desc) =
+                        audio_context_layout_summary(&ctx);
+                    let stereo_request_sent = request_stereo_audio_decoder_output(
+                        &mut ctx,
+                        &audio_codec_name,
+                        container_channels,
+                        &container_layout_desc,
+                    );
+                    match ctx.decoder().audio() {
+                        Ok(mut dec) => {
+                            let in_fmt = dec.format();
+                            let in_rate = dec.rate();
+                            // FFmpeg 7.x API: channel_layout → ch_layout, get → get2
+                            let (in_layout, guessed_stereo) = {
+                                let raw_in_layout = dec.ch_layout();
+                                normalize_audio_input_layout(raw_in_layout)
+                            };
+                            if guessed_stereo {
+                                crate::logger::log(
                                 "audio channel layout unspecified for 2ch stream; guessing stereo"
                                     .to_string(),
                             );
-                            dec.set_ch_layout(in_layout.clone());
-                        }
-                        // 出力は f32 packed stereo / target_audio_sample_rate
-                        let out_fmt = Sample::F32(SampleType::Packed);
-                        let out_rate = target_audio_sample_rate;
-                        let out_layout = ffmpeg::ChannelLayout::STEREO;
-                        match ResampleContext::get2(
-                            in_fmt, in_layout, in_rate, out_fmt, out_layout, out_rate,
-                        ) {
-                            Ok(rs) => Some(AudioSetup {
-                                stream_idx: idx,
-                                out_rate,
-                                time_base_num: tb.numerator() as f64,
-                                time_base_den: tb.denominator() as f64,
-                                decoder: dec,
-                                resampler: rs,
-                                codec_name: "audio".to_string(),
-                            }),
-                            Err(e) => {
-                                crate::logger::log(format!(
-                                    "audio resampler init failed: {e} (再生は映像のみ)"
-                                ));
-                                None
+                                dec.set_ch_layout(in_layout.clone());
+                            }
+                            // 出力は f32 packed stereo / target_audio_sample_rate
+                            let out_fmt = Sample::F32(SampleType::Packed);
+                            let out_rate = target_audio_sample_rate;
+                            let out_layout = ffmpeg::ChannelLayout::STEREO;
+                            let input_channels = in_layout.channels();
+                            let input_layout_desc = in_layout.description();
+                            let input_format = format!("{in_fmt:?}");
+                            let decoder_stereo_effective = input_channels <= 2;
+                            crate::logger::log(format!(
+                                "audio setup: codec={audio_codec_name} container_layout=\"{container_layout_desc}\" container_channels={container_channels} decoder_layout=\"{input_layout_desc}\" decoder_channels={input_channels} in_fmt={input_format} in_rate={in_rate} out_layout=stereo out_rate={out_rate} request_stereo={stereo_request_sent} request_effective={decoder_stereo_effective}"
+                            ));
+                            match ResampleContext::get2(
+                                in_fmt, in_layout, in_rate, out_fmt, out_layout, out_rate,
+                            ) {
+                                Ok(rs) => Some(AudioSetup {
+                                    stream_idx: idx,
+                                    out_rate,
+                                    input_rate: in_rate,
+                                    input_channels,
+                                    input_layout_desc,
+                                    input_format,
+                                    output_channels: 2,
+                                    decoder_stereo_requested: stereo_request_sent,
+                                    decoder_stereo_effective,
+                                    time_base_num: tb.numerator() as f64,
+                                    time_base_den: tb.denominator() as f64,
+                                    decoder: dec,
+                                    resampler: rs,
+                                    codec_name: audio_codec_name,
+                                }),
+                                Err(e) => {
+                                    crate::logger::log(format!(
+                                        "audio resampler init failed: {e} (再生は映像のみ)"
+                                    ));
+                                    None
+                                }
                             }
                         }
+                        Err(e) => {
+                            crate::logger::log(format!("audio decoder open failed: {e}"));
+                            None
+                        }
                     }
-                    Err(e) => {
-                        crate::logger::log(format!("audio decoder open failed: {e}"));
-                        None
-                    }
-                },
+                }
                 Err(e) => {
                     crate::logger::log(format!("audio codec context failed: {e}"));
                     None
@@ -644,10 +670,44 @@ fn run_decoder(
         let file_size = std::fs::metadata(&path)
             .map(|m| m.len() as i64)
             .unwrap_or(-1);
-        let (audio_codec, audio_rate, audio_ch) = audio_setup
+        let (
+            audio_codec,
+            audio_rate,
+            audio_ch,
+            audio_input_rate,
+            audio_input_ch,
+            audio_input_layout,
+            audio_input_format,
+            audio_decoder_stereo_requested,
+            audio_decoder_stereo_effective,
+        ) = audio_setup
             .as_ref()
-            .map(|a| (a.codec_name.clone(), a.out_rate as i64, 2_i64))
-            .unwrap_or_else(|| ("none".to_string(), 0, 0));
+            .map(|a| {
+                (
+                    a.codec_name.clone(),
+                    a.out_rate as i64,
+                    a.output_channels as i64,
+                    a.input_rate as i64,
+                    a.input_channels as i64,
+                    a.input_layout_desc.clone(),
+                    a.input_format.clone(),
+                    a.decoder_stereo_requested,
+                    a.decoder_stereo_effective,
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    "none".to_string(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    "none".to_string(),
+                    "none".to_string(),
+                    false,
+                    false,
+                )
+            });
         crate::perf::event(
             "video",
             "open",
@@ -681,6 +741,30 @@ fn run_decoder(
                 ("audio_codec", serde_json::Value::from(audio_codec)),
                 ("audio_rate", serde_json::Value::from(audio_rate)),
                 ("audio_channels", serde_json::Value::from(audio_ch)),
+                (
+                    "audio_input_rate",
+                    serde_json::Value::from(audio_input_rate),
+                ),
+                (
+                    "audio_input_channels",
+                    serde_json::Value::from(audio_input_ch),
+                ),
+                (
+                    "audio_input_layout",
+                    serde_json::Value::from(audio_input_layout),
+                ),
+                (
+                    "audio_input_format",
+                    serde_json::Value::from(audio_input_format),
+                ),
+                (
+                    "audio_decoder_stereo_requested",
+                    serde_json::Value::from(audio_decoder_stereo_requested),
+                ),
+                (
+                    "audio_decoder_stereo_effective",
+                    serde_json::Value::from(audio_decoder_stereo_effective),
+                ),
             ],
         );
     }
@@ -1967,9 +2051,66 @@ fn normalize_audio_input_layout(
     }
 }
 
+fn audio_context_layout_summary(ctx: &ffmpeg_the_third::codec::context::Context) -> (u32, String) {
+    unsafe {
+        let avctx = ffmpeg_the_third::AsPtr::as_ptr(ctx);
+        let layout = ffmpeg_the_third::ChannelLayout::from(&(*avctx).ch_layout);
+        let desc = layout.description();
+        (
+            layout.channels(),
+            if desc.is_empty() {
+                "unknown".to_string()
+            } else {
+                desc
+            },
+        )
+    }
+}
+
+fn request_stereo_audio_decoder_output(
+    ctx: &mut ffmpeg_the_third::codec::context::Context,
+    codec_name: &str,
+    input_channels: u32,
+    input_layout_desc: &str,
+) -> bool {
+    use ffmpeg_the_third::option::Settable;
+
+    // mIV の audio output / VST chain は stereo 固定なので、multichannel decoder には
+    // 可能なら最初から stereo 出力を要求する。WMA Pro 5.1ch などで、重い
+    // 6ch decode + swresample downmix 経路を避けるための互換ワークアラウンド。
+    if input_channels <= 2 {
+        return false;
+    }
+
+    let result = ctx
+        .set_str("request_ch_layout", "stereo")
+        .or_else(|_| ctx.set_str("request_channel_layout", "stereo"));
+    match result {
+        Ok(()) => {
+            crate::logger::log(format!(
+                "audio decoder stereo request: codec={codec_name} input_layout=\"{input_layout_desc}\" input_channels={input_channels}"
+            ));
+            true
+        }
+        Err(e) => {
+            crate::logger::log(format!(
+                "audio decoder stereo request failed: codec={codec_name} input_layout=\"{input_layout_desc}\" input_channels={input_channels} err={e}"
+            ));
+            false
+        }
+    }
+}
+
 struct AudioSetup {
     stream_idx: usize,
     out_rate: u32,
+    input_rate: u32,
+    input_channels: u32,
+    input_layout_desc: String,
+    input_format: String,
+    output_channels: u32,
+    decoder_stereo_requested: bool,
+    decoder_stereo_effective: bool,
     time_base_num: f64,
     time_base_den: f64,
     decoder: ffmpeg_the_third::decoder::Audio,
@@ -2577,8 +2718,7 @@ fn try_gpu_blit_path(
 #[cfg(test)]
 mod decoder_candidate_tests {
     use super::{
-        DecoderChoice, normalize_audio_input_layout, preferred_video_decoders,
-        selected_video_rate,
+        DecoderChoice, normalize_audio_input_layout, preferred_video_decoders, selected_video_rate,
     };
     use ffmpeg_the_third::ChannelLayout;
     use ffmpeg_the_third::codec::Id;
