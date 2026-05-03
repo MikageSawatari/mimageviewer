@@ -190,6 +190,9 @@ bridge → 親:
   - **sample_rate が変わったら** bridge に `setup_processing` 再呼び出し
     (= プラグインの state は維持、IO config だけ再構成)
   - sample_rate が同じなら何もしない
+  - `audio-pump` は新しい動画の最初の有効 audio frame でも `reset_plugins_sync`
+    を実行する。bridge / plugin instance は動画間で永続するため、前動画の
+    VST delay-line や shared-memory out ring の残りを次動画の冒頭へ漏らさない。
 - プラグイン側の **lookahead / latency は state を維持**したまま継続
 
 実装メモ: VST3 仕様では `IAudioProcessor::setupProcessing()` を再呼び出す前に

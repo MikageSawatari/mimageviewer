@@ -483,6 +483,10 @@ fn run_pump(
 
     let mut activated = false;
     let mut last_seen_seek_serial: u64 = 0;
+    // The VST bridge persists across videos, while each new VideoPlayer starts
+    // its seek serial at 0. Reset plugins on the first valid frame too, not only
+    // when the serial increases, so previous-video delay/ring tails cannot leak.
+    let mut seen_valid_audio_frame = false;
     // このシーク世代の seek_target (= 最初の post-seek フレームの input PTS)。
     // PDC 適用後の chunk が `audible_pts < seek_target` だと「pre-target silence」と
     // 判定して push せずに drop する (= Codex P1-1: 早すぎる BufferReady 防止)。
@@ -539,7 +543,9 @@ fn run_pump(
             // ── 新 seek 世代の検出 → VST plugin sync reset (= 既存挙動) ──
             let frame_seek_serial = frame.seek_serial;
             let cur_clock_serial = clock.current_seek_serial();
-            if frame_seek_serial > last_seen_seek_serial && frame_seek_serial >= cur_clock_serial {
+            let should_reset_plugins = frame_seek_serial >= cur_clock_serial
+                && (!seen_valid_audio_frame || frame_seek_serial > last_seen_seek_serial);
+            if should_reset_plugins {
                 #[cfg(windows)]
                 if let Some(b) = &dsp_bridge {
                     if b.is_enabled() && b.active_slot_count() > 0 {
@@ -547,6 +553,7 @@ fn run_pump(
                     }
                 }
                 last_seen_seek_serial = frame_seek_serial;
+                seen_valid_audio_frame = true;
                 // 新 seek 世代: overflow / target / activate を全 reset
                 overflow_for_serial = None;
                 safety_limiter.reset();
