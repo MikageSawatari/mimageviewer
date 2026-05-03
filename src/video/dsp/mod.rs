@@ -99,6 +99,9 @@ pub struct DspBridge {
     /// Bridge-owned plugin surfaces should stay above the video only while
     /// mIV itself or one of its VST bridge processes is foreground.
     gui_app_active_effective: AtomicBool,
+    /// Debounce transient foreground changes so clicking the fullscreen
+    /// viewport does not briefly drop plugin editors behind the video.
+    gui_app_inactive_since: Mutex<Option<Instant>>,
     /// audio output の sample_rate (= cpal 出力レート)。`add_plugin` の 1 回目で
     /// 設定される (= 全 slot 同一)。UI で latency を ms 表示する際に使う。
     /// 0 = 未設定 (= プラグイン未追加状態)。
@@ -172,6 +175,10 @@ pub(crate) struct PluginSlot {
     /// Host HWND WM_ACTIVATEAPP signal. Used to hide bridge-owned plugin
     /// surfaces while another application is foreground.
     pub gui_app_active_signal: Option<Arc<Mutex<Option<std::sync::mpsc::Receiver<bool>>>>>,
+    /// True while the user is dragging/resizing the GUI host window. During
+    /// this session bridge surface move notifications are sent without the
+    /// normal throttle so D3D editors do not visibly lag behind the host.
+    pub gui_resize_session_active: bool,
 }
 
 impl DspBridge {
@@ -189,6 +196,7 @@ impl DspBridge {
             active_slot_count: AtomicUsize::new(0),
             gui_topmost_desired: AtomicBool::new(false),
             gui_app_active_effective: AtomicBool::new(true),
+            gui_app_inactive_since: Mutex::new(None),
             sample_rate: AtomicU32::new(0),
         })
     }
@@ -582,6 +590,7 @@ impl DspBridge {
             last_resize_notify: None,
             gui_resize_session_signal: None,
             gui_app_active_signal: None,
+            gui_resize_session_active: false,
         });
         self.recalc_active_count(&inner);
         drop(inner);
@@ -1049,6 +1058,7 @@ impl DspBridge {
             slot.last_resize_notify = None;
             slot.gui_resize_session_signal = Some(reply.resize_session_signal);
             slot.gui_app_active_signal = Some(reply.app_active_signal);
+            slot.gui_resize_session_active = false;
         }
         drop(inner);
         // 新規作成時も「現在の topmost desired state」を反映
@@ -1355,7 +1365,7 @@ impl DspBridge {
         let mut session_targets: Vec<(usize, bool)> = Vec::new();
         let mut app_active_latest: Option<bool> = None;
         let now = Instant::now();
-        let resize_interval = Duration::from_millis(33);
+        let normal_resize_interval = Duration::from_millis(16);
         {
             let mut inner = self.inner.lock().unwrap();
             for (idx, slot) in inner.slots.iter_mut().enumerate() {
@@ -1383,7 +1393,26 @@ impl DspBridge {
                         }
                     }
                 }
+                if let Some(arc) = slot.gui_resize_session_signal.as_ref() {
+                    if let Ok(guard) = arc.lock() {
+                        if let Some(rx) = guard.as_ref() {
+                            let mut latest: Option<bool> = None;
+                            while let Ok(active) = rx.try_recv() {
+                                latest = Some(active);
+                            }
+                            if let Some(active) = latest {
+                                slot.gui_resize_session_active = active;
+                                session_targets.push((idx, active));
+                            }
+                        }
+                    }
+                }
                 if let Some((w, h)) = slot.pending_resize_notify {
+                    let resize_interval = if slot.gui_resize_session_active {
+                        Duration::ZERO
+                    } else {
+                        normal_resize_interval
+                    };
                     let ready = slot
                         .last_resize_notify
                         .map(|last| now.duration_since(last) >= resize_interval)
@@ -1456,7 +1485,26 @@ impl DspBridge {
         // resize は bridge に send (Mutex 外で bridge clone してから)
         let foreground_active = self.foreground_belongs_to_miv_or_bridge();
         let active = if cfg!(windows) {
-            foreground_active
+            if foreground_active {
+                if let Ok(mut inactive_since) = self.gui_app_inactive_since.lock() {
+                    *inactive_since = None;
+                }
+                true
+            } else {
+                let previous = self.gui_app_active_effective.load(Ordering::Acquire);
+                let inactive_long_enough =
+                    if let Ok(mut inactive_since) = self.gui_app_inactive_since.lock() {
+                        let since = inactive_since.get_or_insert(now);
+                        now.duration_since(*since) >= Duration::from_millis(160)
+                    } else {
+                        true
+                    };
+                if inactive_long_enough {
+                    false
+                } else {
+                    previous
+                }
+            }
         } else {
             app_active_latest.unwrap_or(foreground_active)
         };

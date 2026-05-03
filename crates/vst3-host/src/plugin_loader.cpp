@@ -1336,25 +1336,14 @@ void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd)) {
         RECT rect{};
-        bool moved_surface = false;
-        int x = 0;
-        int y = 0;
-        UINT flags = SWP_NOZORDER | SWP_NOACTIVATE;
         if (host_client_rect_on_screen(reinterpret_cast<HWND>(view_host_hwnd_), rect)) {
-            x = rect.left;
-            y = rect.top;
-        } else {
-            flags |= SWP_NOMOVE;
-        }
-        SetWindowPos(container_hwnd,
-                     nullptr,
-                     x,
-                     y,
-                     std::max<int>(1, static_cast<int>(width)),
-                     std::max<int>(1, static_cast<int>(height)),
-                     flags);
-        moved_surface = (flags & SWP_NOMOVE) == 0;
-        if (moved_surface) {
+            SetWindowPos(container_hwnd,
+                         nullptr,
+                         rect.left,
+                         rect.top,
+                         std::max<int>(1, static_cast<int>(width)),
+                         std::max<int>(1, static_cast<int>(height)),
+                         SWP_NOZORDER | SWP_NOACTIVATE);
             // Move-only updates do not call IPlugView::onSize below. Nudge
             // D3D-backed editors so their swapchain presents at the new
             // desktop position instead of leaving stale pixels behind until
@@ -1363,6 +1352,8 @@ void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
                          nullptr,
                          nullptr,
                          RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
+        } else {
+            blog("notify_host_resize: skipped bridge surface move; host rect unavailable");
         }
     }
     const bool size_changed = width != last_gui_width_ || height != last_gui_height_;
