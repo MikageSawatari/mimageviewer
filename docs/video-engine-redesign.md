@@ -1224,6 +1224,10 @@ request was sent/effective.
 
 The FFmpeg 7.1 build used by the Windows bundle does not expose that decoder
 request for WMA Pro (`Option not found`), so mIV also has a narrow fast path for
-the actual sample: planar f32 multichannel input at the output sample rate is
-folded down directly to packed stereo in Rust. That bypasses swresample's
-5.1-to-stereo matrix path while preserving the stereo-only cpal/VST contract.
+multichannel input at the output sample rate: f32/s32/s16, planar or packed, is
+folded down directly to packed stereo in Rust using FFmpeg's channel-position
+metadata. That bypasses swresample's multichannel-to-stereo matrix path while
+preserving the stereo-only cpal/VST contract.
+The perf log records per-audio-frame diagnostics (`path`, `decode_wait_ms`,
+`convert_ms`, `send_wait_ms`, `total_ms`) so WMA Pro and similar files can be
+split into decoder, downmix/resample, and queue-backpressure costs.

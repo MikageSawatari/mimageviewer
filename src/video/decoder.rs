@@ -532,7 +532,7 @@ fn run_decoder(
                             let input_format = format!("{in_fmt:?}");
                             let decoder_stereo_effective = input_channels <= 2;
                             let fast_downmix =
-                                FastDownmixPlanarF32::new(in_fmt, &in_layout, in_rate, out_rate);
+                                FastDownmixToStereo::new(in_fmt, &in_layout, in_rate, out_rate);
                             let fast_downmix_enabled = fast_downmix.is_some();
                             crate::logger::log(format!(
                                 "audio setup: codec={audio_codec_name} container_layout=\"{container_layout_desc}\" container_channels={container_channels} decoder_layout=\"{input_layout_desc}\" decoder_channels={input_channels} in_fmt={input_format} in_rate={in_rate} out_layout=stereo out_rate={out_rate} request_stereo={stereo_request_sent} request_effective={decoder_stereo_effective} fast_downmix={fast_downmix_enabled}"
@@ -1882,6 +1882,7 @@ fn run_audio_decode(
                         &mut drop_before_secs,
                         current_seek_serial,
                         current_seek_target_secs,
+                        None,
                         &clock,
                         &audio_tx,
                     ) {
@@ -1914,6 +1915,7 @@ fn run_audio_decode(
                         }
                     }
                 }
+                let packet_decode_t0 = std::time::Instant::now();
                 if let Err(e) = setup.decoder.send_packet(&packet) {
                     crate::logger::log(format!("audio send_packet: {e}"));
                     continue;
@@ -1929,6 +1931,7 @@ fn run_audio_decode(
                         &mut drop_before_secs,
                         current_seek_serial,
                         current_seek_target_secs,
+                        Some(packet_decode_t0.elapsed().as_secs_f64() * 1000.0),
                         &clock,
                         &audio_tx,
                     ) {
@@ -1950,6 +1953,7 @@ fn emit_audio_frame(
     drop_before_secs: &mut Option<f64>,
     current_seek_serial: u64,
     current_seek_target_secs: Option<f64>,
+    decode_wait_ms: Option<f64>,
     clock: &AvClock,
     audio_tx: &Sender<AudioFrame>,
 ) -> bool {
@@ -1957,61 +1961,66 @@ fn emit_audio_frame(
     use ffmpeg::util::frame::audio::Audio;
     use ffmpeg_the_third as ffmpeg;
 
+    let emit_t0 = std::time::Instant::now();
     let pts = audio_frame_timestamp(frame).unwrap_or(0);
     let mut pts_secs = (pts as f64) * setup.time_base_num / setup.time_base_den;
     const CHANNELS: usize = 2;
-    let mut samples: Vec<f32> = if let Some(downmix) = &setup.fast_downmix {
-        match downmix.run(frame) {
-            Some(samples) => samples,
-            None => return true,
-        }
-    } else {
-        let (_, guessed_frame_stereo) = normalize_audio_input_layout(frame.ch_layout());
-        if guessed_frame_stereo {
-            frame.set_ch_layout(ffmpeg::ChannelLayout::STEREO);
-        }
-        let mut resampled = Audio::empty();
-        if let Err(e) = setup.resampler.run(frame, &mut resampled) {
-            crate::logger::log(format!("swr resample: {e}"));
-            return true; // 1 frame 失敗は致命的でない
-        }
-        // 1 plane (packed) の f32 を取り出す。
-        //
-        // ⚠️ **`data(0)` は使わない**。`data(0)` が返すスライスは
-        // ffmpeg-the-third の `linesize[0]` ベースで、SIMD アラインメント
-        // のため **実サンプル数より大きいバイト列を返す**。
-        // `chunks_exact(4)` で f32 化すると末尾のパディング
-        // (未初期化メモリ or 0) も f32 として再生してしまい、
-        // 強い "ブチブチ" ノイズの原因になる。
-        //
-        // door_player と同じく `(*frame.as_ptr()).data[0]` を直接 `*const f32`
-        // としてキャストし、要素数 = `samples * channels` (= 実サンプル数)
-        // を指定して `from_raw_parts` でスライス化する。これにより
-        // FFmpeg の linesize パディングを完全にスキップできる。
-        //
-        // SAFETY:
-        //   - resampled は packed format (Sample::F32(Type::Packed))
-        //   - data[0] は frame の生存中有効
-        //   - samples * channels * sizeof(f32) バイトは確実にアロケート済み
-        //   - resampler.run() の出力なので i32 オーバーフローは起きない
-        let nb_samples = resampled.samples();
-        if nb_samples == 0 {
-            // 解像度の都合等で 0 サンプルが返ることがある (resample のラグ)。
-            // raw pointer dereference を避けて早期 return。
-            return true;
-        }
-        // ランタイム不変条件チェック (Codex P3): resampler の出力が
-        // 期待通り f32 packed であること。デバッグ時に format/layout
-        // を取り違えていれば即座に panic で気付ける。
-        debug_assert_eq!(resampled.format(), Sample::F32(SampleType::Packed));
-        debug_assert!(resampled.is_packed());
-        let element_count = nb_samples * CHANNELS;
-        unsafe {
-            let raw_ptr = (*resampled.as_ptr()).data[0] as *const f32;
-            debug_assert!(!raw_ptr.is_null());
-            std::slice::from_raw_parts(raw_ptr, element_count).to_vec()
-        }
-    };
+    let convert_t0 = std::time::Instant::now();
+    let (mut samples, audio_path): (Vec<f32>, &'static str) =
+        if let Some(downmix) = &setup.fast_downmix {
+            match downmix.run(frame) {
+                Some(samples) => (samples, "fast_downmix"),
+                None => return true,
+            }
+        } else {
+            let (_, guessed_frame_stereo) = normalize_audio_input_layout(frame.ch_layout());
+            if guessed_frame_stereo {
+                frame.set_ch_layout(ffmpeg::ChannelLayout::STEREO);
+            }
+            let mut resampled = Audio::empty();
+            if let Err(e) = setup.resampler.run(frame, &mut resampled) {
+                crate::logger::log(format!("swr resample: {e}"));
+                return true; // 1 frame 失敗は致命的でない
+            }
+            // 1 plane (packed) の f32 を取り出す。
+            //
+            // ⚠️ **`data(0)` は使わない**。`data(0)` が返すスライスは
+            // ffmpeg-the-third の `linesize[0]` ベースで、SIMD アラインメント
+            // のため **実サンプル数より大きいバイト列を返す**。
+            // `chunks_exact(4)` で f32 化すると末尾のパディング
+            // (未初期化メモリ or 0) も f32 として再生してしまい、
+            // 強い "ブチブチ" ノイズの原因になる。
+            //
+            // door_player と同じく `(*frame.as_ptr()).data[0]` を直接 `*const f32`
+            // としてキャストし、要素数 = `samples * channels` (= 実サンプル数)
+            // を指定して `from_raw_parts` でスライス化する。これにより
+            // FFmpeg の linesize パディングを完全にスキップできる。
+            //
+            // SAFETY:
+            //   - resampled は packed format (Sample::F32(Type::Packed))
+            //   - data[0] は frame の生存中有効
+            //   - samples * channels * sizeof(f32) バイトは確実にアロケート済み
+            //   - resampler.run() の出力なので i32 オーバーフローは起きない
+            let nb_samples = resampled.samples();
+            if nb_samples == 0 {
+                // 解像度の都合等で 0 サンプルが返ることがある (resample のラグ)。
+                // raw pointer dereference を避けて早期 return。
+                return true;
+            }
+            // ランタイム不変条件チェック (Codex P3): resampler の出力が
+            // 期待通り f32 packed であること。デバッグ時に format/layout
+            // を取り違えていれば即座に panic で気付ける。
+            debug_assert_eq!(resampled.format(), Sample::F32(SampleType::Packed));
+            debug_assert!(resampled.is_packed());
+            let element_count = nb_samples * CHANNELS;
+            let samples = unsafe {
+                let raw_ptr = (*resampled.as_ptr()).data[0] as *const f32;
+                debug_assert!(!raw_ptr.is_null());
+                std::slice::from_raw_parts(raw_ptr, element_count).to_vec()
+            };
+            (samples, "swr")
+        };
+    let convert_ms = convert_t0.elapsed().as_secs_f64() * 1000.0;
 
     // post-seek preroll の trim:
     // avformat_seek は keyframe に戻るので、target_secs 未満の
@@ -2038,7 +2047,8 @@ fn emit_audio_frame(
     }
 
     // 1 stereo pair = 2 float (samples_per_sec stereo = setup.out_rate * 2)
-    let duration_secs = (samples.len() / 2) as f64 / setup.out_rate as f64;
+    let frame_sample_pairs = samples.len() / CHANNELS;
+    let duration_secs = frame_sample_pairs as f64 / setup.out_rate as f64;
     let frame_out = AudioFrame {
         samples,
         pts_secs,
@@ -2049,9 +2059,56 @@ fn emit_audio_frame(
     // tx queued 合計を **send 前に加算**。pump.recv 後の減算と
     // 競合しないよう順序を保つ。失敗時はロールバック。
     clock.add_audio_tx_queued_secs(duration_secs);
+    let send_t0 = std::time::Instant::now();
     if audio_tx.send(frame_out).is_err() {
         clock.add_audio_tx_queued_secs(-duration_secs);
         return false;
+    }
+    let send_wait_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "audio",
+            "frame",
+            None,
+            0,
+            &[
+                ("pts", serde_json::Value::from(pts_secs)),
+                ("duration_secs", serde_json::Value::from(duration_secs)),
+                (
+                    "sample_pairs",
+                    serde_json::Value::from(frame_sample_pairs as i64),
+                ),
+                ("path", serde_json::Value::from(audio_path)),
+                (
+                    "input_format",
+                    serde_json::Value::from(setup.input_format.as_str()),
+                ),
+                (
+                    "decode_wait_ms",
+                    decode_wait_ms
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                ("convert_ms", serde_json::Value::from(convert_ms)),
+                ("send_wait_ms", serde_json::Value::from(send_wait_ms)),
+                (
+                    "total_ms",
+                    serde_json::Value::from(emit_t0.elapsed().as_secs_f64() * 1000.0),
+                ),
+                (
+                    "input_channels",
+                    serde_json::Value::from(setup.input_channels as i64),
+                ),
+                (
+                    "audio_tx_queued_secs",
+                    serde_json::Value::from(clock.audio_tx_queued_secs()),
+                ),
+                (
+                    "seek_serial",
+                    serde_json::Value::from(i64::try_from(current_seek_serial).unwrap_or(i64::MAX)),
+                ),
+            ],
+        );
     }
     true
 }
@@ -2106,71 +2163,136 @@ fn request_stereo_audio_decoder_output(
 }
 
 #[derive(Clone, Debug)]
-struct FastDownmixPlanarF32 {
-    channels: usize,
-    fl: Option<usize>,
-    fr: Option<usize>,
-    fc: Option<usize>,
-    lfe: Option<usize>,
-    sl: Option<usize>,
-    sr: Option<usize>,
-    bl: Option<usize>,
-    br: Option<usize>,
+struct DownmixEntry {
+    plane: usize,
+    left: f32,
+    right: f32,
+    name: String,
 }
 
-impl FastDownmixPlanarF32 {
+#[derive(Clone, Debug)]
+struct FastDownmixToStereo {
+    channels: usize,
+    format: ffmpeg_the_third::format::sample::Sample,
+    entries: Vec<DownmixEntry>,
+}
+
+impl FastDownmixToStereo {
     fn new(
         input_format: ffmpeg_the_third::format::sample::Sample,
         input_layout: &ffmpeg_the_third::ChannelLayout<'_>,
         input_rate: u32,
         output_rate: u32,
     ) -> Option<Self> {
-        use ffmpeg::format::sample::{Sample, Type as SampleType};
         use ffmpeg_the_third as ffmpeg;
 
         let channels = input_layout.channels() as usize;
-        if input_format != Sample::F32(SampleType::Planar)
-            || channels <= 2
-            || channels > 8
-            || input_rate != output_rate
-        {
+        if !Self::supports_format(input_format) || channels <= 2 || input_rate != output_rate {
             return None;
         }
 
-        let mut this = Self {
+        let mut entries = Self::entries_for_layout(input_layout, channels);
+        if entries.is_empty() {
+            // Some legacy files only expose the channel count. Fall back to
+            // FFmpeg's default ordering for that count so 5.1/7.1 material can
+            // still use the fast path without assuming every file is 5.1.
+            let fallback = ffmpeg::ChannelLayout::default_for_channels(channels as u32);
+            entries = Self::entries_for_layout(&fallback, channels);
+        }
+        if entries.is_empty() {
+            return None;
+        }
+
+        let this = Self {
             channels,
-            fl: input_layout.index_from_string("FL").map(|v| v as usize),
-            fr: input_layout.index_from_string("FR").map(|v| v as usize),
-            fc: input_layout.index_from_string("FC").map(|v| v as usize),
-            lfe: input_layout.index_from_string("LFE").map(|v| v as usize),
-            sl: input_layout.index_from_string("SL").map(|v| v as usize),
-            sr: input_layout.index_from_string("SR").map(|v| v as usize),
-            bl: input_layout.index_from_string("BL").map(|v| v as usize),
-            br: input_layout.index_from_string("BR").map(|v| v as usize),
+            format: input_format,
+            entries,
         };
 
-        if this.fl.is_none() && channels >= 2 {
-            this.fl = Some(0);
-            this.fr = Some(1);
-        }
-        if this.fc.is_none() && channels >= 3 {
-            this.fc = Some(2);
-        }
-        if this.lfe.is_none() && channels >= 4 {
-            this.lfe = Some(3);
-        }
-        if this.sl.is_none() && this.bl.is_none() && channels >= 6 {
-            this.sl = Some(4);
-            this.sr = Some(5);
-        }
-
+        let map = this
+            .entries
+            .iter()
+            .map(|entry| {
+                format!(
+                    "{}:{}:{:.3}/{:.3}",
+                    entry.plane, entry.name, entry.left, entry.right
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
         crate::logger::log(format!(
-            "audio fast downmix enabled: layout=\"{}\" channels={} map={:?}",
+            "audio fast downmix enabled: layout=\"{}\" format={} channels={} map={map}",
             input_layout.description(),
+            input_format.name(),
             channels,
-            this
         ));
         Some(this)
+    }
+
+    fn supports_format(format: ffmpeg_the_third::format::sample::Sample) -> bool {
+        use ffmpeg::format::sample::{Sample, Type as SampleType};
+        use ffmpeg_the_third as ffmpeg;
+
+        matches!(
+            format,
+            Sample::F32(SampleType::Planar)
+                | Sample::F32(SampleType::Packed)
+                | Sample::I32(SampleType::Planar)
+                | Sample::I32(SampleType::Packed)
+                | Sample::I16(SampleType::Planar)
+                | Sample::I16(SampleType::Packed)
+        )
+    }
+
+    fn entries_for_layout(
+        layout: &ffmpeg_the_third::ChannelLayout<'_>,
+        channels: usize,
+    ) -> Vec<DownmixEntry> {
+        const HEADROOM: f32 = 0.75;
+
+        let mut entries = Vec::new();
+        for plane in 0..channels {
+            let channel = layout.channel_from_index(plane as u32);
+            let (left, right) = Self::stereo_coeffs(channel);
+            if left == 0.0 && right == 0.0 {
+                continue;
+            }
+            entries.push(DownmixEntry {
+                plane,
+                left: left * HEADROOM,
+                right: right * HEADROOM,
+                name: channel.name(),
+            });
+        }
+        entries
+    }
+
+    fn stereo_coeffs(channel: ffmpeg_the_third::Channel) -> (f32, f32) {
+        use ffmpeg_the_third::Channel::*;
+
+        const CENTER: f32 = 0.707_106_77;
+        const SURROUND: f32 = 0.707_106_77;
+        const HEIGHT_SIDE: f32 = 0.707_106_77;
+        const HEIGHT_CENTER: f32 = 0.5;
+
+        match channel {
+            FrontLeft | StereoLeft => (1.0, 0.0),
+            FrontRight | StereoRight => (0.0, 1.0),
+            FrontCenter | TopCenter | TopFrontCenter | TopBackCenter | BottomFrontCenter
+            | BackCenter => (CENTER, CENTER),
+            LowFrequency | LowFrequency2 | Unused | Unknown | None => (0.0, 0.0),
+            BackLeft | SideLeft | FrontLeftOfCenter | WideLeft | SurroundDirectLeft => {
+                (SURROUND, 0.0)
+            }
+            BackRight | SideRight | FrontRightOfCenter | WideRight | SurroundDirectRight => {
+                (0.0, SURROUND)
+            }
+            TopFrontLeft | TopBackLeft | TopSideLeft | BottomFrontLeft => (HEIGHT_SIDE, 0.0),
+            TopFrontRight | TopBackRight | TopSideRight | BottomFrontRight => (0.0, HEIGHT_SIDE),
+            SideSurroundLeft | TopSurroundLeft => (HEIGHT_SIDE, 0.0),
+            SideSurroundRight | TopSurroundRight => (0.0, HEIGHT_SIDE),
+            AmbisonicBase | AmbisonicEnd => (HEIGHT_CENTER, HEIGHT_CENTER),
+        }
     }
 
     fn run(&self, frame: &ffmpeg_the_third::util::frame::audio::Audio) -> Option<Vec<f32>> {
@@ -2179,50 +2301,106 @@ impl FastDownmixPlanarF32 {
             return None;
         }
 
-        let planes = self.planes(frame)?;
-        let mut out = Vec::with_capacity(nb_samples * 2);
-        for i in 0..nb_samples {
-            let fl = self.sample(&planes, self.fl, i);
-            let fr = self.sample(&planes, self.fr, i);
-            let fc = self.sample(&planes, self.fc, i);
-            let lfe = self.sample(&planes, self.lfe, i);
-            let ls = self.sample(&planes, self.sl.or(self.bl), i);
-            let rs = self.sample(&planes, self.sr.or(self.br), i);
+        use ffmpeg::format::sample::{Sample, Type as SampleType};
+        use ffmpeg_the_third as ffmpeg;
 
-            // Conservative ITU-style stereo fold-down. The final scale keeps
-            // WMA Pro 5.1 material from clipping before the optional VST limiter.
-            out.push((fl + 0.707_106_77 * fc + 0.707_106_77 * ls + 0.5 * lfe) * 0.75);
-            out.push((fr + 0.707_106_77 * fc + 0.707_106_77 * rs + 0.5 * lfe) * 0.75);
+        match self.format {
+            Sample::F32(SampleType::Planar) => {
+                self.mix_planar(frame, |ptr, i| unsafe { *(ptr as *const f32).add(i) })
+            }
+            Sample::F32(SampleType::Packed) => {
+                self.mix_packed(frame, |ptr, i| unsafe { *(ptr as *const f32).add(i) })
+            }
+            Sample::I32(SampleType::Planar) => self.mix_planar(frame, |ptr, i| unsafe {
+                *(ptr as *const i32).add(i) as f32 / 2_147_483_648.0
+            }),
+            Sample::I32(SampleType::Packed) => self.mix_packed(frame, |ptr, i| unsafe {
+                *(ptr as *const i32).add(i) as f32 / 2_147_483_648.0
+            }),
+            Sample::I16(SampleType::Planar) => self.mix_planar(frame, |ptr, i| unsafe {
+                *(ptr as *const i16).add(i) as f32 / 32_768.0
+            }),
+            Sample::I16(SampleType::Packed) => self.mix_packed(frame, |ptr, i| unsafe {
+                *(ptr as *const i16).add(i) as f32 / 32_768.0
+            }),
+            _ => None,
+        }
+    }
+
+    fn mix_planar<F>(
+        &self,
+        frame: &ffmpeg_the_third::util::frame::audio::Audio,
+        mut sample_at: F,
+    ) -> Option<Vec<f32>>
+    where
+        F: FnMut(*const u8, usize) -> f32,
+    {
+        let nb_samples = frame.samples();
+        let mut out = vec![0.0; nb_samples * 2];
+        for entry in &self.entries {
+            let plane = self.plane_ptr(frame, entry.plane)?;
+            for i in 0..nb_samples {
+                let sample = sample_at(plane, i);
+                let out_idx = i * 2;
+                out[out_idx] += sample * entry.left;
+                out[out_idx + 1] += sample * entry.right;
+            }
         }
         Some(out)
     }
 
-    fn planes<'a>(
+    fn mix_packed<F>(
         &self,
-        frame: &'a ffmpeg_the_third::util::frame::audio::Audio,
-    ) -> Option<Vec<&'a [f32]>> {
+        frame: &ffmpeg_the_third::util::frame::audio::Audio,
+        mut sample_at: F,
+    ) -> Option<Vec<f32>>
+    where
+        F: FnMut(*const u8, usize) -> f32,
+    {
         let nb_samples = frame.samples();
-        let mut planes = Vec::with_capacity(self.channels);
-        unsafe {
-            let av = frame.as_ptr();
-            for ch in 0..self.channels {
-                let ptr = (*av).data[ch] as *const f32;
-                if ptr.is_null() {
-                    return None;
-                }
-                planes.push(std::slice::from_raw_parts(ptr, nb_samples));
+        let base = self.packed_ptr(frame)?;
+        let mut out = vec![0.0; nb_samples * 2];
+        for i in 0..nb_samples {
+            let frame_base = i * self.channels;
+            let out_idx = i * 2;
+            for entry in &self.entries {
+                let sample = sample_at(base, frame_base + entry.plane);
+                out[out_idx] += sample * entry.left;
+                out[out_idx + 1] += sample * entry.right;
             }
         }
-        Some(planes)
+        Some(out)
     }
 
-    #[inline]
-    fn sample(&self, planes: &[&[f32]], channel: Option<usize>, index: usize) -> f32 {
-        channel
-            .and_then(|ch| planes.get(ch))
-            .and_then(|plane| plane.get(index))
-            .copied()
-            .unwrap_or(0.0)
+    fn plane_ptr(
+        &self,
+        frame: &ffmpeg_the_third::util::frame::audio::Audio,
+        plane: usize,
+    ) -> Option<*const u8> {
+        unsafe {
+            let av = frame.as_ptr();
+            let data = if !(*av).extended_data.is_null() {
+                (*av).extended_data
+            } else {
+                (*av).data.as_ptr() as *mut *mut u8
+            };
+            if data.is_null() {
+                return None;
+            }
+            let ptr = *data.add(plane) as *const u8;
+            if ptr.is_null() {
+                return None;
+            }
+            Some(ptr)
+        }
+    }
+
+    fn packed_ptr(&self, frame: &ffmpeg_the_third::util::frame::audio::Audio) -> Option<*const u8> {
+        unsafe {
+            let av = frame.as_ptr();
+            let ptr = (*av).data[0] as *const u8;
+            if ptr.is_null() { None } else { Some(ptr) }
+        }
     }
 }
 
@@ -2236,7 +2414,7 @@ struct AudioSetup {
     output_channels: u32,
     decoder_stereo_requested: bool,
     decoder_stereo_effective: bool,
-    fast_downmix: Option<FastDownmixPlanarF32>,
+    fast_downmix: Option<FastDownmixToStereo>,
     time_base_num: f64,
     time_base_den: f64,
     decoder: ffmpeg_the_third::decoder::Audio,
