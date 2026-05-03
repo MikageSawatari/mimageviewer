@@ -174,6 +174,12 @@ void send_event_gui_user_hidden(uint64_t slot_id) {
     write_message(msg);
 }
 
+void send_event_gui_bypass_toggle(uint64_t slot_id) {
+    std::string msg = "{\"event\":\"gui_bypass_toggle\",\"slot_id\":" +
+                      std::to_string(slot_id) + "}";
+    write_message(msg);
+}
+
 static std::string wide_to_utf8(const wchar_t* text) {
     if (!text || !*text) {
         return {};
@@ -862,11 +868,14 @@ private:
         }
         if (cmd == "set_bypass") {
             uint64_t slot = extract_number_field(msg, "slot_id");
+            const bool bypass = extract_number_field(msg, "bypass") != 0;
             {
                 std::lock_guard<std::mutex> lk(loaders_mutex_);
                 if (slot < plugin_bypass_.size()) {
-                    plugin_bypass_[static_cast<size_t>(slot)] =
-                        extract_number_field(msg, "bypass") != 0;
+                    plugin_bypass_[static_cast<size_t>(slot)] = bypass;
+                    if (PluginLoader* loader = loader_at_unlocked(slot)) {
+                        loader->set_editor_chrome_bypassed(bypass);
+                    }
                     rebuild_chain_snapshot_unlocked();
                 }
             }
@@ -1063,6 +1072,7 @@ private:
         {
             std::lock_guard<std::mutex> lk(loaders_mutex_);
             plugin_bypass_.push_back(false);
+            loader_->set_editor_chrome_bypassed(false);
             processing_order_.push_back(0);
             rebuild_chain_snapshot_unlocked();
         }
@@ -1134,8 +1144,10 @@ private:
 
         {
             std::lock_guard<std::mutex> lk(loaders_mutex_);
+            const bool bypass = extract_number_field(msg, "bypass") != 0;
+            loader->set_editor_chrome_bypassed(bypass);
             extra_loaders_.push_back(std::move(loader));
-            plugin_bypass_.push_back(extract_number_field(msg, "bypass") != 0);
+            plugin_bypass_.push_back(bypass);
             processing_order_.push_back(slot_id);
             rebuild_chain_snapshot_unlocked();
         }

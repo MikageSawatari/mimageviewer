@@ -13,6 +13,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <windows.h>
 
 #include "host_app.h"  // PlugFrame, HostApplication, ComponentHandler の完全型
 #include "pluginterfaces/gui/iplugview.h"
@@ -150,6 +151,15 @@ public:
     std::string editor_chrome_title() const {
         return plugin_name_;
     }
+    bool editor_chrome_bypassed() const {
+        return editor_bypassed_.load(std::memory_order_acquire);
+    }
+    void set_editor_chrome_bypassed(bool bypassed) {
+        editor_bypassed_.store(bypassed, std::memory_order_release);
+        if (auto* hwnd = static_cast<HWND>(view_container_hwnd_snapshot_.load(std::memory_order_acquire))) {
+            InvalidateRect(hwnd, nullptr, FALSE);
+        }
+    }
     uint32_t editor_chrome_latency_samples() const {
         return latency_samples();
     }
@@ -217,6 +227,7 @@ private:
     void* view_plugin_host_hwnd_ = nullptr;
     uint64_t editor_slot_id_ = 0;
     std::atomic<void*> view_container_hwnd_snapshot_{nullptr};
+    std::atomic<bool> editor_bypassed_{false};
     bool gui_surface_visible_ = false;
     bool gui_app_active_ = true;
     uint32_t last_gui_width_ = 0;

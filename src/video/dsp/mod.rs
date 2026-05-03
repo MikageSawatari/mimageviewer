@@ -79,6 +79,12 @@ pub struct SlotInfo {
     pub auto_bypassed_for_latency: bool,
 }
 
+#[derive(Debug, Default)]
+pub struct GuiSignalChanges {
+    pub user_hidden_paths: Vec<String>,
+    pub bypass_updates: Vec<(String, bool)>,
+}
+
 /// DspBridge — VST3 プラグインホスト bridge との対話を管理する singleton。
 ///
 /// アプリ起動から終了まで 1 個のインスタンスを保持する。
@@ -1582,13 +1588,11 @@ impl DspBridge {
     /// 設計のため window/view は破棄しない)。
     /// resize 通知 → bridge に notify_host_resize を送る。
     ///
-    /// 戻り値: `user_hidden=true` に切り替わった (= ユーザーが × で閉じた) スロットの
-    /// **plugin_path 一覧**。呼出側 (App) はこれで `settings.vst3_plugins` を path 検索
-    /// して `user_hidden` を反映する。idx を返さないのは bridge slots と
-    /// `settings.vst3_plugins` で index がズレる (= ロード失敗で詰まる) ため
-    /// (Codex P2 2026-05-01)。
-    pub fn pump_gui_signals(&self) -> Vec<String> {
-        let bridge_user_hidden_slot_ids: Vec<u64> = {
+    /// 戻り値: settings 側に同期すべき GUI 操作結果。idx ではなく path を返すのは、
+    /// bridge slots と `settings.vst3_plugins` で index がズレる (= ロード失敗で詰まる)
+    /// ため (Codex P2 2026-05-01)。
+    pub fn pump_gui_signals(&self) -> GuiSignalChanges {
+        let (bridge_user_hidden_slot_ids, bridge_bypass_toggle_slot_ids): (Vec<u64>, Vec<u64>) = {
             let bridges: Vec<Arc<Bridge>> = {
                 let inner = self.inner.lock().unwrap();
                 let mut bridges: Vec<Arc<Bridge>> = Vec::new();
@@ -1602,16 +1606,19 @@ impl DspBridge {
                 }
                 bridges
             };
-            let mut slot_ids = Vec::new();
+            let mut user_hidden_slot_ids = Vec::new();
+            let mut bypass_toggle_slot_ids = Vec::new();
             for bridge in bridges {
-                slot_ids.extend(bridge.drain_gui_user_hidden_slots());
+                user_hidden_slot_ids.extend(bridge.drain_gui_user_hidden_slots());
+                bypass_toggle_slot_ids.extend(bridge.drain_gui_bypass_toggle_slots());
             }
-            slot_ids
+            (user_hidden_slot_ids, bypass_toggle_slot_ids)
         };
         // close 通知の検出 (Mutex 内で全 slot を調べる)
         let mut close_targets: Vec<usize> = Vec::new();
         let mut resize_targets: Vec<(usize, u32, u32)> = Vec::new();
         let mut session_targets: Vec<(usize, bool)> = Vec::new();
+        let mut bypass_toggle_targets: Vec<(usize, String, bool)> = Vec::new();
         let mut app_active_latest: Option<bool> = None;
         let now = Instant::now();
         let normal_resize_interval = Duration::from_millis(16);
@@ -1621,6 +1628,9 @@ impl DspBridge {
                 if bridge_user_hidden_slot_ids.contains(&slot.slot_id) {
                     close_targets.push(idx);
                     continue;
+                }
+                if bridge_bypass_toggle_slot_ids.contains(&slot.slot_id) {
+                    bypass_toggle_targets.push((idx, slot.plugin_path.clone(), !slot.bypass));
                 }
                 if let Some(arc) = slot.gui_close_signal.as_ref() {
                     if let Ok(guard) = arc.lock() {
@@ -1778,7 +1788,23 @@ impl DspBridge {
                 }));
             }
         }
-        user_hidden_paths
+        let mut bypass_updates = Vec::with_capacity(bypass_toggle_targets.len());
+        for (idx, path, requested_bypass) in bypass_toggle_targets {
+            self.set_bypass(idx, requested_bypass);
+            let actual_bypass = {
+                let inner = self.inner.lock().unwrap();
+                inner
+                    .slots
+                    .get(idx)
+                    .map(|slot| slot.bypass)
+                    .unwrap_or(requested_bypass)
+            };
+            bypass_updates.push((path, actual_bypass));
+        }
+        GuiSignalChanges {
+            user_hidden_paths,
+            bypass_updates,
+        }
     }
 
     /// 指定 idx のスロットを削除する。bridge 子プロセスは shutdown される。

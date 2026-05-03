@@ -210,6 +210,10 @@ pub enum Event {
         #[serde(default)]
         slot_id: u64,
     },
+    GuiBypassToggle {
+        #[serde(default)]
+        slot_id: u64,
+    },
     /// プラグインの推奨 GUI サイズ (query_gui_size の応答)。
     /// `resizable` は IPlugView::canResize() の結果 (= ホスト側が WS_THICKFRAME を
     /// 付けるかの判断に使う)。古い bridge との互換性のため `#[serde(default)]` で false。
@@ -250,6 +254,7 @@ pub struct Bridge {
     /// (= stale ack race 防止、Codex 助言、2026-05-01)。
     reset_ack_rx: crossbeam_channel::Receiver<u64>,
     gui_user_hidden_rx: crossbeam_channel::Receiver<u64>,
+    gui_bypass_toggle_rx: crossbeam_channel::Receiver<u64>,
     /// reset_sync helper が使う世代 ID counter。`fetch_add(1)` で発行する。
     next_reset_id: AtomicU64,
     #[cfg(windows)]
@@ -347,6 +352,7 @@ impl Bridge {
         // bounded(8) は十分 (= 通常 1 個ずつ即消費、複数 reset 連続でも全 ID を保持)。
         let (reset_ack_tx, reset_ack_rx) = crossbeam_channel::bounded::<u64>(8);
         let (gui_user_hidden_tx, gui_user_hidden_rx) = crossbeam_channel::bounded::<u64>(64);
+        let (gui_bypass_toggle_tx, gui_bypass_toggle_rx) = crossbeam_channel::bounded::<u64>(64);
         let cached_latency_for_pump = cached_latency.clone();
         let cached_latency_by_slot_for_pump = cached_latency_by_slot.clone();
         std::thread::Builder::new()
@@ -384,6 +390,9 @@ impl Bridge {
                         }
                         Ok(Event::GuiUserHidden { slot_id }) => {
                             let _ = gui_user_hidden_tx.try_send(slot_id);
+                        }
+                        Ok(Event::GuiBypassToggle { slot_id }) => {
+                            let _ = gui_bypass_toggle_tx.try_send(slot_id);
                         }
                         Ok(other) => {
                             // Loaded を受信したら cached_latency にも反映する
@@ -424,6 +433,7 @@ impl Bridge {
             cached_latency_by_slot,
             reset_ack_rx,
             gui_user_hidden_rx,
+            gui_bypass_toggle_rx,
             next_reset_id: AtomicU64::new(0),
             #[cfg(windows)]
             shm: None,
@@ -437,6 +447,14 @@ impl Bridge {
     pub fn drain_gui_user_hidden_slots(&self) -> Vec<u64> {
         let mut out = Vec::new();
         while let Ok(slot_id) = self.gui_user_hidden_rx.try_recv() {
+            out.push(slot_id);
+        }
+        out
+    }
+
+    pub fn drain_gui_bypass_toggle_slots(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        while let Ok(slot_id) = self.gui_bypass_toggle_rx.try_recv() {
             out.push(slot_id);
         }
         out

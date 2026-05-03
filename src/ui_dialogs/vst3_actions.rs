@@ -84,15 +84,23 @@ impl App {
     /// `dsp_bridge.pump_gui_signals` は plugin_path 一覧を返す (= bridge slots と
     /// `settings.vst3_plugins` で index がズレるため、path 一致で entry を引く)。
     pub(crate) fn vst3_pump_gui_signals(&mut self) {
-        let user_hidden_paths = self.dsp_bridge.pump_gui_signals();
-        if user_hidden_paths.is_empty() {
+        let changes = self.dsp_bridge.pump_gui_signals();
+        if changes.user_hidden_paths.is_empty() && changes.bypass_updates.is_empty() {
             return;
         }
         let mut changed = false;
-        for path in user_hidden_paths {
+        for path in changes.user_hidden_paths {
             if let Some(entry) = self.find_vst3_entry_mut(&path) {
                 if !entry.user_hidden {
                     entry.user_hidden = true;
+                    changed = true;
+                }
+            }
+        }
+        for (path, bypass) in changes.bypass_updates {
+            if let Some(entry) = self.find_vst3_entry_mut(&path) {
+                if entry.bypass != bypass {
+                    entry.bypass = bypass;
                     changed = true;
                 }
             }

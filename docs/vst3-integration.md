@@ -50,7 +50,13 @@ that value against the clicked fullscreen HWND rather than only trusting
 ## Editor chrome resize rules (2026-05)
 
 The bridge-owned VST editor surface uses a custom dark title area above the
-plugin child HWND. When the user resizes the outer editor frame, the bridge
+plugin child HWND. The title area includes a left-side power button that toggles
+the slot bypass state through the same Rust `DspBridge::set_bypass` path used by
+the VST3 playback panel, so the setting is persisted in `settings.json` and the
+normal PDC auto-bypass guard still applies. The right-side close button hides
+only that plugin editor and marks the slot `user_hidden=true`.
+
+When the user resizes the outer editor frame, the bridge
 first asks `IPlugView::checkSizeConstraint` and snaps the outer frame back to
 the plugin-approved client size before calling `IPlugView::onSize`. Plugin
 initiated `IPlugFrame::resizeView` calls are accepted unless a native

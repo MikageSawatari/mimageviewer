@@ -28,6 +28,7 @@
 
 namespace miv {
 void send_event_gui_user_hidden(uint64_t slot_id);
+void send_event_gui_bypass_toggle(uint64_t slot_id);
 }
 
 namespace {
@@ -87,6 +88,15 @@ RECT editor_close_button_rect(HWND hwnd) {
     const int button = std::max(18, title_h - 10);
     const int top = std::max(0, (title_h - button) / 2);
     return RECT{client.right - button - 8, top, client.right - 8, top + button};
+}
+
+RECT editor_power_button_rect(HWND hwnd) {
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    const int title_h = editor_titlebar_height(hwnd);
+    const int button = std::max(18, title_h - 10);
+    const int top = std::max(0, (title_h - button) / 2);
+    return RECT{8, top, 8 + button, top + button};
 }
 
 bool point_in_rect(const RECT& rect, POINT pt) {
@@ -157,17 +167,35 @@ void draw_editor_chrome(HWND hwnd, miv::PluginLoader* loader) {
     FillRect(hdc, &client, bg);
     DeleteObject(bg);
 
+    RECT power_rect = editor_power_button_rect(hwnd);
+    const bool bypassed = loader && loader->editor_chrome_bypassed();
+    HBRUSH power_bg = CreateSolidBrush(bypassed ? RGB(42, 42, 42) : RGB(36, 72, 44));
+    FillRect(hdc, &power_rect, power_bg);
+    DeleteObject(power_bg);
+    HPEN power_pen = CreatePen(PS_SOLID, 2, bypassed ? RGB(165, 165, 165) : RGB(118, 230, 130));
+    HGDIOBJ old_power_pen = SelectObject(hdc, power_pen);
+    HGDIOBJ old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    const int cx = (power_rect.left + power_rect.right) / 2;
+    const int cy = (power_rect.top + power_rect.bottom) / 2 + 1;
+    const int r = std::max<int>(5, (power_rect.bottom - power_rect.top) / 2 - 7);
+    Arc(hdc, cx - r, cy - r, cx + r, cy + r, cx + r, cy - r / 2, cx - r, cy - r / 2);
+    MoveToEx(hdc, cx, power_rect.top + 6, nullptr);
+    LineTo(hdc, cx, cy - 1);
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_power_pen);
+    DeleteObject(power_pen);
+
     RECT close_rect = editor_close_button_rect(hwnd);
     HBRUSH close_bg = CreateSolidBrush(RGB(38, 38, 38));
     FillRect(hdc, &close_rect, close_bg);
     DeleteObject(close_bg);
     HPEN close_pen = CreatePen(PS_SOLID, 2, RGB(230, 230, 230));
-    HGDIOBJ old_pen = SelectObject(hdc, close_pen);
+    HGDIOBJ old_close_pen = SelectObject(hdc, close_pen);
     MoveToEx(hdc, close_rect.left + 6, close_rect.top + 6, nullptr);
     LineTo(hdc, close_rect.right - 6, close_rect.bottom - 6);
     MoveToEx(hdc, close_rect.right - 6, close_rect.top + 6, nullptr);
     LineTo(hdc, close_rect.left + 6, close_rect.bottom - 6);
-    SelectObject(hdc, old_pen);
+    SelectObject(hdc, old_close_pen);
     DeleteObject(close_pen);
 
     SetBkMode(hdc, TRANSPARENT);
@@ -184,7 +212,7 @@ void draw_editor_chrome(HWND hwnd, miv::PluginLoader* loader) {
             title += suffix;
         }
     }
-    RECT text_rect{12, 0, close_rect.left - 10, title_rect.bottom};
+    RECT text_rect{power_rect.right + 10, 0, close_rect.left - 10, title_rect.bottom};
     DrawTextW(hdc,
               title.c_str(),
               static_cast<int>(title.size()),
@@ -260,7 +288,8 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
             if (top) return HTTOP;
             if (bottom) return HTBOTTOM;
         }
-        if (point_in_rect(editor_close_button_rect(hwnd), pt)) {
+        if (point_in_rect(editor_power_button_rect(hwnd), pt) ||
+            point_in_rect(editor_close_button_rect(hwnd), pt)) {
             return HTCLIENT;
         }
         if (pt.y < editor_titlebar_height(hwnd)) {
@@ -270,7 +299,8 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
     }
     if (msg == WM_LBUTTONDOWN) {
         POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
-        if (point_in_rect(editor_close_button_rect(hwnd), pt)) {
+        if (point_in_rect(editor_power_button_rect(hwnd), pt) ||
+            point_in_rect(editor_close_button_rect(hwnd), pt)) {
             SetCapture(hwnd);
             return 0;
         }
@@ -279,6 +309,12 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
         POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
         if (GetCapture() == hwnd) {
             ReleaseCapture();
+        }
+        if (point_in_rect(editor_power_button_rect(hwnd), pt)) {
+            if (loader) {
+                miv::send_event_gui_bypass_toggle(loader->editor_chrome_slot_id());
+            }
+            return 0;
         }
         if (point_in_rect(editor_close_button_rect(hwnd), pt)) {
             hide_editor_surface_from_user(hwnd, loader);
