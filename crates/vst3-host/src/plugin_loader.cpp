@@ -26,6 +26,10 @@
 #include <ole2.h>
 #include "pluginterfaces/gui/iplugviewcontentscalesupport.h"
 
+namespace miv {
+void send_event_gui_user_hidden(uint64_t slot_id);
+}
+
 namespace {
 // stderr へのデバッグログ。tester 側で pipe して log_file に流す。
 template <typename... Args>
@@ -106,7 +110,11 @@ void layout_editor_child(HWND frame_hwnd, HWND child_hwnd) {
                  title_h,
                  width,
                  height,
-                 SWP_NOZORDER | SWP_NOACTIVATE);
+                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
+    RedrawWindow(child_hwnd,
+                 nullptr,
+                 nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 
 bool resize_frame_for_plugin_client(HWND frame_hwnd, int plugin_w, int plugin_h) {
@@ -126,8 +134,16 @@ bool resize_frame_for_plugin_client(HWND frame_hwnd, int plugin_w, int plugin_h)
                  0,
                  std::max<LONG>(1, outer.right - outer.left),
                  std::max<LONG>(1, outer.bottom - outer.top),
-                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                 SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
     return true;
+}
+
+void hide_editor_surface_from_user(HWND hwnd, miv::PluginLoader* loader) {
+    if (loader) {
+        loader->set_gui_surface_visible_state(false);
+        miv::send_event_gui_user_hidden(loader->editor_chrome_slot_id());
+    }
+    ShowWindow(hwnd, SW_HIDE);
 }
 
 void draw_editor_chrome(HWND hwnd, miv::PluginLoader* loader) {
@@ -138,7 +154,7 @@ void draw_editor_chrome(HWND hwnd, miv::PluginLoader* loader) {
     GetClientRect(hwnd, &client);
     RECT title_rect{0, 0, client.right, editor_titlebar_height(hwnd)};
     HBRUSH bg = CreateSolidBrush(RGB(18, 18, 18));
-    FillRect(hdc, &title_rect, bg);
+    FillRect(hdc, &client, bg);
     DeleteObject(bg);
 
     RECT close_rect = editor_close_button_rect(hwnd);
@@ -195,17 +211,11 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
         return 0;
     }
     if (msg == WM_CLOSE) {
-        if (loader) {
-            loader->set_gui_surface_visible_state(false);
-        }
-        ShowWindow(hwnd, SW_HIDE);
+        hide_editor_surface_from_user(hwnd, loader);
         return 0;
     }
     if (msg == WM_SYSCOMMAND && ((wparam & 0xFFF0) == SC_CLOSE)) {
-        if (loader) {
-            loader->set_gui_surface_visible_state(false);
-        }
-        ShowWindow(hwnd, SW_HIDE);
+        hide_editor_surface_from_user(hwnd, loader);
         return 0;
     }
     if (msg == WM_SIZE && wparam != SIZE_MINIMIZED) {
@@ -214,12 +224,28 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
             loader->handle_editor_drag_tick(msg);
             loader->handle_editor_window_size();
         }
+        RedrawWindow(hwnd,
+                     nullptr,
+                     nullptr,
+                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME);
+    }
+    if (msg == WM_MOUSEACTIVATE) {
+        const WORD hit = LOWORD(lparam);
+        if (hit == HTCAPTION || hit == HTCLIENT) {
+            return MA_NOACTIVATE;
+        }
     }
     if (msg == WM_NCHITTEST) {
         POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
         ScreenToClient(hwnd, &pt);
         RECT client{};
         GetClientRect(hwnd, &client);
+        if (point_in_rect(editor_close_button_rect(hwnd), pt)) {
+            return HTCLIENT;
+        }
+        if (pt.y < editor_titlebar_height(hwnd)) {
+            return HTCAPTION;
+        }
         UINT dpi = GetDpiForWindow(hwnd);
         if (dpi == 0) dpi = 96;
         const int frame = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) +
@@ -240,18 +266,22 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
             if (top) return HTTOP;
             if (bottom) return HTBOTTOM;
         }
-        if (pt.y < editor_titlebar_height(hwnd) && !point_in_rect(editor_close_button_rect(hwnd), pt)) {
-            return HTCAPTION;
-        }
         return HTCLIENT;
+    }
+    if (msg == WM_LBUTTONDOWN) {
+        POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        if (point_in_rect(editor_close_button_rect(hwnd), pt)) {
+            SetCapture(hwnd);
+            return 0;
+        }
     }
     if (msg == WM_LBUTTONUP) {
         POINT pt{GET_X_LPARAM(lparam), GET_Y_LPARAM(lparam)};
+        if (GetCapture() == hwnd) {
+            ReleaseCapture();
+        }
         if (point_in_rect(editor_close_button_rect(hwnd), pt)) {
-            if (loader) {
-                loader->set_gui_surface_visible_state(false);
-            }
-            ShowWindow(hwnd, SW_HIDE);
+            hide_editor_surface_from_user(hwnd, loader);
             return 0;
         }
     }
@@ -297,6 +327,9 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
 }
 
 LRESULT CALLBACK BridgePluginHostProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (msg == WM_MOUSEACTIVATE) {
+        return MA_NOACTIVATE;
+    }
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
 
@@ -1319,6 +1352,7 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
          GetCurrentThreadId(),
          (unsigned long long)options.owner_hwnd,
          visible ? 1 : 0);
+    editor_slot_id_ = options.slot_id;
     if (!controller_) {
         error_out = "controller not available";
         return false;
@@ -1396,6 +1430,7 @@ bool PluginLoader::show_gui(const GuiWindowOptions& options, bool visible, std::
     view_host_hwnd_ = options.owner_hwnd;
     view_container_hwnd_ = frame_hwnd;
     view_plugin_host_hwnd_ = attach_hwnd;
+    editor_slot_id_ = options.slot_id;
     view_container_hwnd_snapshot_.store(frame_hwnd, std::memory_order_release);
     blog("show_gui: attached ok");
 
@@ -1754,6 +1789,10 @@ void PluginLoader::handle_editor_window_size() {
                              static_cast<Steinberg::int32>(width),
                              static_cast<Steinberg::int32>(height)};
     view_->onSize(&rect);
+    RedrawWindow(container_hwnd,
+                 nullptr,
+                 nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME);
 }
 
 void PluginLoader::handle_editor_drag_start() {

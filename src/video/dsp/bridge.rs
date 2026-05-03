@@ -206,6 +206,10 @@ pub enum Event {
         container_hwnd: u64,
     },
     GuiDetached,
+    GuiUserHidden {
+        #[serde(default)]
+        slot_id: u64,
+    },
     /// プラグインの推奨 GUI サイズ (query_gui_size の応答)。
     /// `resizable` は IPlugView::canResize() の結果 (= ホスト側が WS_THICKFRAME を
     /// 付けるかの判断に使う)。古い bridge との互換性のため `#[serde(default)]` で false。
@@ -245,6 +249,7 @@ pub struct Bridge {
     /// 値は `reset_id` の世代 ID で、`wait_reset_done(expected_id)` が照合に使う
     /// (= stale ack race 防止、Codex 助言、2026-05-01)。
     reset_ack_rx: crossbeam_channel::Receiver<u64>,
+    gui_user_hidden_rx: crossbeam_channel::Receiver<u64>,
     /// reset_sync helper が使う世代 ID counter。`fetch_add(1)` で発行する。
     next_reset_id: AtomicU64,
     #[cfg(windows)]
@@ -341,6 +346,7 @@ impl Bridge {
         // `wait_reset_done(expected_id)` が照合してから受理する (= stale ack 排除)。
         // bounded(8) は十分 (= 通常 1 個ずつ即消費、複数 reset 連続でも全 ID を保持)。
         let (reset_ack_tx, reset_ack_rx) = crossbeam_channel::bounded::<u64>(8);
+        let (gui_user_hidden_tx, gui_user_hidden_rx) = crossbeam_channel::bounded::<u64>(64);
         let cached_latency_for_pump = cached_latency.clone();
         let cached_latency_by_slot_for_pump = cached_latency_by_slot.clone();
         std::thread::Builder::new()
@@ -375,6 +381,9 @@ impl Bridge {
                             // reset_id を流して `wait_reset_done(expected_id)` が照合する
                             // (= stale ack race 防止、Codex 助言、2026-05-01)。
                             let _ = reset_ack_tx.try_send(reset_id);
+                        }
+                        Ok(Event::GuiUserHidden { slot_id }) => {
+                            let _ = gui_user_hidden_tx.try_send(slot_id);
                         }
                         Ok(other) => {
                             // Loaded を受信したら cached_latency にも反映する
@@ -414,6 +423,7 @@ impl Bridge {
             cached_latency_samples: cached_latency,
             cached_latency_by_slot,
             reset_ack_rx,
+            gui_user_hidden_rx,
             next_reset_id: AtomicU64::new(0),
             #[cfg(windows)]
             shm: None,
@@ -422,6 +432,14 @@ impl Bridge {
             #[cfg(windows)]
             sig_out: None,
         })
+    }
+
+    pub fn drain_gui_user_hidden_slots(&self) -> Vec<u64> {
+        let mut out = Vec::new();
+        while let Ok(slot_id) = self.gui_user_hidden_rx.try_recv() {
+            out.push(slot_id);
+        }
+        out
     }
 
     /// シーク時の同期 reset (= Codex 助言、2026-05-01、ack generation ID で stale-ack race 防止):

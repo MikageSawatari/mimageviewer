@@ -168,6 +168,12 @@ void send_event_error(const std::string& detail) {
     write_message(msg);
 }
 
+void send_event_gui_user_hidden(uint64_t slot_id) {
+    std::string msg = "{\"event\":\"gui_user_hidden\",\"slot_id\":" +
+                      std::to_string(slot_id) + "}";
+    write_message(msg);
+}
+
 static std::string wide_to_utf8(const wchar_t* text) {
     if (!text || !*text) {
         return {};
@@ -768,6 +774,7 @@ private:
                 return true;
             }
             GuiWindowOptions options;
+            options.slot_id = slot_id;
             options.owner_hwnd = reinterpret_cast<void*>(extract_number_field(msg, "owner_hwnd"));
             if (!options.owner_hwnd) {
                 send_event_error("show_gui: owner_hwnd missing");

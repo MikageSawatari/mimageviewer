@@ -1588,6 +1588,26 @@ impl DspBridge {
     /// `settings.vst3_plugins` で index がズレる (= ロード失敗で詰まる) ため
     /// (Codex P2 2026-05-01)。
     pub fn pump_gui_signals(&self) -> Vec<String> {
+        let bridge_user_hidden_slot_ids: Vec<u64> = {
+            let bridges: Vec<Arc<Bridge>> = {
+                let inner = self.inner.lock().unwrap();
+                let mut bridges: Vec<Arc<Bridge>> = Vec::new();
+                for slot in &inner.slots {
+                    if !bridges
+                        .iter()
+                        .any(|bridge| Arc::ptr_eq(bridge, &slot.bridge))
+                    {
+                        bridges.push(slot.bridge.clone());
+                    }
+                }
+                bridges
+            };
+            let mut slot_ids = Vec::new();
+            for bridge in bridges {
+                slot_ids.extend(bridge.drain_gui_user_hidden_slots());
+            }
+            slot_ids
+        };
         // close 通知の検出 (Mutex 内で全 slot を調べる)
         let mut close_targets: Vec<usize> = Vec::new();
         let mut resize_targets: Vec<(usize, u32, u32)> = Vec::new();
@@ -1598,6 +1618,10 @@ impl DspBridge {
         {
             let mut inner = self.inner.lock().unwrap();
             for (idx, slot) in inner.slots.iter_mut().enumerate() {
+                if bridge_user_hidden_slot_ids.contains(&slot.slot_id) {
+                    close_targets.push(idx);
+                    continue;
+                }
                 if let Some(arc) = slot.gui_close_signal.as_ref() {
                     if let Ok(guard) = arc.lock() {
                         if let Some(rx) = guard.as_ref() {

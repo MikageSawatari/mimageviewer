@@ -364,5 +364,10 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
   HWND and an inner child HWND used for `IPlugView::attached()`. The outer frame
   draws a black title bar with plugin name, latency, and a close button, while
   drag/resize/z-order still target the outer HWND.
+- Phase 2 interaction fix: the custom close button now sends a
+  `gui_user_hidden` bridge event so Rust uses the same per-slot user-hide path
+  as the old host close signal. Resize invalidates both the outer frame and
+  inner plugin host to avoid stale pixels, and the plugin host avoids mouse
+  activation to keep the mIV window group from surfacing unexpectedly.
 - Follow-up: a fully custom title bar with inline power/bypass and latency
   control still needs a Rust-side bypass IPC event and settings sync.

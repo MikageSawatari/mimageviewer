@@ -46,6 +46,7 @@ struct PluginProbeInfo {
 };
 
 struct GuiWindowOptions {
+    uint64_t slot_id = 0;
     void* owner_hwnd = nullptr;
     uint32_t width = 0;
     uint32_t height = 0;
@@ -155,6 +156,9 @@ public:
     uint32_t editor_chrome_sample_rate() const {
         return sample_rate_;
     }
+    uint64_t editor_chrome_slot_id() const {
+        return editor_slot_id_;
+    }
     bool is_editor_quarantined() const {
         return editor_quarantined_.load(std::memory_order_acquire);
     }
@@ -211,6 +215,7 @@ private:
     void* view_host_hwnd_ = nullptr;
     void* view_container_hwnd_ = nullptr;
     void* view_plugin_host_hwnd_ = nullptr;
+    uint64_t editor_slot_id_ = 0;
     std::atomic<void*> view_container_hwnd_snapshot_{nullptr};
     bool gui_surface_visible_ = false;
     bool gui_app_active_ = true;
