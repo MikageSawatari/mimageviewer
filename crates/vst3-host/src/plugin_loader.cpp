@@ -114,7 +114,7 @@ void layout_editor_child(HWND frame_hwnd, HWND child_hwnd) {
     RedrawWindow(child_hwnd,
                  nullptr,
                  nullptr,
-                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+                 RDW_INVALIDATE | RDW_ALLCHILDREN);
 }
 
 bool resize_frame_for_plugin_client(HWND frame_hwnd, int plugin_w, int plugin_h) {
@@ -227,7 +227,7 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
         RedrawWindow(hwnd,
                      nullptr,
                      nullptr,
-                     RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME);
+                     RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
     }
     if (msg == WM_MOUSEACTIVATE) {
         const WORD hit = LOWORD(lparam);
@@ -1823,7 +1823,7 @@ void PluginLoader::handle_editor_window_size() {
     RedrawWindow(container_hwnd,
                  nullptr,
                  nullptr,
-                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_FRAME);
+                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
 }
 
 void PluginLoader::handle_editor_drag_start() {

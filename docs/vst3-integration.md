@@ -56,7 +56,10 @@ the plugin-approved client size before calling `IPlugView::onSize`. Plugin
 initiated `IPlugFrame::resizeView` calls are accepted unless a native
 WM_ENTERSIZEMOVE resize session is actively in progress; a stale WM_SIZE
 timestamp alone is not enough to suppress them, because many editors implement
-their own resize handle inside the plugin view.
+their own resize handle inside the plugin view. Resize-path redraws only
+invalidate the affected HWNDs and let the normal message pump repaint them; they
+do not use synchronous `RDW_UPDATENOW`, which can make native resize drags wait
+for plugin relayout/paint work on every mouse step.
 
 ## 2. 全体構成
 
