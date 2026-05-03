@@ -69,13 +69,6 @@ fn selected_video_rate(
     sane_video_rate(avg_rate).or_else(|| sane_video_rate(stream_rate))
 }
 
-fn force_software_decode_for_stable_playback(codec_id: ffmpeg_the_third::codec::Id) -> bool {
-    matches!(
-        codec_id,
-        ffmpeg_the_third::codec::Id::WMV3 | ffmpeg_the_third::codec::Id::VC1
-    )
-}
-
 fn packet_timestamp(packet: &ffmpeg_the_third::Packet) -> Option<i64> {
     packet.pts().or_else(|| packet.dts())
 }
@@ -436,13 +429,7 @@ fn run_decoder(
     // 出力は av_hwframe_transfer_data で CPU readback する旧経路。
     let codec_id = video_params_owned.id();
     let stream_codec_name = codec_id.name().to_string();
-    let force_sw_decode = force_software_decode_for_stable_playback(codec_id);
-    if hw_decode_requested && force_sw_decode {
-        crate::logger::log(format!(
-            "HW: disabled D3D11VA for codec={stream_codec_name} reason=stable_playback_legacy_wmv_vc1"
-        ));
-    }
-    let effective_hw_decode_requested = hw_decode_requested && !force_sw_decode;
+    let effective_hw_decode_requested = hw_decode_requested;
     let opened_video_result = if effective_hw_decode_requested {
         #[cfg(windows)]
         {
@@ -2590,8 +2577,8 @@ fn try_gpu_blit_path(
 #[cfg(test)]
 mod decoder_candidate_tests {
     use super::{
-        DecoderChoice, force_software_decode_for_stable_playback, normalize_audio_input_layout,
-        preferred_video_decoders, selected_video_rate,
+        DecoderChoice, normalize_audio_input_layout, preferred_video_decoders,
+        selected_video_rate,
     };
     use ffmpeg_the_third::ChannelLayout;
     use ffmpeg_the_third::codec::Id;
@@ -2652,14 +2639,6 @@ mod decoder_candidate_tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].choice, DecoderChoice::Default);
         assert!(candidates[0].allow_sw_fallback);
-    }
-
-    #[test]
-    fn wmv3_and_vc1_force_software_decode_for_stability() {
-        assert!(force_software_decode_for_stable_playback(Id::WMV3));
-        assert!(force_software_decode_for_stable_playback(Id::VC1));
-        assert!(!force_software_decode_for_stable_playback(Id::H264));
-        assert!(!force_software_decode_for_stable_playback(Id::HEVC));
     }
 
     #[test]

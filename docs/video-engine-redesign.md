@@ -1179,21 +1179,18 @@ The remaining structural improvement is optional back-pressure on `audio_rx`
 while `raw_pending` is above a soft cap. Keep that as a follow-up if high-water
 logs remain frequent on normal files.
 
-## Phase 9.I: WMV3/VC-1 stable playback fallback (2026-05-03)
+## Phase 9.I: WMV/ASF frame-rate metadata fallback (2026-05-03)
 
 Some ASF/WMV files report `avg_frame_rate=0/0` while still carrying a usable
-stream rate such as `24/1`. They can also advertise D3D11VA support for
-WMV3/VC-1 even when the hardware path produces frames much slower than real
-time on the current GPU/driver stack.
+stream rate such as `24/1`.
 
-mIV now handles that compatibility corner case conservatively:
+mIV handles that compatibility corner case by deriving display/VPP frame-rate
+metadata from `avg_frame_rate` first and falling back to `stream.rate()` when
+the average is missing. This avoids `fps=0/0` diagnostics for old WMV/ASF
+files.
 
-- `src/video/decoder.rs` derives display/VPP frame-rate metadata from
-  `avg_frame_rate` first and falls back to `stream.rate()` when the average is
-  missing. This avoids `fps=0/0` diagnostics for old WMV/ASF files.
-- WMV3 and VC-1 are forced to the software decoder even when global hardware
-  decode is enabled. H.264/HEVC/AV1 hardware decode behavior is unchanged.
-
-This is intentionally narrower than disabling D3D11VA globally: the affected
-WMV3 sample was only 640x480, where software decode is cheap, while modern
-H.264/HEVC content still benefits from the zero-copy GPU path.
+WMV3/VC-1 continue to follow the user's global hardware decode setting. A
+2026-05-03 investigation showed the affected WMV3 sample still stuttered with
+software decode (`decode_path=sw`, `hw_effective=false`), so the remaining
+issue is tracked as audio/VST raw backlog after seek rather than a D3D11VA
+decoder problem.
