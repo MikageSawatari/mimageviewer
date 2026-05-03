@@ -1347,7 +1347,9 @@ publishes post-seek audio.
 2026-05-04 follow-up: after sync was stable, remaining red perf-graph ticks were
 mostly UI display misses rather than decoder drops (`decoder_skips=0` with a
 full render buffer). For 60fps playback, `request_repaint_after(16ms)` can wake
-one OS timer tick late and miss a vsync. While a video is playing and the next
-frame is due within one frame interval, mIV now requests an immediate repaint so
-egui/winit can schedule the next vsync directly. Paused and long-delay states
-still use delayed repaint requests.
+one OS timer tick late and miss a vsync. The render queue now schedules wakeups
+before the exact frame time by roughly half the source frame interval
+(`0.5 / fps`, clamped to 4-20ms), and the app subtracts the time already spent
+inside `poll_video` before issuing `request_repaint_after`. This keeps 60fps
+content from losing repaint opportunities without forcing low-fps files into a
+tight immediate-repaint loop.

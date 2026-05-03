@@ -158,6 +158,15 @@ unsafe impl Sync for GpuLatestFrame {}
 pub(crate) const MAX_RENDER_QUEUE: usize = 24;
 
 impl VideoPlayer {
+    fn repaint_prewake_secs(&self) -> f64 {
+        let fps = self.info.as_ref().map(|i| i.avg_fps).unwrap_or(0.0);
+        if fps.is_finite() && fps > 1.0 {
+            (0.5 / fps).clamp(0.004, 0.020)
+        } else {
+            0.008
+        }
+    }
+
     /// 新しい VideoPlayer を作る。FFmpeg DLL のロードはここで行う (冪等)。
     /// ファイルオープン自体はワーカースレッド内で非同期に行うので、UI スレッドは
     /// ブロックされない。
@@ -721,7 +730,7 @@ impl VideoPlayer {
             // 最初の真の未来フレーム → そのまま残し、次 tick を予約。
             // request_repaint_after は厳密なタイマーではないため、表示許容と同じ
             // 小さな margin だけ早めに起こし、displayable 判定側でまだ早ければ残す。
-            let until = (front.pts_secs - now - lead_tol).max(0.001);
+            let until = (front.pts_secs - now - self.repaint_prewake_secs()).max(0.001);
             next_due = Some(std::time::Duration::from_secs_f64(until));
             break;
         }
