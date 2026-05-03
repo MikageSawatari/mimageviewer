@@ -128,6 +128,7 @@ public:
     void set_gui_topmost(bool topmost);
     /// Relay mIV app activation to the bridge-owned plugin surface.
     void set_gui_app_active(bool active);
+    void* gui_container_hwnd() const { return view_container_hwnd_; }
     /// GUI を外す。HWND 自体は呼び出し側が破棄する。
     void hide_gui();
 

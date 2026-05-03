@@ -30,6 +30,7 @@
 #include <cstring>  // memcpy
 #include <deque>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -187,6 +188,12 @@ static bool base64_decode(const std::string& in, std::vector<uint8_t>& out) {
     return true;
 }
 
+struct ChainSnapshot {
+    std::vector<uint64_t> slot_ids;
+    std::vector<PluginLoader*> loaders;
+    std::vector<bool> bypassed;
+};
+
 class Bridge {
 public:
     Bridge() = default;
@@ -236,6 +243,9 @@ public:
 
         {
             std::lock_guard<std::mutex> lk(loaders_mutex_);
+            processing_order_.clear();
+            plugin_bypass_.clear();
+            rebuild_chain_snapshot_unlocked();
             if (loader_) {
                 loader_->unload();
             }
@@ -334,6 +344,28 @@ private:
         return v;
     }
 
+    static std::vector<uint64_t> parse_u64_list(const std::string& text) {
+        std::vector<uint64_t> out;
+        uint64_t value = 0;
+        bool have_digit = false;
+        for (char ch : text) {
+            if (ch >= '0' && ch <= '9') {
+                value = value * 10 + static_cast<uint64_t>(ch - '0');
+                have_digit = true;
+            } else if (ch == ',') {
+                if (have_digit) {
+                    out.push_back(value);
+                }
+                value = 0;
+                have_digit = false;
+            }
+        }
+        if (have_digit) {
+            out.push_back(value);
+        }
+        return out;
+    }
+
     PluginLoader* loader_at(uint64_t slot_id) {
         std::lock_guard<std::mutex> lk(loaders_mutex_);
         return loader_at_unlocked(slot_id);
@@ -374,6 +406,40 @@ private:
 
     bool slot_bypassed(size_t slot) const {
         return slot < plugin_bypass_.size() && plugin_bypass_[slot];
+    }
+
+    void rebuild_chain_snapshot_unlocked() {
+        auto next = std::make_shared<ChainSnapshot>();
+        next->slot_ids.reserve(processing_order_.size());
+        next->loaders.reserve(processing_order_.size());
+        next->bypassed.reserve(processing_order_.size());
+        for (uint64_t slot_id : processing_order_) {
+            PluginLoader* loader = loader_at_unlocked(slot_id);
+            if (!loader) continue;
+            next->slot_ids.push_back(slot_id);
+            next->loaders.push_back(loader);
+            next->bypassed.push_back(slot_bypassed(static_cast<size_t>(slot_id)));
+        }
+        std::atomic_store(&chain_snapshot_, std::shared_ptr<const ChainSnapshot>(next));
+    }
+
+    std::shared_ptr<const ChainSnapshot> chain_snapshot() const {
+        auto snap = std::atomic_load(&chain_snapshot_);
+        if (snap) return snap;
+        return std::make_shared<ChainSnapshot>();
+    }
+
+    static PluginLoader* loader_from_snapshot(
+        const std::shared_ptr<const ChainSnapshot>& snap,
+        uint64_t slot_id)
+    {
+        if (!snap) return nullptr;
+        for (size_t i = 0; i < snap->slot_ids.size(); ++i) {
+            if (snap->slot_ids[i] == slot_id) {
+                return snap->loaders[i];
+            }
+        }
+        return nullptr;
     }
 
     bool handle_message(const std::string& msg) {
@@ -514,26 +580,40 @@ private:
             }
             return true;
         }
+        if (cmd == "set_chain_z_order") {
+            auto ordered_slots = parse_u64_list(extract_string_field(msg, "ordered_slots"));
+            const bool topmost = extract_number_field(msg, "topmost") != 0;
+            apply_chain_z_order(ordered_slots, topmost);
+            return true;
+        }
         if (cmd == "set_bypass") {
             uint64_t slot = extract_number_field(msg, "slot_id");
-            if (slot < plugin_bypass_.size()) {
-                plugin_bypass_[static_cast<size_t>(slot)] =
-                    extract_number_field(msg, "bypass") != 0;
+            {
+                std::lock_guard<std::mutex> lk(loaders_mutex_);
+                if (slot < plugin_bypass_.size()) {
+                    plugin_bypass_[static_cast<size_t>(slot)] =
+                        extract_number_field(msg, "bypass") != 0;
+                    rebuild_chain_snapshot_unlocked();
+                }
             }
             return true;
         }
         if (cmd == "move_plugin") {
             uint64_t slot = extract_number_field(msg, "slot_id");
             uint64_t before = extract_number_field(msg, "before_slot_id");
-            auto it = std::find(processing_order_.begin(), processing_order_.end(), slot);
-            if (it != processing_order_.end()) {
-                processing_order_.erase(it);
-            }
-            auto before_it = std::find(processing_order_.begin(), processing_order_.end(), before);
-            if (before_it != processing_order_.end()) {
-                processing_order_.insert(before_it, slot);
-            } else {
-                processing_order_.push_back(slot);
+            {
+                std::lock_guard<std::mutex> lk(loaders_mutex_);
+                auto it = std::find(processing_order_.begin(), processing_order_.end(), slot);
+                if (it != processing_order_.end()) {
+                    processing_order_.erase(it);
+                }
+                auto before_it = std::find(processing_order_.begin(), processing_order_.end(), before);
+                if (before_it != processing_order_.end()) {
+                    processing_order_.insert(before_it, slot);
+                } else {
+                    processing_order_.push_back(slot);
+                }
+                rebuild_chain_snapshot_unlocked();
             }
             return true;
         }
@@ -621,6 +701,7 @@ private:
                 extra_loaders_.clear();
                 plugin_bypass_.clear();
                 processing_order_.clear();
+                rebuild_chain_snapshot_unlocked();
             }
             write_message("{\"event\":\"closed\"}");
             return true;
@@ -670,6 +751,7 @@ private:
             plugin_bypass_.clear();
             processing_order_.clear();
             loader_ = std::make_unique<PluginLoader>();
+            rebuild_chain_snapshot_unlocked();
         }
 
         LoadedPluginInfo info;
@@ -678,6 +760,7 @@ private:
             {
                 std::lock_guard<std::mutex> lk(loaders_mutex_);
                 loader_.reset();
+                rebuild_chain_snapshot_unlocked();
             }
             pipe_.detach();
             return true;
@@ -706,6 +789,7 @@ private:
             std::lock_guard<std::mutex> lk(loaders_mutex_);
             plugin_bypass_.push_back(false);
             processing_order_.push_back(0);
+            rebuild_chain_snapshot_unlocked();
         }
 
         std::string reply = "{\"event\":\"loaded\",\"plugin_name\":\"" +
@@ -770,6 +854,7 @@ private:
             extra_loaders_.push_back(std::move(loader));
             plugin_bypass_.push_back(extract_number_field(msg, "bypass") != 0);
             processing_order_.push_back(slot_id);
+            rebuild_chain_snapshot_unlocked();
         }
         std::string reply = "{\"event\":\"loaded\",\"plugin_name\":\"" +
                             json_escape(info.plugin_name) +
@@ -778,6 +863,55 @@ private:
                             std::to_string(info.latency_samples) + "}";
         write_message(reply);
         return true;
+    }
+
+    void apply_chain_z_order(const std::vector<uint64_t>& ordered_slots_top_to_bottom,
+                             bool topmost) {
+        std::vector<HWND> hwnds;
+        {
+            std::lock_guard<std::mutex> lk(loaders_mutex_);
+            hwnds.reserve(ordered_slots_top_to_bottom.size());
+            for (uint64_t slot_id : ordered_slots_top_to_bottom) {
+                PluginLoader* loader = loader_at_unlocked(slot_id);
+                if (!loader) continue;
+                HWND hwnd = reinterpret_cast<HWND>(loader->gui_container_hwnd());
+                if (hwnd && IsWindow(hwnd)) {
+                    hwnds.push_back(hwnd);
+                }
+            }
+        }
+        if (hwnds.empty()) return;
+
+        HDWP batch = BeginDeferWindowPos(static_cast<int>(hwnds.size()));
+        if (!batch) {
+            for (auto it = hwnds.rbegin(); it != hwnds.rend(); ++it) {
+                SetWindowPos(*it,
+                             topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
+                             0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            }
+            return;
+        }
+        HWND insert_after = topmost ? HWND_TOPMOST : HWND_NOTOPMOST;
+        for (auto it = hwnds.rbegin(); it != hwnds.rend(); ++it) {
+            HDWP next = DeferWindowPos(batch,
+                                       *it,
+                                       insert_after,
+                                       0, 0, 0, 0,
+                                       SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            if (!next) {
+                EndDeferWindowPos(batch);
+                for (auto fallback = hwnds.rbegin(); fallback != hwnds.rend(); ++fallback) {
+                    SetWindowPos(*fallback,
+                                 insert_after,
+                                 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                }
+                return;
+            }
+            batch = next;
+        }
+        EndDeferWindowPos(batch);
     }
 
     void audio_loop(uint32_t max_block_size) {
@@ -856,18 +990,16 @@ private:
                 pipe_.discard_all();
                 uint32_t total_latency = 0;
                 uint32_t active_loaders = 0;
-                {
-                    std::lock_guard<std::mutex> lk(loaders_mutex_);
-                    for (uint64_t slot_id : processing_order_) {
-                        PluginLoader* loader = loader_at_unlocked(slot_id);
-                        if (!loader || slot_bypassed(static_cast<size_t>(slot_id))) continue;
-                        ++active_loaders;
-                        loader->reset();
-                        uint32_t lat = loader->latency_samples();
-                        total_latency += lat;
-                        if (lat > 0) {
-                            loader->flush_with_silence(lat);
-                        }
+                auto snap = chain_snapshot();
+                for (size_t i = 0; i < snap->loaders.size(); ++i) {
+                    PluginLoader* loader = snap->loaders[i];
+                    if (!loader || snap->bypassed[i]) continue;
+                    ++active_loaders;
+                    loader->reset();
+                    uint32_t lat = loader->latency_samples();
+                    total_latency += lat;
+                    if (lat > 0) {
+                        loader->flush_with_silence(lat);
                     }
                 }
                 if (active_loaders > 0) {
@@ -922,8 +1054,8 @@ private:
             //   状態で次の process_block に渡る (= pre-warm が古い state で走る race を防止)
             if (query_state_pending_.exchange(false, std::memory_order_acq_rel)) {
                 uint64_t slot_id = pending_state_slot_.load(std::memory_order_acquire);
-                std::lock_guard<std::mutex> lk(loaders_mutex_);
-                PluginLoader* loader = loader_at_unlocked(slot_id);
+                auto snap = chain_snapshot();
+                PluginLoader* loader = loader_from_snapshot(snap, slot_id);
                 if (loader) {
                     std::vector<uint8_t> bytes;
                     if (loader->query_state(bytes)) {
@@ -944,8 +1076,8 @@ private:
                     bytes = std::move(restore_state_bytes_);
                 }
                 uint64_t slot_id = pending_state_slot_.load(std::memory_order_acquire);
-                std::lock_guard<std::mutex> lk(loaders_mutex_);
-                PluginLoader* loader = loader_at_unlocked(slot_id);
+                auto snap = chain_snapshot();
+                PluginLoader* loader = loader_from_snapshot(snap, slot_id);
                 if (loader && !bytes.empty()) {
                     if (!loader->restore_state(bytes)) {
                         send_event_error("restore_state: setState failed");
@@ -982,22 +1114,20 @@ private:
                 bool processed_any = false;
                 const float* current_in = input.data();
                 float* current_out = output.data();
-                {
-                    std::lock_guard<std::mutex> lk(loaders_mutex_);
-                    for (uint64_t slot_id : processing_order_) {
-                        PluginLoader* loader = loader_at_unlocked(slot_id);
-                        if (!loader || slot_bypassed(static_cast<size_t>(slot_id))) continue;
-                        current_out = processed_any
-                            ? (current_out == output.data() ? temp.data() : output.data())
-                            : output.data();
-                        if (!loader->process_block(current_in, current_out, frames)) {
-                            send_event_error("process_block failed");
-                            audio_running_ = false;
-                            break;
-                        }
-                        processed_any = true;
-                        current_in = current_out;
+                auto snap = chain_snapshot();
+                for (size_t i = 0; i < snap->loaders.size(); ++i) {
+                    PluginLoader* loader = snap->loaders[i];
+                    if (!loader || snap->bypassed[i]) continue;
+                    current_out = processed_any
+                        ? (current_out == output.data() ? temp.data() : output.data())
+                        : output.data();
+                    if (!loader->process_block(current_in, current_out, frames)) {
+                        send_event_error("process_block failed");
+                        audio_running_ = false;
+                        break;
                     }
+                    processed_any = true;
+                    current_in = current_out;
                 }
                 if (!audio_running_) {
                     break;
@@ -1034,6 +1164,7 @@ private:
     std::vector<std::unique_ptr<PluginLoader>> extra_loaders_;
     std::vector<bool> plugin_bypass_;
     std::vector<uint64_t> processing_order_;
+    std::shared_ptr<const ChainSnapshot> chain_snapshot_;
     AudioPipe pipe_;
     uint32_t sample_rate_ = 0;
     uint32_t block_size_ = 0;

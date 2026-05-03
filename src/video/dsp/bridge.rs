@@ -229,6 +229,7 @@ pub struct Bridge {
     /// stdout を読んで非同期 (LatencyChanged / ResetDone) 以外の event をここに流す。
     /// recv() はここから読む。
     event_rx: crossbeam_channel::Receiver<std::io::Result<Event>>,
+    sync_call_mutex: Mutex<()>,
     /// プラグインの最新 latency_samples (= bridge から非同期通知された値)。
     /// 初期値 = u32::MAX (= 「未受信」マーカ)。Loaded event 受信後に通常値が入る。
     /// audio-pump が `total_latency_samples()` から定期 polling して slot.latency_samples
@@ -404,6 +405,7 @@ impl Bridge {
             child,
             stdin: Mutex::new(stdin),
             event_rx,
+            sync_call_mutex: Mutex::new(()),
             cached_latency_samples: cached_latency,
             cached_latency_by_slot,
             reset_ack_rx,
@@ -493,6 +495,15 @@ impl Bridge {
         self.send_value(&msg)
     }
 
+    pub fn with_sync_call<R>(&self, f: impl FnOnce() -> R) -> R {
+        let _guard = self.sync_call_mutex.lock().unwrap();
+        f()
+    }
+
+    pub fn sync_call_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.sync_call_mutex.lock().unwrap()
+    }
+
     pub fn set_bypass_slot(&self, slot_id: u64, bypass: bool) -> std::io::Result<()> {
         self.send_value(&serde_json::json!({
             "cmd": "set_bypass",
@@ -519,6 +530,7 @@ impl Bridge {
     /// 待ち続ける (= 他の同期 IPC と混線しないが、想定外があれば情報として残す)。
     /// 戻り値: Ok(state_b64) | Err(原因)。
     pub fn query_state_sync(&self, timeout: std::time::Duration) -> Result<String, String> {
+        let _guard = self.sync_call_mutex.lock().unwrap();
         self.send(&Cmd::QueryState)
             .map_err(|e| format!("send: {e}"))?;
         let deadline = std::time::Instant::now() + timeout;
@@ -546,6 +558,7 @@ impl Bridge {
         slot_id: u64,
         timeout: std::time::Duration,
     ) -> Result<String, String> {
+        let _guard = self.sync_call_mutex.lock().unwrap();
         self.send_value(&serde_json::json!({
             "cmd": "query_state",
             "slot_id": slot_id,

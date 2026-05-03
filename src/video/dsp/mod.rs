@@ -495,6 +495,12 @@ impl DspBridge {
             }
         };
 
+        let _sync_guard = if slot_id != 0 {
+            Some(bridge_arc.sync_call_guard())
+        } else {
+            None
+        };
+
         if slot_id != 0 {
             bridge_arc
                 .add_plugin_to_chain(slot_id, plugin_path, initial_state, bypass)
@@ -519,6 +525,7 @@ impl DspBridge {
         if bypass {
             let _ = bridge_arc.set_bypass_slot(slot_id, true);
         }
+        drop(_sync_guard);
         // PDC 診断: プラグインがレポートした latency をログに残す。
         crate::logger::log(format!(
             "[VST3 PDC] plugin loaded: '{}' latency_samples={} ({:.3}ms@{}Hz)",
@@ -811,6 +818,41 @@ impl DspBridge {
         }
     }
 
+    fn send_chain_z_order(&self, ordered_top_to_bottom: &[u64], topmost: bool) {
+        let commands: Vec<(Arc<Bridge>, Vec<u64>)> = {
+            let inner = self.inner.lock().unwrap();
+            let mut out: Vec<(Arc<Bridge>, Vec<u64>)> = Vec::new();
+            for hwnd in ordered_top_to_bottom {
+                let Some(slot) = inner.slots.iter().find(|s| s.gui_hwnd == *hwnd) else {
+                    continue;
+                };
+                if let Some((_, slots)) = out.iter_mut().find(|(b, _)| Arc::ptr_eq(b, &slot.bridge))
+                {
+                    slots.push(slot.slot_id);
+                } else {
+                    out.push((slot.bridge.clone(), vec![slot.slot_id]));
+                }
+            }
+            out
+        };
+
+        for (bridge, slots) in commands {
+            if slots.is_empty() {
+                continue;
+            }
+            let ordered_slots = slots
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let _ = bridge.send_value(&serde_json::json!({
+                "cmd": "set_chain_z_order",
+                "topmost": if topmost { 1 } else { 0 },
+                "ordered_slots": ordered_slots,
+            }));
+        }
+    }
+
     fn prewarm_slot_gui(&self, idx: usize) -> Result<(), String> {
         self.ensure_slot_gui_attached(idx, false, false)
     }
@@ -877,6 +919,7 @@ impl DspBridge {
                 .and_then(|s| s.plugin_name.clone())
                 .unwrap_or_else(|| "VST3 Plugin".to_string())
         };
+        let _gui_sync_guard = bridge_arc.sync_call_guard();
         bridge_arc
             .send_value(&serde_json::json!({
                 "cmd": "query_gui_size",
@@ -1150,8 +1193,8 @@ impl DspBridge {
             if !restore_order.is_empty() {
                 let topmost = self.gui_topmost_desired.load(Ordering::Acquire);
                 gui::show_windows_in_z_order(&restore_order, topmost);
+                self.send_chain_z_order(&restore_order, topmost);
                 for idx in shown_indices {
-                    self.send_slot_gui_topmost(idx, topmost);
                     self.send_slot_gui_visible(idx, true);
                 }
             }
@@ -1200,13 +1243,7 @@ impl DspBridge {
         for hwnd in ordered_top_to_bottom.iter().rev() {
             gui::set_window_topmost(*hwnd, topmost);
         }
-        let n = {
-            let inner = self.inner.lock().unwrap();
-            inner.slots.len()
-        };
-        for idx in 0..n {
-            self.send_slot_gui_topmost(idx, topmost);
-        }
+        self.send_chain_z_order(&ordered_top_to_bottom, topmost);
     }
 
     /// mIV が他アプリへ切り替わった時は plugin GUI を NOTOPMOST/非表示にし、
@@ -1228,12 +1265,15 @@ impl DspBridge {
                 gui::set_window_topmost(*hwnd, effective_topmost);
             }
         }
+        if !target_hwnds.is_empty() {
+            let ordered_top_to_bottom = gui::snapshot_z_order(&target_hwnds);
+            self.send_chain_z_order(&ordered_top_to_bottom, effective_topmost);
+        }
         let n = {
             let inner = self.inner.lock().unwrap();
             inner.slots.len()
         };
         for idx in 0..n {
-            self.send_slot_gui_topmost(idx, effective_topmost);
             self.send_slot_gui_app_active(idx, active);
         }
     }
