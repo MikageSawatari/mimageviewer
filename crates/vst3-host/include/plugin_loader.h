@@ -154,11 +154,14 @@ public:
     bool editor_chrome_bypassed() const {
         return editor_bypassed_.load(std::memory_order_acquire);
     }
-    void set_editor_chrome_bypassed(bool bypassed) {
-        editor_bypassed_.store(bypassed, std::memory_order_release);
+    void invalidate_editor_chrome() const {
         if (auto* hwnd = static_cast<HWND>(view_container_hwnd_snapshot_.load(std::memory_order_acquire))) {
             InvalidateRect(hwnd, nullptr, FALSE);
         }
+    }
+    void set_editor_chrome_bypassed(bool bypassed) {
+        editor_bypassed_.store(bypassed, std::memory_order_release);
+        invalidate_editor_chrome();
     }
     uint32_t editor_chrome_latency_samples() const {
         return latency_samples();

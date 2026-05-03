@@ -100,6 +100,27 @@ RECT editor_power_button_rect(HWND hwnd) {
     return RECT{8, top, 8 + button, top + button};
 }
 
+std::wstring editor_latency_text(miv::PluginLoader* loader) {
+    if (!loader) {
+        return L"-- ms";
+    }
+    const uint32_t sample_rate = loader->editor_chrome_sample_rate();
+    if (sample_rate == 0) {
+        return L"-- ms";
+    }
+    const double ms = static_cast<double>(loader->editor_chrome_latency_samples()) *
+                      1000.0 / static_cast<double>(sample_rate);
+    wchar_t text[32]{};
+    if (ms >= 1000.0) {
+        swprintf_s(text, L"%.2f s", ms / 1000.0);
+    } else if (ms >= 100.0) {
+        swprintf_s(text, L"%.0f ms", ms);
+    } else {
+        swprintf_s(text, L"%.1f ms", ms);
+    }
+    return text;
+}
+
 bool point_in_rect(const RECT& rect, POINT pt) {
     return pt.x >= rect.left && pt.x < rect.right && pt.y >= rect.top && pt.y < rect.bottom;
 }
@@ -211,20 +232,22 @@ void draw_editor_chrome(HWND hwnd, miv::PluginLoader* loader) {
     DeleteObject(close_pen);
 
     SetBkMode(hdc, TRANSPARENT);
+    std::wstring latency_text = editor_latency_text(loader);
+    const LONG title_left = power_rect.right + 10;
+    RECT latency_rect{std::max<LONG>(power_rect.right + 24, close_rect.left - 96),
+                      0,
+                      close_rect.left - 10,
+                      title_rect.bottom};
+    SetTextColor(hdc, bypassed ? RGB(150, 150, 150) : RGB(180, 210, 188));
+    DrawTextW(hdc,
+              latency_text.c_str(),
+              static_cast<int>(latency_text.size()),
+              &latency_rect,
+              DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
     SetTextColor(hdc, RGB(228, 228, 228));
     std::wstring title = utf8_to_wide(loader ? loader->editor_chrome_title() : std::string{});
-    if (loader) {
-        const uint32_t latency = loader->editor_chrome_latency_samples();
-        const uint32_t sample_rate = loader->editor_chrome_sample_rate();
-        if (latency > 0 && sample_rate > 0) {
-            wchar_t suffix[96]{};
-            swprintf_s(suffix,
-                       L"  |  %.1f ms",
-                       static_cast<double>(latency) * 1000.0 / static_cast<double>(sample_rate));
-            title += suffix;
-        }
-    }
-    RECT text_rect{power_rect.right + 10, 0, close_rect.left - 10, title_rect.bottom};
+    RECT text_rect{title_left, 0, std::max<LONG>(title_left, latency_rect.left - 10), title_rect.bottom};
     DrawTextW(hdc,
               title.c_str(),
               static_cast<int>(title.size()),
@@ -2029,6 +2052,7 @@ bool PluginLoader::poll_latency_change(uint32_t& new_latency_out) {
             [this]() -> uint32_t {
                 uint32_t latest = static_cast<uint32_t>(processor_->getLatencySamples());
                 cached_latency_samples_.store(latest, std::memory_order_release);
+                invalidate_editor_chrome();
                 return latest;
             });
         if (!result) {
@@ -2044,6 +2068,7 @@ bool PluginLoader::poll_latency_change(uint32_t& new_latency_out) {
     // あるが、次回 polling で正しい値が拾える設計で許容する (= 実害は数十 ms 程度)。
     uint32_t latest = static_cast<uint32_t>(processor_->getLatencySamples());
     cached_latency_samples_.store(latest, std::memory_order_release);
+    invalidate_editor_chrome();
     new_latency_out = latest;
     blog("poll_latency_change: new latency_samples=%u", latest);
     return true;

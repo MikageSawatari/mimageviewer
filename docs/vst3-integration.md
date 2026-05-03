@@ -53,8 +53,10 @@ The bridge-owned VST editor surface uses a custom dark title area above the
 plugin child HWND. The title area includes a left-side power button that toggles
 the slot bypass state through the same Rust `DspBridge::set_bypass` path used by
 the VST3 playback panel, so the setting is persisted in `settings.json` and the
-normal PDC auto-bypass guard still applies. The right-side close button hides
-only that plugin editor and marks the slot `user_hidden=true`.
+normal PDC auto-bypass guard still applies. The right side shows the current
+plugin-reported latency as a separate `ms` readout next to the close button; the
+readout is repainted when the bridge observes `kLatencyChanged`. The right-side
+close button hides only that plugin editor and marks the slot `user_hidden=true`.
 
 When the user resizes the outer editor frame, the bridge
 first asks `IPlugView::checkSizeConstraint` and snaps the outer frame back to
