@@ -310,22 +310,19 @@ impl App {
         // ── ボタンクリック処理 (Window closure 外で実行 = self の借用解放後) ──
         // bridge への命令は **bridge slot idx**、settings 検索は **plugin_path** で行う。
         if let Some((idx, path)) = clicked_show_gui {
-            if let Err(e) = self.dsp_bridge.show_slot_gui(idx) {
-                crate::logger::log(format!("vst3 show_slot_gui: {e}"));
-            } else {
-                // 明示的な show は user_hidden 解除も意味する (= 起動時 settings から
-                // 復元した user_hidden=true を、ユーザーが「GUI」ボタンで上書き)。
-                let mut changed = !self.settings.vst3_gui_visible;
-                self.settings.vst3_gui_visible = true;
-                if let Some(entry) = self.find_vst3_entry_mut(&path) {
-                    if entry.user_hidden {
-                        entry.user_hidden = false;
-                        changed = true;
-                    }
+            std::sync::Arc::clone(&self.dsp_bridge).show_slot_gui_async(idx);
+            // 明示的な show は user_hidden 解除も意味する (= 起動時 settings から
+            // 復元した user_hidden=true を、ユーザーが「GUI」ボタンで上書き)。
+            let mut changed = !self.settings.vst3_gui_visible;
+            self.settings.vst3_gui_visible = true;
+            if let Some(entry) = self.find_vst3_entry_mut(&path) {
+                if entry.user_hidden {
+                    entry.user_hidden = false;
+                    changed = true;
                 }
-                if changed {
-                    self.settings.save();
-                }
+            }
+            if changed {
+                self.settings.save();
             }
         }
         if let Some((idx, path)) = clicked_hide_gui {

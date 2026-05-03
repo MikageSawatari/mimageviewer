@@ -1033,6 +1033,41 @@ impl DspBridge {
         self.ensure_slot_gui_attached(idx, true, true)
     }
 
+    pub fn show_slot_gui_async(self: Arc<Self>, idx: usize) {
+        if self.gui_show_all_in_progress.swap(true, Ordering::AcqRel) {
+            crate::logger::log(format!(
+                "[VST3 GUI] show_slot_gui idx={idx} skipped: GUI attach already in progress"
+            ));
+            return;
+        }
+        let bridge = Arc::clone(&self);
+        if let Err(err) = std::thread::Builder::new()
+            .name(format!("vst3-gui-show-slot-{idx}"))
+            .spawn(move || {
+                crate::logger::log(format!("[VST3 GUI] async show-slot begin idx={idx}"));
+                if let Err(err) = bridge.ensure_slot_gui_attached(idx, true, true) {
+                    crate::logger::log(format!(
+                        "[VST3 GUI] async show-slot failed idx={idx}: {err}"
+                    ));
+                }
+                bridge
+                    .gui_show_all_in_progress
+                    .store(false, Ordering::Release);
+                crate::logger::log(format!("[VST3 GUI] async show-slot end idx={idx}"));
+            })
+        {
+            self.gui_show_all_in_progress
+                .store(false, Ordering::Release);
+            crate::logger::log(format!(
+                "[VST3 GUI] failed to spawn async show-slot idx={idx}: {err}"
+            ));
+        }
+    }
+
+    fn is_bridge_poison_detail(detail: &str) -> bool {
+        detail.contains("timeout") || detail.contains("timed out") || detail.contains("quarantined")
+    }
+
     fn ensure_slot_gui_attached(
         &self,
         idx: usize,
@@ -1091,7 +1126,7 @@ impl DspBridge {
                 .and_then(|s| s.plugin_name.clone())
                 .unwrap_or_else(|| "VST3 Plugin".to_string())
         };
-        let _gui_sync_guard = bridge_arc.sync_call_guard();
+        let mut gui_sync_guard = Some(bridge_arc.sync_call_guard());
         bridge_arc
             .send_value(&serde_json::json!({
                 "cmd": "query_gui_size",
@@ -1113,7 +1148,11 @@ impl DspBridge {
                 }
                 Err(e) => {
                     crate::logger::log(format!("vst3 query_gui_size: {e}, fallback 1200x800"));
-                    (1200, 800, true)
+                    drop(gui_sync_guard.take());
+                    self.disable_with_reason(Some(format!(
+                        "GUI size query timed out for {plugin_name}: {e}"
+                    )));
+                    return Err(format!("query_gui_size recv: {e}"));
                 }
             };
 
@@ -1159,17 +1198,29 @@ impl DspBridge {
                 }
             }
             Ok(Event::Error { detail }) => {
+                if Self::is_bridge_poison_detail(&detail) {
+                    drop(gui_sync_guard.take());
+                    self.disable_with_reason(Some(format!(
+                        "GUI attach failed for {plugin_name}: {detail}"
+                    )));
+                }
                 return Err(format!("gui attach: {detail}"));
             }
             Ok(other) => {
                 crate::logger::log(format!("vst3 attach: unexpected {other:?}"));
             }
             Err(e) => {
+                drop(gui_sync_guard.take());
+                self.disable_with_reason(Some(format!(
+                    "GUI attach timed out for {plugin_name}: {e}"
+                )));
                 return Err(format!("attach recv: {e}"));
             }
         }
 
         // ─ Step 4: スロットに GUI 情報を書き戻す ─
+        drop(gui_sync_guard.take());
+
         let mut inner = self.inner.lock().unwrap();
         if let Some(slot) = inner.slots.get_mut(idx) {
             slot.gui_hwnd = hwnd;

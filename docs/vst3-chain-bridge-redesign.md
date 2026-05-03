@@ -212,6 +212,11 @@ Design rules:
   editor HWNDs are attached from a background worker. This preserves the fast
   z-order toggle path after editors exist while preventing plugins that spend
   seconds in `attached()` from freezing video playback or the fullscreen UI.
+- The VST3 manager's per-slot GUI button follows the same rule: it may update
+  user-visible intent immediately, but first-time editor attach runs in the
+  background. A GUI attach or GUI-size query timeout poisons the chain bridge
+  for the rest of the session, because the bridge main pump may be stuck inside
+  a plugin-created hidden-window message such as `0x47B`.
 - `query_state` / `restore_state` currently use the bridge audio-thread fence to
   avoid racing VST3 `process`. Keep that ownership explicit during the GUI
   thread refactor. If a plugin proves to require GUI-thread state I/O, add a
