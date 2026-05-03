@@ -33,11 +33,11 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForSystem};
 use windows::Win32::UI::WindowsAndMessaging::{
     CW_USEDEFAULT, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GetClientRect,
-    HWND_NOTOPMOST, IDC_ARROW, IsIconic, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW,
-    SW_SHOW, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-    SetForegroundWindow, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE,
-    WM_ACTIVATEAPP, WM_CLOSE, WM_DESTROY, WM_LBUTTONDOWN, WM_MOVE, WM_PARENTNOTIFY, WM_SIZE,
-    WNDCLASSEXW, WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
+    IDC_ARROW, IsIconic, LoadCursorW, MSG, PostQuitMessage, RegisterClassExW, SW_SHOW,
+    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SetForegroundWindow,
+    SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_ACTIVATEAPP, WM_CLOSE,
+    WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOVE, WM_PARENTNOTIFY, WM_SIZE, WNDCLASSEXW,
+    WS_CLIPCHILDREN, WS_MAXIMIZEBOX, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 use windows::core::{HSTRING, PCWSTR};
 
@@ -278,23 +278,18 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_ACTIVATEAPP => {
                 let active = wparam.0 != 0;
-                if !active {
-                    let _ = SetWindowPos(
-                        hwnd,
-                        Some(HWND_NOTOPMOST),
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-                    );
-                }
                 let tx_opt: Option<Sender<bool>> = THREAD_STATE
                     .with(|s| s.borrow().as_ref().and_then(|st| st.app_active_tx.clone()));
                 if let Some(tx) = tx_opt {
                     let _ = tx.send(active);
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_ERASEBKGND => {
+                // The bridge-owned editor surface covers the entire client
+                // area. Suppress background erase so a move/resize does not
+                // flash a white client edge while the surface follows.
+                LRESULT(1)
             }
             WM_DESTROY => {
                 PostQuitMessage(0);

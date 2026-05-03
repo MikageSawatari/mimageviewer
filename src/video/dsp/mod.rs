@@ -791,6 +791,11 @@ impl DspBridge {
             inner.slots.get(idx).map(|s| (s.bridge.clone(), s.slot_id))
         };
         if let Some((bridge, slot_id)) = slot {
+            if !visible {
+                crate::logger::log(format!(
+                    "[VST3 GUI] send_slot_gui_visible idx={idx} slot={slot_id} visible=false"
+                ));
+            }
             let _ = bridge.send_value(&serde_json::json!({
                 "cmd": "set_gui_visible",
                 "slot_id": slot_id,
@@ -1079,6 +1084,7 @@ impl DspBridge {
     /// `user_hidden` フラグは触らない。VST 全体トグル / フルスクリーン解除等の
     /// 暗黙 hide パスで使う。
     pub fn hide_slot_gui(&self, idx: usize) {
+        crate::logger::log(format!("[VST3 GUI] hide_slot_gui idx={idx}"));
         let hwnd = {
             let mut inner = self.inner.lock().unwrap();
             if let Some(slot) = inner.slots.get_mut(idx) {
@@ -1099,6 +1105,7 @@ impl DspBridge {
     /// VST ボタン全表示) では表示しない (= ユーザー報告 2026-04 「個別に閉じた
     /// ものは再表示しないでほしい」)。
     pub fn user_hide_slot_gui(&self, idx: usize) {
+        crate::logger::log(format!("[VST3 GUI] user_hide_slot_gui idx={idx}"));
         let hwnd = {
             let mut inner = self.inner.lock().unwrap();
             if let Some(slot) = inner.slots.get_mut(idx) {

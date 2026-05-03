@@ -36,6 +36,20 @@ HWND g_plugin_mouse_hook_host_hwnd = nullptr;
 constexpr const wchar_t* kBridgeViewContainerClass = L"MivVst3BridgeViewContainer";
 
 LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (msg == WM_WINDOWPOSCHANGING) {
+        auto* wp = reinterpret_cast<WINDOWPOS*>(lparam);
+        if (wp && ((wp->flags & SWP_NOMOVE) == 0 || (wp->flags & SWP_NOSIZE) == 0)) {
+            if (wp->x < -30000 || wp->y < -30000 || wp->cx <= 1 || wp->cy <= 1) {
+                blog("bridge container suspicious WINDOWPOSCHANGING hwnd=0x%llx flags=0x%X x=%d y=%d cx=%d cy=%d",
+                     reinterpret_cast<unsigned long long>(hwnd),
+                     wp->flags,
+                     wp->x,
+                     wp->y,
+                     wp->cx,
+                     wp->cy);
+            }
+        }
+    }
     if (msg == WM_ACTIVATEAPP) {
         blog("bridge container WM_ACTIVATEAPP active=%d", wparam != FALSE ? 1 : 0);
         // Do not lower the surface directly here. Moving focus between the Rust
@@ -1337,12 +1351,22 @@ void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
     if (container_hwnd && IsWindow(container_hwnd)) {
         RECT rect{};
         if (host_client_rect_on_screen(reinterpret_cast<HWND>(view_host_hwnd_), rect)) {
+            const int target_width = std::max<LONG>(1, rect.right - rect.left);
+            const int target_height = std::max<LONG>(1, rect.bottom - rect.top);
+            if (target_width != static_cast<int>(width) ||
+                target_height != static_cast<int>(height)) {
+                blog("notify_host_resize: requested=%ux%u host_client=%dx%d",
+                     width,
+                     height,
+                     target_width,
+                     target_height);
+            }
             SetWindowPos(container_hwnd,
                          nullptr,
                          rect.left,
                          rect.top,
-                         std::max<int>(1, static_cast<int>(width)),
-                         std::max<int>(1, static_cast<int>(height)),
+                         target_width,
+                         target_height,
                          SWP_NOZORDER | SWP_NOACTIVATE);
             // Move-only updates do not call IPlugView::onSize below. Nudge
             // D3D-backed editors so their swapchain presents at the new

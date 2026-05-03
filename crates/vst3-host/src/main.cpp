@@ -566,6 +566,11 @@ private:
         if (cmd == "set_gui_visible") {
             if (PluginLoader* loader = loader_for_message(msg)) {
                 uint64_t visible = extract_number_field(msg, "visible");
+                uint64_t slot_id = extract_number_field(msg, "slot_id");
+                std::fprintf(stderr,
+                             "[BRIDGE] set_gui_visible cmd: slot=%llu visible=%llu\n",
+                             static_cast<unsigned long long>(slot_id),
+                             static_cast<unsigned long long>(visible));
                 loader->set_gui_visible(visible != 0);
             }
             return true;
