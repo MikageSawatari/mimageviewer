@@ -59,18 +59,15 @@ public:
     /// 操作も Win32 API は許容)。
     void set_host_hwnd(void* hwnd) { host_hwnd_ = hwnd; }
 
-    /// `notify_host_resize` ハンドラから呼ばれる。タイムスタンプを更新しておくと、
-    /// その後 250ms 以内にプラグインから来る `resizeView` コールバックを
-    /// SetWindowPos スキップ扱いにする (= フィードバックループ抑止)。
-    /// 同期再帰だけでなく PostMessage 経由の **非同期 resizeView** にも対応するため
-    /// 時間ベースで判定する。Insight2 はリサイズドラッグ中に内部で複数回非同期
-    /// resizeView を発火するため、瞬間的なフラグでは間に合わなかった。
+    /// ホスト主導の `onSize` を送る直前に呼ぶ。ログ診断用に時刻を保持するが、
+    /// `resizeView` の抑止判定は `user_resizing_` のみで行う。直近 WM_SIZE の
+    /// 余韻だけでプラグイン内部 resize handle 由来の正規 resizeView を捨てると、
+    /// editor が内部サイズだけ変わり、外枠と中身がずれる。
     void mark_user_resize();
 
     /// ユーザー drag によるリサイズ session の開始 / 終了 (Codex P4)。
     /// `active=true` 中は `resizeView` callback で SetWindowPos を **常に**
-    /// スキップする。`set_user_resizing(false)` 後にタイムスタンプ式の 250ms
-    /// fallback と組み合わせて Insight2 の非同期 resizeView も抑止する。
+    /// スキップする。
     void set_user_resizing(bool active);
 
     Steinberg::tresult PLUGIN_API resizeView(Steinberg::IPlugView* view,

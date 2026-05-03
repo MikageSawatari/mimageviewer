@@ -100,8 +100,6 @@ void PlugFrame::mark_user_resize() {
 
 void PlugFrame::set_user_resizing(bool active) {
     user_resizing_ = active;
-    // session 終了時にもタイムスタンプを更新しておくと、直後の遅延 resizeView
-    // が 250ms fallback で抑止される。Codex P4 「session 後の余韻」対応。
     if (!active) {
         last_user_resize_tick_ = static_cast<uint64_t>(GetTickCount64());
     }
@@ -121,30 +119,14 @@ tresult PLUGIN_API PlugFrame::resizeView(Steinberg::IPlugView* view,
     }
     int32 w = newSize->right - newSize->left;
     int32 h = newSize->bottom - newSize->top;
-    // ── フィードバックループ抑止 (Insight2 リサイズ振動への対策) ──
-    // ユーザーがホストウィンドウをドラッグしてリサイズ中、host は WM_SIZE 受信
-    // ごとに `notify_host_resize` → mark_user_resize() で last_user_resize_tick_
-    // を更新しながら view->onSize を呼ぶ。Insight2 はそれに対し、同期 / 非同期
-    // (PostMessage) で resizeView を多発させてホスト窓のサイズ調整を要求して
-    // くる。ここで SetWindowPos するとユーザーのドラッグと衝突して
-    // ウィンドウが瞬間的にプラグイン推奨サイズへ吸着 → 次フレームでユーザー位置
-    // に戻る → 暴れる。
-    // 直近 250ms 以内に user resize があったときは SetWindowPos をスキップして
-    // view->onSize で確認だけ返答する (= フィードバックループ抑止)。
-    // Codex P4: session フラグ優先。WM_ENTERSIZEMOVE-EXITSIZEMOVE 中はずっと
-    // SetWindowPos スキップ。fallback として 250ms タイムスタンプ抑止も併用
-    // (= session 後の遅延 resizeView や session 経路を通らない場合の保険)。
-    constexpr uint64_t SUPPRESS_WINDOW_MS = 250;
+    // ── フィードバックループ抑止 ──
+    // WM_ENTERSIZEMOVE-EXITSIZEMOVE 中だけ SetWindowPos を抑止する。
+    // 直近 WM_SIZE の時間ベース抑止は、プラグイン内蔵 resize handle から来る
+    // 正規 resizeView まで捨ててしまい、外枠と editor 内部サイズの不一致を作る。
     bool suppressed = user_resizing_;
-    if (!suppressed && last_user_resize_tick_ > 0) {
-        uint64_t now = static_cast<uint64_t>(GetTickCount64());
-        if (now - last_user_resize_tick_ < SUPPRESS_WINDOW_MS) {
-            suppressed = true;
-        }
-    }
     if (suppressed || w <= 0 || h <= 0) {
         std::fprintf(stderr,
-                     "[BRIDGE] resizeView: rect=(%d,%d,%d,%d) size=%dx%d suppressed=%d user_resizing=%d\n",
+                     "[BRIDGE] resizeView: rect=(%d,%d,%d,%d) size=%dx%d suppressed=%d user_resizing=%d last_user_resize_ms=%llu\n",
                      newSize->left,
                      newSize->top,
                      newSize->right,
@@ -152,10 +134,19 @@ tresult PLUGIN_API PlugFrame::resizeView(Steinberg::IPlugView* view,
                      w,
                      h,
                      suppressed ? 1 : 0,
-                     user_resizing_ ? 1 : 0);
+                     user_resizing_ ? 1 : 0,
+                     static_cast<unsigned long long>(last_user_resize_tick_));
     }
     if (host_hwnd_ && w > 0 && h > 0 && !suppressed) {
         HWND hwnd = reinterpret_cast<HWND>(host_hwnd_);
+        std::fprintf(stderr,
+                     "[BRIDGE] resizeView apply: rect=(%d,%d,%d,%d) size=%dx%d\n",
+                     newSize->left,
+                     newSize->top,
+                     newSize->right,
+                     newSize->bottom,
+                     w,
+                     h);
         SendMessageW(hwnd,
                      kBridgeResizePluginClientMsg,
                      static_cast<WPARAM>(std::max<int32>(1, w)),

@@ -240,12 +240,6 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
         ScreenToClient(hwnd, &pt);
         RECT client{};
         GetClientRect(hwnd, &client);
-        if (point_in_rect(editor_close_button_rect(hwnd), pt)) {
-            return HTCLIENT;
-        }
-        if (pt.y < editor_titlebar_height(hwnd)) {
-            return HTCAPTION;
-        }
         UINT dpi = GetDpiForWindow(hwnd);
         if (dpi == 0) dpi = 96;
         const int frame = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) +
@@ -265,6 +259,12 @@ LRESULT CALLBACK BridgeViewContainerProc(HWND hwnd, UINT msg, WPARAM wparam, LPA
             if (right) return HTRIGHT;
             if (top) return HTTOP;
             if (bottom) return HTBOTTOM;
+        }
+        if (point_in_rect(editor_close_button_rect(hwnd), pt)) {
+            return HTCLIENT;
+        }
+        if (pt.y < editor_titlebar_height(hwnd)) {
+            return HTCAPTION;
         }
         return HTCLIENT;
     }
@@ -1776,18 +1776,49 @@ void PluginLoader::handle_editor_window_size() {
     }
     const uint32_t width = static_cast<uint32_t>(std::max<LONG>(1, client.right - client.left));
     const uint32_t height = static_cast<uint32_t>(std::max<LONG>(1, client.bottom - client.top));
-    if (width == last_gui_width_ && height == last_gui_height_) {
+    uint32_t constrained_width = width;
+    uint32_t constrained_height = height;
+    Steinberg::ViewRect constrained_rect{0,
+                                         0,
+                                         static_cast<Steinberg::int32>(width),
+                                         static_cast<Steinberg::int32>(height)};
+    view_->checkSizeConstraint(&constrained_rect);
+    if (constrained_rect.right > constrained_rect.left &&
+        constrained_rect.bottom > constrained_rect.top) {
+        constrained_width = static_cast<uint32_t>(std::max<Steinberg::int32>(
+            1, constrained_rect.right - constrained_rect.left));
+        constrained_height = static_cast<uint32_t>(std::max<Steinberg::int32>(
+            1, constrained_rect.bottom - constrained_rect.top));
+    }
+    if ((constrained_width != width || constrained_height != height) &&
+        resize_frame_for_plugin_client(container_hwnd,
+                                       static_cast<int>(constrained_width),
+                                       static_cast<int>(constrained_height))) {
+        layout_editor_child(container_hwnd, plugin_hwnd);
+        if (!GetClientRect(plugin_hwnd, &client)) {
+            return;
+        }
+        constrained_width = static_cast<uint32_t>(std::max<LONG>(1, client.right - client.left));
+        constrained_height = static_cast<uint32_t>(std::max<LONG>(1, client.bottom - client.top));
+        blog("editor host resize constrained plugin=\"%s\" requested=%ux%u constrained=%ux%u",
+             plugin_name_.empty() ? "(unknown)" : plugin_name_.c_str(),
+             width,
+             height,
+             constrained_width,
+             constrained_height);
+    }
+    if (constrained_width == last_gui_width_ && constrained_height == last_gui_height_) {
         return;
     }
-    last_gui_width_ = width;
-    last_gui_height_ = height;
+    last_gui_width_ = constrained_width;
+    last_gui_height_ = constrained_height;
     if (plug_frame_) {
         plug_frame_->mark_user_resize();
     }
     Steinberg::ViewRect rect{0,
                              0,
-                             static_cast<Steinberg::int32>(width),
-                             static_cast<Steinberg::int32>(height)};
+                             static_cast<Steinberg::int32>(constrained_width),
+                             static_cast<Steinberg::int32>(constrained_height)};
     view_->onSize(&rect);
     RedrawWindow(container_hwnd,
                  nullptr,

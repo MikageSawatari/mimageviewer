@@ -44,8 +44,19 @@ work while the panel is open.
 The handoff check stores the previous frame's Win32 foreground HWND and compares
 that value against the clicked fullscreen HWND rather than only trusting
 `viewport().focused`, because cross-process owner windows can keep egui's focus
-flag true and a click can activate fullscreen before the click handler observes
-the foreground window.
+  flag true and a click can activate fullscreen before the click handler observes
+  the foreground window.
+
+## Editor chrome resize rules (2026-05)
+
+The bridge-owned VST editor surface uses a custom dark title area above the
+plugin child HWND. When the user resizes the outer editor frame, the bridge
+first asks `IPlugView::checkSizeConstraint` and snaps the outer frame back to
+the plugin-approved client size before calling `IPlugView::onSize`. Plugin
+initiated `IPlugFrame::resizeView` calls are accepted unless a native
+WM_ENTERSIZEMOVE resize session is actively in progress; a stale WM_SIZE
+timestamp alone is not enough to suppress them, because many editors implement
+their own resize handle inside the plugin view.
 
 ## 2. 全体構成
 
