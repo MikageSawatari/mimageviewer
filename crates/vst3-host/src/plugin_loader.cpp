@@ -1336,6 +1336,7 @@ void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
     HWND container_hwnd = reinterpret_cast<HWND>(view_container_hwnd_);
     if (container_hwnd && IsWindow(container_hwnd)) {
         RECT rect{};
+        bool moved_surface = false;
         int x = 0;
         int y = 0;
         UINT flags = SWP_NOZORDER | SWP_NOACTIVATE;
@@ -1352,6 +1353,17 @@ void PluginLoader::notify_host_resize(uint32_t width, uint32_t height) {
                      std::max<int>(1, static_cast<int>(width)),
                      std::max<int>(1, static_cast<int>(height)),
                      flags);
+        moved_surface = (flags & SWP_NOMOVE) == 0;
+        if (moved_surface) {
+            // Move-only updates do not call IPlugView::onSize below. Nudge
+            // D3D-backed editors so their swapchain presents at the new
+            // desktop position instead of leaving stale pixels behind until
+            // their next internal repaint.
+            RedrawWindow(container_hwnd,
+                         nullptr,
+                         nullptr,
+                         RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_FRAME);
+        }
     }
     const bool size_changed = width != last_gui_width_ || height != last_gui_height_;
     if (!size_changed) {
