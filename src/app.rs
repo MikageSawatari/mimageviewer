@@ -13567,6 +13567,7 @@ impl eframe::App for App {
         {
             ctx.request_repaint();
         }
+        let t_background_polls = frame_t0.elapsed();
 
         // フルスクリーン表示中なら AI アップスケール + 画像補正を検討
         if let Some(fs_idx) = self.fullscreen_idx {
@@ -13613,6 +13614,7 @@ impl eframe::App for App {
             }
             self.evict_adjustment_cache(fs_idx);
         }
+        let t_fullscreen_work = frame_t0.elapsed();
 
         // タイトルバーに現在のフォルダパスを表示する。
         // フォルダ未選択時や読み込み途中はアプリ名のみ。
@@ -13635,6 +13637,7 @@ impl eframe::App for App {
 
         // スクロールは egui に触れる前に処理（イベントを消費）
         self.process_scroll(ctx);
+        let t_title_scroll = frame_t0.elapsed();
 
         // ── フルスクリーン中にメインウィンドウへフォーカスが来たら閉じる ──
         // ボーダーレスウィンドウなので Alt-Tab 等でメインに戻れるが、
@@ -13670,11 +13673,13 @@ impl eframe::App for App {
         } else {
             self.handle_keyboard(ctx)
         };
+        let t_root_input = frame_t0.elapsed();
 
         // ── フルスクリーンビューポート ──────────────────────────────────
         // 非アクティブ時も非表示でビューポートを維持（次回表示のちらつき防止）
         self.keep_fullscreen_viewport_alive(ctx);
         self.render_fullscreen_viewport(ctx);
+        let t_fullscreen_viewport = frame_t0.elapsed();
 
         // 補正パネルでスライダーをドラッグ中に true → release で false の遷移を検知し、
         // サムネ補正テクスチャを全無効化する (次フレームに visible は同期適用、
@@ -13740,6 +13745,7 @@ impl eframe::App for App {
             // 結果到着までフレーム駆動で待つ (worker 完了通知は poll で拾う)
             ctx.request_repaint();
         }
+        let t_menus_dialogs = frame_t0.elapsed();
 
         // ── ツールバー ───────────────────────────────────────────────
         let toolbar_fav_nav = self.render_toolbar(ctx);
@@ -13906,6 +13912,7 @@ impl eframe::App for App {
                 }
             }
         }
+        let t_toolbar_input = frame_t0.elapsed();
 
         // ── 検索バー ─────────────────────────────────────────────────
         self.render_search_bar(ctx);
@@ -14021,6 +14028,108 @@ impl eframe::App for App {
                 self.texture_backlog.len(),
                 self.requested.len(),
             ));
+        }
+        if crate::perf::is_enabled() && frame_total.as_millis() > 30 {
+            let video_playing = self
+                .fullscreen_idx
+                .and_then(|idx| match self.fs_cache.get(&idx) {
+                    Some(FsCacheEntry::Video { player, .. }) => Some(player.is_playing()),
+                    _ => None,
+                })
+                .unwrap_or(false);
+            crate::perf::event(
+                "ui",
+                "slow_frame_breakdown",
+                None,
+                0,
+                &[
+                    (
+                        "total_ms",
+                        serde_json::Value::from(frame_total.as_secs_f64() * 1000.0),
+                    ),
+                    (
+                        "poll_ms",
+                        serde_json::Value::from(t_poll.as_secs_f64() * 1000.0),
+                    ),
+                    (
+                        "keep_ms",
+                        serde_json::Value::from((t_keep - t_poll).as_secs_f64() * 1000.0),
+                    ),
+                    (
+                        "background_polls_ms",
+                        serde_json::Value::from(
+                            (t_background_polls - t_keep).as_secs_f64() * 1000.0,
+                        ),
+                    ),
+                    (
+                        "fullscreen_work_ms",
+                        serde_json::Value::from(
+                            (t_fullscreen_work - t_background_polls).as_secs_f64() * 1000.0,
+                        ),
+                    ),
+                    (
+                        "title_scroll_ms",
+                        serde_json::Value::from(
+                            (t_title_scroll - t_fullscreen_work).as_secs_f64() * 1000.0,
+                        ),
+                    ),
+                    (
+                        "root_input_ms",
+                        serde_json::Value::from(
+                            (t_root_input - t_title_scroll).as_secs_f64() * 1000.0,
+                        ),
+                    ),
+                    (
+                        "fullscreen_viewport_ms",
+                        serde_json::Value::from(
+                            (t_fullscreen_viewport - t_root_input).as_secs_f64() * 1000.0,
+                        ),
+                    ),
+                    (
+                        "menus_dialogs_ms",
+                        serde_json::Value::from(
+                            (t_menus_dialogs - t_fullscreen_viewport).as_secs_f64() * 1000.0,
+                        ),
+                    ),
+                    (
+                        "toolbar_input_ms",
+                        serde_json::Value::from(
+                            (t_toolbar_input - t_menus_dialogs).as_secs_f64() * 1000.0,
+                        ),
+                    ),
+                    (
+                        "bars_ms",
+                        serde_json::Value::from(
+                            (t_pre_grid - t_toolbar_input).as_secs_f64() * 1000.0,
+                        ),
+                    ),
+                    (
+                        "grid_ms",
+                        serde_json::Value::from((t_grid - t_pre_grid).as_secs_f64() * 1000.0),
+                    ),
+                    (
+                        "post_grid_ms",
+                        serde_json::Value::from((frame_total - t_grid).as_secs_f64() * 1000.0),
+                    ),
+                    (
+                        "pre_grid_ms",
+                        serde_json::Value::from((t_pre_grid - t_keep).as_secs_f64() * 1000.0),
+                    ),
+                    (
+                        "texture_backlog",
+                        serde_json::Value::from(self.texture_backlog.len() as i64),
+                    ),
+                    (
+                        "requested",
+                        serde_json::Value::from(self.requested.len() as i64),
+                    ),
+                    (
+                        "fullscreen",
+                        serde_json::Value::from(self.fullscreen_idx.is_some()),
+                    ),
+                    ("video_playing", serde_json::Value::from(video_playing)),
+                ],
+            );
         }
     }
 

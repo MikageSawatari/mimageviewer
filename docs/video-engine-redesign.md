@@ -1256,3 +1256,18 @@ the cursor by the frame duration. This is intentionally generic, not WMA Pro
 specific, so other decoders that intermittently drop frame timestamps can use
 the same recovery path. Perf events expose both `raw_pts` and
 `pts_synthesized` for verification.
+
+Follow-up diagnostics for remaining visual hitch reports:
+
+- `video/display_miss` records frames that are skipped at display time because
+  the UI side is already late.
+- GPU-backed video frames now go through the same `video/tick` diagnostics as
+  CPU frames, including displayed-PTS deltas and dropped-past counts.
+- During playback, the app caps its normal repaint wait to 16ms so the
+  fullscreen video viewport keeps a frame-scale cadence even when other UI
+  panels are idle.
+- `ui/slow_frame_breakdown` is emitted for frames over 30ms and splits
+  `App::update` into poll, keep-range, background polls, fullscreen work,
+  root input, fullscreen viewport, menus/dialogs, toolbar/input, search bars,
+  grid, and post-grid costs. Use this together with `video/display_miss` to
+  distinguish decoder/pacing drops from UI-thread repaint stalls.
