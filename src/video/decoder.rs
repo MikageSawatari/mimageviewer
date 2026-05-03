@@ -1841,6 +1841,11 @@ fn run_audio_decode(
     // から受け取った `seek_target_secs` を世代単位で保持し、emit する全 AudioFrame
     // に焼き付ける (= pump がどのタイミングで観測しても target を取り出せる)。
     let mut current_seek_target_secs: Option<f64> = None;
+    // Some codecs, notably WMA Pro in ASF/WMV, emit one correctly timestamped
+    // frame followed by several decoded frames with pts/best_effort_timestamp
+    // reset to 0. Keep a monotonic synthetic cursor per seek generation so the
+    // audio clock and video pacing do not get pinned to zero.
+    let mut next_audio_pts_secs: Option<f64> = None;
 
     'outer: loop {
         if cancel.load(Ordering::Acquire) {
@@ -1862,6 +1867,7 @@ fn run_audio_decode(
                 current_seek_serial = serial;
                 drop_before_secs = trim_before_secs;
                 current_seek_target_secs = seek_target_secs;
+                next_audio_pts_secs = None;
             }
             AudioWorkerMsg::Eof => {
                 // 残フレーム drain: send_eof + receive_frame ループで decoder 内の
@@ -1883,6 +1889,7 @@ fn run_audio_decode(
                         current_seek_serial,
                         current_seek_target_secs,
                         None,
+                        &mut next_audio_pts_secs,
                         &clock,
                         &audio_tx,
                     ) {
@@ -1932,6 +1939,7 @@ fn run_audio_decode(
                         current_seek_serial,
                         current_seek_target_secs,
                         Some(packet_decode_t0.elapsed().as_secs_f64() * 1000.0),
+                        &mut next_audio_pts_secs,
                         &clock,
                         &audio_tx,
                     ) {
@@ -1954,6 +1962,7 @@ fn emit_audio_frame(
     current_seek_serial: u64,
     current_seek_target_secs: Option<f64>,
     decode_wait_ms: Option<f64>,
+    next_audio_pts_secs: &mut Option<f64>,
     clock: &AvClock,
     audio_tx: &Sender<AudioFrame>,
 ) -> bool {
@@ -1962,8 +1971,21 @@ fn emit_audio_frame(
     use ffmpeg_the_third as ffmpeg;
 
     let emit_t0 = std::time::Instant::now();
-    let pts = audio_frame_timestamp(frame).unwrap_or(0);
-    let mut pts_secs = (pts as f64) * setup.time_base_num / setup.time_base_den;
+    let raw_pts_secs = audio_frame_timestamp(frame)
+        .map(|pts| (pts as f64) * setup.time_base_num / setup.time_base_den);
+    let mut pts_synthesized = false;
+    let mut pts_secs = match (*next_audio_pts_secs, raw_pts_secs) {
+        (Some(next), Some(raw)) if raw + 0.001 >= next => raw,
+        (Some(next), _) => {
+            pts_synthesized = true;
+            next
+        }
+        (None, Some(raw)) => raw,
+        (None, None) => {
+            pts_synthesized = true;
+            0.0
+        }
+    };
     const CHANNELS: usize = 2;
     let convert_t0 = std::time::Instant::now();
     let (mut samples, audio_path): (Vec<f32>, &'static str) =
@@ -2030,6 +2052,7 @@ fn emit_audio_frame(
         let frame_secs = (samples.len() / CHANNELS) as f64 / setup.out_rate as f64;
         if pts_secs + frame_secs <= min {
             // 完全に target 前 → 捨てる
+            *next_audio_pts_secs = Some(pts_secs + frame_secs);
             return true;
         }
         if pts_secs < min {
@@ -2049,6 +2072,7 @@ fn emit_audio_frame(
     // 1 stereo pair = 2 float (samples_per_sec stereo = setup.out_rate * 2)
     let frame_sample_pairs = samples.len() / CHANNELS;
     let duration_secs = frame_sample_pairs as f64 / setup.out_rate as f64;
+    *next_audio_pts_secs = Some(pts_secs + duration_secs);
     let frame_out = AudioFrame {
         samples,
         pts_secs,
@@ -2079,6 +2103,13 @@ fn emit_audio_frame(
                     serde_json::Value::from(frame_sample_pairs as i64),
                 ),
                 ("path", serde_json::Value::from(audio_path)),
+                (
+                    "raw_pts",
+                    raw_pts_secs
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                ("pts_synthesized", serde_json::Value::from(pts_synthesized)),
                 (
                     "input_format",
                     serde_json::Value::from(setup.input_format.as_str()),

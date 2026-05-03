@@ -1231,3 +1231,8 @@ preserving the stereo-only cpal/VST contract.
 The perf log records per-audio-frame diagnostics (`path`, `decode_wait_ms`,
 `convert_ms`, `send_wait_ms`, `total_ms`) so WMA Pro and similar files can be
 split into decoder, downmix/resample, and queue-backpressure costs.
+Some ASF/WMA Pro streams emit decoded audio frames whose raw PTS repeatedly
+falls back to `0` between correctly timestamped packet-leading frames. The
+audio decode worker therefore keeps a monotonic synthetic PTS cursor per seek
+generation and uses it whenever a decoded frame timestamp would move backward;
+perf events expose both `raw_pts` and `pts_synthesized` for verification.
