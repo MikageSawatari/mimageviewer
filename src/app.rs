@@ -2333,6 +2333,9 @@ pub struct App {
     pub(crate) last_input_at: Option<std::time::Instant>,
     /// フレーム番号 (update 呼出しのたびに +1)
     pub(crate) frame_counter: u64,
+    /// Previous `App::update` frame boundary. Used by perf diagnostics to
+    /// catch stalls that happen before the next Rust frame begins.
+    pub(crate) perf_last_frame_begin: Option<std::time::Instant>,
     /// 最後に perf::flush() した時刻。約 1 秒に 1 回フラッシュする。
     pub(crate) perf_last_flush: Option<std::time::Instant>,
     /// 直近フレームでフルスクリーンが描画した (idx, texture_id, input_seq)。
@@ -2880,6 +2883,7 @@ impl Default for App {
             input_seq: 0,
             last_input_at: None,
             frame_counter: 0,
+            perf_last_frame_begin: None,
             perf_last_flush: None,
             fs_painted_last: None,
             video_seek_thumb_tex: None,
@@ -13501,6 +13505,79 @@ impl eframe::App for App {
         // パフォーマンス計装: フレーム境界。--perf-log 無効時は is_enabled() 読みのみ
         self.frame_counter = self.frame_counter.wrapping_add(1);
         if crate::perf::is_enabled() {
+            let frame_begin_now = std::time::Instant::now();
+            if let Some(prev_begin) = self.perf_last_frame_begin {
+                let gap = frame_begin_now.saturating_duration_since(prev_begin);
+                if gap > std::time::Duration::from_millis(30) {
+                    let video_snapshot =
+                        self.fullscreen_idx
+                            .and_then(|idx| match self.fs_cache.get(&idx) {
+                                Some(FsCacheEntry::Video { player, .. }) => Some((
+                                    idx,
+                                    player.is_playing(),
+                                    player.is_paused_or_seeking(),
+                                    player.pending_frames(),
+                                    player.engine_state_code(),
+                                    player.displayed_frame_seq(),
+                                )),
+                                _ => None,
+                            });
+                    let (
+                        video_idx,
+                        video_playing,
+                        video_freeze,
+                        video_pending_frames,
+                        video_state,
+                        video_seq,
+                    ) = video_snapshot
+                        .map(|(idx, playing, freeze, pending, state, seq)| {
+                            (
+                                idx as i64,
+                                playing,
+                                freeze,
+                                pending as i64,
+                                state as i64,
+                                seq as i64,
+                            )
+                        })
+                        .unwrap_or((-1, false, false, -1, -1, -1));
+                    crate::perf::event(
+                        "ui",
+                        "frame_gap",
+                        None,
+                        self.input_seq,
+                        &[
+                            (
+                                "gap_ms",
+                                serde_json::Value::from(gap.as_secs_f64() * 1000.0),
+                            ),
+                            ("n", serde_json::Value::from(self.frame_counter as i64)),
+                            (
+                                "fullscreen",
+                                serde_json::Value::from(self.fullscreen_idx.is_some()),
+                            ),
+                            ("video_idx", serde_json::Value::from(video_idx)),
+                            ("video_playing", serde_json::Value::from(video_playing)),
+                            ("video_freeze", serde_json::Value::from(video_freeze)),
+                            (
+                                "video_pending_frames",
+                                serde_json::Value::from(video_pending_frames),
+                            ),
+                            ("video_state", serde_json::Value::from(video_state)),
+                            ("video_seq", serde_json::Value::from(video_seq)),
+                            (
+                                "vst3_manager",
+                                serde_json::Value::from(self.show_vst3_manager),
+                            ),
+                            (
+                                "vst3_visible",
+                                serde_json::Value::from(self.settings.vst3_gui_visible),
+                            ),
+                        ],
+                    );
+                }
+            }
+            self.perf_last_frame_begin = Some(frame_begin_now);
             crate::perf::event(
                 "frame",
                 "begin",

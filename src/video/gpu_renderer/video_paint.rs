@@ -376,6 +376,7 @@ impl CallbackTrait for VideoPaintCallback {
         }
 
         // GPU 側で D3D11 fence が fence_value に到達するまで wait。失敗時は skip。
+        let wait_t0 = std::time::Instant::now();
         let wait_ok = if let Some(iop) = callback_resources.get::<VideoFenceInterop>() {
             match unsafe { queue_wait_fence(queue, &iop.fence, self.fence_value) } {
                 Ok(()) => true,
@@ -389,6 +390,7 @@ impl CallbackTrait for VideoPaintCallback {
         } else {
             false
         };
+        let wait_ms = wait_t0.elapsed().as_secs_f64() * 1000.0;
         if !wait_ok {
             return Vec::new();
         }
@@ -411,10 +413,36 @@ impl CallbackTrait for VideoPaintCallback {
             let total_ms = prepare_start.elapsed().as_secs_f64() * 1000.0;
             crate::logger::log(format!(
                 "VideoPaintCallback::prepare #{n} total={total_ms:.2}ms \
-                 import={imported_ms:.2}ms bg={bg_ms:.2}ms cache_hit={cache_hit} \
+                 import={imported_ms:.2}ms bg={bg_ms:.2}ms wait={wait_ms:.2}ms cache_hit={cache_hit} \
                  fence_value={}",
                 self.fence_value
             ));
+        }
+        if crate::perf::is_enabled() {
+            let total_ms = prepare_start.elapsed().as_secs_f64() * 1000.0;
+            if total_ms > 4.0 || wait_ms > 2.0 || imported_ms > 2.0 || bg_ms > 2.0 {
+                crate::perf::event(
+                    "video_gpu",
+                    "prepare",
+                    None,
+                    0,
+                    &[
+                        ("total_ms", serde_json::Value::from(total_ms)),
+                        ("import_ms", serde_json::Value::from(imported_ms)),
+                        ("bind_group_ms", serde_json::Value::from(bg_ms)),
+                        ("wait_ms", serde_json::Value::from(wait_ms)),
+                        ("cache_hit", serde_json::Value::from(cache_hit)),
+                        ("width", serde_json::Value::from(self.width as i64)),
+                        ("height", serde_json::Value::from(self.height as i64)),
+                        ("ten_bit", serde_json::Value::from(self.ten_bit)),
+                        (
+                            "fence_value",
+                            serde_json::Value::from(self.fence_value as i64),
+                        ),
+                        ("fence_gen", serde_json::Value::from(self.fence_gen as i64)),
+                    ],
+                );
+            }
         }
 
         Vec::new()
@@ -426,6 +454,7 @@ impl CallbackTrait for VideoPaintCallback {
         render_pass: &mut wgpu::RenderPass<'static>,
         callback_resources: &egui_wgpu::CallbackResources,
     ) {
+        let paint_t0 = std::time::Instant::now();
         let pipeline = match callback_resources.get::<VideoPipeline>() {
             Some(p) => p,
             None => return,
@@ -445,6 +474,27 @@ impl CallbackTrait for VideoPaintCallback {
         render_pass.set_pipeline(&pipeline.pipeline);
         render_pass.set_bind_group(0, &cache.bind_group, &[]);
         render_pass.draw(0..3, 0..1);
+        if crate::perf::is_enabled() {
+            let paint_ms = paint_t0.elapsed().as_secs_f64() * 1000.0;
+            if paint_ms > 1.0 {
+                crate::perf::event(
+                    "video_gpu",
+                    "paint",
+                    None,
+                    0,
+                    &[
+                        ("paint_ms", serde_json::Value::from(paint_ms)),
+                        ("width", serde_json::Value::from(self.width as i64)),
+                        ("height", serde_json::Value::from(self.height as i64)),
+                        (
+                            "fence_value",
+                            serde_json::Value::from(self.fence_value as i64),
+                        ),
+                        ("fence_gen", serde_json::Value::from(self.fence_gen as i64)),
+                    ],
+                );
+            }
+        }
     }
 }
 

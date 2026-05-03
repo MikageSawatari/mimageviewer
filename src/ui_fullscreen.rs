@@ -1016,11 +1016,27 @@ impl App {
         // ── ビューポート構築 ──
         let fs_builder = self.build_fullscreen_viewport_builder();
         let need_show = !self.fs_viewport_shown;
+        let fs_viewport_t0 = std::time::Instant::now();
+        let mut fs_setup_ms = 0.0_f64;
+        let mut fs_input_ms = 0.0_f64;
+        let mut fs_media_ms = 0.0_f64;
+        let mut fs_overlay_ms = 0.0_f64;
+        let mut fs_hud_ms = 0.0_f64;
+        let mut fs_panels_ms = 0.0_f64;
+        let mut fs_hover_bar_ms = 0.0_f64;
+        let mut fs_central_ms = 0.0_f64;
+        let mut fs_vst_manager_ms = 0.0_f64;
+        let fs_state_is_video = state.is_video;
+        #[cfg(windows)]
+        let fs_state_gpu_video = state.gpu_video_frame.is_some();
+        #[cfg(not(windows))]
+        let fs_state_gpu_video = false;
 
         ctx.show_viewport_immediate(
             self.fullscreen_viewport_id(),
             fs_builder,
             |ctx, _class| {
+                let setup_t0 = std::time::Instant::now();
                 // フルスクリーンビューポート内のイベントで IME 状態を更新する
                 // (メインビューポートとは別のイベントキューなのでここで呼ぶ必要がある)
                 self.update_ime_state(ctx);
@@ -1054,11 +1070,14 @@ impl App {
                 if ctx.input(|i| i.viewport().close_requested()) {
                     close_fs = true;
                 }
+                fs_setup_ms = setup_t0.elapsed().as_secs_f64() * 1000.0;
 
+                let central_t0 = std::time::Instant::now();
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                     .show(ctx, |ui| {
                         let full_rect = ui.max_rect();
+                        let input_t0 = std::time::Instant::now();
 
                         // ── キー入力 ──
                         if let Some(keys) = fullscreen_shortcut_event_summary(ctx) {
@@ -1104,6 +1123,7 @@ impl App {
                         // ホイール/キーで nav_delta が確定済みなら、
                         // ホバーバーのボタンホバーで上書きされないよう保護
                         let nav_locked = nav_delta != 0;
+                        fs_input_ms = input_t0.elapsed().as_secs_f64() * 1000.0;
 
                         // ── 分析/補正モード: 見開き中は無効 ──
                         // 分析モードは画像エリアを左側に制限する（右パネルと重ならないよう）。
@@ -1128,6 +1148,7 @@ impl App {
                         };
 
                         // ── 画像 / 動画 / セパレータ描画 ──
+                        let media_t0 = std::time::Instant::now();
                         if let Some(sep) = state.separator_text.as_ref() {
                             Self::draw_fs_separator(ui, image_rect, sep);
                         } else {
@@ -1187,6 +1208,7 @@ impl App {
                                 }
                             }
                         }
+                        fs_media_ms = media_t0.elapsed().as_secs_f64() * 1000.0;
 
                         // ── 消しゴムモード: マスク塗り＋オーバーレイ描画 ──
                         // `is_spread_double` はキー入力ハンドラより前 (フレーム冒頭) で
@@ -1205,6 +1227,7 @@ impl App {
                             ctx.request_repaint();
                         }
 
+                        let overlay_t0 = std::time::Instant::now();
                         // ── ルーペ (Shift ホールド / M トグル) ──
                         // 見開き・分析・補正モードでは内部で早期 return する。
                         // 消しゴムモードのマスクオーバーレイより上に載せる (最新状態を拡大)。
@@ -1216,12 +1239,14 @@ impl App {
 
                         // ── 透過背景インジケータ (B キー変更直後のみフェード表示) ──
                         self.draw_fs_transparent_bg_indicator(ui, full_rect);
+                        fs_overlay_ms = overlay_t0.elapsed().as_secs_f64() * 1000.0;
 
                         // ── 動画 HUD (下部の再生バー + 時刻 + 音量 + シークバー) ──
                         // 入力ハンドリングは handle_image_keys の冒頭で先に呼ばれる
                         // (handle_video_input)。ここでは描画のみ。
                         // Phase 5.6 ミニツールバーはパネル描画 **後** (= 上層) に
                         // 移すため、ここでは draw_video_hud / paused_hint のみ。
+                        let hud_t0 = std::time::Instant::now();
                         if state.is_video {
                             self.draw_video_hud(ui, ctx, full_rect, fs_idx);
                             self.draw_video_paused_hint(ui, full_rect, fs_idx);
@@ -1230,6 +1255,7 @@ impl App {
                                 self.draw_video_perf_overlay(ui, full_rect);
                             }
                         }
+                        fs_hud_ms = hud_t0.elapsed().as_secs_f64() * 1000.0;
 
                         // ── チェックマーク ──
                         if self.checked.contains(&fs_idx) {
@@ -1272,6 +1298,7 @@ impl App {
                         }
 
                         // ── 分析パネル（分析モード時、見開き中は無効）──
+                        let panels_t0 = std::time::Instant::now();
                         if analysis_active {
                             let pixels = match self.fs_cache.get(&fs_idx) {
                                 Some(FsCacheEntry::Static { pixels, .. }) => {
@@ -1345,8 +1372,10 @@ impl App {
                                 self.draw_metadata_panel(ui, ctx, full_rect);
                             let _ = right_panel_visible;
                         }
+                        fs_panels_ms = panels_t0.elapsed().as_secs_f64() * 1000.0;
 
                         // ── ホバーバー ──
+                        let hover_bar_t0 = std::time::Instant::now();
                         let mut bar_rotate_cw = false;
                         let mut bar_rotate_ccw = false;
                         let spread_before = self.spread_mode;
@@ -1466,6 +1495,7 @@ impl App {
                             // ホイール/キーで確定した nav_delta を保護
                             if nav_locked { nav_delta = saved_nav; }
                         }
+                        fs_hover_bar_ms = hover_bar_t0.elapsed().as_secs_f64() * 1000.0;
                         if bar_rotate_cw { self.rotate_image_cw(fs_idx); }
                         if bar_rotate_ccw { self.rotate_image_ccw(fs_idx); }
 
@@ -1500,6 +1530,7 @@ impl App {
                             self.normalize_spread_position();
                         }
                     });
+                fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
 
                 // ── VST3 プラグイン管理ウィンドウ + チェーンエディタ (フルスクリーン中も表示) ──
                 // egui::Window はビューポート単位で z-order が独立しているので、
@@ -1508,13 +1539,60 @@ impl App {
                 // プラグインを追加・順序入れ替え・バイパス切替・GUI 表示できる。
                 #[cfg(windows)]
                 {
+                    let vst_t0 = std::time::Instant::now();
                     self.show_vst3_manager(ctx);
                     self.vst3_pump_gui_signals();
+                    fs_vst_manager_ms = vst_t0.elapsed().as_secs_f64() * 1000.0;
                 }
 
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
             },
         );
+        let fs_viewport_ms = fs_viewport_t0.elapsed().as_secs_f64() * 1000.0;
+        if crate::perf::is_enabled() && fs_viewport_ms > 8.0 {
+            let (video_playing, video_pending_frames, video_state, video_seq) =
+                match self.fs_cache.get(&fs_idx) {
+                    Some(FsCacheEntry::Video { player, .. }) => (
+                        player.is_playing(),
+                        player.pending_frames() as i64,
+                        player.engine_state_code() as i64,
+                        player.displayed_frame_seq() as i64,
+                    ),
+                    _ => (false, -1, -1, -1),
+                };
+            crate::perf::event(
+                "ui",
+                "fs_viewport_breakdown",
+                None,
+                self.input_seq,
+                &[
+                    ("idx", serde_json::Value::from(fs_idx as i64)),
+                    ("total_ms", serde_json::Value::from(fs_viewport_ms)),
+                    ("setup_ms", serde_json::Value::from(fs_setup_ms)),
+                    ("central_ms", serde_json::Value::from(fs_central_ms)),
+                    ("input_ms", serde_json::Value::from(fs_input_ms)),
+                    ("media_ms", serde_json::Value::from(fs_media_ms)),
+                    ("overlay_ms", serde_json::Value::from(fs_overlay_ms)),
+                    ("hud_ms", serde_json::Value::from(fs_hud_ms)),
+                    ("panels_ms", serde_json::Value::from(fs_panels_ms)),
+                    ("hover_bar_ms", serde_json::Value::from(fs_hover_bar_ms)),
+                    ("vst_manager_ms", serde_json::Value::from(fs_vst_manager_ms)),
+                    ("is_video", serde_json::Value::from(fs_state_is_video)),
+                    ("gpu_video", serde_json::Value::from(fs_state_gpu_video)),
+                    ("video_playing", serde_json::Value::from(video_playing)),
+                    (
+                        "video_pending_frames",
+                        serde_json::Value::from(video_pending_frames),
+                    ),
+                    ("video_state", serde_json::Value::from(video_state)),
+                    ("video_seq", serde_json::Value::from(video_seq)),
+                    (
+                        "vst3_manager",
+                        serde_json::Value::from(self.show_vst3_manager),
+                    ),
+                ],
+            );
+        }
 
         self.fs_viewport_shown = true;
 

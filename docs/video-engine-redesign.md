@@ -1353,3 +1353,12 @@ before the exact frame time by roughly half the source frame interval
 inside `poll_video` before issuing `request_repaint_after`. This keeps 60fps
 content from losing repaint opportunities without forcing low-fps files into a
 tight immediate-repaint loop.
+
+2026-05-04 diagnostics follow-up: if red perf ticks remain after the repaint
+prewake fix, `ui/frame_gap` now records stalls between `App::update` frame
+boundaries with fullscreen/video/VST context, `ui/fs_viewport_breakdown` splits
+the fullscreen viewport closure into input, media draw, HUD, panels, hover bar,
+and VST manager costs, and `video_gpu/prepare` / `video_gpu/paint` records slow
+GPU video callback import/fence/draw costs. These events are emitted only under
+`--perf-log` and are thresholded, so they are intended for reproducing the
+remaining UI-thread or GPU-present stalls without changing normal playback.
