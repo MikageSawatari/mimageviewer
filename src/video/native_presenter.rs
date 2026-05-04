@@ -746,7 +746,7 @@ impl NativeVideoPresenter {
         };
         unsafe {
             mutex
-                .AcquireSync(1, 2)
+                .AcquireSync(1, 10)
                 .map_err(|e| format!("source keyed mutex AcquireSync(1): {e:?}"))?;
         }
         Ok(Some(KeyedMutexReadGuard {

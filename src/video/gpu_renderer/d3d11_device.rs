@@ -75,6 +75,7 @@ pub struct D3d11Frame {
     pub close_shared_handle_on_drop: bool,
     pub shared_output_in_use: Option<Arc<AtomicBool>>,
     pub shared_output_notify: Option<Arc<Condvar>>,
+    pub shared_output_keyed_mutex: Option<IDXGIKeyedMutex>,
     /// 共有テクスチャが 10-bit (R10G10B10A2_UNORM) か。入力が P010/P016 の
     /// HDR ソースの場合のみ true になる。wgpu 側 import 時の format 選択に必要
     /// (false → Bgra8Unorm、true → Rgb10a2Unorm)。
@@ -97,6 +98,37 @@ pub struct D3d11Frame {
 // HANDLE は OS のリソース ID 相当 (= 単純な i64 値) で、所有権を移動する分には
 // thread-safe。Sync は付けない (= 同時参照は許さない)。
 unsafe impl Send for D3d11Frame {}
+
+impl D3d11Frame {
+    /// Return an unpresented pooled output texture from key=1 to key=0 before
+    /// releasing its slot. This is needed when the decoder cannot enqueue a
+    /// freshly produced GPU frame; no presenter will acquire/read it.
+    pub fn reset_unpresented_shared_output(&mut self) {
+        let Some(mutex) = self.shared_output_keyed_mutex.take() else {
+            return;
+        };
+        match unsafe { mutex.AcquireSync(1, 100) } {
+            Ok(()) => unsafe {
+                let _ = mutex.ReleaseSync(0);
+            },
+            Err(e) => {
+                crate::logger::log(format!(
+                    "[video] shared output unpresented reset failed: {e:?}"
+                ));
+                crate::perf::event(
+                    "video",
+                    "shared_output_unpresented_reset_failed",
+                    None,
+                    0,
+                    &[(
+                        "shared_handle",
+                        serde_json::Value::from(self.shared_handle.0 as usize as u64),
+                    )],
+                );
+            }
+        }
+    }
+}
 
 impl Drop for D3d11Frame {
     fn drop(&mut self) {
@@ -209,6 +241,7 @@ pub struct BlitOutput {
     pub close_shared_handle_on_drop: bool,
     pub shared_output_in_use: Option<Arc<AtomicBool>>,
     pub shared_output_notify: Option<Arc<Condvar>>,
+    pub shared_output_keyed_mutex: Option<IDXGIKeyedMutex>,
     pub fence_value: u64,
 }
 
@@ -436,6 +469,7 @@ impl GpuVideoDevice {
             close_shared_handle_on_drop,
             shared_output_in_use,
             shared_output_notify,
+            shared_output_keyed_mutex,
             km_acquired,
         ) = self.acquire_shared_output(out_w, out_h, out_format)?;
 
@@ -641,6 +675,7 @@ impl GpuVideoDevice {
             close_shared_handle_on_drop,
             shared_output_in_use,
             shared_output_notify,
+            shared_output_keyed_mutex,
             fence_value,
         })
     }
@@ -773,6 +808,7 @@ impl GpuVideoDevice {
             Option<Arc<AtomicBool>>,
             Option<Arc<Condvar>>,
             Option<IDXGIKeyedMutex>,
+            Option<IDXGIKeyedMutex>,
         ),
         GpuVideoError,
     > {
@@ -801,6 +837,7 @@ impl GpuVideoDevice {
                         Some(Arc::clone(&slot.in_use)),
                         Some(Arc::clone(&self.shared_output_pool_cv)),
                         None,
+                        None,
                     ));
                 };
                 match unsafe { km.AcquireSync(0, 100) } {
@@ -811,11 +848,23 @@ impl GpuVideoDevice {
                             false,
                             Some(Arc::clone(&slot.in_use)),
                             Some(Arc::clone(&self.shared_output_pool_cv)),
+                            Some(km.clone()),
                             Some(km),
                         ));
                     }
                     Err(_) => {
+                        crate::perf::event(
+                            "video",
+                            "shared_output_acquire_timeout",
+                            None,
+                            0,
+                            &[(
+                                "shared_handle",
+                                serde_json::Value::from(slot.shared_handle.0 as usize as u64),
+                            )],
+                        );
                         slot.in_use.store(false, Ordering::Release);
+                        self.shared_output_pool_cv.notify_one();
                         continue;
                     }
                 }
@@ -871,12 +920,13 @@ impl GpuVideoDevice {
                     false,
                     Some(in_use),
                     Some(Arc::clone(&self.shared_output_pool_cv)),
+                    km_acquired.clone(),
                     km_acquired,
                 ));
             }
 
             drop(pool);
-            if wait_started.elapsed() >= std::time::Duration::from_millis(100) {
+            if wait_started.elapsed() >= std::time::Duration::from_millis(500) {
                 return Err(GpuVideoError::Blt(
                     "shared output pool exhausted waiting for free slot".into(),
                 ));

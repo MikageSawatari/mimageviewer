@@ -45,7 +45,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use egui::{ColorImage, TextureHandle, TextureOptions};
 
 use clock::AvClock;
-use decoder::{DecodeHandles, VideoFrame, VideoInfo};
+use decoder::{DecodeHandles, VideoFrame, VideoFrameData, VideoInfo};
 use thumbnail::{Thumbnail, ThumbnailWorker};
 
 use std::sync::Mutex;
@@ -324,6 +324,7 @@ impl NativeFullscreenPresentStats {
         self.max_interval_ms = self.max_interval_ms.max(interval_ms);
     }
 
+    #[allow(dead_code)]
     fn record_late_drop(&mut self, pts: f64, late_ms: f64, queue_len: usize) {
         self.late_drop += 1;
         crate::perf::event(
@@ -379,6 +380,36 @@ impl NativeFullscreenPresentStats {
             self.max_interval_ms
         ));
     }
+}
+
+#[cfg(windows)]
+fn native_reset_unpresented_frame(mut frame: VideoFrame) {
+    if let VideoFrameData::Gpu(gpu) = &mut frame.data {
+        gpu.reset_unpresented_shared_output();
+    }
+}
+
+#[cfg(windows)]
+fn native_source_pacing_delay(
+    last_pts: Option<f64>,
+    last_wall: Option<std::time::Instant>,
+    next_pts: f64,
+) -> Option<std::time::Duration> {
+    let (Some(last_pts), Some(last_wall)) = (last_pts, last_wall) else {
+        return None;
+    };
+    let source_delta = next_pts - last_pts;
+    if !(0.001..=0.050).contains(&source_delta) {
+        return None;
+    }
+    let elapsed = last_wall.elapsed().as_secs_f64();
+    let target_elapsed = (source_delta - 0.0002).max(0.0);
+    if elapsed >= target_elapsed {
+        return None;
+    }
+    Some(std::time::Duration::from_secs_f64(
+        (target_elapsed - elapsed).clamp(0.001, 0.012),
+    ))
 }
 
 #[cfg(windows)]
@@ -439,6 +470,7 @@ fn run_native_video_output(
     let run_started = Instant::now();
     let mut present_stats = NativeFullscreenPresentStats::default();
     let mut last_present_wall: Option<Instant> = None;
+    let mut last_present_source_pts: Option<f64> = None;
     let mut last_summary_log = Instant::now();
     let mut last_present_log = Instant::now();
     let mut last_overlay_tick = Instant::now();
@@ -505,6 +537,7 @@ fn run_native_video_output(
             queue.clear();
             last_seen_serial = clock_serial;
             first_frame_event_last_epoch = None;
+            last_present_source_pts = None;
         }
         while let Ok(frame) = video_rx.try_recv() {
             if frame.seek_serial < clock_serial {
@@ -514,6 +547,7 @@ fn run_native_video_output(
                 queue.clear();
                 last_seen_serial = frame.seek_serial;
                 first_frame_event_last_epoch = None;
+                last_present_source_pts = None;
             }
             queue.push_back(frame);
         }
@@ -527,36 +561,42 @@ fn run_native_video_output(
         let mut latest_renderable: Option<VideoFrame> = None;
         while let Some(front) = queue.front() {
             if front.seek_serial < clock.current_seek_serial() {
-                queue.pop_front();
+                if let Some(frame) = queue.pop_front() {
+                    native_reset_unpresented_frame(frame);
+                }
                 continue;
             }
             if front.pts_secs <= now + clock::DISPLAY_LEAD_TOLERANCE_SECS {
-                let candidate = queue.pop_front().expect("queue.front() returned Some");
-                if let Some(dropped) = latest_renderable.replace(candidate) {
-                    let late_ms = ((now - dropped.pts_secs) * 1000.0).max(0.0);
-                    if present_stats.presented > 0 && late_ms > 50.0 {
-                        present_stats.record_late_drop(dropped.pts_secs, late_ms, queue.len());
-                    }
-                }
-                continue;
+                latest_renderable = Some(queue.pop_front().expect("queue.front() returned Some"));
             }
             break;
         }
 
         if let Some(frame) = latest_renderable {
             let pts = frame.pts_secs;
+            if let Some(delay) =
+                native_source_pacing_delay(last_present_source_pts, last_present_wall, pts)
+            {
+                queue.push_front(frame);
+                std::thread::sleep(delay);
+                continue;
+            }
             let serial = frame.seek_serial;
             let present_t0 = Instant::now();
             match presenter.present(&frame, config.sync_interval) {
                 Ok(outcome) => {
                     let total_ms = present_t0.elapsed().as_secs_f64() * 1000.0;
                     let late_ms = ((clock.now_secs() - pts) * 1000.0).max(0.0);
+                    let source_delta_ms = last_present_source_pts
+                        .map(|last| (pts - last) * 1000.0)
+                        .unwrap_or(0.0);
                     let interval_ms = last_present_wall
                         .map(|last| {
                             present_t0.saturating_duration_since(last).as_secs_f64() * 1000.0
                         })
                         .unwrap_or(0.0);
                     last_present_wall = Some(present_t0);
+                    last_present_source_pts = Some(pts);
                     present_stats.record_present(&outcome, late_ms, total_ms, interval_ms);
                     if last_summary_log.elapsed() >= Duration::from_secs(1) {
                         present_stats.emit_summary(run_started.elapsed());
@@ -619,6 +659,7 @@ fn run_native_video_output(
                                     ("copy_ms", serde_json::Value::from(outcome.copy_ms)),
                                     ("present_ms", serde_json::Value::from(outcome.present_ms)),
                                     ("total_ms", serde_json::Value::from(total_ms)),
+                                    ("source_delta_ms", serde_json::Value::from(source_delta_ms)),
                                 ],
                             );
                         }

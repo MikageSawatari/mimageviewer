@@ -91,6 +91,9 @@ Optionally repeat with the egui overlay enabled:
 - `native_copy_p95_ms` stays comfortably below the 120fps frame budget.
 - Any `native_copy_max_ms` spike above the frame budget is inspected in the raw
   JSONL and classified as startup-only, rare isolated, or sustained.
+- `native_presenter/fullscreen_present.source_delta_ms` stays near the source
+  frame duration during steady playback (for the 120fps sync clip, about
+  8.33ms). Startup should not show a long run of `cpu_upload` presents.
 - If a copy spike coincides with a high `native_fence_max_ms`, treat it as a
   producer/fence wait issue before investigating the copy itself.
 - If `native_fence_max_ms` is low, inspect the spike row's `open_shared_ms`,

@@ -1801,15 +1801,24 @@ fn run_video_decode(
                             }
                             use crossbeam_channel::TrySendError;
                             let pts_gap = pts_secs - last_enqueued_pts;
-                            let send_result = video_tx.try_send(gpu_frame_out);
-                            let dropped_full = matches!(&send_result, Err(TrySendError::Full(_)));
-                            if !dropped_full && send_result.is_ok() {
-                                last_enqueued_pts = pts_secs;
-                                post_seek_frame_sent = true;
-                            }
-                            if dropped_full {
-                                skipped_frame_count
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let mut dropped_full = false;
+                            let mut send_disconnected = false;
+                            match video_tx.try_send(gpu_frame_out) {
+                                Ok(()) => {
+                                    last_enqueued_pts = pts_secs;
+                                    post_seek_frame_sent = true;
+                                }
+                                Err(TrySendError::Full(mut frame_out)) => {
+                                    dropped_full = true;
+                                    if let VideoFrameData::Gpu(gpu) = &mut frame_out.data {
+                                        gpu.reset_unpresented_shared_output();
+                                    }
+                                    skipped_frame_count
+                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                }
+                                Err(TrySendError::Disconnected(_)) => {
+                                    send_disconnected = true;
+                                }
                             }
                             if crate::perf::is_enabled() {
                                 crate::perf::event(
@@ -1849,7 +1858,7 @@ fn run_video_decode(
                                     ],
                                 );
                             }
-                            if let Err(TrySendError::Disconnected(_)) = send_result {
+                            if send_disconnected {
                                 break 'outer;
                             }
                             continue;
@@ -3483,6 +3492,7 @@ fn try_gpu_blit_path(
         close_shared_handle_on_drop: blit.close_shared_handle_on_drop,
         shared_output_in_use: blit.shared_output_in_use,
         shared_output_notify: blit.shared_output_notify,
+        shared_output_keyed_mutex: blit.shared_output_keyed_mutex,
         ten_bit,
         fence_value,
         fence_shared_handle,

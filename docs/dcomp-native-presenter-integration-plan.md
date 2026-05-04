@@ -295,6 +295,12 @@ ownership as a fail-fast check after the shared fence has completed, avoiding a
 long presenter-thread stall if a pooled texture is not immediately readable.
 The pool size tracks the existing video frame channel depth so startup does not
 create more shared textures than the playback queue can reasonably hold.
+The native presenter drains due frames in source PTS order rather than replacing
+all due frames with the newest one; this prevents startup backlog from dropping
+unpresented keyed-mutex frames and briefly forcing the decoder into CPU
+readback fallback. When `MIV_NATIVE_VIDEO_PRESENT_TRACE=1` is enabled, the
+`source_delta_ms` field on `fullscreen_present` helps confirm that 120fps
+content advances at roughly 8.33ms per presented frame.
 
 Core clips:
 
