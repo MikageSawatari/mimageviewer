@@ -1362,3 +1362,11 @@ and VST manager costs, and `video_gpu/prepare` / `video_gpu/paint` records slow
 GPU video callback import/fence/draw costs. These events are emitted only under
 `--perf-log` and are thresholded, so they are intended for reproducing the
 remaining UI-thread or GPU-present stalls without changing normal playback.
+
+2026-05-04 diagnostics follow-up 2: `ui/fs_viewport_breakdown` now separates
+the full `show_viewport_immediate` wall time into closure time, outer viewport
+overhead, closure unaccounted time, and central-panel unaccounted time. This
+distinguishes work done by mIV's fullscreen closure from egui/viewport/wgpu work
+outside that closure. `video_gpu/prepare` and `video_gpu/paint` also emit a low
+frequency sample even when fast, so perf logs can prove the GPU callback path is
+active instead of only reporting slow frames.

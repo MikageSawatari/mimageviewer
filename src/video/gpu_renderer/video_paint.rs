@@ -420,7 +420,8 @@ impl CallbackTrait for VideoPaintCallback {
         }
         if crate::perf::is_enabled() {
             let total_ms = prepare_start.elapsed().as_secs_f64() * 1000.0;
-            if total_ms > 4.0 || wait_ms > 2.0 || imported_ms > 2.0 || bg_ms > 2.0 {
+            let sampled = n == 0 || n % 300 == 0;
+            if sampled || total_ms > 4.0 || wait_ms > 2.0 || imported_ms > 2.0 || bg_ms > 2.0 {
                 crate::perf::event(
                     "video_gpu",
                     "prepare",
@@ -432,6 +433,7 @@ impl CallbackTrait for VideoPaintCallback {
                         ("bind_group_ms", serde_json::Value::from(bg_ms)),
                         ("wait_ms", serde_json::Value::from(wait_ms)),
                         ("cache_hit", serde_json::Value::from(cache_hit)),
+                        ("sampled", serde_json::Value::from(sampled)),
                         ("width", serde_json::Value::from(self.width as i64)),
                         ("height", serde_json::Value::from(self.height as i64)),
                         ("ten_bit", serde_json::Value::from(self.ten_bit)),
@@ -475,8 +477,12 @@ impl CallbackTrait for VideoPaintCallback {
         render_pass.set_bind_group(0, &cache.bind_group, &[]);
         render_pass.draw(0..3, 0..1);
         if crate::perf::is_enabled() {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static PAINT_COUNT: AtomicU64 = AtomicU64::new(0);
+            let n = PAINT_COUNT.fetch_add(1, Ordering::Relaxed);
             let paint_ms = paint_t0.elapsed().as_secs_f64() * 1000.0;
-            if paint_ms > 1.0 {
+            let sampled = n == 0 || n % 300 == 0;
+            if sampled || paint_ms > 1.0 {
                 crate::perf::event(
                     "video_gpu",
                     "paint",
@@ -484,6 +490,7 @@ impl CallbackTrait for VideoPaintCallback {
                     0,
                     &[
                         ("paint_ms", serde_json::Value::from(paint_ms)),
+                        ("sampled", serde_json::Value::from(sampled)),
                         ("width", serde_json::Value::from(self.width as i64)),
                         ("height", serde_json::Value::from(self.height as i64)),
                         (

@@ -13541,6 +13541,10 @@ impl eframe::App for App {
                             )
                         })
                         .unwrap_or((-1, false, false, -1, -1, -1));
+                    #[cfg(windows)]
+                    let vst3_active_slots = self.dsp_bridge.active_slot_count() as i64;
+                    #[cfg(not(windows))]
+                    let vst3_active_slots = 0_i64;
                     crate::perf::event(
                         "ui",
                         "frame_gap",
@@ -13572,6 +13576,10 @@ impl eframe::App for App {
                             (
                                 "vst3_visible",
                                 serde_json::Value::from(self.settings.vst3_gui_visible),
+                            ),
+                            (
+                                "vst3_active_slots",
+                                serde_json::Value::from(vst3_active_slots),
                             ),
                         ],
                     );

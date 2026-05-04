@@ -1026,6 +1026,7 @@ impl App {
         let mut fs_hover_bar_ms = 0.0_f64;
         let mut fs_central_ms = 0.0_f64;
         let mut fs_vst_manager_ms = 0.0_f64;
+        let mut fs_closure_ms = 0.0_f64;
         let fs_state_is_video = state.is_video;
         #[cfg(windows)]
         let fs_state_gpu_video = state.gpu_video_frame.is_some();
@@ -1036,6 +1037,7 @@ impl App {
             self.fullscreen_viewport_id(),
             fs_builder,
             |ctx, _class| {
+                let closure_t0 = std::time::Instant::now();
                 let setup_t0 = std::time::Instant::now();
                 // フルスクリーンビューポート内のイベントで IME 状態を更新する
                 // (メインビューポートとは別のイベントキューなのでここで呼ぶ必要がある)
@@ -1546,10 +1548,21 @@ impl App {
                 }
 
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
+                fs_closure_ms = closure_t0.elapsed().as_secs_f64() * 1000.0;
             },
         );
         let fs_viewport_ms = fs_viewport_t0.elapsed().as_secs_f64() * 1000.0;
         if crate::perf::is_enabled() && fs_viewport_ms > 8.0 {
+            let fs_outer_ms = (fs_viewport_ms - fs_closure_ms).max(0.0);
+            let fs_closure_tracked_ms = fs_setup_ms + fs_central_ms + fs_vst_manager_ms;
+            let fs_closure_unaccounted_ms = (fs_closure_ms - fs_closure_tracked_ms).max(0.0);
+            let fs_central_tracked_ms = fs_input_ms
+                + fs_media_ms
+                + fs_overlay_ms
+                + fs_hud_ms
+                + fs_panels_ms
+                + fs_hover_bar_ms;
+            let fs_central_unaccounted_ms = (fs_central_ms - fs_central_tracked_ms).max(0.0);
             let (video_playing, video_pending_frames, video_state, video_seq) =
                 match self.fs_cache.get(&fs_idx) {
                     Some(FsCacheEntry::Video { player, .. }) => (
@@ -1568,6 +1581,16 @@ impl App {
                 &[
                     ("idx", serde_json::Value::from(fs_idx as i64)),
                     ("total_ms", serde_json::Value::from(fs_viewport_ms)),
+                    ("outer_ms", serde_json::Value::from(fs_outer_ms)),
+                    ("closure_ms", serde_json::Value::from(fs_closure_ms)),
+                    (
+                        "closure_unaccounted_ms",
+                        serde_json::Value::from(fs_closure_unaccounted_ms),
+                    ),
+                    (
+                        "central_unaccounted_ms",
+                        serde_json::Value::from(fs_central_unaccounted_ms),
+                    ),
                     ("setup_ms", serde_json::Value::from(fs_setup_ms)),
                     ("central_ms", serde_json::Value::from(fs_central_ms)),
                     ("input_ms", serde_json::Value::from(fs_input_ms)),
