@@ -1,0 +1,178 @@
+# DirectComposition Native Presenter Integration Plan
+
+This document turns the successful `--dcomp-presenter-test` prototype into a
+production integration plan for fullscreen video playback.
+
+## Why
+
+The egui/wgpu fullscreen path tops out below stable 1080p120 playback on the
+test machine even when VST3 is skipped. The DirectComposition prototype reuses
+the existing decoder and `GpuVideoDevice`, but presents decoded D3D11 frames via
+a native HWND + DComp visual + flip-model DXGI swap chain. The 1080p120 smoke
+run presented 360/360 frames in 3 seconds with no late drops and sub-millisecond
+present work.
+
+The production goal is to split frame-rate-critical video presentation from the
+egui UI rate:
+
+- video: native DComp/DXGI presenter at the source frame rate (120fps+)
+- HUD, seek bar, panels, dialogs: egui, allowed to update at a lower UI cadence
+- VST3 editor windows: existing cross-process HWND path, owned by the fullscreen
+  parent HWND as today
+
+## Target Shape
+
+```text
+Fullscreen top-level HWND
+  DirectComposition target
+    Visual 0: video swap chain (native presenter, D3D11/DXGI)
+    Visual 1: egui overlay swap chain or transparent overlay HWND
+  VST3 editor top-level owned popups (existing bridge windows)
+```
+
+The prototype currently validates only Visual 0. Production work must add input,
+overlay, resize, DPI, and state-machine integration.
+
+## Phase A: Reusable Native Presenter Module
+
+Move prototype-only code from `src/dcomp_presenter_test.rs` into a reusable
+Windows module, for example `src/video/native_presenter.rs`.
+
+Required API sketch:
+
+```rust
+pub struct NativeVideoPresenter { ... }
+
+pub struct NativePresenterConfig {
+    pub hwnd: HWND,
+    pub width: u32,
+    pub height: u32,
+    pub sync_interval: u32,
+}
+
+impl NativeVideoPresenter {
+    pub fn new(config: NativePresenterConfig) -> Result<Self, NativePresenterError>;
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), NativePresenterError>;
+    pub fn present(&mut self, frame: &VideoFrame) -> Result<PresentStats, NativePresenterError>;
+}
+```
+
+Keep prototype CLI as the first caller, so the module remains testable before
+the fullscreen viewer uses it.
+
+Acceptance:
+
+- `--dcomp-presenter-test` still reaches 1080p120 with no late drops.
+- No behavior change in normal fullscreen playback.
+
+## Phase B: Fullscreen HWND Ownership
+
+The current fullscreen path is an egui viewport. Native presentation needs the
+native HWND that owns:
+
+- the DComp video visual
+- the egui overlay
+- VST3 editor windows
+
+Two possible approaches:
+
+1. Keep eframe's fullscreen viewport HWND and attach the native presenter to it.
+2. Create a dedicated Win32 fullscreen HWND and embed/overlay egui separately.
+
+Start with approach 1 if the HWND can be obtained reliably for the fullscreen
+viewport. Fall back to approach 2 if eframe/winit handle access or resize/DPI
+events are too constrained.
+
+Acceptance:
+
+- Alt-tab, Escape close, multi-monitor placement, and DPI changes keep the same
+  user-visible behavior as the current fullscreen path.
+- VST3 owner switching still uses the fullscreen parent HWND and does not bring
+  the thumbnail grid window forward.
+
+## Phase C: Overlay Strategy
+
+The video visual can present independently, but HUD and seek UI still need to
+draw above it. Evaluate in this order:
+
+1. Egui overlay as a transparent child/top-level overlay HWND.
+2. Egui overlay as a second DComp visual backed by its own swap chain.
+3. Minimal native HUD for the hottest controls, with egui panels shown only
+   while interaction is active.
+
+The first production slice can accept a 60Hz overlay cadence as long as video
+presentation remains independent at 120fps.
+
+Acceptance:
+
+- Hover bar, seek bar, metadata, and shortcuts keep working.
+- UI overlay stalls do not block video present cadence.
+- Click/focus behavior with visible VST3 editors remains fixed.
+
+## Phase D: Frame Timing And Queues
+
+The native presenter should own display timing. The decoder may continue to
+produce future frames into the existing `VideoPlayer` queue, but presentation
+must be based on:
+
+- source PTS
+- current audio/wall clock
+- display refresh pacing from the native presenter
+
+Avoid egui repaint scheduling as a video timing source.
+
+Acceptance:
+
+- 1080p120 synthetic sync video has no sustained display misses on a 165Hz
+  monitor.
+- 60fps AV1 files keep audio/video sync after resume, W seek-to-start, and
+  repeated open/close.
+- `video/display_miss` or a replacement native metric can still be graphed in
+  the perf overlay.
+
+## Phase E: Production Gaps From Prototype
+
+Before enabling by default:
+
+- implement `WM_SIZE` / `ResizeBuffers`
+- handle DPI and monitor changes
+- support 10-bit/HDR GPU frames or fall back cleanly
+- decide tearing policy (`sync_interval=0`) vs vsync policy (`sync_interval=1`)
+- handle fullscreen close without the known `set_gui_owner` burst stalls
+- keep CPU fallback path correct for software decoded frames
+- add feature gate / setting for quick rollback
+
+## Test Matrix
+
+Use `scripts/video_soak.py` for A/B comparisons:
+
+```powershell
+python scripts/video_soak.py --exe target\release\mimageviewer-core.exe `
+  --duration 10 --start 0 --skip-vst3 --window-size 1920x1080 `
+  --mode egui-default `
+  H:\home\mimageviewer_old\testimage\movie\test_120fps_1080p_sync.mp4
+
+python scripts/video_soak.py --exe target\release\mimageviewer-core.exe `
+  --duration 10 --start 0 --dcomp-presenter --window-size 1920x1080 `
+  --mode dcomp `
+  H:\home\mimageviewer_old\testimage\movie\test_120fps_1080p_sync.mp4
+```
+
+Core clips:
+
+- synthetic 1080p120 sync video
+- strong-wind AV1 60fps file
+- WMA Pro 5.1 WMV file
+- old DivX/AVI file with missing PTS
+- a normal H.264/AAC 30fps file
+
+## Rollout
+
+Keep the egui fullscreen path until the native path passes the test matrix.
+Prefer an environment variable or hidden setting first:
+
+```text
+MIV_NATIVE_VIDEO_PRESENTER=1
+```
+
+After sustained testing, graduate it to a user setting or default path.
