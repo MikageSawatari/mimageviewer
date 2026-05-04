@@ -312,6 +312,7 @@ fn run_native_video_output(
             width,
             height,
             test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
+            egui_overlay: std::env::var_os("MIV_NATIVE_VIDEO_EGUI_OVERLAY").is_some(),
         },
     )?;
     crate::logger::log(format!(

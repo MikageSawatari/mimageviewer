@@ -3385,6 +3385,7 @@ dependencies = [
  "ort",
  "pdfium-render",
  "png 0.18.1",
+ "pollster",
  "quick-xml 0.39.2",
  "rayon",
  "rexif",

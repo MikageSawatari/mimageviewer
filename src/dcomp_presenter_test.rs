@@ -101,6 +101,7 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
         width: config.width,
         height: config.height,
         test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
+        egui_overlay: std::env::var_os("MIV_NATIVE_VIDEO_EGUI_OVERLAY").is_some(),
     })?;
 
     let seek_serial = Arc::new(AtomicU64::new(0));

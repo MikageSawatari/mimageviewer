@@ -51,6 +51,19 @@ Start with an isolated overlay spike before wiring the production HUD:
 6. Run the existing 1080p120 soak with the overlay spike enabled and require
    `late_drop=0`.
 
+Status:
+
+- 2026-05-04: the first spike is implemented behind
+  `MIV_NATIVE_VIDEO_EGUI_OVERLAY=1`. It creates a wgpu DX12 surface from a
+  second `IDCompositionVisual`, renders a tiny standalone egui label with
+  `egui_wgpu::Renderer`, and fails closed to video-only presentation if the
+  CompositionVisual surface path is unavailable.
+- 2026-05-04: the 1080p120 soak with the spike enabled presented 601 frames in
+  5 seconds with `late_drop=0`, max interval 9.8ms, and one static egui overlay
+  render (`shapes=4`, `paint_jobs=1`). This proves the CompositionVisual route
+  can draw egui primitives above video without tying overlay redraws to video
+  cadence.
+
 Acceptance for the spike:
 
 - The overlay appears above video with transparency.

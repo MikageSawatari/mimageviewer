@@ -65,6 +65,7 @@ egui-wgpu = "0.33"
 # するため、そちらも `windows_058` 別名で導入する (本体側は windows 0.61)。
 wgpu = "27"
 wgpu-hal = { version = "27", features = ["dx12"] }
+pollster = "0.4"
 image = { version = "0.25", features = ["jpeg", "png", "webp", "bmp", "gif"] }
 # SIMD (SSE4.1/AVX2) 実装のリサイズ。image crate の imageops::resize はスカラー実装で
 # 7K-9K クラスの画像で秒単位かかるため、clamp_dynamic_for_gpu とサムネイル生成で使用。

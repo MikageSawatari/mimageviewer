@@ -34,6 +34,7 @@ pub struct NativePresenterConfig {
     pub width: u32,
     pub height: u32,
     pub test_overlay: bool,
+    pub egui_overlay: bool,
 }
 
 pub struct NativeVideoPresenter {
@@ -50,6 +51,7 @@ pub struct NativeVideoPresenter {
     _video_visual: IDCompositionVisual,
     backbuffer: Option<ID3D11Texture2D>,
     test_overlay: Option<NativeTestOverlay>,
+    egui_overlay: Option<NativeEguiOverlay>,
     fence_cache: Option<(u64, isize, ID3D11Fence)>,
     width: u32,
     height: u32,
@@ -60,6 +62,23 @@ struct NativeTestOverlay {
     _visual: IDCompositionVisual,
     backbuffer: Option<ID3D11Texture2D>,
     render_target: Option<ID3D11RenderTargetView>,
+    width: u32,
+    height: u32,
+}
+
+struct NativeEguiOverlay {
+    _visual: IDCompositionVisual,
+    surface: wgpu::Surface<'static>,
+    _instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    format: wgpu::TextureFormat,
+    present_mode: wgpu::PresentMode,
+    alpha_mode: wgpu::CompositeAlphaMode,
+    renderer: egui_wgpu::Renderer,
+    egui_ctx: egui::Context,
+    started_at: Instant,
     width: u32,
     height: u32,
 }
@@ -173,7 +192,42 @@ impl NativeVideoPresenter {
             root_visual
                 .AddVisual(&video_visual, false, None::<&IDCompositionVisual>)
                 .map_err(|e| format!("IDCompositionVisual::AddVisual video: {e:?}"))?;
-            let test_overlay = if config.test_overlay {
+            let mut egui_overlay = None;
+            if config.egui_overlay {
+                let overlay_visual = dcomp_device
+                    .CreateVisual()
+                    .map_err(|e| format!("CreateVisual egui overlay: {e:?}"))?;
+                match NativeEguiOverlay::new(overlay_visual, config.width, config.height) {
+                    Ok(mut overlay) => {
+                        root_visual
+                            .AddVisual(&overlay._visual, true, &video_visual)
+                            .map_err(|e| {
+                                format!("IDCompositionVisual::AddVisual egui overlay: {e:?}")
+                            })?;
+                        if let Err(err) = overlay.render_once() {
+                            crate::logger::log(format!(
+                                "native-presenter: egui overlay initial render failed: {err}"
+                            ));
+                            log_event(
+                                "egui_overlay_error",
+                                &[("error", Value::from(err.to_string()))],
+                            );
+                        }
+                        egui_overlay = Some(overlay);
+                    }
+                    Err(err) => {
+                        crate::logger::log(format!(
+                            "native-presenter: egui overlay disabled after init failure: {err}"
+                        ));
+                        log_event(
+                            "egui_overlay_error",
+                            &[("error", Value::from(err.to_string()))],
+                        );
+                    }
+                }
+            }
+
+            let test_overlay = if config.test_overlay && egui_overlay.is_none() {
                 let overlay = NativeTestOverlay::new(
                     &factory,
                     &d3d_device,
@@ -212,6 +266,7 @@ impl NativeVideoPresenter {
                 _video_visual: video_visual,
                 backbuffer: None,
                 test_overlay,
+                egui_overlay,
                 fence_cache: None,
                 width: config.width,
                 height: config.height,
@@ -225,6 +280,7 @@ impl NativeVideoPresenter {
                     ("buffer_count", Value::from(3)),
                     ("latency", Value::from(1)),
                     ("test_overlay", Value::from(config.test_overlay)),
+                    ("egui_overlay", Value::from(config.egui_overlay)),
                 ],
             );
             Ok(this)
@@ -260,6 +316,9 @@ impl NativeVideoPresenter {
                 width,
                 height,
             )?;
+        }
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.resize(width, height)?;
         }
         log_event(
             "resize",
@@ -403,6 +462,253 @@ impl NativeVideoPresenter {
         self.backbuffer = Some(backbuffer);
         Ok(())
     }
+}
+
+impl NativeEguiOverlay {
+    fn new(visual: IDCompositionVisual, width: u32, height: u32) -> Result<Self, String> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::DX12,
+            ..Default::default()
+        });
+        let surface = unsafe {
+            instance
+                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CompositionVisual(
+                    visual.as_raw() as *mut core::ffi::c_void,
+                ))
+                .map_err(|e| format!("wgpu CompositionVisual surface: {e:?}"))?
+        };
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: Some(&surface),
+        }))
+        .map_err(|e| format!("wgpu request_adapter for DComp overlay: {e:?}"))?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("mIV native egui overlay"),
+            ..Default::default()
+        }))
+        .map_err(|e| format!("wgpu request_device for DComp overlay: {e:?}"))?;
+        let caps = surface.get_capabilities(&adapter);
+        let format = choose_overlay_surface_format(&caps.formats)?;
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::AutoVsync) {
+            wgpu::PresentMode::AutoVsync
+        } else {
+            *caps
+                .present_modes
+                .first()
+                .ok_or_else(|| "wgpu DComp overlay surface has no present modes".to_string())?
+        };
+        let alpha_mode = if caps
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PreMultiplied)
+        {
+            wgpu::CompositeAlphaMode::PreMultiplied
+        } else {
+            wgpu::CompositeAlphaMode::Auto
+        };
+        let renderer =
+            egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
+        let egui_ctx = egui::Context::default();
+        let this = Self {
+            _visual: visual,
+            surface,
+            _instance: instance,
+            adapter,
+            device,
+            queue,
+            format,
+            present_mode,
+            alpha_mode,
+            renderer,
+            egui_ctx,
+            started_at: Instant::now(),
+            width: width.max(1),
+            height: height.max(1),
+        };
+        this.configure();
+        log_event(
+            "egui_overlay_init",
+            &[
+                ("width", Value::from(this.width as i64)),
+                ("height", Value::from(this.height as i64)),
+                ("format", Value::from(format!("{:?}", this.format))),
+                (
+                    "present_mode",
+                    Value::from(format!("{:?}", this.present_mode)),
+                ),
+                ("alpha_mode", Value::from(format!("{:?}", this.alpha_mode))),
+                ("adapter", Value::from(this.adapter.get_info().name)),
+            ],
+        );
+        Ok(this)
+    }
+
+    fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+        let width = width.max(1);
+        let height = height.max(1);
+        if self.width == width && self.height == height {
+            return Ok(());
+        }
+        self.width = width;
+        self.height = height;
+        self.configure();
+        self.render_once()
+    }
+
+    fn configure(&self) {
+        self.surface.configure(
+            &self.device,
+            &wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format: self.format,
+                width: self.width,
+                height: self.height,
+                present_mode: self.present_mode,
+                desired_maximum_frame_latency: 1,
+                alpha_mode: self.alpha_mode,
+                view_formats: vec![],
+            },
+        );
+    }
+
+    fn render_once(&mut self) -> Result<(), String> {
+        let render_t0 = Instant::now();
+        let ppp = 1.0f32;
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(self.width as f32 / ppp, self.height as f32 / ppp),
+            )),
+            time: Some(self.started_at.elapsed().as_secs_f64()),
+            predicted_dt: 1.0 / 60.0,
+            ..Default::default()
+        };
+        let full_output = self.egui_ctx.run(raw_input, |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground,
+                egui::Id::new("native_egui_overlay_spike"),
+            ));
+            let rect = egui::Rect::from_min_size(egui::pos2(32.0, 32.0), egui::vec2(360.0, 74.0));
+            painter.rect_filled(
+                rect,
+                egui::CornerRadius::same(6),
+                egui::Color32::from_rgba_premultiplied(0, 46, 21, 168),
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_size(egui::pos2(46.0, 48.0), egui::vec2(28.0, 28.0)),
+                egui::CornerRadius::same(4),
+                egui::Color32::from_rgba_premultiplied(0, 92, 38, 188),
+            );
+            painter.text(
+                egui::pos2(88.0, 46.0),
+                egui::Align2::LEFT_TOP,
+                "DComp egui overlay",
+                egui::FontId::proportional(19.0),
+                egui::Color32::from_rgb(210, 246, 218),
+            );
+            painter.text(
+                egui::pos2(88.0, 72.0),
+                egui::Align2::LEFT_TOP,
+                "wgpu SurfaceTarget::CompositionVisual",
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgb(158, 206, 172),
+            );
+        });
+
+        let shape_count = full_output.shapes.len();
+        for (id, image_delta) in &full_output.textures_delta.set {
+            self.renderer
+                .update_texture(&self.device, &self.queue, *id, image_delta);
+        }
+        let paint_jobs = self
+            .egui_ctx
+            .tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.width, self.height],
+            pixels_per_point: full_output.pixels_per_point,
+        };
+        let surface_texture = self
+            .surface
+            .get_current_texture()
+            .map_err(|e| format!("egui overlay get_current_texture: {e:?}"))?;
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("mIV native egui overlay encoder"),
+            });
+        let user_cmds = self.renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+        {
+            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("mIV native egui overlay render"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.renderer.render(
+                &mut render_pass.forget_lifetime(),
+                &paint_jobs,
+                &screen_descriptor,
+            );
+        }
+        let mut submissions = user_cmds;
+        submissions.push(encoder.finish());
+        self.queue.submit(submissions);
+        surface_texture.present();
+        for id in &full_output.textures_delta.free {
+            self.renderer.free_texture(id);
+        }
+        log_event(
+            "egui_overlay_present",
+            &[
+                ("width", Value::from(self.width as i64)),
+                ("height", Value::from(self.height as i64)),
+                ("shapes", Value::from(shape_count as i64)),
+                ("paint_jobs", Value::from(paint_jobs.len() as i64)),
+                (
+                    "render_ms",
+                    Value::from(render_t0.elapsed().as_secs_f64() * 1000.0),
+                ),
+            ],
+        );
+        Ok(())
+    }
+}
+
+fn choose_overlay_surface_format(
+    formats: &[wgpu::TextureFormat],
+) -> Result<wgpu::TextureFormat, String> {
+    for preferred in [
+        wgpu::TextureFormat::Bgra8Unorm,
+        wgpu::TextureFormat::Rgba8Unorm,
+        wgpu::TextureFormat::Bgra8UnormSrgb,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+    ] {
+        if formats.contains(&preferred) {
+            return Ok(preferred);
+        }
+    }
+    formats
+        .first()
+        .copied()
+        .ok_or_else(|| "wgpu DComp overlay surface has no formats".to_string())
 }
 
 impl NativeTestOverlay {

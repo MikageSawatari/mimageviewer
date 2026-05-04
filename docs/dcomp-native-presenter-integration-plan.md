@@ -167,6 +167,13 @@ Status:
   surface created from `SurfaceTargetUnsafe::CompositionVisual`, so egui-wgpu can
   render to the second DComp visual without introducing a transparent overlay
   HWND.
+- 2026-05-04: the CompositionVisual/egui-wgpu spike is implemented behind
+  `MIV_NATIVE_VIDEO_EGUI_OVERLAY=1`. It uses a standalone egui context and
+  renderer to draw a tiny static label into the second DComp visual, with
+  video-only fail-closed behavior if the overlay cannot initialize.
+  The 1080p120 soak kept `late_drop=0` for 601 frames over 5 seconds with max
+  interval 9.8ms, so the egui overlay surface can coexist with the native video
+  visual without coupling redraw cadence.
 
 The first production slice can accept a 60Hz overlay cadence as long as video
 presentation remains independent at 120fps.
