@@ -90,6 +90,7 @@ struct NativeEguiOverlay {
     video_position_secs: f64,
     video_duration_secs: f64,
     video_is_playing: bool,
+    last_seek_target_secs: Option<f64>,
     pixels_per_point: f32,
     width: u32,
     height: u32,
@@ -639,6 +640,7 @@ impl NativeEguiOverlay {
             video_position_secs: 0.0,
             video_duration_secs: 0.0,
             video_is_playing: false,
+            last_seek_target_secs: None,
             pixels_per_point,
             width: width.max(1),
             height: height.max(1),
@@ -830,6 +832,10 @@ impl NativeEguiOverlay {
         let hud_visible = self.hud_visible();
         let pending_event_count = self.pending_events.len();
         let mut commands = Vec::new();
+        let mut last_seek_target_secs = self.last_seek_target_secs;
+        if !hud_visible {
+            last_seek_target_secs = None;
+        }
         let mut raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -917,15 +923,25 @@ impl NativeEguiOverlay {
                     if seek_resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     }
-                    if duration_secs > 0.0
-                        && (seek_resp.clicked() || seek_resp.dragged())
-                        && let Some(pos) = seek_resp.interact_pointer_pos()
-                    {
-                        let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
-                        let frac = ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
-                        commands.push(NativeOverlayCommand::Seek {
-                            target_secs: duration_secs * frac as f64,
-                        });
+                    if duration_secs > 0.0 {
+                        if (seek_resp.clicked() || seek_resp.dragged())
+                            && let Some(pos) = seek_resp.interact_pointer_pos()
+                        {
+                            let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
+                            let frac = ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
+                            let target_secs = duration_secs * frac as f64;
+                            let should_emit = seek_resp.clicked()
+                                || last_seek_target_secs
+                                    .map(|prev| (prev - target_secs).abs() >= 0.10)
+                                    .unwrap_or(true);
+                            if should_emit {
+                                last_seek_target_secs = Some(target_secs);
+                                commands.push(NativeOverlayCommand::Seek { target_secs });
+                            }
+                        }
+                        if seek_resp.drag_stopped() {
+                            last_seek_target_secs = None;
+                        }
                     }
                     if duration_secs > 0.0
                         && seek_resp.hovered()
@@ -969,6 +985,7 @@ impl NativeEguiOverlay {
         // native input batch to the legacy fullscreen shortcut path.
         self.wants_pointer_input = self.egui_ctx.wants_pointer_input();
         self.wants_keyboard_input = self.egui_ctx.wants_keyboard_input();
+        self.last_seek_target_secs = last_seek_target_secs;
 
         let shape_count = full_output.shapes.len();
         for (id, image_delta) in &full_output.textures_delta.set {

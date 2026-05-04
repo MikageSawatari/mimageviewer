@@ -395,7 +395,7 @@ fn run_native_video_output(
             if let Err(err) = presenter.tick_overlay_video_state(
                 clock.now_secs(),
                 f64::from_bits(duration_secs_bits.load(Ordering::Acquire)),
-                true,
+                clock.is_playing(),
             ) {
                 crate::logger::log(format!("[native-video] overlay tick render failed: {err}"));
             }

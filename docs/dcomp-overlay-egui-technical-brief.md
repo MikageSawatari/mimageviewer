@@ -79,7 +79,8 @@ Status:
   shortcut path, so overlay widgets can consume their own input while video-area
   clicks keep using the existing shortcuts. A first bottom seek/hover bar has
   replaced the static spike label as the production-shaped HUD slice. Its
-  click/drag seek action is sent back to the UI thread as an overlay command,
+  click/drag seek action is sent back to the UI thread as an overlay command;
+  drag seek commands are coalesced to target changes of roughly 100ms or more,
   and the presenter gives the visible HUD a 250ms playback tick so progress
   remains live even when the pointer is stationary.
 
