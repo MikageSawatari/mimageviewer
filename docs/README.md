@@ -32,6 +32,7 @@
 | [pdf-issues.md](pdf-issues.md) | PDF サポートの既知問題 |
 | [screenshot-howto.md](screenshot-howto.md) | 製品ページ用スクリーンショット手順 |
 | [e2e-smoke-test.md](e2e-smoke-test.md) | E2E スモークテストのチェックリスト |
+| [test-video-generation.md](test-video-generation.md) | `testimage/movie/test_*fps_*p_sync.mp4` (FFmpeg testsrc2 + sine ビープ) の再生成手順 |
 | [ui-snapshot-policy.md](ui-snapshot-policy.md) | egui_kittest によるスナップショットテストの運用方針 |
 | [bench-scroll-report.md](bench-scroll-report.md) | スクロール性能ベンチマーク結果 |
 | [perf-investigation-handoff.md](perf-investigation-handoff.md) | パフォーマンス調査の進行中メモ (AI アップスケール優先度 / スクロール中の重複エンキュー抑制) |
