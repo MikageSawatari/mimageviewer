@@ -12994,10 +12994,7 @@ impl App {
         #[cfg(windows)]
         let mut native_owner_hwnd: u64 = 0;
         #[cfg(windows)]
-        let mut native_events: Vec<(
-            usize,
-            crate::video::native_window::NativeVideoWindowEvent,
-        )> = Vec::new();
+        let mut native_events: Vec<(usize, crate::video::NativeVideoOutputEvent)> = Vec::new();
         for (idx, entry) in self.fs_cache.iter_mut() {
             if let FsCacheEntry::Video { player, .. } = entry {
                 player.set_loop_enabled(loop_enabled);
@@ -13042,7 +13039,7 @@ impl App {
         }
         #[cfg(windows)]
         for (idx, event) in native_events {
-            self.handle_native_video_window_event(ctx, idx, event);
+            self.handle_native_video_output_event(ctx, idx, event);
         }
         #[cfg(windows)]
         if native_closed_idx.is_some() {
@@ -13066,6 +13063,23 @@ impl App {
                 ctx.request_repaint();
             } else {
                 ctx.request_repaint_after(d);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_output_event(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        event: crate::video::NativeVideoOutputEvent,
+    ) {
+        match event {
+            crate::video::NativeVideoOutputEvent::Window(event) => {
+                self.handle_native_video_window_event(ctx, fs_idx, event);
+            }
+            crate::video::NativeVideoOutputEvent::Seek { target_secs } => {
+                self.handle_native_video_seek_command(ctx, fs_idx, target_secs);
             }
         }
     }
@@ -13097,6 +13111,22 @@ impl App {
             crate::video::native_window::NativeVideoWindowEvent::MouseLeave => {
                 self.native_video_pointer_down = None;
             }
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_seek_command(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        target_secs: f64,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.seek(target_secs);
+            self.mark_native_video_hud_activity(ctx);
         }
     }
 

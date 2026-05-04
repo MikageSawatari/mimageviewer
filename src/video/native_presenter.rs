@@ -110,6 +110,25 @@ pub struct NativeOverlayInputRouting {
     pub wants_keyboard_input: bool,
 }
 
+pub struct NativeOverlayInputOutcome {
+    pub routing: NativeOverlayInputRouting,
+    pub commands: Vec<NativeOverlayCommand>,
+}
+
+impl NativeOverlayInputOutcome {
+    fn empty() -> Self {
+        Self {
+            routing: NativeOverlayInputRouting::default(),
+            commands: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum NativeOverlayCommand {
+    Seek { target_secs: f64 },
+}
+
 impl NativeOverlayInputRouting {
     pub fn should_forward_to_ui(
         self,
@@ -455,12 +474,12 @@ impl NativeVideoPresenter {
     pub fn handle_window_events(
         &mut self,
         events: &[crate::video::native_window::NativeVideoWindowEvent],
-    ) -> Result<NativeOverlayInputRouting, String> {
+    ) -> Result<NativeOverlayInputOutcome, String> {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.push_native_events(events);
             return overlay.render_if_dirty();
         }
-        Ok(NativeOverlayInputRouting::default())
+        Ok(NativeOverlayInputOutcome::empty())
     }
 
     pub fn update_overlay_video_state(
@@ -472,6 +491,26 @@ impl NativeVideoPresenter {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.update_video_state(position_secs, duration_secs, is_playing);
         }
+    }
+
+    pub fn tick_overlay_video_state(
+        &mut self,
+        position_secs: f64,
+        duration_secs: f64,
+        is_playing: bool,
+    ) -> Result<(), String> {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.update_video_state(position_secs, duration_secs, is_playing);
+            overlay.render_if_dirty()?;
+        }
+        Ok(())
+    }
+
+    pub fn overlay_hud_visible(&self) -> bool {
+        self.egui_overlay
+            .as_ref()
+            .map(NativeEguiOverlay::hud_visible)
+            .unwrap_or(false)
     }
 
     fn open_fence(
@@ -633,7 +672,7 @@ impl NativeEguiOverlay {
         self.height = height;
         self.configure();
         self.dirty = true;
-        self.render_once()
+        self.render_once().map(|_| ())
     }
 
     fn push_native_events(
@@ -718,10 +757,12 @@ impl NativeEguiOverlay {
         let position_secs = finite_nonnegative(position_secs);
         let duration_secs = finite_nonnegative(duration_secs);
         let duration_changed = (self.video_duration_secs - duration_secs).abs() > 0.001;
+        let position_changed = (self.video_position_secs - position_secs).abs() >= 0.25;
+        let playing_changed = self.video_is_playing != is_playing;
         self.video_position_secs = position_secs;
         self.video_duration_secs = duration_secs;
         self.video_is_playing = is_playing;
-        if duration_changed {
+        if duration_changed || position_changed || playing_changed {
             self.dirty = true;
         }
     }
@@ -733,12 +774,18 @@ impl NativeEguiOverlay {
         )
     }
 
-    fn render_if_dirty(&mut self) -> Result<NativeOverlayInputRouting, String> {
+    fn render_if_dirty(&mut self) -> Result<NativeOverlayInputOutcome, String> {
         if !self.dirty && self.pending_events.is_empty() {
-            return Ok(self.input_routing());
+            return Ok(NativeOverlayInputOutcome {
+                routing: self.input_routing(),
+                commands: Vec::new(),
+            });
         }
-        self.render_once()?;
-        Ok(self.input_routing())
+        let commands = self.render_once()?;
+        Ok(NativeOverlayInputOutcome {
+            routing: self.input_routing(),
+            commands,
+        })
     }
 
     fn input_routing(&self) -> NativeOverlayInputRouting {
@@ -746,6 +793,12 @@ impl NativeEguiOverlay {
             wants_pointer_input: self.wants_pointer_input,
             wants_keyboard_input: self.wants_keyboard_input,
         }
+    }
+
+    fn hud_visible(&self) -> bool {
+        let overlay_height_points = self.height as f32 / self.pixels_per_point;
+        self.pointer_pos
+            .is_some_and(|pos| pos.y >= (overlay_height_points - 76.0).max(0.0))
     }
 
     fn configure(&self) {
@@ -764,7 +817,7 @@ impl NativeEguiOverlay {
         );
     }
 
-    fn render_once(&mut self) -> Result<(), String> {
+    fn render_once(&mut self) -> Result<Vec<NativeOverlayCommand>, String> {
         let render_t0 = Instant::now();
         let ppp = self.pixels_per_point;
         let event_count = self.event_count;
@@ -774,9 +827,9 @@ impl NativeEguiOverlay {
         let position_secs = self.video_position_secs;
         let duration_secs = self.video_duration_secs;
         let is_playing = self.video_is_playing;
-        let hud_visible =
-            pointer_pos.is_some_and(|pos| pos.y >= (overlay_height_points - 76.0).max(0.0));
+        let hud_visible = self.hud_visible();
         let pending_event_count = self.pending_events.len();
+        let mut commands = Vec::new();
         let mut raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -863,6 +916,16 @@ impl NativeEguiOverlay {
                     );
                     if seek_resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                    if duration_secs > 0.0
+                        && (seek_resp.clicked() || seek_resp.dragged())
+                        && let Some(pos) = seek_resp.interact_pointer_pos()
+                    {
+                        let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
+                        let frac = ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
+                        commands.push(NativeOverlayCommand::Seek {
+                            target_secs: duration_secs * frac as f64,
+                        });
                     }
                     if duration_secs > 0.0
                         && seek_resp.hovered()
@@ -986,7 +1049,7 @@ impl NativeEguiOverlay {
                 ),
             ],
         );
-        Ok(())
+        Ok(commands)
     }
 }
 

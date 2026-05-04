@@ -166,11 +166,18 @@ pub struct NativeVideoOutputConfig {
 }
 
 #[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub enum NativeVideoOutputEvent {
+    Window(native_window::NativeVideoWindowEvent),
+    Seek { target_secs: f64 },
+}
+
+#[cfg(windows)]
 struct NativeVideoOutput {
     cancel: Arc<AtomicBool>,
     hwnd: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
-    event_rx: std::sync::Mutex<std::sync::mpsc::Receiver<native_window::NativeVideoWindowEvent>>,
+    event_rx: std::sync::Mutex<std::sync::mpsc::Receiver<NativeVideoOutputEvent>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -232,7 +239,7 @@ impl NativeVideoOutput {
         self.closed.load(Ordering::Acquire)
     }
 
-    fn drain_events(&self) -> Vec<native_window::NativeVideoWindowEvent> {
+    fn drain_events(&self) -> Vec<NativeVideoOutputEvent> {
         let Ok(rx) = self.event_rx.lock() else {
             return Vec::new();
         };
@@ -289,7 +296,7 @@ fn run_native_video_output(
     displayed_frame_seq: Arc<AtomicU64>,
     duration_secs_bits: Arc<AtomicU64>,
     config: NativeVideoOutputConfig,
-    ui_event_tx: std::sync::mpsc::Sender<native_window::NativeVideoWindowEvent>,
+    ui_event_tx: std::sync::mpsc::Sender<NativeVideoOutputEvent>,
     cancel: Arc<AtomicBool>,
     hwnd_out: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
@@ -337,6 +344,7 @@ fn run_native_video_output(
     let mut last_seen_serial = clock.current_seek_serial();
     let mut first_frame_event_last_epoch: Option<u64> = None;
     let mut last_present_log = Instant::now();
+    let mut last_overlay_tick = Instant::now();
     let mut native_events = Vec::new();
     while !cancel.load(Ordering::Acquire) {
         if crate::video::native_window::pump_thread_messages() {
@@ -354,7 +362,19 @@ fn run_native_video_output(
                 clock.is_playing(),
             );
             let overlay_routing = match presenter.handle_window_events(&native_events) {
-                Ok(routing) => routing,
+                Ok(outcome) => {
+                    for command in outcome.commands {
+                        match command {
+                            crate::video::native_presenter::NativeOverlayCommand::Seek {
+                                target_secs,
+                            } => {
+                                let _ =
+                                    ui_event_tx.send(NativeVideoOutputEvent::Seek { target_secs });
+                            }
+                        }
+                    }
+                    outcome.routing
+                }
                 Err(err) => {
                     crate::logger::log(format!(
                         "[native-video] overlay input render failed: {err}"
@@ -364,9 +384,22 @@ fn run_native_video_output(
             };
             for event in &native_events {
                 if overlay_routing.should_forward_to_ui(*event) {
-                    let _ = ui_event_tx.send(*event);
+                    let _ = ui_event_tx.send(NativeVideoOutputEvent::Window(*event));
                 }
             }
+            last_overlay_tick = Instant::now();
+        } else if clock.is_playing()
+            && presenter.overlay_hud_visible()
+            && last_overlay_tick.elapsed() >= Duration::from_millis(250)
+        {
+            if let Err(err) = presenter.tick_overlay_video_state(
+                clock.now_secs(),
+                f64::from_bits(duration_secs_bits.load(Ordering::Acquire)),
+                true,
+            ) {
+                crate::logger::log(format!("[native-video] overlay tick render failed: {err}"));
+            }
+            last_overlay_tick = Instant::now();
         }
 
         let clock_serial = clock.current_seek_serial();
@@ -944,7 +977,7 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
-    pub fn drain_native_presenter_events(&self) -> Vec<native_window::NativeVideoWindowEvent> {
+    pub fn drain_native_presenter_events(&self) -> Vec<NativeVideoOutputEvent> {
         self.native_output
             .as_ref()
             .map(NativeVideoOutput::drain_events)

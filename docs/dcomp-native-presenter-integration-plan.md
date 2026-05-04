@@ -192,7 +192,11 @@ Status:
   through to the existing native video shortcuts. The first production-shaped
   overlay HUD slice is a bottom seek/hover bar that reads playback position
   from the native clock and duration from a shared atomic updated on
-  `InfoReceived`.
+  `InfoReceived`. Seek-bar click/drag now emits a native overlay seek command
+  back to the UI thread so it uses the same `VideoPlayer::seek()` path as the
+  legacy fullscreen HUD. While playback continues with the pointer resting over
+  the HUD, the presenter ticks the overlay at roughly 250ms intervals so the
+  time label and progress fill do not freeze.
 
 The first production slice can accept a 60Hz overlay cadence as long as video
 presentation remains independent at 120fps.
