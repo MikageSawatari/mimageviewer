@@ -25,6 +25,7 @@ use windows::Win32::Graphics::Dxgi::{
     IDXGISwapChain2,
 };
 use windows::Win32::System::Threading::WaitForSingleObject;
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::core::Interface;
 
 use crate::video::decoder::{VideoFrame, VideoFrameData};
@@ -84,6 +85,7 @@ struct NativeEguiOverlay {
     pointer_pos: Option<egui::Pos2>,
     event_count: u64,
     dirty: bool,
+    pixels_per_point: f32,
     width: u32,
     height: u32,
 }
@@ -202,7 +204,12 @@ impl NativeVideoPresenter {
                 let overlay_visual = dcomp_device
                     .CreateVisual()
                     .map_err(|e| format!("CreateVisual egui overlay: {e:?}"))?;
-                match NativeEguiOverlay::new(overlay_visual, config.width, config.height) {
+                match NativeEguiOverlay::new(
+                    overlay_visual,
+                    config.hwnd,
+                    config.width,
+                    config.height,
+                ) {
                     Ok(mut overlay) => {
                         root_visual
                             .AddVisual(&overlay._visual, true, &video_visual)
@@ -481,7 +488,12 @@ impl NativeVideoPresenter {
 }
 
 impl NativeEguiOverlay {
-    fn new(visual: IDCompositionVisual, width: u32, height: u32) -> Result<Self, String> {
+    fn new(
+        visual: IDCompositionVisual,
+        hwnd: HWND,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
             ..Default::default()
@@ -525,6 +537,7 @@ impl NativeEguiOverlay {
         let renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
+        let pixels_per_point = pixels_per_point_for_hwnd(hwnd);
         let this = Self {
             surface,
             _visual: visual,
@@ -543,6 +556,7 @@ impl NativeEguiOverlay {
             pointer_pos: None,
             event_count: 0,
             dirty: true,
+            pixels_per_point,
             width: width.max(1),
             height: height.max(1),
         };
@@ -559,6 +573,7 @@ impl NativeEguiOverlay {
                 ),
                 ("alpha_mode", Value::from(format!("{:?}", this.alpha_mode))),
                 ("adapter", Value::from(this.adapter.get_info().name)),
+                ("pixels_per_point", Value::from(this.pixels_per_point)),
             ],
         );
         Ok(this)
@@ -609,14 +624,14 @@ impl NativeEguiOverlay {
                 }
             }
             NativeEvent::MouseMove(mouse) => {
-                let pos = native_pos(mouse.x, mouse.y);
+                let pos = self.native_pos(mouse.x, mouse.y);
                 self.pointer_pos = Some(pos);
                 self.modifiers = egui_modifiers(mouse.shift, mouse.ctrl, false);
                 self.pending_events.push(egui::Event::PointerMoved(pos));
                 self.dirty = true;
             }
             NativeEvent::MouseButton(button) => {
-                let pos = native_pos(button.x, button.y);
+                let pos = self.native_pos(button.x, button.y);
                 let modifiers = egui_modifiers(button.shift, button.ctrl, false);
                 self.pointer_pos = Some(pos);
                 self.modifiers = modifiers;
@@ -635,7 +650,7 @@ impl NativeEguiOverlay {
                 self.dirty = true;
             }
             NativeEvent::MouseWheel(wheel) => {
-                let pos = native_pos(wheel.x, wheel.y);
+                let pos = self.native_pos(wheel.x, wheel.y);
                 let modifiers = egui_modifiers(wheel.shift, wheel.ctrl, false);
                 self.pointer_pos = Some(pos);
                 self.modifiers = modifiers;
@@ -653,6 +668,13 @@ impl NativeEguiOverlay {
                 self.dirty = true;
             }
         }
+    }
+
+    fn native_pos(&self, x: i32, y: i32) -> egui::Pos2 {
+        egui::pos2(
+            x as f32 / self.pixels_per_point,
+            y as f32 / self.pixels_per_point,
+        )
     }
 
     fn render_if_dirty(&mut self) -> Result<(), String> {
@@ -680,11 +702,11 @@ impl NativeEguiOverlay {
 
     fn render_once(&mut self) -> Result<(), String> {
         let render_t0 = Instant::now();
-        let ppp = 1.0f32;
+        let ppp = self.pixels_per_point;
         let event_count = self.event_count;
         let pointer_pos = self.pointer_pos;
         let pending_event_count = self.pending_events.len();
-        let raw_input = egui::RawInput {
+        let mut raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(self.width as f32 / ppp, self.height as f32 / ppp),
@@ -695,6 +717,9 @@ impl NativeEguiOverlay {
             events: std::mem::take(&mut self.pending_events),
             ..Default::default()
         };
+        if let Some(viewport) = raw_input.viewports.get_mut(&egui::ViewportId::ROOT) {
+            viewport.native_pixels_per_point = Some(ppp);
+        }
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
             let painter = ctx.layer_painter(egui::LayerId::new(
                 egui::Order::Foreground,
@@ -805,6 +830,7 @@ impl NativeEguiOverlay {
                 ("height", Value::from(self.height as i64)),
                 ("input_events", Value::from(pending_event_count as i64)),
                 ("native_events", Value::from(event_count as i64)),
+                ("pixels_per_point", Value::from(ppp)),
                 ("shapes", Value::from(shape_count as i64)),
                 ("paint_jobs", Value::from(paint_jobs.len() as i64)),
                 (
@@ -836,8 +862,14 @@ fn choose_overlay_surface_format(
         .ok_or_else(|| "wgpu DComp overlay surface has no formats".to_string())
 }
 
-fn native_pos(x: i32, y: i32) -> egui::Pos2 {
-    egui::pos2(x as f32, y as f32)
+fn pixels_per_point_for_hwnd(hwnd: HWND) -> f32 {
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    let pixels_per_point = dpi as f32 / 96.0;
+    if pixels_per_point.is_finite() && pixels_per_point > 0.0 {
+        pixels_per_point
+    } else {
+        1.0
+    }
 }
 
 fn egui_modifiers(shift: bool, ctrl: bool, alt: bool) -> egui::Modifiers {

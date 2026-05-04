@@ -181,6 +181,10 @@ Status:
 - 2026-05-04: key release events and normalized line-scroll wheel events are now
   part of the native-to-egui bridge. Hit-test routing and DPI-aware coordinates
   remain Phase C production work.
+- 2026-05-04: the overlay now derives `pixels_per_point` from
+  `GetDpiForWindow`, sends it through egui's viewport input, and scales native
+  mouse coordinates from physical pixels to egui points. Dynamic DPI-change
+  handling is still a Phase E production gap.
 
 The first production slice can accept a 60Hz overlay cadence as long as video
 presentation remains independent at 120fps.

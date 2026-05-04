@@ -70,6 +70,9 @@ Status:
 - 2026-05-04: the input bridge now also forwards key releases and normalizes
   Win32 wheel deltas as egui line-scroll units, so future overlay widgets can
   rely on pressed/released key state and standard scroll scaling.
+- 2026-05-04: the overlay now seeds egui with `GetDpiForWindow`-based
+  `native_pixels_per_point` and converts Win32 physical mouse coordinates into
+  egui points. This keeps future HUD hit-testing aligned on high-DPI monitors.
 
 Acceptance for the spike:
 
