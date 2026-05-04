@@ -6,8 +6,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetWindowLongPtrW, IDC_ARROW,
     IsWindow, LoadCursorW, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW,
     SetWindowLongPtrW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
-    WM_KEYDOWN, WM_NCCREATE, WM_NCDESTROY, WNDCLASSW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
+    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -23,6 +25,37 @@ pub struct NativeVideoKeyEvent {
 #[derive(Clone, Copy, Debug)]
 pub enum NativeVideoWindowEvent {
     KeyDown(NativeVideoKeyEvent),
+    MouseMove(NativeVideoMouseEvent),
+    MouseButton(NativeVideoMouseButtonEvent),
+    MouseWheel(NativeVideoMouseWheelEvent),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeVideoMouseButton {
+    Left,
+    Right,
+    Middle,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NativeVideoMouseEvent {
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NativeVideoMouseButtonEvent {
+    pub button: NativeVideoMouseButton,
+    pub down: bool,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NativeVideoMouseWheelEvent {
+    pub delta: i16,
+    pub x: i32,
+    pub y: i32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -200,18 +233,41 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_KEYDOWN => {
-            if let Some(state) = window_state(hwnd) {
-                if let Some(tx) = &state.event_tx {
-                    let _ = tx.send(NativeVideoWindowEvent::KeyDown(native_key_event(
-                        wparam, lparam,
-                    )));
-                }
+            if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
+                let _ = tx.send(NativeVideoWindowEvent::KeyDown(native_key_event(
+                    wparam, lparam,
+                )));
             }
             if wparam.0 as u32 == 0x1B && window_state(hwnd).is_some_and(|s| s.close_on_escape) {
                 unsafe {
                     let _ = DestroyWindow(hwnd);
                 }
                 return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_MOUSEMOVE => {
+            if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
+                let _ = tx.send(NativeVideoWindowEvent::MouseMove(native_mouse_event(
+                    lparam,
+                )));
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
+        | WM_MBUTTONUP => {
+            if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
+                let _ = tx.send(NativeVideoWindowEvent::MouseButton(
+                    native_mouse_button_event(msg, lparam),
+                ));
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_MOUSEWHEEL => {
+            if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
+                let _ = tx.send(NativeVideoWindowEvent::MouseWheel(
+                    native_mouse_wheel_event(wparam, lparam),
+                ));
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -263,4 +319,41 @@ fn native_key_event(wparam: WPARAM, lparam: LPARAM) -> NativeVideoKeyEvent {
         alt,
         repeat: ((lparam.0 as u64) & (1 << 30)) != 0,
     }
+}
+
+fn native_mouse_event(lparam: LPARAM) -> NativeVideoMouseEvent {
+    NativeVideoMouseEvent {
+        x: signed_low_word(lparam.0),
+        y: signed_high_word(lparam.0),
+    }
+}
+
+fn native_mouse_button_event(msg: u32, lparam: LPARAM) -> NativeVideoMouseButtonEvent {
+    let button = match msg {
+        WM_RBUTTONDOWN | WM_RBUTTONUP => NativeVideoMouseButton::Right,
+        WM_MBUTTONDOWN | WM_MBUTTONUP => NativeVideoMouseButton::Middle,
+        _ => NativeVideoMouseButton::Left,
+    };
+    NativeVideoMouseButtonEvent {
+        button,
+        down: matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN),
+        x: signed_low_word(lparam.0),
+        y: signed_high_word(lparam.0),
+    }
+}
+
+fn native_mouse_wheel_event(wparam: WPARAM, lparam: LPARAM) -> NativeVideoMouseWheelEvent {
+    NativeVideoMouseWheelEvent {
+        delta: signed_high_word(wparam.0 as isize) as i16,
+        x: signed_low_word(lparam.0),
+        y: signed_high_word(lparam.0),
+    }
+}
+
+fn signed_low_word(value: isize) -> i32 {
+    ((value as u32 & 0xffff) as i16) as i32
+}
+
+fn signed_high_word(value: isize) -> i32 {
+    (((value as u32 >> 16) & 0xffff) as i16) as i32
 }

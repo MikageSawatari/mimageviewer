@@ -122,6 +122,10 @@ Current limitations of the experimental slice:
   A minimal native key bridge forwards core video shortcuts (Enter, W,
   Left/Right seek, Shift+Up/Down volume, M/L/P/S/B) back to the UI thread, but
   full file navigation and overlay hit-testing remain Phase C work.
+- Native mouse messages are now forwarded to the UI thread as Phase C
+  scaffolding. Mouse movement only wakes future HUD state, and left-click
+  toggles play/pause when VST3 GUI windows are not visible; full overlay
+  hit-testing and seek-bar interaction remain Phase C work.
 - GPU frames are copied directly to the presenter backbuffer, so this slice is
   intended for same-size smoke tests such as the 1080p120 sync clip until
   scaling/letterboxing is added

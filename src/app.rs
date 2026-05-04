@@ -130,6 +130,15 @@ impl PlayTestState {
     }
 }
 
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct NativeVideoPointerDown {
+    fs_idx: usize,
+    x: i32,
+    y: i32,
+    at: std::time::Instant,
+}
+
 pub(crate) struct UpdateCheckPending {
     pub(crate) rx: mpsc::Receiver<Result<crate::update_check::UpdateInfo, String>>,
     pub(crate) manual: bool,
@@ -2414,6 +2423,10 @@ pub struct App {
     /// Native fullscreen presenter の HWND を最後に VST bridge owner として同期した値。
     /// set_chain_owner は cross-process IPC なので、毎フレーム送らないための guard。
     pub(crate) native_video_owner_synced_hwnd: u64,
+    #[cfg(windows)]
+    /// Native fullscreen presenter 上の左クリック候補。overlay hit-test が入るまでの
+    /// 暫定 transport 操作用で、drag と click を release 時に分ける。
+    native_video_pointer_down: Option<NativeVideoPointerDown>,
     /// 共有プレースメントスロット。UI スレッドが hide 時にセット、トレイスレッドが
     /// show 時に take して `SetWindowPlacement` する。トレイスレッドから Win32 を直接
     /// 叩けるようにすることで、復帰時の黒フラッシュ / サイズジャンプを防ぐ。
@@ -2935,6 +2948,8 @@ impl Default for App {
             main_hwnd: None,
             #[cfg(windows)]
             native_video_owner_synced_hwnd: 0,
+            #[cfg(windows)]
+            native_video_pointer_down: None,
             placement_slot: None,
             activation_listener: None,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
@@ -10882,6 +10897,7 @@ impl App {
         #[cfg(windows)]
         {
             self.vst3_deferred_video_open = None;
+            self.native_video_pointer_down = None;
         }
         #[cfg(windows)]
         if self.show_vst3_manager || self.settings.vst3_gui_visible {
@@ -13064,7 +13080,29 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
             return;
         }
-        let crate::video::native_window::NativeVideoWindowEvent::KeyDown(key) = event;
+        match event {
+            crate::video::native_window::NativeVideoWindowEvent::KeyDown(key) => {
+                self.handle_native_video_key_event(ctx, fs_idx, key);
+            }
+            crate::video::native_window::NativeVideoWindowEvent::MouseMove(_) => {
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::native_window::NativeVideoWindowEvent::MouseButton(button) => {
+                self.handle_native_video_mouse_button(ctx, fs_idx, button);
+            }
+            crate::video::native_window::NativeVideoWindowEvent::MouseWheel(_) => {
+                self.mark_native_video_hud_activity(ctx);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_key_event(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        key: crate::video::native_window::NativeVideoKeyEvent,
+    ) {
         if key.alt {
             return;
         }
@@ -13181,9 +13219,57 @@ impl App {
             }
         }
         if hud_activity {
-            self.video_hud_last_activity = Some(std::time::Instant::now());
-            ctx.request_repaint();
+            self.mark_native_video_hud_activity(ctx);
         }
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_mouse_button(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        event: crate::video::native_window::NativeVideoMouseButtonEvent,
+    ) {
+        use crate::video::native_window::NativeVideoMouseButton;
+
+        self.mark_native_video_hud_activity(ctx);
+        if event.button != NativeVideoMouseButton::Left {
+            return;
+        }
+
+        if event.down {
+            self.native_video_pointer_down = Some(NativeVideoPointerDown {
+                fs_idx,
+                x: event.x,
+                y: event.y,
+                at: std::time::Instant::now(),
+            });
+            return;
+        }
+
+        let Some(start) = self.native_video_pointer_down.take() else {
+            return;
+        };
+        if start.fs_idx != fs_idx {
+            return;
+        }
+        let dx = event.x - start.x;
+        let dy = event.y - start.y;
+        let moved_sq = dx.saturating_mul(dx) + dy.saturating_mul(dy);
+        let click_like =
+            moved_sq <= 36 && start.at.elapsed() <= std::time::Duration::from_millis(500);
+        if !click_like || self.settings.vst3_gui_visible {
+            return;
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.toggle_play();
+        }
+    }
+
+    #[cfg(windows)]
+    fn mark_native_video_hud_activity(&mut self, ctx: &egui::Context) {
+        self.video_hud_last_activity = Some(std::time::Instant::now());
+        ctx.request_repaint();
     }
 
     // -------------------------------------------------------------------
