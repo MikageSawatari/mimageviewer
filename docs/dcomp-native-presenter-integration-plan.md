@@ -154,6 +154,15 @@ video and overlay composition inside the same visual tree. Transparent overlay
 HWND experiments are still useful as a fallback, but they carry more Z-order and
 airspace risk.
 
+Status:
+
+- 2026-05-04: the native presenter can optionally create a second premultiplied
+  DComp visual backed by its own DXGI composition swap chain when
+  `MIV_NATIVE_VIDEO_TEST_OVERLAY=1` is set. The overlay currently draws only a
+  static translucent test marker and is intentionally not wired to egui yet; its
+  purpose is to verify DComp layering and alpha composition while keeping the
+  120fps video visual independent.
+
 The first production slice can accept a 60Hz overlay cadence as long as video
 presentation remains independent at 120fps.
 

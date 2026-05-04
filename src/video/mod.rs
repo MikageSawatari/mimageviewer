@@ -311,6 +311,7 @@ fn run_native_video_output(
             hwnd: window.hwnd(),
             width,
             height,
+            test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
         },
     )?;
     crate::logger::log(format!(

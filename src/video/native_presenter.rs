@@ -1,21 +1,25 @@
 use std::time::Instant;
 
 use serde_json::Value;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, RECT, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
     D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11Device5, ID3D11DeviceContext,
-    ID3D11DeviceContext4, ID3D11Fence, ID3D11RenderTargetView, ID3D11Resource, ID3D11Texture2D,
+    ID3D11DeviceContext1, ID3D11DeviceContext4, ID3D11Fence, ID3D11RenderTargetView,
+    ID3D11Resource, ID3D11Texture2D, ID3D11View,
 };
-use windows::Win32::Graphics::DirectComposition::{DCompositionCreateDevice, IDCompositionDevice};
+use windows::Win32::Graphics::DirectComposition::{
+    DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
+};
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM,
+    DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
-    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
     DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGIOutput, IDXGISwapChain1,
     IDXGISwapChain2,
@@ -29,6 +33,7 @@ pub struct NativePresenterConfig {
     pub hwnd: HWND,
     pub width: u32,
     pub height: u32,
+    pub test_overlay: bool,
 }
 
 pub struct NativeVideoPresenter {
@@ -37,9 +42,24 @@ pub struct NativeVideoPresenter {
     d3d_device1: ID3D11Device1,
     d3d_device5: ID3D11Device5,
     d3d_context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    d3d_context1: ID3D11DeviceContext1,
     d3d_context4: ID3D11DeviceContext4,
+    _dcomp_device: IDCompositionDevice,
+    _dcomp_target: IDCompositionTarget,
+    _root_visual: IDCompositionVisual,
+    _video_visual: IDCompositionVisual,
     backbuffer: Option<ID3D11Texture2D>,
+    test_overlay: Option<NativeTestOverlay>,
     fence_cache: Option<(u64, isize, ID3D11Fence)>,
+    width: u32,
+    height: u32,
+}
+
+struct NativeTestOverlay {
+    swap_chain: IDXGISwapChain1,
+    _visual: IDCompositionVisual,
+    backbuffer: Option<ID3D11Texture2D>,
+    render_target: Option<ID3D11RenderTargetView>,
     width: u32,
     height: u32,
 }
@@ -97,6 +117,9 @@ impl NativeVideoPresenter {
             let d3d_context4: ID3D11DeviceContext4 = d3d_context
                 .cast()
                 .map_err(|e| format!("cast ID3D11DeviceContext4: {e:?}"))?;
+            let d3d_context1: ID3D11DeviceContext1 = d3d_context
+                .cast()
+                .map_err(|e| format!("cast ID3D11DeviceContext1: {e:?}"))?;
             let dxgi_device: IDXGIDevice = d3d_device
                 .cast()
                 .map_err(|e| format!("cast IDXGIDevice: {e:?}"))?;
@@ -138,14 +161,38 @@ impl NativeVideoPresenter {
             let target = dcomp_device
                 .CreateTargetForHwnd(config.hwnd, true)
                 .map_err(|e| format!("CreateTargetForHwnd: {e:?}"))?;
-            let visual = dcomp_device
+            let root_visual = dcomp_device
                 .CreateVisual()
-                .map_err(|e| format!("CreateVisual: {e:?}"))?;
-            visual
+                .map_err(|e| format!("CreateVisual root: {e:?}"))?;
+            let video_visual = dcomp_device
+                .CreateVisual()
+                .map_err(|e| format!("CreateVisual video: {e:?}"))?;
+            video_visual
                 .SetContent(&swap_chain)
-                .map_err(|e| format!("IDCompositionVisual::SetContent: {e:?}"))?;
+                .map_err(|e| format!("IDCompositionVisual::SetContent video: {e:?}"))?;
+            root_visual
+                .AddVisual(&video_visual, false, None::<&IDCompositionVisual>)
+                .map_err(|e| format!("IDCompositionVisual::AddVisual video: {e:?}"))?;
+            let test_overlay = if config.test_overlay {
+                let overlay = NativeTestOverlay::new(
+                    &factory,
+                    &d3d_device,
+                    &d3d_device1,
+                    &d3d_context,
+                    &d3d_context1,
+                    &dcomp_device,
+                    config.width,
+                    config.height,
+                )?;
+                root_visual
+                    .AddVisual(&overlay._visual, true, &video_visual)
+                    .map_err(|e| format!("IDCompositionVisual::AddVisual overlay: {e:?}"))?;
+                Some(overlay)
+            } else {
+                None
+            };
             target
-                .SetRoot(&visual)
+                .SetRoot(&root_visual)
                 .map_err(|e| format!("IDCompositionTarget::SetRoot: {e:?}"))?;
             dcomp_device
                 .Commit()
@@ -157,8 +204,14 @@ impl NativeVideoPresenter {
                 d3d_device1,
                 d3d_device5,
                 d3d_context,
+                d3d_context1,
                 d3d_context4,
+                _dcomp_device: dcomp_device,
+                _dcomp_target: target,
+                _root_visual: root_visual,
+                _video_visual: video_visual,
                 backbuffer: None,
+                test_overlay,
                 fence_cache: None,
                 width: config.width,
                 height: config.height,
@@ -171,6 +224,7 @@ impl NativeVideoPresenter {
                     ("height", Value::from(config.height as i64)),
                     ("buffer_count", Value::from(3)),
                     ("latency", Value::from(1)),
+                    ("test_overlay", Value::from(config.test_overlay)),
                 ],
             );
             Ok(this)
@@ -198,6 +252,15 @@ impl NativeVideoPresenter {
         self.width = width;
         self.height = height;
         self.recreate_backbuffer(false)?;
+        if let Some(overlay) = self.test_overlay.as_mut() {
+            overlay.resize(
+                &self.d3d_device1,
+                &self.d3d_context,
+                &self.d3d_context1,
+                width,
+                height,
+            )?;
+        }
         log_event(
             "resize",
             &[
@@ -338,6 +401,172 @@ impl NativeVideoPresenter {
             }
         }
         self.backbuffer = Some(backbuffer);
+        Ok(())
+    }
+}
+
+impl NativeTestOverlay {
+    fn new(
+        factory: &IDXGIFactory2,
+        d3d_device: &ID3D11Device,
+        d3d_device1: &ID3D11Device1,
+        d3d_context: &ID3D11DeviceContext,
+        d3d_context1: &ID3D11DeviceContext1,
+        dcomp_device: &IDCompositionDevice,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, String> {
+        let desc = DXGI_SWAP_CHAIN_DESC1 {
+            Width: width.max(1),
+            Height: height.max(1),
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Stereo: false.into(),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 2,
+            Scaling: DXGI_SCALING_STRETCH,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
+            Flags: 0,
+        };
+        let swap_chain = unsafe {
+            factory
+                .CreateSwapChainForComposition(d3d_device, &desc, None::<&IDXGIOutput>)
+                .map_err(|e| format!("CreateSwapChainForComposition overlay: {e:?}"))?
+        };
+        let visual = unsafe {
+            let visual = dcomp_device
+                .CreateVisual()
+                .map_err(|e| format!("CreateVisual overlay: {e:?}"))?;
+            visual
+                .SetContent(&swap_chain)
+                .map_err(|e| format!("IDCompositionVisual::SetContent overlay: {e:?}"))?;
+            visual
+        };
+        let mut this = Self {
+            swap_chain,
+            _visual: visual,
+            backbuffer: None,
+            render_target: None,
+            width: width.max(1),
+            height: height.max(1),
+        };
+        this.recreate_backbuffer(d3d_device1, d3d_context)?;
+        this.draw_test_pattern(d3d_context, d3d_context1)?;
+        log_event(
+            "overlay_init",
+            &[
+                ("width", Value::from(this.width as i64)),
+                ("height", Value::from(this.height as i64)),
+                ("alpha_mode", Value::from("premultiplied")),
+            ],
+        );
+        Ok(this)
+    }
+
+    fn resize(
+        &mut self,
+        d3d_device1: &ID3D11Device1,
+        d3d_context: &ID3D11DeviceContext,
+        d3d_context1: &ID3D11DeviceContext1,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        let width = width.max(1);
+        let height = height.max(1);
+        if self.width == width && self.height == height {
+            return Ok(());
+        }
+        self.render_target = None;
+        self.backbuffer = None;
+        unsafe {
+            self.swap_chain
+                .ResizeBuffers(
+                    0,
+                    width,
+                    height,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_SWAP_CHAIN_FLAG(0),
+                )
+                .map_err(|e| format!("overlay IDXGISwapChain::ResizeBuffers: {e:?}"))?;
+        }
+        self.width = width;
+        self.height = height;
+        self.recreate_backbuffer(d3d_device1, d3d_context)?;
+        self.draw_test_pattern(d3d_context, d3d_context1)?;
+        Ok(())
+    }
+
+    fn recreate_backbuffer(
+        &mut self,
+        d3d_device1: &ID3D11Device1,
+        d3d_context: &ID3D11DeviceContext,
+    ) -> Result<(), String> {
+        let backbuffer: ID3D11Texture2D = unsafe {
+            self.swap_chain
+                .GetBuffer(0)
+                .map_err(|e| format!("overlay IDXGISwapChain::GetBuffer: {e:?}"))?
+        };
+        let mut render_target = None;
+        unsafe {
+            d3d_device1
+                .CreateRenderTargetView(&backbuffer, None, Some(&mut render_target))
+                .map_err(|e| format!("overlay CreateRenderTargetView: {e:?}"))?;
+        }
+        let render_target: ID3D11RenderTargetView = render_target
+            .ok_or_else(|| "overlay CreateRenderTargetView returned null".to_string())?;
+        unsafe {
+            d3d_context.ClearRenderTargetView(&render_target, &[0.0, 0.0, 0.0, 0.0]);
+        }
+        self.backbuffer = Some(backbuffer);
+        self.render_target = Some(render_target);
+        Ok(())
+    }
+
+    fn draw_test_pattern(
+        &mut self,
+        d3d_context: &ID3D11DeviceContext,
+        d3d_context1: &ID3D11DeviceContext1,
+    ) -> Result<(), String> {
+        let render_target = self
+            .render_target
+            .as_ref()
+            .ok_or_else(|| "overlay render target is not initialized".to_string())?;
+        unsafe {
+            d3d_context.ClearRenderTargetView(render_target, &[0.0, 0.0, 0.0, 0.0]);
+            let view: ID3D11View = render_target
+                .cast()
+                .map_err(|e| format!("cast overlay RTV to view: {e:?}"))?;
+            let bar = RECT {
+                left: 32,
+                top: 32,
+                right: (self.width as i32).min(360).max(33),
+                bottom: (self.height as i32).min(92).max(33),
+            };
+            let badge = RECT {
+                left: 44,
+                top: 44,
+                right: (self.width as i32).min(84).max(45),
+                bottom: (self.height as i32).min(80).max(45),
+            };
+            // Premultiplied colors: RGB components are intentionally <= alpha.
+            d3d_context1.ClearView(&view, &[0.0, 0.09, 0.04, 0.34], Some(&[bar]));
+            d3d_context1.ClearView(&view, &[0.0, 0.24, 0.10, 0.52], Some(&[badge]));
+            self.swap_chain
+                .Present(1, Default::default())
+                .ok()
+                .map_err(|e| format!("overlay IDXGISwapChain::Present: {e:?}"))?;
+        }
+        log_event(
+            "overlay_present",
+            &[
+                ("width", Value::from(self.width as i64)),
+                ("height", Value::from(self.height as i64)),
+            ],
+        );
         Ok(())
     }
 }
