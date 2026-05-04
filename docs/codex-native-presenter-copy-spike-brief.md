@@ -22,6 +22,12 @@ startup noise, rare driver stalls, or a sustained production-path problem.
 - `native_copy_max_ms`
 - `native_fence_max_ms`
 
+The raw `fullscreen_present` events also split the aggregate `copy_ms` into:
+
+- `open_shared_ms` (`OpenSharedResource1`)
+- `keyed_mutex_ms` (`AcquireSync(1)`)
+- `copy_call_ms` (`UpdateSubresource` or `CopySubresourceRegion`)
+
 By default the app logs slow presents and roughly one present per second. For a
 full per-present distribution, run with:
 
@@ -71,6 +77,8 @@ Optionally repeat with the egui overlay enabled:
   JSONL and classified as startup-only, rare isolated, or sustained.
 - If a copy spike coincides with a high `native_fence_max_ms`, treat it as a
   producer/fence wait issue before investigating the copy itself.
+- If `native_fence_max_ms` is low, inspect the spike row's `open_shared_ms`,
+  `keyed_mutex_ms`, and `copy_call_ms` fields to identify the blocking API.
 
 ## Follow-Up
 

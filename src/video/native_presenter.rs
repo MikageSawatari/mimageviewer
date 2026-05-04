@@ -107,6 +107,9 @@ pub struct NativePresentOutcome {
     pub wait_ms: f64,
     pub wait_timed_out: bool,
     pub fence_wait_ms: f64,
+    pub open_shared_ms: f64,
+    pub keyed_mutex_ms: f64,
+    pub copy_call_ms: f64,
     pub copy_ms: f64,
     pub present_ms: f64,
 }
@@ -428,6 +431,9 @@ impl NativeVideoPresenter {
 
         let copy_t0 = Instant::now();
         let mut fence_wait_ms = 0.0;
+        let mut open_shared_ms = 0.0;
+        let mut keyed_mutex_ms = 0.0;
+        let copy_call_ms;
         let path = match &frame.data {
             VideoFrameData::Cpu(bytes) => {
                 self.ensure_video_surface_size(frame.width, frame.height)?;
@@ -436,6 +442,7 @@ impl NativeVideoPresenter {
                     .as_ref()
                     .ok_or_else(|| "native presenter backbuffer is not initialized".to_string())?;
                 unsafe {
+                    let copy_call_t0 = Instant::now();
                     self.d3d_context.UpdateSubresource(
                         backbuffer,
                         0,
@@ -444,6 +451,7 @@ impl NativeVideoPresenter {
                         frame.width.saturating_mul(4),
                         0,
                     );
+                    copy_call_ms = copy_call_t0.elapsed().as_secs_f64() * 1000.0;
                 }
                 "cpu_upload"
             }
@@ -464,12 +472,16 @@ impl NativeVideoPresenter {
                         .map_err(|e| format!("D3D11 fence wait: {e:?}"))?;
                 }
                 fence_wait_ms = fence_t0.elapsed().as_secs_f64() * 1000.0;
+                let open_shared_t0 = Instant::now();
                 let src: ID3D11Texture2D = unsafe {
                     self.d3d_device1
                         .OpenSharedResource1(gpu_frame.shared_handle)
                         .map_err(|e| format!("OpenSharedResource1 frame texture: {e:?}"))?
                 };
+                open_shared_ms = open_shared_t0.elapsed().as_secs_f64() * 1000.0;
+                let keyed_mutex_t0 = Instant::now();
                 let _keyed_mutex = self.acquire_source_keyed_mutex(&src)?;
+                keyed_mutex_ms = keyed_mutex_t0.elapsed().as_secs_f64() * 1000.0;
                 let src_probe = if probe_this_frame {
                     Some(self.sample_texture_pixel(&src, "source")?)
                 } else {
@@ -497,6 +509,7 @@ impl NativeVideoPresenter {
                         bottom: gpu_frame.height,
                         back: 1,
                     };
+                    let copy_call_t0 = Instant::now();
                     self.d3d_context.CopySubresourceRegion(
                         &dst_res,
                         0,
@@ -507,6 +520,7 @@ impl NativeVideoPresenter {
                         0,
                         Some(&copy_box),
                     );
+                    copy_call_ms = copy_call_t0.elapsed().as_secs_f64() * 1000.0;
                     if probe_this_frame {
                         let backbuffer_probe =
                             self.sample_texture_pixel(&backbuffer, "backbuffer")?;
@@ -534,6 +548,9 @@ impl NativeVideoPresenter {
             wait_ms,
             wait_timed_out: timed_out,
             fence_wait_ms,
+            open_shared_ms,
+            keyed_mutex_ms,
+            copy_call_ms,
             copy_ms,
             present_ms,
         })

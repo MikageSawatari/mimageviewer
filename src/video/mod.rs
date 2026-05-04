@@ -596,6 +596,18 @@ fn run_native_video_output(
                                         "fence_wait_ms",
                                         serde_json::Value::from(outcome.fence_wait_ms),
                                     ),
+                                    (
+                                        "open_shared_ms",
+                                        serde_json::Value::from(outcome.open_shared_ms),
+                                    ),
+                                    (
+                                        "keyed_mutex_ms",
+                                        serde_json::Value::from(outcome.keyed_mutex_ms),
+                                    ),
+                                    (
+                                        "copy_call_ms",
+                                        serde_json::Value::from(outcome.copy_call_ms),
+                                    ),
                                     ("copy_ms", serde_json::Value::from(outcome.copy_ms)),
                                     ("present_ms", serde_json::Value::from(outcome.present_ms)),
                                     ("total_ms", serde_json::Value::from(total_ms)),
