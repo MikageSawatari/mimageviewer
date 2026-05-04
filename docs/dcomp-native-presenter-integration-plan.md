@@ -162,6 +162,11 @@ Status:
   static translucent test marker and is intentionally not wired to egui yet; its
   purpose is to verify DComp layering and alpha composition while keeping the
   120fps video visual independent.
+- 2026-05-04: the next overlay technical choice is documented in
+  `dcomp-overlay-egui-technical-brief.md`. The preferred spike is a wgpu DX12
+  surface created from `SurfaceTargetUnsafe::CompositionVisual`, so egui-wgpu can
+  render to the second DComp visual without introducing a transparent overlay
+  HWND.
 
 The first production slice can accept a 60Hz overlay cadence as long as video
 presentation remains independent at 120fps.
