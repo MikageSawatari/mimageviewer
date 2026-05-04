@@ -85,7 +85,7 @@ pub struct VideoPlayer {
     /// 表示したフレーム数の累積カウンタ。tick で latest_renderable を採用するたびに
     /// +1。GPU/CPU 両経路で更新するので、UI 側の perf overlay が経路に依存せず
     /// 「新フレーム到着」を検知できる (Phase 8.I 修正)。
-    displayed_frame_seq: AtomicU64,
+    displayed_frame_seq: Arc<AtomicU64>,
     /// decoder の video_tx try_send が Full で送信できず捨てた累積数。
     /// decoder thread と共有し、perf overlay では UI 側 dropped_past と色分けする。
     decoder_dropped_full_count: Arc<AtomicU64>,
@@ -125,6 +125,8 @@ pub struct VideoPlayer {
     /// 描画している期間は HANDLE が valid であることを保証する)。
     #[cfg(windows)]
     gpu_latest: Option<crate::video::gpu_renderer::D3d11Frame>,
+    #[cfg(windows)]
+    native_output: Option<NativeVideoOutput>,
 }
 
 /// `VideoPlayer::gpu_latest_info()` が返す view-only 情報。Copy なので
@@ -151,6 +153,273 @@ pub struct GpuLatestFrame {
 // HANDLE は thread を渡って良い (D3d11Frame と同様の論理)。
 #[cfg(windows)]
 unsafe impl Send for GpuLatestFrame {}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+pub struct NativeVideoOutputConfig {
+    pub rect: windows::Win32::Foundation::RECT,
+    pub sync_interval: u32,
+}
+
+#[cfg(windows)]
+struct NativeVideoOutput {
+    cancel: Arc<AtomicBool>,
+    hwnd: Arc<AtomicU64>,
+    closed: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(windows)]
+impl NativeVideoOutput {
+    fn spawn(
+        video_rx: crossbeam_channel::Receiver<VideoFrame>,
+        clock: Arc<AvClock>,
+        engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
+        displayed_frame_seq: Arc<AtomicU64>,
+        config: NativeVideoOutputConfig,
+    ) -> Option<Self> {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let hwnd = Arc::new(AtomicU64::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        let thread_cancel = Arc::clone(&cancel);
+        let thread_hwnd = Arc::clone(&hwnd);
+        let thread_closed = Arc::clone(&closed);
+        let thread = match std::thread::Builder::new()
+            .name("native-video-presenter".into())
+            .spawn(move || {
+                if let Err(err) = run_native_video_output(
+                    video_rx,
+                    clock,
+                    engine_event_tx,
+                    displayed_frame_seq,
+                    config,
+                    thread_cancel,
+                    thread_hwnd,
+                    thread_closed,
+                ) {
+                    crate::logger::log(format!("[native-video] presenter stopped: {err}"));
+                }
+            }) {
+            Ok(thread) => thread,
+            Err(err) => {
+                crate::logger::log(format!("[native-video] failed to spawn presenter: {err}"));
+                return None;
+            }
+        };
+        Some(Self {
+            cancel,
+            hwnd,
+            closed,
+            thread: Some(thread),
+        })
+    }
+
+    fn hwnd(&self) -> u64 {
+        self.hwnd.load(Ordering::Acquire)
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NativeVideoOutput {
+    fn drop(&mut self) {
+        self.cancel.store(true, Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+#[cfg(windows)]
+struct NativeComApartment;
+
+#[cfg(windows)]
+impl NativeComApartment {
+    fn init() -> Result<Self, String> {
+        unsafe {
+            windows::Win32::System::Com::CoInitializeEx(
+                None,
+                windows::Win32::System::Com::COINIT_MULTITHREADED,
+            )
+            .ok()
+            .map_err(|e| format!("CoInitializeEx: {e:?}"))?;
+        }
+        Ok(Self)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for NativeComApartment {
+    fn drop(&mut self) {
+        unsafe {
+            windows::Win32::System::Com::CoUninitialize();
+        }
+    }
+}
+
+#[cfg(windows)]
+fn run_native_video_output(
+    video_rx: crossbeam_channel::Receiver<VideoFrame>,
+    clock: Arc<AvClock>,
+    engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
+    displayed_frame_seq: Arc<AtomicU64>,
+    config: NativeVideoOutputConfig,
+    cancel: Arc<AtomicBool>,
+    hwnd_out: Arc<AtomicU64>,
+    closed: Arc<AtomicBool>,
+) -> Result<(), String> {
+    use std::collections::VecDeque;
+    use std::time::{Duration, Instant};
+
+    let _com = NativeComApartment::init()?;
+    let width = (config.rect.right - config.rect.left).max(1) as u32;
+    let height = (config.rect.bottom - config.rect.top).max(1) as u32;
+    let mut window = crate::video::native_window::NativeVideoWindow::create(
+        crate::video::native_window::NativeVideoWindowConfig {
+            mode: crate::video::native_window::NativeVideoWindowMode::Borderless {
+                rect: config.rect,
+            },
+            close_on_escape: true,
+            // This HWND lives on the presenter thread, so WM_QUIT only exits
+            // this loop and does not affect eframe's main event loop.
+            post_quit_on_destroy: true,
+        },
+    )?;
+    hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
+    let mut presenter = crate::video::native_presenter::NativeVideoPresenter::new(
+        crate::video::native_presenter::NativePresenterConfig {
+            hwnd: window.hwnd(),
+            width,
+            height,
+        },
+    )?;
+    crate::logger::log(format!(
+        "[native-video] fullscreen presenter started hwnd=0x{:x} rect=({},{} {}x{}) sync_interval={}",
+        window.hwnd().0 as usize,
+        config.rect.left,
+        config.rect.top,
+        width,
+        height,
+        config.sync_interval
+    ));
+
+    let mut queue: VecDeque<VideoFrame> = VecDeque::new();
+    let mut last_seen_serial = clock.current_seek_serial();
+    let mut first_frame_event_last_epoch: Option<u64> = None;
+    let mut last_present_log = Instant::now();
+    while !cancel.load(Ordering::Acquire) {
+        if crate::video::native_window::pump_thread_messages() {
+            closed.store(true, Ordering::Release);
+            break;
+        }
+
+        let clock_serial = clock.current_seek_serial();
+        if clock_serial != last_seen_serial {
+            queue.clear();
+            last_seen_serial = clock_serial;
+            first_frame_event_last_epoch = None;
+        }
+        while let Ok(frame) = video_rx.try_recv() {
+            if frame.seek_serial < clock_serial {
+                continue;
+            }
+            if frame.seek_serial > last_seen_serial {
+                queue.clear();
+                last_seen_serial = frame.seek_serial;
+                first_frame_event_last_epoch = None;
+            }
+            queue.push_back(frame);
+        }
+
+        if !clock.is_playing() {
+            std::thread::sleep(Duration::from_millis(8));
+            continue;
+        }
+
+        let now = clock.now_secs();
+        let mut latest_renderable: Option<VideoFrame> = None;
+        while let Some(front) = queue.front() {
+            if front.seek_serial < clock.current_seek_serial() {
+                queue.pop_front();
+                continue;
+            }
+            if front.pts_secs <= now + clock::DISPLAY_LEAD_TOLERANCE_SECS {
+                latest_renderable = queue.pop_front();
+                continue;
+            }
+            break;
+        }
+
+        if let Some(frame) = latest_renderable {
+            let pts = frame.pts_secs;
+            let serial = frame.seek_serial;
+            let present_t0 = Instant::now();
+            match presenter.present(&frame, config.sync_interval) {
+                Ok(outcome) => {
+                    displayed_frame_seq.fetch_add(1, Ordering::Release);
+                    if first_frame_event_last_epoch != Some(serial) {
+                        first_frame_event_last_epoch = Some(serial);
+                        let _ = engine_event_tx.try_send(EngineEvent::Decoder(
+                            engine::state::DecoderEvent::FirstFrameReady { epoch: serial, pts },
+                        ));
+                    }
+                    let now_for_clear = clock.now_secs();
+                    if clock::pts_clears_seek_override(pts, now_for_clear)
+                        && !clock.is_audio_active()
+                    {
+                        clock.set_fallback_anchor(pts);
+                        clock.clear_seek_target_override(serial);
+                    }
+                    if crate::perf::is_enabled() {
+                        let total_ms = present_t0.elapsed().as_secs_f64() * 1000.0;
+                        if total_ms > 4.0 || last_present_log.elapsed() > Duration::from_secs(1) {
+                            last_present_log = Instant::now();
+                            crate::perf::event(
+                                "native_presenter",
+                                "fullscreen_present",
+                                None,
+                                0,
+                                &[
+                                    ("pts", serde_json::Value::from(pts)),
+                                    ("queue_len", serde_json::Value::from(queue.len() as i64)),
+                                    ("path", serde_json::Value::from(outcome.path)),
+                                    ("wait_ms", serde_json::Value::from(outcome.wait_ms)),
+                                    (
+                                        "fence_wait_ms",
+                                        serde_json::Value::from(outcome.fence_wait_ms),
+                                    ),
+                                    ("copy_ms", serde_json::Value::from(outcome.copy_ms)),
+                                    ("present_ms", serde_json::Value::from(outcome.present_ms)),
+                                    ("total_ms", serde_json::Value::from(total_ms)),
+                                ],
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    crate::logger::log(format!("[native-video] present failed: {err}"));
+                    std::thread::sleep(Duration::from_millis(16));
+                }
+            }
+        } else {
+            let wait_ms = queue
+                .front()
+                .map(|front| ((front.pts_secs - now) * 500.0).clamp(1.0, 8.0) as u64)
+                .unwrap_or(1);
+            std::thread::sleep(Duration::from_millis(wait_ms));
+        }
+    }
+
+    hwnd_out.store(0, Ordering::Release);
+    window.destroy();
+    closed.store(true, Ordering::Release);
+    crate::logger::log("[native-video] fullscreen presenter stopped".to_string());
+    Ok(())
+}
+
 #[cfg(windows)]
 unsafe impl Sync for GpuLatestFrame {}
 
@@ -191,6 +460,7 @@ impl VideoPlayer {
             std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
         >,
         #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
+        #[cfg(windows)] native_output_config: Option<NativeVideoOutputConfig>,
     ) -> Self {
         // FFmpeg DLL ロード (1 回目のみ実時間の I/O。以降は OnceLock で即返り)
         if let Err(e) = ffmpeg_loader::init() {
@@ -222,7 +492,7 @@ impl VideoPlayer {
                 engine_event_rx,
                 info_event_emitted: false,
                 first_frame_event_last_epoch: None,
-                displayed_frame_seq: AtomicU64::new(0),
+                displayed_frame_seq: Arc::new(AtomicU64::new(0)),
                 decoder_dropped_full_count: Arc::new(AtomicU64::new(0)),
                 ui_dropped_past_count: AtomicU64::new(0),
                 cancel: Arc::new(AtomicBool::new(true)),
@@ -239,6 +509,8 @@ impl VideoPlayer {
                 seek_inflight_since: None,
                 #[cfg(windows)]
                 gpu_latest: None,
+                #[cfg(windows)]
+                native_output: None,
             };
         }
 
@@ -310,6 +582,8 @@ impl VideoPlayer {
             audio_rx,
             info_rx,
         } = decode;
+        #[cfg(windows)]
+        let native_video_rx = video_rx.clone();
         let audio = match audio::start(
             audio_rx,
             clock.clone(),
@@ -331,6 +605,17 @@ impl VideoPlayer {
 
         // シーク先サムネ抽出ワーカー (失敗してもメイン再生は続行)
         let thumb_worker = Some(ThumbnailWorker::spawn(path.clone()));
+        let displayed_frame_seq = Arc::new(AtomicU64::new(0));
+        #[cfg(windows)]
+        let native_output = native_output_config.and_then(|config| {
+            NativeVideoOutput::spawn(
+                native_video_rx,
+                Arc::clone(&clock),
+                engine_event_tx.clone(),
+                Arc::clone(&displayed_frame_seq),
+                config,
+            )
+        });
 
         Self {
             path,
@@ -341,7 +626,7 @@ impl VideoPlayer {
             engine_event_rx,
             info_event_emitted: false,
             first_frame_event_last_epoch: None,
-            displayed_frame_seq: AtomicU64::new(0),
+            displayed_frame_seq,
             decoder_dropped_full_count,
             ui_dropped_past_count: AtomicU64::new(0),
             cancel,
@@ -362,6 +647,8 @@ impl VideoPlayer {
             seek_inflight_since: None,
             #[cfg(windows)]
             gpu_latest: None,
+            #[cfg(windows)]
+            native_output,
         }
     }
 
@@ -580,6 +867,22 @@ impl VideoPlayer {
             .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
+    #[cfg(windows)]
+    pub fn native_presenter_hwnd(&self) -> u64 {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::hwnd)
+            .unwrap_or(0)
+    }
+
+    #[cfg(windows)]
+    pub fn native_presenter_closed(&self) -> bool {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::is_closed)
+            .unwrap_or(false)
+    }
+
     /// UI スレッドが毎フレーム呼ぶ。新しい info / video frame があれば反映する。
     /// 戻り値は次回再描画推奨時刻 (秒) — `ctx.request_repaint_after` に渡す目安。
     pub fn tick(&mut self, ctx: &egui::Context) -> Option<std::time::Duration> {
@@ -658,6 +961,15 @@ impl VideoPlayer {
 
         // クロックの今時刻
         let now = self.clock.now_secs();
+
+        #[cfg(windows)]
+        if self.native_output.is_some() {
+            return if self.is_playing() || self.clock.is_seeking() {
+                Some(std::time::Duration::from_millis(16))
+            } else {
+                None
+            };
+        }
 
         // ── 動画フレーム取得・表示判定 ──
         //

@@ -108,6 +108,22 @@ Status:
   integration can destroy the native video HWND without accidentally terminating
   the eframe app loop. `NativeVideoPresenter::resize()` was also added as the
   swap-chain side of future `WM_SIZE` / DPI handling.
+- 2026-05-04: an experimental production slice was added behind
+  `MIV_NATIVE_VIDEO_PRESENTER=1`. It keeps the existing `VideoPlayer` decoder,
+  audio, VST3, and clock paths, but clones the video frame receiver into a
+  dedicated native presenter thread with its own borderless HWND. VST editor
+  owner sync is guarded so the bridge receives `set_chain_owner` only when the
+  native HWND changes.
+
+Current limitations of the experimental slice:
+
+- no egui overlay/input routing on the native HWND yet; it is video-only
+- Escape closes the native video HWND and then the existing fullscreen state
+- GPU frames are copied directly to the presenter backbuffer, so this slice is
+  intended for same-size smoke tests such as the 1080p120 sync clip until
+  scaling/letterboxing is added
+- it remains opt-in via environment variable and the egui fullscreen path is
+  still the default
 
 ## Phase C: Overlay Strategy
 

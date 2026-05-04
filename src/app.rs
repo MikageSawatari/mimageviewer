@@ -2410,6 +2410,10 @@ pub struct App {
     /// `ViewportCommand::Visible(false)` を使うと eframe が update を呼ばなくなり
     /// トレイメニューから復帰できなくなるため、Win32 直叩きに切り替えた。
     pub(crate) main_hwnd: Option<isize>,
+    #[cfg(windows)]
+    /// Native fullscreen presenter の HWND を最後に VST bridge owner として同期した値。
+    /// set_chain_owner は cross-process IPC なので、毎フレーム送らないための guard。
+    pub(crate) native_video_owner_synced_hwnd: u64,
     /// 共有プレースメントスロット。UI スレッドが hide 時にセット、トレイスレッドが
     /// show 時に take して `SetWindowPlacement` する。トレイスレッドから Win32 を直接
     /// 叩けるようにすることで、復帰時の黒フラッシュ / サイズジャンプを防ぐ。
@@ -2929,6 +2933,8 @@ impl Default for App {
             update_check_last_spawn: None,
             show_update_dialog: false,
             main_hwnd: None,
+            #[cfg(windows)]
+            native_video_owner_synced_hwnd: 0,
             placement_slot: None,
             activation_listener: None,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
@@ -10304,6 +10310,8 @@ impl App {
                     // オーバーヘッドで no-op (= デフォルト挙動を壊さない)。
                     #[cfg(windows)]
                     Some(self.dsp_bridge.clone()),
+                    #[cfg(windows)]
+                    native_video_presenter_config(self.main_hwnd),
                 );
                 if self.settings.video_start_muted {
                     player.set_muted(true);
@@ -10877,6 +10885,7 @@ impl App {
         }
         #[cfg(windows)]
         if self.show_vst3_manager || self.settings.vst3_gui_visible {
+            self.native_video_owner_synced_hwnd = 0;
             // The normal per-frame fullscreen-state watcher also hides VST
             // editors, but doing it here keeps bridge-owned plugin surfaces
             // from lingering for a frame after the fullscreen viewport closes.
@@ -12964,7 +12973,11 @@ impl App {
             .unwrap_or(true);
         let mut updates: Vec<(String, f64, f64)> = Vec::new();
         let loop_enabled = self.settings.video_loop;
-        for entry in self.fs_cache.values_mut() {
+        #[cfg(windows)]
+        let mut native_closed_idx: Option<usize> = None;
+        #[cfg(windows)]
+        let mut native_owner_hwnd: u64 = 0;
+        for (idx, entry) in self.fs_cache.iter_mut() {
             if let FsCacheEntry::Video { player, .. } = entry {
                 player.set_loop_enabled(loop_enabled);
                 if let Some(d) = player.tick(ctx) {
@@ -12978,11 +12991,32 @@ impl App {
                         None => d,
                     });
                 }
+                #[cfg(windows)]
+                {
+                    let hwnd = player.native_presenter_hwnd();
+                    if hwnd != 0 {
+                        native_owner_hwnd = hwnd;
+                    }
+                    if player.native_presenter_closed() {
+                        native_closed_idx = Some(*idx);
+                    }
+                }
                 if do_save {
                     let path_key = crate::adjustment_db::normalize_path(player.path());
                     updates.push((path_key, player.position(), player.duration()));
                 }
             }
+        }
+        #[cfg(windows)]
+        if native_owner_hwnd != 0 && native_owner_hwnd != self.native_video_owner_synced_hwnd {
+            self.dsp_bridge
+                .set_existing_guis_owner_to_hwnd(native_owner_hwnd);
+            self.native_video_owner_synced_hwnd = native_owner_hwnd;
+        }
+        #[cfg(windows)]
+        if native_closed_idx.is_some() {
+            self.close_fullscreen();
+            return;
         }
         if do_save {
             self.video_resume_last_save = Some(now);
@@ -13889,6 +13923,7 @@ impl eframe::App for App {
                 if !is_fs {
                     // フルスクリーン解除 → VST 関連 UI を全部畳む。
                     // 動画 compact の設定値は保持し、次に VST を開いた時に復元する。
+                    self.native_video_owner_synced_hwnd = 0;
                     self.dsp_bridge.set_existing_guis_owner_to_main();
                     self.dsp_bridge.set_all_guis_visible(false);
                     self.show_vst3_manager = false;
@@ -15766,6 +15801,46 @@ fn video_autoplay_for_open(
         crate::settings::VideoAutoplayMode::OnlyFromGrid
         | crate::settings::VideoAutoplayMode::Off => from_grid,
     }
+}
+
+#[cfg(windows)]
+fn native_video_presenter_config(
+    main_hwnd: Option<isize>,
+) -> Option<crate::video::NativeVideoOutputConfig> {
+    let enabled = std::env::var("MIV_NATIVE_VIDEO_PRESENTER")
+        .map(|v| {
+            let v = v.trim();
+            !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
+        })
+        .unwrap_or(false);
+    if !enabled {
+        return None;
+    }
+
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+
+    let hwnd = HWND(main_hwnd.unwrap_or_default() as *mut _);
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        crate::logger::log("[native-video] GetMonitorInfoW failed; using egui presenter");
+        return None;
+    }
+    let sync_interval = std::env::var("MIV_NATIVE_VIDEO_SYNC_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(1)
+        .min(4);
+    Some(crate::video::NativeVideoOutputConfig {
+        rect: info.rcMonitor,
+        sync_interval,
+    })
 }
 
 #[cfg(test)]

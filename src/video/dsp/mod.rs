@@ -305,6 +305,10 @@ impl DspBridge {
         self.sync_existing_gui_owner(self.main_hwnd.load(Ordering::Acquire));
     }
 
+    pub fn set_existing_guis_owner_to_hwnd(&self, owner_hwnd: u64) {
+        self.sync_existing_gui_owner(owner_hwnd);
+    }
+
     /// audio output の sample_rate (= cpal 出力レート)。0 = 未設定。UI で
     /// プラグイン latency を ms に変換する際の分母として使う。
     pub fn sample_rate(&self) -> u32 {
