@@ -35,6 +35,7 @@ pub(crate) struct VideoUpscaleRunningTask {
     pub source_path: PathBuf,
     pub cancel: Arc<AtomicBool>,
     pub pause: Arc<AtomicBool>,
+    pub paused_idle: Arc<AtomicBool>,
     pub progress: Arc<VideoUpscaleProgressShared>,
     pub rx: mpsc::Receiver<VideoUpscaleMessage>,
     pub delete_artifacts_after_cancel: bool,
@@ -268,13 +269,20 @@ impl App {
         let tasks = self.video_upscale_queue.tasks.clone();
         let queue_paused = self.video_upscale_queue.paused;
         let running_task_id = self.video_upscale_running.as_ref().map(|r| r.task_id);
-        let running_progress = self.video_upscale_running.as_ref().map(|r| {
-            (
-                r.task_id,
-                r.progress.snapshot(),
-                r.cancel.load(Ordering::Relaxed),
-            )
-        });
+        let running_status = self
+            .video_upscale_running
+            .as_ref()
+            .map(|r| RunningTaskUiStatus {
+                task_id: r.task_id,
+                progress: r.progress.snapshot(),
+                canceling: r.cancel.load(Ordering::Relaxed),
+                paused_idle: queue_paused && r.paused_idle.load(Ordering::Relaxed),
+            });
+        let running_pause_pending = queue_paused
+            && self
+                .video_upscale_running
+                .as_ref()
+                .is_some_and(|r| !r.paused_idle.load(Ordering::Relaxed));
         let mut action = TaskUiAction::None;
 
         egui::Window::new("アップスケールタスク")
@@ -293,10 +301,11 @@ impl App {
                     if ui.button(pause_label).clicked() {
                         action = TaskUiAction::TogglePause;
                     }
-                    if self.video_upscale_running.is_some() {
+                    if self.video_upscale_running.is_some() && !queue_paused {
                         ui.spinner();
                     }
-                    if queue_paused {
+                    if running_pause_pending {
+                        ui.spinner();
                         ui.label(
                             egui::RichText::new("一時停止中")
                                 .color(egui::Color32::from_rgb(210, 150, 60)),
@@ -318,7 +327,14 @@ impl App {
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for task in &tasks {
-                        render_task_row(ui, task, running_task_id, running_progress, &mut action);
+                        render_task_row(
+                            ui,
+                            task,
+                            running_task_id,
+                            running_status,
+                            queue_paused,
+                            &mut action,
+                        );
                         ui.separator();
                     }
                 });
@@ -440,11 +456,13 @@ impl App {
         let model_manager = self.ai_model_manager.clone();
         let cancel = Arc::new(AtomicBool::new(false));
         let pause = Arc::new(AtomicBool::new(self.video_upscale_queue.paused));
+        let paused_idle = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(VideoUpscaleProgressShared::new(None));
         let (tx, rx) = mpsc::channel();
         let task_for_worker = task.clone();
         let cancel_worker = cancel.clone();
         let pause_worker = pause.clone();
+        let paused_idle_worker = paused_idle.clone();
         let progress_worker = progress.clone();
         let parallel_segments_worker = Arc::new(AtomicU8::new(1));
 
@@ -465,6 +483,7 @@ impl App {
                     options: task_for_worker.options.normalized_for_video_export(),
                     parallel_segments: parallel_segments_worker,
                     pause: pause_worker,
+                    paused_idle: paused_idle_worker,
                 };
                 run_job(job, runtime, model_manager, cancel_worker, progress_worker)
             });
@@ -476,6 +495,7 @@ impl App {
             source_path: task.source_path,
             cancel,
             pause,
+            paused_idle,
             progress,
             rx,
             delete_artifacts_after_cancel: false,
@@ -655,24 +675,36 @@ enum TaskUiAction {
     MoveDown(Uuid),
 }
 
+#[derive(Clone, Copy)]
+struct RunningTaskUiStatus {
+    task_id: Uuid,
+    progress: (u64, u64, u64, Duration),
+    canceling: bool,
+    paused_idle: bool,
+}
+
 fn render_task_row(
     ui: &mut egui::Ui,
     task: &crate::video::upscale::queue::VideoUpscaleTask,
     running_task_id: Option<Uuid>,
-    running_progress: Option<(Uuid, (u64, u64, u64, Duration), bool)>,
+    running_status: Option<RunningTaskUiStatus>,
+    queue_paused: bool,
     action: &mut TaskUiAction,
 ) {
     let is_running = running_task_id == Some(task.task_id);
+    let running_for_task = running_status.filter(|status| status.task_id == task.task_id);
     let file_name = task
         .source_path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
-    let state_label = state_label(task.state);
+    let state_label = task_state_label(task, is_running, queue_paused, running_for_task);
 
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(file_name).strong());
-        ui.label(state_label);
+        if let Some(label) = state_label {
+            ui.label(label);
+        }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if matches!(task.state, TaskState::Queued | TaskState::Running) {
                 let cancel_label = if task.state == TaskState::Queued {
@@ -711,9 +743,8 @@ fn render_task_row(
     });
 
     ui.horizontal(|ui| {
-        if let Some((_, (done, total, rate_base, elapsed), canceled)) =
-            running_progress.filter(|(id, _, _)| *id == task.task_id)
-        {
+        if let Some(status) = running_for_task {
+            let (done, total, rate_base, elapsed) = status.progress;
             let frac = if total > 0 {
                 (done as f32 / total as f32).clamp(0.0, 1.0)
             } else {
@@ -728,13 +759,15 @@ fn render_task_row(
             } else {
                 ui.label(format!("{done} frame"));
             }
-            if let Some((fps, remaining)) = progress_rate(done, total, rate_base, elapsed) {
+            if status.paused_idle {
+                // No transient status here: the row header intentionally goes quiet once idle.
+            } else if let Some((fps, remaining)) = progress_rate(done, total, rate_base, elapsed) {
                 ui.label(format!("{fps:.2} fps"));
                 ui.label(format!("残り: {}", format_eta(remaining)));
             } else if total > done {
                 ui.label("残り: 計算中...");
             }
-            if canceled {
+            if status.canceling {
                 ui.label("中止中");
             }
         } else if is_running {
@@ -836,6 +869,21 @@ fn progress_rate(
     }
     let remaining_secs = (total - done) as f64 / fps;
     Some((fps, Duration::from_secs_f64(remaining_secs.max(0.0))))
+}
+
+fn task_state_label(
+    task: &crate::video::upscale::queue::VideoUpscaleTask,
+    is_running: bool,
+    queue_paused: bool,
+    running_status: Option<RunningTaskUiStatus>,
+) -> Option<&'static str> {
+    if is_running && queue_paused {
+        return match running_status {
+            Some(status) if status.paused_idle => None,
+            _ => Some("一時停止中"),
+        };
+    }
+    Some(state_label(task.state))
 }
 
 fn state_label(state: TaskState) -> &'static str {

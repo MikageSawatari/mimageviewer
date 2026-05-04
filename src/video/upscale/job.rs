@@ -264,6 +264,7 @@ pub struct VideoUpscaleJob {
     pub options: VideoUpscaleOptions,
     pub parallel_segments: Arc<AtomicU8>,
     pub pause: Arc<AtomicBool>,
+    pub paused_idle: Arc<AtomicBool>,
 }
 
 impl VideoUpscaleJob {
@@ -799,18 +800,21 @@ fn run_segments_parallel(
     let mut active = 0_usize;
     let mut slot_active = vec![false; worker_slots];
     let mut first_error: Option<String> = None;
+    job.paused_idle.store(false, Ordering::Relaxed);
 
     while active > 0 || (!pending.is_empty() && first_error.is_none()) {
         if active == 0 && job.pause_requested() && first_error.is_none() {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
+            job.paused_idle.store(true, Ordering::Relaxed);
             progress
                 .elapsed_ms
                 .store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
             thread::sleep(Duration::from_millis(250));
             continue;
         }
+        job.paused_idle.store(false, Ordering::Relaxed);
 
         let desired_workers = if job.pause_requested() {
             active
@@ -2242,6 +2246,7 @@ mod tests {
             },
             parallel_segments: Arc::new(AtomicU8::new(1)),
             pause: Arc::new(AtomicBool::new(false)),
+            paused_idle: Arc::new(AtomicBool::new(false)),
         }
     }
 

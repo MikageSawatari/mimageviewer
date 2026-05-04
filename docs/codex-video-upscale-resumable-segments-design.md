@@ -613,6 +613,10 @@ Controls:
 - remove failed/done/pending task
 - open output folder for done tasks
 
+When pause is requested while a segment is still active, the task row shows `一時停止中` and keeps
+the spinner visible. Once the worker has reached the pause boundary and is idle, the row should stop
+showing a transient status/spinner while keeping the resume button available.
+
 MVP starts with a compact egui window and no drag-and-drop. Phase E shows a per-video ETA for the
 currently running task from `frames_done / elapsed`; until progress has enough data, show
 `計算中...` instead of a misleading zero estimate. A later phase can switch this to a moving average
