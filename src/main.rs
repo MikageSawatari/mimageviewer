@@ -10,6 +10,8 @@ pub mod archive_converter;
 pub mod cache_maintenance;
 pub mod catalog;
 pub mod data_dir;
+#[cfg(windows)]
+mod dcomp_presenter_test;
 pub mod delete_worker;
 pub mod dwm_transitions;
 pub mod exif_reader;
@@ -185,6 +187,8 @@ fn main() -> eframe::Result {
     // --perf-log 無効時は `emit_startup` が no-op なのでコストはゼロ。
     let prog_start = Instant::now();
     let play_test_config = parse_play_test_config();
+    #[cfg(windows)]
+    let dcomp_presenter_config = dcomp_presenter_test::parse_config();
     let perf_log_path = parse_perf_log_path_arg();
 
     // --pdf-worker モード: GUI なしで PDFium ワーカープロセスとして起動
@@ -269,6 +273,36 @@ fn main() -> eframe::Result {
             config.duration.as_millis(),
             config.mute
         ));
+    }
+
+    #[cfg(windows)]
+    if let Some(config) = dcomp_presenter_config {
+        if !config.path.is_file() {
+            eprintln!(
+                "--dcomp-presenter-test path is not a file: {}",
+                config.path.display()
+            );
+            logger::log(format!(
+                "dcomp-presenter-test: path is not a file: {}",
+                config.path.display()
+            ));
+            std::process::exit(2);
+        }
+        logger::log(format!(
+            "dcomp-presenter-test: path={} duration_ms={} window={}x{} sync_interval={}",
+            config.path.display(),
+            config.duration.as_millis(),
+            config.width,
+            config.height,
+            config.sync_interval
+        ));
+        if let Err(e) = dcomp_presenter_test::run(config) {
+            eprintln!("dcomp-presenter-test failed: {e}");
+            logger::log(format!("dcomp-presenter-test failed: {e}"));
+            std::process::exit(1);
+        }
+        perf::flush();
+        std::process::exit(0);
     }
 
     // 起動時間計測: data_dir 初期化は先行ステップなので perf::init 後に後追いで打つ。

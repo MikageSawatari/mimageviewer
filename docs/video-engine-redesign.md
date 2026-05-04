@@ -1395,3 +1395,27 @@ recursively shuffles one or more folders, launches one mIV process per video,
 summarizes `display_miss`, `frame_gap`, decoder drops, packet waits, and
 completion status, and can run multiple environment-defined modes (for example
 different wgpu present modes) against the same corpus.
+
+2026-05-04 DirectComposition presenter prototype: because 1080p120 testing
+showed an egui/wgpu fullscreen ceiling around 95-102 fps even with VST3 skipped,
+mIV now includes a Windows-only native presentation test path. The mode is not
+used by the normal application UI; it is an isolated experiment for measuring
+whether a D3D11 + DirectComposition swap chain can present decoded frames
+without the egui viewport/wgpu layer.
+
+Run it with:
+
+```text
+mimageviewer-core.exe --dcomp-presenter-test <FILE> --dcomp-duration 10 --dcomp-start 0 --dcomp-window-size 1920x1080 --dcomp-sync-interval 1 --perf-log <PATH>
+```
+
+The test reuses the existing demux/decode pipeline and `GpuVideoDevice`, drains
+audio in a worker so decoder pacing remains comparable, creates a native HWND,
+attaches a flip-model DXGI swap chain to a DirectComposition visual, and copies
+GPU decoded BGRA frames directly into the swap chain back buffer before
+`Present`. It emits `native_presenter/*` perf events (`present`, `late_drop`,
+`summary`) with wait, fence, copy, present, cadence, and queue metrics. Current
+prototype limits: no egui HUD overlay, no VST3 startup path, no 10-bit GPU frame
+presentation, and exact-size BGRA frames are the intended fast path. The goal is
+to make a data-driven GO/NO-GO decision before integrating a native presenter
+into the fullscreen viewer.
