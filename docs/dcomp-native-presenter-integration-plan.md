@@ -174,6 +174,10 @@ Status:
   The 1080p120 soak kept `late_drop=0` for 601 frames over 5 seconds with max
   interval 9.8ms, so the egui overlay surface can coexist with the native video
   visual without coupling redraw cadence.
+- 2026-05-04: native key and mouse events are now translated to `egui::Event`s
+  on the presenter thread before being forwarded to the existing UI-thread
+  shortcut path. The overlay redraw path is dirty-driven, so input updates can
+  refresh the HUD without tying the overlay to every video present.
 
 The first production slice can accept a 60Hz overlay cadence as long as video
 presentation remains independent at 120fps.

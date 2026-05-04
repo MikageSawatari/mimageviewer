@@ -12,7 +12,9 @@ use crate::video::gpu_renderer::GpuVideoDevice;
 use crate::video::native_presenter::{
     NativePresentOutcome, NativePresenterConfig, NativeVideoPresenter,
 };
-use crate::video::native_window::{NativeVideoWindow, NativeVideoWindowConfig};
+use crate::video::native_window::{
+    NativeVideoWindow, NativeVideoWindowConfig, NativeVideoWindowMode,
+};
 
 #[derive(Clone, Debug)]
 pub struct DcompPresenterTestConfig {
@@ -91,10 +93,16 @@ fn parse_size(s: &str) -> Option<(u32, u32)> {
 
 pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
     let _com = ComApartment::init()?;
-    let mut window = NativeVideoWindow::create(NativeVideoWindowConfig::test_windowed(
-        config.width,
-        config.height,
-    ))?;
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    let mut window = NativeVideoWindow::create(NativeVideoWindowConfig {
+        mode: NativeVideoWindowMode::Windowed {
+            width: config.width,
+            height: config.height,
+        },
+        close_on_escape: true,
+        post_quit_on_destroy: true,
+        event_tx: Some(event_tx),
+    })?;
     let gpu = GpuVideoDevice::new().map_err(|e| e.to_string())?;
     let mut presenter = NativeVideoPresenter::new(NativePresenterConfig {
         hwnd: window.hwnd(),
@@ -186,6 +194,14 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
             .unwrap_or_else(|| run_started.elapsed() < config.duration)
     {
         quit = crate::video::native_window::pump_thread_messages();
+        let mut native_events = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            native_events.push(event);
+        }
+        if !native_events.is_empty() {
+            presenter.handle_window_events(&native_events)?;
+        }
+
         while let Ok(frame) = handles.video_rx.try_recv() {
             if timeline_base_pts.is_none() {
                 timeline_base_pts = Some(frame.pts_secs);

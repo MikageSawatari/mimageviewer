@@ -67,8 +67,8 @@ struct NativeTestOverlay {
 }
 
 struct NativeEguiOverlay {
-    _visual: IDCompositionVisual,
     surface: wgpu::Surface<'static>,
+    _visual: IDCompositionVisual,
     _instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -79,6 +79,11 @@ struct NativeEguiOverlay {
     renderer: egui_wgpu::Renderer,
     egui_ctx: egui::Context,
     started_at: Instant,
+    pending_events: Vec<egui::Event>,
+    modifiers: egui::Modifiers,
+    pointer_pos: Option<egui::Pos2>,
+    event_count: u64,
+    dirty: bool,
     width: u32,
     height: u32,
 }
@@ -412,6 +417,17 @@ impl NativeVideoPresenter {
         })
     }
 
+    pub fn handle_window_events(
+        &mut self,
+        events: &[crate::video::native_window::NativeVideoWindowEvent],
+    ) -> Result<(), String> {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.push_native_events(events);
+            overlay.render_if_dirty()?;
+        }
+        Ok(())
+    }
+
     fn open_fence(
         &mut self,
         fence_gen: u64,
@@ -510,8 +526,8 @@ impl NativeEguiOverlay {
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
         let this = Self {
-            _visual: visual,
             surface,
+            _visual: visual,
             _instance: instance,
             adapter,
             device,
@@ -522,6 +538,11 @@ impl NativeEguiOverlay {
             renderer,
             egui_ctx,
             started_at: Instant::now(),
+            pending_events: Vec::new(),
+            modifiers: egui::Modifiers::default(),
+            pointer_pos: None,
+            event_count: 0,
+            dirty: true,
             width: width.max(1),
             height: height.max(1),
         };
@@ -552,6 +573,91 @@ impl NativeEguiOverlay {
         self.width = width;
         self.height = height;
         self.configure();
+        self.dirty = true;
+        self.render_once()
+    }
+
+    fn push_native_events(
+        &mut self,
+        events: &[crate::video::native_window::NativeVideoWindowEvent],
+    ) {
+        for event in events {
+            self.push_native_event(*event);
+        }
+    }
+
+    fn push_native_event(&mut self, event: crate::video::native_window::NativeVideoWindowEvent) {
+        use crate::video::native_window::{
+            NativeVideoMouseButton, NativeVideoWindowEvent as NativeEvent,
+        };
+
+        self.event_count = self.event_count.saturating_add(1);
+        match event {
+            NativeEvent::KeyDown(key) => {
+                let modifiers = egui_modifiers(key.shift, key.ctrl, key.alt);
+                self.modifiers = modifiers;
+                if let Some(egui_key) = egui_key_from_virtual_key(key.virtual_key) {
+                    self.pending_events.push(egui::Event::Key {
+                        key: egui_key,
+                        physical_key: Some(egui_key),
+                        pressed: true,
+                        repeat: key.repeat,
+                        modifiers,
+                    });
+                    self.dirty = true;
+                }
+            }
+            NativeEvent::MouseMove(mouse) => {
+                let pos = native_pos(mouse.x, mouse.y);
+                self.pointer_pos = Some(pos);
+                self.modifiers = egui_modifiers(mouse.shift, mouse.ctrl, false);
+                self.pending_events.push(egui::Event::PointerMoved(pos));
+                self.dirty = true;
+            }
+            NativeEvent::MouseButton(button) => {
+                let pos = native_pos(button.x, button.y);
+                let modifiers = egui_modifiers(button.shift, button.ctrl, false);
+                self.pointer_pos = Some(pos);
+                self.modifiers = modifiers;
+                self.pending_events.push(egui::Event::PointerMoved(pos));
+                let egui_button = match button.button {
+                    NativeVideoMouseButton::Left => egui::PointerButton::Primary,
+                    NativeVideoMouseButton::Right => egui::PointerButton::Secondary,
+                    NativeVideoMouseButton::Middle => egui::PointerButton::Middle,
+                };
+                self.pending_events.push(egui::Event::PointerButton {
+                    pos,
+                    button: egui_button,
+                    pressed: button.down,
+                    modifiers,
+                });
+                self.dirty = true;
+            }
+            NativeEvent::MouseWheel(wheel) => {
+                let pos = native_pos(wheel.x, wheel.y);
+                let modifiers = egui_modifiers(wheel.shift, wheel.ctrl, false);
+                self.pointer_pos = Some(pos);
+                self.modifiers = modifiers;
+                self.pending_events.push(egui::Event::PointerMoved(pos));
+                self.pending_events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, wheel.delta as f32),
+                    modifiers,
+                });
+                self.dirty = true;
+            }
+            NativeEvent::MouseLeave => {
+                self.pointer_pos = None;
+                self.pending_events.push(egui::Event::PointerGone);
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn render_if_dirty(&mut self) -> Result<(), String> {
+        if !self.dirty && self.pending_events.is_empty() {
+            return Ok(());
+        }
         self.render_once()
     }
 
@@ -574,6 +680,9 @@ impl NativeEguiOverlay {
     fn render_once(&mut self) -> Result<(), String> {
         let render_t0 = Instant::now();
         let ppp = 1.0f32;
+        let event_count = self.event_count;
+        let pointer_pos = self.pointer_pos;
+        let pending_event_count = self.pending_events.len();
         let raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -581,6 +690,8 @@ impl NativeEguiOverlay {
             )),
             time: Some(self.started_at.elapsed().as_secs_f64()),
             predicted_dt: 1.0 / 60.0,
+            modifiers: self.modifiers,
+            events: std::mem::take(&mut self.pending_events),
             ..Default::default()
         };
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
@@ -612,6 +723,16 @@ impl NativeEguiOverlay {
                 "wgpu SurfaceTarget::CompositionVisual",
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_rgb(158, 206, 172),
+            );
+            let pointer = pointer_pos
+                .map(|p| format!("{:.0},{:.0}", p.x, p.y))
+                .unwrap_or_else(|| "outside".to_string());
+            painter.text(
+                egui::pos2(88.0, 90.0),
+                egui::Align2::LEFT_TOP,
+                format!("events={event_count} pointer={pointer}"),
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_rgb(132, 188, 148),
             );
         });
 
@@ -675,11 +796,14 @@ impl NativeEguiOverlay {
         for id in &full_output.textures_delta.free {
             self.renderer.free_texture(id);
         }
+        self.dirty = false;
         log_event(
             "egui_overlay_present",
             &[
                 ("width", Value::from(self.width as i64)),
                 ("height", Value::from(self.height as i64)),
+                ("input_events", Value::from(pending_event_count as i64)),
+                ("native_events", Value::from(event_count as i64)),
                 ("shapes", Value::from(shape_count as i64)),
                 ("paint_jobs", Value::from(paint_jobs.len() as i64)),
                 (
@@ -709,6 +833,89 @@ fn choose_overlay_surface_format(
         .first()
         .copied()
         .ok_or_else(|| "wgpu DComp overlay surface has no formats".to_string())
+}
+
+fn native_pos(x: i32, y: i32) -> egui::Pos2 {
+    egui::pos2(x as f32, y as f32)
+}
+
+fn egui_modifiers(shift: bool, ctrl: bool, alt: bool) -> egui::Modifiers {
+    egui::Modifiers {
+        alt,
+        ctrl,
+        shift,
+        mac_cmd: false,
+        command: ctrl,
+    }
+}
+
+fn egui_key_from_virtual_key(vk: u32) -> Option<egui::Key> {
+    Some(match vk {
+        0x08 => egui::Key::Backspace,
+        0x09 => egui::Key::Tab,
+        0x0D => egui::Key::Enter,
+        0x1B => egui::Key::Escape,
+        0x20 => egui::Key::Space,
+        0x21 => egui::Key::PageUp,
+        0x22 => egui::Key::PageDown,
+        0x23 => egui::Key::End,
+        0x24 => egui::Key::Home,
+        0x25 => egui::Key::ArrowLeft,
+        0x26 => egui::Key::ArrowUp,
+        0x27 => egui::Key::ArrowRight,
+        0x28 => egui::Key::ArrowDown,
+        0x2D => egui::Key::Insert,
+        0x2E => egui::Key::Delete,
+        0x30 => egui::Key::Num0,
+        0x31 => egui::Key::Num1,
+        0x32 => egui::Key::Num2,
+        0x33 => egui::Key::Num3,
+        0x34 => egui::Key::Num4,
+        0x35 => egui::Key::Num5,
+        0x36 => egui::Key::Num6,
+        0x37 => egui::Key::Num7,
+        0x38 => egui::Key::Num8,
+        0x39 => egui::Key::Num9,
+        0x41 => egui::Key::A,
+        0x42 => egui::Key::B,
+        0x43 => egui::Key::C,
+        0x44 => egui::Key::D,
+        0x45 => egui::Key::E,
+        0x46 => egui::Key::F,
+        0x47 => egui::Key::G,
+        0x48 => egui::Key::H,
+        0x49 => egui::Key::I,
+        0x4A => egui::Key::J,
+        0x4B => egui::Key::K,
+        0x4C => egui::Key::L,
+        0x4D => egui::Key::M,
+        0x4E => egui::Key::N,
+        0x4F => egui::Key::O,
+        0x50 => egui::Key::P,
+        0x51 => egui::Key::Q,
+        0x52 => egui::Key::R,
+        0x53 => egui::Key::S,
+        0x54 => egui::Key::T,
+        0x55 => egui::Key::U,
+        0x56 => egui::Key::V,
+        0x57 => egui::Key::W,
+        0x58 => egui::Key::X,
+        0x59 => egui::Key::Y,
+        0x5A => egui::Key::Z,
+        0x70 => egui::Key::F1,
+        0x71 => egui::Key::F2,
+        0x72 => egui::Key::F3,
+        0x73 => egui::Key::F4,
+        0x74 => egui::Key::F5,
+        0x75 => egui::Key::F6,
+        0x76 => egui::Key::F7,
+        0x77 => egui::Key::F8,
+        0x78 => egui::Key::F9,
+        0x79 => egui::Key::F10,
+        0x7A => egui::Key::F11,
+        0x7B => egui::Key::F12,
+        _ => return None,
+    })
 }
 
 impl NativeTestOverlay {

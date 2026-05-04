@@ -282,7 +282,7 @@ fn run_native_video_output(
     engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
     displayed_frame_seq: Arc<AtomicU64>,
     config: NativeVideoOutputConfig,
-    event_tx: std::sync::mpsc::Sender<native_window::NativeVideoWindowEvent>,
+    ui_event_tx: std::sync::mpsc::Sender<native_window::NativeVideoWindowEvent>,
     cancel: Arc<AtomicBool>,
     hwnd_out: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
@@ -293,6 +293,7 @@ fn run_native_video_output(
     let _com = NativeComApartment::init()?;
     let width = (config.rect.right - config.rect.left).max(1) as u32;
     let height = (config.rect.bottom - config.rect.top).max(1) as u32;
+    let (presenter_event_tx, presenter_event_rx) = std::sync::mpsc::channel();
     let mut window = crate::video::native_window::NativeVideoWindow::create(
         crate::video::native_window::NativeVideoWindowConfig {
             mode: crate::video::native_window::NativeVideoWindowMode::Borderless {
@@ -302,7 +303,7 @@ fn run_native_video_output(
             // This HWND lives on the presenter thread, so WM_QUIT only exits
             // this loop and does not affect eframe's main event loop.
             post_quit_on_destroy: true,
-            event_tx: Some(event_tx),
+            event_tx: Some(presenter_event_tx),
         },
     )?;
     hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
@@ -329,10 +330,23 @@ fn run_native_video_output(
     let mut last_seen_serial = clock.current_seek_serial();
     let mut first_frame_event_last_epoch: Option<u64> = None;
     let mut last_present_log = Instant::now();
+    let mut native_events = Vec::new();
     while !cancel.load(Ordering::Acquire) {
         if crate::video::native_window::pump_thread_messages() {
             closed.store(true, Ordering::Release);
             break;
+        }
+        native_events.clear();
+        while let Ok(event) = presenter_event_rx.try_recv() {
+            native_events.push(event);
+        }
+        if !native_events.is_empty() {
+            if let Err(err) = presenter.handle_window_events(&native_events) {
+                crate::logger::log(format!("[native-video] overlay input render failed: {err}"));
+            }
+            for event in &native_events {
+                let _ = ui_event_tx.send(*event);
+            }
         }
 
         let clock_serial = clock.current_seek_serial();

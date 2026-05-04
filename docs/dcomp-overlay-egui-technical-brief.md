@@ -63,6 +63,10 @@ Status:
   render (`shapes=4`, `paint_jobs=1`). This proves the CompositionVisual route
   can draw egui primitives above video without tying overlay redraws to video
   cadence.
+- 2026-05-04: native HWND input is now tee'd through the presenter thread before
+  being forwarded to the UI thread. The egui overlay translates the same key and
+  mouse events into `egui::Event`s and redraws only when dirty, which is the
+  first production-shaped input/render loop for the overlay path.
 
 Acceptance for the spike:
 
