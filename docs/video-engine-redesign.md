@@ -1370,3 +1370,13 @@ distinguishes work done by mIV's fullscreen closure from egui/viewport/wgpu work
 outside that closure. `video_gpu/prepare` and `video_gpu/paint` also emit a low
 frequency sample even when fast, so perf logs can prove the GPU callback path is
 active instead of only reporting slow frames.
+
+2026-05-04 present-latency experiment: the eframe/wgpu surface is now configured
+for lower presentation latency by default (`PresentMode::AutoNoVsync` and
+`desired_maximum_frame_latency=1`). The goal is to reduce red-line
+`display_miss` events where decoded frames are ready but the egui/wgpu viewport
+misses a present opportunity. The defaults are intentionally reversible for A/B
+testing: set `MIV_WGPU_PRESENT_MODE=auto_vsync` and
+`MIV_WGPU_FRAME_LATENCY=default` to return to egui-wgpu's default behavior, or
+try `mailbox`, `immediate`, `fifo`, or `fifo_relaxed` when comparing GPU/driver
+behavior.

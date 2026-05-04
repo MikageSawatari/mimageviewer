@@ -117,6 +117,68 @@ fn emit_startup(step: &str, phase_start: Option<Instant>) {
     perf::event("startup", step, None, 0, &extras);
 }
 
+fn parse_wgpu_present_mode(raw: &str) -> Option<wgpu::PresentMode> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "auto_no_vsync" | "autonovsync" | "no_vsync" | "novsync" => {
+            Some(wgpu::PresentMode::AutoNoVsync)
+        }
+        "auto_vsync" | "autovsync" | "vsync" => Some(wgpu::PresentMode::AutoVsync),
+        "fifo" => Some(wgpu::PresentMode::Fifo),
+        "fifo_relaxed" | "fiforelaxed" => Some(wgpu::PresentMode::FifoRelaxed),
+        "immediate" => Some(wgpu::PresentMode::Immediate),
+        "mailbox" => Some(wgpu::PresentMode::Mailbox),
+        _ => None,
+    }
+}
+
+fn parse_wgpu_frame_latency(raw: &str) -> Option<Option<u32>> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("default")
+        || trimmed.eq_ignore_ascii_case("none")
+        || trimmed == "0"
+    {
+        return Some(None);
+    }
+    trimmed.parse::<u32>().ok().filter(|v| *v > 0).map(Some)
+}
+
+fn configure_wgpu_presentation(wgpu_options: &mut egui_wgpu::WgpuConfiguration) {
+    let present_mode = match std::env::var("MIV_WGPU_PRESENT_MODE") {
+        Ok(raw) => match parse_wgpu_present_mode(&raw) {
+            Some(mode) => mode,
+            None => {
+                logger::log(format!(
+                    "wgpu presentation: ignoring invalid MIV_WGPU_PRESENT_MODE={raw:?}; \
+                     using AutoNoVsync"
+                ));
+                wgpu::PresentMode::AutoNoVsync
+            }
+        },
+        Err(_) => wgpu::PresentMode::AutoNoVsync,
+    };
+
+    let desired_maximum_frame_latency = match std::env::var("MIV_WGPU_FRAME_LATENCY") {
+        Ok(raw) => match parse_wgpu_frame_latency(&raw) {
+            Some(value) => value,
+            None => {
+                logger::log(format!(
+                    "wgpu presentation: ignoring invalid MIV_WGPU_FRAME_LATENCY={raw:?}; \
+                     using 1"
+                ));
+                Some(1)
+            }
+        },
+        Err(_) => Some(1),
+    };
+
+    wgpu_options.present_mode = present_mode;
+    wgpu_options.desired_maximum_frame_latency = desired_maximum_frame_latency;
+    logger::log(format!(
+        "wgpu presentation: present_mode={present_mode:?} \
+         desired_maximum_frame_latency={desired_maximum_frame_latency:?}"
+    ));
+}
+
 fn main() -> eframe::Result {
     // main() 入口の Instant を起動時間計測の t=0 とする。
     // --pdf-worker モードでは計測しないので worker 判定の前に取らない。
@@ -300,6 +362,7 @@ fn main() -> eframe::Result {
     // 動画 GPU 経路は実行時に `cc.wgpu_render_state.adapter.get_info().backend` を見て
     // DX12 のときだけ有効化、Vulkan ならスキップして CPU readback で再生する。
     let mut wgpu_options = egui_wgpu::WgpuConfiguration::default();
+    configure_wgpu_presentation(&mut wgpu_options);
     if let egui_wgpu::WgpuSetup::CreateNew(create_new) = &mut wgpu_options.wgpu_setup {
         create_new.instance_descriptor.backends = wgpu::Backends::DX12 | wgpu::Backends::VULKAN;
         create_new.native_adapter_selector = Some(std::sync::Arc::new(
