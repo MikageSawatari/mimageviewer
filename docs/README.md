@@ -45,6 +45,7 @@
 | [dcomp-native-presenter-integration-plan.md](dcomp-native-presenter-integration-plan.md) | DirectComposition native video presenter prototype を本番 fullscreen path へ統合するための段階計画。1080p120/165Hz 対応、egui overlay 分離、DPI/resize/VST owner 課題を整理 |
 | [dcomp-overlay-egui-technical-brief.md](dcomp-overlay-egui-technical-brief.md) | DirectComposition native presenter Phase C overlay で egui-wgpu をどう載せるかの技術選択メモ |
 | [codex-native-overlay-redraw-cadence-brief.md](codex-native-overlay-redraw-cadence-brief.md) | Phase C native egui overlay の redraw cadence / render_ms を soak で確認するための計測ブリーフ |
+| [codex-native-presenter-copy-spike-brief.md](codex-native-presenter-copy-spike-brief.md) | Production native DComp presenter の `copy_ms` / `fence_wait_ms` spike を per-present trace soak で切り分ける計測ブリーフ |
 | [ffmpeg-lgpl-source-distribution.md](ffmpeg-lgpl-source-distribution.md) | FFmpeg LGPLv3-or-later build の配布時チェックリスト、対応ソース、同梱外部ライブラリの確認メモ |
 | [codex-video-upscale-resumable-segments-design.md](codex-video-upscale-resumable-segments-design.md) | Offline video upscale の resumable segment / persistent queue 設計 |
 | [codex-video-upscale-resumable-segments-phasec-implementation-review.md](codex-video-upscale-resumable-segments-phasec-implementation-review.md) | Offline video upscale Phase C/D/E 実装レビュー依頼メモ |

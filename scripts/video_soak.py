@@ -66,6 +66,14 @@ def parse_mode(raw: str) -> Mode:
     return Mode(name, env)
 
 
+def percentile(values: list[float], pct: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    idx = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * pct)))
+    return ordered[idx]
+
+
 def iter_videos(roots: list[Path]) -> list[Path]:
     videos: list[Path] = []
     for root in roots:
@@ -88,6 +96,11 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
     overlay_idle_presents = 0
     overlay_prev_t: float | None = None
     overlay_max_interval_ms = 0.0
+    present_copy_ms: list[float] = []
+    gpu_copy_ms: list[float] = []
+    cpu_copy_ms: list[float] = []
+    present_fence_wait_ms: list[float] = []
+    present_total_ms: list[float] = []
     total = 0
     if not path.exists():
         return {"events": 0, "missing_log": 1}
@@ -142,6 +155,22 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
                     value = event.get(field)
                     if isinstance(value, (int, float)):
                         native_summary[f"native_{field}"] = value
+            if cat == "native_presenter" and kind == "fullscreen_present":
+                path_value = str(event.get("path", ""))
+                copy_ms = event.get("copy_ms")
+                if isinstance(copy_ms, (int, float)):
+                    copy_ms_f = float(copy_ms)
+                    present_copy_ms.append(copy_ms_f)
+                    if path_value == "d3d11_shared":
+                        gpu_copy_ms.append(copy_ms_f)
+                    elif path_value == "cpu_upload":
+                        cpu_copy_ms.append(copy_ms_f)
+                fence_wait_ms = event.get("fence_wait_ms")
+                if isinstance(fence_wait_ms, (int, float)):
+                    present_fence_wait_ms.append(float(fence_wait_ms))
+                total_ms = event.get("total_ms")
+                if isinstance(total_ms, (int, float)):
+                    present_total_ms.append(float(total_ms))
     return {
         "events": total,
         "display_miss": counts.get("video/display_miss", 0),
@@ -160,6 +189,18 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
             overlay_render_total_ms / overlay_render_count if overlay_render_count else 0.0
         ),
         "overlay_max_interval_ms": overlay_max_interval_ms,
+        "native_present_logged": counts.get("native_presenter/fullscreen_present", 0),
+        "native_copy_ms_p50": percentile(present_copy_ms, 0.50),
+        "native_copy_ms_p95": percentile(present_copy_ms, 0.95),
+        "native_copy_ms_max": max(present_copy_ms, default=0.0),
+        "native_gpu_copy_ms_p95": percentile(gpu_copy_ms, 0.95),
+        "native_gpu_copy_ms_max": max(gpu_copy_ms, default=0.0),
+        "native_cpu_copy_ms_p95": percentile(cpu_copy_ms, 0.95),
+        "native_cpu_copy_ms_max": max(cpu_copy_ms, default=0.0),
+        "native_fence_wait_ms_p95": percentile(present_fence_wait_ms, 0.95),
+        "native_fence_wait_ms_max": max(present_fence_wait_ms, default=0.0),
+        "native_total_ms_p95": percentile(present_total_ms, 0.95),
+        "native_total_ms_max": max(present_total_ms, default=0.0),
         **native_summary,
         **max_values,
     }
@@ -314,8 +355,8 @@ def main() -> int:
         f"- modes: {', '.join(m.name for m in modes)}",
         f"- duration: {args.duration}s",
         "",
-        "| status | mode | seconds | display_miss | frame_gap | drops | max_gap_ms | overlay_present | overlay_max_render_ms | overlay_max_interval_ms | log | video |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        "| status | mode | seconds | display_miss | frame_gap | drops | max_gap_ms | overlay_present | overlay_max_render_ms | overlay_max_interval_ms | native_present_samples | native_copy_p95_ms | native_copy_max_ms | native_fence_max_ms | log | video |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
 
     failures = 0
@@ -351,6 +392,10 @@ def main() -> int:
             overlay_present = int(metrics.get("overlay_present", 0))
             overlay_max_render_ms = float(metrics.get("max_overlay_render_ms", 0.0))
             overlay_max_interval_ms = float(metrics.get("overlay_max_interval_ms", 0.0))
+            native_present_logged = int(metrics.get("native_present_logged", 0))
+            native_copy_p95 = float(metrics.get("native_copy_ms_p95", 0.0))
+            native_copy_max = float(metrics.get("native_copy_ms_max", 0.0))
+            native_fence_max = float(metrics.get("native_fence_wait_ms_max", 0.0))
             row = (
                 f"| {status} | {mode.name} | {elapsed:.1f} | "
                 f"{display_miss} | "
@@ -359,6 +404,10 @@ def main() -> int:
                 f"{overlay_present} | "
                 f"{overlay_max_render_ms:.2f} | "
                 f"{overlay_max_interval_ms:.1f} | "
+                f"{native_present_logged} | "
+                f"{native_copy_p95:.2f} | "
+                f"{native_copy_max:.2f} | "
+                f"{native_fence_max:.2f} | "
                 f"`{log_path.name}` | `{video}` |"
             )
             print(row)

@@ -443,6 +443,7 @@ fn run_native_video_output(
     let mut last_present_log = Instant::now();
     let mut last_overlay_tick = Instant::now();
     let mut native_events = Vec::new();
+    let trace_every_present = std::env::var_os("MIV_NATIVE_VIDEO_PRESENT_TRACE").is_some();
     while !cancel.load(Ordering::Acquire) {
         if crate::video::native_window::pump_thread_messages() {
             closed.store(true, Ordering::Release);
@@ -576,7 +577,10 @@ fn run_native_video_output(
                         clock.clear_seek_target_override(serial);
                     }
                     if crate::perf::is_enabled() {
-                        if total_ms > 4.0 || last_present_log.elapsed() > Duration::from_secs(1) {
+                        if trace_every_present
+                            || total_ms > 4.0
+                            || last_present_log.elapsed() > Duration::from_secs(1)
+                        {
                             last_present_log = Instant::now();
                             crate::perf::event(
                                 "native_presenter",

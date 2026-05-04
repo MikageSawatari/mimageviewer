@@ -282,6 +282,12 @@ viewport that still runs during the opt-in phase. The production path emits this
 summary periodically as well as during orderly shutdown because play-test runs
 can exit before the presenter thread's final shutdown log is flushed.
 
+For production native presenter copy/fence spikes, use
+`docs/codex-native-presenter-copy-spike-brief.md`. Setting
+`MIV_NATIVE_VIDEO_PRESENT_TRACE=1` logs every `fullscreen_present` event so
+`scripts/video_soak.py` can report `native_copy_p95_ms`,
+`native_copy_max_ms`, and `native_fence_max_ms` from real per-present samples.
+
 Core clips:
 
 - synthetic 1080p120 sync video
