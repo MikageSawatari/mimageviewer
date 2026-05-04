@@ -11,7 +11,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
     GetWindowLongPtrW, IDC_ARROW, IsWindow, LoadCursorW, MSG, PM_REMOVE, PeekMessageW,
     PostQuitMessage, RegisterClassW, SW_SHOW, SetWindowLongPtrW, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
     WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW,
     WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP,
@@ -31,6 +31,7 @@ pub struct NativeVideoKeyEvent {
 #[derive(Clone, Copy, Debug)]
 pub enum NativeVideoWindowEvent {
     KeyDown(NativeVideoKeyEvent),
+    KeyUp(NativeVideoKeyEvent),
     MouseMove(NativeVideoMouseEvent),
     MouseButton(NativeVideoMouseButtonEvent),
     MouseWheel(NativeVideoMouseWheelEvent),
@@ -257,6 +258,14 @@ unsafe extern "system" fn wnd_proc(
                     let _ = DestroyWindow(hwnd);
                 }
                 return LRESULT(0);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_KEYUP => {
+            if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
+                let _ = tx.send(NativeVideoWindowEvent::KeyUp(native_key_event(
+                    wparam, lparam,
+                )));
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }

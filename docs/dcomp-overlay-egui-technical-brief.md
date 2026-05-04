@@ -67,6 +67,9 @@ Status:
   being forwarded to the UI thread. The egui overlay translates the same key and
   mouse events into `egui::Event`s and redraws only when dirty, which is the
   first production-shaped input/render loop for the overlay path.
+- 2026-05-04: the input bridge now also forwards key releases and normalizes
+  Win32 wheel deltas as egui line-scroll units, so future overlay widgets can
+  rely on pressed/released key state and standard scroll scaling.
 
 Acceptance for the spike:
 

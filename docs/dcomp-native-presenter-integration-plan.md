@@ -178,6 +178,9 @@ Status:
   on the presenter thread before being forwarded to the existing UI-thread
   shortcut path. The overlay redraw path is dirty-driven, so input updates can
   refresh the HUD without tying the overlay to every video present.
+- 2026-05-04: key release events and normalized line-scroll wheel events are now
+  part of the native-to-egui bridge. Hit-test routing and DPI-aware coordinates
+  remain Phase C production work.
 
 The first production slice can accept a 60Hz overlay cadence as long as video
 presentation remains independent at 120fps.

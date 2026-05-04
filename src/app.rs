@@ -13084,6 +13084,7 @@ impl App {
             crate::video::native_window::NativeVideoWindowEvent::KeyDown(key) => {
                 self.handle_native_video_key_event(ctx, fs_idx, key);
             }
+            crate::video::native_window::NativeVideoWindowEvent::KeyUp(_) => {}
             crate::video::native_window::NativeVideoWindowEvent::MouseMove(_) => {
                 self.mark_native_video_hud_activity(ctx);
             }

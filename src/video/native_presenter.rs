@@ -593,14 +593,15 @@ impl NativeEguiOverlay {
 
         self.event_count = self.event_count.saturating_add(1);
         match event {
-            NativeEvent::KeyDown(key) => {
+            NativeEvent::KeyDown(key) | NativeEvent::KeyUp(key) => {
                 let modifiers = egui_modifiers(key.shift, key.ctrl, key.alt);
                 self.modifiers = modifiers;
                 if let Some(egui_key) = egui_key_from_virtual_key(key.virtual_key) {
+                    let pressed = matches!(event, NativeEvent::KeyDown(_));
                     self.pending_events.push(egui::Event::Key {
                         key: egui_key,
                         physical_key: Some(egui_key),
-                        pressed: true,
+                        pressed,
                         repeat: key.repeat,
                         modifiers,
                     });
@@ -640,8 +641,8 @@ impl NativeEguiOverlay {
                 self.modifiers = modifiers;
                 self.pending_events.push(egui::Event::PointerMoved(pos));
                 self.pending_events.push(egui::Event::MouseWheel {
-                    unit: egui::MouseWheelUnit::Point,
-                    delta: egui::vec2(0.0, wheel.delta as f32),
+                    unit: egui::MouseWheelUnit::Line,
+                    delta: egui::vec2(0.0, wheel.delta as f32 / 120.0),
                     modifiers,
                 });
                 self.dirty = true;
