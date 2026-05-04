@@ -129,6 +129,10 @@ Current limitations of the experimental slice:
   normalizes wheel coordinates to client space, includes Shift/Ctrl flags, and
   tracks mouse leave/capture so the later overlay hit-test can reuse the same
   event path.
+- The native HWND can also handle the basic non-overlay fullscreen actions that
+  do not need egui hit-testing: plain Up/Down navigates to adjacent items,
+  Home/End jumps to the first/last navigable item, Space toggles the current
+  checkmark, and a short right-click closes fullscreen.
 - GPU frames are copied directly to the presenter backbuffer, so this slice is
   intended for same-size smoke tests such as the 1080p120 sync clip until
   scaling/letterboxing is added

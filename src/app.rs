@@ -13150,8 +13150,39 @@ impl App {
                     player.seek_relative(delta);
                 }
             }
+            // Plain Up / Down: navigate files, matching the egui fullscreen path.
+            0x26 if !key.shift && !key.ctrl => {
+                self.navigate_native_video_fullscreen(ctx, fs_idx, -1);
+            }
+            0x28 if !key.shift && !key.ctrl => {
+                self.navigate_native_video_fullscreen(ctx, fs_idx, 1);
+            }
+            // Home / End: jump to the first / last visible navigable item.
+            0x24 if !key.shift && !key.ctrl && !key.repeat => {
+                if let Some(idx) = crate::ui_helpers::boundary_navigable_idx(
+                    &self.items,
+                    &self.visible_indices,
+                    false,
+                ) {
+                    if idx != fs_idx {
+                        self.open_fullscreen(idx);
+                    }
+                }
+            }
+            0x23 if !key.shift && !key.ctrl && !key.repeat => {
+                if let Some(idx) = crate::ui_helpers::boundary_navigable_idx(
+                    &self.items,
+                    &self.visible_indices,
+                    true,
+                ) {
+                    if idx != fs_idx {
+                        self.open_fullscreen(idx);
+                    }
+                }
+            }
             // Shift+Up / Shift+Down: volume. Plain Up/Down remains for the
-            // future full input-routing phase because it navigates files.
+            // future full overlay phase as well, but the native HWND can already
+            // perform the same item navigation without involving egui input.
             0x26 if key.shift && !key.ctrl => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     let v = (player.volume() + 0.20).min(1.0);
@@ -13178,6 +13209,14 @@ impl App {
             0x4C if !key.shift && !key.ctrl && !key.repeat => {
                 self.settings.video_loop = !self.settings.video_loop;
                 self.settings.save();
+            }
+            // Space: check/uncheck the current item, matching normal fullscreen.
+            0x20 if !key.shift && !key.ctrl && !key.repeat => {
+                if self.checked.contains(&fs_idx) {
+                    self.checked.remove(&fs_idx);
+                } else {
+                    self.checked.insert(fs_idx);
+                }
             }
             // P: perf overlay
             0x50 if !key.shift && !key.ctrl && !key.repeat => {
@@ -13227,6 +13266,34 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn navigate_native_video_fullscreen(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        base_delta: i32,
+    ) {
+        if self.fs_nav_is_locked() {
+            return;
+        }
+        let nav_delta = self.spread_nav_delta(base_delta, false);
+        if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(
+            &self.items,
+            &self.visible_indices,
+            fs_idx,
+            nav_delta,
+        ) {
+            self.open_fullscreen(new_idx);
+            ctx.request_repaint();
+        } else {
+            self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::Edge {
+                at_end: nav_delta > 0,
+                at: std::time::Instant::now(),
+            });
+            self.mark_native_video_hud_activity(ctx);
+        }
+    }
+
+    #[cfg(windows)]
     fn handle_native_video_mouse_button(
         &mut self,
         ctx: &egui::Context,
@@ -13236,6 +13303,10 @@ impl App {
         use crate::video::native_window::NativeVideoMouseButton;
 
         self.mark_native_video_hud_activity(ctx);
+        if event.button == NativeVideoMouseButton::Right && !event.down && !event.double_click {
+            self.close_fullscreen();
+            return;
+        }
         if event.button != NativeVideoMouseButton::Left {
             return;
         }
