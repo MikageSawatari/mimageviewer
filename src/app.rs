@@ -13093,6 +13093,9 @@ impl App {
             crate::video::native_window::NativeVideoWindowEvent::MouseWheel(_) => {
                 self.mark_native_video_hud_activity(ctx);
             }
+            crate::video::native_window::NativeVideoWindowEvent::MouseLeave => {
+                self.native_video_pointer_down = None;
+            }
         }
     }
 
@@ -13234,6 +13237,11 @@ impl App {
 
         self.mark_native_video_hud_activity(ctx);
         if event.button != NativeVideoMouseButton::Left {
+            return;
+        }
+
+        if event.double_click {
+            self.native_video_pointer_down = None;
             return;
         }
 

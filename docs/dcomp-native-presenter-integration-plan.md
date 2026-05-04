@@ -125,7 +125,10 @@ Current limitations of the experimental slice:
 - Native mouse messages are now forwarded to the UI thread as Phase C
   scaffolding. Mouse movement only wakes future HUD state, and left-click
   toggles play/pause when VST3 GUI windows are not visible; full overlay
-  hit-testing and seek-bar interaction remain Phase C work.
+  hit-testing and seek-bar interaction remain Phase C work. The bridge already
+  normalizes wheel coordinates to client space, includes Shift/Ctrl flags, and
+  tracks mouse leave/capture so the later overlay hit-test can reuse the same
+  event path.
 - GPU frames are copied directly to the presenter backbuffer, so this slice is
   intended for same-size smoke tests such as the 1080p120 sync clip until
   scaling/letterboxing is added

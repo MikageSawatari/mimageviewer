@@ -1,13 +1,19 @@
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
+use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    VK_CONTROL, VK_MENU, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
-    DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetWindowLongPtrW, IDC_ARROW,
-    IsWindow, LoadCursorW, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW,
-    SetWindowLongPtrW, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
-    WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW,
+    AdjustWindowRectEx, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
+    GetWindowLongPtrW, IDC_ARROW, IsWindow, LoadCursorW, MSG, PM_REMOVE, PeekMessageW,
+    PostQuitMessage, RegisterClassW, SW_SHOW, SetWindowLongPtrW, ShowWindow, TranslateMessage,
+    WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW,
     WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP,
     WS_VISIBLE,
 };
@@ -28,6 +34,7 @@ pub enum NativeVideoWindowEvent {
     MouseMove(NativeVideoMouseEvent),
     MouseButton(NativeVideoMouseButtonEvent),
     MouseWheel(NativeVideoMouseWheelEvent),
+    MouseLeave,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,14 +48,19 @@ pub enum NativeVideoMouseButton {
 pub struct NativeVideoMouseEvent {
     pub x: i32,
     pub y: i32,
+    pub shift: bool,
+    pub ctrl: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub struct NativeVideoMouseButtonEvent {
     pub button: NativeVideoMouseButton,
     pub down: bool,
+    pub double_click: bool,
     pub x: i32,
     pub y: i32,
+    pub shift: bool,
+    pub ctrl: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -56,6 +68,8 @@ pub struct NativeVideoMouseWheelEvent {
     pub delta: i16,
     pub x: i32,
     pub y: i32,
+    pub shift: bool,
+    pub ctrl: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -99,7 +113,7 @@ impl NativeVideoWindow {
             let hinstance = HINSTANCE(hmodule.0);
             let cursor = LoadCursorW(None, IDC_ARROW).ok();
             let wc = WNDCLASSW {
-                style: CS_HREDRAW | CS_VREDRAW,
+                style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
                 lpfnWndProc: Some(wnd_proc),
                 hInstance: hinstance,
                 hCursor: cursor.unwrap_or_default(),
@@ -247,18 +261,28 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOUSEMOVE => {
+            track_mouse_leave(hwnd);
             if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
                 let _ = tx.send(NativeVideoWindowEvent::MouseMove(native_mouse_event(
-                    lparam,
+                    wparam, lparam,
                 )));
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
-        | WM_MBUTTONUP => {
+        | WM_MBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK | WM_MBUTTONDBLCLK => {
+            if mouse_message_is_down(msg) {
+                unsafe {
+                    let _ = SetCapture(hwnd);
+                }
+            } else {
+                unsafe {
+                    let _ = ReleaseCapture();
+                }
+            }
             if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
                 let _ = tx.send(NativeVideoWindowEvent::MouseButton(
-                    native_mouse_button_event(msg, lparam),
+                    native_mouse_button_event(msg, wparam, lparam),
                 ));
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
@@ -266,8 +290,14 @@ unsafe extern "system" fn wnd_proc(
         WM_MOUSEWHEEL => {
             if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
                 let _ = tx.send(NativeVideoWindowEvent::MouseWheel(
-                    native_mouse_wheel_event(wparam, lparam),
+                    native_mouse_wheel_event(hwnd, wparam, lparam),
                 ));
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_MOUSELEAVE => {
+            if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
+                let _ = tx.send(NativeVideoWindowEvent::MouseLeave);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -321,32 +351,86 @@ fn native_key_event(wparam: WPARAM, lparam: LPARAM) -> NativeVideoKeyEvent {
     }
 }
 
-fn native_mouse_event(lparam: LPARAM) -> NativeVideoMouseEvent {
+fn native_mouse_event(wparam: WPARAM, lparam: LPARAM) -> NativeVideoMouseEvent {
     NativeVideoMouseEvent {
         x: signed_low_word(lparam.0),
         y: signed_high_word(lparam.0),
+        shift: mouse_shift(wparam),
+        ctrl: mouse_ctrl(wparam),
     }
 }
 
-fn native_mouse_button_event(msg: u32, lparam: LPARAM) -> NativeVideoMouseButtonEvent {
+fn native_mouse_button_event(
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> NativeVideoMouseButtonEvent {
     let button = match msg {
-        WM_RBUTTONDOWN | WM_RBUTTONUP => NativeVideoMouseButton::Right,
-        WM_MBUTTONDOWN | WM_MBUTTONUP => NativeVideoMouseButton::Middle,
+        WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK => NativeVideoMouseButton::Right,
+        WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK => NativeVideoMouseButton::Middle,
         _ => NativeVideoMouseButton::Left,
     };
     NativeVideoMouseButtonEvent {
         button,
-        down: matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN),
+        down: mouse_message_is_down(msg),
+        double_click: matches!(msg, WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK | WM_MBUTTONDBLCLK),
         x: signed_low_word(lparam.0),
         y: signed_high_word(lparam.0),
+        shift: mouse_shift(wparam),
+        ctrl: mouse_ctrl(wparam),
     }
 }
 
-fn native_mouse_wheel_event(wparam: WPARAM, lparam: LPARAM) -> NativeVideoMouseWheelEvent {
-    NativeVideoMouseWheelEvent {
-        delta: signed_high_word(wparam.0 as isize) as i16,
+fn native_mouse_wheel_event(
+    hwnd: HWND,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> NativeVideoMouseWheelEvent {
+    let mut point = POINT {
         x: signed_low_word(lparam.0),
         y: signed_high_word(lparam.0),
+    };
+    unsafe {
+        let _ = ScreenToClient(hwnd, &mut point);
+    }
+    NativeVideoMouseWheelEvent {
+        delta: signed_high_word(wparam.0 as isize) as i16,
+        x: point.x,
+        y: point.y,
+        shift: mouse_shift(wparam),
+        ctrl: mouse_ctrl(wparam),
+    }
+}
+
+fn mouse_message_is_down(msg: u32) -> bool {
+    matches!(
+        msg,
+        WM_LBUTTONDOWN
+            | WM_RBUTTONDOWN
+            | WM_MBUTTONDOWN
+            | WM_LBUTTONDBLCLK
+            | WM_RBUTTONDBLCLK
+            | WM_MBUTTONDBLCLK
+    )
+}
+
+fn mouse_shift(wparam: WPARAM) -> bool {
+    (wparam.0 & 0x0004) != 0
+}
+
+fn mouse_ctrl(wparam: WPARAM) -> bool {
+    (wparam.0 & 0x0008) != 0
+}
+
+fn track_mouse_leave(hwnd: HWND) {
+    let mut track = TRACKMOUSEEVENT {
+        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+        dwFlags: TME_LEAVE,
+        hwndTrack: hwnd,
+        dwHoverTime: 0,
+    };
+    unsafe {
+        let _ = TrackMouseEvent(&mut track);
     }
 }
 
