@@ -101,6 +101,33 @@ impl Vst3StartupLoadPending {
 /// 進行中の更新チェックワーカー。`rx` が結果を運び、`manual` は失敗時の UI 表示判定。
 /// `App::update_check_pending = None` で両方をまとめて落とせるため、リセットの整合性が
 /// 取りやすい (rx だけ落として manual を残すミスが起きない)。
+/// CLI soak test 用の再生設定。mIV 本体の fullscreen 動画経路をそのまま使い、
+/// 指定時間だけ再生したら自動終了する。
+#[derive(Clone, Debug)]
+pub struct PlayTestConfig {
+    pub path: PathBuf,
+    pub duration: std::time::Duration,
+    pub mute: bool,
+}
+
+pub(crate) struct PlayTestState {
+    config: PlayTestConfig,
+    launched_idx: Option<usize>,
+    playback_started_at: Option<std::time::Instant>,
+    close_sent: bool,
+}
+
+impl PlayTestState {
+    fn new(config: PlayTestConfig) -> Self {
+        Self {
+            config,
+            launched_idx: None,
+            playback_started_at: None,
+            close_sent: false,
+        }
+    }
+}
+
 pub(crate) struct UpdateCheckPending {
     pub(crate) rx: mpsc::Receiver<Result<crate::update_check::UpdateInfo, String>>,
     pub(crate) manual: bool,
@@ -2420,6 +2447,8 @@ pub struct App {
     /// `indexer_manager.is_none()` だけだと「init 失敗で永続 None」と
     /// 「未起動」を区別できないので別フラグで持つ。
     pub(crate) startup_done: bool,
+    /// CLI soak test (`--play-test`) の進行状態。通常起動では None。
+    pub(crate) play_test: Option<PlayTestState>,
     /// `fts_meta` の housekeeping (VACUUM) を起動完了後に走らせるための armed フラグ。
     /// `startup_done` で true になり、全 supervisor が idle に達したフレームで
     /// `spawn_housekeeping` を 1 回呼んで false に倒す (Codex 指摘: VACUUM が
@@ -2908,6 +2937,7 @@ impl Default for App {
             startup_progress: Arc::new(Mutex::new("起動中…".to_string())),
             startup_init: None,
             startup_done: false,
+            play_test: None,
             housekeeping_armed: false,
 
             #[cfg(windows)]
@@ -3659,6 +3689,173 @@ impl App {
                 self.vst3_startup_load = None;
                 self.resume_deferred_vst3_video_open(ctx);
             }
+        }
+    }
+
+    pub fn configure_play_test(&mut self, config: PlayTestConfig) {
+        crate::logger::log(format!(
+            "[play-test] configured path={} duration_ms={} mute={}",
+            config.path.display(),
+            config.duration.as_millis(),
+            config.mute
+        ));
+        self.play_test = Some(PlayTestState::new(config));
+    }
+
+    pub(crate) fn poll_play_test(&mut self, ctx: &egui::Context) {
+        if self.play_test.as_ref().is_none_or(|s| s.close_sent) {
+            return;
+        }
+        if !self.startup_done {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            return;
+        }
+
+        if self
+            .play_test
+            .as_ref()
+            .and_then(|s| s.launched_idx)
+            .is_none()
+        {
+            let Some(config) = self.play_test.as_ref().map(|s| s.config.clone()) else {
+                return;
+            };
+            let idx = self.items.len();
+            self.items.push(GridItem::Video(config.path.clone()));
+            self.image_metas.push(None);
+            self.thumbnails.push(ThumbnailState::Pending);
+            self.items_generation = self.items_generation.wrapping_add(1);
+            self.visible_indices.push(idx);
+            self.selected = Some(idx);
+            self.fs_open_intent_from_grid = true;
+            if config.mute {
+                self.settings.video_start_muted = true;
+            }
+            self.open_fullscreen(idx);
+            if let Some(state) = self.play_test.as_mut() {
+                state.launched_idx = Some(idx);
+            }
+            crate::logger::log(format!(
+                "[play-test] launched idx={} path={}",
+                idx,
+                config.path.display()
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "play_test",
+                    "launched",
+                    Some(&config.path.display().to_string()),
+                    0,
+                    &[
+                        ("idx", serde_json::Value::from(idx as i64)),
+                        (
+                            "duration_ms",
+                            serde_json::Value::from(config.duration.as_secs_f64() * 1000.0),
+                        ),
+                        ("mute", serde_json::Value::from(config.mute)),
+                    ],
+                );
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            return;
+        }
+
+        let Some(idx) = self.play_test.as_ref().and_then(|s| s.launched_idx) else {
+            return;
+        };
+        let video_snapshot = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => Some((
+                player.is_playing(),
+                player.pending_frames(),
+                player.engine_state_code(),
+                player.position(),
+                player.duration(),
+            )),
+            _ => None,
+        };
+
+        if let Some((is_playing, pending_frames, state_code, pos, dur)) = video_snapshot {
+            if self
+                .play_test
+                .as_ref()
+                .and_then(|s| s.playback_started_at)
+                .is_none()
+                && (is_playing || pending_frames > 0)
+            {
+                let now = std::time::Instant::now();
+                if let Some(state) = self.play_test.as_mut() {
+                    state.playback_started_at = Some(now);
+                }
+                crate::logger::log(format!(
+                    "[play-test] playback started idx={idx} state={state_code} pending={pending_frames} pos={pos:.3}"
+                ));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "play_test",
+                        "playback_started",
+                        None,
+                        0,
+                        &[
+                            ("idx", serde_json::Value::from(idx as i64)),
+                            ("state", serde_json::Value::from(state_code as i64)),
+                            (
+                                "pending_frames",
+                                serde_json::Value::from(pending_frames as i64),
+                            ),
+                            ("pos", serde_json::Value::from(pos)),
+                            ("duration", serde_json::Value::from(dur)),
+                        ],
+                    );
+                }
+            }
+        }
+
+        let Some(started_at) = self.play_test.as_ref().and_then(|s| s.playback_started_at) else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            return;
+        };
+        let duration = self
+            .play_test
+            .as_ref()
+            .map(|s| s.config.duration)
+            .unwrap_or_else(|| std::time::Duration::from_secs(30));
+        if started_at.elapsed() >= duration {
+            let final_snapshot = match self.fs_cache.get(&idx) {
+                Some(FsCacheEntry::Video { player, .. }) => Some((
+                    player.position(),
+                    player.duration(),
+                    player.pending_frames(),
+                    player.engine_state_code(),
+                )),
+                _ => None,
+            };
+            if let Some((pos, dur, pending, state_code)) = final_snapshot {
+                crate::logger::log(format!(
+                    "[play-test] completed idx={idx} pos={pos:.3} duration={dur:.3} pending={pending} state={state_code}"
+                ));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "play_test",
+                        "completed",
+                        None,
+                        0,
+                        &[
+                            ("idx", serde_json::Value::from(idx as i64)),
+                            ("pos", serde_json::Value::from(pos)),
+                            ("duration", serde_json::Value::from(dur)),
+                            ("pending_frames", serde_json::Value::from(pending as i64)),
+                            ("state", serde_json::Value::from(state_code as i64)),
+                        ],
+                    );
+                }
+            }
+            crate::perf::flush();
+            if let Some(state) = self.play_test.as_mut() {
+                state.close_sent = true;
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
     }
 
@@ -13673,6 +13870,7 @@ impl eframe::App for App {
         }
         #[cfg(windows)]
         self.poll_vst3_startup_load(ctx);
+        self.poll_play_test(ctx);
 
         // バージョン更新通知: 起動完了後の初回 + 24h 周期で auto kick。
         self.maybe_auto_update_check();

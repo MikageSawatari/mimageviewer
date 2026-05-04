@@ -1380,3 +1380,15 @@ testing: set `MIV_WGPU_PRESENT_MODE=auto_vsync` and
 `MIV_WGPU_FRAME_LATENCY=default` to return to egui-wgpu's default behavior, or
 try `mailbox`, `immediate`, `fifo`, or `fifo_relaxed` when comparing GPU/driver
 behavior.
+
+2026-05-04 playback soak test mode: mIV now has a one-file playback automation
+entry point for nightly regression checks. `--play-test <FILE>` opens the file
+through the normal fullscreen video path, `--play-duration <SECONDS>` closes the
+app after playback has run for that long (default 30s), and `--play-muted`
+prevents audible output during unattended runs. `--perf-log <PATH>` or
+`--perf-log-path <PATH>` writes JSONL events to a per-run path instead of the
+default `%APPDATA%` log, which lets harnesses keep one log per video. The helper
+`scripts/video_soak.py` recursively shuffles one or more folders, launches one
+mIV process per video, summarizes `display_miss`, `frame_gap`, decoder drops,
+packet waits, and completion status, and can run multiple environment-defined
+modes (for example different wgpu present modes) against the same corpus.

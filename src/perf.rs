@@ -23,6 +23,7 @@
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -43,15 +44,32 @@ const MAX_GENERATIONS: usize = 5;
 /// 初期化ステップ (data_dir / モデル展開 / Susie 展開 等) の時間も、
 /// 後からイベントとして打刻できる。`None` なら `Instant::now()` を基準にする。
 pub fn init(enabled: bool, start_override: Option<Instant>) {
+    init_with_path(enabled, start_override, None);
+}
+
+/// `init` と同じだが、`log_path_override` が指定された場合はそのパスへ直接書く。
+/// soak test では 1 動画 1 JSONL に分けるため、固定ログの rotation は行わない。
+pub fn init_with_path(
+    enabled: bool,
+    start_override: Option<Instant>,
+    log_path_override: Option<PathBuf>,
+) {
     if !enabled {
         return;
     }
     let start = start_override.unwrap_or_else(Instant::now);
     START.set(start).ok();
-    let log_dir = crate::data_dir::logs_dir();
-    let _ = std::fs::create_dir_all(&log_dir);
-    let log_path = log_dir.join("perf_events.jsonl");
-    rotate_logs(&log_dir);
+    let log_path = if let Some(path) = log_path_override {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        path
+    } else {
+        let log_dir = crate::data_dir::logs_dir();
+        let _ = std::fs::create_dir_all(&log_dir);
+        rotate_logs(&log_dir);
+        log_dir.join("perf_events.jsonl")
+    };
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).write(true).truncate(true);
     allow_live_log_reading(&mut opts);

@@ -184,6 +184,8 @@ fn main() -> eframe::Result {
     // --pdf-worker モードでは計測しないので worker 判定の前に取らない。
     // --perf-log 無効時は `emit_startup` が no-op なのでコストはゼロ。
     let prog_start = Instant::now();
+    let play_test_config = parse_play_test_config();
+    let perf_log_path = parse_perf_log_path_arg();
 
     // --pdf-worker モード: GUI なしで PDFium ワーカープロセスとして起動
     if std::env::args().any(|a| a == pdf_loader::PDF_WORKER_ARG) {
@@ -248,8 +250,26 @@ fn main() -> eframe::Result {
     // --perf-log: 構造化イベントログ (JSON Lines) を有効化する。
     // 無指定時は `perf::is_enabled()` が false のまま、全 perf::event 呼出しが即 return。
     // prog_start を基準にすることで startup.* イベントの `total_ms` が真の経過時間を指す。
-    let perf_enabled = std::env::args().any(|a| a == "--perf-log");
-    perf::init(perf_enabled, Some(prog_start));
+    let perf_enabled = std::env::args().any(|a| a == "--perf-log" || a == "--perf-log-path")
+        || perf_log_path.is_some();
+    perf::init_with_path(perf_enabled, Some(prog_start), perf_log_path);
+
+    if let Some(config) = &play_test_config {
+        if !config.path.is_file() {
+            eprintln!("--play-test path is not a file: {}", config.path.display());
+            logger::log(format!(
+                "play-test: path is not a file: {}",
+                config.path.display()
+            ));
+            std::process::exit(2);
+        }
+        logger::log(format!(
+            "play-test: path={} duration_ms={} mute={}",
+            config.path.display(),
+            config.duration.as_millis(),
+            config.mute
+        ));
+    }
 
     // 起動時間計測: data_dir 初期化は先行ステップなので perf::init 後に後追いで打つ。
     // phase_start を渡すと ms を載せられるが、ここは経過分を再現できないので
@@ -417,6 +437,9 @@ fn main() -> eframe::Result {
             let t = Instant::now();
             let mut app = app::App::default();
             emit_startup("app_default", Some(t));
+            if let Some(config) = play_test_config.clone() {
+                app.configure_play_test(config);
+            }
             app.applied_ui_theme = Some(resolved);
 
             // 動画 GPU レンダリング用の wgpu::Device / Queue を保存。
@@ -562,6 +585,46 @@ fn parse_window_size_arg() -> Option<[f32; 2]> {
         }
     }
     None
+}
+
+fn arg_value(flag: &str) -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    for i in 0..args.len().saturating_sub(1) {
+        if args[i] == flag {
+            return Some(args[i + 1].clone());
+        }
+    }
+    None
+}
+
+fn has_arg(flag: &str) -> bool {
+    std::env::args().any(|a| a == flag)
+}
+
+fn parse_perf_log_path_arg() -> Option<std::path::PathBuf> {
+    if let Some(path) = arg_value("--perf-log-path") {
+        return Some(std::path::PathBuf::from(path));
+    }
+    let args: Vec<String> = std::env::args().collect();
+    for i in 0..args.len().saturating_sub(1) {
+        if args[i] == "--perf-log" && !args[i + 1].starts_with("--") {
+            return Some(std::path::PathBuf::from(args[i + 1].clone()));
+        }
+    }
+    None
+}
+
+fn parse_play_test_config() -> Option<app::PlayTestConfig> {
+    let path = std::path::PathBuf::from(arg_value("--play-test")?);
+    let duration_secs = arg_value("--play-duration")
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .unwrap_or(30.0);
+    Some(app::PlayTestConfig {
+        path,
+        duration: std::time::Duration::from_secs_f64(duration_secs),
+        mute: has_arg("--play-muted") || has_arg("--mute"),
+    })
 }
 
 fn sane_window_size(size: [f32; 2]) -> bool {
