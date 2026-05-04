@@ -73,6 +73,12 @@ Status:
 - 2026-05-04: the overlay now seeds egui with `GetDpiForWindow`-based
   `native_pixels_per_point` and converts Win32 physical mouse coordinates into
   egui points. This keeps future HUD hit-testing aligned on high-DPI monitors.
+- 2026-05-04: hit-test routing is now wired through `egui_ctx` after each
+  overlay frame. `wants_pointer_input()` gates mouse forwarding and
+  `wants_keyboard_input()` gates key forwarding to the legacy native fullscreen
+  shortcut path, so overlay widgets can consume their own input while video-area
+  clicks keep using the existing shortcuts. A first bottom seek/hover bar has
+  replaced the static spike label as the production-shaped HUD slice.
 
 Acceptance for the spike:
 

@@ -185,6 +185,14 @@ Status:
   `GetDpiForWindow`, sends it through egui's viewport input, and scales native
   mouse coordinates from physical pixels to egui points. Dynamic DPI-change
   handling is still a Phase E production gap.
+- 2026-05-04: overlay input now feeds an egui hit-test routing decision back to
+  the native presenter loop. When the egui overlay wants pointer or keyboard
+  input, the matching native input batch is no longer forwarded to the legacy
+  UI-thread fullscreen shortcut path; clicks outside the overlay still pass
+  through to the existing native video shortcuts. The first production-shaped
+  overlay HUD slice is a bottom seek/hover bar that reads playback position
+  from the native clock and duration from a shared atomic updated on
+  `InfoReceived`.
 
 The first production slice can accept a 60Hz overlay cadence as long as video
 presentation remains independent at 120fps.

@@ -85,6 +85,11 @@ struct NativeEguiOverlay {
     pointer_pos: Option<egui::Pos2>,
     event_count: u64,
     dirty: bool,
+    wants_pointer_input: bool,
+    wants_keyboard_input: bool,
+    video_position_secs: f64,
+    video_duration_secs: f64,
+    video_is_playing: bool,
     pixels_per_point: f32,
     width: u32,
     height: u32,
@@ -97,6 +102,29 @@ pub struct NativePresentOutcome {
     pub fence_wait_ms: f64,
     pub copy_ms: f64,
     pub present_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeOverlayInputRouting {
+    pub wants_pointer_input: bool,
+    pub wants_keyboard_input: bool,
+}
+
+impl NativeOverlayInputRouting {
+    pub fn should_forward_to_ui(
+        self,
+        event: crate::video::native_window::NativeVideoWindowEvent,
+    ) -> bool {
+        use crate::video::native_window::NativeVideoWindowEvent as NativeEvent;
+
+        match event {
+            NativeEvent::KeyDown(_) | NativeEvent::KeyUp(_) => !self.wants_keyboard_input,
+            NativeEvent::MouseMove(_)
+            | NativeEvent::MouseButton(_)
+            | NativeEvent::MouseWheel(_)
+            | NativeEvent::MouseLeave => !self.wants_pointer_input,
+        }
+    }
 }
 
 fn create_present_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), String> {
@@ -427,12 +455,23 @@ impl NativeVideoPresenter {
     pub fn handle_window_events(
         &mut self,
         events: &[crate::video::native_window::NativeVideoWindowEvent],
-    ) -> Result<(), String> {
+    ) -> Result<NativeOverlayInputRouting, String> {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.push_native_events(events);
-            overlay.render_if_dirty()?;
+            return overlay.render_if_dirty();
         }
-        Ok(())
+        Ok(NativeOverlayInputRouting::default())
+    }
+
+    pub fn update_overlay_video_state(
+        &mut self,
+        position_secs: f64,
+        duration_secs: f64,
+        is_playing: bool,
+    ) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.update_video_state(position_secs, duration_secs, is_playing);
+        }
     }
 
     fn open_fence(
@@ -556,6 +595,11 @@ impl NativeEguiOverlay {
             pointer_pos: None,
             event_count: 0,
             dirty: true,
+            wants_pointer_input: false,
+            wants_keyboard_input: false,
+            video_position_secs: 0.0,
+            video_duration_secs: 0.0,
+            video_is_playing: false,
             pixels_per_point,
             width: width.max(1),
             height: height.max(1),
@@ -670,6 +714,18 @@ impl NativeEguiOverlay {
         }
     }
 
+    fn update_video_state(&mut self, position_secs: f64, duration_secs: f64, is_playing: bool) {
+        let position_secs = finite_nonnegative(position_secs);
+        let duration_secs = finite_nonnegative(duration_secs);
+        let duration_changed = (self.video_duration_secs - duration_secs).abs() > 0.001;
+        self.video_position_secs = position_secs;
+        self.video_duration_secs = duration_secs;
+        self.video_is_playing = is_playing;
+        if duration_changed {
+            self.dirty = true;
+        }
+    }
+
     fn native_pos(&self, x: i32, y: i32) -> egui::Pos2 {
         egui::pos2(
             x as f32 / self.pixels_per_point,
@@ -677,11 +733,19 @@ impl NativeEguiOverlay {
         )
     }
 
-    fn render_if_dirty(&mut self) -> Result<(), String> {
+    fn render_if_dirty(&mut self) -> Result<NativeOverlayInputRouting, String> {
         if !self.dirty && self.pending_events.is_empty() {
-            return Ok(());
+            return Ok(self.input_routing());
         }
-        self.render_once()
+        self.render_once()?;
+        Ok(self.input_routing())
+    }
+
+    fn input_routing(&self) -> NativeOverlayInputRouting {
+        NativeOverlayInputRouting {
+            wants_pointer_input: self.wants_pointer_input,
+            wants_keyboard_input: self.wants_keyboard_input,
+        }
     }
 
     fn configure(&self) {
@@ -705,11 +769,18 @@ impl NativeEguiOverlay {
         let ppp = self.pixels_per_point;
         let event_count = self.event_count;
         let pointer_pos = self.pointer_pos;
+        let overlay_width_points = self.width as f32 / ppp;
+        let overlay_height_points = self.height as f32 / ppp;
+        let position_secs = self.video_position_secs;
+        let duration_secs = self.video_duration_secs;
+        let is_playing = self.video_is_playing;
+        let hud_visible =
+            pointer_pos.is_some_and(|pos| pos.y >= (overlay_height_points - 76.0).max(0.0));
         let pending_event_count = self.pending_events.len();
         let mut raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(self.width as f32 / ppp, self.height as f32 / ppp),
+                egui::vec2(overlay_width_points, overlay_height_points),
             )),
             time: Some(self.started_at.elapsed().as_secs_f64()),
             predicted_dt: 1.0 / 60.0,
@@ -721,46 +792,120 @@ impl NativeEguiOverlay {
             viewport.native_pixels_per_point = Some(ppp);
         }
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            let painter = ctx.layer_painter(egui::LayerId::new(
-                egui::Order::Foreground,
-                egui::Id::new("native_egui_overlay_spike"),
-            ));
-            let rect = egui::Rect::from_min_size(egui::pos2(32.0, 32.0), egui::vec2(360.0, 74.0));
-            painter.rect_filled(
-                rect,
-                egui::CornerRadius::same(6),
-                egui::Color32::from_rgba_premultiplied(0, 46, 21, 168),
-            );
-            painter.rect_filled(
-                egui::Rect::from_min_size(egui::pos2(46.0, 48.0), egui::vec2(28.0, 28.0)),
-                egui::CornerRadius::same(4),
-                egui::Color32::from_rgba_premultiplied(0, 92, 38, 188),
-            );
-            painter.text(
-                egui::pos2(88.0, 46.0),
-                egui::Align2::LEFT_TOP,
-                "DComp egui overlay",
-                egui::FontId::proportional(19.0),
-                egui::Color32::from_rgb(210, 246, 218),
-            );
-            painter.text(
-                egui::pos2(88.0, 72.0),
-                egui::Align2::LEFT_TOP,
-                "wgpu SurfaceTarget::CompositionVisual",
-                egui::FontId::proportional(13.0),
-                egui::Color32::from_rgb(158, 206, 172),
-            );
-            let pointer = pointer_pos
-                .map(|p| format!("{:.0},{:.0}", p.x, p.y))
-                .unwrap_or_else(|| "outside".to_string());
-            painter.text(
-                egui::pos2(88.0, 90.0),
-                egui::Align2::LEFT_TOP,
-                format!("events={event_count} pointer={pointer}"),
-                egui::FontId::proportional(12.0),
-                egui::Color32::from_rgb(132, 188, 148),
-            );
+            if !hud_visible {
+                return;
+            }
+            egui::Area::new(egui::Id::new("native_video_seek_hud"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(0.0, (overlay_height_points - 46.0).max(0.0)))
+                .show(ctx, |ui| {
+                    ui.set_min_size(egui::vec2(overlay_width_points, 46.0));
+                    let hud_rect = ui.min_rect();
+                    let painter = ui.painter();
+                    painter.rect_filled(
+                        hud_rect,
+                        0.0,
+                        egui::Color32::from_rgba_premultiplied(0, 0, 0, 176),
+                    );
+
+                    let side_pad = 24.0;
+                    let time_w = 132.0;
+                    let bar_min_x = hud_rect.min.x + side_pad + time_w + 12.0;
+                    let bar_max_x = (hud_rect.max.x - side_pad).max(bar_min_x + 1.0);
+                    let center_y = hud_rect.center().y;
+                    let bar_rect = egui::Rect::from_min_max(
+                        egui::pos2(bar_min_x, center_y - 4.0),
+                        egui::pos2(bar_max_x, center_y + 4.0),
+                    );
+                    let hit_rect = egui::Rect::from_min_max(
+                        egui::pos2(bar_min_x, hud_rect.min.y),
+                        egui::pos2(bar_max_x, hud_rect.max.y),
+                    );
+
+                    let label = format!(
+                        "{} / {}",
+                        format_overlay_time(position_secs),
+                        format_overlay_time(duration_secs)
+                    );
+                    painter.text(
+                        egui::pos2(hud_rect.min.x + side_pad, center_y),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        egui::FontId::proportional(14.0),
+                        egui::Color32::from_rgb(238, 238, 238),
+                    );
+                    let play_glyph = if is_playing { "||" } else { ">" };
+                    painter.text(
+                        egui::pos2(hud_rect.min.x + 10.0, center_y),
+                        egui::Align2::CENTER_CENTER,
+                        play_glyph,
+                        egui::FontId::proportional(15.0),
+                        egui::Color32::from_rgb(220, 220, 220),
+                    );
+
+                    painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(74));
+                    if duration_secs > 0.0 {
+                        let progress = (position_secs / duration_secs).clamp(0.0, 1.0) as f32;
+                        let filled = egui::Rect::from_min_max(
+                            bar_rect.min,
+                            egui::pos2(
+                                bar_rect.min.x + bar_rect.width() * progress,
+                                bar_rect.max.y,
+                            ),
+                        );
+                        painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(228, 228, 228));
+                    }
+
+                    let seek_resp = ui.interact(
+                        hit_rect,
+                        egui::Id::new("native_video_seek_hit"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if seek_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                    if duration_secs > 0.0
+                        && seek_resp.hovered()
+                        && let Some(pos) = pointer_pos
+                    {
+                        let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
+                        let frac = ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
+                        let target = duration_secs * frac as f64;
+                        painter.line_segment(
+                            [
+                                egui::pos2(x, hud_rect.min.y + 6.0),
+                                egui::pos2(x, hud_rect.max.y - 6.0),
+                            ],
+                            egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 214, 106)),
+                        );
+                        painter.text(
+                            egui::pos2(x, hud_rect.min.y - 8.0),
+                            egui::Align2::CENTER_BOTTOM,
+                            format_overlay_time(target),
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::from_rgb(255, 232, 160),
+                        );
+                    }
+
+                    if cfg!(debug_assertions) {
+                        let pointer = pointer_pos
+                            .map(|p| format!("{:.0},{:.0}", p.x, p.y))
+                            .unwrap_or_else(|| "outside".to_string());
+                        painter.text(
+                            egui::pos2(hud_rect.max.x - 12.0, hud_rect.min.y + 10.0),
+                            egui::Align2::RIGHT_TOP,
+                            format!("native overlay events={event_count} pointer={pointer}"),
+                            egui::FontId::proportional(10.0),
+                            egui::Color32::from_rgb(150, 150, 150),
+                        );
+                    }
+                });
         });
+        // Query after `run`: egui updates these flags from the just-processed
+        // frame, which lets this presenter decide whether to forward the same
+        // native input batch to the legacy fullscreen shortcut path.
+        self.wants_pointer_input = self.egui_ctx.wants_pointer_input();
+        self.wants_keyboard_input = self.egui_ctx.wants_keyboard_input();
 
         let shape_count = full_output.shapes.len();
         for (id, image_delta) in &full_output.textures_delta.set {
@@ -833,6 +978,8 @@ impl NativeEguiOverlay {
                 ("pixels_per_point", Value::from(ppp)),
                 ("shapes", Value::from(shape_count as i64)),
                 ("paint_jobs", Value::from(paint_jobs.len() as i64)),
+                ("wants_pointer", Value::from(self.wants_pointer_input)),
+                ("wants_keyboard", Value::from(self.wants_keyboard_input)),
                 (
                     "render_ms",
                     Value::from(render_t0.elapsed().as_secs_f64() * 1000.0),
@@ -860,6 +1007,26 @@ fn choose_overlay_surface_format(
         .first()
         .copied()
         .ok_or_else(|| "wgpu DComp overlay surface has no formats".to_string())
+}
+
+fn finite_nonnegative(value: f64) -> f64 {
+    if value.is_finite() && value > 0.0 {
+        value
+    } else {
+        0.0
+    }
+}
+
+fn format_overlay_time(secs: f64) -> String {
+    let total = finite_nonnegative(secs).round() as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
 fn pixels_per_point_for_hwnd(hwnd: HWND) -> f32 {

@@ -86,6 +86,10 @@ pub struct VideoPlayer {
     /// +1。GPU/CPU 両経路で更新するので、UI 側の perf overlay が経路に依存せず
     /// 「新フレーム到着」を検知できる (Phase 8.I 修正)。
     displayed_frame_seq: Arc<AtomicU64>,
+    /// Native overlay HUD が UI thread を経由せず duration を読めるように共有する。
+    /// f64::to_bits() / from_bits() で保持し、InfoReceived 時に一度更新する。
+    #[cfg(windows)]
+    duration_secs_bits: Arc<AtomicU64>,
     /// decoder の video_tx try_send が Full で送信できず捨てた累積数。
     /// decoder thread と共有し、perf overlay では UI 側 dropped_past と色分けする。
     decoder_dropped_full_count: Arc<AtomicU64>,
@@ -177,6 +181,7 @@ impl NativeVideoOutput {
         clock: Arc<AvClock>,
         engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
         displayed_frame_seq: Arc<AtomicU64>,
+        duration_secs_bits: Arc<AtomicU64>,
         config: NativeVideoOutputConfig,
     ) -> Option<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
@@ -194,6 +199,7 @@ impl NativeVideoOutput {
                     clock,
                     engine_event_tx,
                     displayed_frame_seq,
+                    duration_secs_bits,
                     config,
                     event_tx,
                     thread_cancel,
@@ -281,6 +287,7 @@ fn run_native_video_output(
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
     displayed_frame_seq: Arc<AtomicU64>,
+    duration_secs_bits: Arc<AtomicU64>,
     config: NativeVideoOutputConfig,
     ui_event_tx: std::sync::mpsc::Sender<native_window::NativeVideoWindowEvent>,
     cancel: Arc<AtomicBool>,
@@ -341,11 +348,24 @@ fn run_native_video_output(
             native_events.push(event);
         }
         if !native_events.is_empty() {
-            if let Err(err) = presenter.handle_window_events(&native_events) {
-                crate::logger::log(format!("[native-video] overlay input render failed: {err}"));
-            }
+            presenter.update_overlay_video_state(
+                clock.now_secs(),
+                f64::from_bits(duration_secs_bits.load(Ordering::Acquire)),
+                clock.is_playing(),
+            );
+            let overlay_routing = match presenter.handle_window_events(&native_events) {
+                Ok(routing) => routing,
+                Err(err) => {
+                    crate::logger::log(format!(
+                        "[native-video] overlay input render failed: {err}"
+                    ));
+                    crate::video::native_presenter::NativeOverlayInputRouting::default()
+                }
+            };
             for event in &native_events {
-                let _ = ui_event_tx.send(*event);
+                if overlay_routing.should_forward_to_ui(*event) {
+                    let _ = ui_event_tx.send(*event);
+                }
             }
         }
 
@@ -544,6 +564,8 @@ impl VideoPlayer {
                 gpu_latest: None,
                 #[cfg(windows)]
                 native_output: None,
+                #[cfg(windows)]
+                duration_secs_bits: Arc::new(AtomicU64::new(0.0_f64.to_bits())),
             };
         }
 
@@ -640,12 +662,15 @@ impl VideoPlayer {
         let thumb_worker = Some(ThumbnailWorker::spawn(path.clone()));
         let displayed_frame_seq = Arc::new(AtomicU64::new(0));
         #[cfg(windows)]
+        let duration_secs_bits = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
+        #[cfg(windows)]
         let native_output = native_output_config.and_then(|config| {
             NativeVideoOutput::spawn(
                 native_video_rx,
                 Arc::clone(&clock),
                 engine_event_tx.clone(),
                 Arc::clone(&displayed_frame_seq),
+                Arc::clone(&duration_secs_bits),
                 config,
             )
         });
@@ -660,6 +685,8 @@ impl VideoPlayer {
             info_event_emitted: false,
             first_frame_event_last_epoch: None,
             displayed_frame_seq,
+            #[cfg(windows)]
+            duration_secs_bits,
             decoder_dropped_full_count,
             ui_dropped_past_count: AtomicU64::new(0),
             cancel,
@@ -938,6 +965,9 @@ impl VideoPlayer {
             if let Ok(result) = self.decode.info_rx.try_recv() {
                 match result {
                     Ok(info) => {
+                        #[cfg(windows)]
+                        self.duration_secs_bits
+                            .store(info.duration_secs.to_bits(), Ordering::Release);
                         // Phase 3c: engine にも InfoReceived event を流す。
                         // resume_secs は **AvClock 経由の旧経路** で処理し続け、
                         // engine 側でも resume_secs を OpenOptions で受領済みなので
