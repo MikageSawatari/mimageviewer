@@ -32,6 +32,8 @@ use windows_numerics::Matrix3x2;
 
 use crate::video::decoder::{VideoFrame, VideoFrameData};
 
+const SHARED_TEXTURE_CACHE_CAPACITY: usize = 64;
+
 pub struct NativePresenterConfig {
     pub hwnd: HWND,
     pub width: u32,
@@ -56,6 +58,7 @@ pub struct NativeVideoPresenter {
     test_overlay: Option<NativeTestOverlay>,
     egui_overlay: Option<NativeEguiOverlay>,
     fence_cache: Option<(u64, isize, ID3D11Fence)>,
+    shared_texture_cache: Vec<(u64, ID3D11Texture2D)>,
     pixel_probe_enabled: bool,
     last_pixel_probe: Option<Instant>,
     width: u32,
@@ -104,6 +107,8 @@ struct NativeEguiOverlay {
 
 pub struct NativePresentOutcome {
     pub path: &'static str,
+    pub shared_handle: u64,
+    pub shared_cache_hit: bool,
     pub wait_ms: f64,
     pub wait_timed_out: bool,
     pub fence_wait_ms: f64,
@@ -363,6 +368,7 @@ impl NativeVideoPresenter {
                 test_overlay,
                 egui_overlay,
                 fence_cache: None,
+                shared_texture_cache: Vec::new(),
                 pixel_probe_enabled: std::env::var_os("MIV_NATIVE_VIDEO_PIXEL_PROBE").is_some(),
                 last_pixel_probe: None,
                 width: config.width,
@@ -434,6 +440,8 @@ impl NativeVideoPresenter {
         let mut open_shared_ms = 0.0;
         let mut keyed_mutex_ms = 0.0;
         let copy_call_ms;
+        let mut shared_handle = 0;
+        let mut shared_cache_hit = false;
         let path = match &frame.data {
             VideoFrameData::Cpu(bytes) => {
                 self.ensure_video_surface_size(frame.width, frame.height)?;
@@ -462,6 +470,7 @@ impl NativeVideoPresenter {
                 if gpu_frame.width != frame.width || gpu_frame.height != frame.height {
                     return Err("D3D11 frame metadata size mismatch".into());
                 }
+                shared_handle = gpu_frame.shared_handle.0 as usize as u64;
                 self.ensure_video_surface_size(gpu_frame.width, gpu_frame.height)?;
                 let probe_this_frame = self.pixel_probe_due();
                 let fence = self.open_fence(gpu_frame.fence_gen, gpu_frame.fence_shared_handle)?;
@@ -473,11 +482,8 @@ impl NativeVideoPresenter {
                 }
                 fence_wait_ms = fence_t0.elapsed().as_secs_f64() * 1000.0;
                 let open_shared_t0 = Instant::now();
-                let src: ID3D11Texture2D = unsafe {
-                    self.d3d_device1
-                        .OpenSharedResource1(gpu_frame.shared_handle)
-                        .map_err(|e| format!("OpenSharedResource1 frame texture: {e:?}"))?
-                };
+                let (src, cache_hit) = self.open_shared_texture(gpu_frame.shared_handle)?;
+                shared_cache_hit = cache_hit;
                 open_shared_ms = open_shared_t0.elapsed().as_secs_f64() * 1000.0;
                 let keyed_mutex_t0 = Instant::now();
                 let _keyed_mutex = self.acquire_source_keyed_mutex(&src)?;
@@ -545,6 +551,8 @@ impl NativeVideoPresenter {
         let present_ms = present_t0.elapsed().as_secs_f64() * 1000.0;
         Ok(NativePresentOutcome {
             path,
+            shared_handle,
+            shared_cache_hit,
             wait_ms,
             wait_timed_out: timed_out,
             fence_wait_ms,
@@ -619,6 +627,37 @@ impl NativeVideoPresenter {
             self.fence_cache = Some((fence_gen, handle_key, fence));
         }
         Ok(self.fence_cache.as_ref().unwrap().2.clone())
+    }
+
+    fn open_shared_texture(
+        &mut self,
+        shared_handle: HANDLE,
+    ) -> Result<(ID3D11Texture2D, bool), String> {
+        let handle_key = shared_handle.0 as usize as u64;
+        if let Some(pos) = self
+            .shared_texture_cache
+            .iter()
+            .position(|(cached_key, _)| *cached_key == handle_key)
+        {
+            let texture = self.shared_texture_cache[pos].1.clone();
+            if pos != 0 {
+                let entry = self.shared_texture_cache.remove(pos);
+                self.shared_texture_cache.insert(0, entry);
+            }
+            return Ok((texture, true));
+        }
+
+        let texture: ID3D11Texture2D = unsafe {
+            self.d3d_device1
+                .OpenSharedResource1(shared_handle)
+                .map_err(|e| format!("OpenSharedResource1 frame texture: {e:?}"))?
+        };
+        self.shared_texture_cache
+            .insert(0, (handle_key, texture.clone()));
+        if self.shared_texture_cache.len() > SHARED_TEXTURE_CACHE_CAPACITY {
+            self.shared_texture_cache.pop();
+        }
+        Ok((texture, false))
     }
 
     fn ensure_video_surface_size(&mut self, width: u32, height: u32) -> Result<(), String> {
@@ -707,7 +746,7 @@ impl NativeVideoPresenter {
         };
         unsafe {
             mutex
-                .AcquireSync(1, 100)
+                .AcquireSync(1, 2)
                 .map_err(|e| format!("source keyed mutex AcquireSync(1): {e:?}"))?;
         }
         Ok(Some(KeyedMutexReadGuard {

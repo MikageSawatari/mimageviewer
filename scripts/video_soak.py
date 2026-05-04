@@ -104,6 +104,9 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
     present_keyed_mutex_ms: list[float] = []
     present_copy_call_ms: list[float] = []
     present_total_ms: list[float] = []
+    present_shared_handles: set[int] = set()
+    present_shared_cache_hits = 0
+    present_shared_cache_misses = 0
     total = 0
     if not path.exists():
         return {"events": 0, "missing_log": 1}
@@ -160,6 +163,14 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
                         native_summary[f"native_{field}"] = value
             if cat == "native_presenter" and kind == "fullscreen_present":
                 path_value = str(event.get("path", ""))
+                shared_handle = event.get("shared_handle")
+                if isinstance(shared_handle, int) and shared_handle:
+                    present_shared_handles.add(shared_handle)
+                shared_cache_hit = event.get("shared_cache_hit")
+                if shared_cache_hit is True:
+                    present_shared_cache_hits += 1
+                elif shared_cache_hit is False and path_value == "d3d11_shared":
+                    present_shared_cache_misses += 1
                 copy_ms = event.get("copy_ms")
                 if isinstance(copy_ms, (int, float)):
                     copy_ms_f = float(copy_ms)
@@ -202,6 +213,9 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
         ),
         "overlay_max_interval_ms": overlay_max_interval_ms,
         "native_present_logged": counts.get("native_presenter/fullscreen_present", 0),
+        "native_shared_handle_unique": len(present_shared_handles),
+        "native_shared_cache_hits": present_shared_cache_hits,
+        "native_shared_cache_misses": present_shared_cache_misses,
         "native_copy_ms_p50": percentile(present_copy_ms, 0.50),
         "native_copy_ms_p95": percentile(present_copy_ms, 0.95),
         "native_copy_ms_max": max(present_copy_ms, default=0.0),
@@ -373,8 +387,8 @@ def main() -> int:
         f"- modes: {', '.join(m.name for m in modes)}",
         f"- duration: {args.duration}s",
         "",
-        "| status | mode | seconds | display_miss | frame_gap | drops | max_gap_ms | overlay_present | overlay_max_render_ms | overlay_max_interval_ms | native_present_samples | native_copy_p95_ms | native_copy_max_ms | native_fence_max_ms | log | video |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        "| status | mode | seconds | display_miss | frame_gap | drops | max_gap_ms | overlay_present | overlay_max_render_ms | overlay_max_interval_ms | native_present_samples | native_shared_handles | native_cache_hits | native_cache_misses | native_copy_p95_ms | native_copy_max_ms | native_fence_max_ms | log | video |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
 
     failures = 0
@@ -411,6 +425,9 @@ def main() -> int:
             overlay_max_render_ms = float(metrics.get("max_overlay_render_ms", 0.0))
             overlay_max_interval_ms = float(metrics.get("overlay_max_interval_ms", 0.0))
             native_present_logged = int(metrics.get("native_present_logged", 0))
+            native_shared_handles = int(metrics.get("native_shared_handle_unique", 0))
+            native_cache_hits = int(metrics.get("native_shared_cache_hits", 0))
+            native_cache_misses = int(metrics.get("native_shared_cache_misses", 0))
             native_copy_p95 = float(metrics.get("native_copy_ms_p95", 0.0))
             native_copy_max = float(metrics.get("native_copy_ms_max", 0.0))
             native_fence_max = float(metrics.get("native_fence_wait_ms_max", 0.0))
@@ -423,6 +440,9 @@ def main() -> int:
                 f"{overlay_max_render_ms:.2f} | "
                 f"{overlay_max_interval_ms:.1f} | "
                 f"{native_present_logged} | "
+                f"{native_shared_handles} | "
+                f"{native_cache_hits} | "
+                f"{native_cache_misses} | "
                 f"{native_copy_p95:.2f} | "
                 f"{native_copy_max:.2f} | "
                 f"{native_fence_max:.2f} | "

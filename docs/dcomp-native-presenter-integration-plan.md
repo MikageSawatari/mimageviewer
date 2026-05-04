@@ -286,7 +286,15 @@ For production native presenter copy/fence spikes, use
 `docs/codex-native-presenter-copy-spike-brief.md`. Setting
 `MIV_NATIVE_VIDEO_PRESENT_TRACE=1` logs every `fullscreen_present` event so
 `scripts/video_soak.py` can report `native_copy_p95_ms`,
-`native_copy_max_ms`, and `native_fence_max_ms` from real per-present samples.
+`native_copy_max_ms`, `native_fence_max_ms`, shared handle cardinality, and
+presenter shared-texture cache hits from real per-present samples. The
+production decoder keeps a bounded D3D11 shared-output pool so NT shared handles
+remain stable across frames; `OpenSharedResource1` should be limited to pool
+warmup and source size/format changes. The presenter treats keyed-mutex read
+ownership as a fail-fast check after the shared fence has completed, avoiding a
+long presenter-thread stall if a pooled texture is not immediately readable.
+The pool size tracks the existing video frame channel depth so startup does not
+create more shared textures than the playback queue can reasonably hold.
 
 Core clips:
 

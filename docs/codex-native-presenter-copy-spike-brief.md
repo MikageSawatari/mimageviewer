@@ -18,12 +18,23 @@ startup noise, rare driver stalls, or a sustained production-path problem.
 `native_presenter/fullscreen_present` events:
 
 - `native_present_samples`
+- `native_shared_handles`
+- `native_shared_cache_hits`
+- `native_shared_cache_misses`
 - `native_copy_p95_ms`
 - `native_copy_max_ms`
 - `native_fence_max_ms`
 
+The decoder also emits `video/shared_output_pool_grow` while the reusable D3D11
+shared-output pool warms up. These events should stop once the pool has enough
+free slots for the current source size/format. Once the bounded pool is full,
+the decoder worker waits for a frame-owned slot release instead of allocating a
+transient NT shared handle.
+
 The raw `fullscreen_present` events also split the aggregate `copy_ms` into:
 
+- `shared_handle`
+- `shared_cache_hit`
 - `open_shared_ms` (`OpenSharedResource1`)
 - `keyed_mutex_ms` (`AcquireSync(1)`)
 - `copy_call_ms` (`UpdateSubresource` or `CopySubresourceRegion`)
@@ -72,6 +83,11 @@ Optionally repeat with the egui overlay enabled:
 - `status` stays `OK`.
 - `native_late_drop` remains `0` in raw `native_presenter/summary` events.
 - `native_present_samples` is close to the native present count for traced runs.
+- `native_shared_handles` identifies whether the producer is reusing a small
+  shared-output ring or creating a new NT shared texture handle per frame.
+- `native_shared_cache_hits` should dominate after the producer shared-output
+  pool is warm; cache misses should be limited to pool growth and source
+  size/format changes.
 - `native_copy_p95_ms` stays comfortably below the 120fps frame budget.
 - Any `native_copy_max_ms` spike above the frame budget is inspected in the raw
   JSONL and classified as startup-only, rare isolated, or sustained.
@@ -79,6 +95,10 @@ Optionally repeat with the egui overlay enabled:
   producer/fence wait issue before investigating the copy itself.
 - If `native_fence_max_ms` is low, inspect the spike row's `open_shared_ms`,
   `keyed_mutex_ms`, and `copy_call_ms` fields to identify the blocking API.
+- If `native_shared_handles` is close to `native_present_samples`, a presenter
+  cache keyed only by handle value is unsafe because `D3d11Frame` owns and
+  closes those NT handles; fix the producer side with an explicit reusable
+  shared-output ring/pool instead.
 
 ## Follow-Up
 

@@ -16,7 +16,10 @@
 //! `Err` を返し、呼び出し側は SW (CPU readback + swscale) 経路にフォールバックする。
 
 use std::ptr;
-use std::sync::Arc;
+use std::sync::{
+    Arc, Condvar, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
 
 use windows::Win32::Foundation::{HANDLE, HMODULE};
 use windows::Win32::Graphics::Direct3D::{
@@ -47,8 +50,7 @@ use windows::core::Interface;
 
 /// 出力テクスチャのリングバッファサイズ。decoder が書き → UI が読む間
 /// に少なくとも 2 枚 in-flight を許す。
-#[allow(dead_code)]
-const OUTPUT_RING_SIZE: usize = 3;
+const OUTPUT_RING_SIZE: usize = 24;
 
 /// 1 フレームの GPU 出力。
 ///
@@ -70,6 +72,9 @@ pub struct D3d11Frame {
     /// NT shared handle (テクスチャ用、フレーム毎に新規)。wgpu 側で `OpenSharedHandle` する。
     /// `Drop` で `CloseHandle` する責任は所有者にある。
     pub shared_handle: HANDLE,
+    pub close_shared_handle_on_drop: bool,
+    pub shared_output_in_use: Option<Arc<AtomicBool>>,
+    pub shared_output_notify: Option<Arc<Condvar>>,
     /// 共有テクスチャが 10-bit (R10G10B10A2_UNORM) か。入力が P010/P016 の
     /// HDR ソースの場合のみ true になる。wgpu 側 import 時の format 選択に必要
     /// (false → Bgra8Unorm、true → Rgb10a2Unorm)。
@@ -99,10 +104,16 @@ impl Drop for D3d11Frame {
         // CloseHandle で解放しないと毎フレームのリークになる。
         // wgpu 側 (D3D12 OpenSharedHandle) は HANDLE 値を内部複製しているので、
         // ここで close しても D3D12 リソースは生存する。
-        if !self.shared_handle.is_invalid() {
+        if self.close_shared_handle_on_drop && !self.shared_handle.is_invalid() {
             unsafe {
                 let _ = windows::Win32::Foundation::CloseHandle(self.shared_handle);
             }
+        }
+        if let Some(in_use) = self.shared_output_in_use.take() {
+            in_use.store(false, Ordering::Release);
+        }
+        if let Some(notify) = self.shared_output_notify.take() {
+            notify.notify_one();
         }
     }
 }
@@ -155,6 +166,9 @@ pub struct GpuVideoDevice {
     video_context1: ID3D11VideoContext1,
     /// processor + enumerator のキャッシュ。同一 (in_size, out_size, format) なら使い回す。
     processor_cache: std::cell::RefCell<Option<ProcessorState>>,
+    shared_output_pool: Mutex<Vec<SharedOutputSlot>>,
+    shared_output_pool_wait: Mutex<()>,
+    shared_output_pool_cv: Arc<Condvar>,
     /// CopyResource 完了の signaling 用。device 寿命中 1 個。各フレームは
     /// `next_fence_value.fetch_add(1)` で得た値で `Signal(fence, value)` する。
     fence: ID3D11Fence,
@@ -187,12 +201,34 @@ pub enum VideoColorHint {
 /// - `output_texture` は呼び出し側でこのフレームの寿命中保持する責任を負う
 ///   (= drop すると D3D11 側のテクスチャ解放、ただし NT shared handle は別命数管理なので
 ///   D3D12 側からは引き続き参照可能)
-/// - `shared_handle` は `D3d11Frame` の `Drop` で `CloseHandle` される
+/// - `shared_handle` is either owned by `D3d11Frame` or by the shared-output pool
 /// - `fence_value` を `D3d11Frame` に乗せて wgpu 側 `Wait(fence, fence_value)` に渡す
 pub struct BlitOutput {
     pub output_texture: ID3D11Texture2D,
     pub shared_handle: HANDLE,
+    pub close_shared_handle_on_drop: bool,
+    pub shared_output_in_use: Option<Arc<AtomicBool>>,
+    pub shared_output_notify: Option<Arc<Condvar>>,
     pub fence_value: u64,
+}
+
+struct SharedOutputSlot {
+    tex: ID3D11Texture2D,
+    shared_handle: HANDLE,
+    width: u32,
+    height: u32,
+    format: DXGI_FORMAT,
+    in_use: Arc<AtomicBool>,
+}
+
+impl Drop for SharedOutputSlot {
+    fn drop(&mut self) {
+        if !self.shared_handle.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::Foundation::CloseHandle(self.shared_handle);
+            }
+        }
+    }
 }
 
 struct ProcessorState {
@@ -303,6 +339,9 @@ impl GpuVideoDevice {
             video_context,
             video_context1,
             processor_cache: std::cell::RefCell::new(None),
+            shared_output_pool: Mutex::new(Vec::new()),
+            shared_output_pool_wait: Mutex::new(()),
+            shared_output_pool_cv: Arc::new(Condvar::new()),
             fence,
             fence_shared_handle,
             next_fence_value: std::sync::atomic::AtomicU64::new(0),
@@ -391,29 +430,19 @@ impl GpuVideoDevice {
         //       (D3D12 側で IDXGIKeyedMutex 取得不可)、ID3D11Fence ↔ ID3D12Fence の
         //       共有 fence で行う (`Signal`/`Wait`)。
         let intermediate = self.create_intermediate_rt(out_w, out_h, out_format)?;
-        let (out_tex, shared_handle) = self.create_shared_output(out_w, out_h, out_format)?;
+        let (
+            out_tex,
+            shared_handle,
+            close_shared_handle_on_drop,
+            shared_output_in_use,
+            shared_output_notify,
+            km_acquired,
+        ) = self.acquire_shared_output(out_w, out_h, out_format)?;
 
         // shared_handle は CreateInputView/OutputView/Blt のいずれかが失敗して `?` で
         // 早期リターンされても close する必要がある (Codex P2)。BlitOutput を返す直前で
         // disarm() してリーク防止責任を呼び出し側 (D3d11Frame::Drop) に移譲する。
-        struct HandleGuard(HANDLE);
-        impl HandleGuard {
-            fn disarm(mut self) -> HANDLE {
-                let h = self.0;
-                self.0 = HANDLE::default();
-                h
-            }
-        }
-        impl Drop for HandleGuard {
-            fn drop(&mut self) {
-                if !self.0.is_invalid() {
-                    unsafe {
-                        let _ = windows::Win32::Foundation::CloseHandle(self.0);
-                    }
-                }
-            }
-        }
-        let handle_guard = HandleGuard(shared_handle);
+        // Shared output handles are owned by `shared_output_pool` and reused.
 
         // 4. 入力 view を作成
         let mut in_view: Option<ID3D11VideoProcessorInputView> = None;
@@ -576,21 +605,6 @@ impl GpuVideoDevice {
             // INFINITE timeout は危険 (driver state 異常で永久ブロック)。
             // 100ms timeout で fail-fast、タイムアウト時はそのフレームを諦めて Err を返す。
             // 通常は fresh out_tex (= released-with-key-0 状態) なので即取れる。
-            let km_acquired = match out_tex.cast::<IDXGIKeyedMutex>() {
-                Ok(km) => match km.AcquireSync(0, 100) {
-                    Ok(()) => Some(km),
-                    Err(e) => {
-                        crate::logger::log(format!(
-                            "KeyedMutex AcquireSync(0) timeout/err: {e:?} — skipping frame"
-                        ));
-                        return Err(GpuVideoError::Blt(format!("KeyedMutex AcquireSync: {e:?}")));
-                    }
-                },
-                Err(e) => {
-                    crate::logger::log(format!("cast IDXGIKeyedMutex failed: {e:?}"));
-                    None
-                }
-            };
             self.context.CopyResource(&out_tex, &intermediate);
             // KeyedMutex を release (key=1) — D3D12 OpenSharedHandle 側はこれ以降の状態
             // (= "key=1 で release 済み") を読み取れる。AcquireSync 自体はしない (= D3D12 の
@@ -621,10 +635,12 @@ impl GpuVideoDevice {
 
         // 全成功: HANDLE 所有権を BlitOutput → D3d11Frame に移譲する。以降 guard が drop
         // しても close は走らない (= D3d11Frame::Drop の責任になる)。
-        let shared_handle = handle_guard.disarm();
         Ok(BlitOutput {
             output_texture: out_tex,
             shared_handle,
+            close_shared_handle_on_drop,
+            shared_output_in_use,
+            shared_output_notify,
             fence_value,
         })
     }
@@ -742,6 +758,137 @@ impl GpuVideoDevice {
                 })?;
         }
         tex.ok_or_else(|| GpuVideoError::TextureCreate("intermediate null".into()))
+    }
+
+    fn acquire_shared_output(
+        &self,
+        w: u32,
+        h: u32,
+        format: DXGI_FORMAT,
+    ) -> Result<
+        (
+            ID3D11Texture2D,
+            HANDLE,
+            bool,
+            Option<Arc<AtomicBool>>,
+            Option<Arc<Condvar>>,
+            Option<IDXGIKeyedMutex>,
+        ),
+        GpuVideoError,
+    > {
+        let wait_started = std::time::Instant::now();
+        loop {
+            let mut pool = self
+                .shared_output_pool
+                .lock()
+                .map_err(|_| GpuVideoError::Blt("shared output pool poisoned".into()))?;
+
+            for slot in pool
+                .iter()
+                .filter(|slot| slot.width == w && slot.height == h && slot.format == format)
+            {
+                let Ok(false) =
+                    slot.in_use
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                else {
+                    continue;
+                };
+                let Ok(km) = slot.tex.cast::<IDXGIKeyedMutex>() else {
+                    return Ok((
+                        slot.tex.clone(),
+                        slot.shared_handle,
+                        false,
+                        Some(Arc::clone(&slot.in_use)),
+                        Some(Arc::clone(&self.shared_output_pool_cv)),
+                        None,
+                    ));
+                };
+                match unsafe { km.AcquireSync(0, 100) } {
+                    Ok(()) => {
+                        return Ok((
+                            slot.tex.clone(),
+                            slot.shared_handle,
+                            false,
+                            Some(Arc::clone(&slot.in_use)),
+                            Some(Arc::clone(&self.shared_output_pool_cv)),
+                            Some(km),
+                        ));
+                    }
+                    Err(_) => {
+                        slot.in_use.store(false, Ordering::Release);
+                        continue;
+                    }
+                }
+            }
+
+            if pool.len() < OUTPUT_RING_SIZE {
+                let (tex, shared_handle) = self.create_shared_output(w, h, format)?;
+                let in_use = Arc::new(AtomicBool::new(true));
+                let km_acquired = match tex.cast::<IDXGIKeyedMutex>() {
+                    Ok(km) => match unsafe { km.AcquireSync(0, 100) } {
+                        Ok(()) => Some(km),
+                        Err(e) => {
+                            in_use.store(false, Ordering::Release);
+                            unsafe {
+                                let _ = windows::Win32::Foundation::CloseHandle(shared_handle);
+                            }
+                            return Err(GpuVideoError::Blt(format!(
+                                "KeyedMutex AcquireSync: {e:?}"
+                            )));
+                        }
+                    },
+                    Err(e) => {
+                        crate::logger::log(format!("cast IDXGIKeyedMutex failed: {e:?}"));
+                        None
+                    }
+                };
+                pool.push(SharedOutputSlot {
+                    tex: tex.clone(),
+                    shared_handle,
+                    width: w,
+                    height: h,
+                    format,
+                    in_use: Arc::clone(&in_use),
+                });
+                crate::perf::event(
+                    "video",
+                    "shared_output_pool_grow",
+                    None,
+                    0,
+                    &[
+                        ("width", serde_json::Value::from(w as i64)),
+                        ("height", serde_json::Value::from(h as i64)),
+                        ("pool_len", serde_json::Value::from(pool.len() as i64)),
+                        (
+                            "shared_handle",
+                            serde_json::Value::from(shared_handle.0 as usize as u64),
+                        ),
+                    ],
+                );
+                return Ok((
+                    tex,
+                    shared_handle,
+                    false,
+                    Some(in_use),
+                    Some(Arc::clone(&self.shared_output_pool_cv)),
+                    km_acquired,
+                ));
+            }
+
+            drop(pool);
+            if wait_started.elapsed() >= std::time::Duration::from_millis(100) {
+                return Err(GpuVideoError::Blt(
+                    "shared output pool exhausted waiting for free slot".into(),
+                ));
+            }
+            let guard = self
+                .shared_output_pool_wait
+                .lock()
+                .map_err(|_| GpuVideoError::Blt("shared output pool wait poisoned".into()))?;
+            let _ = self
+                .shared_output_pool_cv
+                .wait_timeout(guard, std::time::Duration::from_millis(4));
+        }
     }
 
     /// 2 段アーキ用 shared output (CopyResource の宛先)。

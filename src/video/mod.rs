@@ -591,6 +591,14 @@ fn run_native_video_output(
                                     ("pts", serde_json::Value::from(pts)),
                                     ("queue_len", serde_json::Value::from(queue.len() as i64)),
                                     ("path", serde_json::Value::from(outcome.path)),
+                                    (
+                                        "shared_handle",
+                                        serde_json::Value::from(outcome.shared_handle),
+                                    ),
+                                    (
+                                        "shared_cache_hit",
+                                        serde_json::Value::from(outcome.shared_cache_hit),
+                                    ),
                                     ("wait_ms", serde_json::Value::from(outcome.wait_ms)),
                                     (
                                         "fence_wait_ms",
