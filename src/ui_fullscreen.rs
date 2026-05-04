@@ -986,6 +986,12 @@ impl App {
         self.poll_prefetch(ctx);
 
         // ── 状態の事前計算 ──
+        #[cfg(windows)]
+        if self.native_video_presenter_hwnd_for_fs(fs_idx).is_some() {
+            self.hide_fullscreen_viewport_for_native(ctx);
+            return;
+        }
+
         self.advance_animation(ctx, fs_idx);
         // 見開きペアを 1 回だけ解決し、以降のフレーム処理で再利用する
         // (resolve_spread_pair は get_nav_indices 内で Vec<usize> をクローンするため、
@@ -1875,6 +1881,32 @@ impl App {
     }
 
     /// フルスクリーンビューポートの ViewportBuilder を構築する。
+    #[cfg(windows)]
+    fn native_video_presenter_hwnd_for_fs(&self, fs_idx: usize) -> Option<u64> {
+        match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                let hwnd = player.native_presenter_hwnd();
+                (hwnd != 0).then_some(hwnd)
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg(windows)]
+    fn hide_fullscreen_viewport_for_native(&mut self, ctx: &egui::Context) {
+        let fs_id = self.fullscreen_viewport_id();
+        let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
+        ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
+        if self.fs_viewport_shown {
+            crate::dwm_transitions::disable_transitions_for_thread_windows();
+            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+            self.fs_viewport_shown = false;
+            crate::logger::log(
+                "[native-video] hid egui fullscreen viewport behind native presenter".to_string(),
+            );
+        }
+    }
+
     fn build_fullscreen_viewport_builder(&self) -> egui::ViewportBuilder {
         let center = self.last_outer_rect.map(|r| r.center());
         let ppp = self.last_pixels_per_point;

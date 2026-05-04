@@ -2424,6 +2424,11 @@ pub struct App {
     /// set_chain_owner は cross-process IPC なので、毎フレーム送らないための guard。
     pub(crate) native_video_owner_synced_hwnd: u64,
     #[cfg(windows)]
+    /// Native fullscreen presenter の HWND を最後に fullscreen viewport より前面へ
+    /// 持ち上げた値。egui 側の fullscreen viewport は opt-in 期間中も alive なので、
+    /// native HWND 作成後に一度だけ z-order を補正する。
+    pub(crate) native_video_front_synced_hwnd: u64,
+    #[cfg(windows)]
     /// Native fullscreen presenter 上の左クリック候補。overlay hit-test が入るまでの
     /// 暫定 transport 操作用で、drag と click を release 時に分ける。
     native_video_pointer_down: Option<NativeVideoPointerDown>,
@@ -2948,6 +2953,8 @@ impl Default for App {
             main_hwnd: None,
             #[cfg(windows)]
             native_video_owner_synced_hwnd: 0,
+            #[cfg(windows)]
+            native_video_front_synced_hwnd: 0,
             #[cfg(windows)]
             native_video_pointer_down: None,
             placement_slot: None,
@@ -10306,16 +10313,17 @@ impl App {
                 });
                 let resume = play_test_start
                     .or_else(|| self.settings.video_resume_positions.get(&path_key).copied());
+                let video_hw_decode = self.settings.video_hw_decode;
                 let player = crate::video::VideoPlayer::open(
                     vp,
                     vol,
                     autoplay,
                     resume,
-                    self.settings.video_hw_decode,
+                    video_hw_decode,
                     // GPU レンダリングが利用可能なら渡す。HW デコード OFF の場合や
                     // GpuVideoDevice 作成失敗時は None で旧経路 (CPU readback)。
                     #[cfg(windows)]
-                    if self.settings.video_hw_decode {
+                    if video_hw_decode {
                         self.gpu_video_device.clone()
                     } else {
                         None
@@ -10897,6 +10905,7 @@ impl App {
         #[cfg(windows)]
         {
             self.vst3_deferred_video_open = None;
+            self.native_video_front_synced_hwnd = 0;
             self.native_video_pointer_down = None;
         }
         #[cfg(windows)]
@@ -13043,6 +13052,7 @@ impl App {
         }
         #[cfg(windows)]
         if native_closed_idx.is_some() {
+            self.native_video_front_synced_hwnd = 0;
             self.close_fullscreen();
             return;
         }
@@ -13065,6 +13075,49 @@ impl App {
                 ctx.request_repaint_after(d);
             }
         }
+    }
+
+    #[cfg(windows)]
+    fn ensure_native_video_front(&mut self) {
+        if self.fullscreen_idx.is_none() {
+            self.native_video_front_synced_hwnd = 0;
+            return;
+        }
+        let hwnd = self
+            .fullscreen_idx
+            .and_then(|idx| self.fs_cache.get(&idx))
+            .and_then(|entry| match entry {
+                FsCacheEntry::Video { player, .. } => {
+                    let hwnd = player.native_presenter_hwnd();
+                    (hwnd != 0).then_some(hwnd)
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
+        if hwnd == 0 || hwnd == self.native_video_front_synced_hwnd {
+            return;
+        }
+        if crate::video::native_window::bring_to_front(hwnd) {
+            self.native_video_front_synced_hwnd = hwnd;
+            crate::video::native_window::log_state(hwnd, "raised");
+            crate::logger::log(format!(
+                "[native-video] raised fullscreen presenter hwnd=0x{hwnd:x}"
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    fn native_video_presenter_hwnd_for_focus_guard(&self) -> bool {
+        self.fullscreen_idx
+            .and_then(|idx| self.fs_cache.get(&idx))
+            .and_then(|entry| match entry {
+                FsCacheEntry::Video { player, .. } => {
+                    let hwnd = player.native_presenter_hwnd();
+                    (hwnd != 0).then_some(hwnd)
+                }
+                _ => None,
+            })
+            .is_some()
     }
 
     #[cfg(windows)]
@@ -14515,9 +14568,13 @@ impl eframe::App for App {
                     .map(|t| t.elapsed().as_millis() > FS_FOCUS_GRACE_MS)
                     .unwrap_or(true);
             }
+            #[cfg(windows)]
+            let native_video_presenter_active = self.native_video_presenter_hwnd_for_focus_guard();
+            #[cfg(not(windows))]
+            let native_video_presenter_active = false;
             let main_has_focus =
                 self.fs_focus_grace_elapsed && ctx.input(|i| i.viewport().focused).unwrap_or(false);
-            if main_has_focus {
+            if main_has_focus && !native_video_presenter_active {
                 self.close_fullscreen();
             }
         }
@@ -14538,6 +14595,8 @@ impl eframe::App for App {
         // 非アクティブ時も非表示でビューポートを維持（次回表示のちらつき防止）
         self.keep_fullscreen_viewport_alive(ctx);
         self.render_fullscreen_viewport(ctx);
+        #[cfg(windows)]
+        self.ensure_native_video_front();
         let t_fullscreen_viewport = frame_t0.elapsed();
 
         // 補正パネルでスライダーをドラッグ中に true → release で false の遷移を検知し、

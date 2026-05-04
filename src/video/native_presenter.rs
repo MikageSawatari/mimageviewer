@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, RECT, WAIT_TIMEOUT};
@@ -6,10 +6,11 @@ use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG, D3D11_SDK_VERSION,
-    D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11Device5, ID3D11DeviceContext,
-    ID3D11DeviceContext1, ID3D11DeviceContext4, ID3D11Fence, ID3D11RenderTargetView,
-    ID3D11Resource, ID3D11Texture2D, ID3D11View,
+    D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG,
+    D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11Device5,
+    ID3D11DeviceContext, ID3D11DeviceContext1, ID3D11DeviceContext4, ID3D11Fence,
+    ID3D11RenderTargetView, ID3D11Resource, ID3D11Texture2D, ID3D11View,
 };
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
@@ -21,12 +22,13 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGIOutput, IDXGISwapChain1,
-    IDXGISwapChain2,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGIKeyedMutex, IDXGIOutput,
+    IDXGISwapChain1, IDXGISwapChain2,
 };
 use windows::Win32::System::Threading::WaitForSingleObject;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::core::Interface;
+use windows_numerics::Matrix3x2;
 
 use crate::video::decoder::{VideoFrame, VideoFrameData};
 
@@ -54,8 +56,12 @@ pub struct NativeVideoPresenter {
     test_overlay: Option<NativeTestOverlay>,
     egui_overlay: Option<NativeEguiOverlay>,
     fence_cache: Option<(u64, isize, ID3D11Fence)>,
+    pixel_probe_enabled: bool,
+    last_pixel_probe: Option<Instant>,
     width: u32,
     height: u32,
+    surface_width: u32,
+    surface_height: u32,
 }
 
 struct NativeTestOverlay {
@@ -103,6 +109,32 @@ pub struct NativePresentOutcome {
     pub fence_wait_ms: f64,
     pub copy_ms: f64,
     pub present_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativePixelSample {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+    format: i32,
+    b: u8,
+    g: u8,
+    r: u8,
+    a: u8,
+}
+
+struct KeyedMutexReadGuard {
+    mutex: IDXGIKeyedMutex,
+    release_key: u64,
+}
+
+impl Drop for KeyedMutexReadGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.mutex.ReleaseSync(self.release_key);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -328,8 +360,12 @@ impl NativeVideoPresenter {
                 test_overlay,
                 egui_overlay,
                 fence_cache: None,
+                pixel_probe_enabled: std::env::var_os("MIV_NATIVE_VIDEO_PIXEL_PROBE").is_some(),
+                last_pixel_probe: None,
                 width: config.width,
                 height: config.height,
+                surface_width: config.width,
+                surface_height: config.height,
             };
             this.recreate_backbuffer(true)?;
             log_event(
@@ -353,21 +389,9 @@ impl NativeVideoPresenter {
         if self.width == width && self.height == height {
             return Ok(());
         }
-        self.backbuffer = None;
-        unsafe {
-            self.swap_chain
-                .ResizeBuffers(
-                    0,
-                    width,
-                    height,
-                    DXGI_FORMAT_UNKNOWN,
-                    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
-                )
-                .map_err(|e| format!("IDXGISwapChain::ResizeBuffers: {e:?}"))?;
-        }
         self.width = width;
         self.height = height;
-        self.recreate_backbuffer(false)?;
+        self.update_video_visual_transform()?;
         if let Some(overlay) = self.test_overlay.as_mut() {
             overlay.resize(
                 &self.d3d_device1,
@@ -385,6 +409,8 @@ impl NativeVideoPresenter {
             &[
                 ("width", Value::from(width as i64)),
                 ("height", Value::from(height as i64)),
+                ("surface_width", Value::from(self.surface_width as i64)),
+                ("surface_height", Value::from(self.surface_height as i64)),
             ],
         );
         Ok(())
@@ -404,6 +430,7 @@ impl NativeVideoPresenter {
         let mut fence_wait_ms = 0.0;
         let path = match &frame.data {
             VideoFrameData::Cpu(bytes) => {
+                self.ensure_video_surface_size(frame.width, frame.height)?;
                 let backbuffer = self
                     .backbuffer
                     .as_ref()
@@ -427,6 +454,8 @@ impl NativeVideoPresenter {
                 if gpu_frame.width != frame.width || gpu_frame.height != frame.height {
                     return Err("D3D11 frame metadata size mismatch".into());
                 }
+                self.ensure_video_surface_size(gpu_frame.width, gpu_frame.height)?;
+                let probe_this_frame = self.pixel_probe_due();
                 let fence = self.open_fence(gpu_frame.fence_gen, gpu_frame.fence_shared_handle)?;
                 let fence_t0 = Instant::now();
                 unsafe {
@@ -440,17 +469,55 @@ impl NativeVideoPresenter {
                         .OpenSharedResource1(gpu_frame.shared_handle)
                         .map_err(|e| format!("OpenSharedResource1 frame texture: {e:?}"))?
                 };
+                let _keyed_mutex = self.acquire_source_keyed_mutex(&src)?;
+                let src_probe = if probe_this_frame {
+                    Some(self.sample_texture_pixel(&src, "source")?)
+                } else {
+                    None
+                };
                 unsafe {
-                    let backbuffer = self.backbuffer.as_ref().ok_or_else(|| {
-                        "native presenter backbuffer is not initialized".to_string()
-                    })?;
+                    let backbuffer = self
+                        .backbuffer
+                        .as_ref()
+                        .ok_or_else(|| {
+                            "native presenter backbuffer is not initialized".to_string()
+                        })?
+                        .clone();
                     let dst_res: ID3D11Resource = backbuffer
                         .cast()
                         .map_err(|e| format!("cast backbuffer resource: {e:?}"))?;
                     let src_res: ID3D11Resource = src
                         .cast()
                         .map_err(|e| format!("cast source resource: {e:?}"))?;
-                    self.d3d_context.CopyResource(&dst_res, &src_res);
+                    let copy_box = D3D11_BOX {
+                        left: 0,
+                        top: 0,
+                        front: 0,
+                        right: gpu_frame.width,
+                        bottom: gpu_frame.height,
+                        back: 1,
+                    };
+                    self.d3d_context.CopySubresourceRegion(
+                        &dst_res,
+                        0,
+                        0,
+                        0,
+                        0,
+                        &src_res,
+                        0,
+                        Some(&copy_box),
+                    );
+                    if probe_this_frame {
+                        let backbuffer_probe =
+                            self.sample_texture_pixel(&backbuffer, "backbuffer")?;
+                        self.log_pixel_probe(
+                            gpu_frame.fence_gen,
+                            gpu_frame.fence_value,
+                            fence_wait_ms,
+                            src_probe,
+                            Some(backbuffer_probe),
+                        );
+                    }
                 }
                 "d3d11_shared"
             }
@@ -535,6 +602,259 @@ impl NativeVideoPresenter {
             self.fence_cache = Some((fence_gen, handle_key, fence));
         }
         Ok(self.fence_cache.as_ref().unwrap().2.clone())
+    }
+
+    fn ensure_video_surface_size(&mut self, width: u32, height: u32) -> Result<(), String> {
+        let width = width.max(1);
+        let height = height.max(1);
+        if self.surface_width == width && self.surface_height == height {
+            return Ok(());
+        }
+
+        self.backbuffer = None;
+        unsafe {
+            self.swap_chain
+                .ResizeBuffers(
+                    0,
+                    width,
+                    height,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+                )
+                .map_err(|e| format!("IDXGISwapChain::ResizeBuffers video surface: {e:?}"))?;
+        }
+        self.surface_width = width;
+        self.surface_height = height;
+        self.recreate_backbuffer(false)?;
+        self.update_video_visual_transform()?;
+        log_event(
+            "surface_resize",
+            &[
+                ("width", Value::from(self.width as i64)),
+                ("height", Value::from(self.height as i64)),
+                ("surface_width", Value::from(width as i64)),
+                ("surface_height", Value::from(height as i64)),
+            ],
+        );
+        Ok(())
+    }
+
+    fn update_video_visual_transform(&self) -> Result<(), String> {
+        let surface_width = self.surface_width.max(1) as f32;
+        let surface_height = self.surface_height.max(1) as f32;
+        let width = self.width.max(1) as f32;
+        let height = self.height.max(1) as f32;
+        let scale = (width / surface_width).min(height / surface_height);
+        let offset_x = (width - surface_width * scale) * 0.5;
+        let offset_y = (height - surface_height * scale) * 0.5;
+        let transform = Matrix3x2 {
+            M11: scale,
+            M12: 0.0,
+            M21: 0.0,
+            M22: scale,
+            M31: offset_x,
+            M32: offset_y,
+        };
+        unsafe {
+            self._video_visual
+                .SetTransform2(&transform)
+                .map_err(|e| format!("IDCompositionVisual::SetTransform2 video: {e:?}"))?;
+            self._dcomp_device
+                .Commit()
+                .map_err(|e| format!("IDCompositionDevice::Commit video transform: {e:?}"))?;
+        }
+        Ok(())
+    }
+
+    fn pixel_probe_due(&mut self) -> bool {
+        if !self.pixel_probe_enabled {
+            return false;
+        }
+        let now = Instant::now();
+        let due = self
+            .last_pixel_probe
+            .map(|last| now.duration_since(last) >= Duration::from_secs(1))
+            .unwrap_or(true);
+        if due {
+            self.last_pixel_probe = Some(now);
+        }
+        due
+    }
+
+    fn acquire_source_keyed_mutex(
+        &self,
+        texture: &ID3D11Texture2D,
+    ) -> Result<Option<KeyedMutexReadGuard>, String> {
+        let Ok(mutex) = texture.cast::<IDXGIKeyedMutex>() else {
+            return Ok(None);
+        };
+        unsafe {
+            mutex
+                .AcquireSync(1, 100)
+                .map_err(|e| format!("source keyed mutex AcquireSync(1): {e:?}"))?;
+        }
+        Ok(Some(KeyedMutexReadGuard {
+            mutex,
+            release_key: 0,
+        }))
+    }
+
+    fn sample_texture_pixel(
+        &self,
+        texture: &ID3D11Texture2D,
+        label: &str,
+    ) -> Result<NativePixelSample, String> {
+        unsafe {
+            let mut desc = D3D11_TEXTURE2D_DESC::default();
+            texture.GetDesc(&mut desc);
+            if desc.Width == 0 || desc.Height == 0 {
+                return Err(format!("pixel probe {label}: empty texture desc"));
+            }
+            if desc.Format != DXGI_FORMAT_B8G8R8A8_UNORM {
+                return Err(format!(
+                    "pixel probe {label}: unsupported format {:?}",
+                    desc.Format
+                ));
+            }
+
+            let x = desc.Width / 2;
+            let y = desc.Height / 2;
+            let staging_desc = D3D11_TEXTURE2D_DESC {
+                Width: 1,
+                Height: 1,
+                MipLevels: 1,
+                ArraySize: 1,
+                Format: desc.Format,
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Usage: D3D11_USAGE_STAGING,
+                BindFlags: 0,
+                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                MiscFlags: 0,
+            };
+            let mut staging = None;
+            self.d3d_device1
+                .CreateTexture2D(&staging_desc, None, Some(&mut staging))
+                .map_err(|e| format!("pixel probe {label}: CreateTexture2D staging: {e:?}"))?;
+            let staging =
+                staging.ok_or_else(|| format!("pixel probe {label}: staging texture null"))?;
+            let src_res: ID3D11Resource = texture
+                .cast()
+                .map_err(|e| format!("pixel probe {label}: cast source: {e:?}"))?;
+            let staging_res: ID3D11Resource = staging
+                .cast()
+                .map_err(|e| format!("pixel probe {label}: cast staging: {e:?}"))?;
+            let src_box = D3D11_BOX {
+                left: x,
+                top: y,
+                front: 0,
+                right: x.saturating_add(1),
+                bottom: y.saturating_add(1),
+                back: 1,
+            };
+            self.d3d_context.CopySubresourceRegion(
+                &staging_res,
+                0,
+                0,
+                0,
+                0,
+                &src_res,
+                0,
+                Some(&src_box),
+            );
+
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            self.d3d_context
+                .Map(&staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .map_err(|e| format!("pixel probe {label}: Map staging: {e:?}"))?;
+            let ptr = mapped.pData.cast::<u8>();
+            let sample = NativePixelSample {
+                x,
+                y,
+                width: desc.Width,
+                height: desc.Height,
+                format: desc.Format.0,
+                b: *ptr,
+                g: *ptr.add(1),
+                r: *ptr.add(2),
+                a: *ptr.add(3),
+            };
+            self.d3d_context.Unmap(&staging_res, 0);
+            Ok(sample)
+        }
+    }
+
+    fn log_pixel_probe(
+        &self,
+        fence_gen: u64,
+        fence_value: u64,
+        fence_wait_ms: f64,
+        source: Option<NativePixelSample>,
+        backbuffer: Option<NativePixelSample>,
+    ) {
+        let src = source.unwrap_or(NativePixelSample {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+            format: 0,
+            b: 0,
+            g: 0,
+            r: 0,
+            a: 0,
+        });
+        let dst = backbuffer.unwrap_or(src);
+        crate::logger::log(format!(
+            "native-presenter: pixel_probe fence_gen={fence_gen} fence_value={fence_value} \
+             fence_wait_ms={fence_wait_ms:.3} src@{},{} size={}x{} fmt={} bgra=({},{},{},{}) \
+             backbuffer@{},{} size={}x{} fmt={} bgra=({},{},{},{})",
+            src.x,
+            src.y,
+            src.width,
+            src.height,
+            src.format,
+            src.b,
+            src.g,
+            src.r,
+            src.a,
+            dst.x,
+            dst.y,
+            dst.width,
+            dst.height,
+            dst.format,
+            dst.b,
+            dst.g,
+            dst.r,
+            dst.a,
+        ));
+        log_event(
+            "pixel_probe",
+            &[
+                ("fence_gen", Value::from(fence_gen as i64)),
+                ("fence_value", Value::from(fence_value as i64)),
+                ("fence_wait_ms", Value::from(fence_wait_ms)),
+                ("source_b", Value::from(src.b as i64)),
+                ("source_g", Value::from(src.g as i64)),
+                ("source_r", Value::from(src.r as i64)),
+                ("source_a", Value::from(src.a as i64)),
+                ("source_x", Value::from(src.x as i64)),
+                ("source_y", Value::from(src.y as i64)),
+                ("source_width", Value::from(src.width as i64)),
+                ("source_height", Value::from(src.height as i64)),
+                ("source_format", Value::from(src.format as i64)),
+                ("backbuffer_b", Value::from(dst.b as i64)),
+                ("backbuffer_g", Value::from(dst.g as i64)),
+                ("backbuffer_r", Value::from(dst.r as i64)),
+                ("backbuffer_a", Value::from(dst.a as i64)),
+                ("backbuffer_x", Value::from(dst.x as i64)),
+                ("backbuffer_y", Value::from(dst.y as i64)),
+                ("backbuffer_width", Value::from(dst.width as i64)),
+                ("backbuffer_height", Value::from(dst.height as i64)),
+                ("backbuffer_format", Value::from(dst.format as i64)),
+            ],
+        );
     }
 
     fn recreate_backbuffer(&mut self, present_initial_black: bool) -> Result<(), String> {

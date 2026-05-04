@@ -114,10 +114,20 @@ Status:
   dedicated native presenter thread with its own borderless HWND. VST editor
   owner sync is guarded so the bridge receives `set_chain_owner` only when the
   native HWND changes.
+- 2026-05-04: the opt-in slice now hides the legacy egui fullscreen viewport
+  once the native borderless HWND exists, then raises the native HWND. The
+  legacy viewport is still kept available for fallback before native HWND
+  creation, but it must not cover the native DComp presenter after startup.
+- 2026-05-04: production GPU frames now follow the decoder's keyed-mutex
+  protocol (`ReleaseSync(1)` on the producer side, `AcquireSync(1)` /
+  `ReleaseSync(0)` on the presenter side) before copying the shared texture.
+  The video swap chain is resized to the source frame size and the video visual
+  is aspect-fit to the native fullscreen HWND with a DirectComposition
+  transform, so a 1080p clip can fill a 4K fullscreen window without coupling
+  the video copy path to the window backbuffer size.
 
 Current limitations of the experimental slice:
 
-- no egui overlay/input routing on the native HWND yet; it is video-only
 - Escape closes the native video HWND and then the existing fullscreen state.
   A minimal native key bridge forwards core video shortcuts (Enter, W,
   Left/Right seek, Shift+Up/Down volume, M/L/P/S/B) back to the UI thread, but
@@ -133,9 +143,9 @@ Current limitations of the experimental slice:
   do not need egui hit-testing: plain Up/Down navigates to adjacent items,
   Home/End jumps to the first/last navigable item, Space toggles the current
   checkmark, and a short right-click closes fullscreen.
-- GPU frames are copied directly to the presenter backbuffer, so this slice is
-  intended for same-size smoke tests such as the 1080p120 sync clip until
-  scaling/letterboxing is added
+- GPU frames are copied into a source-sized presenter swap chain after keyed
+  mutex acquisition, then scaled by DirectComposition. 10-bit/HDR GPU frames
+  still need a fallback or a dedicated presentation path.
 - it remains opt-in via environment variable and the egui fullscreen path is
   still the default
 
@@ -234,7 +244,8 @@ Acceptance:
 
 Before enabling by default:
 
-- implement `WM_SIZE` / `ResizeBuffers`
+- complete dynamic `WM_SIZE` / monitor-change coverage around the source-sized
+  video surface and DComp aspect-fit transform
 - handle DPI and monitor changes
 - support 10-bit/HDR GPU frames or fall back cleanly
 - decide tearing policy (`sync_interval=0`) vs vsync policy (`sync_interval=1`)

@@ -9,13 +9,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-    GetWindowLongPtrW, IDC_ARROW, IsWindow, LoadCursorW, MSG, PM_REMOVE, PeekMessageW,
-    PostQuitMessage, RegisterClassW, SW_SHOW, SetWindowLongPtrW, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW,
-    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP,
-    WS_VISIBLE,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, HWND_TOP, IDC_ARROW, IsWindow,
+    IsWindowVisible, LoadCursorW, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW,
+    SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE,
+    WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE,
+    WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW, WS_CLIPCHILDREN,
+    WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -123,7 +124,7 @@ impl NativeVideoWindow {
             };
             RegisterClassW(&wc);
 
-            let (ex_style, style, x, y, width, height) = match config.mode {
+            let (ex_style, style, x, y, width, height, raise_on_show) = match config.mode {
                 NativeVideoWindowMode::Windowed { width, height } => {
                     let style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
                     let ex_style = WINDOW_EX_STYLE::default();
@@ -142,6 +143,7 @@ impl NativeVideoWindow {
                         CW_USEDEFAULT,
                         rect.right - rect.left,
                         rect.bottom - rect.top,
+                        false,
                     )
                 }
                 NativeVideoWindowMode::Borderless { rect } => {
@@ -154,6 +156,7 @@ impl NativeVideoWindow {
                         rect.top,
                         rect.right - rect.left,
                         rect.bottom - rect.top,
+                        true,
                     )
                 }
             };
@@ -185,6 +188,10 @@ impl NativeVideoWindow {
                 }
             };
             let _ = ShowWindow(hwnd, SW_SHOW);
+            if raise_on_show {
+                bring_hwnd_to_front(hwnd);
+                log_window_state("created", hwnd);
+            }
             Ok(Self { hwnd })
         }
     }
@@ -203,6 +210,86 @@ impl NativeVideoWindow {
             }
         }
         self.hwnd = HWND::default();
+    }
+}
+
+pub fn bring_to_front(hwnd_raw: u64) -> bool {
+    if hwnd_raw == 0 {
+        return false;
+    }
+    unsafe {
+        let hwnd = HWND(hwnd_raw as *mut _);
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return false;
+        }
+        bring_hwnd_to_front(hwnd)
+    }
+}
+
+fn bring_hwnd_to_front(hwnd: HWND) -> bool {
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+        )
+        .is_ok()
+    }
+}
+
+pub fn log_state(hwnd_raw: u64, label: &str) {
+    if hwnd_raw == 0 {
+        return;
+    }
+    unsafe {
+        let hwnd = HWND(hwnd_raw as *mut _);
+        if IsWindow(Some(hwnd)).as_bool() {
+            log_window_state(label, hwnd);
+        }
+    }
+}
+
+fn log_window_state(label: &str, hwnd: HWND) {
+    unsafe {
+        let mut rect = RECT::default();
+        let rect_ok = GetWindowRect(hwnd, &mut rect).is_ok();
+        let visible = IsWindowVisible(hwnd).as_bool();
+        let foreground = GetForegroundWindow();
+        crate::logger::log(format!(
+            "[native-video] window {label}: hwnd=0x{:x} visible={} rect_ok={} rect=({},{} {}x{}) foreground=0x{:x}",
+            hwnd.0 as usize,
+            visible,
+            rect_ok,
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+            foreground.0 as usize
+        ));
+        crate::perf::event(
+            "native_presenter",
+            "window_state",
+            None,
+            0,
+            &[
+                ("label", serde_json::Value::from(label)),
+                ("hwnd", serde_json::Value::from(hwnd.0 as usize as u64)),
+                ("visible", serde_json::Value::from(visible)),
+                ("rect_ok", serde_json::Value::from(rect_ok)),
+                ("left", serde_json::Value::from(rect.left)),
+                ("top", serde_json::Value::from(rect.top)),
+                ("width", serde_json::Value::from(rect.right - rect.left)),
+                ("height", serde_json::Value::from(rect.bottom - rect.top)),
+                (
+                    "foreground",
+                    serde_json::Value::from(foreground.0 as usize as u64),
+                ),
+            ],
+        );
     }
 }
 

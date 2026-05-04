@@ -54,6 +54,7 @@ windows = { version = "0.61", features = [
     "Win32_System_SystemInformation",
     "Win32_UI_HiDpi",
 ] }
+windows-numerics = "0.2"
 
 [dependencies]
 eframe = { version = "0.33", features = ["wgpu"] }
