@@ -20,6 +20,7 @@ bench_thumbs.tsv
 /codex-review*.md
 # Benchmark output (scripts/bench-overnight.ps1)
 /bench_results/
+/video-soak-results/
 # TensorRT pack DL cache (scripts/setup-tensorrt-pack.ps1)
 /vendor/tensorrt-cache/
 

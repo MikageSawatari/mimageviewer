@@ -1371,24 +1371,27 @@ outside that closure. `video_gpu/prepare` and `video_gpu/paint` also emit a low
 frequency sample even when fast, so perf logs can prove the GPU callback path is
 active instead of only reporting slow frames.
 
-2026-05-04 present-latency experiment: the eframe/wgpu surface is now configured
-for lower presentation latency by default (`PresentMode::AutoNoVsync` and
-`desired_maximum_frame_latency=1`). The goal is to reduce red-line
-`display_miss` events where decoded frames are ready but the egui/wgpu viewport
-misses a present opportunity. The defaults are intentionally reversible for A/B
-testing: set `MIV_WGPU_PRESENT_MODE=auto_vsync` and
-`MIV_WGPU_FRAME_LATENCY=default` to return to egui-wgpu's default behavior, or
-try `mailbox`, `immediate`, `fifo`, or `fifo_relaxed` when comparing GPU/driver
-behavior.
+2026-05-04 present-latency experiment: the eframe/wgpu surface keeps
+`PresentMode::AutoNoVsync` as the default and requests
+`desired_maximum_frame_latency=1`. A/B runs on 1080p60 and 1080p120 files show
+that `mailbox` or `immediate` can change hitch distribution, but the improvement
+is not reliable enough to treat presentation mode as a fix. Use
+`MIV_WGPU_PRESENT_MODE=mailbox`, `auto_vsync`, `auto_no_vsync`, `immediate`,
+`fifo`, or `fifo_relaxed`, and `MIV_WGPU_FRAME_LATENCY=default` or a positive
+integer when comparing GPU/driver behavior.
 
 2026-05-04 playback soak test mode: mIV now has a one-file playback automation
 entry point for nightly regression checks. `--play-test <FILE>` opens the file
-through the normal fullscreen video path, `--play-duration <SECONDS>` closes the
-app after playback has run for that long (default 30s), and `--play-muted`
-prevents audible output during unattended runs. `--perf-log <PATH>` or
-`--perf-log-path <PATH>` writes JSONL events to a per-run path instead of the
-default `%APPDATA%` log, which lets harnesses keep one log per video. The helper
-`scripts/video_soak.py` recursively shuffles one or more folders, launches one
-mIV process per video, summarizes `display_miss`, `frame_gap`, decoder drops,
-packet waits, and completion status, and can run multiple environment-defined
-modes (for example different wgpu present modes) against the same corpus.
+through the normal fullscreen video path, `--play-test-start <SECONDS>` forces a
+deterministic start point (the soak harness defaults to 0s instead of saved
+resume), `--play-duration <SECONDS>` exits the process after playback has run
+for that long (default 30s), and `--play-muted` prevents audible output during
+unattended runs. `--play-test-skip-vst3` disables VST3 only for that test
+process so video playback can be benchmarked independently from plugin startup
+and audio processing. `--perf-log <PATH>` or `--perf-log-path <PATH>` writes
+JSONL events to a per-run path instead of the default `%APPDATA%` log, which
+lets harnesses keep one log per video. The helper `scripts/video_soak.py`
+recursively shuffles one or more folders, launches one mIV process per video,
+summarizes `display_miss`, `frame_gap`, decoder drops, packet waits, and
+completion status, and can run multiple environment-defined modes (for example
+different wgpu present modes) against the same corpus.

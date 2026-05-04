@@ -132,9 +132,11 @@ def run_one(
     out_dir: Path,
     index: int,
     duration: float,
+    start: float | None,
     timeout: float,
     window_size: str,
     mute: bool,
+    skip_vst3: bool,
 ) -> tuple[str, Path, dict[str, float | int], float]:
     log_path = out_dir / f"{index:04d}_{mode.name}_{safe_stem(video)}.jsonl"
     env = os.environ.copy()
@@ -150,8 +152,12 @@ def run_one(
         "--window-size",
         window_size,
     ]
+    if start is not None:
+        cmd.extend(["--play-test-start", str(start)])
     if mute:
         cmd.append("--play-muted")
+    if skip_vst3:
+        cmd.append("--play-test-skip-vst3")
     started = time.monotonic()
     timed_out = False
     try:
@@ -170,12 +176,24 @@ def main() -> int:
     parser.add_argument("roots", nargs="+", type=Path, help="Folders or files to test")
     parser.add_argument("--exe", type=Path, default=Path("target/release/mimageviewer.exe"))
     parser.add_argument("--duration", type=float, default=30.0)
+    parser.add_argument(
+        "--start",
+        type=float,
+        default=0.0,
+        help="Playback start position in seconds for --play-test (default: 0; use --resume to keep saved resume)",
+    )
+    parser.add_argument("--resume", action="store_true", help="Do not pass --play-test-start")
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--out-dir", type=Path, default=Path("video-soak-results"))
     parser.add_argument("--limit", type=int, default=0, help="Maximum videos to run (0 = all)")
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--window-size", default="1280x720")
     parser.add_argument("--no-mute", action="store_true", help="Do not pass --play-muted")
+    parser.add_argument(
+        "--skip-vst3",
+        action="store_true",
+        help="Pass --play-test-skip-vst3 to isolate video playback from VST3 startup/processing",
+    )
     parser.add_argument(
         "--mode",
         action="append",
@@ -194,6 +212,7 @@ def main() -> int:
         return 2
 
     modes = [parse_mode(m) for m in args.mode] or [Mode("default", {})]
+    start = None if args.resume else max(0.0, args.start)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     report_path = args.out_dir / "report.md"
     rows: list[str] = [
@@ -219,9 +238,11 @@ def main() -> int:
                 args.out_dir,
                 run_index,
                 args.duration,
+                start,
                 args.timeout,
                 args.window_size,
                 not args.no_mute,
+                args.skip_vst3,
             )
             if status != "OK":
                 failures += 1

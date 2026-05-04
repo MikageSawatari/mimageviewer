@@ -624,6 +624,10 @@ fn parse_play_test_config() -> Option<app::PlayTestConfig> {
         path,
         duration: std::time::Duration::from_secs_f64(duration_secs),
         mute: has_arg("--play-muted") || has_arg("--mute"),
+        start_secs: arg_value("--play-test-start")
+            .and_then(|s| s.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0),
+        skip_vst3: has_arg("--play-test-skip-vst3"),
     })
 }
 

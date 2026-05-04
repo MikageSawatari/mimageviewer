@@ -108,6 +108,8 @@ pub struct PlayTestConfig {
     pub path: PathBuf,
     pub duration: std::time::Duration,
     pub mute: bool,
+    pub start_secs: Option<f64>,
+    pub skip_vst3: bool,
 }
 
 pub(crate) struct PlayTestState {
@@ -3694,11 +3696,18 @@ impl App {
 
     pub fn configure_play_test(&mut self, config: PlayTestConfig) {
         crate::logger::log(format!(
-            "[play-test] configured path={} duration_ms={} mute={}",
+            "[play-test] configured path={} duration_ms={} mute={} start_secs={:?} skip_vst3={}",
             config.path.display(),
             config.duration.as_millis(),
-            config.mute
+            config.mute,
+            config.start_secs,
+            config.skip_vst3
         ));
+        if config.skip_vst3 {
+            self.settings.vst3_enabled = false;
+            self.vst3_init_kicked = true;
+            crate::logger::log("[play-test] VST3 startup skipped for playback benchmark");
+        }
         self.play_test = Some(PlayTestState::new(config));
     }
 
@@ -3720,12 +3729,43 @@ impl App {
             let Some(config) = self.play_test.as_ref().map(|s| s.config.clone()) else {
                 return;
             };
-            let idx = self.items.len();
-            self.items.push(GridItem::Video(config.path.clone()));
-            self.image_metas.push(None);
-            self.thumbnails.push(ThumbnailState::Pending);
-            self.items_generation = self.items_generation.wrapping_add(1);
-            self.visible_indices.push(idx);
+            if let Some(parent) = config.path.parent().map(PathBuf::from) {
+                if self.current_folder.as_deref() != Some(parent.as_path()) {
+                    crate::logger::log(format!(
+                        "[play-test] loading parent folder before launch path={} parent={}",
+                        config.path.display(),
+                        parent.display()
+                    ));
+                    self.load_folder(parent);
+                    ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                    return;
+                }
+            }
+            let target_key = crate::adjustment_db::normalize_path(&config.path);
+            let idx = self
+                .items
+                .iter()
+                .enumerate()
+                .find_map(|(idx, item)| match item {
+                    GridItem::Video(path)
+                        if crate::adjustment_db::normalize_path(path) == target_key =>
+                    {
+                        Some(idx)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| {
+                    // If the folder view filtered the file out for any reason, keep the
+                    // soak test deterministic by injecting a one-off video item after
+                    // the parent folder has already been loaded.
+                    let idx = self.items.len();
+                    self.items.push(GridItem::Video(config.path.clone()));
+                    self.image_metas.push(None);
+                    self.thumbnails.push(ThumbnailState::Pending);
+                    self.items_generation = self.items_generation.wrapping_add(1);
+                    self.visible_indices.push(idx);
+                    idx
+                });
             self.selected = Some(idx);
             self.fs_open_intent_from_grid = true;
             if config.mute {
@@ -3853,7 +3893,7 @@ impl App {
             if let Some(state) = self.play_test.as_mut() {
                 state.close_sent = true;
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            std::process::exit(0);
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
@@ -10237,7 +10277,14 @@ impl App {
                 // 自動シークさせる。Windows の case-insensitive パスを揃えるため
                 // adjustment_db::normalize_path に合わせる。
                 let path_key = crate::adjustment_db::normalize_path(&vp);
-                let resume = self.settings.video_resume_positions.get(&path_key).copied();
+                let play_test_start = self.play_test.as_ref().and_then(|state| {
+                    let config_key = crate::adjustment_db::normalize_path(&state.config.path);
+                    (config_key == path_key)
+                        .then_some(state.config.start_secs)
+                        .flatten()
+                });
+                let resume = play_test_start
+                    .or_else(|| self.settings.video_resume_positions.get(&path_key).copied());
                 let player = crate::video::VideoPlayer::open(
                     vp,
                     vol,
