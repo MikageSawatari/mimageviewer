@@ -99,6 +99,16 @@ Acceptance:
 - VST3 owner switching still uses the fullscreen parent HWND and does not bring
   the thumbnail grid window forward.
 
+Status:
+
+- 2026-05-04: the prototype HWND wrapper was extracted into
+  `src/video/native_window.rs` as `NativeVideoWindow`. It supports the existing
+  windowed test mode plus a borderless `WS_POPUP` mode for the future fullscreen
+  parent HWND. Its WndProc keeps `PostQuitMessage` configurable so production
+  integration can destroy the native video HWND without accidentally terminating
+  the eframe app loop. `NativeVideoPresenter::resize()` was also added as the
+  swap-chain side of future `WM_SIZE` / DPI handling.
+
 ## Phase C: Overlay Strategy
 
 The video visual can present independently, but HUD and seek UI still need to

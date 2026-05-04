@@ -31,6 +31,8 @@ pub mod ffmpeg_loader;
 pub mod gpu_renderer;
 #[cfg(windows)]
 pub mod native_presenter;
+#[cfg(windows)]
+pub mod native_window;
 pub mod thumbnail;
 pub mod tile_thumb_cache;
 pub mod tile_thumbnails;

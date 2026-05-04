@@ -12,7 +12,7 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::DirectComposition::{DCompositionCreateDevice, IDCompositionDevice};
 use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
+    DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{
     DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
@@ -38,8 +38,10 @@ pub struct NativeVideoPresenter {
     d3d_device5: ID3D11Device5,
     d3d_context: windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
     d3d_context4: ID3D11DeviceContext4,
-    backbuffer: ID3D11Texture2D,
+    backbuffer: Option<ID3D11Texture2D>,
     fence_cache: Option<(u64, isize, ID3D11Fence)>,
+    width: u32,
+    height: u32,
 }
 
 pub struct NativePresentOutcome {
@@ -149,20 +151,19 @@ impl NativeVideoPresenter {
                 .Commit()
                 .map_err(|e| format!("IDCompositionDevice::Commit: {e:?}"))?;
 
-            let backbuffer: ID3D11Texture2D = swap_chain
-                .GetBuffer(0)
-                .map_err(|e| format!("IDXGISwapChain::GetBuffer: {e:?}"))?;
-            let mut backbuffer_view = None;
-            d3d_device1
-                .CreateRenderTargetView(&backbuffer, None, Some(&mut backbuffer_view))
-                .map_err(|e| format!("CreateRenderTargetView: {e:?}"))?;
-            let backbuffer_view: ID3D11RenderTargetView = backbuffer_view
-                .ok_or_else(|| "CreateRenderTargetView returned null".to_string())?;
-            d3d_context.ClearRenderTargetView(&backbuffer_view, &[0.0, 0.0, 0.0, 1.0]);
-            swap_chain
-                .Present(1, Default::default())
-                .ok()
-                .map_err(|e| format!("initial IDXGISwapChain::Present: {e:?}"))?;
+            let mut this = Self {
+                swap_chain,
+                waitable,
+                d3d_device1,
+                d3d_device5,
+                d3d_context,
+                d3d_context4,
+                backbuffer: None,
+                fence_cache: None,
+                width: config.width,
+                height: config.height,
+            };
+            this.recreate_backbuffer(true)?;
             log_event(
                 "init",
                 &[
@@ -172,17 +173,39 @@ impl NativeVideoPresenter {
                     ("latency", Value::from(1)),
                 ],
             );
-            Ok(Self {
-                swap_chain,
-                waitable,
-                d3d_device1,
-                d3d_device5,
-                d3d_context,
-                d3d_context4,
-                backbuffer,
-                fence_cache: None,
-            })
+            Ok(this)
         }
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
+        let width = width.max(1);
+        let height = height.max(1);
+        if self.width == width && self.height == height {
+            return Ok(());
+        }
+        self.backbuffer = None;
+        unsafe {
+            self.swap_chain
+                .ResizeBuffers(
+                    0,
+                    width,
+                    height,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+                )
+                .map_err(|e| format!("IDXGISwapChain::ResizeBuffers: {e:?}"))?;
+        }
+        self.width = width;
+        self.height = height;
+        self.recreate_backbuffer(false)?;
+        log_event(
+            "resize",
+            &[
+                ("width", Value::from(width as i64)),
+                ("height", Value::from(height as i64)),
+            ],
+        );
+        Ok(())
     }
 
     pub fn present(
@@ -199,9 +222,13 @@ impl NativeVideoPresenter {
         let mut fence_wait_ms = 0.0;
         let path = match &frame.data {
             VideoFrameData::Cpu(bytes) => {
+                let backbuffer = self
+                    .backbuffer
+                    .as_ref()
+                    .ok_or_else(|| "native presenter backbuffer is not initialized".to_string())?;
                 unsafe {
                     self.d3d_context.UpdateSubresource(
-                        &self.backbuffer,
+                        backbuffer,
                         0,
                         None,
                         bytes.as_ptr().cast(),
@@ -232,8 +259,10 @@ impl NativeVideoPresenter {
                         .map_err(|e| format!("OpenSharedResource1 frame texture: {e:?}"))?
                 };
                 unsafe {
-                    let dst_res: ID3D11Resource = self
-                        .backbuffer
+                    let backbuffer = self.backbuffer.as_ref().ok_or_else(|| {
+                        "native presenter backbuffer is not initialized".to_string()
+                    })?;
+                    let dst_res: ID3D11Resource = backbuffer
                         .cast()
                         .map_err(|e| format!("cast backbuffer resource: {e:?}"))?;
                     let src_res: ID3D11Resource = src
@@ -282,6 +311,34 @@ impl NativeVideoPresenter {
             self.fence_cache = Some((fence_gen, handle_key, fence));
         }
         Ok(self.fence_cache.as_ref().unwrap().2.clone())
+    }
+
+    fn recreate_backbuffer(&mut self, present_initial_black: bool) -> Result<(), String> {
+        let backbuffer: ID3D11Texture2D = unsafe {
+            self.swap_chain
+                .GetBuffer(0)
+                .map_err(|e| format!("IDXGISwapChain::GetBuffer: {e:?}"))?
+        };
+        let mut backbuffer_view = None;
+        unsafe {
+            self.d3d_device1
+                .CreateRenderTargetView(&backbuffer, None, Some(&mut backbuffer_view))
+                .map_err(|e| format!("CreateRenderTargetView: {e:?}"))?;
+        }
+        let backbuffer_view: ID3D11RenderTargetView =
+            backbuffer_view.ok_or_else(|| "CreateRenderTargetView returned null".to_string())?;
+        unsafe {
+            self.d3d_context
+                .ClearRenderTargetView(&backbuffer_view, &[0.0, 0.0, 0.0, 1.0]);
+            if present_initial_black {
+                self.swap_chain
+                    .Present(1, Default::default())
+                    .ok()
+                    .map_err(|e| format!("initial IDXGISwapChain::Present: {e:?}"))?;
+            }
+        }
+        self.backbuffer = Some(backbuffer);
+        Ok(())
     }
 }
 

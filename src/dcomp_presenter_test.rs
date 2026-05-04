@@ -5,23 +5,14 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::WindowsAndMessaging::{
-    AdjustWindowRectEx, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
-    DefWindowProcW, DestroyWindow, DispatchMessageW, IDC_ARROW, LoadCursorW, MSG, PM_REMOVE,
-    PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_NCCREATE, WNDCLASSW, WS_OVERLAPPEDWINDOW,
-    WS_VISIBLE,
-};
-use windows::core::w;
 
 use crate::video::engine::actor::state_code;
 use crate::video::gpu_renderer::GpuVideoDevice;
 use crate::video::native_presenter::{
     NativePresentOutcome, NativePresenterConfig, NativeVideoPresenter,
 };
+use crate::video::native_window::{NativeVideoWindow, NativeVideoWindowConfig};
 
 #[derive(Clone, Debug)]
 pub struct DcompPresenterTestConfig {
@@ -100,10 +91,13 @@ fn parse_size(s: &str) -> Option<(u32, u32)> {
 
 pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
     let _com = ComApartment::init()?;
-    let window = NativeWindow::create(config.width, config.height)?;
+    let mut window = NativeVideoWindow::create(NativeVideoWindowConfig::test_windowed(
+        config.width,
+        config.height,
+    ))?;
     let gpu = GpuVideoDevice::new().map_err(|e| e.to_string())?;
     let mut presenter = NativeVideoPresenter::new(NativePresenterConfig {
-        hwnd: window.hwnd,
+        hwnd: window.hwnd(),
         width: config.width,
         height: config.height,
     })?;
@@ -189,7 +183,7 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
             .map(|started: Instant| started.elapsed() < config.duration)
             .unwrap_or_else(|| run_started.elapsed() < config.duration)
     {
-        quit = pump_messages();
+        quit = crate::video::native_window::pump_thread_messages();
         while let Ok(frame) = handles.video_rx.try_recv() {
             if timeline_base_pts.is_none() {
                 timeline_base_pts = Some(frame.pts_secs);
@@ -258,9 +252,7 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
     cancel.store(true, Ordering::Release);
     let _ = audio_drain.join();
     stats.emit_summary(config.duration);
-    unsafe {
-        let _ = DestroyWindow(window.hwnd);
-    }
+    window.destroy();
     Ok(())
 }
 
@@ -283,105 +275,6 @@ impl Drop for ComApartment {
             CoUninitialize();
         }
     }
-}
-
-struct NativeWindow {
-    hwnd: HWND,
-}
-
-impl NativeWindow {
-    fn create(width: u32, height: u32) -> Result<Self, String> {
-        unsafe {
-            let hmodule = GetModuleHandleW(None).map_err(|e| format!("GetModuleHandleW: {e:?}"))?;
-            let hinstance = HINSTANCE(hmodule.0);
-            let cursor = LoadCursorW(None, IDC_ARROW).ok();
-            let wc = WNDCLASSW {
-                style: CS_HREDRAW | CS_VREDRAW,
-                lpfnWndProc: Some(wnd_proc),
-                hInstance: hinstance,
-                hCursor: cursor.unwrap_or_default(),
-                lpszClassName: w!("mIVDcompPresenterTest"),
-                ..Default::default()
-            };
-            RegisterClassW(&wc);
-            let style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
-            let ex_style = WINDOW_EX_STYLE::default();
-            let mut rect = RECT {
-                left: 0,
-                top: 0,
-                right: width as i32,
-                bottom: height as i32,
-            };
-            AdjustWindowRectEx(&mut rect, style, false, ex_style)
-                .map_err(|e| format!("AdjustWindowRectEx: {e:?}"))?;
-            let hwnd = CreateWindowExW(
-                ex_style,
-                w!("mIVDcompPresenterTest"),
-                w!("mIV DirectComposition Presenter Test"),
-                style,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                None,
-                None,
-                Some(hinstance),
-                None,
-            )
-            .map_err(|e| format!("CreateWindowExW: {e:?}"))?;
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            Ok(Self { hwnd })
-        }
-    }
-}
-
-unsafe extern "system" fn wnd_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    match msg {
-        WM_NCCREATE => {
-            let _ = lparam.0 as *const CREATESTRUCTW;
-            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
-        }
-        WM_KEYDOWN if wparam.0 as u32 == 0x1B => {
-            unsafe {
-                let _ = DestroyWindow(hwnd);
-            }
-            LRESULT(0)
-        }
-        WM_CLOSE => {
-            unsafe {
-                let _ = DestroyWindow(hwnd);
-            }
-            LRESULT(0)
-        }
-        WM_DESTROY => {
-            unsafe {
-                PostQuitMessage(0);
-            }
-            LRESULT(0)
-        }
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
-    }
-}
-
-fn pump_messages() -> bool {
-    let mut quit = false;
-    unsafe {
-        let mut msg = MSG::default();
-        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
-            if msg.message == windows::Win32::UI::WindowsAndMessaging::WM_QUIT {
-                quit = true;
-                break;
-            }
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-    quit
 }
 
 #[derive(Default)]
