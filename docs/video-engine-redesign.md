@@ -1419,3 +1419,9 @@ prototype limits: no egui HUD overlay, no VST3 startup path, no 10-bit GPU frame
 presentation, and exact-size BGRA frames are the intended fast path. The goal is
 to make a data-driven GO/NO-GO decision before integrating a native presenter
 into the fullscreen viewer.
+
+`scripts/video_soak.py --dcomp-presenter` runs the same one-process-per-video
+harness through this native path instead of `--play-test`. The report reuses the
+existing columns but maps them to native metrics while in this mode:
+`display_miss` shows presented frame count, `frame_gap` shows native late-drop
+count, and `max_gap_ms` shows `native_presenter/summary.max_interval_ms`.

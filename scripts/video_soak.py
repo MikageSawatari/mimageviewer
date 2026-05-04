@@ -81,6 +81,7 @@ def iter_videos(roots: list[Path]) -> list[Path]:
 def analyze_perf(path: Path) -> dict[str, float | int]:
     counts: dict[str, int] = {}
     max_values: dict[str, float] = {}
+    native_summary: dict[str, float | int] = {}
     total = 0
     if not path.exists():
         return {"events": 0, "missing_log": 1}
@@ -99,6 +100,21 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
                 value = event.get(field)
                 if isinstance(value, (int, float)):
                     max_values[f"max_{field}"] = max(max_values.get(f"max_{field}", 0.0), float(value))
+            if cat == "native_presenter" and kind == "summary":
+                for field in (
+                    "presented",
+                    "gpu_frames",
+                    "cpu_frames",
+                    "late_drop",
+                    "wait_timeout",
+                    "actual_fps",
+                    "max_late_ms",
+                    "max_total_ms",
+                    "max_interval_ms",
+                ):
+                    value = event.get(field)
+                    if isinstance(value, (int, float)):
+                        native_summary[f"native_{field}"] = value
     return {
         "events": total,
         "display_miss": counts.get("video/display_miss", 0),
@@ -107,6 +123,10 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
         "dropped_past": counts.get("video/dropped_past", 0),
         "packet_wait": counts.get("demux/packet_send_wait", 0),
         "play_completed": counts.get("play_test/completed", 0),
+        "native_present": counts.get("native_presenter/present", 0),
+        "native_late_drop": counts.get("native_presenter/late_drop", 0),
+        "native_summary": counts.get("native_presenter/summary", 0),
+        **native_summary,
         **max_values,
     }
 
@@ -116,6 +136,14 @@ def status_for(metrics: dict[str, float | int], proc_code: int | None, timed_out
         return "TIMEOUT"
     if proc_code not in (0, None):
         return f"EXIT_{proc_code}"
+    if metrics.get("native_summary", 0) >= 1:
+        if metrics.get("native_late_drop", 0):
+            return "DROP"
+        if metrics.get("native_wait_timeout", 0):
+            return "WAIT"
+        if metrics.get("native_presented", 0) < 1:
+            return "NO_PRESENT"
+        return "OK"
     if metrics.get("play_completed", 0) < 1:
         return "NO_COMPLETE"
     if metrics.get("dropped_full", 0) or metrics.get("dropped_past", 0):
@@ -137,27 +165,46 @@ def run_one(
     window_size: str,
     mute: bool,
     skip_vst3: bool,
+    dcomp_presenter: bool,
+    dcomp_sync_interval: int,
 ) -> tuple[str, Path, dict[str, float | int], float]:
     log_path = out_dir / f"{index:04d}_{mode.name}_{safe_stem(video)}.jsonl"
     env = os.environ.copy()
     env.update(mode.env)
-    cmd = [
-        str(exe),
-        "--play-test",
-        str(video),
-        "--play-duration",
-        str(duration),
-        "--perf-log",
-        str(log_path),
-        "--window-size",
-        window_size,
-    ]
-    if start is not None:
-        cmd.extend(["--play-test-start", str(start)])
-    if mute:
-        cmd.append("--play-muted")
-    if skip_vst3:
-        cmd.append("--play-test-skip-vst3")
+    if dcomp_presenter:
+        cmd = [
+            str(exe),
+            "--dcomp-presenter-test",
+            str(video),
+            "--dcomp-duration",
+            str(duration),
+            "--perf-log",
+            str(log_path),
+            "--dcomp-window-size",
+            window_size,
+            "--dcomp-sync-interval",
+            str(dcomp_sync_interval),
+        ]
+        if start is not None:
+            cmd.extend(["--dcomp-start", str(start)])
+    else:
+        cmd = [
+            str(exe),
+            "--play-test",
+            str(video),
+            "--play-duration",
+            str(duration),
+            "--perf-log",
+            str(log_path),
+            "--window-size",
+            window_size,
+        ]
+        if start is not None:
+            cmd.extend(["--play-test-start", str(start)])
+        if mute:
+            cmd.append("--play-muted")
+        if skip_vst3:
+            cmd.append("--play-test-skip-vst3")
     started = time.monotonic()
     timed_out = False
     try:
@@ -193,6 +240,17 @@ def main() -> int:
         "--skip-vst3",
         action="store_true",
         help="Pass --play-test-skip-vst3 to isolate video playback from VST3 startup/processing",
+    )
+    parser.add_argument(
+        "--dcomp-presenter",
+        action="store_true",
+        help="Run --dcomp-presenter-test instead of the normal egui fullscreen --play-test path",
+    )
+    parser.add_argument(
+        "--dcomp-sync-interval",
+        type=int,
+        default=1,
+        help="Sync interval passed to --dcomp-presenter-test (default: 1)",
     )
     parser.add_argument(
         "--mode",
@@ -243,15 +301,24 @@ def main() -> int:
                 args.window_size,
                 not args.no_mute,
                 args.skip_vst3,
+                args.dcomp_presenter,
+                args.dcomp_sync_interval,
             )
             if status != "OK":
                 failures += 1
             drops = int(metrics.get("dropped_full", 0)) + int(metrics.get("dropped_past", 0))
+            display_miss = int(metrics.get("display_miss", 0))
+            frame_gap = int(metrics.get("frame_gap", 0))
+            max_gap = float(metrics.get("max_gap_ms", 0.0))
+            if args.dcomp_presenter:
+                display_miss = int(metrics.get("native_presented", metrics.get("native_present", 0)))
+                frame_gap = int(metrics.get("native_late_drop", 0))
+                max_gap = float(metrics.get("native_max_interval_ms", 0.0))
             row = (
                 f"| {status} | {mode.name} | {elapsed:.1f} | "
-                f"{int(metrics.get('display_miss', 0))} | "
-                f"{int(metrics.get('frame_gap', 0))} | {drops} | "
-                f"{float(metrics.get('max_gap_ms', 0.0)):.1f} | "
+                f"{display_miss} | "
+                f"{frame_gap} | {drops} | "
+                f"{max_gap:.1f} | "
                 f"`{log_path.name}` | `{video}` |"
             )
             print(row)
