@@ -118,7 +118,10 @@ Status:
 Current limitations of the experimental slice:
 
 - no egui overlay/input routing on the native HWND yet; it is video-only
-- Escape closes the native video HWND and then the existing fullscreen state
+- Escape closes the native video HWND and then the existing fullscreen state.
+  A minimal native key bridge forwards core video shortcuts (Enter, W,
+  Left/Right seek, Shift+Up/Down volume, M/L/P/S/B) back to the UI thread, but
+  full file navigation and overlay hit-testing remain Phase C work.
 - GPU frames are copied directly to the presenter backbuffer, so this slice is
   intended for same-size smoke tests such as the 1080p120 sync clip until
   scaling/letterboxing is added

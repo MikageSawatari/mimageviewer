@@ -12977,6 +12977,11 @@ impl App {
         let mut native_closed_idx: Option<usize> = None;
         #[cfg(windows)]
         let mut native_owner_hwnd: u64 = 0;
+        #[cfg(windows)]
+        let mut native_events: Vec<(
+            usize,
+            crate::video::native_window::NativeVideoWindowEvent,
+        )> = Vec::new();
         for (idx, entry) in self.fs_cache.iter_mut() {
             if let FsCacheEntry::Video { player, .. } = entry {
                 player.set_loop_enabled(loop_enabled);
@@ -13000,6 +13005,12 @@ impl App {
                     if player.native_presenter_closed() {
                         native_closed_idx = Some(*idx);
                     }
+                    native_events.extend(
+                        player
+                            .drain_native_presenter_events()
+                            .into_iter()
+                            .map(|event| (*idx, event)),
+                    );
                 }
                 if do_save {
                     let path_key = crate::adjustment_db::normalize_path(player.path());
@@ -13012,6 +13023,10 @@ impl App {
             self.dsp_bridge
                 .set_existing_guis_owner_to_hwnd(native_owner_hwnd);
             self.native_video_owner_synced_hwnd = native_owner_hwnd;
+        }
+        #[cfg(windows)]
+        for (idx, event) in native_events {
+            self.handle_native_video_window_event(ctx, idx, event);
         }
         #[cfg(windows)]
         if native_closed_idx.is_some() {
@@ -13036,6 +13051,138 @@ impl App {
             } else {
                 ctx.request_repaint_after(d);
             }
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_window_event(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        event: crate::video::native_window::NativeVideoWindowEvent,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        let crate::video::native_window::NativeVideoWindowEvent::KeyDown(key) = event;
+        if key.alt {
+            return;
+        }
+        let mut hud_activity = true;
+        match key.virtual_key {
+            // Enter: play / pause. Shift+Enter is still handled by the egui
+            // fullscreen path; native HWND support keeps the core transport
+            // controls usable until the overlay/input phase is complete.
+            0x0D if !key.shift && !key.ctrl && !key.repeat => {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.toggle_play();
+                }
+            }
+            // W: seek to start and play.
+            0x57 if !key.shift && !key.ctrl && !key.repeat => {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.seek(0.0);
+                }
+            }
+            // Left / Right: same seek granularity as the egui fullscreen path.
+            0x25 => {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    let delta = if key.ctrl {
+                        -30.0
+                    } else if key.shift {
+                        -1.0
+                    } else {
+                        -5.0
+                    };
+                    player.seek_relative(delta);
+                }
+            }
+            0x27 => {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    let delta = if key.ctrl {
+                        30.0
+                    } else if key.shift {
+                        1.0
+                    } else {
+                        5.0
+                    };
+                    player.seek_relative(delta);
+                }
+            }
+            // Shift+Up / Shift+Down: volume. Plain Up/Down remains for the
+            // future full input-routing phase because it navigates files.
+            0x26 if key.shift && !key.ctrl => {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    let v = (player.volume() + 0.20).min(1.0);
+                    player.set_volume(v);
+                    self.settings.video_volume = v;
+                    self.settings.save();
+                }
+            }
+            0x28 if key.shift && !key.ctrl => {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    let v = (player.volume() - 0.20).max(0.0);
+                    player.set_volume(v);
+                    self.settings.video_volume = v;
+                    self.settings.save();
+                }
+            }
+            // M: mute
+            0x4D if !key.shift && !key.ctrl && !key.repeat => {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.set_muted(!player.is_muted());
+                }
+            }
+            // L: loop
+            0x4C if !key.shift && !key.ctrl && !key.repeat => {
+                self.settings.video_loop = !self.settings.video_loop;
+                self.settings.save();
+            }
+            // P: perf overlay
+            0x50 if !key.shift && !key.ctrl && !key.repeat => {
+                self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
+                self.video_perf_history.clear();
+                self.video_perf_last_wall = None;
+                self.video_perf_last_seq = None;
+                self.video_perf_last_decoder_skip = None;
+                self.video_perf_last_ui_skip = None;
+            }
+            // S: tile mode toggle. This still uses the egui context for screen
+            // size until the native overlay owns layout.
+            0x53 if !key.shift && !key.ctrl && !key.repeat => {
+                let screen = ctx.content_rect().size();
+                self.toggle_video_tile_mode(fs_idx, screen);
+            }
+            // B: add video bookmark.
+            0x42 if !key.shift && !key.ctrl && !key.repeat => {
+                let snapshot = match self.fs_cache.get(&fs_idx) {
+                    Some(FsCacheEntry::Video { player, .. }) => {
+                        if player.error().is_some() || player.info().is_none() {
+                            None
+                        } else {
+                            Some((player.path().clone(), player.position()))
+                        }
+                    }
+                    _ => None,
+                };
+                if let (Some((path, pts)), Some(db)) = (snapshot, self.video_bookmark_db.as_ref()) {
+                    if let Err(e) = db.add(&path, pts, None, &[]) {
+                        crate::logger::log(format!("video bookmark add failed: {e}"));
+                    } else {
+                        crate::logger::log(format!(
+                            "video bookmark added: pts={pts:.2}s {}",
+                            path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                        ));
+                    }
+                }
+            }
+            _ => {
+                hud_activity = false;
+            }
+        }
+        if hud_activity {
+            self.video_hud_last_activity = Some(std::time::Instant::now());
+            ctx.request_repaint();
         }
     }
 

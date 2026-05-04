@@ -1,5 +1,6 @@
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, CreateWindowExW,
     DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetWindowLongPtrW, IDC_ARROW,
@@ -11,16 +12,30 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::w;
 
 #[derive(Clone, Copy, Debug)]
+pub struct NativeVideoKeyEvent {
+    pub virtual_key: u32,
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub repeat: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum NativeVideoWindowEvent {
+    KeyDown(NativeVideoKeyEvent),
+}
+
+#[derive(Clone, Copy, Debug)]
 pub enum NativeVideoWindowMode {
     Windowed { width: u32, height: u32 },
     Borderless { rect: RECT },
 }
 
-#[derive(Clone, Copy, Debug)]
 pub struct NativeVideoWindowConfig {
     pub mode: NativeVideoWindowMode,
     pub close_on_escape: bool,
     pub post_quit_on_destroy: bool,
+    pub event_tx: Option<std::sync::mpsc::Sender<NativeVideoWindowEvent>>,
 }
 
 impl NativeVideoWindowConfig {
@@ -29,6 +44,7 @@ impl NativeVideoWindowConfig {
             mode: NativeVideoWindowMode::Windowed { width, height },
             close_on_escape: true,
             post_quit_on_destroy: true,
+            event_tx: None,
         }
     }
 }
@@ -40,6 +56,7 @@ pub struct NativeVideoWindow {
 struct WindowState {
     close_on_escape: bool,
     post_quit_on_destroy: bool,
+    event_tx: Option<std::sync::mpsc::Sender<NativeVideoWindowEvent>>,
 }
 
 impl NativeVideoWindow {
@@ -96,6 +113,7 @@ impl NativeVideoWindow {
             let state = Box::new(WindowState {
                 close_on_escape: config.close_on_escape,
                 post_quit_on_destroy: config.post_quit_on_destroy,
+                event_tx: config.event_tx,
             });
             let state_ptr = Box::into_raw(state);
             let hwnd = match CreateWindowExW(
@@ -181,8 +199,15 @@ unsafe extern "system" fn wnd_proc(
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
-        WM_KEYDOWN if wparam.0 as u32 == 0x1B => {
-            if window_state(hwnd).is_some_and(|s| s.close_on_escape) {
+        WM_KEYDOWN => {
+            if let Some(state) = window_state(hwnd) {
+                if let Some(tx) = &state.event_tx {
+                    let _ = tx.send(NativeVideoWindowEvent::KeyDown(native_key_event(
+                        wparam, lparam,
+                    )));
+                }
+            }
+            if wparam.0 as u32 == 0x1B && window_state(hwnd).is_some_and(|s| s.close_on_escape) {
                 unsafe {
                     let _ = DestroyWindow(hwnd);
                 }
@@ -224,5 +249,18 @@ fn window_state(hwnd: HWND) -> Option<&'static WindowState> {
         None
     } else {
         Some(unsafe { &*ptr })
+    }
+}
+
+fn native_key_event(wparam: WPARAM, lparam: LPARAM) -> NativeVideoKeyEvent {
+    let shift = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
+    let ctrl = unsafe { GetKeyState(VK_CONTROL.0 as i32) } < 0;
+    let alt = unsafe { GetKeyState(VK_MENU.0 as i32) } < 0;
+    NativeVideoKeyEvent {
+        virtual_key: wparam.0 as u32,
+        shift,
+        ctrl,
+        alt,
+        repeat: ((lparam.0 as u64) & (1 << 30)) != 0,
     }
 }

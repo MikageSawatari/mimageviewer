@@ -166,6 +166,7 @@ struct NativeVideoOutput {
     cancel: Arc<AtomicBool>,
     hwnd: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
+    event_rx: std::sync::Mutex<std::sync::mpsc::Receiver<native_window::NativeVideoWindowEvent>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -181,6 +182,7 @@ impl NativeVideoOutput {
         let cancel = Arc::new(AtomicBool::new(false));
         let hwnd = Arc::new(AtomicU64::new(0));
         let closed = Arc::new(AtomicBool::new(false));
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
         let thread_cancel = Arc::clone(&cancel);
         let thread_hwnd = Arc::clone(&hwnd);
         let thread_closed = Arc::clone(&closed);
@@ -193,6 +195,7 @@ impl NativeVideoOutput {
                     engine_event_tx,
                     displayed_frame_seq,
                     config,
+                    event_tx,
                     thread_cancel,
                     thread_hwnd,
                     thread_closed,
@@ -210,6 +213,7 @@ impl NativeVideoOutput {
             cancel,
             hwnd,
             closed,
+            event_rx: std::sync::Mutex::new(event_rx),
             thread: Some(thread),
         })
     }
@@ -220,6 +224,17 @@ impl NativeVideoOutput {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    fn drain_events(&self) -> Vec<native_window::NativeVideoWindowEvent> {
+        let Ok(rx) = self.event_rx.lock() else {
+            return Vec::new();
+        };
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
     }
 }
 
@@ -267,6 +282,7 @@ fn run_native_video_output(
     engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
     displayed_frame_seq: Arc<AtomicU64>,
     config: NativeVideoOutputConfig,
+    event_tx: std::sync::mpsc::Sender<native_window::NativeVideoWindowEvent>,
     cancel: Arc<AtomicBool>,
     hwnd_out: Arc<AtomicU64>,
     closed: Arc<AtomicBool>,
@@ -286,6 +302,7 @@ fn run_native_video_output(
             // This HWND lives on the presenter thread, so WM_QUIT only exits
             // this loop and does not affect eframe's main event loop.
             post_quit_on_destroy: true,
+            event_tx: Some(event_tx),
         },
     )?;
     hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
@@ -881,6 +898,14 @@ impl VideoPlayer {
             .as_ref()
             .map(NativeVideoOutput::is_closed)
             .unwrap_or(false)
+    }
+
+    #[cfg(windows)]
+    pub fn drain_native_presenter_events(&self) -> Vec<native_window::NativeVideoWindowEvent> {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::drain_events)
+            .unwrap_or_default()
     }
 
     /// UI スレッドが毎フレーム呼ぶ。新しい info / video frame があれば反映する。
