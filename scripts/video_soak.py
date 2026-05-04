@@ -82,6 +82,12 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
     counts: dict[str, int] = {}
     max_values: dict[str, float] = {}
     native_summary: dict[str, float | int] = {}
+    overlay_render_total_ms = 0.0
+    overlay_render_count = 0
+    overlay_input_presents = 0
+    overlay_idle_presents = 0
+    overlay_prev_t: float | None = None
+    overlay_max_interval_ms = 0.0
     total = 0
     if not path.exists():
         return {"events": 0, "missing_log": 1}
@@ -100,6 +106,27 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
                 value = event.get(field)
                 if isinstance(value, (int, float)):
                     max_values[f"max_{field}"] = max(max_values.get(f"max_{field}", 0.0), float(value))
+            if cat == "native_presenter" and kind == "egui_overlay_present":
+                t = event.get("t")
+                if isinstance(t, (int, float)):
+                    if overlay_prev_t is not None:
+                        overlay_max_interval_ms = max(
+                            overlay_max_interval_ms, (float(t) - overlay_prev_t) * 1000.0
+                        )
+                    overlay_prev_t = float(t)
+                render_ms = event.get("render_ms")
+                if isinstance(render_ms, (int, float)):
+                    overlay_render_count += 1
+                    overlay_render_total_ms += float(render_ms)
+                    max_values["max_overlay_render_ms"] = max(
+                        max_values.get("max_overlay_render_ms", 0.0), float(render_ms)
+                    )
+                input_events = int(event.get("input_events", 0) or 0)
+                native_events = int(event.get("native_events", 0) or 0)
+                if input_events or native_events:
+                    overlay_input_presents += 1
+                else:
+                    overlay_idle_presents += 1
             if cat == "native_presenter" and kind == "summary":
                 for field in (
                     "presented",
@@ -126,6 +153,13 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
         "native_present": counts.get("native_presenter/present", 0),
         "native_late_drop": counts.get("native_presenter/late_drop", 0),
         "native_summary": counts.get("native_presenter/summary", 0),
+        "overlay_present": counts.get("native_presenter/egui_overlay_present", 0),
+        "overlay_input_present": overlay_input_presents,
+        "overlay_idle_present": overlay_idle_presents,
+        "overlay_avg_render_ms": (
+            overlay_render_total_ms / overlay_render_count if overlay_render_count else 0.0
+        ),
+        "overlay_max_interval_ms": overlay_max_interval_ms,
         **native_summary,
         **max_values,
     }
@@ -280,8 +314,8 @@ def main() -> int:
         f"- modes: {', '.join(m.name for m in modes)}",
         f"- duration: {args.duration}s",
         "",
-        "| status | mode | seconds | display_miss | frame_gap | drops | max_gap_ms | log | video |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        "| status | mode | seconds | display_miss | frame_gap | drops | max_gap_ms | overlay_present | overlay_max_render_ms | overlay_max_interval_ms | log | video |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
 
     failures = 0
@@ -314,11 +348,17 @@ def main() -> int:
                 display_miss = int(metrics.get("native_presented", metrics.get("native_present", 0)))
                 frame_gap = int(metrics.get("native_late_drop", 0))
                 max_gap = float(metrics.get("native_max_interval_ms", 0.0))
+            overlay_present = int(metrics.get("overlay_present", 0))
+            overlay_max_render_ms = float(metrics.get("max_overlay_render_ms", 0.0))
+            overlay_max_interval_ms = float(metrics.get("overlay_max_interval_ms", 0.0))
             row = (
                 f"| {status} | {mode.name} | {elapsed:.1f} | "
                 f"{display_miss} | "
                 f"{frame_gap} | {drops} | "
                 f"{max_gap:.1f} | "
+                f"{overlay_present} | "
+                f"{overlay_max_render_ms:.2f} | "
+                f"{overlay_max_interval_ms:.1f} | "
                 f"`{log_path.name}` | `{video}` |"
             )
             print(row)

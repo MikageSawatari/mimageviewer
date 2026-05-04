@@ -258,6 +258,12 @@ python scripts/video_soak.py --exe target\release\mimageviewer-core.exe `
   H:\home\mimageviewer_old\testimage\movie\test_120fps_1080p_sync.mp4
 ```
 
+For the Phase C production overlay path, use
+`docs/codex-native-overlay-redraw-cadence-brief.md`. The soak report includes
+`overlay_present`, `overlay_max_render_ms`, and `overlay_max_interval_ms` from
+`native_presenter/egui_overlay_present` events so overlay redraw cadence can be
+checked separately from native video present cadence.
+
 Core clips:
 
 - synthetic 1080p120 sync video
