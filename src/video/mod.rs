@@ -29,6 +29,8 @@ pub mod engine;
 pub mod ffmpeg_loader;
 #[cfg(windows)]
 pub mod gpu_renderer;
+#[cfg(windows)]
+pub mod native_presenter;
 pub mod thumbnail;
 pub mod tile_thumb_cache;
 pub mod tile_thumbnails;

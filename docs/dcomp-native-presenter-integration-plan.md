@@ -65,6 +65,13 @@ Acceptance:
 - `--dcomp-presenter-test` still reaches 1080p120 with no late drops.
 - No behavior change in normal fullscreen playback.
 
+Status:
+
+- 2026-05-04: `NativeVideoPresenter` was extracted into
+  `src/video/native_presenter.rs`. The prototype CLI remains the first caller,
+  so the native presenter can be regression-tested with `--dcomp-presenter-test`
+  while production fullscreen integration is still pending.
+
 ## Phase B: Fullscreen HWND Ownership
 
 The current fullscreen path is an egui viewport. Native presentation needs the
@@ -79,9 +86,11 @@ Two possible approaches:
 1. Keep eframe's fullscreen viewport HWND and attach the native presenter to it.
 2. Create a dedicated Win32 fullscreen HWND and embed/overlay egui separately.
 
-Start with approach 1 if the HWND can be obtained reliably for the fullscreen
-viewport. Fall back to approach 2 if eframe/winit handle access or resize/DPI
-events are too constrained.
+The prototype already validates approach 2, and it avoids possible conflicts
+between an eframe/wgpu swap chain and a DComp target on the same HWND. Start
+Phase B by evaluating approach 2 first. Approach 1 remains available only if
+embedding into the eframe fullscreen viewport proves clearly simpler and does
+not interfere with wgpu presentation.
 
 Acceptance:
 
@@ -95,10 +104,15 @@ Acceptance:
 The video visual can present independently, but HUD and seek UI still need to
 draw above it. Evaluate in this order:
 
-1. Egui overlay as a transparent child/top-level overlay HWND.
-2. Egui overlay as a second DComp visual backed by its own swap chain.
+1. Egui overlay as a second DComp visual backed by its own swap chain.
+2. Egui overlay as a transparent child/top-level overlay HWND.
 3. Minimal native HUD for the hottest controls, with egui panels shown only
    while interaction is active.
+
+The second DComp visual is the preferred production direction because it keeps
+video and overlay composition inside the same visual tree. Transparent overlay
+HWND experiments are still useful as a fallback, but they carry more Z-order and
+airspace risk.
 
 The first production slice can accept a 60Hz overlay cadence as long as video
 presentation remains independent at 120fps.
