@@ -262,7 +262,14 @@ For the Phase C production overlay path, use
 `docs/codex-native-overlay-redraw-cadence-brief.md`. The soak report includes
 `overlay_present`, `overlay_max_render_ms`, and `overlay_max_interval_ms` from
 `native_presenter/egui_overlay_present` events so overlay redraw cadence can be
-checked separately from native video present cadence.
+checked separately from native video present cadence. The production native
+fullscreen path also emits `native_presenter/summary` with the same core fields
+as `--dcomp-presenter-test` (`presented`, `gpu_frames`, `cpu_frames`,
+`late_drop`, `wait_timeout`, `actual_fps`, and max timing fields), so soak
+status can key off the native presenter rather than the legacy egui fullscreen
+viewport that still runs during the opt-in phase. The production path emits this
+summary periodically as well as during orderly shutdown because play-test runs
+can exit before the presenter thread's final shutdown log is flushed.
 
 Core clips:
 

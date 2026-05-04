@@ -289,6 +289,99 @@ impl Drop for NativeComApartment {
 }
 
 #[cfg(windows)]
+#[derive(Default)]
+struct NativeFullscreenPresentStats {
+    presented: u64,
+    gpu: u64,
+    cpu: u64,
+    late_drop: u64,
+    wait_timeout: u64,
+    max_late_ms: f64,
+    max_total_ms: f64,
+    max_interval_ms: f64,
+}
+
+#[cfg(windows)]
+impl NativeFullscreenPresentStats {
+    fn record_present(
+        &mut self,
+        outcome: &crate::video::native_presenter::NativePresentOutcome,
+        late_ms: f64,
+        total_ms: f64,
+        interval_ms: f64,
+    ) {
+        self.presented += 1;
+        match outcome.path {
+            "d3d11_shared" => self.gpu += 1,
+            "cpu_upload" => self.cpu += 1,
+            _ => {}
+        }
+        if outcome.wait_timed_out {
+            self.wait_timeout += 1;
+        }
+        self.max_late_ms = self.max_late_ms.max(late_ms);
+        self.max_total_ms = self.max_total_ms.max(total_ms);
+        self.max_interval_ms = self.max_interval_ms.max(interval_ms);
+    }
+
+    fn record_late_drop(&mut self, pts: f64, late_ms: f64, queue_len: usize) {
+        self.late_drop += 1;
+        crate::perf::event(
+            "native_presenter",
+            "late_drop",
+            None,
+            0,
+            &[
+                ("pts", serde_json::Value::from(pts)),
+                ("late_ms", serde_json::Value::from(late_ms)),
+                ("queue_len", serde_json::Value::from(queue_len as i64)),
+            ],
+        );
+    }
+
+    fn emit_summary(&self, duration: std::time::Duration) {
+        let actual_fps = if duration.as_secs_f64() > 0.0 {
+            self.presented as f64 / duration.as_secs_f64()
+        } else {
+            0.0
+        };
+        crate::perf::event(
+            "native_presenter",
+            "summary",
+            None,
+            0,
+            &[
+                ("presented", serde_json::Value::from(self.presented as i64)),
+                ("gpu_frames", serde_json::Value::from(self.gpu as i64)),
+                ("cpu_frames", serde_json::Value::from(self.cpu as i64)),
+                ("late_drop", serde_json::Value::from(self.late_drop as i64)),
+                (
+                    "wait_timeout",
+                    serde_json::Value::from(self.wait_timeout as i64),
+                ),
+                ("actual_fps", serde_json::Value::from(actual_fps)),
+                ("max_late_ms", serde_json::Value::from(self.max_late_ms)),
+                ("max_total_ms", serde_json::Value::from(self.max_total_ms)),
+                (
+                    "max_interval_ms",
+                    serde_json::Value::from(self.max_interval_ms),
+                ),
+            ],
+        );
+        crate::logger::log(format!(
+            "[native-video] fullscreen presenter summary: presented={} fps={:.1} gpu={} cpu={} late_drop={} max_late_ms={:.1} max_interval_ms={:.1}",
+            self.presented,
+            actual_fps,
+            self.gpu,
+            self.cpu,
+            self.late_drop,
+            self.max_late_ms,
+            self.max_interval_ms
+        ));
+    }
+}
+
+#[cfg(windows)]
 fn run_native_video_output(
     video_rx: crossbeam_channel::Receiver<VideoFrame>,
     clock: Arc<AvClock>,
@@ -343,6 +436,10 @@ fn run_native_video_output(
     let mut queue: VecDeque<VideoFrame> = VecDeque::new();
     let mut last_seen_serial = clock.current_seek_serial();
     let mut first_frame_event_last_epoch: Option<u64> = None;
+    let run_started = Instant::now();
+    let mut present_stats = NativeFullscreenPresentStats::default();
+    let mut last_present_wall: Option<Instant> = None;
+    let mut last_summary_log = Instant::now();
     let mut last_present_log = Instant::now();
     let mut last_overlay_tick = Instant::now();
     let mut native_events = Vec::new();
@@ -433,7 +530,13 @@ fn run_native_video_output(
                 continue;
             }
             if front.pts_secs <= now + clock::DISPLAY_LEAD_TOLERANCE_SECS {
-                latest_renderable = queue.pop_front();
+                let candidate = queue.pop_front().expect("queue.front() returned Some");
+                if let Some(dropped) = latest_renderable.replace(candidate) {
+                    let late_ms = ((now - dropped.pts_secs) * 1000.0).max(0.0);
+                    if present_stats.presented > 0 && late_ms > 50.0 {
+                        present_stats.record_late_drop(dropped.pts_secs, late_ms, queue.len());
+                    }
+                }
                 continue;
             }
             break;
@@ -445,6 +548,19 @@ fn run_native_video_output(
             let present_t0 = Instant::now();
             match presenter.present(&frame, config.sync_interval) {
                 Ok(outcome) => {
+                    let total_ms = present_t0.elapsed().as_secs_f64() * 1000.0;
+                    let late_ms = ((clock.now_secs() - pts) * 1000.0).max(0.0);
+                    let interval_ms = last_present_wall
+                        .map(|last| {
+                            present_t0.saturating_duration_since(last).as_secs_f64() * 1000.0
+                        })
+                        .unwrap_or(0.0);
+                    last_present_wall = Some(present_t0);
+                    present_stats.record_present(&outcome, late_ms, total_ms, interval_ms);
+                    if last_summary_log.elapsed() >= Duration::from_secs(1) {
+                        present_stats.emit_summary(run_started.elapsed());
+                        last_summary_log = Instant::now();
+                    }
                     displayed_frame_seq.fetch_add(1, Ordering::Release);
                     if first_frame_event_last_epoch != Some(serial) {
                         first_frame_event_last_epoch = Some(serial);
@@ -460,7 +576,6 @@ fn run_native_video_output(
                         clock.clear_seek_target_override(serial);
                     }
                     if crate::perf::is_enabled() {
-                        let total_ms = present_t0.elapsed().as_secs_f64() * 1000.0;
                         if total_ms > 4.0 || last_present_log.elapsed() > Duration::from_secs(1) {
                             last_present_log = Instant::now();
                             crate::perf::event(
@@ -499,6 +614,7 @@ fn run_native_video_output(
         }
     }
 
+    present_stats.emit_summary(run_started.elapsed());
     hwnd_out.store(0, Ordering::Release);
     window.destroy();
     closed.store(true, Ordering::Release);

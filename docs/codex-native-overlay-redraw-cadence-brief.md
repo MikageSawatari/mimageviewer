@@ -24,6 +24,11 @@ from 1080p120 video presentation during idle HUD ticks and drag scrubbing.
 - `overlay_max_interval_ms`: largest interval between overlay presents
 
 The raw JSONL remains the source of truth when investigating a specific spike.
+The production native fullscreen path also emits `native_presenter/summary`, so
+`scripts/video_soak.py` can distinguish native-presenter cadence from legacy
+egui fullscreen viewport hitches while the old path still coexists. Production
+summary events are emitted periodically as well as during orderly shutdown, so
+short play-test runs still leave native-presenter status in the raw log.
 
 ## Suggested Soak
 
@@ -51,6 +56,8 @@ python scripts\video_soak.py `
 During one manual pass, keep the pointer over the bottom HUD strip for several
 seconds to exercise the 250ms visible-HUD tick. During another pass, drag the
 seek bar for several seconds to exercise 100ms target coalescing.
+This soak requires manual interaction during the run window; a headless run can
+only verify startup stability and HUD-hidden quietness.
 
 ## Acceptance
 
@@ -64,6 +71,9 @@ seek bar for several seconds to exercise 100ms target coalescing.
 - `overlay_max_interval_ms` is expected to be near 250ms during stationary
   visible-HUD playback. It can be lower while pointer input or drag scrubbing is
   active.
+  Note: overlay events do not fire while the HUD is hidden, so a long
+  HUD-hidden gap can inflate `overlay_max_interval_ms`. Interpret this metric
+  only across spans where the HUD remained visible.
 
 ## Follow-Up
 
