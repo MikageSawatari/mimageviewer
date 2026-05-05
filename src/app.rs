@@ -10360,7 +10360,11 @@ impl App {
                     #[cfg(windows)]
                     Some(self.dsp_bridge.clone()),
                     #[cfg(windows)]
-                    native_video_presenter_config(self.main_hwnd, self.video_perf_overlay_visible),
+                    native_video_presenter_config(
+                        self.main_hwnd,
+                        self.video_perf_overlay_visible,
+                        self.video_tile_reopen_pending,
+                    ),
                 );
                 if self.settings.video_start_muted || play_test_mute {
                     player.set_muted(true);
@@ -13738,17 +13742,7 @@ impl App {
     #[cfg(windows)]
     fn native_video_tile_preparing_overlay()
     -> crate::video::native_presenter::NativeOverlayTileOverlay {
-        crate::video::native_presenter::NativeOverlayTileOverlay {
-            interval_secs: 0.0,
-            timestamps: Vec::new(),
-            tile_w: 160,
-            tile_h: 90,
-            columns: 1,
-            progress_done: 0,
-            progress_total: 0,
-            finished: false,
-            tiles: Vec::new(),
-        }
+        crate::video::native_presenter::NativeOverlayTileOverlay::preparing()
     }
 
     #[cfg(windows)]
@@ -14249,20 +14243,26 @@ impl App {
     #[cfg(windows)]
     fn open_native_video_fullscreen_from_navigation(&mut self, ctx: &egui::Context, idx: usize) {
         let restore_video_tile = self.video_tile_state.is_some();
+        let restore_target_is_video = matches!(self.items.get(idx), Some(GridItem::Video(_)));
         if restore_video_tile {
             self.video_tile_state = None;
             self.video_tile_textures.clear();
             if let Some(current_idx) = self.fullscreen_idx {
                 self.set_native_video_tile_preparing_overlay(current_idx);
             }
+            if restore_target_is_video {
+                self.video_tile_reopen_pending = true;
+                self.video_tile_reopen_deadline =
+                    Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+            } else {
+                self.video_tile_reopen_pending = false;
+                self.video_tile_reopen_deadline = None;
+            }
         }
 
         self.open_fullscreen(idx);
 
-        if restore_video_tile && matches!(self.items.get(idx), Some(GridItem::Video(_))) {
-            self.video_tile_reopen_pending = true;
-            self.video_tile_reopen_deadline =
-                Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+        if restore_video_tile && restore_target_is_video {
             self.set_native_video_tile_preparing_overlay(idx);
         } else if restore_video_tile {
             self.video_tile_reopen_pending = false;
@@ -17165,6 +17165,7 @@ fn env_flag_enabled(name: &str, default: bool) -> bool {
 fn native_video_presenter_config(
     main_hwnd: Option<isize>,
     perf_overlay_visible: bool,
+    initial_tile_overlay: bool,
 ) -> Option<crate::video::NativeVideoOutputConfig> {
     if !env_flag_enabled("MIV_NATIVE_VIDEO_PRESENTER", true) {
         return None;
@@ -17195,6 +17196,7 @@ fn native_video_presenter_config(
         owner_hwnd: main_hwnd.unwrap_or_default() as u64,
         sync_interval,
         perf_overlay_visible,
+        initial_tile_overlay,
     })
 }
 

@@ -268,6 +268,22 @@ pub struct NativeOverlayTileOverlay {
     pub tiles: Vec<Option<NativeOverlayTileThumbnail>>,
 }
 
+impl NativeOverlayTileOverlay {
+    pub fn preparing() -> Self {
+        Self {
+            interval_secs: 0.0,
+            timestamps: Vec::new(),
+            tile_w: 160,
+            tile_h: 90,
+            columns: 1,
+            progress_done: 0,
+            progress_total: 0,
+            finished: false,
+            tiles: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NativeOverlayJumpEntry {
     pub pts_secs: f64,

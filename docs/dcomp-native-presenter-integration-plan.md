@@ -226,6 +226,11 @@ Current limitations of the experimental slice:
 - S-mode video-to-video navigation keeps a native tile preparing overlay active
   across the handoff, so the next video cannot briefly show at normal brightness
   before its tile thumbnails arrive.
+- When S-mode navigation is restoring the tile view, the new native presenter
+  is created with an initial opaque tile curtain and renders it before the first
+  video present. This prevents the first decoded frame or the underlying
+  thumbnail grid from winning the frame race before UI-thread tile commands
+  arrive.
 - The seek/jump thumbnail worker has no fixed entry-count cap; generated
   thumbnails are retained for the lifetime of the current `VideoPlayer` so
   unusually large chapter lists can continue filling instead of cycling older

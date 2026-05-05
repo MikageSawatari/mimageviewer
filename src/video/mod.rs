@@ -178,6 +178,7 @@ pub struct NativeVideoOutputConfig {
     pub owner_hwnd: u64,
     pub sync_interval: u32,
     pub perf_overlay_visible: bool,
+    pub initial_tile_overlay: bool,
 }
 
 #[cfg(windows)]
@@ -734,6 +735,22 @@ fn run_native_video_output(
         height,
         config.sync_interval
     ));
+    if config.initial_tile_overlay {
+        presenter.set_overlay_tile_overlay(Some(
+            crate::video::native_presenter::NativeOverlayTileOverlay::preparing(),
+        ));
+        if let Err(err) = presenter.tick_overlay_video_state(
+            clock.now_secs(),
+            f64::from_bits(duration_secs_bits.load(Ordering::Acquire)),
+            clock.is_playing(),
+            clock.volume(),
+            clock.is_muted(),
+        ) {
+            crate::logger::log(format!(
+                "[native-video] initial tile overlay render failed: {err}"
+            ));
+        }
+    }
 
     let mut queue: VecDeque<VideoFrame> = VecDeque::new();
     let mut last_seen_serial = clock.current_seek_serial();

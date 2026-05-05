@@ -213,6 +213,11 @@ Status:
   immediately after opening the next cached video. This keeps the dark tile
   curtain alive until the next tile worker snapshot is ready, avoiding a
   one-frame flash of the raw video surface.
+- 2026-05-05: the next native presenter now receives an `initial_tile_overlay`
+  flag in its startup config when S-mode video navigation is being restored.
+  The presenter renders the opaque tile curtain before its first video present,
+  closing the command-delivery race where the first frame could otherwise beat
+  the follow-up `SetTileOverlay` message.
 - 2026-05-05: the seek/jump thumbnail worker no longer has a fixed entry-count
   cap. Generated thumbnails are retained for the lifetime of the current
   `VideoPlayer`, so videos with hundreds of chapters can keep their left-panel
