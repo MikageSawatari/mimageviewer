@@ -235,9 +235,11 @@ Status:
 - 2026-05-05: S-mode's native tile curtain is now fully opaque black during
   preparing/navigation states, so the raw video surface cannot flash through at
   normal brightness. The top hover bar also replaced the S/P/V text buttons
-  with a 2x2 tile icon, a small line-graph icon, and a wider `VST` button; the
-  VST button resynchronizes plugin GUI ownership/topmost state to the native
-  fullscreen HWND before toggling visibility.
+  with same-size custom icons for VST3, perf graph, and tiles; the VST button
+  resynchronizes plugin GUI ownership/topmost state to the native fullscreen
+  HWND before toggling visibility. The perf graph is drawn at a lower egui
+  order than the side panels from the first frame, and an open VST panel no
+  longer forces the edge-hover chrome to stay visible.
 
 Acceptance for the spike:
 

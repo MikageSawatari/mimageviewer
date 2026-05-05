@@ -2366,8 +2366,8 @@ impl NativeEguiOverlay {
         let tile_overlay_visible = tile_overlay.is_some();
         let status_visible = video_error.is_some() || !first_frame_presented;
         let toast_visible = toast.is_some();
-        let panel_chrome_visible = !tile_overlay_visible
-            && (jump_panel_visible || top_bar_visible || right_panel_visible || vst3_panel_visible);
+        let panel_chrome_visible =
+            !tile_overlay_visible && (jump_panel_visible || top_bar_visible || right_panel_visible);
         let bottom_hud_visible = hud_visible || panel_chrome_visible;
         let paused_center_visible =
             !tile_overlay_visible && !is_playing && first_frame_presented && video_error.is_none();
@@ -3067,7 +3067,7 @@ fn draw_native_perf_overlay(
     origin: egui::Pos2,
 ) {
     egui::Area::new(egui::Id::new("native_video_perf_overlay"))
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Middle)
         .fixed_pos(origin)
         .show(ctx, |ui| {
             let width = overlay_width_points.min(460.0).max(300.0);
@@ -3502,7 +3502,7 @@ fn draw_native_jump_row(
 enum NativeTopButtonGlyph {
     TileGrid,
     PerfGraph,
-    Text(&'static str),
+    Vst3,
     Close,
 }
 
@@ -3527,16 +3527,8 @@ fn draw_native_top_button(
     match glyph {
         NativeTopButtonGlyph::TileGrid => draw_overlay_tile_grid_icon(painter, rect),
         NativeTopButtonGlyph::PerfGraph => draw_overlay_perf_graph_icon(painter, rect),
+        NativeTopButtonGlyph::Vst3 => draw_overlay_vst3_top_icon(painter, rect),
         NativeTopButtonGlyph::Close => draw_overlay_close_icon(painter, rect),
-        NativeTopButtonGlyph::Text(label) => {
-            painter.text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                label,
-                egui::FontId::monospace(12.0),
-                egui::Color32::from_rgb(238, 238, 238),
-            );
-        }
     }
     let resp = resp.on_hover_text(tooltip);
     if resp.clicked() {
@@ -3582,6 +3574,49 @@ fn draw_overlay_perf_graph_icon(painter: &egui::Painter, rect: egui::Rect) {
         points.to_vec(),
         egui::Stroke::new(1.7, egui::Color32::from_rgb(170, 230, 255)),
     ));
+}
+
+fn draw_overlay_vst3_top_icon(painter: &egui::Painter, rect: egui::Rect) {
+    let color = egui::Color32::from_rgb(238, 238, 238);
+    let stroke = egui::Stroke::new(1.55, color);
+    let base_y = rect.center().y + 5.0;
+    let top_y = rect.center().y - 6.0;
+    let left = rect.min.x + 5.5;
+    let mid = rect.center().x;
+    let right = rect.max.x - 5.5;
+
+    painter.line_segment(
+        [egui::pos2(left, top_y), egui::pos2(left + 3.4, base_y)],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(left + 3.4, base_y),
+            egui::pos2(left + 6.8, top_y),
+        ],
+        stroke,
+    );
+
+    let s_points = [
+        egui::pos2(mid - 2.0, top_y + 0.8),
+        egui::pos2(mid + 4.2, top_y + 0.8),
+        egui::pos2(mid - 0.6, rect.center().y - 0.5),
+        egui::pos2(mid + 4.8, base_y - 0.8),
+        egui::pos2(mid - 1.8, base_y - 0.8),
+    ];
+    painter.add(egui::Shape::line(s_points.to_vec(), stroke));
+
+    painter.line_segment(
+        [egui::pos2(right - 6.0, top_y), egui::pos2(right, top_y)],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(right - 3.0, top_y),
+            egui::pos2(right - 3.0, base_y),
+        ],
+        stroke,
+    );
 }
 
 fn draw_overlay_close_icon(painter: &egui::Painter, rect: egui::Rect) {
@@ -4001,11 +4036,11 @@ fn draw_native_top_bar(
                     &painter,
                     &mut x,
                     y,
-                    42.0,
+                    btn_size,
                     btn_size,
                     gap,
                     "native_top_vst3",
-                    NativeTopButtonGlyph::Text("VST"),
+                    NativeTopButtonGlyph::Vst3,
                     vst3_panel_visible,
                     "VST3 パネル表示/非表示",
                     NativeOverlayCommand::ToggleVst3Gui,
