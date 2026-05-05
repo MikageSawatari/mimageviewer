@@ -180,6 +180,7 @@ pub struct NativeVideoOutputConfig {
     pub perf_overlay_visible: bool,
     pub initial_tile_overlay: bool,
     pub vst3_available: bool,
+    pub checked: bool,
 }
 
 #[cfg(windows)]
@@ -272,6 +273,9 @@ enum NativeVideoOutputCommand {
     SetVst3Available {
         available: bool,
     },
+    SetChecked {
+        checked: bool,
+    },
     SetVideoCompact {
         compact: bool,
     },
@@ -298,6 +302,8 @@ struct NativeVideoOutput {
     first_presented: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     perf_overlay_visible: Arc<AtomicBool>,
+    last_vst3_available: AtomicBool,
+    last_checked: AtomicBool,
     command_tx: std::sync::mpsc::Sender<NativeVideoOutputCommand>,
     event_rx: std::sync::Mutex<std::sync::mpsc::Receiver<NativeVideoOutputEvent>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -318,6 +324,8 @@ impl NativeVideoOutput {
         let first_presented = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
         let perf_overlay_visible = Arc::new(AtomicBool::new(config.perf_overlay_visible));
+        let initial_vst3_available = config.vst3_available;
+        let initial_checked = config.checked;
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let (command_tx, command_rx) = std::sync::mpsc::channel();
         let thread_cancel = Arc::clone(&cancel);
@@ -358,6 +366,8 @@ impl NativeVideoOutput {
             first_presented,
             closed,
             perf_overlay_visible,
+            last_vst3_available: AtomicBool::new(initial_vst3_available),
+            last_checked: AtomicBool::new(initial_checked),
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
             thread: Some(thread),
@@ -417,9 +427,21 @@ impl NativeVideoOutput {
     }
 
     fn set_vst3_available(&self, available: bool) {
+        if self.last_vst3_available.swap(available, Ordering::AcqRel) == available {
+            return;
+        }
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetVst3Available { available });
+    }
+
+    fn set_checked(&self, checked: bool) {
+        if self.last_checked.swap(checked, Ordering::AcqRel) == checked {
+            return;
+        }
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetChecked { checked });
     }
 
     fn set_video_compact(&self, compact: bool) {
@@ -813,6 +835,7 @@ fn run_native_video_output(
         config.sync_interval
     ));
     presenter.set_overlay_vst3_available(config.vst3_available);
+    presenter.set_overlay_checked(config.checked);
     if config.initial_tile_overlay {
         presenter.set_overlay_tile_overlay(Some(
             crate::video::native_presenter::NativeOverlayTileOverlay::preparing(),
@@ -887,6 +910,9 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetVst3Available { available } => {
                     presenter.set_overlay_vst3_available(available);
+                }
+                NativeVideoOutputCommand::SetChecked { checked } => {
+                    presenter.set_overlay_checked(checked);
                 }
                 NativeVideoOutputCommand::SetVideoCompact { compact } => {
                     if let Err(err) = presenter.set_video_compact(compact) {
@@ -1894,6 +1920,13 @@ impl VideoPlayer {
     pub fn set_native_vst3_available(&self, available: bool) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_vst3_available(available);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_checked(&self, checked: bool) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_checked(checked);
         }
     }
 

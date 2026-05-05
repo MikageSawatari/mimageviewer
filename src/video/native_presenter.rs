@@ -123,6 +123,7 @@ struct NativeEguiOverlay {
     video_volume: f64,
     video_muted: bool,
     video_loop_enabled: bool,
+    video_checked: bool,
     vst3_available: bool,
     vst3_panel: Option<NativeOverlayVst3Panel>,
     first_frame_presented: bool,
@@ -1066,6 +1067,12 @@ impl NativeVideoPresenter {
         }
     }
 
+    pub fn set_overlay_checked(&mut self, checked: bool) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_checked(checked);
+        }
+    }
+
     pub fn set_overlay_vst3_available(&mut self, available: bool) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_vst3_available(available);
@@ -1703,6 +1710,7 @@ impl NativeEguiOverlay {
             video_volume: 1.0,
             video_muted: false,
             video_loop_enabled: false,
+            video_checked: false,
             vst3_available: false,
             vst3_panel: None,
             first_frame_presented: false,
@@ -2012,6 +2020,14 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
+    fn set_checked(&mut self, checked: bool) {
+        if self.video_checked == checked {
+            return;
+        }
+        self.video_checked = checked;
+        self.dirty = true;
+    }
+
     fn set_vst3_available(&mut self, available: bool) {
         if self.vst3_available == available {
             return;
@@ -2315,6 +2331,7 @@ impl NativeEguiOverlay {
         let is_playing = self.video_is_playing;
         let volume = self.video_volume;
         let muted = self.video_muted;
+        let checked = self.video_checked;
         let loop_enabled = self.video_loop_enabled;
         let first_frame_presented = self.first_frame_presented;
         let video_error = self.video_error.clone();
@@ -2359,6 +2376,7 @@ impl NativeEguiOverlay {
             || bottom_hud_visible
             || panel_chrome_visible
             || perf_visible
+            || (!tile_overlay_visible && checked)
             || status_visible
             || toast_visible
             || paused_center_visible
@@ -2445,6 +2463,13 @@ impl NativeEguiOverlay {
                     vst3_available,
                     vst3_panel_visible,
                     &mut commands,
+                );
+            }
+            if checked {
+                draw_native_checkmark(
+                    ctx,
+                    overlay_width_points,
+                    if panel_chrome_visible { 68.0 } else { 28.0 },
                 );
             }
             if vst3_panel_visible && let Some(panel) = vst3_panel.as_ref() {
@@ -3595,6 +3620,46 @@ fn draw_overlay_vst3_gui_icon(
         egui::Stroke::new(1.8, color),
         egui::StrokeKind::Inside,
     );
+}
+
+fn draw_native_checkmark(ctx: &egui::Context, overlay_width_points: f32, top: f32) {
+    egui::Area::new(egui::Id::new("native_video_checkmark"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let radius = 18.0;
+            let center = egui::pos2((overlay_width_points - 30.0).max(radius), top + radius);
+            let rect = egui::Rect::from_center_size(center, egui::vec2(radius * 2.2, radius * 2.2));
+            ui.allocate_rect(rect, egui::Sense::hover());
+            let painter = ui.painter();
+            painter.circle_filled(
+                center,
+                radius,
+                egui::Color32::from_rgba_unmultiplied(22, 154, 84, 226),
+            );
+            painter.circle_stroke(
+                center,
+                radius,
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 90),
+                ),
+            );
+            painter.line_segment(
+                [
+                    center + egui::vec2(-7.0, 0.5),
+                    center + egui::vec2(-2.0, 6.0),
+                ],
+                egui::Stroke::new(3.0, egui::Color32::WHITE),
+            );
+            painter.line_segment(
+                [
+                    center + egui::vec2(-2.0, 6.0),
+                    center + egui::vec2(8.0, -7.0),
+                ],
+                egui::Stroke::new(3.0, egui::Color32::WHITE),
+            );
+        });
 }
 
 fn draw_native_center_status(

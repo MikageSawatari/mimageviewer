@@ -223,6 +223,11 @@ Status:
   loop, mute, and bookmark actions remain on the bottom seek HUD or side
   panels, avoiding duplicate controls and top-bar button overlap. S-mode tile
   view also has a top-right close button that returns directly to normal video.
+- 2026-05-05: native fullscreen now mirrors the file checked state into the
+  overlay and draws the green check badge after Space toggles, matching the
+  legacy fullscreen feedback. The VST3-available and checked sync commands are
+  also change-filtered before they enter the presenter command queue, so steady
+  playback no longer sends redundant no-op state updates every UI tick.
 - 2026-05-05: the seek/jump thumbnail worker no longer has a fixed entry-count
   cap. Generated thumbnails are retained for the lifetime of the current
   `VideoPlayer`, so videos with hundreds of chapters can keep their left-panel

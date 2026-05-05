@@ -10365,6 +10365,7 @@ impl App {
                         self.video_perf_overlay_visible,
                         self.video_tile_reopen_pending,
                         self.settings.vst3_enabled,
+                        self.checked.contains(&idx),
                     ),
                 );
                 if self.settings.video_start_muted || play_test_mute {
@@ -13052,6 +13053,8 @@ impl App {
                 player.set_native_loop_enabled(loop_enabled);
                 #[cfg(windows)]
                 player.set_native_vst3_available(self.settings.vst3_enabled);
+                #[cfg(windows)]
+                player.set_native_checked(self.checked.contains(idx));
                 if let Some(d) = player.tick(ctx) {
                     let d = if player.is_playing() {
                         d.min(std::time::Duration::from_millis(16))
@@ -14188,10 +14191,15 @@ impl App {
             }
             // Space: check/uncheck the current item, matching normal fullscreen.
             0x20 if !key.shift && !key.ctrl && !key.repeat => {
-                if self.checked.contains(&fs_idx) {
+                let checked = if self.checked.contains(&fs_idx) {
                     self.checked.remove(&fs_idx);
+                    false
                 } else {
                     self.checked.insert(fs_idx);
+                    true
+                };
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.set_native_checked(checked);
                 }
             }
             // P: perf overlay
@@ -17389,6 +17397,7 @@ fn native_video_presenter_config(
     perf_overlay_visible: bool,
     initial_tile_overlay: bool,
     vst3_available: bool,
+    checked: bool,
 ) -> Option<crate::video::NativeVideoOutputConfig> {
     if !env_flag_enabled("MIV_NATIVE_VIDEO_PRESENTER", true) {
         return None;
@@ -17421,6 +17430,7 @@ fn native_video_presenter_config(
         perf_overlay_visible,
         initial_tile_overlay,
         vst3_available,
+        checked,
     })
 }
 
