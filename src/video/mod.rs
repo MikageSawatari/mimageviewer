@@ -572,6 +572,7 @@ fn run_native_video_output(
         }
         while let Ok(frame) = video_rx.try_recv() {
             if frame.seek_serial < clock_serial {
+                native_reset_unpresented_frame(frame);
                 continue;
             }
             if frame.seek_serial > last_seen_serial {
@@ -583,7 +584,8 @@ fn run_native_video_output(
             queue.push_back(frame);
         }
 
-        if !clock.is_playing() {
+        let waiting_for_first_frame = first_frame_event_last_epoch != Some(last_seen_serial);
+        if !clock.is_playing() && !clock.is_seeking() && !waiting_for_first_frame {
             std::thread::sleep(Duration::from_millis(8));
             continue;
         }
@@ -597,7 +599,9 @@ fn run_native_video_output(
                 }
                 continue;
             }
-            if front.pts_secs <= now + clock::DISPLAY_LEAD_TOLERANCE_SECS {
+            let force_first_frame =
+                waiting_for_first_frame && front.seek_serial == last_seen_serial;
+            if force_first_frame || front.pts_secs <= now + clock::DISPLAY_LEAD_TOLERANCE_SECS {
                 latest_renderable = Some(queue.pop_front().expect("queue.front() returned Some"));
             }
             break;
