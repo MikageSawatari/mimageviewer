@@ -321,6 +321,11 @@ unpresented keyed-mutex frames and briefly forcing the decoder into CPU
 readback fallback. When `MIV_NATIVE_VIDEO_PRESENT_TRACE=1` is enabled, the
 `source_delta_ms` field on `fullscreen_present` helps confirm that 120fps
 content advances at roughly 8.33ms per presented frame.
+Phase E presentation timing traces split swap-chain throttling from the DXGI
+present call itself: `present_waitable_ms` records the frame-latency waitable
+object wait before copy, while `present_call_ms` records the
+`IDXGISwapChain::Present` call. A spike in the latter points to vsync / DComp /
+DWM present policy rather than decoder, copy, or keyed-mutex ownership.
 The legacy egui/wgpu rollback path must also reset discarded pooled GPU frames
 before replacing `gpu_latest` or draining seek-era queues, because D3D12 import
 does not release the D3D11 keyed mutex on behalf of the producer.

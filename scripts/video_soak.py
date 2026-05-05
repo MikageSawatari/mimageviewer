@@ -105,6 +105,9 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
     present_keyed_mutex_cast_ms: list[float] = []
     present_keyed_mutex_acquire_ms: list[float] = []
     present_copy_call_ms: list[float] = []
+    present_waitable_ms: list[float] = []
+    present_call_ms: list[float] = []
+    present_ms: list[float] = []
     present_total_ms: list[float] = []
     present_shared_handles: set[int] = set()
     present_shared_cache_hits = 0
@@ -200,6 +203,15 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
                 copy_call_ms = event.get("copy_call_ms")
                 if isinstance(copy_call_ms, (int, float)):
                     present_copy_call_ms.append(float(copy_call_ms))
+                present_waitable = event.get("present_waitable_ms")
+                if isinstance(present_waitable, (int, float)):
+                    present_waitable_ms.append(float(present_waitable))
+                present_call = event.get("present_call_ms")
+                if isinstance(present_call, (int, float)):
+                    present_call_ms.append(float(present_call))
+                present_ms_value = event.get("present_ms")
+                if isinstance(present_ms_value, (int, float)):
+                    present_ms.append(float(present_ms_value))
                 total_ms = event.get("total_ms")
                 if isinstance(total_ms, (int, float)):
                     present_total_ms.append(float(total_ms))
@@ -257,6 +269,12 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
         "native_keyed_mutex_acquire_ms_max": max(present_keyed_mutex_acquire_ms, default=0.0),
         "native_copy_call_ms_p95": percentile(present_copy_call_ms, 0.95),
         "native_copy_call_ms_max": max(present_copy_call_ms, default=0.0),
+        "native_present_waitable_ms_p95": percentile(present_waitable_ms, 0.95),
+        "native_present_waitable_ms_max": max(present_waitable_ms, default=0.0),
+        "native_present_call_ms_p95": percentile(present_call_ms, 0.95),
+        "native_present_call_ms_max": max(present_call_ms, default=0.0),
+        "native_present_ms_p95": percentile(present_ms, 0.95),
+        "native_present_ms_max": max(present_ms, default=0.0),
         "native_total_ms_p95": percentile(present_total_ms, 0.95),
         "native_total_ms_max": max(present_total_ms, default=0.0),
         **native_summary,
@@ -413,8 +431,8 @@ def main() -> int:
         f"- modes: {', '.join(m.name for m in modes)}",
         f"- duration: {args.duration}s",
         "",
-        "| status | mode | seconds | display_miss | frame_gap | drops | max_gap_ms | overlay_present | overlay_max_render_ms | overlay_max_interval_ms | native_present_samples | native_shared_handles | native_cache_hits | native_cache_misses | native_copy_p95_ms | native_copy_max_ms | native_fence_max_ms | native_keyed_acq_max_ms | native_recover_count | native_recover_max_ms | log | video |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        "| status | mode | seconds | display_miss | frame_gap | drops | max_gap_ms | overlay_present | overlay_max_render_ms | overlay_max_interval_ms | native_present_samples | native_shared_handles | native_cache_hits | native_cache_misses | native_copy_p95_ms | native_copy_max_ms | native_fence_max_ms | native_keyed_acq_max_ms | native_recover_count | native_recover_max_ms | native_waitable_max_ms | native_present_call_max_ms | log | video |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
 
     failures = 0
@@ -460,6 +478,8 @@ def main() -> int:
             native_keyed_acquire_max = float(metrics.get("native_keyed_mutex_acquire_ms_max", 0.0))
             native_recover_count = int(metrics.get("native_shared_output_recover_count", 0))
             native_recover_max = float(metrics.get("native_shared_output_recover_ms_max", 0.0))
+            native_waitable_max = float(metrics.get("native_present_waitable_ms_max", 0.0))
+            native_present_call_max = float(metrics.get("native_present_call_ms_max", 0.0))
             row = (
                 f"| {status} | {mode.name} | {elapsed:.1f} | "
                 f"{display_miss} | "
@@ -478,6 +498,8 @@ def main() -> int:
                 f"{native_keyed_acquire_max:.2f} | "
                 f"{native_recover_count} | "
                 f"{native_recover_max:.2f} | "
+                f"{native_waitable_max:.2f} | "
+                f"{native_present_call_max:.2f} | "
                 f"`{log_path.name}` | `{video}` |"
             )
             print(row)

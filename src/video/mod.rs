@@ -718,7 +718,19 @@ fn run_native_video_output(
                                         serde_json::Value::from(outcome.copy_call_ms),
                                     ),
                                     ("copy_ms", serde_json::Value::from(outcome.copy_ms)),
+                                    (
+                                        "present_waitable_ms",
+                                        serde_json::Value::from(outcome.present_waitable_ms),
+                                    ),
+                                    (
+                                        "present_call_ms",
+                                        serde_json::Value::from(outcome.present_call_ms),
+                                    ),
                                     ("present_ms", serde_json::Value::from(outcome.present_ms)),
+                                    (
+                                        "sync_interval",
+                                        serde_json::Value::from(config.sync_interval as i64),
+                                    ),
                                     ("total_ms", serde_json::Value::from(total_ms)),
                                     ("source_delta_ms", serde_json::Value::from(source_delta_ms)),
                                 ],

@@ -118,6 +118,8 @@ pub struct NativePresentOutcome {
     pub keyed_mutex_acquire_ms: f64,
     pub copy_call_ms: f64,
     pub copy_ms: f64,
+    pub present_waitable_ms: f64,
+    pub present_call_ms: f64,
     pub present_ms: f64,
 }
 
@@ -427,6 +429,7 @@ impl NativeVideoPresenter {
         let wait_t0 = Instant::now();
         let wait_result = unsafe { WaitForSingleObject(self.waitable, 100) };
         let wait_ms = wait_t0.elapsed().as_secs_f64() * 1000.0;
+        let present_waitable_ms = wait_ms;
         let timed_out = wait_result == WAIT_TIMEOUT;
 
         let copy_t0 = Instant::now();
@@ -546,7 +549,8 @@ impl NativeVideoPresenter {
         if hr.is_err() {
             return Err(format!("IDXGISwapChain::Present: {hr:?}"));
         }
-        let present_ms = present_t0.elapsed().as_secs_f64() * 1000.0;
+        let present_call_ms = present_t0.elapsed().as_secs_f64() * 1000.0;
+        let present_ms = present_call_ms;
         Ok(NativePresentOutcome {
             path,
             shared_handle,
@@ -560,6 +564,8 @@ impl NativeVideoPresenter {
             keyed_mutex_acquire_ms,
             copy_call_ms,
             copy_ms,
+            present_waitable_ms,
+            present_call_ms,
             present_ms,
         })
     }
