@@ -4773,9 +4773,9 @@ fn draw_timeline_marker(
     let frac = (marker.pts_secs / duration_secs).clamp(0.0, 1.0) as f32;
     let x = bar_rect.min.x + bar_rect.width() * frac;
     let (height, color) = match marker.kind {
-        NativeOverlayTimelineMarkerKind::Pin => (16.0, egui::Color32::from_rgb(140, 245, 170)),
-        NativeOverlayTimelineMarkerKind::Bookmark => (14.0, egui::Color32::from_rgb(255, 220, 82)),
-        NativeOverlayTimelineMarkerKind::Chapter => (10.0, egui::Color32::from_rgb(115, 210, 255)),
+        NativeOverlayTimelineMarkerKind::Pin => (30.0, egui::Color32::from_rgb(140, 245, 170)),
+        NativeOverlayTimelineMarkerKind::Bookmark => (28.0, egui::Color32::from_rgb(255, 220, 82)),
+        NativeOverlayTimelineMarkerKind::Chapter => (24.0, egui::Color32::from_rgb(115, 210, 255)),
     };
     let top = bar_rect.center().y - height * 0.5;
     let bottom = bar_rect.center().y + height * 0.5;
