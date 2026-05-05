@@ -1900,7 +1900,13 @@ impl App {
     #[cfg(windows)]
     fn native_video_presenter_pending_for_fs(&self, fs_idx: usize) -> bool {
         match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player.native_presenter_pending(),
+            Some(FsCacheEntry::Video { player, .. }) => {
+                if player.native_presenter_pending() {
+                    return true;
+                }
+                let hwnd = player.native_presenter_hwnd();
+                hwnd != 0 && self.native_video_front_synced_hwnd != hwnd
+            }
             _ => false,
         }
     }

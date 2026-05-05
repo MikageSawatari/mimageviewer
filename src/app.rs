@@ -13134,7 +13134,6 @@ impl App {
         let now = std::time::Instant::now();
         let is_new_hwnd = hwnd != self.native_video_front_synced_hwnd;
         if is_new_hwnd {
-            self.native_video_front_synced_hwnd = hwnd;
             self.native_video_front_raise_until = Some(now + std::time::Duration::from_secs(3));
             self.native_video_front_last_raise = None;
         }
@@ -13155,6 +13154,7 @@ impl App {
         if crate::video::native_window::bring_to_front(hwnd) {
             self.native_video_front_last_raise = Some(now);
             if is_new_hwnd {
+                self.native_video_front_synced_hwnd = hwnd;
                 crate::video::native_window::log_state(hwnd, "raised");
                 crate::logger::log(format!(
                     "[native-video] raised fullscreen presenter hwnd=0x{hwnd:x}"
@@ -14651,9 +14651,9 @@ impl eframe::App for App {
         // ── フルスクリーンビューポート ──────────────────────────────────
         // 非アクティブ時も非表示でビューポートを維持（次回表示のちらつき防止）
         self.keep_fullscreen_viewport_alive(ctx);
-        self.render_fullscreen_viewport(ctx);
         #[cfg(windows)]
         self.ensure_native_video_front();
+        self.render_fullscreen_viewport(ctx);
         let t_fullscreen_viewport = frame_t0.elapsed();
 
         // 補正パネルでスライダーをドラッグ中に true → release で false の遷移を検知し、
