@@ -254,6 +254,67 @@ fn emit_video_packet_overflow_queued(
 // 異なるスレッドからの ref/unref は安全 (Sync は不要 = 1 thread が排他所有する形で使う)。
 unsafe impl Send for HwDevice {}
 
+fn drain_pending_video_packets(
+    pending_video_packets: &mut VecDeque<QueuedVideoPacket>,
+    pending_video_packet_bytes: &mut usize,
+    video_pkt_tx: &Sender<VideoWorkerMsg>,
+    clock: &AvClock,
+    cancel: &AtomicBool,
+) -> bool {
+    while let Some(queued) = pending_video_packets.pop_front() {
+        let QueuedVideoPacket {
+            serial,
+            packet,
+            pts_secs,
+            size_bytes,
+        } = queued;
+        *pending_video_packet_bytes = pending_video_packet_bytes.saturating_sub(size_bytes);
+
+        let live_serial = clock.current_seek_serial();
+        if serial != live_serial {
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "demux",
+                    "video_packet_overflow_stale_discarded",
+                    None,
+                    0,
+                    &[
+                        ("packet_serial", serde_json::Value::from(serial as i64)),
+                        ("live_serial", serde_json::Value::from(live_serial as i64)),
+                        (
+                            "pending_packets",
+                            serde_json::Value::from(pending_video_packets.len() as i64),
+                        ),
+                    ],
+                );
+            }
+            continue;
+        }
+
+        let queue_len_before = video_pkt_tx.len();
+        let send_t0 = std::time::Instant::now();
+        if !send_demux_msg_cancel_aware(
+            video_pkt_tx,
+            VideoWorkerMsg::Packet { serial, packet },
+            cancel,
+        ) {
+            return false;
+        }
+        let wait_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
+        if wait_ms >= DEMUX_PACKET_SEND_WAIT_WARN_MS {
+            emit_demux_packet_send_wait(
+                "video",
+                wait_ms,
+                queue_len_before,
+                VIDEO_PACKET_QUEUE_CAP,
+                pts_secs,
+                serial,
+            );
+        }
+    }
+    true
+}
+
 /// Phase A (3-thread split): demux + video decode thread から audio decode thread に
 /// 流すメッセージ。
 ///
@@ -1284,6 +1345,18 @@ fn run_decoder(
         }
 
         // 1 パケット読み込み
+        if !pending_video_packets.is_empty()
+            && !drain_pending_video_packets(
+                &mut pending_video_packets,
+                &mut pending_video_packet_bytes,
+                &video_pkt_tx,
+                &clock,
+                &cancel,
+            )
+        {
+            break 'outer;
+        }
+
         let packet_iter = input.packets();
         // ※ packets() は &mut input を取るので毎ループ作り直す形になる。
         //    ffmpeg-the-third 3.x では packets() のアイテムが Result<(Stream, Packet), Error>
@@ -1314,6 +1387,17 @@ fn run_decoder(
                 let packet_size = packet.size();
                 let seek_serial = clock.current_seek_serial();
                 let queue_len_before = video_pkt_tx.len();
+                if !pending_video_packets.is_empty()
+                    && !drain_pending_video_packets(
+                        &mut pending_video_packets,
+                        &mut pending_video_packet_bytes,
+                        &video_pkt_tx,
+                        &clock,
+                        &cancel,
+                    )
+                {
+                    break 'outer;
+                }
                 if !pending_video_packets.is_empty() || video_pkt_tx.is_full() {
                     while pending_video_packet_bytes.saturating_add(packet_size)
                         > VIDEO_PACKET_OVERFLOW_MAX_BYTES
