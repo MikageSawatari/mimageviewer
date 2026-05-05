@@ -131,9 +131,12 @@ Status:
   native frame has presented, or before the UI thread has raised the native HWND
   at least once, the legacy egui fullscreen viewport is shown as an opaque black
   startup curtain instead of drawing thumbnails, placeholder text, or a
-  transparent window. After the first native present succeeds and the native
-  HWND has been raised, that viewport stays visible as the same opaque black
-  backdrop behind the native HWND instead of being hidden. Avoiding
+  transparent window. This target check is based on the `GridItem::Video`
+  itself, not on whether `VideoPlayer` has already populated `fs_cache`, so the
+  legacy transparent fullscreen path is skipped even during the first
+  cache-miss frames after a double-click. After the first native present
+  succeeds and the native HWND has been raised, that viewport stays visible as
+  the same opaque black backdrop behind the native HWND instead of being hidden. Avoiding
   `Visible(false)` during active native playback prevents the fullscreen
   viewport's hide/activation transition from briefly revealing the thumbnail
   grid if Windows reorders regular HWND composition for one frame. The backdrop
@@ -141,9 +144,11 @@ Status:
   remains visible, the UI thread keeps a cheap foreground-only `HWND_TOP` raise
   at the 16ms native-input pump cadence while native fullscreen is active; this
   uses no TOPMOST pulse and only preserves the native HWND above its black
-  backdrop. The main viewport also draws only a black panel while native
-  fullscreen video is pending or active, so if Windows transiently exposes the
-  main HWND during activation/z-order churn the thumbnail grid is still masked.
+  backdrop. The main viewport also draws only a black panel whenever the current
+  fullscreen target is a video and the native presenter is enabled, even before
+  the `VideoPlayer` has populated `fs_cache`, so if Windows transiently exposes
+  the main HWND during activation/z-order churn the thumbnail grid is still
+  masked.
 - 2026-05-05: while a native presenter HWND is active, the UI thread keeps a
   lightweight 16ms repaint pump alive even though video frames are presented on
   the native thread. This prevents native-window shortcut events such as Escape

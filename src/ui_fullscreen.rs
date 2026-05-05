@@ -987,6 +987,11 @@ impl App {
 
         // ── 状態の事前計算 ──
         #[cfg(windows)]
+        if self.native_video_backdrop_target_for_fs(fs_idx) {
+            self.show_native_video_black_backdrop(ctx);
+            return;
+        }
+        #[cfg(windows)]
         if self.native_video_presenter_pending_for_fs(fs_idx) {
             self.show_native_video_black_backdrop(ctx);
             return;
@@ -1895,6 +1900,12 @@ impl App {
             }
             _ => None,
         }
+    }
+
+    #[cfg(windows)]
+    fn native_video_backdrop_target_for_fs(&self, fs_idx: usize) -> bool {
+        matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            && crate::video::native_presenter_enabled_by_env()
     }
 
     #[cfg(windows)]

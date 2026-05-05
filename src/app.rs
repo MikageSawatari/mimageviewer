@@ -13164,14 +13164,11 @@ impl App {
 
     #[cfg(windows)]
     fn native_video_fullscreen_active_for_main_backdrop(&self) -> bool {
-        self.fullscreen_idx
-            .and_then(|idx| self.fs_cache.get(&idx))
-            .is_some_and(|entry| match entry {
-                FsCacheEntry::Video { player, .. } => {
-                    player.native_presenter_pending() || player.native_presenter_hwnd() != 0
-                }
-                _ => false,
-            })
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return false;
+        };
+        matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+            && env_flag_enabled("MIV_NATIVE_VIDEO_PRESENTER", true)
     }
 
     #[cfg(windows)]

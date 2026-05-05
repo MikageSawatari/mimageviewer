@@ -429,6 +429,11 @@ fn native_video_env_flag_enabled(name: &str, default: bool) -> bool {
 }
 
 #[cfg(windows)]
+pub fn native_presenter_enabled_by_env() -> bool {
+    native_video_env_flag_enabled("MIV_NATIVE_VIDEO_PRESENTER", true)
+}
+
+#[cfg(windows)]
 fn native_source_pacing_delay(
     last_pts: Option<f64>,
     last_wall: Option<std::time::Instant>,
