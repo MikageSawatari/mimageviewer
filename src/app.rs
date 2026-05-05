@@ -2426,8 +2426,13 @@ pub struct App {
     #[cfg(windows)]
     /// Native fullscreen presenter の HWND を最後に fullscreen viewport より前面へ
     /// 持ち上げた値。egui 側の fullscreen viewport は opt-in 期間中も alive なので、
-    /// native HWND 作成後に一度だけ z-order を補正する。
+    /// native HWND 作成後に短時間 z-order を補正する。
     pub(crate) native_video_front_synced_hwnd: u64,
+    #[cfg(windows)]
+    /// Native HWND 作成直後の z-order boost 期限。ダブルクリック起動では main/egui
+    /// 側の window operation が直後に走ることがあるため、一度だけの raise では
+    /// thumbnail grid が前面に残る race がある。
+    native_video_front_raise_until: Option<std::time::Instant>,
     #[cfg(windows)]
     /// Native fullscreen presenter 上の左クリック候補。overlay hit-test が入るまでの
     /// 暫定 transport 操作用で、drag と click を release 時に分ける。
@@ -2955,6 +2960,8 @@ impl Default for App {
             native_video_owner_synced_hwnd: 0,
             #[cfg(windows)]
             native_video_front_synced_hwnd: 0,
+            #[cfg(windows)]
+            native_video_front_raise_until: None,
             #[cfg(windows)]
             native_video_pointer_down: None,
             placement_slot: None,
@@ -10903,6 +10910,7 @@ impl App {
         {
             self.vst3_deferred_video_open = None;
             self.native_video_front_synced_hwnd = 0;
+            self.native_video_front_raise_until = None;
             self.native_video_pointer_down = None;
         }
         #[cfg(windows)]
@@ -13050,6 +13058,7 @@ impl App {
         #[cfg(windows)]
         if native_closed_idx.is_some() {
             self.native_video_front_synced_hwnd = 0;
+            self.native_video_front_raise_until = None;
             self.close_fullscreen();
             return;
         }
@@ -13078,6 +13087,7 @@ impl App {
     fn ensure_native_video_front(&mut self) {
         if self.fullscreen_idx.is_none() {
             self.native_video_front_synced_hwnd = 0;
+            self.native_video_front_raise_until = None;
             return;
         }
         let hwnd = self
@@ -13091,15 +13101,30 @@ impl App {
                 _ => None,
             })
             .unwrap_or(0);
-        if hwnd == 0 || hwnd == self.native_video_front_synced_hwnd {
+        if hwnd == 0 {
+            self.native_video_front_synced_hwnd = 0;
+            self.native_video_front_raise_until = None;
             return;
         }
-        if crate::video::native_window::bring_to_front(hwnd) {
+        let now = std::time::Instant::now();
+        let is_new_hwnd = hwnd != self.native_video_front_synced_hwnd;
+        if is_new_hwnd {
             self.native_video_front_synced_hwnd = hwnd;
-            crate::video::native_window::log_state(hwnd, "raised");
-            crate::logger::log(format!(
-                "[native-video] raised fullscreen presenter hwnd=0x{hwnd:x}"
-            ));
+            self.native_video_front_raise_until = Some(now + std::time::Duration::from_secs(1));
+        } else if self
+            .native_video_front_raise_until
+            .is_none_or(|deadline| now >= deadline)
+        {
+            return;
+        }
+
+        if crate::video::native_window::bring_to_front(hwnd) {
+            if is_new_hwnd {
+                crate::video::native_window::log_state(hwnd, "raised");
+                crate::logger::log(format!(
+                    "[native-video] raised fullscreen presenter hwnd=0x{hwnd:x}"
+                ));
+            }
         }
     }
 

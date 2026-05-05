@@ -120,6 +120,10 @@ Status:
   once the native borderless HWND exists, then raises the native HWND. The
   legacy viewport is still kept available for fallback before native HWND
   creation, but it must not cover the native DComp presenter after startup.
+- 2026-05-05: the UI thread re-raises the native HWND for a short startup window
+  after the presenter HWND appears. This absorbs a double-click startup race
+  where the main thumbnail grid can reclaim z-order after the first raise while
+  the native presenter is already playing.
 - 2026-05-04: production GPU frames initially followed the decoder's keyed-mutex
   protocol (`ReleaseSync(1)` on the producer side, `AcquireSync(1)` /
   `ReleaseSync(0)` on the presenter side) before copying the shared texture.
