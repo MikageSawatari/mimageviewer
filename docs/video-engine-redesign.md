@@ -1324,6 +1324,13 @@ packet/frame output whenever `clock.current_seek_serial()` has already advanced
 beyond the packet/decoder serial, and `audio_tx` sends use short timeout slices
 so a blocked old frame can be abandoned promptly when a seek arrives.
 
+2026-05-05 follow-up: demux-to-audio/video packet sends now use the same
+cancel-aware short timeout pattern. The channels still provide bounded
+back-pressure during normal playback, but fullscreen close or player shutdown
+can break out within a few milliseconds even when `audio_pkt_tx` or
+`video_pkt_tx` is full. This prevents old packet queues from continuing to
+block the demux thread after the native presenter has already stopped.
+
 2026-05-04 follow-up: a short-lived experiment reduced the direct audio/video
 packet channels from 256 packets to 32 packets so `Flush` markers could reach
 the decoders sooner. Real 60fps AV1 files showed the opposite failure mode:

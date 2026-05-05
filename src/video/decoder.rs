@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, SendTimeoutError, Sender, bounded};
 
 use super::clock::AvClock;
 
@@ -31,10 +31,31 @@ const AUDIO_PACKET_QUEUE_CAP: usize = 256;
 const VIDEO_PACKET_QUEUE_CAP: usize = 256;
 const VIDEO_PACKET_OVERFLOW_MAX_BYTES: usize = 64 * 1024 * 1024;
 const DEMUX_PACKET_SEND_WAIT_WARN_MS: f64 = 20.0;
+const DEMUX_PACKET_SEND_TIMEOUT_MS: u64 = 2;
 const VIDEO_PACING_SLEEP_MS: u64 = 1;
 
 fn sleep_video_pacing() {
     std::thread::sleep(std::time::Duration::from_millis(VIDEO_PACING_SLEEP_MS));
+}
+
+// Preserve bounded-channel back-pressure during normal playback while still
+// letting fullscreen close/cancel cut through a full demux packet queue quickly.
+fn send_demux_msg_cancel_aware<T>(tx: &Sender<T>, mut msg: T, cancel: &AtomicBool) -> bool {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return false;
+        }
+        match tx.send_timeout(
+            msg,
+            std::time::Duration::from_millis(DEMUX_PACKET_SEND_TIMEOUT_MS),
+        ) {
+            Ok(()) => return true,
+            Err(SendTimeoutError::Disconnected(_)) => return false,
+            Err(SendTimeoutError::Timeout(returned)) => {
+                msg = returned;
+            }
+        }
+    }
 }
 
 fn frame_best_effort_timestamp(raw: *const ffmpeg_the_third::ffi::AVFrame) -> Option<i64> {
@@ -1218,22 +1239,27 @@ fn run_decoder(
                 pending_video_packet_bytes = 0;
                 next_video_overflow_log_bytes = 0;
             }
-            if video_pkt_tx
-                .send(VideoWorkerMsg::Flush {
+            if !send_demux_msg_cancel_aware(
+                &video_pkt_tx,
+                VideoWorkerMsg::Flush {
                     serial,
                     seek_target_secs: seek_target_for_flush,
                     trim_before_secs: video_trim_before,
-                })
-                .is_err()
-            {
+                },
+                &cancel,
+            ) {
                 break 'outer;
             }
             if audio_stream_idx_for_demux.is_some() {
-                let _ = audio_pkt_tx.send(AudioWorkerMsg::Flush {
-                    serial,
-                    seek_target_secs: seek_target_for_flush,
-                    trim_before_secs: audio_trim_before,
-                });
+                let _ = send_demux_msg_cancel_aware(
+                    &audio_pkt_tx,
+                    AudioWorkerMsg::Flush {
+                        serial,
+                        seek_target_secs: seek_target_for_flush,
+                        trim_before_secs: audio_trim_before,
+                    },
+                    &cancel,
+                );
             }
             // 成功時のみ anchor を target に進める。失敗時に target を anchor すると
             // demux 位置とクロックが食い違い、anchor < frame_pts な audio set_audio_pts
@@ -1302,10 +1328,11 @@ fn run_decoder(
                             size_bytes,
                         } = queued;
                         let send_t0 = std::time::Instant::now();
-                        if video_pkt_tx
-                            .send(VideoWorkerMsg::Packet { serial, packet })
-                            .is_err()
-                        {
+                        if !send_demux_msg_cancel_aware(
+                            &video_pkt_tx,
+                            VideoWorkerMsg::Packet { serial, packet },
+                            &cancel,
+                        ) {
                             break 'outer;
                         }
                         pending_video_packet_bytes =
@@ -1348,13 +1375,14 @@ fn run_decoder(
                     }
                 }
                 let send_t0 = std::time::Instant::now();
-                if video_pkt_tx
-                    .send(VideoWorkerMsg::Packet {
+                if !send_demux_msg_cancel_aware(
+                    &video_pkt_tx,
+                    VideoWorkerMsg::Packet {
                         serial: seek_serial,
                         packet,
-                    })
-                    .is_err()
-                {
+                    },
+                    &cancel,
+                ) {
                     // video decode thread が既に終了している → 自分も exit。
                     break 'outer;
                 }
@@ -1389,13 +1417,14 @@ fn run_decoder(
                     let seek_serial = clock.current_seek_serial();
                     let queue_len_before = audio_pkt_tx.len();
                     let send_t0 = std::time::Instant::now();
-                    if audio_pkt_tx
-                        .send(AudioWorkerMsg::Packet {
+                    if !send_demux_msg_cancel_aware(
+                        &audio_pkt_tx,
+                        AudioWorkerMsg::Packet {
                             serial: seek_serial,
                             packet,
-                        })
-                        .is_err()
-                    {
+                        },
+                        &cancel,
+                    ) {
                         // audio decode thread が既に終了している (= disconnect)。
                         // VideoPlayer の shutdown 経路 → 自分も exit。
                         break 'outer;
@@ -1432,11 +1461,11 @@ fn run_decoder(
             // Phase A: audio decode thread にも Eof を通知して残フレームを drain させる。
             // (= 末尾の音声を確実に出し切る。drain しないと数十 ms の音声が抜ける。)
             if audio_stream_idx_for_demux.is_some() {
-                let _ = audio_pkt_tx.send(AudioWorkerMsg::Eof);
+                let _ = send_demux_msg_cancel_aware(&audio_pkt_tx, AudioWorkerMsg::Eof, &cancel);
             }
             // Phase B: video decode thread にも Eof を通知。動画は内部残フレームを
             // 失っても許容なので drain しないが、Eof 自体は送って状態を伝える。
-            let _ = video_pkt_tx.send(VideoWorkerMsg::Eof);
+            let _ = send_demux_msg_cancel_aware(&video_pkt_tx, VideoWorkerMsg::Eof, &cancel);
             loop {
                 if cancel.load(Ordering::Acquire) {
                     crate::logger::log(format!("video decoder finished: {}", path.display()));
