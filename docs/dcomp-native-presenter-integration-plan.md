@@ -171,8 +171,10 @@ Status:
   On 2026-05-05 Phase D found that D3D12/wgpu consumers can be fence-only, but
   the native D3D11 presenter must still acquire key=1 before copying or the
   shared texture can read back as black on production hardware. The producer
-  also recovers key=1 pooled slots before reuse so non-D3D11 consumers do not
-  leave the pool locked. The video swap chain is
+  also recovers key=1 pooled slots before reuse so non-D3D11 consumers and
+  discarded unpresented frames do not leave the pool locked. Unpresented frame
+  cleanup must not call `AcquireSync(1)` directly; driver timeouts are not
+  reliable enough for seek/close/drop paths. The video swap chain is
   resized to the source frame size and the video visual is aspect-fit to the
   native fullscreen HWND with a DirectComposition transform, so a 1080p clip can
   fill a 4K fullscreen window without coupling the video copy path to the window
@@ -380,6 +382,11 @@ and the producer tracks slots released to readers so it can recover
 key=1 back to key=0 immediately before reusing a pooled output slot. Trace runs
 should keep keyed mutex acquire time small in steady state and
 `native_recover_max_ms` below 1ms.
+Unpresented frame drains only release the pool slot and leave
+`released_to_reader=true` for the next producer reuse. Do not move
+`AcquireSync(1)` back into `reset_unpresented_shared_output`; a 2026-05-05 live
+hang showed the native presenter thread blocked inside NVIDIA's D3D11 keyed
+mutex acquire while draining seek-era frames.
 Trace events split `keyed_mutex_ms` into `keyed_mutex_cast_ms` and
 `keyed_mutex_acquire_ms` so Phase D can distinguish COM interface lookup from
 the `AcquireSync(1)` wait.

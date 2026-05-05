@@ -101,39 +101,39 @@ pub struct D3d11Frame {
 unsafe impl Send for D3d11Frame {}
 
 impl D3d11Frame {
-    /// Return an unpresented pooled output texture from key=1 to key=0 before
-    /// releasing its slot. This is needed when the decoder cannot enqueue a
-    /// freshly produced GPU frame; no presenter will acquire/read it.
+    /// Return an unpresented pooled output texture to the producer-side pool.
     ///
-    /// Drop intentionally does not reset keyed-mutex ownership. Any path that
-    /// discards an unpresented pooled GPU frame must call this first.
+    /// Do **not** call `AcquireSync(1)` here. NVIDIA's D3D11 driver can block
+    /// inside keyed-mutex acquire even for short/zero timeouts, and this method
+    /// is called from seek/close/drop paths on latency-sensitive threads. Leave
+    /// `released_to_reader=true` in place and let `acquire_shared_output`
+    /// recover key=1 on the producer thread when the slot is reused.
     pub fn reset_unpresented_shared_output(&mut self) {
-        let Some(mutex) = self.shared_output_keyed_mutex.take() else {
+        if self.shared_output_keyed_mutex.is_none()
+            && self.shared_output_released_to_reader.is_none()
+        {
             return;
         };
-        match unsafe { mutex.AcquireSync(1, 10) } {
-            Ok(()) => unsafe {
-                let _ = mutex.ReleaseSync(0);
-                if let Some(released) = self.shared_output_released_to_reader.take() {
-                    released.store(false, Ordering::Release);
-                }
-            },
-            Err(e) => {
-                crate::logger::log(format!(
-                    "[video] shared output unpresented reset failed: {e:?}"
-                ));
-                crate::perf::event(
-                    "video",
-                    "shared_output_unpresented_reset_failed",
-                    None,
-                    0,
-                    &[(
-                        "shared_handle",
-                        serde_json::Value::from(self.shared_handle.0 as usize as u64),
-                    )],
-                );
-            }
-        }
+        crate::perf::event(
+            "video",
+            "shared_output_unpresented_reset_deferred",
+            None,
+            0,
+            &[
+                (
+                    "shared_handle",
+                    serde_json::Value::from(self.shared_handle.0 as usize as u64),
+                ),
+                (
+                    "released_to_reader",
+                    serde_json::Value::from(
+                        self.shared_output_released_to_reader
+                            .as_ref()
+                            .is_some_and(|released| released.load(Ordering::Acquire)),
+                    ),
+                ),
+            ],
+        );
     }
 }
 
