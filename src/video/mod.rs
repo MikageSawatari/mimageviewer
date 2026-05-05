@@ -698,6 +698,7 @@ fn run_native_video_output(
                 }
                 Err(err) => {
                     crate::logger::log(format!("[native-video] present failed: {err}"));
+                    native_reset_unpresented_frame(frame);
                     std::thread::sleep(Duration::from_millis(16));
                 }
             }
@@ -710,6 +711,7 @@ fn run_native_video_output(
         }
     }
 
+    native_drain_unpresented_queue(&mut queue);
     present_stats.emit_summary(run_started.elapsed());
     hwnd_out.store(0, Ordering::Release);
     window.destroy();
