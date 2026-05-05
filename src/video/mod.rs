@@ -389,11 +389,19 @@ fn native_reset_unpresented_frame(mut frame: VideoFrame) {
     }
 }
 
+#[cfg(not(windows))]
+fn native_reset_unpresented_frame(_frame: VideoFrame) {}
+
 #[cfg(windows)]
 fn native_drain_unpresented_queue(queue: &mut std::collections::VecDeque<VideoFrame>) {
     while let Some(frame) = queue.pop_front() {
         native_reset_unpresented_frame(frame);
     }
+}
+
+#[cfg(not(windows))]
+fn native_drain_unpresented_queue(queue: &mut std::collections::VecDeque<VideoFrame>) {
+    queue.clear();
 }
 
 #[cfg(windows)]
@@ -1333,7 +1341,7 @@ impl VideoPlayer {
         // 個別の `seek_serial < clock_serial` 1 ずつ pop だと N tick かかるが、
         // 一括で消すことで post-seek 反応が速くなる。
         if self.last_seen_seek_serial != clock_serial {
-            self.future_frames.clear();
+            native_drain_unpresented_queue(&mut self.future_frames);
             self.last_seen_seek_serial = clock_serial;
         }
 
@@ -1354,7 +1362,9 @@ impl VideoPlayer {
         // Step 2: 先頭から displayable なものを順に取る
         while let Some(front) = self.future_frames.front() {
             if front.seek_serial < clock_serial {
-                self.future_frames.pop_front();
+                if let Some(frame) = self.future_frames.pop_front() {
+                    native_reset_unpresented_frame(frame);
+                }
                 dropped_old_serial += 1;
                 continue;
             }
@@ -1369,10 +1379,10 @@ impl VideoPlayer {
                 && clock::pts_clears_seek_override(front.pts_secs, now);
             if force_display_seek || front.pts_secs <= now + lead_tol {
                 let frame = self.future_frames.pop_front().unwrap();
-                if latest_renderable.is_some() {
+                if let Some(previous) = latest_renderable.replace(frame) {
+                    native_reset_unpresented_frame(previous);
                     dropped_past += 1;
                 }
-                latest_renderable = Some(frame);
                 continue;
             }
             // 最初の真の未来フレーム → そのまま残し、次 tick を予約。
@@ -1429,6 +1439,9 @@ impl VideoPlayer {
                     let pts = frame.pts_secs;
                     let serial = frame.seek_serial;
                     let was_none = self.gpu_latest.is_none();
+                    if let Some(mut previous) = self.gpu_latest.take() {
+                        previous.reset_unpresented_shared_output();
+                    }
                     self.gpu_latest = Some(d3d);
                     if was_none {
                         crate::logger::log(format!(
@@ -1683,6 +1696,10 @@ impl VideoPlayer {
     pub fn shutdown(&mut self) {
         self.cancel
             .store(true, std::sync::atomic::Ordering::Release);
+        #[cfg(windows)]
+        if let Some(mut frame) = self.gpu_latest.take() {
+            frame.reset_unpresented_shared_output();
+        }
         // AudioOutput を先に drop して cpal stream を止める。
         // Drop で pump も join される。
         self.audio.take();
@@ -1694,6 +1711,10 @@ impl Drop for VideoPlayer {
         // shutdown() が事前に呼ばれていなければここで stop。
         self.cancel
             .store(true, std::sync::atomic::Ordering::Release);
+        #[cfg(windows)]
+        if let Some(mut frame) = self.gpu_latest.take() {
+            frame.reset_unpresented_shared_output();
+        }
         self.audio.take();
         // decoder thread は cancel フラグを見て終了
     }
