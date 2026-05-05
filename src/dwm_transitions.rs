@@ -14,7 +14,9 @@
 //! Windows 11 で効きが不安定という報告があるため、失敗は無視 (ベストエフォート)。
 
 use windows::Win32::Foundation::{HWND, LPARAM};
-use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
+use windows::Win32::Graphics::Dwm::{
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute,
+};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::EnumThreadWindows;
 use windows::core::BOOL;
@@ -44,6 +46,25 @@ pub fn disable_transitions_for_window(hwnd: HWND) {
             std::mem::size_of::<BOOL>() as u32,
         )
     };
+}
+
+pub fn set_window_chrome_black(hwnd: HWND) {
+    let black: u32 = 0x000000;
+    let size = std::mem::size_of::<u32>() as u32;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            &black as *const u32 as *const _,
+            size,
+        );
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &black as *const u32 as *const _,
+            size,
+        );
+    }
 }
 
 unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {

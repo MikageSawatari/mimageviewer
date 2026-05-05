@@ -2434,10 +2434,6 @@ pub struct App {
     /// 16ms pump に合わせて通常の HWND_TOP raise を保つ。
     native_video_front_last_raise: Option<std::time::Instant>,
     #[cfg(windows)]
-    /// Native fullscreen 中に main HWND が一瞬露出しても白いタイトルバーを見せないため、
-    /// main viewport の decorations を一時的に外しているか。
-    native_video_main_decorations_hidden: bool,
-    #[cfg(windows)]
     /// Native fullscreen presenter 上の左クリック候補。overlay hit-test が入るまでの
     /// 暫定 transport 操作用で、drag と click を release 時に分ける。
     native_video_pointer_down: Option<NativeVideoPointerDown>,
@@ -2966,8 +2962,6 @@ impl Default for App {
             native_video_front_synced_hwnd: 0,
             #[cfg(windows)]
             native_video_front_last_raise: None,
-            #[cfg(windows)]
-            native_video_main_decorations_hidden: false,
             #[cfg(windows)]
             native_video_pointer_down: None,
             placement_slot: None,
@@ -13178,15 +13172,6 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn sync_native_video_main_decorations(&mut self, ctx: &egui::Context, hide: bool) {
-        if hide == self.native_video_main_decorations_hidden {
-            return;
-        }
-        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!hide));
-        self.native_video_main_decorations_hidden = hide;
-    }
-
-    #[cfg(windows)]
     fn handle_native_video_output_event(
         &mut self,
         ctx: &egui::Context,
@@ -14177,6 +14162,10 @@ impl eframe::App for App {
                     self.main_hwnd = Some(hwnd_raw);
                     #[cfg(windows)]
                     self.dsp_bridge.set_main_hwnd(hwnd_raw as u64);
+                    #[cfg(windows)]
+                    crate::dwm_transitions::set_window_chrome_black(
+                        windows::Win32::Foundation::HWND(hwnd_raw as *mut _),
+                    );
                     crate::logger::log(format!("tray: captured main HWND = {hwnd_raw:#x}"));
                     // アクティベーションリスナーに placement_slot を共有するため、
                     // ここでスロットを作成しておく (sync_tray_with_settings での遅延作成と
@@ -14668,7 +14657,6 @@ impl eframe::App for App {
         #[cfg(windows)]
         {
             let native_main_backdrop = self.native_video_fullscreen_active_for_main_backdrop();
-            self.sync_native_video_main_decorations(ctx, native_main_backdrop);
             if native_main_backdrop {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))

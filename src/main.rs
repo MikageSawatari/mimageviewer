@@ -181,6 +181,39 @@ fn configure_wgpu_presentation(wgpu_options: &mut egui_wgpu::WgpuConfiguration) 
     ));
 }
 
+fn install_panic_log_hook() {
+    // windows_subsystem = "windows" では stderr が見えないため、Rust panic は
+    // data_dir 初期化直後から panic.log に残す。ネイティブ DLL / driver の
+    // access violation は Rust panic ではないので、この hook では捕捉できない。
+    std::panic::set_hook(Box::new(|info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown payload".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown location".to_string());
+        let bt = std::backtrace::Backtrace::force_capture();
+        let msg = format!("PANIC at {location}: {payload}\n{bt}");
+        logger::log(&msg);
+        let log_dir = data_dir::logs_dir();
+        let _ = std::fs::create_dir_all(&log_dir);
+        let panic_log = log_dir.join("panic.log");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&panic_log)
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "[{:?}] {msg}", std::time::SystemTime::now());
+        }
+    }));
+}
+
 fn main() -> eframe::Result {
     // main() 入口の Instant を起動時間計測の t=0 とする。
     // --pdf-worker モードでは計測しないので worker 判定の前に取らない。
@@ -244,6 +277,7 @@ fn main() -> eframe::Result {
     let t0 = Instant::now();
     data_dir::init();
     let data_dir_elapsed = t0.elapsed();
+    install_panic_log_hook();
 
     // デバッグビルドでは常にログ出力。リリースビルドでは --log 引数で有効化
     let log_enabled = cfg!(debug_assertions) || std::env::args().any(|a| a == "--log");
@@ -345,36 +379,6 @@ fn main() -> eframe::Result {
             let _ = susie_loader::get_pool();
         })
         .ok();
-
-    // パニック時にログファイルへ記録するフック（windows_subsystem = "windows" では
-    // stderr が見えないため、ここで捕捉しないとクラッシュ原因が不明になる）
-    std::panic::set_hook(Box::new(|info| {
-        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
-            (*s).to_string()
-        } else if let Some(s) = info.payload().downcast_ref::<String>() {
-            s.clone()
-        } else {
-            "unknown payload".to_string()
-        };
-        let location = info
-            .location()
-            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
-            .unwrap_or_else(|| "unknown location".to_string());
-        let bt = std::backtrace::Backtrace::force_capture();
-        let msg = format!("PANIC at {location}: {payload}\n{bt}");
-        logger::log(&msg);
-        let log_dir = data_dir::logs_dir();
-        let _ = std::fs::create_dir_all(&log_dir);
-        let panic_log = log_dir.join("panic.log");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&panic_log)
-        {
-            use std::io::Write;
-            let _ = writeln!(f, "[{:?}] {msg}", std::time::SystemTime::now());
-        }
-    }));
 
     // 保存済み設定からウィンドウ初期状態を決定する
     let t = Instant::now();
