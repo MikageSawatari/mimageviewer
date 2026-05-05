@@ -120,13 +120,16 @@ Status:
   once the native borderless HWND exists, then raises the native HWND. The
   legacy viewport is still kept available for fallback before native HWND
   creation, but it must not cover the native DComp presenter after startup.
-- 2026-05-04: production GPU frames now follow the decoder's keyed-mutex
+- 2026-05-04: production GPU frames initially followed the decoder's keyed-mutex
   protocol (`ReleaseSync(1)` on the producer side, `AcquireSync(1)` /
   `ReleaseSync(0)` on the presenter side) before copying the shared texture.
-  The video swap chain is resized to the source frame size and the video visual
-  is aspect-fit to the native fullscreen HWND with a DirectComposition
-  transform, so a 1080p clip can fill a 4K fullscreen window without coupling
-  the video copy path to the window backbuffer size.
+  On 2026-05-05 Phase D changed the presenter hot path to fence-only reads
+  because `AcquireSync(1)` could stall the presenter thread for 25-35ms; the
+  producer now recovers key=1 pooled slots before reuse. The video swap chain is
+  resized to the source frame size and the video visual is aspect-fit to the
+  native fullscreen HWND with a DirectComposition transform, so a 1080p clip can
+  fill a 4K fullscreen window without coupling the video copy path to the window
+  backbuffer size.
 
 Current limitations of the experimental slice:
 
@@ -298,9 +301,15 @@ For production native presenter copy/fence spikes, use
 presenter shared-texture cache hits from real per-present samples. The
 production decoder keeps a bounded D3D11 shared-output pool so NT shared handles
 remain stable across frames; `OpenSharedResource1` should be limited to pool
-warmup and source size/format changes. The presenter treats keyed-mutex read
-ownership as a fail-fast check after the shared fence has completed, avoiding a
-long presenter-thread stall if a pooled texture is not immediately readable.
+warmup and source size/format changes. A 2026-05-05 Phase D trace showed that
+consumer-side `IDXGIKeyedMutex::AcquireSync(1)` can block the native presenter
+thread for 25-35ms even with a zero timeout, while the shared fence, shared
+texture cache, and copy call remain sub-millisecond. The native presenter now
+treats the source read as fence-only: it waits the producer's shared fence,
+copies the shared texture, and does not acquire the keyed mutex on the hot path.
+The producer tracks slots released to readers and recovers key=1 back to key=0
+immediately before reusing a pooled output slot; trace runs should keep
+`native_keyed_acq_max_ms` at 0 and `native_recover_max_ms` below 1ms.
 Trace events split `keyed_mutex_ms` into `keyed_mutex_cast_ms` and
 `keyed_mutex_acquire_ms` so Phase D can distinguish COM interface lookup from
 the `AcquireSync(1)` wait.

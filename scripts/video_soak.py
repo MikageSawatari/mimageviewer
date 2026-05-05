@@ -109,6 +109,7 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
     present_shared_handles: set[int] = set()
     present_shared_cache_hits = 0
     present_shared_cache_misses = 0
+    shared_output_recover_ms: list[float] = []
     total = 0
     if not path.exists():
         return {"events": 0, "missing_log": 1}
@@ -202,6 +203,10 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
                 total_ms = event.get("total_ms")
                 if isinstance(total_ms, (int, float)):
                     present_total_ms.append(float(total_ms))
+            if cat == "video" and kind == "shared_output_keyed_mutex_recovered":
+                recover_ms = event.get("recover_ms")
+                if isinstance(recover_ms, (int, float)):
+                    shared_output_recover_ms.append(float(recover_ms))
     return {
         "events": total,
         "display_miss": counts.get("video/display_miss", 0),
@@ -224,6 +229,15 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
         "native_shared_handle_unique": len(present_shared_handles),
         "native_shared_cache_hits": present_shared_cache_hits,
         "native_shared_cache_misses": present_shared_cache_misses,
+        "native_shared_output_recover_count": counts.get(
+            "video/shared_output_keyed_mutex_recovered", 0
+        ),
+        "native_shared_output_recover_ms_p95": percentile(shared_output_recover_ms, 0.95),
+        "native_shared_output_recover_ms_max": max(shared_output_recover_ms, default=0.0),
+        "native_shared_output_acquire_timeout": counts.get("video/shared_output_acquire_timeout", 0),
+        "native_shared_output_reset_failed": counts.get(
+            "video/shared_output_unpresented_reset_failed", 0
+        ),
         "native_copy_ms_p50": percentile(present_copy_ms, 0.50),
         "native_copy_ms_p95": percentile(present_copy_ms, 0.95),
         "native_copy_ms_max": max(present_copy_ms, default=0.0),
@@ -399,8 +413,8 @@ def main() -> int:
         f"- modes: {', '.join(m.name for m in modes)}",
         f"- duration: {args.duration}s",
         "",
-        "| status | mode | seconds | display_miss | frame_gap | drops | max_gap_ms | overlay_present | overlay_max_render_ms | overlay_max_interval_ms | native_present_samples | native_shared_handles | native_cache_hits | native_cache_misses | native_copy_p95_ms | native_copy_max_ms | native_fence_max_ms | log | video |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
+        "| status | mode | seconds | display_miss | frame_gap | drops | max_gap_ms | overlay_present | overlay_max_render_ms | overlay_max_interval_ms | native_present_samples | native_shared_handles | native_cache_hits | native_cache_misses | native_copy_p95_ms | native_copy_max_ms | native_fence_max_ms | native_keyed_acq_max_ms | native_recover_count | native_recover_max_ms | log | video |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |",
     ]
 
     failures = 0
@@ -443,6 +457,9 @@ def main() -> int:
             native_copy_p95 = float(metrics.get("native_copy_ms_p95", 0.0))
             native_copy_max = float(metrics.get("native_copy_ms_max", 0.0))
             native_fence_max = float(metrics.get("native_fence_wait_ms_max", 0.0))
+            native_keyed_acquire_max = float(metrics.get("native_keyed_mutex_acquire_ms_max", 0.0))
+            native_recover_count = int(metrics.get("native_shared_output_recover_count", 0))
+            native_recover_max = float(metrics.get("native_shared_output_recover_ms_max", 0.0))
             row = (
                 f"| {status} | {mode.name} | {elapsed:.1f} | "
                 f"{display_miss} | "
@@ -458,6 +475,9 @@ def main() -> int:
                 f"{native_copy_p95:.2f} | "
                 f"{native_copy_max:.2f} | "
                 f"{native_fence_max:.2f} | "
+                f"{native_keyed_acquire_max:.2f} | "
+                f"{native_recover_count} | "
+                f"{native_recover_max:.2f} | "
                 f"`{log_path.name}` | `{video}` |"
             )
             print(row)

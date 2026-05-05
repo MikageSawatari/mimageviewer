@@ -3493,6 +3493,7 @@ fn try_gpu_blit_path(
         shared_output_in_use: blit.shared_output_in_use,
         shared_output_notify: blit.shared_output_notify,
         shared_output_keyed_mutex: blit.shared_output_keyed_mutex,
+        shared_output_released_to_reader: blit.shared_output_released_to_reader,
         ten_bit,
         fence_value,
         fence_shared_handle,

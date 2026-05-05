@@ -76,6 +76,7 @@ pub struct D3d11Frame {
     pub shared_output_in_use: Option<Arc<AtomicBool>>,
     pub shared_output_notify: Option<Arc<Condvar>>,
     pub shared_output_keyed_mutex: Option<IDXGIKeyedMutex>,
+    pub shared_output_released_to_reader: Option<Arc<AtomicBool>>,
     /// 共有テクスチャが 10-bit (R10G10B10A2_UNORM) か。入力が P010/P016 の
     /// HDR ソースの場合のみ true になる。wgpu 側 import 時の format 選択に必要
     /// (false → Bgra8Unorm、true → Rgb10a2Unorm)。
@@ -113,6 +114,9 @@ impl D3d11Frame {
         match unsafe { mutex.AcquireSync(1, 10) } {
             Ok(()) => unsafe {
                 let _ = mutex.ReleaseSync(0);
+                if let Some(released) = self.shared_output_released_to_reader.take() {
+                    released.store(false, Ordering::Release);
+                }
             },
             Err(e) => {
                 crate::logger::log(format!(
@@ -245,6 +249,7 @@ pub struct BlitOutput {
     pub shared_output_in_use: Option<Arc<AtomicBool>>,
     pub shared_output_notify: Option<Arc<Condvar>>,
     pub shared_output_keyed_mutex: Option<IDXGIKeyedMutex>,
+    pub shared_output_released_to_reader: Option<Arc<AtomicBool>>,
     pub fence_value: u64,
 }
 
@@ -255,6 +260,7 @@ struct SharedOutputSlot {
     height: u32,
     format: DXGI_FORMAT,
     in_use: Arc<AtomicBool>,
+    released_to_reader: Arc<AtomicBool>,
 }
 
 impl Drop for SharedOutputSlot {
@@ -473,6 +479,7 @@ impl GpuVideoDevice {
             shared_output_in_use,
             shared_output_notify,
             shared_output_keyed_mutex,
+            shared_output_released_to_reader,
             km_acquired,
         ) = self.acquire_shared_output(out_w, out_h, out_format)?;
 
@@ -653,6 +660,9 @@ impl GpuVideoDevice {
                     crate::logger::log(format!("KeyedMutex ReleaseSync(1) failed: {e:?}"));
                     return Err(GpuVideoError::Blt(format!("KeyedMutex ReleaseSync: {e:?}")));
                 }
+                if let Some(released) = &shared_output_released_to_reader {
+                    released.store(true, Ordering::Release);
+                }
             }
             self.context.Flush();
         }
@@ -679,6 +689,7 @@ impl GpuVideoDevice {
             shared_output_in_use,
             shared_output_notify,
             shared_output_keyed_mutex,
+            shared_output_released_to_reader,
             fence_value,
         })
     }
@@ -798,6 +809,43 @@ impl GpuVideoDevice {
         tex.ok_or_else(|| GpuVideoError::TextureCreate("intermediate null".into()))
     }
 
+    fn recover_shared_output_keyed_mutex(
+        mutex: &IDXGIKeyedMutex,
+        released_to_reader: &AtomicBool,
+        shared_handle: HANDLE,
+        expected_released_to_reader: bool,
+    ) -> bool {
+        let recover_t0 = std::time::Instant::now();
+        let Ok(()) = (unsafe { mutex.AcquireSync(1, 0) }) else {
+            return false;
+        };
+        unsafe {
+            let _ = mutex.ReleaseSync(0);
+        }
+        released_to_reader.store(false, Ordering::Release);
+        crate::perf::event(
+            "video",
+            "shared_output_keyed_mutex_recovered",
+            None,
+            0,
+            &[
+                (
+                    "shared_handle",
+                    serde_json::Value::from(shared_handle.0 as usize as u64),
+                ),
+                (
+                    "recover_ms",
+                    serde_json::Value::from(recover_t0.elapsed().as_secs_f64() * 1000.0),
+                ),
+                (
+                    "expected_released_to_reader",
+                    serde_json::Value::from(expected_released_to_reader),
+                ),
+            ],
+        );
+        true
+    }
+
     fn acquire_shared_output(
         &self,
         w: u32,
@@ -811,6 +859,7 @@ impl GpuVideoDevice {
             Option<Arc<AtomicBool>>,
             Option<Arc<Condvar>>,
             Option<IDXGIKeyedMutex>,
+            Option<Arc<AtomicBool>>,
             Option<IDXGIKeyedMutex>,
         ),
         GpuVideoError,
@@ -832,6 +881,7 @@ impl GpuVideoDevice {
                 else {
                     continue;
                 };
+                let released_to_reader = Arc::clone(&slot.released_to_reader);
                 let Ok(km) = slot.tex.cast::<IDXGIKeyedMutex>() else {
                     return Ok((
                         slot.tex.clone(),
@@ -840,42 +890,73 @@ impl GpuVideoDevice {
                         Some(Arc::clone(&slot.in_use)),
                         Some(Arc::clone(&self.shared_output_pool_cv)),
                         None,
+                        Some(released_to_reader),
                         None,
                     ));
                 };
-                match unsafe { km.AcquireSync(0, 100) } {
-                    Ok(()) => {
-                        return Ok((
-                            slot.tex.clone(),
+                let expected_released_to_reader = released_to_reader.load(Ordering::Acquire);
+                let mut recovered_key_one = false;
+                let acquired_for_write = if expected_released_to_reader {
+                    recovered_key_one = Self::recover_shared_output_keyed_mutex(
+                        &km,
+                        &released_to_reader,
+                        slot.shared_handle,
+                        expected_released_to_reader,
+                    );
+                    recovered_key_one && (unsafe { km.AcquireSync(0, 0) }).is_ok()
+                } else {
+                    (unsafe { km.AcquireSync(0, 0) }).is_ok() || {
+                        recovered_key_one = Self::recover_shared_output_keyed_mutex(
+                            &km,
+                            &released_to_reader,
                             slot.shared_handle,
-                            false,
-                            Some(Arc::clone(&slot.in_use)),
-                            Some(Arc::clone(&self.shared_output_pool_cv)),
-                            Some(km.clone()),
-                            Some(km),
-                        ));
-                    }
-                    Err(_) => {
-                        crate::perf::event(
-                            "video",
-                            "shared_output_acquire_timeout",
-                            None,
-                            0,
-                            &[(
-                                "shared_handle",
-                                serde_json::Value::from(slot.shared_handle.0 as usize as u64),
-                            )],
+                            expected_released_to_reader,
                         );
-                        slot.in_use.store(false, Ordering::Release);
-                        self.shared_output_pool_cv.notify_one();
-                        continue;
+                        recovered_key_one && (unsafe { km.AcquireSync(0, 0) }).is_ok()
                     }
+                };
+                if acquired_for_write {
+                    released_to_reader.store(false, Ordering::Release);
+                    return Ok((
+                        slot.tex.clone(),
+                        slot.shared_handle,
+                        false,
+                        Some(Arc::clone(&slot.in_use)),
+                        Some(Arc::clone(&self.shared_output_pool_cv)),
+                        Some(km.clone()),
+                        Some(released_to_reader),
+                        Some(km),
+                    ));
                 }
+                crate::perf::event(
+                    "video",
+                    "shared_output_acquire_timeout",
+                    None,
+                    0,
+                    &[
+                        (
+                            "shared_handle",
+                            serde_json::Value::from(slot.shared_handle.0 as usize as u64),
+                        ),
+                        (
+                            "released_to_reader",
+                            serde_json::Value::from(expected_released_to_reader),
+                        ),
+                        (
+                            "recovered_key_one",
+                            serde_json::Value::from(recovered_key_one),
+                        ),
+                    ],
+                );
+                slot.in_use.store(false, Ordering::Release);
+                self.shared_output_pool_cv.notify_one();
+                continue;
             }
 
             if pool.len() < OUTPUT_RING_SIZE {
                 let (tex, shared_handle) = self.create_shared_output(w, h, format)?;
                 let in_use = Arc::new(AtomicBool::new(true));
+                let released_to_reader = Arc::new(AtomicBool::new(false));
                 let km_acquired = match tex.cast::<IDXGIKeyedMutex>() {
                     Ok(km) => match unsafe { km.AcquireSync(0, 100) } {
                         Ok(()) => Some(km),
@@ -901,6 +982,7 @@ impl GpuVideoDevice {
                     height: h,
                     format,
                     in_use: Arc::clone(&in_use),
+                    released_to_reader: Arc::clone(&released_to_reader),
                 });
                 crate::perf::event(
                     "video",
@@ -924,6 +1006,7 @@ impl GpuVideoDevice {
                     Some(in_use),
                     Some(Arc::clone(&self.shared_output_pool_cv)),
                     km_acquired.clone(),
+                    Some(released_to_reader),
                     km_acquired,
                 ));
             }
