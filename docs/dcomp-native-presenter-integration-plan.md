@@ -253,6 +253,13 @@ Status:
   or transparent-cleared surface cover the video if the underlying DComp/wgpu
   path treats it as opaque. The env flag remains opt-in until manual trial on
   affected machines confirms that visible HUD pixels blend correctly.
+- 2026-05-05: native-presenter `FirstFrameReady` delivery now retries when the
+  engine event channel is temporarily full. HUD seek bursts can coincide with
+  stale-packet and audio events; if the first presented frame notification is
+  dropped, the engine can remain in `Buffering` even though the native presenter
+  has already displayed a post-seek frame. The presenter only marks the epoch's
+  first-frame event delivered after `try_send` succeeds, and discards pending
+  retries when a newer seek serial appears.
   The 1080p120 soak kept `late_drop=0` for 601 frames over 5 seconds with max
   interval 9.8ms, so the egui overlay surface can coexist with the native video
   visual without coupling redraw cadence.

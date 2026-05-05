@@ -457,6 +457,65 @@ fn native_source_pacing_delay(
 }
 
 #[cfg(windows)]
+fn try_send_native_first_frame_ready(
+    engine_event_tx: &crossbeam_channel::Sender<EngineEvent>,
+    epoch: u64,
+    pts: f64,
+) -> bool {
+    let event = EngineEvent::Decoder(engine::state::DecoderEvent::FirstFrameReady { epoch, pts });
+    match engine_event_tx.try_send(event) {
+        Ok(()) => {
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "native_presenter",
+                    "first_frame_ready_send",
+                    None,
+                    0,
+                    &[
+                        ("result", serde_json::Value::from("sent")),
+                        ("epoch", serde_json::Value::from(epoch as i64)),
+                        ("pts", serde_json::Value::from(pts)),
+                    ],
+                );
+            }
+            true
+        }
+        Err(crossbeam_channel::TrySendError::Full(_)) => {
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "native_presenter",
+                    "first_frame_ready_send",
+                    None,
+                    0,
+                    &[
+                        ("result", serde_json::Value::from("pending")),
+                        ("epoch", serde_json::Value::from(epoch as i64)),
+                        ("pts", serde_json::Value::from(pts)),
+                    ],
+                );
+            }
+            false
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "native_presenter",
+                    "first_frame_ready_send",
+                    None,
+                    0,
+                    &[
+                        ("result", serde_json::Value::from("disconnected")),
+                        ("epoch", serde_json::Value::from(epoch as i64)),
+                        ("pts", serde_json::Value::from(pts)),
+                    ],
+                );
+            }
+            true
+        }
+    }
+}
+
+#[cfg(windows)]
 fn run_native_video_output(
     video_rx: crossbeam_channel::Receiver<VideoFrame>,
     clock: Arc<AvClock>,
@@ -521,6 +580,7 @@ fn run_native_video_output(
     let mut queue: VecDeque<VideoFrame> = VecDeque::new();
     let mut last_seen_serial = clock.current_seek_serial();
     let mut first_frame_event_last_epoch: Option<u64> = None;
+    let mut pending_first_frame_event: Option<(u64, f64)> = None;
     let run_started = Instant::now();
     let mut present_stats = NativeFullscreenPresentStats::default();
     let mut last_present_wall: Option<Instant> = None;
@@ -533,6 +593,19 @@ fn run_native_video_output(
     let mut native_events = Vec::new();
     let trace_every_present = std::env::var_os("MIV_NATIVE_VIDEO_PRESENT_TRACE").is_some();
     while !cancel.load(Ordering::Acquire) {
+        // `FirstFrameReady` is what lets the engine leave Buffering after a seek.
+        // The engine event channel can be temporarily full during seek bursts, so
+        // retry instead of treating a failed try_send as delivered.
+        if let Some((epoch, pts)) = pending_first_frame_event {
+            let clock_serial = clock.current_seek_serial();
+            if epoch < clock_serial {
+                pending_first_frame_event = None;
+            } else if try_send_native_first_frame_ready(&engine_event_tx, epoch, pts) {
+                first_frame_event_last_epoch = Some(epoch);
+                pending_first_frame_event = None;
+            }
+        }
+
         if crate::video::native_window::pump_thread_messages() {
             closed.store(true, Ordering::Release);
             break;
@@ -593,6 +666,7 @@ fn run_native_video_output(
             native_drain_unpresented_queue(&mut queue);
             last_seen_serial = clock_serial;
             first_frame_event_last_epoch = None;
+            pending_first_frame_event = None;
             last_present_source_pts = None;
         }
         while let Ok(frame) = video_rx.try_recv() {
@@ -604,6 +678,7 @@ fn run_native_video_output(
                 native_drain_unpresented_queue(&mut queue);
                 last_seen_serial = frame.seek_serial;
                 first_frame_event_last_epoch = None;
+                pending_first_frame_event = None;
                 last_present_source_pts = None;
             }
             queue.push_back(frame);
@@ -693,10 +768,12 @@ fn run_native_video_output(
                     displayed_frame_seq.fetch_add(1, Ordering::Release);
                     first_presented_out.store(true, Ordering::Release);
                     if first_frame_event_last_epoch != Some(serial) {
-                        first_frame_event_last_epoch = Some(serial);
-                        let _ = engine_event_tx.try_send(EngineEvent::Decoder(
-                            engine::state::DecoderEvent::FirstFrameReady { epoch: serial, pts },
-                        ));
+                        if try_send_native_first_frame_ready(&engine_event_tx, serial, pts) {
+                            first_frame_event_last_epoch = Some(serial);
+                            pending_first_frame_event = None;
+                        } else {
+                            pending_first_frame_event = Some((serial, pts));
+                        }
                     }
                     let now_for_clear = clock.now_secs();
                     if clock::pts_clears_seek_override(pts, now_for_clear)

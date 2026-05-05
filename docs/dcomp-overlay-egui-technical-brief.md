@@ -94,6 +94,11 @@ Status:
   as opaque cannot cover the video. Keep the flag opt-in until this visual
   attach/detach path is manually verified on the production machines that saw
   the black overlay.
+- 2026-05-05: native `FirstFrameReady` delivery is retried if the engine event
+  channel is temporarily full. This protects HUD seek bursts from leaving the
+  engine in `Buffering` after the native presenter has already displayed the
+  first post-seek frame; pending retries are cleared when a newer seek epoch
+  arrives.
 
 Acceptance for the spike:
 
