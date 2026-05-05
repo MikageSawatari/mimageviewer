@@ -1946,12 +1946,24 @@ impl App {
     #[cfg(windows)]
     fn hide_fullscreen_viewport_for_native(&mut self, ctx: &egui::Context) {
         let fs_id = self.fullscreen_viewport_id();
-        let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
-        ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
+        let fs_builder = self
+            .build_fullscreen_viewport_builder_with_transparency(false)
+            .with_visible(false);
+        ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
+            // Visible(false) が DWM に反映されるまでの遷移 tick でも、
+            // 透明化して背後のグリッドを透かさない。
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+                .show(ctx, |_ui| {});
+        });
         if self.fs_viewport_shown {
             crate::dwm_transitions::disable_transitions_for_thread_windows();
             ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
             self.fs_viewport_shown = false;
+            // この tick では egui fullscreen viewport を hide するために触っている。
+            // 直後の App::update 末尾で native HWND を必ず上げ直し、hide 反映までの
+            // 隙間でサムネイルグリッドが前面化しないようにする。
+            self.force_native_video_front_raise_next_tick();
             crate::logger::log(
                 "[native-video] hid egui fullscreen viewport behind native presenter".to_string(),
             );

@@ -13164,6 +13164,11 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn force_native_video_front_raise_next_tick(&mut self) {
+        self.native_video_front_last_raise = None;
+    }
+
+    #[cfg(windows)]
     fn native_video_presenter_hwnd_for_focus_guard(&self) -> bool {
         self.fullscreen_idx
             .and_then(|idx| self.fs_cache.get(&idx))
@@ -14651,9 +14656,9 @@ impl eframe::App for App {
         // ── フルスクリーンビューポート ──────────────────────────────────
         // 非アクティブ時も非表示でビューポートを維持（次回表示のちらつき防止）
         self.keep_fullscreen_viewport_alive(ctx);
+        self.render_fullscreen_viewport(ctx);
         #[cfg(windows)]
         self.ensure_native_video_front();
-        self.render_fullscreen_viewport(ctx);
         let t_fullscreen_viewport = frame_t0.elapsed();
 
         // 補正パネルでスライダーをドラッグ中に true → release で false の遷移を検知し、
