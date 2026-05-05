@@ -385,6 +385,15 @@ The native fullscreen video HUD only shows its `VST` top-bar button when
 playback does not advertise the VST3 playback panel because the button cannot
 open a useful plugin GUI workspace.
 
+The native DComp fullscreen path does not render the legacy egui fullscreen
+viewport, so the playback VST3 panel is mirrored into the native overlay as a
+self-drawn panel. The UI thread sends a small snapshot of bridge slot state,
+chain-slot labels, latency/bypass flags, and compact-video mode to the presenter;
+button clicks come back as native overlay events and are handled by the same
+`DspBridge` actions used by the legacy playback panel. While native fullscreen
+is active, GUI close/bypass signals are still pumped on the UI thread so plugin
+window state stays synchronized with settings.
+
 The Preferences VST3 scanner reports probe progress over the scan worker
 channel. The UI drains progress messages and shows the current `(done/total)`
 count, plus the plugin currently being probed, while the bridge subprocess probe

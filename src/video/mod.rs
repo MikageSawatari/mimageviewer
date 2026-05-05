@@ -183,25 +183,69 @@ pub struct NativeVideoOutputConfig {
 }
 
 #[cfg(windows)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum NativeVideoOutputEvent {
     Window(native_window::NativeVideoWindowEvent),
-    Seek { target_secs: f64 },
-    TileSeek { target_secs: f64 },
-    WheelNavigate { delta: i32 },
-    TileColumnsDelta { delta: i32 },
-    RequestSeekThumbnail { target_secs: f64 },
+    Seek {
+        target_secs: f64,
+    },
+    TileSeek {
+        target_secs: f64,
+    },
+    WheelNavigate {
+        delta: i32,
+    },
+    TileColumnsDelta {
+        delta: i32,
+    },
+    RequestSeekThumbnail {
+        target_secs: f64,
+    },
     ToggleTileMode,
     TogglePerfOverlay,
     ToggleVst3Gui,
+    SetVst3PanelVisible {
+        visible: bool,
+    },
+    SetVst3VideoCompact {
+        compact: bool,
+    },
+    Vst3ShowSlotGui {
+        idx: usize,
+        path: String,
+    },
+    Vst3HideSlotGui {
+        idx: usize,
+        path: String,
+    },
+    Vst3SetBypass {
+        idx: usize,
+        path: String,
+        bypass: bool,
+    },
+    Vst3LoadChainSlot {
+        slot_idx: usize,
+    },
+    Vst3SaveChainSlot {
+        slot_idx: usize,
+    },
     SeekToStartAndPlay,
     TogglePlay,
     ToggleMute,
     ToggleLoop,
-    SetVolume { volume: f64, persist: bool },
-    AddBookmarkAt { target_secs: f64 },
-    TogglePinAt { target_secs: f64 },
-    DeleteBookmark { id: i64 },
+    SetVolume {
+        volume: f64,
+        persist: bool,
+    },
+    AddBookmarkAt {
+        target_secs: f64,
+    },
+    TogglePinAt {
+        target_secs: f64,
+    },
+    DeleteBookmark {
+        id: i64,
+    },
 }
 
 #[cfg(windows)]
@@ -226,6 +270,9 @@ enum NativeVideoOutputCommand {
     },
     SetVst3Available {
         available: bool,
+    },
+    SetVst3Panel {
+        panel: Option<native_presenter::NativeOverlayVst3Panel>,
     },
     SetPlaybackStatus {
         first_frame_presented: bool,
@@ -369,6 +416,12 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetVst3Available { available });
+    }
+
+    fn set_vst3_panel(&self, panel: Option<native_presenter::NativeOverlayVst3Panel>) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetVst3Panel { panel });
     }
 
     fn set_tile_overlay(&self, tile_overlay: Option<native_presenter::NativeOverlayTileOverlay>) {
@@ -821,6 +874,9 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetVst3Available { available } => {
                     presenter.set_overlay_vst3_available(available);
                 }
+                NativeVideoOutputCommand::SetVst3Panel { panel } => {
+                    presenter.set_overlay_vst3_panel(panel);
+                }
                 NativeVideoOutputCommand::SetPlaybackStatus {
                     first_frame_presented,
                     error,
@@ -890,6 +946,55 @@ fn run_native_video_output(
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleVst3Gui => {
                                 let _ = ui_event_tx.send(NativeVideoOutputEvent::ToggleVst3Gui);
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetVst3PanelVisible {
+                                visible,
+                            } => {
+                                let _ = ui_event_tx
+                                    .send(NativeVideoOutputEvent::SetVst3PanelVisible { visible });
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetVst3VideoCompact {
+                                compact,
+                            } => {
+                                let _ = ui_event_tx
+                                    .send(NativeVideoOutputEvent::SetVst3VideoCompact { compact });
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::Vst3ShowSlotGui {
+                                idx,
+                                path,
+                            } => {
+                                let _ = ui_event_tx
+                                    .send(NativeVideoOutputEvent::Vst3ShowSlotGui { idx, path });
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::Vst3HideSlotGui {
+                                idx,
+                                path,
+                            } => {
+                                let _ = ui_event_tx
+                                    .send(NativeVideoOutputEvent::Vst3HideSlotGui { idx, path });
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::Vst3SetBypass {
+                                idx,
+                                path,
+                                bypass,
+                            } => {
+                                let _ = ui_event_tx.send(NativeVideoOutputEvent::Vst3SetBypass {
+                                    idx,
+                                    path,
+                                    bypass,
+                                });
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::Vst3LoadChainSlot {
+                                slot_idx,
+                            } => {
+                                let _ = ui_event_tx
+                                    .send(NativeVideoOutputEvent::Vst3LoadChainSlot { slot_idx });
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::Vst3SaveChainSlot {
+                                slot_idx,
+                            } => {
+                                let _ = ui_event_tx
+                                    .send(NativeVideoOutputEvent::Vst3SaveChainSlot { slot_idx });
                             }
                             crate::video::native_presenter::NativeOverlayCommand::SeekToStartAndPlay => {
                                 let _ = ui_event_tx.send(NativeVideoOutputEvent::SeekToStartAndPlay);
@@ -1765,6 +1870,13 @@ impl VideoPlayer {
     pub fn set_native_vst3_available(&self, available: bool) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_vst3_available(available);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_vst3_panel(&self, panel: Option<native_presenter::NativeOverlayVst3Panel>) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_vst3_panel(panel);
         }
     }
 

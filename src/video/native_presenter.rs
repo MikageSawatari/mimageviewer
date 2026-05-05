@@ -123,6 +123,7 @@ struct NativeEguiOverlay {
     video_muted: bool,
     video_loop_enabled: bool,
     vst3_available: bool,
+    vst3_panel: Option<NativeOverlayVst3Panel>,
     first_frame_presented: bool,
     video_error: Option<String>,
     toast: Option<NativeOverlayToast>,
@@ -248,6 +249,45 @@ pub struct NativeOverlayMetadata {
     pub d3d11va_supported: bool,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeOverlayVst3Panel {
+    pub visible: bool,
+    pub video_compact: bool,
+    pub state_text: String,
+    pub disabled_reason: Option<String>,
+    pub slots: Vec<NativeOverlayVst3Slot>,
+    pub chain_slots: Vec<NativeOverlayVst3ChainSlot>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeOverlayVst3Slot {
+    pub idx: usize,
+    pub path: String,
+    pub name: String,
+    pub state: NativeOverlayVst3SlotState,
+    pub bypass: bool,
+    pub gui_visible: bool,
+    pub latency_ms: Option<f64>,
+    pub auto_bypassed_for_latency: bool,
+    pub placeholder: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeOverlayVst3SlotState {
+    Loading,
+    Loaded,
+    Error,
+    Placeholder,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeOverlayVst3ChainSlot {
+    pub idx: usize,
+    pub key_label: String,
+    pub name: Option<String>,
+    pub plugin_count: usize,
+}
+
 #[derive(Clone)]
 pub struct NativeOverlayTileThumbnail {
     pub target_secs: f64,
@@ -351,22 +391,66 @@ impl NativeOverlayInputOutcome {
 
 #[derive(Clone, Debug)]
 pub enum NativeOverlayCommand {
-    Seek { target_secs: f64 },
-    TileSeek { target_secs: f64 },
-    WheelNavigate { delta: i32 },
-    TileColumnsDelta { delta: i32 },
-    RequestSeekThumbnail { target_secs: f64 },
+    Seek {
+        target_secs: f64,
+    },
+    TileSeek {
+        target_secs: f64,
+    },
+    WheelNavigate {
+        delta: i32,
+    },
+    TileColumnsDelta {
+        delta: i32,
+    },
+    RequestSeekThumbnail {
+        target_secs: f64,
+    },
     ToggleTileMode,
     TogglePerfOverlay,
     ToggleVst3Gui,
+    SetVst3PanelVisible {
+        visible: bool,
+    },
+    SetVst3VideoCompact {
+        compact: bool,
+    },
+    Vst3ShowSlotGui {
+        idx: usize,
+        path: String,
+    },
+    Vst3HideSlotGui {
+        idx: usize,
+        path: String,
+    },
+    Vst3SetBypass {
+        idx: usize,
+        path: String,
+        bypass: bool,
+    },
+    Vst3LoadChainSlot {
+        slot_idx: usize,
+    },
+    Vst3SaveChainSlot {
+        slot_idx: usize,
+    },
     SeekToStartAndPlay,
     TogglePlay,
     ToggleMute,
-    SetVolume { volume: f64, persist: bool },
+    SetVolume {
+        volume: f64,
+        persist: bool,
+    },
     ToggleLoop,
-    AddBookmarkAt { target_secs: f64 },
-    TogglePinAt { target_secs: f64 },
-    DeleteBookmark { id: i64 },
+    AddBookmarkAt {
+        target_secs: f64,
+    },
+    TogglePinAt {
+        target_secs: f64,
+    },
+    DeleteBookmark {
+        id: i64,
+    },
 }
 
 impl NativeOverlayInputRouting {
@@ -969,6 +1053,12 @@ impl NativeVideoPresenter {
     pub fn set_overlay_vst3_available(&mut self, available: bool) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_vst3_available(available);
+        }
+    }
+
+    pub fn set_overlay_vst3_panel(&mut self, panel: Option<NativeOverlayVst3Panel>) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_vst3_panel(panel);
         }
     }
 
@@ -1593,6 +1683,7 @@ impl NativeEguiOverlay {
             video_muted: false,
             video_loop_enabled: false,
             vst3_available: false,
+            vst3_panel: None,
             first_frame_presented: false,
             video_error: None,
             toast: None,
@@ -1905,6 +1996,17 @@ impl NativeEguiOverlay {
             return;
         }
         self.vst3_available = available;
+        if !available {
+            self.vst3_panel = None;
+        }
+        self.dirty = true;
+    }
+
+    fn set_vst3_panel(&mut self, panel: Option<NativeOverlayVst3Panel>) {
+        if self.vst3_panel == panel {
+            return;
+        }
+        self.vst3_panel = panel;
         self.dirty = true;
     }
 
@@ -2039,6 +2141,7 @@ impl NativeEguiOverlay {
             || self.jump_panel_visible()
             || self.top_bar_visible()
             || self.right_panel_visible()
+            || self.vst3_panel.as_ref().is_some_and(|panel| panel.visible)
             || self.perf_visible
             || self.tile_overlay.is_some()
             || self.hover_preview_target_secs.is_some()
@@ -2201,6 +2304,7 @@ impl NativeEguiOverlay {
         let timeline_markers = self.timeline_markers.clone();
         let jump_entries = self.jump_entries.clone();
         let video_metadata = self.video_metadata.clone();
+        let vst3_panel = self.vst3_panel.clone();
         let tile_overlay = self.tile_overlay.clone();
         let tile_texture_ids: HashMap<usize, egui::TextureId> = self
             .tile_textures
@@ -2214,6 +2318,7 @@ impl NativeEguiOverlay {
             .collect();
         let perf_visible = self.perf_visible;
         let vst3_available = self.vst3_available;
+        let vst3_panel_visible = vst3_panel.as_ref().is_some_and(|panel| panel.visible);
         let perf_latest = self.perf_latest;
         let perf_history: Vec<_> = self.perf_history.iter().copied().collect();
         let hud_visible = self.hud_visible();
@@ -2223,8 +2328,8 @@ impl NativeEguiOverlay {
         let tile_overlay_visible = tile_overlay.is_some();
         let status_visible = video_error.is_some() || !first_frame_presented;
         let toast_visible = toast.is_some();
-        let panel_chrome_visible =
-            !tile_overlay_visible && (jump_panel_visible || top_bar_visible || right_panel_visible);
+        let panel_chrome_visible = !tile_overlay_visible
+            && (jump_panel_visible || top_bar_visible || right_panel_visible || vst3_panel_visible);
         let bottom_hud_visible = hud_visible || panel_chrome_visible;
         let paused_center_visible =
             !tile_overlay_visible && !is_playing && first_frame_presented && video_error.is_none();
@@ -2246,7 +2351,8 @@ impl NativeEguiOverlay {
             || perf_visible
             || status_visible
             || toast_visible
-            || paused_center_visible;
+            || paused_center_visible
+            || vst3_panel_visible;
         let pending_event_count = self.pending_events.len();
         let mut commands = std::mem::take(&mut self.pending_overlay_commands);
         let mut last_seek_target_secs = self.last_seek_target_secs;
@@ -2330,6 +2436,16 @@ impl NativeEguiOverlay {
                     loop_enabled,
                     perf_visible,
                     vst3_available,
+                    vst3_panel_visible,
+                    &mut commands,
+                );
+            }
+            if vst3_panel_visible && let Some(panel) = vst3_panel.as_ref() {
+                draw_native_vst3_panel(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    panel,
                     &mut commands,
                 );
             }
@@ -3664,6 +3780,7 @@ fn draw_native_top_bar(
     loop_enabled: bool,
     perf_visible: bool,
     vst3_available: bool,
+    vst3_panel_visible: bool,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     egui::Area::new(egui::Id::new("native_video_top_bar"))
@@ -3765,8 +3882,8 @@ fn draw_native_top_bar(
                     gap,
                     "native_top_vst3",
                     NativeTopButtonGlyph::Text("VST"),
-                    false,
-                    "VST3 GUI 表示/非表示",
+                    vst3_panel_visible,
+                    "VST3 パネル表示/非表示",
                     NativeOverlayCommand::ToggleVst3Gui,
                     commands,
                 );
@@ -3855,6 +3972,240 @@ fn draw_native_top_bar(
                 commands.push(NativeOverlayCommand::TogglePlay);
             }
         });
+}
+
+fn draw_native_vst3_panel(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    panel: &NativeOverlayVst3Panel,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    let rect = native_vst3_panel_rect(overlay_width_points, overlay_height_points);
+    egui::Area::new(egui::Id::new("native_video_vst3_panel"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min)
+        .show(ctx, |ui| {
+            ui.set_min_size(rect.size());
+            ui.set_max_size(rect.size());
+            let frame = egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(14, 14, 18, 238))
+                .stroke(egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 58),
+                ))
+                .inner_margin(egui::Margin::same(10));
+            frame.show(ui, |ui| {
+                ui.set_max_size(rect.size() - egui::vec2(20.0, 20.0));
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("VST3")
+                            .strong()
+                            .color(egui::Color32::from_rgb(242, 242, 242)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        egui::RichText::new(&panel.state_text)
+                            .small()
+                            .color(egui::Color32::from_rgb(178, 188, 202)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button(egui::RichText::new("X").monospace())
+                            .on_hover_text("VST3 パネルを閉じる")
+                            .clicked()
+                        {
+                            commands
+                                .push(NativeOverlayCommand::SetVst3PanelVisible { visible: false });
+                        }
+                    });
+                });
+
+                if let Some(reason) = panel.disabled_reason.as_ref() {
+                    ui.add_space(6.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(238, 184, 88),
+                        "このセッションでは VST3 が一時停止しています",
+                    );
+                    ui.label(
+                        egui::RichText::new(reason)
+                            .small()
+                            .color(egui::Color32::from_rgb(208, 208, 208)),
+                    );
+                    return;
+                }
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("動画").small());
+                    let full_resp = ui.selectable_label(!panel.video_compact, "フル");
+                    if full_resp
+                        .on_hover_text("動画をフルスクリーン全体に表示します")
+                        .clicked()
+                    {
+                        commands.push(NativeOverlayCommand::SetVst3VideoCompact { compact: false });
+                    }
+                    let compact_resp = ui.selectable_label(panel.video_compact, "右上 1/4");
+                    if compact_resp
+                        .on_hover_text("動画を右上 1/4 に縮小し、プラグイン GUI の領域を空けます")
+                        .clicked()
+                    {
+                        commands.push(NativeOverlayCommand::SetVst3VideoCompact { compact: true });
+                    }
+                });
+
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("native_vst3_panel_scroll")
+                    .max_height((rect.height() - 150.0).max(120.0))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if panel.slots.is_empty() {
+                            ui.label(
+                                egui::RichText::new("プラグイン未設定")
+                                    .color(egui::Color32::from_rgb(190, 190, 190)),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "環境設定の VST3 ページでチェーンに追加してください。",
+                                )
+                                .small()
+                                .color(egui::Color32::from_rgb(160, 160, 160)),
+                            );
+                        }
+                        for slot in &panel.slots {
+                            draw_native_vst3_slot_row(ui, slot, commands);
+                        }
+                    });
+
+                ui.separator();
+                ui.label(
+                    egui::RichText::new("チェーンスロット")
+                        .small()
+                        .strong()
+                        .color(egui::Color32::from_rgb(210, 210, 210)),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("読込").small());
+                    for chain in &panel.chain_slots {
+                        let response = ui
+                            .add_enabled(
+                                chain.name.is_some(),
+                                egui::Button::new(chain.key_label.clone()).small(),
+                            )
+                            .on_hover_text(native_vst3_chain_slot_tooltip(chain));
+                        if response.clicked() {
+                            commands.push(NativeOverlayCommand::Vst3LoadChainSlot {
+                                slot_idx: chain.idx,
+                            });
+                        }
+                    }
+                });
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("保存").small());
+                    for chain in &panel.chain_slots {
+                        let response = ui
+                            .add(egui::Button::new(chain.key_label.clone()).small())
+                            .on_hover_text(native_vst3_chain_slot_tooltip(chain));
+                        if response.clicked() {
+                            commands.push(NativeOverlayCommand::Vst3SaveChainSlot {
+                                slot_idx: chain.idx,
+                            });
+                        }
+                    }
+                });
+            });
+        });
+}
+
+fn draw_native_vst3_slot_row(
+    ui: &mut egui::Ui,
+    slot: &NativeOverlayVst3Slot,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    ui.horizontal(|ui| {
+        let mut enabled = !slot.bypass;
+        let label = format!("{}. {}", slot.idx + 1, slot.name);
+        let checkbox = ui.add_enabled(
+            !slot.placeholder,
+            egui::Checkbox::new(&mut enabled, truncate_overlay_text(&label, 42)),
+        );
+        if checkbox.on_hover_text("ON/OFF を切り替えます").changed() {
+            commands.push(NativeOverlayCommand::Vst3SetBypass {
+                idx: slot.idx,
+                path: slot.path.clone(),
+                bypass: !enabled,
+            });
+        }
+        if slot.placeholder {
+            ui.label(
+                egui::RichText::new("読込中")
+                    .small()
+                    .color(egui::Color32::from_rgb(170, 170, 170)),
+            );
+        } else if slot.state == NativeOverlayVst3SlotState::Loading {
+            ui.label(
+                egui::RichText::new("loading")
+                    .small()
+                    .color(egui::Color32::from_rgb(170, 200, 255)),
+            );
+        } else if slot.state == NativeOverlayVst3SlotState::Error {
+            ui.label(
+                egui::RichText::new("error")
+                    .small()
+                    .color(egui::Color32::from_rgb(245, 120, 120)),
+            );
+        }
+        if let Some(ms) = slot.latency_ms
+            && ms > 0.0
+            && !slot.bypass
+        {
+            ui.label(
+                egui::RichText::new(format!("{ms:.1}ms"))
+                    .small()
+                    .color(egui::Color32::from_rgb(255, 206, 116)),
+            );
+        }
+        if slot.auto_bypassed_for_latency && slot.bypass {
+            ui.label(
+                egui::RichText::new("auto-OFF")
+                    .small()
+                    .strong()
+                    .color(egui::Color32::from_rgb(255, 150, 150)),
+            );
+        }
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let text = if slot.gui_visible { "閉" } else { "GUI" };
+            let response = ui.add_enabled(!slot.placeholder, egui::Button::new(text).small());
+            if response
+                .on_hover_text(if slot.gui_visible {
+                    "プラグイン GUI を閉じる"
+                } else {
+                    "プラグイン GUI を表示"
+                })
+                .clicked()
+            {
+                if slot.gui_visible {
+                    commands.push(NativeOverlayCommand::Vst3HideSlotGui {
+                        idx: slot.idx,
+                        path: slot.path.clone(),
+                    });
+                } else {
+                    commands.push(NativeOverlayCommand::Vst3ShowSlotGui {
+                        idx: slot.idx,
+                        path: slot.path.clone(),
+                    });
+                }
+            }
+        });
+    });
+}
+
+fn native_vst3_chain_slot_tooltip(slot: &NativeOverlayVst3ChainSlot) -> String {
+    match slot.name.as_ref() {
+        Some(name) => format!("{}\n{} 件", name, slot.plugin_count),
+        None => format!("VST3 Slot {} は空です", slot.key_label),
+    }
 }
 
 fn draw_native_metadata_panel(
@@ -4226,6 +4577,17 @@ fn native_metadata_panel_rect(overlay_width_points: f32, overlay_height_points: 
     egui::Rect::from_min_size(
         egui::pos2(overlay_width_points - panel_w, top),
         egui::vec2(panel_w, panel_h),
+    )
+}
+
+fn native_vst3_panel_rect(overlay_width_points: f32, overlay_height_points: f32) -> egui::Rect {
+    let width = 380.0_f32.min((overlay_width_points - 32.0).max(260.0));
+    let height = (overlay_height_points - native_panel_top() - 56.0)
+        .clamp(280.0, 620.0)
+        .min((overlay_height_points - 72.0).max(240.0));
+    egui::Rect::from_min_size(
+        egui::pos2(18.0, native_panel_top() + 10.0),
+        egui::vec2(width, height),
     )
 }
 

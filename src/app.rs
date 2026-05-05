@@ -13103,11 +13103,16 @@ impl App {
             self.handle_native_video_output_event(ctx, idx, event);
         }
         #[cfg(windows)]
+        if self.fullscreen_idx.is_some() && self.settings.vst3_enabled {
+            self.vst3_pump_gui_signals();
+        }
+        #[cfg(windows)]
         if let Some(fs_idx) = self.fullscreen_idx {
             self.sync_native_video_metadata(fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);
             self.sync_native_video_tile_overlay(ctx, fs_idx);
             self.sync_native_video_vst3_available(fs_idx);
+            self.sync_native_video_vst3_panel(fs_idx);
         }
         #[cfg(windows)]
         if native_closed_idx.is_some() {
@@ -13310,6 +13315,41 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::ToggleVst3Gui => {
                 self.toggle_native_video_vst3_gui();
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::SetVst3PanelVisible { visible } => {
+                self.set_native_video_vst3_panel_visible(visible);
+                self.sync_native_video_vst3_panel(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::SetVst3VideoCompact { compact } => {
+                self.set_native_video_vst3_compact(compact);
+                self.sync_native_video_vst3_panel(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::Vst3ShowSlotGui { idx, path } => {
+                self.show_native_video_vst3_slot_gui(idx, path);
+                self.sync_native_video_vst3_panel(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::Vst3HideSlotGui { idx, path } => {
+                self.hide_native_video_vst3_slot_gui(idx, path);
+                self.sync_native_video_vst3_panel(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::Vst3SetBypass { idx, path, bypass } => {
+                self.set_native_video_vst3_slot_bypass(idx, path, bypass);
+                self.sync_native_video_vst3_panel(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::Vst3LoadChainSlot { slot_idx } => {
+                self.load_vst3_chain_slot(slot_idx);
+                self.sync_native_video_vst3_panel(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::Vst3SaveChainSlot { slot_idx } => {
+                self.save_vst3_chain_slot(slot_idx);
+                self.sync_native_video_vst3_panel(fs_idx);
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::SeekToStartAndPlay => {
@@ -13661,6 +13701,116 @@ impl App {
             return;
         };
         player.set_native_vst3_available(self.settings.vst3_enabled);
+    }
+
+    #[cfg(windows)]
+    fn sync_native_video_vst3_panel(&self, fs_idx: usize) {
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return;
+        };
+        let panel = self.build_native_video_vst3_panel();
+        player.set_native_vst3_panel(panel);
+    }
+
+    #[cfg(windows)]
+    fn build_native_video_vst3_panel(
+        &self,
+    ) -> Option<crate::video::native_presenter::NativeOverlayVst3Panel> {
+        if !self.settings.vst3_enabled || !self.show_vst3_manager {
+            return None;
+        }
+        use crate::video::dsp::{DspState, SlotState};
+        use crate::video::native_presenter::{
+            NativeOverlayVst3ChainSlot, NativeOverlayVst3Panel, NativeOverlayVst3Slot,
+            NativeOverlayVst3SlotState,
+        };
+
+        let bridge_state = self.dsp_bridge.state();
+        let state_text = match bridge_state {
+            DspState::Disabled => "disabled".to_string(),
+            DspState::Enabled => "enabled".to_string(),
+            DspState::Error(err) => format!("error: {err}"),
+        };
+        let disabled_reason = if bridge_state == DspState::Disabled {
+            self.dsp_bridge.session_disabled_reason()
+        } else {
+            None
+        };
+        let sample_rate = self.dsp_bridge.sample_rate();
+        let bridge_slots = self.dsp_bridge.slots();
+        let display_count = bridge_slots.len().max(self.settings.vst3_plugins.len());
+        let plugin_label = |path: &str| -> String {
+            std::path::Path::new(path)
+                .file_stem()
+                .or_else(|| std::path::Path::new(path).file_name())
+                .map(|name| name.to_string_lossy().to_string())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| "(unknown)".to_string())
+        };
+        let mut slots = Vec::with_capacity(display_count);
+        for idx in 0..display_count {
+            if let Some(slot) = bridge_slots.get(idx) {
+                let state = match slot.state {
+                    SlotState::Loading => NativeOverlayVst3SlotState::Loading,
+                    SlotState::Loaded => NativeOverlayVst3SlotState::Loaded,
+                    SlotState::Error => NativeOverlayVst3SlotState::Error,
+                };
+                let latency_ms = if sample_rate > 0 && slot.latency_samples > 0 {
+                    Some(slot.latency_samples as f64 / sample_rate as f64 * 1000.0)
+                } else {
+                    None
+                };
+                slots.push(NativeOverlayVst3Slot {
+                    idx,
+                    path: slot.plugin_path.clone(),
+                    name: slot
+                        .plugin_name
+                        .clone()
+                        .unwrap_or_else(|| plugin_label(&slot.plugin_path)),
+                    state,
+                    bypass: slot.bypass,
+                    gui_visible: slot.gui_visible,
+                    latency_ms,
+                    auto_bypassed_for_latency: slot.auto_bypassed_for_latency,
+                    placeholder: false,
+                });
+            } else if let Some(entry) = self.settings.vst3_plugins.get(idx) {
+                slots.push(NativeOverlayVst3Slot {
+                    idx,
+                    path: entry.path.clone(),
+                    name: plugin_label(&entry.path),
+                    state: NativeOverlayVst3SlotState::Placeholder,
+                    bypass: entry.bypass,
+                    gui_visible: !entry.user_hidden,
+                    latency_ms: None,
+                    auto_bypassed_for_latency: false,
+                    placeholder: true,
+                });
+            }
+        }
+
+        let chain_slots = self
+            .settings
+            .vst3_chain_slots
+            .slots
+            .iter()
+            .enumerate()
+            .map(|(idx, slot)| NativeOverlayVst3ChainSlot {
+                idx,
+                key_label: crate::adjustment::slot_key_label(idx),
+                name: slot.as_ref().map(|slot| slot.name.clone()),
+                plugin_count: slot.as_ref().map(|slot| slot.plugins.len()).unwrap_or(0),
+            })
+            .collect();
+
+        Some(NativeOverlayVst3Panel {
+            visible: true,
+            video_compact: self.settings.vst3_video_compact,
+            state_text,
+            disabled_reason,
+            slots,
+            chain_slots,
+        })
     }
 
     #[cfg(windows)]
@@ -14136,6 +14286,58 @@ impl App {
         std::sync::Arc::clone(&self.dsp_bridge).set_all_guis_visible_async(opening);
         self.settings.vst3_gui_visible = opening;
         self.settings.save();
+    }
+
+    #[cfg(windows)]
+    fn set_native_video_vst3_panel_visible(&mut self, visible: bool) {
+        self.show_vst3_manager = visible;
+    }
+
+    #[cfg(windows)]
+    fn set_native_video_vst3_compact(&mut self, compact: bool) {
+        if self.settings.vst3_video_compact == compact {
+            return;
+        }
+        self.settings.vst3_video_compact = compact;
+        self.settings.save();
+    }
+
+    #[cfg(windows)]
+    fn show_native_video_vst3_slot_gui(&mut self, idx: usize, path: String) {
+        std::sync::Arc::clone(&self.dsp_bridge).show_slot_gui_async(idx);
+        let mut changed = !self.settings.vst3_gui_visible;
+        self.settings.vst3_gui_visible = true;
+        if let Some(entry) = self.find_vst3_entry_mut(&path)
+            && entry.user_hidden
+        {
+            entry.user_hidden = false;
+            changed = true;
+        }
+        if changed {
+            self.settings.save();
+        }
+    }
+
+    #[cfg(windows)]
+    fn hide_native_video_vst3_slot_gui(&mut self, idx: usize, path: String) {
+        self.dsp_bridge.user_hide_slot_gui(idx);
+        if let Some(entry) = self.find_vst3_entry_mut(&path)
+            && !entry.user_hidden
+        {
+            entry.user_hidden = true;
+            self.settings.save();
+        }
+    }
+
+    #[cfg(windows)]
+    fn set_native_video_vst3_slot_bypass(&mut self, idx: usize, path: String, bypass: bool) {
+        self.dsp_bridge.set_bypass(idx, bypass);
+        if let Some(entry) = self.find_vst3_entry_mut(&path)
+            && entry.bypass != bypass
+        {
+            entry.bypass = bypass;
+            self.settings.save();
+        }
     }
 
     #[cfg(windows)]
