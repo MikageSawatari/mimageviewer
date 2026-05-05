@@ -141,7 +141,9 @@ Status:
   remains visible, the UI thread keeps a cheap foreground-only `HWND_TOP` raise
   at the 16ms native-input pump cadence while native fullscreen is active; this
   uses no TOPMOST pulse and only preserves the native HWND above its black
-  backdrop.
+  backdrop. The main viewport also draws only a black panel while native
+  fullscreen video is pending or active, so if Windows transiently exposes the
+  main HWND during activation/z-order churn the thumbnail grid is still masked.
 - 2026-05-05: while a native presenter HWND is active, the UI thread keeps a
   lightweight 16ms repaint pump alive even though video frames are presented on
   the native thread. This prevents native-window shortcut events such as Escape

@@ -13163,6 +13163,18 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn native_video_fullscreen_active_for_main_backdrop(&self) -> bool {
+        self.fullscreen_idx
+            .and_then(|idx| self.fs_cache.get(&idx))
+            .is_some_and(|entry| match entry {
+                FsCacheEntry::Video { player, .. } => {
+                    player.native_presenter_pending() || player.native_presenter_hwnd() != 0
+                }
+                _ => false,
+            })
+    }
+
+    #[cfg(windows)]
     fn handle_native_video_output_event(
         &mut self,
         ctx: &egui::Context,
@@ -14640,6 +14652,15 @@ impl eframe::App for App {
         #[cfg(windows)]
         self.ensure_native_video_front();
         let t_fullscreen_viewport = frame_t0.elapsed();
+
+        #[cfg(windows)]
+        if self.native_video_fullscreen_active_for_main_backdrop() {
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+                .show(ctx, |_ui| {});
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        }
 
         // 補正パネルでスライダーをドラッグ中に true → release で false の遷移を検知し、
         // サムネ補正テクスチャを全無効化する (次フレームに visible は同期適用、
