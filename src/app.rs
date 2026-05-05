@@ -13701,6 +13701,11 @@ impl App {
             return;
         };
         player.set_native_vst3_available(self.settings.vst3_enabled);
+        player.set_native_video_compact(
+            self.settings.vst3_enabled
+                && self.settings.vst3_gui_visible
+                && self.settings.vst3_video_compact,
+        );
     }
 
     #[cfg(windows)]

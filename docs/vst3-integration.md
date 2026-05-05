@@ -394,6 +394,12 @@ button clicks come back as native overlay events and are handled by the same
 is active, GUI close/bypass signals are still pumped on the UI thread so plugin
 window state stays synchronized with settings.
 
+Compact video mode is applied by the native presenter itself: the DComp video
+visual is transformed into the upper-right quarter while the black background
+remains full-screen. Presenter teardown is signaled from the UI thread but the
+thread join runs on a helper thread, so rapid video switching cannot freeze
+`App::update` if Win32 window creation/destruction stalls.
+
 The Preferences VST3 scanner reports probe progress over the scan worker
 channel. The UI drains progress messages and shows the current `(done/total)`
 count, plus the plugin currently being probed, while the bridge subprocess probe

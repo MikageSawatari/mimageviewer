@@ -69,6 +69,7 @@ pub struct NativeVideoPresenter {
     pixel_probe_enabled: bool,
     pixel_probe_strict: bool,
     last_pixel_probe: Option<Instant>,
+    video_compact: bool,
     width: u32,
     height: u32,
     surface_width: u32,
@@ -714,6 +715,7 @@ impl NativeVideoPresenter {
                 pixel_probe_strict: std::env::var_os("MIV_NATIVE_VIDEO_PIXEL_PROBE_STRICT")
                     .is_some(),
                 last_pixel_probe: None,
+                video_compact: false,
                 width: config.width,
                 height: config.height,
                 surface_width: config.width,
@@ -766,6 +768,19 @@ impl NativeVideoPresenter {
                 ("surface_width", Value::from(self.surface_width as i64)),
                 ("surface_height", Value::from(self.surface_height as i64)),
             ],
+        );
+        Ok(())
+    }
+
+    pub fn set_video_compact(&mut self, compact: bool) -> Result<(), String> {
+        if self.video_compact == compact {
+            return Ok(());
+        }
+        self.video_compact = compact;
+        self.update_video_visual_transform()?;
+        log_event(
+            "video_compact",
+            &[("compact", Value::from(self.video_compact))],
         );
         Ok(())
     }
@@ -1218,9 +1233,14 @@ impl NativeVideoPresenter {
         let surface_height = self.surface_height.max(1) as f32;
         let width = self.width.max(1) as f32;
         let height = self.height.max(1) as f32;
-        let scale = (width / surface_width).min(height / surface_height);
-        let offset_x = (width - surface_width * scale) * 0.5;
-        let offset_y = (height - surface_height * scale) * 0.5;
+        let (target_x, target_y, target_w, target_h) = if self.video_compact {
+            (width * 0.5, 0.0, width * 0.5, height * 0.5)
+        } else {
+            (0.0, 0.0, width, height)
+        };
+        let scale = (target_w / surface_width).min(target_h / surface_height);
+        let offset_x = target_x + (target_w - surface_width * scale) * 0.5;
+        let offset_y = target_y + (target_h - surface_height * scale) * 0.5;
         let transform = Matrix3x2 {
             M11: scale,
             M12: 0.0,
@@ -2333,18 +2353,7 @@ impl NativeEguiOverlay {
         let bottom_hud_visible = hud_visible || panel_chrome_visible;
         let paused_center_visible =
             !tile_overlay_visible && !is_playing && first_frame_presented && video_error.is_none();
-        let perf_origin = if panel_chrome_visible {
-            egui::pos2(
-                if jump_panel_visible {
-                    native_jump_panel_width() + 12.0
-                } else {
-                    14.0
-                },
-                native_panel_top() + 8.0,
-            )
-        } else {
-            egui::pos2(14.0, 14.0)
-        };
+        let perf_origin = egui::pos2(14.0, 14.0);
         let overlay_visible = tile_overlay_visible
             || bottom_hud_visible
             || panel_chrome_visible
@@ -3981,7 +3990,7 @@ fn draw_native_vst3_panel(
     panel: &NativeOverlayVst3Panel,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
-    let rect = native_vst3_panel_rect(overlay_width_points, overlay_height_points);
+    let rect = native_vst3_panel_rect(overlay_width_points, overlay_height_points, panel);
     egui::Area::new(egui::Id::new("native_video_vst3_panel"))
         .order(egui::Order::Foreground)
         .fixed_pos(rect.min)
@@ -4057,7 +4066,7 @@ fn draw_native_vst3_panel(
                 ui.separator();
                 egui::ScrollArea::vertical()
                     .id_salt("native_vst3_panel_scroll")
-                    .max_height((rect.height() - 150.0).max(120.0))
+                    .max_height(native_vst3_slot_list_height(panel))
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if panel.slots.is_empty() {
@@ -4580,15 +4589,25 @@ fn native_metadata_panel_rect(overlay_width_points: f32, overlay_height_points: 
     )
 }
 
-fn native_vst3_panel_rect(overlay_width_points: f32, overlay_height_points: f32) -> egui::Rect {
+fn native_vst3_panel_rect(
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    panel: &NativeOverlayVst3Panel,
+) -> egui::Rect {
     let width = 380.0_f32.min((overlay_width_points - 32.0).max(260.0));
-    let height = (overlay_height_points - native_panel_top() - 56.0)
-        .clamp(280.0, 620.0)
-        .min((overlay_height_points - 72.0).max(240.0));
+    let row_count = panel.slots.len().max(1).min(10) as f32;
+    let desired_height = 154.0 + row_count * 28.0;
+    let max_height = (overlay_height_points - native_panel_top() - 56.0).max(240.0);
+    let height = desired_height.clamp(236.0, max_height.min(620.0));
     egui::Rect::from_min_size(
         egui::pos2(18.0, native_panel_top() + 10.0),
         egui::vec2(width, height),
     )
+}
+
+fn native_vst3_slot_list_height(panel: &NativeOverlayVst3Panel) -> f32 {
+    let row_count = panel.slots.len().max(1).min(10) as f32;
+    (row_count * 28.0 + 8.0).min(288.0)
 }
 
 fn metadata_clean_text(value: &str) -> String {

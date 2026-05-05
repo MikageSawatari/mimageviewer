@@ -271,6 +271,9 @@ enum NativeVideoOutputCommand {
     SetVst3Available {
         available: bool,
     },
+    SetVideoCompact {
+        compact: bool,
+    },
     SetVst3Panel {
         panel: Option<native_presenter::NativeOverlayVst3Panel>,
     },
@@ -418,6 +421,12 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::SetVst3Available { available });
     }
 
+    fn set_video_compact(&self, compact: bool) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetVideoCompact { compact });
+    }
+
     fn set_vst3_panel(&self, panel: Option<native_presenter::NativeOverlayVst3Panel>) {
         let _ = self
             .command_tx
@@ -462,7 +471,11 @@ impl Drop for NativeVideoOutput {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+            let _ = std::thread::Builder::new()
+                .name("native-video-output-drop-join".to_string())
+                .spawn(move || {
+                    let _ = thread.join();
+                });
         }
     }
 }
@@ -873,6 +886,13 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetVst3Available { available } => {
                     presenter.set_overlay_vst3_available(available);
+                }
+                NativeVideoOutputCommand::SetVideoCompact { compact } => {
+                    if let Err(err) = presenter.set_video_compact(compact) {
+                        crate::logger::log(format!(
+                            "[native-video] set compact transform failed: {err}"
+                        ));
+                    }
                 }
                 NativeVideoOutputCommand::SetVst3Panel { panel } => {
                     presenter.set_overlay_vst3_panel(panel);
@@ -1870,6 +1890,13 @@ impl VideoPlayer {
     pub fn set_native_vst3_available(&self, available: bool) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_vst3_available(available);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_video_compact(&self, compact: bool) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_video_compact(compact);
         }
     }
 
