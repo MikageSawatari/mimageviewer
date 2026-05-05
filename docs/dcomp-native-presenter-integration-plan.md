@@ -121,9 +121,11 @@ Status:
   legacy viewport is still kept available for fallback before native HWND
   creation, but it must not cover the native DComp presenter after startup.
 - 2026-05-05: the UI thread re-raises the native HWND for a short startup window
-  after the presenter HWND appears. This absorbs a double-click startup race
-  where the main thumbnail grid can reclaim z-order after the first raise while
-  the native presenter is already playing.
+  after the presenter HWND appears, then continues a throttled foreground-only
+  z-order maintenance pulse while native fullscreen is active. The pulse briefly
+  moves the video HWND through the TOPMOST band and demotes it immediately, so
+  the main thumbnail grid cannot reclaim z-order during double-click startup
+  without leaving the video window above other applications after Alt-Tab.
 - 2026-05-05: while a native presenter HWND is active, the UI thread keeps a
   lightweight 16ms repaint pump alive even though video frames are presented on
   the native thread. This prevents native-window shortcut events such as Escape

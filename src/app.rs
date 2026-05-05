@@ -2434,6 +2434,11 @@ pub struct App {
     /// thumbnail grid が前面に残る race がある。
     native_video_front_raise_until: Option<std::time::Instant>,
     #[cfg(windows)]
+    /// Native HWND の z-order maintenance を間引くための最終 raise 時刻。
+    /// 起動後の短い window-operation race だけでなく、main grid が後勝ちで前面化した
+    /// 場合にも mIV が foreground の間だけ低頻度に補正する。
+    native_video_front_last_raise: Option<std::time::Instant>,
+    #[cfg(windows)]
     /// Native fullscreen presenter 上の左クリック候補。overlay hit-test が入るまでの
     /// 暫定 transport 操作用で、drag と click を release 時に分ける。
     native_video_pointer_down: Option<NativeVideoPointerDown>,
@@ -2962,6 +2967,8 @@ impl Default for App {
             native_video_front_synced_hwnd: 0,
             #[cfg(windows)]
             native_video_front_raise_until: None,
+            #[cfg(windows)]
+            native_video_front_last_raise: None,
             #[cfg(windows)]
             native_video_pointer_down: None,
             placement_slot: None,
@@ -10911,6 +10918,7 @@ impl App {
             self.vst3_deferred_video_open = None;
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_raise_until = None;
+            self.native_video_front_last_raise = None;
             self.native_video_pointer_down = None;
         }
         #[cfg(windows)]
@@ -11139,8 +11147,9 @@ impl App {
     ///
     /// Phase 3 アーキテクチャ:
     /// - メイン: 常に DirectML で AiRuntime を作る (`ai_backend` 設定値に依らない)
-    /// - 設定が TensorRt: 別プロセス TrtWorkerPool を起動して runtime に attach
-    ///   (失敗時は DirectML のみで動作、UI で通知)
+    /// - 起動時は TensorRT 設定でも worker pool を自動起動しない。CUDA/TensorRT
+    ///   provider DLL はプロセス境界外とはいえ driver crash を誘発し得るため、実際に
+    ///   AI 処理が必要になったタイミングで遅延起動する。
     pub(crate) fn ensure_ai_runtime(&mut self) {
         if self.ai_runtime.is_none() {
             // 常に DirectML で起動 (Phase 3)
@@ -11153,25 +11162,6 @@ impl App {
                     ));
                     let runtime_arc = std::sync::Arc::new(rt);
 
-                    // 設定が TRT のとき、子プロセスでワーカープールを起動して attach。
-                    // pack 未インストールの場合は試行せず DirectML 単独で動作 (= UI 側で
-                    // 「パック未インストール」表記を出す。`apply_ai_backend_change` と同じ
-                    // ガード)。
-                    let want_trt = self
-                        .settings
-                        .ai_backend
-                        .as_deref()
-                        .and_then(crate::ai::AiBackend::from_str)
-                        == Some(crate::ai::AiBackend::TensorRt);
-                    if want_trt && crate::ai::tensorrt_pack::is_pack_installed() {
-                        Self::spawn_trt_worker_pool(&runtime_arc);
-                    } else if want_trt {
-                        crate::logger::log(
-                            "[AI] 起動時 TensorRT 選択中だが pack 未インストール、DirectML で動作"
-                                .to_string(),
-                        );
-                    }
-
                     self.ai_runtime = Some(runtime_arc);
                 }
                 Err(e) => {
@@ -11179,6 +11169,29 @@ impl App {
                 }
             }
         }
+    }
+
+    fn maybe_start_trt_worker_pool_for_ai_use(
+        &self,
+        runtime: &std::sync::Arc<crate::ai::runtime::AiRuntime>,
+    ) {
+        let want_trt = self
+            .settings
+            .ai_backend
+            .as_deref()
+            .and_then(crate::ai::AiBackend::from_str)
+            == Some(crate::ai::AiBackend::TensorRt);
+        if !want_trt || runtime.has_worker_pool() {
+            return;
+        }
+        if !crate::ai::tensorrt_pack::is_pack_installed() {
+            crate::logger::log(
+                "[AI] TensorRT 選択中だが pack 未インストール、DirectML で動作".to_string(),
+            );
+            return;
+        }
+        crate::logger::log("[AI] TensorRT worker pool を初回 AI 処理で遅延起動します".to_string());
+        Self::spawn_trt_worker_pool_guarded(runtime, self.trt_restart_in_flight.clone());
     }
 
     /// TRT ワーカープールをバックグラウンドで起動して runtime に attach する。
@@ -11444,6 +11457,7 @@ impl App {
         let Some(runtime) = self.ai_runtime.clone() else {
             return;
         };
+        self.maybe_start_trt_worker_pool_for_ai_use(&runtime);
         let manager = self.ai_model_manager.clone();
 
         // デノイズモデル選択・ロード
@@ -13059,6 +13073,7 @@ impl App {
         if native_closed_idx.is_some() {
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_raise_until = None;
+            self.native_video_front_last_raise = None;
             self.close_fullscreen();
             return;
         }
@@ -13096,6 +13111,7 @@ impl App {
         if self.fullscreen_idx.is_none() {
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_raise_until = None;
+            self.native_video_front_last_raise = None;
             return;
         }
         let hwnd = self
@@ -13112,21 +13128,32 @@ impl App {
         if hwnd == 0 {
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_raise_until = None;
+            self.native_video_front_last_raise = None;
             return;
         }
         let now = std::time::Instant::now();
         let is_new_hwnd = hwnd != self.native_video_front_synced_hwnd;
         if is_new_hwnd {
             self.native_video_front_synced_hwnd = hwnd;
-            self.native_video_front_raise_until = Some(now + std::time::Duration::from_secs(1));
-        } else if self
+            self.native_video_front_raise_until = Some(now + std::time::Duration::from_secs(3));
+            self.native_video_front_last_raise = None;
+        }
+
+        let in_startup_boost = self
             .native_video_front_raise_until
-            .is_none_or(|deadline| now >= deadline)
-        {
+            .is_some_and(|deadline| now < deadline);
+        let periodic_due = self.native_video_front_last_raise.is_none_or(|last| {
+            now.saturating_duration_since(last) >= std::time::Duration::from_millis(100)
+        });
+        if !is_new_hwnd && !in_startup_boost && !periodic_due {
+            return;
+        }
+        if !crate::video::native_window::foreground_belongs_to_current_process() {
             return;
         }
 
         if crate::video::native_window::bring_to_front(hwnd) {
+            self.native_video_front_last_raise = Some(now);
             if is_new_hwnd {
                 crate::video::native_window::log_state(hwnd, "raised");
                 crate::logger::log(format!(
