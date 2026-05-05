@@ -390,6 +390,13 @@ fn native_reset_unpresented_frame(mut frame: VideoFrame) {
 }
 
 #[cfg(windows)]
+fn native_drain_unpresented_queue(queue: &mut std::collections::VecDeque<VideoFrame>) {
+    while let Some(frame) = queue.pop_front() {
+        native_reset_unpresented_frame(frame);
+    }
+}
+
+#[cfg(windows)]
 fn native_source_pacing_delay(
     last_pts: Option<f64>,
     last_wall: Option<std::time::Instant>,
@@ -474,6 +481,8 @@ fn run_native_video_output(
     let mut last_summary_log = Instant::now();
     let mut last_present_log = Instant::now();
     let mut last_overlay_tick = Instant::now();
+    let mut source_pacing_sleep_count: u64 = 0;
+    let mut source_pacing_sleep_total_ms = 0.0_f64;
     let mut native_events = Vec::new();
     let trace_every_present = std::env::var_os("MIV_NATIVE_VIDEO_PRESENT_TRACE").is_some();
     while !cancel.load(Ordering::Acquire) {
@@ -534,7 +543,7 @@ fn run_native_video_output(
 
         let clock_serial = clock.current_seek_serial();
         if clock_serial != last_seen_serial {
-            queue.clear();
+            native_drain_unpresented_queue(&mut queue);
             last_seen_serial = clock_serial;
             first_frame_event_last_epoch = None;
             last_present_source_pts = None;
@@ -544,7 +553,7 @@ fn run_native_video_output(
                 continue;
             }
             if frame.seek_serial > last_seen_serial {
-                queue.clear();
+                native_drain_unpresented_queue(&mut queue);
                 last_seen_serial = frame.seek_serial;
                 first_frame_event_last_epoch = None;
                 last_present_source_pts = None;
@@ -578,6 +587,8 @@ fn run_native_video_output(
                 native_source_pacing_delay(last_present_source_pts, last_present_wall, pts)
             {
                 queue.push_front(frame);
+                source_pacing_sleep_count = source_pacing_sleep_count.saturating_add(1);
+                source_pacing_sleep_total_ms += delay.as_secs_f64() * 1000.0;
                 std::thread::sleep(delay);
                 continue;
             }
@@ -600,6 +611,26 @@ fn run_native_video_output(
                     present_stats.record_present(&outcome, late_ms, total_ms, interval_ms);
                     if last_summary_log.elapsed() >= Duration::from_secs(1) {
                         present_stats.emit_summary(run_started.elapsed());
+                        if source_pacing_sleep_count > 0 && crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "native_presenter",
+                                "source_pacing_summary",
+                                None,
+                                0,
+                                &[
+                                    (
+                                        "count",
+                                        serde_json::Value::from(source_pacing_sleep_count as i64),
+                                    ),
+                                    (
+                                        "total_ms",
+                                        serde_json::Value::from(source_pacing_sleep_total_ms),
+                                    ),
+                                ],
+                            );
+                        }
+                        source_pacing_sleep_count = 0;
+                        source_pacing_sleep_total_ms = 0.0;
                         last_summary_log = Instant::now();
                     }
                     displayed_frame_seq.fetch_add(1, Ordering::Release);

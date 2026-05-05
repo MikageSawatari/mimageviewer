@@ -103,11 +103,14 @@ impl D3d11Frame {
     /// Return an unpresented pooled output texture from key=1 to key=0 before
     /// releasing its slot. This is needed when the decoder cannot enqueue a
     /// freshly produced GPU frame; no presenter will acquire/read it.
+    ///
+    /// Drop intentionally does not reset keyed-mutex ownership. Any path that
+    /// discards an unpresented pooled GPU frame must call this first.
     pub fn reset_unpresented_shared_output(&mut self) {
         let Some(mutex) = self.shared_output_keyed_mutex.take() else {
             return;
         };
-        match unsafe { mutex.AcquireSync(1, 100) } {
+        match unsafe { mutex.AcquireSync(1, 10) } {
             Ok(()) => unsafe {
                 let _ = mutex.ReleaseSync(0);
             },
