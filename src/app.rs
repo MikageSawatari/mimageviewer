@@ -13143,32 +13143,24 @@ impl App {
             self.native_video_front_last_raise = None;
             return;
         }
-        let now = std::time::Instant::now();
         let is_new_hwnd = hwnd != self.native_video_front_synced_hwnd;
-        if is_new_hwnd {
-            self.native_video_front_last_raise = None;
-        }
-
-        let periodic_due = self.native_video_front_last_raise.is_none_or(|last| {
-            now.saturating_duration_since(last) >= std::time::Duration::from_millis(16)
-        });
-        if !is_new_hwnd && !periodic_due {
-            return;
-        }
-        if !crate::video::native_window::foreground_belongs_to_current_process() {
+        if !is_new_hwnd {
             return;
         }
 
-        if crate::video::native_window::bring_to_front(hwnd) {
-            self.native_video_front_last_raise = Some(now);
-            if is_new_hwnd {
-                self.native_video_front_synced_hwnd = hwnd;
-                crate::video::native_window::log_state(hwnd, "raised");
-                crate::logger::log(format!(
-                    "[native-video] raised fullscreen presenter hwnd=0x{hwnd:x}"
-                ));
-            }
-        }
+        // The native HWND is created and raised on the presenter thread. Calling
+        // SetWindowPos on that HWND from the egui UI thread can synchronously
+        // cross into the presenter thread / DWM while HUD seek and overlay input
+        // are active, which has produced UI-thread hangs. Owner z-order plus the
+        // fullscreen black backdrop now cover the startup race, so the UI thread
+        // only records the new HWND and leaves z-order mutation to its owner
+        // thread.
+        self.native_video_front_synced_hwnd = hwnd;
+        self.native_video_front_last_raise = Some(std::time::Instant::now());
+        crate::video::native_window::log_state(hwnd, "synced");
+        crate::logger::log(format!(
+            "[native-video] synced fullscreen presenter hwnd=0x{hwnd:x}"
+        ));
     }
 
     #[cfg(windows)]

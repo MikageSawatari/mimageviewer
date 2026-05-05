@@ -121,12 +121,12 @@ Status:
   legacy viewport is still kept available for fallback before native HWND
   creation, but it must not cover the native DComp presenter after startup.
 - 2026-05-05: the native fullscreen HWND is created as an owned popup of the
-  main mIV HWND when that owner is available. The UI thread still performs a
-  throttled foreground-only `HWND_TOP` raise during the startup window, but it
-  no longer pulses through the TOPMOST band and the startup boost is throttled.
-  This keeps the thumbnail grid from reclaiming z-order during double-click
-  startup without causing visible TOPMOST flicker or leaving the video window
-  above other applications after Alt-Tab.
+  main mIV HWND when that owner is available. The presenter thread raises the
+  native HWND when it creates the window; the egui UI thread does not issue
+  periodic `SetWindowPos` calls against that cross-thread HWND. This avoids
+  UI-thread hangs in Win32/DWM z-order mutation while HUD seek and overlay input
+  are active, and relies on the owner relationship plus the black fullscreen
+  backdrop to keep the thumbnail grid hidden during startup.
 - 2026-05-05: while the native presenter thread is starting, before its first
   native frame has presented, or before the UI thread has raised the native HWND
   at least once, the legacy egui fullscreen viewport is shown as an opaque black
@@ -141,22 +141,20 @@ Status:
   viewport's hide/activation transition from briefly revealing the thumbnail
   grid if Windows reorders regular HWND composition for one frame. The backdrop
   is hidden only by the normal fullscreen-exit path. Because the backdrop
-  remains visible, the UI thread keeps a cheap foreground-only `HWND_TOP` raise
-  at the 16ms native-input pump cadence while native fullscreen is active; this
-  uses no TOPMOST pulse and only preserves the native HWND above its black
-  backdrop. The main viewport also draws only a black panel whenever the current
-  fullscreen target is a video and the native presenter is enabled, even before
-  the `VideoPlayer` has populated `fs_cache`, so if Windows transiently exposes
-  the main HWND during activation/z-order churn the thumbnail grid is still
-  masked. The main HWND's DWM caption and border colors are set to black only
-  while native video fullscreen is active, then restored to theme-aware DWM
-  defaults after exit (including the effective Light/Dark mode). The black
-  override is applied after the fullscreen/backdrop viewport has been drawn and
-  restored only after the viewport hide has had a short DWM settling window, so
-  the chrome color change does not lead or trail the fullscreen transition by a
-  visible frame. This avoids white non-client title-bar/border flashes without
-  toggling `ViewportCommand::Decorations`, which can resize the main client area
-  and disturb the thumbnail grid when fullscreen exits.
+  remains visible, there is no need for UI-thread z-order polling. The main
+  viewport also draws only a black panel whenever the current fullscreen target
+  is a video and the native presenter is enabled, even before the `VideoPlayer`
+  has populated `fs_cache`, so if Windows transiently exposes the main HWND
+  during activation/z-order churn the thumbnail grid is still masked. The main
+  HWND's DWM caption and border colors are set to black only while native video
+  fullscreen is active, then restored to theme-aware DWM defaults after exit
+  (including the effective Light/Dark mode). The black override is applied
+  after the fullscreen/backdrop viewport has been drawn and restored only after
+  the viewport hide has had a short DWM settling window, so the chrome color
+  change does not lead or trail the fullscreen transition by a visible frame.
+  This avoids white non-client title-bar/border flashes without toggling
+  `ViewportCommand::Decorations`, which can resize the main client area and
+  disturb the thumbnail grid when fullscreen exits.
 - 2026-05-05: the Rust panic hook is complemented by a Windows native exception
   handler and a UI heartbeat watchdog. Native access violations are appended to
   `panic.log`, while an `App::update` heartbeat gap of more than five seconds is
