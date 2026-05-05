@@ -91,8 +91,13 @@ pub mod xmp_reader;
 pub mod xmp_writer;
 pub mod zip_loader;
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Instant;
+
+static NATIVE_EXCEPTION_LOGGING: AtomicBool = AtomicBool::new(false);
 
 /// `startup.<step>` perf イベントを emit する共通ヘルパー。
 /// `phase_start` を渡すと当該フェーズの `ms` + 累計 `total_ms` を、
@@ -200,18 +205,90 @@ fn install_panic_log_hook() {
         let bt = std::backtrace::Backtrace::force_capture();
         let msg = format!("PANIC at {location}: {payload}\n{bt}");
         logger::log(&msg);
-        let log_dir = data_dir::logs_dir();
-        let _ = std::fs::create_dir_all(&log_dir);
-        let panic_log = log_dir.join("panic.log");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&panic_log)
-        {
-            use std::io::Write;
-            let _ = writeln!(f, "[{:?}] {msg}", std::time::SystemTime::now());
-        }
+        append_panic_log_entry(&msg);
     }));
+}
+
+fn append_panic_log_entry(msg: &str) {
+    let log_dir = data_dir::logs_dir();
+    let _ = std::fs::create_dir_all(&log_dir);
+    let panic_log = log_dir.join("panic.log");
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&panic_log)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "[{:?}] {msg}", std::time::SystemTime::now());
+    }
+}
+
+#[cfg(windows)]
+fn install_native_exception_log_hook() {
+    use windows::Win32::System::Diagnostics::Debug::AddVectoredExceptionHandler;
+
+    unsafe {
+        let handle = AddVectoredExceptionHandler(1, Some(native_exception_handler));
+        if handle.is_null() {
+            logger::log("native exception logger: AddVectoredExceptionHandler failed");
+        } else {
+            logger::log("native exception logger: installed vectored exception handler");
+        }
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn native_exception_handler(
+    info: *mut windows::Win32::System::Diagnostics::Debug::EXCEPTION_POINTERS,
+) -> i32 {
+    use windows::Win32::System::Diagnostics::Debug::EXCEPTION_CONTINUE_SEARCH;
+
+    let Some(info) = (unsafe { info.as_ref() }) else {
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
+    let Some(record) = (unsafe { info.ExceptionRecord.as_ref() }) else {
+        return EXCEPTION_CONTINUE_SEARCH;
+    };
+    let code = record.ExceptionCode.0 as u32;
+    if !matches!(
+        code,
+        0xC000_0005 // EXCEPTION_ACCESS_VIOLATION
+            | 0xC000_00FD // EXCEPTION_STACK_OVERFLOW
+            | 0x8000_0003 // EXCEPTION_BREAKPOINT
+            | 0xC000_001D // EXCEPTION_ILLEGAL_INSTRUCTION
+            | 0xC000_0094 // EXCEPTION_INT_DIVIDE_BY_ZERO
+            | 0xC000_0095 // EXCEPTION_FLT_OVERFLOW
+            | 0xC000_0374 // STATUS_HEAP_CORRUPTION
+    ) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    if NATIVE_EXCEPTION_LOGGING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        let tid = logger::current_thread_id_num()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        let mut details = format!(
+            "NATIVE EXCEPTION code=0x{code:08X} flags=0x{:08X} address={:p} thread={tid}",
+            record.ExceptionFlags, record.ExceptionAddress
+        );
+        if code == 0xC000_0005 {
+            let access_kind = match record.ExceptionInformation[0] {
+                0 => "read",
+                1 => "write",
+                8 => "execute",
+                _ => "unknown",
+            };
+            let access_address = record.ExceptionInformation[1] as *const core::ffi::c_void;
+            details.push_str(&format!(" access={access_kind} target={access_address:p}"));
+        }
+        append_panic_log_entry(&details);
+        NATIVE_EXCEPTION_LOGGING.store(false, Ordering::Release);
+    }
+
+    EXCEPTION_CONTINUE_SEARCH
 }
 
 fn main() -> eframe::Result {
@@ -278,6 +355,8 @@ fn main() -> eframe::Result {
     data_dir::init();
     let data_dir_elapsed = t0.elapsed();
     install_panic_log_hook();
+    #[cfg(windows)]
+    install_native_exception_log_hook();
 
     // デバッグビルドでは常にログ出力。リリースビルドでは --log 引数で有効化
     let log_enabled = cfg!(debug_assertions) || std::env::args().any(|a| a == "--log");

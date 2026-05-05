@@ -15,7 +15,8 @@
 
 use windows::Win32::Foundation::{HWND, LPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_COLOR_DEFAULT, DWMWA_TRANSITIONS_FORCEDISABLED,
+    DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::EnumThreadWindows;
@@ -49,19 +50,35 @@ pub fn disable_transitions_for_window(hwnd: HWND) {
 }
 
 pub fn set_window_chrome_black(hwnd: HWND) {
-    let black: u32 = 0x000000;
+    set_window_chrome_color(hwnd, 0x000000);
+}
+
+pub fn restore_window_chrome_for_theme(hwnd: HWND, dark: bool) {
+    let dark_mode: i32 = if dark { 1 } else { 0 };
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &dark_mode as *const i32 as *const _,
+            std::mem::size_of::<i32>() as u32,
+        );
+    }
+    set_window_chrome_color(hwnd, DWMWA_COLOR_DEFAULT);
+}
+
+fn set_window_chrome_color(hwnd: HWND, color: u32) {
     let size = std::mem::size_of::<u32>() as u32;
     unsafe {
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_CAPTION_COLOR,
-            &black as *const u32 as *const _,
+            &color as *const u32 as *const _,
             size,
         );
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_BORDER_COLOR,
-            &black as *const u32 as *const _,
+            &color as *const u32 as *const _,
             size,
         );
     }

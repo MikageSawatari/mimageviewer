@@ -2434,9 +2434,15 @@ pub struct App {
     /// 16ms pump に合わせて通常の HWND_TOP raise を保つ。
     native_video_front_last_raise: Option<std::time::Instant>,
     #[cfg(windows)]
+    /// Native fullscreen 中だけ main HWND の DWM caption/border を黒へ寄せているか。
+    /// `Decorations` は client area を変えるため使わない。
+    native_video_main_chrome_black: bool,
+    #[cfg(windows)]
     /// Native fullscreen presenter 上の左クリック候補。overlay hit-test が入るまでの
     /// 暫定 transport 操作用で、drag と click を release 時に分ける。
     native_video_pointer_down: Option<NativeVideoPointerDown>,
+    /// ハング調査用: UI thread が最後に `App::update` を通過した時刻を通常ログへ残す。
+    last_ui_heartbeat_log: std::time::Instant,
     /// 共有プレースメントスロット。UI スレッドが hide 時にセット、トレイスレッドが
     /// show 時に take して `SetWindowPlacement` する。トレイスレッドから Win32 を直接
     /// 叩けるようにすることで、復帰時の黒フラッシュ / サイズジャンプを防ぐ。
@@ -2963,7 +2969,10 @@ impl Default for App {
             #[cfg(windows)]
             native_video_front_last_raise: None,
             #[cfg(windows)]
+            native_video_main_chrome_black: false,
+            #[cfg(windows)]
             native_video_pointer_down: None,
+            last_ui_heartbeat_log: std::time::Instant::now(),
             placement_slot: None,
             activation_listener: None,
             shutdown_requested: Arc::new(AtomicBool::new(false)),
@@ -8698,6 +8707,10 @@ impl App {
         // スタックで管理する (画像移動でさらにクリアされる)。
         self.clear_meta_undo();
         self.fullscreen_idx = Some(idx);
+        #[cfg(windows)]
+        if self.native_video_fullscreen_active_for_main_backdrop() {
+            self.sync_native_video_main_chrome(true);
+        }
         self.adjust_spread_target = AdjustSpreadTarget::Left;
         // PDF pool の Critical 予約を ON: 現在ページのレンダリング用に 1 ワーカー確保。
         // グリッドに戻ったら OFF に戻し、全 3 ワーカーを Normal に使えるようにする。
@@ -10912,6 +10925,7 @@ impl App {
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
             self.native_video_pointer_down = None;
+            self.sync_native_video_main_chrome(false);
         }
         #[cfg(windows)]
         if self.show_vst3_manager || self.settings.vst3_gui_visible {
@@ -13172,6 +13186,27 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn sync_native_video_main_chrome(&mut self, active: bool) {
+        if active == self.native_video_main_chrome_black {
+            return;
+        }
+        let Some(hwnd_raw) = self.main_hwnd else {
+            return;
+        };
+        let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut _);
+        if active {
+            crate::dwm_transitions::set_window_chrome_black(hwnd);
+        } else {
+            let dark = matches!(
+                crate::os_theme::resolve(self.settings.ui_theme),
+                crate::os_theme::ResolvedTheme::Dark
+            );
+            crate::dwm_transitions::restore_window_chrome_for_theme(hwnd, dark);
+        }
+        self.native_video_main_chrome_black = active;
+    }
+
+    #[cfg(windows)]
     fn handle_native_video_output_event(
         &mut self,
         ctx: &egui::Context,
@@ -14150,6 +14185,28 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let now = std::time::Instant::now();
+        if now.saturating_duration_since(self.last_ui_heartbeat_log)
+            >= std::time::Duration::from_secs(1)
+        {
+            crate::logger::log(format!(
+                "[heartbeat] app_update fullscreen={:?} native_main_backdrop={} main_hwnd={:?}",
+                self.fullscreen_idx,
+                {
+                    #[cfg(windows)]
+                    {
+                        self.native_video_fullscreen_active_for_main_backdrop()
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        false
+                    }
+                },
+                self.main_hwnd
+            ));
+            self.last_ui_heartbeat_log = now;
+        }
+
         // メインウィンドウの HWND を最初のフレームで取得 (Win32 ShowWindow 用)。
         // eframe::Frame::window_handle() は raw_window_handle::WindowHandle を返す。
         // Windows では Win32WindowHandle の hwnd フィールドに HWND が入る。
@@ -14162,10 +14219,6 @@ impl eframe::App for App {
                     self.main_hwnd = Some(hwnd_raw);
                     #[cfg(windows)]
                     self.dsp_bridge.set_main_hwnd(hwnd_raw as u64);
-                    #[cfg(windows)]
-                    crate::dwm_transitions::set_window_chrome_black(
-                        windows::Win32::Foundation::HWND(hwnd_raw as *mut _),
-                    );
                     crate::logger::log(format!("tray: captured main HWND = {hwnd_raw:#x}"));
                     // アクティベーションリスナーに placement_slot を共有するため、
                     // ここでスロットを作成しておく (sync_tray_with_settings での遅延作成と
@@ -14446,6 +14499,15 @@ impl eframe::App for App {
         if self.applied_ui_theme != Some(resolved_theme) {
             crate::os_theme::apply_resolved(ctx, resolved_theme);
             self.applied_ui_theme = Some(resolved_theme);
+            #[cfg(windows)]
+            if !self.native_video_main_chrome_black
+                && let Some(hwnd_raw) = self.main_hwnd
+            {
+                crate::dwm_transitions::restore_window_chrome_for_theme(
+                    windows::Win32::Foundation::HWND(hwnd_raw as *mut _),
+                    matches!(resolved_theme, crate::os_theme::ResolvedTheme::Dark),
+                );
+            }
         }
 
         // 初回フレームで前回フォルダを復元
@@ -14657,6 +14719,7 @@ impl eframe::App for App {
         #[cfg(windows)]
         {
             let native_main_backdrop = self.native_video_fullscreen_active_for_main_backdrop();
+            self.sync_native_video_main_chrome(native_main_backdrop);
             if native_main_backdrop {
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
