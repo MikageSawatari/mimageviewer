@@ -301,6 +301,9 @@ remain stable across frames; `OpenSharedResource1` should be limited to pool
 warmup and source size/format changes. The presenter treats keyed-mutex read
 ownership as a fail-fast check after the shared fence has completed, avoiding a
 long presenter-thread stall if a pooled texture is not immediately readable.
+Trace events split `keyed_mutex_ms` into `keyed_mutex_cast_ms` and
+`keyed_mutex_acquire_ms` so Phase D can distinguish COM interface lookup from
+the `AcquireSync(1)` wait.
 The pool size tracks the existing video frame channel depth so startup does not
 create more shared textures than the playback queue can reasonably hold.
 The native presenter drains due frames in source PTS order rather than replacing

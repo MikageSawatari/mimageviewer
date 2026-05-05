@@ -102,6 +102,8 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
     present_fence_wait_ms: list[float] = []
     present_open_shared_ms: list[float] = []
     present_keyed_mutex_ms: list[float] = []
+    present_keyed_mutex_cast_ms: list[float] = []
+    present_keyed_mutex_acquire_ms: list[float] = []
     present_copy_call_ms: list[float] = []
     present_total_ms: list[float] = []
     present_shared_handles: set[int] = set()
@@ -188,6 +190,12 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
                 keyed_mutex_ms = event.get("keyed_mutex_ms")
                 if isinstance(keyed_mutex_ms, (int, float)):
                     present_keyed_mutex_ms.append(float(keyed_mutex_ms))
+                keyed_mutex_cast_ms = event.get("keyed_mutex_cast_ms")
+                if isinstance(keyed_mutex_cast_ms, (int, float)):
+                    present_keyed_mutex_cast_ms.append(float(keyed_mutex_cast_ms))
+                keyed_mutex_acquire_ms = event.get("keyed_mutex_acquire_ms")
+                if isinstance(keyed_mutex_acquire_ms, (int, float)):
+                    present_keyed_mutex_acquire_ms.append(float(keyed_mutex_acquire_ms))
                 copy_call_ms = event.get("copy_call_ms")
                 if isinstance(copy_call_ms, (int, float)):
                     present_copy_call_ms.append(float(copy_call_ms))
@@ -229,6 +237,10 @@ def analyze_perf(path: Path) -> dict[str, float | int]:
         "native_open_shared_ms_max": max(present_open_shared_ms, default=0.0),
         "native_keyed_mutex_ms_p95": percentile(present_keyed_mutex_ms, 0.95),
         "native_keyed_mutex_ms_max": max(present_keyed_mutex_ms, default=0.0),
+        "native_keyed_mutex_cast_ms_p95": percentile(present_keyed_mutex_cast_ms, 0.95),
+        "native_keyed_mutex_cast_ms_max": max(present_keyed_mutex_cast_ms, default=0.0),
+        "native_keyed_mutex_acquire_ms_p95": percentile(present_keyed_mutex_acquire_ms, 0.95),
+        "native_keyed_mutex_acquire_ms_max": max(present_keyed_mutex_acquire_ms, default=0.0),
         "native_copy_call_ms_p95": percentile(present_copy_call_ms, 0.95),
         "native_copy_call_ms_max": max(present_copy_call_ms, default=0.0),
         "native_total_ms_p95": percentile(present_total_ms, 0.95),

@@ -114,6 +114,8 @@ pub struct NativePresentOutcome {
     pub fence_wait_ms: f64,
     pub open_shared_ms: f64,
     pub keyed_mutex_ms: f64,
+    pub keyed_mutex_cast_ms: f64,
+    pub keyed_mutex_acquire_ms: f64,
     pub copy_call_ms: f64,
     pub copy_ms: f64,
     pub present_ms: f64,
@@ -135,6 +137,12 @@ struct NativePixelSample {
 struct KeyedMutexReadGuard {
     mutex: IDXGIKeyedMutex,
     release_key: u64,
+}
+
+struct SourceKeyedMutexAcquire {
+    guard: Option<KeyedMutexReadGuard>,
+    cast_ms: f64,
+    acquire_ms: f64,
 }
 
 impl Drop for KeyedMutexReadGuard {
@@ -439,6 +447,8 @@ impl NativeVideoPresenter {
         let mut fence_wait_ms = 0.0;
         let mut open_shared_ms = 0.0;
         let mut keyed_mutex_ms = 0.0;
+        let mut keyed_mutex_cast_ms = 0.0;
+        let mut keyed_mutex_acquire_ms = 0.0;
         let copy_call_ms;
         let mut shared_handle = 0;
         let mut shared_cache_hit = false;
@@ -486,8 +496,11 @@ impl NativeVideoPresenter {
                 shared_cache_hit = cache_hit;
                 open_shared_ms = open_shared_t0.elapsed().as_secs_f64() * 1000.0;
                 let keyed_mutex_t0 = Instant::now();
-                let _keyed_mutex = self.acquire_source_keyed_mutex(&src)?;
+                let keyed_mutex = self.acquire_source_keyed_mutex(&src)?;
                 keyed_mutex_ms = keyed_mutex_t0.elapsed().as_secs_f64() * 1000.0;
+                keyed_mutex_cast_ms = keyed_mutex.cast_ms;
+                keyed_mutex_acquire_ms = keyed_mutex.acquire_ms;
+                let _keyed_mutex = keyed_mutex.guard;
                 let src_probe = if probe_this_frame {
                     Some(self.sample_texture_pixel(&src, "source")?)
                 } else {
@@ -558,6 +571,8 @@ impl NativeVideoPresenter {
             fence_wait_ms,
             open_shared_ms,
             keyed_mutex_ms,
+            keyed_mutex_cast_ms,
+            keyed_mutex_acquire_ms,
             copy_call_ms,
             copy_ms,
             present_ms,
@@ -740,19 +755,31 @@ impl NativeVideoPresenter {
     fn acquire_source_keyed_mutex(
         &self,
         texture: &ID3D11Texture2D,
-    ) -> Result<Option<KeyedMutexReadGuard>, String> {
+    ) -> Result<SourceKeyedMutexAcquire, String> {
+        let cast_t0 = Instant::now();
         let Ok(mutex) = texture.cast::<IDXGIKeyedMutex>() else {
-            return Ok(None);
+            return Ok(SourceKeyedMutexAcquire {
+                guard: None,
+                cast_ms: cast_t0.elapsed().as_secs_f64() * 1000.0,
+                acquire_ms: 0.0,
+            });
         };
+        let cast_ms = cast_t0.elapsed().as_secs_f64() * 1000.0;
+        let acquire_t0 = Instant::now();
         unsafe {
             mutex
                 .AcquireSync(1, 10)
                 .map_err(|e| format!("source keyed mutex AcquireSync(1): {e:?}"))?;
         }
-        Ok(Some(KeyedMutexReadGuard {
-            mutex,
-            release_key: 0,
-        }))
+        let acquire_ms = acquire_t0.elapsed().as_secs_f64() * 1000.0;
+        Ok(SourceKeyedMutexAcquire {
+            guard: Some(KeyedMutexReadGuard {
+                mutex,
+                release_key: 0,
+            }),
+            cast_ms,
+            acquire_ms,
+        })
     }
 
     fn sample_texture_pixel(

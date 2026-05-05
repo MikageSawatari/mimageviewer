@@ -706,6 +706,14 @@ fn run_native_video_output(
                                         serde_json::Value::from(outcome.keyed_mutex_ms),
                                     ),
                                     (
+                                        "keyed_mutex_cast_ms",
+                                        serde_json::Value::from(outcome.keyed_mutex_cast_ms),
+                                    ),
+                                    (
+                                        "keyed_mutex_acquire_ms",
+                                        serde_json::Value::from(outcome.keyed_mutex_acquire_ms),
+                                    ),
+                                    (
                                         "copy_call_ms",
                                         serde_json::Value::from(outcome.copy_call_ms),
                                     ),
@@ -1697,8 +1705,11 @@ impl VideoPlayer {
         self.cancel
             .store(true, std::sync::atomic::Ordering::Release);
         #[cfg(windows)]
-        if let Some(mut frame) = self.gpu_latest.take() {
-            frame.reset_unpresented_shared_output();
+        {
+            if let Some(mut frame) = self.gpu_latest.take() {
+                frame.reset_unpresented_shared_output();
+            }
+            native_drain_unpresented_queue(&mut self.future_frames);
         }
         // AudioOutput を先に drop して cpal stream を止める。
         // Drop で pump も join される。
@@ -1712,8 +1723,11 @@ impl Drop for VideoPlayer {
         self.cancel
             .store(true, std::sync::atomic::Ordering::Release);
         #[cfg(windows)]
-        if let Some(mut frame) = self.gpu_latest.take() {
-            frame.reset_unpresented_shared_output();
+        {
+            if let Some(mut frame) = self.gpu_latest.take() {
+                frame.reset_unpresented_shared_output();
+            }
+            native_drain_unpresented_queue(&mut self.future_frames);
         }
         self.audio.take();
         // decoder thread は cancel フラグを見て終了
