@@ -2739,7 +2739,7 @@ impl NativeEguiOverlay {
                                     egui::pos2(x, hud_rect.min.y + 6.0),
                                     egui::pos2(x, hud_rect.max.y - 6.0),
                                 ],
-                                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 214, 106)),
+                                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 88, 88)),
                             );
 
                             painter.rect_filled(
