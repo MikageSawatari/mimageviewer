@@ -2438,6 +2438,10 @@ pub struct App {
     /// `Decorations` は client area を変えるため使わない。
     native_video_main_chrome_black: bool,
     #[cfg(windows)]
+    /// Native fullscreen 退出時、fullscreen/backdrop HWND の hide が DWM に反映される
+    /// まで theme chrome 復元を少し遅らせるための期限。
+    native_video_main_chrome_restore_at: Option<std::time::Instant>,
+    #[cfg(windows)]
     /// Native fullscreen presenter 上の左クリック候補。overlay hit-test が入るまでの
     /// 暫定 transport 操作用で、drag と click を release 時に分ける。
     native_video_pointer_down: Option<NativeVideoPointerDown>,
@@ -2970,6 +2974,8 @@ impl Default for App {
             native_video_front_last_raise: None,
             #[cfg(windows)]
             native_video_main_chrome_black: false,
+            #[cfg(windows)]
+            native_video_main_chrome_restore_at: None,
             #[cfg(windows)]
             native_video_pointer_down: None,
             last_ui_heartbeat_log: std::time::Instant::now(),
@@ -8709,7 +8715,10 @@ impl App {
         self.fullscreen_idx = Some(idx);
         #[cfg(windows)]
         if self.native_video_fullscreen_active_for_main_backdrop() {
-            self.sync_native_video_main_chrome(true);
+            // 黒 chrome は fullscreen/backdrop viewport を描画した後の update 末尾で
+            // 適用する。ここで先に DWM chrome だけ変えると、通常ウィンドウの
+            // タイトルバーが黒くなってから fullscreen が出る 1-frame race が見える。
+            self.native_video_main_chrome_restore_at = None;
         }
         self.adjust_spread_target = AdjustSpreadTarget::Left;
         // PDF pool の Critical 予約を ON: 現在ページのレンダリング用に 1 ワーカー確保。
@@ -10925,7 +10934,7 @@ impl App {
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
             self.native_video_pointer_down = None;
-            self.sync_native_video_main_chrome(false);
+            self.schedule_native_video_main_chrome_restore();
         }
         #[cfg(windows)]
         if self.show_vst3_manager || self.settings.vst3_gui_visible {
@@ -13187,6 +13196,9 @@ impl App {
 
     #[cfg(windows)]
     fn sync_native_video_main_chrome(&mut self, active: bool) {
+        if active {
+            self.native_video_main_chrome_restore_at = None;
+        }
         if active == self.native_video_main_chrome_black {
             return;
         }
@@ -13204,6 +13216,40 @@ impl App {
             crate::dwm_transitions::restore_window_chrome_for_theme(hwnd, dark);
         }
         self.native_video_main_chrome_black = active;
+    }
+
+    #[cfg(windows)]
+    fn schedule_native_video_main_chrome_restore(&mut self) {
+        if self.native_video_main_chrome_black {
+            self.native_video_main_chrome_restore_at =
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(80));
+        } else {
+            self.native_video_main_chrome_restore_at = None;
+        }
+    }
+
+    #[cfg(windows)]
+    fn process_native_video_main_chrome_restore(&mut self, ctx: &egui::Context) {
+        let Some(deadline) = self.native_video_main_chrome_restore_at else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if self.fullscreen_idx.is_some() || self.fs_viewport_shown {
+            self.native_video_main_chrome_restore_at =
+                Some(now + std::time::Duration::from_millis(80));
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return;
+        }
+        if now >= deadline {
+            self.native_video_main_chrome_restore_at = None;
+            self.sync_native_video_main_chrome(false);
+        } else {
+            ctx.request_repaint_after(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(std::time::Duration::from_millis(16)),
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -14185,11 +14231,12 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        crate::record_ui_heartbeat_tick();
         let now = std::time::Instant::now();
         if now.saturating_duration_since(self.last_ui_heartbeat_log)
             >= std::time::Duration::from_secs(1)
         {
-            crate::logger::log(format!(
+            let heartbeat = format!(
                 "[heartbeat] app_update fullscreen={:?} native_main_backdrop={} main_hwnd={:?}",
                 self.fullscreen_idx,
                 {
@@ -14203,7 +14250,9 @@ impl eframe::App for App {
                     }
                 },
                 self.main_hwnd
-            ));
+            );
+            crate::record_ui_heartbeat_detail(heartbeat.clone());
+            crate::logger::log(heartbeat);
             self.last_ui_heartbeat_log = now;
         }
 
@@ -14719,14 +14768,15 @@ impl eframe::App for App {
         #[cfg(windows)]
         {
             let native_main_backdrop = self.native_video_fullscreen_active_for_main_backdrop();
-            self.sync_native_video_main_chrome(native_main_backdrop);
             if native_main_backdrop {
+                self.sync_native_video_main_chrome(true);
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                     .show(ctx, |_ui| {});
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
                 return;
             }
+            self.process_native_video_main_chrome_restore(ctx);
         }
 
         // 補正パネルでスライダーをドラッグ中に true → release で false の遷移を検知し、

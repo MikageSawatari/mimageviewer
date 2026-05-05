@@ -92,12 +92,20 @@ pub mod xmp_writer;
 pub mod zip_loader;
 
 use std::sync::{
-    Arc,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 static NATIVE_EXCEPTION_LOGGING: AtomicBool = AtomicBool::new(false);
+static UI_HEARTBEAT: OnceLock<Arc<UiHeartbeatState>> = OnceLock::new();
+
+struct UiHeartbeatState {
+    start: Instant,
+    last_ms: std::sync::atomic::AtomicU64,
+    last_report_ms: std::sync::atomic::AtomicU64,
+    detail: Mutex<String>,
+}
 
 /// `startup.<step>` perf イベントを emit する共通ヘルパー。
 /// `phase_start` を渡すと当該フェーズの `ms` + 累計 `total_ms` を、
@@ -220,6 +228,71 @@ fn append_panic_log_entry(msg: &str) {
     {
         use std::io::Write;
         let _ = writeln!(f, "[{:?}] {msg}", std::time::SystemTime::now());
+    }
+}
+
+fn install_ui_heartbeat_watchdog() {
+    let state = UI_HEARTBEAT
+        .get_or_init(|| {
+            let now = Instant::now();
+            Arc::new(UiHeartbeatState {
+                start: now,
+                last_ms: std::sync::atomic::AtomicU64::new(0),
+                last_report_ms: std::sync::atomic::AtomicU64::new(0),
+                detail: Mutex::new("no App::update heartbeat yet".to_owned()),
+            })
+        })
+        .clone();
+
+    let _ = std::thread::Builder::new()
+        .name("ui-heartbeat-watchdog".to_owned())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                let now_ms = state.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                let last_ms = state.last_ms.load(Ordering::Acquire);
+                let age_ms = now_ms.saturating_sub(last_ms);
+                if age_ms < 5_000 {
+                    continue;
+                }
+                let last_report_ms = state.last_report_ms.load(Ordering::Acquire);
+                if now_ms.saturating_sub(last_report_ms) < 10_000 {
+                    continue;
+                }
+                if state
+                    .last_report_ms
+                    .compare_exchange(last_report_ms, now_ms, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
+                    continue;
+                }
+                let detail = state
+                    .detail
+                    .lock()
+                    .map(|s| s.clone())
+                    .unwrap_or_else(|_| "<heartbeat detail mutex poisoned>".to_owned());
+                append_panic_log_entry(&format!(
+                    "UI THREAD HANG suspected: no App::update heartbeat for {age_ms}ms \
+                 (last_ms={last_ms}, now_ms={now_ms}); last_detail={detail}"
+                ));
+            }
+        });
+}
+
+pub(crate) fn record_ui_heartbeat_tick() {
+    if let Some(state) = UI_HEARTBEAT.get() {
+        let now_ms = state.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        state.last_ms.store(now_ms, Ordering::Release);
+    }
+}
+
+pub(crate) fn record_ui_heartbeat_detail(detail: String) {
+    if let Some(state) = UI_HEARTBEAT.get() {
+        let now_ms = state.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        state.last_ms.store(now_ms, Ordering::Release);
+        if let Ok(mut slot) = state.detail.lock() {
+            *slot = detail;
+        }
     }
 }
 
@@ -532,6 +605,7 @@ fn main() -> eframe::Result {
     // eframe::run_native に入る手前までを 1 つの marker として記録する。
     // これ以降は eframe (winit + wgpu) の初期化が走り、creator closure が呼ばれる。
     emit_startup("before_run_native", None);
+    install_ui_heartbeat_watchdog();
 
     eframe::run_native(
         "mimageviewer",

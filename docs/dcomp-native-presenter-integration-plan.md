@@ -150,10 +150,18 @@ Status:
   the main HWND during activation/z-order churn the thumbnail grid is still
   masked. The main HWND's DWM caption and border colors are set to black only
   while native video fullscreen is active, then restored to theme-aware DWM
-  defaults after exit (including the effective Light/Dark mode). This avoids
-  white non-client title-bar/border flashes without toggling
-  `ViewportCommand::Decorations`, which can resize the main client area and
-  disturb the thumbnail grid when fullscreen exits.
+  defaults after exit (including the effective Light/Dark mode). The black
+  override is applied after the fullscreen/backdrop viewport has been drawn and
+  restored only after the viewport hide has had a short DWM settling window, so
+  the chrome color change does not lead or trail the fullscreen transition by a
+  visible frame. This avoids white non-client title-bar/border flashes without
+  toggling `ViewportCommand::Decorations`, which can resize the main client area
+  and disturb the thumbnail grid when fullscreen exits.
+- 2026-05-05: the Rust panic hook is complemented by a Windows native exception
+  handler and a UI heartbeat watchdog. Native access violations are appended to
+  `panic.log`, while an `App::update` heartbeat gap of more than five seconds is
+  logged as a suspected UI hang so AppHang reports have a local breadcrumb even
+  when no Rust panic occurs.
 - 2026-05-05: while a native presenter HWND is active, the UI thread keeps a
   lightweight 16ms repaint pump alive even though video frames are presented on
   the native thread. This prevents native-window shortcut events such as Escape
