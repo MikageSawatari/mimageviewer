@@ -953,6 +953,33 @@ impl GpuVideoDevice {
                 continue;
             }
 
+            if pool.len() >= OUTPUT_RING_SIZE {
+                if let Some(pos) = pool.iter().position(|slot| {
+                    (slot.width != w || slot.height != h || slot.format != format)
+                        && !slot.in_use.load(Ordering::Acquire)
+                }) {
+                    let evicted = pool.remove(pos);
+                    crate::perf::event(
+                        "video",
+                        "shared_output_pool_evict",
+                        None,
+                        0,
+                        &[
+                            ("width", serde_json::Value::from(evicted.width as i64)),
+                            ("height", serde_json::Value::from(evicted.height as i64)),
+                            ("requested_width", serde_json::Value::from(w as i64)),
+                            ("requested_height", serde_json::Value::from(h as i64)),
+                            ("pool_len", serde_json::Value::from(pool.len() as i64)),
+                            (
+                                "shared_handle",
+                                serde_json::Value::from(evicted.shared_handle.0 as usize as u64),
+                            ),
+                        ],
+                    );
+                    drop(evicted);
+                }
+            }
+
             if pool.len() < OUTPUT_RING_SIZE {
                 let (tex, shared_handle) = self.create_shared_output(w, h, format)?;
                 let in_use = Arc::new(AtomicBool::new(true));

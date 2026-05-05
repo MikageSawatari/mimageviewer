@@ -136,6 +136,10 @@ Status:
   native fullscreen HWND with a DirectComposition transform, so a 1080p clip can
   fill a 4K fullscreen window without coupling the video copy path to the window
   backbuffer size.
+- 2026-05-05: the fullscreen DComp tree now keeps an opaque black background
+  visual behind the aspect-fit video visual. Letterbox/pillarbox regions are
+  therefore filled by the native presenter instead of showing the desktop behind
+  the borderless HWND.
 
 Current limitations of the experimental slice:
 
@@ -325,6 +329,11 @@ Trace events split `keyed_mutex_ms` into `keyed_mutex_cast_ms` and
 the `AcquireSync(1)` wait.
 The pool size tracks the existing video frame channel depth so startup does not
 create more shared textures than the playback queue can reasonably hold.
+Because the same `GpuVideoDevice` is reused across clips, the pool may contain
+idle textures for earlier source sizes. When a new size arrives and the bounded
+pool is full, the producer evicts an idle slot from a different size/format
+before falling back to CPU readback; otherwise a sequence of mixed-resolution
+clips can exhaust the pool with unusable old slots.
 The native presenter drains due frames in source PTS order rather than replacing
 all due frames with the newest one; this prevents startup backlog from dropping
 unpresented keyed-mutex frames and briefly forcing the decoder into CPU
