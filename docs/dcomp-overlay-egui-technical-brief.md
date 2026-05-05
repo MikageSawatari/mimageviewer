@@ -240,6 +240,12 @@ Status:
   HWND before toggling visibility. The perf graph is drawn at a lower egui
   order than the side panels from the first frame, and an open VST panel no
   longer forces the edge-hover chrome to stay visible.
+- 2026-05-06: native overlay events are ignored when they arrive from a stale
+  fullscreen index. This prevents delayed wheel/close/tile commands from an old
+  presenter from closing or navigating the next video during S-mode
+  video-to-video transitions. The seek-hover thumbnail worker also detaches on
+  drop instead of joining on the UI thread, reducing transition stalls while the
+  worker exits itself after seeing cancellation.
 
 Acceptance for the spike:
 

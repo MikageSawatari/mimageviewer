@@ -154,10 +154,10 @@ impl ThumbnailWorker {
 impl Drop for ThumbnailWorker {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Release);
-        if let Some(t) = self.thread.take() {
-            // worker は recv_timeout で 100ms 以内に cancel をチェックする想定
-            let _ = t.join();
-        }
+        // UI スレッドで join すると、動画間ホイール移動や S-mode の動画切替時に
+        // ffmpeg seek/decode 中の worker を数十〜数百 ms 待つことがある。worker は
+        // Arc 所有の状態だけを触り、cancel/wake 切断で自力終了できるため detach する。
+        let _ = self.thread.take();
     }
 }
 

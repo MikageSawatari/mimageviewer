@@ -13288,6 +13288,13 @@ impl App {
         fs_idx: usize,
         event: crate::video::NativeVideoOutputEvent,
     ) {
+        if self.fullscreen_idx != Some(fs_idx) {
+            crate::logger::log(format!(
+                "[native-video] stale overlay event ignored: event_idx={fs_idx} current={:?}",
+                self.fullscreen_idx
+            ));
+            return;
+        }
         match event {
             crate::video::NativeVideoOutputEvent::Window(event) => {
                 self.handle_native_video_window_event(ctx, fs_idx, event);
@@ -14472,8 +14479,13 @@ impl App {
 
     #[cfg(windows)]
     fn open_native_video_fullscreen_from_navigation(&mut self, ctx: &egui::Context, idx: usize) {
+        let started = std::time::Instant::now();
+        let from_idx = self.fullscreen_idx;
         let restore_video_tile = self.video_tile_state.is_some();
         let restore_target_is_video = matches!(self.items.get(idx), Some(GridItem::Video(_)));
+        crate::logger::log(format!(
+            "[native-video] wheel navigation open: from={from_idx:?} to={idx} tile_restore={restore_video_tile} target_video={restore_target_is_video}"
+        ));
         if restore_video_tile {
             self.video_tile_state = None;
             self.video_tile_textures.clear();
@@ -14498,6 +14510,10 @@ impl App {
             self.video_tile_reopen_pending = false;
             self.video_tile_reopen_deadline = None;
         }
+        crate::logger::log(format!(
+            "[native-video] wheel navigation open queued: to={idx} elapsed_ms={:.1}",
+            started.elapsed().as_secs_f64() * 1000.0
+        ));
         ctx.request_repaint();
     }
 
