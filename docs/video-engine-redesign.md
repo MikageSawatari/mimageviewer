@@ -1386,9 +1386,11 @@ through the normal fullscreen video path, `--play-test-start <SECONDS>` forces a
 deterministic start point (the soak harness defaults to 0s instead of saved
 resume), `--play-duration <SECONDS>` exits the process after playback has run
 for that long (default 30s), and `--play-muted` prevents audible output during
-unattended runs. `--play-test-skip-vst3` disables VST3 only for that test
-process so video playback can be benchmarked independently from plugin startup
-and audio processing. `--perf-log <PATH>` or `--perf-log-path <PATH>` writes
+unattended runs. The muted flag is per-run only and must not persist
+`video_start_muted` into normal user playback settings. `--play-test-skip-vst3`
+disables VST3 only for that test process so video playback can be benchmarked
+independently from plugin startup and audio processing. `--perf-log <PATH>` or
+`--perf-log-path <PATH>` writes
 JSONL events to a per-run path instead of the default `%APPDATA%` log, which
 lets harnesses keep one log per video. The helper `scripts/video_soak.py`
 recursively shuffles one or more folders, launches one mIV process per video,

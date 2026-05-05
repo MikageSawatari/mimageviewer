@@ -3796,9 +3796,6 @@ impl App {
                 });
             self.selected = Some(idx);
             self.fs_open_intent_from_grid = true;
-            if config.mute {
-                self.settings.video_start_muted = true;
-            }
             self.open_fullscreen(idx);
             if let Some(state) = self.play_test.as_mut() {
                 state.launched_idx = Some(idx);
@@ -10305,12 +10302,12 @@ impl App {
                 // 自動シークさせる。Windows の case-insensitive パスを揃えるため
                 // adjustment_db::normalize_path に合わせる。
                 let path_key = crate::adjustment_db::normalize_path(&vp);
-                let play_test_start = self.play_test.as_ref().and_then(|state| {
+                let play_test_for_video = self.play_test.as_ref().filter(|state| {
                     let config_key = crate::adjustment_db::normalize_path(&state.config.path);
-                    (config_key == path_key)
-                        .then_some(state.config.start_secs)
-                        .flatten()
+                    config_key == path_key
                 });
+                let play_test_start = play_test_for_video.and_then(|state| state.config.start_secs);
+                let play_test_mute = play_test_for_video.is_some_and(|state| state.config.mute);
                 let resume = play_test_start
                     .or_else(|| self.settings.video_resume_positions.get(&path_key).copied());
                 let video_hw_decode = self.settings.video_hw_decode;
@@ -10336,7 +10333,7 @@ impl App {
                     #[cfg(windows)]
                     native_video_presenter_config(self.main_hwnd),
                 );
-                if self.settings.video_start_muted {
+                if self.settings.video_start_muted || play_test_mute {
                     player.set_muted(true);
                 }
                 self.fs_cache.insert(

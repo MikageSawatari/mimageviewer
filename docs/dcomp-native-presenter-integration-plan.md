@@ -309,8 +309,10 @@ consumer-side `IDXGIKeyedMutex::AcquireSync(1)` can block the native presenter
 thread for 25-35ms even with a zero timeout, while the shared fence, shared
 texture cache, and copy call remain sub-millisecond. Follow-up validation showed
 that the native D3D11 presenter still has to acquire key=1 before copying; using
-only the fence made the source texture read as black. D3D12/wgpu consumers remain
-fence-only, and the producer tracks slots released to readers so it can recover
+only the fence made the source texture read as black. Treat this as a D3D11
+shared-resource visibility/cache-flush requirement on the tested driver, not
+just keyed-mutex ownership bookkeeping. D3D12/wgpu consumers remain fence-only,
+and the producer tracks slots released to readers so it can recover
 key=1 back to key=0 immediately before reusing a pooled output slot. Trace runs
 should keep keyed mutex acquire time small in steady state and
 `native_recover_max_ms` below 1ms.
