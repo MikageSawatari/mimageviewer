@@ -13079,7 +13079,7 @@ impl App {
                     if hwnd != 0 {
                         native_owner_hwnd = hwnd;
                     }
-                    if player.native_presenter_closed() {
+                    if self.fullscreen_idx == Some(*idx) && player.native_presenter_closed() {
                         native_closed_idx = Some(*idx);
                     }
                     native_events.extend(
