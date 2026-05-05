@@ -2434,6 +2434,10 @@ pub struct App {
     /// 16ms pump に合わせて通常の HWND_TOP raise を保つ。
     native_video_front_last_raise: Option<std::time::Instant>,
     #[cfg(windows)]
+    /// Native fullscreen 中に main HWND が一瞬露出しても白いタイトルバーを見せないため、
+    /// main viewport の decorations を一時的に外しているか。
+    native_video_main_decorations_hidden: bool,
+    #[cfg(windows)]
     /// Native fullscreen presenter 上の左クリック候補。overlay hit-test が入るまでの
     /// 暫定 transport 操作用で、drag と click を release 時に分ける。
     native_video_pointer_down: Option<NativeVideoPointerDown>,
@@ -2962,6 +2966,8 @@ impl Default for App {
             native_video_front_synced_hwnd: 0,
             #[cfg(windows)]
             native_video_front_last_raise: None,
+            #[cfg(windows)]
+            native_video_main_decorations_hidden: false,
             #[cfg(windows)]
             native_video_pointer_down: None,
             placement_slot: None,
@@ -13172,6 +13178,15 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn sync_native_video_main_decorations(&mut self, ctx: &egui::Context, hide: bool) {
+        if hide == self.native_video_main_decorations_hidden {
+            return;
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Decorations(!hide));
+        self.native_video_main_decorations_hidden = hide;
+    }
+
+    #[cfg(windows)]
     fn handle_native_video_output_event(
         &mut self,
         ctx: &egui::Context,
@@ -14651,12 +14666,16 @@ impl eframe::App for App {
         let t_fullscreen_viewport = frame_t0.elapsed();
 
         #[cfg(windows)]
-        if self.native_video_fullscreen_active_for_main_backdrop() {
-            egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(egui::Color32::BLACK))
-                .show(ctx, |_ui| {});
-            ctx.request_repaint_after(std::time::Duration::from_millis(16));
-            return;
+        {
+            let native_main_backdrop = self.native_video_fullscreen_active_for_main_backdrop();
+            self.sync_native_video_main_decorations(ctx, native_main_backdrop);
+            if native_main_backdrop {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+                    .show(ctx, |_ui| {});
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                return;
+            }
         }
 
         // 補正パネルでスライダーをドラッグ中に true → release で false の遷移を検知し、

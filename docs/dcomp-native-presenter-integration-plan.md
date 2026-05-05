@@ -148,7 +148,9 @@ Status:
   fullscreen target is a video and the native presenter is enabled, even before
   the `VideoPlayer` has populated `fs_cache`, so if Windows transiently exposes
   the main HWND during activation/z-order churn the thumbnail grid is still
-  masked.
+  masked. During that same native fullscreen period the main viewport
+  decorations are temporarily disabled, because egui cannot paint over the
+  Win32 non-client title bar; decorations are restored when fullscreen exits.
 - 2026-05-05: while a native presenter HWND is active, the UI thread keeps a
   lightweight 16ms repaint pump alive even though video frames are presented on
   the native thread. This prevents native-window shortcut events such as Escape
