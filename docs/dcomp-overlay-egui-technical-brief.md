@@ -84,16 +84,17 @@ Status:
   and the presenter gives the visible HUD a 250ms playback tick so progress
   remains live even when the pointer is stationary.
 - 2026-05-05: the egui overlay was briefly default-on with the native presenter
-  for Windows fullscreen video trial use, but is opt-in again via
-  `MIV_NATIVE_VIDEO_EGUI_OVERLAY=1` while an opaque-black blank overlay visual
-  is investigated on production machines.
+  for Windows fullscreen video trial use, then temporarily returned to opt-in
+  while an opaque-black blank overlay visual was investigated on production
+  machines.
 - 2026-05-05: blank overlay frames no longer rely solely on transparent
   surface composition. The egui overlay DComp visual is detached from the root
   visual tree while the HUD is hidden and reattached only after a visible HUD
   frame has been rendered, so a driver path that treats the blank wgpu surface
-  as opaque cannot cover the video. Keep the flag opt-in until this visual
-  attach/detach path is manually verified on the production machines that saw
-  the black overlay.
+  as opaque cannot cover the video. Manual trial on the affected machine
+  confirmed the HUD blends correctly, so `MIV_NATIVE_VIDEO_EGUI_OVERLAY` is
+  default-on again; set it to `0` to run the native presenter without the HUD
+  overlay.
 - 2026-05-05: native `FirstFrameReady` delivery is retried if the engine event
   channel is temporarily full. This protects HUD seek bursts from leaving the
   engine in `Buffering` after the native presenter has already displayed the

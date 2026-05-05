@@ -556,7 +556,7 @@ fn run_native_video_output(
             width,
             height,
             test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
-            egui_overlay: native_video_env_flag_enabled("MIV_NATIVE_VIDEO_EGUI_OVERLAY", false),
+            egui_overlay: native_video_env_flag_enabled("MIV_NATIVE_VIDEO_EGUI_OVERLAY", true),
         },
     ) {
         Ok(presenter) => presenter,

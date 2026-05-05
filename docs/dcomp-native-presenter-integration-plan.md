@@ -207,8 +207,9 @@ Current limitations of the experimental slice:
 - 2026-05-05: the production native presenter is now the default Windows
   fullscreen video path for trial use. Set `MIV_NATIVE_VIDEO_PRESENTER=0` to
   return to the legacy egui fullscreen presenter. The egui DComp overlay HUD is
-  opt-in again via `MIV_NATIVE_VIDEO_EGUI_OVERLAY=1` while its alpha/blank
-  visual behavior is investigated on production machines.
+  also default-on after the attach/detach visual gate was verified on the
+  affected production machine; set `MIV_NATIVE_VIDEO_EGUI_OVERLAY=0` to run the
+  native presenter without the HUD overlay.
 
 ## Phase C: Overlay Strategy
 
@@ -241,18 +242,18 @@ Status:
 - 2026-05-04: the CompositionVisual/egui-wgpu spike was implemented behind
   `MIV_NATIVE_VIDEO_EGUI_OVERLAY=1`. It uses a standalone egui context and
   renderer to draw into the second DComp visual, with video-only fail-closed
-  behavior if the overlay cannot initialize. It was briefly default-on with the
-  native presenter during the 2026-05-05 trial, but is opt-in again because an
-  empty overlay surface can appear as an opaque black visual on at least one
-  production setup.
+  behavior if the overlay cannot initialize. It was briefly returned to opt-in
+  during the 2026-05-05 trial because an empty overlay surface could appear as
+  an opaque black visual on at least one production setup.
 - 2026-05-05: the blank-overlay failure mode is mitigated by keeping the egui
   overlay visual detached from the root DComp visual tree while the HUD is
   hidden. The presenter renders the HUD into the wgpu CompositionVisual surface
   first, then attaches the visual above the video visual; on mouse leave or any
   hidden-HUD redraw it removes the visual again. This avoids letting an empty
   or transparent-cleared surface cover the video if the underlying DComp/wgpu
-  path treats it as opaque. The env flag remains opt-in until manual trial on
-  affected machines confirms that visible HUD pixels blend correctly.
+  path treats it as opaque. Manual trial on the affected machine confirmed that
+  visible HUD pixels blend correctly, so the env flag is default-on again with
+  `MIV_NATIVE_VIDEO_EGUI_OVERLAY=0` kept as the overlay rollback.
 - 2026-05-05: native-presenter `FirstFrameReady` delivery now retries when the
   engine event channel is temporarily full. HUD seek bursts can coincide with
   stale-packet and audio events; if the first presented frame notification is
