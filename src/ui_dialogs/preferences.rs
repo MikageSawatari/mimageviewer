@@ -1925,14 +1925,7 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
     // ── プラグイン追加 ──
     ui.horizontal(|ui| {
         let scan_label = if state.vst3_scan_in_progress {
-            if state.vst3_scan_total > 0 {
-                format!(
-                    "スキャン中... ({}/{})",
-                    state.vst3_scan_done, state.vst3_scan_total
-                )
-            } else {
-                "スキャン中...".to_string()
-            }
+            "スキャン中...".to_string()
         } else if state.vst3_discovered.is_empty() {
             "プラグインをスキャン".to_string()
         } else {
