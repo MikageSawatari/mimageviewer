@@ -10,15 +10,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-    HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, MSG,
-    PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WNDCLASSW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP,
-    WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOP,
+    IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, MSG, PM_REMOVE, PeekMessageW,
+    PostQuitMessage, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
+    WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -84,6 +84,7 @@ pub enum NativeVideoWindowMode {
 
 pub struct NativeVideoWindowConfig {
     pub mode: NativeVideoWindowMode,
+    pub owner_hwnd: u64,
     pub close_on_escape: bool,
     pub post_quit_on_destroy: bool,
     pub event_tx: Option<std::sync::mpsc::Sender<NativeVideoWindowEvent>>,
@@ -93,6 +94,7 @@ impl NativeVideoWindowConfig {
     pub fn test_windowed(width: u32, height: u32) -> Self {
         Self {
             mode: NativeVideoWindowMode::Windowed { width, height },
+            owner_hwnd: 0,
             close_on_escape: true,
             post_quit_on_destroy: true,
             event_tx: None,
@@ -169,6 +171,11 @@ impl NativeVideoWindow {
                 event_tx: config.event_tx,
             });
             let state_ptr = Box::into_raw(state);
+            let owner_hwnd = if config.owner_hwnd != 0 {
+                Some(HWND(config.owner_hwnd as *mut _))
+            } else {
+                None
+            };
             let hwnd = match CreateWindowExW(
                 ex_style,
                 w!("mIVNativeVideoWindow"),
@@ -178,7 +185,7 @@ impl NativeVideoWindow {
                 y,
                 width,
                 height,
-                None,
+                owner_hwnd,
                 None,
                 Some(hinstance),
                 Some(state_ptr.cast()),
@@ -243,14 +250,7 @@ pub fn foreground_belongs_to_current_process() -> bool {
 fn bring_hwnd_to_front(hwnd: HWND) -> bool {
     unsafe {
         let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW;
-        let top_ok = SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, 0, 0, flags).is_ok();
-        // A plain HWND_TOP raise can lose a same-process activation race to the thumbnail grid
-        // during double-click fullscreen startup. Pulse through the TOPMOST band and immediately
-        // demote back to normal so the native video stays above mIV windows without becoming an
-        // always-on-top window over other applications.
-        let pulse_ok = SetWindowPos(hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, flags).is_ok()
-            && SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, flags).is_ok();
-        top_ok || pulse_ok
+        SetWindowPos(hwnd, Some(HWND_TOP), 0, 0, 0, 0, flags).is_ok()
     }
 }
 

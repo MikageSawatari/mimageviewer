@@ -120,12 +120,13 @@ Status:
   once the native borderless HWND exists, then raises the native HWND. The
   legacy viewport is still kept available for fallback before native HWND
   creation, but it must not cover the native DComp presenter after startup.
-- 2026-05-05: the UI thread re-raises the native HWND for a short startup window
-  after the presenter HWND appears, then continues a throttled foreground-only
-  z-order maintenance pulse while native fullscreen is active. The pulse briefly
-  moves the video HWND through the TOPMOST band and demotes it immediately, so
-  the main thumbnail grid cannot reclaim z-order during double-click startup
-  without leaving the video window above other applications after Alt-Tab.
+- 2026-05-05: the native fullscreen HWND is created as an owned popup of the
+  main mIV HWND when that owner is available. The UI thread still performs a
+  throttled foreground-only `HWND_TOP` raise during the startup window, but it
+  no longer pulses through the TOPMOST band and the startup boost is throttled.
+  This keeps the thumbnail grid from reclaiming z-order during double-click
+  startup without causing visible TOPMOST flicker or leaving the video window
+  above other applications after Alt-Tab.
 - 2026-05-05: while a native presenter HWND is active, the UI thread keeps a
   lightweight 16ms repaint pump alive even though video frames are presented on
   the native thread. This prevents native-window shortcut events such as Escape

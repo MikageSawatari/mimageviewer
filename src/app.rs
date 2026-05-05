@@ -13145,7 +13145,7 @@ impl App {
         let periodic_due = self.native_video_front_last_raise.is_none_or(|last| {
             now.saturating_duration_since(last) >= std::time::Duration::from_millis(100)
         });
-        if !is_new_hwnd && !in_startup_boost && !periodic_due {
+        if !is_new_hwnd && (!in_startup_boost || !periodic_due) {
             return;
         }
         if !crate::video::native_window::foreground_belongs_to_current_process() {
@@ -16306,6 +16306,7 @@ fn native_video_presenter_config(
         .min(4);
     Some(crate::video::NativeVideoOutputConfig {
         rect: info.rcMonitor,
+        owner_hwnd: main_hwnd.unwrap_or_default() as u64,
         sync_interval,
     })
 }

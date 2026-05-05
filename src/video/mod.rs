@@ -162,6 +162,7 @@ unsafe impl Send for GpuLatestFrame {}
 #[derive(Clone, Copy, Debug)]
 pub struct NativeVideoOutputConfig {
     pub rect: windows::Win32::Foundation::RECT,
+    pub owner_hwnd: u64,
     pub sync_interval: u32,
 }
 
@@ -466,6 +467,7 @@ fn run_native_video_output(
             mode: crate::video::native_window::NativeVideoWindowMode::Borderless {
                 rect: config.rect,
             },
+            owner_hwnd: config.owner_hwnd,
             close_on_escape: true,
             // This HWND lives on the presenter thread, so WM_QUIT only exits
             // this loop and does not affect eframe's main event loop.
