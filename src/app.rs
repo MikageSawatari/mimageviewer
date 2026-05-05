@@ -16206,16 +16206,24 @@ fn video_autoplay_for_open(
 }
 
 #[cfg(windows)]
+fn env_flag_enabled(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            !(v.is_empty()
+                || v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no"))
+        })
+        .unwrap_or(default)
+}
+
+#[cfg(windows)]
 fn native_video_presenter_config(
     main_hwnd: Option<isize>,
 ) -> Option<crate::video::NativeVideoOutputConfig> {
-    let enabled = std::env::var("MIV_NATIVE_VIDEO_PRESENTER")
-        .map(|v| {
-            let v = v.trim();
-            !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
-        })
-        .unwrap_or(false);
-    if !enabled {
+    if !env_flag_enabled("MIV_NATIVE_VIDEO_PRESENTER", true) {
         return None;
     }
 

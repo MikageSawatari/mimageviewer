@@ -397,6 +397,20 @@ fn native_drain_unpresented_queue(queue: &mut std::collections::VecDeque<VideoFr
 }
 
 #[cfg(windows)]
+fn native_video_env_flag_enabled(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            !(v.is_empty()
+                || v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no"))
+        })
+        .unwrap_or(default)
+}
+
+#[cfg(windows)]
 fn native_source_pacing_delay(
     last_pts: Option<f64>,
     last_wall: Option<std::time::Instant>,
@@ -458,7 +472,7 @@ fn run_native_video_output(
             width,
             height,
             test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
-            egui_overlay: std::env::var_os("MIV_NATIVE_VIDEO_EGUI_OVERLAY").is_some(),
+            egui_overlay: native_video_env_flag_enabled("MIV_NATIVE_VIDEO_EGUI_OVERLAY", true),
         },
     )?;
     crate::logger::log(format!(

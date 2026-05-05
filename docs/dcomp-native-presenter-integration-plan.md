@@ -113,8 +113,10 @@ Status:
   audio, VST3, and clock paths, but clones the video frame receiver into a
   dedicated native presenter thread with its own borderless HWND. VST editor
   owner sync is guarded so the bridge receives `set_chain_owner` only when the
-  native HWND changes.
-- 2026-05-04: the opt-in slice now hides the legacy egui fullscreen viewport
+  native HWND changes. As of 2026-05-05, this path is default-on for Windows
+  trial use; set `MIV_NATIVE_VIDEO_PRESENTER=0` to force the legacy egui
+  fullscreen path.
+- 2026-05-04: the native slice now hides the legacy egui fullscreen viewport
   once the native borderless HWND exists, then raises the native HWND. The
   legacy viewport is still kept available for fallback before native HWND
   creation, but it must not cover the native DComp presenter after startup.
@@ -146,8 +148,11 @@ Current limitations of the experimental slice:
 - GPU frames are copied into a source-sized presenter swap chain after keyed
   mutex acquisition, then scaled by DirectComposition. 10-bit/HDR GPU frames
   still need a fallback or a dedicated presentation path.
-- it remains opt-in via environment variable and the egui fullscreen path is
-  still the default
+- 2026-05-05: the production native presenter is now the default Windows
+  fullscreen video path for trial use. Set `MIV_NATIVE_VIDEO_PRESENTER=0` to
+  return to the legacy egui fullscreen presenter, or
+  `MIV_NATIVE_VIDEO_EGUI_OVERLAY=0` to keep native video while disabling the
+  egui DComp overlay HUD.
 
 ## Phase C: Overlay Strategy
 
@@ -177,10 +182,12 @@ Status:
   surface created from `SurfaceTargetUnsafe::CompositionVisual`, so egui-wgpu can
   render to the second DComp visual without introducing a transparent overlay
   HWND.
-- 2026-05-04: the CompositionVisual/egui-wgpu spike is implemented behind
+- 2026-05-04: the CompositionVisual/egui-wgpu spike was implemented behind
   `MIV_NATIVE_VIDEO_EGUI_OVERLAY=1`. It uses a standalone egui context and
-  renderer to draw a tiny static label into the second DComp visual, with
-  video-only fail-closed behavior if the overlay cannot initialize.
+  renderer to draw into the second DComp visual, with video-only fail-closed
+  behavior if the overlay cannot initialize. As of 2026-05-05, the egui overlay
+  is default-on with the native presenter for trial use; set
+  `MIV_NATIVE_VIDEO_EGUI_OVERLAY=0` to disable only the overlay.
   The 1080p120 soak kept `late_drop=0` for 601 frames over 5 seconds with max
   interval 9.8ms, so the egui overlay surface can coexist with the native video
   visual without coupling redraw cadence.
@@ -242,7 +249,7 @@ Acceptance:
 
 ## Phase E: Production Gaps From Prototype
 
-Before enabling by default:
+Before making the trial default permanent:
 
 - complete dynamic `WM_SIZE` / monitor-change coverage around the source-sized
   video surface and DComp aspect-fit transform
@@ -251,7 +258,8 @@ Before enabling by default:
 - decide tearing policy (`sync_interval=0`) vs vsync policy (`sync_interval=1`)
 - handle fullscreen close without the known `set_gui_owner` burst stalls
 - keep CPU fallback path correct for software decoded frames
-- add feature gate / setting for quick rollback
+- replace the temporary environment rollback with a user-facing setting if the
+  native path remains default
 
 ## Test Matrix
 
@@ -260,7 +268,7 @@ Use `scripts/video_soak.py` for A/B comparisons:
 ```powershell
 python scripts/video_soak.py --exe target\release\mimageviewer-core.exe `
   --duration 10 --start 0 --skip-vst3 --window-size 1920x1080 `
-  --mode egui-default `
+  --mode egui-default:MIV_NATIVE_VIDEO_PRESENTER=0 `
   H:\home\mimageviewer_old\testimage\movie\test_120fps_1080p_sync.mp4
 
 python scripts/video_soak.py --exe target\release\mimageviewer-core.exe `
@@ -278,9 +286,9 @@ fullscreen path also emits `native_presenter/summary` with the same core fields
 as `--dcomp-presenter-test` (`presented`, `gpu_frames`, `cpu_frames`,
 `late_drop`, `wait_timeout`, `actual_fps`, and max timing fields), so soak
 status can key off the native presenter rather than the legacy egui fullscreen
-viewport that still runs during the opt-in phase. The production path emits this
-summary periodically as well as during orderly shutdown because play-test runs
-can exit before the presenter thread's final shutdown log is flushed.
+viewport. The production path emits this summary periodically as well as during
+orderly shutdown because play-test runs can exit before the presenter thread's
+final shutdown log is flushed.
 
 For production native presenter copy/fence spikes, use
 `docs/codex-native-presenter-copy-spike-brief.md`. Setting
@@ -312,11 +320,13 @@ Core clips:
 
 ## Rollout
 
-Keep the egui fullscreen path until the native path passes the test matrix.
-Prefer an environment variable or hidden setting first:
+The native presenter is the default Windows fullscreen video path for trial use.
+Keep the egui fullscreen path available as a rollback path until the native path
+passes the full test matrix:
 
 ```text
-MIV_NATIVE_VIDEO_PRESENTER=1
+MIV_NATIVE_VIDEO_PRESENTER=0
 ```
 
-After sustained testing, graduate it to a user setting or default path.
+If sustained testing is clean, replace the environment rollback with a
+user-facing setting or remove it when the legacy path is retired.
