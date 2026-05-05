@@ -245,6 +245,14 @@ Status:
   native presenter during the 2026-05-05 trial, but is opt-in again because an
   empty overlay surface can appear as an opaque black visual on at least one
   production setup.
+- 2026-05-05: the blank-overlay failure mode is mitigated by keeping the egui
+  overlay visual detached from the root DComp visual tree while the HUD is
+  hidden. The presenter renders the HUD into the wgpu CompositionVisual surface
+  first, then attaches the visual above the video visual; on mouse leave or any
+  hidden-HUD redraw it removes the visual again. This avoids letting an empty
+  or transparent-cleared surface cover the video if the underlying DComp/wgpu
+  path treats it as opaque. The env flag remains opt-in until manual trial on
+  affected machines confirms that visible HUD pixels blend correctly.
   The 1080p120 soak kept `late_drop=0` for 601 frames over 5 seconds with max
   interval 9.8ms, so the egui overlay surface can coexist with the native video
   visual without coupling redraw cadence.

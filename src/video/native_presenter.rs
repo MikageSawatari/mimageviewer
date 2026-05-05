@@ -92,7 +92,10 @@ struct NativeTestOverlay {
 
 struct NativeEguiOverlay {
     surface: wgpu::Surface<'static>,
-    _visual: IDCompositionVisual,
+    visual: IDCompositionVisual,
+    dcomp_device: IDCompositionDevice,
+    root_visual: IDCompositionVisual,
+    after_visual: IDCompositionVisual,
     _instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -114,6 +117,7 @@ struct NativeEguiOverlay {
     video_duration_secs: f64,
     video_is_playing: bool,
     last_seek_target_secs: Option<f64>,
+    visual_attached: bool,
     pixels_per_point: f32,
     width: u32,
     height: u32,
@@ -333,16 +337,14 @@ impl NativeVideoPresenter {
                     .map_err(|e| format!("CreateVisual egui overlay: {e:?}"))?;
                 match NativeEguiOverlay::new(
                     overlay_visual,
+                    &dcomp_device,
+                    &root_visual,
+                    &video_visual,
                     config.hwnd,
                     config.width,
                     config.height,
                 ) {
                     Ok(mut overlay) => {
-                        root_visual
-                            .AddVisual(&overlay._visual, true, &video_visual)
-                            .map_err(|e| {
-                                format!("IDCompositionVisual::AddVisual egui overlay: {e:?}")
-                            })?;
                         if let Err(err) = overlay.render_once() {
                             crate::logger::log(format!(
                                 "native-presenter: egui overlay initial render failed: {err}"
@@ -1137,6 +1139,9 @@ impl NativeBlackBackground {
 impl NativeEguiOverlay {
     fn new(
         visual: IDCompositionVisual,
+        dcomp_device: &IDCompositionDevice,
+        root_visual: &IDCompositionVisual,
+        after_visual: &IDCompositionVisual,
         hwnd: HWND,
         width: u32,
         height: u32,
@@ -1187,7 +1192,10 @@ impl NativeEguiOverlay {
         let pixels_per_point = pixels_per_point_for_hwnd(hwnd);
         let this = Self {
             surface,
-            _visual: visual,
+            visual,
+            dcomp_device: dcomp_device.clone(),
+            root_visual: root_visual.clone(),
+            after_visual: after_visual.clone(),
             _instance: instance,
             adapter,
             device,
@@ -1209,6 +1217,7 @@ impl NativeEguiOverlay {
             video_duration_secs: 0.0,
             video_is_playing: false,
             last_seek_target_secs: None,
+            visual_attached: false,
             pixels_per_point,
             width: width.max(1),
             height: height.max(1),
@@ -1227,6 +1236,7 @@ impl NativeEguiOverlay {
                 ("alpha_mode", Value::from(format!("{:?}", this.alpha_mode))),
                 ("adapter", Value::from(this.adapter.get_info().name)),
                 ("pixels_per_point", Value::from(this.pixels_per_point)),
+                ("visual_attached", Value::from(this.visual_attached)),
             ],
         );
         Ok(this)
@@ -1387,6 +1397,32 @@ impl NativeEguiOverlay {
         );
     }
 
+    fn set_visual_attached(&mut self, attached: bool) -> Result<(), String> {
+        if self.visual_attached == attached {
+            return Ok(());
+        }
+        unsafe {
+            if attached {
+                self.root_visual
+                    .AddVisual(&self.visual, true, &self.after_visual)
+                    .map_err(|e| format!("IDCompositionVisual::AddVisual egui overlay: {e:?}"))?;
+            } else {
+                self.root_visual.RemoveVisual(&self.visual).map_err(|e| {
+                    format!("IDCompositionVisual::RemoveVisual egui overlay: {e:?}")
+                })?;
+            }
+            self.dcomp_device
+                .Commit()
+                .map_err(|e| format!("IDCompositionDevice::Commit egui overlay visual: {e:?}"))?;
+        }
+        self.visual_attached = attached;
+        log_event(
+            "egui_overlay_visual",
+            &[("attached", Value::from(self.visual_attached))],
+        );
+        Ok(())
+    }
+
     fn render_once(&mut self) -> Result<Vec<NativeOverlayCommand>, String> {
         let render_t0 = Instant::now();
         let ppp = self.pixels_per_point;
@@ -1402,6 +1438,7 @@ impl NativeEguiOverlay {
         let mut commands = Vec::new();
         let mut last_seek_target_secs = self.last_seek_target_secs;
         if !hud_visible {
+            self.set_visual_attached(false)?;
             last_seek_target_secs = None;
         }
         let mut raw_input = egui::RawInput {
@@ -1612,6 +1649,9 @@ impl NativeEguiOverlay {
         submissions.push(encoder.finish());
         self.queue.submit(submissions);
         surface_texture.present();
+        if hud_visible {
+            self.set_visual_attached(true)?;
+        }
         for id in &full_output.textures_delta.free {
             self.renderer.free_texture(id);
         }
@@ -1628,6 +1668,8 @@ impl NativeEguiOverlay {
                 ("paint_jobs", Value::from(paint_jobs.len() as i64)),
                 ("wants_pointer", Value::from(self.wants_pointer_input)),
                 ("wants_keyboard", Value::from(self.wants_keyboard_input)),
+                ("hud_visible", Value::from(hud_visible)),
+                ("visual_attached", Value::from(self.visual_attached)),
                 (
                     "render_ms",
                     Value::from(render_t0.elapsed().as_secs_f64() * 1000.0),

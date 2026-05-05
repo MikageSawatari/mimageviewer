@@ -87,6 +87,13 @@ Status:
   for Windows fullscreen video trial use, but is opt-in again via
   `MIV_NATIVE_VIDEO_EGUI_OVERLAY=1` while an opaque-black blank overlay visual
   is investigated on production machines.
+- 2026-05-05: blank overlay frames no longer rely solely on transparent
+  surface composition. The egui overlay DComp visual is detached from the root
+  visual tree while the HUD is hidden and reattached only after a visible HUD
+  frame has been rendered, so a driver path that treats the blank wgpu surface
+  as opaque cannot cover the video. Keep the flag opt-in until this visual
+  attach/detach path is manually verified on the production machines that saw
+  the black overlay.
 
 Acceptance for the spike:
 
@@ -100,8 +107,9 @@ Acceptance for the spike:
 - `SurfaceTargetUnsafe::CompositionVisual` is DX12-only. If wgpu chooses another
   backend, overlay creation must fail closed and the native presenter should
   keep video-only mode.
-- Alpha support depends on the surface format and DComp surface path. The spike
-  must prove transparent pixels actually compose correctly.
+- Alpha support depends on the surface format and DComp surface path. The
+  overlay now detaches its visual when no HUD is visible, but visible HUD
+  pixels still need transparent composition around the drawn controls.
 - The overlay wgpu device may be separate from the existing eframe render state.
   That is acceptable for a first spike, but production should avoid duplicating
   large GPU resources if it becomes expensive.
