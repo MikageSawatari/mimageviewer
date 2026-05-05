@@ -13062,6 +13062,14 @@ impl App {
             self.close_fullscreen();
             return;
         }
+        #[cfg(windows)]
+        if native_owner_hwnd != 0 {
+            let pump_interval = std::time::Duration::from_millis(16);
+            next_repaint = Some(match next_repaint {
+                Some(prev) => prev.min(pump_interval),
+                None => pump_interval,
+            });
+        }
         if do_save {
             self.video_resume_last_save = Some(now);
             for (key, pos, dur) in updates {

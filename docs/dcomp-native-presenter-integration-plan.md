@@ -124,6 +124,11 @@ Status:
   after the presenter HWND appears. This absorbs a double-click startup race
   where the main thumbnail grid can reclaim z-order after the first raise while
   the native presenter is already playing.
+- 2026-05-05: while a native presenter HWND is active, the UI thread keeps a
+  lightweight 16ms repaint pump alive even though video frames are presented on
+  the native thread. This prevents native-window shortcut events such as Escape
+  from sitting in the UI event queue when the hidden egui fullscreen viewport
+  has no other reason to repaint.
 - 2026-05-04: production GPU frames initially followed the decoder's keyed-mutex
   protocol (`ReleaseSync(1)` on the producer side, `AcquireSync(1)` /
   `ReleaseSync(0)` on the presenter side) before copying the shared texture.
