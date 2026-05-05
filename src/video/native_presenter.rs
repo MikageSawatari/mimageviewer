@@ -1,3 +1,7 @@
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -22,8 +26,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 use windows::Win32::Graphics::Dxgi::{
     DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
     DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGIOutput, IDXGISwapChain1,
-    IDXGISwapChain2,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIFactory2, IDXGIKeyedMutex, IDXGIOutput,
+    IDXGISwapChain1, IDXGISwapChain2,
 };
 use windows::Win32::System::Threading::WaitForSingleObject;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
@@ -137,8 +141,25 @@ struct NativePixelSample {
 }
 
 struct SourceKeyedMutexAcquire {
+    guard: Option<KeyedMutexReadGuard>,
     cast_ms: f64,
     acquire_ms: f64,
+}
+
+struct KeyedMutexReadGuard {
+    mutex: IDXGIKeyedMutex,
+    released_to_reader: Option<Arc<AtomicBool>>,
+}
+
+impl Drop for KeyedMutexReadGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.mutex.ReleaseSync(0);
+        }
+        if let Some(released) = &self.released_to_reader {
+            released.store(false, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -485,10 +506,14 @@ impl NativeVideoPresenter {
                 shared_cache_hit = cache_hit;
                 open_shared_ms = open_shared_t0.elapsed().as_secs_f64() * 1000.0;
                 let keyed_mutex_t0 = Instant::now();
-                let keyed_mutex = self.acquire_source_keyed_mutex(&src)?;
+                let keyed_mutex = self.acquire_source_keyed_mutex(
+                    &src,
+                    gpu_frame.shared_output_released_to_reader.clone(),
+                )?;
                 keyed_mutex_ms = keyed_mutex_t0.elapsed().as_secs_f64() * 1000.0;
                 keyed_mutex_cast_ms = keyed_mutex.cast_ms;
                 keyed_mutex_acquire_ms = keyed_mutex.acquire_ms;
+                let _keyed_mutex_guard = keyed_mutex.guard;
                 let src_probe = if probe_this_frame {
                     Some(self.sample_texture_pixel(&src, "source")?)
                 } else {
@@ -745,16 +770,32 @@ impl NativeVideoPresenter {
 
     fn acquire_source_keyed_mutex(
         &self,
-        _texture: &ID3D11Texture2D,
+        texture: &ID3D11Texture2D,
+        released_to_reader: Option<Arc<AtomicBool>>,
     ) -> Result<SourceKeyedMutexAcquire, String> {
-        // The producer-side shared fence already orders writes before this copy.
-        // Calling IDXGIKeyedMutex::AcquireSync(1) here caused driver stalls of
-        // 25-35ms even with a zero timeout. The pooled producer now recovers
-        // key=1 slots before reuse, so the presenter keeps the hot path
-        // fence-only.
+        let cast_t0 = Instant::now();
+        let Ok(mutex) = texture.cast::<IDXGIKeyedMutex>() else {
+            return Ok(SourceKeyedMutexAcquire {
+                guard: None,
+                cast_ms: cast_t0.elapsed().as_secs_f64() * 1000.0,
+                acquire_ms: 0.0,
+            });
+        };
+        let cast_ms = cast_t0.elapsed().as_secs_f64() * 1000.0;
+        let acquire_t0 = Instant::now();
+        unsafe {
+            mutex
+                .AcquireSync(1, 10)
+                .map_err(|e| format!("source keyed mutex AcquireSync(1): {e:?}"))?;
+        }
+        let acquire_ms = acquire_t0.elapsed().as_secs_f64() * 1000.0;
         Ok(SourceKeyedMutexAcquire {
-            cast_ms: 0.0,
-            acquire_ms: 0.0,
+            guard: Some(KeyedMutexReadGuard {
+                mutex,
+                released_to_reader,
+            }),
+            cast_ms,
+            acquire_ms,
         })
     }
 

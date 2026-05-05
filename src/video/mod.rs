@@ -480,7 +480,7 @@ fn run_native_video_output(
             width,
             height,
             test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
-            egui_overlay: native_video_env_flag_enabled("MIV_NATIVE_VIDEO_EGUI_OVERLAY", true),
+            egui_overlay: native_video_env_flag_enabled("MIV_NATIVE_VIDEO_EGUI_OVERLAY", false),
         },
     )?;
     crate::logger::log(format!(
@@ -601,7 +601,13 @@ fn run_native_video_output(
             }
             let force_first_frame =
                 waiting_for_first_frame && front.seek_serial == last_seen_serial;
-            if force_first_frame || front.pts_secs <= now + clock::DISPLAY_LEAD_TOLERANCE_SECS {
+            let force_display_seek = clock.is_seeking()
+                && front.seek_serial == last_seen_serial
+                && clock::pts_clears_seek_override(front.pts_secs, now);
+            if force_first_frame
+                || force_display_seek
+                || front.pts_secs <= now + clock::DISPLAY_LEAD_TOLERANCE_SECS
+            {
                 latest_renderable = Some(queue.pop_front().expect("queue.front() returned Some"));
             }
             break;

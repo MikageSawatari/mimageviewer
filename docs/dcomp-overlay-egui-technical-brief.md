@@ -83,9 +83,10 @@ Status:
   drag seek commands are coalesced to target changes of roughly 100ms or more,
   and the presenter gives the visible HUD a 250ms playback tick so progress
   remains live even when the pointer is stationary.
-- 2026-05-05: the egui overlay is default-on with the native presenter for
-  Windows fullscreen video trial use. Set `MIV_NATIVE_VIDEO_EGUI_OVERLAY=0` to
-  keep native video while disabling the overlay HUD.
+- 2026-05-05: the egui overlay was briefly default-on with the native presenter
+  for Windows fullscreen video trial use, but is opt-in again via
+  `MIV_NATIVE_VIDEO_EGUI_OVERLAY=1` while an opaque-black blank overlay visual
+  is investigated on production machines.
 
 Acceptance for the spike:
 

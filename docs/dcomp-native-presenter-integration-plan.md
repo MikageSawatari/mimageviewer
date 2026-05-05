@@ -123,9 +123,11 @@ Status:
 - 2026-05-04: production GPU frames initially followed the decoder's keyed-mutex
   protocol (`ReleaseSync(1)` on the producer side, `AcquireSync(1)` /
   `ReleaseSync(0)` on the presenter side) before copying the shared texture.
-  On 2026-05-05 Phase D changed the presenter hot path to fence-only reads
-  because `AcquireSync(1)` could stall the presenter thread for 25-35ms; the
-  producer now recovers key=1 pooled slots before reuse. The video swap chain is
+  On 2026-05-05 Phase D found that D3D12/wgpu consumers can be fence-only, but
+  the native D3D11 presenter must still acquire key=1 before copying or the
+  shared texture can read back as black on production hardware. The producer
+  also recovers key=1 pooled slots before reuse so non-D3D11 consumers do not
+  leave the pool locked. The video swap chain is
   resized to the source frame size and the video visual is aspect-fit to the
   native fullscreen HWND with a DirectComposition transform, so a 1080p clip can
   fill a 4K fullscreen window without coupling the video copy path to the window
@@ -153,9 +155,9 @@ Current limitations of the experimental slice:
   still need a fallback or a dedicated presentation path.
 - 2026-05-05: the production native presenter is now the default Windows
   fullscreen video path for trial use. Set `MIV_NATIVE_VIDEO_PRESENTER=0` to
-  return to the legacy egui fullscreen presenter, or
-  `MIV_NATIVE_VIDEO_EGUI_OVERLAY=0` to keep native video while disabling the
-  egui DComp overlay HUD.
+  return to the legacy egui fullscreen presenter. The egui DComp overlay HUD is
+  opt-in again via `MIV_NATIVE_VIDEO_EGUI_OVERLAY=1` while its alpha/blank
+  visual behavior is investigated on production machines.
 
 ## Phase C: Overlay Strategy
 
@@ -188,9 +190,10 @@ Status:
 - 2026-05-04: the CompositionVisual/egui-wgpu spike was implemented behind
   `MIV_NATIVE_VIDEO_EGUI_OVERLAY=1`. It uses a standalone egui context and
   renderer to draw into the second DComp visual, with video-only fail-closed
-  behavior if the overlay cannot initialize. As of 2026-05-05, the egui overlay
-  is default-on with the native presenter for trial use; set
-  `MIV_NATIVE_VIDEO_EGUI_OVERLAY=0` to disable only the overlay.
+  behavior if the overlay cannot initialize. It was briefly default-on with the
+  native presenter during the 2026-05-05 trial, but is opt-in again because an
+  empty overlay surface can appear as an opaque black visual on at least one
+  production setup.
   The 1080p120 soak kept `late_drop=0` for 601 frames over 5 seconds with max
   interval 9.8ms, so the egui overlay surface can coexist with the native video
   visual without coupling redraw cadence.
@@ -304,12 +307,13 @@ remain stable across frames; `OpenSharedResource1` should be limited to pool
 warmup and source size/format changes. A 2026-05-05 Phase D trace showed that
 consumer-side `IDXGIKeyedMutex::AcquireSync(1)` can block the native presenter
 thread for 25-35ms even with a zero timeout, while the shared fence, shared
-texture cache, and copy call remain sub-millisecond. The native presenter now
-treats the source read as fence-only: it waits the producer's shared fence,
-copies the shared texture, and does not acquire the keyed mutex on the hot path.
-The producer tracks slots released to readers and recovers key=1 back to key=0
-immediately before reusing a pooled output slot; trace runs should keep
-`native_keyed_acq_max_ms` at 0 and `native_recover_max_ms` below 1ms.
+texture cache, and copy call remain sub-millisecond. Follow-up validation showed
+that the native D3D11 presenter still has to acquire key=1 before copying; using
+only the fence made the source texture read as black. D3D12/wgpu consumers remain
+fence-only, and the producer tracks slots released to readers so it can recover
+key=1 back to key=0 immediately before reusing a pooled output slot. Trace runs
+should keep keyed mutex acquire time small in steady state and
+`native_recover_max_ms` below 1ms.
 Trace events split `keyed_mutex_ms` into `keyed_mutex_cast_ms` and
 `keyed_mutex_acquire_ms` so Phase D can distinguish COM interface lookup from
 the `AcquireSync(1)` wait.
