@@ -131,14 +131,17 @@ Status:
   native frame has presented, or before the UI thread has raised the native HWND
   at least once, the legacy egui fullscreen viewport is shown as an opaque black
   startup curtain instead of drawing thumbnails, placeholder text, or a
-  transparent window. Once the first native present succeeds and the native HWND
-  has been raised, the viewport is hidden through the same opaque-black builder
-  and a final black paint so the `Visible(false)` transition cannot briefly
-  reveal the thumbnail grid. The UI thread also forces one more native HWND
-  raise immediately after that hide tick, because touching the egui fullscreen
-  viewport can otherwise transiently move it above the native HWND. This masks
-  the last grid/white-frame flash during double-click startup without
-  introducing a second Win32 shield window.
+  transparent window. After the first native present succeeds and the native
+  HWND has been raised, that viewport stays visible as the same opaque black
+  backdrop behind the native HWND instead of being hidden. Avoiding
+  `Visible(false)` during active native playback prevents the fullscreen
+  viewport's hide/activation transition from briefly revealing the thumbnail
+  grid if Windows reorders regular HWND composition for one frame. The backdrop
+  is hidden only by the normal fullscreen-exit path. Because the backdrop
+  remains visible, the UI thread keeps a cheap foreground-only `HWND_TOP` raise
+  at the 16ms native-input pump cadence while native fullscreen is active; this
+  uses no TOPMOST pulse and only preserves the native HWND above its black
+  backdrop.
 - 2026-05-05: while a native presenter HWND is active, the UI thread keeps a
   lightweight 16ms repaint pump alive even though video frames are presented on
   the native thread. This prevents native-window shortcut events such as Escape

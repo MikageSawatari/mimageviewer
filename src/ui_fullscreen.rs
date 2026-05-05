@@ -988,12 +988,12 @@ impl App {
         // ── 状態の事前計算 ──
         #[cfg(windows)]
         if self.native_video_presenter_pending_for_fs(fs_idx) {
-            self.show_native_video_startup_curtain(ctx);
+            self.show_native_video_black_backdrop(ctx);
             return;
         }
         #[cfg(windows)]
         if self.native_video_presenter_hwnd_for_fs(fs_idx).is_some() {
-            self.hide_fullscreen_viewport_for_native(ctx);
+            self.show_native_video_black_backdrop(ctx);
             return;
         }
 
@@ -1912,14 +1912,14 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn show_native_video_startup_curtain(&mut self, ctx: &egui::Context) {
+    fn show_native_video_black_backdrop(&mut self, ctx: &egui::Context) {
         let fs_id = self.fullscreen_viewport_id();
         let fs_builder = self.build_fullscreen_viewport_builder_with_transparency(false);
         let need_show = !self.fs_viewport_shown;
         let mut close_fs = false;
         ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
-            // Visible な fullscreen viewport なので、native HWND 起動待ちの
-            // 黒カーテン中も IME 状態だけは通常 viewport と同じ入口で更新する。
+            // Visible な fullscreen viewport なので、native 動画の黒 backdrop 中も
+            // IME 状態だけは通常 viewport と同じ入口で更新する。
             self.update_ime_state(ctx);
             if need_show {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -1940,33 +1940,6 @@ impl App {
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
-        }
-    }
-
-    #[cfg(windows)]
-    fn hide_fullscreen_viewport_for_native(&mut self, ctx: &egui::Context) {
-        let fs_id = self.fullscreen_viewport_id();
-        let fs_builder = self
-            .build_fullscreen_viewport_builder_with_transparency(false)
-            .with_visible(false);
-        ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
-            // Visible(false) が DWM に反映されるまでの遷移 tick でも、
-            // 透明化して背後のグリッドを透かさない。
-            egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(egui::Color32::BLACK))
-                .show(ctx, |_ui| {});
-        });
-        if self.fs_viewport_shown {
-            crate::dwm_transitions::disable_transitions_for_thread_windows();
-            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
-            self.fs_viewport_shown = false;
-            // この tick では egui fullscreen viewport を hide するために触っている。
-            // 直後の App::update 末尾で native HWND を必ず上げ直し、hide 反映までの
-            // 隙間でサムネイルグリッドが前面化しないようにする。
-            self.force_native_video_front_raise_next_tick();
-            crate::logger::log(
-                "[native-video] hid egui fullscreen viewport behind native presenter".to_string(),
-            );
         }
     }
 

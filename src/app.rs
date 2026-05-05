@@ -2429,14 +2429,9 @@ pub struct App {
     /// native HWND 作成後に短時間 z-order を補正する。
     pub(crate) native_video_front_synced_hwnd: u64,
     #[cfg(windows)]
-    /// Native HWND 作成直後の z-order boost 期限。ダブルクリック起動では main/egui
-    /// 側の window operation が直後に走ることがあるため、一度だけの raise では
-    /// thumbnail grid が前面に残る race がある。
-    native_video_front_raise_until: Option<std::time::Instant>,
-    #[cfg(windows)]
     /// Native HWND の z-order maintenance を間引くための最終 raise 時刻。
-    /// 起動後の短い window-operation race だけでなく、main grid が後勝ちで前面化した
-    /// 場合にも mIV が foreground の間だけ低頻度に補正する。
+    /// native 再生中は黒 backdrop も alive なので、mIV が foreground の間だけ
+    /// 16ms pump に合わせて通常の HWND_TOP raise を保つ。
     native_video_front_last_raise: Option<std::time::Instant>,
     #[cfg(windows)]
     /// Native fullscreen presenter 上の左クリック候補。overlay hit-test が入るまでの
@@ -2965,8 +2960,6 @@ impl Default for App {
             native_video_owner_synced_hwnd: 0,
             #[cfg(windows)]
             native_video_front_synced_hwnd: 0,
-            #[cfg(windows)]
-            native_video_front_raise_until: None,
             #[cfg(windows)]
             native_video_front_last_raise: None,
             #[cfg(windows)]
@@ -10917,7 +10910,6 @@ impl App {
         {
             self.vst3_deferred_video_open = None;
             self.native_video_front_synced_hwnd = 0;
-            self.native_video_front_raise_until = None;
             self.native_video_front_last_raise = None;
             self.native_video_pointer_down = None;
         }
@@ -13072,7 +13064,6 @@ impl App {
         #[cfg(windows)]
         if native_closed_idx.is_some() {
             self.native_video_front_synced_hwnd = 0;
-            self.native_video_front_raise_until = None;
             self.native_video_front_last_raise = None;
             self.close_fullscreen();
             return;
@@ -13110,7 +13101,6 @@ impl App {
     fn ensure_native_video_front(&mut self) {
         if self.fullscreen_idx.is_none() {
             self.native_video_front_synced_hwnd = 0;
-            self.native_video_front_raise_until = None;
             self.native_video_front_last_raise = None;
             return;
         }
@@ -13127,24 +13117,19 @@ impl App {
             .unwrap_or(0);
         if hwnd == 0 {
             self.native_video_front_synced_hwnd = 0;
-            self.native_video_front_raise_until = None;
             self.native_video_front_last_raise = None;
             return;
         }
         let now = std::time::Instant::now();
         let is_new_hwnd = hwnd != self.native_video_front_synced_hwnd;
         if is_new_hwnd {
-            self.native_video_front_raise_until = Some(now + std::time::Duration::from_secs(3));
             self.native_video_front_last_raise = None;
         }
 
-        let in_startup_boost = self
-            .native_video_front_raise_until
-            .is_some_and(|deadline| now < deadline);
         let periodic_due = self.native_video_front_last_raise.is_none_or(|last| {
-            now.saturating_duration_since(last) >= std::time::Duration::from_millis(100)
+            now.saturating_duration_since(last) >= std::time::Duration::from_millis(16)
         });
-        if !is_new_hwnd && (!in_startup_boost || !periodic_due) {
+        if !is_new_hwnd && !periodic_due {
             return;
         }
         if !crate::video::native_window::foreground_belongs_to_current_process() {
@@ -13161,11 +13146,6 @@ impl App {
                 ));
             }
         }
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn force_native_video_front_raise_next_tick(&mut self) {
-        self.native_video_front_last_raise = None;
     }
 
     #[cfg(windows)]
