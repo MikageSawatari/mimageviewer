@@ -122,6 +122,7 @@ struct NativeEguiOverlay {
     video_volume: f64,
     video_muted: bool,
     video_loop_enabled: bool,
+    vst3_available: bool,
     first_frame_presented: bool,
     video_error: Option<String>,
     toast: Option<NativeOverlayToast>,
@@ -965,6 +966,12 @@ impl NativeVideoPresenter {
         }
     }
 
+    pub fn set_overlay_vst3_available(&mut self, available: bool) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_vst3_available(available);
+        }
+    }
+
     pub fn set_overlay_playback_status(
         &mut self,
         first_frame_presented: bool,
@@ -1585,6 +1592,7 @@ impl NativeEguiOverlay {
             video_volume: 1.0,
             video_muted: false,
             video_loop_enabled: false,
+            vst3_available: false,
             first_frame_presented: false,
             video_error: None,
             toast: None,
@@ -1889,6 +1897,14 @@ impl NativeEguiOverlay {
             return;
         }
         self.video_loop_enabled = enabled;
+        self.dirty = true;
+    }
+
+    fn set_vst3_available(&mut self, available: bool) {
+        if self.vst3_available == available {
+            return;
+        }
+        self.vst3_available = available;
         self.dirty = true;
     }
 
@@ -2197,6 +2213,7 @@ impl NativeEguiOverlay {
             .map(|(idx, (_, texture))| (*idx, texture.id()))
             .collect();
         let perf_visible = self.perf_visible;
+        let vst3_available = self.vst3_available;
         let perf_latest = self.perf_latest;
         let perf_history: Vec<_> = self.perf_history.iter().copied().collect();
         let hud_visible = self.hud_visible();
@@ -2312,6 +2329,7 @@ impl NativeEguiOverlay {
                     muted,
                     loop_enabled,
                     perf_visible,
+                    vst3_available,
                     &mut commands,
                 );
             }
@@ -3645,6 +3663,7 @@ fn draw_native_top_bar(
     muted: bool,
     loop_enabled: bool,
     perf_visible: bool,
+    vst3_available: bool,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     egui::Area::new(egui::Id::new("native_video_top_bar"))
@@ -3735,21 +3754,23 @@ fn draw_native_top_bar(
                 NativeOverlayCommand::TogglePerfOverlay,
                 commands,
             );
-            draw_native_top_button(
-                ui,
-                &painter,
-                &mut x,
-                y,
-                42.0,
-                btn_size,
-                gap,
-                "native_top_vst3",
-                NativeTopButtonGlyph::Text("VST"),
-                false,
-                "VST3 GUI 表示/非表示",
-                NativeOverlayCommand::ToggleVst3Gui,
-                commands,
-            );
+            if vst3_available {
+                draw_native_top_button(
+                    ui,
+                    &painter,
+                    &mut x,
+                    y,
+                    42.0,
+                    btn_size,
+                    gap,
+                    "native_top_vst3",
+                    NativeTopButtonGlyph::Text("VST"),
+                    false,
+                    "VST3 GUI 表示/非表示",
+                    NativeOverlayCommand::ToggleVst3Gui,
+                    commands,
+                );
+            }
 
             let bookmark_rect =
                 egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(btn_size, btn_size));

@@ -11,6 +11,16 @@ use crate::settings::{
     self, CachePolicy, Parallelism, Settings, SortOrder, SpreadMode, ThumbAspect, UiTheme,
 };
 
+#[cfg(windows)]
+pub enum Vst3ScanMessage {
+    Progress {
+        done: usize,
+        total: usize,
+        path: String,
+    },
+    Finished(Result<Vec<crate::video::dsp::DiscoveredPlugin>, String>),
+}
+
 // ── ページ列挙 ──────────────────────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -223,12 +233,17 @@ pub(crate) struct PreferencesState {
     /// VST3 scan/probe worker の完了通知。bridge subprocess で bus probe するため
     /// UI thread では直接走らせない。
     #[cfg(windows)]
-    pub vst3_scan_rx:
-        Option<std::sync::mpsc::Receiver<Result<Vec<crate::video::dsp::DiscoveredPlugin>, String>>>,
+    pub vst3_scan_rx: Option<std::sync::mpsc::Receiver<Vst3ScanMessage>>,
     #[cfg(windows)]
     pub vst3_scan_in_progress: bool,
     #[cfg(windows)]
     pub vst3_scan_error: Option<String>,
+    #[cfg(windows)]
+    pub vst3_scan_done: usize,
+    #[cfg(windows)]
+    pub vst3_scan_total: usize,
+    #[cfg(windows)]
+    pub vst3_scan_current: String,
     /// VST3 ページ内のフィルタ文字列。
     pub vst3_filter: String,
     /// 音声入力を持たない plugin (= Instrument / MIDI FX 等) も候補一覧に表示する。
@@ -308,6 +323,12 @@ impl PreferencesState {
             vst3_scan_in_progress: false,
             #[cfg(windows)]
             vst3_scan_error: None,
+            #[cfg(windows)]
+            vst3_scan_done: 0,
+            #[cfg(windows)]
+            vst3_scan_total: 0,
+            #[cfg(windows)]
+            vst3_scan_current: String::new(),
             vst3_filter: String::new(),
             #[cfg(windows)]
             vst3_show_unusable: false,
@@ -1724,29 +1745,52 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     const MAX_CHAIN_LEN: usize = 10;
 
+    let mut scan_finished: Option<Result<Vec<crate::video::dsp::DiscoveredPlugin>, String>> = None;
+    let mut scan_disconnected = false;
     if let Some(rx) = state.vst3_scan_rx.as_ref() {
-        match rx.try_recv() {
-            Ok(Ok(found)) => {
-                state.vst3_discovered = found;
-                state.vst3_scan_rx = None;
-                state.vst3_scan_in_progress = false;
-                state.vst3_scan_error = None;
-            }
-            Ok(Err(err)) => {
-                state.vst3_scan_rx = None;
-                state.vst3_scan_in_progress = false;
-                state.vst3_scan_error = Some(err);
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                ui.ctx()
-                    .request_repaint_after(std::time::Duration::from_millis(100));
-            }
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                state.vst3_scan_rx = None;
-                state.vst3_scan_in_progress = false;
-                state.vst3_scan_error = Some("VST3 scan worker が終了しました".to_string());
+        loop {
+            match rx.try_recv() {
+                Ok(Vst3ScanMessage::Progress { done, total, path }) => {
+                    state.vst3_scan_done = done;
+                    state.vst3_scan_total = total;
+                    state.vst3_scan_current = path;
+                    ui.ctx().request_repaint();
+                }
+                Ok(Vst3ScanMessage::Finished(result)) => {
+                    scan_finished = Some(result);
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(100));
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    scan_disconnected = true;
+                    break;
+                }
             }
         }
+    }
+    if let Some(result) = scan_finished {
+        match result {
+            Ok(found) => {
+                state.vst3_scan_done = state.vst3_scan_total;
+                state.vst3_discovered = found;
+                state.vst3_scan_error = None;
+            }
+            Err(err) => {
+                state.vst3_scan_error = Some(err);
+            }
+        }
+        state.vst3_scan_rx = None;
+        state.vst3_scan_in_progress = false;
+        state.vst3_scan_current.clear();
+    } else if scan_disconnected {
+        state.vst3_scan_rx = None;
+        state.vst3_scan_in_progress = false;
+        state.vst3_scan_current.clear();
+        state.vst3_scan_error = Some("VST3 scan worker が終了しました".to_string());
     }
 
     ui.label(
@@ -1881,11 +1925,18 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
     // ── プラグイン追加 ──
     ui.horizontal(|ui| {
         let scan_label = if state.vst3_scan_in_progress {
-            "スキャン中..."
+            if state.vst3_scan_total > 0 {
+                format!(
+                    "スキャン中... ({}/{})",
+                    state.vst3_scan_done, state.vst3_scan_total
+                )
+            } else {
+                "スキャン中...".to_string()
+            }
         } else if state.vst3_discovered.is_empty() {
-            "プラグインをスキャン"
+            "プラグインをスキャン".to_string()
         } else {
-            "再スキャン"
+            "再スキャン".to_string()
         };
         if ui
             .add_enabled(!state.vst3_scan_in_progress, egui::Button::new(scan_label))
@@ -1898,18 +1949,55 @@ fn page_vst3(ui: &mut egui::Ui, state: &mut PreferencesState) {
             state.vst3_scan_rx = Some(rx);
             state.vst3_scan_in_progress = true;
             state.vst3_scan_error = None;
+            state.vst3_scan_done = 0;
+            state.vst3_scan_total = 0;
+            state.vst3_scan_current = "候補を列挙中...".to_string();
             if let Err(e) = std::thread::Builder::new()
                 .name("vst3-scan-probe".into())
                 .spawn(move || {
+                    let _ = tx.send(Vst3ScanMessage::Progress {
+                        done: 0,
+                        total: 0,
+                        path: "候補を列挙中...".to_string(),
+                    });
                     let roots = crate::video::dsp::default_vst3_paths();
-                    let result = crate::video::dsp::scan_with_audio_probe(&roots);
-                    let _ = tx.send(result);
+                    let progress_tx = tx.clone();
+                    let result =
+                        crate::video::dsp::scan_with_audio_probe_progress(&roots, |done, total, path| {
+                            let label = path
+                                .file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("")
+                                .to_string();
+                            let _ = progress_tx.send(Vst3ScanMessage::Progress {
+                                done,
+                                total,
+                                path: label,
+                            });
+                        });
+                    let _ = tx.send(Vst3ScanMessage::Finished(result));
                 })
             {
                 state.vst3_scan_rx = None;
                 state.vst3_scan_in_progress = false;
+                state.vst3_scan_current.clear();
                 state.vst3_scan_error = Some(format!("scan worker 起動失敗: {e}"));
             }
+        }
+        if state.vst3_scan_in_progress {
+            let mut progress = if state.vst3_scan_total > 0 {
+                format!(
+                    "({}/{})",
+                    state.vst3_scan_done, state.vst3_scan_total
+                )
+            } else {
+                "(列挙中)".to_string()
+            };
+            if !state.vst3_scan_current.is_empty() {
+                progress.push(' ');
+                progress.push_str(&state.vst3_scan_current);
+            }
+            ui.label(egui::RichText::new(progress).small().weak());
         }
         if !state.vst3_discovered.is_empty() {
             let hidden_unusable = state

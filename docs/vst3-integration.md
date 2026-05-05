@@ -377,3 +377,15 @@ bridge forwards `onSize()` to the plugin but temporarily suppresses the host
 HWND `SetWindowPos` side effect from `resizeView`. After the restored attach
 settles, host resizing is re-enabled so explicit plugin/user resize paths keep
 their existing behavior.
+
+## 2026-05 native fullscreen HUD and scan progress
+
+The native fullscreen video HUD only shows its `VST` top-bar button when
+`settings.vst3_enabled` is true. When VST3 processing is disabled, fullscreen
+playback does not advertise the VST3 playback panel because the button cannot
+open a useful plugin GUI workspace.
+
+The Preferences VST3 scanner reports probe progress over the scan worker
+channel. The UI drains progress messages and shows the current `(done/total)`
+count, plus the plugin currently being probed, while the bridge subprocess probe
+continues off the UI thread.

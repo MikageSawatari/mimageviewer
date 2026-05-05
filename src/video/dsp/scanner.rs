@@ -147,7 +147,20 @@ struct ProbeResult {
 /// UI thread から直接呼ばず、環境設定の scan worker から呼ぶ想定。
 #[cfg(windows)]
 pub fn scan_with_audio_probe(roots: &[PathBuf]) -> Result<Vec<DiscoveredPlugin>, String> {
+    scan_with_audio_probe_progress(roots, |_, _, _| {})
+}
+
+#[cfg(windows)]
+pub fn scan_with_audio_probe_progress<F>(
+    roots: &[PathBuf],
+    progress: F,
+) -> Result<Vec<DiscoveredPlugin>, String>
+where
+    F: Fn(usize, usize, &Path) + Sync,
+{
     let mut plugins = scan(roots);
+    let total = plugins.len();
+    progress(0, total, Path::new(""));
     if plugins.is_empty() {
         return Ok(plugins);
     }
@@ -161,6 +174,7 @@ pub fn scan_with_audio_probe(roots: &[PathBuf]) -> Result<Vec<DiscoveredPlugin>,
         .build()
         .map_err(|e| format!("vst3 probe thread pool: {e}"))?;
 
+    let completed = std::sync::atomic::AtomicUsize::new(0);
     pool.install(|| {
         plugins.par_iter_mut().for_each(|plugin| {
             match probe_plugin_with_bridge(&exe, &plugin.path) {
@@ -181,6 +195,8 @@ pub fn scan_with_audio_probe(roots: &[PathBuf]) -> Result<Vec<DiscoveredPlugin>,
                     plugin.probe_error = Some(err);
                 }
             }
+            let done = completed.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+            progress(done, total, &plugin.path);
         });
     });
 

@@ -10364,6 +10364,7 @@ impl App {
                         self.main_hwnd,
                         self.video_perf_overlay_visible,
                         self.video_tile_reopen_pending,
+                        self.settings.vst3_enabled,
                     ),
                 );
                 if self.settings.video_start_muted || play_test_mute {
@@ -13049,6 +13050,8 @@ impl App {
                 player.set_loop_enabled(loop_enabled);
                 #[cfg(windows)]
                 player.set_native_loop_enabled(loop_enabled);
+                #[cfg(windows)]
+                player.set_native_vst3_available(self.settings.vst3_enabled);
                 if let Some(d) = player.tick(ctx) {
                     let d = if player.is_playing() {
                         d.min(std::time::Duration::from_millis(16))
@@ -13104,6 +13107,7 @@ impl App {
             self.sync_native_video_metadata(fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);
             self.sync_native_video_tile_overlay(ctx, fs_idx);
+            self.sync_native_video_vst3_available(fs_idx);
         }
         #[cfg(windows)]
         if native_closed_idx.is_some() {
@@ -13649,6 +13653,14 @@ impl App {
             }
         });
         player.set_native_metadata(metadata);
+    }
+
+    #[cfg(windows)]
+    fn sync_native_video_vst3_available(&self, fs_idx: usize) {
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return;
+        };
+        player.set_native_vst3_available(self.settings.vst3_enabled);
     }
 
     #[cfg(windows)]
@@ -17166,6 +17178,7 @@ fn native_video_presenter_config(
     main_hwnd: Option<isize>,
     perf_overlay_visible: bool,
     initial_tile_overlay: bool,
+    vst3_available: bool,
 ) -> Option<crate::video::NativeVideoOutputConfig> {
     if !env_flag_enabled("MIV_NATIVE_VIDEO_PRESENTER", true) {
         return None;
@@ -17197,6 +17210,7 @@ fn native_video_presenter_config(
         sync_interval,
         perf_overlay_visible,
         initial_tile_overlay,
+        vst3_available,
     })
 }
 

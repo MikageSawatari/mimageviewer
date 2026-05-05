@@ -24,7 +24,10 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub use bridge::{Bridge, Cmd, Event};
-pub use scanner::{DiscoveredPlugin, default_vst3_paths, scan, scan_with_audio_probe};
+pub use scanner::{
+    DiscoveredPlugin, default_vst3_paths, scan, scan_with_audio_probe,
+    scan_with_audio_probe_progress,
+};
 
 /// PDC (Plugin Delay Compensation) で許容する最大遅延 (秒)。
 ///

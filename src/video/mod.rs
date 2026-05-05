@@ -179,6 +179,7 @@ pub struct NativeVideoOutputConfig {
     pub sync_interval: u32,
     pub perf_overlay_visible: bool,
     pub initial_tile_overlay: bool,
+    pub vst3_available: bool,
 }
 
 #[cfg(windows)]
@@ -222,6 +223,9 @@ enum NativeVideoOutputCommand {
     },
     SetLoopEnabled {
         enabled: bool,
+    },
+    SetVst3Available {
+        available: bool,
     },
     SetPlaybackStatus {
         first_frame_presented: bool,
@@ -359,6 +363,12 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetLoopEnabled { enabled });
+    }
+
+    fn set_vst3_available(&self, available: bool) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetVst3Available { available });
     }
 
     fn set_tile_overlay(&self, tile_overlay: Option<native_presenter::NativeOverlayTileOverlay>) {
@@ -735,6 +745,7 @@ fn run_native_video_output(
         height,
         config.sync_interval
     ));
+    presenter.set_overlay_vst3_available(config.vst3_available);
     if config.initial_tile_overlay {
         presenter.set_overlay_tile_overlay(Some(
             crate::video::native_presenter::NativeOverlayTileOverlay::preparing(),
@@ -806,6 +817,9 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetLoopEnabled { enabled } => {
                     presenter.set_overlay_loop_enabled(enabled);
+                }
+                NativeVideoOutputCommand::SetVst3Available { available } => {
+                    presenter.set_overlay_vst3_available(available);
                 }
                 NativeVideoOutputCommand::SetPlaybackStatus {
                     first_frame_presented,
@@ -1744,6 +1758,13 @@ impl VideoPlayer {
     pub fn set_native_loop_enabled(&self, enabled: bool) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_loop_enabled(enabled);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_vst3_available(&self, available: bool) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_vst3_available(available);
         }
     }
 
