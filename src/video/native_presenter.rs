@@ -410,6 +410,7 @@ pub enum NativeOverlayCommand {
     ToggleTileMode,
     TogglePerfOverlay,
     ToggleVst3Gui,
+    CloseFullscreen,
     SetVst3PanelVisible {
         visible: bool,
     },
@@ -2440,9 +2441,6 @@ impl NativeEguiOverlay {
                     position_secs,
                     duration_secs,
                     video_metadata.as_ref(),
-                    is_playing,
-                    muted,
-                    loop_enabled,
                     perf_visible,
                     vst3_available,
                     vst3_panel_visible,
@@ -3480,6 +3478,7 @@ enum NativeTopButtonGlyph {
     TileGrid,
     PerfGraph,
     Text(&'static str),
+    Close,
 }
 
 fn draw_native_top_button(
@@ -3503,6 +3502,7 @@ fn draw_native_top_button(
     match glyph {
         NativeTopButtonGlyph::TileGrid => draw_overlay_tile_grid_icon(painter, rect),
         NativeTopButtonGlyph::PerfGraph => draw_overlay_perf_graph_icon(painter, rect),
+        NativeTopButtonGlyph::Close => draw_overlay_close_icon(painter, rect),
         NativeTopButtonGlyph::Text(label) => {
             painter.text(
                 rect.center(),
@@ -3557,6 +3557,44 @@ fn draw_overlay_perf_graph_icon(painter: &egui::Painter, rect: egui::Rect) {
         points.to_vec(),
         egui::Stroke::new(1.7, egui::Color32::from_rgb(170, 230, 255)),
     ));
+}
+
+fn draw_overlay_close_icon(painter: &egui::Painter, rect: egui::Rect) {
+    let c = rect.center();
+    let r = rect.width().min(rect.height()) * 0.26;
+    let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(242, 242, 242));
+    painter.line_segment([c + egui::vec2(-r, -r), c + egui::vec2(r, r)], stroke);
+    painter.line_segment([c + egui::vec2(r, -r), c + egui::vec2(-r, r)], stroke);
+}
+
+fn draw_overlay_vst3_gui_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    hovered: bool,
+    visible: bool,
+    enabled: bool,
+) {
+    draw_overlay_button_bg(painter, rect, hovered, visible);
+    let color = if !enabled {
+        egui::Color32::from_gray(84)
+    } else if visible {
+        egui::Color32::from_rgb(245, 132, 28)
+    } else {
+        egui::Color32::from_gray(132)
+    };
+    let fill = if visible {
+        egui::Color32::from_rgba_unmultiplied(245, 132, 28, 34)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(132, 132, 132, 20)
+    };
+    let icon_rect = egui::Rect::from_center_size(rect.center(), egui::vec2(15.0, 12.0));
+    painter.rect_filled(icon_rect, 2.0, fill);
+    painter.rect_stroke(
+        icon_rect,
+        2.0,
+        egui::Stroke::new(1.8, color),
+        egui::StrokeKind::Inside,
+    );
 }
 
 fn draw_native_center_status(
@@ -3784,9 +3822,6 @@ fn draw_native_top_bar(
     position_secs: f64,
     duration_secs: f64,
     metadata: Option<&NativeOverlayMetadata>,
-    is_playing: bool,
-    muted: bool,
-    loop_enabled: bool,
     perf_visible: bool,
     vst3_available: bool,
     vst3_panel_visible: bool,
@@ -3846,10 +3881,25 @@ fn draw_native_top_bar(
             );
 
             let btn_size = 28.0;
-            let gap = 6.0;
+            let gap = 8.0;
             let mut x = overlay_width_points - 12.0 - btn_size;
             let y = 13.0;
 
+            draw_native_top_button(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                btn_size,
+                btn_size,
+                gap,
+                "native_top_close",
+                NativeTopButtonGlyph::Close,
+                false,
+                "動画を終了",
+                NativeOverlayCommand::CloseFullscreen,
+                commands,
+            );
             draw_native_top_button(
                 ui,
                 &painter,
@@ -3896,89 +3946,6 @@ fn draw_native_top_bar(
                     NativeOverlayCommand::ToggleVst3Gui,
                     commands,
                 );
-            }
-
-            let bookmark_rect =
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(btn_size, btn_size));
-            let bookmark_resp = ui.interact(
-                bookmark_rect,
-                egui::Id::new("native_top_bookmark"),
-                egui::Sense::click(),
-            );
-            draw_overlay_button_bg(&painter, bookmark_rect, bookmark_resp.hovered(), false);
-            draw_overlay_bookmark_icon(
-                &painter,
-                bookmark_rect.center(),
-                7.0,
-                egui::Color32::from_rgb(255, 220, 82),
-            );
-            let bookmark_resp = bookmark_resp.on_hover_text("現在位置をブックマーク [B]");
-            if bookmark_resp.clicked() {
-                commands.push(NativeOverlayCommand::AddBookmarkAt {
-                    target_secs: position_secs,
-                });
-            }
-            x -= btn_size + gap;
-
-            let mute_rect =
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(btn_size, btn_size));
-            let mute_resp = ui.interact(
-                mute_rect,
-                egui::Id::new("native_top_mute"),
-                egui::Sense::click(),
-            );
-            draw_overlay_button_bg(&painter, mute_rect, mute_resp.hovered(), muted);
-            draw_overlay_speaker_icon(&painter, mute_rect.center(), 7.0, muted);
-            let mute_resp = mute_resp.on_hover_text("ミュート [M]");
-            if mute_resp.clicked() {
-                commands.push(NativeOverlayCommand::ToggleMute);
-            }
-            x -= btn_size + gap;
-
-            let loop_rect =
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(btn_size, btn_size));
-            let loop_resp = ui.interact(
-                loop_rect,
-                egui::Id::new("native_top_loop"),
-                egui::Sense::click(),
-            );
-            draw_overlay_button_bg(&painter, loop_rect, loop_resp.hovered(), loop_enabled);
-            draw_overlay_loop_icon(
-                &painter,
-                loop_rect.center(),
-                7.0,
-                if loop_enabled {
-                    egui::Color32::from_rgb(170, 230, 255)
-                } else {
-                    egui::Color32::WHITE
-                },
-            );
-            let loop_resp = loop_resp.on_hover_text(if loop_enabled {
-                "ループ再生を解除 [L]"
-            } else {
-                "ループ再生 [L]"
-            });
-            if loop_resp.clicked() {
-                commands.push(NativeOverlayCommand::ToggleLoop);
-            }
-            x -= btn_size + gap;
-
-            let play_rect =
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(btn_size, btn_size));
-            let play_resp = ui.interact(
-                play_rect,
-                egui::Id::new("native_top_play"),
-                egui::Sense::click(),
-            );
-            draw_overlay_button_bg(&painter, play_rect, play_resp.hovered(), is_playing);
-            if is_playing {
-                draw_overlay_pause_icon(&painter, play_rect.center(), 7.0);
-            } else {
-                draw_overlay_play_icon(&painter, play_rect.center(), 7.0);
-            }
-            let play_resp = play_resp.on_hover_text("再生/一時停止 [Enter]");
-            if play_resp.clicked() {
-                commands.push(NativeOverlayCommand::TogglePlay);
             }
         });
 }
@@ -4184,8 +4151,15 @@ fn draw_native_vst3_slot_row(
             );
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            let text = if slot.gui_visible { "閉" } else { "GUI" };
-            let response = ui.add_enabled(!slot.placeholder, egui::Button::new(text).small());
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(28.0, 22.0), egui::Sense::click());
+            draw_overlay_vst3_gui_icon(
+                ui.painter(),
+                rect,
+                response.hovered(),
+                slot.gui_visible,
+                !slot.placeholder,
+            );
             if response
                 .on_hover_text(if slot.gui_visible {
                     "プラグイン GUI を閉じる"
@@ -4193,6 +4167,7 @@ fn draw_native_vst3_slot_row(
                     "プラグイン GUI を表示"
                 })
                 .clicked()
+                && !slot.placeholder
             {
                 if slot.gui_visible {
                     commands.push(NativeOverlayCommand::Vst3HideSlotGui {
@@ -4388,6 +4363,20 @@ fn draw_native_tile_overlay(
                 egui::FontId::proportional(14.0),
                 egui::Color32::from_rgb(224, 224, 224),
             );
+            let close_rect = egui::Rect::from_min_size(
+                egui::pos2((overlay_width_points - 44.0).max(8.0), 10.0),
+                egui::vec2(32.0, 32.0),
+            );
+            let close_resp = ui.interact(
+                close_rect,
+                egui::Id::new("native_video_tile_close"),
+                egui::Sense::click(),
+            );
+            draw_overlay_button_bg(painter, close_rect, close_resp.hovered(), false);
+            draw_overlay_close_icon(painter, close_rect);
+            if close_resp.on_hover_text("動画に戻る [S]").clicked() {
+                commands.push(NativeOverlayCommand::ToggleTileMode);
+            }
 
             if state.progress_done == 0 && !state.finished {
                 painter.text(

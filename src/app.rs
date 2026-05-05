@@ -13317,6 +13317,9 @@ impl App {
                 self.toggle_native_video_vst3_gui();
                 self.mark_native_video_hud_activity(ctx);
             }
+            crate::video::NativeVideoOutputEvent::CloseFullscreen => {
+                self.close_fullscreen();
+            }
             crate::video::NativeVideoOutputEvent::SetVst3PanelVisible { visible } => {
                 self.set_native_video_vst3_panel_visible(visible);
                 self.sync_native_video_vst3_panel(fs_idx);

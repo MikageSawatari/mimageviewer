@@ -204,6 +204,7 @@ pub enum NativeVideoOutputEvent {
     ToggleTileMode,
     TogglePerfOverlay,
     ToggleVst3Gui,
+    CloseFullscreen,
     SetVst3PanelVisible {
         visible: bool,
     },
@@ -966,6 +967,9 @@ fn run_native_video_output(
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleVst3Gui => {
                                 let _ = ui_event_tx.send(NativeVideoOutputEvent::ToggleVst3Gui);
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::CloseFullscreen => {
+                                let _ = ui_event_tx.send(NativeVideoOutputEvent::CloseFullscreen);
                             }
                             crate::video::native_presenter::NativeOverlayCommand::SetVst3PanelVisible {
                                 visible,

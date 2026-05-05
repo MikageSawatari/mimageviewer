@@ -218,6 +218,11 @@ Status:
   The presenter renders the opaque tile curtain before its first video present,
   closing the command-delivery race where the first frame could otherwise beat
   the follow-up `SetTileOverlay` message.
+- 2026-05-05: the top hover toolbar was narrowed to overlay-only actions:
+  VST3, perf graph, S-mode thumbnails, and close fullscreen. Playback,
+  loop, mute, and bookmark actions remain on the bottom seek HUD or side
+  panels, avoiding duplicate controls and top-bar button overlap. S-mode tile
+  view also has a top-right close button that returns directly to normal video.
 - 2026-05-05: the seek/jump thumbnail worker no longer has a fixed entry-count
   cap. Generated thumbnails are retained for the lifetime of the current
   `VideoPlayer`, so videos with hundreds of chapters can keep their left-panel
