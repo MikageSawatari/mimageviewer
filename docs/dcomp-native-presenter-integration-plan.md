@@ -127,6 +127,12 @@ Status:
   This keeps the thumbnail grid from reclaiming z-order during double-click
   startup without causing visible TOPMOST flicker or leaving the video window
   above other applications after Alt-Tab.
+- 2026-05-05: while the native presenter thread is starting and before its first
+  native frame has presented, the legacy egui fullscreen viewport is shown as
+  an opaque black startup curtain instead of drawing thumbnails, placeholder
+  text, or a transparent window. Once the first native present succeeds, the
+  viewport is hidden as before. This masks the last grid/white-frame flash
+  during double-click startup without introducing a second Win32 shield window.
 - 2026-05-05: while a native presenter HWND is active, the UI thread keeps a
   lightweight 16ms repaint pump alive even though video frames are presented on
   the native thread. This prevents native-window shortcut events such as Escape

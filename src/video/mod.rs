@@ -177,6 +177,7 @@ pub enum NativeVideoOutputEvent {
 struct NativeVideoOutput {
     cancel: Arc<AtomicBool>,
     hwnd: Arc<AtomicU64>,
+    first_presented: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     event_rx: std::sync::Mutex<std::sync::mpsc::Receiver<NativeVideoOutputEvent>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -194,10 +195,12 @@ impl NativeVideoOutput {
     ) -> Option<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
         let hwnd = Arc::new(AtomicU64::new(0));
+        let first_presented = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let thread_cancel = Arc::clone(&cancel);
         let thread_hwnd = Arc::clone(&hwnd);
+        let thread_first_presented = Arc::clone(&first_presented);
         let thread_closed = Arc::clone(&closed);
         let thread = match std::thread::Builder::new()
             .name("native-video-presenter".into())
@@ -212,6 +215,7 @@ impl NativeVideoOutput {
                     event_tx,
                     thread_cancel,
                     thread_hwnd,
+                    thread_first_presented,
                     thread_closed,
                 ) {
                     crate::logger::log(format!("[native-video] presenter stopped: {err}"));
@@ -226,6 +230,7 @@ impl NativeVideoOutput {
         Some(Self {
             cancel,
             hwnd,
+            first_presented,
             closed,
             event_rx: std::sync::Mutex::new(event_rx),
             thread: Some(thread),
@@ -234,6 +239,10 @@ impl NativeVideoOutput {
 
     fn hwnd(&self) -> u64 {
         self.hwnd.load(Ordering::Acquire)
+    }
+
+    fn first_presented(&self) -> bool {
+        self.first_presented.load(Ordering::Acquire)
     }
 
     fn is_closed(&self) -> bool {
@@ -453,6 +462,7 @@ fn run_native_video_output(
     ui_event_tx: std::sync::mpsc::Sender<NativeVideoOutputEvent>,
     cancel: Arc<AtomicBool>,
     hwnd_out: Arc<AtomicU64>,
+    first_presented_out: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
 ) -> Result<(), String> {
     use std::collections::VecDeque;
@@ -476,7 +486,7 @@ fn run_native_video_output(
         },
     )?;
     hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
-    let mut presenter = crate::video::native_presenter::NativeVideoPresenter::new(
+    let mut presenter = match crate::video::native_presenter::NativeVideoPresenter::new(
         crate::video::native_presenter::NativePresenterConfig {
             hwnd: window.hwnd(),
             width,
@@ -484,7 +494,15 @@ fn run_native_video_output(
             test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
             egui_overlay: native_video_env_flag_enabled("MIV_NATIVE_VIDEO_EGUI_OVERLAY", false),
         },
-    )?;
+    ) {
+        Ok(presenter) => presenter,
+        Err(err) => {
+            hwnd_out.store(0, Ordering::Release);
+            window.destroy();
+            closed.store(true, Ordering::Release);
+            return Err(err);
+        }
+    };
     crate::logger::log(format!(
         "[native-video] fullscreen presenter started hwnd=0x{:x} rect=({},{} {}x{}) sync_interval={}",
         window.hwnd().0 as usize,
@@ -668,6 +686,7 @@ fn run_native_video_output(
                         last_summary_log = Instant::now();
                     }
                     displayed_frame_seq.fetch_add(1, Ordering::Release);
+                    first_presented_out.store(true, Ordering::Release);
                     if first_frame_event_last_epoch != Some(serial) {
                         first_frame_event_last_epoch = Some(serial);
                         let _ = engine_event_tx.try_send(EngineEvent::Decoder(
@@ -767,6 +786,7 @@ fn run_native_video_output(
 
     native_drain_unpresented_queue(&mut queue);
     present_stats.emit_summary(run_started.elapsed());
+    first_presented_out.store(false, Ordering::Release);
     hwnd_out.store(0, Ordering::Release);
     window.destroy();
     closed.store(true, Ordering::Release);
@@ -1234,6 +1254,14 @@ impl VideoPlayer {
             .as_ref()
             .map(NativeVideoOutput::hwnd)
             .unwrap_or(0)
+    }
+
+    #[cfg(windows)]
+    pub fn native_presenter_pending(&self) -> bool {
+        self.native_output
+            .as_ref()
+            .map(|output| !output.first_presented() && !output.is_closed())
+            .unwrap_or(false)
     }
 
     #[cfg(windows)]

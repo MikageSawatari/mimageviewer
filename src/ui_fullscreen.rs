@@ -987,6 +987,11 @@ impl App {
 
         // ── 状態の事前計算 ──
         #[cfg(windows)]
+        if self.native_video_presenter_pending_for_fs(fs_idx) {
+            self.show_native_video_startup_curtain(ctx);
+            return;
+        }
+        #[cfg(windows)]
         if self.native_video_presenter_hwnd_for_fs(fs_idx).is_some() {
             self.hide_fullscreen_viewport_for_native(ctx);
             return;
@@ -1893,6 +1898,46 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn native_video_presenter_pending_for_fs(&self, fs_idx: usize) -> bool {
+        match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.native_presenter_pending(),
+            _ => false,
+        }
+    }
+
+    #[cfg(windows)]
+    fn show_native_video_startup_curtain(&mut self, ctx: &egui::Context) {
+        let fs_id = self.fullscreen_viewport_id();
+        let fs_builder = self.build_fullscreen_viewport_builder_with_transparency(false);
+        let need_show = !self.fs_viewport_shown;
+        let mut close_fs = false;
+        ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
+            // Visible な fullscreen viewport なので、native HWND 起動待ちの
+            // 黒カーテン中も IME 状態だけは通常 viewport と同じ入口で更新する。
+            self.update_ime_state(ctx);
+            if need_show {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            if ctx.input(|i| i.viewport().close_requested())
+                || ctx.input(|i| i.key_pressed(egui::Key::Escape))
+            {
+                close_fs = true;
+            }
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+                .show(ctx, |_ui| {});
+        });
+        self.fs_viewport_shown = true;
+        if close_fs {
+            self.close_fullscreen();
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
+    #[cfg(windows)]
     fn hide_fullscreen_viewport_for_native(&mut self, ctx: &egui::Context) {
         let fs_id = self.fullscreen_viewport_id();
         let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
@@ -1908,6 +1953,13 @@ impl App {
     }
 
     fn build_fullscreen_viewport_builder(&self) -> egui::ViewportBuilder {
+        self.build_fullscreen_viewport_builder_with_transparency(true)
+    }
+
+    fn build_fullscreen_viewport_builder_with_transparency(
+        &self,
+        transparent: bool,
+    ) -> egui::ViewportBuilder {
         let center = self.last_outer_rect.map(|r| r.center());
         let ppp = self.last_pixels_per_point;
 
@@ -1916,7 +1968,7 @@ impl App {
 
         let b = egui::ViewportBuilder::default()
             .with_decorations(false)
-            .with_transparent(true)
+            .with_transparent(transparent)
             .with_taskbar(false);
         match monitor_rect {
             Some(rect) => b
