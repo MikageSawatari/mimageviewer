@@ -19,7 +19,7 @@
 #   このスクリプトは触らない。ビルド済み exe を別 worktree や前回のビルド結果から
 #   コピーするか、CLAUDE.md「VST3 host bridge 管理」節に従って
 #     bash scripts/setup-vst3-sdk.sh
-#     cmake -S crates/vst3-host -B crates/vst3-host/build -G "Visual Studio 17 2022" -A x64
+#     cmake -S crates/vst3-host -B crates/vst3-host/build -G "Visual Studio 18 2026" -A x64
 #     cmake --build crates/vst3-host/build --config Release
 #     cp crates/vst3-host/build/Release/mimageviewer-vst3-host.exe vendor/vst3-host/
 #   を手動で実行する。SDK 取得が ~490 MB なので bootstrap には混ぜない。

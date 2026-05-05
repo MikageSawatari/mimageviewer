@@ -143,7 +143,7 @@ fn check_vendor_files() {
         // (PDFium / Susie ワーカーと同パターン)。
         (
             "vendor/vst3-host/mimageviewer-vst3-host.exe",
-            "cmake -S crates/vst3-host -B crates/vst3-host/build -G \"Visual Studio 17 2022\" -A x64 && cmake --build crates/vst3-host/build --config Release",
+            "cmake -S crates/vst3-host -B crates/vst3-host/build -G \"Visual Studio 18 2026\" -A x64 && cmake --build crates/vst3-host/build --config Release",
         ),
     ];
 

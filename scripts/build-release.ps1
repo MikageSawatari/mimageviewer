@@ -225,7 +225,7 @@ if (-not $SkipVst3Bridge) {
     }
     if (-not $SkipVst3Bridge -and -not (Test-Path (Join-Path -Path $vst3BuildDir -ChildPath 'CMakeCache.txt'))) {
         Write-Host "[build-release] configuring VST3 bridge (cmake)"
-        & cmake -S $vst3SourceDir -B $vst3BuildDir -G "Visual Studio 17 2022" -A x64
+        & cmake -S $vst3SourceDir -B $vst3BuildDir -G "Visual Studio 18 2026" -A x64
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
 

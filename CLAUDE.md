@@ -198,7 +198,7 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
   - **CMake で再ビルド**:
     ```bash
     bash scripts/setup-vst3-sdk.sh
-    cmake -S crates/vst3-host -B crates/vst3-host/build -G "Visual Studio 17 2022" -A x64
+    cmake -S crates/vst3-host -B crates/vst3-host/build -G "Visual Studio 18 2026" -A x64
     cmake --build crates/vst3-host/build --config Release
     cp crates/vst3-host/build/Release/mimageviewer-vst3-host.exe vendor/vst3-host/
     ```
@@ -212,7 +212,7 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
 - `rustup target add i686-pc-windows-msvc` 済み — susie 32bit ワーカービルド
 - `LIBCLANG_PATH` 環境変数登録済み — FFmpeg の bindgen 用 (本書「FFmpeg LGPL DLL
   管理」節に詳細)
-- `cmake` + Visual Studio 2022 + NASM — TurboJPEG / vst3-host ビルド
+- `cmake` + Visual Studio 2026 (18) BuildTools + NASM — TurboJPEG / vst3-host ビルド
 - `unzip`, `tar`, `curl` — setup スクリプト群が使う
 
 ## Implementation Phases
@@ -700,13 +700,13 @@ VST3 SDK は **MIT ライセンス化されている** (3.8.0、2025-10-20 以�
 bash scripts/setup-vst3-sdk.sh
 
 # 2. CMake で C++ bridge をビルド
-cmake -S crates/vst3-host -B crates/vst3-host/build -G "Visual Studio 17 2022" -A x64
+cmake -S crates/vst3-host -B crates/vst3-host/build -G "Visual Studio 18 2026" -A x64
 cmake --build crates/vst3-host/build --config Release
 # → vendor/vst3-host/mimageviewer-vst3-host.exe (~640 KB)
 ```
 
 - 前提:
-  - Visual Studio 2022 (MSVC C++ デスクトップ開発ワークロード)
+  - Visual Studio 2026 (18) BuildTools (MSVC C++ デスクトップ開発ワークロード)
   - CMake 3.20+
   - 一度ビルドしたら、C++ ソースを変更しない限り再ビルド不要
 - 出力: `vendor/vst3-host/mimageviewer-vst3-host.exe` (.gitignore)。

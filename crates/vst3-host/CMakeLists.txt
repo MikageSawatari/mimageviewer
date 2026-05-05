@@ -7,11 +7,11 @@
 ## ビルド前提:
 ##   - bash scripts/setup-vst3-sdk.sh で vendor/vst3sdk/ に SDK 3.8.0+ を配置
 ##   - CMake 3.20+ (PDFium / FFmpeg と同じく Visual Studio 同梱で OK)
-##   - MSVC 2022 (Visual Studio C++ デスクトップ開発ワークロード)
+##   - MSVC 2026 (Visual Studio 18 BuildTools, C++ デスクトップ開発ワークロード)
 ##
 ## ビルド方法:
 ##   cd crates/vst3-host
-##   cmake -B build -G "Visual Studio 17 2022" -A x64
+##   cmake -B build -G "Visual Studio 18 2026" -A x64
 ##   cmake --build build --config Release
 ##
 ## 出力:
