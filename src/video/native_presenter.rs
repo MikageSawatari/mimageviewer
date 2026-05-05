@@ -3597,14 +3597,20 @@ fn draw_overlay_vst3_top_icon(painter: &egui::Painter, rect: egui::Rect) {
         stroke,
     );
 
-    let s_points = [
-        egui::pos2(mid - 2.0, top_y + 0.8),
-        egui::pos2(mid + 4.2, top_y + 0.8),
-        egui::pos2(mid - 0.6, rect.center().y - 0.5),
-        egui::pos2(mid + 4.8, base_y - 0.8),
-        egui::pos2(mid - 1.8, base_y - 0.8),
-    ];
-    painter.add(egui::Shape::line(s_points.to_vec(), stroke));
+    let sx0 = mid - 1.8;
+    let sx1 = mid + 4.8;
+    let sy0 = top_y + 0.8;
+    let sym = rect.center().y - 0.4;
+    let sy1 = base_y - 0.8;
+    for [a, b] in [
+        [egui::pos2(sx0, sy0), egui::pos2(sx1, sy0)],
+        [egui::pos2(sx0, sy0), egui::pos2(sx0, sym)],
+        [egui::pos2(sx0, sym), egui::pos2(sx1, sym)],
+        [egui::pos2(sx1, sym), egui::pos2(sx1, sy1)],
+        [egui::pos2(sx0, sy1), egui::pos2(sx1, sy1)],
+    ] {
+        painter.line_segment([a, b], stroke);
+    }
 
     painter.line_segment(
         [egui::pos2(right - 6.0, top_y), egui::pos2(right, top_y)],
