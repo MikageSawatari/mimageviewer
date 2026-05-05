@@ -131,6 +131,19 @@ pub struct VideoPlayer {
     gpu_latest: Option<crate::video::gpu_renderer::D3d11Frame>,
     #[cfg(windows)]
     native_output: Option<NativeVideoOutput>,
+    #[cfg(windows)]
+    native_hover_thumbnail_target_secs: Mutex<Option<f64>>,
+    #[cfg(windows)]
+    native_hover_thumbnail_sent_key: Mutex<Option<NativeHoverThumbnailKey>>,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct NativeHoverThumbnailKey {
+    target_bits: u64,
+    width: u32,
+    height: u32,
+    rgba_ptr: usize,
 }
 
 /// `VideoPlayer::gpu_latest_info()` が返す view-only 情報。Copy なので
@@ -164,6 +177,7 @@ pub struct NativeVideoOutputConfig {
     pub rect: windows::Win32::Foundation::RECT,
     pub owner_hwnd: u64,
     pub sync_interval: u32,
+    pub perf_overlay_visible: bool,
 }
 
 #[cfg(windows)]
@@ -171,6 +185,54 @@ pub struct NativeVideoOutputConfig {
 pub enum NativeVideoOutputEvent {
     Window(native_window::NativeVideoWindowEvent),
     Seek { target_secs: f64 },
+    TileSeek { target_secs: f64 },
+    WheelNavigate { delta: i32 },
+    TileColumnsDelta { delta: i32 },
+    RequestSeekThumbnail { target_secs: f64 },
+    ToggleTileMode,
+    TogglePerfOverlay,
+    ToggleVst3Gui,
+    SeekToStartAndPlay,
+    TogglePlay,
+    ToggleMute,
+    ToggleLoop,
+    SetVolume { volume: f64, persist: bool },
+    AddBookmarkAt { target_secs: f64 },
+    TogglePinAt { target_secs: f64 },
+    DeleteBookmark { id: i64 },
+}
+
+#[cfg(windows)]
+enum NativeVideoOutputCommand {
+    SetHoverThumbnail {
+        thumbnail: Option<native_presenter::NativeOverlayThumbnail>,
+    },
+    SetHoverPreviewPinned {
+        pinned: bool,
+    },
+    SetTimelineMarkers {
+        markers: Vec<native_presenter::NativeOverlayTimelineMarker>,
+    },
+    SetJumpEntries {
+        entries: Vec<native_presenter::NativeOverlayJumpEntry>,
+    },
+    SetMetadata {
+        metadata: Option<native_presenter::NativeOverlayMetadata>,
+    },
+    SetLoopEnabled {
+        enabled: bool,
+    },
+    SetPlaybackStatus {
+        first_frame_presented: bool,
+        error: Option<String>,
+    },
+    ShowToast {
+        text: String,
+        centered: bool,
+    },
+    SetTileOverlay {
+        tile_overlay: Option<native_presenter::NativeOverlayTileOverlay>,
+    },
 }
 
 #[cfg(windows)]
@@ -179,6 +241,8 @@ struct NativeVideoOutput {
     hwnd: Arc<AtomicU64>,
     first_presented: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
+    perf_overlay_visible: Arc<AtomicBool>,
+    command_tx: std::sync::mpsc::Sender<NativeVideoOutputCommand>,
     event_rx: std::sync::Mutex<std::sync::mpsc::Receiver<NativeVideoOutputEvent>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -197,11 +261,14 @@ impl NativeVideoOutput {
         let hwnd = Arc::new(AtomicU64::new(0));
         let first_presented = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
+        let perf_overlay_visible = Arc::new(AtomicBool::new(config.perf_overlay_visible));
         let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (command_tx, command_rx) = std::sync::mpsc::channel();
         let thread_cancel = Arc::clone(&cancel);
         let thread_hwnd = Arc::clone(&hwnd);
         let thread_first_presented = Arc::clone(&first_presented);
         let thread_closed = Arc::clone(&closed);
+        let thread_perf_overlay_visible = Arc::clone(&perf_overlay_visible);
         let thread = match std::thread::Builder::new()
             .name("native-video-presenter".into())
             .spawn(move || {
@@ -212,11 +279,13 @@ impl NativeVideoOutput {
                     displayed_frame_seq,
                     duration_secs_bits,
                     config,
+                    command_rx,
                     event_tx,
                     thread_cancel,
                     thread_hwnd,
                     thread_first_presented,
                     thread_closed,
+                    thread_perf_overlay_visible,
                 ) {
                     crate::logger::log(format!("[native-video] presenter stopped: {err}"));
                 }
@@ -232,6 +301,8 @@ impl NativeVideoOutput {
             hwnd,
             first_presented,
             closed,
+            perf_overlay_visible,
+            command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
             thread: Some(thread),
         })
@@ -247,6 +318,67 @@ impl NativeVideoOutput {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    fn set_perf_overlay_visible(&self, visible: bool) {
+        self.perf_overlay_visible.store(visible, Ordering::Release);
+    }
+
+    fn set_hover_thumbnail(&self, thumbnail: Option<native_presenter::NativeOverlayThumbnail>) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetHoverThumbnail { thumbnail });
+    }
+
+    fn set_hover_preview_pinned(&self, pinned: bool) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetHoverPreviewPinned { pinned });
+    }
+
+    fn set_timeline_markers(&self, markers: Vec<native_presenter::NativeOverlayTimelineMarker>) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetTimelineMarkers { markers });
+    }
+
+    fn set_jump_entries(&self, entries: Vec<native_presenter::NativeOverlayJumpEntry>) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetJumpEntries { entries });
+    }
+
+    fn set_metadata(&self, metadata: Option<native_presenter::NativeOverlayMetadata>) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetMetadata { metadata });
+    }
+
+    fn set_loop_enabled(&self, enabled: bool) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetLoopEnabled { enabled });
+    }
+
+    fn set_tile_overlay(&self, tile_overlay: Option<native_presenter::NativeOverlayTileOverlay>) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetTileOverlay { tile_overlay });
+    }
+
+    fn set_playback_status(&self, first_frame_presented: bool, error: Option<String>) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetPlaybackStatus {
+                first_frame_presented,
+                error,
+            });
+    }
+
+    fn show_toast(&self, text: String, centered: bool) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::ShowToast { text, centered });
     }
 
     fn drain_events(&self) -> Vec<NativeVideoOutputEvent> {
@@ -390,6 +522,30 @@ impl NativeFullscreenPresentStats {
             self.max_interval_ms
         ));
     }
+
+    fn overlay_snapshot(
+        &self,
+        duration: std::time::Duration,
+    ) -> crate::video::native_presenter::NativeOverlayPerfSnapshot {
+        let elapsed_secs = duration.as_secs_f64();
+        let actual_fps = if elapsed_secs > 0.0 {
+            self.presented as f64 / elapsed_secs
+        } else {
+            0.0
+        };
+        crate::video::native_presenter::NativeOverlayPerfSnapshot {
+            elapsed_secs,
+            presented: self.presented,
+            gpu: self.gpu,
+            cpu: self.cpu,
+            late_drop: self.late_drop,
+            wait_timeout: self.wait_timeout,
+            actual_fps,
+            max_late_ms: self.max_late_ms,
+            max_total_ms: self.max_total_ms,
+            max_interval_ms: self.max_interval_ms,
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -523,11 +679,13 @@ fn run_native_video_output(
     displayed_frame_seq: Arc<AtomicU64>,
     duration_secs_bits: Arc<AtomicU64>,
     config: NativeVideoOutputConfig,
+    command_rx: std::sync::mpsc::Receiver<NativeVideoOutputCommand>,
     ui_event_tx: std::sync::mpsc::Sender<NativeVideoOutputEvent>,
     cancel: Arc<AtomicBool>,
     hwnd_out: Arc<AtomicU64>,
     first_presented_out: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
+    perf_overlay_visible: Arc<AtomicBool>,
 ) -> Result<(), String> {
     use std::collections::VecDeque;
     use std::time::{Duration, Instant};
@@ -610,6 +768,42 @@ fn run_native_video_output(
             closed.store(true, Ordering::Release);
             break;
         }
+        let perf_visible = perf_overlay_visible.load(Ordering::Acquire);
+        let perf_visibility_changed = presenter.set_overlay_perf_visible(perf_visible);
+        while let Ok(command) = command_rx.try_recv() {
+            match command {
+                NativeVideoOutputCommand::SetHoverThumbnail { thumbnail } => {
+                    presenter.set_overlay_hover_thumbnail(thumbnail);
+                }
+                NativeVideoOutputCommand::SetHoverPreviewPinned { pinned } => {
+                    presenter.set_overlay_hover_preview_pinned(pinned);
+                }
+                NativeVideoOutputCommand::SetTimelineMarkers { markers } => {
+                    presenter.set_overlay_timeline_markers(markers);
+                }
+                NativeVideoOutputCommand::SetJumpEntries { entries } => {
+                    presenter.set_overlay_jump_entries(entries);
+                }
+                NativeVideoOutputCommand::SetMetadata { metadata } => {
+                    presenter.set_overlay_metadata(metadata);
+                }
+                NativeVideoOutputCommand::SetLoopEnabled { enabled } => {
+                    presenter.set_overlay_loop_enabled(enabled);
+                }
+                NativeVideoOutputCommand::SetPlaybackStatus {
+                    first_frame_presented,
+                    error,
+                } => {
+                    presenter.set_overlay_playback_status(first_frame_presented, error);
+                }
+                NativeVideoOutputCommand::ShowToast { text, centered } => {
+                    presenter.show_overlay_toast(text, centered);
+                }
+                NativeVideoOutputCommand::SetTileOverlay { tile_overlay } => {
+                    presenter.set_overlay_tile_overlay(tile_overlay);
+                }
+            }
+        }
         native_events.clear();
         while let Ok(event) = presenter_event_rx.try_recv() {
             native_events.push(event);
@@ -619,6 +813,8 @@ fn run_native_video_output(
                 clock.now_secs(),
                 f64::from_bits(duration_secs_bits.load(Ordering::Acquire)),
                 clock.is_playing(),
+                clock.volume(),
+                clock.is_muted(),
             );
             let overlay_routing = match presenter.handle_window_events(&native_events) {
                 Ok(outcome) => {
@@ -629,6 +825,79 @@ fn run_native_video_output(
                             } => {
                                 let _ =
                                     ui_event_tx.send(NativeVideoOutputEvent::Seek { target_secs });
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::TileSeek {
+                                target_secs,
+                            } => {
+                                let _ = ui_event_tx
+                                    .send(NativeVideoOutputEvent::TileSeek { target_secs });
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::WheelNavigate {
+                                delta,
+                            } => {
+                                let _ = ui_event_tx
+                                    .send(NativeVideoOutputEvent::WheelNavigate { delta });
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::TileColumnsDelta {
+                                delta,
+                            } => {
+                                let _ = ui_event_tx
+                                    .send(NativeVideoOutputEvent::TileColumnsDelta { delta });
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::RequestSeekThumbnail {
+                                target_secs,
+                            } => {
+                                let _ = ui_event_tx.send(
+                                    NativeVideoOutputEvent::RequestSeekThumbnail { target_secs },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleTileMode => {
+                                let _ = ui_event_tx.send(NativeVideoOutputEvent::ToggleTileMode);
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::TogglePerfOverlay => {
+                                let _ = ui_event_tx.send(NativeVideoOutputEvent::TogglePerfOverlay);
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleVst3Gui => {
+                                let _ = ui_event_tx.send(NativeVideoOutputEvent::ToggleVst3Gui);
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SeekToStartAndPlay => {
+                                let _ = ui_event_tx.send(NativeVideoOutputEvent::SeekToStartAndPlay);
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::TogglePlay => {
+                                let _ = ui_event_tx.send(NativeVideoOutputEvent::TogglePlay);
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleMute => {
+                                let _ = ui_event_tx.send(NativeVideoOutputEvent::ToggleMute);
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleLoop => {
+                                let _ = ui_event_tx.send(NativeVideoOutputEvent::ToggleLoop);
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetVolume {
+                                volume,
+                                persist,
+                            } => {
+                                let _ = ui_event_tx.send(NativeVideoOutputEvent::SetVolume {
+                                    volume,
+                                    persist,
+                                });
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::AddBookmarkAt {
+                                target_secs,
+                            } => {
+                                let _ = ui_event_tx
+                                    .send(NativeVideoOutputEvent::AddBookmarkAt { target_secs });
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::TogglePinAt {
+                                target_secs,
+                            } => {
+                                let _ = ui_event_tx
+                                    .send(NativeVideoOutputEvent::TogglePinAt { target_secs });
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::DeleteBookmark {
+                                id,
+                            } => {
+                                let _ =
+                                    ui_event_tx.send(NativeVideoOutputEvent::DeleteBookmark { id });
                             }
                         }
                     }
@@ -647,14 +916,17 @@ fn run_native_video_output(
                 }
             }
             last_overlay_tick = Instant::now();
-        } else if clock.is_playing()
-            && presenter.overlay_hud_visible()
-            && last_overlay_tick.elapsed() >= Duration::from_millis(250)
+        } else if perf_visibility_changed
+            || presenter.overlay_needs_render()
+            || (presenter.overlay_wants_periodic_tick()
+                && last_overlay_tick.elapsed() >= Duration::from_millis(250))
         {
             if let Err(err) = presenter.tick_overlay_video_state(
                 clock.now_secs(),
                 f64::from_bits(duration_secs_bits.load(Ordering::Acquire)),
                 clock.is_playing(),
+                clock.volume(),
+                clock.is_muted(),
             ) {
                 crate::logger::log(format!("[native-video] overlay tick render failed: {err}"));
             }
@@ -686,6 +958,8 @@ fn run_native_video_output(
 
         let waiting_for_first_frame = first_frame_event_last_epoch != Some(last_seen_serial);
         if !clock.is_playing() && !clock.is_seeking() && !waiting_for_first_frame {
+            last_present_wall = None;
+            last_present_source_pts = None;
             std::thread::sleep(Duration::from_millis(8));
             continue;
         }
@@ -708,7 +982,13 @@ fn run_native_video_output(
                 || force_display_seek
                 || front.pts_secs <= now + clock::DISPLAY_LEAD_TOLERANCE_SECS
             {
-                latest_renderable = Some(queue.pop_front().expect("queue.front() returned Some"));
+                let candidate = queue.pop_front().expect("queue.front() returned Some");
+                if let Some(dropped) = latest_renderable.replace(candidate) {
+                    let late_ms = ((now - dropped.pts_secs) * 1000.0).max(0.0);
+                    present_stats.record_late_drop(dropped.pts_secs, late_ms, queue.len());
+                    native_reset_unpresented_frame(dropped);
+                }
+                continue;
             }
             break;
         }
@@ -741,6 +1021,19 @@ fn run_native_video_output(
                     last_present_wall = Some(present_t0);
                     last_present_source_pts = Some(pts);
                     present_stats.record_present(&outcome, late_ms, total_ms, interval_ms);
+                    presenter.push_overlay_perf_sample(
+                        crate::video::native_presenter::NativeOverlayPerfSample {
+                            arrival: present_t0,
+                            interval_ms: interval_ms as f32,
+                            total_ms: total_ms as f32,
+                            copy_ms: outcome.copy_ms as f32,
+                            present_waitable_ms: outcome.present_waitable_ms as f32,
+                            present_call_ms: outcome.present_call_ms as f32,
+                            late_ms: late_ms as f32,
+                            source_delta_ms: source_delta_ms as f32,
+                        },
+                        present_stats.overlay_snapshot(run_started.elapsed()),
+                    );
                     if last_summary_log.elapsed() >= Duration::from_secs(1) {
                         present_stats.emit_summary(run_started.elapsed());
                         if source_pacing_sleep_count > 0 && crate::perf::is_enabled() {
@@ -969,6 +1262,10 @@ impl VideoPlayer {
                 native_output: None,
                 #[cfg(windows)]
                 duration_secs_bits: Arc::new(AtomicU64::new(0.0_f64.to_bits())),
+                #[cfg(windows)]
+                native_hover_thumbnail_target_secs: Mutex::new(None),
+                #[cfg(windows)]
+                native_hover_thumbnail_sent_key: Mutex::new(None),
             };
         }
 
@@ -1112,6 +1409,10 @@ impl VideoPlayer {
             gpu_latest: None,
             #[cfg(windows)]
             native_output,
+            #[cfg(windows)]
+            native_hover_thumbnail_target_secs: Mutex::new(None),
+            #[cfg(windows)]
+            native_hover_thumbnail_sent_key: Mutex::new(None),
         }
     }
 
@@ -1151,6 +1452,26 @@ impl VideoPlayer {
     pub fn request_seek_thumbnail(&self, target_secs: f64) {
         if let Some(w) = &self.thumb_worker {
             w.request(target_secs);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn request_native_hover_thumbnail(&self, target_secs: f64) {
+        let target_secs = if target_secs.is_finite() {
+            target_secs.max(0.0)
+        } else {
+            return;
+        };
+        self.request_seek_thumbnail(target_secs);
+        if let Ok(mut target) = self.native_hover_thumbnail_target_secs.lock() {
+            let old_bucket = target.map(crate::video::thumbnail::bucket_key);
+            let new_bucket = crate::video::thumbnail::bucket_key(target_secs);
+            if old_bucket != Some(new_bucket)
+                && let Ok(mut sent) = self.native_hover_thumbnail_sent_key.lock()
+            {
+                *sent = None;
+            }
+            *target = Some(target_secs);
         }
     }
 
@@ -1355,6 +1676,85 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
+    pub fn set_native_perf_overlay_visible(&self, visible: bool) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_perf_overlay_visible(visible);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_hover_thumbnail(
+        &self,
+        thumbnail: Option<native_presenter::NativeOverlayThumbnail>,
+    ) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_hover_thumbnail(thumbnail);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_hover_preview_pinned(&self, pinned: bool) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_hover_preview_pinned(pinned);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_timeline_markers(
+        &self,
+        markers: Vec<native_presenter::NativeOverlayTimelineMarker>,
+    ) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_timeline_markers(markers);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_jump_entries(&self, entries: Vec<native_presenter::NativeOverlayJumpEntry>) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_jump_entries(entries);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_metadata(&self, metadata: Option<native_presenter::NativeOverlayMetadata>) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_metadata(metadata);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_loop_enabled(&self, enabled: bool) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_loop_enabled(enabled);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_tile_overlay(
+        &self,
+        tile_overlay: Option<native_presenter::NativeOverlayTileOverlay>,
+    ) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_tile_overlay(tile_overlay);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_playback_status(&self, first_frame_presented: bool, error: Option<String>) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_playback_status(first_frame_presented, error);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn show_native_overlay_toast(&self, text: String, centered: bool) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.show_toast(text, centered);
+        }
+    }
+
+    #[cfg(windows)]
     pub fn drain_native_presenter_events(&self) -> Vec<NativeVideoOutputEvent> {
         self.native_output
             .as_ref()
@@ -1443,6 +1843,9 @@ impl VideoPlayer {
 
         // クロックの今時刻
         let now = self.clock.now_secs();
+
+        #[cfg(windows)]
+        self.pump_native_hover_thumbnail();
 
         #[cfg(windows)]
         if self.native_output.is_some() {
@@ -1743,6 +2146,9 @@ impl VideoPlayer {
             );
         }
 
+        #[cfg(windows)]
+        self.pump_native_hover_thumbnail();
+
         // 再生中 / seek 中なら repaint 予約。
         // seek 中も polling 必須: post-seek 第一フレームが channel に積まれても
         // egui に repaint 要求が無いと UI が起きず channel が drain されない。
@@ -1770,6 +2176,43 @@ impl VideoPlayer {
 
     pub fn texture(&self) -> Option<&TextureHandle> {
         self.texture.as_ref()
+    }
+
+    #[cfg(windows)]
+    fn pump_native_hover_thumbnail(&self) {
+        let Some(output) = self.native_output.as_ref() else {
+            return;
+        };
+        let target_secs = self
+            .native_hover_thumbnail_target_secs
+            .lock()
+            .ok()
+            .and_then(|target| *target);
+        let Some(target_secs) = target_secs else {
+            return;
+        };
+        let Some(thumb) = self.nearest_seek_thumbnail(target_secs) else {
+            self.request_seek_thumbnail(target_secs);
+            return;
+        };
+        let key = NativeHoverThumbnailKey {
+            target_bits: thumb.target_secs.to_bits(),
+            width: thumb.width,
+            height: thumb.height,
+            rgba_ptr: Arc::as_ptr(&thumb.rgba) as usize,
+        };
+        if let Ok(mut sent) = self.native_hover_thumbnail_sent_key.lock() {
+            if *sent == Some(key) {
+                return;
+            }
+            *sent = Some(key);
+        }
+        output.set_hover_thumbnail(Some(native_presenter::NativeOverlayThumbnail {
+            target_secs: thumb.target_secs,
+            width: thumb.width,
+            height: thumb.height,
+            rgba: thumb.rgba,
+        }));
     }
 
     /// 表示済フレーム数の累積値。perf overlay が経路 (GPU/CPU) に依存せず

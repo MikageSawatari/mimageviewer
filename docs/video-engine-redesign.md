@@ -1331,6 +1331,17 @@ can break out within a few milliseconds even when `audio_pkt_tx` or
 `video_pkt_tx` is full. This prevents old packet queues from continuing to
 block the demux thread after the native presenter has already stopped.
 
+2026-05-05 follow-up: 240fps material exposed that the compressed-video
+overflow queue still used a blocking drain before reading later packets. When
+`video_pkt_tx` stayed full, demux waited on video and starved audio packets,
+causing audio underruns even though the overflow queue existed. Pending video
+packet drain is now non-blocking (`try_send`); if the video queue is still full,
+the packet is pushed back to the front of the pending queue and demux continues
+reading later packets so audio can keep flowing. Perf logging also records
+`demux/queue_state` once per second and `demux/drain_full_hit` when the
+non-blocking drain finds a full video packet queue, including pending video
+packet bytes/count and PTS span for lag diagnosis.
+
 2026-05-04 follow-up: a short-lived experiment reduced the direct audio/video
 packet channels from 256 packets to 32 packets so `Flush` markers could reach
 the decoders sooner. Real 60fps AV1 files showed the opposite failure mode:

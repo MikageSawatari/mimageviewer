@@ -39,9 +39,9 @@ FFmpeg HW decoder (D3D11VA)
     ↓
 AVFrame (format = AV_PIX_FMT_D3D11、data[0]=ID3D11Texture2D*、data[1]=subresource)
     ↓
-ID3D11VideoProcessor (NV12/P010 → BGRA8/RGB10A2、bicubic)
+ID3D11VideoProcessor (NV12/P010 → SDR BGRA8、bicubic)
     ↓
-NT 共有 ID3D11Texture2D (BGRA8 or RGB10A2、KEYEDMUTEX 付き)
+NT 共有 ID3D11Texture2D (BGRA8、KEYEDMUTEX 付き)
     ↓
 ID3D11Fence::Signal (共有 fence で blit 完了通知)
     ↓
@@ -223,7 +223,7 @@ forward seek 常時 backward+preroll、perf overlay seek freeze、seek epoch 二
   - 中間 RT (NT shared なし) → CopyResource で NT/KM 付き共有テクスチャに転送 (NVIDIA driver 仕様)
   - blit 完了後に fence を Signal (= UI thread の wgpu wait 用)
 - 色空間 hint (`SetStreamColorSpace1` / `SetOutputColorSpace1`) は SDR/HDR PQ/HLG を明示
-  (HDR は VPP がトーンマップして SDR RGB として出力)
+  (HDR 表示は非対応。HDR/10-bit 入力も VPP が SDR BGRA8 として出力)
 
 #### `gpu_renderer/ffmpeg_d3d11.rs`
 - FFmpeg の `AVHWDeviceContext` (D3D11VA) を **mIV の D3D11 Device で初期化**

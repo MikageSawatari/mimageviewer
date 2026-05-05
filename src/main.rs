@@ -412,16 +412,25 @@ fn main() -> eframe::Result {
     // is_first_instance() == false のときは既にもう 1 つ mIV が動いているので
     // 静かに exit する (トレイ常駐中でもここで落ちる = ユーザーはトレイアイコンから
     // 復帰することで操作を再開できる)。
-    let _single_instance = single_instance::SingleInstanceGuard::acquire();
-    if !_single_instance.is_first_instance() {
-        // 2 重起動: 既存インスタンスの activate event を叩いてウィンドウを前面に出す。
-        // ユーザーが「もう一度 mIV を起動」した意図を既存インスタンスで復帰として解釈する。
-        let signaled = single_instance::signal_activate_existing();
-        eprintln!(
-            "mImageViewer is already running (activate signaled: {signaled}). Exiting second instance."
-        );
-        std::process::exit(0);
-    }
+    #[cfg(windows)]
+    let skip_single_instance = dcomp_presenter_config.is_some();
+    #[cfg(not(windows))]
+    let skip_single_instance = false;
+    let _single_instance = if skip_single_instance {
+        None
+    } else {
+        let guard = single_instance::SingleInstanceGuard::acquire();
+        if !guard.is_first_instance() {
+            // 2 重起動: 既存インスタンスの activate event を叩いてウィンドウを前面に出す。
+            // ユーザーが「もう一度 mIV を起動」した意図を既存インスタンスで復帰として解釈する。
+            let signaled = single_instance::signal_activate_existing();
+            eprintln!(
+                "mImageViewer is already running (activate signaled: {signaled}). Exiting second instance."
+            );
+            std::process::exit(0);
+        }
+        Some(guard)
+    };
 
     // data_dir::init() は perf::init が logs_dir を使うため先行させる必要がある。
     let t0 = Instant::now();
@@ -475,12 +484,14 @@ fn main() -> eframe::Result {
             std::process::exit(2);
         }
         logger::log(format!(
-            "dcomp-presenter-test: path={} duration_ms={} window={}x{} sync_interval={}",
+            "dcomp-presenter-test: path={} duration_ms={} window={}x{} sync_interval={} force_sw={} pixel_probe_strict={}",
             config.path.display(),
             config.duration.as_millis(),
             config.width,
             config.height,
-            config.sync_interval
+            config.sync_interval,
+            config.force_sw,
+            config.pixel_probe_strict
         ));
         if let Err(e) = dcomp_presenter_test::run(config) {
             eprintln!("dcomp-presenter-test failed: {e}");

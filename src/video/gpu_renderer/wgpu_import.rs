@@ -55,7 +55,8 @@ pub struct ImportedTexture {
 /// NT shared handle を開いて wgpu::Texture を作る。
 ///
 /// `format` は D3D11 側で出力した format に対応する wgpu フォーマット。
-/// 8-bit RGBA → `Bgra8UnormSrgb`、10-bit (HDR) → `Rgb10a2Unorm` 想定。
+/// 現在の decoder 出力は HDR 表示非対応のため BGRA8 に正規化される。
+/// `ten_bit=true` の import は古い/防御的な経路として残している。
 ///
 /// SAFETY: handle が valid であり、対応する D3D11 テクスチャが KEYEDMUTEX 付きで
 /// 作られていること。寸法 / format が D3D11 側と一致していること。

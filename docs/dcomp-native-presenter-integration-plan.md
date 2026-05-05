@@ -183,6 +183,14 @@ Status:
   visual behind the aspect-fit video visual. Letterbox/pillarbox regions are
   therefore filled by the native presenter instead of showing the desktop behind
   the borderless HWND.
+- 2026-05-05: the native presenter's software-decoded fallback keeps the
+  decoder's shared CPU frame contract as RGBA8, then converts to BGRA only at
+  the DComp swap-chain upload boundary. This preserves the legacy egui/wgpu CPU
+  path while matching the presenter's `B8G8R8A8_UNORM` video surface.
+  `--dcomp-presenter-test --dcomp-force-sw --dcomp-pixel-probe-strict` now
+  exercises that fallback by comparing the CPU RGBA source pixel with the
+  D3D11 BGRA backbuffer pixel; `scripts/video_color_probe.py` wraps the check
+  for repeatable smoke runs without screenshot capture.
 
 Current limitations of the experimental slice:
 
@@ -201,9 +209,36 @@ Current limitations of the experimental slice:
   do not need egui hit-testing: plain Up/Down navigates to adjacent items,
   Home/End jumps to the first/last navigable item, Space toggles the current
   checkmark, and a short right-click closes fullscreen.
+- Native egui overlay parity is in progress: edge-hover top/left/right chrome
+  is now synchronized, the left jump panel remains visible in the empty state,
+  wheel navigation and S-mode column adjustment are routed through overlay
+  commands, and the native overlay installs Japanese-capable fonts independently
+  from the main egui context.
+- Native egui overlay parity now also covers the legacy pause/loading/error
+  affordances and feedback paths: centered pause controls, "preparing video" and
+  playback error status, native feedback toasts, boundary hints, Shift+Enter
+  external-player launch, J/K marker jumps, and a top-bar VST3 GUI toggle.
+- Left/right native side-panel entry zones use the same x range as the visible
+  panel bodies, excluding the bottom seek zone. Showing the side/top panel
+  chrome also keeps the bottom seek HUD visible so the fullscreen HUD does not
+  leave an empty lower band; seek-bar hover alone still keeps the side/top
+  panels hidden.
+- S-mode video-to-video navigation keeps a native tile preparing overlay active
+  across the handoff, so the next video cannot briefly show at normal brightness
+  before its tile thumbnails arrive.
+- The seek/jump thumbnail worker has no fixed entry-count cap; generated
+  thumbnails are retained for the lifetime of the current `VideoPlayer` so
+  unusually large chapter lists can continue filling instead of cycling older
+  thumbnails out of cache.
+- S-mode's native tile curtain is opaque while preparing or navigating between
+  videos, and top-bar controls now use icon-style S/P buttons plus a wider
+  `VST` toggle that resynchronizes plugin GUI ownership/topmost state to the
+  native fullscreen HWND.
 - GPU frames are copied into a source-sized presenter swap chain after keyed
-  mutex acquisition, then scaled by DirectComposition. 10-bit/HDR GPU frames
-  still need a fallback or a dedicated presentation path.
+  mutex acquisition, then scaled by DirectComposition. HDR display output is
+  intentionally unsupported; high-bit-depth inputs are converted by the D3D11
+  video processor into the same SDR BGRA8 display texture used for normal
+  8-bit sources.
 - 2026-05-05: the production native presenter is now the default Windows
   fullscreen video path for trial use. Set `MIV_NATIVE_VIDEO_PRESENTER=0` to
   return to the legacy egui fullscreen presenter. The egui DComp overlay HUD is
@@ -289,6 +324,33 @@ Status:
   continues with the pointer resting over the HUD, the presenter ticks the
   overlay at roughly 250ms intervals so the time label and progress fill do not
   freeze.
+- 2026-05-05: the native egui overlay HUD now carries the first legacy-control
+  follow-up slice on top of the seek bar: seek-to-start/play, play/pause,
+  add-bookmark, mute, and volume controls. The overlay still emits commands
+  from the presenter thread and lets the UI thread call the existing
+  `VideoPlayer` and video bookmark DB paths, so playback state changes,
+  click/drag volume persistence, and bookmark writes stay on the same side of
+  the thread boundary as the legacy fullscreen HUD. Thumbnail preview, bookmark
+  pinning, and side panels remain staged Phase C production work.
+- 2026-05-05: the native overlay gained an early P-key perf graph so native
+  fullscreen A/B checks do not have to wait for the full legacy HUD parity
+  pass. The graph is fed by presenter-thread present samples and the existing
+  native summary counters, draws a compact 6-second interval/total/copy trace,
+  and is throttled by the same dirty-driven overlay path instead of presenting
+  a HUD frame for every video frame.
+- 2026-05-05: bookmark and pin actions were moved toward the legacy seek-hover
+  model. The bottom transport strip no longer owns a standalone bookmark
+  button; hovering the seek bar now keeps a preview target alive, asks the UI
+  thread to warm the seek-thumbnail cache, and shows bookmark/pin actions on
+  that preview target. Actual thumbnail pixels are still a follow-up bridge
+  from the UI/thumbnail cache into the native overlay texture path.
+- 2026-05-05: the seek-hover preview now receives real thumbnail pixels from
+  the UI thread. The native output owns a small UI-to-presenter command channel;
+  when the existing `ThumbnailWorker` cache has a nearby RGBA frame, the UI
+  sends an `Arc<Vec<u8>>` clone to the presenter thread, which uploads it as an
+  egui texture and draws it aspect-fit in the preview. The perf graph history
+  cap was also raised so 120fps runs fill the intended 6-second window instead
+  of only the right edge.
 
 The first production slice can accept a 60Hz overlay cadence as long as video
 presentation remains independent at 120fps.
@@ -327,7 +389,8 @@ Before making the trial default permanent:
 - complete dynamic `WM_SIZE` / monitor-change coverage around the source-sized
   video surface and DComp aspect-fit transform
 - handle DPI and monitor changes
-- support 10-bit/HDR GPU frames or fall back cleanly
+- keep 10-bit/HDR sources on the GPU path by converting them to SDR BGRA8
+  display textures; true HDR output remains out of scope
 - decide tearing policy (`sync_interval=0`) vs vsync policy (`sync_interval=1`)
 - handle fullscreen close without the known `set_gui_owner` burst stalls
 - keep CPU fallback path correct for software decoded frames
@@ -412,6 +475,53 @@ DWM present policy rather than decoder, copy, or keyed-mutex ownership.
 The legacy egui/wgpu rollback path must also reset discarded pooled GPU frames
 before replacing `gpu_latest` or draining seek-era queues, because D3D12 import
 does not release the D3D11 keyed mutex on behalf of the producer.
+Native seek-hover thumbnails are updated through a UI-to-presenter command
+channel. While a hover preview target is active, the overlay performs a
+low-rate dirty render even when the video clock is idle so completed thumbnail
+work can replace the `loading` placeholder without a pointer move. The preview
+keeps bookmark/pin actions and the time label in a black action bar below the
+image to avoid burying controls in thumbnail colors.
+`VideoPlayer` also stores the latest native hover target and pumps completed
+thumbnail-worker cache entries to the presenter from its UI-thread tick, so
+worker completion does not depend on a second native pointer event. Pin active
+state remains UI-owned and is sent to the presenter as a small overlay state
+command after DB lookup or toggle.
+The UI thread now also sends lightweight timeline markers for pin/bookmark/
+chapter positions. The presenter draws these over the native seek bar and uses
+the bookmark markers to make the seek-hover bookmark icon show an active state
+near existing bookmarks.
+A first native left-edge jump panel consumes the same marker list and exposes a
+compact PIN/BM/CH time list with click-to-seek rows. It intentionally omits
+thumbnail rows and edit/delete actions until the full left/right panel parity
+slice.
+The left panel has its own hover lifetime separate from the bottom seek HUD:
+the full visible panel width opens and retains it, while the bottom seek-bar
+zone remains excluded so seek hover does not accidentally open the side panel.
+This mirrors the legacy fullscreen side-panel behavior and keeps rows clickable
+when the cursor leaves the seek-bar hover region.
+Marker synchronization is now requested on left-edge mouse movement, so the
+panel can initialize before any seek-hover thumbnail has been opened.
+
+The native overlay now also has first-pass top and right hover panels. The
+right panel receives a compact metadata snapshot from the UI thread (file/title,
+codec, decoder, audio, bitrate, duration, and chapter count), while the top bar
+shows title and playback context. These hover zones are independent from the
+bottom seek HUD and follow the legacy direction-based panel model.
+The right metadata panel now wraps and scrolls long metadata values, and wheel
+input over either side panel scrolls that panel instead of navigating to another
+video. The top bar, side panels, and perf graph use separate rectangles so the
+chrome can be shown together without text or panels covering each other.
+
+S-key video tile mode is now represented in the native overlay. The existing
+UI-owned `VideoTileState` and thumbnail worker remain the source of truth; the
+UI thread periodically sends tile progress and decoded RGBA thumbnails to the
+presenter. When tile-mode navigation lands on another video, the native overlay
+keeps a black preparing screen visible until the new video's tile state can be
+reopened, reducing flicker back to the thumbnail grid/backdrop.
+Native presentation drops stale due frames before presenting when the presenter
+thread has fallen behind the audio clock, and pause/resume clears the native
+source-pacing baseline. This keeps overloaded CPU fallback playback closer to
+audio time; dropped video frames are preferred to sustained A/V drift.
 
 Core clips:
 

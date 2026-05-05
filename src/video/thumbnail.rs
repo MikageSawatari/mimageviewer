@@ -4,7 +4,7 @@
 //!
 //! メインの `decoder` とは **完全に独立** したワーカースレッドが、同じ動画ファイルを
 //! 別の [`ffmpeg::format::Input`] で開き、要求された `target_secs` の前後の keyframe を
-//! 1 枚だけデコード → `swscale` で `THUMB_W x THUMB_H` の RGBA に変換 → LRU キャッシュ
+//! 1 枚だけデコード → `swscale` で `THUMB_W x THUMB_H` の RGBA に変換 → キャッシュ
 //! に格納する。
 //!
 //! UI スレッドは [`ThumbnailWorker::request`] で「この target_secs のサムネが欲しい」
@@ -18,12 +18,12 @@
 //!
 //! ## メモリ
 //!
-//! `MAX_ENTRIES * THUMB_W * THUMB_H * 4` バイト = 32 × 320 × 180 × 4 ≈ 7.4 MB
-//! (Phase 5.2 でサイズを 2x に拡大、見た目を改善)。VideoPlayer 1 つにつき 1 worker
-//! なので、フルスクリーンで 1 動画開いている間だけ確保される。Drop で worker と
-//! 一緒に解放。
+//! The cache has no fixed entry-count cap. A `VideoPlayer` owns one worker, so
+//! generated thumbnails live only while that video player is alive and are
+//! released together with it. For scale, 400 thumbnails at 320x180 RGBA are
+//! about 92 MB.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -35,8 +35,6 @@ use crossbeam_channel::{Sender, bounded};
 /// Phase 5.2 で 160x90 → 320x180 に 2x 拡大 (見た目改善)。
 pub const THUMB_W: u32 = 320;
 pub const THUMB_H: u32 = 180;
-/// LRU 容量。これ以上は古い順に捨てる。
-const MAX_ENTRIES: usize = 32;
 /// キャッシュ key の粒度 (秒)。シーク サムネ + 動画ジャンプパネル左サムネで共通の
 /// 粒度を使う必要がある (= UI が同 pts に対して同じ key を期待するため)。
 pub const SECONDS_PER_BUCKET: f64 = 0.5;
@@ -50,17 +48,15 @@ pub struct Thumbnail {
     pub rgba: Arc<Vec<u8>>,
 }
 
-/// LRU キャッシュ + 最新リクエスト追跡。worker と UI で共有する。
+/// サムネイルキャッシュ + 最新リクエスト追跡。worker と UI で共有する。
 struct ThumbnailState {
     cache: HashMap<i64, Thumbnail>,
-    lru: VecDeque<i64>,
 }
 
 impl ThumbnailState {
     fn new() -> Self {
         Self {
-            cache: HashMap::with_capacity(MAX_ENTRIES),
-            lru: VecDeque::with_capacity(MAX_ENTRIES),
+            cache: HashMap::new(),
         }
     }
 
@@ -80,16 +76,7 @@ impl ThumbnailState {
     }
 
     fn insert(&mut self, key: i64, thumb: Thumbnail) {
-        if self.cache.contains_key(&key) {
-            // すでにある → LRU 順だけ更新 (新しい方の rgba で上書き)
-            self.lru.retain(|k| *k != key);
-        } else if self.cache.len() >= MAX_ENTRIES {
-            if let Some(old) = self.lru.pop_front() {
-                self.cache.remove(&old);
-            }
-        }
         self.cache.insert(key, thumb);
-        self.lru.push_back(key);
     }
 }
 

@@ -10360,7 +10360,7 @@ impl App {
                     #[cfg(windows)]
                     Some(self.dsp_bridge.clone()),
                     #[cfg(windows)]
-                    native_video_presenter_config(self.main_hwnd),
+                    native_video_presenter_config(self.main_hwnd, self.video_perf_overlay_visible),
                 );
                 if self.settings.video_start_muted || play_test_mute {
                     player.set_muted(true);
@@ -12050,6 +12050,8 @@ impl App {
 
     /// 右上フィードバック表示を設定する。
     pub(crate) fn show_feedback_toast(&mut self, text: String) {
+        #[cfg(windows)]
+        self.show_native_video_overlay_toast(text.clone(), false);
         self.fs_feedback_toast = Some((text, std::time::Instant::now()));
     }
 
@@ -13041,6 +13043,8 @@ impl App {
         for (idx, entry) in self.fs_cache.iter_mut() {
             if let FsCacheEntry::Video { player, .. } = entry {
                 player.set_loop_enabled(loop_enabled);
+                #[cfg(windows)]
+                player.set_native_loop_enabled(loop_enabled);
                 if let Some(d) = player.tick(ctx) {
                     let d = if player.is_playing() {
                         d.min(std::time::Duration::from_millis(16))
@@ -13051,6 +13055,13 @@ impl App {
                         Some(prev) => prev.min(d),
                         None => d,
                     });
+                }
+                #[cfg(windows)]
+                {
+                    player.set_native_playback_status(
+                        !player.native_presenter_pending(),
+                        player.error().map(ToOwned::to_owned),
+                    );
                 }
                 #[cfg(windows)]
                 {
@@ -13083,6 +13094,12 @@ impl App {
         #[cfg(windows)]
         for (idx, event) in native_events {
             self.handle_native_video_output_event(ctx, idx, event);
+        }
+        #[cfg(windows)]
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.sync_native_video_metadata(fs_idx);
+            self.sync_native_video_timeline_markers(fs_idx);
+            self.sync_native_video_tile_overlay(ctx, fs_idx);
         }
         #[cfg(windows)]
         if native_closed_idx.is_some() {
@@ -13165,6 +13182,11 @@ impl App {
 
     #[cfg(windows)]
     fn native_video_presenter_hwnd_for_focus_guard(&self) -> bool {
+        self.native_video_presenter_hwnd().is_some()
+    }
+
+    #[cfg(windows)]
+    fn native_video_presenter_hwnd(&self) -> Option<u64> {
         self.fullscreen_idx
             .and_then(|idx| self.fs_cache.get(&idx))
             .and_then(|entry| match entry {
@@ -13174,7 +13196,6 @@ impl App {
                 }
                 _ => None,
             })
-            .is_some()
     }
 
     #[cfg(windows)]
@@ -13258,6 +13279,55 @@ impl App {
             crate::video::NativeVideoOutputEvent::Seek { target_secs } => {
                 self.handle_native_video_seek_command(ctx, fs_idx, target_secs);
             }
+            crate::video::NativeVideoOutputEvent::TileSeek { target_secs } => {
+                self.handle_native_video_tile_seek_command(ctx, fs_idx, target_secs);
+            }
+            crate::video::NativeVideoOutputEvent::WheelNavigate { delta } => {
+                self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
+            }
+            crate::video::NativeVideoOutputEvent::TileColumnsDelta { delta } => {
+                self.adjust_native_video_tile_columns(ctx, fs_idx, delta);
+            }
+            crate::video::NativeVideoOutputEvent::RequestSeekThumbnail { target_secs } => {
+                self.handle_native_video_request_seek_thumbnail(fs_idx, target_secs);
+            }
+            crate::video::NativeVideoOutputEvent::ToggleTileMode => {
+                let screen = ctx.content_rect().size();
+                self.toggle_video_tile_mode(fs_idx, screen);
+                self.sync_native_video_tile_overlay(ctx, fs_idx);
+            }
+            crate::video::NativeVideoOutputEvent::TogglePerfOverlay => {
+                self.toggle_native_video_perf_overlay(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::ToggleVst3Gui => {
+                self.toggle_native_video_vst3_gui();
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::SeekToStartAndPlay => {
+                self.handle_native_video_seek_to_start_command(ctx, fs_idx);
+            }
+            crate::video::NativeVideoOutputEvent::TogglePlay => {
+                self.handle_native_video_toggle_play_command(ctx, fs_idx);
+            }
+            crate::video::NativeVideoOutputEvent::ToggleMute => {
+                self.handle_native_video_toggle_mute_command(ctx, fs_idx);
+            }
+            crate::video::NativeVideoOutputEvent::ToggleLoop => {
+                self.handle_native_video_toggle_loop_command(ctx, fs_idx);
+            }
+            crate::video::NativeVideoOutputEvent::SetVolume { volume, persist } => {
+                self.handle_native_video_set_volume_command(ctx, fs_idx, volume, persist);
+            }
+            crate::video::NativeVideoOutputEvent::AddBookmarkAt { target_secs } => {
+                self.handle_native_video_add_bookmark_command(ctx, fs_idx, target_secs);
+            }
+            crate::video::NativeVideoOutputEvent::TogglePinAt { target_secs } => {
+                self.handle_native_video_toggle_pin_command(ctx, fs_idx, target_secs);
+            }
+            crate::video::NativeVideoOutputEvent::DeleteBookmark { id } => {
+                self.handle_native_video_delete_bookmark_command(ctx, fs_idx, id);
+            }
         }
     }
 
@@ -13276,13 +13346,23 @@ impl App {
                 self.handle_native_video_key_event(ctx, fs_idx, key);
             }
             crate::video::native_window::NativeVideoWindowEvent::KeyUp(_) => {}
-            crate::video::native_window::NativeVideoWindowEvent::MouseMove(_) => {
+            crate::video::native_window::NativeVideoWindowEvent::MouseMove(mouse) => {
+                if mouse.x < 340 {
+                    self.sync_native_video_timeline_markers(fs_idx);
+                }
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseButton(button) => {
                 self.handle_native_video_mouse_button(ctx, fs_idx, button);
             }
-            crate::video::native_window::NativeVideoWindowEvent::MouseWheel(_) => {
+            crate::video::native_window::NativeVideoWindowEvent::MouseWheel(wheel) => {
+                if wheel.ctrl && self.video_tile_state.is_some() {
+                    let delta = if wheel.delta > 0 { -1 } else { 1 };
+                    self.adjust_native_video_tile_columns(ctx, fs_idx, delta);
+                } else if !wheel.ctrl {
+                    let delta = if wheel.delta < 0 { 1 } else { -1 };
+                    self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
+                }
                 self.mark_native_video_hud_activity(ctx);
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseLeave => {
@@ -13308,6 +13388,518 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn handle_native_video_tile_seek_command(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        target_secs: f64,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.seek(target_secs);
+            self.video_tile_state = None;
+            self.video_tile_textures.clear();
+            player.set_native_tile_overlay(None);
+            self.mark_native_video_hud_activity(ctx);
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_seek_to_start_command(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.seek(0.0);
+            if !player.is_playing() {
+                player.toggle_play();
+            }
+            self.mark_native_video_hud_activity(ctx);
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_toggle_play_command(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.toggle_play();
+            self.mark_native_video_hud_activity(ctx);
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_toggle_mute_command(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_muted(!player.is_muted());
+            self.mark_native_video_hud_activity(ctx);
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_toggle_loop_command(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        self.settings.video_loop = !self.settings.video_loop;
+        self.settings.save();
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_loop_enabled(self.settings.video_loop);
+            player.set_native_loop_enabled(self.settings.video_loop);
+        }
+        self.mark_native_video_hud_activity(ctx);
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_set_volume_command(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        volume: f64,
+        persist: bool,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        let volume = if volume.is_finite() {
+            volume.clamp(0.0, 1.0)
+        } else {
+            return;
+        };
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_volume(volume);
+            self.settings.video_volume = volume;
+            if persist {
+                self.settings.save();
+            }
+            self.mark_native_video_hud_activity(ctx);
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_request_seek_thumbnail(&mut self, fs_idx: usize, target_secs: f64) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        let path = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. })
+                if player.error().is_none()
+                    && player.info().is_some()
+                    && target_secs.is_finite() =>
+            {
+                let target_secs = target_secs.max(0.0);
+                player.request_native_hover_thumbnail(target_secs);
+                Some(player.path().clone())
+            }
+            _ => None,
+        };
+        let Some(path) = path else {
+            return;
+        };
+        let pinned = self
+            .video_pin_db
+            .as_ref()
+            .and_then(|db| db.lookup_pts(&path))
+            .is_some();
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_hover_preview_pinned(pinned);
+        }
+        self.sync_native_video_timeline_markers(fs_idx);
+    }
+
+    #[cfg(windows)]
+    fn sync_native_video_timeline_markers(&self, fs_idx: usize) {
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return;
+        };
+        if player.error().is_some() {
+            return;
+        };
+        let path = player.path().clone();
+        let chapters = player
+            .info()
+            .map(|info| info.chapters.clone())
+            .unwrap_or_default();
+        let mut markers: Vec<crate::video::native_presenter::NativeOverlayTimelineMarker> =
+            Vec::new();
+        let mut entries: Vec<crate::video::native_presenter::NativeOverlayJumpEntry> = Vec::new();
+
+        let requested_thumb = std::cell::Cell::new(false);
+        let make_thumbnail =
+            |pts_secs: f64| -> Option<crate::video::native_presenter::NativeOverlayThumbnail> {
+                if let Some(thumb) = player.nearest_seek_thumbnail(pts_secs) {
+                    Some(crate::video::native_presenter::NativeOverlayThumbnail {
+                        target_secs: thumb.target_secs,
+                        width: thumb.width,
+                        height: thumb.height,
+                        rgba: thumb.rgba,
+                    })
+                } else {
+                    if !requested_thumb.replace(true) {
+                        player.request_seek_thumbnail(pts_secs);
+                    }
+                    None
+                }
+            };
+
+        if let Some(pts_secs) = self
+            .video_pin_db
+            .as_ref()
+            .and_then(|db| db.lookup_pts(&path))
+        {
+            markers.push(
+                crate::video::native_presenter::NativeOverlayTimelineMarker {
+                    pts_secs,
+                    kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Pin,
+                },
+            );
+            entries.push(crate::video::native_presenter::NativeOverlayJumpEntry {
+                pts_secs,
+                kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Pin,
+                title: Some("代表フレーム".to_string()),
+                bookmark_id: None,
+                thumbnail: make_thumbnail(pts_secs),
+            });
+        }
+        if let Some(db) = self.video_bookmark_db.as_ref() {
+            for bookmark in db.list(&path) {
+                markers.push(crate::video::native_presenter::NativeOverlayTimelineMarker {
+                    pts_secs: bookmark.pts_secs,
+                    kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Bookmark,
+                });
+                entries.push(crate::video::native_presenter::NativeOverlayJumpEntry {
+                    pts_secs: bookmark.pts_secs,
+                    kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Bookmark,
+                    title: bookmark.title.clone(),
+                    bookmark_id: Some(bookmark.id),
+                    thumbnail: make_thumbnail(bookmark.pts_secs),
+                });
+            }
+        }
+        for chapter in chapters {
+            markers.push(
+                crate::video::native_presenter::NativeOverlayTimelineMarker {
+                    pts_secs: chapter.start_secs,
+                    kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Chapter,
+                },
+            );
+            entries.push(crate::video::native_presenter::NativeOverlayJumpEntry {
+                pts_secs: chapter.start_secs,
+                kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Chapter,
+                title: chapter.title.clone(),
+                bookmark_id: None,
+                thumbnail: make_thumbnail(chapter.start_secs),
+            });
+        }
+        markers.retain(|marker| marker.pts_secs.is_finite() && marker.pts_secs >= 0.0);
+        markers.sort_by(|a, b| {
+            a.pts_secs
+                .partial_cmp(&b.pts_secs)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        entries.retain(|entry| entry.pts_secs.is_finite() && entry.pts_secs >= 0.0);
+        entries.sort_by(|a, b| {
+            a.pts_secs
+                .partial_cmp(&b.pts_secs)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        player.set_native_timeline_markers(markers);
+        player.set_native_jump_entries(entries);
+    }
+
+    #[cfg(windows)]
+    fn sync_native_video_metadata(&self, fs_idx: usize) {
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return;
+        };
+        let metadata = player.info().map(|info| {
+            let file_name = player
+                .path()
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("video")
+                .to_string();
+            crate::video::native_presenter::NativeOverlayMetadata {
+                file_name,
+                title: info.title.clone(),
+                artist: info.artist.clone(),
+                description: info.description.clone(),
+                width: info.width,
+                height: info.height,
+                duration_secs: info.duration_secs,
+                video_codec: info.video_codec.clone(),
+                video_decoder: info.video_decoder.clone(),
+                audio_codec: info.audio_codec.clone(),
+                avg_fps: info.avg_fps,
+                bit_rate_bps: info.bit_rate_bps,
+                chapter_count: info.chapters.len(),
+                hw_decode_active: info.hw_decode_active,
+                gpu_path_active: info.gpu_path_active,
+                d3d11va_supported: info.d3d11va_supported,
+            }
+        });
+        player.set_native_metadata(metadata);
+    }
+
+    #[cfg(windows)]
+    fn sync_native_video_tile_overlay(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        let current_path = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) if player.error().is_none() => {
+                Some(player.path().clone())
+            }
+            _ => None,
+        };
+        let Some(current_path) = current_path else {
+            return;
+        };
+
+        if self.video_tile_reopen_pending && self.video_tile_state.is_none() {
+            let now = std::time::Instant::now();
+            let deadline = *self
+                .video_tile_reopen_deadline
+                .get_or_insert_with(|| now + std::time::Duration::from_secs(3));
+            if now >= deadline {
+                self.video_tile_reopen_pending = false;
+                self.video_tile_reopen_deadline = None;
+            } else {
+                let screen = ctx.content_rect().size();
+                self.toggle_video_tile_mode(fs_idx, screen);
+                if self.video_tile_state.is_some() {
+                    self.video_tile_reopen_pending = false;
+                    self.video_tile_reopen_deadline = None;
+                } else {
+                    ctx.request_repaint_after(
+                        deadline
+                            .saturating_duration_since(now)
+                            .min(std::time::Duration::from_millis(80)),
+                    );
+                }
+            }
+        }
+
+        let mut clear_state = false;
+        let tile_overlay = if let Some(state) = self.video_tile_state.as_ref() {
+            if state.video_path != current_path {
+                clear_state = true;
+                None
+            } else {
+                let snapshot = state.worker.snapshot();
+                let (progress_done, progress_total) = state.worker.progress();
+                let finished = state.worker.is_finished();
+                if !finished {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+                let tiles = snapshot
+                    .into_iter()
+                    .map(|slot| {
+                        slot.map(|thumb| {
+                            crate::video::native_presenter::NativeOverlayTileThumbnail {
+                                target_secs: thumb.pts_secs,
+                                width: thumb.width,
+                                height: thumb.height,
+                                rgba: thumb.rgba,
+                            }
+                        })
+                    })
+                    .collect();
+                Some(crate::video::native_presenter::NativeOverlayTileOverlay {
+                    interval_secs: state.interval_secs,
+                    timestamps: state.timestamps.clone(),
+                    tile_w: state.tile_w,
+                    tile_h: state.tile_h,
+                    columns: state.columns,
+                    progress_done,
+                    progress_total,
+                    finished,
+                    tiles,
+                })
+            }
+        } else if self.video_tile_reopen_pending {
+            Some(Self::native_video_tile_preparing_overlay())
+        } else {
+            None
+        };
+
+        if clear_state {
+            self.video_tile_state = None;
+            self.video_tile_textures.clear();
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_tile_overlay(tile_overlay);
+        }
+    }
+
+    #[cfg(windows)]
+    fn native_video_tile_preparing_overlay()
+    -> crate::video::native_presenter::NativeOverlayTileOverlay {
+        crate::video::native_presenter::NativeOverlayTileOverlay {
+            interval_secs: 0.0,
+            timestamps: Vec::new(),
+            tile_w: 160,
+            tile_h: 90,
+            columns: 1,
+            progress_done: 0,
+            progress_total: 0,
+            finished: false,
+            tiles: Vec::new(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn set_native_video_tile_preparing_overlay(&self, fs_idx: usize) {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_tile_overlay(Some(Self::native_video_tile_preparing_overlay()));
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_add_bookmark_command(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        target_secs: f64,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        self.add_native_video_bookmark(fs_idx, Some(target_secs));
+        self.mark_native_video_hud_activity(ctx);
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_toggle_pin_command(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        target_secs: f64,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        self.toggle_native_video_pin(fs_idx, target_secs);
+        self.mark_native_video_hud_activity(ctx);
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_delete_bookmark_command(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        id: i64,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        if let Some(db) = self.video_bookmark_db.as_ref() {
+            if let Err(e) = db.remove(id) {
+                crate::logger::log(format!("video bookmark remove failed: {e}"));
+            } else {
+                self.sync_native_video_timeline_markers(fs_idx);
+            }
+        }
+        self.mark_native_video_hud_activity(ctx);
+    }
+
+    #[cfg(windows)]
+    fn add_native_video_bookmark(&mut self, fs_idx: usize, target_secs: Option<f64>) {
+        let snapshot = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                if player.error().is_some() || player.info().is_none() {
+                    None
+                } else {
+                    let pts = target_secs.unwrap_or_else(|| player.position());
+                    Some((
+                        player.path().clone(),
+                        finite_video_target_secs(pts, player.duration()),
+                    ))
+                }
+            }
+            _ => None,
+        };
+        if let (Some((path, pts)), Some(db)) = (snapshot, self.video_bookmark_db.as_ref()) {
+            if let Err(e) = db.add(&path, pts, None, &[]) {
+                crate::logger::log(format!("video bookmark add failed: {e}"));
+            } else {
+                crate::logger::log(format!(
+                    "video bookmark added: pts={pts:.2}s {}",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                ));
+                self.sync_native_video_timeline_markers(fs_idx);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn toggle_native_video_pin(&mut self, fs_idx: usize, target_secs: f64) {
+        let snapshot = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                if player.error().is_some() || player.info().is_none() {
+                    None
+                } else {
+                    let pts = finite_video_target_secs(target_secs, player.duration());
+                    player.request_seek_thumbnail(pts);
+                    let thumb = player.nearest_seek_thumbnail(pts);
+                    Some((player.path().clone(), pts, thumb))
+                }
+            }
+            _ => None,
+        };
+        let Some((path, pts, thumb)) = snapshot else {
+            return;
+        };
+        let Some(db) = self.video_pin_db.as_ref() else {
+            crate::logger::log("video pin: DB not open".to_string());
+            return;
+        };
+        if db.lookup(&path).is_some() {
+            match db.remove(&path) {
+                Ok(()) => {
+                    self.video_thumb_overrides_dirty = true;
+                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                        player.set_native_hover_preview_pinned(false);
+                    }
+                    self.sync_native_video_timeline_markers(fs_idx);
+                    crate::logger::log(format!(
+                        "video pin removed: {}",
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                    ));
+                }
+                Err(e) => crate::logger::log(format!("video pin remove failed: {e}")),
+            }
+            return;
+        }
+        let webp = thumb
+            .as_ref()
+            .map(|t| {
+                let encoder = webp::Encoder::from_rgba(&t.rgba, t.width, t.height);
+                encoder.encode(75.0).to_vec()
+            })
+            .unwrap_or_default();
+        let webp_len = webp.len();
+        match db.set_pin(&path, pts, &webp) {
+            Ok(()) => {
+                self.video_thumb_overrides_dirty = true;
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.set_native_hover_preview_pinned(true);
+                }
+                self.sync_native_video_timeline_markers(fs_idx);
+                crate::logger::log(format!(
+                    "video pin set: pts={pts:.2}s webp={}B {}",
+                    webp_len,
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                ));
+            }
+            Err(e) => crate::logger::log(format!("video pin set failed: {e}")),
+        }
+    }
+
+    #[cfg(windows)]
     fn handle_native_video_key_event(
         &mut self,
         ctx: &egui::Context,
@@ -13319,9 +13911,14 @@ impl App {
         }
         let mut hud_activity = true;
         match key.virtual_key {
-            // Enter: play / pause. Shift+Enter is still handled by the egui
-            // fullscreen path; native HWND support keeps the core transport
-            // controls usable until the overlay/input phase is complete.
+            // Shift+Enter: open in external player, matching the legacy egui
+            // fullscreen video path.
+            0x0D if key.shift && !key.ctrl && !key.repeat => {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    crate::ui_helpers::open_external_player(player.path());
+                }
+            }
+            // Enter: play / pause.
             0x0D if !key.shift && !key.ctrl && !key.repeat => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.toggle_play();
@@ -13373,7 +13970,7 @@ impl App {
                     false,
                 ) {
                     if idx != fs_idx {
-                        self.open_fullscreen(idx);
+                        self.open_native_video_fullscreen_from_navigation(ctx, idx);
                     }
                 }
             }
@@ -13384,7 +13981,7 @@ impl App {
                     true,
                 ) {
                     if idx != fs_idx {
-                        self.open_fullscreen(idx);
+                        self.open_native_video_fullscreen_from_navigation(ctx, idx);
                     }
                 }
             }
@@ -13418,6 +14015,13 @@ impl App {
                 self.settings.video_loop = !self.settings.video_loop;
                 self.settings.save();
             }
+            // J / K: previous / next chapter, bookmark, or pin marker.
+            0x4A if !key.shift && !key.ctrl && !key.repeat => {
+                self.jump_native_video_marker(fs_idx, false);
+            }
+            0x4B if !key.shift && !key.ctrl && !key.repeat => {
+                self.jump_native_video_marker(fs_idx, true);
+            }
             // Space: check/uncheck the current item, matching normal fullscreen.
             0x20 if !key.shift && !key.ctrl && !key.repeat => {
                 if self.checked.contains(&fs_idx) {
@@ -13429,6 +14033,9 @@ impl App {
             // P: perf overlay
             0x50 if !key.shift && !key.ctrl && !key.repeat => {
                 self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.set_native_perf_overlay_visible(self.video_perf_overlay_visible);
+                }
                 self.video_perf_history.clear();
                 self.video_perf_last_wall = None;
                 self.video_perf_last_seq = None;
@@ -13440,29 +14047,12 @@ impl App {
             0x53 if !key.shift && !key.ctrl && !key.repeat => {
                 let screen = ctx.content_rect().size();
                 self.toggle_video_tile_mode(fs_idx, screen);
+                self.sync_native_video_tile_overlay(ctx, fs_idx);
             }
             // B: add video bookmark.
             0x42 if !key.shift && !key.ctrl && !key.repeat => {
-                let snapshot = match self.fs_cache.get(&fs_idx) {
-                    Some(FsCacheEntry::Video { player, .. }) => {
-                        if player.error().is_some() || player.info().is_none() {
-                            None
-                        } else {
-                            Some((player.path().clone(), player.position()))
-                        }
-                    }
-                    _ => None,
-                };
-                if let (Some((path, pts)), Some(db)) = (snapshot, self.video_bookmark_db.as_ref()) {
-                    if let Err(e) = db.add(&path, pts, None, &[]) {
-                        crate::logger::log(format!("video bookmark add failed: {e}"));
-                    } else {
-                        crate::logger::log(format!(
-                            "video bookmark added: pts={pts:.2}s {}",
-                            path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
-                        ));
-                    }
-                }
+                self.add_native_video_bookmark(fs_idx, None);
+                self.sync_native_video_timeline_markers(fs_idx);
             }
             _ => {
                 hud_activity = false;
@@ -13470,6 +14060,112 @@ impl App {
         }
         if hud_activity {
             self.mark_native_video_hud_activity(ctx);
+        }
+    }
+
+    #[cfg(windows)]
+    fn jump_native_video_marker(&mut self, fs_idx: usize, next: bool) {
+        const NAV_MARKER_EPSILON: f64 = 0.5;
+        let markers = self.collect_video_nav_markers(fs_idx);
+        let current = self
+            .fs_video_player(fs_idx)
+            .map(|p| p.position())
+            .unwrap_or(0.0);
+        let target = if next {
+            markers
+                .iter()
+                .find(|marker| marker.pts > current + NAV_MARKER_EPSILON)
+                .cloned()
+        } else {
+            markers
+                .iter()
+                .rev()
+                .find(|marker| marker.pts < current - NAV_MARKER_EPSILON)
+                .cloned()
+        };
+        let Some(marker) = target else {
+            return;
+        };
+        if let Some(player) = self.fs_video_player(fs_idx) {
+            player.seek(marker.pts);
+        }
+        let direction = if next { "次の" } else { "前の" };
+        let kind_label = match marker.kind {
+            crate::ui_fullscreen::NavMarkerKind::Chapter => "チャプター",
+            crate::ui_fullscreen::NavMarkerKind::Bookmark => "ブックマーク",
+            crate::ui_fullscreen::NavMarkerKind::Pin => "ピン",
+        };
+        let toast = match (marker.kind, marker.title.as_deref()) {
+            (crate::ui_fullscreen::NavMarkerKind::Chapter, Some(title))
+            | (crate::ui_fullscreen::NavMarkerKind::Bookmark, Some(title))
+                if !title.is_empty() =>
+            {
+                format!(
+                    "{} {}{}: {}",
+                    crate::ui_helpers::format_hms(marker.pts),
+                    direction,
+                    kind_label,
+                    title
+                )
+            }
+            _ => format!(
+                "{} {}{}",
+                crate::ui_helpers::format_hms(marker.pts),
+                direction,
+                kind_label
+            ),
+        };
+        self.show_feedback_toast(toast);
+    }
+
+    #[cfg(windows)]
+    fn toggle_native_video_vst3_gui(&mut self) {
+        let opening = !self.show_vst3_manager;
+        self.show_vst3_manager = opening;
+        if let Some(hwnd) = self.native_video_presenter_hwnd() {
+            self.dsp_bridge.set_existing_guis_owner_to_hwnd(hwnd);
+            self.native_video_owner_synced_hwnd = hwnd;
+        }
+        self.dsp_bridge.set_all_guis_topmost(opening);
+        std::sync::Arc::clone(&self.dsp_bridge).set_all_guis_visible_async(opening);
+        self.settings.vst3_gui_visible = opening;
+        self.settings.save();
+    }
+
+    #[cfg(windows)]
+    fn show_native_video_overlay_toast(&self, text: String, centered: bool) {
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.show_native_overlay_toast(text, centered);
+        }
+    }
+
+    #[cfg(windows)]
+    fn native_boundary_hint_text(hint: crate::ui_fullscreen::FsBoundaryHint) -> String {
+        match hint {
+            crate::ui_fullscreen::FsBoundaryHint::Edge { at_end, .. } => {
+                if at_end {
+                    "最後の画像です".to_string()
+                } else {
+                    "最初の画像です".to_string()
+                }
+            }
+            crate::ui_fullscreen::FsBoundaryHint::NoImageFolder { forward, .. } => {
+                if forward {
+                    "次の画像フォルダが見つかりません".to_string()
+                } else {
+                    "前の画像フォルダが見つかりません".to_string()
+                }
+            }
+            crate::ui_fullscreen::FsBoundaryHint::SearchEnd { forward, .. } => {
+                if forward {
+                    "これ以上先の検索結果はありません".to_string()
+                } else {
+                    "これ以上前の検索結果はありません".to_string()
+                }
+            }
         }
     }
 
@@ -13490,15 +14186,89 @@ impl App {
             fs_idx,
             nav_delta,
         ) {
-            self.open_fullscreen(new_idx);
-            ctx.request_repaint();
+            self.open_native_video_fullscreen_from_navigation(ctx, new_idx);
         } else {
-            self.fs_boundary_hint = Some(crate::ui_fullscreen::FsBoundaryHint::Edge {
+            let hint = crate::ui_fullscreen::FsBoundaryHint::Edge {
                 at_end: nav_delta > 0,
                 at: std::time::Instant::now(),
-            });
+            };
+            self.show_native_video_overlay_toast(Self::native_boundary_hint_text(hint), true);
+            self.fs_boundary_hint = Some(hint);
             self.mark_native_video_hud_activity(ctx);
         }
+    }
+
+    #[cfg(windows)]
+    fn adjust_native_video_tile_columns(&mut self, ctx: &egui::Context, fs_idx: usize, delta: i32) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() || delta == 0 {
+            return;
+        }
+        let candidates = crate::settings::VIDEO_TILE_COLUMN_CANDIDATES;
+        let current = self.settings.video_tile_columns;
+        let current_idx = candidates
+            .iter()
+            .position(|&cols| cols == current)
+            .unwrap_or_else(|| {
+                candidates
+                    .iter()
+                    .position(|&cols| cols >= current)
+                    .unwrap_or(candidates.len().saturating_sub(1))
+            });
+        let next_idx = (current_idx as i32 + delta)
+            .clamp(0, candidates.len().saturating_sub(1) as i32) as usize;
+        let next_cols = candidates[next_idx];
+        if next_cols == current {
+            return;
+        }
+        self.settings.video_tile_columns = next_cols;
+        self.settings.save();
+        let was_open = self.video_tile_state.is_some();
+        self.video_tile_state = None;
+        self.video_tile_textures.clear();
+        if was_open {
+            let screen = ctx.content_rect().size();
+            self.toggle_video_tile_mode(fs_idx, screen);
+            self.sync_native_video_tile_overlay(ctx, fs_idx);
+        }
+        self.mark_native_video_hud_activity(ctx);
+    }
+
+    #[cfg(windows)]
+    fn toggle_native_video_perf_overlay(&mut self, fs_idx: usize) {
+        self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_perf_overlay_visible(self.video_perf_overlay_visible);
+        }
+        self.video_perf_history.clear();
+        self.video_perf_last_wall = None;
+        self.video_perf_last_seq = None;
+        self.video_perf_last_decoder_skip = None;
+        self.video_perf_last_ui_skip = None;
+    }
+
+    #[cfg(windows)]
+    fn open_native_video_fullscreen_from_navigation(&mut self, ctx: &egui::Context, idx: usize) {
+        let restore_video_tile = self.video_tile_state.is_some();
+        if restore_video_tile {
+            self.video_tile_state = None;
+            self.video_tile_textures.clear();
+            if let Some(current_idx) = self.fullscreen_idx {
+                self.set_native_video_tile_preparing_overlay(current_idx);
+            }
+        }
+
+        self.open_fullscreen(idx);
+
+        if restore_video_tile && matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+            self.video_tile_reopen_pending = true;
+            self.video_tile_reopen_deadline =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+            self.set_native_video_tile_preparing_overlay(idx);
+        } else if restore_video_tile {
+            self.video_tile_reopen_pending = false;
+            self.video_tile_reopen_deadline = None;
+        }
+        ctx.request_repaint();
     }
 
     #[cfg(windows)]
@@ -16394,6 +17164,7 @@ fn env_flag_enabled(name: &str, default: bool) -> bool {
 #[cfg(windows)]
 fn native_video_presenter_config(
     main_hwnd: Option<isize>,
+    perf_overlay_visible: bool,
 ) -> Option<crate::video::NativeVideoOutputConfig> {
     if !env_flag_enabled("MIV_NATIVE_VIDEO_PRESENTER", true) {
         return None;
@@ -16423,7 +17194,21 @@ fn native_video_presenter_config(
         rect: info.rcMonitor,
         owner_hwnd: main_hwnd.unwrap_or_default() as u64,
         sync_interval,
+        perf_overlay_visible,
     })
+}
+
+#[cfg(windows)]
+fn finite_video_target_secs(target_secs: f64, duration_secs: f64) -> f64 {
+    if !target_secs.is_finite() {
+        return 0.0;
+    }
+    let upper = if duration_secs.is_finite() && duration_secs > 0.0 {
+        duration_secs
+    } else {
+        f64::MAX
+    };
+    target_secs.clamp(0.0, upper)
 }
 
 #[cfg(test)]

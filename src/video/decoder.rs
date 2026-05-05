@@ -254,6 +254,104 @@ fn emit_video_packet_overflow_queued(
 // 異なるスレッドからの ref/unref は安全 (Sync は不要 = 1 thread が排他所有する形で使う)。
 unsafe impl Send for HwDevice {}
 
+fn pending_video_pts_span_ms(pending_video_packets: &VecDeque<QueuedVideoPacket>) -> Option<f64> {
+    let first = pending_video_packets.front()?.pts_secs?;
+    let last = pending_video_packets.back()?.pts_secs?;
+    let span_ms = (last - first) * 1000.0;
+    if span_ms.is_finite() && span_ms >= 0.0 {
+        Some(span_ms)
+    } else {
+        None
+    }
+}
+
+fn emit_demux_drain_full_hit(
+    pending_video_packets: &VecDeque<QueuedVideoPacket>,
+    pending_video_packet_bytes: usize,
+    video_pkt_tx_len: usize,
+    seek_serial: u64,
+) {
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "demux",
+            "drain_full_hit",
+            None,
+            0,
+            &[
+                (
+                    "pending_video_packets",
+                    serde_json::Value::from(pending_video_packets.len() as i64),
+                ),
+                (
+                    "pending_video_bytes",
+                    serde_json::Value::from(pending_video_packet_bytes as i64),
+                ),
+                (
+                    "video_pkt_tx_len",
+                    serde_json::Value::from(video_pkt_tx_len as i64),
+                ),
+                (
+                    "pending_video_pts_span_ms",
+                    pending_video_pts_span_ms(pending_video_packets)
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+                ("seek_serial", serde_json::Value::from(seek_serial as i64)),
+            ],
+        );
+    }
+}
+
+fn emit_demux_queue_state(
+    pending_video_packets: &VecDeque<QueuedVideoPacket>,
+    pending_video_packet_bytes: usize,
+    pending_video_peak_packets: usize,
+    pending_video_peak_bytes: usize,
+    video_pkt_tx: &Sender<VideoWorkerMsg>,
+    audio_pkt_tx: &Sender<AudioWorkerMsg>,
+) {
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "demux",
+            "queue_state",
+            None,
+            0,
+            &[
+                (
+                    "pending_video_packets",
+                    serde_json::Value::from(pending_video_packets.len() as i64),
+                ),
+                (
+                    "pending_video_bytes",
+                    serde_json::Value::from(pending_video_packet_bytes as i64),
+                ),
+                (
+                    "pending_video_peak_packets",
+                    serde_json::Value::from(pending_video_peak_packets as i64),
+                ),
+                (
+                    "pending_video_peak_bytes",
+                    serde_json::Value::from(pending_video_peak_bytes as i64),
+                ),
+                (
+                    "video_pkt_tx_len",
+                    serde_json::Value::from(video_pkt_tx.len() as i64),
+                ),
+                (
+                    "audio_pkt_tx_len",
+                    serde_json::Value::from(audio_pkt_tx.len() as i64),
+                ),
+                (
+                    "pending_video_pts_span_ms",
+                    pending_video_pts_span_ms(pending_video_packets)
+                        .map(serde_json::Value::from)
+                        .unwrap_or(serde_json::Value::Null),
+                ),
+            ],
+        );
+    }
+}
+
 fn drain_pending_video_packets(
     pending_video_packets: &mut VecDeque<QueuedVideoPacket>,
     pending_video_packet_bytes: &mut usize,
@@ -261,17 +359,24 @@ fn drain_pending_video_packets(
     clock: &AvClock,
     cancel: &AtomicBool,
 ) -> bool {
+    use crossbeam_channel::TrySendError;
+
     while let Some(queued) = pending_video_packets.pop_front() {
+        if cancel.load(Ordering::Acquire) {
+            pending_video_packets.push_front(queued);
+            return false;
+        }
+
         let QueuedVideoPacket {
             serial,
             packet,
             pts_secs,
             size_bytes,
         } = queued;
-        *pending_video_packet_bytes = pending_video_packet_bytes.saturating_sub(size_bytes);
 
         let live_serial = clock.current_seek_serial();
         if serial != live_serial {
+            *pending_video_packet_bytes = pending_video_packet_bytes.saturating_sub(size_bytes);
             if crate::perf::is_enabled() {
                 crate::perf::event(
                     "demux",
@@ -291,25 +396,29 @@ fn drain_pending_video_packets(
             continue;
         }
 
-        let queue_len_before = video_pkt_tx.len();
-        let send_t0 = std::time::Instant::now();
-        if !send_demux_msg_cancel_aware(
-            video_pkt_tx,
-            VideoWorkerMsg::Packet { serial, packet },
-            cancel,
-        ) {
-            return false;
-        }
-        let wait_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
-        if wait_ms >= DEMUX_PACKET_SEND_WAIT_WARN_MS {
-            emit_demux_packet_send_wait(
-                "video",
-                wait_ms,
-                queue_len_before,
-                VIDEO_PACKET_QUEUE_CAP,
-                pts_secs,
-                serial,
-            );
+        match video_pkt_tx.try_send(VideoWorkerMsg::Packet { serial, packet }) {
+            Ok(()) => {
+                *pending_video_packet_bytes = pending_video_packet_bytes.saturating_sub(size_bytes);
+            }
+            Err(TrySendError::Full(VideoWorkerMsg::Packet {
+                serial: ret_serial,
+                packet: ret_packet,
+            })) => {
+                pending_video_packets.push_front(QueuedVideoPacket {
+                    serial: ret_serial,
+                    packet: ret_packet,
+                    pts_secs,
+                    size_bytes,
+                });
+                emit_demux_drain_full_hit(
+                    pending_video_packets,
+                    *pending_video_packet_bytes,
+                    video_pkt_tx.len(),
+                    ret_serial,
+                );
+                break;
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => return false,
         }
     }
     true
@@ -1076,43 +1185,42 @@ fn run_decoder(
 
     let mut pending_video_packets: VecDeque<QueuedVideoPacket> = VecDeque::new();
     let mut pending_video_packet_bytes: usize = 0;
+    let mut pending_video_peak_packets: usize = 0;
+    let mut pending_video_peak_bytes: usize = 0;
     let mut next_video_overflow_log_bytes: usize = 0;
+    let mut last_demux_queue_state_at = std::time::Instant::now();
 
     'outer: loop {
         if cancel.load(Ordering::Acquire) {
             break;
         }
 
-        while let Some(queued) = pending_video_packets.pop_front() {
-            let QueuedVideoPacket {
-                serial,
-                packet,
-                pts_secs,
-                size_bytes,
-            } = queued;
-            match video_pkt_tx.try_send(VideoWorkerMsg::Packet { serial, packet }) {
-                Ok(()) => {
-                    pending_video_packet_bytes =
-                        pending_video_packet_bytes.saturating_sub(size_bytes);
-                    if pending_video_packets.is_empty() {
-                        next_video_overflow_log_bytes = 0;
-                    }
-                }
-                Err(crossbeam_channel::TrySendError::Full(VideoWorkerMsg::Packet {
-                    serial,
-                    packet,
-                })) => {
-                    pending_video_packets.push_front(QueuedVideoPacket {
-                        serial,
-                        packet,
-                        pts_secs,
-                        size_bytes,
-                    });
-                    break;
-                }
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => break 'outer,
-                Err(crossbeam_channel::TrySendError::Full(_)) => unreachable!(),
-            }
+        if !pending_video_packets.is_empty()
+            && !drain_pending_video_packets(
+                &mut pending_video_packets,
+                &mut pending_video_packet_bytes,
+                &video_pkt_tx,
+                &clock,
+                &cancel,
+            )
+        {
+            break 'outer;
+        }
+        if pending_video_packets.is_empty() {
+            next_video_overflow_log_bytes = 0;
+        }
+        if crate::perf::is_enabled()
+            && last_demux_queue_state_at.elapsed() >= std::time::Duration::from_secs(1)
+        {
+            emit_demux_queue_state(
+                &pending_video_packets,
+                pending_video_packet_bytes,
+                pending_video_peak_packets,
+                pending_video_peak_bytes,
+                &video_pkt_tx,
+                &audio_pkt_tx,
+            );
+            last_demux_queue_state_at = std::time::Instant::now();
         }
 
         // シーク要求を確認
@@ -1444,6 +1552,10 @@ fn run_decoder(
                             pts_secs: packet_pts,
                             size_bytes: packet_size,
                         });
+                        pending_video_peak_packets =
+                            pending_video_peak_packets.max(pending_video_packets.len());
+                        pending_video_peak_bytes =
+                            pending_video_peak_bytes.max(pending_video_packet_bytes);
                         if should_log {
                             emit_video_packet_overflow_queued(
                                 pending_video_packets.len(),
@@ -3524,7 +3636,7 @@ fn try_gpu_blit_path(
         texture.GetDesc(&mut d);
         d
     };
-    let ten_bit = matches!(
+    let source_ten_bit = matches!(
         in_desc.Format,
         windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_P010
             | windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_P016
@@ -3556,7 +3668,7 @@ fn try_gpu_blit_path(
             active_h,
             final_w,
             final_h,
-            ten_bit,
+            source_ten_bit,
             color_hint,
             fps_num,
             fps_den,
@@ -3607,7 +3719,9 @@ fn try_gpu_blit_path(
         shared_output_notify: blit.shared_output_notify,
         shared_output_keyed_mutex: blit.shared_output_keyed_mutex,
         shared_output_released_to_reader: blit.shared_output_released_to_reader,
-        ten_bit,
+        // Display output is normalized to BGRA8. The source bit depth is used
+        // only while configuring the D3D11 video processor input/color space.
+        ten_bit: false,
         fence_value,
         fence_shared_handle,
         fence_gen,

@@ -24,6 +24,8 @@ pub struct DcompPresenterTestConfig {
     pub height: u32,
     pub sync_interval: u32,
     pub start_secs: f64,
+    pub force_sw: bool,
+    pub pixel_probe_strict: bool,
 }
 
 pub fn parse_config() -> Option<DcompPresenterTestConfig> {
@@ -34,6 +36,8 @@ pub fn parse_config() -> Option<DcompPresenterTestConfig> {
     let mut height = 1080u32;
     let mut sync_interval = 1u32;
     let mut start_secs = 0.0f64;
+    let mut force_sw = false;
+    let mut pixel_probe_strict = false;
     let mut i = 1usize;
     while i < args.len() {
         match args[i].as_str() {
@@ -70,6 +74,12 @@ pub fn parse_config() -> Option<DcompPresenterTestConfig> {
                     i += 1;
                 }
             }
+            "--dcomp-force-sw" => {
+                force_sw = true;
+            }
+            "--dcomp-pixel-probe-strict" => {
+                pixel_probe_strict = true;
+            }
             _ => {}
         }
         i += 1;
@@ -81,6 +91,8 @@ pub fn parse_config() -> Option<DcompPresenterTestConfig> {
         height,
         sync_interval,
         start_secs,
+        force_sw,
+        pixel_probe_strict,
     })
 }
 
@@ -104,7 +116,11 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
         post_quit_on_destroy: true,
         event_tx: Some(event_tx),
     })?;
-    let gpu = GpuVideoDevice::new().map_err(|e| e.to_string())?;
+    let gpu = if config.force_sw {
+        None
+    } else {
+        Some(GpuVideoDevice::new().map_err(|e| e.to_string())?)
+    };
     let mut presenter = NativeVideoPresenter::new(NativePresenterConfig {
         hwnd: window.hwnd(),
         width: config.width,
@@ -112,6 +128,9 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
         test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
         egui_overlay: std::env::var_os("MIV_NATIVE_VIDEO_EGUI_OVERLAY").is_some(),
     })?;
+    if config.pixel_probe_strict {
+        presenter.set_pixel_probe(true, true);
+    }
 
     let seek_serial = Arc::new(AtomicU64::new(0));
     let clock = Arc::new(crate::video::clock::AvClock::new(1.0, seek_serial));
@@ -129,8 +148,8 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
         Arc::clone(&clock),
         Arc::clone(&cancel),
         48_000,
-        true,
-        Some(Arc::clone(&gpu)),
+        !config.force_sw,
+        gpu.clone(),
         engine_state,
         engine_event_tx,
         Arc::clone(&skipped_frame_count),
@@ -179,6 +198,8 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
             ("hw_decode_active", Value::from(info.hw_decode_active)),
             ("gpu_path_active", Value::from(info.gpu_path_active)),
             ("sync_interval", Value::from(config.sync_interval as i64)),
+            ("force_sw", Value::from(config.force_sw)),
+            ("pixel_probe_strict", Value::from(config.pixel_probe_strict)),
         ],
     );
 

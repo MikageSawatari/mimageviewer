@@ -43,7 +43,7 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_TYPE,
     DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709, DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
     DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
-    DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_RATIONAL, DXGI_SAMPLE_DESC,
+    DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIKeyedMutex, IDXGIResource1};
 use windows::core::Interface;
@@ -77,9 +77,11 @@ pub struct D3d11Frame {
     pub shared_output_notify: Option<Arc<Condvar>>,
     pub shared_output_keyed_mutex: Option<IDXGIKeyedMutex>,
     pub shared_output_released_to_reader: Option<Arc<AtomicBool>>,
-    /// 共有テクスチャが 10-bit (R10G10B10A2_UNORM) か。入力が P010/P016 の
-    /// HDR ソースの場合のみ true になる。wgpu 側 import 時の format 選択に必要
-    /// (false → Bgra8Unorm、true → Rgb10a2Unorm)。
+    /// Display texture format selector for legacy import/cache paths.
+    ///
+    /// The current display path intentionally does not expose HDR output, so
+    /// decoder-produced GPU frames are normalized to BGRA8 even for P010/P016
+    /// sources and this flag is false.
     pub ten_bit: bool,
     /// このフレームの GPU 完了に対応する fence 値。`ID3D11DeviceContext4::Signal` で
     /// この値まで進めてあるので、wgpu 側は `Wait(fence, fence_value)` してから
@@ -439,11 +441,10 @@ impl GpuVideoDevice {
         let in_w = in_desc.Width;
         let in_h = in_desc.Height;
         let in_format = in_desc.Format;
-        let out_format = if ten_bit {
-            DXGI_FORMAT_R10G10B10A2_UNORM
-        } else {
-            DXGI_FORMAT_B8G8R8A8_UNORM
-        };
+        // mIV does not expose an HDR display path. Normalize even P010/P016
+        // sources to SDR BGRA8 here so native DComp and legacy wgpu consume one
+        // display texture format.
+        let out_format = DXGI_FORMAT_B8G8R8A8_UNORM;
 
         // 2. processor / enumerator を確保 (キャッシュ)
         self.ensure_processor(
@@ -575,7 +576,7 @@ impl GpuVideoDevice {
                     "VPP blit #{n} pts={pts_secs:.2}s in={active_w}x{active_h} \
                      ({:?} {}) out={out_w}x{out_h} ({:?}) fps={}/{} hint={:?}",
                     in_format,
-                    if ten_bit { "10b" } else { "8b" },
+                    if ten_bit { "10b-src" } else { "8b-src" },
                     out_format,
                     input_fps_num,
                     input_fps_den,
@@ -594,7 +595,6 @@ impl GpuVideoDevice {
             VideoColorHint::HdrPq => DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020,
             VideoColorHint::HdrHlg => DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020,
         };
-        let _ = ten_bit; // ten_bit は出力 format で既に使用済 (10-bit 入力 = R10G10B10A2 出力)
         let out_color_space = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
         unsafe {
             self.video_context1.VideoProcessorSetStreamColorSpace1(

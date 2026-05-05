@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -64,7 +65,9 @@ pub struct NativeVideoPresenter {
     egui_overlay: Option<NativeEguiOverlay>,
     fence_cache: Option<(u64, isize, ID3D11Fence)>,
     shared_texture_cache: Vec<(u64, ID3D11Texture2D)>,
+    cpu_upload_scratch: Vec<u8>,
     pixel_probe_enabled: bool,
+    pixel_probe_strict: bool,
     last_pixel_probe: Option<Instant>,
     width: u32,
     height: u32,
@@ -116,11 +119,47 @@ struct NativeEguiOverlay {
     video_position_secs: f64,
     video_duration_secs: f64,
     video_is_playing: bool,
+    video_volume: f64,
+    video_muted: bool,
+    video_loop_enabled: bool,
+    first_frame_presented: bool,
+    video_error: Option<String>,
+    toast: Option<NativeOverlayToast>,
+    perf_visible: bool,
+    perf_history: VecDeque<NativeOverlayPerfSample>,
+    perf_latest: NativeOverlayPerfSnapshot,
+    perf_last_dirty: Instant,
+    perf_pause_gap_pending: bool,
     last_seek_target_secs: Option<f64>,
+    last_thumbnail_request_secs: Option<f64>,
+    last_thumbnail_request_at: Option<Instant>,
+    hover_preview_target_secs: Option<f64>,
+    hover_preview_pinned: bool,
+    hover_thumbnail: Option<NativeOverlayThumbnail>,
+    hover_texture: Option<egui::TextureHandle>,
+    hover_texture_key: Option<(u32, u32, u64)>,
+    timeline_markers: Vec<NativeOverlayTimelineMarker>,
+    jump_entries: Vec<NativeOverlayJumpEntry>,
+    video_metadata: Option<NativeOverlayMetadata>,
+    tile_overlay: Option<NativeOverlayTileOverlay>,
+    tile_textures: HashMap<usize, (u64, egui::TextureHandle)>,
+    jump_textures: HashMap<usize, (u64, egui::TextureHandle)>,
+    top_bar_visible: bool,
+    right_panel_visible: bool,
+    jump_panel_visible: bool,
+    pending_overlay_commands: Vec<NativeOverlayCommand>,
+    last_volume_target: Option<f64>,
     visual_attached: bool,
     pixels_per_point: f32,
     width: u32,
     height: u32,
+}
+
+#[derive(Clone, Debug)]
+struct NativeOverlayToast {
+    text: String,
+    started_at: Instant,
+    centered: bool,
 }
 
 pub struct NativePresentOutcome {
@@ -139,6 +178,103 @@ pub struct NativePresentOutcome {
     pub present_waitable_ms: f64,
     pub present_call_ms: f64,
     pub present_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NativeOverlayPerfSnapshot {
+    pub elapsed_secs: f64,
+    pub presented: u64,
+    pub gpu: u64,
+    pub cpu: u64,
+    pub late_drop: u64,
+    pub wait_timeout: u64,
+    pub actual_fps: f64,
+    pub max_late_ms: f64,
+    pub max_total_ms: f64,
+    pub max_interval_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NativeOverlayPerfSample {
+    pub arrival: Instant,
+    pub interval_ms: f32,
+    pub total_ms: f32,
+    pub copy_ms: f32,
+    pub present_waitable_ms: f32,
+    pub present_call_ms: f32,
+    pub late_ms: f32,
+    pub source_delta_ms: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeOverlayThumbnail {
+    pub target_secs: f64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Arc<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NativeOverlayTimelineMarkerKind {
+    Pin,
+    Bookmark,
+    Chapter,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NativeOverlayTimelineMarker {
+    pub pts_secs: f64,
+    pub kind: NativeOverlayTimelineMarkerKind,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct NativeOverlayMetadata {
+    pub file_name: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub description: Option<String>,
+    pub width: u32,
+    pub height: u32,
+    pub duration_secs: f64,
+    pub video_codec: String,
+    pub video_decoder: String,
+    pub audio_codec: Option<String>,
+    pub avg_fps: f64,
+    pub bit_rate_bps: i64,
+    pub chapter_count: usize,
+    pub hw_decode_active: bool,
+    pub gpu_path_active: bool,
+    pub d3d11va_supported: bool,
+}
+
+#[derive(Clone)]
+pub struct NativeOverlayTileThumbnail {
+    pub target_secs: f64,
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Arc<Vec<u8>>,
+}
+
+#[derive(Clone)]
+pub struct NativeOverlayTileOverlay {
+    pub interval_secs: f64,
+    pub timestamps: Vec<f64>,
+    pub tile_w: u32,
+    pub tile_h: u32,
+    pub columns: usize,
+    pub progress_done: usize,
+    pub progress_total: usize,
+    pub finished: bool,
+    pub tiles: Vec<Option<NativeOverlayTileThumbnail>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NativeOverlayJumpEntry {
+    pub pts_secs: f64,
+    pub kind: NativeOverlayTimelineMarkerKind,
+    pub title: Option<String>,
+    pub bookmark_id: Option<i64>,
+    pub thumbnail: Option<NativeOverlayThumbnail>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -196,9 +332,24 @@ impl NativeOverlayInputOutcome {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum NativeOverlayCommand {
     Seek { target_secs: f64 },
+    TileSeek { target_secs: f64 },
+    WheelNavigate { delta: i32 },
+    TileColumnsDelta { delta: i32 },
+    RequestSeekThumbnail { target_secs: f64 },
+    ToggleTileMode,
+    TogglePerfOverlay,
+    ToggleVst3Gui,
+    SeekToStartAndPlay,
+    TogglePlay,
+    ToggleMute,
+    SetVolume { volume: f64, persist: bool },
+    ToggleLoop,
+    AddBookmarkAt { target_secs: f64 },
+    TogglePinAt { target_secs: f64 },
+    DeleteBookmark { id: i64 },
 }
 
 impl NativeOverlayInputRouting {
@@ -247,6 +398,52 @@ fn create_present_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), 
         feature_level.0
     ));
     Ok((device, context))
+}
+
+fn configure_overlay_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    if let Ok(data) = std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf") {
+        fonts.font_data.insert(
+            "emoji".to_owned(),
+            Arc::new(egui::FontData::from_owned(data)),
+        );
+        // Prefer the emoji font for symbol/emoji codepoints in the standalone
+        // native overlay; Japanese text still falls through to the UI font.
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "emoji".to_owned());
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "emoji".to_owned());
+    }
+    for path in [
+        r"C:\Windows\Fonts\YuGothM.ttc",
+        r"C:\Windows\Fonts\meiryo.ttc",
+        r"C:\Windows\Fonts\msgothic.ttc",
+    ] {
+        let Ok(data) = std::fs::read(path) else {
+            continue;
+        };
+        fonts.font_data.insert(
+            "japanese".to_owned(),
+            Arc::new(egui::FontData::from_owned(data)),
+        );
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let family_fonts = fonts.families.entry(family).or_default();
+            let insert_at = if family_fonts.iter().any(|name| name == "emoji") {
+                1
+            } else {
+                0
+            };
+            family_fonts.insert(insert_at, "japanese".to_owned());
+        }
+        break;
+    }
+    ctx.set_fonts(fonts);
 }
 
 impl NativeVideoPresenter {
@@ -411,7 +608,10 @@ impl NativeVideoPresenter {
                 egui_overlay,
                 fence_cache: None,
                 shared_texture_cache: Vec::new(),
+                cpu_upload_scratch: Vec::new(),
                 pixel_probe_enabled: std::env::var_os("MIV_NATIVE_VIDEO_PIXEL_PROBE").is_some(),
+                pixel_probe_strict: std::env::var_os("MIV_NATIVE_VIDEO_PIXEL_PROBE_STRICT")
+                    .is_some(),
                 last_pixel_probe: None,
                 width: config.width,
                 height: config.height,
@@ -492,6 +692,23 @@ impl NativeVideoPresenter {
         let path = match &frame.data {
             VideoFrameData::Cpu(bytes) => {
                 self.ensure_video_surface_size(frame.width, frame.height)?;
+                let probe_this_frame = self.pixel_probe_due();
+                let src_probe = if probe_this_frame {
+                    Some(sample_cpu_rgba_pixel(
+                        bytes,
+                        frame.width,
+                        frame.height,
+                        DXGI_FORMAT_B8G8R8A8_UNORM.0,
+                    )?)
+                } else {
+                    None
+                };
+                copy_cpu_rgba_to_swapchain_bgra(
+                    bytes,
+                    &mut self.cpu_upload_scratch,
+                    frame.width,
+                    frame.height,
+                )?;
                 let backbuffer = self
                     .backbuffer
                     .as_ref()
@@ -502,11 +719,30 @@ impl NativeVideoPresenter {
                         backbuffer,
                         0,
                         None,
-                        bytes.as_ptr().cast(),
+                        self.cpu_upload_scratch.as_ptr().cast(),
                         frame.width.saturating_mul(4),
                         0,
                     );
                     copy_call_ms = copy_call_t0.elapsed().as_secs_f64() * 1000.0;
+                    if probe_this_frame {
+                        let backbuffer_probe =
+                            self.sample_texture_pixel(backbuffer, "backbuffer")?;
+                        self.log_pixel_probe(
+                            "cpu_upload",
+                            0,
+                            0,
+                            0.0,
+                            src_probe,
+                            Some(backbuffer_probe),
+                        );
+                        if self.pixel_probe_strict {
+                            compare_pixel_probe(
+                                "cpu_upload",
+                                src_probe.unwrap(),
+                                backbuffer_probe,
+                            )?;
+                        }
+                    }
                 }
                 "cpu_upload"
             }
@@ -584,12 +820,20 @@ impl NativeVideoPresenter {
                         let backbuffer_probe =
                             self.sample_texture_pixel(&backbuffer, "backbuffer")?;
                         self.log_pixel_probe(
+                            "d3d11_shared",
                             gpu_frame.fence_gen,
                             gpu_frame.fence_value,
                             fence_wait_ms,
                             src_probe,
                             Some(backbuffer_probe),
                         );
+                        if self.pixel_probe_strict {
+                            compare_pixel_probe(
+                                "d3d11_shared",
+                                src_probe.unwrap(),
+                                backbuffer_probe,
+                            )?;
+                        }
                     }
                 }
                 "d3d11_shared"
@@ -638,10 +882,93 @@ impl NativeVideoPresenter {
         position_secs: f64,
         duration_secs: f64,
         is_playing: bool,
+        volume: f64,
+        muted: bool,
     ) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.update_video_state(position_secs, duration_secs, is_playing);
+            overlay.update_video_state(position_secs, duration_secs, is_playing, volume, muted);
         }
+    }
+
+    pub fn set_overlay_perf_visible(&mut self, visible: bool) -> bool {
+        self.egui_overlay
+            .as_mut()
+            .map(|overlay| overlay.set_perf_visible(visible))
+            .unwrap_or(false)
+    }
+
+    pub fn push_overlay_perf_sample(
+        &mut self,
+        sample: NativeOverlayPerfSample,
+        snapshot: NativeOverlayPerfSnapshot,
+    ) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.push_perf_sample(sample, snapshot);
+        }
+    }
+
+    pub fn set_overlay_hover_thumbnail(&mut self, thumbnail: Option<NativeOverlayThumbnail>) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_hover_thumbnail(thumbnail);
+        }
+    }
+
+    pub fn set_overlay_hover_preview_pinned(&mut self, pinned: bool) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_hover_preview_pinned(pinned);
+        }
+    }
+
+    pub fn set_overlay_timeline_markers(&mut self, markers: Vec<NativeOverlayTimelineMarker>) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_timeline_markers(markers);
+        }
+    }
+
+    pub fn set_overlay_jump_entries(&mut self, entries: Vec<NativeOverlayJumpEntry>) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_jump_entries(entries);
+        }
+    }
+
+    pub fn set_overlay_metadata(&mut self, metadata: Option<NativeOverlayMetadata>) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_metadata(metadata);
+        }
+    }
+
+    pub fn set_overlay_tile_overlay(&mut self, tile_overlay: Option<NativeOverlayTileOverlay>) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_tile_overlay(tile_overlay);
+        }
+    }
+
+    pub fn set_overlay_loop_enabled(&mut self, enabled: bool) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_loop_enabled(enabled);
+        }
+    }
+
+    pub fn set_overlay_playback_status(
+        &mut self,
+        first_frame_presented: bool,
+        error: Option<String>,
+    ) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_playback_status(first_frame_presented, error);
+        }
+    }
+
+    pub fn show_overlay_toast(&mut self, text: String, centered: bool) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.show_toast(text, centered);
+        }
+    }
+
+    pub fn set_pixel_probe(&mut self, enabled: bool, strict: bool) {
+        self.pixel_probe_enabled = enabled;
+        self.pixel_probe_strict = strict;
+        self.last_pixel_probe = None;
     }
 
     pub fn tick_overlay_video_state(
@@ -649,9 +976,15 @@ impl NativeVideoPresenter {
         position_secs: f64,
         duration_secs: f64,
         is_playing: bool,
+        volume: f64,
+        muted: bool,
     ) -> Result<(), String> {
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.update_video_state(position_secs, duration_secs, is_playing);
+            let force_tick_render = overlay.wants_periodic_tick();
+            overlay.update_video_state(position_secs, duration_secs, is_playing, volume, muted);
+            if force_tick_render {
+                overlay.dirty = true;
+            }
             overlay.render_if_dirty()?;
         }
         Ok(())
@@ -661,6 +994,20 @@ impl NativeVideoPresenter {
         self.egui_overlay
             .as_ref()
             .map(NativeEguiOverlay::hud_visible)
+            .unwrap_or(false)
+    }
+
+    pub fn overlay_wants_periodic_tick(&self) -> bool {
+        self.egui_overlay
+            .as_ref()
+            .map(NativeEguiOverlay::wants_periodic_tick)
+            .unwrap_or(false)
+    }
+
+    pub fn overlay_needs_render(&self) -> bool {
+        self.egui_overlay
+            .as_ref()
+            .map(NativeEguiOverlay::needs_render)
             .unwrap_or(false)
     }
 
@@ -915,6 +1262,7 @@ impl NativeVideoPresenter {
 
     fn log_pixel_probe(
         &self,
+        path: &str,
         fence_gen: u64,
         fence_value: u64,
         fence_wait_ms: f64,
@@ -934,7 +1282,7 @@ impl NativeVideoPresenter {
         });
         let dst = backbuffer.unwrap_or(src);
         crate::logger::log(format!(
-            "native-presenter: pixel_probe fence_gen={fence_gen} fence_value={fence_value} \
+            "native-presenter: pixel_probe path={path} fence_gen={fence_gen} fence_value={fence_value} \
              fence_wait_ms={fence_wait_ms:.3} src@{},{} size={}x{} fmt={} bgra=({},{},{},{}) \
              backbuffer@{},{} size={}x{} fmt={} bgra=({},{},{},{})",
             src.x,
@@ -959,6 +1307,7 @@ impl NativeVideoPresenter {
         log_event(
             "pixel_probe",
             &[
+                ("path", Value::from(path)),
                 ("fence_gen", Value::from(fence_gen as i64)),
                 ("fence_value", Value::from(fence_value as i64)),
                 ("fence_wait_ms", Value::from(fence_wait_ms)),
@@ -1189,6 +1538,7 @@ impl NativeEguiOverlay {
         let renderer =
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
+        configure_overlay_fonts(&egui_ctx);
         let pixels_per_point = pixels_per_point_for_hwnd(hwnd);
         let this = Self {
             surface,
@@ -1216,7 +1566,36 @@ impl NativeEguiOverlay {
             video_position_secs: 0.0,
             video_duration_secs: 0.0,
             video_is_playing: false,
+            video_volume: 1.0,
+            video_muted: false,
+            video_loop_enabled: false,
+            first_frame_presented: false,
+            video_error: None,
+            toast: None,
+            perf_visible: false,
+            perf_history: VecDeque::with_capacity(256),
+            perf_latest: NativeOverlayPerfSnapshot::default(),
+            perf_last_dirty: Instant::now(),
+            perf_pause_gap_pending: false,
             last_seek_target_secs: None,
+            last_thumbnail_request_secs: None,
+            last_thumbnail_request_at: None,
+            hover_preview_target_secs: None,
+            hover_preview_pinned: false,
+            hover_thumbnail: None,
+            hover_texture: None,
+            hover_texture_key: None,
+            timeline_markers: Vec::new(),
+            jump_entries: Vec::new(),
+            video_metadata: None,
+            tile_overlay: None,
+            tile_textures: HashMap::new(),
+            jump_textures: HashMap::new(),
+            top_bar_visible: false,
+            right_panel_visible: false,
+            jump_panel_visible: false,
+            pending_overlay_commands: Vec::new(),
+            last_volume_target: None,
             visual_attached: false,
             pixels_per_point,
             width: width.max(1),
@@ -1317,6 +1696,18 @@ impl NativeEguiOverlay {
                 let modifiers = egui_modifiers(wheel.shift, wheel.ctrl, false);
                 self.pointer_pos = Some(pos);
                 self.modifiers = modifiers;
+                let over_scroll_panel = self.pointer_over_scroll_panel(pos);
+                if wheel.ctrl && self.tile_overlay.is_some() {
+                    self.pending_overlay_commands
+                        .push(NativeOverlayCommand::TileColumnsDelta {
+                            delta: if wheel.delta > 0 { -1 } else { 1 },
+                        });
+                } else if !wheel.ctrl && !over_scroll_panel {
+                    self.pending_overlay_commands
+                        .push(NativeOverlayCommand::WheelNavigate {
+                            delta: if wheel.delta < 0 { 1 } else { -1 },
+                        });
+                }
                 self.pending_events.push(egui::Event::PointerMoved(pos));
                 self.pending_events.push(egui::Event::MouseWheel {
                     unit: egui::MouseWheelUnit::Line,
@@ -1333,16 +1724,36 @@ impl NativeEguiOverlay {
         }
     }
 
-    fn update_video_state(&mut self, position_secs: f64, duration_secs: f64, is_playing: bool) {
+    fn update_video_state(
+        &mut self,
+        position_secs: f64,
+        duration_secs: f64,
+        is_playing: bool,
+        volume: f64,
+        muted: bool,
+    ) {
         let position_secs = finite_nonnegative(position_secs);
         let duration_secs = finite_nonnegative(duration_secs);
+        let volume = finite_unit(volume);
         let duration_changed = (self.video_duration_secs - duration_secs).abs() > 0.001;
         let position_changed = (self.video_position_secs - position_secs).abs() >= 0.25;
         let playing_changed = self.video_is_playing != is_playing;
+        let volume_changed = (self.video_volume - volume).abs() >= 0.005;
+        let muted_changed = self.video_muted != muted;
+        if !is_playing {
+            self.perf_pause_gap_pending = true;
+        }
         self.video_position_secs = position_secs;
         self.video_duration_secs = duration_secs;
         self.video_is_playing = is_playing;
-        if duration_changed || position_changed || playing_changed {
+        self.video_volume = volume;
+        self.video_muted = muted;
+        if duration_changed
+            || position_changed
+            || playing_changed
+            || volume_changed
+            || muted_changed
+        {
             self.dirty = true;
         }
     }
@@ -1352,6 +1763,260 @@ impl NativeEguiOverlay {
             x as f32 / self.pixels_per_point,
             y as f32 / self.pixels_per_point,
         )
+    }
+
+    fn set_perf_visible(&mut self, visible: bool) -> bool {
+        if self.perf_visible == visible {
+            return false;
+        }
+        self.perf_visible = visible;
+        self.dirty = true;
+        true
+    }
+
+    fn push_perf_sample(
+        &mut self,
+        mut sample: NativeOverlayPerfSample,
+        snapshot: NativeOverlayPerfSnapshot,
+    ) {
+        if let Some(prev) = self.perf_history.back() {
+            let expected_ms = native_perf_expected_frame_ms_from_samples([*prev, sample])
+                .unwrap_or_else(|| {
+                    if sample.source_delta_ms.is_finite() && sample.source_delta_ms > 0.5 {
+                        sample.source_delta_ms
+                    } else if prev.interval_ms.is_finite() && prev.interval_ms > 0.5 {
+                        prev.interval_ms
+                    } else {
+                        16.67
+                    }
+                });
+            sample.arrival =
+                prev.arrival + Duration::from_secs_f32((expected_ms / 1000.0).clamp(0.001, 0.25));
+            if self.perf_pause_gap_pending {
+                sample.interval_ms = expected_ms;
+            }
+        }
+        self.perf_pause_gap_pending = false;
+        self.perf_latest = snapshot;
+        self.perf_history.push_back(sample);
+        while self.perf_history.len() > 1400 {
+            self.perf_history.pop_front();
+        }
+        while self.perf_history.front().is_some_and(|front| {
+            sample
+                .arrival
+                .saturating_duration_since(front.arrival)
+                .as_secs_f32()
+                > 6.5
+        }) {
+            self.perf_history.pop_front();
+        }
+        if self.perf_visible && self.perf_last_dirty.elapsed() >= Duration::from_millis(100) {
+            self.perf_last_dirty = Instant::now();
+            self.dirty = true;
+        }
+    }
+
+    fn set_hover_thumbnail(&mut self, thumbnail: Option<NativeOverlayThumbnail>) {
+        let new_key = thumbnail
+            .as_ref()
+            .map(|t| (t.width, t.height, thumbnail_rgba_key(t)));
+        let old_key = self
+            .hover_thumbnail
+            .as_ref()
+            .map(|t| (t.width, t.height, thumbnail_rgba_key(t)));
+        if new_key == old_key {
+            return;
+        }
+        self.hover_thumbnail = thumbnail;
+        if self.hover_thumbnail.is_none() {
+            self.hover_texture = None;
+            self.hover_texture_key = None;
+        }
+        self.dirty = true;
+    }
+
+    fn set_hover_preview_pinned(&mut self, pinned: bool) {
+        if self.hover_preview_pinned == pinned {
+            return;
+        }
+        self.hover_preview_pinned = pinned;
+        self.dirty = true;
+    }
+
+    fn set_timeline_markers(&mut self, markers: Vec<NativeOverlayTimelineMarker>) {
+        if timeline_markers_match(&self.timeline_markers, &markers) {
+            return;
+        }
+        self.timeline_markers = markers;
+        self.dirty = true;
+    }
+
+    fn set_jump_entries(&mut self, entries: Vec<NativeOverlayJumpEntry>) {
+        if jump_entries_match(&self.jump_entries, &entries) {
+            return;
+        }
+        self.jump_entries = entries;
+        self.dirty = true;
+    }
+
+    fn set_metadata(&mut self, metadata: Option<NativeOverlayMetadata>) {
+        if self.video_metadata == metadata {
+            return;
+        }
+        self.video_metadata = metadata;
+        self.dirty = true;
+    }
+
+    fn set_loop_enabled(&mut self, enabled: bool) {
+        if self.video_loop_enabled == enabled {
+            return;
+        }
+        self.video_loop_enabled = enabled;
+        self.dirty = true;
+    }
+
+    fn set_playback_status(&mut self, first_frame_presented: bool, error: Option<String>) {
+        if self.first_frame_presented == first_frame_presented && self.video_error == error {
+            return;
+        }
+        self.first_frame_presented = first_frame_presented;
+        self.video_error = error;
+        self.dirty = true;
+    }
+
+    fn show_toast(&mut self, text: String, centered: bool) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.toast = Some(NativeOverlayToast {
+            text,
+            started_at: Instant::now(),
+            centered,
+        });
+        self.dirty = true;
+    }
+
+    fn set_tile_overlay(&mut self, tile_overlay: Option<NativeOverlayTileOverlay>) {
+        if self.tile_overlay.is_none() && tile_overlay.is_none() {
+            return;
+        }
+        if tile_overlay.is_none() {
+            self.tile_textures.clear();
+        }
+        self.tile_overlay = tile_overlay;
+        self.dirty = true;
+    }
+
+    fn sync_hover_thumbnail_texture(&mut self) {
+        let Some(thumbnail) = self.hover_thumbnail.as_ref() else {
+            self.hover_texture = None;
+            self.hover_texture_key = None;
+            return;
+        };
+        let key = (
+            thumbnail.width,
+            thumbnail.height,
+            thumbnail_rgba_key(thumbnail),
+        );
+        if self.hover_texture_key == Some(key) {
+            return;
+        }
+        let size = [thumbnail.width as usize, thumbnail.height as usize];
+        if size[0] == 0 || size[1] == 0 || thumbnail.rgba.len() != size[0] * size[1] * 4 {
+            return;
+        }
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, thumbnail.rgba.as_ref());
+        let texture = self.egui_ctx.load_texture(
+            "native_seek_hover_thumbnail",
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.hover_texture = Some(texture);
+        self.hover_texture_key = Some(key);
+    }
+
+    fn sync_tile_overlay_textures(&mut self) {
+        let Some(tile_overlay) = self.tile_overlay.as_ref() else {
+            self.tile_textures.clear();
+            return;
+        };
+        self.tile_textures
+            .retain(|idx, _| tile_overlay.tiles.get(*idx).is_some_and(Option::is_some));
+        for (idx, slot) in tile_overlay.tiles.iter().enumerate() {
+            let Some(tile) = slot.as_ref() else {
+                self.tile_textures.remove(&idx);
+                continue;
+            };
+            let key = tile.target_secs.to_bits() ^ ((tile.width as u64) << 32) ^ tile.height as u64;
+            if self
+                .tile_textures
+                .get(&idx)
+                .is_some_and(|(cached_key, _)| *cached_key == key)
+            {
+                continue;
+            }
+            let size = [tile.width as usize, tile.height as usize];
+            if size[0] == 0 || size[1] == 0 || tile.rgba.len() != size[0] * size[1] * 4 {
+                continue;
+            }
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, tile.rgba.as_ref());
+            let texture = self.egui_ctx.load_texture(
+                format!("native_video_tile:{idx}"),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.tile_textures.insert(idx, (key, texture));
+        }
+    }
+
+    fn sync_jump_entry_textures(&mut self) {
+        self.jump_textures
+            .retain(|idx, _| self.jump_entries.get(*idx).is_some());
+        for (idx, entry) in self.jump_entries.iter().enumerate() {
+            let Some(thumbnail) = entry.thumbnail.as_ref() else {
+                continue;
+            };
+            let key = thumbnail_rgba_key(thumbnail)
+                ^ ((thumbnail.width as u64) << 32)
+                ^ thumbnail.height as u64;
+            if self
+                .jump_textures
+                .get(&idx)
+                .is_some_and(|(cached_key, _)| *cached_key == key)
+            {
+                continue;
+            }
+            let size = [thumbnail.width as usize, thumbnail.height as usize];
+            if size[0] == 0 || size[1] == 0 || thumbnail.rgba.len() != size[0] * size[1] * 4 {
+                continue;
+            }
+            let color_image =
+                egui::ColorImage::from_rgba_unmultiplied(size, thumbnail.rgba.as_ref());
+            let texture = self.egui_ctx.load_texture(
+                format!("native_video_jump:{idx}"),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.jump_textures.insert(idx, (key, texture));
+        }
+    }
+
+    fn wants_periodic_tick(&self) -> bool {
+        self.hud_visible()
+            || self.jump_panel_visible()
+            || self.top_bar_visible()
+            || self.right_panel_visible()
+            || self.perf_visible
+            || self.tile_overlay.is_some()
+            || self.hover_preview_target_secs.is_some()
+            || self.toast.is_some()
+            || self.video_error.is_some()
+            || !self.first_frame_presented
+    }
+
+    fn needs_render(&self) -> bool {
+        self.dirty || !self.pending_events.is_empty()
     }
 
     fn render_if_dirty(&mut self) -> Result<NativeOverlayInputOutcome, String> {
@@ -1378,7 +2043,57 @@ impl NativeEguiOverlay {
     fn hud_visible(&self) -> bool {
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
         self.pointer_pos
-            .is_some_and(|pos| pos.y >= (overlay_height_points - 76.0).max(0.0))
+            .is_some_and(|pos| pos.y >= (overlay_height_points - 220.0).max(0.0))
+    }
+
+    fn top_bar_visible(&self) -> bool {
+        self.pointer_pos.is_some_and(|pos| {
+            let y_max = if self.top_bar_visible { 76.0 } else { 36.0 };
+            pos.y <= y_max
+        })
+    }
+
+    fn right_panel_visible(&self) -> bool {
+        if self.video_metadata.is_none() {
+            return false;
+        }
+        let Some(pos) = self.pointer_pos else {
+            return false;
+        };
+        let overlay_width_points = self.width as f32 / self.pixels_per_point;
+        let overlay_height_points = self.height as f32 / self.pixels_per_point;
+        let panel_w =
+            native_metadata_panel_rect(overlay_width_points, overlay_height_points).width();
+        let x_min = overlay_width_points - panel_w;
+        native_panel_hover_rect(
+            egui::pos2(x_min, 0.0),
+            egui::vec2(overlay_width_points - x_min, overlay_height_points),
+            overlay_height_points,
+        )
+        .contains(pos)
+    }
+
+    fn jump_panel_visible(&self) -> bool {
+        let Some(pos) = self.pointer_pos else {
+            return false;
+        };
+        let overlay_height_points = self.height as f32 / self.pixels_per_point;
+        let x_max = native_jump_panel_width();
+        native_panel_hover_rect(
+            egui::pos2(0.0, 0.0),
+            egui::vec2(x_max, overlay_height_points),
+            overlay_height_points,
+        )
+        .contains(pos)
+    }
+
+    fn pointer_over_scroll_panel(&self, pos: egui::Pos2) -> bool {
+        let overlay_width_points = self.width as f32 / self.pixels_per_point;
+        let overlay_height_points = self.height as f32 / self.pixels_per_point;
+        (self.jump_panel_visible() && native_jump_panel_rect(overlay_height_points).contains(pos))
+            || (self.right_panel_visible()
+                && native_metadata_panel_rect(overlay_width_points, overlay_height_points)
+                    .contains(pos))
     }
 
     fn configure(&self) {
@@ -1425,6 +2140,15 @@ impl NativeEguiOverlay {
 
     fn render_once(&mut self) -> Result<Vec<NativeOverlayCommand>, String> {
         let render_t0 = Instant::now();
+        if self.toast.as_ref().is_some_and(|toast| {
+            toast.started_at.elapsed()
+                > Duration::from_millis(if toast.centered { 2500 } else { 1800 })
+        }) {
+            self.toast = None;
+        }
+        self.sync_hover_thumbnail_texture();
+        self.sync_tile_overlay_textures();
+        self.sync_jump_entry_textures();
         let ppp = self.pixels_per_point;
         let event_count = self.event_count;
         let pointer_pos = self.pointer_pos;
@@ -1433,13 +2157,75 @@ impl NativeEguiOverlay {
         let position_secs = self.video_position_secs;
         let duration_secs = self.video_duration_secs;
         let is_playing = self.video_is_playing;
+        let volume = self.video_volume;
+        let muted = self.video_muted;
+        let loop_enabled = self.video_loop_enabled;
+        let first_frame_presented = self.first_frame_presented;
+        let video_error = self.video_error.clone();
+        let toast = self.toast.clone();
+        let hover_thumbnail = self.hover_thumbnail.clone();
+        let hover_texture_id = self.hover_texture.as_ref().map(|texture| texture.id());
+        let hover_preview_pinned = self.hover_preview_pinned;
+        let timeline_markers = self.timeline_markers.clone();
+        let jump_entries = self.jump_entries.clone();
+        let video_metadata = self.video_metadata.clone();
+        let tile_overlay = self.tile_overlay.clone();
+        let tile_texture_ids: HashMap<usize, egui::TextureId> = self
+            .tile_textures
+            .iter()
+            .map(|(idx, (_, texture))| (*idx, texture.id()))
+            .collect();
+        let jump_texture_ids: HashMap<usize, egui::TextureId> = self
+            .jump_textures
+            .iter()
+            .map(|(idx, (_, texture))| (*idx, texture.id()))
+            .collect();
+        let perf_visible = self.perf_visible;
+        let perf_latest = self.perf_latest;
+        let perf_history: Vec<_> = self.perf_history.iter().copied().collect();
         let hud_visible = self.hud_visible();
+        let jump_panel_visible = self.jump_panel_visible();
+        let top_bar_visible = self.top_bar_visible();
+        let right_panel_visible = self.right_panel_visible();
+        let tile_overlay_visible = tile_overlay.is_some();
+        let status_visible = video_error.is_some() || !first_frame_presented;
+        let toast_visible = toast.is_some();
+        let panel_chrome_visible =
+            !tile_overlay_visible && (jump_panel_visible || top_bar_visible || right_panel_visible);
+        let bottom_hud_visible = hud_visible || panel_chrome_visible;
+        let paused_center_visible =
+            !tile_overlay_visible && !is_playing && first_frame_presented && video_error.is_none();
+        let perf_origin = if panel_chrome_visible {
+            egui::pos2(
+                if jump_panel_visible {
+                    native_jump_panel_width() + 12.0
+                } else {
+                    14.0
+                },
+                native_panel_top() + 8.0,
+            )
+        } else {
+            egui::pos2(14.0, 14.0)
+        };
+        let overlay_visible = tile_overlay_visible
+            || bottom_hud_visible
+            || panel_chrome_visible
+            || perf_visible
+            || status_visible
+            || toast_visible
+            || paused_center_visible;
         let pending_event_count = self.pending_events.len();
-        let mut commands = Vec::new();
+        let mut commands = std::mem::take(&mut self.pending_overlay_commands);
         let mut last_seek_target_secs = self.last_seek_target_secs;
-        if !hud_visible {
+        let mut last_thumbnail_request_secs = self.last_thumbnail_request_secs;
+        let mut last_thumbnail_request_at = self.last_thumbnail_request_at;
+        let mut hover_preview_target_secs = self.hover_preview_target_secs;
+        if !overlay_visible {
             self.set_visual_attached(false)?;
             last_seek_target_secs = None;
+            last_thumbnail_request_secs = None;
+            last_thumbnail_request_at = None;
+            hover_preview_target_secs = None;
         }
         let mut raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1456,7 +2242,93 @@ impl NativeEguiOverlay {
             viewport.native_pixels_per_point = Some(ppp);
         }
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
-            if !hud_visible {
+            if !overlay_visible {
+                return;
+            }
+            if perf_visible {
+                draw_native_perf_overlay(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    &perf_history,
+                    perf_latest,
+                    perf_origin,
+                );
+            }
+            if let Some(tile_overlay) = tile_overlay.as_ref() {
+                draw_native_tile_overlay(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    tile_overlay,
+                    &tile_texture_ids,
+                    &mut commands,
+                );
+                return;
+            }
+            if let Some(error) = video_error.as_deref() {
+                draw_native_center_status(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    "動画を再生できません",
+                    Some(error),
+                    true,
+                );
+            } else if !first_frame_presented {
+                draw_native_center_status(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    "動画を準備中...",
+                    None,
+                    false,
+                );
+            }
+            if panel_chrome_visible {
+                draw_native_top_bar(
+                    ctx,
+                    overlay_width_points,
+                    position_secs,
+                    duration_secs,
+                    video_metadata.as_ref(),
+                    is_playing,
+                    muted,
+                    loop_enabled,
+                    perf_visible,
+                    &mut commands,
+                );
+            }
+            if paused_center_visible {
+                draw_native_center_pause_controls(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    &mut commands,
+                );
+            }
+            if let Some(toast) = toast.as_ref() {
+                draw_native_toast(ctx, overlay_width_points, overlay_height_points, toast);
+            }
+            if panel_chrome_visible && let Some(metadata) = video_metadata.as_ref() {
+                draw_native_metadata_panel(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    metadata,
+                );
+            }
+            if panel_chrome_visible {
+                draw_native_jump_panel(
+                    ctx,
+                    overlay_height_points,
+                    position_secs,
+                    &jump_entries,
+                    &jump_texture_ids,
+                    &mut commands,
+                );
+            }
+            if !bottom_hud_visible {
                 return;
             }
             egui::Area::new(egui::Id::new("native_video_seek_hud"))
@@ -1472,11 +2344,92 @@ impl NativeEguiOverlay {
                         egui::Color32::from_rgba_premultiplied(0, 0, 0, 176),
                     );
 
-                    let side_pad = 24.0;
-                    let time_w = 132.0;
-                    let bar_min_x = hud_rect.min.x + side_pad + time_w + 12.0;
-                    let bar_max_x = (hud_rect.max.x - side_pad).max(bar_min_x + 1.0);
+                    let side_pad = 10.0;
+                    let btn_size = 28.0;
+                    let gap = 8.0;
                     let center_y = hud_rect.center().y;
+                    let mut x = hud_rect.min.x + side_pad;
+
+                    let replay_rect = egui::Rect::from_min_size(
+                        egui::pos2(x, center_y - btn_size * 0.5),
+                        egui::vec2(btn_size, btn_size),
+                    );
+                    let replay_resp = ui.interact(
+                        replay_rect,
+                        egui::Id::new("native_video_replay"),
+                        egui::Sense::click(),
+                    );
+                    draw_overlay_button_bg(painter, replay_rect, replay_resp.hovered(), false);
+                    draw_overlay_replay_icon(painter, replay_rect.center(), btn_size * 0.36);
+                    let replay_resp =
+                        replay_resp.on_hover_text("最初から再生 (頭出し + 即再生) [W]");
+                    if replay_resp.clicked() {
+                        commands.push(NativeOverlayCommand::SeekToStartAndPlay);
+                    }
+                    x = replay_rect.max.x + gap;
+
+                    let play_rect = egui::Rect::from_min_size(
+                        egui::pos2(x, center_y - btn_size * 0.5),
+                        egui::vec2(btn_size, btn_size),
+                    );
+                    let play_resp = ui.interact(
+                        play_rect,
+                        egui::Id::new("native_video_play"),
+                        egui::Sense::click(),
+                    );
+                    draw_overlay_button_bg(painter, play_rect, play_resp.hovered(), false);
+                    if is_playing {
+                        draw_overlay_pause_icon(painter, play_rect.center(), btn_size * 0.30);
+                    } else {
+                        draw_overlay_play_icon(painter, play_rect.center(), btn_size * 0.38);
+                    }
+                    let play_resp = play_resp.on_hover_text(if is_playing {
+                        "一時停止 [Enter]"
+                    } else {
+                        "再生 [Enter]"
+                    });
+                    if play_resp.clicked() {
+                        commands.push(NativeOverlayCommand::TogglePlay);
+                    }
+                    x = play_rect.max.x + gap;
+
+                    let loop_rect = egui::Rect::from_min_size(
+                        egui::pos2(x, center_y - btn_size * 0.5),
+                        egui::vec2(btn_size, btn_size),
+                    );
+                    let loop_resp = ui.interact(
+                        loop_rect,
+                        egui::Id::new("native_video_loop"),
+                        egui::Sense::click(),
+                    );
+                    draw_overlay_button_bg(painter, loop_rect, loop_resp.hovered(), loop_enabled);
+                    draw_overlay_loop_icon(
+                        painter,
+                        loop_rect.center(),
+                        btn_size * 0.36,
+                        if loop_enabled {
+                            egui::Color32::from_rgb(170, 230, 255)
+                        } else {
+                            egui::Color32::from_rgb(238, 238, 238)
+                        },
+                    );
+                    let loop_resp = loop_resp.on_hover_text(if loop_enabled {
+                        "ループ再生を解除 [L]"
+                    } else {
+                        "ループ再生 [L]"
+                    });
+                    if loop_resp.clicked() {
+                        commands.push(NativeOverlayCommand::ToggleLoop);
+                    }
+                    x = loop_rect.max.x + gap;
+
+                    let time_w = 132.0;
+                    let vol_pct_w = 40.0;
+                    let vol_slider_w = 90.0;
+                    let mute_w = btn_size;
+                    let right_pad = side_pad + vol_pct_w + gap + vol_slider_w + gap + mute_w;
+                    let bar_min_x = x + time_w + gap;
+                    let bar_max_x = (hud_rect.max.x - right_pad).max(bar_min_x + 1.0);
                     let bar_rect = egui::Rect::from_min_max(
                         egui::pos2(bar_min_x, center_y - 4.0),
                         egui::pos2(bar_max_x, center_y + 4.0),
@@ -1492,19 +2445,11 @@ impl NativeEguiOverlay {
                         format_overlay_time(duration_secs)
                     );
                     painter.text(
-                        egui::pos2(hud_rect.min.x + side_pad, center_y),
+                        egui::pos2(x, center_y),
                         egui::Align2::LEFT_CENTER,
                         label,
                         egui::FontId::proportional(14.0),
                         egui::Color32::from_rgb(238, 238, 238),
-                    );
-                    let play_glyph = if is_playing { "||" } else { ">" };
-                    painter.text(
-                        egui::pos2(hud_rect.min.x + 10.0, center_y),
-                        egui::Align2::CENTER_CENTER,
-                        play_glyph,
-                        egui::FontId::proportional(15.0),
-                        egui::Color32::from_rgb(220, 220, 220),
                     );
 
                     painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(74));
@@ -1518,6 +2463,11 @@ impl NativeEguiOverlay {
                             ),
                         );
                         painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(228, 228, 228));
+                    }
+                    if duration_secs > 0.0 {
+                        for marker in &timeline_markers {
+                            draw_timeline_marker(painter, bar_rect, duration_secs, *marker);
+                        }
                     }
 
                     let seek_resp = ui.interact(
@@ -1548,28 +2498,267 @@ impl NativeEguiOverlay {
                             last_seek_target_secs = None;
                         }
                     }
-                    if duration_secs > 0.0
-                        && seek_resp.hovered()
-                        && let Some(pos) = pointer_pos
-                    {
-                        let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
-                        let frac = ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
-                        let target = duration_secs * frac as f64;
-                        painter.line_segment(
-                            [
-                                egui::pos2(x, hud_rect.min.y + 6.0),
-                                egui::pos2(x, hud_rect.max.y - 6.0),
-                            ],
-                            egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 214, 106)),
-                        );
-                        painter.text(
-                            egui::pos2(x, hud_rect.min.y - 8.0),
-                            egui::Align2::CENTER_BOTTOM,
-                            format_overlay_time(target),
-                            egui::FontId::proportional(12.0),
-                            egui::Color32::from_rgb(255, 232, 160),
-                        );
+                    if duration_secs > 0.0 {
+                        if seek_resp.hovered()
+                            && let Some(pos) = pointer_pos
+                        {
+                            let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
+                            let frac = ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
+                            hover_preview_target_secs = Some(duration_secs * frac as f64);
+                        }
+                    } else {
+                        hover_preview_target_secs = None;
                     }
+                    if duration_secs > 0.0
+                        && let Some(target) = hover_preview_target_secs
+                    {
+                        let frac = (target / duration_secs).clamp(0.0, 1.0) as f32;
+                        let x = bar_rect.min.x + bar_rect.width() * frac;
+                        let hover_preview_bookmarked =
+                            target_has_marker(&timeline_markers, target, duration_secs, |kind| {
+                                kind == NativeOverlayTimelineMarkerKind::Bookmark
+                            });
+                        let preview_image_w = (overlay_width_points * 0.30).clamp(300.0, 352.0);
+                        let image_size = egui::vec2(preview_image_w, preview_image_w * 9.0 / 16.0);
+                        let action_bar_h = 38.0;
+                        let preview_size = egui::vec2(image_size.x, image_size.y + action_bar_h);
+                        let preview_x = (x - preview_size.x * 0.5)
+                            .clamp(8.0, overlay_width_points - preview_size.x - 8.0);
+                        let preview_y = (hud_rect.min.y - preview_size.y - 14.0).max(8.0);
+                        let preview_rect = egui::Rect::from_min_size(
+                            egui::pos2(preview_x, preview_y),
+                            preview_size,
+                        );
+                        let image_rect = egui::Rect::from_min_size(preview_rect.min, image_size);
+                        let action_rect = egui::Rect::from_min_max(
+                            egui::pos2(preview_rect.min.x, image_rect.max.y),
+                            preview_rect.max,
+                        );
+                        let pointer_in_preview =
+                            pointer_pos.is_some_and(|pos| preview_rect.expand(8.0).contains(pos));
+                        if !seek_resp.hovered() && !pointer_in_preview {
+                            hover_preview_target_secs = None;
+                        } else {
+                            let request_due = last_thumbnail_request_secs
+                                .map(|prev| (prev - target).abs() >= 0.25)
+                                .unwrap_or(true)
+                                || last_thumbnail_request_at
+                                    .map(|last| last.elapsed() >= Duration::from_millis(250))
+                                    .unwrap_or(true);
+                            if request_due {
+                                last_thumbnail_request_secs = Some(target);
+                                last_thumbnail_request_at = Some(Instant::now());
+                                commands.push(NativeOverlayCommand::RequestSeekThumbnail {
+                                    target_secs: target,
+                                });
+                            }
+                            painter.line_segment(
+                                [
+                                    egui::pos2(x, hud_rect.min.y + 6.0),
+                                    egui::pos2(x, hud_rect.max.y - 6.0),
+                                ],
+                                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 214, 106)),
+                            );
+
+                            painter.rect_filled(
+                                preview_rect.expand(2.0),
+                                4.0,
+                                egui::Color32::from_rgba_premultiplied(0, 0, 0, 220),
+                            );
+                            painter.rect_filled(image_rect, 3.0, egui::Color32::from_gray(20));
+                            painter.rect_filled(
+                                action_rect,
+                                0.0,
+                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 235),
+                            );
+                            painter.rect_stroke(
+                                preview_rect,
+                                3.0,
+                                egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
+                                egui::StrokeKind::Inside,
+                            );
+                            let thumbnail_matches = hover_thumbnail.as_ref().is_some_and(|thumb| {
+                                (thumb.target_secs - target).abs()
+                                    <= crate::video::thumbnail::SECONDS_PER_BUCKET * 2.0
+                            });
+                            if thumbnail_matches {
+                                if let (Some(texture_id), Some(thumb)) =
+                                    (hover_texture_id, hover_thumbnail.as_ref())
+                                {
+                                    let fitted = fit_rect_in_rect(
+                                        egui::vec2(thumb.width as f32, thumb.height as f32),
+                                        image_rect,
+                                    );
+                                    painter.image(
+                                        texture_id,
+                                        fitted,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                            } else {
+                                painter.text(
+                                    image_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    "loading",
+                                    egui::FontId::proportional(12.0),
+                                    egui::Color32::from_gray(150),
+                                );
+                            }
+
+                            let action_size = 24.0;
+                            let action_gap = 6.0;
+                            let pin_rect = egui::Rect::from_min_size(
+                                action_rect.min + egui::vec2(6.0, 4.0),
+                                egui::vec2(action_size, action_size),
+                            );
+                            let bookmark_rect = egui::Rect::from_min_size(
+                                egui::pos2(pin_rect.max.x + action_gap, pin_rect.min.y),
+                                egui::vec2(action_size, action_size),
+                            );
+                            let pin_resp = ui.interact(
+                                pin_rect,
+                                egui::Id::new("native_video_hover_pin"),
+                                egui::Sense::click(),
+                            );
+                            draw_overlay_button_bg(
+                                painter,
+                                pin_rect,
+                                pin_resp.hovered(),
+                                hover_preview_pinned,
+                            );
+                            draw_overlay_pin_icon(
+                                painter,
+                                pin_rect.center(),
+                                action_size * 0.34,
+                                if hover_preview_pinned {
+                                    egui::Color32::from_rgb(180, 255, 180)
+                                } else {
+                                    egui::Color32::from_rgb(118, 214, 255)
+                                },
+                            );
+                            let pin_resp = pin_resp.on_hover_text(if hover_preview_pinned {
+                                "ピン留めを解除"
+                            } else {
+                                "サムネイルをピン留め"
+                            });
+                            if pin_resp.clicked() {
+                                commands.push(NativeOverlayCommand::TogglePinAt {
+                                    target_secs: target,
+                                });
+                            }
+                            let bookmark_resp = ui.interact(
+                                bookmark_rect,
+                                egui::Id::new("native_video_hover_bookmark"),
+                                egui::Sense::click(),
+                            );
+                            draw_overlay_button_bg(
+                                painter,
+                                bookmark_rect,
+                                bookmark_resp.hovered(),
+                                hover_preview_bookmarked,
+                            );
+                            draw_overlay_bookmark_icon(
+                                painter,
+                                bookmark_rect.center(),
+                                action_size * 0.32,
+                                if hover_preview_bookmarked {
+                                    egui::Color32::from_rgb(255, 245, 145)
+                                } else {
+                                    egui::Color32::from_rgb(255, 220, 80)
+                                },
+                            );
+                            let bookmark_resp =
+                                bookmark_resp.on_hover_text(if hover_preview_bookmarked {
+                                    "ブックマーク済み [B]"
+                                } else {
+                                    "ブックマークを追加 [B]"
+                                });
+                            if bookmark_resp.clicked() {
+                                commands.push(NativeOverlayCommand::AddBookmarkAt {
+                                    target_secs: target,
+                                });
+                            }
+
+                            let time_label = format_overlay_time(target);
+                            painter.text(
+                                egui::pos2(action_rect.max.x - 8.0, action_rect.center().y),
+                                egui::Align2::RIGHT_CENTER,
+                                time_label,
+                                egui::FontId::proportional(13.0),
+                                egui::Color32::from_rgb(245, 245, 245),
+                            );
+                        }
+                    }
+
+                    let mute_rect = egui::Rect::from_min_size(
+                        egui::pos2(bar_max_x + gap, center_y - btn_size * 0.5),
+                        egui::vec2(btn_size, btn_size),
+                    );
+                    let mute_resp = ui.interact(
+                        mute_rect,
+                        egui::Id::new("native_video_mute"),
+                        egui::Sense::click(),
+                    );
+                    draw_overlay_button_bg(painter, mute_rect, mute_resp.hovered(), muted);
+                    draw_overlay_speaker_icon(painter, mute_rect.center(), btn_size * 0.46, muted);
+                    let mute_resp = mute_resp.on_hover_text(if muted {
+                        "ミュート解除 [M]"
+                    } else {
+                        "ミュート [M]"
+                    });
+                    if mute_resp.clicked() {
+                        commands.push(NativeOverlayCommand::ToggleMute);
+                    }
+
+                    let vol_rect = egui::Rect::from_min_max(
+                        egui::pos2(mute_rect.max.x + gap, center_y - 4.0),
+                        egui::pos2(mute_rect.max.x + gap + vol_slider_w, center_y + 4.0),
+                    );
+                    painter.rect_filled(vol_rect, 2.0, egui::Color32::from_gray(74));
+                    let vol_frac = finite_unit(volume) as f32;
+                    let vol_fill = egui::Rect::from_min_max(
+                        vol_rect.min,
+                        egui::pos2(vol_rect.min.x + vol_rect.width() * vol_frac, vol_rect.max.y),
+                    );
+                    painter.rect_filled(vol_fill, 2.0, egui::Color32::from_rgb(220, 220, 220));
+                    let vol_resp = ui.interact(
+                        vol_rect.expand2(egui::vec2(0.0, 10.0)),
+                        egui::Id::new("native_video_volume"),
+                        egui::Sense::click_and_drag(),
+                    );
+                    if vol_resp.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                    }
+                    let vol_resp = vol_resp.on_hover_text("音量 [Shift+↑ / Shift+↓]");
+                    if (vol_resp.clicked() || vol_resp.dragged())
+                        && let Some(pos) = vol_resp.interact_pointer_pos()
+                    {
+                        let value =
+                            ((pos.x - vol_rect.min.x) / vol_rect.width()).clamp(0.0, 1.0) as f64;
+                        self.last_volume_target = Some(value);
+                        commands.push(NativeOverlayCommand::SetVolume {
+                            volume: value,
+                            persist: vol_resp.clicked() && !vol_resp.dragged(),
+                        });
+                    }
+                    if vol_resp.drag_stopped() {
+                        let value = self.last_volume_target.take().unwrap_or(volume);
+                        commands.push(NativeOverlayCommand::SetVolume {
+                            volume: value,
+                            persist: true,
+                        });
+                    }
+                    painter.text(
+                        egui::pos2(vol_rect.max.x + gap, center_y),
+                        egui::Align2::LEFT_CENTER,
+                        format!("{:>3}%", (finite_unit(volume) * 100.0).round() as i32),
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::from_rgb(238, 238, 238),
+                    );
 
                     if cfg!(debug_assertions) {
                         let pointer = pointer_pos
@@ -1591,6 +2780,12 @@ impl NativeEguiOverlay {
         self.wants_pointer_input = self.egui_ctx.wants_pointer_input();
         self.wants_keyboard_input = self.egui_ctx.wants_keyboard_input();
         self.last_seek_target_secs = last_seek_target_secs;
+        self.last_thumbnail_request_secs = last_thumbnail_request_secs;
+        self.last_thumbnail_request_at = last_thumbnail_request_at;
+        self.hover_preview_target_secs = hover_preview_target_secs;
+        self.top_bar_visible = panel_chrome_visible;
+        self.right_panel_visible = panel_chrome_visible;
+        self.jump_panel_visible = panel_chrome_visible;
 
         let shape_count = full_output.shapes.len();
         for (id, image_delta) in &full_output.textures_delta.set {
@@ -1649,7 +2844,7 @@ impl NativeEguiOverlay {
         submissions.push(encoder.finish());
         self.queue.submit(submissions);
         surface_texture.present();
-        if hud_visible {
+        if overlay_visible {
             self.set_visual_attached(true)?;
         }
         for id in &full_output.textures_delta.free {
@@ -1669,6 +2864,7 @@ impl NativeEguiOverlay {
                 ("wants_pointer", Value::from(self.wants_pointer_input)),
                 ("wants_keyboard", Value::from(self.wants_keyboard_input)),
                 ("hud_visible", Value::from(hud_visible)),
+                ("perf_visible", Value::from(perf_visible)),
                 ("visual_attached", Value::from(self.visual_attached)),
                 (
                     "render_ms",
@@ -1677,6 +2873,1612 @@ impl NativeEguiOverlay {
             ],
         );
         Ok(commands)
+    }
+}
+
+fn draw_native_perf_overlay(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    _overlay_height_points: f32,
+    history: &[NativeOverlayPerfSample],
+    latest: NativeOverlayPerfSnapshot,
+    origin: egui::Pos2,
+) {
+    egui::Area::new(egui::Id::new("native_video_perf_overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(origin)
+        .show(ctx, |ui| {
+            let width = overlay_width_points.min(460.0).max(300.0);
+            let panel_rect =
+                egui::Rect::from_min_size(ui.min_rect().min, egui::vec2(width, 158.0));
+            ui.set_min_size(panel_rect.size());
+            let painter = ui.painter().clone();
+            painter.rect_filled(
+                panel_rect,
+                5.0,
+                egui::Color32::from_rgba_unmultiplied(8, 10, 14, 218),
+            );
+            painter.rect_stroke(
+                panel_rect,
+                5.0,
+                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 42)),
+                egui::StrokeKind::Inside,
+            );
+
+            let graph = egui::Rect::from_min_max(
+                panel_rect.min + egui::vec2(10.0, 48.0),
+                panel_rect.max - egui::vec2(10.0, 34.0),
+            );
+            let title = format!(
+                "native {:.1} fps  frames {}  GPU {} CPU {}",
+                latest.actual_fps, latest.presented, latest.gpu, latest.cpu
+            );
+            painter.text(
+                panel_rect.min + egui::vec2(10.0, 9.0),
+                egui::Align2::LEFT_TOP,
+                title,
+                egui::FontId::monospace(12.0),
+                egui::Color32::from_rgb(235, 238, 244),
+            );
+            let warn = if latest.late_drop > 0 || latest.wait_timeout > 0 {
+                egui::Color32::from_rgb(255, 112, 112)
+            } else {
+                egui::Color32::from_rgb(154, 236, 178)
+            };
+            painter.text(
+                panel_rect.min + egui::vec2(panel_rect.width() - 10.0, 9.0),
+                egui::Align2::RIGHT_TOP,
+                format!("drop {} timeout {}", latest.late_drop, latest.wait_timeout),
+                egui::FontId::monospace(12.0),
+                warn,
+            );
+            painter.text(
+                panel_rect.min + egui::vec2(10.0, 25.0),
+                egui::Align2::LEFT_TOP,
+                format!(
+                    "clock late {:.1}ms  total {:.1}ms  max dt {:.1}ms  t {:.0}s",
+                    latest.max_late_ms,
+                    latest.max_total_ms,
+                    latest.max_interval_ms,
+                    latest.elapsed_secs
+                ),
+                egui::FontId::monospace(10.0),
+                egui::Color32::from_rgb(168, 176, 188),
+            );
+
+            painter.rect_filled(
+                graph,
+                2.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
+            );
+            let expected_ms = native_perf_expected_frame_ms(history);
+            let y_max_ms = (expected_ms * 2.0).clamp(8.0, 160.0);
+            let y_for_ms = |ms: f32| {
+                graph.max.y - (ms.clamp(0.0, y_max_ms) / y_max_ms) * graph.height()
+            };
+            let grid_lines = [
+                (expected_ms * 0.5, format!("{:.1}", expected_ms * 0.5)),
+                (expected_ms, format!("{:.1}", expected_ms)),
+                (expected_ms * 2.0, format!("{:.0}", expected_ms * 2.0)),
+            ];
+            for (ms, label) in grid_lines {
+                let y = y_for_ms(ms);
+                painter.line_segment(
+                    [egui::pos2(graph.min.x, y), egui::pos2(graph.max.x, y)],
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 34),
+                    ),
+                );
+                painter.text(
+                    egui::pos2(graph.max.x - 2.0, y - 1.0),
+                    egui::Align2::RIGHT_BOTTOM,
+                    label,
+                    egui::FontId::monospace(9.0),
+                    egui::Color32::from_rgb(160, 166, 176),
+                );
+            }
+
+            if let Some(last) = history.last() {
+                let now = last.arrival;
+                let px_per_sec = graph.width() / 6.0;
+                let mut prev_interval = None;
+                let mut prev_total = None;
+                let mut last_draw_x = f32::INFINITY;
+                let clipped = painter.with_clip_rect(graph);
+                for (idx, sample) in history.iter().enumerate() {
+                    let age = now.saturating_duration_since(sample.arrival).as_secs_f32();
+                    if age > 6.0 {
+                        continue;
+                    }
+                    let x = graph.max.x - age * px_per_sec;
+                    if (last_draw_x - x).abs() < 0.75 && idx + 1 < history.len() {
+                        continue;
+                    }
+                    last_draw_x = x;
+                    let interval_y = y_for_ms(sample.interval_ms);
+                    let total_y = y_for_ms(sample.total_ms);
+                    let copy_y = y_for_ms(sample.copy_ms);
+                    let interval_point = egui::pos2(x, interval_y);
+                    let total_point = egui::pos2(x, total_y);
+                    if let Some(prev) = prev_interval {
+                        clipped.line_segment(
+                            [prev, interval_point],
+                            egui::Stroke::new(1.8, egui::Color32::from_rgb(111, 211, 255)),
+                        );
+                    }
+                    if let Some(prev) = prev_total {
+                        clipped.line_segment(
+                            [prev, total_point],
+                            egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 194, 87)),
+                        );
+                    }
+                    clipped.circle_filled(
+                        egui::pos2(x, copy_y),
+                        1.4,
+                        egui::Color32::from_rgb(178, 236, 135),
+                    );
+                    if native_perf_sample_has_frame_gap(sample) {
+                        clipped.line_segment(
+                            [egui::pos2(x, graph.min.y), egui::pos2(x, graph.max.y)],
+                            egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 95, 95)),
+                        );
+                    }
+                    prev_interval = Some(interval_point);
+                    prev_total = Some(total_point);
+                }
+            }
+
+            let latest_sample = history.last().copied();
+            let interval = latest_sample.map(|s| s.interval_ms).unwrap_or(0.0);
+            let total = latest_sample.map(|s| s.total_ms).unwrap_or(0.0);
+            let copy = latest_sample.map(|s| s.copy_ms).unwrap_or(0.0);
+            let waitable = latest_sample.map(|s| s.present_waitable_ms).unwrap_or(0.0);
+            let present = latest_sample.map(|s| s.present_call_ms).unwrap_or(0.0);
+            let source = latest_sample.map(|s| s.source_delta_ms).unwrap_or(0.0);
+            let footer = format!(
+                "dt {:>4.1}  total {:>4.1}  copy {:>4.1}  wait {:>4.1}  present {:>4.1}  src {:>4.1}",
+                interval, total, copy, waitable, present, source
+            );
+            painter.text(
+                panel_rect.min + egui::vec2(10.0, 137.0),
+                egui::Align2::LEFT_TOP,
+                footer,
+                egui::FontId::monospace(11.0),
+                egui::Color32::from_rgb(212, 216, 224),
+            );
+        });
+}
+
+fn draw_native_jump_panel(
+    ctx: &egui::Context,
+    overlay_height_points: f32,
+    position_secs: f64,
+    entries: &[NativeOverlayJumpEntry],
+    jump_texture_ids: &HashMap<usize, egui::TextureId>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    let panel_rect = native_jump_panel_rect(overlay_height_points);
+
+    egui::Area::new(egui::Id::new("native_video_jump_panel"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(panel_rect.min)
+        .show(ctx, |ui| {
+            ui.set_min_size(panel_rect.size());
+            let rect = ui.min_rect();
+            let painter = ui.painter().clone();
+            painter.rect_filled(
+                rect,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(14, 14, 18, 232),
+            );
+            painter.line_segment(
+                [rect.right_top(), rect.right_bottom()],
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 55),
+                ),
+            );
+            let _ = ui.interact(
+                rect,
+                egui::Id::new("native_video_jump_panel_bg"),
+                egui::Sense::click(),
+            );
+            painter.text(
+                rect.min + egui::vec2(10.0, 10.0),
+                egui::Align2::LEFT_TOP,
+                "ジャンプ",
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgb(238, 238, 238),
+            );
+
+            let pin_rect = egui::Rect::from_min_size(
+                rect.min + egui::vec2(rect.width() - 68.0, 6.0),
+                egui::vec2(26.0, 24.0),
+            );
+            let pin_resp = ui.interact(
+                pin_rect,
+                egui::Id::new("native_jump_pin_here"),
+                egui::Sense::click(),
+            );
+            draw_overlay_button_bg(&painter, pin_rect, pin_resp.hovered(), false);
+            draw_overlay_pin_icon(
+                &painter,
+                pin_rect.center(),
+                7.0,
+                egui::Color32::from_rgb(140, 245, 170),
+            );
+            let pin_resp = pin_resp.on_hover_text("現在位置をピン留め [P]");
+            if pin_resp.clicked() {
+                commands.push(NativeOverlayCommand::TogglePinAt {
+                    target_secs: position_secs,
+                });
+            }
+
+            let bm_rect = egui::Rect::from_min_size(
+                rect.min + egui::vec2(rect.width() - 36.0, 6.0),
+                egui::vec2(26.0, 24.0),
+            );
+            let bm_resp = ui.interact(
+                bm_rect,
+                egui::Id::new("native_jump_bookmark_here"),
+                egui::Sense::click(),
+            );
+            draw_overlay_button_bg(&painter, bm_rect, bm_resp.hovered(), false);
+            draw_overlay_bookmark_icon(
+                &painter,
+                bm_rect.center(),
+                7.0,
+                egui::Color32::from_rgb(255, 220, 82),
+            );
+            let bm_resp = bm_resp.on_hover_text("現在位置をブックマーク [B]");
+            if bm_resp.clicked() {
+                commands.push(NativeOverlayCommand::AddBookmarkAt {
+                    target_secs: position_secs,
+                });
+            }
+
+            let content_rect = egui::Rect::from_min_max(rect.min + egui::vec2(0.0, 34.0), rect.max);
+            let mut content_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(content_rect)
+                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            );
+            egui::ScrollArea::vertical()
+                .auto_shrink([false; 2])
+                .max_height(content_rect.height())
+                .show(&mut content_ui, |ui| {
+                    ui.add_space(6.0);
+                    if entries.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.colored_label(
+                                egui::Color32::from_gray(170),
+                                "ピン・ブックマーク・チャプターはまだありません",
+                            );
+                        });
+                        return;
+                    }
+
+                    for kind in [
+                        NativeOverlayTimelineMarkerKind::Pin,
+                        NativeOverlayTimelineMarkerKind::Bookmark,
+                        NativeOverlayTimelineMarkerKind::Chapter,
+                    ] {
+                        let section_entries: Vec<_> = entries
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, entry)| entry.kind == kind)
+                            .collect();
+                        if section_entries.is_empty() {
+                            continue;
+                        }
+                        let (label, color) = match kind {
+                            NativeOverlayTimelineMarkerKind::Pin => {
+                                ("ピン留め", egui::Color32::from_rgb(140, 245, 170))
+                            }
+                            NativeOverlayTimelineMarkerKind::Bookmark => {
+                                ("ブックマーク", egui::Color32::from_rgb(255, 220, 82))
+                            }
+                            NativeOverlayTimelineMarkerKind::Chapter => {
+                                ("チャプター", egui::Color32::from_rgb(115, 210, 255))
+                            }
+                        };
+                        ui.horizontal(|ui| {
+                            ui.add_space(12.0);
+                            ui.colored_label(color, egui::RichText::new(label).size(12.0));
+                        });
+                        ui.add_space(3.0);
+                        for (idx, entry) in section_entries {
+                            draw_native_jump_row(ui, idx, entry, jump_texture_ids, commands);
+                        }
+                        ui.add_space(8.0);
+                    }
+                });
+        });
+}
+
+fn draw_native_jump_row(
+    ui: &mut egui::Ui,
+    idx: usize,
+    entry: &NativeOverlayJumpEntry,
+    jump_texture_ids: &HashMap<usize, egui::TextureId>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    let row_h = 76.0;
+    let row_w = (ui.available_width() - 12.0).max(260.0);
+    ui.horizontal(|ui| {
+        ui.add_space(6.0);
+        let (row_rect, resp) =
+            ui.allocate_exact_size(egui::vec2(row_w, row_h), egui::Sense::click());
+        let painter = ui.painter().clone();
+        if resp.hovered() {
+            painter.rect_filled(
+                row_rect,
+                4.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22),
+            );
+        }
+        let thumb_rect =
+            egui::Rect::from_min_size(row_rect.min + egui::vec2(6.0, 4.0), egui::vec2(120.0, 68.0));
+        painter.rect_filled(thumb_rect, 3.0, egui::Color32::from_rgb(30, 30, 35));
+        if let Some(texture_id) = jump_texture_ids.get(&idx) {
+            painter.image(
+                *texture_id,
+                thumb_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE,
+            );
+        } else {
+            painter.text(
+                thumb_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "...",
+                egui::FontId::proportional(14.0),
+                egui::Color32::from_gray(140),
+            );
+        }
+        painter.rect_stroke(
+            thumb_rect,
+            3.0,
+            egui::Stroke::new(1.0, egui::Color32::from_gray(72)),
+            egui::StrokeKind::Inside,
+        );
+
+        let text_x = thumb_rect.max.x + 10.0;
+        let (kind_label, kind_color) = match entry.kind {
+            NativeOverlayTimelineMarkerKind::Pin => ("PIN", egui::Color32::from_rgb(140, 245, 170)),
+            NativeOverlayTimelineMarkerKind::Bookmark => {
+                ("BM", egui::Color32::from_rgb(255, 220, 82))
+            }
+            NativeOverlayTimelineMarkerKind::Chapter => {
+                ("CH", egui::Color32::from_rgb(115, 210, 255))
+            }
+        };
+        painter.text(
+            egui::pos2(text_x, row_rect.min.y + 14.0),
+            egui::Align2::LEFT_CENTER,
+            kind_label,
+            egui::FontId::monospace(11.0),
+            kind_color,
+        );
+        painter.text(
+            egui::pos2(text_x + 36.0, row_rect.min.y + 14.0),
+            egui::Align2::LEFT_CENTER,
+            format_overlay_time(entry.pts_secs),
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_rgb(232, 232, 232),
+        );
+        let title = entry
+            .title
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("無題");
+        painter.text(
+            egui::pos2(text_x, row_rect.min.y + 38.0),
+            egui::Align2::LEFT_TOP,
+            truncate_overlay_text(title, 22),
+            egui::FontId::proportional(12.0),
+            egui::Color32::from_rgb(205, 205, 205),
+        );
+
+        let mut delete_clicked = false;
+        if let Some(id) = entry.bookmark_id {
+            let delete_rect = egui::Rect::from_min_size(
+                egui::pos2(row_rect.max.x - 28.0, row_rect.min.y + 8.0),
+                egui::vec2(22.0, 22.0),
+            );
+            let delete_resp = ui.interact(
+                delete_rect,
+                egui::Id::new(("native_jump_delete", id)),
+                egui::Sense::click(),
+            );
+            draw_overlay_button_bg(&painter, delete_rect, delete_resp.hovered(), false);
+            painter.text(
+                delete_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "X",
+                egui::FontId::monospace(12.0),
+                egui::Color32::from_rgb(240, 190, 190),
+            );
+            let delete_resp = delete_resp.on_hover_text("ブックマークを削除");
+            if delete_resp.clicked() {
+                delete_clicked = true;
+                commands.push(NativeOverlayCommand::DeleteBookmark { id });
+            }
+        }
+
+        if resp.clicked() && !delete_clicked {
+            commands.push(NativeOverlayCommand::Seek {
+                target_secs: entry.pts_secs,
+            });
+        }
+    });
+}
+
+#[derive(Copy, Clone)]
+enum NativeTopButtonGlyph {
+    TileGrid,
+    PerfGraph,
+    Text(&'static str),
+}
+
+fn draw_native_top_button(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    x: &mut f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    gap: f32,
+    id: &'static str,
+    glyph: NativeTopButtonGlyph,
+    active: bool,
+    tooltip: &str,
+    command: NativeOverlayCommand,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    let rect = egui::Rect::from_min_size(egui::pos2(*x, y), egui::vec2(width, height));
+    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    draw_overlay_button_bg(painter, rect, resp.hovered(), active);
+    match glyph {
+        NativeTopButtonGlyph::TileGrid => draw_overlay_tile_grid_icon(painter, rect),
+        NativeTopButtonGlyph::PerfGraph => draw_overlay_perf_graph_icon(painter, rect),
+        NativeTopButtonGlyph::Text(label) => {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                label,
+                egui::FontId::monospace(12.0),
+                egui::Color32::from_rgb(238, 238, 238),
+            );
+        }
+    }
+    let resp = resp.on_hover_text(tooltip);
+    if resp.clicked() {
+        commands.push(command);
+    }
+    *x -= width + gap;
+}
+
+fn draw_overlay_tile_grid_icon(painter: &egui::Painter, rect: egui::Rect) {
+    let cell = 7.0;
+    let gap = 3.0;
+    let total = cell * 2.0 + gap;
+    let start = rect.center() - egui::vec2(total * 0.5, total * 0.5);
+    for row in 0..2 {
+        for col in 0..2 {
+            let min = start + egui::vec2((cell + gap) * col as f32, (cell + gap) * row as f32);
+            painter.rect_filled(
+                egui::Rect::from_min_size(min, egui::vec2(cell, cell)),
+                1.5,
+                egui::Color32::from_rgb(238, 238, 238),
+            );
+        }
+    }
+}
+
+fn draw_overlay_perf_graph_icon(painter: &egui::Painter, rect: egui::Rect) {
+    let left = rect.min.x + 6.0;
+    let right = rect.max.x - 5.0;
+    let top = rect.min.y + 7.0;
+    let bottom = rect.max.y - 6.0;
+    painter.line_segment(
+        [egui::pos2(left, bottom), egui::pos2(right, bottom)],
+        egui::Stroke::new(1.0, egui::Color32::from_gray(140)),
+    );
+    let points = [
+        egui::pos2(left, bottom - 3.0),
+        egui::pos2(left + 5.0, bottom - 9.0),
+        egui::pos2(left + 10.0, bottom - 5.0),
+        egui::pos2(left + 15.0, top + 2.0),
+        egui::pos2(right, bottom - 12.0),
+    ];
+    painter.add(egui::Shape::line(
+        points.to_vec(),
+        egui::Stroke::new(1.7, egui::Color32::from_rgb(170, 230, 255)),
+    ));
+}
+
+fn draw_native_center_status(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    title: &str,
+    body: Option<&str>,
+    is_error: bool,
+) {
+    egui::Area::new(egui::Id::new("native_video_center_status"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let full_rect = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(overlay_width_points, overlay_height_points),
+            );
+            ui.set_min_size(full_rect.size());
+            let painter = ui.painter();
+            let box_w = overlay_width_points.clamp(360.0, 720.0);
+            let box_h = if body.is_some() { 132.0 } else { 76.0 };
+            let rect = egui::Rect::from_center_size(full_rect.center(), egui::vec2(box_w, box_h));
+            painter.rect_filled(
+                rect,
+                8.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 214),
+            );
+            let title_color = if is_error {
+                egui::Color32::from_rgb(255, 120, 120)
+            } else {
+                egui::Color32::from_rgb(238, 238, 238)
+            };
+            painter.text(
+                egui::pos2(rect.center().x, rect.min.y + 26.0),
+                egui::Align2::CENTER_CENTER,
+                title,
+                egui::FontId::proportional(22.0),
+                title_color,
+            );
+            if let Some(body) = body {
+                let body_rect = egui::Rect::from_min_max(
+                    rect.min + egui::vec2(22.0, 52.0),
+                    rect.max - egui::vec2(22.0, 14.0),
+                );
+                let mut child = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(body_rect)
+                        .layout(egui::Layout::top_down(egui::Align::Center)),
+                );
+                child.add(
+                    egui::Label::new(
+                        egui::RichText::new(body)
+                            .size(14.0)
+                            .color(egui::Color32::from_gray(230)),
+                    )
+                    .wrap(),
+                );
+            }
+        });
+}
+
+fn draw_native_center_pause_controls(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    egui::Area::new(egui::Id::new("native_video_center_pause_controls"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let full_rect = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(overlay_width_points, overlay_height_points),
+            );
+            ui.set_min_size(full_rect.size());
+            let painter = ui.painter().clone();
+            let radius = 56.0;
+            let gap = 34.0;
+            let center_y = full_rect.center().y;
+            let replay_center = egui::pos2(full_rect.center().x - radius - gap * 0.5, center_y);
+            let play_center = egui::pos2(full_rect.center().x + radius + gap * 0.5, center_y);
+
+            let replay_rect =
+                egui::Rect::from_center_size(replay_center, egui::vec2(radius * 2.0, radius * 2.0));
+            let play_rect =
+                egui::Rect::from_center_size(play_center, egui::vec2(radius * 2.0, radius * 2.0));
+
+            let replay_resp = ui
+                .interact(
+                    replay_rect,
+                    egui::Id::new("native_center_replay"),
+                    egui::Sense::click(),
+                )
+                .on_hover_text("最初から再生 [W]");
+            let play_resp = ui
+                .interact(
+                    play_rect,
+                    egui::Id::new("native_center_play"),
+                    egui::Sense::click(),
+                )
+                .on_hover_text("続きから再生 [Enter]");
+
+            for (rect, hovered) in [
+                (replay_rect, replay_resp.hovered()),
+                (play_rect, play_resp.hovered()),
+            ] {
+                painter.circle_filled(
+                    rect.center(),
+                    radius,
+                    if hovered {
+                        egui::Color32::from_rgba_unmultiplied(40, 40, 46, 238)
+                    } else {
+                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 214)
+                    },
+                );
+                painter.circle_stroke(
+                    rect.center(),
+                    radius,
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+                    ),
+                );
+            }
+            draw_overlay_replay_icon(&painter, replay_center, 22.0);
+            draw_overlay_play_icon(&painter, play_center, 24.0);
+            painter.text(
+                replay_center + egui::vec2(0.0, radius + 22.0),
+                egui::Align2::CENTER_CENTER,
+                "最初から",
+                egui::FontId::proportional(16.0),
+                egui::Color32::WHITE,
+            );
+            painter.text(
+                play_center + egui::vec2(0.0, radius + 22.0),
+                egui::Align2::CENTER_CENTER,
+                "続きから",
+                egui::FontId::proportional(16.0),
+                egui::Color32::WHITE,
+            );
+            painter.text(
+                egui::pos2(full_rect.center().x, center_y + radius + 52.0),
+                egui::Align2::CENTER_CENTER,
+                "Enter: 再生 / W: 頭出し / ←→: シーク / J,K: マーカー移動",
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_gray(205),
+            );
+
+            if replay_resp.clicked() {
+                commands.push(NativeOverlayCommand::SeekToStartAndPlay);
+            }
+            if play_resp.clicked() {
+                commands.push(NativeOverlayCommand::TogglePlay);
+            }
+        });
+}
+
+fn draw_native_toast(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    toast: &NativeOverlayToast,
+) {
+    let elapsed = toast.started_at.elapsed().as_secs_f32();
+    let duration = if toast.centered { 2.5 } else { 1.8 };
+    let alpha = if elapsed > duration - 0.35 {
+        ((duration - elapsed) / 0.35).clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    if alpha <= 0.0 {
+        return;
+    }
+    egui::Area::new(egui::Id::new("native_video_toast"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let full_rect = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(overlay_width_points, overlay_height_points),
+            );
+            ui.set_min_size(full_rect.size());
+            let painter = ui.painter();
+            let font = egui::FontId::proportional(if toast.centered { 24.0 } else { 16.0 });
+            let galley =
+                painter.layout_no_wrap(toast.text.clone(), font.clone(), egui::Color32::WHITE);
+            let padding = if toast.centered {
+                egui::vec2(28.0, 18.0)
+            } else {
+                egui::vec2(16.0, 10.0)
+            };
+            let max_w = (overlay_width_points - 40.0).max(160.0);
+            let size = egui::vec2(
+                (galley.size().x + padding.x * 2.0).min(max_w),
+                galley.size().y + padding.y * 2.0,
+            );
+            let rect = if toast.centered {
+                egui::Rect::from_center_size(full_rect.center(), size)
+            } else {
+                egui::Rect::from_min_size(
+                    egui::pos2(full_rect.max.x - size.x - 20.0, full_rect.min.y + 62.0),
+                    size,
+                )
+            };
+            painter.rect_filled(
+                rect,
+                8.0,
+                egui::Color32::from_rgba_unmultiplied(24, 24, 28, (alpha * 224.0) as u8),
+            );
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                &toast.text,
+                font,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 255.0) as u8),
+            );
+        });
+}
+
+fn draw_native_top_bar(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    position_secs: f64,
+    duration_secs: f64,
+    metadata: Option<&NativeOverlayMetadata>,
+    is_playing: bool,
+    muted: bool,
+    loop_enabled: bool,
+    perf_visible: bool,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    egui::Area::new(egui::Id::new("native_video_top_bar"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let rect =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(overlay_width_points, 54.0));
+            ui.set_min_size(rect.size());
+            let painter = ui.painter().clone();
+            painter.rect_filled(
+                rect,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 186),
+            );
+            let name = metadata
+                .and_then(|m| {
+                    m.title
+                        .as_ref()
+                        .filter(|title| !title.trim().is_empty())
+                        .or(Some(&m.file_name))
+                })
+                .map(String::as_str)
+                .unwrap_or("video");
+            painter.text(
+                egui::pos2(14.0, 20.0),
+                egui::Align2::LEFT_CENTER,
+                truncate_overlay_text(name, 88),
+                egui::FontId::proportional(15.0),
+                egui::Color32::from_rgb(240, 240, 240),
+            );
+            let sub = if let Some(m) = metadata {
+                format!(
+                    "{}x{}  {}  {}  {}",
+                    m.width,
+                    m.height,
+                    format_fps(m.avg_fps),
+                    m.video_codec,
+                    format_overlay_time(position_secs)
+                )
+            } else {
+                format!(
+                    "{} / {}",
+                    format_overlay_time(position_secs),
+                    format_overlay_time(duration_secs)
+                )
+            };
+            painter.text(
+                egui::pos2(14.0, 39.0),
+                egui::Align2::LEFT_CENTER,
+                truncate_overlay_text(&sub, 120),
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_rgb(190, 190, 190),
+            );
+
+            let btn_size = 28.0;
+            let gap = 6.0;
+            let mut x = overlay_width_points - 12.0 - btn_size;
+            let y = 13.0;
+
+            draw_native_top_button(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                btn_size,
+                btn_size,
+                gap,
+                "native_top_tile",
+                NativeTopButtonGlyph::TileGrid,
+                false,
+                "サムネイル一覧 [S]",
+                NativeOverlayCommand::ToggleTileMode,
+                commands,
+            );
+            draw_native_top_button(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                btn_size,
+                btn_size,
+                gap,
+                "native_top_perf",
+                NativeTopButtonGlyph::PerfGraph,
+                perf_visible,
+                "Perfグラフ [P]",
+                NativeOverlayCommand::TogglePerfOverlay,
+                commands,
+            );
+            draw_native_top_button(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                42.0,
+                btn_size,
+                gap,
+                "native_top_vst3",
+                NativeTopButtonGlyph::Text("VST"),
+                false,
+                "VST3 GUI 表示/非表示",
+                NativeOverlayCommand::ToggleVst3Gui,
+                commands,
+            );
+
+            let bookmark_rect =
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(btn_size, btn_size));
+            let bookmark_resp = ui.interact(
+                bookmark_rect,
+                egui::Id::new("native_top_bookmark"),
+                egui::Sense::click(),
+            );
+            draw_overlay_button_bg(&painter, bookmark_rect, bookmark_resp.hovered(), false);
+            draw_overlay_bookmark_icon(
+                &painter,
+                bookmark_rect.center(),
+                7.0,
+                egui::Color32::from_rgb(255, 220, 82),
+            );
+            let bookmark_resp = bookmark_resp.on_hover_text("現在位置をブックマーク [B]");
+            if bookmark_resp.clicked() {
+                commands.push(NativeOverlayCommand::AddBookmarkAt {
+                    target_secs: position_secs,
+                });
+            }
+            x -= btn_size + gap;
+
+            let mute_rect =
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(btn_size, btn_size));
+            let mute_resp = ui.interact(
+                mute_rect,
+                egui::Id::new("native_top_mute"),
+                egui::Sense::click(),
+            );
+            draw_overlay_button_bg(&painter, mute_rect, mute_resp.hovered(), muted);
+            draw_overlay_speaker_icon(&painter, mute_rect.center(), 7.0, muted);
+            let mute_resp = mute_resp.on_hover_text("ミュート [M]");
+            if mute_resp.clicked() {
+                commands.push(NativeOverlayCommand::ToggleMute);
+            }
+            x -= btn_size + gap;
+
+            let loop_rect =
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(btn_size, btn_size));
+            let loop_resp = ui.interact(
+                loop_rect,
+                egui::Id::new("native_top_loop"),
+                egui::Sense::click(),
+            );
+            draw_overlay_button_bg(&painter, loop_rect, loop_resp.hovered(), loop_enabled);
+            draw_overlay_loop_icon(
+                &painter,
+                loop_rect.center(),
+                7.0,
+                if loop_enabled {
+                    egui::Color32::from_rgb(170, 230, 255)
+                } else {
+                    egui::Color32::WHITE
+                },
+            );
+            let loop_resp = loop_resp.on_hover_text(if loop_enabled {
+                "ループ再生を解除 [L]"
+            } else {
+                "ループ再生 [L]"
+            });
+            if loop_resp.clicked() {
+                commands.push(NativeOverlayCommand::ToggleLoop);
+            }
+            x -= btn_size + gap;
+
+            let play_rect =
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(btn_size, btn_size));
+            let play_resp = ui.interact(
+                play_rect,
+                egui::Id::new("native_top_play"),
+                egui::Sense::click(),
+            );
+            draw_overlay_button_bg(&painter, play_rect, play_resp.hovered(), is_playing);
+            if is_playing {
+                draw_overlay_pause_icon(&painter, play_rect.center(), 7.0);
+            } else {
+                draw_overlay_play_icon(&painter, play_rect.center(), 7.0);
+            }
+            let play_resp = play_resp.on_hover_text("再生/一時停止 [Enter]");
+            if play_resp.clicked() {
+                commands.push(NativeOverlayCommand::TogglePlay);
+            }
+        });
+}
+
+fn draw_native_metadata_panel(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    metadata: &NativeOverlayMetadata,
+) {
+    let rect = native_metadata_panel_rect(overlay_width_points, overlay_height_points);
+    egui::Area::new(egui::Id::new("native_video_metadata_panel"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(rect.min)
+        .show(ctx, |ui| {
+            ui.set_min_size(rect.size());
+            let rect = ui.min_rect();
+            let painter = ui.painter();
+            painter.rect_filled(
+                rect,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(14, 14, 18, 232),
+            );
+            painter.line_segment(
+                [rect.left_top(), rect.left_bottom()],
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 55),
+                ),
+            );
+            let _ = ui.interact(
+                rect,
+                egui::Id::new("native_video_metadata_panel_bg"),
+                egui::Sense::click(),
+            );
+            painter.text(
+                rect.min + egui::vec2(14.0, 14.0),
+                egui::Align2::LEFT_TOP,
+                "動画メタ情報",
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgb(238, 238, 238),
+            );
+
+            let title = metadata
+                .title
+                .as_deref()
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or(&metadata.file_name);
+            let path_kind = if metadata.gpu_path_active {
+                "GPU (D3D11 zero-copy)"
+            } else {
+                "CPU (readback + swscale)"
+            };
+            let decode_kind = if metadata.hw_decode_active {
+                "HW"
+            } else {
+                "SW"
+            };
+            let d3d11va = if metadata.d3d11va_supported {
+                "対応"
+            } else {
+                "非対応"
+            };
+            let mut rows = vec![
+                ("ファイル", metadata.file_name.clone()),
+                ("タイトル", title.to_string()),
+                ("アーティスト", metadata.artist.clone().unwrap_or_default()),
+                ("説明", metadata.description.clone().unwrap_or_default()),
+                (
+                    "動画",
+                    format!(
+                        "{}x{}  {}  {}",
+                        metadata.width,
+                        metadata.height,
+                        format_fps(metadata.avg_fps),
+                        metadata.video_codec
+                    ),
+                ),
+                ("デコーダ", metadata.video_decoder.clone()),
+                (
+                    "音声",
+                    metadata
+                        .audio_codec
+                        .clone()
+                        .unwrap_or_else(|| "なし".to_string()),
+                ),
+                ("ビットレート", format_bitrate(metadata.bit_rate_bps)),
+                ("長さ", format_overlay_time(metadata.duration_secs)),
+                ("チャプター", metadata.chapter_count.to_string()),
+                ("経路", path_kind.to_string()),
+                ("デコード", decode_kind.to_string()),
+                ("D3D11VA", d3d11va.to_string()),
+            ];
+            rows.retain(|(_, value)| !metadata_clean_text(value).is_empty());
+
+            let content_rect = egui::Rect::from_min_max(rect.min + egui::vec2(0.0, 38.0), rect.max);
+            let mut content_ui = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(content_rect)
+                    .layout(egui::Layout::top_down(egui::Align::LEFT)),
+            );
+            egui::ScrollArea::vertical()
+                .id_salt("native_video_metadata_scroll")
+                .auto_shrink([false; 2])
+                .max_height(content_rect.height())
+                .show(&mut content_ui, |ui| {
+                    ui.add_space(6.0);
+                    for (label, value) in rows {
+                        let value = metadata_clean_text(&value);
+                        ui.horizontal_top(|ui| {
+                            ui.add_space(14.0);
+                            ui.add_sized(
+                                egui::vec2(88.0, 18.0),
+                                egui::Label::new(
+                                    egui::RichText::new(label)
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(egui::Color32::from_gray(150)),
+                                ),
+                            );
+                            ui.vertical(|ui| {
+                                ui.set_width((rect.width() - 118.0).max(160.0));
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(value)
+                                            .size(12.0)
+                                            .color(egui::Color32::from_rgb(230, 230, 230)),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        });
+                        ui.add_space(7.0);
+                    }
+                });
+        });
+}
+
+fn draw_native_tile_overlay(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    state: &NativeOverlayTileOverlay,
+    tile_texture_ids: &HashMap<usize, egui::TextureId>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    egui::Area::new(egui::Id::new("native_video_tile_overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let full_rect = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(overlay_width_points, overlay_height_points),
+            );
+            ui.set_min_size(full_rect.size());
+            let painter = ui.painter();
+            painter.rect_filled(full_rect, 0.0, egui::Color32::BLACK);
+            let _ = ui.interact(
+                full_rect,
+                egui::Id::new("native_video_tile_overlay_bg"),
+                egui::Sense::click(),
+            );
+
+            let interval = format_tile_interval(state.interval_secs);
+            let header = format!(
+                "タイル モード - 間隔 {interval} - {}/{}  [S]",
+                state.progress_done, state.progress_total
+            );
+            painter.text(
+                egui::pos2(16.0, 24.0),
+                egui::Align2::LEFT_CENTER,
+                header,
+                egui::FontId::proportional(14.0),
+                egui::Color32::from_rgb(224, 224, 224),
+            );
+
+            if state.progress_done == 0 && !state.finished {
+                painter.text(
+                    full_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "動画を準備中...",
+                    egui::FontId::proportional(20.0),
+                    egui::Color32::from_gray(180),
+                );
+            }
+
+            let columns = state.columns.max(1);
+            let label_h = 16.0;
+            let gap_x = 6.0;
+            let gap_y = 6.0;
+            let grid_left = 16.0;
+            let total_grid_w = (overlay_width_points - grid_left * 2.0).max(240.0);
+            let tile_w = ((total_grid_w - gap_x * columns.saturating_sub(1) as f32)
+                / columns as f32)
+                .floor()
+                .max(40.0);
+            let aspect_h = if state.tile_w > 0 && state.tile_h > 0 {
+                state.tile_h as f32 / state.tile_w as f32
+            } else {
+                9.0 / 16.0
+            };
+            let tile_h = (tile_w * aspect_h).round().max(30.0);
+            let grid_top = 56.0;
+
+            for idx in 0..state.timestamps.len() {
+                let col = idx % columns;
+                let row = idx / columns;
+                let x0 = grid_left + (tile_w + gap_x) * col as f32;
+                let y0 = grid_top + (tile_h + label_h + gap_y) * row as f32;
+                let tile_rect =
+                    egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(tile_w, tile_h));
+                if tile_rect.max.y > overlay_height_points - 20.0 {
+                    continue;
+                }
+
+                painter.rect_filled(tile_rect, 4.0, egui::Color32::from_rgb(28, 28, 32));
+                if let Some(texture_id) = tile_texture_ids.get(&idx) {
+                    painter.image(
+                        *texture_id,
+                        tile_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                } else {
+                    painter.text(
+                        tile_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "...",
+                        egui::FontId::proportional(20.0),
+                        egui::Color32::from_gray(120),
+                    );
+                }
+                painter.rect_stroke(
+                    tile_rect,
+                    4.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_gray(82)),
+                    egui::StrokeKind::Inside,
+                );
+
+                let pts = state.timestamps.get(idx).copied().unwrap_or(0.0);
+                painter.text(
+                    egui::pos2(tile_rect.center().x, tile_rect.max.y + label_h * 0.5),
+                    egui::Align2::CENTER_CENTER,
+                    format_overlay_time(pts),
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_rgb(220, 220, 220),
+                );
+
+                let resp = ui.interact(
+                    tile_rect,
+                    egui::Id::new(("native_video_tile", idx)),
+                    egui::Sense::click(),
+                );
+                if resp.hovered() {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    painter.rect_stroke(
+                        tile_rect.expand(1.0),
+                        4.0,
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(235, 235, 235)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                if resp.clicked() {
+                    commands.push(NativeOverlayCommand::TileSeek { target_secs: pts });
+                }
+            }
+        });
+}
+
+fn native_perf_expected_frame_ms(history: &[NativeOverlayPerfSample]) -> f32 {
+    native_perf_expected_frame_ms_from_values(
+        history
+            .iter()
+            .rev()
+            .take(180)
+            .map(|sample| sample.source_delta_ms),
+    )
+    .unwrap_or(16.67)
+}
+
+fn native_perf_expected_frame_ms_from_samples<I>(samples: I) -> Option<f32>
+where
+    I: IntoIterator<Item = NativeOverlayPerfSample>,
+{
+    native_perf_expected_frame_ms_from_values(
+        samples.into_iter().map(|sample| sample.source_delta_ms),
+    )
+}
+
+fn native_perf_expected_frame_ms_from_values<I>(values: I) -> Option<f32>
+where
+    I: IntoIterator<Item = f32>,
+{
+    let mut values: Vec<f32> = values
+        .into_iter()
+        .filter(|value| value.is_finite() && *value > 0.5 && *value < 250.0)
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Some(values[values.len() / 2].clamp(1.0, 120.0))
+}
+
+fn native_perf_sample_has_frame_gap(sample: &NativeOverlayPerfSample) -> bool {
+    let interval = sample.interval_ms;
+    if !interval.is_finite() || interval <= 0.0 {
+        return false;
+    }
+    let expected = if sample.source_delta_ms.is_finite() && sample.source_delta_ms > 1.0 {
+        sample.source_delta_ms
+    } else {
+        16.67
+    };
+    let threshold = (expected * 1.35).max(expected + 4.0);
+    interval > threshold
+}
+
+fn thumbnail_rgba_key(thumbnail: &NativeOverlayThumbnail) -> u64 {
+    let ptr = Arc::as_ptr(&thumbnail.rgba) as usize as u64;
+    ptr ^ thumbnail.target_secs.to_bits()
+}
+
+fn fit_rect_in_rect(content_size: egui::Vec2, outer: egui::Rect) -> egui::Rect {
+    if content_size.x <= 0.0 || content_size.y <= 0.0 {
+        return outer;
+    }
+    let scale = (outer.width() / content_size.x).min(outer.height() / content_size.y);
+    let size = content_size * scale;
+    egui::Rect::from_center_size(outer.center(), size)
+}
+
+fn native_jump_panel_width() -> f32 {
+    320.0
+}
+
+fn native_metadata_panel_width() -> f32 {
+    430.0
+}
+
+fn native_panel_top() -> f32 {
+    56.0
+}
+
+fn native_panel_hover_bottom(overlay_height_points: f32) -> f32 {
+    (overlay_height_points - 48.0).max(native_panel_top())
+}
+
+fn native_panel_hover_rect(
+    min: egui::Pos2,
+    size: egui::Vec2,
+    overlay_height_points: f32,
+) -> egui::Rect {
+    let bottom = native_panel_hover_bottom(overlay_height_points);
+    egui::Rect::from_min_max(egui::pos2(min.x, 0.0), egui::pos2(min.x + size.x, bottom))
+}
+
+fn native_jump_panel_rect(overlay_height_points: f32) -> egui::Rect {
+    let top = native_panel_top();
+    let panel_h = (overlay_height_points - top - 44.0).max(240.0);
+    egui::Rect::from_min_size(
+        egui::pos2(0.0, top),
+        egui::vec2(native_jump_panel_width(), panel_h),
+    )
+}
+
+fn native_metadata_panel_rect(overlay_width_points: f32, overlay_height_points: f32) -> egui::Rect {
+    let panel_w = native_metadata_panel_width().min(overlay_width_points * 0.5);
+    let top = native_panel_top();
+    let panel_h = (overlay_height_points - top - 44.0).max(260.0);
+    egui::Rect::from_min_size(
+        egui::pos2(overlay_width_points - panel_w, top),
+        egui::vec2(panel_w, panel_h),
+    )
+}
+
+fn metadata_clean_text(value: &str) -> String {
+    let normalized = value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace("\\r\\n", "\n")
+        .replace("\\n", "\n");
+    let mut lines = Vec::new();
+    let mut last_was_blank = true;
+    for line in normalized.lines() {
+        let cleaned = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if cleaned.is_empty() {
+            if !last_was_blank {
+                lines.push(String::new());
+                last_was_blank = true;
+            }
+        } else {
+            lines.push(cleaned);
+            last_was_blank = false;
+        }
+    }
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+fn timeline_markers_match(
+    a: &[NativeOverlayTimelineMarker],
+    b: &[NativeOverlayTimelineMarker],
+) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b.iter())
+            .all(|(a, b)| a.kind == b.kind && (a.pts_secs - b.pts_secs).abs() <= f64::EPSILON)
+}
+
+fn jump_entries_match(a: &[NativeOverlayJumpEntry], b: &[NativeOverlayJumpEntry]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b.iter()).all(|(a, b)| {
+            a.kind == b.kind
+                && a.bookmark_id == b.bookmark_id
+                && a.title == b.title
+                && (a.pts_secs - b.pts_secs).abs() <= f64::EPSILON
+                && a.thumbnail.as_ref().map(thumbnail_rgba_key)
+                    == b.thumbnail.as_ref().map(thumbnail_rgba_key)
+        })
+}
+
+fn target_has_marker(
+    markers: &[NativeOverlayTimelineMarker],
+    target_secs: f64,
+    duration_secs: f64,
+    kind_matches: impl Fn(NativeOverlayTimelineMarkerKind) -> bool,
+) -> bool {
+    let bucket_window = crate::video::thumbnail::SECONDS_PER_BUCKET * 1.5;
+    let visual_window = (duration_secs / 300.0).clamp(0.15, 1.5);
+    let tolerance = bucket_window.max(visual_window);
+    markers.iter().any(|marker| {
+        kind_matches(marker.kind) && (marker.pts_secs - target_secs).abs() <= tolerance
+    })
+}
+
+fn draw_timeline_marker(
+    painter: &egui::Painter,
+    bar_rect: egui::Rect,
+    duration_secs: f64,
+    marker: NativeOverlayTimelineMarker,
+) {
+    if duration_secs <= 0.0 || !marker.pts_secs.is_finite() {
+        return;
+    }
+    let frac = (marker.pts_secs / duration_secs).clamp(0.0, 1.0) as f32;
+    let x = bar_rect.min.x + bar_rect.width() * frac;
+    let (height, color) = match marker.kind {
+        NativeOverlayTimelineMarkerKind::Pin => (16.0, egui::Color32::from_rgb(140, 245, 170)),
+        NativeOverlayTimelineMarkerKind::Bookmark => (14.0, egui::Color32::from_rgb(255, 220, 82)),
+        NativeOverlayTimelineMarkerKind::Chapter => (10.0, egui::Color32::from_rgb(115, 210, 255)),
+    };
+    let top = bar_rect.center().y - height * 0.5;
+    let bottom = bar_rect.center().y + height * 0.5;
+    painter.line_segment(
+        [egui::pos2(x, top), egui::pos2(x, bottom)],
+        egui::Stroke::new(2.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150)),
+    );
+    painter.line_segment(
+        [egui::pos2(x, top), egui::pos2(x, bottom)],
+        egui::Stroke::new(1.0, color),
+    );
+}
+
+fn draw_overlay_button_bg(painter: &egui::Painter, rect: egui::Rect, hovered: bool, active: bool) {
+    let bg = if active {
+        egui::Color32::from_rgba_unmultiplied(80, 140, 220, 190)
+    } else if hovered {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 34)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    painter.rect_filled(rect, 4.0, bg);
+}
+
+fn draw_overlay_play_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x - r * 0.45, c.y - r * 0.70),
+            egui::pos2(c.x - r * 0.45, c.y + r * 0.70),
+            egui::pos2(c.x + r * 0.65, c.y),
+        ],
+        egui::Color32::WHITE,
+        egui::Stroke::NONE,
+    ));
+}
+
+fn draw_overlay_pause_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let stroke = egui::Stroke::new((r * 0.34).max(2.0), egui::Color32::WHITE);
+    painter.line_segment(
+        [
+            egui::pos2(c.x - r * 0.35, c.y - r),
+            egui::pos2(c.x - r * 0.35, c.y + r),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(c.x + r * 0.35, c.y - r),
+            egui::pos2(c.x + r * 0.35, c.y + r),
+        ],
+        stroke,
+    );
+}
+
+fn draw_overlay_replay_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let white = egui::Color32::WHITE;
+    let bar_w = (r * 0.22).max(2.0);
+    painter.rect_filled(
+        egui::Rect::from_min_max(
+            egui::pos2(c.x - r * 0.80, c.y - r * 0.72),
+            egui::pos2(c.x - r * 0.80 + bar_w, c.y + r * 0.72),
+        ),
+        0.0,
+        white,
+    );
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x - r * 0.35, c.y),
+            egui::pos2(c.x + r * 0.55, c.y - r * 0.70),
+            egui::pos2(c.x + r * 0.55, c.y + r * 0.70),
+        ],
+        white,
+        egui::Stroke::NONE,
+    ));
+}
+
+fn draw_overlay_loop_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, color: egui::Color32) {
+    let stroke = egui::Stroke::new((r * 0.16).max(1.5), color);
+    let left = c.x - r * 0.78;
+    let right = c.x + r * 0.78;
+    let top = c.y - r * 0.42;
+    let bottom = c.y + r * 0.42;
+    painter.line_segment([egui::pos2(left, top), egui::pos2(right, top)], stroke);
+    painter.line_segment(
+        [egui::pos2(right, bottom), egui::pos2(left, bottom)],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(left, top), egui::pos2(left, c.y - r * 0.12)],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(right, bottom), egui::pos2(right, c.y + r * 0.12)],
+        stroke,
+    );
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(right + r * 0.03, top),
+            egui::pos2(right - r * 0.34, top - r * 0.25),
+            egui::pos2(right - r * 0.34, top + r * 0.25),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(left - r * 0.03, bottom),
+            egui::pos2(left + r * 0.34, bottom - r * 0.25),
+            egui::pos2(left + r * 0.34, bottom + r * 0.25),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
+fn draw_overlay_bookmark_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, fill: egui::Color32) {
+    let rect = egui::Rect::from_center_size(c, egui::vec2(r * 1.10, r * 1.55));
+    let notch = egui::pos2(rect.center().x, rect.max.y - r * 0.35);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            notch,
+            rect.left_bottom(),
+        ],
+        fill,
+        egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 245, 190)),
+    ));
+}
+
+fn draw_overlay_pin_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, color: egui::Color32) {
+    let stroke = egui::Stroke::new((r * 0.18).max(1.5), color);
+    let head = egui::Rect::from_center_size(
+        egui::pos2(c.x - r * 0.05, c.y - r * 0.32),
+        egui::vec2(r * 0.95, r * 0.48),
+    );
+    painter.rect_filled(head, 1.5, color);
+    painter.line_segment(
+        [
+            egui::pos2(c.x - r * 0.06, c.y - r * 0.05),
+            egui::pos2(c.x + r * 0.32, c.y + r * 0.44),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(c.x + r * 0.32, c.y + r * 0.44),
+            egui::pos2(c.x + r * 0.08, c.y + r * 0.72),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(c.x + r * 0.10, c.y + r * 0.26),
+            egui::pos2(c.x - r * 0.48, c.y + r * 0.84),
+        ],
+        egui::Stroke::new((r * 0.12).max(1.2), color),
+    );
+}
+
+fn draw_overlay_speaker_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, muted: bool) {
+    let white = egui::Color32::WHITE;
+    let body = egui::Rect::from_min_max(
+        egui::pos2(c.x - r * 0.75, c.y - r * 0.38),
+        egui::pos2(c.x - r * 0.40, c.y + r * 0.38),
+    );
+    painter.rect_filled(body, 1.0, white);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(body.max.x, body.min.y),
+            egui::pos2(c.x + r * 0.10, c.y - r * 0.68),
+            egui::pos2(c.x + r * 0.10, c.y + r * 0.68),
+            egui::pos2(body.max.x, body.max.y),
+        ],
+        white,
+        egui::Stroke::NONE,
+    ));
+    if muted {
+        let stroke = egui::Stroke::new((r * 0.16).max(2.0), egui::Color32::from_rgb(240, 100, 100));
+        painter.line_segment(
+            [
+                egui::pos2(c.x + r * 0.30, c.y - r * 0.50),
+                egui::pos2(c.x + r * 0.85, c.y + r * 0.50),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(c.x + r * 0.85, c.y - r * 0.50),
+                egui::pos2(c.x + r * 0.30, c.y + r * 0.50),
+            ],
+            stroke,
+        );
+    } else {
+        let stroke = egui::Stroke::new((r * 0.13).max(1.4), white);
+        painter.line_segment(
+            [
+                egui::pos2(c.x + r * 0.35, c.y - r * 0.35),
+                egui::pos2(c.x + r * 0.35, c.y + r * 0.35),
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                egui::pos2(c.x + r * 0.62, c.y - r * 0.55),
+                egui::pos2(c.x + r * 0.62, c.y + r * 0.55),
+            ],
+            stroke,
+        );
     }
 }
 
@@ -1707,6 +4509,14 @@ fn finite_nonnegative(value: f64) -> f64 {
     }
 }
 
+fn finite_unit(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 fn format_overlay_time(secs: f64) -> String {
     let total = finite_nonnegative(secs).round() as u64;
     let h = total / 3600;
@@ -1717,6 +4527,50 @@ fn format_overlay_time(secs: f64) -> String {
     } else {
         format!("{m}:{s:02}")
     }
+}
+
+fn format_tile_interval(secs: f64) -> String {
+    let secs = finite_nonnegative(secs);
+    if secs >= 60.0 {
+        format!("{}分", (secs / 60.0).round() as u64)
+    } else {
+        format!("{}秒", secs.round() as u64)
+    }
+}
+
+fn format_fps(fps: f64) -> String {
+    if fps.is_finite() && fps > 0.0 {
+        format!("{fps:.2}fps")
+    } else {
+        "fps ?".to_string()
+    }
+}
+
+fn format_bitrate(bit_rate_bps: i64) -> String {
+    if bit_rate_bps <= 0 {
+        return "unknown".to_string();
+    }
+    let mbps = bit_rate_bps as f64 / 1_000_000.0;
+    if mbps >= 1.0 {
+        format!("{mbps:.1}Mbps")
+    } else {
+        format!("{}kbps", (bit_rate_bps as f64 / 1000.0).round() as i64)
+    }
+}
+
+fn truncate_overlay_text(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut out = String::new();
+    for _ in 0..max_chars {
+        let Some(ch) = chars.next() else {
+            return out;
+        };
+        out.push(ch);
+    }
+    if chars.next().is_some() {
+        out.push_str("...");
+    }
+    out
 }
 
 fn pixels_per_point_for_hwnd(hwnd: HWND) -> f32 {
@@ -1986,4 +4840,209 @@ impl Drop for NativeVideoPresenter {
 
 fn log_event(kind: &str, fields: &[(&str, Value)]) {
     crate::perf::event("native_presenter", kind, None, 0, fields);
+}
+
+fn copy_cpu_rgba_to_swapchain_bgra(
+    src_rgba: &[u8],
+    dst_bgra: &mut Vec<u8>,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    let expected_len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| format!("CPU frame size overflow: {width}x{height}"))?;
+    if src_rgba.len() < expected_len {
+        return Err(format!(
+            "CPU frame buffer is too small: got {} bytes, expected {expected_len}",
+            src_rgba.len()
+        ));
+    }
+
+    dst_bgra.resize(expected_len, 0);
+    for (src, dst) in src_rgba[..expected_len]
+        .chunks_exact(4)
+        .zip(dst_bgra.chunks_exact_mut(4))
+    {
+        dst[0] = src[2];
+        dst[1] = src[1];
+        dst[2] = src[0];
+        dst[3] = src[3];
+    }
+    Ok(())
+}
+
+fn sample_cpu_rgba_pixel(
+    src_rgba: &[u8],
+    width: u32,
+    height: u32,
+    format: i32,
+) -> Result<NativePixelSample, String> {
+    if width == 0 || height == 0 {
+        return Err("CPU pixel probe: empty frame".to_string());
+    }
+    let x = width / 2;
+    let y = height / 2;
+    let offset = (y as usize)
+        .checked_mul(width as usize)
+        .and_then(|row| row.checked_add(x as usize))
+        .and_then(|px| px.checked_mul(4))
+        .ok_or_else(|| format!("CPU pixel probe size overflow: {width}x{height}"))?;
+    if src_rgba.len() < offset + 4 {
+        return Err(format!(
+            "CPU pixel probe buffer is too small: got {} bytes, need {}",
+            src_rgba.len(),
+            offset + 4
+        ));
+    }
+    Ok(NativePixelSample {
+        x,
+        y,
+        width,
+        height,
+        format,
+        b: src_rgba[offset + 2],
+        g: src_rgba[offset + 1],
+        r: src_rgba[offset],
+        a: src_rgba[offset + 3],
+    })
+}
+
+fn compare_pixel_probe(
+    path: &str,
+    expected: NativePixelSample,
+    actual: NativePixelSample,
+) -> Result<(), String> {
+    const TOLERANCE: u8 = 0;
+    let mismatch = expected.width != actual.width
+        || expected.height != actual.height
+        || expected.format != actual.format
+        || channel_delta(expected.b, actual.b) > TOLERANCE
+        || channel_delta(expected.g, actual.g) > TOLERANCE
+        || channel_delta(expected.r, actual.r) > TOLERANCE
+        || channel_delta(expected.a, actual.a) > TOLERANCE;
+    if !mismatch {
+        log_event(
+            "pixel_probe_match",
+            &[
+                ("path", Value::from(path)),
+                ("x", Value::from(actual.x as i64)),
+                ("y", Value::from(actual.y as i64)),
+                ("b", Value::from(actual.b as i64)),
+                ("g", Value::from(actual.g as i64)),
+                ("r", Value::from(actual.r as i64)),
+                ("a", Value::from(actual.a as i64)),
+            ],
+        );
+        return Ok(());
+    }
+
+    log_event(
+        "pixel_probe_mismatch",
+        &[
+            ("path", Value::from(path)),
+            ("expected_b", Value::from(expected.b as i64)),
+            ("expected_g", Value::from(expected.g as i64)),
+            ("expected_r", Value::from(expected.r as i64)),
+            ("expected_a", Value::from(expected.a as i64)),
+            ("actual_b", Value::from(actual.b as i64)),
+            ("actual_g", Value::from(actual.g as i64)),
+            ("actual_r", Value::from(actual.r as i64)),
+            ("actual_a", Value::from(actual.a as i64)),
+        ],
+    );
+    Err(format!(
+        "native presenter pixel probe mismatch on {path}: expected BGRA=({},{},{},{}) got BGRA=({},{},{},{})",
+        expected.b, expected.g, expected.r, expected.a, actual.b, actual.g, actual.r, actual.a
+    ))
+}
+
+fn channel_delta(a: u8, b: u8) -> u8 {
+    a.abs_diff(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        NativePixelSample, compare_pixel_probe, copy_cpu_rgba_to_swapchain_bgra,
+        metadata_clean_text, sample_cpu_rgba_pixel,
+    };
+
+    #[test]
+    fn copy_cpu_rgba_to_swapchain_bgra_swaps_red_and_blue() {
+        let src = [
+            0x10, 0x20, 0x30, 0x40, //
+            0xaa, 0xbb, 0xcc, 0xdd,
+        ];
+        let mut dst = Vec::new();
+
+        copy_cpu_rgba_to_swapchain_bgra(&src, &mut dst, 2, 1).unwrap();
+
+        assert_eq!(
+            dst,
+            [
+                0x30, 0x20, 0x10, 0x40, //
+                0xcc, 0xbb, 0xaa, 0xdd,
+            ]
+        );
+    }
+
+    #[test]
+    fn copy_cpu_rgba_to_swapchain_bgra_rejects_short_input() {
+        let mut dst = Vec::new();
+
+        let err = copy_cpu_rgba_to_swapchain_bgra(&[0, 1, 2], &mut dst, 1, 1).unwrap_err();
+
+        assert!(err.contains("too small"));
+    }
+
+    #[test]
+    fn sample_cpu_rgba_pixel_returns_bgra_at_center() {
+        let src = [
+            1, 2, 3, 4, //
+            5, 6, 7, 8, //
+            9, 10, 11, 12, //
+            13, 14, 15, 16,
+        ];
+
+        let sample = sample_cpu_rgba_pixel(&src, 2, 2, 87).unwrap();
+
+        assert_eq!(sample.x, 1);
+        assert_eq!(sample.y, 1);
+        assert_eq!((sample.b, sample.g, sample.r, sample.a), (15, 14, 13, 16));
+    }
+
+    #[test]
+    fn compare_pixel_probe_detects_channel_mismatch() {
+        let expected = NativePixelSample {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 1,
+            format: 87,
+            b: 10,
+            g: 20,
+            r: 30,
+            a: 255,
+        };
+        let actual = NativePixelSample {
+            r: 10,
+            b: 30,
+            ..expected
+        };
+
+        let err = compare_pixel_probe("cpu_upload", expected, actual).unwrap_err();
+
+        assert!(err.contains("mismatch"));
+    }
+
+    #[test]
+    fn metadata_clean_text_preserves_description_line_breaks() {
+        let text = " line one  with   spaces\\n\\nline two\r\n  line three  ";
+
+        assert_eq!(
+            metadata_clean_text(text),
+            "line one with spaces\n\nline two\nline three"
+        );
+    }
 }
