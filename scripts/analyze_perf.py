@@ -49,7 +49,9 @@ def load_events(path: Path) -> list[dict]:
             if not line:
                 continue
             try:
-                events.append(json.loads(line))
+                event = json.loads(line)
+                event["_line"] = lineno
+                events.append(event)
             except json.JSONDecodeError as e:
                 print(
                     f"warning: line {lineno}: {e}",
@@ -586,6 +588,103 @@ def cmd_hitches(events: list[dict], threshold_ms: float) -> None:
 
 
 # -----------------------------------------------------------------------
+# spike-context -- native presenter spike の前後イベントを見る
+# -----------------------------------------------------------------------
+
+def _compact_event(e: dict) -> str:
+    cat = e.get("cat", "?")
+    kind = e.get("kind", "?")
+    t = float(e.get("t", 0.0) or 0.0)
+    line = int(e.get("_line", 0) or 0)
+    parts = [f"L{line}", f"t={t:.3f}", f"{cat}/{kind}"]
+    for key in (
+        "pts",
+        "path",
+        "queue_len",
+        "copy_ms",
+        "keyed_mutex_ms",
+        "keyed_mutex_acquire_ms",
+        "keyed_mutex_cast_ms",
+        "fence_wait_ms",
+        "open_shared_ms",
+        "copy_call_ms",
+        "total_ms",
+        "late_ms",
+        "gap_ms",
+        "pool_len",
+        "shared_handle",
+        "dropped_full",
+        "scale_ms",
+        "decode_wait_ms",
+        "send_wait_ms",
+    ):
+        if key in e:
+            value = e.get(key)
+            if isinstance(value, float):
+                parts.append(f"{key}={value:.3f}")
+            else:
+                parts.append(f"{key}={value}")
+    return "  ".join(parts)
+
+
+def cmd_spike_context(
+    events: list[dict],
+    metric: str,
+    threshold_ms: float,
+    window_ms: float,
+    limit: int,
+    all_events: bool,
+) -> None:
+    spikes = [
+        e
+        for e in events
+        if e.get("cat") == "native_presenter"
+        and e.get("kind") == "fullscreen_present"
+        and isinstance(e.get(metric), (int, float))
+        and float(e.get(metric, 0.0)) >= threshold_ms
+    ]
+    spikes.sort(key=lambda e: float(e.get(metric, 0.0)), reverse=True)
+    if limit > 0:
+        spikes = spikes[:limit]
+
+    print(
+        f"native_presenter/fullscreen_present spikes: metric={metric} "
+        f">= {threshold_ms:.1f}ms, window=+/-{window_ms:.0f}ms, count={len(spikes)}"
+    )
+    if not spikes:
+        return
+
+    window_s = window_ms / 1000.0
+    relevant_cats = {"native_presenter", "video", "demux", "ui"}
+    relevant_ui_kinds = {"frame_gap", "slow_frame_breakdown"}
+    for i, spike in enumerate(spikes, 1):
+        t0 = float(spike.get("t", 0.0) or 0.0)
+        lo = t0 - window_s
+        hi = t0 + window_s
+        context = []
+        for e in events:
+            t = float(e.get("t", 0.0) or 0.0)
+            if not (lo <= t <= hi):
+                continue
+            if not all_events:
+                cat = e.get("cat")
+                kind = e.get("kind")
+                if cat not in relevant_cats:
+                    continue
+                if cat == "ui" and kind not in relevant_ui_kinds:
+                    continue
+            context.append(e)
+
+        print()
+        print(f"#{i} spike")
+        print(_compact_event(spike))
+        print(f"context events: {len(context)}")
+        for e in context:
+            marker = ">>" if e is spike else "  "
+            print(f"{marker} {_compact_event(e)}")
+
+
+# -----------------------------------------------------------------------
 # main
 # -----------------------------------------------------------------------
 
@@ -603,6 +702,12 @@ def main() -> None:
     subs.add_parser("startup")
     p_hit = subs.add_parser("hitches")
     p_hit.add_argument("--ms", type=float, default=33.0, help="ヒッチ閾値 (ms、既定 33.0)")
+    p_spike = subs.add_parser("spike-context")
+    p_spike.add_argument("--metric", default="keyed_mutex_acquire_ms")
+    p_spike.add_argument("--ms", type=float, default=16.0, help="spike 閾値 (ms、既定 16.0)")
+    p_spike.add_argument("--window-ms", type=float, default=100.0, help="前後 window (ms、既定 100)")
+    p_spike.add_argument("--limit", type=int, default=10, help="表示する spike 数 (0 なら全件)")
+    p_spike.add_argument("--all-events", action="store_true", help="audio 等を含む全イベントを表示")
     p_dump = subs.add_parser("dump")
     p_dump.add_argument("seq", type=int)
     p_dump.add_argument("--with-frames", action="store_true", help="frame.begin も表示する")
@@ -631,6 +736,8 @@ def main() -> None:
         cmd_startup(events)
     elif args.cmd == "hitches":
         cmd_hitches(events, args.ms)
+    elif args.cmd == "spike-context":
+        cmd_spike_context(events, args.metric, args.ms, args.window_ms, args.limit, args.all_events)
     elif args.cmd == "dump":
         cmd_dump(events, args.seq, args.with_frames)
     elif args.cmd == "timeline":
