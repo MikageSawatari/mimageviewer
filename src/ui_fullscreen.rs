@@ -3142,6 +3142,7 @@ impl App {
         #[cfg(windows)]
         if restore_video_tile {
             self.video_tile_state = None;
+            self.video_tile_swap_pending = None;
             self.video_tile_textures.clear();
         }
 
@@ -5908,6 +5909,7 @@ impl App {
         // (handle_image_keys 後段) の通常 ESC で扱う。
         if escape_for_tile {
             self.video_tile_state = None;
+            self.video_tile_swap_pending = None;
             self.video_tile_textures.clear();
         }
 

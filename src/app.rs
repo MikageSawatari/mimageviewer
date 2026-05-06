@@ -1321,6 +1321,15 @@ pub(crate) fn is_thumb_adjust_target(item: Option<&GridItem>) -> bool {
 // App
 // -----------------------------------------------------------------------
 
+#[cfg(windows)]
+pub(crate) struct VideoTileSwapPending {
+    pub(crate) target_idx: usize,
+    pub(crate) target_path: PathBuf,
+    pub(crate) source_epoch: u64,
+    pub(crate) started_at: std::time::Instant,
+    pub(crate) deadline: std::time::Instant,
+}
+
 pub struct App {
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
@@ -1811,6 +1820,10 @@ pub struct App {
     pub(crate) video_tile_reopen_pending: bool,
     #[cfg(windows)]
     pub(crate) video_tile_reopen_deadline: Option<std::time::Instant>,
+    #[cfg(windows)]
+    pub(crate) video_tile_swap_pending: Option<VideoTileSwapPending>,
+    #[cfg(windows)]
+    pub(crate) native_video_source_epoch_next: u64,
     /// タイルモードのサムネ texture キャッシュ (slot_idx → (key, tex))。
     /// state Drop 時にこちらも `clear()` で解放する想定。
     #[cfg(windows)]
@@ -2785,6 +2798,10 @@ impl Default for App {
             video_tile_reopen_pending: false,
             #[cfg(windows)]
             video_tile_reopen_deadline: None,
+            #[cfg(windows)]
+            video_tile_swap_pending: None,
+            #[cfg(windows)]
+            native_video_source_epoch_next: 1,
             #[cfg(windows)]
             video_tile_textures: std::collections::HashMap::new(),
             #[cfg(windows)]
@@ -10288,6 +10305,55 @@ impl App {
     /// 1枚のフルサイズ画像を非同期で読み込み開始する。
     /// 通常画像 / ZIP エントリ / PDF ページ の全てに対応。
     /// GIF / APNG はアニメーションフレームを全デコードして FsLoadResult::Animated を送信する。
+    fn build_video_player_for_open(
+        &mut self,
+        _idx: usize,
+        vp: PathBuf,
+        from_grid: bool,
+        autoplay_override: Option<bool>,
+        #[cfg(windows)] native_output_config: Option<crate::video::NativeVideoOutputConfig>,
+    ) -> crate::video::VideoPlayer {
+        let vol = self.settings.video_volume;
+        let autoplay = autoplay_override.unwrap_or_else(|| {
+            video_autoplay_for_open(
+                self.settings.video_autoplay_mode,
+                self.settings.video_autoplay,
+                from_grid,
+            )
+        });
+        let path_key = crate::adjustment_db::normalize_path(&vp);
+        let play_test_for_video = self.play_test.as_ref().filter(|state| {
+            let config_key = crate::adjustment_db::normalize_path(&state.config.path);
+            config_key == path_key
+        });
+        let play_test_start = play_test_for_video.and_then(|state| state.config.start_secs);
+        let play_test_mute = play_test_for_video.is_some_and(|state| state.config.mute);
+        let resume = play_test_start
+            .or_else(|| self.settings.video_resume_positions.get(&path_key).copied());
+        let video_hw_decode = self.settings.video_hw_decode;
+        let player = crate::video::VideoPlayer::open(
+            vp,
+            vol,
+            autoplay,
+            resume,
+            video_hw_decode,
+            #[cfg(windows)]
+            if video_hw_decode {
+                self.gpu_video_device.clone()
+            } else {
+                None
+            },
+            #[cfg(windows)]
+            Some(self.dsp_bridge.clone()),
+            #[cfg(windows)]
+            native_output_config,
+        );
+        if self.settings.video_start_muted || play_test_mute {
+            player.set_muted(true);
+        }
+        player
+    }
+
     pub(crate) fn start_fs_load(&mut self, idx: usize) {
         // 動画は専用パス: VideoPlayer を作って fs_cache に直接入れる。
         // 通常の画像デコードスレッドは起動しない。
@@ -10313,52 +10379,12 @@ impl App {
                 }
             }
             if !self.fs_cache.contains_key(&idx) {
-                // start_muted の場合も volume はそのままにし、Player 内 atomic で
-                // ミュートだけ切る (= 解除時に元の音量に戻る)。0.0 を渡してしまうと
-                // 「ミュート解除しても音が出ない」状態になり Codex に指摘された。
-                let vol = self.settings.video_volume;
-                // 一覧から明示的に開いた動画は再生開始、動画送りでは停止する。
-                // migration: 旧 video_autoplay=true で video_autoplay_mode が
-                // デフォルト (= Off、つまり明示的に保存していない) なら Always に
-                // bridge する (= 旧設定からのアップグレードで挙動が突然変わらない)。
                 let from_grid = std::mem::take(&mut self.fs_open_intent_from_grid);
-                let autoplay = video_autoplay_for_open(
-                    self.settings.video_autoplay_mode,
-                    self.settings.video_autoplay,
-                    from_grid,
-                );
-                // resume 位置の取得: 直近に保存した位置を渡して最初の info 受領後に
-                // 自動シークさせる。Windows の case-insensitive パスを揃えるため
-                // adjustment_db::normalize_path に合わせる。
-                let path_key = crate::adjustment_db::normalize_path(&vp);
-                let play_test_for_video = self.play_test.as_ref().filter(|state| {
-                    let config_key = crate::adjustment_db::normalize_path(&state.config.path);
-                    config_key == path_key
-                });
-                let play_test_start = play_test_for_video.and_then(|state| state.config.start_secs);
-                let play_test_mute = play_test_for_video.is_some_and(|state| state.config.mute);
-                let resume = play_test_start
-                    .or_else(|| self.settings.video_resume_positions.get(&path_key).copied());
-                let video_hw_decode = self.settings.video_hw_decode;
-                let player = crate::video::VideoPlayer::open(
+                let player = self.build_video_player_for_open(
+                    idx,
                     vp,
-                    vol,
-                    autoplay,
-                    resume,
-                    video_hw_decode,
-                    // GPU レンダリングが利用可能なら渡す。HW デコード OFF の場合や
-                    // GpuVideoDevice 作成失敗時は None で旧経路 (CPU readback)。
-                    #[cfg(windows)]
-                    if video_hw_decode {
-                        self.gpu_video_device.clone()
-                    } else {
-                        None
-                    },
-                    // VST3 plugin processing (optional). bridge は App lifetime で
-                    // 1 個だけ存在し、`is_enabled()=false` の間は audio-pump 側でゼロ
-                    // オーバーヘッドで no-op (= デフォルト挙動を壊さない)。
-                    #[cfg(windows)]
-                    Some(self.dsp_bridge.clone()),
+                    from_grid,
+                    None,
                     #[cfg(windows)]
                     native_video_presenter_config(
                         self.main_hwnd,
@@ -10368,9 +10394,6 @@ impl App {
                         self.checked.contains(&idx),
                     ),
                 );
-                if self.settings.video_start_muted || play_test_mute {
-                    player.set_muted(true);
-                }
                 self.fs_cache.insert(
                     idx,
                     FsCacheEntry::Video {
@@ -11038,6 +11061,7 @@ impl App {
             self.video_tile_state = None;
             self.video_tile_reopen_pending = false;
             self.video_tile_reopen_deadline = None;
+            self.video_tile_swap_pending = None;
             self.video_tile_textures.clear();
             self.video_jump_textures.clear();
         }
@@ -13045,7 +13069,7 @@ impl App {
         #[cfg(windows)]
         let mut native_owner_hwnd: u64 = 0;
         #[cfg(windows)]
-        let mut native_events: Vec<(usize, crate::video::NativeVideoOutputEvent)> = Vec::new();
+        let mut native_events: Vec<(usize, u64, crate::video::NativeVideoOutputEvent)> = Vec::new();
         for (idx, entry) in self.fs_cache.iter_mut() {
             if let FsCacheEntry::Video { player, .. } = entry {
                 player.set_loop_enabled(loop_enabled);
@@ -13086,7 +13110,7 @@ impl App {
                         player
                             .drain_native_presenter_events()
                             .into_iter()
-                            .map(|event| (*idx, event)),
+                            .map(|(epoch, event)| (*idx, epoch, event)),
                     );
                 }
                 if do_save {
@@ -13102,8 +13126,8 @@ impl App {
             self.native_video_owner_synced_hwnd = native_owner_hwnd;
         }
         #[cfg(windows)]
-        for (idx, event) in native_events {
-            self.handle_native_video_output_event(ctx, idx, event);
+        for (idx, epoch, event) in native_events {
+            self.handle_native_video_output_event(ctx, idx, epoch, event);
         }
         #[cfg(windows)]
         if self.fullscreen_idx.is_some() && self.settings.vst3_enabled {
@@ -13111,6 +13135,7 @@ impl App {
         }
         #[cfg(windows)]
         if let Some(fs_idx) = self.fullscreen_idx {
+            self.poll_video_tile_swap(ctx);
             self.sync_native_video_metadata(fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);
             self.sync_native_video_tile_overlay(ctx, fs_idx);
@@ -13286,12 +13311,23 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
+        source_epoch: u64,
         event: crate::video::NativeVideoOutputEvent,
     ) {
         if self.fullscreen_idx != Some(fs_idx) {
             crate::logger::log(format!(
                 "[native-video] stale overlay event ignored: event_idx={fs_idx} current={:?}",
                 self.fullscreen_idx
+            ));
+            return;
+        }
+        let current_epoch = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+            FsCacheEntry::Video { player, .. } => player.native_source_epoch(),
+            _ => None,
+        });
+        if current_epoch != Some(source_epoch) {
+            crate::logger::log(format!(
+                "[native-video] stale overlay event ignored: event_idx={fs_idx} event_epoch={source_epoch} current_epoch={current_epoch:?}"
             ));
             return;
         }
@@ -13461,6 +13497,7 @@ impl App {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.seek(target_secs);
             self.video_tile_state = None;
+            self.video_tile_swap_pending = None;
             self.video_tile_textures.clear();
             player.set_native_tile_overlay(None);
             self.mark_native_video_hud_activity(ctx);
@@ -13832,6 +13869,86 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn poll_video_tile_swap(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.video_tile_swap_pending.as_ref() else {
+            return;
+        };
+        let target_idx = pending.target_idx;
+        let target_path = pending.target_path.clone();
+        let source_epoch = pending.source_epoch;
+        let started_at = pending.started_at;
+        let deadline = pending.deadline;
+        if self.fullscreen_idx != Some(target_idx) {
+            self.video_tile_swap_pending = None;
+            return;
+        }
+        let now = std::time::Instant::now();
+        enum SwapStatus {
+            Ready,
+            Pending,
+            Timeout,
+            Error,
+            Missing,
+        }
+        let status = match self.fs_cache.get(&target_idx) {
+            Some(FsCacheEntry::Video { player, .. }) if player.path() == &target_path => {
+                if player.error().is_some() {
+                    SwapStatus::Error
+                } else if player.info().is_some() {
+                    SwapStatus::Ready
+                } else if now >= deadline {
+                    SwapStatus::Timeout
+                } else {
+                    SwapStatus::Pending
+                }
+            }
+            _ => SwapStatus::Missing,
+        };
+        match status {
+            SwapStatus::Ready => {
+                let screen = ctx.content_rect().size();
+                self.video_tile_textures.clear();
+                self.video_tile_state = self.build_video_tile_state_for(target_idx, screen);
+                self.video_tile_swap_pending = None;
+                self.video_tile_reopen_pending = false;
+                self.video_tile_reopen_deadline = None;
+                self.sync_native_video_tile_overlay(ctx, target_idx);
+                crate::logger::log(format!(
+                    "[native-video] fast tile swap ready: idx={target_idx} epoch={source_epoch} elapsed_ms={:.1}",
+                    started_at.elapsed().as_secs_f64() * 1000.0
+                ));
+                ctx.request_repaint();
+            }
+            SwapStatus::Pending => {
+                self.set_native_video_tile_preparing_overlay(target_idx);
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            }
+            SwapStatus::Timeout => {
+                self.video_tile_swap_pending = None;
+                self.video_tile_state = None;
+                self.video_tile_textures.clear();
+                self.video_tile_reopen_pending = true;
+                self.video_tile_reopen_deadline = Some(now + std::time::Duration::from_secs(3));
+                self.set_native_video_tile_preparing_overlay(target_idx);
+                crate::logger::log(format!(
+                    "[native-video] fast tile swap timeout: idx={target_idx} epoch={source_epoch} elapsed_ms={:.1}",
+                    started_at.elapsed().as_secs_f64() * 1000.0
+                ));
+                ctx.request_repaint();
+            }
+            SwapStatus::Error | SwapStatus::Missing => {
+                self.video_tile_swap_pending = None;
+                self.video_tile_state = None;
+                self.video_tile_textures.clear();
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
+                    player.set_native_tile_overlay(None);
+                }
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    #[cfg(windows)]
     fn sync_native_video_tile_overlay(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let current_path = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) if player.error().is_none() => {
@@ -13867,11 +13984,21 @@ impl App {
             }
         }
 
+        let swap_pending_for_current =
+            self.video_tile_swap_pending
+                .as_ref()
+                .is_some_and(|pending| {
+                    pending.target_idx == fs_idx && pending.target_path == current_path
+                });
         let mut clear_state = false;
         let tile_overlay = if let Some(state) = self.video_tile_state.as_ref() {
             if state.video_path != current_path {
-                clear_state = true;
-                None
+                if swap_pending_for_current {
+                    Some(Self::native_video_tile_preparing_overlay())
+                } else {
+                    clear_state = true;
+                    None
+                }
             } else {
                 let snapshot = state.worker.snapshot();
                 let (progress_done, progress_total) = state.worker.progress();
@@ -13904,7 +14031,7 @@ impl App {
                     tiles,
                 })
             }
-        } else if self.video_tile_reopen_pending {
+        } else if swap_pending_for_current || self.video_tile_reopen_pending {
             Some(Self::native_video_tile_preparing_overlay())
         } else {
             None
@@ -13912,6 +14039,7 @@ impl App {
 
         if clear_state {
             self.video_tile_state = None;
+            self.video_tile_swap_pending = None;
             self.video_tile_textures.clear();
         }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
@@ -14407,6 +14535,9 @@ impl App {
         fs_idx: usize,
         base_delta: i32,
     ) {
+        if self.video_tile_swap_pending.is_some() {
+            return;
+        }
         if self.fs_nav_is_locked() {
             return;
         }
@@ -14431,6 +14562,9 @@ impl App {
 
     #[cfg(windows)]
     fn adjust_native_video_tile_columns(&mut self, ctx: &egui::Context, fs_idx: usize, delta: i32) {
+        if self.video_tile_swap_pending.is_some() {
+            return;
+        }
         if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() || delta == 0 {
             return;
         }
@@ -14455,6 +14589,7 @@ impl App {
         self.settings.save();
         let was_open = self.video_tile_state.is_some();
         self.video_tile_state = None;
+        self.video_tile_swap_pending = None;
         self.video_tile_textures.clear();
         if was_open {
             let screen = ctx.content_rect().size();
@@ -14478,7 +14613,100 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn next_native_video_source_epoch(&mut self) -> u64 {
+        let epoch = self.native_video_source_epoch_next.max(1);
+        self.native_video_source_epoch_next = epoch.wrapping_add(1).max(1);
+        epoch
+    }
+
+    #[cfg(windows)]
+    fn try_start_video_tile_fast_swap(&mut self, ctx: &egui::Context, target_idx: usize) -> bool {
+        if self.video_tile_swap_pending.is_some() {
+            return true;
+        }
+        let Some(from_idx) = self.fullscreen_idx else {
+            return false;
+        };
+        if from_idx == target_idx {
+            return true;
+        }
+        if self.video_tile_state.is_none() {
+            return false;
+        }
+        let Some(GridItem::Video(target_path)) = self.items.get(target_idx).cloned() else {
+            return false;
+        };
+        if !matches!(self.items.get(from_idx), Some(GridItem::Video(_))) {
+            return false;
+        }
+
+        self.save_all_video_resume_positions();
+        let native_output = match self.fs_cache.get_mut(&from_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                player.set_playing(false);
+                player.take_native_output()
+            }
+            _ => None,
+        };
+        let Some(native_output) = native_output else {
+            return false;
+        };
+
+        let source_epoch = self.next_native_video_source_epoch();
+        let mut new_player = self.build_video_player_for_open(
+            target_idx,
+            target_path.clone(),
+            false,
+            Some(false),
+            None,
+        );
+        new_player.attach_native_output(native_output);
+        let payload = new_player.build_switch_source_payload(source_epoch, true);
+        new_player.switch_native_source(payload);
+
+        self.fs_cache.insert(
+            target_idx,
+            FsCacheEntry::Video {
+                player: Box::new(new_player),
+                load_seq: self.input_seq,
+            },
+        );
+        self.video_tile_swap_pending = Some(VideoTileSwapPending {
+            target_idx,
+            target_path,
+            source_epoch,
+            started_at: std::time::Instant::now(),
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
+        });
+        self.video_tile_reopen_pending = false;
+        self.video_tile_reopen_deadline = None;
+        self.video_tile_textures.clear();
+
+        self.open_fullscreen(target_idx);
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
+            player.set_playing(false);
+        }
+        self.set_native_video_tile_preparing_overlay(target_idx);
+        self.sync_native_video_metadata(target_idx);
+        self.sync_native_video_timeline_markers(target_idx);
+        self.sync_native_video_vst3_available(target_idx);
+        self.sync_native_video_vst3_panel(target_idx);
+
+        if from_idx != target_idx {
+            self.fs_cache.remove(&from_idx);
+        }
+        crate::logger::log(format!(
+            "[native-video] fast tile swap: from={from_idx} to={target_idx} epoch={source_epoch}"
+        ));
+        ctx.request_repaint();
+        true
+    }
+
+    #[cfg(windows)]
     fn open_native_video_fullscreen_from_navigation(&mut self, ctx: &egui::Context, idx: usize) {
+        if self.try_start_video_tile_fast_swap(ctx, idx) {
+            return;
+        }
         let started = std::time::Instant::now();
         let from_idx = self.fullscreen_idx;
         let restore_video_tile = self.video_tile_state.is_some();
@@ -14488,6 +14716,7 @@ impl App {
         ));
         if restore_video_tile {
             self.video_tile_state = None;
+            self.video_tile_swap_pending = None;
             self.video_tile_textures.clear();
             if let Some(current_idx) = self.fullscreen_idx {
                 self.set_native_video_tile_preparing_overlay(current_idx);

@@ -21,6 +21,7 @@
 | 動画 video decode | `std::thread` (`video-decode`、= `run_video_decode`) | 動画 1 つにつき 1 本 | `video_pkt_rx` から `VideoWorkerMsg::{Packet, Flush, Eof}` を受け、HW (D3D11VA + GPU blit) → SW (`av_hwframe_transfer_data` + swscale) で frame を生成、PACE_LEAD=0.30 の pacing 後に `video_tx` (bounded=24) へ `try_send`。`Flush` で `flush()` + `current_seek_serial` / `drop_before_secs` / `post_seek_frame_sent` を更新 |
 | 動画 audio decode | `std::thread` (`video-audio-decode`、= `run_audio_decode`) | 動画 1 つにつき 1 本 (音声無し動画では起動しない) | `audio_pkt_rx` から `AudioWorkerMsg::{Packet, Flush, Eof}` を受け、avcodec decode + swresample で f32 stereo 48kHz に揃え、post-seek packet/sample trim 後に `audio_tx` (bounded=32) へ送出。`Eof` では `avcodec_send_packet(NULL)` + receive_frame ループで残サンプルを drain (= 末尾の数十 ms の音声を出し切る) |
 | 動画音声 pump | `std::thread` (`audio-pump`) | 動画 1 つにつき 1 本 | `audio_tx` から受けたフレームを ring buffer に押し込む。RT 出力は cpal の専用スレッドが担当。VST3 enable + プラグインロード済みのときは ring buffer に push する直前に `DspBridge::process_block` 経由で bridge プロセスへ往復する (= ~1-2ms IPC roundtrip) |
+| 動画 native presenter | `std::thread` (`native-video-presenter`, Windows) | フルスクリーン動画 1 つにつき 1 本。ただし動画タイルモード中の動画→動画移動では `SwitchSource` で再利用 | 専用 HWND + D3D11 presenter + egui overlay を保持し、`video_rx` から受けた `VideoFrame` を表示する。`NativeVideoOutputCommand::SwitchSource` で source binding (`video_rx` / `AvClock` / engine event tx / duration / displayed_frame_seq) を差し替え、HWND と overlay を破棄せず次動画へ切り替える |
 | VST3 host bridge | **別プロセス** (`mimageviewer-vst3-host.exe`、C++) | アプリ起動中 0 or 1 本 | VST3 SDK は C++ 前提なので bridge プロセス分離。bridge 内部は 3 thread (audio loop + GUI message pump + stdin pump)。詳細は [docs/vst3-integration.md](vst3-integration.md) と `crates/vst3-host/` ソースコメント |
 | VST3 plugin GUI ホスト | `std::thread` (`vst3-plugin-gui`) | プラグイン GUI 表示中のみ 1 本 | Win32 `CreateWindowExW` で独立 HWND を作成 → bridge にその HWND を渡してプラグイン側で `IPlugView::attached()`。HWND の WndProc + メッセージループはこのスレッドで回す (eframe (winit) と衝突しない) |
 | 動画音声 RT 出力 | `cpal::Stream` 内部スレッド | 動画 1 つにつき 1 本 | WASAPI Shared モード。コールバックで ring buffer から f32 stereo を pop し、**実消費サンプル数 (= `real_consumed`) 分のみ** `next_pts_secs` を進めて `AvClock::set_audio_pts` でマスタークロックを更新。silence 出力中 (= `real_consumed=0`) は pts 進行 skip。`!clock.is_playing()` (= 一時停止 / EOF) と `pump_seek_serial < clock_serial` (= pre-seek サンプル全消去) は早期 return。`AvClock::set_audio_pts` 側に defensive wall-rate cap (= `wall_dt + 5ms` で pts 進行を頭打ち) を保持し、buffer 非空 pre-fill burst の異常前進への保険にしている (Phase 9 後の cleanup refactor、詳細は [docs/video-engine-redesign.md](video-engine-redesign.md) の「Phase 9 後の Post-cleanup refactor」節) |
@@ -54,6 +55,7 @@
 | `SupervisorHandle.cancel` | `Arc<AtomicBool>` | UI (お気に入り OFF, App drop) | メタ / 名前索引 supervisor | supervisor 全体の停止シグナル |
 | `GlobalSearchHandle.cancel` | `Arc<AtomicBool>` | UI (クエリ変更, バー閉じ, folder 遷移, Handle drop) | Ctrl+G クエリワーカー | Tantivy ページングループの中断 |
 | `tag_write_worker.cancel` | `Arc<AtomicBool>` | App drop | タグ書き込みワーカー | 書込ループ + commit の中断 |
+| `NativeVideoOutput.source_epoch` | `Arc<AtomicU64>` | UI / native presenter | UI / native presenter | native presenter 再利用時の stale event 防止。`SwitchSource` ごとに epoch を進め、presenter から UI へ送る `NativeVideoOutputEvent` に付与する。UI は現在の player epoch と一致しない event を破棄する |
 | `ActivityGate.paused` (v0.9) | `AtomicBool` | UI (トレイメニュー「一時停止」 / ウィンドウ hide) | `wait_until_idle` を呼ぶ全ワーカー (walker / ingest / name_bulk_indexer) | true の間 wait ループが解除 or cancel まで抜けない。cancel は貫通 (終了時の固まり防止) |
 | `GlobalIoSemaphore.throttled` (v0.9) | `Mutex` ガード | UI (ウィンドウ hide/show) | 全インデクサ worker | true の間、実効 permit=1 (in_use ≥ 1 なら新規 acquire 不可)。解除で `notify_all` |
 
@@ -181,6 +183,29 @@ Ctrl+↑↓ は 3 つの起点から発火し、DFS 完了時に異なる後処�
   `start_loading_items` が folder_nav_pending を一律キャンセル。
 - モード違いで `start_folder_nav` が呼ばれた場合 (理論的エッジケース) は、
   旧 DFS をキャンセルしてから新モードで仕切り直す。
+
+### 3.1.6 動画タイルモード中の動画→動画切替
+
+Windows native presenter 有効時、動画タイルモード中にホイールで隣の動画へ移動する場合は
+通常の fullscreen reopen 経路ではなく fast path を使う。
+
+処理順序:
+
+1. 旧 `VideoPlayer` から `NativeVideoOutput` を取り外す。
+2. 新 `VideoPlayer` を `native_output_config=None` で構築する。
+3. 新 player の `SwitchSourcePayload` を既存 `NativeVideoOutput` に送る。
+4. 新 player に native output を attach し、`fs_cache[target_idx]` に入れる。
+5. `fullscreen_idx` と overlay / metadata 同期を新 idx へ更新する。
+6. 最後に旧 video entry を remove する。
+
+旧 entry の remove を最後にする理由は、旧 decoder を先に drop すると presenter thread が
+まだ旧 `video_rx` を見ている間に sender が close し、SwitchSource 到着まで disconnected
+状態を経由するため。source binding を先に差し替えてから旧 player を shutdown する。
+
+`video_tile_swap_pending` は新動画の `player.info()` 到着を待つ UI 側 pending state。
+pending 中は追加ホイール入力を捨て、queue も delta 累積もしない。これは Ctrl+↑↓ の
+ロックと同じく、ユーザーが操作を止めたあとに溜まった移動が遅れて発火しないようにするため。
+`info()` が来たら新しい `VideoTileState` を構築し、来なければ既存 reopen 経路へ fallback する。
 
 ### 3.2 フルスクリーン / AI のキャンセル
 

@@ -57,6 +57,7 @@ impl App {
             // Codex P5.5 H2 反映: state Drop だけでは texture cache がクリアされない
             // (Drop impl が無いため)。閉じる側で明示的にクリアしてリーク防止。
             self.video_tile_state = None;
+            self.video_tile_swap_pending = None;
             self.video_tile_textures.clear();
             return;
         }
@@ -64,14 +65,23 @@ impl App {
         // 列数の grid から切り替えるとき、古いキーで残った texture が誤マッチする
         // のを防ぐ)。
         self.video_tile_textures.clear();
+        self.video_tile_state = self.build_video_tile_state_for(fs_idx, screen_size);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn build_video_tile_state_for(
+        &self,
+        fs_idx: usize,
+        screen_size: egui::Vec2,
+    ) -> Option<VideoTileState> {
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
-            return;
+            return None;
         };
         let Some(info) = player.info().cloned() else {
-            return;
+            return None;
         };
         if info.duration_secs <= 0.5 {
-            return;
+            return None;
         }
         let path = player.path().clone();
         let aspect = if info.height > 0 {
@@ -85,7 +95,6 @@ impl App {
         let mut columns = self.settings.video_tile_columns;
         if !crate::settings::VIDEO_TILE_COLUMN_CANDIDATES.contains(&columns) {
             columns = 10;
-            self.settings.video_tile_columns = 10;
         }
         // 画面幅 (left/right に余白 16px を確保)。
         let usable_w = (screen_size.x - 32.0).max(200.0);
@@ -124,7 +133,7 @@ impl App {
         // メモリ / GPU テクスチャ確保を抑える。
         let timestamps: Vec<f64> = generate_timestamps(dur, interval, max_tiles);
         if timestamps.is_empty() {
-            return;
+            return None;
         }
 
         // Phase 6.D-2: 永続キャッシュを worker に渡す。動画 mtime をキーに mismatch
@@ -148,7 +157,7 @@ impl App {
             cache,
             video_mtime,
         );
-        self.video_tile_state = Some(VideoTileState {
+        Some(VideoTileState {
             video_path: path,
             interval_secs: interval,
             worker,
@@ -156,7 +165,7 @@ impl App {
             tile_w,
             tile_h,
             columns,
-        });
+        })
     }
 
     /// 動画タイル モードのオーバーレイを描画する。再生中の他の入力 (= クリック →
@@ -210,7 +219,31 @@ impl App {
             _ => None,
         };
         if cur_path.as_ref() != Some(&state_video_path) {
+            let swap_pending_for_current =
+                self.video_tile_swap_pending
+                    .as_ref()
+                    .is_some_and(|pending| {
+                        pending.target_idx == fs_idx
+                            && cur_path.as_ref() == Some(&pending.target_path)
+                    });
+            if swap_pending_for_current {
+                let painter = ui.painter().clone();
+                painter.rect_filled(
+                    full_rect,
+                    0.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 230),
+                );
+                painter.text(
+                    full_rect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "動画を準備中...",
+                    egui::FontId::proportional(20.0),
+                    egui::Color32::from_gray(180),
+                );
+                return true;
+            }
             self.video_tile_state = None;
+            self.video_tile_swap_pending = None;
             self.video_tile_textures.clear();
             return false;
         }
@@ -363,6 +396,7 @@ impl App {
                 };
                 if cur_path.as_ref() == Some(&video_path) {
                     self.video_tile_state = None;
+                    self.video_tile_swap_pending = None;
                     self.video_tile_textures.clear();
                     let screen = ctx.content_rect().size();
                     self.toggle_video_tile_mode(fs_idx, screen);
@@ -382,6 +416,7 @@ impl App {
                 player.seek(pts);
             }
             self.video_tile_state = None;
+            self.video_tile_swap_pending = None;
             self.video_tile_textures.clear();
         }
 

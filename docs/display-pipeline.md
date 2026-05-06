@@ -149,6 +149,26 @@ ui_fullscreen.rs::render_fullscreen_viewport
 → 結果: FsCacheEntry (Static / Animated / Failed) を fs_cache に格納
 ```
 
+### 2.2.1 動画フルスクリーンとタイルモード
+
+`GridItem::Video` は画像ロードワーカーを使わず、`App::start_fs_load` の動画分岐で
+`FsCacheEntry::Video { player }` を直接 `fs_cache` に挿入する。Windows の native
+presenter 有効時は `VideoPlayer` が `NativeVideoOutput` を持ち、動画フレームと
+egui overlay は専用 HWND 側で表示される。フルスクリーン viewport は黒い backdrop と
+focus/chrome 管理だけを担当する。
+
+動画タイルモード (`video_tile_state`) は再生中動画の `VideoInfo` からタイムスタンプ列を
+作り、`TileThumbnailWorker` が別 FFmpeg input でサムネイルを抽出する。動画から動画への
+ホイール移動でタイルモードが active の場合、Windows native presenter 経路では
+`NativeVideoOutput::SwitchSource` で HWND / D3D11 presenter / overlay を保持したまま
+新しい `VideoPlayer` の source binding に差し替える。`video_tile_swap_pending` 中は
+preparing overlay を出し、新動画の `player.info()` 到着後に新しい `VideoTileState` を
+構築してタイルを progressive に埋める。
+
+この fast path では保存済み resume 位置を新 `VideoPlayer` に渡すが、autoplay は false
+に固定する。タイル解除後は resume 位置の静止状態を表示し、特定位置から見たい場合は
+タイルクリックによる seek を使う。
+
 **リサイズ実装 (`src/fast_resize.rs`)**:
 
 リサイズは `image::imageops::resize` (スカラー) ではなく、`fast_image_resize`

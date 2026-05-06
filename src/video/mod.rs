@@ -251,6 +251,17 @@ pub enum NativeVideoOutputEvent {
 }
 
 #[cfg(windows)]
+pub(crate) struct SwitchSourcePayload {
+    video_rx: crossbeam_channel::Receiver<VideoFrame>,
+    clock: Arc<AvClock>,
+    engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
+    displayed_frame_seq: Arc<AtomicU64>,
+    duration_secs_bits: Arc<AtomicU64>,
+    source_epoch: u64,
+    show_preparing_overlay: bool,
+}
+
+#[cfg(windows)]
 enum NativeVideoOutputCommand {
     SetHoverThumbnail {
         thumbnail: Option<native_presenter::NativeOverlayThumbnail>,
@@ -293,19 +304,68 @@ enum NativeVideoOutputCommand {
     SetTileOverlay {
         tile_overlay: Option<native_presenter::NativeOverlayTileOverlay>,
     },
+    #[allow(dead_code)]
+    SwitchSource {
+        payload: Box<SwitchSourcePayload>,
+    },
 }
 
 #[cfg(windows)]
-struct NativeVideoOutput {
+struct PresenterSourceState {
+    video_rx: crossbeam_channel::Receiver<VideoFrame>,
+    clock: Arc<AvClock>,
+    engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
+    displayed_frame_seq: Arc<AtomicU64>,
+    duration_secs_bits: Arc<AtomicU64>,
+    source_epoch: u64,
+    queue: std::collections::VecDeque<VideoFrame>,
+    last_seen_serial: u64,
+    first_frame_event_last_epoch: Option<u64>,
+    pending_first_frame_event: Option<(u64, f64)>,
+    present_stats: NativeFullscreenPresentStats,
+    last_present_wall: Option<std::time::Instant>,
+    last_present_source_pts: Option<f64>,
+    source_pacing_sleep_count: u64,
+    source_pacing_sleep_total_ms: f64,
+}
+
+#[cfg(windows)]
+impl PresenterSourceState {
+    fn new(payload: SwitchSourcePayload) -> Self {
+        let last_seen_serial = payload.clock.current_seek_serial();
+        Self {
+            video_rx: payload.video_rx,
+            clock: payload.clock,
+            engine_event_tx: payload.engine_event_tx,
+            displayed_frame_seq: payload.displayed_frame_seq,
+            duration_secs_bits: payload.duration_secs_bits,
+            source_epoch: payload.source_epoch,
+            queue: std::collections::VecDeque::new(),
+            last_seen_serial,
+            first_frame_event_last_epoch: None,
+            pending_first_frame_event: None,
+            present_stats: NativeFullscreenPresentStats::default(),
+            last_present_wall: None,
+            last_present_source_pts: None,
+            source_pacing_sleep_count: 0,
+            source_pacing_sleep_total_ms: 0.0,
+        }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) struct NativeVideoOutput {
     cancel: Arc<AtomicBool>,
     hwnd: Arc<AtomicU64>,
     first_presented: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     perf_overlay_visible: Arc<AtomicBool>,
+    #[allow(dead_code)]
+    source_epoch: Arc<AtomicU64>,
     last_vst3_available: AtomicBool,
     last_checked: AtomicBool,
     command_tx: std::sync::mpsc::Sender<NativeVideoOutputCommand>,
-    event_rx: std::sync::Mutex<std::sync::mpsc::Receiver<NativeVideoOutputEvent>>,
+    event_rx: std::sync::Mutex<std::sync::mpsc::Receiver<(u64, NativeVideoOutputEvent)>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -324,6 +384,7 @@ impl NativeVideoOutput {
         let first_presented = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
         let perf_overlay_visible = Arc::new(AtomicBool::new(config.perf_overlay_visible));
+        let source_epoch = Arc::new(AtomicU64::new(0));
         let initial_vst3_available = config.vst3_available;
         let initial_checked = config.checked;
         let (event_tx, event_rx) = std::sync::mpsc::channel();
@@ -366,6 +427,7 @@ impl NativeVideoOutput {
             first_presented,
             closed,
             perf_overlay_visible,
+            source_epoch,
             last_vst3_available: AtomicBool::new(initial_vst3_available),
             last_checked: AtomicBool::new(initial_checked),
             command_tx,
@@ -384,6 +446,11 @@ impl NativeVideoOutput {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    #[allow(dead_code)]
+    fn source_epoch(&self) -> u64 {
+        self.source_epoch.load(Ordering::Acquire)
     }
 
     fn set_perf_overlay_visible(&self, visible: bool) {
@@ -462,6 +529,18 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::SetTileOverlay { tile_overlay });
     }
 
+    #[allow(dead_code)]
+    fn switch_source(&self, payload: SwitchSourcePayload) {
+        self.first_presented.store(false, Ordering::Release);
+        self.source_epoch
+            .store(payload.source_epoch, Ordering::Release);
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SwitchSource {
+                payload: Box::new(payload),
+            });
+    }
+
     fn set_playback_status(&self, first_frame_presented: bool, error: Option<String>) {
         let _ = self
             .command_tx
@@ -477,7 +556,7 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::ShowToast { text, centered });
     }
 
-    fn drain_events(&self) -> Vec<NativeVideoOutputEvent> {
+    fn drain_events(&self) -> Vec<(u64, NativeVideoOutputEvent)> {
         let Ok(rx) = self.event_rx.lock() else {
             return Vec::new();
         };
@@ -772,6 +851,15 @@ fn try_send_native_first_frame_ready(
 }
 
 #[cfg(windows)]
+fn send_native_output_event(
+    tx: &std::sync::mpsc::Sender<(u64, NativeVideoOutputEvent)>,
+    source_epoch: u64,
+    event: NativeVideoOutputEvent,
+) {
+    let _ = tx.send((source_epoch, event));
+}
+
+#[cfg(windows)]
 fn run_native_video_output(
     video_rx: crossbeam_channel::Receiver<VideoFrame>,
     clock: Arc<AvClock>,
@@ -780,14 +868,13 @@ fn run_native_video_output(
     duration_secs_bits: Arc<AtomicU64>,
     config: NativeVideoOutputConfig,
     command_rx: std::sync::mpsc::Receiver<NativeVideoOutputCommand>,
-    ui_event_tx: std::sync::mpsc::Sender<NativeVideoOutputEvent>,
+    ui_event_tx: std::sync::mpsc::Sender<(u64, NativeVideoOutputEvent)>,
     cancel: Arc<AtomicBool>,
     hwnd_out: Arc<AtomicU64>,
     first_presented_out: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     perf_overlay_visible: Arc<AtomicBool>,
 ) -> Result<(), String> {
-    use std::collections::VecDeque;
     use std::time::{Duration, Instant};
 
     let _com = NativeComApartment::init()?;
@@ -853,32 +940,32 @@ fn run_native_video_output(
         }
     }
 
-    let mut queue: VecDeque<VideoFrame> = VecDeque::new();
-    let mut last_seen_serial = clock.current_seek_serial();
-    let mut first_frame_event_last_epoch: Option<u64> = None;
-    let mut pending_first_frame_event: Option<(u64, f64)> = None;
+    let mut source = PresenterSourceState::new(SwitchSourcePayload {
+        video_rx,
+        clock,
+        engine_event_tx,
+        displayed_frame_seq,
+        duration_secs_bits,
+        source_epoch: 0,
+        show_preparing_overlay: config.initial_tile_overlay,
+    });
     let run_started = Instant::now();
-    let mut present_stats = NativeFullscreenPresentStats::default();
-    let mut last_present_wall: Option<Instant> = None;
-    let mut last_present_source_pts: Option<f64> = None;
     let mut last_summary_log = Instant::now();
     let mut last_present_log = Instant::now();
     let mut last_overlay_tick = Instant::now();
-    let mut source_pacing_sleep_count: u64 = 0;
-    let mut source_pacing_sleep_total_ms = 0.0_f64;
     let mut native_events = Vec::new();
     let trace_every_present = std::env::var_os("MIV_NATIVE_VIDEO_PRESENT_TRACE").is_some();
     while !cancel.load(Ordering::Acquire) {
         // `FirstFrameReady` is what lets the engine leave Buffering after a seek.
         // The engine event channel can be temporarily full during seek bursts, so
         // retry instead of treating a failed try_send as delivered.
-        if let Some((epoch, pts)) = pending_first_frame_event {
-            let clock_serial = clock.current_seek_serial();
+        if let Some((epoch, pts)) = source.pending_first_frame_event {
+            let clock_serial = source.clock.current_seek_serial();
             if epoch < clock_serial {
-                pending_first_frame_event = None;
-            } else if try_send_native_first_frame_ready(&engine_event_tx, epoch, pts) {
-                first_frame_event_last_epoch = Some(epoch);
-                pending_first_frame_event = None;
+                source.pending_first_frame_event = None;
+            } else if try_send_native_first_frame_ready(&source.engine_event_tx, epoch, pts) {
+                source.first_frame_event_last_epoch = Some(epoch);
+                source.pending_first_frame_event = None;
             }
         }
 
@@ -936,6 +1023,40 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetTileOverlay { tile_overlay } => {
                     presenter.set_overlay_tile_overlay(tile_overlay);
                 }
+                NativeVideoOutputCommand::SwitchSource { payload } => {
+                    native_drain_unpresented_queue(&mut source.queue);
+                    let show_preparing_overlay = payload.show_preparing_overlay;
+                    source = PresenterSourceState::new(*payload);
+                    first_presented_out.store(false, Ordering::Release);
+                    presenter.set_overlay_playback_status(false, None);
+                    presenter.set_overlay_metadata(None);
+                    presenter.set_overlay_timeline_markers(Vec::new());
+                    presenter.set_overlay_jump_entries(Vec::new());
+                    if source.source_epoch > 0 && source.queue.is_empty() {
+                        crate::logger::log(format!(
+                            "[native-video] presenter switched source epoch={}",
+                            source.source_epoch
+                        ));
+                    }
+                    if source.source_epoch > 0 || source.clock.is_seeking() {
+                        last_overlay_tick = Instant::now();
+                    }
+                    if source.source_epoch > 0 {
+                        native_events.clear();
+                        while presenter_event_rx.try_recv().is_ok() {}
+                    }
+                    if show_preparing_overlay {
+                        // The new player will resend fresh overlay content; keep the
+                        // tile surface visible while its VideoInfo and thumbnails load.
+                        presenter.set_overlay_tile_overlay(Some(
+                            crate::video::native_presenter::NativeOverlayTileOverlay::preparing(),
+                        ));
+                    }
+                    if !source.clock.is_playing() {
+                        source.last_present_wall = None;
+                        source.last_present_source_pts = None;
+                    }
+                }
             }
         }
         native_events.clear();
@@ -944,146 +1065,221 @@ fn run_native_video_output(
         }
         if !native_events.is_empty() {
             presenter.update_overlay_video_state(
-                clock.now_secs(),
-                f64::from_bits(duration_secs_bits.load(Ordering::Acquire)),
-                clock.is_playing(),
-                clock.volume(),
-                clock.is_muted(),
+                source.clock.now_secs(),
+                f64::from_bits(source.duration_secs_bits.load(Ordering::Acquire)),
+                source.clock.is_playing(),
+                source.clock.volume(),
+                source.clock.is_muted(),
             );
             let overlay_routing = match presenter.handle_window_events(&native_events) {
                 Ok(outcome) => {
                     for command in outcome.commands {
+                        let event_epoch = source.source_epoch;
                         match command {
                             crate::video::native_presenter::NativeOverlayCommand::Seek {
                                 target_secs,
                             } => {
-                                let _ =
-                                    ui_event_tx.send(NativeVideoOutputEvent::Seek { target_secs });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::Seek { target_secs },
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TileSeek {
                                 target_secs,
                             } => {
-                                let _ = ui_event_tx
-                                    .send(NativeVideoOutputEvent::TileSeek { target_secs });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::TileSeek { target_secs },
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::WheelNavigate {
                                 delta,
                             } => {
-                                let _ = ui_event_tx
-                                    .send(NativeVideoOutputEvent::WheelNavigate { delta });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::WheelNavigate { delta },
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TileColumnsDelta {
                                 delta,
                             } => {
-                                let _ = ui_event_tx
-                                    .send(NativeVideoOutputEvent::TileColumnsDelta { delta });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::TileColumnsDelta { delta },
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::RequestSeekThumbnail {
                                 target_secs,
                             } => {
-                                let _ = ui_event_tx.send(
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
                                     NativeVideoOutputEvent::RequestSeekThumbnail { target_secs },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleTileMode => {
-                                let _ = ui_event_tx.send(NativeVideoOutputEvent::ToggleTileMode);
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ToggleTileMode,
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TogglePerfOverlay => {
-                                let _ = ui_event_tx.send(NativeVideoOutputEvent::TogglePerfOverlay);
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::TogglePerfOverlay,
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleVst3Gui => {
-                                let _ = ui_event_tx.send(NativeVideoOutputEvent::ToggleVst3Gui);
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ToggleVst3Gui,
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::CloseFullscreen => {
-                                let _ = ui_event_tx.send(NativeVideoOutputEvent::CloseFullscreen);
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::CloseFullscreen,
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::SetVst3PanelVisible {
                                 visible,
                             } => {
-                                let _ = ui_event_tx
-                                    .send(NativeVideoOutputEvent::SetVst3PanelVisible { visible });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetVst3PanelVisible { visible },
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::SetVst3VideoCompact {
                                 compact,
                             } => {
-                                let _ = ui_event_tx
-                                    .send(NativeVideoOutputEvent::SetVst3VideoCompact { compact });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetVst3VideoCompact { compact },
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::Vst3ShowSlotGui {
                                 idx,
                                 path,
                             } => {
-                                let _ = ui_event_tx
-                                    .send(NativeVideoOutputEvent::Vst3ShowSlotGui { idx, path });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::Vst3ShowSlotGui { idx, path },
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::Vst3HideSlotGui {
                                 idx,
                                 path,
                             } => {
-                                let _ = ui_event_tx
-                                    .send(NativeVideoOutputEvent::Vst3HideSlotGui { idx, path });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::Vst3HideSlotGui { idx, path },
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::Vst3SetBypass {
                                 idx,
                                 path,
                                 bypass,
                             } => {
-                                let _ = ui_event_tx.send(NativeVideoOutputEvent::Vst3SetBypass {
-                                    idx,
-                                    path,
-                                    bypass,
-                                });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::Vst3SetBypass { idx, path, bypass },
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::Vst3LoadChainSlot {
                                 slot_idx,
                             } => {
-                                let _ = ui_event_tx
-                                    .send(NativeVideoOutputEvent::Vst3LoadChainSlot { slot_idx });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::Vst3LoadChainSlot { slot_idx },
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::Vst3SaveChainSlot {
                                 slot_idx,
                             } => {
-                                let _ = ui_event_tx
-                                    .send(NativeVideoOutputEvent::Vst3SaveChainSlot { slot_idx });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::Vst3SaveChainSlot { slot_idx },
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::SeekToStartAndPlay => {
-                                let _ = ui_event_tx.send(NativeVideoOutputEvent::SeekToStartAndPlay);
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SeekToStartAndPlay,
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TogglePlay => {
-                                let _ = ui_event_tx.send(NativeVideoOutputEvent::TogglePlay);
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::TogglePlay,
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleMute => {
-                                let _ = ui_event_tx.send(NativeVideoOutputEvent::ToggleMute);
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ToggleMute,
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleLoop => {
-                                let _ = ui_event_tx.send(NativeVideoOutputEvent::ToggleLoop);
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ToggleLoop,
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::SetVolume {
                                 volume,
                                 persist,
                             } => {
-                                let _ = ui_event_tx.send(NativeVideoOutputEvent::SetVolume {
-                                    volume,
-                                    persist,
-                                });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetVolume { volume, persist },
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::AddBookmarkAt {
                                 target_secs,
                             } => {
-                                let _ = ui_event_tx
-                                    .send(NativeVideoOutputEvent::AddBookmarkAt { target_secs });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::AddBookmarkAt { target_secs },
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TogglePinAt {
                                 target_secs,
                             } => {
-                                let _ = ui_event_tx
-                                    .send(NativeVideoOutputEvent::TogglePinAt { target_secs });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::TogglePinAt { target_secs },
+                                );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::DeleteBookmark {
                                 id,
                             } => {
-                                let _ =
-                                    ui_event_tx.send(NativeVideoOutputEvent::DeleteBookmark { id });
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::DeleteBookmark { id },
+                                );
                             }
                         }
                     }
@@ -1098,7 +1294,11 @@ fn run_native_video_output(
             };
             for event in &native_events {
                 if overlay_routing.should_forward_to_ui(*event) {
-                    let _ = ui_event_tx.send(NativeVideoOutputEvent::Window(*event));
+                    send_native_output_event(
+                        &ui_event_tx,
+                        source.source_epoch,
+                        NativeVideoOutputEvent::Window(*event),
+                    );
                 }
             }
             last_overlay_tick = Instant::now();
@@ -1108,70 +1308,78 @@ fn run_native_video_output(
                 && last_overlay_tick.elapsed() >= Duration::from_millis(250))
         {
             if let Err(err) = presenter.tick_overlay_video_state(
-                clock.now_secs(),
-                f64::from_bits(duration_secs_bits.load(Ordering::Acquire)),
-                clock.is_playing(),
-                clock.volume(),
-                clock.is_muted(),
+                source.clock.now_secs(),
+                f64::from_bits(source.duration_secs_bits.load(Ordering::Acquire)),
+                source.clock.is_playing(),
+                source.clock.volume(),
+                source.clock.is_muted(),
             ) {
                 crate::logger::log(format!("[native-video] overlay tick render failed: {err}"));
             }
             last_overlay_tick = Instant::now();
         }
 
-        let clock_serial = clock.current_seek_serial();
-        if clock_serial != last_seen_serial {
-            native_drain_unpresented_queue(&mut queue);
-            last_seen_serial = clock_serial;
-            first_frame_event_last_epoch = None;
-            pending_first_frame_event = None;
-            last_present_source_pts = None;
+        let clock_serial = source.clock.current_seek_serial();
+        if clock_serial != source.last_seen_serial {
+            native_drain_unpresented_queue(&mut source.queue);
+            source.last_seen_serial = clock_serial;
+            source.first_frame_event_last_epoch = None;
+            source.pending_first_frame_event = None;
+            source.last_present_source_pts = None;
         }
-        while let Ok(frame) = video_rx.try_recv() {
+        while let Ok(frame) = source.video_rx.try_recv() {
             if frame.seek_serial < clock_serial {
                 native_reset_unpresented_frame(frame);
                 continue;
             }
-            if frame.seek_serial > last_seen_serial {
-                native_drain_unpresented_queue(&mut queue);
-                last_seen_serial = frame.seek_serial;
-                first_frame_event_last_epoch = None;
-                pending_first_frame_event = None;
-                last_present_source_pts = None;
+            if frame.seek_serial > source.last_seen_serial {
+                native_drain_unpresented_queue(&mut source.queue);
+                source.last_seen_serial = frame.seek_serial;
+                source.first_frame_event_last_epoch = None;
+                source.pending_first_frame_event = None;
+                source.last_present_source_pts = None;
             }
-            queue.push_back(frame);
+            source.queue.push_back(frame);
         }
 
-        let waiting_for_first_frame = first_frame_event_last_epoch != Some(last_seen_serial);
-        if !clock.is_playing() && !clock.is_seeking() && !waiting_for_first_frame {
-            last_present_wall = None;
-            last_present_source_pts = None;
+        let waiting_for_first_frame =
+            source.first_frame_event_last_epoch != Some(source.last_seen_serial);
+        if !source.clock.is_playing() && !source.clock.is_seeking() && !waiting_for_first_frame {
+            source.last_present_wall = None;
+            source.last_present_source_pts = None;
             std::thread::sleep(Duration::from_millis(8));
             continue;
         }
 
-        let now = clock.now_secs();
+        let now = source.clock.now_secs();
         let mut latest_renderable: Option<VideoFrame> = None;
-        while let Some(front) = queue.front() {
-            if front.seek_serial < clock.current_seek_serial() {
-                if let Some(frame) = queue.pop_front() {
+        while let Some(front) = source.queue.front() {
+            if front.seek_serial < source.clock.current_seek_serial() {
+                if let Some(frame) = source.queue.pop_front() {
                     native_reset_unpresented_frame(frame);
                 }
                 continue;
             }
             let force_first_frame =
-                waiting_for_first_frame && front.seek_serial == last_seen_serial;
-            let force_display_seek = clock.is_seeking()
-                && front.seek_serial == last_seen_serial
+                waiting_for_first_frame && front.seek_serial == source.last_seen_serial;
+            let force_display_seek = source.clock.is_seeking()
+                && front.seek_serial == source.last_seen_serial
                 && clock::pts_clears_seek_override(front.pts_secs, now);
             if force_first_frame
                 || force_display_seek
                 || front.pts_secs <= now + clock::DISPLAY_LEAD_TOLERANCE_SECS
             {
-                let candidate = queue.pop_front().expect("queue.front() returned Some");
+                let candidate = source
+                    .queue
+                    .pop_front()
+                    .expect("queue.front() returned Some");
                 if let Some(dropped) = latest_renderable.replace(candidate) {
                     let late_ms = ((now - dropped.pts_secs) * 1000.0).max(0.0);
-                    present_stats.record_late_drop(dropped.pts_secs, late_ms, queue.len());
+                    source.present_stats.record_late_drop(
+                        dropped.pts_secs,
+                        late_ms,
+                        source.queue.len(),
+                    );
                     native_reset_unpresented_frame(dropped);
                 }
                 continue;
@@ -1181,12 +1389,15 @@ fn run_native_video_output(
 
         if let Some(frame) = latest_renderable {
             let pts = frame.pts_secs;
-            if let Some(delay) =
-                native_source_pacing_delay(last_present_source_pts, last_present_wall, pts)
-            {
-                queue.push_front(frame);
-                source_pacing_sleep_count = source_pacing_sleep_count.saturating_add(1);
-                source_pacing_sleep_total_ms += delay.as_secs_f64() * 1000.0;
+            if let Some(delay) = native_source_pacing_delay(
+                source.last_present_source_pts,
+                source.last_present_wall,
+                pts,
+            ) {
+                source.queue.push_front(frame);
+                source.source_pacing_sleep_count =
+                    source.source_pacing_sleep_count.saturating_add(1);
+                source.source_pacing_sleep_total_ms += delay.as_secs_f64() * 1000.0;
                 std::thread::sleep(delay);
                 continue;
             }
@@ -1195,18 +1406,22 @@ fn run_native_video_output(
             match presenter.present(&frame, config.sync_interval) {
                 Ok(outcome) => {
                     let total_ms = present_t0.elapsed().as_secs_f64() * 1000.0;
-                    let late_ms = ((clock.now_secs() - pts) * 1000.0).max(0.0);
-                    let source_delta_ms = last_present_source_pts
+                    let late_ms = ((source.clock.now_secs() - pts) * 1000.0).max(0.0);
+                    let source_delta_ms = source
+                        .last_present_source_pts
                         .map(|last| (pts - last) * 1000.0)
                         .unwrap_or(0.0);
-                    let interval_ms = last_present_wall
+                    let interval_ms = source
+                        .last_present_wall
                         .map(|last| {
                             present_t0.saturating_duration_since(last).as_secs_f64() * 1000.0
                         })
                         .unwrap_or(0.0);
-                    last_present_wall = Some(present_t0);
-                    last_present_source_pts = Some(pts);
-                    present_stats.record_present(&outcome, late_ms, total_ms, interval_ms);
+                    source.last_present_wall = Some(present_t0);
+                    source.last_present_source_pts = Some(pts);
+                    source
+                        .present_stats
+                        .record_present(&outcome, late_ms, total_ms, interval_ms);
                     presenter.push_overlay_perf_sample(
                         crate::video::native_presenter::NativeOverlayPerfSample {
                             arrival: present_t0,
@@ -1218,11 +1433,11 @@ fn run_native_video_output(
                             late_ms: late_ms as f32,
                             source_delta_ms: source_delta_ms as f32,
                         },
-                        present_stats.overlay_snapshot(run_started.elapsed()),
+                        source.present_stats.overlay_snapshot(run_started.elapsed()),
                     );
                     if last_summary_log.elapsed() >= Duration::from_secs(1) {
-                        present_stats.emit_summary(run_started.elapsed());
-                        if source_pacing_sleep_count > 0 && crate::perf::is_enabled() {
+                        source.present_stats.emit_summary(run_started.elapsed());
+                        if source.source_pacing_sleep_count > 0 && crate::perf::is_enabled() {
                             crate::perf::event(
                                 "native_presenter",
                                 "source_pacing_summary",
@@ -1231,35 +1446,39 @@ fn run_native_video_output(
                                 &[
                                     (
                                         "count",
-                                        serde_json::Value::from(source_pacing_sleep_count as i64),
+                                        serde_json::Value::from(
+                                            source.source_pacing_sleep_count as i64,
+                                        ),
                                     ),
                                     (
                                         "total_ms",
-                                        serde_json::Value::from(source_pacing_sleep_total_ms),
+                                        serde_json::Value::from(
+                                            source.source_pacing_sleep_total_ms,
+                                        ),
                                     ),
                                 ],
                             );
                         }
-                        source_pacing_sleep_count = 0;
-                        source_pacing_sleep_total_ms = 0.0;
+                        source.source_pacing_sleep_count = 0;
+                        source.source_pacing_sleep_total_ms = 0.0;
                         last_summary_log = Instant::now();
                     }
-                    displayed_frame_seq.fetch_add(1, Ordering::Release);
+                    source.displayed_frame_seq.fetch_add(1, Ordering::Release);
                     first_presented_out.store(true, Ordering::Release);
-                    if first_frame_event_last_epoch != Some(serial) {
-                        if try_send_native_first_frame_ready(&engine_event_tx, serial, pts) {
-                            first_frame_event_last_epoch = Some(serial);
-                            pending_first_frame_event = None;
+                    if source.first_frame_event_last_epoch != Some(serial) {
+                        if try_send_native_first_frame_ready(&source.engine_event_tx, serial, pts) {
+                            source.first_frame_event_last_epoch = Some(serial);
+                            source.pending_first_frame_event = None;
                         } else {
-                            pending_first_frame_event = Some((serial, pts));
+                            source.pending_first_frame_event = Some((serial, pts));
                         }
                     }
-                    let now_for_clear = clock.now_secs();
+                    let now_for_clear = source.clock.now_secs();
                     if clock::pts_clears_seek_override(pts, now_for_clear)
-                        && !clock.is_audio_active()
+                        && !source.clock.is_audio_active()
                     {
-                        clock.set_fallback_anchor(pts);
-                        clock.clear_seek_target_override(serial);
+                        source.clock.set_fallback_anchor(pts);
+                        source.clock.clear_seek_target_override(serial);
                     }
                     if crate::perf::is_enabled() {
                         if trace_every_present
@@ -1274,7 +1493,10 @@ fn run_native_video_output(
                                 0,
                                 &[
                                     ("pts", serde_json::Value::from(pts)),
-                                    ("queue_len", serde_json::Value::from(queue.len() as i64)),
+                                    (
+                                        "queue_len",
+                                        serde_json::Value::from(source.queue.len() as i64),
+                                    ),
                                     ("path", serde_json::Value::from(outcome.path)),
                                     (
                                         "shared_handle",
@@ -1337,7 +1559,8 @@ fn run_native_video_output(
                 }
             }
         } else {
-            let wait_ms = queue
+            let wait_ms = source
+                .queue
                 .front()
                 .map(|front| ((front.pts_secs - now) * 500.0).clamp(1.0, 8.0) as u64)
                 .unwrap_or(1);
@@ -1345,8 +1568,8 @@ fn run_native_video_output(
         }
     }
 
-    native_drain_unpresented_queue(&mut queue);
-    present_stats.emit_summary(run_started.elapsed());
+    native_drain_unpresented_queue(&mut source.queue);
+    source.present_stats.emit_summary(run_started.elapsed());
     first_presented_out.store(false, Ordering::Release);
     hwnd_out.store(0, Ordering::Release);
     window.destroy();
@@ -1854,6 +2077,52 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn native_source_epoch(&self) -> Option<u64> {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::source_epoch)
+    }
+
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn take_native_output(&mut self) -> Option<NativeVideoOutput> {
+        self.native_output.take()
+    }
+
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn attach_native_output(&mut self, output: NativeVideoOutput) {
+        self.native_output = Some(output);
+    }
+
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn build_switch_source_payload(
+        &self,
+        source_epoch: u64,
+        show_preparing_overlay: bool,
+    ) -> SwitchSourcePayload {
+        SwitchSourcePayload {
+            video_rx: self.decode.video_rx.clone(),
+            clock: Arc::clone(&self.clock),
+            engine_event_tx: self.engine_event_tx.clone(),
+            displayed_frame_seq: Arc::clone(&self.displayed_frame_seq),
+            duration_secs_bits: Arc::clone(&self.duration_secs_bits),
+            source_epoch,
+            show_preparing_overlay,
+        }
+    }
+
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn switch_native_source(&self, payload: SwitchSourcePayload) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.switch_source(payload);
+        }
+    }
+
+    #[cfg(windows)]
     pub fn native_presenter_closed(&self) -> bool {
         self.native_output
             .as_ref()
@@ -1969,7 +2238,7 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
-    pub fn drain_native_presenter_events(&self) -> Vec<NativeVideoOutputEvent> {
+    pub fn drain_native_presenter_events(&self) -> Vec<(u64, NativeVideoOutputEvent)> {
         self.native_output
             .as_ref()
             .map(NativeVideoOutput::drain_events)
