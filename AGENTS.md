@@ -15,6 +15,9 @@ always-active guidance.
   virtual folders, presets, adjustments, AI features, or UI responsiveness,
   read the related document listed near the top of `CLAUDE.md` in the
   required-before-work section.
+- On Japanese Windows, PowerShell 5.1 may mojibake UTF-8 files without a BOM.
+  When reading repository documents through PowerShell, use
+  `Get-Content -Encoding UTF8` explicitly.
 - Check the current git status before editing. Do not revert or overwrite
   unrelated user changes.
 
