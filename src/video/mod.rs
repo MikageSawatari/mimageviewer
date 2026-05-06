@@ -1973,6 +1973,18 @@ impl VideoPlayer {
         }
     }
 
+    pub(crate) fn clear_audio_output_buffer(&self) {
+        if let Some(audio) = &self.audio {
+            audio.clear_buffer(&self.clock);
+        }
+    }
+
+    pub(crate) fn pause_audio_output(&self) {
+        if let Some(audio) = &self.audio {
+            audio.pause_stream();
+        }
+    }
+
     /// 絶対シーク (シークバークリック / ブックマーク等)。
     /// **[`SeekKind::Precise`]**: `..target` のキーフレーム + preroll trim で
     /// target ぴったりに着地。
@@ -2773,6 +2785,8 @@ impl VideoPlayer {
         }
         // AudioOutput を先に drop して cpal stream を止める。
         // Drop で pump も join される。
+        self.pause_audio_output();
+        self.clear_audio_output_buffer();
         self.audio.take();
     }
 }
@@ -2789,6 +2803,8 @@ impl Drop for VideoPlayer {
             }
             native_drain_unpresented_queue(&mut self.future_frames);
         }
+        self.pause_audio_output();
+        self.clear_audio_output_buffer();
         self.audio.take();
         // decoder thread は cancel フラグを見て終了
     }

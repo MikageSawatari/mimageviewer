@@ -58,6 +58,41 @@ fn send_demux_msg_cancel_aware<T>(tx: &Sender<T>, mut msg: T, cancel: &AtomicBoo
     }
 }
 
+enum DemuxPacketSend {
+    Sent,
+    Cancelled,
+    SeekPending,
+}
+
+// Packet sends are back-pressure points, but seek/flush is control traffic.
+// If a seek arrives while a packet queue is full, dropping the old packet and
+// returning to the demux loop lets the Flush marker reach decoders promptly.
+fn send_demux_packet_seek_aware<T>(
+    tx: &Sender<T>,
+    mut msg: T,
+    clock: &AvClock,
+    cancel: &AtomicBool,
+) -> DemuxPacketSend {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return DemuxPacketSend::Cancelled;
+        }
+        if clock.peek_seek_request_pending() {
+            return DemuxPacketSend::SeekPending;
+        }
+        match tx.send_timeout(
+            msg,
+            std::time::Duration::from_millis(DEMUX_PACKET_SEND_TIMEOUT_MS),
+        ) {
+            Ok(()) => return DemuxPacketSend::Sent,
+            Err(SendTimeoutError::Disconnected(_)) => return DemuxPacketSend::Cancelled,
+            Err(SendTimeoutError::Timeout(returned)) => {
+                msg = returned;
+            }
+        }
+    }
+}
+
 fn frame_best_effort_timestamp(raw: *const ffmpeg_the_third::ffi::AVFrame) -> Option<i64> {
     if raw.is_null() {
         return None;
@@ -1520,12 +1555,19 @@ fn run_decoder(
                             size_bytes,
                         } = queued;
                         let send_t0 = std::time::Instant::now();
-                        if !send_demux_msg_cancel_aware(
+                        match send_demux_packet_seek_aware(
                             &video_pkt_tx,
                             VideoWorkerMsg::Packet { serial, packet },
+                            &clock,
                             &cancel,
                         ) {
-                            break 'outer;
+                            DemuxPacketSend::Sent => {}
+                            DemuxPacketSend::Cancelled => break 'outer,
+                            DemuxPacketSend::SeekPending => {
+                                pending_video_packet_bytes =
+                                    pending_video_packet_bytes.saturating_sub(size_bytes);
+                                continue 'outer;
+                            }
                         }
                         pending_video_packet_bytes =
                             pending_video_packet_bytes.saturating_sub(size_bytes);
@@ -1571,16 +1613,19 @@ fn run_decoder(
                     }
                 }
                 let send_t0 = std::time::Instant::now();
-                if !send_demux_msg_cancel_aware(
+                match send_demux_packet_seek_aware(
                     &video_pkt_tx,
                     VideoWorkerMsg::Packet {
                         serial: seek_serial,
                         packet,
                     },
+                    &clock,
                     &cancel,
                 ) {
+                    DemuxPacketSend::Sent => {}
                     // video decode thread が既に終了している → 自分も exit。
-                    break 'outer;
+                    DemuxPacketSend::Cancelled => break 'outer,
+                    DemuxPacketSend::SeekPending => continue 'outer,
                 }
                 let wait_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
                 if wait_ms >= DEMUX_PACKET_SEND_WAIT_WARN_MS {
@@ -1613,17 +1658,20 @@ fn run_decoder(
                     let seek_serial = clock.current_seek_serial();
                     let queue_len_before = audio_pkt_tx.len();
                     let send_t0 = std::time::Instant::now();
-                    if !send_demux_msg_cancel_aware(
+                    match send_demux_packet_seek_aware(
                         &audio_pkt_tx,
                         AudioWorkerMsg::Packet {
                             serial: seek_serial,
                             packet,
                         },
+                        &clock,
                         &cancel,
                     ) {
+                        DemuxPacketSend::Sent => {}
                         // audio decode thread が既に終了している (= disconnect)。
                         // VideoPlayer の shutdown 経路 → 自分も exit。
-                        break 'outer;
+                        DemuxPacketSend::Cancelled => break 'outer,
+                        DemuxPacketSend::SeekPending => continue 'outer,
                     }
                     let wait_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
                     if wait_ms >= DEMUX_PACKET_SEND_WAIT_WARN_MS {

@@ -167,7 +167,10 @@ preparing overlay を出し、新動画の `player.info()` 到着後に新しい
 
 この fast path では保存済み resume 位置を新 `VideoPlayer` に渡すが、autoplay は false
 に固定する。タイル解除後は resume 位置の静止状態を表示し、特定位置から見たい場合は
-タイルクリックによる seek を使う。
+タイルクリックによる seek を使う。タイルクリックは autoplay 設定に関係なく、その位置へ
+seek して再生開始する。切替元の `VideoPlayer` は cpal stream を同期 pause し、audio
+buffer を明示クリアしてから native presenter を渡し、前動画の処理済み音声が短く漏れる
+のを抑える。
 
 **リサイズ実装 (`src/fast_resize.rs`)**:
 

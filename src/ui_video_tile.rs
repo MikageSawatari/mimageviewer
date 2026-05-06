@@ -411,9 +411,10 @@ impl App {
         }
 
         if let Some(pts) = clicked_pts {
-            // クリック → seek + close
+            // クリック → seek + 再生開始 + close
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.seek(pts);
+                player.set_playing(true);
             }
             self.video_tile_state = None;
             self.video_tile_swap_pending = None;

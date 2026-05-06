@@ -30,6 +30,9 @@ use super::engine::actor::state_code;
 pub struct AudioOutput {
     /// cpal Stream は !Send。Option にして drop 時に明示的に落とす。
     stream: Option<cpal::Stream>,
+    /// pump / cpal callback が共有する audio buffer。fast video switch では旧ソースの
+    /// processed/raw 音声を先に捨て、ハードウェアへ流れる残りを最小化する。
+    buffer: Arc<Mutex<AudioBuffer>>,
     /// pump thread の停止フラグ。
     cancel: Arc<AtomicBool>,
     /// pump スレッド起床用 (recv_timeout より速く抜けるため)。
@@ -37,6 +40,68 @@ pub struct AudioOutput {
     /// pump スレッドハンドル。drop で join する。
     pump: Option<std::thread::JoinHandle<()>>,
     pub sample_rate: u32,
+}
+
+impl AudioOutput {
+    pub fn pause_stream(&self) {
+        if let Some(stream) = self.stream.as_ref() {
+            let _ = stream.pause();
+        }
+    }
+
+    pub fn clear_buffer(&self, clock: &AvClock) {
+        if let Ok(mut buf) = self.buffer.lock() {
+            buf.processed.clear();
+            buf.raw_pending.clear();
+            buf.drain_offset_in_first = 0;
+            buf.next_pts_secs = clock.now_secs();
+            publish_buffer_secs(&buf, clock);
+        }
+        clock.zero_audio_tx_queued_secs();
+    }
+}
+
+pub fn warm_up_default_output_device() {
+    let _ = std::thread::Builder::new()
+        .name("cpal-warmup".into())
+        .spawn(|| {
+            let started = std::time::Instant::now();
+            let host = cpal::default_host();
+            let Some(device) = host.default_output_device() else {
+                crate::logger::log("[startup] cpal warm-up skipped: no output device".to_string());
+                return;
+            };
+            let Ok(supported) = device.default_output_config() else {
+                crate::logger::log(
+                    "[startup] cpal warm-up skipped: default output config unavailable".to_string(),
+                );
+                return;
+            };
+            let config = supported.config();
+            let Ok(stream) = device.build_output_stream(
+                &config,
+                |out: &mut [f32], _: &cpal::OutputCallbackInfo| out.fill(0.0),
+                |err| crate::logger::log(format!("cpal warm-up stream error: {err}")),
+                None,
+            ) else {
+                crate::logger::log(
+                    "[startup] cpal warm-up skipped: stream build failed".to_string(),
+                );
+                return;
+            };
+            if let Err(err) = stream.play() {
+                crate::logger::log(format!(
+                    "[startup] cpal warm-up skipped: stream.play: {err}"
+                ));
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let _ = stream.pause();
+            crate::logger::log(format!(
+                "[startup] cpal warm-up done ms={:.1}",
+                started.elapsed().as_secs_f64() * 1000.0
+            ));
+        });
 }
 
 impl Drop for AudioOutput {
@@ -349,6 +414,7 @@ pub fn start(
 
     Ok(AudioOutput {
         stream: Some(stream),
+        buffer,
         cancel,
         shutdown_tx,
         pump: Some(pump_handle),

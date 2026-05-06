@@ -453,6 +453,11 @@ fn main() -> eframe::Result {
         || perf_log_path.is_some();
     perf::init_with_path(perf_enabled, Some(prog_start), perf_log_path);
 
+    // WASAPI can take over a second to create the first output stream on a cold
+    // boot. Warm it in the background so the first video open does not freeze
+    // the UI long enough for queued fullscreen-close inputs/focus checks to win.
+    video::audio::warm_up_default_output_device();
+
     if let Some(config) = &play_test_config {
         if !config.path.is_file() {
             eprintln!("--play-test path is not a file: {}", config.path.display());

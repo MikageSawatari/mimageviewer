@@ -1331,6 +1331,20 @@ can break out within a few milliseconds even when `audio_pkt_tx` or
 `video_pkt_tx` is full. This prevents old packet queues from continuing to
 block the demux thread after the native presenter has already stopped.
 
+2026-05-06 follow-up: the same packet send wait is now seek-preemptive. If a
+seek request arrives while demux is blocked on a full packet channel, demux
+drops that old packet and returns to the loop so `take_seek_request()` can send
+the ordered `Flush` marker immediately. This avoids the intermittent black
+screen case where a resume/tile-click seek waited behind a full audio packet
+queue and the engine remained stuck after presenting only the first frame.
+
+2026-05-06 startup follow-up: cold WASAPI stream creation can stall the UI
+thread during the first grid-open video. mIV now starts a background
+`cpal-warmup` thread at process startup, and the fullscreen focus guard treats a
+native presenter with `native_presenter_pending()` as active even before its
+HWND is visible. This keeps the focus guard from closing a video while the
+presenter is still creating its first frame after a cold open.
+
 2026-05-05 follow-up: 240fps material exposed that the compressed-video
 overflow queue still used a blocking drain before reading later packets. When
 `video_pkt_tx` stayed full, demux waited on video and starved audio packets,

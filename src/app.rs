@@ -13223,7 +13223,14 @@ impl App {
 
     #[cfg(windows)]
     fn native_video_presenter_hwnd_for_focus_guard(&self) -> bool {
-        self.native_video_presenter_hwnd().is_some()
+        self.fullscreen_idx
+            .and_then(|idx| self.fs_cache.get(&idx))
+            .is_some_and(|entry| match entry {
+                FsCacheEntry::Video { player, .. } => {
+                    player.native_presenter_hwnd() != 0 || player.native_presenter_pending()
+                }
+                _ => false,
+            })
     }
 
     #[cfg(windows)]
@@ -14643,7 +14650,9 @@ impl App {
         self.save_all_video_resume_positions();
         let native_output = match self.fs_cache.get_mut(&from_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
+                player.pause_audio_output();
                 player.set_playing(false);
+                player.clear_audio_output_buffer();
                 player.take_native_output()
             }
             _ => None,
