@@ -246,6 +246,63 @@ fn fullscreen_shortcut_event_summary(ctx: &egui::Context) -> Option<String> {
     }
 }
 
+#[cfg(windows)]
+fn native_video_vk_from_egui_key(key: egui::Key) -> Option<u32> {
+    Some(match key {
+        egui::Key::Enter => 0x0D,
+        egui::Key::Escape => 0x1B,
+        egui::Key::Space => 0x20,
+        egui::Key::End => 0x23,
+        egui::Key::Home => 0x24,
+        egui::Key::ArrowLeft => 0x25,
+        egui::Key::ArrowUp => 0x26,
+        egui::Key::ArrowRight => 0x27,
+        egui::Key::ArrowDown => 0x28,
+        egui::Key::B => 0x42,
+        egui::Key::J => 0x4A,
+        egui::Key::K => 0x4B,
+        egui::Key::L => 0x4C,
+        egui::Key::M => 0x4D,
+        egui::Key::P => 0x50,
+        egui::Key::S => 0x53,
+        egui::Key::W => 0x57,
+        _ => return None,
+    })
+}
+
+#[cfg(windows)]
+fn native_video_key_events_from_ctx(
+    ctx: &egui::Context,
+) -> Vec<crate::video::native_window::NativeVideoKeyEvent> {
+    ctx.input(|i| {
+        i.events
+            .iter()
+            .filter_map(|event| {
+                if let egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat,
+                    modifiers,
+                    ..
+                } = event
+                {
+                    native_video_vk_from_egui_key(*key).map(|virtual_key| {
+                        crate::video::native_window::NativeVideoKeyEvent {
+                            virtual_key,
+                            shift: modifiers.shift,
+                            ctrl: modifiers.ctrl,
+                            alt: modifiers.alt,
+                            repeat: *repeat,
+                        }
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    })
+}
+
 /// 補正ショートカット (U/P/N) のスコープ。どの層を書き換えるかを表す。
 /// 解決 (`App::resolve_adjust_scope`) と書き込み (`App::write_params_for_scope`) は
 /// App 側にメソッドとして実装され、ここには enum 定義とラベルだけ置く。
@@ -988,17 +1045,17 @@ impl App {
         // ── 状態の事前計算 ──
         #[cfg(windows)]
         if self.native_video_backdrop_target_for_fs(fs_idx) {
-            self.show_native_video_black_backdrop(ctx);
+            self.show_native_video_black_backdrop(ctx, fs_idx);
             return;
         }
         #[cfg(windows)]
         if self.native_video_presenter_pending_for_fs(fs_idx) {
-            self.show_native_video_black_backdrop(ctx);
+            self.show_native_video_black_backdrop(ctx, fs_idx);
             return;
         }
         #[cfg(windows)]
         if self.native_video_presenter_hwnd_for_fs(fs_idx).is_some() {
-            self.show_native_video_black_backdrop(ctx);
+            self.show_native_video_black_backdrop(ctx, fs_idx);
             return;
         }
 
@@ -1923,7 +1980,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn show_native_video_black_backdrop(&mut self, ctx: &egui::Context) {
+    fn show_native_video_black_backdrop(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let fs_id = self.fullscreen_viewport_id();
         let fs_builder = self.build_fullscreen_viewport_builder_with_transparency(false);
         let need_show = !self.fs_viewport_shown;
@@ -1936,9 +1993,24 @@ impl App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
-            if ctx.input(|i| i.viewport().close_requested())
-                || ctx.input(|i| i.key_pressed(egui::Key::Escape))
-            {
+            if let Some(keys) = fullscreen_shortcut_event_summary(ctx) {
+                let focused = ctx.input(|i| i.viewport().focused).unwrap_or(true);
+                crate::logger::log(format!(
+                    "[fs-key] source=native-backdrop focused={} foreground=0x{:x} keys={}",
+                    focused,
+                    current_foreground_hwnd(),
+                    keys
+                ));
+            }
+            if !self.ime_input_active() {
+                for key in native_video_key_events_from_ctx(ctx) {
+                    self.handle_native_video_key_event(ctx, fs_idx, key);
+                }
+            }
+            let close_requested = ctx.input(|i| i.viewport().close_requested());
+            let escape_pressed = !self.ime_input_active()
+                && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            if close_requested || escape_pressed {
                 close_fs = true;
             }
             egui::CentralPanel::default()

@@ -14255,7 +14255,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn handle_native_video_key_event(
+    pub(crate) fn handle_native_video_key_event(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
