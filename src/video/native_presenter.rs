@@ -1826,6 +1826,8 @@ impl NativeEguiOverlay {
                     NativeVideoMouseButton::Left => egui::PointerButton::Primary,
                     NativeVideoMouseButton::Right => egui::PointerButton::Secondary,
                     NativeVideoMouseButton::Middle => egui::PointerButton::Middle,
+                    NativeVideoMouseButton::Extra1 => egui::PointerButton::Extra1,
+                    NativeVideoMouseButton::Extra2 => egui::PointerButton::Extra2,
                 };
                 self.pending_events.push(egui::Event::PointerButton {
                     pos,

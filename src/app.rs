@@ -7694,6 +7694,8 @@ impl App {
             space,
             key_r,
             key_l,
+            mouse_back,
+            mouse_forward,
         ) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::ArrowRight),
@@ -7711,12 +7713,15 @@ impl App {
                 i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::R),
                 i.key_pressed(egui::Key::L),
+                i.pointer.button_pressed(egui::PointerButton::Extra1),
+                i.pointer.button_pressed(egui::PointerButton::Extra2),
             )
         });
 
-        // Ctrl+矢印: modifiers.ctrl に加え ctrl_held (key_down) でも判定
-        let ctrl_up = ctrl_held && up;
-        let ctrl_down = ctrl_held && down;
+        // Ctrl+矢印: modifiers.ctrl に加え ctrl_held (key_down) でも判定。
+        // マウス戻る/進む (Extra1/Extra2) も Ctrl+↑/↓ と等価に扱う。
+        let ctrl_up = (ctrl_held && up) || mouse_back;
+        let ctrl_down = (ctrl_held && down) || mouse_forward;
 
         // Ctrl+G の DrilledInto で drill-back する手段は BS (↓で始まる通常ハンドラ)
         // と検索バーの ← ボタンに限定する。

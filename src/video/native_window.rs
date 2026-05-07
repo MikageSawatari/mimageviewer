@@ -16,9 +16,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
     WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WNDCLASSW,
-    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP,
-    WS_VISIBLE,
+    WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDBLCLK,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -46,6 +46,8 @@ pub enum NativeVideoMouseButton {
     Left,
     Right,
     Middle,
+    Extra1,
+    Extra2,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -379,7 +381,8 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
-        | WM_MBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK | WM_MBUTTONDBLCLK => {
+        | WM_MBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK | WM_MBUTTONDBLCLK
+        | WM_XBUTTONDOWN | WM_XBUTTONUP | WM_XBUTTONDBLCLK => {
             if mouse_message_is_down(msg) {
                 unsafe {
                     let _ = SetCapture(hwnd);
@@ -477,12 +480,22 @@ fn native_mouse_button_event(
     let button = match msg {
         WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK => NativeVideoMouseButton::Right,
         WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK => NativeVideoMouseButton::Middle,
+        WM_XBUTTONDOWN | WM_XBUTTONUP | WM_XBUTTONDBLCLK => {
+            // HIWORD(wparam): XBUTTON1=1 (back), XBUTTON2=2 (forward)
+            match ((wparam.0 >> 16) & 0xFFFF) as u16 {
+                2 => NativeVideoMouseButton::Extra2,
+                _ => NativeVideoMouseButton::Extra1,
+            }
+        }
         _ => NativeVideoMouseButton::Left,
     };
     NativeVideoMouseButtonEvent {
         button,
         down: mouse_message_is_down(msg),
-        double_click: matches!(msg, WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK | WM_MBUTTONDBLCLK),
+        double_click: matches!(
+            msg,
+            WM_LBUTTONDBLCLK | WM_RBUTTONDBLCLK | WM_MBUTTONDBLCLK | WM_XBUTTONDBLCLK
+        ),
         x: signed_low_word(lparam.0),
         y: signed_high_word(lparam.0),
         shift: mouse_shift(wparam),
@@ -517,9 +530,11 @@ fn mouse_message_is_down(msg: u32) -> bool {
         WM_LBUTTONDOWN
             | WM_RBUTTONDOWN
             | WM_MBUTTONDOWN
+            | WM_XBUTTONDOWN
             | WM_LBUTTONDBLCLK
             | WM_RBUTTONDBLCLK
             | WM_MBUTTONDBLCLK
+            | WM_XBUTTONDBLCLK
     )
 }
 
