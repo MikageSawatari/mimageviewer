@@ -149,6 +149,7 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
         Arc::clone(&cancel),
         48_000,
         !config.force_sw,
+        crate::settings::VideoDeinterlaceMode::Auto,
         gpu.clone(),
         engine_state,
         engine_event_tx,

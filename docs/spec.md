@@ -318,6 +318,7 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 |--------|-----|---------|------|
 | `parallelism` | Parallelism | Auto | 並列読み込みスレッド数 |
 | `folder_skip_limit` | usize | 5 | Ctrl+↑↓ で空フォルダ・画像なし ZIP をスキップする上限（UI 上限 30） |
+| `video_deinterlace` | VideoDeinterlaceMode | Auto | 動画再生時のデインターレース（Off / Auto / On）。Auto/On は FFmpeg bwdif を表示前に適用 |
 | `folder_thumb_depth` | u32 | 3 | フォルダ代表画像の探索最大階層数（0 で直接の子のみ） |
 | `sidecar_backup_enabled` | bool | true | フォルダ直下に `mimageviewer.dat` (Hidden+System 属性の JSON) を作り、補正・消しゴムマスクの設定をバックアップする。フォルダ丸ごと別ドライブへ移動しても設定が保持される。OFF 時は読み書き両方スキップ |
 | `show_toolbar_favorites` | bool | true | ツールバーにお気に入りを表示 |

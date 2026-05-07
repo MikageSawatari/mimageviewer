@@ -838,6 +838,10 @@ pub struct Settings {
     /// 有効化することを想定。
     #[serde(default)]
     pub video_hw_decode: bool,
+    /// インターレース動画のデインターレース処理。
+    /// Auto は FFmpeg frame の interlaced flag が立ったフレームのみ bwdif を適用する。
+    #[serde(default)]
+    pub video_deinterlace: VideoDeinterlaceMode,
     /// 動画グリッドサムネに、同名ファイル名の画像 (= sidecar、例 movie.mp4 の隣の
     /// movie.jpg) があれば優先採用するか。Phase 5.3 で導入。
     /// 既存ユーザー (= 過去の動作と整合) のため既定 true。OFF にすると Windows Shell
@@ -965,6 +969,40 @@ impl VideoAutoplayMode {
     }
     pub fn all() -> &'static [Self] {
         &[Self::Off, Self::Always]
+    }
+}
+
+/// 動画再生時のデインターレース設定。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VideoDeinterlaceMode {
+    /// デコードフレームが interlaced と示しているときだけ bwdif を適用する。
+    #[default]
+    Auto,
+    /// 常に bwdif を適用する。メタデータが壊れている素材向け。
+    On,
+    /// デインターレースしない。
+    Off,
+}
+
+impl VideoDeinterlaceMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "自動",
+            Self::On => "常に有効",
+            Self::Off => "無効",
+        }
+    }
+
+    pub fn all() -> &'static [Self] {
+        &[Self::Auto, Self::On, Self::Off]
+    }
+
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn force_all_frames(self) -> bool {
+        matches!(self, Self::On)
     }
 }
 
@@ -1188,6 +1226,7 @@ impl Default for Settings {
             video_start_muted: false,
             video_resume_positions: std::collections::HashMap::new(),
             video_hw_decode: false,
+            video_deinterlace: VideoDeinterlaceMode::default(),
             video_thumb_use_sidecar_image: true,
             video_tile_columns: default_video_tile_columns(),
             vst3_enabled: false,
@@ -1486,6 +1525,7 @@ mod tests {
         assert_eq!(loaded.grid_cols, 4);
         assert_eq!(loaded.thumb_px, 512);
         assert_eq!(loaded.thumb_quality, 75);
+        assert_eq!(loaded.video_deinterlace, VideoDeinterlaceMode::Auto);
         assert!(loaded.favorites.is_empty());
     }
 

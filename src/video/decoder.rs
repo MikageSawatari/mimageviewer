@@ -38,9 +38,38 @@ fn sleep_video_pacing() {
     std::thread::sleep(std::time::Duration::from_millis(VIDEO_PACING_SLEEP_MS));
 }
 
+const EAGAIN_ERRNO: i32 = 11;
+
+fn engine_state_code_name(code: u8) -> &'static str {
+    match code {
+        crate::video::engine::actor::state_code::IDLE => "Idle",
+        crate::video::engine::actor::state_code::LOADING => "Loading",
+        crate::video::engine::actor::state_code::BUFFERING => "Buffering",
+        crate::video::engine::actor::state_code::PLAYING => "Playing",
+        crate::video::engine::actor::state_code::PAUSED => "Paused",
+        crate::video::engine::actor::state_code::SEEKING => "Seeking",
+        crate::video::engine::actor::state_code::EOF => "Eof",
+        _ => "Unknown",
+    }
+}
+
+fn engine_state_parks_decode(code: u8) -> bool {
+    code == crate::video::engine::actor::state_code::PAUSED
+        || code == crate::video::engine::actor::state_code::EOF
+}
+
 // Preserve bounded-channel back-pressure during normal playback while still
 // letting fullscreen close/cancel cut through a full demux packet queue quickly.
-fn send_demux_msg_cancel_aware<T>(tx: &Sender<T>, mut msg: T, cancel: &AtomicBool) -> bool {
+fn send_demux_msg_cancel_aware<T>(
+    tx: &Sender<T>,
+    mut msg: T,
+    cancel: &AtomicBool,
+    stream: &'static str,
+    msg_kind: &'static str,
+    queue_cap: usize,
+) -> bool {
+    let wait_started = std::time::Instant::now();
+    let mut last_wait_log = wait_started;
     loop {
         if cancel.load(Ordering::Acquire) {
             return false;
@@ -53,6 +82,39 @@ fn send_demux_msg_cancel_aware<T>(tx: &Sender<T>, mut msg: T, cancel: &AtomicBoo
             Err(SendTimeoutError::Disconnected(_)) => return false,
             Err(SendTimeoutError::Timeout(returned)) => {
                 msg = returned;
+                let now = std::time::Instant::now();
+                let waited = now.duration_since(wait_started);
+                if waited >= std::time::Duration::from_millis(250)
+                    && now.duration_since(last_wait_log) >= std::time::Duration::from_millis(250)
+                {
+                    last_wait_log = now;
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "demux",
+                            "control_send_waiting",
+                            None,
+                            0,
+                            &[
+                                ("stream", serde_json::Value::from(stream)),
+                                ("message", serde_json::Value::from(msg_kind)),
+                                (
+                                    "wait_ms",
+                                    serde_json::Value::from(waited.as_secs_f64() * 1000.0),
+                                ),
+                                ("queue_len", serde_json::Value::from(tx.len() as i64)),
+                                ("queue_cap", serde_json::Value::from(queue_cap as i64)),
+                            ],
+                        );
+                    }
+                    if waited >= std::time::Duration::from_secs(1) {
+                        crate::logger::log(format!(
+                            "[demux] {stream} {msg_kind} send still waiting {:.1}ms queue_len={}/{}",
+                            waited.as_secs_f64() * 1000.0,
+                            tx.len(),
+                            queue_cap
+                        ));
+                    }
+                }
             }
         }
     }
@@ -72,7 +134,11 @@ fn send_demux_packet_seek_aware<T>(
     mut msg: T,
     clock: &AvClock,
     cancel: &AtomicBool,
+    stream: &'static str,
+    queue_cap: usize,
 ) -> DemuxPacketSend {
+    let wait_started = std::time::Instant::now();
+    let mut last_wait_log = wait_started;
     loop {
         if cancel.load(Ordering::Acquire) {
             return DemuxPacketSend::Cancelled;
@@ -88,6 +154,174 @@ fn send_demux_packet_seek_aware<T>(
             Err(SendTimeoutError::Disconnected(_)) => return DemuxPacketSend::Cancelled,
             Err(SendTimeoutError::Timeout(returned)) => {
                 msg = returned;
+                let now = std::time::Instant::now();
+                let waited = now.duration_since(wait_started);
+                if waited >= std::time::Duration::from_millis(250)
+                    && now.duration_since(last_wait_log) >= std::time::Duration::from_millis(250)
+                {
+                    last_wait_log = now;
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "demux",
+                            "packet_send_waiting",
+                            None,
+                            0,
+                            &[
+                                ("stream", serde_json::Value::from(stream)),
+                                (
+                                    "wait_ms",
+                                    serde_json::Value::from(waited.as_secs_f64() * 1000.0),
+                                ),
+                                ("queue_len", serde_json::Value::from(tx.len() as i64)),
+                                ("queue_cap", serde_json::Value::from(queue_cap as i64)),
+                                (
+                                    "seek_serial",
+                                    serde_json::Value::from(clock.current_seek_serial() as i64),
+                                ),
+                            ],
+                        );
+                    }
+                    if waited >= std::time::Duration::from_secs(1) {
+                        crate::logger::log(format!(
+                            "[demux] {stream} packet send still waiting {:.1}ms queue_len={}/{} seek_serial={}",
+                            waited.as_secs_f64() * 1000.0,
+                            tx.len(),
+                            queue_cap,
+                            clock.current_seek_serial()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Audio packet back-pressure must not strand already-demuxed video packets.
+// During precise seek preroll the demux thread may have enough video packets in
+// pending_video_packets to reach the target, while the next audio packet send is
+// blocked by the frozen Buffering audio pipeline. Drain the video overflow on
+// each audio send timeout so FirstFrameReady can still be produced.
+fn send_audio_packet_with_video_drain(
+    audio_pkt_tx: &Sender<AudioWorkerMsg>,
+    mut msg: AudioWorkerMsg,
+    clock: &AvClock,
+    cancel: &AtomicBool,
+    pending_video_packets: &mut VecDeque<QueuedVideoPacket>,
+    pending_video_packet_bytes: &mut usize,
+    video_pkt_tx: &Sender<VideoWorkerMsg>,
+) -> DemuxPacketSend {
+    let wait_started = std::time::Instant::now();
+    let mut last_wait_log = wait_started;
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return DemuxPacketSend::Cancelled;
+        }
+        if clock.peek_seek_request_pending() {
+            return DemuxPacketSend::SeekPending;
+        }
+        match audio_pkt_tx.send_timeout(
+            msg,
+            std::time::Duration::from_millis(DEMUX_PACKET_SEND_TIMEOUT_MS),
+        ) {
+            Ok(()) => return DemuxPacketSend::Sent,
+            Err(SendTimeoutError::Disconnected(_)) => return DemuxPacketSend::Cancelled,
+            Err(SendTimeoutError::Timeout(returned)) => {
+                msg = returned;
+                if !pending_video_packets.is_empty() {
+                    let before_packets = pending_video_packets.len();
+                    let before_bytes = *pending_video_packet_bytes;
+                    if !drain_pending_video_packets(
+                        pending_video_packets,
+                        pending_video_packet_bytes,
+                        video_pkt_tx,
+                        clock,
+                        cancel,
+                    ) {
+                        return DemuxPacketSend::Cancelled;
+                    }
+                    let after_packets = pending_video_packets.len();
+                    if after_packets < before_packets && crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "demux",
+                            "audio_wait_video_drain",
+                            None,
+                            0,
+                            &[
+                                (
+                                    "drained_packets",
+                                    serde_json::Value::from(
+                                        (before_packets - after_packets) as i64,
+                                    ),
+                                ),
+                                (
+                                    "before_packets",
+                                    serde_json::Value::from(before_packets as i64),
+                                ),
+                                (
+                                    "after_packets",
+                                    serde_json::Value::from(after_packets as i64),
+                                ),
+                                ("before_bytes", serde_json::Value::from(before_bytes as i64)),
+                                (
+                                    "after_bytes",
+                                    serde_json::Value::from(*pending_video_packet_bytes as i64),
+                                ),
+                                (
+                                    "video_pkt_tx_len",
+                                    serde_json::Value::from(video_pkt_tx.len() as i64),
+                                ),
+                                (
+                                    "seek_serial",
+                                    serde_json::Value::from(clock.current_seek_serial() as i64),
+                                ),
+                            ],
+                        );
+                    }
+                }
+
+                let now = std::time::Instant::now();
+                let waited = now.duration_since(wait_started);
+                if waited >= std::time::Duration::from_millis(250)
+                    && now.duration_since(last_wait_log) >= std::time::Duration::from_millis(250)
+                {
+                    last_wait_log = now;
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "demux",
+                            "packet_send_waiting",
+                            None,
+                            0,
+                            &[
+                                ("stream", serde_json::Value::from("audio")),
+                                (
+                                    "wait_ms",
+                                    serde_json::Value::from(waited.as_secs_f64() * 1000.0),
+                                ),
+                                (
+                                    "queue_len",
+                                    serde_json::Value::from(audio_pkt_tx.len() as i64),
+                                ),
+                                (
+                                    "queue_cap",
+                                    serde_json::Value::from(AUDIO_PACKET_QUEUE_CAP as i64),
+                                ),
+                                (
+                                    "seek_serial",
+                                    serde_json::Value::from(clock.current_seek_serial() as i64),
+                                ),
+                            ],
+                        );
+                    }
+                    if waited >= std::time::Duration::from_secs(1) {
+                        crate::logger::log(format!(
+                            "[demux] audio packet send still waiting {:.1}ms queue_len={}/{} seek_serial={}",
+                            waited.as_secs_f64() * 1000.0,
+                            audio_pkt_tx.len(),
+                            AUDIO_PACKET_QUEUE_CAP,
+                            clock.current_seek_serial()
+                        ));
+                    }
+                }
             }
         }
     }
@@ -387,6 +621,132 @@ fn emit_demux_queue_state(
     }
 }
 
+struct BwdifFilter {
+    graph: ffmpeg_the_third::filter::Graph,
+    key: BwdifFilterKey,
+    force_all_frames: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BwdifFilterKey {
+    pix_fmt: ffmpeg_the_third::format::Pixel,
+    width: u32,
+    height: u32,
+    sar_num: i32,
+    sar_den: i32,
+    time_base_num: i32,
+    time_base_den: i32,
+}
+
+impl BwdifFilter {
+    fn new(key: BwdifFilterKey, force_all_frames: bool) -> Result<Self, String> {
+        use ffmpeg_the_third as ffmpeg;
+
+        let buffer = ffmpeg::filter::find("buffer").ok_or("FFmpeg filter 'buffer' not found")?;
+        let buffersink =
+            ffmpeg::filter::find("buffersink").ok_or("FFmpeg filter 'buffersink' not found")?;
+        let pix_fmt = Into::<ffmpeg::ffi::AVPixelFormat>::into(key.pix_fmt) as i32;
+        let args = format!(
+            "video_size={}x{}:pix_fmt={}:time_base={}/{}:pixel_aspect={}/{}",
+            key.width,
+            key.height,
+            pix_fmt,
+            key.time_base_num.max(1),
+            key.time_base_den.max(1),
+            key.sar_num.max(1),
+            key.sar_den.max(1)
+        );
+
+        let mut graph = ffmpeg::filter::Graph::new();
+        graph
+            .add(&buffer, "in", &args)
+            .map_err(|e| format!("bwdif buffer init: {e}"))?;
+        {
+            let mut sink = graph
+                .add(&buffersink, "out", "")
+                .map_err(|e| format!("bwdif buffersink init: {e}"))?;
+            sink.set_pixel_format(key.pix_fmt);
+        }
+
+        let deint = if force_all_frames {
+            "bwdif=mode=send_frame:parity=auto:deint=all"
+        } else {
+            "bwdif=mode=send_frame:parity=auto:deint=interlaced"
+        };
+        graph
+            .output("in", 0)
+            .and_then(|p| p.input("out", 0))
+            .and_then(|p| p.parse(deint))
+            .map_err(|e| format!("bwdif graph parse: {e}"))?;
+        graph
+            .validate()
+            .map_err(|e| format!("bwdif graph validate: {e}"))?;
+
+        Ok(Self {
+            graph,
+            key,
+            force_all_frames,
+        })
+    }
+
+    fn matches(&self, key: BwdifFilterKey, force_all_frames: bool) -> bool {
+        self.key == key && self.force_all_frames == force_all_frames
+    }
+
+    fn filter_one(
+        &mut self,
+        frame: &ffmpeg_the_third::util::frame::video::Video,
+    ) -> Result<Option<ffmpeg_the_third::util::frame::video::Video>, String> {
+        use ffmpeg_the_third as ffmpeg;
+
+        let input = frame.clone();
+        {
+            let mut src_ctx = self
+                .graph
+                .get("in")
+                .ok_or_else(|| "bwdif source context missing".to_string())?;
+            src_ctx
+                .source()
+                .add(&input)
+                .map_err(|e| format!("bwdif source add: {e}"))?;
+        }
+        drop(input);
+
+        let mut output = ffmpeg::util::frame::video::Video::empty();
+        {
+            let mut sink_ctx = self
+                .graph
+                .get("out")
+                .ok_or_else(|| "bwdif sink context missing".to_string())?;
+            match sink_ctx.sink().frame(&mut output) {
+                Ok(()) => Ok(Some(output)),
+                Err(ffmpeg::Error::Other { errno }) if errno == EAGAIN_ERRNO => Ok(None),
+                Err(ffmpeg::Error::Eof) => Ok(None),
+                Err(e) => Err(format!("bwdif sink frame: {e}")),
+            }
+        }
+    }
+}
+
+fn bwdif_filter_key(
+    frame: &ffmpeg_the_third::util::frame::video::Video,
+    time_base_num: i32,
+    time_base_den: i32,
+) -> BwdifFilterKey {
+    let sar = frame.aspect_ratio();
+    let sar_num = sar.numerator();
+    let sar_den = sar.denominator();
+    BwdifFilterKey {
+        pix_fmt: frame.format(),
+        width: frame.width(),
+        height: frame.height(),
+        sar_num: if sar_num > 0 { sar_num } else { 1 },
+        sar_den: if sar_den > 0 { sar_den } else { 1 },
+        time_base_num: time_base_num.max(1),
+        time_base_den: time_base_den.max(1),
+    }
+}
+
 fn drain_pending_video_packets(
     pending_video_packets: &mut VecDeque<QueuedVideoPacket>,
     pending_video_packet_bytes: &mut usize,
@@ -646,6 +1006,7 @@ pub fn spawn(
     cancel: Arc<AtomicBool>,
     target_audio_sample_rate: u32,
     hw_decode: bool,
+    deinterlace: crate::settings::VideoDeinterlaceMode,
     #[cfg(windows)] gpu_video_device: Option<
         std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
     >,
@@ -675,6 +1036,7 @@ pub fn spawn(
                 cancel,
                 target_audio_sample_rate,
                 hw_decode,
+                deinterlace,
                 #[cfg(windows)]
                 gpu_video_device,
                 engine_state,
@@ -700,6 +1062,7 @@ fn run_decoder(
     cancel: Arc<AtomicBool>,
     target_audio_sample_rate: u32,
     hw_decode_requested: bool,
+    deinterlace: crate::settings::VideoDeinterlaceMode,
     #[cfg(windows)] gpu_video_device: Option<
         std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
     >,
@@ -1143,6 +1506,7 @@ fn run_decoder(
     {
         let clock_a = clock.clone();
         let cancel_a = cancel.clone();
+        let engine_state_a = engine_state.clone();
         // audio_tx の所有を audio decode thread に move。run_decoder 側は
         // 以降 audio_tx を直接触らない (audio_pkt_tx 経由で間接的に流す)。
         let audio_tx_for_thread = audio_tx;
@@ -1150,7 +1514,14 @@ fn run_decoder(
             std::thread::Builder::new()
                 .name("video-audio-decode".into())
                 .spawn(move || {
-                    run_audio_decode(setup, audio_pkt_rx, audio_tx_for_thread, clock_a, cancel_a);
+                    run_audio_decode(
+                        setup,
+                        audio_pkt_rx,
+                        audio_tx_for_thread,
+                        clock_a,
+                        cancel_a,
+                        engine_state_a,
+                    );
                 })
                 .expect("spawn video-audio-decode thread"),
         )
@@ -1203,11 +1574,14 @@ fn run_decoder(
                     skipped_frame_count_v,
                     dst_w,
                     dst_h,
+                    video_time_base.numerator(),
+                    video_time_base.denominator(),
                     video_tb_num,
                     video_tb_den,
                     video_fps_num,
                     video_fps_den,
                     hw_active_initially,
+                    deinterlace,
                 )
             })
             .expect("spawn video-decode thread")
@@ -1451,6 +1825,9 @@ fn run_decoder(
                     trim_before_secs: video_trim_before,
                 },
                 &cancel,
+                "video",
+                "flush",
+                VIDEO_PACKET_QUEUE_CAP,
             ) {
                 break 'outer;
             }
@@ -1463,6 +1840,9 @@ fn run_decoder(
                         trim_before_secs: audio_trim_before,
                     },
                     &cancel,
+                    "audio",
+                    "flush",
+                    AUDIO_PACKET_QUEUE_CAP,
                 );
             }
             // 成功時のみ anchor を target に進める。失敗時に target を anchor すると
@@ -1560,6 +1940,8 @@ fn run_decoder(
                             VideoWorkerMsg::Packet { serial, packet },
                             &clock,
                             &cancel,
+                            "video",
+                            VIDEO_PACKET_QUEUE_CAP,
                         ) {
                             DemuxPacketSend::Sent => {}
                             DemuxPacketSend::Cancelled => break 'outer,
@@ -1621,6 +2003,8 @@ fn run_decoder(
                     },
                     &clock,
                     &cancel,
+                    "video",
+                    VIDEO_PACKET_QUEUE_CAP,
                 ) {
                     DemuxPacketSend::Sent => {}
                     // video decode thread が既に終了している → 自分も exit。
@@ -1650,15 +2034,17 @@ fn run_decoder(
                     // 直前の Flush marker と packet の到着順が逆転しない。bounded queue が
                     // 満杯なら demux 側を一時 stall させて逆圧をかけるのが正しい
                     // (audio_pkt_rx 側が止まっているのに packet を取り続けると memory が
-                    // 無制限に膨らむ)。stall 中も cancel は反映可能 (recv 側 disconnect で
-                    // SendError → 'outer break)。
+                    // 無制限に膨らむ)。ただし stall 中も pending video overflow は drain
+                    // する。precise seek では video 側の FirstFrameReady が Buffering を
+                    // 抜ける条件なので、既に読めている video packet を audio back-pressure
+                    // の後ろに取り残さない。
                     let packet_pts = audio_time_base_for_demux.and_then(|(tb_num, tb_den)| {
                         packet_timestamp(&packet).map(|pts| (pts as f64) * tb_num / tb_den)
                     });
                     let seek_serial = clock.current_seek_serial();
                     let queue_len_before = audio_pkt_tx.len();
                     let send_t0 = std::time::Instant::now();
-                    match send_demux_packet_seek_aware(
+                    match send_audio_packet_with_video_drain(
                         &audio_pkt_tx,
                         AudioWorkerMsg::Packet {
                             serial: seek_serial,
@@ -1666,6 +2052,9 @@ fn run_decoder(
                         },
                         &clock,
                         &cancel,
+                        &mut pending_video_packets,
+                        &mut pending_video_packet_bytes,
+                        &video_pkt_tx,
                     ) {
                         DemuxPacketSend::Sent => {}
                         // audio decode thread が既に終了している (= disconnect)。
@@ -1705,11 +2094,25 @@ fn run_decoder(
             // Phase A: audio decode thread にも Eof を通知して残フレームを drain させる。
             // (= 末尾の音声を確実に出し切る。drain しないと数十 ms の音声が抜ける。)
             if audio_stream_idx_for_demux.is_some() {
-                let _ = send_demux_msg_cancel_aware(&audio_pkt_tx, AudioWorkerMsg::Eof, &cancel);
+                let _ = send_demux_msg_cancel_aware(
+                    &audio_pkt_tx,
+                    AudioWorkerMsg::Eof,
+                    &cancel,
+                    "audio",
+                    "eof",
+                    AUDIO_PACKET_QUEUE_CAP,
+                );
             }
             // Phase B: video decode thread にも Eof を通知。動画は内部残フレームを
             // 失っても許容なので drain しないが、Eof 自体は送って状態を伝える。
-            let _ = send_demux_msg_cancel_aware(&video_pkt_tx, VideoWorkerMsg::Eof, &cancel);
+            let _ = send_demux_msg_cancel_aware(
+                &video_pkt_tx,
+                VideoWorkerMsg::Eof,
+                &cancel,
+                "video",
+                "eof",
+                VIDEO_PACKET_QUEUE_CAP,
+            );
             loop {
                 if cancel.load(Ordering::Acquire) {
                     crate::logger::log(format!("video decoder finished: {}", path.display()));
@@ -1776,11 +2179,14 @@ fn run_video_decode(
     skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
     dst_w: u32,
     dst_h: u32,
+    video_tb_num_i32: i32,
+    video_tb_den_i32: i32,
     video_tb_num: f64,
     video_tb_den: f64,
     video_fps_num: u32,
     video_fps_den: u32,
     hw_active_initially: bool,
+    deinterlace: crate::settings::VideoDeinterlaceMode,
 ) {
     use ffmpeg::format::Pixel;
     use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
@@ -1789,11 +2195,20 @@ fn run_video_decode(
 
     let mut scaler: Option<ScaleContext> = None;
     let mut scaler_key: Option<(Pixel, u32, u32)> = None;
+    let mut deinterlacer: Option<BwdifFilter> = None;
+    let mut deinterlace_failure_logged = false;
+    let mut deinterlace_cpu_fallback_logged = false;
     let mut first_frame_logged = false;
     let mut current_seek_serial: u64 = 0;
     let mut drop_before_secs: Option<f64> = None;
     let mut post_seek_frame_sent: bool = true;
     let mut last_enqueued_pts: f64 = 0.0;
+    let mut stale_drop_burst_count: u64 = 0;
+    let mut first_packet_logged_for_serial: Option<u64> = None;
+    let mut preroll_drop_count: u64 = 0;
+    let mut preroll_reached_logged_for_serial: Option<u64> = None;
+    let mut pause_park_last_log: Option<std::time::Instant> = None;
+    let mut post_seek_tx_full_last_log: Option<std::time::Instant> = None;
 
     'outer: loop {
         if cancel.load(Ordering::Acquire) {
@@ -1809,9 +2224,62 @@ fn run_video_decode(
                 seek_target_secs: _,
                 trim_before_secs,
             } => {
+                if stale_drop_burst_count > 0 {
+                    crate::logger::log(format!(
+                        "[video-decode] stale packet burst drained before flush: count={stale_drop_burst_count} next_serial={serial} live_serial={}",
+                        clock.current_seek_serial()
+                    ));
+                    stale_drop_burst_count = 0;
+                }
+                let prev_serial = current_seek_serial;
+                let engine_st = engine_state.load(Ordering::Acquire);
+                crate::logger::log(format!(
+                    "[video-decode] flush received: serial={serial} prev_serial={prev_serial} trim_before={trim_before_secs:?} pkt_rx_len={} video_tx_len={} engine_state={}",
+                    video_pkt_rx.len(),
+                    video_tx.len(),
+                    engine_state_code_name(engine_st)
+                ));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "video",
+                        "flush_received",
+                        None,
+                        0,
+                        &[
+                            ("serial", serde_json::Value::from(serial as i64)),
+                            ("prev_serial", serde_json::Value::from(prev_serial as i64)),
+                            (
+                                "trim_before",
+                                trim_before_secs
+                                    .map(serde_json::Value::from)
+                                    .unwrap_or(serde_json::Value::Null),
+                            ),
+                            (
+                                "pkt_rx_len",
+                                serde_json::Value::from(video_pkt_rx.len() as i64),
+                            ),
+                            (
+                                "video_tx_len",
+                                serde_json::Value::from(video_tx.len() as i64),
+                            ),
+                            (
+                                "engine_state",
+                                serde_json::Value::from(engine_state_code_name(engine_st)),
+                            ),
+                        ],
+                    );
+                }
                 video_decoder.flush();
                 current_seek_serial = serial;
+                // bwdif keeps a tiny temporal window. Drop it on seek so the
+                // first post-seek frame cannot be compared with pre-seek data.
+                deinterlacer = None;
                 drop_before_secs = trim_before_secs;
+                first_packet_logged_for_serial = None;
+                preroll_drop_count = 0;
+                preroll_reached_logged_for_serial = None;
+                pause_park_last_log = None;
+                post_seek_tx_full_last_log = None;
                 // trim_before あり (Precise / Fast forward retry / 安全側) → post-seek
                 // 1 枚目を待つので false。trim_before なし (Fast backward / 失敗) →
                 // 通常 pacing に戻すので true。
@@ -1823,11 +2291,18 @@ fn run_video_decode(
             VideoWorkerMsg::Eof => {
                 // 動画は EOF で内部 frame を失っても許容 (旧 run_decoder と同じ挙動)。
                 // 何もせず次の Packet/Flush/disconnect を待つ。
+                crate::logger::log(format!(
+                    "[video-decode] eof received: serial={current_seek_serial} pkt_rx_len={} video_tx_len={} engine_state={}",
+                    video_pkt_rx.len(),
+                    video_tx.len(),
+                    engine_state_code_name(engine_state.load(Ordering::Acquire))
+                ));
                 continue;
             }
             VideoWorkerMsg::Packet { serial, packet } => {
                 let live_seek_serial = clock.current_seek_serial();
                 if serial != current_seek_serial || serial != live_seek_serial {
+                    stale_drop_burst_count = stale_drop_burst_count.saturating_add(1);
                     if crate::perf::is_enabled() {
                         let reason = if serial != live_seek_serial {
                             "live_seek_advanced"
@@ -1855,6 +2330,48 @@ fn run_video_decode(
                     }
                     continue;
                 }
+                if stale_drop_burst_count > 0 {
+                    crate::logger::log(format!(
+                        "[video-decode] stale packet burst ended: count={stale_drop_burst_count} serial={serial} live_serial={live_seek_serial} pkt_rx_len={}",
+                        video_pkt_rx.len()
+                    ));
+                    stale_drop_burst_count = 0;
+                }
+                if first_packet_logged_for_serial != Some(serial) {
+                    let packet_pts = packet_timestamp(&packet)
+                        .map(|pts| (pts as f64) * video_tb_num / video_tb_den);
+                    crate::logger::log(format!(
+                        "[video-decode] first packet for serial={serial}: pts={packet_pts:?} pkt_rx_len={} video_tx_len={}",
+                        video_pkt_rx.len(),
+                        video_tx.len()
+                    ));
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "video",
+                            "first_packet_for_serial",
+                            None,
+                            0,
+                            &[
+                                ("serial", serde_json::Value::from(serial as i64)),
+                                (
+                                    "packet_pts",
+                                    packet_pts
+                                        .map(serde_json::Value::from)
+                                        .unwrap_or(serde_json::Value::Null),
+                                ),
+                                (
+                                    "pkt_rx_len",
+                                    serde_json::Value::from(video_pkt_rx.len() as i64),
+                                ),
+                                (
+                                    "video_tx_len",
+                                    serde_json::Value::from(video_tx.len() as i64),
+                                ),
+                            ],
+                        );
+                    }
+                    first_packet_logged_for_serial = Some(serial);
+                }
                 packet
             }
         };
@@ -1875,8 +2392,68 @@ fn run_video_decode(
             // post-seek preroll: target 前のフレームは描画しない
             if let Some(min) = drop_before_secs {
                 if pts_secs + 0.005 < min {
+                    preroll_drop_count = preroll_drop_count.saturating_add(1);
+                    if crate::perf::is_enabled()
+                        && (preroll_drop_count == 1 || preroll_drop_count % 30 == 0)
+                    {
+                        crate::perf::event(
+                            "video",
+                            "preroll_drop",
+                            None,
+                            0,
+                            &[
+                                (
+                                    "serial",
+                                    serde_json::Value::from(current_seek_serial as i64),
+                                ),
+                                ("count", serde_json::Value::from(preroll_drop_count as i64)),
+                                ("frame_pts", serde_json::Value::from(pts_secs)),
+                                ("trim_before", serde_json::Value::from(min)),
+                                (
+                                    "pkt_rx_len",
+                                    serde_json::Value::from(video_pkt_rx.len() as i64),
+                                ),
+                            ],
+                        );
+                    }
                     continue;
                 } else {
+                    if preroll_reached_logged_for_serial != Some(current_seek_serial) {
+                        crate::logger::log(format!(
+                            "[video-decode] preroll reached target: serial={current_seek_serial} dropped={preroll_drop_count} first_pts={pts_secs:.3} trim_before={min:.3} pkt_rx_len={} video_tx_len={}",
+                            video_pkt_rx.len(),
+                            video_tx.len()
+                        ));
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "video",
+                                "preroll_reached",
+                                None,
+                                0,
+                                &[
+                                    (
+                                        "serial",
+                                        serde_json::Value::from(current_seek_serial as i64),
+                                    ),
+                                    (
+                                        "dropped",
+                                        serde_json::Value::from(preroll_drop_count as i64),
+                                    ),
+                                    ("first_pts", serde_json::Value::from(pts_secs)),
+                                    ("trim_before", serde_json::Value::from(min)),
+                                    (
+                                        "pkt_rx_len",
+                                        serde_json::Value::from(video_pkt_rx.len() as i64),
+                                    ),
+                                    (
+                                        "video_tx_len",
+                                        serde_json::Value::from(video_tx.len() as i64),
+                                    ),
+                                ],
+                            );
+                        }
+                        preroll_reached_logged_for_serial = Some(current_seek_serial);
+                    }
                     // target に到達した → preroll guard 解除 (動画側のみ)
                     // 音声側はまだ trim 必要なので drop_before_secs は audio thread
                     // が独自に管理する (= ここでは触らない)。
@@ -1890,7 +2467,18 @@ fn run_video_decode(
             // 出力は NT 共有 ID3D11Texture2D で wgpu (egui) 側から sample される。
             #[cfg(windows)]
             if matches!(frame.format(), Pixel::D3D11) {
-                if let Some(gpu_dev) = gpu_video_device.as_ref() {
+                let deinterlace_wants_cpu = deinterlace.is_enabled()
+                    && !deinterlace_failure_logged
+                    && (deinterlace.force_all_frames() || frame.is_interlaced());
+                if deinterlace_wants_cpu {
+                    if !deinterlace_cpu_fallback_logged {
+                        crate::logger::log(
+                            "video deinterlace: using CPU bwdif path for D3D11VA frames"
+                                .to_string(),
+                        );
+                        deinterlace_cpu_fallback_logged = true;
+                    }
+                } else if let Some(gpu_dev) = gpu_video_device.as_ref() {
                     match try_gpu_blit_path(
                         gpu_dev,
                         &frame,
@@ -1968,8 +2556,79 @@ fn run_video_decode(
                                 if engine_st == crate::video::engine::actor::state_code::PAUSED
                                     || engine_st == crate::video::engine::actor::state_code::EOF
                                 {
+                                    let now = std::time::Instant::now();
+                                    if pause_park_last_log.is_none_or(|last| {
+                                        now.duration_since(last)
+                                            >= std::time::Duration::from_secs(2)
+                                    }) {
+                                        crate::logger::log(format!(
+                                            "[video-decode] pause park: serial={current_seek_serial} frame_pts={pts_secs:.3} state={} pkt_rx_len={} video_tx_len={} clock_playing={} clock_seeking={}",
+                                            engine_state_code_name(engine_st),
+                                            video_pkt_rx.len(),
+                                            video_tx.len(),
+                                            clock.is_playing(),
+                                            clock.is_seeking()
+                                        ));
+                                        if crate::perf::is_enabled() {
+                                            crate::perf::event(
+                                                "video",
+                                                "pause_park",
+                                                None,
+                                                0,
+                                                &[
+                                                    (
+                                                        "serial",
+                                                        serde_json::Value::from(
+                                                            current_seek_serial as i64,
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "frame_pts",
+                                                        serde_json::Value::from(pts_secs),
+                                                    ),
+                                                    (
+                                                        "engine_state",
+                                                        serde_json::Value::from(
+                                                            engine_state_code_name(engine_st),
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "pkt_rx_len",
+                                                        serde_json::Value::from(
+                                                            video_pkt_rx.len() as i64
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "video_tx_len",
+                                                        serde_json::Value::from(
+                                                            video_tx.len() as i64
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "clock_playing",
+                                                        serde_json::Value::from(clock.is_playing()),
+                                                    ),
+                                                    (
+                                                        "clock_seeking",
+                                                        serde_json::Value::from(clock.is_seeking()),
+                                                    ),
+                                                ],
+                                            );
+                                        }
+                                        pause_park_last_log = Some(now);
+                                    }
                                     std::thread::sleep(std::time::Duration::from_millis(50));
                                     continue;
+                                }
+                                if pause_park_last_log.take().is_some() {
+                                    crate::logger::log(format!(
+                                        "[video-decode] pause park exit: serial={current_seek_serial} frame_pts={pts_secs:.3} state={} pkt_rx_len={} video_tx_len={} clock_playing={} clock_seeking={}",
+                                        engine_state_code_name(engine_st),
+                                        video_pkt_rx.len(),
+                                        video_tx.len(),
+                                        clock.is_playing(),
+                                        clock.is_seeking()
+                                    ));
                                 }
                                 let audio_buf = clock.total_audio_buffer_secs();
                                 let audio_active = clock.is_audio_active();
@@ -2000,9 +2659,67 @@ fn run_video_decode(
                                 }
                                 let ahead = pts_secs - clock.video_pacing_now_secs();
                                 if !post_seek_frame_sent && video_tx.is_full() {
+                                    let now = std::time::Instant::now();
+                                    if post_seek_tx_full_last_log.is_none_or(|last| {
+                                        now.duration_since(last)
+                                            >= std::time::Duration::from_millis(500)
+                                    }) {
+                                        let engine_st = engine_state.load(Ordering::Acquire);
+                                        crate::logger::log(format!(
+                                            "[video-decode] post-seek first frame waiting for video_tx space: serial={current_seek_serial} frame_pts={pts_secs:.3} video_tx_len={} pkt_rx_len={} engine_state={} clock_seeking={}",
+                                            video_tx.len(),
+                                            video_pkt_rx.len(),
+                                            engine_state_code_name(engine_st),
+                                            clock.is_seeking()
+                                        ));
+                                        if crate::perf::is_enabled() {
+                                            crate::perf::event(
+                                                "video",
+                                                "post_seek_video_tx_full_wait",
+                                                None,
+                                                0,
+                                                &[
+                                                    (
+                                                        "serial",
+                                                        serde_json::Value::from(
+                                                            current_seek_serial as i64,
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "frame_pts",
+                                                        serde_json::Value::from(pts_secs),
+                                                    ),
+                                                    (
+                                                        "video_tx_len",
+                                                        serde_json::Value::from(
+                                                            video_tx.len() as i64
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "pkt_rx_len",
+                                                        serde_json::Value::from(
+                                                            video_pkt_rx.len() as i64
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "engine_state",
+                                                        serde_json::Value::from(
+                                                            engine_state_code_name(engine_st),
+                                                        ),
+                                                    ),
+                                                    (
+                                                        "clock_seeking",
+                                                        serde_json::Value::from(clock.is_seeking()),
+                                                    ),
+                                                ],
+                                            );
+                                        }
+                                        post_seek_tx_full_last_log = Some(now);
+                                    }
                                     sleep_video_pacing();
                                     continue;
                                 }
+                                post_seek_tx_full_last_log = None;
                                 // Phase 9.E (2026-04-30 fixup): post-seek 1 枚目は
                                 // **audio_buf に関係なく必ず送出** (= override clear に必須)。
                                 // 旧コード (Phase 8.F-9.D) は seek_burst 全体を
@@ -2169,6 +2886,65 @@ fn run_video_decode(
                 }
             };
 
+            let mut filtered_owned: Option<Video> = None;
+            let mut pts_secs_for_output = pts_secs;
+            let should_try_deinterlace = deinterlace.is_enabled()
+                && !deinterlace_failure_logged
+                && (deinterlace.force_all_frames() || frame_for_scaler.is_interlaced());
+            if should_try_deinterlace {
+                let key = bwdif_filter_key(frame_for_scaler, video_tb_num_i32, video_tb_den_i32);
+                let force_all_frames = deinterlace.force_all_frames();
+                let needs_new_graph = deinterlacer
+                    .as_ref()
+                    .is_none_or(|f| !f.matches(key, force_all_frames));
+                if needs_new_graph {
+                    match BwdifFilter::new(key, force_all_frames) {
+                        Ok(f) => {
+                            crate::logger::log(format!(
+                                "video deinterlace: bwdif enabled mode={} fmt={:?} size={}x{}",
+                                if force_all_frames {
+                                    "all"
+                                } else {
+                                    "interlaced"
+                                },
+                                key.pix_fmt,
+                                key.width,
+                                key.height
+                            ));
+                            deinterlacer = Some(f);
+                        }
+                        Err(e) => {
+                            crate::logger::log(format!(
+                                "video deinterlace: bwdif init failed, continuing without deinterlace: {e}"
+                            ));
+                            deinterlace_failure_logged = true;
+                        }
+                    }
+                }
+                if let Some(filter) = deinterlacer.as_mut() {
+                    match filter.filter_one(frame_for_scaler) {
+                        Ok(Some(filtered)) => {
+                            if let Some(filtered_pts) = video_frame_timestamp(&filtered) {
+                                pts_secs_for_output =
+                                    (filtered_pts as f64) * video_tb_num / video_tb_den;
+                            }
+                            filtered_owned = Some(filtered);
+                        }
+                        Ok(None) => {
+                            continue;
+                        }
+                        Err(e) => {
+                            crate::logger::log(format!(
+                                "video deinterlace: bwdif failed, continuing without deinterlace: {e}"
+                            ));
+                            deinterlace_failure_logged = true;
+                        }
+                    }
+                }
+            }
+            let frame_for_scaler = filtered_owned.as_ref().unwrap_or(frame_for_scaler);
+            let pts_secs = pts_secs_for_output;
+
             // scaler の lazy 構築 / 入力 (フォーマット|寸法) 変化時の再構築。
             let cur_fmt = frame_for_scaler.format();
             let cur_w = frame_for_scaler.width();
@@ -2281,8 +3057,61 @@ fn run_video_decode(
                 if engine_st == crate::video::engine::actor::state_code::PAUSED
                     || engine_st == crate::video::engine::actor::state_code::EOF
                 {
+                    let now = std::time::Instant::now();
+                    if pause_park_last_log.map_or(true, |last| {
+                        now.duration_since(last) >= std::time::Duration::from_secs(2)
+                    }) {
+                        crate::logger::log(format!(
+                            "[video-decode] pause park: serial={current_seek_serial} frame_pts={pts_secs:.3} state={} pkt_rx_len={} video_tx_len={} clock_playing={} clock_seeking={}",
+                            engine_state_code_name(engine_st),
+                            video_pkt_rx.len(),
+                            video_tx.len(),
+                            clock.is_playing(),
+                            clock.is_seeking()
+                        ));
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "video",
+                                "pause_park",
+                                None,
+                                0,
+                                &[
+                                    (
+                                        "serial",
+                                        serde_json::Value::from(current_seek_serial as i64),
+                                    ),
+                                    ("frame_pts", serde_json::Value::from(pts_secs)),
+                                    (
+                                        "engine_state",
+                                        serde_json::Value::from(engine_state_code_name(engine_st)),
+                                    ),
+                                    (
+                                        "pkt_rx_len",
+                                        serde_json::Value::from(video_pkt_rx.len() as i64),
+                                    ),
+                                    (
+                                        "video_tx_len",
+                                        serde_json::Value::from(video_tx.len() as i64),
+                                    ),
+                                    ("clock_playing", serde_json::Value::from(clock.is_playing())),
+                                    ("clock_seeking", serde_json::Value::from(clock.is_seeking())),
+                                ],
+                            );
+                        }
+                        pause_park_last_log = Some(now);
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     continue;
+                }
+                if pause_park_last_log.take().is_some() {
+                    crate::logger::log(format!(
+                        "[video-decode] pause park exit: serial={current_seek_serial} frame_pts={pts_secs:.3} state={} pkt_rx_len={} video_tx_len={} clock_playing={} clock_seeking={}",
+                        engine_state_code_name(engine_st),
+                        video_pkt_rx.len(),
+                        video_tx.len(),
+                        clock.is_playing(),
+                        clock.is_seeking()
+                    ));
                 }
                 let audio_buf = clock.total_audio_buffer_secs();
                 let audio_active = clock.is_audio_active();
@@ -2300,9 +3129,52 @@ fn run_video_decode(
                 }
                 let ahead = pts_secs - clock.video_pacing_now_secs();
                 if !post_seek_frame_sent && video_tx.is_full() {
+                    let now = std::time::Instant::now();
+                    if post_seek_tx_full_last_log.map_or(true, |last| {
+                        now.duration_since(last) >= std::time::Duration::from_millis(500)
+                    }) {
+                        let engine_st = engine_state.load(Ordering::Acquire);
+                        crate::logger::log(format!(
+                            "[video-decode] post-seek first frame waiting for video_tx space: serial={current_seek_serial} frame_pts={pts_secs:.3} video_tx_len={} pkt_rx_len={} engine_state={} clock_seeking={}",
+                            video_tx.len(),
+                            video_pkt_rx.len(),
+                            engine_state_code_name(engine_st),
+                            clock.is_seeking()
+                        ));
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "video",
+                                "post_seek_video_tx_full_wait",
+                                None,
+                                0,
+                                &[
+                                    (
+                                        "serial",
+                                        serde_json::Value::from(current_seek_serial as i64),
+                                    ),
+                                    ("frame_pts", serde_json::Value::from(pts_secs)),
+                                    (
+                                        "video_tx_len",
+                                        serde_json::Value::from(video_tx.len() as i64),
+                                    ),
+                                    (
+                                        "pkt_rx_len",
+                                        serde_json::Value::from(video_pkt_rx.len() as i64),
+                                    ),
+                                    (
+                                        "engine_state",
+                                        serde_json::Value::from(engine_state_code_name(engine_st)),
+                                    ),
+                                    ("clock_seeking", serde_json::Value::from(clock.is_seeking())),
+                                ],
+                            );
+                        }
+                        post_seek_tx_full_last_log = Some(now);
+                    }
                     sleep_video_pacing();
                     continue;
                 }
+                post_seek_tx_full_last_log = None;
                 // Phase 9.E: post-seek 1 枚目は audio_buf 不問で必ず送出
                 // (詳細は GPU 経路の同コメント参照、forward seek deadlock 修正)。
                 if clock.is_seeking() && !post_seek_frame_sent {
@@ -2435,6 +3307,7 @@ fn run_audio_decode(
     audio_tx: Sender<AudioFrame>,
     clock: Arc<AvClock>,
     cancel: Arc<AtomicBool>,
+    engine_state: Arc<std::sync::atomic::AtomicU8>,
 ) {
     use ffmpeg_the_third::util::frame::audio::Audio;
 
@@ -2451,10 +3324,88 @@ fn run_audio_decode(
     // reset to 0. Keep a monotonic synthetic cursor per seek generation so the
     // audio clock and video pacing do not get pinned to zero.
     let mut next_audio_pts_secs: Option<f64> = None;
+    let mut pause_park_last_log: Option<std::time::Instant> = None;
 
     'outer: loop {
         if cancel.load(Ordering::Acquire) {
             break;
+        }
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                break 'outer;
+            }
+            let live_seek_serial = clock.current_seek_serial();
+            if live_seek_serial != current_seek_serial {
+                if pause_park_last_log.take().is_some() {
+                    let engine_st = engine_state.load(Ordering::Acquire);
+                    crate::logger::log(format!(
+                        "[audio-decode] pause park exit: reason=seek_serial_changed serial={current_seek_serial} live_serial={live_seek_serial} state={} pkt_rx_len={} audio_tx_len={} clock_playing={} clock_seeking={}",
+                        engine_state_code_name(engine_st),
+                        audio_pkt_rx.len(),
+                        audio_tx.len(),
+                        clock.is_playing(),
+                        clock.is_seeking()
+                    ));
+                }
+                break;
+            }
+            let engine_st = engine_state.load(Ordering::Acquire);
+            if !engine_state_parks_decode(engine_st) {
+                if pause_park_last_log.take().is_some() {
+                    crate::logger::log(format!(
+                        "[audio-decode] pause park exit: serial={current_seek_serial} state={} pkt_rx_len={} audio_tx_len={} clock_playing={} clock_seeking={}",
+                        engine_state_code_name(engine_st),
+                        audio_pkt_rx.len(),
+                        audio_tx.len(),
+                        clock.is_playing(),
+                        clock.is_seeking()
+                    ));
+                }
+                break;
+            }
+            let now = std::time::Instant::now();
+            if pause_park_last_log
+                .is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_secs(2))
+            {
+                crate::logger::log(format!(
+                    "[audio-decode] pause park: serial={current_seek_serial} state={} pkt_rx_len={} audio_tx_len={} clock_playing={} clock_seeking={}",
+                    engine_state_code_name(engine_st),
+                    audio_pkt_rx.len(),
+                    audio_tx.len(),
+                    clock.is_playing(),
+                    clock.is_seeking()
+                ));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "audio",
+                        "pause_park",
+                        None,
+                        0,
+                        &[
+                            (
+                                "serial",
+                                serde_json::Value::from(current_seek_serial as i64),
+                            ),
+                            (
+                                "engine_state",
+                                serde_json::Value::from(engine_state_code_name(engine_st)),
+                            ),
+                            (
+                                "pkt_rx_len",
+                                serde_json::Value::from(audio_pkt_rx.len() as i64),
+                            ),
+                            (
+                                "audio_tx_len",
+                                serde_json::Value::from(audio_tx.len() as i64),
+                            ),
+                            ("clock_playing", serde_json::Value::from(clock.is_playing())),
+                            ("clock_seeking", serde_json::Value::from(clock.is_seeking())),
+                        ],
+                    );
+                }
+                pause_park_last_log = Some(now);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
         }
         let msg = match audio_pkt_rx.recv() {
             Ok(m) => m,
@@ -2497,6 +3448,7 @@ fn run_audio_decode(
                         &mut next_audio_pts_secs,
                         &clock,
                         &audio_tx,
+                        &engine_state,
                     ) {
                         break 'outer;
                     }
@@ -2600,6 +3552,7 @@ fn run_audio_decode(
                         &mut next_audio_pts_secs,
                         &clock,
                         &audio_tx,
+                        &engine_state,
                     ) {
                         break 'outer;
                     }
@@ -2623,6 +3576,7 @@ fn emit_audio_frame(
     next_audio_pts_secs: &mut Option<f64>,
     clock: &AvClock,
     audio_tx: &Sender<AudioFrame>,
+    engine_state: &std::sync::atomic::AtomicU8,
 ) -> bool {
     use ffmpeg::format::sample::{Sample, Type as SampleType};
     use ffmpeg::util::frame::audio::Audio;
@@ -2768,6 +3722,7 @@ fn emit_audio_frame(
     // 競合しないよう順序を保つ。失敗時はロールバック。
     clock.add_audio_tx_queued_secs(duration_secs);
     let send_t0 = std::time::Instant::now();
+    let mut last_send_wait_log = send_t0;
     let mut pending_frame = Some(frame_out);
     loop {
         if clock.current_seek_serial() != current_seek_serial {
@@ -2797,6 +3752,41 @@ fn emit_audio_frame(
             }
             return true;
         }
+        let engine_st = engine_state.load(Ordering::Acquire);
+        if engine_state_parks_decode(engine_st) {
+            clock.add_audio_tx_queued_secs(-duration_secs);
+            crate::logger::log(format!(
+                "[audio-decode] audio_tx send aborted for park: serial={current_seek_serial} pts={pts_secs:.3} audio_tx_len={} engine_state={} clock_playing={} clock_seeking={}",
+                audio_tx.len(),
+                engine_state_code_name(engine_st),
+                clock.is_playing(),
+                clock.is_seeking()
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "audio",
+                    "frame_send_aborted_for_park",
+                    None,
+                    0,
+                    &[
+                        ("pts", serde_json::Value::from(pts_secs)),
+                        (
+                            "serial",
+                            serde_json::Value::from(current_seek_serial as i64),
+                        ),
+                        (
+                            "audio_tx_len",
+                            serde_json::Value::from(audio_tx.len() as i64),
+                        ),
+                        (
+                            "engine_state",
+                            serde_json::Value::from(engine_state_code_name(engine_st)),
+                        ),
+                    ],
+                );
+            }
+            return true;
+        }
         let frame = pending_frame
             .take()
             .expect("pending audio frame should exist before send_timeout");
@@ -2804,6 +3794,51 @@ fn emit_audio_frame(
             Ok(()) => break,
             Err(crossbeam_channel::SendTimeoutError::Timeout(frame)) => {
                 pending_frame = Some(frame);
+                let now = std::time::Instant::now();
+                let waited = now.duration_since(send_t0);
+                if waited >= std::time::Duration::from_millis(100)
+                    && now.duration_since(last_send_wait_log)
+                        >= std::time::Duration::from_millis(500)
+                {
+                    last_send_wait_log = now;
+                    crate::logger::log(format!(
+                        "[audio-decode] audio_tx send blocked {:.1}ms: serial={current_seek_serial} pts={pts_secs:.3} audio_tx_len={} engine_state={} clock_playing={} clock_seeking={}",
+                        waited.as_secs_f64() * 1000.0,
+                        audio_tx.len(),
+                        engine_state_code_name(engine_st),
+                        clock.is_playing(),
+                        clock.is_seeking()
+                    ));
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "audio",
+                            "frame_send_waiting",
+                            None,
+                            0,
+                            &[
+                                ("pts", serde_json::Value::from(pts_secs)),
+                                (
+                                    "wait_ms",
+                                    serde_json::Value::from(waited.as_secs_f64() * 1000.0),
+                                ),
+                                (
+                                    "serial",
+                                    serde_json::Value::from(current_seek_serial as i64),
+                                ),
+                                (
+                                    "audio_tx_len",
+                                    serde_json::Value::from(audio_tx.len() as i64),
+                                ),
+                                (
+                                    "engine_state",
+                                    serde_json::Value::from(engine_state_code_name(engine_st)),
+                                ),
+                                ("clock_playing", serde_json::Value::from(clock.is_playing())),
+                                ("clock_seeking", serde_json::Value::from(clock.is_seeking())),
+                            ],
+                        );
+                    }
+                }
             }
             Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
                 clock.add_audio_tx_queued_secs(-duration_secs);
@@ -3786,10 +4821,13 @@ fn try_gpu_blit_path(
 #[cfg(test)]
 mod decoder_candidate_tests {
     use super::{
-        DecoderChoice, normalize_audio_input_layout, preferred_video_decoders, selected_video_rate,
+        BwdifFilterKey, DecoderChoice, bwdif_filter_key, normalize_audio_input_layout,
+        preferred_video_decoders, selected_video_rate,
     };
     use ffmpeg_the_third::ChannelLayout;
     use ffmpeg_the_third::codec::Id;
+    use ffmpeg_the_third::format::Pixel;
+    use ffmpeg_the_third::util::frame::video::Video;
 
     #[test]
     fn unspecified_two_channel_audio_layout_is_guessed_as_stereo() {
@@ -3856,5 +4894,48 @@ mod decoder_candidate_tests {
             ffmpeg_the_third::Rational(24, 1),
         );
         assert_eq!(rate, Some((24, 1)));
+    }
+
+    #[test]
+    fn bwdif_filter_key_normalizes_missing_sar_and_time_base() {
+        let mut frame = Video::empty();
+        frame.set_format(Pixel::YUV420P);
+        frame.set_width(720);
+        frame.set_height(480);
+
+        let key = bwdif_filter_key(&frame, 0, 0);
+        assert_eq!(
+            key,
+            BwdifFilterKey {
+                pix_fmt: Pixel::YUV420P,
+                width: 720,
+                height: 480,
+                sar_num: 1,
+                sar_den: 1,
+                time_base_num: 1,
+                time_base_den: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn bwdif_filter_reports_missing_filter() {
+        let key = BwdifFilterKey {
+            pix_fmt: Pixel::None,
+            width: 0,
+            height: 0,
+            sar_num: 1,
+            sar_den: 1,
+            time_base_num: 1,
+            time_base_den: 1,
+        };
+        let err = match super::BwdifFilter::new(key, false) {
+            Ok(_) => panic!("invalid bwdif key unexpectedly created a filter graph"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("buffer init") || err.contains("graph"),
+            "unexpected error: {err}"
+        );
     }
 }

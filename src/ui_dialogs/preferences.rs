@@ -1658,6 +1658,23 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         );
 
     ui.add_space(12.0);
+    ui.label(egui::RichText::new("デインターレース").strong());
+    ui.add_space(4.0);
+    ui.label("インターレース動画の横縞ノイズを、FFmpeg の bwdif フィルタで表示前に補正します。");
+    ui.add_space(6.0);
+    egui::ComboBox::from_label("デインターレース")
+        .selected_text(s.video_deinterlace.label())
+        .show_ui(ui, |ui| {
+            for &mode in crate::settings::VideoDeinterlaceMode::all() {
+                ui.selectable_value(&mut s.video_deinterlace, mode, mode.label());
+            }
+        });
+    ui.label(
+        egui::RichText::new("自動: インターレースとしてデコードされたフレームだけ補正。切り替え後は次に開く動画から反映されます。")
+            .small(),
+    );
+
+    ui.add_space(12.0);
     ui.separator();
     ui.add_space(8.0);
 

@@ -53,6 +53,19 @@ use std::sync::Mutex;
 use engine::EngineEvent;
 use engine::actor::{EngineActor, OpenOptions};
 
+fn engine_state_code_name(code: u8) -> &'static str {
+    match code {
+        engine::actor::state_code::IDLE => "Idle",
+        engine::actor::state_code::LOADING => "Loading",
+        engine::actor::state_code::BUFFERING => "Buffering",
+        engine::actor::state_code::PLAYING => "Playing",
+        engine::actor::state_code::PAUSED => "Paused",
+        engine::actor::state_code::SEEKING => "Seeking",
+        engine::actor::state_code::EOF => "Eof",
+        _ => "Unknown",
+    }
+}
+
 pub struct VideoPlayer {
     path: PathBuf,
     clock: Arc<AvClock>,
@@ -953,6 +966,13 @@ fn run_native_video_output(
     let mut last_summary_log = Instant::now();
     let mut last_present_log = Instant::now();
     let mut last_overlay_tick = Instant::now();
+    let mut last_source_state_probe = Instant::now();
+    let startup_probe_until = run_started + Duration::from_secs(5);
+    let mut last_startup_probe = run_started
+        .checked_sub(Duration::from_millis(250))
+        .unwrap_or(run_started);
+    let mut startup_probe_count = 0_u32;
+    let mut first_present_probe_logged = false;
     let mut native_events = Vec::new();
     let trace_every_present = std::env::var_os("MIV_NATIVE_VIDEO_PRESENT_TRACE").is_some();
     while !cancel.load(Ordering::Acquire) {
@@ -972,6 +992,76 @@ fn run_native_video_output(
         if crate::video::native_window::pump_thread_messages() {
             closed.store(true, Ordering::Release);
             break;
+        }
+        let now = Instant::now();
+        if now < startup_probe_until
+            && now.duration_since(last_startup_probe) >= Duration::from_millis(250)
+        {
+            last_startup_probe = now;
+            startup_probe_count = startup_probe_count.saturating_add(1);
+            let first_presented = first_presented_out.load(Ordering::Acquire);
+            let displayed_seq = source.displayed_frame_seq.load(Ordering::Acquire);
+            let foreground_current_process =
+                crate::video::native_window::foreground_belongs_to_current_process();
+            let source_queue_len = source.queue.len();
+            let source_video_rx_len = source.video_rx.len();
+            let source_serial = source.clock.current_seek_serial();
+            let source_playing = source.clock.is_playing();
+            let source_seeking = source.clock.is_seeking();
+            crate::logger::log(format!(
+                "[native-video] startup probe #{} elapsed_ms={:.1} first_presented={} displayed_seq={} foreground_current_process={} source_serial={} playing={} seeking={} source_queue_len={} video_rx_len={}",
+                startup_probe_count,
+                now.duration_since(run_started).as_secs_f64() * 1000.0,
+                first_presented,
+                displayed_seq,
+                foreground_current_process,
+                source_serial,
+                source_playing,
+                source_seeking,
+                source_queue_len,
+                source_video_rx_len
+            ));
+            crate::video::native_window::log_state(window.hwnd().0 as u64, "startup-probe");
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "native_presenter",
+                    "startup_probe",
+                    None,
+                    0,
+                    &[
+                        ("probe", serde_json::Value::from(startup_probe_count as i64)),
+                        (
+                            "elapsed_ms",
+                            serde_json::Value::from(
+                                now.duration_since(run_started).as_secs_f64() * 1000.0,
+                            ),
+                        ),
+                        ("first_presented", serde_json::Value::from(first_presented)),
+                        (
+                            "displayed_seq",
+                            serde_json::Value::from(displayed_seq as i64),
+                        ),
+                        (
+                            "foreground_current_process",
+                            serde_json::Value::from(foreground_current_process),
+                        ),
+                        (
+                            "source_serial",
+                            serde_json::Value::from(source_serial as i64),
+                        ),
+                        ("playing", serde_json::Value::from(source_playing)),
+                        ("seeking", serde_json::Value::from(source_seeking)),
+                        (
+                            "source_queue_len",
+                            serde_json::Value::from(source_queue_len as i64),
+                        ),
+                        (
+                            "video_rx_len",
+                            serde_json::Value::from(source_video_rx_len as i64),
+                        ),
+                    ],
+                );
+            }
         }
         let perf_visible = perf_overlay_visible.load(Ordering::Acquire);
         let perf_visibility_changed = presenter.set_overlay_perf_visible(perf_visible);
@@ -1344,6 +1434,56 @@ fn run_native_video_output(
 
         let waiting_for_first_frame =
             source.first_frame_event_last_epoch != Some(source.last_seen_serial);
+        if crate::perf::is_enabled() && last_source_state_probe.elapsed() >= Duration::from_secs(1)
+        {
+            last_source_state_probe = Instant::now();
+            crate::perf::event(
+                "native_presenter",
+                "source_state",
+                None,
+                0,
+                &[
+                    (
+                        "source_epoch",
+                        serde_json::Value::from(source.source_epoch as i64),
+                    ),
+                    (
+                        "clock_serial",
+                        serde_json::Value::from(source.clock.current_seek_serial() as i64),
+                    ),
+                    (
+                        "last_seen_serial",
+                        serde_json::Value::from(source.last_seen_serial as i64),
+                    ),
+                    (
+                        "playing",
+                        serde_json::Value::from(source.clock.is_playing()),
+                    ),
+                    (
+                        "seeking",
+                        serde_json::Value::from(source.clock.is_seeking()),
+                    ),
+                    (
+                        "waiting_for_first_frame",
+                        serde_json::Value::from(waiting_for_first_frame),
+                    ),
+                    (
+                        "source_queue_len",
+                        serde_json::Value::from(source.queue.len() as i64),
+                    ),
+                    (
+                        "video_rx_len",
+                        serde_json::Value::from(source.video_rx.len() as i64),
+                    ),
+                    (
+                        "displayed_seq",
+                        serde_json::Value::from(
+                            source.displayed_frame_seq.load(Ordering::Acquire) as i64
+                        ),
+                    ),
+                ],
+            );
+        }
         if !source.clock.is_playing() && !source.clock.is_seeking() && !waiting_for_first_frame {
             source.last_present_wall = None;
             source.last_present_source_pts = None;
@@ -1465,6 +1605,19 @@ fn run_native_video_output(
                     }
                     source.displayed_frame_seq.fetch_add(1, Ordering::Release);
                     first_presented_out.store(true, Ordering::Release);
+                    if !first_present_probe_logged {
+                        first_present_probe_logged = true;
+                        crate::logger::log(format!(
+                            "[native-video] first present probe: pts={:.3} serial={} elapsed_ms={:.1}",
+                            pts,
+                            serial,
+                            present_t0.duration_since(run_started).as_secs_f64() * 1000.0
+                        ));
+                        crate::video::native_window::log_state(
+                            window.hwnd().0 as u64,
+                            "first-present",
+                        );
+                    }
                     if source.first_frame_event_last_epoch != Some(serial) {
                         if try_send_native_first_frame_ready(&source.engine_event_tx, serial, pts) {
                             source.first_frame_event_last_epoch = Some(serial);
@@ -1570,6 +1723,28 @@ fn run_native_video_output(
 
     native_drain_unpresented_queue(&mut source.queue);
     source.present_stats.emit_summary(run_started.elapsed());
+    crate::logger::log(format!(
+        "[native-video] startup probe summary: probes={} first_present_logged={}",
+        startup_probe_count, first_present_probe_logged
+    ));
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "native_presenter",
+            "startup_probe_summary",
+            None,
+            0,
+            &[
+                (
+                    "probes",
+                    serde_json::Value::from(startup_probe_count as i64),
+                ),
+                (
+                    "first_present_logged",
+                    serde_json::Value::from(first_present_probe_logged),
+                ),
+            ],
+        );
+    }
     first_presented_out.store(false, Ordering::Release);
     hwnd_out.store(0, Ordering::Release);
     window.destroy();
@@ -1614,6 +1789,7 @@ impl VideoPlayer {
         autoplay: bool,
         resume_secs: Option<f64>,
         hw_decode: bool,
+        deinterlace: crate::settings::VideoDeinterlaceMode,
         #[cfg(windows)] gpu_video_device: Option<
             std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
         >,
@@ -1731,6 +1907,7 @@ impl VideoPlayer {
             cancel.clone(),
             target_rate,
             hw_decode,
+            deinterlace,
             #[cfg(windows)]
             gpu_video_device,
             engine_state_handle.clone(),
@@ -1784,7 +1961,7 @@ impl VideoPlayer {
             )
         });
 
-        Self {
+        let player = Self {
             path,
             clock,
             engine,
@@ -1822,7 +1999,18 @@ impl VideoPlayer {
             native_hover_thumbnail_target_secs: Mutex::new(None),
             #[cfg(windows)]
             native_hover_thumbnail_sent_key: Mutex::new(None),
-        }
+        };
+        crate::logger::log(format!(
+            "[video-debug] VideoPlayer::open done path={} autoplay={} volume={:.2} engine_state={} resume_secs={:?} video_rx_len={} audio_rx_len={}",
+            player.path.display(),
+            autoplay,
+            initial_volume,
+            player.engine_state_name(),
+            player.pending_resume_secs,
+            player.decode.video_rx.len(),
+            player.decode.audio_rx.len()
+        ));
+        player
     }
 
     /// Phase 3c: engine event channel から events を drain して engine actor に
@@ -1936,6 +2124,7 @@ impl VideoPlayer {
         // 通常の再生中は単純トグル。
         if !self.clock.is_playing() && self.clock.is_eof_reached() {
             self.clock.request_seek(0.0);
+            self.clear_audio_output_buffer();
             self.clock.set_playing(true);
             // engine 側にも seek を伝えて epoch を同期させる。user 操作の seek は
             // autoplay 強制 (= seek 後に Paused にならないように)。
@@ -1964,6 +2153,13 @@ impl VideoPlayer {
 
     pub fn set_playing(&self, p: bool) {
         let prev = self.clock.is_playing();
+        crate::logger::log(format!(
+            "[video-debug] set_playing({p}) called: prev_playing={prev} engine_state={} seek_serial={} video_rx_len={} audio_rx_len={}",
+            self.engine_state_name(),
+            self.clock.current_seek_serial(),
+            self.decode.video_rx.len(),
+            self.decode.audio_rx.len()
+        ));
         self.clock.set_playing(p);
         // Phase 9.C: engine 状態も同期。set_playing は外部 API なので呼び出し元が
         // 既に engine.apply_command を呼んでいるケースがあるが、apply_command は
@@ -1971,6 +2167,12 @@ impl VideoPlayer {
         if prev != p {
             self.dispatch_play_pause(p);
         }
+        crate::logger::log(format!(
+            "[video-debug] set_playing({p}) done: engine_state={} playing={} seek_serial={}",
+            self.engine_state_name(),
+            self.clock.is_playing(),
+            self.clock.current_seek_serial()
+        ));
     }
 
     pub(crate) fn clear_audio_output_buffer(&self) {
@@ -1993,7 +2195,16 @@ impl VideoPlayer {
     /// ユーザー操作 1 回で完結させる)。
     pub fn seek(&self, target_secs: f64) {
         let clamped = self.clamp_seek_target(target_secs);
+        crate::logger::log(format!(
+            "[video-debug] seek({target_secs:.3}) called: clamped={clamped:.3} engine_state={} prev_seek_serial={} playing={} video_rx_len={} audio_rx_len={}",
+            self.engine_state_name(),
+            self.clock.current_seek_serial(),
+            self.clock.is_playing(),
+            self.decode.video_rx.len(),
+            self.decode.audio_rx.len()
+        ));
         self.clock.request_seek(clamped); // = SeekKind::Precise
+        self.clear_audio_output_buffer();
         if !self.clock.is_playing() {
             self.clock.set_playing(true);
         }
@@ -2004,6 +2215,15 @@ impl VideoPlayer {
         let mut g = self.engine.lock().unwrap();
         g.handle_seek_request(clamped);
         g.apply_command(engine::actor::TransportCommand::Play);
+        drop(g);
+        crate::logger::log(format!(
+            "[video-debug] seek({target_secs:.3}) dispatched: engine_state={} seek_serial={} playing={} video_rx_len={} audio_rx_len={}",
+            self.engine_state_name(),
+            self.clock.current_seek_serial(),
+            self.clock.is_playing(),
+            self.decode.video_rx.len(),
+            self.decode.audio_rx.len()
+        ));
     }
 
     /// 相対シーク (←→ ホットキー)。
@@ -2019,6 +2239,7 @@ impl VideoPlayer {
         let target = self.clamp_seek_target(raw);
         self.clock
             .request_seek_with_kind(target, clock::SeekKind::Fast);
+        self.clear_audio_output_buffer();
         if !self.clock.is_playing() {
             self.clock.set_playing(true);
         }
@@ -2446,6 +2667,7 @@ impl VideoPlayer {
             if self.loop_enabled.load(std::sync::atomic::Ordering::Acquire) {
                 // ループ再生 ON: 先頭にシークし続行 (= 設定の video_loop)。
                 self.clock.request_seek(0.0);
+                self.clear_audio_output_buffer();
                 self.clock.set_playing(true);
                 // engine 側の epoch も同期 (= AvClock seek_serial と engine
                 // current_seek_epoch の不整合を防ぐ)。loop 周回も autoplay 強制。
@@ -2746,6 +2968,22 @@ impl VideoPlayer {
     pub fn engine_state_code(&self) -> u8 {
         self.engine_state_atomic
             .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub fn engine_state_name(&self) -> &'static str {
+        engine_state_code_name(self.engine_state_code())
+    }
+
+    pub fn current_seek_serial(&self) -> u64 {
+        self.clock.current_seek_serial()
+    }
+
+    pub fn video_rx_len(&self) -> usize {
+        self.decode.video_rx.len()
+    }
+
+    pub fn audio_rx_len(&self) -> usize {
+        self.decode.audio_rx.len()
     }
 
     /// GPU 経路で最新表示フレームの view-only 情報 (handle / dims)。

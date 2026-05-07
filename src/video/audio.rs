@@ -25,6 +25,8 @@ use super::clock::{AvClock, SEEK_TARGET_TOLERANCE_SECS};
 use super::decoder::AudioFrame;
 use super::engine::actor::state_code;
 
+const MAX_STALE_AUDIO_DRAIN_PER_TICK: usize = 256;
+
 /// 音声出力ストリーム。drop すると `pause` + Stream drop + pump スレッド join を
 /// 順序通りに行い、別動画への切替時に前動画の音声が残らないようにする。
 pub struct AudioOutput {
@@ -187,6 +189,8 @@ struct AudioBuffer {
     /// 最後に push したフレームの seek_serial。AvClock の現行 serial と異なれば
     /// pump thread 側で破棄する。
     pump_seek_serial: u64,
+    /// `fill_output` の seek stale clear ログを seek 世代ごとに 1 回に抑えるための記録。
+    last_fill_stale_clear_logged_serial: u64,
     /// PDC (Plugin Delay Compensation) 用: 直近 push 時点でのプラグインチェーン
     /// 全体の構造的遅延 (秒)。`fill_output` がこれを `clock.set_audio_pts` で減算し、
     /// video clock を audio より遅らせて A/V sync を保つ。
@@ -211,6 +215,45 @@ struct AudioBuffer {
     /// 動画凍結 / 長時間の wall-rate キャッチアップ無しで瞬時に映像位置が補正される
     /// (= ユーザー要望: 「映像ジャンプの方が好ましい」)。
     pdc_latency_secs_applied: f64,
+}
+
+#[derive(Debug, Default)]
+struct StaleAudioDrainResult {
+    dropped: usize,
+    deferred_serial: Option<u64>,
+    hit_limit: bool,
+    disconnected: bool,
+    remaining_rx_len: usize,
+}
+
+fn drain_stale_audio_rx(
+    rx: &Receiver<AudioFrame>,
+    live_serial: u64,
+    deferred_frame: &mut Option<AudioFrame>,
+) -> StaleAudioDrainResult {
+    let mut result = StaleAudioDrainResult::default();
+    while result.dropped < MAX_STALE_AUDIO_DRAIN_PER_TICK {
+        match rx.try_recv() {
+            Ok(frame) if frame.seek_serial < live_serial => {
+                result.dropped += 1;
+            }
+            Ok(frame) => {
+                result.deferred_serial = Some(frame.seek_serial);
+                *deferred_frame = Some(frame);
+                break;
+            }
+            Err(crossbeam_channel::TryRecvError::Empty) => break,
+            Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                result.disconnected = true;
+                break;
+            }
+        }
+    }
+    result.hit_limit = result.dropped >= MAX_STALE_AUDIO_DRAIN_PER_TICK
+        && deferred_frame.is_none()
+        && !result.disconnected;
+    result.remaining_rx_len = rx.len();
+    result
 }
 
 const SAFETY_LIMITER_LOOKAHEAD_SECS: f64 = 0.005;
@@ -363,6 +406,7 @@ pub fn start(
         sample_rate,
         samples_per_sec: sample_rate as f64 * 2.0,
         pump_seek_serial: 0,
+        last_fill_stale_clear_logged_serial: 0,
         pdc_latency_secs: 0.0,
         pdc_latency_secs_applied: 0.0,
     }));
@@ -578,6 +622,8 @@ fn run_pump(
     // notify_seek_completed(target) で立てた anchor が上書きされていた。
     let mut pump_anchor_target_secs: Option<f64> = None;
     let mut last_warning_at: Option<std::time::Instant> = None;
+    let mut last_stale_drain_log_serial: Option<u64> = None;
+    let mut deferred_frame: Option<AudioFrame> = None;
 
     while !cancel.load(Ordering::Acquire) {
         // ── frame 受信 (timeout 付き、Codex 助言): audio_rx 到着を待たず自律 refill ──
@@ -590,7 +636,9 @@ fn run_pump(
             RAW_BACKPRESSURE_PREROLL_SECS
         };
         let pause_audio_intake = clock.audio_raw_pending_secs() >= raw_backpressure_secs;
-        let frame_opt: Option<AudioFrame> = if pause_audio_intake {
+        let frame_opt: Option<AudioFrame> = if let Some(frame) = deferred_frame.take() {
+            Some(frame)
+        } else if pause_audio_intake {
             crossbeam_channel::select! {
                 recv(shutdown_rx) -> _ => return,
                 default(std::time::Duration::from_millis(REFILL_TICK_MS)) => None,
@@ -707,8 +755,8 @@ fn run_pump(
         // timeout tick で起きた場合、'intake で seek serial 更新が走らないため、
         // 旧 seek 世代の raw/processed を保持したまま VST process してしまう可能性がある。
         // 直接 clock.current_seek_serial() と buf.pump_seek_serial を比較し、
-        // pump の方が古ければ raw/processed を clear + tx_queued を 0 化 + publish 0 して
-        // refill loop を skip。
+        // pump の方が古ければ raw/processed を clear + tx_queued を 0 化 + publish 0 し、
+        // audio_rx に残った stale frame も一気に drain してから refill loop を skip。
         //
         // **tx_queued も 0 化** (Codex P2、2026-05-01 改訂):
         // raw/processed だけ消しても、`total_audio_buffer_secs()` には audio_tx_queued が
@@ -718,15 +766,76 @@ fn run_pump(
         // 旧世代の `add_tx_queued(-duration)` が後から届いても `max(0.0)` で clamp される。
         {
             let cur_clock_serial = clock.current_seek_serial();
-            let mut buf = buffer.lock().unwrap();
-            if buf.pump_seek_serial < cur_clock_serial {
-                buf.processed.clear();
-                buf.drain_offset_in_first = 0;
-                buf.raw_pending.clear();
-                clock.zero_audio_tx_queued_secs();
-                publish_buffer_secs(&buf, &clock);
-                // pump_seek_serial は変更しない (= 次の 'intake で frame.seek_serial 経由
-                // で正規ルートで更新される)。本 tick は queue clear だけして outer loop へ。
+            let cleared_pump_serial = {
+                let mut buf = buffer.lock().unwrap();
+                if buf.pump_seek_serial < cur_clock_serial {
+                    let old_serial = buf.pump_seek_serial;
+                    buf.processed.clear();
+                    buf.drain_offset_in_first = 0;
+                    buf.raw_pending.clear();
+                    clock.zero_audio_tx_queued_secs();
+                    publish_buffer_secs(&buf, &clock);
+                    Some(old_serial)
+                } else {
+                    None
+                }
+            };
+
+            if let Some(old_serial) = cleared_pump_serial {
+                seek_target_secs = None;
+                pump_anchor_target_secs = None;
+                activated = false;
+
+                let drain_result = drain_stale_audio_rx(&rx, cur_clock_serial, &mut deferred_frame);
+                let should_log = drain_result.dropped > 0
+                    || drain_result.deferred_serial.is_some()
+                    || drain_result.hit_limit
+                    || drain_result.disconnected
+                    || last_stale_drain_log_serial != Some(cur_clock_serial);
+                if should_log {
+                    last_stale_drain_log_serial = Some(cur_clock_serial);
+                    crate::logger::log(format!(
+                        "[audio-pump] stale drain on seek: old_serial={} live_serial={} dropped={} deferred_serial={:?} rx_len={} hit_limit={} disconnected={}",
+                        old_serial,
+                        cur_clock_serial,
+                        drain_result.dropped,
+                        drain_result.deferred_serial,
+                        drain_result.remaining_rx_len,
+                        drain_result.hit_limit,
+                        drain_result.disconnected
+                    ));
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "audio_pump",
+                            "stale_drain_on_seek",
+                            None,
+                            0,
+                            &[
+                                ("old_serial", serde_json::Value::from(old_serial as i64)),
+                                (
+                                    "live_serial",
+                                    serde_json::Value::from(cur_clock_serial as i64),
+                                ),
+                                (
+                                    "dropped",
+                                    serde_json::Value::from(drain_result.dropped as i64),
+                                ),
+                                (
+                                    "deferred_serial",
+                                    drain_result
+                                        .deferred_serial
+                                        .map(|s| serde_json::Value::from(s as i64))
+                                        .unwrap_or(serde_json::Value::Null),
+                                ),
+                                (
+                                    "remaining_rx_len",
+                                    serde_json::Value::from(drain_result.remaining_rx_len as i64),
+                                ),
+                                ("hit_limit", serde_json::Value::from(drain_result.hit_limit)),
+                            ],
+                        );
+                    }
+                }
                 continue;
             }
         }
@@ -1013,18 +1122,52 @@ fn fill_output(
     let mut buf = buffer.lock().unwrap();
 
     if buf.pump_seek_serial < clock_serial {
+        let pump_serial = buf.pump_seek_serial;
+        let processed_secs: f64 = buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
+            + remaining_first_chunk_secs(&buf);
+        let raw_pending_secs: f64 = buf.raw_pending.iter().map(|f| f.duration_secs).sum::<f64>();
+        let should_log = buf.last_fill_stale_clear_logged_serial != clock_serial;
+        if should_log {
+            buf.last_fill_stale_clear_logged_serial = clock_serial;
+        }
         buf.processed.clear();
         buf.drain_offset_in_first = 0;
         buf.raw_pending.clear();
         publish_buffer_secs(&buf, clock);
+        drop(buf);
+        if should_log {
+            crate::logger::log(format!(
+                "[audio-out] fill_output stale clear: pump_serial={} live_serial={} processed_secs={:.3} raw_pending_secs={:.3}",
+                pump_serial, clock_serial, processed_secs, raw_pending_secs
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "audio_out",
+                    "fill_output_stale_clear",
+                    None,
+                    0,
+                    &[
+                        ("pump_serial", serde_json::Value::from(pump_serial as i64)),
+                        ("live_serial", serde_json::Value::from(clock_serial as i64)),
+                        ("processed_secs", serde_json::Value::from(processed_secs)),
+                        (
+                            "raw_pending_secs",
+                            serde_json::Value::from(raw_pending_secs),
+                        ),
+                    ],
+                );
+            }
+        }
         out.fill(0.0);
         return;
     }
 
     // ── EngineState gate (Codex P1-4): PLAYING 以外は silence + 非 drain ──
     //
-    // pump は raw_pending に積み続けるので back-pressure 連鎖は発生しない (= Codex
-    // P1-1 の overflow handling と組み合わせて demux/audio_decode を止めない設計)。
+    // PLAYING 以外で processed を drain しないため、上流が音声を作り続けると
+    // raw_pending → processed → audio_tx → audio_pkt_tx の順に逆圧が連鎖する。
+    // そのため decoder.rs の audio decode thread は PAUSED/EOF で park し、タイル
+    // fast swap 中などの停止状態で audio 側だけが queue を満杯にしないようにする。
     if engine_state.load(Ordering::Acquire) != state_code::PLAYING {
         publish_buffer_secs(&buf, clock);
         out.fill(0.0);
@@ -1177,6 +1320,7 @@ mod tests {
             sample_rate,
             samples_per_sec: sample_rate as f64 * 2.0,
             pump_seek_serial: 0,
+            last_fill_stale_clear_logged_serial: 0,
             pdc_latency_secs: 0.0,
             pdc_latency_secs_applied: 0.0,
         }))
@@ -1197,6 +1341,54 @@ mod tests {
             seek_serial: 0,
             pdc_latency_secs_at_process: 0.0,
         }
+    }
+
+    fn make_audio_frame(seek_serial: u64) -> AudioFrame {
+        AudioFrame {
+            samples: vec![0.0; 2],
+            pts_secs: seek_serial as f64,
+            seek_serial,
+            duration_secs: 0.01,
+            seek_target_secs: Some(seek_serial as f64),
+        }
+    }
+
+    #[test]
+    fn drain_stale_audio_rx_drops_old_and_defers_first_current() {
+        let (tx, rx) = bounded(8);
+        tx.send(make_audio_frame(1)).unwrap();
+        tx.send(make_audio_frame(1)).unwrap();
+        tx.send(make_audio_frame(2)).unwrap();
+        tx.send(make_audio_frame(3)).unwrap();
+
+        let mut deferred = None;
+        let result = drain_stale_audio_rx(&rx, 2, &mut deferred);
+
+        assert_eq!(result.dropped, 2);
+        assert_eq!(result.deferred_serial, Some(2));
+        assert_eq!(deferred.as_ref().map(|f| f.seek_serial), Some(2));
+        assert_eq!(
+            rx.len(),
+            1,
+            "frames after the deferred one must stay queued"
+        );
+        assert!(!result.disconnected);
+    }
+
+    #[test]
+    fn drain_stale_audio_rx_drops_all_stale_without_deferred() {
+        let (tx, rx) = bounded(8);
+        tx.send(make_audio_frame(0)).unwrap();
+        tx.send(make_audio_frame(1)).unwrap();
+
+        let mut deferred = None;
+        let result = drain_stale_audio_rx(&rx, 2, &mut deferred);
+
+        assert_eq!(result.dropped, 2);
+        assert_eq!(result.deferred_serial, None);
+        assert!(deferred.is_none());
+        assert_eq!(rx.len(), 0);
+        assert!(!result.hit_limit);
     }
 
     #[test]
@@ -1407,6 +1599,50 @@ mod tests {
         assert!(
             out.iter().all(|&s| s == 0.0),
             "Buffering: output must be silence"
+        );
+    }
+
+    /// PAUSED 中は drain せず、PLAYING へ戻したら同じ buffer を消費し始める。
+    #[test]
+    fn fill_output_paused_then_playing_starts_drain() {
+        let buf = make_buffer(48_000);
+        let clock = make_clock();
+        let samples_per_sec = buf.lock().unwrap().samples_per_sec;
+        let state = Arc::new(AtomicU8::new(state_code::PAUSED));
+
+        {
+            let mut b = buf.lock().unwrap();
+            b.processed
+                .push_back(make_chunk(vec![0.5; 480], 0.0, samples_per_sec));
+        }
+        let pts_before = buf.lock().unwrap().next_pts_secs;
+
+        let mut out = [1.0_f32; 480];
+        fill_output(&mut out, &buf, &clock, &state);
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "Paused: output must be silence"
+        );
+        assert_eq!(
+            buf.lock().unwrap().processed.front().unwrap().samples.len(),
+            480,
+            "Paused: processed chunk must remain queued"
+        );
+        assert_eq!(
+            buf.lock().unwrap().next_pts_secs,
+            pts_before,
+            "Paused: pts must not advance"
+        );
+
+        state.store(state_code::PLAYING, Ordering::Release);
+        fill_output(&mut out, &buf, &clock, &state);
+        assert!(
+            out.iter().all(|&s| (s - 0.3).abs() < 1e-6),
+            "Playing: buffered samples should be drained with volume applied"
+        );
+        assert!(
+            buf.lock().unwrap().processed.is_empty(),
+            "Playing: processed chunk should be consumed"
         );
     }
 

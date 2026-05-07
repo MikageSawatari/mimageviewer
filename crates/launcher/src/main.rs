@@ -20,6 +20,7 @@ static CORE_EXE: &[u8] = include_bytes!(env!("MIMV_CORE_EXE"));
 static AVCODEC_DLL: &[u8] = include_bytes!(env!("MIMV_AVCODEC_DLL"));
 static AVFORMAT_DLL: &[u8] = include_bytes!(env!("MIMV_AVFORMAT_DLL"));
 static AVUTIL_DLL: &[u8] = include_bytes!(env!("MIMV_AVUTIL_DLL"));
+static AVFILTER_DLL: &[u8] = include_bytes!(env!("MIMV_AVFILTER_DLL"));
 static SWSCALE_DLL: &[u8] = include_bytes!(env!("MIMV_SWSCALE_DLL"));
 static SWRESAMPLE_DLL: &[u8] = include_bytes!(env!("MIMV_SWRESAMPLE_DLL"));
 
@@ -34,6 +35,11 @@ const ASSETS: &[(&str, &[u8], &str)] = &[
         "swscale-8.dll",
         SWSCALE_DLL,
         env!("MIMV_SWSCALE_DLL_SHA256"),
+    ),
+    (
+        "avfilter-10.dll",
+        AVFILTER_DLL,
+        env!("MIMV_AVFILTER_DLL_SHA256"),
     ),
     (
         "avcodec-61.dll",

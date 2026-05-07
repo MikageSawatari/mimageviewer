@@ -10336,12 +10336,14 @@ impl App {
         let resume = play_test_start
             .or_else(|| self.settings.video_resume_positions.get(&path_key).copied());
         let video_hw_decode = self.settings.video_hw_decode;
+        let video_deinterlace = self.settings.video_deinterlace;
         let player = crate::video::VideoPlayer::open(
             vp,
             vol,
             autoplay,
             resume,
             video_hw_decode,
+            video_deinterlace,
             #[cfg(windows)]
             if video_hw_decode {
                 self.gpu_video_device.clone()
@@ -13507,6 +13509,45 @@ impl App {
             return;
         }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            crate::logger::log(format!(
+                "[native-video] tile seek command: idx={fs_idx} target={target_secs:.3} engine_state={} seek_serial={} playing={} pos={:.3} video_rx_len={} audio_rx_len={}",
+                player.engine_state_name(),
+                player.current_seek_serial(),
+                player.is_playing(),
+                player.position(),
+                player.video_rx_len(),
+                player.audio_rx_len()
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "native_presenter",
+                    "tile_seek_command",
+                    None,
+                    0,
+                    &[
+                        ("idx", serde_json::Value::from(fs_idx as i64)),
+                        ("target", serde_json::Value::from(target_secs)),
+                        (
+                            "engine_state",
+                            serde_json::Value::from(player.engine_state_name()),
+                        ),
+                        (
+                            "seek_serial",
+                            serde_json::Value::from(player.current_seek_serial() as i64),
+                        ),
+                        ("playing", serde_json::Value::from(player.is_playing())),
+                        ("position", serde_json::Value::from(player.position())),
+                        (
+                            "video_rx_len",
+                            serde_json::Value::from(player.video_rx_len() as i64),
+                        ),
+                        (
+                            "audio_rx_len",
+                            serde_json::Value::from(player.audio_rx_len() as i64),
+                        ),
+                    ],
+                );
+            }
             player.seek(target_secs);
             self.video_tile_state = None;
             self.video_tile_swap_pending = None;
@@ -14699,6 +14740,49 @@ impl App {
         self.open_fullscreen(target_idx);
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
             player.set_playing(false);
+            crate::logger::log(format!(
+                "[video-debug] post-swap state: idx={target_idx} engine_state={} seek_serial={} clock_is_playing={} pos={:.3} video_rx_len={} audio_rx_len={} pending_frames={}",
+                player.engine_state_name(),
+                player.current_seek_serial(),
+                player.is_playing(),
+                player.position(),
+                player.video_rx_len(),
+                player.audio_rx_len(),
+                player.pending_frames()
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "native_presenter",
+                    "post_swap_state",
+                    None,
+                    0,
+                    &[
+                        ("idx", serde_json::Value::from(target_idx as i64)),
+                        (
+                            "engine_state",
+                            serde_json::Value::from(player.engine_state_name()),
+                        ),
+                        (
+                            "seek_serial",
+                            serde_json::Value::from(player.current_seek_serial() as i64),
+                        ),
+                        ("playing", serde_json::Value::from(player.is_playing())),
+                        ("position", serde_json::Value::from(player.position())),
+                        (
+                            "video_rx_len",
+                            serde_json::Value::from(player.video_rx_len() as i64),
+                        ),
+                        (
+                            "audio_rx_len",
+                            serde_json::Value::from(player.audio_rx_len() as i64),
+                        ),
+                        (
+                            "pending_frames",
+                            serde_json::Value::from(player.pending_frames() as i64),
+                        ),
+                    ],
+                );
+            }
         }
         self.set_native_video_tile_preparing_overlay(target_idx);
         self.sync_native_video_metadata(target_idx);

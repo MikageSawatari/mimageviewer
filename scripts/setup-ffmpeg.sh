@@ -9,7 +9,7 @@
 #   - gh (GitHub CLI), unzip, curl が使えること (Git Bash / MSYS2 等)
 #
 # 出力:
-#   vendor/ffmpeg/bin/{avcodec,avformat,avutil,swscale,swresample}-*.dll
+#   vendor/ffmpeg/bin/{avcodec,avformat,avutil,avfilter,swscale,swresample}-*.dll
 #   vendor/ffmpeg/include/  (FFmpeg ヘッダ)
 #   vendor/ffmpeg/lib/      (import library .lib)
 #   vendor/ffmpeg/LICENSE.txt
@@ -97,11 +97,11 @@ if [ -z "$src_root" ] || [ ! -d "$src_root/bin" ]; then
     exit 1
 fi
 
-# ── 必要 DLL のみをコピー (avdevice/avfilter/postproc/ffmpeg.exe 等は不要) ──
+# ── 必要 DLL のみをコピー (avdevice/postproc/ffmpeg.exe 等は不要) ──
 mkdir -p "$VENDOR_DIR/bin" "$VENDOR_DIR/include" "$VENDOR_DIR/lib"
 
 echo "Copying DLLs ..."
-for prefix in avcodec avformat avutil swscale swresample; do
+for prefix in avcodec avformat avutil avfilter swscale swresample; do
     found=$(find "$src_root/bin" -maxdepth 1 -name "${prefix}-*.dll" -type f | head -1)
     if [ -z "$found" ]; then
         echo "Missing required DLL: ${prefix}-*.dll" >&2
@@ -111,7 +111,7 @@ for prefix in avcodec avformat avutil swscale swresample; do
 done
 
 echo "Copying import libraries ..."
-for prefix in avcodec avformat avutil swscale swresample; do
+for prefix in avcodec avformat avutil avfilter swscale swresample; do
     found=$(find "$src_root/lib" -maxdepth 1 -name "${prefix}.lib" -type f | head -1)
     if [ -z "$found" ]; then
         echo "Missing required lib: ${prefix}.lib" >&2

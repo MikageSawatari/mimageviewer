@@ -77,6 +77,10 @@ fn check_vendor_files() {
             "bash scripts/setup-ffmpeg.sh",
         ),
         (
+            "vendor/ffmpeg/bin/avfilter-10.dll",
+            "bash scripts/setup-ffmpeg.sh",
+        ),
+        (
             "vendor/ffmpeg/bin/swscale-8.dll",
             "bash scripts/setup-ffmpeg.sh",
         ),
@@ -94,6 +98,10 @@ fn check_vendor_files() {
         ),
         (
             "vendor/ffmpeg/lib/avutil.lib",
+            "bash scripts/setup-ffmpeg.sh",
+        ),
+        (
+            "vendor/ffmpeg/lib/avfilter.lib",
             "bash scripts/setup-ffmpeg.sh",
         ),
         (

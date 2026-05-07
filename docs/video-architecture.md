@@ -39,7 +39,7 @@ FFmpeg HW decoder (D3D11VA)
     ↓
 AVFrame (format = AV_PIX_FMT_D3D11、data[0]=ID3D11Texture2D*、data[1]=subresource)
     ↓
-ID3D11VideoProcessor (NV12/P010 → SDR BGRA8、bicubic)
+ID3D11VideoProcessor (NV12/P010 → SDR BGRA8、bicubic。現状 GPU 経路のデインターレースは未実装)
     ↓
 NT 共有 ID3D11Texture2D (BGRA8、KEYEDMUTEX 付き)
     ↓
@@ -64,6 +64,8 @@ FFmpeg HW decoder (D3D11VA) or SW decoder
 AVFrame
     ↓
 av_hwframe_transfer_data (HW のとき、GPU→CPU、12.5MB/frame@4K)
+    ↓
+libavfilter bwdif (設定が Auto/On かつ対象フレームの場合。send_frame、フレームレート維持)
     ↓
 swscale (NV12/YUV → RGBA、CPU で 24MB allocation)
     ↓
@@ -123,7 +125,7 @@ src/video/
 |---|---|---|---|
 | `video-demux` (= `run_decoder`) | `Input::packets()` ループ、seek 調停、EOF idle wait、`engine_event_tx` への SeekCompleted 発火 | `Arc<AvClock>` (seek_request) / 動画ファイル | `video_pkt_tx` / `audio_pkt_tx` (各 bounded=64) |
 | `video-decode` (= `run_video_decode`) | HW (`D3D11VA`) → GPU blit / SW + swscale、PACE_LEAD=0.30 の pacing、`new_seek_pending` generation race check | `video_pkt_rx` (`VideoWorkerMsg::{Packet, Flush, Eof}`) | `video_tx` (bounded=24、`VideoFrame`) |
-| `video-audio-decode` (= `run_audio_decode`) | avcodec decode + swresample、post-seek packet/sample trim、EOF drain | `audio_pkt_rx` (`AudioWorkerMsg::{Packet, Flush, Eof}`) | `audio_tx` (bounded=32、`AudioFrame`) |
+| `video-audio-decode` (= `run_audio_decode`) | avcodec decode + swresample、post-seek packet/sample trim、PAUSED/EOF park、EOF drain | `audio_pkt_rx` (`AudioWorkerMsg::{Packet, Flush, Eof}`) | `audio_tx` (bounded=32、`AudioFrame`) |
 
 **seek 調停**: `clock.take_seek_request()` を pull するのは demux thread のみ
 (= 旧構造と同じ単一 puller)。`input.seek` 成否を判定後、両 decode thread に
@@ -132,6 +134,11 @@ src/video/
 (動画は `drop_before_secs` + `post_seek_frame_sent=false` で 1 枚目を保護、音声は
 packet/sample 段階の trim)。`target_secs.is_none()` (= seek 失敗) なら trim なしで
 通常 pacing に戻す。
+video packet は direct queue が満杯になると demux 側の `pending_video_packets`
+overflow に退避する。seek preroll 中に audio packet send が満杯で待っている場合も、
+audio の timeout 待ちごとにこの video overflow を opportunistic に drain し、
+FirstFrameReady に必要な post-seek video packet が audio back-pressure の後ろに
+取り残されないようにする。
 
 **EOF**: demux thread が `input.packets()` 空を検出 → `clock.notify_eof_reached()`
 + 両 channel に `Eof` を送る。動画は内部残フレームを失っても許容なので drain なし、
@@ -174,6 +181,16 @@ LOADING/IDLE silence、Buffering 中 lookahead 許可、post-seek 1 枚目 uncon
 forward seek 常時 backward+preroll、perf overlay seek freeze、seek epoch 二重 ++ 修正
 等) は engine-redesign.md の「Phase 9 シリーズの追加修正」節に記述。
 
+**PAUSED/EOF park**: 動画 decode thread だけでなく音声 decode thread も
+`EngineState::{Paused,Eof}` では packet decode と `audio_tx` 送信を止める。`audio.rs`
+の `fill_output` は PLAYING 以外で silence を返し processed queue を drain しないため、
+音声だけが先読みを続けると `raw_pending → processed → audio_tx → audio_pkt_tx` の順に
+逆圧が連鎖し、demux が audio packet 送信で停止して post-seek video packet が供給されない。
+park 中も `seek_serial` 変化は即時に検知し、stale packet を捨てて `Flush` を受け取れるようにする。
+さらに seek 世代が進んだときは audio pump が `audio_tx` に残った stale `AudioFrame` を
+`try_recv` で一括 drain し、最初の新世代 frame だけ既存 intake 経路へ defer する。これにより
+短い park 後の `Buffering` 中でも stale audio frame が `audio_tx` を塞ぎ続けない。
+
 #### `audio.rs`
 - cpal で WASAPI Shared mode の出力 stream
 - ringbuffer 経由で decoder からのサンプルを取り込み
@@ -189,9 +206,10 @@ forward seek 常時 backward+preroll、perf overlay seek freeze、seek epoch 二
   - **実消費サンプル数ベース**: `pop_front` で取り出した分 (= `real_consumed`) のみ
     `next_pts_secs` を進める。silence 出力中は pts 進行 0 (= 旧版の「常に full want
     分進める」バグを修正、上流で正確化)。
-  - 早期 return: `!clock.is_playing()` (= PAUSED / EOF) と `pump_seek_serial < clock_serial`
-    (= pre-seek サンプル全消去) のみ。LOADING/IDLE silence gate は撤去 (= 上流 bookkeeping
-    で対処済)。詳細は [docs/video-engine-redesign.md] の「Phase 9 後の Post-cleanup refactor」節。
+  - 早期 return: `pump_seek_serial < clock_serial` (= pre-seek サンプル全消去) と
+    `engine_state != PLAYING` (= silence + processed 非 drain)、および `!clock.is_playing()`
+    のみ。非 PLAYING 中の逆圧連鎖は decoder 側の audio park で上流から抑制する。
+    詳細は [docs/video-engine-redesign.md] の「Phase 9 後の Post-cleanup refactor」節。
 
 #### `clock.rs` (`AvClock` — 薄い facade)
 - 公開 API は変更しないまま内部実装を `engine/` に委譲する **薄い facade**。
@@ -305,10 +323,11 @@ pub enum VideoFrameData {
 - `Settings.video_loop` (ループ再生)
 - `Settings.video_resume_position` (シーク位置の永続化、ファイル単位)
 - `Settings.video_hw_decode` (HW デコードを試みるかのフラグ、トラブルシュート用)
+- `Settings.video_deinterlace` (Off / Auto / On。CPU 経路で FFmpeg `bwdif=mode=send_frame` を適用)
 
 ## 配布要件
 
-- FFmpeg LGPL shared build (`avcodec`/`avformat`/`avutil`/`swscale`/`swresample` 5 DLL) を
+- FFmpeg LGPL shared build (`avcodec`/`avformat`/`avutil`/`avfilter`/`swscale`/`swresample`) を
   `include_bytes!` で exe に埋め込み、`%APPDATA%/mimageviewer/ffmpeg/` に展開
 - `SetDllDirectoryW` で動的ロード
 - LGPL ライセンス通知をソフトウェア情報パネルに掲載

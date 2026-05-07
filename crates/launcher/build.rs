@@ -65,6 +65,7 @@ fn main() {
         ("MIMV_AVCODEC_DLL", "avcodec-61.dll"),
         ("MIMV_AVFORMAT_DLL", "avformat-61.dll"),
         ("MIMV_AVUTIL_DLL", "avutil-59.dll"),
+        ("MIMV_AVFILTER_DLL", "avfilter-10.dll"),
         ("MIMV_SWSCALE_DLL", "swscale-8.dll"),
         ("MIMV_SWRESAMPLE_DLL", "swresample-5.dll"),
     ];

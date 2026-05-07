@@ -12,12 +12,12 @@
 //! (詳細は `build.rs` 上部のコメントと CLAUDE.md「FFmpeg LGPL DLL 管理」節)。
 //!
 //! 妥協策として、`build.rs` が `vendor/ffmpeg/bin/*.dll` を `target/{debug,release}/`
-//! に自動コピーする。配布時は exe と DLL 5 ファイルを同じフォルダに置く必要がある:
+//! に自動コピーする。配布時は exe と FFmpeg DLL を同じフォルダに置く必要がある:
 //!
-//! - インストーラ (Inno Setup): `installer/mimageviewer.iss` で DLL 5 ファイルを
+//! - インストーラ (Inno Setup): `installer/mimageviewer.iss` で FFmpeg DLL を
 //!   インストール先にコピーする。
 //! - 単体配布: `mimageviewer.exe` + `avcodec-61.dll` + `avformat-61.dll` +
-//!   `avutil-59.dll` + `swscale-8.dll` + `swresample-5.dll` の 6 ファイルセット。
+//!   `avutil-59.dll` + `avfilter-10.dll` + `swscale-8.dll` + `swresample-5.dll`。
 //!
 //! 本モジュールは「DLL が exe と同じ場所にあるか」を確認してログに出すだけ
 //! (実体ロードは Windows ローダが既に行っている)。
@@ -28,6 +28,7 @@ const REQUIRED_DLLS: &[&str] = &[
     "avcodec-61.dll",
     "avformat-61.dll",
     "avutil-59.dll",
+    "avfilter-10.dll",
     "swscale-8.dll",
     "swresample-5.dll",
 ];

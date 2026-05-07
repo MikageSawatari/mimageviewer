@@ -804,10 +804,12 @@ buf.next_pts_secs += consumed_secs;
 // ... set_audio_pts
 ```
 
-**撤去**:
-- Phase 9.B/9.E LOADING/IDLE silence gate (= 不要)
-- `audio.rs::start` / `fill_output` の `engine_state: Arc<AtomicU8>` 引数 (= silence gate
-  のためだけに渡していた)
+**撤去/保持**:
+- Phase 9.B/9.E LOADING/IDLE 専用 silence gate (= 不要)
+- `audio.rs::start` / `fill_output` の `engine_state: Arc<AtomicU8>` 引数は保持。
+  PLAYING 以外では silence + processed 非 drain にするためで、これにより一時停止中の
+  PTS 前進を防ぐ。非 drain に伴う上流の逆圧連鎖は `run_audio_decode` の
+  PAUSED/EOF park で抑制する。
 
 **保持** (Codex review P? 反映):
 - Phase 9.A wall-rate cap (`clock.rs::set_audio_pts`) は **defensive safety net**
@@ -823,6 +825,11 @@ buf.next_pts_secs += consumed_secs;
 - `fill_output_empty_buffer_does_not_advance_pts`: 完全 underrun で pts 進行 0
 - `fill_output_partial_drain_advances_only_real_consumed`: 部分 drain で実消費分のみ
 - `fill_output_full_drain_advances_full_amount`: 完全 drain で旧版と同じ全消費量
+- `fill_output_paused_then_playing_starts_drain`: PAUSED 中は silence + 非 drain、
+  PLAYING 復帰後に同じ processed chunk を消費
+- `drain_stale_audio_rx_drops_old_and_defers_first_current`: seek 世代更新時に
+  audio pump が stale `audio_tx` frame を一括破棄し、新世代 frame は既存 intake
+  経路へ defer する
 
 ## 検証
 
@@ -1337,6 +1344,16 @@ drops that old packet and returns to the loop so `take_seek_request()` can send
 the ordered `Flush` marker immediately. This avoids the intermittent black
 screen case where a resume/tile-click seek waited behind a full audio packet
 queue and the engine remained stuck after presenting only the first frame.
+
+2026-05-07 follow-up: tile-click precise seek exposed another demux ordering
+case. The demux-side video overflow already held enough post-seek video packets
+to reach the requested target, but the next audio packet send blocked on a full
+`audio_pkt_tx`; while stuck in that send loop, demux could not return to the
+top-level pending-video drain and `FirstFrameReady` was never emitted. Audio
+packet sends now use an audio-specific timeout loop that opportunistically
+drains `pending_video_packets` into `video_pkt_tx` while waiting. This preserves
+audio back-pressure semantics while preventing video preroll packets from being
+stranded behind a full audio queue.
 
 2026-05-06 startup follow-up: cold WASAPI stream creation can stall the UI
 thread during the first grid-open video. mIV now starts a background

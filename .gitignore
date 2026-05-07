@@ -21,6 +21,7 @@ bench_thumbs.tsv
 # Benchmark output (scripts/bench-overnight.ps1)
 /bench_results/
 /video-soak-results/
+/tools/ffmpeg/
 # TensorRT pack DL cache (scripts/setup-tensorrt-pack.ps1)
 /vendor/tensorrt-cache/
 
