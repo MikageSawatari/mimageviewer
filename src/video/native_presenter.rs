@@ -543,24 +543,7 @@ fn create_present_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), 
 
 fn configure_overlay_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
-    if let Ok(data) = std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf") {
-        fonts.font_data.insert(
-            "emoji".to_owned(),
-            Arc::new(egui::FontData::from_owned(data)),
-        );
-        // Prefer the emoji font for symbol/emoji codepoints in the standalone
-        // native overlay; Japanese text still falls through to the UI font.
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "emoji".to_owned());
-        fonts
-            .families
-            .entry(egui::FontFamily::Monospace)
-            .or_default()
-            .insert(0, "emoji".to_owned());
-    }
+    let mut fallback_order: Vec<String> = Vec::new();
     for path in [
         r"C:\Windows\Fonts\YuGothM.ttc",
         r"C:\Windows\Fonts\meiryo.ttc",
@@ -573,16 +556,28 @@ fn configure_overlay_fonts(ctx: &egui::Context) {
             "japanese".to_owned(),
             Arc::new(egui::FontData::from_owned(data)),
         );
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            let family_fonts = fonts.families.entry(family).or_default();
-            let insert_at = if family_fonts.iter().any(|name| name == "emoji") {
-                1
-            } else {
-                0
-            };
-            family_fonts.insert(insert_at, "japanese".to_owned());
-        }
+        fallback_order.push("japanese".to_owned());
         break;
+    }
+    for (name, path) in [
+        ("symbols", r"C:\Windows\Fonts\seguisym.ttf"),
+        ("math", r"C:\Windows\Fonts\cambria.ttc"),
+        ("historic", r"C:\Windows\Fonts\seguihis.ttf"),
+        ("emoji", r"C:\Windows\Fonts\seguiemj.ttf"),
+    ] {
+        let Ok(data) = std::fs::read(path) else {
+            continue;
+        };
+        fonts
+            .font_data
+            .insert(name.to_owned(), Arc::new(egui::FontData::from_owned(data)));
+        fallback_order.push(name.to_owned());
+    }
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let family_fonts = fonts.families.entry(family).or_default();
+        for name in fallback_order.iter().rev() {
+            family_fonts.insert(0, name.clone());
+        }
     }
     ctx.set_fonts(fonts);
 }
@@ -2570,7 +2565,6 @@ impl NativeEguiOverlay {
                     perf_visible,
                     vst3_available,
                     vst3_panel_visible,
-                    &mut frame_step_hold,
                     &mut commands,
                 );
             }
@@ -2638,7 +2632,8 @@ impl NativeEguiOverlay {
                 .show(ctx, |ui| {
                     ui.set_min_size(egui::vec2(overlay_width_points, 46.0));
                     let hud_rect = ui.min_rect();
-                    let painter = ui.painter();
+                    let painter = ui.painter().clone();
+                    let painter = &painter;
                     painter.rect_filled(
                         hud_rect,
                         0.0,
@@ -2724,15 +2719,81 @@ impl NativeEguiOverlay {
                     }
                     x = loop_rect.max.x + gap;
 
+                    let prev_frame_rect = egui::Rect::from_min_size(
+                        egui::pos2(x, center_y - btn_size * 0.5),
+                        egui::vec2(btn_size, btn_size),
+                    );
+                    let prev_down = draw_native_frame_step_button(
+                        ui,
+                        painter,
+                        prev_frame_rect,
+                        "native_video_prev_frame",
+                        -1,
+                        "前のフレーム [Ctrl+Shift+←]",
+                        &mut frame_step_hold,
+                        &mut commands,
+                    );
+                    x = prev_frame_rect.max.x + gap;
+
+                    let screenshot_rect = egui::Rect::from_min_size(
+                        egui::pos2(x, center_y - btn_size * 0.5),
+                        egui::vec2(btn_size, btn_size),
+                    );
+                    let screenshot_resp = ui.interact(
+                        screenshot_rect,
+                        egui::Id::new("native_video_screenshot"),
+                        egui::Sense::click(),
+                    );
+                    draw_overlay_button_bg(
+                        painter,
+                        screenshot_rect,
+                        screenshot_resp.hovered(),
+                        false,
+                    );
+                    draw_overlay_camera_icon(painter, screenshot_rect);
+                    let screenshot_resp =
+                        screenshot_resp.on_hover_text("現在フレームをクリップボードにコピー");
+                    if screenshot_resp.clicked() {
+                        commands.push(NativeOverlayCommand::CopyFrameToClipboard);
+                    }
+                    x = screenshot_rect.max.x + gap;
+
+                    let next_frame_rect = egui::Rect::from_min_size(
+                        egui::pos2(x, center_y - btn_size * 0.5),
+                        egui::vec2(btn_size, btn_size),
+                    );
+                    let next_down = draw_native_frame_step_button(
+                        ui,
+                        painter,
+                        next_frame_rect,
+                        "native_video_next_frame",
+                        1,
+                        "次のフレーム [Ctrl+Shift+→]",
+                        &mut frame_step_hold,
+                        &mut commands,
+                    );
+                    x = next_frame_rect.max.x + gap;
+                    if !prev_down && !next_down {
+                        frame_step_hold = None;
+                    }
+
                     let time_w = 132.0;
                     let vol_pct_w = 40.0;
                     let vol_slider_w = 90.0;
                     let mute_w = btn_size;
                     let speed_w = btn_size * 1.55;
-                    let right_pad =
-                        side_pad + vol_pct_w + gap + vol_slider_w + gap + speed_w + gap + mute_w;
-                    let bar_min_x = x + time_w + gap;
-                    let bar_max_x = (hud_rect.max.x - right_pad).max(bar_min_x + 1.0);
+                    let right_controls_w = time_w
+                        + gap
+                        + speed_w
+                        + gap
+                        + mute_w
+                        + gap
+                        + vol_slider_w
+                        + gap
+                        + vol_pct_w;
+                    let right_controls_x = hud_rect.max.x - side_pad - right_controls_w;
+                    let bar_min_x = x;
+                    let bar_max_x = (right_controls_x - gap).max(bar_min_x + 1.0);
                     let bar_rect = egui::Rect::from_min_max(
                         egui::pos2(bar_min_x, center_y - 4.0),
                         egui::pos2(bar_max_x, center_y + 4.0),
@@ -2742,17 +2803,31 @@ impl NativeEguiOverlay {
                         egui::pos2(bar_max_x, hud_rect.max.y),
                     );
 
+                    let time_x = bar_max_x + gap;
                     let label = format!(
                         "{} / {}",
                         format_overlay_time(position_secs),
                         format_overlay_time(duration_secs)
                     );
                     painter.text(
-                        egui::pos2(x, center_y),
+                        egui::pos2(time_x, center_y),
                         egui::Align2::LEFT_CENTER,
                         label,
                         egui::FontId::proportional(14.0),
                         egui::Color32::from_rgb(238, 238, 238),
+                    );
+
+                    let speed_rect = egui::Rect::from_min_size(
+                        egui::pos2(time_x + time_w + gap, center_y - btn_size * 0.5),
+                        egui::vec2(speed_w, btn_size),
+                    );
+                    let mute_rect = egui::Rect::from_min_size(
+                        egui::pos2(speed_rect.max.x + gap, center_y - btn_size * 0.5),
+                        egui::vec2(mute_w, btn_size),
+                    );
+                    let vol_rect = egui::Rect::from_min_max(
+                        egui::pos2(mute_rect.max.x + gap, center_y - 4.0),
+                        egui::pos2(mute_rect.max.x + gap + vol_slider_w, center_y + 4.0),
                     );
 
                     painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(74));
@@ -3003,30 +3078,6 @@ impl NativeEguiOverlay {
                         }
                     }
 
-                    let mute_rect = egui::Rect::from_min_size(
-                        egui::pos2(bar_max_x + gap, center_y - btn_size * 0.5),
-                        egui::vec2(btn_size, btn_size),
-                    );
-                    let mute_resp = ui.interact(
-                        mute_rect,
-                        egui::Id::new("native_video_mute"),
-                        egui::Sense::click(),
-                    );
-                    draw_overlay_button_bg(painter, mute_rect, mute_resp.hovered(), muted);
-                    draw_overlay_speaker_icon(painter, mute_rect.center(), btn_size * 0.46, muted);
-                    let mute_resp = mute_resp.on_hover_text(if muted {
-                        "ミュート解除 [M]"
-                    } else {
-                        "ミュート [M]"
-                    });
-                    if mute_resp.clicked() {
-                        commands.push(NativeOverlayCommand::ToggleMute);
-                    }
-
-                    let speed_rect = egui::Rect::from_min_size(
-                        egui::pos2(mute_rect.max.x + gap, center_y - btn_size * 0.5),
-                        egui::vec2(speed_w, btn_size),
-                    );
                     let speed_resp = ui.interact(
                         speed_rect,
                         egui::Id::new("native_video_speed"),
@@ -3100,10 +3151,22 @@ impl NativeEguiOverlay {
                         }
                     }
 
-                    let vol_rect = egui::Rect::from_min_max(
-                        egui::pos2(speed_rect.max.x + gap, center_y - 4.0),
-                        egui::pos2(speed_rect.max.x + gap + vol_slider_w, center_y + 4.0),
+                    let mute_resp = ui.interact(
+                        mute_rect,
+                        egui::Id::new("native_video_mute"),
+                        egui::Sense::click(),
                     );
+                    draw_overlay_button_bg(painter, mute_rect, mute_resp.hovered(), muted);
+                    draw_overlay_speaker_icon(painter, mute_rect.center(), btn_size * 0.46, muted);
+                    let mute_resp = mute_resp.on_hover_text(if muted {
+                        "ミュート解除 [M]"
+                    } else {
+                        "ミュート [M]"
+                    });
+                    if mute_resp.clicked() {
+                        commands.push(NativeOverlayCommand::ToggleMute);
+                    }
+
                     painter.rect_filled(vol_rect, 2.0, egui::Color32::from_gray(74));
                     let volume = finite_video_volume(volume);
                     let max_volume = crate::settings::VIDEO_VOLUME_MAX;
@@ -3153,9 +3216,16 @@ impl NativeEguiOverlay {
                     if vol_resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     }
-                    let vol_resp =
-                        vol_resp.on_hover_text("音量 (100%超はブースト) [Shift+↑ / Shift+↓]");
-                    if (vol_resp.clicked() || vol_resp.dragged())
+                    let vol_resp = vol_resp.on_hover_text(
+                        "音量 (右クリック / ダブルクリックで 100%) [Shift+↑ / Shift+↓]",
+                    );
+                    if vol_resp.secondary_clicked() || vol_resp.double_clicked() {
+                        self.last_volume_target = Some(1.0);
+                        commands.push(NativeOverlayCommand::SetVolume {
+                            volume: 1.0,
+                            persist: true,
+                        });
+                    } else if (vol_resp.clicked() || vol_resp.dragged())
                         && let Some(pos) = vol_resp.interact_pointer_pos()
                     {
                         let value = ((pos.x - vol_rect.min.x) / vol_rect.width()).clamp(0.0, 1.0)
@@ -3898,7 +3968,6 @@ fn draw_native_bookmark_title_editor(
 
 #[derive(Copy, Clone)]
 enum NativeTopButtonGlyph {
-    Screenshot,
     TileGrid,
     PerfGraph,
     Vst3,
@@ -3924,7 +3993,6 @@ fn draw_native_top_button(
     let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
     draw_overlay_button_bg(painter, rect, resp.hovered(), active);
     match glyph {
-        NativeTopButtonGlyph::Screenshot => draw_overlay_camera_icon(painter, rect),
         NativeTopButtonGlyph::TileGrid => draw_overlay_tile_grid_icon(painter, rect),
         NativeTopButtonGlyph::PerfGraph => draw_overlay_perf_graph_icon(painter, rect),
         NativeTopButtonGlyph::Vst3 => draw_overlay_vst3_top_icon(painter, rect),
@@ -3940,18 +4008,13 @@ fn draw_native_top_button(
 fn draw_native_frame_step_button(
     ui: &mut egui::Ui,
     painter: &egui::Painter,
-    x: &mut f32,
-    y: f32,
-    width: f32,
-    height: f32,
-    gap: f32,
+    rect: egui::Rect,
     id: &'static str,
     direction: i32,
     tooltip: &str,
     hold: &mut Option<NativeFrameStepHold>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) -> bool {
-    let rect = egui::Rect::from_min_size(egui::pos2(*x, y), egui::vec2(width, height));
     let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
     draw_overlay_button_bg(painter, rect, resp.hovered(), false);
     draw_overlay_frame_step_icon(painter, rect, direction);
@@ -3979,7 +4042,6 @@ fn draw_native_frame_step_button(
             }
         }
     }
-    *x -= width + gap;
     down
 }
 
@@ -4415,7 +4477,6 @@ fn draw_native_top_bar(
     perf_visible: bool,
     vst3_available: bool,
     vst3_panel_visible: bool,
-    frame_step_hold: &mut Option<NativeFrameStepHold>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     egui::Area::new(egui::Id::new("native_video_top_bar"))
@@ -4537,52 +4598,6 @@ fn draw_native_top_bar(
                     NativeOverlayCommand::ToggleVst3Gui,
                     commands,
                 );
-            }
-            let next_down = draw_native_frame_step_button(
-                ui,
-                &painter,
-                &mut x,
-                y,
-                btn_size,
-                btn_size,
-                gap,
-                "native_top_next_frame",
-                1,
-                "次のフレーム [Ctrl+Shift+→]",
-                frame_step_hold,
-                commands,
-            );
-            draw_native_top_button(
-                ui,
-                &painter,
-                &mut x,
-                y,
-                btn_size,
-                btn_size,
-                gap,
-                "native_top_screenshot",
-                NativeTopButtonGlyph::Screenshot,
-                false,
-                "現在フレームをクリップボードにコピー",
-                NativeOverlayCommand::CopyFrameToClipboard,
-                commands,
-            );
-            let prev_down = draw_native_frame_step_button(
-                ui,
-                &painter,
-                &mut x,
-                y,
-                btn_size,
-                btn_size,
-                gap,
-                "native_top_prev_frame",
-                -1,
-                "前のフレーム [Ctrl+Shift+←]",
-                frame_step_hold,
-                commands,
-            );
-            if !prev_down && !next_down {
-                *frame_step_hold = None;
             }
         });
 }
