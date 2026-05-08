@@ -104,9 +104,12 @@ pub struct VideoPlayer {
     /// 最後に実際へ表示したフレームの source pts。スクリーンショットとフレーム送りは
     /// 再生クロックではなく「見えているフレーム」を基準にする。
     last_displayed_pts_bits: Arc<AtomicU64>,
-    /// フレーム送りで最後に発行した precise seek target。seek 完了前に連続入力された
-    /// ときも同じ表示フレームを基準にせず、発行済み target から次の target を積む。
+    /// フレーム送りで最後に発行した precise seek target。repeat で次 target を出すとき、
+    /// 表示済み PTS がまだ追いついていなくても発行済み target を基準にできる。
     frame_step_target_bits: AtomicU64,
+    /// 最後の frame-step seek 発行時点での表示済みフレーム sequence。
+    /// 長押し repeat はこの値から `displayed_frame_seq` が進むまで次 target を出さない。
+    frame_step_issued_display_seq: AtomicU64,
     /// Native overlay HUD が UI thread を経由せず duration を読めるように共有する。
     /// f64::to_bits() / from_bits() で保持し、InfoReceived 時に一度更新する。
     #[cfg(windows)]
@@ -1902,6 +1905,7 @@ unsafe impl Sync for GpuLatestFrame {}
 /// パターン (~400ms) + HDD random read (~100-300ms) を ~800ms buffer で
 /// 吸収して UI tick の空振りを抑える (Phase 8.J)。
 pub(crate) const MAX_RENDER_QUEUE: usize = 24;
+const FRAME_STEP_NO_PENDING_SEQ: u64 = u64::MAX;
 
 pub(crate) fn frame_step_interval_secs(avg_fps: f64) -> f64 {
     if avg_fps.is_finite() && avg_fps > 1.0 {
@@ -1920,6 +1924,16 @@ fn frame_step_base_secs(
         .or(last_displayed_pts)
         .unwrap_or(current_position)
         .max(0.0)
+}
+
+fn frame_step_waiting_for_display(
+    pending_step_target: Option<f64>,
+    issued_display_seq: u64,
+    current_display_seq: u64,
+) -> bool {
+    pending_step_target.is_some()
+        && issued_display_seq != FRAME_STEP_NO_PENDING_SEQ
+        && issued_display_seq == current_display_seq
 }
 
 impl VideoPlayer {
@@ -1988,6 +2002,7 @@ impl VideoPlayer {
                 displayed_frame_seq: Arc::new(AtomicU64::new(0)),
                 last_displayed_pts_bits: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
                 frame_step_target_bits: AtomicU64::new(f64::NAN.to_bits()),
+                frame_step_issued_display_seq: AtomicU64::new(FRAME_STEP_NO_PENDING_SEQ),
                 decoder_dropped_full_count: Arc::new(AtomicU64::new(0)),
                 ui_dropped_past_count: AtomicU64::new(0),
                 cancel: Arc::new(AtomicBool::new(true)),
@@ -2136,6 +2151,7 @@ impl VideoPlayer {
             displayed_frame_seq,
             last_displayed_pts_bits,
             frame_step_target_bits: AtomicU64::new(f64::NAN.to_bits()),
+            frame_step_issued_display_seq: AtomicU64::new(FRAME_STEP_NO_PENDING_SEQ),
             #[cfg(windows)]
             duration_secs_bits,
             decoder_dropped_full_count,
@@ -2459,8 +2475,14 @@ impl VideoPlayer {
         if direction == 0 {
             return;
         }
+        let pending_step_target = self.frame_step_target();
+        let displayed_seq = self.displayed_frame_seq.load(Ordering::Acquire);
+        let issued_display_seq = self.frame_step_issued_display_seq.load(Ordering::Acquire);
+        if frame_step_waiting_for_display(pending_step_target, issued_display_seq, displayed_seq) {
+            return;
+        }
         let base = frame_step_base_secs(
-            self.frame_step_target(),
+            pending_step_target,
             self.last_displayed_pts(),
             self.position(),
         );
@@ -2468,6 +2490,8 @@ impl VideoPlayer {
         let target = self.clamp_seek_target(base + step * direction.signum() as f64);
         self.frame_step_target_bits
             .store(target.to_bits(), Ordering::Release);
+        self.frame_step_issued_display_seq
+            .store(displayed_seq, Ordering::Release);
         self.seek_paused_internal(target);
     }
 
@@ -2512,6 +2536,8 @@ impl VideoPlayer {
     fn clear_frame_step_target(&self) {
         self.frame_step_target_bits
             .store(f64::NAN.to_bits(), Ordering::Release);
+        self.frame_step_issued_display_seq
+            .store(FRAME_STEP_NO_PENDING_SEQ, Ordering::Release);
     }
 
     pub fn duration(&self) -> f64 {
@@ -3344,5 +3370,21 @@ mod tests {
         assert!((displayed - 20.0).abs() < 1.0e-9);
         let position = super::frame_step_base_secs(None, None, 30.0);
         assert!((position - 30.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn frame_step_waits_until_issued_seek_is_displayed() {
+        assert!(super::frame_step_waiting_for_display(Some(10.0), 42, 42));
+        assert!(!super::frame_step_waiting_for_display(Some(10.0), 42, 43));
+    }
+
+    #[test]
+    fn frame_step_wait_gate_ignores_empty_pending_target() {
+        assert!(!super::frame_step_waiting_for_display(None, 42, 42));
+        assert!(!super::frame_step_waiting_for_display(
+            Some(10.0),
+            super::FRAME_STEP_NO_PENDING_SEQ,
+            42
+        ));
     }
 }

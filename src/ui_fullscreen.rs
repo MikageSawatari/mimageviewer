@@ -5034,8 +5034,8 @@ fn draw_frame_step_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, directio
         ],
         stroke,
     );
-    let tip = egui::pos2(c.x - sign * r * 0.9, c.y);
-    let back_x = c.x + sign * r * 0.35;
+    let tip = egui::pos2(c.x + sign * r * 0.9, c.y);
+    let back_x = c.x - sign * r * 0.35;
     painter.add(egui::Shape::convex_polygon(
         vec![
             tip,

@@ -3920,8 +3920,8 @@ fn draw_overlay_frame_step_icon(painter: &egui::Painter, rect: egui::Rect, direc
         [egui::pos2(bar_x, c.y - 8.0), egui::pos2(bar_x, c.y + 8.0)],
         stroke,
     );
-    let tip = egui::pos2(c.x - sign * 7.0, c.y);
-    let back_x = c.x + sign * 3.5;
+    let tip = egui::pos2(c.x + sign * 7.0, c.y);
+    let back_x = c.x - sign * 3.5;
     painter.add(egui::Shape::convex_polygon(
         vec![
             tip,
