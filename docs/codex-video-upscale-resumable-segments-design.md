@@ -739,3 +739,78 @@ applicable:
    FFI wrapper be planned?
 7. Should Phase C ship video-only resume first, or should audio final mux be blocking?
 8. Are queue JSON and work manifest enough, or should the queue use SQLite from the start?
+
+---
+
+## 実装状況 (v0.9.0 リリース時点)
+
+Phase A〜F まで実装済み。`src/video/upscale/` 配下のファイル構成:
+
+| ファイル | 行数 | 責務 |
+|---|---:|---|
+| `mod.rs` | 6 | 公開 API (再エクスポート) |
+| `job.rs` | 2551 ⚠ | scale / model preset / quality enum + Options + Preflight + run_job + segment 並列実装 + keyframe snap planning + concat/mux |
+| `queue.rs` | 465 | TaskQueue / VideoUpscaleTask / TaskState / FailureReason / QueueLock + 永続化 |
+| `manifest.rs` | 408 | JobManifest + SegmentPlan + SegmentEntry + JSON atomic save/load |
+| `sidecar.rs` | 284 | `.miv.json` sidecar 読み書き |
+| `disk.rs` | 92 | ディスク空き容量チェック |
+| `paths.rs` | 188 | work dir / segment path / final temp path 計算 |
+| `ui_dialogs/video_upscale.rs` | 1122 | 登録ダイアログ + タスクウィンドウ UI |
+
+### `job.rs` 2551 行は最大の負債
+
+Phase A〜F で機能追加するたびに job.rs に積み上げてきた結果、以下の責務が同居:
+
+1. **公開 enum 定義群** (`VideoUpscaleScale` / `VideoUpscaleModelPreset` /
+   `VideoUpscaleQuality`、~140 行)
+2. **Options / Preflight 構造体** (~100 行)
+3. **`probe_video_info`** (FFmpeg avformat 経由のメタデータ取得、~70 行)
+4. **`run_job` メイン関数** (state machine 駆動の job 実行、~100 行)
+5. **`run_segmented_video_only`** (シリアル segment loop)
+6. **`run_segments_parallel`** (並列 segment loop、UI からは公開していない実験版)
+7. **Keyframe snap planning** (`build_keyframe_snap_plan` / `scan_source_keyframes` /
+   `plan_segments_from_keyframes`、~200 行)
+8. **Segment lifecycle helpers** (frame_to_pts / segment_done_and_reusable /
+   cleanup_segment_parts 等、~100 行)
+9. **後段の concat / final mux**
+
+自然な分割案 (Phase 10+):
+
+```
+upscale/
+├── job/mod.rs              # VideoUpscaleJob struct + 公開 API + run_job
+├── job/options.rs          # 公開 enum + VideoUpscaleOptions + VideoUpscalePreflight
+├── job/probe.rs            # probe_video_info (FFmpeg avformat 経由)
+├── job/segment_serial.rs   # run_segmented_video_only
+├── job/segment_parallel.rs # run_segments_parallel (実験版)
+├── job/plan.rs             # keyframe snap planning + plan_segments_from_keyframes
+└── job/finalize.rs         # video concat + final mux + sidecar 書き込み
+```
+
+### レイヤ評価
+
+| レイヤ | 状態 | 評価 |
+|---|---|---|
+| 永続キュー (`queue.rs`) | ✅ 良好 | TaskQueue / QueueLock の責務が明確、JSON atomic save、起動時 recovery 経路あり |
+| マニフェスト (`manifest.rs`) | ✅ 良好 | JobManifest schema が clean、`save_json_atomic` / `load_json` のみ汎用化 |
+| サイドカー (`sidecar.rs`) | ✅ 良好 | 単一責務、`.miv.json` 読み書きだけ |
+| ジョブ実行 (`job.rs`) | ⚠⚠ 肥大 | 上述。機能 set としては正しく動いているが、ファイルが太い |
+| UI (`ui_dialogs/video_upscale.rs`) | ✅ 良好 | 1122 行は登録ダイアログ + タスクウィンドウ + 進捗表示で妥当 |
+
+### 抽象化リーク懸念
+
+Job 実行が **同期 FFmpeg API を呼ぶ別スレッドで完結している**ため、UI スレッドが
+job を直接観測することはない。`VideoUpscaleProgressShared` を mpsc 経由で UI に
+push するため、抽象化リークは無い。
+
+### 計画的負債
+
+Phase G 候補としてあり得るもの (Phase 10+ で機能追加するなら):
+
+- **並列 segment ワーカーを正式機能化**: `run_segments_parallel` は実装済みだが UI に
+  公開していない (= 並列度が GPU メモリ / VRAM に依存して安定しないため)。`run_segments_parallel`
+  単体テストを増やしてから公開を再検討
+- **GeneralV3 以外のモデル選択**: 現状はリリース UI で「高速汎用」(`UpscaleRealEsrGeneralV3`)
+  のみ。Anime6B / x4plus 等を有効化する選択肢は残してあるが UI から触れない
+- **音声トラックの選択 / 字幕保持**: 現状は単一 audio stream を concat 後に mux で copy する。
+  multi-audio / 字幕の保持は未対応

@@ -244,10 +244,16 @@ PID 含めることで複数 mIV インスタンス起動時の衝突回避。
   `worker_notice` に `WorkerNoticeKind::DiedDuringInfer` を積む
 - 以降の `should_route_to_worker` は worker_pool が None なので false → 推論は
   自動的に DirectML へフォールバック
-- UI は毎フレーム `take_worker_notice()` で 1 回だけ通知を引き取り、右上に floating
-  banner (「TensorRT ワーカーが停止」)。「ワーカーを再起動」ボタンで
+- **自動再起動 (silent recovery、Apr 29 追加)**: `App::trt_auto_restart_attempts` が
+  `MAX_TRT_AUTO_RESTART_ATTEMPTS` (= 3) 未満なら、`poll_trt_worker_notice` が
+  バナー表示の代わりに `spawn_trt_worker_pool_guarded` でバックグラウンドに
+  pool 再 spawn を投げる (= ユーザー無通知)。`trt_restart_in_flight: AtomicBool` で
+  並行する複数の死亡通知から 2 重 spawn を防ぐ (Codex P2.6 反映)
+- silent recovery が **3 回失敗したら** (= TRT pack 自体の問題等)、4 回目以降は
+  通常の floating banner を出してユーザー操作を待つ。「ワーカーを再起動」ボタンで
   `spawn_trt_worker_pool` を再呼び出し可能 (連続失敗時はまた通知される)
-- 自動再起動はしない (連続クラッシュを避けるため、明示的なユーザー操作で復旧)
+- バックエンド切替・pack 再インストール等の正常な再起動成功で `trt_auto_restart_attempts`
+  はリセットされる
 - `TrtWorkerPool::shutdown` 時に `is_dead` なら念のため `child.kill()` してから
   `child.wait()` (子が hang した病理的ケースの保険、kill は冪等)
 
@@ -457,3 +463,39 @@ DirectML の方が速い。
 
 なお他のアップスケール 4 モデル + denoise は同じ 2026-05 bench で 1.5-2.8× の改善が
 維持されているので pack 同梱を継続。
+
+---
+
+## 抽象化評価 (v0.9.0 リリース時点)
+
+TRT サブシステムの責務分割は **clean** で、video / VST3 のような肥大ファイル問題は
+ない。ファイル構成と現在のサイズ:
+
+| ファイル | 行数 | 責務 | 評価 |
+|---|---:|---|---|
+| `runtime.rs` | 648 | AiRuntime + multi-EP dispatch + `report_worker_*` | ✅ |
+| `tensorrt_pack.rs` | 67 | pack のロード判定 | ✅ |
+| `tensorrt_builder.rs` | 163 | `--tensorrt-build` 子プロセス (engine 事前ビルド) | ✅ |
+| `tensorrt_installer.rs` | 1053 | オンラインインストーラ + manifest fetch + DL UI | ⚠ 1000 行超だが UI とロジックが緊密 |
+| `trt_worker_pool.rs` | 604 | pool 管理 + IPC + crash 検出 | ✅ |
+| `trt_worker_proto.rs` | 217 | IPC プロトコル型 (Cmd / Resp) | ✅ |
+| `trt_worker_runtime.rs` | 424 | worker subprocess エントリポイント | ✅ |
+| `trt_worker_shm.rs` | 256 | shm 管理 (CreateFileMapping ラッパー) | ✅ |
+| `ui_dialogs/trt_install.rs` | 467 | install ダイアログ | ✅ |
+| `ui_dialogs/trt_worker_notice.rs` | 153 | 通知バナー | ✅ |
+
+`tensorrt_installer.rs` は 1053 行と大きめだが、HTTP DL + 進捗報告 + 一時パス /
+manifest 検証 / final move + UI コールバックを一連で行うインストール ロジックで、
+責務が「pack をローカルに展開する」に閉じている。ロジックと UI の分離が必要に
+なった時点で `installer/core.rs` + `installer/ui.rs` に分けるのが自然 (Phase 10+)。
+
+### 自動再起動が `app.rs` に住んでいる件
+
+silent recovery 3 回までの自動再起動ロジックは `App::trt_auto_restart_attempts` /
+`App::trt_restart_in_flight` / `App::poll_trt_worker_notice` で実装されているため、
+**TRT サブシステムから見ると app.rs に逆依存している**形になっている。
+
+これ自体は不健全とまでは言えない (= UI 表示判断と再起動判断は同じ場所で持つのが
+自然) が、もし将来的に「mIV 以外のフロントエンドからも TRT runtime を使いたい」
+状況が出たら、auto-restart ループは `AiRuntime` 側に移すべき。現状の単一フロント
+エンド (= mIV 本体のみ) では問題なし。

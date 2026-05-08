@@ -74,31 +74,52 @@ ctx.load_texture (CPU→GPU、26-58ms@4K)
 egui::Image で描画
 ```
 
-## モジュール構成 (整理後)
+## モジュール構成 (v0.9.0 時点)
 
 ```
 src/video/
-├── mod.rs                  # VideoPlayer 公開 API (open / tick / seek / volume / loop)
-├── decoder.rs              # demux + 動画/音声 decode の 3-thread 構成 (HW/SW 自動切替)
-├── audio.rs                # cpal WASAPI Shared 出力
-├── audio_stretch.rs        # Signalsmith Stretch によるピッチ維持の倍速音声処理
-├── clock.rs                # AvClock (薄い facade、engine/ に委譲) — 詳細は下記
+├── mod.rs                  # VideoPlayer 公開 API + NativeVideoOutput 統合 (3445 行 ⚠ 肥大)
+├── decoder.rs              # demux + 動画/音声 decode の 3-thread 実装 (4962 行 ⚠ 肥大)
+├── audio.rs                # cpal WASAPI Shared 出力 + audio-pump thread + VST3 経由 (1864 行)
+├── audio_stretch.rs        # Signalsmith Stretch によるピッチ維持の倍速音声処理 (172 行)
+├── clock.rs                # AvClock (薄い facade、engine/ に委譲) — 詳細は下記 (905 行)
 ├── engine/                 # 動画再生エンジン (state machine + master clock 分割実装)
-│   ├── mod.rs              # EngineEvent enum (Decoder/Audio events)
-│   ├── actor.rs            # EngineActor (state machine の source of truth)
-│   ├── state.rs            # EngineState / DecoderEvent / AudioEvent / ReadinessLatch
-│   ├── clock.rs            # MasterClock + ClockAnchor (純粋な値オブジェクト)
-│   └── audio_bookkeeping.rs # 音声バッファ会計 (atomic、単独で unit test 可)
-├── ffmpeg_loader.rs        # DLL extraction + LoadLibrary (一度だけ実行)
-├── screenshot.rs           # 現在フレームのクリップボードコピー用 one-shot RGBA 抽出
-├── thumbnail.rs            # シーク先サムネイル取得 worker
-└── gpu_renderer/           # ★ DX12 backend 時のみ active、unsafe を局所化
-    ├── mod.rs              # 公開 API: GpuVideoDevice, D3d11Frame, VideoPipeline 等
-    ├── d3d11_device.rs     # D3D11 Device + VideoProcessor + Fence (純粋な NV12→RGBA blit のみ)
-    ├── ffmpeg_d3d11.rs     # FFmpeg D3D11VA hw_device_ctx 共有 (= GpuVideoDevice の D3D11 を FFmpeg に貸す)
-    ├── video_paint.rs      # egui_wgpu Callback で fullscreen quad 描画
-    └── wgpu_import.rs      # NT shared HANDLE → wgpu::Texture (wgpu_hal::dx12 経由)
+│   ├── mod.rs              # EngineEvent enum (Decoder/Audio events) (37 行)
+│   ├── actor.rs            # EngineActor (state machine の source of truth) (1873 行)
+│   ├── state.rs            # EngineState / DecoderEvent / AudioEvent / ReadinessLatch (357 行)
+│   ├── clock.rs            # MasterClock + ClockAnchor (純粋な値オブジェクト) (292 行)
+│   └── audio_bookkeeping.rs # 音声バッファ会計 (atomic、単独で unit test 可) (316 行)
+├── ffmpeg_loader.rs        # DLL extraction + LoadLibrary (57 行)
+├── screenshot.rs           # 現在フレームのクリップボードコピー用 one-shot RGBA 抽出 (173 行)
+├── thumbnail.rs            # シーク先サムネイル取得 worker (361 行)
+├── tile_thumbnails.rs      # タイルモード用一括サムネイル抽出 worker (384 行)
+├── tile_thumb_cache.rs     # タイル サムネ SQLite WebP 永続キャッシュ (358 行)
+├── native_window.rs        # ネイティブ Win32 message loop + 入力イベント変換 (577 行)
+├── native_presenter.rs     # ネイティブ DComp プレゼンター + egui overlay (6060 行 ⚠⚠ 巨大)
+├── gpu_renderer/           # ★ DX12 backend 時のみ active、unsafe を局所化
+│   ├── mod.rs              # 公開 API: GpuVideoDevice, D3d11Frame, VideoPipeline 等 (57 行)
+│   ├── d3d11_device.rs     # D3D11 Device + VideoProcessor + Fence (1134 行)
+│   ├── ffmpeg_d3d11.rs     # FFmpeg D3D11VA hw_device_ctx 共有 (159 行)
+│   ├── video_paint.rs      # egui_wgpu Callback で fullscreen quad 描画 (557 行)
+│   └── wgpu_import.rs      # NT shared HANDLE → wgpu::Texture (148 行)
+├── dsp/                    # VST3 プラグインチェーン (詳細は docs/vst3-integration.md)
+│   ├── mod.rs              # DspBridge 公開 API + チェーン管理 (2102 行 ⚠ 肥大)
+│   ├── bridge.rs           # bridge 子プロセス管理 + IPC (1033 行)
+│   ├── gui.rs              # プラグイン GUI Win32 親ウィンドウ管理 (1164 行)
+│   ├── scanner.rs          # VST3 plugin スキャン (291 行)
+│   └── extract.rs          # bridge exe APPDATA 展開 (30 行)
+└── upscale/                # オフライン動画アップスケール (詳細は本書「オフラインアップスケール」節)
+    ├── mod.rs              # 公開 API (6 行)
+    ├── job.rs              # ジョブ実行 (resumable segment 化) (2551 行 ⚠ 肥大)
+    ├── queue.rs            # 永続キュー (465 行)
+    ├── manifest.rs         # マニフェスト (進捗 / セグメント完了状態) (408 行)
+    ├── sidecar.rs          # サイドカーファイル管理 (284 行)
+    ├── disk.rs             # ディスク I/O (92 行)
+    └── paths.rs            # パス管理 (188 行)
 ```
+
+⚠ マークは「設計ドキュメントが想定する単一責務に対して、ファイルが太りすぎているか責務が
+混ざっている」ファイル。詳細は本書末尾「抽象化の現状と既知の負債」節を参照。
 
 エンジン側のリデザイン経緯は [docs/video-engine-redesign.md](video-engine-redesign.md) を
 参照。Phase 1 (skeleton) → Phase 2 (facade 化、AvClock を MasterClock + AudioBookkeeping に
@@ -298,6 +319,64 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - shader: NV12 ではなく RGBA 入力 (= VPP で変換済み) を fullscreen quad に貼る
 - bind group は毎フレーム再構築 (テクスチャが毎フレーム別 ID3D11Texture2D なので)
 
+#### `native_window.rs` (`NativeVideoWindow`)
+
+ネイティブ Win32 メッセージループ + 入力イベント変換。フルスクリーン動画再生時に
+**eframe (winit) のメインビューポートとは別の独立 HWND** を作って、DWM の合成を
+迂回するために用意した薄い層。
+
+- `CreateWindowExW` で borderless top-level window を作成、message pump を別スレッドで回す
+- `WM_KEYDOWN` / `WM_LBUTTONDOWN` / `WM_MOUSEWHEEL` 等を `NativeVideoWindowEvent` enum
+  に正規化して内部 channel に push (UI スレッドが受信)
+- `NativeVideoMouseButton` (L/M/R/X1/X2) / `NativeVideoMouseWheelEvent` 等の型は
+  egui の Event との 1:1 翻訳を意図しており、`native_presenter.rs` 側で
+  `egui::Event` に変換される
+
+責務は単一 (= 単純な入力 marshalling)。設計上の懸念はなし。
+
+#### `native_presenter.rs` (`NativeVideoPresenter` + `NativeEguiOverlay`)
+
+フルスクリーン動画用の DirectComposition 経路を一手に引き受ける**大型ファイル
+(6060 行)**。複数の責務が同居しているため将来の分割対象 (本書「抽象化の現状と既知の
+負債」節参照)。
+
+現状の内部構成:
+
+| 範囲 (行) | 責務 | 主な型 |
+|---|---|---|
+| 42–488 | 公開型定義 (overlay 状態 / イベント / コマンド) | `NativePresenterConfig`, `NativeVideoPresenter`, `NativeEguiOverlay`, 各種 `NativeOverlay*` 構造体 (15+ 個) |
+| 488–584 | 入力ルーティング (`NativeOverlayInputRouting` impl) | — |
+| 584–1557 | **D3D11 デバイス + swap chain + 共有テクスチャ + keyed mutex + 動画 present** (`NativeVideoPresenter` impl) | — |
+| 1557–1680 | 黒背景レイヤ (`NativeBlackBackground` impl) | — |
+| 1680–3291 | **egui overlay 本体** (`NativeEguiOverlay` impl: wgpu surface 管理 / context / state) | — |
+| 3291–5052 | **overlay 描画関数群** (perf overlay / jump panel / top bar / VST3 panel / metadata panel / tile overlay / center status / アイコン群) | — |
+| 5052–6060 | helper 関数 (panel 矩形計算 / 永続キャッシュキー生成 / その他) | — |
+
+ネイティブ DComp 経路を採用した理由:
+
+- eframe の `show_viewport_immediate` で借りる winit ビューポートは DWM 合成下で
+  動作するため、4K 60fps + perf overlay + 動画フレーム描画の合成が DWM の
+  `vblank` バジェットを超えて hitch する事例があった
+- ネイティブ HWND + DComp で「動画レイヤ」「黒背景レイヤ」「egui overlay レイヤ」を
+  別々の swap chain に分離し、動画レイヤだけを高頻度 present、overlay は必要時のみ
+  redraw する構造に変えることで pacing が安定した
+- 経緯と設計判断は [docs/dcomp-native-presenter-integration-plan.md](dcomp-native-presenter-integration-plan.md)
+  に詳細あり (Phase A〜D の段階的移行)
+
+#### `tile_thumbnails.rs` / `tile_thumb_cache.rs`
+
+フルスクリーン中の **タイルモード** (`S` キー / ホバーバー ▦ ボタン) で使う、
+動画から複数フレームを一括抽出して並べる仕組み。
+
+- `tile_thumbnails.rs`: 一括サムネイル抽出 worker。指定動画から N 個の絶対 PTS で
+  フレーム取得 (FFmpeg seek 系統は `screenshot.rs` と同じ one-shot 方式)
+- `tile_thumb_cache.rs`: SQLite + WebP の永続キャッシュ。**絶対 PTS をキー**にしているため
+  動画の長さが変わっても再ヒットする (Phase 8.C の修正)
+
+タイルモードの UI 描画は `native_presenter.rs` の `draw_native_tile_overlay` (4907 行〜) と
+`ui_video_tile.rs` (eframe 経路の旧実装) の二重実装になっている (= ネイティブ DComp
+経路と eframe 経路の両方で動かすため)。
+
 ## 経路選択ロジック (起動時 1 回)
 
 `src/main.rs` で以下を実行 (整理後も維持):
@@ -379,6 +458,143 @@ pub enum VideoFrameData {
 - ベンチ: `cargo run --release --bin bench_thumbs` (動画関係なし)
 - 実機検証: 4K HEVC ファイルを動画フォルダに置いてフルスクリーン再生、滑らかさ目視
 - リモデ検証: RDP 経由で起動して、`logger` の `gpu_video_pipeline=disabled (non-DX12)` を確認、CPU 経路で 1080p 動画が再生できること
+
+---
+
+## 抽象化の現状と既知の負債
+
+v0.9.0 リリース直前 (2026-05-08) に行ったアーキテクチャ レビューの所見を残す。
+**設計レイヤ自体は妥当だが、実装ファイルが太りすぎている**箇所が複数ある。
+
+### レイヤ階層自体の評価
+
+| レイヤ | 状態 | 評価 |
+|---|---|---|
+| `engine/` (state machine + master clock + audio bookkeeping) | ✅ 良好 | Phase 1〜9 の段階的リファクタで責務が綺麗に分離されている。`actor.rs` は state machine の中核として 1873 行あるが、`apply_command` / `handle_decoder_event` / `handle_audio_event` の 3 つに大別され、unit test 9 件が通っている |
+| `gpu_renderer/` | ✅ 良好 | `unsafe` を局所化する目的で 5 ファイルに分割され、各ファイルの責務が単一 (D3D11 device / FFmpeg interop / wgpu import / paint) |
+| `clock.rs` (`AvClock` facade) | ⚠️ 計画的負債 | 設計上は engine に委譲する薄い facade だが、905 行と肥大。理由は legacy 互換のため `volume` / `muted` / `seek_serial` 等を所有したまま (= EngineActor への完全移行が Phase 5+ 以降に持ち越し)。**新規コードは AvClock を直接呼ばずに EngineActor 経由で書くこと** |
+| `native_window.rs` | ✅ 良好 | 単一責務 (Win32 → enum 変換) で 577 行。問題なし |
+
+### ファイル規模の負債
+
+以下のファイルは責務が混ざって肥大しており、Phase 10 以降のリファクタ対象。
+**現状で動いているものをいじらないこと**を優先するため、即時の分割は行わない。
+新機能を入れる時に 「ついでに分けられないか」 を検討する、という運用にする。
+
+#### `native_presenter.rs` (6060 行) — 最大の負債
+
+DirectComposition プレゼンター本体に egui overlay 描画 (3370 行!) が同居している。
+自然な分割は次の通り (将来検討):
+
+```
+native_presenter.rs  (6060)
+├── (型定義 ~450 行)        → 現状維持
+├── (D3D11 + present ~970 行)→ native_presenter/core.rs (推奨残し)
+├── (NativeBlackBackground ~120) → core.rs に同居でよい
+├── (NativeEguiOverlay ~1610)→ native_presenter/overlay.rs
+├── (描画関数群 ~1760)
+│   ├── perf overlay        → native_presenter/overlay/perf.rs
+│   ├── jump panel          → native_presenter/overlay/jump.rs
+│   ├── top bar             → native_presenter/overlay/top_bar.rs
+│   ├── VST3 panel          → native_presenter/overlay/vst3.rs
+│   ├── metadata panel      → native_presenter/overlay/metadata.rs
+│   ├── tile overlay        → native_presenter/overlay/tile.rs
+│   └── center status / icons → native_presenter/overlay/icons.rs
+└── (helper ~1000 行)        → native_presenter/util.rs
+```
+
+なぜ現状で 1 ファイルになっているか: ネイティブプレゼンター実装は短期間で
+Phase A〜D を回しながら追加機能 (perf overlay → bookmark 編集 → VST3 panel → tile
+mode) を織り込んできたため、機能ごとの drawing fn を追加する場所として `native_presenter.rs`
+末尾が選ばれ続けた。各 drawing fn は 100〜200 行程度の独立関数なので、
+ファイル分割自体は機械的にできる (impl block を割らずに済む構造)。
+
+#### `decoder.rs` (4962 行) — demux + video + audio + HW + probe の同居
+
+3-thread 構成は設計通り (= demux / video decode / audio decode の thread 分離) だが、
+それぞれの thread の `run_*` 関数 + その helper 群が 1 ファイルに同居している。
+自然な分割:
+
+```
+decoder.rs (4962)
+├── decoder/mod.rs          # 公開型 (VideoFrame / AudioFrame / VideoInfo) + spawn
+├── decoder/demux.rs        # run_decoder + packet send 系 helper (~1100)
+├── decoder/video.rs        # run_video_decode + GPU blit path (~1300)
+├── decoder/audio.rs        # run_audio_decode + downmix + layout 正規化 (~1100)
+├── decoder/hw.rs           # HwDevice / try_init_d3d11va / probe_d3d11va (~600)
+└── decoder/codec.rs        # codec 候補解決 / open_video_decoder_with_candidates (~400)
+```
+
+GPU blit path (`try_gpu_blit_path` 等) は HW device と一緒に `hw.rs` に入れても良い。
+
+#### `mod.rs` (3445 行) — VideoPlayer + NativeVideoOutput の同居
+
+`VideoPlayer` impl が 1400 行あり、その中の `tick()` メソッドが特に長い (デコーダフレーム
+ポーリング / engine event dispatch / audio buffer 会計 / native presenter 呼び出し /
+UI texture アップロードがすべて入っている)。さらに同じファイルに `NativeVideoOutput` の
+入出力 channel 管理 (~200 行) が同居している。
+
+自然な分割:
+
+```
+mod.rs (3445)
+├── mod.rs                  # VideoPlayer struct + 公開 API + Drop (~700 行残し)
+├── tick.rs                 # VideoPlayer::tick + sub-routines (~1700 行)
+└── native_output.rs        # NativeVideoOutput / NativeVideoOutputCommand 系 (~500 行)
+```
+
+#### `audio.rs` (1864 行) — pump + cpal callback + VST bridge の同居
+
+`audio-pump` thread (decoder からの AudioFrame 受信 → time stretch → VST3 IPC → ring
+buffer push) と cpal RT callback (`fill_output`) と SafetyLimiter が同じファイル。
+3 つのスレッドが ring buffer (`AudioBuffer`) を介して連携するため、buffer の所有を
+中心に分けるのが自然:
+
+```
+audio.rs (1864)
+├── audio/mod.rs            # AudioOutput 公開 API + AudioBuffer (~400)
+├── audio/pump.rs           # audio-pump thread + VST3 結線 + time stretch (~700)
+├── audio/callback.rs       # fill_output + cpal stream + SafetyLimiter (~500)
+└── audio/device.rs         # cpal device 列挙 + warmup (~250)
+```
+
+#### `dsp/mod.rs` (2102 行) と `upscale/job.rs` (2551 行)
+
+VST3 と offline upscale。これらの分割方針は別ドキュメント
+([docs/vst3-integration.md](vst3-integration.md), 後述の offline upscale design) で
+扱う。
+
+### 抽象化の境界として正しい分け方になっているか
+
+**結論: 大きな線引きは正しい**。
+
+- `engine/` ↔ `decoder.rs` ↔ `audio.rs` ↔ `gpu_renderer/` ↔ `native_presenter.rs` の
+  境界は妥当。各層が他の層に対して「event channel + Arc<X> 共有」という最小 API で
+  接続されており、内部を入れ替えやすい (実際 native presenter は eframe ビューポート版
+  と切り替え可能になっている)
+- `engine/` 内部の `MasterClock` / `EngineActor` / `AudioBookkeeping` の 3 分割は
+  Codex レビューで明示的に推奨された分割で、適切なグラニュラリティ
+- `gpu_renderer/` は unsafe 境界としても綺麗 (4 つのモジュールにまたがる D3D11 / D3D12
+  / wgpu interop が型レベルで境界を持っている)
+
+**問題なのは「層の中の責務」が太っていること**で、層をまたいだ抽象化リークではない。
+将来の Phase 10+ で機械的にファイル分割すれば解消できる範囲の負債。
+
+### Codex レビューを定期的に取る運用について
+
+video サブシステムは Codex P1〜P3 反映を多数行ってきた経緯がある (=
+[docs/video-engine-redesign.md](video-engine-redesign.md) の Phase 9.A〜9.G、Phase 9
+後の counter consolidation 等)。今後も `cargo build` と単体テストが通っただけで
+「設計上正しい」とは限らないので、新機能や挙動変更を入れたときは
+
+```bash
+codex exec --sandbox read-only -o /tmp/codex-video.txt \
+  "Review video subsystem changes since <baseline>. Focus on engine state machine
+   invariants, decoder pacing, audio buffer accounting, native presenter z-order /
+   keyed mutex / fence ordering. Return findings ordered by severity." < /dev/null
+```
+
+の形で第二意見を取ることを推奨する (CLAUDE.md「Codex CLI レビュー」節)。
 
 ---
 
