@@ -1519,6 +1519,8 @@ impl App {
                                 cfg!(windows) && is_video_mode && self.settings.vst3_enabled;
                             let vst3_panel_open = self.show_vst3_manager;
                             let mut vst3_pressed = false;
+                            let mut video_screenshot_pressed = false;
+                            let mut video_frame_step_request = None;
                             Self::draw_fs_hover_bar(
                                 ui, ctx, full_rect,
                                 &state.location_display,
@@ -1544,7 +1546,17 @@ impl App {
                                 show_vst3_button,
                                 vst3_panel_open,
                                 &mut vst3_pressed,
+                                &mut video_screenshot_pressed,
+                                &mut video_frame_step_request,
+                                &mut self.video_frame_step_hold,
+                                fs_idx,
                             );
+                            if video_screenshot_pressed {
+                                self.copy_video_frame_to_clipboard(fs_idx);
+                            }
+                            if let Some(direction) = video_frame_step_request {
+                                self.step_video_frame(ctx, fs_idx, direction);
+                            }
                             // ▦ タイルボタンが押されたら toggle_video_tile_mode に dispatch
                             #[cfg(windows)]
                             if tile_pressed {
@@ -4134,11 +4146,20 @@ impl App {
         show_vst3_button: bool,
         vst3_panel_open: bool,
         vst3_pressed: &mut bool,
+        video_screenshot_pressed: &mut bool,
+        video_frame_step_request: &mut Option<i32>,
+        video_frame_step_hold: &mut Option<crate::app::VideoFrameStepHold>,
+        fs_idx: usize,
     ) {
         let hover_in_top =
             ctx.input(|i| i.pointer.hover_pos().map(|p| p.y < 60.0).unwrap_or(false));
         // adjustment_mode がオンならオーバーレイとして常に表示
         if !hover_in_top && !force_show && !*spread_popup_open && !*adjustment_mode {
+            if !ctx.input(|i| i.pointer.primary_down())
+                && video_frame_step_hold.is_some_and(|h| h.fs_idx == fs_idx)
+            {
+                *video_frame_step_hold = None;
+            }
             return;
         }
 
@@ -4238,6 +4259,76 @@ impl App {
                 *nav_delta = 0;
             }
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+
+            let next_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_video_next_frame_btn",
+                |hovered| bar_button_bg(hovered, false),
+                false,
+                |p, c, r| draw_frame_step_icon(p, c, r, 1),
+            );
+            let next_resp = next_resp.on_hover_text("次のフレーム [Ctrl+Shift+→]");
+            let next_down = handle_frame_step_button(
+                ctx,
+                fs_idx,
+                1,
+                &next_resp,
+                video_frame_step_hold,
+                video_frame_step_request,
+            );
+            if next_resp.hovered() {
+                *nav_delta = 0;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+
+            let screenshot_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_video_screenshot_btn",
+                |hovered| bar_button_bg(hovered, false),
+                false,
+                |p, c, r| draw_camera_icon(p, c, r),
+            );
+            let screenshot_resp =
+                screenshot_resp.on_hover_text("現在フレームをクリップボードにコピー");
+            if screenshot_resp.clicked() {
+                *video_screenshot_pressed = true;
+            }
+            if screenshot_resp.hovered() {
+                *nav_delta = 0;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+
+            let prev_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_video_prev_frame_btn",
+                |hovered| bar_button_bg(hovered, false),
+                false,
+                |p, c, r| draw_frame_step_icon(p, c, r, -1),
+            );
+            let prev_resp = prev_resp.on_hover_text("前のフレーム [Ctrl+Shift+←]");
+            let prev_down = handle_frame_step_button(
+                ctx,
+                fs_idx,
+                -1,
+                &prev_resp,
+                video_frame_step_hold,
+                video_frame_step_request,
+            );
+            if prev_resp.hovered() {
+                *nav_delta = 0;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+
+            if !prev_down && !next_down && video_frame_step_hold.is_some_and(|h| h.fs_idx == fs_idx)
+            {
+                *video_frame_step_hold = None;
+            }
         } else {
             let play_resp = draw_bar_button(
                 ui,
@@ -4831,6 +4922,41 @@ fn draw_bar_button(
     resp
 }
 
+fn handle_frame_step_button(
+    ctx: &egui::Context,
+    fs_idx: usize,
+    direction: i32,
+    response: &egui::Response,
+    hold: &mut Option<crate::app::VideoFrameStepHold>,
+    request: &mut Option<i32>,
+) -> bool {
+    let down = response.is_pointer_button_down_on();
+    if !down {
+        return false;
+    }
+    let now = std::time::Instant::now();
+    match hold {
+        Some(state) if state.fs_idx == fs_idx && state.direction == direction => {
+            if now.saturating_duration_since(state.last_step_at)
+                >= std::time::Duration::from_millis(100)
+            {
+                state.last_step_at = now;
+                *request = Some(direction);
+            }
+        }
+        _ => {
+            *hold = Some(crate::app::VideoFrameStepHold {
+                fs_idx,
+                direction,
+                last_step_at: now,
+            });
+            *request = Some(direction);
+        }
+    }
+    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    true
+}
+
 /// "VST" テキストラベルを描画する (= ホバーバーの VST3 管理ボタン用アイコン)。
 /// 🎚 (LEVEL SLIDER) は mIV のフォント (Noto Sans CJK JP) で tofu 化するため
 /// テキストで描く。3 文字なら 32px のボタンに収まる。
@@ -4856,6 +4982,46 @@ fn draw_close_icon(painter: &egui::Painter, c: egui::Pos2, _r: f32) {
         [egui::pos2(c.x + r, c.y - r), egui::pos2(c.x - r, c.y + r)],
         stroke,
     );
+}
+
+fn draw_frame_step_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, direction: i32) {
+    let color = egui::Color32::WHITE;
+    let stroke = egui::Stroke::new(2.0, color);
+    let sign = if direction < 0 { -1.0 } else { 1.0 };
+    let bar_x = c.x + sign * r * 0.9;
+    painter.line_segment(
+        [
+            egui::pos2(bar_x, c.y - r * 1.05),
+            egui::pos2(bar_x, c.y + r * 1.05),
+        ],
+        stroke,
+    );
+    let tip = egui::pos2(c.x - sign * r * 0.9, c.y);
+    let back_x = c.x + sign * r * 0.35;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            tip,
+            egui::pos2(back_x, c.y - r * 1.0),
+            egui::pos2(back_x, c.y + r * 1.0),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
+fn draw_camera_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let color = egui::Color32::WHITE;
+    let stroke = egui::Stroke::new(1.8, color);
+    let body =
+        egui::Rect::from_center_size(c + egui::vec2(0.0, r * 0.18), egui::vec2(r * 2.1, r * 1.5));
+    painter.rect_stroke(body, 2.0, stroke, egui::StrokeKind::Inside);
+    let hump = egui::Rect::from_min_size(
+        egui::pos2(body.min.x + r * 0.35, body.min.y - r * 0.45),
+        egui::vec2(r * 0.8, r * 0.45),
+    );
+    painter.rect_filled(hump, 1.5, color);
+    painter.circle_stroke(body.center(), r * 0.43, stroke);
+    painter.circle_filled(body.center(), r * 0.17, color);
 }
 
 /// 動画 HUD のボタン (play/pause / mute) の hover ハイライト。
@@ -5700,6 +5866,57 @@ impl App {
         }
     }
 
+    pub(crate) fn step_video_frame(&mut self, ctx: &egui::Context, fs_idx: usize, direction: i32) {
+        if let Some(player) = self.fs_video_player(fs_idx) {
+            player.step_frame(direction);
+            self.video_hud_last_activity = Some(std::time::Instant::now());
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
+    pub(crate) fn copy_video_frame_to_clipboard(&mut self, fs_idx: usize) {
+        let Some((path, target_secs)) = self.fs_video_player(fs_idx).and_then(|player| {
+            if player.error().is_some() || player.info().is_none() {
+                None
+            } else {
+                Some((player.path().clone(), player.screenshot_target_secs()))
+            }
+        }) else {
+            self.show_feedback_toast("動画フレームをコピーできません".to_string());
+            return;
+        };
+
+        self.show_feedback_toast("動画フレームをクリップボードへコピー中".to_string());
+        let clipboard_seq = crate::ui_dialogs::context_menu::reserve_clipboard_write_sequence();
+        std::thread::Builder::new()
+            .name("video-frame-copy".into())
+            .spawn(move || match crate::video::screenshot::capture_frame(&path, target_secs) {
+                Ok(frame) => {
+                    crate::logger::log(format!(
+                        "video frame copied to clipboard: target={:.3}s decoded_target={:.3}s {}x{} {}",
+                        target_secs,
+                        frame.target_secs,
+                        frame.width,
+                        frame.height,
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                    ));
+                    crate::ui_dialogs::context_menu::copy_rgba_image_to_clipboard_async_seq(
+                        frame.width,
+                        frame.height,
+                        frame.rgba,
+                        clipboard_seq,
+                    );
+                }
+                Err(err) => {
+                    crate::logger::log(format!(
+                        "video frame copy failed: target={target_secs:.3}s {}: {err}",
+                        path.display()
+                    ));
+                }
+            })
+            .ok();
+    }
+
     /// 動画のチャプター開始 / ブックマーク / ピンを 1 本の Vec に集約し pts 昇順で返す。
     /// シークバー描画 (マーカー縦線) と J/K ジャンプの両方が同じソースを使う。
     pub(crate) fn collect_video_nav_markers(&self, fs_idx: usize) -> Vec<NavMarker> {
@@ -5777,6 +5994,18 @@ impl App {
         // Phase 7.H シーク粒度: ←→=5 秒、Shift+←→=1 秒、Ctrl+←→=30 秒。
         // ↑↓ は consume せず後段の image arrow_up/down (= 前後ファイル) に流す
         // (= マウスホイールと整合)。Shift+↑↓ だけ動画モードで音量に使う。
+        let ctrl_shift_left = ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::ArrowLeft,
+            )
+        });
+        let ctrl_shift_right = ctx.input_mut(|i| {
+            i.consume_key(
+                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                egui::Key::ArrowRight,
+            )
+        });
         let shift_left =
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft));
         let shift_right =
@@ -5839,6 +6068,12 @@ impl App {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             if enter {
                 player.toggle_play();
+            }
+            if ctrl_shift_left {
+                player.step_frame(-1);
+            }
+            if ctrl_shift_right {
+                player.step_frame(1);
             }
             // Phase 7.H シーク粒度:
             //   ←→ = 5 秒 (デフォルト、動画プレイヤー慣例)
@@ -5913,6 +6148,8 @@ impl App {
             || shift_right
             || ctrl_left
             || ctrl_right
+            || ctrl_shift_left
+            || ctrl_shift_right
             || shift_up
             || shift_down
             || mute_key

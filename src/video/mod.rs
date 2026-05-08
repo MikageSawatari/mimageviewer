@@ -34,6 +34,7 @@ pub mod gpu_renderer;
 pub mod native_presenter;
 #[cfg(windows)]
 pub mod native_window;
+pub mod screenshot;
 pub mod thumbnail;
 pub mod tile_thumb_cache;
 pub mod tile_thumbnails;
@@ -100,6 +101,9 @@ pub struct VideoPlayer {
     /// +1。GPU/CPU 両経路で更新するので、UI 側の perf overlay が経路に依存せず
     /// 「新フレーム到着」を検知できる (Phase 8.I 修正)。
     displayed_frame_seq: Arc<AtomicU64>,
+    /// 最後に実際へ表示したフレームの source pts。スクリーンショットとフレーム送りは
+    /// 再生クロックではなく「見えているフレーム」を基準にする。
+    last_displayed_pts_bits: Arc<AtomicU64>,
     /// Native overlay HUD が UI thread を経由せず duration を読めるように共有する。
     /// f64::to_bits() / from_bits() で保持し、InfoReceived 時に一度更新する。
     #[cfg(windows)]
@@ -256,6 +260,10 @@ pub enum NativeVideoOutputEvent {
     SetPlaybackSpeed {
         speed: f64,
     },
+    CopyFrameToClipboard,
+    FrameStep {
+        direction: i32,
+    },
     AddBookmarkAt {
         target_secs: f64,
     },
@@ -273,6 +281,7 @@ pub(crate) struct SwitchSourcePayload {
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
     displayed_frame_seq: Arc<AtomicU64>,
+    last_displayed_pts_bits: Arc<AtomicU64>,
     duration_secs_bits: Arc<AtomicU64>,
     source_epoch: u64,
     show_preparing_overlay: bool,
@@ -333,6 +342,7 @@ struct PresenterSourceState {
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
     displayed_frame_seq: Arc<AtomicU64>,
+    last_displayed_pts_bits: Arc<AtomicU64>,
     duration_secs_bits: Arc<AtomicU64>,
     source_epoch: u64,
     queue: std::collections::VecDeque<VideoFrame>,
@@ -355,6 +365,7 @@ impl PresenterSourceState {
             clock: payload.clock,
             engine_event_tx: payload.engine_event_tx,
             displayed_frame_seq: payload.displayed_frame_seq,
+            last_displayed_pts_bits: payload.last_displayed_pts_bits,
             duration_secs_bits: payload.duration_secs_bits,
             source_epoch: payload.source_epoch,
             queue: std::collections::VecDeque::new(),
@@ -393,6 +404,7 @@ impl NativeVideoOutput {
         clock: Arc<AvClock>,
         engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
         displayed_frame_seq: Arc<AtomicU64>,
+        last_displayed_pts_bits: Arc<AtomicU64>,
         duration_secs_bits: Arc<AtomicU64>,
         config: NativeVideoOutputConfig,
     ) -> Option<Self> {
@@ -419,6 +431,7 @@ impl NativeVideoOutput {
                     clock,
                     engine_event_tx,
                     displayed_frame_seq,
+                    last_displayed_pts_bits,
                     duration_secs_bits,
                     config,
                     command_rx,
@@ -879,11 +892,71 @@ fn send_native_output_event(
 }
 
 #[cfg(windows)]
+fn send_native_overlay_command(
+    tx: &std::sync::mpsc::Sender<(u64, NativeVideoOutputEvent)>,
+    source_epoch: u64,
+    command: crate::video::native_presenter::NativeOverlayCommand,
+) {
+    use crate::video::native_presenter::NativeOverlayCommand as Command;
+    let event = match command {
+        Command::Seek { target_secs } => NativeVideoOutputEvent::Seek { target_secs },
+        Command::TileSeek { target_secs } => NativeVideoOutputEvent::TileSeek { target_secs },
+        Command::WheelNavigate { delta } => NativeVideoOutputEvent::WheelNavigate { delta },
+        Command::TileColumnsDelta { delta } => NativeVideoOutputEvent::TileColumnsDelta { delta },
+        Command::RequestSeekThumbnail { target_secs } => {
+            NativeVideoOutputEvent::RequestSeekThumbnail { target_secs }
+        }
+        Command::ToggleTileMode => NativeVideoOutputEvent::ToggleTileMode,
+        Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
+        Command::ToggleVst3Gui => NativeVideoOutputEvent::ToggleVst3Gui,
+        Command::CloseFullscreen => NativeVideoOutputEvent::CloseFullscreen,
+        Command::SetVst3PanelVisible { visible } => {
+            NativeVideoOutputEvent::SetVst3PanelVisible { visible }
+        }
+        Command::SetVst3VideoCompact { compact } => {
+            NativeVideoOutputEvent::SetVst3VideoCompact { compact }
+        }
+        Command::Vst3ShowSlotGui { idx, path } => {
+            NativeVideoOutputEvent::Vst3ShowSlotGui { idx, path }
+        }
+        Command::Vst3HideSlotGui { idx, path } => {
+            NativeVideoOutputEvent::Vst3HideSlotGui { idx, path }
+        }
+        Command::Vst3SetBypass { idx, path, bypass } => {
+            NativeVideoOutputEvent::Vst3SetBypass { idx, path, bypass }
+        }
+        Command::Vst3LoadChainSlot { slot_idx } => {
+            NativeVideoOutputEvent::Vst3LoadChainSlot { slot_idx }
+        }
+        Command::Vst3SaveChainSlot { slot_idx } => {
+            NativeVideoOutputEvent::Vst3SaveChainSlot { slot_idx }
+        }
+        Command::SeekToStartAndPlay => NativeVideoOutputEvent::SeekToStartAndPlay,
+        Command::TogglePlay => NativeVideoOutputEvent::TogglePlay,
+        Command::ToggleMute => NativeVideoOutputEvent::ToggleMute,
+        Command::SetVolume { volume, persist } => {
+            NativeVideoOutputEvent::SetVolume { volume, persist }
+        }
+        Command::SetPlaybackSpeed { speed } => NativeVideoOutputEvent::SetPlaybackSpeed { speed },
+        Command::CopyFrameToClipboard => NativeVideoOutputEvent::CopyFrameToClipboard,
+        Command::FrameStep { direction } => NativeVideoOutputEvent::FrameStep { direction },
+        Command::ToggleLoop => NativeVideoOutputEvent::ToggleLoop,
+        Command::AddBookmarkAt { target_secs } => {
+            NativeVideoOutputEvent::AddBookmarkAt { target_secs }
+        }
+        Command::TogglePinAt { target_secs } => NativeVideoOutputEvent::TogglePinAt { target_secs },
+        Command::DeleteBookmark { id } => NativeVideoOutputEvent::DeleteBookmark { id },
+    };
+    send_native_output_event(tx, source_epoch, event);
+}
+
+#[cfg(windows)]
 fn run_native_video_output(
     video_rx: crossbeam_channel::Receiver<VideoFrame>,
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
     displayed_frame_seq: Arc<AtomicU64>,
+    last_displayed_pts_bits: Arc<AtomicU64>,
     duration_secs_bits: Arc<AtomicU64>,
     config: NativeVideoOutputConfig,
     command_rx: std::sync::mpsc::Receiver<NativeVideoOutputCommand>,
@@ -965,6 +1038,7 @@ fn run_native_video_output(
         clock,
         engine_event_tx,
         displayed_frame_seq,
+        last_displayed_pts_bits,
         duration_secs_bits,
         source_epoch: 0,
         show_preparing_overlay: config.initial_tile_overlay,
@@ -1361,6 +1435,22 @@ fn run_native_video_output(
                                     NativeVideoOutputEvent::SetPlaybackSpeed { speed },
                                 );
                             }
+                            crate::video::native_presenter::NativeOverlayCommand::CopyFrameToClipboard => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::CopyFrameToClipboard,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::FrameStep {
+                                direction,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::FrameStep { direction },
+                                );
+                            }
                             crate::video::native_presenter::NativeOverlayCommand::AddBookmarkAt {
                                 target_secs,
                             } => {
@@ -1414,7 +1504,7 @@ fn run_native_video_output(
             || (presenter.overlay_wants_periodic_tick()
                 && last_overlay_tick.elapsed() >= Duration::from_millis(250))
         {
-            if let Err(err) = presenter.tick_overlay_video_state(
+            match presenter.tick_overlay_video_state(
                 source.clock.now_secs(),
                 f64::from_bits(source.duration_secs_bits.load(Ordering::Acquire)),
                 source.clock.is_playing(),
@@ -1422,7 +1512,14 @@ fn run_native_video_output(
                 source.clock.is_muted(),
                 source.clock.playback_speed(),
             ) {
-                crate::logger::log(format!("[native-video] overlay tick render failed: {err}"));
+                Ok(outcome) => {
+                    for command in outcome.commands {
+                        send_native_overlay_command(&ui_event_tx, source.source_epoch, command);
+                    }
+                }
+                Err(err) => {
+                    crate::logger::log(format!("[native-video] overlay tick render failed: {err}"));
+                }
             }
             last_overlay_tick = Instant::now();
         }
@@ -1578,6 +1675,9 @@ fn run_native_video_output(
                         .unwrap_or(0.0);
                     source.last_present_wall = Some(present_t0);
                     source.last_present_source_pts = Some(pts);
+                    source
+                        .last_displayed_pts_bits
+                        .store(pts.to_bits(), Ordering::Release);
                     source
                         .present_stats
                         .record_present(&outcome, late_ms, total_ms, interval_ms);
@@ -1783,6 +1883,14 @@ unsafe impl Sync for GpuLatestFrame {}
 /// 吸収して UI tick の空振りを抑える (Phase 8.J)。
 pub(crate) const MAX_RENDER_QUEUE: usize = 24;
 
+pub(crate) fn frame_step_interval_secs(avg_fps: f64) -> f64 {
+    if avg_fps.is_finite() && avg_fps > 1.0 {
+        (1.0 / avg_fps).clamp(1.0 / 240.0, 1.0)
+    } else {
+        1.0 / 30.0
+    }
+}
+
 impl VideoPlayer {
     fn repaint_prewake_secs(&self) -> f64 {
         let fps = self.info.as_ref().map(|i| i.avg_fps).unwrap_or(0.0);
@@ -1847,6 +1955,7 @@ impl VideoPlayer {
                 info_event_emitted: false,
                 first_frame_event_last_epoch: None,
                 displayed_frame_seq: Arc::new(AtomicU64::new(0)),
+                last_displayed_pts_bits: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
                 decoder_dropped_full_count: Arc::new(AtomicU64::new(0)),
                 ui_dropped_past_count: AtomicU64::new(0),
                 cancel: Arc::new(AtomicBool::new(true)),
@@ -1967,6 +2076,7 @@ impl VideoPlayer {
         // シーク先サムネ抽出ワーカー (失敗してもメイン再生は続行)
         let thumb_worker = Some(ThumbnailWorker::spawn(path.clone()));
         let displayed_frame_seq = Arc::new(AtomicU64::new(0));
+        let last_displayed_pts_bits = Arc::new(AtomicU64::new(f64::NAN.to_bits()));
         #[cfg(windows)]
         let duration_secs_bits = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
         #[cfg(windows)]
@@ -1976,6 +2086,7 @@ impl VideoPlayer {
                 Arc::clone(&clock),
                 engine_event_tx.clone(),
                 Arc::clone(&displayed_frame_seq),
+                Arc::clone(&last_displayed_pts_bits),
                 Arc::clone(&duration_secs_bits),
                 config,
             )
@@ -1991,6 +2102,7 @@ impl VideoPlayer {
             info_event_emitted: false,
             first_frame_event_last_epoch: None,
             displayed_frame_seq,
+            last_displayed_pts_bits,
             #[cfg(windows)]
             duration_secs_bits,
             decoder_dropped_full_count,
@@ -2284,6 +2396,28 @@ impl VideoPlayer {
         g.apply_command(engine::actor::TransportCommand::Play);
     }
 
+    /// フレーム送り用の精密シーク。到着後は必ず一時停止状態に保つ。
+    pub fn seek_paused(&self, target_secs: f64) {
+        let clamped = self.clamp_seek_target(target_secs);
+        self.clock.request_seek(clamped);
+        self.clear_audio_output_buffer();
+        self.clock.set_playing(false);
+        let mut g = self.engine.lock().unwrap();
+        g.handle_seek_request(clamped);
+        g.apply_command(engine::actor::TransportCommand::Pause);
+    }
+
+    /// 前後 1 フレームへ移動し、一時停止する。
+    pub fn step_frame(&self, direction: i32) {
+        if direction == 0 {
+            return;
+        }
+        let base = self.last_displayed_pts().unwrap_or_else(|| self.position());
+        let step = frame_step_interval_secs(self.info.as_ref().map(|i| i.avg_fps).unwrap_or(0.0));
+        let target = base + step * direction.signum() as f64;
+        self.seek_paused(target);
+    }
+
     /// シーク target を `[0, duration - 0.1s)` にクランプする。duration が
     /// 不明な (= info まだ来ていない) 場合は target をそのまま通す。
     fn clamp_seek_target(&self, target_secs: f64) -> f64 {
@@ -2298,6 +2432,19 @@ impl VideoPlayer {
 
     pub fn position(&self) -> f64 {
         self.clock.now_secs()
+    }
+
+    pub fn screenshot_target_secs(&self) -> f64 {
+        self.last_displayed_pts().unwrap_or_else(|| self.position())
+    }
+
+    fn last_displayed_pts(&self) -> Option<f64> {
+        let pts = f64::from_bits(self.last_displayed_pts_bits.load(Ordering::Acquire));
+        if pts.is_finite() {
+            Some(pts.max(0.0))
+        } else {
+            None
+        }
     }
 
     pub fn duration(&self) -> f64 {
@@ -2374,6 +2521,7 @@ impl VideoPlayer {
             clock: Arc::clone(&self.clock),
             engine_event_tx: self.engine_event_tx.clone(),
             displayed_frame_seq: Arc::clone(&self.displayed_frame_seq),
+            last_displayed_pts_bits: Arc::clone(&self.last_displayed_pts_bits),
             duration_secs_bits: Arc::clone(&self.duration_secs_bits),
             source_epoch,
             show_preparing_overlay,
@@ -2782,6 +2930,8 @@ impl VideoPlayer {
                         );
                     }
                     self.emit_first_frame_event(pts);
+                    self.last_displayed_pts_bits
+                        .store(pts.to_bits(), Ordering::Release);
                     self.displayed_frame_seq.fetch_add(1, Ordering::Release);
                     displayed_pts = Some(pts);
                     // GPU frames do not need a CPU texture upload, but they still
@@ -2857,6 +3007,8 @@ impl VideoPlayer {
                     }
                     upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
                     self.emit_first_frame_event(pts_for_log);
+                    self.last_displayed_pts_bits
+                        .store(pts_for_log.to_bits(), Ordering::Release);
                     self.displayed_frame_seq.fetch_add(1, Ordering::Release);
                     displayed_pts = Some(pts_for_log);
                 }
@@ -3097,4 +3249,19 @@ fn dummy_decode_handles() -> DecodeHandles {
 fn dummy_audio_rx() -> crossbeam_channel::Receiver<decoder::AudioFrame> {
     let (_, rx) = crossbeam_channel::bounded(0);
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn frame_step_interval_uses_average_fps() {
+        let step = super::frame_step_interval_secs(60.0);
+        assert!((step - (1.0 / 60.0)).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn frame_step_interval_falls_back_to_30fps() {
+        let step = super::frame_step_interval_secs(0.0);
+        assert!((step - (1.0 / 30.0)).abs() < 1.0e-9);
+    }
 }

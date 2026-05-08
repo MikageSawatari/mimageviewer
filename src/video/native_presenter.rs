@@ -124,6 +124,7 @@ struct NativeEguiOverlay {
     video_muted: bool,
     video_playback_speed: f64,
     video_speed_popup_open: bool,
+    frame_step_hold: Option<NativeFrameStepHold>,
     video_loop_enabled: bool,
     video_checked: bool,
     vst3_available: bool,
@@ -159,6 +160,12 @@ struct NativeEguiOverlay {
     pixels_per_point: f32,
     width: u32,
     height: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeFrameStepHold {
+    direction: i32,
+    last_step_at: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -448,6 +455,10 @@ pub enum NativeOverlayCommand {
     },
     SetPlaybackSpeed {
         speed: f64,
+    },
+    CopyFrameToClipboard,
+    FrameStep {
+        direction: i32,
     },
     ToggleLoop,
     AddBookmarkAt {
@@ -1128,7 +1139,7 @@ impl NativeVideoPresenter {
         volume: f64,
         muted: bool,
         playback_speed: f64,
-    ) -> Result<(), String> {
+    ) -> Result<NativeOverlayInputOutcome, String> {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             let force_tick_render = overlay.wants_periodic_tick();
             overlay.update_video_state(
@@ -1142,9 +1153,9 @@ impl NativeVideoPresenter {
             if force_tick_render {
                 overlay.dirty = true;
             }
-            overlay.render_if_dirty()?;
+            return overlay.render_if_dirty();
         }
-        Ok(())
+        Ok(NativeOverlayInputOutcome::empty())
     }
 
     pub fn overlay_hud_visible(&self) -> bool {
@@ -1732,6 +1743,7 @@ impl NativeEguiOverlay {
             video_muted: false,
             video_playback_speed: 1.0,
             video_speed_popup_open: false,
+            frame_step_hold: None,
             video_loop_enabled: false,
             video_checked: false,
             vst3_available: false,
@@ -2212,6 +2224,7 @@ impl NativeEguiOverlay {
             || self.perf_visible
             || self.tile_overlay.is_some()
             || self.hover_preview_target_secs.is_some()
+            || self.frame_step_hold.is_some()
             || self.toast.is_some()
             || self.video_error.is_some()
             || !self.first_frame_presented
@@ -2426,12 +2439,14 @@ impl NativeEguiOverlay {
         let mut last_thumbnail_request_at = self.last_thumbnail_request_at;
         let mut hover_preview_target_secs = self.hover_preview_target_secs;
         let mut video_speed_popup_open = self.video_speed_popup_open;
+        let mut frame_step_hold = self.frame_step_hold;
         if !overlay_visible {
             self.set_visual_attached(false)?;
             last_seek_target_secs = None;
             last_thumbnail_request_secs = None;
             last_thumbnail_request_at = None;
             hover_preview_target_secs = None;
+            frame_step_hold = None;
         }
         let mut raw_input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -2501,6 +2516,7 @@ impl NativeEguiOverlay {
                     perf_visible,
                     vst3_available,
                     vst3_panel_visible,
+                    &mut frame_step_hold,
                     &mut commands,
                 );
             }
@@ -3130,6 +3146,7 @@ impl NativeEguiOverlay {
         self.last_thumbnail_request_at = last_thumbnail_request_at;
         self.hover_preview_target_secs = hover_preview_target_secs;
         self.video_speed_popup_open = video_speed_popup_open;
+        self.frame_step_hold = frame_step_hold;
         self.top_bar_visible = top_bar_visible || side_panel_visible;
         self.right_panel_visible = right_panel_visible;
         self.jump_panel_visible = jump_panel_visible;
@@ -3197,7 +3214,7 @@ impl NativeEguiOverlay {
         for id in &full_output.textures_delta.free {
             self.renderer.free_texture(id);
         }
-        self.dirty = false;
+        self.dirty = self.frame_step_hold.is_some();
         log_event(
             "egui_overlay_present",
             &[
@@ -3665,6 +3682,7 @@ fn draw_native_jump_row(
 
 #[derive(Copy, Clone)]
 enum NativeTopButtonGlyph {
+    Screenshot,
     TileGrid,
     PerfGraph,
     Vst3,
@@ -3690,6 +3708,7 @@ fn draw_native_top_button(
     let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
     draw_overlay_button_bg(painter, rect, resp.hovered(), active);
     match glyph {
+        NativeTopButtonGlyph::Screenshot => draw_overlay_camera_icon(painter, rect),
         NativeTopButtonGlyph::TileGrid => draw_overlay_tile_grid_icon(painter, rect),
         NativeTopButtonGlyph::PerfGraph => draw_overlay_perf_graph_icon(painter, rect),
         NativeTopButtonGlyph::Vst3 => draw_overlay_vst3_top_icon(painter, rect),
@@ -3700,6 +3719,86 @@ fn draw_native_top_button(
         commands.push(command);
     }
     *x -= width + gap;
+}
+
+fn draw_native_frame_step_button(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    x: &mut f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    gap: f32,
+    id: &'static str,
+    direction: i32,
+    tooltip: &str,
+    hold: &mut Option<NativeFrameStepHold>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) -> bool {
+    let rect = egui::Rect::from_min_size(egui::pos2(*x, y), egui::vec2(width, height));
+    let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
+    draw_overlay_button_bg(painter, rect, resp.hovered(), false);
+    draw_overlay_frame_step_icon(painter, rect, direction);
+    let resp = resp.on_hover_text(tooltip);
+    let down = resp.is_pointer_button_down_on();
+    let now = Instant::now();
+    if down {
+        match hold {
+            Some(state) if state.direction == direction => {
+                if now.saturating_duration_since(state.last_step_at) >= Duration::from_millis(100) {
+                    state.last_step_at = now;
+                    commands.push(NativeOverlayCommand::FrameStep { direction });
+                }
+            }
+            _ => {
+                *hold = Some(NativeFrameStepHold {
+                    direction,
+                    last_step_at: now,
+                });
+                commands.push(NativeOverlayCommand::FrameStep { direction });
+            }
+        }
+    }
+    *x -= width + gap;
+    down
+}
+
+fn draw_overlay_frame_step_icon(painter: &egui::Painter, rect: egui::Rect, direction: i32) {
+    let color = egui::Color32::from_rgb(238, 238, 238);
+    let stroke = egui::Stroke::new(1.8, color);
+    let c = rect.center();
+    let sign = if direction < 0 { -1.0 } else { 1.0 };
+    let bar_x = c.x + sign * 7.0;
+    painter.line_segment(
+        [egui::pos2(bar_x, c.y - 8.0), egui::pos2(bar_x, c.y + 8.0)],
+        stroke,
+    );
+    let tip = egui::pos2(c.x - sign * 7.0, c.y);
+    let back_x = c.x + sign * 3.5;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            tip,
+            egui::pos2(back_x, c.y - 8.0),
+            egui::pos2(back_x, c.y + 8.0),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
+fn draw_overlay_camera_icon(painter: &egui::Painter, rect: egui::Rect) {
+    let color = egui::Color32::from_rgb(238, 238, 238);
+    let stroke = egui::Stroke::new(1.6, color);
+    let body =
+        egui::Rect::from_center_size(rect.center() + egui::vec2(0.0, 2.0), egui::vec2(18.0, 13.0));
+    painter.rect_stroke(body, 2.0, stroke, egui::StrokeKind::Inside);
+    let hump = egui::Rect::from_min_size(
+        egui::pos2(body.min.x + 3.0, body.min.y - 4.0),
+        egui::vec2(7.0, 4.0),
+    );
+    painter.rect_filled(hump, 1.2, color);
+    painter.circle_stroke(body.center(), 4.1, stroke);
+    painter.circle_filled(body.center(), 1.7, color);
 }
 
 fn draw_overlay_tile_grid_icon(painter: &egui::Painter, rect: egui::Rect) {
@@ -4096,6 +4195,7 @@ fn draw_native_top_bar(
     perf_visible: bool,
     vst3_available: bool,
     vst3_panel_visible: bool,
+    frame_step_hold: &mut Option<NativeFrameStepHold>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     egui::Area::new(egui::Id::new("native_video_top_bar"))
@@ -4217,6 +4317,52 @@ fn draw_native_top_bar(
                     NativeOverlayCommand::ToggleVst3Gui,
                     commands,
                 );
+            }
+            let next_down = draw_native_frame_step_button(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                btn_size,
+                btn_size,
+                gap,
+                "native_top_next_frame",
+                1,
+                "次のフレーム [Ctrl+Shift+→]",
+                frame_step_hold,
+                commands,
+            );
+            draw_native_top_button(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                btn_size,
+                btn_size,
+                gap,
+                "native_top_screenshot",
+                NativeTopButtonGlyph::Screenshot,
+                false,
+                "現在フレームをクリップボードにコピー",
+                NativeOverlayCommand::CopyFrameToClipboard,
+                commands,
+            );
+            let prev_down = draw_native_frame_step_button(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                btn_size,
+                btn_size,
+                gap,
+                "native_top_prev_frame",
+                -1,
+                "前のフレーム [Ctrl+Shift+←]",
+                frame_step_hold,
+                commands,
+            );
+            if !prev_down && !next_down {
+                *frame_step_hold = None;
             }
         });
 }

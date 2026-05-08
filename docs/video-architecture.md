@@ -90,6 +90,7 @@ src/video/
 │   ├── clock.rs            # MasterClock + ClockAnchor (純粋な値オブジェクト)
 │   └── audio_bookkeeping.rs # 音声バッファ会計 (atomic、単独で unit test 可)
 ├── ffmpeg_loader.rs        # DLL extraction + LoadLibrary (一度だけ実行)
+├── screenshot.rs           # 現在フレームのクリップボードコピー用 one-shot RGBA 抽出
 ├── thumbnail.rs            # シーク先サムネイル取得 worker
 └── gpu_renderer/           # ★ DX12 backend 時のみ active、unsafe を局所化
     ├── mod.rs              # 公開 API: GpuVideoDevice, D3d11Frame, VideoPipeline 等
@@ -213,6 +214,13 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   preamp gain として掛け、`fill_output` 側の RT 音量は最大 100% に抑える。これにより
   100% 以下の音量変更は従来通り低レイテンシで、boost 時だけ limiter の 5ms lookahead を
   PDC latency として扱う。
+- 現在フレームのクリップボードコピーは `screenshot.rs` の one-shot worker で別 FFmpeg
+  input を開き、最後に表示済みの source pts 近傍をフル解像度 RGBA に変換してから
+  既存の CF_DIB clipboard helper へ渡す。メイン decode queue / native presenter の GPU
+  surface には触れないため、D3D11VA / CPU fallback / native DComp 経路で同じ操作にできる。
+- 前/次フレーム送りは `VideoPlayer::step_frame()` が `avg_fps` から 1 frame 秒を求め、
+  `seek_paused()` で precise seek + pause を発行する。上部ボタン長押しは UI/overlay 側の
+  100ms repeat state だけで実現し、decoder 側には通常の seek として流す。
 - `fill_output` の bookkeeping (Phase 9 後の cleanup refactor):
   - **実消費サンプル数ベース**: `pop_front` で取り出した分 (= `real_consumed`) のみ
     `next_pts_secs` を進める。silence 出力中は pts 進行 0 (= 旧版の「常に full want

@@ -864,6 +864,32 @@ fn copy_zip_image_to_clipboard(zip_path: &std::path::Path, entry_name: &str) {
         .ok();
 }
 
+/// 遅い decode が後続の clipboard 操作を上書きしないよう、呼び出し開始時点で
+/// clipboard 書き込み世代を予約する。
+pub fn reserve_clipboard_write_sequence() -> u64 {
+    bump_clipboard_seq()
+}
+
+/// 予約済み clipboard 世代で RGBA8 画像をコピーする。
+///
+/// 動画フレームのスクリーンショットなど、呼び出し側がピクセルを持っている場合に使う。
+/// DIB 構築と OS clipboard I/O は画像ファイルコピーと同じく worker thread で行い、
+/// UI スレッドを止めない。
+pub fn copy_rgba_image_to_clipboard_async_seq(width: u32, height: u32, rgba: Vec<u8>, my_seq: u64) {
+    if width == 0 || height == 0 || rgba.len() != width as usize * height as usize * 4 {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("clipboard-rgba-copy".into())
+        .spawn(move || {
+            if !clipboard_seq_is_latest(my_seq) {
+                return;
+            }
+            set_rgba_to_clipboard(width, height, &rgba, my_seq);
+        })
+        .ok();
+}
+
 /// DynamicImage をクリップボードに CF_DIB として設定する。
 ///
 /// `my_seq` は発行時に取得した世代番号。`CLIPBOARD_WRITE_MUTEX` を保持した状態で
@@ -878,7 +904,11 @@ fn set_image_to_clipboard(img: &image::DynamicImage, my_seq: u64) {
     let rgba = img.to_rgba8();
     let width = rgba.width();
     let height = rgba.height();
+    set_rgba_to_clipboard(width, height, rgba.as_raw(), my_seq);
+}
 
+/// RGBA8 pixels をクリップボードに CF_DIB として設定する。
+fn set_rgba_to_clipboard(width: u32, height: u32, rgba: &[u8], my_seq: u64) {
     #[cfg(windows)]
     {
         use windows::Win32::Foundation::HANDLE;
@@ -902,16 +932,15 @@ fn set_image_to_clipboard(img: &image::DynamicImage, my_seq: u64) {
         buf[8..12].copy_from_slice(&(height as i32).to_le_bytes());
         buf[12..14].copy_from_slice(&1u16.to_le_bytes());
         buf[14..16].copy_from_slice(&24u16.to_le_bytes());
-        let pixels = &rgba;
         for y in 0..height {
             let src_row = (height - 1 - y) as usize;
             let dst_offset = header_size as usize + (y * row_size) as usize;
             for x in 0..width {
                 let src_idx = (src_row * width as usize + x as usize) * 4;
                 let dst_idx = dst_offset + (x * 3) as usize;
-                buf[dst_idx] = pixels.as_raw()[src_idx + 2];
-                buf[dst_idx + 1] = pixels.as_raw()[src_idx + 1];
-                buf[dst_idx + 2] = pixels.as_raw()[src_idx];
+                buf[dst_idx] = rgba[src_idx + 2];
+                buf[dst_idx + 1] = rgba[src_idx + 1];
+                buf[dst_idx + 2] = rgba[src_idx];
             }
         }
 
@@ -942,7 +971,7 @@ fn set_image_to_clipboard(img: &image::DynamicImage, my_seq: u64) {
     }
     #[cfg(not(windows))]
     {
-        let _ = (width, height, my_seq);
+        let _ = (width, height, rgba, my_seq);
     }
 }
 

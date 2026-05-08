@@ -1330,6 +1330,13 @@ pub(crate) struct VideoTileSwapPending {
     pub(crate) deadline: std::time::Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VideoFrameStepHold {
+    pub(crate) fs_idx: usize,
+    pub(crate) direction: i32,
+    pub(crate) last_step_at: std::time::Instant,
+}
+
 pub struct App {
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
@@ -2230,6 +2237,8 @@ pub struct App {
     pub(crate) video_playback_speed: f64,
     /// legacy egui HUD の速度ポップアップ表示状態。
     pub(crate) video_speed_popup_open: bool,
+    /// legacy egui 上部バーの前/次フレーム長押しリピート状態。
+    pub(crate) video_frame_step_hold: Option<VideoFrameStepHold>,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -2931,6 +2940,7 @@ impl Default for App {
             video_hud_visible_factor: 1.0,
             video_playback_speed: 1.0,
             video_speed_popup_open: false,
+            video_frame_step_hold: None,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_restart_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13440,6 +13450,14 @@ impl App {
             crate::video::NativeVideoOutputEvent::SetPlaybackSpeed { speed } => {
                 self.handle_video_playback_speed_command(ctx, fs_idx, speed);
             }
+            crate::video::NativeVideoOutputEvent::CopyFrameToClipboard => {
+                self.copy_video_frame_to_clipboard(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            crate::video::NativeVideoOutputEvent::FrameStep { direction } => {
+                self.step_video_frame(ctx, fs_idx, direction);
+                self.mark_native_video_hud_activity(ctx);
+            }
             crate::video::NativeVideoOutputEvent::AddBookmarkAt { target_secs } => {
                 self.handle_native_video_add_bookmark_command(ctx, fs_idx, target_secs);
             }
@@ -14312,6 +14330,13 @@ impl App {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.seek(0.0);
                 }
+            }
+            // Ctrl+Shift+Left / Right: frame step and pause.
+            0x25 if key.ctrl && key.shift => {
+                self.step_video_frame(ctx, fs_idx, -1);
+            }
+            0x27 if key.ctrl && key.shift => {
+                self.step_video_frame(ctx, fs_idx, 1);
             }
             // Left / Right: same seek granularity as the egui fullscreen path.
             0x25 => {
