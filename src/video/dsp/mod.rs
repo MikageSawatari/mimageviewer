@@ -131,10 +131,6 @@ struct DspBridgeInner {
     state: DspState,
     slots: Vec<PluginSlot>,
     next_slot_id: u64,
-    /// 直近 `process_block` が使う scratch バッファ。Mutex 内に持たせて毎回 alloc を回避。
-    /// 2 本必要なのは ping-pong 時のみだが、シンプルさのため常に 2 本持つ。
-    scratch_a: Vec<f32>,
-    scratch_b: Vec<f32>,
     /// 直近 hide した時点の z-order スナップショット (top-to-bottom 順 HWND リスト)。
     /// `set_all_guis_visible(false)` 直前に取得し、`set_all_guis_visible(true)` で
     /// 復元するために使う。これにより VST ボタン toggle で z-order が保たれる
@@ -211,8 +207,6 @@ impl DspBridge {
                 state: DspState::Disabled,
                 slots: Vec::new(),
                 next_slot_id: 0,
-                scratch_a: Vec::new(),
-                scratch_b: Vec::new(),
                 last_z_order_snapshot: Vec::new(),
             }),
             enabled: AtomicBool::new(false),
@@ -1987,63 +1981,40 @@ impl DspBridge {
         inner.slots.get(idx).map(|s| f(&s.bridge))
     }
 
-    /// 音声処理: チェーンの全アクティブスロットを順番に通す。
+    /// 音声処理: chain bridge にスナップショット越しに 1 回だけ IPC を発行する。
     /// `dst.len() == src.len()` が前提。
+    ///
+    /// 設計メモ (chain bridge 移行後): 全ての PluginSlot は同じ bridge プロセスを
+    /// 共有する Arc<Bridge> を保持している。bridge 内部の audio_loop が
+    /// `input → loader[0] → loader[1] → ... → output` を in-place で処理するため、
+    /// mIV 側は 1 回の `process_audio_blocking` 呼び出しで済む。複数の bridge を
+    /// 跨ぐ ping-pong は per-plugin bridge 時代の遺物で、現状の chain bridge 構造
+    /// では発生しない。
     pub fn process_block(&self, src: &[f32], dst: &mut [f32]) -> Result<(), String> {
         debug_assert_eq!(src.len(), dst.len());
 
-        // ── ホットパス: スロットの Arc<Bridge> snapshot を Mutex 短時間保持で取る ──
+        // ── ホットパス: chain bridge を Mutex 短時間保持で取る ──
         // process_block は audio-pump からのみ呼ばれるが、UI からの add/remove と
         // 競合する可能性があるので Mutex で snapshot を取る (= IPC roundtrip 中は
         // ロック解放済み)。
-        let mut active_bridges: Vec<Arc<Bridge>> = {
-            let mut inner = self.inner.lock().unwrap();
-            // scratch バッファをこの timing で resize (audio frame サイズが変わる可能性)
-            let n = src.len();
-            if inner.scratch_a.len() != n {
-                inner.scratch_a.resize(n, 0.0);
-                inner.scratch_b.resize(n, 0.0);
-            }
+        let bridge = {
+            let inner = self.inner.lock().unwrap();
             inner
                 .slots
                 .iter()
-                .filter(|s| !s.bypass && matches!(s.state, SlotState::Loaded))
+                .find(|s| !s.bypass && matches!(s.state, SlotState::Loaded))
                 .map(|s| s.bridge.clone())
-                .collect()
         };
-        active_bridges.dedup_by(|a, b| Arc::ptr_eq(a, b));
 
-        if active_bridges.is_empty() {
+        let Some(bridge) = bridge else {
+            // 全 slot が bypass か未ロード: パススルー
             dst.copy_from_slice(src);
             return Ok(());
-        }
+        };
 
-        // 単一プラグイン: 直接 src -> dst で処理 (scratch 不要)
-        if active_bridges.len() == 1 {
-            active_bridges[0]
-                .process_audio_blocking(src, dst, 100)
-                .map_err(|e| format!("process_audio: {e}"))?;
-            return Ok(());
-        }
-
-        // 複数プラグイン: scratch_a / scratch_b で ping-pong してから dst にコピー。
-        // 短時間 Mutex 保持で scratch を切り出す (process_block は他に呼び手がいないので OK)
-        let mut inner = self.inner.lock().unwrap();
-        let scratch_a = std::mem::take(&mut inner.scratch_a);
-        let scratch_b = std::mem::take(&mut inner.scratch_b);
-        drop(inner);
-
-        let mut buf = [scratch_a, scratch_b];
-        let result = chain_process(&active_bridges, src, &mut buf, dst);
-
-        // scratch を戻す (alloc を残して再利用)
-        let mut inner = self.inner.lock().unwrap();
-        let [a, b] = buf;
-        inner.scratch_a = a;
-        inner.scratch_b = b;
-        drop(inner);
-
-        result
+        bridge
+            .process_audio_blocking(src, dst, 100)
+            .map_err(|e| format!("process_audio: {e}"))
     }
 
     /// active_slot_count atomic を再計算 (= Loaded かつ bypass=false なものの個数)。
@@ -2056,43 +2027,6 @@ impl DspBridge {
             .count();
         self.active_slot_count.store(count, Ordering::Release);
     }
-}
-
-/// 複数プラグインを順番に通す。`buf[0]` / `buf[1]` を scratch として ping-pong。
-/// 最終結果は `dst` に書き込む。
-fn chain_process(
-    bridges: &[Arc<Bridge>],
-    src: &[f32],
-    buf: &mut [Vec<f32>; 2],
-    dst: &mut [f32],
-) -> Result<(), String> {
-    debug_assert!(bridges.len() >= 2);
-
-    // 1: src -> buf[0] (plugin[0] が処理)
-    bridges[0]
-        .process_audio_blocking(src, &mut buf[0], 100)
-        .map_err(|e| format!("process_audio[0]: {e}"))?;
-
-    // 2..N-1: buf[i%2] -> buf[(i+1)%2] (plugin[i] が処理)
-    for i in 1..bridges.len() {
-        let in_idx = (i - 1) % 2;
-        // split_at_mut で buf[in_idx] と buf[1-in_idx] を別 borrow に
-        let (input, output) = if in_idx == 0 {
-            let (a, b) = buf.split_at_mut(1);
-            (&a[0][..], &mut b[0][..])
-        } else {
-            let (a, b) = buf.split_at_mut(1);
-            (&b[0][..], &mut a[0][..])
-        };
-        bridges[i]
-            .process_audio_blocking(input, output, 100)
-            .map_err(|e| format!("process_audio[{i}]: {e}"))?;
-    }
-
-    // 最終: 最後に書き込まれた buf[(N-1)%2] を dst にコピー
-    let final_idx = (bridges.len() - 1) % 2;
-    dst.copy_from_slice(&buf[final_idx]);
-    Ok(())
 }
 
 impl Drop for DspBridge {

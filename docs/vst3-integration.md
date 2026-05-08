@@ -75,43 +75,58 @@ invalidate the affected HWNDs and let the normal message pump repaint them; they
 do not use synchronous `RDW_UPDATENOW`, which can make native resize drags wait
 for plugin relayout/paint work on every mouse step.
 
-## 2. 全体構成
+## 2. 全体構成 (chain bridge 移行後 = v0.9.0 現行)
+
+⚠️ **2026-05 に「1 bridge per plugin」→「1 bridge per chain」へ移行済**。本書末尾の
+「2026-05 chain bridge note」セクションは plan として書かれているが、実装は完了して
+いる ([vst3-chain-bridge-redesign.md](vst3-chain-bridge-redesign.md) も同じ)。
+以下の図は移行後の現状。
 
 ```
 mimageviewer-core.exe (Rust)
-├─ DspBridge (singleton, src/video/dsp/)
+├─ DspBridge (singleton, src/video/dsp/mod.rs)
 │   ├─ Vec<PluginSlot>          ← チェーン (順番が音声適用順)
-│   │   ├─ Slot[0]: bridge プロセス + プラグイン名 + GUI HWND + bypass フラグ
-│   │   ├─ Slot[1]: ...
-│   │   └─ ...
+│   │   ├─ Slot[0]: bridge: Arc<Bridge> ──┐
+│   │   ├─ Slot[1]: bridge: Arc<Bridge> ──┤  全 slot が同じ Arc を共有
+│   │   └─ ...                            ┘  (= 1 bridge プロセスが全プラグインを host)
 │   ├─ active_slot_count (atomic): bypass=false の Loaded 個数
-│   └─ scratch_a / scratch_b: 多段チェーンの ping-pong 用 (alloc 再利用)
-├─ src/video/audio.rs: audio-pump thread が DspBridge::process_block を呼び、
-│   全アクティブスロットを順番に IPC で通す。enable=false / 全 bypass / 0 個なら no-op
+│   └─ scratch_a / scratch_b: 旧 ping-pong 用 (chain bridge 移行後はほぼ未使用)
+├─ src/video/audio.rs: audio-pump thread が DspBridge::process_block を呼ぶ。
+│   bridges を Arc::ptr_eq で dedup するため、N 個のプラグインがあっても
+│   IPC roundtrip は **1 回だけ** (= bridge 内部で chain 順に処理して 1 回で返す)
 ├─ src/video/dsp/gui.rs: プラグイン GUI ホスト (Win32 子ウィンドウ)
 │   - フルスクリーン中は WS_EX_TOPMOST で動画の手前に維持
-│   - 各スロットが個別の HWND を持つ。再生中パネルから全体 / 個別表示を切り替える
+│   - 各スロットが個別の HWND を持つが、すべて同じ bridge プロセス内で生成される
 └─ Settings (settings.json):
     - vst3_enabled: bool (default false)
     - vst3_plugins: Vec<Vst3PluginEntry>  ← チェーン定義
     -   .path: String
     -   .bypass: bool
-    -   .state: Option<Base64<...>>  (= IComponent::getState)
+    -   .state: Option<Base64<...>>  (= IComponent::getState chunk)
     -   .user_hidden: bool
     -   .window_rect: Option<...>
     - vst3_gui_visible: bool  (再生中パネルの全体表示状態)
+    - vst3_chain_slots: 10 個のチェーンプリセット
 
-各 PluginSlot は独立した bridge 子プロセス:
+bridge 子プロセス (chain bridge):
 vendor/vst3-host/mimageviewer-vst3-host.exe (C++ bridge)
-├─ 1 プロセス = 1 プラグイン (= プラグインクラッシュの隔離)
-├─ stdin/stdout: 制御 (length-prefixed JSON)
-├─ Shared memory: 2 本の SPSC ring (in/out, f32 stereo) — slot 別に独立
+├─ **1 プロセス = 1 チェーン全体** (= mIV プロセスとは隔離されている、
+│   ただしチェーン内のプラグインクラッシュは bridge 全体を落とす可能性あり)
+├─ stdin/stdout: 制御 (length-prefixed JSON: open_audio_pipe / add_plugin_to_chain
+│   / remove_plugin / move_plugin / set_bypass / show_gui / query_state / restore_state)
+├─ Shared memory: 2 本の SPSC ring (in/out, f32 stereo)
+│   bridge 内部の audio_loop が `input → loader[0] → loader[1] → ... → output` で
+│   in-place chain 処理する (= 中間バッファは bridge 側のメモリ)
 └─ Named events: sig_in / sig_out で同期
 
 include_bytes! でメイン exe に埋め込み、初回 enable 時に
 %APPDATA%\mimageviewer\vst3\mimageviewer-vst3-host.exe へ展開
 (PDFium / Susie ワーカー / FFmpeg DLL と同パターン)
 ```
+
+**chain_process 関数の扱い**: `src/video/dsp/mod.rs::chain_process` は per-plugin
+bridge 時代の遺物。`process_block` で `Arc::ptr_eq` の dedup により bridges が常に
+長さ 1 になるため、現状コードでは到達しない。Phase 10+ のリファクタ時に削除候補。
 
 ## 3. ディレクトリ / モジュールマップ
 
@@ -338,20 +353,24 @@ CLAUDE.md の「リリース手順チェックリスト」に追記:
 - [ ] 動画再生中の VST3 パネルから全体表示 / 個別 GUI / bypass が操作できること
 - [ ] settings.json に `vst3_plugins[].state` が保存され、再起動で復元されること
 - [ ] safety limiter 有効時に過大出力が -1dBFS ceiling 以下に抑えられること
-# 2026-05 chain bridge note
+# 2026-05 chain bridge migration (実装済)
 
-The original VST3 implementation used one bridge process per plugin. The
-current direction is one bridge process per VST3 chain, so mIV remains isolated
-from plugin crashes while all plugin editors and audio processing share one
-bridge process. See [vst3-chain-bridge-redesign.md](vst3-chain-bridge-redesign.md)
-for the migration plan and protocol shape.
+⚠️ 旧版「1 bridge per plugin」→「1 bridge per chain」への移行は v0.9.0 リリース前
+までに完了している。本節は経緯記録として残す。詳細は
+[vst3-chain-bridge-redesign.md](vst3-chain-bridge-redesign.md) を参照。
 
-Follow-up: the chain bridge keeps one audio/control process, but plugin editors
-should no longer share one bridge GUI thread. Drag diagnostics after the
-Bitwig-style owner/z-order refactor still show 250-300ms editor message gaps,
-so the next GUI architecture is one STA editor/message-pump thread per plugin
-slot inside the same bridge process. The detailed design lives in
-[vst3-chain-bridge-redesign.md](vst3-chain-bridge-redesign.md).
+実装上の確認ポイント:
+- `src/video/dsp/mod.rs::add_plugin` で `inner.slots.first()` が存在するなら
+  `first.bridge.clone()` を再利用、無ければ `Bridge::spawn` で新規 bridge を作る
+  → 全 PluginSlot は同じ Arc<Bridge> を共有
+- `process_block` は active bridges を `Arc::ptr_eq` で dedup するため、N プラグインでも
+  IPC roundtrip は **1 回**
+- bridge 内の audio_loop が in-place で chain を回す (input → loader[0] → ... → output)
+- `chain_process` 関数は per-plugin bridge 時代の遺物 (現状到達せず、削除候補)
+
+GUI thread separation: 各 plugin editor は bridge プロセス内で **per-slot STA
+thread** として動かす (Bitwig-style owner/z-order 構造)。これにより一つのプラグインの
+重い描画が他のプラグインの editor message pump を blocking しない。
 
 ## 2026-05 startup load policy
 
@@ -408,3 +427,70 @@ The Preferences VST3 scanner reports probe progress over the scan worker
 channel. The UI drains progress messages and shows the current `(done/total)`
 count, plus the plugin currently being probed, while the bridge subprocess probe
 continues off the UI thread.
+
+---
+
+## 抽象化の現状と既知の負債 (v0.9.0 リリース時点)
+
+VST3 統合の責務分割は概ね妥当だが、`dsp/mod.rs` への詰め込みすぎが目立つ。
+
+### レイヤ評価
+
+| レイヤ | 状態 | 評価 |
+|---|---|---|
+| C++ bridge process (`crates/vst3-host/`) | ✅ 良好 | VST3 SDK との接続、GUI thread の分離、ProcessContext / setupProcessing の規格準拠が C++ 側に閉じている |
+| Rust ↔ bridge IPC (`dsp/bridge.rs`, 1033 行) | ✅ 良好 | length-prefixed JSON + shared memory + named events の 3 つに分離。ShmHeader / Cmd / Event の型が 1 ファイル内で完結 |
+| Plugin scanner (`dsp/scanner.rs`, 291 行) | ✅ 良好 | 単一責務 |
+| Bridge exe extract (`dsp/extract.rs`, 30 行) | ✅ 良好 | PDFium / Susie ワーカーと同パターンで小さく完結 |
+| GUI host (`dsp/gui.rs`, 1164 行) | ⚠️ 肥大気味 | Win32 メッセージループ + monitor work area 計算 + window コマンド (resize / topmost / show / z-order snapshot) が同居。コマンドカテゴリで分割可能だが、現状でも責務は単一 (= 「GUI ウィンドウの所有と命令遂行」) |
+| `DspBridge` (`dsp/mod.rs`, 2102 行 ⚠️ 巨大) | ⚠️⚠️ **肥大化** | 後述 |
+
+### `dsp/mod.rs` の負債詳細
+
+`impl DspBridge` ブロック単独で 1850+ 行ある (= 207 行〜2059 行)。これに以下の責務が
+集約されている:
+
+1. **チェーン管理** (`add_plugin` / `remove_plugin` / `move_plugin` / `set_bypass`)
+2. **GUI 表示制御** (`show_slot_gui` / `set_all_guis_visible` / `set_all_guis_topmost` /
+   `set_app_active` / z-order snapshot 復元)
+3. **bridge プロセス制御** (`enable` / `disable` / `disable_with_reason` /
+   `session_disabled_reason` 管理 / poisoned bridge handling)
+4. **Audio 処理エントリ** (`process_block` / `chain_process` / `recalc_active_count`)
+5. **State 永続化** (`query_all_states` / `apply_saved_states`)
+6. **PDC / latency** (`total_latency_samples` / `latency_changed` イベント)
+7. **`PluginSlot` 構造体** (60 フィールド級、`gui_*`, `desired_window_*`,
+   `gui_resize_session_*` 等)
+
+自然な分割案 (Phase 10+):
+
+```
+dsp/mod.rs  (2102)
+├── dsp/mod.rs          # DspBridge struct + 公開 API + 一部の小 fn (~400)
+├── dsp/slot.rs         # PluginSlot struct + impl + 関連 helper (~500)
+├── dsp/chain.rs        # add_plugin / remove_plugin / move_plugin / set_bypass (~400)
+├── dsp/gui_ops.rs      # show_slot_gui / 全表示・topmost / z-order snapshot (~500)
+├── dsp/state_io.rs     # query_all_states / apply_saved_states (~150)
+└── dsp/audio_io.rs     # process_block + chain_process (~150)
+```
+
+**ただし `dsp/mod.rs` は内部状態 (`DspBridgeInner`) を Mutex 越しに共有しているため、
+分割するなら `DspBridgeInner` を `pub(super)` で残し、各サブモジュールから lock する
+形になる**。これは技術的には可能だが、現状で動作している Mutex 規約 (= 「inner を
+保持したまま IPC を呼ばない」「scratch を `std::mem::take` で外に出してから call」等)
+を機械的にサブモジュール越しに維持するコストが分割の利益を上回る可能性がある。
+
+**現状判断: Phase 10+ で「新機能を追加するときに、追加箇所が `dsp/mod.rs` に向かう
+ようなら先に分割する」という機会的リファクタにする**。リリース直前に投機的に分けない。
+
+### 抽象化リークの懸念
+
+特になし。Rust 側 (`DspBridge` / `PluginSlot`) は VST3 SDK の型を一切知らず、bridge
+プロセスとの IPC プロトコル (`Cmd` / `Event`) だけを介して操作している。VST3 SDK の
+プラットフォーム差異 (Mac / Linux 対応の見送り、IPlugView / IPlugFrame 等) は C++ bridge
+の中に閉じている。
+
+### 計画的負債
+
+- **chain_process 関数の死コード**: 上述の通り、Arc::ptr_eq dedup により現状到達せず。
+  Phase 10 のクリーンアップで削除予定
+- **scratch_a / scratch_b**: chain_process が dead code なので一緒に削除可能
