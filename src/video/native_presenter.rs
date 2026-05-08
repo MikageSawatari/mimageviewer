@@ -123,6 +123,7 @@ struct NativeEguiOverlay {
     video_volume: f64,
     video_muted: bool,
     video_playback_speed: f64,
+    video_frame_step_active: bool,
     video_speed_popup_open: bool,
     frame_step_hold: Option<NativeFrameStepHold>,
     video_loop_enabled: bool,
@@ -1033,6 +1034,7 @@ impl NativeVideoPresenter {
         volume: f64,
         muted: bool,
         playback_speed: f64,
+        frame_step_active: bool,
     ) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.update_video_state(
@@ -1042,6 +1044,7 @@ impl NativeVideoPresenter {
                 volume,
                 muted,
                 playback_speed,
+                frame_step_active,
             );
         }
     }
@@ -1153,6 +1156,7 @@ impl NativeVideoPresenter {
         volume: f64,
         muted: bool,
         playback_speed: f64,
+        frame_step_active: bool,
     ) -> Result<NativeOverlayInputOutcome, String> {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             let force_tick_render = overlay.wants_periodic_tick();
@@ -1163,6 +1167,7 @@ impl NativeVideoPresenter {
                 volume,
                 muted,
                 playback_speed,
+                frame_step_active,
             );
             if force_tick_render {
                 overlay.dirty = true;
@@ -1756,6 +1761,7 @@ impl NativeEguiOverlay {
             video_volume: 1.0,
             video_muted: false,
             video_playback_speed: 1.0,
+            video_frame_step_active: false,
             video_speed_popup_open: false,
             frame_step_hold: None,
             video_loop_enabled: false,
@@ -1932,6 +1938,7 @@ impl NativeEguiOverlay {
         volume: f64,
         muted: bool,
         playback_speed: f64,
+        frame_step_active: bool,
     ) {
         let position_secs = finite_nonnegative(position_secs);
         let duration_secs = finite_nonnegative(duration_secs);
@@ -1943,6 +1950,7 @@ impl NativeEguiOverlay {
         let volume_changed = (self.video_volume - volume).abs() >= 0.005;
         let muted_changed = self.video_muted != muted;
         let speed_changed = (self.video_playback_speed - playback_speed).abs() >= 1.0e-6;
+        let frame_step_changed = self.video_frame_step_active != frame_step_active;
         if !is_playing {
             self.perf_pause_gap_pending = true;
         }
@@ -1952,12 +1960,14 @@ impl NativeEguiOverlay {
         self.video_volume = volume;
         self.video_muted = muted;
         self.video_playback_speed = playback_speed;
+        self.video_frame_step_active = frame_step_active;
         if duration_changed
             || position_changed
             || playing_changed
             || volume_changed
             || muted_changed
             || speed_changed
+            || frame_step_changed
         {
             self.dirty = true;
         }
@@ -2398,6 +2408,7 @@ impl NativeEguiOverlay {
         let position_secs = self.video_position_secs;
         let duration_secs = self.video_duration_secs;
         let is_playing = self.video_is_playing;
+        let frame_step_active = self.video_frame_step_active;
         let volume = self.video_volume;
         let muted = self.video_muted;
         let playback_speed = self.video_playback_speed;
@@ -2442,8 +2453,11 @@ impl NativeEguiOverlay {
             !tile_overlay_visible && (jump_panel_visible || right_panel_visible);
         let panel_chrome_visible = !tile_overlay_visible && (top_bar_visible || side_panel_visible);
         let bottom_hud_visible = hud_visible || panel_chrome_visible;
-        let paused_center_visible =
-            !tile_overlay_visible && !is_playing && first_frame_presented && video_error.is_none();
+        let paused_center_visible = !tile_overlay_visible
+            && !is_playing
+            && !frame_step_active
+            && first_frame_presented
+            && video_error.is_none();
         let perf_origin = egui::pos2(14.0, 14.0);
         let overlay_visible = tile_overlay_visible
             || bottom_hud_visible

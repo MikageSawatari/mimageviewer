@@ -223,9 +223,11 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   「最後に発行した frame-step target」を基準にして target を積み、seek 完了前の
   連打 / 長押しでも同じ位置へ再 seek しない。ただし長押し repeat は、発行時点の
   `displayed_frame_seq` から新しいフレームが 1 枚表示されるまで次 target を出さない。
-  これにより clock target だけが進んで画面が追いつかない状態を避ける。上部ボタン
-  長押しは UI/overlay 側の 100ms repeat state だけで実現し、decoder 側には通常の seek
-  として流す。
+  これにより clock target だけが進んで画面が追いつかない状態を避ける。戻り方向は
+  preroll trim が現在フレームへ吸われないよう、1 frame + 最大 4ms 手前を seek target にする。
+  `frame_step_active` は通常 pause と UI を分離するための共有フラグで、frame-step pause 中は
+  中央の resume controls を出さない。上部ボタン長押しは UI/overlay 側の 100ms repeat state
+  だけで実現し、decoder 側には通常の seek として流す。
 - 動画ブックマークの任意名称は `video_bookmarks.title` に保存する。左ジャンプパネルの
   ✏ 操作だけが名称を更新し、追加時は従来通り title=NULL のままにする。native DComp
   overlay 側は `WM_CHAR` から egui `Event::Text` を渡し、独立 overlay 上の TextEdit で

@@ -6870,32 +6870,42 @@ impl App {
         full_rect: egui::Rect,
         fs_idx: usize,
     ) {
-        let (is_playing, position, duration, volume, muted, playback_speed, has_texture, has_error) =
-            match self.fs_cache.get(&fs_idx) {
-                Some(FsCacheEntry::Video { player, .. }) => (
-                    player.is_playing(),
-                    player.position(),
-                    player.duration(),
-                    player.volume(),
-                    player.is_muted(),
-                    player.playback_speed(),
-                    // CPU path: TextureHandle 有り、または GPU path: 共有 D3D11 フレーム有り、
-                    // のいずれかなら描画コンテンツが揃っているとみなす
-                    // (= "動画を準備中..." を抜けて通常表示に切り替える)。
-                    player.texture().is_some() || {
-                        #[cfg(windows)]
-                        {
-                            player.gpu_latest().is_some()
-                        }
-                        #[cfg(not(windows))]
-                        {
-                            false
-                        }
-                    },
-                    player.error().map(|s| s.to_string()),
-                ),
-                _ => return,
-            };
+        let (
+            is_playing,
+            frame_step_active,
+            position,
+            duration,
+            volume,
+            muted,
+            playback_speed,
+            has_texture,
+            has_error,
+        ) = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => (
+                player.is_playing(),
+                player.is_frame_step_active(),
+                player.position(),
+                player.duration(),
+                player.volume(),
+                player.is_muted(),
+                player.playback_speed(),
+                // CPU path: TextureHandle 有り、または GPU path: 共有 D3D11 フレーム有り、
+                // のいずれかなら描画コンテンツが揃っているとみなす
+                // (= "動画を準備中..." を抜けて通常表示に切り替える)。
+                player.texture().is_some() || {
+                    #[cfg(windows)]
+                    {
+                        player.gpu_latest().is_some()
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        false
+                    }
+                },
+                player.error().map(|s| s.to_string()),
+            ),
+            _ => return,
+        };
 
         // ── エラー表示 ──
         if let Some(err) = has_error {
@@ -6932,7 +6942,7 @@ impl App {
         // ── 一時停止中: 中央に再生アイコン (続きから) + ⏮ アイコン (最初から) ──
         // Phase 7.I: 「前回の続きからみたいのか / 最初から観たいのか選べるように」
         // 同サイズの 2 ボタンを左右に並べる。
-        if !is_playing {
+        if !is_playing && !frame_step_active {
             let painter = ui.painter().clone();
             let icon_radius = 56.0;
             let gap = 64.0;
@@ -7601,6 +7611,8 @@ impl App {
                 } else if player.info().is_none() {
                     false
                 } else if player.is_playing() {
+                    false
+                } else if player.is_frame_step_active() {
                     false
                 } else {
                     let dur = player.duration();

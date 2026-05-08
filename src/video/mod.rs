@@ -107,6 +107,8 @@ pub struct VideoPlayer {
     /// フレーム送りで最後に発行した precise seek target。repeat で次 target を出すとき、
     /// 表示済み PTS がまだ追いついていなくても発行済み target を基準にできる。
     frame_step_target_bits: AtomicU64,
+    /// フレーム送り操作による一時停止中なら true。通常 pause の中央再生 UI と分ける。
+    frame_step_active: Arc<AtomicBool>,
     /// 最後の frame-step seek 発行時点での表示済みフレーム sequence。
     /// 長押し repeat はこの値から `displayed_frame_seq` が進むまで次 target を出さない。
     frame_step_issued_display_seq: AtomicU64,
@@ -292,6 +294,7 @@ pub(crate) struct SwitchSourcePayload {
     engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
     displayed_frame_seq: Arc<AtomicU64>,
     last_displayed_pts_bits: Arc<AtomicU64>,
+    frame_step_active: Arc<AtomicBool>,
     duration_secs_bits: Arc<AtomicU64>,
     source_epoch: u64,
     show_preparing_overlay: bool,
@@ -353,6 +356,7 @@ struct PresenterSourceState {
     engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
     displayed_frame_seq: Arc<AtomicU64>,
     last_displayed_pts_bits: Arc<AtomicU64>,
+    frame_step_active: Arc<AtomicBool>,
     duration_secs_bits: Arc<AtomicU64>,
     source_epoch: u64,
     queue: std::collections::VecDeque<VideoFrame>,
@@ -376,6 +380,7 @@ impl PresenterSourceState {
             engine_event_tx: payload.engine_event_tx,
             displayed_frame_seq: payload.displayed_frame_seq,
             last_displayed_pts_bits: payload.last_displayed_pts_bits,
+            frame_step_active: payload.frame_step_active,
             duration_secs_bits: payload.duration_secs_bits,
             source_epoch: payload.source_epoch,
             queue: std::collections::VecDeque::new(),
@@ -415,6 +420,7 @@ impl NativeVideoOutput {
         engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
         displayed_frame_seq: Arc<AtomicU64>,
         last_displayed_pts_bits: Arc<AtomicU64>,
+        frame_step_active: Arc<AtomicBool>,
         duration_secs_bits: Arc<AtomicU64>,
         config: NativeVideoOutputConfig,
     ) -> Option<Self> {
@@ -442,6 +448,7 @@ impl NativeVideoOutput {
                     engine_event_tx,
                     displayed_frame_seq,
                     last_displayed_pts_bits,
+                    frame_step_active,
                     duration_secs_bits,
                     config,
                     command_rx,
@@ -970,6 +977,7 @@ fn run_native_video_output(
     engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
     displayed_frame_seq: Arc<AtomicU64>,
     last_displayed_pts_bits: Arc<AtomicU64>,
+    frame_step_active: Arc<AtomicBool>,
     duration_secs_bits: Arc<AtomicU64>,
     config: NativeVideoOutputConfig,
     command_rx: std::sync::mpsc::Receiver<NativeVideoOutputCommand>,
@@ -1039,6 +1047,7 @@ fn run_native_video_output(
             clock.volume(),
             clock.is_muted(),
             clock.playback_speed(),
+            frame_step_active.load(Ordering::Acquire),
         ) {
             crate::logger::log(format!(
                 "[native-video] initial tile overlay render failed: {err}"
@@ -1052,6 +1061,7 @@ fn run_native_video_output(
         engine_event_tx,
         displayed_frame_seq,
         last_displayed_pts_bits,
+        frame_step_active,
         duration_secs_bits,
         source_epoch: 0,
         show_preparing_overlay: config.initial_tile_overlay,
@@ -1255,6 +1265,7 @@ fn run_native_video_output(
                 source.clock.volume(),
                 source.clock.is_muted(),
                 source.clock.playback_speed(),
+                source.frame_step_active.load(Ordering::Acquire),
             );
             let overlay_routing = match presenter.handle_window_events(&native_events) {
                 Ok(outcome) => {
@@ -1534,6 +1545,7 @@ fn run_native_video_output(
                 source.clock.volume(),
                 source.clock.is_muted(),
                 source.clock.playback_speed(),
+                source.frame_step_active.load(Ordering::Acquire),
             ) {
                 Ok(outcome) => {
                     for command in outcome.commands {
@@ -1926,6 +1938,16 @@ fn frame_step_base_secs(
         .max(0.0)
 }
 
+fn frame_step_seek_target_secs(base: f64, step: f64, direction: i32) -> f64 {
+    let direction = direction.signum();
+    if direction < 0 {
+        let backward_bias = (step * 0.25).min(0.004);
+        base - step - backward_bias
+    } else {
+        base + step
+    }
+}
+
 fn frame_step_waiting_for_display(
     pending_step_target: Option<f64>,
     issued_display_seq: u64,
@@ -2002,6 +2024,7 @@ impl VideoPlayer {
                 displayed_frame_seq: Arc::new(AtomicU64::new(0)),
                 last_displayed_pts_bits: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
                 frame_step_target_bits: AtomicU64::new(f64::NAN.to_bits()),
+                frame_step_active: Arc::new(AtomicBool::new(false)),
                 frame_step_issued_display_seq: AtomicU64::new(FRAME_STEP_NO_PENDING_SEQ),
                 decoder_dropped_full_count: Arc::new(AtomicU64::new(0)),
                 ui_dropped_past_count: AtomicU64::new(0),
@@ -2124,6 +2147,7 @@ impl VideoPlayer {
         let thumb_worker = Some(ThumbnailWorker::spawn(path.clone()));
         let displayed_frame_seq = Arc::new(AtomicU64::new(0));
         let last_displayed_pts_bits = Arc::new(AtomicU64::new(f64::NAN.to_bits()));
+        let frame_step_active = Arc::new(AtomicBool::new(false));
         #[cfg(windows)]
         let duration_secs_bits = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
         #[cfg(windows)]
@@ -2134,6 +2158,7 @@ impl VideoPlayer {
                 engine_event_tx.clone(),
                 Arc::clone(&displayed_frame_seq),
                 Arc::clone(&last_displayed_pts_bits),
+                Arc::clone(&frame_step_active),
                 Arc::clone(&duration_secs_bits),
                 config,
             )
@@ -2151,6 +2176,7 @@ impl VideoPlayer {
             displayed_frame_seq,
             last_displayed_pts_bits,
             frame_step_target_bits: AtomicU64::new(f64::NAN.to_bits()),
+            frame_step_active,
             frame_step_issued_display_seq: AtomicU64::new(FRAME_STEP_NO_PENDING_SEQ),
             #[cfg(windows)]
             duration_secs_bits,
@@ -2487,9 +2513,10 @@ impl VideoPlayer {
             self.position(),
         );
         let step = frame_step_interval_secs(self.info.as_ref().map(|i| i.avg_fps).unwrap_or(0.0));
-        let target = self.clamp_seek_target(base + step * direction.signum() as f64);
+        let target = self.clamp_seek_target(frame_step_seek_target_secs(base, step, direction));
         self.frame_step_target_bits
             .store(target.to_bits(), Ordering::Release);
+        self.frame_step_active.store(true, Ordering::Release);
         self.frame_step_issued_display_seq
             .store(displayed_seq, Ordering::Release);
         self.seek_paused_internal(target);
@@ -2536,8 +2563,13 @@ impl VideoPlayer {
     fn clear_frame_step_target(&self) {
         self.frame_step_target_bits
             .store(f64::NAN.to_bits(), Ordering::Release);
+        self.frame_step_active.store(false, Ordering::Release);
         self.frame_step_issued_display_seq
             .store(FRAME_STEP_NO_PENDING_SEQ, Ordering::Release);
+    }
+
+    pub fn is_frame_step_active(&self) -> bool {
+        self.frame_step_active.load(Ordering::Acquire)
     }
 
     pub fn duration(&self) -> f64 {
@@ -2615,6 +2647,7 @@ impl VideoPlayer {
             engine_event_tx: self.engine_event_tx.clone(),
             displayed_frame_seq: Arc::clone(&self.displayed_frame_seq),
             last_displayed_pts_bits: Arc::clone(&self.last_displayed_pts_bits),
+            frame_step_active: Arc::clone(&self.frame_step_active),
             duration_secs_bits: Arc::clone(&self.duration_secs_bits),
             source_epoch,
             show_preparing_overlay,
@@ -3370,6 +3403,17 @@ mod tests {
         assert!((displayed - 20.0).abs() < 1.0e-9);
         let position = super::frame_step_base_secs(None, None, 30.0);
         assert!((position - 30.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn frame_step_seek_target_biases_backward_only() {
+        let step = 1.0 / 60.0;
+        let forward = super::frame_step_seek_target_secs(10.0, step, 1);
+        assert!((forward - (10.0 + step)).abs() < 1.0e-9);
+
+        let backward = super::frame_step_seek_target_secs(10.0, step, -1);
+        assert!(backward < 10.0 - step);
+        assert!((backward - (10.0 - step - 0.004)).abs() < 1.0e-9);
     }
 
     #[test]
