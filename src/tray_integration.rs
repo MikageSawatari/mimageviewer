@@ -107,6 +107,10 @@ impl App {
             return;
         }
         self.window_visible = false;
+        crate::set_ui_heartbeat_suspended(
+            true,
+            "App::update heartbeat suspended while hidden to tray".to_string(),
+        );
 
         // 先に WINDOWPLACEMENT を共有スロットに保存してから hide する。
         // トレイスレッドの復帰処理が ShowWindow より**前**にこれを読み取って
@@ -154,6 +158,10 @@ impl App {
             return;
         }
         self.window_visible = true;
+        crate::set_ui_heartbeat_suspended(
+            false,
+            "App::update heartbeat resumed after tray restore".to_string(),
+        );
         if let Some(mgr) = self.indexer_manager.as_ref() {
             mgr.set_io_throttled(false);
         }

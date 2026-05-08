@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include <xmmintrin.h> // _MM_SET_FLUSH_ZERO_MODE
@@ -338,6 +339,7 @@ public:
 
         if (audio_thread_.joinable()) {
             audio_running_ = false;
+            pipe_.wake_input();
             audio_thread_.join();
         }
         if (stdin_thread.joinable()) {
@@ -385,6 +387,9 @@ private:
     }
 
     void watchdog_loop() {
+        ULONGLONG last_idle_heartbeat_tick = 0;
+        uint64_t last_idle_cmds_received = UINT64_MAX;
+        uint64_t last_idle_cmds_processed = UINT64_MAX;
         while (running_) {
             ::Sleep(1000);
             const ULONGLONG now = GetTickCount64();
@@ -419,6 +424,30 @@ private:
                 main_dispatch_started_tick_.load(std::memory_order_acquire);
             const ULONGLONG dispatch_in_ms =
                 dispatch_started == 0 ? 0 : now - dispatch_started;
+            const uint64_t cmds_received =
+                reader_cmds_received_.load(std::memory_order_relaxed);
+            const uint64_t cmds_processed =
+                main_cmds_processed_.load(std::memory_order_relaxed);
+
+            const bool idle =
+                queue_size_known && queue_size == 0 && current_cmd == "-" &&
+                dispatch_msg == 0 && dispatch_started == 0 &&
+                main_state == static_cast<int>(BridgeMainState::WaitingCmdQueue) &&
+                reader_state == static_cast<int>(BridgeReaderState::WaitingRead);
+            const bool idle_counters_changed =
+                cmds_received != last_idle_cmds_received ||
+                cmds_processed != last_idle_cmds_processed;
+            if (idle && !idle_counters_changed && last_idle_heartbeat_tick != 0 &&
+                now - last_idle_heartbeat_tick < 60'000) {
+                continue;
+            }
+            if (idle) {
+                last_idle_heartbeat_tick = now;
+                last_idle_cmds_received = cmds_received;
+                last_idle_cmds_processed = cmds_processed;
+            } else {
+                last_idle_heartbeat_tick = 0;
+            }
 
             if (queue_size_known) {
                 std::fprintf(stderr,
@@ -435,10 +464,8 @@ private:
                              bridge_reader_state_name(reader_state),
                              static_cast<unsigned long long>(now - reader_entered),
                              queue_size,
-                             static_cast<unsigned long long>(
-                                 reader_cmds_received_.load(std::memory_order_relaxed)),
-                             static_cast<unsigned long long>(
-                                 main_cmds_processed_.load(std::memory_order_relaxed)));
+                             static_cast<unsigned long long>(cmds_received),
+                             static_cast<unsigned long long>(cmds_processed));
             } else {
                 std::fprintf(stderr,
                              "[BRIDGE main heartbeat] state=%s in_state_ms=%llu current_cmd=%s "
@@ -453,10 +480,8 @@ private:
                              static_cast<unsigned long long>(dispatch_in_ms),
                              bridge_reader_state_name(reader_state),
                              static_cast<unsigned long long>(now - reader_entered),
-                             static_cast<unsigned long long>(
-                                 reader_cmds_received_.load(std::memory_order_relaxed)),
-                             static_cast<unsigned long long>(
-                                 main_cmds_processed_.load(std::memory_order_relaxed)));
+                             static_cast<unsigned long long>(cmds_received),
+                             static_cast<unsigned long long>(cmds_processed));
             }
             std::fflush(stderr);
         }
@@ -745,6 +770,7 @@ private:
             auto id = extract_number_field(msg, "reset_id");
             pending_reset_id_.store(static_cast<uint64_t>(id), std::memory_order_release);
             reset_pending_.store(true, std::memory_order_release);
+            pipe_.wake_input();
             return true;
         }
         if (cmd == "query_gui_size") {
@@ -947,6 +973,7 @@ private:
             }
             pending_state_slot_.store(extract_number_field(msg, "slot_id"), std::memory_order_release);
             query_state_pending_.store(true, std::memory_order_release);
+            pipe_.wake_input();
             return true;
         }
         if (cmd == "restore_state") {
@@ -971,10 +998,12 @@ private:
             }
             pending_state_slot_.store(extract_number_field(msg, "slot_id"), std::memory_order_release);
             restore_state_pending_.store(true, std::memory_order_release);
+            pipe_.wake_input();
             return true;
         }
         if (cmd == "close") {
             audio_running_ = false;
+            pipe_.wake_input();
             if (audio_thread_.joinable()) audio_thread_.join();
             pipe_.detach();
             {
@@ -1015,6 +1044,7 @@ private:
 
         if (audio_thread_.joinable()) {
             audio_running_ = false;
+            pipe_.wake_input();
             audio_thread_.join();
             pipe_.detach();
         }
@@ -1079,6 +1109,7 @@ private:
             processing_order_.push_back(0);
             rebuild_chain_snapshot_unlocked();
         }
+        loader_->set_processing_enabled(false);
 
         std::string reply = "{\"event\":\"loaded\",\"plugin_name\":\"" +
                             json_escape(info.plugin_name) +
@@ -1144,10 +1175,13 @@ private:
             std::fflush(stderr);
         }
         debug_dump_current_thread_windows("after add_plugin load");
+        const bool bypass = extract_number_field(msg, "bypass") != 0;
+        if (bypass || !audio_realtime_active_.load(std::memory_order_acquire)) {
+            loader->set_processing_enabled(false);
+        }
 
         {
             std::lock_guard<std::mutex> lk(loaders_mutex_);
-            const bool bypass = extract_number_field(msg, "bypass") != 0;
             loader->set_editor_chrome_bypassed(bypass);
             extra_loaders_.push_back(std::move(loader));
             plugin_bypass_.push_back(bypass);
@@ -1370,6 +1404,17 @@ private:
         }
     }
 
+    void set_chain_processing_enabled(bool enabled) {
+        auto snap = chain_snapshot();
+        std::unordered_set<PluginLoader*> seen;
+        for (size_t i = 0; i < snap->loaders.size(); ++i) {
+            PluginLoader* loader = snap->loaders[i];
+            if (!loader || !seen.insert(loader).second) continue;
+            if (enabled && snap->bypassed[i]) continue;
+            loader->set_processing_enabled(enabled);
+        }
+    }
+
     void audio_loop(uint32_t max_block_size) {
         // 可変ブロックサイズモード: tester (cpal) から push されたサンプル数を
         // そのまま 1 ブロックとして処理する (上限は max_block_size = setupProcessing
@@ -1381,21 +1426,6 @@ private:
         std::vector<float> output(max_block_size * channels);
         std::vector<float> temp(max_block_size * channels);
 
-        // ── audio thread を realtime 優先度に上げる ──
-        // VST3 host の責務: audio スレッドを GUI thread 等より高優先度にすることで、
-        // プラグイン GUI のアナライザ FFT などに割り込まれず一定周期で処理できる。
-        // これがないと thread スケジューラ jitter で audio 出力にノイズが乗る。
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-
-        // MMCSS (Multimedia Class Scheduler Service) に "Pro Audio" タスクとして
-        // 登録すると、Windows audio scheduler から特別待遇を受ける (= プリエンプト
-        // されにくい)。WASAPI Exclusive 系の audio app と同等の品質を確保。
-        DWORD mmcss_index = 0;
-        HANDLE mmcss_handle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcss_index);
-        if (mmcss_handle) {
-            AvSetMmThreadPriority(mmcss_handle, AVRT_PRIORITY_HIGH);
-        }
-
         // ── Denormal flush を有効化 ──
         // プラグイン内部のフィルタ計算で 1e-30 オーダーの極小値が出ると CPU 計算が
         // 極端に遅くなる (denormal handling)。FTZ/DAZ をセットして「極小値は 0 に
@@ -1404,9 +1434,36 @@ private:
         _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
         _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
 
-        std::fprintf(stderr, "[BRIDGE] audio_loop start (max_block=%u, variable size, mmcss=%s)\n",
-                     max_block_size, mmcss_handle ? "ok" : "failed");
+        HANDLE mmcss_handle = nullptr;
+        bool realtime_audio = false;
+        auto enter_realtime_audio = [&]() {
+            if (realtime_audio) return;
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+            DWORD mmcss_index = 0;
+            mmcss_handle = AvSetMmThreadCharacteristicsW(L"Pro Audio", &mmcss_index);
+            if (mmcss_handle) {
+                AvSetMmThreadPriority(mmcss_handle, AVRT_PRIORITY_HIGH);
+            }
+            realtime_audio = true;
+            audio_realtime_active_.store(true, std::memory_order_release);
+            set_chain_processing_enabled(true);
+        };
+        auto leave_realtime_audio = [&]() {
+            if (!realtime_audio) return;
+            set_chain_processing_enabled(false);
+            if (mmcss_handle) {
+                AvRevertMmThreadCharacteristics(mmcss_handle);
+                mmcss_handle = nullptr;
+            }
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+            realtime_audio = false;
+            audio_realtime_active_.store(false, std::memory_order_release);
+        };
+
+        std::fprintf(stderr, "[BRIDGE] audio_loop start (max_block=%u, variable size, idle-suspend=on)\n",
+                     max_block_size);
         std::fflush(stderr);
+        set_chain_processing_enabled(false);
         uint64_t blocks_in = 0, blocks_processed = 0, blocks_out = 0;
         uint64_t timeouts_in = 0, timeouts_out = 0;
         uint64_t total_frames = 0;
@@ -1415,7 +1472,15 @@ private:
         auto last_report = std::chrono::steady_clock::now();
         auto report_now = [&]() {
             auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_report).count() < 1000) {
+            const bool active_report =
+                blocks_in != 0 || blocks_processed != 0 || blocks_out != 0 ||
+                total_frames != 0 || timeouts_out != 0 ||
+                input_peak != 0.0f || output_peak != 0.0f;
+            const int64_t min_interval_ms = active_report ? 1000 : 60'000;
+            const int64_t elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - last_report)
+                    .count();
+            if (elapsed_ms < min_interval_ms) {
                 return;
             }
             std::fprintf(stderr,
@@ -1436,6 +1501,7 @@ private:
             last_report = now;
         };
 
+        ULONGLONG last_audio_activity_tick = 0;
         while (audio_running_) {
             // ── reset fence (= Codex 助言、2026-05-01) ──
             // control thread が `reset_pending_` を立てたら、ここで in/out ring を
@@ -1498,9 +1564,10 @@ private:
                 // Rust pump は reset_done ack 待ちなので、次 push まで待つ。
                 continue;
             }
+            const uint32_t input_wait_ms = realtime_audio ? 100 : 5000;
             uint32_t got = pipe_.read_in_available(input.data(),
                                                     max_block_size * channels,
-                                                    100 /* ms */);
+                                                    input_wait_ms);
 
             // ── State op fence (Codex P2-2、2026-05-01) ──
             // control thread が立てた query_state / restore_state を audio thread 上で
@@ -1544,9 +1611,16 @@ private:
             if (got == 0) {
                 ++timeouts_in;
                 report_now();
+                const ULONGLONG now_tick = GetTickCount64();
+                if (realtime_audio && last_audio_activity_tick != 0 &&
+                    now_tick - last_audio_activity_tick >= 1000) {
+                    leave_realtime_audio();
+                }
                 if (!audio_running_) break;
                 continue;
             }
+            enter_realtime_audio();
+            last_audio_activity_tick = GetTickCount64();
             // 必ず channels の倍数に揃える (= 半端な 1 sample があれば次回に持ち越す)。
             uint32_t aligned = got - (got % channels);
             if (aligned == 0) {
@@ -1608,9 +1682,7 @@ private:
             ++blocks_out;
             report_now();
         }
-        if (mmcss_handle) {
-            AvRevertMmThreadCharacteristics(mmcss_handle);
-        }
+        leave_realtime_audio();
         std::fprintf(stderr, "[BRIDGE] audio_loop exit\n");
         std::fflush(stderr);
     }
@@ -1647,6 +1719,7 @@ private:
     // audio
     std::thread audio_thread_;
     std::atomic<bool> audio_running_{false};
+    std::atomic<bool> audio_realtime_active_{false};
     // 診断用 passthrough flag (= true なら plugin を経由しない)
     std::atomic<bool> passthrough_{false};
     // シーク時 reset 用 fence。control thread (= run_gui_loop で `cmd == "reset"`) が

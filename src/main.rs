@@ -104,6 +104,7 @@ struct UiHeartbeatState {
     start: Instant,
     last_ms: std::sync::atomic::AtomicU64,
     last_report_ms: std::sync::atomic::AtomicU64,
+    suspended: AtomicBool,
     detail: Mutex<String>,
 }
 
@@ -239,6 +240,7 @@ fn install_ui_heartbeat_watchdog() {
                 start: now,
                 last_ms: std::sync::atomic::AtomicU64::new(0),
                 last_report_ms: std::sync::atomic::AtomicU64::new(0),
+                suspended: AtomicBool::new(false),
                 detail: Mutex::new("no App::update heartbeat yet".to_owned()),
             })
         })
@@ -250,6 +252,10 @@ fn install_ui_heartbeat_watchdog() {
             loop {
                 std::thread::sleep(Duration::from_secs(1));
                 let now_ms = state.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                if state.suspended.load(Ordering::Acquire) {
+                    state.last_report_ms.store(now_ms, Ordering::Release);
+                    continue;
+                }
                 let last_ms = state.last_ms.load(Ordering::Acquire);
                 let age_ms = now_ms.saturating_sub(last_ms);
                 if age_ms < 5_000 {
@@ -282,6 +288,7 @@ fn install_ui_heartbeat_watchdog() {
 pub(crate) fn record_ui_heartbeat_tick() {
     if let Some(state) = UI_HEARTBEAT.get() {
         let now_ms = state.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        state.suspended.store(false, Ordering::Release);
         state.last_ms.store(now_ms, Ordering::Release);
     }
 }
@@ -290,6 +297,18 @@ pub(crate) fn record_ui_heartbeat_detail(detail: String) {
     if let Some(state) = UI_HEARTBEAT.get() {
         let now_ms = state.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
         state.last_ms.store(now_ms, Ordering::Release);
+        if let Ok(mut slot) = state.detail.lock() {
+            *slot = detail;
+        }
+    }
+}
+
+pub(crate) fn set_ui_heartbeat_suspended(suspended: bool, detail: String) {
+    if let Some(state) = UI_HEARTBEAT.get() {
+        let now_ms = state.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        state.suspended.store(suspended, Ordering::Release);
+        state.last_ms.store(now_ms, Ordering::Release);
+        state.last_report_ms.store(now_ms, Ordering::Release);
         if let Ok(mut slot) = state.detail.lock() {
             *slot = detail;
         }

@@ -76,6 +76,10 @@ processes. Scanner/probe can continue to spawn a short-lived bridge process.
   summed value from per-slot events.
 - Reset runs on the bridge audio thread and resets every active loader, then
   flushes silence for the summed latency.
+- Even while the bridge is idle, reset briefly runs the VST3
+  `setProcessing(false) -> setProcessing(true)` transition and then returns the
+  plugin to idle. This keeps seek/file-change resets from preserving old plugin
+  tails without making tray residency stay in processing mode.
 - Query/restore state run on the bridge audio thread fence, keyed by `slot_id`,
   so they do not race plugin `process`.
 
@@ -184,7 +188,9 @@ Design rules:
   `[BRIDGE main heartbeat] state=... current_cmd=... reader_state=...
   queue_size=... cmds_received=... cmds_processed=...`. This is intentionally
   produced by a separate watchdog thread so it keeps logging even if the bridge
-  main thread is blocked inside a plugin callback or IPC handler.
+  main thread is blocked inside a plugin callback or IPC handler. Fully idle
+  heartbeats are throttled to 60 seconds so tray residency does not grow the
+  normal log by multiple lines per second for days.
 - Bridge main heartbeat also reports the current `DispatchMessageW` message,
   HWND, and elapsed dispatch time while the main thread is pumping messages.
   This is required because some plugins create hidden main-thread windows even
@@ -233,6 +239,16 @@ Design rules:
   avoid racing VST3 `process`. Keep that ownership explicit during the GUI
   thread refactor. If a plugin proves to require GUI-thread state I/O, add a
   stop-processing fence before marshalling state I/O to the slot GUI thread.
+- The bridge audio loop logs active audio reports at 1 second cadence, but when
+  it is only timing out waiting for input it emits an idle report at most every
+  60 seconds. This preserves a long-soak liveness signal without turning a
+  minimized-to-tray session into a log writer.
+- When no audio input arrives, the bridge suspends plugin processing with
+  `setProcessing(false)`, drops the audio thread back to normal priority, and
+  waits on the input event with a long timeout. The next pushed audio block
+  re-enters MMCSS `Pro Audio` / high priority and calls `setProcessing(true)`
+  before `process()`. This keeps loaded plugin state and GUI alive while matching
+  DAW-like stop behavior during tray residency.
 - Probe/scanner paths are unaffected because they do not create editor views and
   therefore do not start per-slot GUI threads.
 - Drag diagnostics stay in place for validation. A good result is drag

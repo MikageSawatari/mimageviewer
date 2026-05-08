@@ -1187,6 +1187,7 @@ bool PluginLoader::load(const std::string& plugin_path,
     }
     processor_->setProcessing(true);
     active_ = true;
+    processing_enabled_.store(true, std::memory_order_release);
 
     cached_latency_samples_.store(
         static_cast<uint32_t>(processor_->getLatencySamples()),
@@ -1211,6 +1212,7 @@ bool PluginLoader::load(const std::string& plugin_path,
 bool PluginLoader::process_block(const float* input, float* output, uint32_t num_frames) {
     if (!active_ || !processor_) return false;
     if (num_frames > block_size_) return false;
+    if (!is_processing_enabled() && !set_processing_enabled(true)) return false;
 
     // f32 packed stereo → planar に分解。同時に silence 検出も行う。
     bool ch0_silent = true;
@@ -1403,6 +1405,17 @@ bool PluginLoader::query_gui_size_at_dpi(uint32_t dpi, uint32_t& width_out, uint
     // SSL Meter Pro 等の固定サイズ プラグインは false を返すので、ホスト側で
     // WS_THICKFRAME を外して外側ウィンドウのリサイズ自体を禁止する。
     resizable_out = (v->canResize() == Steinberg::kResultTrue);
+    return true;
+}
+
+bool PluginLoader::set_processing_enabled(bool enabled) {
+    if (!active_ || !processor_) return false;
+    bool current = processing_enabled_.load(std::memory_order_acquire);
+    if (current == enabled) return true;
+    if (processor_->setProcessing(enabled) != kResultOk) {
+        return false;
+    }
+    processing_enabled_.store(enabled, std::memory_order_release);
     return true;
 }
 
@@ -2206,10 +2219,30 @@ void PluginLoader::hide_gui() {
 }
 
 void PluginLoader::reset() {
-    if (!processor_) return;
-    // VST3 標準: setProcessing(false) → setProcessing(true) でフィルタ履歴 flush
-    processor_->setProcessing(false);
-    processor_->setProcessing(true);
+    if (!active_ || !processor_) return;
+    // VST3 標準: setProcessing(false) → setProcessing(true) でフィルタ履歴 flush。
+    // idle 中でも一時的に true まで進めてから停止へ戻し、シーク後に古い tail が
+    // 残るプラグインを避ける。
+    const bool was_processing = is_processing_enabled();
+    auto force_processing_state = [this](bool enabled) -> bool {
+        if (processor_->setProcessing(enabled) != kResultOk) {
+            return false;
+        }
+        processing_enabled_.store(enabled, std::memory_order_release);
+        return true;
+    };
+
+    force_processing_state(false);
+    const bool reenabled = force_processing_state(true);
+    if (!was_processing) {
+        if (reenabled) {
+            if (!force_processing_state(false)) {
+                processing_enabled_.store(false, std::memory_order_release);
+            }
+        } else {
+            processing_enabled_.store(false, std::memory_order_release);
+        }
+    }
     // 時刻もリセット (= ProcessContext の sample カウンタ)
     process_time_samples_ = 0;
 }
@@ -2293,17 +2326,17 @@ bool PluginLoader::restore_state(const std::vector<uint8_t>& bytes) {
     // RAII guard で「pause 中に return しても必ず resume される」ことを保証する
     // (= setState 失敗時 / controller setState 失敗時の二重 re-enable 重複を排除)。
     struct ProcessingPauseGuard {
-        Steinberg::Vst::IAudioProcessor* p;
+        PluginLoader* loader;
         bool was_processing;
         ~ProcessingPauseGuard() {
-            if (was_processing && p) p->setProcessing(true);
+            if (was_processing && loader) loader->set_processing_enabled(true);
         }
     };
-    bool was_processing = active_;
-    if (was_processing && processor_) {
-        processor_->setProcessing(false);
+    bool was_processing = is_processing_enabled();
+    if (was_processing) {
+        set_processing_enabled(false);
     }
-    ProcessingPauseGuard guard{processor_.get(), was_processing};
+    ProcessingPauseGuard guard{this, was_processing};
     if (component_->setState(&stream) != Steinberg::kResultOk) {
         return false;
     }
@@ -2319,6 +2352,8 @@ bool PluginLoader::restore_state(const std::vector<uint8_t>& bytes) {
 
 void PluginLoader::flush_with_silence(uint32_t num_samples) {
     if (!processor_ || num_samples == 0) return;
+    const bool was_processing = is_processing_enabled();
+    if (!was_processing && !set_processing_enabled(true)) return;
     // process_block の上限 (= setupProcessing 時の maxSamplesPerBlock)。
     // 大きすぎる latency でも安全に分割処理する。
     //
@@ -2348,6 +2383,9 @@ void PluginLoader::flush_with_silence(uint32_t num_samples) {
         }
         pushed += this_blk;
     }
+    if (!was_processing) {
+        set_processing_enabled(false);
+    }
 }
 
 void PluginLoader::unload() {
@@ -2363,6 +2401,7 @@ void PluginLoader::unload() {
     hide_gui();
     if (active_ && processor_) {
         processor_->setProcessing(false);
+        processing_enabled_.store(false, std::memory_order_release);
     }
     if (active_ && component_) {
         component_->setActive(false);

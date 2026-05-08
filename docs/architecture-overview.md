@@ -208,7 +208,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `pdf_passwords` | PDF パスワード (DPAPI 暗号化) | `pdf_passwords.rs` |
 | `pdfium.dll` | 初回起動時に exe から展開 | `main.rs` |
 | `models/*.onnx` | 初回起動時に exe から展開 | `ai/model_manager.rs` |
-| `mimageviewer.log` | 起動ごとに追記 | `logger.rs` |
+| `mimageviewer.log` | 起動ごとに truncate。実行中は 16 MiB 超で `mimageviewer.log.bak` にローテーション | `logger.rs` |
 
 **パスキーの正規化**: Windows は大文字小文字非区別なので、すべての DB は **小文字化 + バックスラッシュ→スラッシュ** に正規化してから格納する。新しい DB を追加するときも同じ規約に従う (`rotation_db.rs` / `adjustment_db.rs` を参照)。
 
