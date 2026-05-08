@@ -264,7 +264,15 @@ bilinear 補間ソースサンプリング + 水平ブラー (h_blur) で、「�
 - `is_identity()` = 色調 identity **かつ** `post_filter == None`
 - `is_color_identity()` = 色調 identity のみ (バイパス中の早期 return 判定用)
 
-### 2.4 Auto モード
+### 2.4 元画像プレビュー
+
+右 Ctrl を押している間だけ、補正 / ポストフィルタ / AI アップスケール・デノイズ /
+消しゴム補完結果を表示選択から外し、元画像を一時表示する。これは「比較用の描画 override」
+であり、`adjustment_cache` や `ai_upscale_cache` の無効化、DB 書き換え、AI ジョブの停止は
+行わない。消しゴム補完済みページは `erase_base_cache` を使い、それ以外は `fs_cache`
+の生デコード結果を使う。
+
+### 2.5 Auto モード
 
 - **Auto**: ヒストグラムの 0.5/99.5 パーセンタイルでレベル補正
 - **MangaCleanup**: 紙/インク検出 → グレースケール → S 字カーブ → γ=0.85 → コントラスト ≥15

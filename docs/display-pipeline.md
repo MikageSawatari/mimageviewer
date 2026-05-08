@@ -247,6 +247,7 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 `ui_fullscreen.rs` はフレームごとに以下の順で「今表示するテクスチャ」を選ぶ:
 
 ```
+0. 右 Ctrl ホールド中の元画像プレビュー (消しゴム補完前の erase_base_cache or fs_cache)
 1. erase モードで編集中のマスクプレビュー   (ui_erase.rs)
 2. adjustment_cache[idx]                   (プリセット補正済み)
 3. ai_upscale_cache[idx]                   (AI アップスケール/デノイズ済み)
@@ -256,6 +257,11 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 
 **この優先順位は動かさないこと**。変更すると「補正を掛けた瞬間に一瞬生画像が見える」
 「AI 処理中にプリセットを変えると AI 結果で上書きされる」等の不整合が出る。
+
+右 Ctrl ホールドの元画像プレビューは例外的な一時表示で、派生キャッシュは作り直さない。
+通常の画像 / ZIP 内画像 / PDF ページだけを対象にし、動画には適用しない。消しゴム補完済みの
+ページでは `erase_base_cache` から補完前のテクスチャを lazy 作成し、それ以外は `fs_cache`
+の生デコード結果をそのまま使う。
 
 ### 2.4 変換の合成順序
 
@@ -298,6 +304,8 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
   `apply_sync_adjustment` が post-filter 段をスキップし color-only の `adjustment_cache` を生成。
   モード解除時に false に戻し該当 idx をクリアして post-filter 適用状態で再生成させる。
 - **AI アップスケール/デノイズ**: 別スレッドで推論。完了時に `ai_upscale_cache` に格納。
+- **元画像プレビュー**: 右 Ctrl を押している間だけ描画時のテクスチャ選択を
+  `fs_cache` / `erase_base_cache` に切り替える。DB・補正設定・AI queue は変更しない。
 - **何かを変えたら正しいキャッシュをクリア**:
   - 補正パラメータ変更 → `adjustment_cache[idx]` のみクリア
   - ポストフィルタ変更 → `adjustment_cache[idx]` のみクリア (色系変更と同じ扱い)

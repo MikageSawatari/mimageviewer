@@ -2307,6 +2307,10 @@ pub struct App {
     /// inpaint 適用前の元画像キャッシュ: item_idx → ピクセルデータ
     /// inpaint 実行後も元画像を保持し、マスク変更時に常に元画像から再適用する。
     pub(crate) erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    /// 右 Ctrl ホールドの元画像プレビュー用テクスチャ。
+    /// 通常は fs_cache の元テクスチャを使えるが、消しゴム補完後は fs_cache が補完結果に
+    /// 差し替わるため、erase_base_cache から一度だけ GPU texture を作って再利用する。
+    pub(crate) original_preview_tex_cache: std::collections::HashMap<usize, egui::TextureHandle>,
     /// マスク永続化 DB
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
     /// 消しゴムの Undo スタック (マスク/ベクタ両方のスナップショット、最大 20 エントリ)
@@ -2974,6 +2978,7 @@ impl Default for App {
             erase_shift_drag: None,
             erase_paint_mode: true,
             erase_base_cache: std::collections::HashMap::new(),
+            original_preview_tex_cache: std::collections::HashMap::new(),
             mask_db,
             erase_undo_stack: std::collections::VecDeque::new(),
             meta_undo: crate::undo_stack::UndoStack::new(),
@@ -5898,6 +5903,7 @@ impl App {
         self.ai_upscale_failed.clear();
         self.ai_classify_cache.clear();
         self.erase_base_cache.clear();
+        self.original_preview_tex_cache.clear();
         self.fs_early_dims.clear();
         self.fs_cache.clear();
         self.fs_upload_backlog.clear();
@@ -10239,6 +10245,7 @@ impl App {
             // フルスクリーンで現在これらのページを開いている可能性は低い (grid モード) が、
             // 念のため inpaint 結果キャッシュを落として次回開いたときに再適用させる。
             self.erase_base_cache.remove(idx);
+            self.original_preview_tex_cache.remove(idx);
             self.fs_cache.remove(idx);
             self.save_mask_raw_with_sidecar(
                 *idx,
@@ -11104,6 +11111,7 @@ impl App {
         }
         self.reset_erase_mode();
         self.erase_base_cache.clear();
+        self.original_preview_tex_cache.clear();
         for (cancel, _, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
         }

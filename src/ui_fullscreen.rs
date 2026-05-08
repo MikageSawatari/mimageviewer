@@ -188,6 +188,18 @@ fn current_foreground_hwnd() -> usize {
     0
 }
 
+#[cfg(windows)]
+fn original_preview_shortcut_held(_ctx: &egui::Context) -> bool {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_RCONTROL};
+
+    unsafe { GetAsyncKeyState(VK_RCONTROL.0 as i32) < 0 }
+}
+
+#[cfg(not(windows))]
+fn original_preview_shortcut_held(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.key_down(egui::Key::Num0))
+}
+
 fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
     matches!(
         key,
@@ -574,6 +586,59 @@ impl App {
         None
     }
 
+    /// 右 Ctrl ホールド中だけ、mIV 側の派生表示 (補正 / AI / 消しゴム補完) を
+    /// 迂回して元画像テクスチャを選ぶ。
+    fn original_preview_active(&self, ctx: &egui::Context, idx: usize) -> bool {
+        if !ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
+            return false;
+        }
+        if self.any_modal_dialog_open_for_fullscreen_keys() {
+            return false;
+        }
+        if !original_preview_shortcut_held(ctx) {
+            return false;
+        }
+        matches!(
+            self.items.get(idx),
+            Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. })
+        )
+    }
+
+    fn resolve_original_preview_tex(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        if let Some(base) = self.erase_base_cache.get(&idx) {
+            let needs_upload = self
+                .original_preview_tex_cache
+                .get(&idx)
+                .map(|tex| tex.size() != base.size)
+                .unwrap_or(true);
+            if needs_upload {
+                let tex = ctx.load_texture(
+                    format!("fs_original_preview_{idx}"),
+                    base.as_ref().clone(),
+                    egui::TextureOptions::LINEAR,
+                );
+                self.original_preview_tex_cache.insert(idx, tex);
+            }
+            return self.original_preview_tex_cache.get(&idx).cloned();
+        }
+
+        match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
+            Some(FsCacheEntry::Animated {
+                frames,
+                current_frame,
+                ..
+            }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
+            _ => None,
+        }
+    }
+
     /// Ctrl+↑↓ ナビ発火直前に `fs_holdover_tex` を仕込むためのヘルパ。
     /// `resolve_fs_display_tex` を `include_thumb=true` で呼んで「最良の表示物」を取る。
     pub(crate) fn current_fs_tex_for_holdover(&self, fs_idx: usize) -> Option<egui::TextureHandle> {
@@ -902,6 +967,7 @@ fn is_landscape(
 struct FsFrameState {
     is_video: bool,
     separator_text: Option<String>,
+    original_preview_active: bool,
     tex: Option<egui::TextureHandle>,
     thumb_tex: Option<egui::TextureHandle>,
     /// 上部ホバーバー左側に表示するパス文字列。
@@ -1279,7 +1345,14 @@ impl App {
                                     self.fs_spread_layout = None;
                                 }
                                 SpreadPair::Double { left, right } => {
-                                    self.draw_fs_spread(ui, ctx, image_rect, left, right);
+                                    self.draw_fs_spread(
+                                        ui,
+                                        ctx,
+                                        image_rect,
+                                        left,
+                                        right,
+                                        state.original_preview_active,
+                                    );
                                 }
                             }
                         }
@@ -1292,7 +1365,7 @@ impl App {
                         // フレーム単位の遷移期間が存在する。この 1 フレームでは見開き
                         // レンダ + 消しゴム overlay を併発させずスキップして、次フレームに
                         // 単一ページ表示で消しゴムを描画する。
-                        if self.erase_mode && !is_spread_double {
+                        if self.erase_mode && !is_spread_double && !state.original_preview_active {
                             let zp = self.fs_zoom_pan();
                             self.handle_erase_paint(ctx, image_rect, zp);
                             self.draw_erase_overlay(ui, ctx, image_rect, zp);
@@ -1314,6 +1387,7 @@ impl App {
 
                         // ── 透過背景インジケータ (B キー変更直後のみフェード表示) ──
                         self.draw_fs_transparent_bg_indicator(ui, full_rect);
+                        self.draw_original_preview_indicator(ui, full_rect, state.original_preview_active);
                         fs_overlay_ms = overlay_t0.elapsed().as_secs_f64() * 1000.0;
 
                         // ── 動画 HUD (下部の再生バー + 時刻 + 音量 + シークバー) ──
@@ -1779,13 +1853,14 @@ impl App {
     }
 
     /// フルスクリーン描画に必要な状態を事前計算する。
-    fn prepare_fullscreen_state(&self, _ctx: &egui::Context, fs_idx: usize) -> FsFrameState {
+    fn prepare_fullscreen_state(&mut self, ctx: &egui::Context, fs_idx: usize) -> FsFrameState {
         let is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
         let separator_text = match self.items.get(fs_idx) {
             Some(GridItem::ZipSeparator { dir_display }) => Some(dir_display.clone()),
             _ => None,
         };
         let is_separator = separator_text.is_some();
+        let original_preview_active = self.original_preview_active(ctx, fs_idx);
 
         let tex: Option<egui::TextureHandle> = if is_video {
             // 動画: VideoPlayer が in-place 更新するテクスチャをそのまま使う
@@ -1793,6 +1868,8 @@ impl App {
                 Some(FsCacheEntry::Video { player, .. }) => player.texture().cloned(),
                 _ => None,
             }
+        } else if original_preview_active {
+            self.resolve_original_preview_tex(ctx, fs_idx)
         } else {
             // 補正済みキャッシュ（フル解像度）
             let adj_tex = match self.adjustment_cache.get(&fs_idx) {
@@ -1947,6 +2024,7 @@ impl App {
         FsFrameState {
             is_video,
             separator_text,
+            original_preview_active,
             tex,
             thumb_tex,
             location_display,
@@ -3691,6 +3769,25 @@ impl App {
         ui.ctx().request_repaint(); // フェードを継続
     }
 
+    fn draw_original_preview_indicator(&self, ui: &egui::Ui, full_rect: egui::Rect, active: bool) {
+        if !active {
+            return;
+        }
+        let label = if cfg!(windows) {
+            "元画像表示中: 右Ctrl"
+        } else {
+            "元画像表示中: 0"
+        };
+        let painter = ui.painter();
+        let font = egui::FontId::proportional(14.0);
+        let galley = painter.layout_no_wrap(label.to_string(), font, egui::Color32::WHITE);
+        let pos = egui::pos2(full_rect.min.x + 16.0, full_rect.min.y + 12.0);
+        let bg = egui::Rect::from_min_size(pos, galley.size()).expand(6.0);
+        painter.rect_filled(bg, 4.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190));
+        painter.galley(pos, galley, egui::Color32::WHITE);
+        ui.ctx().request_repaint();
+    }
+
     /// ルーペ (局所拡大) 描画。
     ///
     /// 有効条件:
@@ -3861,6 +3958,7 @@ impl App {
         image_rect: egui::Rect,
         left_idx: usize,
         right_idx: usize,
+        original_preview_active: bool,
     ) {
         let zoom_pan = self.fs_zoom_pan();
         let left_rot = self.get_rotation(left_idx);
@@ -3945,13 +4043,31 @@ impl App {
             // 使い、「ファイル名のみ表示」状態を回避する。両ページに同じ holdover が
             // 出るのは束の間 (poll_fs_nav_lock がサムネ Loaded で解除する) なので許容。
             let holdover_for_locked = if self.fs_nav_is_locked() {
-                self.fs_holdover_tex.as_ref()
+                self.fs_holdover_tex.clone()
             } else {
                 None
             };
-            for (rect, idx, rot, location) in [
-                (left_rect, left_idx, left_rot, &left_location),
-                (right_rect, right_idx, right_rot, &right_location),
+            let left_original_tex = original_preview_active
+                .then(|| self.resolve_original_preview_tex(ctx, left_idx))
+                .flatten();
+            let right_original_tex = original_preview_active
+                .then(|| self.resolve_original_preview_tex(ctx, right_idx))
+                .flatten();
+            for (rect, idx, rot, location, original_tex) in [
+                (
+                    left_rect,
+                    left_idx,
+                    left_rot,
+                    &left_location,
+                    left_original_tex.as_ref(),
+                ),
+                (
+                    right_rect,
+                    right_idx,
+                    right_rot,
+                    &right_location,
+                    right_original_tex.as_ref(),
+                ),
             ] {
                 Self::draw_fs_spread_page(
                     &painter,
@@ -3963,7 +4079,8 @@ impl App {
                     &self.thumbnails,
                     &bg_style,
                     location,
-                    holdover_for_locked,
+                    holdover_for_locked.as_ref(),
+                    original_tex,
                 );
             }
 
@@ -3996,13 +4113,31 @@ impl App {
             );
             // フォールバック分岐でも nav ロック中の holdover を渡す (上のパス参照)。
             let holdover_for_locked = if self.fs_nav_is_locked() {
-                self.fs_holdover_tex.as_ref()
+                self.fs_holdover_tex.clone()
             } else {
                 None
             };
-            for (rect, idx, rot, location) in [
-                (left_rect, left_idx, left_rot, &left_location),
-                (right_rect, right_idx, right_rot, &right_location),
+            let left_original_tex = original_preview_active
+                .then(|| self.resolve_original_preview_tex(ctx, left_idx))
+                .flatten();
+            let right_original_tex = original_preview_active
+                .then(|| self.resolve_original_preview_tex(ctx, right_idx))
+                .flatten();
+            for (rect, idx, rot, location, original_tex) in [
+                (
+                    left_rect,
+                    left_idx,
+                    left_rot,
+                    &left_location,
+                    left_original_tex.as_ref(),
+                ),
+                (
+                    right_rect,
+                    right_idx,
+                    right_rot,
+                    &right_location,
+                    right_original_tex.as_ref(),
+                ),
             ] {
                 Self::draw_fs_spread_page(
                     &painter,
@@ -4014,7 +4149,8 @@ impl App {
                     &self.thumbnails,
                     &bg_style,
                     location,
-                    holdover_for_locked,
+                    holdover_for_locked.as_ref(),
+                    original_tex,
                 );
             }
             // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
@@ -4070,19 +4206,24 @@ impl App {
         bg_style: &FsBgStyle<'_>,
         location_display: &str,
         holdover_tex: Option<&egui::TextureHandle>,
+        original_tex: Option<&egui::TextureHandle>,
     ) {
         // テクスチャ取得（補正済 or フルサイズ or サムネイル → ロック中なら最後に holdover）
-        let tex = match adjustment_cache.get(&idx) {
-            Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
-            _ => match fs_cache.get(&idx) {
+        let tex = if let Some(tex) = original_tex {
+            Some(tex.clone())
+        } else {
+            match adjustment_cache.get(&idx) {
                 Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
-                Some(FsCacheEntry::Animated {
-                    frames,
-                    current_frame,
-                    ..
-                }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
-                _ => None,
-            },
+                _ => match fs_cache.get(&idx) {
+                    Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
+                    Some(FsCacheEntry::Animated {
+                        frames,
+                        current_frame,
+                        ..
+                    }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
+                    _ => None,
+                },
+            }
         };
         let thumb_tex = match thumbnails.get(idx) {
             Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
