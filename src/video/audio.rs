@@ -265,11 +265,12 @@ const SAFETY_LIMITER_LOOKAHEAD_SECS: f64 = 0.005;
 const SAFETY_LIMITER_RELEASE_SECS: f64 = 0.100;
 const SAFETY_LIMITER_CEILING_DBFS: f32 = -1.0;
 
-/// VST3 チェーン後段の保険用 lookahead limiter。
+/// VST3 チェーン後段と 100% 超の手動音量 boost の保険用 lookahead limiter。
 ///
 /// ユーザーがチェーン末尾に limiter を入れていない場合でも、過大出力が WASAPI /
 /// OS mixer 側で hard clip するのを避けるための最終安全網。制作向け limiter ではなく
-/// 視聴用の保護なので、パラメータは固定し、VST3 チェーンが active のときだけ動かす。
+/// 視聴用の保護なので、パラメータは固定し、VST3 チェーンまたは手動 boost が active の
+/// ときだけ動かす。
 struct SafetyLimiter {
     channels: usize,
     lookahead_frames: usize,
@@ -917,7 +918,14 @@ fn run_pump(
                 bool,
             ) = (stretched.samples.clone(), 0.0, false);
 
-            if vst_chain_active {
+            let pre_limiter_gain = clock.pre_limiter_gain();
+            if pre_limiter_gain > 1.0 {
+                for sample in &mut output_samples {
+                    *sample *= pre_limiter_gain;
+                }
+            }
+            let limiter_active = vst_chain_active || pre_limiter_gain > 1.0;
+            if limiter_active {
                 safety_limiter.process_block(&mut output_samples);
                 current_pdc_latency_secs += safety_limiter.latency_secs();
             } else {
@@ -1211,7 +1219,7 @@ fn fill_output(
         return;
     }
 
-    let vol = clock.effective_volume();
+    let vol = clock.output_volume();
 
     // ── chunk-based drain (Codex P1-1 反映、2026-05) ──
     // processed の先頭 chunk から `drain_offset_in_first` 経由で順に取り出す。

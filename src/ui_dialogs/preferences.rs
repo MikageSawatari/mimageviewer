@@ -1701,15 +1701,16 @@ fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     ui.add_space(8.0);
     let mut vol_pct = (s.video_volume * 100.0).round() as i32;
+    let max_vol_pct = (crate::settings::VIDEO_VOLUME_MAX * 100.0).round() as i32;
     if ui
         .add(
-            egui::Slider::new(&mut vol_pct, 0..=100)
+            egui::Slider::new(&mut vol_pct, 0..=max_vol_pct)
                 .text("既定音量 (%)")
                 .clamping(egui::SliderClamping::Always),
         )
         .changed()
     {
-        s.video_volume = (vol_pct as f64 / 100.0).clamp(0.0, 1.0);
+        s.video_volume = crate::settings::clamp_video_volume(vol_pct as f64 / 100.0);
     }
 
     ui.add_space(12.0);

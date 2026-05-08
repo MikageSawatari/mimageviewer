@@ -146,6 +146,9 @@ VST3 enable 時:
 decoder → audio_rx → audio-pump thread:
    if vst3_enabled && bridge.is_loaded():
        bridge.process_block(frame.samples) → frame.samples
+   if video_volume > 100%:
+       apply manual preamp boost            → frame.samples
+   if VST3 active or manual boost active:
        safety_limiter(frame.samples)        → frame.samples
    AudioBuffer に push
                 → cpal RT → 出力 (変更なし)
@@ -155,11 +158,12 @@ decoder → audio_rx → audio-pump thread:
 
 - **plugin process は audio-pump thread で実行する**。cpal RT スレッドではない。
   bridge IPC roundtrip (~1-2ms) を AudioBuffer の processed depth (100ms) で吸収する。
-- **VST3 チェーン後段には安全 limiter を入れる**。ユーザーが limiter プラグインを
-  末尾に挿していない場合の保険で、5ms lookahead / -1dBFS ceiling / 100ms release の
-  固定 sample-peak limiter とする。true-peak limiter ではないため inter-sample peak は
-  完全保証しないが、視聴時の hard clip 保険として扱う。VST3 が無効、または active
-  plugin が無い場合は完全に bypass する。
+- **VST3 チェーン後段と手動音量 boost には安全 limiter を入れる**。ユーザーが limiter
+  プラグインを末尾に挿していない場合、および動画音量を 100% 超にした場合の保険で、
+  5ms lookahead / -1dBFS ceiling / 100ms release の固定 sample-peak limiter とする。
+  true-peak limiter ではないため inter-sample peak は完全保証しないが、視聴時の hard
+  clip 保険として扱う。VST3 が無効、active plugin が無く、音量も 100% 以下の場合は
+  完全に bypass する。
 - **enable=false なら処理ゼロオーバーヘッド**。frame をそのまま push。
 - **bridge unload 中も音声は流れる**。ロード前は plugin pass-through (= 何もしない)。
 - **block size は decoder のフレームサイズに依存しない**。bridge 側で variable

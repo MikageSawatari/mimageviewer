@@ -1797,7 +1797,7 @@ impl VideoPlayer {
     /// ファイルオープン自体はワーカースレッド内で非同期に行うので、UI スレッドは
     /// ブロックされない。
     ///
-    /// `initial_volume` は 0.0-1.0。
+    /// `initial_volume` は 0.0-1.5。1.0 超は音声ポンプ側の手動 boost として扱う。
     /// `resume_secs` を指定すると、最初の動画情報受領後に自動的にその位置へシークする。
     /// `hw_decode` が true なら D3D11VA HW デコードを試行 (失敗時は SW にフォールバック)。
     /// VST3 プラグイン処理用の DspBridge は `dsp_bridge` 引数で渡す。

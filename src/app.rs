@@ -10324,7 +10324,7 @@ impl App {
         autoplay_override: Option<bool>,
         #[cfg(windows)] native_output_config: Option<crate::video::NativeVideoOutputConfig>,
     ) -> crate::video::VideoPlayer {
-        let vol = self.settings.video_volume;
+        let vol = crate::settings::clamp_video_volume(self.settings.video_volume);
         let autoplay = autoplay_override.unwrap_or_else(|| {
             video_autoplay_for_open(
                 self.settings.video_autoplay_mode,
@@ -13629,7 +13629,7 @@ impl App {
             return;
         }
         let volume = if volume.is_finite() {
-            volume.clamp(0.0, 1.0)
+            crate::settings::clamp_video_volume(volume)
         } else {
             return;
         };
@@ -14373,7 +14373,7 @@ impl App {
             // perform the same item navigation without involving egui input.
             0x26 if key.shift && !key.ctrl => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    let v = (player.volume() + 0.20).min(1.0);
+                    let v = (player.volume() + 0.20).min(crate::settings::VIDEO_VOLUME_MAX);
                     player.set_volume(v);
                     self.settings.video_volume = v;
                     self.settings.save();

@@ -209,6 +209,10 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   `DspBridge::process_block` 経由で bridge プロセスに送り、戻ってきた処理済みサンプルを
   ring buffer に push する (= IPC roundtrip ~1-2ms、AudioBuffer processed queue 100ms
   で吸収)
+- 動画音量は 0〜150% の手動調整。100% 超の分は `audio-pump` で safety limiter の前に
+  preamp gain として掛け、`fill_output` 側の RT 音量は最大 100% に抑える。これにより
+  100% 以下の音量変更は従来通り低レイテンシで、boost 時だけ limiter の 5ms lookahead を
+  PDC latency として扱う。
 - `fill_output` の bookkeeping (Phase 9 後の cleanup refactor):
   - **実消費サンプル数ベース**: `pop_front` で取り出した分 (= `real_consumed`) のみ
     `next_pts_secs` を進める。silence 出力中は pts 進行 0 (= 旧版の「常に full want
@@ -230,7 +234,7 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
     state 更新のみ」「内部 bump 必要時は av_clock.request_seek 経由で publish」を
     自動判別。詳細は [docs/video-engine-redesign.md] の「counter consolidation」節。
   - **再生制御の互換複製** (`playing` / `audio_active` / `eof_reached` / `seek_request` / `seek_target_override`): `EngineActor` の `published_state` (`Arc<AtomicU8>`) と並列管理されている **複製**。新規コードはこれらを AvClock からは読まず、EngineActor 経由で取得すること (source of truth は EngineActor)。
-  - **AvClock 単独で保持しているレガシー所有状態** (`volume` / `muted`): TransportCommand::SetVolume / SetMuted は EngineActor 側では no-op で、現状 `audio.rs` が `clock.effective_volume()` を直接読んでいる。これらは将来的に `EngineActor` (もしくは独立の `VolumeController`) に移すべきだが、Phase 4 時点では AvClock が source of truth のまま。
+  - **AvClock 単独で保持しているレガシー所有状態** (`volume` / `muted`): TransportCommand::SetVolume / SetMuted は EngineActor 側では no-op で、現状 `audio.rs` が `clock.output_volume()` / `clock.pre_limiter_gain()` を直接読んでいる。これらは将来的に `EngineActor` (もしくは独立の `VolumeController`) に移すべきだが、Phase 4 時点では AvClock が source of truth のまま。
 - `playback_speed` は AvClock と EngineActor の anchor speed に伝搬し、`now_secs()` は
   source timeline を `speed` 倍で進める。速度変更時は現在 PTS で anchor を張り直し、
   `audio_tx_accounting_epoch` を進めて旧速度で enqueue 済みの tx 会計を無効化する。
@@ -331,7 +335,7 @@ pub enum VideoFrameData {
 - `Settings.video_rtx_vsr` (= VSR ON/OFF トグル、撤回により不要)
 
 維持する設定項目:
-- `Settings.video_volume` (音量)
+- `Settings.video_volume` (音量。既定 1.0、手動 boost 上限 1.5)
 - `Settings.video_loop` (ループ再生)
 - `Settings.video_resume_position` (シーク位置の永続化、ファイル単位)
 - `Settings.video_hw_decode` (HW デコードを試みるかのフラグ、トラブルシュート用)

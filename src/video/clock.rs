@@ -24,7 +24,8 @@
 //!   truth。新規コードはこれらを `EngineActor` 経由で読むこと。
 //! - **AvClock 単独で source of truth を保持しているレガシー所有状態** (`volume` /
 //!   `muted`): `TransportCommand::SetVolume / SetMuted` は `EngineActor` 側では
-//!   no-op で、`audio.rs` が `clock.effective_volume()` を直接読む構造になっている。
+//!   no-op で、`audio.rs` が `clock.output_volume()` / `clock.pre_limiter_gain()` を
+//!   直接読む構造になっている。
 //!   将来 `EngineActor` (もしくは独立の `VolumeController`) に移すべきだが、
 //!   Phase 4 時点では AvClock 所有のまま。
 //!
@@ -267,7 +268,9 @@ impl AvClock {
             audio_tx_accounting_epoch: AtomicU64::new(0),
             audio_active: AtomicBool::new(false),
             eof_reached: AtomicBool::new(false),
-            volume_bits: AtomicU64::new(initial_volume.clamp(0.0, 1.0).to_bits()),
+            volume_bits: AtomicU64::new(
+                crate::settings::clamp_video_volume(initial_volume).to_bits(),
+            ),
             muted: AtomicBool::new(false),
         }
     }
@@ -809,8 +812,10 @@ impl AvClock {
     }
 
     pub fn set_volume(&self, v: f64) {
-        self.volume_bits
-            .store(v.clamp(0.0, 1.0).to_bits(), Ordering::Release);
+        self.volume_bits.store(
+            crate::settings::clamp_video_volume(v).to_bits(),
+            Ordering::Release,
+        );
     }
 
     pub fn is_muted(&self) -> bool {
@@ -821,12 +826,21 @@ impl AvClock {
         self.muted.store(m, Ordering::Release);
     }
 
-    /// 実効音量 (mute 中は 0)。音声コールバックが毎回参照する。
-    pub fn effective_volume(&self) -> f32 {
+    /// RT 出力コールバックで掛ける音量 (mute 中は 0、100% 超 boost はここでは掛けない)。
+    pub fn output_volume(&self) -> f32 {
         if self.is_muted() {
             0.0
         } else {
-            self.volume() as f32
+            self.volume().min(1.0) as f32
+        }
+    }
+
+    /// 音声ポンプ側で safety limiter の前に掛ける boost。100% 以下では 1.0。
+    pub fn pre_limiter_gain(&self) -> f32 {
+        if self.is_muted() {
+            1.0
+        } else {
+            self.volume().max(1.0) as f32
         }
     }
 }
@@ -868,5 +882,17 @@ mod tests {
 
         clock.add_audio_tx_queued_secs_for_epoch(0.2, new_epoch);
         assert!((clock.audio_tx_queued_secs() - 0.2).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn volume_supports_manual_boost_but_caps_rt_output_gain() {
+        let clock = AvClock::new(2.0, Arc::new(AtomicU64::new(0)));
+        assert!((clock.volume() - crate::settings::VIDEO_VOLUME_MAX).abs() < 1.0e-9);
+        assert!((clock.output_volume() - 1.0).abs() < 1.0e-6);
+        assert!((clock.pre_limiter_gain() - 1.5).abs() < 1.0e-6);
+
+        clock.set_muted(true);
+        assert_eq!(clock.output_volume(), 0.0);
+        assert_eq!(clock.pre_limiter_gain(), 1.0);
     }
 }

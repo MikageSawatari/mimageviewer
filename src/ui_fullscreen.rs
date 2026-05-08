@@ -5828,7 +5828,7 @@ impl App {
         };
         // Phase 7.H: 音量は Shift+↑↓ 限定 (= 20% step)。プレーン ↑↓ はファイル移動。
         let new_vol = if shift_up {
-            Some((cur_volume + 0.20).min(1.0))
+            Some((cur_volume + 0.20).min(crate::settings::VIDEO_VOLUME_MAX))
         } else if shift_down {
             Some((cur_volume - 0.20).max(0.0))
         } else {
@@ -6917,9 +6917,15 @@ impl App {
         // 右側にはみ出すだけで隣接ウィジェットには影響しないが、これより狭いと
         // 99% などで右にずれて見えるので保守的に大きめにする。
         const VOL_PCT_MAX_W: f32 = 36.0;
+        let volume = crate::settings::clamp_video_volume(volume);
         let vol_pct_text = format!("{:>3}%", (volume * 100.0).round() as i32);
+        let vol_text_color = if volume > 1.0 {
+            egui::Color32::from_rgb(255, 210, 80)
+        } else {
+            egui::Color32::WHITE
+        };
         let vol_pct_galley =
-            painter.layout_no_wrap(vol_pct_text, label_font.clone(), egui::Color32::WHITE);
+            painter.layout_no_wrap(vol_pct_text, label_font.clone(), vol_text_color);
         let vol_pct_block_x = hud_rect.max.x - pad - VOL_PCT_MAX_W;
         let vol_pct_pos = egui::pos2(
             vol_pct_block_x + (VOL_PCT_MAX_W - vol_pct_galley.size().x), // 右寄せ
@@ -7224,14 +7230,41 @@ impl App {
 
         // ── 音量スライダー (描画 + 入力) ──
         painter.rect_filled(vol_slider_rect, 2.0, egui::Color32::from_gray(80));
-        let vol_filled = egui::Rect::from_min_max(
-            vol_slider_rect.min,
-            egui::pos2(
-                vol_slider_rect.min.x + vol_slider_rect.width() * volume.clamp(0.0, 1.0) as f32,
-                vol_slider_rect.max.y,
-            ),
+        let max_volume = crate::settings::VIDEO_VOLUME_MAX;
+        let normal_frac = (1.0 / max_volume) as f32;
+        let normal_fill_frac = (volume.min(1.0) / max_volume) as f32;
+        if normal_fill_frac > 0.0 {
+            let normal_fill = egui::Rect::from_min_max(
+                vol_slider_rect.min,
+                egui::pos2(
+                    vol_slider_rect.min.x + vol_slider_rect.width() * normal_fill_frac,
+                    vol_slider_rect.max.y,
+                ),
+            );
+            painter.rect_filled(normal_fill, 2.0, egui::Color32::from_rgb(220, 220, 220));
+        }
+        if volume > 1.0 {
+            let boost_fill_frac = (volume / max_volume) as f32;
+            let boost_fill = egui::Rect::from_min_max(
+                egui::pos2(
+                    vol_slider_rect.min.x + vol_slider_rect.width() * normal_frac,
+                    vol_slider_rect.min.y,
+                ),
+                egui::pos2(
+                    vol_slider_rect.min.x + vol_slider_rect.width() * boost_fill_frac,
+                    vol_slider_rect.max.y,
+                ),
+            );
+            painter.rect_filled(boost_fill, 2.0, egui::Color32::from_rgb(255, 198, 62));
+        }
+        let normal_x = vol_slider_rect.min.x + vol_slider_rect.width() * normal_frac;
+        painter.line_segment(
+            [
+                egui::pos2(normal_x, vol_slider_rect.min.y - 3.0),
+                egui::pos2(normal_x, vol_slider_rect.max.y + 3.0),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
         );
-        painter.rect_filled(vol_filled, 2.0, egui::Color32::from_rgb(220, 220, 220));
         let vol_resp = ui.interact(
             vol_hit_rect,
             egui::Id::new(("video_vol", fs_idx)),
@@ -7240,21 +7273,23 @@ impl App {
         if vol_resp.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
         }
+        let vol_resp = vol_resp.on_hover_text("音量 (100%超はブースト) [Shift+↑ / Shift+↓]");
         if (vol_resp.clicked() || vol_resp.dragged())
             && let Some(pp) = vol_resp.interact_pointer_pos()
         {
-            let frac =
-                ((pp.x - vol_slider_rect.min.x) / vol_slider_rect.width()).clamp(0.0, 1.0) as f64;
+            let frac = ((pp.x - vol_slider_rect.min.x) / vol_slider_rect.width()).clamp(0.0, 1.0)
+                as f64
+                * max_volume;
             if let Some(p) = self.fs_video_player(fs_idx) {
                 p.set_volume(frac);
             }
             // Phase 8 (Codex P3-1): 即時 save (HUD スライダー操作の永続化)。
-            self.settings.video_volume = frac;
+            self.settings.video_volume = crate::settings::clamp_video_volume(frac);
             self.settings.save();
         }
 
         // ── 音量 % テキスト (一番最後に描画 = 上に乗せる) ──
-        painter.galley(vol_pct_pos, vol_pct_galley, egui::Color32::WHITE);
+        painter.galley(vol_pct_pos, vol_pct_galley, vol_text_color);
     }
 
     /// 動画一時停止中のキー操作ヒントを **画面中央の再生アイコン直下** に表示する

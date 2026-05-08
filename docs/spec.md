@@ -118,6 +118,8 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 - 動画はフルスクリーンでインライン再生。下部 HUD の速度ボタンから 0.5x〜3.0x の
   倍速再生を選択でき、音声は pitch を維持して再生する。外部プレイヤーは
   Shift+Enter で起動する。
+- 動画音量は既定 100%。下部 HUD / Shift+↑↓ / 環境設定から 0〜150% で手動調整でき、
+  100% 超の boost 部分は HUD で黄色表示し、音声ポンプ側の safety limiter を通す。
 - ビューポートは起動時から非表示で維持し、表示時のちらつきを防止
 
 ---
@@ -321,6 +323,7 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 |--------|-----|---------|------|
 | `parallelism` | Parallelism | Auto | 並列読み込みスレッド数 |
 | `folder_skip_limit` | usize | 5 | Ctrl+↑↓ で空フォルダ・画像なし ZIP をスキップする上限（UI 上限 30） |
+| `video_volume` | f64 | 1.0 | 動画再生時の既定音量（0.0〜1.5）。1.0 超は手動 boost として safety limiter 前で適用 |
 | `video_deinterlace` | VideoDeinterlaceMode | Auto | 動画再生時のデインターレース（Off / Auto / On）。Auto/On は FFmpeg bwdif を表示前に適用 |
 | `folder_thumb_depth` | u32 | 3 | フォルダ代表画像の探索最大階層数（0 で直接の子のみ） |
 | `sidecar_backup_enabled` | bool | true | フォルダ直下に `mimageviewer.dat` (Hidden+System 属性の JSON) を作り、補正・消しゴムマスクの設定をバックアップする。フォルダ丸ごと別ドライブへ移動しても設定が保持される。OFF 時は読み書き両方スキップ |

@@ -809,7 +809,8 @@ pub struct Settings {
     pub update_check_dismissed_version: Option<String>,
 
     // ── 動画インライン再生 ────────────────────────────────────────
-    /// 動画再生時の既定音量 (0.0-1.0)。
+    /// 動画再生時の既定音量 (0.0-1.5)。1.0 を超える値は音声ポンプ側で
+    /// pre-limiter boost として扱う。
     #[serde(default = "default_video_volume")]
     pub video_volume: f64,
     /// フルスクリーン化時に自動再生を開始するか (旧: bool)。
@@ -940,6 +941,19 @@ pub struct Vst3ChainPresetSlots {
     pub slots: [Option<Vst3ChainPresetSlot>; 10],
 }
 
+/// 動画音量の既定値。100% (= boost なし)。
+pub const VIDEO_VOLUME_DEFAULT: f64 = 1.0;
+/// 動画音量の上限。150% は +3.5dB 程度の手動 boost。
+pub const VIDEO_VOLUME_MAX: f64 = 1.5;
+
+pub fn clamp_video_volume(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, VIDEO_VOLUME_MAX)
+    } else {
+        VIDEO_VOLUME_DEFAULT
+    }
+}
+
 /// 動画タイルモード列数の候補 (Phase 6.D)。
 pub const VIDEO_TILE_COLUMN_CANDIDATES: &[usize] = &[6, 10, 16, 20, 26, 30];
 
@@ -1007,7 +1021,7 @@ impl VideoDeinterlaceMode {
 }
 
 fn default_video_volume() -> f64 {
-    0.6
+    VIDEO_VOLUME_DEFAULT
 }
 
 /// グリッド列数の最小値
@@ -1267,12 +1281,15 @@ impl Settings {
         let had_nil_uuids = settings.favorites.iter().any(|f| f.id.is_nil());
         let autoplay_mode_migrated =
             settings.video_autoplay_mode == VideoAutoplayMode::OnlyFromGrid;
+        let video_volume_before_sanitize = settings.video_volume;
         // migration: VST3 旧形式 (vst3_plugin_path / vst3_plugin_state) を Vec に移送
         let vst3_migrated = settings.migrate_vst3_legacy();
         settings.sanitize();
+        let video_volume_sanitized =
+            (settings.video_volume - video_volume_before_sanitize).abs() > 1.0e-9;
         // 新規 UUID を発行したので settings.json に書き戻して永続化する。
         // これで次回起動以降は sanitize でのマイグレーションが不要になる。
-        if had_nil_uuids || vst3_migrated || autoplay_mode_migrated {
+        if had_nil_uuids || vst3_migrated || autoplay_mode_migrated || video_volume_sanitized {
             settings.save();
         }
         settings
@@ -1316,6 +1333,7 @@ impl Settings {
             self.video_autoplay = false;
             self.video_autoplay_mode = VideoAutoplayMode::Off;
         }
+        self.video_volume = clamp_video_volume(self.video_volume);
 
         // v0.8 マイグレーション: お気に入りの UUID が nil なら発行する。
         // 旧形式 / id フィールド欠落時は deserialize で Uuid::nil() が入っているので、
@@ -1525,6 +1543,7 @@ mod tests {
         assert_eq!(loaded.grid_cols, 4);
         assert_eq!(loaded.thumb_px, 512);
         assert_eq!(loaded.thumb_quality, 75);
+        assert_eq!(loaded.video_volume, VIDEO_VOLUME_DEFAULT);
         assert_eq!(loaded.video_deinterlace, VideoDeinterlaceMode::Auto);
         assert!(loaded.favorites.is_empty());
     }
@@ -1562,6 +1581,18 @@ mod tests {
             !s.video_autoplay,
             "legacy OnlyFromGrid should not be bridged back to Always by video_autoplay"
         );
+    }
+
+    #[test]
+    fn sanitize_clamps_video_volume_to_manual_boost_range() {
+        let mut s = Settings::default();
+        s.video_volume = 2.0;
+        s.sanitize();
+        assert_eq!(s.video_volume, VIDEO_VOLUME_MAX);
+
+        s.video_volume = -0.5;
+        s.sanitize();
+        assert_eq!(s.video_volume, 0.0);
     }
 
     #[test]

@@ -1904,7 +1904,7 @@ impl NativeEguiOverlay {
     ) {
         let position_secs = finite_nonnegative(position_secs);
         let duration_secs = finite_nonnegative(duration_secs);
-        let volume = finite_unit(volume);
+        let volume = finite_video_volume(volume);
         let playback_speed = crate::video::clock::clamp_playback_speed(playback_speed);
         let duration_changed = (self.video_duration_secs - duration_secs).abs() > 0.001;
         let position_changed = (self.video_position_secs - position_secs).abs() >= 0.25;
@@ -3025,12 +3025,46 @@ impl NativeEguiOverlay {
                         egui::pos2(speed_rect.max.x + gap + vol_slider_w, center_y + 4.0),
                     );
                     painter.rect_filled(vol_rect, 2.0, egui::Color32::from_gray(74));
-                    let vol_frac = finite_unit(volume) as f32;
-                    let vol_fill = egui::Rect::from_min_max(
-                        vol_rect.min,
-                        egui::pos2(vol_rect.min.x + vol_rect.width() * vol_frac, vol_rect.max.y),
+                    let volume = finite_video_volume(volume);
+                    let max_volume = crate::settings::VIDEO_VOLUME_MAX;
+                    let normal_frac = (1.0 / max_volume) as f32;
+                    let normal_fill_frac = (volume.min(1.0) / max_volume) as f32;
+                    if normal_fill_frac > 0.0 {
+                        let normal_fill = egui::Rect::from_min_max(
+                            vol_rect.min,
+                            egui::pos2(
+                                vol_rect.min.x + vol_rect.width() * normal_fill_frac,
+                                vol_rect.max.y,
+                            ),
+                        );
+                        painter.rect_filled(
+                            normal_fill,
+                            2.0,
+                            egui::Color32::from_rgb(220, 220, 220),
+                        );
+                    }
+                    if volume > 1.0 {
+                        let boost_fill_frac = (volume / max_volume) as f32;
+                        let boost_fill = egui::Rect::from_min_max(
+                            egui::pos2(
+                                vol_rect.min.x + vol_rect.width() * normal_frac,
+                                vol_rect.min.y,
+                            ),
+                            egui::pos2(
+                                vol_rect.min.x + vol_rect.width() * boost_fill_frac,
+                                vol_rect.max.y,
+                            ),
+                        );
+                        painter.rect_filled(boost_fill, 2.0, egui::Color32::from_rgb(255, 198, 62));
+                    }
+                    let normal_x = vol_rect.min.x + vol_rect.width() * normal_frac;
+                    painter.line_segment(
+                        [
+                            egui::pos2(normal_x, vol_rect.min.y - 3.0),
+                            egui::pos2(normal_x, vol_rect.max.y + 3.0),
+                        ],
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
                     );
-                    painter.rect_filled(vol_fill, 2.0, egui::Color32::from_rgb(220, 220, 220));
                     let vol_resp = ui.interact(
                         vol_rect.expand2(egui::vec2(0.0, 10.0)),
                         egui::Id::new("native_video_volume"),
@@ -3039,12 +3073,14 @@ impl NativeEguiOverlay {
                     if vol_resp.hovered() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                     }
-                    let vol_resp = vol_resp.on_hover_text("音量 [Shift+↑ / Shift+↓]");
+                    let vol_resp =
+                        vol_resp.on_hover_text("音量 (100%超はブースト) [Shift+↑ / Shift+↓]");
                     if (vol_resp.clicked() || vol_resp.dragged())
                         && let Some(pos) = vol_resp.interact_pointer_pos()
                     {
-                        let value =
-                            ((pos.x - vol_rect.min.x) / vol_rect.width()).clamp(0.0, 1.0) as f64;
+                        let value = ((pos.x - vol_rect.min.x) / vol_rect.width()).clamp(0.0, 1.0)
+                            as f64
+                            * max_volume;
                         self.last_volume_target = Some(value);
                         commands.push(NativeOverlayCommand::SetVolume {
                             volume: value,
@@ -3061,9 +3097,13 @@ impl NativeEguiOverlay {
                     painter.text(
                         egui::pos2(vol_rect.max.x + gap, center_y),
                         egui::Align2::LEFT_CENTER,
-                        format!("{:>3}%", (finite_unit(volume) * 100.0).round() as i32),
+                        format!("{:>3}%", (volume * 100.0).round() as i32),
                         egui::FontId::proportional(13.0),
-                        egui::Color32::from_rgb(238, 238, 238),
+                        if volume > 1.0 {
+                            egui::Color32::from_rgb(255, 210, 80)
+                        } else {
+                            egui::Color32::from_rgb(238, 238, 238)
+                        },
                     );
 
                     if cfg!(debug_assertions) {
@@ -5147,9 +5187,9 @@ fn finite_nonnegative(value: f64) -> f64 {
     }
 }
 
-fn finite_unit(value: f64) -> f64 {
+fn finite_video_volume(value: f64) -> f64 {
     if value.is_finite() {
-        value.clamp(0.0, 1.0)
+        crate::settings::clamp_video_volume(value)
     } else {
         0.0
     }
