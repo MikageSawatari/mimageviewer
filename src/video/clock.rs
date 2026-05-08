@@ -837,11 +837,7 @@ impl AvClock {
 
     /// 音声ポンプ側で safety limiter の前に掛ける boost。100% 以下では 1.0。
     pub fn pre_limiter_gain(&self) -> f32 {
-        if self.is_muted() {
-            1.0
-        } else {
-            self.volume().max(1.0) as f32
-        }
+        self.volume().max(1.0) as f32
     }
 }
 
@@ -893,6 +889,6 @@ mod tests {
 
         clock.set_muted(true);
         assert_eq!(clock.output_volume(), 0.0);
-        assert_eq!(clock.pre_limiter_gain(), 1.0);
+        assert!((clock.pre_limiter_gain() - 1.5).abs() < 1.0e-6);
     }
 }
