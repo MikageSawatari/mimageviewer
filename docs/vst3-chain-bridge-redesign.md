@@ -76,6 +76,10 @@ processes. Scanner/probe can continue to spawn a short-lived bridge process.
   summed value from per-slot events.
 - Reset runs on the bridge audio thread and resets every active loader, then
   flushes silence for the summed latency.
+- Even while the bridge is idle, reset briefly runs the VST3
+  `setProcessing(false) -> setProcessing(true)` transition and then returns the
+  plugin to idle. This keeps seek/file-change resets from preserving old plugin
+  tails without making tray residency stay in processing mode.
 - Query/restore state run on the bridge audio thread fence, keyed by `slot_id`,
   so they do not race plugin `process`.
 

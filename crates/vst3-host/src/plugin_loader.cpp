@@ -2219,12 +2219,29 @@ void PluginLoader::hide_gui() {
 }
 
 void PluginLoader::reset() {
-    if (!processor_) return;
-    // VST3 標準: setProcessing(false) → setProcessing(true) でフィルタ履歴 flush
+    if (!active_ || !processor_) return;
+    // VST3 標準: setProcessing(false) → setProcessing(true) でフィルタ履歴 flush。
+    // idle 中でも一時的に true まで進めてから停止へ戻し、シーク後に古い tail が
+    // 残るプラグインを避ける。
     const bool was_processing = is_processing_enabled();
-    set_processing_enabled(false);
-    if (was_processing) {
-        set_processing_enabled(true);
+    auto force_processing_state = [this](bool enabled) -> bool {
+        if (processor_->setProcessing(enabled) != kResultOk) {
+            return false;
+        }
+        processing_enabled_.store(enabled, std::memory_order_release);
+        return true;
+    };
+
+    force_processing_state(false);
+    const bool reenabled = force_processing_state(true);
+    if (!was_processing) {
+        if (reenabled) {
+            if (!force_processing_state(false)) {
+                processing_enabled_.store(false, std::memory_order_release);
+            }
+        } else {
+            processing_enabled_.store(false, std::memory_order_release);
+        }
     }
     // 時刻もリセット (= ProcessContext の sample カウンタ)
     process_time_samples_ = 0;
