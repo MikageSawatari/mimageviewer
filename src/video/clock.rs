@@ -463,6 +463,17 @@ impl AvClock {
             .set_anchor(ClockAnchor::frozen_at(pts_secs).with_speed(self.playback_speed()));
     }
 
+    /// 一時停止状態の表示位置を指定 PTS に固定する。
+    ///
+    /// frame-step の post-seek では音声 callback が drain されないため、通常の
+    /// audio 側 override 解除を待つと seek 中扱いが残り、後続フレームを強制表示
+    /// してしまう。表示した 1 枚の PTS で Frozen anchor を張り直すための helper。
+    pub fn set_paused_position(&self, pts_secs: f64) {
+        self.master_clock.set_anchor(
+            ClockAnchor::frozen_at(pts_secs.max(0.0)).with_speed(self.playback_speed()),
+        );
+    }
+
     /// 真の音声フレームが pump に到達した時に呼ぶ。これで `audio_active = true`
     /// になり、`now_secs()` が audio master モードに切り替わる。
     pub fn notify_audio_active(&self) {

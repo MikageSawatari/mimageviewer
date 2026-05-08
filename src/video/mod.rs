@@ -1653,6 +1653,7 @@ fn run_native_video_output(
             let force_first_frame =
                 waiting_for_first_frame && front.seek_serial == source.last_seen_serial;
             let force_display_seek = source.clock.is_seeking()
+                && latest_renderable.is_none()
                 && front.seek_serial == source.last_seen_serial
                 && clock::pts_clears_seek_override(front.pts_secs, now);
             if force_first_frame
@@ -1781,7 +1782,11 @@ fn run_native_video_output(
                         }
                     }
                     let now_for_clear = source.clock.now_secs();
-                    if clock::pts_clears_seek_override(pts, now_for_clear)
+                    let frame_step_active = source.frame_step_active.load(Ordering::Acquire);
+                    if clock::pts_clears_seek_override(pts, now_for_clear) && frame_step_active {
+                        source.clock.set_paused_position(pts);
+                        source.clock.clear_seek_target_override(serial);
+                    } else if clock::pts_clears_seek_override(pts, now_for_clear)
                         && !source.clock.is_audio_active()
                     {
                         source.clock.set_fallback_anchor(pts);
@@ -3022,7 +3027,10 @@ impl VideoPlayer {
                     }
                     let now_for_clear = self.clock.now_secs();
                     if clock::pts_clears_seek_override(pts, now_for_clear) {
-                        if self.clock.is_audio_active() {
+                        if self.is_frame_step_active() {
+                            self.clock.set_paused_position(pts);
+                            self.clock.clear_seek_target_override(serial);
+                        } else if self.clock.is_audio_active() {
                             if self.clock.is_seeking() && crate::perf::is_enabled() {
                                 crate::perf::event(
                                     "video",
@@ -3082,7 +3090,10 @@ impl VideoPlayer {
                         // when the first audible post-seek samples actually reach the output.
                         // Clearing from video here starts the visual clock before audio is ready
                         // and produces AV drift on high-rate files with deep audio queues.
-                        if self.clock.is_audio_active() {
+                        if self.is_frame_step_active() {
+                            self.clock.set_paused_position(frame.pts_secs);
+                            self.clock.clear_seek_target_override(frame.seek_serial);
+                        } else if self.clock.is_audio_active() {
                             if self.clock.is_seeking() && crate::perf::is_enabled() {
                                 crate::perf::event(
                                     "video",

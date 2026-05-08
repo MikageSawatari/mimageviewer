@@ -226,8 +226,10 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   これにより clock target だけが進んで画面が追いつかない状態を避ける。戻り方向は
   preroll trim が現在フレームへ吸われないよう、1 frame + 最大 4ms 手前を seek target にする。
   `frame_step_active` は通常 pause と UI を分離するための共有フラグで、frame-step pause 中は
-  中央の resume controls を出さない。上部ボタン長押しは UI/overlay 側の 100ms repeat state
-  だけで実現し、decoder 側には通常の seek として流す。
+  中央の resume controls を出さない。さらに frame-step pause は音声 callback が drain されないため、
+  最初の表示フレームで `set_paused_position()` + `clear_seek_target_override()` を実行し、
+  seek 中扱いが残って後続フレームを強制表示し続けることを防ぐ。上部ボタン長押しは
+  UI/overlay 側の 100ms repeat state だけで実現し、decoder 側には通常の seek として流す。
 - 動画ブックマークの任意名称は `video_bookmarks.title` に保存する。左ジャンプパネルの
   ✏ 操作だけが名称を更新し、追加時は従来通り title=NULL のままにする。native DComp
   overlay 側は `WM_CHAR` から egui `Event::Text` を渡し、独立 overlay 上の TextEdit で
