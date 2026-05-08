@@ -14394,7 +14394,11 @@ impl App {
             // editor focused this key is not forwarded here, so dialog editing
             // does not accidentally close the fullscreen window.
             0x1B if !key.repeat => {
-                self.close_fullscreen();
+                if self.close_video_tile_mode() {
+                    self.sync_native_video_tile_overlay(ctx, fs_idx);
+                } else {
+                    self.close_fullscreen();
+                }
             }
             // W: seek to start and play.
             0x57 if !key.shift && !key.ctrl && !key.repeat => {

@@ -56,9 +56,7 @@ impl App {
         if self.video_tile_state.is_some() {
             // Codex P5.5 H2 反映: state Drop だけでは texture cache がクリアされない
             // (Drop impl が無いため)。閉じる側で明示的にクリアしてリーク防止。
-            self.video_tile_state = None;
-            self.video_tile_swap_pending = None;
-            self.video_tile_textures.clear();
+            self.close_video_tile_mode();
             return;
         }
         // 古い texture が残っていれば再 open 前にもクリア (= 異なる動画 / 異なる
@@ -66,6 +64,19 @@ impl App {
         // のを防ぐ)。
         self.video_tile_textures.clear();
         self.video_tile_state = self.build_video_tile_state_for(fs_idx, screen_size);
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn close_video_tile_mode(&mut self) -> bool {
+        let was_open = self.video_tile_state.is_some()
+            || self.video_tile_swap_pending.is_some()
+            || self.video_tile_reopen_pending;
+        self.video_tile_state = None;
+        self.video_tile_swap_pending = None;
+        self.video_tile_reopen_pending = false;
+        self.video_tile_reopen_deadline = None;
+        self.video_tile_textures.clear();
+        was_open
     }
 
     #[cfg(windows)]

@@ -4990,7 +4990,7 @@ fn draw_native_tile_overlay(
 
             let interval = format_tile_interval(state.interval_secs);
             let header = format!(
-                "タイル モード - 間隔 {interval} - {}/{}  [S]",
+                "タイル モード - 間隔 {interval} - {}/{}  [S / Esc]",
                 state.progress_done, state.progress_total
             );
             painter.text(
@@ -5011,7 +5011,7 @@ fn draw_native_tile_overlay(
             );
             draw_overlay_button_bg(painter, close_rect, close_resp.hovered(), false);
             draw_overlay_close_icon(painter, close_rect);
-            if close_resp.on_hover_text("動画に戻る [S]").clicked() {
+            if close_resp.on_hover_text("動画に戻る [S / Esc]").clicked() {
                 commands.push(NativeOverlayCommand::ToggleTileMode);
             }
 
