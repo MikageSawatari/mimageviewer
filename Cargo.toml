@@ -124,6 +124,8 @@ semver = "1"
 ffmpeg-the-third = { version = "3", default-features = false, features = ["codec", "filter", "format", "software-resampling", "software-scaling"] }
 # 動画の音声出力 (Windows では WASAPI Shared モード)。
 cpal = "0.16"
+# 動画倍速再生用のピッチ維持タイムストレッチ。MIT ライセンス。
+signalsmith-stretch = "0.1.3"
 
 [dev-dependencies]
 tempfile = "3"

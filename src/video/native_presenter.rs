@@ -122,6 +122,8 @@ struct NativeEguiOverlay {
     video_is_playing: bool,
     video_volume: f64,
     video_muted: bool,
+    video_playback_speed: f64,
+    video_speed_popup_open: bool,
     video_loop_enabled: bool,
     video_checked: bool,
     vst3_available: bool,
@@ -443,6 +445,9 @@ pub enum NativeOverlayCommand {
     SetVolume {
         volume: f64,
         persist: bool,
+    },
+    SetPlaybackSpeed {
+        speed: f64,
     },
     ToggleLoop,
     AddBookmarkAt {
@@ -1002,9 +1007,17 @@ impl NativeVideoPresenter {
         is_playing: bool,
         volume: f64,
         muted: bool,
+        playback_speed: f64,
     ) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.update_video_state(position_secs, duration_secs, is_playing, volume, muted);
+            overlay.update_video_state(
+                position_secs,
+                duration_secs,
+                is_playing,
+                volume,
+                muted,
+                playback_speed,
+            );
         }
     }
 
@@ -1114,10 +1127,18 @@ impl NativeVideoPresenter {
         is_playing: bool,
         volume: f64,
         muted: bool,
+        playback_speed: f64,
     ) -> Result<(), String> {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             let force_tick_render = overlay.wants_periodic_tick();
-            overlay.update_video_state(position_secs, duration_secs, is_playing, volume, muted);
+            overlay.update_video_state(
+                position_secs,
+                duration_secs,
+                is_playing,
+                volume,
+                muted,
+                playback_speed,
+            );
             if force_tick_render {
                 overlay.dirty = true;
             }
@@ -1709,6 +1730,8 @@ impl NativeEguiOverlay {
             video_is_playing: false,
             video_volume: 1.0,
             video_muted: false,
+            video_playback_speed: 1.0,
+            video_speed_popup_open: false,
             video_loop_enabled: false,
             video_checked: false,
             vst3_available: false,
@@ -1877,15 +1900,18 @@ impl NativeEguiOverlay {
         is_playing: bool,
         volume: f64,
         muted: bool,
+        playback_speed: f64,
     ) {
         let position_secs = finite_nonnegative(position_secs);
         let duration_secs = finite_nonnegative(duration_secs);
         let volume = finite_unit(volume);
+        let playback_speed = crate::video::clock::clamp_playback_speed(playback_speed);
         let duration_changed = (self.video_duration_secs - duration_secs).abs() > 0.001;
         let position_changed = (self.video_position_secs - position_secs).abs() >= 0.25;
         let playing_changed = self.video_is_playing != is_playing;
         let volume_changed = (self.video_volume - volume).abs() >= 0.005;
         let muted_changed = self.video_muted != muted;
+        let speed_changed = (self.video_playback_speed - playback_speed).abs() >= 1.0e-6;
         if !is_playing {
             self.perf_pause_gap_pending = true;
         }
@@ -1894,11 +1920,13 @@ impl NativeEguiOverlay {
         self.video_is_playing = is_playing;
         self.video_volume = volume;
         self.video_muted = muted;
+        self.video_playback_speed = playback_speed;
         if duration_changed
             || position_changed
             || playing_changed
             || volume_changed
             || muted_changed
+            || speed_changed
         {
             self.dirty = true;
         }
@@ -2231,6 +2259,9 @@ impl NativeEguiOverlay {
         if self.video_metadata.is_none() {
             return false;
         }
+        if self.video_speed_popup_open || self.hover_preview_target_secs.is_some() {
+            return false;
+        }
         let Some(pos) = self.pointer_pos else {
             return false;
         };
@@ -2248,6 +2279,9 @@ impl NativeEguiOverlay {
     }
 
     fn jump_panel_visible(&self) -> bool {
+        if self.video_speed_popup_open || self.hover_preview_target_secs.is_some() {
+            return false;
+        }
         let Some(pos) = self.pointer_pos else {
             return false;
         };
@@ -2333,6 +2367,7 @@ impl NativeEguiOverlay {
         let is_playing = self.video_is_playing;
         let volume = self.video_volume;
         let muted = self.video_muted;
+        let playback_speed = self.video_playback_speed;
         let checked = self.video_checked;
         let loop_enabled = self.video_loop_enabled;
         let first_frame_presented = self.first_frame_presented;
@@ -2368,8 +2403,9 @@ impl NativeEguiOverlay {
         let tile_overlay_visible = tile_overlay.is_some();
         let status_visible = video_error.is_some() || !first_frame_presented;
         let toast_visible = toast.is_some();
-        let panel_chrome_visible =
-            !tile_overlay_visible && (jump_panel_visible || top_bar_visible || right_panel_visible);
+        let side_panel_visible =
+            !tile_overlay_visible && (jump_panel_visible || right_panel_visible);
+        let panel_chrome_visible = !tile_overlay_visible && (top_bar_visible || side_panel_visible);
         let bottom_hud_visible = hud_visible || panel_chrome_visible;
         let paused_center_visible =
             !tile_overlay_visible && !is_playing && first_frame_presented && video_error.is_none();
@@ -2389,6 +2425,7 @@ impl NativeEguiOverlay {
         let mut last_thumbnail_request_secs = self.last_thumbnail_request_secs;
         let mut last_thumbnail_request_at = self.last_thumbnail_request_at;
         let mut hover_preview_target_secs = self.hover_preview_target_secs;
+        let mut video_speed_popup_open = self.video_speed_popup_open;
         if !overlay_visible {
             self.set_visual_attached(false)?;
             last_seek_target_secs = None;
@@ -2494,7 +2531,7 @@ impl NativeEguiOverlay {
             if let Some(toast) = toast.as_ref() {
                 draw_native_toast(ctx, overlay_width_points, overlay_height_points, toast);
             }
-            if panel_chrome_visible && let Some(metadata) = video_metadata.as_ref() {
+            if right_panel_visible && let Some(metadata) = video_metadata.as_ref() {
                 draw_native_metadata_panel(
                     ctx,
                     overlay_width_points,
@@ -2502,7 +2539,7 @@ impl NativeEguiOverlay {
                     metadata,
                 );
             }
-            if panel_chrome_visible {
+            if jump_panel_visible {
                 draw_native_jump_panel(
                     ctx,
                     overlay_height_points,
@@ -2611,7 +2648,9 @@ impl NativeEguiOverlay {
                     let vol_pct_w = 40.0;
                     let vol_slider_w = 90.0;
                     let mute_w = btn_size;
-                    let right_pad = side_pad + vol_pct_w + gap + vol_slider_w + gap + mute_w;
+                    let speed_w = btn_size * 1.55;
+                    let right_pad =
+                        side_pad + vol_pct_w + gap + vol_slider_w + gap + speed_w + gap + mute_w;
                     let bar_min_x = x + time_w + gap;
                     let bar_max_x = (hud_rect.max.x - right_pad).max(bar_min_x + 1.0);
                     let bar_rect = egui::Rect::from_min_max(
@@ -2718,8 +2757,14 @@ impl NativeEguiOverlay {
                             egui::pos2(preview_rect.min.x, image_rect.max.y),
                             preview_rect.max,
                         );
-                        let pointer_in_preview =
-                            pointer_pos.is_some_and(|pos| preview_rect.expand(8.0).contains(pos));
+                        let preview_corridor_rect = egui::Rect::from_min_max(
+                            egui::pos2(preview_rect.min.x - 8.0, preview_rect.max.y),
+                            egui::pos2(preview_rect.max.x + 8.0, hud_rect.max.y),
+                        );
+                        let pointer_in_preview = pointer_pos.is_some_and(|pos| {
+                            preview_rect.expand(8.0).contains(pos)
+                                || preview_corridor_rect.contains(pos)
+                        });
                         if !seek_resp.hovered() && !pointer_in_preview {
                             hover_preview_target_secs = None;
                         } else {
@@ -2898,9 +2943,86 @@ impl NativeEguiOverlay {
                         commands.push(NativeOverlayCommand::ToggleMute);
                     }
 
+                    let speed_rect = egui::Rect::from_min_size(
+                        egui::pos2(mute_rect.max.x + gap, center_y - btn_size * 0.5),
+                        egui::vec2(speed_w, btn_size),
+                    );
+                    let speed_resp = ui.interact(
+                        speed_rect,
+                        egui::Id::new("native_video_speed"),
+                        egui::Sense::click(),
+                    );
+                    draw_overlay_button_bg(painter, speed_rect, speed_resp.hovered(), false);
+                    painter.text(
+                        speed_rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        crate::video::clock::format_playback_speed(playback_speed),
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::from_rgb(238, 238, 238),
+                    );
+                    let speed_resp = speed_resp.on_hover_text("再生速度");
+                    if speed_resp.clicked() {
+                        video_speed_popup_open = !video_speed_popup_open;
+                    }
+                    if video_speed_popup_open {
+                        let popup_w = 356.0_f32.min((overlay_width_points - 16.0).max(180.0));
+                        let popup_h = 74.0;
+                        let popup_x = (speed_rect.center().x - popup_w * 0.5)
+                            .clamp(8.0, overlay_width_points - popup_w - 8.0);
+                        let popup_y = (hud_rect.min.y - popup_h - 6.0).max(8.0);
+                        let mut selected_speed = None;
+                        egui::Area::new(egui::Id::new("native_video_speed_popup"))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(egui::pos2(popup_x, popup_y))
+                            .show(ctx, |ui| {
+                                egui::Frame::new()
+                                    .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 225))
+                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(110)))
+                                    .corner_radius(egui::CornerRadius::same(4))
+                                    .inner_margin(egui::Margin::same(6))
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(popup_w - 12.0);
+                                        ui.horizontal_wrapped(|ui| {
+                                            for speed in crate::video::clock::PLAYBACK_SPEED_CHOICES
+                                            {
+                                                let selected =
+                                                    (playback_speed - speed).abs() < 1.0e-6;
+                                                let label =
+                                                    crate::video::clock::format_playback_speed(
+                                                        speed,
+                                                    );
+                                                let button = egui::Button::new(label)
+                                                    .selected(selected)
+                                                    .min_size(egui::vec2(46.0, 24.0));
+                                                if ui.add(button).clicked() {
+                                                    selected_speed = Some(speed);
+                                                }
+                                            }
+                                        });
+                                    });
+                            });
+                        if ui.ctx().input(|i| i.pointer.any_click())
+                            && !speed_resp.hovered()
+                            && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
+                        {
+                            let popup_rect = egui::Rect::from_min_size(
+                                egui::pos2(popup_x, popup_y),
+                                egui::vec2(popup_w, popup_h),
+                            );
+                            if !popup_rect.contains(pos) {
+                                video_speed_popup_open = false;
+                            }
+                        }
+                        if let Some(speed) = selected_speed {
+                            let speed = crate::video::clock::clamp_playback_speed(speed);
+                            video_speed_popup_open = false;
+                            commands.push(NativeOverlayCommand::SetPlaybackSpeed { speed });
+                        }
+                    }
+
                     let vol_rect = egui::Rect::from_min_max(
-                        egui::pos2(mute_rect.max.x + gap, center_y - 4.0),
-                        egui::pos2(mute_rect.max.x + gap + vol_slider_w, center_y + 4.0),
+                        egui::pos2(speed_rect.max.x + gap, center_y - 4.0),
+                        egui::pos2(speed_rect.max.x + gap + vol_slider_w, center_y + 4.0),
                     );
                     painter.rect_filled(vol_rect, 2.0, egui::Color32::from_gray(74));
                     let vol_frac = finite_unit(volume) as f32;
@@ -2967,9 +3089,10 @@ impl NativeEguiOverlay {
         self.last_thumbnail_request_secs = last_thumbnail_request_secs;
         self.last_thumbnail_request_at = last_thumbnail_request_at;
         self.hover_preview_target_secs = hover_preview_target_secs;
-        self.top_bar_visible = panel_chrome_visible;
-        self.right_panel_visible = panel_chrome_visible;
-        self.jump_panel_visible = panel_chrome_visible;
+        self.video_speed_popup_open = video_speed_popup_open;
+        self.top_bar_visible = top_bar_visible || side_panel_visible;
+        self.right_panel_visible = right_panel_visible;
+        self.jump_panel_visible = jump_panel_visible;
 
         let shape_count = full_output.shapes.len();
         for (id, image_delta) in &full_output.textures_delta.set {

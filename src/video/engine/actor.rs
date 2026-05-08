@@ -120,6 +120,9 @@ pub struct EngineActor {
 
     /// 構築時に渡された options。autoplay 判定や resume 履歴に使う。
     opts: OpenOptions,
+    /// 現在の再生速度。現行 path の source of truth は AvClock だが、EngineActor
+    /// 内部の MasterClock も同じ速度で動かして future integration と tests を保つ。
+    playback_speed: f64,
 }
 
 /// EngineState を `AtomicU8` で publish するための discriminant code。
@@ -165,6 +168,7 @@ impl EngineActor {
             last_audio_pts: f64::NEG_INFINITY,
             last_audio_epoch: initial_serial,
             opts,
+            playback_speed: 1.0,
         }
     }
 
@@ -208,6 +212,7 @@ impl EngineActor {
     /// monotonic guard は anchor の PTS / 現 epoch でリセット (= Playing 入場直後の
     /// AudioRendered がこの anchor 周辺の小さい pts でも受け入れられるように)。
     fn transition_to_playing(&mut self, anchor: ClockAnchor) {
+        let anchor = anchor.with_speed(self.playback_speed);
         debug_assert!(
             !matches!(anchor.source, super::clock::ClockSource::Frozen),
             "transition_to_playing requires non-Frozen anchor"
@@ -222,7 +227,8 @@ impl EngineActor {
 
     /// `Paused` への遷移 (= 凍結 anchor)。
     fn transition_to_paused(&mut self, pts: f64) {
-        self.clock.set_anchor(ClockAnchor::frozen_at(pts));
+        self.clock
+            .set_anchor(ClockAnchor::frozen_at(pts).with_speed(self.playback_speed));
         self.state = EngineState::Paused;
         self.published_state
             .store(state_code::PAUSED, Ordering::Release);
@@ -245,7 +251,8 @@ impl EngineActor {
         } else {
             self.latch = ReadinessLatch::new(cur_epoch);
         }
-        self.clock.set_anchor(ClockAnchor::frozen_at(pts));
+        self.clock
+            .set_anchor(ClockAnchor::frozen_at(pts).with_speed(self.playback_speed));
         self.state = EngineState::Buffering;
         self.published_state
             .store(state_code::BUFFERING, Ordering::Release);
@@ -253,7 +260,8 @@ impl EngineActor {
 
     /// `Seeking` への遷移。target で凍結。**epoch は handle_seek_request で進める**。
     fn transition_to_seeking(&mut self, target_secs: f64) {
-        self.clock.set_anchor(ClockAnchor::frozen_at(target_secs));
+        self.clock
+            .set_anchor(ClockAnchor::frozen_at(target_secs).with_speed(self.playback_speed));
         self.state = EngineState::Seeking { target_secs };
         self.published_state
             .store(state_code::SEEKING, Ordering::Release);
@@ -261,7 +269,8 @@ impl EngineActor {
 
     /// `Loading` への遷移 (= 0 で凍結 or resume 値で凍結)。
     fn transition_to_loading(&mut self, pts: f64) {
-        self.clock.set_anchor(ClockAnchor::frozen_at(pts));
+        self.clock
+            .set_anchor(ClockAnchor::frozen_at(pts).with_speed(self.playback_speed));
         self.state = EngineState::Loading;
         self.published_state
             .store(state_code::LOADING, Ordering::Release);
@@ -269,7 +278,8 @@ impl EngineActor {
 
     /// `Eof` への遷移 (= duration で凍結)。
     fn transition_to_eof(&mut self, duration: f64) {
-        self.clock.set_anchor(ClockAnchor::frozen_at(duration));
+        self.clock
+            .set_anchor(ClockAnchor::frozen_at(duration).with_speed(self.playback_speed));
         self.state = EngineState::Eof;
         self.published_state
             .store(state_code::EOF, Ordering::Release);
@@ -311,13 +321,21 @@ impl EngineActor {
                 self.handle_seek_request(target);
             }
             TransportCommand::SetSpeed { speed } => {
-                // Phase 3a: speed は anchor に伝搬しない (= 1.0 固定の前提)。
-                // 倍率変更は Phase 4+ で MasterClock への anchor.with_speed() 経由実装予定。
                 debug_assert!(
                     speed > 0.0 && speed.is_finite(),
                     "speed must be finite positive, got {speed}"
                 );
-                let _ = speed;
+                let speed = crate::video::clock::clamp_playback_speed(speed);
+                if (self.playback_speed - speed).abs() <= 1.0e-9 {
+                    return;
+                }
+                let pts_now = self.clock.now_secs();
+                let mut anchor = self.clock.anchor();
+                anchor.pts_secs = pts_now;
+                anchor.wall_at_anchor = Instant::now();
+                anchor.speed = speed;
+                self.playback_speed = speed;
+                self.clock.set_anchor(anchor);
             }
             TransportCommand::SetVolume { volume: _ }
             | TransportCommand::SetMuted { muted: _ }
@@ -349,7 +367,8 @@ impl EngineActor {
                     ClockAnchor::audio(pts, Instant::now())
                 } else {
                     ClockAnchor::wall(pts, Instant::now())
-                };
+                }
+                .with_speed(self.playback_speed);
                 self.transition_to_playing(anchor);
             }
             EngineState::Eof => {
@@ -530,7 +549,8 @@ impl EngineActor {
                 } else {
                     self.last_audio_pts = pts;
                 }
-                self.clock.set_anchor(ClockAnchor::audio(pts, wall_now));
+                self.clock
+                    .set_anchor(ClockAnchor::audio(pts, wall_now).with_speed(self.playback_speed));
             }
             AudioEvent::BufferReady {
                 epoch,
@@ -603,7 +623,8 @@ impl EngineActor {
                 .first_frame_pts
                 .expect("is_ready guarantees first_frame_pts");
             ClockAnchor::wall(pts, now)
-        };
+        }
+        .with_speed(self.playback_speed);
         if self.opts.autoplay {
             self.transition_to_playing(anchor);
         } else {

@@ -850,18 +850,31 @@ buf.next_pts_secs += consumed_secs;
 - `docs/video-architecture.md` の `clock.rs` 節が新構造 (= engine/ 委譲) を反映
 - AvClock を完全削除する場合の段階移行計画が本ドキュメントに記録されている
 
-## 倍速再生 (Codex P2 反映)
+## 倍速再生 (Signalsmith Stretch 実装)
 
-`MasterClock.speed: f64` を最初から設計に入れるが、実装は段階的に:
+動画再生速度は `AvClock` / `EngineActor` / `MasterClock` の anchor speed に通す。
+`now_secs()` は source timeline を `playback_speed` 倍で進め、速度変更時は現在 PTS で
+anchor を張り直す。既存の seek / pause / EOF / PDC latency jump 経路も、anchor
+再構築時に現在 speed を保持する。
 
-- Phase 4 までは `speed = 1.0` 固定 (= 既存挙動維持)
-- 倍速 UI 追加時:
-  - **動画 PTS pacing**: speed 倍率で `now_secs()` の extrapolation を係数化
-  - **音声 resample**: swresample の output rate を `cpal_rate / speed` に動的変更
-    - swresample の ratio change はサポートされているが click が出やすい
-    - `swr_set_compensation` で 100ms 程度かけて smooth に切替
-    - **pitch-preserving** (speed 変えても声が高くならない) は外部 lib (SoundTouch /
-      Rubber Band) が必要 → 初版では pitch shift で OK の前提
+- **対応 UI**: 下部 HUD の速度ボタンから 0.5x / 0.75x / 1.0x / 1.25x / 1.5x /
+  1.75x / 2.0x / 2.25x / 2.5x / 2.75x / 3.0x を選ぶ。選択は session 内設定で、
+  `settings.json` には保存しない。
+- **動画 PTS pacing**: `VideoPlayer::tick`、native presenter の source pacing、
+  decoder の `PACE_LEAD` / seek burst lead は wall 秒基準になるよう speed で換算する。
+  3.0x などで decode が追いつかない場合は通常の Buffering 遷移に落とし、busy wait で
+  詰まらせない。
+- **音声 pitch 維持**: swresample の output rate 変更ではなく、`audio-pump` 内で
+  Signalsmith Stretch (`signalsmith-stretch`) を VST3 plugin chain の前段に挿入する。
+  これにより、VST3 には常に cpal と同じ sample rate の等倍 output stream として渡す。
+- **音声 PTS**: `ProcessedChunk::source_secs_per_output_sec` で output/wall 秒と source 秒を
+  分離する。2.0x なら output 1 秒で source 約 2 秒ぶん進め、PDC / safety limiter /
+  stretcher latency は source 秒に換算して `AvClock::set_audio_pts` に反映する。
+- **tx queue 会計**: decoder enqueue 時点の `queued_wall_secs = source_duration / speed` と
+  `audio_tx_accounting_epoch` を `AudioFrame` に持たせる。速度変更時は tx 会計を 0 に戻して
+  epoch を進め、旧速度 frame は音声としては有効に処理しつつ tx 会計の減算だけ無視する。
+- **Signalsmith reset 粒度**: AV seek と 1.0x bypass ↔ 非 1.0x の境界で reset する。
+  1.25x → 1.5x のような非 1.0x 同士の変更では reset せず、クリックや音切れを避ける。
 
 ## 旧 monotonic guard の扱い
 

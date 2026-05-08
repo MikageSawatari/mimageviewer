@@ -6585,7 +6585,7 @@ impl App {
         full_rect: egui::Rect,
         fs_idx: usize,
     ) {
-        let (is_playing, position, duration, volume, muted, has_texture, has_error) =
+        let (is_playing, position, duration, volume, muted, playback_speed, has_texture, has_error) =
             match self.fs_cache.get(&fs_idx) {
                 Some(FsCacheEntry::Video { player, .. }) => (
                     player.is_playing(),
@@ -6593,6 +6593,7 @@ impl App {
                     player.duration(),
                     player.volume(),
                     player.is_muted(),
+                    player.playback_speed(),
                     // CPU path: TextureHandle 有り、または GPU path: 共有 D3D11 フレーム有り、
                     // のいずれかなら描画コンテンツが揃っているとみなす
                     // (= "動画を準備中..." を抜けて通常表示に切り替える)。
@@ -6795,7 +6796,7 @@ impl App {
             egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
         );
 
-        // レイアウト計算 (左から): [play/pause][time][seek bar][mute][vol slider][vol %]
+        // レイアウト計算 (左から): [play/pause][time][seek bar][mute][speed][vol slider][vol %]
         let pad = 8.0;
         let btn_size = 28.0;
         let cy = hud_rect.center().y;
@@ -6935,8 +6936,16 @@ impl App {
 
         // ── ミュートアイコン rect (描画 / 入力は下) ──
         let mute_rect = egui::Rect::from_min_size(
-            egui::pos2(vol_slider_rect.min.x - pad - btn_size, cy - btn_size / 2.0),
+            egui::pos2(
+                vol_slider_rect.min.x - pad - btn_size * 2.0 - pad,
+                cy - btn_size / 2.0,
+            ),
             egui::vec2(btn_size, btn_size),
+        );
+
+        let speed_rect = egui::Rect::from_min_size(
+            egui::pos2(mute_rect.max.x + pad, cy - btn_size / 2.0),
+            egui::vec2(btn_size * 1.55, btn_size),
         );
 
         // ── シークバー (描画 + 入力) ──
@@ -7138,6 +7147,79 @@ impl App {
             && let Some(p) = self.fs_video_player(fs_idx)
         {
             p.set_muted(!muted);
+        }
+
+        // ── 倍速ボタン + ポップアップ ──
+        let speed_resp = ui.interact(
+            speed_rect,
+            egui::Id::new(("video_speed", fs_idx)),
+            egui::Sense::click(),
+        );
+        draw_hud_button_bg(&painter, speed_rect, speed_resp.hovered());
+        painter.text(
+            speed_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            crate::video::clock::format_playback_speed(playback_speed),
+            egui::FontId::proportional(12.0),
+            egui::Color32::WHITE,
+        );
+        let speed_resp = speed_resp.on_hover_text("再生速度");
+        if speed_resp.clicked() {
+            self.video_speed_popup_open = !self.video_speed_popup_open;
+            self.video_hud_last_activity = Some(std::time::Instant::now());
+        }
+        if self.video_speed_popup_open {
+            let popup_w = 356.0_f32.min((full_rect.width() - 16.0).max(180.0));
+            let popup_h = 74.0;
+            let popup_x = (speed_rect.center().x - popup_w * 0.5)
+                .clamp(full_rect.min.x + 8.0, full_rect.max.x - popup_w - 8.0);
+            let popup_y = (hud_rect.min.y - popup_h - 6.0).max(full_rect.min.y + 8.0);
+            let mut selected_speed = None;
+            egui::Area::new(egui::Id::new(("video_speed_popup", fs_idx)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(popup_x, popup_y))
+                .show(ui.ctx(), |ui| {
+                    egui::Frame::new()
+                        .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 225))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(110)))
+                        .corner_radius(egui::CornerRadius::same(4))
+                        .inner_margin(egui::Margin::same(6))
+                        .show(ui, |ui| {
+                            ui.set_min_width(popup_w - 12.0);
+                            ui.horizontal_wrapped(|ui| {
+                                for speed in crate::video::clock::PLAYBACK_SPEED_CHOICES {
+                                    let selected = (playback_speed - speed).abs() < 1.0e-6;
+                                    let label = crate::video::clock::format_playback_speed(speed);
+                                    let button = egui::Button::new(label)
+                                        .selected(selected)
+                                        .min_size(egui::vec2(46.0, 24.0));
+                                    if ui.add(button).clicked() {
+                                        selected_speed = Some(speed);
+                                    }
+                                }
+                            });
+                        });
+                });
+            if ui.ctx().input(|i| i.pointer.any_click())
+                && !speed_resp.hovered()
+                && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
+            {
+                let popup_rect = egui::Rect::from_min_size(
+                    egui::pos2(popup_x, popup_y),
+                    egui::vec2(popup_w, popup_h),
+                );
+                if !popup_rect.contains(pos) {
+                    self.video_speed_popup_open = false;
+                }
+            }
+            if let Some(speed) = selected_speed {
+                let speed = crate::video::clock::clamp_playback_speed(speed);
+                self.video_playback_speed = speed;
+                self.video_speed_popup_open = false;
+                if let Some(p) = self.fs_video_player(fs_idx) {
+                    p.set_playback_speed(speed);
+                }
+            }
         }
 
         // ── 音量スライダー (描画 + 入力) ──

@@ -45,6 +45,30 @@ use std::time::Instant;
 use crate::video::engine::audio_bookkeeping::AudioBookkeeping;
 use crate::video::engine::clock::{ClockAnchor, ClockSource, MasterClock};
 
+pub(crate) const MIN_PLAYBACK_SPEED: f64 = 0.25;
+pub(crate) const MAX_PLAYBACK_SPEED: f64 = 4.0;
+pub(crate) const PLAYBACK_SPEED_CHOICES: [f64; 11] =
+    [0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0];
+
+pub(crate) fn clamp_playback_speed(speed: f64) -> f64 {
+    if speed.is_finite() {
+        speed.clamp(MIN_PLAYBACK_SPEED, MAX_PLAYBACK_SPEED)
+    } else {
+        1.0
+    }
+}
+
+pub(crate) fn format_playback_speed(speed: f64) -> String {
+    let speed = clamp_playback_speed(speed);
+    if (speed.fract()).abs() < 1.0e-6 {
+        format!("x{}", speed as i32)
+    } else if ((speed * 10.0).fract()).abs() < 1.0e-6 {
+        format!("x{speed:.1}")
+    } else {
+        format!("x{speed:.2}")
+    }
+}
+
 /// シーク種別 (= 速度と精度のトレードオフ選択)。
 ///
 /// **Fast** はユーザー要望 (= ←→キーの体感を速くしたい) に応える hybrid 設計の
@@ -142,6 +166,14 @@ pub struct AvClock {
     /// 音声バッファ会計 (pump 残量 + tx queued)。
     /// Phase 2a で `AudioBookkeeping` に切り出し、AvClock は委譲のみ。動作は等価。
     audio_bookkeeping: AudioBookkeeping,
+    /// 再生速度倍率。1.0 = 等速。MasterClock anchor の speed と同じ値を保持する。
+    playback_speed_bits: AtomicU64,
+    /// 再生速度変更は anchor と audio_tx 会計 epoch をまとめて更新するため直列化する。
+    playback_speed_update_lock: Mutex<()>,
+    /// audio_tx queued 会計の世代。偶数は安定状態、奇数は速度変更中。
+    /// 速度変更で tx 会計をゼロ化し、旧 speed で enqueue 済みの frame が
+    /// 新会計を壊さないようにする。
+    audio_tx_accounting_epoch: AtomicU64,
     /// audio が「healthy」状態か。decoder が `notify_audio_active(true)` で開始、
     /// audio 出力起動失敗 / 音声ストリーム不在のとき false。
     /// false なら `now_secs()` はフォールバック wall clock を使う (= MasterClock の
@@ -230,10 +262,79 @@ impl AvClock {
             seek_target_override_bits: AtomicU64::new(SEEK_NONE),
             seek_override_serial: AtomicU64::new(0),
             audio_bookkeeping: AudioBookkeeping::new(),
+            playback_speed_bits: AtomicU64::new(1.0_f64.to_bits()),
+            playback_speed_update_lock: Mutex::new(()),
+            audio_tx_accounting_epoch: AtomicU64::new(0),
             audio_active: AtomicBool::new(false),
             eof_reached: AtomicBool::new(false),
             volume_bits: AtomicU64::new(initial_volume.clamp(0.0, 1.0).to_bits()),
             muted: AtomicBool::new(false),
+        }
+    }
+
+    pub fn playback_speed(&self) -> f64 {
+        clamp_playback_speed(f64::from_bits(
+            self.playback_speed_bits.load(Ordering::Acquire),
+        ))
+    }
+
+    pub fn set_playback_speed(&self, speed: f64) {
+        let _update_guard = self
+            .playback_speed_update_lock
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let speed = clamp_playback_speed(speed);
+        let old = self.playback_speed();
+        if (old - speed).abs() < 1.0e-9 {
+            return;
+        }
+
+        let pts_now = self.now_secs();
+        let mut anchor = self.master_clock.anchor();
+        anchor.pts_secs = pts_now;
+        anchor.wall_at_anchor = Instant::now();
+        anchor.speed = speed;
+        if self.audio_tx_accounting_epoch() % 2 != 0 {
+            self.audio_tx_accounting_epoch
+                .fetch_add(1, Ordering::AcqRel);
+        }
+        // Odd epoch = accounting transition. Decoders wait for a stable even epoch,
+        // while in-flight old-epoch add/sub calls become no-ops.
+        self.audio_tx_accounting_epoch
+            .fetch_add(1, Ordering::AcqRel);
+        let _epoch_guard = AudioTxAccountingEpochGuard {
+            epoch: &self.audio_tx_accounting_epoch,
+        };
+        self.master_clock.set_anchor(anchor);
+        self.playback_speed_bits
+            .store(speed.to_bits(), Ordering::Release);
+        // Frames already in audio_tx were accounted with the previous speed.
+        // Keep the audio samples valid, but invalidate only their tx accounting.
+        self.zero_audio_tx_queued_secs();
+    }
+
+    pub fn audio_tx_accounting_epoch(&self) -> u64 {
+        self.audio_tx_accounting_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn audio_tx_accounting_snapshot(&self) -> (f64, u64) {
+        loop {
+            let epoch_before = self.audio_tx_accounting_epoch();
+            if epoch_before % 2 != 0 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let speed = self.playback_speed();
+            let epoch_after = self.audio_tx_accounting_epoch();
+            if epoch_before == epoch_after {
+                return (speed, epoch_before);
+            }
+        }
+    }
+
+    pub fn add_audio_tx_queued_secs_for_epoch(&self, delta_secs: f64, epoch: u64) {
+        if self.audio_tx_accounting_epoch() == epoch {
+            self.add_audio_tx_queued_secs(delta_secs);
         }
     }
 
@@ -293,8 +394,9 @@ impl AvClock {
             let wall_dt = wall
                 .saturating_duration_since(prev.wall_at_anchor)
                 .as_secs_f64();
-            const MAX_AUDIO_CLOCK_RATE: f64 = 1.02;
-            let max_advance = wall_dt * MAX_AUDIO_CLOCK_RATE;
+            let speed = self.playback_speed();
+            let max_audio_clock_rate = if speed < 1.0 { 1.10 } else { 1.02 };
+            let max_advance = wall_dt * max_audio_clock_rate * speed;
             (pts_secs - prev.pts_secs).min(max_advance).max(0.0) + prev.pts_secs
         } else {
             // 前回 Wall/Frozen → audio 起動直後 / seek 直後の起点。cap 無効化
@@ -316,14 +418,16 @@ impl AvClock {
     /// この helper は **常に Wall** を書く。Audio source は `write_audio_anchor_at`
     /// 経由でのみ書ける。
     fn write_fallback_anchor_at(&self, pts: f64, wall: Instant) {
-        self.master_clock.set_anchor(ClockAnchor::wall(pts, wall));
+        self.master_clock
+            .set_anchor(ClockAnchor::wall(pts, wall).with_speed(self.playback_speed()));
     }
 
     /// **Audio** anchor で全置換する内部ヘルパ。
     /// 用途: audio actor (cpal callback / pump) が報告した実 audio PTS を anchor 化する。
     /// Phase 2b: MasterClock に Audio source で書く。
     fn write_audio_anchor_at(&self, pts: f64, wall: Instant) {
-        self.master_clock.set_anchor(ClockAnchor::audio(pts, wall));
+        self.master_clock
+            .set_anchor(ClockAnchor::audio(pts, wall).with_speed(self.playback_speed()));
     }
 
     /// **PDC latency 変化時専用** の anchor 強制再設定。
@@ -353,7 +457,7 @@ impl AvClock {
         // EOF 時は時間進行を止める (= 元コードでも recorded_at を今にしていたので
         // 直後の経過は 0)。ここでは Frozen anchor で書く。
         self.master_clock
-            .set_anchor(ClockAnchor::frozen_at(pts_secs));
+            .set_anchor(ClockAnchor::frozen_at(pts_secs).with_speed(self.playback_speed()));
     }
 
     /// 真の音声フレームが pump に到達した時に呼ぶ。これで `audio_active = true`
@@ -429,6 +533,7 @@ impl AvClock {
             // 再生再開: 現 anchor の pts をそのまま使い、wall 起点を「今」に書き換える。
             // audio_active=true → Audio source、false → Wall source。
             let cur = self.master_clock.anchor();
+            let speed = self.playback_speed();
             let source = if self.audio_active.load(Ordering::Acquire) {
                 ClockSource::Audio
             } else {
@@ -437,14 +542,14 @@ impl AvClock {
             self.master_clock.set_anchor(ClockAnchor {
                 pts_secs: cur.pts_secs,
                 wall_at_anchor: wall_now,
-                speed: 1.0,
+                speed,
                 source,
             });
         } else {
             // 一時停止: 現時点の now_secs() で Frozen に固定。
             let frozen_pts = self.now_secs();
             self.master_clock
-                .set_anchor(ClockAnchor::frozen_at(frozen_pts));
+                .set_anchor(ClockAnchor::frozen_at(frozen_pts).with_speed(self.playback_speed()));
         }
         self.playing.store(playing, Ordering::Release);
     }
@@ -723,5 +828,45 @@ impl AvClock {
         } else {
             self.volume() as f32
         }
+    }
+}
+
+struct AudioTxAccountingEpochGuard<'a> {
+    epoch: &'a AtomicU64,
+}
+
+impl Drop for AudioTxAccountingEpochGuard<'_> {
+    fn drop(&mut self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn speed_change_invalidates_old_audio_tx_accounting_epoch() {
+        let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+
+        let (_, old_epoch) = clock.audio_tx_accounting_snapshot();
+        clock.add_audio_tx_queued_secs_for_epoch(0.4, old_epoch);
+        assert!((clock.audio_tx_queued_secs() - 0.4).abs() < 1.0e-9);
+
+        clock.set_playback_speed(2.0);
+        assert_eq!(clock.audio_tx_accounting_epoch() % 2, 0);
+        assert!(clock.audio_tx_queued_secs().abs() < 1.0e-9);
+
+        clock.add_audio_tx_queued_secs_for_epoch(-0.4, old_epoch);
+        assert!(clock.audio_tx_queued_secs().abs() < 1.0e-9);
+
+        let (speed, new_epoch) = clock.audio_tx_accounting_snapshot();
+        assert!((speed - 2.0).abs() < 1.0e-9);
+        assert_ne!(new_epoch, old_epoch);
+
+        clock.add_audio_tx_queued_secs_for_epoch(0.2, new_epoch);
+        assert!((clock.audio_tx_queued_secs() - 0.2).abs() < 1.0e-9);
     }
 }

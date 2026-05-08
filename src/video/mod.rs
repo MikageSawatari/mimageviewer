@@ -21,6 +21,7 @@
 //! CLAUDE.md の「FFmpeg ライセンス対応」節を参照。
 
 pub mod audio;
+pub mod audio_stretch;
 pub mod clock;
 pub mod decoder;
 #[cfg(windows)]
@@ -251,6 +252,9 @@ pub enum NativeVideoOutputEvent {
     SetVolume {
         volume: f64,
         persist: bool,
+    },
+    SetPlaybackSpeed {
+        speed: f64,
     },
     AddBookmarkAt {
         target_secs: f64,
@@ -786,6 +790,7 @@ fn native_source_pacing_delay(
     last_pts: Option<f64>,
     last_wall: Option<std::time::Instant>,
     next_pts: f64,
+    playback_speed: f64,
 ) -> Option<std::time::Duration> {
     let (Some(last_pts), Some(last_wall)) = (last_pts, last_wall) else {
         return None;
@@ -795,7 +800,8 @@ fn native_source_pacing_delay(
         return None;
     }
     let elapsed = last_wall.elapsed().as_secs_f64();
-    let target_elapsed = (source_delta - 0.0002).max(0.0);
+    let speed = playback_speed.max(clock::MIN_PLAYBACK_SPEED);
+    let target_elapsed = ((source_delta - 0.0002).max(0.0)) / speed;
     if elapsed >= target_elapsed {
         return None;
     }
@@ -946,6 +952,7 @@ fn run_native_video_output(
             clock.is_playing(),
             clock.volume(),
             clock.is_muted(),
+            clock.playback_speed(),
         ) {
             crate::logger::log(format!(
                 "[native-video] initial tile overlay render failed: {err}"
@@ -1160,6 +1167,7 @@ fn run_native_video_output(
                 source.clock.is_playing(),
                 source.clock.volume(),
                 source.clock.is_muted(),
+                source.clock.playback_speed(),
             );
             let overlay_routing = match presenter.handle_window_events(&native_events) {
                 Ok(outcome) => {
@@ -1344,6 +1352,15 @@ fn run_native_video_output(
                                     NativeVideoOutputEvent::SetVolume { volume, persist },
                                 );
                             }
+                            crate::video::native_presenter::NativeOverlayCommand::SetPlaybackSpeed {
+                                speed,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetPlaybackSpeed { speed },
+                                );
+                            }
                             crate::video::native_presenter::NativeOverlayCommand::AddBookmarkAt {
                                 target_secs,
                             } => {
@@ -1403,6 +1420,7 @@ fn run_native_video_output(
                 source.clock.is_playing(),
                 source.clock.volume(),
                 source.clock.is_muted(),
+                source.clock.playback_speed(),
             ) {
                 crate::logger::log(format!("[native-video] overlay tick render failed: {err}"));
             }
@@ -1533,6 +1551,7 @@ fn run_native_video_output(
                 source.last_present_source_pts,
                 source.last_present_wall,
                 pts,
+                source.clock.playback_speed(),
             ) {
                 source.queue.push_front(frame);
                 source.source_pacing_sleep_count =
@@ -1712,10 +1731,11 @@ fn run_native_video_output(
                 }
             }
         } else {
+            let speed = source.clock.playback_speed().max(clock::MIN_PLAYBACK_SPEED);
             let wait_ms = source
                 .queue
                 .front()
-                .map(|front| ((front.pts_secs - now) * 500.0).clamp(1.0, 8.0) as u64)
+                .map(|front| (((front.pts_secs - now) / speed) * 500.0).clamp(1.0, 8.0) as u64)
                 .unwrap_or(1);
             std::thread::sleep(Duration::from_millis(wait_ms));
         }
@@ -2093,6 +2113,19 @@ impl VideoPlayer {
 
     pub fn is_playing(&self) -> bool {
         self.clock.is_playing()
+    }
+
+    pub fn playback_speed(&self) -> f64 {
+        self.clock.playback_speed()
+    }
+
+    pub fn set_playback_speed(&self, speed: f64) {
+        let speed = clock::clamp_playback_speed(speed);
+        self.engine
+            .lock()
+            .unwrap()
+            .apply_command(engine::actor::TransportCommand::SetSpeed { speed });
+        self.clock.set_playback_speed(speed);
     }
 
     /// Phase 9.G: シーク中 (= override 設定中、UI が post-seek 1 枚目を表示する前) か。
@@ -2649,7 +2682,9 @@ impl VideoPlayer {
             // 最初の真の未来フレーム → そのまま残し、次 tick を予約。
             // request_repaint_after は厳密なタイマーではないため、表示許容と同じ
             // 小さな margin だけ早めに起こし、displayable 判定側でまだ早ければ残す。
-            let until = (front.pts_secs - now - self.repaint_prewake_secs()).max(0.001);
+            let speed = self.clock.playback_speed().max(clock::MIN_PLAYBACK_SPEED);
+            let until = ((front.pts_secs - now - self.repaint_prewake_secs()).max(0.001) / speed)
+                .max(0.001);
             next_due = Some(std::time::Duration::from_secs_f64(until));
             break;
         }

@@ -2226,6 +2226,10 @@ pub struct App {
     /// `video_hud_rect` のクリック判定が「描画されている領域だけクリックを吸収する」
     /// ように使う (= フェードアウト後の領域は背景クリックを通過させる)。
     pub(crate) video_hud_visible_factor: f32,
+    /// 動画倍速再生のセッション内設定。settings には保存しない。
+    pub(crate) video_playback_speed: f64,
+    /// legacy egui HUD の速度ポップアップ表示状態。
+    pub(crate) video_speed_popup_open: bool,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -2925,6 +2929,8 @@ impl Default for App {
             fs_feedback_toast: None,
             video_hud_last_activity: None,
             video_hud_visible_factor: 1.0,
+            video_playback_speed: 1.0,
+            video_speed_popup_open: false,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_restart_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -10355,6 +10361,7 @@ impl App {
             #[cfg(windows)]
             native_output_config,
         );
+        player.set_playback_speed(self.video_playback_speed);
         if self.settings.video_start_muted || play_test_mute {
             player.set_muted(true);
         }
@@ -13430,6 +13437,9 @@ impl App {
             crate::video::NativeVideoOutputEvent::SetVolume { volume, persist } => {
                 self.handle_native_video_set_volume_command(ctx, fs_idx, volume, persist);
             }
+            crate::video::NativeVideoOutputEvent::SetPlaybackSpeed { speed } => {
+                self.handle_video_playback_speed_command(ctx, fs_idx, speed);
+            }
             crate::video::NativeVideoOutputEvent::AddBookmarkAt { target_secs } => {
                 self.handle_native_video_add_bookmark_command(ctx, fs_idx, target_secs);
             }
@@ -13629,6 +13639,24 @@ impl App {
             if persist {
                 self.settings.save();
             }
+            self.mark_native_video_hud_activity(ctx);
+        }
+    }
+
+    #[cfg(windows)]
+    fn handle_video_playback_speed_command(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        speed: f64,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        let speed = crate::video::clock::clamp_playback_speed(speed);
+        self.video_playback_speed = speed;
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_playback_speed(speed);
             self.mark_native_video_hud_activity(ctx);
         }
     }

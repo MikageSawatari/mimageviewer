@@ -81,6 +81,7 @@ src/video/
 ├── mod.rs                  # VideoPlayer 公開 API (open / tick / seek / volume / loop)
 ├── decoder.rs              # demux + 動画/音声 decode の 3-thread 構成 (HW/SW 自動切替)
 ├── audio.rs                # cpal WASAPI Shared 出力
+├── audio_stretch.rs        # Signalsmith Stretch によるピッチ維持の倍速音声処理
 ├── clock.rs                # AvClock (薄い facade、engine/ に委譲) — 詳細は下記
 ├── engine/                 # 動画再生エンジン (state machine + master clock 分割実装)
 │   ├── mod.rs              # EngineEvent enum (Decoder/Audio events)
@@ -198,10 +199,16 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - audio 出力失敗時はクロックを wall-clock fallback に切替
 - 音声バッファ ≥100ms に達したら `EngineEvent::Audio(AudioEvent::BufferReady)` を発火
   (Phase 8.K で 500ms から下げた、典型的 audio_buf hover 帯に合わせた)
+- 再生速度が 1.0x 以外の場合は、VST3 plugin chain の前段で
+  `audio_stretch.rs` の Signalsmith Stretch wrapper を通し、pitch を維持したまま
+  output/wall 秒の音声へ変換する。`ProcessedChunk::source_secs_per_output_sec` で
+  「出力 1 秒が source timeline 何秒ぶんか」を保持し、`fill_output` はこの値で
+  audio PTS を進める。
 - VST3 plugin chain 統合 (v0.9.0+): `audio-pump` thread が `audio_rx` から受領した
-  AudioFrame を `DspBridge::process_block` 経由で bridge プロセスに送り、戻ってきた
-  処理済みサンプルを ring buffer に push する (= IPC roundtrip ~1-2ms、AudioBuffer
-  processed queue 100ms で吸収)
+  AudioFrame を必要なら Signalsmith Stretch で time-stretch した後、
+  `DspBridge::process_block` 経由で bridge プロセスに送り、戻ってきた処理済みサンプルを
+  ring buffer に push する (= IPC roundtrip ~1-2ms、AudioBuffer processed queue 100ms
+  で吸収)
 - `fill_output` の bookkeeping (Phase 9 後の cleanup refactor):
   - **実消費サンプル数ベース**: `pop_front` で取り出した分 (= `real_consumed`) のみ
     `next_pts_secs` を進める。silence 出力中は pts 進行 0 (= 旧版の「常に full want
@@ -224,11 +231,16 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
     自動判別。詳細は [docs/video-engine-redesign.md] の「counter consolidation」節。
   - **再生制御の互換複製** (`playing` / `audio_active` / `eof_reached` / `seek_request` / `seek_target_override`): `EngineActor` の `published_state` (`Arc<AtomicU8>`) と並列管理されている **複製**。新規コードはこれらを AvClock からは読まず、EngineActor 経由で取得すること (source of truth は EngineActor)。
   - **AvClock 単独で保持しているレガシー所有状態** (`volume` / `muted`): TransportCommand::SetVolume / SetMuted は EngineActor 側では no-op で、現状 `audio.rs` が `clock.effective_volume()` を直接読んでいる。これらは将来的に `EngineActor` (もしくは独立の `VolumeController`) に移すべきだが、Phase 4 時点では AvClock が source of truth のまま。
+- `playback_speed` は AvClock と EngineActor の anchor speed に伝搬し、`now_secs()` は
+  source timeline を `speed` 倍で進める。速度変更時は現在 PTS で anchor を張り直し、
+  `audio_tx_accounting_epoch` を進めて旧速度で enqueue 済みの tx 会計を無効化する。
+  epoch は偶数を安定状態、奇数を速度変更中として使い、decoder の enqueue 会計 snapshot は
+  安定状態だけを採用する。
 - `set_audio_pts` の wall-rate cap: defensive safety net として保持。bookkeeping は
-  上流 (`fill_output`) で正確化済だが、buffer 非空での pre-fill burst (= callback
-  連続 pop が wall 進行を超える) シナリオへの保険として `wall_dt + 5ms ジッタ` で
-  pts 進行を頭打ちにする。実機 perf-log smoke で「pace/wall ≈ 1.0 (= cap 無発動)」
-  確認後に撤去再検討。
+  上流 (`fill_output`) で `source_secs_per_output_sec` により正確化済だが、buffer 非空での
+  pre-fill burst (= callback 連続 pop が wall 進行を超える) シナリオへの保険として
+  `wall_dt * playback_speed` を基準に頭打ちにする。0.5x など低速時は callback jitter で
+  過剰発火しないよう、speed<1.0 の cap だけ少し広めに取る。
 - ⚠️ **新規コードからは AvClock を直接呼び出さない**。新しい状態を扱う処理は必ず
   `EngineActor` 経由 (= `apply_command` / `handle_seek_request` / イベント送信) で書く。
   volume / muted を engine 側に移す改修も Phase 5+ で個別タスクとして扱う。

@@ -54,11 +54,30 @@ impl App {
         let hover_y_max = full_rect.max.y - 48.0; // HUD 44px + 4px 余白
         let entry_x_threshold = full_rect.max.x - 80.0;
         let panel_x_threshold = full_rect.max.x - panel_w;
+        let panel_top = full_rect.min.y + TOP_BAR_H;
+        // Phase 7: HUD (下部 44px) と重ならないようパネルをそこで終わらせる。
+        let panel_bottom = full_rect.max.y - 44.0;
+        let panel_rect = egui::Rect::from_min_max(
+            egui::pos2(full_rect.max.x - panel_w, panel_top),
+            egui::pos2(full_rect.max.x, panel_bottom),
+        );
+        let bottom_control_exclusion = egui::Rect::from_min_max(
+            egui::pos2(full_rect.min.x, full_rect.max.y - 160.0),
+            full_rect.max,
+        );
         let was_visible = self.show_video_metadata_panel_visible;
+        if self.video_speed_popup_open {
+            self.show_video_metadata_panel_visible = false;
+            return false;
+        }
         let hover_in_zone = ctx.input(|i| {
             i.pointer
                 .hover_pos()
                 .map(|p| {
+                    let in_existing_panel = was_visible && panel_rect.contains(p);
+                    if !in_existing_panel && bottom_control_exclusion.contains(p) {
+                        return false;
+                    }
                     let x_min = if was_visible {
                         panel_x_threshold
                     } else {
@@ -80,14 +99,6 @@ impl App {
             Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => player.info().cloned(),
             _ => None,
         };
-
-        let panel_top = full_rect.min.y + TOP_BAR_H;
-        // Phase 7: HUD (下部 44px) と重ならないようパネルをそこで終わらせる。
-        let panel_bottom = full_rect.max.y - 44.0;
-        let panel_rect = egui::Rect::from_min_max(
-            egui::pos2(full_rect.max.x - panel_w, panel_top),
-            egui::pos2(full_rect.max.x, panel_bottom),
-        );
 
         let painter = ui.painter().clone();
         painter.rect_filled(
@@ -256,11 +267,30 @@ impl App {
         let hover_y_max = full_rect.max.y - 48.0;
         let entry_x_threshold = full_rect.min.x + 80.0;
         let panel_x_threshold = full_rect.min.x + panel_w;
+        let panel_top = full_rect.min.y + TOP_BAR_H;
+        // Phase 7: HUD (下部 44px) と重ならないようパネルをそこで終わらせる。
+        let panel_bottom = full_rect.max.y - 44.0;
+        let panel_rect = egui::Rect::from_min_max(
+            egui::pos2(full_rect.min.x, panel_top),
+            egui::pos2(full_rect.min.x + panel_w, panel_bottom),
+        );
+        let bottom_control_exclusion = egui::Rect::from_min_max(
+            egui::pos2(full_rect.min.x, full_rect.max.y - 160.0),
+            full_rect.max,
+        );
         let was_visible = self.show_video_jump_panel_visible;
+        if self.video_speed_popup_open {
+            self.show_video_jump_panel_visible = false;
+            return false;
+        }
         let hover_in_zone = ctx.input(|i| {
             i.pointer
                 .hover_pos()
                 .map(|p| {
+                    let in_existing_panel = was_visible && panel_rect.contains(p);
+                    if !in_existing_panel && bottom_control_exclusion.contains(p) {
+                        return false;
+                    }
                     let x_max = if was_visible {
                         panel_x_threshold
                     } else {
@@ -354,14 +384,6 @@ impl App {
 
         // Phase 6: 動画モードの左パネルは常時表示候補 (= 🔖 ボタンがあるため、
         // 中身が空でもパネル自体は出す)。
-
-        let panel_top = full_rect.min.y + TOP_BAR_H;
-        // Phase 7: HUD (下部 44px) と重ならないようパネルをそこで終わらせる。
-        let panel_bottom = full_rect.max.y - 44.0;
-        let panel_rect = egui::Rect::from_min_max(
-            egui::pos2(full_rect.min.x, panel_top),
-            egui::pos2(full_rect.min.x + panel_w, panel_bottom),
-        );
 
         let painter = ui.painter().clone();
         painter.rect_filled(

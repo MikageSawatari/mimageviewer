@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender, bounded};
 
+use super::audio_stretch::TimeStretcher;
 use super::clock::{AvClock, SEEK_TARGET_TOLERANCE_SECS};
 use super::decoder::AudioFrame;
 use super::engine::actor::state_code;
@@ -145,10 +146,14 @@ struct ProcessedChunk {
     /// chunk の音声時間 (秒) = `samples.len() / samples_per_sec`。
     /// BufferReady 判定や processed cap 比較で再計算を避けるためキャッシュ。
     duration_secs: f64,
+    /// output/wall 秒 1 秒に対応する source timeline 秒。
+    /// 2.0x なら約 2.0。fill_output はこれで PTS を進める。
+    source_secs_per_output_sec: f64,
     /// この chunk がどの seek 世代で生成されたか (= stale 判定用)。
     seek_serial: u64,
-    /// VST process した時点の合計 PDC latency。後続 chunk と差があれば video clock
-    /// jump で吸収 (旧 `pdc_latency_secs_applied` 比較ロジックを chunk 単位に分離)。
+    /// VST / safety limiter / stretcher を含む処理時点の合計 latency (source 秒)。
+    /// 後続 chunk と差があれば video clock jump で吸収
+    /// (旧 `pdc_latency_secs_applied` 比較ロジックを chunk 単位に分離)。
     /// 現状は fill_output が `buf.pdc_latency_secs` (= 最新 pump 更新値) を使うため
     /// 未参照だが、将来の chunk-aware PDC jump 判定で使用予定。
     #[allow(dead_code)]
@@ -588,6 +593,7 @@ fn run_pump(
     let samples_per_sec = (sample_rate as f64) * 2.0;
     let _ = (samples_per_sec * TARGET_PROCESSED_SECS) as usize; // future use: explicit cap_samples cache
     let mut safety_limiter = SafetyLimiter::new(sample_rate, 2);
+    let mut time_stretcher = TimeStretcher::new(sample_rate);
 
     let mut activated = false;
     let mut last_seen_seek_serial: u64 = 0;
@@ -662,7 +668,10 @@ fn run_pump(
                 break 'intake;
             };
 
-            clock.add_audio_tx_queued_secs(-frame.duration_secs);
+            clock.add_audio_tx_queued_secs_for_epoch(
+                -frame.queued_wall_secs,
+                frame.audio_tx_accounting_epoch,
+            );
 
             // ── 新 seek 世代の検出 → VST plugin sync reset (= 既存挙動) ──
             let frame_seek_serial = frame.seek_serial;
@@ -680,6 +689,9 @@ fn run_pump(
                 seen_valid_audio_frame = true;
                 // 新 seek 世代: target / activate を reset
                 safety_limiter.reset();
+                // AV seek ではここで reset。1.0x bypass 境界の reset は
+                // TimeStretcher::process 内で自動的に行う。
+                time_stretcher.reset();
                 // PDC trim 用 seek_target は frame.pts_secs (= Fast では keyframe_pts、
                 // Precise では target ぴったり)。詳細は seek_target_secs の宣言コメント参照。
                 seek_target_secs = Some(frame.pts_secs);
@@ -866,7 +878,9 @@ fn run_pump(
                 None => break,
             };
 
-            // ── VST process_block (mutex 解放中) ──
+            // ── Time stretch → VST process_block (mutex 解放中) ──
+            let playback_speed = clock.playback_speed();
+            let stretched = time_stretcher.process(&raw.samples, raw.duration_secs, playback_speed);
             #[cfg(windows)]
             let (mut output_samples, mut current_pdc_latency_secs, vst_chain_active): (
                 Vec<f32>,
@@ -874,8 +888,8 @@ fn run_pump(
                 bool,
             ) = if let Some(b) = &dsp_bridge {
                 if b.is_enabled() && b.active_slot_count() > 0 {
-                    fx_out.resize(raw.samples.len(), 0.0);
-                    let success = b.process_block(&raw.samples, &mut fx_out).is_ok();
+                    fx_out.resize(stretched.samples.len(), 0.0);
+                    let success = b.process_block(&stretched.samples, &mut fx_out).is_ok();
                     if !success {
                         crate::logger::log("vst3 process_block failed");
                     }
@@ -888,20 +902,20 @@ fn run_pump(
                     if success {
                         (fx_out.clone(), lat_secs, true)
                     } else {
-                        (raw.samples.clone(), lat_secs, true)
+                        (stretched.samples.clone(), lat_secs, true)
                     }
                 } else {
-                    (raw.samples.clone(), 0.0, false)
+                    (stretched.samples.clone(), 0.0, false)
                 }
             } else {
-                (raw.samples.clone(), 0.0, false)
+                (stretched.samples.clone(), 0.0, false)
             };
             #[cfg(not(windows))]
             let (mut output_samples, mut current_pdc_latency_secs, vst_chain_active): (
                 Vec<f32>,
                 f64,
                 bool,
-            ) = (raw.samples.clone(), 0.0, false);
+            ) = (stretched.samples.clone(), 0.0, false);
 
             if vst_chain_active {
                 safety_limiter.process_block(&mut output_samples);
@@ -911,9 +925,16 @@ fn run_pump(
             }
 
             // ── chunk metadata 計算 ──
-            // audible_pts = input_pts - pdc_latency (Codex P1-3 反映、PDC 正しい同期用)
+            // latency は output 秒で発生するため、source timeline に換算する。
             let duration_secs = output_samples.len() as f64 / samples_per_sec;
-            let audible_pts_secs = (raw.pts_secs - current_pdc_latency_secs).max(0.0);
+            let source_secs_per_output_sec = if duration_secs > 0.0 {
+                stretched.source_secs_per_output_sec
+            } else {
+                playback_speed
+            };
+            current_pdc_latency_secs += stretched.stretcher_latency_output_secs;
+            let current_latency_source_secs = current_pdc_latency_secs * source_secs_per_output_sec;
+            let audible_pts_secs = (raw.pts_secs - current_latency_source_secs).max(0.0);
 
             // ── pre-target trim (Codex P1-1: PDC plugin で早すぎる BufferReady 防止) ──
             //
@@ -931,6 +952,7 @@ fn run_pump(
                 match pre_target_trim_decision(
                     audible_pts_secs,
                     duration_secs,
+                    source_secs_per_output_sec,
                     target,
                     samples_per_sec,
                     2,
@@ -960,8 +982,9 @@ fn run_pump(
                 samples,
                 audible_pts_secs: chunk_audible_pts,
                 duration_secs: chunk_duration,
+                source_secs_per_output_sec,
                 seek_serial: raw.seek_serial,
-                pdc_latency_secs_at_process: current_pdc_latency_secs,
+                pdc_latency_secs_at_process: current_latency_source_secs,
             };
 
             // ── lock 再取得して processed に push (= seek serial check) ──
@@ -986,13 +1009,13 @@ fn run_pump(
             }
             // PDC latency 変化のログ + 同期 (= 既存挙動、chunk metadata だが
             // global pdc_latency_secs も維持)
-            if (buf.pdc_latency_secs - current_pdc_latency_secs).abs() > 1e-6 {
+            if (buf.pdc_latency_secs - current_latency_source_secs).abs() > 1e-6 {
                 crate::logger::log(format!(
-                    "PDC latency changed: {:.3}ms -> {:.3}ms",
+                    "Audio latency changed: {:.3}ms -> {:.3}ms source-time",
                     buf.pdc_latency_secs * 1000.0,
-                    current_pdc_latency_secs * 1000.0
+                    current_latency_source_secs * 1000.0
                 ));
-                buf.pdc_latency_secs = current_pdc_latency_secs;
+                buf.pdc_latency_secs = current_latency_source_secs;
             }
             buf.processed.push_back(chunk);
         }
@@ -1018,7 +1041,9 @@ fn run_pump(
             let secs: f64 = buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
                 + remaining_first_chunk_secs(&buf);
             let audible = if let Some(first) = buf.processed.front() {
-                first.audible_pts_secs + buf.drain_offset_in_first as f64 / buf.samples_per_sec
+                first.audible_pts_secs
+                    + (buf.drain_offset_in_first as f64 / buf.samples_per_sec)
+                        * first.source_secs_per_output_sec
             } else {
                 buf.next_pts_secs
             };
@@ -1074,22 +1099,26 @@ enum TrimResult {
 /// に丸めた値)。呼出側はこの値で `samples.drain(..trim_samples)` する。
 fn pre_target_trim_decision(
     audible_pts_secs: f64,
-    duration_secs: f64,
+    output_duration_secs: f64,
+    source_secs_per_output_sec: f64,
     target_secs: f64,
     samples_per_sec: f64,
     channels: usize,
 ) -> TrimResult {
-    let audible_end = audible_pts_secs + duration_secs;
+    let source_rate = source_secs_per_output_sec.max(1.0e-6);
+    let audible_end = audible_pts_secs + output_duration_secs * source_rate;
     if audible_end <= target_secs - 1e-6 {
         TrimResult::DropAll
     } else if audible_pts_secs >= target_secs - 1e-6 {
         TrimResult::KeepAll
     } else {
-        let trim_secs = target_secs - audible_pts_secs;
-        let trim_samples_raw = (trim_secs * samples_per_sec).round() as usize;
+        let trim_source_secs = target_secs - audible_pts_secs;
+        let trim_output_secs = trim_source_secs / source_rate;
+        let trim_samples_raw = (trim_output_secs * samples_per_sec).round() as usize;
         // channel-aligned (= interleaved stereo は 2 単位)
         let trim_samples = (trim_samples_raw / channels) * channels;
-        let new_audible_pts = audible_pts_secs + trim_samples as f64 / samples_per_sec;
+        let new_audible_pts =
+            audible_pts_secs + (trim_samples as f64 / samples_per_sec) * source_rate;
         TrimResult::TrimFront {
             trim_samples,
             new_audible_pts,
@@ -1221,6 +1250,7 @@ fn fill_output(
         let first = buf.processed.front().unwrap();
         let chunk_audible_pts = first.audible_pts_secs;
         let chunk_latency = first.pdc_latency_secs_at_process;
+        let chunk_source_rate = first.source_secs_per_output_sec;
         chunk_pdc_latency_at_drain = Some(chunk_latency);
 
         for i in 0..take {
@@ -1231,8 +1261,10 @@ fn fill_output(
         buf.drain_offset_in_first += take;
 
         // chunk 内 drain 後の audible_pts を計算 (= 次に drain される予定の PTS)
-        next_audible_pts =
-            Some(chunk_audible_pts + buf.drain_offset_in_first as f64 / samples_per_sec);
+        next_audible_pts = Some(
+            chunk_audible_pts
+                + (buf.drain_offset_in_first as f64 / samples_per_sec) * chunk_source_rate,
+        );
 
         if buf.drain_offset_in_first >= buf.processed.front().map(|c| c.samples.len()).unwrap_or(0)
         {
@@ -1338,6 +1370,7 @@ mod tests {
             samples,
             audible_pts_secs: pts_secs,
             duration_secs,
+            source_secs_per_output_sec: 1.0,
             seek_serial: 0,
             pdc_latency_secs_at_process: 0.0,
         }
@@ -1349,6 +1382,8 @@ mod tests {
             pts_secs: seek_serial as f64,
             seek_serial,
             duration_secs: 0.01,
+            queued_wall_secs: 0.01,
+            audio_tx_accounting_epoch: 0,
             seek_target_secs: Some(seek_serial as f64),
         }
     }
@@ -1652,7 +1687,7 @@ mod tests {
         // PDC = 1.0 sec、input pts = 5.0、duration = 0.023 (= 1 frame)
         // audible_pts = 5.0 - 1.0 = 4.0、audible_end = 4.023
         // target = 5.0 → audible_end < target → DropAll
-        let result = pre_target_trim_decision(4.0, 0.023, 5.0, 96000.0, 2);
+        let result = pre_target_trim_decision(4.0, 0.023, 1.0, 5.0, 96000.0, 2);
         assert!(matches!(result, TrimResult::DropAll));
     }
 
@@ -1661,7 +1696,7 @@ mod tests {
     fn pre_target_trim_keeps_chunk_fully_after_target() {
         // input pts = 5.5、PDC = 0.0、audible_pts = 5.5
         // target = 5.0 → audible_pts >= target → KeepAll
-        let result = pre_target_trim_decision(5.5, 0.023, 5.0, 96000.0, 2);
+        let result = pre_target_trim_decision(5.5, 0.023, 1.0, 5.0, 96000.0, 2);
         assert!(matches!(result, TrimResult::KeepAll));
     }
 
@@ -1671,7 +1706,7 @@ mod tests {
         // PDC = 0.5、input pts = 5.5、duration = 1.0、audible_pts = 5.0
         // target = 5.5 → 跨ぐ → 先頭 0.5 sec trim、new_audible = 5.5
         // sample_per_sec = 96000、trim = 0.5 * 96000 = 48000 samples (channel-aligned)
-        let result = pre_target_trim_decision(5.0, 1.0, 5.5, 96000.0, 2);
+        let result = pre_target_trim_decision(5.0, 1.0, 1.0, 5.5, 96000.0, 2);
         match result {
             TrimResult::TrimFront {
                 trim_samples,
@@ -1679,6 +1714,24 @@ mod tests {
             } => {
                 assert_eq!(trim_samples, 48000);
                 assert!((new_audible_pts - 5.5).abs() < 1e-6);
+            }
+            _ => panic!("expected TrimFront"),
+        }
+    }
+
+    /// PDC pre-target trim: 2.0x では output 0.25s が source 0.5s に相当する。
+    #[test]
+    fn pre_target_trim_handles_double_speed() {
+        // audible_pts=4.0、output_duration=0.5、source_rate=2.0 → audible_end=5.0
+        // target=4.5 → source 0.5s 分だけ trim。output では 0.25s。
+        let result = pre_target_trim_decision(4.0, 0.5, 2.0, 4.5, 96000.0, 2);
+        match result {
+            TrimResult::TrimFront {
+                trim_samples,
+                new_audible_pts,
+            } => {
+                assert_eq!(trim_samples, 24000);
+                assert!((new_audible_pts - 4.5).abs() < 1e-6);
             }
             _ => panic!("expected TrimFront"),
         }
@@ -1707,7 +1760,7 @@ mod tests {
         let mut saw_keep_all = false;
         for _ in 0..50 {
             let audible_pts = input_pts - pdc;
-            let result = pre_target_trim_decision(audible_pts, frame_duration, target, sps, 2);
+            let result = pre_target_trim_decision(audible_pts, frame_duration, 1.0, target, sps, 2);
             match result {
                 TrimResult::DropAll => saw_drop_all = true,
                 TrimResult::TrimFront { .. } => saw_trim_front = true,
@@ -1744,6 +1797,7 @@ mod tests {
                 samples: vec![0.5; 480],
                 audible_pts_secs: target_audible,
                 duration_secs: 480.0 / samples_per_sec,
+                source_secs_per_output_sec: 1.0,
                 seek_serial: 0,
                 pdc_latency_secs_at_process: 1.0,
             };

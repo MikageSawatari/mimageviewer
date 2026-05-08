@@ -907,8 +907,14 @@ pub struct AudioFrame {
     pub samples: Vec<f32>,
     pub pts_secs: f64,
     pub seek_serial: u64,
-    /// このフレーム分の再生時間 (秒)。total audio buffer の差分加算に使う。
+    /// このフレーム分の元音声の再生時間 (source timeline 秒)。
     pub duration_secs: f64,
+    /// decoder→pump 間の tx queue 会計に使う wall 秒。enqueue 時の playback speed で
+    /// 固定し、pump 受信時も同じ値を減算する。
+    pub queued_wall_secs: f64,
+    /// `queued_wall_secs` を加算した時点の会計世代。速度変更で世代が進んだ後の
+    /// 旧 frame は音声としては使うが、tx queue 会計からは除外する。
+    pub audio_tx_accounting_epoch: u64,
     /// この `seek_serial` におけるユーザー要求 seek 位置 (秒)。
     ///
     /// **背景 (Codex P1 修正、2026-05-01)**: pump 側で BufferReady の audio_anchor を
@@ -2729,6 +2735,10 @@ fn run_video_decode(
                                 // (= 一時停止後など) のとき、`!post_seek_frame_sent` 経路が
                                 // 発火せず 1 枚目が送出できない → override が永久残留 →
                                 // deadlock になっていた。
+                                const VIDEO_QUEUE_LEAD_CAP_SECS: f64 = 0.60;
+                                let playback_speed = clock.playback_speed();
+                                let seek_burst_lead = (SEEK_BURST_LEAD_MAX_SECS * playback_speed)
+                                    .min(VIDEO_QUEUE_LEAD_CAP_SECS);
                                 if clock.is_seeking() && !post_seek_frame_sent {
                                     break;
                                 }
@@ -2736,7 +2746,7 @@ fn run_video_decode(
                                     && !in_audio_escape
                                     && audio_buf < AUDIO_SAFE_HI
                                 {
-                                    if ahead < SEEK_BURST_LEAD_MAX_SECS {
+                                    if ahead < seek_burst_lead {
                                         break;
                                     }
                                     if audio_active && audio_buf < AUDIO_SAFE_LO {
@@ -2757,7 +2767,6 @@ fn run_video_decode(
                                 // absorbed by the demux-side overflow queue rather than by this
                                 // direct control/packet channel.
                                 // 非 Windows では VST3 機能なし → pdc_latency=0 = 既存動作。
-                                const VIDEO_QUEUE_LEAD_CAP_SECS: f64 = 0.60;
                                 #[cfg(windows)]
                                 let pdc_latency = clock
                                     .vst3_pdc_latency_secs()
@@ -2765,7 +2774,8 @@ fn run_video_decode(
                                 #[cfg(not(windows))]
                                 let pdc_latency: f64 = 0.0;
                                 let pace_lead = if allow_pace_lead {
-                                    (PACE_LEAD_SECS + pdc_latency).min(VIDEO_QUEUE_LEAD_CAP_SECS)
+                                    (PACE_LEAD_SECS * playback_speed + pdc_latency)
+                                        .min(VIDEO_QUEUE_LEAD_CAP_SECS)
                                 } else {
                                     0.0
                                 };
@@ -2777,7 +2787,7 @@ fn run_video_decode(
                                 // 送出を許可。`audio_buf < AUDIO_CRITICAL_LO` 単独 bypass は撤去
                                 // (= Codex 助言、2026-05-01。video frame の過剰生産は audio を救わない)。
                                 let _ = AUDIO_CRITICAL_LO; // 将来 audio 専用 emergency 用に定数保持
-                                if in_audio_escape && ahead < SEEK_BURST_LEAD_MAX_SECS {
+                                if in_audio_escape && ahead < seek_burst_lead {
                                     break;
                                 }
                                 sleep_video_pacing();
@@ -3180,8 +3190,12 @@ fn run_video_decode(
                 if clock.is_seeking() && !post_seek_frame_sent {
                     break;
                 }
+                const VIDEO_QUEUE_LEAD_CAP_SECS: f64 = 0.60;
+                let playback_speed = clock.playback_speed();
+                let seek_burst_lead =
+                    (SEEK_BURST_LEAD_MAX_SECS * playback_speed).min(VIDEO_QUEUE_LEAD_CAP_SECS);
                 if clock.is_seeking() && !in_audio_escape && audio_buf < AUDIO_SAFE_HI {
-                    if ahead < SEEK_BURST_LEAD_MAX_SECS {
+                    if ahead < seek_burst_lead {
                         break;
                     }
                     if audio_active && audio_buf < AUDIO_SAFE_LO {
@@ -3190,7 +3204,6 @@ fn run_video_decode(
                 }
                 // PDC-aware pace_lead with queue-cap (= GPU 経路と同じ理屈、Codex 助言改訂版)。
                 // 詳細コメントは GPU 経路を参照。
-                const VIDEO_QUEUE_LEAD_CAP_SECS: f64 = 0.60;
                 #[cfg(windows)]
                 let pdc_latency = clock
                     .vst3_pdc_latency_secs()
@@ -3198,7 +3211,7 @@ fn run_video_decode(
                 #[cfg(not(windows))]
                 let pdc_latency: f64 = 0.0;
                 let pace_lead = if allow_pace_lead {
-                    (PACE_LEAD_SECS + pdc_latency).min(VIDEO_QUEUE_LEAD_CAP_SECS)
+                    (PACE_LEAD_SECS * playback_speed + pdc_latency).min(VIDEO_QUEUE_LEAD_CAP_SECS)
                 } else {
                     0.0
                 };
@@ -3207,7 +3220,7 @@ fn run_video_decode(
                 }
                 // audio_escape bypass: GPU 経路と同じ理屈で `audio_buf < CRITICAL` 単独 bypass を撤去。
                 let _ = AUDIO_CRITICAL_LO; // 将来 audio 専用 emergency 用に定数保持
-                if in_audio_escape && ahead < SEEK_BURST_LEAD_MAX_SECS {
+                if in_audio_escape && ahead < seek_burst_lead {
                     break;
                 }
                 sleep_video_pacing();
@@ -3711,22 +3724,27 @@ fn emit_audio_frame(
         }
         return true;
     }
+    let (speed_at_enqueue, audio_tx_accounting_epoch) = clock.audio_tx_accounting_snapshot();
+    let queued_wall_secs =
+        duration_secs / speed_at_enqueue.max(crate::video::clock::MIN_PLAYBACK_SPEED);
     let frame_out = AudioFrame {
         samples,
         pts_secs,
         seek_serial: current_seek_serial,
         duration_secs,
+        queued_wall_secs,
+        audio_tx_accounting_epoch,
         seek_target_secs: current_seek_target_secs,
     };
     // tx queued 合計を **send 前に加算**。pump.recv 後の減算と
     // 競合しないよう順序を保つ。失敗時はロールバック。
-    clock.add_audio_tx_queued_secs(duration_secs);
+    clock.add_audio_tx_queued_secs_for_epoch(queued_wall_secs, audio_tx_accounting_epoch);
     let send_t0 = std::time::Instant::now();
     let mut last_send_wait_log = send_t0;
     let mut pending_frame = Some(frame_out);
     loop {
         if clock.current_seek_serial() != current_seek_serial {
-            clock.add_audio_tx_queued_secs(-duration_secs);
+            clock.add_audio_tx_queued_secs_for_epoch(-queued_wall_secs, audio_tx_accounting_epoch);
             if crate::perf::is_enabled() {
                 crate::perf::event(
                     "audio",
@@ -3754,7 +3772,7 @@ fn emit_audio_frame(
         }
         let engine_st = engine_state.load(Ordering::Acquire);
         if engine_state_parks_decode(engine_st) {
-            clock.add_audio_tx_queued_secs(-duration_secs);
+            clock.add_audio_tx_queued_secs_for_epoch(-queued_wall_secs, audio_tx_accounting_epoch);
             crate::logger::log(format!(
                 "[audio-decode] audio_tx send aborted for park: serial={current_seek_serial} pts={pts_secs:.3} audio_tx_len={} engine_state={} clock_playing={} clock_seeking={}",
                 audio_tx.len(),
@@ -3841,7 +3859,10 @@ fn emit_audio_frame(
                 }
             }
             Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
-                clock.add_audio_tx_queued_secs(-duration_secs);
+                clock.add_audio_tx_queued_secs_for_epoch(
+                    -queued_wall_secs,
+                    audio_tx_accounting_epoch,
+                );
                 return false;
             }
         }
