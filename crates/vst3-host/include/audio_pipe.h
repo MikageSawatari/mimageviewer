@@ -55,6 +55,10 @@ public:
     // 通常 cpal 側が確実に読みに来るので timeout_ms 内で書ければ OK。
     bool write_out(const float* in, uint32_t num_samples, uint32_t timeout_ms);
 
+    /// 入力待ちで眠っている bridge audio thread を起こす。
+    /// reset/query/shutdown など、音声サンプルを伴わない制御要求を即時処理するために使う。
+    void wake_input();
+
     /// in_ring と out_ring の両方の未消費データをすべて捨てる。
     /// シーク等で plugin reset を行うときに、pre-seek の audio が残ったまま
     /// 新しい状態に進まないよう、reset fence の一部として呼ぶ。

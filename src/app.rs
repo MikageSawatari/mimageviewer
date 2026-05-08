@@ -15559,6 +15559,10 @@ impl eframe::App for App {
                     self.sync_after_restore();
                 } else if !is_visible_now && self.window_visible {
                     self.window_visible = false;
+                    crate::set_ui_heartbeat_suspended(
+                        true,
+                        "App::update heartbeat suspended after external window hide".to_string(),
+                    );
                 }
             }
 

@@ -168,6 +168,12 @@ bool AudioPipe::write_out(const float* in, uint32_t num_samples, uint32_t timeou
     return true;
 }
 
+void AudioPipe::wake_input() {
+    if (sig_in_) {
+        SetEvent(sig_in_);
+    }
+}
+
 void AudioPipe::discard_all() {
     if (!header_) return;
     // SPSC 規則上、in_ring は consumer (= bridge audio thread) のみが read 側 index を

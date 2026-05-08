@@ -586,6 +586,9 @@ fn dispatcher(queue: Arc<(Mutex<JobQueue>, Condvar)>, resource: Resource) {
   **cancel は paused を貫通** させる (アプリ終了時に supervisor スレッドが固まらないため)。
 - **GPU リソース解放**: `App::release_gpu_resources` が `thumbnails[*] = Evicted` や
   `fs_cache.clear()` 等で `TextureHandle` を drop。ウィンドウ復帰後は通常ロード経路で再取得。
+- **UI heartbeat watchdog**: `App::update` は SW_HIDE 中に止まるため、`hide_to_tray` で
+  watchdog を suspended にし、復帰時に resume する。これにより正常なトレイ常駐を
+  `panic.log` の `UI THREAD HANG suspected` として記録し続けない。
 
 設計上の注意:
 - notify-rs の crossbeam-channel (unbounded) は paused 中も受信し続けるので、溜まった

@@ -86,6 +86,13 @@ public:
     // 返り値: true = 処理成功、false = エラー (= 状態異常、要 reset)
     bool process_block(const float* input, float* output, uint32_t num_frames);
 
+    /// DAW の stop/play に相当する VST3 processing 状態を切り替える。
+    /// component active / plugin state / GUI は保持し、process() 呼び出しだけ止める。
+    bool set_processing_enabled(bool enabled);
+    bool is_processing_enabled() const {
+        return processing_enabled_.load(std::memory_order_acquire);
+    }
+
     // 状態リセット (再生位置変更時等)。プラグイン内部のフィルタ履歴を flush する。
     void reset();
 
@@ -245,6 +252,7 @@ private:
     uint32_t block_size_ = 0;
     std::atomic<uint32_t> cached_latency_samples_{0};
     bool active_ = false;
+    std::atomic<bool> processing_enabled_{false};
 
     bool editor_drag_active_ = false;
     void* editor_drag_restore_owner_hwnd_ = nullptr;

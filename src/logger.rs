@@ -3,11 +3,44 @@
 /// ログは mimageviewer.log に出力される。
 /// 書式: [経過秒数][スレッドID] メッセージ
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 static START: OnceLock<Instant> = OnceLock::new();
-static FILE: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+static FILE: OnceLock<Mutex<LogFile>> = OnceLock::new();
+const MAX_LOG_BYTES: u64 = 16 * 1024 * 1024;
+
+struct LogFile {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    bytes_written: u64,
+}
+
+impl LogFile {
+    fn rotate_if_needed(&mut self, incoming_bytes: usize) {
+        if self.bytes_written + incoming_bytes as u64 <= MAX_LOG_BYTES {
+            return;
+        }
+        if let Some(mut f) = self.file.take() {
+            let _ = f.flush();
+        }
+        let backup_path = self.path.with_extension("log.bak");
+        let _ = std::fs::remove_file(&backup_path);
+        if self.path.exists() {
+            let _ = std::fs::rename(&self.path, &backup_path);
+        }
+        match open_log_path(&self.path, true) {
+            Ok(f) => {
+                self.file = Some(f);
+                self.bytes_written = 0;
+            }
+            Err(_) => {
+                self.file = None;
+            }
+        }
+    }
+}
 
 /// メインプロセス用 logger 初期化。`mimageviewer.log` を truncate して書き始める。
 pub fn init() {
@@ -42,10 +75,32 @@ fn init_inner(file_name: &str, truncate: bool) {
     }
     match opts.open(&log_path) {
         Ok(f) => {
-            FILE.set(Mutex::new(f)).ok();
+            let bytes_written = if truncate {
+                0
+            } else {
+                f.metadata().map(|m| m.len()).unwrap_or(0)
+            };
+            FILE.set(Mutex::new(LogFile {
+                path: log_path,
+                file: Some(f),
+                bytes_written,
+            }))
+            .ok();
         }
         Err(e) => eprintln!("ログファイル作成失敗: {e} (path: {})", log_path.display()),
     }
+}
+
+fn open_log_path(path: &std::path::Path, truncate: bool) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true);
+    allow_live_log_reading(&mut opts);
+    if truncate {
+        opts.truncate(true);
+    } else {
+        opts.append(true);
+    }
+    opts.open(path)
 }
 
 fn allow_live_log_reading(opts: &mut std::fs::OpenOptions) {
@@ -74,9 +129,21 @@ pub fn log(msg: impl AsRef<str>) {
         .unwrap_or_else(|| "?".to_owned());
 
     if let Some(file) = FILE.get() {
-        if let Ok(mut f) = file.lock() {
-            let _ = writeln!(f, "[{elapsed:>8.3}s][t{tid_num:>3}] {}", msg.as_ref());
-            let _ = f.flush();
+        if let Ok(mut log_file) = file.lock() {
+            let line = format!("[{elapsed:>8.3}s][t{tid_num:>3}] {}\n", msg.as_ref());
+            log_file.rotate_if_needed(line.len());
+            let wrote = if let Some(f) = log_file.file.as_mut() {
+                let ok = f.write_all(line.as_bytes()).is_ok();
+                if ok {
+                    let _ = f.flush();
+                }
+                ok
+            } else {
+                false
+            };
+            if wrote {
+                log_file.bytes_written += line.len() as u64;
+            }
         }
     }
 }
