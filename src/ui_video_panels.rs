@@ -242,6 +242,11 @@ fn draw_kv_section(ui: &mut egui::Ui, info: &VideoInfo) {
 pub(crate) enum JumpPanelAction {
     /// 指定秒に seek (ブックマーク / チャプター 共通)。
     Seek(f64),
+    /// このブックマーク id の名称を編集。
+    EditBookmarkTitle {
+        id: i64,
+        current_title: Option<String>,
+    },
     /// このブックマーク id を削除。
     DeleteBookmark(i64),
     /// 現在位置にブックマークを追加 (= 上部 🔖 ボタン)。
@@ -589,6 +594,14 @@ impl App {
                         let _ = db.remove(id);
                     }
                 }
+                JumpPanelAction::EditBookmarkTitle { id, current_title } => {
+                    self.video_bookmark_title_editor = Some(crate::app::VideoBookmarkTitleEditor {
+                        fs_idx,
+                        id,
+                        title: current_title.unwrap_or_default(),
+                        request_focus: true,
+                    });
+                }
                 JumpPanelAction::AddBookmarkHere => {
                     self.add_video_bookmark_at_current(fs_idx);
                 }
@@ -694,6 +707,9 @@ impl App {
             ui.add_space(6.0);
             // 縦 2 行: 時間 + タイトル
             ui.vertical(|ui| {
+                if delete_id.is_some() {
+                    ui.set_width(118.0);
+                }
                 ui.add_space(4.0);
                 let time_label = crate::ui_helpers::format_hms(pts_secs);
                 let time_resp = ui.add(
@@ -711,21 +727,108 @@ impl App {
                     ui.colored_label(DIM_COLOR, egui::RichText::new(t).size(11.0));
                 }
             });
-            // 削除ボタン (右端)
+            // ブックマーク行だけ編集 / 削除ボタンを出す。
             if let Some(id) = delete_id {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let x_resp = ui.add(
+                let edit_resp = ui
+                    .add(
+                        egui::Button::new(egui::RichText::new("✏").color(DIM_COLOR).size(13.0))
+                            .frame(false),
+                    )
+                    .on_hover_text("ブックマーク名を編集");
+                if edit_resp.clicked() {
+                    out.push(JumpPanelAction::EditBookmarkTitle {
+                        id,
+                        current_title: title.map(|s| s.to_string()),
+                    });
+                }
+                let x_resp = ui
+                    .add(
                         egui::Button::new(egui::RichText::new("×").color(DIM_COLOR).size(14.0))
                             .frame(false),
-                    );
-                    if x_resp.clicked() {
-                        out.push(JumpPanelAction::DeleteBookmark(id));
-                    }
-                });
+                    )
+                    .on_hover_text("ブックマークを削除");
+                if x_resp.clicked() {
+                    out.push(JumpPanelAction::DeleteBookmark(id));
+                }
             }
         });
         ui.add_space(2.0);
         out
+    }
+
+    /// 左ジャンプパネルのブックマーク名称編集ダイアログ。
+    pub(crate) fn draw_video_bookmark_title_editor(&mut self, ctx: &egui::Context) {
+        let Some(editor) = self.video_bookmark_title_editor.as_ref() else {
+            return;
+        };
+        if self.fullscreen_idx != Some(editor.fs_idx) {
+            self.video_bookmark_title_editor = None;
+            return;
+        }
+
+        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let escape_pressed = self.dialog_escape_pressed(ctx);
+        let mut open = true;
+        let mut save = false;
+        let mut clear = false;
+        let mut cancel = escape_pressed;
+        let default_pos = ctx.content_rect().min + egui::vec2(60.0, 60.0);
+
+        egui::Window::new("ブックマーク名")
+            .id(egui::Id::new("video_bookmark_title_editor"))
+            .default_pos(default_pos)
+            .resizable(false)
+            .collapsible(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(320.0);
+                if let Some(editor) = self.video_bookmark_title_editor.as_mut() {
+                    ui.label("左パネルに表示する名称");
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut editor.title)
+                            .desired_width(300.0)
+                            .hint_text("未設定"),
+                    );
+                    if editor.request_focus {
+                        response.request_focus();
+                        editor.request_focus = false;
+                    }
+                    if response.lost_focus() && enter_pressed {
+                        save = true;
+                    }
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("保存").clicked() {
+                        save = true;
+                    }
+                    if ui.button("名称なし").clicked() {
+                        clear = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if !open || cancel {
+            self.video_bookmark_title_editor = None;
+            return;
+        }
+
+        if save || clear {
+            if let Some(editor) = self.video_bookmark_title_editor.take() {
+                let title = if clear { String::new() } else { editor.title };
+                if let Some(db) = self.video_bookmark_db.as_ref()
+                    && let Err(err) = db.update_title(editor.id, Some(&title))
+                {
+                    crate::logger::log(format!(
+                        "video bookmark title update failed: id={} {err}",
+                        editor.id
+                    ));
+                }
+            }
+        }
     }
 
     /// 現在のフレームをピン留め (= 動画グリッドサムネに固定) するトグル。

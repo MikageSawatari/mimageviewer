@@ -1337,6 +1337,14 @@ pub(crate) struct VideoFrameStepHold {
     pub(crate) last_step_at: std::time::Instant,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct VideoBookmarkTitleEditor {
+    pub(crate) fs_idx: usize,
+    pub(crate) id: i64,
+    pub(crate) title: String,
+    pub(crate) request_focus: bool,
+}
+
 pub struct App {
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
@@ -1868,6 +1876,8 @@ pub struct App {
     /// ピン操作後にジャンプパネルへ短時間表示する状態テキスト (Phase 8.B'-2)。
     /// `(message, until)` で `Instant::now() < until` の間だけ表示。
     pub(crate) video_pin_status: Option<(String, std::time::Instant)>,
+    /// 左ジャンプパネルのブックマーク名称編集ダイアログ。
+    pub(crate) video_bookmark_title_editor: Option<VideoBookmarkTitleEditor>,
     /// 動画再生中の FPS / フレーム間隔オーバーレイ (P キーで トグル)。
     pub(crate) video_perf_overlay_visible: bool,
     /// 直近 N フレームの perf overlay サンプル。
@@ -2828,6 +2838,7 @@ impl Default for App {
             fs_open_intent_from_grid: false,
             video_thumb_overrides_dirty: false,
             video_pin_status: None,
+            video_bookmark_title_editor: None,
             video_perf_overlay_visible: false,
             video_perf_history: std::collections::VecDeque::with_capacity(200),
             video_perf_last_wall: None,
@@ -11078,6 +11089,7 @@ impl App {
         self.fs_secondary_press_start = None;
         self.fs_middle_zoom_drag = None;
         self.fs_context_menu_idx = None;
+        self.video_bookmark_title_editor = None;
         // Phase 5.5: タイルモードもフルスクリーン解除と同時に閉じる (Codex H2 反映)。
         // Phase 6.C: 左ジャンプパネルのサムネ texture キャッシュもクリア。
         #[cfg(windows)]
@@ -13464,6 +13476,9 @@ impl App {
             crate::video::NativeVideoOutputEvent::TogglePinAt { target_secs } => {
                 self.handle_native_video_toggle_pin_command(ctx, fs_idx, target_secs);
             }
+            crate::video::NativeVideoOutputEvent::SetBookmarkTitle { id, title } => {
+                self.handle_native_video_set_bookmark_title_command(ctx, fs_idx, id, title);
+            }
             crate::video::NativeVideoOutputEvent::DeleteBookmark { id } => {
                 self.handle_native_video_delete_bookmark_command(ctx, fs_idx, id);
             }
@@ -13485,6 +13500,7 @@ impl App {
                 self.handle_native_video_key_event(ctx, fs_idx, key);
             }
             crate::video::native_window::NativeVideoWindowEvent::KeyUp(_) => {}
+            crate::video::native_window::NativeVideoWindowEvent::Text(_) => {}
             crate::video::native_window::NativeVideoWindowEvent::MouseMove(mouse) => {
                 if mouse.x < 340 {
                     self.sync_native_video_timeline_markers(fs_idx);
@@ -14208,6 +14224,27 @@ impl App {
     }
 
     #[cfg(windows)]
+    fn handle_native_video_set_bookmark_title_command(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        id: i64,
+        title: String,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        if let Some(db) = self.video_bookmark_db.as_ref() {
+            if let Err(e) = db.update_title(id, Some(&title)) {
+                crate::logger::log(format!("video bookmark title update failed: {e}"));
+            } else {
+                self.sync_native_video_timeline_markers(fs_idx);
+            }
+        }
+        self.mark_native_video_hud_activity(ctx);
+    }
+
+    #[cfg(windows)]
     fn add_native_video_bookmark(&mut self, fs_idx: usize, target_secs: Option<f64>) {
         let snapshot = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
@@ -14324,6 +14361,12 @@ impl App {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.toggle_play();
                 }
+            }
+            // Escape: close native fullscreen. If the native overlay has a text
+            // editor focused this key is not forwarded here, so dialog editing
+            // does not accidentally close the fullscreen window.
+            0x1B if !key.repeat => {
+                self.close_fullscreen();
             }
             // W: seek to start and play.
             0x57 if !key.shift && !key.ctrl && !key.repeat => {

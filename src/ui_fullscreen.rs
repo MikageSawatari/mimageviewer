@@ -1599,6 +1599,9 @@ impl App {
                         // ── 右上フィードバックトースト ──
                         self.draw_feedback_toast(ui, full_rect, ctx);
 
+                        // ── 動画ブックマーク名編集ダイアログ ──
+                        self.draw_video_bookmark_title_editor(ctx);
+
                         // ── 中央の境界ヒント (最初/最後の画像です…) ──
                         self.draw_boundary_hint(ui, full_rect, ctx);
 

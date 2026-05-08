@@ -26,6 +26,7 @@
 //!
 //! - `list(path)`: その動画の全ブックマークを `pts_secs` 昇順で返す。
 //! - `add(path, pts_secs, title, thumb_webp) -> id`: 新規追加。
+//! - `update_title(id, title)`: 既存ブックマークの任意ラベルを更新。
 //! - `remove(id)`: 個別削除。
 //! - `clear_for(path)`: 動画切替時の cleanup などに使う想定 (Phase 5.4 では未配線)。
 
@@ -141,7 +142,7 @@ impl VideoBookmarkDb {
         thumb_webp: &[u8],
     ) -> Result<i64, rusqlite::Error> {
         let key = crate::path_key::normalize_keep_drive(video_path);
-        let title_arg: Option<&str> = title.filter(|s| !s.is_empty());
+        let title_arg = normalize_bookmark_title(title);
         let blob: Option<&[u8]> = if thumb_webp.is_empty() {
             None
         } else {
@@ -155,9 +156,20 @@ impl VideoBookmarkDb {
             "INSERT INTO video_bookmarks
                 (path, pts_secs, title, thumb_webp, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![key, pts_secs, title_arg, blob, now],
+            rusqlite::params![key, pts_secs, title_arg.as_deref(), blob, now],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// 既存ブックマークの名称を更新する。空文字 / 空白のみ / None は NULL として保存。
+    #[allow(dead_code)]
+    pub fn update_title(&self, id: i64, title: Option<&str>) -> Result<(), rusqlite::Error> {
+        let title_arg = normalize_bookmark_title(title);
+        self.conn.execute(
+            "UPDATE video_bookmarks SET title = ?1 WHERE id = ?2",
+            rusqlite::params![title_arg.as_deref(), id],
+        )?;
+        Ok(())
     }
 
     /// 個別削除 (id = `add` の戻り値)。
@@ -177,6 +189,13 @@ impl VideoBookmarkDb {
             .execute("DELETE FROM video_bookmarks WHERE path = ?1", [&key])?;
         Ok(())
     }
+}
+
+fn normalize_bookmark_title(title: Option<&str>) -> Option<String> {
+    title
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -223,6 +242,23 @@ mod tests {
         let list = db.list(p);
         assert_eq!(list.len(), 1);
         assert!((list[0].pts_secs - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn update_title_sets_and_clears_label() {
+        let db = open_in_memory();
+        let p = Path::new("C:/v.mp4");
+        let id = db.add(p, 1.0, None, &[]).unwrap();
+
+        db.update_title(id, Some("  見どころ  ")).unwrap();
+        let list = db.list(p);
+        assert_eq!(list[0].title.as_deref(), Some("見どころ"));
+        let marker_meta = db.list_marker_meta(p);
+        assert_eq!(marker_meta[0].1.as_deref(), Some("見どころ"));
+
+        db.update_title(id, Some("   ")).unwrap();
+        let list = db.list(p);
+        assert!(list[0].title.is_none());
     }
 
     #[test]

@@ -147,6 +147,7 @@ struct NativeEguiOverlay {
     hover_texture_key: Option<(u32, u32, u64)>,
     timeline_markers: Vec<NativeOverlayTimelineMarker>,
     jump_entries: Vec<NativeOverlayJumpEntry>,
+    bookmark_title_edit: Option<NativeBookmarkTitleEdit>,
     video_metadata: Option<NativeOverlayMetadata>,
     tile_overlay: Option<NativeOverlayTileOverlay>,
     tile_textures: HashMap<usize, (u64, egui::TextureHandle)>,
@@ -166,6 +167,13 @@ struct NativeEguiOverlay {
 struct NativeFrameStepHold {
     direction: i32,
     last_step_at: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct NativeBookmarkTitleEdit {
+    id: i64,
+    title: String,
+    request_focus: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -467,6 +475,10 @@ pub enum NativeOverlayCommand {
     TogglePinAt {
         target_secs: f64,
     },
+    SetBookmarkTitle {
+        id: i64,
+        title: String,
+    },
     DeleteBookmark {
         id: i64,
     },
@@ -480,7 +492,9 @@ impl NativeOverlayInputRouting {
         use crate::video::native_window::NativeVideoWindowEvent as NativeEvent;
 
         match event {
-            NativeEvent::KeyDown(_) | NativeEvent::KeyUp(_) => !self.wants_keyboard_input,
+            NativeEvent::KeyDown(_) | NativeEvent::KeyUp(_) | NativeEvent::Text(_) => {
+                !self.wants_keyboard_input
+            }
             NativeEvent::MouseMove(_)
             | NativeEvent::MouseButton(_)
             | NativeEvent::MouseWheel(_)
@@ -1766,6 +1780,7 @@ impl NativeEguiOverlay {
             hover_texture_key: None,
             timeline_markers: Vec::new(),
             jump_entries: Vec::new(),
+            bookmark_title_edit: None,
             video_metadata: None,
             tile_overlay: None,
             tile_textures: HashMap::new(),
@@ -1843,6 +1858,10 @@ impl NativeEguiOverlay {
                     });
                     self.dirty = true;
                 }
+            }
+            NativeEvent::Text(ch) => {
+                self.pending_events.push(egui::Event::Text(ch.to_string()));
+                self.dirty = true;
             }
             NativeEvent::MouseMove(mouse) => {
                 let pos = self.native_pos(mouse.x, mouse.y);
@@ -2225,6 +2244,7 @@ impl NativeEguiOverlay {
             || self.tile_overlay.is_some()
             || self.hover_preview_target_secs.is_some()
             || self.frame_step_hold.is_some()
+            || self.bookmark_title_edit.is_some()
             || self.toast.is_some()
             || self.video_error.is_some()
             || !self.first_frame_presented
@@ -2391,6 +2411,7 @@ impl NativeEguiOverlay {
         let hover_preview_pinned = self.hover_preview_pinned;
         let timeline_markers = self.timeline_markers.clone();
         let jump_entries = self.jump_entries.clone();
+        let mut bookmark_title_edit = self.bookmark_title_edit.take();
         let video_metadata = self.video_metadata.clone();
         let vst3_panel = self.vst3_panel.clone();
         let tile_overlay = self.tile_overlay.clone();
@@ -2416,6 +2437,7 @@ impl NativeEguiOverlay {
         let tile_overlay_visible = tile_overlay.is_some();
         let status_visible = video_error.is_some() || !first_frame_presented;
         let toast_visible = toast.is_some();
+        let bookmark_title_edit_visible = bookmark_title_edit.is_some();
         let side_panel_visible =
             !tile_overlay_visible && (jump_panel_visible || right_panel_visible);
         let panel_chrome_visible = !tile_overlay_visible && (top_bar_visible || side_panel_visible);
@@ -2430,6 +2452,7 @@ impl NativeEguiOverlay {
             || (!tile_overlay_visible && checked)
             || status_visible
             || toast_visible
+            || bookmark_title_edit_visible
             || paused_center_visible
             || vst3_panel_visible;
         let pending_event_count = self.pending_events.len();
@@ -2562,6 +2585,16 @@ impl NativeEguiOverlay {
                     position_secs,
                     &jump_entries,
                     &jump_texture_ids,
+                    &mut bookmark_title_edit,
+                    &mut commands,
+                );
+            }
+            if bookmark_title_edit.is_some() {
+                draw_native_bookmark_title_editor(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    &mut bookmark_title_edit,
                     &mut commands,
                 );
             }
@@ -3147,6 +3180,7 @@ impl NativeEguiOverlay {
         self.hover_preview_target_secs = hover_preview_target_secs;
         self.video_speed_popup_open = video_speed_popup_open;
         self.frame_step_hold = frame_step_hold;
+        self.bookmark_title_edit = bookmark_title_edit;
         self.top_bar_visible = top_bar_visible || side_panel_visible;
         self.right_panel_visible = right_panel_visible;
         self.jump_panel_visible = jump_panel_visible;
@@ -3214,7 +3248,7 @@ impl NativeEguiOverlay {
         for id in &full_output.textures_delta.free {
             self.renderer.free_texture(id);
         }
-        self.dirty = self.frame_step_hold.is_some();
+        self.dirty = self.frame_step_hold.is_some() || self.bookmark_title_edit.is_some();
         log_event(
             "egui_overlay_present",
             &[
@@ -3420,6 +3454,7 @@ fn draw_native_jump_panel(
     position_secs: f64,
     entries: &[NativeOverlayJumpEntry],
     jump_texture_ids: &HashMap<usize, egui::TextureId>,
+    bookmark_title_edit: &mut Option<NativeBookmarkTitleEdit>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     let panel_rect = native_jump_panel_rect(overlay_height_points);
@@ -3554,7 +3589,14 @@ fn draw_native_jump_panel(
                         });
                         ui.add_space(3.0);
                         for (idx, entry) in section_entries {
-                            draw_native_jump_row(ui, idx, entry, jump_texture_ids, commands);
+                            draw_native_jump_row(
+                                ui,
+                                idx,
+                                entry,
+                                jump_texture_ids,
+                                bookmark_title_edit,
+                                commands,
+                            );
                         }
                         ui.add_space(8.0);
                     }
@@ -3567,6 +3609,7 @@ fn draw_native_jump_row(
     idx: usize,
     entry: &NativeOverlayJumpEntry,
     jump_texture_ids: &HashMap<usize, egui::TextureId>,
+    bookmark_title_edit: &mut Option<NativeBookmarkTitleEdit>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     let row_h = 76.0;
@@ -3633,21 +3676,49 @@ fn draw_native_jump_row(
             egui::FontId::proportional(12.0),
             egui::Color32::from_rgb(232, 232, 232),
         );
-        let title = entry
-            .title
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or("無題");
-        painter.text(
-            egui::pos2(text_x, row_rect.min.y + 38.0),
-            egui::Align2::LEFT_TOP,
-            truncate_overlay_text(title, 22),
-            egui::FontId::proportional(12.0),
-            egui::Color32::from_rgb(205, 205, 205),
-        );
+        if let Some(title) = entry.title.as_deref().filter(|s| !s.trim().is_empty()) {
+            let title_max_chars = if entry.bookmark_id.is_some() { 16 } else { 22 };
+            painter.text(
+                egui::pos2(text_x, row_rect.min.y + 38.0),
+                egui::Align2::LEFT_TOP,
+                truncate_overlay_text(title, title_max_chars),
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_rgb(205, 205, 205),
+            );
+        }
 
         let mut delete_clicked = false;
+        let mut edit_clicked = false;
         if let Some(id) = entry.bookmark_id {
+            let edit_rect = egui::Rect::from_min_size(
+                egui::pos2(row_rect.max.x - 56.0, row_rect.min.y + 8.0),
+                egui::vec2(22.0, 22.0),
+            );
+            let edit_resp = ui.interact(
+                edit_rect,
+                egui::Id::new(("native_jump_edit", id)),
+                egui::Sense::click(),
+            );
+            draw_overlay_button_bg(&painter, edit_rect, edit_resp.hovered(), false);
+            draw_overlay_pencil_icon(
+                &painter,
+                edit_rect,
+                if edit_resp.hovered() {
+                    egui::Color32::from_rgb(255, 235, 160)
+                } else {
+                    egui::Color32::from_rgb(225, 210, 150)
+                },
+            );
+            let edit_resp = edit_resp.on_hover_text("ブックマーク名を編集");
+            if edit_resp.clicked() {
+                edit_clicked = true;
+                *bookmark_title_edit = Some(NativeBookmarkTitleEdit {
+                    id,
+                    title: entry.title.clone().unwrap_or_default(),
+                    request_focus: true,
+                });
+            }
+
             let delete_rect = egui::Rect::from_min_size(
                 egui::pos2(row_rect.max.x - 28.0, row_rect.min.y + 8.0),
                 egui::vec2(22.0, 22.0),
@@ -3672,12 +3743,84 @@ fn draw_native_jump_row(
             }
         }
 
-        if resp.clicked() && !delete_clicked {
+        if resp.clicked() && !delete_clicked && !edit_clicked {
             commands.push(NativeOverlayCommand::Seek {
                 target_secs: entry.pts_secs,
             });
         }
     });
+}
+
+fn draw_native_bookmark_title_editor(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    edit: &mut Option<NativeBookmarkTitleEdit>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    let Some(state) = edit.as_mut() else {
+        return;
+    };
+    let dialog_w = 360.0_f32.min((overlay_width_points - 32.0).max(260.0));
+    let dialog_h = 142.0;
+    let pos = egui::pos2(
+        (overlay_width_points - dialog_w) * 0.5,
+        (overlay_height_points - dialog_h) * 0.5,
+    );
+    let mut save = false;
+    let mut clear = false;
+    let mut cancel = false;
+
+    egui::Area::new(egui::Id::new("native_video_bookmark_title_editor"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(18, 18, 24, 244))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(112)))
+                .corner_radius(egui::CornerRadius::same(5))
+                .inner_margin(egui::Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_min_width(dialog_w - 24.0);
+                    ui.label(
+                        egui::RichText::new("ブックマーク名")
+                            .size(14.0)
+                            .color(egui::Color32::from_rgb(238, 238, 238)),
+                    );
+                    ui.add_space(6.0);
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut state.title)
+                            .desired_width(dialog_w - 24.0)
+                            .hint_text("未設定"),
+                    );
+                    if state.request_focus {
+                        response.request_focus();
+                        state.request_focus = false;
+                    }
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("保存").clicked() {
+                            save = true;
+                        }
+                        if ui.button("名称なし").clicked() {
+                            clear = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            cancel = true;
+                        }
+                    });
+                });
+        });
+
+    if save || clear {
+        let state = edit.take().expect("bookmark title edit exists");
+        commands.push(NativeOverlayCommand::SetBookmarkTitle {
+            id: state.id,
+            title: if clear { String::new() } else { state.title },
+        });
+    } else if cancel {
+        *edit = None;
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -5222,6 +5365,33 @@ fn draw_overlay_bookmark_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, fi
         fill,
         egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 245, 190)),
     ));
+}
+
+fn draw_overlay_pencil_icon(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.6, color);
+    let a = egui::pos2(
+        rect.min.x + rect.width() * 0.30,
+        rect.max.y - rect.height() * 0.28,
+    );
+    let b = egui::pos2(
+        rect.max.x - rect.width() * 0.24,
+        rect.min.y + rect.height() * 0.34,
+    );
+    painter.line_segment([a, b], stroke);
+    painter.line_segment(
+        [
+            egui::pos2(a.x - 2.2, a.y + 2.2),
+            egui::pos2(a.x + 3.2, a.y + 3.2),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(b.x - 2.8, b.y - 1.6),
+            egui::pos2(b.x + 1.8, b.y + 2.8),
+        ],
+        stroke,
+    );
 }
 
 fn draw_overlay_pin_icon(painter: &egui::Painter, c: egui::Pos2, r: f32, color: egui::Color32) {

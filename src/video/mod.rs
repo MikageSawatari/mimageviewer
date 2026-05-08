@@ -270,6 +270,10 @@ pub enum NativeVideoOutputEvent {
     TogglePinAt {
         target_secs: f64,
     },
+    SetBookmarkTitle {
+        id: i64,
+        title: String,
+    },
     DeleteBookmark {
         id: i64,
     },
@@ -945,6 +949,9 @@ fn send_native_overlay_command(
             NativeVideoOutputEvent::AddBookmarkAt { target_secs }
         }
         Command::TogglePinAt { target_secs } => NativeVideoOutputEvent::TogglePinAt { target_secs },
+        Command::SetBookmarkTitle { id, title } => {
+            NativeVideoOutputEvent::SetBookmarkTitle { id, title }
+        }
         Command::DeleteBookmark { id } => NativeVideoOutputEvent::DeleteBookmark { id },
     };
     send_native_output_event(tx, source_epoch, event);
@@ -979,7 +986,7 @@ fn run_native_video_output(
                 rect: config.rect,
             },
             owner_hwnd: config.owner_hwnd,
-            close_on_escape: true,
+            close_on_escape: false,
             // This HWND lives on the presenter thread, so WM_QUIT only exits
             // this loop and does not affect eframe's main event loop.
             post_quit_on_destroy: true,
@@ -1467,6 +1474,16 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::TogglePinAt { target_secs },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetBookmarkTitle {
+                                id,
+                                title,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetBookmarkTitle { id, title },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::DeleteBookmark {
