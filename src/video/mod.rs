@@ -1524,11 +1524,11 @@ fn run_native_video_output(
                 }
             };
             for event in &native_events {
-                if overlay_routing.should_forward_to_ui(*event) {
+                if overlay_routing.should_forward_to_ui(event) {
                     send_native_output_event(
                         &ui_event_tx,
                         source.source_epoch,
-                        NativeVideoOutputEvent::Window(*event),
+                        NativeVideoOutputEvent::Window(event.clone()),
                     );
                 }
             }

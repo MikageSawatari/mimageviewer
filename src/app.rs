@@ -13528,6 +13528,7 @@ impl App {
             }
             crate::video::native_window::NativeVideoWindowEvent::KeyUp(_) => {}
             crate::video::native_window::NativeVideoWindowEvent::Text(_) => {}
+            crate::video::native_window::NativeVideoWindowEvent::Ime(_) => {}
             crate::video::native_window::NativeVideoWindowEvent::MouseMove(mouse) => {
                 if mouse.x < 340 {
                     self.sync_native_video_timeline_markers(fs_idx);

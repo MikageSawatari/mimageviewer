@@ -1,8 +1,14 @@
+use std::ffi::c_void;
+
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::Input::Ime::{
+    GCS_COMPSTR, GCS_RESULTSTR, IME_COMPOSITION_STRING, ISC_SHOWUICOMPOSITIONWINDOW,
+    ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
     VK_CONTROL, VK_MENU, VK_SHIFT,
@@ -14,7 +20,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, MSG, PM_REMOVE, PeekMessageW,
     PostQuitMessage, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
     SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
+    WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
     WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
     WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
@@ -31,11 +38,20 @@ pub struct NativeVideoKeyEvent {
     pub repeat: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
+pub enum NativeVideoImeEvent {
+    Enabled,
+    Preedit(String),
+    Commit(String),
+    Disabled,
+}
+
+#[derive(Clone, Debug)]
 pub enum NativeVideoWindowEvent {
     KeyDown(NativeVideoKeyEvent),
     KeyUp(NativeVideoKeyEvent),
     Text(char),
+    Ime(NativeVideoImeEvent),
     MouseMove(NativeVideoMouseEvent),
     MouseButton(NativeVideoMouseButtonEvent),
     MouseWheel(NativeVideoMouseWheelEvent),
@@ -113,6 +129,7 @@ struct WindowState {
     close_on_escape: bool,
     post_quit_on_destroy: bool,
     event_tx: Option<std::sync::mpsc::Sender<NativeVideoWindowEvent>>,
+    ime_preediting: bool,
 }
 
 impl NativeVideoWindow {
@@ -172,6 +189,7 @@ impl NativeVideoWindow {
                 close_on_escape: config.close_on_escape,
                 post_quit_on_destroy: config.post_quit_on_destroy,
                 event_tx: config.event_tx,
+                ime_preediting: false,
             });
             let state_ptr = Box::into_raw(state);
             let owner_hwnd = if config.owner_hwnd != 0 {
@@ -381,6 +399,61 @@ unsafe extern "system" fn wnd_proc(
             }
             LRESULT(0)
         }
+        WM_IME_STARTCOMPOSITION => {
+            if let Some(state) = window_state_mut(hwnd) {
+                state.ime_preediting = false;
+                send_ime_event(state, NativeVideoImeEvent::Enabled);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_IME_COMPOSITION => {
+            if let Some(state) = window_state_mut(hwnd) {
+                let flags = lparam.0 as u32;
+                if flags == 0 {
+                    state.ime_preediting = false;
+                    send_ime_event(state, NativeVideoImeEvent::Preedit(String::new()));
+                }
+                if (flags & GCS_RESULTSTR.0) != 0
+                    && let Some(text) = ime_composition_string(hwnd, GCS_RESULTSTR)
+                {
+                    state.ime_preediting = false;
+                    send_ime_event(state, NativeVideoImeEvent::Preedit(String::new()));
+                    if !text.is_empty() {
+                        send_ime_event(state, NativeVideoImeEvent::Commit(text));
+                    }
+                }
+                if (flags & GCS_COMPSTR.0) != 0
+                    && let Some(text) = ime_composition_string(hwnd, GCS_COMPSTR)
+                {
+                    state.ime_preediting = true;
+                    send_ime_event(state, NativeVideoImeEvent::Preedit(text));
+                }
+                // egui draws the preedit text itself; suppress the default IME
+                // composition window that otherwise appears at the top-left.
+                LRESULT(0)
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+        }
+        WM_IME_ENDCOMPOSITION => {
+            if let Some(state) = window_state_mut(hwnd) {
+                if state.ime_preediting
+                    && let Some(text) = ime_composition_string(hwnd, GCS_RESULTSTR)
+                {
+                    send_ime_event(state, NativeVideoImeEvent::Preedit(String::new()));
+                    if !text.is_empty() {
+                        send_ime_event(state, NativeVideoImeEvent::Commit(text));
+                    }
+                }
+                state.ime_preediting = false;
+                send_ime_event(state, NativeVideoImeEvent::Disabled);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_IME_SETCONTEXT => {
+            let lparam = LPARAM(lparam.0 & !(ISC_SHOWUICOMPOSITIONWINDOW as isize));
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
         WM_MOUSEMOVE => {
             track_mouse_leave(hwnd);
             if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
@@ -457,6 +530,52 @@ fn window_state(hwnd: HWND) -> Option<&'static WindowState> {
         None
     } else {
         Some(unsafe { &*ptr })
+    }
+}
+
+fn window_state_mut(hwnd: HWND) -> Option<&'static mut WindowState> {
+    let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut WindowState;
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { &mut *ptr })
+    }
+}
+
+fn send_ime_event(state: &WindowState, event: NativeVideoImeEvent) {
+    if let Some(tx) = state.event_tx.as_ref() {
+        let _ = tx.send(NativeVideoWindowEvent::Ime(event));
+    }
+}
+
+fn ime_composition_string(hwnd: HWND, mode: IME_COMPOSITION_STRING) -> Option<String> {
+    unsafe {
+        let himc = ImmGetContext(hwnd);
+        if himc.0.is_null() {
+            return None;
+        }
+        let byte_len = ImmGetCompositionStringW(himc, mode, None, 0);
+        let result = if byte_len < 0 {
+            None
+        } else if byte_len == 0 {
+            Some(String::new())
+        } else {
+            let mut buf = vec![0_u16; byte_len as usize / 2];
+            let read = ImmGetCompositionStringW(
+                himc,
+                mode,
+                Some(buf.as_mut_ptr().cast::<c_void>()),
+                byte_len as u32,
+            );
+            if read < 0 {
+                None
+            } else {
+                buf.truncate(read as usize / 2);
+                Some(String::from_utf16_lossy(&buf))
+            }
+        };
+        let _ = ImmReleaseContext(hwnd, himc);
+        result
     }
 }
 

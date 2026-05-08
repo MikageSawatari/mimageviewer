@@ -232,8 +232,10 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   UI/overlay 側の 100ms repeat state だけで実現し、decoder 側には通常の seek として流す。
 - 動画ブックマークの任意名称は `video_bookmarks.title` に保存する。左ジャンプパネルの
   ✏ 操作だけが名称を更新し、追加時は従来通り title=NULL のままにする。native DComp
-  overlay 側は `WM_CHAR` から egui `Event::Text` を渡し、独立 overlay 上の TextEdit で
-  編集してから UI thread の DB 更新イベントへ戻す。
+  overlay 側は `WM_CHAR` から egui `Event::Text` を渡すだけでなく、`WM_IME_*` を
+  egui `Event::Ime` に変換し、`PlatformOutput::ime` のカーソル矩形を IMM32 の
+  composition / candidate window 位置へ返す。これにより独立 overlay 上の TextEdit でも
+  日本語 IME の変換文字列・候補が入力位置に追従し、保存時だけ UI thread の DB 更新イベントへ戻す。
 - `fill_output` の bookkeeping (Phase 9 後の cleanup refactor):
   - **実消費サンプル数ベース**: `pop_front` で取り出した分 (= `real_consumed`) のみ
     `next_pts_secs` を進める。silence 出力中は pts 進行 0 (= 旧版の「常に full want

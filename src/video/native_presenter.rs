@@ -6,7 +6,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, RECT, WAIT_TIMEOUT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, POINT, RECT, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
 };
@@ -32,6 +32,10 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::Win32::System::Threading::WaitForSingleObject;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Input::Ime::{
+    CANDIDATEFORM, CFS_EXCLUDE, CFS_POINT, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext,
+    ImmSetCandidateWindow, ImmSetCompositionWindow,
+};
 use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 
@@ -109,6 +113,7 @@ struct NativeEguiOverlay {
     alpha_mode: wgpu::CompositeAlphaMode,
     renderer: egui_wgpu::Renderer,
     egui_ctx: egui::Context,
+    hwnd: HWND,
     started_at: Instant,
     pending_events: Vec<egui::Event>,
     modifiers: egui::Modifiers,
@@ -488,14 +493,15 @@ pub enum NativeOverlayCommand {
 impl NativeOverlayInputRouting {
     pub fn should_forward_to_ui(
         self,
-        event: crate::video::native_window::NativeVideoWindowEvent,
+        event: &crate::video::native_window::NativeVideoWindowEvent,
     ) -> bool {
         use crate::video::native_window::NativeVideoWindowEvent as NativeEvent;
 
         match event {
-            NativeEvent::KeyDown(_) | NativeEvent::KeyUp(_) | NativeEvent::Text(_) => {
-                !self.wants_keyboard_input
-            }
+            NativeEvent::KeyDown(_)
+            | NativeEvent::KeyUp(_)
+            | NativeEvent::Text(_)
+            | NativeEvent::Ime(_) => !self.wants_keyboard_input,
             NativeEvent::MouseMove(_)
             | NativeEvent::MouseButton(_)
             | NativeEvent::MouseWheel(_)
@@ -1747,6 +1753,7 @@ impl NativeEguiOverlay {
             alpha_mode,
             renderer,
             egui_ctx,
+            hwnd,
             started_at: Instant::now(),
             pending_events: Vec::new(),
             modifiers: egui::Modifiers::default(),
@@ -1839,13 +1846,13 @@ impl NativeEguiOverlay {
         events: &[crate::video::native_window::NativeVideoWindowEvent],
     ) {
         for event in events {
-            self.push_native_event(*event);
+            self.push_native_event(event.clone());
         }
     }
 
     fn push_native_event(&mut self, event: crate::video::native_window::NativeVideoWindowEvent) {
         use crate::video::native_window::{
-            NativeVideoMouseButton, NativeVideoWindowEvent as NativeEvent,
+            NativeVideoImeEvent, NativeVideoMouseButton, NativeVideoWindowEvent as NativeEvent,
         };
 
         self.event_count = self.event_count.saturating_add(1);
@@ -1867,6 +1874,16 @@ impl NativeEguiOverlay {
             }
             NativeEvent::Text(ch) => {
                 self.pending_events.push(egui::Event::Text(ch.to_string()));
+                self.dirty = true;
+            }
+            NativeEvent::Ime(ime) => {
+                let ime = match ime {
+                    NativeVideoImeEvent::Enabled => egui::ImeEvent::Enabled,
+                    NativeVideoImeEvent::Preedit(text) => egui::ImeEvent::Preedit(text),
+                    NativeVideoImeEvent::Commit(text) => egui::ImeEvent::Commit(text),
+                    NativeVideoImeEvent::Disabled => egui::ImeEvent::Disabled,
+                };
+                self.pending_events.push(egui::Event::Ime(ime));
                 self.dirty = true;
             }
             NativeEvent::MouseMove(mouse) => {
@@ -3198,6 +3215,7 @@ impl NativeEguiOverlay {
         self.top_bar_visible = top_bar_visible || side_panel_visible;
         self.right_panel_visible = right_panel_visible;
         self.jump_panel_visible = jump_panel_visible;
+        self.update_ime_cursor_area(full_output.platform_output.ime);
 
         let shape_count = full_output.shapes.len();
         for (id, image_delta) in &full_output.textures_delta.set {
@@ -3285,6 +3303,47 @@ impl NativeEguiOverlay {
             ],
         );
         Ok(commands)
+    }
+
+    fn update_ime_cursor_area(&self, ime: Option<egui::output::IMEOutput>) {
+        let Some(ime) = ime else {
+            return;
+        };
+        let ppp = self.pixels_per_point.max(1.0);
+        let cursor = ime.cursor_rect;
+        let x = (cursor.min.x * ppp).round() as i32;
+        let y = (cursor.min.y * ppp).round() as i32;
+        let width = (cursor.width().max(1.0) * ppp).round() as i32;
+        let height = (cursor.height().max(1.0) * ppp).round() as i32;
+        let rc_area = RECT {
+            left: x,
+            top: y,
+            right: x + width.max(1),
+            bottom: y + height.max(1),
+        };
+        let candidate_form = CANDIDATEFORM {
+            dwIndex: 0,
+            dwStyle: CFS_EXCLUDE,
+            ptCurrentPos: POINT { x, y },
+            rcArea: rc_area,
+        };
+        let composition_form = COMPOSITIONFORM {
+            dwStyle: CFS_POINT,
+            ptCurrentPos: POINT {
+                x,
+                y: rc_area.bottom,
+            },
+            rcArea: rc_area,
+        };
+        unsafe {
+            let himc = ImmGetContext(self.hwnd);
+            if himc.0.is_null() {
+                return;
+            }
+            let _ = ImmSetCompositionWindow(himc, &composition_form);
+            let _ = ImmSetCandidateWindow(himc, &candidate_form);
+            let _ = ImmReleaseContext(self.hwnd, himc);
+        }
     }
 }
 
