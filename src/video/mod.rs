@@ -104,6 +104,9 @@ pub struct VideoPlayer {
     /// 最後に実際へ表示したフレームの source pts。スクリーンショットとフレーム送りは
     /// 再生クロックではなく「見えているフレーム」を基準にする。
     last_displayed_pts_bits: Arc<AtomicU64>,
+    /// フレーム送りで最後に発行した precise seek target。seek 完了前に連続入力された
+    /// ときも同じ表示フレームを基準にせず、発行済み target から次の target を積む。
+    frame_step_target_bits: AtomicU64,
     /// Native overlay HUD が UI thread を経由せず duration を読めるように共有する。
     /// f64::to_bits() / from_bits() で保持し、InfoReceived 時に一度更新する。
     #[cfg(windows)]
@@ -1908,6 +1911,17 @@ pub(crate) fn frame_step_interval_secs(avg_fps: f64) -> f64 {
     }
 }
 
+fn frame_step_base_secs(
+    pending_step_target: Option<f64>,
+    last_displayed_pts: Option<f64>,
+    current_position: f64,
+) -> f64 {
+    pending_step_target
+        .or(last_displayed_pts)
+        .unwrap_or(current_position)
+        .max(0.0)
+}
+
 impl VideoPlayer {
     fn repaint_prewake_secs(&self) -> f64 {
         let fps = self.info.as_ref().map(|i| i.avg_fps).unwrap_or(0.0);
@@ -1973,6 +1987,7 @@ impl VideoPlayer {
                 first_frame_event_last_epoch: None,
                 displayed_frame_seq: Arc::new(AtomicU64::new(0)),
                 last_displayed_pts_bits: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
+                frame_step_target_bits: AtomicU64::new(f64::NAN.to_bits()),
                 decoder_dropped_full_count: Arc::new(AtomicU64::new(0)),
                 ui_dropped_past_count: AtomicU64::new(0),
                 cancel: Arc::new(AtomicBool::new(true)),
@@ -2120,6 +2135,7 @@ impl VideoPlayer {
             first_frame_event_last_epoch: None,
             displayed_frame_seq,
             last_displayed_pts_bits,
+            frame_step_target_bits: AtomicU64::new(f64::NAN.to_bits()),
             #[cfg(windows)]
             duration_secs_bits,
             decoder_dropped_full_count,
@@ -2285,6 +2301,7 @@ impl VideoPlayer {
         // EOF で停止中に Space を押されたら 0 から再生し直す (replay)。
         // 通常の再生中は単純トグル。
         if !self.clock.is_playing() && self.clock.is_eof_reached() {
+            self.clear_frame_step_target();
             self.clock.request_seek(0.0);
             self.clear_audio_output_buffer();
             self.clock.set_playing(true);
@@ -2309,6 +2326,9 @@ impl VideoPlayer {
         // EngineState::parks_decoder() が立たないので decoder 側の pause-park 経路と
         // 食い違っていた。
         let new_playing = !self.clock.is_playing();
+        if new_playing {
+            self.clear_frame_step_target();
+        }
         self.clock.set_playing(new_playing);
         self.dispatch_play_pause(new_playing);
     }
@@ -2322,6 +2342,9 @@ impl VideoPlayer {
             self.decode.video_rx.len(),
             self.decode.audio_rx.len()
         ));
+        if p {
+            self.clear_frame_step_target();
+        }
         self.clock.set_playing(p);
         // Phase 9.C: engine 状態も同期。set_playing は外部 API なので呼び出し元が
         // 既に engine.apply_command を呼んでいるケースがあるが、apply_command は
@@ -2356,6 +2379,7 @@ impl VideoPlayer {
     /// 一時停止中なら自動的に再生再開する (post-EOF / pause からの seek を
     /// ユーザー操作 1 回で完結させる)。
     pub fn seek(&self, target_secs: f64) {
+        self.clear_frame_step_target();
         let clamped = self.clamp_seek_target(target_secs);
         crate::logger::log(format!(
             "[video-debug] seek({target_secs:.3}) called: clamped={clamped:.3} engine_state={} prev_seek_serial={} playing={} video_rx_len={} audio_rx_len={}",
@@ -2396,6 +2420,7 @@ impl VideoPlayer {
     /// なる。0〜3 秒の wall 経過で audio が target に追いつき完全同期する。
     /// 一時停止中なら自動的に再生再開する。
     pub fn seek_relative(&self, delta_secs: f64) {
+        self.clear_frame_step_target();
         let cur = self.position();
         let raw = (cur + delta_secs).max(0.0);
         let target = self.clamp_seek_target(raw);
@@ -2415,6 +2440,11 @@ impl VideoPlayer {
 
     /// フレーム送り用の精密シーク。到着後は必ず一時停止状態に保つ。
     pub fn seek_paused(&self, target_secs: f64) {
+        self.clear_frame_step_target();
+        self.seek_paused_internal(target_secs);
+    }
+
+    fn seek_paused_internal(&self, target_secs: f64) {
         let clamped = self.clamp_seek_target(target_secs);
         self.clock.request_seek(clamped);
         self.clear_audio_output_buffer();
@@ -2429,10 +2459,16 @@ impl VideoPlayer {
         if direction == 0 {
             return;
         }
-        let base = self.last_displayed_pts().unwrap_or_else(|| self.position());
+        let base = frame_step_base_secs(
+            self.frame_step_target(),
+            self.last_displayed_pts(),
+            self.position(),
+        );
         let step = frame_step_interval_secs(self.info.as_ref().map(|i| i.avg_fps).unwrap_or(0.0));
-        let target = base + step * direction.signum() as f64;
-        self.seek_paused(target);
+        let target = self.clamp_seek_target(base + step * direction.signum() as f64);
+        self.frame_step_target_bits
+            .store(target.to_bits(), Ordering::Release);
+        self.seek_paused_internal(target);
     }
 
     /// シーク target を `[0, duration - 0.1s)` にクランプする。duration が
@@ -2462,6 +2498,20 @@ impl VideoPlayer {
         } else {
             None
         }
+    }
+
+    fn frame_step_target(&self) -> Option<f64> {
+        let pts = f64::from_bits(self.frame_step_target_bits.load(Ordering::Acquire));
+        if pts.is_finite() {
+            Some(pts.max(0.0))
+        } else {
+            None
+        }
+    }
+
+    fn clear_frame_step_target(&self) {
+        self.frame_step_target_bits
+            .store(f64::NAN.to_bits(), Ordering::Release);
     }
 
     pub fn duration(&self) -> f64 {
@@ -3280,5 +3330,19 @@ mod tests {
     fn frame_step_interval_falls_back_to_30fps() {
         let step = super::frame_step_interval_secs(0.0);
         assert!((step - (1.0 / 30.0)).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn frame_step_base_prefers_pending_target() {
+        let base = super::frame_step_base_secs(Some(10.0), Some(20.0), 30.0);
+        assert!((base - 10.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn frame_step_base_falls_back_to_displayed_then_position() {
+        let displayed = super::frame_step_base_secs(None, Some(20.0), 30.0);
+        assert!((displayed - 20.0).abs() < 1.0e-9);
+        let position = super::frame_step_base_secs(None, None, 30.0);
+        assert!((position - 30.0).abs() < 1.0e-9);
     }
 }

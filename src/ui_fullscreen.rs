@@ -2272,6 +2272,33 @@ impl App {
         // 選択操作を優先、Codex Phase 5.1 P2 反映)。
         let is_video_fs = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
             && self.fs_context_menu_idx.is_none();
+        let video_horizontal_arrow_key = is_video_fs
+            && ctx.input(|i| {
+                i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::ArrowLeft | egui::Key::ArrowRight,
+                            pressed: true,
+                            ..
+                        }
+                    )
+                })
+            });
+        let video_shift_vertical_key = is_video_fs
+            && ctx.input(|i| {
+                i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Key {
+                            key: egui::Key::ArrowUp | egui::Key::ArrowDown,
+                            pressed: true,
+                            modifiers,
+                            ..
+                        } if modifiers.shift
+                    )
+                })
+            });
         if is_video_fs {
             let video_path = if let Some(GridItem::Video(p)) = self.items.get(fs_idx) {
                 Some(p.clone())
@@ -2293,20 +2320,24 @@ impl App {
         let mouse_back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1));
         let mouse_forward = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra2));
         let arrow_right = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
-                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight)
+            !video_horizontal_arrow_key
+                && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
+                    || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight))
         });
         let arrow_left = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
-                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft)
+            !video_horizontal_arrow_key
+                && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
+                    || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft))
         });
         let arrow_down = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
-                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown)
+            !video_shift_vertical_key
+                && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowDown)
+                    || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown))
         });
         let arrow_up = ctx.input_mut(|i| {
-            i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
-                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp)
+            !video_shift_vertical_key
+                && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowUp)
+                    || i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp))
         });
         let key_home = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Home));
         let key_end = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::End));
@@ -4933,7 +4964,11 @@ fn handle_frame_step_button(
     hold: &mut Option<crate::app::VideoFrameStepHold>,
     request: &mut Option<i32>,
 ) -> bool {
-    let down = response.is_pointer_button_down_on();
+    let primary_down = ctx.input(|i| i.pointer.primary_down());
+    let held_from_this_button = hold
+        .as_ref()
+        .is_some_and(|state| state.fs_idx == fs_idx && state.direction == direction);
+    let down = response.is_pointer_button_down_on() || (primary_down && held_from_this_button);
     if !down {
         return false;
     }
@@ -6009,16 +6044,26 @@ impl App {
                 egui::Key::ArrowRight,
             )
         });
-        let shift_left =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft));
-        let shift_right =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight));
-        let ctrl_left =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft));
-        let ctrl_right =
-            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight));
-        let left = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft));
-        let right = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight));
+        let frame_step_key = ctrl_shift_left || ctrl_shift_right;
+        let ctrl_shift_held_now = ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift);
+        let shift_left = !frame_step_key
+            && !ctrl_shift_held_now
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft));
+        let shift_right = !frame_step_key
+            && !ctrl_shift_held_now
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight));
+        let ctrl_left = !frame_step_key
+            && !ctrl_shift_held_now
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft));
+        let ctrl_right = !frame_step_key
+            && !ctrl_shift_held_now
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight));
+        let left = !frame_step_key
+            && !ctrl_shift_held_now
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft));
+        let right = !frame_step_key
+            && !ctrl_shift_held_now
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight));
         let shift_up = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowUp));
         let shift_down =
             ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowDown));

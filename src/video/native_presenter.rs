@@ -3883,7 +3883,11 @@ fn draw_native_frame_step_button(
     draw_overlay_button_bg(painter, rect, resp.hovered(), false);
     draw_overlay_frame_step_icon(painter, rect, direction);
     let resp = resp.on_hover_text(tooltip);
-    let down = resp.is_pointer_button_down_on();
+    let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
+    let held_from_this_button = hold
+        .as_ref()
+        .is_some_and(|state| state.direction == direction);
+    let down = resp.is_pointer_button_down_on() || (primary_down && held_from_this_button);
     let now = Instant::now();
     if down {
         match hold {

@@ -219,7 +219,9 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   既存の CF_DIB clipboard helper へ渡す。メイン decode queue / native presenter の GPU
   surface には触れないため、D3D11VA / CPU fallback / native DComp 経路で同じ操作にできる。
 - 前/次フレーム送りは `VideoPlayer::step_frame()` が `avg_fps` から 1 frame 秒を求め、
-  `seek_paused()` で precise seek + pause を発行する。上部ボタン長押しは UI/overlay 側の
+  precise seek + pause を発行する。連続入力中は「最後に表示されたフレーム」ではなく
+  「最後に発行した frame-step target」を基準にして target を積み、seek 完了前の
+  連打 / 長押しでも同じ位置へ再 seek しない。上部ボタン長押しは UI/overlay 側の
   100ms repeat state だけで実現し、decoder 側には通常の seek として流す。
 - 動画ブックマークの任意名称は `video_bookmarks.title` に保存する。左ジャンプパネルの
   ✏ 操作だけが名称を更新し、追加時は従来通り title=NULL のままにする。native DComp
