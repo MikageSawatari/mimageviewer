@@ -10992,6 +10992,7 @@ impl App {
     pub(crate) fn close_fullscreen(&mut self) {
         // フルスクリーン解除前に動画再生位置を保存 (drop で消える前に)
         self.save_all_video_resume_positions();
+        self.restore_grid_cursor_to_fullscreen_item();
         #[cfg(windows)]
         {
             self.vst3_deferred_video_open = None;
@@ -11140,6 +11141,24 @@ impl App {
                 ],
             );
         }
+    }
+
+    /// フルスクリーン終了後のグリッドカーソルを、最後に表示していた item に戻す。
+    ///
+    /// グリッドでダブルクリックした時点の `selected` と、フルスクリーン側で現在表示中の
+    /// `fullscreen_idx` は別々に進むことがある。終了時に同期しておくと、動画を右クリックで
+    /// 閉じた場合も画像と同じく「今見ていた場所」へスクロールして戻れる。
+    fn restore_grid_cursor_to_fullscreen_item(&mut self) {
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        if self.items.get(idx).is_none() {
+            return;
+        }
+        self.selected = Some(idx);
+        self.scroll_to_selected = true;
+        self.update_last_selected_image();
+        self.redirect_selected_to_visible();
     }
 
     // -------------------------------------------------------------------
@@ -19984,6 +20003,42 @@ mod favorite_adjustment_defaults_tests {
         assert!(
             app.select_after_load.is_none(),
             "見つからなかった場合でもヒントは消費する (持ち越さない)"
+        );
+    }
+
+    /// フルスクリーンを閉じたとき、グリッド側のカーソルを最後に表示していた item へ
+    /// 戻すこと。動画は fullscreen 中に `selected` が更新されない経路があるため、
+    /// 右クリック終了で元のサムネイル位置へ戻れない不具合の回帰ガード。
+    #[test]
+    fn close_fullscreen_restores_grid_cursor_to_current_video() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.items
+            .push(GridItem::Video(std::path::PathBuf::from("c:/p/movie.mp4")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+
+        app.selected = Some(0);
+        app.scroll_to_selected = false;
+        app.fullscreen_idx = Some(1);
+
+        app.close_fullscreen();
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(
+            app.selected,
+            Some(1),
+            "動画終了時も表示中だった動画セルへカーソルを戻す"
+        );
+        assert!(
+            app.scroll_to_selected,
+            "次のグリッド描画で選択セルへスクロールする"
         );
     }
 
