@@ -840,7 +840,8 @@ pub struct Settings {
     #[serde(default)]
     pub video_hw_decode: bool,
     /// インターレース動画のデインターレース処理。
-    /// Auto は FFmpeg frame の interlaced flag が立ったフレームのみ bwdif を適用する。
+    /// Auto は FFmpeg frame の interlaced flag または stream field_order が
+    /// interlaced を示す場合に bwdif を適用する。
     #[serde(default)]
     pub video_deinterlace: VideoDeinterlaceMode,
     /// 動画グリッドサムネに、同名ファイル名の画像 (= sidecar、例 movie.mp4 の隣の
@@ -989,7 +990,7 @@ impl VideoAutoplayMode {
 /// 動画再生時のデインターレース設定。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum VideoDeinterlaceMode {
-    /// デコードフレームが interlaced と示しているときだけ bwdif を適用する。
+    /// デコードフレームまたはストリームが interlaced と示しているときだけ bwdif を適用する。
     #[default]
     Auto,
     /// 常に bwdif を適用する。メタデータが壊れている素材向け。

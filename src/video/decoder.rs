@@ -747,6 +747,38 @@ fn bwdif_filter_key(
     }
 }
 
+fn field_order_is_interlaced(field_order: ffmpeg_the_third::FieldOrder) -> bool {
+    matches!(
+        field_order,
+        ffmpeg_the_third::FieldOrder::TT
+            | ffmpeg_the_third::FieldOrder::BB
+            | ffmpeg_the_third::FieldOrder::TB
+            | ffmpeg_the_third::FieldOrder::BT
+    )
+}
+
+fn should_try_deinterlace(
+    mode: crate::settings::VideoDeinterlaceMode,
+    frame_interlaced: bool,
+    stream_interlaced: bool,
+    failure_logged: bool,
+) -> bool {
+    mode.is_enabled()
+        && !failure_logged
+        && (mode.force_all_frames() || frame_interlaced || stream_interlaced)
+}
+
+fn bwdif_force_all_frames(
+    mode: crate::settings::VideoDeinterlaceMode,
+    frame_interlaced: bool,
+    stream_interlaced: bool,
+) -> bool {
+    mode.force_all_frames()
+        || (mode == crate::settings::VideoDeinterlaceMode::Auto
+            && stream_interlaced
+            && !frame_interlaced)
+}
+
 fn drain_pending_video_packets(
     pending_video_packets: &mut VecDeque<QueuedVideoPacket>,
     pending_video_packet_bytes: &mut usize,
@@ -1130,6 +1162,8 @@ fn run_decoder(
             return;
         }
     };
+    let video_field_order = video_params_owned.field_order();
+    let video_stream_interlaced = field_order_is_interlaced(video_field_order);
     // ── HW デコード初期化 (D3D11VA) ──
     // 失敗時は黙って SW デコードに落ちる。`hw_device` を _hw_device で持って Drop 時に
     // unref されるようにし、AVCodecContext は内部でさらに ref を取るので競合しない。
@@ -1367,7 +1401,7 @@ fn run_decoder(
     let _ = info_tx.send(Ok(info));
 
     crate::logger::log(format!(
-        "video decoder: codec={stream_codec_name} decoder={video_decoder_name} hw_requested={hw_decode_requested} hw_effective={effective_hw_decode_requested} d3d11va_supported={} hw_active_initially={hw_active_initially} gpu_path={gpu_path_active} d3d11va_config={}",
+        "video decoder: codec={stream_codec_name} decoder={video_decoder_name} hw_requested={hw_decode_requested} hw_effective={effective_hw_decode_requested} d3d11va_supported={} hw_active_initially={hw_active_initially} gpu_path={gpu_path_active} field_order={video_field_order:?} stream_interlaced={video_stream_interlaced} d3d11va_config={}",
         hw_probe.d3d11va_supported, hw_probe.d3d11va_config
     ));
 
@@ -1454,6 +1488,14 @@ fn run_decoder(
                 (
                     "d3d11va_config",
                     serde_json::Value::from(hw_probe.d3d11va_config),
+                ),
+                (
+                    "field_order",
+                    serde_json::Value::from(format!("{video_field_order:?}")),
+                ),
+                (
+                    "stream_interlaced",
+                    serde_json::Value::from(video_stream_interlaced),
                 ),
                 ("avg_fps", serde_json::Value::from(video_avg_fps)),
                 ("duration_secs", serde_json::Value::from(duration_secs)),
@@ -1588,6 +1630,7 @@ fn run_decoder(
                     video_fps_den,
                     hw_active_initially,
                     deinterlace,
+                    video_stream_interlaced,
                 )
             })
             .expect("spawn video-decode thread")
@@ -2193,6 +2236,7 @@ fn run_video_decode(
     video_fps_den: u32,
     hw_active_initially: bool,
     deinterlace: crate::settings::VideoDeinterlaceMode,
+    stream_interlaced: bool,
 ) {
     use ffmpeg::format::Pixel;
     use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
@@ -2473,9 +2517,12 @@ fn run_video_decode(
             // 出力は NT 共有 ID3D11Texture2D で wgpu (egui) 側から sample される。
             #[cfg(windows)]
             if matches!(frame.format(), Pixel::D3D11) {
-                let deinterlace_wants_cpu = deinterlace.is_enabled()
-                    && !deinterlace_failure_logged
-                    && (deinterlace.force_all_frames() || frame.is_interlaced());
+                let deinterlace_wants_cpu = should_try_deinterlace(
+                    deinterlace,
+                    frame.is_interlaced(),
+                    stream_interlaced,
+                    deinterlace_failure_logged,
+                );
                 if deinterlace_wants_cpu {
                     if !deinterlace_cpu_fallback_logged {
                         crate::logger::log(
@@ -2898,12 +2945,16 @@ fn run_video_decode(
 
             let mut filtered_owned: Option<Video> = None;
             let mut pts_secs_for_output = pts_secs;
-            let should_try_deinterlace = deinterlace.is_enabled()
-                && !deinterlace_failure_logged
-                && (deinterlace.force_all_frames() || frame_for_scaler.is_interlaced());
-            if should_try_deinterlace {
+            let frame_interlaced = frame_for_scaler.is_interlaced();
+            if should_try_deinterlace(
+                deinterlace,
+                frame_interlaced,
+                stream_interlaced,
+                deinterlace_failure_logged,
+            ) {
                 let key = bwdif_filter_key(frame_for_scaler, video_tb_num_i32, video_tb_den_i32);
-                let force_all_frames = deinterlace.force_all_frames();
+                let force_all_frames =
+                    bwdif_force_all_frames(deinterlace, frame_interlaced, stream_interlaced);
                 let needs_new_graph = deinterlacer
                     .as_ref()
                     .is_none_or(|f| !f.matches(key, force_all_frames));
@@ -4842,10 +4893,13 @@ fn try_gpu_blit_path(
 #[cfg(test)]
 mod decoder_candidate_tests {
     use super::{
-        BwdifFilterKey, DecoderChoice, bwdif_filter_key, normalize_audio_input_layout,
-        preferred_video_decoders, selected_video_rate,
+        BwdifFilterKey, DecoderChoice, bwdif_filter_key, bwdif_force_all_frames,
+        field_order_is_interlaced, normalize_audio_input_layout, preferred_video_decoders,
+        selected_video_rate, should_try_deinterlace,
     };
+    use crate::settings::VideoDeinterlaceMode;
     use ffmpeg_the_third::ChannelLayout;
+    use ffmpeg_the_third::FieldOrder;
     use ffmpeg_the_third::codec::Id;
     use ffmpeg_the_third::format::Pixel;
     use ffmpeg_the_third::util::frame::video::Video;
@@ -4915,6 +4969,66 @@ mod decoder_candidate_tests {
             ffmpeg_the_third::Rational(24, 1),
         );
         assert_eq!(rate, Some((24, 1)));
+    }
+
+    #[test]
+    fn field_order_marks_interlaced_streams() {
+        for order in [
+            FieldOrder::TT,
+            FieldOrder::BB,
+            FieldOrder::TB,
+            FieldOrder::BT,
+        ] {
+            assert!(field_order_is_interlaced(order), "{order:?}");
+        }
+        assert!(!field_order_is_interlaced(FieldOrder::Progressive));
+        assert!(!field_order_is_interlaced(FieldOrder::Unknown));
+    }
+
+    #[test]
+    fn auto_deinterlace_uses_stream_field_order_hint() {
+        assert!(should_try_deinterlace(
+            VideoDeinterlaceMode::Auto,
+            false,
+            true,
+            false
+        ));
+        assert!(bwdif_force_all_frames(
+            VideoDeinterlaceMode::Auto,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn auto_deinterlace_keeps_frame_flag_mode_when_available() {
+        assert!(should_try_deinterlace(
+            VideoDeinterlaceMode::Auto,
+            true,
+            false,
+            false
+        ));
+        assert!(!bwdif_force_all_frames(
+            VideoDeinterlaceMode::Auto,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn off_and_failure_disable_deinterlace() {
+        assert!(!should_try_deinterlace(
+            VideoDeinterlaceMode::Off,
+            true,
+            true,
+            false
+        ));
+        assert!(!should_try_deinterlace(
+            VideoDeinterlaceMode::Auto,
+            true,
+            true,
+            true
+        ));
     }
 
     #[test]

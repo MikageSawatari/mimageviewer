@@ -39,7 +39,7 @@ FFmpeg HW decoder (D3D11VA)
     ↓
 AVFrame (format = AV_PIX_FMT_D3D11、data[0]=ID3D11Texture2D*、data[1]=subresource)
     ↓
-ID3D11VideoProcessor (NV12/P010 → SDR BGRA8、bicubic。現状 GPU 経路のデインターレースは未実装)
+ID3D11VideoProcessor (NV12/P010 → SDR BGRA8、bicubic。現状 GPU 経路のデインターレースは未実装。Auto/On が必要なフレーム/ストリームは CPU bwdif 経路へ fallback)
     ↓
 NT 共有 ID3D11Texture2D (BGRA8、KEYEDMUTEX 付き)
     ↓
@@ -65,7 +65,7 @@ AVFrame
     ↓
 av_hwframe_transfer_data (HW のとき、GPU→CPU、12.5MB/frame@4K)
     ↓
-libavfilter bwdif (設定が Auto/On かつ対象フレームの場合。send_frame、フレームレート維持)
+libavfilter bwdif (設定が Auto/On かつ対象フレーム/ストリームの場合。Auto は frame interlaced flag と stream field_order を参照。send_frame、フレームレート維持)
     ↓
 swscale (NV12/YUV → RGBA、CPU で 24MB allocation)
     ↓
@@ -362,7 +362,7 @@ pub enum VideoFrameData {
 - `Settings.video_loop` (ループ再生)
 - `Settings.video_resume_position` (シーク位置の永続化、ファイル単位)
 - `Settings.video_hw_decode` (HW デコードを試みるかのフラグ、トラブルシュート用)
-- `Settings.video_deinterlace` (Off / Auto / On。CPU 経路で FFmpeg `bwdif=mode=send_frame` を適用)
+- `Settings.video_deinterlace` (Off / Auto / On。CPU 経路で FFmpeg `bwdif=mode=send_frame` を適用。Auto は frame interlaced flag と stream field_order を参照)
 
 ## 配布要件
 
