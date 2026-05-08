@@ -1345,6 +1345,14 @@ pub(crate) struct VideoBookmarkTitleEditor {
     pub(crate) request_focus: bool,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct FullscreenVideoMarkerCache {
+    pub(crate) fs_idx: usize,
+    pub(crate) path: PathBuf,
+    pub(crate) pin_pts: Option<f64>,
+    pub(crate) bookmarks: Vec<crate::video_bookmarks::VideoBookmarkMeta>,
+}
+
 pub struct App {
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
@@ -1878,6 +1886,9 @@ pub struct App {
     pub(crate) video_pin_status: Option<(String, std::time::Instant)>,
     /// 左ジャンプパネルのブックマーク名称編集ダイアログ。
     pub(crate) video_bookmark_title_editor: Option<VideoBookmarkTitleEditor>,
+    /// フルスクリーン動画のピン / ブックマークキャッシュ。
+    /// `App::update` とシークバー描画中に SQLite SELECT を毎フレーム走らせない。
+    pub(crate) fullscreen_video_marker_cache: Option<FullscreenVideoMarkerCache>,
     /// 動画再生中の FPS / フレーム間隔オーバーレイ (P キーで トグル)。
     pub(crate) video_perf_overlay_visible: bool,
     /// 直近 N フレームの perf overlay サンプル。
@@ -2843,6 +2854,7 @@ impl Default for App {
             video_thumb_overrides_dirty: false,
             video_pin_status: None,
             video_bookmark_title_editor: None,
+            fullscreen_video_marker_cache: None,
             video_perf_overlay_visible: false,
             video_perf_history: std::collections::VecDeque::with_capacity(200),
             video_perf_last_wall: None,
@@ -3125,6 +3137,74 @@ impl App {
         self.items.push(item);
         self.thumbnails.push(ThumbnailState::Pending);
         idx
+    }
+
+    pub(crate) fn refresh_fullscreen_video_marker_cache(&mut self, fs_idx: usize) {
+        let Some(path) = self.fullscreen_video_marker_path(fs_idx) else {
+            if self.fullscreen_idx == Some(fs_idx) {
+                self.fullscreen_video_marker_cache = None;
+            }
+            return;
+        };
+        let pin_pts = self
+            .video_pin_db
+            .as_ref()
+            .and_then(|db| db.lookup_pts(&path));
+        let bookmarks = self
+            .video_bookmark_db
+            .as_ref()
+            .map(|db| db.list_marker_entries(&path))
+            .unwrap_or_default();
+        self.fullscreen_video_marker_cache = Some(FullscreenVideoMarkerCache {
+            fs_idx,
+            path,
+            pin_pts,
+            bookmarks,
+        });
+    }
+
+    pub(crate) fn ensure_fullscreen_video_marker_cache(&mut self, fs_idx: usize) {
+        let expected_path = self.fullscreen_video_marker_path(fs_idx);
+        let cache_matches = match (self.fullscreen_video_marker_cache.as_ref(), &expected_path) {
+            (Some(cache), Some(path)) => cache.fs_idx == fs_idx && cache.path == *path,
+            (None, None) => true,
+            _ => false,
+        };
+        if !cache_matches {
+            self.refresh_fullscreen_video_marker_cache(fs_idx);
+        }
+    }
+
+    fn fullscreen_video_marker_path(&self, fs_idx: usize) -> Option<PathBuf> {
+        self.fs_video_player(fs_idx)
+            .map(|player| player.path().clone())
+            .or_else(|| match self.items.get(fs_idx) {
+                Some(GridItem::Video(path)) => Some(path.clone()),
+                _ => None,
+            })
+    }
+
+    pub(crate) fn fullscreen_video_marker_snapshot(
+        &self,
+        fs_idx: usize,
+        path: &Path,
+    ) -> (Option<f64>, Vec<crate::video_bookmarks::VideoBookmarkMeta>) {
+        if let Some(cache) = self.fullscreen_video_marker_cache.as_ref()
+            && cache.fs_idx == fs_idx
+            && cache.path == path
+        {
+            return (cache.pin_pts, cache.bookmarks.clone());
+        }
+        let pin_pts = self
+            .video_pin_db
+            .as_ref()
+            .and_then(|db| db.lookup_pts(path));
+        let bookmarks = self
+            .video_bookmark_db
+            .as_ref()
+            .map(|db| db.list_marker_entries(path))
+            .unwrap_or_default();
+        (pin_pts, bookmarks)
     }
 
     /// パフォーマンス計装用の input_seq を +1 してユーザー入力イベントを記録する。
@@ -8768,6 +8848,7 @@ impl App {
         // スタックで管理する (画像移動でさらにクリアされる)。
         self.clear_meta_undo();
         self.fullscreen_idx = Some(idx);
+        self.refresh_fullscreen_video_marker_cache(idx);
         #[cfg(windows)]
         if self.native_video_fullscreen_active_for_main_backdrop() {
             // 黒 chrome は fullscreen/backdrop viewport を描画した後の update 末尾で
@@ -11075,6 +11156,7 @@ impl App {
             }
         }
         self.fullscreen_idx = None;
+        self.fullscreen_video_marker_cache = None;
         self.fs_viewport_recreate_after_hide = true;
         // ※ ここで `fs_nav_locked` / `fs_holdover_tex` を即時クリアしてはいけない:
         //   `apply_folder_nav_result` の Fullscreen 分岐は close_fullscreen → load_folder
@@ -13743,10 +13825,10 @@ impl App {
         let Some(path) = path else {
             return;
         };
+        self.ensure_fullscreen_video_marker_cache(fs_idx);
         let pinned = self
-            .video_pin_db
-            .as_ref()
-            .and_then(|db| db.lookup_pts(&path))
+            .fullscreen_video_marker_snapshot(fs_idx, &path)
+            .0
             .is_some();
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_native_hover_preview_pinned(pinned);
@@ -13755,7 +13837,8 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn sync_native_video_timeline_markers(&self, fs_idx: usize) {
+    pub(crate) fn sync_native_video_timeline_markers(&mut self, fs_idx: usize) {
+        self.ensure_fullscreen_video_marker_cache(fs_idx);
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return;
         };
@@ -13770,6 +13853,7 @@ impl App {
         let mut markers: Vec<crate::video::native_presenter::NativeOverlayTimelineMarker> =
             Vec::new();
         let mut entries: Vec<crate::video::native_presenter::NativeOverlayJumpEntry> = Vec::new();
+        let (pin_pts, bookmarks) = self.fullscreen_video_marker_snapshot(fs_idx, &path);
 
         let requested_thumb = std::cell::Cell::new(false);
         let make_thumbnail =
@@ -13789,11 +13873,7 @@ impl App {
                 }
             };
 
-        if let Some(pts_secs) = self
-            .video_pin_db
-            .as_ref()
-            .and_then(|db| db.lookup_pts(&path))
-        {
+        if let Some(pts_secs) = pin_pts {
             markers.push(
                 crate::video::native_presenter::NativeOverlayTimelineMarker {
                     pts_secs,
@@ -13808,20 +13888,20 @@ impl App {
                 thumbnail: make_thumbnail(pts_secs),
             });
         }
-        if let Some(db) = self.video_bookmark_db.as_ref() {
-            for bookmark in db.list(&path) {
-                markers.push(crate::video::native_presenter::NativeOverlayTimelineMarker {
+        for bookmark in bookmarks {
+            markers.push(
+                crate::video::native_presenter::NativeOverlayTimelineMarker {
                     pts_secs: bookmark.pts_secs,
                     kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Bookmark,
-                });
-                entries.push(crate::video::native_presenter::NativeOverlayJumpEntry {
-                    pts_secs: bookmark.pts_secs,
-                    kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Bookmark,
-                    title: bookmark.title.clone(),
-                    bookmark_id: Some(bookmark.id),
-                    thumbnail: make_thumbnail(bookmark.pts_secs),
-                });
-            }
+                },
+            );
+            entries.push(crate::video::native_presenter::NativeOverlayJumpEntry {
+                pts_secs: bookmark.pts_secs,
+                kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Bookmark,
+                title: bookmark.title.clone(),
+                bookmark_id: Some(bookmark.id),
+                thumbnail: make_thumbnail(bookmark.pts_secs),
+            });
         }
         for chapter in chapters {
             markers.push(
@@ -14245,6 +14325,7 @@ impl App {
             if let Err(e) = db.remove(id) {
                 crate::logger::log(format!("video bookmark remove failed: {e}"));
             } else {
+                self.refresh_fullscreen_video_marker_cache(fs_idx);
                 self.sync_native_video_timeline_markers(fs_idx);
             }
         }
@@ -14266,6 +14347,7 @@ impl App {
             if let Err(e) = db.update_title(id, Some(&title)) {
                 crate::logger::log(format!("video bookmark title update failed: {e}"));
             } else {
+                self.refresh_fullscreen_video_marker_cache(fs_idx);
                 self.sync_native_video_timeline_markers(fs_idx);
             }
         }
@@ -14296,6 +14378,7 @@ impl App {
                     "video bookmark added: pts={pts:.2}s {}",
                     path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
                 ));
+                self.refresh_fullscreen_video_marker_cache(fs_idx);
                 self.sync_native_video_timeline_markers(fs_idx);
             }
         }
@@ -14330,6 +14413,7 @@ impl App {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                         player.set_native_hover_preview_pinned(false);
                     }
+                    self.refresh_fullscreen_video_marker_cache(fs_idx);
                     self.sync_native_video_timeline_markers(fs_idx);
                     crate::logger::log(format!(
                         "video pin removed: {}",
@@ -14354,6 +14438,7 @@ impl App {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.set_native_hover_preview_pinned(true);
                 }
+                self.refresh_fullscreen_video_marker_cache(fs_idx);
                 self.sync_native_video_timeline_markers(fs_idx);
                 crate::logger::log(format!(
                     "video pin set: pts={pts:.2}s webp={}B {}",
@@ -14540,7 +14625,6 @@ impl App {
             // B: add video bookmark.
             0x42 if !key.shift && !key.ctrl && !key.repeat => {
                 self.add_native_video_bookmark(fs_idx, None);
-                self.sync_native_video_timeline_markers(fs_idx);
             }
             _ => {
                 hud_activity = false;

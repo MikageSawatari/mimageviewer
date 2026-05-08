@@ -17,7 +17,6 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::video::decoder::{Chapter, VideoInfo};
-use crate::video_bookmarks::VideoBookmark;
 
 /// 右側パネルの幅 (画像と揃える)。
 const VIDEO_PANEL_WIDTH: f32 = 380.0;
@@ -321,18 +320,8 @@ impl App {
         let Some(video_path) = video_path else {
             return false;
         };
-        let bookmarks: Vec<VideoBookmark> = self
-            .video_bookmark_db
-            .as_ref()
-            .map(|db| db.list(&video_path))
-            .unwrap_or_default();
-        // ピン位置を毎フレーム読み出してボタンラベル + ジャンプ行に反映する。
-        // BLOB を取り出さない `lookup_pts` を使うことで毎フレーム数十 KB の WebP を
-        // Vec 化するコストを回避 (simplify P1)。
-        let pin_pts: Option<f64> = self
-            .video_pin_db
-            .as_ref()
-            .and_then(|db| db.lookup_pts(&video_path));
+        self.ensure_fullscreen_video_marker_cache(fs_idx);
+        let (pin_pts, bookmarks) = self.fullscreen_video_marker_snapshot(fs_idx, &video_path);
         let chapters: Vec<Chapter> = match self.fs_cache.get(&fs_idx) {
             Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => player
                 .info()
@@ -591,7 +580,13 @@ impl App {
                 }
                 JumpPanelAction::DeleteBookmark(id) => {
                     if let Some(db) = self.video_bookmark_db.as_ref() {
-                        let _ = db.remove(id);
+                        if let Err(err) = db.remove(id) {
+                            crate::logger::log(format!("video bookmark remove failed: {err}"));
+                        } else {
+                            self.refresh_fullscreen_video_marker_cache(fs_idx);
+                            #[cfg(windows)]
+                            self.sync_native_video_timeline_markers(fs_idx);
+                        }
                     }
                 }
                 JumpPanelAction::EditBookmarkTitle { id, current_title } => {
@@ -819,13 +814,17 @@ impl App {
         if save || clear {
             if let Some(editor) = self.video_bookmark_title_editor.take() {
                 let title = if clear { String::new() } else { editor.title };
-                if let Some(db) = self.video_bookmark_db.as_ref()
-                    && let Err(err) = db.update_title(editor.id, Some(&title))
-                {
-                    crate::logger::log(format!(
-                        "video bookmark title update failed: id={} {err}",
-                        editor.id
-                    ));
+                if let Some(db) = self.video_bookmark_db.as_ref() {
+                    if let Err(err) = db.update_title(editor.id, Some(&title)) {
+                        crate::logger::log(format!(
+                            "video bookmark title update failed: id={} {err}",
+                            editor.id
+                        ));
+                    } else {
+                        self.refresh_fullscreen_video_marker_cache(editor.fs_idx);
+                        #[cfg(windows)]
+                        self.sync_native_video_timeline_markers(editor.fs_idx);
+                    }
                 }
             }
         }
@@ -859,12 +858,16 @@ impl App {
             self.set_pin_status("✗ 動画情報がまだ読めていません");
             return;
         };
+        self.ensure_fullscreen_video_marker_cache(fs_idx);
+        let already_pinned = self
+            .fullscreen_video_marker_snapshot(fs_idx, &path)
+            .0
+            .is_some();
         let Some(db) = self.video_pin_db.as_ref() else {
             crate::logger::log("video pin: DB not open".to_string());
             self.set_pin_status("✗ DB を開けません");
             return;
         };
-        let already_pinned = db.lookup(&path).is_some();
         if already_pinned {
             if let Err(e) = db.remove(&path) {
                 crate::logger::log(format!("video pin remove failed: {e}"));
@@ -876,6 +879,9 @@ impl App {
                 ));
                 self.set_pin_status("✓ ピン留めを解除しました");
                 self.video_thumb_overrides_dirty = true;
+                self.refresh_fullscreen_video_marker_cache(fs_idx);
+                #[cfg(windows)]
+                self.sync_native_video_timeline_markers(fs_idx);
             }
             return;
         }
@@ -923,6 +929,9 @@ impl App {
                 self.set_pin_status("✓ サムネを更新しました");
             }
             self.video_thumb_overrides_dirty = true;
+            self.refresh_fullscreen_video_marker_cache(fs_idx);
+            #[cfg(windows)]
+            self.sync_native_video_timeline_markers(fs_idx);
         }
     }
 
@@ -955,6 +964,9 @@ impl App {
                     "video bookmark added: pts={pts:.2}s {}",
                     path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
                 ));
+                self.refresh_fullscreen_video_marker_cache(fs_idx);
+                #[cfg(windows)]
+                self.sync_native_video_timeline_markers(fs_idx);
             }
         }
     }

@@ -42,6 +42,14 @@ pub struct VideoBookmark {
     pub thumb_webp: Vec<u8>,
 }
 
+/// シークバーマーカー / ジャンプパネル用の軽量メタデータ。
+#[derive(Clone, Debug)]
+pub struct VideoBookmarkMeta {
+    pub id: i64,
+    pub pts_secs: f64,
+    pub title: Option<String>,
+}
+
 /// 動画ブックマーク DB ハンドル。
 pub struct VideoBookmarkDb {
     conn: rusqlite::Connection,
@@ -95,6 +103,33 @@ impl VideoBookmarkDb {
             let pts_secs: f64 = row.get(0)?;
             let title: Option<String> = row.get(1)?;
             Ok((pts_secs, title.filter(|s| !s.is_empty())))
+        });
+        match rows {
+            Ok(it) => it.filter_map(|r| r.ok()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// `list` の軽量版: thumbnail BLOB を読まずに `id`, `pts_secs`, `title` だけ返す。
+    pub fn list_marker_entries(&self, video_path: &Path) -> Vec<VideoBookmarkMeta> {
+        let key = crate::path_key::normalize_keep_drive(video_path);
+        let stmt = self.conn.prepare_cached(
+            "SELECT id, pts_secs, title FROM video_bookmarks
+              WHERE path = ?1 ORDER BY pts_secs ASC",
+        );
+        let mut stmt = match stmt {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = stmt.query_map([&key], |row| {
+            let id: i64 = row.get(0)?;
+            let pts_secs: f64 = row.get(1)?;
+            let title: Option<String> = row.get(2)?;
+            Ok(VideoBookmarkMeta {
+                id,
+                pts_secs,
+                title: title.filter(|s| !s.is_empty()),
+            })
         });
         match rows {
             Ok(it) => it.filter_map(|r| r.ok()).collect(),

@@ -27,6 +27,11 @@ UI スレッド同期 I/O の混入が無いかを系統的に監査する。
 ⚠️ **🔴 を 1 件確認**。動画フルスクリーン中、`App::update` から毎フレーム
 `video_pin_db.lookup_pts` + `video_bookmark_db.list` の SQLite SELECT が走る。
 
+**対応状況 (Codex)**: 妥当な指摘として確認し、`FullscreenVideoMarkerCache` を導入して
+対応済み。フルスクリーン動画の open / ピン・ブックマーク変更時だけ SQLite から軽量
+メタデータを再読込し、`App::update`、native overlay 同期、旧 egui HUD のシークバー /
+J/K ジャンプ、左ジャンプパネル描画はキャッシュを参照する。
+
 ---
 
 ## 🔴 要修正
@@ -244,8 +249,8 @@ DLL を **既に隣同居している前提**で `LoadLibrary` できる (= 展�
 
 ## 反映方針
 
-1. Codex レビュー後、合意した修正内容で `#1` を Tier 0.5 として実装
-2. 実装後 Codex で diff レビュー
+1. `#1` は Codex で妥当性を確認し、Tier 0.5 として実装済み
+2. 実装後の差分レビューと automated check で P1 ゼロを確認する
 3. P1 ゼロを確認したら Tier 1 #2 (native_presenter.rs drawing fn 抽出) に進む
 4. Tier 1 #2 完了時にもこの監査を再実行 (= リファクタで新たな同期 I/O が混入していないか)
 

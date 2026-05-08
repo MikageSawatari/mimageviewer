@@ -6098,7 +6098,8 @@ impl App {
 
     /// 動画のチャプター開始 / ブックマーク / ピンを 1 本の Vec に集約し pts 昇順で返す。
     /// シークバー描画 (マーカー縦線) と J/K ジャンプの両方が同じソースを使う。
-    pub(crate) fn collect_video_nav_markers(&self, fs_idx: usize) -> Vec<NavMarker> {
+    pub(crate) fn collect_video_nav_markers(&mut self, fs_idx: usize) -> Vec<NavMarker> {
+        self.ensure_fullscreen_video_marker_cache(fs_idx);
         let path = match self.fs_video_player(fs_idx) {
             Some(p) => p.path().clone(),
             None => return Vec::new(),
@@ -6113,18 +6114,15 @@ impl App {
                 });
             }
         }
-        if let Some(db) = self.video_bookmark_db.as_ref() {
-            for (pts, title) in db.list_marker_meta(&path) {
-                markers.push(NavMarker {
-                    pts,
-                    kind: NavMarkerKind::Bookmark,
-                    title,
-                });
-            }
+        let (pin_pts, bookmarks) = self.fullscreen_video_marker_snapshot(fs_idx, &path);
+        for bookmark in bookmarks {
+            markers.push(NavMarker {
+                pts: bookmark.pts_secs,
+                kind: NavMarkerKind::Bookmark,
+                title: bookmark.title,
+            });
         }
-        if let Some(db) = self.video_pin_db.as_ref()
-            && let Some(pts) = db.lookup_pts(&path)
-        {
+        if let Some(pts) = pin_pts {
             markers.push(NavMarker {
                 pts,
                 kind: NavMarkerKind::Pin,
@@ -6438,6 +6436,9 @@ impl App {
                         "video bookmark added: pts={pts:.2}s {}",
                         path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
                     ));
+                    self.refresh_fullscreen_video_marker_cache(fs_idx);
+                    #[cfg(windows)]
+                    self.sync_native_video_timeline_markers(fs_idx);
                 }
             }
         }
