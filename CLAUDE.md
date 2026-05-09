@@ -787,13 +787,15 @@ BOM 不要 (= Linux / macOS / git diff の互換性のため)。
 mIV はプライマリ proportional フォントに **Yu Gothic Medium** (Windows 標準) を
 使う ([src/ui_fonts.rs](src/ui_fonts.rs))。通常 UI と native overlay は同じ
 `ui_fonts::configure_fonts()` を通り、動画メタデータなどユーザー由来テキスト向けに
-`miv-user-text` family を別途登録する。この family は Segoe UI Emoji を優先し、
-ttf-parser で Yu Gothic の日本語 glyph と Segoe UI Emoji の代表 glyph の中心を読んで
-baseline 補正を計算する。カラー絵文字は outline が全 em-box のプレースホルダに
-なる場合があるため、取得できるときは raster image bounds を優先し、複数サンプルは
-中央値で扱う。Cambria Math の `⋈` など、区切り線で使われる記号は Yu Gothic の
-ASCII hyphen run に中心を合わせる。`⋈` はフォント bbox と実描画の見た目がずれるため、
-UI スナップショットで確認した補正値を使う。Cambria Math / Segoe UI Historic / Segoe UI Symbol も
+`miv-user-text` family を別途登録する。この family は text-presentation 記号、
+数学英字、絵文字の fallback を明示し、ttf-parser で Yu Gothic の日本語 glyph と
+Segoe UI Emoji の代表 glyph の中心を読んで
+baseline 補正を計算する。egui 0.33 は `ab_glyph` の outline 描画を使うため、
+計測も outline bbox を優先し、raster image bounds は bbox が取れない場合の fallback
+にする。複数サンプルは中央値で扱う。`✉` / `⋈` のような text-presentation 記号は
+Cambria Math や Segoe UI Emoji より前の Meiryo fallback で拾わせ、ブラウザに近い
+文字表示へ寄せる。数学英字は Cambria Math、色付き絵文字は Segoe UI Emoji へ回す。
+Segoe UI Historic / Segoe UI Symbol も
 縦位置補正付きで使う。通常 UI の proportional family ではこれらを egui 既定 font の
 後ろに置き、固定 UI 文言の幅変化を抑える。Yu Gothic は日本語 + 基本 Latin
 + Latin-1 Supplement までは網羅するが、**Misc Symbols** や **絵文字**は欠落

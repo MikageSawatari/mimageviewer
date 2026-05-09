@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 pub const USER_TEXT_FAMILY_NAME: &str = "miv-user-text";
-const DERIVED_Y_OFFSET_CLAMP: f32 = 0.40;
+const DERIVED_Y_OFFSET_CLAMP: f32 = 0.24;
 
 const JAPANESE_FONT_PATHS: &[&str] = &[
     r"C:\Windows\Fonts\YuGothM.ttc",
@@ -31,6 +31,22 @@ struct FontAlignmentTarget {
 }
 
 const USER_TEXT_FALLBACKS: &[FallbackFont] = &[
+    // Text-presentation symbols such as ✉ and ⋈ should follow browser-like
+    // text fallback instead of being captured by emoji/math fonts.
+    FallbackFont {
+        name: "text_symbols",
+        path: r"C:\Windows\Fonts\meiryo.ttc",
+        scale: 1.0,
+        y_offset: FallbackYOffset::Fixed(-0.20),
+    },
+    // Mathematical alphanumeric symbols such as 𝓈𝒸𝓇𝑒𝒶𝓂 are not covered by
+    // Yu Gothic or Meiryo. Keep this before emoji so script letters stay texty.
+    FallbackFont {
+        name: "math",
+        path: r"C:\Windows\Fonts\cambria.ttc",
+        scale: 0.98,
+        y_offset: FallbackYOffset::Fixed(0.04),
+    },
     FallbackFont {
         name: "emoji",
         path: r"C:\Windows\Fonts\seguiemj.ttf",
@@ -42,19 +58,6 @@ const USER_TEXT_FALLBACKS: &[FallbackFont] = &[
             samples: &['🐾', '🧠', '🍧', '💗'],
             fallback: -0.12,
         },
-    },
-    // Mathematical alphanumeric symbols such as 𝓈𝒸𝓇𝑒𝒶𝓂 and separator glyphs
-    // such as ⋈ are not covered by Yu Gothic. Align Cambria Math with the
-    // primary-font hyphen run so metadata separator rows do not drift vertically.
-    FallbackFont {
-        name: "math",
-        path: r"C:\Windows\Fonts\cambria.ttc",
-        scale: 0.98,
-        // Cambria Math reports reasonable font metrics for ⋈, but egui's
-        // rasterized pixels sit visibly below ASCII hyphen separator runs.
-        // Snapshot coverage locks this calibrated offset to the visible target:
-        // the center of ⋈ should sit on the hyphen stroke.
-        y_offset: FallbackYOffset::Fixed(-0.30),
     },
     FallbackFont {
         name: "historic",
@@ -233,14 +236,12 @@ fn font_metric_center_y(data: &[u8]) -> Option<f32> {
 
 fn glyph_center_y(face: &ttf_parser::Face<'_>, sample: char) -> Option<f32> {
     let glyph_id = face.glyph_index(sample)?;
-    if let Some(image) = face.glyph_raster_image(glyph_id, face.units_per_em()) {
-        return Some(
-            (f32::from(image.y) + f32::from(image.height) * 0.5) / f32::from(image.pixels_per_em),
-        );
-    }
     let units_per_em = f32::from(face.units_per_em());
-    let rect = face.glyph_bounding_box(glyph_id)?;
-    Some((f32::from(rect.y_min) + f32::from(rect.y_max)) * 0.5 / units_per_em)
+    if let Some(rect) = face.glyph_bounding_box(glyph_id) {
+        return Some((f32::from(rect.y_min) + f32::from(rect.y_max)) * 0.5 / units_per_em);
+    }
+    let image = face.glyph_raster_image(glyph_id, face.units_per_em())?;
+    Some((f32::from(image.y) + f32::from(image.height) * 0.5) / f32::from(image.pixels_per_em))
 }
 
 fn remove_font_name(fonts: &mut Vec<String>, name: &str) {
@@ -289,6 +290,34 @@ mod tests {
         assert!(
             (-0.24..=0.0).contains(&offset),
             "emoji should be nudged upward from measured glyph centers, got {offset}",
+        );
+    }
+
+    #[test]
+    fn user_text_prefers_text_symbols_before_emoji() {
+        let mut fonts = egui::FontDefinitions::default();
+        install_mimageviewer_fonts(&mut fonts);
+        let family = fonts
+            .families
+            .get(&egui::FontFamily::Name(Arc::<str>::from(
+                USER_TEXT_FAMILY_NAME,
+            )))
+            .expect("user text family should be registered");
+        let text_symbols = family
+            .iter()
+            .position(|name| name == "text_symbols")
+            .expect("text symbol fallback should be registered");
+        let emoji = family
+            .iter()
+            .position(|name| name == "emoji")
+            .expect("emoji fallback should be registered");
+        let math = family
+            .iter()
+            .position(|name| name == "math")
+            .expect("math fallback should be registered");
+        assert!(
+            text_symbols < math && math < emoji,
+            "text-presentation symbols should be tried before math and emoji: {family:?}",
         );
     }
 }

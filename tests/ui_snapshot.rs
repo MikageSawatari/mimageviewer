@@ -118,6 +118,10 @@ fn metadata_text_fallback_emoji_symbols_dark() {
                     .font(mimageviewer::ui_fonts::user_text_font(18.0)),
             );
             ui.label(
+                egui::RichText::new("✉Contact form")
+                    .font(mimageviewer::ui_fonts::user_text_font(18.0)),
+            );
+            ui.label(
                 egui::RichText::new("🧠今までのおうたの再生リスト")
                     .font(mimageviewer::ui_fonts::user_text_font(12.0)),
             );
