@@ -164,6 +164,38 @@ pub fn truncate_name(name: &str, max_chars: usize) -> String {
     }
 }
 
+/// グリッドセル底部にファイル名を描画する。文字の後ろに半透明の角丸プレートを敷いて、
+/// 動画サムネの黒帯のような暗部に重なってもファイル名が読めるようにする。
+///
+/// - 文字幅は `layout_no_wrap` で実測 (CJK / 絵文字混在でも正確)
+/// - プレートは dark mode で半透明黒、light mode で半透明白
+/// - 位置は `Align2::CENTER_BOTTOM` 相当、`inner.max.y - 4.0` を底とする
+pub fn draw_cell_filename(
+    painter: &egui::Painter,
+    inner: egui::Rect,
+    name: &str,
+    text_color: egui::Color32,
+    dark: bool,
+) {
+    let text = truncate_name(name, 18);
+    let font = egui::FontId::proportional(11.0);
+    let galley = painter.layout_no_wrap(text, font, text_color);
+    let text_size = galley.size();
+    let text_pos = egui::pos2(
+        inner.center().x - text_size.x / 2.0,
+        inner.max.y - 4.0 - text_size.y,
+    );
+    let pad = egui::vec2(4.0, 1.0);
+    let bg_rect = egui::Rect::from_min_size(text_pos - pad, text_size + 2.0 * pad);
+    let bg_color = if dark {
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 220)
+    };
+    painter.rect_filled(bg_rect, 3.0, bg_color);
+    painter.galley(text_pos, galley, text_color);
+}
+
 // -----------------------------------------------------------------------
 // 自然順ソート
 // -----------------------------------------------------------------------

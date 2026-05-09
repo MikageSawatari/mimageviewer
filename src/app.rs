@@ -982,7 +982,6 @@ use crate::thumb_loader::{
 };
 use crate::ui_helpers::{
     draw_folder_badge, draw_pdf_badge, draw_play_icon, draw_zip_badge, natural_sort_key,
-    truncate_name,
 };
 
 /// 消しゴムモードのツール種別。
@@ -15345,12 +15344,12 @@ pub(crate) fn draw_cell(
                         egui::FontId::proportional(42.0),
                         egui::Color32::from_rgb(220, 170, 30),
                     );
-                    painter.text(
-                        egui::pos2(inner.center().x, inner.max.y - 4.0),
-                        egui::Align2::CENTER_BOTTOM,
-                        truncate_name(name, 18),
-                        egui::FontId::proportional(11.0),
+                    crate::ui_helpers::draw_cell_filename(
+                        painter,
+                        inner,
+                        name,
                         name_text_color,
+                        dark,
                     );
                 }
             }
@@ -15386,13 +15385,7 @@ pub(crate) fn draw_cell(
             }
             // ファイル名
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            painter.text(
-                egui::pos2(inner.center().x, inner.max.y - 4.0),
-                egui::Align2::CENTER_BOTTOM,
-                truncate_name(name, 18),
-                egui::FontId::proportional(11.0),
-                name_text_color,
-            );
+            crate::ui_helpers::draw_cell_filename(painter, inner, name, name_text_color, dark);
         }
         GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
             draw_thumb(painter, inner, thumb, rotation, dark, adjusted_tex);
@@ -15422,13 +15415,7 @@ pub(crate) fn draw_cell(
             }
             badge_fn(painter, inner);
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            painter.text(
-                egui::pos2(inner.center().x, inner.max.y - 4.0),
-                egui::Align2::CENTER_BOTTOM,
-                truncate_name(name, 18),
-                egui::FontId::proportional(11.0),
-                name_text_color,
-            );
+            crate::ui_helpers::draw_cell_filename(painter, inner, name, name_text_color, dark);
         }
         GridItem::ConvertibleArchive { path, format } => {
             // 7z / LZH: クリック時に ZIP 変換→閲覧のフロー。サムネイルなしで
@@ -15443,13 +15430,7 @@ pub(crate) fn draw_cell(
             );
             crate::ui_helpers::draw_archive_badge(painter, inner, format.label());
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            painter.text(
-                egui::pos2(inner.center().x, inner.max.y - 4.0),
-                egui::Align2::CENTER_BOTTOM,
-                truncate_name(name, 18),
-                egui::FontId::proportional(11.0),
-                name_text_color,
-            );
+            crate::ui_helpers::draw_cell_filename(painter, inner, name, name_text_color, dark);
         }
         GridItem::ZipSeparator { dir_display } => {
             // 作品境界のセパレータ: 1 セル全体に目立つ背景 + フォルダ名
