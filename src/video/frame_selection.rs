@@ -45,10 +45,14 @@ pub(crate) struct FrameCandidate {
 ///
 /// アルゴリズム (queue 先頭から走査):
 /// 1. `seek_serial < current_seek_serial` なら `DiscardStale` を吐いて次へ。
-/// 2. `force_first_frame` または `force_display_seek` が立つフレームに当たったら、
-///    `Display` を 1 つ吐いて即終了 (= 強制表示は同 tick 1 枚だけ)。
-/// 3. `pts_secs <= now_secs + tol` なら eligible。前に Display を出していれば、
-///    それを `LateDrop` に格下げして新しい `Display` を吐く。
+/// 2. `force_first_frame` (= source 切替直後の first present 待ち) なら `Display` を
+///    1 つ吐いて即終了 (= 起動 burst-drop の防止)。
+/// 3. `force_display_seek` (= seek 中で target 近傍 / overshoot 許容) または
+///    `pts_secs <= now_secs + tol` (= 通常 eligibility) なら eligible。前に Display を
+///    出していれば、それを `LateDrop` に格下げして新しい `Display` を吐く。
+///    `force_display_seek` は Fast seek の keyframe→target burst 消化設計
+///    ([src/video/clock.rs] の `SeekKind::Fast` コメント参照) を維持するため
+///    coalesce を許可する (= 1 枚で打ち切らない)。
 /// 4. eligible でなければ走査終了 (= 残りは next tick 以降)。
 pub(crate) fn select_frame_for_present(
     queue: &[FrameCandidate],
@@ -69,17 +73,24 @@ pub(crate) fn select_frame_for_present(
         }
 
         let force_first_frame = waiting_for_first_frame && frame.seek_serial == last_seen_serial;
+        if force_first_frame {
+            actions.push(PopAction::Display);
+            return FrameSelection { actions };
+        }
+
+        // `force_display_seek` は seek 中の first frame に限り pts > now でも eligible
+        // 扱いする (`pts_clears_seek_override` が片側許容 = pts > target は無制限)。
+        // 2 枚目以降は have_display_candidate=true で false になり、自然に通常
+        // eligibility 経路に戻る (= 元実装と同じ挙動)。
         let force_display_seek = is_seeking
             && !have_display_candidate
             && frame.seek_serial == last_seen_serial
             && clock::pts_clears_seek_override(frame.pts_secs, now_secs);
 
-        if force_first_frame || force_display_seek {
-            actions.push(PopAction::Display);
-            return FrameSelection { actions };
-        }
+        let eligible =
+            force_display_seek || frame.pts_secs <= now_secs + display_lead_tolerance_secs;
 
-        if frame.pts_secs <= now_secs + display_lead_tolerance_secs {
+        if eligible {
             if have_display_candidate {
                 let last = actions
                     .last_mut()
@@ -156,12 +167,35 @@ mod tests {
     }
 
     #[test]
-    fn force_display_seek_picks_only_one_even_when_more_eligible() {
-        // is_seeking=true, latest_renderable=None (= have_display_candidate=false 相当)。
-        // queue 全部 eligible でも force_display_seek が 1 枚だけ Display して止まる。
-        let queue = vec![frame(0.000, 1), frame(0.033, 1), frame(0.066, 1)];
-        let sel = select_frame_for_present(&queue, 0.500, 1, 1, false, true, TOL);
+    fn force_display_seek_allows_coalesce_to_target() {
+        // Fast seek: keyframe→target burst を 1 tick で消化する設計
+        // ([src/video/clock.rs] `SeekKind::Fast` 参照)。target 近傍の連続 frame は
+        // 通常 eligibility 経由で coalesce され、最新だけ Display される。
+        let queue = vec![frame(4.500, 1), frame(4.533, 1), frame(5.000, 1)];
+        let sel = select_frame_for_present(&queue, 5.000, 1, 1, false, true, TOL);
+        assert_eq!(
+            sel.actions,
+            vec![PopAction::LateDrop, PopAction::LateDrop, PopAction::Display]
+        );
+    }
+
+    #[test]
+    fn force_display_seek_picks_overshoot_future_frame() {
+        // 4K HEVC の GOP overshoot: keyframe が target を越して着地するケース。
+        // 通常 eligibility (pts <= now + tol) では false だが、
+        // pts_clears_seek_override (片側許容、pts > target は無制限) で eligible 扱い。
+        let queue = vec![frame(5.500, 1)];
+        let sel = select_frame_for_present(&queue, 5.000, 1, 1, false, true, TOL);
         assert_eq!(sel.actions, vec![PopAction::Display]);
+    }
+
+    #[test]
+    fn force_display_seek_inactive_when_not_seeking() {
+        // is_seeking=false なら force_display_seek は発火しない。
+        // pts > now + tol の future frame はそのまま queue に残る。
+        let queue = vec![frame(5.500, 1)];
+        let sel = select_frame_for_present(&queue, 5.000, 1, 1, false, false, TOL);
+        assert_eq!(sel.actions, vec![] as Vec<PopAction>);
     }
 
     #[test]
