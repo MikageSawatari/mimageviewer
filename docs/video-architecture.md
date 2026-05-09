@@ -95,7 +95,9 @@ src/video/
 ├── tile_thumbnails.rs      # タイルモード用一括サムネイル抽出 worker (384 行)
 ├── tile_thumb_cache.rs     # タイル サムネ SQLite WebP 永続キャッシュ (358 行)
 ├── native_window.rs        # ネイティブ Win32 message loop + 入力イベント変換 (577 行)
-├── native_presenter.rs     # ネイティブ DComp プレゼンター + egui overlay (6060 行 ⚠⚠ 巨大)
+├── native_presenter/       # ネイティブ DComp プレゼンター + egui overlay
+│   ├── mod.rs              # NativeVideoPresenter / NativeEguiOverlay impl (3900 行級)
+│   └── overlay_draw.rs     # native overlay 描画・layout helper (2300 行級)
 ├── gpu_renderer/           # ★ DX12 backend 時のみ active、unsafe を局所化
 │   ├── mod.rs              # 公開 API: GpuVideoDevice, D3d11Frame, VideoPipeline 等 (57 行)
 │   ├── d3d11_device.rs     # D3D11 Device + VideoProcessor + Fence (1134 行)
@@ -342,28 +344,26 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - `WM_KEYDOWN` / `WM_LBUTTONDOWN` / `WM_MOUSEWHEEL` 等を `NativeVideoWindowEvent` enum
   に正規化して内部 channel に push (UI スレッドが受信)
 - `NativeVideoMouseButton` (L/M/R/X1/X2) / `NativeVideoMouseWheelEvent` 等の型は
-  egui の Event との 1:1 翻訳を意図しており、`native_presenter.rs` 側で
+  egui の Event との 1:1 翻訳を意図しており、`native_presenter/mod.rs` 側で
   `egui::Event` に変換される
 
 責務は単一 (= 単純な入力 marshalling)。設計上の懸念はなし。
 
-#### `native_presenter.rs` (`NativeVideoPresenter` + `NativeEguiOverlay`)
+#### `native_presenter/` (`NativeVideoPresenter` + `NativeEguiOverlay`)
 
-フルスクリーン動画用の DirectComposition 経路を一手に引き受ける**大型ファイル
-(6060 行)**。複数の責務が同居しているため将来の分割対象 (本書「抽象化の現状と既知の
-負債」節参照)。
+フルスクリーン動画用の DirectComposition 経路を一手に引き受ける大型モジュール。
+2026-05-09 の Tier 1 #2 で描画自由関数群を `overlay_draw.rs` に分離し、
+`mod.rs` は D3D11 / DComp / egui overlay state と入力変換を担当する形に整理した。
 
 現状の内部構成:
 
-| 範囲 (行) | 責務 | 主な型 |
+| ファイル / 範囲 | 責務 | 主な型 |
 |---|---|---|
-| 42–488 | 公開型定義 (overlay 状態 / イベント / コマンド) | `NativePresenterConfig`, `NativeVideoPresenter`, `NativeEguiOverlay`, 各種 `NativeOverlay*` 構造体 (15+ 個) |
-| 488–584 | 入力ルーティング (`NativeOverlayInputRouting` impl) | — |
-| 584–1557 | **D3D11 デバイス + swap chain + 共有テクスチャ + keyed mutex + 動画 present** (`NativeVideoPresenter` impl) | — |
-| 1557–1680 | 黒背景レイヤ (`NativeBlackBackground` impl) | — |
-| 1680–3291 | **egui overlay 本体** (`NativeEguiOverlay` impl: wgpu surface 管理 / context / state) | — |
-| 3291–5052 | **overlay 描画関数群** (perf overlay / jump panel / top bar / VST3 panel / metadata panel / tile overlay / center status / アイコン群) | — |
-| 5052–6060 | helper 関数 (panel 矩形計算 / 永続キャッシュキー生成 / その他) | — |
+| `mod.rs` 前半 | 公開型定義 (overlay 状態 / イベント / コマンド) | `NativePresenterConfig`, `NativeVideoPresenter`, `NativeEguiOverlay`, 各種 `NativeOverlay*` 構造体 (15+ 個) |
+| `mod.rs` 中盤 | D3D11 デバイス + swap chain + 共有テクスチャ + keyed mutex + 動画 present | `NativeVideoPresenter` |
+| `mod.rs` 中盤 | 黒背景レイヤ / egui overlay state / wgpu surface 管理 / 入力変換 | `NativeBlackBackground`, `NativeEguiOverlay` |
+| `overlay_draw.rs` | overlay 描画関数群、panel 矩形計算、format helper、タイムライン marker / icon 描画 | `NativeOverlay*` 値型 |
+| `mod.rs` 末尾 | wgpu surface format 選択、DPI / egui key 変換、D3D11 test helper | — |
 
 ネイティブ DComp 経路を採用した理由:
 
@@ -391,7 +391,7 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - `tile_thumb_cache.rs`: SQLite + WebP の永続キャッシュ。**絶対 PTS をキー**にしているため
   動画の長さが変わっても再ヒットする (Phase 8.C の修正)
 
-タイルモードの UI 描画は `native_presenter.rs` の `draw_native_tile_overlay` (4907 行〜) と
+タイルモードの UI 描画は `native_presenter/overlay_draw.rs` の `draw_native_tile_overlay` と
 `ui_video_tile.rs` (eframe 経路の旧実装) の二重実装になっている (= ネイティブ DComp
 経路と eframe 経路の両方で動かすため)。
 
@@ -495,22 +495,23 @@ v0.9.0 リリース直前 (2026-05-08) に行ったアーキテクチャ レビ�
 
 ### ファイル規模の負債
 
-以下のファイルは責務が混ざって肥大しており、Phase 10 以降のリファクタ対象。
-**現状で動いているものをいじらないこと**を優先するため、即時の分割は行わない。
-新機能を入れる時に 「ついでに分けられないか」 を検討する、という運用にする。
+以下のファイル / モジュールはまだ責務が混ざって肥大しており、Phase 10 以降の
+リファクタ対象。`native_presenter/` は Tier 1 #2 で描画関数だけ分離済みだが、
+残りの core / overlay state 分割は中期課題として扱う。新機能を入れる時に
+「ついでに分けられないか」 を検討する、という運用にする。
 
-#### `native_presenter.rs` (6060 行) — 最大の負債
+#### `native_presenter/` — Tier 1 #2 で描画関数を分離済み、残りは中期負債
 
-DirectComposition プレゼンター本体に egui overlay 描画 (3370 行!) が同居している。
-自然な分割は次の通り (将来検討):
+DirectComposition プレゼンター本体と egui overlay 本体は `mod.rs` に残し、egui の
+描画自由関数群は `overlay_draw.rs` に移動済み。今後さらに分けるなら次の粒度が自然:
 
 ```
-native_presenter.rs  (6060)
+native_presenter/
 ├── (型定義 ~450 行)        → 現状維持
 ├── (D3D11 + present ~970 行)→ native_presenter/core.rs (推奨残し)
 ├── (NativeBlackBackground ~120) → core.rs に同居でよい
 ├── (NativeEguiOverlay ~1610)→ native_presenter/overlay.rs
-├── (描画関数群 ~1760)
+├── overlay_draw.rs (描画関数群、現状)
 │   ├── perf overlay        → native_presenter/overlay/perf.rs
 │   ├── jump panel          → native_presenter/overlay/jump.rs
 │   ├── top bar             → native_presenter/overlay/top_bar.rs
@@ -521,11 +522,11 @@ native_presenter.rs  (6060)
 └── (helper ~1000 行)        → native_presenter/util.rs
 ```
 
-なぜ現状で 1 ファイルになっているか: ネイティブプレゼンター実装は短期間で
+なぜ元々 1 ファイルだったか: ネイティブプレゼンター実装は短期間で
 Phase A〜D を回しながら追加機能 (perf overlay → bookmark 編集 → VST3 panel → tile
-mode) を織り込んできたため、機能ごとの drawing fn を追加する場所として `native_presenter.rs`
-末尾が選ばれ続けた。各 drawing fn は 100〜200 行程度の独立関数なので、
-ファイル分割自体は機械的にできる (impl block を割らずに済む構造)。
+mode) を織り込んできたため、機能ごとの drawing fn を追加する場所として
+`native_presenter.rs` 末尾が選ばれ続けた。Tier 1 #2 では impl block を割らず、
+自由関数だけを移動した。
 
 #### `decoder.rs` (4962 行) — demux + video + audio + HW + probe の同居
 
@@ -586,7 +587,7 @@ VST3 と offline upscale。これらの分割方針は別ドキュメント
 
 **結論: 大きな線引きは正しい**。
 
-- `engine/` ↔ `decoder.rs` ↔ `audio.rs` ↔ `gpu_renderer/` ↔ `native_presenter.rs` の
+- `engine/` ↔ `decoder.rs` ↔ `audio.rs` ↔ `gpu_renderer/` ↔ `native_presenter/` の
   境界は妥当。各層が他の層に対して「event channel + Arc<X> 共有」という最小 API で
   接続されており、内部を入れ替えやすい (実際 native presenter は eframe ビューポート版
   と切り替え可能になっている)

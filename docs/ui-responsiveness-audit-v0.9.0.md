@@ -142,8 +142,8 @@ load_texture)。本書には記録のみ。
 | 機能 | 場所 | 確認 |
 |---|---|---|
 | `VideoPlayer::open` の重い処理 | [src/video/mod.rs](../src/video/mod.rs) | `decoder::spawn` (3-thread) / `audio::start` / `NativeVideoOutput::spawn` (`native-video-presenter` thread) で全て worker 化、UI thread はチャネル / Arc を渡すだけ |
-| `NativeVideoPresenter::new` (D3D11 device + COM init + DComp tree + font load) | [src/video/native_presenter.rs](../src/video/native_presenter.rs) | `run_native_video_output` 内で実行 = `native-video-presenter` 専用 thread。UI thread には影響なし |
-| 動画フォント読み込み (`std::fs::read("C:\\Windows\\Fonts\\...")`) | [native_presenter.rs:546-571](../src/video/native_presenter.rs) | `configure_overlay_fonts` は `NativeVideoPresenter::new` 内で 1 回のみ実行、worker thread |
+| `NativeVideoPresenter::new` (D3D11 device + COM init + DComp tree + font load) | [src/video/native_presenter/mod.rs](../src/video/native_presenter/mod.rs) | `run_native_video_output` 内で実行 = `native-video-presenter` 専用 thread。UI thread には影響なし |
+| 動画フォント読み込み (`std::fs::read("C:\\Windows\\Fonts\\...")`) | [native_presenter/mod.rs](../src/video/native_presenter/mod.rs) | `configure_overlay_fonts` は `NativeVideoPresenter::new` 内で 1 回のみ実行、worker thread |
 | 動画 thumbnail worker | [src/video/thumbnail.rs](../src/video/thumbnail.rs) | `ThumbnailWorker::spawn` で専用 thread |
 | Tile thumbnail 抽出 | [src/video/tile_thumbnails.rs](../src/video/tile_thumbnails.rs) | `start_extraction` で専用 thread。UI からはチャネルで結果を受け取るのみ |
 | Tile thumbnail SQLite キャッシュ | [src/video/tile_thumb_cache.rs](../src/video/tile_thumb_cache.rs) | DB open は startup で 1 回 (`startup.db_open_video_tile_cache` perf event)。読み書きは抽出 worker からのみ |
@@ -250,8 +250,8 @@ DLL を **既に隣同居している前提**で `LoadLibrary` できる (= 展�
 ## 反映方針
 
 1. `#1` は Codex で妥当性を確認し、Tier 0.5 として実装済み
-2. 実装後の差分レビューと automated check で P1 ゼロを確認する
-3. P1 ゼロを確認したら Tier 1 #2 (native_presenter.rs drawing fn 抽出) に進む
+2. Tier 1 #2 (`native_presenter/overlay_draw.rs` 抽出) は 2026-05-09 に実装済み
+3. 実装後の差分レビューと automated check で P1 ゼロを確認する
 4. Tier 1 #2 完了時にもこの監査を再実行 (= リファクタで新たな同期 I/O が混入していないか)
 
 ## ロールバック・継続性
