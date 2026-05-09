@@ -58,9 +58,10 @@ UI コードをスナップショットしたい場合は、まずロジック�
 - `snapshot_with_theme(name, theme, build_ui)`: 任意 UI + テーマ指定
 - `snapshot_diagnostic(name, status, plugins)`: Susie 診断専用
 
-これらはすべて `install_japanese_font()` を呼んで、本体と同じ日本語フォント
-(YuGothM / meiryo / msgothic) を登録する。豆腐化したスナップショットは
-「描画が崩れている」のか「フォントが無いだけ」のか区別できないため常に登録する。
+これらはすべて `install_app_fonts()` を呼んで、本体と同じ `ui_fonts::configure_fonts()`
+のフォント fallback (YuGothM / meiryo / msgothic + 記号・絵文字補完) を登録する。
+豆腐化したスナップショットは「描画が崩れている」のか「フォントが無いだけ」のか
+区別できないため常に登録する。
 
 ### 3. サイズは固定
 
@@ -96,7 +97,7 @@ PNG は現状 1 ファイル 5〜10 KB 程度。100 ファイル程度までは�
 ## CI での扱い
 
 現時点では CI 環境を持たないためローカル実行のみ。将来 GitHub Actions 等で
-自動化する場合、Windows runner が必要 (本体と同じ日本語フォントを登録するため
+自動化する場合、Windows runner が必要 (本体と同じ Windows フォント fallback を登録するため
 `C:\Windows\Fonts\*.ttc` を参照している)。Linux runner に移行する際は、
 CJK フォントを自前で vendored するか `Noto Sans CJK` をインストールする必要がある。
 

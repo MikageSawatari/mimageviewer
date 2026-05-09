@@ -542,44 +542,7 @@ fn create_present_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), 
 }
 
 fn configure_overlay_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    let mut fallback_order: Vec<String> = Vec::new();
-    for path in [
-        r"C:\Windows\Fonts\YuGothM.ttc",
-        r"C:\Windows\Fonts\meiryo.ttc",
-        r"C:\Windows\Fonts\msgothic.ttc",
-    ] {
-        let Ok(data) = std::fs::read(path) else {
-            continue;
-        };
-        fonts.font_data.insert(
-            "japanese".to_owned(),
-            Arc::new(egui::FontData::from_owned(data)),
-        );
-        fallback_order.push("japanese".to_owned());
-        break;
-    }
-    for (name, path) in [
-        ("symbols", r"C:\Windows\Fonts\seguisym.ttf"),
-        ("math", r"C:\Windows\Fonts\cambria.ttc"),
-        ("historic", r"C:\Windows\Fonts\seguihis.ttf"),
-        ("emoji", r"C:\Windows\Fonts\seguiemj.ttf"),
-    ] {
-        let Ok(data) = std::fs::read(path) else {
-            continue;
-        };
-        fonts
-            .font_data
-            .insert(name.to_owned(), Arc::new(egui::FontData::from_owned(data)));
-        fallback_order.push(name.to_owned());
-    }
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        let family_fonts = fonts.families.entry(family).or_default();
-        for name in fallback_order.iter().rev() {
-            family_fonts.insert(0, name.clone());
-        }
-    }
-    ctx.set_fonts(fonts);
+    crate::ui_fonts::configure_fonts(ctx);
 }
 
 impl NativeVideoPresenter {
@@ -4965,7 +4928,7 @@ fn draw_native_metadata_panel(
                                 ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(value)
-                                            .size(12.0)
+                                            .font(crate::ui_fonts::user_text_font(12.0))
                                             .color(egui::Color32::from_rgb(230, 230, 230)),
                                     )
                                     .wrap(),

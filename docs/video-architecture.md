@@ -257,6 +257,12 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   egui `Event::Ime` に変換し、`PlatformOutput::ime` のカーソル矩形を IMM32 の
   composition / candidate window 位置へ返す。これにより独立 overlay 上の TextEdit でも
   日本語 IME の変換文字列・候補が入力位置に追従し、保存時だけ UI thread の DB 更新イベントへ戻す。
+- 動画メタデータパネルの記号・絵文字・数学英字 fallback は通常 UI と同じ
+  `ui_fonts::configure_fonts()` で登録する `miv-user-text` family を使う。通常 UI の
+  proportional family は既存幅を保つため Windows fallback を egui 既定 font の後ろに置き、
+  ユーザー由来の長文だけ Segoe UI Emoji / Cambria Math / Segoe UI Historic /
+  Segoe UI Symbol を優先する。Windows fallback glyph には軽い縦位置補正を入れて本文の
+  ベースラインずれを抑える。
 - `fill_output` の bookkeeping (Phase 9 後の cleanup refactor):
   - **実消費サンプル数ベース**: `pop_front` で取り出した分 (= `real_consumed`) のみ
     `next_pts_secs` を進める。silence 出力中は pts 進行 0 (= 旧版の「常に full want

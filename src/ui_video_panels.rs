@@ -182,7 +182,11 @@ fn draw_kv_section(ui: &mut egui::Ui, info: &VideoInfo) {
         });
         ui.horizontal(|ui| {
             ui.add_space(20.0);
-            ui.colored_label(TEXT_COLOR, value);
+            ui.label(
+                egui::RichText::new(value)
+                    .color(TEXT_COLOR)
+                    .font(crate::ui_fonts::user_text_font(13.0)),
+            );
         });
         ui.add_space(2.0);
     };

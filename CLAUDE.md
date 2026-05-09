@@ -785,12 +785,16 @@ BOM 不要 (= Linux / macOS / git diff の互換性のため)。
 ## UI 文字列の Unicode グリフ選定ルール
 
 mIV はプライマリ proportional フォントに **Yu Gothic Medium** (Windows 標準) を
-使う ([src/main.rs `setup_fonts`](src/main.rs))。Yu Gothic は日本語 + 基本 Latin
+使う ([src/ui_fonts.rs](src/ui_fonts.rs))。通常 UI と native overlay は同じ
+`ui_fonts::configure_fonts()` を通り、動画メタデータなどユーザー由来テキスト向けに
+`miv-user-text` family を別途登録する。この family は Segoe UI Emoji を優先し、
+Cambria Math / Segoe UI Historic / Segoe UI Symbol も縦位置補正付きで使う。通常 UI の
+proportional family ではこれらを egui 既定 font の後ろに置き、固定 UI 文言の幅変化を
+抑える。Yu Gothic は日本語 + 基本 Latin
 + Latin-1 Supplement までは網羅するが、**Misc Symbols** や **絵文字**は欠落
-していることが多く、UI に置くと **□ (tofu)** で表示される。egui の NotoEmoji
-fallback はあるが、プライマリが「tofu glyph」を返した時点で fallback まで
-到達しない実環境ケースがあり、過去に複数の文字化けバグが繰り返されている
-(2026-04 までに 🎚 / ✕ で発生)。
+していることが多い。fallback はユーザー由来テキストの文字化けを軽減するためのもので、
+UI の固定文言・ボタン・状態表示へ絵文字や環境依存記号を新規採用する理由にはしない。
+過去に複数の文字化けバグが繰り返されている (2026-04 までに 🎚 / ✕ で発生)。
 
 ### 安全な代替表
 

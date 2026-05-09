@@ -70,6 +70,7 @@ mod ui_adjustment_panel;
 mod ui_analysis_panel;
 pub mod ui_dialogs;
 mod ui_erase;
+pub mod ui_fonts;
 mod ui_fullscreen;
 pub mod ui_helpers;
 mod ui_main;
@@ -650,7 +651,7 @@ fn main() -> eframe::Result {
             // この closure の先頭までの所要時間 = eframe 自体のセットアップ時間。
             emit_startup("creator_enter", None);
             let t = Instant::now();
-            setup_fonts(&cc.egui_ctx);
+            ui_fonts::configure_fonts(&cc.egui_ctx);
             emit_startup("setup_fonts", Some(t));
             // 起動時点で UI テーマを先行適用して、初回フレームでの
             // ダーク/ライト切替ちらつきを避ける (set_visuals は次フレームから
@@ -877,40 +878,4 @@ fn load_icon() -> egui::IconData {
         width,
         height,
     }
-}
-
-fn setup_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-
-    // Windows システムフォントから日本語フォントを読み込む
-    let font_paths = [
-        r"C:\Windows\Fonts\YuGothM.ttc",
-        r"C:\Windows\Fonts\meiryo.ttc",
-        r"C:\Windows\Fonts\msgothic.ttc",
-    ];
-
-    for path in &font_paths {
-        if let Ok(data) = std::fs::read(path) {
-            fonts.font_data.insert(
-                "japanese".to_owned(),
-                Arc::new(egui::FontData::from_owned(data)),
-            );
-            // 日本語フォントをリストの先頭に挿入してプライマリにする。
-            // fallback（末尾追加）にすると Latin フォントとメトリクスが混在し、
-            // TextEdit 等で文字の縦位置がずれる。
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, "japanese".to_owned());
-            fonts
-                .families
-                .entry(egui::FontFamily::Monospace)
-                .or_default()
-                .insert(0, "japanese".to_owned());
-            break;
-        }
-    }
-
-    ctx.set_fonts(fonts);
 }

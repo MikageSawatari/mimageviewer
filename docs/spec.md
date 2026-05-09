@@ -466,7 +466,7 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - [x] 仕様策定
 - [x] Rust環境構築（rustc stable / MSVC toolchain）
 - [x] ウィンドウ表示（eframe 0.33 / egui 0.33）
-- [x] 日本語フォント読み込み（YuGothic/Meiryo/MSGothic）
+- [x] 日本語フォント読み込み（YuGothic/Meiryo/MSGothic）と動画メタデータ向けの記号・絵文字 fallback
 - [x] メニューバー + アドレスバー
 - [x] フォルダ読み込み + サムネイルグリッド表示
 - [x] 仮想スクロール（行スナップ）

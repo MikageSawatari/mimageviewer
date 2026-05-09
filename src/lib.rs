@@ -71,6 +71,7 @@ pub mod susie_loader;
 pub mod sys_memory;
 pub mod tag_write_worker;
 pub mod thumb_loader;
+pub mod ui_fonts;
 pub mod ui_helpers;
 pub mod ui_susie_diagnostic;
 pub mod undo_stack;

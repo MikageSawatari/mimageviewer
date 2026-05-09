@@ -567,7 +567,7 @@ fn draw_unknown_panel(ui: &mut egui::Ui, chunks: &[(String, String)]) {
         ui.label(
             egui::RichText::new(display)
                 .color(TEXT_COLOR)
-                .size(BODY_FONT),
+                .font(crate::ui_fonts::user_text_font(BODY_FONT)),
         );
         ui.add_space(8.0);
     }
@@ -653,7 +653,7 @@ fn draw_key_value_wrapped(ui: &mut egui::Ui, key: &str, val: &str) {
         val,
         0.0,
         egui::TextFormat {
-            font_id: egui::FontId::proportional(BODY_FONT),
+            font_id: crate::ui_fonts::user_text_font(BODY_FONT),
             color: TEXT_COLOR,
             ..Default::default()
         },
@@ -948,5 +948,9 @@ fn draw_text_section(ui: &mut egui::Ui, ctx: &egui::Context, label: &str, text: 
         }
     });
     ui.add_space(2.0);
-    ui.label(egui::RichText::new(text).color(TEXT_COLOR).size(BODY_FONT));
+    ui.label(
+        egui::RichText::new(text)
+            .color(TEXT_COLOR)
+            .font(crate::ui_fonts::user_text_font(BODY_FONT)),
+    );
 }
