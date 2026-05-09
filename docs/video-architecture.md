@@ -268,7 +268,8 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   取れない場合の fallback にする。サンプルの外れ値は中央値で抑える。`✉` / `⋈`
   のような text-presentation 記号は Cambria Math や Segoe UI Emoji より前の
   Meiryo fallback で拾わせ、数学英字は Cambria Math、色付き絵文字は
-  Segoe UI Emoji へ回す。
+  Segoe UI Emoji へ回す。Cambria Math の数学英字も代表 glyph の中心から
+  `FontTweak` 補正を導出し、`…` など主フォント側の句読点と極端に上下ずれしないようにする。
 - `fill_output` の bookkeeping (Phase 9 後の cleanup refactor):
   - **実消費サンプル数ベース**: `pop_front` で取り出した分 (= `real_consumed`) のみ
     `next_pts_secs` を進める。silence 出力中は pts 進行 0 (= 旧版の「常に full want

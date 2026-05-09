@@ -37,6 +37,9 @@ const USER_TEXT_FALLBACKS: &[FallbackFont] = &[
         name: "text_symbols",
         path: r"C:\Windows\Fonts\meiryo.ttc",
         scale: 1.0,
+        // Snapshot-locked to align text symbols with nearby Latin lowercase
+        // and separator strokes; this is a visual text-presentation target,
+        // not the Yu Gothic ideographic center used for emoji.
         y_offset: FallbackYOffset::Fixed(-0.20),
     },
     // Mathematical alphanumeric symbols such as 𝓈𝒸𝓇𝑒𝒶𝓂 are not covered by
@@ -45,7 +48,10 @@ const USER_TEXT_FALLBACKS: &[FallbackFont] = &[
         name: "math",
         path: r"C:\Windows\Fonts\cambria.ttc",
         scale: 0.98,
-        y_offset: FallbackYOffset::Fixed(0.04),
+        y_offset: FallbackYOffset::AlignGlyphCenter {
+            samples: &['𝓈', '𝒸', '𝓇', '𝑒', '𝒶', '𝓂'],
+            fallback: -0.12,
+        },
     },
     FallbackFont {
         name: "emoji",
@@ -174,7 +180,13 @@ fn fallback_y_offset_factor(
     alignment_target: Option<FontAlignmentTarget>,
 ) -> f32 {
     match fallback.y_offset {
-        FallbackYOffset::Fixed(value) => value,
+        FallbackYOffset::Fixed(value) => {
+            crate::logger::log(format!(
+                "ui_fonts: {} alignment fixed scale={:.3} factor={:.4}",
+                fallback.name, fallback.scale, value
+            ));
+            value
+        }
         FallbackYOffset::AlignGlyphCenter {
             samples,
             fallback: fallback_offset,
@@ -291,6 +303,89 @@ mod tests {
             (-0.24..=0.0).contains(&offset),
             "emoji should be nudged upward from measured glyph centers, got {offset}",
         );
+    }
+
+    #[test]
+    fn math_offset_is_derived_from_script_glyph_centers() {
+        let japanese = JAPANESE_FONT_PATHS
+            .iter()
+            .find_map(|path| std::fs::read(path).ok())
+            .expect("Windows Japanese font should be available");
+        let math =
+            std::fs::read(r"C:\Windows\Fonts\cambria.ttc").expect("Cambria should be available");
+        let body_text = font_center_y_for_samples(&japanese, &['今', 'あ'])
+            .or_else(|| font_metric_center_y(&japanese))
+            .map(|center_y| FontAlignmentTarget { center_y })
+            .expect("Japanese glyph center should be measurable");
+        let math_font = USER_TEXT_FALLBACKS
+            .iter()
+            .find(|font| font.name == "math")
+            .expect("math fallback definition should exist");
+        let samples = ['𝓈', '𝒸', '𝓇', '𝑒', '𝒶', '𝓂'];
+        let fallback_center = font_center_y_for_samples(&math, &samples)
+            .expect("math script center should be measurable");
+        let offset = fallback_y_offset_factor(math_font, &math, Some(body_text));
+        let expected = (fallback_center - body_text.center_y / math_font.scale)
+            .clamp(-DERIVED_Y_OFFSET_CLAMP, DERIVED_Y_OFFSET_CLAMP);
+        assert!(
+            (offset - expected).abs() < f32::EPSILON,
+            "math offset should follow egui's scaled y_offset formula: {offset} vs {expected}",
+        );
+        assert!(
+            offset < 0.0,
+            "math script should be nudged upward to sit with Yu Gothic punctuation, got {offset}",
+        );
+    }
+
+    #[test]
+    fn text_symbol_fallback_has_expected_symbols() {
+        let data =
+            std::fs::read(r"C:\Windows\Fonts\meiryo.ttc").expect("Meiryo should be available");
+        let face = ttf_parser::Face::parse(&data, 0).expect("Meiryo should parse");
+        for symbol in ['✉', '⋈', '★', '♪', '※', '☎'] {
+            assert!(
+                face.glyph_index(symbol).is_some(),
+                "Meiryo should cover text symbol {symbol}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_text_routes_common_metadata_symbols() {
+        let mut fonts = egui::FontDefinitions::default();
+        install_mimageviewer_fonts(&mut fonts);
+        let family = fonts
+            .families
+            .get(&egui::FontFamily::Name(Arc::<str>::from(
+                USER_TEXT_FAMILY_NAME,
+            )))
+            .expect("user text family should be registered");
+        for (ch, expected_font) in [
+            ('…', "japanese"),
+            ('✉', "text_symbols"),
+            ('⋈', "text_symbols"),
+            ('★', "japanese"),
+            ('♪', "japanese"),
+            ('※', "japanese"),
+            ('☎', "japanese"),
+            ('𝓈', "math"),
+            ('💗', "emoji"),
+        ] {
+            let actual = family.iter().find(|font_name| {
+                fonts
+                    .font_data
+                    .get(*font_name)
+                    .and_then(|font| ttf_parser::Face::parse(font.font.as_ref(), font.index).ok())
+                    .and_then(|face| face.glyph_index(ch))
+                    .is_some()
+            });
+            println!("ui_fonts route {ch:?} -> {actual:?}");
+            assert_eq!(
+                actual.map(String::as_str),
+                Some(expected_font),
+                "unexpected fallback route for {ch:?} in {family:?}",
+            );
+        }
     }
 
     #[test]

@@ -795,6 +795,8 @@ baseline 補正を計算する。egui 0.33 は `ab_glyph` の outline 描画を�
 にする。複数サンプルは中央値で扱う。`✉` / `⋈` のような text-presentation 記号は
 Cambria Math や Segoe UI Emoji より前の Meiryo fallback で拾わせ、ブラウザに近い
 文字表示へ寄せる。数学英字は Cambria Math、色付き絵文字は Segoe UI Emoji へ回す。
+Cambria Math の数学英字も代表 glyph の中心から `FontTweak` 補正を導出し、`…` など
+主フォント側の句読点と極端に上下ずれしないようにする。
 Segoe UI Historic / Segoe UI Symbol も
 縦位置補正付きで使う。通常 UI の proportional family ではこれらを egui 既定 font の
 後ろに置き、固定 UI 文言の幅変化を抑える。Yu Gothic は日本語 + 基本 Latin
