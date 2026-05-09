@@ -591,8 +591,18 @@ impl App {
 
     /// 右 Ctrl ホールド中だけ、mIV 側の派生表示 (補正 / AI / 消しゴム補完) を
     /// 迂回して元画像テクスチャを選ぶ。
+    ///
+    /// フォーカスは `ctx.input(|i| i.viewport().focused)` ではなく
+    /// `self.fs_prev_focused` で確認する: この関数の呼び出し元
+    /// `prepare_fullscreen_state` は `show_viewport_immediate` の **外側** で
+    /// 呼ばれているので、ここでの ctx はメインビューポートのもの = フルスクリーンが
+    /// OS フォーカスを持っている間は常に `Some(false)` を返してしまう。
+    /// `fs_prev_focused` はフルスクリーン viewport closure 内で毎フレーム更新される
+    /// ので、フルスクリーン側の前フレーム focus 状態を反映する。`GetAsyncKeyState`
+    /// 単体だと動画/アニメ駆動の repaint 中に他アプリの右Ctrl を拾うリスクがあるので、
+    /// 必ずフォーカス gate と AND させる。
     fn original_preview_active(&self, ctx: &egui::Context, idx: usize) -> bool {
-        if !ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
+        if !self.fs_prev_focused {
             return false;
         }
         if self.any_modal_dialog_open_for_fullscreen_keys() {
