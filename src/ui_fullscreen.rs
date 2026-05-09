@@ -5693,11 +5693,6 @@ impl App {
         }
     }
 
-    /// 動画 VideoPlayer の `displayed_frame_seq` (= GPU/CPU 経路問わず tick で +1)
-    /// の変化で frame interval (ms) を履歴に記録。skip delta は decoder 側
-    /// `dropped_full` と UI 側 `dropped_past` に分けて記録し、色分け表示する。
-    /// 期待 interval (= 1000/fps) の 3x を超える値は「再生開始 / seek / pause 復帰
-    /// 等の transient による wall 待ち時間」とみなして履歴に入れない。
     /// Perf graph の history と関連トラッキング状態を全部クリア。
     /// 速度変更 / overlay トグル時に呼ぶ。旧速度サンプルが新スケールで誤色表示
     /// される現象を回避する。
@@ -5710,6 +5705,11 @@ impl App {
         self.video_perf_pause_start = None;
     }
 
+    /// 動画 VideoPlayer の `displayed_frame_seq` (= GPU/CPU 経路問わず tick で +1)
+    /// の変化で frame interval (ms) を履歴に記録。skip delta は decoder 側
+    /// `dropped_full` と UI 側 `dropped_past` に分けて記録し、色分け表示する。
+    /// 期待 interval (= 1000/fps) の 3x を超える値は「再生開始 / seek / pause 復帰
+    /// 等の transient による wall 待ち時間」とみなして履歴に入れない。
     pub(crate) fn sample_video_perf(&mut self, fs_idx: usize) {
         let snapshot: Option<(u64, u64, u64, usize, f32, bool, bool)> =
             match self.fs_cache.get(&fs_idx) {

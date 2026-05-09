@@ -1729,6 +1729,7 @@ fn run_native_video_output(
                             present_call_ms: outcome.present_call_ms as f32,
                             late_ms: late_ms as f32,
                             source_delta_ms: source_delta_ms as f32,
+                            playback_speed: source.clock.playback_speed() as f32,
                         },
                         source.present_stats.overlay_snapshot(run_started.elapsed()),
                     );

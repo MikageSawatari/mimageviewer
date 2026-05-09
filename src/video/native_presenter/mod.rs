@@ -257,7 +257,13 @@ pub struct NativeOverlayPerfSample {
     pub present_waitable_ms: f32,
     pub present_call_ms: f32,
     pub late_ms: f32,
+    /// PTS delta between consecutive presented frames (= 1/native_fps の生値)。
+    /// 再生速度の影響を受けない (= 30fps なら常に 33.33ms)。Y 軸 / gap 判定には
+    /// `playback_speed` で割って実 frame interval に正規化したものを使う。
     pub source_delta_ms: f32,
+    /// この sample が記録された時点の再生速度倍率 (= 0.25..=4.0)。
+    /// 0.5x なら実 frame interval は `source_delta_ms / 0.5 = 2 * source_delta_ms`。
+    pub playback_speed: f32,
 }
 
 #[derive(Clone, Debug)]
@@ -1983,6 +1989,15 @@ impl NativeEguiOverlay {
         self.video_muted = muted;
         self.video_playback_speed = playback_speed;
         self.video_frame_step_active = frame_step_active;
+        if speed_changed {
+            // 速度変更前のサンプルは旧 playback_speed のまま `perf_history` に残るが、
+            // Y 軸スケールと gap 判定は最新サンプル群の median から導出されるため、
+            // 過渡期に旧サンプルが新スケール基準で再解釈されて色がちらつく。新速度
+            // で素のグラフから始めるためにクリアする (= reset_video_perf_history と
+            // 同じ意図)。
+            self.perf_history.clear();
+            self.perf_pause_gap_pending = false;
+        }
         if duration_changed
             || position_changed
             || playing_changed
@@ -2017,10 +2032,14 @@ impl NativeEguiOverlay {
         snapshot: NativeOverlayPerfSnapshot,
     ) {
         if let Some(prev) = self.perf_history.back() {
+            // synthetic arrival は実時間ベースの間隔で前進させる必要がある。
+            // 0.5x 再生では実 interval は source_delta_ms の 2 倍 = 横スクロールも
+            // 2 倍遅くなるべき。speed-adjusted な effective interval を使う。
             let expected_ms = native_perf_expected_frame_ms_from_samples([*prev, sample])
                 .unwrap_or_else(|| {
-                    if sample.source_delta_ms.is_finite() && sample.source_delta_ms > 0.5 {
-                        sample.source_delta_ms
+                    let sample_eff = native_perf_effective_interval_ms(&sample);
+                    if sample_eff.is_finite() && sample_eff > 0.5 {
+                        sample_eff
                     } else if prev.interval_ms.is_finite() && prev.interval_ms > 0.5 {
                         prev.interval_ms
                     } else {
@@ -2028,7 +2047,7 @@ impl NativeEguiOverlay {
                     }
                 });
             sample.arrival =
-                prev.arrival + Duration::from_secs_f32((expected_ms / 1000.0).clamp(0.001, 0.25));
+                prev.arrival + Duration::from_secs_f32((expected_ms / 1000.0).clamp(0.001, 0.5));
             if self.perf_pause_gap_pending {
                 sample.interval_ms = expected_ms;
             }

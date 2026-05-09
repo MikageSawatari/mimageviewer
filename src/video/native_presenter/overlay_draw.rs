@@ -1812,13 +1812,24 @@ pub(super) fn draw_native_tile_overlay(
         });
 }
 
+/// `source_delta_ms` を再生速度で正規化した「実 frame interval (ms)」を返す。
+/// 0.5x なら 2 倍、2x なら半分。speed が NaN や 0 近傍なら 1.0 倍として扱う。
+pub(super) fn native_perf_effective_interval_ms(sample: &NativeOverlayPerfSample) -> f32 {
+    let speed = if sample.playback_speed.is_finite() && sample.playback_speed > 0.05 {
+        sample.playback_speed
+    } else {
+        1.0
+    };
+    sample.source_delta_ms / speed
+}
+
 pub(super) fn native_perf_expected_frame_ms(history: &[NativeOverlayPerfSample]) -> f32 {
     native_perf_expected_frame_ms_from_values(
         history
             .iter()
             .rev()
             .take(180)
-            .map(|sample| sample.source_delta_ms),
+            .map(native_perf_effective_interval_ms),
     )
     .unwrap_or(16.67)
 }
@@ -1828,7 +1839,9 @@ where
     I: IntoIterator<Item = NativeOverlayPerfSample>,
 {
     native_perf_expected_frame_ms_from_values(
-        samples.into_iter().map(|sample| sample.source_delta_ms),
+        samples
+            .into_iter()
+            .map(|sample| native_perf_effective_interval_ms(&sample)),
     )
 }
 
@@ -1852,8 +1865,9 @@ pub(super) fn native_perf_sample_has_frame_gap(sample: &NativeOverlayPerfSample)
     if !interval.is_finite() || interval <= 0.0 {
         return false;
     }
-    let expected = if sample.source_delta_ms.is_finite() && sample.source_delta_ms > 1.0 {
-        sample.source_delta_ms
+    let effective = native_perf_effective_interval_ms(sample);
+    let expected = if effective.is_finite() && effective > 1.0 {
+        effective
     } else {
         16.67
     };
