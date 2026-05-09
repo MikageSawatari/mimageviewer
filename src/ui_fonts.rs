@@ -20,7 +20,9 @@ const USER_TEXT_FALLBACKS: &[FallbackFont] = &[
         name: "emoji",
         path: r"C:\Windows\Fonts\seguiemj.ttf",
         scale: 0.90,
-        y_offset_factor: 0.06,
+        // Segoe UI Emoji sits lower than Yu Gothic in egui's glyph metrics.
+        // Nudge it up so leading emoji lines match Japanese text baselines.
+        y_offset_factor: -0.12,
     },
     // Mathematical alphanumeric symbols such as 𝓈𝒸𝓇𝑒𝒶𝓂 are not covered by
     // Yu Gothic. A small downward tweak keeps them on the same visual baseline.
