@@ -1,4 +1,5 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use uuid::Uuid;
 
 const MAX_FAVORITES: usize = 20;
@@ -888,6 +889,15 @@ pub struct Settings {
     pub vst3_video_compact: bool,
     #[serde(default)]
     pub vst3_chain_slots: Vst3ChainPresetSlots,
+
+    // ── settings.json 内部メタ ──
+    /// 直近にこの settings.json を書き込んだ mIV のバージョン。
+    /// `Settings::load` でアプリの現バージョンと比較し、変わっていれば
+    /// 旧版のスナップショットを `settings.json.preupgrade-v<old>` として
+    /// 退避する (= バージョン跨ぎの安全網)。
+    /// 新規 (= 過去に保存履歴なし) や旧コードで保存された JSON では None。
+    #[serde(default)]
+    pub last_seen_version: Option<String>,
 }
 
 /// VST3 プラグインチェーンの 1 エントリ。
@@ -1251,8 +1261,363 @@ impl Default for Settings {
             vst3_gui_visible: true,
             vst3_video_compact: false,
             vst3_chain_slots: Vst3ChainPresetSlots::default(),
+            last_seen_version: None,
         }
     }
+}
+
+// -----------------------------------------------------------------------
+// settings.json バックアップ / アトミック保存
+// -----------------------------------------------------------------------
+//
+// 過去に新バイナリ初回起動時に settings.json が default で上書きされ、お気に入り
+// やタグが消えるユーザー報告 (2026-05-09) があった。再発しても自動復旧できるよう、
+// 以下の安全網を 1 セットで導入する:
+//
+//   #1 atomic save                  — 半端ファイル根絶
+//   #2 世代バックアップ (10 世代)   — `settings.json.bak1..bak10`
+//   #3 logger 出力                  — 失敗を `mimageviewer.log` に残す
+//   #4 アップグレード前バックアップ — `settings.json.preupgrade-v<old>`
+//   #5 quarantine                   — 壊れた main を `settings.json.broken-<TS>` に退避
+//
+// 詳細フロー:
+//   load(): try main → fail なら quarantine → bak1..bak10 を新→古で順試行 →
+//            復旧成功なら main に copy 戻し / 全滅なら Default。
+//            その後バージョン跨ぎを検出したら preupgrade snapshot を作成。
+//   save(): プロセス内最初の保存だけ rotate_backups で世代を 1 段ずらしてから
+//            atomic write で main を書き換える。
+
+const BACKUP_COUNT: usize = 10;
+
+/// 現プロセス内で `Settings::save()` の世代ローテーションが既に実施されたかを記録する。
+/// 起動 1 回につき最初の save() でのみ rotation を走らせ、以降の保存は
+/// settings.json を上書きするだけ (= bak1 = "今セッションを開いた時点の状態" を維持)。
+static BACKUP_DONE_THIS_SESSION: AtomicBool = AtomicBool::new(false);
+
+/// 起動時に main がパースエラーではなく **I/O エラー** で読めなかった場合に立てる。
+///
+/// このセッションでは backup から in-memory 復旧して動作するが、`Settings::save()`
+/// は **完全にスキップ** する。理由: save() は `rotate_backups` で `settings.json -> bak1`
+/// に rename し、その後 `write_atomic` で新規 main を作る。main が
+/// (権限拒否・ロック・ディレクトリと衝突等で) 一時的にアクセス不能なだけのとき、
+/// この rename が成功してしまうと **真に保護したかった main** が bak1 に置き換わり
+/// 失われる (Codex P2 2026-05-09 指摘)。
+///
+/// 抑止結果として、このセッションでユーザーが触った設定は永続化されない。
+/// 次回起動で I/O 障害が解消していれば main をそのまま読めるし、解消していなくても
+/// backup から再度 in-memory 復旧する。**意図したトレードオフ**: 「セッション中の
+/// 入力消失」 vs 「本物の main 喪失」。後者の方が遥かに深刻なので前者を選ぶ。
+static MAIN_UNREADABLE_THIS_SESSION: AtomicBool = AtomicBool::new(false);
+
+fn backup_path(main: &Path, n: usize) -> PathBuf {
+    let mut name = main
+        .file_name()
+        .map(|n| n.to_owned())
+        .unwrap_or_else(|| std::ffi::OsString::from("settings.json"));
+    name.push(format!(".bak{}", n));
+    main.with_file_name(name)
+}
+
+fn quarantine_path(main: &Path) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut name = main
+        .file_name()
+        .map(|n| n.to_owned())
+        .unwrap_or_else(|| std::ffi::OsString::from("settings.json"));
+    name.push(format!(".broken-{}", stamp));
+    main.with_file_name(name)
+}
+
+fn preupgrade_path(main: &Path, prev_version: &str) -> PathBuf {
+    let label = safe_version_label(prev_version);
+    let mut name = main
+        .file_name()
+        .map(|n| n.to_owned())
+        .unwrap_or_else(|| std::ffi::OsString::from("settings.json"));
+    name.push(format!(".preupgrade-v{}", label));
+    main.with_file_name(name)
+}
+
+/// バージョン文字列をファイル名に埋めても安全な形にする。
+/// `[A-Za-z0-9._-]` 以外は `_` に置換、空文字は "unknown"。
+fn safe_version_label(v: &str) -> String {
+    let cleaned: String = v
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "unknown".to_string()
+    } else {
+        cleaned
+    }
+}
+
+/// `try_parse_settings_file` の結果。
+///
+/// I/O エラー (`PermissionDenied`, ファイルロック中, デバイスエラー等) と
+/// 内容のエラー (UTF-8 デコード失敗 / JSON パース失敗) を区別する。
+/// 前者は **一時的かもしれない** ため main を quarantine してはならず、
+/// 後者は本当に壊れているので退避して bak から復旧する (Codex P2 2026-05-09)。
+enum LoadFileResult {
+    Ok(Settings),
+    NotFound,
+    /// 読み取り I/O 失敗。ファイルは存在するが内容を取得できなかった
+    /// (権限・ロック・デバイス障害等)。再試行で直る可能性があるので退避しない。
+    IoError,
+    /// 内容を bytes として取得できたが Settings として解釈できなかった
+    /// (UTF-8 でない / JSON でない / スキーマ違反)。退避対象。
+    ParseError,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for LoadFileResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LoadFileResult::Ok(_) => write!(f, "Ok(_)"),
+            LoadFileResult::NotFound => write!(f, "NotFound"),
+            LoadFileResult::IoError => write!(f, "IoError"),
+            LoadFileResult::ParseError => write!(f, "ParseError"),
+        }
+    }
+}
+
+/// 指定パスの JSON を `Settings` にパースする。詳細は `LoadFileResult` を参照。
+///
+/// `read_to_string` ではなく `std::fs::read` で bytes を読んでから UTF-8 変換することで、
+/// I/O 段階のエラー (`InvalidData` 以外の OS エラー) と内容段階のエラー (UTF-8 / JSON) を
+/// 切り分ける。前者は IoError、後者はどちらも ParseError。
+/// `NotFound` のみは正常な「初回起動」相当なのでログを抑制する。
+fn try_parse_settings_file(path: &Path) -> LoadFileResult {
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return LoadFileResult::NotFound,
+        Err(e) => {
+            settings_diag_log(&format!("settings: read failed {}: {}", path.display(), e));
+            return LoadFileResult::IoError;
+        }
+    };
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            settings_diag_log(&format!(
+                "settings: UTF-8 decode failed {}: {}",
+                path.display(),
+                e
+            ));
+            return LoadFileResult::ParseError;
+        }
+    };
+    match serde_json::from_str::<Settings>(text) {
+        Ok(s) => LoadFileResult::Ok(s),
+        Err(e) => {
+            settings_diag_log(&format!(
+                "settings: JSON parse failed {}: {}",
+                path.display(),
+                e
+            ));
+            LoadFileResult::ParseError
+        }
+    }
+}
+
+/// `try_load_with_recovery` の結果。
+///
+/// `main_unreadable` は **main が I/O エラーで読めなかった** ことを示す。
+/// パース失敗 (`ParseError`) は main を quarantine してしまうので、その後はもう
+/// "main が手付かずで残っているケース" ではない → false に集約する。
+/// 一方 `IoError` は main をそのまま残しているので、後段の save() が rotate で
+/// 触らないよう呼び出し元 (`Settings::load`) でフラグ伝搬する。
+struct LoadOutcome {
+    settings: Option<Settings>,
+    main_unreadable: bool,
+}
+
+/// メイン → bak1 → bak2 → … の順で復旧を試みる。
+///
+/// メインが **パース失敗** (= 内容が壊れている) のときだけ `.broken-<TS>` に rename 退避し、
+/// I/O エラー (権限拒否・ロック・ディレクトリと衝突等) のときは退避しない
+/// (Codex P2 2026-05-09)。I/O エラーは一時的な可能性があり、ここで rename して
+/// しまうと正常なファイルを失う恐れがある。
+/// 復旧できた場合は **退避が成功した時のみ** bak の内容を main に copy で書き戻し、
+/// 次回 load から同じ復旧を繰り返さないようにする。全滅は `settings = None`。
+fn try_load_with_recovery(main: &Path) -> LoadOutcome {
+    let main_result = try_parse_settings_file(main);
+    if let LoadFileResult::Ok(s) = main_result {
+        return LoadOutcome {
+            settings: Some(s),
+            main_unreadable: false,
+        };
+    }
+
+    let main_was_io_error = matches!(main_result, LoadFileResult::IoError);
+    let main_quarantined = matches!(main_result, LoadFileResult::ParseError);
+    if main_quarantined {
+        let q = quarantine_path(main);
+        match std::fs::rename(main, &q) {
+            Ok(_) => settings_diag_log(&format!(
+                "settings: quarantined corrupt {} -> {}",
+                main.display(),
+                q.display()
+            )),
+            Err(e) => settings_diag_log(&format!(
+                "settings: quarantine failed {} -> {}: {}",
+                main.display(),
+                q.display(),
+                e
+            )),
+        }
+    }
+
+    for n in 1..=BACKUP_COUNT {
+        let bak = backup_path(main, n);
+        match try_parse_settings_file(&bak) {
+            LoadFileResult::Ok(s) => {
+                settings_diag_log(&format!("settings: recovered from {}", bak.display()));
+                // 退避が走ったときのみ main に書き戻す。I/O エラーで main を残した
+                // ケースは触らない (= ロックが解けたら元の main をまた読める)。
+                if main_quarantined {
+                    if let Err(e) = std::fs::copy(&bak, main) {
+                        settings_diag_log(&format!(
+                            "settings: failed to write recovered content back to {}: {}",
+                            main.display(),
+                            e
+                        ));
+                    }
+                }
+                return LoadOutcome {
+                    settings: Some(s),
+                    main_unreadable: main_was_io_error,
+                };
+            }
+            // NotFound / IoError / ParseError はどれも次の bak を試すだけ。
+            // bak ファイル自体は退避しない (= 壊れた bak はそのまま放置し、
+            // ローテーションで自然に押し出されるのを待つ)。
+            _ => continue,
+        }
+    }
+
+    LoadOutcome {
+        settings: None,
+        main_unreadable: main_was_io_error,
+    }
+}
+
+/// 世代バックアップを 1 段ずらす。`bak{N}` を捨て、`bakN-1 -> bakN` …
+/// 最後に `settings.json -> bak1` で現状を退避する。本関数は **メインを書き込む前**
+/// に呼ぶ前提 (= 実行後 main は存在しなくなるが、続く `write_atomic` が新ファイルを作る)。
+fn rotate_backups(main: &Path) {
+    // 一番古い世代を捨てる。
+    let oldest = backup_path(main, BACKUP_COUNT);
+    let _ = std::fs::remove_file(&oldest);
+
+    // bak{n} -> bak{n+1} (高い番号から処理しないと衝突する)。
+    for n in (1..BACKUP_COUNT).rev() {
+        let from = backup_path(main, n);
+        let to = backup_path(main, n + 1);
+        if from.exists() {
+            if let Err(e) = std::fs::rename(&from, &to) {
+                settings_diag_log(&format!(
+                    "settings: rotate {} -> {} failed: {}",
+                    from.display(),
+                    to.display(),
+                    e
+                ));
+            }
+        }
+    }
+
+    // 最後に main -> bak1。
+    let bak1 = backup_path(main, 1);
+    if main.exists() {
+        if let Err(e) = std::fs::rename(main, &bak1) {
+            settings_diag_log(&format!(
+                "settings: rotate {} -> {} failed: {}",
+                main.display(),
+                bak1.display(),
+                e
+            ));
+        }
+    }
+}
+
+/// アトミック書き込み: `<path>.tmp` に書き込んでから rename で置き換える。
+///
+/// `std::fs::rename` は **Windows でも `MoveFileExW(MOVEFILE_REPLACE_EXISTING |
+/// MOVEFILE_WRITE_THROUGH)` 経由で atomic な置換を行う** (Rust 1.70+ の仕様、
+/// `library/std/src/sys/pal/windows/fs.rs` 参照)。POSIX の rename(2) も同様に
+/// atomic。よって既存 dest を事前削除する必要はなく、削除すると逆に
+/// rename 失敗時に main が消えてセッション中の変更が飛ぶ
+/// (Codex P2 2026-05-09 指摘)。
+///
+/// rename 失敗時は新内容が `.tmp` に残っていても main の旧内容は無傷なので、
+/// アプリは古い設定で動き続ける。`.tmp` は best-effort で掃除する。
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = {
+        let mut name = path
+            .file_name()
+            .map(|n| n.to_owned())
+            .unwrap_or_else(|| std::ffi::OsString::from("settings.json"));
+        name.push(".tmp");
+        path.with_file_name(name)
+    };
+    std::fs::write(&tmp, bytes)?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// settings 復旧経路向けの永続診断ログ。
+///
+/// `crate::logger::log` はデフォルトでは未初期化 (`logger::init()` が
+/// `cfg!(debug_assertions) || --log` でしか呼ばれない、`src/main.rs` 参照) なので、
+/// **release ビルドの通常起動では復旧ログが残らない** (Codex P2 2026-05-09 指摘)。
+/// 設定リセット系のユーザー報告は再現が難しく、後追い解析するためにはイベントが
+/// 確実にディスクに残っている必要がある。
+///
+/// そこで本関数は:
+///   1. `crate::logger::log` にも投げる (initialized なら mimageviewer.log に残る)
+///   2. **常に** `<data_dir>/logs/settings.log` に append する
+///      (= release ビルドでも `--log` 不要で診断履歴が残る)
+///
+/// `panic.log` と同じ「常時 ON の診断ログ」枠の扱い。
+fn settings_diag_log(msg: &str) {
+    use std::io::Write;
+
+    // dev / `--log` 起動時はメインの logger にも残しておく。
+    crate::logger::log(msg);
+
+    // <data_dir>/logs/settings.log は常に append する (init 不要の独立 sink)。
+    let path = crate::data_dir::logs_dir().join("settings.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{timestamp}] {msg}\n");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(line.as_bytes()));
+}
+
+#[cfg(test)]
+fn reset_backup_state_for_test() {
+    BACKUP_DONE_THIS_SESSION.store(false, Ordering::Relaxed);
+    MAIN_UNREADABLE_THIS_SESSION.store(false, Ordering::Relaxed);
 }
 
 impl Settings {
@@ -1267,17 +1632,25 @@ impl Settings {
 
     pub fn load() -> Self {
         let path = Self::settings_path();
-        let data = match std::fs::read_to_string(&path) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("settings load failed: {} ({})", path.display(), e);
-                return Self::default();
-            }
-        };
-        let mut settings: Self = serde_json::from_str(&data).unwrap_or_else(|e| {
-            eprintln!("settings JSON parse failed: {} ({})", path.display(), e);
+        // メインがパース可能ならそのまま、壊れていれば main を quarantine してから
+        // bak1..bak{BACKUP_COUNT} を新→古で順試行する。全滅したら Default。
+        let outcome = try_load_with_recovery(&path);
+        // I/O エラーで main がそのまま残っているケースは、本セッションでの
+        // save() を抑止する (= rotate_backups で main が壊れるのを防ぐ)。
+        if outcome.main_unreadable {
+            MAIN_UNREADABLE_THIS_SESSION.store(true, Ordering::Relaxed);
+            settings_diag_log(&format!(
+                "settings: {} unreadable (I/O error); save() suppressed for this session",
+                path.display()
+            ));
+        }
+        let mut settings = outcome.settings.unwrap_or_else(|| {
+            settings_diag_log(
+                "settings: no readable settings/backup found; using built-in default",
+            );
             Self::default()
         });
+
         // migration: UUID nil チェック → 割り当てが発生したかを検出
         let had_nil_uuids = settings.favorites.iter().any(|f| f.id.is_nil());
         let autoplay_mode_migrated =
@@ -1288,9 +1661,45 @@ impl Settings {
         settings.sanitize();
         let video_volume_sanitized =
             (settings.video_volume - video_volume_before_sanitize).abs() > 1.0e-9;
-        // 新規 UUID を発行したので settings.json に書き戻して永続化する。
-        // これで次回起動以降は sanitize でのマイグレーションが不要になる。
-        if had_nil_uuids || vst3_migrated || autoplay_mode_migrated || video_volume_sanitized {
+
+        // バージョン跨ぎの安全網 (#4):
+        // 直近に保存したバイナリと現バイナリのバージョンが違うなら、
+        // 現状の settings.json を `settings.json.preupgrade-v<old>` に複製して
+        // バージョン固定スナップショットとして残す。アップグレードでスキーマが
+        // 壊れて自動復旧も効かなかったケースの最終ライフラインになる。
+        let current_version = env!("CARGO_PKG_VERSION");
+        let prev_version = settings.last_seen_version.clone();
+        let version_changed = prev_version.as_deref() != Some(current_version);
+        if version_changed {
+            let prev_label = prev_version.as_deref().unwrap_or("unknown");
+            let pre_path = preupgrade_path(&path, prev_label);
+            // 同じ "前バージョン" 名のスナップショットが既にあれば上書きしない
+            // (= 同バージョンを複数回起動しても直近 1 回分だけが残る挙動)。
+            if !pre_path.exists() && path.exists() {
+                match std::fs::copy(&path, &pre_path) {
+                    Ok(_) => settings_diag_log(&format!(
+                        "settings: pre-upgrade snapshot saved {} (prev v{})",
+                        pre_path.display(),
+                        prev_label
+                    )),
+                    Err(e) => settings_diag_log(&format!(
+                        "settings: pre-upgrade snapshot failed {}: {}",
+                        pre_path.display(),
+                        e
+                    )),
+                }
+            }
+            settings.last_seen_version = Some(current_version.to_string());
+        }
+
+        // 何かしら値が変わったなら書き戻して永続化する。
+        // これで次回起動以降は sanitize / version 判定での副作用が不要になる。
+        if had_nil_uuids
+            || vst3_migrated
+            || autoplay_mode_migrated
+            || video_volume_sanitized
+            || version_changed
+        {
             settings.save();
         }
         settings
@@ -1433,21 +1842,47 @@ impl Settings {
     }
 
     pub fn save(&self) {
+        // 起動時に main が I/O エラーで読めなかったケースでは、save() の副作用で
+        // main を壊さないために本セッションは一切書き込まない (Codex P2 2026-05-09)。
+        // rotate_backups の `settings.json -> bak1` rename が「アクセス不能なだけの
+        // 真の main」を bak1 に置き換えてしまう問題を回避する。
+        if MAIN_UNREADABLE_THIS_SESSION.load(Ordering::Relaxed) {
+            settings_diag_log(
+                "settings: save suppressed (main was unreadable at load; preserving disk state)",
+            );
+            return;
+        }
         let path = Self::settings_path();
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 eprintln!("settings dir create failed: {} ({})", parent.display(), e);
+                settings_diag_log(&format!(
+                    "settings: dir create failed {}: {}",
+                    parent.display(),
+                    e
+                ));
             }
         }
-        match serde_json::to_string_pretty(self) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(&path, json) {
-                    eprintln!("settings save failed: {} ({})", path.display(), e);
-                }
-            }
+        let json = match serde_json::to_string_pretty(self) {
+            Ok(s) => s,
             Err(e) => {
                 eprintln!("settings serialize failed: {e}");
+                settings_diag_log(&format!("settings: serialize failed: {e}"));
+                return;
             }
+        };
+
+        // プロセス内最初の保存だけ世代ローテーションを走らせる。
+        // ウィンドウ位置・動画再生位置などランタイム書込みで頻繁に save() が
+        // 呼ばれるため、毎回ローテートすると bak が即座に流れて 10 世代の
+        // 安全網が無効化されてしまう。1 起動 = 1 世代のスナップショットに留める。
+        if !BACKUP_DONE_THIS_SESSION.swap(true, Ordering::Relaxed) {
+            rotate_backups(&path);
+        }
+
+        if let Err(e) = write_atomic(&path, json.as_bytes()) {
+            eprintln!("settings save failed: {} ({})", path.display(), e);
+            settings_diag_log(&format!("settings: save failed {}: {}", path.display(), e));
         }
     }
 
@@ -1865,5 +2300,471 @@ mod tests {
         // 21個目は追加できない
         assert!(!s.add_favorite("Overflow".to_string(), PathBuf::from(r"C:\overflow")));
         assert_eq!(s.favorites.len(), MAX_FAVORITES);
+    }
+
+    // -----------------------------------------------------------------
+    // Backup / atomic save tests (#1, #2, #3, #4, #5)
+    // -----------------------------------------------------------------
+
+    /// data_dir override は OnceLock 状態に書き込むので並列テストで衝突する。
+    /// 以下のテストはこの mutex で直列化する (App テストの PHASE_C_LOCK と同じ思想)。
+    static BACKUP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct BackupTestEnv {
+        _tmp: tempfile::TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for BackupTestEnv {
+        fn drop(&mut self) {
+            crate::data_dir::set_test_override(None);
+            // 後続テストが state を持ち込まないようリセット。
+            reset_backup_state_for_test();
+        }
+    }
+
+    fn setup_backup_env() -> BackupTestEnv {
+        let lock = BACKUP_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        crate::data_dir::set_test_override(Some(tmp.path().to_path_buf()));
+        reset_backup_state_for_test();
+        BackupTestEnv {
+            _tmp: tmp,
+            _lock: lock,
+        }
+    }
+
+    fn settings_with_favorite(name: &str) -> Settings {
+        let mut s = Settings::default();
+        s.add_favorite(name.to_string(), PathBuf::from(format!(r"C:\{name}")));
+        s
+    }
+
+    /// #1 atomic save / #4 preupgrade: 普通のラウンドトリップで .tmp が残らず、
+    ///    保存後の last_seen_version が現バージョンに更新されること。
+    #[test]
+    fn save_load_roundtrip_clean() {
+        let _env = setup_backup_env();
+        let s = settings_with_favorite("alpha");
+        s.save();
+
+        let main_path = Settings::settings_path();
+        let tmp_path = main_path.with_file_name("settings.json.tmp");
+        assert!(main_path.exists(), "main settings.json should exist");
+        assert!(!tmp_path.exists(), "tmp file should be cleaned up");
+
+        let loaded = Settings::load();
+        assert_eq!(loaded.favorites.len(), 1);
+        assert_eq!(loaded.favorites[0].name, "alpha");
+        assert_eq!(
+            loaded.last_seen_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// #2 世代バックアップ: 起動 (= save 1 回) ごとに 1 段ずつ rotate される。
+    /// 同プロセス内では 2 回目以降の save() で rotate しない (= bak1 が
+    /// "セッション開始時の状態" のまま維持される) ことを確認する。
+    #[test]
+    fn save_rotates_only_once_per_session() {
+        let _env = setup_backup_env();
+
+        let s1 = settings_with_favorite("first");
+        s1.save();
+
+        let main_path = Settings::settings_path();
+        let bak1 = backup_path(&main_path, 1);
+        // 初回 save: 旧 main は無いので bak1 はまだ作られていない。
+        assert!(!bak1.exists(), "no rotation source on initial save");
+
+        // 同プロセス内で 2 回保存しても rotation は走らないので bak1 は依然空。
+        let s2 = settings_with_favorite("second");
+        s2.save();
+        assert!(
+            !bak1.exists(),
+            "second save in same session must not rotate"
+        );
+
+        // 別セッションを模す (= rotation flag をリセット) と、次の save で
+        // 直前 main が bak1 へ退避される。
+        reset_backup_state_for_test();
+        let s3 = settings_with_favorite("third");
+        s3.save();
+        assert!(
+            bak1.exists(),
+            "next session should rotate prior main into bak1"
+        );
+
+        let prior: Settings =
+            serde_json::from_str(&std::fs::read_to_string(&bak1).unwrap()).unwrap();
+        assert_eq!(prior.favorites[0].name, "second");
+    }
+
+    /// 10 セッション分 rotate すると bak10 まで埋まり、それ以降の世代は捨てられる。
+    #[test]
+    fn rotation_keeps_at_most_10_generations() {
+        let _env = setup_backup_env();
+        let main_path = Settings::settings_path();
+
+        // セッション 1..=12 を模す: 各セッションで save 1 回 + rotation flag リセット。
+        for i in 1..=12 {
+            reset_backup_state_for_test();
+            let s = settings_with_favorite(&format!("gen{i}"));
+            s.save();
+        }
+
+        // bak1..bak10 まで存在し、bak11+ は存在しないこと。
+        for n in 1..=BACKUP_COUNT {
+            assert!(
+                backup_path(&main_path, n).exists(),
+                "bak{n} should exist after 12 sessions"
+            );
+        }
+        assert!(
+            !backup_path(&main_path, BACKUP_COUNT + 1).exists(),
+            "bak{} must not exist (we only keep {} generations)",
+            BACKUP_COUNT + 1,
+            BACKUP_COUNT
+        );
+
+        // bak1 はセッション 11 の状態 (= "gen11") のはず
+        // (セッション 12 の save 直前の main は gen11)。
+        let bak1: Settings =
+            serde_json::from_str(&std::fs::read_to_string(backup_path(&main_path, 1)).unwrap())
+                .unwrap();
+        assert_eq!(bak1.favorites[0].name, "gen11");
+    }
+
+    /// #5 quarantine + #2 auto recovery: 壊れた main は .broken-<TS> へ退避され、
+    /// 直近の bak1 から復旧される。
+    #[test]
+    fn corrupt_main_recovers_from_bak1() {
+        let _env = setup_backup_env();
+        let main_path = Settings::settings_path();
+
+        // bak1 に良い JSON を仕込む。
+        let good = settings_with_favorite("recovered");
+        let good_json = serde_json::to_string_pretty(&good).unwrap();
+        std::fs::create_dir_all(main_path.parent().unwrap()).unwrap();
+        std::fs::write(backup_path(&main_path, 1), &good_json).unwrap();
+
+        // main を壊す。
+        std::fs::write(&main_path, "{ this is not json").unwrap();
+
+        let loaded = Settings::load();
+        assert_eq!(loaded.favorites.len(), 1);
+        assert_eq!(loaded.favorites[0].name, "recovered");
+
+        // 壊れた main は .broken-<TS> に rename されている。
+        let broken_dir = main_path.parent().unwrap();
+        let broken_files: Vec<_> = std::fs::read_dir(broken_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("settings.json.broken-")
+            })
+            .collect();
+        assert!(
+            !broken_files.is_empty(),
+            "corrupt main should be quarantined as .broken-<TS>"
+        );
+    }
+
+    /// bak1 も壊れていれば bak2 へフォールバックする (= 新→古に順試行)。
+    #[test]
+    fn corrupt_main_and_bak1_falls_through_to_bak2() {
+        let _env = setup_backup_env();
+        let main_path = Settings::settings_path();
+
+        std::fs::create_dir_all(main_path.parent().unwrap()).unwrap();
+        let good = settings_with_favorite("from_bak2");
+        std::fs::write(
+            backup_path(&main_path, 2),
+            serde_json::to_string_pretty(&good).unwrap(),
+        )
+        .unwrap();
+        // bak1 と main は壊しておく。
+        std::fs::write(backup_path(&main_path, 1), "{ corrupt").unwrap();
+        std::fs::write(&main_path, "{ corrupt").unwrap();
+
+        let loaded = Settings::load();
+        assert_eq!(loaded.favorites[0].name, "from_bak2");
+    }
+
+    /// 全滅 (main + bak1..bak10 すべて壊れている) なら Default。
+    #[test]
+    fn all_broken_falls_back_to_default() {
+        let _env = setup_backup_env();
+        let main_path = Settings::settings_path();
+        std::fs::create_dir_all(main_path.parent().unwrap()).unwrap();
+
+        std::fs::write(&main_path, "{ broken").unwrap();
+        for n in 1..=BACKUP_COUNT {
+            std::fs::write(backup_path(&main_path, n), "{ broken").unwrap();
+        }
+
+        let loaded = Settings::load();
+        assert!(loaded.favorites.is_empty());
+        assert_eq!(loaded.grid_cols, default_grid_cols());
+    }
+
+    /// #4 preupgrade: 過去に保存された JSON のバージョンと現バイナリのバージョンが
+    /// 違うとき、現状の settings.json を `settings.json.preupgrade-v<old>` に複製する。
+    #[test]
+    fn version_change_creates_preupgrade_snapshot() {
+        let _env = setup_backup_env();
+        let main_path = Settings::settings_path();
+        std::fs::create_dir_all(main_path.parent().unwrap()).unwrap();
+
+        // 旧バージョンで保存された状態を仕込む。
+        let mut old = settings_with_favorite("preupgrade_test");
+        old.last_seen_version = Some("0.0.0-test-prev".to_string());
+        std::fs::write(&main_path, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+
+        let loaded = Settings::load();
+        // 現バイナリのバージョンに更新されている。
+        assert_eq!(
+            loaded.last_seen_version.as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+
+        // preupgrade snapshot が存在し、中身は旧 last_seen_version を持っている。
+        let pre = preupgrade_path(&main_path, "0.0.0-test-prev");
+        assert!(pre.exists(), "preupgrade snapshot should be created");
+        let pre_settings: Settings =
+            serde_json::from_str(&std::fs::read_to_string(&pre).unwrap()).unwrap();
+        assert_eq!(
+            pre_settings.last_seen_version.as_deref(),
+            Some("0.0.0-test-prev")
+        );
+        assert_eq!(pre_settings.favorites[0].name, "preupgrade_test");
+    }
+
+    /// 同じ「前バージョン」名の preupgrade snapshot が既に存在するなら上書きしない
+    /// (= 同バージョンの起動を繰り返しても、直近 1 回分の素材だけが保存される)。
+    #[test]
+    fn preupgrade_snapshot_is_not_overwritten() {
+        let _env = setup_backup_env();
+        let main_path = Settings::settings_path();
+        std::fs::create_dir_all(main_path.parent().unwrap()).unwrap();
+
+        let pre = preupgrade_path(&main_path, "0.0.0-test-prev");
+        std::fs::write(&pre, "EXISTING_SNAPSHOT_CONTENT").unwrap();
+
+        let mut old = settings_with_favorite("snapshot_collision");
+        old.last_seen_version = Some("0.0.0-test-prev".to_string());
+        std::fs::write(&main_path, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+
+        let _ = Settings::load();
+
+        // 既存ファイルは温存されている (= load 中に上書きしていない)。
+        assert_eq!(
+            std::fs::read_to_string(&pre).unwrap(),
+            "EXISTING_SNAPSHOT_CONTENT"
+        );
+    }
+
+    /// Codex P2 (#2): try_parse_settings_file は **read I/O 失敗** と
+    /// **内容のエラー (UTF-8 / JSON)** を別の variant で返さねばならない。
+    #[test]
+    fn try_parse_distinguishes_io_from_parse_error() {
+        let _env = setup_backup_env();
+        let dir = Settings::settings_path().parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // (a) 存在しない -> NotFound
+        assert!(matches!(
+            try_parse_settings_file(&dir.join("nonexistent.json")),
+            LoadFileResult::NotFound
+        ));
+
+        // (b) 不正な JSON テキスト -> ParseError
+        let bad_json = dir.join("bad.json");
+        std::fs::write(&bad_json, b"{ invalid").unwrap();
+        assert!(matches!(
+            try_parse_settings_file(&bad_json),
+            LoadFileResult::ParseError
+        ));
+
+        // (c) 不正な UTF-8 バイト列 -> ParseError (Codex 指摘のとおり、
+        //     read 段階で読めても内容が不正なら ParseError 扱い)
+        let utf8_bad = dir.join("utf8_bad.json");
+        std::fs::write(&utf8_bad, &[0xFFu8, 0xFE, 0xFD][..]).unwrap();
+        assert!(matches!(
+            try_parse_settings_file(&utf8_bad),
+            LoadFileResult::ParseError
+        ));
+
+        // (d) 正常 -> Ok
+        let good = dir.join("good.json");
+        std::fs::write(&good, serde_json::to_string(&Settings::default()).unwrap()).unwrap();
+        assert!(matches!(
+            try_parse_settings_file(&good),
+            LoadFileResult::Ok(_)
+        ));
+
+        // (e) ディレクトリ -> IoError (read が NotFound 以外の OS エラーで失敗)
+        let dir_path = dir.join("isadir.json");
+        std::fs::create_dir(&dir_path).unwrap();
+        let result = try_parse_settings_file(&dir_path);
+        assert!(
+            matches!(result, LoadFileResult::IoError),
+            "expected IoError for directory path, got {:?}",
+            result
+        );
+    }
+
+    /// Codex P2 (#2): main 読み取りが I/O エラー (一時的かもしれない) のときは
+    /// quarantine してはいけない (= ロックが解けたら正常な main を再読みしたい)。
+    #[test]
+    fn io_error_on_main_does_not_quarantine() {
+        let _env = setup_backup_env();
+        let main_path = Settings::settings_path();
+        std::fs::create_dir_all(main_path.parent().unwrap()).unwrap();
+
+        // bak1 に良い JSON を仕込む。
+        let good = settings_with_favorite("from_bak1");
+        std::fs::write(
+            backup_path(&main_path, 1),
+            serde_json::to_string_pretty(&good).unwrap(),
+        )
+        .unwrap();
+
+        // main を read 不能にする (= ディレクトリにする)。
+        std::fs::create_dir(&main_path).unwrap();
+
+        // recovery は走るが quarantine は起きない。main_unreadable フラグも立つ。
+        let outcome = try_load_with_recovery(&main_path);
+        let recovered = outcome.settings.expect("should recover from bak1");
+        assert_eq!(recovered.favorites[0].name, "from_bak1");
+        assert!(
+            outcome.main_unreadable,
+            "outcome must flag main as unreadable when read failed with non-NotFound I/O error"
+        );
+
+        // main path は依然ディレクトリのまま (= rename されていない)。
+        assert!(
+            main_path.is_dir(),
+            "main path must not be quarantined on I/O error"
+        );
+
+        // .broken-* も作られていないこと。
+        let parent = main_path.parent().unwrap();
+        let broken_files: Vec<_> = std::fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("settings.json.broken-")
+            })
+            .collect();
+        assert!(
+            broken_files.is_empty(),
+            "no quarantine file should be created on I/O error"
+        );
+    }
+
+    /// Codex P2 (#4 2026-05-09): main が I/O エラーで読めなかったセッションで
+    /// `Settings::load()` 全体を通したとき、後段の自動 save (= migration / version
+    /// 変更トリガ) が `rotate_backups` で main を bak1 に rename して壊さないこと。
+    ///
+    /// 直前の修正は helper レベル (= `try_load_with_recovery`) しか抑止しておらず、
+    /// `load() -> migration -> save()` の経路で同じ問題が再発していた。
+    #[test]
+    fn io_error_on_main_during_load_does_not_clobber_via_save() {
+        let _env = setup_backup_env();
+        let main_path = Settings::settings_path();
+        std::fs::create_dir_all(main_path.parent().unwrap()).unwrap();
+
+        // bak1 に良い JSON を仕込む (last_seen_version は意図的に旧値にして
+        // version_changed = true で save が走る条件を作る)。
+        let mut good = settings_with_favorite("from_bak1");
+        good.last_seen_version = Some("0.0.0-prev".to_string());
+        std::fs::write(
+            backup_path(&main_path, 1),
+            serde_json::to_string_pretty(&good).unwrap(),
+        )
+        .unwrap();
+
+        // main を read 不能にする (= ディレクトリにする)。
+        std::fs::create_dir(&main_path).unwrap();
+
+        // フル load() を走らせる。in-memory には bak1 の内容、副作用は最小限。
+        let loaded = Settings::load();
+        assert_eq!(loaded.favorites[0].name, "from_bak1");
+
+        // main path は依然ディレクトリのまま (= save() の rotate / write_atomic で
+        // 触られていない)。
+        assert!(
+            main_path.is_dir(),
+            "main path must remain (unrenamed) after Settings::load() with I/O error"
+        );
+
+        // bak1 もそのまま (= rotate されていない)。同じ内容で再パースできる。
+        let bak1_path = backup_path(&main_path, 1);
+        assert!(bak1_path.is_file(), "bak1 should remain a regular file");
+        let bak1_loaded: Settings =
+            serde_json::from_str(&std::fs::read_to_string(&bak1_path).unwrap()).unwrap();
+        assert_eq!(bak1_loaded.favorites[0].name, "from_bak1");
+
+        // 万一サブシステム経由で `settings.save()` が呼ばれてもスキップされる。
+        let mut later = loaded.clone();
+        later.add_favorite("after_load".to_string(), PathBuf::from(r"C:\after"));
+        later.save();
+        assert!(
+            main_path.is_dir(),
+            "explicit save() in unreadable session must remain a no-op"
+        );
+        let bak1_after: Settings =
+            serde_json::from_str(&std::fs::read_to_string(&bak1_path).unwrap()).unwrap();
+        assert_eq!(
+            bak1_after.favorites[0].name, "from_bak1",
+            "bak1 must not be rotated by suppressed save()"
+        );
+    }
+
+    /// Codex P2 (#3): release ビルド (= main logger 未初期化) でも、復旧経路の
+    /// 診断は `<data_dir>/logs/settings.log` に常時記録される。
+    #[test]
+    fn settings_diag_log_writes_to_persistent_file() {
+        let _env = setup_backup_env();
+        let main_path = Settings::settings_path();
+        std::fs::create_dir_all(main_path.parent().unwrap()).unwrap();
+
+        // 壊れた main + 良い bak1 で recovery + diag log を発生させる。
+        std::fs::write(&main_path, "{ corrupt").unwrap();
+        let good = settings_with_favorite("diag_test");
+        std::fs::write(
+            backup_path(&main_path, 1),
+            serde_json::to_string_pretty(&good).unwrap(),
+        )
+        .unwrap();
+
+        let _ = Settings::load();
+
+        let diag_path = crate::data_dir::logs_dir().join("settings.log");
+        assert!(diag_path.exists(), "settings.log should be created");
+        let content = std::fs::read_to_string(&diag_path).unwrap();
+        assert!(
+            content.contains("JSON parse failed") || content.contains("UTF-8 decode failed"),
+            "diag log should record the parse failure, got: {content}"
+        );
+        assert!(
+            content.contains("recovered from"),
+            "diag log should record the recovery, got: {content}"
+        );
+    }
+
+    /// `safe_version_label`: ファイル名に不適な文字を `_` 化する。
+    #[test]
+    fn safe_version_label_sanitizes() {
+        assert_eq!(safe_version_label("0.9.0"), "0.9.0");
+        assert_eq!(safe_version_label("1.0.0-rc1"), "1.0.0-rc1");
+        assert_eq!(safe_version_label("evil/path"), "evil_path");
+        assert_eq!(safe_version_label("..\\foo"), ".._foo");
+        assert_eq!(safe_version_label(""), "unknown");
     }
 }

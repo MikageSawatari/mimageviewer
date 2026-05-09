@@ -302,6 +302,32 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 
 設定は JSON ファイルとして `%APPDATA%\mimageviewer\settings.json` に自動保存される。
 
+### 永続化と復旧の仕組み
+
+- **アトミック保存**: `settings.json.tmp` に書いてから rename で置き換える
+  (Windows でも `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` 経由で atomic)。
+  書き込み中の電源断・force kill で半端ファイルが残らない。
+- **世代バックアップ (10 世代)**: 起動 1 回につき最初の保存で 1 段ローテートし、
+  `settings.json.bak1`〜`settings.json.bak10` に過去 10 セッション分の
+  スナップショットを保持する。同セッション内の追加保存は main を上書きするだけで
+  bak には伝播しない (= 1 起動 = 1 世代)。
+- **自動復旧**: 起動時に main がパース失敗していたら `settings.json.broken-<TS>` に
+  rename 退避し、`bak1`→`bak10` を新→古の順に試行して最初にパース可能なものから復元する。
+  全滅した場合のみビルトイン default に落ちる。`PermissionDenied` 等の I/O エラーは
+  一時的な可能性があるため main を退避せず、bak からの読み出しのみ行う。
+- **I/O エラー時の保存抑止**: 起動時に main が I/O エラーで読めなかったセッションでは、
+  当該セッション中の `Settings::save()` をすべて no-op にする。理由は世代ローテーション
+  が `settings.json -> bak1` rename で **アクセス不能なだけの真の main** を bak1 に
+  置き換えてしまう可能性があるため。永続化はそのセッション分諦め、次回起動でリトライする。
+- **アップグレード前バックアップ**: 直近に保存したバイナリと現バイナリの
+  バージョンが違うとき、初回 load で現状の `settings.json` を
+  `settings.json.preupgrade-v<old>` に複製する。スキーマ破壊が自動復旧で
+  救えなかった場合の最終ライフライン。同じ前バージョン名の snapshot が既に
+  存在するなら上書きしない。
+- **診断ログ**: 復旧経路で起きたイベント (パース失敗 / quarantine / recovery /
+  preupgrade / save 抑止) は **`<data_dir>/logs/settings.log` に常に append** される。
+  release ビルド (= `--log` 不指定) でも残り、ユーザー報告時の調査に使える。
+
 ### 8.1 主要設定
 
 | 設定名 | 型 | デフォルト | 説明 |

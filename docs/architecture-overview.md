@@ -200,7 +200,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 
 | ファイル | 内容 | 書き込むモジュール |
 | --- | --- | --- |
-| `settings.json` | アプリ全体設定・グローバルプリセット・保存スロット・お気に入り (`FavoriteEntry { id: Uuid, name, path, auto_index_{structure,metadata,thumbs} }`)・タグ定義 (`Vec<TagDef>`) | `settings.rs` |
+| `settings.json` | アプリ全体設定・グローバルプリセット・保存スロット・お気に入り (`FavoriteEntry { id: Uuid, name, path, auto_index_{structure,metadata,thumbs} }`)・タグ定義 (`Vec<TagDef>`)。**保存はアトミック (.tmp → rename)、起動 1 回ごとに `settings.json.bak1..bak10` に世代退避**。パース失敗時は `.broken-<TS>` に隔離して bak1→bak10 を新→古で試行し復旧。バージョン跨ぎは初回 load で `settings.json.preupgrade-v<old>` にスナップショット。**main が I/O エラー (権限拒否・ロック・ディレクトリ衝突等) で読めなかったセッションでは `Settings::save()` を完全に no-op 化** (= rotate / write_atomic で本物の main を上書きする事故を防ぐ) | `settings.rs` |
 | `catalog.db` | サムネイル WebP キャッシュ (BLOB) + メタデータ | `catalog.rs` |
 | `rotation.db` | 非破壊回転角 (0/90/180/270) | `rotation_db.rs` |
 | `rating.db` | レーティング (★1〜5、0 は未登録)。ページ単位 (画像/ZIP 内画像/PDF ページ) とコンテナ (フォルダ/ZIP/PDF 本体) を同一テーブルに格納。キー形式の違い (`::` の有無) で区別 | `rating_db.rs` |
@@ -214,6 +214,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `pdfium.dll` | 初回起動時に exe から展開 | `main.rs` |
 | `models/*.onnx` | 初回起動時に exe から展開 | `ai/model_manager.rs` |
 | `mimageviewer.log` | 起動ごとに truncate。実行中は 16 MiB 超で `mimageviewer.log.bak` にローテーション | `logger.rs` |
+| `logs/settings.log` | 設定復旧経路の永続診断ログ。**logger 未初期化 (= release ビルドで `--log` なし) でも常に append される独立 sink**。パース失敗 / quarantine / bak 復旧 / preupgrade snapshot / save 抑止のイベントが残る。再現が難しい設定リセット系報告の事後解析用 | `settings.rs` (`settings_diag_log`) |
 
 **パスキーの正規化**: Windows は大文字小文字非区別なので、すべての DB は **小文字化 + バックスラッシュ→スラッシュ** に正規化してから格納する。新しい DB を追加するときも同じ規約に従う (`rotation_db.rs` / `adjustment_db.rs` を参照)。
 
