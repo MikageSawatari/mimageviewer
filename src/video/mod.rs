@@ -30,6 +30,7 @@ pub mod decoder;
 pub mod dsp;
 pub mod engine;
 pub mod ffmpeg_loader;
+mod frame_selection;
 #[cfg(windows)]
 pub mod gpu_renderer;
 #[cfg(windows)]
@@ -347,8 +348,6 @@ struct PresenterSourceState {
     present_stats: NativeFullscreenPresentStats,
     last_present_wall: Option<std::time::Instant>,
     last_present_source_pts: Option<f64>,
-    source_pacing_sleep_count: u64,
-    source_pacing_sleep_total_ms: f64,
 }
 
 #[cfg(windows)]
@@ -371,8 +370,6 @@ impl PresenterSourceState {
             present_stats: NativeFullscreenPresentStats::default(),
             last_present_wall: None,
             last_present_source_pts: None,
-            source_pacing_sleep_count: 0,
-            source_pacing_sleep_total_ms: 0.0,
         }
     }
 }
@@ -830,31 +827,6 @@ fn native_video_env_flag_enabled(name: &str, default: bool) -> bool {
                 || v.eq_ignore_ascii_case("no"))
         })
         .unwrap_or(default)
-}
-
-#[cfg(windows)]
-fn native_source_pacing_delay(
-    last_pts: Option<f64>,
-    last_wall: Option<std::time::Instant>,
-    next_pts: f64,
-    playback_speed: f64,
-) -> Option<std::time::Duration> {
-    let (Some(last_pts), Some(last_wall)) = (last_pts, last_wall) else {
-        return None;
-    };
-    let source_delta = next_pts - last_pts;
-    if !(0.001..=0.050).contains(&source_delta) {
-        return None;
-    }
-    let elapsed = last_wall.elapsed().as_secs_f64();
-    let speed = playback_speed.max(clock::MIN_PLAYBACK_SPEED);
-    let target_elapsed = ((source_delta - 0.0002).max(0.0)) / speed;
-    if elapsed >= target_elapsed {
-        return None;
-    }
-    Some(std::time::Duration::from_secs_f64(
-        (target_elapsed - elapsed).clamp(0.001, 0.012),
-    ))
 }
 
 #[cfg(windows)]
@@ -1674,57 +1646,55 @@ fn run_native_video_output(
         }
 
         let now = source.clock.now_secs();
+        let candidates: Vec<frame_selection::FrameCandidate> = source
+            .queue
+            .iter()
+            .map(|f| frame_selection::FrameCandidate {
+                pts_secs: f.pts_secs,
+                seek_serial: f.seek_serial,
+            })
+            .collect();
+        let selection = frame_selection::select_frame_for_present(
+            &candidates,
+            now,
+            source.clock.current_seek_serial(),
+            source.last_seen_serial,
+            waiting_for_first_frame,
+            source.clock.is_seeking(),
+            clock::DISPLAY_LEAD_TOLERANCE_SECS,
+        );
+        drop(candidates);
         let mut latest_renderable: Option<VideoFrame> = None;
-        while let Some(front) = source.queue.front() {
-            if front.seek_serial < source.clock.current_seek_serial() {
-                if let Some(frame) = source.queue.pop_front() {
+        for action in &selection.actions {
+            let frame = source
+                .queue
+                .pop_front()
+                .expect("frame_selection::select_frame_for_present promised this many frames");
+            match action {
+                frame_selection::PopAction::DiscardStale => {
                     native_reset_unpresented_frame(frame);
                 }
-                continue;
-            }
-            let force_first_frame =
-                waiting_for_first_frame && front.seek_serial == source.last_seen_serial;
-            let force_display_seek = source.clock.is_seeking()
-                && latest_renderable.is_none()
-                && front.seek_serial == source.last_seen_serial
-                && clock::pts_clears_seek_override(front.pts_secs, now);
-            if force_first_frame
-                || force_display_seek
-                || front.pts_secs <= now + clock::DISPLAY_LEAD_TOLERANCE_SECS
-            {
-                let candidate = source
-                    .queue
-                    .pop_front()
-                    .expect("queue.front() returned Some");
-                if let Some(dropped) = latest_renderable.replace(candidate) {
-                    let late_ms = ((now - dropped.pts_secs) * 1000.0).max(0.0);
+                frame_selection::PopAction::LateDrop => {
+                    let late_ms = ((now - frame.pts_secs) * 1000.0).max(0.0);
                     source.present_stats.record_late_drop(
-                        dropped.pts_secs,
+                        frame.pts_secs,
                         late_ms,
                         source.queue.len(),
                     );
-                    native_reset_unpresented_frame(dropped);
+                    native_reset_unpresented_frame(frame);
                 }
-                continue;
+                frame_selection::PopAction::Display => {
+                    debug_assert!(
+                        latest_renderable.is_none(),
+                        "FrameSelection invariant: at most one Display per tick"
+                    );
+                    latest_renderable = Some(frame);
+                }
             }
-            break;
         }
 
         if let Some(frame) = latest_renderable {
             let pts = frame.pts_secs;
-            if let Some(delay) = native_source_pacing_delay(
-                source.last_present_source_pts,
-                source.last_present_wall,
-                pts,
-                source.clock.playback_speed(),
-            ) {
-                source.queue.push_front(frame);
-                source.source_pacing_sleep_count =
-                    source.source_pacing_sleep_count.saturating_add(1);
-                source.source_pacing_sleep_total_ms += delay.as_secs_f64() * 1000.0;
-                std::thread::sleep(delay);
-                continue;
-            }
             let serial = frame.seek_serial;
             let present_t0 = Instant::now();
             match presenter.present(&frame, config.sync_interval) {
@@ -1764,30 +1734,6 @@ fn run_native_video_output(
                     );
                     if last_summary_log.elapsed() >= Duration::from_secs(1) {
                         source.present_stats.emit_summary(run_started.elapsed());
-                        if source.source_pacing_sleep_count > 0 && crate::perf::is_enabled() {
-                            crate::perf::event(
-                                "native_presenter",
-                                "source_pacing_summary",
-                                None,
-                                0,
-                                &[
-                                    (
-                                        "count",
-                                        serde_json::Value::from(
-                                            source.source_pacing_sleep_count as i64,
-                                        ),
-                                    ),
-                                    (
-                                        "total_ms",
-                                        serde_json::Value::from(
-                                            source.source_pacing_sleep_total_ms,
-                                        ),
-                                    ),
-                                ],
-                            );
-                        }
-                        source.source_pacing_sleep_count = 0;
-                        source.source_pacing_sleep_total_ms = 0.0;
                         last_summary_log = Instant::now();
                     }
                     source.displayed_frame_seq.fetch_add(1, Ordering::Release);
