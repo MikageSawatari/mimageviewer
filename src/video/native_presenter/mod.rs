@@ -2576,6 +2576,23 @@ impl NativeEguiOverlay {
                 // 計算幅 / VST3 計算 rect) を渡すことで、不可視パネルや
                 // パネル端のマージンが誤ってデッドゾーン化するのを防ぐ。
                 let mut excluded_rects: Vec<egui::Rect> = Vec::new();
+                // bookmark 名編集ダイアログ / 速度ポップアップ / シーク hover
+                // preview のいずれかが開いている間は、画面のどこをクリックしても
+                // TogglePlay/CloseFullscreen を発行しない (= 全画面を除外する)。
+                // これらの popup 群は seek HUD の closure 内で動的に layout が
+                // 決まり外から rect 計算が困難なうえ、popup 操作中にクリックで
+                // 再生再開/フルスクリーン解除が混入すると操作意図と食い違う。
+                // popup 自体の dismiss/操作は popup 側ロジックが担うので、
+                // 「popup 表示中は overlay 側の click hook を停止」が安全。
+                let popup_active = bookmark_title_edit_visible
+                    || video_speed_popup_open
+                    || hover_preview_target_secs.is_some();
+                if popup_active {
+                    excluded_rects.push(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(overlay_width_points, overlay_height_points),
+                    ));
+                }
                 if top_bar_visible {
                     excluded_rects.push(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
