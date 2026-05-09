@@ -261,8 +261,9 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   `ui_fonts::configure_fonts()` で登録する `miv-user-text` family を使う。通常 UI の
   proportional family は既存幅を保つため Windows fallback を egui 既定 font の後ろに置き、
   ユーザー由来の長文だけ Segoe UI Emoji / Cambria Math / Segoe UI Historic /
-  Segoe UI Symbol を優先する。Windows fallback glyph には軽い縦位置補正を入れて本文の
-  ベースラインずれを抑える。
+  Segoe UI Symbol を優先する。絵文字の縦位置は ttf-parser で Yu Gothic の日本語 glyph と
+  Segoe UI Emoji の代表 glyph の中心を読み、egui の `FontTweak` に入れる補正量を
+  起動時に計算してベースラインずれを抑える。
 - `fill_output` の bookkeeping (Phase 9 後の cleanup refactor):
   - **実消費サンプル数ベース**: `pop_front` で取り出した分 (= `real_consumed`) のみ
     `next_pts_secs` を進める。silence 出力中は pts 進行 0 (= 旧版の「常に full want

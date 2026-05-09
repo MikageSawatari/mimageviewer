@@ -3532,6 +3532,7 @@ dependencies = [
  "tantivy",
  "tempfile",
  "tray-icon",
+ "ttf-parser",
  "turbojpeg",
  "ureq 2.12.1",
  "uuid",

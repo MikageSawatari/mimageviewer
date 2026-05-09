@@ -788,9 +788,10 @@ mIV はプライマリ proportional フォントに **Yu Gothic Medium** (Window
 使う ([src/ui_fonts.rs](src/ui_fonts.rs))。通常 UI と native overlay は同じ
 `ui_fonts::configure_fonts()` を通り、動画メタデータなどユーザー由来テキスト向けに
 `miv-user-text` family を別途登録する。この family は Segoe UI Emoji を優先し、
-Cambria Math / Segoe UI Historic / Segoe UI Symbol も縦位置補正付きで使う。通常 UI の
-proportional family ではこれらを egui 既定 font の後ろに置き、固定 UI 文言の幅変化を
-抑える。Yu Gothic は日本語 + 基本 Latin
+ttf-parser で Yu Gothic の日本語 glyph と Segoe UI Emoji の代表 glyph の中心を読んで
+baseline 補正を計算する。Cambria Math / Segoe UI Historic / Segoe UI Symbol も
+縦位置補正付きで使う。通常 UI の proportional family ではこれらを egui 既定 font の
+後ろに置き、固定 UI 文言の幅変化を抑える。Yu Gothic は日本語 + 基本 Latin
 + Latin-1 Supplement までは網羅するが、**Misc Symbols** や **絵文字**は欠落
 していることが多い。fallback はユーザー由来テキストの文字化けを軽減するためのもので、
 UI の固定文言・ボタン・状態表示へ絵文字や環境依存記号を新規採用する理由にはしない。
