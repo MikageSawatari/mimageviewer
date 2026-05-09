@@ -2569,10 +2569,46 @@ impl NativeEguiOverlay {
                 );
             }
             if paused_center_visible {
+                // 「中央パネル外クリックで再開」判定の除外対象として、
+                // 同じフレームで実際に描画されている他パネル rect を集める。
+                // ホバー判定領域 (top 76 / 下 220 / 左 320 / 右 430) ではなく
+                // 描画中の rect (top 54 / 下 46 / jump width 320 / metadata
+                // 計算幅 / VST3 計算 rect) を渡すことで、不可視パネルや
+                // パネル端のマージンが誤ってデッドゾーン化するのを防ぐ。
+                let mut excluded_rects: Vec<egui::Rect> = Vec::new();
+                if top_bar_visible {
+                    excluded_rects.push(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(overlay_width_points, 54.0),
+                    ));
+                }
+                if bottom_hud_visible {
+                    excluded_rects.push(egui::Rect::from_min_max(
+                        egui::pos2(0.0, (overlay_height_points - 46.0).max(0.0)),
+                        egui::pos2(overlay_width_points, overlay_height_points),
+                    ));
+                }
+                if jump_panel_visible {
+                    excluded_rects.push(native_jump_panel_rect(overlay_height_points));
+                }
+                if right_panel_visible {
+                    excluded_rects.push(native_metadata_panel_rect(
+                        overlay_width_points,
+                        overlay_height_points,
+                    ));
+                }
+                if vst3_panel_visible && let Some(panel) = vst3_panel.as_ref() {
+                    excluded_rects.push(native_vst3_panel_rect(
+                        overlay_width_points,
+                        overlay_height_points,
+                        panel,
+                    ));
+                }
                 draw_native_center_pause_controls(
                     ctx,
                     overlay_width_points,
                     overlay_height_points,
+                    &excluded_rects,
                     &mut commands,
                 );
             }

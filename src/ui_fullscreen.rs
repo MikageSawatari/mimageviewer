@@ -10,7 +10,7 @@ use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::SpreadMode;
-use crate::ui_helpers::{draw_play_icon, open_external_player};
+use crate::ui_helpers::open_external_player;
 
 mod draw_icons;
 use self::draw_icons::*;
@@ -3201,19 +3201,38 @@ impl App {
                                     && p.y >= full_rect.min.y + 44.0
                             })
                             .unwrap_or(false);
-                        // 中央ボタン (一時停止時のみ描画) の領域を除外。
-                        let video_paused = self
+                        // 中央 2 ボタン (一時停止時のみ描画) の領域だけを除外。
+                        // 描画条件は native_presenter::draw_native_center_pause_controls
+                        // (overlay_draw.rs) と完全に揃える。frame_step 中はボタン非表示
+                        // なので除外しない (= ボタン跡地のクリックで toggle_play() が走り
+                        // 再生再開できる)。
+                        let center_buttons_visible = self
                             .fullscreen_idx
                             .and_then(|idx| self.fs_video_player(idx))
-                            .map(|p| !p.is_playing())
+                            .map(|p| {
+                                !p.is_playing()
+                                    && !p.is_frame_step_active()
+                                    && p.displayed_frame_seq() > 0
+                            })
                             .unwrap_or(false);
-                        let in_center_buttons = if video_paused {
+                        let in_center_buttons = if center_buttons_visible {
                             pos_opt
                                 .map(|p| {
                                     let cx = full_rect.center().x;
                                     let cy = full_rect.center().y;
-                                    // 2 ボタンを覆う 320x150 の中央帯 (= 各 112x112 + gap)
-                                    (p.x - cx).abs() < 160.0 && (p.y - cy).abs() < 75.0
+                                    // overlay_draw.rs::draw_native_center_pause_controls
+                                    // の rect に揃える (radius=56, gap=34, 各 112x112)。
+                                    let radius = 56.0_f32;
+                                    let gap = 34.0_f32;
+                                    let left_rect = egui::Rect::from_center_size(
+                                        egui::pos2(cx - radius - gap * 0.5, cy),
+                                        egui::vec2(radius * 2.0, radius * 2.0),
+                                    );
+                                    let right_rect = egui::Rect::from_center_size(
+                                        egui::pos2(cx + radius + gap * 0.5, cy),
+                                        egui::vec2(radius * 2.0, radius * 2.0),
+                                    );
+                                    left_rect.contains(p) || right_rect.contains(p)
                                 })
                                 .unwrap_or(false)
                         } else {
@@ -6150,34 +6169,24 @@ impl App {
         full_rect: egui::Rect,
         fs_idx: usize,
     ) {
-        let (
-            is_playing,
-            frame_step_active,
-            position,
-            duration,
-            volume,
-            muted,
-            playback_speed,
-            has_texture,
-            has_error,
-        ) = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => (
-                player.is_playing(),
-                player.is_frame_step_active(),
-                player.position(),
-                player.duration(),
-                player.volume(),
-                player.is_muted(),
-                player.playback_speed(),
-                // 1 枚以上のフレームが decoder から供給され UI tick が認識した
-                // 時点で「描画コンテンツが揃った」とみなす (= "動画を準備中..."
-                // を抜けて通常表示に切り替える)。native presenter / 旧 egui 経路の
-                // 違いに依存しない atomic counter ベースの判定。
-                player.displayed_frame_seq() > 0,
-                player.error().map(|s| s.to_string()),
-            ),
-            _ => return,
-        };
+        let (is_playing, position, duration, volume, muted, playback_speed, has_texture, has_error) =
+            match self.fs_cache.get(&fs_idx) {
+                Some(FsCacheEntry::Video { player, .. }) => (
+                    player.is_playing(),
+                    player.position(),
+                    player.duration(),
+                    player.volume(),
+                    player.is_muted(),
+                    player.playback_speed(),
+                    // 1 枚以上のフレームが decoder から供給され UI tick が認識した
+                    // 時点で「描画コンテンツが揃った」とみなす (= "動画を準備中..."
+                    // を抜けて通常表示に切り替える)。native presenter / 旧 egui 経路の
+                    // 違いに依存しない atomic counter ベースの判定。
+                    player.displayed_frame_seq() > 0,
+                    player.error().map(|s| s.to_string()),
+                ),
+                _ => return,
+            };
 
         // ── エラー表示 ──
         if let Some(err) = has_error {
@@ -6211,140 +6220,9 @@ impl App {
             return;
         }
 
-        // ── 一時停止中: 中央に再生アイコン (続きから) + ⏮ アイコン (最初から) ──
-        // Phase 7.I: 「前回の続きからみたいのか / 最初から観たいのか選べるように」
-        // 同サイズの 2 ボタンを左右に並べる。
-        if !is_playing && !frame_step_active {
-            let painter = ui.painter().clone();
-            let icon_radius = 56.0;
-            let gap = 64.0;
-            let left_center = egui::pos2(
-                full_rect.center().x - icon_radius - gap / 2.0,
-                full_rect.center().y,
-            );
-            let right_center = egui::pos2(
-                full_rect.center().x + icon_radius + gap / 2.0,
-                full_rect.center().y,
-            );
-
-            // ⏮ 最初から再生 (左)
-            let left_rect = egui::Rect::from_center_size(
-                left_center,
-                egui::vec2(icon_radius * 2.0, icon_radius * 2.0),
-            );
-            let left_resp = ui.interact(
-                left_rect,
-                egui::Id::new(("video_center_replay", fs_idx)),
-                egui::Sense::click(),
-            );
-            // 半透明黒の円形バッジで視認性 + ホバー時に明るく
-            let left_bg_alpha = if left_resp.hovered() { 180 } else { 110 };
-            painter.circle_filled(
-                left_center,
-                icon_radius,
-                egui::Color32::from_rgba_unmultiplied(0, 0, 0, left_bg_alpha),
-            );
-            painter.circle_stroke(
-                left_center,
-                icon_radius,
-                egui::Stroke::new(
-                    2.0,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
-                ),
-            );
-            draw_replay_icon(&painter, left_center, icon_radius * 0.6);
-            if left_resp.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if left_resp.clicked()
-                && let Some(p) = self.fs_video_player(fs_idx)
-            {
-                p.seek(0.0);
-                if !p.is_playing() {
-                    p.toggle_play();
-                }
-            }
-
-            // ▶ 続きから再生 (右、= 既存の center 再生アイコン位置を踏襲)
-            let right_rect = egui::Rect::from_center_size(
-                right_center,
-                egui::vec2(icon_radius * 2.0, icon_radius * 2.0),
-            );
-            let right_resp = ui.interact(
-                right_rect,
-                egui::Id::new(("video_center_play", fs_idx)),
-                egui::Sense::click(),
-            );
-            let right_bg_alpha = if right_resp.hovered() { 180 } else { 110 };
-            painter.circle_filled(
-                right_center,
-                icon_radius,
-                egui::Color32::from_rgba_unmultiplied(0, 0, 0, right_bg_alpha),
-            );
-            painter.circle_stroke(
-                right_center,
-                icon_radius,
-                egui::Stroke::new(
-                    2.0,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200),
-                ),
-            );
-            draw_play_icon(&painter, right_center, icon_radius);
-            if right_resp.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if right_resp.clicked()
-                && let Some(p) = self.fs_video_player(fs_idx)
-            {
-                p.toggle_play();
-            }
-
-            // 動画の明るいフレーム上でもボタン説明が読めるよう、ラベルだけを
-            // 控えめな半透明の黒帯に載せる。
-            let label_font = egui::FontId::proportional(14.0);
-            let label_color = egui::Color32::from_rgba_unmultiplied(240, 240, 240, 238);
-            let left_label =
-                painter.layout_no_wrap("最初から".to_owned(), label_font.clone(), label_color);
-            let right_label =
-                painter.layout_no_wrap("続きから".to_owned(), label_font, label_color);
-            let label_y = full_rect.center().y + icon_radius + 14.0;
-            let left_label_pos = egui::pos2(
-                left_center.x - left_label.size().x * 0.5,
-                label_y - left_label.size().y * 0.5,
-            );
-            let right_label_pos = egui::pos2(
-                right_center.x - right_label.size().x * 0.5,
-                label_y - right_label.size().y * 0.5,
-            );
-            let text_min = egui::pos2(
-                left_label_pos.x.min(right_label_pos.x),
-                left_label_pos.y.min(right_label_pos.y),
-            );
-            let text_max = egui::pos2(
-                (left_label_pos.x + left_label.size().x)
-                    .max(right_label_pos.x + right_label.size().x),
-                (left_label_pos.y + left_label.size().y)
-                    .max(right_label_pos.y + right_label.size().y),
-            );
-            let label_bg_rect =
-                egui::Rect::from_min_max(text_min, text_max).expand2(egui::vec2(16.0, 7.0));
-            painter.rect_filled(
-                label_bg_rect,
-                6.0,
-                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 168),
-            );
-            painter.rect_stroke(
-                label_bg_rect,
-                6.0,
-                egui::Stroke::new(
-                    1.0,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
-                ),
-                egui::StrokeKind::Outside,
-            );
-            painter.galley(left_label_pos, left_label, label_color);
-            painter.galley(right_label_pos, right_label, label_color);
-        }
+        // 一時停止中の中央 2 ボタン (「最初から」「続きから」) は native presenter
+        // 専用 (overlay_draw.rs::draw_native_center_pause_controls)。legacy egui
+        // presenter は 6d3ba5e で drop 済みなので、ここでは描画しない。
 
         // 再生中、ユーザーが一定時間操作しなかったら HUD を滑らかに薄くしていく。
         // 一時停止中も last_activity を最新化することで、再生再開直後に 2 秒は表示が

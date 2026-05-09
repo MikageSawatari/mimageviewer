@@ -903,11 +903,19 @@ pub(super) fn draw_native_center_pause_controls(
     ctx: &egui::Context,
     overlay_width_points: f32,
     overlay_height_points: f32,
+    excluded_panel_rects: &[egui::Rect],
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     egui::Area::new(egui::Id::new("native_video_center_pause_controls"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
+        // ⚠️ fade_in(false): egui::Area は新規可視時に animation_time をかけて
+        // opacity を 0→1 に animate するが、本 overlay は paused 中の自動 tick
+        // を持たない (wants_periodic_tick に paused_center_visible は含まれない)
+        // ため、最初のレンダー後に追加フレームが流れず alpha が 1.0 に到達しない。
+        // ユーザーには「半透明のまま」に見えてマウス移動で初めて正しい濃さに
+        // なる挙動になる。要件 = 瞬時に最終濃度で出す、なので fade を無効化する。
+        .fade_in(false)
         .show(ctx, |ui| {
             let full_rect = egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -1035,6 +1043,48 @@ pub(super) fn draw_native_center_pause_controls(
             }
             if play_resp.clicked() {
                 commands.push(NativeOverlayCommand::TogglePlay);
+            }
+
+            // 一時停止中の中央パネル外クリック処理。
+            //
+            // 設計上の問題: paused_center_visible の Area は set_min_size で
+            // 全画面を占有する。egui::Context::wants_pointer_input は
+            // `is_pointer_over_area() && !any_down` でも true になるため、
+            // mouse UP イベント (= any_down=false) は常に true になり
+            // should_forward_to_ui が false を返す → UI 側の
+            // handle_native_video_mouse_button まで届かない。結果、playing 中の
+            // クリック (= UI 側で処理されるパス) では成立する toggle/close が
+            // paused 中だと完全に死ぬ。
+            //
+            // 対策: overlay 側で raw `*_clicked()` を見て、UI 側で発行されるはず
+            // だった command を直接 emit する。primary は TogglePlay (= 再開)、
+            // secondary は CloseFullscreen (= 右クリックで閉じる) に対応させて
+            // playing 中と同じ操作感を保つ。
+            //
+            // 除外領域 (= 「中央パネル外でない」と判定する位置):
+            // - 左右ボタン rect: 上の replay_resp/play_resp.clicked() で処理済
+            // - backdrop_rect: ラベル「最初から/続きから」の黒背景 (Codex P3)
+            // - excluded_panel_rects: 呼び出し元で「実際に描画中の」パネル rect
+            //   (top bar / seek HUD / 左 jump / 右 metadata / VST3) を集めたもの。
+            //   ホバー判定領域より狭く、不可視パネルを誤って除外しない。
+            // 右クリック (close) はボタン上で押されても close 扱いで OK なので、
+            // 中央ボタン rect は除外しない。
+            let pos_opt = ctx.input(|i| i.pointer.interact_pos());
+            if let Some(pos) = pos_opt {
+                let in_visible_panel = excluded_panel_rects.iter().any(|r| r.contains(pos));
+                if !in_visible_panel {
+                    let on_center_button = replay_rect.contains(pos) || play_rect.contains(pos);
+                    let on_label_backdrop = backdrop_rect.contains(pos);
+                    if ctx.input(|i| i.pointer.primary_clicked())
+                        && !on_center_button
+                        && !on_label_backdrop
+                    {
+                        commands.push(NativeOverlayCommand::TogglePlay);
+                    }
+                    if ctx.input(|i| i.pointer.secondary_clicked()) {
+                        commands.push(NativeOverlayCommand::CloseFullscreen);
+                    }
+                }
             }
         });
 }
