@@ -3,6 +3,52 @@ use crate::archive_converter::ArchiveFormat;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
+/// `App::new_for_test` に渡すテスト設定。
+///
+/// Phase C では実プロセスの `data_dir::init` を経由せず、`set_test_override` で
+/// `TempDir` を差し込む。App 内の全 DB/インデクサ open はその data_dir を参照する。
+struct AppTestConfig {
+    /// テスト用データディレクトリ。`data_dir::set_test_override(Some(...))` に設定済みの
+    /// パスを渡す。(呼び出し側の `TempDir` が App より長生きする必要あり)
+    data_dir: std::path::PathBuf,
+    /// 起動時に `settings.json` をこの内容で上書きしてから App::default を呼ぶ。
+    /// None なら `Settings::load` が空ファイルから default 設定を作る。
+    settings: Option<crate::settings::Settings>,
+}
+
+impl App {
+    /// テスト用コンストラクタ。本番の `App::default` と同じ DB/indexer open 経路を
+    /// 通すが、以下が異なる:
+    ///
+    /// 1. `config.data_dir` を `data_dir::set_test_override` 経由で強制する前提 (呼び出し側で)
+    /// 2. `config.settings` があれば `settings.json` に書き出してから load する
+    /// 3. 名前索引 supervisor の初期 spawn は行わない
+    ///    (呼び出し側が `spawn_initial_name_index_supervisors()` を明示的に呼ぶ)
+    /// 4. 初期サイズ / font / theme は設定しない (テスト側で Context を用意する想定)
+    ///
+    /// 注意: Tantivy / SQLite / notify-rs などの実スレッドは通常どおり起動するので、
+    /// テスト終了時には `drop(app)` で正しく停止すること (IndexerManager::drop が
+    /// supervisor を signal_stop→join で止める)。
+    fn new_for_test(config: AppTestConfig) -> Self {
+        // settings.json をあらかじめ書いておく (App::default 内の Settings::load が拾う)
+        if let Some(settings) = &config.settings {
+            std::fs::create_dir_all(&config.data_dir).ok();
+            let json = serde_json::to_string_pretty(settings).expect("serialize settings");
+            std::fs::write(config.data_dir.join("settings.json"), json)
+                .expect("write settings.json");
+        }
+        // data_dir::get() はこの時点で config.data_dir を返さなければならない
+        debug_assert_eq!(
+            crate::data_dir::get(),
+            config.data_dir,
+            "data_dir::set_test_override(Some(config.data_dir)) を先に呼ぶこと"
+        );
+        let app = App::default();
+        // `spawn_initial_name_index_supervisors` はテスト側で必要なときだけ呼ぶ契約
+        app
+    }
+}
+
 fn scan_media_names(dir: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = scan_directory(dir)
         .all_media

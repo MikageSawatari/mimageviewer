@@ -76,6 +76,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | --- | --- |
 | `ui_main.rs` | メイン画面のグリッド描画とクリック/ドラッグ処理 |
 | `ui_fullscreen.rs` | フルスクリーンビューポート (`show_viewport_immediate`)。描画テクスチャの優先順位はここで決定 |
+| `ui_fullscreen/draw_icons.rs` | フルスクリーン上部バー / 動画 HUD のボタン・アイコン描画 helper、ファイル情報文字列 builder |
 | `ui_helpers.rs` | メニューバー、ツールバー、アドレスバー等の共通 UI |
 | `grid_item.rs` | `GridItem` 列挙型と `ThumbnailState` (Pending/Loaded/Failed/Evicted) |
 | `thumb_loader.rs` | サムネイル並列ロード (WebP キャッシュ生成含む) |
@@ -121,6 +122,8 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `ui_metadata_panel.rs` | メタデータパネル (AI メタデータ + EXIF + X ツイート情報) |
 | `ui_erase.rs` | 消しゴムモード (Lasso/縦線/横線/ブラシ → MI-GAN で inpaint) |
 | `ui_dialogs/` | 環境設定・サムネイルキャッシュ管理・変換済みアーカイブキャッシュ管理 (`archive_cache_manager.rs`)・アーカイブ変換ダイアログ (`archive_convert.rs`)・お気に入り編集・スライドショー設定等 |
+| `ui_dialogs/preferences.rs` | 環境設定ダイアログの状態、App 連携、ツリー / ページ dispatch |
+| `ui_dialogs/preferences/pages.rs` | 環境設定の各 `page_*` 描画関数 |
 | `ui_susie_diagnostic.rs` | Susie プラグイン診断パネルの描画。環境設定の「Susie プラグイン」ページから切り出し、`PoolStatus` 各バリアントごとにメッセージ・配色を出し分け。`egui_kittest` のスナップショットテスト対象 |
 
 ### 検索 / インデクサ / タグ

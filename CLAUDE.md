@@ -78,13 +78,17 @@ mimageviewer/
 │   │   ├── denoise.rs       # JPEG ノイズ除去推論
 │   │   └── upscale.rs       # タイル分割 4x アップスケール推論
 │   ├── ui_main.rs           # メイン画面 UI（グリッド描画）
-│   ├── ui_fullscreen.rs     # フルスクリーン表示（上部ホバーバー含む）
+│   ├── ui_fullscreen.rs     # フルスクリーン表示（ビューポート制御・描画 dispatch）
+│   ├── ui_fullscreen/
+│   │   └── draw_icons.rs    # 上部ホバーバー / 動画 HUD のアイコン・情報テキスト helper
 │   ├── ui_helpers.rs        # UI ヘルパー関数
 │   ├── ui_metadata_panel.rs # フルスクリーン メタデータパネル（AI + EXIF）
 │   ├── ui_susie_diagnostic.rs # Susie プラグイン診断パネル描画（環境設定から切り出し、kittest でスナップショットテスト）
 │   ├── ui_dialogs/          # ダイアログ群
 │   │   ├── mod.rs
-│   │   ├── preferences.rs        # 環境設定（表示・パフォーマンス・フォルダ・ファイル処理・UI テーマ・Susie プラグイン…）
+│   │   ├── preferences.rs        # 環境設定（状態・App 連携・ツリー / ページ dispatch）
+│   │   ├── preferences/
+│   │   │   └── pages.rs          # 環境設定の page_* 描画関数
 │   │   ├── cache_manager.rs      # サムネイルキャッシュ管理
 │   │   ├── archive_cache_manager.rs # 変換済みアーカイブキャッシュ管理（v0.7.0）
 │   │   ├── archive_convert.rs    # 7z/LZH → ZIP 変換ダイアログ（v0.7.0）
