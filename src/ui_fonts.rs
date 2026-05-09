@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 pub const USER_TEXT_FAMILY_NAME: &str = "miv-user-text";
+const DERIVED_Y_OFFSET_CLAMP: f32 = 0.40;
 
 const JAPANESE_FONT_PATHS: &[&str] = &[
     r"C:\Windows\Fonts\YuGothM.ttc",
@@ -38,17 +39,22 @@ const USER_TEXT_FALLBACKS: &[FallbackFont] = &[
         // same center line as Japanese body text, not below it. Compute the
         // tweak from real glyph bounds to avoid hand-tuning magic numbers.
         y_offset: FallbackYOffset::AlignGlyphCenter {
-            samples: &['🧠', '🍧', '💗'],
+            samples: &['🐾', '🧠', '🍧', '💗'],
             fallback: -0.12,
         },
     },
-    // Mathematical alphanumeric symbols such as 𝓈𝒸𝓇𝑒𝒶𝓂 are not covered by
-    // Yu Gothic. A small downward tweak keeps them on the same visual baseline.
+    // Mathematical alphanumeric symbols such as 𝓈𝒸𝓇𝑒𝒶𝓂 and separator glyphs
+    // such as ⋈ are not covered by Yu Gothic. Align Cambria Math with the
+    // primary-font hyphen run so metadata separator rows do not drift vertically.
     FallbackFont {
         name: "math",
         path: r"C:\Windows\Fonts\cambria.ttc",
         scale: 0.98,
-        y_offset: FallbackYOffset::Fixed(0.04),
+        // Cambria Math reports reasonable font metrics for ⋈, but egui's
+        // rasterized pixels sit visibly below ASCII hyphen separator runs.
+        // Snapshot coverage locks this calibrated offset to the visible target:
+        // the center of ⋈ should sit on the hyphen stroke.
+        y_offset: FallbackYOffset::Fixed(-0.30),
     },
     FallbackFont {
         name: "historic",
@@ -173,11 +179,23 @@ fn fallback_y_offset_factor(
             .and_then(|target| {
                 let fallback_center = font_center_y_for_samples(data, samples)?;
                 let scale = fallback.scale.max(0.01);
-                // egui applies y_offset_factor in screen-space points after glyph scaling.
-                // Font coordinates are positive-up, so aligning normalized glyph centers yields:
-                //   -fallback_center * size * scale + size * scale * factor
+                // egui 0.33 applies y_offset_factor after multiplying it by
+                // FontTweak::scale. Font coordinates are positive-up, so aligning
+                // normalized glyph centers yields:
+                //   factor * size * scale - fallback_center * size * scale
                 //     == -target_center * size
-                Some((fallback_center - target.center_y / scale).clamp(-0.24, 0.24))
+                let factor = (fallback_center - target.center_y / scale)
+                    .clamp(-DERIVED_Y_OFFSET_CLAMP, DERIVED_Y_OFFSET_CLAMP);
+                crate::logger::log(format!(
+                    "ui_fonts: {} alignment derived target_center={:.4} fallback_center={:.4} scale={:.3} factor={:.4} samples={}",
+                    fallback.name,
+                    target.center_y,
+                    fallback_center,
+                    scale,
+                    factor,
+                    samples.iter().collect::<String>()
+                ));
+                Some(factor)
             })
             .unwrap_or(fallback_offset),
     }
@@ -185,15 +203,20 @@ fn fallback_y_offset_factor(
 
 fn font_center_y_for_samples(data: &[u8], samples: &[char]) -> Option<f32> {
     let face = ttf_parser::Face::parse(data, 0).ok()?;
-    let mut total = 0.0;
-    let mut count = 0.0;
-    for sample in samples {
-        if let Some(center_y) = glyph_center_y(&face, *sample) {
-            total += center_y;
-            count += 1.0;
-        }
+    let mut centers = samples
+        .iter()
+        .filter_map(|sample| glyph_center_y(&face, *sample))
+        .collect::<Vec<_>>();
+    if centers.is_empty() {
+        return None;
     }
-    (count > 0.0).then_some(total / count)
+    centers.sort_by(|a, b| a.total_cmp(b));
+    let mid = centers.len() / 2;
+    if centers.len() % 2 == 0 {
+        Some((centers[mid - 1] + centers[mid]) * 0.5)
+    } else {
+        Some(centers[mid])
+    }
 }
 
 fn font_metric_center_y(data: &[u8]) -> Option<f32> {
@@ -210,12 +233,14 @@ fn font_metric_center_y(data: &[u8]) -> Option<f32> {
 
 fn glyph_center_y(face: &ttf_parser::Face<'_>, sample: char) -> Option<f32> {
     let glyph_id = face.glyph_index(sample)?;
-    let units_per_em = f32::from(face.units_per_em());
-    if let Some(rect) = face.glyph_bounding_box(glyph_id) {
-        return Some((f32::from(rect.y_min) + f32::from(rect.y_max)) * 0.5 / units_per_em);
+    if let Some(image) = face.glyph_raster_image(glyph_id, face.units_per_em()) {
+        return Some(
+            (f32::from(image.y) + f32::from(image.height) * 0.5) / f32::from(image.pixels_per_em),
+        );
     }
-    let image = face.glyph_raster_image(glyph_id, face.units_per_em())?;
-    Some((f32::from(image.y) + f32::from(image.height) * 0.5) / f32::from(image.pixels_per_em))
+    let units_per_em = f32::from(face.units_per_em());
+    let rect = face.glyph_bounding_box(glyph_id)?;
+    Some((f32::from(rect.y_min) + f32::from(rect.y_max)) * 0.5 / units_per_em)
 }
 
 fn remove_font_name(fonts: &mut Vec<String>, name: &str) {
@@ -242,7 +267,7 @@ mod tests {
             .expect("Windows Japanese font should be available");
         let emoji = std::fs::read(r"C:\Windows\Fonts\seguiemj.ttf")
             .expect("Segoe UI Emoji should be available");
-        let target = font_center_y_for_samples(&japanese, &['今', 'あ'])
+        let body_text = font_center_y_for_samples(&japanese, &['今', 'あ'])
             .or_else(|| font_metric_center_y(&japanese))
             .map(|center_y| FontAlignmentTarget { center_y })
             .expect("Japanese glyph center should be measurable");
@@ -251,8 +276,16 @@ mod tests {
             .find(|font| font.name == "emoji")
             .expect("emoji fallback definition should exist");
 
-        assert!(font_center_y_for_samples(&emoji, &['🧠', '🍧', '💗']).is_some());
-        let offset = fallback_y_offset_factor(emoji_font, &emoji, Some(target));
+        let samples = ['🐾', '🧠', '🍧', '💗'];
+        let fallback_center =
+            font_center_y_for_samples(&emoji, &samples).expect("emoji center should be measurable");
+        let offset = fallback_y_offset_factor(emoji_font, &emoji, Some(body_text));
+        let expected = (fallback_center - body_text.center_y / emoji_font.scale)
+            .clamp(-DERIVED_Y_OFFSET_CLAMP, DERIVED_Y_OFFSET_CLAMP);
+        assert!(
+            (offset - expected).abs() < f32::EPSILON,
+            "emoji offset should follow egui's scaled y_offset formula: {offset} vs {expected}",
+        );
         assert!(
             (-0.24..=0.0).contains(&offset),
             "emoji should be nudged upward from measured glyph centers, got {offset}",

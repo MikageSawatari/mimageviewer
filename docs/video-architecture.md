@@ -263,7 +263,12 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   ユーザー由来の長文だけ Segoe UI Emoji / Cambria Math / Segoe UI Historic /
   Segoe UI Symbol を優先する。絵文字の縦位置は ttf-parser で Yu Gothic の日本語 glyph と
   Segoe UI Emoji の代表 glyph の中心を読み、egui の `FontTweak` に入れる補正量を
-  起動時に計算してベースラインずれを抑える。
+  起動時に計算してベースラインずれを抑える。Segoe UI Emoji は outline bbox が
+  実描画と違う場合があるため、取得できるときは raster image bounds を優先し、
+  サンプルの外れ値は中央値で抑える。Cambria Math の `⋈` など、区切り線で
+  使われる記号は Yu Gothic の ASCII hyphen run に中心を合わせる。`⋈` は
+  フォント bbox と実描画の見た目がずれるため、UI スナップショットで確認した
+  補正値を使う。
 - `fill_output` の bookkeeping (Phase 9 後の cleanup refactor):
   - **実消費サンプル数ベース**: `pop_front` で取り出した分 (= `real_consumed`) のみ
     `next_pts_secs` を進める。silence 出力中は pts 進行 0 (= 旧版の「常に full want
