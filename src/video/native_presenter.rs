@@ -36,6 +36,10 @@ use windows::Win32::UI::Input::Ime::{
     CANDIDATEFORM, CFS_EXCLUDE, CFS_POINT, COMPOSITIONFORM, ImmGetContext, ImmReleaseContext,
     ImmSetCandidateWindow, ImmSetCompositionWindow,
 };
+use windows::Win32::UI::WindowsAndMessaging::{
+    IDC_ARROW, IDC_HAND, IDC_IBEAM, IDC_NO, IDC_SIZEALL, IDC_SIZENS, IDC_SIZEWE, IDC_WAIT,
+    LoadCursorW, SetCursor,
+};
 use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 
@@ -259,6 +263,7 @@ pub struct NativeOverlayMetadata {
     pub file_name: String,
     pub title: Option<String>,
     pub artist: Option<String>,
+    pub original_url: Option<String>,
     pub description: Option<String>,
     pub width: u32,
     pub height: u32,
@@ -487,6 +492,9 @@ pub enum NativeOverlayCommand {
     },
     DeleteBookmark {
         id: i64,
+    },
+    OpenExternalUrl {
+        url: String,
     },
 }
 
@@ -2564,6 +2572,7 @@ impl NativeEguiOverlay {
                     overlay_width_points,
                     overlay_height_points,
                     metadata,
+                    &mut commands,
                 );
             }
             if jump_panel_visible {
@@ -3249,6 +3258,7 @@ impl NativeEguiOverlay {
         self.right_panel_visible = right_panel_visible;
         self.jump_panel_visible = jump_panel_visible;
         self.update_ime_cursor_area(full_output.platform_output.ime);
+        self.update_cursor_icon(full_output.platform_output.cursor_icon);
 
         let shape_count = full_output.shapes.len();
         for (id, image_delta) in &full_output.textures_delta.set {
@@ -3376,6 +3386,28 @@ impl NativeEguiOverlay {
             let _ = ImmSetCompositionWindow(himc, &composition_form);
             let _ = ImmSetCandidateWindow(himc, &candidate_form);
             let _ = ImmReleaseContext(self.hwnd, himc);
+        }
+    }
+
+    fn update_cursor_icon(&self, cursor_icon: egui::CursorIcon) {
+        let cursor_id = match cursor_icon {
+            egui::CursorIcon::PointingHand => IDC_HAND,
+            egui::CursorIcon::Text | egui::CursorIcon::VerticalText => IDC_IBEAM,
+            egui::CursorIcon::ResizeHorizontal => IDC_SIZEWE,
+            egui::CursorIcon::ResizeVertical => IDC_SIZENS,
+            egui::CursorIcon::Move
+            | egui::CursorIcon::Grab
+            | egui::CursorIcon::Grabbing
+            | egui::CursorIcon::AllScroll => IDC_SIZEALL,
+            egui::CursorIcon::NotAllowed | egui::CursorIcon::NoDrop => IDC_NO,
+            egui::CursorIcon::Progress | egui::CursorIcon::Wait => IDC_WAIT,
+            egui::CursorIcon::Default | egui::CursorIcon::None => IDC_ARROW,
+            _ => IDC_ARROW,
+        };
+        if let Ok(cursor) = unsafe { LoadCursorW(None, cursor_id) } {
+            unsafe {
+                SetCursor(Some(cursor));
+            }
         }
     }
 }
@@ -4855,6 +4887,7 @@ fn draw_native_metadata_panel(
     overlay_width_points: f32,
     overlay_height_points: f32,
     metadata: &NativeOverlayMetadata,
+    commands: &mut Vec<NativeOverlayCommand>,
 ) {
     let rect = native_metadata_panel_rect(overlay_width_points, overlay_height_points);
     egui::Area::new(egui::Id::new("native_video_metadata_panel"))
@@ -4913,6 +4946,10 @@ fn draw_native_metadata_panel(
                 ("ファイル", metadata.file_name.clone()),
                 ("タイトル", title.to_string()),
                 ("アーティスト", metadata.artist.clone().unwrap_or_default()),
+                (
+                    "元動画URL",
+                    metadata.original_url.clone().unwrap_or_default(),
+                ),
                 ("説明", metadata.description.clone().unwrap_or_default()),
                 (
                     "動画",
@@ -4968,14 +5005,15 @@ fn draw_native_metadata_panel(
                             );
                             ui.vertical(|ui| {
                                 ui.set_width((rect.width() - 118.0).max(160.0));
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(value)
-                                            .font(crate::ui_fonts::user_text_font(12.0))
-                                            .color(egui::Color32::from_rgb(230, 230, 230)),
-                                    )
-                                    .wrap(),
-                                );
+                                if let Some(url) = crate::ui_text_links::draw_text_with_links(
+                                    ui,
+                                    &value,
+                                    crate::ui_fonts::user_text_font(12.0),
+                                    egui::Color32::from_rgb(230, 230, 230),
+                                    egui::Color32::from_rgb(115, 180, 255),
+                                ) {
+                                    commands.push(NativeOverlayCommand::OpenExternalUrl { url });
+                                }
                             });
                         });
                         ui.add_space(7.0);

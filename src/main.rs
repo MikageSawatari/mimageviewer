@@ -15,6 +15,7 @@ mod dcomp_presenter_test;
 pub mod delete_worker;
 pub mod dwm_transitions;
 pub mod exif_reader;
+pub mod external_links;
 pub mod fast_resize;
 pub mod folder_rating_counter;
 pub mod folder_tree;
@@ -76,6 +77,7 @@ pub mod ui_helpers;
 mod ui_main;
 mod ui_metadata_panel;
 pub mod ui_susie_diagnostic;
+pub mod ui_text_links;
 #[cfg(windows)]
 pub mod ui_video_panels;
 #[cfg(windows)]

@@ -285,6 +285,9 @@ pub enum NativeVideoOutputEvent {
     DeleteBookmark {
         id: i64,
     },
+    OpenExternalUrl {
+        url: String,
+    },
 }
 
 #[cfg(windows)]
@@ -966,6 +969,7 @@ fn send_native_overlay_command(
             NativeVideoOutputEvent::SetBookmarkTitle { id, title }
         }
         Command::DeleteBookmark { id } => NativeVideoOutputEvent::DeleteBookmark { id },
+        Command::OpenExternalUrl { url } => NativeVideoOutputEvent::OpenExternalUrl { url },
     };
     send_native_output_event(tx, source_epoch, event);
 }
@@ -1510,6 +1514,15 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::DeleteBookmark { id },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::OpenExternalUrl {
+                                url,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::OpenExternalUrl { url },
                                 );
                             }
                         }

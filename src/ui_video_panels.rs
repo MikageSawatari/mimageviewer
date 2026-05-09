@@ -33,6 +33,7 @@ const TITLE_BAR_H: f32 = 32.0;
 const LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(140, 160, 200);
 const TEXT_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 230, 230);
 const DIM_COLOR: egui::Color32 = egui::Color32::from_rgb(150, 150, 150);
+const LINK_COLOR: egui::Color32 = egui::Color32::from_rgb(115, 180, 255);
 
 impl App {
     /// 動画フルスクリーン中の **右パネル** (= メタ情報) を描画する。
@@ -157,69 +158,72 @@ impl App {
                 .max_rect(content_rect)
                 .layout(egui::Layout::top_down(egui::Align::LEFT)),
         );
+        let mut clicked_url = None;
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show(&mut content_ui, |ui| {
                 ui.add_space(8.0);
                 if let Some(info) = info.as_ref() {
-                    draw_kv_section(ui, info);
+                    clicked_url = draw_kv_section(ui, info);
                 } else {
                     ui.add_space(8.0);
                     ui.colored_label(DIM_COLOR, "読み込み中...");
                 }
                 ui.add_space(16.0);
             });
+        if let Some(url) = clicked_url {
+            self.open_video_metadata_url(ctx, fs_idx, &url);
+        }
 
         true
     }
+
+    fn open_video_metadata_url(&mut self, ctx: &egui::Context, fs_idx: usize, url: &str) {
+        if let Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) =
+            self.fs_cache.get(&fs_idx)
+        {
+            player.set_playing(false);
+        }
+        crate::ui_helpers::open_url(url);
+        ctx.request_repaint();
+    }
 }
 
-fn draw_kv_section(ui: &mut egui::Ui, info: &VideoInfo) {
-    let put = |ui: &mut egui::Ui, label: &str, value: &str| {
-        ui.horizontal(|ui| {
-            ui.add_space(12.0);
-            ui.colored_label(LABEL_COLOR, label);
-        });
-        ui.horizontal(|ui| {
-            ui.add_space(20.0);
-            ui.label(
-                egui::RichText::new(value)
-                    .color(TEXT_COLOR)
-                    .font(crate::ui_fonts::user_text_font(13.0)),
-            );
-        });
-        ui.add_space(2.0);
-    };
+fn draw_kv_section(ui: &mut egui::Ui, info: &VideoInfo) -> Option<String> {
+    let mut clicked_url = None;
 
     if let Some(t) = info.title.as_deref() {
-        put(ui, "タイトル", t);
+        put_metadata_row(ui, "タイトル", t, &mut clicked_url);
     }
     if let Some(a) = info.artist.as_deref() {
-        put(ui, "作成者", a);
+        put_metadata_row(ui, "作成者", a, &mut clicked_url);
+    }
+    if let Some(url) = info.original_url.as_deref() {
+        put_metadata_row(ui, "元動画URL", url, &mut clicked_url);
     }
     if let Some(d) = info.description.as_deref() {
-        put(ui, "説明", d);
+        put_metadata_row(ui, "説明", d, &mut clicked_url);
     }
 
     let dur_str = crate::ui_helpers::format_hms(info.duration_secs);
-    put(ui, "長さ", &dur_str);
+    put_metadata_row(ui, "長さ", &dur_str, &mut clicked_url);
 
     let res_str = format!("{} × {} px", info.width, info.height);
-    put(ui, "解像度", &res_str);
+    put_metadata_row(ui, "解像度", &res_str, &mut clicked_url);
 
     if info.avg_fps > 0.0 {
         let fps_str = format!("{:.2} fps", info.avg_fps);
-        put(ui, "フレームレート", &fps_str);
+        put_metadata_row(ui, "フレームレート", &fps_str, &mut clicked_url);
     }
 
-    put(ui, "動画コーデック", &info.video_codec);
+    put_metadata_row(ui, "動画コーデック", &info.video_codec, &mut clicked_url);
 
-    put(ui, "使用デコーダ", &info.video_decoder);
+    put_metadata_row(ui, "使用デコーダ", &info.video_decoder, &mut clicked_url);
 
     if let Some(ac) = info.audio_codec.as_deref() {
-        put(ui, "音声コーデック", ac);
+        put_metadata_row(ui, "音声コーデック", ac, &mut clicked_url);
     } else {
-        put(ui, "音声", "なし");
+        put_metadata_row(ui, "音声", "なし", &mut clicked_url);
     }
 
     let path_label = if info.gpu_path_active {
@@ -227,17 +231,43 @@ fn draw_kv_section(ui: &mut egui::Ui, info: &VideoInfo) {
     } else {
         "CPU (readback + swscale)"
     };
-    put(ui, "経路", path_label);
+    put_metadata_row(ui, "経路", path_label, &mut clicked_url);
 
     let decode_label = if info.hw_decode_active { "HW" } else { "SW" };
-    put(ui, "デコーダ", decode_label);
+    put_metadata_row(ui, "デコーダ", decode_label, &mut clicked_url);
 
     let d3d11_label = if info.d3d11va_supported {
         "対応"
     } else {
         "非対応"
     };
-    put(ui, "D3D11VA候補", d3d11_label);
+    put_metadata_row(ui, "D3D11VA候補", d3d11_label, &mut clicked_url);
+
+    clicked_url
+}
+
+fn put_metadata_row(ui: &mut egui::Ui, label: &str, value: &str, clicked_url: &mut Option<String>) {
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.colored_label(LABEL_COLOR, label);
+    });
+    ui.horizontal_top(|ui| {
+        ui.add_space(20.0);
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width().max(80.0));
+            if let Some(url) = crate::ui_text_links::draw_text_with_links(
+                ui,
+                value,
+                crate::ui_fonts::user_text_font(13.0),
+                TEXT_COLOR,
+                LINK_COLOR,
+            ) && clicked_url.is_none()
+            {
+                *clicked_url = Some(url);
+            }
+        });
+    });
+    ui.add_space(2.0);
 }
 
 /// 左パネルでクリックされた行から発生する操作。

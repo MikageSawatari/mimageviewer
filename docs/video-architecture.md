@@ -373,6 +373,11 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - ネイティブ HWND + DComp で「動画レイヤ」「黒背景レイヤ」「egui overlay レイヤ」を
   別々の swap chain に分離し、動画レイヤだけを高頻度 present、overlay は必要時のみ
   redraw する構造に変えることで pacing が安定した
+- メタデータパネルは FFmpeg format metadata から title / artist / description /
+  HTTP(S) の元動画 URL (`comment` / `PURL` / `webpage_url` 等) を受け取り、description 内 URL も
+  `ui_text_links` でリンク化する。リンククリックは native overlay command として
+  UI thread へ戻し、`VideoPlayer::set_playing(false)` 後に
+  `opener` 経由で既定ブラウザを起動する。URL は `external_links` で HTTP(S) のみに制限する。
 - 経緯と設計判断は [docs/dcomp-native-presenter-integration-plan.md](dcomp-native-presenter-integration-plan.md)
   に詳細あり (Phase A〜D の段階的移行)
 

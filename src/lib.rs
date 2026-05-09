@@ -30,6 +30,7 @@ pub mod delete_worker;
 #[cfg(windows)]
 pub mod dwm_transitions;
 pub mod exif_reader;
+pub mod external_links;
 pub mod fast_resize;
 pub mod folder_rating_counter;
 pub mod folder_tree;
@@ -74,6 +75,7 @@ pub mod thumb_loader;
 pub mod ui_fonts;
 pub mod ui_helpers;
 pub mod ui_susie_diagnostic;
+pub mod ui_text_links;
 pub mod undo_stack;
 pub mod update_check;
 #[cfg(windows)]

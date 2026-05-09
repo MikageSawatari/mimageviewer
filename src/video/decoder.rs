@@ -994,6 +994,9 @@ pub struct VideoInfo {
     /// 想定。値が無いキーは None。
     pub title: Option<String>,
     pub artist: Option<String>,
+    /// Original webpage URL embedded by external tools (`PURL`,
+    /// `webpage_url`, etc.). Only HTTP(S) URLs are surfaced to the UI.
+    pub original_url: Option<String>,
     pub description: Option<String>,
     /// 平均フレームレート (Phase 5.4 の右パネル表示用)。
     pub avg_fps: f64,
@@ -1344,6 +1347,23 @@ fn run_decoder(
     // 大文字違いも順に試す。値が空なら None。
     let title = read_metadata_value(&input, &["title", "TITLE"]);
     let artist = read_metadata_value(&input, &["artist", "ARTIST", "author"]);
+    let original_url = read_metadata_http_url(
+        &input,
+        &[
+            "purl",
+            "PURL",
+            "url",
+            "URL",
+            "webpage_url",
+            "WEBPAGE_URL",
+            "source_url",
+            "SOURCE_URL",
+            "original_url",
+            "ORIGINAL_URL",
+            "comment",
+            "COMMENT",
+        ],
+    );
     let description = read_metadata_value(
         &input,
         &["description", "DESCRIPTION", "comment", "COMMENT"],
@@ -1393,6 +1413,7 @@ fn run_decoder(
         gpu_path_active,
         title,
         artist,
+        original_url,
         description,
         avg_fps: video_avg_fps,
         bit_rate_bps,
@@ -4725,7 +4746,24 @@ fn read_metadata_value(
             }
         }
     }
+    for (key, value) in dict.iter() {
+        if keys
+            .iter()
+            .any(|candidate| key.eq_ignore_ascii_case(candidate))
+            && !value.trim().is_empty()
+        {
+            return Some(value.to_string());
+        }
+    }
     None
+}
+
+fn read_metadata_http_url(
+    input: &ffmpeg_the_third::format::context::Input,
+    keys: &[&str],
+) -> Option<String> {
+    read_metadata_value(input, keys)
+        .and_then(|value| crate::external_links::normalize_http_url(&value))
 }
 
 /// AV_PIX_FMT_D3D11 の AVFrame を mIV 側 D3D11 デバイス上で NV12→RGBA blit して

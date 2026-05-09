@@ -13591,6 +13591,9 @@ impl App {
             crate::video::NativeVideoOutputEvent::DeleteBookmark { id } => {
                 self.handle_native_video_delete_bookmark_command(ctx, fs_idx, id);
             }
+            crate::video::NativeVideoOutputEvent::OpenExternalUrl { url } => {
+                self.handle_native_video_open_external_url_command(ctx, fs_idx, url);
+            }
         }
     }
 
@@ -13734,6 +13737,23 @@ impl App {
             player.toggle_play();
             self.mark_native_video_hud_activity(ctx);
         }
+    }
+
+    #[cfg(windows)]
+    fn handle_native_video_open_external_url_command(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        url: String,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) {
+            return;
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_playing(false);
+        }
+        crate::ui_helpers::open_url(&url);
+        self.mark_native_video_hud_activity(ctx);
     }
 
     #[cfg(windows)]
@@ -13950,6 +13970,7 @@ impl App {
                 file_name,
                 title: info.title.clone(),
                 artist: info.artist.clone(),
+                original_url: info.original_url.clone(),
                 description: info.description.clone(),
                 width: info.width,
                 height: info.height,
