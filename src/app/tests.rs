@@ -1,0 +1,2984 @@
+use super::*;
+use crate::archive_converter::ArchiveFormat;
+use std::path::PathBuf;
+use tempfile::TempDir;
+
+fn scan_media_names(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = scan_directory(dir)
+        .all_media
+        .into_iter()
+        .filter_map(|(path, _, _, _)| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn scan_directory_hides_source_when_upscaled_derivative_sidecar_exists() {
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("movie.mp4"), b"source").unwrap();
+    std::fs::write(tmp.path().join("movie.jpg"), b"cover").unwrap();
+    std::fs::write(tmp.path().join("movie.miv.mkv"), b"upscaled").unwrap();
+    std::fs::write(tmp.path().join("movie.miv.json"), b"{}").unwrap();
+
+    assert_eq!(scan_media_names(tmp.path()), vec!["movie.miv.mkv"]);
+}
+
+#[test]
+fn scan_directory_hides_multiple_companion_images_when_derivative_exists() {
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("movie.mp4"), b"source").unwrap();
+    std::fs::write(tmp.path().join("movie.jpg"), b"cover").unwrap();
+    std::fs::write(tmp.path().join("movie.png"), b"thumb").unwrap();
+    std::fs::write(tmp.path().join("movie.webp"), b"thumb2").unwrap();
+    std::fs::write(tmp.path().join("movie.miv.mkv"), b"upscaled").unwrap();
+    std::fs::write(tmp.path().join("movie.miv.json"), b"{}").unwrap();
+
+    assert_eq!(scan_media_names(tmp.path()), vec!["movie.miv.mkv"]);
+}
+
+#[test]
+fn scan_directory_keeps_source_when_upscaled_sidecar_is_missing() {
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("movie.mp4"), b"source").unwrap();
+    std::fs::write(tmp.path().join("movie.miv.mkv"), b"upscaled").unwrap();
+
+    assert_eq!(
+        scan_media_names(tmp.path()),
+        vec!["movie.miv.mkv", "movie.mp4"]
+    );
+}
+
+#[test]
+fn scan_directory_keeps_sources_when_upscaled_stem_is_ambiguous() {
+    let tmp = TempDir::new().expect("tempdir");
+    std::fs::write(tmp.path().join("movie.mp4"), b"source-a").unwrap();
+    std::fs::write(tmp.path().join("movie.avi"), b"source-b").unwrap();
+    std::fs::write(tmp.path().join("movie.miv.mkv"), b"upscaled").unwrap();
+    std::fs::write(tmp.path().join("movie.miv.json"), b"{}").unwrap();
+
+    assert_eq!(
+        scan_media_names(tmp.path()),
+        vec!["movie.avi", "movie.miv.mkv", "movie.mp4"]
+    );
+}
+
+// ── passes_rating_filter (コンテナ/画像/Video の挙動) ──
+
+#[test]
+fn video_autoplay_for_open_treats_grid_open_as_play_intent() {
+    use crate::settings::VideoAutoplayMode;
+
+    assert!(video_autoplay_for_open(VideoAutoplayMode::Off, false, true));
+    assert!(!video_autoplay_for_open(
+        VideoAutoplayMode::Off,
+        false,
+        false
+    ));
+    assert!(video_autoplay_for_open(
+        VideoAutoplayMode::OnlyFromGrid,
+        false,
+        true
+    ));
+    assert!(!video_autoplay_for_open(
+        VideoAutoplayMode::OnlyFromGrid,
+        false,
+        false
+    ));
+    assert!(video_autoplay_for_open(
+        VideoAutoplayMode::Always,
+        false,
+        false
+    ));
+    assert!(video_autoplay_for_open(VideoAutoplayMode::Off, true, false));
+}
+
+#[test]
+fn rating_filter_container_uses_all_6_buckets() {
+    let folder = GridItem::Folder(PathBuf::from("/a"));
+    // ★なし OFF → 未評価フォルダも隠れる (「★5 のみ表示」が実際に効くために必要)
+    let mut f = [true; 6];
+    f[0] = false;
+    assert!(!passes_rating_filter(&folder, 0, &f));
+    // ★3 フォルダ、★3 ON なら可視
+    assert!(passes_rating_filter(&folder, 3, &[true; 6]));
+    // ★3 フォルダ、★3 OFF なら非可視
+    let mut f = [true; 6];
+    f[3] = false;
+    assert!(!passes_rating_filter(&folder, 3, &f));
+}
+
+#[test]
+fn rating_filter_zip_pdf_containers_behave_like_folder() {
+    let zip = GridItem::ZipFile(PathBuf::from("/a.zip"));
+    let pdf = GridItem::PdfFile(PathBuf::from("/a.pdf"));
+    let mut f = [true; 6];
+    f[0] = false;
+    assert!(!passes_rating_filter(&zip, 0, &f));
+    assert!(!passes_rating_filter(&pdf, 0, &f));
+    let mut f = [true; 6];
+    f[4] = false;
+    assert!(!passes_rating_filter(&zip, 4, &f));
+    assert!(!passes_rating_filter(&pdf, 4, &f));
+}
+
+#[test]
+fn rating_filter_image_page_uses_all_6_buckets() {
+    let img = GridItem::Image(PathBuf::from("/a.jpg"));
+    let mut f = [true; 6];
+    f[0] = false;
+    assert!(!passes_rating_filter(&img, 0, &f));
+    let f = [true; 6];
+    assert!(passes_rating_filter(&img, 2, &f));
+    let mut f = [true; 6];
+    f[2] = false;
+    assert!(!passes_rating_filter(&img, 2, &f));
+}
+
+#[test]
+fn rating_filter_zip_image_and_pdf_page_behave_like_image() {
+    // ページ系の残り 2 種 (ZipImage / PdfPage) が Image と同じ 6 バケット判定で
+    // 動いていることを担保 (コンテナと対称)。
+    let zip_img = GridItem::ZipImage {
+        zip_path: PathBuf::from("/a.zip"),
+        entry_name: "x.jpg".to_string(),
+    };
+    let pdf_page = GridItem::PdfPage {
+        pdf_path: PathBuf::from("/a.pdf"),
+        page_num: 1,
+        content_type: None,
+    };
+    let mut f = [true; 6];
+    f[0] = false;
+    assert!(!passes_rating_filter(&zip_img, 0, &f));
+    assert!(!passes_rating_filter(&pdf_page, 0, &f));
+    let mut f = [true; 6];
+    f[3] = false;
+    assert!(!passes_rating_filter(&zip_img, 3, &f));
+    assert!(!passes_rating_filter(&pdf_page, 3, &f));
+}
+
+#[test]
+fn rating_filter_star5_only_hides_unrated_containers() {
+    // ユーザが明示的に「★5 だけ見たい」(★5 のみ ON、他全部 OFF) を選んだとき、
+    // 未評価のフォルダも確実に非表示になること (本修正の主目的)
+    let folder = GridItem::Folder(PathBuf::from("/a"));
+    let img = GridItem::Image(PathBuf::from("/b.jpg"));
+    let mut f = [false; 6];
+    f[5] = true;
+    assert!(!passes_rating_filter(&folder, 0, &f));
+    assert!(!passes_rating_filter(&img, 0, &f));
+    assert!(passes_rating_filter(&folder, 5, &f));
+    assert!(passes_rating_filter(&img, 5, &f));
+}
+
+#[test]
+fn rating_filter_applies_to_video_when_unrated_off() {
+    // Video もレーティング対象なので「なし」フィルタ OFF で未評価動画は隠れる。
+    // 通常画像と同じ扱い。
+    let vid = GridItem::Video(PathBuf::from("/a.mp4"));
+    // 全 OFF: ★0 (未評価) の動画は隠れる
+    assert!(!passes_rating_filter(&vid, 0, &[false; 6]));
+    // ★0 ON: ★0 の動画は通る
+    let mut rf = [false; 6];
+    rf[0] = true;
+    assert!(passes_rating_filter(&vid, 0, &rf));
+    // ★3 のみ ON: ★0 動画は通らない、★3 動画は通る
+    let mut rf = [false; 6];
+    rf[3] = true;
+    assert!(!passes_rating_filter(&vid, 0, &rf));
+    assert!(passes_rating_filter(&vid, 3, &rf));
+}
+
+#[test]
+fn separator_is_not_rating_target() {
+    // ZipSeparator はレーティング対象外なのでフィルタ素通り (常に可視)。
+    let sep = GridItem::ZipSeparator {
+        dir_display: "x".into(),
+    };
+    assert!(passes_rating_filter(&sep, 0, &[false; 6]));
+}
+
+#[test]
+fn rating_filter_defensive_against_corrupt_stars() {
+    // 想定外の stars>5 はインデックス越境を避けるため非可視にする (防御)
+    let folder = GridItem::Folder(PathBuf::from("/a"));
+    let img = GridItem::Image(PathBuf::from("/a.jpg"));
+    assert!(!passes_rating_filter(&folder, 99, &[true; 6]));
+    assert!(!passes_rating_filter(&img, 99, &[true; 6]));
+}
+
+/// ★フィルタ suppression の scope 判定: folder anchor。
+/// case-insensitive + component-boundary + cross-drive を `path_in_subtree_ci` で担保する。
+#[test]
+fn rating_filter_suppression_scope_folder_anchor() {
+    use std::path::Path;
+    let anchor = PathBuf::from("/books/book-a");
+    // 同一 / 子孫
+    assert!(path_in_subtree_ci(Path::new("/books/book-a"), &anchor));
+    assert!(path_in_subtree_ci(
+        Path::new("/books/book-a/chapter1"),
+        &anchor
+    ));
+    assert!(path_in_subtree_ci(
+        Path::new("/books/book-a/chapter1/sub"),
+        &anchor
+    ));
+    // 親 / sibling は外
+    assert!(!path_in_subtree_ci(Path::new("/books"), &anchor));
+    assert!(!path_in_subtree_ci(Path::new("/books/book-b"), &anchor));
+    // name prefix match (`book-a-extra`) は component 境界を守って外れる
+    assert!(!path_in_subtree_ci(
+        Path::new("/books/book-a-extra"),
+        &anchor
+    ));
+}
+
+#[test]
+fn rating_filter_suppression_scope_zip_pdf_anchor() {
+    use std::path::Path;
+    let zip = PathBuf::from("/books/vol1.zip");
+    assert!(path_in_subtree_ci(Path::new("/books/vol1.zip"), &zip));
+    assert!(!path_in_subtree_ci(Path::new("/books"), &zip)); // BS で親へ → outside
+    assert!(!path_in_subtree_ci(Path::new("/books/vol2.zip"), &zip)); // sibling
+
+    let pdf = PathBuf::from("/books/manual.pdf");
+    assert!(path_in_subtree_ci(Path::new("/books/manual.pdf"), &pdf));
+    assert!(!path_in_subtree_ci(Path::new("/books"), &pdf));
+}
+
+/// Windows の case-insensitive FS: ドライブ文字や階層名の casing 違いを同一視する。
+/// これが効かないと、address bar 入力や Explorer D&D で casing が変わった瞬間に
+/// suppression scope から脱落してフィルタが復元されてしまう (ユーザー視点では
+/// 「なぜか filter が急に戻った」= 旧バグ)。
+#[test]
+fn path_in_subtree_ci_is_case_insensitive() {
+    use std::path::Path;
+    let anchor = PathBuf::from(r"C:\Books\Vol1.zip");
+    assert!(path_in_subtree_ci(Path::new(r"c:\books\vol1.zip"), &anchor));
+    assert!(path_in_subtree_ci(Path::new(r"C:\BOOKS\VOL1.ZIP"), &anchor));
+    // 区切り文字の違いも吸収する
+    assert!(path_in_subtree_ci(Path::new("C:/Books/Vol1.zip"), &anchor));
+}
+
+/// cross-drive 偶然一致を起こさない (C:/foo と D:/foo は別扱い)。
+/// path_key::normalize がドライブ文字を剥がすのに対し、こちらは保持することで
+/// 別ドライブの同名コンテナを誤って同一 scope と判定しない。
+#[test]
+fn path_in_subtree_ci_keeps_drive_letter_distinct() {
+    use std::path::Path;
+    let anchor = PathBuf::from(r"C:\books\vol1.zip");
+    assert!(!path_in_subtree_ci(
+        Path::new(r"D:\books\vol1.zip"),
+        &anchor
+    ));
+    assert!(!path_in_subtree_ci(
+        Path::new(r"D:\books\vol1.zip\page001.jpg"),
+        &anchor
+    ));
+}
+
+/// 同名フォルダがある ZIP/PDF/ConvertibleArchive (7z/LZH) は
+/// `filter_virtual_folder_duplicates` でスキップされる。
+/// v0.7.0 の Task 17 で 7z/LZH への拡張を入れた回帰テスト。
+#[test]
+fn filter_virtual_folder_skips_archive_matching_folder() {
+    let mut folders: Vec<GridItem> = vec![
+        GridItem::Folder(PathBuf::from("/r/vol01")),
+        GridItem::ZipFile(PathBuf::from("/r/vol01.zip")), // 同名フォルダあり → 消える
+        GridItem::ZipFile(PathBuf::from("/r/other.zip")), // 同名フォルダなし → 残る
+        GridItem::PdfFile(PathBuf::from("/r/vol01.pdf")), // 同名フォルダあり → 消える
+        GridItem::ConvertibleArchive {
+            path: PathBuf::from("/r/vol01.7z"), // 同名フォルダあり → 消える
+            format: ArchiveFormat::SevenZ,
+        },
+        GridItem::ConvertibleArchive {
+            path: PathBuf::from("/r/bonus.lzh"), // 同名フォルダなし → 残る
+            format: ArchiveFormat::Lzh,
+        },
+    ];
+    let mut folder_metas: Vec<Option<(i64, i64)>> = vec![None, None, None, None, None, None];
+
+    App::filter_virtual_folder_duplicates(&mut folders, &mut folder_metas);
+
+    let remaining_names: Vec<String> = folders
+        .iter()
+        .map(|item| match item {
+            GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+                p.file_name().unwrap().to_string_lossy().into_owned()
+            }
+            GridItem::ConvertibleArchive { path, .. } => {
+                path.file_name().unwrap().to_string_lossy().into_owned()
+            }
+            _ => String::new(),
+        })
+        .collect();
+
+    assert_eq!(
+        remaining_names,
+        vec!["vol01", "other.zip", "bonus.lzh"],
+        "同名フォルダ vol01 があるアーカイブ 3 件は消え、他は残る",
+    );
+    assert_eq!(folders.len(), folder_metas.len(), "metas も同期して削除");
+}
+
+/// 大文字小文字は無視して同名判定する (Windows 文化圏での実運用に合わせる)。
+#[test]
+fn filter_virtual_folder_case_insensitive() {
+    let mut folders: Vec<GridItem> = vec![
+        GridItem::Folder(PathBuf::from("/r/VOL01")),
+        GridItem::ConvertibleArchive {
+            path: PathBuf::from("/r/vol01.7z"),
+            format: ArchiveFormat::SevenZ,
+        },
+    ];
+    let mut folder_metas: Vec<Option<(i64, i64)>> = vec![None, None];
+
+    App::filter_virtual_folder_duplicates(&mut folders, &mut folder_metas);
+
+    assert_eq!(folders.len(), 1, "大文字小文字違いでも一致扱い");
+}
+
+/// `clamp_dynamic_for_gpu` は 8192 以内の画像には触れず、超えるときだけ
+/// 長辺 8192 にアスペクト比保持で縮小する。
+#[test]
+fn clamp_dynamic_for_gpu_noop_within_limit() {
+    let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(4096, 2048));
+    let out = clamp_dynamic_for_gpu(img);
+    assert_eq!((out.width(), out.height()), (4096, 2048));
+}
+
+#[test]
+fn clamp_dynamic_for_gpu_scales_portrait_oversize() {
+    // 7168x9216 は再現バグのテストサイズ。長辺 9216 → 8192 で縮小され、
+    // 短辺もアスペクト比を保って縮む (7168 * 8192/9216 = 6371.55… ≈ 6372)。
+    let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(7168, 9216));
+    let out = clamp_dynamic_for_gpu(img);
+    assert_eq!(out.height(), 8192, "long edge clamped to MAX_TEXTURE_DIM");
+    assert_eq!(out.width(), 6372, "aspect-preserving short edge");
+}
+
+#[test]
+fn clamp_dynamic_for_gpu_scales_landscape_oversize() {
+    let img = image::DynamicImage::ImageRgba8(image::RgbaImage::new(16384, 4096));
+    let out = clamp_dynamic_for_gpu(img);
+    assert_eq!(out.width(), 8192);
+    assert_eq!(out.height(), 2048);
+}
+
+// =======================================================================
+// Phase C (App-level) テスト
+//
+// docs/search-test-plan.md §Phase C の位置付け。App 全体を構築して、
+// 検索バー起動ヘルパ (open_favsearch / open_global_search /
+// open_local_metadata_search) の相互排他ロジックを回帰テストとして固定する。
+//
+// 完全な Ctrl+G キー → update() 経由のフルスタックテストは eframe::Frame の
+// モック化が必要で重いため、本ラウンドでは **public 起動 API の状態遷移** を
+// 対象にする。検索バー同時表示バグ (2026-04 ユーザー報告) の回帰防止が主目的。
+// =======================================================================
+
+/// Phase C 共通 setup。`data_dir::TEST_OVERRIDE` (プロセス全域のグローバル状態) を
+/// 使うテストはすべてここの `PHASE_C_LOCK` と `setup_app()` を経由する。
+///
+/// 旧実装は 3 つの test モジュールがそれぞれ独自の `PHASE_C_LOCK` を持っていて、
+/// 別モジュール同士で並列実行されると data_dir override が干渉するリスクがあった
+/// (Codex P3 指摘、2026-04)。親モジュールの 1 本に統合して直列化を保証する。
+#[cfg(test)]
+mod phase_c_support {
+    use super::{App, AppTestConfig};
+    use std::sync::Mutex;
+    use tempfile::TempDir;
+
+    pub(super) static PHASE_C_LOCK: Mutex<()> = Mutex::new(());
+
+    /// テスト終了時に必ず `data_dir::set_test_override(None)` を呼ぶ RAII ガード。
+    /// panic 経路でも確実にオーバーライドを解除して後続テストに影響させない。
+    pub(super) struct OverrideGuard;
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            crate::data_dir::set_test_override(None);
+        }
+    }
+
+    /// TempDir を data_dir として差し替え、空の settings で App を構築する。
+    /// TempDir / OverrideGuard / App は declared order と逆順で drop されるので、
+    /// App (supervisor join 含む) → OverrideGuard (data_dir clear) → TempDir (削除)
+    /// の正しい順序で片付く。
+    pub(super) fn setup_app() -> (
+        App,
+        OverrideGuard,
+        TempDir,
+        std::sync::MutexGuard<'static, ()>,
+    ) {
+        let lock = PHASE_C_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tmp = TempDir::new().expect("tempdir");
+        crate::data_dir::set_test_override(Some(tmp.path().to_path_buf()));
+        let guard = OverrideGuard;
+        let config = AppTestConfig {
+            data_dir: tmp.path().to_path_buf(),
+            settings: None,
+        };
+        let app = App::new_for_test(config);
+        (app, guard, tmp, lock)
+    }
+}
+
+#[cfg(test)]
+mod phase_c_key_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+
+    /// ベースライン: 新規 App はどの検索バーも開いていないこと。
+    #[test]
+    fn new_app_has_no_search_bar_open() {
+        let (app, _g, _tmp, _l) = setup_app();
+        assert!(!app.show_search_bar, "Ctrl+F bar must be closed");
+        assert!(!app.favsearch.active, "Ctrl+S bar must be closed");
+        assert!(!app.global_search.active, "Ctrl+G bar must be closed");
+    }
+
+    /// Ctrl+F 相当の起動ヘルパを呼ぶと Ctrl+F バーのみが立ち、他 2 つは閉じたままであること。
+    #[test]
+    fn open_local_metadata_search_activates_only_ctrl_f() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.open_local_metadata_search();
+        assert!(app.show_search_bar);
+        assert!(!app.favsearch.active);
+        assert!(!app.global_search.active);
+    }
+
+    /// Ctrl+S 相当の起動ヘルパを呼ぶと Ctrl+S バーのみが立つこと。
+    #[test]
+    fn open_favsearch_activates_only_ctrl_s() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.open_favsearch();
+        assert!(!app.show_search_bar);
+        assert!(app.favsearch.active);
+        assert!(!app.global_search.active);
+    }
+
+    /// Ctrl+G 相当の起動ヘルパを呼ぶと Ctrl+G バーのみが立つこと。
+    #[test]
+    fn open_global_search_activates_only_ctrl_g() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.open_global_search();
+        assert!(!app.show_search_bar);
+        assert!(!app.favsearch.active);
+        assert!(app.global_search.active);
+    }
+
+    /// 既に別の検索バーが開いているところで Ctrl+F を起動すると、先行バーが閉じて
+    /// Ctrl+F だけが残ること (相互排他、2026-04 バグ回帰ガード)。
+    #[test]
+    fn ctrl_f_closes_ctrl_s_and_ctrl_g() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.open_favsearch();
+        app.open_global_search();
+        assert!(!app.favsearch.active, "Ctrl+G should have closed Ctrl+S");
+        assert!(app.global_search.active);
+        app.open_local_metadata_search();
+        assert!(app.show_search_bar);
+        assert!(!app.favsearch.active);
+        assert!(!app.global_search.active, "Ctrl+F should close Ctrl+G");
+    }
+
+    /// 既に Ctrl+F が開いているところで Ctrl+S を起動すると Ctrl+F が閉じて
+    /// Ctrl+S だけが残ること (回帰)。
+    #[test]
+    fn ctrl_s_closes_ctrl_f() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.open_local_metadata_search();
+        assert!(app.show_search_bar);
+        app.open_favsearch();
+        assert!(app.favsearch.active);
+        assert!(!app.show_search_bar, "Ctrl+S should close Ctrl+F");
+        assert!(!app.global_search.active);
+    }
+
+    /// 既に Ctrl+F が開いているところで Ctrl+G を起動すると Ctrl+F が閉じて
+    /// Ctrl+G だけが残ること (回帰)。
+    #[test]
+    fn ctrl_g_closes_ctrl_f() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.open_local_metadata_search();
+        app.open_global_search();
+        assert!(app.global_search.active);
+        assert!(!app.show_search_bar, "Ctrl+G should close Ctrl+F");
+        assert!(!app.favsearch.active);
+    }
+
+    /// Codex P2 #3: 選択中の Ctrl+S お気に入りフィルタが設定から消えたら、
+    /// `execute_favsearch` が UI と整合を取るために filter を None にクリアする。
+    #[test]
+    fn favsearch_clears_stale_favorite_filter() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // 存在しない UUID を filter に立てて search を走らせる
+        let bogus = uuid::Uuid::new_v4();
+        app.favsearch.favorite_filter = Some(bogus);
+        app.favsearch.query = "x".to_string();
+        app.execute_favsearch();
+        assert_eq!(
+            app.favsearch.favorite_filter, None,
+            "無効 filter は None に戻さないと UI ラベルと検索スコープが食い違う"
+        );
+    }
+
+    /// Codex P2 #3 (Ctrl+G 側): 選択中の Ctrl+G お気に入りフィルタが対象セットに
+    /// いなくなったら、`spawn_global_search` が filter を None にクリアする。
+    #[test]
+    fn global_search_clears_stale_favorite_filter() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let bogus = uuid::Uuid::new_v4();
+        app.global_search.active = true;
+        app.global_search.filters.favorite = Some(bogus);
+        app.global_search.query = "x".to_string();
+        // spawn_global_search は indexer_manager が None のときに reject_message を出して早期 return するが、
+        // その前に filter の健全化は行う (コードは filter 正規化 → manager 存在確認 → spawn の順)。
+        app.spawn_global_search();
+        assert_eq!(
+            app.global_search.filters.favorite, None,
+            "無効 filter は None に戻さないと UI ラベルと検索スコープが食い違う"
+        );
+    }
+
+    /// どの順番で 3 検索モードを切り替えても、同時に 2 つ以上が active にならないこと。
+    /// 2026-04 報告「検索バーが 2 つでることがあった」の総合回帰ガード。
+    #[test]
+    fn at_most_one_search_bar_ever_active() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let check_invariant = |app: &App, label: &str| {
+            let count = [
+                app.show_search_bar,
+                app.favsearch.active,
+                app.global_search.active,
+            ]
+            .iter()
+            .filter(|b| **b)
+            .count();
+            assert!(
+                count <= 1,
+                "{label}: 同時に active なバーが {count} 個 (F={}, S={}, G={})",
+                app.show_search_bar,
+                app.favsearch.active,
+                app.global_search.active,
+            );
+        };
+        // F → S → G → F → G → S → F と順番に切り替えて各ステップで不変量を確認
+        check_invariant(&app, "initial");
+        app.open_local_metadata_search();
+        check_invariant(&app, "after open F");
+        app.open_favsearch();
+        check_invariant(&app, "after open S (should close F)");
+        app.open_global_search();
+        check_invariant(&app, "after open G (should close S)");
+        app.open_local_metadata_search();
+        check_invariant(&app, "after open F (should close G)");
+        app.open_global_search();
+        check_invariant(&app, "after open G (should close F)");
+        app.open_favsearch();
+        check_invariant(&app, "after open S (should close G)");
+        app.open_local_metadata_search();
+        check_invariant(&app, "after open F (should close S)");
+    }
+}
+
+// =======================================================================
+// Phase C (App-level) - Ctrl+G drill ナビゲーション状態機械テスト
+//
+// 2026-04 ユーザー報告バグ:
+//   「Ctrl+G → 検索 → 結果のフォルダを開く → フォルダの中の PDF 一覧 →
+//    PDF をクリック → ページ一覧 → BS で戻ると、PDF 一覧まで戻るはずが
+//    検索結果 (Aggregated) まで 1 段多く戻ってしまう」
+//
+// 原因: PDF/ZIP を開いても `global_search.view.DrilledInto.current_path` が
+// 更新されず、drill_back_one_level が「current_path == container_root」を
+// 根拠に drill_back_to_aggregated を直接呼ぶ。
+//
+// 修正: container (PDF/ZIP/Folder) を開く時点で current_path をその path に
+// 進めておく。BS 時は drill_back_one_level が親へ戻す動作になり、
+// PDF 一覧に正しく復帰する。
+// =======================================================================
+
+#[cfg(test)]
+mod phase_c_drill_nav_tests {
+    use super::phase_c_support::setup_app;
+    use crate::global_search::GlobalHit;
+    use crate::global_search_ui::GlobalSearchView;
+
+    /// Ctrl+G 絞り込みビューで folder_path に drill-in したあと、その配下の PDF を
+    /// 開くと、drill_back_one_level が「PDF → folder_path (ヒット一覧) → Aggregated」
+    /// の 2 段階 BS で辿れる状態になること。
+    ///
+    /// 修正前: PDF を開いても current_path=folder_path のままなので、
+    /// drill_back_one_level が即 drill_back_to_aggregated を呼び、ヒット一覧を
+    /// スキップして検索結果に戻ってしまう。
+    #[test]
+    fn bs_after_opening_pdf_in_drilled_returns_to_folder_not_aggregated() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let folder_path = std::path::PathBuf::from("C:/fav/scansnap");
+        let pdf_path = folder_path.join("doc.pdf");
+
+        // Aggregated 状態でヒットだけ用意する (実検索は行わない、
+        // build_drilled_items が current_path でフィルタするため)
+        app.global_search.active = true;
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: format!("{}/doc.pdf", folder_path.display()).to_lowercase(),
+            score: 1.0,
+            stars: 0,
+        });
+        // コンテナへ drill-in (SearchContainer を Enter 相当)
+        app.drill_into_container(folder_path.clone(), false);
+        assert!(matches!(
+            app.global_search.view,
+            GlobalSearchView::DrilledInto { ref current_path, .. }
+                if current_path == &folder_path
+        ));
+
+        // PDF を開く操作を模擬: 新ヘルパ `advance_drilled_current_path` が current_path を
+        // pdf_path に更新する (修正前は何もしない = 下の 1 段目 BS で Aggregated に飛ぶ)
+        app.advance_drilled_current_path(&pdf_path);
+
+        // 1 段目 BS: PDF ページ → drilled folder view (ヒット一覧)
+        app.drill_back_one_level();
+        match &app.global_search.view {
+            GlobalSearchView::DrilledInto { current_path, .. } => {
+                assert_eq!(
+                    current_path, &folder_path,
+                    "1段目 BS で drilled folder view に戻るべき (current_path=folder)"
+                );
+            }
+            GlobalSearchView::Aggregated => {
+                panic!("BUG: BS が PDF 一覧をスキップして Aggregated に飛んだ");
+            }
+        }
+
+        // 2 段目 BS: drilled folder view → Aggregated
+        app.drill_back_one_level();
+        assert!(
+            matches!(app.global_search.view, GlobalSearchView::Aggregated),
+            "2段目 BS で Aggregated に戻るべき"
+        );
+    }
+
+    /// ZIP 版: PDF と同じ状態機械で動くこと (GridItem::ZipFile の click も同じ
+    /// advance_drilled_current_path 経路を通る想定)。
+    #[test]
+    fn bs_after_opening_zip_in_drilled_returns_to_folder_not_aggregated() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let folder_path = std::path::PathBuf::from("C:/fav/archives");
+        let zip_path = folder_path.join("album.zip");
+
+        app.global_search.active = true;
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: format!("{}/album.zip", folder_path.display()).to_lowercase(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.drill_into_container(folder_path.clone(), false);
+        app.advance_drilled_current_path(&zip_path);
+
+        app.drill_back_one_level();
+        match &app.global_search.view {
+            GlobalSearchView::DrilledInto { current_path, .. } => {
+                assert_eq!(current_path, &folder_path);
+            }
+            _ => panic!("BUG: BS が ZIP 一覧をスキップして Aggregated に飛んだ"),
+        }
+
+        app.drill_back_one_level();
+        assert!(matches!(
+            app.global_search.view,
+            GlobalSearchView::Aggregated
+        ));
+    }
+
+    /// 2026-04 ユーザー報告: Ctrl+G で 1 つめのコンテナに drill-in して Ctrl+↓ を
+    /// 押したとき、現コンテナ subtree を抜けたら**次コンテナの container_root** に
+    /// 跳ぶこと。旧実装は cross-container フラットリスト + dedup で、ネスト関係にある
+    /// コンテナで「次コンテナ深部」(例: `output > 2025-12-30-1`) に直接ワープしていた。
+    #[test]
+    fn ctrl_down_at_container_end_jumps_to_next_container_root() {
+        use crate::global_search_ui::GlobalSearchView;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+
+        // コンテナ A: 直接ヒット 2 件 (件数で先頭になる)。
+        // parent_container("c:/root/2025-11-30/a.jpg") = "c:/root/2025-11-30" → これがコンテナ root
+        // hit 親まで walk up すると "2025-11-30" のみ → DFS = [2025-11-30]
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/2025-11-30/a.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/2025-11-30/b.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        // コンテナ B: deep ヒット 1 件。parent_container = "c:/root/output/2025-12-30-1"
+        // DFS = [2025-12-30-1] のみ (container_root より上は walk しない)
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/output/2025-12-30-1/x.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+
+        // A に drill-in。
+        let a_root = std::path::PathBuf::from("c:/root/2025-11-30");
+        app.drill_into_container(a_root.clone(), false);
+        match &app.global_search.view {
+            GlobalSearchView::DrilledInto {
+                current_path,
+                container_root,
+                ..
+            } => {
+                assert_eq!(current_path, &a_root);
+                assert_eq!(container_root, &a_root);
+            }
+            _ => panic!("drill_into_container 後は DrilledInto"),
+        }
+
+        // Ctrl+↓: A の subtree は [a_root] のみ → 末端 → 次コンテナ B の container_root に跳ぶ。
+        // ここで「container_root と current_path が同じ」になることが重要 (= breadcrumb は
+        // `> 2025-12-30-1` だけになり、深部ワープ `> output > 2025-12-30-1` は起きない)。
+        app.global_search_ctrl_nav(true);
+        let b_root = std::path::PathBuf::from("c:/root/output/2025-12-30-1");
+        match &app.global_search.view {
+            GlobalSearchView::DrilledInto {
+                current_path,
+                container_root,
+                ..
+            } => {
+                assert_eq!(container_root, &b_root, "次コンテナ root に跳ぶべき");
+                assert_eq!(
+                    current_path, &b_root,
+                    "current_path が container_root と一致 (= breadcrumb は root_name だけ)"
+                );
+            }
+            _ => panic!("Ctrl+↓ 後も DrilledInto"),
+        }
+    }
+
+    /// Ctrl+G drilled view で Ctrl+↓ がコンテナ subtree 内では DFS 順で潜ること。
+    /// (cross-container 跨ぎではない通常ケースの回帰ガード)
+    #[test]
+    fn ctrl_down_within_container_descends_dfs() {
+        use crate::global_search_ui::GlobalSearchView;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+        // コンテナ root に直接ヒット + サブフォルダにもヒット。
+        // parent_container 単位で見ると "root" と "root/sub" の 2 コンテナだが、
+        // Newer/Older ではなく HitCount ソートで root (件数 2) → root/sub (件数 1) の順。
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/x/root/a.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/x/root/b.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/x/root/sub/c.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+
+        // コンテナ root に drill-in。subtree DFS は [root, root/sub]。
+        let root = std::path::PathBuf::from("c:/x/root");
+        app.drill_into_container(root.clone(), false);
+
+        // Ctrl+↓: subtree 内 DFS の次 (root/sub)。container_root は root のまま。
+        app.global_search_ctrl_nav(true);
+        match &app.global_search.view {
+            GlobalSearchView::DrilledInto {
+                current_path,
+                container_root,
+                ..
+            } => {
+                assert_eq!(container_root, &root, "container_root は不変");
+                assert_eq!(
+                    current_path,
+                    &std::path::PathBuf::from("c:/x/root/sub"),
+                    "subtree 内 DFS で sub に潜る"
+                );
+            }
+            _ => panic!("Ctrl+↓ 後も DrilledInto"),
+        }
+    }
+
+    /// 2026-04 ユーザー要望: Ctrl+G drilled view のサブフォルダ表示は通常フォルダと
+    /// 同じ filter ルールに揃える。「★3 のみ」では未評価サブフォルダは隠れ、
+    /// 「なし+★3」では未評価サブフォルダが (descendant 件数バッジつきで) 表示される。
+    #[test]
+    fn drilled_unrated_subfolder_hidden_when_unrated_filter_off() {
+        use crate::global_search::GlobalHit;
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub_unrated/a.jpg".into(),
+            score: 1.0,
+            stars: 3,
+        });
+        app.drill_into_container(std::path::PathBuf::from("c:/root"), false);
+
+        // ★3 のみ ON (なし=OFF) → unrated サブフォルダは隠れる
+        let mut rf = [false; 6];
+        rf[3] = true;
+        app.settings.rating_filter = rf;
+        app.rebuild_items_from_global_search();
+        let folder_visible_star_only = app
+            .visible_indices
+            .iter()
+            .any(|&i| matches!(app.items.get(i), Some(GridItem::Folder(_))));
+        assert!(
+            !folder_visible_star_only,
+            "★3 のみフィルタでは unrated subfolder は通常フォルダと同様に隠れるべき"
+        );
+
+        // なし + ★3 → unrated subfolder 表示 + ★3 件数バッジ
+        let mut rf = [false; 6];
+        rf[0] = true;
+        rf[3] = true;
+        app.settings.rating_filter = rf;
+        app.rebuild_items_from_global_search();
+        let sub_idx = app.items.iter().position(|it| {
+            matches!(it, GridItem::Folder(p) if p == &std::path::PathBuf::from("c:/root/sub_unrated"))
+        }).expect("なし+★3 では unrated subfolder が items に並ぶ");
+        assert!(
+            app.idx_visible(sub_idx),
+            "なし+★3 では unrated subfolder が visible_indices にも入る"
+        );
+        let badge = app.folder_rating_match(sub_idx).expect("badge expected");
+        assert_eq!(badge.0, 1, "badge total = ★3 descendant 1 件");
+    }
+
+    /// 通常表示 (Ctrl+G 外) でも unrated folder は ★3-only で隠れる従来挙動を維持。
+    #[test]
+    fn unrated_folder_hidden_in_normal_view_under_star_only_filter() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.items
+            .push(GridItem::Folder(std::path::PathBuf::from("c:/some/folder")));
+        let mut rf = [false; 6];
+        rf[3] = true;
+        app.settings.rating_filter = rf;
+        app.rebuild_visible_indices();
+        assert!(
+            app.visible_indices.is_empty(),
+            "通常表示の unrated folder は ★3-only で隠れる"
+        );
+    }
+
+    /// 2026-04 ユーザー報告: Ctrl+G で検索 → SearchContainer に drill-in →
+    /// BS で Aggregated に戻ったとき、開いていたコンテナのセルにカーソルが
+    /// 復帰してほしい (旧実装は selected=None で先頭に飛んでいた)。
+    #[test]
+    fn bs_back_to_aggregated_restores_cursor_on_previous_container() {
+        use crate::global_search::GlobalHit;
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // 2 つの SearchContainer を accumulate (folder_b の方を開く想定)
+        app.global_search.active = true;
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/folder_a/x.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/folder_b/y.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        // 初回 rebuild (Aggregated)
+        app.rebuild_items_from_global_search();
+        // folder_b に drill-in
+        app.drill_into_container(std::path::PathBuf::from("c:/folder_b"), false);
+        // BS で Aggregated に戻る
+        app.drill_back_one_level();
+        // 戻った先で folder_b の SearchContainer が selected であること
+        let selected_path = app
+            .selected
+            .and_then(|i| app.items.get(i))
+            .map(|it| match it {
+                GridItem::SearchContainer { path, .. } => path.clone(),
+                _ => std::path::PathBuf::new(),
+            });
+        assert_eq!(
+            selected_path,
+            Some(std::path::PathBuf::from("c:/folder_b")),
+            "BS で Aggregated に戻ったとき、直前に開いた folder_b にカーソルが残るべき"
+        );
+    }
+
+    /// Codex P2: ★コンテナ drill-in で suppression 起動 → drilled view 内の
+    /// サブフォルダへ入る → BS で 1 階層戻る、を順に行ったとき、suppression が
+    /// 維持されること。subtree 内の上下移動で復元されると未評価の中身が突然
+    /// 消える挙動になる。
+    #[test]
+    fn drill_back_within_suppression_anchor_keeps_filter_disabled() {
+        use crate::global_search::GlobalHit;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // ★5 フィルタ ON
+        let mut rf = [false; 6];
+        rf[5] = true;
+        app.settings.rating_filter = rf;
+        // ★5 のコンテナを rating_db に登録
+        let container = std::path::PathBuf::from("c:/books/vol1");
+        let key = crate::adjustment_db::normalize_path(&container);
+        app.rating_db.as_ref().unwrap().set(&key, 5).unwrap();
+        // 検索ヒット: コンテナ配下のサブフォルダ画像 (未評価)
+        app.global_search.active = true;
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/books/vol1/sub/p1.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        // SearchContainer を開く (path-based suppression を起動)
+        app.maybe_suppress_rating_filter_for_opened_container_path(&container);
+        app.drill_into_container(container.clone(), false);
+        assert!(
+            app.rating_filter_suppressed_at.is_some(),
+            "drill 直後は suppression 起動中"
+        );
+        // サブフォルダにドリルイン
+        app.drill_into_subfolder(std::path::PathBuf::from("c:/books/vol1/sub"));
+        assert!(
+            app.rating_filter_suppressed_at.is_some(),
+            "サブフォルダへ進んでも suppression 維持"
+        );
+        // BS で 1 階層戻る (sub → vol1)
+        app.drill_back_one_level();
+        assert!(
+            app.rating_filter_suppressed_at.is_some(),
+            "subtree 内 BS では suppression 維持されるべき"
+        );
+        // さらに BS で Aggregated に戻る → suppression 解除
+        app.drill_back_one_level();
+        assert!(
+            app.rating_filter_suppressed_at.is_none(),
+            "anchor の外 (Aggregated) に出たら suppression 解除"
+        );
+    }
+
+    /// 2026-04 ユーザー報告: Ctrl+G ストリーミング中に rebuild が走って items に
+    /// アイテムが挿入されたとき、選択中のアイテムが別の物を指してしまっていた
+    /// (旧実装は `replace_search_view_items` で `selected = None`)。
+    /// 修正後: 内容キー (`thumb_reuse_key`) で旧選択を新 idx に再マップする。
+    /// `checked` set も同じ仕組みで追従する。
+    #[test]
+    fn streaming_rebuild_preserves_selected_and_checked_by_content_key() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let initial = vec![
+            GridItem::Image(std::path::PathBuf::from("c:/a.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/b.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/c.jpg")),
+        ];
+        app.replace_search_view_items(initial, vec![None, None, None]);
+        // B (idx=1) を選択、A と C をチェック
+        app.selected = Some(1);
+        app.checked.insert(0);
+        app.checked.insert(2);
+
+        // ストリーミング rebuild: 先頭に X が追加されて A/B/C が後ろにシフト
+        let after = vec![
+            GridItem::Image(std::path::PathBuf::from("c:/x.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/a.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/b.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/c.jpg")),
+        ];
+        app.replace_search_view_items(after, vec![None; 4]);
+
+        assert_eq!(
+            app.selected,
+            Some(2),
+            "選択は同じ B (内容キー) を指し続けるよう新 idx=2 に追従"
+        );
+        assert!(app.checked.contains(&1), "A の checked が新 idx=1 に追従");
+        assert!(app.checked.contains(&3), "C の checked が新 idx=3 に追従");
+        assert!(!app.checked.contains(&0), "X (新規) は checked ではない");
+        assert!(
+            !app.checked.contains(&2),
+            "B は selected のみ、checked ではない"
+        );
+    }
+
+    /// 旧選択アイテムが新 items から消えた場合は selected = None に戻し、
+    /// 先頭スクロールにフォールバックする (= 復元不能時の安全側挙動)。
+    #[test]
+    fn streaming_rebuild_clears_selected_when_item_disappears() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let initial = vec![
+            GridItem::Image(std::path::PathBuf::from("c:/a.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/b.jpg")),
+        ];
+        app.replace_search_view_items(initial, vec![None, None]);
+        app.selected = Some(1); // B を選択
+
+        // B が消えて A だけになる
+        let after = vec![GridItem::Image(std::path::PathBuf::from("c:/a.jpg"))];
+        app.replace_search_view_items(after, vec![None]);
+
+        assert_eq!(app.selected, None, "旧選択アイテムが消えたので None");
+        assert_eq!(app.scroll_offset_y, 0.0, "復元失敗時は先頭スクロール");
+    }
+
+    /// Codex P2: Ctrl+G から実フォルダ/ZIP/PDF を開いた状態で rating 変更すると、
+    /// items が検索合成ビューに置き換わってはならない。
+    /// `items_are_global_search_view` フラグが install_new_items 時に false に倒され、
+    /// rebuild_items_from_global_search が走らないことを確認する。
+    #[test]
+    fn rating_change_in_real_view_does_not_rebuild_search_items() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // Ctrl+G 中に実体ビュー (例: PDF を開いた直後の状態) を install_new_items 経由で構築
+        app.global_search.active = true;
+        let pdf_pages = vec![
+            GridItem::PdfPage {
+                pdf_path: std::path::PathBuf::from("c:/doc.pdf"),
+                page_num: 0,
+                content_type: None,
+            },
+            GridItem::PdfPage {
+                pdf_path: std::path::PathBuf::from("c:/doc.pdf"),
+                page_num: 1,
+                content_type: None,
+            },
+        ];
+        app.install_new_items(pdf_pages, vec![None, None]);
+        assert!(
+            !app.items_are_global_search_view,
+            "install_new_items は flag を false に倒す (= 実体ビュー)"
+        );
+        let before_len = app.items.len();
+        // rating 変更を発火 (= apply_rating_to_selection 内の rebuild 分岐)
+        // ここでは rebuild_items_from_global_search を直接トリガーするか check する代わりに、
+        // 分岐ロジックで実体ビュー時には visible_indices だけ更新されることを確認する。
+        // ※ targets が空なら refresh_global_search_hit_stars もスキップ。
+        // ここでは「items.len() が変わらない」ことだけを最低限の不変条件として確認。
+        app.rebuild_visible_indices();
+        assert_eq!(app.items.len(), before_len, "実体ビュー items が消えない");
+        assert!(
+            !app.items_are_global_search_view,
+            "rebuild_visible_indices ではフラグが書き換わらない"
+        );
+    }
+
+    /// Codex P2: Ctrl+G 集約結果で ★コンテナを開いたとき、コンテナ★が現在
+    /// フィルタを通っていれば一時解除されること。これにより内部画像が未評価でも
+    /// drilled view が空にならない。
+    #[test]
+    fn search_container_drill_in_suppresses_rating_filter_when_container_starred() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // ★5 フィルタ ON
+        let mut rf = [false; 6];
+        rf[5] = true;
+        app.settings.rating_filter = rf;
+        // rating_db に ★5 でコンテナ (フォルダ) を登録。
+        // setup_app は rating_db を必ず開ける前提。開けないなら test 環境がおかしい
+        // ので `expect` で即時 panic させて原因を読みやすくする (Codex P3)。
+        let folder = std::path::PathBuf::from("c:/books/vol1");
+        let key = crate::adjustment_db::normalize_path(&folder);
+        let db = app
+            .rating_db
+            .as_ref()
+            .expect("rating_db must be open in test (setup_app の data_dir override 失敗?)");
+        db.set(&key, 5).expect("set rating");
+        // ★コンテナを「開く」前は suppression なし
+        assert!(app.rating_filter_suppressed_at.is_none());
+        // 開く
+        app.maybe_suppress_rating_filter_for_opened_container_path(&folder);
+        // suppression 起動 + filter は全 ON に
+        assert_eq!(
+            app.rating_filter_suppressed_at
+                .as_ref()
+                .map(|(p, _)| p.clone()),
+            Some(folder),
+            "★5 コンテナを開いたら suppression anchor が設定される"
+        );
+        assert_eq!(
+            app.settings.rating_filter, [true; 6],
+            "suppression 起動中は filter が全 ON"
+        );
+    }
+
+    /// Codex P2 スコープ外: コンテナ★が現フィルタを通らない場合は suppression しない。
+    #[test]
+    fn search_container_drill_in_does_not_suppress_when_rating_does_not_match() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // ★5 フィルタ ON
+        let mut rf = [false; 6];
+        rf[5] = true;
+        app.settings.rating_filter = rf;
+        // ★3 コンテナ (★5 フィルタを通らない)
+        let folder = std::path::PathBuf::from("c:/notes/draft");
+        let key = crate::adjustment_db::normalize_path(&folder);
+        let db = app
+            .rating_db
+            .as_ref()
+            .expect("rating_db must be open in test");
+        db.set(&key, 3).expect("set rating");
+        app.maybe_suppress_rating_filter_for_opened_container_path(&folder);
+        assert!(
+            app.rating_filter_suppressed_at.is_none(),
+            "コンテナ★がフィルタ外なら suppression しない"
+        );
+    }
+
+    /// Codex P3: Ctrl+G 中にレーティング変更すると、`all_hits.stars` が更新され、
+    /// drilled view のバッジ件数が新しい値に追従すること。
+    #[test]
+    fn rating_change_updates_global_search_hit_stars_snapshot() {
+        use crate::global_search::GlobalHit;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+        // 単一画像を accumulate (★3 で受信)
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub/a.jpg".into(),
+            score: 1.0,
+            stars: 3,
+        });
+        // items に直接置く (drill_into_container は load_folder を呼ばないテスト用簡易セットアップ)
+        app.items
+            .push(crate::grid_item::GridItem::Image(std::path::PathBuf::from(
+                "c:/root/sub/a.jpg",
+            )));
+        // rating を 1 に変更
+        app.set_rating(0, 1);
+        let idxs = vec![0_usize];
+        app.refresh_global_search_hit_stars(&idxs);
+        // all_hits.stars が更新されているはず
+        assert_eq!(
+            app.global_search.all_hits[0].stars, 1,
+            "rating 変更後、all_hits.stars が 1 に追従するはず"
+        );
+    }
+
+    /// 2026-04 ユーザー報告: Ctrl+G drilled view で「なし+★2」と「★2 のみ」で
+    /// 見た目が同じだった問題の修正検証。
+    /// 通常フォルダと同じ仕様に揃える:
+    /// - フィルタ「なし+★2」: 未評価 subfolder は表示、バッジは ★1..★5 で集計 (= ★2 件数のみ)
+    /// - フィルタ「★2 のみ」: 未評価 subfolder は visibility check で隠れる
+    #[test]
+    fn drilled_subfolder_badge_matches_normal_folder_semantics() {
+        use crate::global_search::GlobalHit;
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+        // /root/sub に: ★なし 2 件、★2 が 1 件、★4 が 1 件 を accumulate
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub/a.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub/b.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub/c.jpg".into(),
+            score: 1.0,
+            stars: 2,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub/d.jpg".into(),
+            score: 1.0,
+            stars: 4,
+        });
+        app.drill_into_container(std::path::PathBuf::from("c:/root"), false);
+
+        // ── フィルタ「なし + ★2」: subfolder visible + badge=1 (★2 件数のみ) ──
+        let mut rf = [false; 6];
+        rf[0] = true;
+        rf[2] = true;
+        app.settings.rating_filter = rf;
+        app.rebuild_items_from_global_search();
+        let sub_idx = app.items.iter().position(|it| {
+            matches!(it, GridItem::Folder(p) if p == &std::path::PathBuf::from("c:/root/sub"))
+        }).expect("subfolder in items");
+        assert!(
+            app.idx_visible(sub_idx),
+            "なし+★2 で unrated subfolder が表示"
+        );
+        let badge = app.folder_rating_match(sub_idx).expect("badge");
+        assert_eq!(
+            badge.0, 1,
+            "badge は ★1..★5 のみ集計。★2 が 1 件なので 1 (なしは folder visibility だけに使う)"
+        );
+
+        // ── フィルタ「★2 のみ」: subfolder 自体が visible_indices から落ちる ──
+        let mut rf = [false; 6];
+        rf[2] = true;
+        app.settings.rating_filter = rf;
+        app.rebuild_items_from_global_search();
+        let sub_idx = app.items.iter().position(|it| {
+            matches!(it, GridItem::Folder(p) if p == &std::path::PathBuf::from("c:/root/sub"))
+        }).expect("subfolder in items");
+        assert!(
+            !app.idx_visible(sub_idx),
+            "★2 のみで unrated subfolder は隠れる (通常フォルダと同じ挙動)"
+        );
+    }
+
+    /// `restore_select_path` のターゲットが items 中に存在しない (= 何らかの理由で
+    /// 消えた) 場合は selected=None のまま放置せず、先頭の visible item に
+    /// フォールバックする。次の方向キーで idx 0 に飛ぶ事故を防ぐため。
+    #[test]
+    fn bs_back_falls_back_to_first_visible_when_target_missing() {
+        use crate::global_search::GlobalHit;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/folder_a/x.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        // 存在しないパスを restore target に設定して rebuild
+        app.global_search.restore_select_path =
+            Some(std::path::PathBuf::from("c:/nonexistent/folder"));
+        app.rebuild_items_from_global_search();
+        // フォールバック: 先頭の visible item が選択されているはず
+        assert_eq!(
+            app.selected,
+            app.visible_indices.first().copied(),
+            "target 不在のときは先頭の visible item に落ちるべき"
+        );
+        assert!(
+            app.selected.is_some(),
+            "items が空でない限り selected は Some"
+        );
+    }
+
+    /// drilled view 内で deeper subfolder に drill-in → BS で 1 階層戻ったとき、
+    /// 直前に居た subfolder の Folder セルにカーソルが復帰すること。
+    #[test]
+    fn bs_back_within_drilled_restores_cursor_on_previous_subfolder() {
+        use crate::global_search::GlobalHit;
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+        // /root/sub1/x.jpg と /root/sub2/y.jpg のヒットを accumulate
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub1/x.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "c:/root/sub2/y.jpg".into(),
+            score: 1.0,
+            stars: 0,
+        });
+        // /root に drill-in
+        app.drill_into_container(std::path::PathBuf::from("c:/root"), false);
+        // /root/sub2 にさらに drill-in
+        app.drill_into_subfolder(std::path::PathBuf::from("c:/root/sub2"));
+        // BS で /root に戻る
+        app.drill_back_one_level();
+        let selected_path = app
+            .selected
+            .and_then(|i| app.items.get(i))
+            .map(|it| match it {
+                GridItem::Folder(p) => p.clone(),
+                _ => std::path::PathBuf::new(),
+            });
+        assert_eq!(
+            selected_path,
+            Some(std::path::PathBuf::from("c:/root/sub2")),
+            "drilled view で BS したとき、直前のサブフォルダ (sub2) にカーソルが残るべき"
+        );
+    }
+
+    /// Ctrl+G が非アクティブな状態で advance_drilled_current_path を呼んでも
+    /// view に影響しないこと (no-op)。
+    #[test]
+    fn advance_drilled_is_noop_when_not_in_drilled_view() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        assert!(matches!(
+            app.global_search.view,
+            GlobalSearchView::Aggregated
+        ));
+        app.advance_drilled_current_path(std::path::Path::new("C:/anything.pdf"));
+        assert!(
+            matches!(app.global_search.view, GlobalSearchView::Aggregated),
+            "Aggregated 時の advance は no-op であるべき"
+        );
+    }
+}
+
+// =======================================================================
+// Phase C - Ctrl+G drill view アドレスバー表示テスト (2026-04 報告)
+//
+// 期待: "🌐 全検索: \"グルグル\" > scansnap > 衛藤ヒロユキ_魔法陣グルグル01_ipad.pdf"
+// バグ: PDF を開くと raw パス "d:/oldpc_backup/data2/scansnap/衛藤..._ipad.pdf"
+// が address に書かれて、ブレッドクラムが失われる。
+//
+// 修正: `load_pdf_as_folder` (sync 経路) / `start_loading_items` (async 経路) /
+// `advance_drilled_current_path` の 3 箇所で、self.address 設定の直後に
+// `update_global_search_address()` を呼び直して breadcrumb を再適用する。
+// =======================================================================
+
+#[cfg(test)]
+mod phase_c_drill_address_tests {
+    use super::phase_c_support::setup_app;
+    use crate::global_search::GlobalHit;
+
+    /// Ctrl+G drill-in → PDF を開いた時点で address がブレッドクラム表示
+    /// (`🌐 全検索: "query" > container > filename.pdf`) になること。
+    /// 旧実装は raw PDF パス (`d:/.../...pdf`) が入っていた (2026-04 バグ)。
+    #[test]
+    fn address_shows_breadcrumb_after_opening_pdf_in_drilled() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let folder_path = std::path::PathBuf::from("d:/oldpc_backup/data2/scansnap");
+        let pdf_path = folder_path.join("衛藤ヒロユキ_魔法陣グルグル01_ipad.pdf");
+
+        app.global_search.active = true;
+        app.global_search.last_executed = "グルグル".to_string();
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: format!(
+                "{}/衛藤ヒロユキ_魔法陣グルグル01_ipad.pdf",
+                folder_path.display()
+            )
+            .to_lowercase(),
+            score: 1.0,
+            stars: 0,
+        });
+        app.drill_into_container(folder_path.clone(), false);
+        // drill 直後は container_root のみの breadcrumb
+        assert!(
+            app.address.contains("scansnap"),
+            "drill 直後: {}",
+            app.address
+        );
+        assert!(
+            app.address.contains("グルグル"),
+            "drill 直後のクエリ: {}",
+            app.address
+        );
+
+        // PDF を開く: advance_drilled_current_path + load_pdf_as_folder の
+        // 同期 address 書き込みパスを模擬する
+        app.advance_drilled_current_path(&pdf_path);
+        // 「load_pdf_as_folder 内部で一旦 address = pdf_path を書く」の再現
+        app.address = pdf_path.to_string_lossy().to_string();
+        // 修正: 直後に update_global_search_address() が走って breadcrumb に戻す
+        app.update_global_search_address();
+
+        // 期待: raw path ではなく breadcrumb
+        assert!(
+            !app.address.starts_with("d:/"),
+            "raw PDF path が address に残っている (修正前のバグ): {}",
+            app.address
+        );
+        assert!(
+            app.address.contains("🌐 全検索"),
+            "breadcrumb prefix 欠落: {}",
+            app.address
+        );
+        assert!(
+            app.address.contains("グルグル"),
+            "クエリ欠落: {}",
+            app.address
+        );
+        assert!(
+            app.address.contains("scansnap"),
+            "container_root 欠落: {}",
+            app.address
+        );
+        assert!(
+            app.address
+                .contains("衛藤ヒロユキ_魔法陣グルグル01_ipad.pdf"),
+            "PDF ファイル名欠落: {}",
+            app.address
+        );
+    }
+
+    /// Ctrl+G が非アクティブなときは `update_global_search_address` が no-op で
+    /// address を書き換えないこと (本番経路で raw path が壊れない回帰ガード)。
+    #[test]
+    fn update_address_is_noop_when_ctrl_g_inactive() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.address = "C:/some/folder".to_string();
+        app.update_global_search_address();
+        assert_eq!(
+            app.address, "C:/some/folder",
+            "Ctrl+G 非アクティブ時に address を書き換えてはならない"
+        );
+    }
+
+    /// Aggregated 状態 → breadcrumb は N 件表示で、raw パスには戻らないこと。
+    #[test]
+    fn aggregated_address_shows_hit_count_not_raw_path() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.global_search.active = true;
+        app.global_search.last_executed = "グルグル".to_string();
+        app.global_search.accumulate_hit(&GlobalHit {
+            path: "d:/scansnap/a.pdf".to_string(),
+            score: 1.0,
+            stars: 0,
+        });
+        // Aggregated のまま update_global_search_address
+        app.update_global_search_address();
+        assert!(
+            app.address.contains("🌐 全検索"),
+            "Aggregated でも prefix は付く: {}",
+            app.address
+        );
+        assert!(
+            !app.address.starts_with("d:/"),
+            "Aggregated 中は raw path が入ってはならない: {}",
+            app.address
+        );
+    }
+}
+
+/// 補正パラメータのお気に入り単位標準 (v0.8.1) に関する回帰テスト。
+///
+/// 3 層カスケード (個別 → お気に入り → global)、入れ子時の nearest-favorite 優先、
+/// `resolve_adjust_scope` によるスコープ判定、`set_favorite_default` で冗長な個別設定が
+/// 自動的に解除されること (Codex P2) を担保する。
+#[cfg(test)]
+mod favorite_adjustment_defaults_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use crate::adjustment::AdjustParams;
+    use crate::settings::FavoriteEntry;
+    use crate::ui_fullscreen::AdjustScope;
+    use std::path::PathBuf;
+
+    /// テスト用: 画像 1 枚だけを items に詰めて idx 0 を返す。
+    fn push_image(app: &mut App, path: &str) -> usize {
+        app.items.push(GridItem::Image(PathBuf::from(path)));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.items.len() - 1
+    }
+
+    fn params_with_brightness(v: f32) -> AdjustParams {
+        let mut p = AdjustParams::default();
+        p.brightness = v;
+        p
+    }
+
+    /// effective_params は「個別 → お気に入り → global」の順で解決する。
+    #[test]
+    fn cascade_individual_beats_favorite_beats_global() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let fav = FavoriteEntry::new("test".to_string(), PathBuf::from("C:/pics"));
+        let fav_id = fav.id;
+        app.settings.favorites.push(fav);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        // 初期状態: global
+        app.settings.global_preset = params_with_brightness(5.0);
+        assert_eq!(app.effective_params(idx).brightness, 5.0);
+
+        // お気に入り標準を入れる → 優先
+        app.adjustment_favorite_params
+            .insert(fav_id, params_with_brightness(20.0));
+        assert_eq!(app.effective_params(idx).brightness, 20.0);
+
+        // 個別設定を入れる → 最優先
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(50.0));
+        assert_eq!(app.effective_params(idx).brightness, 50.0);
+
+        // 個別解除 → お気に入り、お気に入り解除 → global に戻る
+        app.adjustment_page_params.remove(&idx);
+        assert_eq!(app.effective_params(idx).brightness, 20.0);
+        app.adjustment_favorite_params.remove(&fav_id);
+        assert_eq!(app.effective_params(idx).brightness, 5.0);
+    }
+
+    /// 入れ子お気に入りでは最も近い祖先 (パス最長) が優先される。
+    #[test]
+    fn nested_favorite_picks_nearest_ancestor() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let outer = FavoriteEntry::new("outer".to_string(), PathBuf::from("C:/pics"));
+        let inner = FavoriteEntry::new("inner".to_string(), PathBuf::from("C:/pics/ai"));
+        let inner_id = inner.id;
+        app.settings.favorites.push(outer);
+        app.settings.favorites.push(inner);
+
+        let idx = push_image(&mut app, "C:/pics/ai/gen.jpg");
+        let nearest = app.current_favorite_id_for_idx(idx);
+        assert_eq!(
+            nearest,
+            Some(inner_id),
+            "深い方のお気に入りが優先されるべき"
+        );
+    }
+
+    /// resolve_adjust_scope は個別 > favorite > global の順に層を報告する。
+    #[test]
+    fn resolve_adjust_scope_picks_effective_layer() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
+        let fav_id = fav.id;
+        app.settings.favorites.push(fav);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        assert!(matches!(app.resolve_adjust_scope(idx), AdjustScope::Global));
+        app.adjustment_favorite_params
+            .insert(fav_id, params_with_brightness(10.0));
+        assert!(
+            matches!(app.resolve_adjust_scope(idx), AdjustScope::FavoriteDefault(id) if id == fav_id)
+        );
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(30.0));
+        assert!(matches!(
+            app.resolve_adjust_scope(idx),
+            AdjustScope::PageOverride
+        ));
+    }
+
+    /// set_favorite_default 直後に、ちょうど同じ値の個別設定を持っていたページは
+    /// 冗長なので自動的に解除され、スコープは FavoriteDefault になる (Codex P2 回帰)。
+    #[test]
+    fn set_favorite_default_collapses_redundant_page_override() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
+        let fav_id = fav.id;
+        app.settings.favorites.push(fav);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        // 個別に brightness=25 を設定 (= これから新しい favorite 標準にしたい値)
+        let custom = params_with_brightness(25.0);
+        app.adjustment_page_params.insert(idx, custom.clone());
+        assert!(matches!(
+            app.resolve_adjust_scope(idx),
+            AdjustScope::PageOverride
+        ));
+
+        // 「このお気に入りの標準にする」と同じ操作
+        app.set_favorite_default(fav_id, custom);
+
+        assert!(
+            !app.adjustment_page_params.contains_key(&idx),
+            "新 favorite 標準と一致する個別は解除されるべき"
+        );
+        assert!(
+            matches!(
+                app.resolve_adjust_scope(idx),
+                AdjustScope::FavoriteDefault(id) if id == fav_id
+            ),
+            "scope は FavoriteDefault に正規化されるべき"
+        );
+    }
+
+    /// clear_favorite_default でそのお気に入り配下の、global と同値な個別もまとめて解除される。
+    #[test]
+    fn clear_favorite_default_collapses_overrides_matching_global() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
+        let fav_id = fav.id;
+        app.settings.favorites.push(fav);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        // favorite 標準 = 20, global = 5, 個別 = 5 (= global)
+        app.settings.global_preset = params_with_brightness(5.0);
+        app.adjustment_favorite_params
+            .insert(fav_id, params_with_brightness(20.0));
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(5.0));
+
+        // favorite 未設定のとき effective_default は global なので、個別は当初から冗長
+        // (ただし UI 経路では set_page_params が弾くのでここでは手動 insert)。
+        // favorite 解除後は「global が新しい default」に戻り、同値の個別は冗長になる。
+        app.clear_favorite_default(fav_id);
+
+        assert!(
+            !app.adjustment_page_params.contains_key(&idx),
+            "clear 後、新 default (global) と一致する個別は解除されるべき"
+        );
+    }
+
+    /// set_page_params は新 3 層カスケード用の「effective_default_for_idx」との等価比較で
+    /// 冗長判定を行う。お気に入り標準と一致する params を渡しても個別は作られない。
+    #[test]
+    fn set_page_params_drops_individual_when_matching_favorite_default() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
+        let fav_id = fav.id;
+        app.settings.favorites.push(fav);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        let fav_default = params_with_brightness(15.0);
+        app.adjustment_favorite_params
+            .insert(fav_id, fav_default.clone());
+
+        // 個別を入れてから、favorite と同値を書く → 削除される
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(99.0));
+        app.set_page_params(idx, fav_default);
+        assert!(
+            !app.adjustment_page_params.contains_key(&idx),
+            "favorite 標準と等価な個別は保存しないべき"
+        );
+    }
+
+    // ── Undo/Redo for image adjustments ────────────────────────────────
+
+    /// ページ個別補正の Undo/Redo: 1 回スライダーを動かして Ctrl+Z で戻る、Ctrl+Y で戻し直し。
+    #[test]
+    fn page_adjustment_undo_redo_round_trip() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        // 初期: 個別なし
+        assert!(!app.adjustment_page_params.contains_key(&idx));
+
+        // 個別設定 brightness=30 を書く (capture_adjust_full でラップ)
+        app.capture_adjust_full("test slider".into(), |a| {
+            a.set_page_params(idx, params_with_brightness(30.0));
+        });
+        assert_eq!(
+            app.adjustment_page_params.get(&idx).unwrap().brightness,
+            30.0
+        );
+
+        // Undo: 個別が消える
+        app.apply_meta_undo();
+        assert!(
+            !app.adjustment_page_params.contains_key(&idx),
+            "Undo 後はエントリが消える"
+        );
+
+        // Redo: 個別が brightness=30 に戻る
+        app.apply_meta_redo();
+        assert_eq!(
+            app.adjustment_page_params.get(&idx).unwrap().brightness,
+            30.0,
+            "Redo で再適用される"
+        );
+    }
+
+    /// Codex P1 回帰: お気に入り標準の更新で冗長な個別ページが pruning される。
+    /// Undo するとお気に入り標準は元に戻り、かつ削除された個別ページも復元される。
+    #[test]
+    fn favorite_default_undo_restores_pruned_page_overrides() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
+        let fav_id = fav.id;
+        app.settings.favorites.push(fav);
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        // 個別 = 25 (favorite 未設定)
+        app.adjustment_page_params
+            .insert(idx, params_with_brightness(25.0));
+
+        // 「このお気に入りの標準にする」(= 個別と同値) を capture_adjust_full でラップ
+        let new_fav_default = params_with_brightness(25.0);
+        app.capture_adjust_full("set favorite".into(), |a| {
+            a.set_favorite_default(fav_id, new_fav_default);
+        });
+        // pruning が走り、個別は消える
+        assert!(
+            !app.adjustment_page_params.contains_key(&idx),
+            "set_favorite_default は冗長な個別を pruning する"
+        );
+        assert!(app.adjustment_favorite_params.contains_key(&fav_id));
+
+        // Undo: お気に入り標準が消え、個別 25 が復元される (Codex P1)
+        app.apply_meta_undo();
+        assert!(
+            !app.adjustment_favorite_params.contains_key(&fav_id),
+            "Undo でお気に入り標準が解除"
+        );
+        assert_eq!(
+            app.adjustment_page_params.get(&idx).unwrap().brightness,
+            25.0,
+            "pruning された個別ページも復元されること (Codex P1)"
+        );
+
+        // Redo: 元の状態 (お気に入り標準 + 個別なし) に戻る
+        app.apply_meta_redo();
+        assert!(app.adjustment_favorite_params.contains_key(&fav_id));
+        assert!(
+            !app.adjustment_page_params.contains_key(&idx),
+            "Redo で再 pruning される"
+        );
+    }
+
+    /// Codex P2 回帰: バルク操作 (apply_to_all / clear_all) も Undo に積まれる。
+    #[test]
+    fn bulk_apply_clear_all_pages_pushes_undo_entry() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let idx_a = push_image(&mut app, "C:/pics/a.jpg");
+        let idx_b = push_image(&mut app, "C:/pics/b.jpg");
+
+        // a, b に個別設定を入れる
+        app.adjustment_page_params
+            .insert(idx_a, params_with_brightness(40.0));
+        app.adjustment_page_params
+            .insert(idx_b, params_with_brightness(60.0));
+
+        // 「全画像から解除」をラップして実行
+        app.capture_adjust_full("clear all".into(), |a| {
+            a.clear_all_page_params();
+        });
+        assert!(app.adjustment_page_params.is_empty(), "全画像が解除される");
+
+        // Undo: 個別設定が両方復元される
+        app.apply_meta_undo();
+        assert_eq!(
+            app.adjustment_page_params.get(&idx_a).unwrap().brightness,
+            40.0,
+            "個別設定 a が復元"
+        );
+        assert_eq!(
+            app.adjustment_page_params.get(&idx_b).unwrap().brightness,
+            60.0,
+            "個別設定 b が復元"
+        );
+
+        // Redo: 全画像が再び解除される
+        app.apply_meta_redo();
+        assert!(app.adjustment_page_params.is_empty(), "Redo で再 clear");
+    }
+
+    /// 新しい補正操作を行うと redo スタックがクリアされる (Ctrl+Z 後の操作で
+    /// ぶら下がっていた redo は無効化される)。
+    #[test]
+    fn new_adjustment_op_clears_redo_stack() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+
+        // 操作 1: brightness=10
+        app.capture_adjust_full("op1".into(), |a| {
+            a.set_page_params(idx, params_with_brightness(10.0));
+        });
+        // Undo → redo に積まれる
+        app.apply_meta_undo();
+        assert!(app.meta_undo.can_redo());
+
+        // 操作 2: brightness=20 → redo がクリアされる
+        app.capture_adjust_full("op2".into(), |a| {
+            a.set_page_params(idx, params_with_brightness(20.0));
+        });
+        assert!(
+            !app.meta_undo.can_redo(),
+            "新しい操作で redo がクリアされる"
+        );
+        assert_eq!(
+            app.adjustment_page_params.get(&idx).unwrap().brightness,
+            20.0
+        );
+    }
+
+    /// `is_meaningful` 抑止: 何も変化しない write_op は Undo に積まれない。
+    #[test]
+    fn no_op_write_does_not_push_undo() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let _idx = push_image(&mut app, "C:/pics/a.jpg");
+        let undo_len_before = app.meta_undo.undo_len();
+
+        // 何も変更しない write_op
+        app.capture_adjust_full("noop".into(), |_a| {});
+
+        assert_eq!(
+            app.meta_undo.undo_len(),
+            undo_len_before,
+            "no-op は積まれない"
+        );
+    }
+
+    /// Codex P2 #1 回帰: グリッド Ctrl+1〜0 のスロット一括適用 (`apply_slot_to_grid_selection`)
+    /// が `capture_adjust_full` でラップされ、N 枚の個別設定が 1 回の Ctrl+Z で全て戻る。
+    #[test]
+    fn grid_slot_apply_is_undoable() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let idx_a = push_image(&mut app, "C:/pics/a.jpg");
+        let idx_b = push_image(&mut app, "C:/pics/b.jpg");
+        // ratable_page_targets は visible_indices で絞るのでテストで埋めておく
+        app.visible_indices = vec![idx_a, idx_b];
+        // 2 枚チェック (= 一括対象)
+        app.checked.insert(idx_a);
+        app.checked.insert(idx_b);
+        // スロット 0 に brightness=42 を保存
+        app.settings.preset_slots.slots[0] = Some(crate::adjustment::PresetSlot {
+            name: "test".into(),
+            params: params_with_brightness(42.0),
+        });
+
+        app.capture_adjust_full("slot apply".into(), |a| {
+            a.apply_slot_to_grid_selection(0);
+        });
+        assert_eq!(
+            app.adjustment_page_params.get(&idx_a).unwrap().brightness,
+            42.0
+        );
+        assert_eq!(
+            app.adjustment_page_params.get(&idx_b).unwrap().brightness,
+            42.0
+        );
+
+        // Ctrl+Z で両方戻る
+        app.apply_meta_undo();
+        assert!(!app.adjustment_page_params.contains_key(&idx_a));
+        assert!(!app.adjustment_page_params.contains_key(&idx_b));
+    }
+
+    // ── タグ Undo: pending → finalize の検証 (Codex P3 完全対応) ──────────────
+
+    /// stale cache + Toggle で worker が逆方向 (Remove) に解決した場合、
+    /// 楽観 cache 更新は予測値だが、Undo entry は **worker が読んだ実 disk の
+    /// before/after** で作られる。これにより Ctrl+Z が真の逆操作になる。
+    #[test]
+    fn tag_undo_uses_worker_actual_disk_state_not_optimistic_prediction() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let path = PathBuf::from("C:/pics/a.jpg");
+
+        // 1) 操作開始: pending を register
+        let tx = app.next_tag_tx_id();
+        app.register_pending_tag_op(tx, "#A のトグル".into(), 1);
+
+        // 2) 楽観 cache 更新 (UI 即時反映): cache=[] と仮定し、predicted after=[#A]
+        // (実際の試験では cache に何があってもよい — Undo の正しさには影響しない)
+
+        // 3) worker 結果到着: 実 disk は実は既に [#A] だった (= 外部ツールで付与済み)。
+        //    worker は Remove を選び、tags_after=[]. tags_before=[#A] を返す。
+        let actual_before = vec!["#A".to_string()];
+        let actual_after: Vec<String> = vec![];
+        app.test_finalize_tag_success(
+            tx,
+            crate::undo_stack::TagChange {
+                path: path.clone(),
+                before: actual_before.clone(),
+                after: actual_after.clone(),
+            },
+        );
+
+        // 4) meta_undo に **実 disk** の before/after で entry が積まれている
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        match app.meta_undo.peek_undo().unwrap() {
+            crate::undo_stack::UndoEntry::Tag { changes, .. } => {
+                assert_eq!(changes.len(), 1);
+                assert_eq!(changes[0].before, actual_before);
+                assert_eq!(changes[0].after, actual_after);
+            }
+            _ => panic!("expected Tag entry"),
+        }
+
+        // 5) pending は finalize 後に消えている
+        assert!(app.pending_tag_undos.is_empty());
+    }
+
+    /// XMP 書き込みが失敗したジョブは Undo entry に含まれない (= 失敗パスを Ctrl+Z すると
+    /// 「実ディスクは変わっていないのに書き戻し命令が飛ぶ」事故を防ぐ)。
+    #[test]
+    fn tag_undo_skips_failed_writes() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let path_ok = PathBuf::from("C:/pics/ok.jpg");
+
+        let tx = app.next_tag_tx_id();
+        app.register_pending_tag_op(tx, "#A のトグル".into(), 2);
+
+        // 1 件成功、1 件失敗
+        app.test_finalize_tag_success(
+            tx,
+            crate::undo_stack::TagChange {
+                path: path_ok,
+                before: vec![],
+                after: vec!["#A".into()],
+            },
+        );
+        app.test_finalize_tag_failure(tx);
+
+        // 完了 (1 success + 1 failure = 2 = expected_total)、Undo entry は成功 1 件分のみ
+        assert_eq!(app.meta_undo.undo_len(), 1);
+        match app.meta_undo.peek_undo().unwrap() {
+            crate::undo_stack::UndoEntry::Tag { changes, .. } => {
+                assert_eq!(changes.len(), 1, "失敗分は entry に含まれない");
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// 全件失敗した場合は Undo entry が積まれない (空エントリの抑止)。
+    #[test]
+    fn tag_undo_all_failed_pushes_no_entry() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let tx = app.next_tag_tx_id();
+        app.register_pending_tag_op(tx, "all fail".into(), 2);
+
+        app.test_finalize_tag_failure(tx);
+        app.test_finalize_tag_failure(tx);
+
+        assert_eq!(app.meta_undo.undo_len(), 0, "全件失敗は entry なし");
+        assert!(app.pending_tag_undos.is_empty());
+    }
+
+    /// stale cache のシナリオ C 防止: 連続操作 + Ctrl+Z 連打で外部由来タグを
+    /// 破壊しないことを検証。worker 結果ベースで Undo entry が作られているので
+    /// Ctrl+Z は真の disk 状態に戻る (#A は保持される)。
+    #[test]
+    fn tag_undo_chain_does_not_destroy_external_tags() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let path = PathBuf::from("C:/pics/a.jpg");
+
+        // 操作 1: 外部で #A 付与済みの状態で mIV が #B トグル
+        // worker が読む disk: [#A] → 書く: [#A, #B]
+        let tx1 = app.next_tag_tx_id();
+        app.register_pending_tag_op(tx1, "#B".into(), 1);
+        app.test_finalize_tag_success(
+            tx1,
+            crate::undo_stack::TagChange {
+                path: path.clone(),
+                before: vec!["#A".into()],
+                after: vec!["#A".into(), "#B".into()],
+            },
+        );
+
+        // 操作 2: #C トグル
+        // worker が読む disk: [#A, #B] → 書く: [#A, #B, #C]
+        let tx2 = app.next_tag_tx_id();
+        app.register_pending_tag_op(tx2, "#C".into(), 1);
+        app.test_finalize_tag_success(
+            tx2,
+            crate::undo_stack::TagChange {
+                path: path.clone(),
+                before: vec!["#A".into(), "#B".into()],
+                after: vec!["#A".into(), "#B".into(), "#C".into()],
+            },
+        );
+
+        assert_eq!(app.meta_undo.undo_len(), 2);
+
+        // 直近 (op2) を Ctrl+Z: pop entry — before=[#A,#B] が正しい逆操作
+        let entry = app.meta_undo.pop_undo().unwrap();
+        match &entry {
+            crate::undo_stack::UndoEntry::Tag { changes, .. } => {
+                assert_eq!(changes[0].before, vec!["#A", "#B"]);
+                assert_eq!(changes[0].after, vec!["#A", "#B", "#C"]);
+            }
+            _ => panic!(),
+        }
+
+        // 1 つ前 (op1) を Ctrl+Z: before=[#A] が正しい逆操作 — **空ではない**
+        // (旧実装ではここが [] になり、Ctrl+Z で #A まで消えてしまう破壊)
+        let entry = app.meta_undo.pop_undo().unwrap();
+        match &entry {
+            crate::undo_stack::UndoEntry::Tag { changes, .. } => {
+                assert_eq!(
+                    changes[0].before,
+                    vec!["#A"],
+                    "Ctrl+Z は外部由来 #A を保持しなければならない (シナリオ C 防止)"
+                );
+                assert_eq!(changes[0].after, vec!["#A", "#B"]);
+            }
+            _ => panic!(),
+        }
+    }
+
+    /// pending が消えている (= clear_meta_undo で boundary を跨いだ) tx_id の worker 結果は
+    /// 静かに drop し、Undo stack には影響しない。
+    #[test]
+    fn tag_undo_orphan_result_after_boundary_does_not_push() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let tx = app.next_tag_tx_id();
+        app.register_pending_tag_op(tx, "abandoned".into(), 1);
+
+        // boundary clear (フォルダ移動相当) で pending が破棄される
+        app.clear_meta_undo();
+        assert!(app.pending_tag_undos.is_empty());
+
+        // 後から worker 結果が届いても entry は積まれない
+        app.test_finalize_tag_success(
+            tx,
+            crate::undo_stack::TagChange {
+                path: PathBuf::from("C:/pics/a.jpg"),
+                before: vec![],
+                after: vec!["#A".into()],
+            },
+        );
+        assert_eq!(app.meta_undo.undo_len(), 0);
+    }
+
+    /// Codex P2 #1 回帰: グリッド Q / Ctrl+Backspace の一括解除
+    /// (`clear_page_params_for_selection`) が capture_adjust_full でラップされ、
+    /// N 枚の個別設定が 1 回の Ctrl+Z で全て復元される。
+    #[test]
+    fn grid_clear_selection_is_undoable() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let idx_a = push_image(&mut app, "C:/pics/a.jpg");
+        let idx_b = push_image(&mut app, "C:/pics/b.jpg");
+        app.visible_indices = vec![idx_a, idx_b];
+        // 既存の個別設定
+        app.adjustment_page_params
+            .insert(idx_a, params_with_brightness(15.0));
+        app.adjustment_page_params
+            .insert(idx_b, params_with_brightness(35.0));
+        // 2 枚チェック
+        app.checked.insert(idx_a);
+        app.checked.insert(idx_b);
+
+        app.capture_adjust_full("clear sel".into(), |a| {
+            a.clear_page_params_for_selection();
+        });
+        assert!(!app.adjustment_page_params.contains_key(&idx_a));
+        assert!(!app.adjustment_page_params.contains_key(&idx_b));
+
+        // Ctrl+Z で両方の個別設定が復元
+        app.apply_meta_undo();
+        assert_eq!(
+            app.adjustment_page_params.get(&idx_a).unwrap().brightness,
+            15.0
+        );
+        assert_eq!(
+            app.adjustment_page_params.get(&idx_b).unwrap().brightness,
+            35.0
+        );
+    }
+
+    /// Codex P3 (2026-04): BS で深い階層から戻ったとき、`select_after_load` が
+    /// `folder_history` の古い選択より優先されること。Ctrl+↓ で進んだ先から
+    /// 戻ったとき「最初に入った位置」ではなく「今いる位置」にカーソルを合わせる
+    /// ための優先順位反転 (load_folder の選択復元) の回帰テスト。
+    #[test]
+    fn select_after_load_overrides_folder_history() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.items.push(GridItem::Folder("c:/root/folderA".into()));
+        app.items.push(GridItem::Folder("c:/root/folderB".into()));
+        app.rebuild_visible_indices();
+
+        // 履歴: folderA (idx=0) を保存
+        let source = std::path::PathBuf::from("c:/root");
+        app.folder_history.insert(source.clone(), (123.0, Some(0)));
+        // ヒント: folderB を選びたい (BS で戻った直後の状態を模擬)
+        app.select_after_load = Some("folderB".to_string());
+
+        let restored = app.try_select_after_load();
+        assert!(restored, "ヒントが items に存在するなら true を返す");
+        assert_eq!(
+            app.selected,
+            Some(1),
+            "folderB (idx=1) がヒントで選ばれるべき (履歴の folderA に負けない)"
+        );
+        assert!(
+            app.select_after_load.is_none(),
+            "ヒントは take() で消費される (次回 load に持ち越さない)"
+        );
+        assert!(
+            app.scroll_to_selected,
+            "選択行を可視化するスクロール要求が立つ"
+        );
+    }
+
+    /// Codex P3 (2026-04): ヒントの指す名前が items に無い場合 (削除等) は false を
+    /// 返し、`start_loading_items` 側の履歴フォールバック分岐に委ねる。
+    #[test]
+    fn try_select_after_load_returns_false_on_missing_name() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.items.push(GridItem::Folder("c:/root/folderA".into()));
+        app.rebuild_visible_indices();
+        app.selected = None;
+
+        app.select_after_load = Some("ghost".to_string());
+        let restored = app.try_select_after_load();
+        assert!(!restored, "ヒストリにフォールバックさせるため false を返す");
+        assert_eq!(app.selected, None, "selected は変更されない");
+        assert!(
+            app.select_after_load.is_none(),
+            "見つからなかった場合でもヒントは消費する (持ち越さない)"
+        );
+    }
+
+    /// フルスクリーンを閉じたとき、グリッド側のカーソルを最後に表示していた item へ
+    /// 戻すこと。動画は fullscreen 中に `selected` が更新されない経路があるため、
+    /// 右クリック終了で元のサムネイル位置へ戻れない不具合の回帰ガード。
+    #[test]
+    fn close_fullscreen_restores_grid_cursor_to_current_video() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.items
+            .push(GridItem::Video(std::path::PathBuf::from("c:/p/movie.mp4")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+
+        app.selected = Some(0);
+        app.scroll_to_selected = false;
+        app.fullscreen_idx = Some(1);
+
+        app.close_fullscreen();
+
+        assert_eq!(app.fullscreen_idx, None);
+        assert_eq!(
+            app.selected,
+            Some(1),
+            "動画終了時も表示中だった動画セルへカーソルを戻す"
+        );
+        assert!(
+            app.scroll_to_selected,
+            "次のグリッド描画で選択セルへスクロールする"
+        );
+    }
+
+    /// Codex P3 (動画レーティング対応): `rating_path_key` / `set_rating` / `get_rating`
+    /// の Video 経路がフィルタテストだけでなく永続化往復で機能することを確認する。
+    /// パス正規化キーが取れ、rating_db に書いた値がキャッシュ経由でなく DB ヒットでも
+    /// 同じ値で読み戻せることを assert する。
+    #[test]
+    fn video_rating_roundtrips_through_rating_db() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // Video アイテムを 1 件登録
+        app.items.push(GridItem::Video(std::path::PathBuf::from(
+            "C:/clips/movie.mp4",
+        )));
+        app.thumbnails.push(ThumbnailState::Pending);
+        let idx = app.items.len() - 1;
+
+        // rating_path_key が None でない (= rating_db キーを取れる)
+        let key = app
+            .rating_path_key(idx)
+            .expect("Video の rating_path_key は Some を返す");
+        assert!(
+            !key.is_empty(),
+            "正規化されたパスキーが空でない (= normalize_path 経由で生成される)"
+        );
+
+        // set_rating → rating_db に書き込みかつ rating_cache が更新される
+        app.set_rating(idx, 3);
+        assert_eq!(
+            app.get_rating(idx),
+            3,
+            "set 直後に get で同値が読める (cache hit)"
+        );
+        // DB にも入っているはず
+        let db_value = app
+            .rating_db
+            .as_ref()
+            .expect("rating_db must be open in test")
+            .get(&key);
+        assert_eq!(db_value, 3, "rating_db に書き込まれている");
+
+        // cache を捨てて DB から再取得 → 永続化を確認
+        app.rating_cache.clear();
+        assert_eq!(
+            app.get_rating(idx),
+            3,
+            "cache を捨てても DB から ★3 が読み戻る (永続化済み)"
+        );
+
+        // 0 への戻し (= 「★解除」) も DB に反映
+        app.set_rating(idx, 0);
+        let db_value = app.rating_db.as_ref().unwrap().get(&key);
+        assert_eq!(db_value, 0, "★0 で DB を上書きできる");
+    }
+
+    /// 見開きから消しゴムに入ったあと `reset_erase_mode` で元の見開き状態に戻ること。
+    /// (Apply [E] / Cancel [Esc] どちらの経路でも内部的に reset_erase_mode が呼ばれる。)
+    #[test]
+    fn reset_erase_mode_restores_saved_spread_state() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // ペア: idx 0 (left), idx 1 (right) を仮想的に保存している状態を組み立てる。
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        // 編集対象は左ページとする
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = SpreadMode::Single; // 消しゴム中の状態
+        app.erase_spread_ctx = Some(crate::app::EraseSpreadCtx {
+            saved_mode: SpreadMode::Ltr,
+            pair: (0, 1),
+        });
+        app.fs_zoom = 2.0;
+        app.fs_pan = egui::Vec2::new(50.0, 30.0);
+        app.erase_mode = true;
+
+        app.reset_erase_mode();
+
+        assert_eq!(
+            app.spread_mode,
+            SpreadMode::Ltr,
+            "reset 後に spread_mode が Ltr へ復元される"
+        );
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(0),
+            "fullscreen_idx は左ページに戻る (resolve_spread_pair で同ペアが復元される)"
+        );
+        assert!(app.erase_spread_ctx.is_none(), "spread_ctx は消費される");
+        assert_eq!(app.fs_zoom, 1.0, "ズームはリセット");
+        assert_eq!(app.fs_pan, egui::Vec2::ZERO, "パンはリセット");
+        assert!(!app.erase_mode);
+    }
+
+    /// 単一ページから入った場合 (= erase_spread_ctx が None) は spread_mode を
+    /// 触らずに reset すること。誤って Single に書き換えないことの回帰ガード。
+    #[test]
+    fn reset_erase_mode_leaves_spread_state_untouched_when_single_entry() {
+        use crate::settings::SpreadMode;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.spread_mode = SpreadMode::Single;
+        app.erase_spread_ctx = None;
+        app.erase_mode = true;
+        app.fullscreen_idx = Some(7);
+
+        app.reset_erase_mode();
+
+        assert_eq!(app.spread_mode, SpreadMode::Single);
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(7),
+            "Single 経由なら fullscreen_idx は弄らない"
+        );
+    }
+
+    /// PDF を仮想フォルダとして開いた直後、親フォルダ catalog の `pdfthumb:foo.pdf`
+    /// が PDF 自身の catalog に `page_0000` として seed されることを確認する回帰
+    /// テスト。これによって PDFium による初回 1 ページ目レンダリング (200-500ms)
+    /// が省略される。
+    #[test]
+    fn seed_virtual_folder_first_thumb_copies_pdf_thumb_from_parent() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, tmp, _l) = setup_app();
+        // 親フォルダと PDF パスを準備 (実ファイルは要らない、catalog DB のキーだけが
+        // 関心事)。
+        let parent_dir = tmp.path().join("parent");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let pdf_path = parent_dir.join("foo.pdf");
+
+        // 親 catalog に pdfthumb:foo.pdf を仕込む (4×4 の dummy WebP をでっち上げる)。
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent_db = crate::catalog::CatalogDb::open(&cache_dir, &parent_dir).unwrap();
+        // 4x4 white WebP を image::ImageBuffer から生成。
+        let img = image::RgbaImage::from_pixel(4, 4, image::Rgba([255, 255, 255, 255]));
+        let mut webp_bytes: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut webp_bytes),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+        let parent_key = format!("{}{}", crate::thumb_loader::CACHE_KEY_PDF, "foo.pdf");
+        parent_db
+            .save(
+                &parent_key,
+                12345,
+                67890,
+                4,
+                4,
+                Some((100, 100)),
+                &webp_bytes,
+            )
+            .unwrap();
+
+        // 仮想 catalog (PDF パスで別 SQLite) と空 cache_map を用意。
+        let pdf_db = crate::catalog::CatalogDb::open(&cache_dir, &pdf_path).unwrap();
+        let cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        // PdfPage(page_num=0) を items に積む (= setup が target_idx を見つけられるように)。
+        app.items.push(GridItem::PdfPage {
+            pdf_path: pdf_path.clone(),
+            page_num: 0,
+            content_type: None,
+        });
+
+        // seed + writeback ターゲット設定を実行。PDF として認識させるため source_path には
+        // pdf_path を渡す。
+        app.setup_virtual_folder_seed_and_writeback(&pdf_path, &pdf_db, &cache_map);
+
+        // 仮想 catalog の DB と cache_map の両方に page_0000 が入っているはず。
+        let target_key = crate::grid_item::pdf_page_cache_key(0);
+        let in_db = pdf_db.load_one(&target_key).unwrap();
+        assert!(
+            in_db.is_some(),
+            "PDF catalog DB に page_0000 が seed される"
+        );
+        let entry = in_db.unwrap();
+        assert_eq!(entry.mtime, 12345);
+        assert_eq!(entry.file_size, 67890);
+        assert_eq!(entry.source_dims, Some((100, 100)));
+        assert_eq!(entry.jpeg_data, webp_bytes);
+
+        let in_map = cache_map.read().unwrap();
+        assert!(
+            in_map.contains_key(&target_key),
+            "ワーカーが即時 hit するよう cache_map にも入る"
+        );
+
+        // PDF prefetch grace が 100ms 以内で設定されていること (Ctrl+↑↓ 連打時の
+        // PDFium thrash 抑制)。
+        assert!(
+            app.pdf_prefetch_grace_until.is_some(),
+            "PDF を開いた瞬間に prefetch grace を仕掛ける"
+        );
+    }
+
+    /// 親フォルダ catalog にエントリが無い場合は seed しない (= no-op)。
+    /// ただし writeback ターゲットと grace は仕掛ける (将来の write-back 経路用)。
+    #[test]
+    fn seed_virtual_folder_first_thumb_no_parent_entry_is_noop() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, tmp, _l) = setup_app();
+        let parent_dir = tmp.path().join("parent2");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let pdf_path = parent_dir.join("missing.pdf");
+        let cache_dir = crate::catalog::default_cache_dir();
+        let pdf_db = crate::catalog::CatalogDb::open(&cache_dir, &pdf_path).unwrap();
+        let cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        app.items.push(GridItem::PdfPage {
+            pdf_path: pdf_path.clone(),
+            page_num: 0,
+            content_type: None,
+        });
+
+        app.setup_virtual_folder_seed_and_writeback(&pdf_path, &pdf_db, &cache_map);
+
+        let target_key = crate::grid_item::pdf_page_cache_key(0);
+        assert!(pdf_db.load_one(&target_key).unwrap().is_none());
+        assert!(!cache_map.read().unwrap().contains_key(&target_key));
+        // writeback ターゲットは設定される (= 後続の worker 完成時に親 catalog にミラー)。
+        assert!(
+            app.virtual_folder_writeback.is_some(),
+            "親 catalog がミスでも writeback ターゲットは設定する"
+        );
+    }
+
+    /// 仮想 catalog で先頭ページが完成したとき、`fire_virtual_folder_writeback_if_ready`
+    /// が親 catalog の `pdfthumb:foo.pdf` 行に WebP データを書き戻すこと。
+    #[test]
+    fn fire_virtual_folder_writeback_mirrors_to_parent() {
+        let (mut app, _g, tmp, _l) = setup_app();
+        let parent_dir = tmp.path().join("parent3");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let _pdf_path = parent_dir.join("bar.pdf");
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent_db_arc =
+            Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &parent_dir).unwrap());
+
+        // worker が page_0000 として cache_map に入れた WebP を準備。
+        let img = image::RgbaImage::from_pixel(8, 8, image::Rgba([0, 128, 255, 255]));
+        let mut webp_bytes: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut webp_bytes),
+                image::ImageFormat::WebP,
+            )
+            .unwrap();
+        let target_key = crate::grid_item::pdf_page_cache_key(0);
+        let cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        cache_map.write().unwrap().insert(
+            target_key.clone(),
+            crate::catalog::CacheEntry {
+                mtime: 999,
+                file_size: 4096,
+                jpeg_data: webp_bytes.clone(),
+                source_dims: Some((400, 400)),
+            },
+        );
+
+        let parent_key = format!("{}{}", crate::thumb_loader::CACHE_KEY_PDF, "bar.pdf");
+        let cur_gen = app.items_generation;
+        app.virtual_folder_writeback = Some(crate::app::VirtualFolderWriteback {
+            parent_catalog: Arc::clone(&parent_db_arc),
+            parent_key: parent_key.clone(),
+            target_key: target_key.clone(),
+            target_idx: 3,
+            items_gen: cur_gen,
+            cache_map: Arc::clone(&cache_map),
+            parent_entry_mtime: 1234567,
+            parent_entry_size: 9999,
+        });
+
+        // 別 idx で発火しても何も起きない。
+        app.fire_virtual_folder_writeback_if_ready(2);
+        assert!(parent_db_arc.load_one(&parent_key).unwrap().is_none());
+        assert!(app.virtual_folder_writeback.is_some());
+
+        // target_idx で発火すると親 catalog にミラーされ、writeback がクリアされる。
+        app.fire_virtual_folder_writeback_if_ready(3);
+        let entry = parent_db_arc
+            .load_one(&parent_key)
+            .unwrap()
+            .expect("親 catalog にミラー保存される");
+        assert_eq!(entry.mtime, 1234567);
+        assert_eq!(entry.file_size, 9999);
+        assert_eq!(entry.source_dims, Some((400, 400)));
+        assert_eq!(entry.jpeg_data, webp_bytes);
+        assert!(
+            app.virtual_folder_writeback.is_none(),
+            "発火後は writeback を None に戻して二重書き込みを防ぐ"
+        );
+    }
+
+    /// Codex P2: items_generation がずれた古い writeback ターゲットは発火させずに
+    /// クリアするだけにする (= 別フォルダに飛んで戻ったときの誤発火防止)。
+    #[test]
+    fn fire_virtual_folder_writeback_drops_stale_generation() {
+        let (mut app, _g, tmp, _l) = setup_app();
+        let parent_dir = tmp.path().join("parent4");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent_db_arc =
+            Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &parent_dir).unwrap());
+        let cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let parent_key = format!("{}{}", crate::thumb_loader::CACHE_KEY_PDF, "stale.pdf");
+        app.virtual_folder_writeback = Some(crate::app::VirtualFolderWriteback {
+            parent_catalog: Arc::clone(&parent_db_arc),
+            parent_key: parent_key.clone(),
+            target_key: crate::grid_item::pdf_page_cache_key(0),
+            target_idx: 0,
+            // 古い世代 (現在 items_generation が進んだ状態を模す)。
+            items_gen: 0,
+            cache_map: Arc::clone(&cache_map),
+            parent_entry_mtime: 0,
+            parent_entry_size: 0,
+        });
+        // app.items_generation を進めて発火 → 親 catalog には何も書かれず writeback が
+        // None に戻る。`replace_search_view_items` / `remove_items_batch` 経由で
+        // items_generation だけが進む実機シナリオの再現。
+        app.items_generation = 7;
+        app.fire_virtual_folder_writeback_if_ready(0);
+        assert!(parent_db_arc.load_one(&parent_key).unwrap().is_none());
+        assert!(
+            app.virtual_folder_writeback.is_none(),
+            "古い世代の writeback はクリアして次に持ち越さない"
+        );
+    }
+
+    /// Codex P2: 同じ世代・対象 idx で発火しても `cache_map` が空なら親 catalog には
+    /// 何も書かず、writeback だけクリアする (= one-shot)。実機では from_cache 経路で
+    /// finalize シグナルが届かないため永続的に再発火しない、その場で諦める。
+    #[test]
+    fn fire_virtual_folder_writeback_clears_when_cache_map_empty() {
+        let (mut app, _g, tmp, _l) = setup_app();
+        let parent_dir = tmp.path().join("parent_empty");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent_db_arc =
+            Arc::new(crate::catalog::CatalogDb::open(&cache_dir, &parent_dir).unwrap());
+        // cache_map は空のまま (= worker が page_0000 を入れていない)。
+        let cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let parent_key = format!("{}{}", crate::thumb_loader::CACHE_KEY_PDF, "empty.pdf");
+        let cur_gen = app.items_generation;
+        app.virtual_folder_writeback = Some(crate::app::VirtualFolderWriteback {
+            parent_catalog: Arc::clone(&parent_db_arc),
+            parent_key: parent_key.clone(),
+            target_key: crate::grid_item::pdf_page_cache_key(0),
+            target_idx: 0,
+            items_gen: cur_gen,
+            cache_map: Arc::clone(&cache_map),
+            parent_entry_mtime: 0,
+            parent_entry_size: 0,
+        });
+        app.fire_virtual_folder_writeback_if_ready(0);
+        assert!(parent_db_arc.load_one(&parent_key).unwrap().is_none());
+        assert!(
+            app.virtual_folder_writeback.is_none(),
+            "cache_map が空でも 1 度試したらクリアして次の finalize に持ち越さない"
+        );
+    }
+
+    /// Codex P2: 親 catalog のサムネが壊れていた場合、`save_thumb_bytes` が `Ok(false)`
+    /// を返し、seed 経路は `cache_map` に入れない。これがないと表示時にデコード失敗で
+    /// 永続的に Failed になる退行が起きる。
+    #[test]
+    fn seed_skips_cache_map_when_parent_thumb_undecodable() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, tmp, _l) = setup_app();
+        let parent_dir = tmp.path().join("parent_corrupt");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        let pdf_path = parent_dir.join("corrupt.pdf");
+        let cache_dir = crate::catalog::default_cache_dir();
+        let parent_db = crate::catalog::CatalogDb::open(&cache_dir, &parent_dir).unwrap();
+        // 寸法が取れないバイト列 (適当な ASCII)。`decode_thumb_dims` が None を返す。
+        let bad_bytes: Vec<u8> = b"NOT-A-WEBP-OR-JPEG".to_vec();
+        let parent_key = format!("{}{}", crate::thumb_loader::CACHE_KEY_PDF, "corrupt.pdf");
+        // 直接 save() で壊れたバイトを置く (= 旧版や外部経路で壊れた行が残った状況を再現)。
+        parent_db
+            .save(&parent_key, 0, 0, 1, 1, None, &bad_bytes)
+            .unwrap();
+
+        let pdf_db = crate::catalog::CatalogDb::open(&cache_dir, &pdf_path).unwrap();
+        let cache_map: Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        > = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+
+        app.items.push(GridItem::PdfPage {
+            pdf_path: pdf_path.clone(),
+            page_num: 0,
+            content_type: None,
+        });
+        app.setup_virtual_folder_seed_and_writeback(&pdf_path, &pdf_db, &cache_map);
+
+        // cache_map は空のまま (= 表示時に decode 失敗で Failed にならない)。
+        let target_key = crate::grid_item::pdf_page_cache_key(0);
+        assert!(
+            !cache_map.read().unwrap().contains_key(&target_key),
+            "壊れたサムネは cache_map に入れない (= Failed 退行を防ぐ)"
+        );
+        // writeback ターゲットは設定される (= 後続 worker が完成させたら親 catalog に
+        // 書き戻して corrupt 行を上書きする経路は維持)。
+        assert!(app.virtual_folder_writeback.is_some());
+    }
+
+    /// `save_thumb_bytes` 単体: 寸法が取れないバイト列を渡したら `Ok(false)` を返し、
+    /// DB には何も書き込まない。
+    #[test]
+    fn save_thumb_bytes_returns_false_for_undecodable() {
+        let (_app, _g, tmp, _l) = setup_app();
+        let cache_dir = crate::catalog::default_cache_dir();
+        let dir = tmp.path().join("save_thumb_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::catalog::CatalogDb::open(&cache_dir, &dir).unwrap();
+        let bad: Vec<u8> = b"DEADBEEF-NOT-AN-IMAGE".to_vec();
+        let saved = db
+            .save_thumb_bytes("k1", 1, 2, None, &bad)
+            .expect("Err なし、Ok(false) で skip 表現");
+        assert!(!saved, "壊れたバイト列は save 断念 → false");
+        assert!(db.load_one("k1").unwrap().is_none(), "DB にも何も書かない");
+    }
+
+    /// Codex P1 (0.8.2 後半): `release_fs_nav_lock` が `fs_nav_locked_gen` /
+    /// `fs_holdover_tex` を確実に解除すること。境界・キャンセル経路で items_generation
+    /// が進まないまま return すると `poll_fs_nav_lock` では解除されないため、
+    /// その経路で本ヘルパが呼ばれることを別途確認する必要がある。
+    #[test]
+    fn release_fs_nav_lock_clears_both_fields() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.fs_nav_locked_gen = Some(42);
+        app.fs_holdover_tex = None; // None でも問題ない
+        app.release_fs_nav_lock();
+        assert!(app.fs_nav_locked_gen.is_none());
+        assert!(app.fs_holdover_tex.is_none());
+        // 何度呼んでも safe (idempotent)
+        app.release_fs_nav_lock();
+        assert!(app.fs_nav_locked_gen.is_none());
+    }
+
+    /// `find_fullscreen_nav_target`: 常にフォルダ先頭の画像系アイテムを返すこと。
+    /// Ctrl+↑ でも前フォルダの最後ではなく最初の画像に着地させる仕様変更の回帰ガード。
+    /// (旧 API の `forward: bool` 引数は仕様統一に伴って削除済み。)
+    #[test]
+    fn find_fullscreen_nav_target_returns_first_image() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // 並び: Folder, Image_a, Image_b, Image_c (visible_indices は items 全部)
+        app.items.push(GridItem::Folder("c:/sub".into()));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/b.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/c.jpg")));
+        for _ in 0..app.items.len() {
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.find_fullscreen_nav_target(),
+            Some(1),
+            "先頭の画像系アイテム idx=1 (Image_a) を返す (Folder idx=0 はスキップ)"
+        );
+    }
+
+    /// `poll_fs_nav_lock`: items_generation が進んだあとに新ページのサムネが
+    /// Loaded になって初めてロック解除されること。`items_generation` チェックが
+    /// 無いと、ナビ発火直後 (まだ items 入れ替え前) で旧ページのサムネが Loaded だと
+    /// 誤って解除されて、後で実際に items が入れ替わった瞬間に「ファイル名のみ表示」が
+    /// 一瞬出てしまう不具合になる。その回帰テスト。
+    #[test]
+    fn poll_fs_nav_lock_waits_for_items_generation_bump() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let ctx = egui::Context::default();
+        let dummy_tex = ctx.load_texture(
+            "test_dummy",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        // 初期: items_generation = 0、idx 0 が「現在表示中ページ」 (Loaded 済) として置く。
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.thumbnails.push(ThumbnailState::Loaded {
+            tex: dummy_tex.clone(),
+            from_cache: false,
+            rendered_at_px: 64,
+            source_dims: None,
+        });
+        app.fullscreen_idx = Some(0);
+        // items_generation は変えない (= 0)、ロック発火時の gen は 0 を記録する想定
+        let lock_gen = app.items_generation;
+        app.fs_nav_locked_gen = Some(lock_gen);
+        app.fs_holdover_tex = Some(dummy_tex.clone());
+
+        // ① items_generation が進んでいない (= まだナビが完了していない) →
+        //    現ページが Loaded でもロック解除されない (主要バグの回帰防止)。
+        app.poll_fs_nav_lock();
+        assert!(
+            app.fs_nav_locked_gen.is_some(),
+            "items_generation 据え置きならロック維持 (旧ページの Loaded で誤解除しない)"
+        );
+
+        // ② items_generation を進めて再度 poll: 新ページのサムネ Loaded を見て解除。
+        app.items_generation += 1;
+        app.poll_fs_nav_lock();
+        assert!(app.fs_nav_locked_gen.is_none(), "gen 進行 + Loaded で解除");
+        assert!(app.fs_holdover_tex.is_none(), "holdover も解放");
+
+        // ③ フルスクリーン抜け (fs_idx None) でも、items_generation 進行が必要。
+        //    そうしないとナビ最中の close_fullscreen 経路で誤解除される。
+        app.fs_nav_locked_gen = Some(app.items_generation);
+        app.fs_holdover_tex = Some(dummy_tex.clone());
+        app.fullscreen_idx = None;
+        app.poll_fs_nav_lock();
+        assert!(
+            app.fs_nav_locked_gen.is_some(),
+            "items_generation 据え置きなら fs_idx=None でも維持 (apply_folder_nav_result 内の close→open 遷移を許容)"
+        );
+        // items が進んでから抜け検知すれば解除される。
+        app.items_generation += 1;
+        app.poll_fs_nav_lock();
+        assert!(app.fs_nav_locked_gen.is_none());
+        assert!(app.fs_holdover_tex.is_none());
+    }
+
+    /// `get_or_open_catalog` の LRU キャッシュ動作: 同じフォルダで 2 回呼ぶと
+    /// 同じ `Arc<CatalogDb>` (= 同じ Arc::ptr) が返ること、容量を超えると古いものから
+    /// 抜けること。Ctrl+↓ 連打時に毎ステップ `CatalogDb::open` を走らせないための
+    /// 本キャッシュの回帰ガード。
+    #[test]
+    fn catalog_cache_reuses_arc_for_same_folder_and_evicts_oldest() {
+        let (mut app, _g, tmp, _l) = setup_app();
+        // tmp 配下に 18 個 (LRU 上限 16 を 2 つ超える) のフォルダを作る。
+        let mut folders: Vec<std::path::PathBuf> = Vec::new();
+        for i in 0..18 {
+            let p = tmp.path().join(format!("cat_{i:02}"));
+            std::fs::create_dir_all(&p).unwrap();
+            folders.push(p);
+        }
+        // 最初の open: 新規挿入。
+        let arc0_first = app.get_or_open_catalog(&folders[0]).expect("open ok");
+        // 同じフォルダを再度 open: 同 Arc が返る (= キャッシュヒット)。
+        let arc0_again = app.get_or_open_catalog(&folders[0]).expect("hit");
+        assert!(
+            std::sync::Arc::ptr_eq(&arc0_first, &arc0_again),
+            "同フォルダの 2 回目は同じ Arc を返す"
+        );
+        assert_eq!(app.catalog_cache_order.len(), 1);
+        // 16 個目までは順に挿入。
+        for f in &folders[1..16] {
+            app.get_or_open_catalog(f);
+        }
+        assert_eq!(app.catalog_cache_order.len(), 16);
+        assert!(app.catalog_cache.contains_key(&folders[0]));
+        // 17 個目: folders[0] が evict される (LRU 順で古いから)。
+        // ただし「folders[0] を最後に hit」した直後ではない (上の hit は新規挿入の直後の
+        // 触り直しで再度末尾移動しているはず) なので、ここで先に folders[1] を hit させて
+        // folders[0] を本当に最古に位置づけ直す。
+        app.get_or_open_catalog(&folders[1]); // [1] を末尾へ
+        // この時点で LRU 順は [0, 2, 3, ..., 15, 1] (= 0 が最古)。
+        // 17 個目 folders[16] を入れると [0] が evict される。
+        app.get_or_open_catalog(&folders[16]);
+        assert_eq!(app.catalog_cache_order.len(), 16);
+        assert!(
+            !app.catalog_cache.contains_key(&folders[0]),
+            "LRU 上限超過で最古 (folders[0]) が evict される"
+        );
+        assert!(app.catalog_cache.contains_key(&folders[16]));
+    }
+
+    /// Codex P1 (見開き消しゴム): `erase_inpaint_pending` が idx 別 HashMap になり、
+    /// 左ページ apply 直後に右ページに切り替えても左の inpaint がキャンセルされない
+    /// (旧実装は `Option` で 1 件しか持たず、新ジョブ投入が旧ジョブを cancel していた)。
+    /// 同じ idx への再投入だけは旧版どおり cancel する。
+    #[test]
+    fn erase_inpaint_pending_keeps_jobs_for_different_pages() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // 2 つの idx (0=左, 1=右) に対して dummy pending を入れる。
+        let make_pending = |idx: usize| {
+            let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
+            crate::ui_erase::EraseInpaintPending {
+                idx,
+                items_generation: 0,
+                path_key: None,
+                rx,
+                cancel: Arc::new(AtomicBool::new(false)),
+                started_at: std::time::Instant::now(),
+                log_prefix: "test",
+            }
+        };
+        let p0 = make_pending(0);
+        let cancel_p0 = p0.cancel.clone();
+        app.erase_inpaint_pending.insert(0, p0);
+        app.erase_inpaint_pending.insert(1, make_pending(1));
+        assert_eq!(
+            app.erase_inpaint_pending.len(),
+            2,
+            "両ページの pending が並走"
+        );
+
+        // 異なる idx (1) への再投入をシミュレート: idx=0 の pending はそのまま残るべき。
+        // (run_inpaint_and_cache の挙動を最小再現)
+        if let Some(prev) = app.erase_inpaint_pending.remove(&1) {
+            prev.cancel.store(true, Ordering::Relaxed);
+        }
+        app.erase_inpaint_pending.insert(1, make_pending(1));
+        assert_eq!(app.erase_inpaint_pending.len(), 2);
+        assert!(
+            !cancel_p0.load(Ordering::Relaxed),
+            "他ページ (idx=0) の pending は cancel されない"
+        );
+
+        // 同じ idx (0) への再投入は旧 pending を cancel する。
+        if let Some(prev) = app.erase_inpaint_pending.remove(&0) {
+            prev.cancel.store(true, Ordering::Relaxed);
+        }
+        assert!(
+            cancel_p0.load(Ordering::Relaxed),
+            "同 idx の再投入で旧 pending が cancel される"
+        );
+    }
+
+    /// `switch_erase_target_in_spread`: 左→右ボタンで `fullscreen_idx` がペアの
+    /// もう一方に切り替わり、`erase_spread_ctx` は維持されること (= パネルボタンが
+    /// 引き続きトグルとして使える)。マスクが空の状態で呼んでも安全 (空 inpaint は
+    /// 早期 return、reset 経由で spread_ctx が消えても再保存される)。
+    #[test]
+    fn switch_erase_target_in_spread_moves_to_other_page_keeping_ctx() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = SpreadMode::Single; // 消しゴム中
+        app.erase_spread_ctx = Some(crate::app::EraseSpreadCtx {
+            saved_mode: SpreadMode::Ltr,
+            pair: (0, 1),
+        });
+        app.erase_mode = true;
+        // erase_base_cache に dummy ピクセルを入れる必要は無い: マスクが空なので
+        // apply_inpaint_only は composite_mask の段階で false を返し、
+        // base_cache 参照は走らない。
+
+        let dummy_ctx = egui::Context::default();
+        app.switch_erase_target_in_spread(&dummy_ctx, 1);
+
+        assert_eq!(
+            app.fullscreen_idx,
+            Some(1),
+            "fullscreen_idx が右ページ idx=1 に切り替わる"
+        );
+        assert_eq!(
+            app.spread_mode,
+            SpreadMode::Single,
+            "spread_mode は Single のまま (見開き表示には戻らない)"
+        );
+        let ctx = app.erase_spread_ctx.expect("spread_ctx は維持される");
+        assert_eq!(ctx.saved_mode, SpreadMode::Ltr);
+        assert_eq!(ctx.pair, (0, 1));
+        assert!(app.erase_mode, "erase_mode は維持される (= 編集継続)");
+        assert_eq!(app.fs_zoom, 1.0, "ズームはリセット");
+    }
+
+    /// Codex 0.8.2 P1: 検索バー (Ctrl+F/S/G) の TextEdit にフォーカスがある間は
+    /// グリッドショートカットを抑止する。`global_search.has_focus` の追加が無いと
+    /// Ctrl+G の検索入力欄で BS が `close_global_search` に流れて入力が破壊される。
+    #[test]
+    fn shortcuts_are_blocked_while_search_text_input_has_focus() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        // 全フォーカスフラグが false の初期状態ではブロックされない。
+        assert!(!app.shortcuts_blocked_by_text_input());
+        // Ctrl+F バー
+        app.search_has_focus = true;
+        assert!(app.shortcuts_blocked_by_text_input());
+        app.search_has_focus = false;
+        // Ctrl+S バー
+        app.favsearch.has_focus = true;
+        assert!(app.shortcuts_blocked_by_text_input());
+        app.favsearch.has_focus = false;
+        // Ctrl+G バー (本コミットの修正対象)
+        app.global_search.has_focus = true;
+        assert!(
+            app.shortcuts_blocked_by_text_input(),
+            "Ctrl+G TextEdit フォーカス中も BS / Enter / Ctrl+C 等を grid に漏らさない"
+        );
+        app.global_search.has_focus = false;
+        // アドレスバー
+        app.address_has_focus = true;
+        assert!(app.shortcuts_blocked_by_text_input());
+    }
+
+    /// `poll_delete_pending` が削除完了時に `current_folder_signature` を None に
+    /// 倒すことを検証 (= 後続の外部 mtime 変化で誤 reload しない)。
+    ///
+    /// 0.8.x で導入: 削除成功直後は items が UI 側で in-place に絞り込まれており、
+    /// stale な signature が残っていると `check_external_folder_changes` が
+    /// 「内容変化あり」と誤判定して数千件の items を再走査して UI が固まる。
+    #[test]
+    fn poll_delete_pending_clears_current_folder_signature() {
+        use crate::delete_worker::{DeleteMsg, DeletePending};
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use std::sync::atomic::AtomicBool;
+
+        let (mut app, _g, tmp, _l) = setup_app();
+        let folder = tmp.path().join("delete_test_folder");
+        std::fs::create_dir_all(&folder).unwrap();
+        let target_path = folder.join("a.jpg");
+        std::fs::write(&target_path, b"dummy").unwrap();
+
+        app.current_folder = Some(folder.clone());
+        app.current_folder_signature = Some(0xDEAD_BEEF);
+        app.items.push(GridItem::Image(target_path.clone()));
+        app.thumbnails.push(ThumbnailState::Pending);
+
+        // 完了済み worker を疑似する: succeeded に target_path を入れて Done を即送る。
+        let (tx, rx) = std::sync::mpsc::channel::<DeleteMsg>();
+        tx.send(DeleteMsg::Batch {
+            succeeded: vec![target_path.clone()],
+            failed: vec![],
+        })
+        .unwrap();
+        tx.send(DeleteMsg::Done { canceled: false }).unwrap();
+        drop(tx);
+
+        app.delete_pending = Some(DeletePending {
+            cancel: std::sync::Arc::new(AtomicBool::new(false)),
+            rx,
+            total: 1,
+            succeeded: vec![],
+            failed: vec![],
+        });
+
+        // 実 ファイルも消しておかないと metadata() が古いまま (実機では worker が消す)。
+        std::fs::remove_file(&target_path).unwrap();
+
+        app.poll_delete_pending();
+
+        assert!(
+            app.delete_pending.is_none(),
+            "Done 受信で delete_pending は take される"
+        );
+        assert!(
+            app.current_folder_signature.is_none(),
+            "削除完了で signature が None reset されること"
+        );
+        assert_eq!(
+            app.items.len(),
+            0,
+            "削除成功した path は items から抜かれる"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // 見開き左右独立補正: copy_spread_adjust のテスト
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 左ページに +30 を設定 → 右ページにコピー → 右ページの effective が +30 になる。
+    #[test]
+    fn copy_spread_adjust_left_to_right() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let left = push_image(&mut app, "C:/pics/a.jpg");
+        let right = push_image(&mut app, "C:/pics/b.jpg");
+        app.set_page_params(left, params_with_brightness(30.0));
+
+        app.copy_spread_adjust(left, right);
+
+        assert!(
+            (app.effective_params(right).brightness - 30.0).abs() < f32::EPSILON,
+            "右ページの effective brightness が +30 にコピーされる"
+        );
+        assert!(
+            app.adjustment_page_params.contains_key(&right),
+            "右ページの page_params エントリが作成される"
+        );
+    }
+
+    /// コピー先がデフォルトと一致する値になる場合、page_params エントリは作られず
+    /// カスケード解決に任せる (DB が無駄に増えない)。
+    #[test]
+    fn copy_spread_adjust_clears_when_matches_default() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let left = push_image(&mut app, "C:/pics/a.jpg");
+        let right = push_image(&mut app, "C:/pics/b.jpg");
+        // 左はデフォルト (= global_preset = identity) のまま、右に +30 を設定。
+        app.set_page_params(right, params_with_brightness(30.0));
+        assert!(app.adjustment_page_params.contains_key(&right));
+
+        // 左 (= デフォルト) を右にコピー → 右の page_params は冗長なので削除される
+        app.copy_spread_adjust(left, right);
+
+        assert!(
+            !app.adjustment_page_params.contains_key(&right),
+            "コピー後、デフォルトと一致した page_params エントリは削除される"
+        );
+        assert!(
+            app.effective_params(right).brightness.abs() < f32::EPSILON,
+            "右ページの effective はカスケード経由でデフォルト値に戻る"
+        );
+    }
+
+    /// コピー操作は capture_adjust_full 経由で Undo に乗り、Ctrl+Z で元に戻る。
+    /// Redo (Ctrl+Y) で再度コピーされる。
+    #[test]
+    fn copy_spread_adjust_undo_redo() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let left = push_image(&mut app, "C:/pics/a.jpg");
+        let right = push_image(&mut app, "C:/pics/b.jpg");
+        app.set_page_params(left, params_with_brightness(30.0));
+        app.set_page_params(right, params_with_brightness(-10.0));
+        let right_before = app.effective_params(right).brightness;
+        assert!((right_before - (-10.0)).abs() < f32::EPSILON);
+
+        app.copy_spread_adjust(left, right);
+        assert!((app.effective_params(right).brightness - 30.0).abs() < f32::EPSILON);
+
+        // Undo: 右ページが元の -10 に戻る
+        app.apply_meta_undo();
+        assert!(
+            (app.effective_params(right).brightness - (-10.0)).abs() < f32::EPSILON,
+            "Undo で右ページの brightness が -10 に戻る"
+        );
+
+        // Redo: 再度コピーされる
+        app.apply_meta_redo();
+        assert!(
+            (app.effective_params(right).brightness - 30.0).abs() < f32::EPSILON,
+            "Redo で右ページの brightness が +30 に再適用される"
+        );
+    }
+}

@@ -365,6 +365,11 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 | `overlay_draw.rs` | overlay 描画関数群、panel 矩形計算、format helper、タイムライン marker / icon 描画 | `NativeOverlay*` 値型 |
 | `mod.rs` 末尾 | wgpu surface format 選択、DPI / egui key 変換、D3D11 test helper | — |
 
+native overlay から UI thread へ戻るコマンドの App 側 dispatch は
+`src/app/native_video.rs` に分離している。`VideoPlayer` / `NativeVideoOutput` は
+event channel で App に通知し、App 側がシーク、ブックマーク、ピン、VST3 操作、
+外部 URL open などの状態更新を行う。
+
 ネイティブ DComp 経路を採用した理由:
 
 - eframe の `show_viewport_immediate` で借りる winit ビューポートは DWM 合成下で

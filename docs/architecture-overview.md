@@ -62,7 +62,9 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | --- | --- |
 | `main.rs` | エントリポイント。フォント設定、logger 初期化、eframe 起動、`--pdf-worker` サブコマンド分岐 |
 | `lib.rs` | モジュール宣言のみ (ベンチマーク・テスト用に公開) |
-| `app.rs` | `App` 構造体と `eframe::App` 実装。**3900 行超** — 状態遷移の中心 |
+| `app.rs` | `App` 構造体と `eframe::App` 実装。状態遷移の中心 |
+| `app/native_video.rs` | Windows native video presenter から戻る overlay event / key / mouse / marker / VST3 操作の App 側処理 |
+| `app/tests.rs` | `App` 周辺の unit test / App-level 状態機械テスト |
 | `settings.rs` | 設定の JSON 永続化 (`%APPDATA%/mimageviewer/settings.json`) |
 | `data_dir.rs` | `%APPDATA%/mimageviewer/` のパス解決 |
 | `logger.rs` | パフォーマンス分析用ファイルロガー (`mimageviewer.log`) |
