@@ -487,6 +487,36 @@ pub enum VideoFrameData {
 
 `Nv12Direct` variant は **削除** (Phase 2 で導入したが、その経路自体を撤回するため)。
 
+## アスペクト比 (SAR) 補正
+
+アナモフィック動画 (NTSC DVD・一部のキャプチャ素材など) は raw pixel 解像度
+(`width × height`) と表示比が一致しない。例えば 720×480 + SAR=97/80 の動画は
+DAR ≈ 1.819:1 (= 16:9) で表示すべきで、square pixel で扱うと縦長になる。
+
+mIV は **decoder で SAR を読み取り → VideoInfo に格納 → native presenter の visual
+transform で anisotropic scale として適用する**:
+
+- `decoder.rs` の `normalize_sar(num, den) -> (u32, u32)` で `AVCodecParameters.sample_aspect_ratio`
+  を正規化 (0/0・0/1・負値はすべて 1/1 に倒す)。`VideoInfo { sar_num, sar_den }` で UI 層へ伝搬。
+- `VideoPlayer::tick` で info を初めて受領した時に 1 度だけ `set_native_video_sar(num, den)` を
+  発行 (= mid-stream 変化は無視、bwdif フィルタは frame.aspect_ratio() で keying するので
+  逆インタレース側は引き続き frame-level SAR で動く)。
+- `NativeVideoPresenter::update_video_visual_transform()` は `compute_video_visual_transform()`
+  helper (純粋関数、unit test 6 件あり) で transform 行列を計算する:
+  ```
+  display_w = surface_w * sar_num / sar_den
+  scale     = min(target_w / display_w, target_h / surface_h)
+  M11 = scale * sar    (= 横方向だけ余分に伸ばす)
+  M22 = scale
+  ```
+  SAR=1:1 の動画は `M11 == M22` で従来挙動と完全に同一 (regression-safe)。
+- swap chain backbuffer / VPP / CPU upload はすべて raw encoded サイズのまま動く
+  (= 余計な GPU/CPU 仕事ゼロ、stretch は DComp 側で 1 度だけ走る)。
+- タイルモードのセル比率 (`ui_video_tile.rs`) も同じ SAR を反映する。
+
+UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFmpeg の慣例に合わせ
+**encoded サイズのまま** (例: `720×480`)。DAR の併記は将来検討。
+
 ## ライフサイクル管理
 
 - **VideoPlayer の Drop**: `cancel.store(true)` → decoder thread が exit、`audio.take()` で cpal stream 停止

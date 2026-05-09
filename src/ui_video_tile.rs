@@ -94,8 +94,12 @@ impl App {
             return None;
         }
         let path = player.path().clone();
-        let aspect = if info.height > 0 {
-            info.width as f64 / info.height as f64
+        // SAR (sample aspect ratio) を反映した表示アスペクト。
+        // anamorphic 動画 (NTSC DVD 等) では encoded `width/height` (= 1.5:1) と
+        // 表示比 (= 1.819:1 など) が異なるため、SAR を掛けないとタイルセル比が
+        // ずれてサムネが letterbox 表示される。
+        let aspect = if info.height > 0 && info.sar_den > 0 {
+            (info.width as f64 * info.sar_num as f64) / (info.height as f64 * info.sar_den as f64)
         } else {
             16.0 / 9.0
         };

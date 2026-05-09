@@ -306,6 +306,10 @@ enum NativeVideoOutputCommand {
     SetVideoCompact {
         compact: bool,
     },
+    SetVideoSar {
+        num: u32,
+        den: u32,
+    },
     SetVst3Panel {
         panel: Option<native_presenter::NativeOverlayVst3Panel>,
     },
@@ -573,6 +577,12 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetVideoCompact { compact });
+    }
+
+    fn set_video_sar(&self, num: u32, den: u32) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetVideoSar { num, den });
     }
 
     fn set_vst3_panel(&self, panel: Option<native_presenter::NativeOverlayVst3Panel>) {
@@ -1191,6 +1201,13 @@ fn run_native_video_output(
                     if let Err(err) = presenter.set_video_compact(compact) {
                         crate::logger::log(format!(
                             "[native-video] set compact transform failed: {err}"
+                        ));
+                    }
+                }
+                NativeVideoOutputCommand::SetVideoSar { num, den } => {
+                    if let Err(err) = presenter.set_video_sar(num, den) {
+                        crate::logger::log(format!(
+                            "[native-video] set sar transform failed: {err}"
                         ));
                     }
                 }
@@ -2774,6 +2791,13 @@ impl VideoPlayer {
     }
 
     #[cfg(windows)]
+    pub fn set_native_video_sar(&self, num: u32, den: u32) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_video_sar(num, den);
+        }
+    }
+
+    #[cfg(windows)]
     pub fn set_native_vst3_panel(&self, panel: Option<native_presenter::NativeOverlayVst3Panel>) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_vst3_panel(panel);
@@ -2829,6 +2853,11 @@ impl VideoPlayer {
                         #[cfg(windows)]
                         self.duration_secs_bits
                             .store(info.duration_secs.to_bits(), Ordering::Release);
+                        // SAR (= sample aspect ratio) を native presenter に伝える。
+                        // anamorphic 動画 (NTSC DVD など) で表示比を補正するために
+                        // 1 度だけ送る。SAR=1:1 の動画では従来通りの isotropic 表示。
+                        #[cfg(windows)]
+                        self.set_native_video_sar(info.sar_num, info.sar_den);
                         // Phase 3c: engine にも InfoReceived event を流す。
                         // resume_secs は **AvClock 経由の旧経路** で処理し続け、
                         // engine 側でも resume_secs を OpenOptions で受領済みなので

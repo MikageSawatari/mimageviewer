@@ -747,6 +747,16 @@ fn bwdif_filter_key(
     }
 }
 
+/// SAR (sample aspect ratio) を `(u32, u32)` に正規化する。
+/// 未指定 (0/0, 0/1)・負値・不正値はすべて `(1, 1)` (正方ピクセル) として扱う。
+pub fn normalize_sar(num: i32, den: i32) -> (u32, u32) {
+    if num <= 0 || den <= 0 {
+        (1, 1)
+    } else {
+        (num as u32, den as u32)
+    }
+}
+
 fn field_order_is_interlaced(field_order: ffmpeg_the_third::FieldOrder) -> bool {
     matches!(
         field_order,
@@ -1007,6 +1017,12 @@ pub struct VideoInfo {
     /// 埋め込みチャプター (Phase 5.4)。`AVChapter*` 配列を時間秒単位で 1 度だけ
     /// 抽出して保持する。空配列ならチャプターは無し。
     pub chapters: Vec<Chapter>,
+    /// Sample aspect ratio (= pixel aspect ratio)。アナモフィック動画で
+    /// `width × height` の raw pixel サイズと表示サイズが異なる場合に
+    /// `display_w = width * sar_num / sar_den` で補正する。
+    /// 未指定 / 不正値は (1, 1) に正規化する。
+    pub sar_num: u32,
+    pub sar_den: u32,
 }
 
 /// 埋め込みチャプター 1 件分。`AVChapter` の `start`/`end` を `time_base` で秒に
@@ -1152,6 +1168,14 @@ fn run_decoder(
         selected_video_rate(video_stream.avg_frame_rate(), video_stream.rate())
             .map(|(n, d)| (n as u32, d as u32))
             .unwrap_or((0u32, 0u32));
+    // SAR (= sample aspect ratio) は AVCodecParameters から読む。container 側
+    // (MP4 / MKV / MOV / AVI) の値が正、raw H.264 ストリーム等では未指定 (0/0)
+    // で 1:1 にフォールバック。アナモフィック動画 (NTSC DVD 等) は SAR != 1:1。
+    let video_sar_rational = video_params.sample_aspect_ratio();
+    let (video_sar_num, video_sar_den) = normalize_sar(
+        video_sar_rational.numerator(),
+        video_sar_rational.denominator(),
+    );
     let video_avg_fps = if video_fps_num == 0 || video_fps_den == 0 {
         0.0
     } else {
@@ -1419,11 +1443,13 @@ fn run_decoder(
         avg_fps: video_avg_fps,
         bit_rate_bps,
         chapters,
+        sar_num: video_sar_num,
+        sar_den: video_sar_den,
     };
     let _ = info_tx.send(Ok(info));
 
     crate::logger::log(format!(
-        "video decoder: codec={stream_codec_name} decoder={video_decoder_name} hw_requested={hw_decode_requested} hw_effective={effective_hw_decode_requested} d3d11va_supported={} hw_active_initially={hw_active_initially} gpu_path={gpu_path_active} field_order={video_field_order:?} stream_interlaced={video_stream_interlaced} d3d11va_config={}",
+        "video decoder: codec={stream_codec_name} decoder={video_decoder_name} hw_requested={hw_decode_requested} hw_effective={effective_hw_decode_requested} d3d11va_supported={} hw_active_initially={hw_active_initially} gpu_path={gpu_path_active} field_order={video_field_order:?} stream_interlaced={video_stream_interlaced} sar={video_sar_num}/{video_sar_den} d3d11va_config={}",
         hw_probe.d3d11va_supported, hw_probe.d3d11va_config
     ));
 
@@ -5020,8 +5046,8 @@ fn try_gpu_blit_path(
 mod decoder_candidate_tests {
     use super::{
         BwdifFilterKey, DecoderChoice, bwdif_filter_key, bwdif_force_all_frames,
-        field_order_is_interlaced, normalize_audio_input_layout, preferred_video_decoders,
-        selected_video_rate, should_try_deinterlace,
+        field_order_is_interlaced, normalize_audio_input_layout, normalize_sar,
+        preferred_video_decoders, selected_video_rate, should_try_deinterlace,
     };
     use crate::settings::VideoDeinterlaceMode;
     use ffmpeg_the_third::ChannelLayout;
@@ -5060,6 +5086,26 @@ mod decoder_candidate_tests {
             assert_eq!(candidates[0].choice, DecoderChoice::Default);
             assert!(candidates[0].allow_sw_fallback);
         }
+    }
+
+    #[test]
+    fn normalize_sar_keeps_valid_values() {
+        assert_eq!(normalize_sar(1, 1), (1, 1));
+        assert_eq!(normalize_sar(97, 80), (97, 80));
+        assert_eq!(normalize_sar(59, 54), (59, 54)); // PAL 4:3 anamorphic
+        assert_eq!(normalize_sar(2, 1), (2, 1));
+    }
+
+    #[test]
+    fn normalize_sar_falls_back_for_invalid_or_unspecified() {
+        // FFmpeg の "未指定" sentinel
+        assert_eq!(normalize_sar(0, 1), (1, 1));
+        assert_eq!(normalize_sar(0, 0), (1, 1));
+        assert_eq!(normalize_sar(1, 0), (1, 1));
+        // 負値 (= 不正、defensive)
+        assert_eq!(normalize_sar(-1, 1), (1, 1));
+        assert_eq!(normalize_sar(1, -1), (1, 1));
+        assert_eq!(normalize_sar(-97, -80), (1, 1));
     }
 
     #[test]

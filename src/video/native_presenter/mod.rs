@@ -87,6 +87,12 @@ pub struct NativeVideoPresenter {
     pixel_probe_strict: bool,
     last_pixel_probe: Option<Instant>,
     video_compact: bool,
+    /// Sample aspect ratio (= pixel aspect ratio)。1/1 = 正方ピクセル (= 従来挙動)。
+    /// アナモフィック動画 (NTSC DVD 等で SAR=97/80 など) で `update_video_visual_transform`
+    /// の M11/M22 を anisotropic にして表示比を補正する。decoder の VideoInfo 経由で
+    /// `set_video_sar(num, den)` で設定される。
+    sar_num: u32,
+    sar_den: u32,
     width: u32,
     height: u32,
     surface_width: u32,
@@ -750,6 +756,8 @@ impl NativeVideoPresenter {
                     .is_some(),
                 last_pixel_probe: None,
                 video_compact: false,
+                sar_num: 1,
+                sar_den: 1,
                 width: config.width,
                 height: config.height,
                 surface_width: config.width,
@@ -815,6 +823,25 @@ impl NativeVideoPresenter {
         log_event(
             "video_compact",
             &[("compact", Value::from(self.video_compact))],
+        );
+        Ok(())
+    }
+
+    pub fn set_video_sar(&mut self, num: u32, den: u32) -> Result<(), String> {
+        let num = num.max(1);
+        let den = den.max(1);
+        if self.sar_num == num && self.sar_den == den {
+            return Ok(());
+        }
+        self.sar_num = num;
+        self.sar_den = den;
+        self.update_video_visual_transform()?;
+        log_event(
+            "video_sar",
+            &[
+                ("sar_num", Value::from(self.sar_num as i64)),
+                ("sar_den", Value::from(self.sar_den as i64)),
+            ],
         );
         Ok(())
     }
@@ -1297,23 +1324,20 @@ impl NativeVideoPresenter {
     }
 
     fn update_video_visual_transform(&self) -> Result<(), String> {
-        let surface_width = self.surface_width.max(1) as f32;
-        let surface_height = self.surface_height.max(1) as f32;
-        let width = self.width.max(1) as f32;
-        let height = self.height.max(1) as f32;
-        let (target_x, target_y, target_w, target_h) = if self.video_compact {
-            (width * 0.5, 0.0, width * 0.5, height * 0.5)
-        } else {
-            (0.0, 0.0, width, height)
-        };
-        let scale = (target_w / surface_width).min(target_h / surface_height);
-        let offset_x = target_x + (target_w - surface_width * scale) * 0.5;
-        let offset_y = target_y + (target_h - surface_height * scale) * 0.5;
+        let (m11, m22, offset_x, offset_y) = compute_video_visual_transform(
+            self.surface_width,
+            self.surface_height,
+            self.width,
+            self.height,
+            self.sar_num,
+            self.sar_den,
+            self.video_compact,
+        );
         let transform = Matrix3x2 {
-            M11: scale,
+            M11: m11,
             M12: 0.0,
             M21: 0.0,
-            M22: scale,
+            M22: m22,
             M31: offset_x,
             M32: offset_y,
         };
@@ -3901,6 +3925,49 @@ fn log_event(kind: &str, fields: &[(&str, Value)]) {
     crate::perf::event("native_presenter", kind, None, 0, fields);
 }
 
+/// 動画 visual の DirectComposition transform 行列を SAR 込みで計算する。
+///
+/// `surface_w/h` は decoded frame の raw pixel サイズ (= swap chain backbuffer)。
+/// `win_w/h` はウィンドウサイズ。`sar_num/sar_den` は sample aspect ratio
+/// (= pixel aspect ratio)、1/1 で従来の isotropic 表示。`compact` は VST3 panel 表示時の
+/// 1/4 領域モード。
+///
+/// 戻り値は `(M11, M22, M31, M32)`。`M12 = M21 = 0` (= 回転 / shear なし)。
+/// SAR != 1:1 の場合は M11 != M22 の anisotropic scale になる
+/// (= 横方向だけ伸ばして表示比を補正する、SAR>1 の anamorphic 動画)。
+fn compute_video_visual_transform(
+    surface_w: u32,
+    surface_h: u32,
+    win_w: u32,
+    win_h: u32,
+    sar_num: u32,
+    sar_den: u32,
+    compact: bool,
+) -> (f32, f32, f32, f32) {
+    let surface_w = surface_w.max(1) as f32;
+    let surface_h = surface_h.max(1) as f32;
+    let win_w = win_w.max(1) as f32;
+    let win_h = win_h.max(1) as f32;
+    let sar = (sar_num.max(1) as f32) / (sar_den.max(1) as f32);
+    // 表示寸法 = raw pixel × SAR (横だけ)。SAR>1 で widen、SAR<1 で narrow。
+    let display_w = surface_w * sar;
+    let display_h = surface_h;
+    let (target_x, target_y, target_w, target_h) = if compact {
+        (win_w * 0.5, 0.0, win_w * 0.5, win_h * 0.5)
+    } else {
+        (0.0, 0.0, win_w, win_h)
+    };
+    // `display_w × display_h` を `target_w × target_h` に letterbox fit する scale。
+    let scale = (target_w / display_w).min(target_h / display_h);
+    // M11 は raw surface 幅から最終表示幅への係数なので、scale × sar が掛かる。
+    // M22 は高さなので scale だけ。SAR=1:1 なら M11 == M22 で従来挙動と同一。
+    let m11 = scale * sar;
+    let m22 = scale;
+    let offset_x = target_x + (target_w - display_w * scale) * 0.5;
+    let offset_y = target_y + (target_h - display_h * scale) * 0.5;
+    (m11, m22, offset_x, offset_y)
+}
+
 fn copy_cpu_rgba_to_swapchain_bgra(
     src_rgba: &[u8],
     dst_bgra: &mut Vec<u8>,
@@ -4023,9 +4090,102 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativePixelSample, compare_pixel_probe, copy_cpu_rgba_to_swapchain_bgra,
-        metadata_clean_text, sample_cpu_rgba_pixel,
+        NativePixelSample, compare_pixel_probe, compute_video_visual_transform,
+        copy_cpu_rgba_to_swapchain_bgra, metadata_clean_text, sample_cpu_rgba_pixel,
     };
+
+    /// 1:1 SAR では従来の isotropic transform と一致 (regression-safe を保証)。
+    #[test]
+    fn compute_video_visual_transform_sar_1_1_is_isotropic() {
+        let (m11, m22, ox, oy) =
+            compute_video_visual_transform(1920, 1080, 3840, 2160, 1, 1, false);
+        assert!(
+            (m11 - m22).abs() < 1e-6,
+            "M11 ({m11}) should equal M22 ({m22})"
+        );
+        assert!((m11 - 2.0).abs() < 1e-6, "1920->3840 should be 2x");
+        assert!(ox.abs() < 1e-3, "centered horizontally");
+        assert!(oy.abs() < 1e-3, "centered vertically");
+    }
+
+    /// SAR 97/80 (= 1.2125、本件動画) で 720x480 を 1920x1080 に letterbox fit。
+    /// 表示寸法 = 720*1.2125 × 480 = 873x480、aspect 1.819:1 なので window 16:9 に
+    /// 横いっぱい (1920 幅) 入るはず。M11/M22 比は SAR と一致する。
+    #[test]
+    fn compute_video_visual_transform_anamorphic_97_80() {
+        let (m11, m22, ox, oy) =
+            compute_video_visual_transform(720, 480, 1920, 1080, 97, 80, false);
+        let ratio = m11 / m22;
+        assert!(
+            (ratio - 1.2125).abs() < 1e-4,
+            "M11/M22 should equal SAR 1.2125 (got {ratio})"
+        );
+        // display_w = 720 * 1.2125 = 873, display_h = 480, win 1920x1080
+        // scale = min(1920/873, 1080/480) = min(2.199, 2.25) = 2.199
+        // → 横いっぱい、縦に余白
+        let expected_scale = 1920.0_f32 / (720.0 * 97.0 / 80.0);
+        assert!((m22 - expected_scale).abs() < 1e-3);
+        assert!(ox.abs() < 0.5, "should fit horizontally edge-to-edge");
+        assert!(oy > 0.0, "should letterbox vertically");
+    }
+
+    /// SAR 0/0 (未指定)・0/1・1/0 はすべて 1:1 として扱う (= max(1) で正規化)。
+    #[test]
+    fn compute_video_visual_transform_zero_sar_normalizes_to_one() {
+        let baseline = compute_video_visual_transform(720, 480, 1920, 1080, 1, 1, false);
+        assert_eq!(
+            compute_video_visual_transform(720, 480, 1920, 1080, 0, 0, false),
+            baseline,
+            "0/0 must equal 1/1"
+        );
+        assert_eq!(
+            compute_video_visual_transform(720, 480, 1920, 1080, 0, 1, false),
+            baseline,
+            "0/1 must equal 1/1"
+        );
+        assert_eq!(
+            compute_video_visual_transform(720, 480, 1920, 1080, 1, 0, false),
+            baseline,
+            "1/0 must equal 1/1"
+        );
+    }
+
+    /// SAR < 1 (縦アナモフィック、稀) でも letterbox が成立する。
+    #[test]
+    fn compute_video_visual_transform_vertical_anamorphic() {
+        let (m11, m22, _ox, _oy) =
+            compute_video_visual_transform(960, 540, 1920, 1080, 1, 2, false);
+        // SAR=0.5 → display_w=480, display_h=540, ratio M11/M22 = 0.5
+        let ratio = m11 / m22;
+        assert!((ratio - 0.5).abs() < 1e-4);
+    }
+
+    /// Compact mode (VST3 panel 表示時の 1/4 領域) でも SAR 補正が正しく適用される。
+    #[test]
+    fn compute_video_visual_transform_compact_mode_respects_sar() {
+        let (m11_normal, m22_normal, _, _) =
+            compute_video_visual_transform(720, 480, 1920, 1080, 97, 80, false);
+        let (m11_compact, m22_compact, ox, oy) =
+            compute_video_visual_transform(720, 480, 1920, 1080, 97, 80, true);
+        // compact = 1/4 領域なので scale も半分。M11/M22 比は SAR で同じ。
+        let ratio_normal = m11_normal / m22_normal;
+        let ratio_compact = m11_compact / m22_compact;
+        assert!((ratio_normal - ratio_compact).abs() < 1e-5);
+        assert!(m11_compact < m11_normal, "compact should fit smaller area");
+        // compact 領域は右上 (target_x = win_w/2 = 960、target_y = 0)
+        assert!(ox >= 960.0, "compact target starts at right half");
+        assert!(oy >= 0.0);
+    }
+
+    /// 不正な (極めて小さい / 0) ウィンドウやサーフェイスでも panic しない。
+    #[test]
+    fn compute_video_visual_transform_handles_zero_dims() {
+        // surface 0/0 → max(1) 正規化、計算が NaN/inf にならず数値で返ること
+        let (m11, m22, ox, oy) = compute_video_visual_transform(0, 0, 1920, 1080, 1, 1, false);
+        assert!(m11.is_finite() && m22.is_finite() && ox.is_finite() && oy.is_finite());
+        let (m11, m22, ox, oy) = compute_video_visual_transform(720, 480, 0, 0, 1, 1, false);
+        assert!(m11.is_finite() && m22.is_finite() && ox.is_finite() && oy.is_finite());
+    }
 
     #[test]
     fn copy_cpu_rgba_to_swapchain_bgra_swaps_red_and_blue() {
