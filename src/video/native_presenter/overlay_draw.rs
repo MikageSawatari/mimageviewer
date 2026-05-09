@@ -719,52 +719,46 @@ pub(super) fn draw_overlay_perf_graph_icon(painter: &egui::Painter, rect: egui::
 }
 
 pub(super) fn draw_overlay_vst3_top_icon(painter: &egui::Painter, rect: egui::Rect) {
+    // 3 文字を等幅・gap 固定で並べることで proportional font 風の重なりを回避する。
+    // 旧実装は V/S/T それぞれ独立座標だったため stroke 込みで S と T が重なっていた。
     let color = egui::Color32::from_rgb(238, 238, 238);
-    let stroke = egui::Stroke::new(1.55, color);
-    let base_y = rect.center().y + 5.0;
-    let top_y = rect.center().y - 6.0;
-    let left = rect.min.x + 5.5;
-    let mid = rect.center().x;
-    let right = rect.max.x - 5.5;
+    let stroke = egui::Stroke::new(1.5, color);
+    let c = rect.center();
+    let char_w = 5.5_f32;
+    let gap = 2.0_f32;
+    let char_h = 10.0_f32;
+    let group_w = 3.0 * char_w + 2.0 * gap;
+    let top = c.y - char_h * 0.5;
+    let bot = c.y + char_h * 0.5;
+    let mid = c.y;
+    let left = c.x - group_w * 0.5;
 
-    painter.line_segment(
-        [egui::pos2(left, top_y), egui::pos2(left + 3.4, base_y)],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            egui::pos2(left + 3.4, base_y),
-            egui::pos2(left + 6.8, top_y),
-        ],
-        stroke,
-    );
+    // V
+    let v_x0 = left;
+    let v_x1 = v_x0 + char_w;
+    let v_xc = (v_x0 + v_x1) * 0.5;
+    painter.line_segment([egui::pos2(v_x0, top), egui::pos2(v_xc, bot)], stroke);
+    painter.line_segment([egui::pos2(v_x1, top), egui::pos2(v_xc, bot)], stroke);
 
-    let sx0 = mid - 1.8;
-    let sx1 = mid + 4.8;
-    let sy0 = top_y + 0.8;
-    let sym = rect.center().y - 0.4;
-    let sy1 = base_y - 0.8;
+    // S (zigzag polyline)
+    let s_x0 = v_x1 + gap;
+    let s_x1 = s_x0 + char_w;
     for [a, b] in [
-        [egui::pos2(sx0, sy0), egui::pos2(sx1, sy0)],
-        [egui::pos2(sx0, sy0), egui::pos2(sx0, sym)],
-        [egui::pos2(sx0, sym), egui::pos2(sx1, sym)],
-        [egui::pos2(sx1, sym), egui::pos2(sx1, sy1)],
-        [egui::pos2(sx0, sy1), egui::pos2(sx1, sy1)],
+        [egui::pos2(s_x1, top), egui::pos2(s_x0, top)],
+        [egui::pos2(s_x0, top), egui::pos2(s_x0, mid)],
+        [egui::pos2(s_x0, mid), egui::pos2(s_x1, mid)],
+        [egui::pos2(s_x1, mid), egui::pos2(s_x1, bot)],
+        [egui::pos2(s_x1, bot), egui::pos2(s_x0, bot)],
     ] {
         painter.line_segment([a, b], stroke);
     }
 
-    painter.line_segment(
-        [egui::pos2(right - 6.0, top_y), egui::pos2(right, top_y)],
-        stroke,
-    );
-    painter.line_segment(
-        [
-            egui::pos2(right - 3.0, top_y),
-            egui::pos2(right - 3.0, base_y),
-        ],
-        stroke,
-    );
+    // T
+    let t_x0 = s_x1 + gap;
+    let t_x1 = t_x0 + char_w;
+    let t_xc = (t_x0 + t_x1) * 0.5;
+    painter.line_segment([egui::pos2(t_x0, top), egui::pos2(t_x1, top)], stroke);
+    painter.line_segment([egui::pos2(t_xc, top), egui::pos2(t_xc, bot)], stroke);
 }
 
 pub(super) fn draw_overlay_close_icon(painter: &egui::Painter, rect: egui::Rect) {

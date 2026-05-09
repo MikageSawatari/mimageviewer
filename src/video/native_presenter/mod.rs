@@ -2235,7 +2235,7 @@ impl NativeEguiOverlay {
             || self.jump_panel_visible()
             || self.top_bar_visible()
             || self.right_panel_visible()
-            || self.vst3_panel.as_ref().is_some_and(|panel| panel.visible)
+            || self.vst3_panel_visible()
             || self.perf_visible
             || self.tile_overlay.is_some()
             || self.hover_preview_target_secs.is_some()
@@ -2284,7 +2284,14 @@ impl NativeEguiOverlay {
         })
     }
 
+    fn vst3_panel_visible(&self) -> bool {
+        self.vst3_panel.as_ref().is_some_and(|panel| panel.visible)
+    }
+
     fn right_panel_visible(&self) -> bool {
+        if self.vst3_panel_visible() {
+            return false;
+        }
         if self.video_metadata.is_none() {
             return false;
         }
@@ -2308,6 +2315,9 @@ impl NativeEguiOverlay {
     }
 
     fn jump_panel_visible(&self) -> bool {
+        if self.vst3_panel_visible() {
+            return false;
+        }
         if self.video_speed_popup_open || self.hover_preview_target_secs.is_some() {
             return false;
         }

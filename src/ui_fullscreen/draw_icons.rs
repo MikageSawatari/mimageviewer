@@ -81,17 +81,42 @@ pub(super) fn handle_frame_step_button(
     true
 }
 
-/// "VST" テキストラベルを描画する (= ホバーバーの VST3 管理ボタン用アイコン)。
-/// 🎚 (LEVEL SLIDER) は mIV のフォント (Noto Sans CJK JP) で tofu 化するため
-/// テキストで描く。3 文字なら 32px のボタンに収まる。
+/// "VST" ラベルを線分で自前描画する (= ホバーバーの VST3 管理ボタン用アイコン)。
+/// proportional font だと S/T や V/S が重なって読みづらいため、line_segment で
+/// 等幅 + 文字間 gap を確保する。3 文字を 32px のボタンに余裕を持って収める。
 pub(super) fn draw_vst_text_label(painter: &egui::Painter, c: egui::Pos2) {
-    painter.text(
-        c,
-        egui::Align2::CENTER_CENTER,
-        "VST",
-        egui::FontId::proportional(11.0),
-        egui::Color32::WHITE,
-    );
+    let stroke = egui::Stroke::new(1.5, egui::Color32::WHITE);
+    let char_w = 5.5_f32;
+    let gap = 2.0_f32;
+    let char_h = 10.0_f32;
+    let group_w = 3.0 * char_w + 2.0 * gap;
+    let top = c.y - char_h * 0.5;
+    let bot = c.y + char_h * 0.5;
+    let mid = c.y;
+    let left = c.x - group_w * 0.5;
+
+    // V
+    let v_x0 = left;
+    let v_x1 = v_x0 + char_w;
+    let v_xc = (v_x0 + v_x1) * 0.5;
+    painter.line_segment([egui::pos2(v_x0, top), egui::pos2(v_xc, bot)], stroke);
+    painter.line_segment([egui::pos2(v_x1, top), egui::pos2(v_xc, bot)], stroke);
+
+    // S (zigzag polyline)
+    let s_x0 = v_x1 + gap;
+    let s_x1 = s_x0 + char_w;
+    painter.line_segment([egui::pos2(s_x1, top), egui::pos2(s_x0, top)], stroke);
+    painter.line_segment([egui::pos2(s_x0, top), egui::pos2(s_x0, mid)], stroke);
+    painter.line_segment([egui::pos2(s_x0, mid), egui::pos2(s_x1, mid)], stroke);
+    painter.line_segment([egui::pos2(s_x1, mid), egui::pos2(s_x1, bot)], stroke);
+    painter.line_segment([egui::pos2(s_x1, bot), egui::pos2(s_x0, bot)], stroke);
+
+    // T
+    let t_x0 = s_x1 + gap;
+    let t_x1 = t_x0 + char_w;
+    let t_xc = (t_x0 + t_x1) * 0.5;
+    painter.line_segment([egui::pos2(t_x0, top), egui::pos2(t_x1, top)], stroke);
+    painter.line_segment([egui::pos2(t_xc, top), egui::pos2(t_xc, bot)], stroke);
 }
 
 /// × アイコンを描画する。
