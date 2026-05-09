@@ -171,6 +171,39 @@ FirstFrameReady に必要な post-seek video packet が audio back-pressure の�
 (= 末尾の数十 ms の音声を出し切る)。demux thread はその後 `peek_seek_request_pending`
 の idle wait に入り、cancel か新 seek 要求まで待機。
 
+**swresample 出力 frame の pre-allocation (⚠ 重要)**: `emit_audio_frame` は
+`setup.resampler.run(input, output)` を呼ぶ前に **output frame を正しいサイズで
+明示確保** する。`ffmpeg-the-third 3.0.2` の `Context::run()` 実装は `output.is_empty()`
+の場合に `output.alloc(format, input.samples(), layout)` で確保するが、これは
+sample-rate 変換時に出力サンプル数として誤った値 (= 入力サンプル数そのまま) を
+使う上流バグ。32kHz AAC → 44.1kHz cpal 出力の場合、本来 `1024 × 44100 ÷ 32000 ≈ 1411`
+samples 必要なのに 1024 しか確保されず、約 27% (= `1 - in_rate/out_rate`) のサンプルが
+swr 内部 delay に取り残される。これが累積し audio 残量が想定より速く尽きて、動画
+末尾が無音になる事象を引き起こす (2026-05、bipbop 32kHz AAC で再現確認)。
+
+回避策として `emit_audio_frame` では `resample_output_buffer_samples` helper で
+標準 FFmpeg パターン (av_rescale_rnd 相当):
+
+```text
+out_samples = ceil(in_samples * out_rate / in_rate) + delay_output + SAFETY
+```
+
+を計算し、`av_frame_get_buffer` 済みの frame を渡すことで `Context::run()` の
+誤った alloc 経路をスキップしている。⚠️ `Delay::output` は **既に出力サンプル
+単位** なのでレート換算をかけずにそのまま加算する (delay にもレート換算を
+かけてしまうと downsample 96k→44.1k で過小見積もりになり swr 内部 delay 残留が
+再発する。Codex P2 指摘で修正済み)。
+
+回帰テストは `decoder_candidate_tests::` の以下 6 件で固定:
+- `resample_buffer_size_{upsample,downsample,same_rate,adds_delay}_*` — formula
+  単体テスト (ffmpeg 不要、純粋計算)
+- `resample_run_with_preallocated_output_returns_full_output_samples_upsample`
+  — 32k→44.1k 実 swr で in_samples のまま返らないことを確認
+- `resample_run_downsample_no_cumulative_drift` — 96k→44.1k で 8 iteration
+  回した累積出力が理論値内に収まることを確認 (delay 過小見積もり回帰検知)
+
+`FastDownmixToStereo` path は同一レート時のみ動作するので bug の影響を受けない。
+
 **Drop / shutdown 順**: VideoPlayer drop → `cancel.store(true)` → demux thread が
 break → 関数末尾で `audio_pkt_tx` / `video_pkt_tx` を順次 drop → 各 decode thread が
 channel disconnect で recv() 抜け → exit。demux thread が両 decode thread を

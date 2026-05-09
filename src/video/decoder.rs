@@ -3514,6 +3514,15 @@ fn run_audio_decode(
                 // 残フレーム drain: send_eof + receive_frame ループで decoder 内の
                 // 残サンプルを最後まで取り出して送る。これにより末尾の数十 ms が
                 // 抜けない。FFmpeg の API では NULL packet で EOF flush を伝える。
+                //
+                // ⚠️ resampler 側 (`setup.resampler.flush()`) はここでは呼ばない。
+                // emit_audio_frame の pre-alloc 修正により swr 内部 delay は
+                // SAFETY=32 sample (= 0.7ms @ 44.1kHz) 以下で安定するため、
+                // EOF 残留 sample も同オーダーで体感不可能。flush するには
+                // emit_audio_frame の送信処理 (preroll trim / serial check /
+                // AudioFrame 送出ループ) を helper に分離する大規模 refactor が
+                // 必要なので費用対効果が悪い。将来 emit パスを整理する機会が
+                // あれば併せて入れる。
                 use ffmpeg_the_third::ffi::avcodec_send_packet;
                 unsafe {
                     let _ = avcodec_send_packet(setup.decoder.as_mut_ptr(), std::ptr::null());
@@ -3651,6 +3660,31 @@ fn run_audio_decode(
 ///
 /// 戻り値: false なら audio_tx が disconnected なので呼び出し元はスレッド終了する。
 /// drop_before_secs は preroll trim で drain した結果ここで `None` に戻ることがある。
+
+/// swr resample 出力 frame 用のバッファサイズ (samples) を計算する。
+/// 標準 FFmpeg パターン (av_rescale_rnd 相当):
+///
+/// ```text
+/// out_samples = ceil(in_samples * out_rate / in_rate) + delay_output + safety
+/// ```
+///
+/// ⚠️ `delay_out_samples` は **出力サンプル単位** (= `Delay::output`) で渡すこと。
+/// レート換算 (`* out_rate / in_rate`) は入力サンプル数のみに適用し、delay には
+/// 適用しない。delay にもレート換算をかけてしまうと downsample (例: 96k→44.1k) で
+/// 既存 delay 分を過小見積もりし、swr 内部 delay にサンプルが残る。
+///
+/// `safety` は swr 位相補間の丸め誤差吸収用 (典型 32 sample = 0.7ms @ 44.1kHz)。
+fn resample_output_buffer_samples(
+    in_samples: u64,
+    in_rate: u32,
+    out_rate: u32,
+    delay_out_samples: u64,
+    safety: u64,
+) -> usize {
+    let rate_converted = (in_samples * out_rate as u64).div_ceil(in_rate as u64);
+    (rate_converted + delay_out_samples + safety) as usize
+}
+
 fn emit_audio_frame(
     setup: &mut AudioSetup,
     frame: &mut ffmpeg_the_third::util::frame::audio::Audio,
@@ -3696,7 +3730,60 @@ fn emit_audio_frame(
             if guessed_frame_stereo {
                 frame.set_ch_layout(ffmpeg::ChannelLayout::STEREO);
             }
+            // ⚠️ output frame を **正しいサイズ**で pre-allocate する。
+            //
+            // ffmpeg-the-third 3.0.2 の `Context::run()` は `output.is_empty()` の
+            // ときに `output.alloc(format, input.samples(), layout)` で確保するが、
+            // これは入力サンプル数を出力サンプル数として使っており、サンプル
+            // レート変換 (例: 32kHz AAC → 44.1kHz) で不足する。32k→44.1k の
+            // 場合、本来 1024 * 44100 / 32000 ≈ 1411 samples 必要だが 1024 しか
+            // 確保されず、約 27% (= 1 - in_rate/out_rate) のサンプルが swr
+            // 内部 delay に取り残される。これが累積し audio buffer が想定より
+            // 早く尽きて、動画末尾が無音になる。
+            //
+            // ここで標準 FFmpeg パターン (av_rescale_rnd 相当) で
+            //   out_samples = ceil(in_samples * out_rate / in_rate) + delay_output + safety
+            // を計算し、`av_frame_get_buffer` 済みの output を渡すことで
+            // `Context::run()` の誤った alloc 経路をスキップする。
+            //
+            // ⚠️ `Delay::output` は **既に出力サンプル単位** なので、レート換算
+            // (`* out_rate / in_rate`) を**かけずに**そのまま加算する。
+            // 過去の実装で `(in_samples + delay_output) * out_rate / in_rate` と
+            // していたが、これは delay を out_rate/in_rate 倍してしまう誤りで、
+            // upsample (32k→44.1k) では過大確保で偶然安全側、downsample
+            // (96k→44.1k) では過小見積もりとなり swr 内部 delay にサンプルが
+            // 残る危険があった (Codex 指摘)。
+            let in_samples = frame.samples();
+            if in_samples == 0 {
+                // 入力 0 サンプル frame は av_frame_get_buffer が失敗する。
+                // PTS 維持だけ next に伝えて即 return。
+                *next_audio_pts_secs = Some(pts_secs);
+                return true;
+            }
+            let delay_out_samples = setup
+                .resampler
+                .delay()
+                .map(|d| d.output.max(0) as u64)
+                .unwrap_or(0);
+            // SAFETY margin: swr 位相補間の丸め誤差吸収用。32 sample / 44.1kHz
+            // = 0.7ms 相当で十分なバッファ。
+            const SWR_OUTPUT_SAFETY_SAMPLES: u64 = 32;
+            let out_samples = resample_output_buffer_samples(
+                in_samples as u64,
+                setup.input_rate,
+                setup.out_rate,
+                delay_out_samples,
+                SWR_OUTPUT_SAFETY_SAMPLES,
+            );
             let mut resampled = Audio::empty();
+            unsafe {
+                resampled.alloc(
+                    Sample::F32(SampleType::Packed),
+                    out_samples,
+                    ffmpeg::ChannelLayoutMask::STEREO,
+                );
+                resampled.set_rate(setup.out_rate);
+            }
             if let Err(e) = setup.resampler.run(frame, &mut resampled) {
                 crate::logger::log(format!("swr resample: {e}"));
                 return true; // 1 frame 失敗は致命的でない
@@ -5109,6 +5196,228 @@ mod decoder_candidate_tests {
         assert!(
             err.contains("buffer init") || err.contains("graph"),
             "unexpected error: {err}"
+        );
+    }
+
+    // ── resample_output_buffer_samples の formula 単体テスト ──
+    //
+    // helper の純粋計算部分を ffmpeg を呼ばずにカバーする。formula を間違えると
+    // ここで即 fail するので、formula 改修時の安全網として機能する。
+
+    #[test]
+    fn resample_buffer_size_upsample_32k_to_44p1k() {
+        // ceil(1024 * 44100 / 32000) = ceil(1411.2) = 1412
+        // + delay 0 + safety 32 = 1444
+        let n = super::resample_output_buffer_samples(1024, 32_000, 44_100, 0, 32);
+        assert_eq!(n, 1412 + 32);
+    }
+
+    #[test]
+    fn resample_buffer_size_downsample_96k_to_44p1k() {
+        // ceil(1024 * 44100 / 96000) = ceil(470.4) = 471
+        // + delay 0 + safety 32 = 503
+        let n = super::resample_output_buffer_samples(1024, 96_000, 44_100, 0, 32);
+        assert_eq!(n, 471 + 32);
+    }
+
+    #[test]
+    fn resample_buffer_size_same_rate_passthrough() {
+        // ceil(1024 * 44100 / 44100) = 1024 (= in_samples)
+        // + delay 0 + safety 32 = 1056
+        let n = super::resample_output_buffer_samples(1024, 44_100, 44_100, 0, 32);
+        assert_eq!(n, 1024 + 32);
+    }
+
+    #[test]
+    fn resample_buffer_size_adds_delay_in_output_units_unchanged() {
+        // ⚠️ Codex 指摘ケース。delay は出力サンプル単位なのでレート換算しない。
+        //
+        // downsample で delay=100 (output units) なら、buffer は ceil(1024 *
+        // 44100/96000) + 100 + 32 = 471 + 100 + 32 = 603 必要。
+        //
+        // 旧 buggy formula は (1024 + 100) * 44100/96000 = 516.4 → 517 + 32 = 549
+        // しか確保せず、delay 100 sample のうち 86 sample 分が swr に
+        // 残ってしまう。本テストはこの過小見積もりを検知する。
+        let with_delay = super::resample_output_buffer_samples(1024, 96_000, 44_100, 100, 32);
+        let without_delay = super::resample_output_buffer_samples(1024, 96_000, 44_100, 0, 32);
+        assert_eq!(with_delay, without_delay + 100);
+    }
+
+    /// emit_audio_frame の resample pre-allocation ロジックの回帰テスト
+    /// (upsample 32kHz → 44.1kHz)。
+    ///
+    /// `ffmpeg-the-third 3.0.2` の `Context::run()` は output frame を
+    /// `input.samples()` で確保するバグがある (input rate を使うべきではない)。
+    /// emit_audio_frame では `resample_output_buffer_samples` で正しいサイズを
+    /// pre-alloc して回避している。本テストはその振る舞いを固定する。
+    ///
+    /// 32kHz mono → 44.1kHz stereo の場合、1024 入力サンプル → 約 1411
+    /// 出力サンプルが期待値。pre-alloc が外れると 1024 になり sync ズレが
+    /// 再発するので即座に検知できる。
+    #[test]
+    fn resample_run_with_preallocated_output_returns_full_output_samples_upsample() {
+        use ffmpeg::ChannelLayout;
+        use ffmpeg::ChannelLayoutMask;
+        use ffmpeg::format::sample::{Sample, Type as SampleType};
+        use ffmpeg::software::resampling::Context as ResampleContext;
+        use ffmpeg::util::frame::audio::Audio;
+        use ffmpeg_the_third as ffmpeg;
+
+        ffmpeg::init().expect("ffmpeg init");
+
+        const IN_RATE: u32 = 32_000;
+        const OUT_RATE: u32 = 44_100;
+        const IN_SAMPLES: usize = 1024;
+        // 標準 FFmpeg 期待値 (av_rescale_rnd の AV_ROUND_UP):
+        //   ceil(1024 * 44100 / 32000) = ceil(1411.2) = 1412
+        // ただし polyphase filter の warm-up により初回 call は数十サンプル
+        // 少なめに返る (~1390)。下限はバグ値 (1024) と明確に区別できる程度に
+        // 広く取り、回帰検知だけ確実にする。
+        const EXPECTED_OUT_LO: usize = 1300;
+        const EXPECTED_OUT_HI: usize = 1420;
+
+        let mut resampler = ResampleContext::get2(
+            Sample::F32(SampleType::Packed),
+            ChannelLayout::MONO,
+            IN_RATE,
+            Sample::F32(SampleType::Packed),
+            ChannelLayout::STEREO,
+            OUT_RATE,
+        )
+        .expect("resampler init");
+
+        let mut input = Audio::empty();
+        unsafe {
+            input.alloc(
+                Sample::F32(SampleType::Packed),
+                IN_SAMPLES,
+                ChannelLayoutMask::FRONT_CENTER,
+            );
+            input.set_rate(IN_RATE);
+        }
+
+        let delay_out_samples = resampler
+            .delay()
+            .map(|d| d.output.max(0) as u64)
+            .unwrap_or(0);
+        let out_samples = super::resample_output_buffer_samples(
+            input.samples() as u64,
+            IN_RATE,
+            OUT_RATE,
+            delay_out_samples,
+            32,
+        );
+
+        let mut output = Audio::empty();
+        unsafe {
+            output.alloc(
+                Sample::F32(SampleType::Packed),
+                out_samples,
+                ChannelLayoutMask::STEREO,
+            );
+            output.set_rate(OUT_RATE);
+        }
+
+        resampler.run(&input, &mut output).expect("resampler.run");
+
+        let actual = output.samples();
+        assert!(
+            (EXPECTED_OUT_LO..=EXPECTED_OUT_HI).contains(&actual),
+            "expected output samples ~1411 (got {actual}); pre-alloc may be broken (would yield {IN_SAMPLES})"
+        );
+        // バグ検知: もし output.samples() == input.samples() なら
+        // pre-alloc 経路が外れて Context::run() の自前 alloc に
+        // fallback している = sync ズレ再発。
+        assert_ne!(
+            actual, IN_SAMPLES,
+            "output samples == input samples — Context::run() の buggy auto-alloc が発動している"
+        );
+    }
+
+    /// downsample (96kHz → 44.1kHz) で複数 iteration 回しても sync drift が
+    /// 発生しないことを検証する。Codex 指摘ケース: `Delay::output` を出力単位
+    /// として正しく扱わずレート換算してしまうと、downsample で delay 分が
+    /// 過小見積もりとなり swr 内部に残留して累積する。
+    ///
+    /// 8 iteration 回した時点での **累積出力サンプル数** が理論値に近いことを
+    /// 確認する。バグ formula なら毎回 sample が delay buffer に取り残されて
+    /// 累積出力が不足する。
+    #[test]
+    fn resample_run_downsample_no_cumulative_drift() {
+        use ffmpeg::ChannelLayout;
+        use ffmpeg::ChannelLayoutMask;
+        use ffmpeg::format::sample::{Sample, Type as SampleType};
+        use ffmpeg::software::resampling::Context as ResampleContext;
+        use ffmpeg::util::frame::audio::Audio;
+        use ffmpeg_the_third as ffmpeg;
+
+        ffmpeg::init().expect("ffmpeg init");
+
+        const IN_RATE: u32 = 96_000;
+        const OUT_RATE: u32 = 44_100;
+        const IN_SAMPLES: usize = 1024;
+        const ITERATIONS: usize = 8;
+        // 8 frame 分の累積入力 8192 sample を 44.1kHz に変換すると
+        //   ceil(8192 * 44100 / 96000) ≈ 3763 sample
+        // polyphase filter の delay があるので実出力はやや少なめになるが、
+        // バグ式 (delay にレート換算をかける誤り) なら毎回 ~14 sample ずつ
+        // 取り残されて累計で 100 sample 以上の drift が発生する。
+        const EXPECTED_TOTAL_LO: usize = 3500;
+        const EXPECTED_TOTAL_HI: usize = 3800;
+
+        let mut resampler = ResampleContext::get2(
+            Sample::F32(SampleType::Packed),
+            ChannelLayout::MONO,
+            IN_RATE,
+            Sample::F32(SampleType::Packed),
+            ChannelLayout::STEREO,
+            OUT_RATE,
+        )
+        .expect("resampler init");
+
+        let mut total_out: usize = 0;
+        for _ in 0..ITERATIONS {
+            let mut input = Audio::empty();
+            unsafe {
+                input.alloc(
+                    Sample::F32(SampleType::Packed),
+                    IN_SAMPLES,
+                    ChannelLayoutMask::FRONT_CENTER,
+                );
+                input.set_rate(IN_RATE);
+            }
+
+            let delay_out_samples = resampler
+                .delay()
+                .map(|d| d.output.max(0) as u64)
+                .unwrap_or(0);
+            let out_samples = super::resample_output_buffer_samples(
+                input.samples() as u64,
+                IN_RATE,
+                OUT_RATE,
+                delay_out_samples,
+                32,
+            );
+
+            let mut output = Audio::empty();
+            unsafe {
+                output.alloc(
+                    Sample::F32(SampleType::Packed),
+                    out_samples,
+                    ChannelLayoutMask::STEREO,
+                );
+                output.set_rate(OUT_RATE);
+            }
+
+            resampler.run(&input, &mut output).expect("resampler.run");
+            total_out += output.samples();
+        }
+
+        assert!(
+            (EXPECTED_TOTAL_LO..=EXPECTED_TOTAL_HI).contains(&total_out),
+            "downsample drift detected: cumulative output {total_out} samples after {ITERATIONS} \
+             iterations (expected {EXPECTED_TOTAL_LO}..{EXPECTED_TOTAL_HI}). \
+             buggy formula 過小見積もりで delay 残留が発生していないか確認すること"
         );
     }
 }
