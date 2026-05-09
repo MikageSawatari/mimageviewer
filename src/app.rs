@@ -2225,6 +2225,17 @@ pub struct App {
     /// `video_hud_rect` のクリック判定が「描画されている領域だけクリックを吸収する」
     /// ように使う (= フェードアウト後の領域は背景クリックを通過させる)。
     pub(crate) video_hud_visible_factor: f32,
+    /// フルスクリーンでマウスカーソルの最終活動時刻 (移動 / クリック / キー入力)。
+    /// パネル / HUD が全て非表示で `CURSOR_HIDE_IDLE_SECS` 経過したらカーソルを隠す。
+    /// `None` はまだ活動が記録されていない状態 (= 直前に活動があったとみなしカーソル表示)。
+    /// パネル / HUD 表示中もタイマをリセットする (= 表示が消えてから 3 秒測り直し)。
+    pub(crate) cursor_last_activity: Option<std::time::Instant>,
+    /// 直前フレームでカーソルを `CursorIcon::None` で隠した sticky フラグ。
+    /// 隠した後は次の活動 / UI 表示までこの状態を維持する。これにより 3 秒経過直後の
+    /// 1 フレームで隠した後、render が間引かれてもカーソルが復活しない (egui は
+    /// 毎フレーム set_cursor_icon を呼ばないと cursor 状態が消えるため、`cursor_hidden`
+    /// が true の間は毎フレーム None を打ち続ける)。
+    pub(crate) cursor_hidden: bool,
     /// 動画倍速再生のセッション内設定。settings には保存しない。
     pub(crate) video_playback_speed: f64,
     /// legacy egui HUD の速度ポップアップ表示状態。
@@ -2927,6 +2938,8 @@ impl Default for App {
             fs_feedback_toast: None,
             video_hud_last_activity: None,
             video_hud_visible_factor: 1.0,
+            cursor_last_activity: None,
+            cursor_hidden: false,
             video_playback_speed: 1.0,
             video_speed_popup_open: false,
             video_frame_step_hold: None,
@@ -8762,6 +8775,12 @@ impl App {
         // スタックで管理する (画像移動でさらにクリアされる)。
         self.clear_meta_undo();
         self.fullscreen_idx = Some(idx);
+        // フルスクリーン入場時にカーソル idle タイマをリセット (= 直前まで隠れていた
+        // 状態を引き継がないようにする)。前回フルスクリーンを 5 分放置した後に
+        // すぐ再入場した場合、Some(<古い時刻>) のままだと 1 フレーム目で
+        // 「3 秒以上経過」と判定されカーソルが即時消える事故を防ぐ。
+        self.cursor_last_activity = Some(std::time::Instant::now());
+        self.cursor_hidden = false;
         self.refresh_fullscreen_video_marker_cache(idx);
         #[cfg(windows)]
         if self.native_video_fullscreen_active_for_main_backdrop() {
@@ -11084,6 +11103,9 @@ impl App {
         self.fullscreen_idx = None;
         self.fullscreen_video_marker_cache = None;
         self.fs_viewport_recreate_after_hide = true;
+        // 次回フルスクリーン入場時に古い活動時刻 / hidden 状態を引き継がないようクリア。
+        self.cursor_last_activity = None;
+        self.cursor_hidden = false;
         // ※ ここで `fs_nav_locked` / `fs_holdover_tex` を即時クリアしてはいけない:
         //   `apply_folder_nav_result` の Fullscreen 分岐は close_fullscreen → load_folder
         //   → open_fullscreen と直列に呼ぶので、その途中で lock を捨てると新ページが

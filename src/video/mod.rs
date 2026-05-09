@@ -323,6 +323,11 @@ enum NativeVideoOutputCommand {
     SwitchSource {
         payload: Box<SwitchSourcePayload>,
     },
+    /// eframe 経由のキー入力 (= `show_native_video_black_backdrop` で受け取って
+    /// `handle_native_video_key_event` に流すパス) など、native presenter HWND の
+    /// `push_native_event` を経由しない活動を伝搬する。NativeEguiOverlay の
+    /// cursor auto-hide タイマをリセットして即時にカーソルを再表示するため。
+    MarkCursorActivity,
 }
 
 #[cfg(windows)]
@@ -610,6 +615,12 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::ShowToast { text, centered });
+    }
+
+    fn mark_cursor_activity(&self) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::MarkCursorActivity);
     }
 
     fn drain_events(&self) -> Vec<(u64, NativeVideoOutputEvent)> {
@@ -1225,6 +1236,9 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetTileOverlay { tile_overlay } => {
                     presenter.set_overlay_tile_overlay(tile_overlay);
+                }
+                NativeVideoOutputCommand::MarkCursorActivity => {
+                    presenter.mark_overlay_cursor_activity();
                 }
                 NativeVideoOutputCommand::SwitchSource { payload } => {
                     native_drain_unpresented_queue(&mut source.queue);
@@ -2660,6 +2674,17 @@ impl VideoPlayer {
             .as_ref()
             .map(NativeVideoOutput::hwnd)
             .unwrap_or(0)
+    }
+
+    /// eframe 経由のキー入力 (Space で pause/resume 等) は native presenter HWND を
+    /// 経由しないため、`push_native_event` で行われる cursor auto-hide タイマの
+    /// リセットが走らない。`mark_native_video_hud_activity` 等から呼んで明示的に
+    /// 伝搬する。command channel を介すので 1〜2 フレームの遅延はあるが許容範囲。
+    #[cfg(windows)]
+    pub fn mark_cursor_activity(&self) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.mark_cursor_activity();
+        }
     }
 
     #[cfg(windows)]

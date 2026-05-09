@@ -441,6 +441,12 @@ const VIDEO_HUD_IDLE_BEFORE_FADE: f32 = 2.0;
 /// この時間で 1.0 → 0.0 まで滑らかに減衰する。
 const VIDEO_HUD_FADE_DURATION: f32 = 0.3;
 
+/// フルスクリーンで上部ホバーバーが表示される画面上端からの距離 (ピクセル)。
+/// `draw_fs_hover_bar` の hover 判定と、`fs_ui_is_clean` のクリーン判定で共有する。
+const TOP_BAR_HOVER_Y: f32 = 60.0;
+// CURSOR_HIDE_IDLE_SECS は `crate::video::native_presenter::CURSOR_HIDE_IDLE_SECS`
+// に集約している (eframe 経路と D3D11 native 経路の両方で同じ閾値を使うため)。
+
 /// 動画のチャプター・ブックマーク・ピンを 1 本の Vec に集約するための種別タグ。
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum NavMarkerKind {
@@ -1198,6 +1204,32 @@ impl App {
                 }
                 self.fs_prev_focused = focused_now;
 
+                // カーソル自動非表示用のアクティビティ検出。マウス移動 / クリック /
+                // ホイール / キー入力のいずれかがあれば「活動中」とみなしタイマをリセット。
+                // `pointer.velocity()` ではなく `delta()` を使う (velocity は静止後も
+                // 慣性を残し、3 秒タイマがいつまでも進まない誤動作になるため)。
+                // `open_fullscreen` で Some 初期化されるが、想定外の入場経路で None の
+                // まま到達した場合も safety net として今フレームで起動する。
+                if self.cursor_last_activity.is_none() {
+                    self.cursor_last_activity = Some(std::time::Instant::now());
+                }
+                let cursor_active = ctx.input(|i| {
+                    i.pointer.delta() != egui::Vec2::ZERO
+                        || i.pointer.any_pressed()
+                        || i.pointer.any_click()
+                        || i.smooth_scroll_delta != egui::Vec2::ZERO
+                        || i.events.iter().any(|e| {
+                            matches!(
+                                e,
+                                egui::Event::Key { pressed: true, .. } | egui::Event::Text(_)
+                            )
+                        })
+                });
+                if cursor_active {
+                    self.cursor_last_activity = Some(std::time::Instant::now());
+                    self.cursor_hidden = false;
+                }
+
                 // event consume される前に捕捉 (handle_fs_key_input が矢印等を
                 // 消費するとイベントが見えなくなるため)。マウス移動は操作と見なさない。
                 if self.fs_boundary_hint.is_some() {
@@ -1676,6 +1708,45 @@ impl App {
                         }
                     });
                 fs_central_ms = central_t0.elapsed().as_secs_f64() * 1000.0;
+
+                // パネル / HUD が全て非表示で 3 秒以上アイドルならカーソルを隠す。
+                // 動画 native presenter 経路は `update_cursor_icon` で
+                // `CursorIcon::None` → `SetCursor(None)` に解決する (= 完全非表示)。
+                // 静止画 (egui) 経路は winit が `CursorIcon::None` を Windows API で
+                // 正しく非表示処理する。VST3 manager 等のダイアログ表示中は
+                // `any_dialog_open()` で `fs_ui_is_clean` が false を返すため抑制される。
+                //
+                // 状態機械:
+                // - 入力あり / UI 表示中: `cursor_last_activity = Some(now)`,
+                //   `cursor_hidden = false` (idle タイマをリセット)。これにより
+                //   一時停止 (HUD 表示中) の間にタイマが古くなり、再開直後に即座に
+                //   カーソルが消える事故を防ぐ。
+                // - clean かつ idle >= 3 秒、または `cursor_hidden` が立っている:
+                //   `CursorIcon::None` を毎フレーム適用 (egui は frame 跨ぎで sticky に
+                //   ならないため)、`cursor_hidden = true` をセット。
+                {
+                    let full_rect = ctx.content_rect();
+                    let is_video = state.is_video;
+                    let clean = self.fs_ui_is_clean(ctx, full_rect, is_video);
+                    if !clean {
+                        // UI が出ている間はタイマを today に戻して countdown を停止。
+                        self.cursor_last_activity = Some(std::time::Instant::now());
+                        self.cursor_hidden = false;
+                    }
+                    let idle = self
+                        .cursor_last_activity
+                        .map(|t| t.elapsed().as_secs_f32())
+                        .unwrap_or(0.0);
+                    let threshold = crate::video::native_presenter::CURSOR_HIDE_IDLE_SECS;
+                    if clean && (idle >= threshold || self.cursor_hidden) {
+                        ctx.set_cursor_icon(egui::CursorIcon::None);
+                        self.cursor_hidden = true;
+                    } else if clean {
+                        // カウントダウン中: 残時間後に再描画予約してきっかり 3 秒で隠す。
+                        let remain = (threshold - idle).max(0.05);
+                        ctx.request_repaint_after(std::time::Duration::from_secs_f32(remain));
+                    }
+                }
 
                 // ── VST3 プラグイン管理ウィンドウ + チェーンエディタ (フルスクリーン中も表示) ──
                 // egui::Window はビューポート単位で z-order が独立しているので、
@@ -4245,6 +4316,27 @@ impl App {
         }
     }
 
+    /// フルスクリーン UI が「クリーンな状態」(= 上部バー / 左右パネル / HUD / モーダルが
+    /// 何も出ていない) か判定する。`true` かつアイドル時間が `CURSOR_HIDE_IDLE_SECS` を
+    /// 超えたらマウスカーソルを `CursorIcon::None` で非表示にする。
+    fn fs_ui_is_clean(&self, ctx: &egui::Context, full_rect: egui::Rect, is_video: bool) -> bool {
+        let pointer = ctx.input(|i| i.pointer.hover_pos());
+        let in_top = pointer.is_some_and(|p| p.y < TOP_BAR_HOVER_Y);
+        let in_right = pointer.is_some_and(|p| p.x > full_rect.max.x - full_rect.width() * 0.25);
+        let hud_visible = is_video && self.video_hud_visible_factor >= 0.05;
+        !in_top
+            && !in_right
+            && !self.show_metadata_panel
+            && !self.adjustment_mode
+            && !self.erase_mode
+            && !self.analysis_mode
+            && !self.spread_popup_open
+            && !self.video_speed_popup_open
+            && self.fs_context_menu_idx.is_none()
+            && !self.any_dialog_open()
+            && !hud_visible
+    }
+
     /// フルスクリーンのホバー時トップバーを描画する。
     #[allow(clippy::too_many_arguments)]
     /// 上部ホバーバーを描画する。`location_display` は左側に表示するパス文字列
@@ -4294,8 +4386,12 @@ impl App {
         vst3_panel_open: bool,
         vst3_pressed: &mut bool,
     ) {
-        let hover_in_top =
-            ctx.input(|i| i.pointer.hover_pos().map(|p| p.y < 60.0).unwrap_or(false));
+        let hover_in_top = ctx.input(|i| {
+            i.pointer
+                .hover_pos()
+                .map(|p| p.y < TOP_BAR_HOVER_Y)
+                .unwrap_or(false)
+        });
         // adjustment_mode がオンならオーバーレイとして常に表示
         if !hover_in_top && !force_show && !*spread_popup_open && !*adjustment_mode {
             return;

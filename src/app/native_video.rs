@@ -1838,7 +1838,23 @@ impl App {
 
     #[cfg(windows)]
     pub(super) fn mark_native_video_hud_activity(&mut self, ctx: &egui::Context) {
-        self.video_hud_last_activity = Some(std::time::Instant::now());
+        let now = std::time::Instant::now();
+        self.video_hud_last_activity = Some(now);
+        // ネイティブビデオウィンドウのマウス/キー入力は eframe フルスクリーンビューポートの
+        // input には現れないため、カーソル auto-hide のアクティビティタイマもここで更新する。
+        // 動画 HUD 活動 = ユーザーがマウスを動かしたかキー操作した = カーソル可視。
+        self.cursor_last_activity = Some(now);
+        self.cursor_hidden = false;
+        // eframe 経由のキー入力 (Space で pause/resume 等) は native presenter HWND の
+        // `push_native_event` を経由しないので、NativeEguiOverlay 側の cursor タイマが
+        // ズレる (= 一時停止前にカーソルが隠れていたまま再開しても消えたままになる)。
+        // current の player に明示的にアクティビティを伝搬してリセットさせる。
+        if let Some(idx) = self.fullscreen_idx
+            && let Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) =
+                self.fs_cache.get(&idx)
+        {
+            player.mark_cursor_activity();
+        }
         ctx.request_repaint();
     }
 }
