@@ -510,10 +510,17 @@ impl App {
             return;
         }
         let speed = crate::video::clock::clamp_playback_speed(speed);
+        let speed_changed = (self.video_playback_speed - speed).abs() > 1.0e-9;
         self.video_playback_speed = speed;
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_playback_speed(speed);
             self.mark_native_video_hud_activity(ctx);
+        }
+        if speed_changed {
+            // Perf overlay の Y 軸スケールは現在速度に追従する。旧スケールの
+            // サンプルが残ると色判定 (hitch 閾値) が不整合になるため history を
+            // クリアして新スケールで再構築させる。
+            self.reset_video_perf_history();
         }
     }
 

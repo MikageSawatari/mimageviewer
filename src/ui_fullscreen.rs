@@ -5567,11 +5567,7 @@ impl App {
         if perf_key {
             self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
             // 切替時に履歴を一旦クリア (= ON 直後は素のグラフから始まる)。
-            self.video_perf_history.clear();
-            self.video_perf_last_wall = None;
-            self.video_perf_last_seq = None;
-            self.video_perf_last_decoder_skip = None;
-            self.video_perf_last_ui_skip = None;
+            self.reset_video_perf_history();
         }
         if rewind_key && let Some(p) = self.fs_video_player(fs_idx) {
             p.seek(0.0);
@@ -5702,17 +5698,32 @@ impl App {
     /// `dropped_full` と UI 側 `dropped_past` に分けて記録し、色分け表示する。
     /// 期待 interval (= 1000/fps) の 3x を超える値は「再生開始 / seek / pause 復帰
     /// 等の transient による wall 待ち時間」とみなして履歴に入れない。
+    /// Perf graph の history と関連トラッキング状態を全部クリア。
+    /// 速度変更 / overlay トグル時に呼ぶ。旧速度サンプルが新スケールで誤色表示
+    /// される現象を回避する。
+    pub(crate) fn reset_video_perf_history(&mut self) {
+        self.video_perf_history.clear();
+        self.video_perf_last_wall = None;
+        self.video_perf_last_seq = None;
+        self.video_perf_last_decoder_skip = None;
+        self.video_perf_last_ui_skip = None;
+        self.video_perf_pause_start = None;
+    }
+
     pub(crate) fn sample_video_perf(&mut self, fs_idx: usize) {
         let snapshot: Option<(u64, u64, u64, usize, f32, bool, bool)> =
             match self.fs_cache.get(&fs_idx) {
                 Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
                     let (decoder_skips, ui_skips) = player.skip_counters();
-                    let expected_ms = player
+                    // 期待 interval は再生速度に追従する: 30fps を 0.5x 再生なら
+                    // 実フレーム間隔は 66.7ms、2x なら 16.7ms。
+                    let avg_fps = player
                         .info()
                         .map(|i| i.avg_fps as f32)
                         .filter(|fps| *fps > 0.5 && fps.is_finite())
-                        .map(|fps| 1000.0 / fps)
-                        .unwrap_or(33.3);
+                        .unwrap_or(30.0);
+                    let playback_speed = (player.playback_speed() as f32).max(0.1);
+                    let expected_ms = 1000.0 / (avg_fps * playback_speed);
                     let state = player.engine_state_code();
                     let is_warmup = state != crate::video::engine::actor::state_code::PLAYING;
                     // Phase 9.G: graph freeze 判定 = pause OR seeking。
@@ -5853,22 +5864,26 @@ impl App {
     /// 動画 fps から期待値の 1.5x 超を赤縦線 (hitch) で目立たせる。左上半透明。
     pub(crate) fn draw_video_perf_overlay(&self, ui: &mut egui::Ui, full_rect: egui::Rect) {
         let painter = ui.painter().clone();
-        let video_info = self
+        let (video_info, playback_speed) = self
             .fullscreen_idx
             .and_then(|idx| match self.fs_cache.get(&idx) {
                 Some(crate::fs_animation::FsCacheEntry::Video { player, .. }) => {
-                    player.info().cloned()
+                    Some((player.info().cloned(), player.playback_speed() as f32))
                 }
                 _ => None,
-            });
-        // 動画の fps から期待 interval (ms) を取得。fps 不明なら 30fps 仮定。
-        // hitch 閾値は期待値の 1.5x (= 50% 超過 = 1 frame 落ち相当)。
-        let expected_ms: f32 = video_info
+            })
+            .unwrap_or((None, 1.0));
+        // 動画の fps と再生速度から実 frame interval (ms) を計算する。
+        // 0.5x なら 30fps→66.7ms、2x なら→16.7ms。Y 軸は実 interval を基準に
+        // スケーリングする (= 速度変更で hitch 閾値が追従する)。
+        let avg_fps: f32 = video_info
             .as_ref()
             .map(|i| i.avg_fps as f32)
             .filter(|fps| *fps > 0.5 && fps.is_finite())
-            .map(|fps| 1000.0 / fps)
-            .unwrap_or(33.3);
+            .unwrap_or(30.0);
+        let speed = playback_speed.max(0.1);
+        let expected_ms: f32 = 1000.0 / (avg_fps * speed);
+        // hitch 閾値は期待値の 1.5x (= 50% 超過 = 1 frame 落ち相当)。
         let hitch_ms: f32 = (expected_ms * 1.5).max(20.0);
         // 縦軸上限は期待値の 2x、ただし最小 50ms (= 60fps 基準でも見やすい)。
         let y_max_ms: f32 = (expected_ms * 2.0).max(50.0);
@@ -6031,9 +6046,17 @@ impl App {
         // 旧挙動: `now = Instant::now()` を毎 frame 計算するため、pause / seek 中も
         // 時間が進み、サンプルは左に流れて画面外に消える + seek 後に「黒い空間」が
         // できる。
-        // 新挙動: pause/seek 中は最新サンプルの arrival 時刻を `now` として使い、
-        // graph を凍結。post-seek 1 枚目が来た時点で再開すると同時に history の
-        // arrival を freeze 期間分 shift してジャンプを抑止 (sample_video_perf 側)。
+        // 新挙動: pause/seek 中は freeze 開始時刻 (`video_perf_pause_start`、
+        // sample_video_perf が立てる) を `now` として使い、graph を凍結。
+        // post-seek 1 枚目が来た時点で再開すると同時に history の arrival を
+        // freeze 期間分 shift してジャンプを抑止 (sample_video_perf 側)。
+        //
+        // 旧版は `last_sample.arrival` に snap していたが、is_paused_or_seeking が
+        // 一瞬だけ true → false に揺れる場面 (= 速度変更や transient state) で、
+        // 1 frame だけ「`now` が直近 sample の arrival に snap」する → 次 frame で
+        // real `Instant::now()` に戻る、を繰り返してグラフがちらつく問題があった。
+        // freeze 開始時の real time を保持することで、freeze 入退出時の `now` の
+        // 不連続をなくす (= 直前の real `now` と連続的に繋がる)。
         let is_freeze = self
             .fullscreen_idx
             .and_then(|idx| match self.fs_cache.get(&idx) {
@@ -6044,9 +6067,7 @@ impl App {
             })
             .unwrap_or(false);
         let now = if is_freeze {
-            self.video_perf_history
-                .back()
-                .map(|s| s.arrival)
+            self.video_perf_pause_start
                 .unwrap_or_else(std::time::Instant::now)
         } else {
             std::time::Instant::now()
@@ -6864,10 +6885,16 @@ impl App {
             }
             if let Some(speed) = selected_speed {
                 let speed = crate::video::clock::clamp_playback_speed(speed);
+                let speed_changed = (self.video_playback_speed - speed).abs() > 1.0e-9;
                 self.video_playback_speed = speed;
                 self.video_speed_popup_open = false;
                 if let Some(p) = self.fs_video_player(fs_idx) {
                     p.set_playback_speed(speed);
+                }
+                if speed_changed {
+                    // Y 軸スケールが追従するため、旧スケールのサンプルを残すと
+                    // 表示色が不整合になる。クリアして新スケールで再構築する。
+                    self.reset_video_perf_history();
                 }
             }
         }
