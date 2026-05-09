@@ -13,6 +13,12 @@
 //! 抽出済タイル (= `TileThumbnailWorker.snapshot()`) は VideoPlayer 切替まで生存。
 //! 同じ動画で同じ間隔を再選択した場合は worker を作り直さない (= 既存
 //! VideoTileState を流用)。
+//!
+//! ## 描画
+//!
+//! 描画自体は `src/video/native_presenter/overlay_draw.rs::draw_native_tile_overlay`
+//! が native overlay 上で行う。本モジュールは `VideoTileState` の生成 / トグル /
+//! クローズと、間隔自動選択など描画と独立した算出ロジックだけを持つ。
 
 use std::path::PathBuf;
 
@@ -20,7 +26,7 @@ use eframe::egui;
 
 use crate::app::App;
 use crate::fs_animation::FsCacheEntry;
-use crate::video::tile_thumbnails::{TileThumbnail, TileThumbnailWorker};
+use crate::video::tile_thumbnails::TileThumbnailWorker;
 
 // 列数候補は `crate::settings::VIDEO_TILE_COLUMN_CANDIDATES` (= 6/10/16/20/26/30)。
 // `Settings.video_tile_columns` が source of truth。Ctrl+Wheel で次/前の候補に
@@ -54,15 +60,9 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn toggle_video_tile_mode(&mut self, fs_idx: usize, screen_size: egui::Vec2) {
         if self.video_tile_state.is_some() {
-            // Codex P5.5 H2 反映: state Drop だけでは texture cache がクリアされない
-            // (Drop impl が無いため)。閉じる側で明示的にクリアしてリーク防止。
             self.close_video_tile_mode();
             return;
         }
-        // 古い texture が残っていれば再 open 前にもクリア (= 異なる動画 / 異なる
-        // 列数の grid から切り替えるとき、古いキーで残った texture が誤マッチする
-        // のを防ぐ)。
-        self.video_tile_textures.clear();
         self.video_tile_state = self.build_video_tile_state_for(fs_idx, screen_size);
     }
 
@@ -75,7 +75,6 @@ impl App {
         self.video_tile_swap_pending = None;
         self.video_tile_reopen_pending = false;
         self.video_tile_reopen_deadline = None;
-        self.video_tile_textures.clear();
         was_open
     }
 
@@ -117,8 +116,8 @@ impl App {
         // - マルチモニターで FS 幅が違ってもキャッシュ再利用可 (= ユーザー環境の
         //   最大解像度モニターを基準にすると、どのモニター上で再生しても同じ
         //   tile_w で抽出された 1 つのキャッシュ行に集約される)
-        // egui の painter.image() が tile_rect にスケールするので描画側は再抽出不要。
-        // モニター情報が取れない場合のフォールバックは 640px (4K/6 ≈ 640 相当)。
+        // native overlay の描画スケールは tile_rect に合わせて適用するので描画側は
+        // 再抽出不要。モニター情報が取れない場合のフォールバックは 640px (4K/6 ≈ 640 相当)。
         let max_screen_w = crate::monitor::max_monitor_pixel_width().unwrap_or(3840) as f32;
         let min_columns = *crate::settings::VIDEO_TILE_COLUMN_CANDIDATES
             .iter()
@@ -159,7 +158,7 @@ impl App {
             .unwrap_or(0);
         let cache = self.video_tile_cache.clone();
         // worker には extract サイズ (= 最大列幅) を渡す。描画用の tile_w/tile_h は
-        // VideoTileState に持って egui の painter.image スケーリングに使う。
+        // VideoTileState に持って native overlay 側の描画でスケーリングに使う。
         let worker = TileThumbnailWorker::spawn(
             path.clone(),
             timestamps.clone(),
@@ -177,299 +176,6 @@ impl App {
             tile_h,
             columns,
         })
-    }
-
-    /// 動画タイル モードのオーバーレイを描画する。再生中の他の入力 (= クリック →
-    /// toggle_play、ジャンプパネル等) は **タイルモード中は抑止** する想定で、
-    /// 呼び出し側 (ui_fullscreen) で early-return する。
-    /// 戻り値: モードが描画された (= active) ら true。
-    #[cfg(windows)]
-    pub(crate) fn draw_video_tile_overlay(
-        &mut self,
-        ui: &mut egui::Ui,
-        ctx: &egui::Context,
-        full_rect: egui::Rect,
-        fs_idx: usize,
-    ) -> bool {
-        // state から必要な値を **コピー** して借用を切る (= 後で self を mutable borrow
-        // するため)。snapshot / progress / is_finished は全て Arc<Mutex> 越しのコピーなので
-        // 軽い。
-        let (
-            state_video_path,
-            state_interval_secs,
-            state_timestamps,
-            state_tile_w,
-            state_tile_h,
-            state_columns,
-            snapshot,
-            progress_done,
-            progress_total,
-            worker_finished,
-        ) = {
-            let Some(state) = self.video_tile_state.as_ref() else {
-                return false;
-            };
-            let (done, total) = state.worker.progress();
-            (
-                state.video_path.clone(),
-                state.interval_secs,
-                state.timestamps.clone(),
-                state.tile_w,
-                state.tile_h,
-                state.columns,
-                state.worker.snapshot(),
-                done,
-                total,
-                state.worker.is_finished(),
-            )
-        };
-
-        // 動画切替を検知 → 自動 close
-        let cur_path = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => Some(player.path().clone()),
-            _ => None,
-        };
-        if cur_path.as_ref() != Some(&state_video_path) {
-            let swap_pending_for_current =
-                self.video_tile_swap_pending
-                    .as_ref()
-                    .is_some_and(|pending| {
-                        pending.target_idx == fs_idx
-                            && cur_path.as_ref() == Some(&pending.target_path)
-                    });
-            if swap_pending_for_current {
-                let painter = ui.painter().clone();
-                painter.rect_filled(
-                    full_rect,
-                    0.0,
-                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 230),
-                );
-                painter.text(
-                    full_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "動画を準備中...",
-                    egui::FontId::proportional(20.0),
-                    egui::Color32::from_gray(180),
-                );
-                return true;
-            }
-            self.video_tile_state = None;
-            self.video_tile_swap_pending = None;
-            self.video_tile_textures.clear();
-            return false;
-        }
-
-        // 黒背景で全画面を覆う
-        let painter = ui.painter().clone();
-        painter.rect_filled(
-            full_rect,
-            0.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 230),
-        );
-        // 背景クリックを消費 (= toggle_play などの catch-all を抑止)
-        let _ = ui.interact(
-            full_rect,
-            egui::Id::new(("video_tile_bg", fs_idx)),
-            egui::Sense::click(),
-        );
-
-        // タイトル + 進捗
-        let header = format!(
-            "タイル モード — 間隔 {} / 進捗 {progress_done}/{progress_total} (S または ESC で閉じる)",
-            format_interval(state_interval_secs)
-        );
-        painter.text(
-            egui::pos2(full_rect.min.x + 16.0, full_rect.min.y + 24.0),
-            egui::Align2::LEFT_CENTER,
-            header,
-            egui::FontId::proportional(14.0),
-            egui::Color32::from_rgb(220, 220, 220),
-        );
-
-        // タイルグリッド
-        let columns = state_columns;
-        let tile_w = state_tile_w as f32;
-        let tile_h = state_tile_h as f32;
-        let label_h = 16.0;
-        let gap_x = 6.0;
-        let gap_y = 6.0;
-        let total_grid_w = (tile_w + gap_x) * columns as f32 - gap_x;
-        let grid_left = full_rect.min.x + (full_rect.width() - total_grid_w) * 0.5;
-        let grid_top = full_rect.min.y + 56.0;
-
-        let mut clicked_pts: Option<f64> = None;
-
-        for (idx, slot) in snapshot.iter().enumerate() {
-            let col = idx % columns;
-            let row = idx / columns;
-            let x0 = grid_left + (tile_w + gap_x) * col as f32;
-            let y0 = grid_top + (tile_h + label_h + gap_y) * row as f32;
-            let tile_rect =
-                egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(tile_w, tile_h));
-            // 画面下端を超えるタイルはスキップ (描画しない、列の続きが画面外に出る場合)
-            if tile_rect.max.y > full_rect.max.y - 20.0 {
-                continue;
-            }
-            // 背景 (黒くより淡い灰色) + サムネ画像 + 枠
-            painter.rect_filled(
-                tile_rect,
-                4.0,
-                egui::Color32::from_rgba_unmultiplied(35, 35, 40, 255),
-            );
-            if let Some(t) = slot {
-                let tex_id = self.upload_video_tile_texture(ctx, idx, t);
-                painter.image(
-                    tex_id,
-                    tile_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
-            } else {
-                painter.text(
-                    tile_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "...",
-                    egui::FontId::proportional(20.0),
-                    egui::Color32::from_gray(120),
-                );
-            }
-            painter.rect_stroke(
-                tile_rect,
-                4.0,
-                egui::Stroke::new(1.0, egui::Color32::from_gray(80)),
-                egui::StrokeKind::Inside,
-            );
-            // mm:ss ラベル (タイル直下)
-            let pts = state_timestamps.get(idx).copied().unwrap_or(0.0);
-            painter.text(
-                egui::pos2(tile_rect.center().x, tile_rect.max.y + label_h * 0.5),
-                egui::Align2::CENTER_CENTER,
-                crate::ui_helpers::format_hms(pts),
-                egui::FontId::proportional(12.0),
-                egui::Color32::from_rgb(220, 220, 220),
-            );
-
-            // クリック判定
-            let resp = ui.interact(
-                tile_rect,
-                egui::Id::new(("video_tile", fs_idx, idx)),
-                egui::Sense::click(),
-            );
-            if resp.hovered() {
-                ctx.set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            if resp.clicked() {
-                clicked_pts = Some(pts);
-            }
-        }
-
-        // Ctrl+Wheel で列数候補を切替。タイル中のみ有効。
-        // ⚠️ egui 0.33 は Ctrl+Wheel を「ズーム入力」と判定して `smooth_scroll_delta`
-        // ではなく `zoom_factor_delta` 側に流すため、smooth 経由では値が来ない。
-        // 一方 `raw_scroll_delta` は modifier に関わらず生 delta が積まれるので、
-        // Ctrl 押下時はそちらを使う。1 ノッチで連続発火しないよう raw / smooth /
-        // 該当 MouseWheel イベントを全て消費する。
-        let wheel_y = ctx.input_mut(|i| {
-            if i.modifiers.ctrl {
-                let y = i.raw_scroll_delta.y;
-                if y.abs() > 0.5 {
-                    i.raw_scroll_delta.y = 0.0;
-                    i.smooth_scroll_delta.y = 0.0;
-                    i.events
-                        .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
-                }
-                y
-            } else {
-                0.0
-            }
-        });
-        if wheel_y.abs() > 0.5 {
-            let cur = self.settings.video_tile_columns;
-            let cands = crate::settings::VIDEO_TILE_COLUMN_CANDIDATES;
-            let idx = cands.iter().position(|&v| v == cur).unwrap_or(1);
-            // wheel_y > 0 = 上回転 = 列数を **減らす** (= 1 タイルが大きくなる、直感的)
-            // wheel_y < 0 = 下回転 = 列数を **増やす**
-            let new_idx = if wheel_y > 0.0 {
-                idx.saturating_sub(1)
-            } else {
-                (idx + 1).min(cands.len() - 1)
-            };
-            if new_idx != idx {
-                let new_cols = cands[new_idx];
-                self.settings.video_tile_columns = new_cols;
-                self.settings.save();
-                // 列数変わると tile_w/tile_h と timestamps が変わるので、現在の
-                // state を捨てて再 spawn。
-                let video_path = state_video_path.clone();
-                let cur_path = match self.fs_cache.get(&fs_idx) {
-                    Some(FsCacheEntry::Video { player, .. }) => Some(player.path().clone()),
-                    _ => None,
-                };
-                if cur_path.as_ref() == Some(&video_path) {
-                    self.video_tile_state = None;
-                    self.video_tile_swap_pending = None;
-                    self.video_tile_textures.clear();
-                    let screen = ctx.content_rect().size();
-                    self.toggle_video_tile_mode(fs_idx, screen);
-                }
-                return true;
-            }
-        }
-
-        // タイル抽出が進行中なら毎フレーム repaint (= 進捗を反映)。
-        if !worker_finished {
-            ctx.request_repaint_after(std::time::Duration::from_millis(80));
-        }
-
-        if let Some(pts) = clicked_pts {
-            // クリック → seek + 再生開始 + close
-            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                player.seek(pts);
-                player.set_playing(true);
-            }
-            self.video_tile_state = None;
-            self.video_tile_swap_pending = None;
-            self.video_tile_textures.clear();
-        }
-
-        true
-    }
-
-    /// タイル 1 個分のテクスチャをアップロード (キャッシュは簡易: id ごとに 1 件保持
-    /// で、別 idx で上書き)。Phase 5.5 では VideoTileState 内に専用キャッシュを
-    /// 持たないシンプル実装。再描画ごとに texture が増える可能性があるため、
-    /// 期間が長いタスクで GPU メモリを食う場合は将来的にキャッシュ追加。
-    #[cfg(windows)]
-    fn upload_video_tile_texture(
-        &mut self,
-        ctx: &egui::Context,
-        slot_idx: usize,
-        thumb: &TileThumbnail,
-    ) -> egui::TextureId {
-        let key = (
-            slot_idx as u64,
-            thumb.pts_secs.to_bits(),
-            thumb.width,
-            thumb.height,
-        );
-        // 既存キャッシュにヒットすればそのまま返す
-        if let Some((k, tex)) = self.video_tile_textures.get(&slot_idx) {
-            if *k == key {
-                return tex.id();
-            }
-        }
-        let img = egui::ColorImage::from_rgba_unmultiplied(
-            [thumb.width as usize, thumb.height as usize],
-            &thumb.rgba,
-        );
-        let tex = ctx.load_texture(
-            format!("video_tile:{slot_idx}"),
-            img,
-            egui::TextureOptions::LINEAR,
-        );
-        let id = tex.id();
-        self.video_tile_textures.insert(slot_idx, (key, tex));
-        id
     }
 }
 
@@ -497,15 +203,6 @@ fn generate_timestamps(duration_secs: f64, interval_secs: f64, max_count: usize)
         t += interval_secs;
     }
     out
-}
-
-fn format_interval(secs: f64) -> String {
-    if secs >= 60.0 {
-        let m = (secs / 60.0).round() as i64;
-        format!("{m} 分")
-    } else {
-        format!("{} 秒", secs.round() as i64)
-    }
 }
 
 #[cfg(test)]

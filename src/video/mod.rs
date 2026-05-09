@@ -7,8 +7,10 @@
 //! - **音声出力** (`cpal` Stream)
 //! - **AV マスタークロック** ([`clock::AvClock`])
 //!
-//! を持つ。UI スレッドは [`VideoPlayer::tick`] を毎フレーム呼んで、再生位置に応じた
-//! 動画フレームを GPU テクスチャ ([`egui::TextureHandle`]) に in-place で書き込む。
+//! を持つ。UI スレッドは [`VideoPlayer::tick`] を毎フレーム呼ぶが、フレームの実体描画は
+//! native presenter (`crate::video::native_presenter`、独立 Win32 HWND + D3D11 swap chain) が
+//! デコーダ出力を直接受け取って行う。`tick` は再生制御ステート / ホバーサムネイル要求 /
+//! repaint hint だけを扱う。
 //!
 //! ## 配布要件
 //! `vendor/ffmpeg/bin/*.dll` (BtbN LGPL shared build) を `include_bytes!` で
@@ -43,8 +45,6 @@ pub mod upscale;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
-
-use egui::{ColorImage, TextureHandle, TextureOptions};
 
 use clock::AvClock;
 use decoder::{DecodeHandles, VideoFrame, VideoFrameData, VideoInfo};
@@ -127,8 +127,6 @@ pub struct VideoPlayer {
     #[allow(dead_code)]
     audio: Option<audio::AudioOutput>,
     info: Option<VideoInfo>,
-    /// 最新フレームのテクスチャ。最初の有効フレーム到着時に作成、その後は in-place set。
-    texture: Option<TextureHandle>,
     /// open 失敗 / DLL ロード失敗のメッセージ。Some なら UI は赤字エラー表示する。
     error: Option<String>,
     /// シーク先サムネ抽出ワーカー。Drop で停止する。
@@ -171,31 +169,6 @@ struct NativeHoverThumbnailKey {
     height: u32,
     rgba_ptr: usize,
 }
-
-/// `VideoPlayer::gpu_latest_info()` が返す view-only 情報。Copy なので
-/// `FsFrameState` などの構造体に値で持たせて safe。HANDLE の寿命は
-/// `VideoPlayer.gpu_latest` (= D3d11Frame) が保証する。
-#[cfg(windows)]
-#[derive(Clone, Copy)]
-pub struct GpuLatestFrame {
-    pub shared_handle: windows::Win32::Foundation::HANDLE,
-    pub width: u32,
-    pub height: u32,
-    pub ten_bit: bool,
-    /// このフレームの GPU 完了に対応する fence 値。wgpu 側で
-    /// `ID3D12CommandQueue::Wait(fence, fence_value)` してから sample する。
-    pub fence_value: u64,
-    /// fence の NT shared handle (`GpuVideoDevice` 寿命中は同じ値)。
-    /// wgpu 側で `OpenSharedHandle` するが、所有権は `GpuVideoDevice` が持っているので
-    /// このフィールドからは close しない。
-    pub fence_shared_handle: windows::Win32::Foundation::HANDLE,
-    /// プロセス内ユニークな fence 世代 ID。wgpu 側のキャッシュキー (Codex P1)。
-    pub fence_gen: u64,
-}
-
-// HANDLE は thread を渡って良い (D3d11Frame と同様の論理)。
-#[cfg(windows)]
-unsafe impl Send for GpuLatestFrame {}
 
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug)]
@@ -412,6 +385,11 @@ pub(crate) struct NativeVideoOutput {
     last_checked: AtomicBool,
     command_tx: std::sync::mpsc::Sender<NativeVideoOutputCommand>,
     event_rx: std::sync::Mutex<std::sync::mpsc::Receiver<(u64, NativeVideoOutputEvent)>>,
+    /// Presenter thread 内で起きた fatal init error (`CoInitializeEx` /
+    /// `NativeVideoWindow::create` / `NativeVideoPresenter::new` 失敗) を
+    /// VideoPlayer に伝えるための one-shot ストレージ。
+    /// `take_init_error` で 1 度だけ取り出し、`VideoPlayer.error` に転写する。
+    init_error: Arc<Mutex<Option<String>>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -437,11 +415,13 @@ impl NativeVideoOutput {
         let initial_checked = config.checked;
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let (command_tx, command_rx) = std::sync::mpsc::channel();
+        let init_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let thread_cancel = Arc::clone(&cancel);
         let thread_hwnd = Arc::clone(&hwnd);
         let thread_first_presented = Arc::clone(&first_presented);
         let thread_closed = Arc::clone(&closed);
         let thread_perf_overlay_visible = Arc::clone(&perf_overlay_visible);
+        let thread_init_error = Arc::clone(&init_error);
         let thread = match std::thread::Builder::new()
             .name("native-video-presenter".into())
             .spawn(move || {
@@ -457,12 +437,30 @@ impl NativeVideoOutput {
                     command_rx,
                     event_tx,
                     thread_cancel,
-                    thread_hwnd,
+                    Arc::clone(&thread_hwnd),
                     thread_first_presented,
-                    thread_closed,
+                    Arc::clone(&thread_closed),
                     thread_perf_overlay_visible,
                 ) {
                     crate::logger::log(format!("[native-video] presenter stopped: {err}"));
+                    // run_native_video_output が Err で抜けた = init 失敗または run 中の致命的
+                    // エラー。VideoPlayer 側に必ず通知できるよう、init_error にメッセージを
+                    // 保存してから closed=true を立てる。
+                    //
+                    // ⚠ publish 順序が重要: `init_error` 書き込み → `closed.store(true, Release)`
+                    // の順にしないと、UI thread が `closed.load(Acquire)=true` を観測した時点で
+                    // `init_error` がまだ書かれておらず、エラー toast が出ないレースが起きる
+                    // (Codex P3 指摘)。Release/Acquire ペアで closed=true 観測後の init_error
+                    // 読み出しを happens-before に乗せる。
+                    if let Ok(mut slot) = thread_init_error.lock() {
+                        if slot.is_none() {
+                            *slot = Some(format!(
+                                "ネイティブ動画プレゼンターの初期化に失敗しました: {err}"
+                            ));
+                        }
+                    }
+                    thread_hwnd.store(0, Ordering::Release);
+                    thread_closed.store(true, Ordering::Release);
                 }
             }) {
             Ok(thread) => thread,
@@ -482,6 +480,7 @@ impl NativeVideoOutput {
             last_checked: AtomicBool::new(initial_checked),
             command_tx,
             event_rx: std::sync::Mutex::new(event_rx),
+            init_error,
             thread: Some(thread),
         })
     }
@@ -496,6 +495,13 @@ impl NativeVideoOutput {
 
     fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
+    }
+
+    /// presenter thread 内で起きた fatal init error を 1 度だけ取り出す。
+    /// VideoPlayer::tick が毎フレーム pull し、Some なら `self.error` に転写して
+    /// UI に赤字エラーを表示させる。
+    fn take_init_error(&self) -> Option<String> {
+        self.init_error.lock().ok().and_then(|mut g| g.take())
     }
 
     #[allow(dead_code)]
@@ -799,6 +805,8 @@ fn native_drain_unpresented_queue(queue: &mut std::collections::VecDeque<VideoFr
     queue.clear();
 }
 
+/// 環境変数を「真偽値」として読む。`""`/`"0"`/`"false"`/`"off"`/`"no"`
+/// (大小無視) を false、未設定時は `default` を返す。
 #[cfg(windows)]
 fn native_video_env_flag_enabled(name: &str, default: bool) -> bool {
     std::env::var(name)
@@ -811,11 +819,6 @@ fn native_video_env_flag_enabled(name: &str, default: bool) -> bool {
                 || v.eq_ignore_ascii_case("no"))
         })
         .unwrap_or(default)
-}
-
-#[cfg(windows)]
-pub fn native_presenter_enabled_by_env() -> bool {
-    native_video_env_flag_enabled("MIV_NATIVE_VIDEO_PRESENTER", true)
 }
 
 #[cfg(windows)]
@@ -1025,7 +1028,9 @@ fn run_native_video_output(
         Err(err) => {
             hwnd_out.store(0, Ordering::Release);
             window.destroy();
-            closed.store(true, Ordering::Release);
+            // closed=true / init_error の write は spawn closure 側で一括して行う
+            // (Release ordering を init_error の後ろに置く必要があるため)。ここでは
+            // hwnd=0 + window.destroy() の即時クリーンアップのみで Err を返す。
             return Err(err);
         }
     };
@@ -1926,9 +1931,6 @@ fn run_native_video_output(
     Ok(())
 }
 
-#[cfg(windows)]
-unsafe impl Sync for GpuLatestFrame {}
-
 /// `future_frames` キューの最大長。decoder の `video_tx` (= 24) と揃える。
 /// 1080p RGBA で 24 × ~8MB = 192MB 程度 (CPU 経路の上限)。GPU 経路では
 /// 1 frame ≈ HANDLE+メタのみで実コストは無視できる。decoder の burst-stall
@@ -2050,7 +2052,6 @@ impl VideoPlayer {
                 decode: dummy_decode_handles(),
                 audio: None,
                 info: None,
-                texture: None,
                 error: Some(format!("FFmpeg DLL のロードに失敗しました: {e}")),
                 thumb_worker: None,
                 future_frames: std::collections::VecDeque::new(),
@@ -2168,21 +2169,50 @@ impl VideoPlayer {
         let frame_step_active = Arc::new(AtomicBool::new(false));
         #[cfg(windows)]
         let duration_secs_bits = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
+        // 動画は native presenter (独立 HWND + D3D11 swap chain) を必須とする。
+        // config が無い (= モニター情報取得失敗) / spawn が失敗 (= スレッド生成失敗) の
+        // どちらでも、UI に表示するフレームの実体経路がないので、その時点で player の
+        // `error` フィールドにメッセージを入れる。UI は赤字エラーで「読込失敗」を表示し、
+        // displayed_frame_seq=0 のままなので "動画を準備中..." の無限ループに陥らない。
         #[cfg(windows)]
-        let native_output = native_output_config.and_then(|config| {
-            NativeVideoOutput::spawn(
-                native_video_rx,
-                Arc::clone(&clock),
-                engine_event_tx.clone(),
-                Arc::clone(&displayed_frame_seq),
-                Arc::clone(&last_displayed_pts_bits),
-                Arc::clone(&frame_step_active),
-                Arc::clone(&duration_secs_bits),
-                config,
-            )
-        });
+        let (native_output, native_init_error): (
+            Option<NativeVideoOutput>,
+            Option<String>,
+        ) = {
+            match native_output_config {
+                None => (
+                    None,
+                    Some(
+                        "ネイティブ動画プレゼンターの設定取得に失敗しました (モニター情報を取れません)"
+                            .to_string(),
+                    ),
+                ),
+                Some(config) => match NativeVideoOutput::spawn(
+                    native_video_rx,
+                    Arc::clone(&clock),
+                    engine_event_tx.clone(),
+                    Arc::clone(&displayed_frame_seq),
+                    Arc::clone(&last_displayed_pts_bits),
+                    Arc::clone(&frame_step_active),
+                    Arc::clone(&duration_secs_bits),
+                    config,
+                ) {
+                    Some(output) => (Some(output), None),
+                    None => (
+                        None,
+                        Some(
+                            "ネイティブ動画プレゼンターの起動に失敗しました (スレッド生成エラー)"
+                                .to_string(),
+                        ),
+                    ),
+                },
+            }
+        };
 
-        let player = Self {
+        #[cfg(not(windows))]
+        let native_init_error: Option<String> = None;
+
+        let mut player = Self {
             path,
             clock,
             engine,
@@ -2208,8 +2238,7 @@ impl VideoPlayer {
             },
             audio,
             info: None,
-            texture: None,
-            error: None,
+            error: native_init_error,
             thumb_worker,
             future_frames: std::collections::VecDeque::new(),
             pending_resume_secs: resume_secs,
@@ -2225,6 +2254,13 @@ impl VideoPlayer {
             #[cfg(windows)]
             native_hover_thumbnail_sent_key: Mutex::new(None),
         };
+        // 同期 init error (config=None / spawn=None) の場合、すでに走っている
+        // decoder / audio / thumbnail worker を停止する。`tick()` は
+        // `error.is_some()` で早期 return するので、放置すると裏で再生パイプライン
+        // だけが回り続ける。
+        if player.error.is_some() {
+            player.shutdown_workers_for_error();
+        }
         crate::logger::log(format!(
             "[video-debug] VideoPlayer::open done path={} autoplay={} volume={:.2} engine_state={} resume_secs={:?} video_rx_len={} audio_rx_len={}",
             player.path.display(),
@@ -2805,7 +2841,7 @@ impl VideoPlayer {
 
     /// UI スレッドが毎フレーム呼ぶ。新しい info / video frame があれば反映する。
     /// 戻り値は次回再描画推奨時刻 (秒) — `ctx.request_repaint_after` に渡す目安。
-    pub fn tick(&mut self, ctx: &egui::Context) -> Option<std::time::Duration> {
+    pub fn tick(&mut self, _ctx: &egui::Context) -> Option<std::time::Duration> {
         // Phase 3c: engine_event channel の drain を **tick の冒頭** で行う。
         // decoder/audio thread から push された events を engine.handle_*_event に
         // dispatch する。EngineActor は state machine のみ更新し、AvClock の挙動には
@@ -2874,6 +2910,30 @@ impl VideoPlayer {
                         self.error = Some(e);
                         return None;
                     }
+                }
+            }
+        }
+
+        // Native presenter thread 内で起きた fatal init error を取り込む
+        // (= CoInit / NativeVideoWindow::create / NativeVideoPresenter::new 失敗)。
+        // VideoPlayer::open() の同期エラーと同じ経路で UI に赤字エラーを表示し、
+        // 同時に decoder/audio worker を停止して裏で再生パイプラインが残らないようにする。
+        //
+        // Race close: writer は (init_error 書き込み) → (closed.store(true, Release)) の順で
+        // publish するので、reader が `closed=true` を Acquire load で観測した時点で
+        // init_error も必ず見える。1 度目の take_init_error が None でも、その直後に
+        // is_closed=true なら writer が我々を追い越して両方書いた可能性があるので
+        // もう 1 度 take する (Codex P3 race 指摘)。
+        #[cfg(windows)]
+        if self.error.is_none() {
+            if let Some(out) = self.native_output.as_ref() {
+                let mut init_err = out.take_init_error();
+                if init_err.is_none() && out.is_closed() {
+                    init_err = out.take_init_error();
+                }
+                if let Some(err) = init_err {
+                    self.error = Some(err);
+                    self.shutdown_workers_for_error();
                 }
             }
         }
@@ -3016,7 +3076,7 @@ impl VideoPlayer {
 
         // 最新フレームをテクスチャに反映
         let mut displayed_pts: Option<f64> = None;
-        let mut upload_ms: f64 = 0.0;
+        let upload_ms: f64 = 0.0;
         if let Some(frame) = latest_renderable {
             let pts_for_log = frame.pts_secs;
             // GPU フレームは `gpu_latest` に **所有権ごと** 引き取り、UI は handle を
@@ -3086,12 +3146,7 @@ impl VideoPlayer {
                     // perf event below. Returning here used to hide UI-side frame
                     // batching from perf logs on the D3D11VA path.
                 }
-                decoder::VideoFrameData::Cpu(b) => {
-                    let cpu_bytes = b.as_slice();
-                    let color = ColorImage::from_rgba_unmultiplied(
-                        [frame.width as usize, frame.height as usize],
-                        cpu_bytes,
-                    );
+                decoder::VideoFrameData::Cpu(_b) => {
                     // override は frame.pts が override target 近傍のときだけ解除する。
                     // backward seek が外れて pts ≈ 元位置のフレームが新世代 serial で来た
                     // 場合に override を消すと、シークバーが target → 元位置にスナップバック
@@ -3144,18 +3199,10 @@ impl VideoPlayer {
                             ],
                         );
                     }
-                    let upload_t0 = std::time::Instant::now();
-                    match self.texture.as_mut() {
-                        Some(tex) => {
-                            tex.set(color, TextureOptions::LINEAR);
-                        }
-                        None => {
-                            let label = format!("video:{}", self.path.display());
-                            self.texture =
-                                Some(ctx.load_texture(label, color, TextureOptions::LINEAR));
-                        }
-                    }
-                    upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+                    // CPU フレームの実際の pixel upload は native presenter
+                    // (`native_presenter/mod.rs`) が `UpdateSubresource` 経由で行う。
+                    // ここに到達する経路は native_output を持たない非 Windows ビルド等
+                    // 限定的なケースで、実際の表示は行われない (PTS bookkeeping のみ)。
                     self.emit_first_frame_event(pts_for_log);
                     self.last_displayed_pts_bits
                         .store(pts_for_log.to_bits(), Ordering::Release);
@@ -3226,10 +3273,6 @@ impl VideoPlayer {
         } else {
             None
         }
-    }
-
-    pub fn texture(&self) -> Option<&TextureHandle> {
-        self.texture.as_ref()
     }
 
     #[cfg(windows)]
@@ -3323,21 +3366,48 @@ impl VideoPlayer {
         self.decode.audio_rx.len()
     }
 
-    /// GPU 経路で最新表示フレームの view-only 情報 (handle / dims)。
-    /// Some なら UI は `egui::PaintCallback` 経由で `VideoPaintCallback` を発行する。
-    /// HANDLE の寿命は本構造体内の `D3d11Frame` が保証する (= 次フレームに置換される
-    /// まで close されない)。
+    /// presenter thread 内 init error を取り込んで `self.error` に転写する。
+    /// App 側 (`update_video_state`) が `native_presenter_closed()` を観測したタイミングで
+    /// 防御的に呼ぶ — `closed=true` を Acquire load で観測した時点で、writer の
+    /// init_error 書き込み (Release-before) が必ず可視なので、ここで take すれば
+    /// tick との二重 race も含めて確実に拾える。冪等。
+    ///
+    /// `app` module は bin 専属で lib からは見えないので、lib 単独 build では
+    /// caller 不在に見える。
     #[cfg(windows)]
-    pub fn gpu_latest(&self) -> Option<GpuLatestFrame> {
-        self.gpu_latest.as_ref().map(|d| GpuLatestFrame {
-            shared_handle: d.shared_handle,
-            width: d.width,
-            height: d.height,
-            ten_bit: d.ten_bit,
-            fence_value: d.fence_value,
-            fence_shared_handle: d.fence_shared_handle,
-            fence_gen: d.fence_gen,
-        })
+    #[allow(dead_code)]
+    pub(crate) fn consume_native_init_error(&mut self) {
+        if self.error.is_some() {
+            return;
+        }
+        if let Some(out) = self.native_output.as_ref() {
+            if let Some(err) = out.take_init_error() {
+                self.error = Some(err);
+                self.shutdown_workers_for_error();
+            }
+        }
+    }
+
+    /// `error` を立てた直後に裏で動き続けている decoder / audio / thumbnail worker を
+    /// 停止する。`open()` の native_output_config=None / spawn 失敗パスと、
+    /// presenter thread 内 init 失敗を `tick()` で検知したパスから呼ぶ。
+    ///
+    /// 内部的には `shutdown()` と同じ処理 (cancel フラグ + audio drop) に加えて
+    /// thumbnail worker も解放する。完全 idempotent なので open() から複数回呼んでも安全。
+    fn shutdown_workers_for_error(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.pause_audio_output();
+        self.clear_audio_output_buffer();
+        self.audio.take();
+        self.thumb_worker.take();
+        #[cfg(windows)]
+        {
+            if let Some(mut frame) = self.gpu_latest.take() {
+                frame.reset_unpresented_shared_output();
+            }
+            native_drain_unpresented_queue(&mut self.future_frames);
+        }
     }
 
     /// Drop 前に明示的に呼ぶと、AudioOutput の停止 (cpal Stream pause/drop +

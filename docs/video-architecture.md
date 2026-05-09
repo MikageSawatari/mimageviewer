@@ -17,22 +17,31 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 **スコープ外**: NVIDIA RTX VSR / Super Resolution、HDR 表示、外部プレイヤー (この機能はあり)、
 動画編集機能。
 
-## 採用アーキテクチャ: D 経路 (zero-copy interop) + 自動 fallback
+## 採用アーキテクチャ: native presenter (独立 HWND + D3D11 swap chain) 必須
+
+旧版では「DX12 wgpu backend なら egui_wgpu callback で zero-copy GPU 描画、それ以外
+なら CPU readback + `ctx.load_texture` で egui::Image 描画」の二経路 + 自動フォール
+バック構成だったが、v0.9 系で **native presenter** (`src/video/native_presenter`、
+独立 Win32 HWND + 自前 D3D11 swap chain + DirectComposition) に統一済み。
+動画再生は **常に native presenter 経路を必須**とする (旧 egui 描画パスと
+`MIV_NATIVE_VIDEO_PRESENTER` フォールバック環境変数は削除済み)。
 
 ```
 [起動時]
-  wgpu の backend (cc.adapter.get_info().backend) を確認
-  ↓
-  ├─ DX12 → GpuVideoDevice 作成 → 「GPU 経路」(zero-copy)
-  │       ローカル native の 99% のケース、4K@30/60fps 滑らか
-  │
-  └─ Vulkan/WARP/etc. → GpuVideoDevice 作成しない → 「CPU 経路」
-          リモデ等の限定環境、1080p 程度なら動く、4K は重い
+  GpuVideoDevice 作成 (mIV 専用の D3D11 device + VideoProcessor + Fence)
+    ├─ 成功: HW decoder (D3D11VA) + GPU blit が使える
+    └─ 失敗: 動画は SW decode + CPU upload に fallback (decoder 内部で完結)
+
+[動画フルスクリーン open]
+  NativeVideoPresenter (独立 HWND + DComp visual tree) を生成
+  decoder thread → video_tx → native_output thread が pull → 自前 swap chain に present
 ```
 
-`VideoPlayer::tick(ctx)` の API は両経路で統一。経路の違いは内部にカプセル化される。
+`VideoPlayer::tick(_ctx)` は再生制御 / repaint hint / ホバーサムネイル要求のみ扱う。
+フレームの実体描画は native presenter 内のスレッドが行うため、`tick` で受け取る
+`egui::Context` は実質未使用 (互換のため引数だけ残してある)。
 
-### GPU 経路の内部フロー
+### GPU フレームの内部フロー (HW decoder 利用時)
 
 ```
 FFmpeg HW decoder (D3D11VA)
@@ -45,21 +54,18 @@ NT 共有 ID3D11Texture2D (BGRA8、KEYEDMUTEX 付き)
     ↓
 ID3D11Fence::Signal (共有 fence で blit 完了通知)
     ↓
-[ チャネル経由で UI thread へ ]
+[ video_tx (bounded mpsc) で UI / native presenter thread へ ]
     ↓
-ID3D12Device::OpenSharedHandle → ID3D12Resource (wgpu DX12 backend)
-    ↓
-wgpu_hal::dx12::Device::texture_from_raw → wgpu::Texture
-    ↓
-ID3D12CommandQueue::Wait (fence) で blit 完了を待つ
-    ↓
-egui_wgpu::CallbackTrait で fullscreen quad に貼って描画
+NativeVideoPresenter (= 独立 HWND を持つ別スレッド)
+    ├─ ID3D11Device::OpenSharedHandle で受信 → ID3D11Texture2D
+    ├─ KEYEDMUTEX 取得 + Fence Wait で同期
+    └─ CopyResource → swap chain backbuffer → Present (DComp visual tree 内)
 ```
 
-### CPU 経路 (fallback) の内部フロー
+### CPU フレームの内部フロー (HW decoder 失敗 / 非対応コーデック時)
 
 ```
-FFmpeg HW decoder (D3D11VA) or SW decoder
+FFmpeg SW decoder (or HW フォールバック後の swscale)
     ↓
 AVFrame
     ↓
@@ -69,10 +75,18 @@ libavfilter bwdif (設定が Auto/On かつ対象フレーム/ストリームの
     ↓
 swscale (NV12/YUV → RGBA、CPU で 24MB allocation)
     ↓
-ctx.load_texture (CPU→GPU、26-58ms@4K)
+[ video_tx (bounded mpsc) で native presenter thread へ ]
     ↓
-egui::Image で描画
+NativeVideoPresenter::present (CPU 経路ブランチ)
+    └─ ID3D11DeviceContext::UpdateSubresource で backbuffer に upload → Present
 ```
+
+旧 egui 描画パス (`gpu_renderer::video_paint::VideoPaintCallback` /
+`wgpu_import::import_shared_d3d11_texture` / `VideoPlayer::texture` /
+`ctx.load_texture` 経由の `egui::Image` 表示) は撤去済み。互換のため
+`gpu_renderer::d3d11_device` (= `GpuVideoDevice`) と `gpu_renderer::ffmpeg_d3d11`
+(= FFmpeg D3D11VA hw_device_ctx 共有) は残っており、decoder と native presenter の
+共通基盤として機能する。
 
 ## モジュール構成 (v0.9.0 時点)
 
@@ -98,12 +112,10 @@ src/video/
 ├── native_presenter/       # ネイティブ DComp プレゼンター + egui overlay
 │   ├── mod.rs              # NativeVideoPresenter / NativeEguiOverlay impl (3900 行級)
 │   └── overlay_draw.rs     # native overlay 描画・layout helper (2300 行級)
-├── gpu_renderer/           # ★ DX12 backend 時のみ active、unsafe を局所化
-│   ├── mod.rs              # 公開 API: GpuVideoDevice, D3d11Frame, VideoPipeline 等 (57 行)
+├── gpu_renderer/           # decoder + native presenter の D3D11 共有基盤、unsafe を局所化
+│   ├── mod.rs              # 公開 API: GpuVideoDevice, D3d11Frame, GpuVideoError, VideoColorHint
 │   ├── d3d11_device.rs     # D3D11 Device + VideoProcessor + Fence (1134 行)
-│   ├── ffmpeg_d3d11.rs     # FFmpeg D3D11VA hw_device_ctx 共有 (159 行)
-│   ├── video_paint.rs      # egui_wgpu Callback で fullscreen quad 描画 (557 行)
-│   └── wgpu_import.rs      # NT shared HANDLE → wgpu::Texture (148 行)
+│   └── ffmpeg_d3d11.rs     # FFmpeg D3D11VA hw_device_ctx 共有 (159 行)
 ├── dsp/                    # VST3 プラグインチェーン (詳細は docs/vst3-integration.md)
 │   ├── mod.rs              # DspBridge 公開 API + チェーン管理 (2102 行 ⚠ 肥大)
 │   ├── bridge.rs           # bridge 子プロセス管理 + IPC (1033 行)
@@ -133,9 +145,9 @@ src/video/
 #### `mod.rs` (`VideoPlayer`)
 - 公開 API (`open` / `tick` / `seek` / `set_volume` / `set_loop_enabled` / `shutdown`)
 - decoder スレッド・audio スレッドのライフサイクル管理
-- `gpu_latest: Option<D3d11Frame>` で **最新 GPU フレームを所有** (= 次フレーム到着まで HANDLE valid 保証)
-- `texture: Option<TextureHandle>` で CPU 経路の最新フレーム保持
-- `future_frames: VecDeque<VideoFrame>` で FIFO 連続性を保証 (= UI が pts ジャンプしない)
+- native presenter のライフタイム管理 (`native_output: Option<NativeVideoOutput>`)
+- `gpu_latest: Option<D3d11Frame>` / `future_frames: VecDeque<VideoFrame>` は native
+  presenter 経路を持たない過渡状態用の保持フィールド (通常運用ではほぼ未使用)。
 
 #### `decoder.rs` (3-thread 構成)
 
@@ -347,7 +359,7 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - `blit_nv12_to_rgba` メソッド: AVFrame の NV12 入力を NT 共有 RGBA テクスチャに blit
   - 出力テクスチャは新規作成 (リング管理は呼び出し側)
   - 中間 RT (NT shared なし) → CopyResource で NT/KM 付き共有テクスチャに転送 (NVIDIA driver 仕様)
-  - blit 完了後に fence を Signal (= UI thread の wgpu wait 用)
+  - blit 完了後に fence を Signal (= native presenter の wait 用)
 - 色空間 hint (`SetStreamColorSpace1` / `SetOutputColorSpace1`) は SDR/HDR PQ/HLG を明示
   (HDR 表示は非対応。HDR/10-bit 入力も VPP が SDR BGRA8 として出力)
 
@@ -356,16 +368,9 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - これにより HW デコード結果テクスチャと VPP が同じ D3D11 device 上にある
   (= `CopyResource` 等で device 跨ぎなく扱える)
 
-#### `gpu_renderer/wgpu_import.rs`
-- NT 共有 HANDLE を `ID3D12Device::OpenSharedHandle` で開く
-- `wgpu_hal::dx12::Device::texture_from_raw` で wgpu::Texture に変換
-- D3D12 Fence も `OpenSharedHandle` でオープンして command queue に Wait を積む
-- Fence 世代 ID (`fence_gen`) でキャッシュ判定 (= HANDLE 値再利用への対策)
-
-#### `gpu_renderer/video_paint.rs`
-- `egui::PaintCallback` で発行される `VideoPaintCallback`
-- shader: NV12 ではなく RGBA 入力 (= VPP で変換済み) を fullscreen quad に貼る
-- bind group は毎フレーム再構築 (テクスチャが毎フレーム別 ID3D11Texture2D なので)
+> **撤去済み**: `gpu_renderer/wgpu_import.rs` (NT 共有 HANDLE → wgpu::Texture import) と
+> `gpu_renderer/video_paint.rs` (`egui::PaintCallback` ベースの `VideoPaintCallback`) は、
+> 旧 egui 描画パスでのみ使われていたため v0.9 系の native presenter 必須化と同時に削除。
 
 #### `native_window.rs` (`NativeVideoWindow`)
 
@@ -429,33 +434,32 @@ event channel で App に通知し、App 側がシーク、ブックマーク、
 - `tile_thumb_cache.rs`: SQLite + WebP の永続キャッシュ。**絶対 PTS をキー**にしているため
   動画の長さが変わっても再ヒットする (Phase 8.C の修正)
 
-タイルモードの UI 描画は `native_presenter/overlay_draw.rs` の `draw_native_tile_overlay` と
-`ui_video_tile.rs` (eframe 経路の旧実装) の二重実装になっている (= ネイティブ DComp
-経路と eframe 経路の両方で動かすため)。
+タイルモードの UI 描画は `native_presenter/overlay_draw.rs` の `draw_native_tile_overlay`
+が一手に行う。`ui_video_tile.rs` は state 構造体 (`VideoTileState`) と worker spawn
+ロジックだけを持ち、egui 描画関数は v0.9 系で削除済み。
 
 ## 経路選択ロジック (起動時 1 回)
 
-`src/main.rs` で以下を実行 (整理後も維持):
+`src/main.rs` で以下を実行する。`GpuVideoDevice` は decoder の HW デコード + native
+presenter への NT-shared blit に使うので、wgpu backend の種別とは独立に常に作成を
+試みる。失敗時は decoder が SW デコード + CPU upload に自動 fallback (どちらの
+経路でも native presenter が描画する)。
 
 ```rust
 let backend = rs.adapter.get_info().backend;
-let is_dx12 = matches!(backend, wgpu::Backend::Dx12);
-crate::logger::log(format!(
-    "wgpu backend selected: {backend:?} (gpu_video_pipeline={})",
-    if is_dx12 { "available" } else { "disabled (non-DX12)" }
-));
-if is_dx12 {
-    crate::video::gpu_renderer::init_video_pipeline(&rs);
-    match crate::video::gpu_renderer::GpuVideoDevice::new() {
-        Ok(dev) => app.gpu_video_device = Some(dev),
-        Err(e) => crate::logger::log(format!(
-            "GPU video device: failed (will fallback to CPU readback): {e}"
-        )),
-    }
+crate::logger::log(format!("wgpu backend selected: {backend:?}"));
+match crate::video::gpu_renderer::GpuVideoDevice::new() {
+    Ok(dev) => app.gpu_video_device = Some(dev),
+    Err(e) => crate::logger::log(format!(
+        "GPU video device: failed (will fallback to CPU readback): {e}"
+    )),
 }
 ```
 
 `GpuVideoDevice::new` のシグネチャから `vsr_enabled: bool` 引数は削除 (= VSR を扱わなくなるため)。
+
+旧 `init_video_pipeline()` (egui_wgpu の callback_resources に動画 wgpu パイプラインを
+登録する起動時処理) は native presenter 必須化と同時に削除済み。
 
 ## VideoFrame 形式
 
@@ -469,9 +473,13 @@ pub struct VideoFrame {
 }
 
 pub enum VideoFrameData {
-    /// CPU 経路 (旧経路)。`Vec<u8>` は width * height * 4 の RGBA8。
+    /// CPU 経路。`Vec<u8>` は width * height * 4 の **RGBA8** (decoder 側 swscale が
+    /// `Pixel::RGBA` 出力を生成する)。native presenter の
+    /// `copy_cpu_rgba_to_swapchain_bgra` が RGBA→BGRA 変換しつつ swap chain backbuffer
+    /// に `UpdateSubresource` で upload する。
     Cpu(Vec<u8>),
-    /// GPU 経路。NT 共有テクスチャ + fence で UI thread が直接 sample。
+    /// GPU 経路。NT 共有テクスチャ + fence で native presenter が `OpenSharedHandle` 経由
+    /// に取得して自分の swap chain にコピーする。
     #[cfg(windows)]
     Gpu(crate::video::gpu_renderer::D3d11Frame),
 }
@@ -484,8 +492,12 @@ pub enum VideoFrameData {
 - **VideoPlayer の Drop**: `cancel.store(true)` → decoder thread が exit、`audio.take()` で cpal stream 停止
 - **VideoPlayer.shutdown() の用途**: 動画切替時に Drop より早く audio を切るため (= 残音を防ぐ)
 - **GpuVideoDevice の Drop**: D3D11 リソース全解放、fence の NT shared handle を `CloseHandle`
-- **VideoPipeline (= app 起動時 1 回)**: アプリ終了まで生存、wgpu shader/sampler/bind group layout を保持
-- **D3d11Frame の所有権**: `VideoPlayer.gpu_latest` が「現在表示中のフレーム」を所有、次フレーム到着で旧 frame の Drop が NT HANDLE を `CloseHandle` する (= UI が描画中の HANDLE が close される race を防ぐ)
+- **NativeVideoPresenter** (= `VideoPlayer::open` 時に 1 個生成、`VideoPlayer` Drop で停止):
+  独立 Win32 HWND + 自前 D3D11 swap chain + DComp visual tree を所有。decoder からの
+  VideoFrame を専用 thread で pull → present。
+- **D3d11Frame の所有権**: native presenter thread が channel から受信して自身の Drop
+  まで保持。次フレーム到着で旧 frame の Drop が NT HANDLE を `CloseHandle` する
+  (= 描画中の HANDLE が close される race を防ぐ)
 
 ## 設定との関係
 
@@ -513,7 +525,14 @@ pub enum VideoFrameData {
 - 通常: `cargo build --release --bin mimageviewer-core`
 - ベンチ: `cargo run --release --bin bench_thumbs` (動画関係なし)
 - 実機検証: 4K HEVC ファイルを動画フォルダに置いてフルスクリーン再生、滑らかさ目視
-- リモデ検証: RDP 経由で起動して、`logger` の `gpu_video_pipeline=disabled (non-DX12)` を確認、CPU 経路で 1080p 動画が再生できること
+- リモデ検証: RDP 経由で起動して動画を開く。HW デコード (`D3D11VA`) が失敗するなら
+  decoder が SW デコード + CPU upload に自動 fallback して native presenter が描画
+  するので、1080p 程度なら再生できる。`mimageviewer.log` に `GPU video device: failed
+  (will fallback to CPU readback)` と出ているか、または `decoder` のログで HW 候補に
+  落ちているか確認する。
+- native presenter 起動失敗時の挙動: `GetMonitorInfoW` 失敗や thread 生成エラーが
+  起きると `VideoPlayer.error` に日本語のエラー文言が入り、フルスクリーンに赤字で
+  「動画を再生できません: ...」が表示される (= 旧 egui presenter フォールバックは無い)。
 
 ---
 

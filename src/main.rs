@@ -79,7 +79,6 @@ mod ui_metadata_panel;
 pub mod ui_susie_diagnostic;
 pub mod ui_text_links;
 #[cfg(windows)]
-pub mod ui_video_panels;
 #[cfg(windows)]
 pub mod ui_video_tile;
 mod undo_ops;
@@ -683,32 +682,21 @@ fn main() -> eframe::Result {
                     // (= リモートデスクトップ等の fallback) では GPU video device を
                     // 作らず CPU readback + swscale 経路にフォールバックする。
                     let backend = rs.adapter.get_info().backend;
-                    let is_dx12 = matches!(backend, wgpu::Backend::Dx12);
-                    crate::logger::log(format!(
-                        "wgpu backend selected: {backend:?} (gpu_video_pipeline={})",
-                        if is_dx12 {
-                            "available"
-                        } else {
-                            "disabled (non-DX12)"
+                    crate::logger::log(format!("wgpu backend selected: {backend:?}"));
+                    // GpuVideoDevice は wgpu backend に依存せず独立した D3D11 device を
+                    // 持つため、native presenter の動作前提として常に作成を試みる。
+                    // 失敗時は decoder が SW デコード + CPU upload にフォールバックする。
+                    match crate::video::gpu_renderer::GpuVideoDevice::new() {
+                        Ok(dev) => {
+                            crate::logger::log(
+                                "GPU video device: created (D3D11 + video processor)".to_string(),
+                            );
+                            app.gpu_video_device = Some(dev);
                         }
-                    ));
-                    if is_dx12 {
-                        // egui_wgpu の callback_resources に動画描画用の wgpu パイプラインを
-                        // 起動時 1 度だけ登録 (= 各 paint で再利用される shared resource)。
-                        crate::video::gpu_renderer::init_video_pipeline(&rs);
-                        match crate::video::gpu_renderer::GpuVideoDevice::new() {
-                            Ok(dev) => {
-                                crate::logger::log(
-                                    "GPU video device: created (D3D11 + video processor)"
-                                        .to_string(),
-                                );
-                                app.gpu_video_device = Some(dev);
-                            }
-                            Err(e) => {
-                                crate::logger::log(format!(
-                                    "GPU video device: failed (will fallback to CPU readback): {e}"
-                                ));
-                            }
+                        Err(e) => {
+                            crate::logger::log(format!(
+                                "GPU video device: failed (will fallback to CPU readback): {e}"
+                            ));
                         }
                     }
                     app.wgpu_render_state = Some(rs);

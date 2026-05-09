@@ -915,7 +915,8 @@ pub enum VideoFrameData {
     /// `Vec<u8>` は `width * height * 4` バイト。
     Cpu(Vec<u8>),
     /// GPU 上の D3D11 NT 共有テクスチャ (GPU 経路: HW + VideoProcessorBlt → RGBA shared)。
-    /// UI は `import_shared_d3d11_texture` で wgpu::Texture に import して描画する。
+    /// native presenter (`crate::video::native_presenter`) が `OpenSharedHandle` で
+    /// 受け取り、自分の D3D11 swap chain backbuffer に Copy/Blit して present する。
     /// テクスチャの寿命管理は `D3d11Frame` が `Drop` で `CloseHandle` する責務を持つ。
     #[cfg(windows)]
     Gpu(crate::video::gpu_renderer::D3d11Frame),

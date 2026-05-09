@@ -572,10 +572,10 @@ impl App {
                     return Some(h.clone());
                 }
             }
-            Some(FsCacheEntry::Video { player, .. }) => {
-                if let Some(tex) = player.texture() {
-                    return Some(tex.clone());
-                }
+            Some(FsCacheEntry::Video { .. }) => {
+                // 動画は native presenter が独立 HWND に描画するため、
+                // ここから取り出せる egui TextureHandle はない。サムネイルへ
+                // フォールバックする。
             }
             _ => {}
         }
@@ -948,10 +948,6 @@ fn is_landscape(
                 if let Some(info) = player.info() {
                     return info.width > info.height;
                 }
-                if let Some(tex) = player.texture() {
-                    let s = tex.size_vec2();
-                    return s.x > s.y;
-                }
             }
             FsCacheEntry::Failed => {}
         }
@@ -990,11 +986,6 @@ struct FsFrameState {
     fs_load_failed: bool,
     /// PDF ページのコンテンツ種別 (非 PDF なら None)
     pdf_content_type: Option<PdfPageContentType>,
-    /// 動画 GPU レンダリングで描画する最新フレーム情報 (Windows のみ)。
-    /// `Some` のとき draw_fs_image は通常 texture 描画ではなく
-    /// `egui_wgpu::Callback` 経由で fullscreen quad を描画する。
-    #[cfg(windows)]
-    gpu_video_frame: Option<crate::video::GpuLatestFrame>,
 }
 
 /// フルスクリーンのキー入力結果。
@@ -1170,9 +1161,8 @@ impl App {
         let mut fs_vst_manager_ms = 0.0_f64;
         let mut fs_closure_ms = 0.0_f64;
         let fs_state_is_video = state.is_video;
-        #[cfg(windows)]
-        let fs_state_gpu_video = state.gpu_video_frame.is_some();
-        #[cfg(not(windows))]
+        // 動画は native presenter が独立 HWND に描画するので、egui 側 viewport は
+        // 黒 backdrop のみ。ここで GPU 経路かどうかを区別する必要は無い。
         let fs_state_gpu_video = false;
 
         ctx.show_viewport_immediate(
@@ -1341,8 +1331,6 @@ impl App {
                                         state.is_video, state.vst3_waiting_for_video,
                                         state.fs_load_failed, fs_rotation, zp,
                                         free_rot, &bg_style, &state.location_display,
-                                        #[cfg(windows)]
-                                        state.gpu_video_frame,
                                     );
                                     // 単一表示時は見開きレイアウトキャッシュを破棄
                                     self.fs_spread_layout = None;
@@ -1465,10 +1453,9 @@ impl App {
                                 self.reset_analysis_mode();
                             }
                         } else if state.is_video {
-                            // 動画は専用パネルに分岐する (Phase 5.4):
-                            //   左 = ジャンプ先 (ピン / ブックマーク / チャプター)、
-                            //   右 = メタ情報 (タイトル / コーデック / チャプター…)。
-                            // Phase 5.5: タイルモード中は他のパネルを抑止しオーバーレイのみ描画。
+                            // 動画は native presenter (独立 HWND) が描画とオーバーレイを担うため、
+                            // 通常 eframe ビューポート側ではパネルを描画しない。タイル再オープン
+                            // 要求 (S キーの遷移) のリトライだけはここで処理する。
                             #[cfg(windows)]
                             {
                                 if self.video_tile_reopen_pending
@@ -1495,14 +1482,6 @@ impl App {
                                             ctx.request_repaint_after(wait);
                                         }
                                     }
-                                }
-                                if self.video_tile_state.is_some() {
-                                    self.draw_video_tile_overlay(ui, ctx, full_rect, fs_idx);
-                                } else {
-                                    self.draw_video_jump_panel(ui, ctx, full_rect, fs_idx);
-                                    self.draw_video_metadata_panel(ui, ctx, full_rect, fs_idx);
-                                    // Phase 6: ミニツールバーは廃止。タイルモードは上ホバー
-                                    // バーの ▦ ボタン (Phase 6.B) で起動する。
                                 }
                             }
                         } else if adjustment_active {
@@ -1664,8 +1643,9 @@ impl App {
                         // ── 右上フィードバックトースト ──
                         self.draw_feedback_toast(ui, full_rect, ctx);
 
-                        // ── 動画ブックマーク名編集ダイアログ ──
-                        self.draw_video_bookmark_title_editor(ctx);
+                        // 動画ブックマーク名編集ダイアログは native presenter overlay の
+                        // 中で描画される (= `native_presenter/overlay_draw.rs::draw_native_*`)。
+                        // eframe ビューポートからは描画しない。
 
                         // ── 中央の境界ヒント (最初/最後の画像です…) ──
                         self.draw_boundary_hint(ui, full_rect, ctx);
@@ -1854,11 +1834,9 @@ impl App {
         let original_preview_active = self.original_preview_active(ctx, fs_idx);
 
         let tex: Option<egui::TextureHandle> = if is_video {
-            // 動画: VideoPlayer が in-place 更新するテクスチャをそのまま使う
-            match self.fs_cache.get(&fs_idx) {
-                Some(FsCacheEntry::Video { player, .. }) => player.texture().cloned(),
-                _ => None,
-            }
+            // 動画は native presenter が独立 HWND に描画するため、egui 側で
+            // 表示するテクスチャは無い。サムネイル fallback に任せる。
+            None
         } else if original_preview_active {
             self.resolve_original_preview_tex(ctx, fs_idx)
         } else {
@@ -1890,7 +1868,7 @@ impl App {
                         current_frame,
                         ..
                     }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
-                    Some(FsCacheEntry::Video { player, .. }) => player.texture().cloned(),
+                    Some(FsCacheEntry::Video { .. }) => None,
                     Some(FsCacheEntry::Failed) | None => None,
                 })
         };
@@ -2006,12 +1984,6 @@ impl App {
             _ => None,
         };
 
-        #[cfg(windows)]
-        let gpu_video_frame = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player.gpu_latest(),
-            _ => None,
-        };
-
         FsFrameState {
             is_video,
             separator_text,
@@ -2026,8 +1998,6 @@ impl App {
             vst3_waiting_for_video,
             fs_load_failed,
             pdf_content_type,
-            #[cfg(windows)]
-            gpu_video_frame,
         }
     }
 
@@ -2046,7 +2016,6 @@ impl App {
     #[cfg(windows)]
     fn native_video_backdrop_target_for_fs(&self, fs_idx: usize) -> bool {
         matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
-            && crate::video::native_presenter_enabled_by_env()
     }
 
     #[cfg(windows)]
@@ -3344,7 +3313,6 @@ impl App {
         if restore_video_tile {
             self.video_tile_state = None;
             self.video_tile_swap_pending = None;
-            self.video_tile_textures.clear();
         }
 
         self.open_fullscreen(idx);
@@ -3556,6 +3524,9 @@ impl App {
     /// フルスクリーンの画像 / 動画 / 読込中 / 失敗 表示を描画する。
     /// zoom/pan が Some のとき分析モードのズーム/パンを適用する。
     /// `bg_style` が Default 以外のとき、画像 rect の直下に透過背景を塗る。
+    ///
+    /// 動画は native presenter が独立 HWND に直接描画するので、ここでは
+    /// 静止画 / アニメーション / サムネイル / プレースホルダーだけを扱う。
     #[allow(clippy::too_many_arguments)]
     fn draw_fs_image(
         ui: &mut egui::Ui,
@@ -3572,37 +3543,7 @@ impl App {
         // 読込中プレースホルダ直下に出す対象パス (`location_display_for` 参照)。
         // 空ならラベル描画をスキップ。
         location_display: &str,
-        #[cfg(windows)] gpu_video_frame: Option<crate::video::GpuLatestFrame>,
     ) {
-        // GPU 経路: D3D11 共有テクスチャを wgpu に import して fullscreen quad で描画。
-        #[cfg(windows)]
-        if let Some(g) = gpu_video_frame {
-            // アスペクト比維持で full_rect 内に収める。
-            let aspect = g.width as f32 / (g.height as f32).max(1.0);
-            let avail_aspect = full_rect.width() / full_rect.height().max(1.0);
-            let img_rect = if aspect > avail_aspect {
-                let h = full_rect.width() / aspect;
-                egui::Rect::from_center_size(full_rect.center(), egui::vec2(full_rect.width(), h))
-            } else {
-                let w = full_rect.height() * aspect;
-                egui::Rect::from_center_size(full_rect.center(), egui::vec2(w, full_rect.height()))
-            };
-            let cb = egui_wgpu::Callback::new_paint_callback(
-                img_rect,
-                crate::video::gpu_renderer::VideoPaintCallback::new(
-                    g.shared_handle,
-                    g.width,
-                    g.height,
-                    g.ten_bit,
-                    g.fence_shared_handle,
-                    g.fence_value,
-                    g.fence_gen,
-                ),
-            );
-            ui.painter().add(cb);
-            return;
-        }
-
         let display_tex = tex.or(thumb_tex);
         if let Some(handle) = display_tex {
             let tex_size = handle.size_vec2();
@@ -5597,7 +5538,6 @@ impl App {
         if escape_for_tile {
             self.video_tile_state = None;
             self.video_tile_swap_pending = None;
-            self.video_tile_textures.clear();
         }
 
         // Phase 5.4.1: ブックマーク追加。現在位置 + 動画パスを取得して DB に挿入。
@@ -6219,19 +6159,11 @@ impl App {
                 player.volume(),
                 player.is_muted(),
                 player.playback_speed(),
-                // CPU path: TextureHandle 有り、または GPU path: 共有 D3D11 フレーム有り、
-                // のいずれかなら描画コンテンツが揃っているとみなす
-                // (= "動画を準備中..." を抜けて通常表示に切り替える)。
-                player.texture().is_some() || {
-                    #[cfg(windows)]
-                    {
-                        player.gpu_latest().is_some()
-                    }
-                    #[cfg(not(windows))]
-                    {
-                        false
-                    }
-                },
+                // 1 枚以上のフレームが decoder から供給され UI tick が認識した
+                // 時点で「描画コンテンツが揃った」とみなす (= "動画を準備中..."
+                // を抜けて通常表示に切り替える)。native presenter / 旧 egui 経路の
+                // 違いに依存しない atomic counter ベースの判定。
+                player.displayed_frame_seq() > 0,
                 player.error().map(|s| s.to_string()),
             ),
             _ => return,

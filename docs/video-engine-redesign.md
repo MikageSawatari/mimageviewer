@@ -1489,3 +1489,34 @@ harness through this native path instead of `--play-test`. The report reuses the
 existing columns but maps them to native metrics while in this mode:
 `display_miss` shows presented frame count, `frame_gap` shows native late-drop
 count, and `max_gap_ms` shows `native_presenter/summary.max_interval_ms`.
+
+## Phase 11: 旧 egui presenter 撤去 (2026-05-09)
+
+native presenter (Phase 10 系) 投入後しばらくは、旧 egui ベースの動画描画パスを
+`MIV_NATIVE_VIDEO_PRESENTER=false` 環境変数 + native HWND 初期化失敗時の自動
+フォールバックとして残していた。しかし v0.9 系で追加された機能 (VST3 パネル / リッチな
+メタデータパネル / フレームステップ UI / 動画ジャンプパネル / タイル overlay 等) は
+全て native 専用で旧パスには未実装で、フォールバックは実質「機能劣化版」となっていた。
+
+ユーザー判断で **native presenter を必須化** し、旧パスとフォールバック配線を撤去:
+
+- `src/video/gpu_renderer/video_paint.rs` (`VideoPaintCallback` / `VideoPipeline` /
+  `init_video_pipeline`) と `src/video/gpu_renderer/wgpu_import.rs`
+  (`import_shared_d3d11_texture` / `ImportedTexture`) を削除 (合計 ~700 行)。
+- `VideoPlayer::texture: Option<TextureHandle>` フィールド + `texture()` getter +
+  `tick()` 内の `ColorImage` + `ctx.load_texture` 経由の CPU upload 経路を削除。
+  CPU フレームの実体描画は native presenter 内の `UpdateSubresource` 経由で行う。
+- `MIV_NATIVE_VIDEO_PRESENTER` 環境変数とフォールバック早期 return (app.rs /
+  app/native_video.rs / video/mod.rs / ui_fullscreen.rs の 4 箇所) を削除。
+- 旧 eframe フルスクリーンの動画用パネル (`src/ui_video_panels.rs` =
+  `draw_video_metadata_panel` / `draw_video_jump_panel` / `add_video_bookmark_at_current` /
+  `toggle_video_pin_at_current` / `draw_video_bookmark_title_editor` 等、~1000 行) と、
+  egui 経路のタイル描画 `draw_video_tile_overlay` (`src/ui_video_tile.rs`、~290 行) +
+  関連 texture cache (`video_tile_textures` / `VideoBookmarkTitleEditor` 等) を削除。
+- `VideoTileState` 構造体・`toggle_video_tile_mode` / `build_video_tile_state_for` は
+  native overlay の描画と `app/native_video.rs` のディスパッチ経路で共有しているため
+  存続。
+
+差分は `git log` 経由で確認可能。最終的に ~2200 行のデッドコードを削除し、build /
+unit test (video::* 195 件、ui_video_tile::* 6 件) は通過。手動 E2E は CLAUDE.md の
+リリースチェック手順に従って実施する。

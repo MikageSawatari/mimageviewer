@@ -1341,14 +1341,6 @@ pub(crate) struct VideoFrameStepHold {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct VideoBookmarkTitleEditor {
-    pub(crate) fs_idx: usize,
-    pub(crate) id: i64,
-    pub(crate) title: String,
-    pub(crate) request_focus: bool,
-}
-
-#[derive(Clone, Debug)]
 pub(crate) struct FullscreenVideoMarkerCache {
     pub(crate) fs_idx: usize,
     pub(crate) path: PathBuf,
@@ -1850,31 +1842,12 @@ pub struct App {
     pub(crate) video_tile_swap_pending: Option<VideoTileSwapPending>,
     #[cfg(windows)]
     pub(crate) native_video_source_epoch_next: u64,
-    /// タイルモードのサムネ texture キャッシュ (slot_idx → (key, tex))。
-    /// state Drop 時にこちらも `clear()` で解放する想定。
-    #[cfg(windows)]
-    pub(crate) video_tile_textures:
-        std::collections::HashMap<usize, ((u64, u64, u32, u32), egui::TextureHandle)>,
-    /// 動画ジャンプパネル (左) の各行サムネ texture キャッシュ。
-    /// key: bucket(pts_secs) — 同一 pts は同じ texture を再利用。動画切替で
-    /// `clear()` する。
-    #[cfg(windows)]
-    pub(crate) video_jump_textures:
-        std::collections::HashMap<i64, ((u64, u32, u32), egui::TextureHandle)>,
     /// タイルモードのサムネ WebP 永続キャッシュ (Phase 6.D-2、Phase 8.C で絶対 PTS 化)。
     /// 同 (動画 path, tile_w, timestamp_ms) のキーで再オープン時に即座に表示できる。
     /// 列数が同じなら抽出間隔を変えても共通 PTS のサムネは再利用される。
     #[cfg(windows)]
     pub(crate) video_tile_cache:
         Option<std::sync::Arc<crate::video::tile_thumb_cache::TileThumbCache>>,
-    /// 動画フルスクリーン中の右メタ情報パネルが現在表示中か (Phase 7.I: ホバー
-    /// 条件のヒステリシス用 — 表示後はパネル矩形全体をホバー範囲にして、
-    /// パネル上スクロール中に消えないようにする)。
-    #[cfg(windows)]
-    pub(crate) show_video_metadata_panel_visible: bool,
-    /// 同左ジャンプパネル用。
-    #[cfg(windows)]
-    pub(crate) show_video_jump_panel_visible: bool,
     /// 次の `open_fullscreen` を「グリッド (サムネ一覧) から明示的に開いた」
     /// ケースとして扱うフラグ (Phase 7.J)。一覧から開いた動画は再生開始し、
     /// 動画送りで開いた動画は一時停止するかどうかの判定に使う。
@@ -1884,11 +1857,6 @@ pub struct App {
     /// 動画ピン留めの書き換えがあったので、フルスクリーン解除時 / 次回 grid 表示時
     /// に動画サムネ オーバーライド map を再構築する必要があるフラグ (Phase 8.B')。
     pub(crate) video_thumb_overrides_dirty: bool,
-    /// ピン操作後にジャンプパネルへ短時間表示する状態テキスト (Phase 8.B'-2)。
-    /// `(message, until)` で `Instant::now() < until` の間だけ表示。
-    pub(crate) video_pin_status: Option<(String, std::time::Instant)>,
-    /// 左ジャンプパネルのブックマーク名称編集ダイアログ。
-    pub(crate) video_bookmark_title_editor: Option<VideoBookmarkTitleEditor>,
     /// フルスクリーン動画のピン / ブックマークキャッシュ。
     /// `App::update` とシークバー描画中に SQLite SELECT を毎フレーム走らせない。
     pub(crate) fullscreen_video_marker_cache: Option<FullscreenVideoMarkerCache>,
@@ -2844,19 +2812,10 @@ impl Default for App {
             #[cfg(windows)]
             native_video_source_epoch_next: 1,
             #[cfg(windows)]
-            video_tile_textures: std::collections::HashMap::new(),
-            #[cfg(windows)]
-            video_jump_textures: std::collections::HashMap::new(),
             #[cfg(windows)]
             video_tile_cache,
-            #[cfg(windows)]
-            show_video_metadata_panel_visible: false,
-            #[cfg(windows)]
-            show_video_jump_panel_visible: false,
             fs_open_intent_from_grid: false,
             video_thumb_overrides_dirty: false,
-            video_pin_status: None,
-            video_bookmark_title_editor: None,
             fullscreen_video_marker_cache: None,
             video_perf_overlay_visible: false,
             video_perf_history: std::collections::VecDeque::with_capacity(200),
@@ -11134,17 +11093,13 @@ impl App {
         self.fs_secondary_press_start = None;
         self.fs_middle_zoom_drag = None;
         self.fs_context_menu_idx = None;
-        self.video_bookmark_title_editor = None;
         // Phase 5.5: タイルモードもフルスクリーン解除と同時に閉じる (Codex H2 反映)。
-        // Phase 6.C: 左ジャンプパネルのサムネ texture キャッシュもクリア。
         #[cfg(windows)]
         {
             self.video_tile_state = None;
             self.video_tile_reopen_pending = false;
             self.video_tile_reopen_deadline = None;
             self.video_tile_swap_pending = None;
-            self.video_tile_textures.clear();
-            self.video_jump_textures.clear();
         }
         self.reset_erase_mode();
         self.erase_base_cache.clear();
@@ -13167,6 +13122,8 @@ impl App {
         #[cfg(windows)]
         let mut native_closed_idx: Option<usize> = None;
         #[cfg(windows)]
+        let mut native_close_error: Option<String> = None;
+        #[cfg(windows)]
         let mut native_owner_hwnd: u64 = 0;
         #[cfg(windows)]
         let mut native_events: Vec<(usize, u64, crate::video::NativeVideoOutputEvent)> = Vec::new();
@@ -13205,6 +13162,11 @@ impl App {
                     }
                     if self.fullscreen_idx == Some(*idx) && player.native_presenter_closed() {
                         native_closed_idx = Some(*idx);
+                        // closed=true を観測 (Acquire) した時点で writer の init_error
+                        // 書き込み (Release-before) は必ず可視。tick が race で取り逃した
+                        // ケースに備え、ここで再度 consume してから error を読む。
+                        player.consume_native_init_error();
+                        native_close_error = player.error().map(|s| s.to_string());
                     }
                     native_events.extend(
                         player
@@ -13247,6 +13209,9 @@ impl App {
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
             self.close_fullscreen();
+            if let Some(err) = native_close_error {
+                self.show_feedback_toast(format!("動画を再生できません: {err}"));
+            }
             return;
         }
         #[cfg(windows)]
@@ -16101,20 +16066,6 @@ fn video_autoplay_for_open(
 }
 
 #[cfg(windows)]
-fn env_flag_enabled(name: &str, default: bool) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            let v = v.trim();
-            !(v.is_empty()
-                || v == "0"
-                || v.eq_ignore_ascii_case("false")
-                || v.eq_ignore_ascii_case("off")
-                || v.eq_ignore_ascii_case("no"))
-        })
-        .unwrap_or(default)
-}
-
-#[cfg(windows)]
 fn native_video_presenter_config(
     main_hwnd: Option<isize>,
     perf_overlay_visible: bool,
@@ -16122,10 +16073,6 @@ fn native_video_presenter_config(
     vst3_available: bool,
     checked: bool,
 ) -> Option<crate::video::NativeVideoOutputConfig> {
-    if !env_flag_enabled("MIV_NATIVE_VIDEO_PRESENTER", true) {
-        return None;
-    }
-
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
@@ -16138,7 +16085,10 @@ fn native_video_presenter_config(
         ..Default::default()
     };
     if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        crate::logger::log("[native-video] GetMonitorInfoW failed; using egui presenter");
+        // VideoPlayer::open 側で `error` を立てて UI に「読込失敗」を表示させる。
+        crate::logger::log(
+            "[native-video] GetMonitorInfoW failed; native presenter cannot start, video will fail to open",
+        );
         return None;
     }
     let sync_interval = std::env::var("MIV_NATIVE_VIDEO_SYNC_INTERVAL")

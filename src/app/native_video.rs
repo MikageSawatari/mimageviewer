@@ -75,7 +75,6 @@ impl App {
             return false;
         };
         matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
-            && env_flag_enabled("MIV_NATIVE_VIDEO_PRESENTER", true)
     }
 
     #[cfg(windows)]
@@ -386,7 +385,6 @@ impl App {
             player.seek(target_secs);
             self.video_tile_state = None;
             self.video_tile_swap_pending = None;
-            self.video_tile_textures.clear();
             player.set_native_tile_overlay(None);
             self.mark_native_video_hud_activity(ctx);
         }
@@ -849,7 +847,6 @@ impl App {
         match status {
             SwapStatus::Ready => {
                 let screen = ctx.content_rect().size();
-                self.video_tile_textures.clear();
                 self.video_tile_state = self.build_video_tile_state_for(target_idx, screen);
                 self.video_tile_swap_pending = None;
                 self.video_tile_reopen_pending = false;
@@ -868,7 +865,6 @@ impl App {
             SwapStatus::Timeout => {
                 self.video_tile_swap_pending = None;
                 self.video_tile_state = None;
-                self.video_tile_textures.clear();
                 self.video_tile_reopen_pending = true;
                 self.video_tile_reopen_deadline = Some(now + std::time::Duration::from_secs(3));
                 self.set_native_video_tile_preparing_overlay(target_idx);
@@ -881,7 +877,6 @@ impl App {
             SwapStatus::Error | SwapStatus::Missing => {
                 self.video_tile_swap_pending = None;
                 self.video_tile_state = None;
-                self.video_tile_textures.clear();
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
                     player.set_native_tile_overlay(None);
                 }
@@ -982,7 +977,6 @@ impl App {
         if clear_state {
             self.video_tile_state = None;
             self.video_tile_swap_pending = None;
-            self.video_tile_textures.clear();
         }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_native_tile_overlay(tile_overlay);
@@ -1584,7 +1578,6 @@ impl App {
         let was_open = self.video_tile_state.is_some();
         self.video_tile_state = None;
         self.video_tile_swap_pending = None;
-        self.video_tile_textures.clear();
         if was_open {
             let screen = ctx.content_rect().size();
             self.toggle_video_tile_mode(fs_idx, screen);
@@ -1680,7 +1673,6 @@ impl App {
         });
         self.video_tile_reopen_pending = false;
         self.video_tile_reopen_deadline = None;
-        self.video_tile_textures.clear();
 
         self.open_fullscreen(target_idx);
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
@@ -1764,7 +1756,6 @@ impl App {
         if restore_video_tile {
             self.video_tile_state = None;
             self.video_tile_swap_pending = None;
-            self.video_tile_textures.clear();
             if let Some(current_idx) = self.fullscreen_idx {
                 self.set_native_video_tile_preparing_overlay(current_idx);
             }
