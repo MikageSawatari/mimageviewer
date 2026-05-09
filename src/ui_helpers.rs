@@ -167,7 +167,12 @@ pub fn truncate_name(name: &str, max_chars: usize) -> String {
 /// グリッドセル底部にファイル名を描画する。文字の後ろに半透明の角丸プレートを敷いて、
 /// 動画サムネの黒帯のような暗部に重なってもファイル名が読めるようにする。
 ///
-/// - 文字幅は `layout_no_wrap` で実測 (CJK / 絵文字混在でも正確)
+/// - 文字幅は `layout_no_wrap` で実測 (CJK / 絵文字混在でも正確)。プレート全体が
+///   `inner` を超える場合は `truncate_name` の 18 文字 soft cap から末尾を `…` で
+///   削って実幅に収める。極小セル (`MIN_CELL_PX = 32`) で `…` も入らないなら描画諦め
+/// - `reserve_left_w` は `draw_zip_badge` / `draw_pdf_badge` / `draw_archive_badge`
+///   が左下に描く ASCII 3 文字バッジ分の予約幅 (`estimated_file_badge_width` を渡す)。
+///   バッジの無いセル (Folder / Video) では 0.0
 /// - プレートは dark mode で半透明黒、light mode で半透明白
 /// - 位置は `Align2::CENTER_BOTTOM` 相当、`inner.max.y - 4.0` を底とする
 pub fn draw_cell_filename(
@@ -176,17 +181,49 @@ pub fn draw_cell_filename(
     name: &str,
     text_color: egui::Color32,
     dark: bool,
+    reserve_left_w: f32,
 ) {
-    let text = truncate_name(name, 18);
     let font = egui::FontId::proportional(11.0);
-    let galley = painter.layout_no_wrap(text, font, text_color);
+    let plate_pad = egui::vec2(4.0, 1.0);
+    let outer_margin = 3.0;
+
+    // プレート利用可能領域: 左は max(outer_margin, バッジ予約幅) ぶんだけ右に寄せる。
+    let avail_left = inner.min.x + reserve_left_w.max(outer_margin);
+    let avail_right = inner.max.x - outer_margin;
+    let max_text_w = (avail_right - avail_left - plate_pad.x * 2.0).max(0.0);
+    if max_text_w < 4.0 {
+        return; // 領域不足 → 描画諦め
+    }
+    let center_x = (avail_left + avail_right) * 0.5;
+
+    // 18 文字までで初回 layout、はみ出していたら末尾を `…` で 1 文字ずつ削って再 layout。
+    // CJK と ASCII で文字幅が大きく違うので平均幅近似は使えない (`draw_tag_badges` と同じ手法)。
+    let initial = truncate_name(name, 18);
+    let mut galley = painter.layout_no_wrap(initial.clone(), font.clone(), text_color);
+    if galley.size().x > max_text_w {
+        let chars: Vec<char> = initial.chars().collect();
+        for take in (1..chars.len()).rev() {
+            let candidate: String = chars[..take].iter().collect::<String>() + "…";
+            let g = painter.layout_no_wrap(candidate, font.clone(), text_color);
+            if g.size().x <= max_text_w {
+                galley = g;
+                break;
+            }
+        }
+        if galley.size().x > max_text_w {
+            galley = painter.layout_no_wrap("…".to_string(), font.clone(), text_color);
+            if galley.size().x > max_text_w {
+                return; // `…` も入らない極小セル → 諦め
+            }
+        }
+    }
+
     let text_size = galley.size();
     let text_pos = egui::pos2(
-        inner.center().x - text_size.x / 2.0,
+        center_x - text_size.x / 2.0,
         inner.max.y - 4.0 - text_size.y,
     );
-    let pad = egui::vec2(4.0, 1.0);
-    let bg_rect = egui::Rect::from_min_size(text_pos - pad, text_size + 2.0 * pad);
+    let bg_rect = egui::Rect::from_min_size(text_pos - plate_pad, text_size + 2.0 * plate_pad);
     let bg_color = if dark {
         egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160)
     } else {
@@ -194,6 +231,16 @@ pub fn draw_cell_filename(
     };
     painter.rect_filled(bg_rect, 3.0, bg_color);
     painter.galley(text_pos, galley, text_color);
+}
+
+/// `draw_zip_badge` / `draw_pdf_badge` / `draw_archive_badge` が左下に描く ASCII 3 文字
+/// バッジの幅を pessimistic に見積もって、`draw_cell_filename` の `reserve_left_w`
+/// に渡す値を返す。`draw_file_badge` の font_size = `clamp(h*0.10, 9, 16)` に合わせて
+/// `badge_w ≈ font_size * 2.65` (3 文字 ASCII 大文字 + pad_h*2) を `font_size * 3.0`
+/// に余裕を持たせ、左マージン 3.0 と視覚的隙間 4.0 を加算する。
+pub fn estimated_file_badge_width(inner: egui::Rect) -> f32 {
+    let font_size = (inner.height() * 0.10).clamp(9.0, 16.0);
+    3.0 + font_size * 3.0 + 4.0
 }
 
 // -----------------------------------------------------------------------

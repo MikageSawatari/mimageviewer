@@ -15350,6 +15350,7 @@ pub(crate) fn draw_cell(
                         name,
                         name_text_color,
                         dark,
+                        0.0,
                     );
                 }
             }
@@ -15385,7 +15386,7 @@ pub(crate) fn draw_cell(
             }
             // ファイル名
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            crate::ui_helpers::draw_cell_filename(painter, inner, name, name_text_color, dark);
+            crate::ui_helpers::draw_cell_filename(painter, inner, name, name_text_color, dark, 0.0);
         }
         GridItem::ZipImage { .. } | GridItem::PdfPage { .. } => {
             draw_thumb(painter, inner, thumb, rotation, dark, adjusted_tex);
@@ -15415,7 +15416,14 @@ pub(crate) fn draw_cell(
             }
             badge_fn(painter, inner);
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            crate::ui_helpers::draw_cell_filename(painter, inner, name, name_text_color, dark);
+            crate::ui_helpers::draw_cell_filename(
+                painter,
+                inner,
+                name,
+                name_text_color,
+                dark,
+                crate::ui_helpers::estimated_file_badge_width(inner),
+            );
         }
         GridItem::ConvertibleArchive { path, format } => {
             // 7z / LZH: クリック時に ZIP 変換→閲覧のフロー。サムネイルなしで
@@ -15430,7 +15438,14 @@ pub(crate) fn draw_cell(
             );
             crate::ui_helpers::draw_archive_badge(painter, inner, format.label());
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            crate::ui_helpers::draw_cell_filename(painter, inner, name, name_text_color, dark);
+            crate::ui_helpers::draw_cell_filename(
+                painter,
+                inner,
+                name,
+                name_text_color,
+                dark,
+                crate::ui_helpers::estimated_file_badge_width(inner),
+            );
         }
         GridItem::ZipSeparator { dir_display } => {
             // 作品境界のセパレータ: 1 セル全体に目立つ背景 + フォルダ名
