@@ -1849,15 +1849,19 @@ pub(super) fn native_perf_expected_frame_ms_from_values<I>(values: I) -> Option<
 where
     I: IntoIterator<Item = f32>,
 {
+    // Upper bound 250ms は MIN_PLAYBACK_SPEED=0.25 × 24fps (= 166.7ms) に余裕を持たせた値。
+    // filter (= 入力 reject) と clamp (= 出力丸め) で同じ値にしておくと、24fps を 0.25x で
+    // 再生した時に median が input を通過しても出力で潰れる、という不整合を防げる。
+    const EXPECTED_MS_MAX: f32 = 250.0;
     let mut values: Vec<f32> = values
         .into_iter()
-        .filter(|value| value.is_finite() && *value > 0.5 && *value < 250.0)
+        .filter(|value| value.is_finite() && *value > 0.5 && *value < EXPECTED_MS_MAX)
         .collect();
     if values.is_empty() {
         return None;
     }
     values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    Some(values[values.len() / 2].clamp(1.0, 120.0))
+    Some(values[values.len() / 2].clamp(1.0, EXPECTED_MS_MAX))
 }
 
 pub(super) fn native_perf_sample_has_frame_gap(sample: &NativeOverlayPerfSample) -> bool {
