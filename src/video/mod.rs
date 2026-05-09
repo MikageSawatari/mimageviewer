@@ -2338,9 +2338,8 @@ impl VideoPlayer {
         self.clock.is_seeking()
     }
 
-    /// Phase 9.G: perf overlay graph の freeze 判定。pause OR seek 処理中なら true。
-    /// `sample_video_perf` と `draw_video_perf_overlay` で同じ条件を見るため
-    /// VideoPlayer 側にまとめている (engine_state_atomic load + clock.is_seeking 1 回)。
+    /// pause OR seek 処理中なら true。native presenter overlay の perf graph
+    /// freeze 判定で使う (engine_state_atomic load + clock.is_seeking 1 回)。
     pub fn is_paused_or_seeking(&self) -> bool {
         self.engine_state_code() == engine::actor::state_code::PAUSED || self.is_seeking()
     }

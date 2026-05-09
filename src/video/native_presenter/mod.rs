@@ -1993,8 +1993,7 @@ impl NativeEguiOverlay {
             // 速度変更前のサンプルは旧 playback_speed のまま `perf_history` に残るが、
             // Y 軸スケールと gap 判定は最新サンプル群の median から導出されるため、
             // 過渡期に旧サンプルが新スケール基準で再解釈されて色がちらつく。新速度
-            // で素のグラフから始めるためにクリアする (= reset_video_perf_history と
-            // 同じ意図)。
+            // で素のグラフから始めるためにクリアする。
             self.perf_history.clear();
             self.perf_pause_gap_pending = false;
         }

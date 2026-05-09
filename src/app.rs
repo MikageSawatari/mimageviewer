@@ -985,19 +985,6 @@ use crate::ui_helpers::{
     truncate_name,
 };
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct VideoPerfSample {
-    pub interval_ms: f32,
-    pub arrival: std::time::Instant,
-    /// Frames that should have appeared at the source FPS during this interval
-    /// but did not reach the fullscreen presenter.
-    pub expected_misses: u32,
-    pub decoder_skips: u32,
-    pub ui_skips: u32,
-    pub buffer_len: u8,
-    pub is_warmup: bool,
-}
-
 /// 消しゴムモードのツール種別。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EraseTool {
@@ -1331,13 +1318,6 @@ pub(crate) struct VideoTileSwapPending {
     pub(crate) source_epoch: u64,
     pub(crate) started_at: std::time::Instant,
     pub(crate) deadline: std::time::Instant,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct VideoFrameStepHold {
-    pub(crate) fs_idx: usize,
-    pub(crate) direction: i32,
-    pub(crate) last_step_at: std::time::Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -1862,28 +1842,6 @@ pub struct App {
     pub(crate) fullscreen_video_marker_cache: Option<FullscreenVideoMarkerCache>,
     /// 動画再生中の FPS / フレーム間隔オーバーレイ (P キーで トグル)。
     pub(crate) video_perf_overlay_visible: bool,
-    /// 直近 N フレームの perf overlay サンプル。
-    /// `arrival` で repaint 時の連続スクロールを可能にし、`decoder_skips`
-    /// (= video_tx overflow) と `ui_skips` (= dropped_past) を色分けする。
-    /// `buffer_len` は UI side future_frames キュー残量、`is_warmup` は
-    /// 「engine state ≠ Playing (= Buffering / Loading / Seeking、cpal 出力が
-    /// silent な期間)」を記録する。perf overlay の graph 上で warmup 区間を
-    /// 背景色で識別する用 (Phase 9.B)。
-    pub(crate) video_perf_history: std::collections::VecDeque<VideoPerfSample>,
-    /// 前回サンプリング時刻 (= 直前の新フレーム検知 wall 時刻)。
-    pub(crate) video_perf_last_wall: Option<std::time::Instant>,
-    /// 前回サンプリング時の displayed_frame_seq (= VideoPlayer の atomic カウンタ、
-    /// GPU/CPU 経路の両方で tick 内 +1)。これで経路に依存せず新フレーム検知できる。
-    pub(crate) video_perf_last_seq: Option<u64>,
-    /// 前回サンプリング時の decoder 側 dropped_full 累積。
-    pub(crate) video_perf_last_decoder_skip: Option<u64>,
-    /// 前回サンプリング時の UI 側 dropped_past 累積。
-    pub(crate) video_perf_last_ui_skip: Option<u64>,
-    /// Phase 9.F: 一時停止が開始された wall 時刻。Some の間は pause 中。
-    /// resume 時に (Instant::now - pause_start) を全 history の arrival に加算して
-    /// graph 表示位置を維持する (= ユーザー要望「pause→resume 時にグラフがジャンプ
-    /// しないようにしたい」を反映)。
-    pub(crate) video_perf_pause_start: Option<std::time::Instant>,
 
     // ── レーティング DB ──────────────────────────────────────────
     /// レーティング DB (全体で 1 ファイル)
@@ -2217,14 +2175,6 @@ pub struct App {
     /// 右上フィードバック表示: (テキスト, 表示開始時刻)。フルスクリーン / グリッド共通。
     /// 命名の `fs_` プレフィックスはフルスクリーン専用だった頃の名残。
     pub(crate) fs_feedback_toast: Option<(String, std::time::Instant)>,
-    /// 動画 HUD の最終ユーザー活動時刻 (マウス移動 / キー入力 / HUD ホバー)。
-    /// `draw_video_hud` がアイドル時間を計算してフェードアウトの αを決定する。
-    /// `None` は「まだ動画を開いた直後 / 直前に活動があったとみなす」状態。
-    pub(crate) video_hud_last_activity: Option<std::time::Instant>,
-    /// 動画 HUD が現在描画されている可視度 (0.0 = 完全非表示、1.0 = フル表示)。
-    /// `video_hud_rect` のクリック判定が「描画されている領域だけクリックを吸収する」
-    /// ように使う (= フェードアウト後の領域は背景クリックを通過させる)。
-    pub(crate) video_hud_visible_factor: f32,
     /// フルスクリーンでマウスカーソルの最終活動時刻 (移動 / クリック / キー入力)。
     /// パネル / HUD が全て非表示で `CURSOR_HIDE_IDLE_SECS` 経過したらカーソルを隠す。
     /// `None` はまだ活動が記録されていない状態 (= 直前に活動があったとみなしカーソル表示)。
@@ -2238,10 +2188,6 @@ pub struct App {
     pub(crate) cursor_hidden: bool,
     /// 動画倍速再生のセッション内設定。settings には保存しない。
     pub(crate) video_playback_speed: f64,
-    /// legacy egui HUD の速度ポップアップ表示状態。
-    pub(crate) video_speed_popup_open: bool,
-    /// legacy egui 上部バーの前/次フレーム長押しリピート状態。
-    pub(crate) video_frame_step_hold: Option<VideoFrameStepHold>,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -2413,10 +2359,6 @@ pub struct App {
     /// 変化を検出したフレームで `fs.paint` イベントを発火する。
     pub(crate) fs_painted_last: Option<(usize, egui::TextureId, u64)>,
 
-    /// 動画シークホバー時のサムネ表示用テクスチャ。1 動画につき 1 つだけ持ち、
-    /// hover 中の target_secs key が変わるたびに `set()` で in-place 更新する。
-    /// (fs_idx, bucket_key, TextureHandle) — fs_idx 切替時に再作成。
-    pub(crate) video_seek_thumb_tex: Option<(usize, i64, egui::TextureHandle)>,
     /// 動画再生位置の自動保存タイマ (5 秒間隔)。
     pub(crate) video_resume_last_save: Option<std::time::Instant>,
 
@@ -2829,12 +2771,6 @@ impl Default for App {
             video_thumb_overrides_dirty: false,
             fullscreen_video_marker_cache: None,
             video_perf_overlay_visible: false,
-            video_perf_history: std::collections::VecDeque::with_capacity(200),
-            video_perf_last_wall: None,
-            video_perf_last_seq: None,
-            video_perf_last_decoder_skip: None,
-            video_perf_last_ui_skip: None,
-            video_perf_pause_start: None,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
             rating_filter_suppressed_at: None,
@@ -2936,13 +2872,9 @@ impl Default for App {
             ime_composing: false,
             ime_last_event_at: None,
             fs_feedback_toast: None,
-            video_hud_last_activity: None,
-            video_hud_visible_factor: 1.0,
             cursor_last_activity: None,
             cursor_hidden: false,
             video_playback_speed: 1.0,
-            video_speed_popup_open: false,
-            video_frame_step_hold: None,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_restart_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2990,7 +2922,6 @@ impl Default for App {
             perf_last_frame_begin: None,
             perf_last_flush: None,
             fs_painted_last: None,
-            video_seek_thumb_tex: None,
             video_resume_last_save: None,
             sidecars: std::collections::HashMap::new(),
             tray_controller: None,

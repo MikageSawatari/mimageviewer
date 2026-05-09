@@ -510,17 +510,10 @@ impl App {
             return;
         }
         let speed = crate::video::clock::clamp_playback_speed(speed);
-        let speed_changed = (self.video_playback_speed - speed).abs() > 1.0e-9;
         self.video_playback_speed = speed;
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_playback_speed(speed);
             self.mark_native_video_hud_activity(ctx);
-        }
-        if speed_changed {
-            // Perf overlay の Y 軸スケールは現在速度に追従する。旧スケールの
-            // サンプルが残ると色判定 (hitch 閾値) が不整合になるため history を
-            // クリアして新スケールで再構築させる。
-            self.reset_video_perf_history();
         }
     }
 
@@ -1329,11 +1322,6 @@ impl App {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.set_native_perf_overlay_visible(self.video_perf_overlay_visible);
                 }
-                self.video_perf_history.clear();
-                self.video_perf_last_wall = None;
-                self.video_perf_last_seq = None;
-                self.video_perf_last_decoder_skip = None;
-                self.video_perf_last_ui_skip = None;
             }
             // S: tile mode toggle. This still uses the egui context for screen
             // size until the native overlay owns layout.
@@ -1599,11 +1587,6 @@ impl App {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_native_perf_overlay_visible(self.video_perf_overlay_visible);
         }
-        self.video_perf_history.clear();
-        self.video_perf_last_wall = None;
-        self.video_perf_last_seq = None;
-        self.video_perf_last_decoder_skip = None;
-        self.video_perf_last_ui_skip = None;
     }
 
     #[cfg(windows)]
@@ -1846,7 +1829,6 @@ impl App {
     #[cfg(windows)]
     pub(super) fn mark_native_video_hud_activity(&mut self, ctx: &egui::Context) {
         let now = std::time::Instant::now();
-        self.video_hud_last_activity = Some(now);
         // ネイティブビデオウィンドウのマウス/キー入力は eframe フルスクリーンビューポートの
         // input には現れないため、カーソル auto-hide のアクティビティタイマもここで更新する。
         // 動画 HUD 活動 = ユーザーがマウスを動かしたかキー操作した = カーソル可視。
