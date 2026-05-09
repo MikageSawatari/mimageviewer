@@ -7042,14 +7042,6 @@ impl App {
                 ),
             );
             draw_replay_icon(&painter, left_center, icon_radius * 0.6);
-            // 「最初から」ラベル (アイコン直下)
-            painter.text(
-                egui::pos2(left_center.x, left_center.y + icon_radius + 14.0),
-                egui::Align2::CENTER_CENTER,
-                "最初から",
-                egui::FontId::proportional(14.0),
-                egui::Color32::from_rgba_unmultiplied(230, 230, 230, 230),
-            );
             if left_resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
@@ -7087,13 +7079,6 @@ impl App {
                 ),
             );
             draw_play_icon(&painter, right_center, icon_radius);
-            painter.text(
-                egui::pos2(right_center.x, right_center.y + icon_radius + 14.0),
-                egui::Align2::CENTER_CENTER,
-                "続きから",
-                egui::FontId::proportional(14.0),
-                egui::Color32::from_rgba_unmultiplied(230, 230, 230, 230),
-            );
             if right_resp.hovered() {
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
@@ -7102,6 +7087,52 @@ impl App {
             {
                 p.toggle_play();
             }
+
+            // 動画の明るいフレーム上でもボタン説明が読めるよう、ラベルだけを
+            // 控えめな半透明の黒帯に載せる。
+            let label_font = egui::FontId::proportional(14.0);
+            let label_color = egui::Color32::from_rgba_unmultiplied(240, 240, 240, 238);
+            let left_label =
+                painter.layout_no_wrap("最初から".to_owned(), label_font.clone(), label_color);
+            let right_label =
+                painter.layout_no_wrap("続きから".to_owned(), label_font, label_color);
+            let label_y = full_rect.center().y + icon_radius + 14.0;
+            let left_label_pos = egui::pos2(
+                left_center.x - left_label.size().x * 0.5,
+                label_y - left_label.size().y * 0.5,
+            );
+            let right_label_pos = egui::pos2(
+                right_center.x - right_label.size().x * 0.5,
+                label_y - right_label.size().y * 0.5,
+            );
+            let text_min = egui::pos2(
+                left_label_pos.x.min(right_label_pos.x),
+                left_label_pos.y.min(right_label_pos.y),
+            );
+            let text_max = egui::pos2(
+                (left_label_pos.x + left_label.size().x)
+                    .max(right_label_pos.x + right_label.size().x),
+                (left_label_pos.y + left_label.size().y)
+                    .max(right_label_pos.y + right_label.size().y),
+            );
+            let label_bg_rect =
+                egui::Rect::from_min_max(text_min, text_max).expand2(egui::vec2(16.0, 7.0));
+            painter.rect_filled(
+                label_bg_rect,
+                6.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 168),
+            );
+            painter.rect_stroke(
+                label_bg_rect,
+                6.0,
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 36),
+                ),
+                egui::StrokeKind::Outside,
+            );
+            painter.galley(left_label_pos, left_label, label_color);
+            painter.galley(right_label_pos, right_label, label_color);
         }
 
         // 再生中、ユーザーが一定時間操作しなかったら HUD を滑らかに薄くしていく。
@@ -7787,7 +7818,16 @@ impl App {
         painter.rect_filled(
             bg_rect,
             6.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160),
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 184),
+        );
+        painter.rect_stroke(
+            bg_rect,
+            6.0,
+            egui::Stroke::new(
+                1.0,
+                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 38),
+            ),
+            egui::StrokeKind::Outside,
         );
         let l1_pos = egui::pos2(center_x - g1.size().x / 2.0, bg_rect.min.y + pad);
         painter.galley(l1_pos, g1, text_color);

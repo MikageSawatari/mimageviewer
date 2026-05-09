@@ -4338,27 +4338,70 @@ fn draw_native_center_pause_controls(
             }
             draw_overlay_replay_icon(&painter, replay_center, 22.0);
             draw_overlay_play_icon(&painter, play_center, 24.0);
-            painter.text(
-                replay_center + egui::vec2(0.0, radius + 22.0),
-                egui::Align2::CENTER_CENTER,
-                "最初から",
-                egui::FontId::proportional(16.0),
-                egui::Color32::WHITE,
+
+            let label_font = egui::FontId::proportional(16.0);
+            let hint_font = egui::FontId::proportional(13.0);
+            let label_color = egui::Color32::WHITE;
+            let hint_color = egui::Color32::from_gray(220);
+            let replay_label =
+                painter.layout_no_wrap("最初から".to_owned(), label_font.clone(), label_color);
+            let play_label = painter.layout_no_wrap("続きから".to_owned(), label_font, label_color);
+            let hint_label = painter.layout_no_wrap(
+                "Enter: 再生 / W: 頭出し / ←→: シーク / J,K: マーカー移動".to_owned(),
+                hint_font,
+                hint_color,
             );
-            painter.text(
-                play_center + egui::vec2(0.0, radius + 22.0),
-                egui::Align2::CENTER_CENTER,
-                "続きから",
-                egui::FontId::proportional(16.0),
-                egui::Color32::WHITE,
+            let label_y = center_y + radius + 22.0;
+            let hint_y = center_y + radius + 52.0;
+            let replay_label_pos = egui::pos2(
+                replay_center.x - replay_label.size().x * 0.5,
+                label_y - replay_label.size().y * 0.5,
             );
-            painter.text(
-                egui::pos2(full_rect.center().x, center_y + radius + 52.0),
-                egui::Align2::CENTER_CENTER,
-                "Enter: 再生 / W: 頭出し / ←→: シーク / J,K: マーカー移動",
-                egui::FontId::proportional(13.0),
-                egui::Color32::from_gray(205),
+            let play_label_pos = egui::pos2(
+                play_center.x - play_label.size().x * 0.5,
+                label_y - play_label.size().y * 0.5,
             );
+            let hint_label_pos = egui::pos2(
+                full_rect.center().x - hint_label.size().x * 0.5,
+                hint_y - hint_label.size().y * 0.5,
+            );
+            let text_min = egui::pos2(
+                replay_label_pos
+                    .x
+                    .min(play_label_pos.x)
+                    .min(hint_label_pos.x),
+                replay_label_pos
+                    .y
+                    .min(play_label_pos.y)
+                    .min(hint_label_pos.y),
+            );
+            let text_max = egui::pos2(
+                (replay_label_pos.x + replay_label.size().x)
+                    .max(play_label_pos.x + play_label.size().x)
+                    .max(hint_label_pos.x + hint_label.size().x),
+                (replay_label_pos.y + replay_label.size().y)
+                    .max(play_label_pos.y + play_label.size().y)
+                    .max(hint_label_pos.y + hint_label.size().y),
+            );
+            let backdrop_rect =
+                egui::Rect::from_min_max(text_min, text_max).expand2(egui::vec2(16.0, 9.0));
+            painter.rect_filled(
+                backdrop_rect,
+                6.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 178),
+            );
+            painter.rect_stroke(
+                backdrop_rect,
+                6.0,
+                egui::Stroke::new(
+                    1.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 42),
+                ),
+                egui::StrokeKind::Outside,
+            );
+            painter.galley(replay_label_pos, replay_label, label_color);
+            painter.galley(play_label_pos, play_label, label_color);
+            painter.galley(hint_label_pos, hint_label, hint_color);
 
             if replay_resp.clicked() {
                 commands.push(NativeOverlayCommand::SeekToStartAndPlay);
