@@ -2170,23 +2170,25 @@ impl VideoPlayer {
         #[cfg(windows)]
         let duration_secs_bits = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
         // 動画は native presenter (独立 HWND + D3D11 swap chain) を必須とする。
-        // config が無い (= モニター情報取得失敗) / spawn が失敗 (= スレッド生成失敗) の
-        // どちらでも、UI に表示するフレームの実体経路がないので、その時点で player の
-        // `error` フィールドにメッセージを入れる。UI は赤字エラーで「読込失敗」を表示し、
-        // displayed_frame_seq=0 のままなので "動画を準備中..." の無限ループに陥らない。
+        // - `native_output_config = None`: 呼び出し元が後から `attach_native_output`
+        //   で output を渡す fast-swap 経路のシグナル (= ここではエラー扱いしない)。
+        //   実際にモニター情報取得失敗で None になった場合は、呼び出し元
+        //   (`start_fs_load`) が `fail_native_init` で error を立てる責務を持つ。
+        // - `spawn` 失敗: presenter スレッド生成エラー。UI に表示するフレームの
+        //   実体経路がないので、その時点で player の `error` フィールドにメッセージを
+        //   入れる。UI は赤字エラーで「読込失敗」を表示し、displayed_frame_seq=0 の
+        //   ままなので "動画を準備中..." の無限ループに陥らない。
         #[cfg(windows)]
         let (native_output, native_init_error): (
             Option<NativeVideoOutput>,
             Option<String>,
         ) = {
             match native_output_config {
-                None => (
-                    None,
-                    Some(
-                        "ネイティブ動画プレゼンターの設定取得に失敗しました (モニター情報を取れません)"
-                            .to_string(),
-                    ),
-                ),
+                // None は「呼び出し元が attach_native_output で後から output を渡す」
+                // ことを示すシグナル (fast-swap 経路)。実際にモニター情報取得失敗で
+                // None になったケースは、呼び出し元 (start_fs_load) が
+                // `fail_native_init` で error をセットする責務を持つ。
+                None => (None, None),
                 Some(config) => match NativeVideoOutput::spawn(
                     native_video_rx,
                     Arc::clone(&clock),
@@ -2254,10 +2256,10 @@ impl VideoPlayer {
             #[cfg(windows)]
             native_hover_thumbnail_sent_key: Mutex::new(None),
         };
-        // 同期 init error (config=None / spawn=None) の場合、すでに走っている
-        // decoder / audio / thumbnail worker を停止する。`tick()` は
-        // `error.is_some()` で早期 return するので、放置すると裏で再生パイプライン
-        // だけが回り続ける。
+        // spawn 失敗で error が立った場合、すでに走っている decoder / audio /
+        // thumbnail worker を停止する。`tick()` は `error.is_some()` で早期 return
+        // するので、放置すると裏で再生パイプラインだけが回り続ける。
+        // (config=None ケースは呼び出し元が `fail_native_init` 経由で同等の処理を行う)
         if player.error.is_some() {
             player.shutdown_workers_for_error();
         }
@@ -3388,9 +3390,33 @@ impl VideoPlayer {
         }
     }
 
+    /// 呼び出し元 (= `start_fs_load`) が `native_video_presenter_config` の
+    /// 取得に同期的に失敗したとき、construct 済み player に init エラーを伝える
+    /// 正規 API。`error` フィールドに message を立てた直後に
+    /// `shutdown_workers_for_error()` を呼んで decoder / audio / thumb worker を
+    /// 停止する (= `tick()` が `error.is_some()` で早期 return するため、
+    /// 放置すると裏で再生パイプラインだけが回り続けることを防ぐ)。
+    ///
+    /// `VideoPlayer::open(..., native_output_config=None)` は fast-swap 経路で
+    /// 意図的に呼ばれるシグナルなので open() 内ではエラー扱いしない。実エラー
+    /// 判定は呼び出し元の責務。
+    ///
+    /// 呼び出し元 (`src/app.rs:start_fs_load`) は lib crate からは見えない
+    /// (`src/lib.rs` の `app` は stub) ため、lib build では未使用に見える。
+    /// `attach_native_output` と同じ理由で `#[allow(dead_code)]` を付与する。
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn fail_native_init(&mut self, message: String) {
+        self.error = Some(message);
+        self.shutdown_workers_for_error();
+    }
+
     /// `error` を立てた直後に裏で動き続けている decoder / audio / thumbnail worker を
-    /// 停止する。`open()` の native_output_config=None / spawn 失敗パスと、
-    /// presenter thread 内 init 失敗を `tick()` で検知したパスから呼ぶ。
+    /// 停止する。呼び出し元は 3 経路:
+    ///   1. `open()` の spawn 失敗パス (config=Some だが presenter スレッド生成失敗)
+    ///   2. `consume_native_init_error()` (presenter thread 内 init 失敗を tick で検知)
+    ///   3. `fail_native_init()` (呼び出し元が `native_video_presenter_config` の
+    ///      同期取得に失敗 = config=None を検知して通知)
     ///
     /// 内部的には `shutdown()` と同じ処理 (cancel フラグ + audio drop) に加えて
     /// thumbnail worker も解放する。完全 idempotent なので open() から複数回呼んでも安全。

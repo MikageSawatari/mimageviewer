@@ -10417,20 +10417,32 @@ impl App {
             }
             if !self.fs_cache.contains_key(&idx) {
                 let from_grid = std::mem::take(&mut self.fs_open_intent_from_grid);
-                let player = self.build_video_player_for_open(
+                #[cfg(windows)]
+                let native_config = native_video_presenter_config(
+                    self.main_hwnd,
+                    self.video_perf_overlay_visible,
+                    self.video_tile_reopen_pending,
+                    self.settings.vst3_enabled,
+                    self.checked.contains(&idx),
+                );
+                #[cfg(windows)]
+                let native_config_missing = native_config.is_none();
+                #[allow(unused_mut)]
+                let mut player = self.build_video_player_for_open(
                     idx,
                     vp,
                     from_grid,
                     None,
                     #[cfg(windows)]
-                    native_video_presenter_config(
-                        self.main_hwnd,
-                        self.video_perf_overlay_visible,
-                        self.video_tile_reopen_pending,
-                        self.settings.vst3_enabled,
-                        self.checked.contains(&idx),
-                    ),
+                    native_config,
                 );
+                #[cfg(windows)]
+                if native_config_missing {
+                    player.fail_native_init(
+                        "ネイティブ動画プレゼンターの設定取得に失敗しました (モニター情報を取れません)"
+                            .to_string(),
+                    );
+                }
                 self.fs_cache.insert(
                     idx,
                     FsCacheEntry::Video {
@@ -16085,7 +16097,10 @@ fn native_video_presenter_config(
         ..Default::default()
     };
     if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        // VideoPlayer::open 側で `error` を立てて UI に「読込失敗」を表示させる。
+        // None を返すと、呼び出し元 (`start_fs_load`) が `player.fail_native_init()`
+        // で error を立てて UI に「読込失敗」を表示させる。
+        // (fast-swap 経路は意図的に None を渡すため、ここの None と区別するために
+        // 「呼び出し元が config を期待していたか」を呼び出し元側で判断している)
         crate::logger::log(
             "[native-video] GetMonitorInfoW failed; native presenter cannot start, video will fail to open",
         );

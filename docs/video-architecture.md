@@ -499,6 +499,27 @@ pub enum VideoFrameData {
   まで保持。次フレーム到着で旧 frame の Drop が NT HANDLE を `CloseHandle` する
   (= 描画中の HANDLE が close される race を防ぐ)
 
+### `VideoPlayer::open(..., native_output_config=None)` のセマンティクス
+
+`VideoPlayer::open` の `native_output_config: Option<NativeVideoOutputConfig>` 引数で
+`None` を渡すのは「呼び出し元が後から `attach_native_output` で output を移植する」
+ことを示す**正常なシグナル**で、エラー扱いしない。
+
+- **fast-swap 経路** (`try_start_video_tile_fast_swap` in [src/app/native_video.rs](../src/app/native_video.rs)):
+  動画タイルモード中のホイールナビゲーションで、旧 player から
+  `take_native_output()` で取り外した output を新 player に `attach_native_output`
+  で移植する。新 player 側の `VideoPlayer::open` には `native_output_config=None`
+  を渡す (= 自前で spawn しない)。
+- **通常経路** (`start_fs_load` in [src/app.rs](../src/app.rs)):
+  `native_video_presenter_config(self.main_hwnd, ...)` で config を取得して
+  `Some(config)` を渡す。万一 `None` が返った (= モニター情報取得失敗) ときは、
+  呼び出し元が `player.fail_native_init(message)` を呼んで error を立てて
+  worker を停止する。
+- **責務分担**: 「config が取れなかった = 同期 init エラー」の判断は呼び出し元が
+  行う (= 呼び出し元だけが「自分が config を期待していたか」を知っている)。
+  presenter thread 内の遅延 init エラーは別系統 (`consume_native_init_error`)
+  で `tick()` 中に取り込む。
+
 ## 設定との関係
 
 整理後、削除する設定項目:
