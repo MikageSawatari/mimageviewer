@@ -863,8 +863,8 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(6.0);
     ui.checkbox(&mut s.video_hw_decode, "ハードウェアデコードを有効にする")
         .on_hover_text(
-            "ON: 対応コーデックは GPU でデコード (失敗時は CPU に自動フォールバック)。\n\
-         OFF (既定): 常に CPU でデコード。\n\
+            "ON (既定): 対応コーデックは GPU でデコード (失敗時は CPU に自動フォールバック)。\n\
+         OFF: 常に CPU でデコード。\n\
          切り替え後は次に開く動画から反映されます。",
         );
 

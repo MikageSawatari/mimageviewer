@@ -836,9 +836,9 @@ pub struct Settings {
     #[serde(default)]
     pub video_resume_positions: std::collections::HashMap<String, f64>,
     /// ハードウェアデコードを利用するか (Windows D3D11VA)。失敗時は自動的に SW にフォールバック。
-    /// 初期は OFF (安定優先)。HEVC / 4K 動画の CPU 負荷を大きく下げるため、動作確認後に
-    /// 有効化することを想定。
-    #[serde(default)]
+    /// HEVC / 4K 動画の CPU 負荷を大きく下げるため既定 ON。GPU ドライバの不具合等で
+    /// HW 経路だけ問題が出る場合は環境設定から OFF に切り替えて回避できる。
+    #[serde(default = "default_true")]
     pub video_hw_decode: bool,
     /// インターレース動画のデインターレース処理。
     /// Auto は FFmpeg frame の interlaced flag または stream field_order が
@@ -1250,7 +1250,7 @@ impl Default for Settings {
             video_loop: false,
             video_start_muted: false,
             video_resume_positions: std::collections::HashMap::new(),
-            video_hw_decode: false,
+            video_hw_decode: true,
             video_deinterlace: VideoDeinterlaceMode::default(),
             video_thumb_use_sidecar_image: true,
             video_tile_columns: default_video_tile_columns(),
