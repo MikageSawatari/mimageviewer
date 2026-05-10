@@ -2654,7 +2654,6 @@ impl NativeEguiOverlay {
         let cursor_blocking_overlay_visible = tile_overlay_visible
             || bottom_hud_visible
             || panel_chrome_visible
-            || perf_visible
             || status_visible
             || toast_visible
             || bookmark_title_edit_visible
