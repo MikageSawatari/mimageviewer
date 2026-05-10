@@ -2558,6 +2558,14 @@ impl NativeEguiOverlay {
         let ppp = self.pixels_per_point;
         let event_count = self.event_count;
         let pointer_pos = self.pointer_pos;
+        // hover_preview_target_secs はシークバー Area (= bottom_hud_visible) 内でしか
+        // 更新されない。pointer が hud 領域から外れた状態で Some が居座ると
+        // jump_panel_visible() / right_panel_visible() を false に固定し続ける
+        // (paused_center_visible により overlay_visible 経路の clear も走らない)。
+        // hud 領域外なら preview UI 自体描画されないので、ここで先に倒す。
+        if self.hover_preview_target_secs.is_some() && !self.hud_visible() {
+            self.hover_preview_target_secs = None;
+        }
         let overlay_width_points = self.width as f32 / ppp;
         let overlay_height_points = self.height as f32 / ppp;
         let position_secs = self.video_position_secs;
