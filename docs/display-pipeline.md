@@ -126,6 +126,12 @@ ui_fullscreen.rs::render_fullscreen_viewport
     └─ update_prefetch_window(idx)     # 前後数枚を先読み / 範囲外を解放
 ```
 
+**`keep_fullscreen_viewport_alive`** はフルスクリーン非アクティブ時 (`fullscreen_idx == None`)
+に呼ばれ、`fs_viewport_shown == true` の 1 フレームだけ `Visible(false)` cmd を送って hidden 化
+する責務を持つ。それ以外のアイドルでは何もしない (2026-05-10、hidden viewport 維持コスト削減)。
+代償として `close_fullscreen` 後の再入場で 1x1 → フルサイズの DWM 遷移フラッシュが毎回出る。
+詳細は [docs/ui-responsiveness.md §9](ui-responsiveness.md) を参照。
+
 ### 2.2 ロードスレッド
 
 `App::start_fs_load` (app.rs) が std::thread::spawn で 1 枚ごとに spawn:

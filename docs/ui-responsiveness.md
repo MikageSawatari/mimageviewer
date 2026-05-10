@@ -345,3 +345,30 @@ UI を止めない」方針の未達項目として残す。
 | バックグラウンドメタデータ読み | [src/app.rs `start_metadata_load`, `run_metadata_load`](../src/app.rs) |
 | 起動時間計装 | [src/main.rs `emit_startup`](../src/main.rs), [src/app.rs `startup.first_frame`](../src/app.rs) |
 | 解析スクリプト | [scripts/analyze_perf.py](../scripts/analyze_perf.py) |
+
+---
+
+## 9. hidden viewport の常時維持を避ける (2026-05-10 追加)
+
+`ctx.show_viewport_immediate(...with_visible(false), ...)` を「次回表示のちらつき防止」目的で
+毎フレーム呼ぶと、hidden viewport の維持コストが他フレーム作業を圧迫する。2026-05-10 の
+perf log では `fullscreen_viewport_ms` が 30-70ms/frame を占めており、`keep_fullscreen_viewport_alive`
+内の inactive hidden viewport 維持が主要候補だった (修正後は `keep_fullscreen_viewport_ms` /
+`render_fullscreen_viewport_ms` / `ensure_native_video_front_ms` の分割計装で確認可能)。
+非アクティブ時には呼ばないこと。終了直後 1 フレームだけ `Visible(false)` cmd 送信用に
+show_viewport_immediate を呼ぶ用法は OK。
+
+代償: `close_fullscreen` 後の再入場時に 1x1 → フルサイズの DWM 遷移フラッシュが毎回出る
+(`fs_viewport_recreate_after_hide` で generation が進み新しい ViewportId になるため)。
+実機で許容できないと判定された場合は、フルスクリーン終了後 N 秒は keep_alive を維持する
+grace 期間を別途追加する。
+
+**関連ルール**: `keep_fullscreen_viewport_alive` 実行後に `close_fullscreen` する経路で、
+同フレーム内に fullscreen を再 open しない場合は明示的に `ctx.request_repaint()` を呼ぶ。
+修正後の keep_alive はアイドル時ゼロコスト早期 return するため、cleanup 用の次フレームを
+偶発的な input/focus repaint に依存させてはいけない。
+
+**統一安全網**: `App::update` 末尾で `if self.fs_viewport_shown && self.fullscreen_idx.is_none()`
+が true なら `ctx.request_repaint()` を呼ぶ。これにより `close_fullscreen` が update 内の
+どこで呼ばれても次フレームで cleanup が確実に走る。個別 call site の `request_repaint` 追加は
+意図表明としての価値はあるが、漏れたケースもこの安全網が拾う。

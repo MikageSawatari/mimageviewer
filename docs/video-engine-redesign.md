@@ -1446,6 +1446,21 @@ visible beside other apps. Use
 `fifo`, or `fifo_relaxed`, and `MIV_WGPU_FRAME_LATENCY=default` or a positive
 integer when comparing GPU/driver behavior.
 
+2026-05-10 follow-up: even after the AutoVsync change, perf logs still showed
+`fullscreen_viewport_ms` consuming 30-70 ms/frame while the grid window was idle.
+The cause was `keep_fullscreen_viewport_alive` calling
+`ctx.show_viewport_immediate(...with_visible(false), |_, _| {})` on every frame to
+pre-warm the hidden fullscreen viewport for flicker-free first entry. We now skip
+that call when the viewport is not actively shown, and only invoke
+`show_viewport_immediate` for the single cleanup frame after `close_fullscreen`
+to send `Visible(false)`. Newly added split metrics (`keep_fullscreen_viewport_ms`,
+`render_fullscreen_viewport_ms`, `ensure_native_video_front_ms`) coexist with the
+existing `fullscreen_viewport_ms` aggregate so before/after comparisons stay
+straightforward. Trade-off: re-entering fullscreen after `close_fullscreen` shows a
+brief 1x1 → fullsize DWM transition each time. See
+[docs/ui-responsiveness.md §9](ui-responsiveness.md) for the rule and
+implementation guidance.
+
 2026-05-04 playback soak test mode: mIV now has a one-file playback automation
 entry point for nightly regression checks. `--play-test <FILE>` opens the file
 through the normal fullscreen video path, `--play-test-start <SECONDS>` forces a

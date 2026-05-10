@@ -992,10 +992,19 @@ impl App {
         egui::ViewportId::from_hash_of(("fullscreen_viewer", self.fs_viewport_generation))
     }
 
-    /// フルスクリーンビューポートを描画し、終了後のナビゲーション処理も行う。
-    /// フルスクリーン表示中でなければ何もしない。
-    /// フルスクリーンが非アクティブでもビューポートを非表示で維持する。
-    /// アプリ起動直後から呼ばれ、初回のフルスクリーン表示時のちらつきを防ぐ。
+    /// フルスクリーンビューポートのライフサイクル後始末を行う。
+    ///
+    /// - フルスクリーンが現在アクティブ (`fullscreen_idx.is_some()`) なら何もしない
+    ///   (描画は `render_fullscreen_viewport` が担当)。
+    /// - PDF 列挙待ちの遷移中は holdover を表示してちらつきを防ぐ。
+    /// - フルスクリーン終了直後の 1 フレームだけ `Visible(false)` を送って hidden に落とす。
+    /// - それ以外のアイドル時は何もしない。以前は「入場時のちらつき防止」のため毎フレーム
+    ///   `show_viewport_immediate(...with_visible(false), ...)` を呼んでいたが、hidden viewport の
+    ///   常時維持が `fullscreen_viewport_ms` の主要候補だった (2026-05-10 perf log で
+    ///   非アクティブ時に 30-70ms/frame を計測、内訳分割は同改修で追加) ため、呼ばない方針に
+    ///   変更した。代償として `close_fullscreen` 後の再入場時に 1x1 → フルサイズの DWM 遷移
+    ///   フラッシュが毎回出る (`fs_viewport_recreate_after_hide` で generation が進み新しい
+    ///   ViewportId になるため)。
     pub(crate) fn keep_fullscreen_viewport_alive(&mut self, ctx: &egui::Context) {
         if self.fullscreen_idx.is_some() {
             return; // アクティブなときは render_fullscreen_viewport が担当
@@ -1063,22 +1072,24 @@ impl App {
             return;
         }
 
-        // 非表示でもフルスクリーンサイズを維持する。
-        // 1x1 → フルサイズへのリサイズが Visible(true) と同時に発生すると
-        // OS のウィンドウマネージャが中間状態を描画してちらつく。
-        let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
-        ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
+        // フルスクリーン非アクティブ時の hidden viewport 維持コストを排除する。
+        // 詳細は関数 doc を参照。
+        if !self.fs_viewport_shown {
+            return;
+        }
+        // ここに来るのは close_fullscreen 直後の 1 フレーム。
+        // show_viewport_immediate を 1 回呼んで viewport を alive にし、
         // ViewportBuilder::with_visible(false) は「initial」可視性しか制御しないため、
         // 一度表示済みのビューポートを隠すには明示的に Visible(false) を送る必要がある。
         // 送信直前に DWM トランジションを無効化して Win11 のフェードアウトを抑止する。
-        if self.fs_viewport_shown {
-            crate::dwm_transitions::disable_transitions_for_thread_windows();
-            ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
-            self.fs_viewport_shown = false;
-            if self.fs_viewport_recreate_after_hide {
-                self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
-                self.fs_viewport_recreate_after_hide = false;
-            }
+        let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
+        ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
+        crate::dwm_transitions::disable_transitions_for_thread_windows();
+        ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        self.fs_viewport_shown = false;
+        if self.fs_viewport_recreate_after_hide {
+            self.fs_viewport_generation = self.fs_viewport_generation.wrapping_add(1);
+            self.fs_viewport_recreate_after_hide = false;
         }
     }
 
@@ -3408,6 +3419,10 @@ impl App {
         if close_fs {
             self.close_fullscreen();
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            // keep_fullscreen_viewport_alive の cleanup フレーム (Visible(false) 送信) を保証。
+            // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、偶発的な
+            // input/focus repaint に頼らず明示的に次フレームを起こす。
+            ctx.request_repaint();
         }
         // Ctrl+↑↓ はフルスクリーンを保ったまま前後フォルダへ飛び、先頭/末尾の
         // 画像系アイテムを開く。self.selected も合わせて更新するので、ここから

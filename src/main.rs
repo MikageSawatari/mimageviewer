@@ -109,6 +109,10 @@ struct UiHeartbeatState {
     last_report_ms: std::sync::atomic::AtomicU64,
     suspended: AtomicBool,
     detail: Mutex<String>,
+    /// メインウィンドウの HWND (Windows only)。watchdog から `IsHungAppWindow` を
+    /// 呼ぶために共有する。0 の間は未捕捉 (early startup) を意味する。
+    /// `App::update` が main_hwnd を捕捉した時点で書き込む。
+    main_hwnd: std::sync::atomic::AtomicU64,
 }
 
 /// `startup.<step>` perf イベントを emit する共通ヘルパー。
@@ -245,6 +249,7 @@ fn install_ui_heartbeat_watchdog() {
                 last_report_ms: std::sync::atomic::AtomicU64::new(0),
                 suspended: AtomicBool::new(false),
                 detail: Mutex::new("no App::update heartbeat yet".to_owned()),
+                main_hwnd: std::sync::atomic::AtomicU64::new(0),
             })
         })
         .clone();
@@ -263,6 +268,29 @@ fn install_ui_heartbeat_watchdog() {
                 let age_ms = now_ms.saturating_sub(last_ms);
                 if age_ms < 5_000 {
                     continue;
+                }
+                // App::update が 5s 以上呼ばれていない。ただし「アイドルで意図的に
+                // sleep している」のと「message pump が hang している」を区別する。
+                // Windows なら `IsHungAppWindow` が真の判定手段 (= ユーザーが
+                // 「応答なし」表示を見るのと同じ条件)。message pump が応答するなら
+                // App::update が呼ばれていないのは正常 (request_repaint が呼ばれて
+                // いない idle 状態)。HWND がまだ未捕捉 (early startup) なら
+                // 安全側で警告する (= 旧来の挙動)。
+                #[cfg(windows)]
+                {
+                    let hwnd_raw = state.main_hwnd.load(Ordering::Acquire);
+                    if hwnd_raw != 0 {
+                        use windows::Win32::Foundation::HWND;
+                        use windows::Win32::UI::WindowsAndMessaging::IsHungAppWindow;
+                        let hwnd = HWND(hwnd_raw as *mut _);
+                        let is_hung = unsafe { IsHungAppWindow(hwnd).as_bool() };
+                        if !is_hung {
+                            // message pump は応答中。正常な idle なので報告しない。
+                            // last_report_ms を更新して次回 5s 後にまた静かに再評価。
+                            state.last_report_ms.store(now_ms, Ordering::Release);
+                            continue;
+                        }
+                    }
                 }
                 let last_report_ms = state.last_report_ms.load(Ordering::Acquire);
                 if now_ms.saturating_sub(last_report_ms) < 10_000 {
@@ -303,6 +331,15 @@ pub(crate) fn record_ui_heartbeat_detail(detail: String) {
         if let Ok(mut slot) = state.detail.lock() {
             *slot = detail;
         }
+    }
+}
+
+/// watchdog に main HWND を共有する。App::update が main_hwnd を捕捉した直後に
+/// 呼ぶ。watchdog はこの HWND に対して `IsHungAppWindow` を照会して、
+/// 「intentionally idle」と「actually hung」を区別する。
+pub(crate) fn set_ui_heartbeat_main_hwnd(hwnd_raw: u64) {
+    if let Some(state) = UI_HEARTBEAT.get() {
+        state.main_hwnd.store(hwnd_raw, Ordering::Release);
     }
 }
 

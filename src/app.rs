@@ -1364,6 +1364,12 @@ pub struct App {
     /// 直接整合する値。起動時の「outer を保存して inner として適用」によるタイトルバー
     /// 分のサイズ縮小を防ぐために、これを settings.window_size に書き戻す。
     pub(crate) last_inner_size: Option<[f32; 2]>,
+    /// 直近に `ViewportCommand::Title` で送信したタイトル文字列のキャッシュ。
+    /// 毎フレーム無条件に send_viewport_cmd(Title(...)) すると、egui 内部の
+    /// `request_repaint_of` が毎回発火して App::update が 60fps で回り続け、
+    /// 他アプリ (ゲーム等) の GPU/CPU 帯域を奪う。タイトルが変わったときだけ
+    /// 送信することで、アイドル時の repaint loop を断ち切る (2026-05-10 修正)。
+    pub(crate) last_window_title: Option<String>,
     /// 現在のウィンドウの DPI スケール（論理→物理変換に使用）
     pub(crate) last_pixels_per_point: f32,
     /// 初回フレームで適用する inner_size（egui#4918 / winit#923 対策）。
@@ -2650,6 +2656,7 @@ impl Default for App {
             scroll_to_selected: false,
             last_outer_rect: None,
             last_inner_size: None,
+            last_window_title: None,
             last_pixels_per_point: 1.0,
             pending_initial_size: None,
             cache_gen_total: 0,
@@ -13330,6 +13337,10 @@ impl App {
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
             self.close_fullscreen();
+            // keep_fullscreen_viewport_alive の cleanup フレーム (Visible(false) 送信) を保証。
+            // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、return 後の
+            // toast / 偶発 repaint に頼らず明示的に次フレームを起こす。
+            ctx.request_repaint();
             if let Some(err) = native_close_error {
                 self.show_feedback_toast(format!("動画を再生できません: {err}"));
             }
@@ -14065,6 +14076,9 @@ impl eframe::App for App {
                     self.main_hwnd = Some(hwnd_raw);
                     #[cfg(windows)]
                     self.dsp_bridge.set_main_hwnd(hwnd_raw as u64);
+                    // watchdog に HWND を共有 (IsHungAppWindow チェック用、
+                    // intentional idle と actual hang を区別するため)。
+                    crate::set_ui_heartbeat_main_hwnd(hwnd_raw as u64);
                     crate::logger::log(format!("tray: captured main HWND = {hwnd_raw:#x}"));
                     // アクティベーションリスナーに placement_slot を共有するため、
                     // ここでスロットを作成しておく (sync_tray_with_settings での遅延作成と
@@ -14177,6 +14191,20 @@ impl eframe::App for App {
                     let vst3_active_slots = self.dsp_bridge.active_slot_count() as i64;
                     #[cfg(not(windows))]
                     let vst3_active_slots = 0_i64;
+                    // 計装: window state と repaint 駆動条件を frame_gap に同梱する
+                    // (2026-05-10、最小化中に App::update が止まらない問題の調査用)。
+                    let is_minimized =
+                        ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+                    let visible_video_thumb_pending = self.keep_set.iter().any(|&idx| {
+                        matches!(self.items.get(idx), Some(GridItem::Video(_)))
+                            && matches!(
+                                self.thumbnails.get(idx),
+                                Some(ThumbnailState::Pending | ThumbnailState::Evicted)
+                            )
+                    });
+                    let thumbnail_work_active = !self.requested.is_empty()
+                        || !self.texture_backlog.is_empty()
+                        || visible_video_thumb_pending;
                     crate::perf::event(
                         "ui",
                         "frame_gap",
@@ -14212,6 +14240,43 @@ impl eframe::App for App {
                             (
                                 "vst3_active_slots",
                                 serde_json::Value::from(vst3_active_slots),
+                            ),
+                            ("is_minimized", serde_json::Value::from(is_minimized)),
+                            (
+                                "window_visible",
+                                serde_json::Value::from(self.window_visible),
+                            ),
+                            (
+                                "thumbnail_work_active",
+                                serde_json::Value::from(thumbnail_work_active),
+                            ),
+                            (
+                                "requested_len",
+                                serde_json::Value::from(self.requested.len() as i64),
+                            ),
+                            (
+                                "texture_backlog_len",
+                                serde_json::Value::from(self.texture_backlog.len() as i64),
+                            ),
+                            (
+                                "folder_nav_pending",
+                                serde_json::Value::from(self.folder_nav_pending.is_some()),
+                            ),
+                            (
+                                "pdf_enumerate_pending",
+                                serde_json::Value::from(self.pdf_enumerate_pending.is_some()),
+                            ),
+                            (
+                                "zip_enumerate_pending",
+                                serde_json::Value::from(self.zip_enumerate_pending.is_some()),
+                            ),
+                            (
+                                "video_upscale_running",
+                                serde_json::Value::from(self.video_upscale_running.is_some()),
+                            ),
+                            (
+                                "fs_viewport_shown",
+                                serde_json::Value::from(self.fs_viewport_shown),
                             ),
                         ],
                     );
@@ -14512,7 +14577,13 @@ impl eframe::App for App {
         } else {
             base
         };
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+        // タイトルが変わったときだけ送信する (2026-05-10 修正)。
+        // 無条件に send_viewport_cmd(Title(...)) すると egui 内部の `request_repaint_of`
+        // が毎フレーム発火し、App::update が 60fps で回り続けて他アプリ FPS を奪う。
+        if self.last_window_title.as_deref() != Some(title.as_str()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_window_title = Some(title);
+        }
 
         // スクロールは egui に触れる前に処理（イベントを消費）
         self.process_scroll(ctx);
@@ -14559,9 +14630,15 @@ impl eframe::App for App {
         let t_root_input = frame_t0.elapsed();
 
         // ── フルスクリーンビューポート ──────────────────────────────────
-        // 非アクティブ時も非表示でビューポートを維持（次回表示のちらつき防止）
+        // 非アクティブ時の hidden viewport 維持コストを排除する仕組みは
+        // `keep_fullscreen_viewport_alive` の関数 doc 参照。
+        // 細分計装: フルスクリーンビューポート関連の 3 段階を個別計測する
+        // (`keep_fullscreen_viewport_ms` / `render_fullscreen_viewport_ms` /
+        //  `ensure_native_video_front_ms`)。既存の `fullscreen_viewport_ms` は集計用に残す。
         self.keep_fullscreen_viewport_alive(ctx);
+        let t_keep_fullscreen_viewport = frame_t0.elapsed();
         self.render_fullscreen_viewport(ctx);
+        let t_render_fullscreen_viewport = frame_t0.elapsed();
         #[cfg(windows)]
         self.ensure_native_video_front();
         let t_fullscreen_viewport = frame_t0.elapsed();
@@ -14911,17 +14988,124 @@ impl eframe::App for App {
                     Some(ThumbnailState::Pending | ThumbnailState::Evicted)
                 )
         });
-        let thumbnail_work_active = !self.requested.is_empty()
-            || !self.texture_backlog.is_empty()
-            || visible_video_thumb_pending;
-        if self.folder_nav_pending.is_some()
-            || thumbnail_work_active
-            || self.pdf_enumerate_pending.is_some()
-            || self.video_upscale_running.is_some()
-        {
+        // tail repaint の発火理由を perf event で記録する (2026-05-10 計装)。
+        // 「アイドル中なのに 60fps で App::update が回り続けている」原因を特定する。
+        // 個別の if/else が立ち上がった理由を reasons[] に積み、tail_repaint event として emit する。
+        let mut reasons: Vec<&'static str> = Vec::new();
+        if self.folder_nav_pending.is_some() {
+            reasons.push("folder_nav_pending");
+        }
+        if !self.requested.is_empty() {
+            reasons.push("requested_nonempty");
+        }
+        if !self.texture_backlog.is_empty() {
+            reasons.push("texture_backlog_nonempty");
+        }
+        if visible_video_thumb_pending {
+            reasons.push("visible_video_thumb_pending");
+        }
+        if self.pdf_enumerate_pending.is_some() {
+            reasons.push("pdf_enumerate_pending");
+        }
+        if self.video_upscale_running.is_some() {
+            reasons.push("video_upscale_running");
+        }
+        // `keep_fullscreen_viewport_alive` の cleanup フレーム保証 (Codex P2 — 統一安全網)。
+        // close_fullscreen が App::update 内のどこで呼ばれても、次フレームで keep_alive の
+        // "Visible(false) 送信" 経路が確実に走るよう repaint を要求する。アイドル時の
+        // keep_alive はゼロコスト早期 return するため、偶発的な input/focus repaint に
+        // 依存させない。fs_viewport_shown は次フレーム keep_alive で false になるので、
+        // この経路が連続発火することはない (= 1 フレームの cleanup repaint だけ)。
+        let fs_cleanup_pending = self.fs_viewport_shown && self.fullscreen_idx.is_none();
+        if fs_cleanup_pending {
+            reasons.push("fs_viewport_cleanup");
+        }
+        let idle_upgrade_delay = if reasons.is_empty() {
+            self.thumb_idle_upgrade_recheck_delay()
+        } else {
+            None
+        };
+
+        if !reasons.is_empty() {
             ctx.request_repaint();
-        } else if let Some(delay) = self.thumb_idle_upgrade_recheck_delay() {
+        } else if let Some(delay) = idle_upgrade_delay {
             ctx.request_repaint_after(delay);
+        }
+
+        // perf 計装: tail repaint の発火 (または無発火) を記録。
+        // request_repaint も request_repaint_after も呼ばれていない (= idle frame) かつ
+        // 直前の frame begin から短時間で次フレームが来ているなら、別の経路で
+        // request_repaint が呼ばれていることになる。それを `prev_frame_causes` で特定する。
+        if crate::perf::is_enabled() {
+            let action = if !reasons.is_empty() {
+                "request_repaint"
+            } else if idle_upgrade_delay.is_some() {
+                "request_repaint_after_idle_upgrade"
+            } else {
+                "none"
+            };
+            let reasons_json = serde_json::Value::from(
+                reasons
+                    .iter()
+                    .map(|s| serde_json::Value::from(*s))
+                    .collect::<Vec<_>>(),
+            );
+            // 「このフレームが何故走ったか」を egui の repaint_causes() から取得する。
+            // file:line:reason で出るので、tail_repaint=none で連続 60fps が続く真因
+            // (egui 内部 animation か、外部の request_repaint 呼び出しか) を特定できる。
+            let causes = ctx.repaint_causes();
+            let causes_json = serde_json::Value::Array(
+                causes
+                    .iter()
+                    .map(|c| {
+                        serde_json::Value::String(format!(
+                            "{}:{} {}",
+                            c.file, c.line, c.reason
+                        ))
+                    })
+                    .collect(),
+            );
+            crate::perf::event(
+                "ui",
+                "tail_repaint",
+                None,
+                self.input_seq,
+                &[
+                    ("action", serde_json::Value::from(action)),
+                    ("reasons", reasons_json),
+                    (
+                        "idle_upgrade_delay_ms",
+                        serde_json::Value::from(
+                            idle_upgrade_delay
+                                .map(|d| d.as_secs_f64() * 1000.0)
+                                .unwrap_or(0.0),
+                        ),
+                    ),
+                    (
+                        "is_minimized",
+                        serde_json::Value::from(
+                            ctx.input(|i| i.viewport().minimized.unwrap_or(false)),
+                        ),
+                    ),
+                    (
+                        "window_visible",
+                        serde_json::Value::from(self.window_visible),
+                    ),
+                    (
+                        "fullscreen",
+                        serde_json::Value::from(self.fullscreen_idx.is_some()),
+                    ),
+                    (
+                        "fs_viewport_shown",
+                        serde_json::Value::from(self.fs_viewport_shown),
+                    ),
+                    (
+                        "n",
+                        serde_json::Value::from(self.frame_counter as i64),
+                    ),
+                    ("prev_frame_causes", causes_json),
+                ],
+            );
         }
 
         // フレーム計測: 8 ms (≈120 fps) 超えた場合のみログに出力
@@ -14995,6 +15179,27 @@ impl eframe::App for App {
                         ),
                     ),
                     (
+                        "keep_fullscreen_viewport_ms",
+                        serde_json::Value::from(
+                            (t_keep_fullscreen_viewport - t_root_input).as_secs_f64() * 1000.0,
+                        ),
+                    ),
+                    (
+                        "render_fullscreen_viewport_ms",
+                        serde_json::Value::from(
+                            (t_render_fullscreen_viewport - t_keep_fullscreen_viewport)
+                                .as_secs_f64()
+                                * 1000.0,
+                        ),
+                    ),
+                    (
+                        "ensure_native_video_front_ms",
+                        serde_json::Value::from(
+                            (t_fullscreen_viewport - t_render_fullscreen_viewport).as_secs_f64()
+                                * 1000.0,
+                        ),
+                    ),
+                    (
                         "menus_dialogs_ms",
                         serde_json::Value::from(
                             (t_menus_dialogs - t_fullscreen_viewport).as_secs_f64() * 1000.0,
@@ -15037,6 +15242,38 @@ impl eframe::App for App {
                         serde_json::Value::from(self.fullscreen_idx.is_some()),
                     ),
                     ("video_playing", serde_json::Value::from(video_playing)),
+                    // 最小化中・ペンディング状態のスナップショット (2026-05-10、
+                    // 最小化中に App::update が止まらない問題の調査用)。
+                    (
+                        "is_minimized",
+                        serde_json::Value::from(
+                            ctx.input(|i| i.viewport().minimized.unwrap_or(false)),
+                        ),
+                    ),
+                    (
+                        "window_visible",
+                        serde_json::Value::from(self.window_visible),
+                    ),
+                    (
+                        "folder_nav_pending",
+                        serde_json::Value::from(self.folder_nav_pending.is_some()),
+                    ),
+                    (
+                        "pdf_enumerate_pending",
+                        serde_json::Value::from(self.pdf_enumerate_pending.is_some()),
+                    ),
+                    (
+                        "zip_enumerate_pending",
+                        serde_json::Value::from(self.zip_enumerate_pending.is_some()),
+                    ),
+                    (
+                        "video_upscale_running",
+                        serde_json::Value::from(self.video_upscale_running.is_some()),
+                    ),
+                    (
+                        "fs_viewport_shown",
+                        serde_json::Value::from(self.fs_viewport_shown),
+                    ),
                 ],
             );
         }
