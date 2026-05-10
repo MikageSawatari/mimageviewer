@@ -3247,8 +3247,12 @@ impl NativeEguiOverlay {
                         egui::FontId::proportional(12.0),
                         egui::Color32::from_rgb(238, 238, 238),
                     );
-                    let speed_resp = speed_resp.on_hover_text("再生速度");
-                    if speed_resp.clicked() {
+                    let speed_resp =
+                        speed_resp.on_hover_text("再生速度 (右クリック / ダブルクリックで x1)");
+                    if speed_resp.secondary_clicked() || speed_resp.double_clicked() {
+                        video_speed_popup_open = false;
+                        commands.push(NativeOverlayCommand::SetPlaybackSpeed { speed: 1.0 });
+                    } else if speed_resp.clicked() {
                         video_speed_popup_open = !video_speed_popup_open;
                     }
                     if video_speed_popup_open {
