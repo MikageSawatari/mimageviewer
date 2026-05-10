@@ -18,16 +18,17 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOP,
-    IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, MSG, PM_REMOVE, PeekMessageW,
-    PostQuitMessage, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION,
-    WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CLIPCHILDREN,
-    WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HTCLIENT,
+    HWND_TOP, IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, MA_ACTIVATE, MA_ACTIVATEANDEAT,
+    MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_CHAR,
+    WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDBLCLK,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
+    WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -447,6 +448,33 @@ unsafe extern "system" fn wnd_proc(
                 }
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_MOUSEACTIVATE => {
+            // 他アプリから戻ってきたときの左クリックは「フォーカスを戻すためのクリック」
+            // とみなし、再生 toggle に作用させない。MA_ACTIVATEANDEAT はアクティブ化を
+            // 引き起こしたマウス down メッセージ (= WM_LBUTTONDOWN) を Windows が破棄
+            // する動作で、結果として App 経路 (handle_native_video_mouse_button) と
+            // egui overlay 経路 (overlay_draw.rs primary_clicked) のどちらの click
+            // 判定も成立しなくなる。WM_LBUTTONUP 単独は届く可能性があるが、App 側は
+            // 対応する down 記録が無ければ無視するし、egui も down 抜きの up を
+            // click 扱いしないので副作用は出ない。
+            //
+            // 画像フルスクリーン (ui_fullscreen.rs の fs_suppress_primary_until_release)
+            // と同じく左クリックのみ抑制し、右/中ボタンによるアクティブ化は通常通り
+            // 通す (右クリック = フルスクリーン終了がそのまま走るのは画像側挙動と
+            // 整合する)。LOWORD(lparam) == HTCLIENT で「クライアント領域上のクリック」
+            // だけを対象にし、test_windowed (debug 用ウィンドウモード) で title bar や
+            // resize 枠をクリックして戻るときの操作まで食べないようにする。
+            // WM_LBUTTONDBLCLK は通常 WM_LBUTTONDOWN の後に来るので trigger になる
+            // ことは稀だが、念のため同等扱い。
+            let hit_test = (lparam.0 & 0xFFFF) as u32;
+            let trigger_msg = ((lparam.0 >> 16) & 0xFFFF) as u32;
+            let is_left = trigger_msg == WM_LBUTTONDOWN || trigger_msg == WM_LBUTTONDBLCLK;
+            if hit_test == HTCLIENT as u32 && is_left {
+                LRESULT(MA_ACTIVATEANDEAT as isize)
+            } else {
+                LRESULT(MA_ACTIVATE as isize)
+            }
         }
         WM_KEYDOWN => {
             if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {

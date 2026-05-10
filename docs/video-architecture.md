@@ -389,6 +389,12 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
 - `NativeVideoMouseButton` (L/M/R/X1/X2) / `NativeVideoMouseWheelEvent` 等の型は
   egui の Event との 1:1 翻訳を意図しており、`native_presenter/mod.rs` 側で
   `egui::Event` に変換される
+- 他アプリからフォーカスを戻すための左クリックは `WM_MOUSEACTIVATE` で
+  `MA_ACTIVATEANDEAT` を返して破棄する。Windows がアクティブ化トリガとなった
+  `WM_LBUTTONDOWN` を `wnd_proc` に dispatch しないので、再生 toggle (App 経路の
+  `handle_native_video_mouse_button` / overlay 経路の `primary_clicked`) どちらも
+  発火せず、画像フルスクリーンの `fs_suppress_primary_until_release` と同等の
+  挙動になる (HTCLIENT 上の左クリックのみ対象、右/中ボタンはそのまま通す)
 
 責務は単一 (= 単純な入力 marshalling)。設計上の懸念はなし。
 
