@@ -1433,11 +1433,15 @@ outside that closure. `video_gpu/prepare` and `video_gpu/paint` also emit a low
 frequency sample even when fast, so perf logs can prove the GPU callback path is
 active instead of only reporting slow frames.
 
-2026-05-04 present-latency experiment: the eframe/wgpu surface keeps
-`PresentMode::AutoNoVsync` as the default and requests
-`desired_maximum_frame_latency=1`. A/B runs on 1080p60 and 1080p120 files show
-that `mailbox` or `immediate` can change hitch distribution, but the improvement
-is not reliable enough to treat presentation mode as a fix. Use
+2026-05-04 present-latency experiment: A/B runs on 1080p60 and 1080p120 files
+showed that `mailbox` or `immediate` can change hitch distribution, but the
+improvement was not reliable enough to treat presentation mode as a fix.
+
+2026-05-10 coexistence update: video presentation moved to the native fullscreen
+presenter path, so the main eframe/wgpu surface no longer needs the old
+no-vsync default. It now uses `PresentMode::AutoVsync` by default and requests
+`desired_maximum_frame_latency=1`, reducing GPU pressure while the grid window is
+visible beside other apps. Use
 `MIV_WGPU_PRESENT_MODE=mailbox`, `auto_vsync`, `auto_no_vsync`, `immediate`,
 `fifo`, or `fifo_relaxed`, and `MIV_WGPU_FRAME_LATENCY=default` or a positive
 integer when comparing GPU/driver behavior.

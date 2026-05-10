@@ -168,12 +168,12 @@ fn configure_wgpu_presentation(wgpu_options: &mut egui_wgpu::WgpuConfiguration) 
             None => {
                 logger::log(format!(
                     "wgpu presentation: ignoring invalid MIV_WGPU_PRESENT_MODE={raw:?}; \
-                     using AutoNoVsync"
+                     using AutoVsync"
                 ));
-                wgpu::PresentMode::AutoNoVsync
+                wgpu::PresentMode::AutoVsync
             }
         },
-        Err(_) => wgpu::PresentMode::AutoNoVsync,
+        Err(_) => wgpu::PresentMode::AutoVsync,
     };
 
     let desired_maximum_frame_latency = match std::env::var("MIV_WGPU_FRAME_LATENCY") {

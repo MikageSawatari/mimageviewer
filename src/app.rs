@@ -7590,6 +7590,27 @@ impl App {
         }
     }
 
+    /// アイドル高画質化の開始条件が時刻待ちだけなら、その時刻に 1 回だけ起こす。
+    ///
+    /// 以前は範囲外サムネイルの `Pending` が常に repaint を駆動していたため、自然に
+    /// 500ms アイドル判定へ到達していた。範囲外 `Pending` で常時描画しないようにした後も、
+    /// 高画質化の開始タイミングだけは維持する。
+    fn thumb_idle_upgrade_recheck_delay(&self) -> Option<std::time::Duration> {
+        const SCROLL_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
+        const INPUT_IDLE: std::time::Duration = std::time::Duration::from_millis(500);
+
+        if !self.settings.thumb_idle_upgrade || !self.requested.is_empty() {
+            return None;
+        }
+
+        let mut delay = SCROLL_IDLE.saturating_sub(self.last_scroll_change_time.elapsed());
+        if let Some(last_input_at) = self.last_input_at {
+            delay = delay.max(INPUT_IDLE.saturating_sub(last_input_at.elapsed()));
+        }
+
+        if delay.is_zero() { None } else { Some(delay) }
+    }
+
     /// in-flight + キュー内の通常/アップグレード件数を返す。
     ///
     /// `requested` マップは queue に push した時点で insert され、
@@ -14830,18 +14851,28 @@ impl eframe::App for App {
             }
         }
 
-        // Pending なサムネイルがある間は毎フレーム再描画をリクエストする。
-        // バックグラウンドスレッドがチャネルに送信しても egui は自動では
-        // 起きないため、ここで継続的に repaint を要求しておく必要がある。
+        // 実際に進行中のサムネイル作業がある間だけ repaint を駆動する。
+        // 範囲外の `Pending` は「まだ先読み対象に入っていない」正常状態なので、
+        // それだけで描画ループを回し続けると、大きなフォルダを開いたままでも
+        // メインウィンドウがアイドルにならない。
+        let visible_video_thumb_pending = self.keep_set.iter().any(|&idx| {
+            matches!(self.items.get(idx), Some(GridItem::Video(_)))
+                && matches!(
+                    self.thumbnails.get(idx),
+                    Some(ThumbnailState::Pending | ThumbnailState::Evicted)
+                )
+        });
+        let thumbnail_work_active = !self.requested.is_empty()
+            || !self.texture_backlog.is_empty()
+            || visible_video_thumb_pending;
         if self.folder_nav_pending.is_some()
-            || self
-                .thumbnails
-                .iter()
-                .any(|t| matches!(t, ThumbnailState::Pending))
+            || thumbnail_work_active
             || self.pdf_enumerate_pending.is_some()
             || self.video_upscale_running.is_some()
         {
             ctx.request_repaint();
+        } else if let Some(delay) = self.thumb_idle_upgrade_recheck_delay() {
+            ctx.request_repaint_after(delay);
         }
 
         // フレーム計測: 8 ms (≈120 fps) 超えた場合のみログに出力
