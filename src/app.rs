@@ -4687,6 +4687,12 @@ impl App {
         self.current_folder_rating_cache = None;
         self.address = zip_path.to_string_lossy().to_string();
         self.update_global_search_address();
+        // items_generation はここでは進めない。PDF と同じく、async enumerate 完了後に
+        // start_loading_items 内 install_new_items が bump する。ここで進めると
+        // poll_fs_nav_lock が「新 items 投入」と誤認して fs_holdover_tex を premature に
+        // クリアし、ZIP enumerate 完了前に黒画面遷移してしまう (Codex 指摘)。
+        // 代わりに「ZIP 投入直後の repaint」は tail repaint reasons に
+        // zip_enumerate_pending を含めることで担保する。
 
         // worker spawn
         let cancel = Arc::new(AtomicBool::new(false));
@@ -14464,6 +14470,14 @@ impl eframe::App for App {
 
         let frame_t0 = std::time::Instant::now();
 
+        // late-frame で items が入れ替わった経路を tail で検出して次フレーム repaint を
+        // 駆動するためのスナップショット (Codex P1/P2、2026-05-10)。
+        // 真の入口でキャプチャすることで、handle_keyboard / Ctrl+G drill / drill_into_*
+        // / poll_pdf/zip_enumerate / apply_folder_nav_result / load_folder(p) など、
+        // 当フレーム内のあらゆる items 入替を漏れなく検出する。bump 漏れがあった場合は
+        // install_new_items / remove_items_batch 側に追加する。
+        let items_gen_pre_late = self.items_generation;
+
         self.poll_thumbnails(ctx);
         // poll_thumbnails の直後にロック解除判定を入れる (= サムネ Loaded が
         // 立った同フレームで holdover を捨てて新画面に切り替える)。
@@ -14717,10 +14731,8 @@ impl eframe::App for App {
         self.show_tray_enabled_notice_dialog(ctx);
         self.poll_pdf_enumerate();
         self.poll_zip_enumerate();
-        if self.zip_enumerate_pending.is_some() {
-            // 結果到着までフレーム駆動で待つ (worker 完了通知は poll で拾う)
-            ctx.request_repaint();
-        }
+        // ZIP enumerate worker 結果待ちの repaint 駆動は tail repaint reasons の
+        // `zip_enumerate_pending` 経由で行う (PDF と同様)。
         let t_menus_dialogs = frame_t0.elapsed();
 
         // ── ツールバー ───────────────────────────────────────────────
@@ -14977,6 +14989,23 @@ impl eframe::App for App {
             }
         }
 
+        // late-frame で items が入れ替わった経路 (= grid 描画より後の mutation) を
+        // 単一の世代差チェックでまとめて拾う (Codex P1/P2、2026-05-10)。
+        //
+        // 対象経路:
+        // - poll_pdf_enumerate / poll_zip_enumerate 完了 → start_loading_items で items 入替
+        // - render_grid 内 handle_cell_interaction → drill_into_container/subfolder で items 入替
+        //   (drill 系は ctx を持たないので世代差でまとめて検出する)
+        // - apply_folder_nav_result / load_folder(p) (上記の if/else)
+        //
+        // どの経路も items_generation を進めるので、late-frame 入口でのスナップショット
+        // (`items_gen_pre_late`) と比較すれば次フレームの再描画を確実に駆動できる。
+        // 修正前の「タイトル毎フレーム送信が暗黙に repaint を駆動していた」状態を
+        // 個別 ctx.request_repaint 散布なしで置き換える。
+        if self.items_generation != items_gen_pre_late {
+            ctx.request_repaint();
+        }
+
         // 実際に進行中のサムネイル作業がある間だけ repaint を駆動する。
         // 範囲外の `Pending` は「まだ先読み対象に入っていない」正常状態なので、
         // それだけで描画ループを回し続けると、大きなフォルダを開いたままでも
@@ -15006,6 +15035,9 @@ impl eframe::App for App {
         }
         if self.pdf_enumerate_pending.is_some() {
             reasons.push("pdf_enumerate_pending");
+        }
+        if self.zip_enumerate_pending.is_some() {
+            reasons.push("zip_enumerate_pending");
         }
         if self.video_upscale_running.is_some() {
             reasons.push("video_upscale_running");
