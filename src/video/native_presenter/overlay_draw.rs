@@ -1920,7 +1920,7 @@ pub(super) fn native_panel_hover_rect(
 
 pub(super) fn native_jump_panel_rect(overlay_height_points: f32) -> egui::Rect {
     let top = native_panel_top();
-    let panel_h = (overlay_height_points - top - 44.0).max(240.0);
+    let panel_h = (overlay_height_points - top - 48.0).max(240.0);
     egui::Rect::from_min_size(
         egui::pos2(0.0, top),
         egui::vec2(native_jump_panel_width(), panel_h),
@@ -1933,7 +1933,7 @@ pub(super) fn native_metadata_panel_rect(
 ) -> egui::Rect {
     let panel_w = native_metadata_panel_width().min(overlay_width_points * 0.5);
     let top = native_panel_top();
-    let panel_h = (overlay_height_points - top - 44.0).max(260.0);
+    let panel_h = (overlay_height_points - top - 48.0).max(260.0);
     egui::Rect::from_min_size(
         egui::pos2(overlay_width_points - panel_w, top),
         egui::vec2(panel_w, panel_h),
@@ -2380,4 +2380,26 @@ pub(super) fn truncate_overlay_text(text: &str, max_chars: usize) -> String {
         out.push_str("...");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// jump / metadata 両パネルの底辺がホバー判定の底辺と一致し、シーク HUD
+    /// (top y = overlay_h - 46) の上に 2pt の隙間が空くことを保証する回帰テスト。
+    /// 上ホバーバー bottom y = 54 と panel top y = 56 の 2pt 隙間と対称になる前提。
+    #[test]
+    fn side_panel_bottoms_match_hover_bottom() {
+        let overlay_h = 1080.0_f32;
+        let overlay_w = 1920.0_f32;
+
+        let hover_bottom = native_panel_hover_bottom(overlay_h);
+        let jump = native_jump_panel_rect(overlay_h);
+        let meta = native_metadata_panel_rect(overlay_w, overlay_h);
+
+        assert_eq!(hover_bottom, overlay_h - 48.0);
+        assert_eq!(jump.max.y, hover_bottom);
+        assert_eq!(meta.max.y, hover_bottom);
+    }
 }
