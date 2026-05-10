@@ -1151,6 +1151,125 @@ pub(super) fn draw_native_toast(
         });
 }
 
+/// 音量ノーマライズ スキャン中の進捗パネル (中央表示)。
+/// プログレスバー + キャンセルボタン (× / ESC)。
+pub(super) fn draw_native_normalize_progress(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    progress: &crate::video::normalize_types::NormalizeProgressSnapshot,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    egui::Area::new(egui::Id::new("native_video_normalize_progress"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let full_rect = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(overlay_width_points, overlay_height_points),
+            );
+            ui.set_min_size(full_rect.size());
+            let painter = ui.painter().clone();
+            // Codex 2周目 P2: 全画面 blocker — 進捗パネル外のクリック / ホバーが背面の
+            // HUD / seek bar / volume slider 等に届かないようキャプチャする (= モーダル化)。
+            // 半透明の暗幕も兼ねる (動画は見えるが UI 操作は止まる)。
+            let _block = ui.interact(
+                full_rect,
+                egui::Id::new("native_video_normalize_blocker"),
+                egui::Sense::CLICK | egui::Sense::HOVER,
+            );
+            painter.rect_filled(
+                full_rect,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 96),
+            );
+            // 中央パネル
+            let panel_w = 420.0_f32;
+            let panel_h = 110.0_f32;
+            let panel_rect =
+                egui::Rect::from_center_size(full_rect.center(), egui::vec2(panel_w, panel_h));
+            painter.rect_filled(
+                panel_rect,
+                10.0,
+                egui::Color32::from_rgba_unmultiplied(20, 20, 24, 232),
+            );
+            // タイトル
+            painter.text(
+                egui::pos2(panel_rect.center().x, panel_rect.min.y + 22.0),
+                egui::Align2::CENTER_CENTER,
+                "音量ノーマライズ中…",
+                egui::FontId::proportional(16.0),
+                egui::Color32::from_rgb(238, 238, 238),
+            );
+            // プログレスバー or スピナー
+            let bar_pad_x = 24.0;
+            let bar_y = panel_rect.center().y + 6.0;
+            let bar_rect = egui::Rect::from_min_max(
+                egui::pos2(panel_rect.min.x + bar_pad_x, bar_y - 4.0),
+                egui::pos2(panel_rect.max.x - bar_pad_x, bar_y + 4.0),
+            );
+            painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(60));
+            if progress.indeterminate || progress.duration_ms == 0 {
+                // スピナー的に動くインジケータ (時間ベース)
+                let t = ui.ctx().input(|i| i.time as f32);
+                let frac = ((t * 0.7).fract() + 0.0).clamp(0.0, 1.0);
+                let lo = (frac - 0.18).clamp(0.0, 1.0);
+                let hi = (frac + 0.18).clamp(0.0, 1.0);
+                let lo_x = bar_rect.min.x + bar_rect.width() * lo;
+                let hi_x = bar_rect.min.x + bar_rect.width() * hi;
+                let chunk = egui::Rect::from_min_max(
+                    egui::pos2(lo_x, bar_rect.min.y),
+                    egui::pos2(hi_x, bar_rect.max.y),
+                );
+                painter.rect_filled(chunk, 2.0, egui::Color32::from_rgb(255, 198, 62));
+                ui.ctx().request_repaint();
+            } else {
+                let frac = (progress.pts_processed_ms as f32 / progress.duration_ms as f32)
+                    .clamp(0.0, 1.0);
+                let filled = egui::Rect::from_min_max(
+                    bar_rect.min,
+                    egui::pos2(bar_rect.min.x + bar_rect.width() * frac, bar_rect.max.y),
+                );
+                painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(255, 198, 62));
+                let pct_text = format!("{:.0}%", frac * 100.0);
+                painter.text(
+                    egui::pos2(panel_rect.center().x, bar_y + 18.0),
+                    egui::Align2::CENTER_CENTER,
+                    pct_text,
+                    egui::FontId::proportional(12.0),
+                    egui::Color32::from_gray(200),
+                );
+            }
+            // キャンセルボタン (右下)
+            let cancel_size = 24.0;
+            let cancel_rect = egui::Rect::from_min_size(
+                egui::pos2(panel_rect.max.x - cancel_size - 8.0, panel_rect.min.y + 8.0),
+                egui::vec2(cancel_size, cancel_size),
+            );
+            let cancel_resp = ui.interact(
+                cancel_rect,
+                egui::Id::new("native_video_normalize_cancel"),
+                egui::Sense::click(),
+            );
+            let cancel_color = if cancel_resp.hovered() {
+                egui::Color32::from_rgb(255, 120, 120)
+            } else {
+                egui::Color32::from_gray(180)
+            };
+            painter.text(
+                cancel_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "\u{00D7}", // U+00D7 multiplication sign (ANSI 安全、glyph lint 通過)
+                egui::FontId::proportional(20.0),
+                cancel_color,
+            );
+            let cancel_resp = cancel_resp.on_hover_text("キャンセル [ESC]");
+            if cancel_resp.clicked() || ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
+                commands.push(NativeOverlayCommand::CancelNormalizeScan);
+            }
+        });
+}
+
 pub(super) fn draw_native_top_bar(
     ctx: &egui::Context,
     overlay_width_points: f32,

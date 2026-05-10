@@ -187,6 +187,11 @@ pub struct AvClock {
     volume_bits: AtomicU64,
     /// ミュート。
     muted: AtomicBool,
+    /// 音量ノーマライズの線形ゲイン (f64 bits)。1.0 = 素通し、>1.0 = boost、<1.0 = attenuation。
+    /// `[10^(-24/20), 10^(24/20)]` (= 約 0.063 〜 15.85) にクランプされる。
+    /// 状態判定 (Off / OnApplied / OnUnmeasured) はこの値で行わず、App 側の
+    /// `NormalizeUiState` enum で扱う (gain = 1.0 でも測定済みのケースがあるため)。
+    normalize_gain_bits: AtomicU64,
 }
 
 const SEEK_NONE: u64 = u64::MAX;
@@ -272,6 +277,7 @@ impl AvClock {
                 crate::settings::clamp_video_volume(initial_volume).to_bits(),
             ),
             muted: AtomicBool::new(false),
+            normalize_gain_bits: AtomicU64::new(1.0_f64.to_bits()),
         }
     }
 
@@ -850,6 +856,36 @@ impl AvClock {
     pub fn pre_limiter_gain(&self) -> f32 {
         self.volume().max(1.0) as f32
     }
+
+    /// 音量ノーマライズ用の線形ゲイン (1.0 = 素通し)。
+    pub fn normalize_gain(&self) -> f64 {
+        f64::from_bits(self.normalize_gain_bits.load(Ordering::Acquire))
+    }
+
+    /// 音量ノーマライズ用の線形ゲインを設定 (内部で `[10^(-24/20), 10^(24/20)]` にクランプ)。
+    pub fn set_normalize_gain(&self, gain: f64) {
+        self.normalize_gain_bits
+            .store(clamp_normalize_gain(gain).to_bits(), Ordering::Release);
+    }
+}
+
+/// 音量ノーマライズの ±24dB 線形値。
+pub const NORMALIZE_GAIN_DB_LIMIT: f64 = 24.0;
+/// 上限 +24dB の線形値 (= 10^(24/20) ≈ 15.849)。
+pub fn normalize_gain_max_linear() -> f64 {
+    10.0_f64.powf(NORMALIZE_GAIN_DB_LIMIT / 20.0)
+}
+/// 下限 -24dB の線形値 (= 10^(-24/20) ≈ 0.0631)。
+pub fn normalize_gain_min_linear() -> f64 {
+    10.0_f64.powf(-NORMALIZE_GAIN_DB_LIMIT / 20.0)
+}
+
+/// `set_normalize_gain` で適用するクランプ関数。NaN / Inf は 1.0 にフォールバック。
+pub fn clamp_normalize_gain(gain: f64) -> f64 {
+    if !gain.is_finite() || gain <= 0.0 {
+        return 1.0;
+    }
+    gain.clamp(normalize_gain_min_linear(), normalize_gain_max_linear())
 }
 
 struct AudioTxAccountingEpochGuard<'a> {
@@ -901,5 +937,38 @@ mod tests {
         clock.set_muted(true);
         assert_eq!(clock.output_volume(), 0.0);
         assert!((clock.pre_limiter_gain() - 1.5).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn normalize_gain_default_is_unity() {
+        let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+        assert!((clock.normalize_gain() - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn normalize_gain_clamps_to_24db_range() {
+        let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+        // +30dB を入れても +24dB に丸められる
+        clock.set_normalize_gain(31.62);
+        assert!((clock.normalize_gain() - normalize_gain_max_linear()).abs() < 1.0e-9);
+        // -30dB を入れても -24dB に丸められる
+        clock.set_normalize_gain(0.0316);
+        assert!((clock.normalize_gain() - normalize_gain_min_linear()).abs() < 1.0e-9);
+        // 範囲内の値はそのまま
+        clock.set_normalize_gain(2.0);
+        assert!((clock.normalize_gain() - 2.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn normalize_gain_falls_back_on_non_finite() {
+        let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+        clock.set_normalize_gain(f64::NAN);
+        assert_eq!(clock.normalize_gain(), 1.0);
+        clock.set_normalize_gain(f64::INFINITY);
+        assert_eq!(clock.normalize_gain(), 1.0);
+        clock.set_normalize_gain(-1.0);
+        assert_eq!(clock.normalize_gain(), 1.0);
+        clock.set_normalize_gain(0.0);
+        assert_eq!(clock.normalize_gain(), 1.0);
     }
 }

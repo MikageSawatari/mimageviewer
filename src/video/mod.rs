@@ -37,6 +37,8 @@ pub mod gpu_renderer;
 pub mod native_presenter;
 #[cfg(windows)]
 pub mod native_window;
+pub mod normalize_scanner;
+pub mod normalize_types;
 pub mod screenshot;
 pub mod thumbnail;
 pub mod tile_thumb_cache;
@@ -262,6 +264,13 @@ pub enum NativeVideoOutputEvent {
     OpenExternalUrl {
         url: String,
     },
+    /// 音量ノーマライズボタン左クリック (3 状態モデル: Off → ON 化 / OnApplied → OFF 化 /
+    /// OnUnmeasured → スキャン起動)。詳細は `App::handle_toggle_normalize`。
+    ToggleNormalize,
+    /// 音量ノーマライズボタン右クリック (どの状態からでもグローバル OFF 化、救済経路)。
+    DisableNormalize,
+    /// スキャン中の進捗パネル × ボタン or ESC でキャンセル。
+    CancelNormalizeScan,
 }
 
 #[cfg(windows)]
@@ -333,6 +342,13 @@ enum NativeVideoOutputCommand {
     /// `push_native_event` を経由しない活動を伝搬する。NativeEguiOverlay の
     /// cursor auto-hide タイマをリセットして即時にカーソルを再表示するため。
     MarkCursorActivity,
+    /// 音量ノーマライズの UI 状態 + 進捗 snapshot を native overlay に配信する。
+    /// App 側 `update` で normalize_ui_states と normalize_state.progress を読んで
+    /// `NormalizeOverlayState` を作り、毎フレーム送る。overlay 側はボタン色 +
+    /// (Scanning 中) 進捗パネルの描画に使う。
+    SetNormalizeOverlayState {
+        state: crate::video::normalize_types::NormalizeOverlayState,
+    },
 }
 
 #[cfg(windows)]
@@ -628,6 +644,15 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::MarkCursorActivity);
+    }
+
+    fn set_normalize_overlay_state(
+        &self,
+        state: crate::video::normalize_types::NormalizeOverlayState,
+    ) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetNormalizeOverlayState { state });
     }
 
     fn drain_events(&self) -> Vec<(u64, NativeVideoOutputEvent)> {
@@ -966,6 +991,9 @@ fn send_native_overlay_command(
         }
         Command::DeleteBookmark { id } => NativeVideoOutputEvent::DeleteBookmark { id },
         Command::OpenExternalUrl { url } => NativeVideoOutputEvent::OpenExternalUrl { url },
+        Command::ToggleNormalize => NativeVideoOutputEvent::ToggleNormalize,
+        Command::DisableNormalize => NativeVideoOutputEvent::DisableNormalize,
+        Command::CancelNormalizeScan => NativeVideoOutputEvent::CancelNormalizeScan,
     };
     send_native_output_event(tx, source_epoch, event);
 }
@@ -1228,6 +1256,9 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::MarkCursorActivity => {
                     presenter.mark_overlay_cursor_activity();
+                }
+                NativeVideoOutputCommand::SetNormalizeOverlayState { state } => {
+                    presenter.set_overlay_normalize_state(state);
                 }
                 NativeVideoOutputCommand::SwitchSource { payload } => {
                     native_drain_unpresented_queue(&mut source.queue);
@@ -1531,6 +1562,27 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::OpenExternalUrl { url },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleNormalize => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ToggleNormalize,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::DisableNormalize => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::DisableNormalize,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::CancelNormalizeScan => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::CancelNormalizeScan,
                                 );
                             }
                         }
@@ -2623,6 +2675,35 @@ impl VideoPlayer {
 
     pub fn set_muted(&self, m: bool) {
         self.clock.set_muted(m);
+    }
+
+    /// 音量ノーマライズの線形ゲイン (1.0 = 素通し)。
+    pub fn normalize_gain(&self) -> f64 {
+        self.clock.normalize_gain()
+    }
+
+    /// 音量ノーマライズの線形ゲインを設定 (内部で ±24dB にクランプ)。
+    ///
+    /// 再生中の動画に適用するときは、呼び出した **直後** に `clear_audio_output_buffer()` を
+    /// 呼んで旧 gain で生成済みの processed buffer を破棄すること (set → clear の順)。
+    /// 順序を逆 (clear → set) にすると、clear と set の間に audio pump が回って
+    /// 旧 gain で processed が再生成される小窓ができ、短い音量ズレが発生する
+    /// (Codex P2 1周目の修正方針)。
+    /// 動画 open 直後で player がまだ再生開始していない場合は flush 不要。
+    pub fn set_normalize_gain(&self, gain: f64) {
+        self.clock.set_normalize_gain(gain);
+    }
+
+    /// 音量ノーマライズの UI 状態 + 進捗 snapshot を native overlay に配信する。
+    /// App 側は毎 update で呼び、overlay 側でボタン色 + 進捗パネル描画に使う。
+    #[cfg(windows)]
+    pub fn set_native_normalize_state(
+        &self,
+        state: crate::video::normalize_types::NormalizeOverlayState,
+    ) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_normalize_overlay_state(state);
+        }
     }
 
     /// ループ再生 ON/OFF を更新。App は毎 poll_video で settings 値を反映する。

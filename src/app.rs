@@ -7,6 +7,7 @@ use std::sync::{
 
 #[cfg(windows)]
 mod native_video;
+pub(crate) mod normalize;
 
 /// Condvar 付きキュー: ワーカーはキューが空のとき sleep ポーリングではなく wait() で待機し、
 /// push 側が notify_one() で起こす。
@@ -1800,6 +1801,17 @@ pub struct App {
     /// 現在フォルダのアイテムごとの回転キャッシュ (idx → Rotation)
     pub(crate) rotation_cache: std::collections::HashMap<usize, crate::rotation_db::Rotation>,
 
+    // ── 音量ノーマライズ ──────────────────────────────────────────
+    /// 動画音量の per-file 測定値キャッシュ (整 LUFS / true peak / 算出ゲイン)。
+    /// グローバル ON 時に動画 open 時の自動適用 + Norm ボタン押下時の即適用に使う。
+    pub(crate) audio_normalize_db: Option<crate::audio_normalize_db::AudioNormalizeDb>,
+    /// 進行中スキャン (= App 全体で同時 1 つのみ。新規スキャンは前のを cancel + take してから)。
+    pub(crate) normalize_state: Option<crate::app::normalize::NormalizeScanState>,
+    /// fs_idx 単位のボタン UI 状態。動画 open / トグル / スキャン完了で更新する。
+    /// stale 防止のため close_fullscreen / fs_cache evict / フォルダ再ロードで cleanup する。
+    pub(crate) normalize_ui_states:
+        std::collections::HashMap<usize, crate::video::normalize_types::NormalizeUiState>,
+
     // ── 動画ピン / ブックマーク DB ───────────────────────────
     /// 動画フレーム ピン留め DB (= ユーザーが固定したフレーム = 動画グリッドサムネ
     /// 最優先)。Phase 7 で左パネル上部の 📌 ボタンから set_pin / remove する。
@@ -2541,6 +2553,10 @@ impl Default for App {
         crate::perf::emit_ms("startup", "db_open_rotation", 0, t);
 
         let t = std::time::Instant::now();
+        let audio_normalize_db = crate::audio_normalize_db::AudioNormalizeDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_audio_normalize", 0, t);
+
+        let t = std::time::Instant::now();
         let video_pin_db = crate::video_pins::VideoPinDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_video_pins", 0, t);
 
@@ -2751,6 +2767,9 @@ impl Default for App {
             search_or_mode: false,
             rotation_db,
             rotation_cache: std::collections::HashMap::new(),
+            audio_normalize_db,
+            normalize_state: None,
+            normalize_ui_states: std::collections::HashMap::new(),
             video_pin_db,
             video_bookmark_db,
             #[cfg(windows)]
@@ -10399,6 +10418,8 @@ impl App {
                         load_seq: self.input_seq,
                     },
                 );
+                #[cfg(windows)]
+                self.init_normalize_state_for_opened_video(idx);
             }
             return;
         }
@@ -10955,6 +10976,15 @@ impl App {
     pub(crate) fn close_fullscreen(&mut self) {
         // フルスクリーン解除前に動画再生位置を保存 (drop で消える前に)
         self.save_all_video_resume_positions();
+        // 進行中のノーマライズスキャンをキャンセル + 全 fs_idx の UI 状態をクリア
+        // (= フルスクリーン抜けると別動画扱い、stale fs_idx 復活防止)
+        #[cfg(windows)]
+        {
+            let fs_idxs: Vec<usize> = self.normalize_ui_states.keys().copied().collect();
+            for idx in fs_idxs {
+                self.cleanup_normalize_state_for_fs_idx(idx);
+            }
+        }
         self.restore_grid_cursor_to_fullscreen_item();
         #[cfg(windows)]
         {
@@ -13167,6 +13197,9 @@ impl App {
             self.sync_native_video_tile_overlay(ctx, fs_idx);
             self.sync_native_video_vst3_available(fs_idx);
             self.sync_native_video_vst3_panel(fs_idx);
+            // 音量ノーマライズの完了 poll + overlay 状態同期
+            self.poll_normalize_scan(ctx);
+            self.sync_native_video_normalize_state(fs_idx);
         }
         #[cfg(windows)]
         if native_closed_idx.is_some() {

@@ -879,9 +879,18 @@ fn run_pump(
                 None => break,
             };
 
-            // ── Time stretch → VST process_block (mutex 解放中) ──
+            // ── Time stretch → normalize gain → VST process_block (mutex 解放中) ──
             let playback_speed = clock.playback_speed();
-            let stretched = time_stretcher.process(&raw.samples, raw.duration_secs, playback_speed);
+            let mut stretched =
+                time_stretcher.process(&raw.samples, raw.duration_secs, playback_speed);
+            // 音量ノーマライズの線形ゲイン (Phase 2-A): VST3 入力前に掛ける。
+            // VST3 (Pro-L2 等) が「-14 LUFS に揃った入力」を見られるよう前段に置く。
+            let normalize_gain = clock.normalize_gain() as f32;
+            if (normalize_gain - 1.0).abs() > f32::EPSILON {
+                for s in stretched.samples.iter_mut() {
+                    *s *= normalize_gain;
+                }
+            }
             #[cfg(windows)]
             let (mut output_samples, mut current_pdc_latency_secs, vst_chain_active): (
                 Vec<f32>,
@@ -924,7 +933,12 @@ fn run_pump(
                     *sample *= pre_limiter_gain;
                 }
             }
-            let limiter_active = vst_chain_active || pre_limiter_gain > 1.0;
+            // Phase 2-B: normalize gain が +側 (>1.0) のときも safety_limiter を通す。
+            // VST3 無効 + 音量100%以下 + normalize +20dB のケースで clip を防ぐ。
+            // 下げ方向 (<1.0) は clip 不可なので limiter 不要 (5ms latency 節約)。
+            let normalize_boost_active = normalize_gain > 1.0 + f32::EPSILON;
+            let limiter_active =
+                vst_chain_active || pre_limiter_gain > 1.0 || normalize_boost_active;
             if limiter_active {
                 safety_limiter.process_block(&mut output_samples);
                 current_pdc_latency_secs += safety_limiter.latency_secs();

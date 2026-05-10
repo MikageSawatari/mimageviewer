@@ -4,6 +4,11 @@ mimageviewer の動画インライン再生機能の設計指針と内部構造�
 NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終構成** を記述する。
 撤回経緯は本書末尾の「Appendix: Phase 2 撤回理由」を参照。
 
+> ⚠️ **動画 HUD UI は `src/video/native_presenter/{mod.rs,overlay_draw.rs}` で描画される**。
+> `src/ui_fullscreen.rs` の動画関連コードは error / loading 表示と shortcut 経路のみ active で、
+> HUD 描画コードは旧版の残骸 (v0.9.0 で native presenter に移行)。新規 UI 機能を追加する際は
+> `native_presenter` 側に書くこと。詳細は本書「採用アーキテクチャ」節と「ファイル責務」節を参照。
+
 ## 設計目標
 
 | 優先順位 | 目標 |

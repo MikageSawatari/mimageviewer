@@ -7,6 +7,7 @@ pub mod ai;
 mod app;
 pub mod archive_cache;
 pub mod archive_converter;
+pub mod audio_normalize_db;
 pub mod cache_maintenance;
 pub mod catalog;
 pub mod data_dir;

@@ -200,6 +200,8 @@ struct NativeEguiOverlay {
     /// 余計な tick を止める。3 秒経過判定後に確実に 1 回 `SetCursor(None)` を打つために
     /// 「!cursor_hidden の間は tick 継続」という形で利用する。
     cursor_hidden: bool,
+    /// 音量ノーマライズ UI 状態 (App から `SetNormalizeOverlayState` で配信される)。
+    normalize_state: crate::video::normalize_types::NormalizeOverlayState,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -531,6 +533,12 @@ pub enum NativeOverlayCommand {
     OpenExternalUrl {
         url: String,
     },
+    /// 音量ノーマライズボタンの左クリック (3 状態モデルでトグル動作)。
+    ToggleNormalize,
+    /// 音量ノーマライズボタンの右クリック (どの状態からでもグローバル OFF 化)。
+    DisableNormalize,
+    /// スキャン中の進捗パネル × / ESC でキャンセル。
+    CancelNormalizeScan,
 }
 
 impl NativeOverlayInputRouting {
@@ -1161,6 +1169,16 @@ impl NativeVideoPresenter {
     ) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_playback_status(first_frame_presented, error);
+        }
+    }
+
+    /// 音量ノーマライズ UI 状態を overlay に配信。boutton 色 + 進捗パネル描画に使う。
+    pub fn set_overlay_normalize_state(
+        &mut self,
+        state: crate::video::normalize_types::NormalizeOverlayState,
+    ) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_normalize_state(state);
         }
     }
 
@@ -1836,6 +1854,7 @@ impl NativeEguiOverlay {
             height: height.max(1),
             cursor_last_activity: None,
             cursor_hidden: false,
+            normalize_state: crate::video::normalize_types::NormalizeOverlayState::default(),
         };
         this.configure();
         log_event(
@@ -2144,6 +2163,14 @@ impl NativeEguiOverlay {
             return;
         }
         self.video_metadata = metadata;
+        self.dirty = true;
+    }
+
+    fn set_normalize_state(&mut self, state: crate::video::normalize_types::NormalizeOverlayState) {
+        if self.normalize_state == state {
+            return;
+        }
+        self.normalize_state = state;
         self.dirty = true;
     }
 
@@ -2524,6 +2551,8 @@ impl NativeEguiOverlay {
         let jump_entries = self.jump_entries.clone();
         let mut bookmark_title_edit = self.bookmark_title_edit.take();
         let video_metadata = self.video_metadata.clone();
+        // 音量ノーマライズ overlay state (Copy 型なので clone 不要)
+        let normalize_state_snap = self.normalize_state;
         let vst3_panel = self.vst3_panel.clone();
         let tile_overlay = self.tile_overlay.clone();
         let tile_texture_ids: HashMap<usize, egui::TextureId> = self
@@ -2553,12 +2582,22 @@ impl NativeEguiOverlay {
             !tile_overlay_visible && (jump_panel_visible || right_panel_visible);
         let panel_chrome_visible = !tile_overlay_visible && (top_bar_visible || side_panel_visible);
         let bottom_hud_visible = hud_visible || panel_chrome_visible;
+        // Codex P1: Scanning 中は paused_center を出さない (スキャン用に pause している
+        // のがバレないため + clickハンドラ TogglePlay/CloseFullscreen を抑制)。
+        let normalize_scanning = matches!(
+            normalize_state_snap.ui_state,
+            crate::video::normalize_types::NormalizeUiState::Scanning
+        );
         let paused_center_visible = !tile_overlay_visible
             && !is_playing
             && !frame_step_active
             && first_frame_presented
-            && video_error.is_none();
+            && video_error.is_none()
+            && !normalize_scanning;
         let perf_origin = egui::pos2(14.0, 14.0);
+        // Codex 2周目 P1: normalize_scanning も overlay_visible / cursor_blocking_overlay_visible
+        // に含める。さもないと HUD/Toast 等が出ていない状態で `if !overlay_visible { return; }`
+        // 早期 return に入って progress UI まで到達しない。
         let overlay_visible = tile_overlay_visible
             || bottom_hud_visible
             || panel_chrome_visible
@@ -2568,7 +2607,8 @@ impl NativeEguiOverlay {
             || toast_visible
             || bookmark_title_edit_visible
             || paused_center_visible
-            || vst3_panel_visible;
+            || vst3_panel_visible
+            || normalize_scanning;
         // カーソル auto-hide の判定用: チェックマークのような「受動表示」(ユーザーが
         // 操作する対象ではなく単なる状態インジケータ) は countdown をブロックしない。
         // 静止画側 `fs_ui_is_clean` がチェック状態を考慮しないのと挙動を揃える。
@@ -2582,7 +2622,8 @@ impl NativeEguiOverlay {
             || toast_visible
             || bookmark_title_edit_visible
             || paused_center_visible
-            || vst3_panel_visible;
+            || vst3_panel_visible
+            || normalize_scanning;
         let pending_event_count = self.pending_events.len();
         let mut commands = std::mem::take(&mut self.pending_overlay_commands);
         let mut last_seek_target_secs = self.last_seek_target_secs;
@@ -2779,656 +2820,780 @@ impl NativeEguiOverlay {
                     &mut commands,
                 );
             }
-            if !bottom_hud_visible {
-                return;
-            }
-            egui::Area::new(egui::Id::new("native_video_seek_hud"))
-                .order(egui::Order::Foreground)
-                .fixed_pos(egui::pos2(0.0, (overlay_height_points - 46.0).max(0.0)))
-                .show(ctx, |ui| {
-                    ui.set_min_size(egui::vec2(overlay_width_points, 46.0));
-                    let hud_rect = ui.min_rect();
-                    let painter = ui.painter().clone();
-                    let painter = &painter;
-                    painter.rect_filled(
-                        hud_rect,
-                        0.0,
-                        egui::Color32::from_rgba_premultiplied(0, 0, 0, 176),
-                    );
+            // Codex 4周目 P1: 旧コードは `if !bottom_hud_visible { return; }` で
+            // 早期 return していたが、それだと bottom HUD 非表示時に下の
+            // `draw_native_normalize_progress` まで届かない (= スキャン中に HUD が
+            // フェードアウトすると進捗 UI も消える)。bottom HUD だけを条件分岐し、
+            // progress UI 描画は必ず実行する。
+            if bottom_hud_visible {
+                egui::Area::new(egui::Id::new("native_video_seek_hud"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(0.0, (overlay_height_points - 46.0).max(0.0)))
+                    .show(ctx, |ui| {
+                        ui.set_min_size(egui::vec2(overlay_width_points, 46.0));
+                        let hud_rect = ui.min_rect();
+                        let painter = ui.painter().clone();
+                        let painter = &painter;
+                        painter.rect_filled(
+                            hud_rect,
+                            0.0,
+                            egui::Color32::from_rgba_premultiplied(0, 0, 0, 176),
+                        );
 
-                    let side_pad = 10.0;
-                    let btn_size = 28.0;
-                    let gap = 8.0;
-                    let center_y = hud_rect.center().y;
-                    let mut x = hud_rect.min.x + side_pad;
+                        let side_pad = 10.0;
+                        let btn_size = 28.0;
+                        let gap = 8.0;
+                        let center_y = hud_rect.center().y;
+                        let mut x = hud_rect.min.x + side_pad;
 
-                    let replay_rect = egui::Rect::from_min_size(
-                        egui::pos2(x, center_y - btn_size * 0.5),
-                        egui::vec2(btn_size, btn_size),
-                    );
-                    let replay_resp = ui.interact(
-                        replay_rect,
-                        egui::Id::new("native_video_replay"),
-                        egui::Sense::click(),
-                    );
-                    draw_overlay_button_bg(painter, replay_rect, replay_resp.hovered(), false);
-                    draw_overlay_replay_icon(painter, replay_rect.center(), btn_size * 0.36);
-                    let replay_resp =
-                        replay_resp.on_hover_text("最初から再生 (頭出し + 即再生) [W]");
-                    if replay_resp.clicked() {
-                        commands.push(NativeOverlayCommand::SeekToStartAndPlay);
-                    }
-                    x = replay_rect.max.x + gap;
+                        let replay_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, center_y - btn_size * 0.5),
+                            egui::vec2(btn_size, btn_size),
+                        );
+                        let replay_resp = ui.interact(
+                            replay_rect,
+                            egui::Id::new("native_video_replay"),
+                            egui::Sense::click(),
+                        );
+                        draw_overlay_button_bg(painter, replay_rect, replay_resp.hovered(), false);
+                        draw_overlay_replay_icon(painter, replay_rect.center(), btn_size * 0.36);
+                        let replay_resp =
+                            replay_resp.on_hover_text("最初から再生 (頭出し + 即再生) [W]");
+                        if replay_resp.clicked() {
+                            commands.push(NativeOverlayCommand::SeekToStartAndPlay);
+                        }
+                        x = replay_rect.max.x + gap;
 
-                    let play_rect = egui::Rect::from_min_size(
-                        egui::pos2(x, center_y - btn_size * 0.5),
-                        egui::vec2(btn_size, btn_size),
-                    );
-                    let play_resp = ui.interact(
-                        play_rect,
-                        egui::Id::new("native_video_play"),
-                        egui::Sense::click(),
-                    );
-                    draw_overlay_button_bg(painter, play_rect, play_resp.hovered(), false);
-                    if is_playing {
-                        draw_overlay_pause_icon(painter, play_rect.center(), btn_size * 0.30);
-                    } else {
-                        draw_overlay_play_icon(painter, play_rect.center(), btn_size * 0.38);
-                    }
-                    let play_resp = play_resp.on_hover_text(if is_playing {
-                        "一時停止 [Enter]"
-                    } else {
-                        "再生 [Enter]"
-                    });
-                    if play_resp.clicked() {
-                        commands.push(NativeOverlayCommand::TogglePlay);
-                    }
-                    x = play_rect.max.x + gap;
-
-                    let loop_rect = egui::Rect::from_min_size(
-                        egui::pos2(x, center_y - btn_size * 0.5),
-                        egui::vec2(btn_size, btn_size),
-                    );
-                    let loop_resp = ui.interact(
-                        loop_rect,
-                        egui::Id::new("native_video_loop"),
-                        egui::Sense::click(),
-                    );
-                    draw_overlay_button_bg(painter, loop_rect, loop_resp.hovered(), loop_enabled);
-                    draw_overlay_loop_icon(
-                        painter,
-                        loop_rect.center(),
-                        btn_size * 0.36,
-                        if loop_enabled {
-                            egui::Color32::from_rgb(170, 230, 255)
+                        let play_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, center_y - btn_size * 0.5),
+                            egui::vec2(btn_size, btn_size),
+                        );
+                        let play_resp = ui.interact(
+                            play_rect,
+                            egui::Id::new("native_video_play"),
+                            egui::Sense::click(),
+                        );
+                        draw_overlay_button_bg(painter, play_rect, play_resp.hovered(), false);
+                        if is_playing {
+                            draw_overlay_pause_icon(painter, play_rect.center(), btn_size * 0.30);
                         } else {
-                            egui::Color32::from_rgb(238, 238, 238)
-                        },
-                    );
-                    let loop_resp = loop_resp.on_hover_text(if loop_enabled {
-                        "ループ再生を解除 [L]"
-                    } else {
-                        "ループ再生 [L]"
-                    });
-                    if loop_resp.clicked() {
-                        commands.push(NativeOverlayCommand::ToggleLoop);
-                    }
-                    x = loop_rect.max.x + gap;
-
-                    let prev_frame_rect = egui::Rect::from_min_size(
-                        egui::pos2(x, center_y - btn_size * 0.5),
-                        egui::vec2(btn_size, btn_size),
-                    );
-                    let prev_down = draw_native_frame_step_button(
-                        ui,
-                        painter,
-                        prev_frame_rect,
-                        "native_video_prev_frame",
-                        -1,
-                        "前のフレーム [Ctrl+Shift+←]",
-                        &mut frame_step_hold,
-                        &mut commands,
-                    );
-                    x = prev_frame_rect.max.x + gap;
-
-                    let screenshot_rect = egui::Rect::from_min_size(
-                        egui::pos2(x, center_y - btn_size * 0.5),
-                        egui::vec2(btn_size, btn_size),
-                    );
-                    let screenshot_resp = ui.interact(
-                        screenshot_rect,
-                        egui::Id::new("native_video_screenshot"),
-                        egui::Sense::click(),
-                    );
-                    draw_overlay_button_bg(
-                        painter,
-                        screenshot_rect,
-                        screenshot_resp.hovered(),
-                        false,
-                    );
-                    draw_overlay_camera_icon(painter, screenshot_rect);
-                    let screenshot_resp =
-                        screenshot_resp.on_hover_text("現在フレームをクリップボードにコピー");
-                    if screenshot_resp.clicked() {
-                        commands.push(NativeOverlayCommand::CopyFrameToClipboard);
-                    }
-                    x = screenshot_rect.max.x + gap;
-
-                    let next_frame_rect = egui::Rect::from_min_size(
-                        egui::pos2(x, center_y - btn_size * 0.5),
-                        egui::vec2(btn_size, btn_size),
-                    );
-                    let next_down = draw_native_frame_step_button(
-                        ui,
-                        painter,
-                        next_frame_rect,
-                        "native_video_next_frame",
-                        1,
-                        "次のフレーム [Ctrl+Shift+→]",
-                        &mut frame_step_hold,
-                        &mut commands,
-                    );
-                    x = next_frame_rect.max.x + gap;
-                    if !prev_down && !next_down {
-                        frame_step_hold = None;
-                    }
-
-                    let time_w = 132.0;
-                    let vol_pct_w = 40.0;
-                    let vol_slider_w = 90.0;
-                    let mute_w = btn_size;
-                    let speed_w = btn_size * 1.55;
-                    let right_controls_w = time_w
-                        + gap
-                        + speed_w
-                        + gap
-                        + mute_w
-                        + gap
-                        + vol_slider_w
-                        + gap
-                        + vol_pct_w;
-                    let right_controls_x = hud_rect.max.x - side_pad - right_controls_w;
-                    let bar_min_x = x;
-                    let bar_max_x = (right_controls_x - gap).max(bar_min_x + 1.0);
-                    let bar_rect = egui::Rect::from_min_max(
-                        egui::pos2(bar_min_x, center_y - 4.0),
-                        egui::pos2(bar_max_x, center_y + 4.0),
-                    );
-                    let hit_rect = egui::Rect::from_min_max(
-                        egui::pos2(bar_min_x, hud_rect.min.y),
-                        egui::pos2(bar_max_x, hud_rect.max.y),
-                    );
-
-                    let time_x = bar_max_x + gap;
-                    let label = format!(
-                        "{} / {}",
-                        format_overlay_time(position_secs),
-                        format_overlay_time(duration_secs)
-                    );
-                    painter.text(
-                        egui::pos2(time_x, center_y),
-                        egui::Align2::LEFT_CENTER,
-                        label,
-                        egui::FontId::proportional(14.0),
-                        egui::Color32::from_rgb(238, 238, 238),
-                    );
-
-                    let speed_rect = egui::Rect::from_min_size(
-                        egui::pos2(time_x + time_w + gap, center_y - btn_size * 0.5),
-                        egui::vec2(speed_w, btn_size),
-                    );
-                    let mute_rect = egui::Rect::from_min_size(
-                        egui::pos2(speed_rect.max.x + gap, center_y - btn_size * 0.5),
-                        egui::vec2(mute_w, btn_size),
-                    );
-                    let vol_rect = egui::Rect::from_min_max(
-                        egui::pos2(mute_rect.max.x + gap, center_y - 4.0),
-                        egui::pos2(mute_rect.max.x + gap + vol_slider_w, center_y + 4.0),
-                    );
-
-                    painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(74));
-                    if duration_secs > 0.0 {
-                        let progress = (position_secs / duration_secs).clamp(0.0, 1.0) as f32;
-                        let filled = egui::Rect::from_min_max(
-                            bar_rect.min,
-                            egui::pos2(
-                                bar_rect.min.x + bar_rect.width() * progress,
-                                bar_rect.max.y,
-                            ),
-                        );
-                        painter.rect_filled(filled, 2.0, egui::Color32::from_rgb(228, 228, 228));
-                    }
-                    if duration_secs > 0.0 {
-                        for marker in &timeline_markers {
-                            draw_timeline_marker(painter, bar_rect, duration_secs, *marker);
+                            draw_overlay_play_icon(painter, play_rect.center(), btn_size * 0.38);
                         }
-                    }
-
-                    let seek_resp = ui.interact(
-                        hit_rect,
-                        egui::Id::new("native_video_seek_hit"),
-                        egui::Sense::click_and_drag(),
-                    );
-                    if seek_resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                    }
-                    if duration_secs > 0.0 {
-                        if (seek_resp.clicked() || seek_resp.dragged())
-                            && let Some(pos) = seek_resp.interact_pointer_pos()
-                        {
-                            let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
-                            let frac = ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
-                            let target_secs = duration_secs * frac as f64;
-                            let should_emit = seek_resp.clicked()
-                                || last_seek_target_secs
-                                    .map(|prev| (prev - target_secs).abs() >= 0.10)
-                                    .unwrap_or(true);
-                            if should_emit {
-                                last_seek_target_secs = Some(target_secs);
-                                commands.push(NativeOverlayCommand::Seek { target_secs });
-                            }
-                        }
-                        if seek_resp.drag_stopped() {
-                            last_seek_target_secs = None;
-                        }
-                    }
-                    if duration_secs > 0.0 {
-                        if seek_resp.hovered()
-                            && let Some(pos) = pointer_pos
-                        {
-                            let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
-                            let frac = ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
-                            hover_preview_target_secs = Some(duration_secs * frac as f64);
-                        }
-                    } else {
-                        hover_preview_target_secs = None;
-                    }
-                    if duration_secs > 0.0
-                        && let Some(target) = hover_preview_target_secs
-                    {
-                        let frac = (target / duration_secs).clamp(0.0, 1.0) as f32;
-                        let x = bar_rect.min.x + bar_rect.width() * frac;
-                        let hover_preview_bookmarked =
-                            target_has_marker(&timeline_markers, target, duration_secs, |kind| {
-                                kind == NativeOverlayTimelineMarkerKind::Bookmark
-                            });
-                        let preview_image_w = (overlay_width_points * 0.30).clamp(300.0, 352.0);
-                        let image_size = egui::vec2(preview_image_w, preview_image_w * 9.0 / 16.0);
-                        let action_bar_h = 38.0;
-                        let preview_size = egui::vec2(image_size.x, image_size.y + action_bar_h);
-                        let preview_x = (x - preview_size.x * 0.5)
-                            .clamp(8.0, overlay_width_points - preview_size.x - 8.0);
-                        let preview_y = (hud_rect.min.y - preview_size.y - 14.0).max(8.0);
-                        let preview_rect = egui::Rect::from_min_size(
-                            egui::pos2(preview_x, preview_y),
-                            preview_size,
-                        );
-                        let image_rect = egui::Rect::from_min_size(preview_rect.min, image_size);
-                        let action_rect = egui::Rect::from_min_max(
-                            egui::pos2(preview_rect.min.x, image_rect.max.y),
-                            preview_rect.max,
-                        );
-                        let preview_corridor_rect = egui::Rect::from_min_max(
-                            egui::pos2(preview_rect.min.x - 8.0, preview_rect.max.y),
-                            egui::pos2(preview_rect.max.x + 8.0, hud_rect.max.y),
-                        );
-                        let pointer_in_preview = pointer_pos.is_some_and(|pos| {
-                            preview_rect.expand(8.0).contains(pos)
-                                || preview_corridor_rect.contains(pos)
+                        let play_resp = play_resp.on_hover_text(if is_playing {
+                            "一時停止 [Enter]"
+                        } else {
+                            "再生 [Enter]"
                         });
-                        if !seek_resp.hovered() && !pointer_in_preview {
-                            hover_preview_target_secs = None;
-                        } else {
-                            let request_due = last_thumbnail_request_secs
-                                .map(|prev| (prev - target).abs() >= 0.25)
-                                .unwrap_or(true)
-                                || last_thumbnail_request_at
-                                    .map(|last| last.elapsed() >= Duration::from_millis(250))
-                                    .unwrap_or(true);
-                            if request_due {
-                                last_thumbnail_request_secs = Some(target);
-                                last_thumbnail_request_at = Some(Instant::now());
-                                commands.push(NativeOverlayCommand::RequestSeekThumbnail {
-                                    target_secs: target,
-                                });
-                            }
-                            painter.line_segment(
-                                [
-                                    egui::pos2(x, hud_rect.min.y + 6.0),
-                                    egui::pos2(x, hud_rect.max.y - 6.0),
-                                ],
-                                egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 88, 88)),
-                            );
+                        if play_resp.clicked() {
+                            commands.push(NativeOverlayCommand::TogglePlay);
+                        }
+                        x = play_rect.max.x + gap;
 
+                        let loop_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, center_y - btn_size * 0.5),
+                            egui::vec2(btn_size, btn_size),
+                        );
+                        let loop_resp = ui.interact(
+                            loop_rect,
+                            egui::Id::new("native_video_loop"),
+                            egui::Sense::click(),
+                        );
+                        draw_overlay_button_bg(
+                            painter,
+                            loop_rect,
+                            loop_resp.hovered(),
+                            loop_enabled,
+                        );
+                        draw_overlay_loop_icon(
+                            painter,
+                            loop_rect.center(),
+                            btn_size * 0.36,
+                            if loop_enabled {
+                                egui::Color32::from_rgb(170, 230, 255)
+                            } else {
+                                egui::Color32::from_rgb(238, 238, 238)
+                            },
+                        );
+                        let loop_resp = loop_resp.on_hover_text(if loop_enabled {
+                            "ループ再生を解除 [L]"
+                        } else {
+                            "ループ再生 [L]"
+                        });
+                        if loop_resp.clicked() {
+                            commands.push(NativeOverlayCommand::ToggleLoop);
+                        }
+                        x = loop_rect.max.x + gap;
+
+                        let prev_frame_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, center_y - btn_size * 0.5),
+                            egui::vec2(btn_size, btn_size),
+                        );
+                        let prev_down = draw_native_frame_step_button(
+                            ui,
+                            painter,
+                            prev_frame_rect,
+                            "native_video_prev_frame",
+                            -1,
+                            "前のフレーム [Ctrl+Shift+←]",
+                            &mut frame_step_hold,
+                            &mut commands,
+                        );
+                        x = prev_frame_rect.max.x + gap;
+
+                        let screenshot_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, center_y - btn_size * 0.5),
+                            egui::vec2(btn_size, btn_size),
+                        );
+                        let screenshot_resp = ui.interact(
+                            screenshot_rect,
+                            egui::Id::new("native_video_screenshot"),
+                            egui::Sense::click(),
+                        );
+                        draw_overlay_button_bg(
+                            painter,
+                            screenshot_rect,
+                            screenshot_resp.hovered(),
+                            false,
+                        );
+                        draw_overlay_camera_icon(painter, screenshot_rect);
+                        let screenshot_resp =
+                            screenshot_resp.on_hover_text("現在フレームをクリップボードにコピー");
+                        if screenshot_resp.clicked() {
+                            commands.push(NativeOverlayCommand::CopyFrameToClipboard);
+                        }
+                        x = screenshot_rect.max.x + gap;
+
+                        let next_frame_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, center_y - btn_size * 0.5),
+                            egui::vec2(btn_size, btn_size),
+                        );
+                        let next_down = draw_native_frame_step_button(
+                            ui,
+                            painter,
+                            next_frame_rect,
+                            "native_video_next_frame",
+                            1,
+                            "次のフレーム [Ctrl+Shift+→]",
+                            &mut frame_step_hold,
+                            &mut commands,
+                        );
+                        x = next_frame_rect.max.x + gap;
+                        if !prev_down && !next_down {
+                            frame_step_hold = None;
+                        }
+
+                        let time_w = 132.0;
+                        let vol_pct_w = 40.0;
+                        let vol_slider_w = 90.0;
+                        let mute_w = btn_size;
+                        let norm_w = btn_size; // 音量ノーマライズボタン (mute と同じサイズ)
+                        let speed_w = btn_size * 1.55;
+                        let right_controls_w = time_w
+                            + gap
+                            + speed_w
+                            + gap
+                            + mute_w
+                            + gap
+                            + norm_w
+                            + gap
+                            + vol_slider_w
+                            + gap
+                            + vol_pct_w;
+                        let right_controls_x = hud_rect.max.x - side_pad - right_controls_w;
+                        let bar_min_x = x;
+                        let bar_max_x = (right_controls_x - gap).max(bar_min_x + 1.0);
+                        let bar_rect = egui::Rect::from_min_max(
+                            egui::pos2(bar_min_x, center_y - 4.0),
+                            egui::pos2(bar_max_x, center_y + 4.0),
+                        );
+                        let hit_rect = egui::Rect::from_min_max(
+                            egui::pos2(bar_min_x, hud_rect.min.y),
+                            egui::pos2(bar_max_x, hud_rect.max.y),
+                        );
+
+                        let time_x = bar_max_x + gap;
+                        let label = format!(
+                            "{} / {}",
+                            format_overlay_time(position_secs),
+                            format_overlay_time(duration_secs)
+                        );
+                        painter.text(
+                            egui::pos2(time_x, center_y),
+                            egui::Align2::LEFT_CENTER,
+                            label,
+                            egui::FontId::proportional(14.0),
+                            egui::Color32::from_rgb(238, 238, 238),
+                        );
+
+                        let speed_rect = egui::Rect::from_min_size(
+                            egui::pos2(time_x + time_w + gap, center_y - btn_size * 0.5),
+                            egui::vec2(speed_w, btn_size),
+                        );
+                        let mute_rect = egui::Rect::from_min_size(
+                            egui::pos2(speed_rect.max.x + gap, center_y - btn_size * 0.5),
+                            egui::vec2(mute_w, btn_size),
+                        );
+                        let norm_rect = egui::Rect::from_min_size(
+                            egui::pos2(mute_rect.max.x + gap, center_y - btn_size * 0.5),
+                            egui::vec2(norm_w, btn_size),
+                        );
+                        let vol_rect = egui::Rect::from_min_max(
+                            egui::pos2(norm_rect.max.x + gap, center_y - 4.0),
+                            egui::pos2(norm_rect.max.x + gap + vol_slider_w, center_y + 4.0),
+                        );
+
+                        painter.rect_filled(bar_rect, 2.0, egui::Color32::from_gray(74));
+                        if duration_secs > 0.0 {
+                            let progress = (position_secs / duration_secs).clamp(0.0, 1.0) as f32;
+                            let filled = egui::Rect::from_min_max(
+                                bar_rect.min,
+                                egui::pos2(
+                                    bar_rect.min.x + bar_rect.width() * progress,
+                                    bar_rect.max.y,
+                                ),
+                            );
                             painter.rect_filled(
-                                preview_rect.expand(2.0),
-                                4.0,
-                                egui::Color32::from_rgba_premultiplied(0, 0, 0, 220),
+                                filled,
+                                2.0,
+                                egui::Color32::from_rgb(228, 228, 228),
                             );
-                            painter.rect_filled(image_rect, 3.0, egui::Color32::from_gray(20));
-                            painter.rect_filled(
-                                action_rect,
-                                0.0,
-                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 235),
+                        }
+                        if duration_secs > 0.0 {
+                            for marker in &timeline_markers {
+                                draw_timeline_marker(painter, bar_rect, duration_secs, *marker);
+                            }
+                        }
+
+                        let seek_resp = ui.interact(
+                            hit_rect,
+                            egui::Id::new("native_video_seek_hit"),
+                            egui::Sense::click_and_drag(),
+                        );
+                        if seek_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        }
+                        if duration_secs > 0.0 {
+                            if (seek_resp.clicked() || seek_resp.dragged())
+                                && let Some(pos) = seek_resp.interact_pointer_pos()
+                            {
+                                let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
+                                let frac =
+                                    ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
+                                let target_secs = duration_secs * frac as f64;
+                                let should_emit = seek_resp.clicked()
+                                    || last_seek_target_secs
+                                        .map(|prev| (prev - target_secs).abs() >= 0.10)
+                                        .unwrap_or(true);
+                                if should_emit {
+                                    last_seek_target_secs = Some(target_secs);
+                                    commands.push(NativeOverlayCommand::Seek { target_secs });
+                                }
+                            }
+                            if seek_resp.drag_stopped() {
+                                last_seek_target_secs = None;
+                            }
+                        }
+                        if duration_secs > 0.0 {
+                            if seek_resp.hovered()
+                                && let Some(pos) = pointer_pos
+                            {
+                                let x = pos.x.clamp(bar_rect.min.x, bar_rect.max.x);
+                                let frac =
+                                    ((x - bar_rect.min.x) / bar_rect.width()).clamp(0.0, 1.0);
+                                hover_preview_target_secs = Some(duration_secs * frac as f64);
+                            }
+                        } else {
+                            hover_preview_target_secs = None;
+                        }
+                        if duration_secs > 0.0
+                            && let Some(target) = hover_preview_target_secs
+                        {
+                            let frac = (target / duration_secs).clamp(0.0, 1.0) as f32;
+                            let x = bar_rect.min.x + bar_rect.width() * frac;
+                            let hover_preview_bookmarked = target_has_marker(
+                                &timeline_markers,
+                                target,
+                                duration_secs,
+                                |kind| kind == NativeOverlayTimelineMarkerKind::Bookmark,
                             );
-                            painter.rect_stroke(
-                                preview_rect,
-                                3.0,
-                                egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
-                                egui::StrokeKind::Inside,
+                            let preview_image_w = (overlay_width_points * 0.30).clamp(300.0, 352.0);
+                            let image_size =
+                                egui::vec2(preview_image_w, preview_image_w * 9.0 / 16.0);
+                            let action_bar_h = 38.0;
+                            let preview_size =
+                                egui::vec2(image_size.x, image_size.y + action_bar_h);
+                            let preview_x = (x - preview_size.x * 0.5)
+                                .clamp(8.0, overlay_width_points - preview_size.x - 8.0);
+                            let preview_y = (hud_rect.min.y - preview_size.y - 14.0).max(8.0);
+                            let preview_rect = egui::Rect::from_min_size(
+                                egui::pos2(preview_x, preview_y),
+                                preview_size,
                             );
-                            let thumbnail_matches = hover_thumbnail.as_ref().is_some_and(|thumb| {
-                                (thumb.target_secs - target).abs()
-                                    <= crate::video::thumbnail::SECONDS_PER_BUCKET * 2.0
+                            let image_rect =
+                                egui::Rect::from_min_size(preview_rect.min, image_size);
+                            let action_rect = egui::Rect::from_min_max(
+                                egui::pos2(preview_rect.min.x, image_rect.max.y),
+                                preview_rect.max,
+                            );
+                            let preview_corridor_rect = egui::Rect::from_min_max(
+                                egui::pos2(preview_rect.min.x - 8.0, preview_rect.max.y),
+                                egui::pos2(preview_rect.max.x + 8.0, hud_rect.max.y),
+                            );
+                            let pointer_in_preview = pointer_pos.is_some_and(|pos| {
+                                preview_rect.expand(8.0).contains(pos)
+                                    || preview_corridor_rect.contains(pos)
                             });
-                            if thumbnail_matches {
-                                if let (Some(texture_id), Some(thumb)) =
-                                    (hover_texture_id, hover_thumbnail.as_ref())
-                                {
-                                    let fitted = fit_rect_in_rect(
-                                        egui::vec2(thumb.width as f32, thumb.height as f32),
-                                        image_rect,
-                                    );
-                                    painter.image(
-                                        texture_id,
-                                        fitted,
-                                        egui::Rect::from_min_max(
-                                            egui::pos2(0.0, 0.0),
-                                            egui::pos2(1.0, 1.0),
-                                        ),
-                                        egui::Color32::WHITE,
+                            if !seek_resp.hovered() && !pointer_in_preview {
+                                hover_preview_target_secs = None;
+                            } else {
+                                let request_due = last_thumbnail_request_secs
+                                    .map(|prev| (prev - target).abs() >= 0.25)
+                                    .unwrap_or(true)
+                                    || last_thumbnail_request_at
+                                        .map(|last| last.elapsed() >= Duration::from_millis(250))
+                                        .unwrap_or(true);
+                                if request_due {
+                                    last_thumbnail_request_secs = Some(target);
+                                    last_thumbnail_request_at = Some(Instant::now());
+                                    commands.push(NativeOverlayCommand::RequestSeekThumbnail {
+                                        target_secs: target,
+                                    });
+                                }
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(x, hud_rect.min.y + 6.0),
+                                        egui::pos2(x, hud_rect.max.y - 6.0),
+                                    ],
+                                    egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 88, 88)),
+                                );
+
+                                painter.rect_filled(
+                                    preview_rect.expand(2.0),
+                                    4.0,
+                                    egui::Color32::from_rgba_premultiplied(0, 0, 0, 220),
+                                );
+                                painter.rect_filled(image_rect, 3.0, egui::Color32::from_gray(20));
+                                painter.rect_filled(
+                                    action_rect,
+                                    0.0,
+                                    egui::Color32::from_rgba_unmultiplied(0, 0, 0, 235),
+                                );
+                                painter.rect_stroke(
+                                    preview_rect,
+                                    3.0,
+                                    egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
+                                    egui::StrokeKind::Inside,
+                                );
+                                let thumbnail_matches =
+                                    hover_thumbnail.as_ref().is_some_and(|thumb| {
+                                        (thumb.target_secs - target).abs()
+                                            <= crate::video::thumbnail::SECONDS_PER_BUCKET * 2.0
+                                    });
+                                if thumbnail_matches {
+                                    if let (Some(texture_id), Some(thumb)) =
+                                        (hover_texture_id, hover_thumbnail.as_ref())
+                                    {
+                                        let fitted = fit_rect_in_rect(
+                                            egui::vec2(thumb.width as f32, thumb.height as f32),
+                                            image_rect,
+                                        );
+                                        painter.image(
+                                            texture_id,
+                                            fitted,
+                                            egui::Rect::from_min_max(
+                                                egui::pos2(0.0, 0.0),
+                                                egui::pos2(1.0, 1.0),
+                                            ),
+                                            egui::Color32::WHITE,
+                                        );
+                                    }
+                                } else {
+                                    painter.text(
+                                        image_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "loading",
+                                        egui::FontId::proportional(12.0),
+                                        egui::Color32::from_gray(150),
                                     );
                                 }
-                            } else {
+
+                                let action_size = 24.0;
+                                let action_gap = 6.0;
+                                let pin_rect = egui::Rect::from_min_size(
+                                    action_rect.min + egui::vec2(6.0, 4.0),
+                                    egui::vec2(action_size, action_size),
+                                );
+                                let bookmark_rect = egui::Rect::from_min_size(
+                                    egui::pos2(pin_rect.max.x + action_gap, pin_rect.min.y),
+                                    egui::vec2(action_size, action_size),
+                                );
+                                let pin_resp = ui.interact(
+                                    pin_rect,
+                                    egui::Id::new("native_video_hover_pin"),
+                                    egui::Sense::click(),
+                                );
+                                draw_overlay_button_bg(
+                                    painter,
+                                    pin_rect,
+                                    pin_resp.hovered(),
+                                    hover_preview_pinned,
+                                );
+                                draw_overlay_pin_icon(
+                                    painter,
+                                    pin_rect.center(),
+                                    action_size * 0.34,
+                                    if hover_preview_pinned {
+                                        egui::Color32::from_rgb(180, 255, 180)
+                                    } else {
+                                        egui::Color32::from_rgb(118, 214, 255)
+                                    },
+                                );
+                                let pin_resp = pin_resp.on_hover_text(if hover_preview_pinned {
+                                    "ピン留めを解除"
+                                } else {
+                                    "サムネイルをピン留め"
+                                });
+                                if pin_resp.clicked() {
+                                    commands.push(NativeOverlayCommand::TogglePinAt {
+                                        target_secs: target,
+                                    });
+                                }
+                                let bookmark_resp = ui.interact(
+                                    bookmark_rect,
+                                    egui::Id::new("native_video_hover_bookmark"),
+                                    egui::Sense::click(),
+                                );
+                                draw_overlay_button_bg(
+                                    painter,
+                                    bookmark_rect,
+                                    bookmark_resp.hovered(),
+                                    hover_preview_bookmarked,
+                                );
+                                draw_overlay_bookmark_icon(
+                                    painter,
+                                    bookmark_rect.center(),
+                                    action_size * 0.32,
+                                    if hover_preview_bookmarked {
+                                        egui::Color32::from_rgb(255, 245, 145)
+                                    } else {
+                                        egui::Color32::from_rgb(255, 220, 80)
+                                    },
+                                );
+                                let bookmark_resp =
+                                    bookmark_resp.on_hover_text(if hover_preview_bookmarked {
+                                        "ブックマーク済み [B]"
+                                    } else {
+                                        "ブックマークを追加 [B]"
+                                    });
+                                if bookmark_resp.clicked() {
+                                    commands.push(NativeOverlayCommand::AddBookmarkAt {
+                                        target_secs: target,
+                                    });
+                                }
+
+                                let time_label = format_overlay_time(target);
                                 painter.text(
-                                    image_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "loading",
-                                    egui::FontId::proportional(12.0),
-                                    egui::Color32::from_gray(150),
+                                    egui::pos2(action_rect.max.x - 8.0, action_rect.center().y),
+                                    egui::Align2::RIGHT_CENTER,
+                                    time_label,
+                                    egui::FontId::proportional(13.0),
+                                    egui::Color32::from_rgb(245, 245, 245),
                                 );
                             }
-
-                            let action_size = 24.0;
-                            let action_gap = 6.0;
-                            let pin_rect = egui::Rect::from_min_size(
-                                action_rect.min + egui::vec2(6.0, 4.0),
-                                egui::vec2(action_size, action_size),
-                            );
-                            let bookmark_rect = egui::Rect::from_min_size(
-                                egui::pos2(pin_rect.max.x + action_gap, pin_rect.min.y),
-                                egui::vec2(action_size, action_size),
-                            );
-                            let pin_resp = ui.interact(
-                                pin_rect,
-                                egui::Id::new("native_video_hover_pin"),
-                                egui::Sense::click(),
-                            );
-                            draw_overlay_button_bg(
-                                painter,
-                                pin_rect,
-                                pin_resp.hovered(),
-                                hover_preview_pinned,
-                            );
-                            draw_overlay_pin_icon(
-                                painter,
-                                pin_rect.center(),
-                                action_size * 0.34,
-                                if hover_preview_pinned {
-                                    egui::Color32::from_rgb(180, 255, 180)
-                                } else {
-                                    egui::Color32::from_rgb(118, 214, 255)
-                                },
-                            );
-                            let pin_resp = pin_resp.on_hover_text(if hover_preview_pinned {
-                                "ピン留めを解除"
-                            } else {
-                                "サムネイルをピン留め"
-                            });
-                            if pin_resp.clicked() {
-                                commands.push(NativeOverlayCommand::TogglePinAt {
-                                    target_secs: target,
-                                });
-                            }
-                            let bookmark_resp = ui.interact(
-                                bookmark_rect,
-                                egui::Id::new("native_video_hover_bookmark"),
-                                egui::Sense::click(),
-                            );
-                            draw_overlay_button_bg(
-                                painter,
-                                bookmark_rect,
-                                bookmark_resp.hovered(),
-                                hover_preview_bookmarked,
-                            );
-                            draw_overlay_bookmark_icon(
-                                painter,
-                                bookmark_rect.center(),
-                                action_size * 0.32,
-                                if hover_preview_bookmarked {
-                                    egui::Color32::from_rgb(255, 245, 145)
-                                } else {
-                                    egui::Color32::from_rgb(255, 220, 80)
-                                },
-                            );
-                            let bookmark_resp =
-                                bookmark_resp.on_hover_text(if hover_preview_bookmarked {
-                                    "ブックマーク済み [B]"
-                                } else {
-                                    "ブックマークを追加 [B]"
-                                });
-                            if bookmark_resp.clicked() {
-                                commands.push(NativeOverlayCommand::AddBookmarkAt {
-                                    target_secs: target,
-                                });
-                            }
-
-                            let time_label = format_overlay_time(target);
-                            painter.text(
-                                egui::pos2(action_rect.max.x - 8.0, action_rect.center().y),
-                                egui::Align2::RIGHT_CENTER,
-                                time_label,
-                                egui::FontId::proportional(13.0),
-                                egui::Color32::from_rgb(245, 245, 245),
-                            );
                         }
-                    }
 
-                    let speed_resp = ui.interact(
-                        speed_rect,
-                        egui::Id::new("native_video_speed"),
-                        egui::Sense::click(),
-                    );
-                    draw_overlay_button_bg(painter, speed_rect, speed_resp.hovered(), false);
-                    painter.text(
-                        speed_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        crate::video::clock::format_playback_speed(playback_speed),
-                        egui::FontId::proportional(12.0),
-                        egui::Color32::from_rgb(238, 238, 238),
-                    );
-                    let speed_resp =
-                        speed_resp.on_hover_text("再生速度 (右クリック / ダブルクリックで x1)");
-                    if speed_resp.secondary_clicked() || speed_resp.double_clicked() {
-                        video_speed_popup_open = false;
-                        commands.push(NativeOverlayCommand::SetPlaybackSpeed { speed: 1.0 });
-                    } else if speed_resp.clicked() {
-                        video_speed_popup_open = !video_speed_popup_open;
-                    }
-                    if video_speed_popup_open {
-                        let popup_w = 356.0_f32.min((overlay_width_points - 16.0).max(180.0));
-                        let popup_h = 74.0;
-                        let popup_x = (speed_rect.center().x - popup_w * 0.5)
-                            .clamp(8.0, overlay_width_points - popup_w - 8.0);
-                        let popup_y = (hud_rect.min.y - popup_h - 6.0).max(8.0);
-                        let mut selected_speed = None;
-                        egui::Area::new(egui::Id::new("native_video_speed_popup"))
-                            .order(egui::Order::Foreground)
-                            .fixed_pos(egui::pos2(popup_x, popup_y))
-                            .show(ctx, |ui| {
-                                egui::Frame::new()
-                                    .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 225))
-                                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(110)))
-                                    .corner_radius(egui::CornerRadius::same(4))
-                                    .inner_margin(egui::Margin::same(6))
-                                    .show(ui, |ui| {
-                                        ui.set_min_width(popup_w - 12.0);
-                                        ui.horizontal_wrapped(|ui| {
-                                            for speed in crate::video::clock::PLAYBACK_SPEED_CHOICES
-                                            {
-                                                let selected =
-                                                    (playback_speed - speed).abs() < 1.0e-6;
-                                                let label =
-                                                    crate::video::clock::format_playback_speed(
-                                                        speed,
-                                                    );
-                                                let button = egui::Button::new(label)
-                                                    .selected(selected)
-                                                    .min_size(egui::vec2(46.0, 24.0));
-                                                if ui.add(button).clicked() {
-                                                    selected_speed = Some(speed);
-                                                }
-                                            }
-                                        });
-                                    });
-                            });
-                        if ui.ctx().input(|i| i.pointer.any_click())
-                            && !speed_resp.hovered()
-                            && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
-                        {
-                            let popup_rect = egui::Rect::from_min_size(
-                                egui::pos2(popup_x, popup_y),
-                                egui::vec2(popup_w, popup_h),
-                            );
-                            if !popup_rect.contains(pos) {
-                                video_speed_popup_open = false;
-                            }
-                        }
-                        if let Some(speed) = selected_speed {
-                            let speed = crate::video::clock::clamp_playback_speed(speed);
-                            video_speed_popup_open = false;
-                            commands.push(NativeOverlayCommand::SetPlaybackSpeed { speed });
-                        }
-                    }
-
-                    let mute_resp = ui.interact(
-                        mute_rect,
-                        egui::Id::new("native_video_mute"),
-                        egui::Sense::click(),
-                    );
-                    draw_overlay_button_bg(painter, mute_rect, mute_resp.hovered(), muted);
-                    draw_overlay_speaker_icon(painter, mute_rect.center(), btn_size * 0.46, muted);
-                    let mute_resp = mute_resp.on_hover_text(if muted {
-                        "ミュート解除 [M]"
-                    } else {
-                        "ミュート [M]"
-                    });
-                    if mute_resp.clicked() {
-                        commands.push(NativeOverlayCommand::ToggleMute);
-                    }
-
-                    painter.rect_filled(vol_rect, 2.0, egui::Color32::from_gray(74));
-                    let volume = finite_video_volume(volume);
-                    let max_volume = crate::settings::VIDEO_VOLUME_MAX;
-                    let normal_frac = (1.0 / max_volume) as f32;
-                    let normal_fill_frac = (volume.min(1.0) / max_volume) as f32;
-                    if normal_fill_frac > 0.0 {
-                        let normal_fill = egui::Rect::from_min_max(
-                            vol_rect.min,
-                            egui::pos2(
-                                vol_rect.min.x + vol_rect.width() * normal_fill_frac,
-                                vol_rect.max.y,
-                            ),
+                        let speed_resp = ui.interact(
+                            speed_rect,
+                            egui::Id::new("native_video_speed"),
+                            egui::Sense::click(),
                         );
-                        painter.rect_filled(
-                            normal_fill,
-                            2.0,
-                            egui::Color32::from_rgb(220, 220, 220),
-                        );
-                    }
-                    if volume > 1.0 {
-                        let boost_fill_frac = (volume / max_volume) as f32;
-                        let boost_fill = egui::Rect::from_min_max(
-                            egui::pos2(
-                                vol_rect.min.x + vol_rect.width() * normal_frac,
-                                vol_rect.min.y,
-                            ),
-                            egui::pos2(
-                                vol_rect.min.x + vol_rect.width() * boost_fill_frac,
-                                vol_rect.max.y,
-                            ),
-                        );
-                        painter.rect_filled(boost_fill, 2.0, egui::Color32::from_rgb(255, 198, 62));
-                    }
-                    let normal_x = vol_rect.min.x + vol_rect.width() * normal_frac;
-                    painter.line_segment(
-                        [
-                            egui::pos2(normal_x, vol_rect.min.y - 3.0),
-                            egui::pos2(normal_x, vol_rect.max.y + 3.0),
-                        ],
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
-                    );
-                    let vol_resp = ui.interact(
-                        vol_rect.expand2(egui::vec2(0.0, 10.0)),
-                        egui::Id::new("native_video_volume"),
-                        egui::Sense::click_and_drag(),
-                    );
-                    if vol_resp.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
-                    }
-                    let vol_resp = vol_resp.on_hover_text(
-                        "音量 (右クリック / ダブルクリックで 100%) [Shift+↑ / Shift+↓]",
-                    );
-                    if vol_resp.secondary_clicked() || vol_resp.double_clicked() {
-                        self.last_volume_target = Some(1.0);
-                        commands.push(NativeOverlayCommand::SetVolume {
-                            volume: 1.0,
-                            persist: true,
-                        });
-                    } else if (vol_resp.clicked() || vol_resp.dragged())
-                        && let Some(pos) = vol_resp.interact_pointer_pos()
-                    {
-                        let value = ((pos.x - vol_rect.min.x) / vol_rect.width()).clamp(0.0, 1.0)
-                            as f64
-                            * max_volume;
-                        self.last_volume_target = Some(value);
-                        commands.push(NativeOverlayCommand::SetVolume {
-                            volume: value,
-                            persist: vol_resp.clicked() && !vol_resp.dragged(),
-                        });
-                    }
-                    if vol_resp.drag_stopped() {
-                        let value = self.last_volume_target.take().unwrap_or(volume);
-                        commands.push(NativeOverlayCommand::SetVolume {
-                            volume: value,
-                            persist: true,
-                        });
-                    }
-                    painter.text(
-                        egui::pos2(vol_rect.max.x + gap, center_y),
-                        egui::Align2::LEFT_CENTER,
-                        format!("{:>3}%", (volume * 100.0).round() as i32),
-                        egui::FontId::proportional(13.0),
-                        if volume > 1.0 {
-                            egui::Color32::from_rgb(255, 210, 80)
-                        } else {
-                            egui::Color32::from_rgb(238, 238, 238)
-                        },
-                    );
-
-                    if cfg!(debug_assertions) {
-                        let pointer = pointer_pos
-                            .map(|p| format!("{:.0},{:.0}", p.x, p.y))
-                            .unwrap_or_else(|| "outside".to_string());
+                        draw_overlay_button_bg(painter, speed_rect, speed_resp.hovered(), false);
                         painter.text(
-                            egui::pos2(hud_rect.max.x - 12.0, hud_rect.min.y + 10.0),
-                            egui::Align2::RIGHT_TOP,
-                            format!("native overlay events={event_count} pointer={pointer}"),
-                            egui::FontId::proportional(10.0),
-                            egui::Color32::from_rgb(150, 150, 150),
+                            speed_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            crate::video::clock::format_playback_speed(playback_speed),
+                            egui::FontId::proportional(12.0),
+                            egui::Color32::from_rgb(238, 238, 238),
                         );
-                    }
-                });
+                        let speed_resp =
+                            speed_resp.on_hover_text("再生速度 (右クリック / ダブルクリックで x1)");
+                        if speed_resp.secondary_clicked() || speed_resp.double_clicked() {
+                            video_speed_popup_open = false;
+                            commands.push(NativeOverlayCommand::SetPlaybackSpeed { speed: 1.0 });
+                        } else if speed_resp.clicked() {
+                            video_speed_popup_open = !video_speed_popup_open;
+                        }
+                        if video_speed_popup_open {
+                            let popup_w = 356.0_f32.min((overlay_width_points - 16.0).max(180.0));
+                            let popup_h = 74.0;
+                            let popup_x = (speed_rect.center().x - popup_w * 0.5)
+                                .clamp(8.0, overlay_width_points - popup_w - 8.0);
+                            let popup_y = (hud_rect.min.y - popup_h - 6.0).max(8.0);
+                            let mut selected_speed = None;
+                            egui::Area::new(egui::Id::new("native_video_speed_popup"))
+                                .order(egui::Order::Foreground)
+                                .fixed_pos(egui::pos2(popup_x, popup_y))
+                                .show(ctx, |ui| {
+                                    egui::Frame::new()
+                                        .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 225))
+                                        .stroke(egui::Stroke::new(
+                                            1.0,
+                                            egui::Color32::from_gray(110),
+                                        ))
+                                        .corner_radius(egui::CornerRadius::same(4))
+                                        .inner_margin(egui::Margin::same(6))
+                                        .show(ui, |ui| {
+                                            ui.set_min_width(popup_w - 12.0);
+                                            ui.horizontal_wrapped(|ui| {
+                                                for speed in
+                                                    crate::video::clock::PLAYBACK_SPEED_CHOICES
+                                                {
+                                                    let selected =
+                                                        (playback_speed - speed).abs() < 1.0e-6;
+                                                    let label =
+                                                        crate::video::clock::format_playback_speed(
+                                                            speed,
+                                                        );
+                                                    let button = egui::Button::new(label)
+                                                        .selected(selected)
+                                                        .min_size(egui::vec2(46.0, 24.0));
+                                                    if ui.add(button).clicked() {
+                                                        selected_speed = Some(speed);
+                                                    }
+                                                }
+                                            });
+                                        });
+                                });
+                            if ui.ctx().input(|i| i.pointer.any_click())
+                                && !speed_resp.hovered()
+                                && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
+                            {
+                                let popup_rect = egui::Rect::from_min_size(
+                                    egui::pos2(popup_x, popup_y),
+                                    egui::vec2(popup_w, popup_h),
+                                );
+                                if !popup_rect.contains(pos) {
+                                    video_speed_popup_open = false;
+                                }
+                            }
+                            if let Some(speed) = selected_speed {
+                                let speed = crate::video::clock::clamp_playback_speed(speed);
+                                video_speed_popup_open = false;
+                                commands.push(NativeOverlayCommand::SetPlaybackSpeed { speed });
+                            }
+                        }
+
+                        let mute_resp = ui.interact(
+                            mute_rect,
+                            egui::Id::new("native_video_mute"),
+                            egui::Sense::click(),
+                        );
+                        draw_overlay_button_bg(painter, mute_rect, mute_resp.hovered(), muted);
+                        draw_overlay_speaker_icon(
+                            painter,
+                            mute_rect.center(),
+                            btn_size * 0.46,
+                            muted,
+                        );
+                        let mute_resp = mute_resp.on_hover_text(if muted {
+                            "ミュート解除 [M]"
+                        } else {
+                            "ミュート [M]"
+                        });
+                        if mute_resp.clicked() {
+                            commands.push(NativeOverlayCommand::ToggleMute);
+                        }
+
+                        // ── 音量ノーマライズボタン (mute と vol_slider の間) ──
+                        use crate::video::normalize_types::NormalizeUiState;
+                        let norm_ui_state = self.normalize_state.ui_state;
+                        let is_scanning = matches!(norm_ui_state, NormalizeUiState::Scanning);
+                        let norm_active =
+                            matches!(norm_ui_state, NormalizeUiState::OnApplied { .. });
+                        let norm_unmeasured =
+                            matches!(norm_ui_state, NormalizeUiState::OnUnmeasured);
+                        let norm_resp = ui.interact(
+                            norm_rect,
+                            egui::Id::new("native_video_normalize"),
+                            egui::Sense::CLICK | egui::Sense::HOVER,
+                        );
+                        let norm_hover_label = match norm_ui_state {
+                            NormalizeUiState::Off => {
+                                "音量ノーマライズ (-14 LUFS)。クリックで ON".to_string()
+                            }
+                            NormalizeUiState::OnApplied { gain_db } => format!(
+                                "音量ノーマライズ ON ({gain_db:+.1}dB / -14 LUFS)。クリックで OFF"
+                            ),
+                            NormalizeUiState::OnUnmeasured => {
+                                "音量ノーマライズが有効です。クリックして測定 / 右クリックで OFF"
+                                    .to_string()
+                            }
+                            NormalizeUiState::Scanning => "ノーマライズ中…".to_string(),
+                        };
+                        draw_overlay_button_bg(
+                            painter,
+                            norm_rect,
+                            norm_resp.hovered() && !is_scanning,
+                            norm_active,
+                        );
+                        // ボタン色: Off=グレー / OnApplied=黄 / OnUnmeasured=オレンジ点滅 / Scanning=グレー
+                        let norm_color = if is_scanning {
+                            egui::Color32::from_gray(120)
+                        } else if norm_active {
+                            egui::Color32::from_rgb(255, 198, 62)
+                        } else if norm_unmeasured {
+                            // 半透明 blink (時間ベースで alpha 変動)
+                            let t = ui.ctx().input(|i| i.time);
+                            let blink = (((t * 2.0).sin() + 1.0) * 0.5) as f32;
+                            let alpha = (180.0 + blink * 75.0) as u8;
+                            egui::Color32::from_rgba_unmultiplied(255, 150, 60, alpha)
+                        } else {
+                            egui::Color32::from_gray(180)
+                        };
+                        // "Norm" ラベル
+                        painter.text(
+                            norm_rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            "Norm",
+                            egui::FontId::proportional(11.0),
+                            norm_color,
+                        );
+                        let norm_resp = norm_resp.on_hover_text(norm_hover_label);
+                        if !is_scanning {
+                            if norm_resp.clicked() {
+                                commands.push(NativeOverlayCommand::ToggleNormalize);
+                            } else if norm_resp.secondary_clicked() {
+                                commands.push(NativeOverlayCommand::DisableNormalize);
+                            }
+                        }
+
+                        painter.rect_filled(vol_rect, 2.0, egui::Color32::from_gray(74));
+                        let volume = finite_video_volume(volume);
+                        let max_volume = crate::settings::VIDEO_VOLUME_MAX;
+                        let normal_frac = (1.0 / max_volume) as f32;
+                        let normal_fill_frac = (volume.min(1.0) / max_volume) as f32;
+                        if normal_fill_frac > 0.0 {
+                            let normal_fill = egui::Rect::from_min_max(
+                                vol_rect.min,
+                                egui::pos2(
+                                    vol_rect.min.x + vol_rect.width() * normal_fill_frac,
+                                    vol_rect.max.y,
+                                ),
+                            );
+                            painter.rect_filled(
+                                normal_fill,
+                                2.0,
+                                egui::Color32::from_rgb(220, 220, 220),
+                            );
+                        }
+                        if volume > 1.0 {
+                            let boost_fill_frac = (volume / max_volume) as f32;
+                            let boost_fill = egui::Rect::from_min_max(
+                                egui::pos2(
+                                    vol_rect.min.x + vol_rect.width() * normal_frac,
+                                    vol_rect.min.y,
+                                ),
+                                egui::pos2(
+                                    vol_rect.min.x + vol_rect.width() * boost_fill_frac,
+                                    vol_rect.max.y,
+                                ),
+                            );
+                            painter.rect_filled(
+                                boost_fill,
+                                2.0,
+                                egui::Color32::from_rgb(255, 198, 62),
+                            );
+                        }
+                        let normal_x = vol_rect.min.x + vol_rect.width() * normal_frac;
+                        painter.line_segment(
+                            [
+                                egui::pos2(normal_x, vol_rect.min.y - 3.0),
+                                egui::pos2(normal_x, vol_rect.max.y + 3.0),
+                            ],
+                            egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
+                        );
+                        let vol_resp = ui.interact(
+                            vol_rect.expand2(egui::vec2(0.0, 10.0)),
+                            egui::Id::new("native_video_volume"),
+                            egui::Sense::click_and_drag(),
+                        );
+                        if vol_resp.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                        }
+                        let vol_resp = vol_resp.on_hover_text(
+                            "音量 (右クリック / ダブルクリックで 100%) [Shift+↑ / Shift+↓]",
+                        );
+                        if vol_resp.secondary_clicked() || vol_resp.double_clicked() {
+                            self.last_volume_target = Some(1.0);
+                            commands.push(NativeOverlayCommand::SetVolume {
+                                volume: 1.0,
+                                persist: true,
+                            });
+                        } else if (vol_resp.clicked() || vol_resp.dragged())
+                            && let Some(pos) = vol_resp.interact_pointer_pos()
+                        {
+                            let value = ((pos.x - vol_rect.min.x) / vol_rect.width())
+                                .clamp(0.0, 1.0) as f64
+                                * max_volume;
+                            self.last_volume_target = Some(value);
+                            commands.push(NativeOverlayCommand::SetVolume {
+                                volume: value,
+                                persist: vol_resp.clicked() && !vol_resp.dragged(),
+                            });
+                        }
+                        if vol_resp.drag_stopped() {
+                            let value = self.last_volume_target.take().unwrap_or(volume);
+                            commands.push(NativeOverlayCommand::SetVolume {
+                                volume: value,
+                                persist: true,
+                            });
+                        }
+                        painter.text(
+                            egui::pos2(vol_rect.max.x + gap, center_y),
+                            egui::Align2::LEFT_CENTER,
+                            format!("{:>3}%", (volume * 100.0).round() as i32),
+                            egui::FontId::proportional(13.0),
+                            if volume > 1.0 {
+                                egui::Color32::from_rgb(255, 210, 80)
+                            } else {
+                                egui::Color32::from_rgb(238, 238, 238)
+                            },
+                        );
+
+                        if cfg!(debug_assertions) {
+                            let pointer = pointer_pos
+                                .map(|p| format!("{:.0},{:.0}", p.x, p.y))
+                                .unwrap_or_else(|| "outside".to_string());
+                            painter.text(
+                                egui::pos2(hud_rect.max.x - 12.0, hud_rect.min.y + 10.0),
+                                egui::Align2::RIGHT_TOP,
+                                format!("native overlay events={event_count} pointer={pointer}"),
+                                egui::FontId::proportional(10.0),
+                                egui::Color32::from_rgb(150, 150, 150),
+                            );
+                        }
+                    });
+            } // ← `if bottom_hud_visible {` の閉じ (Codex 4周目 P1)
+            // Codex 3周目 P2 反映: 音量ノーマライズ進捗パネルは **すべての overlay UI
+            // 描画の最後** に置く。同じ Order::Foreground の Area は描画順 = z-order なので、
+            // metadata panel / jump panel / bookmark editor / bottom HUD より後に描けば
+            // 全画面 blocker がそれらより前面に出てクリックを完全にキャプチャできる。
+            // Codex 4周目 P1: bottom_hud_visible == false でも必ず実行 (HUD フェードアウト中も
+            // 進捗 UI は出続ける)。
+            if matches!(
+                normalize_state_snap.ui_state,
+                crate::video::normalize_types::NormalizeUiState::Scanning
+            ) {
+                if let Some(progress) = normalize_state_snap.progress.as_ref() {
+                    draw_native_normalize_progress(
+                        ctx,
+                        overlay_width_points,
+                        overlay_height_points,
+                        progress,
+                        &mut commands,
+                    );
+                }
+            }
         });
         // Query after `run`: egui updates these flags from the just-processed
         // frame, which lets this presenter decide whether to forward the same

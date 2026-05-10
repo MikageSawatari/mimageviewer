@@ -890,6 +890,20 @@ pub struct Settings {
     #[serde(default)]
     pub vst3_chain_slots: Vst3ChainPresetSlots,
 
+    // ── 音量ノーマライズ (v0.10+) ──
+    //
+    // 動画ごとに -14 LUFS 相当に揃える音量自動調整。グローバル ON/OFF。
+    // 測定値は別 DB (`audio_normalize.db`) にファイル単位でキャッシュ。
+    /// グローバル ON/OFF。OFF (既定) なら gain は常に 1.0。
+    #[serde(default)]
+    pub audio_normalize_enabled: bool,
+    /// ターゲット音量 (LUFS の千分の一単位、整数で持つ)。
+    /// 既定 -14000 (= -14.000 LUFS、YouTube/Spotify 相当)。
+    /// 直接編集される可能性を考慮し、使用時は `clamped_audio_normalize_target_lufs_milli()` で
+    /// `-60_000..=0` にクランプする。
+    #[serde(default = "default_audio_normalize_target_lufs_milli")]
+    pub audio_normalize_target_lufs_milli: i32,
+
     // ── settings.json 内部メタ ──
     /// 直近にこの settings.json を書き込んだ mIV のバージョン。
     /// `Settings::load` でアプリの現バージョンと比較し、変わっていれば
@@ -964,6 +978,16 @@ pub fn clamp_video_volume(value: f64) -> f64 {
         VIDEO_VOLUME_DEFAULT
     }
 }
+
+/// 音量ノーマライズの target_lufs_milli 既定値 (= -14.000 LUFS、YouTube/Spotify 相当)。
+fn default_audio_normalize_target_lufs_milli() -> i32 {
+    -14_000
+}
+
+/// 音量ノーマライズの target_lufs_milli 範囲 (= -60 LUFS 〜 0 LUFS)。
+/// 設定ファイル直接編集で異常値が入っても DB キーが無限に増える事故を防ぐためクランプする。
+pub const AUDIO_NORMALIZE_TARGET_LUFS_MILLI_MIN: i32 = -60_000;
+pub const AUDIO_NORMALIZE_TARGET_LUFS_MILLI_MAX: i32 = 0;
 
 /// 動画タイルモード列数の候補 (Phase 6.D)。
 pub const VIDEO_TILE_COLUMN_CANDIDATES: &[usize] = &[6, 10, 16, 20, 26, 30];
@@ -1261,6 +1285,8 @@ impl Default for Settings {
             vst3_gui_visible: true,
             vst3_video_compact: false,
             vst3_chain_slots: Vst3ChainPresetSlots::default(),
+            audio_normalize_enabled: false,
+            audio_normalize_target_lufs_milli: default_audio_normalize_target_lufs_milli(),
             last_seen_version: None,
         }
     }
@@ -1628,6 +1654,15 @@ impl Settings {
     /// UUID でお気に入りを引く。UI ドロップダウン等で `Option<Uuid>` を表示するときに使う。
     pub fn favorite_by_id(&self, id: uuid::Uuid) -> Option<&FavoriteEntry> {
         self.favorites.iter().find(|f| f.id == id)
+    }
+
+    /// 音量ノーマライズの target_lufs_milli を、設定ファイル直接編集による
+    /// 異常値から守るため `[-60_000, 0]` の範囲にクランプして返す。
+    pub fn clamped_audio_normalize_target_lufs_milli(&self) -> i32 {
+        self.audio_normalize_target_lufs_milli.clamp(
+            AUDIO_NORMALIZE_TARGET_LUFS_MILLI_MIN,
+            AUDIO_NORMALIZE_TARGET_LUFS_MILLI_MAX,
+        )
     }
 
     pub fn load() -> Self {

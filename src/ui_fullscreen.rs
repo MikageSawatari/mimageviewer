@@ -2,6 +2,21 @@
 //!
 //! `App::update()` から呼ばれる `render_fullscreen_viewport()` を実装する。
 //! 元は `update()` 内にインラインで書かれていた ~460 行を独立メソッドに切り出したもの。
+//!
+//! # ⚠️ 動画 UI の責任分担に注意
+//!
+//! - **動画フルスクリーン中の HUD・音量スライダ・seek bar・ミュート・top bar・
+//!   メタデータパネル・ノーマライズボタン等の playback controls は、このファイルではなく
+//!   [`crate::video::native_presenter`] (egui overlay) が描画する**
+//! - このファイルが現役で担当する動画関連は:
+//!   - 動画の **エラー表示** と **「動画を準備中…」スピナー**
+//!     ([`crate::App::draw_video_hud`])
+//! - 動画 UI を変更したい場合は必ず [docs/video-architecture.md] と
+//!   [src/video/native_presenter/mod.rs] を読むこと
+//!
+//! 過去にこのファイル内 (line 6800 付近) に動画 HUD コードが書かれていた経緯があるが、
+//! v0.9.0 で native presenter に移行済。新規追加 / 移植時に「ui_fullscreen.rs を見て
+//! しまう」誤認を避けるため明示。
 
 use eframe::egui;
 
@@ -2116,15 +2131,23 @@ impl App {
                     keys
                 ));
             }
+            // Codex 2周目 P1: ノーマライズスキャン中なら handle_native_video_key_event の
+            // ESC は cancel ルートに乗る。直後の `consume_key` で ESC を取るとフォールバック側で
+            // close_fs = true になり、cancel + close が同フレームで走ってしまうので、
+            // この呼び出し前後でスキャン状態の変化 (= ESC で cancel された) を検出して
+            // close 判定をスキップする。
+            let normalize_active_before = self.normalize_state.is_some();
             if !self.ime_input_active() {
                 for key in native_video_key_events_from_ctx(ctx) {
                     self.handle_native_video_key_event(ctx, fs_idx, key);
                 }
             }
+            let normalize_cancelled_this_frame =
+                normalize_active_before && self.normalize_state.is_none();
             let close_requested = ctx.input(|i| i.viewport().close_requested());
             let escape_pressed = !self.ime_input_active()
                 && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-            if close_requested || escape_pressed {
+            if (close_requested || escape_pressed) && !normalize_cancelled_this_frame {
                 close_fs = true;
             }
             egui::CentralPanel::default()

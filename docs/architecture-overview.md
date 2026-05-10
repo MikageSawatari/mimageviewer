@@ -105,6 +105,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `adjustment.rs` | `AdjustParams` (輝度/コントラスト/γ/彩度/色温度…)、LUT 適用、オート補正 |
 | `adjustment_db.rs` | フォルダ別プリセット・ページ別プリセットの SQLite 永続化 |
 | `rotation_db.rs` | 非破壊回転の SQLite 永続化 |
+| `audio_normalize_db.rs` | 動画音量ノーマライズの per-file 測定値 (integrated LUFS / true peak / 算出ゲイン) の SQLite 永続化 |
 | `rating_db.rs` | レーティング (★1〜5) の SQLite 永続化 |
 | `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮) |
 | `spread_db.rs` | フォルダ別の見開きモード永続化 |
@@ -203,6 +204,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `settings.json` | アプリ全体設定・グローバルプリセット・保存スロット・お気に入り (`FavoriteEntry { id: Uuid, name, path, auto_index_{structure,metadata,thumbs} }`)・タグ定義 (`Vec<TagDef>`)。**保存はアトミック (.tmp → rename)、起動 1 回ごとに `settings.json.bak1..bak10` に世代退避**。パース失敗時は `.broken-<TS>` に隔離して bak1→bak10 を新→古で試行し復旧。バージョン跨ぎは初回 load で `settings.json.preupgrade-v<old>` にスナップショット。**main が I/O エラー (権限拒否・ロック・ディレクトリ衝突等) で読めなかったセッションでは `Settings::save()` を完全に no-op 化** (= rotate / write_atomic で本物の main を上書きする事故を防ぐ) | `settings.rs` |
 | `catalog.db` | サムネイル WebP キャッシュ (BLOB) + メタデータ | `catalog.rs` |
 | `rotation.db` | 非破壊回転角 (0/90/180/270) | `rotation_db.rs` |
+| `audio_normalize.db` | 動画ファイル単位のノーマライズ測定値 (integrated LUFS / true peak / 算出ゲイン)。主キー `(path_lower, file_size, mtime_ms, target_lufs_milli)` | `audio_normalize_db.rs` |
 | `rating.db` | レーティング (★1〜5、0 は未登録)。ページ単位 (画像/ZIP 内画像/PDF ページ) とコンテナ (フォルダ/ZIP/PDF 本体) を同一テーブルに格納。キー形式の違い (`::` の有無) で区別 | `rating_db.rs` |
 | `search_index.db` | Ctrl+S 用。お気に入り配下のフォルダ/ZIP/PDF 名索引 | `search_index_db.rs` |
 | `fts_index/` | Ctrl+G 用 Tantivy index (複数 segment + meta.json)。bigram 候補絞り込み | `fts_index.rs` → `ingest_worker.rs` / `tag_write_worker.rs` |

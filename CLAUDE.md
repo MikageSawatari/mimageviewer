@@ -18,6 +18,7 @@
 | 触る領域 | 読むドキュメント |
 | --- | --- |
 | サムネイル / フルスクリーン描画 / 回転 / 表示変換 | [docs/display-pipeline.md](docs/display-pipeline.md) |
+| **動画 HUD・音量・seek bar・動画フルスクリーン UI** | [docs/video-architecture.md](docs/video-architecture.md) (特に native presenter の節)。**`ui_fullscreen.rs` ではなく `src/video/native_presenter/` を見ること** |
 | ワーカー追加・キャッシュ・キャンセル処理 | [docs/async-architecture.md](docs/async-architecture.md) |
 | UI スレッドから新しい同期 I/O / GPU アップロード / read_dir 走査を呼ぶ | [docs/ui-responsiveness.md](docs/ui-responsiveness.md) (§4 チェックリスト) |
 | ZIP / PDF 対応が必要な機能 | [docs/virtual-folders.md](docs/virtual-folders.md) |

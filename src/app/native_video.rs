@@ -271,6 +271,15 @@ impl App {
             crate::video::NativeVideoOutputEvent::OpenExternalUrl { url } => {
                 self.handle_native_video_open_external_url_command(ctx, fs_idx, url);
             }
+            crate::video::NativeVideoOutputEvent::ToggleNormalize => {
+                self.handle_toggle_normalize(ctx, fs_idx);
+            }
+            crate::video::NativeVideoOutputEvent::DisableNormalize => {
+                self.handle_disable_normalize(ctx, fs_idx);
+            }
+            crate::video::NativeVideoOutputEvent::CancelNormalizeScan => {
+                self.handle_cancel_normalize_scan(ctx, fs_idx);
+            }
         }
     }
 
@@ -471,6 +480,415 @@ impl App {
             player.set_native_loop_enabled(self.settings.video_loop);
         }
         self.mark_native_video_hud_activity(ctx);
+    }
+
+    /// 音量ノーマライズ ボタン左クリック (3 状態モデル: Off → ON 化 / OnApplied → OFF 化 /
+    /// OnUnmeasured → スキャン起動)。
+    #[cfg(windows)]
+    pub(super) fn handle_toggle_normalize(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.fullscreen_idx != Some(fs_idx) {
+            return;
+        }
+        // [Scanning] 中はクリック無効
+        if self.normalize_state.is_some() {
+            return;
+        }
+        use crate::video::normalize_types::NormalizeUiState;
+        // ── snapshot phase: self の借用を短くする ──
+        let current_state = self
+            .normalize_ui_states
+            .get(&fs_idx)
+            .copied()
+            .unwrap_or(NormalizeUiState::Off);
+        let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
+        let current_path: Option<PathBuf> = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => Some(player.path().to_path_buf()),
+            _ => None,
+        };
+        let Some(current_path) = current_path else {
+            return;
+        };
+
+        match current_state {
+            NormalizeUiState::OnApplied { .. } => {
+                // [OnApplied] → [Off]: グローバル OFF + 全 player に gain=1.0 即時適用
+                self.disable_normalize_globally();
+            }
+            NormalizeUiState::OnUnmeasured => {
+                // [OnUnmeasured] → [Scanning]: グローバル ON は維持、スキャン起動
+                self.start_normalize_scan(fs_idx);
+            }
+            NormalizeUiState::Off => {
+                // [Off] → [OnApplied] or [Scanning]: グローバル ON 化、現在動画 DB lookup
+                self.settings.audio_normalize_enabled = true;
+                self.settings.save();
+                let lookup = self
+                    .audio_normalize_db
+                    .as_ref()
+                    .and_then(|db| db.lookup(&current_path, target_milli));
+                if let Some(result) = lookup {
+                    self.apply_normalize_gain_db_to_player(fs_idx, result.gain_db);
+                    self.normalize_ui_states.insert(
+                        fs_idx,
+                        NormalizeUiState::OnApplied {
+                            gain_db: result.gain_db,
+                        },
+                    );
+                } else {
+                    self.start_normalize_scan(fs_idx);
+                }
+                // 他の動画にも反映 (ヒットしたものから順に適用)
+                self.apply_normalize_to_all_videos_except(fs_idx, target_milli);
+            }
+            NormalizeUiState::Scanning => {
+                // is_some() ガードで通常到達しない
+            }
+        }
+        self.mark_native_video_hud_activity(ctx);
+    }
+
+    /// 音量ノーマライズ ボタン右クリック (どの状態からでもグローバル OFF 化、救済経路)。
+    #[cfg(windows)]
+    pub(super) fn handle_disable_normalize(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.fullscreen_idx != Some(fs_idx) {
+            return;
+        }
+        // [Scanning] 中は無効
+        if self.normalize_state.is_some() {
+            return;
+        }
+        self.disable_normalize_globally();
+        self.mark_native_video_hud_activity(ctx);
+    }
+
+    /// 進捗パネル × ボタン or ESC でキャンセル。
+    /// take() で state を捨てて新規スキャン即開始可能にする。
+    #[cfg(windows)]
+    pub(super) fn handle_cancel_normalize_scan(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        let should_drop = self
+            .normalize_state
+            .as_ref()
+            .map(|s| s.fs_idx == fs_idx)
+            .unwrap_or(false);
+        if !should_drop {
+            return;
+        }
+        if let Some(state) = self.normalize_state.take() {
+            state.cancel();
+            // 元再生状態に復帰
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&state.fs_idx) {
+                if state.was_playing {
+                    player.set_playing(true);
+                }
+            }
+            self.normalize_ui_states.insert(
+                state.fs_idx,
+                crate::video::normalize_types::NormalizeUiState::OnUnmeasured,
+            );
+            // worker は cancel atomic を見て早期 return、_join + rx も drop で解放される
+        }
+        self.mark_native_video_hud_activity(ctx);
+    }
+
+    /// 全 fs_cache の VideoPlayer に gain=1.0 を即時適用 + Settings 保存。
+    /// DB エントリは残す (= 次回 ON 復帰で即適用できる)。
+    #[cfg(windows)]
+    pub(super) fn disable_normalize_globally(&mut self) {
+        use crate::video::normalize_types::NormalizeUiState;
+        self.settings.audio_normalize_enabled = false;
+        self.settings.save();
+        let fs_idxs: Vec<usize> = self.fs_cache.keys().copied().collect();
+        for idx in fs_idxs {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+                // Codex P2: set → clear の順 (clear → set だと clear と set の間に
+                // pump が回って旧 gain で processed 再生成される小窓がある)。
+                player.set_normalize_gain(1.0);
+                player.clear_audio_output_buffer();
+                self.normalize_ui_states.insert(idx, NormalizeUiState::Off);
+            }
+        }
+    }
+
+    /// 1 player に gain_db を線形変換して適用。clear_audio_output_buffer も呼ぶ。
+    #[cfg(windows)]
+    pub(super) fn apply_normalize_gain_db_to_player(&mut self, fs_idx: usize, gain_db: f32) {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            let linear = 10.0_f64.powf(gain_db as f64 / 20.0);
+            // Codex P2: set → clear の順 (旧 gain processed の残存防止)
+            player.set_normalize_gain(linear);
+            player.clear_audio_output_buffer();
+        }
+    }
+
+    /// 他の fs_cache entry (= except_fs_idx 以外) について DB lookup → ヒットなら適用、
+    /// ミスなら OnUnmeasured 設定。トグル ON 時の同期適用に使う。
+    #[cfg(windows)]
+    pub(super) fn apply_normalize_to_all_videos_except(
+        &mut self,
+        except_fs_idx: usize,
+        target_milli: i32,
+    ) {
+        use crate::video::normalize_types::NormalizeUiState;
+        let other_idxs: Vec<usize> = self
+            .fs_cache
+            .keys()
+            .copied()
+            .filter(|i| *i != except_fs_idx)
+            .collect();
+        for idx in other_idxs {
+            let path = match self.fs_cache.get(&idx) {
+                Some(FsCacheEntry::Video { player, .. }) => Some(player.path().to_path_buf()),
+                _ => None,
+            };
+            let Some(path) = path else { continue };
+            let lookup = self
+                .audio_normalize_db
+                .as_ref()
+                .and_then(|db| db.lookup(&path, target_milli));
+            match lookup {
+                Some(result) => {
+                    self.apply_normalize_gain_db_to_player(idx, result.gain_db);
+                    self.normalize_ui_states.insert(
+                        idx,
+                        NormalizeUiState::OnApplied {
+                            gain_db: result.gain_db,
+                        },
+                    );
+                }
+                None => {
+                    self.normalize_ui_states
+                        .insert(idx, NormalizeUiState::OnUnmeasured);
+                }
+            }
+        }
+    }
+
+    /// スキャン worker thread を起動。再生中なら一時停止 → スキャン → poll で完了検知。
+    #[cfg(windows)]
+    pub(super) fn start_normalize_scan(&mut self, fs_idx: usize) {
+        use crate::video::normalize_types::NormalizeUiState;
+        let (path, was_playing) = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                (player.path().to_path_buf(), player.is_playing())
+            }
+            _ => return,
+        };
+        // 既存 state を捨てる (cancel を立てておく) — 通常は is_some() で弾かれているが defensive
+        if let Some(prev) = self.normalize_state.take() {
+            prev.cancel();
+        }
+        // 再生中なら一時停止
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            if was_playing {
+                player.set_playing(false);
+            }
+        }
+        let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(crate::video::normalize_scanner::NormalizeScanProgress::default());
+        let (tx, rx) = mpsc::channel();
+        let cancel_clone = cancel.clone();
+        let progress_clone = progress.clone();
+        let path_clone = path.clone();
+        let join = std::thread::Builder::new()
+            .name("normalize-scan".to_string())
+            .spawn(move || {
+                let result = crate::video::normalize_scanner::scan_audio_loudness(
+                    &path_clone,
+                    target_milli,
+                    cancel_clone,
+                    progress_clone,
+                );
+                let _ = tx.send(crate::app::normalize::NormalizeMessage::from(result));
+            });
+        let join = match join {
+            Ok(j) => j,
+            Err(e) => {
+                crate::logger::log(format!("normalize-scan thread spawn failed: {e}"));
+                // Codex P2: spawn 失敗時は元再生状態に戻し、UI 状態も OnUnmeasured に
+                if was_playing {
+                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                        player.set_playing(true);
+                    }
+                }
+                self.normalize_ui_states
+                    .insert(fs_idx, NormalizeUiState::OnUnmeasured);
+                return;
+            }
+        };
+        self.normalize_state = Some(crate::app::normalize::NormalizeScanState {
+            fs_idx,
+            cancel,
+            progress,
+            rx,
+            was_playing,
+            file_path: path,
+            target_lufs_milli: target_milli,
+            _join: join,
+        });
+        self.normalize_ui_states
+            .insert(fs_idx, NormalizeUiState::Scanning);
+    }
+
+    /// スキャン完了 / キャンセル / エラーを検知して後処理する。`App::update` から毎フレーム呼ぶ。
+    #[cfg(windows)]
+    pub(super) fn poll_normalize_scan(&mut self, _ctx: &egui::Context) {
+        use crate::video::normalize_types::NormalizeUiState;
+        // 1. メッセージ peek (try_recv)
+        let msg = match self.normalize_state.as_ref() {
+            Some(state) => match state.rx.try_recv() {
+                Ok(msg) => Some(Ok(msg)),
+                Err(mpsc::TryRecvError::Empty) => return,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(())),
+            },
+            None => return,
+        };
+        // 2. 完了確定: state を所有してから後処理
+        let Some(state) = self.normalize_state.take() else {
+            return;
+        };
+        let target_milli = state.target_lufs_milli;
+        // 3. stale fs_idx 復活防止
+        let still_valid = match self.fs_cache.get(&state.fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.path() == state.file_path.as_path(),
+            _ => false,
+        };
+        match msg {
+            Some(Ok(crate::app::normalize::NormalizeMessage::Done(result))) => {
+                // 測定値はファイル単位なので、stale でも DB に保存しておく (= 次回開いたとき即適用)
+                if let Some(db) = self.audio_normalize_db.as_ref() {
+                    let _ = db.upsert(&state.file_path, &result);
+                }
+                if still_valid {
+                    if let Some(FsCacheEntry::Video { player, .. }) =
+                        self.fs_cache.get(&state.fs_idx)
+                    {
+                        let linear = 10.0_f64.powf(result.gain_db as f64 / 20.0);
+                        // Codex P2: set → clear の順 (旧 gain processed の残存防止)
+                        player.set_normalize_gain(linear);
+                        player.clear_audio_output_buffer();
+                        if state.was_playing {
+                            player.set_playing(true);
+                        }
+                    }
+                    self.normalize_ui_states.insert(
+                        state.fs_idx,
+                        NormalizeUiState::OnApplied {
+                            gain_db: result.gain_db,
+                        },
+                    );
+                }
+                let _ = target_milli; // suppress unused warning
+            }
+            Some(Ok(crate::app::normalize::NormalizeMessage::Cancelled))
+            | Some(Ok(crate::app::normalize::NormalizeMessage::Error(_)))
+            | Some(Err(())) => {
+                if let Some(Ok(crate::app::normalize::NormalizeMessage::Error(ref m))) = msg {
+                    crate::logger::log(format!("normalize-scan error: {m}"));
+                }
+                // DB に書かない、グローバル ON は維持、UI 状態を OnUnmeasured に戻す
+                if still_valid {
+                    if let Some(FsCacheEntry::Video { player, .. }) =
+                        self.fs_cache.get(&state.fs_idx)
+                    {
+                        if state.was_playing {
+                            player.set_playing(true);
+                        }
+                    }
+                    self.normalize_ui_states
+                        .insert(state.fs_idx, NormalizeUiState::OnUnmeasured);
+                }
+            }
+            None => {
+                // unreachable - try_recv が Empty なら return 済み、Disconnected なら Some(Err(()))
+            }
+        }
+    }
+
+    /// fs_idx 単位の normalize state を cleanup (close_fullscreen / fs_cache evict 時に呼ぶ)。
+    #[cfg(windows)]
+    pub(super) fn cleanup_normalize_state_for_fs_idx(&mut self, fs_idx: usize) {
+        self.normalize_ui_states.remove(&fs_idx);
+        // 同 fs_idx のスキャン中なら state を持ち去って捨てる (= 新規スキャン即開始可能に)
+        let should_drop = self
+            .normalize_state
+            .as_ref()
+            .map(|s| s.fs_idx == fs_idx)
+            .unwrap_or(false);
+        if should_drop {
+            if let Some(state) = self.normalize_state.take() {
+                state.cancel();
+            }
+        }
+    }
+
+    /// 動画 open 時の自動適用。Settings ON + DB ヒットなら gain を即適用、ミスなら
+    /// OnUnmeasured 表示。OFF なら Off 状態で初期化。
+    #[cfg(windows)]
+    pub(super) fn init_normalize_state_for_opened_video(&mut self, fs_idx: usize) {
+        use crate::video::normalize_types::NormalizeUiState;
+        let path = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.path().to_path_buf(),
+            _ => return,
+        };
+        let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
+        let ui_state = if self.settings.audio_normalize_enabled {
+            let lookup = self
+                .audio_normalize_db
+                .as_ref()
+                .and_then(|db| db.lookup(&path, target_milli));
+            if let Some(result) = lookup {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    let linear = 10.0_f64.powf(result.gain_db as f64 / 20.0);
+                    // 再生開始前なので flush 不要
+                    player.set_normalize_gain(linear);
+                }
+                NormalizeUiState::OnApplied {
+                    gain_db: result.gain_db,
+                }
+            } else {
+                NormalizeUiState::OnUnmeasured
+            }
+        } else {
+            NormalizeUiState::Off
+        };
+        self.normalize_ui_states.insert(fs_idx, ui_state);
+    }
+
+    /// native overlay にノーマライズ UI 状態 + 進捗 snapshot を配信する。
+    /// `App::update` から毎フレーム呼ぶ。
+    #[cfg(windows)]
+    pub(super) fn sync_native_video_normalize_state(&self, fs_idx: usize) {
+        use crate::video::normalize_types::{
+            NormalizeOverlayState, NormalizeProgressSnapshot, NormalizeUiState,
+        };
+        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+            return;
+        };
+        let ui_state = self
+            .normalize_ui_states
+            .get(&fs_idx)
+            .copied()
+            .unwrap_or(NormalizeUiState::Off);
+        let progress = self
+            .normalize_state
+            .as_ref()
+            .filter(|s| s.fs_idx == fs_idx)
+            .map(|s| NormalizeProgressSnapshot {
+                pts_processed_ms: s
+                    .progress
+                    .pts_processed_ms
+                    .load(std::sync::atomic::Ordering::Acquire),
+                duration_ms: s
+                    .progress
+                    .duration_ms
+                    .load(std::sync::atomic::Ordering::Acquire),
+                indeterminate: s
+                    .progress
+                    .indeterminate
+                    .load(std::sync::atomic::Ordering::Acquire),
+            });
+        player.set_native_normalize_state(NormalizeOverlayState { ui_state, progress });
     }
 
     #[cfg(windows)]
@@ -1173,6 +1591,18 @@ impl App {
         if key.alt {
             return;
         }
+        // Codex 5周目 P1: ノーマライズスキャン中はモーダル動作のため、ESC (cancel) 以外の
+        // キー入力 (Enter で再生再開、S で tile mode、B でブックマーク等) を全て遮断する。
+        // ESC だけ下の match に流す。
+        if self
+            .normalize_state
+            .as_ref()
+            .map(|s| s.fs_idx == fs_idx)
+            .unwrap_or(false)
+            && !(key.virtual_key == 0x1B && !key.repeat)
+        {
+            return;
+        }
         let mut hud_activity = true;
         match key.virtual_key {
             // Shift+Enter: open in external player, matching the legacy egui
@@ -1191,8 +1621,17 @@ impl App {
             // Escape: close native fullscreen. If the native overlay has a text
             // editor focused this key is not forwarded here, so dialog editing
             // does not accidentally close the fullscreen window.
+            // Codex P1 反映: ノーマライズスキャン中の ESC は cancel に優先ルーティング。
+            // (overlay 側 progress UI のキャンセルボタン押下と等価)
             0x1B if !key.repeat => {
-                if self.close_video_tile_mode() {
+                if self
+                    .normalize_state
+                    .as_ref()
+                    .map(|s| s.fs_idx == fs_idx)
+                    .unwrap_or(false)
+                {
+                    self.handle_cancel_normalize_scan(ctx, fs_idx);
+                } else if self.close_video_tile_mode() {
                     self.sync_native_video_tile_overlay(ctx, fs_idx);
                 } else {
                     self.close_fullscreen();
