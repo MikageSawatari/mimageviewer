@@ -586,10 +586,46 @@ chrome 復帰の deferred restore に相乗りで `SetForegroundWindow(main_hwnd
 
 維持する設定項目:
 - `Settings.video_volume` (音量。既定 1.0、手動 boost 上限 1.5)
-- `Settings.video_loop` (ループ再生)
+- `Settings.video_loop_mode` (ループ再生モード: Off / Full / Chapter / Bookmark)。
+  旧 `Settings.video_loop: bool` は移行用に残存し、`Settings::load()` 内の
+  `migrate_legacy_video_loop` で `video_loop=true && video_loop_mode==Off` を Full へ昇格。
+  以降は `video_loop_mode` を source of truth として `Settings::save()` 内 clone で
+  旧 bool を `mode != Off` から導出して書き戻す。
 - `Settings.video_resume_position` (シーク位置の永続化、ファイル単位)
 - `Settings.video_hw_decode` (HW デコードを試みるかのフラグ、トラブルシュート用)
 - `Settings.video_deinterlace` (Off / Auto / On。CPU 経路で FFmpeg `bwdif=mode=send_frame` を適用。Auto は frame interlaced flag と stream field_order を参照)
+
+### ループ再生 4 段階モードの実装メモ
+
+`L` キー / HUD ループボタンで `Off → Full → Chapter → Bookmark → Off` を循環。
+チャプター / ブックマークが空の段階は `cycle_loop_mode` (`settings.rs`) で自動スキップ。
+動画移動でモードを保持し、当該データが無い動画では `effective_loop_mode` (`settings.rs`) が
+Chapter/Bookmark を Full に降格する (= 再生挙動だけ Full と等価、HUD 表示はユーザー設定モード
+を維持するため、`set_loop_enabled(bool)` と `set_native_loop_mode(VideoLoopMode)` を
+分離して送る)。
+
+ループ復帰 seek 先は `VideoPlayer::loop_target_bits: AtomicU64` (秒、`f64::to_bits`) に持つ。
+`EngineActor::OpenOptions.loop_enabled` は触らず、EOF 経路は `VideoPlayer::tick` 側で
+`loop_target_secs()` → `clamp_seek_target` → `clock.request_seek` の順で呼ぶ。
+入力サニタイズ (NaN/inf/負値) は setter で済ませ、duration クランプは EOF 直前に既存の
+`clamp_seek_target` を経由する。
+
+CH/BM ループは「次境界の手前で現区間の開始へ seek」を `tick_native_video_loop_boundary`
+(`app/native_video.rs`) が `poll_video` Phase 3 (= native_events 反映後) で行う。判定は
+**`prev_pos` 側の区間で計算する** 純関数 `decide_boundary_action` (`settings.rs`) に委譲し、
+serial 変化や巻き戻り時は baseline 更新のみで誤爆 seek を防ぐ (= シークバー / J/K /
+タイル seek 直後に勝手にループ開始点へ戻されない)。境界 Vec は
+`boundary_starts_from_chapters` (`video/decoder.rs`) /
+`boundary_starts_from_bookmarks` (`video_bookmarks.rs`) で finite + nonneg + sort + dedup
+正規化済み `&[f64]` を作り、`start_at` / `first_boundary_after` (`settings.rs`) は
+この正規化前提で動く。
+
+`poll_video` (`app.rs`) は 4 段階構成: Phase 0 で `ensure_fullscreen_video_marker_cache`
+(= 毎 tick の DB クエリを避ける)、Phase 1 で `iter_mut` 中に `set_loop_enabled` / `set_native_loop_mode`
+を effective + display_mode 分離で push + `active_video_indices` 収集 + `native_events` drain、
+Phase 2 で `handle_native_video_output_event` (= 入力イベント反映)、Phase 3 で
+`tick_native_video_loop_boundary` (= 境界 tick)。順序は P2/P3 を入れ替えると serial guard が
+直近 seek を検出できないため固定。
 
 ## 配布要件
 

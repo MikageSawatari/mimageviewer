@@ -151,6 +151,10 @@ struct NativeEguiOverlay {
     video_speed_popup_open: bool,
     frame_step_hold: Option<NativeFrameStepHold>,
     video_loop_enabled: bool,
+    /// HUD ボタン表示用のループモード (= ユーザー設定の display_mode)。
+    /// 「BM 設定 + BM 無し動画」のとき、`video_loop_enabled` は effective から導出した
+    /// bool が入るが、`video_loop_mode` は表示用に Bookmark のまま維持する。
+    video_loop_mode: crate::settings::VideoLoopMode,
     video_checked: bool,
     vst3_available: bool,
     vst3_panel: Option<NativeOverlayVst3Panel>,
@@ -1152,6 +1156,13 @@ impl NativeVideoPresenter {
         }
     }
 
+    /// HUD ボタン表示用のループモード (= ユーザー設定の display_mode) を overlay に伝える。
+    pub fn set_overlay_loop_mode(&mut self, mode: crate::settings::VideoLoopMode) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_loop_mode(mode);
+        }
+    }
+
     pub fn set_overlay_checked(&mut self, checked: bool) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_checked(checked);
@@ -1825,6 +1836,7 @@ impl NativeEguiOverlay {
             video_speed_popup_open: false,
             frame_step_hold: None,
             video_loop_enabled: false,
+            video_loop_mode: crate::settings::VideoLoopMode::Off,
             video_checked: false,
             vst3_available: false,
             vst3_panel: None,
@@ -2190,6 +2202,14 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
+    fn set_loop_mode(&mut self, mode: crate::settings::VideoLoopMode) {
+        if self.video_loop_mode == mode {
+            return;
+        }
+        self.video_loop_mode = mode;
+        self.dirty = true;
+    }
+
     fn set_checked(&mut self, checked: bool) {
         if self.video_checked == checked {
             return;
@@ -2549,6 +2569,7 @@ impl NativeEguiOverlay {
         let playback_speed = self.video_playback_speed;
         let checked = self.video_checked;
         let loop_enabled = self.video_loop_enabled;
+        let loop_mode = self.video_loop_mode;
         let first_frame_presented = self.first_frame_presented;
         let video_error = self.video_error.clone();
         let toast = self.toast.clone();
@@ -2906,30 +2927,81 @@ impl NativeEguiOverlay {
                             egui::Id::new("native_video_loop"),
                             egui::Sense::click(),
                         );
+                        // 4 段階ループモード: Off / Full / Chapter / Bookmark
+                        // - Off: アイコン中央、active 背景なし
+                        // - Full: アイコン中央、active 背景 (青)
+                        // - Chapter: アイコン下半分縮小 + 上に「CH」テキスト
+                        // - Bookmark: アイコン下半分縮小 + 上にブックマーク vector アイコン
+                        // active 背景は loop_mode != Off (= 表示用) に基づき判定する。
+                        // 「BM 設定 + BM 無し動画」では loop_enabled は true (Full と等価) でも
+                        // ボタン表示は BM のまま (active 背景 + BM 装飾) になる。
+                        use crate::settings::VideoLoopMode;
+                        let mode_active = !matches!(loop_mode, VideoLoopMode::Off);
                         draw_overlay_button_bg(
                             painter,
                             loop_rect,
                             loop_resp.hovered(),
-                            loop_enabled,
+                            mode_active,
                         );
-                        draw_overlay_loop_icon(
-                            painter,
-                            loop_rect.center(),
-                            btn_size * 0.36,
-                            if loop_enabled {
-                                egui::Color32::from_rgb(170, 230, 255)
-                            } else {
-                                egui::Color32::from_rgb(238, 238, 238)
-                            },
-                        );
-                        let loop_resp = loop_resp.on_hover_text(if loop_enabled {
-                            "ループ再生を解除 [L]"
+                        let icon_color = if mode_active {
+                            egui::Color32::from_rgb(170, 230, 255)
                         } else {
-                            "ループ再生 [L]"
-                        });
+                            egui::Color32::from_rgb(238, 238, 238)
+                        };
+                        match loop_mode {
+                            VideoLoopMode::Off | VideoLoopMode::Full => {
+                                draw_overlay_loop_icon(
+                                    painter,
+                                    loop_rect.center(),
+                                    btn_size * 0.36,
+                                    icon_color,
+                                );
+                            }
+                            VideoLoopMode::Chapter => {
+                                let r = btn_size * 0.36;
+                                let c = loop_rect.center();
+                                draw_overlay_loop_icon(
+                                    painter,
+                                    egui::pos2(c.x, c.y + r * 0.18),
+                                    r * 0.65,
+                                    icon_color,
+                                );
+                                painter.text(
+                                    egui::pos2(c.x, c.y - r * 0.55),
+                                    egui::Align2::CENTER_CENTER,
+                                    "CH",
+                                    egui::FontId::proportional(11.0),
+                                    egui::Color32::from_rgb(115, 210, 255),
+                                );
+                            }
+                            VideoLoopMode::Bookmark => {
+                                let r = btn_size * 0.36;
+                                let c = loop_rect.center();
+                                draw_overlay_loop_icon(
+                                    painter,
+                                    egui::pos2(c.x, c.y + r * 0.18),
+                                    r * 0.65,
+                                    icon_color,
+                                );
+                                draw_overlay_bookmark_icon(
+                                    painter,
+                                    egui::pos2(c.x, c.y - r * 0.55),
+                                    r * 0.32,
+                                    egui::Color32::from_rgb(255, 220, 82),
+                                );
+                            }
+                        }
+                        let hover_text = match loop_mode {
+                            VideoLoopMode::Off => "ループ再生 [L]",
+                            VideoLoopMode::Full => "ループ: 全体 [L]",
+                            VideoLoopMode::Chapter => "ループ: チャプター [L]",
+                            VideoLoopMode::Bookmark => "ループ: ブックマーク [L]",
+                        };
+                        let loop_resp = loop_resp.on_hover_text(hover_text);
                         if loop_resp.clicked() {
                             commands.push(NativeOverlayCommand::ToggleLoop);
                         }
+                        let _ = loop_enabled; // mode_active ベース描画なので未使用
                         x = loop_rect.max.x + gap;
 
                         let prev_frame_rect = egui::Rect::from_min_size(

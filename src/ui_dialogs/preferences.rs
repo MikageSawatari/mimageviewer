@@ -516,6 +516,9 @@ impl App {
 
                 let old_pause_minimized = self.settings.pause_indexer_while_minimized;
 
+                // 動画ループモード変更を検出してフルスクリーン中の player に反映する
+                let old_loop_mode = self.settings.video_loop_mode;
+
                 // AI バックエンド設定変更を検出してホットリロードトリガに使う
                 let old_ai_backend = self.settings.ai_backend.clone();
                 let new_ai_backend = state.settings.ai_backend.clone();
@@ -555,6 +558,16 @@ impl App {
 
                 self.settings = state.settings;
                 self.settings.save();
+
+                // 動画ループモードが変わったらフルスクリーン中の player に反映する
+                #[cfg(windows)]
+                if old_loop_mode != self.settings.video_loop_mode {
+                    if let Some(idx) = self.fullscreen_idx {
+                        self.apply_loop_mode_to_player(idx);
+                    }
+                }
+                #[cfg(not(windows))]
+                let _ = old_loop_mode;
 
                 // 「常駐中はインデックス更新を一時停止する」が変わったらトレイの checkmark も
                 // 同期する (お気に入り編集ダイアログと同じチェックボックス項目への二重経路)。

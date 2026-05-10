@@ -1106,6 +1106,74 @@ pub struct Chapter {
     pub title: Option<String>,
 }
 
+/// チャプター列から、ループ境界として使う「区間の開始秒」を **正規化済み Vec** で返す。
+/// finite + nonneg + sort + dedup (1us 単位)。`start_at` / `first_boundary_after` は
+/// この正規化を前提に動く。
+pub fn boundary_starts_from_chapters(chapters: &[Chapter]) -> Vec<f64> {
+    let mut v: Vec<f64> = chapters
+        .iter()
+        .map(|c| c.start_secs)
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v.dedup_by(|a, b| (*a - *b).abs() < 1.0e-6);
+    v
+}
+
+#[cfg(test)]
+mod chapter_tests {
+    use super::*;
+
+    #[test]
+    fn boundary_starts_filters_nan_and_negative() {
+        let chs = vec![
+            Chapter {
+                start_secs: f64::NAN,
+                end_secs: 1.0,
+                title: None,
+            },
+            Chapter {
+                start_secs: -1.0,
+                end_secs: 2.0,
+                title: None,
+            },
+            Chapter {
+                start_secs: 5.0,
+                end_secs: 10.0,
+                title: None,
+            },
+        ];
+        assert_eq!(boundary_starts_from_chapters(&chs), vec![5.0]);
+    }
+
+    #[test]
+    fn boundary_starts_sorts_and_dedups() {
+        let chs = vec![
+            Chapter {
+                start_secs: 10.0,
+                end_secs: 20.0,
+                title: None,
+            },
+            Chapter {
+                start_secs: 5.0,
+                end_secs: 10.0,
+                title: None,
+            },
+            Chapter {
+                start_secs: 5.0,
+                end_secs: 10.0,
+                title: None,
+            }, // dup
+        ];
+        assert_eq!(boundary_starts_from_chapters(&chs), vec![5.0, 10.0]);
+    }
+
+    #[test]
+    fn boundary_starts_handles_empty() {
+        assert_eq!(boundary_starts_from_chapters(&[]), Vec::<f64>::new());
+    }
+}
+
 pub struct DecodeHandles {
     /// 動画フレーム受信。容量 4 (UI 1 フレーム/リフレッシュで十分)。
     pub video_rx: crossbeam_channel::Receiver<VideoFrame>,

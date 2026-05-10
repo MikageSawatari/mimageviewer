@@ -386,6 +386,9 @@ impl App {
             player.seek(target_secs);
             self.mark_native_video_hud_activity(ctx);
         }
+        // CH/BM ループモード時、seek 後に loop_target_secs を再計算する
+        // (= 新位置の chapter/bookmark 開始秒に揃える)。
+        self.apply_loop_mode_to_player(fs_idx);
     }
 
     #[cfg(windows)]
@@ -444,6 +447,7 @@ impl App {
             player.set_native_tile_overlay(None);
             self.mark_native_video_hud_activity(ctx);
         }
+        self.apply_loop_mode_to_player(fs_idx);
     }
 
     #[cfg(windows)]
@@ -455,12 +459,20 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
             return;
         }
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+        let did_seek = if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
+        {
             player.seek(0.0);
             if !player.is_playing() {
                 player.toggle_play();
             }
+            true
+        } else {
+            false
+        };
+        if did_seek {
             self.mark_native_video_hud_activity(ctx);
+            // 0 への seek は loop_target も chapter/bookmark の最初の区間に揃える
+            self.apply_loop_mode_to_player(fs_idx);
         }
     }
 
@@ -520,13 +532,214 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
             return;
         }
-        self.settings.video_loop = !self.settings.video_loop;
+        self.cycle_native_video_loop_common(ctx, fs_idx);
+    }
+
+    /// L キー / ループボタンクリックのサイクル処理 (cfg 不問の共通部)。
+    /// CH/BM 段階は当該動画にデータが無いとき自動でスキップする。
+    /// 設定保存 → effective mode を再計算して player に反映 → トースト → HUD activity 更新。
+    pub(crate) fn cycle_native_video_loop_common(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        // Phase 1: チャプター / ブックマークの有無を取得 (player から snapshot)
+        let (path, has_ch) = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                let chapters_empty = player.info().map(|i| i.chapters.is_empty()).unwrap_or(true);
+                (player.path().clone(), !chapters_empty)
+            }
+            _ => return,
+        };
+        // Phase 2: bookmark cache を ensure してから snapshot 経由で取得
+        self.ensure_fullscreen_video_marker_cache(fs_idx);
+        let (_pin, bookmarks) = self.fullscreen_video_marker_snapshot(fs_idx, &path);
+        let has_bm = !bookmarks.is_empty();
+
+        let next = crate::settings::cycle_loop_mode(self.settings.video_loop_mode, has_ch, has_bm);
+        self.settings.video_loop_mode = next;
+        // 旧 bool を in-memory でも同期 (= save() 内 clone でも導出するが念のため)。
+        self.settings.video_loop = !matches!(next, crate::settings::VideoLoopMode::Off);
         self.settings.save();
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.set_loop_enabled(self.settings.video_loop);
-            player.set_native_loop_enabled(self.settings.video_loop);
-        }
+
+        self.apply_loop_mode_to_player(fs_idx);
+
+        // トースト通知 (右上、J/K や画像系ショートカットと同じ位置・サイズ)。
+        // 中央 (= centered=true) はクリック面積が大きすぎてループボタンを覆ってしまう。
+        let label = next.label();
+        self.show_native_video_overlay_toast(format!("ループ: {label}"), false);
+
+        #[cfg(windows)]
         self.mark_native_video_hud_activity(ctx);
+        #[cfg(not(windows))]
+        let _ = ctx;
+    }
+
+    /// 現在の `settings.video_loop_mode` と動画の chapter/bookmark 状況から
+    /// `effective_mode` を計算し、player に loop_enabled / loop_target_secs / display_mode を
+    /// 反映する。
+    ///
+    /// 呼ぶ場所: 動画 open 直後、VideoInfo 到着、L キー / ボタンクリック (cycle 経由)、
+    /// 各種 seek 後 (J/K, ←/→, シークバー, タイル seek, マーカージャンプ),
+    /// ブックマーク CRUD 直後, ナビゲーション後。
+    pub(crate) fn apply_loop_mode_to_player(&mut self, fs_idx: usize) {
+        // Phase 1: player から必要データを snapshot して borrow を即解放
+        let (path, chapter_starts, pos, serial) = {
+            let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+                return;
+            };
+            let chapters = player.info().map(|i| i.chapters.as_slice()).unwrap_or(&[]);
+            (
+                player.path().clone(),
+                crate::video::decoder::boundary_starts_from_chapters(chapters),
+                player.position_secs(),
+                player.current_seek_serial(),
+            )
+        };
+
+        // Phase 2: cache 経由で bookmark を取得 (fallback DB 読みを許容、cycle 1 回限り)
+        let (_pin, bookmarks) = self.fullscreen_video_marker_snapshot(fs_idx, &path);
+        let bookmark_starts = crate::video_bookmarks::boundary_starts_from_bookmarks(&bookmarks);
+        let has_ch = !chapter_starts.is_empty();
+        let has_bm = !bookmark_starts.is_empty();
+        let display_mode = self.settings.video_loop_mode;
+        let eff = crate::settings::effective_loop_mode(display_mode, has_ch, has_bm);
+
+        let target = match eff {
+            crate::settings::VideoLoopMode::Off | crate::settings::VideoLoopMode::Full => 0.0,
+            crate::settings::VideoLoopMode::Chapter => {
+                crate::settings::start_at(&chapter_starts, pos).unwrap_or(0.0)
+            }
+            crate::settings::VideoLoopMode::Bookmark => {
+                crate::settings::start_at(&bookmark_starts, pos).unwrap_or(0.0)
+            }
+        };
+        let enabled = !matches!(eff, crate::settings::VideoLoopMode::Off);
+
+        // Phase 3: 再度 player を借りて状態を push
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_loop_enabled(enabled);
+            player.set_loop_target_secs(target);
+            #[cfg(windows)]
+            player.set_native_loop_mode(display_mode); // HUD 表示は user intent
+            #[cfg(windows)]
+            player.set_native_loop_enabled(enabled); // 互換のため残す
+        }
+        self.last_loop_pos.insert(fs_idx, (pos, serial));
+    }
+
+    /// 動画再生中、CH/BM ループモード時に「次境界跨ぎ」を検出してループ seek を発行する。
+    /// `poll_video` の Phase 3 (= native_events 反映後) から fs_idx ごとに呼ぶ。
+    ///
+    /// 手動 seek (シークバー/J/K/←/→/タイル) は serial 変化で検出して baseline 更新のみに
+    /// 切り替え、誤爆 seek を防ぐ (Codex P1 第2ラウンド)。
+    pub(crate) fn tick_native_video_loop_boundary(&mut self, fs_idx: usize) {
+        let display_mode = self.settings.video_loop_mode;
+        // 早期 return: HUD 表示は CH/BM でも、effective が Off/Full なら何もしない
+        // (= データ無し動画では境界 tick が発火しない)。
+        if matches!(
+            display_mode,
+            crate::settings::VideoLoopMode::Off | crate::settings::VideoLoopMode::Full
+        ) {
+            return;
+        }
+        // Phase 1: player + cache から必要データを snapshot。再生中でなければ何もしない。
+        // 一時停止 / scrub 中は baseline だけ最新位置に更新 (Codex P2 第7ラウンド —
+        // 一時停止中に境界手前へ scrub すると即ループ開始点へ戻されるのを防ぐ)。
+        let (cur, serial, chapters_owned, is_playing) = {
+            let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+                return;
+            };
+            let chapters = player
+                .info()
+                .map(|i| i.chapters.clone())
+                .unwrap_or_default();
+            (
+                player.position_secs(),
+                player.current_seek_serial(),
+                chapters,
+                player.is_playing(),
+            )
+        };
+        if !is_playing {
+            self.last_loop_pos.insert(fs_idx, (cur, serial));
+            return;
+        }
+
+        // bookmarks は cache 直読み (DB fallback しない)
+        let bookmarks = match self
+            .fullscreen_video_marker_cache
+            .as_ref()
+            .filter(|c| c.fs_idx == fs_idx)
+        {
+            Some(c) => c.bookmarks.clone(),
+            None => return,
+        };
+
+        let chapter_starts = crate::video::decoder::boundary_starts_from_chapters(&chapters_owned);
+        let bookmark_starts = crate::video_bookmarks::boundary_starts_from_bookmarks(&bookmarks);
+        let has_ch = !chapter_starts.is_empty();
+        let has_bm = !bookmark_starts.is_empty();
+        let eff = crate::settings::effective_loop_mode(display_mode, has_ch, has_bm);
+        if !matches!(
+            eff,
+            crate::settings::VideoLoopMode::Chapter | crate::settings::VideoLoopMode::Bookmark
+        ) {
+            return;
+        }
+        let starts = match eff {
+            crate::settings::VideoLoopMode::Chapter => chapter_starts,
+            crate::settings::VideoLoopMode::Bookmark => bookmark_starts,
+            _ => unreachable!(),
+        };
+        if starts.is_empty() {
+            return;
+        }
+
+        let (prev_pos, prev_serial) = self
+            .last_loop_pos
+            .get(&fs_idx)
+            .copied()
+            .unwrap_or((cur, serial));
+
+        // 境界判定: prev_pos 側の区間で計算 (Codex P1 — cur 側は跨いだ瞬間に次区間に入る)
+        let prev_start = crate::settings::start_at(&starts, prev_pos).unwrap_or(0.0);
+        let next_boundary = crate::settings::first_boundary_after(&starts, prev_start);
+
+        const LOOP_BOUNDARY_TOL: f64 = 0.020;
+        match crate::settings::decide_boundary_action(
+            prev_pos,
+            prev_serial,
+            cur,
+            serial,
+            prev_start,
+            next_boundary,
+            LOOP_BOUNDARY_TOL,
+        ) {
+            crate::settings::BoundaryDecision::BaselineUpdate => {
+                // serial 変化 / 巻き戻り → loop_target_secs を cur 基準で再計算 + baseline 更新
+                let new_target = crate::settings::start_at(&starts, cur).unwrap_or(0.0);
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.set_loop_target_secs(new_target);
+                }
+                self.last_loop_pos.insert(fs_idx, (cur, serial));
+            }
+            crate::settings::BoundaryDecision::Loop { seek_to } => {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.seek(seek_to);
+                    // loop_target は同区間の開始 (= seek_to) で維持
+                    player.set_loop_target_secs(seek_to);
+                }
+                // seek 後 baseline は seek_to に。次 tick で serial 変化を検出すれば baseline
+                // が再更新される。
+                self.last_loop_pos.insert(fs_idx, (seek_to, serial));
+            }
+            crate::settings::BoundaryDecision::Continue => {
+                // 現区間の開始秒 (= prev_start) で loop_target を維持する。
+                // これで動画 open 直後 (info() 未到着 → 初期 0.0) から info() 到着後の最初の
+                // tick で正しい値に書き換わる。値が変わらない通常 tick では no-op。
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.set_loop_target_secs(prev_start);
+                }
+                self.last_loop_pos.insert(fs_idx, (cur, serial));
+            }
+        }
     }
 
     /// 音量ノーマライズ ボタン左クリック (3 状態モデル: Off → ON 化 / OnApplied → OFF 化 /
@@ -1519,6 +1732,8 @@ impl App {
             } else {
                 self.refresh_fullscreen_video_marker_cache(fs_idx);
                 self.sync_native_video_timeline_markers(fs_idx);
+                // BM ループ中なら境界リストが変わったので loop_target を再計算
+                self.apply_loop_mode_to_player(fs_idx);
             }
         }
         self.mark_native_video_hud_activity(ctx);
@@ -1541,6 +1756,8 @@ impl App {
             } else {
                 self.refresh_fullscreen_video_marker_cache(fs_idx);
                 self.sync_native_video_timeline_markers(fs_idx);
+                // タイトル変更だけでも boundary 起点に変化はないが、念のため apply。
+                self.apply_loop_mode_to_player(fs_idx);
             }
         }
         self.mark_native_video_hud_activity(ctx);
@@ -1572,6 +1789,8 @@ impl App {
                 ));
                 self.refresh_fullscreen_video_marker_cache(fs_idx);
                 self.sync_native_video_timeline_markers(fs_idx);
+                // BM ループ中なら新 bookmark を含めて loop_target を再計算
+                self.apply_loop_mode_to_player(fs_idx);
             }
         }
     }
@@ -1791,10 +2010,9 @@ impl App {
                     player.set_muted(!player.is_muted());
                 }
             }
-            // L: loop
+            // L: loop (4 段階サイクル: Off → Full → Chapter → Bookmark)
             0x4C if !key.shift && !key.ctrl && !key.repeat => {
-                self.settings.video_loop = !self.settings.video_loop;
-                self.settings.save();
+                self.cycle_native_video_loop_common(ctx, fs_idx);
             }
             // J / K: previous / next chapter, bookmark, or pin marker.
             0x4A if !key.shift && !key.ctrl && !key.repeat => {
@@ -1846,6 +2064,9 @@ impl App {
     #[cfg(windows)]
     pub(super) fn jump_native_video_marker(&mut self, fs_idx: usize, next: bool) {
         const NAV_MARKER_EPSILON: f64 = 0.5;
+        // 「すでに先頭」と判定する閾値。マーカースキップ用 NAV_MARKER_EPSILON (0.5s) とは別に
+        // ここを小さく取ることで、現在位置 0.1s〜0.5s で J を押しても先頭へジャンプできる。
+        const ALREADY_AT_START_TOL: f64 = 0.05;
         let markers = self.collect_video_nav_markers(fs_idx);
         let current = self
             .fs_video_player(fs_idx)
@@ -1863,39 +2084,59 @@ impl App {
                 .find(|marker| marker.pts < current - NAV_MARKER_EPSILON)
                 .cloned()
         };
-        let Some(marker) = target else {
-            return;
-        };
-        if let Some(player) = self.fs_video_player(fs_idx) {
-            player.seek(marker.pts);
-        }
-        let direction = if next { "次の" } else { "前の" };
-        let kind_label = match marker.kind {
-            crate::ui_fullscreen::NavMarkerKind::Chapter => "チャプター",
-            crate::ui_fullscreen::NavMarkerKind::Bookmark => "ブックマーク",
-            crate::ui_fullscreen::NavMarkerKind::Pin => "ピン",
-        };
-        let toast = match (marker.kind, marker.title.as_deref()) {
-            (crate::ui_fullscreen::NavMarkerKind::Chapter, Some(title))
-            | (crate::ui_fullscreen::NavMarkerKind::Bookmark, Some(title))
-                if !title.is_empty() =>
-            {
-                format!(
-                    "{} {}{}: {}",
-                    crate::ui_helpers::format_hms(marker.pts),
-                    direction,
-                    kind_label,
-                    title
-                )
+        match target {
+            Some(marker) => {
+                if let Some(player) = self.fs_video_player(fs_idx) {
+                    player.seek(marker.pts);
+                }
+                // CH/BM ループ中ならマーカージャンプ後に loop_target を更新
+                self.apply_loop_mode_to_player(fs_idx);
+                let direction = if next { "次の" } else { "前の" };
+                let kind_label = match marker.kind {
+                    crate::ui_fullscreen::NavMarkerKind::Chapter => "チャプター",
+                    crate::ui_fullscreen::NavMarkerKind::Bookmark => "ブックマーク",
+                    crate::ui_fullscreen::NavMarkerKind::Pin => "ピン",
+                };
+                let toast = match (marker.kind, marker.title.as_deref()) {
+                    (crate::ui_fullscreen::NavMarkerKind::Chapter, Some(title))
+                    | (crate::ui_fullscreen::NavMarkerKind::Bookmark, Some(title))
+                        if !title.is_empty() =>
+                    {
+                        format!(
+                            "{} {}{}: {}",
+                            crate::ui_helpers::format_hms(marker.pts),
+                            direction,
+                            kind_label,
+                            title
+                        )
+                    }
+                    _ => format!(
+                        "{} {}{}",
+                        crate::ui_helpers::format_hms(marker.pts),
+                        direction,
+                        kind_label
+                    ),
+                };
+                self.show_feedback_toast(toast);
             }
-            _ => format!(
-                "{} {}{}",
-                crate::ui_helpers::format_hms(marker.pts),
-                direction,
-                kind_label
-            ),
-        };
-        self.show_feedback_toast(toast);
+            None if !next && current > ALREADY_AT_START_TOL => {
+                // J キーで前のマーカーが見つからない (= 最初のマーカー手前または空) かつ
+                // 既に先頭に居なければ動画先頭へ seek。
+                if let Some(player) = self.fs_video_player(fs_idx) {
+                    player.seek(0.0);
+                }
+                self.apply_loop_mode_to_player(fs_idx);
+                // native presenter 経路では overlay 上にトーストを出す (= HUD と整合)
+                self.show_native_video_overlay_toast(
+                    format!("{} 動画先頭", crate::ui_helpers::format_hms(0.0)),
+                    false,
+                );
+            }
+            None => {
+                // K キーでマーカーが無い (= 末尾以降) ケース、
+                // または J キーで既に先頭にいるケースは何もしない。
+            }
+        }
     }
 
     #[cfg(windows)]

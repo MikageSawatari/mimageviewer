@@ -1105,9 +1105,13 @@ pub(super) fn draw_native_toast(
     if alpha <= 0.0 {
         return;
     }
+    // interactable(false) でこの Area がクリックイベントを奪わないようにする。
+    // 旧: set_min_size で画面全体を Area として確保していたため、トースト表示中は
+    //     overlay の他のボタン (ループ / 再生 / etc.) クリックがこの Area に消費されていた。
     egui::Area::new(egui::Id::new("native_video_toast"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
+        .interactable(false)
         .show(ctx, |ui| {
             let full_rect = egui::Rect::from_min_size(
                 egui::Pos2::ZERO,

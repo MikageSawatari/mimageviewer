@@ -50,6 +50,20 @@ pub struct VideoBookmarkMeta {
     pub title: Option<String>,
 }
 
+/// ブックマーク列から、ループ境界として使う「区間の開始秒」を **正規化済み Vec** で返す。
+/// finite + nonneg + sort + dedup (1us 単位)。`start_at` / `first_boundary_after` は
+/// この正規化を前提に動く。
+pub fn boundary_starts_from_bookmarks(bookmarks: &[VideoBookmarkMeta]) -> Vec<f64> {
+    let mut v: Vec<f64> = bookmarks
+        .iter()
+        .map(|b| b.pts_secs)
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .collect();
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    v.dedup_by(|a, b| (*a - *b).abs() < 1.0e-6);
+    v
+}
+
 /// 動画ブックマーク DB ハンドル。
 pub struct VideoBookmarkDb {
     conn: rusqlite::Connection,
@@ -242,6 +256,43 @@ mod tests {
         let conn = Connection::open_in_memory().expect("memory db");
         VideoBookmarkDb::init_schema(&conn).expect("schema");
         VideoBookmarkDb { conn }
+    }
+
+    #[test]
+    fn boundary_starts_from_bookmarks_normalizes() {
+        let bms = vec![
+            VideoBookmarkMeta {
+                id: 1,
+                pts_secs: f64::NAN,
+                title: None,
+            },
+            VideoBookmarkMeta {
+                id: 2,
+                pts_secs: -3.0,
+                title: None,
+            },
+            VideoBookmarkMeta {
+                id: 3,
+                pts_secs: 10.0,
+                title: None,
+            },
+            VideoBookmarkMeta {
+                id: 4,
+                pts_secs: 5.0,
+                title: None,
+            },
+            VideoBookmarkMeta {
+                id: 5,
+                pts_secs: 5.0,
+                title: None,
+            }, // dup
+        ];
+        assert_eq!(boundary_starts_from_bookmarks(&bms), vec![5.0, 10.0]);
+    }
+
+    #[test]
+    fn boundary_starts_from_bookmarks_handles_empty() {
+        assert_eq!(boundary_starts_from_bookmarks(&[]), Vec::<f64>::new());
     }
 
     #[test]

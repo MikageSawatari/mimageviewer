@@ -47,7 +47,7 @@ pub mod upscale;
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use clock::AvClock;
 use decoder::{DecodeHandles, VideoFrame, VideoFrameData, VideoInfo};
@@ -142,9 +142,19 @@ pub struct VideoPlayer {
     pending_resume_secs: Option<f64>,
     /// 直前 tick で観測した seek_serial。新世代に変わったら future_frames を一掃する。
     last_seen_seek_serial: u64,
-    /// EOF 到達時に先頭から再生し直すか (= 設定の video_loop)。App が
-    /// `set_loop_enabled` で更新する。
+    /// EOF 到達時に先頭から再生し直すか (= 設定の video_loop_mode != Off の effective)。
+    /// App が `set_loop_enabled` で更新する。`true` のとき EOF 経路は
+    /// `loop_target_bits` を seek 先として使う。
     loop_enabled: AtomicBool,
+    /// EOF 到達時 (および将来的にチャプター/ブックマーク境界 tick から要求された seek 用)
+    /// の seek 先 (秒、`f64::to_bits`)。Full ループでは `0.0` 固定だが、CH/BM ループでは
+    /// app 側で「現区間の開始秒」を書き戻す。
+    loop_target_bits: AtomicU64,
+    /// EOF ループ発火前の「drain 完了」連続観測カウンタ。tick 毎に audio buffer 群
+    /// (processed / raw_pending / tx_queued) が全て quiet 閾値未満で、かつ rx channel が
+    /// 両方空なら +1。1 つでも条件破りで 0 にリセット。指定 tick 数連続で観測したら
+    /// pump handoff race (= 一瞬すべてが 0 になる) を吸収済みとみなしてループ seek 発火。
+    eof_loop_quiet_ticks: AtomicU32,
     /// 現在進行中のシークが開始された壁時計時刻。シーク中は UI tick が短周期で
     /// repaint を予約してデコーダ完成を polling 待ちする。長引いたら back off する。
     /// シーク完了 (override が 1 度クリア) で None に戻す。
@@ -315,6 +325,12 @@ enum NativeVideoOutputCommand {
     },
     SetLoopEnabled {
         enabled: bool,
+    },
+    /// HUD ボタン表示用のループモード (= ユーザー設定の video_loop_mode、display mode)。
+    /// 再生挙動には `SetLoopEnabled` の bool を使う (= effective mode から導出)。
+    /// 「BM モード設定 + BM 無し動画」のとき、ボタン表示は BM のまま、挙動は Full と等価。
+    SetLoopMode {
+        mode: crate::settings::VideoLoopMode,
     },
     SetVst3Available {
         available: bool,
@@ -588,6 +604,12 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetLoopEnabled { enabled });
+    }
+
+    fn set_loop_mode(&self, mode: crate::settings::VideoLoopMode) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetLoopMode { mode });
     }
 
     fn set_vst3_available(&self, available: bool) {
@@ -1265,6 +1287,9 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetLoopEnabled { enabled } => {
                     presenter.set_overlay_loop_enabled(enabled);
+                }
+                NativeVideoOutputCommand::SetLoopMode { mode } => {
+                    presenter.set_overlay_loop_mode(mode);
                 }
                 NativeVideoOutputCommand::SetVst3Available { available } => {
                     presenter.set_overlay_vst3_available(available);
@@ -2135,6 +2160,8 @@ impl VideoPlayer {
                 pending_resume_secs: None,
                 last_seen_seek_serial: 0,
                 loop_enabled: AtomicBool::new(false),
+                loop_target_bits: AtomicU64::new(0u64), // = (0.0_f64).to_bits()
+                eof_loop_quiet_ticks: AtomicU32::new(0),
                 seek_inflight_since: None,
                 #[cfg(windows)]
                 gpu_latest: None,
@@ -2331,6 +2358,8 @@ impl VideoPlayer {
             pending_resume_secs: resume_secs,
             last_seen_seek_serial: 0,
             loop_enabled: AtomicBool::new(false),
+            loop_target_bits: AtomicU64::new(0u64),
+            eof_loop_quiet_ticks: AtomicU32::new(0),
             seek_inflight_since: None,
             #[cfg(windows)]
             gpu_latest: None,
@@ -2769,6 +2798,31 @@ impl VideoPlayer {
             .store(enabled, std::sync::atomic::Ordering::Release);
     }
 
+    /// EOF / 境界 tick からループ復帰先として使う秒値を atomic で書き込む。
+    /// **入力サニタイズ**: `NaN` / `inf` は `0.0` に、負値は `0.0` にクランプする。
+    /// 上限 (= duration) クランプは EOF 経路で `clamp_seek_target` を再度通すので
+    /// ここでは行わない (info() 未到着時に duration が 0 で潰されるのを避けるため)。
+    pub fn set_loop_target_secs(&self, secs: f64) {
+        let safe = if secs.is_finite() { secs.max(0.0) } else { 0.0 };
+        self.loop_target_bits
+            .store(safe.to_bits(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// 現在の loop seek target (秒) を読む。値はサニタイズ済み (`set_loop_target_secs`)
+    /// だが duration クランプは未適用。EOF 経路では追加で `clamp_seek_target` を通す。
+    pub fn loop_target_secs(&self) -> f64 {
+        f64::from_bits(
+            self.loop_target_bits
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+    }
+
+    /// 現在の再生位置 (秒) を読む。`current_seek_serial` と組で境界 tick から使う薄い
+    /// wrapper。内部的には `clock.now_secs()`。
+    pub fn position_secs(&self) -> f64 {
+        self.clock.now_secs()
+    }
+
     #[cfg(windows)]
     pub fn native_presenter_hwnd(&self) -> u64 {
         self.native_output
@@ -2905,6 +2959,16 @@ impl VideoPlayer {
     pub fn set_native_loop_enabled(&self, enabled: bool) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_loop_enabled(enabled);
+        }
+    }
+
+    /// HUD ボタン表示用のループモード (= ユーザー設定の display_mode) を presenter に伝える。
+    /// 再生挙動 (= EOF で seek するか) には `set_native_loop_enabled` の bool を別途使う。
+    /// 両者は app 側で `effective_loop_mode` を経由して算出される。
+    #[cfg(windows)]
+    pub fn set_native_loop_mode(&self, mode: crate::settings::VideoLoopMode) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_loop_mode(mode);
         }
     }
 
@@ -3091,6 +3155,67 @@ impl VideoPlayer {
 
         #[cfg(windows)]
         if self.native_output.is_some() {
+            // EOF ループ処理: native presenter 経路でも `clock.is_eof_reached()` を見て
+            // ループ seek を発行する。ここで処理しないと line 3246 以降の EOF ブロックには
+            // 到達せずループが効かない (= 既存のフル経路でも同様の前提)。
+            // ★末尾の音声 drain と最終フレーム表示を待つ★ (Codex P1 第10ラウンド +
+            // 第11ラウンド — demux EOF 時点で `is_eof_reached` が立つが、その直後に
+            // audio worker が残フレームを drain しており、また pump 内には raw_pending /
+            // processed / tx_queued の各 buffer が残っている。ここで即 seek すると
+            // 末尾 ~10-100ms の音声 / 最終フレームが失われる)。
+            // 完了条件:
+            //   - decoder→presenter / decoder→audio pump channel 両方空
+            //   - audio pump 内 buffer (processed + raw_pending + tx_queued) が全て quiet 閾値未満
+            //   - presenter 内の自前 queue は直接観測できないが、video_rx_len==0 後の
+            //     1 tick で消費されるので 16ms tick の遅延だけで実用上は十分
+            //
+            // ★閾値の設計★ (Codex P2 第13ラウンド + 第14ラウンド):
+            // - `EOF_DRAIN_AUDIO_QUIET_TOL = 20ms`: 単発観測で「ほぼ drain 済み」とみなす上限。
+            //   processed buffer は cpal-ready な実再生待ち音声なので、これより大きい値を
+            //   許容すると末尾音声が切れる。
+            // - `EOF_DRAIN_QUIET_TICKS = 3` (~48ms): pump 側の publish は
+            //   (audio_tx_queued -= n) → (raw_pending push/pop) → VST/stretch 処理 →
+            //   (publish processed) と段階を経るので、その handoff window 中に 3 counter が
+            //   全て 0 を読む race がある。重めの VST3 plugin で 1 frame の処理が ~10-30ms
+            //   かかる場合があるため、3 tick (~48ms) 連続で quiet を観測してから seek する。
+            // 完全な解決には pump 側から「EOF drain 完了 / in-flight 数」を publish する形が
+            // 良いが、連続観測ラッチで実用上は十分。VST/stretch が 48ms 超ブロックする状況は
+            // UI 不応答相当 (= 通常運用ではほぼ起きない) なので、その race で末尾 1 frame が
+            // 切れる確率は許容範囲とする。
+            const EOF_DRAIN_AUDIO_QUIET_TOL: f64 = 0.020;
+            const EOF_DRAIN_QUIET_TICKS: u32 = 3;
+            let audio_drained =
+                self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
+                    && self.clock.audio_raw_pending_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
+                    && self.clock.audio_tx_queued_secs() < EOF_DRAIN_AUDIO_QUIET_TOL;
+            let channels_drained = self.audio_rx_len() == 0 && self.video_rx_len() == 0;
+            let quiet_now = self.clock.is_eof_reached()
+                && !self.clock.is_seeking()
+                && self.is_playing()
+                && self.loop_enabled.load(std::sync::atomic::Ordering::Acquire)
+                && channels_drained
+                && audio_drained;
+            let quiet_ticks = if quiet_now {
+                self.eof_loop_quiet_ticks
+                    .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
+                    + 1
+            } else {
+                self.eof_loop_quiet_ticks
+                    .store(0, std::sync::atomic::Ordering::Release);
+                0
+            };
+            if quiet_ticks >= EOF_DRAIN_QUIET_TICKS {
+                self.eof_loop_quiet_ticks
+                    .store(0, std::sync::atomic::Ordering::Release);
+                let raw = self.loop_target_secs();
+                let target = self.clamp_seek_target(raw);
+                self.clock.request_seek(target);
+                self.clear_audio_output_buffer();
+                self.clock.set_playing(true);
+                let mut g = self.engine.lock().unwrap();
+                g.handle_seek_request(target);
+                g.apply_command(engine::actor::TransportCommand::Play);
+            }
             return if self.is_playing() || self.clock.is_seeking() {
                 Some(std::time::Duration::from_millis(16))
             } else {
@@ -3193,8 +3318,13 @@ impl VideoPlayer {
             && self.is_playing()
         {
             if self.loop_enabled.load(std::sync::atomic::Ordering::Acquire) {
-                // ループ再生 ON: 先頭にシークし続行 (= 設定の video_loop)。
-                self.clock.request_seek(0.0);
+                // ループ再生 ON: `loop_target_bits` (= app が書き戻している
+                // 「現区間の開始秒」 / Full ループでは 0.0) にシークし続行。
+                // duration クランプは clamp_seek_target に通す (info() 到着済みなら
+                // duration を超えないことを保証)。
+                let raw = self.loop_target_secs();
+                let target = self.clamp_seek_target(raw);
+                self.clock.request_seek(target);
                 self.clear_audio_output_buffer();
                 self.clock.set_playing(true);
                 // engine 側の epoch も同期 (= AvClock seek_serial と engine
@@ -3202,7 +3332,7 @@ impl VideoPlayer {
                 // 呼び出し順注意: handle_seek_request → apply_command(Play)
                 // (詳細は toggle_play を参照)。
                 let mut g = self.engine.lock().unwrap();
-                g.handle_seek_request(0.0);
+                g.handle_seek_request(target);
                 g.apply_command(engine::actor::TransportCommand::Play);
             } else {
                 // 末端到達 → duration 位置に進めて停止 (シークバー右端を確実にする)。

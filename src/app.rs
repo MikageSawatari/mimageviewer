@@ -1851,6 +1851,12 @@ pub struct App {
     /// フルスクリーン動画のピン / ブックマークキャッシュ。
     /// `App::update` とシークバー描画中に SQLite SELECT を毎フレーム走らせない。
     pub(crate) fullscreen_video_marker_cache: Option<FullscreenVideoMarkerCache>,
+    /// 動画ループ境界 tick の baseline (= 直前 tick の `(position_secs, current_seek_serial)`)。
+    /// CH/BM ループモードで「次境界跨ぎ」を検出するために `tick_native_video_loop_boundary` が
+    /// fs_idx ごとに維持する。serial 変化や巻き戻りで baseline 更新のみを行い、誤爆 seek を防ぐ。
+    /// fullscreen から動画を切り替えた時 (= fs_cache から Video エントリが消える時) に
+    /// クリアされる。
+    pub(crate) last_loop_pos: std::collections::HashMap<usize, (f64, u64)>,
     /// 動画再生中の FPS / フレーム間隔オーバーレイ (P キーで トグル)。
     pub(crate) video_perf_overlay_visible: bool,
 
@@ -2802,6 +2808,7 @@ impl Default for App {
             fs_open_intent_from_grid: false,
             video_thumb_overrides_dirty: false,
             fullscreen_video_marker_cache: None,
+            last_loop_pos: std::collections::HashMap::new(),
             video_perf_overlay_visible: false,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
@@ -11137,6 +11144,10 @@ impl App {
         }
         self.fullscreen_idx = None;
         self.fullscreen_video_marker_cache = None;
+        // 動画ループの baseline (= 直前 tick の position/serial) もクリアする。
+        // 次回フルスクリーンで別動画を開いたときに古い baseline を引き継いで誤爆 seek を
+        // 起こさないため。
+        self.last_loop_pos.clear();
         self.fs_viewport_recreate_after_hide = true;
         // 次回フルスクリーン入場時に古い活動時刻 / hidden 状態を引き継がないようクリア。
         self.cursor_last_activity = None;
@@ -13187,7 +13198,19 @@ impl App {
             .map(|t| now.duration_since(t).as_secs_f64() >= 5.0)
             .unwrap_or(true);
         let mut updates: Vec<(String, f64, f64)> = Vec::new();
-        let loop_enabled = self.settings.video_loop;
+
+        // Phase 0: bookmark cache を ensure (Phase 1 / Phase 3 で直読みするため)。
+        // 既存の sync_native_video_timeline_markers 経路でも ensure されているが、
+        // 4 段階構成の入り口で 1 回保証しておく方が分岐が単純。
+        if let Some(idx) = self.fullscreen_idx {
+            self.ensure_fullscreen_video_marker_cache(idx);
+        }
+
+        // 表示用 mode (= ユーザー設定値) は HUD ボタン表示にそのまま使う。
+        // 再生挙動用 (= 「実際にループするか」) は per-video の has_ch / has_bm から導出する
+        // effective_mode の bool に置換する (Codex P1 — display と effective を分離)。
+        let display_mode = self.settings.video_loop_mode;
+
         #[cfg(windows)]
         let mut native_closed_idx: Option<usize> = None;
         #[cfg(windows)]
@@ -13196,11 +13219,30 @@ impl App {
         let mut native_owner_hwnd: u64 = 0;
         #[cfg(windows)]
         let mut native_events: Vec<(usize, u64, crate::video::NativeVideoOutputEvent)> = Vec::new();
+        let mut active_video_indices: Vec<usize> = Vec::new();
         for (idx, entry) in self.fs_cache.iter_mut() {
             if let FsCacheEntry::Video { player, .. } = entry {
-                player.set_loop_enabled(loop_enabled);
+                // チャプター / ブックマーク有無を判定 (cache 直読み、DB クエリ無し)
+                let has_ch = player
+                    .info()
+                    .map(|i| !i.chapters.is_empty())
+                    .unwrap_or(false);
+                let has_bm = self
+                    .fullscreen_video_marker_cache
+                    .as_ref()
+                    .filter(|c| c.fs_idx == *idx)
+                    .map(|c| !c.bookmarks.is_empty())
+                    .unwrap_or(false);
+                let eff = crate::settings::effective_loop_mode(display_mode, has_ch, has_bm);
+                let enabled = !matches!(eff, crate::settings::VideoLoopMode::Off);
+                player.set_loop_enabled(enabled);
                 #[cfg(windows)]
-                player.set_native_loop_enabled(loop_enabled);
+                player.set_native_loop_enabled(enabled);
+                #[cfg(windows)]
+                player.set_native_loop_mode(display_mode); // HUD は user intent
+                // loop_target_secs は apply_loop_mode_to_player / boundary tick で維持済み。
+                // ここでは触らない (毎 tick 上書きすると再生中のセクションループが崩れる)。
+                active_video_indices.push(*idx);
                 #[cfg(windows)]
                 player.set_native_vst3_available(self.settings.vst3_enabled);
                 #[cfg(windows)]
@@ -13259,6 +13301,13 @@ impl App {
         #[cfg(windows)]
         for (idx, epoch, event) in native_events {
             self.handle_native_video_output_event(ctx, idx, epoch, event);
+        }
+        // Phase 3: 入力イベント (= seek / ToggleLoop / pause) 反映後に CH/BM ループ境界 tick。
+        // 順序が重要 (Codex P2 第4ラウンド): native_events を先に処理することで、
+        // 直近の手動 seek が serial 変化として可視化され、誤爆 seek を防げる。
+        #[cfg(windows)]
+        for idx in &active_video_indices {
+            self.tick_native_video_loop_boundary(*idx);
         }
         #[cfg(windows)]
         if self.fullscreen_idx.is_some() && self.settings.vst3_enabled {

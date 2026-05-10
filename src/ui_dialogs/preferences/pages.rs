@@ -907,7 +907,22 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
         }
     }
     ui.add_space(4.0);
-    ui.checkbox(&mut s.video_loop, "終端まで再生したら最初から繰り返す");
+    ui.horizontal(|ui| {
+        ui.label("ループ再生:");
+        let mut current = s.video_loop_mode;
+        egui::ComboBox::from_id_salt("video_loop_mode")
+            .selected_text(current.label())
+            .show_ui(ui, |ui| {
+                for mode in crate::settings::VideoLoopMode::all() {
+                    ui.selectable_value(&mut current, *mode, mode.label());
+                }
+            });
+        if current != s.video_loop_mode {
+            s.video_loop_mode = current;
+            // 旧 bool 設定も新モードと矛盾しないよう同期 (古いコード誤読対策)。
+            s.video_loop = !matches!(current, crate::settings::VideoLoopMode::Off);
+        }
+    });
     ui.checkbox(&mut s.video_start_muted, "起動直後はミュートで開始");
 
     ui.add_space(8.0);

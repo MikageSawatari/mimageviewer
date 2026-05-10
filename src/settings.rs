@@ -824,9 +824,17 @@ pub struct Settings {
     /// 動画フルスクリーン時の自動再生ポリシー (Phase 7.J)。
     #[serde(default)]
     pub video_autoplay_mode: VideoAutoplayMode,
-    /// 終端到達時に先頭から再生を繰り返すか。
+    /// 終端到達時に先頭から再生を繰り返すか (旧 v0.8.x 以前)。
+    /// `video_loop_mode` がデフォルト値 (Off) のときだけ参照され、true なら Full に昇格する。
+    /// 新ビルドでは `Settings::save()` の中で `mode != Off` から導出して書き戻すので、
+    /// 個別 toggle 経路ではこのフィールドを意識する必要はない。
     #[serde(default)]
     pub video_loop: bool,
+    /// 動画フルスクリーン時のループ再生モード (Off / 全体 / チャプター / ブックマーク)。
+    /// Phase 0.10 で `video_loop: bool` から拡張。`Settings::sanitize()` の中で旧 bool から
+    /// マイグレーションされる。
+    #[serde(default)]
+    pub video_loop_mode: VideoLoopMode,
     /// 起動時にミュートで開始するか (オフィス環境などでの保険)。
     #[serde(default)]
     pub video_start_muted: bool,
@@ -1019,6 +1027,132 @@ impl VideoAutoplayMode {
     pub fn all() -> &'static [Self] {
         &[Self::Off, Self::Always]
     }
+}
+
+/// 動画フルスクリーン時のループ再生モード。
+///
+/// Off → Full → Chapter → Bookmark → Off の 4 段階サイクル。
+/// チャプター / ブックマークが空の動画では当該段階は cycle でスキップされ、
+/// 既に当該モードのまま当該データ無しの動画に移動した場合は Full と等価に振る舞う
+/// (= ボタンの見た目はユーザー意図のモードを維持しつつ、実効的な loop は全体ループ)。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VideoLoopMode {
+    #[default]
+    Off,
+    Full,
+    Chapter,
+    Bookmark,
+}
+
+impl VideoLoopMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "ループしない",
+            Self::Full => "全体ループ",
+            Self::Chapter => "チャプターループ",
+            Self::Bookmark => "ブックマークループ",
+        }
+    }
+    pub fn all() -> &'static [Self] {
+        &[Self::Off, Self::Full, Self::Chapter, Self::Bookmark]
+    }
+}
+
+/// `current` の **次** の loop モードを返す。`has_ch` / `has_bm` が false の段階は
+/// 飛ばす。Off → Full → Chapter → Bookmark → Off の循環順。
+///
+/// 「現在モードが無効」のケース (動画移動でモードを保持しているが新動画では当該
+/// データが無い) は、循環順の **次** の有効モードを返す:
+/// - `(Chapter, has_ch=false, has_bm=true)` → Bookmark
+/// - `(Chapter, has_ch=false, has_bm=false)` → Off (Bookmark もスキップ)
+/// - `(Bookmark, has_bm=false, ...)` → Off (Bookmark の次は Off で常に有効)
+pub fn cycle_loop_mode(current: VideoLoopMode, has_ch: bool, has_bm: bool) -> VideoLoopMode {
+    let order = [
+        VideoLoopMode::Off,
+        VideoLoopMode::Full,
+        VideoLoopMode::Chapter,
+        VideoLoopMode::Bookmark,
+    ];
+    let mut idx = order.iter().position(|m| *m == current).unwrap_or(0);
+    for _ in 0..order.len() {
+        idx = (idx + 1) % order.len();
+        match order[idx] {
+            VideoLoopMode::Chapter if !has_ch => continue,
+            VideoLoopMode::Bookmark if !has_bm => continue,
+            m => return m,
+        }
+    }
+    VideoLoopMode::Off
+}
+
+/// 「ユーザーが選んでいる mode」と「現動画で実際に効く mode」を分離する。
+/// チャプター/ブックマーク無しの動画では Chapter/Bookmark は Full に降格される。
+/// HUD 表示には設定値 (= `mode`) を使い、再生挙動には effective を使う。
+pub fn effective_loop_mode(mode: VideoLoopMode, has_ch: bool, has_bm: bool) -> VideoLoopMode {
+    match mode {
+        VideoLoopMode::Chapter if !has_ch => VideoLoopMode::Full,
+        VideoLoopMode::Bookmark if !has_bm => VideoLoopMode::Full,
+        other => other,
+    }
+}
+
+/// `starts` (finite + nonneg + sort + dedup 前提) の中で、`t` 以下の最大値を返す。
+/// ループ境界の「現在区間の開始秒」を求めるのに使う。
+pub fn start_at(starts: &[f64], t: f64) -> Option<f64> {
+    starts.iter().rev().copied().find(|s| *s <= t)
+}
+
+/// `starts` (finite + nonneg + sort + dedup 前提) の中で、`v` より大きい最小値を返す。
+/// ループ境界の「次の境界 = 現在区間の end」を求めるのに使う。
+pub fn first_boundary_after(starts: &[f64], v: f64) -> Option<f64> {
+    starts.iter().copied().find(|s| *s > v)
+}
+
+/// 境界 tick の判定結果。`tick_native_video_loop_boundary` から呼ばれる純関数。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BoundaryDecision {
+    /// serial 変化 / 巻き戻り → seek を起こさず baseline (last_loop_pos と
+    /// loop_target_secs) を更新するだけ。
+    BaselineUpdate,
+    /// 境界跨ぎ → `seek_to` (= prev_pos が属する区間の開始秒) へ seek。
+    Loop { seek_to: f64 },
+    /// 何もしない (= まだ境界手前)。
+    Continue,
+}
+
+/// 境界 tick の判定純関数。`prev_pos` 側の区間で `prev_start` / `next_boundary`
+/// を計算する前提 (= 跨いだ瞬間 cur が次区間に入っていても見逃さない)。
+///
+/// `tol` は境界手前の小マージン (フレーム間隔吸収用、20ms 程度)。`prev_pos < boundary`
+/// は厳密判定 (左辺は tol 引かない) — `prev_pos=9.99`, `boundary=10.00` で `prev_pos < boundary - tol`
+/// を採ると false になり境界跨ぎを見逃すため。
+pub fn decide_boundary_action(
+    prev_pos: f64,
+    prev_serial: u64,
+    cur: f64,
+    serial: u64,
+    prev_start: f64,
+    next_boundary: Option<f64>,
+    tol: f64,
+) -> BoundaryDecision {
+    if serial != prev_serial || cur < prev_pos {
+        return BoundaryDecision::BaselineUpdate;
+    }
+    // 「前進していること」だけを微小 epsilon で確認する (Codex P1 第10ラウンド):
+    // 旧 `cur >= prev_pos + tol * 0.5` (= tol/2 = 10ms) は厳しすぎて、低速再生 (0.5x)
+    // や高頻度 tick で 1 tick 分の進行が 10ms 未満になると境界を見逃した。
+    // FORWARD_PROGRESS_EPSILON 超の前進があれば通常再生・低速再生・stutter 後の進行の
+    // いずれでも検出でき、pause/scrub の `cur == prev_pos` だけが除外される
+    // (= 誤発火防止としては十分)。strict `>` 比較なので、ちょうど 1us の進行は
+    // 不発になるが実用上問題ない (clock 解像度より十分粗い)。
+    const FORWARD_PROGRESS_EPSILON: f64 = 1.0e-6;
+    let boundary = next_boundary.unwrap_or(f64::INFINITY);
+    if prev_pos < boundary && cur >= boundary - tol && cur > prev_pos + FORWARD_PROGRESS_EPSILON {
+        return BoundaryDecision::Loop {
+            seek_to: prev_start,
+        };
+    }
+    BoundaryDecision::Continue
 }
 
 /// 動画再生時のデインターレース設定。
@@ -1272,6 +1406,7 @@ impl Default for Settings {
             video_autoplay: false,
             video_autoplay_mode: VideoAutoplayMode::default(),
             video_loop: false,
+            video_loop_mode: VideoLoopMode::default(),
             video_start_muted: false,
             video_resume_positions: std::collections::HashMap::new(),
             video_hw_decode: true,
@@ -1693,6 +1828,8 @@ impl Settings {
         let video_volume_before_sanitize = settings.video_volume;
         // migration: VST3 旧形式 (vst3_plugin_path / vst3_plugin_state) を Vec に移送
         let vst3_migrated = settings.migrate_vst3_legacy();
+        // migration: 旧 bool `video_loop=true` + 新 enum=Off → 新 enum=Full に昇格 (load 時 1 回だけ)
+        let video_loop_migrated = settings.migrate_legacy_video_loop();
         settings.sanitize();
         let video_volume_sanitized =
             (settings.video_volume - video_volume_before_sanitize).abs() > 1.0e-9;
@@ -1732,6 +1869,7 @@ impl Settings {
         if had_nil_uuids
             || vst3_migrated
             || autoplay_mode_migrated
+            || video_loop_migrated
             || video_volume_sanitized
             || version_changed
         {
@@ -1744,6 +1882,17 @@ impl Settings {
     /// から Vec 形式 (`vst3_plugins`) への migration。
     /// 一度実行されたら旧フィールドは None にクリアし、次回 save で settings.json から消える。
     /// 戻り値: migration が発生したか (= save が必要か)。
+    /// 旧 v0.8.x 以前: `video_loop: bool` だけだった。新 enum `video_loop_mode` が
+    /// Default (Off) のまま旧 bool が true なら Full に昇格する片方向 migration。
+    /// **load() からだけ呼ぶ** (sanitize は冪等にするためこのロジックは sanitize に置かない)。
+    fn migrate_legacy_video_loop(&mut self) -> bool {
+        if self.video_loop_mode == VideoLoopMode::Off && self.video_loop {
+            self.video_loop_mode = VideoLoopMode::Full;
+            return true;
+        }
+        false
+    }
+
     fn migrate_vst3_legacy(&mut self) -> bool {
         if self.vst3_plugin_path.is_none() {
             return false;
@@ -1778,6 +1927,12 @@ impl Settings {
             self.video_autoplay = false;
             self.video_autoplay_mode = VideoAutoplayMode::Off;
         }
+        // 旧 bool `video_loop` ↔ 新 enum `video_loop_mode` の同期。
+        // **bool → mode の片方向 migration は `migrate_legacy_video_loop` で load 時 1 回だけ**
+        // 行う (sanitize は冪等にする必要があるため — Off にしたとき毎回 Full に戻されると
+        // 「ユーザーが意図的に Off にした」と「旧 bool=true のまま新 enum=Off に書き戻し」が
+        // 区別できない)。ここでは mode を source of truth として bool を導出する片方向のみ。
+        self.video_loop = !matches!(self.video_loop_mode, VideoLoopMode::Off);
         self.video_volume = clamp_video_volume(self.video_volume);
 
         // v0.8 マイグレーション: お気に入りの UUID が nil なら発行する。
@@ -1898,7 +2053,14 @@ impl Settings {
                 ));
             }
         }
-        let json = match serde_json::to_string_pretty(self) {
+        // 保存直前に旧フィールドを新フィールドから導出する (Phase 0.10 ループモード移行)。
+        // self は &self なので clone してから書き換える。
+        let snapshot = {
+            let mut s = self.clone();
+            s.video_loop = !matches!(s.video_loop_mode, VideoLoopMode::Off);
+            s
+        };
+        let json = match serde_json::to_string_pretty(&snapshot) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("settings serialize failed: {e}");
@@ -2052,6 +2214,237 @@ mod tests {
             !s.video_autoplay,
             "legacy OnlyFromGrid should not be bridged back to Always by video_autoplay"
         );
+    }
+
+    #[test]
+    fn migrate_legacy_video_loop_promotes_bool_true_to_full() {
+        // 旧 bool=true + 新 enum=Off (= 旧バージョンの settings.json を読み込んだ直後)
+        // → Full に昇格する。
+        let mut s = Settings::default();
+        s.video_loop = true;
+        s.video_loop_mode = VideoLoopMode::Off;
+        let did_migrate = s.migrate_legacy_video_loop();
+        assert!(did_migrate);
+        assert_eq!(s.video_loop_mode, VideoLoopMode::Full);
+    }
+
+    #[test]
+    fn migrate_legacy_video_loop_does_not_overwrite_explicit_mode() {
+        // 新 enum=Chapter (新ビルドが書いた値) + 旧 bool=false → Chapter のまま、migration なし。
+        let mut s = Settings::default();
+        s.video_loop = false;
+        s.video_loop_mode = VideoLoopMode::Chapter;
+        assert!(!s.migrate_legacy_video_loop());
+        assert_eq!(s.video_loop_mode, VideoLoopMode::Chapter);
+    }
+
+    #[test]
+    fn migrate_legacy_video_loop_is_noop_when_bool_false_and_mode_off() {
+        let mut s = Settings::default();
+        assert!(!s.migrate_legacy_video_loop());
+        assert_eq!(s.video_loop_mode, VideoLoopMode::Off);
+    }
+
+    #[test]
+    fn sanitize_syncs_legacy_bool_from_mode_idempotent() {
+        // mode を source of truth として bool を導出。sanitize は idempotent。
+        let mut s = Settings::default();
+        s.video_loop_mode = VideoLoopMode::Bookmark;
+        s.video_loop = false;
+        s.sanitize();
+        assert!(s.video_loop);
+
+        s.video_loop_mode = VideoLoopMode::Off;
+        s.sanitize();
+        assert!(!s.video_loop);
+        // 2 回目の sanitize でも変化なし
+        s.sanitize();
+        assert!(!s.video_loop);
+        assert_eq!(s.video_loop_mode, VideoLoopMode::Off);
+    }
+
+    #[test]
+    fn cycle_loop_mode_normal_progression_when_all_available() {
+        let f = |m| cycle_loop_mode(m, true, true);
+        assert_eq!(f(VideoLoopMode::Off), VideoLoopMode::Full);
+        assert_eq!(f(VideoLoopMode::Full), VideoLoopMode::Chapter);
+        assert_eq!(f(VideoLoopMode::Chapter), VideoLoopMode::Bookmark);
+        assert_eq!(f(VideoLoopMode::Bookmark), VideoLoopMode::Off);
+    }
+
+    #[test]
+    fn cycle_loop_mode_skips_chapter_when_no_chapters() {
+        let f = |m| cycle_loop_mode(m, false, true);
+        assert_eq!(f(VideoLoopMode::Off), VideoLoopMode::Full);
+        assert_eq!(f(VideoLoopMode::Full), VideoLoopMode::Bookmark);
+        assert_eq!(f(VideoLoopMode::Bookmark), VideoLoopMode::Off);
+    }
+
+    #[test]
+    fn cycle_loop_mode_skips_bookmark_when_no_bookmarks() {
+        let f = |m| cycle_loop_mode(m, true, false);
+        assert_eq!(f(VideoLoopMode::Off), VideoLoopMode::Full);
+        assert_eq!(f(VideoLoopMode::Full), VideoLoopMode::Chapter);
+        assert_eq!(f(VideoLoopMode::Chapter), VideoLoopMode::Off);
+    }
+
+    #[test]
+    fn cycle_loop_mode_skips_both_when_neither_available() {
+        let f = |m| cycle_loop_mode(m, false, false);
+        assert_eq!(f(VideoLoopMode::Off), VideoLoopMode::Full);
+        assert_eq!(f(VideoLoopMode::Full), VideoLoopMode::Off);
+    }
+
+    #[test]
+    fn cycle_loop_mode_handles_invalid_current_chapter() {
+        // 動画 A (CH 有り) で Chapter モードのまま動画 B (CH 無し / BM 有り) に移動した状態。
+        // 「無効な現在モードから次に押した時」の挙動を固定する。
+        assert_eq!(
+            cycle_loop_mode(VideoLoopMode::Chapter, false, true),
+            VideoLoopMode::Bookmark
+        );
+        assert_eq!(
+            cycle_loop_mode(VideoLoopMode::Chapter, false, false),
+            VideoLoopMode::Off
+        );
+    }
+
+    #[test]
+    fn cycle_loop_mode_handles_invalid_current_bookmark() {
+        assert_eq!(
+            cycle_loop_mode(VideoLoopMode::Bookmark, true, false),
+            VideoLoopMode::Off
+        );
+        assert_eq!(
+            cycle_loop_mode(VideoLoopMode::Bookmark, false, false),
+            VideoLoopMode::Off
+        );
+        assert_eq!(
+            cycle_loop_mode(VideoLoopMode::Bookmark, true, true),
+            VideoLoopMode::Off
+        );
+    }
+
+    #[test]
+    fn effective_loop_mode_degrades_to_full_when_data_missing() {
+        assert_eq!(
+            effective_loop_mode(VideoLoopMode::Chapter, false, true),
+            VideoLoopMode::Full
+        );
+        assert_eq!(
+            effective_loop_mode(VideoLoopMode::Bookmark, true, false),
+            VideoLoopMode::Full
+        );
+        // 当該データありなら降格しない
+        assert_eq!(
+            effective_loop_mode(VideoLoopMode::Chapter, true, false),
+            VideoLoopMode::Chapter
+        );
+        // Off / Full は has_* に依存しない
+        assert_eq!(
+            effective_loop_mode(VideoLoopMode::Off, true, true),
+            VideoLoopMode::Off
+        );
+        assert_eq!(
+            effective_loop_mode(VideoLoopMode::Full, false, false),
+            VideoLoopMode::Full
+        );
+    }
+
+    #[test]
+    fn start_at_returns_largest_le() {
+        let starts = vec![0.0, 5.0, 10.0, 20.0];
+        assert_eq!(start_at(&starts, -1.0), None);
+        assert_eq!(start_at(&starts, 0.0), Some(0.0));
+        assert_eq!(start_at(&starts, 4.99), Some(0.0));
+        assert_eq!(start_at(&starts, 5.0), Some(5.0));
+        assert_eq!(start_at(&starts, 9.99), Some(5.0));
+        assert_eq!(start_at(&starts, 100.0), Some(20.0));
+        assert_eq!(start_at(&[], 5.0), None);
+    }
+
+    #[test]
+    fn first_boundary_after_returns_smallest_gt() {
+        let starts = vec![0.0, 5.0, 10.0, 20.0];
+        assert_eq!(first_boundary_after(&starts, -1.0), Some(0.0));
+        assert_eq!(first_boundary_after(&starts, 0.0), Some(5.0));
+        assert_eq!(first_boundary_after(&starts, 4.99), Some(5.0));
+        assert_eq!(first_boundary_after(&starts, 5.0), Some(10.0));
+        assert_eq!(first_boundary_after(&starts, 19.99), Some(20.0));
+        assert_eq!(first_boundary_after(&starts, 20.0), None);
+        assert_eq!(first_boundary_after(&starts, 100.0), None);
+    }
+
+    #[test]
+    fn decide_boundary_action_loops_on_crossing() {
+        // prev=9.99, cur=10.01 で boundary 10.00 を跨いだ → Loop へ
+        let dec = decide_boundary_action(9.99, 7, 10.01, 7, 0.0, Some(10.0), 0.020);
+        assert_eq!(dec, BoundaryDecision::Loop { seek_to: 0.0 });
+    }
+
+    #[test]
+    fn decide_boundary_action_no_loop_when_not_crossed() {
+        // 9.0 → 9.5 はまだ跨いでいない (tol=0.020 マージン外)
+        let dec = decide_boundary_action(9.0, 7, 9.5, 7, 0.0, Some(10.0), 0.020);
+        assert_eq!(dec, BoundaryDecision::Continue);
+    }
+
+    #[test]
+    fn decide_boundary_action_baseline_update_on_seek_serial_change() {
+        // 境界跨ぎ相当の delta でも serial 変化があれば手動 seek と判断
+        let dec = decide_boundary_action(9.99, 7, 10.01, 8, 0.0, Some(10.0), 0.020);
+        assert_eq!(dec, BoundaryDecision::BaselineUpdate);
+    }
+
+    #[test]
+    fn decide_boundary_action_baseline_update_on_backward() {
+        let dec = decide_boundary_action(10.0, 7, 9.0, 7, 0.0, Some(10.0), 0.020);
+        assert_eq!(dec, BoundaryDecision::BaselineUpdate);
+    }
+
+    #[test]
+    fn decide_boundary_action_continue_when_no_next_boundary() {
+        // 最後の区間 (= duration まで境界なし) では Loop しない (EOF は VideoPlayer 側経路)
+        let dec = decide_boundary_action(10.0, 7, 10.5, 7, 5.0, None, 0.020);
+        assert_eq!(dec, BoundaryDecision::Continue);
+    }
+
+    #[test]
+    fn decide_boundary_action_loops_within_tolerance_margin() {
+        // tol=0.020, prev=9.99, cur=9.99 + 0.010 → cur >= boundary - tol で発火
+        let dec = decide_boundary_action(9.99, 7, 9.99 + 0.010, 7, 0.0, Some(10.0), 0.020);
+        assert_eq!(dec, BoundaryDecision::Loop { seek_to: 0.0 });
+    }
+
+    #[test]
+    fn decide_boundary_action_loops_when_prev_is_just_below_boundary() {
+        // prev=9.99, boundary=10.00, cur=10.00 (= boundary に到達)
+        // 左辺 prev_pos < boundary は厳密判定 (tol 引かない) なので 9.99 < 10.00 で true
+        let dec = decide_boundary_action(9.99, 7, 10.00, 7, 0.0, Some(10.0), 0.020);
+        assert_eq!(dec, BoundaryDecision::Loop { seek_to: 0.0 });
+    }
+
+    #[test]
+    fn decide_boundary_action_no_loop_when_strictly_no_progress() {
+        // playing seek/scrub が tol 内に着地して cur == prev_pos のまま再開した場合、
+        // 即ループしない (Codex P2 第8ラウンド)。前進ゼロは Continue。
+        let dec = decide_boundary_action(9.99, 7, 9.99, 7, 0.0, Some(10.0), 0.020);
+        assert_eq!(dec, BoundaryDecision::Continue);
+    }
+
+    #[test]
+    fn decide_boundary_action_loops_at_low_speed_with_small_delta() {
+        // 0.5x 再生 + 60Hz tick 相当 (delta ≈ 8ms)。低速再生でも境界を見逃さない
+        // (Codex P1 第10ラウンド)。
+        let dec = decide_boundary_action(9.974, 7, 9.982, 7, 0.0, Some(10.0), 0.020);
+        assert_eq!(dec, BoundaryDecision::Loop { seek_to: 0.0 });
+    }
+
+    #[test]
+    fn decide_boundary_action_loops_at_micro_progress() {
+        // 1us 単位の進行でも前進している限り境界手前 tol 内なら Loop 発火する。
+        let dec = decide_boundary_action(9.9999, 7, 9.99991, 7, 0.0, Some(10.0), 0.020);
+        assert_eq!(dec, BoundaryDecision::Loop { seek_to: 0.0 });
     }
 
     #[test]

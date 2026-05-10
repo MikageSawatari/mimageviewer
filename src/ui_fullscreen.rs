@@ -5469,8 +5469,14 @@ impl App {
             self.settings.save();
         }
         if loop_key {
-            self.settings.video_loop = !self.settings.video_loop;
-            self.settings.save();
+            // cycle_native_video_loop_common は app/native_video.rs (cfg(windows)) に
+            // 定義されているため、非 Windows ビルドではリンクできない。
+            // mimageviewer の動画機能自体が Windows 限定 (`pub mod video;` が cfg(windows))
+            // なので非 Windows では何もしない。
+            #[cfg(windows)]
+            self.cycle_native_video_loop_common(ctx, fs_idx);
+            #[cfg(not(windows))]
+            let _ = (ctx, fs_idx);
         }
 
         // Phase 5.5: S キーでタイルモード トグル。画面サイズは Context 側から取得。
@@ -5493,7 +5499,9 @@ impl App {
         // (= HUD を再表示)。マウス活動と同様の扱い。
         // J/K: マーカー (チャプター/ブックマーク/ピン) 間の前後ジャンプ。
         // 現在再生位置 ± epsilon を境にした最近接探索で「現在マーカーで足踏み」を防ぐ。
-        // ジャンプ先がなければ何もしない (= 端で止まる)。
+        // J で前のマーカーが見つからないときは動画先頭 (0.0) へ seek (= 既に先頭に
+        // 居る場合だけ何もしない、閾値は ALREADY_AT_START_TOL)。K のときは何もしない。
+        const ALREADY_AT_START_TOL: f64 = 0.05;
         if prev_marker_key || next_marker_key {
             let markers = self.collect_video_nav_markers(fs_idx);
             let current = self
@@ -5512,36 +5520,58 @@ impl App {
                     .find(|m| m.pts < current - NAV_MARKER_EPSILON)
                     .cloned()
             };
-            if let Some(m) = target {
-                if let Some(p) = self.fs_video_player(fs_idx) {
-                    p.seek(m.pts);
-                }
-                let direction = if next_marker_key { "次の" } else { "前の" };
-                let kind_label = match m.kind {
-                    NavMarkerKind::Chapter => "チャプター",
-                    NavMarkerKind::Bookmark => "ブックマーク",
-                    NavMarkerKind::Pin => "ピン",
-                };
-                let toast = match (m.kind, m.title.as_deref()) {
-                    (NavMarkerKind::Chapter, Some(t)) | (NavMarkerKind::Bookmark, Some(t))
-                        if !t.is_empty() =>
-                    {
-                        format!(
-                            "{} {}{}: {}",
+            match target {
+                Some(m) => {
+                    if let Some(p) = self.fs_video_player(fs_idx) {
+                        p.seek(m.pts);
+                    }
+                    // CH/BM ループ中ならマーカージャンプ後に loop_target を更新
+                    #[cfg(windows)]
+                    self.apply_loop_mode_to_player(fs_idx);
+                    let direction = if next_marker_key { "次の" } else { "前の" };
+                    let kind_label = match m.kind {
+                        NavMarkerKind::Chapter => "チャプター",
+                        NavMarkerKind::Bookmark => "ブックマーク",
+                        NavMarkerKind::Pin => "ピン",
+                    };
+                    let toast = match (m.kind, m.title.as_deref()) {
+                        (NavMarkerKind::Chapter, Some(t)) | (NavMarkerKind::Bookmark, Some(t))
+                            if !t.is_empty() =>
+                        {
+                            format!(
+                                "{} {}{}: {}",
+                                crate::ui_helpers::format_hms(m.pts),
+                                direction,
+                                kind_label,
+                                t
+                            )
+                        }
+                        _ => format!(
+                            "{} {}{}",
                             crate::ui_helpers::format_hms(m.pts),
                             direction,
-                            kind_label,
-                            t
-                        )
+                            kind_label
+                        ),
+                    };
+                    self.show_feedback_toast(toast);
+                }
+                None if !next_marker_key && current > ALREADY_AT_START_TOL => {
+                    // J キーで前のマーカーが見つからない (= 最初のマーカー手前または空) かつ
+                    // 既に先頭に居なければ動画先頭へ seek。
+                    if let Some(p) = self.fs_video_player(fs_idx) {
+                        p.seek(0.0);
                     }
-                    _ => format!(
-                        "{} {}{}",
-                        crate::ui_helpers::format_hms(m.pts),
-                        direction,
-                        kind_label
-                    ),
-                };
-                self.show_feedback_toast(toast);
+                    #[cfg(windows)]
+                    self.apply_loop_mode_to_player(fs_idx);
+                    self.show_feedback_toast(format!(
+                        "{} 動画先頭",
+                        crate::ui_helpers::format_hms(0.0)
+                    ));
+                }
+                None => {
+                    // K キーでマーカーが無い (= 末尾以降) ケース、
+                    // または J キーで既に先頭にいるケースは何もしない。
+                }
             }
         }
         // ESC は タイルモード中のみキャッチして close。フルスクリーン解脱は呼び出し側
