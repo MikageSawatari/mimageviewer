@@ -3,15 +3,17 @@ use std::ffi::c_void;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::System::Threading::{
+    AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId,
+};
 use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::Ime::{
     GCS_COMPSTR, GCS_RESULTSTR, IME_COMPOSITION_STRING, ISC_SHOWUICOMPOSITIONWINDOW,
     ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
-    VK_CONTROL, VK_MENU, VK_SHIFT,
+    GetKeyState, ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
+    TrackMouseEvent, VK_CONTROL, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
@@ -19,13 +21,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOP,
     IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, MSG, PM_REMOVE, PeekMessageW,
     PostQuitMessage, RegisterClassW, SW_SHOW, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage,
-    WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
-    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
-    WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    TranslateMessage, WINDOW_EX_STYLE, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION,
+    WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CLIPCHILDREN,
+    WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -265,6 +267,84 @@ pub fn foreground_belongs_to_current_process() -> bool {
         let mut foreground_pid = 0_u32;
         let _ = GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
         foreground_pid == 0 || foreground_pid == GetCurrentProcessId()
+    }
+}
+
+/// `foreground_belongs_to_current_process` の保守的版。
+/// foreground=null / pid=0 の不確定ケースは false を返す
+/// (= 「mIV が前面と確信できない」場合は奪還しない)。
+pub fn foreground_belongs_to_current_process_strict() -> bool {
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.0.is_null() {
+            return false;
+        }
+        let mut foreground_pid = 0_u32;
+        let _ = GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
+        foreground_pid != 0 && foreground_pid == GetCurrentProcessId()
+    }
+}
+
+pub fn is_window_alive(hwnd_raw: u64) -> bool {
+    if hwnd_raw == 0 {
+        return false;
+    }
+    unsafe { IsWindow(Some(HWND(hwnd_raw as *mut _))).as_bool() }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ForegroundClaimReport {
+    pub foreground_hwnd: u64,
+    pub post_foreground_hwnd: u64,
+    pub target_hwnd: u64,
+    pub attach_thread_input_ok: bool,
+    pub set_foreground_ok: bool,
+    pub set_active_ok: bool,
+    pub set_focus_ok: bool,
+}
+
+/// `SetForegroundWindow` cooperative ルールを掻い潜って HWND を最前面に上げる。
+/// Alt+Tab で他アプリが foreground を持っている状態でも安定して動く best-effort。
+/// 詳細ログ用に各 API 結果を返す。
+///
+/// `target_hwnd_raw == 0` または `!IsWindow(target)` の場合は何もせず、
+/// 全 ok=false の report を返す (共通 utility なので呼び出し側で stale HWND を
+/// 渡しても安全に no-op になる)。
+pub fn claim_foreground(target_hwnd_raw: u64) -> ForegroundClaimReport {
+    if target_hwnd_raw == 0 || !is_window_alive(target_hwnd_raw) {
+        return ForegroundClaimReport {
+            target_hwnd: target_hwnd_raw,
+            ..ForegroundClaimReport::default()
+        };
+    }
+    unsafe {
+        let target = HWND(target_hwnd_raw as *mut c_void);
+        let foreground = GetForegroundWindow();
+        let this_tid = GetCurrentThreadId();
+        let foreground_tid = if !foreground.0.is_null() {
+            GetWindowThreadProcessId(foreground, None)
+        } else {
+            0
+        };
+        let attached = foreground_tid != 0
+            && foreground_tid != this_tid
+            && AttachThreadInput(this_tid, foreground_tid, true).as_bool();
+        let set_foreground_ok = SetForegroundWindow(target).as_bool();
+        let set_active_ok = SetActiveWindow(target).is_ok();
+        let set_focus_ok = SetFocus(Some(target)).is_ok();
+        let post_foreground = GetForegroundWindow();
+        if attached {
+            let _ = AttachThreadInput(this_tid, foreground_tid, false);
+        }
+        ForegroundClaimReport {
+            foreground_hwnd: foreground.0 as u64,
+            post_foreground_hwnd: post_foreground.0 as u64,
+            target_hwnd: target.0 as u64,
+            attach_thread_input_ok: attached,
+            set_foreground_ok,
+            set_active_ok,
+            set_focus_ok,
+        }
     }
 }
 

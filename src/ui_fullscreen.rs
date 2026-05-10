@@ -118,41 +118,15 @@ fn native_window_under_cursor_focus_target() -> NativeFocusTarget {
 
 #[cfg(windows)]
 fn claim_native_window_focus(target_hwnd: usize) -> NativeFocusClaim {
-    use windows::Win32::Foundation::HWND;
-    use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-    use windows::Win32::UI::Input::KeyboardAndMouse::{SetActiveWindow, SetFocus};
-    use windows::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId, SetForegroundWindow,
-    };
-
-    unsafe {
-        let target = HWND(target_hwnd as *mut std::ffi::c_void);
-        let foreground = GetForegroundWindow();
-        let this_tid = GetCurrentThreadId();
-        let foreground_tid = if !foreground.0.is_null() {
-            GetWindowThreadProcessId(foreground, None)
-        } else {
-            0
-        };
-        let attached = foreground_tid != 0
-            && foreground_tid != this_tid
-            && AttachThreadInput(this_tid, foreground_tid, true).as_bool();
-        let set_foreground_ok = SetForegroundWindow(target).as_bool();
-        let set_active_ok = SetActiveWindow(target).is_ok();
-        let set_focus_ok = SetFocus(Some(target)).is_ok();
-        let post_foreground = GetForegroundWindow();
-        if attached {
-            let _ = AttachThreadInput(this_tid, foreground_tid, false);
-        }
-        NativeFocusClaim {
-            foreground_hwnd: foreground.0 as usize,
-            post_foreground_hwnd: post_foreground.0 as usize,
-            target_hwnd: target.0 as usize,
-            set_foreground_ok,
-            attach_thread_input_ok: attached,
-            set_active_ok,
-            set_focus_ok,
-        }
+    let report = crate::video::native_window::claim_foreground(target_hwnd as u64);
+    NativeFocusClaim {
+        foreground_hwnd: report.foreground_hwnd as usize,
+        post_foreground_hwnd: report.post_foreground_hwnd as usize,
+        target_hwnd: report.target_hwnd as usize,
+        set_foreground_ok: report.set_foreground_ok,
+        attach_thread_input_ok: report.attach_thread_input_ok,
+        set_active_ok: report.set_active_ok,
+        set_focus_ok: report.set_focus_ok,
     }
 }
 

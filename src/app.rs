@@ -2428,6 +2428,20 @@ pub struct App {
     /// まで theme chrome 復元を少し遅らせるための期限。
     native_video_main_chrome_restore_at: Option<std::time::Instant>,
     #[cfg(windows)]
+    /// 動画フルスクリーン終了時に main_hwnd の foreground 奪還を試みるべきか。
+    /// close_fullscreen 時点で「mIV が foreground だった」ときに true、
+    /// process_native_video_main_chrome_restore 完走 / 期限超過で消費する。
+    pub(crate) pending_main_foreground_reclaim: bool,
+    #[cfg(windows)]
+    /// close_fullscreen 時点での native presenter HWND。Drop 完了の判定に使う
+    /// (`IsWindow(saved) == false` なら destroy 済み)。0 なら presenter 不在。
+    pub(crate) pending_main_foreground_reclaim_after_hwnd: u64,
+    #[cfg(windows)]
+    /// 奪還処理の絶対 deadline。close_fullscreen 時点で `now + 200ms`。
+    /// 期限超過時は presenter HWND が残っていても claim せず clear する
+    /// (= ユーザーがこの間に他アプリへ切替えていた場合に奪い返さない実用上抑制)。
+    pub(crate) pending_main_foreground_reclaim_force_at: Option<std::time::Instant>,
+    #[cfg(windows)]
     /// Native fullscreen presenter 上の左クリック候補。overlay hit-test が入るまでの
     /// 暫定 transport 操作用で、drag と click を release 時に分ける。
     native_video_pointer_down: Option<NativeVideoPointerDown>,
@@ -2961,6 +2975,12 @@ impl Default for App {
             native_video_main_chrome_black: false,
             #[cfg(windows)]
             native_video_main_chrome_restore_at: None,
+            #[cfg(windows)]
+            pending_main_foreground_reclaim: false,
+            #[cfg(windows)]
+            pending_main_foreground_reclaim_after_hwnd: 0,
+            #[cfg(windows)]
+            pending_main_foreground_reclaim_force_at: None,
             #[cfg(windows)]
             native_video_pointer_down: None,
             last_ui_heartbeat_log: std::time::Instant::now(),
@@ -8738,6 +8758,16 @@ impl App {
             // タイトルバーが黒くなってから fullscreen が出る 1-frame race が見える。
             self.native_video_main_chrome_restore_at = None;
         }
+        // 動画フルスクリーン → 別 idx を直接 open する経路 (例: 動画→画像遷移、
+        // open_fullscreen_from_fs_navigation の継続ナビ) では、close_fullscreen を
+        // 経由しないので奪還候補がそのまま残る。継続ナビなら新しい fullscreen が
+        // 引き続き表示されているため reclaim 不要 → ここでクリアする。
+        #[cfg(windows)]
+        {
+            self.pending_main_foreground_reclaim = false;
+            self.pending_main_foreground_reclaim_after_hwnd = 0;
+            self.pending_main_foreground_reclaim_force_at = None;
+        }
         self.adjust_spread_target = AdjustSpreadTarget::Left;
         // PDF pool の Critical 予約を ON: 現在ページのレンダリング用に 1 ワーカー確保。
         // グリッドに戻ったら OFF に戻し、全 3 ワーカーを Normal に使えるようにする。
@@ -10993,6 +11023,30 @@ impl App {
             self.native_video_front_last_raise = None;
             self.native_video_pointer_down = None;
             self.schedule_native_video_main_chrome_restore();
+            // 動画フルスクリーンだった (= chrome を黒くしていた) ときだけ奪還候補。
+            // mIV が foreground を持っていた瞬間にだけ true にする (ユーザーが他アプリを
+            // 意図的に前面にしていたケースで奪い返さないため)。
+            // foreground=null/pid=0 の不確定ケースは保守的に false 扱い。
+            let foreground_is_ours =
+                crate::video::native_window::foreground_belongs_to_current_process_strict();
+            if self.native_video_main_chrome_black && foreground_is_ours {
+                self.pending_main_foreground_reclaim = true;
+                self.pending_main_foreground_reclaim_after_hwnd =
+                    self.native_video_presenter_hwnd().unwrap_or(0);
+                self.pending_main_foreground_reclaim_force_at =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(200));
+            } else {
+                self.pending_main_foreground_reclaim = false;
+                self.pending_main_foreground_reclaim_after_hwnd = 0;
+                self.pending_main_foreground_reclaim_force_at = None;
+                if self.native_video_main_chrome_black {
+                    crate::logger::log(
+                        "[native-video] foreground_unknown_or_foreign at close_fullscreen, \
+                         skip reclaim"
+                            .to_string(),
+                    );
+                }
+            }
         }
         #[cfg(windows)]
         if self.show_vst3_manager || self.settings.vst3_gui_visible {

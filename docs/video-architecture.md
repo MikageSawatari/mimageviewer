@@ -534,6 +534,30 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
   まで保持。次フレーム到着で旧 frame の Drop が NT HANDLE を `CloseHandle` する
   (= 描画中の HANDLE が close される race を防ぐ)
 
+### フルスクリーン終了時の foreground 奪還
+
+native presenter の HWND は WS_POPUP として独立に存在し、`owner_hwnd = main_hwnd` で
+作成される。Alt+Tab で他アプリが「main」と「popup」の z-order の間に割り込むと、
+popup destroy 後に Windows が owner ではなく z-order 順で次の他アプリを foreground に
+昇格させ、サムネイル一覧が他アプリの後ろに隠れることがある。
+
+これを補正するため、`close_fullscreen` 時点で奪還候補を凍結し
+([src/app.rs](../src/app.rs) `pending_main_foreground_reclaim*` フィールド群)、
+chrome 復帰の deferred restore に相乗りで `SetForegroundWindow(main_hwnd)` を
+`AttachThreadInput` 併用で呼び戻す ([src/app/native_video.rs](../src/app/native_video.rs)
+`process_native_video_main_chrome_restore`)。
+
+ガード条件:
+- 動画フルスクリーンを通った時のみ (`native_video_main_chrome_black=true`)
+- close_fullscreen 時点で mIV プロセスが foreground を持っていた場合のみ
+  ([src/video/native_window.rs](../src/video/native_window.rs)
+  `foreground_belongs_to_current_process_strict`、null/pid=0 の不確定ケースは false)
+- 保存した presenter HWND の `IsWindow == false` (= destroy 完了) を待ってから claim
+- 絶対 deadline (`now + 200ms`) を超えても presenter が destroy されていなければ
+  諦めて clear (= destroy 待ちが長引いた間にユーザーが他アプリへ切替えた場合に
+  奪い返さない実用上抑制)
+- `open_fullscreen` で別 idx を直接 open する継続ナビ経路では reclaim 不要なのでクリア
+
 ### `VideoPlayer::open(..., native_output_config=None)` のセマンティクス
 
 `VideoPlayer::open` の `native_output_config: Option<NativeVideoOutputConfig>` 引数で
