@@ -143,6 +143,31 @@ fn metadata_text_fallback_emoji_symbols_dark() {
     );
 }
 
+/// `draw_cell_filename` のフォント family が `miv-user-text` であることの回帰防止。
+/// 絵文字 (💎) / 数学英字 (𝓈𝒸𝓇𝑒𝒶𝓂) / 日本語 / ASCII を 1 つのラベルに混ぜて、
+/// ベースラインのずれが PNG 差分として検知できる状態にする。
+#[test]
+fn cell_filename_mixed_glyphs_dark() {
+    snapshot_with_theme(
+        "cell_filename_mixed_glyphs_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            let (_resp, painter) =
+                ui.allocate_painter(egui::vec2(220.0, 160.0), egui::Sense::hover());
+            let inner = painter.clip_rect();
+            painter.rect_filled(inner, 2.0, egui::Color32::from_gray(60));
+            mimageviewer::ui_helpers::draw_cell_filename(
+                &painter,
+                inner,
+                "001 - お返事まだカナ💎𝓈𝒸𝓇𝑒𝒶𝓂おじ",
+                egui::Color32::WHITE,
+                true,
+                0.0,
+            );
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Susie 診断 UI (PoolStatus 各バリアントのレンダリング) のスナップショット
 // ---------------------------------------------------------------------------

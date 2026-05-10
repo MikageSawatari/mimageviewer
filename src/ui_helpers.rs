@@ -183,7 +183,7 @@ pub fn draw_cell_filename(
     dark: bool,
     reserve_left_w: f32,
 ) {
-    let font = egui::FontId::proportional(11.0);
+    let font = crate::ui_fonts::user_text_font(11.0);
     let plate_pad = egui::vec2(4.0, 1.0);
     let outer_margin = 3.0;
 
