@@ -65,19 +65,126 @@ pub(super) fn draw_native_perf_overlay(
                 egui::FontId::monospace(12.0),
                 warn,
             );
+            // ── ヘッダ 2 行目: clock 統計 + A/V offset + audio lead + UNDERRUN ──
+            // `A/V` は **体感の音映像差** (av_offset_ms = video_pts − audio_audible_pts) を
+            // 主指標とする。当初使っていた `av_drift_ms` (= video_pts − master_clock) は
+            // Norm clear バグなど audio が clock から乖離した場面で値が変わらず、
+            // 「音と映像がズレているのに数値が動かない」という体感と乖離する。
+            // 詳細は `docs/video-architecture.md` の「A/V drift 計装」節参照。
             painter.text(
                 panel_rect.min + egui::vec2(10.0, 25.0),
                 egui::Align2::LEFT_TOP,
                 format!(
-                    "clock late {:.1}ms  total {:.1}ms  max dt {:.1}ms  t {:.0}s",
-                    latest.max_late_ms,
-                    latest.max_total_ms,
-                    latest.max_interval_ms,
-                    latest.elapsed_secs
+                    "clock late {:.1}ms  max dt {:.1}ms",
+                    latest.max_late_ms, latest.max_interval_ms
                 ),
                 egui::FontId::monospace(10.0),
                 egui::Color32::from_rgb(168, 176, 188),
             );
+
+            // ── 右端の値表示: label + value を分けて描く ──
+            //
+            // **桁ぶれ問題への対応** (= 2026-05-11):
+            // 旧版は `format!("A/V {:>+8.1}ms", v)` の 1 行で右寄せしていたが、mIV の
+            // monospace family は `ui_fonts.rs` で先頭に Yu Gothic Medium (proportional)
+            // が挿入されているため、leading space と digit の advance 幅が違って
+            // 桁数変化のたびにテキスト全体が左右に動いていた。
+            //
+            // 対策: label 部分と value 部分を **別の painter.text** で描き、value 部分は
+            // **固定 right edge** で右寄せする。これで value 文字数が変わっても
+            // value の右端 / label の位置は動かない (= 視覚的に「動かない」)。
+            // 各 value slot は ~10 char (~70px) で「±9999.9ms」までを含意する余裕。
+            const VALUE_SLOT_W: f32 = 70.0; // 約 10 char @ 7px (monospace)
+            const LABEL_VALUE_GAP: f32 = 4.0;
+
+            let av_offset_finite = latest.av_offset_ms.is_finite();
+            let display_value = if av_offset_finite {
+                latest.av_offset_ms
+            } else {
+                // audio inactive (動画 only) のとき av_drift_ms を表示する。
+                latest.av_drift_ms
+            };
+            let display_abs = display_value.abs();
+            let av_color = if display_abs < 5.0 {
+                egui::Color32::from_rgb(154, 236, 178) // 緑
+            } else if display_abs < 20.0 {
+                egui::Color32::from_rgb(255, 220, 120) // 黄
+            } else {
+                egui::Color32::from_rgb(255, 112, 112) // 赤
+            };
+            let av_label = if av_offset_finite { "A/V" } else { "vid" };
+            // value は padding なし。slot 右端で右寄せ → 文字数変化で左端だけ動く (= label と干渉せず)。
+            let av_value_text = format!("{:+.1}ms", display_value);
+            let av_value_right = panel_rect.min.x + panel_rect.width() - 10.0;
+            let av_value_left = av_value_right - VALUE_SLOT_W;
+            let row_y = panel_rect.min.y + 25.0;
+            painter.text(
+                egui::pos2(av_value_right, row_y),
+                egui::Align2::RIGHT_TOP,
+                &av_value_text,
+                egui::FontId::monospace(10.0),
+                av_color,
+            );
+            // label の右端 = value_slot 左端 - gap (= label の位置は完全に固定)
+            painter.text(
+                egui::pos2(av_value_left - LABEL_VALUE_GAP, row_y),
+                egui::Align2::RIGHT_TOP,
+                av_label,
+                egui::FontId::monospace(10.0),
+                av_color,
+            );
+
+            // 右端 2 (A/V の左): audio が master clock より何 ms 先行しているか。
+            // 通常 ≈ 0、Norm clear バグ時は +5000ms 級。
+            // panel width が狭いと左の「clock late ...」と重なるので、380px 未満は省略。
+            //
+            // ⚠ レイアウト: label "lead" + value_slot (= A/V と同じ 70px slot)。
+            // av_label の左端から GROUP_GAP 左に lead value slot の右端を置く。
+            const LEAD_VISIBLE_MIN_WIDTH: f32 = 380.0;
+            const GROUP_GAP: f32 = 24.0; // A/V グループと lead グループの間
+            let show_lead = panel_rect.width() >= LEAD_VISIBLE_MIN_WIDTH;
+            // av_label の x 位置を保守的に概算 (3 char ≈ 21px)。
+            let av_label_left_approx = av_value_left - LABEL_VALUE_GAP - 24.0;
+            let underrun_anchor_x = if show_lead {
+                let lead_value_right = av_label_left_approx - GROUP_GAP;
+                let lead_value_left = lead_value_right - VALUE_SLOT_W;
+                let lead_value_text = format!("{:+.1}ms", latest.audio_lead_ms);
+                let lead_color = if latest.audio_lead_ms.abs() < 50.0 {
+                    egui::Color32::from_rgb(168, 176, 188) // グレー (= 通常)
+                } else {
+                    egui::Color32::from_rgb(255, 152, 60) // 橙 (= clock 乖離)
+                };
+                painter.text(
+                    egui::pos2(lead_value_right, row_y),
+                    egui::Align2::RIGHT_TOP,
+                    &lead_value_text,
+                    egui::FontId::monospace(10.0),
+                    lead_color,
+                );
+                painter.text(
+                    egui::pos2(lead_value_left - LABEL_VALUE_GAP, row_y),
+                    egui::Align2::RIGHT_TOP,
+                    "lead",
+                    egui::FontId::monospace(10.0),
+                    lead_color,
+                );
+                // UNDERRUN は lead label の更に左に置く (= label 約 4 char 28px 分を引く)
+                lead_value_left - LABEL_VALUE_GAP - 28.0
+            } else {
+                // lead 非表示時は A/V label の左を UNDERRUN の anchor にする。
+                av_label_left_approx
+            };
+
+            // 右端 3: UNDERRUN (左へ更にオフセット)。絵文字は使わない (CLAUDE.md 遵守)。
+            if latest.audio_underrun_active {
+                painter.text(
+                    egui::pos2(underrun_anchor_x - GROUP_GAP, row_y),
+                    egui::Align2::RIGHT_TOP,
+                    "UNDERRUN",
+                    egui::FontId::monospace(10.0),
+                    egui::Color32::from_rgb(255, 95, 95),
+                );
+            }
 
             painter.rect_filled(
                 graph,
@@ -112,11 +219,42 @@ pub(super) fn draw_native_perf_overlay(
                 );
             }
 
+            // ── A/V offset サブトラック用の Y スケール (±200ms 中心) ──
+            // graph 中央が offset=0、上端が +200ms、下端が −200ms。
+            // Norm clear バグ時は ±5000ms 級になるが、グラフは ±200 で saturate するので
+            // 「飽和して上端 / 下端に張り付く」=「異常」のサインとして読める。
+            let drift_y_max_ms: f32 = 200.0;
+            let drift_center_y = (graph.min.y + graph.max.y) * 0.5;
+            let drift_half_h = graph.height() * 0.5;
+            let drift_y_for_ms = |ms: f32| {
+                let clamped = ms.clamp(-drift_y_max_ms, drift_y_max_ms);
+                drift_center_y - (clamped / drift_y_max_ms) * drift_half_h
+            };
+            // 0ms ライン (= drift センター) を点線で示す。
+            {
+                let y0 = drift_center_y;
+                let dash_w: f32 = 6.0;
+                let gap_w: f32 = 4.0;
+                let mut x = graph.min.x;
+                while x < graph.max.x {
+                    let x_end = (x + dash_w).min(graph.max.x);
+                    painter.line_segment(
+                        [egui::pos2(x, y0), egui::pos2(x_end, y0)],
+                        egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(110, 220, 240, 80),
+                        ),
+                    );
+                    x = x_end + gap_w;
+                }
+            }
+
             if let Some(last) = history.last() {
                 let now = last.arrival;
                 let px_per_sec = graph.width() / 6.0;
                 let mut prev_interval = None;
                 let mut prev_total = None;
+                let mut prev_drift = None;
                 let mut last_draw_x = f32::INFINITY;
                 let clipped = painter.with_clip_rect(graph);
                 for (idx, sample) in history.iter().enumerate() {
@@ -129,11 +267,32 @@ pub(super) fn draw_native_perf_overlay(
                         continue;
                     }
                     last_draw_x = x;
+
+                    // underrun 区間は橙色背景帯 (= 既存の frame_gap 赤縦線と同じパターン
+                    // だが、同一 sample で何度も描画されることを許容して帯にする)。
+                    if sample.audio_underrun_active {
+                        clipped.line_segment(
+                            [egui::pos2(x, graph.min.y), egui::pos2(x, graph.max.y)],
+                            egui::Stroke::new(
+                                2.0,
+                                egui::Color32::from_rgba_unmultiplied(255, 165, 60, 70),
+                            ),
+                        );
+                    }
+
                     let interval_y = y_for_ms(sample.interval_ms);
                     let total_y = y_for_ms(sample.total_ms);
                     let copy_y = y_for_ms(sample.copy_ms);
+                    // サブトラック描画は av_offset (= 体感ズレ) を主とする。audio inactive
+                    // の sample は NaN なので skip (= prev_drift を更新しない)。
+                    let drift_value = if sample.av_offset_ms.is_finite() {
+                        Some(sample.av_offset_ms)
+                    } else {
+                        None
+                    };
                     let interval_point = egui::pos2(x, interval_y);
                     let total_point = egui::pos2(x, total_y);
+                    let drift_point = drift_value.map(|v| egui::pos2(x, drift_y_for_ms(v)));
                     if let Some(prev) = prev_interval {
                         clipped.line_segment(
                             [prev, interval_point],
@@ -144,6 +303,16 @@ pub(super) fn draw_native_perf_overlay(
                         clipped.line_segment(
                             [prev, total_point],
                             egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 194, 87)),
+                        );
+                    }
+                    if let (Some(prev), Some(curr)) = (prev_drift, drift_point) {
+                        // av_offset サブトラック: 薄シアン (interval の濃い水色と区別)。
+                        clipped.line_segment(
+                            [prev, curr],
+                            egui::Stroke::new(
+                                1.4,
+                                egui::Color32::from_rgba_unmultiplied(180, 240, 250, 200),
+                            ),
                         );
                     }
                     clipped.circle_filled(
@@ -159,6 +328,11 @@ pub(super) fn draw_native_perf_overlay(
                     }
                     prev_interval = Some(interval_point);
                     prev_total = Some(total_point);
+                    if let Some(curr) = drift_point {
+                        prev_drift = Some(curr);
+                    } else {
+                        prev_drift = None;
+                    }
                 }
             }
 

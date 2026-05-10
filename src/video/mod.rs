@@ -23,6 +23,7 @@
 //! CLAUDE.md の「FFmpeg ライセンス対応」節を参照。
 
 pub mod audio;
+pub mod audio_diagnostics;
 pub mod audio_stretch;
 pub mod clock;
 pub mod decoder;
@@ -178,6 +179,11 @@ pub struct VideoPlayer {
     /// 引き継ぐ)。
     #[cfg(windows)]
     dynamic: Arc<crate::video::decoder::VideoDynamicState>,
+    /// A/V sync drift デバッグ用の atomic bundle。audio.rs (cpal callback / pump) と
+    /// native presenter (present 経路 + overlay 描画) で同じ Arc を共有する。
+    /// fast-swap でも `build_switch_source_payload` で同じ Arc が引き継がれる。
+    /// 詳細は `src/video/audio_diagnostics.rs` の doc コメント参照。
+    audio_diagnostics: Arc<crate::video::audio_diagnostics::AudioDiagnostics>,
 }
 
 #[cfg(windows)]
@@ -302,6 +308,9 @@ pub(crate) struct SwitchSourcePayload {
     /// デインターレース)。fast-swap 経路でも presenter の present_stats が
     /// 同じ Arc を握り直す。
     dynamic: Arc<crate::video::decoder::VideoDynamicState>,
+    /// A/V sync drift デバッグ用 atomic bundle。`VideoPlayer.audio_diagnostics` と
+    /// 同じ Arc を渡す (fast-swap 経路でも引き継がれる)。
+    audio_diagnostics: Arc<crate::video::audio_diagnostics::AudioDiagnostics>,
     source_epoch: u64,
     show_preparing_overlay: bool,
 }
@@ -386,6 +395,9 @@ struct PresenterSourceState {
     last_displayed_pts_bits: Arc<AtomicU64>,
     frame_step_active: Arc<AtomicBool>,
     duration_secs_bits: Arc<AtomicU64>,
+    /// A/V sync drift デバッグ用。fast-swap で旧 source から新 source に payload を
+    /// 切り替えるときも同じ Arc を引き継ぎ、grafana 的な時系列が分断されないようにする。
+    audio_diagnostics: Arc<crate::video::audio_diagnostics::AudioDiagnostics>,
     source_epoch: u64,
     queue: std::collections::VecDeque<VideoFrame>,
     last_seen_serial: u64,
@@ -394,6 +406,12 @@ struct PresenterSourceState {
     present_stats: NativeFullscreenPresentStats,
     last_present_wall: Option<std::time::Instant>,
     last_present_source_pts: Option<f64>,
+    /// drift サンプリングの 1Hz 刻み。
+    last_drift_log_at: std::time::Instant,
+    /// 大ジャンプ閾値跨ぎ edge の連打を抑える 100ms rate limit。
+    last_big_drift_emit_at: std::time::Instant,
+    /// 直前 sample が big_drift だったか (edge 検出用)。
+    last_av_drift_was_big: bool,
 }
 
 #[cfg(windows)]
@@ -407,6 +425,7 @@ impl PresenterSourceState {
             crate::video::decoder::PRESENT_PATH_PENDING,
             std::sync::atomic::Ordering::Release,
         );
+        let now = std::time::Instant::now();
         Self {
             video_rx: payload.video_rx,
             clock: payload.clock,
@@ -415,6 +434,7 @@ impl PresenterSourceState {
             last_displayed_pts_bits: payload.last_displayed_pts_bits,
             frame_step_active: payload.frame_step_active,
             duration_secs_bits: payload.duration_secs_bits,
+            audio_diagnostics: payload.audio_diagnostics,
             source_epoch: payload.source_epoch,
             queue: std::collections::VecDeque::new(),
             last_seen_serial,
@@ -423,6 +443,9 @@ impl PresenterSourceState {
             present_stats: NativeFullscreenPresentStats::new(payload.dynamic),
             last_present_wall: None,
             last_present_source_pts: None,
+            last_drift_log_at: now,
+            last_big_drift_emit_at: now,
+            last_av_drift_was_big: false,
         }
     }
 }
@@ -460,6 +483,7 @@ impl NativeVideoOutput {
         duration_secs_bits: Arc<AtomicU64>,
         config: NativeVideoOutputConfig,
         dynamic: Arc<crate::video::decoder::VideoDynamicState>,
+        audio_diagnostics: Arc<crate::video::audio_diagnostics::AudioDiagnostics>,
     ) -> Option<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
         let hwnd = Arc::new(AtomicU64::new(0));
@@ -498,6 +522,7 @@ impl NativeVideoOutput {
                     Arc::clone(&thread_closed),
                     thread_perf_overlay_visible,
                     dynamic,
+                    audio_diagnostics,
                 ) {
                     crate::logger::log(format!("[native-video] presenter stopped: {err}"));
                     // run_native_video_output が Err で抜けた = init 失敗または run 中の致命的
@@ -868,9 +893,13 @@ impl NativeFullscreenPresentStats {
         ));
     }
 
+    /// Per-frame snapshot for the P-key overlay header text. `diag_view` carries the
+    /// drift / underrun state from `AudioDiagnostics` (callers atomic-load the values
+    /// before invoking; this struct stays decoupled from `Source` / `VideoPlayer`).
     fn overlay_snapshot(
         &self,
         duration: std::time::Duration,
+        diag_view: crate::video::audio_diagnostics::OverlayDiagnostics,
     ) -> crate::video::native_presenter::NativeOverlayPerfSnapshot {
         let elapsed_secs = duration.as_secs_f64();
         let actual_fps = if elapsed_secs > 0.0 {
@@ -889,6 +918,10 @@ impl NativeFullscreenPresentStats {
             max_late_ms: self.max_late_ms,
             max_total_ms: self.max_total_ms,
             max_interval_ms: self.max_interval_ms,
+            av_drift_ms: diag_view.av_drift_ms,
+            av_offset_ms: diag_view.av_offset_ms.unwrap_or(f32::NAN),
+            audio_lead_ms: diag_view.audio_lead_ms,
+            audio_underrun_active: diag_view.audio_underrun_active,
         }
     }
 }
@@ -1083,6 +1116,7 @@ fn run_native_video_output(
     closed: Arc<AtomicBool>,
     perf_overlay_visible: Arc<AtomicBool>,
     dynamic: Arc<crate::video::decoder::VideoDynamicState>,
+    audio_diagnostics: Arc<crate::video::audio_diagnostics::AudioDiagnostics>,
 ) -> Result<(), String> {
     use std::time::{Duration, Instant};
 
@@ -1162,6 +1196,7 @@ fn run_native_video_output(
         frame_step_active,
         duration_secs_bits,
         dynamic,
+        audio_diagnostics,
         source_epoch: 0,
         show_preparing_overlay: config.initial_tile_overlay,
     });
@@ -1857,9 +1892,93 @@ fn run_native_video_output(
                     source
                         .last_displayed_pts_bits
                         .store(pts.to_bits(), Ordering::Release);
+
+                    // ── A/V drift instrumentation ──
+                    // 2 つのメトリクスを書く:
+                    //   (1) av_drift_ms = video_pts − master_clock (= video pacing health。
+                    //       通常 ≈ 0、video frame が clock に追従できていれば値は小さい)
+                    //   (2) av_offset_ms = video_pts − audio_audible_pts (= **ユーザー体感の
+                    //       音映像差**。Norm clear で audio が clock から乖離すると、こちらだけ
+                    //       数秒級に飛ぶ。今回の調査で発見した経路を直接値で見るため)
+                    // late_ms は max(0,...) で正方向に clamp 済みなので drift とは別物。
+                    let now_for_drift = source.clock.now_secs();
+                    let av_drift_ms = ((pts - now_for_drift) * 1000.0) as f32;
+                    source
+                        .audio_diagnostics
+                        .av_drift_ms_bits
+                        .store((av_drift_ms as f64).to_bits(), Ordering::Release);
+
+                    // av_offset_ms: audio inactive (動画 only / 音声起動失敗) のとき None。
+                    let av_offset_ms_opt = source
+                        .audio_diagnostics
+                        .load_audio_audible_pts()
+                        .map(|aud| ((pts - aud) * 1000.0) as f32);
+                    source.audio_diagnostics.av_offset_ms_bits.store(
+                        match av_offset_ms_opt {
+                            Some(v) => (v as f64).to_bits(),
+                            None => f64::NAN.to_bits(),
+                        },
+                        Ordering::Release,
+                    );
+                    let audio_lead_ms = source.audio_diagnostics.load_audio_lead_ms();
+
+                    if crate::perf::is_enabled() {
+                        let log_now = Instant::now();
+                        // 「big」判定は av_offset (= 体感ズレ) を主とし、audio inactive 時のみ
+                        // 旧 av_drift_ms にフォールバック。
+                        let cur_big_value = av_offset_ms_opt.unwrap_or(av_drift_ms).abs();
+                        let big = cur_big_value > 30.0;
+                        let big_edge = big && !source.last_av_drift_was_big;
+                        source.last_av_drift_was_big = big;
+                        let regular = log_now.duration_since(source.last_drift_log_at)
+                            >= Duration::from_secs(1);
+                        let big_emit_ok = big_edge
+                            && log_now.duration_since(source.last_big_drift_emit_at)
+                                >= Duration::from_millis(100);
+                        if regular || big_emit_ok {
+                            let av_offset_for_log = av_offset_ms_opt
+                                .map(|v| serde_json::Value::from(v as f64))
+                                .unwrap_or(serde_json::Value::Null);
+                            crate::perf::event(
+                                "video",
+                                "av_drift",
+                                None,
+                                0,
+                                &[
+                                    ("video_pts", serde_json::Value::from(pts)),
+                                    ("now_secs", serde_json::Value::from(now_for_drift)),
+                                    ("drift_ms", serde_json::Value::from(av_drift_ms as f64)),
+                                    ("av_offset_ms", av_offset_for_log),
+                                    (
+                                        "audio_lead_ms",
+                                        serde_json::Value::from(audio_lead_ms as f64),
+                                    ),
+                                    (
+                                        "audio_active",
+                                        serde_json::Value::from(source.clock.is_audio_active()),
+                                    ),
+                                    ("big_edge", serde_json::Value::from(big_edge)),
+                                ],
+                            );
+                            if regular {
+                                source.last_drift_log_at = log_now;
+                            }
+                            if big_emit_ok {
+                                source.last_big_drift_emit_at = log_now;
+                            }
+                        }
+                    }
+                    let underrun_active = source.audio_diagnostics.load_underrun_active();
+
                     source
                         .present_stats
                         .record_present(&outcome, late_ms, total_ms, interval_ms);
+                    let diag_view = crate::video::audio_diagnostics::OverlayDiagnostics {
+                        av_drift_ms,
+                        av_offset_ms: av_offset_ms_opt,
+                        audio_lead_ms,
+                        audio_underrun_active: underrun_active,
+                    };
                     presenter.push_overlay_perf_sample(
                         crate::video::native_presenter::NativeOverlayPerfSample {
                             arrival: present_t0,
@@ -1871,8 +1990,14 @@ fn run_native_video_output(
                             late_ms: late_ms as f32,
                             source_delta_ms: source_delta_ms as f32,
                             playback_speed: source.clock.playback_speed() as f32,
+                            av_drift_ms,
+                            av_offset_ms: av_offset_ms_opt.unwrap_or(f32::NAN),
+                            audio_lead_ms,
+                            audio_underrun_active: underrun_active,
                         },
-                        source.present_stats.overlay_snapshot(run_started.elapsed()),
+                        source
+                            .present_stats
+                            .overlay_snapshot(run_started.elapsed(), diag_view),
                     );
                     if last_summary_log.elapsed() >= Duration::from_secs(1) {
                         source.present_stats.emit_summary(run_started.elapsed());
@@ -2175,6 +2300,11 @@ impl VideoPlayer {
                 native_hover_thumbnail_sent_key: Mutex::new(None),
                 #[cfg(windows)]
                 dynamic: Arc::new(crate::video::decoder::VideoDynamicState::default()),
+                audio_diagnostics: Arc::new(
+                    crate::video::audio_diagnostics::AudioDiagnostics::new(
+                        std::time::Instant::now(),
+                    ),
+                ),
             };
         }
 
@@ -2189,6 +2319,13 @@ impl VideoPlayer {
         let seek_serial = Arc::new(AtomicU64::new(0));
         let clock = Arc::new(AvClock::new(initial_volume, seek_serial.clone()));
         let cancel = Arc::new(AtomicBool::new(false));
+
+        // A/V sync drift デバッグ用 atomic bundle。audio.rs (cpal callback / pump) と
+        // native presenter (present 経路 + overlay 描画) 両方が同じ Arc を共有する。
+        // VideoPlayer 起動時刻を `wall_ns_now()` の基準として記録。
+        let audio_diagnostics = Arc::new(crate::video::audio_diagnostics::AudioDiagnostics::new(
+            std::time::Instant::now(),
+        ));
 
         // EngineActor 構築。Phase 3b 時点では `engine` は `tick`/`apply_command` から
         // 触られておらず、AvClock が引き続き source of truth。Phase 3c 以降で
@@ -2259,6 +2396,7 @@ impl VideoPlayer {
             clock.clone(),
             engine_event_tx.clone(),
             engine_state_handle.clone(),
+            Arc::clone(&audio_diagnostics),
             #[cfg(windows)]
             dsp_bridge,
         ) {
@@ -2310,6 +2448,7 @@ impl VideoPlayer {
                     Arc::clone(&duration_secs_bits),
                     config,
                     Arc::clone(&dynamic),
+                    Arc::clone(&audio_diagnostics),
                 ) {
                     Some(output) => (Some(output), None),
                     None => (
@@ -2371,6 +2510,7 @@ impl VideoPlayer {
             native_hover_thumbnail_sent_key: Mutex::new(None),
             #[cfg(windows)]
             dynamic,
+            audio_diagnostics,
         };
         // spawn 失敗で error が立った場合、すでに走っている decoder / audio /
         // thumbnail worker を停止する。`tick()` は `error.is_some()` で早期 return
@@ -2680,7 +2820,7 @@ impl VideoPlayer {
         }
         let base = frame_step_base_secs(
             pending_step_target,
-            self.last_displayed_pts(),
+            self.last_displayed_pts_secs(),
             self.position(),
         );
         let step = frame_step_interval_secs(self.info.as_ref().map(|i| i.avg_fps).unwrap_or(0.0));
@@ -2710,16 +2850,29 @@ impl VideoPlayer {
     }
 
     pub fn screenshot_target_secs(&self) -> f64 {
-        self.last_displayed_pts().unwrap_or_else(|| self.position())
+        self.last_displayed_pts_secs()
+            .unwrap_or_else(|| self.position())
     }
 
-    fn last_displayed_pts(&self) -> Option<f64> {
+    /// 最後に native presenter が `present()` 成功させた video frame の PTS (秒)。
+    /// fast-swap で旧 source の最後の値が一時残るが、新 source の最初の present で
+    /// 上書きされる。`f64::NAN` のときは `None` (= まだ何も表示していない)。
+    /// `apply_normalize_gain_with_perf` などの perf event 出力時にも使う。
+    pub(crate) fn last_displayed_pts_secs(&self) -> Option<f64> {
         let pts = f64::from_bits(self.last_displayed_pts_bits.load(Ordering::Acquire));
         if pts.is_finite() {
             Some(pts.max(0.0))
         } else {
             None
         }
+    }
+
+    /// `presenter.present()` 成功直後に書かれた A/V drift (signed ms)。
+    /// `pts - clock.now_secs()` の値を `Source` 側で atomic に書く。
+    /// + 方向 = 映像が音声より進んでいる、− 方向 = 遅れている。
+    /// fast-swap でも同じ Arc を引き継ぐので overlay 表示が分断されない。
+    pub fn av_drift_ms(&self) -> f32 {
+        self.audio_diagnostics.load_av_drift_ms()
     }
 
     fn frame_step_target(&self) -> Option<f64> {
@@ -2770,12 +2923,23 @@ impl VideoPlayer {
 
     /// 音量ノーマライズの線形ゲインを設定 (内部で ±24dB にクランプ)。
     ///
-    /// 再生中の動画に適用するときは、呼び出した **直後** に `clear_audio_output_buffer()` を
-    /// 呼んで旧 gain で生成済みの processed buffer を破棄すること (set → clear の順)。
-    /// 順序を逆 (clear → set) にすると、clear と set の間に audio pump が回って
-    /// 旧 gain で processed が再生成される小窓ができ、短い音量ズレが発生する
-    /// (Codex P2 1周目の修正方針)。
-    /// 動画 open 直後で player がまだ再生開始していない場合は flush 不要。
+    /// 再生中の動画に呼んでも安全。新しい gain は次に `raw_pending` から `processed` へ
+    /// 進む chunk から適用される。既存 `processed` の最大 ~100ms 分は旧 gain で鳴り続けるが、
+    /// 100ms 程度の音量ズレは知覚しにくく、A/V offset は飛ばない。
+    ///
+    /// ## ⚠️ `clear_audio_output_buffer()` を呼ばないこと (= 2026-05-11 修正)
+    ///
+    /// 旧版の doc は「直後に clear」を推奨していたが、`clear_audio_output_buffer` は
+    /// `raw_pending` (= 通常 5 秒分の先読み audio frame) も捨ててしまう。Norm では
+    /// decoder flush しないため、捨てた直後に届く新しい audio frame の audible PTS が
+    /// master clock から **5 秒先行**し、`set_audio_pts` の wall-rate cap で追従できず、
+    /// **A/V offset = −5000ms 級の永続ズレ**が残った (= 1 回の Norm toggle で 5 秒、
+    /// 累積で 10 秒 / 15 秒 / 20 秒 と永続的にズレた)。
+    ///
+    /// 本 method 単独では `processed` / `raw_pending` のいずれも触らない atomic store
+    /// なので、上記問題は起きない。詳細は `docs/video-architecture.md` の
+    /// 「Norm clear で audio が 5+ 秒先行する」節と
+    /// `src/app/native_video.rs::apply_normalize_gain_with_perf` を参照。
     pub fn set_normalize_gain(&self, gain: f64) {
         self.clock.set_normalize_gain(gain);
     }
@@ -2886,6 +3050,7 @@ impl VideoPlayer {
             frame_step_active: Arc::clone(&self.frame_step_active),
             duration_secs_bits: Arc::clone(&self.duration_secs_bits),
             dynamic: Arc::clone(&self.dynamic),
+            audio_diagnostics: Arc::clone(&self.audio_diagnostics),
             source_epoch,
             show_preparing_overlay,
         }
@@ -3184,10 +3349,9 @@ impl VideoPlayer {
             // 切れる確率は許容範囲とする。
             const EOF_DRAIN_AUDIO_QUIET_TOL: f64 = 0.020;
             const EOF_DRAIN_QUIET_TICKS: u32 = 3;
-            let audio_drained =
-                self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
-                    && self.clock.audio_raw_pending_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
-                    && self.clock.audio_tx_queued_secs() < EOF_DRAIN_AUDIO_QUIET_TOL;
+            let audio_drained = self.clock.audio_processed_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
+                && self.clock.audio_raw_pending_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
+                && self.clock.audio_tx_queued_secs() < EOF_DRAIN_AUDIO_QUIET_TOL;
             let channels_drained = self.audio_rx_len() == 0 && self.video_rx_len() == 0;
             let quiet_now = self.clock.is_eof_reached()
                 && !self.clock.is_seeking()

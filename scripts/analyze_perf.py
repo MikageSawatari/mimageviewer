@@ -23,6 +23,9 @@ mimageviewer パフォーマンスイベントログ (perf_events.jsonl) の解�
     startup             起動時間のフェーズ別 breakdown (data_dir / models /
                         susie_worker / settings / icon / fonts / theme / app_default /
                         creator_enter/exit / first_frame) を表示
+    av_drift [--plot]   動画再生中の音声・映像同期 (A/V drift) と audio underrun /
+                        audio_pts_jump / Norm 操作 を時系列で集計する。
+                        --plot で matplotlib グラフを開く
 
 依存:
     標準ライブラリのみ必須。timeline は matplotlib、latency 詳細統計は任意で pandas。
@@ -591,6 +594,358 @@ def cmd_hitches(events: list[dict], threshold_ms: float) -> None:
 # spike-context -- native presenter spike の前後イベントを見る
 # -----------------------------------------------------------------------
 
+def _percentile(values: list[float], pct: float) -> float:
+    """単純な百分位 (リスト未ソート可、pct=50 なら中央値)。"""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    if len(s) == 1:
+        return s[0]
+    rank = (pct / 100.0) * (len(s) - 1)
+    lo = int(rank)
+    hi = min(lo + 1, len(s) - 1)
+    frac = rank - lo
+    return s[lo] * (1.0 - frac) + s[hi] * frac
+
+
+def cmd_av_drift(events: list[dict], plot: bool) -> None:
+    """A/V sync drift 解析。
+
+    対象イベント:
+      video.av_drift                  — drift サンプル (1Hz + edge)
+      video.norm_apply_begin/_end     — Norm 操作の前後 snapshot
+      audio_out.snapshot              — pump 1Hz: underrun_active / silence_ms_last_sec
+      audio_out.underrun_begin/_end   — silence 区間の begin/end edge
+      audio_out.audio_pts_jump        — 大ジャンプ (>5ms or cap 乖離)
+      audio_out.buffer_clear          — clear_audio_output_buffer (Norm/seek/etc)
+
+    判定基準は **時系列対応**を主とする:
+      norm_apply_begin → audio_out.buffer_clear → underrun_begin → underrun_end →
+      audio_out.audio_pts_jump がこの順で並ぶか確認する。
+    """
+    # drift sample: (t, drift_ms, av_offset_ms_or_None, audio_lead_ms, big_edge)
+    drifts: list[tuple[float, float, float | None, float, bool]] = []
+    snapshots: list[tuple[float, bool, float, float]] = []  # (t, underrun, silence_ms, processed)
+    underrun_begins: list[float] = []
+    underrun_ends: list[float] = []
+    pts_jumps: list[tuple[float, float, float]] = []  # (t, requested_delta_ms, applied_delta_ms)
+    buffer_clears: list[tuple[float, float, float, float]] = []  # (t, processed, raw, tx_queued)
+    norm_begins: list[tuple[float, str, float]] = []  # (t, reason, gain_db)
+    norm_ends: list[tuple[float, float]] = []  # (t, now)
+
+    # ログ schema 判定 (Codex P3 ① 反映): `av_offset_ms` キーが av_drift event に
+    # 一度も現れなければ legacy log (新メトリクス導入前のビルドで取得)。
+    # 新ログでは audio inactive 区間の av_offset_ms は明示的に `null` として出るので、
+    # キー存在の有無で legacy / 新を区別できる。
+    has_av_offset_field = False
+    has_audio_lead_field = False
+
+    for e in events:
+        t = e.get("t", 0.0)
+        cat = e.get("cat", "")
+        kind = e.get("kind", "")
+        if cat == "video" and kind == "av_drift":
+            if "av_offset_ms" in e:
+                has_av_offset_field = True
+            if "audio_lead_ms" in e:
+                has_audio_lead_field = True
+            offset_raw = e.get("av_offset_ms")
+            offset = (
+                float(offset_raw)
+                if isinstance(offset_raw, (int, float))
+                else None
+            )
+            drifts.append(
+                (
+                    t,
+                    float(e.get("drift_ms", 0.0)),
+                    offset,
+                    float(e.get("audio_lead_ms", 0.0)),
+                    bool(e.get("big_edge", False)),
+                )
+            )
+        elif cat == "video" and kind == "norm_apply_begin":
+            norm_begins.append(
+                (t, str(e.get("reason", "?")), float(e.get("gain_db", 0.0)))
+            )
+        elif cat == "video" and kind == "norm_apply_end":
+            norm_ends.append((t, float(e.get("now", 0.0))))
+        elif cat == "audio_out" and kind == "snapshot":
+            snapshots.append(
+                (
+                    t,
+                    bool(e.get("underrun_active", False)),
+                    float(e.get("silence_ms_last_sec", 0.0)),
+                    float(e.get("processed_secs", 0.0)),
+                )
+            )
+        elif cat == "audio_out" and kind == "underrun_begin":
+            underrun_begins.append(t)
+        elif cat == "audio_out" and kind == "underrun_end":
+            underrun_ends.append(t)
+        elif cat == "audio_out" and kind == "audio_pts_jump":
+            pts_jumps.append(
+                (
+                    t,
+                    float(e.get("requested_delta_ms", 0.0)),
+                    float(e.get("applied_delta_ms", 0.0)),
+                )
+            )
+        elif cat == "audio_out" and kind == "buffer_clear":
+            buffer_clears.append(
+                (
+                    t,
+                    float(e.get("processed_secs_before", 0.0)),
+                    float(e.get("raw_pending_secs_before", 0.0)),
+                    float(e.get("audio_tx_queued_before", 0.0)),
+                )
+            )
+
+    # ── テキスト統計 ──
+    legacy_log = (not has_av_offset_field) and (not has_audio_lead_field) and bool(drifts)
+    if drifts:
+        drift_values = [d[1] for d in drifts]
+        offset_values = [d[2] for d in drifts if d[2] is not None]
+        lead_values = [d[3] for d in drifts]
+
+        print("=== A/V 同期 統計 ===")
+        print(f"  サンプル数: {len(drifts)}")
+        print(f"  期間:       t={drifts[0][0]:.2f}s 〜 t={drifts[-1][0]:.2f}s")
+        if legacy_log:
+            print(
+                "  schema:     LEGACY (av_offset_ms / audio_lead_ms 未記録のビルドで取得)"
+            )
+            print(
+                "              -> A/V offset / audio lead は表示できない。代わりに"
+                " audio_pts_jump の `requested_delta_ms` を見ること"
+            )
+        print()
+
+        # PRIMARY: av_offset_ms = video_pts − audio_audible_pts (= 体感の音映像差)
+        # 注: legacy log では offset_values が空、audio_lead_ms が全て 0 になる。
+        if legacy_log:
+            print("  >>A/V offset / audio lead: 旧 schema のため未記録")
+        elif offset_values:
+            abs_off = [abs(v) for v in offset_values]
+            print("  >>A/V offset (= ユーザー体感の音映像差、video_pts − audio_audible_pts)")
+            print(
+                f"    範囲:  min={min(offset_values):+.1f}ms  max={max(offset_values):+.1f}ms"
+                f"  mean={sum(offset_values)/len(offset_values):+.1f}ms"
+            )
+            print(
+                f"    |off|: p50={_percentile(abs_off, 50):.1f}"
+                f"  p95={_percentile(abs_off, 95):.1f}"
+                f"  p99={_percentile(abs_off, 99):.1f}"
+                f"  max={max(abs_off):.1f}ms"
+            )
+            # 1 秒超のズレが続いている期間を検出 (= バグ濃厚)
+            long_desync = [(t, off) for t, _, off, _, _ in drifts if off is not None and abs(off) > 1000.0]
+            if long_desync:
+                print(
+                    f"    ! |offset| > 1000ms が {len(long_desync)} サンプル"
+                    f" (= 体感で明確にズレているはず)"
+                )
+                for t, off in long_desync[:5]:
+                    print(f"      t={t:>8.2f}s  offset={off:+8.1f}ms")
+                if len(long_desync) > 5:
+                    print(f"      ... (+{len(long_desync) - 5} 件省略)")
+        else:
+            print("  >>A/V offset: (audio inactive 区間のみ - 動画 only か音声起動失敗)")
+        print()
+
+        # SECONDARY: audio_lead_ms = audio_audible_pts − master_clock (= clock 乖離)
+        if not legacy_log:
+            abs_lead = [abs(v) for v in lead_values]
+            print("  >>audio lead (= audio が master clock から先行している量、post-apply)")
+            print(
+                f"    範囲:  min={min(lead_values):+.1f}ms  max={max(lead_values):+.1f}ms"
+                f"  mean={sum(lead_values)/len(lead_values):+.1f}ms"
+            )
+            print(
+                f"    |lead|: p50={_percentile(abs_lead, 50):.1f}"
+                f"  p95={_percentile(abs_lead, 95):.1f}"
+                f"  p99={_percentile(abs_lead, 99):.1f}"
+                f"  max={max(abs_lead):.1f}ms"
+            )
+            big_lead = [(t, l) for t, _, _, l, _ in drifts if abs(l) > 100.0]
+            if big_lead:
+                print(
+                    f"    ! |lead| > 100ms が {len(big_lead)} サンプル"
+                    f" (= clock が audio に追従できていない可能性)"
+                )
+            print()
+
+        # TERTIARY: video pacing health (av_drift_ms = video_pts − master_clock)
+        abs_drift = [abs(v) for v in drift_values]
+        print("  >>video pacing (= video_pts − master_clock、video が clock に追従しているか)")
+        print(
+            f"    |drift|: p50={_percentile(abs_drift, 50):.2f}"
+            f"  p95={_percentile(abs_drift, 95):.2f}"
+            f"  p99={_percentile(abs_drift, 99):.2f}"
+            f"  max={max(abs_drift):.2f}ms"
+        )
+        big_edges = [d for d in drifts if d[4]]
+        if big_edges:
+            print(f"    big_edge: {len(big_edges)} 件 (= 体感 |offset|>30ms にしきい値跨ぎ)")
+            for t, drift, off, lead, _ in big_edges[:10]:
+                off_str = f"{off:+.1f}" if off is not None else "n/a"
+                print(
+                    f"      t={t:>8.2f}s  offset={off_str}ms"
+                    f"  lead={lead:+.1f}ms  drift={drift:+.2f}ms"
+                )
+        print()
+    else:
+        print("(video.av_drift イベントなし — perf-log 取得時に動画再生していなかった可能性)")
+        print()
+
+    # ── underrun 区間 ──
+    if underrun_begins or underrun_ends:
+        print("=== underrun 区間 (audio_out.underrun_begin / underrun_end) ===")
+        # begin/end をペアリング (begin の後に最初に来る end を相方とする)
+        ends_iter = iter(sorted(underrun_ends))
+        next_end: float | None = next(ends_iter, None)
+        rows: list[tuple[float, float, float]] = []
+        for b in sorted(underrun_begins):
+            while next_end is not None and next_end < b:
+                next_end = next(ends_iter, None)
+            if next_end is None:
+                rows.append((b, float("nan"), float("nan")))
+            else:
+                duration_ms = (next_end - b) * 1000.0
+                rows.append((b, next_end, duration_ms))
+                next_end = next(ends_iter, None)
+        for begin, end, dur in rows[:20]:
+            if isinstance(end, float) and end != end:  # NaN check
+                print(f"  begin={begin:>8.2f}s  end=(none)")
+            else:
+                print(f"  begin={begin:>8.2f}s  end={end:>8.2f}s  duration={dur:>6.1f}ms")
+        if len(rows) > 20:
+            print(f"  ... (+{len(rows) - 20} 件省略)")
+        print()
+    else:
+        print("(audio_out.underrun_begin/end イベントなし — silence 区間検出なし)")
+        print()
+
+    # ── audio_pts_jump 一覧 ──
+    if pts_jumps:
+        print("=== audio_pts_jump (requested_delta vs applied_delta、cap 検出含む) ===")
+        for t, req, applied in pts_jumps[:20]:
+            cap_diverge = abs(req - applied) > 1.0
+            mark = "  [CAP]" if cap_diverge else ""
+            print(
+                f"  t={t:>8.2f}s  requested={req:+8.2f}ms  applied={applied:+8.2f}ms{mark}"
+            )
+        if len(pts_jumps) > 20:
+            print(f"  ... (+{len(pts_jumps) - 20} 件省略)")
+        print()
+    else:
+        print("(audio_out.audio_pts_jump イベントなし)")
+        print()
+
+    # ── buffer_clear 一覧 ──
+    if buffer_clears:
+        print("=== audio_out.buffer_clear ===")
+        for t, processed, raw, tx in buffer_clears[:20]:
+            print(
+                f"  t={t:>8.2f}s  processed={processed:>5.3f}s  raw_pending={raw:>5.3f}s"
+                f"  audio_tx_queued={tx:>5.3f}s"
+            )
+        if len(buffer_clears) > 20:
+            print(f"  ... (+{len(buffer_clears) - 20} 件省略)")
+        print()
+
+    # ── Norm 操作一覧 ──
+    if norm_begins or norm_ends:
+        print("=== Norm 操作 (video.norm_apply_begin / norm_apply_end) ===")
+        for t, reason, gain in norm_begins[:30]:
+            print(f"  begin t={t:>8.2f}s  reason={reason:>12}  gain_db={gain:+5.2f}")
+        if len(norm_begins) > 30:
+            print(f"  ... (+{len(norm_begins) - 30} 件省略)")
+        print()
+
+    # ── matplotlib プロット (オプション) ──
+    if not plot:
+        print("(--plot を付けると drift / underrun / norm を時系列グラフで表示)")
+        return
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib が未インストールです: pip install matplotlib", file=sys.stderr)
+        return
+
+    if not drifts:
+        print("(プロット対象なし)")
+        return
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    times = [d[0] for d in drifts]
+    drift_ms = [d[1] for d in drifts]
+    offset_ms = [d[2] if d[2] is not None else float("nan") for d in drifts]
+    lead_ms = [d[3] for d in drifts]
+    ax.plot(
+        times,
+        offset_ms,
+        color="tab:cyan",
+        linewidth=1.4,
+        label="A/V offset = video − audio (ms)",
+    )
+    ax.plot(
+        times,
+        lead_ms,
+        color="tab:orange",
+        linewidth=0.9,
+        alpha=0.7,
+        label="audio lead = audio − master_clock (ms)",
+    )
+    ax.plot(
+        times,
+        drift_ms,
+        color="tab:gray",
+        linewidth=0.6,
+        alpha=0.5,
+        label="video pacing = video − master_clock (ms)",
+    )
+    ax.axhline(0.0, color="gray", linestyle=":", linewidth=0.5)
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("ms (signed)")
+    ax.set_title("A/V sync over time (offset = perceived A/V mismatch)")
+
+    # underrun 区間を橙色背景で
+    ends_sorted = sorted(underrun_ends)
+    ends_iter = iter(ends_sorted)
+    next_end = next(ends_iter, None)
+    for b in sorted(underrun_begins):
+        while next_end is not None and next_end < b:
+            next_end = next(ends_iter, None)
+        end = next_end if next_end is not None else times[-1]
+        ax.axvspan(b, end, alpha=0.2, color="orange", label="_underrun")
+        if next_end is not None:
+            next_end = next(ends_iter, None)
+
+    # norm_apply_begin を縦線で
+    for t, reason, _ in norm_begins:
+        ax.axvline(t, color="tab:green", linestyle="--", linewidth=0.7, alpha=0.7)
+        ax.text(t, ax.get_ylim()[1] * 0.95, f"norm:{reason}", rotation=90, fontsize=7,
+                verticalalignment="top")
+
+    # audio_pts_jump をマーカーで
+    if pts_jumps:
+        ax.scatter(
+            [j[0] for j in pts_jumps],
+            [0.0] * len(pts_jumps),
+            marker="x",
+            color="tab:red",
+            s=40,
+            label="pts_jump",
+        )
+
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left")
+    plt.tight_layout()
+    plt.show()
+
+
 def _compact_event(e: dict) -> str:
     cat = e.get("cat", "?")
     kind = e.get("kind", "?")
@@ -706,6 +1061,12 @@ def main() -> None:
     subs.add_parser("startup")
     p_hit = subs.add_parser("hitches")
     p_hit.add_argument("--ms", type=float, default=33.0, help="ヒッチ閾値 (ms、既定 33.0)")
+    p_avd = subs.add_parser("av_drift")
+    p_avd.add_argument(
+        "--plot",
+        action="store_true",
+        help="matplotlib で時系列プロット (drift + underrun 帯 + norm 縦線 + pts_jump マーカー)",
+    )
     p_spike = subs.add_parser("spike-context")
     p_spike.add_argument("--metric", default="keyed_mutex_acquire_ms")
     p_spike.add_argument("--ms", type=float, default=16.0, help="spike 閾値 (ms、既定 16.0)")
@@ -740,6 +1101,8 @@ def main() -> None:
         cmd_startup(events)
     elif args.cmd == "hitches":
         cmd_hitches(events, args.ms)
+    elif args.cmd == "av_drift":
+        cmd_av_drift(events, args.plot)
     elif args.cmd == "spike-context":
         cmd_spike_context(events, args.metric, args.ms, args.window_ms, args.limit, args.all_events)
     elif args.cmd == "dump":

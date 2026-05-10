@@ -656,6 +656,208 @@ Phase 2 で `handle_native_video_output_event` (= 入力イベント反映)、Ph
   起きると `VideoPlayer.error` に日本語のエラー文言が入り、フルスクリーンに赤字で
   「動画を再生できません: ...」が表示される (= 旧 egui presenter フォールバックは無い)。
 
+## A/V drift 計装 (動画再生中の音声・映像同期デバッグ)
+
+### 用途
+
+「数分再生していると音声と映像がずれた気がする」「Norm ボタンを ON/OFF するとずれる」
+のような **再現困難・低頻度の同期バグ**を、後追いで定量的に確認できるようにする計装。
+
+通常の運用には影響しない (= perf-log 無効時はノーオーバーヘッド)。再現に遭遇したら
+`mimageviewer.exe --perf-log` で起動し直して操作を再演し、`%APPDATA%\mimageviewer\
+logs\perf_events.jsonl` を `python scripts/analyze_perf.py <path> av_drift [--plot]` で
+解析する。
+
+### 用語と単位
+
+- **PTS (Presentation Timestamp)**: 動画ファイルに焼き付けられた各 video frame /
+  audio frame の表示時刻 (秒、f64)。FFmpeg avformat が抽出する。
+- mIV は **音声マスタークロック方式** (mpv / ffplay と同じ)。音声 pump が物理出力した
+  サンプルの audible PTS を `AvClock::set_audio_pts` に渡し、video 側は `now_secs()` を
+  見て表示・スキップ・待機を決める。
+
+3 つの異なるメトリクスを区別する:
+
+| 指標 | 計算式 | 用途 | 通常値 |
+|---|---|---|---|
+| **A/V offset** | `video_displayed_pts − audio_audible_pts` | **ユーザー体感の音映像差** (主指標) | 約 0ms |
+| audio lead | `audio_audible_pts − master_clock.now_secs()` (post-apply residual) | `set_audio_pts` 適用後でも残っている clock 乖離 | 約 0ms |
+| video pacing (旧 av_drift) | `video_displayed_pts − master_clock.now_secs()` | video pacing 健全性 | 約 0ms |
+
+**audio lead** は **post-apply** で計測することに注意 (Codex 助言、2026-05-11)。
+`set_audio_pts` の **直前**で `requested − prev_now` を取ると wall extrapolation 分で
+通常時にも +10ms 程度の偽 lead が見える。**直後**に `requested − after_now` を取れば
+通常時 ≈ 0、Norm 経路バグで +5000ms 級だけが残る。`audio_pts_jump` event の
+`requested_delta_ms` / `applied_delta_ms` は cap 検出用なので別管理。
+
+**重要**: ユーザーが「音と映像がズレる」と訴えるのは A/V offset。video pacing だけ見ていると
+**Norm clear バグなど audio が clock から乖離するケース**を取り逃す。
+master_clock は wall-rate cap で audio に追従できないことがあり、その場合 video は
+clock に追従しているが (= pacing は 0)、audio は clock より数秒先行している (= lead が
++5000ms 級)、結果としてユーザーは「映像が音声より数秒遅れて見える」(= offset が
+−5000ms 級) と感じる。
+
+### audio buffer clear の atomic 整合性
+
+`AudioOutput::clear_buffer` は seek / Norm / fast-swap / shutdown で呼ばれる。
+clear 直後は **新しい audio frame が届くまで `audio_audible_pts` の旧値を残してはいけない**
+(さもないと次の present が旧 audio_pts と新 video_pts を比較して偽の巨大 offset を
+出す)。`AudioDiagnostics::clear_audio_position()` で
+`audio_audible_pts_valid=false` / `audio_audible_pts=NaN` / `av_offset_ms=NaN` /
+`audio_lead_ms=0` を atomic にリセットし、次の callback `set_audio_pts` 呼出で再開する。
+
+publish 順序 (Codex 助言): clear 系は **valid=false を先に**書き、`set_audio_pts`
+側は **bits 書き込み → valid=true** の順 (= load 側の `valid → bits` の逆順)。
+これで「valid=true で旧 bits」の torn read を防ぐ。
+
+### 既知の症状 (修正済): Norm clear で audio が 5+ 秒先行する
+
+**症状** (修正前、〜 2026-05-11):
+`clear_audio_output_buffer` ([src/video/audio.rs:55](src/video/audio.rs:55)) は
+seek 文脈で decoder が flush 直前という前提で書かれている。Norm 経路 ([src/app/
+native_video.rs](src/app/native_video.rs) の `apply_normalize_gain_with_perf` 経由) は
+seek_serial も engine flush も走らせないので、`raw_pending` (= 通常 5 秒分) を捨てた
+直後に新しい audio frame は 5 秒先 PTS で届き、`set_audio_pts` の wall-rate cap で
+master clock が追従できず、**A/V offset = −5000ms 級の永続ズレ**が残った。
+toggle を繰り返すと累積で −10s, −15s, −20s と進行 (Codex 確認、2026-05-10 perf-log)。
+
+**修正** (2026-05-11):
+[src/app/native_video.rs::apply_normalize_gain_with_perf](src/app/native_video.rs)
+から `clear_audio_output_buffer()` 呼出を削除。`set_normalize_gain` だけ呼んで
+buffer は触らない。Codex の A' 案 (`processed` も `raw_pending` も保持) を採用。
+
+採用理由:
+- `set_normalize_gain` は atomic store だけ。buffer に触らないので audible PTS は連続。
+- 既存 `processed` (~100ms 分) は旧 gain のまま鳴り続けるが、`raw_pending` 経由で
+  新 gain は次の chunk から自然に反映される。100ms 程度の音量ズレは知覚しにくい。
+- A/V offset は飛ばない。連続再生で永続ズレを起こさない。
+
+却下した代替案:
+- **B 案 (seek_serial bump で decoder flush)**: 1-2 秒の音飛びが発生してユーザー体感が
+  かえって悪化する。
+- **A 案 (`processed` だけ捨てる、`raw_pending` 保持)**: 即時反映と引き換えに 100ms
+  分の音切れが残る。A' (clear なし) で十分なので不採用。
+
+検証手順: `apply_normalize_gain_with_perf` 修正前後の `analyze_perf.py av_drift` の
+A/V offset を比較。修正前は累積 −20s 級、修正後は ±数十 ms に収まること。
+
+### 共有 atomic bundle: `AudioDiagnostics`
+
+`src/video/audio_diagnostics.rs` に `AudioDiagnostics` 構造体を置き、`VideoPlayer::open`
+で `Arc::new(AudioDiagnostics::new(Instant::now()))` を生成して以下に同じ Arc を clone
+配布する:
+
+- `audio::start(..., diagnostics.clone())` — cpal RT callback / audio pump の両方が touch
+- `NativeVideoOutput::spawn(..., diagnostics.clone())` → `SwitchSourcePayload` →
+  `PresenterSourceState` → `Source` (= per-source state) に通す。**fast-swap でも
+  同じ Arc が引き継がれる**。
+
+音声なし / cpal 起動失敗時は new() 直後の 0 値のまま動作 (= overlay / JSONL は分岐不要)。
+
+### RT-safe ポリシー
+
+⚠️ **cpal の `fill_output` callback は RT スレッド** (= JSON 構築 + writer mutex は xrun
+の元)。本計装は以下のルールを厳守する:
+
+- callback (`fill_output`) では **atomic 書き込みのみ**:
+  - underrun begin/end edge に応じて `audio_underrun_active` を切替、`audio_underrun_
+    begin/end_seq` を fetch_add
+  - silence 累積を `audio_silence_samples_total` に fetch_add
+  - 大ジャンプ (`AudioDiagnostics::should_record_pts_jump`) のときだけ
+    `audio_pts_jump_*` 系を store + `audio_pts_jump_seq` を fetch_add
+- JSONL emit は **audio pump スレッド**で 1Hz snapshot + edge poll する
+- `clear_buffer` の `audio_out.buffer_clear` event も **MutexGuard drop 後**に emit
+  (lock 中は値 copy のみ)
+
+### perf-log イベント一覧
+
+#### `cat = "video"`
+
+| kind | 説明 | 主な extras |
+|---|---|---|
+| `av_drift` | drift sample (1Hz + `\|offset\|>30ms` の edge、edge は 100ms rate limit) | `video_pts`, `now_secs`, `drift_ms` (= video pacing), `av_offset_ms` (= 体感ズレ、null の時は audio inactive), `audio_lead_ms`, `audio_active`, `big_edge` |
+| `norm_apply_begin` | Norm 操作 (toggle_on / toggle_off / scan_done) の前 snapshot | `fs_idx`, `gain_db`, `reason`, `now`, `video_pts` |
+| `norm_apply_end` | Norm 操作 (`set_normalize_gain` のみ、clear なし) 完了後の snapshot | `fs_idx`, `now` |
+
+#### `cat = "audio_out"`
+
+| kind | 発火元 | 説明 | 主な extras |
+|---|---|---|---|
+| `snapshot` | pump 1Hz | 直近 1 秒の underrun 状態 / silence ms / バッファ残量 | `underrun_active`, `silence_ms_last_sec`, `processed_secs`, `audio_tx_queued_secs` |
+| `underrun_begin` | pump (callback edge) | silence 出力開始 (active false → true) | `edge_wall_ns`, `edge_age_ms` |
+| `underrun_end` | pump (callback edge) | silence 出力終了 (active true → false) | `edge_wall_ns`, `edge_age_ms` |
+| `audio_pts_jump` | pump (callback edge) | `set_audio_pts` 大ジャンプ (\|requested\|>5ms or cap 乖離) | `requested_pts`, `prev_now`, `after_now`, `requested_delta_ms`, `applied_delta_ms`, `edge_wall_ns`, `edge_age_ms` |
+| `buffer_clear` | UI スレッド (`clear_audio_output_buffer`) | seek / fast-swap / shutdown 共通の汎用名。旧版では Norm でも発火していたが 2026-05-11 に削除 (= 5+ 秒 A/V offset バグの直接原因だったため) | `processed_secs_before`, `raw_pending_secs_before`, `audio_tx_queued_before`, `now_secs_at_clear` |
+
+### Norm ボタン関連の判定
+
+通常 seek と Norm toggle のオーディオパス比較 (= 2026-05-11 修正後):
+
+| 経路 | seek_serial bump | engine flush | clear_audio_output_buffer |
+|---|---|---|---|
+| 通常 seek | ✓ | ✓ (`handle_seek_request`) | ✓ |
+| Norm toggle | ✗ | ✗ | ✗ (= 2026-05-11 削除、上の「既知の症状 (修正済)」節参照) |
+
+Norm では `set_normalize_gain` の atomic store のみ行い、`processed` / `raw_pending` /
+`audio_tx_queued` のいずれも触らない。新 gain は `raw_pending` を経由した次の chunk
+から自然に適用される (= 既存 `processed` の最大 ~100ms は旧 gain で鳴り続けるが、
+A/V offset は連続性を保つ)。
+
+修正前の旧仕様 (= Norm でも `clear_audio_output_buffer` を呼んでいた頃) は、
+`raw_pending` 5 秒分を捨てて audio audible PTS が clock から 5 秒先行し、
+`analyze_perf.py av_drift` で `norm_apply_begin → buffer_clear → underrun_begin/end →
+audio_pts_jump` の連鎖と、累積的に成長する負値 `A/V offset` として観測されていた。
+
+### P キー perf overlay 拡張
+
+フルスクリーン再生中に P キーで開く既存の perf overlay (`src/video/native_presenter/
+overlay_draw.rs::draw_native_perf_overlay`) には:
+
+- ヘッダ 2 行目右端: `A/V {offset_ms}` (固定幅 monospace、桁ぶれなし。色: |offset|<5
+  緑 / <20 黄 / >=20 赤)。audio inactive 時は `vid {drift_ms}` (= 旧 av_drift にフォールバック)
+- ヘッダ 2 行目: `lead {audio_lead_ms}` (audio が master clock から先行している量、
+  通常グレー、|lead|>=50ms で橙)
+- ヘッダ 2 行目: `audio_underrun_active == true` のとき赤 `UNDERRUN` (絵文字は使わない、
+  CLAUDE.md「UI 文字列の Unicode グリフ選定ルール」遵守)
+- グラフ rect 内: A/V offset をシアン (alpha=200)、Y 軸スケール ±200ms 中心、0ms
+  ラインを点線で描画。Norm clear バグ時の `-5000ms` 級 (= 映像が音声より秒オーダーで
+  遅れる方向、`offset = video − audio` で負値) は下端で saturate して「異常」のサインとして
+  読める。逆向き (= 映像が音声より進む `+` 方向) も同じく上端 saturate
+- グラフ rect 内: underrun 区間に橙背景帯 (= 既存の frame_gap 赤縦線と同じ流儀)
+
+### 検証手順 (修正後の正常動作確認)
+
+1. `cargo build --release` → `target/release/mimageviewer.exe --perf-log` で起動
+2. 動画フォルダで動画をフルスクリーン再生 → P キーで perf overlay
+3. **シナリオ A (連続再生 5 分)**: A/V シアン線が 0ms 中心で安定、underrun 帯なし、
+   ヘッダ "A/V" が緑のままなら正常
+4. **シナリオ B (Norm 操作 5 回 ON/OFF)** — 修正後の期待動作:
+   - A/V offset がほぼ動かない (= ±数十 ms に収まる、±5000ms 級にならない)
+   - audio lead もほぼ動かない (= 0 近辺、+5000ms 級にならない)
+   - **`audio_out.buffer_clear` event が出ない** (= Norm では呼ばなくなったため。
+     出ているなら別経路 (seek / shutdown / fast-swap) からの clear で、Norm 起源ではない)
+   - **`audio_pts_jump` event が大量に出ない** (= 5000ms 級の requested_delta が
+     連続で出ているなら修正前の挙動。修正後は出ないはず)
+   - underrun 帯 (橙) は短時間 (~10ms 単位) なら無害、それ以上連続するなら別問題
+5. `python scripts/analyze_perf.py %APPDATA%/mimageviewer/logs/perf_events.jsonl
+   av_drift [--plot]` で:
+   - 主判定: **A/V offset の `|max|` が 100ms 未満であること**
+   - `audio_pts_jump` の件数が低い (= 通常時の wall-rate cap 起因の小さい jump のみ。
+     5000ms 級の requested_delta が出ていなければ OK)
+   - `Norm 操作` 一覧と `audio_out.buffer_clear` 一覧を見比べて、Norm 直後に
+     buffer_clear がペアになっていないことを確認
+
+### 検証手順 (修正前の症状を再現する場合)
+
+過去の perf-log と比較するときは、修正前の旧ビルドで Norm を toggle した時の動作
+は以下の通り (= 2026-05-10 のログで観測した症状):
+
+- A/V offset が toggle 毎に約 −5000ms ずつ累積 (= 最終的に −20000ms 級)
+- audio_pts_jump が `requested_delta=+5128ms applied=+0.2ms [CAP]` を毎 callback で
+  emit (= 1 秒間に数十〜100 件)
+- `norm_apply_begin → buffer_clear → underrun_begin/end → audio_pts_jump` が時系列で連鎖
+- video pacing (= 旧 `av_drift`) は 0 近辺で変化なし (= バグ検出ができない指標だった)
+
 ---
 
 ## 抽象化の現状と既知の負債

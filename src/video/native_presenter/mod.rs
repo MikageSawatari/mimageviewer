@@ -258,6 +258,19 @@ pub struct NativeOverlayPerfSnapshot {
     pub max_late_ms: f64,
     pub max_total_ms: f64,
     pub max_interval_ms: f64,
+    /// **video pacing health 指標** (= video_pts − master_clock、ms 単位、符号付き)。
+    /// 通常 ≈ 0。これだけでは Norm 経路バグなど audio が clock から乖離した場合の
+    /// 体感ズレを検出できないので、ユーザー表示は `av_offset_ms` を主にする。
+    pub av_drift_ms: f32,
+    /// **ユーザー体感の音映像差** (= video_pts − audio_audible_pts、ms、符号付き)。
+    /// + = 映像が音声より進んでいる、− = 映像が音声より遅れている。
+    /// audio inactive (動画 only / 音声起動失敗) 時は `f32::NAN`。
+    pub av_offset_ms: f32,
+    /// audio が master clock より何 ms 先行しているか (callback 直近値)。
+    /// 通常 ≈ 0、Norm clear 後の big jump 直後は 5000+ ms に張り付くことがある。
+    pub audio_lead_ms: f32,
+    /// callback で silence を出力中か (= cpal underrun 中)。pump 復活で false に戻る。
+    pub audio_underrun_active: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -276,6 +289,16 @@ pub struct NativeOverlayPerfSample {
     /// この sample が記録された時点の再生速度倍率 (= 0.25..=4.0)。
     /// 0.5x なら実 frame interval は `source_delta_ms / 0.5 = 2 * source_delta_ms`。
     pub playback_speed: f32,
+    /// 本 sample 取得時点の video pacing drift (signed ms、video_pts − master_clock)。
+    pub av_drift_ms: f32,
+    /// 本 sample 取得時点の **体感音映像差** (signed ms、video_pts − audio_audible_pts)。
+    /// audio inactive 時は `f32::NAN`。グラフのサブトラック描画はこちらを優先。
+    pub av_offset_ms: f32,
+    /// 本 sample 取得時点で audio が master clock から先行している量 (ms)。
+    /// 通常 ≈ 0、Norm clear 直後は >>0 に張り付く。
+    pub audio_lead_ms: f32,
+    /// 本 sample 取得時点で audio underrun 中だったか (橙背景帯の描画用)。
+    pub audio_underrun_active: bool,
 }
 
 #[derive(Clone, Debug)]

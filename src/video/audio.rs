@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{Receiver, Sender, bounded};
 
+use super::audio_diagnostics::AudioDiagnostics;
 use super::audio_stretch::TimeStretcher;
 use super::clock::{AvClock, SEEK_TARGET_TOLERANCE_SECS};
 use super::decoder::AudioFrame;
@@ -43,6 +44,9 @@ pub struct AudioOutput {
     /// pump スレッドハンドル。drop で join する。
     pump: Option<std::thread::JoinHandle<()>>,
     pub sample_rate: u32,
+    /// A/V sync drift 計装用 atomic bundle。`clear_buffer` で `audio_out.buffer_clear` を
+    /// emit するために保持する (callback / pump へは spawn 時に Arc clone を渡す)。
+    diagnostics: Arc<AudioDiagnostics>,
 }
 
 impl AudioOutput {
@@ -53,14 +57,62 @@ impl AudioOutput {
     }
 
     pub fn clear_buffer(&self, clock: &AvClock) {
+        // ⚠️ Codex 4 巡目 P1 ① 反映: clear と zero の **前** にすべての snapshot 値を
+        // copy-out する。`audio_tx_queued_before` を `clock.zero_audio_tx_queued_secs()`
+        // の後に読むと必ず 0 になってしまう (= 初回擬似コードのバグ)。同様に
+        // `now_secs_at_clear` も `next_pts_secs = clock.now_secs()` 代入時の値を使いたい
+        // ので、lock の中で 1 回だけ読んでおく。
+        //
+        // ⚠️ Codex 3 巡目 P1 ③ 反映: lock 中は値 copy のみ、`perf::event` は MutexGuard
+        // drop 後に呼ぶ (= cpal callback ブロック防止)。
+        let mut snapshot_for_log: Option<(f64, f64, f64, f64)> = None;
         if let Ok(mut buf) = self.buffer.lock() {
+            if crate::perf::is_enabled() {
+                let processed_secs: f64 =
+                    buf.processed.iter().map(|c| c.duration_secs).sum::<f64>()
+                        + remaining_first_chunk_secs(&buf);
+                let raw_pending_secs: f64 =
+                    buf.raw_pending.iter().map(|f| f.duration_secs).sum::<f64>();
+                let audio_tx_queued_before = clock.audio_tx_queued_secs();
+                let now_secs_at_clear = clock.now_secs();
+                snapshot_for_log = Some((
+                    processed_secs,
+                    raw_pending_secs,
+                    audio_tx_queued_before,
+                    now_secs_at_clear,
+                ));
+            }
             buf.processed.clear();
             buf.raw_pending.clear();
             buf.drain_offset_in_first = 0;
             buf.next_pts_secs = clock.now_secs();
             publish_buffer_secs(&buf, clock);
         }
+        // ← MutexGuard drop
         clock.zero_audio_tx_queued_secs();
+        // Codex P2 ① 反映: clear で audio buffer が空になった瞬間、`audio_audible_pts` の
+        // 旧値を残したままにしない。次の present で旧 audio_pts と新 video_pts を比較して
+        // 偽の巨大 av_offset が出るのを防ぐ。
+        // 次の audio callback が `set_audio_pts` を呼ぶまでは av_offset は NaN
+        // (= overlay は audio inactive として表示、analyzer も Skip する)。
+        self.diagnostics.clear_audio_position();
+        if let Some((processed, raw_pending, tx_queued, now_at_clear)) = snapshot_for_log {
+            crate::perf::event(
+                "audio_out",
+                "buffer_clear",
+                None,
+                0,
+                &[
+                    ("processed_secs_before", serde_json::Value::from(processed)),
+                    (
+                        "raw_pending_secs_before",
+                        serde_json::Value::from(raw_pending),
+                    ),
+                    ("audio_tx_queued_before", serde_json::Value::from(tx_queued)),
+                    ("now_secs_at_clear", serde_json::Value::from(now_at_clear)),
+                ],
+            );
+        }
     }
 }
 
@@ -385,6 +437,7 @@ pub fn start(
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
     engine_state: Arc<AtomicU8>,
+    diagnostics: Arc<AudioDiagnostics>,
     #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
 ) -> Result<AudioOutput, String> {
     let host = cpal::default_host();
@@ -426,6 +479,7 @@ pub fn start(
     let pump_clock = clock.clone();
     let pump_engine_event_tx = engine_event_tx.clone();
     let pump_engine_state = engine_state.clone();
+    let pump_diagnostics = Arc::clone(&diagnostics);
     #[cfg(windows)]
     let pump_dsp_bridge = dsp_bridge;
     let pump_handle = std::thread::Builder::new()
@@ -439,6 +493,7 @@ pub fn start(
                 pump_clock,
                 pump_engine_event_tx,
                 pump_engine_state,
+                pump_diagnostics,
                 #[cfg(windows)]
                 pump_dsp_bridge,
             );
@@ -449,11 +504,18 @@ pub fn start(
     let cb_buffer = buffer.clone();
     let cb_clock = clock.clone();
     let cb_engine_state = engine_state.clone();
+    let cb_diagnostics = Arc::clone(&diagnostics);
     let stream = device
         .build_output_stream(
             &config,
             move |out: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                fill_output(out, &cb_buffer, &cb_clock, &cb_engine_state);
+                fill_output(
+                    out,
+                    &cb_buffer,
+                    &cb_clock,
+                    &cb_engine_state,
+                    &cb_diagnostics,
+                );
             },
             |err| crate::logger::log(format!("cpal output stream error: {err}")),
             None,
@@ -469,6 +531,7 @@ pub fn start(
         shutdown_tx,
         pump: Some(pump_handle),
         sample_rate,
+        diagnostics,
     })
 }
 
@@ -557,6 +620,7 @@ fn run_pump(
     clock: Arc<AvClock>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
     engine_state: Arc<AtomicU8>,
+    diagnostics: Arc<AudioDiagnostics>,
     #[cfg(windows)] dsp_bridge: Option<std::sync::Arc<crate::video::dsp::DspBridge>>,
 ) {
     let _ = engine_state; // 現状は logging 等で使う想定、API 互換のため受け取る
@@ -631,6 +695,15 @@ fn run_pump(
     let mut last_warning_at: Option<std::time::Instant> = None;
     let mut last_stale_drain_log_serial: Option<u64> = None;
     let mut deferred_frame: Option<AudioFrame> = None;
+
+    // ── A/V drift 計装: pump スレッド側の 1Hz snapshot + edge poll ──
+    // RT callback (`fill_output`) は atomic 書き込みのみ。実際の `perf::event` は
+    // ここから 1Hz / edge で emit する (Codex 3 巡目 P1 ① 反映、xrun 防止)。
+    let mut last_diag_log_at = std::time::Instant::now();
+    let mut last_silence_total_logged: u64 = 0;
+    let mut last_seen_underrun_begin_seq: u64 = 0;
+    let mut last_seen_underrun_end_seq: u64 = 0;
+    let mut last_seen_pts_jump_seq: u64 = 0;
 
     while !cancel.load(Ordering::Acquire) {
         // ── frame 受信 (timeout 付き、Codex 助言): audio_rx 到着を待たず自律 refill ──
@@ -1084,6 +1157,128 @@ fn run_pump(
                 },
             ));
         }
+
+        // ── A/V drift instrumentation: 1Hz snapshot + edge JSONL emit (Codex P1 ① 反映) ──
+        // RT callback は atomic を書くだけ。実際の `perf::event` (= JSON 構築 + writer
+        // mutex) は pump スレッドのここでまとめる。callback への影響ゼロ。
+        if crate::perf::is_enabled() {
+            let log_now = std::time::Instant::now();
+
+            // (1) 1Hz snapshot: underrun 状態 / 直近 1 秒の silence ms / バッファ残量
+            if log_now.duration_since(last_diag_log_at) >= std::time::Duration::from_secs(1) {
+                let cur_underrun = diagnostics.audio_underrun_active.load(Ordering::Acquire);
+                let silence_total = diagnostics
+                    .audio_silence_samples_total
+                    .load(Ordering::Acquire);
+                let silence_delta_samples = silence_total.saturating_sub(last_silence_total_logged);
+                last_silence_total_logged = silence_total;
+                let silence_delta_ms = (silence_delta_samples as f64 / samples_per_sec) * 1000.0;
+                crate::perf::event(
+                    "audio_out",
+                    "snapshot",
+                    None,
+                    0,
+                    &[
+                        ("underrun_active", serde_json::Value::from(cur_underrun)),
+                        (
+                            "silence_ms_last_sec",
+                            serde_json::Value::from(silence_delta_ms),
+                        ),
+                        ("processed_secs", serde_json::Value::from(processed_secs)),
+                        (
+                            "audio_tx_queued_secs",
+                            serde_json::Value::from(clock.audio_tx_queued_secs()),
+                        ),
+                    ],
+                );
+                last_diag_log_at = log_now;
+            }
+
+            // (2) underrun begin/end edge: callback 側が seq を bump しているので
+            //     その変化を poll して即時 emit (50-200ms 解像度で取りたい)。
+            let cur_begin_seq = diagnostics.audio_underrun_begin_seq.load(Ordering::Acquire);
+            if cur_begin_seq != last_seen_underrun_begin_seq {
+                last_seen_underrun_begin_seq = cur_begin_seq;
+                let wall_ns = diagnostics
+                    .audio_underrun_begin_wall_ns
+                    .load(Ordering::Acquire);
+                let edge_age_ms =
+                    ((diagnostics.wall_ns_now().saturating_sub(wall_ns)) as f64) / 1.0e6;
+                crate::perf::event(
+                    "audio_out",
+                    "underrun_begin",
+                    None,
+                    0,
+                    &[
+                        ("edge_wall_ns", serde_json::Value::from(wall_ns as i64)),
+                        ("edge_age_ms", serde_json::Value::from(edge_age_ms)),
+                    ],
+                );
+            }
+            let cur_end_seq = diagnostics.audio_underrun_end_seq.load(Ordering::Acquire);
+            if cur_end_seq != last_seen_underrun_end_seq {
+                last_seen_underrun_end_seq = cur_end_seq;
+                let wall_ns = diagnostics
+                    .audio_underrun_end_wall_ns
+                    .load(Ordering::Acquire);
+                let edge_age_ms =
+                    ((diagnostics.wall_ns_now().saturating_sub(wall_ns)) as f64) / 1.0e6;
+                crate::perf::event(
+                    "audio_out",
+                    "underrun_end",
+                    None,
+                    0,
+                    &[
+                        ("edge_wall_ns", serde_json::Value::from(wall_ns as i64)),
+                        ("edge_age_ms", serde_json::Value::from(edge_age_ms)),
+                    ],
+                );
+            }
+
+            // (3) audio_pts_jump: callback 側で閾値判定済みのものだけ seq が上がる。
+            let cur_jump_seq = diagnostics.audio_pts_jump_seq.load(Ordering::Acquire);
+            if cur_jump_seq != last_seen_pts_jump_seq {
+                last_seen_pts_jump_seq = cur_jump_seq;
+                let req = f64::from_bits(
+                    diagnostics
+                        .audio_pts_jump_requested_bits
+                        .load(Ordering::Acquire),
+                );
+                let prev = f64::from_bits(
+                    diagnostics
+                        .audio_pts_jump_prev_now_bits
+                        .load(Ordering::Acquire),
+                );
+                let after = f64::from_bits(
+                    diagnostics
+                        .audio_pts_jump_after_now_bits
+                        .load(Ordering::Acquire),
+                );
+                let wall_ns = diagnostics.audio_pts_jump_wall_ns.load(Ordering::Acquire);
+                let req_delta_ms = (req - prev) * 1000.0;
+                let applied_delta_ms = (after - prev) * 1000.0;
+                let edge_age_ms =
+                    ((diagnostics.wall_ns_now().saturating_sub(wall_ns)) as f64) / 1.0e6;
+                crate::perf::event(
+                    "audio_out",
+                    "audio_pts_jump",
+                    None,
+                    0,
+                    &[
+                        ("requested_pts", serde_json::Value::from(req)),
+                        ("prev_now", serde_json::Value::from(prev)),
+                        ("after_now", serde_json::Value::from(after)),
+                        ("requested_delta_ms", serde_json::Value::from(req_delta_ms)),
+                        (
+                            "applied_delta_ms",
+                            serde_json::Value::from(applied_delta_ms),
+                        ),
+                        ("edge_wall_ns", serde_json::Value::from(wall_ns as i64)),
+                        ("edge_age_ms", serde_json::Value::from(edge_age_ms)),
+                    ],
+                );
+            }
+        }
     }
     // ── 終了時の silence flush (= 既存) ──
     #[cfg(windows)]
@@ -1162,11 +1357,58 @@ fn remaining_first_chunk_secs(buf: &AudioBuffer) -> f64 {
     }
 }
 
+/// PLAYING drain path 出口で呼ぶ silence/underrun 集計ヘルパー (RT-safe)。
+///
+/// ## 適用範囲 (Codex 5 巡目 P2 ②)
+/// **PLAYING かつ `clock.is_playing()` 通過後の drain path** の出口だけで呼ぶ。
+/// `fill_output` 内の他の silence return 経路 (= stale clear / 非 PLAYING /
+/// pause の意図 silence) は **underrun ではない**ので finalize は通さない。
+/// さもないと意図無音を underrun と誤計測する。
+///
+/// ## 単位
+/// `want` / `written` は **stereo interleaved の f32 sample 数** (= `want = 2 * frames`)。
+/// silence ms は `want / samples_per_sec * 1000.0` (`samples_per_sec = sample_rate * 2.0`)。
+/// JSONL emit は pump スレッドが atomic を読んで行う (callback では何も emit しない)。
+pub(crate) fn finalize_fill_output(diagnostics: &AudioDiagnostics, want: usize, written: usize) {
+    let silence_samples = want.saturating_sub(written);
+    if silence_samples > 0 {
+        diagnostics
+            .audio_silence_samples_total
+            .fetch_add(silence_samples as u64, Ordering::Release);
+        let was = diagnostics
+            .audio_underrun_active
+            .swap(true, Ordering::AcqRel);
+        if !was {
+            // begin edge — begin 専用 atomic 群を更新
+            diagnostics
+                .audio_underrun_begin_wall_ns
+                .store(diagnostics.wall_ns_now(), Ordering::Release);
+            diagnostics
+                .audio_underrun_begin_seq
+                .fetch_add(1, Ordering::Release);
+        }
+    } else {
+        let was = diagnostics
+            .audio_underrun_active
+            .swap(false, Ordering::AcqRel);
+        if was {
+            // end edge — end 専用 atomic 群を更新
+            diagnostics
+                .audio_underrun_end_wall_ns
+                .store(diagnostics.wall_ns_now(), Ordering::Release);
+            diagnostics
+                .audio_underrun_end_seq
+                .fetch_add(1, Ordering::Release);
+        }
+    }
+}
+
 fn fill_output(
     out: &mut [f32],
     buffer: &Arc<Mutex<AudioBuffer>>,
     clock: &Arc<AvClock>,
     engine_state: &Arc<AtomicU8>,
+    diagnostics: &Arc<AudioDiagnostics>,
 ) {
     // ── pre-seek discard (= state gate より先、Codex P1-4) ──
     let clock_serial = clock.current_seek_serial();
@@ -1298,6 +1540,8 @@ fn fill_output(
     // ── bookkeeping ──
     if real_consumed == 0 {
         publish_buffer_secs(&buf, clock);
+        // PLAYING drain path の full underrun 出口。silence_samples = want。
+        finalize_fill_output(diagnostics, want, written);
         return;
     }
 
@@ -1333,16 +1577,74 @@ fn fill_output(
     drop(buf);
 
     if pump_serial >= clock.current_seek_serial() {
+        // ── audio_pts_jump 計装 (Codex 5 巡目 P2 ① 反映、上書き対策) ──
+        // requested vs applied を計測して、wall-rate cap や monotonic guard が
+        // 効いた場合の差分を検出する。**大ジャンプ専用 atomic** に書くのは
+        // `should_record_pts_jump` 閾値判定で true のときだけ (= 通常の小さい更新は
+        // pump が読む前に上書きされない)。
+        let prev_now = clock.now_secs();
+        let requested = pts_for_video;
         if latency_jumped {
             clock.set_audio_pts_jump(pts_for_video);
         } else {
             clock.set_audio_pts(pts_for_video);
         }
-        let now = clock.now_secs();
-        if (pts_for_video - now).abs() <= SEEK_TARGET_TOLERANCE_SECS {
+        let after_now = clock.now_secs();
+        let req_delta_ms = (requested - prev_now) * 1000.0;
+        let applied_delta_ms = (after_now - prev_now) * 1000.0;
+
+        // ── 体感ズレ検出用の連続メトリクス ──
+        // Norm 経路で `clear_audio_output_buffer` が `raw_pending` 5 秒分を捨てた後、
+        // 新しく届く audio frame の audible PTS は前回 clock より +5s 先になる。
+        // 一方 wall-rate cap で master clock は 1.02x rate でしか追いつけないため、
+        // この差は数分間そのまま残る。`av_drift_ms` (= video − master_clock) は両方が
+        // 連動して進むので 0 近辺に張り付き、ユーザー体感の音映像差を捉えられない。
+        // ここで `audio_audible_pts` と `audio_lead_ms` を毎 callback 更新することで
+        // overlay と analyze_perf 側がこの状況を即座に把握できるようにする。
+        //
+        // Codex P2 ② 反映: `audio_lead_ms` は **post-apply residual** にする。
+        //   旧版: `req_delta = requested − prev_now` (= 補正要求量)
+        //   新版: `lead = requested − after_now` (= 補正後でも残っている乖離)
+        // 旧版だと wall extrapolation 分で通常時にも +10ms 程度の偽 lead が見えた。
+        // 新版は通常時 ≈ 0、Norm 経路バグ時のみ +5000ms 級が表示される。
+        let post_apply_lead_ms = (requested - after_now) * 1000.0;
+        diagnostics
+            .audio_audible_pts_bits
+            .store(requested.to_bits(), Ordering::Release);
+        // bits 書き込み → valid=true の順 (= load 側は valid → bits の逆順で読むので、
+        // この順だと「valid=true で旧 bits」の中間状態が見えない)
+        diagnostics
+            .audio_audible_pts_valid
+            .store(true, Ordering::Release);
+        diagnostics
+            .audio_lead_ms_bits
+            .store(post_apply_lead_ms.to_bits(), Ordering::Release);
+
+        if AudioDiagnostics::should_record_pts_jump(req_delta_ms, applied_delta_ms) {
+            diagnostics
+                .audio_pts_jump_requested_bits
+                .store(requested.to_bits(), Ordering::Release);
+            diagnostics
+                .audio_pts_jump_prev_now_bits
+                .store(prev_now.to_bits(), Ordering::Release);
+            diagnostics
+                .audio_pts_jump_after_now_bits
+                .store(after_now.to_bits(), Ordering::Release);
+            diagnostics
+                .audio_pts_jump_wall_ns
+                .store(diagnostics.wall_ns_now(), Ordering::Release);
+            diagnostics
+                .audio_pts_jump_seq
+                .fetch_add(1, Ordering::Release);
+        }
+        if (pts_for_video - after_now).abs() <= SEEK_TARGET_TOLERANCE_SECS {
             clock.clear_seek_target_override(pump_serial);
         }
     }
+
+    // PLAYING drain path の正常終了出口。silence_samples = want - written
+    // (= 0 なら recovery edge、>0 なら partial underrun)。
+    finalize_fill_output(diagnostics, want, written);
 }
 
 #[cfg(test)]
@@ -1383,6 +1685,11 @@ mod tests {
     /// PLAYING engine state を test 用に作る。
     fn playing_state() -> Arc<AtomicU8> {
         Arc::new(AtomicU8::new(state_code::PLAYING))
+    }
+
+    /// テスト用 AudioDiagnostics (= atomic 全 0、started_at = now)。
+    fn make_diag() -> Arc<AudioDiagnostics> {
+        Arc::new(AudioDiagnostics::new(std::time::Instant::now()))
     }
 
     /// テスト用の processed chunk を作る。
@@ -1552,7 +1859,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [1.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         assert_eq!(
@@ -1580,7 +1887,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         let expected_advance = 100.0 / (48_000.0 * 2.0);
@@ -1611,7 +1918,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
 
         let pts_after = buf.lock().unwrap().next_pts_secs;
         let expected_advance = 480.0 / (48_000.0 * 2.0);
@@ -1643,7 +1950,7 @@ mod tests {
 
         let buffering_state = Arc::new(AtomicU8::new(state_code::BUFFERING));
         let mut out = [1.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &buffering_state);
+        fill_output(&mut out, &buf, &clock, &buffering_state, &make_diag());
 
         let len_after: usize = buf
             .lock()
@@ -1675,7 +1982,7 @@ mod tests {
         let pts_before = buf.lock().unwrap().next_pts_secs;
 
         let mut out = [1.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &state);
+        fill_output(&mut out, &buf, &clock, &state, &make_diag());
         assert!(
             out.iter().all(|&s| s == 0.0),
             "Paused: output must be silence"
@@ -1692,7 +1999,7 @@ mod tests {
         );
 
         state.store(state_code::PLAYING, Ordering::Release);
-        fill_output(&mut out, &buf, &clock, &state);
+        fill_output(&mut out, &buf, &clock, &state, &make_diag());
         assert!(
             out.iter().all(|&s| (s - 0.3).abs() < 1e-6),
             "Playing: buffered samples should be drained with volume applied"
@@ -1827,7 +2134,7 @@ mod tests {
         }
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
 
         // drain 後、buf.next_pts_secs が audible_pts ベースで更新されている
         let expected_audible_after = target_audible + 480.0 / samples_per_sec;
@@ -1862,7 +2169,7 @@ mod tests {
         }
 
         let mut out = [0.0_f32; 480];
-        fill_output(&mut out, &buf, &clock, &playing_state());
+        fill_output(&mut out, &buf, &clock, &playing_state(), &make_diag());
 
         // 最初 240 samples: 0.5 * 0.6 = 0.3
         for &v in out.iter().take(240) {
@@ -1874,5 +2181,120 @@ mod tests {
         }
         // 両 chunk drain 済み
         assert_eq!(buf.lock().unwrap().processed.len(), 0);
+    }
+
+    // ── finalize_fill_output: PLAYING drain path 出口の silence/underrun 集計 ──
+    // (Codex 5 巡目 P3 ③ 反映)。
+    // - want / written は **stereo interleaved sample 数**。silence_samples = want - written。
+    // - silence_samples > 0 → underrun begin edge (false → true) で begin_seq +1。
+    // - silence_samples == 0 → underrun end edge (true → false) で end_seq +1。
+    // - 連続呼び出しで edge にならない場合 (= 同じ状態のまま) は seq を上げない。
+
+    #[test]
+    fn finalize_fill_output_full_underrun_writes_silence_total_and_begin_edge() {
+        let diag = make_diag();
+        // 初期: active=false, totals=0
+        assert!(!diag.audio_underrun_active.load(Ordering::Acquire));
+        assert_eq!(diag.audio_silence_samples_total.load(Ordering::Acquire), 0);
+
+        // want=1024, written=0 → silence_samples=1024 (full underrun)
+        finalize_fill_output(&diag, 1024, 0);
+
+        assert!(diag.audio_underrun_active.load(Ordering::Acquire));
+        assert_eq!(
+            diag.audio_silence_samples_total.load(Ordering::Acquire),
+            1024
+        );
+        assert_eq!(diag.audio_underrun_begin_seq.load(Ordering::Acquire), 1);
+        assert_eq!(diag.audio_underrun_end_seq.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn finalize_fill_output_partial_underrun_increments_silence() {
+        let diag = make_diag();
+
+        // want=1024, written=512 → silence_samples=512 (partial underrun)
+        finalize_fill_output(&diag, 1024, 512);
+
+        assert!(diag.audio_underrun_active.load(Ordering::Acquire));
+        assert_eq!(
+            diag.audio_silence_samples_total.load(Ordering::Acquire),
+            512
+        );
+        assert_eq!(diag.audio_underrun_begin_seq.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn finalize_fill_output_recovery_emits_end_edge() {
+        let diag = make_diag();
+
+        // 1) full underrun → begin edge
+        finalize_fill_output(&diag, 1024, 0);
+        assert!(diag.audio_underrun_active.load(Ordering::Acquire));
+        assert_eq!(diag.audio_underrun_begin_seq.load(Ordering::Acquire), 1);
+
+        // 2) full drain → end edge
+        finalize_fill_output(&diag, 1024, 1024);
+        assert!(!diag.audio_underrun_active.load(Ordering::Acquire));
+        assert_eq!(diag.audio_underrun_end_seq.load(Ordering::Acquire), 1);
+        // silence_samples_total は変わらない (= 1 回目の 1024 のまま)
+        assert_eq!(
+            diag.audio_silence_samples_total.load(Ordering::Acquire),
+            1024
+        );
+    }
+
+    #[test]
+    fn finalize_fill_output_no_edge_when_state_unchanged() {
+        let diag = make_diag();
+
+        // 連続 full drain (= 通常運転)
+        finalize_fill_output(&diag, 1024, 1024);
+        finalize_fill_output(&diag, 1024, 1024);
+        finalize_fill_output(&diag, 1024, 1024);
+        // begin/end 共に変化なし
+        assert_eq!(diag.audio_underrun_begin_seq.load(Ordering::Acquire), 0);
+        assert_eq!(diag.audio_underrun_end_seq.load(Ordering::Acquire), 0);
+
+        // 連続 underrun (= begin edge は最初の 1 回だけ、その後は seq 不変)
+        finalize_fill_output(&diag, 1024, 0);
+        finalize_fill_output(&diag, 1024, 0);
+        finalize_fill_output(&diag, 1024, 0);
+        assert_eq!(diag.audio_underrun_begin_seq.load(Ordering::Acquire), 1);
+        // 累積 silence は毎回 +1024 加算
+        assert_eq!(
+            diag.audio_silence_samples_total.load(Ordering::Acquire),
+            1024 * 3
+        );
+    }
+
+    #[test]
+    fn finalize_fill_output_silence_ms_conversion_via_samples_per_sec() {
+        // silence_samples を ms に換算するロジックを再現:
+        // silence_ms = silence_samples / samples_per_sec * 1000.0
+        // (samples_per_sec = sample_rate * 2.0 for stereo interleaved)
+        let diag = make_diag();
+        let sample_rate = 48_000_u32;
+        let samples_per_sec = sample_rate as f64 * 2.0;
+
+        // 50ms 相当: 50ms * 48kHz * 2ch = 4800 samples
+        finalize_fill_output(&diag, 4800, 0);
+        let silence_total = diag.audio_silence_samples_total.load(Ordering::Acquire);
+        let silence_ms = (silence_total as f64 / samples_per_sec) * 1000.0;
+        assert!(
+            (silence_ms - 50.0).abs() < 0.01,
+            "expected 50ms, got {silence_ms}ms"
+        );
+    }
+
+    #[test]
+    fn finalize_fill_output_full_drain_from_clean_state_no_edge() {
+        // edge は **状態変化** のときだけ。クリーンな状態 (active=false) で full drain
+        // (silence=0) を呼んでも end_seq は上がらない (= false → false なら no-op)。
+        let diag = make_diag();
+        finalize_fill_output(&diag, 1024, 1024);
+        assert_eq!(diag.audio_underrun_end_seq.load(Ordering::Acquire), 0);
+        assert_eq!(diag.audio_underrun_begin_seq.load(Ordering::Acquire), 0);
+        assert!(!diag.audio_underrun_active.load(Ordering::Acquire));
     }
 }

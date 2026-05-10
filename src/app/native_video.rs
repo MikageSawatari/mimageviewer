@@ -1,5 +1,74 @@
 use super::*;
 
+/// Norm 操作 (toggle ON / OFF / scan 完了) を 1 セットで適用するヘルパー。
+///
+/// 3 箇所 (`disable_normalize_globally` / `apply_normalize_gain_db_to_player` /
+/// scan 完了パス) を集約することで perf event の漏れを防ぐ。
+///
+/// ## 実装方針 (= 2026-05-11 修正、Codex 助言)
+///
+/// **`clear_audio_output_buffer()` を呼ばない**。`set_normalize_gain` だけを呼ぶ。
+/// 理由:
+/// - 汎用 `clear_audio_output_buffer` は `raw_pending` (= 通常 5 秒分の先読み) を
+///   捨てる。Norm では decoder flush しないので、捨てた直後に届く新しい audio frame
+///   の audible PTS が master clock から 5 秒先行し、wall-rate cap で追従できず、
+///   **A/V offset = −5000ms 級の永続ズレ**が残った (= 過去ログで実測、各 toggle 毎に
+///   累積し最終的に −20s に達した)。
+/// - clear せずに `set_normalize_gain` だけ呼ぶと、既存 `processed` の最大 ~100ms 分は
+///   旧 gain のまま再生されるが、`raw_pending` 経由で新 gain が次の chunk から自然に
+///   反映される。100ms 程度の音量ズレは知覚しにくく、A/V offset は飛ばない。
+///
+/// ## 計装内容
+/// - `video.norm_apply_begin`: 直前の master clock pos / 最後に表示した video PTS
+/// - `video.norm_apply_end`: 適用後の master clock pos
+///
+/// 修正前後の比較は `analyze_perf.py av_drift` で `A/V offset` を見ればよい
+/// (= 修正前は累積 −20s 級、修正後は ±数十 ms に収まるはず)。
+#[cfg(windows)]
+pub(super) fn apply_normalize_gain_with_perf(
+    player: &crate::video::VideoPlayer,
+    fs_idx: usize,
+    new_gain_linear: f64,
+    new_gain_db: f32,
+    reason: &'static str,
+) {
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "video",
+            "norm_apply_begin",
+            None,
+            0,
+            &[
+                ("fs_idx", serde_json::Value::from(fs_idx as i64)),
+                ("gain_db", serde_json::Value::from(new_gain_db as f64)),
+                ("reason", serde_json::Value::from(reason)),
+                ("now", serde_json::Value::from(player.position())),
+                (
+                    "video_pts",
+                    serde_json::Value::from(player.last_displayed_pts_secs().unwrap_or(f64::NAN)),
+                ),
+            ],
+        );
+    }
+    // ⚠️ clear_audio_output_buffer() は呼ばない (上記 doc コメント参照)。
+    // set_normalize_gain は atomic store だけで buffer は触らないので、
+    // 既存 processed (~100ms) は旧 gain で鳴り続け、その後 raw_pending 経由で
+    // 新 gain に切り替わる。A/V offset は連続性を保つ。
+    player.set_normalize_gain(new_gain_linear);
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "video",
+            "norm_apply_end",
+            None,
+            0,
+            &[
+                ("fs_idx", serde_json::Value::from(fs_idx as i64)),
+                ("now", serde_json::Value::from(player.position())),
+            ],
+        );
+    }
+}
+
 impl App {
     #[cfg(windows)]
     pub(super) fn ensure_native_video_front(&mut self) {
@@ -860,23 +929,21 @@ impl App {
         let fs_idxs: Vec<usize> = self.fs_cache.keys().copied().collect();
         for idx in fs_idxs {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
-                // Codex P2: set → clear の順 (clear → set だと clear と set の間に
-                // pump が回って旧 gain で processed 再生成される小窓がある)。
-                player.set_normalize_gain(1.0);
-                player.clear_audio_output_buffer();
+                apply_normalize_gain_with_perf(player, idx, 1.0, 0.0, "toggle_off");
                 self.normalize_ui_states.insert(idx, NormalizeUiState::Off);
             }
         }
     }
 
-    /// 1 player に gain_db を線形変換して適用。clear_audio_output_buffer も呼ぶ。
+    /// 1 player に gain_db を線形変換して適用。
+    /// **audio buffer は clear しない** (= `apply_normalize_gain_with_perf` の doc 参照)。
+    /// 過去に `clear_audio_output_buffer()` を併用していたが、`raw_pending` 5 秒分を
+    /// 捨てて A/V offset が永続的にズレるバグの原因だったので 2026-05-11 に削除。
     #[cfg(windows)]
     pub(super) fn apply_normalize_gain_db_to_player(&mut self, fs_idx: usize, gain_db: f32) {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             let linear = 10.0_f64.powf(gain_db as f64 / 20.0);
-            // Codex P2: set → clear の順 (旧 gain processed の残存防止)
-            player.set_normalize_gain(linear);
-            player.clear_audio_output_buffer();
+            apply_normalize_gain_with_perf(player, fs_idx, linear, gain_db, "toggle_on");
         }
     }
 
@@ -1024,9 +1091,13 @@ impl App {
                         self.fs_cache.get(&state.fs_idx)
                     {
                         let linear = 10.0_f64.powf(result.gain_db as f64 / 20.0);
-                        // Codex P2: set → clear の順 (旧 gain processed の残存防止)
-                        player.set_normalize_gain(linear);
-                        player.clear_audio_output_buffer();
+                        apply_normalize_gain_with_perf(
+                            player,
+                            state.fs_idx,
+                            linear,
+                            result.gain_db,
+                            "scan_done",
+                        );
                         if state.was_playing {
                             player.set_playing(true);
                         }

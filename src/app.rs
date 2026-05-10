@@ -14199,8 +14199,7 @@ impl eframe::App for App {
                     let vst3_active_slots = 0_i64;
                     // 計装: window state と repaint 駆動条件を frame_gap に同梱する
                     // (2026-05-10、最小化中に App::update が止まらない問題の調査用)。
-                    let is_minimized =
-                        ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+                    let is_minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
                     let visible_video_thumb_pending = self.keep_set.iter().any(|&idx| {
                         matches!(self.items.get(idx), Some(GridItem::Video(_)))
                             && matches!(
@@ -15090,10 +15089,7 @@ impl eframe::App for App {
                 causes
                     .iter()
                     .map(|c| {
-                        serde_json::Value::String(format!(
-                            "{}:{} {}",
-                            c.file, c.line, c.reason
-                        ))
+                        serde_json::Value::String(format!("{}:{} {}", c.file, c.line, c.reason))
                     })
                     .collect(),
             );
@@ -15131,10 +15127,7 @@ impl eframe::App for App {
                         "fs_viewport_shown",
                         serde_json::Value::from(self.fs_viewport_shown),
                     ),
-                    (
-                        "n",
-                        serde_json::Value::from(self.frame_counter as i64),
-                    ),
+                    ("n", serde_json::Value::from(self.frame_counter as i64)),
                     ("prev_frame_causes", causes_json),
                 ],
             );
