@@ -1080,6 +1080,16 @@ impl App {
                 .and_then(|name| name.to_str())
                 .unwrap_or("video")
                 .to_string();
+            // 動的状態を Acquire load して snapshot 化 (= overlay は毎フレーム rebuild
+            // されるので、ここで読んだ値が右パネルに反映される)。
+            use std::sync::atomic::Ordering;
+            let last_present_path = crate::video::decoder::PresentPathSnapshot::from_atomic(
+                info.dynamic.present_path.load(Ordering::Acquire),
+            );
+            let deinterlace_status = crate::video::decoder::DeinterlaceStatusSnapshot::from_atomic(
+                info.dynamic.deinterlace_status.load(Ordering::Acquire),
+            );
+            let interlace_detected = info.dynamic.interlace_detected.load(Ordering::Acquire);
             crate::video::native_presenter::NativeOverlayMetadata {
                 file_name,
                 title: info.title.clone(),
@@ -1098,6 +1108,10 @@ impl App {
                 hw_decode_active: info.hw_decode_active,
                 gpu_path_active: info.gpu_path_active,
                 d3d11va_supported: info.d3d11va_supported,
+                deinterlace_mode: info.effective_deinterlace_mode,
+                last_present_path,
+                deinterlace_status,
+                interlace_detected,
             }
         });
         player.set_native_metadata(metadata);

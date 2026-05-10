@@ -57,6 +57,9 @@
 | `GlobalSearchHandle.cancel` | `Arc<AtomicBool>` | UI (クエリ変更, バー閉じ, folder 遷移, Handle drop) | Ctrl+G クエリワーカー | Tantivy ページングループの中断 |
 | `tag_write_worker.cancel` | `Arc<AtomicBool>` | App drop | タグ書き込みワーカー | 書込ループ + commit の中断 |
 | `NativeVideoOutput.source_epoch` | `Arc<AtomicU64>` | UI / native presenter | UI / native presenter | native presenter 再利用時の stale event 防止。`SwitchSource` ごとに epoch を進め、presenter から UI へ送る `NativeVideoOutputEvent` に付与する。UI は現在の player epoch と一致しない event を破棄する |
+| `VideoDynamicState.present_path` | `Arc<AtomicU8>` | native-video-presenter (= `record_present`) | UI (右パネル overlay 描画) | per-frame のプレゼン経路 (Pending / GPU / CPU)。`d3d11_shared` なら GPU、`cpu_upload` なら CPU を store。デインターレース ON で CPU 経路に落ちた場合の右パネル「フレーム表示」表示根拠 |
+| `VideoDynamicState.deinterlace_status` | `Arc<AtomicU8>` | video-decode (`run_video_decode`) | UI (右パネル overlay 描画) | bwdif フィルタの動的状態 (Pending / Inactive / Active / Failed)。フィルタ初期化成功 → Active、失敗 → Failed、Auto モードで素材プログレッシブ判定 → Inactive、seek 直後 → Pending。Settings = Off は decode 開始時に Inactive |
+| `VideoDynamicState.interlace_detected` | `Arc<AtomicBool>` | video-decode (`run_video_decode`) | UI (右パネル overlay 描画) | `stream_interlaced || frame_interlaced` の latched 検出。一度 true になったら同 source 再生中は維持 (= 微小な interlaced フレーム混入でも表示安定)。`VideoPlayer::open` ごとに新 Arc 生成で false 初期化 |
 | `ActivityGate.paused` (v0.9) | `AtomicBool` | UI (トレイメニュー「一時停止」 / ウィンドウ hide) | `wait_until_idle` を呼ぶ全ワーカー (walker / ingest / name_bulk_indexer) | true の間 wait ループが解除 or cancel まで抜けない。cancel は貫通 (終了時の固まり防止) |
 | `GlobalIoSemaphore.throttled` (v0.9) | `Mutex` ガード | UI (ウィンドウ hide/show) | 全インデクサ worker | true の間、実効 permit=1 (in_use ≥ 1 なら新規 acquire 不可)。解除で `notify_all` |
 

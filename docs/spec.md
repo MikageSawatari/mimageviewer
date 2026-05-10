@@ -133,6 +133,13 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   description に加え、外部ツールが `comment` / `PURL` / `webpage_url` として埋め込む元動画 URL
   を表示する。元動画 URL と説明文中の HTTP(S) URL はリンクとして表示し、
   クリック時は動画再生を一時停止して既定ブラウザで開く。
+- 動画メタ情報パネルにはデコード backend / フレーム表示経路 / デインターレース状態を
+  併記する。「GPU経路」は ファイル open 時の能力フラグ (= GPU video device
+  が使えるか)、「フレーム表示」は per-frame の実プレゼン経路 (`d3d11_shared` →
+  GPU、`cpu_upload` → CPU)、「デインターレース」は Settings モード (Auto / On / Off) と
+  bwdif フィルタの動的状態 (適用中 / プログレッシブ / 待機中 / 失敗) の組み合わせ表示。
+  HW デコード + デインターレース ON 時は decoder backend が HW のまま、フレーム表示は
+  CPU (= D3D11 → CPU 転送 + bwdif + swscale + CPU upload) になる。
 - 動画音量は既定 100%。下部 HUD / Shift+↑↓ / 環境設定から 0〜150% で手動調整でき、
   音量バーの右クリックまたはダブルクリックで 100% に戻せる。100% 超の boost 部分は
   HUD で黄色表示し、音声ポンプ側の safety limiter を通す。

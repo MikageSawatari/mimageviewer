@@ -21,7 +21,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, bounded};
 
@@ -979,6 +979,71 @@ pub struct AudioFrame {
     pub seek_target_secs: Option<f64>,
 }
 
+/// 動画再生中に decoder/presenter スレッドから UI へ伝える動的状態 (右パネル
+/// 表示用)。`VideoPlayer::open` で 1 度生成し、decoder thread (deinterlace 状態) と
+/// present thread (per-frame プレゼン経路) で書き込み、UI が Acquire load する。
+///
+/// fast-swap 時は同じ Arc が `SwitchSourcePayload` に乗って引き継がれる。
+#[derive(Default, Debug)]
+pub struct VideoDynamicState {
+    /// 直近フレームのプレゼン経路。
+    /// `PRESENT_PATH_PENDING` (0) / `PRESENT_PATH_GPU` (1) / `PRESENT_PATH_CPU` (2)。
+    pub present_path: AtomicU8,
+    /// デインターレース状態。
+    /// `DEINT_STATUS_PENDING` (0) / `DEINT_STATUS_INACTIVE` (1) /
+    /// `DEINT_STATUS_ACTIVE` (2) / `DEINT_STATUS_FAILED` (3)。
+    pub deinterlace_status: AtomicU8,
+    /// インターレース検出 (`stream_interlaced || frame_interlaced`)。一度 true に
+    /// なったら再生中ずっと latched (= プログレッシブ素材内に少数 interlaced
+    /// フレームが混ざるケースの表示安定化)。
+    pub interlace_detected: AtomicBool,
+}
+
+pub const PRESENT_PATH_PENDING: u8 = 0;
+pub const PRESENT_PATH_GPU: u8 = 1;
+pub const PRESENT_PATH_CPU: u8 = 2;
+
+pub const DEINT_STATUS_PENDING: u8 = 0;
+pub const DEINT_STATUS_INACTIVE: u8 = 1;
+pub const DEINT_STATUS_ACTIVE: u8 = 2;
+pub const DEINT_STATUS_FAILED: u8 = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentPathSnapshot {
+    Pending,
+    Gpu,
+    Cpu,
+}
+
+impl PresentPathSnapshot {
+    pub fn from_atomic(v: u8) -> Self {
+        match v {
+            PRESENT_PATH_GPU => Self::Gpu,
+            PRESENT_PATH_CPU => Self::Cpu,
+            _ => Self::Pending,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeinterlaceStatusSnapshot {
+    Pending,
+    Inactive,
+    Active,
+    Failed,
+}
+
+impl DeinterlaceStatusSnapshot {
+    pub fn from_atomic(v: u8) -> Self {
+        match v {
+            DEINT_STATUS_INACTIVE => Self::Inactive,
+            DEINT_STATUS_ACTIVE => Self::Active,
+            DEINT_STATUS_FAILED => Self::Failed,
+            _ => Self::Pending,
+        }
+    }
+}
+
 /// デコード開始時に分かる動画情報。UI の HUD で利用。
 #[derive(Clone, Debug)]
 pub struct VideoInfo {
@@ -997,9 +1062,16 @@ pub struct VideoInfo {
     pub has_audio: bool,
     /// HW デコードが実際に有効化されたか (sw / hw_d3d11va)。
     pub hw_decode_active: bool,
-    /// GPU 経路 (D3D11 video processor blit) が利用可能か。
+    /// GPU 経路 (D3D11 video processor blit) が利用可能か (環境としての能力)。
     /// 第 1 フレーム到着時に確定。`false` の間は CPU readback 経路。
+    /// **per-frame の実プレゼン経路は `dynamic.present_path` を参照**。
     pub gpu_path_active: bool,
+    /// open 時に確定した実効デインターレースモード。Settings の動的変更には
+    /// 追従しない (decoder は open 時のモードで動き続けるため、UI も open 時
+    /// の値で表示する)。
+    pub effective_deinterlace_mode: crate::settings::VideoDeinterlaceMode,
+    /// decoder/presenter スレッドと共有する動的状態。
+    pub dynamic: Arc<VideoDynamicState>,
     /// 動画ファイルに埋め込まれた標準メタデータ (Phase 5.4)。
     /// FFmpeg avformat が解釈できる形式 (Matroska tags / MP4 udta / ffmetadata) を
     /// 想定。値が無いキーは None。
@@ -1071,6 +1143,7 @@ pub fn spawn(
     engine_state: Arc<std::sync::atomic::AtomicU8>,
     engine_event_tx: crossbeam_channel::Sender<crate::video::engine::EngineEvent>,
     skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
+    dynamic: Arc<VideoDynamicState>,
 ) -> DecodeHandles {
     // 60fps 1080p で 8 フレーム = 約 130ms のバッファ。decoder pacing の閾値
     // (100ms) と組み合わせて「pacing 直前に 1-2 フレーム余裕がある」状態を
@@ -1103,6 +1176,7 @@ pub fn spawn(
                 audio_tx,
                 info_tx,
                 skipped_frame_count,
+                dynamic,
             );
         })
         .expect("spawn video-decode thread");
@@ -1130,6 +1204,7 @@ fn run_decoder(
     audio_tx: Sender<AudioFrame>,
     info_tx: Sender<Result<VideoInfo, String>>,
     skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
+    dynamic: Arc<VideoDynamicState>,
 ) {
     use ffmpeg_the_third as ffmpeg;
     // Phase B: Pixel / ScaleContext / ScaleFlags / Video は run_video_decode に移管。
@@ -1424,6 +1499,11 @@ fn run_decoder(
         .collect();
 
     let bit_rate_bps = input.bit_rate();
+    // ストリーム interlaced 判定を `dynamic.interlace_detected` の初期値として記録。
+    // フレームごとの latched 更新 (frame_interlaced=true で立つ) は run_video_decode 内で行う。
+    if video_stream_interlaced {
+        dynamic.interlace_detected.store(true, Ordering::Release);
+    }
     let info = VideoInfo {
         width: src_w,
         height: src_h,
@@ -1436,6 +1516,8 @@ fn run_decoder(
         has_audio,
         hw_decode_active: hw_active_initially,
         gpu_path_active,
+        effective_deinterlace_mode: deinterlace,
+        dynamic: Arc::clone(&dynamic),
         title,
         artist,
         original_url,
@@ -1647,6 +1729,7 @@ fn run_decoder(
         let cancel_v = cancel.clone();
         let engine_state_v = engine_state.clone();
         let skipped_frame_count_v = skipped_frame_count.clone();
+        let dynamic_v = Arc::clone(&dynamic);
         // video_tx の所有を video decode thread に move。run_decoder (= demux) 側は
         // 以降 video_tx を直接触らない (video_pkt_tx 経由で間接的に流す)。
         let video_tx_for_thread = video_tx;
@@ -1679,6 +1762,7 @@ fn run_decoder(
                     hw_active_initially,
                     deinterlace,
                     video_stream_interlaced,
+                    dynamic_v,
                 )
             })
             .expect("spawn video-decode thread")
@@ -2285,6 +2369,7 @@ fn run_video_decode(
     hw_active_initially: bool,
     deinterlace: crate::settings::VideoDeinterlaceMode,
     stream_interlaced: bool,
+    dynamic: Arc<VideoDynamicState>,
 ) {
     use ffmpeg::format::Pixel;
     use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
@@ -2296,6 +2381,13 @@ fn run_video_decode(
     let mut deinterlacer: Option<BwdifFilter> = None;
     let mut deinterlace_failure_logged = false;
     let mut deinterlace_cpu_fallback_logged = false;
+    // デインターレース設定が `Off` なら最初から Inactive。それ以外は最初の bwdif
+    // 判定までは Pending のまま (= 起動直後・seek 直後の誤表示回避)。
+    if !deinterlace.is_enabled() {
+        dynamic
+            .deinterlace_status
+            .store(DEINT_STATUS_INACTIVE, Ordering::Release);
+    }
     let mut first_frame_logged = false;
     let mut current_seek_serial: u64 = 0;
     let mut drop_before_secs: Option<f64> = None;
@@ -2372,6 +2464,14 @@ fn run_video_decode(
                 // bwdif keeps a tiny temporal window. Drop it on seek so the
                 // first post-seek frame cannot be compared with pre-seek data.
                 deinterlacer = None;
+                // seek 直後は次の bwdif 判定が走るまで状態が確定しない。Failed は
+                // 永続するので保持、それ以外は Pending に戻して UI の「待機中」
+                // 表示を一時的に避ける。
+                if !deinterlace_failure_logged && deinterlace.is_enabled() {
+                    dynamic
+                        .deinterlace_status
+                        .store(DEINT_STATUS_PENDING, Ordering::Release);
+                }
                 drop_before_secs = trim_before_secs;
                 first_packet_logged_for_serial = None;
                 preroll_drop_count = 0;
@@ -2580,6 +2680,18 @@ fn run_video_decode(
                         deinterlace_cpu_fallback_logged = true;
                     }
                 } else if let Some(gpu_dev) = gpu_video_device.as_ref() {
+                    // Codex P2 (2026-05-10): GPU 経路 (D3D11VA + try_gpu_blit_path) は
+                    // CPU bwdif 分岐に到達しない。Auto モードで progressive 素材の場合、
+                    // ここで明示的に Inactive へ遷移させないと右パネルが「自動 - 確認中」の
+                    // まま固まる。
+                    if deinterlace.is_enabled() && !deinterlace_failure_logged {
+                        let prev = dynamic.deinterlace_status.load(Ordering::Relaxed);
+                        if prev != DEINT_STATUS_INACTIVE && prev != DEINT_STATUS_FAILED {
+                            dynamic
+                                .deinterlace_status
+                                .store(DEINT_STATUS_INACTIVE, Ordering::Release);
+                        }
+                    }
                     match try_gpu_blit_path(
                         gpu_dev,
                         &frame,
@@ -2994,6 +3106,11 @@ fn run_video_decode(
             let mut filtered_owned: Option<Video> = None;
             let mut pts_secs_for_output = pts_secs;
             let frame_interlaced = frame_for_scaler.is_interlaced();
+            // インターレース検出 (latched true)。すでに true なら store スキップで
+            // ホットパスの atomic 書き込みを最小化。
+            if frame_interlaced && !dynamic.interlace_detected.load(Ordering::Relaxed) {
+                dynamic.interlace_detected.store(true, Ordering::Release);
+            }
             if should_try_deinterlace(
                 deinterlace,
                 frame_interlaced,
@@ -3021,12 +3138,18 @@ fn run_video_decode(
                                 key.height
                             ));
                             deinterlacer = Some(f);
+                            dynamic
+                                .deinterlace_status
+                                .store(DEINT_STATUS_ACTIVE, Ordering::Release);
                         }
                         Err(e) => {
                             crate::logger::log(format!(
                                 "video deinterlace: bwdif init failed, continuing without deinterlace: {e}"
                             ));
                             deinterlace_failure_logged = true;
+                            dynamic
+                                .deinterlace_status
+                                .store(DEINT_STATUS_FAILED, Ordering::Release);
                         }
                     }
                 }
@@ -3047,8 +3170,21 @@ fn run_video_decode(
                                 "video deinterlace: bwdif failed, continuing without deinterlace: {e}"
                             ));
                             deinterlace_failure_logged = true;
+                            dynamic
+                                .deinterlace_status
+                                .store(DEINT_STATUS_FAILED, Ordering::Release);
                         }
                     }
+                }
+            } else if deinterlace.is_enabled() && !deinterlace_failure_logged {
+                // 設定上は ON だが、現在のフレームに bwdif が要らない (= プログレッシブ
+                // 判定)。Auto モードの「プログレッシブ素材」ケース。`Failed` はそのまま
+                // 維持し、それ以外は Inactive に遷移させる。
+                let prev = dynamic.deinterlace_status.load(Ordering::Relaxed);
+                if prev != DEINT_STATUS_INACTIVE && prev != DEINT_STATUS_FAILED {
+                    dynamic
+                        .deinterlace_status
+                        .store(DEINT_STATUS_INACTIVE, Ordering::Release);
                 }
             }
             let frame_for_scaler = filtered_owned.as_ref().unwrap_or(frame_for_scaler);

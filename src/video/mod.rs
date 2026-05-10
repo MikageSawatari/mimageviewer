@@ -162,6 +162,12 @@ pub struct VideoPlayer {
     native_hover_thumbnail_target_secs: Mutex<Option<f64>>,
     #[cfg(windows)]
     native_hover_thumbnail_sent_key: Mutex<Option<NativeHoverThumbnailKey>>,
+    /// decoder thread / native presenter thread / UI と共有する動的状態。
+    /// `open` で 1 度生成し、`build_switch_source_payload` で fast-swap 経路に
+    /// 渡すために保持する (= 新ソース open 時に作った Arc を旧 presenter に
+    /// 引き継ぐ)。
+    #[cfg(windows)]
+    dynamic: Arc<crate::video::decoder::VideoDynamicState>,
 }
 
 #[cfg(windows)]
@@ -282,6 +288,10 @@ pub(crate) struct SwitchSourcePayload {
     last_displayed_pts_bits: Arc<AtomicU64>,
     frame_step_active: Arc<AtomicBool>,
     duration_secs_bits: Arc<AtomicU64>,
+    /// 新ソースの decoder/UI と共有する動的状態 (per-frame プレゼン経路 /
+    /// デインターレース)。fast-swap 経路でも presenter の present_stats が
+    /// 同じ Arc を握り直す。
+    dynamic: Arc<crate::video::decoder::VideoDynamicState>,
     source_epoch: u64,
     show_preparing_overlay: bool,
 }
@@ -374,6 +384,13 @@ struct PresenterSourceState {
 impl PresenterSourceState {
     fn new(payload: SwitchSourcePayload) -> Self {
         let last_seen_serial = payload.clock.current_seek_serial();
+        // 新ソースに切り替わったので present_path は Pending に戻す (= 旧ソースの
+        // 直近フレーム経路が UI に残らないように)。deinterlace_status / interlace_detected
+        // は decoder thread (新ソース) が独自に書き込むため、ここでは触らない。
+        payload.dynamic.present_path.store(
+            crate::video::decoder::PRESENT_PATH_PENDING,
+            std::sync::atomic::Ordering::Release,
+        );
         Self {
             video_rx: payload.video_rx,
             clock: payload.clock,
@@ -387,7 +404,7 @@ impl PresenterSourceState {
             last_seen_serial,
             first_frame_event_last_epoch: None,
             pending_first_frame_event: None,
-            present_stats: NativeFullscreenPresentStats::default(),
+            present_stats: NativeFullscreenPresentStats::new(payload.dynamic),
             last_present_wall: None,
             last_present_source_pts: None,
         }
@@ -426,6 +443,7 @@ impl NativeVideoOutput {
         frame_step_active: Arc<AtomicBool>,
         duration_secs_bits: Arc<AtomicU64>,
         config: NativeVideoOutputConfig,
+        dynamic: Arc<crate::video::decoder::VideoDynamicState>,
     ) -> Option<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
         let hwnd = Arc::new(AtomicU64::new(0));
@@ -463,6 +481,7 @@ impl NativeVideoOutput {
                     thread_first_presented,
                     Arc::clone(&thread_closed),
                     thread_perf_overlay_visible,
+                    dynamic,
                 ) {
                     crate::logger::log(format!("[native-video] presenter stopped: {err}"));
                     // run_native_video_output が Err で抜けた = init 失敗または run 中の致命的
@@ -709,7 +728,6 @@ impl Drop for NativeComApartment {
 }
 
 #[cfg(windows)]
-#[derive(Default)]
 struct NativeFullscreenPresentStats {
     presented: u64,
     gpu: u64,
@@ -719,10 +737,27 @@ struct NativeFullscreenPresentStats {
     max_late_ms: f64,
     max_total_ms: f64,
     max_interval_ms: f64,
+    /// Per-frame プレゼン経路を UI に動的公開するための共有 atomic。
+    /// `record_present` で `present_path` を都度更新する。
+    dynamic: Arc<crate::video::decoder::VideoDynamicState>,
 }
 
 #[cfg(windows)]
 impl NativeFullscreenPresentStats {
+    fn new(dynamic: Arc<crate::video::decoder::VideoDynamicState>) -> Self {
+        Self {
+            presented: 0,
+            gpu: 0,
+            cpu: 0,
+            late_drop: 0,
+            wait_timeout: 0,
+            max_late_ms: 0.0,
+            max_total_ms: 0.0,
+            max_interval_ms: 0.0,
+            dynamic,
+        }
+    }
+
     fn record_present(
         &mut self,
         outcome: &crate::video::native_presenter::NativePresentOutcome,
@@ -732,8 +767,18 @@ impl NativeFullscreenPresentStats {
     ) {
         self.presented += 1;
         match outcome.path {
-            "d3d11_shared" => self.gpu += 1,
-            "cpu_upload" => self.cpu += 1,
+            "d3d11_shared" => {
+                self.gpu += 1;
+                self.dynamic
+                    .present_path
+                    .store(crate::video::decoder::PRESENT_PATH_GPU, Ordering::Release);
+            }
+            "cpu_upload" => {
+                self.cpu += 1;
+                self.dynamic
+                    .present_path
+                    .store(crate::video::decoder::PRESENT_PATH_CPU, Ordering::Release);
+            }
             _ => {}
         }
         if outcome.wait_timed_out {
@@ -1015,6 +1060,7 @@ fn run_native_video_output(
     first_presented_out: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     perf_overlay_visible: Arc<AtomicBool>,
+    dynamic: Arc<crate::video::decoder::VideoDynamicState>,
 ) -> Result<(), String> {
     use std::time::{Duration, Instant};
 
@@ -1093,6 +1139,7 @@ fn run_native_video_output(
         last_displayed_pts_bits,
         frame_step_active,
         duration_secs_bits,
+        dynamic,
         source_epoch: 0,
         show_preparing_overlay: config.initial_tile_overlay,
     });
@@ -2099,6 +2146,8 @@ impl VideoPlayer {
                 native_hover_thumbnail_target_secs: Mutex::new(None),
                 #[cfg(windows)]
                 native_hover_thumbnail_sent_key: Mutex::new(None),
+                #[cfg(windows)]
+                dynamic: Arc::new(crate::video::decoder::VideoDynamicState::default()),
             };
         }
 
@@ -2149,6 +2198,10 @@ impl VideoPlayer {
         // decoder 側から +1)。UI 側 dropped_past は VideoPlayer::tick 内の別 counter。
         let decoder_dropped_full_count = Arc::new(AtomicU64::new(0));
 
+        // decoder thread / native presenter thread / UI で per-frame の動的状態を
+        // 共有するための atomic 群。VideoInfo にも同じ Arc を載せて UI が読む。
+        let dynamic = Arc::new(crate::video::decoder::VideoDynamicState::default());
+
         let decode = decoder::spawn(
             path.clone(),
             clock.clone(),
@@ -2161,6 +2214,7 @@ impl VideoPlayer {
             engine_state_handle.clone(),
             engine_event_tx.clone(),
             decoder_dropped_full_count.clone(),
+            Arc::clone(&dynamic),
         );
 
         // 音声出力起動。失敗してもプレイヤーは生きる (映像のみ再生)。
@@ -2228,6 +2282,7 @@ impl VideoPlayer {
                     Arc::clone(&frame_step_active),
                     Arc::clone(&duration_secs_bits),
                     config,
+                    Arc::clone(&dynamic),
                 ) {
                     Some(output) => (Some(output), None),
                     None => (
@@ -2285,6 +2340,8 @@ impl VideoPlayer {
             native_hover_thumbnail_target_secs: Mutex::new(None),
             #[cfg(windows)]
             native_hover_thumbnail_sent_key: Mutex::new(None),
+            #[cfg(windows)]
+            dynamic,
         };
         // spawn 失敗で error が立った場合、すでに走っている decoder / audio /
         // thumbnail worker を停止する。`tick()` は `error.is_some()` で早期 return
@@ -2774,6 +2831,7 @@ impl VideoPlayer {
             last_displayed_pts_bits: Arc::clone(&self.last_displayed_pts_bits),
             frame_step_active: Arc::clone(&self.frame_step_active),
             duration_secs_bits: Arc::clone(&self.duration_secs_bits),
+            dynamic: Arc::clone(&self.dynamic),
             source_epoch,
             show_preparing_overlay,
         }

@@ -1691,10 +1691,13 @@ pub(super) fn draw_native_metadata_panel(
                 .as_deref()
                 .filter(|title| !title.trim().is_empty())
                 .unwrap_or(&metadata.file_name);
-            let path_kind = if metadata.gpu_path_active {
-                "GPU (D3D11 zero-copy)"
+            // 「GPU経路」は ファイル open 時の能力フラグ (= GPU video device が
+            // 利用可能か)。per-frame の実プレゼン経路は別行「フレーム表示」で動的に
+            // 表示する。
+            let gpu_path_kind = if metadata.gpu_path_active {
+                "利用可能"
             } else {
-                "CPU (readback + swscale)"
+                "未利用"
             };
             let decode_kind = if metadata.hw_decode_active {
                 "HW"
@@ -1706,6 +1709,16 @@ pub(super) fn draw_native_metadata_panel(
             } else {
                 "非対応"
             };
+            let frame_path_kind = match metadata.last_present_path {
+                crate::video::decoder::PresentPathSnapshot::Gpu => "GPU (D3D11)",
+                crate::video::decoder::PresentPathSnapshot::Cpu => "CPU (アップロード)",
+                crate::video::decoder::PresentPathSnapshot::Pending => "確認中",
+            };
+            let deinterlace_text = format_deinterlace_status(
+                metadata.deinterlace_mode,
+                metadata.deinterlace_status,
+                metadata.interlace_detected,
+            );
             let mut rows = vec![
                 ("ファイル", metadata.file_name.clone()),
                 ("タイトル", title.to_string()),
@@ -1736,8 +1749,10 @@ pub(super) fn draw_native_metadata_panel(
                 ("ビットレート", format_bitrate(metadata.bit_rate_bps)),
                 ("長さ", format_overlay_time(metadata.duration_secs)),
                 ("チャプター", metadata.chapter_count.to_string()),
-                ("経路", path_kind.to_string()),
+                ("GPU経路", gpu_path_kind.to_string()),
                 ("デコード", decode_kind.to_string()),
+                ("フレーム表示", frame_path_kind.to_string()),
+                ("デインターレース", deinterlace_text),
                 ("D3D11VA", d3d11va.to_string()),
             ];
             rows.retain(|(_, value)| !metadata_clean_text(value).is_empty());
@@ -2483,6 +2498,39 @@ pub(super) fn format_bitrate(bit_rate_bps: i64) -> String {
         format!("{mbps:.1}Mbps")
     } else {
         format!("{}kbps", (bit_rate_bps as f64 / 1000.0).round() as i64)
+    }
+}
+
+/// 右パネル「デインターレース」行の表示文字列を組み立てる。
+///
+/// 入力は open 時の Settings モード (`mode`) と decoder thread から動的に
+/// 更新される `status` / `interlace_detected` の組み合わせ。
+pub(super) fn format_deinterlace_status(
+    mode: crate::settings::VideoDeinterlaceMode,
+    status: crate::video::decoder::DeinterlaceStatusSnapshot,
+    interlace_detected: bool,
+) -> String {
+    use crate::settings::VideoDeinterlaceMode;
+    use crate::video::decoder::DeinterlaceStatusSnapshot as S;
+    match mode {
+        VideoDeinterlaceMode::Off => "オフ".to_string(),
+        VideoDeinterlaceMode::On => match status {
+            S::Active => "常時 (適用中)".to_string(),
+            S::Failed => "常時 (初期化失敗)".to_string(),
+            S::Pending | S::Inactive => "常時 (準備中)".to_string(),
+        },
+        VideoDeinterlaceMode::Auto => match status {
+            S::Active => "自動 - 適用中".to_string(),
+            S::Failed => "自動 - 初期化失敗".to_string(),
+            S::Pending => "自動 - 確認中".to_string(),
+            S::Inactive => {
+                if interlace_detected {
+                    "自動 - 待機中".to_string()
+                } else {
+                    "自動 - プログレッシブ".to_string()
+                }
+            }
+        },
     }
 }
 

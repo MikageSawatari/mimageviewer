@@ -172,6 +172,33 @@ seek して再生開始する。切替元の `VideoPlayer` は cpal stream を�
 buffer を明示クリアしてから native presenter を渡し、前動画の処理済み音声が短く漏れる
 のを抑える。
 
+#### 2.2.2 右パネルへの動的状態反映
+
+`VideoInfo.dynamic: Arc<VideoDynamicState>` は decoder thread / present thread / UI で
+共有する atomic 群。`VideoPlayer::open` で 1 度生成し、以下の経路で同じ Arc が伝搬する:
+
+- `decoder::spawn` → `run_video_decode` (video-decode スレッド) が `deinterlace_status` /
+  `interlace_detected` を更新
+- `NativeVideoOutput::spawn` → `run_native_video_output` → `PresenterSourceState::new`
+  → `NativeFullscreenPresentStats::new(dynamic)` で保持し、`record_present` が
+  `present_path` を per-frame 更新
+- 動画→動画 fast-swap 時は `SwitchSourcePayload.dynamic` に新 source の Arc が乗り、
+  旧 presenter が新 PresenterSourceState (新 Arc を握る present_stats) に切り替わる
+
+UI 側 (`app/native_video.rs::sync_native_video_metadata`) は overlay 同期時に Acquire load
+して `NativeOverlayMetadata` の動的フィールド (`last_present_path` /
+`deinterlace_status` / `interlace_detected`) に snapshot 化、右パネル
+`overlay_draw.rs::draw_native_metadata_panel` が「フレーム表示」「デインターレース」行
+として描画する。
+
+per-frame 経路 (`d3d11_shared` / `cpu_upload`) はプレゼン側の判定で、デコード自体が HW
+かどうかとは独立。デインターレース (FFmpeg `bwdif`) を使う場合は HW デコード後に D3D11
+テクスチャを CPU メモリへ転送するため、`record_present` は `cpu_upload` を観測する
+(= 右パネル「フレーム表示」が CPU、perf overlay の CPU カウンタが増える)。
+既存の静的フラグ `gpu_path_active` (= GPU video device の有無) は能力フラグとして
+右パネル「GPU経路」(改名前は「経路」) にそのまま残し、per-frame の動的状態は別行で
+表示する。
+
 **リサイズ実装 (`src/fast_resize.rs`)**:
 
 リサイズは `image::imageops::resize` (スカラー) ではなく、`fast_image_resize`

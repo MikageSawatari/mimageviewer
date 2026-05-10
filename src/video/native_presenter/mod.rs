@@ -314,6 +314,14 @@ pub struct NativeOverlayMetadata {
     pub hw_decode_active: bool,
     pub gpu_path_active: bool,
     pub d3d11va_supported: bool,
+    /// open 時に確定したデインターレースモード (Auto/On/Off)。
+    pub deinterlace_mode: crate::settings::VideoDeinterlaceMode,
+    /// 直近フレームのプレゼン経路 (動的)。
+    pub last_present_path: crate::video::decoder::PresentPathSnapshot,
+    /// bwdif フィルタの現在状態 (動的)。
+    pub deinterlace_status: crate::video::decoder::DeinterlaceStatusSnapshot,
+    /// 再生中に一度でもインターレースが検出されたか (latched、動的)。
+    pub interlace_detected: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
