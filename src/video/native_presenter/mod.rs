@@ -555,7 +555,7 @@ pub enum NativeOverlayCommand {
     AddBookmarkAt {
         target_secs: f64,
     },
-    TogglePinAt {
+    SetPinAt {
         target_secs: f64,
     },
     SetBookmarkTitle {
@@ -565,6 +565,7 @@ pub enum NativeOverlayCommand {
     DeleteBookmark {
         id: i64,
     },
+    DeletePin,
     OpenExternalUrl {
         url: String,
     },
@@ -3359,12 +3360,12 @@ impl NativeEguiOverlay {
                                     },
                                 );
                                 let pin_resp = pin_resp.on_hover_text(if hover_preview_pinned {
-                                    "ピン留めを解除"
+                                    "この位置でピン留めを上書き"
                                 } else {
-                                    "サムネイルをピン留め"
+                                    "この位置をピン留め"
                                 });
                                 if pin_resp.clicked() {
-                                    commands.push(NativeOverlayCommand::TogglePinAt {
+                                    commands.push(NativeOverlayCommand::SetPinAt {
                                         target_secs: target,
                                     });
                                 }

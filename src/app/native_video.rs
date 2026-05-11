@@ -375,14 +375,17 @@ impl App {
             crate::video::NativeVideoOutputEvent::AddBookmarkAt { target_secs } => {
                 self.handle_native_video_add_bookmark_command(ctx, fs_idx, target_secs);
             }
-            crate::video::NativeVideoOutputEvent::TogglePinAt { target_secs } => {
-                self.handle_native_video_toggle_pin_command(ctx, fs_idx, target_secs);
+            crate::video::NativeVideoOutputEvent::SetPinAt { target_secs } => {
+                self.handle_native_video_set_pin_command(ctx, fs_idx, target_secs);
             }
             crate::video::NativeVideoOutputEvent::SetBookmarkTitle { id, title } => {
                 self.handle_native_video_set_bookmark_title_command(ctx, fs_idx, id, title);
             }
             crate::video::NativeVideoOutputEvent::DeleteBookmark { id } => {
                 self.handle_native_video_delete_bookmark_command(ctx, fs_idx, id);
+            }
+            crate::video::NativeVideoOutputEvent::DeletePin => {
+                self.handle_native_video_delete_pin_command(ctx, fs_idx);
             }
             crate::video::NativeVideoOutputEvent::OpenExternalUrl { url } => {
                 self.handle_native_video_open_external_url_command(ctx, fs_idx, url);
@@ -1774,7 +1777,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn handle_native_video_toggle_pin_command(
+    pub(super) fn handle_native_video_set_pin_command(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
@@ -1783,7 +1786,7 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
             return;
         }
-        self.toggle_native_video_pin(fs_idx, target_secs);
+        self.set_native_video_pin(fs_idx, target_secs);
         self.mark_native_video_hud_activity(ctx);
     }
 
@@ -1805,6 +1808,39 @@ impl App {
                 self.sync_native_video_timeline_markers(fs_idx);
                 // BM ループ中なら境界リストが変わったので loop_target を再計算
                 self.apply_loop_mode_to_player(fs_idx);
+            }
+        }
+        self.mark_native_video_hud_activity(ctx);
+    }
+
+    #[cfg(windows)]
+    pub(super) fn handle_native_video_delete_pin_command(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        let path = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => Some(player.path().clone()),
+            _ => None,
+        };
+        if let (Some(path), Some(db)) = (path, self.video_pin_db.as_ref()) {
+            match db.remove(&path) {
+                Ok(()) => {
+                    self.video_thumb_overrides_dirty = true;
+                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                        player.set_native_hover_preview_pinned(false);
+                    }
+                    self.refresh_fullscreen_video_marker_cache(fs_idx);
+                    self.sync_native_video_timeline_markers(fs_idx);
+                    crate::logger::log(format!(
+                        "video pin removed: {}",
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                    ));
+                }
+                Err(e) => crate::logger::log(format!("video pin remove failed: {e}")),
             }
         }
         self.mark_native_video_hud_activity(ctx);
@@ -1867,7 +1903,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn toggle_native_video_pin(&mut self, fs_idx: usize, target_secs: f64) {
+    pub(super) fn set_native_video_pin(&mut self, fs_idx: usize, target_secs: f64) {
         let snapshot = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
                 if player.error().is_some() || player.info().is_none() {
@@ -1888,24 +1924,6 @@ impl App {
             crate::logger::log("video pin: DB not open".to_string());
             return;
         };
-        if db.lookup(&path).is_some() {
-            match db.remove(&path) {
-                Ok(()) => {
-                    self.video_thumb_overrides_dirty = true;
-                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                        player.set_native_hover_preview_pinned(false);
-                    }
-                    self.refresh_fullscreen_video_marker_cache(fs_idx);
-                    self.sync_native_video_timeline_markers(fs_idx);
-                    crate::logger::log(format!(
-                        "video pin removed: {}",
-                        path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
-                    ));
-                }
-                Err(e) => crate::logger::log(format!("video pin remove failed: {e}")),
-            }
-            return;
-        }
         let webp = thumb
             .as_ref()
             .map(|t| {

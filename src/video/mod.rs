@@ -273,7 +273,7 @@ pub enum NativeVideoOutputEvent {
     AddBookmarkAt {
         target_secs: f64,
     },
-    TogglePinAt {
+    SetPinAt {
         target_secs: f64,
     },
     SetBookmarkTitle {
@@ -283,6 +283,7 @@ pub enum NativeVideoOutputEvent {
     DeleteBookmark {
         id: i64,
     },
+    DeletePin,
     OpenExternalUrl {
         url: String,
     },
@@ -1085,11 +1086,12 @@ fn send_native_overlay_command(
         Command::AddBookmarkAt { target_secs } => {
             NativeVideoOutputEvent::AddBookmarkAt { target_secs }
         }
-        Command::TogglePinAt { target_secs } => NativeVideoOutputEvent::TogglePinAt { target_secs },
+        Command::SetPinAt { target_secs } => NativeVideoOutputEvent::SetPinAt { target_secs },
         Command::SetBookmarkTitle { id, title } => {
             NativeVideoOutputEvent::SetBookmarkTitle { id, title }
         }
         Command::DeleteBookmark { id } => NativeVideoOutputEvent::DeleteBookmark { id },
+        Command::DeletePin => NativeVideoOutputEvent::DeletePin,
         Command::OpenExternalUrl { url } => NativeVideoOutputEvent::OpenExternalUrl { url },
         Command::ToggleNormalize => NativeVideoOutputEvent::ToggleNormalize,
         Command::DisableNormalize => NativeVideoOutputEvent::DisableNormalize,
@@ -1634,13 +1636,13 @@ fn run_native_video_output(
                                     NativeVideoOutputEvent::AddBookmarkAt { target_secs },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::TogglePinAt {
+                            crate::video::native_presenter::NativeOverlayCommand::SetPinAt {
                                 target_secs,
                             } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::TogglePinAt { target_secs },
+                                    NativeVideoOutputEvent::SetPinAt { target_secs },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::SetBookmarkTitle {
@@ -1660,6 +1662,13 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::DeleteBookmark { id },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::DeletePin => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::DeletePin,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::OpenExternalUrl {

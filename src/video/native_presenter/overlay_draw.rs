@@ -416,9 +416,9 @@ pub(super) fn draw_native_jump_panel(
                 7.0,
                 egui::Color32::from_rgb(140, 245, 170),
             );
-            let pin_resp = pin_resp.on_hover_text("現在位置をピン留め [P]");
+            let pin_resp = pin_resp.on_hover_text("現在位置をピン留め");
             if pin_resp.clicked() {
-                commands.push(NativeOverlayCommand::TogglePinAt {
+                commands.push(NativeOverlayCommand::SetPinAt {
                     target_secs: position_secs,
                 });
             }
@@ -649,6 +649,29 @@ pub(super) fn draw_native_jump_row(
             if delete_resp.clicked() {
                 delete_clicked = true;
                 commands.push(NativeOverlayCommand::DeleteBookmark { id });
+            }
+        } else if entry.kind == NativeOverlayTimelineMarkerKind::Pin {
+            let delete_rect = egui::Rect::from_min_size(
+                egui::pos2(row_rect.max.x - 28.0, row_rect.min.y + 8.0),
+                egui::vec2(22.0, 22.0),
+            );
+            let delete_resp = ui.interact(
+                delete_rect,
+                egui::Id::new("native_jump_delete_pin"),
+                egui::Sense::click(),
+            );
+            draw_overlay_button_bg(&painter, delete_rect, delete_resp.hovered(), false);
+            painter.text(
+                delete_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "X",
+                egui::FontId::monospace(12.0),
+                egui::Color32::from_rgb(240, 190, 190),
+            );
+            let delete_resp = delete_resp.on_hover_text("ピン留めを解除");
+            if delete_resp.clicked() {
+                delete_clicked = true;
+                commands.push(NativeOverlayCommand::DeletePin);
             }
         }
 

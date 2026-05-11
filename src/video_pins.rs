@@ -96,8 +96,16 @@ impl VideoPinDb {
         .ok()
     }
 
-    /// ピンを書き込む (Phase 5.4.1 で UI から呼ばれる予定)。
-    /// 既存ピンがあれば上書きする。`thumb_webp` が空なら BLOB は NULL になる。
+    /// ピンを書き込む。既存ピンがあれば pts を新値で上書きする。
+    ///
+    /// `thumb_webp` の扱い:
+    /// - **新規 path** (= ON CONFLICT に当たらない): 空なら BLOB は NULL のまま入る
+    ///   (グリッド側は空サムネを除外して Shell API サムネ等にフォールバック)
+    /// - **既存 path の上書き**: 引数が空 (NULL) なら既存 `thumb_webp` を**保持**、
+    ///   非空なら新サムネに更新する。これは「常に上書きセット」UI 動作のもとで、
+    ///   新位置の seek thumbnail が未生成のタイミングに上書きされても既存ピンの
+    ///   グリッドサムネが消えないようにするため (`set_native_video_pin` から
+    ///   `nearest_seek_thumbnail` が None を返す瞬間に呼ばれるケース)。
     #[allow(dead_code)]
     pub fn set_pin(
         &self,
@@ -113,7 +121,13 @@ impl VideoPinDb {
         };
         self.conn.execute(
             "INSERT INTO video_pins (path, pin_pts_secs, thumb_webp) VALUES (?1, ?2, ?3)
-             ON CONFLICT(path) DO UPDATE SET pin_pts_secs = ?2, thumb_webp = ?3",
+             ON CONFLICT(path) DO UPDATE SET
+                pin_pts_secs = excluded.pin_pts_secs,
+                thumb_webp = CASE
+                    WHEN excluded.thumb_webp IS NOT NULL AND length(excluded.thumb_webp) > 0
+                        THEN excluded.thumb_webp
+                    ELSE video_pins.thumb_webp
+                END",
             rusqlite::params![key, pin_pts_secs, blob],
         )?;
         Ok(())
@@ -184,6 +198,35 @@ mod tests {
         assert!(db.lookup(p).is_some());
         db.remove(p).unwrap();
         assert!(db.lookup(p).is_none());
+    }
+
+    /// 既存ピン (thumb あり) を空 thumb で上書きしたとき、pts は更新されるが
+    /// thumb_webp は元の値が保持されること (UI の「常に上書きセット」動作で
+    /// 新位置のサムネ未生成時に既存サムネを消さないため)。
+    #[test]
+    fn empty_thumb_preserves_existing() {
+        let db = open_in_memory();
+        let p = Path::new("C:/v.mp4");
+        let original = vec![0xAA, 0xBB, 0xCC];
+        db.set_pin(p, 1.0, &original).unwrap();
+        // 空 thumb で上書き
+        db.set_pin(p, 9.5, &[]).unwrap();
+        let got = db.lookup(p).expect("present");
+        // pts は新値、thumb は元のまま
+        assert!((got.pin_pts_secs - 9.5).abs() < 1e-9);
+        assert_eq!(got.thumb_webp, original);
+    }
+
+    /// 新規 path に空 thumb で set_pin したとき、行は入るが thumb_webp は
+    /// NULL のままになること (lookup では空 Vec として返る)。
+    #[test]
+    fn empty_thumb_on_new_row_stores_null() {
+        let db = open_in_memory();
+        let p = Path::new("C:/new.mp4");
+        db.set_pin(p, 3.0, &[]).unwrap();
+        let got = db.lookup(p).expect("present");
+        assert!((got.pin_pts_secs - 3.0).abs() < 1e-9);
+        assert!(got.thumb_webp.is_empty());
     }
 
     #[test]
