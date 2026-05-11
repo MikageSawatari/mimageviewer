@@ -1854,6 +1854,11 @@ pub struct App {
     /// 動画ピン留めの書き換えがあったので、フルスクリーン解除時 / 次回 grid 表示時
     /// に動画サムネ オーバーライド map を再構築する必要があるフラグ (Phase 8.B')。
     pub(crate) video_thumb_overrides_dirty: bool,
+    /// ピン留めボタン押下時に thumb worker キャッシュが空だった場合の後追い更新待ち。
+    /// `tick_pending_pin_thumb_refresh` が後続フレームで worker 完了をポーリングし、
+    /// 取れ次第 `VideoPinDb::set_pin` を再呼び出しして DB のサムネ BLOB を埋める。
+    #[cfg(windows)]
+    pub(crate) pending_pin_thumb_refresh: Option<native_video::PendingPinThumbRefresh>,
     /// フルスクリーン動画のピン / ブックマークキャッシュ。
     /// `App::update` とシークバー描画中に SQLite SELECT を毎フレーム走らせない。
     pub(crate) fullscreen_video_marker_cache: Option<FullscreenVideoMarkerCache>,
@@ -2814,6 +2819,8 @@ impl Default for App {
             video_tile_cache,
             fs_open_intent_from_grid: false,
             video_thumb_overrides_dirty: false,
+            #[cfg(windows)]
+            pending_pin_thumb_refresh: None,
             fullscreen_video_marker_cache: None,
             last_loop_pos: std::collections::HashMap::new(),
             video_perf_overlay_visible: false,
@@ -11157,6 +11164,10 @@ impl App {
         }
         self.fullscreen_idx = None;
         self.fullscreen_video_marker_cache = None;
+        #[cfg(windows)]
+        {
+            self.pending_pin_thumb_refresh = None;
+        }
         // 動画ループの baseline (= 直前 tick の position/serial) もクリアする。
         // 次回フルスクリーンで別動画を開いたときに古い baseline を引き継いで誤爆 seek を
         // 起こさないため。
@@ -13322,6 +13333,10 @@ impl App {
         for idx in &active_video_indices {
             self.tick_native_video_loop_boundary(*idx);
         }
+        // ピン留め時に thumb worker キャッシュが空だった場合、後続フレームで完了を
+        // ポーリングして DB のサムネ BLOB を埋める。
+        #[cfg(windows)]
+        self.tick_pending_pin_thumb_refresh(ctx);
         #[cfg(windows)]
         if self.fullscreen_idx.is_some() && self.settings.vst3_enabled {
             self.vst3_pump_gui_signals();

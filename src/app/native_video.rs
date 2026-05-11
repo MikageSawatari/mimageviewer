@@ -1,5 +1,19 @@
 use super::*;
 
+/// 動画ピン留めの「ピン位置のフレームをサムネ DB に書き戻す」非同期待ち用。
+///
+/// ピン留めボタンが押されたが thumb worker キャッシュにそのフレームがまだ無い場合、
+/// 1 件だけ pending を保持して `tick_pending_pin_thumb_refresh` が後続フレームで
+/// 完了をポーリングし、揃ったところで `VideoPinDb::set_pin` を再呼び出ししてグリッド
+/// サムネに反映する (`video_thumb_overrides_dirty` を立て直す)。
+#[cfg(windows)]
+pub(crate) struct PendingPinThumbRefresh {
+    pub(crate) fs_idx: usize,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) pts: f64,
+    pub(crate) started_at: std::time::Instant,
+}
+
 /// Norm 操作 (toggle ON / OFF / scan 完了) を 1 セットで適用するヘルパー。
 ///
 /// 3 箇所 (`disable_normalize_globally` / `apply_normalize_gain_db_to_player` /
@@ -1932,6 +1946,7 @@ impl App {
             })
             .unwrap_or_default();
         let webp_len = webp.len();
+        let webp_was_empty = webp.is_empty();
         match db.set_pin(&path, pts, &webp) {
             Ok(()) => {
                 self.video_thumb_overrides_dirty = true;
@@ -1945,9 +1960,104 @@ impl App {
                     webp_len,
                     path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
                 ));
+                // thumb worker のキャッシュに pts のフレームがまだ無いタイミングで
+                // ピン留めされると webp が空になり、set_pin SQL の「空なら既存温存」
+                // 保護で古いサムネが残ったまま新サムネに更新されない。後続フレームで
+                // worker 完了をポーリングして DB を書き直すための pending を立てる。
+                if webp_was_empty {
+                    self.pending_pin_thumb_refresh = Some(PendingPinThumbRefresh {
+                        fs_idx,
+                        path,
+                        pts,
+                        started_at: std::time::Instant::now(),
+                    });
+                } else {
+                    // 取れていれば過去の pending は不要 (同じ path 別 pts でも上書き済み)
+                    self.pending_pin_thumb_refresh = None;
+                }
             }
             Err(e) => crate::logger::log(format!("video pin set failed: {e}")),
         }
+    }
+
+    /// `tick_native_video_loop_boundary` 直後に呼ばれ、`set_native_video_pin` で
+    /// 空サムネのまま set_pin された pin に対して、thumb worker が抽出を完了したら
+    /// WebP に encode し直して DB に書き戻す。完了 or タイムアウトで pending を解放。
+    #[cfg(windows)]
+    pub(crate) fn tick_pending_pin_thumb_refresh(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_pin_thumb_refresh.as_ref() else {
+            return;
+        };
+        // 10s タイムアウト (worker 開始から数百 ms 〜 数秒で取れるのが想定。長尺で
+        // seek が遅い動画でも 10s あれば足りる)。
+        if pending.started_at.elapsed() > std::time::Duration::from_secs(10) {
+            crate::logger::log(format!(
+                "video pin thumb refresh timed out: pts={:.2}s {}",
+                pending.pts,
+                pending
+                    .path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("?")
+            ));
+            self.pending_pin_thumb_refresh = None;
+            return;
+        }
+        // 動画切替やフルスクリーン解除で pending と現状が一致しなくなったら諦める。
+        let player_path = match self.fs_cache.get(&pending.fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => Some(player.path().clone()),
+            _ => None,
+        };
+        if self.fullscreen_idx != Some(pending.fs_idx)
+            || player_path.as_ref() != Some(&pending.path)
+        {
+            self.pending_pin_thumb_refresh = None;
+            return;
+        }
+        // worker キャッシュをポーリング。取れなければ再要求 (worker が次の pause で
+        // request を drop していた場合の保険)。
+        let thumb =
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&pending.fs_idx) {
+                let t = player.nearest_seek_thumbnail(pending.pts);
+                if t.is_none() {
+                    player.request_seek_thumbnail(pending.pts);
+                    // worker が動くまで次フレームで repaint させる
+                    ctx.request_repaint_after(std::time::Duration::from_millis(80));
+                }
+                t
+            } else {
+                None
+            };
+        let Some(thumb) = thumb else {
+            return;
+        };
+        let webp = {
+            let encoder = webp::Encoder::from_rgba(&thumb.rgba, thumb.width, thumb.height);
+            encoder.encode(75.0).to_vec()
+        };
+        if webp.is_empty() {
+            // encode 失敗 — ループに任せて次フレーム再試行
+            return;
+        }
+        let pts = pending.pts;
+        let path = pending.path.clone();
+        let fs_idx = pending.fs_idx;
+        if let Some(db) = self.video_pin_db.as_ref() {
+            match db.set_pin(&path, pts, &webp) {
+                Ok(()) => {
+                    self.video_thumb_overrides_dirty = true;
+                    self.refresh_fullscreen_video_marker_cache(fs_idx);
+                    self.sync_native_video_timeline_markers(fs_idx);
+                    crate::logger::log(format!(
+                        "video pin thumb refreshed: pts={pts:.2}s webp={}B {}",
+                        webp.len(),
+                        path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                    ));
+                }
+                Err(e) => crate::logger::log(format!("video pin thumb refresh failed: {e}")),
+            }
+        }
+        self.pending_pin_thumb_refresh = None;
     }
 
     #[cfg(windows)]
