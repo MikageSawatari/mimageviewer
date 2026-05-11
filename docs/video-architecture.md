@@ -445,8 +445,21 @@ event channel で App に通知し、App 側がシーク、ブックマーク、
 - `tile_thumb_cache.rs`: SQLite + WebP の永続キャッシュ。**絶対 PTS をキー**にしているため
   動画の長さが変わっても再ヒットする (Phase 8.C の修正)
 
-タイルモードの UI 描画は `native_presenter/overlay_draw.rs` の `draw_native_tile_overlay`
-が一手に行う。`ui_video_tile.rs` は state 構造体 (`VideoTileState`) と worker spawn
+タイルモードの UI 描画は `native_presenter/overlay_draw.rs` の以下 2 関数で構成する:
+
+- `draw_native_tile_overlay` — 中央 preparing 文言とサムネイルグリッドを描画。
+- `draw_native_top_bar_tile` — 通常再生時の `draw_native_top_bar` と同じ 54px の
+  上部バーを描画し、タイトル / 解像度 / fps / コーデック / duration / タイル間隔 /
+  抽出進捗 (`N/M`) を表示する。右側に 3 ボタン: × (`ToggleTileMode`)、
+  5x5 / 3x3 グリッドアイコン (`TileColumnsDelta { delta: ±1 }`)。Ctrl+ホイールでの
+  列数切替と等価で、ショートカットの発見性を上げる目的で並べてある。
+- `NativeOverlayTileOverlay` には `fallback_file_name: String` を含む。ホイールで
+  別動画に切り替わって metadata が None になる数フレームでも上部バーにファイル名を
+  出すための fallback。`sync_native_video_tile_overlay` が `state.video_path` から
+  詰める。`preparing_with_filename(name)` コンストラクタで preparing 状態にも値を
+  通す。
+
+`ui_video_tile.rs` は state 構造体 (`VideoTileState`) と worker spawn
 ロジックだけを持ち、egui 描画関数は v0.9 系で削除済み。
 
 ## 経路選択ロジック (起動時 1 回)

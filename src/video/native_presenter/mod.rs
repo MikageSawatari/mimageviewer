@@ -409,10 +409,17 @@ pub struct NativeOverlayTileOverlay {
     pub progress_total: usize,
     pub finished: bool,
     pub tiles: Vec<Option<NativeOverlayTileThumbnail>>,
+    // ホイールで動画を切り替えた直後など metadata が None の数フレームでも、
+    // 上部バーのタイトル行にファイル名を出すための fallback。
+    pub fallback_file_name: String,
 }
 
 impl NativeOverlayTileOverlay {
     pub fn preparing() -> Self {
+        Self::preparing_with_filename(String::new())
+    }
+
+    pub fn preparing_with_filename(file_name: String) -> Self {
         Self {
             interval_secs: 0.0,
             timestamps: Vec::new(),
@@ -423,6 +430,7 @@ impl NativeOverlayTileOverlay {
             progress_total: 0,
             finished: false,
             tiles: Vec::new(),
+            fallback_file_name: file_name,
         }
     }
 }
@@ -2735,6 +2743,13 @@ impl NativeEguiOverlay {
                     overlay_height_points,
                     tile_overlay,
                     &tile_texture_ids,
+                    &mut commands,
+                );
+                draw_native_top_bar_tile(
+                    ctx,
+                    overlay_width_points,
+                    video_metadata.as_ref(),
+                    tile_overlay,
                     &mut commands,
                 );
                 return;

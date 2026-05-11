@@ -1711,7 +1711,9 @@ impl App {
         let tile_overlay = if let Some(state) = self.video_tile_state.as_ref() {
             if state.video_path != current_path {
                 if swap_pending_for_current {
-                    Some(Self::native_video_tile_preparing_overlay())
+                    Some(Self::native_video_tile_preparing_overlay_for_path(
+                        &current_path,
+                    ))
                 } else {
                     clear_state = true;
                     None
@@ -1736,6 +1738,12 @@ impl App {
                         })
                     })
                     .collect();
+                let fallback_file_name = state
+                    .video_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
                 Some(crate::video::native_presenter::NativeOverlayTileOverlay {
                     interval_secs: state.interval_secs,
                     timestamps: state.timestamps.clone(),
@@ -1746,10 +1754,22 @@ impl App {
                     progress_total,
                     finished,
                     tiles,
+                    fallback_file_name,
                 })
             }
-        } else if swap_pending_for_current || self.video_tile_reopen_pending {
-            Some(Self::native_video_tile_preparing_overlay())
+        } else if swap_pending_for_current {
+            let target_path = self
+                .video_tile_swap_pending
+                .as_ref()
+                .map(|pending| pending.target_path.clone())
+                .unwrap_or_else(|| current_path.clone());
+            Some(Self::native_video_tile_preparing_overlay_for_path(
+                &target_path,
+            ))
+        } else if self.video_tile_reopen_pending {
+            Some(Self::native_video_tile_preparing_overlay_for_path(
+                &current_path,
+            ))
         } else {
             None
         };
@@ -1764,15 +1784,24 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn native_video_tile_preparing_overlay()
-    -> crate::video::native_presenter::NativeOverlayTileOverlay {
-        crate::video::native_presenter::NativeOverlayTileOverlay::preparing()
+    pub(super) fn native_video_tile_preparing_overlay_for_path(
+        path: &std::path::Path,
+    ) -> crate::video::native_presenter::NativeOverlayTileOverlay {
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        crate::video::native_presenter::NativeOverlayTileOverlay::preparing_with_filename(file_name)
     }
 
     #[cfg(windows)]
     pub(super) fn set_native_video_tile_preparing_overlay(&self, fs_idx: usize) {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.set_native_tile_overlay(Some(Self::native_video_tile_preparing_overlay()));
+            let path = player.path().clone();
+            player.set_native_tile_overlay(Some(
+                Self::native_video_tile_preparing_overlay_for_path(&path),
+            ));
         }
     }
 

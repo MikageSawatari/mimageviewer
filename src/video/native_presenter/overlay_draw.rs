@@ -758,6 +758,8 @@ pub(super) fn draw_native_bookmark_title_editor(
 #[derive(Copy, Clone)]
 pub(super) enum NativeTopButtonGlyph {
     TileGrid,
+    TileColumnsLess,
+    TileColumnsMore,
     PerfGraph,
     Vst3,
     Close,
@@ -783,6 +785,8 @@ pub(super) fn draw_native_top_button(
     draw_overlay_button_bg(painter, rect, resp.hovered(), active);
     match glyph {
         NativeTopButtonGlyph::TileGrid => draw_overlay_tile_grid_icon(painter, rect),
+        NativeTopButtonGlyph::TileColumnsLess => draw_overlay_grid_density_icon(painter, rect, 3),
+        NativeTopButtonGlyph::TileColumnsMore => draw_overlay_grid_density_icon(painter, rect, 5),
         NativeTopButtonGlyph::PerfGraph => draw_overlay_perf_graph_icon(painter, rect),
         NativeTopButtonGlyph::Vst3 => draw_overlay_vst3_top_icon(painter, rect),
         NativeTopButtonGlyph::Close => draw_overlay_close_icon(painter, rect),
@@ -887,6 +891,26 @@ pub(super) fn draw_overlay_tile_grid_icon(painter: &egui::Painter, rect: egui::R
             painter.rect_filled(
                 egui::Rect::from_min_size(min, egui::vec2(cell, cell)),
                 1.5,
+                egui::Color32::from_rgb(238, 238, 238),
+            );
+        }
+    }
+}
+
+pub(super) fn draw_overlay_grid_density_icon(painter: &egui::Painter, rect: egui::Rect, n: usize) {
+    let n = n.max(2) as f32;
+    let inner = 17.0_f32;
+    let gap = if n >= 5.0 { 1.2 } else { 2.0 };
+    let cell = ((inner - gap * (n - 1.0)) / n).max(1.0);
+    let total = cell * n + gap * (n - 1.0);
+    let start = rect.center() - egui::vec2(total * 0.5, total * 0.5);
+    let rounding = if cell >= 4.0 { 1.0 } else { 0.5 };
+    for row in 0..(n as usize) {
+        for col in 0..(n as usize) {
+            let min = start + egui::vec2((cell + gap) * col as f32, (cell + gap) * row as f32);
+            painter.rect_filled(
+                egui::Rect::from_min_size(min, egui::vec2(cell, cell)),
+                rounding,
                 egui::Color32::from_rgb(238, 238, 238),
             );
         }
@@ -1471,6 +1495,38 @@ pub(super) fn draw_native_normalize_progress(
         });
 }
 
+pub(super) fn draw_top_bar_background(painter: &egui::Painter, overlay_width_points: f32) {
+    let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(overlay_width_points, 54.0));
+    painter.rect_filled(
+        rect,
+        0.0,
+        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 186),
+    );
+}
+
+pub(super) fn draw_top_bar_text_lines(
+    painter: &egui::Painter,
+    title_text: &str,
+    sub_text: &str,
+    name_truncate: usize,
+    sub_truncate: usize,
+) {
+    painter.text(
+        egui::pos2(14.0, 20.0),
+        egui::Align2::LEFT_CENTER,
+        truncate_overlay_text(title_text, name_truncate),
+        egui::FontId::proportional(15.0),
+        egui::Color32::from_rgb(240, 240, 240),
+    );
+    painter.text(
+        egui::pos2(14.0, 39.0),
+        egui::Align2::LEFT_CENTER,
+        truncate_overlay_text(sub_text, sub_truncate),
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_rgb(190, 190, 190),
+    );
+}
+
 pub(super) fn draw_native_top_bar(
     ctx: &egui::Context,
     overlay_width_points: f32,
@@ -1490,11 +1546,7 @@ pub(super) fn draw_native_top_bar(
                 egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(overlay_width_points, 54.0));
             ui.set_min_size(rect.size());
             let painter = ui.painter().clone();
-            painter.rect_filled(
-                rect,
-                0.0,
-                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 186),
-            );
+            draw_top_bar_background(&painter, overlay_width_points);
             let name = metadata
                 .and_then(|m| {
                     m.title
@@ -1504,13 +1556,6 @@ pub(super) fn draw_native_top_bar(
                 })
                 .map(String::as_str)
                 .unwrap_or("video");
-            painter.text(
-                egui::pos2(14.0, 20.0),
-                egui::Align2::LEFT_CENTER,
-                truncate_overlay_text(name, 88),
-                egui::FontId::proportional(15.0),
-                egui::Color32::from_rgb(240, 240, 240),
-            );
             let sub = if let Some(m) = metadata {
                 format!(
                     "{}x{}  {}  {}  {}",
@@ -1527,13 +1572,7 @@ pub(super) fn draw_native_top_bar(
                     format_overlay_time(duration_secs)
                 )
             };
-            painter.text(
-                egui::pos2(14.0, 39.0),
-                egui::Align2::LEFT_CENTER,
-                truncate_overlay_text(&sub, 120),
-                egui::FontId::proportional(12.0),
-                egui::Color32::from_rgb(190, 190, 190),
-            );
+            draw_top_bar_text_lines(&painter, name, &sub, 88, 120);
 
             let btn_size = 28.0;
             let gap = 8.0;
@@ -1602,6 +1641,136 @@ pub(super) fn draw_native_top_bar(
                     commands,
                 );
             }
+        });
+}
+
+pub(super) fn draw_native_top_bar_tile(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    metadata: Option<&NativeOverlayMetadata>,
+    tile_state: &NativeOverlayTileOverlay,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    egui::Area::new(egui::Id::new("native_video_tile_top_bar"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let rect =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(overlay_width_points, 54.0));
+            ui.set_min_size(rect.size());
+            let painter = ui.painter().clone();
+            draw_top_bar_background(&painter, overlay_width_points);
+
+            // タイトル: title (空白除去) → file_name → fallback_file_name → "video"
+            let fallback = tile_state.fallback_file_name.trim();
+            let title_text: &str = metadata
+                .and_then(|m| {
+                    m.title
+                        .as_ref()
+                        .map(String::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .or_else(|| {
+                            let fname = m.file_name.as_str();
+                            if fname.trim().is_empty() {
+                                None
+                            } else {
+                                Some(fname)
+                            }
+                        })
+                })
+                .unwrap_or_else(|| {
+                    if fallback.is_empty() {
+                        "video"
+                    } else {
+                        fallback
+                    }
+                });
+
+            // サブ行: 真空状態を最優先で「タイルを準備中...」、それ以外は metadata 有無で分岐
+            let progress_total = tile_state.progress_total;
+            let progress_done = tile_state.progress_done;
+            let finished = tile_state.finished;
+            let interval_secs = tile_state.interval_secs;
+            let show_counter = progress_total > 0 && !finished;
+            let counter_suffix = if show_counter {
+                format!("  {progress_done}/{progress_total}")
+            } else {
+                String::new()
+            };
+
+            let sub_text = if interval_secs <= 0.0 && progress_total == 0 {
+                String::from("タイルを準備中...")
+            } else if let Some(m) = metadata {
+                format!(
+                    "{}x{}  {}  {}  {}  間隔 {}{}",
+                    m.width,
+                    m.height,
+                    format_fps(m.avg_fps),
+                    m.video_codec,
+                    format_overlay_time(m.duration_secs),
+                    format_tile_interval(interval_secs),
+                    counter_suffix
+                )
+            } else {
+                format!(
+                    "間隔 {}{}",
+                    format_tile_interval(interval_secs),
+                    counter_suffix
+                )
+            };
+
+            draw_top_bar_text_lines(&painter, title_text, &sub_text, 70, 95);
+
+            let btn_size = 28.0;
+            let gap = 8.0;
+            let mut x = overlay_width_points - 12.0 - btn_size;
+            let y = 13.0;
+
+            draw_native_top_button(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                btn_size,
+                btn_size,
+                gap,
+                "native_tile_top_close",
+                NativeTopButtonGlyph::Close,
+                false,
+                "動画に戻る [S / Esc]",
+                NativeOverlayCommand::ToggleTileMode,
+                commands,
+            );
+            draw_native_top_button(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                btn_size,
+                btn_size,
+                gap,
+                "native_tile_columns_more",
+                NativeTopButtonGlyph::TileColumnsMore,
+                false,
+                "サムネ列数を増やす [Ctrl+ホイール下]",
+                NativeOverlayCommand::TileColumnsDelta { delta: 1 },
+                commands,
+            );
+            draw_native_top_button(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                btn_size,
+                btn_size,
+                gap,
+                "native_tile_columns_less",
+                NativeTopButtonGlyph::TileColumnsLess,
+                false,
+                "サムネ列数を減らす [Ctrl+ホイール上]",
+                NativeOverlayCommand::TileColumnsDelta { delta: -1 },
+                commands,
+            );
         });
 }
 
@@ -2027,32 +2196,8 @@ pub(super) fn draw_native_tile_overlay(
                 egui::Sense::click(),
             );
 
-            let interval = format_tile_interval(state.interval_secs);
-            let header = format!(
-                "タイル モード - 間隔 {interval} - {}/{}  [S / Esc]",
-                state.progress_done, state.progress_total
-            );
-            painter.text(
-                egui::pos2(16.0, 24.0),
-                egui::Align2::LEFT_CENTER,
-                header,
-                egui::FontId::proportional(14.0),
-                egui::Color32::from_rgb(224, 224, 224),
-            );
-            let close_rect = egui::Rect::from_min_size(
-                egui::pos2((overlay_width_points - 44.0).max(8.0), 10.0),
-                egui::vec2(32.0, 32.0),
-            );
-            let close_resp = ui.interact(
-                close_rect,
-                egui::Id::new("native_video_tile_close"),
-                egui::Sense::click(),
-            );
-            draw_overlay_button_bg(painter, close_rect, close_resp.hovered(), false);
-            draw_overlay_close_icon(painter, close_rect);
-            if close_resp.on_hover_text("動画に戻る [S / Esc]").clicked() {
-                commands.push(NativeOverlayCommand::ToggleTileMode);
-            }
+            // ヘッダー (タイトル / メタデータ / ボタン列) は draw_native_top_bar_tile が
+            // 描画する。タイルオーバーレイは中央の preparing 文言とグリッドだけを担う。
 
             if state.progress_done == 0 && !state.finished {
                 painter.text(
