@@ -925,6 +925,91 @@ mod phase_c_drill_nav_tests {
         );
     }
 
+    fn run_grid_key(app: &mut super::App, modifiers: egui::Modifiers, key: egui::Key) {
+        let ctx = egui::Context::default();
+        ctx.begin_pass(egui::RawInput {
+            modifiers,
+            events: vec![egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            }],
+            ..Default::default()
+        });
+        let _ = app.handle_keyboard(&ctx);
+        let _ = ctx.end_pass();
+    }
+
+    /// 2026-05 ユーザー報告: ★フィルタでサムネイルが 0 件になった状態でも、
+    /// Shift+F6 は current_folder のコンテナ★を解除できること。
+    #[test]
+    fn shift_f6_clears_current_folder_rating_when_visible_indices_empty() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let folder = std::path::PathBuf::from("c:/pics");
+        let image = folder.join("a.jpg");
+        let key = crate::adjustment_db::normalize_path(&folder);
+
+        app.current_folder = Some(folder);
+        app.items.push(GridItem::Image(image));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rating_db
+            .as_ref()
+            .expect("rating_db")
+            .set(&key, 4)
+            .expect("seed current folder rating");
+
+        let mut rf = [false; 6];
+        rf[5] = true;
+        app.settings.rating_filter = rf;
+        app.rebuild_visible_indices();
+        assert!(
+            app.visible_indices.is_empty(),
+            "前提: フィルタ後のサムネイルは 0 件"
+        );
+
+        run_grid_key(&mut app, egui::Modifiers::SHIFT, egui::Key::F6);
+
+        assert_eq!(
+            app.rating_db.as_ref().unwrap().get(&key),
+            0,
+            "Shift+F6 は可視アイテムがなくても current_folder の★を解除する"
+        );
+        assert_eq!(app.current_folder_rating_cache, Some(0));
+    }
+
+    /// 空表示で Shift+F* によるコンテナ★変更を行った直後も Ctrl+Z で戻せること。
+    #[test]
+    fn ctrl_z_undoes_current_folder_rating_when_visible_indices_empty() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let folder = std::path::PathBuf::from("c:/pics");
+        let image = folder.join("a.jpg");
+        let key = crate::adjustment_db::normalize_path(&folder);
+
+        app.current_folder = Some(folder);
+        app.items.push(GridItem::Image(image));
+        app.thumbnails.push(ThumbnailState::Pending);
+        let mut rf = [false; 6];
+        rf[3] = true;
+        app.settings.rating_filter = rf;
+        app.rebuild_visible_indices();
+        assert!(app.visible_indices.is_empty());
+
+        run_grid_key(&mut app, egui::Modifiers::SHIFT, egui::Key::F5);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 5);
+
+        run_grid_key(&mut app, egui::Modifiers::CTRL, egui::Key::Z);
+
+        assert_eq!(
+            app.rating_db.as_ref().unwrap().get(&key),
+            0,
+            "空表示でもコンテナ★変更の Undo が効く"
+        );
+    }
+
     /// 2026-04 ユーザー報告: Ctrl+G で検索 → SearchContainer に drill-in →
     /// BS で Aggregated に戻ったとき、開いていたコンテナのセルにカーソルが
     /// 復帰してほしい (旧実装は selected=None で先頭に飛んでいた)。

@@ -7890,6 +7890,30 @@ impl App {
         // 奪ってしまい「上右下は動くのに左だけ親階層へ戻る」という現象になっていた
         // (ユーザー報告 2026-04)。カーソル移動を優先する設計に戻す。
 
+        // F1-F5: レーティング 1〜5 を適用 / F6: レーティング解除
+        // (チェック済みアイテムがあれば一括、なければ選択にのみ)
+        // Shift+F1-F5 / F6: 現在一覧表示中のフォルダ / ZIP / PDF 本体に評価を付与。
+        // コンテナ★は可視アイテムが 0 件でも current_folder に対して成立するため、
+        // visible_indices の有無に関係なく処理する。
+        // matches_logically 対策で Shift 版を先に consume する (NONE は Shift 入りも拾う)。
+        {
+            let shift_rating_key = ctx
+                .input_mut(|i| crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::SHIFT));
+            if let Some(stars) = shift_rating_key
+                && self.set_current_folder_rating(stars)
+            {
+                self.show_container_rating_toast(stars);
+            }
+            let rating_key =
+                ctx.input_mut(|i| crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::NONE));
+            if let Some(stars) = rating_key {
+                self.apply_rating_to_selection(stars);
+            }
+        }
+
+        // コンテナ★の Undo/Redo も空表示時に効くよう、可視アイテム数には依存させない。
+        self.handle_meta_undo_keys(ctx);
+
         let vi = &self.visible_indices;
         let vi_len = vi.len();
 
@@ -7992,27 +8016,6 @@ impl App {
                 }
             }
 
-            // F1-F5: レーティング 1〜5 を適用 / F6: レーティング解除
-            // (チェック済みアイテムがあれば一括、なければ選択にのみ)
-            // Shift+F1-F5 / F6: 現在一覧表示中のフォルダ / ZIP / PDF 本体に評価を付与。
-            // matches_logically 対策で Shift 版を先に consume する (NONE は Shift 入りも拾う)。
-            {
-                let shift_rating_key = ctx.input_mut(|i| {
-                    crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::SHIFT)
-                });
-                if let Some(stars) = shift_rating_key
-                    && self.set_current_folder_rating(stars)
-                {
-                    self.show_container_rating_toast(stars);
-                }
-                let rating_key = ctx.input_mut(|i| {
-                    crate::ui_helpers::consume_rating_fkey(i, egui::Modifiers::NONE)
-                });
-                if let Some(stars) = rating_key {
-                    self.apply_rating_to_selection(stars);
-                }
-            }
-
             // F7/F8: マスクスロット 1/2 を一括適用
             // (チェック済みアイテムがあれば一括、なければ選択 1 件に)
             // フルスクリーン側 (ui_fullscreen.rs) と揃えて修飾キー無しのみ受け付ける。
@@ -8089,8 +8092,6 @@ impl App {
                     });
                 }
             }
-
-            self.handle_meta_undo_keys(ctx);
 
             if enter {
                 // Shift+Enter で動画を外部プレイヤーで開く (フルスクリーン中と
