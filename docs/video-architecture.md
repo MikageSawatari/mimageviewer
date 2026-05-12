@@ -245,13 +245,15 @@ src/video/
 
 | thread 名 | 責務 | 入力 | 出力 |
 |---|---|---|---|
-| `video-demux` (= `run_decoder`) | `Input::packets()` ループ、seek 調停、EOF idle wait、`engine_event_tx` への SeekCompleted 発火 | `Arc<AvClock>` (seek_request) / 動画ファイル | `video_pkt_tx` / `audio_pkt_tx` (各 bounded=64) |
-| `video-decode` (= `run_video_decode`) | HW (`D3D11VA`) → GPU blit / SW + swscale、PACE_LEAD=0.30 の pacing、`new_seek_pending` generation race check | `video_pkt_rx` (`VideoWorkerMsg::{Packet, Flush, Eof}`) | `video_tx` (bounded=24、`VideoFrame`) |
-| `video-audio-decode` (= `run_audio_decode`) | avcodec decode + swresample、post-seek packet/sample trim、PAUSED/EOF park、EOF drain | `audio_pkt_rx` (`AudioWorkerMsg::{Packet, Flush, Eof}`) | `audio_tx` (bounded=32、`AudioFrame`) |
+| `video-demux` (= `run_decoder`) | `Input::packets()` ループ、seek 調停、EOF idle wait、`engine_event_tx` への SeekCompleted 発火 | `Arc<AvClock>` (seek_request) / 動画ファイル | `video_pkt_tx` (bounded=32) / `audio_pkt_tx` (bounded=64) / `video_ctl_tx` / `audio_ctl_tx` |
+| `video-decode` (= `run_video_decode`) | HW (`D3D11VA`) → GPU blit / SW + swscale、PACE_LEAD=0.30 の pacing、`new_seek_pending` generation race check | `video_pkt_rx` (`VideoPacketMsg::{Packet, Eof}`) + `video_ctl_rx` (`VideoControlMsg::Flush`) | `video_tx` (bounded=24、`VideoFrame`) |
+| `video-audio-decode` (= `run_audio_decode`) | avcodec decode + swresample、post-seek packet/sample trim、PAUSED/EOF park、EOF drain | `audio_pkt_rx` (`AudioPacketMsg::{Packet, Eof}`) + `audio_ctl_rx` (`AudioControlMsg::Flush`) | `audio_tx` (bounded=32、`AudioFrame`) |
 
 **seek 調停**: `clock.take_seek_request()` を pull するのは demux thread のみ
 (= 旧構造と同じ単一 puller)。`input.seek` 成否を判定後、両 decode thread に
-`Flush { serial, target_secs: Option<f64> }` を順序保証 channel で enqueue する。
+`Flush { serial, target_secs: Option<f64> }` を packet queue とは別の control
+channel で enqueue する。decode thread は `select_biased!` で control を優先受信するため、
+packet queue が満杯でも Flush が古い compressed packet の後ろに埋もれない。
 `target_secs.is_some()` (= seek 成功) なら受信側で post-seek preroll trim を実施
 (動画は `drop_before_secs` + `post_seek_frame_sent=false` で 1 枚目を保護、音声は
 packet/sample 段階の trim)。`target_secs.is_none()` (= seek 失敗) なら trim なしで

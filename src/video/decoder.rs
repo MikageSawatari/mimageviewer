@@ -23,12 +23,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use crossbeam_channel::{Receiver, SendTimeoutError, Sender, bounded};
+use crossbeam_channel::{Receiver, SendTimeoutError, Sender, TryRecvError, bounded};
 
 use super::clock::AvClock;
 
-const AUDIO_PACKET_QUEUE_CAP: usize = 256;
-const VIDEO_PACKET_QUEUE_CAP: usize = 256;
+const AUDIO_PACKET_QUEUE_CAP: usize = 64;
+const VIDEO_PACKET_QUEUE_CAP: usize = 32;
+const AUDIO_CONTROL_QUEUE_CAP: usize = 8;
+const VIDEO_CONTROL_QUEUE_CAP: usize = 8;
 const VIDEO_PACKET_OVERFLOW_MAX_BYTES: usize = 64 * 1024 * 1024;
 const DEMUX_PACKET_SEND_WAIT_WARN_MS: f64 = 20.0;
 const DEMUX_PACKET_SEND_TIMEOUT_MS: u64 = 2;
@@ -202,13 +204,13 @@ fn send_demux_packet_seek_aware<T>(
 // blocked by the frozen Buffering audio pipeline. Drain the video overflow on
 // each audio send timeout so FirstFrameReady can still be produced.
 fn send_audio_packet_with_video_drain(
-    audio_pkt_tx: &Sender<AudioWorkerMsg>,
-    mut msg: AudioWorkerMsg,
+    audio_pkt_tx: &Sender<AudioPacketMsg>,
+    mut msg: AudioPacketMsg,
     clock: &AvClock,
     cancel: &AtomicBool,
     pending_video_packets: &mut VecDeque<QueuedVideoPacket>,
     pending_video_packet_bytes: &mut usize,
-    video_pkt_tx: &Sender<VideoWorkerMsg>,
+    video_pkt_tx: &Sender<VideoPacketMsg>,
 ) -> DemuxPacketSend {
     let wait_started = std::time::Instant::now();
     let mut last_wait_log = wait_started;
@@ -382,12 +384,12 @@ fn packet_timestamp(packet: &ffmpeg_the_third::Packet) -> Option<i64> {
 /// 経路の中で吸収されない、という二次的なストールが残る。Phase B は demux も独立
 /// スレッドにして video decode と並行動作させる。
 ///
-/// `Flush` と `Eof` は `AudioWorkerMsg` と同じセマンティクスで、順序保証は channel
-/// が担保する。`Packet` には `seek_serial` を含める。video decode thread は `Flush`
-/// 受領でローカル serial を更新しつつ、clock の live serial が先に進んだ場合も古い
-/// packet を捨てる。direct queue は shallow に保ち、Flush を古い packet の後ろへ
-/// 深く埋めない設計にしているため、live serial drop でも大きな seek gap を作らない。
-enum VideoWorkerMsg {
+/// `Packet` / `Eof` は順序保証のため同じ bounded queue に置く。`Flush` は seek
+/// 制御トラフィックなので [`VideoControlMsg`] の別 channel で優先配送する。
+/// `Packet` には `seek_serial` を含める。video decode thread は `Flush` 受領で
+/// ローカル serial を更新しつつ、clock の live serial が先に進んだ場合も古い
+/// packet を捨てる。
+enum VideoPacketMsg {
     /// avformat から取り出した未デコード動画 packet。video decode thread が
     /// `send_packet` → `receive_frame` → (GPU blit / swscale) → pacing →
     /// `video_tx.try_send` を行う。
@@ -395,6 +397,18 @@ enum VideoWorkerMsg {
         serial: u64,
         packet: ffmpeg_the_third::Packet,
     },
+    /// EOF 到達通知。video decode thread は何もせずに次の `Packet` か `Flush`
+    /// か channel disconnect を待つ (旧 `run_decoder` の挙動と同じく、内部
+    /// 残フレームは EOF で失われる)。
+    Eof,
+}
+
+/// seek Flush は packet queue とは別の control channel で送る。
+///
+/// 旧構造では `Flush` も [`VideoPacketMsg::Packet`] と同じ bounded queue に
+/// 入っていたため、動画 packet queue が満杯の状態で seek すると Flush が
+/// decode thread に届かず、`video flush send still waiting` が続くことがあった。
+enum VideoControlMsg {
     /// シーク完了通知。video decode thread はこれを受けて自分の avcodec デコーダ
     /// を `flush()` し、`current_seek_serial` を更新する。
     ///
@@ -417,10 +431,27 @@ enum VideoWorkerMsg {
         seek_target_secs: Option<f64>,
         trim_before_secs: Option<f64>,
     },
-    /// EOF 到達通知。video decode thread は何もせずに次の `Packet` か `Flush`
-    /// か channel disconnect を待つ (旧 `run_decoder` の挙動と同じく、内部
-    /// 残フレームは EOF で失われる)。
-    Eof,
+}
+
+enum VideoDecodeInput {
+    Control(VideoControlMsg),
+    Packet(VideoPacketMsg),
+}
+
+fn recv_video_decode_input(
+    video_ctl_rx: &Receiver<VideoControlMsg>,
+    video_pkt_rx: &Receiver<VideoPacketMsg>,
+) -> Option<VideoDecodeInput> {
+    match video_ctl_rx.try_recv() {
+        Ok(msg) => return Some(VideoDecodeInput::Control(msg)),
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => return None,
+    }
+
+    crossbeam_channel::select_biased! {
+        recv(video_ctl_rx) -> msg => msg.ok().map(VideoDecodeInput::Control),
+        recv(video_pkt_rx) -> msg => msg.ok().map(VideoDecodeInput::Packet),
+    }
 }
 
 struct QueuedVideoPacket {
@@ -576,8 +607,8 @@ fn emit_demux_queue_state(
     pending_video_packet_bytes: usize,
     pending_video_peak_packets: usize,
     pending_video_peak_bytes: usize,
-    video_pkt_tx: &Sender<VideoWorkerMsg>,
-    audio_pkt_tx: &Sender<AudioWorkerMsg>,
+    video_pkt_tx: &Sender<VideoPacketMsg>,
+    audio_pkt_tx: &Sender<AudioPacketMsg>,
 ) {
     if crate::perf::is_enabled() {
         crate::perf::event(
@@ -792,7 +823,7 @@ fn bwdif_force_all_frames(
 fn drain_pending_video_packets(
     pending_video_packets: &mut VecDeque<QueuedVideoPacket>,
     pending_video_packet_bytes: &mut usize,
-    video_pkt_tx: &Sender<VideoWorkerMsg>,
+    video_pkt_tx: &Sender<VideoPacketMsg>,
     clock: &AvClock,
     cancel: &AtomicBool,
 ) -> bool {
@@ -833,11 +864,11 @@ fn drain_pending_video_packets(
             continue;
         }
 
-        match video_pkt_tx.try_send(VideoWorkerMsg::Packet { serial, packet }) {
+        match video_pkt_tx.try_send(VideoPacketMsg::Packet { serial, packet }) {
             Ok(()) => {
                 *pending_video_packet_bytes = pending_video_packet_bytes.saturating_sub(size_bytes);
             }
-            Err(TrySendError::Full(VideoWorkerMsg::Packet {
+            Err(TrySendError::Full(VideoPacketMsg::Packet {
                 serial: ret_serial,
                 packet: ret_packet,
             })) => {
@@ -875,24 +906,28 @@ fn drain_pending_video_packets(
 /// なっても demux スレッドが一時停止するだけで、video decode は別経路でそのまま
 /// 進行する (Phase B で demux も video decode から分離予定)。
 ///
-/// `Flush` / `Eof` は順序保証のため packet と同じ channel に enqueue する
-/// (Mutex + 別チャネルだと「Flush 通知より後に届いた packet が前世代として
-/// decode される」race が起きる)。
-///
-/// ただし seek 要求後、Flush marker が bounded queue の奥に滞留している間に旧世代の
-/// audio packet を再生してしまうと、master clock 自体が旧位置で進む。audio worker は
-/// packet/frame 送出時に live seek serial も確認し、Flush 到達前でも旧世代の音を捨てる。
-enum AudioWorkerMsg {
+/// `Packet` / `Eof` は順序保証のため同じ bounded queue に置く。seek `Flush` は
+/// [`AudioControlMsg`] の別 channel で優先配送する。audio worker は packet/frame
+/// 送出時に live seek serial も確認し、Flush 到達前でも旧世代の音を捨てる。
+enum AudioPacketMsg {
     /// avformat から取り出した未デコード音声 packet。audio decode thread が
     /// `send_packet` → `receive_frame` → resample → `audio_tx.send` を行う。
     Packet {
         serial: u64,
         packet: ffmpeg_the_third::Packet,
     },
+    /// EOF 到達通知。audio decode thread は内部 decoder を flush して残フレームを
+    /// drain (= 末尾の音声を出し切る)、その後次の `Flush` か `Packet` か
+    /// channel disconnect を待つ。
+    Eof,
+}
+
+/// seek Flush は packet queue とは別の control channel で送る。
+enum AudioControlMsg {
     /// シーク完了通知。audio decode thread はこれを受けたら自分の avcodec デコーダ
     /// を `flush()` する。
     ///
-    /// **2 つの target を分離管理** (= [`VideoWorkerMsg::Flush`] と同じ理由):
+    /// **2 つの target を分離管理** (= [`VideoControlMsg::Flush`] と同じ理由):
     /// - `seek_target_secs`: pump 経由で BufferReady の audio_anchor pts に伝搬。
     ///   Fast モードでは keyframe pts ではなく target を維持する。
     /// - `trim_before_secs`: `drop_before_secs` (= preroll 切り捨て下限) として保持。
@@ -902,10 +937,27 @@ enum AudioWorkerMsg {
         seek_target_secs: Option<f64>,
         trim_before_secs: Option<f64>,
     },
-    /// EOF 到達通知。audio decode thread は内部 decoder を flush して残フレームを
-    /// drain (= 末尾の音声を出し切る)、その後次の `Flush` か `Packet` か
-    /// channel disconnect を待つ。
-    Eof,
+}
+
+enum AudioDecodeInput {
+    Control(AudioControlMsg),
+    Packet(AudioPacketMsg),
+}
+
+fn recv_audio_decode_input(
+    audio_ctl_rx: &Receiver<AudioControlMsg>,
+    audio_pkt_rx: &Receiver<AudioPacketMsg>,
+) -> Option<AudioDecodeInput> {
+    match audio_ctl_rx.try_recv() {
+        Ok(msg) => return Some(AudioDecodeInput::Control(msg)),
+        Err(TryRecvError::Empty) => {}
+        Err(TryRecvError::Disconnected) => return None,
+    }
+
+    crossbeam_channel::select_biased! {
+        recv(audio_ctl_rx) -> msg => msg.ok().map(AudioDecodeInput::Control),
+        recv(audio_pkt_rx) -> msg => msg.ok().map(AudioDecodeInput::Packet),
+    }
 }
 
 /// 1 動画フレーム。CPU readback (旧経路) と GPU 共有テクスチャ (新経路) の二択。
@@ -1822,13 +1874,14 @@ fn run_decoder(
     // `video_tx` (bounded=24) が枯渇しなくなる (旧構造の "buf 0/24" 振動の解消)。
     //
     // Keep this packet queue shallow. Audio prefill belongs in AudioBuffer
-    // raw_pending; a deep packet queue delays ordered Flush markers after
-    // resume/seek and can let old compressed audio run before the new timeline.
+    // raw_pending; seek Flush is carried by audio_ctl_tx so it can cut ahead
+    // of old compressed packets.
     let audio_stream_idx_for_demux: Option<usize> = audio_setup.as_ref().map(|a| a.stream_idx);
     let audio_time_base_for_demux: Option<(f64, f64)> = audio_setup
         .as_ref()
         .map(|a| (a.time_base_num, a.time_base_den));
-    let (audio_pkt_tx, audio_pkt_rx) = bounded::<AudioWorkerMsg>(AUDIO_PACKET_QUEUE_CAP);
+    let (audio_pkt_tx, audio_pkt_rx) = bounded::<AudioPacketMsg>(AUDIO_PACKET_QUEUE_CAP);
+    let (audio_ctl_tx, audio_ctl_rx) = bounded::<AudioControlMsg>(AUDIO_CONTROL_QUEUE_CAP);
     // audio decode thread の JoinHandle。run_decoder 終了時に
     // `drop(audio_pkt_tx)` → channel disconnect → audio thread exit を経由して join する。
     // `audio_setup` は ここで consume される (= 以降 demux からは触らない)。
@@ -1847,6 +1900,7 @@ fn run_decoder(
                     run_audio_decode(
                         setup,
                         audio_pkt_rx,
+                        audio_ctl_rx,
                         audio_tx_for_thread,
                         clock_a,
                         cancel_a,
@@ -1860,6 +1914,7 @@ fn run_decoder(
         // 元から起動しないか、起動しても channel disconnect で即終了する。
         drop(audio_tx);
         drop(audio_pkt_rx);
+        drop(audio_ctl_rx);
         None
     };
 
@@ -1870,12 +1925,14 @@ fn run_decoder(
     // 飢餓状態に)。Phase B では demux thread が `input.packets()` ループを単独で
     // 回し、video packet を `video_pkt_tx` に enqueue するだけに専念する。
     //
-    // Keep the direct video channel shallow so seek Flush markers reach the
-    // decoder quickly. Sustained compressed-video burst absorption is handled
-    // by the demux-side bounded overflow queue.
+    // Keep the direct video packet channel shallow. Seek Flush uses the
+    // separate control channel below so it cannot be buried behind old packets.
+    // Sustained compressed-video burst absorption is handled by the demux-side
+    // bounded overflow queue.
     let video_tb_num = video_time_base.numerator() as f64;
     let video_tb_den = video_time_base.denominator() as f64;
-    let (video_pkt_tx, video_pkt_rx) = bounded::<VideoWorkerMsg>(VIDEO_PACKET_QUEUE_CAP);
+    let (video_pkt_tx, video_pkt_rx) = bounded::<VideoPacketMsg>(VIDEO_PACKET_QUEUE_CAP);
+    let (video_ctl_tx, video_ctl_rx) = bounded::<VideoControlMsg>(VIDEO_CONTROL_QUEUE_CAP);
     let video_decode_handle: std::thread::JoinHandle<()> = {
         let clock_v = clock.clone();
         let cancel_v = cancel.clone();
@@ -1898,6 +1955,7 @@ fn run_decoder(
                     #[cfg(windows)]
                     gpu_video_device_v,
                     video_pkt_rx,
+                    video_ctl_rx,
                     video_tx_for_thread,
                     clock_v,
                     cancel_v,
@@ -2118,9 +2176,8 @@ fn run_decoder(
             } else {
                 None
             };
-            // video_pkt_tx は drop されない (video decode thread が生きている間ずっと
-            // 受信可能)。send は blocking なので順序保証されるが、cancel 中は
-            // disconnect になる可能性がある (= video decode thread 終了後)。
+            // Flush は packet queue とは別の control channel で送る。packet queue
+            // が満杯でも seek 制御が古い packet の後ろに埋もれないようにする。
             if !pending_video_packets.is_empty() {
                 crate::logger::log(format!(
                     "[demux] discarded {} queued video packets ({} bytes) for seek serial={serial}",
@@ -2151,8 +2208,8 @@ fn run_decoder(
                 next_video_overflow_log_bytes = 0;
             }
             if !send_demux_msg_cancel_aware(
-                &video_pkt_tx,
-                VideoWorkerMsg::Flush {
+                &video_ctl_tx,
+                VideoControlMsg::Flush {
                     serial,
                     seek_target_secs: seek_target_for_flush,
                     trim_before_secs: video_trim_before,
@@ -2160,14 +2217,14 @@ fn run_decoder(
                 &cancel,
                 "video",
                 "flush",
-                VIDEO_PACKET_QUEUE_CAP,
+                VIDEO_CONTROL_QUEUE_CAP,
             ) {
                 break 'outer;
             }
             if audio_stream_idx_for_demux.is_some() {
                 let _ = send_demux_msg_cancel_aware(
-                    &audio_pkt_tx,
-                    AudioWorkerMsg::Flush {
+                    &audio_ctl_tx,
+                    AudioControlMsg::Flush {
                         serial,
                         seek_target_secs: seek_target_for_flush,
                         trim_before_secs: audio_trim_before,
@@ -2175,7 +2232,7 @@ fn run_decoder(
                     &cancel,
                     "audio",
                     "flush",
-                    AUDIO_PACKET_QUEUE_CAP,
+                    AUDIO_CONTROL_QUEUE_CAP,
                 );
             }
             // 成功時のみ anchor を target に進める。失敗時に target を anchor すると
@@ -2235,9 +2292,10 @@ fn run_decoder(
                 // pre-decode preroll trim (= drop_before_secs check) と pacing logic は
                 // すべて video decode thread 側に移管。
                 //
-                // `send` (blocking) を使う理由: 順序保証 channel に enqueue するので、
-                // 直前の Flush marker と packet の到着順が逆転しない。bounded queue が
-                // 満杯なら demux 側を一時 stall させて逆圧をかけるのが正しい。
+                // `send` (blocking) を使う理由: packet 同士の順序を保ち、bounded
+                // queue が満杯なら demux 側を一時 stall させて逆圧をかけるのが正しい。
+                // seek Flush は別 control channel で優先配送するので、ここでは
+                // packet queue の満杯に巻き込まれない。
                 let packet_pts =
                     packet_timestamp(&packet).map(|pts| (pts as f64) * video_tb_num / video_tb_den);
                 let packet_size = packet.size();
@@ -2270,7 +2328,7 @@ fn run_decoder(
                         let send_t0 = std::time::Instant::now();
                         match send_demux_packet_seek_aware(
                             &video_pkt_tx,
-                            VideoWorkerMsg::Packet { serial, packet },
+                            VideoPacketMsg::Packet { serial, packet },
                             &clock,
                             &cancel,
                             "video",
@@ -2330,7 +2388,7 @@ fn run_decoder(
                 let send_t0 = std::time::Instant::now();
                 match send_demux_packet_seek_aware(
                     &video_pkt_tx,
-                    VideoWorkerMsg::Packet {
+                    VideoPacketMsg::Packet {
                         serial: seek_serial,
                         packet,
                     },
@@ -2360,12 +2418,12 @@ fn run_decoder(
                 if stream.index() == audio_idx {
                     // Phase A: 音声 packet は decode せず audio decode thread に転送する。
                     // packet 段階の pre-decode preroll trim と sample-level trim は両方
-                    // audio decode thread 側に移管した (= AudioWorkerMsg::Flush で渡した
+                    // audio decode thread 側に移管した (= AudioControlMsg::Flush で渡した
                     // `trim_before_secs` を audio thread が `drop_before_secs` として保持)。
                     //
-                    // `send` (blocking) を使う理由: 順序保証 channel に enqueue するので、
-                    // 直前の Flush marker と packet の到着順が逆転しない。bounded queue が
+                    // `send` (blocking) を使う理由: packet 同士の順序を保ち、bounded queue が
                     // 満杯なら demux 側を一時 stall させて逆圧をかけるのが正しい
+                    // (seek Flush は別 control channel で優先配送する)
                     // (audio_pkt_rx 側が止まっているのに packet を取り続けると memory が
                     // 無制限に膨らむ)。ただし stall 中も pending video overflow は drain
                     // する。precise seek では video 側の FirstFrameReady が Buffering を
@@ -2379,7 +2437,7 @@ fn run_decoder(
                     let send_t0 = std::time::Instant::now();
                     match send_audio_packet_with_video_drain(
                         &audio_pkt_tx,
-                        AudioWorkerMsg::Packet {
+                        AudioPacketMsg::Packet {
                             serial: seek_serial,
                             packet,
                         },
@@ -2429,7 +2487,7 @@ fn run_decoder(
             if audio_stream_idx_for_demux.is_some() {
                 let _ = send_demux_msg_cancel_aware(
                     &audio_pkt_tx,
-                    AudioWorkerMsg::Eof,
+                    AudioPacketMsg::Eof,
                     &cancel,
                     "audio",
                     "eof",
@@ -2440,7 +2498,7 @@ fn run_decoder(
             // 失っても許容なので drain しないが、Eof 自体は送って状態を伝える。
             let _ = send_demux_msg_cancel_aware(
                 &video_pkt_tx,
-                VideoWorkerMsg::Eof,
+                VideoPacketMsg::Eof,
                 &cancel,
                 "video",
                 "eof",
@@ -2460,17 +2518,19 @@ fn run_decoder(
         }
     }
 
-    // Phase A/B: 終了時の cleanup。各 *_pkt_tx を drop → channel disconnect →
+    // Phase A/B: 終了時の cleanup。各 channel sender を drop → channel disconnect →
     // 各 decode thread の recv() が Err で抜け → exit → join。
     // 順序: audio を先に join (= cpal stream の bookkeeping を Drop より前に
     // 完了させたい)、次に video。
     drop(audio_pkt_tx);
+    drop(audio_ctl_tx);
     if let Some(handle) = audio_decode_handle {
         if let Err(e) = handle.join() {
             crate::logger::log(format!("video-audio-decode thread panicked: {e:?}"));
         }
     }
     drop(video_pkt_tx);
+    drop(video_ctl_tx);
     if let Err(e) = video_decode_handle.join() {
         crate::logger::log(format!("video-decode thread panicked: {e:?}"));
     }
@@ -2479,23 +2539,24 @@ fn run_decoder(
 /// Phase B: 動画 decode + (HW D3D11VA GPU blit / SW swscale) + pacing + VideoFrame
 /// 送出を担う独立スレッド。
 ///
-/// 旧 `run_decoder` の動画 packet 処理ブロック (~450 行) を、`video_pkt_rx` から
-/// 受け取った [`VideoWorkerMsg`] を処理する形に再構成したもの。
+/// 旧 `run_decoder` の動画 packet 処理ブロック (~450 行) を、`video_pkt_rx` /
+/// `video_ctl_rx` から受け取った [`VideoPacketMsg`] / [`VideoControlMsg`] を
+/// 処理する形に再構成したもの。
 ///
 /// 呼び出し元 (= demux thread) は動画 packet を `video_pkt_tx` に enqueue する
 /// だけで、`video_tx` (bounded=24) が満杯のときも自スレッドはブロックしない
 /// (= drop してカウンタ加算)。`video_pkt_rx` (small bounded queue) は demux ↔ video decode
 /// の逆圧経路として機能する。
 ///
-/// シーク時は demux 側が `VideoWorkerMsg::Flush { serial, seek_target_secs,
-/// trim_before_secs }` を送る。この thread は `Flush` 受領で内部 decoder を
+/// シーク時は demux 側が `VideoControlMsg::Flush { serial, seek_target_secs,
+/// trim_before_secs }` を control channel に送る。この thread は `Flush` 受領で内部 decoder を
 /// `flush()` し、`current_seek_serial` / `drop_before_secs` / `post_seek_frame_sent`
 /// をリセットする。`drop_before_secs` には `trim_before_secs` が入る (=
 /// `seek_target_secs` は video 側では使わず、pump 側 BufferReady 用に audio チェーン
 /// が持つ)。`trim_before_secs.is_none()` (= Fast backward 成功 or seek 失敗) の場合は
 /// preroll trim せず通常 pacing に戻す (= post_seek_frame_sent を直ちに true)。
 ///
-/// EOF 時は `VideoWorkerMsg::Eof` を受け取るが、動画は内部残フレームを失っても
+/// EOF 時は `VideoPacketMsg::Eof` を受け取るが、動画は内部残フレームを失っても
 /// 許容なので drain せず何もしない (旧 `run_decoder` の挙動と同じ)。
 #[allow(clippy::too_many_arguments)]
 fn run_video_decode(
@@ -2504,7 +2565,8 @@ fn run_video_decode(
     #[cfg(windows)] gpu_video_device: Option<
         std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
     >,
-    video_pkt_rx: Receiver<VideoWorkerMsg>,
+    video_pkt_rx: Receiver<VideoPacketMsg>,
+    video_ctl_rx: Receiver<VideoControlMsg>,
     video_tx: Sender<VideoFrame>,
     clock: Arc<AvClock>,
     cancel: Arc<AtomicBool>,
@@ -2556,16 +2618,16 @@ fn run_video_decode(
         if cancel.load(Ordering::Acquire) {
             break;
         }
-        let msg = match video_pkt_rx.recv() {
-            Ok(m) => m,
-            Err(_) => break, // demux thread exited → channel disconnect
+        let msg = match recv_video_decode_input(&video_ctl_rx, &video_pkt_rx) {
+            Some(m) => m,
+            None => break, // demux thread exited → channel disconnect
         };
         let packet = match msg {
-            VideoWorkerMsg::Flush {
+            VideoDecodeInput::Control(VideoControlMsg::Flush {
                 serial,
                 seek_target_secs: _,
                 trim_before_secs,
-            } => {
+            }) => {
                 if stale_drop_burst_count > 0 {
                     crate::logger::log(format!(
                         "[video-decode] stale packet burst drained before flush: count={stale_drop_burst_count} next_serial={serial} live_serial={}",
@@ -2638,7 +2700,7 @@ fn run_video_decode(
                 post_seek_frame_sent = trim_before_secs.is_none();
                 continue;
             }
-            VideoWorkerMsg::Eof => {
+            VideoDecodeInput::Packet(VideoPacketMsg::Eof) => {
                 // 動画は EOF で内部 frame を失っても許容 (旧 run_decoder と同じ挙動)。
                 // 何もせず次の Packet/Flush/disconnect を待つ。
                 crate::logger::log(format!(
@@ -2649,7 +2711,7 @@ fn run_video_decode(
                 ));
                 continue;
             }
-            VideoWorkerMsg::Packet { serial, packet } => {
+            VideoDecodeInput::Packet(VideoPacketMsg::Packet { serial, packet }) => {
                 let live_seek_serial = clock.current_seek_serial();
                 if serial != current_seek_serial || serial != live_seek_serial {
                     stale_drop_burst_count = stale_drop_burst_count.saturating_add(1);
@@ -3696,14 +3758,15 @@ fn run_video_decode(
 ///
 /// 旧 `run_decoder` の音声 packet 処理ブロック (avcodec decode + swresample +
 /// `audio_tx.send`) と post-seek preroll trim (packet 段階 + sample 段階) を、
-/// `audio_pkt_rx` から受け取った [`AudioWorkerMsg`] を処理する形に再構成したもの。
+/// `audio_pkt_rx` / `audio_ctl_rx` から受け取った [`AudioPacketMsg`] /
+/// [`AudioControlMsg`] を処理する形に再構成したもの。
 ///
 /// 呼び出し元 (= demux + video decode thread) は音声 packet を `audio_pkt_tx` に
 /// enqueue するだけで、`audio_tx` (bounded=32) が満杯のときも自スレッドはブロック
 /// しない。`audio_pkt_rx` (small bounded queue) は両 thread 間の逆圧経路として機能する。
 ///
-/// シーク時は呼び出し元が `AudioWorkerMsg::Flush { serial, seek_target_secs,
-/// trim_before_secs }` を送る。この thread は `Flush` 受領で内部 decoder を
+/// シーク時は呼び出し元が `AudioControlMsg::Flush { serial, seek_target_secs,
+/// trim_before_secs }` を control channel に送る。この thread は `Flush` 受領で内部 decoder を
 /// `flush()` し、`current_seek_serial` / `drop_before_secs` /
 /// `current_seek_target_secs` をリセットする。
 ///
@@ -3717,11 +3780,12 @@ fn run_video_decode(
 /// `seek_target_secs` は世代単位で保持し、emit する全 AudioFrame に焼き付けて pump
 /// へ伝搬する (= pump が BufferReady の audio_anchor pts に target を反映するため)。
 ///
-/// EOF 時は `AudioWorkerMsg::Eof` を受けて内部 decoder を flush + 残フレーム drain。
+/// EOF 時は `AudioPacketMsg::Eof` を受けて内部 decoder を flush + 残フレーム drain。
 /// その後は次の `Flush` か `Packet` か channel disconnect (= run_decoder 終了) を待つ。
 fn run_audio_decode(
     mut setup: AudioSetup,
-    audio_pkt_rx: Receiver<AudioWorkerMsg>,
+    audio_pkt_rx: Receiver<AudioPacketMsg>,
+    audio_ctl_rx: Receiver<AudioControlMsg>,
     audio_tx: Sender<AudioFrame>,
     clock: Arc<AvClock>,
     cancel: Arc<AtomicBool>,
@@ -3825,25 +3889,25 @@ fn run_audio_decode(
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
-        let msg = match audio_pkt_rx.recv() {
-            Ok(m) => m,
-            // demux 側が exit (= run_decoder 終了 / cancel) → audio_pkt_tx drop →
+        let msg = match recv_audio_decode_input(&audio_ctl_rx, &audio_pkt_rx) {
+            Some(m) => m,
+            // demux 側が exit (= run_decoder 終了 / cancel) → channel sender drop →
             // 自スレッドも exit。
-            Err(_) => break,
+            None => break,
         };
         match msg {
-            AudioWorkerMsg::Flush {
+            AudioDecodeInput::Control(AudioControlMsg::Flush {
                 serial,
                 seek_target_secs,
                 trim_before_secs,
-            } => {
+            }) => {
                 setup.decoder.flush();
                 current_seek_serial = serial;
                 drop_before_secs = trim_before_secs;
                 current_seek_target_secs = seek_target_secs;
                 next_audio_pts_secs = None;
             }
-            AudioWorkerMsg::Eof => {
+            AudioDecodeInput::Packet(AudioPacketMsg::Eof) => {
                 // 残フレーム drain: send_eof + receive_frame ループで decoder 内の
                 // 残サンプルを最後まで取り出して送る。これにより末尾の数十 ms が
                 // 抜けない。FFmpeg の API では NULL packet で EOF flush を伝える。
@@ -3883,7 +3947,7 @@ fn run_audio_decode(
                 // EOF 後 decoder を flush して次回の Packet/Flush に備える。
                 setup.decoder.flush();
             }
-            AudioWorkerMsg::Packet { serial, packet } => {
+            AudioDecodeInput::Packet(AudioPacketMsg::Packet { serial, packet }) => {
                 let live_seek_serial = clock.current_seek_serial();
                 if serial != current_seek_serial || serial != live_seek_serial {
                     if crate::perf::is_enabled() {
@@ -5351,16 +5415,71 @@ fn try_gpu_blit_path(
 #[cfg(test)]
 mod decoder_candidate_tests {
     use super::{
-        BwdifFilterKey, DecoderChoice, bwdif_filter_key, bwdif_force_all_frames,
-        field_order_is_interlaced, normalize_audio_input_layout, normalize_sar,
-        preferred_video_decoders, selected_video_rate, should_try_deinterlace,
+        AudioControlMsg, AudioDecodeInput, AudioPacketMsg, BwdifFilterKey, DecoderChoice,
+        VideoControlMsg, VideoDecodeInput, VideoPacketMsg, bwdif_filter_key,
+        bwdif_force_all_frames, field_order_is_interlaced, normalize_audio_input_layout,
+        normalize_sar, preferred_video_decoders, recv_audio_decode_input, recv_video_decode_input,
+        selected_video_rate, should_try_deinterlace,
     };
     use crate::settings::VideoDeinterlaceMode;
+    use crossbeam_channel::bounded;
     use ffmpeg_the_third::ChannelLayout;
     use ffmpeg_the_third::FieldOrder;
     use ffmpeg_the_third::codec::Id;
     use ffmpeg_the_third::format::Pixel;
     use ffmpeg_the_third::util::frame::video::Video;
+
+    #[test]
+    fn video_decode_recv_prioritizes_control_over_queued_packet() {
+        let (pkt_tx, pkt_rx) = bounded::<VideoPacketMsg>(1);
+        let (ctl_tx, ctl_rx) = bounded::<VideoControlMsg>(1);
+        pkt_tx
+            .send(VideoPacketMsg::Packet {
+                serial: 0,
+                packet: ffmpeg_the_third::Packet::empty(),
+            })
+            .unwrap();
+        ctl_tx
+            .send(VideoControlMsg::Flush {
+                serial: 7,
+                seek_target_secs: Some(7.0),
+                trim_before_secs: Some(7.0),
+            })
+            .unwrap();
+
+        match recv_video_decode_input(&ctl_rx, &pkt_rx).unwrap() {
+            VideoDecodeInput::Control(VideoControlMsg::Flush { serial, .. }) => {
+                assert_eq!(serial, 7);
+            }
+            VideoDecodeInput::Packet(_) => panic!("packet was received before pending control"),
+        }
+    }
+
+    #[test]
+    fn audio_decode_recv_prioritizes_control_over_queued_packet() {
+        let (pkt_tx, pkt_rx) = bounded::<AudioPacketMsg>(1);
+        let (ctl_tx, ctl_rx) = bounded::<AudioControlMsg>(1);
+        pkt_tx
+            .send(AudioPacketMsg::Packet {
+                serial: 0,
+                packet: ffmpeg_the_third::Packet::empty(),
+            })
+            .unwrap();
+        ctl_tx
+            .send(AudioControlMsg::Flush {
+                serial: 9,
+                seek_target_secs: Some(9.0),
+                trim_before_secs: Some(9.0),
+            })
+            .unwrap();
+
+        match recv_audio_decode_input(&ctl_rx, &pkt_rx).unwrap() {
+            AudioDecodeInput::Control(AudioControlMsg::Flush { serial, .. }) => {
+                assert_eq!(serial, 9);
+            }
+            AudioDecodeInput::Packet(_) => panic!("packet was received before pending control"),
+        }
+    }
 
     #[test]
     fn unspecified_two_channel_audio_layout_is_guessed_as_stereo() {
