@@ -276,9 +276,7 @@ impl DspBridge {
     /// clone して返す。presenter thread が polling で `read()` して
     /// `foreground_allows_hud_raise` に渡す。
     #[allow(dead_code)]
-    pub fn editor_hwnds_snapshot(
-        &self,
-    ) -> Arc<std::sync::RwLock<std::collections::HashSet<u64>>> {
+    pub fn editor_hwnds_snapshot(&self) -> Arc<std::sync::RwLock<std::collections::HashSet<u64>>> {
         Arc::clone(&self.editor_hwnds)
     }
 
@@ -2284,8 +2282,8 @@ pub(crate) fn foreground_allows_hud_raise(
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Threading::GetCurrentProcessId;
     use windows::Win32::UI::WindowsAndMessaging::{
-        GA_ROOT, GetAncestor, GetForegroundWindow, GetLastActivePopup,
-        GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+        GA_ROOT, GetAncestor, GetForegroundWindow, GetLastActivePopup, GetWindowThreadProcessId,
+        IsWindow, IsWindowVisible,
     };
 
     unsafe {

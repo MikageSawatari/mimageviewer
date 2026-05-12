@@ -55,23 +55,23 @@ use windows::Win32::Graphics::Gdi::{
     CombineRgn, CreateRectRgn, DeleteObject, HRGN, RGN_OR, ScreenToClient, SetWindowRgn,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetCapture, ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
-use windows::Win32::UI::WindowsAndMessaging::{IDC_ARROW, LoadCursorW};
 use windows::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW,
     DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
     IsWindow, MA_NOACTIVATE, RegisterClassExW, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     WINDOWPOS, WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
-    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
-    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_WINDOWPOSCHANGING,
-    WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_RBUTTONDBLCLK,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_WINDOWPOSCHANGING, WM_XBUTTONDBLCLK,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
-use windows::Win32::UI::Controls::WM_MOUSELEAVE;
+use windows::Win32::UI::WindowsAndMessaging::{IDC_ARROW, LoadCursorW};
 use windows::core::PCWSTR;
 use windows::core::w;
 
@@ -157,8 +157,8 @@ impl HudOverlayWindow {
     pub fn create(cfg: HudOverlayConfig) -> Result<Self, String> {
         register_window_class()?;
         unsafe {
-            let hmodule = GetModuleHandleW(None)
-                .map_err(|e| format!("GetModuleHandleW for HUD: {e:?}"))?;
+            let hmodule =
+                GetModuleHandleW(None).map_err(|e| format!("GetModuleHandleW for HUD: {e:?}"))?;
             let state = Box::new(WindowState {
                 event_tx: cfg.event_tx,
                 regions: cfg.regions,
@@ -415,7 +415,12 @@ fn apply_window_region(hwnd: HWND, regions: &[RECT]) -> bool {
         let hrgn: HRGN = if regions.is_empty() {
             CreateRectRgn(0, 0, 0, 0)
         } else {
-            let combined = CreateRectRgn(regions[0].left, regions[0].top, regions[0].right, regions[0].bottom);
+            let combined = CreateRectRgn(
+                regions[0].left,
+                regions[0].top,
+                regions[0].right,
+                regions[0].bottom,
+            );
             for rect in regions.iter().skip(1) {
                 let next = CreateRectRgn(rect.left, rect.top, rect.right, rect.bottom);
                 let _ = CombineRgn(Some(combined), Some(combined), Some(next), RGN_OR);
@@ -482,17 +487,21 @@ fn mouse_ctrl(wparam: WPARAM) -> bool {
 
 fn button_bit_for_msg(msg: u32, wparam: WPARAM) -> (NativeVideoMouseButton, u8) {
     match msg {
-        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK => (NativeVideoMouseButton::Left, BTN_LEFT),
+        WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
+            (NativeVideoMouseButton::Left, BTN_LEFT)
+        }
         WM_RBUTTONDOWN | WM_RBUTTONUP | WM_RBUTTONDBLCLK => {
             (NativeVideoMouseButton::Right, BTN_RIGHT)
         }
         WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK => {
             (NativeVideoMouseButton::Middle, BTN_MIDDLE)
         }
-        WM_XBUTTONDOWN | WM_XBUTTONUP | WM_XBUTTONDBLCLK => match ((wparam.0 >> 16) & 0xFFFF) as u16 {
-            2 => (NativeVideoMouseButton::Extra2, BTN_X2),
-            _ => (NativeVideoMouseButton::Extra1, BTN_X1),
-        },
+        WM_XBUTTONDOWN | WM_XBUTTONUP | WM_XBUTTONDBLCLK => {
+            match ((wparam.0 >> 16) & 0xFFFF) as u16 {
+                2 => (NativeVideoMouseButton::Extra2, BTN_X2),
+                _ => (NativeVideoMouseButton::Extra1, BTN_X1),
+            }
+        }
         _ => (NativeVideoMouseButton::Left, BTN_LEFT),
     }
 }
@@ -642,8 +651,7 @@ unsafe extern "system" fn hud_wnd_proc(
         WM_NCCREATE => {
             let createstruct = lparam.0 as *const CREATESTRUCTW;
             if !createstruct.is_null() {
-                let state =
-                    unsafe { (*createstruct).lpCreateParams } as *mut WindowState;
+                let state = unsafe { (*createstruct).lpCreateParams } as *mut WindowState;
                 if !state.is_null() {
                     unsafe {
                         let _ = SetWindowLongPtrW(hwnd, GWLP_USERDATA, state as isize);
@@ -727,7 +735,9 @@ unsafe extern "system" fn hud_wnd_proc(
                         ));
                     }
                 }
-                let _ = state.event_tx.send(NativeVideoWindowEvent::MouseMove(event));
+                let _ = state
+                    .event_tx
+                    .send(NativeVideoWindowEvent::MouseMove(event));
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
@@ -750,14 +760,18 @@ unsafe extern "system" fn hud_wnd_proc(
                     shift: mouse_shift(wparam),
                     ctrl: mouse_ctrl(wparam),
                 };
-                let _ = state.event_tx.send(NativeVideoWindowEvent::MouseWheel(event));
+                let _ = state
+                    .event_tx
+                    .send(NativeVideoWindowEvent::MouseWheel(event));
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
 
         WM_MOUSELEAVE => {
             if super::hud_debug_enabled() {
-                crate::logger::log("[HUD-DEBUG] WM_MOUSELEAVE (ignored, not forwarded)".to_string());
+                crate::logger::log(
+                    "[HUD-DEBUG] WM_MOUSELEAVE (ignored, not forwarded)".to_string(),
+                );
             }
             if let Some(state) = window_state(hwnd) {
                 state.mouse_tracking = false;
@@ -778,8 +792,8 @@ unsafe extern "system" fn hud_wnd_proc(
         }
 
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_RBUTTONUP
-        | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK
-        | WM_XBUTTONDOWN | WM_XBUTTONUP | WM_XBUTTONDBLCLK => {
+        | WM_RBUTTONDBLCLK | WM_MBUTTONDOWN | WM_MBUTTONUP | WM_MBUTTONDBLCLK | WM_XBUTTONDOWN
+        | WM_XBUTTONUP | WM_XBUTTONDBLCLK => {
             if let Some(state) = window_state(hwnd) {
                 let (button, bit) = button_bit_for_msg(msg, wparam);
                 let down = mouse_message_is_down(msg);
@@ -885,9 +899,7 @@ unsafe extern "system" fn hud_wnd_proc(
                     let raw = insert_after.0 as isize;
                     if raw == 0 || raw == -1 {
                         if let Some(state) = window_state(hwnd) {
-                            let _ = state
-                                .event_tx
-                                .send(NativeVideoWindowEvent::RequestRaiseHud);
+                            let _ = state.event_tx.send(NativeVideoWindowEvent::RequestRaiseHud);
                         }
                     }
                 }

@@ -758,7 +758,9 @@ impl NativeVideoOutput {
     /// `DspBridge::hud_raise_hook` 経由で発火された全 z-order 変更操作に対する応答。
     /// presenter thread 側で 200ms 抑制 + retry burst (即時/16ms/64ms) で処理される。
     fn request_hud_raise(&self) {
-        let _ = self.command_tx.send(NativeVideoOutputCommand::RaiseHudToTop);
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::RaiseHudToTop);
     }
 
     fn set_normalize_overlay_state(
@@ -1213,12 +1215,13 @@ fn run_native_video_output(
     // 無効時は CP4-6 のフォールバック経路 (= 従来通り presenter HWND の DComp tree)。
     let hud_overlay_enabled =
         config.hud_overlay_enabled && !native_video_env_flag_disabled("MIV_HUD_OVERLAY");
-    let hud_event_tx: Option<std::sync::mpsc::Sender<crate::video::native_window::NativeVideoWindowEvent>> =
-        if hud_overlay_enabled {
-            Some(presenter_event_tx.clone())
-        } else {
-            None
-        };
+    let hud_event_tx: Option<
+        std::sync::mpsc::Sender<crate::video::native_window::NativeVideoWindowEvent>,
+    > = if hud_overlay_enabled {
+        Some(presenter_event_tx.clone())
+    } else {
+        None
+    };
     let mut presenter = match crate::video::native_presenter::NativeVideoPresenter::new(
         crate::video::native_presenter::NativePresenterConfig {
             hwnd: window.hwnd(),
@@ -1566,11 +1569,7 @@ fn run_native_video_output(
                 NEvt::RequestRaiseHud => {
                     // HUD wndproc 由来の `WM_WINDOWPOSCHANGING` での safety net。
                     // 全経路で coalesce + 200ms 抑制を効かせるため helper 経由 (再 P2 反映)。
-                    schedule_hud_raise_burst(
-                        now,
-                        &mut hud_raise_deadlines,
-                        &mut last_hud_raise_at,
-                    );
+                    schedule_hud_raise_burst(now, &mut hud_raise_deadlines, &mut last_hud_raise_at);
                 }
                 NEvt::GeometryChanged { x, y, w, h } => {
                     // CP8: presenter HWND の `WM_WINDOWPOSCHANGED` で発火される。
@@ -1630,11 +1629,7 @@ fn run_native_video_output(
                 &mut pointer_present_synthetic,
             );
             if raise_needed {
-                schedule_hud_raise_burst(
-                    now,
-                    &mut hud_raise_deadlines,
-                    &mut last_hud_raise_at,
-                );
+                schedule_hud_raise_burst(now, &mut hud_raise_deadlines, &mut last_hud_raise_at);
             }
         }
 

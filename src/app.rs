@@ -2442,8 +2442,10 @@ pub struct App {
     /// `tick_vst_window_overlap_adjustment` で per-frame に各 editor HWND の `GetWindowRect` を
     /// 比較し、rect が安定して 250ms 経過したら overlap を check + `SetWindowPos(..., SWP_ASYNCWINDOWPOS)`。
     /// cross-process SetWindowPos の連射を避けるため、stable 検出後の 1 回だけ発火する。
-    vst_geometry_tracker:
-        std::collections::HashMap<u64, (windows::Win32::Foundation::RECT, std::time::Instant, bool)>,
+    vst_geometry_tracker: std::collections::HashMap<
+        u64,
+        (windows::Win32::Foundation::RECT, std::time::Instant, bool),
+    >,
     #[cfg(windows)]
     /// Native fullscreen 中だけ main HWND の DWM caption/border を黒へ寄せているか。
     /// `Decorations` は client area を変えるため使わない。

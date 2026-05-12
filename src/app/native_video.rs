@@ -227,7 +227,8 @@ impl App {
             return;
         }
         // editor 一覧に居なくなった HWND は tracker からも削除 (= stale 防止)。
-        self.vst_geometry_tracker.retain(|k, _| normalized.contains(k));
+        self.vst_geometry_tracker
+            .retain(|k, _| normalized.contains(k));
 
         let presenter_win = Win32Hwnd(presenter_hwnd as *mut _);
         let mut presenter_rect = Win32Rect::default();
