@@ -242,6 +242,7 @@ impl<'a> IngestSession<'a> {
                 CandidateKind::Image => self.build_doc_for_image(&cand),
                 CandidateKind::Zip => self.build_doc_for_name_only(&cand),
                 CandidateKind::Pdf => self.build_doc_for_pdf(&cand),
+                CandidateKind::Video => self.build_doc_for_video(&cand),
             };
             drop(_permit);
             match built {
@@ -290,6 +291,13 @@ impl<'a> IngestSession<'a> {
         self.build_doc(cand, Container::Fs, IndexKind::Image, norms)
     }
 
+    /// 動画ファイルから IndexDoc を組み立てる。ファイル名 / mXD XMP /
+    /// sidecar tags / FFmpeg container metadata をソース別に保持する。
+    fn build_doc_for_video(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
+        let norms = crate::ingest_text::build_per_source_for_file(&cand.abs_path);
+        self.build_doc(cand, Container::Fs, IndexKind::Video, norms)
+    }
+
     /// PDF から IndexDoc を組み立てる (§16 step 17)。
     fn build_doc_for_pdf(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
         let name = cand
@@ -324,6 +332,7 @@ impl<'a> IngestSession<'a> {
         let (container, kind) = match cand.kind {
             CandidateKind::Zip => (Container::Zip, IndexKind::Zip),
             CandidateKind::Pdf => (Container::Fs, IndexKind::Pdf),
+            CandidateKind::Video => (Container::Fs, IndexKind::Video),
             _ => (Container::Fs, IndexKind::Image),
         };
         self.build_doc(cand, container, kind, norms)
@@ -574,6 +583,72 @@ mod tests {
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert!(!hits.is_empty(), "Tantivy 側でヒットする");
+    }
+
+    #[test]
+    fn video_file_ingested_as_video_with_sidecar_tags() {
+        let (tmp, meta, fts) = setup();
+        let fav = Uuid::new_v4();
+        let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
+        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
+            fts.writer().unwrap(),
+            std::sync::Arc::clone(&fts),
+        );
+        let sem = GlobalIoSemaphore::new(2);
+        let cancel = AtomicBool::new(false);
+
+        let mut cand = make_image_file(tmp.path(), "tagged_movie.mp4");
+        cand.kind = CandidateKind::Video;
+        std::fs::write(
+            tmp.path().join("tagged_movie.mp4.xmp"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+           xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <rdf:Description>
+      <dc:subject>
+        <rdf:Bag>
+          <rdf:li>#video_ingest_marker</rdf:li>
+        </rdf:Bag>
+      </dc:subject>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#,
+        )
+        .unwrap();
+        let key = cand.key.clone();
+
+        let stats = session
+            .apply(
+                vec![cand],
+                vec![],
+                &writer,
+                &sem,
+                IoPriority::Low,
+                &cancel,
+                None,
+            )
+            .unwrap();
+        assert_eq!(stats.ingested_ok, 1);
+        let row = meta.get(&key).unwrap().unwrap();
+        assert_eq!(row.status, FileStatus::Ok);
+        assert_eq!(row.kind, IndexKind::Video);
+
+        let favs = [fav];
+        let q = fts_index::build_bigram_and_query(
+            fts.fields(),
+            &["video_ingest_marker"],
+            &crate::fts_index::QueryFilters {
+                favorite_ids: Some(&favs),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        fts.reload_reader().unwrap();
+        let searcher = fts.searcher();
+        let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, key);
     }
 
     /// Codex P1 回帰: ingest commit 後に reader が確実に reload 済みであること。

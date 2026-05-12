@@ -62,6 +62,7 @@ pub fn kind_label(k: IndexKind) -> &'static str {
         IndexKind::Image => "画像",
         IndexKind::Zip => "ZIP ファイル",
         IndexKind::Pdf => "PDF ファイル",
+        IndexKind::Video => "動画ファイル",
     }
 }
 
@@ -81,6 +82,7 @@ impl TargetChoice {
             TargetChoice::Only(SourceKind::XmpTweet) => "mXD ツイート情報",
             TargetChoice::Only(SourceKind::PngPrompt) => "AI プロンプト (PNG)",
             TargetChoice::Only(SourceKind::PdfMeta) => "PDF メタ情報",
+            TargetChoice::Only(SourceKind::VideoMeta) => "動画メタ情報",
             TargetChoice::Only(SourceKind::Tags) => "タグ",
         }
     }
@@ -110,6 +112,7 @@ pub const TARGET_CHOICES: &[TargetChoice] = &[
     TargetChoice::Only(SourceKind::XmpTweet),
     TargetChoice::Only(SourceKind::PngPrompt),
     TargetChoice::Only(SourceKind::PdfMeta),
+    TargetChoice::Only(SourceKind::VideoMeta),
     TargetChoice::Only(SourceKind::Tags),
 ];
 
@@ -119,6 +122,7 @@ pub const KIND_CHOICES: &[Option<IndexKind>] = &[
     Some(IndexKind::Image),
     Some(IndexKind::Zip),
     Some(IndexKind::Pdf),
+    Some(IndexKind::Video),
 ];
 
 /// クエリ入力後、検索実行までの debounce 間隔 (既存 Ctrl+F と揃える)。
@@ -627,6 +631,9 @@ pub(crate) fn build_drilled_items(
         let item = match ext.as_str() {
             "pdf" => GridItem::PdfFile(f.clone()),
             "zip" => GridItem::ZipFile(f.clone()),
+            _ if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) => {
+                GridItem::Video(f.clone())
+            }
             _ => GridItem::Image(f.clone()),
         };
         items.push(item);
@@ -678,7 +685,10 @@ fn path_is_under_or_eq(child: &Path, ancestor: &Path) -> bool {
 fn is_fullscreen_target(item: Option<&GridItem>) -> bool {
     matches!(
         item,
-        Some(GridItem::Image(_)) | Some(GridItem::ZipImage { .. }) | Some(GridItem::PdfPage { .. })
+        Some(GridItem::Image(_))
+            | Some(GridItem::Video(_))
+            | Some(GridItem::ZipImage { .. })
+            | Some(GridItem::PdfPage { .. })
     )
 }
 

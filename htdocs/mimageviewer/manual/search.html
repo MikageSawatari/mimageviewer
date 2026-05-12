@@ -70,14 +70,14 @@
           </tr>
           <tr>
             <td><kbd>Ctrl</kbd>+<kbd>F</kbd></td>
-            <td><strong>今表示中のフォルダ</strong>内の画像・PDF</td>
-            <td>ファイル名 / EXIF / XMP / AI プロンプト / PDF メタ / タグ</td>
+            <td><strong>今表示中のフォルダ</strong>内の画像・PDF・動画</td>
+            <td>ファイル名 / EXIF / XMP / AI プロンプト / PDF メタ / 動画メタ / タグ</td>
             <td>開いているフォルダを絞り込む (Lightroom のフィルタに近い)</td>
           </tr>
           <tr>
             <td><kbd>Ctrl</kbd>+<kbd>G</kbd></td>
-            <td><strong>お気に入り全体</strong>の画像・PDF</td>
-            <td>ファイル名 / EXIF / XMP / AI プロンプト / PDF メタ / タグ</td>
+            <td><strong>お気に入り全体</strong>の画像・PDF・動画</td>
+            <td>ファイル名 / EXIF / XMP / AI プロンプト / PDF メタ / 動画メタ / タグ</td>
             <td>お気に入り横断で 1 枚の画像を掘り出す</td>
           </tr>
         </tbody>
@@ -125,7 +125,7 @@
 
     <h2 id="ctrl-f">3. Ctrl+F: ローカル検索 (メタデータ検索)</h2>
     <p><kbd>Ctrl</kbd>+<kbd>F</kbd> で<strong>今表示しているフォルダ</strong>の中身を絞り込みます。
-    ファイル名に加え、EXIF・XMP・PNG の AI プロンプト・PDF メタデータ・タグまで検索対象に含められます。
+    ファイル名に加え、EXIF・XMP・PNG の AI プロンプト・PDF メタデータ・動画メタデータ・タグまで検索対象に含められます。
     Lightroom の「フィルタ」バーに近い使い勝手です。</p>
 
     <ol>
@@ -137,12 +137,12 @@
 
     <h3>表示中の ZIP についても検索します</h3>
     <p>ZIP を開いた状態で Ctrl+F を使うと、ZIP 内の PNG メタデータも同じルールで検索されます。
-    PDF の場合はタイトル・著者などのドキュメントメタデータが対象です。</p>
+    PDF の場合はタイトル・著者などのドキュメントメタデータ、動画の場合はタイトル・説明文・元 URL などのコンテナメタデータとサイドカータグが対象です。</p>
 
     <h3>Ctrl+F はインデックス不要で動きます</h3>
     <p>表示中のアイテムを対象に、その場で EXIF / XMP / PNG テキスト等を読んで判定します。
-    さらに<a href="#search-index">メタ索引</a>を ON にしたお気に入り配下のファイルでは高速パスが
-    効き、EXIF / XMP をディスクから読み直さず索引から引くので数千件のフォルダでも即時です。</p>
+    重い読み取りはバックグラウンドで行うため、インデックスを ON にしていないフォルダでも使えます。
+    <a href="#search-index">メタ索引</a>は Ctrl+G の横断検索とタグバッジの即時反映に使われます。</p>
 
     <h2 id="ctrl-g">4. Ctrl+G: グローバル全文検索</h2>
     <p>メニュー「お気に入り」→「メタデータ検索 (<kbd>Ctrl</kbd>+<kbd>G</kbd>)」でお気に入り全体を
@@ -249,7 +249,7 @@
         </thead>
         <tbody>
           <tr><td>お気に入り</td><td>◯</td><td>—</td><td>◯</td></tr>
-          <tr><td>タイプ (フォルダ/画像/ZIP/PDF)</td><td>—</td><td>—</td><td>◯</td></tr>
+          <tr><td>タイプ (フォルダ/画像/ZIP/PDF/動画)</td><td>—</td><td>—</td><td>◯</td></tr>
           <tr><td>検索対象 (EXIF/XMP/…)</td><td>—</td><td>◯</td><td>◯</td></tr>
           <tr><td>タグピッカー</td><td>—</td><td>—</td><td>◯</td></tr>
           <tr><td>OR 検索チェック</td><td>◯</td><td>◯</td><td>◯</td></tr>
@@ -263,11 +263,11 @@
     のお気に入りだけが候補に出ます。</p>
 
     <h3>タイプ (Ctrl+G 専用)</h3>
-    <p><strong>フォルダ / 画像 / ZIP ファイル / PDF ファイル</strong>から 1 つを選んで絞り込みます。
-    「PDF のタイトルだけで検索したい」「フォルダ名だけ見たい」といった用途に使います。</p>
+    <p><strong>フォルダ / 画像 / ZIP ファイル / PDF ファイル / 動画ファイル</strong>から 1 つを選んで絞り込みます。
+    「PDF のタイトルだけで検索したい」「動画の説明文だけ見たい」「フォルダ名だけ見たい」といった用途に使います。</p>
 
     <h3 id="target">検索対象 (Ctrl+F / Ctrl+G 共通)</h3>
-    <p>どのメタデータソースを検索するかを選びます。「すべて」だと以下 6 ソースの OR:</p>
+    <p>どのメタデータソースを検索するかを選びます。「すべて」だと以下 7 ソースの OR:</p>
     <ul>
       <li><strong>ファイル名</strong>: ファイル名 (拡張子込み)</li>
       <li><strong>EXIF</strong>: カメラ本体の撮影情報 (メーカー・モデル・レンズ・絞り etc.)</li>
@@ -276,6 +276,7 @@
       <li><strong>AI プロンプト (PNG)</strong>: Stable Diffusion などが PNG tEXt に埋め込んだプロンプト
           (Negative Prompt は自動で除外)</li>
       <li><strong>PDF メタ情報</strong>: PDF のタイトル / 著者 / 件名 / キーワード</li>
+      <li><strong>動画メタ情報</strong>: FFmpeg が読める動画のタイトル / 作者 / 説明 / URL / チャプター名</li>
       <li><strong>タグ</strong>: mImageViewer の<a href="tags.html">タグ機能</a>で付けた <code>#タグ名</code></li>
     </ul>
     <p>単一ソースに絞ると、そのソース以外の情報はノイズとして弾かれます。例えば
@@ -327,8 +328,8 @@
           </tr>
           <tr>
             <td><strong>メタ索引</strong></td>
-            <td>画像の全文: ファイル名 + EXIF + XMP + AI プロンプト + PDF メタ + タグ</td>
-            <td>Ctrl+G / Ctrl+F 高速パス / グリッドのタグバッジ</td>
+            <td>画像 / PDF / 動画の全文: ファイル名 + EXIF + XMP + AI プロンプト + PDF メタ + 動画メタ + タグ</td>
+            <td>Ctrl+G / グリッドのタグバッジ / タグ書き込み後の即時反映</td>
             <td>OFF</td>
           </tr>
         </tbody>

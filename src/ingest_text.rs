@@ -1,11 +1,13 @@
 //! メタ抽出 → ソース別テキスト構築 (docs/search-expansion-design.md §19.5 Ingest Worker)。
 //!
-//! 画像 1 ファイルに対して以下のソースを個別にビルドする:
+//! 画像 / 動画 1 ファイルに対して以下のソースを個別にビルドする:
 //!   - ファイル名 (拡張子を含む) → `SourceKind::Filename`
 //!   - EXIF (カメラ / レンズ / 撮影日時 / GPS など) → `SourceKind::Exif`
 //!   - XMP (X/Twitter 由来の mXD メタ) → `SourceKind::XmpTweet`
 //!   - PNG tEXt/iTXt (A1111 / ComfyUI AI プロンプト) → `SourceKind::PngPrompt`
 //!   - PDFium document info (PDF のみ) → `SourceKind::PdfMeta`
+//!   - FFmpeg container metadata (動画のみ) → `SourceKind::VideoMeta`
+//!   - XMP `dc:subject` タグ (画像本体 / 動画サイドカー) → `SourceKind::Tags`
 //!
 //! ## 設計方針
 //!
@@ -16,7 +18,7 @@
 //!
 //! ## スコープ
 //!
-//! 本モジュールは **通常ファイル (FS 上の画像)** と PDF メタを対象にする。
+//! 本モジュールは **通常ファイル (FS 上の画像 / 動画)** と PDF メタを対象にする。
 //! ZIP 内エントリ (v1.x) は §7.7 の ZIP 専用 ingest コンテキストで別途扱う。
 
 use std::path::Path;
@@ -33,6 +35,7 @@ pub struct PerSourceText {
     pub xmp_tweet: String,
     pub png_prompt: String,
     pub pdf_meta: String,
+    pub video_meta: String,
     /// XMP `dc:subject` 由来のタグ列 (スペース区切り、`#` 込み / 既存タグは `#` なし)。
     /// Tantivy 側は bigram tokenize、fts_meta 側は同文字列を保存。
     pub tags: String,
@@ -46,6 +49,7 @@ impl PerSourceText {
             SourceKind::XmpTweet => &self.xmp_tweet,
             SourceKind::PngPrompt => &self.png_prompt,
             SourceKind::PdfMeta => &self.pdf_meta,
+            SourceKind::VideoMeta => &self.video_meta,
             SourceKind::Tags => &self.tags,
         }
     }
@@ -59,8 +63,9 @@ impl PerSourceText {
                 + self.xmp_tweet.len()
                 + self.png_prompt.len()
                 + self.pdf_meta.len()
+                + self.video_meta.len()
                 + self.tags.len()
-                + 6,
+                + 7,
         );
         for s in [
             &self.name,
@@ -68,6 +73,7 @@ impl PerSourceText {
             &self.xmp_tweet,
             &self.png_prompt,
             &self.pdf_meta,
+            &self.video_meta,
             &self.tags,
         ] {
             if !s.is_empty() {
@@ -86,6 +92,7 @@ impl PerSourceText {
             && self.xmp_tweet.is_empty()
             && self.png_prompt.is_empty()
             && self.pdf_meta.is_empty()
+            && self.video_meta.is_empty()
             && self.tags.is_empty()
     }
 }
@@ -181,9 +188,97 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
     if is_video_sidecar {
         let dc_tags = crate::xmp_reader::read_dc_subject(path);
         out.tags = build_tags_column(&dc_tags);
+        out.video_meta = build_video_metadata_text(path);
     }
 
     out
+}
+
+/// 動画コンテナの埋め込みメタデータを検索用テキストにする。
+///
+/// 再生時の `VideoInfo` と同じ意味合いの代表値 (title / artist / URL /
+/// description / chapter title) を拾う。失敗時は空文字列に倒し、ファイル名や
+/// XMP サイドカータグの検索は継続できるようにする。
+pub fn build_video_metadata_text(path: &Path) -> String {
+    if !crate::xmp_writer::is_video_for_sidecar(path) {
+        return String::new();
+    }
+    let Some(raw) = read_video_metadata_raw(path) else {
+        return String::new();
+    };
+    normalize_for_match(&raw)
+}
+
+fn read_video_metadata_raw(path: &Path) -> Option<String> {
+    use ffmpeg_the_third as ffmpeg;
+
+    ffmpeg::init().ok()?;
+    let input = ffmpeg::format::input(path).ok()?;
+    let mut parts: Vec<String> = Vec::new();
+    push_metadata_value(&mut parts, &input, &["title", "TITLE"]);
+    push_metadata_value(&mut parts, &input, &["artist", "ARTIST", "author"]);
+    push_metadata_value(
+        &mut parts,
+        &input,
+        &[
+            "purl",
+            "PURL",
+            "url",
+            "URL",
+            "webpage_url",
+            "WEBPAGE_URL",
+            "source_url",
+            "SOURCE_URL",
+            "original_url",
+            "ORIGINAL_URL",
+        ],
+    );
+    push_metadata_value(
+        &mut parts,
+        &input,
+        &["description", "DESCRIPTION", "comment", "COMMENT"],
+    );
+
+    for chapter in input.chapters() {
+        let md = chapter.metadata();
+        if let Some(title) = md
+            .get("title")
+            .or_else(|| md.get("TITLE"))
+            .filter(|s| !s.trim().is_empty())
+        {
+            parts.push(title.to_string());
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+fn push_metadata_value(
+    out: &mut Vec<String>,
+    input: &ffmpeg_the_third::format::context::Input,
+    keys: &[&str],
+) {
+    let dict = input.metadata();
+    for k in keys {
+        if let Some(v) = dict.get(k).filter(|s| !s.trim().is_empty()) {
+            out.push(v.to_string());
+            return;
+        }
+    }
+    for (key, value) in dict.iter() {
+        if keys
+            .iter()
+            .any(|candidate| key.eq_ignore_ascii_case(candidate))
+            && !value.trim().is_empty()
+        {
+            out.push(value.to_string());
+            return;
+        }
+    }
 }
 
 /// メタ抽出共通のファイル読み込み (XMP / PNG / dc:subject で共有)。
@@ -270,6 +365,7 @@ pub fn build_per_source_for_pdf(display_name: &str, info_text: &str) -> PerSourc
         } else {
             normalize_for_match(info_text)
         },
+        video_meta: String::new(),
         tags: String::new(),
     }
 }
@@ -340,6 +436,7 @@ mod tests {
         assert!(pst.exif.is_empty());
         assert!(pst.xmp_tweet.is_empty());
         assert!(pst.png_prompt.is_empty());
+        assert!(pst.video_meta.is_empty());
     }
 
     #[test]
@@ -406,10 +503,11 @@ mod tests {
             xmp_tweet: "".into(),
             png_prompt: "prompt text".into(),
             pdf_meta: "".into(),
+            video_meta: "video title".into(),
             tags: "#原神".into(),
         };
         let c = pst.combined();
-        assert_eq!(c, "photo.jpg canon 5d prompt text #原神");
+        assert_eq!(c, "photo.jpg canon 5d prompt text video title #原神");
     }
 
     #[test]
@@ -420,6 +518,7 @@ mod tests {
             xmp_tweet: "x".into(),
             png_prompt: "p".into(),
             pdf_meta: "m".into(),
+            video_meta: "v".into(),
             tags: "t".into(),
         };
         assert_eq!(pst.get(SourceKind::Filename), "n");
@@ -427,6 +526,7 @@ mod tests {
         assert_eq!(pst.get(SourceKind::XmpTweet), "x");
         assert_eq!(pst.get(SourceKind::PngPrompt), "p");
         assert_eq!(pst.get(SourceKind::PdfMeta), "m");
+        assert_eq!(pst.get(SourceKind::VideoMeta), "v");
         assert_eq!(pst.get(SourceKind::Tags), "t");
     }
 

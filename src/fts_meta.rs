@@ -1,4 +1,4 @@
-//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=6)。
+//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=7)。
 //!
 //! docs/search-architecture.md に準拠する。
 //!
@@ -39,7 +39,8 @@ use crate::search_index_db::normalize_path;
 ///      へ集約。fts_meta.db の `*_norm` 列を撤去 (本ファイルから DDL も削除)。
 /// - 6: status を Ok / Failed の 2 値に縮小。Pending / Tombstone を廃止し、検索
 ///      post-filter の SQLite SELECT も削除。
-pub const INDEX_VERSION: i64 = 6;
+/// - 7: 動画メタデータ検索 (IndexKind::Video + video_meta_text) を追加。
+pub const INDEX_VERSION: i64 = 7;
 
 /// 後始末 (VACUUM 等) を要求するスキーマ世代。`PRAGMA application_id` に書き込み、
 /// 既に最新なら再実行しない。INDEX_VERSION とは別管理で、データ移行を伴わない
@@ -958,7 +959,7 @@ mod tests {
     #[test]
     fn migration_v5_to_v6_collapses_pending_and_drops_tombstones() {
         // 旧 v5 スキーマで status=Pending(1) と Tombstone(3) を含むデータを作り、
-        // INDEX_VERSION=6 で開き直したときに pending→failed, tombstone→DELETE される。
+        // 最新 INDEX_VERSION で開き直したときに pending→failed, tombstone→DELETE される。
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fts_meta.db");
         {

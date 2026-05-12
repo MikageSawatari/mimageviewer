@@ -611,10 +611,12 @@ fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<
         search_walker::CandidateKind::Zip
     } else if ext == "pdf" {
         search_walker::CandidateKind::Pdf
+    } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+        search_walker::CandidateKind::Video
     } else if crate::folder_tree::is_recognized_image_ext(&ext) {
         search_walker::CandidateKind::Image
     } else {
-        // 非画像は無視 (typography 違い、notify が .tmp 等を拾う場合も)
+        // 非対応ファイルは無視 (typography 違い、notify が .tmp 等を拾う場合も)
         return None;
     };
     // Apple Double 除外

@@ -1,8 +1,8 @@
 //! Tantivy ベースの全文検索インデックス (docs/search-architecture.md)。
 //!
-//! ## 役割 (INDEX_VERSION=6)
+//! ## 役割 (INDEX_VERSION=7)
 //!
-//! - bigram tokenizer (`NgramTokenizer(2, 2)` + `lower_caser`) で画像メタを転置索引化
+//! - bigram tokenizer (`NgramTokenizer(2, 2)` + `lower_caser`) で画像 / PDF / 動画メタを転置索引化
 //! - **検索原文 (post-filter 用) を STORED で保持する**。`*_text` フィールドが bigram
 //!   索引 + STORED 原文の両方を担い、`fts_meta.db` は管理メタ (path / mtime / size /
 //!   status=Ok|Failed / index_generation) のみを持つ
@@ -12,14 +12,14 @@
 //!   投入 → batch commit + reader reload に成功したフレームでのみ `fts_meta` を更新
 //!   する (Tantivy First)。詳細は [search-architecture.md §4.2](../docs/search-architecture.md)
 //!
-//! ## スキーマ (INDEX_VERSION=6)
+//! ## スキーマ (INDEX_VERSION=7)
 //!
 //! ```text
 //! path             STRING | STORED            完全一致キー、正規化済み
 //! container        STRING | STORED            "fs" / "zip"
 //! zip_entry        STRING | STORED            container="zip" のとき ZIP 内相対パス
 //! favorite_id      STRING | STORED            UUID (exact term filter 用)
-//! kind             STRING | STORED            "folder" / "image" / "zip" / "pdf"
+//! kind             STRING | STORED            "folder" / "image" / "zip" / "pdf" / "video"
 //! mtime            i64    INDEXED | STORED
 //! file_size        i64    STORED
 //! name             TEXT   bigram | STORED     ファイル名 / ZIP エントリ名
@@ -27,6 +27,7 @@
 //! xmp_tweet_text   TEXT   bigram | STORED     XMP / mXD ツイート情報
 //! png_prompt_text  TEXT   bigram | STORED     PNG tEXt/iTXt AI プロンプト
 //! pdf_meta_text    TEXT   bigram | STORED     PDFium document info
+//! video_meta_text  TEXT   bigram | STORED     FFmpeg container metadata (video only)
 //! tags             TEXT   bigram | STORED     XMP dc:subject (#プレフィックス付き)
 //! ```
 //!
@@ -74,6 +75,7 @@ pub enum SourceKind {
     XmpTweet,
     PngPrompt,
     PdfMeta,
+    VideoMeta,
     Tags,
 }
 
@@ -84,11 +86,12 @@ impl SourceKind {
         SourceKind::XmpTweet,
         SourceKind::PngPrompt,
         SourceKind::PdfMeta,
+        SourceKind::VideoMeta,
         SourceKind::Tags,
     ];
 }
 
-/// 検索対象フィルタ (§19.6)。`All` は 5 ソース全部を OR する。
+/// 検索対象フィルタ (§19.6)。`All` は全ソースを OR する。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchTarget {
     All,
@@ -131,6 +134,7 @@ pub enum IndexKind {
     Image,
     Zip,
     Pdf,
+    Video,
 }
 
 impl IndexKind {
@@ -140,6 +144,7 @@ impl IndexKind {
             IndexKind::Image => "image",
             IndexKind::Zip => "zip",
             IndexKind::Pdf => "pdf",
+            IndexKind::Video => "video",
         }
     }
 
@@ -150,6 +155,7 @@ impl IndexKind {
             IndexKind::Image => 1,
             IndexKind::Zip => 2,
             IndexKind::Pdf => 3,
+            IndexKind::Video => 4,
         }
     }
 
@@ -160,6 +166,7 @@ impl IndexKind {
             1 => IndexKind::Image,
             2 => IndexKind::Zip,
             3 => IndexKind::Pdf,
+            4 => IndexKind::Video,
             other => {
                 crate::logger::log(format!(
                     "fts_index: unexpected IndexKind discriminant {other} — falling back to Image"
@@ -177,7 +184,7 @@ pub struct QueryFilters<'a> {
     pub favorite_ids: Option<&'a [Uuid]>,
     /// 指定なら該当 kind の OR で絞る。None = すべて。
     pub kinds: Option<&'a [IndexKind]>,
-    /// 検索対象ソース (ソースを跨いだ OR)。既定は `All` (= 5 ソース全部)。
+    /// 検索対象ソース (ソースを跨いだ OR)。既定は `All` (= 全ソース)。
     pub target: SearchTarget,
     /// include トークン結合モード (docs §20)。既定は AND。
     pub mode: crate::search_query::MatchMode,
@@ -185,7 +192,7 @@ pub struct QueryFilters<'a> {
 
 /// Tantivy ドキュメント 1 件を構築するための入力。
 ///
-/// ソース別テキスト (ファイル名・EXIF・XMP・PNG プロンプト・PDF メタ・タグ) は
+/// ソース別テキスト (ファイル名・EXIF・XMP・PNG プロンプト・PDF/動画メタ・タグ) は
 /// [`crate::ingest_text::PerSourceText`] にまとめて保持する。
 #[derive(Debug, Clone)]
 pub struct IndexDoc {
@@ -230,6 +237,7 @@ pub struct Fields {
     pub xmp_tweet_text: Field,
     pub png_prompt_text: Field,
     pub pdf_meta_text: Field,
+    pub video_meta_text: Field,
     pub tags: Field,
 }
 
@@ -256,6 +264,9 @@ impl Fields {
             pdf_meta_text: schema
                 .get_field("pdf_meta_text")
                 .expect("schema: pdf_meta_text"),
+            video_meta_text: schema
+                .get_field("video_meta_text")
+                .expect("schema: video_meta_text"),
             tags: schema.get_field("tags").expect("schema: tags"),
         }
     }
@@ -268,6 +279,7 @@ impl Fields {
             SourceKind::XmpTweet => self.xmp_tweet_text,
             SourceKind::PngPrompt => self.png_prompt_text,
             SourceKind::PdfMeta => self.pdf_meta_text,
+            SourceKind::VideoMeta => self.video_meta_text,
             SourceKind::Tags => self.tags,
         }
     }
@@ -372,6 +384,7 @@ pub fn upsert_doc(writer: &IndexWriter, fields: &Fields, d: &IndexDoc) -> tantiv
         fields.xmp_tweet_text  => d.norms.xmp_tweet.as_str(),
         fields.png_prompt_text => d.norms.png_prompt.as_str(),
         fields.pdf_meta_text   => d.norms.pdf_meta.as_str(),
+        fields.video_meta_text => d.norms.video_meta.as_str(),
         fields.tags            => d.norms.tags.as_str(),
     ))?;
     Ok(())
@@ -393,8 +406,9 @@ pub fn delete_doc(writer: &IndexWriter, fields: &Fields, path: &str) {
 ///
 /// ## フィールド間の OR (§19 分割対応)
 ///
-/// `SearchTarget::All` では `name / exif_text / xmp_tweet_text / png_prompt_text / pdf_meta_text`
-/// の 5 フィールドに対して OR を取る (ソースを跨いでトークンが見つかれば OK)。
+/// `SearchTarget::All` では `name / exif_text / xmp_tweet_text / png_prompt_text /
+/// pdf_meta_text / video_meta_text / tags` に対して OR を取る
+/// (ソースを跨いでトークンが見つかれば OK)。
 /// `SearchTarget::Only([...])` では指定フィールドのみで OR。
 /// トークン 1 つあたり: (AND of bigrams) を各対象フィールドで作り、フィールド間を OR でまとめる。
 /// トークン間はさらに AND。
@@ -565,7 +579,7 @@ pub fn find_doc_by_path(
     Ok(top.into_iter().next().map(|(_, addr)| addr))
 }
 
-/// 指定 doc の STORED `*_text` 6 ソース全部を `PerSourceText` に詰めて返す。
+/// 指定 doc の STORED `*_text` 全ソースを `PerSourceText` に詰めて返す。
 /// `tag_write_worker` が「他ソースの text を保ったまま tags だけ差し替えて upsert」
 /// するのに使う (INDEX_VERSION=5 以降は fts_meta.db に norms が無いため)。
 pub fn doc_per_source_text(
@@ -586,6 +600,7 @@ pub fn doc_per_source_text(
         xmp_tweet: read(fields.xmp_tweet_text),
         png_prompt: read(fields.png_prompt_text),
         pdf_meta: read(fields.pdf_meta_text),
+        video_meta: read(fields.video_meta_text),
         tags: read(fields.tags),
     })
 }
@@ -626,8 +641,8 @@ pub fn doc_text_for_target(
 // -----------------------------------------------------------------------
 
 /// 既存の Tantivy schema が最新と一致するか判定する。
-/// 判定: 新フィールド 6 本 (`name`/`exif_text`/`xmp_tweet_text`/`png_prompt_text`/
-/// `pdf_meta_text`/`tags`) が揃っていて、旧 `all_text` が残っておらず、
+/// 判定: 新フィールド (`name`/`exif_text`/`xmp_tweet_text`/`png_prompt_text`/
+/// `pdf_meta_text`/`video_meta_text`/`tags`) が揃っていて、旧 `all_text` が残っておらず、
 /// **かつ INDEX_VERSION=5 で要求される STORED 属性が付いていること**。
 ///
 /// STORED チェックを忘れると、v4 (per-source field 名は同じ・STORED なし) を
@@ -638,6 +653,7 @@ fn schema_is_stale(schema: &Schema) -> bool {
         && schema.get_field("xmp_tweet_text").is_ok()
         && schema.get_field("png_prompt_text").is_ok()
         && schema.get_field("pdf_meta_text").is_ok()
+        && schema.get_field("video_meta_text").is_ok()
         && schema.get_field("kind").is_ok()
         && schema.get_field("tags").is_ok();
     if !has_new {
@@ -646,13 +662,14 @@ fn schema_is_stale(schema: &Schema) -> bool {
     if schema.get_field("all_text").is_ok() {
         return true;
     }
-    // text 系 6 フィールドはすべて STORED 必須 (INDEX_VERSION=5)
+    // text 系フィールドはすべて STORED 必須 (INDEX_VERSION=5+)
     for name in [
         "name",
         "exif_text",
         "xmp_tweet_text",
         "png_prompt_text",
         "pdf_meta_text",
+        "video_meta_text",
         "tags",
     ] {
         let Ok(field) = schema.get_field(name) else {
@@ -711,6 +728,7 @@ fn build_schema() -> Schema {
     b.add_text_field("xmp_tweet_text", text_opts.clone());
     b.add_text_field("png_prompt_text", text_opts.clone());
     b.add_text_field("pdf_meta_text", text_opts.clone());
+    b.add_text_field("video_meta_text", text_opts.clone());
     // タグフィールドも bigram tokenize — `原神` キーワード検索で `#原神` タグにヒット、
     // `#原神` 入力でもヒットする (A-1 設計)。target=Tags ドロップダウンで絞り込み可。
     b.add_text_field("tags", text_opts);
@@ -784,6 +802,7 @@ mod tests {
                 xmp_tweet: xmp_tweet.to_string(),
                 png_prompt: png_prompt.to_string(),
                 pdf_meta: String::new(),
+                video_meta: String::new(),
                 tags: String::new(),
             },
         }
@@ -806,6 +825,24 @@ mod tests {
         }
     }
 
+    /// テスト用 doc (video_meta フィールドのみ書き込む版)。
+    fn sample_video_doc_with_meta(path: &str, fav: Uuid, video_meta: &str) -> IndexDoc {
+        IndexDoc {
+            path: path.to_string(),
+            container: Container::Fs,
+            zip_entry: String::new(),
+            favorite_id: fav,
+            kind: IndexKind::Video,
+            mtime: 100,
+            file_size: 1024,
+            norms: crate::ingest_text::PerSourceText {
+                name: path.rsplit('/').next().unwrap_or(path).to_string(),
+                video_meta: video_meta.to_string(),
+                ..Default::default()
+            },
+        }
+    }
+
     fn q_all(fields: &Fields, tokens: &[&str]) -> Option<BooleanQuery> {
         build_bigram_and_query(fields, tokens, &QueryFilters::default())
     }
@@ -821,6 +858,7 @@ mod tests {
         assert!(s.get_field("xmp_tweet_text").is_ok());
         assert!(s.get_field("png_prompt_text").is_ok());
         assert!(s.get_field("pdf_meta_text").is_ok());
+        assert!(s.get_field("video_meta_text").is_ok());
         assert!(
             s.get_field("all_text").is_err(),
             "all_text は §19 で削除済み"
@@ -1206,6 +1244,7 @@ mod tests {
             b.add_text_field("xmp_tweet_text", bigram.clone());
             b.add_text_field("png_prompt_text", bigram.clone());
             b.add_text_field("pdf_meta_text", bigram.clone());
+            b.add_text_field("video_meta_text", bigram.clone());
             b.add_text_field("tags", bigram); // STORED 未指定
             let v4_schema = b.build();
             let v4_index = Index::create_in_dir(&path, v4_schema).unwrap();
@@ -1377,6 +1416,53 @@ mod tests {
     }
 
     #[test]
+    fn target_only_video_meta_matches_video_meta_field() {
+        let (_tmp, idx) = new_index();
+        let fav = Uuid::new_v4();
+        let mut writer = idx.writer().unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_video_doc_with_meta("c:/clip.mp4", fav, "夕焼け movie title"),
+        )
+        .unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_doc_with_sources(
+                "c:/image.jpg",
+                fav,
+                IndexKind::Image,
+                "夕焼け.jpg",
+                "",
+                "",
+                "",
+            ),
+        )
+        .unwrap();
+        writer.commit().unwrap();
+        idx.reload_reader().unwrap();
+
+        let q = build_bigram_and_query(
+            idx.fields(),
+            &["夕焼け"],
+            &QueryFilters {
+                target: SearchTarget::Only(vec![SourceKind::VideoMeta]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let searcher = idx.searcher();
+        let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "VideoMeta target は video_meta フィールドのみ対象"
+        );
+        assert_eq!(hits[0].0, "c:/clip.mp4");
+    }
+
+    #[test]
     fn kind_filter_scopes_results() {
         let (_tmp, idx) = new_index();
         let fav = Uuid::new_v4();
@@ -1413,18 +1499,24 @@ mod tests {
             &sample_doc_with_sources("c:/c.jpg", fav, IndexKind::Image, "夕焼け jpg", "", "", ""),
         )
         .unwrap();
+        upsert_doc(
+            &writer,
+            idx.fields(),
+            &sample_video_doc_with_meta("c:/d.mp4", fav, "夕焼け video"),
+        )
+        .unwrap();
         writer.commit().unwrap();
         idx.reload_reader().unwrap();
 
         let searcher = idx.searcher();
 
-        // kinds=None → 4 件全部
+        // kinds=None → 5 件全部
         let q_all_q = q_all(idx.fields(), &["夕焼け"]).unwrap();
         let all_hits = search_page(&searcher, idx.fields(), &q_all_q, 0, 10).unwrap();
-        assert_eq!(all_hits.len(), 4);
+        assert_eq!(all_hits.len(), 5);
 
-        // kinds=[Zip, Pdf] → 2 件
-        let kinds = [IndexKind::Zip, IndexKind::Pdf];
+        // kinds=[Zip, Pdf, Video] → 3 件
+        let kinds = [IndexKind::Zip, IndexKind::Pdf, IndexKind::Video];
         let q = build_bigram_and_query(
             idx.fields(),
             &["夕焼け"],
@@ -1436,9 +1528,10 @@ mod tests {
         .unwrap();
         let hits = search_page(&searcher, idx.fields(), &q, 0, 10).unwrap();
         let paths: std::collections::HashSet<_> = hits.iter().map(|(p, _, _)| p.as_str()).collect();
-        assert_eq!(hits.len(), 2);
+        assert_eq!(hits.len(), 3);
         assert!(paths.contains("c:/a.zip"));
         assert!(paths.contains("c:/b.pdf"));
+        assert!(paths.contains("c:/d.mp4"));
     }
 
     /// target=Only([Tags]) で tags フィールドだけを対象に検索できることを確認する。

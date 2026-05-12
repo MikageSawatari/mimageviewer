@@ -690,7 +690,7 @@ fn run_metadata_search(
     cancel: &AtomicBool,
 ) -> SearchThreadResult {
     // INDEX_VERSION=5 で fts_meta.db に原文が無くなったため、Ctrl+F は fast path を
-    // 持たず常に on-demand (PNG/EXIF/XMP/dc:subject 直読み) で判定する。表示中の
+    // 持たず常に on-demand (PNG/EXIF/XMP/PDF/動画メタ/dc:subject 直読み) で判定する。表示中の
     // 数十〜数千件しか触らないので体感影響は小さい。PDF の target=PdfMeta 絞り込みは
     // off になり、お気に入り未登録の PDF を Ctrl+F する動線に合わせて「常に表示」扱い。
     let mut matches: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -747,7 +747,7 @@ fn run_metadata_search(
         }
     }
 
-    // Pass 2: Image/Video — cheap hay で決まらなければ XMP を lazy 読み取り (ファイル I/O)
+    // Pass 2: Image/Video — cheap hay で決まらなければ XMP / 動画メタを lazy 読み取り (ファイル I/O)
     //
     // §19 target フィルタ対応: target が全ソース (All) なら従来挙動。単一ソース選択時は
     // そのソース由来の文字列だけで hay を作り、非対象ソースの I/O もスキップする。
@@ -755,11 +755,13 @@ fn run_metadata_search(
     let use_png = target.includes(crate::fts_index::SourceKind::PngPrompt);
     let use_exif = target.includes(crate::fts_index::SourceKind::Exif);
     let use_xmp = target.includes(crate::fts_index::SourceKind::XmpTweet);
+    let use_video_meta = target.includes(crate::fts_index::SourceKind::VideoMeta);
     let use_tags = target.includes(crate::fts_index::SourceKind::Tags);
-    // 画像 / Video 用の fallback 経路は name/png/exif/xmp/tags のいずれかが対象でないと
+    // 画像 / Video 用の fallback 経路は name/png/exif/xmp/video_meta/tags のいずれかが対象でないと
     // 計算結果が常に空になる。PdfMeta-only 等で無駄な per-file 走査を避ける。
     // Tags も含めておかないと、target=Tags のときに未インデックス画像が全件 skip される。
-    let fallback_contributes = use_name || use_png || use_exif || use_xmp || use_tags;
+    let fallback_contributes =
+        use_name || use_png || use_exif || use_xmp || use_video_meta || use_tags;
     for (idx, item) in items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return SearchThreadResult::Done {
@@ -828,9 +830,10 @@ fn run_metadata_search(
                         }
                     }
                 }
-                // target が Tags を含む場合、未インデックスの画像でも dc:subject を
+                // target が Tags を含む場合、未インデックスの画像/動画でも dc:subject を
                 // 直読みして hay に載せる (Ctrl+F で tag 絞り込みを機能させる)。
-                if is_image && use_tags {
+                // 動画は read_dc_subject 側で同名 .xmp サイドカーを読む。
+                if use_tags {
                     let tags_text = crate::ingest_text::build_tags_column(
                         &crate::xmp_reader::read_dc_subject(path),
                     );
@@ -839,6 +842,15 @@ fn run_metadata_search(
                             extended_meta.push('\n');
                         }
                         extended_meta.push_str(&tags_text);
+                    }
+                }
+                if !is_image && use_video_meta {
+                    let video_meta = crate::ingest_text::build_video_metadata_text(path);
+                    if !video_meta.is_empty() {
+                        if !extended_meta.is_empty() {
+                            extended_meta.push('\n');
+                        }
+                        extended_meta.push_str(&video_meta);
                     }
                 }
                 let hay = hay_of(&extended_meta, name_for_hay, xmp_opt.as_ref());

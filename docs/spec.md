@@ -480,8 +480,8 @@ Ctrl+F (ローカル検索) はこれらの制約を受けない。
 | ショートカット | 対象 | 検索経路 | 備考 |
 |---|---|---|---|
 | Ctrl+S | お気に入り全体のフォルダ / ZIP / PDF / 動画名 | `search_index.db` (SQLite LIKE) | 既存実装を継続 |
-| Ctrl+F | **現在グリッドに表示中の一覧のみ** (非再帰) | `fts_meta.db` 直接 lookup (fast path) → 未登録 path はオンデマンド (PNG tEXt + EXIF + XMP) fallback | ZIP 展開中は ZIP 内エントリ画像も対象。PDF は `fts_meta` 登録済みなら PDF メタ情報 (タイトル/著者/件名/キーワード) で絞り込み、未登録 PDF はナビ用途として常に残す |
-| Ctrl+G | **お気に入り全体 (`auto_index_metadata=true`)** | Tantivy bigram 索引で候補絞り込み → `fts_meta.db` で all_text_norm 一括取得 → `matches()` で phrase/NOT/AND 正確判定 (streaming) | v0.8.0 は **通常ファイル (画像) + ZIP ファイル名 + PDF document info** が対象。ZIP 内エントリのメタ展開は v0.8.x 以降に予定 |
+| Ctrl+F | **現在グリッドに表示中の一覧のみ** (非再帰) | worker 上のオンデマンド読み取り (PNG tEXt + EXIF + XMP + PDF info + 動画 metadata / sidecar tags) | ZIP 展開中は ZIP 内エントリ画像も対象。PDF はタイトル/著者/件名/キーワード、動画は FFmpeg が読める title/artist/description/URL/chapter title と `.xmp` サイドカータグで絞り込む |
+| Ctrl+G | **お気に入り全体 (`auto_index_metadata=true`)** | Tantivy bigram 索引で候補絞り込み → STORED 原文を `matches()` で phrase/NOT/AND 正確判定 (streaming) | 通常ファイル (画像 / 動画) + ZIP ファイル名 + PDF document info が対象。動画は `video_meta_text` と `tags`、PDF は `pdf_meta_text` に分けて検索対象フィルタから選べる |
 
 #### AI メタデータ検索の Negative Prompt 除外
 
@@ -623,7 +623,7 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - [x] EXIF 表示パネル（rexif クレート、フィルタ設定付き）
 - [x] スライドショー（フルスクリーン、間隔設定可能、フォルダ内ループ）
 - [x] 非破壊画像回転（SQLite 保存、R/L キー + ボタン操作）
-- [x] メタデータキーワード検索（Ctrl+F、フォルダ内 PNG プロンプト + ファイル名 + ZIP 内 PNG メタデータ。v0.8.0 で `fts_meta.db` fast path を追加）
+- [x] メタデータキーワード検索（Ctrl+F、フォルダ内 PNG プロンプト + ファイル名 + ZIP 内 PNG メタデータ + PDF メタ + 動画メタ / タグ。重い読み取りは worker 上で実行）
 - [x] お気に入り検索（Ctrl+S、お気に入り配下のフォルダ/ZIP/PDF/動画名横断検索、SQLite インデックス）
 - [x] 検索クエリ構文: スペース区切り AND / `-word` NOT / `"..."` フレーズ（Ctrl+F / Ctrl+G / Ctrl+S 共通、`src/search_query.rs`）
 - [x] AI メタデータ検索は Negative Prompt を自動除外（A1111 / ComfyUI / Midjourney を認識した場合）
@@ -662,7 +662,7 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - [x] post-filter で phrase / NOT / AND を正確判定 (bigram だけでは position=0 で不正確なため)
 - [x] HARD_MAX=10,000 で打ち切り (streaming で逐次表示、最初のページは ~5ms)
 - [x] Ctrl+G drill-down view (SearchContainer クリックでコンテナ内ヒット一覧に遷移、BS/← で戻る)
-- [x] **Ctrl+F を fts_meta.db 直接 lookup 経路に差し替え** (fast path + on-demand fallback)
+- [x] **Ctrl+F を worker 上のオンデマンド検索に統一** (PNG / EXIF / XMP / PDF info / 動画メタ / タグを target に応じて読む)
 - [x] `FavoriteEntry` に `id: Uuid` + `auto_index_{structure,metadata,thumbs}` 3 フラグ追加
 - [x] お気に入り編集 / 追加ダイアログに 3 つのチェックボックス + 一括 ON/OFF
 - [x] FsWatcher (notify-rs ReadDirectoryChangesW) + 500ms debounce
@@ -672,7 +672,7 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - [x] PDFium document info (Title / Author / Subject / Keywords) 取り込み
 - [x] 最小クエリ長ポリシー (CJK 2 文字 / ASCII 3 文字) + NOT-only 拒否 (Ctrl+G)
 - [x] **検索絞り込みフィルタ** (§19 per-source 分割): Tantivy / fts_meta.db を ソース別フィールド
-      (name / exif_text / xmp_tweet_text / png_prompt_text / pdf_meta_text / tags) に分割。
+      (name / exif_text / xmp_tweet_text / png_prompt_text / pdf_meta_text / video_meta_text / tags) に分割。
       Ctrl+G/Ctrl+F の「検索対象」ドロップダウンで EXIF だけ / AI プロンプトだけ / タグだけ … 等の絞り込み可能。
       Ctrl+G にはさらに「お気に入り」「タイプ」フィルタと登録済みタグのピッカーを追加。
 

@@ -33,6 +33,7 @@ use common::{
 };
 use mimageviewer::fts_meta::FtsMetaDb;
 use mimageviewer::global_search::{DoneReason, RejectReason, SearchStreamEvent};
+use std::fs;
 
 // -----------------------------------------------------------------------
 // 初期スキャン + 基本検索
@@ -98,6 +99,58 @@ fn initial_scan_hits_by_filename() {
         |h| h.iter().any(|g| g.path.contains("birthday_party")),
         FS_EVENT_TIMEOUT,
         "search finds 'birthday' by filename",
+    );
+    assert_eq!(hits.len(), 1);
+}
+
+/// 動画ファイルも Ctrl+G のメタ索引対象になり、サイドカー XMP のタグで検索できること。
+/// 実動画を fixture に持たずに済むよう、コンテナメタではなく `.xmp` サイドカー経路を使う。
+#[test]
+fn initial_scan_hits_video_sidecar_tags() {
+    let data = FixtureRoot::new();
+    let root = FixtureRoot::new();
+    let video_path = root.path().join("tagged_movie.mp4");
+    fs::write(
+        &video_path,
+        b"not a real mp4, metadata probe should fail gracefully",
+    )
+    .expect("write fake video");
+    fs::write(
+        root.path().join("tagged_movie.mp4.xmp"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+           xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <rdf:Description>
+      <dc:subject>
+        <rdf:Bag>
+          <rdf:li>#video_sidecar_marker</rdf:li>
+        </rdf:Bag>
+      </dc:subject>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#,
+    )
+    .expect("write video sidecar");
+
+    let fav = make_favorite("A", root.path());
+    let mgr = start_indexer_at(data.path(), &[fav.clone()]);
+    wait_scan_done(&mgr, fav.id);
+
+    let meta_db =
+        mimageviewer::fts_meta::FtsMetaDb::open_at(&data.path().join("fts_meta.db")).unwrap();
+    let key = normalize_path(&video_path);
+    wait_meta_contains(&meta_db, &key);
+    let row = meta_db.get(&key).unwrap().unwrap();
+    assert_eq!(row.kind, mimageviewer::fts_index::IndexKind::Video);
+
+    let hits = wait_for_search_hits(
+        &mgr,
+        "video_sidecar_marker",
+        &[fav.id],
+        |h| h.iter().any(|g| g.path.contains("tagged_movie.mp4")),
+        FS_EVENT_TIMEOUT,
+        "search finds video sidecar tag",
     );
     assert_eq!(hits.len(), 1);
 }

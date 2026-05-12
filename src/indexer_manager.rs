@@ -782,17 +782,9 @@ struct ReconciliationReport {
 mod tests {
     use super::*;
     use crate::fts_index::{Container, IndexDoc, IndexKind, QueryFilters, upsert_doc};
-    use crate::ingest_text::PerSourceText;
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
     use tempfile::TempDir;
-
-    fn txt_norms(name: &str) -> PerSourceText {
-        PerSourceText {
-            name: name.to_string(),
-            ..PerSourceText::default()
-        }
-    }
 
     fn mk_fav(name: &str, path: &std::path::Path, metadata: bool) -> FavoriteEntry {
         let mut fav = FavoriteEntry::new(name.to_string(), path.to_path_buf());

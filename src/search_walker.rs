@@ -50,6 +50,8 @@ pub enum CandidateKind {
     Zip,
     /// PDF (v1 は document info のみ ingest、本文は対象外)
     Pdf,
+    /// 動画 (ファイル名 + mXD XMP + sidecar tags + container metadata)
+    Video,
 }
 
 /// 3-way diff 結果。
@@ -263,6 +265,8 @@ fn walk_dir_recursive(
             CandidateKind::Zip
         } else if ext == "pdf" {
             CandidateKind::Pdf
+        } else if folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
+            CandidateKind::Video
         } else if folder_tree::is_recognized_image_ext(&ext) {
             CandidateKind::Image
         } else {
@@ -380,10 +384,11 @@ mod tests {
         make_file(&root, "ignore.txt", b"zz");
         make_file(&root, "archive.zip", b"PK");
         make_file(&root, "doc.pdf", b"%PDF");
+        make_file(&root, "clip.mp4", b"fake mp4");
 
         let r = scan_sync(fav, &root, &db);
-        assert_eq!(r.total_scanned, 4, "jpg+png+zip+pdf の 4 つ");
-        assert_eq!(r.to_ingest.len(), 4);
+        assert_eq!(r.total_scanned, 5, "jpg+png+zip+pdf+mp4 の 5 つ");
+        assert_eq!(r.to_ingest.len(), 5);
         assert_eq!(r.unchanged, 0);
         assert!(r.to_delete.is_empty());
 
@@ -391,6 +396,7 @@ mod tests {
         assert!(kinds.contains(&CandidateKind::Image));
         assert!(kinds.contains(&CandidateKind::Zip));
         assert!(kinds.contains(&CandidateKind::Pdf));
+        assert!(kinds.contains(&CandidateKind::Video));
     }
 
     #[test]

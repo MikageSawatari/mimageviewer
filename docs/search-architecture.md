@@ -14,8 +14,8 @@ mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の
 | ショートカット | 用途 | スコープ | 実装経路 |
 | --- | --- | --- | --- |
 | **Ctrl+S** | フォルダ / ZIP / PDF / 動画名の横断検索 | お気に入り配下 (再帰) | `search_index.db` (SQLite LIKE) |
-| **Ctrl+F** | ローカルメタ検索 | 現在グリッドに表示中の画像のみ (非再帰) | `fts_meta.db` 直接 lookup + 未登録分は on-demand fallback |
-| **Ctrl+G** | グローバルメタ検索 | お気に入り配下 (ZIP 内画像含む、再帰) | Tantivy bigram 候補絞り込み + `fts_meta.db` post-filter の streaming |
+| **Ctrl+F** | ローカルメタ検索 | 現在グリッドに表示中の画像 / PDF / 動画 (非再帰) | worker 上の on-demand メタ読み取り |
+| **Ctrl+G** | グローバルメタ検索 | お気に入り配下 (画像 / PDF / 動画、ZIP 内画像含む、再帰) | Tantivy bigram 候補絞り込み + STORED 原文 post-filter の streaming |
 
 3 つは UI 上で排他表示される (同時に 2 本開かない)。回帰ガードは
 `src/app.rs::phase_c_key_tests`。
@@ -73,7 +73,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | [search_walker.rs](../src/search_walker.rs) | 起動時の再帰 walk + 3-way diff (FS / `fts_meta.db` の突き合わせ) |
 | [search_watcher.rs](../src/search_watcher.rs) | notify-rs `ReadDirectoryChangesW` ラッパ + 500ms debounce |
 | [ingest_worker.rs](../src/ingest_worker.rs) | メタ抽出 + Tantivy buffer + バッチ commit + fts_meta 状態遷移 |
-| [ingest_text.rs](../src/ingest_text.rs) | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / tags) ビルダー |
+| [ingest_text.rs](../src/ingest_text.rs) | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / tags) ビルダー |
 | [name_index_supervisor.rs](../src/name_index_supervisor.rs) | Ctrl+S 用 **名前索引 supervisor** (初期バルク + notify-rs 追従) |
 | [name_bulk_indexer.rs](../src/name_bulk_indexer.rs) | Ctrl+S 用 初期バルクスキャンの本体 |
 | [io_semaphore.rs](../src/io_semaphore.rs) | `GlobalIoSemaphore` — UI / PDF / サムネ / インデクサ横断の I/O 同時実行制御 |
@@ -108,7 +108,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | `fts_meta.db` | `files(path PK, favorite_id, kind, mtime, size, indexed_at, index_version, index_generation, status)` — INDEX_VERSION=5 で `*_norm` 列群を撤去し管理メタ専用に縮小 | `fts_meta.rs` | `INDEX_VERSION` を bump すると `needs_rebuild` が `*_norm` 残存も検出して全再構築を促す |
 
 **パスキー正規化**: Windows の大文字小文字非区別と区切り文字混在に備え、
-fts_meta.db / Tantivy / 起動時 diff・Ctrl+F fast path の全経路で `normalize_path`
+fts_meta.db / Tantivy / 起動時 diff・Ctrl+F on-demand 判定の全経路で `normalize_path`
 (= lowercase + `/` 区切り + ZIP 内エントリは `<zippath>\u{1F}<entry>`、
 separator は `search_norm::ZIP_ENTRY_SEP` = U+001F Unit Separator) を通す。
 新しい lookup 経路を追加するときも同じ正規化を通すこと。
@@ -296,7 +296,17 @@ SMB / NAS では `ReadDirectoryChangesW` が発火しないケースがあるの
   規模で bigram 索引を肥大化させ、誤認識ノイズで偽ヒットが増える。opt-in で
   別 index (`pdf_fts_index/`) に分離する案は v1.x 以降に残す。
 
-### 4.8 タグ書き込みと即時反映 (INDEX_VERSION=5)
+### 4.8 動画対応のスコープ
+
+- 動画ファイル本体: ファイル名 + FFmpeg が読めるコンテナメタデータ (title /
+  artist / URL / description / comment / chapter title 等) を `video_meta_text` へ。
+- 動画タグ: 本体を直接書き換えず、`<video.ext>.xmp` サイドカーの `dc:subject`
+  を `tags` フィールドへ。Ctrl+F / Ctrl+G の「タグ」対象で画像タグと同じように
+  検索できる。
+- フレーム内容 / 音声文字起こし / チャプター以外の本文抽出は対象外。動画再生や
+  サムネイル抽出とは独立した低頻度のメタ読み取りだけを行う。
+
+### 4.9 タグ書き込みと即時反映 (INDEX_VERSION=5)
 
 [tag_write_worker.rs](../src/tag_write_worker.rs) は UI からの Toggle / Clear 要求を
 1 ファイルずつ serial に処理し、以下のフローで進める:
@@ -314,7 +324,7 @@ UI は commit 完了シグナルを受けたタイミングで toast を出す (
 toast を出すと直後の Ctrl+G に新タグが出ない race がある)。
 
 INDEX_VERSION=5 で原文が Tantivy 側に集約された影響で、`tag_write_worker` は
-他ソース原文 (name / exif / xmp_tweet / png_prompt / pdf_meta) を **保持したまま**
+他ソース原文 (name / exif / xmp_tweet / png_prompt / pdf_meta / video_meta) を **保持したまま**
 tags だけ差し替える必要がある。ここで stale snapshot を読むと ingest が直前に
 commit した最新原文を旧値で潰してしまうため、上記 #2 / #3 の race ガードが必須。
 
@@ -343,18 +353,17 @@ Tantivy は通さない。SQLite LIKE の方が対象件数 (フォルダ構造�
 ```
 UI (render_search_bar)
   → run_metadata_search(tokens, items, xmp_cache, fts_meta, target, mode, cancel)
-       1. 表示中 items から画像系の path を集め、normalize_path で正規化
-       2. fts_meta.db を IN 句で一括 SELECT (target で列を絞る)
-          → norms 文字列が取れた path は search_query::matches_with_mode で即判定
-       3. 取れなかった path (インデックス未完了 / auto_index_metadata=false) のみ
-          現行のオンデマンド検索 (PNG tEXt / EXIF / XMP を都度読む) に fallback
+       1. 表示中 items から検索対象 path (画像 / PDF / 動画) を集め、normalize_path で正規化
+       2. 画像 / 動画は target に応じて必要なメタだけを on-demand で読む
+          (PNG tEXt / EXIF / XMP / 動画コンテナメタ / dc:subject)
+       3. ZIP 内 PNG は ZIP を 1 回だけ開き、対象エントリをまとめて on-demand 判定
        4. 合格 path を HashSet<usize> に反映 (search_filter)
 ```
 
-**Tantivy を経由しない理由**: 対象が表示中の数十〜数千枚に限定されるので、
-bigram 候補絞り込みより fts_meta.db を直接引いた方が (a) 検索漏れゼロ
-(Tantivy bigram の post-filter タイミングで偽陽性が混じる余地がない)、
-(b) シンプル、(c) 速い (表示中 path 数 × 数 ms)。
+**Tantivy を経由しない理由**: 対象が表示中の数十〜数千件に限定されるので、
+bigram 候補絞り込みより on-demand で必要なソースだけを読む方が
+(a) 検索漏れゼロ、(b) Ctrl+F の「今見えている一覧」だけに閉じられる、(c) 実装が単純。
+重い読み取りは worker スレッド上で行い、UI スレッドでは実行しない。
 
 ### 5.3 Ctrl+G — グローバルメタ検索 (streaming)
 
@@ -366,7 +375,7 @@ UI (global_search_ui::render_global_search_bar)
   [worker] スレッド内ループ:
     0. クエリ検証 (最小長、NOT-only 禁止)
     1. 正トークンを bigram 分解し build_bigram_and_query で BooleanQuery を構築
-       - include: target フィールド (filename/exif/xmp_tweet/png_prompt/pdf_meta/tags)
+       - include: target フィールド (filename/exif/xmp_tweet/png_prompt/pdf_meta/video_meta/tags)
          ごとの OR を各トークンの子クエリにし、mode=AND なら top-level Must で、
          mode=OR なら Should 群を 1 Must にまとめる
        - favorite_id / kind は Must (exact term の OR)
