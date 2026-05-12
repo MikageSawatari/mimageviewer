@@ -847,13 +847,24 @@ pub(super) fn draw_overlay_frame_step_icon(
     let stroke = egui::Stroke::new(1.8, color);
     let c = rect.center();
     let sign = if direction < 0 { -1.0 } else { 1.0 };
-    let bar_x = c.x + sign * 7.0;
+    let bar_outer_x = c.x - sign * 7.0;
+    let bar_inner_x = c.x - sign * 3.0;
     painter.line_segment(
-        [egui::pos2(bar_x, c.y - 8.0), egui::pos2(bar_x, c.y + 8.0)],
+        [
+            egui::pos2(bar_outer_x, c.y - 8.0),
+            egui::pos2(bar_outer_x, c.y + 8.0),
+        ],
+        stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(bar_inner_x, c.y - 8.0),
+            egui::pos2(bar_inner_x, c.y + 8.0),
+        ],
         stroke,
     );
     let tip = egui::pos2(c.x + sign * 7.0, c.y);
-    let back_x = c.x - sign * 3.5;
+    let back_x = c.x;
     painter.add(egui::Shape::convex_polygon(
         vec![
             tip,
@@ -2646,21 +2657,61 @@ pub(super) fn draw_overlay_pause_icon(painter: &egui::Painter, c: egui::Pos2, r:
 }
 
 pub(super) fn draw_overlay_replay_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    use std::f32::consts::PI;
+
     let white = egui::Color32::WHITE;
-    let bar_w = (r * 0.22).max(2.0);
-    painter.rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(c.x - r * 0.80, c.y - r * 0.72),
-            egui::pos2(c.x - r * 0.80 + bar_w, c.y + r * 0.72),
-        ),
-        0.0,
-        white,
+    let stroke_w = (r * 0.18).max(1.8);
+    let stroke = egui::Stroke::new(stroke_w, white);
+    let radius = r * 0.78;
+
+    // Draw a counter-clockwise replay arc, leaving room for the arrow head near 12 o'clock.
+    let gap_half = 0.45;
+    let start_angle = -PI / 2.0 + gap_half;
+    let end_angle = start_angle - (2.0 * PI - 2.0 * gap_half);
+    let segments = 40;
+    let mut arc_points = Vec::with_capacity(segments + 1);
+    for i in 0..=segments {
+        let t = i as f32 / segments as f32;
+        let angle = start_angle + (end_angle - start_angle) * t;
+        arc_points.push(egui::pos2(
+            c.x + radius * angle.cos(),
+            c.y + radius * angle.sin(),
+        ));
+    }
+    painter.add(egui::Shape::line(arc_points, stroke));
+
+    let arrow_size = r * 0.32;
+    let end_pos = egui::pos2(
+        c.x + radius * end_angle.cos(),
+        c.y + radius * end_angle.sin(),
+    );
+    let tangent = end_angle - PI / 2.0;
+    let tip = egui::pos2(
+        end_pos.x + arrow_size * tangent.cos(),
+        end_pos.y + arrow_size * tangent.sin(),
+    );
+    let base_offset = arrow_size * 0.55;
+    let base_a = egui::pos2(
+        end_pos.x + base_offset * end_angle.cos(),
+        end_pos.y + base_offset * end_angle.sin(),
+    );
+    let base_b = egui::pos2(
+        end_pos.x - base_offset * end_angle.cos(),
+        end_pos.y - base_offset * end_angle.sin(),
     );
     painter.add(egui::Shape::convex_polygon(
+        vec![tip, base_a, base_b],
+        white,
+        egui::Stroke::NONE,
+    ));
+
+    let tri_x = r * 0.38;
+    let tri_y = r * 0.42;
+    painter.add(egui::Shape::convex_polygon(
         vec![
-            egui::pos2(c.x - r * 0.35, c.y),
-            egui::pos2(c.x + r * 0.55, c.y - r * 0.70),
-            egui::pos2(c.x + r * 0.55, c.y + r * 0.70),
+            egui::pos2(c.x + tri_x, c.y),
+            egui::pos2(c.x - tri_x * 0.65, c.y - tri_y),
+            egui::pos2(c.x - tri_x * 0.65, c.y + tri_y),
         ],
         white,
         egui::Stroke::NONE,

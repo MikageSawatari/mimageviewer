@@ -4085,6 +4085,7 @@ impl NativeEguiOverlay {
                         let btn_size = 28.0;
                         let gap = 8.0;
                         let center_y = hud_rect.center().y;
+                        let text_center_y = center_y + 4.0;
                         let mut x = hud_rect.min.x + side_pad;
 
                         let replay_rect = egui::Rect::from_min_size(
@@ -4310,7 +4311,7 @@ impl NativeEguiOverlay {
                             format_overlay_time(duration_secs)
                         );
                         painter.text(
-                            egui::pos2(time_x, center_y),
+                            egui::pos2(time_x, text_center_y),
                             egui::Align2::LEFT_CENTER,
                             label,
                             egui::FontId::proportional(14.0),
@@ -4604,7 +4605,7 @@ impl NativeEguiOverlay {
                         );
                         draw_overlay_button_bg(painter, speed_rect, speed_resp.hovered(), false);
                         painter.text(
-                            speed_rect.center(),
+                            egui::pos2(speed_rect.center().x, text_center_y),
                             egui::Align2::CENTER_CENTER,
                             crate::video::clock::format_playback_speed(playback_speed),
                             egui::FontId::proportional(12.0),
@@ -4626,7 +4627,9 @@ impl NativeEguiOverlay {
                             };
 
                             let popup_w = 356.0_f32.min((overlay_width_points - 16.0).max(180.0));
-                            let popup_h = 74.0;
+                            let speed_choice_size = egui::vec2(46.0, 24.0);
+                            let speed_choice_text_y = 4.0;
+                            let popup_h = speed_choice_size.y + 12.0;
                             let popup_x = (speed_rect.center().x - popup_w * 0.5)
                                 .clamp(8.0, overlay_width_points - popup_w - 8.0);
                             let popup_y = (hud_rect.min.y - popup_h - 6.0).max(8.0);
@@ -4653,10 +4656,46 @@ impl NativeEguiOverlay {
                                                         let selected =
                                                             (playback_speed - speed).abs() < 1.0e-6;
                                                         let label = format_playback_speed(speed);
-                                                        let button = egui::Button::new(label)
-                                                            .selected(selected)
-                                                            .min_size(egui::vec2(46.0, 24.0));
-                                                        if ui.add(button).clicked() {
+                                                        let (button_rect, button_resp) = ui
+                                                            .allocate_exact_size(
+                                                                speed_choice_size,
+                                                                egui::Sense::click(),
+                                                            );
+                                                        if button_resp.hovered() {
+                                                            ui.ctx().set_cursor_icon(
+                                                                egui::CursorIcon::PointingHand,
+                                                            );
+                                                        }
+                                                        let visuals =
+                                                            ui.style().interact_selectable(
+                                                                &button_resp,
+                                                                selected,
+                                                            );
+                                                        let painter = ui.painter();
+                                                        painter.rect_filled(
+                                                            button_rect,
+                                                            3.0,
+                                                            visuals.weak_bg_fill,
+                                                        );
+                                                        painter.rect_stroke(
+                                                            button_rect,
+                                                            3.0,
+                                                            visuals.bg_stroke,
+                                                            egui::StrokeKind::Inside,
+                                                        );
+                                                        painter.text(
+                                                            button_rect.center()
+                                                                + egui::vec2(
+                                                                    0.0,
+                                                                    speed_choice_text_y,
+                                                                ),
+                                                            egui::Align2::CENTER_CENTER,
+                                                            label,
+                                                            egui::TextStyle::Button
+                                                                .resolve(ui.style()),
+                                                            visuals.fg_stroke.color,
+                                                        );
+                                                        if button_resp.clicked() {
                                                             selected_speed = Some(speed);
                                                         }
                                                     }
@@ -4749,7 +4788,7 @@ impl NativeEguiOverlay {
                         };
                         // "Norm" ラベル
                         painter.text(
-                            norm_rect.center(),
+                            egui::pos2(norm_rect.center().x, text_center_y),
                             egui::Align2::CENTER_CENTER,
                             "Norm",
                             egui::FontId::proportional(11.0),
@@ -4846,7 +4885,7 @@ impl NativeEguiOverlay {
                             });
                         }
                         painter.text(
-                            egui::pos2(vol_rect.max.x + gap, center_y),
+                            egui::pos2(vol_rect.max.x + gap, text_center_y),
                             egui::Align2::LEFT_CENTER,
                             format!("{:>3}%", (volume * 100.0).round() as i32),
                             egui::FontId::proportional(13.0),
