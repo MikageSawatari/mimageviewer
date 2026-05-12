@@ -5628,24 +5628,22 @@ impl App {
         }
     }
 
-    /// 動画再生のエラー / 準備中インジケータを描画する。
-    /// playback controls (HUD, seek bar, volume, etc.) は native presenter の
-    /// egui overlay (`src/video/native_presenter/overlay_draw.rs`) が独自に
-    /// 描画するため、ここでは `player.error()` と「動画を準備中...」スピナー
-    /// だけを担当する。
+    /// 動画再生のエラー インジケータを描画する。
+    /// playback controls (HUD, seek bar, volume, etc.) と「動画を準備中…」スピナーは
+    /// **native presenter overlay** (`src/video/native_presenter/overlay_draw.rs` の
+    /// `draw_native_center_status`) が描画する (= native window が egui main の上に
+    /// 乗るので、ここで描画しても見えない)。本関数では egui main window 側に
+    /// 直接出すべきエラー文言だけを担当する。
+    ///
+    /// (旧挙動として `!has_texture` で「動画を準備中...」を egui に描いていたが、
+    /// native presenter が上に乗ると見えなかったので削除。進捗 HUD の本物は
+    /// native presenter 側で `build_preparing_message` を使って描く。)
     pub(crate) fn draw_video_hud(&self, ui: &mut egui::Ui, full_rect: egui::Rect, fs_idx: usize) {
-        let (has_texture, has_error) = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Video { player, .. }) => (
-                // 1 枚以上のフレームが decoder から供給され UI tick が認識した時点で
-                // 「描画コンテンツが揃った」とみなす (= "動画を準備中..." を抜けて
-                // 通常表示に切り替える)。
-                player.displayed_frame_seq() > 0,
-                player.error().map(|s| s.to_string()),
-            ),
+        let has_error = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.error().map(|s| s.to_string()),
             _ => return,
         };
 
-        // ── エラー表示 ──
         if let Some(err) = has_error {
             let painter = ui.painter();
             let galley = painter.layout_no_wrap(
@@ -5661,20 +5659,6 @@ impl App {
                 egui::Color32::from_rgba_unmultiplied(0, 0, 0, 200),
             );
             painter.galley(pos, galley, egui::Color32::from_rgb(255, 120, 120));
-            return;
-        }
-
-        // ── まだ最初のフレームが届いていない: 中央にスピナー ──
-        if !has_texture {
-            let painter = ui.painter();
-            let galley = painter.layout_no_wrap(
-                "動画を準備中...".to_string(),
-                egui::FontId::proportional(18.0),
-                egui::Color32::WHITE,
-            );
-            let pos = full_rect.center() - galley.size() / 2.0;
-            painter.galley(pos, galley, egui::Color32::WHITE);
-            return;
         }
     }
 }

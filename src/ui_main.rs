@@ -444,11 +444,13 @@ impl App {
                         // cache_stats は数千フォルダで秒級になるのでワーカーに回す。
                         // ダイアログは「取得中...」表示で開き、poll 完了時に stats が埋まる。
                         self.cache_manager_stats = None;
+                        self.cache_manager_tile_bytes = None;
                         self.cache_manager_result = None;
                         if self.cache_maint_pending.is_none() {
                             self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
                                 crate::cache_maintenance::CacheMaintTask::Stats,
                                 cache_dir,
+                                self.video_tile_cache.clone(),
                             ));
                         }
                         self.show_cache_manager = true;
@@ -1132,7 +1134,7 @@ impl App {
                 let response = ui.add_sized(
                     [320.0, 20.0],
                     egui::TextEdit::singleline(&mut self.favsearch.query)
-                        .hint_text(r#"お気に入り配下の名前 (AND / -除外 / "…")"#),
+                        .hint_text(r#"お気に入り配下のフォルダ/ZIP/PDF 名 (AND / -除外 / "…")"#),
                 );
 
                 if self.favsearch.focus_request {

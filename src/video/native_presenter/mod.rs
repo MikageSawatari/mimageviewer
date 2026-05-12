@@ -212,6 +212,9 @@ struct NativeEguiOverlay {
     vst3_panel: Option<NativeOverlayVst3Panel>,
     first_frame_presented: bool,
     video_error: Option<String>,
+    /// 動画オープン中の進捗 (phase / bytes_read / file_size)。
+    /// `first_frame_presented = false` の間だけ center status HUD に出る。
+    preparing_status: crate::video::avio_progress::PreparingStatus,
     toast: Option<NativeOverlayToast>,
     perf_visible: bool,
     perf_history: VecDeque<NativeOverlayPerfSample>,
@@ -1855,9 +1858,10 @@ impl NativeVideoPresenter {
         &mut self,
         first_frame_presented: bool,
         error: Option<String>,
+        prep_status: crate::video::avio_progress::PreparingStatus,
     ) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.set_playback_status(first_frame_presented, error);
+            overlay.set_playback_status(first_frame_presented, error, prep_status);
         }
     }
 
@@ -2521,6 +2525,11 @@ impl NativeEguiOverlay {
             vst3_panel: None,
             first_frame_presented: false,
             video_error: None,
+            preparing_status: crate::video::avio_progress::PreparingStatus {
+                phase: crate::video::avio_progress::prep_phase::OPENING,
+                bytes_read: 0,
+                file_size: 0,
+            },
             toast: None,
             perf_visible: false,
             perf_history: VecDeque::with_capacity(256),
@@ -2938,12 +2947,27 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
-    fn set_playback_status(&mut self, first_frame_presented: bool, error: Option<String>) {
-        if self.first_frame_presented == first_frame_presented && self.video_error == error {
+    fn set_playback_status(
+        &mut self,
+        first_frame_presented: bool,
+        error: Option<String>,
+        prep_status: crate::video::avio_progress::PreparingStatus,
+    ) {
+        // first_frame_presented / error が変わらなくても、準備中フェーズの数値
+        // (bytes_read など) は毎 tick 増えるので、`first_frame_presented = false`
+        // の間は常に dirty を立てて再描画する。
+        let prep_changed = !first_frame_presented
+            && (self.preparing_status.phase != prep_status.phase
+                || self.preparing_status.bytes_read != prep_status.bytes_read
+                || self.preparing_status.file_size != prep_status.file_size);
+        let other_changed =
+            self.first_frame_presented != first_frame_presented || self.video_error != error;
+        if !other_changed && !prep_changed {
             return;
         }
         self.first_frame_presented = first_frame_presented;
         self.video_error = error;
+        self.preparing_status = prep_status;
         self.dirty = true;
     }
 
@@ -3610,6 +3634,7 @@ impl NativeEguiOverlay {
         let loop_mode = self.video_loop_mode;
         let first_frame_presented = self.first_frame_presented;
         let video_error = self.video_error.clone();
+        let preparing_status = self.preparing_status;
         let toast = self.toast.clone();
         let hover_thumbnail = self.hover_thumbnail.clone();
         let hover_texture_id = self.hover_texture.as_ref().map(|texture| texture.id());
@@ -3785,11 +3810,15 @@ impl NativeEguiOverlay {
                     true,
                 );
             } else if !first_frame_presented {
+                // フェーズ + 累積バイト数で文言を切り替え (Codex P2 への補足対応):
+                // 「メタデータ読込中... NN MB / YY MB」「ストリーム解析中...」など。
+                // moov atom 末尾配置の遅い動画でフリーズと誤認されないようにする。
+                let title = crate::video::avio_progress::build_preparing_message(preparing_status);
                 draw_native_center_status(
                     ctx,
                     overlay_width_points,
                     overlay_height_points,
-                    "動画を準備中...",
+                    &title,
                     None,
                     false,
                 );

@@ -1635,6 +1635,9 @@ pub struct App {
     pub(crate) cache_manager_days: u32,
     /// 開いたときに取得するキャッシュ統計: (フォルダ数, 合計バイト)
     pub(crate) cache_manager_stats: Option<(usize, u64)>,
+    /// 動画タイル モード サムネ DB のサイズ (バイト、WAL/SHM 込み)。
+    /// `None` の間は「取得中...」、`Some(0)` でファイル無しを表す。
+    pub(crate) cache_manager_tile_bytes: Option<u64>,
     /// 削除後の結果メッセージ
     pub(crate) cache_manager_result: Option<String>,
     /// 「すべてのキャッシュを削除」の確認ステップ
@@ -1842,7 +1845,10 @@ pub struct App {
     /// タイルモードのサムネ WebP 永続キャッシュ (Phase 6.D-2、Phase 8.C で絶対 PTS 化)。
     /// 同 (動画 path, tile_w, timestamp_ms) のキーで再オープン時に即座に表示できる。
     /// 列数が同じなら抽出間隔を変えても共通 PTS のサムネは再利用される。
-    #[cfg(windows)]
+    ///
+    /// 描画経路 (tile worker / native overlay) は Windows のみだが、DB 本体は
+    /// クロスプラットフォームで開けるためフィールドのゲートは外している。
+    /// 「サムネイルキャッシュ管理」ダイアログから削除する経路でも参照される。
     pub(crate) video_tile_cache:
         Option<std::sync::Arc<crate::video::tile_thumb_cache::TileThumbCache>>,
     /// 次の `open_fullscreen` を「グリッド (サムネ一覧) から明示的に開いた」
@@ -2750,6 +2756,7 @@ impl Default for App {
             show_cache_manager: false,
             cache_manager_days: 90,
             cache_manager_stats: None,
+            cache_manager_tile_bytes: None,
             cache_manager_result: None,
             cache_manager_confirm_delete_all: false,
             cache_maint_pending: None,
@@ -2830,8 +2837,6 @@ impl Default for App {
             video_tile_swap_pending: None,
             #[cfg(windows)]
             native_video_source_epoch_next: 1,
-            #[cfg(windows)]
-            #[cfg(windows)]
             video_tile_cache,
             fs_open_intent_from_grid: false,
             video_thumb_overrides_dirty: false,
@@ -6292,28 +6297,63 @@ impl App {
             }
         };
         match msg {
-            crate::cache_maintenance::CacheMaintResult::Stats { folders, bytes } => {
+            crate::cache_maintenance::CacheMaintResult::Stats {
+                folders,
+                bytes,
+                tile_thumb_bytes,
+            } => {
                 self.cache_manager_stats = Some((folders, bytes));
+                self.cache_manager_tile_bytes = Some(tile_thumb_bytes);
             }
             crate::cache_maintenance::CacheMaintResult::DeleteOldDone { deleted, new_stats } => {
                 self.cache_manager_stats = Some(new_stats);
+                // tile cache は対象外なのでサイズを再取得 (= 削除しても変化なしのはず
+                // だが、別経路で書き込みが入っている可能性に備えて refresh)。
+                self.cache_manager_tile_bytes =
+                    Some(crate::video::tile_thumb_cache::TileThumbCache::db_size_bytes());
                 self.cache_manager_result =
                     Some(format!("{} 件のキャッシュを削除しました。", deleted));
             }
-            crate::cache_maintenance::CacheMaintResult::DeleteAllDone => {
+            crate::cache_maintenance::CacheMaintResult::DeleteAllDone { tile_thumb } => {
                 self.cache_manager_stats = Some((0, 0));
-                self.cache_manager_result = Some("すべてのキャッシュを削除しました。".to_string());
+                self.cache_manager_tile_bytes =
+                    Some(crate::video::tile_thumb_cache::TileThumbCache::db_size_bytes());
+                let mut msg = String::from("すべてのキャッシュを削除しました。");
+                match tile_thumb {
+                    crate::cache_maintenance::TileThumbOutcome::Cleared { rows } if rows > 0 => {
+                        msg.push_str(&format!(" (動画タイル サムネも {rows} 件削除)"));
+                    }
+                    crate::cache_maintenance::TileThumbOutcome::FilesErased { files_removed }
+                        if files_removed > 0 =>
+                    {
+                        msg.push_str(" (動画タイル DB を初期化)");
+                    }
+                    _ => {}
+                }
+                self.cache_manager_result = Some(msg);
             }
             crate::cache_maintenance::CacheMaintResult::DeleteFolderDone {
                 existed,
                 folder_name,
                 new_stats,
+                tile_thumb,
             } => {
                 self.cache_manager_stats = Some(new_stats);
-                self.cache_manager_result = Some(if existed {
-                    format!("「{folder_name}」のキャッシュを削除しました。")
-                } else {
-                    "現在のフォルダにはキャッシュがありません。".to_string()
+                self.cache_manager_tile_bytes =
+                    Some(crate::video::tile_thumb_cache::TileThumbCache::db_size_bytes());
+                let tile_rows = match tile_thumb {
+                    crate::cache_maintenance::TileThumbOutcome::Cleared { rows } => rows,
+                    _ => 0,
+                };
+                self.cache_manager_result = Some(match (existed, tile_rows) {
+                    (true, 0) => format!("「{folder_name}」のキャッシュを削除しました。"),
+                    (true, n) => format!(
+                        "「{folder_name}」のキャッシュを削除しました。(動画タイル サムネも {n} 件削除)"
+                    ),
+                    (false, 0) => "現在のフォルダにはキャッシュがありません。".to_string(),
+                    (false, n) => format!(
+                        "現在のフォルダの静止画キャッシュはありませんでした。(動画タイル サムネを {n} 件削除)"
+                    ),
                 });
             }
         }

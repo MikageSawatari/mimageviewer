@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 
+use crate::video::tile_thumb_cache::TileThumbCache;
+
 /// 管理ダイアログで走らせる操作種別。
 #[derive(Debug, Clone)]
 pub enum CacheMaintTask {
@@ -26,21 +28,48 @@ pub enum CacheMaintTask {
     DeleteFolder { folder: PathBuf },
 }
 
+/// 動画タイル サムネ DB の削除アウトカム。
+///
+/// 通常経路では `clear_all` / `clear_for_folder` が削除行数を返すが、open に失敗して
+/// `TileThumbCache` インスタンスが None だったとき / `clear_all` 自体が失敗したとき
+/// (= DB 壊れ / ロック / I/O エラー) の fallback として、DB ファイルを物理削除する
+/// 経路を区別する (Codex P2)。
+#[derive(Debug, Clone)]
+pub enum TileThumbOutcome {
+    /// 通常経路: SQL の DELETE + VACUUM で `rows` 行を消した。
+    Cleared { rows: usize },
+    /// fallback: `video_tile_thumbs.db` / `-wal` / `-shm` を `remove_file` で消した。
+    /// `files_removed` は実際に消えたファイル数 (0〜3、存在しなかったものは含まれない)。
+    FilesErased { files_removed: usize },
+    /// tile cache 経路が今回の処理対象ではない (例: `DeleteOld` や `DeleteFolder` で
+    /// open 失敗時など、何もしないケース)。
+    Untouched,
+}
+
 /// ワーカーから UI に返す結果。
+///
+/// `tile_thumb_*` フィールドは動画タイル モード キャッシュ
+/// (`video_tile_thumbs.db`) の削除/サイズ情報。`DeleteAll` / `DeleteFolder` 経路
+/// では catalog (静止画 + 動画グリッド) と一緒に削除する。
 pub enum CacheMaintResult {
     Stats {
         folders: usize,
         bytes: u64,
+        /// 動画タイル サムネ DB のサイズ (WAL/SHM 込み)。tile cache が無効なら 0。
+        tile_thumb_bytes: u64,
     },
     DeleteOldDone {
         deleted: usize,
         new_stats: (usize, u64),
     },
-    DeleteAllDone,
+    /// すべて削除完了。`tile_thumb` は動画タイル DB に対する処理結果。
+    DeleteAllDone { tile_thumb: TileThumbOutcome },
     DeleteFolderDone {
         existed: bool,
         folder_name: String,
         new_stats: (usize, u64),
+        /// 当該フォルダ配下の動画タイル サムネに対する処理結果。
+        tile_thumb: TileThumbOutcome,
     },
 }
 
@@ -135,7 +164,16 @@ pub fn spawn_archive(
 }
 
 /// 指定タスクを別スレッドで実行し、ハンドルを返す。
-pub fn spawn(task: CacheMaintTask, cache_dir: PathBuf) -> CacheMaintPending {
+///
+/// `video_tile_cache` を渡すと、`DeleteAll` / `DeleteFolder` の際に動画タイル サムネ
+/// キャッシュ DB (`video_tile_thumbs.db`) も同時に削除する (= ユーザー UX で
+/// 「サムネ削除」と一括で動かす)。`DeleteOld` は tile cache に「最終アクセス時刻」が
+/// 無いため対象外。`Stats` 時は tile DB ファイル サイズも添えて返す。
+pub fn spawn(
+    task: CacheMaintTask,
+    cache_dir: PathBuf,
+    video_tile_cache: Option<Arc<TileThumbCache>>,
+) -> CacheMaintPending {
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
     let task_clone = task.clone();
@@ -145,7 +183,12 @@ pub fn spawn(task: CacheMaintTask, cache_dir: PathBuf) -> CacheMaintPending {
             let result = match task_clone {
                 CacheMaintTask::Stats => {
                     let (folders, bytes) = crate::catalog::cache_stats(&cache_dir);
-                    CacheMaintResult::Stats { folders, bytes }
+                    let tile_thumb_bytes = TileThumbCache::db_size_bytes();
+                    CacheMaintResult::Stats {
+                        folders,
+                        bytes,
+                        tile_thumb_bytes,
+                    }
                 }
                 CacheMaintTask::DeleteOld { days } => {
                     let deleted = crate::catalog::delete_old_cache(&cache_dir, days);
@@ -154,7 +197,26 @@ pub fn spawn(task: CacheMaintTask, cache_dir: PathBuf) -> CacheMaintPending {
                 }
                 CacheMaintTask::DeleteAll => {
                     crate::catalog::delete_all_cache(&cache_dir);
-                    CacheMaintResult::DeleteAllDone
+                    // 通常経路: open 済みインスタンスがあれば clear_all (DELETE + VACUUM)。
+                    // 失敗 / インスタンス None なら fallback で DB ファイルを物理削除する
+                    // (Codex P2: DB 壊れ / ロックで「全削除」しても残らないように)。
+                    let tile_thumb = match video_tile_cache.as_ref() {
+                        Some(c) => match c.clear_all() {
+                            Ok(rows) => TileThumbOutcome::Cleared { rows },
+                            Err(e) => {
+                                crate::logger::log(format!(
+                                    "video_tile_cache.clear_all failed: {e} — falling back to file erase"
+                                ));
+                                let files_removed = TileThumbCache::erase_db_files();
+                                TileThumbOutcome::FilesErased { files_removed }
+                            }
+                        },
+                        None => {
+                            let files_removed = TileThumbCache::erase_db_files();
+                            TileThumbOutcome::FilesErased { files_removed }
+                        }
+                    };
+                    CacheMaintResult::DeleteAllDone { tile_thumb }
                 }
                 CacheMaintTask::DeleteFolder { folder } => {
                     let db_path = crate::catalog::db_path_for(&cache_dir, &folder);
@@ -167,11 +229,28 @@ pub fn spawn(task: CacheMaintTask, cache_dir: PathBuf) -> CacheMaintPending {
                     if existed {
                         let _ = std::fs::remove_file(&db_path);
                     }
+                    // フォルダ単位削除は prefix DELETE が必要なので、open 失敗時の
+                    // fallback は無い (= DB 全消しで対応すべきケースではない)。Untouched
+                    // を返して UI 側でメッセージを区別する。
+                    let tile_thumb = match video_tile_cache
+                        .as_ref()
+                        .map(|c| c.clear_for_folder(&folder))
+                    {
+                        Some(Ok(rows)) => TileThumbOutcome::Cleared { rows },
+                        Some(Err(e)) => {
+                            crate::logger::log(format!(
+                                "video_tile_cache.clear_for_folder failed: {e}"
+                            ));
+                            TileThumbOutcome::Untouched
+                        }
+                        None => TileThumbOutcome::Untouched,
+                    };
                     let new_stats = crate::catalog::cache_stats(&cache_dir);
                     CacheMaintResult::DeleteFolderDone {
                         existed,
                         folder_name,
                         new_stats,
+                        tile_thumb,
                     }
                 }
             };

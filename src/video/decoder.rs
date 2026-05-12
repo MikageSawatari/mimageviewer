@@ -1181,6 +1181,10 @@ pub struct DecodeHandles {
     pub audio_rx: crossbeam_channel::Receiver<AudioFrame>,
     /// 動画情報の単発通知 (open 完了時)。
     pub info_rx: crossbeam_channel::Receiver<Result<VideoInfo, String>>,
+    /// 動画オープン (avformat_open_input + find_stream_info) の進捗。UI スレッドが
+    /// `tick` で読んで HUD に「メタデータ読込中... N MB / Y MB」を表示する。
+    /// 共有 Arc なので VideoPlayer が clone を保持して使う。
+    pub prep_progress: Arc<crate::video::avio_progress::PreparingProgress>,
 }
 
 /// デコーダワーカーを起動する。ファイルオープン (`avformat_open_input`) も worker
@@ -1226,6 +1230,13 @@ pub fn spawn(
     let (audio_tx, audio_rx) = bounded::<AudioFrame>(32);
     let (info_tx, info_rx) = bounded::<Result<VideoInfo, String>>(1);
 
+    // 動画 open 進捗 atomic 群。worker spawn 前に Arc を作っておき、worker thread に
+    // clone を渡しつつ DecodeHandles 経由で UI にも一本同じ Arc を返す (Codex の指摘
+    // するとおり drop シーケンス順は問題にならない: UI が clone を保持していれば
+    // worker が終わっても Arc は生きる)。
+    let prep_progress = crate::video::avio_progress::PreparingProgress::new();
+    let prep_progress_for_worker = Arc::clone(&prep_progress);
+
     std::thread::Builder::new()
         .name("video-demux".into())
         .spawn(move || {
@@ -1245,6 +1256,7 @@ pub fn spawn(
                 info_tx,
                 skipped_frame_count,
                 dynamic,
+                prep_progress_for_worker,
             );
         })
         .expect("spawn video-decode thread");
@@ -1253,6 +1265,7 @@ pub fn spawn(
         video_rx,
         audio_rx,
         info_rx,
+        prep_progress,
     }
 }
 
@@ -1273,6 +1286,7 @@ fn run_decoder(
     info_tx: Sender<Result<VideoInfo, String>>,
     skipped_frame_count: Arc<std::sync::atomic::AtomicU64>,
     dynamic: Arc<VideoDynamicState>,
+    prep_progress: Arc<crate::video::avio_progress::PreparingProgress>,
 ) {
     use ffmpeg_the_third as ffmpeg;
     // Phase B: Pixel / ScaleContext / ScaleFlags / Video は run_video_decode に移管。
@@ -1282,19 +1296,60 @@ fn run_decoder(
     use ffmpeg::software::resampling::Context as ResampleContext;
 
     // ── FFmpeg ライブラリ初期化 ──
+    // 2026-05-12「動画を準備中…」遅延解析: `VideoPlayer::open done` (main thread の
+    // 同期 setup 完了) から `[video-decode] first packet for serial=0` までの遅延が
+    // p90=459ms / p99=3s / max=8.3s と bimodal。瞬時に動く動画と数秒待つ動画が
+    // 混在する。原因は本 thread (= run_decoder = demux thread) の入口処理:
+    // (a) `format::input` の container parse (moov atom 末尾だと全データ scan)
+    // (b) `open_video_decoder_with_candidates` の HW (D3D11VA) attach
+    // のどちらか。各ステップの elapsed を log すれば次回再現でピンポイントに犯人特定可能。
+    let open_phase_t0 = std::time::Instant::now();
+    let path_label = path.display().to_string();
+    crate::logger::log(format!("[demux] run_decoder start: path={path_label}"));
     if let Err(e) = ffmpeg::init() {
         let _ = info_tx.send(Err(format!("ffmpeg::init failed: {e}")));
         return;
     }
+    crate::logger::log(format!(
+        "[demux] ffmpeg::init done in {:.1}ms",
+        open_phase_t0.elapsed().as_secs_f64() * 1000.0
+    ));
 
-    // ── ファイルを開く ──
-    let mut input = match ffmpeg::format::input(&path) {
-        Ok(i) => i,
-        Err(e) => {
-            let _ = info_tx.send(Err(format!("open input: {e}")));
-            return;
-        }
-    };
+    // ── ファイルを開く (custom AVIO 経由で進捗 atomic を更新) ──
+    //
+    // 2026-05-12 リファクタ: 旧 `ffmpeg::format::input` は avformat_open_input +
+    // avformat_find_stream_info を一括で呼んでしまい、UI から進捗が見えなかった。
+    // `input_with_progress` は同じ 2 段を内部で分けて呼び、callback 内で
+    // `prep_progress.add_bytes(n)` / `set_phase(...)` を更新する。UI の draw_video_hud は
+    // `phase` と `bytes_read` を見て「メタデータ読込中... NN MB」「ストリーム解析中...」
+    // を切り替え表示する。
+    prep_progress.set_phase(crate::video::avio_progress::prep_phase::OPENING);
+    let format_input_t0 = std::time::Instant::now();
+    let (mut input, timings) =
+        match crate::video::avio_progress::input_with_progress(&path, Arc::clone(&prep_progress)) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = info_tx.send(Err(format!("open input: {e}")));
+                return;
+            }
+        };
+    crate::logger::log(format!(
+        "[demux] avformat_open_input done in {:.1}ms (cumulative {:.1}ms)",
+        timings.open_input_ms,
+        open_phase_t0.elapsed().as_secs_f64() * 1000.0
+    ));
+    crate::logger::log(format!(
+        "[demux] avformat_find_stream_info done in {:.1}ms (cumulative {:.1}ms, bytes_read={})",
+        timings.find_stream_info_ms,
+        open_phase_t0.elapsed().as_secs_f64() * 1000.0,
+        prep_progress.bytes_read()
+    ));
+    // total を残しておく (旧フォーマットとの互換のため。後で grep / analyze script で活用可能)
+    crate::logger::log(format!(
+        "[demux] format::input done in {:.1}ms (cumulative {:.1}ms)",
+        format_input_t0.elapsed().as_secs_f64() * 1000.0,
+        open_phase_t0.elapsed().as_secs_f64() * 1000.0
+    ));
 
     // ── 動画ストリーム選択 ──
     let video_stream = match input.streams().best(MediaType::Video) {
@@ -1347,6 +1402,9 @@ fn run_decoder(
     let codec_id = video_params_owned.id();
     let stream_codec_name = codec_id.name().to_string();
     let effective_hw_decode_requested = hw_decode_requested;
+    // open_video_decoder_with_candidates の elapsed を log (2026-05-12「動画を準備中…」
+    // 遅延解析: format::input と HW attach のどちらが遅いかを切り分けるため)。
+    let decoder_open_t0 = std::time::Instant::now();
     let opened_video_result = if effective_hw_decode_requested {
         #[cfg(windows)]
         {
@@ -1383,6 +1441,11 @@ fn run_decoder(
             return;
         }
     };
+    crate::logger::log(format!(
+        "[demux] open_video_decoder done in {:.1}ms hw_requested={effective_hw_decode_requested} codec={stream_codec_name} (cumulative {:.1}ms)",
+        decoder_open_t0.elapsed().as_secs_f64() * 1000.0,
+        open_phase_t0.elapsed().as_secs_f64() * 1000.0
+    ));
     let video_decoder = opened_video.decoder;
     let video_decoder_name = opened_video.decoder_name;
     let hw_probe = opened_video.hw_probe;
@@ -1412,6 +1475,12 @@ fn run_decoder(
             let idx = audio_stream.index();
             let tb = audio_stream.time_base();
             let params = audio_stream.parameters();
+            // 2026-05-12 crash 解析: audio decoder open 前後のネイティブ FFmpeg 呼出 (codec
+            // ctx alloc / avcodec_open2) で 0xc0000409 が出る可能性もあるので、各ステップを
+            // log で挟む。次回 crash 時の末尾切れ位置で犯人を絞り込む。
+            crate::logger::log(format!(
+                "audio setup: -> Context::from_parameters (stream_idx={idx})"
+            ));
             match ffmpeg::codec::context::Context::from_parameters(params) {
                 Ok(mut ctx) => {
                     let audio_codec_id = ctx.id();
@@ -1424,6 +1493,9 @@ fn run_decoder(
                         container_channels,
                         &container_layout_desc,
                     );
+                    crate::logger::log(format!(
+                        "audio setup: -> ctx.decoder().audio() (codec={audio_codec_name})"
+                    ));
                     match ctx.decoder().audio() {
                         Ok(mut dec) => {
                             let in_fmt = dec.format();
@@ -1454,9 +1526,21 @@ fn run_decoder(
                             crate::logger::log(format!(
                                 "audio setup: codec={audio_codec_name} container_layout=\"{container_layout_desc}\" container_channels={container_channels} decoder_layout=\"{input_layout_desc}\" decoder_channels={input_channels} in_fmt={input_format} in_rate={in_rate} out_layout=stereo out_rate={out_rate} request_stereo={stereo_request_sent} request_effective={decoder_stereo_effective} fast_downmix={fast_downmix_enabled}"
                             ));
-                            match ResampleContext::get2(
+                            // 2026-05-12 crash 解析: `ucrtbase.dll` で 0xc0000409 (heap
+                            // corruption / fast fail) が出ているので、swresample のネイティブ
+                            // 呼出を 1 ステップずつ log で挟む。次回 crash で末尾切れが
+                            // どこまで進むかで「get2 直前 / get2 内部 / get2 直後」を切り分ける。
+                            crate::logger::log(format!(
+                                "audio setup: -> ResampleContext::get2 (in_fmt={input_format} in_rate={in_rate} out_rate={out_rate})"
+                            ));
+                            let rs_result = ResampleContext::get2(
                                 in_fmt, in_layout, in_rate, out_fmt, out_layout, out_rate,
-                            ) {
+                            );
+                            crate::logger::log(format!(
+                                "audio setup: <- ResampleContext::get2 ok={}",
+                                rs_result.is_ok()
+                            ));
+                            match rs_result {
                                 Ok(rs) => Some(AudioSetup {
                                     stream_idx: idx,
                                     out_rate,
@@ -3296,6 +3380,23 @@ fn run_video_decode(
                 first_frame_logged = true;
             }
             if scaler.is_none() || scaler_key != Some(cur_key) {
+                // 2026-05-12 crash 解析: swscale_8.dll の sws_init_context (= 本呼出の内部)
+                // で av_assert0 → abort() (`0xc0000409`, FAST_FAIL_FATAL_APP_EXIT) が出た。
+                // 入力 pix_fmt が不正な値 (= D3D11 のまま etc.) だった場合に発生する。
+                // ScaleContext::get 呼出前に入力を log + 不正 fmt なら **abort せず skip** に。
+                crate::logger::log(format!(
+                    "sws_scale init: -> ScaleContext::get cur_fmt={cur_fmt:?} cur_size={cur_w}x{cur_h} dst_size={dst_w}x{dst_h}"
+                ));
+                if matches!(cur_fmt, Pixel::D3D11 | Pixel::None) {
+                    // HW download が完了していない or format 取得失敗。swscale に渡すと
+                    // ネイティブ av_assert0 が abort() を呼んで FAST_FAIL する。
+                    // フレーム自体をスキップして次フレームで再試行する (= 表示は 1 枚抜けるが
+                    // プロセス死亡よりはるかにマシ)。
+                    crate::logger::log(format!(
+                        "sws_scale init: SKIP — unsupported input pix_fmt {cur_fmt:?} (would crash swscale av_assert0)"
+                    ));
+                    continue;
+                }
                 match ScaleContext::get(
                     cur_fmt,
                     cur_w,
@@ -3308,6 +3409,7 @@ fn run_video_decode(
                     Ok(s) => {
                         scaler = Some(s);
                         scaler_key = Some(cur_key);
+                        crate::logger::log("sws_scale init: <- ScaleContext::get ok");
                     }
                     Err(e) => {
                         crate::logger::log(format!("sws_scale init: {e}"));

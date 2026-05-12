@@ -132,10 +132,16 @@
     <h3>キャッシュの管理</h3>
     <p>設定 → サムネイルキャッシュ管理 から以下の操作ができます：</p>
     <ul>
-      <li>キャッシュの合計フォルダ数・容量の確認</li>
+      <li>キャッシュの合計フォルダ数・容量の確認（うち動画タイル サムネ分も表示）</li>
       <li>指定日数以上更新されていないキャッシュの削除</li>
+      <li>現在のフォルダのキャッシュを削除</li>
       <li>すべてのキャッシュを削除</li>
     </ul>
+    <p>フルスクリーン中に <kbd>S</kbd> キーで開ける<strong>動画のタイム ライン サムネ
+    （動画タイル モード）</strong>のキャッシュは別ファイルで管理されますが、上の
+    「現在のフォルダのキャッシュを削除」「すべてのキャッシュを削除」では同時に
+    削除されます。「現在のフォルダ」削除はサブフォルダ配下の動画タイル サムネも
+    再帰的に対象になります。</p>
 
     <p>お気に入りメニューの「キャッシュ作成」から、お気に入りフォルダのキャッシュを一括生成することもできます。</p>
     <p>一括キャッシュ作成ダイアログでは、以下のオプションを選択できます：</p>
@@ -522,6 +528,7 @@
           <tr><td>PDF パスワード DB</td><td><code>%APPDATA%\mimageviewer\pdf_passwords.json</code></td><td>ファイル単位（A）</td></tr>
           <tr><td>お気に入り検索インデックス</td><td><code>%APPDATA%\mimageviewer\search_index.db</code></td><td>フォルダ単位（B）</td></tr>
           <tr><td>サムネイルキャッシュ</td><td><code>%APPDATA%\mimageviewer\cache\</code>（WebP 形式）</td><td>フォルダ単位（A）</td></tr>
+          <tr><td>動画タイル サムネ キャッシュ</td><td><code>%APPDATA%\mimageviewer\video_tile_thumbs.db</code>（動画のタイム ライン サムネ。<kbd>S</kbd> キーで開ける動画タイル モード用）</td><td>動画 ファイル単位（A）</td></tr>
           <tr><td>変換済みアーカイブキャッシュ</td><td><code>%APPDATA%\mimageviewer\archive_cache\</code>（変換済み ZIP）+ <code>archive_cache.db</code>（マッピング）</td><td>ファイル単位（A）</td></tr>
           <tr><td>Susie プラグイン</td><td><code>%APPDATA%\mimageviewer\susie_plugins\</code>（<code>.spi</code> ファイル配置場所）</td><td>—</td></tr>
           <tr><td>ログ</td><td><code>%APPDATA%\mimageviewer\logs\</code>（動作ログ・エラーログ）</td><td>—</td></tr>

@@ -25,6 +25,7 @@
 pub mod audio;
 pub mod audio_diagnostics;
 pub mod audio_stretch;
+pub mod avio_progress;
 pub mod clock;
 pub mod decoder;
 #[cfg(windows)]
@@ -41,6 +42,7 @@ pub mod native_window;
 pub mod normalize_scanner;
 pub mod normalize_types;
 pub mod screenshot;
+pub mod swscale_helpers;
 pub mod thumbnail;
 pub mod tile_thumb_cache;
 pub mod tile_thumbnails;
@@ -376,6 +378,8 @@ enum NativeVideoOutputCommand {
     SetPlaybackStatus {
         first_frame_presented: bool,
         error: Option<String>,
+        /// 動画オープン中の進捗 (`first_frame_presented = false` の間だけ HUD に出る)。
+        prep_status: avio_progress::PreparingStatus,
     },
     ShowToast {
         text: String,
@@ -733,12 +737,18 @@ impl NativeVideoOutput {
             });
     }
 
-    fn set_playback_status(&self, first_frame_presented: bool, error: Option<String>) {
+    fn set_playback_status(
+        &self,
+        first_frame_presented: bool,
+        error: Option<String>,
+        prep_status: avio_progress::PreparingStatus,
+    ) {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetPlaybackStatus {
                 first_frame_presented,
                 error,
+                prep_status,
             });
     }
 
@@ -1480,8 +1490,13 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetPlaybackStatus {
                     first_frame_presented,
                     error,
+                    prep_status,
                 } => {
-                    presenter.set_overlay_playback_status(first_frame_presented, error);
+                    presenter.set_overlay_playback_status(
+                        first_frame_presented,
+                        error,
+                        prep_status,
+                    );
                 }
                 NativeVideoOutputCommand::ShowToast { text, centered } => {
                     presenter.show_overlay_toast(text, centered);
@@ -1511,7 +1526,18 @@ fn run_native_video_output(
                     let show_preparing_overlay = payload.show_preparing_overlay;
                     source = PresenterSourceState::new(*payload);
                     first_presented_out.store(false, Ordering::Release);
-                    presenter.set_overlay_playback_status(false, None);
+                    // ソース切替時は新動画のオープン前なので prep_status は初期値で送る。
+                    // 直後に decoder thread が format::input を始めると、次の tick で
+                    // 新しい snapshot が押し込まれ、HUD 文言が更新される。
+                    presenter.set_overlay_playback_status(
+                        false,
+                        None,
+                        crate::video::avio_progress::PreparingStatus {
+                            phase: crate::video::avio_progress::prep_phase::OPENING,
+                            bytes_read: 0,
+                            file_size: 0,
+                        },
+                    );
                     presenter.set_overlay_metadata(None);
                     presenter.set_overlay_timeline_markers(Vec::new());
                     presenter.set_overlay_jump_entries(Vec::new());
@@ -2640,6 +2666,7 @@ impl VideoPlayer {
             video_rx,
             audio_rx,
             info_rx,
+            prep_progress,
         } = decode;
         #[cfg(windows)]
         let native_video_rx = video_rx.clone();
@@ -2740,6 +2767,7 @@ impl VideoPlayer {
                 video_rx,
                 audio_rx: dummy_audio_rx(),
                 info_rx,
+                prep_progress,
             },
             audio,
             info: None,
@@ -2860,6 +2888,14 @@ impl VideoPlayer {
 
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
+    }
+
+    /// 動画オープン中の進捗参照を返す。UI スレッドの `draw_video_hud` が
+    /// `displayed_frame_seq() == 0` (= まだ最初のフレームが届いていない) のとき
+    /// この atomic を読んで「メタデータ読込中... NN MB / YY MB」「ストリーム解析中...」
+    /// 「デコード開始中...」を切り替え表示するために使う。
+    pub fn prep_progress(&self) -> &crate::video::avio_progress::PreparingProgress {
+        &self.decode.prep_progress
     }
 
     pub fn is_playing(&self) -> bool {
@@ -3462,7 +3498,8 @@ impl VideoPlayer {
     #[cfg(windows)]
     pub fn set_native_playback_status(&self, first_frame_presented: bool, error: Option<String>) {
         if let Some(output) = self.native_output.as_ref() {
-            output.set_playback_status(first_frame_presented, error);
+            let prep_status = self.decode.prep_progress.snapshot();
+            output.set_playback_status(first_frame_presented, error, prep_status);
         }
     }
 
@@ -3657,8 +3694,14 @@ impl VideoPlayer {
                 g.handle_seek_request(target);
                 g.apply_command(engine::actor::TransportCommand::Play);
             }
+            // 動画オープン中 (= 1 フレームも表示されていない) は preparing HUD の
+            // 数値を 50ms ごとに更新するため強制 polling (Codex P3 第 13 ラウンド対応)。
+            // egui スリープを防ぎ、`set_native_playback_status` が tick ごとに発火する。
+            let preparing = self.displayed_frame_seq.load(Ordering::Relaxed) == 0;
             return if self.is_playing() || self.clock.is_seeking() {
                 Some(std::time::Duration::from_millis(16))
+            } else if preparing {
+                Some(std::time::Duration::from_millis(50))
             } else {
                 None
             };
@@ -3962,10 +4005,20 @@ impl VideoPlayer {
         #[cfg(windows)]
         self.pump_native_hover_thumbnail();
 
-        // 再生中 / seek 中なら repaint 予約。
+        // 再生中 / seek 中 / 動画オープン中 なら repaint 予約。
         // seek 中も polling 必須: post-seek 第一フレームが channel に積まれても
         // egui に repaint 要求が無いと UI が起きず channel が drain されない。
-        if self.is_playing() || seek_in_flight_for_display {
+        //
+        // 動画オープン中 (`displayed_frame_seq == 0` の間) も polling 必須
+        // (Codex P3 第 13 ラウンド): native presenter の center HUD は
+        // `set_native_playback_status` で送られた `prep_status` snapshot を見て
+        // 「メタデータ読込中... NN MB / YY MB」を描画している。app.rs:13373 がこの
+        // 呼び出しを行うのは egui の update tick の中でだけなので、ここで repaint を
+        // 要求しないと egui がスリープして bytes_read が増えても overlay に届かない。
+        // 50ms 間隔で polling すれば、HUD の数値は概ね 50ms ごとに更新される
+        // (= 体感は十分滑らか、CPU 負担も無視できる)。
+        let preparing = self.displayed_frame_seq.load(Ordering::Relaxed) == 0;
+        if self.is_playing() || seek_in_flight_for_display || preparing {
             let mut due = next_due.unwrap_or_else(|| std::time::Duration::from_millis(33));
             if seek_in_flight_for_display && displayed_pts.is_none() {
                 // 2 秒以内は vsync 周期 (16ms) で polling、超えたら decoder 故障を
@@ -3980,6 +4033,11 @@ impl VideoPlayer {
                     std::time::Duration::from_millis(16)
                 };
                 due = due.min(poll);
+            }
+            if preparing {
+                // 準備中は 50ms で十分。is_playing と組み合わさったときは min が効いて
+                // より短い方が採用される。
+                due = due.min(std::time::Duration::from_millis(50));
             }
             Some(due)
         } else {
@@ -4199,6 +4257,7 @@ fn dummy_decode_handles() -> DecodeHandles {
         video_rx,
         audio_rx,
         info_rx,
+        prep_progress: crate::video::avio_progress::PreparingProgress::new(),
     }
 }
 

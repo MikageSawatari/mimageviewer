@@ -66,6 +66,21 @@ impl App {
                     } else {
                         ui.label("キャッシュ情報を取得中...");
                     }
+                    // 動画タイル モード サムネ DB は別ファイル管理だが、
+                    // 削除操作 (フォルダ単位 / すべて) は静止画キャッシュと一括で
+                    // 走るので、サイズもこのダイアログに表示する。
+                    if let Some(tile_bytes) = self.cache_manager_tile_bytes {
+                        let tile_str = if tile_bytes >= 1024 * 1024 * 1024 {
+                            format!("{:.2} GB", tile_bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+                        } else if tile_bytes >= 1024 * 1024 {
+                            format!("{:.1} MB", tile_bytes as f64 / (1024.0 * 1024.0))
+                        } else if tile_bytes > 0 {
+                            format!("{:.0} KB", tile_bytes as f64 / 1024.0)
+                        } else {
+                            "0 MB".to_string()
+                        };
+                        ui.label(format!("うち動画タイル サムネ: {tile_str}"));
+                    }
 
                     ui.add_space(8.0);
                     ui.separator();
@@ -104,6 +119,7 @@ impl App {
                                 days: self.cache_manager_days as u64,
                             },
                             cache_dir.clone(),
+                            self.video_tile_cache.clone(),
                         ));
                     }
 
@@ -121,6 +137,7 @@ impl App {
                             self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
                                 crate::cache_maintenance::CacheMaintTask::DeleteFolder { folder },
                                 cache_dir.clone(),
+                                self.video_tile_cache.clone(),
                             ));
                         }
                     }
@@ -168,6 +185,7 @@ impl App {
                 .resizable(false)
                 .show(ctx, |ui| {
                     ui.label("すべてのサムネイルキャッシュを削除します。");
+                    ui.label("(動画タイル モードのサムネ キャッシュも一緒に削除されます)");
                     ui.label("この操作は元に戻せません。");
                     ui.add_space(8.0);
                     ui.separator();
@@ -182,6 +200,7 @@ impl App {
                             self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
                                 crate::cache_maintenance::CacheMaintTask::DeleteAll,
                                 cache_dir,
+                                self.video_tile_cache.clone(),
                             ));
                             self.cache_manager_confirm_delete_all = false;
                         }

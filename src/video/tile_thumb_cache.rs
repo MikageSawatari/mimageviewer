@@ -233,6 +233,87 @@ impl TileThumbCache {
         conn.execute("DELETE FROM video_tile_thumbs WHERE path = ?1", [&key])?;
         Ok(())
     }
+
+    /// すべての行を削除し、空きページを `VACUUM` で実体解放する。
+    /// 削除した行数を返す。「サムネイルキャッシュ管理」の「すべて削除」と同期し、
+    /// ユーザーの体感としてディスク容量が実際に減るようにする (Codex P2)。
+    /// `VACUUM` は worker thread 内で走るので UI スレッドはブロックしない。
+    pub fn clear_all(&self) -> Result<usize, rusqlite::Error> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let removed = conn.execute("DELETE FROM video_tile_thumbs", [])?;
+        // VACUUM は autocommit 外で実行 (DELETE は execute() の単発なのでこの時点で
+        // 既に commit 済み)。VACUUM 失敗は致命的ではないので log だけ残して継続。
+        if let Err(e) = conn.execute_batch("VACUUM") {
+            crate::logger::log(format!("TileThumbCache::clear_all: VACUUM failed: {e}"));
+        }
+        Ok(removed)
+    }
+
+    /// 指定フォルダ配下の動画パスに紐づく行を削除する (= 「現在のフォルダのキャッシュ
+    /// を削除」と同期)。再帰的にサブフォルダも含む。削除した行数を返す。
+    /// 削除した行が 1 つ以上ある場合は続けて `VACUUM` で実体解放する (Codex P2)。
+    ///
+    /// `folder` は `normalize_keep_drive` で正規化したうえで末尾 `/` を付与し、
+    /// `substr(path, 1, length(?1)) = ?1` で前方一致削除する。`%` `_` を含む path も
+    /// 安全 (= wildcard 評価を経ない)。
+    pub fn clear_for_folder(&self, folder: &Path) -> Result<usize, rusqlite::Error> {
+        let mut prefix = crate::path_key::normalize_keep_drive(folder);
+        if !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        let removed = conn.execute(
+            "DELETE FROM video_tile_thumbs \
+             WHERE substr(path, 1, length(?1)) = ?1",
+            rusqlite::params![prefix],
+        )?;
+        if removed > 0 {
+            if let Err(e) = conn.execute_batch("VACUUM") {
+                crate::logger::log(format!(
+                    "TileThumbCache::clear_for_folder: VACUUM failed: {e}"
+                ));
+            }
+        }
+        Ok(removed)
+    }
+
+    /// DB 本体 + WAL + SHM の合計バイト数 (キャッシュ管理ダイアログの表示用)。
+    /// 取得失敗時は 0 を返す (= 表示でだけ使うので失敗を panic にしない)。
+    pub fn db_size_bytes() -> u64 {
+        let db = Self::db_path();
+        let wal = db.with_extension("db-wal");
+        let shm = db.with_extension("db-shm");
+        let one = |p: &Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        one(&db) + one(&wal) + one(&shm)
+    }
+
+    /// open 失敗時の fallback 用に、DB / WAL / SHM のファイルを物理削除する。
+    /// 削除に成功したファイル数を返す (0〜3)。`open()` が走らない経路でも呼べる
+    /// よう静的メソッドにしている (Codex P2)。`TileThumbCache` インスタンスを
+    /// 持っているなら通常は `clear_all()` を使う。
+    ///
+    /// ## 注意
+    /// 同時に `Connection` を握っているインスタンスが存在するときに呼ぶと SQLite が
+    /// 一貫性を失う。**Arc が dropped されているか、そもそも open に失敗していて
+    /// インスタンスが存在しないとき限定**で使う。
+    pub fn erase_db_files() -> usize {
+        let db = Self::db_path();
+        let wal = db.with_extension("db-wal");
+        let shm = db.with_extension("db-shm");
+        let mut removed = 0usize;
+        for p in [&db, &wal, &shm] {
+            if std::fs::remove_file(p).is_ok() {
+                removed += 1;
+            }
+        }
+        removed
+    }
 }
 
 #[cfg(test)]
@@ -322,6 +403,214 @@ mod tests {
         // 同 pts に複数 tile_w がある場合は最大幅を採用 (= 縮小スケールの方が綺麗)
         db.store_webp(p, 320, 5000, 100, 180, &[42]).unwrap();
         assert_eq!(db.lookup_webp(p, 5000, 100).unwrap(), vec![42]);
+    }
+
+    #[test]
+    fn clear_all_runs_vacuum_shrinks_file() {
+        // P2 (Codex) regression: `DELETE` だけだと SQLite はフリーページを再利用するだけで
+        // ファイルサイズが縮まないので、ユーザーが「全削除」しても `video_tile_thumbs.db`
+        // のディスク使用量が残る。`clear_all()` は VACUUM を行うべき。
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("video_tile_thumbs.db");
+        let conn = Connection::open(&db_path).expect("open file db");
+        TileThumbCache::init_schema(&conn).expect("schema");
+        let db = TileThumbCache {
+            conn: Mutex::new(conn),
+        };
+        // 200 行 × 2KB BLOB を投入してファイルを成長させる
+        for i in 0..200u32 {
+            let blob: Vec<u8> = (0..2048u32).map(|j| ((i * 31 + j) % 256) as u8).collect();
+            db.store_webp(
+                Path::new(&format!("c:/grow/v_{i}.mp4")),
+                320,
+                5000,
+                100,
+                180,
+                &blob,
+            )
+            .expect("store");
+        }
+        // チェックポイント無しでも file は伸びている (rollback journal mode)
+        let size_before = std::fs::metadata(&db_path).expect("meta").len();
+        assert!(
+            size_before > 200_000,
+            "DB should have grown above 200KB after seeding (got {} bytes)",
+            size_before
+        );
+
+        let removed = db.clear_all().expect("clear_all");
+        assert_eq!(removed, 200);
+
+        let size_after = std::fs::metadata(&db_path).expect("meta after").len();
+        assert!(
+            size_after < size_before / 2,
+            "VACUUM should have shrunk the DB: before={} bytes, after={} bytes",
+            size_before,
+            size_after
+        );
+    }
+
+    #[test]
+    fn clear_for_folder_runs_vacuum_when_rows_deleted() {
+        // VACUUM が走るのは「1 行以上削除した」場合のみ (= 0 行で VACUUM すると
+        // 無意味な I/O が走る)。本テストは「削除した場合に size が縮む」ことで
+        // VACUUM パスが踏まれたことを間接的に検証する。
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("video_tile_thumbs.db");
+        let conn = Connection::open(&db_path).expect("open file db");
+        TileThumbCache::init_schema(&conn).expect("schema");
+        let db = TileThumbCache {
+            conn: Mutex::new(conn),
+        };
+        for i in 0..150u32 {
+            let blob: Vec<u8> = (0..2048u32).map(|j| ((i * 17 + j) % 256) as u8).collect();
+            db.store_webp(
+                Path::new(&format!("c:/movies/v_{i}.mp4")),
+                320,
+                5000,
+                100,
+                180,
+                &blob,
+            )
+            .expect("store");
+        }
+        let size_before = std::fs::metadata(&db_path).expect("meta").len();
+        assert!(size_before > 150_000);
+
+        // 全部 c:/movies 配下なので 150 行消える
+        let removed = db
+            .clear_for_folder(Path::new("c:/movies"))
+            .expect("clear_for_folder");
+        assert_eq!(removed, 150);
+
+        let size_after = std::fs::metadata(&db_path).expect("meta after").len();
+        assert!(
+            size_after < size_before / 2,
+            "VACUUM should have shrunk: before={}, after={}",
+            size_before,
+            size_after
+        );
+    }
+
+    #[test]
+    fn clear_for_folder_no_rows_does_not_error() {
+        // rows = 0 のとき VACUUM は skip される。ここでは error 無しで完走することを
+        // 確認する (内部実装が if removed > 0 で gating している前提)。
+        let db = open_in_memory();
+        db.store_webp(Path::new("c:/other/x.mp4"), 320, 5000, 100, 180, &[1])
+            .unwrap();
+        let removed = db.clear_for_folder(Path::new("c:/empty_folder")).unwrap();
+        assert_eq!(removed, 0);
+        // 他フォルダの行は残っている
+        assert!(
+            db.lookup_webp(Path::new("c:/other/x.mp4"), 5000, 100)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn clear_all_wipes_table_keeps_schema() {
+        let db = open_in_memory();
+        let p1 = Path::new("c:/v1.mp4");
+        let p2 = Path::new("d:/dir/v2.mp4");
+        db.store_webp(p1, 320, 5000, 100, 180, &[1]).unwrap();
+        db.store_webp(p2, 320, 5000, 100, 180, &[2]).unwrap();
+        // 2 行ある状態から clear_all → 2 件削除
+        let removed = db.clear_all().unwrap();
+        assert_eq!(removed, 2);
+        // 削除後も schema は残っているので新規 store/lookup が動く
+        db.store_webp(p1, 320, 5000, 100, 180, &[3]).unwrap();
+        assert_eq!(db.lookup_webp(p1, 5000, 100).unwrap(), vec![3]);
+        // p2 は消えたまま
+        assert!(db.lookup_webp(p2, 5000, 100).is_none());
+    }
+
+    #[test]
+    fn clear_for_folder_recursive_prefix() {
+        let db = open_in_memory();
+        // 対象フォルダ配下: c:/movies/  に 2 動画 (直下 + サブフォルダ)
+        db.store_webp(Path::new("c:/movies/a.mp4"), 320, 5000, 100, 180, &[1])
+            .unwrap();
+        db.store_webp(Path::new("c:/movies/sub/b.mp4"), 320, 5000, 100, 180, &[2])
+            .unwrap();
+        // 別フォルダ
+        db.store_webp(Path::new("c:/other/c.mp4"), 320, 5000, 100, 180, &[3])
+            .unwrap();
+        // 紛らわしい類似名 (movies に prefix 一致しないことを確認)
+        db.store_webp(
+            Path::new("c:/movies_backup/d.mp4"),
+            320,
+            5000,
+            100,
+            180,
+            &[4],
+        )
+        .unwrap();
+
+        let removed = db.clear_for_folder(Path::new("c:/movies")).unwrap();
+        assert_eq!(removed, 2, "movies 配下 2 件のみ削除されるべき");
+
+        // 配下 2 件は消えた
+        assert!(
+            db.lookup_webp(Path::new("c:/movies/a.mp4"), 5000, 100)
+                .is_none()
+        );
+        assert!(
+            db.lookup_webp(Path::new("c:/movies/sub/b.mp4"), 5000, 100)
+                .is_none()
+        );
+        // 別フォルダと類似名は残っている
+        assert!(
+            db.lookup_webp(Path::new("c:/other/c.mp4"), 5000, 100)
+                .is_some()
+        );
+        assert!(
+            db.lookup_webp(Path::new("c:/movies_backup/d.mp4"), 5000, 100)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn clear_for_folder_handles_trailing_slash_and_case() {
+        let db = open_in_memory();
+        db.store_webp(Path::new("C:\\Movies\\A.mp4"), 320, 5000, 100, 180, &[1])
+            .unwrap();
+        // 末尾スラッシュあり + 大文字 + バックスラッシュ混じり でも 1 件消える
+        let removed = db.clear_for_folder(Path::new("C:\\Movies\\")).unwrap();
+        assert_eq!(removed, 1);
+    }
+
+    #[test]
+    fn clear_for_folder_with_wildcard_chars_safe() {
+        let db = open_in_memory();
+        // `%` や `_` を含む path も誤削除しない (= LIKE を使っていないことの保証)。
+        db.store_webp(
+            Path::new("c:/movies/foo%bar.mp4"),
+            320,
+            5000,
+            100,
+            180,
+            &[1],
+        )
+        .unwrap();
+        db.store_webp(
+            Path::new("c:/movies/foo_baz.mp4"),
+            320,
+            5000,
+            100,
+            180,
+            &[2],
+        )
+        .unwrap();
+        db.store_webp(Path::new("c:/other/x.mp4"), 320, 5000, 100, 180, &[3])
+            .unwrap();
+
+        let removed = db.clear_for_folder(Path::new("c:/movies")).unwrap();
+        assert_eq!(removed, 2);
+        assert!(
+            db.lookup_webp(Path::new("c:/other/x.mp4"), 5000, 100)
+                .is_some()
+        );
     }
 
     #[test]
