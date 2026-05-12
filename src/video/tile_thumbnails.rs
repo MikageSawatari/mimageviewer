@@ -221,23 +221,14 @@ fn run_worker(
     };
     let src_w = decoder.width();
     let src_h = decoder.height();
-    let src_fmt = decoder.format();
     let (dst_w, dst_h) = fit_within(src_w, src_h, max_w, max_h);
-    let mut scaler = match ScaleContext::get(
-        src_fmt,
-        src_w,
-        src_h,
-        Pixel::RGBA,
-        dst_w,
-        dst_h,
-        ScaleFlags::BILINEAR,
-    ) {
-        Ok(s) => s,
-        Err(e) => {
-            crate::logger::log(format!("video-tile-thumb: sws_scale init failed: {e}"));
-            return;
-        }
-    };
+    // `decoder.format()` ベースの事前 scaler 構築は HW accel attach 時に
+    // `Pixel::D3D11` を返して swscale `av_assert0` → `abort()` を踏むため、
+    // **最初の frame を取った後の `frame.format()` で scaler を lazy 構築** する
+    // 方式に切り替える。HW frame は `prepare_frame_for_swscale` で SW download。
+    // 詳細は `src/video/swscale_helpers.rs` のドキュメントコメント参照。
+    let mut scaler: Option<ScaleContext> = None;
+    let mut scaler_src_fmt: Option<Pixel> = None;
 
     for (idx, &target_secs) in timestamps.iter().enumerate() {
         if cancel.load(Ordering::Acquire) {
@@ -309,8 +300,47 @@ fn run_worker(
         let Some(frame) = got_frame else {
             continue;
         };
+        // HW (D3D11) frame は SW download してから scaler に渡す。SW frame はそのまま。
+        let mut sw_holder: Option<Video> = None;
+        let frame_for_scaler = match crate::video::swscale_helpers::prepare_frame_for_swscale(
+            &frame,
+            &mut sw_holder,
+        ) {
+            Ok(f) => f,
+            Err(e) => {
+                crate::logger::log(format!("video-tile-thumb: {e}"));
+                continue;
+            }
+        };
+        // scaler を lazy 構築 / src_fmt 変化時に再構築。
+        let cur_src_fmt = frame_for_scaler.format();
+        if scaler.is_none() || scaler_src_fmt != Some(cur_src_fmt) {
+            crate::logger::log(format!(
+                "video-tile-thumb: -> ScaleContext::get src_fmt={cur_src_fmt:?} src_size={src_w}x{src_h} dst_size={dst_w}x{dst_h}"
+            ));
+            match ScaleContext::get(
+                cur_src_fmt,
+                src_w,
+                src_h,
+                Pixel::RGBA,
+                dst_w,
+                dst_h,
+                ScaleFlags::BILINEAR,
+            ) {
+                Ok(s) => {
+                    scaler = Some(s);
+                    scaler_src_fmt = Some(cur_src_fmt);
+                    crate::logger::log("video-tile-thumb: <- ScaleContext::get ok");
+                }
+                Err(e) => {
+                    crate::logger::log(format!("video-tile-thumb: sws_scale init failed: {e}"));
+                    continue;
+                }
+            }
+        }
+        let scaler_ref = scaler.as_mut().expect("scaler initialized above");
         let mut rgba = Video::empty();
-        if scaler.run(&frame, &mut rgba).is_err() {
+        if scaler_ref.run(frame_for_scaler, &mut rgba).is_err() {
             continue;
         }
         let stride = rgba.stride(0);

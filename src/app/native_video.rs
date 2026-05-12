@@ -2781,9 +2781,12 @@ impl App {
         if next_cols == current {
             return;
         }
+        let was_open = self.video_tile_state.is_some();
+        crate::logger::log(format!(
+            "[video-tile] adjust_columns: fs_idx={fs_idx} delta={delta} columns {current}->{next_cols} was_open={was_open}"
+        ));
         self.settings.video_tile_columns = next_cols;
         self.settings.save();
-        let was_open = self.video_tile_state.is_some();
         self.video_tile_state = None;
         self.video_tile_swap_pending = None;
         if was_open {
@@ -2834,6 +2837,10 @@ impl App {
             return false;
         }
 
+        crate::logger::log(format!(
+            "[video-tile] fast_swap: from_idx={from_idx} -> target_idx={target_idx} target={}",
+            target_path.display()
+        ));
         self.save_all_video_resume_positions();
         let native_output = match self.fs_cache.get_mut(&from_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {

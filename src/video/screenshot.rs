@@ -51,17 +51,10 @@ pub fn capture_frame(path: &Path, target_secs: f64) -> Result<CapturedVideoFrame
     if src_w == 0 || src_h == 0 {
         return Err("video frame size is zero".to_string());
     }
-    let src_fmt = decoder.format();
-    let mut scaler = ScaleContext::get(
-        src_fmt,
-        src_w,
-        src_h,
-        Pixel::RGBA,
-        src_w,
-        src_h,
-        ScaleFlags::BILINEAR,
-    )
-    .map_err(|e| format!("sws_scale init failed: {e}"))?;
+    // `decoder.format()` は HW accel attach 時に `Pixel::D3D11` を返し swscale
+    // `av_assert0` → `abort()` を踏むので、scaler は **frame 取得後に lazy 構築**
+    // する。HW frame は `prepare_frame_for_swscale` で SW download してから渡す。
+    // (詳細は `src/video/swscale_helpers.rs`)
 
     let target_pts = (target_secs * 1_000_000.0) as i64;
     let seek_ok = unsafe {
@@ -120,9 +113,25 @@ pub fn capture_frame(path: &Path, target_secs: f64) -> Result<CapturedVideoFrame
     let frame = got_frame
         .or(fallback_frame)
         .ok_or_else(|| format!("frame not found near {target_secs:.3}s"))?;
+    // HW (D3D11) frame は SW download してから scaler に渡す。
+    let mut sw_holder: Option<Video> = None;
+    let frame_for_scaler =
+        crate::video::swscale_helpers::prepare_frame_for_swscale(&frame, &mut sw_holder)
+            .map_err(|e| format!("screenshot: {e}"))?;
+    let cur_src_fmt = frame_for_scaler.format();
+    let mut scaler = ScaleContext::get(
+        cur_src_fmt,
+        src_w,
+        src_h,
+        Pixel::RGBA,
+        src_w,
+        src_h,
+        ScaleFlags::BILINEAR,
+    )
+    .map_err(|e| format!("sws_scale init failed: {e}"))?;
     let mut rgba = Video::empty();
     scaler
-        .run(&frame, &mut rgba)
+        .run(frame_for_scaler, &mut rgba)
         .map_err(|e| format!("sws_scale failed: {e}"))?;
     let stride = rgba.stride(0);
     let needed = (src_w * 4) as usize;

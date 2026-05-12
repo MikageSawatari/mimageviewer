@@ -143,3 +143,14 @@ opt-level = 3
 lto = "thin"
 codegen-units = 16
 strip = true
+
+# クラッシュ解析専用: release ビルドだが Rust シンボル + line table を残す版。
+# 本番 release は触らず、WER ダンプから Rust 関数名 / ソース行を取りたいときだけ使う。
+#   cargo build --profile release-debuginfo --bin mimageviewer-core
+#   cargo build --profile release-debuginfo --bin mimageviewer
+# 成果物は target/release-debuginfo/ に出る。配布には使わない (= サイズ膨らむ + dead-code が残る)。
+[profile.release-debuginfo]
+inherits = "release"
+strip = false
+debug = "line-tables-only"
+split-debuginfo = "packed"
