@@ -416,12 +416,12 @@ enum NativeVideoOutputCommand {
     /// CP1-6 までは送る側がないため dead code。CP7 で App から送り始める。
     #[allow(dead_code)]
     RaiseHudToTop,
-    /// native presenter HWND を presenter thread 側で前面に戻す。
+    /// native presenter HWND を presenter thread 側で前面・foreground に戻す。
     ///
     /// PrintScreen / Snipping Tool などで一度 foreground が外部プロセスへ移ったあと、
     /// egui 側の黒 backdrop が presenter HWND より前に残ることがある。UI thread から
-    /// `SetWindowPos` すると DWM / presenter thread 待ちで固まるリスクがあるため、
-    /// command 経由で HWND 所有スレッドに再アサートさせる。
+    /// `SetWindowPos` / `SetForegroundWindow` すると DWM / presenter thread 待ちで
+    /// 固まるリスクがあるため、command 経由で HWND 所有スレッドに再アサートさせる。
     RaisePresenterToFront,
 }
 
@@ -1539,7 +1539,21 @@ fn run_native_video_output(
                     );
                 }
                 NativeVideoOutputCommand::RaisePresenterToFront => {
-                    let _ = crate::video::native_window::bring_to_front(window.hwnd().0 as u64);
+                    let hwnd = window.hwnd().0 as u64;
+                    let z_ok = crate::video::native_window::bring_to_front(hwnd);
+                    let report = crate::video::native_window::claim_foreground(hwnd);
+                    crate::logger::log(format!(
+                        "[native-video] presenter recover foreground hwnd=0x{hwnd:x} \
+                         z_order={} foreground=0x{:x} post=0x{:x} attach={} \
+                         set_foreground={} set_active={} set_focus={}",
+                        z_ok,
+                        report.foreground_hwnd,
+                        report.post_foreground_hwnd,
+                        report.attach_thread_input_ok,
+                        report.set_foreground_ok,
+                        report.set_active_ok,
+                        report.set_focus_ok,
+                    ));
                 }
                 NativeVideoOutputCommand::SwitchSource { payload } => {
                     native_drain_unpresented_queue(&mut source.queue);
