@@ -117,7 +117,6 @@ impl App {
                 self.dsp_bridge.unregister_fullscreen_owner();
                 self.dsp_bridge.set_hud_hwnd(0);
                 self.vst_geometry_tracker.clear();
-                self.dsp_bridge.set_all_guis_move_min_y(None);
             }
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;

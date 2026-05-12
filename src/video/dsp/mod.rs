@@ -148,10 +148,6 @@ pub struct DspBridge {
     /// / `set_all_guis_app_active` / `send_chain_z_order` 等) の末尾で発火する。
     /// hook 側は unbounded mpsc に `send` するだけの非ブロッキング処理を行う。
     hud_raise_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
-    /// 実機修正 (2026-05-12): 直近 `set_all_guis_move_min_y` の値。値が変化したときだけ
-    /// 全 host に Cmd を投げる差分判定用 (= 毎フレーム呼出で send 過多にならないように)。
-    /// `i64::MIN` を sentinel として使い、初回は必ず send。
-    last_move_min_y: std::sync::atomic::AtomicI64,
 }
 
 struct DspBridgeInner {
@@ -250,7 +246,6 @@ impl DspBridge {
             hud_hwnd: AtomicU64::new(0),
             editor_hwnds: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             hud_raise_hook: Mutex::new(None),
-            last_move_min_y: std::sync::atomic::AtomicI64::new(i64::MIN),
         })
     }
 
@@ -275,31 +270,6 @@ impl DspBridge {
     /// **`current_gui_owner_hwnd` の候補には絶対に出さない**ことに注意。
     pub fn set_hud_hwnd(&self, hwnd: u64) {
         self.hud_hwnd.store(hwnd, Ordering::Release);
-    }
-
-    /// 実機修正 (2026-05-12): VST GUI window の `y` 移動下限値を保存。
-    /// 実際の clamp 実行は **App 側で毎フレーム `GetWindowRect` + `SetWindowPos`** で行う
-    /// (= VST GUI HWND は bridge process が host していて、`slot.gui_host` は使われていない。
-    /// 元の cmd_tx 経由 `WM_WINDOWPOSCHANGING` clamp 構想は届かないため放棄)。
-    /// `None` で制限解除。
-    pub fn set_all_guis_move_min_y(&self, min_y: Option<i32>) {
-        let new_v: i64 = min_y.map(|v| v as i64).unwrap_or(i64::MIN);
-        let prev = self.last_move_min_y.swap(new_v, Ordering::AcqRel);
-        if prev != new_v && crate::video::native_presenter::hud_debug_enabled() {
-            crate::logger::log(format!(
-                "[HUD-DEBUG] set_all_guis_move_min_y prev={prev} new={new_v} min_y={min_y:?}"
-            ));
-        }
-    }
-
-    /// 実機修正 (2026-05-12): 保存された move_min_y を取得。App 側 clamp ループから読む。
-    pub fn move_min_y_value(&self) -> Option<i32> {
-        let v = self.last_move_min_y.load(Ordering::Acquire);
-        if v == i64::MIN {
-            None
-        } else {
-            Some(v as i32)
-        }
     }
 
     /// HUD raise allowlist 用に editor_hwnds snapshot の `Arc<RwLock<...>>` を
