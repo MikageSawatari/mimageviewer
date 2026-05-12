@@ -65,6 +65,20 @@ fn init_inner(file_name: &str, truncate: bool) {
     let log_dir = crate::data_dir::logs_dir();
     let _ = std::fs::create_dir_all(&log_dir);
     let log_path = log_dir.join(file_name);
+    // truncate モード (= メインプロセス) の場合、**前回セッションのログを `.prev` に**
+    // 退避してから truncate する。クラッシュ再現で「次の起動」をする前に
+    // `<log>.prev` を見れば直前の死亡時の最終出力が観察できる。
+    // 退避は best-effort (失敗しても通常起動を続ける)。
+    if truncate && log_path.exists() {
+        let mut prev_path = log_path.clone();
+        let mut prev_name = log_path
+            .file_name()
+            .map(|n| n.to_owned())
+            .unwrap_or_else(|| std::ffi::OsString::from(file_name));
+        prev_name.push(".prev");
+        prev_path.set_file_name(prev_name);
+        let _ = std::fs::copy(&log_path, &prev_path);
+    }
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).write(true);
     allow_live_log_reading(&mut opts);

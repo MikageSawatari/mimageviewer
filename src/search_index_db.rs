@@ -61,6 +61,22 @@ pub fn normalize_path(path: &Path) -> String {
     path.to_string_lossy().to_lowercase().replace('\\', "/")
 }
 
+/// `delete_subtree` / `prune_stale_under_subtree` で共用する境界判定。
+/// 戻り値 `(root_norm, prefix)`:
+/// - `root_norm` は `root_path` を `normalize_path` した結果 (root 行一致比較用)。
+/// - `prefix` は常に末尾 `/` で終わる文字列 (root_norm にすでに `/` があれば 1 つだけ、
+///   無ければ追加)。SQL 側で `?2 || '/'` を組むと `c:/` 等の drive root で `//` に
+///   なる事故を避けるため、Rust 側で済ませる。
+fn subtree_bounds(root_path: &Path) -> (String, String) {
+    let root_norm = normalize_path(root_path);
+    let prefix = if root_norm.ends_with('/') {
+        root_norm.clone()
+    } else {
+        format!("{}/", root_norm)
+    };
+    (root_norm, prefix)
+}
+
 // -----------------------------------------------------------------------
 // SearchIndexDb
 // -----------------------------------------------------------------------
@@ -208,6 +224,64 @@ impl SearchIndexDb {
             params![fav_norm],
         )?;
         Ok(())
+    }
+
+    /// `root_path` 自身と配下のすべての行を `favorite_root` スコープで削除する。
+    /// notify-rs の差分追従 (`apply_single_change`) で「フォルダごと消えた」「サブツリーごと
+    /// 消えた」を検知したときに呼ぶ。`upsert_children` の DELETE は親直下しか触れないので、
+    /// 観測できない孫以下を一括で掃除するためにこのメソッドが必要。
+    ///
+    /// 境界判定は wildcard (`LIKE`) を使わない: `path` に `%` / `_` が含まれる ZIP/PDF 名で
+    /// 過剰削除しないため、Rust 側で trailing slash 付きの `prefix` を組んで `substr` で
+    /// 比較する (Codex P1 レビュー指摘)。
+    ///
+    /// 戻り値: 削除行数 (診断用)。
+    pub fn delete_subtree(
+        &self,
+        favorite_root: &Path,
+        root_path: &Path,
+    ) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let fav_norm = normalize_path(favorite_root);
+        let (root_norm, prefix) = subtree_bounds(root_path);
+        conn.execute(
+            "DELETE FROM entries \
+             WHERE favorite_root = ?1 \
+             AND ( path = ?2 OR substr(path, 1, length(?3)) = ?3 )",
+            params![fav_norm, root_norm, prefix],
+        )
+    }
+
+    /// `root_path` 配下 (root 自身を含む) のうち、`updated_at < cutoff` の行だけを削除する。
+    /// `apply_single_change` の subtree recursive upsert 後に呼ぶ post-scan prune 用。
+    ///
+    /// 同名ディレクトリの「fast delete → recreate (子孫が減る)」シナリオでは、新しい実体に
+    /// 以前の深い子孫が無いので recursive upsert が訪問しない → 古い孫行が `updated_at`
+    /// 古いまま残留する。`run_bulk_name_index` の `prune_stale_for_favorite` と同じ
+    /// stamp 方式を subtree scope で適用することで掃除する。
+    ///
+    /// 境界判定は `delete_subtree` と同じ wildcard なしの substr 比較 (helper
+    /// `subtree_bounds` で共有)。
+    ///
+    /// 呼び出し側 (`apply_single_change`) は **subtree scan が clean に完了したときのみ**
+    /// 呼ぶこと。途中 cancel / `read_dir` error 等で不完全な観測になった状態で呼ぶと、
+    /// 正当な行を stale と誤判定して消してしまう。
+    pub fn prune_stale_under_subtree(
+        &self,
+        favorite_root: &Path,
+        root_path: &Path,
+        updated_at_cutoff: i64,
+    ) -> rusqlite::Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        let fav_norm = normalize_path(favorite_root);
+        let (root_norm, prefix) = subtree_bounds(root_path);
+        conn.execute(
+            "DELETE FROM entries \
+             WHERE favorite_root = ?1 \
+             AND ( path = ?2 OR substr(path, 1, length(?3)) = ?3 ) \
+             AND updated_at < ?4",
+            params![fav_norm, root_norm, prefix, updated_at_cutoff],
+        )
     }
 
     /// お気に入りに含まれない (不要になった) エントリを削除する。
@@ -935,5 +1009,321 @@ mod tests {
         assert_eq!(db.total_count().unwrap(), 2);
         db.prune_obsolete(&[normalize_path(&fav_keep)]).unwrap();
         assert_eq!(db.total_count().unwrap(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // delete_subtree / prune_stale_under_subtree
+    // (B4: watcher 経路の subtree prune 用 — Codex レビュー反映)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn subtree_bounds_basic() {
+        let (root, prefix) = subtree_bounds(Path::new(r"C:\Foo\Bar"));
+        assert_eq!(root, "c:/foo/bar");
+        assert_eq!(prefix, "c:/foo/bar/");
+    }
+
+    #[test]
+    fn subtree_bounds_drive_root_does_not_double_slash() {
+        // `c:\` → normalize_path で "c:/" になるので、prefix は二重 '/' にならないこと
+        let (root, prefix) = subtree_bounds(Path::new(r"C:\"));
+        assert_eq!(root, "c:/");
+        assert_eq!(prefix, "c:/");
+    }
+
+    #[test]
+    fn delete_subtree_removes_root_and_descendants() {
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        // /Fav/sub と /Fav/sub/deep/x.zip を入れる
+        db.upsert_children(
+            &fav,
+            &fav,
+            &[entry(r"C:\Fav\sub", "sub", IndexKind::Folder)],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav,
+            &PathBuf::from(r"C:\Fav\sub"),
+            &[entry(r"C:\Fav\sub\deep", "deep", IndexKind::Folder)],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav,
+            &PathBuf::from(r"C:\Fav\sub\deep"),
+            &[entry(r"C:\Fav\sub\deep\x.zip", "x.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        assert_eq!(db.total_count().unwrap(), 3);
+
+        let n = db
+            .delete_subtree(&fav, &PathBuf::from(r"C:\Fav\sub"))
+            .unwrap();
+        // sub, deep, x.zip の 3 行が消える
+        assert_eq!(n, 3);
+        assert_eq!(db.total_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_subtree_respects_path_boundary_foo_vs_foobar() {
+        // `c:/fav/foo` を消そうとして `c:/fav/foobar` まで消えないこと
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        db.upsert_children(
+            &fav,
+            &fav,
+            &[
+                entry(r"C:\Fav\foo", "foo", IndexKind::Folder),
+                entry(r"C:\Fav\foobar", "foobar", IndexKind::Folder),
+            ],
+        )
+        .unwrap();
+        // foo の下に x.zip
+        db.upsert_children(
+            &fav,
+            &PathBuf::from(r"C:\Fav\foo"),
+            &[entry(r"C:\Fav\foo\x.zip", "x.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        // foobar の下に y.zip (これは残るべき)
+        db.upsert_children(
+            &fav,
+            &PathBuf::from(r"C:\Fav\foobar"),
+            &[entry(r"C:\Fav\foobar\y.zip", "y.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        assert_eq!(db.total_count().unwrap(), 4);
+
+        let n = db
+            .delete_subtree(&fav, &PathBuf::from(r"C:\Fav\foo"))
+            .unwrap();
+        // foo と foo/x.zip の 2 行のみ消える
+        assert_eq!(n, 2);
+
+        let r = db
+            .search("y.zip", &[], crate::search_query::MatchMode::And)
+            .unwrap();
+        assert_eq!(r.len(), 1, "foobar 配下の y.zip は残るべき");
+        let r = db
+            .search("foobar", &[], crate::search_query::MatchMode::And)
+            .unwrap();
+        assert_eq!(r.len(), 1, "foobar Folder 行も残るべき");
+    }
+
+    #[test]
+    fn delete_subtree_treats_like_wildcards_as_literal() {
+        // path に `%` `_` が含まれていても LIKE 評価されず、誤削除されない
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        db.upsert_children(
+            &fav,
+            &fav,
+            &[
+                entry(r"C:\Fav\foo_%", "foo_%", IndexKind::Folder),
+                entry(r"C:\Fav\foo%bar", "foo%bar", IndexKind::Folder),
+                entry(r"C:\Fav\fooXY", "fooXY", IndexKind::Folder),
+            ],
+        )
+        .unwrap();
+        assert_eq!(db.total_count().unwrap(), 3);
+
+        // `foo_%` を消す (LIKE で評価されると `foo` + 任意 1 文字 + 任意文字列 で
+        // マッチして fooXY や foo%bar まで消える危険があるシナリオ)
+        let n = db
+            .delete_subtree(&fav, &PathBuf::from(r"C:\Fav\foo_%"))
+            .unwrap();
+        assert_eq!(n, 1, "literal な foo_% のみ消える (LIKE 評価されない)");
+
+        let r = db
+            .search("fooXY", &[], crate::search_query::MatchMode::And)
+            .unwrap();
+        assert_eq!(r.len(), 1, "fooXY は残るべき (LIKE 評価で巻き込まれない)");
+        let r = db
+            .search("foo%bar", &[], crate::search_query::MatchMode::And)
+            .unwrap();
+        assert_eq!(r.len(), 1, "foo%bar は残るべき (LIKE 評価で巻き込まれない)");
+    }
+
+    #[test]
+    fn delete_subtree_scoped_to_favorite_root() {
+        // nested favorites: 親 fav の delete_subtree が子 fav の同一 path 行を巻き込まない
+        let db = open_mem();
+        let fav_parent = PathBuf::from(r"C:\Fav");
+        let fav_child = PathBuf::from(r"C:\Fav\sub");
+        // 両 fav にそれぞれ同じ実体 path を登録
+        db.upsert_children(
+            &fav_parent,
+            &fav_parent,
+            &[entry(r"C:\Fav\sub", "sub", IndexKind::Folder)],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav_parent,
+            &PathBuf::from(r"C:\Fav\sub"),
+            &[entry(r"C:\Fav\sub\x.zip", "x.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav_child,
+            &fav_child,
+            &[entry(r"C:\Fav\sub\x.zip", "x.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        assert_eq!(db.total_count().unwrap(), 3);
+
+        // 親 fav スコープで sub の subtree を delete
+        db.delete_subtree(&fav_parent, &PathBuf::from(r"C:\Fav\sub"))
+            .unwrap();
+
+        // 親 fav 配下は 0 件
+        let r = db
+            .search(
+                "x.zip",
+                &[fav_parent.clone()],
+                crate::search_query::MatchMode::And,
+            )
+            .unwrap();
+        assert!(r.is_empty(), "親 fav 配下は消えるべき");
+
+        // 子 fav スコープは無傷
+        let r = db
+            .search(
+                "x.zip",
+                &[fav_child.clone()],
+                crate::search_query::MatchMode::And,
+            )
+            .unwrap();
+        assert_eq!(r.len(), 1, "子 fav 配下は巻き込まれない");
+    }
+
+    #[test]
+    fn prune_stale_under_subtree_removes_root_self_if_older_than_cutoff() {
+        // `prune_stale_under_subtree` は `path = root_path` 自身の行も cutoff 対象になる。
+        // この不変量は「scan_start を parent refresh の前に取る」設計の意図を固定する
+        // (Codex 第 9 レビュー指摘)。
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        // /Fav/sub を put (これが「root_path 自身の行」)
+        db.upsert_children(
+            &fav,
+            &fav,
+            &[entry(r"C:\Fav\sub", "sub", IndexKind::Folder)],
+        )
+        .unwrap();
+        assert_eq!(db.total_count().unwrap(), 1);
+
+        // 上記 upsert の updated_at より大きい cutoff を取れば、stale 扱いで消える
+        let cutoff = next_write_stamp();
+        let n = db
+            .prune_stale_under_subtree(&fav, &PathBuf::from(r"C:\Fav\sub"), cutoff)
+            .unwrap();
+        assert_eq!(n, 1, "root_path 自身の行が cutoff 対象になるべき");
+        assert_eq!(db.total_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn prune_stale_under_subtree_keeps_fresh_descendants() {
+        // subtree scope 内で `updated_at >= cutoff` の行は残る
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        // 古い行を入れる
+        db.upsert_children(
+            &fav,
+            &PathBuf::from(r"C:\Fav\sub"),
+            &[entry(r"C:\Fav\sub\old.zip", "old.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+
+        // cutoff を取る
+        let cutoff = next_write_stamp();
+
+        // 新しい行を入れる (cutoff より大きい stamp)
+        db.upsert_children(
+            &fav,
+            &PathBuf::from(r"C:\Fav\sub"),
+            &[
+                entry(r"C:\Fav\sub\old.zip", "old.zip", IndexKind::ZipFile),
+                entry(r"C:\Fav\sub\new.zip", "new.zip", IndexKind::ZipFile),
+            ],
+        )
+        .unwrap();
+        // upsert_children は同じ parent の既存行を DELETE → INSERT し直すので、
+        // old.zip の updated_at も新しくなっている
+        assert_eq!(db.total_count().unwrap(), 2);
+
+        // cutoff より古い行は残っていないので prune は 0 件 (= scope 内全部 fresh)
+        let n = db
+            .prune_stale_under_subtree(&fav, &PathBuf::from(r"C:\Fav\sub"), cutoff)
+            .unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(db.total_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn prune_stale_under_subtree_does_not_touch_outside_scope() {
+        // subtree 外 / 他 favorite は cutoff 比較されない
+        let db = open_mem();
+        let fav_a = PathBuf::from(r"C:\FavA");
+        let fav_b = PathBuf::from(r"C:\FavB");
+        db.upsert_children(
+            &fav_a,
+            &fav_a,
+            &[
+                entry(
+                    r"C:\FavA\target_subtree",
+                    "target_subtree",
+                    IndexKind::Folder,
+                ),
+                entry(r"C:\FavA\other_sibling", "other_sibling", IndexKind::Folder),
+            ],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav_b,
+            &fav_b,
+            &[entry(r"C:\FavB\x", "x", IndexKind::Folder)],
+        )
+        .unwrap();
+        assert_eq!(db.total_count().unwrap(), 3);
+
+        // 全行が cutoff より古い状態で prune を呼ぶ
+        let cutoff = next_write_stamp();
+        db.prune_stale_under_subtree(&fav_a, &PathBuf::from(r"C:\FavA\target_subtree"), cutoff)
+            .unwrap();
+
+        // target_subtree のみが消え、other_sibling と FavB は残る
+        assert!(
+            db.search("target_subtree", &[], crate::search_query::MatchMode::And)
+                .unwrap()
+                .is_empty(),
+            "target_subtree は消えるべき"
+        );
+        assert_eq!(
+            db.search("other_sibling", &[], crate::search_query::MatchMode::And)
+                .unwrap()
+                .len(),
+            1,
+            "subtree 外の sibling は残る"
+        );
+        assert_eq!(
+            db.search("x", &[], crate::search_query::MatchMode::And)
+                .unwrap()
+                .len(),
+            1,
+            "他 favorite は巻き込まれない"
+        );
+    }
+
+    #[test]
+    fn prune_stale_under_subtree_drive_root_safety() {
+        // root_path が drive root (`C:\`) のとき、prefix が二重 '/' にならず正しくマッチ
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\");
+        db.upsert_children(&fav, &fav, &[entry(r"C:\foo", "foo", IndexKind::Folder)])
+            .unwrap();
+        // 古い stamp の行を残したまま、新しい cutoff で prune
+        let cutoff = next_write_stamp();
+        let n = db.prune_stale_under_subtree(&fav, &fav, cutoff).unwrap();
+        assert_eq!(n, 1, "drive root でも prefix が正しくマッチする");
     }
 }

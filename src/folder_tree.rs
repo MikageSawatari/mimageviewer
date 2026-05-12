@@ -262,17 +262,22 @@ fn last_descendant_dir(path: &Path) -> PathBuf {
 
 /// path 以下のすべてのサブフォルダ（path 自身を含む）を再帰的に収集する。
 pub fn walk_dirs_recursive(path: &Path, out: &mut Vec<PathBuf>, cancel: &AtomicBool) {
-    walk_dirs_recursive_with_progress(path, out, cancel, &mut |_| {});
+    walk_dirs_recursive_with_progress(path, out, cancel, &mut |_| {}, &mut |_, _| {});
 }
 
 /// `walk_dirs_recursive` の進捗通知付きバージョン。
 /// 訪問するディレクトリごとに `on_visit(path)` を呼ぶ。
-/// 呼び出し側でスロットリング (時間ベースのフィルタ等) を行う想定。
+/// `read_dir` 失敗時は `on_error(path, &err)` を呼ぶ (汎用 DFS なのでこの関数自体は
+/// log を出さず、callback を経由して呼び出し側が用途別に判断する。鳥小屋論理を
+/// `name_bulk_indexer` 等の利用者に集中させ、他用途 (キャッシュ作成等) には影響させない
+/// ため — Codex P2 レビュー指摘)。`on_visit` 同様にスロットリング (rate limit) は
+/// 呼び出し側の責務。
 pub fn walk_dirs_recursive_with_progress(
     path: &Path,
     out: &mut Vec<PathBuf>,
     cancel: &AtomicBool,
     on_visit: &mut dyn FnMut(&Path),
+    on_error: &mut dyn FnMut(&Path, &std::io::Error),
 ) {
     if cancel.load(Ordering::Relaxed) {
         return;
@@ -288,17 +293,26 @@ pub fn walk_dirs_recursive_with_progress(
         return;
     }
     out.push(path.to_path_buf());
-    if let Ok(entries) = std::fs::read_dir(path) {
-        for entry in entries.flatten() {
-            if cancel.load(Ordering::Relaxed) {
-                return;
-            }
-            // file_type() で GetFileAttributes syscall を避ける (scan_directory と同様)
-            let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
-            if is_dir {
-                walk_dirs_recursive_with_progress(&entry.path(), out, cancel, on_visit);
+    match std::fs::read_dir(path) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if cancel.load(Ordering::Relaxed) {
+                    return;
+                }
+                // file_type() で GetFileAttributes syscall を避ける (scan_directory と同様)
+                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                if is_dir {
+                    walk_dirs_recursive_with_progress(
+                        &entry.path(),
+                        out,
+                        cancel,
+                        on_visit,
+                        on_error,
+                    );
+                }
             }
         }
+        Err(e) => on_error(path, &e),
     }
 }
 

@@ -1672,6 +1672,81 @@ fn try_load_with_recovery(main: &Path) -> LoadOutcome {
     }
 }
 
+/// `Settings::load` 入口で main + bak1..bak10 の disk 上の状態を `settings.log` に
+/// 1 ブロック append する。各ファイルの size / mtime / `read()` の即時試行結果を
+/// 1 行ずつ書く。クラッシュ → 再起動で「全 NotFound 落ち」が再発したとき、
+/// 「load 試行時に何が disk 上にあったか」を後から検証するための診断ログ。
+///
+/// 出力例:
+/// ```text
+/// [ts] settings: load disk snapshot:
+/// [ts]   main settings.json: size=4166542 mtime=... read=Ok
+/// [ts]   bak1: size=4166431 mtime=... read=Ok
+/// [ts]   bak2: missing
+/// ...
+/// ```
+fn log_disk_snapshot(main: &Path) {
+    settings_diag_log("settings: load disk snapshot:");
+    log_one_file_snapshot("main settings.json", main);
+    for n in 1..=BACKUP_COUNT {
+        log_one_file_snapshot(&format!("bak{n}"), &backup_path(main, n));
+    }
+}
+
+fn log_one_file_snapshot(label: &str, path: &Path) {
+    let meta = std::fs::metadata(path);
+    let read_kind = match std::fs::File::open(path) {
+        Ok(_) => "Ok".to_string(),
+        Err(e) => format!("Err({:?})", e.kind()),
+    };
+    match meta {
+        Ok(m) => {
+            let mtime = m
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(-1);
+            settings_diag_log(&format!(
+                "settings:   {label}: size={} mtime_unix={} read={read_kind}",
+                m.len(),
+                mtime
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            settings_diag_log(&format!("settings:   {label}: missing"));
+        }
+        Err(e) => {
+            settings_diag_log(&format!(
+                "settings:   {label}: metadata Err({:?}) read={read_kind}",
+                e.kind()
+            ));
+        }
+    }
+}
+
+/// `main` (settings.json) または `bak1..bak{BACKUP_COUNT}` のうち、いずれか 1 つでも
+/// ディスク上に **ファイルとして実在** するかを返す。
+///
+/// `Settings::load` で「全 load 失敗 → built-in default」に落ちたとき、これが `true`
+/// なら「真の初回起動ではない」と判断し、save 抑止フラグを立てて世代ローテで bak が
+/// 空 default に押し出されるのを防ぐ。
+///
+/// `try_parse_settings_file` が `NotFound` を返したパスでも、ここで `metadata()` を呼べば
+/// 別 API なので Windows のロック / share violation 由来の偽 NotFound と区別できる
+/// (= `std::fs::read` が NotFound と言っても `std::fs::metadata` は別経路を辿る)。
+fn any_settings_file_exists(main: &Path) -> bool {
+    if std::fs::metadata(main).is_ok() {
+        return true;
+    }
+    for n in 1..=BACKUP_COUNT {
+        if std::fs::metadata(backup_path(main, n)).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
 /// 世代バックアップを 1 段ずらす。`bak{N}` を捨て、`bakN-1 -> bakN` …
 /// 最後に `settings.json -> bak1` で現状を退避する。本関数は **メインを書き込む前**
 /// に呼ぶ前提 (= 実行後 main は存在しなくなるが、続く `write_atomic` が新ファイルを作る)。
@@ -1802,6 +1877,11 @@ impl Settings {
 
     pub fn load() -> Self {
         let path = Self::settings_path();
+        // **クラッシュ事後解析用**: load 入口で main + bak1..bak10 の disk 上の現状を
+        // settings.log に append する。「全 NotFound 落ち」事故が再発した時に、
+        // ロード時点で本当に disk からファイルが消えていたか / ファイルはあるが
+        // 偽 NotFound で弾かれたかを後から特定できる。
+        log_disk_snapshot(&path);
         // メインがパース可能ならそのまま、壊れていれば main を quarantine してから
         // bak1..bak{BACKUP_COUNT} を新→古で順試行する。全滅したら Default。
         let outcome = try_load_with_recovery(&path);
@@ -1818,6 +1898,21 @@ impl Settings {
             settings_diag_log(
                 "settings: no readable settings/backup found; using built-in default",
             );
+            // 2026-05-12 復元事故対応: 「main + bak1..bak10 が **全部 NotFound 扱い**」で
+            // built-in default に落ちたが実際にはディスク上に bak ファイルが残っている、
+            // というエッジケース (クラッシュ直後の再起動で antivirus / share violation 等が
+            // `ErrorKind::NotFound` にマップされる Windows 特有の挙動と推定) を検知して
+            // **このセッションでの save を抑止する**。これで世代ローテで bak が空 default に
+            // 押し出される事故を防ぐ。
+            //
+            // 「真の初回起動」は main も bak1..bak10 も実在しないので、ここで抑止フラグは
+            // 立たず、通常通り save が走って初期 settings.json が作られる。
+            if any_settings_file_exists(&path) {
+                MAIN_UNREADABLE_THIS_SESSION.store(true, Ordering::Relaxed);
+                settings_diag_log(
+                    "settings: backup files exist on disk; suppressing save() for this session to protect them",
+                );
+            }
             Self::default()
         });
 
@@ -2073,13 +2168,34 @@ impl Settings {
         // ウィンドウ位置・動画再生位置などランタイム書込みで頻繁に save() が
         // 呼ばれるため、毎回ローテートすると bak が即座に流れて 10 世代の
         // 安全網が無効化されてしまう。1 起動 = 1 世代のスナップショットに留める。
-        if !BACKUP_DONE_THIS_SESSION.swap(true, Ordering::Relaxed) {
+        let did_rotate = if !BACKUP_DONE_THIS_SESSION.swap(true, Ordering::Relaxed) {
             rotate_backups(&path);
-        }
+            true
+        } else {
+            false
+        };
 
-        if let Err(e) = write_atomic(&path, json.as_bytes()) {
-            eprintln!("settings save failed: {} ({})", path.display(), e);
-            settings_diag_log(&format!("settings: save failed {}: {}", path.display(), e));
+        match write_atomic(&path, json.as_bytes()) {
+            Ok(()) => {
+                // **クラッシュ事後解析用**: 各 save の完了を 1 行で settings.log に append。
+                // クラッシュ → 再起動した場合に「最後の save 完了は何時、size 何 byte だったか」
+                // を診断できる (= 起動時の disk snapshot と突き合わせて、save 完了後に何が
+                // 壊れたかを切り分けられる)。`did_rotate` で世代ローテーションが
+                // この save で走ったかも記録する。
+                settings_diag_log(&format!(
+                    "settings: save ok: bytes={} favorites={} rotated={did_rotate}",
+                    json.len(),
+                    snapshot.favorites.len(),
+                ));
+            }
+            Err(e) => {
+                eprintln!("settings save failed: {} ({})", path.display(), e);
+                settings_diag_log(&format!(
+                    "settings: save failed {}: {} (rotated={did_rotate})",
+                    path.display(),
+                    e
+                ));
+            }
         }
     }
 
@@ -3152,6 +3268,77 @@ mod tests {
             bak1_after.favorites[0].name, "from_bak1",
             "bak1 must not be rotated by suppressed save()"
         );
+    }
+
+    /// 2026-05-12 復元事故回帰: 「main + bak1..bak10 が全部 load 失敗 (NotFound や
+    /// ParseError 等) → built-in default に落ちる」エッジケースで、**bak ファイルが
+    /// ディスク上に実在しているなら save を抑止する** ことを固定する。
+    ///
+    /// 旧実装は `main_unreadable=false` (main が NotFound 扱いだと立たない) のままで
+    /// save が走り、世代ローテで本物の bak が空 default に押し出される事故が起きた。
+    /// 修正後は `any_settings_file_exists()` でディスク実在を別判定し、1 つでもあれば
+    /// 抑止する。
+    #[test]
+    fn all_load_failed_with_existing_baks_suppresses_save() {
+        let _env = setup_backup_env();
+        let main_path = Settings::settings_path();
+        std::fs::create_dir_all(main_path.parent().unwrap()).unwrap();
+
+        // main は不在 (= NotFound)、bak1..bak3 は壊れた JSON (= ParseError)。
+        // ※ ParseError でも `try_load_with_recovery` は recovery 失敗で skip するだけで、
+        //   bak 自体は disk に残る (Codex P2 2026-05-09: 壊れた bak は放置でローテ任せ)。
+        let original_bak_contents = b"{ this is not json";
+        for n in 1..=3 {
+            std::fs::write(backup_path(&main_path, n), original_bak_contents).unwrap();
+        }
+
+        // load → 全 ParseError 経由で settings = None → default フォールバック
+        let _loaded = Settings::load();
+
+        // 直後の明示的 save() が抑止されることを確認 (= MAIN_UNREADABLE_THIS_SESSION が
+        // 立っている)。
+        let mut later = Settings::default();
+        later.add_favorite("post_load".to_string(), PathBuf::from(r"C:\post"));
+        later.save();
+        assert!(
+            !main_path.exists(),
+            "save() must be suppressed when all loads failed but bak files exist on disk"
+        );
+
+        // bak ファイルもそのまま (= rotate されていない)。
+        for n in 1..=3 {
+            let bak = backup_path(&main_path, n);
+            assert!(bak.is_file(), "bak{n} should remain on disk");
+            let raw = std::fs::read(&bak).unwrap();
+            assert_eq!(
+                raw, original_bak_contents,
+                "bak{n} content must not be touched by suppressed save()"
+            );
+        }
+    }
+
+    /// 「真の初回起動」(= main も bak1..bak10 も実在しない) では、save 抑止は **立たない** こと。
+    /// アプリ初回インストール時に save が抑止されると初期 settings.json が作れず壊れる。
+    #[test]
+    fn pristine_first_launch_does_not_suppress_save() {
+        let _env = setup_backup_env();
+        let main_path = Settings::settings_path();
+        std::fs::create_dir_all(main_path.parent().unwrap()).unwrap();
+
+        // main も bak1..bak10 も無い状態で load
+        let loaded = Settings::load();
+        assert_eq!(loaded.favorites.len(), 0);
+
+        // save が正常に走り、settings.json が作られる
+        let mut s = loaded;
+        s.add_favorite("first_install".to_string(), PathBuf::from(r"C:\first"));
+        s.save();
+        assert!(
+            main_path.exists(),
+            "save() must work on pristine first launch (no bak files exist)"
+        );
+        let reloaded = Settings::load();
+        assert_eq!(reloaded.favorites[0].name, "first_install");
     }
 
     /// Codex P2 (#3): release ビルド (= main logger 未初期化) でも、復旧経路の

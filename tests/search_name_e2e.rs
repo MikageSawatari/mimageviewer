@@ -89,6 +89,56 @@ fn initial_bulk_indexes_folders_and_zips() {
 // notify-rs 監視 (名前索引の "continuous" 挙動 — v0.8.0 新機能の回帰ガード)
 // -----------------------------------------------------------------------
 
+/// 初期バルクで **深い** ZIP/PDF/Folder (depth 3+) が索引化されることを正方向で確認。
+///
+/// prune 系テスト (`full_scan_removes_offline_deleted_subtree` 等) が暗黙的に depth 3 を
+/// カバーしているが、「深い ZIP/PDF が初期バルク完了後の Ctrl+S で検索ヒットする」 を
+/// 主張する単独テストは無かった (Codex P2 レビュー指摘で premise 誤りを訂正)。
+/// `walk_dirs_recursive_with_progress` の再帰が将来止まったらここで検知できる。
+#[test]
+fn initial_bulk_indexes_zip_pdf_at_depth_three_or_four() {
+    let data = FixtureRoot::new();
+    let root = FixtureRoot::new();
+    // 階層構成:
+    //   root/top_marker_folder/
+    //   root/L1/mid_marker_folder/
+    //   root/L1/L2/deep_marker_folder/  (画像入り)
+    //   root/L1/L2/L3/very_deep_marker.zip
+    //   root/L1/L2/L3/very_deep_marker.pdf
+    mkdir_with_image(&root, "top_marker_folder");
+    mkdir_with_image(&root, "L1/mid_marker_folder");
+    mkdir_with_image(&root, "L1/L2/deep_marker_folder");
+    let l3 = root.mkdir("L1/L2/L3");
+    write_empty_zip(&l3.join("very_deep_marker.zip"));
+    std::fs::write(l3.join("very_deep_marker.pdf"), b"fake").expect("write pdf");
+
+    let fav = make_favorite("A", root.path());
+    let (db, handle) = start_name_index_at(data.path(), &fav);
+    wait_name_scan_done(&handle);
+
+    let roots = vec![fav.path.clone()];
+
+    let very_deep = name_index_search(&db, "very_deep_marker", &roots);
+    assert_eq!(
+        very_deep.len(),
+        2,
+        "depth-4 の very_deep_marker.{{zip,pdf}} が 2 件ヒットすべき (got {very_deep:?})"
+    );
+    let kinds: Vec<IndexKind> = very_deep.iter().map(|e| e.kind).collect();
+    assert!(kinds.contains(&IndexKind::ZipFile));
+    assert!(kinds.contains(&IndexKind::PdfFile));
+
+    let deep_folder = name_index_search(&db, "deep_marker_folder", &roots);
+    assert_eq!(deep_folder.len(), 1, "depth-3 Folder がヒットすべき");
+    assert_eq!(deep_folder[0].kind, IndexKind::Folder);
+
+    let mid = name_index_search(&db, "mid_marker_folder", &roots);
+    assert_eq!(mid.len(), 1, "depth-2 Folder がヒットすべき");
+
+    let top = name_index_search(&db, "top_marker_folder", &roots);
+    assert_eq!(top.len(), 1, "depth-1 Folder がヒットすべき");
+}
+
 /// 初期バルク完了後に新しいサブフォルダを掘ると、watcher → supervisor → DB 反映が
 /// 動いて検索にヒットするようになること。**v0.8.0 で新設された挙動**。
 #[test]
@@ -140,6 +190,125 @@ fn watcher_indexes_new_zip() {
     );
     assert_eq!(hits.len(), 1);
     assert_eq!(hits[0].kind, IndexKind::ZipFile);
+}
+
+/// **B4 (Codex P1): 起動後に深いサブツリーを丸ごと追加すると、深い ZIP/PDF も索引化される。**
+///
+/// `apply_single_change` の再帰版が機能していることを e2e で確認。`run_subtree_scan` が
+/// changed_path 配下を再帰的に enumerate して各フォルダの直接子を `upsert_children` する。
+#[test]
+fn watcher_indexes_deep_subtree_added_after_initial() {
+    let data = FixtureRoot::new();
+    let root = FixtureRoot::new();
+    mkdir_with_image(&root, "preexisting_init");
+
+    let fav = make_favorite("A", root.path());
+    let (db, handle) = start_name_index_at(data.path(), &fav);
+    wait_name_scan_done(&handle);
+
+    // 起動後に深いサブツリーを丸ごと作る (= ユーザーが Explorer で subtree をペーストした
+    // 状況の擬似)
+    let deep = root.path().join("new_top_xyz9").join("mid").join("deep");
+    std::fs::create_dir_all(&deep).expect("mkdir -p deep");
+    write_empty_zip(&deep.join("very_deep_marker_added.zip"));
+    std::fs::write(deep.join("very_deep_marker_added.pdf"), b"fake").expect("write pdf");
+
+    let roots = vec![fav.path.clone()];
+
+    // 深い ZIP/PDF が index に入ること
+    wait_for_name_index_hits(
+        &db,
+        "very_deep_marker_added",
+        &roots,
+        |h| h.len() >= 2,
+        FS_EVENT_TIMEOUT,
+        "name index picks up deep ZIP/PDF added after initial scan (apply_single_change recursion)",
+    );
+    // 中間フォルダもヒット
+    wait_for_name_index_hits(
+        &db,
+        "deep",
+        &roots,
+        |h| h.iter().any(|e| e.kind == IndexKind::Folder),
+        FS_EVENT_TIMEOUT,
+        "name index picks up depth-3 Folder row",
+    );
+    wait_for_name_index_hits(
+        &db,
+        "new_top_xyz9",
+        &roots,
+        |h| h.iter().any(|e| e.kind == IndexKind::Folder),
+        FS_EVENT_TIMEOUT,
+        "name index picks up depth-1 Folder row of new subtree",
+    );
+}
+
+/// **B4 (Codex P2): 深いサブツリーを丸ごと削除すると、孫 / 玄孫の Folder 行まで消える。**
+///
+/// `apply_single_change` の ancestor chain prune が機能していることを e2e で確認。
+/// 「子は消えるが孫が残る」リグレッションを CI で固定。
+#[test]
+fn watcher_prunes_deep_subtree_on_removal() {
+    let data = FixtureRoot::new();
+    let root = FixtureRoot::new();
+    mkdir_with_image(&root, "preexisting_init");
+    // 初期から深いサブツリーを置いておく
+    let deep = root.path().join("dying_top_uvw5").join("mid").join("deep");
+    std::fs::create_dir_all(&deep).expect("mkdir -p deep");
+    write_empty_zip(&deep.join("doomed_marker.zip"));
+    std::fs::write(deep.join("doomed_marker.pdf"), b"fake").expect("write pdf");
+
+    let fav = make_favorite("A", root.path());
+    let (db, handle) = start_name_index_at(data.path(), &fav);
+    wait_name_scan_done(&handle);
+
+    let roots = vec![fav.path.clone()];
+
+    // 初期バルク完了後はヒットしているはず
+    let before = name_index_search(&db, "doomed_marker", &roots);
+    assert_eq!(
+        before.len(),
+        2,
+        "初期バルクで doomed_marker.zip/pdf がヒット"
+    );
+    let mid_before = name_index_search(&db, "mid", &roots);
+    assert!(
+        mid_before.iter().any(|e| e.kind == IndexKind::Folder),
+        "mid フォルダ行が初期バルクで入っている"
+    );
+
+    // サブツリーを丸ごと削除
+    std::fs::remove_dir_all(root.path().join("dying_top_uvw5")).expect("remove deep subtree");
+
+    // doomed_marker.zip/pdf が消える
+    wait_for_name_index_hits(
+        &db,
+        "doomed_marker",
+        &roots,
+        |h| h.is_empty(),
+        FS_EVENT_TIMEOUT,
+        "name index removes deep ZIP/PDF when subtree removed",
+    );
+    // 中間フォルダ (mid / deep / dying_top_uvw5) も消える (ancestor chain prune)
+    wait_for_name_index_hits(
+        &db,
+        "dying_top_uvw5",
+        &roots,
+        |h| h.is_empty(),
+        FS_EVENT_TIMEOUT,
+        "name index removes depth-1 Folder row (ancestor chain prune)",
+    );
+    wait_for_name_index_hits(
+        &db,
+        "deep",
+        &roots,
+        |h| {
+            !h.iter()
+                .any(|e| e.path.starts_with(root.path().join("dying_top_uvw5")))
+        },
+        FS_EVENT_TIMEOUT,
+        "name index removes deep Folder row of dying subtree",
+    );
 }
 
 /// 初期バルクでヒットしていたフォルダを削除すると、索引からも消える。

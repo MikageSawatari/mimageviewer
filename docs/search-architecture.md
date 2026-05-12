@@ -206,14 +206,16 @@ idle になった最初のフレームで `spawn_housekeeping` から別スレ�
 NameIndexSupervisor (1 お気に入り 1 本):
   1. name_bulk_indexer::run_bulk_name_index  …… フォルダ / ZIP / PDF の再帰列挙
   2. SearchIndexDb::upsert_children で差分反映 (INSERT OR REPLACE)
-  3. FsWatcher でイベント受信 → 影響 parent フォルダだけ再列挙して upsert
+  3. FsWatcher でイベント受信 → name_index_supervisor::apply_single_change が
+     try_exists() ベースで判定し、新規ディレクトリなら subtree 再帰 upsert、
+     削除なら ancestor chain prune + delete_subtree を実行 (詳細は §4.5)
 ```
 
 - メタ側と違い書き込み先が SQLite 単独なので複数お気に入りの supervisor は
   真の並列で動ける (Tantivy writer 単一制約がない)。
 - 画像個別は扱わない (画像の名前は Ctrl+F / Ctrl+G 側で拾う)。
 
-### 4.5 FsWatcher と debounce
+### 4.5 FsWatcher と debounce、`apply_single_change` の挙動
 
 [search_watcher.rs](../src/search_watcher.rs):
 
@@ -222,8 +224,55 @@ NameIndexSupervisor (1 お気に入り 1 本):
 - rename は Windows で `Modify(Name(From))` + `Modify(Name(To))` として届くため
   `absorb_event` が From を `ChangeKind::Remove`、To を `ChangeKind::Upsert` に
   分ける (単一の `Modify(_) → Upsert` にすると rename 元が削除されず残る)。
-  保険として `indexer_supervisor::apply_single_change` の Upsert 分岐でも
-  「メタ取得不可 = 削除」にフォールバック。
+
+#### `apply_single_change` の判定経路 (v0.9.x B4 改訂、Codex レビュー反映)
+
+旧実装は「changed_path の **親フォルダ** を `read_dir` して `upsert_children`」
+の 1 経路だけだった。これだと:
+
+- 起動後に深いサブツリーをコピー / 移動した場合、watcher overflow や個別イベント
+  欠落で「上位イベントだけ届く」と深い ZIP/PDF が索引に入らない (Codex P1)
+- 深い `marker.zip` の Remove イベントだけ届くと、`new_top/mid/deep` の Folder 行が
+  stale 残留する (`upsert_children` の DELETE は親直下しか触らない)
+- `read_dir(parent)` の `Err` を「親まるごと削除」と即断していたため、アクセス拒否 /
+  一時ロック / NAS 切断で正当な行が消える事故が起き得る
+
+これを以下の経路に再設計:
+
+1. **favorite 境界チェック**: `changed_path` が `favorite_root` 配下でなければ no-op
+2. **`changed_path.try_exists()` を唯一の削除判定にする** (`kind` はヒント / ログ用):
+   - **`Ok(false)`** → ancestor chain を辿り、`favorite_root` 手前まで親を順に確認。
+     `Ok(false)` で繋がる連鎖の **最も浅い missing 祖先** を `delete_subtree` の対象に
+     (`new_top` 全部消えたなら `new_top` 自体を一発 prune)。
+     `changed_path == favorite_root` で `Ok(false)` のときは `clear_for_favorite` で全消し
+   - **`Ok(true)`** → `scan_start = next_write_stamp()` を **最初に** 取得 (post-scan
+     prune が `changed_path` 自身を stale と誤判定しないため)。
+     `changed_path != favorite_root` なら parent refresh
+     (`upsert_children` で sibling 整合)。`is_dir()` なら `run_subtree_scan` で
+     `changed_path` から再帰的に各フォルダ直下を `upsert_children`。scan が
+     `SubtreeScanOutcome::Completed` の場合のみ `prune_stale_under_subtree` を呼び、
+     fast delete → recreate (子孫が減る) ケースの stale 孫行を掃除する。
+     `changed_path == favorite_root` のときは parent refresh を **skip**
+     (`favorite_root.parent()` は favorite 配下外なので、そこを upsert すると sibling
+     フォルダを fav の行として誤投入する事故になる)
+   - **`Err(e)`** → アクセス拒否 / 一時ロック / NAS 切断などの曖昧状態。
+     `crate::logger::log` に warn を残し、**破壊的 cleanup も再帰 upsert も
+     一切走らせない**。次回 watcher イベント / 次回起動時 walker 3-way diff が拾い直す
+
+3. **subtree scan の不完全観測時は post-scan prune を skip**:
+   `run_subtree_scan` は cancel / read_dir error / upsert error を `SubtreeScanOutcome::Cancelled`
+   または `SubtreeScanOutcome::Errored` で返す。`Completed` 以外では `prune_stale_under_subtree`
+   は実行されない (フル scan が `cancelled` 時に prune skip するのと同じポリシー)
+
+`SearchIndexDb` 側の関連メソッド ([src/search_index_db.rs](../src/search_index_db.rs)):
+
+- `delete_subtree(favorite_root, root_path)`: `root_path` 自身と配下を `favorite_root`
+  スコープで一括削除。境界判定は `LIKE` を使わず `subtree_bounds()` ヘルパで構築した
+  trailing-slash 付き prefix を `substr` 比較するので、path に `%` `_` 等の wildcard 文字が
+  含まれていても誤削除されない。
+- `prune_stale_under_subtree(favorite_root, root_path, cutoff)`: 同じ境界判定 +
+  `updated_at < cutoff` を AND。subtree scope の stale 行のみ削除。`Completed` outcome の
+  ときだけ呼ぶ (不完全観測で正当な行を消さないため)。
 
 SMB / NAS では `ReadDirectoryChangesW` が発火しないケースがあるので、将来は
 ポーリング fallback を足す想定 (§7.2)。現状は手動再構築ダイアログで代用。
