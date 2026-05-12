@@ -501,6 +501,12 @@ native overlay から UI thread へ戻るコマンドの App 側 dispatch は
 event channel で App に通知し、App 側がシーク、ブックマーク、ピン、VST3 操作、
 外部 URL open などの状態更新を行う。
 
+VST3 再生中パネルは `egui::Area::movable(true)` で overlay 内をドラッグできる。
+ドラッグ終了時は native overlay command として UI thread へ戻し、
+`settings.vst3_panel_pos` に logical points の左上位置を保存する。復元時は現在の
+overlay bounds に clamp するため、解像度・DPI・モニター構成が変わっても画面外に
+取り残さない。
+
 ネイティブ DComp 経路を採用した理由:
 
 - eframe の `show_viewport_immediate` で借りる winit ビューポートは DWM 合成下で

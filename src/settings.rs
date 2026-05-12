@@ -895,6 +895,10 @@ pub struct Settings {
     /// true: 動画を右上 1/4 (幅・高さ各 1/2 = 面積 1/4) に縮小、左下 3/4 はプラグイン GUI 用に空く。
     #[serde(default)]
     pub vst3_video_compact: bool,
+    /// 動画再生中 VST3 パネルの左上位置 (viewport/native overlay 内の logical points)。
+    /// 解像度・DPI・モニター構成変更で画面外になる場合は、表示時に画面内へ clamp する。
+    #[serde(default)]
+    pub vst3_panel_pos: Option<[f32; 2]>,
     #[serde(default)]
     pub vst3_chain_slots: Vst3ChainPresetSlots,
 
@@ -1419,6 +1423,7 @@ impl Default for Settings {
             vst3_plugin_state: None,
             vst3_gui_visible: true,
             vst3_video_compact: false,
+            vst3_panel_pos: None,
             vst3_chain_slots: Vst3ChainPresetSlots::default(),
             audio_normalize_enabled: false,
             audio_normalize_target_lufs_milli: default_audio_normalize_target_lufs_milli(),
@@ -2120,9 +2125,10 @@ impl Settings {
         self.vst3_plugin_path = src.vst3_plugin_path.take();
         self.vst3_plugin_state = src.vst3_plugin_state.take();
         // `vst3_gui_visible` は VST ボタン runtime トグルで変わるので App 側を保つ。
-        // `vst3_video_compact` も同様 (= プレイバックパネルで切替)。
+        // `vst3_video_compact` / `vst3_panel_pos` も同様 (= プレイバックパネルで切替)。
         self.vst3_gui_visible = src.vst3_gui_visible;
         self.vst3_video_compact = src.vst3_video_compact;
+        self.vst3_panel_pos = src.vst3_panel_pos;
         self.vst3_chain_slots = std::mem::take(&mut src.vst3_chain_slots);
     }
 
@@ -2718,11 +2724,13 @@ mod tests {
     fn vst3_chain_slots_default_when_missing() {
         let loaded: Settings = serde_json::from_str("{}").unwrap();
         assert!(loaded.vst3_chain_slots.slots.iter().all(Option::is_none));
+        assert_eq!(loaded.vst3_panel_pos, None);
     }
 
     #[test]
     fn vst3_chain_slots_roundtrip() {
         let mut settings = Settings::default();
+        settings.vst3_panel_pos = Some([123.0, 456.0]);
         settings.vst3_chain_slots.slots[0] = Some(Vst3ChainPresetSlot {
             name: "Mix".to_string(),
             plugins: vec![Vst3PluginEntry {
@@ -2739,6 +2747,7 @@ mod tests {
 
         let json = serde_json::to_string(&settings).unwrap();
         let loaded: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.vst3_panel_pos, Some([123.0, 456.0]));
         let slot = loaded.vst3_chain_slots.slots[0].as_ref().unwrap();
         assert_eq!(slot.name, "Mix");
         assert!(!slot.gui_visible);

@@ -83,6 +83,34 @@ fn vst3_gui_visibility_button(ui: &mut egui::Ui, visible: bool) -> egui::Respons
     response
 }
 
+fn finite_vst3_panel_pos(pos: [f32; 2]) -> Option<egui::Pos2> {
+    if pos[0].is_finite() && pos[1].is_finite() {
+        Some(egui::pos2(pos[0], pos[1]))
+    } else {
+        None
+    }
+}
+
+fn clamp_vst3_panel_pos_to_rect(
+    pos: egui::Pos2,
+    size: egui::Vec2,
+    bounds: egui::Rect,
+) -> egui::Pos2 {
+    let max_x = (bounds.max.x - size.x).max(bounds.min.x);
+    let max_y = (bounds.max.y - size.y).max(bounds.min.y);
+    egui::pos2(
+        pos.x.clamp(bounds.min.x, max_x),
+        pos.y.clamp(bounds.min.y, max_y),
+    )
+}
+
+fn vst3_panel_pos_changed(saved: Option<[f32; 2]>, actual: egui::Pos2) -> bool {
+    saved
+        .and_then(finite_vst3_panel_pos)
+        .map(|pos| (pos - actual).length_sq() > 0.25)
+        .unwrap_or(true)
+}
+
 impl App {
     pub(crate) fn show_vst3_manager(&mut self, ctx: &egui::Context) {
         if !self.show_vst3_manager {
@@ -113,7 +141,15 @@ impl App {
         // **位置は固定 ID で永続化** (= 旧版で RichText タイトルを使ったため Window の
         // 内部 ID がフレームごとに変動し、ドラッグ位置が記憶されず 1 フレームごとに
         // ずれてしまうユーザー報告に対応)。
-        let initial_pos = ctx.content_rect().min + egui::vec2(60.0, 60.0);
+        let fallback_pos = ctx.content_rect().min + egui::vec2(60.0, 60.0);
+        let saved_pos = self.settings.vst3_panel_pos.and_then(finite_vst3_panel_pos);
+        let estimated_size = egui::vec2(280.0, 360.0);
+        let initial_pos = saved_pos
+            .map(|pos| clamp_vst3_panel_pos_to_rect(pos, estimated_size, ctx.content_rect()))
+            .unwrap_or(fallback_pos);
+        let saved_pos_was_clamped = saved_pos
+            .map(|pos| (pos - initial_pos).length_sq() > 0.25)
+            .unwrap_or(false);
 
         // ── タイトルバー含めた全体の dark Frame ──
         // egui::Window のタイトルバーは ctx.style() の visuals を使うため、
@@ -128,7 +164,7 @@ impl App {
         );
         let frame = egui::Frame::window(&ctx.style()).fill(bg).stroke(stroke);
 
-        egui::Window::new("VST3")
+        let window_response = egui::Window::new("VST3")
             .id(egui::Id::new("vst3-playback-panel"))
             .frame(frame)
             .open(&mut open)
@@ -425,6 +461,16 @@ impl App {
                 .color(egui::Color32::from_rgb(160, 160, 160)),
             );
         });
+
+        if let Some(inner) = window_response {
+            let actual_pos = inner.response.rect.min;
+            if (inner.response.drag_stopped() || saved_pos_was_clamped)
+                && vst3_panel_pos_changed(self.settings.vst3_panel_pos, actual_pos)
+            {
+                self.settings.vst3_panel_pos = Some([actual_pos.x, actual_pos.y]);
+                self.settings.save();
+            }
+        }
 
         // ── ボタンクリック処理 (Window closure 外で実行 = self の借用解放後) ──
         // bridge への命令は **bridge slot idx**、settings 検索は **plugin_path** で行う。

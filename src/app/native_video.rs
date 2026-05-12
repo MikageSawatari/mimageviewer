@@ -556,6 +556,11 @@ impl App {
                 self.sync_native_video_vst3_panel(fs_idx);
                 self.mark_native_video_hud_activity(ctx);
             }
+            crate::video::NativeVideoOutputEvent::SetVst3PanelPos { pos } => {
+                self.set_native_video_vst3_panel_pos(pos);
+                self.sync_native_video_vst3_panel(fs_idx);
+                self.mark_native_video_hud_activity(ctx);
+            }
             crate::video::NativeVideoOutputEvent::Vst3ShowSlotGui { idx, path } => {
                 self.show_native_video_vst3_slot_gui(idx, path);
                 self.sync_native_video_vst3_panel(fs_idx);
@@ -1806,6 +1811,7 @@ impl App {
         Some(NativeOverlayVst3Panel {
             visible: true,
             video_compact: self.settings.vst3_video_compact,
+            panel_pos: self.settings.vst3_panel_pos,
             state_text,
             disabled_reason,
             slots,
@@ -2636,6 +2642,23 @@ impl App {
             return;
         }
         self.settings.vst3_video_compact = compact;
+        self.settings.save();
+    }
+
+    #[cfg(windows)]
+    pub(super) fn set_native_video_vst3_panel_pos(&mut self, pos: [f32; 2]) {
+        if !pos[0].is_finite() || !pos[1].is_finite() {
+            return;
+        }
+        let changed = self
+            .settings
+            .vst3_panel_pos
+            .map(|prev| (prev[0] - pos[0]).hypot(prev[1] - pos[1]) > 0.5)
+            .unwrap_or(true);
+        if !changed {
+            return;
+        }
+        self.settings.vst3_panel_pos = Some(pos);
         self.settings.save();
     }
 

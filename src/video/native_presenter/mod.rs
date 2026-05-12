@@ -439,6 +439,7 @@ pub struct NativeOverlayMetadata {
 pub struct NativeOverlayVst3Panel {
     pub visible: bool,
     pub video_compact: bool,
+    pub panel_pos: Option<[f32; 2]>,
     pub state_text: String,
     pub disabled_reason: Option<String>,
     pub slots: Vec<NativeOverlayVst3Slot>,
@@ -616,6 +617,9 @@ pub enum NativeOverlayCommand {
     },
     SetVst3VideoCompact {
         compact: bool,
+    },
+    SetVst3PanelPos {
+        pos: [f32; 2],
     },
     Vst3ShowSlotGui {
         idx: usize,
@@ -3899,11 +3903,9 @@ impl NativeEguiOverlay {
                     ));
                 }
                 if vst3_panel_visible && let Some(panel) = vst3_panel.as_ref() {
-                    excluded_rects.push(native_vst3_panel_rect(
-                        overlay_width_points,
-                        overlay_height_points,
-                        panel,
-                    ));
+                    excluded_rects.push(last_drawn_vst3_panel_rect.unwrap_or_else(|| {
+                        native_vst3_panel_rect(overlay_width_points, overlay_height_points, panel)
+                    }));
                 }
                 last_drawn_paused_center_rects = draw_native_center_pause_controls(
                     ctx,

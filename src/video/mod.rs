@@ -253,6 +253,9 @@ pub enum NativeVideoOutputEvent {
     SetVst3VideoCompact {
         compact: bool,
     },
+    SetVst3PanelPos {
+        pos: [f32; 2],
+    },
     Vst3ShowSlotGui {
         idx: usize,
         path: String,
@@ -1135,6 +1138,7 @@ fn send_native_overlay_command(
         Command::SetVst3VideoCompact { compact } => {
             NativeVideoOutputEvent::SetVst3VideoCompact { compact }
         }
+        Command::SetVst3PanelPos { pos } => NativeVideoOutputEvent::SetVst3PanelPos { pos },
         Command::Vst3ShowSlotGui { idx, path } => {
             NativeVideoOutputEvent::Vst3ShowSlotGui { idx, path }
         }
@@ -1782,6 +1786,15 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::SetVst3VideoCompact { compact },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SetVst3PanelPos {
+                                pos,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SetVst3PanelPos { pos },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::Vst3ShowSlotGui {

@@ -149,6 +149,9 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 - 動画音量は既定 100%。下部 HUD / Shift+↑↓ / 環境設定から 0〜150% で手動調整でき、
   音量バーの右クリックまたはダブルクリックで 100% に戻せる。100% 超の boost 部分は
   HUD で黄色表示し、音声ポンプ側の safety limiter を通す。
+- VST3 が有効なとき、動画再生中の VST3 パネルからチェーンの ON/OFF、個別 GUI 表示、
+  動画の右上 1/4 表示を切り替えられる。パネル位置はドラッグ終了時に保存され、
+  次回表示時に復元する。解像度やモニター構成変更で画面外になる場合は画面内へ戻す。
 - 動画ブックマークは B キー / 🔖 ボタンで現在位置に追加できる。左ジャンプパネルの
   ✏ ボタンから任意名称を付けると、チャプター名と同じように行タイトルや J/K
   ジャンプ時のトーストに表示される。
@@ -409,6 +412,7 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 | `video_deinterlace` | VideoDeinterlaceMode | Auto | 動画再生時のデインターレース（Off / Auto / On）。Auto は frame interlaced flag と stream field_order を参照し、Auto/On は FFmpeg bwdif を表示前に適用 |
 | `audio_normalize_enabled` | bool | false | 動画音量ノーマライズのグローバル ON/OFF。ON のとき、open / Norm ボタン押下で per-file 測定値 (`audio_normalize.db`) を引いて -14 LUFS 相当に gain 適用 |
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |
+| `vst3_panel_pos` | Option<[f32; 2]> | None | 動画再生中 VST3 パネルの保存位置。表示時に現在の viewport/native overlay 内へクランプ |
 | `folder_thumb_depth` | u32 | 3 | フォルダ代表画像の探索最大階層数（0 で直接の子のみ） |
 | `sidecar_backup_enabled` | bool | true | フォルダ直下に `mimageviewer.dat` (Hidden+System 属性の JSON) を作り、補正・消しゴムマスクの設定をバックアップする。フォルダ丸ごと別ドライブへ移動しても設定が保持される。OFF 時は読み書き両方スキップ |
 | `show_toolbar_favorites` | bool | true | ツールバーにお気に入りを表示 |

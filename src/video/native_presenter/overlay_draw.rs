@@ -1810,9 +1810,15 @@ pub(super) fn draw_native_vst3_panel(
         egui::Pos2::ZERO,
         egui::vec2(overlay_width_points, overlay_height_points),
     );
+    let saved_pos = panel.panel_pos.and_then(finite_panel_pos);
+    let requested_pos = saved_pos.unwrap_or(rect.min);
+    let default_pos = clamp_panel_pos_to_bounds(requested_pos, rect.size(), overlay_bounds);
+    let saved_pos_was_clamped = saved_pos
+        .map(|pos| (pos - default_pos).length_sq() > 0.25)
+        .unwrap_or(false);
     let inner = egui::Area::new(egui::Id::new("native_video_vst3_panel"))
         .order(egui::Order::Foreground)
-        .default_pos(rect.min)
+        .default_pos(default_pos)
         .movable(true)
         .constrain_to(overlay_bounds)
         .show(ctx, |ui| {
@@ -1940,7 +1946,39 @@ pub(super) fn draw_native_vst3_panel(
                 });
             });
         });
+    let actual_pos = inner.response.rect.min;
+    if (inner.response.drag_stopped() || saved_pos_was_clamped)
+        && panel_pos_changed(panel.panel_pos, actual_pos)
+    {
+        commands.push(NativeOverlayCommand::SetVst3PanelPos {
+            pos: [actual_pos.x, actual_pos.y],
+        });
+    }
     Some(inner.response.rect)
+}
+
+fn finite_panel_pos(pos: [f32; 2]) -> Option<egui::Pos2> {
+    if pos[0].is_finite() && pos[1].is_finite() {
+        Some(egui::pos2(pos[0], pos[1]))
+    } else {
+        None
+    }
+}
+
+fn clamp_panel_pos_to_bounds(pos: egui::Pos2, size: egui::Vec2, bounds: egui::Rect) -> egui::Pos2 {
+    let max_x = (bounds.max.x - size.x).max(bounds.min.x);
+    let max_y = (bounds.max.y - size.y).max(bounds.min.y);
+    egui::pos2(
+        pos.x.clamp(bounds.min.x, max_x),
+        pos.y.clamp(bounds.min.y, max_y),
+    )
+}
+
+fn panel_pos_changed(saved: Option<[f32; 2]>, actual: egui::Pos2) -> bool {
+    saved
+        .and_then(finite_panel_pos)
+        .map(|pos| (pos - actual).length_sq() > 0.25)
+        .unwrap_or(true)
 }
 
 pub(super) fn draw_native_vst3_slot_row(

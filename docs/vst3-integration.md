@@ -187,8 +187,9 @@ mimageviewer-core.exe (Rust)
     -   .bypass: bool
     -   .state: Option<Base64<...>>  (= IComponent::getState chunk)
     -   .user_hidden: bool
-    -   .window_rect: Option<...>
+    -   .gui_pos / .gui_size: Option<...>
     - vst3_gui_visible: bool  (再生中パネルの全体表示状態)
+    - vst3_panel_pos: Option<[f32; 2]> (再生中パネル位置)
     - vst3_chain_slots: 10 個のチェーンプリセット
 
 bridge 子プロセス (chain bridge):
@@ -225,7 +226,7 @@ bridge 時代の遺物。`process_block` で `Arc::ptr_eq` の dedup により b
 | `src/video/dsp/scanner.rs` | VST3 plugin scan (`%COMMONPROGRAMFILES%\VST3\` 等) | **新規** (testerからポート) |
 | `src/video/dsp/gui.rs` | プラグイン GUI 用の Win32 親ウィンドウ管理 | **新規** (testerからポート) |
 | `src/video/dsp/extract.rs` | bridge exe の APPDATA 展開 (PDFium pattern) | **新規** |
-| `src/settings.rs` | VST3 設定 (`vst3_enabled`, `vst3_plugins`, `vst3_gui_visible`, `vst3_chain_slots`) | 拡張 |
+| `src/settings.rs` | VST3 設定 (`vst3_enabled`, `vst3_plugins`, `vst3_gui_visible`, `vst3_panel_pos`, `vst3_chain_slots`) | 拡張 |
 | `src/ui_dialogs/preferences.rs` | 環境設定→VST3 プラグインページ | 拡張 |
 | `src/ui_dialogs/vst3_manager.rs` | 動画再生中の VST3 プレイバックパネル | **新規** |
 | `src/video/audio.rs` | pump thread に DspBridge 経由処理を挿入 | 拡張 |
@@ -304,11 +305,13 @@ settings.json に以下を保存する:
       "bypass": false,
       "state": "<base64 of IComponent::getState() chunk>",
       "user_hidden": false,
-      "window_rect": null
+      "gui_pos": null,
+      "gui_size": null
     }
   ],
   "vst3_gui_visible": false,
   "vst3_video_compact": false,
+  "vst3_panel_pos": null,
   "vst3_chain_slots": {
     "slots": [
       {
@@ -330,9 +333,12 @@ settings.json に以下を保存する:
 - `user_hidden`: ユーザーが個別に閉じた GUI を、全体表示で再表示しないためのフラグ。
   再生中 VST3 パネルでは個別 GUI の表示状態を Bitwig 風の小さなウィンドウ枠アイコンで示し、
   表示中はオレンジ、非表示は灰色で描画する。
-- `window_rect`: plugin GUI の位置とサイズ
+- `gui_pos` / `gui_size`: plugin GUI の位置とサイズ。復元時に現在のモニター作業領域外なら
+  最近傍モニター内へ戻す。
 - `vst3_gui_visible`: 再生中パネルからの全体表示状態
 - `vst3_video_compact`: 再生中パネルの動画フル / 右上 1/4 表示状態
+- `vst3_panel_pos`: 再生中 VST3 パネル自体の位置。ドラッグ終了時に保存し、解像度や
+  モニター構成変更で画面外になる場合は表示時に overlay 内へ clamp する。
 - `vst3_chain_slots`: 再生中パネルから保存・読込する 10 個のチェーンスロット。
   各 slot は `vst3_plugins` と同じ plugin entry 配列を持つため、plugin bypass、
   `user_hidden`、state chunk、GUI 位置/サイズ、動画表示モードをまとめて復元できる。

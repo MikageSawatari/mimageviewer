@@ -848,8 +848,8 @@ fn create_window(
 
         // 初期位置: ユーザーが前回終了時に動かしたウィンドウ位置を復元する
         // (= 2026-05 ユーザー要望)。Option::None の場合は CW_USEDEFAULT (= OS 既定の
-        // カスケード配置) を使う。指定座標がモニター外でも Win32 が後段で
-        // SetWindowPos してくれるので追加クランプは不要。
+        // カスケード配置) を使う。指定座標が現在のモニター作業領域外なら、最近傍
+        // モニター内へ clamp してから CreateWindowExW に渡す。
         let (init_x, init_y) = match initial_pos {
             Some((x, y)) => clamp_rect_origin_to_nearest_work_area(x, y, outer_w, outer_h),
             None => (CW_USEDEFAULT, CW_USEDEFAULT),
