@@ -1632,39 +1632,42 @@ impl App {
 
                 // 進捗/結果バッジ。ドロップダウン群より前に置くことで、幅が狭い
                 // ウィンドウでも検索中状態が右端へ押し出されにくくなる。
-                ui.separator();
-                if let Some(msg) = &self.global_search.reject_message {
-                    ui.label(
-                        egui::RichText::new(msg)
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(200, 120, 40)),
-                    );
+                let status = if let Some(msg) = &self.global_search.reject_message {
+                    Some((msg.clone(), egui::Color32::from_rgb(200, 120, 40), None))
                 } else if self.global_search.is_searching() {
-                    let text = format!("{} 件（検索中）", self.global_search.total_valid);
-                    ui.label(
-                        egui::RichText::new(text)
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(180, 180, 80)),
-                    )
-                    .on_hover_text(format!(
-                        "候補 {} 件を確認済み",
-                        self.global_search.total_scanned
-                    ));
+                    Some((
+                        format!("ヒット {} 件（検索中）", self.global_search.total_valid),
+                        egui::Color32::from_rgb(180, 180, 80),
+                        Some(format!(
+                            "候補 {} 件を確認済み。アドレス欄の件数はヒットを含むコンテナ数です。",
+                            self.global_search.total_scanned
+                        )),
+                    ))
                 } else if self.global_search.done {
-                    let text = if self.global_search.truncated {
-                        format!(
-                            "{} 件で打ち切り (絞り込みキーワードを追加してください)",
-                            self.global_search.total_valid
+                    let (text, color) = if self.global_search.truncated {
+                        (
+                            format!(
+                                "ヒット {} 件で打ち切り (絞り込みキーワードを追加してください)",
+                                self.global_search.total_valid
+                            ),
+                            egui::Color32::from_rgb(200, 140, 40),
                         )
                     } else {
-                        format!("{} 件", self.global_search.total_valid)
+                        (
+                            format!("ヒット {} 件", self.global_search.total_valid),
+                            egui::Color32::from_gray(140),
+                        )
                     };
-                    let color = if self.global_search.truncated {
-                        egui::Color32::from_rgb(200, 140, 40)
-                    } else {
-                        egui::Color32::from_gray(140)
-                    };
-                    ui.label(egui::RichText::new(text).size(11.0).color(color));
+                    Some((text, color, None))
+                } else {
+                    None
+                };
+                if let Some((text, color, hover)) = status {
+                    ui.separator();
+                    let response = ui.label(egui::RichText::new(text).size(11.0).color(color));
+                    if let Some(hover) = hover {
+                        response.on_hover_text(hover);
+                    }
                 }
 
                 // ── 絞り込みドロップダウン (§19.7) ──

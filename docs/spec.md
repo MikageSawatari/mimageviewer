@@ -661,7 +661,7 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - [x] Searcher snapshot 固定 + ページング取得 (`TopDocs::with_limit(500).and_offset()`)
 - [x] post-filter で phrase / NOT / AND を正確判定 (bigram だけでは position=0 で不正確なため)
 - [x] HARD_MAX=10,000 で打ち切り (streaming で逐次表示、最初のページは ~5ms)
-- [x] Ctrl+G 検索中表示 (検索バーの件数、アドレス欄、0 件表示前の空グリッドで未確定状態を明示)
+- [x] Ctrl+G 検索中表示 (検索バーのヒット件数、アドレス欄、0 件表示前の空グリッドで未確定状態を明示)
 - [x] Ctrl+G drill-down view (SearchContainer クリックでコンテナ内ヒット一覧に遷移、BS/← で戻る)
 - [x] **Ctrl+F を worker 上のオンデマンド検索に統一** (PNG / EXIF / XMP / PDF info / 動画メタ / タグを target に応じて読む)
 - [x] `FavoriteEntry` に `id: Uuid` + `auto_index_{structure,metadata,thumbs}` 3 フラグ追加
