@@ -764,6 +764,11 @@ pub(crate) fn hud_debug_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("MIV_HUD_DEBUG").is_some())
 }
 
+fn hud_repaint_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MIV_HUD_DEBUG_REPAINT").is_some())
+}
+
 impl NativeVideoPresenter {
     pub fn new(config: NativePresenterConfig) -> Result<Self, String> {
         unsafe {
@@ -4616,6 +4621,10 @@ impl NativeEguiOverlay {
                                 .on_hover_text("再生速度 (右クリック / ダブルクリックで x1)");
                         }
                         if video_speed_popup_open {
+                            use crate::video::clock::{
+                                PLAYBACK_SPEED_CHOICES, format_playback_speed,
+                            };
+
                             let popup_w = 356.0_f32.min((overlay_width_points - 16.0).max(180.0));
                             let popup_h = 74.0;
                             let popup_x = (speed_rect.center().x - popup_w * 0.5)
@@ -4640,15 +4649,10 @@ impl NativeEguiOverlay {
                                             .show(ui, |ui| {
                                                 ui.set_min_width(popup_w - 12.0);
                                                 ui.horizontal_wrapped(|ui| {
-                                                    for speed in
-                                                        crate::video::clock::PLAYBACK_SPEED_CHOICES
-                                                    {
+                                                    for speed in PLAYBACK_SPEED_CHOICES {
                                                         let selected =
                                                             (playback_speed - speed).abs() < 1.0e-6;
-                                                        let label =
-                                                    crate::video::clock::format_playback_speed(
-                                                        speed,
-                                                    );
+                                                        let label = format_playback_speed(speed);
                                                         let button = egui::Button::new(label)
                                                             .selected(selected)
                                                             .min_size(egui::vec2(46.0, 24.0));
@@ -4898,7 +4902,7 @@ impl NativeEguiOverlay {
         } else {
             Instant::now().checked_add(repaint_delay)
         };
-        if hud_debug_enabled() && repaint_delay != Duration::MAX {
+        if hud_repaint_debug_enabled() && repaint_delay != Duration::MAX {
             crate::logger::log(format!(
                 "[HUD-DEBUG] egui repaint_delay={:?} pending={} dirty_after_run={}",
                 repaint_delay,
