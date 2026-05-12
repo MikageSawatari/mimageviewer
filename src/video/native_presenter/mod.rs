@@ -68,7 +68,8 @@ pub struct NativePresenterConfig {
     /// `Some` のとき、presenter は HUD overlay HWND を作って egui overlay を
     /// その DComp tree にぶら下げる (CP4 反映)。`None` または HUD HWND 作成失敗時は
     /// 従来通り presenter HWND の DComp tree に egui overlay をぶら下げるフォールバック経路。
-    pub hud_event_tx: Option<std::sync::mpsc::Sender<crate::video::native_window::NativeVideoWindowEvent>>,
+    pub hud_event_tx:
+        Option<std::sync::mpsc::Sender<crate::video::native_window::NativeVideoWindowEvent>>,
 }
 
 pub struct NativeVideoPresenter {
@@ -232,6 +233,14 @@ struct NativeEguiOverlay {
     /// `native_vst3_panel_rect`) からドラッグでずれた場合、region をその実位置に追従させる。
     /// `None` ならパネル非表示。
     last_drawn_vst3_panel_rect: Option<egui::Rect>,
+    /// 実機修正 (2026-05-12 P2): 直近 egui run で描画した paused center 制御 UI の
+    /// 個別 rect 群 (`[replay_rect, play_rect, backdrop_rect]` の順)。
+    /// `compute_hud_regions` が region 計算で読む (= 200×200pt 固定だと両ボタンの
+    /// 外側 ~29pt とヒント帯が SetWindowRgn でクリップされる症状の修正)。
+    /// union で 1 矩形にまとめず個別 rect で push することで、ヒント横幅に引っ張られた
+    /// 「ボタン上部左右の不要な HUD 入力領域」を作らず VST 入力干渉を最小化する。
+    /// `None` なら paused center 非表示。
+    last_drawn_paused_center_rects: Option<[egui::Rect; 3]>,
     hover_thumbnail: Option<NativeOverlayThumbnail>,
     hover_texture: Option<egui::TextureHandle>,
     hover_texture_key: Option<(u32, u32, u64)>,
@@ -862,33 +871,29 @@ impl NativeVideoPresenter {
                     Ok(hud) => {
                         // HUD 用 DComp target / root visual を作る。drop 防止のため struct で保持。
                         match dcomp_device.CreateTargetForHwnd(hud.hwnd(), true) {
-                            Ok(target) => {
-                                match dcomp_device.CreateVisual() {
-                                    Ok(root_for_hud) => {
-                                        match target.SetRoot(&root_for_hud) {
-                                            Ok(()) => {
-                                                hud_window = Some(hud);
-                                                hud_dcomp_target = Some(target);
-                                                hud_root_visual = Some(root_for_hud);
-                                                hud_regions = Some(regions);
-                                                crate::logger::log(
-                                                    "[native-video] HUD overlay HWND created".to_string(),
-                                                );
-                                            }
-                                            Err(err) => {
-                                                crate::logger::log(format!(
-                                                    "native-presenter: HUD DComp target SetRoot failed, fallback: {err:?}"
-                                                ));
-                                            }
-                                        }
+                            Ok(target) => match dcomp_device.CreateVisual() {
+                                Ok(root_for_hud) => match target.SetRoot(&root_for_hud) {
+                                    Ok(()) => {
+                                        hud_window = Some(hud);
+                                        hud_dcomp_target = Some(target);
+                                        hud_root_visual = Some(root_for_hud);
+                                        hud_regions = Some(regions);
+                                        crate::logger::log(
+                                            "[native-video] HUD overlay HWND created".to_string(),
+                                        );
                                     }
                                     Err(err) => {
                                         crate::logger::log(format!(
-                                            "native-presenter: HUD DComp CreateVisual failed, fallback: {err:?}"
+                                            "native-presenter: HUD DComp target SetRoot failed, fallback: {err:?}"
                                         ));
                                     }
+                                },
+                                Err(err) => {
+                                    crate::logger::log(format!(
+                                        "native-presenter: HUD DComp CreateVisual failed, fallback: {err:?}"
+                                    ));
                                 }
-                            }
+                            },
                             Err(err) => {
                                 crate::logger::log(format!(
                                     "native-presenter: HUD CreateTargetForHwnd failed, fallback: {err:?}"
@@ -952,7 +957,10 @@ impl NativeVideoPresenter {
                             ));
                             log_event(
                                 "egui_overlay_error",
-                                &[("error", Value::from(err.to_string())), ("phase", Value::from("hud_path_fallback"))],
+                                &[
+                                    ("error", Value::from(err.to_string())),
+                                    ("phase", Value::from("hud_path_fallback")),
+                                ],
                             );
                             hud_window = None;
                             hud_dcomp_target = None;
@@ -1525,9 +1533,8 @@ impl NativeVideoPresenter {
         // external_drag は false のまま (= bar 表示維持)。100ms 経過後も DOWN 継続中で
         // egui に any_down が伝わっていなければ「真の外部 drag」と判定する。
         // 通常 click は数 ms ~ 数十 ms で UP するので、この delay で click は誤検出されない。
-        let global_lbutton_down = unsafe {
-            (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0
-        };
+        let global_lbutton_down =
+            unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 };
         let egui_pointer_down = self
             .egui_overlay
             .as_ref()
@@ -1549,11 +1556,11 @@ impl NativeVideoPresenter {
         // を抜けた長押し操作 (e.g. seek bar drag が長引くケース) でも top bar を消さない。
         let hud_has_capture = if let Some(hud) = self.hud_window.as_ref() {
             let hud_hwnd = hud.hwnd();
-            !hud_hwnd.0.is_null() && unsafe {
-                let cur =
-                    windows::Win32::UI::Input::KeyboardAndMouse::GetCapture();
-                cur.0 == hud_hwnd.0
-            }
+            !hud_hwnd.0.is_null()
+                && unsafe {
+                    let cur = windows::Win32::UI::Input::KeyboardAndMouse::GetCapture();
+                    cur.0 == hud_hwnd.0
+                }
         } else {
             false
         };
@@ -1580,17 +1587,17 @@ impl NativeVideoPresenter {
             return false;
         }
         let in_range = unsafe { ScreenToClient(hwnd, &mut pt) }.as_bool() && {
-            pt.x >= 0
-                && pt.y >= 0
-                && (pt.x as u32) < self.width
-                && (pt.y as u32) < self.height
+            pt.x >= 0 && pt.y >= 0 && (pt.x as u32) < self.width && (pt.y as u32) < self.height
         };
 
         if !in_range {
             // 範囲外: 前回 synthetic 状態だったら 1 度だけ MouseLeave を流して終了。
             if *pointer_present_synthetic {
                 if hud_debug_enabled() {
-                    crate::logger::log("[HUD-DEBUG] polling synthetic MouseLeave (cursor out of client rect)".to_string());
+                    crate::logger::log(
+                        "[HUD-DEBUG] polling synthetic MouseLeave (cursor out of client rect)"
+                            .to_string(),
+                    );
                 }
                 if let Some(overlay) = self.egui_overlay.as_mut() {
                     overlay.push_native_event(
@@ -1700,7 +1707,15 @@ impl NativeVideoPresenter {
                 let rects_str: String = outcome
                     .hud_regions
                     .iter()
-                    .map(|r| format!("({},{} {}x{})", r.left, r.top, r.right - r.left, r.bottom - r.top))
+                    .map(|r| {
+                        format!(
+                            "({},{} {}x{})",
+                            r.left,
+                            r.top,
+                            r.right - r.left,
+                            r.bottom - r.top
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(", ");
                 if let Some(overlay) = self.egui_overlay.as_ref() {
@@ -2519,6 +2534,7 @@ impl NativeEguiOverlay {
             hover_preview_pinned: false,
             last_drawn_preview_rect: None,
             last_drawn_vst3_panel_rect: None,
+            last_drawn_paused_center_rects: None,
             hover_thumbnail: None,
             hover_texture: None,
             hover_texture_key: None,
@@ -3279,20 +3295,42 @@ impl NativeEguiOverlay {
             )));
         }
 
-        // Paused center indicator (replay / play ボタン): 中央 200×200pt 概算。
+        // Paused center indicator (replay / play ボタン + ラベル backdrop): 実描画 rect を使う。
         // Codex CP5 P2 #2 反映: paused 中の中央ボタンが VST と重なるケースで
         // クリックが奪われないよう region に追加。
+        //
+        // 旧版は 200×200pt 固定だったが、実 UI は両ボタンだけで横幅 258pt (= 2×112 + 34)、
+        // ヒント背景は center_y+124pt まで広がるため、SetWindowRgn でクリップされて
+        // 「ボタンが変に crop される」症状になっていた (= 2026-05-12 ユーザー報告)。
+        // `draw_native_center_pause_controls` が実描画した個別 rect (replay/play/backdrop、
+        // 各 +4pt margin) を `last_drawn_paused_center_rects` 経由で受け取り、それぞれを
+        // region に push する (union で 1 矩形にせず個別で入れることで、ヒント横幅に
+        // 引っ張られた不要な HUD 入力帯を作らず VST 入力干渉を最小化)。
+        //
+        // `paused_center_visible` ガードを残すことで、直前フレームの stale rect が
+        // 不可視に切り替わった瞬間に region から外れる。初回フレーム fallback として、
+        // visible だが rect 未記録のケース (= ダイアログ表示直後で先に region 計算が
+        // 走るパス) では広めの保険 box を入れて次フレームの実描画 rect 更新を待つ。
         if paused_center_visible {
-            let center_x = width_px / 2;
-            let center_y = height_px / 2;
-            let w = to_px(200.0);
-            let h = to_px(200.0);
-            regions.push(RECT {
-                left: (center_x - w / 2).max(0),
-                top: (center_y - h / 2).max(0),
-                right: (center_x + w / 2).min(width_px),
-                bottom: (center_y + h / 2).min(height_px),
-            });
+            if let Some(rects) = self.last_drawn_paused_center_rects.as_ref() {
+                for rect in rects.iter() {
+                    regions.push(rect_to_px(*rect));
+                }
+            } else {
+                // 初回フレーム fallback: 横幅はヒント文字列 (約 40 字、推定 500pt 程度) +
+                // backdrop expand を覆うために 640pt 確保。縦は radius=56, hint_y=center_y+108 を
+                // 元に上 -64pt〜下 +140pt。次フレームの egui run で正確な個別 rect 群に
+                // 置き換わるので 1 フレームだけ広めでも VST 干渉はごく短時間。
+                let cx = width_px / 2;
+                let cy = height_px / 2;
+                let half_w = to_px(320.0);
+                regions.push(RECT {
+                    left: (cx - half_w).max(0),
+                    top: (cy - to_px(64.0)).max(0),
+                    right: (cx + half_w).min(width_px),
+                    bottom: (cy + to_px(140.0)).min(height_px),
+                });
+            }
         }
 
         // VST3 panel: ドラッグ可能化 (= 2026-05-12 A) に伴い、`last_drawn_vst3_panel_rect`
@@ -3506,9 +3544,10 @@ impl NativeEguiOverlay {
                 // 単独配置する。後者は HUD root に他の visual がないので `None` で OK。
                 let result = match &self.after_visual {
                     Some(v) => self.root_visual.AddVisual(&self.visual, true, v),
-                    None => self
-                        .root_visual
-                        .AddVisual(&self.visual, true, None::<&IDCompositionVisual>),
+                    None => {
+                        self.root_visual
+                            .AddVisual(&self.visual, true, None::<&IDCompositionVisual>)
+                    }
                 };
                 result
                     .map_err(|e| format!("IDCompositionVisual::AddVisual egui overlay: {e:?}"))?;
@@ -3649,9 +3688,7 @@ impl NativeEguiOverlay {
         // フレームと top_bar_visible が true になるフレームが 1 フレームずれて、その間に
         // `cursor_should_hide = true` が成立して `SetCursor(None)` が呼ばれることが原因。
         // activation zone 内では auto-hide を打ち切ることで予防する。
-        let in_top_activation_zone = pointer_pos
-            .map(|p| p.y <= 76.0)
-            .unwrap_or(false);
+        let in_top_activation_zone = pointer_pos.map(|p| p.y <= 76.0).unwrap_or(false);
         let in_bottom_activation_zone = pointer_pos
             .map(|p| p.y >= overlay_height_points - 220.0)
             .unwrap_or(false);
@@ -3680,6 +3717,10 @@ impl NativeEguiOverlay {
         // 実機修正 (2026-05-12 A): VST3 設定パネルをドラッグ可能化 (`.movable(true)`)。
         // ドラッグ後の actual rect を記録して region に追従させる。
         let mut last_drawn_vst3_panel_rect: Option<egui::Rect> = None;
+        // 実機修正 (2026-05-12 P2): paused center 制御 UI (replay/play ボタン + label backdrop)
+        // の実描画 rect を記録して `compute_hud_regions` に渡す。200×200pt 固定 region では
+        // ボタン外側 ~29pt + ヒント帯が SetWindowRgn でクリップされる症状の修正。
+        let mut last_drawn_paused_center_rects: Option<[egui::Rect; 3]> = None;
         if !overlay_visible {
             self.set_visual_attached(false)?;
             last_seek_target_secs = None;
@@ -3835,7 +3876,7 @@ impl NativeEguiOverlay {
                         panel,
                     ));
                 }
-                draw_native_center_pause_controls(
+                last_drawn_paused_center_rects = draw_native_center_pause_controls(
                     ctx,
                     overlay_width_points,
                     overlay_height_points,
@@ -4715,6 +4756,7 @@ impl NativeEguiOverlay {
         self.hover_preview_target_secs = hover_preview_target_secs;
         self.last_drawn_preview_rect = last_drawn_preview_rect;
         self.last_drawn_vst3_panel_rect = last_drawn_vst3_panel_rect;
+        self.last_drawn_paused_center_rects = last_drawn_paused_center_rects;
         self.video_speed_popup_open = video_speed_popup_open;
         self.frame_step_hold = frame_step_hold;
         self.bookmark_title_edit = bookmark_title_edit;
@@ -4905,7 +4947,8 @@ impl NativeEguiOverlay {
             return;
         }
         // 復帰側: cursor が見える icon を設定するとき、hidden flag を clear。
-        self.cursor_was_hidden_shared.store(false, Ordering::Release);
+        self.cursor_was_hidden_shared
+            .store(false, Ordering::Release);
         let cursor_id = match cursor_icon {
             egui::CursorIcon::PointingHand => IDC_HAND,
             egui::CursorIcon::Text | egui::CursorIcon::VerticalText => IDC_IBEAM,

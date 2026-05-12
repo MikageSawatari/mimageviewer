@@ -1126,7 +1126,8 @@ pub(super) fn draw_native_center_pause_controls(
     overlay_height_points: f32,
     excluded_panel_rects: &[egui::Rect],
     commands: &mut Vec<NativeOverlayCommand>,
-) {
+) -> Option<[egui::Rect; 3]> {
+    let mut drawn: Option<[egui::Rect; 3]> = None;
     egui::Area::new(egui::Id::new("native_video_center_pause_controls"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
@@ -1259,6 +1260,18 @@ pub(super) fn draw_native_center_pause_controls(
             painter.galley(play_label_pos, play_label, label_color);
             painter.galley(hint_label_pos, hint_label, hint_color);
 
+            // compute_hud_regions が SetWindowRgn に渡す「実描画 rect」を記録する。
+            // 200×200pt 固定 region では両ボタンの外側 ~29pt とヒント帯が HUD HWND の
+            // region 外に出てしまいクリップされていた。replay/play ボタン円形 rect と
+            // backdrop rect をそれぞれ 4pt 膨らませて返し、`compute_hud_regions` が
+            // 個別 RECT として SetWindowRgn 集合に push する (union しないことで、
+            // ヒント横幅に引っ張られた不要な HUD 入力帯を作らない)。
+            drawn = Some([
+                replay_rect.expand(4.0),
+                play_rect.expand(4.0),
+                backdrop_rect.expand(4.0),
+            ]);
+
             if replay_resp.clicked() {
                 commands.push(NativeOverlayCommand::SeekToStartAndPlay);
             }
@@ -1308,6 +1321,7 @@ pub(super) fn draw_native_center_pause_controls(
                 }
             }
         });
+    drawn
 }
 
 pub(super) fn draw_native_toast(
