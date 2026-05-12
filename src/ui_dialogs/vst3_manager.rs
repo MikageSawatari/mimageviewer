@@ -131,6 +131,7 @@ impl App {
         let bridge = self.dsp_bridge.clone();
         let state = bridge.state();
         let slots = bridge.slots();
+        let display_count = slots.len().max(self.settings.vst3_plugins.len());
 
         // 動画サイズ切替の初期値
         let video_compact = self.settings.vst3_video_compact;
@@ -138,12 +139,13 @@ impl App {
 
         // 動画再生中の使い勝手を考慮した小さめ初期サイズ。チェーン編集を含まない
         // ので幅は狭くて済む (= プラグイン名 + バイパス + GUI ボタンが収まれば OK)。
-        // **位置は固定 ID で永続化** (= 旧版で RichText タイトルを使ったため Window の
-        // 内部 ID がフレームごとに変動し、ドラッグ位置が記憶されず 1 フレームごとに
-        // ずれてしまうユーザー報告に対応)。
+        // 位置は固定 ID の egui memory でフレーム間保持し、ドラッグ終了時に
+        // settings.vst3_panel_pos へ保存する。復元時は現在の viewport 内へ clamp する。
         let fallback_pos = ctx.content_rect().min + egui::vec2(60.0, 60.0);
         let saved_pos = self.settings.vst3_panel_pos.and_then(finite_vst3_panel_pos);
-        let estimated_size = egui::vec2(280.0, 360.0);
+        let estimated_height = (240.0 + display_count.max(1).min(10) as f32 * 28.0)
+            .clamp(300.0, ctx.content_rect().height().max(300.0));
+        let estimated_size = egui::vec2(280.0, estimated_height);
         let initial_pos = saved_pos
             .map(|pos| clamp_vst3_panel_pos_to_rect(pos, estimated_size, ctx.content_rect()))
             .unwrap_or(fallback_pos);
@@ -266,7 +268,6 @@ impl App {
             ui.separator();
 
             // ── プラグイン一覧 (ON/OFF + GUI のみ) ──
-            let display_count = slots.len().max(self.settings.vst3_plugins.len());
             if display_count == 0 {
                 ui.label(
                     egui::RichText::new("プラグイン未設定")

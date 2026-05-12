@@ -1796,6 +1796,7 @@ pub(super) fn draw_native_vst3_panel(
     overlay_height_points: f32,
     panel: &NativeOverlayVst3Panel,
     commands: &mut Vec<NativeOverlayCommand>,
+    last_emitted_panel_pos: &mut Option<[f32; 2]>,
 ) -> Option<egui::Rect> {
     let rect = native_vst3_panel_rect(overlay_width_points, overlay_height_points, panel);
     // 実機修正 (2026-05-12 A): `fixed_pos` → `default_pos` + `movable(true)` でドラッグ可能化。
@@ -1949,10 +1950,11 @@ pub(super) fn draw_native_vst3_panel(
     let actual_pos = inner.response.rect.min;
     if (inner.response.drag_stopped() || saved_pos_was_clamped)
         && panel_pos_changed(panel.panel_pos, actual_pos)
+        && panel_pos_changed(*last_emitted_panel_pos, actual_pos)
     {
-        commands.push(NativeOverlayCommand::SetVst3PanelPos {
-            pos: [actual_pos.x, actual_pos.y],
-        });
+        let pos = [actual_pos.x, actual_pos.y];
+        *last_emitted_panel_pos = Some(pos);
+        commands.push(NativeOverlayCommand::SetVst3PanelPos { pos });
     }
     Some(inner.response.rect)
 }

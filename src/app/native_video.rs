@@ -2653,7 +2653,11 @@ impl App {
         let changed = self
             .settings
             .vst3_panel_pos
-            .map(|prev| (prev[0] - pos[0]).hypot(prev[1] - pos[1]) > 0.5)
+            .map(|prev| {
+                let dx = prev[0] - pos[0];
+                let dy = prev[1] - pos[1];
+                dx * dx + dy * dy > 0.25
+            })
             .unwrap_or(true);
         if !changed {
             return;

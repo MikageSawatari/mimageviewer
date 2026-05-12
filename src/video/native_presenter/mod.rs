@@ -236,6 +236,9 @@ struct NativeEguiOverlay {
     /// `native_vst3_panel_rect`) からドラッグでずれた場合、region をその実位置に追従させる。
     /// `None` ならパネル非表示。
     last_drawn_vst3_panel_rect: Option<egui::Rect>,
+    /// Off-screen clamp 復旧などで同じ VST3 panel 位置 command を複数フレーム連続発行しないための
+    /// presenter-local 記憶。UI thread から新しい panel_pos snapshot が届いたらリセットする。
+    last_emitted_vst3_panel_pos: Option<[f32; 2]>,
     /// 実機修正 (2026-05-12 P2): 直近 egui run で描画した paused center 制御 UI の
     /// 個別 rect 群 (`[replay_rect, play_rect, backdrop_rect]` の順)。
     /// `compute_hud_regions` が region 計算で読む (= 200×200pt 固定だと両ボタンの
@@ -2547,6 +2550,7 @@ impl NativeEguiOverlay {
             hover_preview_pinned: false,
             last_drawn_preview_rect: None,
             last_drawn_vst3_panel_rect: None,
+            last_emitted_vst3_panel_pos: None,
             last_drawn_paused_center_rects: None,
             hover_thumbnail: None,
             hover_texture: None,
@@ -2939,6 +2943,7 @@ impl NativeEguiOverlay {
         self.vst3_available = available;
         if !available {
             self.vst3_panel = None;
+            self.last_emitted_vst3_panel_pos = None;
         }
         self.dirty = true;
     }
@@ -2946,6 +2951,11 @@ impl NativeEguiOverlay {
     fn set_vst3_panel(&mut self, panel: Option<NativeOverlayVst3Panel>) {
         if self.vst3_panel == panel {
             return;
+        }
+        let old_pos = self.vst3_panel.as_ref().and_then(|panel| panel.panel_pos);
+        let new_pos = panel.as_ref().and_then(|panel| panel.panel_pos);
+        if old_pos != new_pos {
+            self.last_emitted_vst3_panel_pos = None;
         }
         self.vst3_panel = panel;
         self.dirty = true;
@@ -3650,6 +3660,7 @@ impl NativeEguiOverlay {
         // 音量ノーマライズ overlay state (Copy 型なので clone 不要)
         let normalize_state_snap = self.normalize_state;
         let vst3_panel = self.vst3_panel.clone();
+        let mut last_emitted_vst3_panel_pos = self.last_emitted_vst3_panel_pos;
         let tile_overlay = self.tile_overlay.clone();
         let tile_texture_ids: HashMap<usize, egui::TextureId> = self
             .tile_textures
@@ -3854,6 +3865,7 @@ impl NativeEguiOverlay {
                     overlay_height_points,
                     panel,
                     &mut commands,
+                    &mut last_emitted_vst3_panel_pos,
                 );
             }
             if paused_center_visible {
@@ -4787,6 +4799,7 @@ impl NativeEguiOverlay {
         self.hover_preview_target_secs = hover_preview_target_secs;
         self.last_drawn_preview_rect = last_drawn_preview_rect;
         self.last_drawn_vst3_panel_rect = last_drawn_vst3_panel_rect;
+        self.last_emitted_vst3_panel_pos = last_emitted_vst3_panel_pos;
         self.last_drawn_paused_center_rects = last_drawn_paused_center_rects;
         self.video_speed_popup_open = video_speed_popup_open;
         self.frame_step_hold = frame_step_hold;
