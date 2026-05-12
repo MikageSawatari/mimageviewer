@@ -191,6 +191,7 @@ struct NativeEguiOverlay {
     pointer_pos: Option<egui::Pos2>,
     event_count: u64,
     dirty: bool,
+    next_repaint_deadline: Option<Instant>,
     wants_pointer_input: bool,
     wants_keyboard_input: bool,
     video_position_secs: f64,
@@ -247,6 +248,11 @@ struct NativeEguiOverlay {
     /// 「ボタン上部左右の不要な HUD 入力領域」を作らず VST 入力干渉を最小化する。
     /// `None` なら paused center 非表示。
     last_drawn_paused_center_rects: Option<[egui::Rect; 3]>,
+    /// 直近 egui run で描画した playback speed popup の actual rect。
+    /// speed ボタンは下 HUD 右側にあるため、中央固定の概算 region だと popup が
+    /// SetWindowRgn 外に落ちて見えたり、click hit-test が不安定になったりする。
+    /// `None` なら popup 非表示または未描画。
+    last_drawn_speed_popup_rect: Option<egui::Rect>,
     hover_thumbnail: Option<NativeOverlayThumbnail>,
     hover_texture: Option<egui::TextureHandle>,
     hover_texture_key: Option<(u32, u32, u64)>,
@@ -740,6 +746,15 @@ fn create_present_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), 
 
 fn configure_overlay_fonts(ctx: &egui::Context) {
     crate::ui_fonts::configure_fonts(ctx);
+}
+
+fn configure_overlay_style(ctx: &egui::Context) {
+    ctx.style_mut(|style| {
+        // native HUD は 46pt の小さな操作面なので、ヘルプ text は hover 直後に出す。
+        // egui default の 0.5s delay だと「初回だけ待つ / 隣ボタンは即時」という
+        // grace-time 由来の不揃いな挙動に見える。
+        style.interaction.tooltip_delay = 0.0;
+    });
 }
 
 /// CP9 実機 debug: `MIV_HUD_DEBUG=1` で起動したか。
@@ -1601,12 +1616,18 @@ impl NativeVideoPresenter {
         };
 
         if !in_range {
-            // 範囲外: 前回 synthetic 状態だったら 1 度だけ MouseLeave を流して終了。
-            if *pointer_present_synthetic {
+            // 範囲外: overlay に残っている pointer_pos を 1 度だけ clear して終了。
+            // 最後の mouse move が HUD HWND 由来の real event だった場合、
+            // pointer_present_synthetic は false のままなので、それだけを見ると
+            // right panel / seek HUD が stale hover で残り続ける。
+            let overlay_has_pointer = self
+                .egui_overlay
+                .as_ref()
+                .is_some_and(NativeEguiOverlay::has_pointer_pos);
+            if overlay_has_pointer {
                 if hud_debug_enabled() {
                     crate::logger::log(
-                        "[HUD-DEBUG] polling synthetic MouseLeave (cursor out of client rect)"
-                            .to_string(),
+                        "[HUD-DEBUG] polling MouseLeave (cursor out of client rect)".to_string(),
                     );
                 }
                 if let Some(overlay) = self.egui_overlay.as_mut() {
@@ -1614,8 +1635,8 @@ impl NativeVideoPresenter {
                         crate::video::native_window::NativeVideoWindowEvent::MouseLeave,
                     );
                 }
-                *pointer_present_synthetic = false;
             }
+            *pointer_present_synthetic = false;
             return false;
         }
 
@@ -1629,7 +1650,11 @@ impl NativeVideoPresenter {
         let now = std::time::Instant::now();
         let recent_native = last_native_mouse_at
             .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(80));
-        if !recent_native {
+        let needs_synthetic_move = self
+            .egui_overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.needs_synthetic_pointer_move(pt.x, pt.y));
+        if !recent_native && needs_synthetic_move {
             if hud_debug_enabled() {
                 crate::logger::log(format!(
                     "[HUD-DEBUG] polling synthetic MouseMove x={} y={} (no native mouse in 80ms)",
@@ -1650,7 +1675,9 @@ impl NativeVideoPresenter {
                 *pointer_present_synthetic = true;
             }
         }
-        // recent_native の場合は `pointer_present_synthetic` を変更しない (前回値維持)。
+        // recent_native / unchanged-position の場合は `pointer_present_synthetic` を変更しない
+        // (前回値維持)。同じ座標の PointerMoved を投げ続けると egui の tooltip
+        // delay が毎回リセットされ、HUD tooltips が出なくなる。
 
         // activation zone 判定 (= 上端 76pt 帯 / 下端 220pt 帯)。
         // pixels_per_point は overlay から取得 (= CP3 で導入した overlay の pixels_per_point)。
@@ -1913,7 +1940,8 @@ impl NativeVideoPresenter {
         frame_step_active: bool,
     ) -> Result<NativeOverlayInputOutcome, String> {
         let outcome = if let Some(overlay) = self.egui_overlay.as_mut() {
-            let force_tick_render = overlay.wants_periodic_tick();
+            let force_tick_render =
+                overlay.wants_periodic_tick() || overlay.repaint_due(Instant::now());
             overlay.update_video_state(
                 position_secs,
                 duration_secs,
@@ -1949,6 +1977,12 @@ impl NativeVideoPresenter {
             .as_ref()
             .map(NativeEguiOverlay::wants_periodic_tick)
             .unwrap_or(false)
+    }
+
+    pub fn overlay_repaint_due(&self, now: Instant) -> bool {
+        self.egui_overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.repaint_due(now))
     }
 
     pub fn overlay_needs_render(&self) -> bool {
@@ -2490,6 +2524,7 @@ impl NativeEguiOverlay {
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
         configure_overlay_fonts(&egui_ctx);
+        configure_overlay_style(&egui_ctx);
         let pixels_per_point = pixels_per_point_for_hwnd(dcomp_hwnd);
         let this = Self {
             surface,
@@ -2514,6 +2549,7 @@ impl NativeEguiOverlay {
             pointer_pos: None,
             event_count: 0,
             dirty: true,
+            next_repaint_deadline: None,
             wants_pointer_input: false,
             wants_keyboard_input: false,
             video_position_secs: 0.0,
@@ -2552,6 +2588,7 @@ impl NativeEguiOverlay {
             last_drawn_vst3_panel_rect: None,
             last_emitted_vst3_panel_pos: None,
             last_drawn_paused_center_rects: None,
+            last_drawn_speed_popup_rect: None,
             hover_thumbnail: None,
             hover_texture: None,
             hover_texture_key: None,
@@ -3138,12 +3175,39 @@ impl NativeEguiOverlay {
             || (self.cursor_last_activity.is_some() && !self.cursor_hidden)
     }
 
+    fn repaint_due(&self, now: Instant) -> bool {
+        self.next_repaint_deadline
+            .is_some_and(|deadline| now >= deadline)
+    }
+
+    fn has_pointer_pos(&self) -> bool {
+        self.pointer_pos.is_some()
+    }
+
+    fn needs_synthetic_pointer_move(&self, x: i32, y: i32) -> bool {
+        let pos = self.native_pos(x, y);
+        self.pointer_pos
+            .is_none_or(|prev| prev.distance_sq(pos) > 0.25)
+    }
+
+    fn hover_tooltip_repaint_needed(&self) -> bool {
+        self.pointer_pos.is_some()
+            && (self.hud_visible()
+                || self.top_bar_visible()
+                || self.right_panel_visible()
+                || self.jump_panel_visible()
+                || self.vst3_panel_visible()
+                || self.video_speed_popup_open
+                || self.hover_preview_target_secs.is_some())
+    }
+
     fn needs_render(&self) -> bool {
         self.dirty || !self.pending_events.is_empty()
     }
 
     fn render_if_dirty(&mut self) -> Result<NativeOverlayInputOutcome, String> {
-        if !self.dirty && self.pending_events.is_empty() {
+        let hover_tooltip_repaint_needed = self.hover_tooltip_repaint_needed();
+        if !self.dirty && self.pending_events.is_empty() && !hover_tooltip_repaint_needed {
             // CP5: dirty フラグ無しでも HUD regions は最新の visibility に合わせて
             // 出しておく (= 例えば mouse hover で bar が消えても、その後の VST z-order
             // 変更で再 raise されたとき HUD HWND の region がきちんと「穴」になっている
@@ -3154,6 +3218,9 @@ impl NativeEguiOverlay {
                 hud_regions: self.compute_hud_regions(),
             });
         }
+        // egui tooltip は hover 後に `request_repaint_after(tooltip_delay)` で開く。
+        // native overlay には eframe の repaint callback が無いため、hover UI 表示中は
+        // periodic tick で egui pass も回して delay 到達を拾う。
         let commands = self.render_once()?;
         Ok(NativeOverlayInputOutcome {
             routing: self.input_routing(),
@@ -3387,18 +3454,21 @@ impl NativeEguiOverlay {
             }
         }
 
-        // Speed popup: 画面下端 + 中央寄せ、概算で 200×200pt。
         if self.video_speed_popup_open {
-            let center_x = width_px / 2;
-            let popup_w = to_px(220.0);
-            let popup_h = to_px(220.0);
-            let bottom = (height_px - to_px(120.0)).max(0);
-            regions.push(RECT {
-                left: (center_x - popup_w / 2).max(0),
-                top: (bottom - popup_h).max(0),
-                right: (center_x + popup_w / 2).min(width_px),
-                bottom,
+            let rect = self.last_drawn_speed_popup_rect.unwrap_or_else(|| {
+                let popup_w = 356.0_f32.min((width_points - 16.0).max(180.0));
+                let popup_h = 74.0;
+                let popup_x = (width_points - popup_w - 8.0).max(8.0);
+                let popup_y = (height_points - 46.0 - popup_h - 6.0).max(8.0);
+                egui::Rect::from_min_size(
+                    egui::pos2(popup_x, popup_y),
+                    egui::vec2(popup_w, popup_h),
+                )
             });
+            let rect_px = rect_to_px(rect.expand(4.0));
+            if rect_px.left < rect_px.right && rect_px.top < rect_px.bottom {
+                regions.push(rect_px);
+            }
         }
 
         // Bookmark title editor: center modal、概算で 500×100pt。
@@ -3458,6 +3528,29 @@ impl NativeEguiOverlay {
         // いる (= None なら描画なし)。これをそのまま region に変換する。
         if let Some(rect) = self.last_drawn_preview_rect {
             regions.push(rect_to_px(rect));
+        }
+
+        // egui tooltip は Order::Tooltip の floating Area として下 HUD / panel の外側に
+        // 描かれる。HUD HWND の SetWindowRgn に実 rect を含めないと、DComp には描けても
+        // HWND region 外で物理的に clip される。
+        let mut tooltip_layers: Vec<egui::LayerId> = self.egui_ctx.memory(|mem| {
+            mem.areas()
+                .visible_layer_ids()
+                .into_iter()
+                .filter(|layer_id| layer_id.order == egui::Order::Tooltip)
+                .collect()
+        });
+        tooltip_layers.sort_by_key(|layer_id| layer_id.id.value());
+        for layer_id in tooltip_layers {
+            if let Some(state) = egui::AreaState::load(&self.egui_ctx, layer_id.id) {
+                let rect = state.rect();
+                if rect.is_finite() && rect.is_positive() {
+                    let rect_px = rect_to_px(rect);
+                    if rect_px.left < rect_px.right && rect_px.top < rect_px.bottom {
+                        regions.push(rect_px);
+                    }
+                }
+            }
         }
 
         regions
@@ -3764,6 +3857,7 @@ impl NativeEguiOverlay {
         // の実描画 rect を記録して `compute_hud_regions` に渡す。200×200pt 固定 region では
         // ボタン外側 ~29pt + ヒント帯が SetWindowRgn でクリップされる症状の修正。
         let mut last_drawn_paused_center_rects: Option<[egui::Rect; 3]> = None;
+        let mut last_drawn_speed_popup_rect: Option<egui::Rect> = None;
         if !overlay_visible {
             self.set_visual_attached(false)?;
             last_seek_target_secs = None;
@@ -4498,7 +4592,7 @@ impl NativeEguiOverlay {
                             }
                         }
 
-                        let speed_resp = ui.interact(
+                        let mut speed_resp = ui.interact(
                             speed_rect,
                             egui::Id::new("native_video_speed"),
                             egui::Sense::click(),
@@ -4511,13 +4605,15 @@ impl NativeEguiOverlay {
                             egui::FontId::proportional(12.0),
                             egui::Color32::from_rgb(238, 238, 238),
                         );
-                        let speed_resp =
-                            speed_resp.on_hover_text("再生速度 (右クリック / ダブルクリックで x1)");
                         if speed_resp.secondary_clicked() || speed_resp.double_clicked() {
                             video_speed_popup_open = false;
                             commands.push(NativeOverlayCommand::SetPlaybackSpeed { speed: 1.0 });
                         } else if speed_resp.clicked() {
                             video_speed_popup_open = !video_speed_popup_open;
+                        }
+                        if !video_speed_popup_open {
+                            speed_resp = speed_resp
+                                .on_hover_text("再生速度 (右クリック / ダブルクリックで x1)");
                         }
                         if video_speed_popup_open {
                             let popup_w = 356.0_f32.min((overlay_width_points - 16.0).max(180.0));
@@ -4526,48 +4622,49 @@ impl NativeEguiOverlay {
                                 .clamp(8.0, overlay_width_points - popup_w - 8.0);
                             let popup_y = (hud_rect.min.y - popup_h - 6.0).max(8.0);
                             let mut selected_speed = None;
-                            egui::Area::new(egui::Id::new("native_video_speed_popup"))
-                                .order(egui::Order::Foreground)
-                                .fixed_pos(egui::pos2(popup_x, popup_y))
-                                .show(ctx, |ui| {
-                                    egui::Frame::new()
-                                        .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 225))
-                                        .stroke(egui::Stroke::new(
-                                            1.0,
-                                            egui::Color32::from_gray(110),
-                                        ))
-                                        .corner_radius(egui::CornerRadius::same(4))
-                                        .inner_margin(egui::Margin::same(6))
-                                        .show(ui, |ui| {
-                                            ui.set_min_width(popup_w - 12.0);
-                                            ui.horizontal_wrapped(|ui| {
-                                                for speed in
-                                                    crate::video::clock::PLAYBACK_SPEED_CHOICES
-                                                {
-                                                    let selected =
-                                                        (playback_speed - speed).abs() < 1.0e-6;
-                                                    let label =
-                                                        crate::video::clock::format_playback_speed(
-                                                            speed,
-                                                        );
-                                                    let button = egui::Button::new(label)
-                                                        .selected(selected)
-                                                        .min_size(egui::vec2(46.0, 24.0));
-                                                    if ui.add(button).clicked() {
-                                                        selected_speed = Some(speed);
+                            let popup_inner =
+                                egui::Area::new(egui::Id::new("native_video_speed_popup"))
+                                    .order(egui::Order::Foreground)
+                                    .fixed_pos(egui::pos2(popup_x, popup_y))
+                                    .show(ctx, |ui| {
+                                        egui::Frame::new()
+                                            .fill(egui::Color32::from_rgba_unmultiplied(
+                                                0, 0, 0, 225,
+                                            ))
+                                            .stroke(egui::Stroke::new(
+                                                1.0,
+                                                egui::Color32::from_gray(110),
+                                            ))
+                                            .corner_radius(egui::CornerRadius::same(4))
+                                            .inner_margin(egui::Margin::same(6))
+                                            .show(ui, |ui| {
+                                                ui.set_min_width(popup_w - 12.0);
+                                                ui.horizontal_wrapped(|ui| {
+                                                    for speed in
+                                                        crate::video::clock::PLAYBACK_SPEED_CHOICES
+                                                    {
+                                                        let selected =
+                                                            (playback_speed - speed).abs() < 1.0e-6;
+                                                        let label =
+                                                    crate::video::clock::format_playback_speed(
+                                                        speed,
+                                                    );
+                                                        let button = egui::Button::new(label)
+                                                            .selected(selected)
+                                                            .min_size(egui::vec2(46.0, 24.0));
+                                                        if ui.add(button).clicked() {
+                                                            selected_speed = Some(speed);
+                                                        }
                                                     }
-                                                }
+                                                });
                                             });
-                                        });
-                                });
+                                    });
+                            let popup_rect = popup_inner.response.rect;
+                            last_drawn_speed_popup_rect = Some(popup_rect);
                             if ui.ctx().input(|i| i.pointer.any_click())
                                 && !speed_resp.hovered()
                                 && let Some(pos) = ui.ctx().input(|i| i.pointer.interact_pos())
                             {
-                                let popup_rect = egui::Rect::from_min_size(
-                                    egui::pos2(popup_x, popup_y),
-                                    egui::vec2(popup_w, popup_h),
-                                );
                                 if !popup_rect.contains(pos) {
                                     video_speed_popup_open = false;
                                 }
@@ -4791,6 +4888,24 @@ impl NativeEguiOverlay {
                 }
             }
         });
+        let repaint_delay = full_output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|output| output.repaint_delay)
+            .unwrap_or(Duration::MAX);
+        self.next_repaint_deadline = if repaint_delay == Duration::MAX {
+            None
+        } else {
+            Instant::now().checked_add(repaint_delay)
+        };
+        if hud_debug_enabled() && repaint_delay != Duration::MAX {
+            crate::logger::log(format!(
+                "[HUD-DEBUG] egui repaint_delay={:?} pending={} dirty_after_run={}",
+                repaint_delay,
+                self.pending_events.len(),
+                self.dirty
+            ));
+        }
         // Query after `run`: egui updates these flags from the just-processed
         // frame, which lets this presenter decide whether to forward the same
         // native input batch to the legacy fullscreen shortcut path.
@@ -4804,6 +4919,7 @@ impl NativeEguiOverlay {
         self.last_drawn_vst3_panel_rect = last_drawn_vst3_panel_rect;
         self.last_emitted_vst3_panel_pos = last_emitted_vst3_panel_pos;
         self.last_drawn_paused_center_rects = last_drawn_paused_center_rects;
+        self.last_drawn_speed_popup_rect = last_drawn_speed_popup_rect;
         self.video_speed_popup_open = video_speed_popup_open;
         self.frame_step_hold = frame_step_hold;
         self.bookmark_title_edit = bookmark_title_edit;

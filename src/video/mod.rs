@@ -2006,6 +2006,7 @@ fn run_native_video_output(
             last_overlay_tick = Instant::now();
         } else if perf_visibility_changed
             || presenter.overlay_needs_render()
+            || presenter.overlay_repaint_due(Instant::now())
             || (presenter.overlay_wants_periodic_tick()
                 && last_overlay_tick.elapsed() >= Duration::from_millis(250))
         {
