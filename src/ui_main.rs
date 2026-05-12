@@ -1380,13 +1380,17 @@ impl App {
 
         egui::CentralPanel::default()
             .show(ctx, |ui| -> Option<PathBuf> {
+                let global_searching =
+                    self.items_are_global_search_view && self.global_search.is_searching();
                 if self.items.is_empty() {
                     // ZIP / PDF 非同期列挙中は「読み込み中…」にして待ち状態を明示する。
                     // BS や Ctrl+↑↓ はこの間でも受理され、load_folder 側で pending が
                     // Drop されて worker が cancel する。
                     let loading = self.zip_enumerate_pending.is_some()
                         || self.pdf_enumerate_pending.is_some();
-                    let msg = if loading {
+                    let msg = if global_searching {
+                        "検索中"
+                    } else if loading {
                         "読み込み中…"
                     } else if self.current_folder.is_some() {
                         "表示するファイルがありません"
@@ -1407,7 +1411,11 @@ impl App {
 
                 if self.visible_indices.is_empty() {
                     ui.centered_and_justified(|ui| {
-                        ui.label("検索結果なし");
+                        ui.label(if global_searching {
+                            "検索中"
+                        } else {
+                            "検索結果なし"
+                        });
                     });
                     return None;
                 }

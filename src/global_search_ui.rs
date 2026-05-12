@@ -273,6 +273,18 @@ pub const SORT_MODES: &[ContainerSortMode] = &[
 ];
 
 impl GlobalSearchState {
+    /// ユーザーに「まだ結果が確定していない」と見せるべき状態か。
+    ///
+    /// pending worker 実行中だけでなく、入力変更後の debounce 待ちも検索中として扱う。
+    /// Ctrl+G を開いただけ / 空クエリ / reject 表示後 / 完了後は false。
+    pub(crate) fn is_searching(&self) -> bool {
+        self.active
+            && !self.done
+            && self.reject_message.is_none()
+            && !self.query.trim().is_empty()
+            && (self.pending.is_some() || self.query != self.last_executed)
+    }
+
     /// 新規検索を開始する (既存 pending があれば cancel してから)。
     pub fn reset_for_new_query(&mut self) {
         // SearchHandle は Drop で cancel するので、take() だけで OK
@@ -1038,6 +1050,7 @@ impl App {
         };
         let mut events_processed = 0;
         let mut changed = false;
+        let mut stats_changed = false;
         while events_processed < MAX_EVENTS_PER_FRAME {
             match rx.try_recv() {
                 Ok(SearchStreamEvent::Batch {
@@ -1084,6 +1097,7 @@ impl App {
                     }
                     self.global_search.total_scanned = scanned_candidates;
                     self.global_search.total_valid = valid_hits;
+                    stats_changed = true;
                     if !hits.is_empty() {
                         changed = true;
                     }
@@ -1106,21 +1120,27 @@ impl App {
                         _ => {}
                     }
                     changed = true;
+                    stats_changed = true;
                     break;
                 }
                 Ok(SearchStreamEvent::Error(msg)) => {
                     self.global_search.done = true;
                     self.global_search.reject_message = Some(format!("エラー: {msg}"));
                     changed = true;
+                    stats_changed = true;
                     break;
                 }
                 Err(crossbeam_channel::TryRecvError::Empty) => break,
                 Err(crossbeam_channel::TryRecvError::Disconnected) => {
                     self.global_search.done = true;
                     changed = true;
+                    stats_changed = true;
                     break;
                 }
             }
+        }
+        if stats_changed {
+            self.update_global_search_address();
         }
         if changed {
             // docs §10.4.3: 順序再評価は 1 秒毎で十分 (頻繁な入れ替えでチラつかない)
@@ -1476,6 +1496,8 @@ impl App {
                 let n = self.global_search.containers.len();
                 if query.is_empty() {
                     self.address = "🌐 全検索".to_string();
+                } else if self.global_search.is_searching() {
+                    self.address = format!("🌐 全検索: \"{query}\"  ({n} 件 / 検索中)");
                 } else {
                     self.address = format!("🌐 全検索: \"{query}\"  ({n} 件)");
                 }
@@ -1505,7 +1527,12 @@ impl App {
                 };
                 let mut segs = vec![root_name];
                 segs.extend(rel);
-                self.address = format!("🌐 全検索: \"{query}\" > {}", segs.join(" > "));
+                let suffix = if self.global_search.is_searching() {
+                    "  (検索中)"
+                } else {
+                    ""
+                };
+                self.address = format!("🌐 全検索: \"{query}\" > {}{suffix}", segs.join(" > "));
             }
         }
     }
@@ -1603,6 +1630,43 @@ impl App {
                     close_requested = true;
                 }
 
+                // 進捗/結果バッジ。ドロップダウン群より前に置くことで、幅が狭い
+                // ウィンドウでも検索中状態が右端へ押し出されにくくなる。
+                ui.separator();
+                if let Some(msg) = &self.global_search.reject_message {
+                    ui.label(
+                        egui::RichText::new(msg)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(200, 120, 40)),
+                    );
+                } else if self.global_search.is_searching() {
+                    let text = format!("{} 件（検索中）", self.global_search.total_valid);
+                    ui.label(
+                        egui::RichText::new(text)
+                            .size(11.0)
+                            .color(egui::Color32::from_rgb(180, 180, 80)),
+                    )
+                    .on_hover_text(format!(
+                        "候補 {} 件を確認済み",
+                        self.global_search.total_scanned
+                    ));
+                } else if self.global_search.done {
+                    let text = if self.global_search.truncated {
+                        format!(
+                            "{} 件で打ち切り (絞り込みキーワードを追加してください)",
+                            self.global_search.total_valid
+                        )
+                    } else {
+                        format!("{} 件", self.global_search.total_valid)
+                    };
+                    let color = if self.global_search.truncated {
+                        egui::Color32::from_rgb(200, 140, 40)
+                    } else {
+                        egui::Color32::from_gray(140)
+                    };
+                    ui.label(egui::RichText::new(text).size(11.0).color(color));
+                }
+
                 // ── 絞り込みドロップダウン (§19.7) ──
                 // お気に入り (auto_index_metadata=true のもののみ候補にする)
                 {
@@ -1683,41 +1747,6 @@ impl App {
                     filter_changed = true;
                 }
 
-                // 進捗/結果バッジ
-                ui.separator();
-                if let Some(msg) = &self.global_search.reject_message {
-                    ui.label(
-                        egui::RichText::new(msg)
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(200, 120, 40)),
-                    );
-                } else if self.global_search.pending.is_some() && !self.global_search.done {
-                    let progress = format!(
-                        "検索中... {} 件 (候補 {})",
-                        self.global_search.total_valid, self.global_search.total_scanned
-                    );
-                    ui.label(
-                        egui::RichText::new(progress)
-                            .size(11.0)
-                            .color(egui::Color32::from_rgb(180, 180, 80)),
-                    );
-                } else if self.global_search.done {
-                    let text = if self.global_search.truncated {
-                        format!(
-                            "{} 件で打ち切り (絞り込みキーワードを追加してください)",
-                            self.global_search.total_valid
-                        )
-                    } else {
-                        format!("{} 件", self.global_search.total_valid)
-                    };
-                    let color = if self.global_search.truncated {
-                        egui::Color32::from_rgb(200, 140, 40)
-                    } else {
-                        egui::Color32::from_gray(140)
-                    };
-                    ui.label(egui::RichText::new(text).size(11.0).color(color));
-                }
-
                 // ── ソート切替 (Aggregated ビューのみ) ──
                 // 件数バッジの右側で「ソート: <現在のモード>」のドロップダウンを出す。
                 // DrilledInto 中は Aggregated のソートが影響しないので隠す。
@@ -1791,6 +1820,7 @@ impl App {
             // 新 spawn を skip し、結果 0 件のまま固着する。
             self.global_search.last_executed.clear();
             self.rebuild_items_from_global_search();
+            ctx.request_repaint_after(Duration::from_millis(DEBOUNCE_MS));
         }
         if sort_changed {
             // ソート変更はクエリ再実行不要 — items を並べ替えるだけ。
@@ -2011,6 +2041,23 @@ mod tests {
     }
 
     #[test]
+    fn is_searching_includes_debounce_wait_but_not_done_or_empty() {
+        let mut state = GlobalSearchState::default();
+        state.active = true;
+        assert!(!state.is_searching());
+
+        state.query = "グルグル".to_string();
+        state.last_executed.clear();
+        assert!(state.is_searching());
+
+        state.last_executed = state.query.clone();
+        assert!(!state.is_searching());
+
+        state.done = true;
+        assert!(!state.is_searching());
+    }
+
+    #[test]
     fn all_hits_preserved_for_drill_down() {
         let mut state = GlobalSearchState::default();
         state.accumulate_hit(&GlobalHit {
@@ -2037,12 +2084,12 @@ mod tests {
     fn accumulate_mixed_folders_and_zips() {
         let mut state = GlobalSearchState::default();
         state.accumulate_hit(&GlobalHit {
-            path: "c:/album.zip!0001.jpg".into(),
+            path: zip_hit("c:/album.zip", "0001.jpg"),
             score: 1.0,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
-            path: "c:/album.zip!0002.jpg".into(),
+            path: zip_hit("c:/album.zip", "0002.jpg"),
             score: 1.0,
             stars: 0,
         });
@@ -2256,13 +2303,13 @@ mod tests {
     fn build_drilled_zip_items_shows_only_entries_of_target_zip() {
         let mut state = GlobalSearchState::default();
         for p in [
-            "c:/archives/target.zip!folder/pic1.jpg",
-            "c:/archives/target.zip!folder/pic2.jpg",
-            "c:/archives/other.zip!x.jpg", // 別 ZIP
-            "c:/loose/z.jpg",              // 通常ファイル
+            zip_hit("c:/archives/target.zip", "folder/pic1.jpg"),
+            zip_hit("c:/archives/target.zip", "folder/pic2.jpg"),
+            zip_hit("c:/archives/other.zip", "x.jpg"), // 別 ZIP
+            "c:/loose/z.jpg".to_string(),              // 通常ファイル
         ] {
             state.accumulate_hit(&GlobalHit {
-                path: p.into(),
+                path: p,
                 score: 1.0,
                 stars: 0,
             });

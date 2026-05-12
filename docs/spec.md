@@ -481,7 +481,7 @@ Ctrl+F (ローカル検索) はこれらの制約を受けない。
 |---|---|---|---|
 | Ctrl+S | お気に入り全体のフォルダ / ZIP / PDF / 動画名 | `search_index.db` (SQLite LIKE) | 既存実装を継続 |
 | Ctrl+F | **現在グリッドに表示中の一覧のみ** (非再帰) | worker 上のオンデマンド読み取り (PNG tEXt + EXIF + XMP + PDF info + 動画 metadata / sidecar tags) | ZIP 展開中は ZIP 内エントリ画像も対象。PDF はタイトル/著者/件名/キーワード、動画は FFmpeg が読める title/artist/description/URL/chapter title と `.xmp` サイドカータグで絞り込む |
-| Ctrl+G | **お気に入り全体 (`auto_index_metadata=true`)** | Tantivy bigram 索引で候補絞り込み → STORED 原文を `matches()` で phrase/NOT/AND 正確判定 (streaming) | 通常ファイル (画像 / 動画) + ZIP ファイル名 + PDF document info が対象。動画は `video_meta_text` と `tags`、PDF は `pdf_meta_text` に分けて検索対象フィルタから選べる |
+| Ctrl+G | **お気に入り全体 (`auto_index_metadata=true`)** | Tantivy bigram 索引で候補絞り込み → STORED 原文を `matches()` で phrase/NOT/AND 正確判定 (streaming) | 通常ファイル (画像 / 動画) + ZIP ファイル名 + PDF document info が対象。動画は `video_meta_text` と `tags`、PDF は `pdf_meta_text` に分けて検索対象フィルタから選べる。検索中はバー / アドレス欄 / 空グリッド中央に「検索中」を表示し、0 件確定と区別する |
 
 #### AI メタデータ検索の Negative Prompt 除外
 
@@ -661,6 +661,7 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - [x] Searcher snapshot 固定 + ページング取得 (`TopDocs::with_limit(500).and_offset()`)
 - [x] post-filter で phrase / NOT / AND を正確判定 (bigram だけでは position=0 で不正確なため)
 - [x] HARD_MAX=10,000 で打ち切り (streaming で逐次表示、最初のページは ~5ms)
+- [x] Ctrl+G 検索中表示 (検索バーの件数、アドレス欄、0 件表示前の空グリッドで未確定状態を明示)
 - [x] Ctrl+G drill-down view (SearchContainer クリックでコンテナ内ヒット一覧に遷移、BS/← で戻る)
 - [x] **Ctrl+F を worker 上のオンデマンド検索に統一** (PNG / EXIF / XMP / PDF info / 動画メタ / タグを target に応じて読む)
 - [x] `FavoriteEntry` に `id: Uuid` + `auto_index_{structure,metadata,thumbs}` 3 フラグ追加
