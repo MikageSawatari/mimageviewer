@@ -1,7 +1,7 @@
 //! 名前索引 (Ctrl+S 検索用 `search_index_db`) のバックグラウンドバルクスキャナ。
 //!
 //! お気に入りで「名前」フル索引化フラグ (`auto_index_structure=true`) を ON にしたとき、
-//! その favorite 配下を一度だけ再帰的に走査してフォルダ / ZIP / PDF 名を一括登録する。
+//! その favorite 配下を一度だけ再帰的に走査してフォルダ / ZIP / PDF / 動画名を一括登録する。
 //!
 //! - 閲覧時自動追記の経路は廃止された (`src/app.rs::load_folder` の "訪問時自動索引化は廃止"
 //!   コメント参照)。現在は `NameIndexSupervisor` の起動時バルク + notify-rs 監視で
@@ -15,7 +15,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::folder_tree::{is_apple_double, walk_dirs_recursive_with_progress};
+use crate::folder_tree::{
+    SUPPORTED_VIDEO_EXTENSIONS, is_apple_double, walk_dirs_recursive_with_progress,
+};
 use crate::indexer_progress::ProgressReporter;
 use crate::search_index_db::{IndexEntry, IndexKind, SearchIndexDb};
 
@@ -131,7 +133,7 @@ pub fn run_bulk_name_index(
     summary.folders_visited = found.len();
     let total_folders = found.len();
 
-    // Pass 2: 各フォルダ直下の Folder / ZipFile / PdfFile を集めて upsert
+    // Pass 2: 各フォルダ直下の Folder / ZipFile / PdfFile / VideoFile を集めて upsert
     for (i, folder) in found.iter().enumerate() {
         // フォルダ 1 つ分を処理してから次でまた判定 (gate + cancel 両対応)。
         if crate::activity_gate::wait_and_check_cancel(activity_gate, cancel) {
@@ -174,7 +176,7 @@ pub fn run_bulk_name_index(
         }
         // **Codex P2 #1 回帰修正 (2026-04)**: `children.is_empty()` でも continue せず、
         // `upsert_children` を呼び出す。旧実装はここで skip していたため、アプリ停止中に
-        // 子フォルダ/ZIP/PDF がすべて削除されて「空になった親フォルダ」では、
+        // 子フォルダ/ZIP/PDF/動画がすべて削除されて「空になった親フォルダ」では、
         // upsert_children の DELETE が走らず古い行が残り続けるバグがあった。
         // (tests/search_name_e2e.rs::full_scan_removes_stale_entries_from_became_empty_folder)
         // upsert_children は DELETE → INSERT の順なので、children が空のときは
@@ -311,6 +313,11 @@ pub fn classify_name_index_kind(
         Some(IndexKind::ZipFile)
     } else if ext.eq_ignore_ascii_case("pdf") {
         Some(IndexKind::PdfFile)
+    } else if SUPPORTED_VIDEO_EXTENSIONS
+        .iter()
+        .any(|video_ext| ext.eq_ignore_ascii_case(video_ext))
+    {
+        Some(IndexKind::VideoFile)
     } else {
         None
     }
@@ -386,14 +393,15 @@ mod tests {
     /// 既存 `bulk_collects_folders_zips_pdfs_and_ignores_other_files` は depth 2 までしか
     /// カバーしていなかった。
     #[test]
-    fn bulk_indexes_zip_pdf_at_depth_three() {
+    fn bulk_indexes_zip_pdf_video_at_depth_three() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("fav");
-        // root/a/b/c/leaf.zip と leaf.pdf
+        // root/a/b/c/leaf.zip と leaf.pdf と leaf.mp4
         let c = root.join("a").join("b").join("c");
         mkdir(&c);
         touch(&c.join("leaf.zip"));
         touch(&c.join("leaf.pdf"));
+        touch(&c.join("leaf.mp4"));
 
         let db = SearchIndexDb::open_in_memory().unwrap();
         let cancel = AtomicBool::new(false);
@@ -402,18 +410,23 @@ mod tests {
         // folders_visited = root + a + b + c = 4
         assert_eq!(summary.folders_visited, 4);
         // entries_written: root直下=a(Folder)=1, a直下=b(Folder)=1, b直下=c(Folder)=1,
-        //                  c直下=leaf.zip + leaf.pdf = 2  → 合計 5
-        assert_eq!(summary.entries_written, 5);
+        //                  c直下=leaf.zip + leaf.pdf + leaf.mp4 = 3  → 合計 6
+        assert_eq!(summary.entries_written, 6);
         assert!(!summary.cancelled);
 
-        // 深い場所の ZIP / PDF も検索ヒット
+        // 深い場所の ZIP / PDF / 動画も検索ヒット
         let leaf = db
             .search("leaf", &[root.clone()], crate::search_query::MatchMode::And)
             .unwrap();
-        assert_eq!(leaf.len(), 2, "leaf.zip + leaf.pdf が 2 件ヒット");
+        assert_eq!(
+            leaf.len(),
+            3,
+            "leaf.zip + leaf.pdf + leaf.mp4 が 3 件ヒット"
+        );
         let kinds: Vec<IndexKind> = leaf.iter().map(|e| e.kind).collect();
         assert!(kinds.contains(&IndexKind::ZipFile));
         assert!(kinds.contains(&IndexKind::PdfFile));
+        assert!(kinds.contains(&IndexKind::VideoFile));
     }
 
     #[test]

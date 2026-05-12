@@ -25,7 +25,7 @@
 //!
 //! 2026-04 ユーザー指摘: 旧 `name_bulk_indexer::spawn_bulk` は初期 1 回だけ走って
 //! 終了していたため、「✅ 索引あり」表示はスナップショット時点の静的状態を示すに
-//! 過ぎず、その後 FS に追加されたフォルダ/ZIP/PDF は Ctrl+S 検索にヒットしなかった。
+//! 過ぎず、その後 FS に追加されたフォルダ/ZIP/PDF/動画は Ctrl+S 検索にヒットしなかった。
 //! この module が FsWatcher を握って差分追従する責務を担う。
 
 use std::path::{Path, PathBuf};
@@ -610,7 +610,7 @@ fn run_subtree_scan(
         return SubtreeScanOutcome::Cancelled;
     }
 
-    // Pass 2: 各フォルダ直下の Folder/ZipFile/PdfFile を upsert
+    // Pass 2: 各フォルダ直下の Folder/ZipFile/PdfFile/VideoFile を upsert
     for folder in &subtree_folders {
         if crate::activity_gate::wait_and_check_cancel(activity_gate, cancel) {
             return SubtreeScanOutcome::Cancelled;

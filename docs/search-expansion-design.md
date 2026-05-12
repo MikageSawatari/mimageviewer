@@ -27,7 +27,7 @@
 
 | ショートカット | スコープ | 経路 |
 | --- | --- | --- |
-| Ctrl+S | お気に入り全体のフォルダ / ZIP / PDF 名 (再帰) | `search_index.db` (SQLite LIKE) |
+| Ctrl+S | お気に入り全体のフォルダ / ZIP / PDF / 動画名 (再帰) | `search_index.db` (SQLite LIKE) |
 | Ctrl+F | 現在グリッドに表示中の一覧のみ (非再帰) | `fts_meta.db` 直接 lookup + 未登録分 on-demand fallback |
 | Ctrl+G | お気に入り全体 + ZIP 内画像 (再帰) | Tantivy bigram 候補絞り込み + `fts_meta.db` post-filter の streaming |
 
@@ -126,7 +126,7 @@ mimageviewer 本体は MIT なのでいずれも組み込み可能。再配布�
 
 | ファイル | 目的 | 技術 |
 | --- | --- | --- |
-| `search_index.db` | Ctrl+S 用フォルダ/ZIP/PDF 構造 index | SQLite |
+| `search_index.db` | Ctrl+S 用フォルダ/ZIP/PDF/動画 構造 index | SQLite |
 | `fts_index/` | Tantivy index ディレクトリ (複数 segment + meta.json) | Tantivy |
 | `fts_meta.db` | Tantivy で持ちにくいメタ情報 (mtime / size / status / ソース別 normalized 全文) | SQLite |
 
@@ -241,7 +241,7 @@ pub struct FavoriteEntry {
     pub id: Uuid,                      // 安定 ID
     pub name: String,
     pub path: PathBuf,
-    pub auto_index_structure: bool,    // Ctrl+S 用 (フォルダ / ZIP / PDF 名)
+    pub auto_index_structure: bool,    // Ctrl+S 用 (フォルダ / ZIP / PDF / 動画名)
     pub auto_index_metadata: bool,     // Ctrl+F / Ctrl+G 用 (全文メタ)
     pub auto_index_thumbs: bool,       // サムネイル事前キャッシュ
 }

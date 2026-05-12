@@ -4634,16 +4634,25 @@ impl App {
 
     /// SQLite 検索結果を `start_loading_items` に流し込む共通処理。
     fn apply_favsearch_results(&mut self, results: Vec<crate::search_index_db::IndexEntry>) {
-        let items: Vec<GridItem> = results
-            .iter()
-            .map(|e| match e.kind {
+        let mut items: Vec<GridItem> = Vec::with_capacity(results.len());
+        let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(results.len());
+        let mut video_items: Vec<(usize, PathBuf, u64)> = Vec::new();
+        for e in &results {
+            let item = match e.kind {
                 crate::search_index_db::IndexKind::Folder => GridItem::Folder(e.path.clone()),
                 crate::search_index_db::IndexKind::ZipFile => GridItem::ZipFile(e.path.clone()),
                 crate::search_index_db::IndexKind::PdfFile => GridItem::PdfFile(e.path.clone()),
-            })
-            .collect();
-        let image_metas: Vec<Option<(i64, i64)>> =
-            results.iter().map(|e| Some((e.mtime, 0))).collect();
+                crate::search_index_db::IndexKind::VideoFile => GridItem::Video(e.path.clone()),
+            };
+            let idx = items.len();
+            if matches!(item, GridItem::Video(_)) {
+                image_metas.push(None);
+                video_items.push((idx, e.path.clone(), 0));
+            } else {
+                image_metas.push(Some((e.mtime, 0)));
+            }
+            items.push(item);
+        }
         self.favsearch.results_paths = results.iter().map(|e| e.path.clone()).collect();
 
         let synthetic = search_results_synthetic_path();
@@ -4670,7 +4679,7 @@ impl App {
             items,
             image_metas,
             existing_keys,
-            Vec::new(),
+            video_items,
             None,
         );
         self.update_favsearch_address();

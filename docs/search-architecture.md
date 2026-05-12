@@ -13,7 +13,7 @@ mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の
 
 | ショートカット | 用途 | スコープ | 実装経路 |
 | --- | --- | --- | --- |
-| **Ctrl+S** | フォルダ / ZIP / PDF 名の横断検索 | お気に入り配下 (再帰) | `search_index.db` (SQLite LIKE) |
+| **Ctrl+S** | フォルダ / ZIP / PDF / 動画名の横断検索 | お気に入り配下 (再帰) | `search_index.db` (SQLite LIKE) |
 | **Ctrl+F** | ローカルメタ検索 | 現在グリッドに表示中の画像のみ (非再帰) | `fts_meta.db` 直接 lookup + 未登録分は on-demand fallback |
 | **Ctrl+G** | グローバルメタ検索 | お気に入り配下 (ZIP 内画像含む、再帰) | Tantivy bigram 候補絞り込み + `fts_meta.db` post-filter の streaming |
 
@@ -84,7 +84,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | --- | --- |
 | [fts_index.rs](../src/fts_index.rs) | Tantivy 0.26 ラッパ。`IndexDoc` / `Fields` / `QueryFilters` / `build_bigram_and_query` / `search_page` |
 | [fts_meta.rs](../src/fts_meta.rs) | `fts_meta.db` (SQLite) ラッパ。ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たず Tantivy STORED に集約 |
-| [search_index_db.rs](../src/search_index_db.rs) | Ctrl+S 用 `search_index.db` (フォルダ / ZIP / PDF 名のみ) |
+| [search_index_db.rs](../src/search_index_db.rs) | Ctrl+S 用 `search_index.db` (フォルダ / ZIP / PDF / 動画名) |
 
 ### 2.4 タグ機能
 
@@ -103,7 +103,7 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | パス | 目的 | 書き手 | 注記 |
 | --- | --- | --- | --- |
 | `settings.json` | `FavoriteEntry { id, name, path, auto_index_{structure,metadata,thumbs} }` + `tags: Vec<TagDef>` | [settings.rs](../src/settings.rs) | UUID が欠けている行は起動時に発行し書き戻し |
-| `search_index.db` | Ctrl+S 用フォルダ/ZIP/PDF 名 index (SQLite LIKE で引く) | `search_index_db.rs` | `indexed_by_auto` 列で手動/自動エントリを区別 |
+| `search_index.db` | Ctrl+S 用フォルダ/ZIP/PDF/動画名 index (SQLite LIKE で引く) | `search_index_db.rs` | `indexed_by_auto` 列で手動/自動エントリを区別 |
 | `fts_index/` | Tantivy index ディレクトリ (複数 segment ファイル + meta.json)。**INDEX_VERSION=5 以降は per-source `*_text` フィールドが STORED で原文を保持** | `fts_index.rs` → IngestSession / tag_write_worker | schema 変更は `schema_is_stale` (STORED 必須含む) で検出し全消去 + 再構築 |
 | `fts_meta.db` | `files(path PK, favorite_id, kind, mtime, size, indexed_at, index_version, index_generation, status)` — INDEX_VERSION=5 で `*_norm` 列群を撤去し管理メタ専用に縮小 | `fts_meta.rs` | `INDEX_VERSION` を bump すると `needs_rebuild` が `*_norm` 残存も検出して全再構築を促す |
 
@@ -204,7 +204,7 @@ idle になった最初のフレームで `spawn_housekeeping` から別スレ�
 
 ```
 NameIndexSupervisor (1 お気に入り 1 本):
-  1. name_bulk_indexer::run_bulk_name_index  …… フォルダ / ZIP / PDF の再帰列挙
+  1. name_bulk_indexer::run_bulk_name_index  …… フォルダ / ZIP / PDF / 動画の再帰列挙
   2. SearchIndexDb::upsert_children で差分反映 (INSERT OR REPLACE)
   3. FsWatcher でイベント受信 → name_index_supervisor::apply_single_change が
      try_exists() ベースで判定し、新規ディレクトリなら subtree 再帰 upsert、
@@ -213,7 +213,8 @@ NameIndexSupervisor (1 お気に入り 1 本):
 
 - メタ側と違い書き込み先が SQLite 単独なので複数お気に入りの supervisor は
   真の並列で動ける (Tantivy writer 単一制約がない)。
-- 画像個別は扱わない (画像の名前は Ctrl+F / Ctrl+G 側で拾う)。
+- 画像個別は扱わない (画像の名前は Ctrl+F / Ctrl+G 側で拾う)。動画ファイル名は
+  グリッド上で通常アイテムとして扱うため Ctrl+S の名前索引にも登録する。
 
 ### 4.5 FsWatcher と debounce、`apply_single_change` の挙動
 
@@ -231,7 +232,7 @@ NameIndexSupervisor (1 お気に入り 1 本):
 の 1 経路だけだった。これだと:
 
 - 起動後に深いサブツリーをコピー / 移動した場合、watcher overflow や個別イベント
-  欠落で「上位イベントだけ届く」と深い ZIP/PDF が索引に入らない (Codex P1)
+  欠落で「上位イベントだけ届く」と深い ZIP/PDF/動画が索引に入らない (Codex P1)
 - 深い `marker.zip` の Remove イベントだけ届くと、`new_top/mid/deep` の Folder 行が
   stale 残留する (`upsert_children` の DELETE は親直下しか触らない)
 - `read_dir(parent)` の `Err` を「親まるごと削除」と即断していたため、アクセス拒否 /
@@ -321,7 +322,7 @@ commit した最新原文を旧値で潰してしまうため、上記 #2 / #3 �
 
 ## 5. クエリ実行パス
 
-### 5.1 Ctrl+S — 構造 (フォルダ/ZIP/PDF) 名検索
+### 5.1 Ctrl+S — 構造 (フォルダ/ZIP/PDF/動画) 名検索
 
 ```
 UI (render_favsearch_bar)
@@ -331,7 +332,7 @@ UI (render_favsearch_bar)
               favorite_root IN (...) AND
               include 群を mode に応じて AND / OR 結合した LIKE
               AND exclude 群の NOT LIKE
-  → poll_favsearch が結果を受け取り GridItem::Folder/ZipFile/PdfFile に展開
+  → poll_favsearch が結果を受け取り GridItem::Folder/ZipFile/PdfFile/Video に展開
 ```
 
 Tantivy は通さない。SQLite LIKE の方が対象件数 (フォルダ構造の粒度) に対して
@@ -415,7 +416,7 @@ Tantivy に渡すと position=0 由来で誤判定するため **post-filter 側
 
 | DB | 担当 | 分離の根拠 |
 | --- | --- | --- |
-| `search_index.db` | Ctrl+S (フォルダ/ZIP/PDF 名) | 既存の手動 index 生成と互換。粒度が荒く SQLite LIKE で十分。書き込み先が SQLite 単独なので 複数 supervisor が真並列で動ける |
+| `search_index.db` | Ctrl+S (フォルダ/ZIP/PDF/動画名) | 既存の手動 index 生成と互換。粒度が荒く SQLite LIKE で十分。書き込み先が SQLite 単独なので 複数 supervisor が真並列で動ける |
 | `fts_index/` (Tantivy) | bigram 候補絞り込み + 検索原文 (`*_text` STORED) | Lucene 系 segment 構造。bigram 索引 + post-filter 用原文を集約することでクエリ経路から SQLite を外している |
 | `fts_meta.db` (SQLite) | ファイル管理メタ (path / mtime / size / status=Ok\|Failed / index_generation) | 差分検出 (walker) の高速 IN 句 lookup、Tantivy に「どの doc が最新か」の真実の源、起動時 reconciliation で Failed 行を再 ingest 候補に集める |
 

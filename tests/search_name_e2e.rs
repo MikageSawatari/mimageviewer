@@ -7,8 +7,8 @@
 //! 「✅ 索引あり」表示がスナップショット時点の静的状態を示すに過ぎなかった
 //! (2026-04 のユーザ指摘)。本ファイルでは:
 //!
-//! - 初期バルクで期待フォルダ/ZIP/PDF が索引化されること
-//! - FsWatcher 経由で **追加された** フォルダ/ZIP/PDF が索引に載ること
+//! - 初期バルクで期待フォルダ/ZIP/PDF/動画が索引化されること
+//! - FsWatcher 経由で **追加された** フォルダ/ZIP/PDF/動画が索引に載ること
 //! - **削除された** エントリが索引から消えること
 //! - クエリ構文 (include / exclude) が SQLite LIKE で正しく動くこと
 //! - お気に入りフィルタ (favorite_roots) が漏れないこと
@@ -89,10 +89,10 @@ fn initial_bulk_indexes_folders_and_zips() {
 // notify-rs 監視 (名前索引の "continuous" 挙動 — v0.8.0 新機能の回帰ガード)
 // -----------------------------------------------------------------------
 
-/// 初期バルクで **深い** ZIP/PDF/Folder (depth 3+) が索引化されることを正方向で確認。
+/// 初期バルクで **深い** ZIP/PDF/動画/Folder (depth 3+) が索引化されることを正方向で確認。
 ///
 /// prune 系テスト (`full_scan_removes_offline_deleted_subtree` 等) が暗黙的に depth 3 を
-/// カバーしているが、「深い ZIP/PDF が初期バルク完了後の Ctrl+S で検索ヒットする」 を
+/// カバーしているが、「深い ZIP/PDF/動画 が初期バルク完了後の Ctrl+S で検索ヒットする」 を
 /// 主張する単独テストは無かった (Codex P2 レビュー指摘で premise 誤りを訂正)。
 /// `walk_dirs_recursive_with_progress` の再帰が将来止まったらここで検知できる。
 #[test]
@@ -105,12 +105,14 @@ fn initial_bulk_indexes_zip_pdf_at_depth_three_or_four() {
     //   root/L1/L2/deep_marker_folder/  (画像入り)
     //   root/L1/L2/L3/very_deep_marker.zip
     //   root/L1/L2/L3/very_deep_marker.pdf
+    //   root/L1/L2/L3/very_deep_marker.mp4
     mkdir_with_image(&root, "top_marker_folder");
     mkdir_with_image(&root, "L1/mid_marker_folder");
     mkdir_with_image(&root, "L1/L2/deep_marker_folder");
     let l3 = root.mkdir("L1/L2/L3");
     write_empty_zip(&l3.join("very_deep_marker.zip"));
     std::fs::write(l3.join("very_deep_marker.pdf"), b"fake").expect("write pdf");
+    std::fs::write(l3.join("very_deep_marker.mp4"), b"fake").expect("write video");
 
     let fav = make_favorite("A", root.path());
     let (db, handle) = start_name_index_at(data.path(), &fav);
@@ -121,12 +123,13 @@ fn initial_bulk_indexes_zip_pdf_at_depth_three_or_four() {
     let very_deep = name_index_search(&db, "very_deep_marker", &roots);
     assert_eq!(
         very_deep.len(),
-        2,
-        "depth-4 の very_deep_marker.{{zip,pdf}} が 2 件ヒットすべき (got {very_deep:?})"
+        3,
+        "depth-4 の very_deep_marker.{{zip,pdf,mp4}} が 3 件ヒットすべき (got {very_deep:?})"
     );
     let kinds: Vec<IndexKind> = very_deep.iter().map(|e| e.kind).collect();
     assert!(kinds.contains(&IndexKind::ZipFile));
     assert!(kinds.contains(&IndexKind::PdfFile));
+    assert!(kinds.contains(&IndexKind::VideoFile));
 
     let deep_folder = name_index_search(&db, "deep_marker_folder", &roots);
     assert_eq!(deep_folder.len(), 1, "depth-3 Folder がヒットすべき");
@@ -192,7 +195,7 @@ fn watcher_indexes_new_zip() {
     assert_eq!(hits[0].kind, IndexKind::ZipFile);
 }
 
-/// **B4 (Codex P1): 起動後に深いサブツリーを丸ごと追加すると、深い ZIP/PDF も索引化される。**
+/// **B4 (Codex P1): 起動後に深いサブツリーを丸ごと追加すると、深い ZIP/PDF/動画も索引化される。**
 ///
 /// `apply_single_change` の再帰版が機能していることを e2e で確認。`run_subtree_scan` が
 /// changed_path 配下を再帰的に enumerate して各フォルダの直接子を `upsert_children` する。
@@ -212,17 +215,22 @@ fn watcher_indexes_deep_subtree_added_after_initial() {
     std::fs::create_dir_all(&deep).expect("mkdir -p deep");
     write_empty_zip(&deep.join("very_deep_marker_added.zip"));
     std::fs::write(deep.join("very_deep_marker_added.pdf"), b"fake").expect("write pdf");
+    std::fs::write(deep.join("very_deep_marker_added.mp4"), b"fake").expect("write video");
 
     let roots = vec![fav.path.clone()];
 
-    // 深い ZIP/PDF が index に入ること
+    // 深い ZIP/PDF/動画 が index に入ること
     wait_for_name_index_hits(
         &db,
         "very_deep_marker_added",
         &roots,
-        |h| h.len() >= 2,
+        |h| {
+            h.iter().any(|e| e.kind == IndexKind::ZipFile)
+                && h.iter().any(|e| e.kind == IndexKind::PdfFile)
+                && h.iter().any(|e| e.kind == IndexKind::VideoFile)
+        },
         FS_EVENT_TIMEOUT,
-        "name index picks up deep ZIP/PDF added after initial scan (apply_single_change recursion)",
+        "name index picks up deep ZIP/PDF/video added after initial scan (apply_single_change recursion)",
     );
     // 中間フォルダもヒット
     wait_for_name_index_hits(
@@ -257,6 +265,7 @@ fn watcher_prunes_deep_subtree_on_removal() {
     std::fs::create_dir_all(&deep).expect("mkdir -p deep");
     write_empty_zip(&deep.join("doomed_marker.zip"));
     std::fs::write(deep.join("doomed_marker.pdf"), b"fake").expect("write pdf");
+    std::fs::write(deep.join("doomed_marker.mp4"), b"fake").expect("write video");
 
     let fav = make_favorite("A", root.path());
     let (db, handle) = start_name_index_at(data.path(), &fav);
@@ -268,8 +277,8 @@ fn watcher_prunes_deep_subtree_on_removal() {
     let before = name_index_search(&db, "doomed_marker", &roots);
     assert_eq!(
         before.len(),
-        2,
-        "初期バルクで doomed_marker.zip/pdf がヒット"
+        3,
+        "初期バルクで doomed_marker.zip/pdf/mp4 がヒット"
     );
     let mid_before = name_index_search(&db, "mid", &roots);
     assert!(
@@ -280,14 +289,14 @@ fn watcher_prunes_deep_subtree_on_removal() {
     // サブツリーを丸ごと削除
     std::fs::remove_dir_all(root.path().join("dying_top_uvw5")).expect("remove deep subtree");
 
-    // doomed_marker.zip/pdf が消える
+    // doomed_marker.zip/pdf/mp4 が消える
     wait_for_name_index_hits(
         &db,
         "doomed_marker",
         &roots,
         |h| h.is_empty(),
         FS_EVENT_TIMEOUT,
-        "name index removes deep ZIP/PDF when subtree removed",
+        "name index removes deep ZIP/PDF/video when subtree removed",
     );
     // 中間フォルダ (mid / deep / dying_top_uvw5) も消える (ancestor chain prune)
     wait_for_name_index_hits(
@@ -560,21 +569,22 @@ fn nested_favorites_both_scopes_find_shared_path() {
 }
 
 // -----------------------------------------------------------------------
-// 表示種別の分類 (Ctrl+S 検索結果が Folder / ZipFile / PdfFile を正しく返す)
+// 表示種別の分類 (Ctrl+S 検索結果が Folder / ZipFile / PdfFile / VideoFile を正しく返す)
 // -----------------------------------------------------------------------
 
-/// Ctrl+S 検索結果で Folder / ZipFile / PdfFile の 3 種別が期待通りの `IndexKind` で
+/// Ctrl+S 検索結果で Folder / ZipFile / PdfFile / VideoFile の 4 種別が期待通りの `IndexKind` で
 /// 返ってくること (UI 側のアイコン / ダブルクリック挙動の分岐に影響するため)。
 ///
 /// 2026-04 ユーザー要望: Ctrl+S の検索結果表示で各種別の動作確認テストが欲しい。
 #[test]
-fn name_search_classifies_folder_zip_and_pdf() {
+fn name_search_classifies_folder_zip_pdf_and_video() {
     let data = FixtureRoot::new();
     let root = FixtureRoot::new();
-    // 名前索引対象の 3 種別を 1 つずつ配置 (画像ファイル (png/jpg) は名前索引対象外)
+    // 名前索引対象の 4 種別を 1 つずつ配置 (画像ファイル (png/jpg) は名前索引対象外)
     mkdir_with_image(&root, "mixed_folder_xuq8");
     write_empty_zip(&root.path().join("mixed_archive_xuq8.zip"));
     std::fs::write(root.path().join("mixed_document_xuq8.pdf"), b"fake").expect("write pdf");
+    std::fs::write(root.path().join("mixed_movie_xuq8.mp4"), b"fake").expect("write video");
 
     let fav = make_favorite("A", root.path());
     let (db, handle) = start_name_index_at(data.path(), &fav);
@@ -582,7 +592,7 @@ fn name_search_classifies_folder_zip_and_pdf() {
 
     let roots = vec![fav.path.clone()];
     let hits = name_index_search(&db, "mixed", &roots);
-    assert_eq!(hits.len(), 3, "3 種別が全ヒット: {hits:?}");
+    assert_eq!(hits.len(), 4, "4 種別が全ヒット: {hits:?}");
 
     // 名前で辿れるように HashMap に詰める
     let by_name: std::collections::HashMap<&str, IndexKind> = hits
@@ -603,6 +613,11 @@ fn name_search_classifies_folder_zip_and_pdf() {
         by_name.get("mixed_document_xuq8.pdf").copied(),
         Some(IndexKind::PdfFile),
         "pdf の kind が PdfFile でない: {hits:?}"
+    );
+    assert_eq!(
+        by_name.get("mixed_movie_xuq8.mp4").copied(),
+        Some(IndexKind::VideoFile),
+        "video の kind が VideoFile でない: {hits:?}"
     );
 }
 

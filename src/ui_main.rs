@@ -1133,8 +1133,9 @@ impl App {
                 ui.label("検索:");
                 let response = ui.add_sized(
                     [320.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.favsearch.query)
-                        .hint_text(r#"お気に入り配下のフォルダ/ZIP/PDF 名 (AND / -除外 / "…")"#),
+                    egui::TextEdit::singleline(&mut self.favsearch.query).hint_text(
+                        r#"お気に入り配下のフォルダ/ZIP/PDF/動画名 (AND / -除外 / "…")"#,
+                    ),
                 );
 
                 if self.favsearch.focus_request {

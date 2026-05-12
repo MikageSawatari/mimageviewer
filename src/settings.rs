@@ -30,7 +30,7 @@ pub struct FavoriteEntry {
     pub id: Uuid,
     pub name: String,
     pub path: PathBuf,
-    /// Ctrl+S (フォルダ/ZIP/PDF 名) の自動インデックス対象にするか。
+    /// Ctrl+S (フォルダ/ZIP/PDF/動画名) の自動インデックス対象にするか。
     pub auto_index_structure: bool,
     /// Ctrl+F/G (全文メタデータ) の自動インデックス対象にするか。
     pub auto_index_metadata: bool,

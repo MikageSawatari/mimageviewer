@@ -1,4 +1,4 @@
-//! お気に入り配下のフォルダ・ZIP・PDF 名を記録する検索インデックス DB。
+//! お気に入り配下のフォルダ・ZIP・PDF・動画名を記録する検索インデックス DB。
 //!
 //! `%APPDATA%/mimageviewer/search_index.db` に単一の SQLite ファイルとして保存される。
 //! - ブラウズ時の差分 upsert (お気に入り配下に入ったフォルダの直下アイテム)
@@ -24,6 +24,7 @@ pub enum IndexKind {
     Folder = 0,
     ZipFile = 1,
     PdfFile = 2,
+    VideoFile = 3,
 }
 
 impl IndexKind {
@@ -32,6 +33,7 @@ impl IndexKind {
             0 => Some(Self::Folder),
             1 => Some(Self::ZipFile),
             2 => Some(Self::PdfFile),
+            3 => Some(Self::VideoFile),
             _ => None,
         }
     }
@@ -711,6 +713,7 @@ mod tests {
                 entry(r"C:\FavA\one", "one", IndexKind::Folder),
                 entry(r"C:\FavA\two.zip", "two.zip", IndexKind::ZipFile),
                 entry(r"C:\FavA\three.pdf", "three.pdf", IndexKind::PdfFile),
+                entry(r"C:\FavA\four.mp4", "four.mp4", IndexKind::VideoFile),
             ],
         )
         .unwrap();
@@ -724,7 +727,7 @@ mod tests {
         let counts = db.count_grouped_by_favorite_root().unwrap();
         let key_a = normalize_path(&fav_a);
         let key_b = normalize_path(&fav_b);
-        assert_eq!(counts.get(&key_a), Some(&3));
+        assert_eq!(counts.get(&key_a), Some(&4));
         assert_eq!(counts.get(&key_b), Some(&1));
     }
 
@@ -737,9 +740,10 @@ mod tests {
             entry(r"C:\Fav\sub\alpha", "alpha", IndexKind::Folder),
             entry(r"C:\Fav\sub\beta.zip", "beta.zip", IndexKind::ZipFile),
             entry(r"C:\Fav\sub\gamma.pdf", "gamma.pdf", IndexKind::PdfFile),
+            entry(r"C:\Fav\sub\delta.mp4", "delta.mp4", IndexKind::VideoFile),
         ];
         db.upsert_children(&fav, &parent, &children).unwrap();
-        assert_eq!(db.total_count().unwrap(), 3);
+        assert_eq!(db.total_count().unwrap(), 4);
 
         let results = db
             .search("alp", &[], crate::search_query::MatchMode::And)
@@ -752,6 +756,12 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].kind, IndexKind::ZipFile);
+
+        let results = db
+            .search(".mp4", &[], crate::search_query::MatchMode::And)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].kind, IndexKind::VideoFile);
 
         // 大文字小文字無視
         let results = db
