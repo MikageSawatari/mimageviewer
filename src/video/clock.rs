@@ -77,16 +77,17 @@ pub(crate) fn format_playback_speed(speed: f64) -> String {
 /// **Precise** を使い、ホットキーによる相対シークだけ **Fast** を使う。
 ///
 /// どちらも `av_seek_frame(AVSEEK_FLAG_BACKWARD)` で keyframe ≤ target に着地する
-/// (= 共通基底)。違いは **video の preroll trim** を行うかどうか:
+/// (= 共通基底)。違いは **target 到達までの見せ方**:
 ///
 /// - **Precise**: video / audio 両方を target まで trim → target ぴったりに再生開始。
-/// - **Fast**: **video は trim 無し** (= keyframe pts から即時再生)、**audio は
-///   target まで trim** (= 通常 1x 再生)。Codex 2 巡目 P1 助言 (2026-05-01):
+/// - **Fast**: video は keyframe preview を 1 枚だけ表示し、その後 target 到達 frame
+///   までは pre-target frame を drop。audio は target まで trim する。
+///   Codex 2 巡目 P1 助言 (2026-05-01):
 ///   audio も trim 無しにすると、keyframe から物理再生する audio の `set_audio_pts`
 ///   monotonic guard が clock を target で凍結し、audio が target に追いつくまで
 ///   (= 数秒) clock が進まず video pacing も停止する (= 6-7 秒の動画フリーズ)。
-///   Fast では video のみ trim を省略して即時 keyframe 再生し、audio は target から
-///   スタートさせて target 直後から clock を 1x で進めることで freeze を回避する。
+///   Fast では audio は target で準備し、preview frame を readiness から分離することで、
+///   target frame 到着まで Buffering/無音のまま待ってから A/V を同時に再開する。
 ///
 /// **target 情報は両モードで `Flush.seek_target_secs = Some(target)` で送る** (Codex
 /// 1 巡目 P1 助言): trim 有無と target 情報を分離管理することで、Fast でも pump が
@@ -94,18 +95,18 @@ pub(crate) fn format_playback_speed(speed: f64) -> String {
 /// clock anchor が target に維持される (= timeline 表示が target 固定)。
 ///
 /// **Fast モードの視覚的トレードオフ (= 設計の意図)**:
-/// video が trim 無しで keyframe から再生されるため、最初の数 100ms 〜 数秒は GOP 1 個分
-/// の pre-target 内容が見える。decoder が keyframe → target を burst 消費し UI tick が
-/// その都度「最後の displayable」を表示するため、視覚的には早送り (~5x 〜 10x) で
-/// target に追いつく形になる。**audio は target からスタート** するので音の頭出し
-/// は target ぴったり。視覚 burst 完了後は audio / video / clock すべて target+wall で
-/// 1x 同期する (= freeze なし)。←→ 連打の skim 用途で受け入れるトレードオフ。
+/// keyframe preview によって「seek した」フィードバックは即時に出す。一方で preview
+/// は `FirstFrameReady` / seek override clear に使わないため、target frame が decode
+/// されるまで engine は Buffering のまま、audio callback は silence を返す。HW decode
+/// なら通常ほぼ一瞬で target に到達し、SW decode / 長 GOP では keyframe 静止画 → target
+/// へのジャンプになる。pre-target frame を連続表示しないので、シーク直後の「早送り」
+/// に見えるスクラブを避けられる。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeekKind {
     /// 正確な位置への seek (シークバー / ブックマーク / loop 再生 / EOF replay /
     /// 自動復元)。preroll decode + trim あり、target ぴったりに着地。
     Precise,
-    /// 高速 seek (←→ キー)。preroll trim を省略、keyframe 即時再生。
+    /// 高速 seek (←→ キー)。keyframe preview を 1 枚だけ表示し、target 到達まで待つ。
     Fast,
 }
 
@@ -586,9 +587,9 @@ impl AvClock {
 
     /// シーク種別を明示してシーク要求を出す。
     ///
-    /// [`SeekKind::Fast`] は preroll trim を省略するため keyframe pts に着地する
-    /// (= target ぴったりではない)。動画 timeline 表示は target で固定されるが、
-    /// 視聴コンテンツは 0〜3 秒程度先行する。詳細は [`SeekKind`] のコメント参照。
+    /// [`SeekKind::Fast`] は keyframe preview を即時表示し、target 到達 frame までは
+    /// readiness を進めない。動画 timeline 表示は target で固定される。
+    /// 詳細は [`SeekKind`] のコメント参照。
     pub fn request_seek_with_kind(&self, target_secs: f64, kind: SeekKind) {
         let clamped = target_secs.max(0.0);
         // post-EOF seek サポート: tick が EOF を見て pause しないように先にクリア。

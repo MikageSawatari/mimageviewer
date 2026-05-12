@@ -2309,7 +2309,9 @@ fn run_native_video_output(
                             "first-present",
                         );
                     }
-                    if source.first_frame_event_last_epoch != Some(serial) {
+                    let should_emit_first_frame_ready = !frame.is_seek_preview
+                        && source.first_frame_event_last_epoch != Some(serial);
+                    if should_emit_first_frame_ready {
                         if try_send_native_first_frame_ready(&source.engine_event_tx, serial, pts) {
                             source.first_frame_event_last_epoch = Some(serial);
                             source.pending_first_frame_event = None;
@@ -2317,16 +2319,19 @@ fn run_native_video_output(
                             source.pending_first_frame_event = Some((serial, pts));
                         }
                     }
-                    let now_for_clear = source.clock.now_secs();
-                    let frame_step_active = source.frame_step_active.load(Ordering::Acquire);
-                    if clock::pts_clears_seek_override(pts, now_for_clear) && frame_step_active {
-                        source.clock.set_paused_position(pts);
-                        source.clock.clear_seek_target_override(serial);
-                    } else if clock::pts_clears_seek_override(pts, now_for_clear)
-                        && !source.clock.is_audio_active()
-                    {
-                        source.clock.set_fallback_anchor(pts);
-                        source.clock.clear_seek_target_override(serial);
+                    if !frame.is_seek_preview {
+                        let now_for_clear = source.clock.now_secs();
+                        let frame_step_active = source.frame_step_active.load(Ordering::Acquire);
+                        if clock::pts_clears_seek_override(pts, now_for_clear) && frame_step_active
+                        {
+                            source.clock.set_paused_position(pts);
+                            source.clock.clear_seek_target_override(serial);
+                        } else if clock::pts_clears_seek_override(pts, now_for_clear)
+                            && !source.clock.is_audio_active()
+                        {
+                            source.clock.set_fallback_anchor(pts);
+                            source.clock.clear_seek_target_override(serial);
+                        }
                     }
                     if crate::perf::is_enabled() {
                         if trace_every_present
@@ -3067,11 +3072,9 @@ impl VideoPlayer {
     }
 
     /// 相対シーク (←→ ホットキー)。
-    /// **[`SeekKind::Fast`]**: keyframe ≤ target に backward seek し、preroll trim
-    /// を省略して即時再生開始する。←→ 連打の体感速度を最優先。
-    /// 着地位置は target ぴったりではなく keyframe pts (= target - 0〜3 秒程度) で、
-    /// 動画 timeline 表示は target を指すが視聴コンテンツは GOP 1 個分だけ先行する形に
-    /// なる。0〜3 秒の wall 経過で audio が target に追いつき完全同期する。
+    /// **[`SeekKind::Fast`]**: keyframe ≤ target に backward seek し、keyframe preview を
+    /// 1 枚だけ即時表示する。その preview は readiness に使わず、target 到達 frame まで
+    /// A/V は Buffering/無音で待ってから同時に再開する。
     /// 一時停止中なら自動的に再生再開する。
     pub fn seek_relative(&self, delta_secs: f64) {
         self.clear_frame_step_target();
@@ -3847,6 +3850,7 @@ impl VideoPlayer {
         let upload_ms: f64 = 0.0;
         if let Some(frame) = latest_renderable {
             let pts_for_log = frame.pts_secs;
+            let is_seek_preview = frame.is_seek_preview;
             // GPU フレームは `gpu_latest` に **所有権ごと** 引き取り、UI は handle を
             // view で参照する。これで前フレームの HANDLE が次フレーム到着まで保持され、
             // 描画中に CloseHandle される race を防ぐ。
@@ -3866,45 +3870,52 @@ impl VideoPlayer {
                          (pts={pts:.3}, serial={serial})"
                         ));
                     }
-                    let now_for_clear = self.clock.now_secs();
-                    if clock::pts_clears_seek_override(pts, now_for_clear) {
-                        if self.is_frame_step_active() {
-                            self.clock.set_paused_position(pts);
-                            self.clock.clear_seek_target_override(serial);
-                        } else if self.clock.is_audio_active() {
-                            if self.clock.is_seeking() && crate::perf::is_enabled() {
-                                crate::perf::event(
-                                    "video",
-                                    "seek_override_wait_audio_gpu",
-                                    None,
-                                    0,
-                                    &[
-                                        ("frame_pts", serde_json::Value::from(pts)),
-                                        ("now", serde_json::Value::from(now_for_clear)),
-                                        ("frame_serial", serde_json::Value::from(serial as i64)),
-                                    ],
-                                );
+                    if !is_seek_preview {
+                        let now_for_clear = self.clock.now_secs();
+                        if clock::pts_clears_seek_override(pts, now_for_clear) {
+                            if self.is_frame_step_active() {
+                                self.clock.set_paused_position(pts);
+                                self.clock.clear_seek_target_override(serial);
+                            } else if self.clock.is_audio_active() {
+                                if self.clock.is_seeking() && crate::perf::is_enabled() {
+                                    crate::perf::event(
+                                        "video",
+                                        "seek_override_wait_audio_gpu",
+                                        None,
+                                        0,
+                                        &[
+                                            ("frame_pts", serde_json::Value::from(pts)),
+                                            ("now", serde_json::Value::from(now_for_clear)),
+                                            (
+                                                "frame_serial",
+                                                serde_json::Value::from(serial as i64),
+                                            ),
+                                        ],
+                                    );
+                                }
+                            } else {
+                                self.clock.set_fallback_anchor(pts);
+                                self.clock.clear_seek_target_override(serial);
                             }
-                        } else {
-                            self.clock.set_fallback_anchor(pts);
-                            self.clock.clear_seek_target_override(serial);
+                        } else if self.clock.is_seeking() && crate::perf::is_enabled() {
+                            // override 中で frame pts < target - 0.75 (= preroll 不足で
+                            // 解除条件を満たさない経路) を perflog から特定するための診断。
+                            crate::perf::event(
+                                "video",
+                                "seek_override_skip_clear_gpu",
+                                None,
+                                0,
+                                &[
+                                    ("frame_pts", serde_json::Value::from(pts)),
+                                    ("now", serde_json::Value::from(now_for_clear)),
+                                    ("frame_serial", serde_json::Value::from(serial as i64)),
+                                ],
+                            );
                         }
-                    } else if self.clock.is_seeking() && crate::perf::is_enabled() {
-                        // override 中で frame pts < target - 0.75 (= preroll 不足で
-                        // 解除条件を満たさない経路) を perflog から特定するための診断。
-                        crate::perf::event(
-                            "video",
-                            "seek_override_skip_clear_gpu",
-                            None,
-                            0,
-                            &[
-                                ("frame_pts", serde_json::Value::from(pts)),
-                                ("now", serde_json::Value::from(now_for_clear)),
-                                ("frame_serial", serde_json::Value::from(serial as i64)),
-                            ],
-                        );
                     }
-                    self.emit_first_frame_event(pts);
+                    if !is_seek_preview {
+                        self.emit_first_frame_event(pts);
+                    }
                     self.last_displayed_pts_bits
                         .store(pts.to_bits(), Ordering::Release);
                     self.displayed_frame_seq.fetch_add(1, Ordering::Release);
@@ -3920,58 +3931,62 @@ impl VideoPlayer {
                     // 場合に override を消すと、シークバーが target → 元位置にスナップバック
                     // する (= 「← シークが効かない」現象の本質)。target 近傍チェックを
                     // 入れて「シークが物理的に成功した」ときだけ通常クロックに戻す。
-                    let now_after = self.clock.now_secs();
-                    if clock::pts_clears_seek_override(frame.pts_secs, now_after) {
-                        // Audio-active playback must let fill_output clear the override only
-                        // when the first audible post-seek samples actually reach the output.
-                        // Clearing from video here starts the visual clock before audio is ready
-                        // and produces AV drift on high-rate files with deep audio queues.
-                        if self.is_frame_step_active() {
-                            self.clock.set_paused_position(frame.pts_secs);
-                            self.clock.clear_seek_target_override(frame.seek_serial);
-                        } else if self.clock.is_audio_active() {
-                            if self.clock.is_seeking() && crate::perf::is_enabled() {
-                                crate::perf::event(
-                                    "video",
-                                    "seek_override_wait_audio_cpu",
-                                    None,
-                                    0,
-                                    &[
-                                        ("frame_pts", serde_json::Value::from(frame.pts_secs)),
-                                        ("now", serde_json::Value::from(now_after)),
-                                        (
-                                            "frame_serial",
-                                            serde_json::Value::from(frame.seek_serial as i64),
-                                        ),
-                                    ],
-                                );
+                    if !is_seek_preview {
+                        let now_after = self.clock.now_secs();
+                        if clock::pts_clears_seek_override(frame.pts_secs, now_after) {
+                            // Audio-active playback must let fill_output clear the override only
+                            // when the first audible post-seek samples actually reach the output.
+                            // Clearing from video here starts the visual clock before audio is ready
+                            // and produces AV drift on high-rate files with deep audio queues.
+                            if self.is_frame_step_active() {
+                                self.clock.set_paused_position(frame.pts_secs);
+                                self.clock.clear_seek_target_override(frame.seek_serial);
+                            } else if self.clock.is_audio_active() {
+                                if self.clock.is_seeking() && crate::perf::is_enabled() {
+                                    crate::perf::event(
+                                        "video",
+                                        "seek_override_wait_audio_cpu",
+                                        None,
+                                        0,
+                                        &[
+                                            ("frame_pts", serde_json::Value::from(frame.pts_secs)),
+                                            ("now", serde_json::Value::from(now_after)),
+                                            (
+                                                "frame_serial",
+                                                serde_json::Value::from(frame.seek_serial as i64),
+                                            ),
+                                        ],
+                                    );
+                                }
+                            } else {
+                                self.clock.set_fallback_anchor(frame.pts_secs);
+                                self.clock.clear_seek_target_override(frame.seek_serial);
                             }
-                        } else {
-                            self.clock.set_fallback_anchor(frame.pts_secs);
-                            self.clock.clear_seek_target_override(frame.seek_serial);
+                        } else if self.clock.is_seeking() && crate::perf::is_enabled() {
+                            // CPU 経路の同診断 (GPU 経路と分けて経路別の発火頻度を追える)。
+                            crate::perf::event(
+                                "video",
+                                "seek_override_skip_clear_cpu",
+                                None,
+                                0,
+                                &[
+                                    ("frame_pts", serde_json::Value::from(frame.pts_secs)),
+                                    ("now", serde_json::Value::from(now_after)),
+                                    (
+                                        "frame_serial",
+                                        serde_json::Value::from(frame.seek_serial as i64),
+                                    ),
+                                ],
+                            );
                         }
-                    } else if self.clock.is_seeking() && crate::perf::is_enabled() {
-                        // CPU 経路の同診断 (GPU 経路と分けて経路別の発火頻度を追える)。
-                        crate::perf::event(
-                            "video",
-                            "seek_override_skip_clear_cpu",
-                            None,
-                            0,
-                            &[
-                                ("frame_pts", serde_json::Value::from(frame.pts_secs)),
-                                ("now", serde_json::Value::from(now_after)),
-                                (
-                                    "frame_serial",
-                                    serde_json::Value::from(frame.seek_serial as i64),
-                                ),
-                            ],
-                        );
                     }
                     // CPU フレームの実際の pixel upload は native presenter
                     // (`native_presenter/mod.rs`) が `UpdateSubresource` 経由で行う。
                     // ここに到達する経路は native_output を持たない非 Windows ビルド等
                     // 限定的なケースで、実際の表示は行われない (PTS bookkeeping のみ)。
-                    self.emit_first_frame_event(pts_for_log);
+                    if !is_seek_preview {
+                        self.emit_first_frame_event(pts_for_log);
+                    }
                     self.last_displayed_pts_bits
                         .store(pts_for_log.to_bits(), Ordering::Release);
                     self.displayed_frame_seq.fetch_add(1, Ordering::Release);

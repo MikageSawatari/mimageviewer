@@ -418,16 +418,16 @@ enum VideoControlMsg {
     ///   入場時の anchor が target に維持される (Fast でも timeline は target 固定)。
     ///   `None` のときは seek 失敗 / 非 seek flush。
     /// - `trim_before_secs`: post-seek preroll trim 用。`Some(t)` で受信側は
-    ///   `drop_before_secs = Some(t)` を設定し target ぴったりに着地。`None` で
-    ///   trim をスキップ (= Fast backward の即時再生 / seek 失敗)。
+    ///   `drop_before_secs = Some(t)` を設定し target ぴったりに着地。`None` でも
+    ///   Fast backward 成功時は `seek_target_secs` を使い、keyframe preview を 1 枚だけ
+    ///   表示して target 到達まで drop する。seek 失敗時だけ trim なし通常 pacing。
     ///
     /// 旧版は `target_secs: Option<f64>` 単一フィールドで両方の役割を兼ねていたが、
     /// Fast モードで「trim 不要だが target 情報は必要」を表現できなかったため分離。
     Flush {
         serial: u64,
-        /// video decode thread では現状未参照 (= pump 経由で audio 側が消費)。
-        /// 将来 video 側でも post-seek 表示同期に使う可能性があるためフィールドとして保持。
-        #[allow(dead_code)]
+        /// ユーザー要求 seek 位置。Fast backward では video 側もこれを使って
+        /// keyframe preview 後に target 到達まで pre-target frame を drop する。
         seek_target_secs: Option<f64>,
         trim_before_secs: Option<f64>,
     },
@@ -969,6 +969,11 @@ pub struct VideoFrame {
     pub pts_secs: f64,
     /// シーク世代。これが現行の AvClock seek_serial と異なれば UI は捨てる。
     pub seek_serial: u64,
+    /// Fast seek の即時フィードバック用 preview frame。
+    ///
+    /// presenter は表示だけ行い、`FirstFrameReady` や seek override clear には使わない。
+    /// これにより keyframe preview を出しつつ、target 到達 frame まで Buffering/無音を維持する。
+    pub is_seek_preview: bool,
 }
 
 /// 動画フレームのピクセルデータ。
@@ -2077,11 +2082,11 @@ fn run_decoder(
             //
             // - **Precise**: drop_before_secs = Some(target)。keyframe → target を decode
             //   + drop して target ぴったりに着地 (= シークバー / ブックマークの精度)。
-            // - **Fast**: drop_before_secs = None。preroll decode を完全にスキップ。
-            //   keyframe pts (= target - 0〜3 秒) で即時再生開始 (= ←→ キーの体感速度)。
-            //   audio monotonic guard が anchor 後退を防ぐので timeline 表示は target で
-            //   固定、視聴コンテンツが GOP 1 個分先行する形になる。0〜3 秒の wall 経過で
-            //   audio が target に追いつき完全同期する。
+            // - **Fast**: demux からは video_trim_before=None で送り、video decode 側が
+            //   seek_target_secs を使って 1 枚目だけ keyframe preview として表示し、
+            //   target 到達 frame までは pre-target frame を drop する。preview は
+            //   readiness に使わないため、A/V は target frame 到着まで Buffering/無音の
+            //   まま待ち、target から同時に再開する。
             let mut seek_result = backward(&mut input);
             // backward が失敗したら forward を retry (= EOF 近傍など、target 以前に
             // keyframe が無い場合)。
@@ -2134,7 +2139,8 @@ fn run_decoder(
             // - `video_trim_before` (= video 用 preroll trim 下限):
             //   - Precise 成功: Some(target) → keyframe → target を decode + drop し
             //     target ぴったりに着地 (post_seek_frame_sent=false で 1 枚目を待機)
-            //   - Fast backward 成功: None → preroll trim 無し、keyframe pts から即時再生
+            //   - Fast backward 成功: None → worker 側で seek_target_secs を参照し、
+            //     keyframe preview を 1 枚表示した後 target 到達まで pre-target frame を drop
             //   - Fast forward retry 成功: Some(target) → retry は keyframe ≥ target に
             //     着地するため、trim 無しだと forward-seek regression (Phase 9.F) を
             //     再発させる (Codex P2 助言)。安全側に Precise 同等の trim を強制
@@ -2145,10 +2151,9 @@ fn run_decoder(
             //     audio が trim なしで keyframe から鳴り始めると、`set_audio_pts`
             //     monotonic guard により clock anchor が target で凍結し、audio が物理
             //     的に target に追いつくまで (= 数秒) clock が進まず video pacing も
-            //     凍結する (= 6-7 秒の動画フリーズ regression)。Fast では video のみ
-            //     trim を省略して即時 keyframe 再生し、audio は target からスタートさせて
-            //     target 直後から clock を 1x で進める。視覚は GOP 分先行する scrub に
-            //     なるが、audio と clock は target 起点で同期するため freeze は発生しない。
+            //     凍結する (= 6-7 秒の動画フリーズ regression)。Fast でも audio は target
+            //     まで trim し、video の preview は readiness から分離することで、
+            //     target 到達 frame まで無音で待ってから A/V を同時に再開する。
             //   - Precise / forward retry / Fast: Some(target)
             //   - 失敗: None
             let seek_target_for_flush = if seek_result.is_ok() {
@@ -2551,10 +2556,9 @@ fn run_decoder(
 /// シーク時は demux 側が `VideoControlMsg::Flush { serial, seek_target_secs,
 /// trim_before_secs }` を control channel に送る。この thread は `Flush` 受領で内部 decoder を
 /// `flush()` し、`current_seek_serial` / `drop_before_secs` / `post_seek_frame_sent`
-/// をリセットする。`drop_before_secs` には `trim_before_secs` が入る (=
-/// `seek_target_secs` は video 側では使わず、pump 側 BufferReady 用に audio チェーン
-/// が持つ)。`trim_before_secs.is_none()` (= Fast backward 成功 or seek 失敗) の場合は
-/// preroll trim せず通常 pacing に戻す (= post_seek_frame_sent を直ちに true)。
+/// をリセットする。`drop_before_secs` には `trim_before_secs` が入る。Fast backward 成功時は
+/// `trim_before_secs=None` かつ `seek_target_secs=Some(target)` なので、1 枚だけ
+/// `is_seek_preview=true` として送出し、その後 target 到達までは drop する。
 ///
 /// EOF 時は `VideoPacketMsg::Eof` を受け取るが、動画は内部残フレームを失っても
 /// 許容なので drain せず何もしない (旧 `run_decoder` の挙動と同じ)。
@@ -2605,6 +2609,8 @@ fn run_video_decode(
     let mut first_frame_logged = false;
     let mut current_seek_serial: u64 = 0;
     let mut drop_before_secs: Option<f64> = None;
+    let mut fast_seek_preview_target_secs: Option<f64> = None;
+    let mut fast_seek_preview_sent: bool = false;
     let mut post_seek_frame_sent: bool = true;
     let mut last_enqueued_pts: f64 = 0.0;
     let mut stale_drop_burst_count: u64 = 0;
@@ -2625,7 +2631,7 @@ fn run_video_decode(
         let packet = match msg {
             VideoDecodeInput::Control(VideoControlMsg::Flush {
                 serial,
-                seek_target_secs: _,
+                seek_target_secs,
                 trim_before_secs,
             }) => {
                 if stale_drop_burst_count > 0 {
@@ -2686,18 +2692,21 @@ fn run_video_decode(
                         .deinterlace_status
                         .store(DEINT_STATUS_PENDING, Ordering::Release);
                 }
-                drop_before_secs = trim_before_secs;
+                fast_seek_preview_target_secs = if trim_before_secs.is_none() {
+                    seek_target_secs
+                } else {
+                    None
+                };
+                fast_seek_preview_sent = false;
+                drop_before_secs = trim_before_secs.or(fast_seek_preview_target_secs);
                 first_packet_logged_for_serial = None;
                 preroll_drop_count = 0;
                 preroll_reached_logged_for_serial = None;
                 pause_park_last_log = None;
                 post_seek_tx_full_last_log = None;
-                // trim_before あり (Precise / Fast forward retry / 安全側) → post-seek
-                // 1 枚目を待つので false。trim_before なし (Fast backward / 失敗) →
-                // 通常 pacing に戻すので true。
-                // seek_target_secs は video decode thread では使わない (= pump 側の
-                // BufferReady audio_anchor 用)。
-                post_seek_frame_sent = trim_before_secs.is_none();
+                // trim_before あり、または Fast preview target あり → target 到達 frame を
+                // post-seek 1 枚目として待つ。preview frame は表示しても readiness には使わない。
+                post_seek_frame_sent = drop_before_secs.is_none();
                 continue;
             }
             VideoDecodeInput::Packet(VideoPacketMsg::Eof) => {
@@ -2801,34 +2810,55 @@ fn run_video_decode(
             let decode_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
             let pts = video_frame_timestamp(&frame).unwrap_or(0);
             let pts_secs = (pts as f64) * video_tb_num / video_tb_den;
+            let mut is_seek_preview = false;
             // post-seek preroll: target 前のフレームは描画しない
             if let Some(min) = drop_before_secs {
                 if pts_secs + 0.005 < min {
-                    preroll_drop_count = preroll_drop_count.saturating_add(1);
-                    if crate::perf::is_enabled()
-                        && (preroll_drop_count == 1 || preroll_drop_count % 30 == 0)
-                    {
-                        crate::perf::event(
-                            "video",
-                            "preroll_drop",
-                            None,
-                            0,
-                            &[
-                                (
-                                    "serial",
-                                    serde_json::Value::from(current_seek_serial as i64),
-                                ),
-                                ("count", serde_json::Value::from(preroll_drop_count as i64)),
-                                ("frame_pts", serde_json::Value::from(pts_secs)),
-                                ("trim_before", serde_json::Value::from(min)),
-                                (
-                                    "pkt_rx_len",
-                                    serde_json::Value::from(video_pkt_rx.len() as i64),
-                                ),
-                            ],
-                        );
+                    if fast_seek_preview_target_secs == Some(min) && !fast_seek_preview_sent {
+                        is_seek_preview = true;
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "video",
+                                "fast_seek_preview",
+                                None,
+                                0,
+                                &[
+                                    (
+                                        "serial",
+                                        serde_json::Value::from(current_seek_serial as i64),
+                                    ),
+                                    ("frame_pts", serde_json::Value::from(pts_secs)),
+                                    ("target", serde_json::Value::from(min)),
+                                ],
+                            );
+                        }
+                    } else {
+                        preroll_drop_count = preroll_drop_count.saturating_add(1);
+                        if crate::perf::is_enabled()
+                            && (preroll_drop_count == 1 || preroll_drop_count % 30 == 0)
+                        {
+                            crate::perf::event(
+                                "video",
+                                "preroll_drop",
+                                None,
+                                0,
+                                &[
+                                    (
+                                        "serial",
+                                        serde_json::Value::from(current_seek_serial as i64),
+                                    ),
+                                    ("count", serde_json::Value::from(preroll_drop_count as i64)),
+                                    ("frame_pts", serde_json::Value::from(pts_secs)),
+                                    ("trim_before", serde_json::Value::from(min)),
+                                    (
+                                        "pkt_rx_len",
+                                        serde_json::Value::from(video_pkt_rx.len() as i64),
+                                    ),
+                                ],
+                            );
+                        }
+                        continue;
                     }
-                    continue;
                 } else {
                     if preroll_reached_logged_for_serial != Some(current_seek_serial) {
                         crate::logger::log(format!(
@@ -2866,9 +2896,10 @@ fn run_video_decode(
                         }
                         preroll_reached_logged_for_serial = Some(current_seek_serial);
                     }
-                    // target に到達した → preroll guard 解除 (動画側のみ)
-                    // 音声側はまだ trim 必要なので drop_before_secs は audio thread
-                    // が独自に管理する (= ここでは触らない)。
+                    fast_seek_preview_target_secs = None;
+                    // target に到達した。video thread 側の drop_before_secs は保持したまま、
+                    // Fast preview 用の追加状態だけ解除する。以降は pts >= target なので
+                    // preroll guard を自然に通過し、通常 frame として readiness に使われる。
                 }
             }
 
@@ -2918,7 +2949,8 @@ fn run_video_decode(
                         video_fps_num,
                         video_fps_den,
                     ) {
-                        Ok(gpu_frame_out) => {
+                        Ok(mut gpu_frame_out) => {
+                            gpu_frame_out.is_seek_preview = is_seek_preview;
                             // ── デコーダのペーシング (GPU 経路) ──
                             // (詳細コメントは旧 run_decoder GPU 経路コメント参照、
                             //  Phase 8.K の PACE_LEAD=0.30 / post_seek_frame_sent /
@@ -3227,7 +3259,11 @@ fn run_video_decode(
                             match video_tx.try_send(gpu_frame_out) {
                                 Ok(()) => {
                                     last_enqueued_pts = pts_secs;
-                                    post_seek_frame_sent = true;
+                                    if is_seek_preview {
+                                        fast_seek_preview_sent = true;
+                                    } else {
+                                        post_seek_frame_sent = true;
+                                    }
                                 }
                                 Err(TrySendError::Full(mut frame_out)) => {
                                     dropped_full = true;
@@ -3250,6 +3286,10 @@ fn run_video_decode(
                                     &[
                                         ("pts", serde_json::Value::from(pts_secs)),
                                         ("path", serde_json::Value::from("gpu_blit")),
+                                        (
+                                            "is_seek_preview",
+                                            serde_json::Value::from(is_seek_preview),
+                                        ),
                                         ("dropped_full", serde_json::Value::from(dropped_full)),
                                         ("pts_gap_ms", serde_json::Value::from(pts_gap * 1000.0)),
                                         (
@@ -3507,6 +3547,7 @@ fn run_video_decode(
                 data: VideoFrameData::Cpu(bgra),
                 pts_secs,
                 seek_serial: current_seek_serial,
+                is_seek_preview,
             };
             let scale_ms = send_t0.elapsed().as_secs_f64() * 1000.0 - decode_ms;
 
@@ -3702,7 +3743,11 @@ fn run_video_decode(
             let dropped_full = matches!(&send_result, Err(TrySendError::Full(_)));
             if !dropped_full && send_result.is_ok() {
                 last_enqueued_pts = pts_secs;
-                post_seek_frame_sent = true;
+                if is_seek_preview {
+                    fast_seek_preview_sent = true;
+                } else {
+                    post_seek_frame_sent = true;
+                }
             }
             if dropped_full {
                 skipped_frame_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3720,6 +3765,7 @@ fn run_video_decode(
                             serde_json::Value::from(decode_ms.round() / 1.0),
                         ),
                         ("scale_ms", serde_json::Value::from(scale_ms.round() / 1.0)),
+                        ("is_seek_preview", serde_json::Value::from(is_seek_preview)),
                         ("dropped_full", serde_json::Value::from(dropped_full)),
                         ("pts_gap_ms", serde_json::Value::from(pts_gap * 1000.0)),
                         (
@@ -3796,8 +3842,9 @@ fn run_audio_decode(
     // run_decoder と同じ thread-local state。Flush で reset する。
     let mut current_seek_serial: u64 = 0;
     let mut drop_before_secs: Option<f64> = None;
-    // **Codex P1 (2026-05-01)**: Fast モードで preroll trim を省略しても
-    // BufferReady の audio_anchor を user-requested target に維持するため、Flush
+    // **Codex P1 (2026-05-01)**: Fast モードで video 側が preview 用に
+    // `trim_before_secs=None` になっても BufferReady の audio_anchor を
+    // user-requested target に維持するため、Flush
     // から受け取った `seek_target_secs` を世代単位で保持し、emit する全 AudioFrame
     // に焼き付ける (= pump がどのタイミングで観測しても target を取り出せる)。
     let mut current_seek_target_secs: Option<f64> = None;
@@ -5409,6 +5456,7 @@ fn try_gpu_blit_path(
         data: VideoFrameData::Gpu(d3d11_frame),
         pts_secs,
         seek_serial: current_seek_serial,
+        is_seek_preview: false,
     })
 }
 

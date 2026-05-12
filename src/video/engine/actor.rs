@@ -938,6 +938,40 @@ mod tests {
     }
 
     #[test]
+    fn buffer_ready_before_first_frame_stays_buffering_until_video_ready() {
+        let mut a = fresh_actor();
+        a.begin_loading();
+        a.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 30.0,
+            has_audio: true,
+        });
+        a.handle_seek_request(10.0);
+        a.handle_decoder_event(DecoderEvent::SeekCompleted {
+            epoch: 1,
+            actual_pts: 10.0,
+        });
+        assert_eq!(a.state, EngineState::Buffering);
+
+        // Fast seek preview は FirstFrameReady を発火しない。audio の BufferReady だけが
+        // 先に来ても target frame が届くまでは Buffering のままにする。
+        a.handle_audio_event(AudioEvent::BufferReady {
+            epoch: 1,
+            pts: 10.0,
+            wall_now: Instant::now(),
+        });
+        assert_eq!(a.state, EngineState::Buffering);
+        assert_eq!(a.clock().anchor().source, ClockSource::Frozen);
+
+        a.handle_decoder_event(DecoderEvent::FirstFrameReady {
+            epoch: 1,
+            pts: 10.0,
+        });
+        assert_eq!(a.state, EngineState::Playing);
+        assert_eq!(a.clock().anchor().source, ClockSource::Audio);
+    }
+
+    #[test]
     fn open_path_with_resume_triggers_seek() {
         let mut a = fresh_with_resume(15.0, true);
         a.begin_loading();

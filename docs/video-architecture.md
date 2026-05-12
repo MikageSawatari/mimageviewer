@@ -251,13 +251,18 @@ src/video/
 
 **seek 調停**: `clock.take_seek_request()` を pull するのは demux thread のみ
 (= 旧構造と同じ単一 puller)。`input.seek` 成否を判定後、両 decode thread に
-`Flush { serial, target_secs: Option<f64> }` を packet queue とは別の control
+`Flush { serial, seek_target_secs, trim_before_secs }` を packet queue とは別の control
 channel で enqueue する。decode thread は `select_biased!` で control を優先受信するため、
 packet queue が満杯でも Flush が古い compressed packet の後ろに埋もれない。
-`target_secs.is_some()` (= seek 成功) なら受信側で post-seek preroll trim を実施
-(動画は `drop_before_secs` + `post_seek_frame_sent=false` で 1 枚目を保護、音声は
-packet/sample 段階の trim)。`target_secs.is_none()` (= seek 失敗) なら trim なしで
-通常 pacing に戻す。
+`seek_target_secs` はユーザー要求 target (= timeline / engine anchor 用)、`trim_before_secs`
+は各 worker の post-seek trim 下限。Precise seek と forward retry は video/audio とも
+`trim_before_secs=Some(target)` で target まで preroll drop する。Fast backward は
+video の `trim_before_secs=None` で worker に送り、video worker が `seek_target_secs`
+を使って keyframe preview を 1 枚だけ `is_seek_preview=true` で送った後、target 到達
+frame まで pre-target frame を drop する。preview は `FirstFrameReady` / seek override
+clear に使わないため、A/V は target frame まで Buffering/無音で待ってから再開する。
+audio は Fast でも常に `trim_before_secs=Some(target)`。
+seek 失敗時は両方 `None` で通常 pacing に戻す。
 video packet は direct queue が満杯になると demux 側の `pending_video_packets`
 overflow に退避する。seek preroll 中に audio packet send が満杯で待っている場合も、
 audio の timeout 待ちごとにこの video overflow を opportunistic に drain し、
@@ -582,6 +587,7 @@ pub struct VideoFrame {
     pub data: VideoFrameData,
     pub pts_secs: f64,
     pub seek_serial: u64,
+    pub is_seek_preview: bool,
 }
 
 pub enum VideoFrameData {
@@ -598,6 +604,8 @@ pub enum VideoFrameData {
 ```
 
 `Nv12Direct` variant は **削除** (Phase 2 で導入したが、その経路自体を撤回するため)。
+`is_seek_preview` は Fast relative seek の keyframe preview 用。native/legacy presenter は
+表示だけ行い、`FirstFrameReady` 発火や seek override clear には使わない。
 
 ## アスペクト比 (SAR) 補正
 

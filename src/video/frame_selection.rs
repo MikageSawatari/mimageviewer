@@ -50,9 +50,9 @@ pub(crate) struct FrameCandidate {
 /// 3. `force_display_seek` (= seek 中で target 近傍 / overshoot 許容) または
 ///    `pts_secs <= now_secs + tol` (= 通常 eligibility) なら eligible。前に Display を
 ///    出していれば、それを `LateDrop` に格下げして新しい `Display` を吐く。
-///    `force_display_seek` は Fast seek の keyframe→target burst 消化設計
-///    ([src/video/clock.rs] の `SeekKind::Fast` コメント参照) を維持するため
-///    coalesce を許可する (= 1 枚で打ち切らない)。
+///    `force_display_seek` は seek target 近傍や forward retry の overshoot frame を
+///    1 tick で表示候補にできるようにする。Fast seek の keyframe preview は
+///    `VideoFrame::is_seek_preview` で readiness から分離される。
 /// 4. eligible でなければ走査終了 (= 残りは next tick 以降)。
 pub(crate) fn select_frame_for_present(
     queue: &[FrameCandidate],
@@ -168,9 +168,9 @@ mod tests {
 
     #[test]
     fn force_display_seek_allows_coalesce_to_target() {
-        // Fast seek: keyframe→target burst を 1 tick で消化する設計
-        // ([src/video/clock.rs] `SeekKind::Fast` 参照)。target 近傍の連続 frame は
-        // 通常 eligibility 経由で coalesce され、最新だけ Display される。
+        // post-seek / scheduler stall で target 近傍の連続 frame が同 tick に
+        // eligible になった場合は通常 eligibility 経由で coalesce され、最新だけ
+        // Display される。
         let queue = vec![frame(4.500, 1), frame(4.533, 1), frame(5.000, 1)];
         let sel = select_frame_for_present(&queue, 5.000, 1, 1, false, true, TOL);
         assert_eq!(
@@ -186,6 +186,16 @@ mod tests {
         // pts_clears_seek_override (片側許容、pts > target は無制限) で eligible 扱い。
         let queue = vec![frame(5.500, 1)];
         let sel = select_frame_for_present(&queue, 5.000, 1, 1, false, true, TOL);
+        assert_eq!(sel.actions, vec![PopAction::Display]);
+    }
+
+    #[test]
+    fn waiting_for_first_frame_after_preview_displays_future_target() {
+        // Fast seek preview は FirstFrameReady を発火しないため、次 tick でも
+        // waiting_for_first_frame=true のまま。target frame が overshoot していても
+        // force_first_frame 経路で 1 枚表示して readiness を進められる。
+        let queue = vec![frame(5.500, 1)];
+        let sel = select_frame_for_present(&queue, 5.000, 1, 1, true, true, TOL);
         assert_eq!(sel.actions, vec![PopAction::Display]);
     }
 
