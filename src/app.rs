@@ -2437,6 +2437,14 @@ pub struct App {
     /// 16ms pump に合わせて通常の HWND_TOP raise を保つ。
     native_video_front_last_raise: Option<std::time::Instant>,
     #[cfg(windows)]
+    /// 実機修正 (2026-05-12 C): VST GUI window のドラッグ/リサイズ終了検知 + bar
+    /// 重なり時の自動位置調整。`HWND -> (last seen rect, last change instant, pending flag)`。
+    /// `tick_vst_window_overlap_adjustment` で per-frame に各 editor HWND の `GetWindowRect` を
+    /// 比較し、rect が安定して 250ms 経過したら overlap を check + `SetWindowPos(..., SWP_ASYNCWINDOWPOS)`。
+    /// cross-process SetWindowPos の連射を避けるため、stable 検出後の 1 回だけ発火する。
+    vst_geometry_tracker:
+        std::collections::HashMap<u64, (windows::Win32::Foundation::RECT, std::time::Instant, bool)>,
+    #[cfg(windows)]
     /// Native fullscreen 中だけ main HWND の DWM caption/border を黒へ寄せているか。
     /// `Decorations` は client area を変えるため使わない。
     native_video_main_chrome_black: bool,
@@ -2539,6 +2547,12 @@ pub struct App {
     /// z-order を調整する (= 動画再生中だけ手前)。
     #[cfg(windows)]
     pub(crate) vst3_was_fullscreen: bool,
+    /// CP7: `DspBridge::hud_raise_hook` 経由で発火された raise 要求を受ける channel。
+    /// hook クロージャが unbounded `mpsc::send(())` するだけの非ブロッキング処理で、
+    /// App.update で `try_iter` で drain → 1 件以上来てれば `VideoPlayer::request_hud_raise()`
+    /// を 1 回だけ呼ぶ (= coalesce)。
+    #[cfg(windows)]
+    pub(crate) hud_raise_rx: std::sync::mpsc::Receiver<()>,
 }
 
 impl Default for App {
@@ -2642,7 +2656,7 @@ impl Default for App {
         );
         let _ = video_upscale_queue.save_atomic(&video_upscale_queue_path);
 
-        Self {
+        let mut app = Self {
             address: String::new(),
             current_folder: None,
             items: Vec::new(),
@@ -2991,6 +3005,8 @@ impl Default for App {
             #[cfg(windows)]
             native_video_front_synced_hwnd: 0,
             #[cfg(windows)]
+            vst_geometry_tracker: std::collections::HashMap::new(),
+            #[cfg(windows)]
             native_video_front_last_raise: None,
             #[cfg(windows)]
             native_video_main_chrome_black: false,
@@ -3030,7 +3046,32 @@ impl Default for App {
             vst3_deferred_video_open: None,
             #[cfg(windows)]
             vst3_was_fullscreen: false,
+            #[cfg(windows)]
+            hud_raise_rx: {
+                // CP7: 仮の placeholder channel (= 即解放される)。実体の channel は
+                // 下の post-init ブロックで作り直して `dsp_bridge.set_hud_raise_hook` も登録する。
+                // (Default impl の struct literal 中では他 field を参照できないので、
+                // 構築後にもう一度書き換える。)
+                let (_, rx) = std::sync::mpsc::channel::<()>();
+                rx
+            },
+        };
+
+        #[cfg(windows)]
+        {
+            // CP7: hud_raise hook を `dsp_bridge` に登録し、hook → mpsc channel → App.update
+            // の経路を確立する。tx は move closure 内に取り込み、rx を App field に上書き。
+            let (hud_tx, hud_rx) = std::sync::mpsc::channel::<()>();
+            app.hud_raise_rx = hud_rx;
+            app.dsp_bridge
+                .set_hud_raise_hook(std::sync::Arc::new(move || {
+                    // unbounded mpsc の `send` は非ブロッキング (= worker thread から呼ばれて
+                    // も block しない、Codex プラン Step 10)。
+                    let _ = hud_tx.send(());
+                }));
         }
+
+        app
     }
 }
 
@@ -10470,6 +10511,9 @@ impl App {
                     self.video_tile_reopen_pending,
                     self.settings.vst3_enabled,
                     self.checked.contains(&idx),
+                    // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
+                    Some(self.dsp_bridge.editor_hwnds_snapshot()),
+                    self.main_hwnd.unwrap_or(0) as u64,
                 );
                 #[cfg(windows)]
                 let native_config_missing = native_config.is_none();
@@ -14669,6 +14713,20 @@ impl eframe::App for App {
         let t_render_fullscreen_viewport = frame_t0.elapsed();
         #[cfg(windows)]
         self.ensure_native_video_front();
+        #[cfg(windows)]
+        {
+            // CP7: `DspBridge::hud_raise_hook` から流れてきた raise 要求を drain して
+            // 1 件以上来てれば fullscreen 中の VideoPlayer に 1 回だけ `request_hud_raise` を呼ぶ
+            // (= coalesce、Codex プラン Step 10)。`try_iter().count()` で要素を消費して個数を取る。
+            let pending = self.hud_raise_rx.try_iter().count();
+            if pending > 0 {
+                if let Some(idx) = self.fullscreen_idx {
+                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+                        player.request_hud_raise();
+                    }
+                }
+            }
+        }
         let t_fullscreen_viewport = frame_t0.elapsed();
 
         #[cfg(windows)]
@@ -16477,6 +16535,10 @@ fn native_video_presenter_config(
     initial_tile_overlay: bool,
     vst3_available: bool,
     checked: bool,
+    editor_hwnds_snapshot: Option<
+        std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
+    >,
+    main_hwnd_for_raise: u64,
 ) -> Option<crate::video::NativeVideoOutputConfig> {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Gdi::{
@@ -16512,6 +16574,11 @@ fn native_video_presenter_config(
         initial_tile_overlay,
         vst3_available,
         checked,
+        editor_hwnds_snapshot,
+        main_hwnd_for_raise,
+        // CP7: HUD overlay HWND を default で有効化。`MIV_HUD_OVERLAY=0` で off にできる
+        // (= run_native_video_output 側で env var もチェック)。
+        hud_overlay_enabled: true,
     })
 }
 

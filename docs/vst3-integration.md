@@ -53,6 +53,89 @@ matches the fullscreen HWND must not call `SetForegroundWindow`/`SetFocus`,
 because repeated no-op focus calls can briefly stall the Windows input queue and
 show up as simultaneous audio/video hitches.
 
+## HUD overlay HWND と VST 前後関係 (v0.9.0+ 後期、CP1-8)
+
+VST editor は presenter HWND の owned + TOPMOST だが、Windows の owner rule で
+owned は owner より常に手前。そのため presenter HWND の DComp tree に描画していた
+HUD バー / シークバー / hover thumbnail は VST GUI の裏に潜っていた。
+
+解決策として、HUD overlay を独立 top-level HWND `HudOverlayWindow` として presenter
+HWND と同じ owner (= presenter HWND) の sibling 配置にし、VST GUI と並ぶ z-order
+group に入れる。両方 `WS_EX_TOPMOST`、HUD を後勝ちで `HWND_TOPMOST` に再アサート
+することで VST より前に出す。詳細な構造は
+[video-architecture.md](video-architecture.md) の "HUD overlay HWND" 節参照。
+
+**Z-order ポリシー (= HUD raise burst)**:
+
+VST z-order が変動する各経路 (`set_all_guis_topmost` / `set_all_guis_visible_blocking`
+/ `set_all_guis_app_active` / `send_chain_z_order` / `show_slot_gui` (sync/async) /
+`hide_slot_gui` / `user_hide_slot_gui` / `remove_plugin` / `disable_with_reason`) の
+末尾で `DspBridge::fire_hud_raise_hook` を呼ぶ → App が unbounded mpsc 経由で受け、
+fullscreen 中の `VideoPlayer::request_hud_raise()` を 1 回 coalesce 発火 → presenter
+thread が **即時/16ms/64ms の short retry burst** で `SetWindowPos(hud, HWND_TOPMOST)`
+を呼ぶ。非同期 VST IPC の z-order 反映を確実に拾うための retry 設計。
+
+加えて presenter thread の **50ms 周期 cursor polling** が activation zone (= 画面上下端
+の hover 検出帯) で cursor を検知したら、最後の raise から 200ms 以上経過していれば
+helper `schedule_hud_raise_burst` 経由で同じ retry burst を起動する (= VST 手動クリックで
+HUD が裏に回ったあとの復帰経路、Codex P1 反映)。
+
+HUD wndproc の `WM_WINDOWPOSCHANGING` で `hwndInsertAfter` が `HWND_TOP` / `HWND_TOPMOST`
+を指していたら `RequestRaiseHud` event を流す best-effort safety net もある。
+
+**Raise skip 条件 (allowlist 判定、`foreground_allows_hud_raise`)**:
+
+各 raise burst deadline 実行直前に `try_raise_hud_to_top(presenter_hwnd)` を通って
+allowlist チェックする (= command / event / polling のすべての raise 経路で同じ判定)。
+**foreground HWND** を以下で判定:
+
+- **許可**: `presenter HWND` / `HUD HWND` / `main HWND` の既知 mIV HWND 3 つ、または
+  `editor_hwnds: Arc<RwLock<HashSet<u64>>>` snapshot (= 現在 visible な editor container
+  HWND) に含まれる HWND (`GA_ROOT` で正規化、`IsWindow` + `IsWindowVisible` で stale 排除)
+- **skip**:
+  - file dialog 等 plugin 外の top-level: foreground 自身も `GA_ROOT` も editor allowlist に
+    無いので不一致で skip。
+  - editor が foreground のまま出る右クリックメニュー / 独自 popup: `GetLastActivePopup(editor)`
+    が editor 自身以外を返した場合に skip (= **best-effort**、すべての plugin 実装で
+    last-active-popup が正しく返るとは限らない。検証で取りこぼしが出た場合は将来的に
+    `EnumWindows` で bridge process の visible top-level を列挙する fallback を追加する想定
+    だが、現状は `GetLastActivePopup` のみ実装)。
+  - mIV の設定ダイアログ等の未登録 mIV HWND、別 process foreground: 既知 HWND と
+    editor allowlist の両方に該当しないので skip。
+
+**`GA_ROOTOWNER` は使わない** — editor を owner にする modal popup を辿ると editor 本体に
+戻るため誤許可リスクがある。`GA_ROOT` までで止める。
+
+既存の `foreground_belongs_to_miv_or_bridge` (PID ベース、`set_all_guis_app_active` で
+「bridge が foreground」判定として使用中) は変更せず、HUD raise 用に別 helper
+`foreground_allows_hud_raise` を新規追加してセマンティクスを分離 (Codex P1 反映)。
+
+**`current_gui_owner_hwnd` の fullscreen 強制**:
+
+`DspBridge::fullscreen_owner_hwnd: AtomicU64` を fullscreen 中だけ presenter HWND に
+セットする。`current_gui_owner_hwnd` はこの値を最優先で返すことで、cursor 依存の
+`WindowFromPoint` 経路よりも先に presenter HWND を確定させる (= cursor が VST 上にあると
+HUD HWND を `WindowFromPoint` が拾って VST が HUD owned になり、目的逆転するのを防ぐ)。
+HUD HWND は `set_hud_hwnd` で別系統に登録し、**`current_gui_owner_hwnd` の候補からは
+絶対に出ない**。
+
+**`editor_hwnds` snapshot の更新タイミング**:
+
+allowlist 判定で参照される `editor_hwnds: Arc<RwLock<HashSet<u64>>>` は、editor 表示状態が
+変わる全経路で `refresh_editor_hwnds_snapshot()` 経由で再構築する (= slot add / show / hide /
+user_hidden / remove / bridge disconnect / 一括 visibility 変更)。「現在 `gui_visible == true`
+かつ `IsWindow` で生存している HWND だけ」を含める (= `gui_hwnd` は hidden 後も残るので
+slot に HWND があるだけでは入れない)。`disable_with_reason` でも明示的に `editor_hwnds.clear()`
+する (= HWND 再利用時の誤許可リスク排除、Codex P2 反映)。
+
+Lock 取得順序として `DspBridgeInner` の lock を握ったまま Windows API (`IsWindow`) や
+`hud_raise_hook` を呼ばない (inner lock → ローカル `Vec` にコピー → inner 解放 → API 呼び出し →
+`editor_hwnds.write()` の順序、deadlock 防止)。
+
+**フォールバック**: 環境変数 `MIV_HUD_OVERLAY=0` で HUD 経路を無効化できる。HUD HWND 作らず、
+従来通り egui overlay を presenter HWND の DComp tree に attach する経路 (= CP8 以前と等価)。
+万が一の regression の retreat 用。
+
 ## Editor chrome resize rules (2026-05)
 
 The bridge-owned VST editor surface uses a custom dark title area above the

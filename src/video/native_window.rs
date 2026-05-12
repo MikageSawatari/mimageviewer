@@ -2,6 +2,7 @@ use std::ffi::c_void;
 
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
+// `GetCursorPos` / `GetClientRect` 等は WindowsAndMessaging から (上の `use` を参照)。
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::{
     AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId,
@@ -18,17 +19,19 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA,
-    GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HTCLIENT,
+    GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, HTCLIENT,
     HWND_TOP, IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, MA_ACTIVATE, MA_ACTIVATEANDEAT,
     MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW, SWP_NOACTIVATE,
     SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WM_CHAR,
-    WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS,
+    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
     WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_XBUTTONDBLCLK,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -59,6 +62,26 @@ pub enum NativeVideoWindowEvent {
     MouseButton(NativeVideoMouseButtonEvent),
     MouseWheel(NativeVideoMouseWheelEvent),
     MouseLeave,
+    /// presenter HWND の `WM_WINDOWPOSCHANGED` で発火。HUD overlay HWND を
+    /// presenter のジオメトリに追従させるために presenter thread が消費する。
+    /// UI 側には転送しない。
+    GeometryChanged {
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+    },
+    /// HUD overlay HWND の `WM_DPICHANGED` で発火。`suggested_rect` は
+    /// `WM_DPICHANGED` の lparam で渡される新 DPI 用 RECT。
+    /// presenter thread 内で pixels_per_point 更新 + resize + 次フレーム region 再計算に使う。
+    DpiChanged {
+        dpi: u32,
+        suggested_rect: RECT,
+    },
+    /// HUD overlay HWND の `WM_WINDOWPOSCHANGING` で「自分より前に別 window が
+    /// 割り込みそう」を検知したときに送る raise 要求。presenter thread が
+    /// `RaiseHudToTop` に内部変換する。これは best-effort safety net。
+    RequestRaiseHud,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -565,6 +588,26 @@ unsafe extern "system" fn wnd_proc(
         WM_MOUSEMOVE => {
             track_mouse_leave(hwnd);
             if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
+                // CP9 実機 debug: presenter wndproc 経由の mouse は HUD region 外 (= 穴)
+                // のときに来るので、これが頻発しているなら HUD region に問題がある。
+                // 100ms 周期 rate limit で log。
+                if std::env::var_os("MIV_HUD_DEBUG").is_some() {
+                    static LAST_LOG_MS: std::sync::atomic::AtomicI64 =
+                        std::sync::atomic::AtomicI64::new(0);
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    let last = LAST_LOG_MS.load(std::sync::atomic::Ordering::Relaxed);
+                    if now_ms - last >= 100 {
+                        LAST_LOG_MS.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+                        let evt = native_mouse_event(wparam, lparam);
+                        crate::logger::log(format!(
+                            "[HUD-DEBUG] presenter WM_MOUSEMOVE x={} y={}",
+                            evt.x, evt.y
+                        ));
+                    }
+                }
                 let _ = tx.send(NativeVideoWindowEvent::MouseMove(native_mouse_event(
                     wparam, lparam,
                 )));
@@ -599,8 +642,94 @@ unsafe extern "system" fn wnd_proc(
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOUSELEAVE => {
-            if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
-                let _ = tx.send(NativeVideoWindowEvent::MouseLeave);
+            // CP9 実機修正: cursor が presenter client rect 内なら MouseLeave を流さない。
+            //
+            // 背景: presenter HWND が `WM_MOUSELEAVE` を受けるのは「cursor が presenter から
+            // 出た」通知。ところが HUD overlay HWND が前面にあると、cursor が HUD region 内に
+            // 入った瞬間に OS から見て「presenter から離脱」になり、WM_MOUSELEAVE が来る。
+            // これを overlay の pointer_pos=None として流すと top_bar_visible=false → region
+            // 縮小 → cursor が region 外に → presenter が再度 mouse 受ける → 振動ループ。
+            //
+            // 真の「cursor が presenter から完全に出た」は cursor polling の client rect 範囲外
+            // 検出で十分カバーされる (CP6 `cursor_polling_tick`)。なので presenter wndproc では
+            // 「実際に画面外/他 window に行ったか」をその場で確認し、内なら流さない。
+            //
+            // HUD HWND がないフォールバック経路では polling 自体が動かないので、その場合は
+            // 従来通り MouseLeave を流す (= cursor が画面外に出たことを overlay に伝える)。
+            // 判定は `GetCursorPos` + `ScreenToClient` で current cursor が presenter client
+            // rect 内かを見る。
+            let cursor_in_client = unsafe {
+                let mut pt = POINT::default();
+                if GetCursorPos(&mut pt).is_ok() && ScreenToClient(hwnd, &mut pt).as_bool() {
+                    let mut rc = windows::Win32::Foundation::RECT::default();
+                    if GetClientRect(hwnd, &mut rc).is_ok() {
+                        pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if !cursor_in_client {
+                // 真に外に出た → overlay に MouseLeave 流す。
+                if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
+                    let _ = tx.send(NativeVideoWindowEvent::MouseLeave);
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_WINDOWPOSCHANGED => {
+            // CP8: presenter HWND の位置 / サイズが変わったら HUD HWND に mirror する。
+            // `lparam` は `WINDOWPOS*`。
+            //
+            // **Codex CP8 P1 反映**: `SWP_NOMOVE` / `SWP_NOSIZE` が立っているとき、その field
+            // (x/y or cx/cy) は無視される値で、bogus。z-order 変更だけの `SetWindowPos(...,
+            // SWP_NOMOVE | SWP_NOSIZE, ...)` でも `WM_WINDOWPOSCHANGED` が発火するため、
+            // フラグを見ずに値を信じると HUD geometry / presenter.resize が bogus で走る。
+            //
+            // 対策:
+            //   - `SWP_NOMOVE && SWP_NOSIZE` 両方なら event 発火せず skip。
+            //   - どちらかだけ立っているなら `GetWindowRect(hwnd)` で現在値を取り直す。
+            //
+            // borderless `WS_POPUP` なので window cx/cy = client サイズ前提。
+            if lparam.0 != 0 {
+                let wp = lparam.0 as *const WINDOWPOS;
+                if !wp.is_null() {
+                    let (flags_value, mut x, mut y, mut w, mut h) = unsafe {
+                        let p = &*wp;
+                        (p.flags.0, p.x, p.y, p.cx, p.cy)
+                    };
+                    let no_move = (flags_value & SWP_NOMOVE.0) != 0;
+                    let no_size = (flags_value & SWP_NOSIZE.0) != 0;
+                    if !(no_move && no_size) {
+                        if no_move || no_size {
+                            // 片方だけ bogus なので `GetWindowRect` で現在値を取り直す。
+                            let mut rc = windows::Win32::Foundation::RECT::default();
+                            if unsafe { GetWindowRect(hwnd, &mut rc) }.is_ok() {
+                                if no_move {
+                                    x = rc.left;
+                                    y = rc.top;
+                                }
+                                if no_size {
+                                    w = rc.right - rc.left;
+                                    h = rc.bottom - rc.top;
+                                }
+                            }
+                        }
+                        let w_u32 = w.max(1) as u32;
+                        let h_u32 = h.max(1) as u32;
+                        if let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref()) {
+                            let _ = tx.send(NativeVideoWindowEvent::GeometryChanged {
+                                x,
+                                y,
+                                w: w_u32,
+                                h: h_u32,
+                            });
+                        }
+                    }
+                    // 両方 NoMove + NoSize は z-order だけの変更 → event 発火しない。
+                }
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }

@@ -48,6 +48,8 @@ use crate::video::decoder::{VideoFrame, VideoFrameData};
 mod overlay_draw;
 use self::overlay_draw::*;
 
+pub mod hud_window;
+
 const SHARED_TEXTURE_CACHE_CAPACITY: usize = 64;
 
 /// パネル / HUD が全て隠れた状態でこの秒数経過したらマウスカーソルを非表示にする。
@@ -62,6 +64,11 @@ pub struct NativePresenterConfig {
     pub height: u32,
     pub test_overlay: bool,
     pub egui_overlay: bool,
+    /// HUD overlay HWND の wndproc が拾った mouse / DPI / raise 要求を流す sender。
+    /// `Some` のとき、presenter は HUD overlay HWND を作って egui overlay を
+    /// その DComp tree にぶら下げる (CP4 反映)。`None` または HUD HWND 作成失敗時は
+    /// 従来通り presenter HWND の DComp tree に egui overlay をぶら下げるフォールバック経路。
+    pub hud_event_tx: Option<std::sync::mpsc::Sender<crate::video::native_window::NativeVideoWindowEvent>>,
 }
 
 pub struct NativeVideoPresenter {
@@ -80,6 +87,37 @@ pub struct NativeVideoPresenter {
     backbuffer: Option<ID3D11Texture2D>,
     test_overlay: Option<NativeTestOverlay>,
     egui_overlay: Option<NativeEguiOverlay>,
+    /// HUD overlay HWND (= bars / interactive UI 用の独立 top-level)。
+    /// `NativePresenterConfig.hud_event_tx` が `Some` のときに `HudOverlayWindow::create` で
+    /// 作成される。HUD HWND の DComp tree に egui overlay visual が乗る (CP4 反映)。
+    /// 作成失敗時は `None` で従来通り presenter HWND の DComp tree に egui overlay を載せる
+    /// フォールバック経路に入る。
+    hud_window: Option<hud_window::HudOverlayWindow>,
+    /// HUD HWND 用の独立 `IDCompositionTarget`。`hud_window` と一緒に保持する。
+    /// **drop されると DComp tree が解除される**ので、`hud_window` と同じ寿命で必ず保持する
+    /// (Codex プラン Step 2 / `_dcomp_target` パターン)。
+    _hud_dcomp_target: Option<IDCompositionTarget>,
+    /// HUD HWND 用の DComp root visual。`_hud_dcomp_target` と同じく drop 防止のため保持。
+    _hud_root_visual: Option<IDCompositionVisual>,
+    /// HUD `WM_NCHITTEST` フェイルセーフ用に `regions` を共有。CP5 で
+    /// `NativeEguiOverlay::run` 末尾から書き込む。CP4 段階では初期値 (= 空 `Vec<RECT>`) のまま。
+    hud_regions: Option<std::sync::Arc<std::sync::Mutex<hud_window::HudInteractiveRegions>>>,
+    /// CP6: HUD raise の allowlist 判定 (`foreground_allows_hud_raise`) で参照する
+    /// VST editor container HWND の snapshot。CP7 で App が `set_editor_hwnds_snapshot`
+    /// で `dsp_bridge.editor_hwnds_snapshot()` を渡す。`None` のとき raise 判定は false 固定
+    /// (= raise burst を起動しない)。
+    editor_hwnds_snapshot:
+        Option<std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>>,
+    /// CP6: `foreground_allows_hud_raise` 判定用の main HWND (mIV メインウィンドウ)。
+    /// CP7 で App が `set_main_hwnd_for_raise_check` で設定する。0 なら未登録扱い。
+    main_hwnd_for_raise: u64,
+    /// CP9 実機 debug: 直近 log した region hash。`MIV_HUD_DEBUG=1` のとき
+    /// region 変化時に 1 回だけログ出力するための重複抑制用。
+    last_logged_region_hash: Option<u64>,
+    /// 実機修正 (2026-05-12 P1 #3): 直近 LBUTTON down が検出された時刻。
+    /// external_drag 判定に 100ms の delay を入れることで「short click」を
+    /// drag と誤検出して top bar を hide させるバグを防ぐ。
+    lbutton_down_since: Option<Instant>,
     fence_cache: Option<(u64, isize, ID3D11Fence)>,
     shared_texture_cache: Vec<(u64, ID3D11Texture2D)>,
     cpu_upload_scratch: Vec<u8>,
@@ -122,7 +160,10 @@ struct NativeEguiOverlay {
     visual: IDCompositionVisual,
     dcomp_device: IDCompositionDevice,
     root_visual: IDCompositionVisual,
-    after_visual: IDCompositionVisual,
+    /// この visual を root にぶら下げる際に「どの sibling の後ろに配置するか」。
+    /// `Some(v)` なら presenter フォールバック経路で `video_visual` の後ろに挟む。
+    /// `None` なら HUD HWND の DComp root に単独で配置する (CP3 P1 #3 反映)。
+    after_visual: Option<IDCompositionVisual>,
     _instance: wgpu::Instance,
     adapter: wgpu::Adapter,
     device: wgpu::Device,
@@ -132,7 +173,17 @@ struct NativeEguiOverlay {
     alpha_mode: wgpu::CompositeAlphaMode,
     renderer: egui_wgpu::Renderer,
     egui_ctx: egui::Context,
-    hwnd: HWND,
+    /// DComp / DPI / wgpu surface 用の HWND。CP4 以降、HUD 経路では HUD overlay HWND、
+    /// presenter フォールバック経路では presenter HWND を渡す。
+    /// CP8 で `WM_DPICHANGED` 経由の DPI 更新 (= `GetDpiForWindow(dcomp_hwnd)` 再計算)
+    /// で参照する予定。CP3 時点ではコンストラクタの初期 `pixels_per_point` 計算のみで使い、
+    /// その後は dead code。
+    #[allow(dead_code)]
+    dcomp_hwnd: HWND,
+    /// IME context lookup / focus handoff の対象 HWND。常に presenter HWND。
+    /// HUD HWND は `WS_EX_NOACTIVATE` で focus を取らないため、IME context を引くと
+    /// 入力が動かない → 必ず presenter HWND を使う (Codex プラン P1 #2 反映)。
+    focus_hwnd: HWND,
     started_at: Instant,
     pending_events: Vec<egui::Event>,
     modifiers: egui::Modifiers,
@@ -171,6 +222,16 @@ struct NativeEguiOverlay {
     last_thumbnail_request_at: Option<Instant>,
     hover_preview_target_secs: Option<f64>,
     hover_preview_pinned: bool,
+    /// 実機修正 (2026-05-12 P1 #2): 直近 egui run で描画した preview rect (= サムネイル枠)。
+    /// `compute_hud_regions` が region 計算で参照する。region を cursor x 追従で再計算すると
+    /// 描画 rect (= `target_secs` 起点) とずれて「サムネ画像は固定なのに枠だけ動く」症状になる。
+    /// `None` ならサムネ非表示。
+    last_drawn_preview_rect: Option<egui::Rect>,
+    /// 実機修正 (2026-05-12 A): 直近 egui run で描画した VST3 設定パネルの actual rect。
+    /// パネルは `egui::Area::movable(true)` でドラッグ可能なので、デフォルト位置 (=
+    /// `native_vst3_panel_rect`) からドラッグでずれた場合、region をその実位置に追従させる。
+    /// `None` ならパネル非表示。
+    last_drawn_vst3_panel_rect: Option<egui::Rect>,
     hover_thumbnail: Option<NativeOverlayThumbnail>,
     hover_texture: Option<egui::TextureHandle>,
     hover_texture_key: Option<(u32, u32, u64)>,
@@ -184,6 +245,13 @@ struct NativeEguiOverlay {
     top_bar_visible: bool,
     right_panel_visible: bool,
     jump_panel_visible: bool,
+    /// 実機修正 (2026-05-12): 外部 drag (= HUD region 外で left button down 中、典型的には VST window
+    /// のドラッグ) を検出するフラグ。`NativeVideoPresenter::cursor_polling_tick` で `GetAsyncKeyState
+    /// (VK_LBUTTON)` の結果と egui の `pointer.any_down()` の差から判定して set する。
+    /// true の間、`top_bar_visible()` / `hud_visible()` / `right_panel_visible()` 等の hover 判定を
+    /// 強制 false にして、bar / panel が出ないようにする (= VST 上端帯にドラッグしても hover 表示で
+    /// VST 入力が奪われないようにする)。
+    external_drag_in_progress: bool,
     pending_overlay_commands: Vec<NativeOverlayCommand>,
     last_volume_target: Option<f64>,
     visual_attached: bool,
@@ -204,6 +272,10 @@ struct NativeEguiOverlay {
     /// 余計な tick を止める。3 秒経過判定後に確実に 1 回 `SetCursor(None)` を打つために
     /// 「!cursor_hidden の間は tick 継続」という形で利用する。
     cursor_hidden: bool,
+    /// 実機修正 (2026-05-12 Codex P2 #6): cursor が `SetCursor(None)` で非表示にされたか
+    /// (= `cursor_hidden` と同じ値) を **HUD wndproc から読める形で共有する atomic**。
+    /// `update_cursor_icon` で書き込み、`WM_SETCURSOR` が読み出して隠れた cursor を復帰させる。
+    cursor_was_hidden_shared: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// 音量ノーマライズ UI 状態 (App から `SetNormalizeOverlayState` で配信される)。
     normalize_state: crate::video::normalize_types::NormalizeOverlayState,
 }
@@ -488,6 +560,12 @@ pub struct NativeOverlayInputRouting {
 pub struct NativeOverlayInputOutcome {
     pub routing: NativeOverlayInputRouting,
     pub commands: Vec<NativeOverlayCommand>,
+    /// CP5 で計算した HUD interactive regions (= 物理ピクセル単位 RECT 集合)。
+    /// 表示中の bar / panel / popup / hover thumbnail などの矩形を含む。
+    /// activation zone は **含めない** (= 上下端の VST 入力を奪わないため、Codex 5 P1 #1)。
+    /// `NativeVideoPresenter::handle_window_events` の戻り値受信側で
+    /// `apply_hud_regions(&hud_regions)` を呼んで `SetWindowRgn` を更新する。
+    pub hud_regions: Vec<RECT>,
 }
 
 impl NativeOverlayInputOutcome {
@@ -495,6 +573,7 @@ impl NativeOverlayInputOutcome {
         Self {
             routing: NativeOverlayInputRouting::default(),
             commands: Vec::new(),
+            hud_regions: Vec::new(),
         }
     }
 }
@@ -601,6 +680,10 @@ impl NativeOverlayInputRouting {
             | NativeEvent::MouseButton(_)
             | NativeEvent::MouseWheel(_)
             | NativeEvent::MouseLeave => !self.wants_pointer_input,
+            // 内部処理イベント (presenter thread が直接消費する)。UI 転送しない。
+            NativeEvent::GeometryChanged { .. }
+            | NativeEvent::DpiChanged { .. }
+            | NativeEvent::RequestRaiseHud => false,
         }
     }
 }
@@ -638,6 +721,13 @@ fn create_present_d3d11_device() -> Result<(ID3D11Device, ID3D11DeviceContext), 
 
 fn configure_overlay_fonts(ctx: &egui::Context) {
     crate::ui_fonts::configure_fonts(ctx);
+}
+
+/// CP9 実機 debug: `MIV_HUD_DEBUG=1` で起動したか。
+/// 起動後一度評価された値を cache (= env を変えても再評価しない、Once セマンティクス)。
+pub(crate) fn hud_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MIV_HUD_DEBUG").is_some())
 }
 
 impl NativeVideoPresenter {
@@ -721,40 +811,195 @@ impl NativeVideoPresenter {
             root_visual
                 .AddVisual(&video_visual, true, &background._visual)
                 .map_err(|e| format!("IDCompositionVisual::AddVisual video: {e:?}"))?;
-            let mut egui_overlay = None;
+            // CP4: HUD overlay HWND を生成 (= bars / interactive UI 用の独立 top-level)。
+            // `hud_event_tx` が `Some` のときだけ作る。失敗時は presenter フォールバック経路
+            // (= presenter HWND の DComp tree に egui overlay を載せる) に入る。
+            //
+            // HUD HWND が成功したら:
+            //   - HUD 用 IDCompositionTarget + root_visual を作って struct で保持
+            //   - egui overlay を HUD root に `after_visual=None` で attach
+            //   - egui の dcomp_hwnd は HUD HWND、focus_hwnd は presenter HWND
+            // 失敗したら:
+            //   - egui overlay を presenter root に `after_visual=Some(&video_visual)` で attach
+            //   - dcomp_hwnd / focus_hwnd ともに presenter HWND (= CP3 までと同じフォールバック挙動)
+            let mut hud_window: Option<hud_window::HudOverlayWindow> = None;
+            let mut hud_dcomp_target: Option<IDCompositionTarget> = None;
+            let mut hud_root_visual: Option<IDCompositionVisual> = None;
+            let mut hud_regions: Option<
+                std::sync::Arc<std::sync::Mutex<hud_window::HudInteractiveRegions>>,
+            > = None;
+            let cursor_was_hidden = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+            if let Some(hud_tx) = config.hud_event_tx.as_ref() {
+                let regions = std::sync::Arc::new(std::sync::Mutex::new(
+                    hud_window::HudInteractiveRegions::default(),
+                ));
+                // Codex CP7 P1 #2 反映: HUD HWND の初期 screen 座標を presenter HWND の
+                // `GetWindowRect` で取得 (= secondary monitor / 負座標 monitor 対応)。
+                // 失敗時は `(0, 0)` フォールバック (= primary monitor 想定)。
+                let (hud_x, hud_y) = {
+                    use windows::Win32::Foundation::RECT;
+                    use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
+                    let mut rc = RECT::default();
+                    if GetWindowRect(config.hwnd, &mut rc).is_ok() {
+                        (rc.left, rc.top)
+                    } else {
+                        (0, 0)
+                    }
+                };
+                let cfg = hud_window::HudOverlayConfig {
+                    owner_hwnd: config.hwnd,
+                    focus_hwnd: config.hwnd,
+                    x: hud_x,
+                    y: hud_y,
+                    width: config.width,
+                    height: config.height,
+                    event_tx: hud_tx.clone(),
+                    regions: std::sync::Arc::clone(&regions),
+                    cursor_was_hidden: std::sync::Arc::clone(&cursor_was_hidden),
+                };
+                match hud_window::HudOverlayWindow::create(cfg) {
+                    Ok(hud) => {
+                        // HUD 用 DComp target / root visual を作る。drop 防止のため struct で保持。
+                        match dcomp_device.CreateTargetForHwnd(hud.hwnd(), true) {
+                            Ok(target) => {
+                                match dcomp_device.CreateVisual() {
+                                    Ok(root_for_hud) => {
+                                        match target.SetRoot(&root_for_hud) {
+                                            Ok(()) => {
+                                                hud_window = Some(hud);
+                                                hud_dcomp_target = Some(target);
+                                                hud_root_visual = Some(root_for_hud);
+                                                hud_regions = Some(regions);
+                                                crate::logger::log(
+                                                    "[native-video] HUD overlay HWND created".to_string(),
+                                                );
+                                            }
+                                            Err(err) => {
+                                                crate::logger::log(format!(
+                                                    "native-presenter: HUD DComp target SetRoot failed, fallback: {err:?}"
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    Err(err) => {
+                                        crate::logger::log(format!(
+                                            "native-presenter: HUD DComp CreateVisual failed, fallback: {err:?}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                crate::logger::log(format!(
+                                    "native-presenter: HUD CreateTargetForHwnd failed, fallback: {err:?}"
+                                ));
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        crate::logger::log(format!(
+                            "native-presenter: HUD overlay HWND creation failed, fallback: {err}"
+                        ));
+                    }
+                }
+            }
+
+            // CP4 + P2 #1 反映: egui overlay の attach は HUD 経路 → presenter フォールバック
+            // 経路の 2 段階で試す。HUD 経路で `NativeEguiOverlay::new` が失敗したら、
+            // HUD fields を全部 None にクリアしてから presenter フォールバック経路で
+            // retry する。これがないと「HUD HWND は作られたが overlay は disable」という
+            // 中途半端な状態 (= `hud_hwnd_out` に非 0、bars が見えない) になる。
+            let mut egui_overlay: Option<NativeEguiOverlay> = None;
             if config.egui_overlay {
-                let overlay_visual = dcomp_device
-                    .CreateVisual()
-                    .map_err(|e| format!("CreateVisual egui overlay: {e:?}"))?;
-                match NativeEguiOverlay::new(
-                    overlay_visual,
-                    &dcomp_device,
-                    &root_visual,
-                    &video_visual,
-                    config.hwnd,
-                    config.width,
-                    config.height,
-                ) {
-                    Ok(mut overlay) => {
-                        if let Err(err) = overlay.render_once() {
+                // Step 1: HUD 経路で attach を試みる。
+                if let Some(hud_root) = hud_root_visual.as_ref() {
+                    let hud_hwnd_val = hud_window
+                        .as_ref()
+                        .map(|h| h.hwnd())
+                        .unwrap_or_else(|| HWND(std::ptr::null_mut()));
+                    let overlay_visual = dcomp_device
+                        .CreateVisual()
+                        .map_err(|e| format!("CreateVisual egui overlay (HUD): {e:?}"))?;
+                    match NativeEguiOverlay::new(
+                        overlay_visual,
+                        &dcomp_device,
+                        hud_root,
+                        None,
+                        hud_hwnd_val,
+                        config.hwnd,
+                        config.width,
+                        config.height,
+                        std::sync::Arc::clone(&cursor_was_hidden),
+                    ) {
+                        Ok(mut overlay) => {
+                            if let Err(err) = overlay.render_once() {
+                                crate::logger::log(format!(
+                                    "native-presenter: HUD egui overlay initial render failed: {err}"
+                                ));
+                                log_event(
+                                    "egui_overlay_error",
+                                    &[("error", Value::from(err.to_string()))],
+                                );
+                            }
+                            egui_overlay = Some(overlay);
+                        }
+                        Err(err) => {
+                            // HUD 経路で失敗 → HUD fields を全部 drop して presenter フォールバック retry。
+                            // `hud_window` / `hud_dcomp_target` / `hud_root_visual` / `hud_regions` を
+                            // None にすることで HUD HWND が destroy され、`hud_hwnd_out` も 0 のままになる。
                             crate::logger::log(format!(
-                                "native-presenter: egui overlay initial render failed: {err}"
+                                "native-presenter: HUD egui overlay init failed, falling back to presenter DComp tree: {err}"
+                            ));
+                            log_event(
+                                "egui_overlay_error",
+                                &[("error", Value::from(err.to_string())), ("phase", Value::from("hud_path_fallback"))],
+                            );
+                            hud_window = None;
+                            hud_dcomp_target = None;
+                            hud_root_visual = None;
+                            hud_regions = None;
+                        }
+                    }
+                }
+
+                // Step 2: フォールバック経路。Step 1 が完全成功なら skip、HUD HWND なし or
+                // HUD 経路で失敗した場合は presenter root の DComp tree に attach する。
+                if egui_overlay.is_none() {
+                    let overlay_visual = dcomp_device
+                        .CreateVisual()
+                        .map_err(|e| format!("CreateVisual egui overlay (fallback): {e:?}"))?;
+                    match NativeEguiOverlay::new(
+                        overlay_visual,
+                        &dcomp_device,
+                        &root_visual,
+                        Some(&video_visual),
+                        config.hwnd,
+                        config.hwnd,
+                        config.width,
+                        config.height,
+                        std::sync::Arc::clone(&cursor_was_hidden),
+                    ) {
+                        Ok(mut overlay) => {
+                            if let Err(err) = overlay.render_once() {
+                                crate::logger::log(format!(
+                                    "native-presenter: egui overlay initial render failed: {err}"
+                                ));
+                                log_event(
+                                    "egui_overlay_error",
+                                    &[("error", Value::from(err.to_string()))],
+                                );
+                            }
+                            egui_overlay = Some(overlay);
+                        }
+                        Err(err) => {
+                            crate::logger::log(format!(
+                                "native-presenter: egui overlay disabled after init failure: {err}"
                             ));
                             log_event(
                                 "egui_overlay_error",
                                 &[("error", Value::from(err.to_string()))],
                             );
                         }
-                        egui_overlay = Some(overlay);
-                    }
-                    Err(err) => {
-                        crate::logger::log(format!(
-                            "native-presenter: egui overlay disabled after init failure: {err}"
-                        ));
-                        log_event(
-                            "egui_overlay_error",
-                            &[("error", Value::from(err.to_string()))],
-                        );
                     }
                 }
             }
@@ -800,6 +1045,14 @@ impl NativeVideoPresenter {
                 backbuffer: None,
                 test_overlay,
                 egui_overlay,
+                hud_window,
+                _hud_dcomp_target: hud_dcomp_target,
+                _hud_root_visual: hud_root_visual,
+                hud_regions,
+                editor_hwnds_snapshot: None,
+                main_hwnd_for_raise: 0,
+                last_logged_region_hash: None,
+                lbutton_down_since: None,
                 fence_cache: None,
                 shared_texture_cache: Vec::new(),
                 cpu_upload_scratch: Vec::new(),
@@ -1095,15 +1348,385 @@ impl NativeVideoPresenter {
         })
     }
 
+    /// HUD overlay HWND の生 u64 値。HUD HWND が生成されていなければ 0。
+    /// `run_native_video_output` が `hud_hwnd_out` に store するための accessor。
+    #[allow(dead_code)]
+    pub fn hud_hwnd(&self) -> u64 {
+        self.hud_window
+            .as_ref()
+            .map(|hud| hud.hwnd().0 as u64)
+            .unwrap_or(0)
+    }
+
+    /// HUD overlay HWND を最前面に上げ直す。**allowlist 判定なしの low-level API**。
+    /// 通常は `try_raise_hud_to_top` を使って allowlist 判定を通す (Codex CP7 P1 #1 反映)。
+    /// このメソッドは内部 (= `try_raise_hud_to_top`) からのみ呼ばれる想定で `pub` にしているが、
+    /// 直接呼ぶと VST popup / mIV 設定ダイアログが foreground でも raise してしまうので注意。
+    #[allow(dead_code)]
+    pub fn raise_hud_to_top(&self) {
+        if let Some(hud) = self.hud_window.as_ref() {
+            hud.raise_to_top();
+        }
+    }
+
+    /// HUD overlay HWND を最前面に上げ直す。**allowlist 判定込み版** (CP7 P1 #1 反映)。
+    /// `RaiseHudToTop` command / `RequestRaiseHud` event / polling のすべての raise 経路で
+    /// これを呼ぶ。`foreground_allows_hud_raise` が false (= VST popup / file dialog /
+    /// mIV 設定ダイアログ等が foreground) のとき raise を skip して `false` を返す。
+    /// 成功時は `true` を返す。HUD HWND が無いフォールバック経路でも `false`。
+    #[allow(dead_code)]
+    pub fn try_raise_hud_to_top(&self, presenter_hwnd: u64) -> bool {
+        if self.hud_window.is_none() {
+            return false;
+        }
+        // allowlist 判定。editor_hwnds_snapshot が未登録なら raise しない (= 安全側)。
+        let editor_hwnds = match self.editor_hwnds_snapshot.as_ref() {
+            Some(arc) => match arc.read() {
+                Ok(g) => g.clone(),
+                Err(_) => return false,
+            },
+            None => return false,
+        };
+        let hud_hwnd_val = self
+            .hud_window
+            .as_ref()
+            .map(|h| h.hwnd().0 as u64)
+            .unwrap_or(0);
+        if !crate::video::dsp::foreground_allows_hud_raise(
+            presenter_hwnd,
+            hud_hwnd_val,
+            self.main_hwnd_for_raise,
+            &editor_hwnds,
+        ) {
+            return false;
+        }
+        if let Some(hud) = self.hud_window.as_ref() {
+            hud.raise_to_top();
+        }
+        true
+    }
+
+    /// HUD HWND の geometry (= 位置・サイズ) を mirror する。`GeometryChanged` 受信時に
+    /// presenter loop から呼ぶ。HUD HWND が無いなら no-op。
+    #[allow(dead_code)]
+    pub fn set_hud_geometry(&self, x: i32, y: i32, w: u32, h: u32) {
+        if let Some(hud) = self.hud_window.as_ref() {
+            hud.set_geometry(x, y, w, h);
+        }
+    }
+
+    /// HUD `WM_NCHITTEST` フェイルセーフ用の `regions` shared lock。
+    /// CP5 で `NativeEguiOverlay::run` 末尾から書き込む。HUD 無いなら `None`。
+    #[allow(dead_code)]
+    pub fn hud_regions_handle(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<hud_window::HudInteractiveRegions>>> {
+        self.hud_regions.as_ref().map(std::sync::Arc::clone)
+    }
+
+    /// HUD HWND の `SetWindowRgn` を `regions` に合わせて更新する。CP5 で
+    /// `NativeEguiOverlay::run` 末尾から `regions` 計算後に呼ばれる。
+    #[allow(dead_code)]
+    pub fn apply_hud_regions(&mut self, regions: &[RECT]) {
+        if let Some(hud) = self.hud_window.as_mut() {
+            hud.apply_regions(regions);
+        }
+    }
+
+    /// CP8: HUD HWND の `WM_DPICHANGED` を受けて overlay の pixels_per_point を更新する。
+    /// `dirty = true` 化されるので次フレームの render で region 物理ピクセル換算が新 DPI 基準になる。
+    /// 戻り値: 値が変わったかどうか。
+    #[allow(dead_code)]
+    pub fn set_overlay_pixels_per_point(&mut self, ppp: f32) -> bool {
+        self.egui_overlay
+            .as_mut()
+            .map(|o| o.set_pixels_per_point(ppp))
+            .unwrap_or(false)
+    }
+
+    /// CP8 (Codex CP8 P2 反映): **overlay (egui_wgpu) の surface だけ** を resize する。
+    /// presenter 全体 (= background / video transform / swap chain) は触らない。
+    ///
+    /// `DpiChanged` 経由で HUD HWND の `suggested_rect` に合わせて overlay surface を
+    /// resize するときに使う。presenter HWND は別 monitor / 別 DPI 経路 (`WM_DPICHANGED`)
+    /// で別途 resize される (現状未配線)。HUD の suggested_rect で presenter video まで
+    /// 引っ張られると video transform が壊れるので、専用経路に分ける。
+    ///
+    /// 通常の `resize(width, height)` は presenter 全体を resize するので、
+    /// `WM_WINDOWPOSCHANGED` 経由で presenter HWND 自身の geometry が変わったときに使う。
+    #[allow(dead_code)]
+    pub fn resize_overlay_surface_only(&mut self, width: u32, height: u32) -> Result<(), String> {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.resize(width, height)?;
+        }
+        Ok(())
+    }
+
+    /// CP6: HUD raise 判定で参照する `editor_hwnds` snapshot を登録する。
+    /// CP7 で App が `dsp_bridge.editor_hwnds_snapshot()` を渡してくる。
+    /// `None` のとき raise 判定は強制 false (= raise burst を起動しない)。
+    #[allow(dead_code)]
+    pub fn set_editor_hwnds_snapshot(
+        &mut self,
+        snapshot: Option<std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>>,
+    ) {
+        self.editor_hwnds_snapshot = snapshot;
+    }
+
+    /// CP6: `foreground_allows_hud_raise` 判定用の既知 mIV HWND (= main HWND) を登録。
+    /// presenter HWND と HUD HWND は presenter 自身が知っているので、外部から
+    /// 渡すのは main HWND だけ。CP7 で App が設定する。
+    #[allow(dead_code)]
+    pub fn set_main_hwnd_for_raise_check(&mut self, main_hwnd: u64) {
+        self.main_hwnd_for_raise = main_hwnd;
+    }
+
+    /// CP6: presenter thread loop から 50ms 周期で呼ばれる cursor polling。
+    /// 戻り値: `true` なら呼び出し側で `raise_hud_to_top()` + retry burst を起動すべき。
+    /// HUD HWND が無い (= CP4 フォールバック経路 / CP7 で flip 前) なら何もせず `false`。
+    ///
+    /// 役割:
+    ///   1. `GetCursorPos` + `ScreenToClient(presenter_hwnd)` で cursor の presenter 座標を取得。
+    ///   2. presenter HWND の client rect 範囲チェック (= 別モニターに移ったケースは弾く、
+    ///      Codex 4 P1/P2 #3): 範囲外なら一度だけ synthetic `MouseLeave` を流して以降何もしない。
+    ///   3. 範囲内: 直近 80ms 以内に HUD/presenter wndproc 経由の本物 `WM_MOUSEMOVE` が
+    ///      届いていなければ synthetic `MouseMove` を overlay の `push_native_event` に流す
+    ///      (= region 外 cursor でも hover 表示遷移を成立させる)。
+    ///   4. cursor が activation zone (= 上端 0..76pt / 下端 H-220..H pt) 内、かつ
+    ///      `editor_hwnds_snapshot` から `foreground_allows_hud_raise` が true を返した場合、
+    ///      raise を要求する (= 戻り値 true)。判定不能なら false で skip。
+    #[allow(dead_code)]
+    pub fn cursor_polling_tick(
+        &mut self,
+        presenter_hwnd: u64,
+        last_native_mouse_at: Option<std::time::Instant>,
+        pointer_present_synthetic: &mut bool,
+    ) -> bool {
+        use windows::Win32::Foundation::{HWND, POINT};
+        use windows::Win32::Graphics::Gdi::ScreenToClient;
+        use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
+        use windows::Win32::UI::WindowsAndMessaging::GetCursorPos;
+
+        // 実機修正 (2026-05-12): 外部 drag 検出。
+        // `GetAsyncKeyState(VK_LBUTTON)` の最上位 bit が立っていれば左ボタン押下中。
+        // ただし HUD region 内クリックは egui の `pointer.any_down()` でも true になる
+        // (= 内部 drag、e.g. seek bar の drag)。両方の差分で「HUD 外で down している」
+        // = 外部 drag (e.g. VST window のドラッグ) を判定する。
+        //
+        // ## 実機修正 (2026-05-12 P1 #3): 100ms delay を入れる
+        //
+        // 旧版は LBUTTON DOWN 直後のフレームで即 external_drag = true と判定していたが、
+        // これだと「user が HUD top bar の button をクリックしたフレーム」と「event が
+        // egui に届くフレーム」の間に polling が走って external_drag flip → top bar 非表示
+        // になり、click event の処理時には button が描画されておらず click が失われる
+        // (= ユーザー報告「VST ボタンを押しても反応しない、一瞬上のホバーバーが消える」)。
+        //
+        // LBUTTON DOWN を検出した最初のフレームでは `lbutton_down_since` だけ記録し、
+        // external_drag は false のまま (= bar 表示維持)。100ms 経過後も DOWN 継続中で
+        // egui に any_down が伝わっていなければ「真の外部 drag」と判定する。
+        // 通常 click は数 ms ~ 数十 ms で UP するので、この delay で click は誤検出されない。
+        let global_lbutton_down = unsafe {
+            (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0
+        };
+        let egui_pointer_down = self
+            .egui_overlay
+            .as_ref()
+            .map(|o| o.egui_ctx.input(|i| i.pointer.any_down()))
+            .unwrap_or(false);
+        if global_lbutton_down {
+            if self.lbutton_down_since.is_none() {
+                self.lbutton_down_since = Some(std::time::Instant::now());
+            }
+        } else {
+            self.lbutton_down_since = None;
+        }
+        let lbutton_down_long_enough = self
+            .lbutton_down_since
+            .map(|t| t.elapsed() >= std::time::Duration::from_millis(100))
+            .unwrap_or(false);
+        // Codex P2 #5 反映: HUD HWND が `SetCapture` で mouse を取っている間は HUD 起点クリック
+        // (= seek drag や bar button hold) なので external_drag に分類しない。これで 100ms heuristic
+        // を抜けた長押し操作 (e.g. seek bar drag が長引くケース) でも top bar を消さない。
+        let hud_has_capture = if let Some(hud) = self.hud_window.as_ref() {
+            let hud_hwnd = hud.hwnd();
+            !hud_hwnd.0.is_null() && unsafe {
+                let cur =
+                    windows::Win32::UI::Input::KeyboardAndMouse::GetCapture();
+                cur.0 == hud_hwnd.0
+            }
+        } else {
+            false
+        };
+        let external_drag = global_lbutton_down
+            && !egui_pointer_down
+            && lbutton_down_long_enough
+            && !hud_has_capture;
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            if overlay.external_drag_in_progress != external_drag {
+                overlay.external_drag_in_progress = external_drag;
+                // 状態変化 → 次フレームで hover 判定が変わるので render dirty 化
+                overlay.dirty = true;
+            }
+        }
+
+        // HUD HWND が無い経路 (= CP4 フォールバック / CP7 で flip 前) は polling 不要。
+        if self.hud_window.is_none() {
+            return false;
+        }
+        let hwnd = HWND(presenter_hwnd as *mut _);
+        let mut pt = POINT::default();
+        let cursor_ok = unsafe { GetCursorPos(&mut pt) }.is_ok();
+        if !cursor_ok {
+            return false;
+        }
+        let in_range = unsafe { ScreenToClient(hwnd, &mut pt) }.as_bool() && {
+            pt.x >= 0
+                && pt.y >= 0
+                && (pt.x as u32) < self.width
+                && (pt.y as u32) < self.height
+        };
+
+        if !in_range {
+            // 範囲外: 前回 synthetic 状態だったら 1 度だけ MouseLeave を流して終了。
+            if *pointer_present_synthetic {
+                if hud_debug_enabled() {
+                    crate::logger::log("[HUD-DEBUG] polling synthetic MouseLeave (cursor out of client rect)".to_string());
+                }
+                if let Some(overlay) = self.egui_overlay.as_mut() {
+                    overlay.push_native_event(
+                        crate::video::native_window::NativeVideoWindowEvent::MouseLeave,
+                    );
+                }
+                *pointer_present_synthetic = false;
+            }
+            return false;
+        }
+
+        // 範囲内: 直近 80ms 以内に本物 mouse が届いていなければ synthetic MouseMove。
+        // Codex CP6 再 P3 反映: `pointer_present_synthetic` は **synthetic を実際に push
+        // した時のみ** `true` にする。recent_native で skip した場合はフラグを動かさない
+        // (= 直前に synthetic だったなら true のまま、本物経路だけなら false のまま)。
+        // これにより client rect 外に出たとき、native `WM_MOUSELEAVE` と二重で synthetic
+        // `MouseLeave` を流すリスクを排除する (= 「synthetic を流した状態」だけが
+        // synthetic leave を必要とする)。
+        let now = std::time::Instant::now();
+        let recent_native = last_native_mouse_at
+            .is_some_and(|t| now.duration_since(t) < std::time::Duration::from_millis(80));
+        if !recent_native {
+            if hud_debug_enabled() {
+                crate::logger::log(format!(
+                    "[HUD-DEBUG] polling synthetic MouseMove x={} y={} (no native mouse in 80ms)",
+                    pt.x, pt.y
+                ));
+            }
+            if let Some(overlay) = self.egui_overlay.as_mut() {
+                overlay.push_native_event(
+                    crate::video::native_window::NativeVideoWindowEvent::MouseMove(
+                        crate::video::native_window::NativeVideoMouseEvent {
+                            x: pt.x,
+                            y: pt.y,
+                            shift: false,
+                            ctrl: false,
+                        },
+                    ),
+                );
+                *pointer_present_synthetic = true;
+            }
+        }
+        // recent_native の場合は `pointer_present_synthetic` を変更しない (前回値維持)。
+
+        // activation zone 判定 (= 上端 76pt 帯 / 下端 220pt 帯)。
+        // pixels_per_point は overlay から取得 (= CP3 で導入した overlay の pixels_per_point)。
+        let ppp = self
+            .egui_overlay
+            .as_ref()
+            .map(|o| o.pixels_per_point.max(1.0))
+            .unwrap_or(1.0);
+        let top_band_px = (76.0_f32 * ppp).round() as i32;
+        let bottom_band_top = self.height as i32 - (220.0_f32 * ppp).round() as i32;
+        let in_activation_zone = pt.y < top_band_px || pt.y >= bottom_band_top;
+        if !in_activation_zone {
+            return false;
+        }
+
+        // raise allowlist 判定 (= mIV 既知 HWND / editor allowlist / popup 検出)。
+        // editor_hwnds_snapshot が未登録なら raise 判定 false で skip。
+        let editor_hwnds = match self.editor_hwnds_snapshot.as_ref() {
+            Some(arc) => match arc.read() {
+                Ok(g) => g.clone(),
+                Err(_) => return false,
+            },
+            None => return false,
+        };
+        let hud_hwnd_val = self
+            .hud_window
+            .as_ref()
+            .map(|h| h.hwnd().0 as u64)
+            .unwrap_or(0);
+        crate::video::dsp::foreground_allows_hud_raise(
+            presenter_hwnd,
+            hud_hwnd_val,
+            self.main_hwnd_for_raise,
+            &editor_hwnds,
+        )
+    }
+
     pub fn handle_window_events(
         &mut self,
         events: &[crate::video::native_window::NativeVideoWindowEvent],
     ) -> Result<NativeOverlayInputOutcome, String> {
-        if let Some(overlay) = self.egui_overlay.as_mut() {
+        let outcome = if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.push_native_events(events);
-            return overlay.render_if_dirty();
+            overlay.render_if_dirty()?
+        } else {
+            NativeOverlayInputOutcome::empty()
+        };
+        self.publish_hud_regions(&outcome);
+        Ok(outcome)
+    }
+
+    /// Codex CP5 P1 反映: HUD HWND region 適用 + shared snapshot 更新を一箇所にまとめる。
+    /// egui overlay が render を経由するすべての経路 (= `handle_window_events` /
+    /// `tick_overlay_video_state` / その他 command 経由の overlay 更新) で必ず呼ぶ。
+    /// 経路漏れがあると HUD region が stale になり、消えた UI の場所で HUD が
+    /// 入力を取り続ける (= VST に入力が抜けない) regression を引き起こす。
+    /// HUD HWND が無い (フォールバック経路) なら両方 no-op。
+    fn publish_hud_regions(&mut self, outcome: &NativeOverlayInputOutcome) {
+        // CP9 実機 debug log: `MIV_HUD_DEBUG=1` で起動したら region 変化を log する。
+        if hud_debug_enabled() && self.hud_window.is_some() {
+            let new_hash = hud_window::hash_regions_for_debug(&outcome.hud_regions);
+            if self.last_logged_region_hash != Some(new_hash) {
+                self.last_logged_region_hash = Some(new_hash);
+                let rects_str: String = outcome
+                    .hud_regions
+                    .iter()
+                    .map(|r| format!("({},{} {}x{})", r.left, r.top, r.right - r.left, r.bottom - r.top))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if let Some(overlay) = self.egui_overlay.as_ref() {
+                    crate::logger::log(format!(
+                        "[HUD-DEBUG] regions changed n={} ptr={:?} top_bar={} hud_vis={} right={} jump={} vst3={} thumb={} pin={} rects=[{}]",
+                        outcome.hud_regions.len(),
+                        overlay.pointer_pos,
+                        overlay.top_bar_visible,
+                        overlay.hud_visible(),
+                        overlay.right_panel_visible(),
+                        overlay.jump_panel_visible,
+                        overlay.vst3_panel_visible(),
+                        overlay.hover_thumbnail.is_some(),
+                        overlay.hover_preview_pinned,
+                        rects_str,
+                    ));
+                }
+            }
         }
-        Ok(NativeOverlayInputOutcome::empty())
+
+        if let Some(regions_arc) = self.hud_regions.as_ref() {
+            if let Ok(mut guard) = regions_arc.lock() {
+                guard.regions = outcome.hud_regions.clone();
+            }
+        }
+        self.apply_hud_regions(&outcome.hud_regions);
     }
 
     pub fn update_overlay_video_state(
@@ -1263,7 +1886,7 @@ impl NativeVideoPresenter {
         playback_speed: f64,
         frame_step_active: bool,
     ) -> Result<NativeOverlayInputOutcome, String> {
-        if let Some(overlay) = self.egui_overlay.as_mut() {
+        let outcome = if let Some(overlay) = self.egui_overlay.as_mut() {
             let force_tick_render = overlay.wants_periodic_tick();
             overlay.update_video_state(
                 position_secs,
@@ -1277,9 +1900,15 @@ impl NativeVideoPresenter {
             if force_tick_render {
                 overlay.dirty = true;
             }
-            return overlay.render_if_dirty();
-        }
-        Ok(NativeOverlayInputOutcome::empty())
+            overlay.render_if_dirty()?
+        } else {
+            NativeOverlayInputOutcome::empty()
+        };
+        // Codex CP5 P1 反映: tick 経路でも overlay UI が時間経過で表示/非表示に変わるので、
+        // 必ず HUD region に反映する。漏らすと periodic 表示状態 (= toast / hover preview /
+        // tile overlay refresh 等) と region がズレて VST にクリックが奪われる。
+        self.publish_hud_regions(&outcome);
+        Ok(outcome)
     }
 
     pub fn overlay_hud_visible(&self) -> bool {
@@ -1784,10 +2413,12 @@ impl NativeEguiOverlay {
         visual: IDCompositionVisual,
         dcomp_device: &IDCompositionDevice,
         root_visual: &IDCompositionVisual,
-        after_visual: &IDCompositionVisual,
-        hwnd: HWND,
+        after_visual: Option<&IDCompositionVisual>,
+        dcomp_hwnd: HWND,
+        focus_hwnd: HWND,
         width: u32,
         height: u32,
+        cursor_was_hidden_shared: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::DX12,
@@ -1833,13 +2464,13 @@ impl NativeEguiOverlay {
             egui_wgpu::Renderer::new(&device, format, egui_wgpu::RendererOptions::default());
         let egui_ctx = egui::Context::default();
         configure_overlay_fonts(&egui_ctx);
-        let pixels_per_point = pixels_per_point_for_hwnd(hwnd);
+        let pixels_per_point = pixels_per_point_for_hwnd(dcomp_hwnd);
         let this = Self {
             surface,
             visual,
             dcomp_device: dcomp_device.clone(),
             root_visual: root_visual.clone(),
-            after_visual: after_visual.clone(),
+            after_visual: after_visual.cloned(),
             _instance: instance,
             adapter,
             device,
@@ -1849,7 +2480,8 @@ impl NativeEguiOverlay {
             alpha_mode,
             renderer,
             egui_ctx,
-            hwnd,
+            dcomp_hwnd,
+            focus_hwnd,
             started_at: Instant::now(),
             pending_events: Vec::new(),
             modifiers: egui::Modifiers::default(),
@@ -1885,6 +2517,8 @@ impl NativeEguiOverlay {
             last_thumbnail_request_at: None,
             hover_preview_target_secs: None,
             hover_preview_pinned: false,
+            last_drawn_preview_rect: None,
+            last_drawn_vst3_panel_rect: None,
             hover_thumbnail: None,
             hover_texture: None,
             hover_texture_key: None,
@@ -1898,6 +2532,7 @@ impl NativeEguiOverlay {
             top_bar_visible: false,
             right_panel_visible: false,
             jump_panel_visible: false,
+            external_drag_in_progress: false,
             pending_overlay_commands: Vec::new(),
             last_volume_target: None,
             visual_attached: false,
@@ -1906,6 +2541,7 @@ impl NativeEguiOverlay {
             height: height.max(1),
             cursor_last_activity: None,
             cursor_hidden: false,
+            cursor_was_hidden_shared,
             normalize_state: crate::video::normalize_types::NormalizeOverlayState::default(),
         };
         this.configure();
@@ -1939,6 +2575,19 @@ impl NativeEguiOverlay {
         self.configure();
         self.dirty = true;
         self.render_once().map(|_| ())
+    }
+
+    /// CP8: DPI 変更を反映する。`pixels_per_point = dpi as f32 / 96.0`。
+    /// 戻り値: 値が変わったかどうか。変わった場合は呼び出し側で next render の
+    /// region 再計算を期待する (= `dirty = true`)。
+    fn set_pixels_per_point(&mut self, ppp: f32) -> bool {
+        let new_ppp = ppp.max(0.5).min(8.0); // 50%-800% の範囲にクランプ
+        if (self.pixels_per_point - new_ppp).abs() < f32::EPSILON {
+            return false;
+        }
+        self.pixels_per_point = new_ppp;
+        self.dirty = true;
+        true
     }
 
     fn push_native_events(
@@ -2050,6 +2699,10 @@ impl NativeEguiOverlay {
                 self.pending_events.push(egui::Event::PointerGone);
                 self.dirty = true;
             }
+            // 内部処理イベント (presenter thread が直接消費する)。overlay には流さない。
+            NativeEvent::GeometryChanged { .. }
+            | NativeEvent::DpiChanged { .. }
+            | NativeEvent::RequestRaiseHud => {}
         }
     }
 
@@ -2437,16 +3090,298 @@ impl NativeEguiOverlay {
 
     fn render_if_dirty(&mut self) -> Result<NativeOverlayInputOutcome, String> {
         if !self.dirty && self.pending_events.is_empty() {
+            // CP5: dirty フラグ無しでも HUD regions は最新の visibility に合わせて
+            // 出しておく (= 例えば mouse hover で bar が消えても、その後の VST z-order
+            // 変更で再 raise されたとき HUD HWND の region がきちんと「穴」になっている
+            // 必要があるため)。dirty 無しの場合は render はしないが regions だけ更新。
             return Ok(NativeOverlayInputOutcome {
                 routing: self.input_routing(),
                 commands: Vec::new(),
+                hud_regions: self.compute_hud_regions(),
             });
         }
         let commands = self.render_once()?;
         Ok(NativeOverlayInputOutcome {
             routing: self.input_routing(),
             commands,
+            hud_regions: self.compute_hud_regions(),
         })
+    }
+
+    /// CP5: 現在表示中の overlay UI 要素の物理ピクセル RECT を集める。
+    /// `apply_hud_regions(&regions)` で `SetWindowRgn` に渡されて、HUD HWND の
+    /// 物理形状が更新される。
+    ///
+    /// **含めるもの (= 実際にクリック可能な UI rect だけ)**:
+    /// - 上 hover bar (`top_bar_visible()`): 画面上端 0..76pt 帯
+    /// - 下 HUD (`hud_visible()`): 画面下端 (H-220)..H pt 帯
+    /// - right panel (`right_panel_visible()`): 画面右端の panel rect
+    /// - jump panel (`jump_panel_visible`): 画面下半分の jump rect
+    /// - VST3 panel (`vst3_panel_visible()`): center modal panel
+    /// - speed popup (`video_speed_popup_open`): 画面下端の popup
+    /// - bookmark title editor (`bookmark_title_edit.is_some()`): center modal
+    /// - normalize progress / scan UI (`normalize_state` の各 phase)
+    /// - tile overlay (`tile_overlay.is_some()`): 全画面 tile grid
+    /// - paused center indicator (paused かつ表示中)
+    /// - seek hover thumbnail + pin/bookmark (`hover_thumbnail.is_some()`)
+    ///
+    /// **含めないもの**:
+    /// - activation zone (= bar 非表示状態の hover 検出範囲) — VST のノブやメニューが
+    ///   上下端に重なったとき入力を奪わないため (Codex 5 P1 #1)。hover 検出は CP6 の
+    ///   presenter polling 経路で代替。
+    ///
+    /// **`capture_all` フラグ**: egui `pointer.any_down() && wants_pointer_input` が
+    /// true のフレーム (= drag 中) は全画面 RECT に置換して drag 維持。
+    ///
+    /// CP5 段階では各 UI 要素の正確な egui `response.rect` を持っていないため、
+    /// **概算 RECT** (= 既知の固定高さ帯) で実装する。CP7 で有効化したあとの実機検証で
+    /// rect ずれが出たら egui レイアウト結果から rect を引いてくる方式に補修する。
+    fn compute_hud_regions(&self) -> Vec<RECT> {
+        let ppp = self.pixels_per_point.max(1.0);
+        let width_px = self.width.max(1) as i32;
+        let height_px = self.height.max(1) as i32;
+
+        // capture_all: drag 中はクリックを HUD 経由で受け取りたいので region を画面全体に。
+        let pointer_down = self.egui_ctx.input(|i| i.pointer.any_down());
+        if pointer_down && self.wants_pointer_input {
+            return vec![RECT {
+                left: 0,
+                top: 0,
+                right: width_px,
+                bottom: height_px,
+            }];
+        }
+
+        let mut regions: Vec<RECT> = Vec::new();
+        let to_px = |pt: f32| -> i32 { (pt * ppp).round() as i32 };
+        let width_points = (self.width as f32 / ppp).max(1.0);
+        let height_points = (self.height as f32 / ppp).max(1.0);
+        // Codex CP9 実機 P1 #3 反映: egui::Rect → physical RECT 変換 helper。
+        // panel 概算値ではなく `overlay_draw::native_*_rect` を直接物理ピクセルに変換することで、
+        // 実 UI rect と region が一致して境界振動を起こさない。
+        let rect_to_px = |r: egui::Rect| -> RECT {
+            let left = (r.min.x * ppp).round() as i32;
+            let top = (r.min.y * ppp).round() as i32;
+            let right = (r.max.x * ppp).round() as i32;
+            let bottom = (r.max.y * ppp).round() as i32;
+            RECT {
+                left: left.max(0).min(width_px),
+                top: top.max(0).min(height_px),
+                right: right.max(0).min(width_px),
+                bottom: bottom.max(0).min(height_px),
+            }
+        };
+
+        // 描画側の visibility 判定をローカルで再現 (`mod.rs:3084` 周辺の `render_once` と整合)。
+        // tile overlay 表示中は通常 HUD UI が非表示 (= tile grid モード) なので region も別系統。
+        let tile_overlay_visible = self.tile_overlay.is_some();
+        let top_bar_visible_flag = self.top_bar_visible;
+        let right_panel_visible_flag = self.right_panel_visible();
+        let jump_panel_visible_flag = self.jump_panel_visible;
+        let side_panel_visible =
+            !tile_overlay_visible && (jump_panel_visible_flag || right_panel_visible_flag);
+        let panel_chrome_visible =
+            !tile_overlay_visible && (top_bar_visible_flag || side_panel_visible);
+        // **bottom_hud_visible** は描画側 (`mod.rs:3091`) と完全一致させる。
+        // CP5 旧版は `hud_visible()` 単独だったが、Codex CP5 P2 #1 で「top bar や
+        // side panel 表示中も bottom HUD が描かれるのに region に下端帯がないと
+        // クリックが奪われる」問題を指摘されたので panel_chrome_visible も含める。
+        let bottom_hud_visible = self.hud_visible() || panel_chrome_visible;
+        let normalize_scanning = matches!(
+            self.normalize_state.ui_state,
+            crate::video::normalize_types::NormalizeUiState::Scanning
+        );
+        // paused_center_visible (= 中央 replay/play ボタンが見えている) も描画側と一致させる
+        // (Codex CP5 P2 #2): paused 中の中央ボタンクリックが VST に抜けないように。
+        let paused_center_visible = !tile_overlay_visible
+            && !self.video_is_playing
+            && !self.video_frame_step_active
+            && self.first_frame_presented
+            && self.video_error.is_none()
+            && !normalize_scanning;
+
+        // 上 hover bar (= 実描画 54pt = overlay_draw:1546 と一致)。
+        //
+        // ## region サイズの選択 (Codex 2026-05-12 P1 反映)
+        //
+        // **実描画 rect (54pt) だけ**を region に入れる。**活性化 zone (76pt) は region に
+        // 入れない** (= polling / presenter wndproc 経由で pointer_pos が更新される経路に任せる)。
+        //
+        // ### なぜ実描画だけか
+        //
+        // `SetWindowRgn` で region に入れた領域は **DComp 透過でも HWND が入力を取る**
+        // (= Codex 指摘の核心)。旧版で 180pt 入れていたのは「pointer が region 外に出ると
+        // WM_MOUSEMOVE が HUD wndproc に届かないので bar 表示が振動する」懸念だったが、
+        // 実際は **presenter HWND の wndproc も WM_MOUSEMOVE を `NativeEguiOverlay` に
+        // push している** (presenter HWND は fullscreen 全画面で region 全域)。region 外でも
+        // egui の pointer_pos は更新され続け、`top_bar_visible()` の hover 判定
+        // (`pos.y <= 76`) は維持される。
+        //
+        // 旧版で region 内に「描画されない 126pt 帯」(= 54pt〜180pt) を入れていたのは、
+        // この 126pt 帯 = VST の上部ヘッダ・タイトルバーが押せない原因だった (= ユーザー
+        // 報告「VST 上端をドラッグして戻せない」「top bar 表示中に VST のヘッダクリックが
+        // 効かない」)。
+        if top_bar_visible_flag {
+            regions.push(RECT {
+                left: 0,
+                top: 0,
+                right: width_px,
+                bottom: to_px(54.0).min(height_px),
+            });
+        }
+
+        // 下 HUD (seek bar + コントロール) 表示中。**実描画 46pt 帯** (= overlay_draw:3797
+        // `fixed_pos(0, height-46)` + `set_min_size(W, 46)` と一致)。
+        //
+        // ## region サイズの選択 (Codex 2026-05-12 P1 反映)
+        //
+        // 旧版は 220pt = `hud_visible()` の活性化 zone と同じだったが、これは hover 検出用
+        // しきい値であって描画 zone ではない。220pt 入れていた 174pt 余分帯 (= 46pt〜220pt) は
+        // VST のフッタ・下半分ボタン・キー操作領域が押せない原因だった (= ユーザー報告
+        // 「下半分の VST ボタンが押せない」の主因)。
+        // 活性化判定は presenter wndproc 経由の pointer_pos で維持されるので region は不要。
+        if bottom_hud_visible {
+            let bottom_band_top = (height_px - to_px(46.0)).max(0);
+            regions.push(RECT {
+                left: 0,
+                top: bottom_band_top,
+                right: width_px,
+                bottom: height_px,
+            });
+        }
+
+        // Right panel 表示中: `native_metadata_panel_rect` の実 rect を使う
+        // (= 幅 430pt 上限、top=56pt から hover_bottom まで、Codex CP9 実機 P1 #3 反映)。
+        if right_panel_visible_flag {
+            regions.push(rect_to_px(self::overlay_draw::native_metadata_panel_rect(
+                width_points,
+                height_points,
+            )));
+        }
+
+        // Jump panel 表示中: `native_jump_panel_rect` の実 rect を使う
+        // (= 幅 320pt、top=56pt から hover_bottom まで、画面左端起点)。
+        if jump_panel_visible_flag {
+            regions.push(rect_to_px(self::overlay_draw::native_jump_panel_rect(
+                height_points,
+            )));
+        }
+
+        // 実機修正 (2026-05-12 P2): Perf overlay 表示中は perf rect を region に
+        // 追加 (= ユーザー報告「Perlグラフが panel に重なる部分しか見えない」対応)。
+        // perf overlay は `origin=(14, 14)` で width 300-460pt、height 158pt
+        // (`overlay_draw.rs:12-26` 参照)。region 外だと SetWindowRgn で clip される。
+        if self.perf_visible {
+            let perf_w = width_points.min(460.0).max(300.0);
+            regions.push(rect_to_px(egui::Rect::from_min_size(
+                egui::pos2(14.0, 14.0),
+                egui::vec2(perf_w, 158.0),
+            )));
+        }
+
+        // Paused center indicator (replay / play ボタン): 中央 200×200pt 概算。
+        // Codex CP5 P2 #2 反映: paused 中の中央ボタンが VST と重なるケースで
+        // クリックが奪われないよう region に追加。
+        if paused_center_visible {
+            let center_x = width_px / 2;
+            let center_y = height_px / 2;
+            let w = to_px(200.0);
+            let h = to_px(200.0);
+            regions.push(RECT {
+                left: (center_x - w / 2).max(0),
+                top: (center_y - h / 2).max(0),
+                right: (center_x + w / 2).min(width_px),
+                bottom: (center_y + h / 2).min(height_px),
+            });
+        }
+
+        // VST3 panel: ドラッグ可能化 (= 2026-05-12 A) に伴い、`last_drawn_vst3_panel_rect`
+        // (実描画後の actual rect) を優先で region に使う。`None` の場合は `native_vst3_panel_rect`
+        // (デフォルト位置) に fallback。これで panel がデフォルト位置にあってもドラッグ後でも
+        // region が描画位置と一致する。
+        if let Some(panel) = self.vst3_panel.as_ref() {
+            if panel.visible {
+                let rect = self.last_drawn_vst3_panel_rect.unwrap_or_else(|| {
+                    self::overlay_draw::native_vst3_panel_rect(width_points, height_points, panel)
+                });
+                regions.push(rect_to_px(rect));
+            }
+        }
+
+        // Speed popup: 画面下端 + 中央寄せ、概算で 200×200pt。
+        if self.video_speed_popup_open {
+            let center_x = width_px / 2;
+            let popup_w = to_px(220.0);
+            let popup_h = to_px(220.0);
+            let bottom = (height_px - to_px(120.0)).max(0);
+            regions.push(RECT {
+                left: (center_x - popup_w / 2).max(0),
+                top: (bottom - popup_h).max(0),
+                right: (center_x + popup_w / 2).min(width_px),
+                bottom,
+            });
+        }
+
+        // Bookmark title editor: center modal、概算で 500×100pt。
+        if self.bookmark_title_edit.is_some() {
+            let center_x = width_px / 2;
+            let center_y = height_px / 2;
+            let w = to_px(500.0);
+            let h = to_px(100.0);
+            regions.push(RECT {
+                left: (center_x - w / 2).max(0),
+                top: (center_y - h / 2).max(0),
+                right: (center_x + w / 2).min(width_px),
+                bottom: (center_y + h / 2).min(height_px),
+            });
+        }
+
+        // Normalize progress / scan blocker: 全画面被覆 (= scan 中はモーダル cancel ボタン操作のため)。
+        if matches!(
+            self.normalize_state.ui_state,
+            crate::video::normalize_types::NormalizeUiState::Scanning
+        ) {
+            regions.push(RECT {
+                left: 0,
+                top: 0,
+                right: width_px,
+                bottom: height_px,
+            });
+        }
+
+        // Tile overlay: 全画面 tile grid。
+        if self.tile_overlay.is_some() {
+            regions.push(RECT {
+                left: 0,
+                top: 0,
+                right: width_px,
+                bottom: height_px,
+            });
+        }
+
+        // Seek hover thumbnail: **直近 egui run で実描画した rect を直接使う** (Codex 助言
+        // 「描画側の preview_rect をそのまま保存して使う」反映、2026-05-12 P1 #2)。
+        //
+        // ## なぜ ptr.x ベース再計算は NG か
+        //
+        // 旧版は `compute_hud_regions` 内で `(ptr.x - preview_image_w * 0.5).clamp(...)` で
+        // 再計算していたが、実描画は `bar_rect.min.x + bar_rect.width() * frac` (=
+        // hover_preview_target_secs ベース) で計算する。両者が乖離するケース:
+        //   - cursor が seek bar を離れ thumbnail 上に移動 → `seek_resp.hovered()` 不成立
+        //   - `hover_preview_target_secs` は cursor 離脱前の値で固定 (overlay_draw:4170-4171)
+        //   - cursor をサムネ上で左右に動かす:
+        //     - 描画 rect: target_secs ベースなので **固定**
+        //     - region rect: ptr.x ベースなので **cursor 追従**
+        //   - 結果: サムネ画像 (= 描画 rect) は固定だが region が動く → region 外に出た部分が
+        //     SetWindowRgn で clip されて「枠だけ動いて見える」症状 (= ユーザー報告)
+        //
+        // `last_drawn_preview_rect` には draw が「実際にこのフレームで描いた rect」が入って
+        // いる (= None なら描画なし)。これをそのまま region に変換する。
+        if let Some(rect) = self.last_drawn_preview_rect {
+            regions.push(rect_to_px(rect));
+        }
+
+        regions
     }
 
     fn input_routing(&self) -> NativeOverlayInputRouting {
@@ -2457,12 +3392,23 @@ impl NativeEguiOverlay {
     }
 
     fn hud_visible(&self) -> bool {
+        // 実機修正 (2026-05-12): 外部 drag (= VST window ドラッグ等) 中は hover bar / panel を
+        // 表示しない。さもないと VST を画面下にドラッグしたとき seek bar が出て VST に入力が
+        // 届かなくなる。
+        if self.external_drag_in_progress {
+            return false;
+        }
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
         self.pointer_pos
             .is_some_and(|pos| pos.y >= (overlay_height_points - 220.0).max(0.0))
     }
 
     fn top_bar_visible(&self) -> bool {
+        // 実機修正 (2026-05-12): 外部 drag 中は top bar を表示しない (= VST を画面上にドラッグ
+        // したとき top bar が出てウィンドウを戻せなくなる症状の対応)。
+        if self.external_drag_in_progress {
+            return false;
+        }
         self.pointer_pos.is_some_and(|pos| {
             let y_max = if self.top_bar_visible { 76.0 } else { 36.0 };
             pos.y <= y_max
@@ -2474,6 +3420,11 @@ impl NativeEguiOverlay {
     }
 
     fn right_panel_visible(&self) -> bool {
+        // 実機修正 (2026-05-12): 外部 drag 中は right panel を表示しない (= VST を画面右に
+        // ドラッグしたとき panel が出て VST 入力が奪われる症状の対応)。
+        if self.external_drag_in_progress {
+            return false;
+        }
         if self.vst3_panel_visible() {
             return false;
         }
@@ -2550,8 +3501,16 @@ impl NativeEguiOverlay {
         }
         unsafe {
             if attached {
-                self.root_visual
-                    .AddVisual(&self.visual, true, &self.after_visual)
+                // CP3 P1 #3 反映: `after_visual` が `Some(v)` なら presenter フォールバック経路
+                // (= video visual の後ろに挟む)、`None` なら HUD HWND の DComp root に
+                // 単独配置する。後者は HUD root に他の visual がないので `None` で OK。
+                let result = match &self.after_visual {
+                    Some(v) => self.root_visual.AddVisual(&self.visual, true, v),
+                    None => self
+                        .root_visual
+                        .AddVisual(&self.visual, true, None::<&IDCompositionVisual>),
+                };
+                result
                     .map_err(|e| format!("IDCompositionVisual::AddVisual egui overlay: {e:?}"))?;
             } else {
                 self.root_visual.RemoveVisual(&self.visual).map_err(|e| {
@@ -2683,6 +3642,19 @@ impl NativeEguiOverlay {
         // 静止画側 `fs_ui_is_clean` がチェック状態を考慮しないのと挙動を揃える。
         // tile overlay は受動表示の側面が強いが、サムネがクリックで操作可能なので
         // カーソル可視を維持する側に含める。
+        //
+        // 実機修正 (2026-05-12, Codex 助言 #3): **HUD activation zone (上端 76pt /
+        // 下端 220pt)** に cursor が入っていれば auto-hide を抑制する。バーが「ふっと
+        // 出る瞬間にカーソルが一瞬消える」症状は、cursor が activation zone に入った
+        // フレームと top_bar_visible が true になるフレームが 1 フレームずれて、その間に
+        // `cursor_should_hide = true` が成立して `SetCursor(None)` が呼ばれることが原因。
+        // activation zone 内では auto-hide を打ち切ることで予防する。
+        let in_top_activation_zone = pointer_pos
+            .map(|p| p.y <= 76.0)
+            .unwrap_or(false);
+        let in_bottom_activation_zone = pointer_pos
+            .map(|p| p.y >= overlay_height_points - 220.0)
+            .unwrap_or(false);
         let cursor_blocking_overlay_visible = tile_overlay_visible
             || bottom_hud_visible
             || panel_chrome_visible
@@ -2691,7 +3663,9 @@ impl NativeEguiOverlay {
             || bookmark_title_edit_visible
             || paused_center_visible
             || vst3_panel_visible
-            || normalize_scanning;
+            || normalize_scanning
+            || in_top_activation_zone
+            || in_bottom_activation_zone;
         let pending_event_count = self.pending_events.len();
         let mut commands = std::mem::take(&mut self.pending_overlay_commands);
         let mut last_seek_target_secs = self.last_seek_target_secs;
@@ -2700,6 +3674,12 @@ impl NativeEguiOverlay {
         let mut hover_preview_target_secs = self.hover_preview_target_secs;
         let mut video_speed_popup_open = self.video_speed_popup_open;
         let mut frame_step_hold = self.frame_step_hold;
+        // 実機修正 (2026-05-12 P1 #2): 実描画した preview_rect を記録して
+        // `compute_hud_regions` に渡す (= region を draw rect と完全同期させる)。
+        let mut last_drawn_preview_rect: Option<egui::Rect> = None;
+        // 実機修正 (2026-05-12 A): VST3 設定パネルをドラッグ可能化 (`.movable(true)`)。
+        // ドラッグ後の actual rect を記録して region に追従させる。
+        let mut last_drawn_vst3_panel_rect: Option<egui::Rect> = None;
         if !overlay_visible {
             self.set_visual_attached(false)?;
             last_seek_target_secs = None;
@@ -2794,7 +3774,7 @@ impl NativeEguiOverlay {
                 );
             }
             if vst3_panel_visible && let Some(panel) = vst3_panel.as_ref() {
-                draw_native_vst3_panel(
+                last_drawn_vst3_panel_rect = draw_native_vst3_panel(
                     ctx,
                     overlay_width_points,
                     overlay_height_points,
@@ -3272,6 +4252,9 @@ impl NativeEguiOverlay {
                             if !seek_resp.hovered() && !pointer_in_preview {
                                 hover_preview_target_secs = None;
                             } else {
+                                // 実機修正 (2026-05-12 P1 #2): 実描画 rect を記録。
+                                // `compute_hud_regions` が region 計算で読む。
+                                last_drawn_preview_rect = Some(preview_rect);
                                 let request_due = last_thumbnail_request_secs
                                     .map(|prev| (prev - target).abs() >= 0.25)
                                     .unwrap_or(true)
@@ -3730,6 +4713,8 @@ impl NativeEguiOverlay {
         self.last_thumbnail_request_secs = last_thumbnail_request_secs;
         self.last_thumbnail_request_at = last_thumbnail_request_at;
         self.hover_preview_target_secs = hover_preview_target_secs;
+        self.last_drawn_preview_rect = last_drawn_preview_rect;
+        self.last_drawn_vst3_panel_rect = last_drawn_vst3_panel_rect;
         self.video_speed_popup_open = video_speed_popup_open;
         self.frame_step_hold = frame_step_hold;
         self.bookmark_title_edit = bookmark_title_edit;
@@ -3890,26 +4875,37 @@ impl NativeEguiOverlay {
             rcArea: rc_area,
         };
         unsafe {
-            let himc = ImmGetContext(self.hwnd);
+            // IME context は **focus を持つ HWND** (= presenter HWND) で取る必要がある。
+            // HUD HWND は `WS_EX_NOACTIVATE` で focus を取らないので、HUD HWND で
+            // `ImmGetContext` を呼んでも有効な context が返らず、IME が動かない
+            // (Codex プラン P1 #2 反映)。
+            let himc = ImmGetContext(self.focus_hwnd);
             if himc.0.is_null() {
                 return;
             }
             let _ = ImmSetCompositionWindow(himc, &composition_form);
             let _ = ImmSetCandidateWindow(himc, &candidate_form);
-            let _ = ImmReleaseContext(self.hwnd, himc);
+            let _ = ImmReleaseContext(self.focus_hwnd, himc);
         }
     }
 
     fn update_cursor_icon(&self, cursor_icon: egui::CursorIcon) {
+        use std::sync::atomic::Ordering;
         // `CursorIcon::None` は `SetCursor(None)` で完全非表示にする。IDC_ARROW へ
         // フォールバックすると idle 時にもポインタが見えてしまう。毎フレーム呼ばれる
         // ので、非表示状態は連続して `SetCursor(None)` が打たれて維持される。
+        //
+        // 実機修正 (2026-05-12 Codex P2 #6): HUD wndproc に「直前に隠した」情報を共有して、
+        // WM_SETCURSOR が必要に応じて IDC_ARROW で復帰させる。
         if matches!(cursor_icon, egui::CursorIcon::None) {
             unsafe {
                 SetCursor(None);
             }
+            self.cursor_was_hidden_shared.store(true, Ordering::Release);
             return;
         }
+        // 復帰側: cursor が見える icon を設定するとき、hidden flag を clear。
+        self.cursor_was_hidden_shared.store(false, Ordering::Release);
         let cursor_id = match cursor_icon {
             egui::CursorIcon::PointingHand => IDC_HAND,
             egui::CursorIcon::Text | egui::CursorIcon::VerticalText => IDC_IBEAM,

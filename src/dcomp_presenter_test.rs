@@ -127,6 +127,9 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
         height: config.height,
         test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
         egui_overlay: std::env::var_os("MIV_NATIVE_VIDEO_EGUI_OVERLAY").is_some(),
+        // CP4: prototype CLI は HUD overlay HWND を作らない (= フォールバック経路で
+        // 従来通り presenter HWND の DComp tree に egui overlay を載せる)。
+        hud_event_tx: None,
     })?;
     if config.pixel_probe_strict {
         presenter.set_pixel_probe(true, true);

@@ -1774,17 +1774,33 @@ pub(super) fn draw_native_top_bar_tile(
         });
 }
 
+/// Returns the actual drawn rect (after user drag). `compute_hud_regions` uses this to
+/// keep the `SetWindowRgn` region in sync with the panel position.
 pub(super) fn draw_native_vst3_panel(
     ctx: &egui::Context,
     overlay_width_points: f32,
     overlay_height_points: f32,
     panel: &NativeOverlayVst3Panel,
     commands: &mut Vec<NativeOverlayCommand>,
-) {
+) -> Option<egui::Rect> {
     let rect = native_vst3_panel_rect(overlay_width_points, overlay_height_points, panel);
-    egui::Area::new(egui::Id::new("native_video_vst3_panel"))
+    // 実機修正 (2026-05-12 A): `fixed_pos` → `default_pos` + `movable(true)` でドラッグ可能化。
+    // egui が internal memory に position を保存するので、`Id` が同じ限りフレーム間で位置維持。
+    // 戻り値の actual rect を `compute_hud_regions` に渡して region を実位置に追従させる。
+    //
+    // 実機修正 (Codex 続編 P2 反映): `constrain_to(overlay_rect)` で画面外に出ないよう clamp。
+    // 旧版は default の `constrain: true` だが、`ctx.content_rect()` は完全に画面いっぱいに
+    // なるとは限らず (= viewport 設定次第)、解像度/DPI 変更や誤ドラッグでパネルが見えなく
+    // なる懸念があった。明示的に overlay 全体を境界に指定する。
+    let overlay_bounds = egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(overlay_width_points, overlay_height_points),
+    );
+    let inner = egui::Area::new(egui::Id::new("native_video_vst3_panel"))
         .order(egui::Order::Foreground)
-        .fixed_pos(rect.min)
+        .default_pos(rect.min)
+        .movable(true)
+        .constrain_to(overlay_bounds)
         .show(ctx, |ui| {
             ui.set_min_size(rect.size());
             ui.set_max_size(rect.size());
@@ -1797,6 +1813,10 @@ pub(super) fn draw_native_vst3_panel(
                 .inner_margin(egui::Margin::same(10));
             frame.show(ui, |ui| {
                 ui.set_max_size(rect.size() - egui::vec2(20.0, 20.0));
+                // 実機修正 (2026-05-12 UX): X (閉じる) ボタンを削除。
+                // 旧版は X で panel だけ非表示 → VST ボタン再押下で panel 再表示、もう一度で
+                // VST ウィンドウ消去、という 3 状態 toggle で複雑だった。
+                // 新版は VST ボタン 1 押下で panel + GUI を一緒に on/off するシンプルな 2 状態 toggle。
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new("VST3")
@@ -1809,16 +1829,6 @@ pub(super) fn draw_native_vst3_panel(
                             .small()
                             .color(egui::Color32::from_rgb(178, 188, 202)),
                     );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui
-                            .button(egui::RichText::new("X").monospace())
-                            .on_hover_text("VST3 パネルを閉じる")
-                            .clicked()
-                        {
-                            commands
-                                .push(NativeOverlayCommand::SetVst3PanelVisible { visible: false });
-                        }
-                    });
                 });
 
                 if let Some(reason) = panel.disabled_reason.as_ref() {
@@ -1916,6 +1926,7 @@ pub(super) fn draw_native_vst3_panel(
                 });
             });
         });
+    Some(inner.response.rect)
 }
 
 pub(super) fn draw_native_vst3_slot_row(

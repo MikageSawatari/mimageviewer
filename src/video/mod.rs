@@ -196,7 +196,7 @@ struct NativeHoverThumbnailKey {
 }
 
 #[cfg(windows)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct NativeVideoOutputConfig {
     pub rect: windows::Win32::Foundation::RECT,
     pub owner_hwnd: u64,
@@ -205,6 +205,21 @@ pub struct NativeVideoOutputConfig {
     pub initial_tile_overlay: bool,
     pub vst3_available: bool,
     pub checked: bool,
+    /// CP7: HUD raise の allowlist 判定 (`foreground_allows_hud_raise`) で参照する
+    /// VST editor container HWND の snapshot。App が `dsp_bridge.editor_hwnds_snapshot()` を
+    /// 渡す。`None` のとき HUD HWND を作っても raise 判定で常に false (= raise 起動しない)
+    /// になるが、`SetWindowRgn` 経由の click-through は機能する。
+    pub editor_hwnds_snapshot:
+        Option<std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>>,
+    /// CP7: `foreground_allows_hud_raise` 判定用の main HWND (mIV メインウィンドウ)。
+    /// 0 だと「mIV 既知 HWND」判定で main HWND が許可されなくなる (= presenter / HUD のみ
+    /// 許可)。App が `self.main_hwnd` を渡す。
+    pub main_hwnd_for_raise: u64,
+    /// CP7: HUD overlay HWND を有効化するか。`false` のとき従来の presenter HWND DComp tree
+    /// に egui overlay を載せるフォールバック経路 (= CP4-6 の動作と等価)。
+    /// `true` で HUD HWND を作成し、VST より前面に bars を出す。万が一の regression に備えて
+    /// 環境変数 `MIV_HUD_OVERLAY=0` で強制 off できるよう App 側で配線する。
+    pub hud_overlay_enabled: bool,
 }
 
 #[cfg(windows)]
@@ -385,6 +400,15 @@ enum NativeVideoOutputCommand {
     SetNormalizeOverlayState {
         state: crate::video::normalize_types::NormalizeOverlayState,
     },
+    /// HUD overlay HWND を VST GUI より前面に上げ直す。VST z-order 操作後の hook、
+    /// presenter thread の cursor polling (activation zone 検知)、HUD wndproc の
+    /// `WM_WINDOWPOSCHANGING` などから発火される。presenter thread が pop して
+    /// 即時 → 16ms → 64ms の short retry burst で `SetWindowPos(hud, HWND_TOPMOST, ...)`
+    /// を呼ぶ (VST IPC が非同期で z-order を動かしても拾えるように)。
+    ///
+    /// CP1-6 までは送る側がないため dead code。CP7 で App から送り始める。
+    #[allow(dead_code)]
+    RaiseHudToTop,
 }
 
 #[cfg(windows)]
@@ -455,6 +479,11 @@ impl PresenterSourceState {
 pub(crate) struct NativeVideoOutput {
     cancel: Arc<AtomicBool>,
     hwnd: Arc<AtomicU64>,
+    /// HUD overlay HWND (= bars / interactive UI 用の独立 top-level)。
+    /// presenter thread が `HudOverlayWindow::create` 成功後に store、
+    /// fullscreen 終了 / 失敗時は 0 に戻す。App が `dsp_bridge.set_hud_hwnd(...)`
+    /// で bridge にも教える経路で参照する (= raise allowlist の「mIV 既知 HWND」判定)。
+    hud_hwnd: Arc<AtomicU64>,
     first_presented: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     perf_overlay_visible: Arc<AtomicBool>,
@@ -488,6 +517,7 @@ impl NativeVideoOutput {
     ) -> Option<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
         let hwnd = Arc::new(AtomicU64::new(0));
+        let hud_hwnd = Arc::new(AtomicU64::new(0));
         let first_presented = Arc::new(AtomicBool::new(false));
         let closed = Arc::new(AtomicBool::new(false));
         let perf_overlay_visible = Arc::new(AtomicBool::new(config.perf_overlay_visible));
@@ -499,6 +529,7 @@ impl NativeVideoOutput {
         let init_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let thread_cancel = Arc::clone(&cancel);
         let thread_hwnd = Arc::clone(&hwnd);
+        let thread_hud_hwnd = Arc::clone(&hud_hwnd);
         let thread_first_presented = Arc::clone(&first_presented);
         let thread_closed = Arc::clone(&closed);
         let thread_perf_overlay_visible = Arc::clone(&perf_overlay_visible);
@@ -519,6 +550,7 @@ impl NativeVideoOutput {
                     event_tx,
                     thread_cancel,
                     Arc::clone(&thread_hwnd),
+                    Arc::clone(&thread_hud_hwnd),
                     thread_first_presented,
                     Arc::clone(&thread_closed),
                     thread_perf_overlay_visible,
@@ -543,6 +575,7 @@ impl NativeVideoOutput {
                         }
                     }
                     thread_hwnd.store(0, Ordering::Release);
+                    thread_hud_hwnd.store(0, Ordering::Release);
                     thread_closed.store(true, Ordering::Release);
                 }
             }) {
@@ -555,6 +588,7 @@ impl NativeVideoOutput {
         Some(Self {
             cancel,
             hwnd,
+            hud_hwnd,
             first_presented,
             closed,
             perf_overlay_visible,
@@ -570,6 +604,13 @@ impl NativeVideoOutput {
 
     fn hwnd(&self) -> u64 {
         self.hwnd.load(Ordering::Acquire)
+    }
+
+    /// HUD overlay HWND (= bars / interactive UI 用の独立 top-level)。
+    /// CP4 以降で presenter thread が store する。store されていなければ 0。
+    #[allow(dead_code)]
+    fn hud_hwnd(&self) -> u64 {
+        self.hud_hwnd.load(Ordering::Acquire)
     }
 
     fn first_presented(&self) -> bool {
@@ -711,6 +752,13 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::MarkCursorActivity);
+    }
+
+    /// CP7: HUD overlay HWND を最前面に上げ直す要求を presenter thread に送る。
+    /// `DspBridge::hud_raise_hook` 経由で発火された全 z-order 変更操作に対する応答。
+    /// presenter thread 側で 200ms 抑制 + retry burst (即時/16ms/64ms) で処理される。
+    fn request_hud_raise(&self) {
+        let _ = self.command_tx.send(NativeVideoOutputCommand::RaiseHudToTop);
     }
 
     fn set_normalize_overlay_state(
@@ -965,6 +1013,23 @@ fn native_video_env_flag_enabled(name: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
+/// CP7: 環境変数で「明示的に off にされているか」を判定。
+/// 値が `0` / `false` / `off` / `no` のとき true、それ以外は false (= 未設定 / その他)。
+/// 「default off で 1/true/on/yes で有効化」する `native_video_env_flag_enabled` と異なり、
+/// 「default on で 0/false/off/no で無効化」する用途に使う。
+#[allow(dead_code)]
+fn native_video_env_flag_disabled(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            v == "0"
+                || v.eq_ignore_ascii_case("false")
+                || v.eq_ignore_ascii_case("off")
+                || v.eq_ignore_ascii_case("no")
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(windows)]
 fn try_send_native_first_frame_ready(
     engine_event_tx: &crossbeam_channel::Sender<EngineEvent>,
@@ -1114,6 +1179,7 @@ fn run_native_video_output(
     ui_event_tx: std::sync::mpsc::Sender<(u64, NativeVideoOutputEvent)>,
     cancel: Arc<AtomicBool>,
     hwnd_out: Arc<AtomicU64>,
+    hud_hwnd_out: Arc<AtomicU64>,
     first_presented_out: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     perf_overlay_visible: Arc<AtomicBool>,
@@ -1136,10 +1202,23 @@ fn run_native_video_output(
             // This HWND lives on the presenter thread, so WM_QUIT only exits
             // this loop and does not affect eframe's main event loop.
             post_quit_on_destroy: true,
-            event_tx: Some(presenter_event_tx),
+            event_tx: Some(presenter_event_tx.clone()),
         },
     )?;
     hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
+    // CP7: HUD overlay HWND の有効化判定。
+    //   - config.hud_overlay_enabled: App が settings / 環境変数経由で渡してくる ON/OFF。
+    //   - 通常は ON (`true`)。
+    //   - `MIV_HUD_OVERLAY=0` で強制 off。万が一の regression のための retreat。
+    // 無効時は CP4-6 のフォールバック経路 (= 従来通り presenter HWND の DComp tree)。
+    let hud_overlay_enabled =
+        config.hud_overlay_enabled && !native_video_env_flag_disabled("MIV_HUD_OVERLAY");
+    let hud_event_tx: Option<std::sync::mpsc::Sender<crate::video::native_window::NativeVideoWindowEvent>> =
+        if hud_overlay_enabled {
+            Some(presenter_event_tx.clone())
+        } else {
+            None
+        };
     let mut presenter = match crate::video::native_presenter::NativeVideoPresenter::new(
         crate::video::native_presenter::NativePresenterConfig {
             hwnd: window.hwnd(),
@@ -1147,11 +1226,13 @@ fn run_native_video_output(
             height,
             test_overlay: std::env::var_os("MIV_NATIVE_VIDEO_TEST_OVERLAY").is_some(),
             egui_overlay: native_video_env_flag_enabled("MIV_NATIVE_VIDEO_EGUI_OVERLAY", true),
+            hud_event_tx,
         },
     ) {
         Ok(presenter) => presenter,
         Err(err) => {
             hwnd_out.store(0, Ordering::Release);
+            hud_hwnd_out.store(0, Ordering::Release);
             window.destroy();
             // closed=true / init_error の write は spawn closure 側で一括して行う
             // (Release ordering を init_error の後ろに置く必要があるため)。ここでは
@@ -1159,6 +1240,15 @@ fn run_native_video_output(
             return Err(err);
         }
     };
+    // HUD HWND が生成されたら App から見えるように atomic に store。
+    // CP4 段階 (= hud_event_tx=None) では生成されないので 0 のまま。
+    hud_hwnd_out.store(presenter.hud_hwnd(), Ordering::Release);
+
+    // CP7: cursor polling の raise allowlist 判定で使う state を presenter に渡す。
+    // `editor_hwnds_snapshot` が `None` のときは raise 判定で常に false (= polling では
+    // raise 起動しない、ただし click-through 自体は SetWindowRgn で機能する)。
+    presenter.set_editor_hwnds_snapshot(config.editor_hwnds_snapshot.clone());
+    presenter.set_main_hwnd_for_raise_check(config.main_hwnd_for_raise);
     crate::logger::log(format!(
         "[native-video] fullscreen presenter started hwnd=0x{:x} rect=({},{} {}x{}) sync_interval={}",
         window.hwnd().0 as usize,
@@ -1207,7 +1297,40 @@ fn run_native_video_output(
     let mut last_present_log = Instant::now();
     let mut last_overlay_tick = Instant::now();
     let mut last_source_state_probe = Instant::now();
+    // CP6: cursor polling 用 state。HUD 経路 (= CP7 で hud_event_tx=Some) のときだけ
+    // 機能する。フォールバック経路では `presenter.cursor_polling_tick` が早期 return。
+    let mut last_cursor_poll: Option<Instant> = None;
+    let mut last_native_mouse_at: Option<Instant> = None;
+    let mut pointer_present_synthetic: bool = false;
+    // CP6: HUD raise の retry burst スケジュール。`RaiseHudToTop` command / `RequestRaiseHud`
+    // event / cursor polling activation zone 検知のいずれかから `schedule_hud_raise_burst` を
+    // 呼ぶことで push される。各 deadline 到来時に `presenter.raise_hud_to_top()` を呼ぶ。
+    // 即時/16ms 後/64ms 後の 3 連発で非同期 VST z-order 操作を確実に拾う。
+    let mut hud_raise_deadlines: Vec<Instant> = Vec::with_capacity(4);
+    let mut last_hud_raise_at: Option<Instant> = None;
     let startup_probe_until = run_started + Duration::from_secs(5);
+
+    // CP6 (Codex 再 P2 反映): 全経路で coalesce + timestamp 更新を統一する helper。
+    // 直近 200ms 以内に raise burst を起動済みなら skip (= 連続トリガーで burst が
+    // 重複しないように)、起動した場合は 即時 + 16ms + 64ms の 3 deadline を push し、
+    // `last_at` を `now` に更新する。`RaiseHudToTop` / `RequestRaiseHud` / polling の
+    // 全経路でこの helper を呼ぶ。
+    fn schedule_hud_raise_burst(
+        now: Instant,
+        deadlines: &mut Vec<Instant>,
+        last_at: &mut Option<Instant>,
+    ) {
+        let recent = last_at
+            .map(|t| now.duration_since(t) < Duration::from_millis(200))
+            .unwrap_or(false);
+        if recent {
+            return;
+        }
+        deadlines.push(now);
+        deadlines.push(now + Duration::from_millis(16));
+        deadlines.push(now + Duration::from_millis(64));
+        *last_at = Some(now);
+    }
     let mut last_startup_probe = run_started
         .checked_sub(Duration::from_millis(250))
         .unwrap_or(run_started);
@@ -1369,6 +1492,17 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetNormalizeOverlayState { state } => {
                     presenter.set_overlay_normalize_state(state);
                 }
+                NativeVideoOutputCommand::RaiseHudToTop => {
+                    // CP6: HUD overlay HWND を最前面に上げ直す要求。
+                    // 即時/16ms/64ms の short retry burst で `SetWindowPos(HUD, HWND_TOPMOST)`
+                    // を呼ぶ (VST 側 IPC が非同期で z-order を動かしても拾えるように)。
+                    // 全経路で coalesce + 200ms 抑制を効かせるため helper 経由 (再 P2 反映)。
+                    schedule_hud_raise_burst(
+                        Instant::now(),
+                        &mut hud_raise_deadlines,
+                        &mut last_hud_raise_at,
+                    );
+                }
                 NativeVideoOutputCommand::SwitchSource { payload } => {
                     native_drain_unpresented_queue(&mut source.queue);
                     let show_preparing_overlay = payload.show_preparing_overlay;
@@ -1409,6 +1543,120 @@ fn run_native_video_output(
         while let Ok(event) = presenter_event_rx.try_recv() {
             native_events.push(event);
         }
+
+        // CP6: 本物の `MouseMove` を観測したら synthetic polling を 80ms 抑制するため
+        // に `last_native_mouse_at` を更新。CP8 で扱う `GeometryChanged` / `DpiChanged` /
+        // CP6 の `RequestRaiseHud` も同じループでハンドリングする。
+        let now = Instant::now();
+        for event in &native_events {
+            use crate::video::native_window::NativeVideoWindowEvent as NEvt;
+            match event {
+                NEvt::MouseMove(_) => {
+                    last_native_mouse_at = Some(now);
+                    // Codex CP6 再 P3 反映: 本物 mouse 観測でフラグをクリア。これにより
+                    // 後で client rect 外に出たときに「直前 synthetic 由来か?」が正しく
+                    // 判定でき、native `WM_MOUSELEAVE` と二重で synthetic `MouseLeave` を
+                    // 流さない。
+                    pointer_present_synthetic = false;
+                }
+                NEvt::MouseLeave => {
+                    // 本物 leave 観測でも synthetic 状態をクリア (二重 leave 防止)。
+                    pointer_present_synthetic = false;
+                }
+                NEvt::RequestRaiseHud => {
+                    // HUD wndproc 由来の `WM_WINDOWPOSCHANGING` での safety net。
+                    // 全経路で coalesce + 200ms 抑制を効かせるため helper 経由 (再 P2 反映)。
+                    schedule_hud_raise_burst(
+                        now,
+                        &mut hud_raise_deadlines,
+                        &mut last_hud_raise_at,
+                    );
+                }
+                NEvt::GeometryChanged { x, y, w, h } => {
+                    // CP8: presenter HWND の `WM_WINDOWPOSCHANGED` で発火される。
+                    // HUD HWND の位置・サイズを presenter に追従させる。
+                    presenter.set_hud_geometry(*x, *y, *w, *h);
+                    // wgpu surface も新サイズに resize (size 同一なら presenter 側で no-op)。
+                    if let Err(err) = presenter.resize(*w, *h) {
+                        crate::logger::log(format!(
+                            "[native-video] CP8 GeometryChanged resize_to({w}x{h}) failed: {err}"
+                        ));
+                    }
+                }
+                NEvt::DpiChanged {
+                    dpi,
+                    suggested_rect,
+                } => {
+                    // CP8: HUD HWND の `WM_DPICHANGED` を受けて以下を実行:
+                    //   1. overlay の pixels_per_point を `dpi / 96.0` で更新
+                    //   2. HUD HWND を `suggested_rect` で移動・リサイズ
+                    //   3. **overlay surface のみ** を新サイズで resize (= `resize_overlay_surface_only`)。
+                    //      presenter 全体 (background / video transform / swap chain) はここでは触らない
+                    //      (Codex CP8 P2 反映)。presenter HWND が同じ monitor にあれば presenter HWND
+                    //      の `WM_DPICHANGED` でも同じ処理が走る (= 別経路で video 側も別途 resize)。
+                    //   4. 次フレームの egui run 末で region が新 ppp で再計算される (= apply_regions)
+                    let ppp = (*dpi as f32 / 96.0).max(0.5);
+                    presenter.set_overlay_pixels_per_point(ppp);
+                    let rect_w = (suggested_rect.right - suggested_rect.left).max(1) as u32;
+                    let rect_h = (suggested_rect.bottom - suggested_rect.top).max(1) as u32;
+                    presenter.set_hud_geometry(
+                        suggested_rect.left,
+                        suggested_rect.top,
+                        rect_w,
+                        rect_h,
+                    );
+                    if let Err(err) = presenter.resize_overlay_surface_only(rect_w, rect_h) {
+                        crate::logger::log(format!(
+                            "[native-video] CP8 DpiChanged resize_overlay_surface_only({rect_w}x{rect_h}) failed: {err}"
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // CP6: 50ms 周期 cursor polling。`presenter.cursor_polling_tick` が
+        // 「raise を要求するか」を返す。raise 必要なら helper 経由で retry burst を
+        // 起動 (= helper 内で 200ms 抑制も効かせる)。
+        let cursor_poll_due = last_cursor_poll
+            .map(|t| now.duration_since(t) >= Duration::from_millis(50))
+            .unwrap_or(true);
+        if cursor_poll_due {
+            last_cursor_poll = Some(now);
+            let presenter_hwnd = window.hwnd().0 as u64;
+            let raise_needed = presenter.cursor_polling_tick(
+                presenter_hwnd,
+                last_native_mouse_at,
+                &mut pointer_present_synthetic,
+            );
+            if raise_needed {
+                schedule_hud_raise_burst(
+                    now,
+                    &mut hud_raise_deadlines,
+                    &mut last_hud_raise_at,
+                );
+            }
+        }
+
+        // CP6: HUD raise retry burst の deadline 到来分を実行。
+        // helper でしか push されないので時系列順で並ぶが、複数 burst が連続発火する
+        // ケースは 200ms 抑制で潰れる。retain で deadline 到来分を全部実行 + 削除。
+        //
+        // **Codex CP7 P1 #1 反映**: `try_raise_hud_to_top(presenter_hwnd)` を呼ぶことで、
+        // command / event / polling のすべての raise 経路で `foreground_allows_hud_raise`
+        // を通す。VST popup / file dialog / mIV 設定ダイアログが foreground のとき
+        // raise が skip される。`raise_hud_to_top()` (allowlist 判定なし) を直接呼んで
+        // はいけない (= popup 埋葬の regression を起こす)。
+        let presenter_hwnd_val = window.hwnd().0 as u64;
+        hud_raise_deadlines.retain(|deadline| {
+            if *deadline <= now {
+                let _ = presenter.try_raise_hud_to_top(presenter_hwnd_val);
+                false // 削除
+            } else {
+                true // 残す
+            }
+        });
+
         if !native_events.is_empty() {
             presenter.update_overlay_video_state(
                 source.clock.now_secs(),
@@ -3004,6 +3252,21 @@ impl VideoPlayer {
             .unwrap_or(0)
     }
 
+    /// HUD overlay HWND (= bars / interactive UI 用の独立 top-level)。
+    /// CP4 で presenter thread が `HudOverlayWindow::create` 成功時に store する。
+    /// store されていなければ 0。
+    ///
+    /// CP7 で App から `dsp_bridge.set_hud_hwnd(...)` 経由で bridge にも教える
+    /// 経路で使う (= raise allowlist の「mIV 既知 HWND」判定)。
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub fn native_hud_hwnd(&self) -> u64 {
+        self.native_output
+            .as_ref()
+            .map(NativeVideoOutput::hud_hwnd)
+            .unwrap_or(0)
+    }
+
     /// eframe 経由のキー入力 (Space で pause/resume 等) は native presenter HWND を
     /// 経由しないため、`push_native_event` で行われる cursor auto-hide タイマの
     /// リセットが走らない。`mark_native_video_hud_activity` 等から呼んで明示的に
@@ -3012,6 +3275,16 @@ impl VideoPlayer {
     pub fn mark_cursor_activity(&self) {
         if let Some(output) = self.native_output.as_ref() {
             output.mark_cursor_activity();
+        }
+    }
+
+    /// CP7: HUD overlay HWND の retry burst raise を presenter thread に依頼する。
+    /// App.update で `dsp_bridge.hud_raise_hook` 経由で来た raise 要求を coalesce して
+    /// 1 回だけ呼ぶ。HUD HWND が無いフォールバック経路では presenter 側で no-op になる。
+    #[cfg(windows)]
+    pub fn request_hud_raise(&self) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.request_hud_raise();
         }
     }
 

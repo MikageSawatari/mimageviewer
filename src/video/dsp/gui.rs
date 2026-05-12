@@ -82,6 +82,10 @@ pub enum Cmd {
     /// Update the bridge-owned top-level surface HWND paired with this host
     /// window. The GUI thread uses it for low-latency move/resize following.
     SetBridgeContainerHwnd(u64),
+    /// 実機修正 (2026-05-12): VST GUI window の `y` 移動下限値 (screen coords) を設定。
+    /// `Some(y)` でフルスクリーン HUD top bar 帯 (= y_min より上は HUD 領域) より上にドラッグ
+    /// 移動できなくする。`None` で制限解除 (= フルスクリーン外)。
+    SetMoveMinY(Option<i32>),
 }
 
 #[derive(Debug)]
@@ -169,6 +173,13 @@ impl GuiHost {
     pub fn set_bridge_container_hwnd(&self, hwnd_u64: u64) {
         let _ = self.cmd_tx.send(Cmd::SetBridgeContainerHwnd(hwnd_u64));
     }
+
+    /// 実機修正 (2026-05-12): VST GUI window の `y` 移動下限を設定する。
+    /// fullscreen 中だけ presenter top + top hover zone より上に移動できないよう clamp する。
+    /// `None` で制限解除。
+    pub fn set_move_min_y(&self, min_y: Option<i32>) {
+        let _ = self.cmd_tx.send(Cmd::SetMoveMinY(min_y));
+    }
 }
 
 impl Drop for GuiHost {
@@ -202,6 +213,12 @@ struct ThreadState {
     /// Win32 allows SetWindowPos from this host thread.
     bridge_container_hwnd: Option<HWND>,
     class_registered: bool,
+    /// 実機修正 (2026-05-12): VST GUI window をユーザーが上端へドラッグしたとき、
+    /// mIV native fullscreen 中の上部 HUD hover 領域 (top bar が出る帯) より上に
+    /// 食い込まないよう `WM_WINDOWPOSCHANGING` で `y` を clamp する下限値 (screen coords)。
+    /// `None` (= フルスクリーン外) のとき clamp 無効。
+    /// `DspBridge::set_gui_move_min_y(min_y)` で App が fullscreen 中だけ設定する。
+    move_min_y: Option<i32>,
 }
 
 unsafe impl Send for ThreadState {}
@@ -285,6 +302,22 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
             }
             WM_WINDOWPOSCHANGING => {
                 if lparam.0 != 0 && !IsIconic(hwnd).as_bool() {
+                    // 実機修正 (2026-05-12): フルスクリーン中の上部 HUD hover 領域に
+                    // VST GUI window が食い込まないよう `y` を clamp する。
+                    // `SWP_NOMOVE` が立っているとき (= z-order 変更のみ等) は move しないので skip。
+                    let wp_mut = lparam.0 as *mut WINDOWPOS;
+                    if !wp_mut.is_null() {
+                        let no_move = ((*wp_mut).flags.0 & SWP_NOMOVE.0) != 0;
+                        if !no_move {
+                            let min_y_opt: Option<i32> = THREAD_STATE
+                                .with(|s| s.borrow().as_ref().and_then(|st| st.move_min_y));
+                            if let Some(min_y) = min_y_opt {
+                                if (*wp_mut).y < min_y {
+                                    (*wp_mut).y = min_y;
+                                }
+                            }
+                        }
+                    }
                     sync_bridge_container_to_pending_window_pos(hwnd, lparam.0 as *const WINDOWPOS);
                 }
                 DefWindowProcW(hwnd, msg, wparam, lparam)
@@ -465,6 +498,7 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
             app_active_tx: None,
             bridge_container_hwnd: None,
             class_registered: false,
+            move_min_y: None,
         }));
     });
 
@@ -481,6 +515,13 @@ fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
             }
             Cmd::SetBridgeContainerHwnd(hwnd_u64) => {
                 set_bridge_container_hwnd_for_thread(hwnd_u64);
+            }
+            Cmd::SetMoveMinY(min_y) => {
+                THREAD_STATE.with(|s| {
+                    if let Some(st) = s.borrow_mut().as_mut() {
+                        st.move_min_y = min_y;
+                    }
+                });
             }
             Cmd::Show {
                 title,
@@ -573,6 +614,13 @@ fn run_message_loop(cmd_rx: &Receiver<Cmd>) {
                 }
                 Ok(Cmd::SetBridgeContainerHwnd(hwnd_u64)) => {
                     set_bridge_container_hwnd_for_thread(hwnd_u64);
+                }
+                Ok(Cmd::SetMoveMinY(min_y)) => {
+                    THREAD_STATE.with(|s| {
+                        if let Some(st) = s.borrow_mut().as_mut() {
+                            st.move_min_y = min_y;
+                        }
+                    });
                 }
                 Ok(Cmd::Show { reply, .. }) => {
                     // すでにウィンドウがあるのに Show 来た。reply に既存 HWND を返さず、

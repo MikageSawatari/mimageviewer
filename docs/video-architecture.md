@@ -46,6 +46,86 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 フレームの実体描画は native presenter 内のスレッドが行うため、`tick` で受け取る
 `egui::Context` は実質未使用 (互換のため引数だけ残してある)。
 
+### HUD overlay HWND (v0.9.0+ 後期 — CP1-8 で導入)
+
+VST3 プラグイン GUI がフルスクリーン動画再生中も最前面に維持されるため (= 動画を見ながら EQ
+カーブを調整する用途)、以前は **VST GUI が presenter HWND の owned + TOPMOST** になっていた。
+Windows の owner rule (= owned は owner より常に手前) で、presenter HWND の DComp tree に
+描画された HUD バー / シークバー / hover thumbnail は VST GUI の裏に潜る regression を抱えていた。
+
+**解決策**: HUD overlay を独立 top-level HWND `HudOverlayWindow` (`src/video/native_presenter/hud_window.rs`)
+として presenter HWND と同じ owner (= presenter HWND 自身) の sibling 配置にし、VST GUI と
+並ぶ z-order group に入れる。両方 `WS_EX_TOPMOST`、HUD を後勝ちで `HWND_TOPMOST` に再アサート
+することで VST より前に出す。
+
+```
+[Fullscreen presenter HWND]                  [HUD overlay HWND]
+  ├─ DComp: background visual                  ├─ owner = presenter (sibling of VST GUI)
+  ├─ DComp: video swap chain visual            ├─ WS_EX_TOPMOST | NOACTIVATE
+  └─ wndproc: key/IME 入力 (presenter focus)   ├─ SetWindowRgn(実 UI rect だけ)
+                                                ├─ wndproc: mouse (region 内のみ)
+[VST GUI HWND] (= bridge process が host)      └─ DComp: egui overlay visual (CP4 で移植)
+  └─ owner = presenter, WS_EX_TOPMOST                ↑ HUD 用 IDCompositionTarget は
+                                                       NativeVideoPresenter で保持
+最終 z-order (上から):
+  HUD overlay HWND (= bars / interactive UI / hover thumbnail)
+  VST GUI HWND (= EQ ノブ等)
+  Fullscreen presenter HWND (= video frame + background)
+```
+
+**入力 2 層化**:
+
+- **Mouse**: HUD wndproc が region 内で受けて `event_tx` に流す。region 外は `SetWindowRgn` で
+  物理的に「存在しない」領域として穴を空けているので、OS が下層 (VST or presenter) に直接 mouse を
+  配送する (= クロスプロセスでも安定)。`HTTRANSPARENT` のクロスプロセス透過には頼らない。
+- **Keyboard / IME**: HUD では受けない (`WS_EX_NOACTIVATE` で focus を取らない)。presenter HWND の
+  既存 wndproc で受けて `NativeEguiOverlay` に流す。HUD 上の mouse-down で `claim_foreground(presenter_hwnd)`
+  を発火することで、VST 操作後でも presenter HWND を foreground/focus に戻して keyboard/IME を維持。
+
+**Region 計算とアクティベーション検出**:
+
+`NativeEguiOverlay::compute_hud_regions` が egui run 末尾で表示中の各 UI 要素の rect を集めて返す
+(= 上 hover bar / 下 HUD / right panel / jump panel / VST3 panel / speed popup / bookmark editor /
+normalize blocker / tile overlay / paused center / seek hover thumbnail)。**activation zone** (= bar
+非表示時の hover 検出範囲、画面上下端の帯) は region に **含めない** — 含めると bar 非表示時に VST の
+ノブが上下端と重なったとき入力を奪うため。
+
+bar の hover 表示は presenter thread の **50ms 周期 `GetCursorPos` polling** (`cursor_polling_tick`)
+で代替: cursor が presenter HWND client rect 内なら synthetic `MouseMove` を `push_native_event` に流し、
+activation zone 内なら HUD raise burst をエンキューする (= VST 手動クリックで HUD が裏に回ったあとの
+復帰経路)。
+
+**Z-order 再アサート (HUD raise burst)**:
+
+VST z-order 操作の各経路 (`set_all_guis_topmost` / `set_all_guis_visible_blocking` /
+`set_all_guis_app_active` / `send_chain_z_order` / `show_slot_gui` / `hide_slot_gui` /
+`user_hide_slot_gui` / `remove_plugin` / `disable_with_reason`) の末尾で `DspBridge::fire_hud_raise_hook`
+が unbounded mpsc に `send(())` する → App `update` で `try_iter` drain → 1 件以上来てれば fullscreen 中の
+`VideoPlayer::request_hud_raise()` を 1 回呼ぶ (= coalesce) → presenter thread が
+`NativeVideoOutputCommand::RaiseHudToTop` を受けて **即時/16ms/64ms の short retry burst** で
+`SetWindowPos(hud, HWND_TOPMOST)` を呼ぶ (= 非同期 VST IPC の z-order 反映を確実に拾う)。
+
+各 raise burst 直前で `foreground_allows_hud_raise` を通す (= command / event / polling のすべての
+raise 経路で **allowlist 判定**):
+
+- **許可**: foreground が `presenter HWND` / `HUD HWND` / `main HWND` のいずれか、または
+  `editor_hwnds` (= 現在 visible な VST editor container HWND の snapshot) に含まれる HWND
+  (`GA_ROOT` で正規化、`IsWindow` + `IsWindowVisible` で stale 排除)
+- **skip**: VST plugin の右クリックメニュー / file dialog / 独自 popup (`GetLastActivePopup(editor)`
+  で検出)、mIV の設定ダイアログ等の未登録 mIV HWND、別 process
+
+詳細は [vst3-integration.md](vst3-integration.md) の "Fullscreen focus handoff" 節を参照。
+
+**Geometry / DPI 同期**: presenter HWND の `WM_WINDOWPOSCHANGED` → `GeometryChanged` event →
+HUD HWND の `SetWindowPos` + overlay surface resize。HUD HWND の `WM_DPICHANGED` → `DpiChanged` event →
+`set_overlay_pixels_per_point(dpi/96.0)` + HUD `set_hud_geometry(suggested_rect)` +
+`resize_overlay_surface_only`。presenter HWND 自身 (= video transform / background) には影響させない。
+
+**フォールバック経路**: HUD HWND 生成失敗 / 環境変数 `MIV_HUD_OVERLAY=0` でフォールバック有効化。
+従来通り egui overlay を presenter HWND の DComp tree に attach (`NativeEguiOverlay::new` の
+`after_visual=Some(&video_visual)`、`dcomp_hwnd=focus_hwnd=presenter_hwnd`)。VST GUI 裏に bars が
+潜る挙動になるが、CP8 以前の動作と完全等価。万が一の regression の retreat 用。
+
 ### GPU フレームの内部フロー (HW decoder 利用時)
 
 ```

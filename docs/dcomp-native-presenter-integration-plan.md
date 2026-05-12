@@ -22,16 +22,42 @@ egui UI rate:
 
 ## Target Shape
 
+**注**: v0.9.0+ 後期の CP1-8 で **「transparent overlay HWND」を選択** して実装済み
+(= egui overlay は presenter HWND の DComp tree ではなく独立 top-level HWND `HudOverlayWindow`
+にぶら下げる)。これは VST GUI が presenter HWND の owned + TOPMOST になっているため、
+presenter HWND 内の DComp visual に描画した overlay が VST の裏に潜る問題を解消するため。
+詳細は [video-architecture.md](video-architecture.md) の "HUD overlay HWND" 節と
+[vst3-integration.md](vst3-integration.md) の "HUD overlay HWND と VST 前後関係" 節を参照。
+
 ```text
-Fullscreen top-level HWND
-  DirectComposition target
-    Visual 0: video swap chain (native presenter, D3D11/DXGI)
-    Visual 1: egui overlay swap chain or transparent overlay HWND
-  VST3 editor top-level owned popups (existing bridge windows)
+Fullscreen top-level HWND (= presenter)        HUD overlay HWND (= 独立 top-level)
+  DirectComposition target                       DirectComposition target
+    Visual 0: video swap chain (D3D11/DXGI)        Visual 0: egui overlay swap chain
+    Visual 1: background visual                  owner = presenter, sibling of VST3
+                                                 WS_EX_TOPMOST | NOACTIVATE
+                                                 SetWindowRgn(実 UI rect only)
+                                                 activation zone は region 外
+                                                 (= 上下端の VST 入力を奪わない)
+                                                                ↑
+VST3 editor top-level owned (existing bridge   ←── 同じ owner = presenter の sibling
+windows): owner = presenter, WS_EX_TOPMOST
 ```
 
-The prototype currently validates only Visual 0. Production work must add input,
-overlay, resize, DPI, and state-machine integration.
+最終 z-order (上から):
+- HUD overlay HWND (= bars / interactive UI / hover thumbnail)
+- VST GUI HWND
+- Fullscreen presenter HWND (= video frame + background)
+
+**activation zone (= 画面上下端の hover 検出帯) は region に含めない** — 含めると bar 非表示
+時に VST のノブやメニューが上下端と重なったとき入力を奪う。代わりに presenter thread の
+50ms 周期 `GetCursorPos` polling で synthetic pointer を `NativeEguiOverlay::push_native_event`
+に流して hover 表示遷移を成立させる。同じ polling で activation zone 検知時に HUD raise
+burst もエンキューする (= VST 手動クリックで HUD が裏に回ったあとの復帰経路)。
+
+The prototype originally validated only Visual 0. Production work added input,
+overlay, resize, DPI, and state-machine integration through CP1-8. フォールバック経路
+として、HUD HWND 生成失敗時 / 環境変数 `MIV_HUD_OVERLAY=0` のときは egui overlay を
+presenter HWND の DComp tree に attach する旧経路に戻る (= CP8 以前と等価)。
 
 ## Phase A: Reusable Native Presenter Module
 

@@ -125,6 +125,33 @@ pub struct DspBridge {
     sample_rate: AtomicU32,
     /// mIV main HWND. Bridge-owned VST editor windows use this as their owner.
     main_hwnd: AtomicU64,
+    /// フルスクリーン動画再生中の native presenter HWND (= VST editor の owner
+    /// に強制的に使う値)。0 = フルスクリーン外。`register_fullscreen_owner` /
+    /// `unregister_fullscreen_owner` で App から更新される。
+    /// `current_gui_owner_hwnd` がこの値を最優先で返すことで、cursor 依存の
+    /// `WindowFromPoint` 経路よりも先に presenter HWND を確定させる
+    /// (= VST が `WindowFromPoint` で HUD HWND を選んでしまうのを防ぐ)。
+    fullscreen_owner_hwnd: AtomicU64,
+    /// HUD overlay HWND (= bars / interactive UI 用の独立 top-level)。
+    /// owner 候補にはしない (= `current_gui_owner_hwnd` から絶対に返さない、
+    /// VST が HUD owned になると目的逆転するため)。
+    /// 用途は HUD raise の allowlist 判定で「mIV の既知 HWND」として参照すること。
+    hud_hwnd: AtomicU64,
+    /// 編集中 (= 現在 visible な) VST editor container HWND のスナップショット。
+    /// HUD raise の allowlist 判定で参照される。slot 作成 / show / hide /
+    /// user_hidden / remove / bridge disconnect / 一括 visibility の全経路で
+    /// 「visible かつ `IsWindow` で生存している HWND だけ」で再構築する。
+    /// `gui_hwnd` は hidden 後も残るので「slot に HWND がある」だけでは入れない。
+    editor_hwnds: Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
+    /// HUD overlay を最前面に上げ直す要求を流すフック。App が `set_hud_raise_hook`
+    /// で登録し、各 z-order op (`set_all_guis_topmost` / `set_all_guis_visible_blocking`
+    /// / `set_all_guis_app_active` / `send_chain_z_order` 等) の末尾で発火する。
+    /// hook 側は unbounded mpsc に `send` するだけの非ブロッキング処理を行う。
+    hud_raise_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// 実機修正 (2026-05-12): 直近 `set_all_guis_move_min_y` の値。値が変化したときだけ
+    /// 全 host に Cmd を投げる差分判定用 (= 毎フレーム呼出で send 過多にならないように)。
+    /// `i64::MIN` を sentinel として使い、初回は必ず send。
+    last_move_min_y: std::sync::atomic::AtomicI64,
 }
 
 struct DspBridgeInner {
@@ -219,6 +246,11 @@ impl DspBridge {
             gui_app_inactive_since: Mutex::new(None),
             sample_rate: AtomicU32::new(0),
             main_hwnd: AtomicU64::new(0),
+            fullscreen_owner_hwnd: AtomicU64::new(0),
+            hud_hwnd: AtomicU64::new(0),
+            editor_hwnds: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
+            hud_raise_hook: Mutex::new(None),
+            last_move_min_y: std::sync::atomic::AtomicI64::new(i64::MIN),
         })
     }
 
@@ -226,8 +258,143 @@ impl DspBridge {
         self.main_hwnd.store(hwnd, Ordering::Release);
     }
 
-    /// VST editor の owner にする mIV 側 HWND を返す。フルスクリーン中は
-    /// foreground viewport を優先し、取れない場合だけ main HWND に戻す。
+    /// フルスクリーン動画再生開始時に presenter HWND を登録。
+    /// `current_gui_owner_hwnd` がこの値を最優先で返すようになる (= VST owner が
+    /// 必ず presenter HWND になり、HUD HWND が owner 候補に出ない)。
+    pub fn register_fullscreen_owner(&self, hwnd: u64) {
+        self.fullscreen_owner_hwnd.store(hwnd, Ordering::Release);
+    }
+
+    /// フルスクリーン解除時に呼ぶ。owner 強制を解いて通常経路に戻す。
+    pub fn unregister_fullscreen_owner(&self) {
+        self.fullscreen_owner_hwnd.store(0, Ordering::Release);
+    }
+
+    /// HUD overlay HWND を登録 / クリア (0 を渡すとクリア)。
+    /// `foreground_allows_hud_raise` で「mIV 既知 HWND」判定に使う。
+    /// **`current_gui_owner_hwnd` の候補には絶対に出さない**ことに注意。
+    pub fn set_hud_hwnd(&self, hwnd: u64) {
+        self.hud_hwnd.store(hwnd, Ordering::Release);
+    }
+
+    /// 実機修正 (2026-05-12): VST GUI window の `y` 移動下限値を保存。
+    /// 実際の clamp 実行は **App 側で毎フレーム `GetWindowRect` + `SetWindowPos`** で行う
+    /// (= VST GUI HWND は bridge process が host していて、`slot.gui_host` は使われていない。
+    /// 元の cmd_tx 経由 `WM_WINDOWPOSCHANGING` clamp 構想は届かないため放棄)。
+    /// `None` で制限解除。
+    pub fn set_all_guis_move_min_y(&self, min_y: Option<i32>) {
+        let new_v: i64 = min_y.map(|v| v as i64).unwrap_or(i64::MIN);
+        let prev = self.last_move_min_y.swap(new_v, Ordering::AcqRel);
+        if prev != new_v && crate::video::native_presenter::hud_debug_enabled() {
+            crate::logger::log(format!(
+                "[HUD-DEBUG] set_all_guis_move_min_y prev={prev} new={new_v} min_y={min_y:?}"
+            ));
+        }
+    }
+
+    /// 実機修正 (2026-05-12): 保存された move_min_y を取得。App 側 clamp ループから読む。
+    pub fn move_min_y_value(&self) -> Option<i32> {
+        let v = self.last_move_min_y.load(Ordering::Acquire);
+        if v == i64::MIN {
+            None
+        } else {
+            Some(v as i32)
+        }
+    }
+
+    /// HUD raise allowlist 用に editor_hwnds snapshot の `Arc<RwLock<...>>` を
+    /// clone して返す。presenter thread が polling で `read()` して
+    /// `foreground_allows_hud_raise` に渡す。
+    #[allow(dead_code)]
+    pub fn editor_hwnds_snapshot(
+        &self,
+    ) -> Arc<std::sync::RwLock<std::collections::HashSet<u64>>> {
+        Arc::clone(&self.editor_hwnds)
+    }
+
+    /// HUD raise hook を登録する。引数のクロージャは `set_all_guis_topmost` 等の
+    /// 末尾で発火される。クロージャ側は unbounded mpsc に `send` するだけの
+    /// 非ブロッキング処理を行うこと (worker thread から呼ばれる可能性があるため)。
+    #[allow(dead_code)]
+    pub fn set_hud_raise_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut slot) = self.hud_raise_hook.lock() {
+            *slot = Some(hook);
+        }
+    }
+
+    /// HUD raise hook を発火 (= 登録済みクロージャを呼ぶ)。inner lock を握ったまま
+    /// 呼ばないこと (Codex P2 #5: hook 内 send が間接的に lock を取り得るため)。
+    /// Mutex を短時間取って clone → lock 解放 → 呼び出し の順で contention を避ける。
+    fn fire_hud_raise_hook(&self) {
+        let hook = {
+            let guard = match self.hud_raise_hook.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            guard.clone()
+        };
+        if let Some(h) = hook {
+            h();
+        }
+    }
+
+    /// `editor_hwnds` snapshot を再構築する。**現在 visible (= `gui_visible == true`)
+    /// で `IsWindow` で生存している HWND** だけを set に入れる。
+    /// `gui_hwnd` は hidden 後も残るので「slot に HWND があるだけ」では入れない。
+    ///
+    /// Lock 順序 (Codex 7 P2 #5):
+    /// 1. inner lock で「HWND + visible 状態」をローカル `Vec` にコピー (短時間)。
+    /// 2. inner lock 解放後に Windows API (`IsWindow`) を呼んで filter。
+    /// 3. `editor_hwnds.write()` で snapshot 入れ替え。
+    fn refresh_editor_hwnds_snapshot(&self) {
+        // Step 1: inner lock を短時間取って HWND リストをコピー。
+        let candidates: Vec<u64> = {
+            let inner = match self.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            inner
+                .slots
+                .iter()
+                .filter(|s| s.gui_hwnd != 0 && s.gui_visible)
+                .map(|s| s.gui_hwnd)
+                .collect()
+        };
+
+        // Step 2: inner lock 外で IsWindow チェックして filter。
+        #[cfg(windows)]
+        let filtered: std::collections::HashSet<u64> = {
+            use windows::Win32::Foundation::HWND;
+            use windows::Win32::UI::WindowsAndMessaging::IsWindow;
+            candidates
+                .into_iter()
+                .filter(|raw| {
+                    let hwnd = HWND(*raw as *mut _);
+                    unsafe { IsWindow(Some(hwnd)) }.as_bool()
+                })
+                .collect()
+        };
+        #[cfg(not(windows))]
+        let filtered: std::collections::HashSet<u64> = candidates.into_iter().collect();
+
+        // Step 3: editor_hwnds.write() で snapshot 入れ替え。
+        if let Ok(mut guard) = self.editor_hwnds.write() {
+            *guard = filtered;
+        }
+    }
+
+    /// VST editor の owner にする mIV 側 HWND を返す。
+    ///
+    /// 優先順:
+    /// 1. **`fullscreen_owner_hwnd` (= presenter HWND) が登録されているとき**は
+    ///    無条件にそれを返す。これにより cursor / foreground の状態に関わらず、
+    ///    フルスクリーン中は VST editor が必ず presenter HWND の owned になる。
+    ///    `WindowFromPoint` が cursor 下の HUD HWND を返してしまうケースを排除する。
+    /// 2. フルスクリーン外では従来通り cursor / foreground 経由で mIV process の
+    ///    任意の top-level (= main / 設定ダイアログ等) を選び、取れなければ main にフォールバック。
+    ///
+    /// HUD HWND は `set_hud_hwnd` で別系統に登録されるが、`current_gui_owner_hwnd`
+    /// の候補には決して出ない (= VST が HUD owned になり目的逆転するのを防ぐ)。
     #[cfg(windows)]
     fn current_gui_owner_hwnd(&self) -> u64 {
         use windows::Win32::Foundation::POINT;
@@ -237,6 +404,14 @@ impl DspBridge {
             WindowFromPoint,
         };
 
+        // 1. フルスクリーン中は presenter HWND を強制 (= cursor 依存判定をバイパス)。
+        let fullscreen = self.fullscreen_owner_hwnd.load(Ordering::Acquire);
+        if fullscreen != 0 {
+            return fullscreen;
+        }
+
+        // 2. フルスクリーン外は従来通り cursor / foreground 経由 (HUD HWND は除外)。
+        let hud = self.hud_hwnd.load(Ordering::Acquire);
         let fallback = self.main_hwnd.load(Ordering::Acquire);
         unsafe {
             let mut pt = POINT::default();
@@ -245,10 +420,17 @@ impl DspBridge {
                 if !hovered.0.is_null() {
                     let root = GetAncestor(hovered, GA_ROOT);
                     let owner = if root.0.is_null() { hovered } else { root };
-                    let mut owner_pid = 0_u32;
-                    let _ = GetWindowThreadProcessId(owner, Some(&mut owner_pid));
-                    if owner_pid == GetCurrentProcessId() {
-                        return owner.0 as u64;
+                    let owner_raw = owner.0 as u64;
+                    // HUD HWND は owner 候補から除外 (念のため、フルスクリーン外では
+                    // HUD HWND も 0 のはずだが、過渡期に残ったケースも防ぐ)。
+                    if hud != 0 && owner_raw == hud {
+                        // 次の foreground 経路にフォールスルー
+                    } else {
+                        let mut owner_pid = 0_u32;
+                        let _ = GetWindowThreadProcessId(owner, Some(&mut owner_pid));
+                        if owner_pid == GetCurrentProcessId() {
+                            return owner_raw;
+                        }
                     }
                 }
             }
@@ -257,10 +439,14 @@ impl DspBridge {
             if hwnd.0.is_null() {
                 return fallback;
             }
+            let raw = hwnd.0 as u64;
+            if hud != 0 && raw == hud {
+                return fallback;
+            }
             let mut foreground_pid = 0_u32;
             let _ = GetWindowThreadProcessId(hwnd, Some(&mut foreground_pid));
             if foreground_pid == GetCurrentProcessId() {
-                return hwnd.0 as u64;
+                return raw;
             }
         }
         fallback
@@ -568,6 +754,16 @@ impl DspBridge {
         }
         inner.next_slot_id = 0;
         inner.state = DspState::Disabled;
+        drop(inner);
+        // editor_hwnds allowlist を確実に空にする (Codex CP1 P2 反映)。
+        // `refresh_editor_hwnds_snapshot` は IsWindow filter で空 set に
+        // なるはずだが、HWND 再利用時の誤許可リスクを残さないよう明示クリアする。
+        if let Ok(mut guard) = self.editor_hwnds.write() {
+            guard.clear();
+        }
+        // bridge disconnect / quarantine 経路。HUD は VST がいなくなったあと
+        // 最前面を維持しておきたいので念のため raise hook を発火する。
+        self.fire_hud_raise_hook();
     }
 
     /// 指定パスの VST3 プラグインを新しいスロットとしてチェーン末尾に追加する。
@@ -1048,7 +1244,16 @@ impl DspBridge {
     }
 
     pub fn show_slot_gui(&self, idx: usize) -> Result<(), String> {
-        self.ensure_slot_gui_attached(idx, true, true)
+        let result = self.ensure_slot_gui_attached(idx, true, true);
+        // editor が visible になった可能性があるので allowlist 更新。
+        // 失敗時 (= attach error / quarantine 等) でも `disable_with_reason` が走った
+        // 可能性があるので refresh は維持する (Codex CP1 P3 反映)。
+        self.refresh_editor_hwnds_snapshot();
+        // raise hook は **成功時のみ** 発火 (失敗時に raise しても意味がないため)。
+        if result.is_ok() {
+            self.fire_hud_raise_hook();
+        }
+        result
     }
 
     pub fn show_slot_gui_async(self: Arc<Self>, idx: usize) {
@@ -1063,10 +1268,20 @@ impl DspBridge {
             .name(format!("vst3-gui-show-slot-{idx}"))
             .spawn(move || {
                 crate::logger::log(format!("[VST3 GUI] async show-slot begin idx={idx}"));
-                if let Err(err) = bridge.ensure_slot_gui_attached(idx, true, true) {
-                    crate::logger::log(format!(
-                        "[VST3 GUI] async show-slot failed idx={idx}: {err}"
-                    ));
+                let attach_ok = match bridge.ensure_slot_gui_attached(idx, true, true) {
+                    Ok(()) => true,
+                    Err(err) => {
+                        crate::logger::log(format!(
+                            "[VST3 GUI] async show-slot failed idx={idx}: {err}"
+                        ));
+                        false
+                    }
+                };
+                // 失敗時でも `disable_with_reason` 経由で stale が残る可能性があるので
+                // refresh は維持。raise hook は成功時のみ発火 (Codex CP1 P3 反映)。
+                bridge.refresh_editor_hwnds_snapshot();
+                if attach_ok {
+                    bridge.fire_hud_raise_hook();
                 }
                 bridge
                     .gui_show_all_in_progress
@@ -1304,6 +1519,10 @@ impl DspBridge {
         if hwnd != 0 {
             self.send_slot_gui_visible(idx, false);
         }
+        // HUD raise allowlist から外す + raise hook 発火 (VST が消えたら HUD は他の
+        // editor の前にいるはずだが、念のため再アサート)。
+        self.refresh_editor_hwnds_snapshot();
+        self.fire_hud_raise_hook();
     }
 
     /// 指定 idx のプラグイン GUI をユーザーが明示的に閉じた。
@@ -1325,6 +1544,9 @@ impl DspBridge {
         if hwnd != 0 {
             self.send_slot_gui_visible(idx, false);
         }
+        // HUD raise allowlist から外す + raise hook 発火。
+        self.refresh_editor_hwnds_snapshot();
+        self.fire_hud_raise_hook();
     }
 
     /// 指定 idx の GUI が表示中かをトグルする。
@@ -1528,6 +1750,12 @@ impl DspBridge {
                 self.send_chain_visible(&restore_order, true, topmost);
             }
         }
+
+        // editor_hwnds snapshot を再構築 (visible / IsWindow フィルタで stale 排除)。
+        // VST z-order が変わった可能性があるので HUD raise 要求を流す。
+        // どちらも inner lock 外で実行する (Codex 7 P2 #5)。
+        self.refresh_editor_hwnds_snapshot();
+        self.fire_hud_raise_hook();
     }
 
     /// 全プラグイン GUI ウィンドウの TOPMOST 属性を一斉切替。
@@ -1573,6 +1801,12 @@ impl DspBridge {
         // editor HWND を直接 ShowWindow/SetWindowPos すると、owner 変更 IPC と
         // 表示順序が前後して main viewport が持ち上がることがある。
         self.send_chain_z_order(&ordered_top_to_bottom, topmost);
+
+        // editor の visible 状態は変わらないが念のため stale をクリーンアップ。
+        self.refresh_editor_hwnds_snapshot();
+        // VST z-order を動かしたあとは HUD overlay を最前面に上げ直す要求を出す
+        // (= App が drain & coalesce で presenter thread に伝え、retry burst で raise)。
+        self.fire_hud_raise_hook();
     }
 
     /// mIV が他アプリへ切り替わった時は plugin GUI を NOTOPMOST/非表示にし、
@@ -1599,6 +1833,11 @@ impl DspBridge {
         for idx in 0..n {
             self.send_slot_gui_app_active(idx, active);
         }
+
+        // editor の visible 状態は変わらないが念のため stale をクリーンアップ。
+        self.refresh_editor_hwnds_snapshot();
+        // VST z-order が変わった可能性があるので HUD raise 要求を流す。
+        self.fire_hud_raise_hook();
     }
 
     /// V キーハンドラ用: 「現在 1 個でも表示されているなら全て非表示」
@@ -1877,6 +2116,10 @@ impl DspBridge {
             let _ = slot.bridge.set_bypass_slot(slot.slot_id, true);
         }
         self.recalc_active_count(&inner);
+        drop(inner);
+        // slot 削除 = editor が消えた可能性。allowlist を更新 + HUD raise を再アサート。
+        self.refresh_editor_hwnds_snapshot();
+        self.fire_hud_raise_hook();
     }
 
     /// スロットを `from` 位置から `to` 位置に移動する。to >= len なら末尾。
@@ -2032,5 +2275,108 @@ impl DspBridge {
 impl Drop for DspBridge {
     fn drop(&mut self) {
         self.disable();
+    }
+}
+
+/// HUD overlay HWND を最前面に上げ直して良いかを判定する `pub(crate)` ヘルパー。
+///
+/// 既存の `foreground_belongs_to_miv_or_bridge` (PID ベース) とは **別物**。
+/// `set_all_guis_app_active` などが PID ベース判定を「bridge が foreground」という
+/// 別の意味で使っているので、HUD raise 用にセマンティクスを変えず別系統にする
+/// (Codex 7/8 回目 P1 #1 反映)。
+///
+/// 判定:
+/// 1. foreground が mIV の既知 HWND (presenter / HUD / main) のいずれか → 許可。
+///    **mIV PID 一致の任意 HWND は許可しない** (Codex 10 回目 P1 #1: 設定ダイアログ等
+///    の mIV モーダルが foreground のとき HUD raise しないため)。
+/// 2. foreground HWND 自身 or `GA_ROOT` が `editor_hwnds` に含まれる → editor。
+///    `IsWindow` / `IsWindowVisible` で stale 排除 (Codex 6 回目 P1 #1)。
+///    **`GA_ROOTOWNER` は使わない** (editor を owner にする popup を誤許可しないため)。
+/// 3. editor が foreground でも、editor が popup/menu を出していたら skip (P1 #2)。
+///    `GetLastActivePopup(editor)` は editor の最後の popup chain を返す:
+///       - popup なし → editor 自身を返す
+///       - 右クリックメニューや plugin 独自 popup → 別 HWND を返す**ことがある** (best-effort)
+///    返り値が editor 以外 (= popup 検出できた) かつ allowlist 外なら skip。
+///    すべての plugin が last-active-popup を正しく返すとは限らないので、検証で
+///    取りこぼしが出たら `EnumWindows` ベースの fallback を追加する。
+///
+/// presenter thread から呼ぶ場合、引数 `editor_hwnds` は `RwLock<HashSet<u64>>` から
+/// **clone した HashSet を渡す** こと (read lock を持ったまま Windows API を呼ばないため、
+/// Codex 10 回目 P2 #4)。
+#[cfg(windows)]
+#[allow(dead_code)]
+pub(crate) fn foreground_allows_hud_raise(
+    presenter_hwnd: u64,
+    hud_hwnd: u64,
+    main_hwnd: u64,
+    editor_hwnds: &std::collections::HashSet<u64>,
+) -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GA_ROOT, GetAncestor, GetForegroundWindow, GetLastActivePopup,
+        GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    };
+
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.0.is_null() {
+            return false;
+        }
+        let raw = foreground.0 as u64;
+
+        // 1. mIV の既知 HWND だけ許可 (= presenter / HUD / main)。
+        if raw == presenter_hwnd || raw == hud_hwnd || raw == main_hwnd {
+            return true;
+        }
+        let mut pid = 0_u32;
+        let _ = GetWindowThreadProcessId(foreground, Some(&mut pid));
+        if pid == GetCurrentProcessId() {
+            // mIV process 内の別 HWND (= 設定ダイアログ等) → skip。
+            return false;
+        }
+
+        // 2. editor allowlist 判定 (foreground 自身 + GA_ROOT、GA_ROOTOWNER は使わない)。
+        let root = GetAncestor(foreground, GA_ROOT);
+        let candidates: [HWND; 2] = [foreground, root];
+        let mut editor_matched = false;
+        for &c in &candidates {
+            if c.0.is_null() {
+                continue;
+            }
+            let c_raw = c.0 as u64;
+            if !editor_hwnds.contains(&c_raw) {
+                continue;
+            }
+            if !IsWindow(Some(c)).as_bool() {
+                continue;
+            }
+            if !IsWindowVisible(c).as_bool() {
+                continue;
+            }
+            editor_matched = true;
+            break;
+        }
+        if !editor_matched {
+            return false;
+        }
+
+        // 3. editor が foreground でも、editor が popup を出していたら skip。
+        for editor_raw in editor_hwnds.iter() {
+            let editor = HWND(*editor_raw as *mut _);
+            if !IsWindow(Some(editor)).as_bool() {
+                continue;
+            }
+            let popup = GetLastActivePopup(editor);
+            if popup.0.is_null() || popup.0 == editor.0 {
+                continue;
+            }
+            let popup_raw = popup.0 as u64;
+            if !editor_hwnds.contains(&popup_raw) && IsWindowVisible(popup).as_bool() {
+                return false;
+            }
+        }
+
+        true
     }
 }

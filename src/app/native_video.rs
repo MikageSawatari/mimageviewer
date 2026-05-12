@@ -87,28 +87,51 @@ impl App {
     #[cfg(windows)]
     pub(super) fn ensure_native_video_front(&mut self) {
         if self.fullscreen_idx.is_none() {
+            if self.native_video_front_synced_hwnd != 0 {
+                // CP7: フルスクリーン解除時に DspBridge 側の owner / hud HWND 登録もクリア。
+                self.dsp_bridge.unregister_fullscreen_owner();
+                self.dsp_bridge.set_hud_hwnd(0);
+                self.vst_geometry_tracker.clear();
+            }
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
             return;
         }
-        let hwnd = self
+        let (hwnd, hud_hwnd) = self
             .fullscreen_idx
             .and_then(|idx| self.fs_cache.get(&idx))
             .and_then(|entry| match entry {
                 FsCacheEntry::Video { player, .. } => {
                     let hwnd = player.native_presenter_hwnd();
-                    (hwnd != 0).then_some(hwnd)
+                    if hwnd == 0 {
+                        None
+                    } else {
+                        Some((hwnd, player.native_hud_hwnd()))
+                    }
                 }
                 _ => None,
             })
-            .unwrap_or(0);
+            .unwrap_or((0, 0));
         if hwnd == 0 {
+            if self.native_video_front_synced_hwnd != 0 {
+                self.dsp_bridge.unregister_fullscreen_owner();
+                self.dsp_bridge.set_hud_hwnd(0);
+                self.vst_geometry_tracker.clear();
+                self.dsp_bridge.set_all_guis_move_min_y(None);
+            }
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
             return;
         }
         let is_new_hwnd = hwnd != self.native_video_front_synced_hwnd;
         if !is_new_hwnd {
+            // 既存 HWND が継続しているケースでも、HUD HWND は遅延生成されることがあるので
+            // bridge 側の登録値が古い (0) のままにならないよう毎フレーム refresh する。
+            self.dsp_bridge.set_hud_hwnd(hud_hwnd);
+            // 実機修正 (2026-05-12 C): VST window が top/bottom bar 帯に重なっていたら
+            // ドラッグ/リサイズ終了後に自動で押し出す。`SWP_ASYNCWINDOWPOS` で非同期
+            // 送信なので bridge GUI スレッドをブロックしない (= 旧 clamp の crash 回避)。
+            self.tick_vst_window_overlap_adjustment(hwnd);
             return;
         }
 
@@ -121,10 +144,208 @@ impl App {
         // thread.
         self.native_video_front_synced_hwnd = hwnd;
         self.native_video_front_last_raise = Some(std::time::Instant::now());
+
+        // CP7: presenter HWND が確定したので、DspBridge に owner / HUD HWND を登録する。
+        // - `register_fullscreen_owner(presenter_hwnd)`: VST editor の owner を presenter HWND に
+        //   強制 (= `current_gui_owner_hwnd` がフルスクリーン中は presenter を最優先で返す)。
+        // - `set_hud_hwnd(hud_hwnd)`: HUD HWND を「raise allowlist の mIV 既知 HWND」として登録
+        //   (= `foreground_allows_hud_raise` で許可される)。**owner 候補には絶対に出さない**
+        //   (= `current_gui_owner_hwnd` 内で除外済み)。
+        self.dsp_bridge.register_fullscreen_owner(hwnd);
+        self.dsp_bridge.set_hud_hwnd(hud_hwnd);
+        // 実機修正 (2026-05-12 P1 致命的問題): cross-process SetWindowPos(VST_HWND) は
+        // bridge GUI スレッドをブロックして bridge 自殺 → VST 全消失。clamp 機能完全削除。
         crate::video::native_window::log_state(hwnd, "synced");
         crate::logger::log(format!(
             "[native-video] synced fullscreen presenter hwnd=0x{hwnd:x}"
         ));
+    }
+
+    /// 実機修正 (2026-05-12 C, Codex P1 #2/#3/#4 反映): VST GUI window が HUD top/bottom bar 帯と
+    /// 重なる位置に **drag/resize で動かした後**、rect が 250ms 安定したら自動で外へ押し出す。
+    ///
+    /// ## 安全策まとめ
+    ///   1. **rect 安定検出 (250ms)**: drag/resize 終了を `GetWindowRect` 比較で検出。
+    ///   2. **1 イベント 1 発火**: 安定検出後 `SetWindowPos` を 1 回だけ呼んで pending を clear。
+    ///   3. **`SWP_ASYNCWINDOWPOS`**: 非同期送信で bridge GUI スレッドをブロックしない。
+    ///   4. **HWND 正規化** (Codex P1 #4): `GetAncestor(hwnd, GA_ROOT)` で top-level に揃え、
+    ///      `WS_CHILD` style の child HWND は skip。stale / child 混入リスクを排除。
+    ///   5. **マルチモニター安全** (Codex P1 #3): VST のタイトルバー中央点が presenter rect 内に
+    ///      ない場合は nudge しない (= 上配置の別ディスプレイへ移動した VST を引き戻さない)。
+    ///   6. **タイトルバー検出のみ** (Codex P1 #2): bottom 側は「VST 全体の bottom」ではなく
+    ///      「VST のタイトルバー上端 (= rect.top + ~30px) が seek bar 帯と重なる」場合のみ発火。
+    ///      大きい VST を画面下半分に置いただけで window 全体が動く症状を防ぐ。
+    #[cfg(windows)]
+    fn tick_vst_window_overlap_adjustment(&mut self, presenter_hwnd: u64) {
+        use std::time::{Duration, Instant};
+        use windows::Win32::Foundation::HWND as Win32Hwnd;
+        use windows::Win32::Foundation::RECT as Win32Rect;
+        use windows::Win32::UI::HiDpi::GetDpiForWindow;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GA_ROOT, GWL_STYLE, GetAncestor, GetWindowLongPtrW, GetWindowRect, IsWindow,
+            IsWindowVisible, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_NOZORDER,
+            SetWindowPos, WS_CHILD,
+        };
+        let editor_arc = self.dsp_bridge.editor_hwnds_snapshot();
+        let raw_list: Vec<u64> = match editor_arc.read() {
+            Ok(set) => set.iter().copied().collect(),
+            Err(_) => return,
+        };
+
+        // HWND 正規化 (Codex 続編 P2 反映): 順序を「先に GA_ROOT で正規化 → 正規化後の root に
+        // 対して IsWindow / IsWindowVisible / WS_CHILD を検査」に修正。
+        // 旧版は raw HWND が WS_CHILD なら即 skip していたが、これだと「子 HWND の root を辿って
+        // 正規化する」目的が満たせない (= child が混じった場合に正規化路に入る前に弾かれていた)。
+        // GA_ROOT は raw が既に top-level なら同じ HWND を返すので、常に正規化を先に行うのが安全。
+        let mut normalized: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for raw in raw_list.iter().copied() {
+            let h = Win32Hwnd(raw as *mut _);
+            if !unsafe { IsWindow(Some(h)) }.as_bool() {
+                continue;
+            }
+            // (1) 先に GA_ROOT で top-level に正規化。
+            let root = unsafe { GetAncestor(h, GA_ROOT) };
+            if root.0.is_null() {
+                continue;
+            }
+            // (2) 正規化後の root に対して生存/可視/style を検査。
+            if !unsafe { IsWindow(Some(root)) }.as_bool() {
+                continue;
+            }
+            if !unsafe { IsWindowVisible(root) }.as_bool() {
+                continue;
+            }
+            let root_style = unsafe { GetWindowLongPtrW(root, GWL_STYLE) } as u32;
+            if (root_style & WS_CHILD.0) != 0 {
+                // GA_ROOT が child を返すのは異常ケース (top-level でない) なので skip。
+                continue;
+            }
+            normalized.insert(root.0 as u64);
+        }
+
+        if normalized.is_empty() {
+            self.vst_geometry_tracker.clear();
+            return;
+        }
+        // editor 一覧に居なくなった HWND は tracker からも削除 (= stale 防止)。
+        self.vst_geometry_tracker.retain(|k, _| normalized.contains(k));
+
+        let presenter_win = Win32Hwnd(presenter_hwnd as *mut _);
+        let mut presenter_rect = Win32Rect::default();
+        if unsafe { GetWindowRect(presenter_win, &mut presenter_rect) }.is_err() {
+            return;
+        }
+        let dpi = unsafe { GetDpiForWindow(presenter_win) } as f32;
+        let ppp = (dpi / 96.0).max(1.0);
+        let top_band_px = (62.0_f32 * ppp).round() as i32; // 54pt + 8pt margin
+        let bottom_band_px = (54.0_f32 * ppp).round() as i32; // 46pt + 8pt margin
+        let titlebar_px = (30.0_f32 * ppp).round() as i32; // VST タイトルバー想定高さ
+        let presenter_top = presenter_rect.top;
+        let presenter_bottom = presenter_rect.bottom;
+        let zone_top_limit = presenter_top + top_band_px;
+        let zone_bottom_limit = presenter_bottom - bottom_band_px;
+
+        let now = Instant::now();
+        let debug = crate::video::native_presenter::hud_debug_enabled();
+
+        for raw in normalized {
+            let hwnd = Win32Hwnd(raw as *mut _);
+            let mut rect = Win32Rect::default();
+            if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
+                continue;
+            }
+            // 実機修正 (Codex 続編 P2 反映): 初回観測時は **pending=false** で挿入する。
+            // 旧版は or_insert_with で pending=true → 既に開いていた VST が overlapping
+            // 位置にあるだけで 250ms 後に勝手に動く症状になった。「drag/resize 後のみ動かす」
+            // 仕様にするには、初回観測 → 何もしない / その後 rect_changed が起きたら pending=true
+            // で 250ms 安定後に発火、という形にする。
+            let entry = self
+                .vst_geometry_tracker
+                .entry(raw)
+                .or_insert_with(|| (rect, now, false));
+            let rect_changed = entry.0.left != rect.left
+                || entry.0.top != rect.top
+                || entry.0.right != rect.right
+                || entry.0.bottom != rect.bottom;
+            if rect_changed {
+                entry.0 = rect;
+                entry.1 = now;
+                entry.2 = true;
+                continue;
+            }
+            if !entry.2 {
+                continue;
+            }
+            if now.duration_since(entry.1) < Duration::from_millis(250) {
+                continue;
+            }
+            entry.2 = false;
+
+            // マルチモニター安全 (Codex P1 #3): VST のタイトルバー中央点が presenter rect の内側に
+            // あるときだけ nudge する。上/横に別モニターで VST を動かした場合は nudge せず放置。
+            let titlebar_center_x = (rect.left + rect.right) / 2;
+            let titlebar_center_y = rect.top + titlebar_px / 2;
+            let inside_presenter = titlebar_center_x >= presenter_rect.left
+                && titlebar_center_x < presenter_rect.right
+                && titlebar_center_y >= presenter_rect.top
+                && titlebar_center_y < presenter_rect.bottom;
+            if !inside_presenter {
+                if debug {
+                    crate::logger::log(format!(
+                        "[HUD-DEBUG] vst overlap skip (off-monitor): hwnd=0x{raw:x} rect.top={} \
+                         titlebar_center=({},{}) presenter=({},{} {}x{})",
+                        rect.top,
+                        titlebar_center_x,
+                        titlebar_center_y,
+                        presenter_rect.left,
+                        presenter_rect.top,
+                        presenter_rect.right - presenter_rect.left,
+                        presenter_rect.bottom - presenter_rect.top,
+                    ));
+                }
+                continue;
+            }
+
+            // タイトルバー重なり判定 (Codex P1 #2):
+            //   - top 帯: タイトルバー上端 (= rect.top) が top 帯内 → 押し下げ
+            //   - bottom 帯: タイトルバー帯 (rect.top..rect.top+titlebar_px) が bottom 帯と交差 → 押し上げ
+            let titlebar_top = rect.top;
+            let titlebar_bot = rect.top + titlebar_px;
+            let overlaps_top_band = titlebar_top < zone_top_limit;
+            let overlaps_bottom_band =
+                titlebar_bot > zone_bottom_limit && titlebar_top < presenter_bottom;
+            let target_top = if overlaps_top_band {
+                Some(zone_top_limit)
+            } else if overlaps_bottom_band {
+                // タイトルバーを seek bar の上に出す: titlebar_bot == zone_bottom_limit になる位置
+                Some(zone_bottom_limit - titlebar_px)
+            } else {
+                None
+            };
+            if let Some(t) = target_top {
+                if t != rect.top {
+                    let ok = unsafe {
+                        SetWindowPos(
+                            hwnd,
+                            None,
+                            rect.left,
+                            t,
+                            0,
+                            0,
+                            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS,
+                        )
+                    }
+                    .is_ok();
+                    if debug {
+                        crate::logger::log(format!(
+                            "[HUD-DEBUG] vst overlap nudge: hwnd=0x{raw:x} old_top={} new_top={t} \
+                             overlaps_top={overlaps_top_band} overlaps_bottom={overlaps_bottom_band} ok={ok}",
+                            rect.top
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(windows)]
@@ -455,6 +676,10 @@ impl App {
             crate::video::native_window::NativeVideoWindowEvent::MouseLeave => {
                 self.native_video_pointer_down = None;
             }
+            // 内部処理イベント (presenter thread が直接消費する)。UI には届かない想定。
+            crate::video::native_window::NativeVideoWindowEvent::GeometryChanged { .. }
+            | crate::video::native_window::NativeVideoWindowEvent::DpiChanged { .. }
+            | crate::video::native_window::NativeVideoWindowEvent::RequestRaiseHud => {}
         }
     }
 
@@ -2375,6 +2600,25 @@ impl App {
             self.dsp_bridge.set_existing_guis_owner_to_hwnd(hwnd);
             self.native_video_owner_synced_hwnd = hwnd;
         }
+        // 実機修正 (2026-05-13 仕様修正): user_hidden は **clear しない**。
+        //
+        // ## 背景
+        // 2026-05-12 に「VST ボタン無反応」の修正として settings + runtime 双方の
+        // `user_hidden` を clear する実装を入れたが、ユーザー報告:
+        // 「設定に関係なくすべての VST プラグインが表示される。前回表示していたもののみが
+        //  表示される仕様」 — つまり個別 × で閉じた slot は VST ボタン全表示でも skip される
+        // のが正しい仕様。
+        //
+        // ## 当時の bug の真因 (推定)
+        // 原 bug 「VST ボタン押しても何も出ない」は user_hidden ではなく、cross-process
+        // `SetWindowPos(clamp)` で bridge が GUI スレッドタイムアウト → 自殺 →
+        // editor HWND が全部 stale、という別の問題が原因だった可能性が高い。
+        // clamp 削除後は bridge が安定するので、この user_hidden clear は不要になった。
+        //
+        // ## 個別表示再開の経路
+        // 個別に hide した slot を再表示したい場合は、VST3 設定パネルのチェーンスロット
+        // 行から GUI ボタンを押すことで個別に再表示できる (`show_native_video_vst3_slot_gui`
+        // が `user_hidden=false` を clear する)。
         self.dsp_bridge.set_all_guis_topmost(opening);
         std::sync::Arc::clone(&self.dsp_bridge).set_all_guis_visible_async(opening);
         self.settings.vst3_gui_visible = opening;
