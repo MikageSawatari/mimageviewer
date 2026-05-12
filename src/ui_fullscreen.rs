@@ -5471,9 +5471,6 @@ impl App {
             if let Some(v) = new_vol {
                 player.set_volume(v);
             }
-            if mute_key {
-                player.set_muted(!player.is_muted());
-            }
         }
 
         // 設定への反映 (player 借用は終わっているので self.settings を書き換え可能)。
@@ -5482,6 +5479,9 @@ impl App {
         if let Some(v) = new_vol {
             self.settings.video_volume = v;
             self.settings.save();
+        }
+        if mute_key {
+            self.toggle_video_session_mute_for_fs_idx(fs_idx);
         }
         if loop_key {
             // cycle_native_video_loop_common は app/native_video.rs (cfg(windows)) に

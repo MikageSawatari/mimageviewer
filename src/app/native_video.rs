@@ -833,8 +833,7 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
             return;
         }
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.set_muted(!player.is_muted());
+        if self.toggle_video_session_mute_for_fs_idx(fs_idx) {
             self.mark_native_video_hud_activity(ctx);
         }
     }
@@ -2465,8 +2464,8 @@ impl App {
             }
             // M: mute
             0x4D if !key.shift && !key.ctrl && !key.repeat => {
-                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    player.set_muted(!player.is_muted());
+                if self.toggle_video_session_mute_for_fs_idx(fs_idx) {
+                    self.mark_native_video_hud_activity(ctx);
                 }
             }
             // L: loop (4 段階サイクル: Off → Full → Chapter → Bookmark)

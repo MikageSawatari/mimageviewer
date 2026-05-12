@@ -2234,6 +2234,8 @@ pub struct App {
     pub(crate) cursor_hidden: bool,
     /// 動画倍速再生のセッション内設定。settings には保存しない。
     pub(crate) video_playback_speed: f64,
+    /// 動画ミュートのセッション内状態。settings には保存せず、次の VideoPlayer 作成時に引き継ぐ。
+    pub(crate) video_session_muted: bool,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
     /// 引いたらここへ転写する。バナー UI で「再起動」/「閉じる」が押されるまで
@@ -2961,6 +2963,7 @@ impl Default for App {
             cursor_last_activity: None,
             cursor_hidden: false,
             video_playback_speed: 1.0,
+            video_session_muted: false,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_restart_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -10487,6 +10490,19 @@ impl App {
         }
     }
 
+    /// 現在動画の mute を反転してセッション状態にも反映する。
+    /// 戻り値は `fs_idx` が生きている動画エントリだったかを表す。
+    pub(crate) fn toggle_video_session_mute_for_fs_idx(&mut self, fs_idx: usize) -> bool {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            let muted = !player.is_muted();
+            player.set_muted(muted);
+            self.video_session_muted = muted;
+            true
+        } else {
+            false
+        }
+    }
+
     /// 1枚のフルサイズ画像を非同期で読み込み開始する。
     /// 通常画像 / ZIP エントリ / PDF ページ の全てに対応。
     /// GIF / APNG はアニメーションフレームを全デコードして FsLoadResult::Animated を送信する。
@@ -10536,7 +10552,7 @@ impl App {
             native_output_config,
         );
         player.set_playback_speed(self.video_playback_speed);
-        if self.settings.video_start_muted || play_test_mute {
+        if self.settings.video_start_muted || play_test_mute || self.video_session_muted {
             player.set_muted(true);
         }
         player

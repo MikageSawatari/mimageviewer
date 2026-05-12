@@ -3236,11 +3236,6 @@ impl NativeEguiOverlay {
             !tile_overlay_visible && (jump_panel_visible_flag || right_panel_visible_flag);
         let panel_chrome_visible =
             !tile_overlay_visible && (top_bar_visible_flag || side_panel_visible);
-        // **bottom_hud_visible** は描画側 (`mod.rs:3091`) と完全一致させる。
-        // CP5 旧版は `hud_visible()` 単独だったが、Codex CP5 P2 #1 で「top bar や
-        // side panel 表示中も bottom HUD が描かれるのに region に下端帯がないと
-        // クリックが奪われる」問題を指摘されたので panel_chrome_visible も含める。
-        let bottom_hud_visible = self.hud_visible() || panel_chrome_visible;
         let normalize_scanning = matches!(
             self.normalize_state.ui_state,
             crate::video::normalize_types::NormalizeUiState::Scanning
@@ -3253,6 +3248,14 @@ impl NativeEguiOverlay {
             && self.first_frame_presented
             && self.video_error.is_none()
             && !normalize_scanning;
+        // **bottom_hud_visible** は描画側 (`render_once`) と完全一致させる。
+        // CP5 旧版は `hud_visible()` 単独だったが、Codex CP5 P2 #1 で「top bar や
+        // side panel 表示中も bottom HUD が描かれるのに region に下端帯がないと
+        // クリックが奪われる」問題を指摘されたので panel_chrome_visible も含める。
+        // paused center 表示中も下 HUD を常時 region に入れ、初回 click の hit-test
+        // 前フレーム未登録問題で mute / seek が無反応になるのを防ぐ。
+        let bottom_hud_visible =
+            self.hud_visible() || panel_chrome_visible || paused_center_visible;
 
         // 上 hover bar (= 実描画 54pt = overlay_draw:1546 と一致)。
         //
@@ -3688,7 +3691,6 @@ impl NativeEguiOverlay {
         let side_panel_visible =
             !tile_overlay_visible && (jump_panel_visible || right_panel_visible);
         let panel_chrome_visible = !tile_overlay_visible && (top_bar_visible || side_panel_visible);
-        let bottom_hud_visible = hud_visible || panel_chrome_visible;
         // Codex P1: Scanning 中は paused_center を出さない (スキャン用に pause している
         // のがバレないため + clickハンドラ TogglePlay/CloseFullscreen を抑制)。
         let normalize_scanning = matches!(
@@ -3701,6 +3703,7 @@ impl NativeEguiOverlay {
             && first_frame_presented
             && video_error.is_none()
             && !normalize_scanning;
+        let bottom_hud_visible = hud_visible || panel_chrome_visible || paused_center_visible;
         let perf_origin = egui::pos2(14.0, 14.0);
         // Codex 2周目 P1: normalize_scanning も overlay_visible / cursor_blocking_overlay_visible
         // に含める。さもないと HUD/Toast 等が出ていない状態で `if !overlay_visible { return; }`
