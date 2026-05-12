@@ -416,6 +416,13 @@ enum NativeVideoOutputCommand {
     /// CP1-6 までは送る側がないため dead code。CP7 で App から送り始める。
     #[allow(dead_code)]
     RaiseHudToTop,
+    /// native presenter HWND を presenter thread 側で前面に戻す。
+    ///
+    /// PrintScreen / Snipping Tool などで一度 foreground が外部プロセスへ移ったあと、
+    /// egui 側の黒 backdrop が presenter HWND より前に残ることがある。UI thread から
+    /// `SetWindowPos` すると DWM / presenter thread 待ちで固まるリスクがあるため、
+    /// command 経由で HWND 所有スレッドに再アサートさせる。
+    RaisePresenterToFront,
 }
 
 #[cfg(windows)]
@@ -774,6 +781,12 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::RaiseHudToTop);
+    }
+
+    fn request_presenter_raise(&self) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::RaisePresenterToFront);
     }
 
     fn set_normalize_overlay_state(
@@ -1524,6 +1537,9 @@ fn run_native_video_output(
                         &mut hud_raise_deadlines,
                         &mut last_hud_raise_at,
                     );
+                }
+                NativeVideoOutputCommand::RaisePresenterToFront => {
+                    let _ = crate::video::native_window::bring_to_front(window.hwnd().0 as u64);
                 }
                 NativeVideoOutputCommand::SwitchSource { payload } => {
                     native_drain_unpresented_queue(&mut source.queue);
@@ -3333,6 +3349,12 @@ impl VideoPlayer {
     pub fn request_hud_raise(&self) {
         if let Some(output) = self.native_output.as_ref() {
             output.request_hud_raise();
+        }
+    }
+
+    pub fn request_presenter_raise(&self) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.request_presenter_raise();
         }
     }
 

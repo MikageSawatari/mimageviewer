@@ -648,6 +648,11 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
 - **D3d11Frame の所有権**: native presenter thread が channel から受信して自身の Drop
   まで保持。次フレーム到着で旧 frame の Drop が NT HANDLE を `CloseHandle` する
   (= 描画中の HANDLE が close される race を防ぐ)
+- **z-order 復旧**: PrintScreen / Snipping Tool などで foreground が一時的に外部へ
+  移った後、egui 側の黒 backdrop が presenter より前に残る場合がある。UI thread から
+  `SetWindowPos` を直接呼ばず、mIV が foreground に戻っている間だけ App が
+  `RaisePresenterToFront` command を rate-limit 送信し、presenter 所有スレッド側で
+  `HWND_TOP` を再アサートする。
 
 ### フルスクリーン終了時の foreground 奪還
 

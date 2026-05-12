@@ -127,6 +127,26 @@ impl App {
             // 既存 HWND が継続しているケースでも、HUD HWND は遅延生成されることがあるので
             // bridge 側の登録値が古い (0) のままにならないよう毎フレーム refresh する。
             self.dsp_bridge.set_hud_hwnd(hud_hwnd);
+            // PrintScreen / Snipping Tool の範囲選択後に egui 側の黒 backdrop が
+            // presenter HWND より前に残ることがある。mIV が foreground に戻っている
+            // ときだけ、presenter 所有スレッドへ z-order 再アサートを依頼する。
+            let now = std::time::Instant::now();
+            let presenter_raise_due = self
+                .native_video_front_last_raise
+                .map(|last| now.duration_since(last) >= std::time::Duration::from_millis(250))
+                .unwrap_or(true);
+            if presenter_raise_due
+                && crate::video::native_window::foreground_belongs_to_current_process_strict()
+            {
+                if let Some(idx) = self.fullscreen_idx {
+                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+                        if player.native_presenter_hwnd() == hwnd {
+                            player.request_presenter_raise();
+                            self.native_video_front_last_raise = Some(now);
+                        }
+                    }
+                }
+            }
             // 実機修正 (2026-05-12 C): VST window が top/bottom bar 帯に重なっていたら
             // ドラッグ/リサイズ終了後に自動で押し出す。`SWP_ASYNCWINDOWPOS` で非同期
             // 送信なので bridge GUI スレッドをブロックしない (= 旧 clamp の crash 回避)。
