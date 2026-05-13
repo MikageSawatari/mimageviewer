@@ -30,7 +30,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
@@ -138,6 +138,60 @@ pub fn classify_open_error(e: &rusqlite::Error) -> OpenFailureKind {
     }
 }
 
+/// `rusqlite::Error` を `SettingsDbError` に変換する。
+///
+/// spec §5.1 に従い、open 経路 (open + PRAGMA + integrity_check + init_schema) の
+/// **どの段階で出たエラーでも** 一貫して分類する。Codex P1 2026-05-13 への対応。
+///
+/// 同時に primary code と extended_code を `settings_diag_log` に出力する
+/// (= `SystemIoFailure` などの内訳を後追いで特定可能にするため、spec §5.1 / P3 対応)。
+fn classify_rusqlite_error_for_open(e: rusqlite::Error, where_: &str) -> SettingsDbError {
+    if let rusqlite::Error::SqliteFailure(err, _) = &e {
+        log_diag(&format!(
+            "settings_db: {where_} sqlite error: primary={:?} extended={}",
+            err.code, err.extended_code
+        ));
+    } else {
+        log_diag(&format!("settings_db: {where_} error: {e}"));
+    }
+    match classify_open_error(&e) {
+        OpenFailureKind::Corrupted => SettingsDbError::Corrupted(format!("{where_}: {e}")),
+        OpenFailureKind::Permission => SettingsDbError::Permission(e),
+        OpenFailureKind::Transient => SettingsDbError::Transient(e),
+        OpenFailureKind::Other => SettingsDbError::Transient(e),
+    }
+}
+
+/// open エラーが `Transient` 分類かどうか (= retry 候補か)。
+fn is_transient_error(e: &SettingsDbError) -> bool {
+    matches!(e, SettingsDbError::Transient(_))
+}
+
+/// 診断ログヘルパ。`crate::settings::settings_diag_log` は private なので、
+/// 同等の append-only sink にここから書く (= `<data_dir>/logs/settings.log`)。
+///
+/// settings.rs の関数を pub にすると lib との二重定義になる + Phase 6 で
+/// 削除予定の経路が増えるため、ここでは独立した実装を持つ (両者が同じ
+/// settings.log に append するのは意図的)。
+fn log_diag(msg: &str) {
+    use std::io::Write;
+    crate::logger::log(msg);
+    let path = crate::data_dir::logs_dir().join("settings.log");
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{timestamp}] {msg}\n");
+    let _ = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .and_then(|mut f| f.write_all(line.as_bytes()));
+}
+
 // ---------------------------------------------------------------------------
 // SettingsDb
 // ---------------------------------------------------------------------------
@@ -160,20 +214,60 @@ struct Inner {
     last_saved_vst3_slots_hash: Option<u64>,
 }
 
+/// Transient 失敗時の retry 回数 + 間隔 (spec §5)。
+const OPEN_RETRY_ATTEMPTS: u32 = 3;
+const OPEN_RETRY_BACKOFF_MS: u64 = 50;
+
 impl SettingsDb {
     /// `<data_dir>/settings.db` を開く。
     ///
-    /// 既存 DB のフォーマット異常は `Corrupted` を返す。`Transient` なら呼出側で
-    /// retry / save 抑止のいずれかを判断する。
+    /// `Transient` 分類のエラーは spec §5 に従って 50ms backoff x 3 回まで自動 retry する。
+    /// `Corrupted` / `Permission` は retry しない (= 環境ステータスが変わらないと直らない)。
     pub fn open(data_dir: &Path) -> Result<Self, SettingsDbError> {
         let path = settings_db_path(data_dir);
         if let Some(parent) = path.parent() {
             // dir 作成失敗は無視 (= conn open でも同じエラーが出るのでそちらに任せる)。
             let _ = std::fs::create_dir_all(parent);
         }
-        let conn = open_with_pragmas(&path)?;
-        check_integrity(&conn)?;
-        init_schema(&conn)?;
+
+        let mut last_err: Option<SettingsDbError> = None;
+        for attempt in 0..OPEN_RETRY_ATTEMPTS {
+            match Self::try_open_once(&path) {
+                Ok(db) => {
+                    if attempt > 0 {
+                        log_diag(&format!(
+                            "settings_db: open succeeded on attempt {} after transient failure",
+                            attempt + 1
+                        ));
+                    }
+                    return Ok(db);
+                }
+                Err(e) if is_transient_error(&e) => {
+                    log_diag(&format!(
+                        "settings_db: open attempt {} failed (transient): {e}",
+                        attempt + 1
+                    ));
+                    last_err = Some(e);
+                    if attempt + 1 < OPEN_RETRY_ATTEMPTS {
+                        std::thread::sleep(std::time::Duration::from_millis(OPEN_RETRY_BACKOFF_MS));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err
+            .unwrap_or_else(|| SettingsDbError::Rusqlite(rusqlite::Error::QueryReturnedNoRows)))
+    }
+
+    /// open の 1 回ぶんの実行。pragma / integrity_check / init_schema を一気通貫で実行する。
+    /// 途中のどのステップで `rusqlite::Error` が出ても、`classify_rusqlite_error_for_open`
+    /// を通すことで Corrupted / Permission / Transient へ正しく分類される (Codex P1 対応)。
+    fn try_open_once(path: &Path) -> Result<Self, SettingsDbError> {
+        let conn = Connection::open(path)
+            .map_err(|e| classify_rusqlite_error_for_open(e, "Connection::open"))?;
+        apply_pragmas(&conn).map_err(|e| classify_rusqlite_error_for_open(e, "apply_pragmas"))?;
+        check_integrity_classified(&conn)?;
+        init_schema(&conn).map_err(|e| classify_rusqlite_error_for_open(e, "init_schema"))?;
 
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -357,16 +451,6 @@ fn is_family_filename(name: &str) -> bool {
 // open / pragmas / schema
 // ---------------------------------------------------------------------------
 
-fn open_with_pragmas(path: &Path) -> Result<Connection, SettingsDbError> {
-    let conn = Connection::open(path).map_err(|e| match classify_open_error(&e) {
-        OpenFailureKind::Corrupted => SettingsDbError::Corrupted(format!("open: {e}")),
-        OpenFailureKind::Permission => SettingsDbError::Permission(e),
-        OpenFailureKind::Transient | OpenFailureKind::Other => SettingsDbError::Transient(e),
-    })?;
-    apply_pragmas(&conn)?;
-    Ok(conn)
-}
-
 fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     // journal_mode=WAL は in-memory DB で no-op になるので silently ignore する
     // (rusqlite が "memory" を返すケース)。本番では WAL に切り替わる。
@@ -380,14 +464,19 @@ fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// `PRAGMA integrity_check` を回し、"ok" 以外なら `Corrupted` を返す。
-fn check_integrity(conn: &Connection) -> Result<(), SettingsDbError> {
+/// `PRAGMA integrity_check(1)` を回し、SQLite エラーは open 系として分類、
+/// 戻り文字列が "ok" 以外なら `Corrupted` を返す (Codex P1 対応で旧
+/// `check_integrity` を retire したものの代替)。
+fn check_integrity_classified(conn: &Connection) -> Result<(), SettingsDbError> {
     let result: String = conn
         .query_row("PRAGMA integrity_check(1)", [], |row| row.get(0))
-        .map_err(SettingsDbError::Rusqlite)?;
+        .map_err(|e| classify_rusqlite_error_for_open(e, "integrity_check"))?;
     if result.eq_ignore_ascii_case("ok") {
         Ok(())
     } else {
+        log_diag(&format!(
+            "settings_db: integrity_check returned non-ok: {result}"
+        ));
         Err(SettingsDbError::Corrupted(format!(
             "integrity_check returned: {result}"
         )))
@@ -1328,6 +1417,9 @@ mod tests {
 
     #[test]
     fn open_corrupted_file_reports_corrupted() {
+        // Codex P1 (2026-05-13) 対応: open / PRAGMA / integrity_check / init_schema の
+        // どの段階で NotADatabase が surface しても `Corrupted` に分類されるべき。
+        // `Rusqlite` や `Transient` で逃げる挙動は許容しない。
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("settings.db");
         // 「SQLite ヘッダではない」16 バイトを書く。
@@ -1336,17 +1428,61 @@ mod tests {
             Ok(_) => panic!("should fail to open a non-sqlite file"),
             Err(e) => e,
         };
-        // Connection::open は遅延 open なので NotADatabase が出るのは最初のクエリ。
-        // 我々は pragma 適用で必ずクエリするので、ここでは Corrupted か Transient を許容する
-        // (環境によっては NotADatabase が SqliteFailure 経由で来ない場合がある)。
         assert!(
-            matches!(
-                err,
-                SettingsDbError::Corrupted(_)
-                    | SettingsDbError::Rusqlite(_)
-                    | SettingsDbError::Transient(_)
-            ),
-            "expected Corrupted/Rusqlite/Transient, got: {err:?}"
+            matches!(err, SettingsDbError::Corrupted(_)),
+            "expected Corrupted, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn classify_open_error_categories() {
+        // Codex P1 (2026-05-13) 補強: 分類関数の挙動が spec §5.1 と一致するか直接確認する。
+        fn make_err(code: rusqlite::ErrorCode) -> rusqlite::Error {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code,
+                    extended_code: 0,
+                },
+                None,
+            )
+        }
+        use rusqlite::ErrorCode::*;
+        assert_eq!(
+            classify_open_error(&make_err(NotADatabase)),
+            OpenFailureKind::Corrupted
+        );
+        assert_eq!(
+            classify_open_error(&make_err(DatabaseCorrupt)),
+            OpenFailureKind::Corrupted
+        );
+        assert_eq!(
+            classify_open_error(&make_err(DatabaseBusy)),
+            OpenFailureKind::Transient
+        );
+        assert_eq!(
+            classify_open_error(&make_err(DatabaseLocked)),
+            OpenFailureKind::Transient
+        );
+        assert_eq!(
+            classify_open_error(&make_err(CannotOpen)),
+            OpenFailureKind::Transient
+        );
+        assert_eq!(
+            classify_open_error(&make_err(SystemIoFailure)),
+            OpenFailureKind::Transient
+        );
+        assert_eq!(
+            classify_open_error(&make_err(PermissionDenied)),
+            OpenFailureKind::Permission
+        );
+        assert_eq!(
+            classify_open_error(&make_err(ReadOnly)),
+            OpenFailureKind::Permission
+        );
+        // Non-SqliteFailure variants -> Other (= retry 候補にする側)
+        assert_eq!(
+            classify_open_error(&rusqlite::Error::QueryReturnedNoRows),
+            OpenFailureKind::Other
         );
     }
 }
