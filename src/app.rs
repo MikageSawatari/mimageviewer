@@ -3669,25 +3669,33 @@ impl App {
             }
         }
 
-        // 画像ファイル名集合 (カタログ掃除用キー)
+        // 画像ファイル名集合 (カタログ掃除用キー)。pinned 形式 (`{base}#pin:{source_id}`)
+        // も含めることで、`delete_missing` がピン由来の cache 行を巻き添えで消さない
+        // (Codex Phase B P2 指摘)。pin DB lookup は load_folder 1 回あたり 1 度だけ実行。
+        let pin_map_for_existing: std::collections::HashMap<
+            String,
+            crate::folder_thumb_pins::FolderPinSource,
+        > = if let Some(db) = self.folder_thumb_pin_db.as_ref() {
+            let containers: Vec<&std::path::Path> = items
+                .iter()
+                .filter_map(|it| match it {
+                    GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+                        Some(p.as_path())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if containers.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                db.lookup_many(containers)
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
-            .filter_map(|it| match it {
-                GridItem::Image(p) => p.file_name()?.to_str().map(String::from),
-                GridItem::ZipFile(p) => {
-                    let fname = p.file_name()?.to_str()?;
-                    Some(format!("{}{fname}", CACHE_KEY_ZIP))
-                }
-                GridItem::PdfFile(p) => {
-                    let fname = p.file_name()?.to_str()?;
-                    Some(format!("{}{fname}", CACHE_KEY_PDF))
-                }
-                GridItem::Folder(p) => {
-                    let fname = p.file_name()?.to_str()?;
-                    Some(format!("{}{fname}", CACHE_KEY_FOLDER))
-                }
-                _ => None,
-            })
+            .flat_map(|it| folder_thumb_existing_keys_for(it, &pin_map_for_existing))
             .collect();
 
         // 訪問時自動索引化は廃止。「名前」フル索引化 ON のお気に入りのみ
@@ -4750,23 +4758,31 @@ impl App {
         self.favsearch.results_paths = results.iter().map(|e| e.path.clone()).collect();
 
         let synthetic = search_results_synthetic_path();
+        // pinned 形式の cache 行も保護対象に入れる (Codex Phase B P2 指摘、load_folder と同様)。
+        let pin_map_for_existing: std::collections::HashMap<
+            String,
+            crate::folder_thumb_pins::FolderPinSource,
+        > = if let Some(db) = self.folder_thumb_pin_db.as_ref() {
+            let containers: Vec<&std::path::Path> = items
+                .iter()
+                .filter_map(|it| match it {
+                    GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+                        Some(p.as_path())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if containers.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                db.lookup_many(containers)
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
-            .filter_map(|it| match it {
-                GridItem::Folder(p) => p
-                    .file_name()?
-                    .to_str()
-                    .map(|n| format!("{}{n}", CACHE_KEY_FOLDER)),
-                GridItem::ZipFile(p) => p
-                    .file_name()?
-                    .to_str()
-                    .map(|n| format!("{}{n}", CACHE_KEY_ZIP)),
-                GridItem::PdfFile(p) => p
-                    .file_name()?
-                    .to_str()
-                    .map(|n| format!("{}{n}", CACHE_KEY_PDF)),
-                _ => None,
-            })
+            .flat_map(|it| folder_thumb_existing_keys_for(it, &pin_map_for_existing))
             .collect();
         self.start_loading_items(
             synthetic,
@@ -15985,7 +16001,14 @@ fn make_load_request(
                 cache_key_override: Some(base_key.clone()),
                 ..base
             };
-            Some(apply_folder_thumb_pin(req, p, &base_key, pin_map, pdf_password))
+            Some(apply_folder_thumb_pin(
+                req,
+                p,
+                &base_key,
+                ContainerKindForPin::ZipFile,
+                pin_map,
+                pdf_password,
+            ))
         }
         GridItem::PdfFile(p) => {
             let fname = p
@@ -16001,7 +16024,14 @@ fn make_load_request(
                 cache_key_override: Some(base_key.clone()),
                 ..base
             };
-            Some(apply_folder_thumb_pin(req, p, &base_key, pin_map, pdf_password))
+            Some(apply_folder_thumb_pin(
+                req,
+                p,
+                &base_key,
+                ContainerKindForPin::PdfFile,
+                pin_map,
+                pdf_password,
+            ))
         }
         GridItem::Folder(p) => {
             let fname = p
@@ -16017,7 +16047,14 @@ fn make_load_request(
                 folder_thumb_depth,
                 ..base
             };
-            Some(apply_folder_thumb_pin(req, p, &base_key, pin_map, pdf_password))
+            Some(apply_folder_thumb_pin(
+                req,
+                p,
+                &base_key,
+                ContainerKindForPin::Folder,
+                pin_map,
+                pdf_password,
+            ))
         }
         GridItem::SearchContainer {
             representative: Some(rep),
@@ -16049,6 +16086,98 @@ fn make_load_request(
     }
 }
 
+/// 1 つの GridItem に対応する catalog cache key を全部 (base + pinned) 返す。
+///
+/// `delete_missing` に渡す `existing_keys` の構築に使う。pinned 形式
+/// (`{base}#pin:{source_id}`) を含めないと、`apply_folder_thumb_pin` が書いた
+/// 行が毎回のフォルダロードで catalog から削除されて再生成が走り続ける
+/// (Codex Phase B P2 指摘)。
+fn folder_thumb_existing_keys_for(
+    item: &GridItem,
+    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+) -> Vec<String> {
+    let (container_path, base_key) = match item {
+        GridItem::Image(p) => {
+            // Image はそもそも pinned 経路に乗らないので 1 つだけ。
+            return p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| vec![n.to_string()])
+                .unwrap_or_default();
+        }
+        GridItem::Folder(p) => (p, {
+            let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
+                return Vec::new();
+            };
+            format!("{}{fname}", CACHE_KEY_FOLDER)
+        }),
+        GridItem::ZipFile(p) => (p, {
+            let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
+                return Vec::new();
+            };
+            format!("{}{fname}", CACHE_KEY_ZIP)
+        }),
+        GridItem::PdfFile(p) => (p, {
+            let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
+                return Vec::new();
+            };
+            format!("{}{fname}", CACHE_KEY_PDF)
+        }),
+        _ => return Vec::new(),
+    };
+
+    let mut keys = vec![base_key.clone()];
+    let container_key = crate::path_key::normalize_keep_drive(container_path);
+    if let Some(source) = pin_map.get(&container_key) {
+        if let Some(resolved) =
+            crate::folder_thumb_pins::resolve_pin_target(container_path, source)
+        {
+            keys.push(format!(
+                "{}{}{}",
+                base_key,
+                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+                resolved.source_id,
+            ));
+        }
+    }
+    keys
+}
+
+/// `apply_folder_thumb_pin` 用の container kind discriminator。
+/// 互換性検査 (container と source の組合せが妥当か) に使う。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContainerKindForPin {
+    Folder,
+    ZipFile,
+    PdfFile,
+}
+
+/// container と source の組合せが妥当か検査する。
+///
+/// 妥当な組合せ:
+/// - **Folder**: 全 source 形を受け入れる (File/ZipEntry/PdfPage)。
+///   - ただし ZipEntry / PdfPage は `*_rel` が **空でない** (= サブの ZIP/PDF を指す) ことを要求。
+/// - **ZipFile**: `ZipEntry { zip_rel: "" }` のみ (= container 自身の中身)
+/// - **PdfFile**: `PdfPage { pdf_rel: "" }` のみ
+fn pin_source_compatible_with_container(
+    container: ContainerKindForPin,
+    source: &crate::folder_thumb_pins::FolderPinSource,
+) -> bool {
+    use crate::folder_thumb_pins::FolderPinSource as S;
+    match (container, source) {
+        // Folder は何でも受け入れる (ただし内側参照 (`_rel==""`) は不可)
+        (ContainerKindForPin::Folder, S::File { .. }) => true,
+        (ContainerKindForPin::Folder, S::ZipEntry { zip_rel, .. }) => !zip_rel.is_empty(),
+        (ContainerKindForPin::Folder, S::PdfPage { pdf_rel, .. }) => !pdf_rel.is_empty(),
+        // ZipFile は内側 ZipEntry のみ
+        (ContainerKindForPin::ZipFile, S::ZipEntry { zip_rel, .. }) => zip_rel.is_empty(),
+        (ContainerKindForPin::ZipFile, _) => false,
+        // PdfFile は内側 PdfPage のみ
+        (ContainerKindForPin::PdfFile, S::PdfPage { pdf_rel, .. }) => pdf_rel.is_empty(),
+        (ContainerKindForPin::PdfFile, _) => false,
+    }
+}
+
 /// 親コンテナ用 `LoadRequest` (Folder/ZipFile/PdfFile) に対し、手動ピンがあれば
 /// target 種別のリクエストに書き換える。
 ///
@@ -16074,6 +16203,7 @@ fn apply_folder_thumb_pin(
     base_req: LoadRequest,
     container: &std::path::Path,
     base_key: &str,
+    container_kind: ContainerKindForPin,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     pdf_password: Option<&str>,
 ) -> LoadRequest {
@@ -16081,6 +16211,17 @@ fn apply_folder_thumb_pin(
     let Some(source) = pin_map.get(&container_key) else {
         return base_req;
     };
+    // container / source の不整合を弾く (Codex Phase B P2 指摘)。
+    // UI 経由では発生しないが、DB 行汚染 / 将来のスキーマ変更で起き得る。
+    if !pin_source_compatible_with_container(container_kind, source) {
+        crate::logger::log(format!(
+            "folder_thumb_pin: incompatible source for container {} (kind={:?}, source={:?}) — falling back",
+            container.display(),
+            container_kind,
+            source,
+        ));
+        return base_req;
+    }
     let Some(resolved) = crate::folder_thumb_pins::resolve_pin_target(container, source) else {
         crate::logger::log(format!(
             "folder_thumb_pin: target unresolved for {} (source={:?}) — falling back to auto-select",

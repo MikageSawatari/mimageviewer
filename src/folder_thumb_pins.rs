@@ -407,6 +407,12 @@ pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<
     let meta = std::fs::metadata(&abs_path).ok()?;
     let mtime = crate::ui_helpers::mtime_secs(&meta);
     let file_size = meta.len() as i64;
+    // 注: ZipEntry / PdfPage の場合、ここで取る mtime/file_size は **container 全体**
+    // の値 (ZIP/PDF ファイル自身)。非ピン経路の ZipImage は entry の uncompressed size と
+    // ZIP の mtime を使うのに対し、ピン経路は粒度が粗い (= container 全体が変わったとき
+    // だけ再生成)。ZIP / PDF が部分書き換えされても mtime が動くので実害は限定的、
+    // entry 単位の granularity が必要なケースが出てきたら entry metadata を別途
+    // 取得する経路を追加する (Codex Phase B P3 指摘)。
 
     // source_id: cache key の suffix として使う。フォーマット例:
     //   "image|cover.jpg|-|-|1700000000|524288"
