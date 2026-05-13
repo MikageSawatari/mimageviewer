@@ -2169,15 +2169,20 @@ impl Settings {
             db_loaded && !MAIN_UNREADABLE_THIS_SESSION.load(Ordering::Relaxed)
         ));
 
-        // 何かしら値が変わったなら書き戻して永続化する。db_loaded == false なら save() が
-        // 即 return するので無害。
+        // 何かしら値が変わったなら書き戻して永続化する。db_loaded == false なら
+        // save_internal が即 return するので無害。
+        //
+        // Codex P2 v13 (2026-05-14): この writeback は **bootstrap save** なので
+        // `save_internal_no_rotation` を使う。spec §6.1 で rotation は「**user** save の
+        // 最初の 1 回」と定義されており、`load()` 内の migration/version 書き戻しで
+        // rotation を消費すると次の真の user save が in-place 書込みになってしまう。
         if vst3_migrated
             || autoplay_mode_migrated
             || video_loop_migrated
             || video_volume_sanitized
             || version_changed
         {
-            settings.save();
+            settings.save_internal_no_rotation();
         }
         settings
     }
@@ -2336,7 +2341,7 @@ impl Settings {
         self.vst3_chain_slots = std::mem::take(&mut src.vst3_chain_slots);
     }
 
-    /// 設定を永続化する (Phase 3: SQLite ベース)。
+    /// 設定を永続化する (Phase 3: SQLite ベース、user save 用)。
     ///
     /// プロセス内最初の user save で 1 回だけ `settings.db.bak1..bak10` を世代ローテし
     /// (`BACKUP_DONE_THIS_SESSION`)、それ以降は in-place で `save_full` のみ実行する。
@@ -2355,6 +2360,18 @@ impl Settings {
                 caller.line()
             ));
         }
+        self.save_internal(/* allow_rotation = */ true);
+    }
+
+    /// `Settings::load` 内部の writeback (migration / version_changed) 専用の保存経路
+    /// (Codex P2 v13 2026-05-14)。**世代 rotation を発火させない / `BACKUP_DONE_THIS_SESSION`
+    /// flag も立てない** ことで、spec §6.1 の「プロセス最初の **user save** で 1 回 rotate」
+    /// 規約を維持する。
+    fn save_internal_no_rotation(&self) {
+        self.save_internal(false);
+    }
+
+    fn save_internal(&self, allow_rotation: bool) {
         // session-wide 抑止フラグ。
         // - `MAIN_UNREADABLE_THIS_SESSION`: settings.rs 上の抑止 (旧来から維持)
         // - `settings_db::save_suppressed()`: settings_db 側の抑止 (Phase 2 で追加)
@@ -2374,7 +2391,15 @@ impl Settings {
         };
 
         let data_dir = crate::data_dir::get();
-        let did_rotate = !BACKUP_DONE_THIS_SESSION.swap(true, Ordering::Relaxed);
+        // Codex P2 v13 (2026-05-14): allow_rotation == false のときは
+        // `BACKUP_DONE_THIS_SESSION` を **触らずに** rotation を skip する。
+        // load() 内の migration / version_changed 用 bootstrap save が次回の user save の
+        // rotation を消費してしまう事故 (= spec §6.1 違反) を防ぐ。
+        let did_rotate = if allow_rotation {
+            !BACKUP_DONE_THIS_SESSION.swap(true, Ordering::Relaxed)
+        } else {
+            false
+        };
 
         // 全体を with_db_result でラップする。global handle が無ければ即 Err。
         let result = crate::settings_db::with_db_result(|db| {
@@ -3884,6 +3909,35 @@ mod tests {
                 "corrupt main should be quarantined as .corrupted-*"
             );
             let _ = env;
+        }
+
+        /// Codex P2 v13 (2026-05-14): `Settings::load()` 内の migration/version
+        /// writeback が rotation を消費しないこと。次の真の user save が初めて
+        /// rotation を発火させて bak1 を作る。
+        #[test]
+        fn load_writeback_does_not_consume_rotation() {
+            let env = setup_backup_env();
+            // 初回 boot で clean install → settings.db 作成。load() 内部で
+            // version_changed=true なので save_internal_no_rotation が走る。
+            // ここで rotation が走ってしまっていないか確認する。
+            let _ = Settings::load();
+            // bak1 はまだ無いはず (= load() 内 writeback が rotation を発火させていない)。
+            assert!(
+                !db_bak_path(&env, 1).exists(),
+                "load()-internal writeback must NOT trigger rotation (bak1 should not exist yet)"
+            );
+            // BACKUP_DONE_THIS_SESSION も立っていないはず。
+            assert!(
+                !BACKUP_DONE_THIS_SESSION.load(Ordering::Relaxed),
+                "BACKUP_DONE_THIS_SESSION must not be set by load()-internal save"
+            );
+            // 次の **user** save で初めて rotation が走り bak1 が作られる。
+            let s = settings_with_favorite("real_user_save");
+            s.save();
+            assert!(
+                db_bak_path(&env, 1).exists(),
+                "first user save() should now create bak1 (rotation finally consumed)"
+            );
         }
 
         /// diag log がブート経路を 1 行記録する (Codex P2 #3 の SQLite 等価)。
