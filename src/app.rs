@@ -2604,10 +2604,24 @@ pub struct App {
 }
 
 impl Default for App {
+    /// Phase 4 (spec §8): 並列 `Settings::load()` 撲滅のため `App::new_from_settings` を
+    /// 直接呼ぶのが本筋。`Default` は内部で `Settings::load()` を呼ぶ後方互換 shim として
+    /// 残置 (app/tests.rs などの旧コード用)。production main.rs は
+    /// [`App::new_from_settings`] を経由するので、ここの `Settings::load` は **runtime には
+    /// 走らない** (= boot race の元にならない)。
     fn default() -> Self {
+        Self::new_from_settings(crate::settings::Settings::load())
+    }
+}
+
+impl App {
+    /// 起動時の保存済み設定 `saved` を受け取って App を構築する (Phase 4)。
+    ///
+    /// spec §8 で並列 `Settings::load()` を撲滅した結果、production では main thread の
+    /// `Settings::load()` が唯一の呼び出し点になっており、その結果を ここに引き渡す。
+    pub fn new_from_settings(settings: crate::settings::Settings) -> Self {
         let (tx, rx) = mpsc::channel();
         let (pdf_ct_tx, pdf_ct_rx) = mpsc::channel();
-        let settings = crate::settings::Settings::load();
         let ai_upscale_enabled = settings.ai_upscale_enabled;
         let ai_upscale_model_override = settings
             .ai_upscale_model_override
@@ -8363,6 +8377,10 @@ impl App {
     /// 次のユーザー操作で即座に DFS を畳めるようにする。
     fn spawn_folder_nav(&mut self, current: PathBuf, forward: bool, mode: FolderNavMode) {
         let skip_limit = self.settings.folder_skip_limit;
+        // Phase 4 (spec §8): `folder_tree::*_dfs` は内部で `Settings::load()` を呼ばず
+        // 呼び出し側から `FolderTreeOptions` を受ける形に変更済み。ここで一度だけ
+        // 値をスナップショットして worker thread に move する。
+        let tree_opts = crate::folder_tree::FolderTreeOptions::from_settings(&self.settings);
         let (tx, rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
@@ -8394,9 +8412,19 @@ impl App {
                 );
             }
             let outcome = if forward {
-                navigate_folder_with_skip(&current, next_folder_dfs, skip_limit, Some(&cancel_w))
+                navigate_folder_with_skip(
+                    &current,
+                    |p| next_folder_dfs(p, tree_opts),
+                    skip_limit,
+                    Some(&cancel_w),
+                )
             } else {
-                navigate_folder_with_skip(&current, prev_folder_dfs, skip_limit, Some(&cancel_w))
+                navigate_folder_with_skip(
+                    &current,
+                    |p| prev_folder_dfs(p, tree_opts),
+                    skip_limit,
+                    Some(&cancel_w),
+                )
             };
             let dfs_ms = t0.elapsed().as_secs_f64() * 1000.0;
 

@@ -598,20 +598,27 @@ fn main() -> eframe::Result {
     susie_loader::ensure_worker_extracted();
     emit_startup("susie_worker_extract", Some(t));
 
-    // Susie プラグインワーカープール: バックグラウンドで初期化する
-    // (プラグインが多いと handshake に数百ms かかる可能性があるため、
-    //  起動 UI をブロックしないようスレッドに逃がす)
-    std::thread::Builder::new()
-        .name("susie-init".to_string())
-        .spawn(|| {
-            let _ = susie_loader::get_pool();
-        })
-        .ok();
-
-    // 保存済み設定からウィンドウ初期状態を決定する
+    // 保存済み設定 (= spec §8 で main thread の **唯一の** `Settings::load()` 呼び出し)。
+    // Phase 4 で susie-init / folder_tree / app::default の Settings::load() を撲滅した
+    // 結果、起動時に Settings::load() が走るのはここだけ。`saved` を後段の Susie 初期化、
+    // ウィンドウ位置、`App::default` などすべてに引き回す。
     let t = Instant::now();
     let saved = settings::Settings::load();
     emit_startup("settings_load", Some(t));
+
+    // Susie プラグインワーカープール: バックグラウンドで初期化する
+    // (プラグインが多いと handshake に数百ms かかる可能性があるため、
+    //  起動 UI をブロックしないようスレッドに逃がす)。
+    // Phase 4 (spec §8.2): worker 内では `Settings::load()` を呼ばず、main で
+    // 既に読んだ `saved` から値を引き渡す。
+    let susie_enabled = saved.susie_enabled;
+    let susie_parallel = saved.susie_allow_parallel;
+    std::thread::Builder::new()
+        .name("susie-init".to_string())
+        .spawn(move || {
+            susie_loader::init_pool(susie_enabled, susie_parallel);
+        })
+        .ok();
 
     let default_size = [1280.0_f32, 800.0_f32];
     // --window-size WxH 引数があればそれを優先（スクリーンショット用）
@@ -702,7 +709,9 @@ fn main() -> eframe::Result {
             os_theme::apply_resolved(&cc.egui_ctx, resolved);
             emit_startup("apply_theme", Some(t));
             let t = Instant::now();
-            let mut app = app::App::default();
+            // Phase 4 (spec §8): `App::default()` は後方互換 shim として残置。production
+            // では事前に読んだ `saved` を直接受け取って boot race を完全に排除する。
+            let mut app = app::App::new_from_settings(saved.clone());
             emit_startup("app_default", Some(t));
             if let Some(config) = play_test_config.clone() {
                 app.configure_play_test(config);

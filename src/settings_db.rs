@@ -30,7 +30,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 

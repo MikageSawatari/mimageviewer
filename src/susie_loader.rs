@@ -434,19 +434,29 @@ impl Drop for SusieWorkerPool {
 
 static POOL: OnceLock<RwLock<Arc<SusieWorkerPool>>> = OnceLock::new();
 
-/// 初回呼び出し時にプールを起動する (アプリ起動直後などで一度呼ぶ想定)。
-/// 再起動は `reload()` を使う。
-pub fn get_pool() -> Arc<SusieWorkerPool> {
-    let lock = POOL.get_or_init(|| {
-        let settings = crate::settings::Settings::load();
-        let enabled = settings.susie_enabled;
-        let parallel = settings.susie_allow_parallel;
+/// プールを **明示的に** 初期化する (Phase 4: spec §8.2 2026-05-14)。
+///
+/// 旧版 `get_pool()` は内部で `Settings::load()` を呼んでいたが、Phase 4 で並列
+/// `Settings::load()` を撲滅するため、`main.rs` の起動シーケンスから一度だけ呼ぶ
+/// `init_pool(enabled, parallel)` に分離した。複数回呼ぶと最初の値が採用される。
+pub fn init_pool(enabled: bool, parallel: bool) {
+    POOL.get_or_init(|| {
         if enabled {
             RwLock::new(Arc::new(SusieWorkerPool::start(parallel)))
         } else {
             RwLock::new(Arc::new(empty_pool()))
         }
     });
+}
+
+/// 初期化済みプールへのハンドルを返す (アプリ全体の Susie 経路で使う)。
+///
+/// **`init_pool()` が事前に呼ばれている前提**。万一それより前に呼ばれた場合は
+/// 安全側として「無効化された (= 空) プール」を遅延初期化して返し、Susie 機能だけ
+/// silently 無効化する (= プロセス全体は引き続き動く)。`Settings::load()` には
+/// 戻さない (= boot race 防止、spec §8.2)。
+pub fn get_pool() -> Arc<SusieWorkerPool> {
+    let lock = POOL.get_or_init(|| RwLock::new(Arc::new(empty_pool())));
     Arc::clone(&lock.read().unwrap())
 }
 

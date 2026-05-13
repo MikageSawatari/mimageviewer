@@ -10,6 +10,39 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Ctrl+↑↓ DFS / `sorted_subdirs` の挙動を変える設定パラメータ。
+///
+/// Phase 4 (spec §8, Codex P2 v13b フォロー) で `Settings::load()` を内部で呼ぶ代わりに、
+/// 呼び出し側 (`App` 等) が `Settings` を一度だけ読み、ここに必要な値だけ詰めて渡す。
+/// これで `folder_tree` モジュールは `crate::settings` に runtime 依存しなくなる
+/// (= ナビゲーション中の並列 `Settings::load()` 起動を撲滅、boot race を消す)。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FolderTreeOptions {
+    /// 同名フォルダがある ZIP をスキップする (= `Settings.skip_zip_if_folder_exists`)。
+    pub skip_zip: bool,
+    /// サブフォルダ / ZIP のソート順 (= `Settings.sort_order`)。
+    pub sort_order: crate::settings::SortOrder,
+}
+
+impl FolderTreeOptions {
+    /// `Settings` から関連フィールドだけ抜き出す convenience。
+    pub fn from_settings(settings: &crate::settings::Settings) -> Self {
+        Self {
+            skip_zip: settings.skip_zip_if_folder_exists,
+            sort_order: settings.sort_order,
+        }
+    }
+}
+
+impl Default for FolderTreeOptions {
+    fn default() -> Self {
+        Self {
+            skip_zip: true,
+            sort_order: crate::settings::SortOrder::default(),
+        }
+    }
+}
+
 // -----------------------------------------------------------------------
 // サポート拡張子
 // -----------------------------------------------------------------------
@@ -209,20 +242,20 @@ where
 
 /// 深さ優先前順で次のフォルダを返す。
 /// 子があれば最初の子、なければ次の兄弟、なければ祖先の次の兄弟。
-pub fn next_folder_dfs(current: &Path) -> Option<PathBuf> {
+pub fn next_folder_dfs(current: &Path, opts: FolderTreeOptions) -> Option<PathBuf> {
     // 1. 子フォルダがあれば最初の子へ
-    if let Some(first_child) = sorted_subdirs(current).into_iter().next() {
+    if let Some(first_child) = sorted_subdirs(current, opts).into_iter().next() {
         return Some(first_child);
     }
     // 2. 子がなければ、次の兄弟または祖先の次の兄弟を探す
-    next_sibling_or_ancestor_sibling(current)
+    next_sibling_or_ancestor_sibling(current, opts)
 }
 
 /// 深さ優先前順で前のフォルダを返す。
 /// 前の兄弟がいればその最後の子孫、最初の子であれば親。
-pub fn prev_folder_dfs(current: &Path) -> Option<PathBuf> {
+pub fn prev_folder_dfs(current: &Path, opts: FolderTreeOptions) -> Option<PathBuf> {
     let parent = current.parent()?;
-    let siblings = sorted_subdirs(parent);
+    let siblings = sorted_subdirs(parent, opts);
     let pos = siblings.iter().position(|s| path_eq(s, current))?;
 
     if pos == 0 {
@@ -230,28 +263,28 @@ pub fn prev_folder_dfs(current: &Path) -> Option<PathBuf> {
         Some(parent.to_path_buf())
     } else {
         // 前の兄弟の最後の子孫へ
-        Some(last_descendant_dir(&siblings[pos - 1]))
+        Some(last_descendant_dir(&siblings[pos - 1], opts))
     }
 }
 
 /// path の次の兄弟を返す。兄弟がなければ親で再帰する。
-fn next_sibling_or_ancestor_sibling(path: &Path) -> Option<PathBuf> {
+fn next_sibling_or_ancestor_sibling(path: &Path, opts: FolderTreeOptions) -> Option<PathBuf> {
     let parent = path.parent()?;
-    let siblings = sorted_subdirs(parent);
+    let siblings = sorted_subdirs(parent, opts);
     let pos = siblings.iter().position(|s| path_eq(s, path))?;
 
     if pos + 1 < siblings.len() {
         Some(siblings[pos + 1].clone())
     } else {
-        next_sibling_or_ancestor_sibling(parent)
+        next_sibling_or_ancestor_sibling(parent, opts)
     }
 }
 
 /// path の最も深い最後の子孫フォルダを返す（子がなければ path 自身）。
-fn last_descendant_dir(path: &Path) -> PathBuf {
-    let children = sorted_subdirs(path);
+fn last_descendant_dir(path: &Path, opts: FolderTreeOptions) -> PathBuf {
+    let children = sorted_subdirs(path, opts);
     match children.last() {
-        Some(last) => last_descendant_dir(last),
+        Some(last) => last_descendant_dir(last, opts),
         None => path.to_path_buf(),
     }
 }
@@ -322,14 +355,13 @@ pub fn walk_dirs_recursive_with_progress(
 
 /// path 配下の "子フォルダ + .zip ファイル" をソート済みで返す。
 /// .zip もナビゲーション対象として扱う (タスク 3)。
-pub fn sorted_subdirs(path: &Path) -> Vec<PathBuf> {
-    // 同名フォルダがある ZIP をスキップするかの設定を読み込む。
-    // Phase 7.E: ユーザー設定の sort_order も流用してグリッド表示順と Ctrl+↑↓ DFS 順を
-    // 一致させる (旧: 常に lowercase 名前順 → 日付順設定のユーザーが「上下逆」に感じる
-    // 不具合の解消)。
-    let settings = crate::settings::Settings::load();
-    let skip_zip = settings.skip_zip_if_folder_exists;
-    let sort_order = settings.sort_order;
+///
+/// Phase 4 (spec §8): 旧版は内部で `Settings::load()` を呼んでいたが、boot race を
+/// 撲滅するため `FolderTreeOptions` を呼び出し側から受け取る形に変更
+/// (= ナビ中の並列 Settings::load() を 0 件に)。
+pub fn sorted_subdirs(path: &Path, opts: FolderTreeOptions) -> Vec<PathBuf> {
+    let skip_zip = opts.skip_zip;
+    let sort_order = opts.sort_order;
 
     // (PathBuf, mtime_secs) を蓄積。ソート時に mtime と name を引く。
     let mut dirs: Vec<(PathBuf, i64)> = Vec::new();
@@ -661,7 +693,8 @@ mod tests {
         let order = [a, a1, a2, b, c, c1];
         let mut cur = root.clone();
         for expected in order {
-            let next = next_folder_dfs(&cur).expect("next_folder_dfs Some");
+            let next =
+                next_folder_dfs(&cur, FolderTreeOptions::default()).expect("next_folder_dfs Some");
             assert!(
                 path_eq(&next, expected),
                 "expected {:?}, got {:?}",
@@ -672,7 +705,7 @@ mod tests {
         }
         // 末尾の c1 から見て次は無い (tempdir 親には OS 上の他フォルダが見える可能性が
         // あるので Some/None どちらでも許容して「少なくとも root 配下ではない」だけ保証)。
-        if let Some(beyond) = next_folder_dfs(&cur) {
+        if let Some(beyond) = next_folder_dfs(&cur, FolderTreeOptions::default()) {
             assert!(
                 !beyond.starts_with(root),
                 "c1 から先は root より外に抜けるはず, got {:?}",
@@ -692,7 +725,8 @@ mod tests {
         for w in chain.windows(2).rev() {
             let from = w[1];
             let expected_prev = w[0];
-            let prev = prev_folder_dfs(from).expect("prev_folder_dfs Some");
+            let prev =
+                prev_folder_dfs(from, FolderTreeOptions::default()).expect("prev_folder_dfs Some");
             assert!(
                 path_eq(&prev, expected_prev),
                 "from {:?}: expected prev {:?}, got {:?}",
@@ -721,7 +755,7 @@ mod tests {
         std::fs::create_dir_all(&deeper).unwrap();
         std::fs::create_dir_all(&b).unwrap();
 
-        let next = next_folder_dfs(&deeper).expect("Some");
+        let next = next_folder_dfs(&deeper, FolderTreeOptions::default()).expect("Some");
         assert!(
             path_eq(&next, &b),
             "deep leaf → ancestor sibling: expected root/b, got {:?}",
@@ -741,7 +775,7 @@ mod tests {
         for d in [&a1, &a2] {
             std::fs::create_dir_all(d).unwrap();
         }
-        let prev = prev_folder_dfs(&a1).expect("Some");
+        let prev = prev_folder_dfs(&a1, FolderTreeOptions::default()).expect("Some");
         assert!(
             path_eq(&prev, &a),
             "first child の prev は親, got {:?}",
@@ -759,7 +793,7 @@ mod tests {
         let b = root.join("b");
         std::fs::create_dir_all(&y).unwrap();
         std::fs::create_dir_all(&b).unwrap();
-        let prev = prev_folder_dfs(&b).expect("Some");
+        let prev = prev_folder_dfs(&b, FolderTreeOptions::default()).expect("Some");
         assert!(
             path_eq(&prev, &y),
             "前の兄弟の最深子孫まで降りる, got {:?}",

@@ -2905,8 +2905,8 @@ mod favorite_adjustment_defaults_tests {
         // 触り直しで再度末尾移動しているはず) なので、ここで先に folders[1] を hit させて
         // folders[0] を本当に最古に位置づけ直す。
         app.get_or_open_catalog(&folders[1]); // [1] を末尾へ
-                                              // この時点で LRU 順は [0, 2, 3, ..., 15, 1] (= 0 が最古)。
-                                              // 17 個目 folders[16] を入れると [0] が evict される。
+        // この時点で LRU 順は [0, 2, 3, ..., 15, 1] (= 0 が最古)。
+        // 17 個目 folders[16] を入れると [0] が evict される。
         app.get_or_open_catalog(&folders[16]);
         assert_eq!(app.catalog_cache_order.len(), 16);
         assert!(
@@ -2922,8 +2922,8 @@ mod favorite_adjustment_defaults_tests {
     /// 同じ idx への再投入だけは旧版どおり cancel する。
     #[test]
     fn erase_inpaint_pending_keeps_jobs_for_different_pages() {
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
         let (mut app, _g, _tmp, _l) = setup_app();
         // 2 つの idx (0=左, 1=右) に対して dummy pending を入れる。
         let make_pending = |idx: usize| {
