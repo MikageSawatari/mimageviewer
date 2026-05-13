@@ -14823,9 +14823,10 @@ impl eframe::App for App {
             let native_main_backdrop = self.native_video_fullscreen_active_for_main_backdrop();
             if native_main_backdrop {
                 self.sync_native_video_main_chrome(true);
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(egui::Color32::BLACK))
-                    .show(ctx, |_ui| {});
+                // Do not paint the main viewport black while the native video
+                // backdrop is taking over. If the main HWND transiently leaks
+                // above the fullscreen backdrop, a black client area makes the
+                // normal DWM title bar stand out as a visible flicker.
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
                 return;
             }
