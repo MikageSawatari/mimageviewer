@@ -1631,7 +1631,12 @@ pub(crate) enum MigrationReadResult {
 /// - main の I/O エラーは bak フォールバック対象とせず、`MainUnreadable` で返す
 ///   (Codex P1 v11 2026-05-14)。main の transient I/O で誤って古い bak から migrate して
 ///   main を上書き quarantine する事故を防ぐ。
-/// - main の NotFound / ParseError は bak フォールバックする (= 内容破損 or 真の不在)。
+/// - main の `NotFound` も **ambiguous NotFound** (= read_dir で親 dir 列挙すると main が
+///   見える) なら `MainUnreadable` で abort。同じ AV / cloud-sync 起因の transient で
+///   bak に倒して main を消す事故を防ぐ (Codex P1 v12 2026-05-14)。
+///   - read_dir で main が本当に見えない場合だけ「真の不在」と見なし、bak フォールバックを
+///     許可する (= 旧マイグレーション残骸 / 手動削除等)。
+/// - main の ParseError は bak フォールバックする (= 内容破損として正当)。
 pub(crate) fn read_settings_json_for_migration(main: &Path) -> MigrationReadResult {
     match try_parse_settings_file(main) {
         LoadFileResult::Ok(s) => return MigrationReadResult::Loaded(s),
@@ -1642,8 +1647,26 @@ pub(crate) fn read_settings_json_for_migration(main: &Path) -> MigrationReadResu
             ));
             return MigrationReadResult::MainUnreadable;
         }
-        // NotFound / ParseError は bak へ
-        LoadFileResult::NotFound | LoadFileResult::ParseError => {}
+        LoadFileResult::NotFound => {
+            // Codex P1 v12 (2026-05-14): read_dir で本当に存在しないか robust 確認。
+            // 一度の `read` が `NotFound` を返してきても、read_dir で main が見えれば
+            // transient と判定して `MainUnreadable` 扱いにする。
+            if !path_really_absent_via_readdir(main) {
+                settings_diag_log(&format!(
+                    "settings: migration: main {} reports NotFound but read_dir sees it; \
+                     treating as transient and aborting migration",
+                    main.display()
+                ));
+                return MigrationReadResult::MainUnreadable;
+            }
+            settings_diag_log(&format!(
+                "settings: migration: main {} confirmed absent via read_dir; bak fallback ok",
+                main.display()
+            ));
+        }
+        LoadFileResult::ParseError => {
+            // 内容破損は bak フォールバックの正当な理由なのでそのまま進む。
+        }
     }
     for n in 1..=BACKUP_COUNT {
         let bak = backup_path(main, n);
@@ -1656,6 +1679,36 @@ pub(crate) fn read_settings_json_for_migration(main: &Path) -> MigrationReadResu
         }
     }
     MigrationReadResult::AllFailed
+}
+
+/// 指定パスの親 dir を `read_dir` で列挙して、対象 file が **本当に存在しない** ことを
+/// 確認する (Codex P1 v12 2026-05-14)。`std::fs::metadata` / `std::fs::read` が
+/// `NotFound` を返しても、read_dir で見えるなら transient NotFound と判定する。
+///
+/// 戻り値:
+/// - true: 親 dir は読めて main が見当たらない → 真の不在
+/// - false: read_dir が main を列挙する → transient (= path 自体は disk 上に存在する)
+/// - false: read_dir 自体が失敗 → 判別不能 → 安全側に倒して transient 扱いとする
+fn path_really_absent_via_readdir(path: &Path) -> bool {
+    let parent = match path.parent() {
+        Some(p) => p,
+        None => return true, // 親 path 不明 (= root 等)。元の NotFound を信じる。
+    };
+    let file_name = match path.file_name() {
+        Some(n) => n,
+        None => return true,
+    };
+    match std::fs::read_dir(parent) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if entry.file_name() == file_name {
+                    return false; // 列挙できた → transient
+                }
+            }
+            true // 列挙したが見えない → 本当に不在
+        }
+        Err(_) => false, // 親 dir 列挙も落ちる → 判別不能 → 安全側 (transient 扱い)
+    }
 }
 
 /// migration 完了後にリネームすべき旧 JSON ファイル一覧を返す
