@@ -276,10 +276,29 @@ impl SettingsDb {
     /// `<data_dir>/settings.db` を新規作成して開く (= bootstrap)。
     ///
     /// `SQLITE_OPEN_CREATE` フラグを付ける。ファイルが存在しなければ作成し、
-    /// 既存ならそのまま開く (= 既存破壊はしない)。Phase 2 のクリーンインストール /
-    /// JSON migration 直後 / quarantine 後の fresh-init で使う。
-    /// retry セマンティクスは [`open`] と同じ。
+    /// 既存 bootstrapped DB ならエラー (`AlreadyBootstrapped`) を返す。
+    /// Phase 2 のクリーンインストール / JSON migration 直後 / quarantine 後の
+    /// fresh-init で使う。retry セマンティクスは [`open`] と同じ。
+    ///
+    /// **2 段の safety net** (Codex P2 v7 + v8 2026-05-13):
+    /// 1. 呼び出し直前に `settings_db_family_exists()` を確認 — family の **どれかが**
+    ///    可視なら、Phase 2 が transient な family-miss-detect で誤って clean-install
+    ///    経路を選んでいる疑いが強いので、`AlreadyBootstrapped` で fail-fast する。
+    ///    これで bak chain が孤立して救えなくなる事故を防ぐ。
+    /// 2. main DB を CREATE フラグ込みで開いた後、`bootstrap_complete` row が
+    ///    既に存在すれば `AlreadyBootstrapped` (= 既存ユーザー設定を握っている DB を
+    ///    save_full(Default::default()) で消すのを防ぐ)。
     pub fn create_new(data_dir: &Path) -> Result<Self, SettingsDbError> {
+        // Codex P2 v8: open より前に family pre-check。bak / WAL / SHM が見えるなら
+        // (= "clean install" を選んだ前提が崩れているなら) 即座に AlreadyBootstrapped で
+        // 失敗し、上層は bak / 旧 JSON への fallback を試みる。
+        if settings_db_family_exists(data_dir) {
+            log_diag(
+                "settings_db: create_new pre-check: family is visible; \
+                 refusing to clobber existing setup (Codex P2 v8)",
+            );
+            return Err(SettingsDbError::AlreadyBootstrapped);
+        }
         Self::open_with_mode(data_dir, OpenMode::CreateNew)
     }
 
@@ -902,7 +921,15 @@ fn read_favorites(conn: &Connection) -> Result<Vec<FavoriteEntry>, SettingsDbErr
     let mut out = Vec::new();
     for row in rows {
         let (id_bytes, name, path, ais, aim, ait) = row?;
-        let id = Uuid::from_slice(&id_bytes).unwrap_or_else(|_| Uuid::nil());
+        // Codex P2 v8 (2026-05-13): UUID 長が 16 でないなら row 破損。silently nil に
+        // fallback すると save_full 後に「ユーザーが個別 favorite を編集していた状態」
+        // が消える。Corrupted で上層に伝え、bak / JSON migration へ倒す。
+        let id = Uuid::from_slice(&id_bytes).map_err(|e| {
+            SettingsDbError::Corrupted(format!(
+                "favorites.id bytes invalid (len={}, name={name:?}): {e}",
+                id_bytes.len()
+            ))
+        })?;
         out.push(FavoriteEntry {
             id,
             name,
@@ -938,7 +965,13 @@ fn read_tags(conn: &Connection) -> Result<Vec<TagDef>, SettingsDbError> {
     let mut out = Vec::new();
     for row in rows {
         let (id_bytes, name) = row?;
-        let id = Uuid::from_slice(&id_bytes).unwrap_or_else(|_| Uuid::new_v4());
+        // Codex P2 v8: 同上。silently new_v4 すると tag id が安定でなくなる。
+        let id = Uuid::from_slice(&id_bytes).map_err(|e| {
+            SettingsDbError::Corrupted(format!(
+                "tags.id bytes invalid (len={}, name={name:?}): {e}",
+                id_bytes.len()
+            ))
+        })?;
         out.push(TagDef { id, name });
     }
     Ok(out)
@@ -1128,7 +1161,12 @@ fn read_vst3_chain_slots(conn: &Connection) -> Result<Vst3ChainPresetSlots, Sett
         if idx < 0 || (idx as usize) >= out.slots.len() {
             continue;
         }
-        let plugins: Vec<Vst3PluginEntry> = serde_json::from_str(&plugins_json).unwrap_or_default();
+        // Codex P2 v8 (2026-05-13): plugins_json が壊れていれば slot 全体を捨てるのではなく
+        // Corrupted を返して上層の bak / JSON fallback に倒す (= silently empty slot に
+        // ならないようにする)。
+        let plugins: Vec<Vst3PluginEntry> = serde_json::from_str(&plugins_json).map_err(|e| {
+            SettingsDbError::Corrupted(format!("vst3_chain_slots[{idx}].plugins_json invalid: {e}"))
+        })?;
         out.slots[idx as usize] = Some(Vst3ChainPresetSlot {
             name,
             plugins,
@@ -1691,6 +1729,88 @@ mod tests {
     }
 
     #[test]
+    fn create_new_refuses_when_only_bak_exists() {
+        // Codex P2 v8 (2026-05-13): family pre-check。main DB が無くても、bak / WAL / SHM が
+        // どれか 1 つでも見えるなら create_new は AlreadyBootstrapped で fail-fast する。
+        // これで「main だけ transient で消えて、Phase 2 が clean install と誤判定」しても
+        // bak chain が orphan 化せず生き残る。
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("settings.db.bak1"), b"dummy").unwrap();
+        let err = match SettingsDb::create_new(dir.path()) {
+            Ok(_) => panic!("create_new should refuse when bak1 is visible"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SettingsDbError::AlreadyBootstrapped),
+            "expected AlreadyBootstrapped, got: {err:?}"
+        );
+        // settings.db を **作らない** (= 既存の bak1 が clean install に巻き込まれない)。
+        assert!(!dir.path().join("settings.db").exists());
+    }
+
+    #[test]
+    fn corrupted_favorite_uuid_returns_corrupted() {
+        // Codex P2 v8 (2026-05-13): row 内の UUID バイト長が 16 でない (= 破損) なら
+        // silently nil-uuid に fallback せず Corrupted を返す。
+        let dir = TempDir::new().unwrap();
+        // bootstrap 済み DB を作る → ファイルを直接書き換えて UUID 列を 8 バイトに。
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            let mut s = Settings::default();
+            s.favorites
+                .push(FavoriteEntry::new("name".into(), PathBuf::from(r"C:\\X")));
+            db.save_full(&s).unwrap();
+        }
+        // 中身を壊す: id を 8 バイトに置換。
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        conn.execute("UPDATE favorites SET id = X'0102030405060708' WHERE 1", [])
+            .unwrap();
+        drop(conn);
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let err = match db.load_into_settings() {
+            Ok(_) => panic!("corrupted UUID should fail load_into_settings"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SettingsDbError::Corrupted(_)),
+            "expected Corrupted, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn corrupted_vst3_slot_plugins_json_returns_corrupted() {
+        // 同上 (Codex P2 v8): plugins_json が壊れていたら Corrupted を返す。
+        let dir = TempDir::new().unwrap();
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            let mut s = Settings::default();
+            s.vst3_chain_slots.slots[0] = Some(Vst3ChainPresetSlot {
+                name: "slot".into(),
+                plugins: vec![],
+                gui_visible: true,
+                video_compact: false,
+            });
+            db.save_full(&s).unwrap();
+        }
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        conn.execute(
+            "UPDATE vst3_chain_slots SET plugins_json = 'NOT JSON' WHERE slot_index = 0",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let err = match db.load_into_settings() {
+            Ok(_) => panic!("corrupted plugins_json should fail load_into_settings"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SettingsDbError::Corrupted(_)),
+            "expected Corrupted, got: {err:?}"
+        );
+    }
+
+    #[test]
     fn create_new_refuses_already_bootstrapped_db() {
         // Codex P2 v7 (2026-05-13): family が transient で見えなかったケースで
         // Phase 2 が誤って clean-install 経路を選び `create_new` を呼んでも、
@@ -1727,6 +1847,11 @@ mod tests {
         // Codex P1 v6 (2026-05-13): create_new で init_schema は走ったが、最初の
         // save_full が呼ばれる前に crash 等で終了した状態。schema_version はあるが
         // bootstrap_complete marker は無い。RequireExisting は Corrupted にすべき。
+        //
+        // 復旧経路 (Phase 2): open() が Corrupted を返したら、ファイルを quarantine
+        // (= 物理的に rename / delete) して bak chain に倒す or 再度 create_new。
+        // 本テストは「open が Corrupted を返す」までで終わらせる (= recovery 部分は
+        // Phase 2 で family pre-check 経由になるため Phase 1 の単体テスト範囲外)。
         let dir = TempDir::new().unwrap();
         // create_new は init_schema を走らせて schema_version を書くが、
         // save_full を呼ばないまま drop すれば bootstrap_complete は付かない。
@@ -1744,12 +1869,13 @@ mod tests {
             matches!(err, SettingsDbError::Corrupted(_)),
             "init-without-save should be Corrupted, got: {err:?}"
         );
-        // 一度 save_full すれば bootstrap_complete が付き、その後の open は成功する。
+        // 復旧: 残骸を物理削除 → create_new + save_full で再 bootstrap → open 成功。
+        std::fs::remove_file(dir.path().join("settings.db")).unwrap();
         {
             let db = SettingsDb::create_new(dir.path()).unwrap();
             db.save_full(&Settings::default()).unwrap();
         }
-        let _ok = SettingsDb::open(dir.path()).expect("after save_full, open should succeed");
+        let _ok = SettingsDb::open(dir.path()).expect("after rebootstrap, open should succeed");
     }
 
     #[test]
