@@ -43,6 +43,18 @@ const SCHEMA_VERSION: &str = "1";
 
 /// `settings_kv` に格納する**しない** (= 専用テーブルに切り出される) フィールド名一覧。
 /// `Settings` の serde フィールド名と一致させる。
+///
+/// ⚠️ **将来このリストを増やす場合の migration 注意点** (Codex P3 2026-05-13):
+/// 既存環境ではこのキーが `settings_kv` に旧 JSON のままで残っている。`build_settings_from_db`
+/// は `read_settings_kv` で map にそれを取り込んだ後、空の新テーブル由来の値で
+/// **上書きしてしまう** (`map.insert("vst3_plugins", ...)` が既存値を破棄するため)。
+///
+/// 新しい complex field をこのリストに追加するときは:
+///   1. 同じ load パス内で、新テーブルが空のときだけ legacy JSON を残す分岐を入れる、
+///   2. または起動時に一度限りの `settings_kv → 新テーブル` migration step を追加し、
+///      完了後 `settings_kv` 側の row を削除する、
+///
+/// のどちらかを行うこと。**何もせず追加すると初回起動でユーザー設定が消える。**
 const COMPLEX_FIELDS: &[&str] = &[
     "favorites",
     "tags",
@@ -215,7 +227,11 @@ struct Inner {
 }
 
 /// Transient 失敗時の retry 回数 + 間隔 (spec §5)。
-const OPEN_RETRY_ATTEMPTS: u32 = 3;
+///
+/// spec の「50ms backoff で最大 3 回 retry」を厳格に解釈し、
+/// **初回 + 3 retries = 計 4 attempts、間に 50ms sleep を最大 3 回** とする
+/// (Codex P2 2026-05-13: 元の 3 attempts/2 sleeps は緩い解釈だったため引き上げ)。
+const OPEN_RETRY_ATTEMPTS: u32 = 4;
 const OPEN_RETRY_BACKOFF_MS: u64 = 50;
 
 impl SettingsDb {
@@ -1483,6 +1499,31 @@ mod tests {
         assert_eq!(
             classify_open_error(&rusqlite::Error::QueryReturnedNoRows),
             OpenFailureKind::Other
+        );
+        // 未知の SqliteFailure code は Other に落ち、open 経路で Transient へ昇格する
+        // (Codex P3 2026-05-13: spec §5.1 のテーブル「default」行のカバレッジ)。
+        let unknown = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: ApiMisuse,
+                extended_code: 0,
+            },
+            None,
+        );
+        assert_eq!(classify_open_error(&unknown), OpenFailureKind::Other);
+        // classify_rusqlite_error_for_open は Other を Transient に昇格させる。
+        let err = classify_rusqlite_error_for_open(
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: ApiMisuse,
+                    extended_code: 0,
+                },
+                None,
+            ),
+            "test",
+        );
+        assert!(
+            matches!(err, SettingsDbError::Transient(_)),
+            "unknown sqlite code should be promoted to Transient: {err:?}"
         );
     }
 }
