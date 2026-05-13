@@ -5523,6 +5523,11 @@ impl App {
         // 進行中のフォルダナビゲーションをキャンセル
         // (他の経路でフォルダが変更された場合に不要な結果を破棄する)
         if let Some(pending) = self.folder_nav_pending.take() {
+            crate::logger::log(format!(
+                "[ctrl-nav-debug] start_loading_items cleared pending mode={:?} forward={}",
+                pending.mode.perf_tag(),
+                pending.forward,
+            ));
             pending.cancel.store(true, Ordering::Relaxed);
         }
         // モード・累積もリセット (新しい load_folder が走る = 連打バースト中断)
@@ -8303,11 +8308,18 @@ impl App {
     /// 検索モードやフルスクリーン状態などの scope が変わると、古い入力を
     /// 新しい表示状態へ適用すると分かりにくいので明示的に流す。
     pub(crate) fn cancel_pending_folder_nav(&mut self) {
+        let had_pending = self.folder_nav_pending.is_some();
         if let Some(pending) = self.folder_nav_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         self.clear_pending_folder_nav_steps();
         self.release_fs_nav_lock();
+        if had_pending {
+            crate::logger::log(format!(
+                "[ctrl-nav-debug] cancel_pending_folder_nav cleared pending; backtrace_len={}",
+                std::backtrace::Backtrace::capture().to_string().lines().count()
+            ));
+        }
     }
 
     /// Ctrl+↑↓ のフォルダナビゲーションをバックグラウンドスレッドで開始する。
@@ -8479,8 +8491,12 @@ impl App {
             cancel,
             rx,
             forward,
-            mode,
+            mode: mode.clone(),
         });
+        crate::logger::log(format!(
+            "[ctrl-nav-debug] spawn_folder_nav: pending=Some(mode={:?}, forward={forward})",
+            mode.perf_tag()
+        ));
     }
 
     /// 直前の folder_nav 完了後に呼ぶ。累積ステップが残っていれば次の DFS を連鎖実行。
@@ -8516,6 +8532,12 @@ impl App {
                     Some(o) => (Some(o.path), o.hit_image_folder),
                     None => (None, false),
                 };
+                crate::logger::log(format!(
+                    "[ctrl-nav-debug] poll_folder_nav recv Ok mode={:?} forward={} found={}",
+                    pending.mode.perf_tag(),
+                    pending.forward,
+                    path.is_some(),
+                ));
                 Some(FolderNavResult {
                     path,
                     hit_image_folder,
@@ -8527,6 +8549,11 @@ impl App {
             Err(mpsc::TryRecvError::Empty) => None,
             Err(mpsc::TryRecvError::Disconnected) => {
                 let pending = self.folder_nav_pending.take().unwrap();
+                crate::logger::log(format!(
+                    "[ctrl-nav-debug] poll_folder_nav recv Disconnected mode={:?} forward={}",
+                    pending.mode.perf_tag(),
+                    pending.forward,
+                ));
                 Some(FolderNavResult {
                     path: None,
                     hit_image_folder: false,
@@ -8592,6 +8619,13 @@ impl App {
     /// DFS 完了時の後処理。モードに応じて load_folder / open_fullscreen /
     /// favsearch の stack push や sibling fallback を使い分ける。
     fn apply_folder_nav_result(&mut self, ctx: &egui::Context, result: FolderNavResult) {
+        crate::logger::log(format!(
+            "[ctrl-nav-debug] apply_folder_nav_result mode={:?} forward={} found={} hit_image_folder={}",
+            result.mode.perf_tag(),
+            result.forward,
+            result.path.is_some(),
+            result.hit_image_folder,
+        ));
         // perf: DFS 結果を UI スレッドで適用する区間 (close_fullscreen + load_folder +
         // open_fullscreen 等) の wall time を計測する。Ctrl+↑↓ 連打中に UI が詰まる
         // 原因がここに集まるため、ms を必ず記録する。
@@ -11495,6 +11529,11 @@ impl App {
                         ..
                     }
             ) {
+                crate::logger::log(format!(
+                    "[ctrl-nav-debug] close_fullscreen cleared pending mode={:?} forward={}",
+                    pending.mode.perf_tag(),
+                    pending.forward,
+                ));
                 pending.cancel.store(true, Ordering::Relaxed);
                 self.folder_nav_pending = None;
                 self.clear_pending_folder_nav_steps();
@@ -15338,6 +15377,15 @@ impl eframe::App for App {
             && fav_nav.is_none()
             && toolbar_fav_nav.is_none()
             && keyboard_nav.is_none();
+
+        if folder_nav_result.is_some() && !folder_nav_wins {
+            crate::logger::log(format!(
+                "[ctrl-nav-debug] folder_nav_result lost: fav_nav={} toolbar={} keyboard={}",
+                fav_nav.is_some(),
+                toolbar_fav_nav.is_some(),
+                keyboard_nav.is_some(),
+            ));
+        }
 
         if folder_nav_wins {
             // folder_nav 勝利: モードに応じて load_folder / close+load+open_fullscreen /
