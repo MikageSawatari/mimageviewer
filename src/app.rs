@@ -7937,10 +7937,17 @@ impl App {
             )
         });
 
+        // マウスドライバが WM_APPCOMMAND / VK_BROWSER_BACK/FORWARD で送る経路を消費。
+        // 詳細は main.rs の `install_mouse_nav_hook` 参照。
+        let (browser_back_count, browser_forward_count) = crate::take_pending_mouse_nav();
+        let browser_back = browser_back_count > 0;
+        let browser_forward = browser_forward_count > 0;
+
         // Ctrl+矢印: modifiers.ctrl に加え ctrl_held (key_down) でも判定。
-        // マウス戻る/進む (Extra1/Extra2) も Ctrl+↑/↓ と等価に扱う。
-        let ctrl_up = (ctrl_held && up) || mouse_back;
-        let ctrl_down = (ctrl_held && down) || mouse_forward;
+        // マウス戻る/進む (Extra1/Extra2 = native XButton、または Browser_Back/Forward
+        // 経由) も Ctrl+↑/↓ と等価に扱う。
+        let ctrl_up = (ctrl_held && up) || mouse_back || browser_back;
+        let ctrl_down = (ctrl_held && down) || mouse_forward || browser_forward;
 
         // Ctrl+G の DrilledInto で drill-back する手段は BS (↓で始まる通常ハンドラ)
         // と検索バーの ← ボタンに限定する。
@@ -14493,6 +14500,11 @@ impl eframe::App for App {
                 if let RawWindowHandle::Win32(h) = wh.as_raw() {
                     let hwnd_raw = h.hwnd.get();
                     self.main_hwnd = Some(hwnd_raw);
+                    // マウスドライバが WM_APPCOMMAND_BROWSER_BACKWARD/FORWARD で送るか、
+                    // AHK 等が VK_BROWSER_BACK/FORWARD keystroke で送るルートを WH_GETMESSAGE
+                    // フックで拾い、進む/戻るボタンを Ctrl+↑/↓ と等価に扱う。詳細は
+                    // main.rs の `install_mouse_nav_hook` のコメント参照。
+                    crate::install_mouse_nav_hook();
                     #[cfg(windows)]
                     self.dsp_bridge.set_main_hwnd(hwnd_raw as u64);
                     // watchdog に HWND を共有 (IsHungAppWindow チェック用、

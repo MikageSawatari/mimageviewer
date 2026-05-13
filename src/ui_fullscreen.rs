@@ -2474,9 +2474,14 @@ impl App {
         // Shift+矢印（スプレッドナビ）にも対応するため、修飾キーを問わず消費
         let ctrl_d = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowDown));
         let ctrl_u = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowUp));
-        // マウス戻る/進む (Extra1/Extra2) を Ctrl+↑/↓ と等価に扱う
+        // マウス戻る/進む (Extra1/Extra2 = native XButton) を Ctrl+↑/↓ と等価に扱う。
         let mouse_back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1));
         let mouse_forward = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra2));
+        // WM_APPCOMMAND / VK_BROWSER_BACK/FORWARD 経路 (mouse driver や AHK が送る) も同等に消費。
+        // 詳細は main.rs の `install_mouse_nav_hook` 参照。
+        let (browser_back_count, browser_forward_count) = crate::take_pending_mouse_nav();
+        let browser_back = browser_back_count > 0;
+        let browser_forward = browser_forward_count > 0;
         let arrow_right = ctx.input_mut(|i| {
             !video_horizontal_arrow_key
                 && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
@@ -2922,10 +2927,10 @@ impl App {
             action.nav_delta = self.spread_nav_delta(-1, shift_held);
             self.slideshow_playing = false;
         }
-        if ctrl_d || mouse_forward {
+        if ctrl_d || mouse_forward || browser_forward {
             action.ctrl_nav = Some(1);
         }
-        if ctrl_u || mouse_back {
+        if ctrl_u || mouse_back || browser_back {
             action.ctrl_nav = Some(-1);
         }
 

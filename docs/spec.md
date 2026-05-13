@@ -299,8 +299,8 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 | Ctrl + O | フォルダを開くダイアログ（無効なパスはエラー表示） |
 | Ctrl + ↑ | フォルダツリーで前のフォルダへ |
 | Ctrl + ↓ | フォルダツリーで次のフォルダへ |
-| マウス戻るボタン (XButton1) | フォルダツリーで前のフォルダへ（Ctrl+↑ と同じ） |
-| マウス進むボタン (XButton2) | フォルダツリーで次のフォルダへ（Ctrl+↓ と同じ） |
+| マウス戻るボタン | フォルダツリーで前のフォルダへ（Ctrl+↑ と同じ）。XButton1 native / WM_APPCOMMAND / `Browser_Back` キーストロークの 3 経路に対応 |
+| マウス進むボタン | フォルダツリーで次のフォルダへ（Ctrl+↓ と同じ）。XButton2 native / WM_APPCOMMAND / `Browser_Forward` キーストロークの 3 経路に対応 |
 | Ctrl + マウスホイール | 列数を増減 |
 | Alt + 1〜9 | 列数を 1〜9 に切り替え |
 | Alt + 0 | 列数を 10 に切り替え |
@@ -329,8 +329,8 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 | Ctrl + ↑ | フォルダツリーで前のフォルダへ移動し、そのフォルダの先頭画像 / 動画をフルスクリーンで表示 |
 | Ctrl + ↓ | フォルダツリーで次のフォルダへ移動し、そのフォルダの先頭画像 / 動画をフルスクリーンで表示 |
 | 右 Ctrl（押している間） / 左クリック長押し | 元画像プレビュー（mIV 側の補正/AI/消しゴム補完を一時的に外す） |
-| マウス戻るボタン (XButton1) | Ctrl+↑ と同じ（画像系 / 動画 native 経路とも有効） |
-| マウス進むボタン (XButton2) | Ctrl+↓ と同じ（画像系 / 動画 native 経路とも有効） |
+| マウス戻るボタン | Ctrl+↑ と同じ（画像系 / 動画 native 経路とも有効）。XButton1 native / WM_APPCOMMAND / `Browser_Back` キーストロークの 3 経路に対応 |
+| マウス進むボタン | Ctrl+↓ と同じ（画像系 / 動画 native 経路とも有効）。XButton2 native / WM_APPCOMMAND / `Browser_Forward` キーストロークの 3 経路に対応 |
 | Enter | 動画の場合、フルスクリーンで一時停止状態で開く（再度 Space / Enter で再生開始） |
 | Shift + Enter | 動画の場合、外部プレイヤーで開く |
 | 右半分クリック | 次の画像へ |
