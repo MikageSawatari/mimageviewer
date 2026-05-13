@@ -2097,11 +2097,8 @@ impl App {
     fn show_native_video_black_backdrop(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let fs_id = self.fullscreen_viewport_id();
         let need_show = !self.fs_viewport_shown;
-        let mut fs_builder = self.build_fullscreen_viewport_builder_with_transparency(false);
-        if need_show {
-            // 初回だけ hidden で作り、DWM transition 抑止を入れてから表示する。
-            fs_builder = fs_builder.with_visible(false);
-        }
+        let fs_builder = self.build_fullscreen_viewport_builder_with_transparency(false);
+        let expected_physical_rect = self.fullscreen_backdrop_physical_rect();
         let mut close_fs = false;
         ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
             // Visible な fullscreen viewport なので、native 動画の黒 backdrop 中も
@@ -2144,6 +2141,21 @@ impl App {
                 .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                 .show(ctx, |_ui| {});
         });
+        if self.native_video_presenter_hwnd_for_fs(fs_idx).is_none()
+            && let (Some(main_hwnd), Some(expected)) = (self.main_hwnd, expected_physical_rect)
+        {
+            let raised = crate::dwm_transitions::raise_visible_thread_window_matching_rect(
+                windows::Win32::Foundation::HWND(main_hwnd as *mut _),
+                expected,
+            );
+            if need_show {
+                crate::logger::log(format!(
+                    "[native-video] raised fullscreen backdrop hwnd=0x{:x} main=0x{:x}",
+                    raised.map(|hwnd| hwnd.0 as usize).unwrap_or(0),
+                    main_hwnd as usize
+                ));
+            }
+        }
         self.fs_viewport_shown = true;
         if close_fs {
             self.close_fullscreen();
@@ -2155,6 +2167,19 @@ impl App {
 
     fn build_fullscreen_viewport_builder(&self) -> egui::ViewportBuilder {
         self.build_fullscreen_viewport_builder_with_transparency(true)
+    }
+
+    #[cfg(windows)]
+    fn fullscreen_backdrop_physical_rect(&self) -> Option<windows::Win32::Foundation::RECT> {
+        let center = self.last_outer_rect.map(|r| r.center())?;
+        let ppp = self.last_pixels_per_point;
+        let rect = crate::monitor::get_monitor_logical_rect_at(center.x * ppp, center.y * ppp)?;
+        Some(windows::Win32::Foundation::RECT {
+            left: (rect.min.x * ppp).round() as i32,
+            top: (rect.min.y * ppp).round() as i32,
+            right: (rect.max.x * ppp).round() as i32,
+            bottom: (rect.max.y * ppp).round() as i32,
+        })
     }
 
     fn build_fullscreen_viewport_builder_with_transparency(

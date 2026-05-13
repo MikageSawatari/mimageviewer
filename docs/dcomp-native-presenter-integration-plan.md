@@ -197,6 +197,11 @@ Status:
   client area without forcing DWM to recalculate title-bar glyph contrast, which
   avoids a visible light/dark caption flip just before the black viewport
   appears.
+- 2026-05-13: while the native presenter HWND is still hidden, the UI thread now
+  enumerates its own top-level HWNDs, finds the visible fullscreen-sized black
+  egui backdrop, and raises it above the main HWND. This keeps the main caption
+  from momentarily sitting above the black startup curtain before native video
+  starts.
 - 2026-05-05: the Rust panic hook is complemented by a Windows native exception
   handler and a UI heartbeat watchdog. Native access violations are appended to
   `panic.log`, while an `App::update` heartbeat gap of more than five seconds is
