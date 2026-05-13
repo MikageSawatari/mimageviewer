@@ -172,8 +172,9 @@ Status:
   curtain while the presenter HWND is still hidden. The main viewport itself
   does not repaint a black panel and its DWM caption/border are not recolored
   during native-video fullscreen; if Windows transiently exposes the main HWND,
-  preserving the existing client contents is less visually disruptive than a
-  black client area with the normal title bar on top. This avoids non-client
+  letting the eframe render pass fall back to the normal theme fill is less
+  visually disruptive than a black client area with the normal title bar on top.
+  This avoids non-client
   title-bar/border flashes without toggling `ViewportCommand::Decorations`,
   which can resize the main client area and disturb the thumbnail grid when
   fullscreen exits.
@@ -203,6 +204,10 @@ Status:
   HWND leaked above the fullscreen backdrop it produced a high-contrast "black
   client plus normal title bar" frame. The dedicated fullscreen backdrop remains
   responsible for the black curtain.
+- 2026-05-13: the native-video black egui fullscreen backdrop is created hidden
+  on its first frame. After the HWND exists, the UI thread applies
+  `DWMWA_TRANSITIONS_FORCEDISABLED` and only then sends `Visible(true)`, so the
+  first show uses the no-transition path instead of Windows' default zoom/fade.
 - 2026-05-05: the Rust panic hook is complemented by a Windows native exception
   handler and a UI heartbeat watchdog. Native access violations are appended to
   `panic.log`, while an `App::update` heartbeat gap of more than five seconds is

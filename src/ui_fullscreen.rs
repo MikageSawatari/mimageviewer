@@ -2098,6 +2098,14 @@ impl App {
         let fs_id = self.fullscreen_viewport_id();
         let need_show = !self.fs_viewport_shown;
         let fs_builder = self.build_fullscreen_viewport_builder_with_transparency(false);
+        let fs_builder = if need_show {
+            // Create the fullscreen backdrop HWND hidden first. The DWM
+            // transition flag can only be applied after the HWND exists, so a
+            // visible initial create can animate before the attribute lands.
+            fs_builder.with_visible(false)
+        } else {
+            fs_builder
+        };
         let expected_physical_rect = self.fullscreen_backdrop_physical_rect();
         let mut close_fs = false;
         ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
