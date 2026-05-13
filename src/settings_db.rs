@@ -504,7 +504,13 @@ fn is_family_filename(name: &str) -> bool {
         return true;
     }
     if let Some(rest) = name.strip_prefix("settings.db.bak") {
-        return rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty();
+        // spec §6 で定義された世代 = bak1..bak10。範囲外 (bak0 / bak11 / bak100…) は
+        // family 扱いしない (Codex P3 v4 2026-05-13: 上位互換でも下位互換でもない
+        // 異物が family と誤判定されると、main 不在時に save 抑止に倒れて
+        // クリーンインストール経路が永久に動かなくなる懸念があるため)。
+        if let Ok(n) = rest.parse::<u32>() {
+            return (1..=10).contains(&n);
+        }
     }
     false
 }
@@ -1470,6 +1476,12 @@ mod tests {
         assert!(!is_family_filename("settings.db.bakX"));
         assert!(!is_family_filename("settings.db.foo"));
         assert!(!is_family_filename("settings.json"));
+        // spec §6 範囲外 (Codex P3 v4 2026-05-13)。bak0 / bak11+ は弾く。
+        assert!(!is_family_filename("settings.db.bak0"));
+        assert!(!is_family_filename("settings.db.bak11"));
+        assert!(!is_family_filename("settings.db.bak100"));
+        // leading zero は数値 parse 上「bak1」と等価 (= 弾く理由がないので許容)。
+        assert!(is_family_filename("settings.db.bak01"));
     }
 
     #[test]
