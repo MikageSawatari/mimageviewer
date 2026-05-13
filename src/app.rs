@@ -6212,14 +6212,19 @@ impl App {
         }
     }
 
-    /// 現在 items 中の親コンテナ (Folder/ZipFile/PdfFile) 分のピンを DB から
-    /// 一括取得して `folder_pin_map` に格納する。pin DB が未開なら no-op。
+    /// 現在 items 中の親コンテナ (Folder/ZipFile/PdfFile) 分のピン + `current_folder`
+    /// 自身のピンを DB から一括取得して `folder_pin_map` に格納する。pin DB が未開なら no-op。
+    ///
+    /// `current_folder` 自身を含めるのは、アドレスバー 📌 ボタンの `folder_thumb_pin_for
+    /// (current_folder)` が「現在表示中のコンテナがピン留め済みか」を判定するため
+    /// (Codex 最終レビュー P2 指摘)。reload 後に map に入っていないと、トグル / アイコン
+    /// 強調 / tooltip が「未ピン」固定になってしまう。
     fn refresh_folder_pin_map(&mut self) {
         self.folder_pin_map.clear();
         let Some(db) = self.folder_thumb_pin_db.as_ref() else {
             return;
         };
-        let container_paths: Vec<&std::path::Path> = self
+        let mut container_paths: Vec<&std::path::Path> = self
             .items
             .iter()
             .filter_map(|it| match it {
@@ -6229,6 +6234,17 @@ impl App {
                 _ => None,
             })
             .collect();
+        // current_folder 自身も lookup 対象に含める (検索合成パス / アグリゲートビューは除外)。
+        // 子 items 由来のパスとは container_key が異なるので、`apply_folder_thumb_pin` が
+        // 子の解決で誤って自分自身のピンを引くことはない。
+        if let Some(cur) = self.current_folder.as_ref() {
+            if *cur != search_results_synthetic_path()
+                && !self.items_are_global_search_view
+                && !container_paths.iter().any(|p| *p == cur.as_path())
+            {
+                container_paths.push(cur.as_path());
+            }
+        }
         if container_paths.is_empty() {
             return;
         }
@@ -6324,6 +6340,13 @@ impl App {
         }
         // 既存 pin (もしあれば) を引いておく
         let existing_pin = self.folder_thumb_pin_for(container).cloned();
+        // 空フォルダ (= ピン可能なアイテムが 1 つも無い) で、なおかつ既存 pin も無い場合は
+        // ボタン自体を隠す (Codex 最終レビュー P3 指摘: 「空フォルダは対象外」の
+        // ドキュメント記述と挙動を揃える)。既存 pin がある場合は「右クリックで解除」を
+        // 提供したいので隠さない (= ファイルを全部削除した後でもピンを掃除できる)。
+        if self.items.is_empty() && existing_pin.is_none() {
+            return None;
+        }
         // 選択中アイテムから source を組み立てる (= 「左クリックで何を pin するか」)
         let selected_source: Option<crate::folder_thumb_pins::FolderPinSource> = self
             .selected
