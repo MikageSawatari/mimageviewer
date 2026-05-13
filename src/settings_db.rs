@@ -234,12 +234,47 @@ struct Inner {
 const OPEN_RETRY_ATTEMPTS: u32 = 4;
 const OPEN_RETRY_BACKOFF_MS: u64 = 50;
 
+/// `SettingsDb::open` / `create_new` で使う open mode 選択 (Codex P2 v3 2026-05-13)。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenMode {
+    /// 既存の main DB を開く。`SQLITE_OPEN_CREATE` を **付けない** ことで、
+    /// AV / cloud sync 等で一時的にファイルが消えても新規 DB が作られず、
+    /// `CannotOpen` → `Transient` として上層に伝わる。spec §5 の
+    /// 「family が見える → open existing」経路で使う想定。
+    RequireExisting,
+    /// 新規 DB を作成する (= bootstrap)。クリーンインストール / JSON migration 直後 /
+    /// quarantine 後の fresh-init で使う。Phase 2 から呼ばれる。
+    CreateNew,
+}
+
 impl SettingsDb {
-    /// `<data_dir>/settings.db` を開く。
+    /// `<data_dir>/settings.db` を **既存ファイル前提で** 開く。
     ///
-    /// `Transient` 分類のエラーは spec §5 に従って 50ms backoff x 3 回まで自動 retry する。
-    /// `Corrupted` / `Permission` は retry しない (= 環境ステータスが変わらないと直らない)。
+    /// `Transient` 分類のエラーは spec §5 に従って `OPEN_RETRY_ATTEMPTS` 回まで
+    /// 自動 retry する。`Corrupted` / `Permission` は即座に返す
+    /// (= 環境ステータスが変わらないと直らない)。
+    ///
+    /// `SQLITE_OPEN_CREATE` を **付けない** ので、ファイルが (transient かつ) 不在
+    /// なら `CannotOpen` → `Transient` が上層に返る。空 DB の自動作成でユーザー設定が
+    /// defaults に上書きされる事故 (= 今回の SQLite 移行の主動機) を構造的に防ぐ
+    /// (Codex P2 v3 2026-05-13)。
+    ///
+    /// クリーンインストールや migration 直後の fresh-init には [`create_new`] を使うこと。
     pub fn open(data_dir: &Path) -> Result<Self, SettingsDbError> {
+        Self::open_with_mode(data_dir, OpenMode::RequireExisting)
+    }
+
+    /// `<data_dir>/settings.db` を新規作成して開く (= bootstrap)。
+    ///
+    /// `SQLITE_OPEN_CREATE` フラグを付ける。ファイルが存在しなければ作成し、
+    /// 既存ならそのまま開く (= 既存破壊はしない)。Phase 2 のクリーンインストール /
+    /// JSON migration 直後 / quarantine 後の fresh-init で使う。
+    /// retry セマンティクスは [`open`] と同じ。
+    pub fn create_new(data_dir: &Path) -> Result<Self, SettingsDbError> {
+        Self::open_with_mode(data_dir, OpenMode::CreateNew)
+    }
+
+    fn open_with_mode(data_dir: &Path, mode: OpenMode) -> Result<Self, SettingsDbError> {
         let path = settings_db_path(data_dir);
         if let Some(parent) = path.parent() {
             // dir 作成失敗は無視 (= conn open でも同じエラーが出るのでそちらに任せる)。
@@ -248,7 +283,7 @@ impl SettingsDb {
 
         let mut last_err: Option<SettingsDbError> = None;
         for attempt in 0..OPEN_RETRY_ATTEMPTS {
-            match Self::try_open_once(&path) {
+            match Self::try_open_once(&path, mode) {
                 Ok(db) => {
                     if attempt > 0 {
                         log_diag(&format!(
@@ -278,8 +313,19 @@ impl SettingsDb {
     /// open の 1 回ぶんの実行。pragma / integrity_check / init_schema を一気通貫で実行する。
     /// 途中のどのステップで `rusqlite::Error` が出ても、`classify_rusqlite_error_for_open`
     /// を通すことで Corrupted / Permission / Transient へ正しく分類される (Codex P1 対応)。
-    fn try_open_once(path: &Path) -> Result<Self, SettingsDbError> {
-        let conn = Connection::open(path)
+    fn try_open_once(path: &Path, mode: OpenMode) -> Result<Self, SettingsDbError> {
+        use rusqlite::OpenFlags;
+        let flags = match mode {
+            OpenMode::RequireExisting => {
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
+            }
+            OpenMode::CreateNew => {
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+                    | OpenFlags::SQLITE_OPEN_CREATE
+                    | OpenFlags::SQLITE_OPEN_URI
+            }
+        };
+        let conn = Connection::open_with_flags(path, flags)
             .map_err(|e| classify_rusqlite_error_for_open(e, "Connection::open"))?;
         apply_pragmas(&conn).map_err(|e| classify_rusqlite_error_for_open(e, "apply_pragmas"))?;
         check_integrity_classified(&conn)?;
@@ -1205,13 +1251,44 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let original = sample_settings();
         {
-            let db = SettingsDb::open(dir.path()).unwrap();
+            // 初回は bootstrap なので `create_new` (= CREATE フラグあり)。
+            let db = SettingsDb::create_new(dir.path()).unwrap();
             db.save_full(&original).unwrap();
         }
         // 再 open して同一性を確認 (= WAL の checkpoint も含めて永続化されているか)。
+        // ここは `open` (= CREATE なし) で十分 (= 既に file 存在)。
         let db2 = SettingsDb::open(dir.path()).unwrap();
         let loaded = db2.load_into_settings().unwrap();
         assert_settings_eq(&original, &loaded);
+    }
+
+    #[test]
+    fn open_existing_fails_when_main_missing() {
+        // Codex P2 v3 (2026-05-13): family が見える / 見えないに関わらず、main DB が
+        // 存在しない状態で `SettingsDb::open()` を呼んでも **空の DB を作って成功させない**。
+        // 必ず Transient で失敗し、上層の save 抑止経路に届くこと。
+        let dir = TempDir::new().unwrap();
+        let err = match SettingsDb::open(dir.path()) {
+            Ok(_) => panic!("open() should not create a new DB when main is missing"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SettingsDbError::Transient(_)),
+            "expected Transient (file missing), got: {err:?}"
+        );
+        // 副作用として settings.db を物理的に作っていないことを確認 (= CREATE フラグなし)。
+        assert!(!dir.path().join("settings.db").exists());
+    }
+
+    #[test]
+    fn create_new_creates_missing_db() {
+        // `create_new` は CREATE フラグ付きなので、最初に呼んだときに DB を作る。
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        // 後続の `open` は file 存在で成功する。
+        drop(db);
+        assert!(dir.path().join("settings.db").exists());
+        let _db2 = SettingsDb::open(dir.path()).unwrap();
     }
 
     #[test]
@@ -1416,7 +1493,7 @@ mod tests {
         // 1 回だけ作って使い回す。
         let original = sample_settings();
         let dir = TempDir::new().unwrap();
-        let db = SettingsDb::open(dir.path()).unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
         db.save_full(&original).unwrap();
         let target = dir.path().join("settings.db.bak1");
         db.backup_to(&target).unwrap();
