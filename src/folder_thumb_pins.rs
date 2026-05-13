@@ -319,6 +319,130 @@ impl FolderThumbPinDb {
     }
 }
 
+/// `FolderPinSource` を実際の target ファイル情報に解決した結果。
+/// `make_load_request` から `process_load_request` に渡す情報を組み立てる。
+///
+/// `mtime` / `file_size` は **target ファイル自身** の metadata。これを
+/// `LoadRequest::mtime/file_size` にコピーすると、catalog の hit 判定が
+/// 「target が変わったら自動で miss」になる (ピン書き換え / 解除でも同様)。
+#[derive(Clone, Debug)]
+pub struct ResolvedPinTarget {
+    pub kind: ResolvedKind,
+    pub abs_path: PathBuf,
+    pub zip_entry: Option<String>,
+    pub pdf_page: Option<u32>,
+    pub mtime: i64,
+    pub file_size: i64,
+    /// pin の identity を表す compact 文字列。cache key suffix として
+    /// 親キー (`folderthumb:{dirname}` 等) の後ろに `#pin:` で連結する。
+    /// pin の付け替え / target ファイル変更で自動的に変わるので、古い
+    /// pin の WebP を catch しない。
+    pub source_id: String,
+}
+
+/// pin target の dispatch 種別。`LoadRequest::resolve_override` と 1 対 1 に対応。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedKind {
+    /// 画像ファイル直接 decode
+    Image,
+    /// 動画ファイル (Phase B では fallback、Phase C で video worker 配線)
+    Video,
+    /// サブフォルダ。`resolve_folder_thumb_image` で代表画像を選び decode
+    /// (recursion clip: そのサブフォルダの pin は引かない)
+    Folder,
+    /// ZIP ファイル直下の 1 枚目 (`read_first_image_bytes`)
+    ZipFirstImage,
+    /// PDF ファイルの page 0
+    PdfFirstPage,
+    /// 既知 ZIP entry を直接 decode
+    ZipEntry,
+    /// 既知 PDF page を render
+    PdfPage,
+}
+
+/// container と source から target を解決し、metadata を読み取って
+/// `ResolvedPinTarget` を返す。
+///
+/// target が存在しない / stat できないときは `None` を返し、呼び出し側は
+/// **無効なピン**として無視して auto-select に fall back する。
+///
+/// この関数は `std::fs::metadata` を 1 回呼ぶ (= cheap stat syscall)。
+/// UI スレッドからの呼び出しを想定。
+pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<ResolvedPinTarget> {
+    let (abs_path, zip_entry, pdf_page, kind) = match source {
+        FolderPinSource::File { rel, kind } => {
+            let abs = container.join(rel);
+            let (rk, page) = match kind {
+                FileKind::Image => (ResolvedKind::Image, None),
+                FileKind::Video => (ResolvedKind::Video, None),
+                FileKind::Folder => (ResolvedKind::Folder, None),
+                FileKind::ZipFile => (ResolvedKind::ZipFirstImage, None),
+                FileKind::PdfFile => (ResolvedKind::PdfFirstPage, Some(0u32)),
+            };
+            (abs, None, page, rk)
+        }
+        FolderPinSource::ZipEntry { zip_rel, entry } => {
+            let abs_zip = if zip_rel.is_empty() {
+                container.to_path_buf()
+            } else {
+                container.join(zip_rel)
+            };
+            (
+                abs_zip,
+                Some(entry.clone()),
+                None,
+                ResolvedKind::ZipEntry,
+            )
+        }
+        FolderPinSource::PdfPage { pdf_rel, page } => {
+            let abs_pdf = if pdf_rel.is_empty() {
+                container.to_path_buf()
+            } else {
+                container.join(pdf_rel)
+            };
+            (abs_pdf, None, Some(*page), ResolvedKind::PdfPage)
+        }
+    };
+
+    let meta = std::fs::metadata(&abs_path).ok()?;
+    let mtime = crate::ui_helpers::mtime_secs(&meta);
+    let file_size = meta.len() as i64;
+
+    // source_id: cache key の suffix として使う。フォーマット例:
+    //   "image|cover.jpg|-|-|1700000000|524288"
+    //   "pdfpage|sub.pdf|-|42|1700000000|1048576"
+    //   "zipentry|scans.zip|page-01.png|-|1700000000|2097152"
+    // pin/unpin/target 変更で必ず変わるので、古い pin の WebP を取り違えない。
+    let entry_part = match source {
+        FolderPinSource::ZipEntry { entry, .. } => entry.as_str(),
+        _ => "-",
+    };
+    let page_part = match source {
+        FolderPinSource::PdfPage { page, .. } => page.to_string(),
+        _ => "-".to_string(),
+    };
+    let rel_part = source.rel();
+    let source_id = format!(
+        "{kind}|{rel}|{entry}|{page}|{mtime}|{size}",
+        kind = source.db_kind(),
+        rel = rel_part,
+        entry = entry_part,
+        page = page_part,
+        mtime = mtime,
+        size = file_size,
+    );
+
+    Some(ResolvedPinTarget {
+        kind,
+        abs_path,
+        zip_entry,
+        pdf_page,
+        mtime,
+        file_size,
+        source_id,
+    })
+}
+
 /// DB 行から `FolderPinSource` を組み立てる。検査に通らない行は `None` を返し、
 /// **どの行をなぜ skip したか**を `logger` 経由でログに出す (= ユーザーが DB を
 /// 手書きで触ったり、将来のスキーマ拡張で互換性が崩れた際に診断できるように)。
@@ -892,6 +1016,104 @@ mod tests {
         )
         .unwrap();
         assert!(db.lookup(Path::new("C:/Albums/Trip")).is_some());
+    }
+
+    /// 一時ディレクトリに実ファイルを作って resolve_pin_target が
+    /// 絶対パス / metadata / source_id を返すことを確認する。
+    #[test]
+    fn resolve_pin_target_image_returns_target_metadata() {
+        use std::io::Write;
+
+        let tmp = std::env::temp_dir().join(format!(
+            "miv_pin_resolve_test_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let img = tmp.join("cover.jpg");
+        let mut f = std::fs::File::create(&img).unwrap();
+        f.write_all(b"fake-jpeg-bytes").unwrap();
+        drop(f);
+
+        let source = FolderPinSource::File {
+            rel: "cover.jpg".to_string(),
+            kind: FileKind::Image,
+        };
+        let resolved = resolve_pin_target(&tmp, &source).expect("target exists");
+        assert_eq!(resolved.kind, ResolvedKind::Image);
+        assert_eq!(resolved.abs_path, img);
+        assert_eq!(resolved.zip_entry, None);
+        assert_eq!(resolved.pdf_page, None);
+        assert_eq!(resolved.file_size, b"fake-jpeg-bytes".len() as i64);
+        assert!(resolved.source_id.starts_with("image|cover.jpg|-|-|"));
+        // source_id に mtime と size が入っている
+        assert!(resolved.source_id.ends_with(&format!("|{}", b"fake-jpeg-bytes".len())));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_pin_target_missing_returns_none() {
+        let tmp = std::env::temp_dir().join(format!(
+            "miv_pin_resolve_missing_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let source = FolderPinSource::File {
+            rel: "nope.jpg".to_string(),
+            kind: FileKind::Image,
+        };
+        assert!(resolve_pin_target(&tmp, &source).is_none());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_pin_target_pdfpage_carries_page_number() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!(
+            "miv_pin_resolve_pdfpage_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let pdf = tmp.join("doc.pdf");
+        std::fs::File::create(&pdf)
+            .unwrap()
+            .write_all(b"%PDF-1.4 dummy")
+            .unwrap();
+        let source = FolderPinSource::PdfPage {
+            pdf_rel: "doc.pdf".to_string(),
+            page: 7,
+        };
+        let resolved = resolve_pin_target(&tmp, &source).unwrap();
+        assert_eq!(resolved.kind, ResolvedKind::PdfPage);
+        assert_eq!(resolved.pdf_page, Some(7));
+        assert!(resolved.source_id.contains("|7|"));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_pin_target_zipentry_in_container_uses_container_path() {
+        use std::io::Write;
+        let tmp = std::env::temp_dir().join(format!(
+            "miv_pin_resolve_zipentry_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let zip = tmp.join("scans.zip");
+        std::fs::File::create(&zip)
+            .unwrap()
+            .write_all(b"PK\x03\x04 dummy")
+            .unwrap();
+        let source = FolderPinSource::ZipEntry {
+            zip_rel: String::new(),
+            entry: "p01.png".to_string(),
+        };
+        // container 自身が ZIP のケース
+        let resolved = resolve_pin_target(&zip, &source).unwrap();
+        assert_eq!(resolved.kind, ResolvedKind::ZipEntry);
+        assert_eq!(resolved.abs_path, zip);
+        assert_eq!(resolved.zip_entry.as_deref(), Some("p01.png"));
+        assert!(resolved.source_id.starts_with("zipentry||p01.png|-|"));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

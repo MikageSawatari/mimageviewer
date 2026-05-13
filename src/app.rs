@@ -1856,6 +1856,20 @@ pub struct App {
     /// 表示される。B キー / 🔖 ボタンで追加。
     pub(crate) video_bookmark_db: Option<crate::video_bookmarks::VideoBookmarkDb>,
 
+    // ── 親コンテナ (フォルダ/ZIP/PDF) 代表サムネ ピン留め ────────
+    /// 親コンテナの代表サムネを手動で固定するためのピン DB。
+    /// 解決優先度: 1) `folder_thumb_pin_db` の手動ピン → 2) `resolve_folder_thumb_image`
+    /// の自動選定 → 3) アイコン fallback。
+    pub(crate) folder_thumb_pin_db: Option<crate::folder_thumb_pins::FolderThumbPinDb>,
+    /// 現在ロード済み items の親コンテナごとのピン source キャッシュ。
+    /// `load_folder` 完了時に `lookup_many` で一括取得し、`make_load_request` から
+    /// 同期参照する (per-frame DB アクセス回避)。キーは `normalize_keep_drive(container)`。
+    pub(crate) folder_pin_map:
+        std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    /// 親コンテナのピン書き換えがあったので、次の機会にフォルダを再ロードして
+    /// グリッドサムネに反映する必要があるフラグ (`video_thumb_overrides_dirty` と同じ作法)。
+    pub(crate) folder_thumb_pin_dirty: bool,
+
     // ── 動画タイルモード (Phase 5.5) ─────────────────────────────
     /// S キーでトグルされる動画タイルモード状態。再生中に間隔別にサムネを並べて
     /// クリックでシーク。VideoPlayer 切替で自動破棄 (Drop で worker 終了)。
@@ -2654,6 +2668,12 @@ impl Default for App {
         crate::perf::emit_ms("startup", "db_open_video_pins", 0, t);
 
         let t = std::time::Instant::now();
+        let folder_thumb_pin_db = crate::folder_thumb_pins::FolderThumbPinDb::open()
+            .map_err(|e| crate::logger::log(format!("folder_thumb_pin_db open failed: {e}")))
+            .ok();
+        crate::perf::emit_ms("startup", "db_open_folder_thumb_pins", 0, t);
+
+        let t = std::time::Instant::now();
         let video_bookmark_db = crate::video_bookmarks::VideoBookmarkDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_video_bookmarks", 0, t);
 
@@ -2867,6 +2887,9 @@ impl Default for App {
             normalize_ui_states: std::collections::HashMap::new(),
             video_pin_db,
             video_bookmark_db,
+            folder_thumb_pin_db,
+            folder_pin_map: std::collections::HashMap::new(),
+            folder_thumb_pin_dirty: false,
             #[cfg(windows)]
             video_tile_state: None,
             #[cfg(windows)]
@@ -5985,6 +6008,95 @@ impl App {
         // 既定は「実ビュー」。`replace_search_view_items` (= 合成ビュー経路) は
         // この後で true に上書きする。
         self.items_are_global_search_view = false;
+        // 親コンテナ (Folder/ZipFile/PdfFile) のピン情報を 1 度の lookup_many で取得し、
+        // make_load_request からの per-frame DB ヒットを回避する。pin がレアケースで
+        // 大半は empty なので、典型的なフォルダで HashMap は数百 bytes に収まる。
+        self.refresh_folder_pin_map();
+    }
+
+    /// 現在 items 中の親コンテナ (Folder/ZipFile/PdfFile) 分のピンを DB から
+    /// 一括取得して `folder_pin_map` に格納する。pin DB が未開なら no-op。
+    fn refresh_folder_pin_map(&mut self) {
+        self.folder_pin_map.clear();
+        let Some(db) = self.folder_thumb_pin_db.as_ref() else {
+            return;
+        };
+        let container_paths: Vec<&std::path::Path> = self
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+                    Some(p.as_path())
+                }
+                _ => None,
+            })
+            .collect();
+        if container_paths.is_empty() {
+            return;
+        }
+        self.folder_pin_map = db.lookup_many(container_paths);
+    }
+
+    /// 指定 container の代表サムネピンを `source` に設定 (上書き) し、再ロード予約を立てる。
+    /// UI 側 (Phase D の 📌 ボタン / コンテキストメニュー) からの主エントリポイント。
+    ///
+    /// 戻り値: 書き込みに成功すれば `true`。pin DB 未開 / SQL エラーで失敗時は
+    /// `false` でログのみ残す (UI 側はエラー詳細を出さずに「設定できませんでした」を表示)。
+    #[allow(dead_code)] // Phase D で UI から配線される
+    pub(crate) fn set_folder_thumb_pin(
+        &mut self,
+        container: &std::path::Path,
+        source: crate::folder_thumb_pins::FolderPinSource,
+    ) -> bool {
+        let Some(db) = self.folder_thumb_pin_db.as_ref() else {
+            crate::logger::log("folder_thumb_pin: DB not open".to_string());
+            return false;
+        };
+        match db.set(container, &source) {
+            Ok(()) => {
+                let key = crate::path_key::normalize_keep_drive(container);
+                self.folder_pin_map.insert(key, source);
+                self.folder_thumb_pin_dirty = true;
+                crate::logger::log(format!("folder_thumb_pin set: {}", container.display()));
+                true
+            }
+            Err(e) => {
+                crate::logger::log(format!("folder_thumb_pin set failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// 指定 container の代表サムネピンを解除する (該当行が無くてもエラーにしない)。
+    #[allow(dead_code)] // Phase D で UI から配線される
+    pub(crate) fn remove_folder_thumb_pin(&mut self, container: &std::path::Path) -> bool {
+        let Some(db) = self.folder_thumb_pin_db.as_ref() else {
+            return false;
+        };
+        match db.remove(container) {
+            Ok(()) => {
+                let key = crate::path_key::normalize_keep_drive(container);
+                self.folder_pin_map.remove(&key);
+                self.folder_thumb_pin_dirty = true;
+                crate::logger::log(format!("folder_thumb_pin removed: {}", container.display()));
+                true
+            }
+            Err(e) => {
+                crate::logger::log(format!("folder_thumb_pin remove failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// 指定 container に現在のピン情報があれば返す。UI 側で「同じ画像が pin 済みか」
+    /// 判定し、トグル動作のためのボタン表示状態を切り替えるのに使う。
+    #[allow(dead_code)] // Phase D で UI から配線される
+    pub(crate) fn folder_thumb_pin_for(
+        &self,
+        container: &std::path::Path,
+    ) -> Option<&crate::folder_thumb_pins::FolderPinSource> {
+        let key = crate::path_key::normalize_keep_drive(container);
+        self.folder_pin_map.get(&key)
     }
 
     /// items の idx 参照がまとめて無効になった後に呼ぶ共通クリーンアップ。
@@ -7428,6 +7540,7 @@ impl App {
                     self.pdf_current_password.as_deref(),
                     Some(self.settings.folder_thumb_sort),
                     self.settings.folder_thumb_depth,
+                    &self.folder_pin_map,
                 )
             }) else {
                 continue;
@@ -7734,6 +7847,7 @@ impl App {
                     self.pdf_current_password.as_deref(),
                     Some(self.settings.folder_thumb_sort),
                     self.settings.folder_thumb_depth,
+                    &self.folder_pin_map,
                 )
             }) else {
                 continue;
@@ -8722,10 +8836,7 @@ impl App {
             // native 動画 fullscreen 中は中央ヒントが見えないので toast でも feedback。
             #[cfg(windows)]
             if self.native_video_fullscreen_active_for_main_backdrop() {
-                self.show_native_video_overlay_toast(
-                    Self::native_boundary_hint_text(hint),
-                    true,
-                );
+                self.show_native_video_overlay_toast(Self::native_boundary_hint_text(hint), true);
             }
             self.clear_pending_folder_nav_steps();
             // 同上: items_generation 不変のまま return するので明示 release (Codex P1)。
@@ -11497,6 +11608,15 @@ impl App {
         if std::mem::take(&mut self.video_thumb_overrides_dirty) {
             if let Some(cur) = self.current_folder.clone() {
                 // 現フォルダ + 履歴を温存したまま再ロード
+                self.folder_history.remove(&cur);
+                self.load_folder(cur);
+            }
+        }
+        // 親コンテナ (Folder/ZipFile/PdfFile) の代表サムネピンが書き換わっていたら
+        // 同じく現フォルダを再ロードしてグリッドに反映する (= pin の cache key が
+        // 新しい source_id に変わるので catalog miss → ピン target で再生成)。
+        if std::mem::take(&mut self.folder_thumb_pin_dirty) {
+            if let Some(cur) = self.current_folder.clone() {
                 self.folder_history.remove(&cur);
                 self.load_folder(cur);
             }
@@ -15804,6 +15924,12 @@ fn interleaved_prefetch_targets(
 }
 
 /// GridItem から LoadRequest を構築する。画像 / ZIP 内画像 / PDF ページ / フォルダ以外は None を返す。
+///
+/// `pin_map` は親コンテナ (Folder/ZipFile/PdfFile) のピン source 一覧で、
+/// `App::folder_pin_map` の参照を渡す。空 HashMap でも構わない (= pin 機能なし相当)。
+/// pin が見つかったコンテナは `apply_folder_thumb_pin` で `LoadRequest` を target
+/// 種別の形に書き換える (cache_key は親 prefix を維持し suffix で identity を載せる)。
+#[allow(clippy::too_many_arguments)]
 fn make_load_request(
     item: &GridItem,
     idx: usize,
@@ -15813,6 +15939,7 @@ fn make_load_request(
     pdf_password: Option<&str>,
     folder_thumb_sort: Option<crate::settings::SortOrder>,
     folder_thumb_depth: u32,
+    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
 ) -> Option<LoadRequest> {
     // 共通フィールド (idx/path/mtime/file_size/skip_cache) 以外は Default (0/None/false)
     // を基底にして差分だけ上書きする。入力 seq / items_gen は後段のエンキューで上書きされる。
@@ -15852,11 +15979,13 @@ fn make_load_request(
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
-            Some(LoadRequest {
+            let base_key = format!("{}{fname}", CACHE_KEY_ZIP);
+            let req = LoadRequest {
                 path: p.clone(),
-                cache_key_override: Some(format!("{}{fname}", CACHE_KEY_ZIP)),
+                cache_key_override: Some(base_key.clone()),
                 ..base
-            })
+            };
+            Some(apply_folder_thumb_pin(req, p, &base_key, pin_map, pdf_password))
         }
         GridItem::PdfFile(p) => {
             let fname = p
@@ -15864,13 +15993,15 @@ fn make_load_request(
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
-            Some(LoadRequest {
+            let base_key = format!("{}{fname}", CACHE_KEY_PDF);
+            let req = LoadRequest {
                 path: p.clone(),
                 pdf_page: Some(0),
                 pdf_password: pdf_password.map(String::from),
-                cache_key_override: Some(format!("{}{fname}", CACHE_KEY_PDF)),
+                cache_key_override: Some(base_key.clone()),
                 ..base
-            })
+            };
+            Some(apply_folder_thumb_pin(req, p, &base_key, pin_map, pdf_password))
         }
         GridItem::Folder(p) => {
             let fname = p
@@ -15878,13 +16009,15 @@ fn make_load_request(
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
-            Some(LoadRequest {
+            let base_key = format!("{}{fname}", CACHE_KEY_FOLDER);
+            let req = LoadRequest {
                 path: p.clone(),
-                cache_key_override: Some(format!("{}{fname}", CACHE_KEY_FOLDER)),
+                cache_key_override: Some(base_key.clone()),
                 folder_thumb_sort,
                 folder_thumb_depth,
                 ..base
-            })
+            };
+            Some(apply_folder_thumb_pin(req, p, &base_key, pin_map, pdf_password))
         }
         GridItem::SearchContainer {
             representative: Some(rep),
@@ -15913,6 +16046,95 @@ fn make_load_request(
             })
         }
         _ => None,
+    }
+}
+
+/// 親コンテナ用 `LoadRequest` (Folder/ZipFile/PdfFile) に対し、手動ピンがあれば
+/// target 種別のリクエストに書き換える。
+///
+/// 動作:
+/// - `pin_map` から container のピン source を引く。無ければ `base_req` をそのまま返す。
+/// - target を `resolve_pin_target` で解決。target ファイルが存在しなければ
+///   無効ピンと判断し `base_req` をそのまま返す (= 自動選定に fall back)。
+/// - target 種別に応じて `path` / `zip_entry` / `pdf_page` / `resolve_override` を上書き。
+/// - `cache_key_override` は `{base_key}#pin:{source_id}` にし、pin の identity が
+///   target 変更で必ず変わるようにする (古い WebP を catch しない)。
+/// - `mtime` / `file_size` を target ファイル自身のものに差し替える (= catalog の
+///   hit 判定が target metadata に対して行われる)。
+///
+/// Phase B 注意:
+/// - Video pin (`ResolvedKind::Video`) は video worker 経由でないと正しく描画できない
+///   ため、Phase B では **pin なし扱い** で `base_req` を返す。Phase C で start_loading_items
+///   側に folder pin → video の別経路を組む予定。
+/// - Folder source (`ResolvedKind::Folder`) は target サブフォルダで `FolderRepresentative`
+///   strategy を実行する。**そのサブフォルダ自身の pin は引かない** ことで再帰を 1 段で
+///   止める (= サイクル A↔B のような無限ループ防止)。pin_map が今フォルダの 1 階層分の
+///   container だけを持っている前提と整合。
+fn apply_folder_thumb_pin(
+    base_req: LoadRequest,
+    container: &std::path::Path,
+    base_key: &str,
+    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pdf_password: Option<&str>,
+) -> LoadRequest {
+    let container_key = crate::path_key::normalize_keep_drive(container);
+    let Some(source) = pin_map.get(&container_key) else {
+        return base_req;
+    };
+    let Some(resolved) = crate::folder_thumb_pins::resolve_pin_target(container, source) else {
+        crate::logger::log(format!(
+            "folder_thumb_pin: target unresolved for {} (source={:?}) — falling back to auto-select",
+            container.display(),
+            source,
+        ));
+        return base_req;
+    };
+
+    use crate::folder_thumb_pins::ResolvedKind;
+    use crate::thumb_loader::ResolveStrategy;
+
+    // Video pin は Phase C で配線。Phase B では fallback。
+    if matches!(resolved.kind, ResolvedKind::Video) {
+        return base_req;
+    }
+
+    let pinned_key = format!(
+        "{}{}{}",
+        base_key,
+        crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+        resolved.source_id,
+    );
+
+    // dispatch field を target 種別ごとに組み立てる。
+    let (resolve_override, zip_entry, pdf_page) = match resolved.kind {
+        ResolvedKind::Image => (Some(ResolveStrategy::DirectImage), None, None),
+        ResolvedKind::Folder => (Some(ResolveStrategy::FolderRepresentative), None, None),
+        ResolvedKind::ZipFirstImage => (Some(ResolveStrategy::ZipFirstImage), None, None),
+        ResolvedKind::PdfFirstPage => (None, None, Some(0u32)),
+        ResolvedKind::ZipEntry => (None, resolved.zip_entry.clone(), None),
+        ResolvedKind::PdfPage => (None, None, resolved.pdf_page),
+        // Video は上で early-return 済み
+        ResolvedKind::Video => return base_req,
+    };
+
+    LoadRequest {
+        path: resolved.abs_path,
+        zip_entry,
+        pdf_page,
+        pdf_password: pdf_password.map(String::from),
+        cache_key_override: Some(pinned_key),
+        mtime: resolved.mtime,
+        file_size: resolved.file_size,
+        resolve_override,
+        // フォルダ自動選定パラメータ (sort/depth) は Folder strategy のときだけ意味がある。
+        // base_req から継承するので Folder → Folder の pin で sort/depth が消えない。
+        folder_thumb_sort: base_req.folder_thumb_sort,
+        folder_thumb_depth: base_req.folder_thumb_depth,
+        idx: base_req.idx,
+        skip_cache: base_req.skip_cache,
+        priority: base_req.priority,
+        input_seq: base_req.input_seq,
+        items_gen: base_req.items_gen,
     }
 }
 

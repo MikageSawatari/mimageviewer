@@ -46,6 +46,30 @@ pub const CACHE_KEY_ZIP: &str = "zipthumb:";
 pub const CACHE_KEY_PDF: &str = "pdfthumb:";
 /// カタログ内のフォルダサムネイル用キャッシュキープレフィックス
 pub const CACHE_KEY_FOLDER: &str = "folderthumb:";
+
+/// 親コンテナ (フォルダ / ZIP / PDF) に手動ピンが付いているときに、cache key の
+/// 後ろに `#pin:` 区切りで pin の identity を埋め込む (docs/virtual-folders.md §3.1)。
+/// pin の付け替え / target 変更で自然に key が変わって古い WebP を catch しない。
+pub const CACHE_KEY_PIN_SUFFIX: &str = "#pin:";
+
+/// pin 解決時の dispatch 戦略。
+///
+/// 通常 (pin なし) は `LoadRequest::cache_key_override` の prefix で is_folder_thumb /
+/// is_zip_thumb を判定するが、pin がある場合は cache key を親 (folderthumb 等) に
+/// 揃えるので prefix では target 種別が分からない。`LoadRequest::resolve_override` を
+/// `Some` にしてここで明示する。
+///
+/// PdfFirstPage / PdfPage / ZipEntry は `pdf_page` / `zip_entry` フィールドで
+/// 暗黙に dispatch されるので、ここには載せない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolveStrategy {
+    /// `req.path` を直接画像として decode
+    DirectImage,
+    /// `req.path` はフォルダ。`resolve_folder_thumb_image` で代表画像を選ぶ
+    FolderRepresentative,
+    /// `req.path` は ZIP。`zip_loader::read_first_image_bytes` で先頭画像を取り出す
+    ZipFirstImage,
+}
 /// Ctrl+G アグリゲートビューの「代表サムネ」用キャッシュキープレフィックス (v0.8.1)。
 /// filename 単体だと別コンテナ同士の同名画像 (例: `cover.jpg`) でキャッシュ衝突し、
 /// placeholder mtime=0 で相手の thumb を読み込んでしまうため、**コンテナ path 丸ごと**
@@ -121,6 +145,10 @@ pub struct LoadRequest {
     pub folder_thumb_sort: Option<crate::settings::SortOrder>,
     /// フォルダサムネイル用: サブフォルダを探索する最大階層数
     pub folder_thumb_depth: u32,
+    /// pin 解決時の dispatch 上書き。`Some` のときは `cache_key_override` の prefix
+    /// 判定 (is_folder_thumb / is_zip_thumb) を無視してここで指定された戦略で
+    /// resolve する。`None` のときは従来通り prefix で判定する。
+    pub resolve_override: Option<ResolveStrategy>,
     /// パフォーマンス計装用: エンキュー時の input_seq (相関キー)。
     /// 0 は未設定を意味する。`--perf-log` 無効時は使われない。
     pub input_seq: u64,
@@ -597,17 +625,28 @@ pub fn process_load_request(
 
     // 重い I/O (ZIP/Folder) は専用 I/O ワーカーキューで処理されるため、
     // セマフォは不要。I/O ワーカー数 (1-2) で自然に同時実行数が制限される。
-    let is_folder_thumb = req
-        .cache_key_override
-        .as_deref()
-        .is_some_and(|k| k.starts_with(CACHE_KEY_FOLDER));
-    // 「override がある && zip_entry も pdf_page も None」だけだと、将来追加された
-    // 別用途の override キー (例: searchrep:) まで ZIP thumb と誤分類してしまう
-    // (Codex P1 対応)。**明示的に zipthumb: プレフィックスを見る**。
-    let is_zip_thumb = req
-        .cache_key_override
-        .as_deref()
-        .is_some_and(|k| k.starts_with(CACHE_KEY_ZIP));
+    //
+    // pin 解決時 (`resolve_override` Some) は **prefix 判定をスキップ**し、
+    // 明示された strategy で dispatch する。pin の cache key は親側の prefix
+    // (folderthumb / zipthumb / pdfthumb) を保つので、prefix 判定だけだと
+    // 「ZIP 内画像を親のフォルダ thumb として scan しようとして失敗」のような
+    // ミスマッチが起きる。
+    let is_folder_thumb = match req.resolve_override {
+        Some(ResolveStrategy::FolderRepresentative) => true,
+        Some(_) => false,
+        None => req
+            .cache_key_override
+            .as_deref()
+            .is_some_and(|k| k.starts_with(CACHE_KEY_FOLDER)),
+    };
+    let is_zip_thumb = match req.resolve_override {
+        Some(ResolveStrategy::ZipFirstImage) => true,
+        Some(_) => false,
+        None => req
+            .cache_key_override
+            .as_deref()
+            .is_some_and(|k| k.starts_with(CACHE_KEY_ZIP)),
+    };
     let needs_heavy_io = is_folder_thumb || is_zip_thumb;
 
     // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替え
