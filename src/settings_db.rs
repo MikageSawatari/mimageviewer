@@ -329,6 +329,14 @@ impl SettingsDb {
             .map_err(|e| classify_rusqlite_error_for_open(e, "Connection::open"))?;
         apply_pragmas(&conn).map_err(|e| classify_rusqlite_error_for_open(e, "apply_pragmas"))?;
         check_integrity_classified(&conn)?;
+        // Codex P3 v5 (2026-05-13): `RequireExisting` で開いたファイルが「形式上 OK な
+        // 空 DB」であってもそのまま init_schema を走らせると defaults でロードされる事故が
+        // 起きる (= bak / JSON migration への fallback を奪う)。Phase 2 で書き込まれる
+        // `schema_meta.schema_version` の存在を必須条件にし、無ければ `Corrupted` 扱いで
+        // 上層に bak 試行を委ねる。
+        if mode == OpenMode::RequireExisting {
+            ensure_existing_db_initialized(&conn)?;
+        }
         init_schema(&conn).map_err(|e| classify_rusqlite_error_for_open(e, "init_schema"))?;
 
         Ok(Self {
@@ -504,12 +512,16 @@ fn is_family_filename(name: &str) -> bool {
         return true;
     }
     if let Some(rest) = name.strip_prefix("settings.db.bak") {
-        // spec §6 で定義された世代 = bak1..bak10。範囲外 (bak0 / bak11 / bak100…) は
-        // family 扱いしない (Codex P3 v4 2026-05-13: 上位互換でも下位互換でもない
-        // 異物が family と誤判定されると、main 不在時に save 抑止に倒れて
-        // クリーンインストール経路が永久に動かなくなる懸念があるため)。
+        // spec §6 で定義された世代 = **正準形の** bak1..bak10 のみ。
+        // 範囲外 (bak0 / bak11 / bak100) と先頭ゼロ (bak01) は family 扱いしない
+        // (Codex P3 v4/v5 2026-05-13: 異物を family と誤判定すると、main 不在時に
+        // save 抑止に倒れてクリーンインストール経路が永久に動かなくなる)。
+        // 「rotate_db_backups が生成する canonical 名以外は無視する」ポリシー。
         if let Ok(n) = rest.parse::<u32>() {
-            return (1..=10).contains(&n);
+            // 先頭ゼロを弾く: parse は "01" -> 1 を許すが正準形 1 桁とは違う。
+            if rest == n.to_string() {
+                return (1..=10).contains(&n);
+            }
         }
     }
     false
@@ -529,6 +541,60 @@ fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
          PRAGMA busy_timeout = 5000;
          PRAGMA foreign_keys = ON;",
     )?;
+    Ok(())
+}
+
+/// `RequireExisting` モードで開いた DB が **既に initial schema を持つ既存ファイル** で
+/// あることを保証する。
+///
+/// SQLite は空ファイル (0 バイト) や形式上有効な空 DB を `Connection::open` で
+/// 受け付けてしまう。そのまま `init_schema` を走らせて defaults でロードすると、
+/// bak / JSON migration への fallback 経路が奪われる (Codex P3 v5 2026-05-13)。
+///
+/// 判定: `schema_meta` テーブルに `schema_version` row が存在するか。Phase 2 以降の
+/// fresh-init は **必ず** `init_schema` でこの row を書き込む契約なので、欠落は
+/// 「partial-init or empty DB」を意味する。
+fn ensure_existing_db_initialized(conn: &Connection) -> Result<(), SettingsDbError> {
+    // schema_meta テーブル自体の存在をまず見る。
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'",
+            [],
+            |_| Ok(true),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(false),
+            _ => Err(e),
+        })
+        .map_err(|e| classify_rusqlite_error_for_open(e, "ensure_existing_db_initialized:table"))?;
+    if !table_exists {
+        log_diag(
+            "settings_db: RequireExisting open: schema_meta table missing (empty or partial DB)",
+        );
+        return Err(SettingsDbError::Corrupted(
+            "RequireExisting: schema_meta table missing".to_string(),
+        ));
+    }
+    // schema_version row が無ければ partial-init として Corrupted 扱い。
+    let has_version: bool = conn
+        .query_row(
+            "SELECT 1 FROM schema_meta WHERE key = 'schema_version'",
+            [],
+            |_| Ok(true),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(false),
+            _ => Err(e),
+        })
+        .map_err(|e| {
+            classify_rusqlite_error_for_open(e, "ensure_existing_db_initialized:version")
+        })?;
+    if !has_version {
+        log_diag("settings_db: RequireExisting open: schema_version row missing");
+        return Err(SettingsDbError::Corrupted(
+            "RequireExisting: schema_version row missing".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -1476,12 +1542,52 @@ mod tests {
         assert!(!is_family_filename("settings.db.bakX"));
         assert!(!is_family_filename("settings.db.foo"));
         assert!(!is_family_filename("settings.json"));
-        // spec §6 範囲外 (Codex P3 v4 2026-05-13)。bak0 / bak11+ は弾く。
+        // spec §6 範囲外 / 非正準形 (Codex P3 v4/v5 2026-05-13)。
         assert!(!is_family_filename("settings.db.bak0"));
         assert!(!is_family_filename("settings.db.bak11"));
         assert!(!is_family_filename("settings.db.bak100"));
-        // leading zero は数値 parse 上「bak1」と等価 (= 弾く理由がないので許容)。
-        assert!(is_family_filename("settings.db.bak01"));
+        // 先頭ゼロは非正準なので弾く (Codex P3 v5)。
+        assert!(!is_family_filename("settings.db.bak01"));
+        assert!(!is_family_filename("settings.db.bak001"));
+    }
+
+    #[test]
+    fn require_existing_rejects_empty_sqlite_db() {
+        // Codex P3 v5 (2026-05-13): 0 バイトファイルや形式上 OK な空 DB を
+        // RequireExisting で開いたとき、defaults でロードせず Corrupted にする。
+        // これで上層が bak / JSON migration の fallback を試行できる。
+        let dir = TempDir::new().unwrap();
+        let main_path = dir.path().join("settings.db");
+
+        // ケース 1: 完全に 0 バイトのファイル。SQLite 的には valid な空 DB と扱われる
+        // (= integrity_check は ok を返す)。
+        std::fs::File::create(&main_path).unwrap();
+        let err = match SettingsDb::open(dir.path()) {
+            Ok(_) => panic!("empty file should not pass RequireExisting"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SettingsDbError::Corrupted(_)),
+            "empty DB should be Corrupted, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn require_existing_rejects_partial_init() {
+        // ケース 2: schema_meta テーブルはあるが schema_version row が無い (= partial init)。
+        let dir = TempDir::new().unwrap();
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        conn.execute_batch("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+            .unwrap();
+        drop(conn);
+        let err = match SettingsDb::open(dir.path()) {
+            Ok(_) => panic!("partial init should not pass RequireExisting"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SettingsDbError::Corrupted(_)),
+            "partial init should be Corrupted, got: {err:?}"
+        );
     }
 
     #[test]
