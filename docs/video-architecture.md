@@ -942,9 +942,11 @@ overlay_draw.rs::draw_native_perf_overlay`) には:
 - ヘッダ 2 行目右端: `A/V {offset_ms}` (固定幅 monospace、桁ぶれなし。色: |offset|<5
   緑 / <20 黄 / >=20 赤)。audio inactive 時は `vid {drift_ms}` (= 旧 av_drift にフォールバック)
 - ヘッダ 2 行目: `lead {audio_lead_ms}` (audio が master clock から先行している量、
-  通常グレー、|lead|>=50ms で橙)
-- ヘッダ 2 行目: `audio_underrun_active == true` のとき赤 `UNDERRUN` (絵文字は使わない、
-  CLAUDE.md「UI 文字列の Unicode グリフ選定ルール」遵守)
+  通常グレー、|lead|>=50ms で橙)。audio inactive 時は表示しない
+- ヘッダ 2 行目: audio active かつ `audio_underrun_active == true` のとき赤 `UNDERRUN`
+  (絵文字は使わない、CLAUDE.md「UI 文字列の Unicode グリフ選定ルール」遵守)
+- ヘッダ 1 行目: `native {fps}` は graph と同じ直近約 6 秒の visible sample から、
+  `interval_ms` の平均で計算する。停止中など sample が無い時間は分母に入れない。
 - グラフ rect 内: A/V offset をシアン (alpha=200)、Y 軸スケール ±200ms 中心、0ms
   ラインを点線で描画。Norm clear バグ時の `-5000ms` 級 (= 映像が音声より秒オーダーで
   遅れる方向、`offset = video − audio` で負値) は下端で saturate して「異常」のサインとして
@@ -953,7 +955,7 @@ overlay_draw.rs::draw_native_perf_overlay`) には:
   の長短だけでは赤縦線を出さない。
 - グラフ rect 内: 赤縦線は `late_drop` が増えた sample のみ (= 古い frame を表示前に捨てた
   タイミング) に出す。`drop` カウンタと視覚 marker の意味を揃える。
-- グラフ rect 内: underrun 区間に橙背景帯。audio 側の警告は赤縦線とは分ける。
+- グラフ rect 内: audio active 時の underrun 区間に橙背景帯。audio 側の警告は赤縦線とは分ける。
 
 ### 検証手順 (修正後の正常動作確認)
 
