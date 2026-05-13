@@ -6045,9 +6045,14 @@ impl App {
     /// 分岐は LoadRequest の `cache_key_override` / `mtime` / `file_size` を target
     /// 動画のメタデータで埋めるので、ここで書き込んだ catalog 行と整合する。
     ///
-    /// WebP が見つからない (= video_pin が登録されていない / blob が空) 場合は
-    /// seed をスキップ。worker は cache miss → `resolve_folder_thumb_image` で
-    /// folder 自身の自動代表サムネを生成する経路 (= base_req と同等) に落ちる。
+    /// **stale 行の掃除** (Codex Phase C P2 指摘): `video_pins` に行が無い / 空 blob /
+    /// 復元失敗のときは、過去に seed されていた pinned cache 行 (= 旧 video pin の
+    /// WebP) を catalog + cache_map から **削除** する。これをやらないと、worker が
+    /// 旧 WebP で cache_hit してしまい、auto-pick fallback に落ちない。
+    ///
+    /// **byte 比較** (Codex Phase C P2 指摘): `video_pins.set_pin` は同じ動画 path に
+    /// 対して `pin_pts_secs` / `thumb_webp` を上書き更新する。mtime/size だけ見ると
+    /// 「内容が変わったか」を判定できないので、`jpeg_data` を直接比較して再 seed する。
     fn seed_folder_video_pin_thumbs(
         &self,
         cache_map: &Arc<
@@ -6066,6 +6071,7 @@ impl App {
         };
         use crate::folder_thumb_pins::{FileKind, FolderPinSource, ResolvedKind};
         let mut seeded = 0u32;
+        let mut purged = 0u32;
         for item in &self.items {
             let GridItem::Folder(container_path) = item else {
                 continue;
@@ -6093,12 +6099,6 @@ impl App {
             if !matches!(resolved.kind, ResolvedKind::Video) {
                 continue;
             }
-            let Some(pin) = video_db.lookup(&resolved.abs_path) else {
-                continue;
-            };
-            if pin.thumb_webp.is_empty() {
-                continue;
-            }
             let Some(fname) = container_path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
@@ -6109,30 +6109,50 @@ impl App {
                 crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
                 resolved.source_id,
             );
-            // 既存 seed が同じ identity (mtime/size) なら書き直さない (典型ケース)。
-            // 動画ファイルが差し替わった (mtime/size 更新) と video_pin が再生成された
-            // ときは source_id が変わるので、自然に新 pinned_key で seed され、古い
-            // 行は `delete_missing` (existing_keys に新 source_id しか入らない) で
-            // 掃除される。
+
+            // 取得可能な WebP を確定する。`Some(Vec<u8>)` なら非空 blob 確定。
+            let webp = video_db
+                .lookup(&resolved.abs_path)
+                .map(|pin| pin.thumb_webp)
+                .filter(|b| !b.is_empty());
+
+            let Some(webp) = webp else {
+                // WebP 無し: 既存 seed (旧 pin の残骸) があれば削除して fallback 経路へ。
+                let stale_exists = cache_map
+                    .read()
+                    .ok()
+                    .map(|map| map.contains_key(&pinned_key))
+                    .unwrap_or(false);
+                if stale_exists {
+                    if let Err(e) = cat.delete_one(&pinned_key) {
+                        crate::logger::log(format!(
+                            "folder_thumb_pin video seed purge failed: {e} ({pinned_key})"
+                        ));
+                    } else if let Ok(mut map) = cache_map.write() {
+                        map.remove(&pinned_key);
+                        purged += 1;
+                    }
+                }
+                continue;
+            };
+
+            // 既存 seed が完全一致 (mtime/size + bytes) なら書き直さない (典型ケース)。
             let already_seeded = cache_map
                 .read()
                 .ok()
                 .and_then(|map| {
                     map.get(&pinned_key).map(|entry| {
-                        entry.mtime == resolved.mtime && entry.file_size == resolved.file_size
+                        entry.mtime == resolved.mtime
+                            && entry.file_size == resolved.file_size
+                            && entry.jpeg_data == webp
                     })
                 })
                 .unwrap_or(false);
             if already_seeded {
                 continue;
             }
-            match cat.save_thumb_bytes(
-                &pinned_key,
-                resolved.mtime,
-                resolved.file_size,
-                None,
-                &pin.thumb_webp,
-            ) {
+            match cat.save_thumb_bytes(&pinned_key, resolved.mtime, resolved.file_size, None, &webp)
+            {
                 Ok(true) => {}
                 Ok(false) => {
                     crate::logger::log(format!(
@@ -6155,16 +6175,16 @@ impl App {
                     crate::catalog::CacheEntry {
                         mtime: resolved.mtime,
                         file_size: resolved.file_size,
-                        jpeg_data: pin.thumb_webp.clone(),
+                        jpeg_data: webp,
                         source_dims: None,
                     },
                 );
             }
             seeded += 1;
         }
-        if seeded > 0 {
+        if seeded > 0 || purged > 0 {
             crate::logger::log(format!(
-                "folder_thumb_pin: seeded {seeded} video pin WebPs into folder cache"
+                "folder_thumb_pin: video seed = {seeded}, purged stale = {purged}"
             ));
         }
     }
@@ -16395,6 +16415,12 @@ fn apply_folder_thumb_pin(
         // は必ず Folder 種別。`path = container` のままで worker の prefix 判定が
         // CACHE_KEY_FOLDER → is_folder_thumb=true となり、cache miss 時に
         // resolve_folder_thumb_image(folder, sort, depth) が走る。
+        //
+        // `skip_cache` は **常に false** (Codex Phase C P1 指摘)。video_pin の WebP は
+        // grid 表示用に既に確定済みで、idle quality-upgrade の「元画像から再 decode」が
+        // 意味を持たない。base_req.skip_cache=true (アップグレード再エンキュー) を継承
+        // すると cache_hit を踏み越えて is_folder_thumb 経路で folder の auto-pick を
+        // pinned_key 下に書き戻してしまい、video frame が消える。
         return LoadRequest {
             path: container.to_path_buf(),
             zip_entry: None,
@@ -16409,7 +16435,7 @@ fn apply_folder_thumb_pin(
             folder_thumb_sort: base_req.folder_thumb_sort,
             folder_thumb_depth: base_req.folder_thumb_depth,
             idx: base_req.idx,
-            skip_cache: base_req.skip_cache,
+            skip_cache: false,
             priority: base_req.priority,
             input_seq: base_req.input_seq,
             items_gen: base_req.items_gen,
