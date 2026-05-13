@@ -97,6 +97,49 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 
 **キャッシュキーの命名規則**を勝手に変えないこと。既存キャッシュが全部無効になる。
 
+#### 3.1.1 親コンテナの代表サムネピン (folder thumb pin、v0.9.x)
+
+ユーザーが「このフォルダ / ZIP / PDF の代表サムネは中の特定アイテム」を手動で指定
+できる機能。優先順位は **手動ピン > 自動代表選定 > フォルダ/ZIP/PDF アイコン**。
+
+- **DB**: `%APPDATA%/mimageviewer/folder_thumb_pins.db` (`folder_thumb_pins.rs`)。
+  schema は `(container_key, source_kind, source_rel, source_entry, source_page)`。
+  container_key は `path_key::normalize_keep_drive` で正規化。
+- **解決パス**: `make_load_request` 経由で `apply_folder_thumb_pin` が pin map
+  (= `App::folder_pin_map`、load 開始時に `lookup_many` で一括取得) を引き、
+  pin があれば `LoadRequest` を target アイテム用の形 (path/zip_entry/pdf_page/
+  resolve_override) に書き換える。
+- **キャッシュキーの例外規則**: pin 適用後は `{base_key}#pin:{source_id}` の形に
+  なる。`source_id` は kind/rel/entry/page/mtime/size を `|` 連結した compact 表現で、
+  pin の付け替え / target ファイルの mtime/size 変化で自動的に変わる
+  (= 古い WebP を catch しない)。`existing_keys` には base + pinned 両形を入れて
+  `delete_missing` の巻き添え削除を防ぐ (`folder_thumb_existing_keys_for`)。
+- **Video ピンの特殊経路**: pin source が動画の場合、`thumb_loader` 側で動画
+  Shell API を直接使うとピン位置の WebP が出ないため、folder load 時に
+  `seed_folder_video_pin_thumbs` が `video_pins` DB から WebP を読んで pinned key
+  下に catalog + cache_map をミラー seed する。worker は通常の cache_hit 経路で
+  動画フレームを取り出す。WebP が無い / 失敗時は seed を skip / 旧 seed 行を purge して
+  worker を folder auto-pick fallback (`resolve_folder_thumb_image`) に落とす。
+  video pin は `skip_cache = false` 固定で idle quality-upgrade の対象外 (WebP IS the source)。
+- **Folder source の再帰クリップ**: pin source がサブフォルダ (`FolderRepresentative`)
+  の場合、worker はそのサブフォルダで `resolve_folder_thumb_image` を 1 段だけ走らせる
+  (= サブフォルダ自身の pin は引かない)。pin_map が 1 階層分しか持たない前提と整合し、
+  A↔B のサイクル無限ループを構造的に防ぐ。
+- **container/source の compat check**: `pin_source_compatible_with_container`
+  で DB 汚染や将来の schema 拡張による不整合 (ZipFile container に PdfPage source 等) を
+  弾き、`base_req` にフォールバックする。
+- **UI**: アドレスバー 📌 ボタン (左クリック toggle / 右クリック解除) + 右クリック
+  メニュー「📌 代表サムネに固定 / 解除」。`Settings.show_address_bar_folder_pin` で
+  ボタン表示を切替。Ctrl+G アグリゲートビュー / 7z/LZH 変換キャッシュの drill-down
+  (`archive_source_override` Some) / 空フォルダ (idx=usize::MAX) では UI を出さない。
+  ConvertibleArchive アイテム選択時は disabled + tooltip「変換後に設定可能」。
+- **書き換え反映経路**: `set_folder_thumb_pin` / `remove_folder_thumb_pin` が DB
+  書き込み + `folder_pin_map` 更新 + `folder_thumb_pin_dirty = true`。
+  `consume_folder_thumb_pin_dirty` が **`update` 内 (fullscreen 中以外)** および
+  **`close_fullscreen`** で `folder_history` を消して `load_folder` を再実行することで、
+  pin の cache key 変化が次フレームのグリッド描画に反映される。fullscreen 中は
+  load_folder が close_fullscreen を呼んでしまうので、抜けるまで dirty を保留する。
+
 ### 3.2 フルスクリーンロードの分岐
 
 `App::start_fs_load`:
