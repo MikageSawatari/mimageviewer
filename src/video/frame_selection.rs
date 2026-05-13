@@ -51,8 +51,8 @@ pub(crate) struct FrameCandidate {
 ///    `pts_secs <= now_secs + tol` (= 通常 eligibility) なら eligible。前に Display を
 ///    出していれば、それを `LateDrop` に格下げして新しい `Display` を吐く。
 ///    `force_display_seek` は seek target 近傍や forward retry の overshoot frame を
-///    1 tick で表示候補にできるようにする。Fast seek の keyframe preview は
-///    `VideoFrame::is_seek_preview` で readiness から分離される。
+///    1 tick で表示候補にできるようにする。target 前の preroll frame は decoder 側で
+///    drop 済みなので、ここには readiness に使える post-target frame だけが届く。
 /// 4. eligible でなければ走査終了 (= 残りは next tick 以降)。
 pub(crate) fn select_frame_for_present(
     queue: &[FrameCandidate],
@@ -190,10 +190,9 @@ mod tests {
     }
 
     #[test]
-    fn waiting_for_first_frame_after_preview_displays_future_target() {
-        // Fast seek preview は FirstFrameReady を発火しないため、次 tick でも
-        // waiting_for_first_frame=true のまま。target frame が overshoot していても
-        // force_first_frame 経路で 1 枚表示して readiness を進められる。
+    fn waiting_for_first_frame_displays_future_target() {
+        // target frame が overshoot していても force_first_frame 経路で 1 枚表示し、
+        // readiness を進められる。
         let queue = vec![frame(5.500, 1)];
         let sel = select_frame_for_present(&queue, 5.000, 1, 1, true, true, TOL);
         assert_eq!(sel.actions, vec![PopAction::Display]);

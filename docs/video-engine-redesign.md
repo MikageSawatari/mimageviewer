@@ -608,16 +608,14 @@ video もデコード止まる → buf 0/24 振動」の構造的問題が残っ
 **新 channel メッセージ型**:
 
 ```rust
-enum VideoWorkerMsg { Packet(Packet), Flush { serial, seek_target_secs, trim_before_secs }, Eof }
+enum VideoWorkerMsg { Packet(Packet), Flush { serial, trim_before_secs }, Eof }
 enum AudioWorkerMsg { Packet(Packet), Flush { serial, seek_target_secs, trim_before_secs }, Eof }
 ```
 
 順序保証 channel に enqueue するため、Flush と pre/post-seek packet の到着順が
-逆転しない。`seek_target_secs` はユーザー要求 target、`trim_before_secs` は worker
-ごとの preroll trim 下限。Precise seek は video/audio とも `Some(target)`、Fast
-backward は audio のみ `Some(target)` で、video は `trim_before_secs=None` のまま
-`seek_target_secs` を使って keyframe preview を 1 枚だけ送出し、target 到達まで
-pre-target frame を drop する。seek 失敗時は両方 `None` で通常 pacing に戻す。
+逆転しない。audio の `seek_target_secs` はユーザー要求 target、`trim_before_secs` は
+worker ごとの preroll trim 下限。seek 成功時は video/audio とも `trim_before_secs=Some(target)`
+で、target 前の preroll frame を drop する。seek 失敗時は `None` で通常 pacing に戻す。
 
 **SeekCompleted の発火点**: 旧構造と同じく demux thread が `clock.notify_seek_completed`
 + `engine_event_tx::SeekCompleted` を発火。post-seek 1 枚目の表示 (= UI tick で seek
@@ -689,11 +687,11 @@ forward seek (`+10s` 等) の deadlock 修正。post-seek 1 枚目までは
 warmup silence と組み合わさって audio buffer がいつまでも満杯にならず 1 枚目が
 送出されない循環に陥っていた。修正: `clock.is_seeking() && !post_seek_frame_sent`
 の場合は無条件で 1 枚送出 (lead cap や audio buffer 状態と関係なく)。
-Fast backward seek ではこの「1 枚目」を keyframe preview として `is_seek_preview=true`
-で送るが、presenter は preview を `FirstFrameReady` / seek override clear に使わない。
-そのため engine は target 到達 frame まで Buffering に留まり、audio callback は silence
-を返す。SW decode / 長 GOP では keyframe 静止画で待ち、target frame 到着時に A/V が
-同時再開する。
+target 前の keyframe / preroll frame は decoder 側で drop するため、この「1 枚目」は
+常に readiness に使える post-target frame である。engine は `FirstFrameReady` と
+`BufferReady` が揃うまで Buffering に留まり、audio callback は silence を返す。
+SW decode / 長 GOP では直前の表示フレームを保ったまま待ち、target frame 到着時に
+A/V が同時再開する。
 
 **Phase 9.F: forward seek の A/V desync 修正 (`decoder.rs`)**
 

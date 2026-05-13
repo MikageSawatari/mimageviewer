@@ -94,7 +94,7 @@ impl AudioOutput {
         // 旧値を残したままにしない。次の present で旧 audio_pts と新 video_pts を比較して
         // 偽の巨大 av_offset が出るのを防ぐ。
         // 次の audio callback が `set_audio_pts` を呼ぶまでは av_offset は NaN
-        // (= overlay は audio inactive として表示、analyzer も Skip する)。
+        // (= overlay / analyzer は体感 A/V offset 未確定として扱う)。
         self.diagnostics.clear_audio_position();
         if let Some((processed, raw_pending, tx_queued, now_at_clear)) = snapshot_for_log {
             crate::perf::event(
@@ -674,13 +674,13 @@ fn run_pump(
     // chunk は無条件 push でいい。
     //
     // ここでの seek_target は **PDC pre-target silence 判定用**であり、
-    // 実際に emit された最初の audio frame PTS を使う。現在の Fast seek でも audio
-    // decode 側は target まで trim 済みなので通常は target 近傍になる。
+    // 実際に emit された最初の audio frame PTS を使う。seek 後の audio decode は
+    // target まで trim 済みなので通常は target 近傍になる。
     // BufferReady audio_anchor 用の **user-requested target** とは別管理
     // (= `pump_anchor_target_secs` 参照)。
     let mut seek_target_secs: Option<f64> = None;
     // **Codex P1 (2026-05-01)**: BufferReady の audio_anchor pts として報告する
-    // **user-requested seek target** (Fast モードでも timeline に表示したい値)。
+    // **user-requested seek target**。
     // demux Flush 経由で全 AudioFrame に焼き付けられている `frame.seek_target_secs`
     // を毎 intake で取り出してここに保存する。
     //
@@ -690,8 +690,8 @@ fn run_pump(
     // Playing 入場時の clock anchor を target に維持する (= timeline 表示が target 固定)。
     //
     // 旧版 (Codex P1 修正前) は `audible_pts` のみで BufferReady を出していたため、
-    // Fast の audio trim / preview 分離が崩れた場合に anchor が target より前へ
-    // 巻き戻り、notify_seek_completed(target) で立てた anchor が上書きされ得た。
+    // PDC などで audible が target より前に見える場合に anchor が巻き戻り、
+    // notify_seek_completed(target) で立てた anchor が上書きされ得た。
     let mut pump_anchor_target_secs: Option<f64> = None;
     let mut last_warning_at: Option<std::time::Instant> = None;
     let mut last_stale_drain_log_serial: Option<u64> = None;
@@ -768,11 +768,11 @@ fn run_pump(
                 // TimeStretcher::process 内で自動的に行う。
                 time_stretcher.reset();
                 // PDC trim 用 seek_target は実際に emit された最初の audio frame PTS。
-                // Fast でも audio decode 側は target まで trim 済みなので通常は target 近傍。
+                // audio decode 側は target まで trim 済みなので通常は target 近傍。
                 // 詳細は seek_target_secs の宣言コメント参照。
                 seek_target_secs = Some(frame.pts_secs);
                 // BufferReady anchor 用 target は demux Flush 経由で焼き付けられた
-                // user-requested target (= Fast でも target を維持)。
+                // user-requested target。
                 // None フォールバック: 失敗 seek / 初期 open など、target が無い場合は
                 // BufferReady で audible_pts をそのまま使う。
                 pump_anchor_target_secs = frame.seek_target_secs;
@@ -1125,10 +1125,10 @@ fn run_pump(
         // target-pdc に固定される。
         //
         // **Codex P1 修正 (2026-05-01)**: BufferReady の audio_anchor は
-        // user-requested target を下限にする。現在の Fast seek でも audio は target まで
-        // trim 済みなので通常 audible ≈ target だが、PDC > 0 などで audible が target
+        // user-requested target を下限にする。seek 後の audio は target まで trim 済み
+        // なので通常 audible ≈ target だが、PDC > 0 などで audible が target
         // より前に見えるケースを `pump_anchor_target_secs` との **max** で吸収する:
-        //   - Precise/Fast: audible ≈ target → max(audible, target) ≈ target
+        //   - precise seek: audible ≈ target → max(audible, target) ≈ target
         //   - PDC 等で audible < target → max は target. anchor が target で固定
         //   - 失敗 / 初期 open: pump_anchor_target = None → audible 単独 (既存挙動)
         //   - BufferStarved (再 buffering): audible は再生位置 >> 旧 target → audible 採用

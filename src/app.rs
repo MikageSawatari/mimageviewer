@@ -1338,6 +1338,15 @@ pub(crate) struct VideoTileSwapPending {
     pub(crate) deadline: std::time::Instant,
 }
 
+#[cfg(windows)]
+pub(crate) struct NativeVideoFastSwapPending {
+    pub(crate) target_idx: usize,
+    pub(crate) target_path: PathBuf,
+    pub(crate) source_epoch: u64,
+    pub(crate) started_at: std::time::Instant,
+    pub(crate) deadline: std::time::Instant,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct FullscreenVideoMarkerCache {
     pub(crate) fs_idx: usize,
@@ -1858,6 +1867,8 @@ pub struct App {
     pub(crate) video_tile_reopen_deadline: Option<std::time::Instant>,
     #[cfg(windows)]
     pub(crate) video_tile_swap_pending: Option<VideoTileSwapPending>,
+    #[cfg(windows)]
+    pub(crate) native_video_fast_swap_pending: Option<NativeVideoFastSwapPending>,
     #[cfg(windows)]
     pub(crate) native_video_source_epoch_next: u64,
     /// タイルモードのサムネ WebP 永続キャッシュ (Phase 6.D-2、Phase 8.C で絶対 PTS 化)。
@@ -2459,9 +2470,13 @@ pub struct App {
     pub(crate) native_video_front_synced_hwnd: u64,
     #[cfg(windows)]
     /// Native HWND の z-order maintenance を間引くための最終 raise 時刻。
-    /// native 再生中は黒 backdrop も alive なので、mIV が foreground の間だけ
-    /// 16ms pump に合わせて通常の HWND_TOP raise を保つ。
+    /// PrintScreen / Snipping Tool などで foreground が外部へ移った後、mIV に
+    /// 戻ったエッジで presenter HWND を再活性化する recovery を間引く。
     native_video_front_last_raise: Option<std::time::Instant>,
+    #[cfg(windows)]
+    /// native video fullscreen 中に外部プロセスが foreground になったことを観測したか。
+    /// true から mIV foreground へ戻ったタイミングで 1 回だけ activation recovery を送る。
+    native_video_front_recover_after_external_foreground: bool,
     #[cfg(windows)]
     /// 実機修正 (2026-05-12 C): VST GUI window のドラッグ/リサイズ終了検知 + bar
     /// 重なり時の自動位置調整。`HWND -> (last seen rect, last change instant, pending flag)`。
@@ -2481,9 +2496,14 @@ pub struct App {
     /// まで theme chrome 復元を少し遅らせるための期限。
     native_video_main_chrome_restore_at: Option<std::time::Instant>,
     #[cfg(windows)]
+    /// Native video fullscreen の startup / video-to-video swap 中だけ main HWND を
+    /// DWM 合成対象から外しているか。`IsWindowVisible` は true のままなので
+    /// winit/eframe の update loop は止まらない。
+    native_video_main_cloaked: bool,
+    #[cfg(windows)]
     /// 動画フルスクリーン終了時に main_hwnd の foreground 奪還を試みるべきか。
     /// close_fullscreen 時点で「mIV が foreground だった」ときに true、
-    /// process_native_video_main_chrome_restore 完走 / 期限超過で消費する。
+    /// presenter HWND の destroy 確認 / 期限超過で消費する。
     pub(crate) pending_main_foreground_reclaim: bool,
     #[cfg(windows)]
     /// close_fullscreen 時点での native presenter HWND。Drop 完了の判定に使う
@@ -2856,6 +2876,8 @@ impl Default for App {
             #[cfg(windows)]
             video_tile_swap_pending: None,
             #[cfg(windows)]
+            native_video_fast_swap_pending: None,
+            #[cfg(windows)]
             native_video_source_epoch_next: 1,
             video_tile_cache,
             fs_open_intent_from_grid: false,
@@ -3037,9 +3059,13 @@ impl Default for App {
             #[cfg(windows)]
             native_video_front_last_raise: None,
             #[cfg(windows)]
+            native_video_front_recover_after_external_foreground: false,
+            #[cfg(windows)]
             native_video_main_chrome_black: false,
             #[cfg(windows)]
             native_video_main_chrome_restore_at: None,
+            #[cfg(windows)]
+            native_video_main_cloaked: false,
             #[cfg(windows)]
             pending_main_foreground_reclaim: false,
             #[cfg(windows)]
@@ -9071,6 +9097,15 @@ impl App {
         // スタックで管理する (画像移動でさらにクリアされる)。
         self.clear_meta_undo();
         self.fullscreen_idx = Some(idx);
+        #[cfg(windows)]
+        let entering_native_video_fullscreen =
+            matches!(self.items.get(idx), Some(GridItem::Video(_)));
+        #[cfg(windows)]
+        if entering_native_video_fullscreen {
+            self.sync_native_video_main_cloak(true);
+        } else {
+            self.sync_native_video_main_cloak(false);
+        }
         // フルスクリーン入場時にカーソル idle タイマをリセット (= 直前まで隠れていた
         // 状態を引き継がないようにする)。前回フルスクリーンを 5 分放置した後に
         // すぐ再入場した場合、Some(<古い時刻>) のままだと 1 フレーム目で
@@ -9079,7 +9114,7 @@ impl App {
         self.cursor_hidden = false;
         self.refresh_fullscreen_video_marker_cache(idx);
         #[cfg(windows)]
-        if self.native_video_fullscreen_active_for_main_backdrop() {
+        if entering_native_video_fullscreen {
             // 黒 chrome は fullscreen/backdrop viewport を描画した後の update 末尾で
             // 適用する。ここで先に DWM chrome だけ変えると、通常ウィンドウの
             // タイトルバーが黒くなってから fullscreen が出る 1-frame race が見える。
@@ -11364,15 +11399,23 @@ impl App {
             self.vst3_deferred_video_open = None;
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
+            self.native_video_front_recover_after_external_foreground = false;
             self.native_video_pointer_down = None;
             self.schedule_native_video_main_chrome_restore();
-            // 動画フルスクリーンだった (= chrome を黒くしていた) ときだけ奪還候補。
+            let native_video_was_active = self.native_video_fullscreen_active_for_main_backdrop();
+            if native_video_was_active || self.native_video_main_cloaked {
+                // SetForegroundWindow cannot reliably target a cloaked HWND. Bring
+                // the main window back into DWM composition before scheduling the
+                // foreground reclaim, while the presenter/backdrop still mask it.
+                self.sync_native_video_main_cloak(false);
+            }
+            // 動画フルスクリーンだったときだけ奪還候補。
             // mIV が foreground を持っていた瞬間にだけ true にする (ユーザーが他アプリを
             // 意図的に前面にしていたケースで奪い返さないため)。
             // foreground=null/pid=0 の不確定ケースは保守的に false 扱い。
             let foreground_is_ours =
                 crate::video::native_window::foreground_belongs_to_current_process_strict();
-            if self.native_video_main_chrome_black && foreground_is_ours {
+            if native_video_was_active && foreground_is_ours {
                 self.pending_main_foreground_reclaim = true;
                 self.pending_main_foreground_reclaim_after_hwnd =
                     self.native_video_presenter_hwnd().unwrap_or(0);
@@ -11382,7 +11425,7 @@ impl App {
                 self.pending_main_foreground_reclaim = false;
                 self.pending_main_foreground_reclaim_after_hwnd = 0;
                 self.pending_main_foreground_reclaim_force_at = None;
-                if self.native_video_main_chrome_black {
+                if native_video_was_active {
                     crate::logger::log(
                         "[native-video] foreground_unknown_or_foreign at close_fullscreen, \
                          skip reclaim"
@@ -11506,6 +11549,7 @@ impl App {
             self.video_tile_reopen_pending = false;
             self.video_tile_reopen_deadline = None;
             self.video_tile_swap_pending = None;
+            self.native_video_fast_swap_pending = None;
         }
         self.reset_erase_mode();
         self.erase_base_cache.clear();
@@ -13645,6 +13689,7 @@ impl App {
         }
         #[cfg(windows)]
         if let Some(fs_idx) = self.fullscreen_idx {
+            self.poll_native_video_fast_swap(ctx);
             self.poll_video_tile_swap(ctx);
             self.sync_native_video_metadata(fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);
@@ -13659,6 +13704,7 @@ impl App {
         if native_closed_idx.is_some() {
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
+            self.native_video_front_recover_after_external_foreground = false;
             self.close_fullscreen();
             // keep_fullscreen_viewport_alive の cleanup フレーム (Visible(false) 送信) を保証。
             // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、return 後の
@@ -14368,12 +14414,23 @@ impl eframe::App for App {
             >= std::time::Duration::from_secs(1)
         {
             let heartbeat = format!(
-                "[heartbeat] app_update fullscreen={:?} native_main_backdrop={} main_hwnd={:?}",
+                "[heartbeat] app_update fullscreen={:?} native_main_backdrop={} \
+                 native_main_cloaked={} main_hwnd={:?}",
                 self.fullscreen_idx,
                 {
                     #[cfg(windows)]
                     {
                         self.native_video_fullscreen_active_for_main_backdrop()
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        false
+                    }
+                },
+                {
+                    #[cfg(windows)]
+                    {
+                        self.native_video_main_cloaked
                     }
                     #[cfg(not(windows))]
                     {
@@ -14992,12 +15049,15 @@ impl eframe::App for App {
             let native_main_backdrop = self.native_video_fullscreen_active_for_main_backdrop();
             if native_main_backdrop {
                 self.sync_native_video_main_chrome(true);
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(egui::Color32::BLACK))
-                    .show(ctx, |_ui| {});
+                self.sync_native_video_main_cloak(self.native_video_presenter_hwnd().is_none());
+                // Do not paint the main viewport black while the native video
+                // backdrop is taking over. If the main HWND transiently leaks
+                // above the fullscreen backdrop, a black client area makes the
+                // normal DWM title bar stand out as a visible flicker.
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
                 return;
             }
+            self.sync_native_video_main_cloak(false);
             self.process_native_video_main_chrome_restore(ctx);
         }
 
@@ -15642,6 +15702,7 @@ impl eframe::App for App {
         // query して結果を settings に書き込んでから持続化する順序が必要。
         #[cfg(windows)]
         {
+            self.sync_native_video_main_cloak(false);
             let states = self.snapshot_vst3_states_into_settings();
             let positions = self.snapshot_vst3_window_positions_into_settings();
             if states > 0 || positions > 0 {

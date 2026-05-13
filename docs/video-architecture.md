@@ -81,12 +81,15 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
 - **Keyboard / IME**: HUD では受けない (`WS_EX_NOACTIVATE` で focus を取らない)。presenter HWND の
   既存 wndproc で受けて `NativeEguiOverlay` に流す。HUD 上の mouse-down で `claim_foreground(presenter_hwnd)`
   を発火することで、VST 操作後でも presenter HWND を foreground/focus に戻して keyboard/IME を維持。
+  Space / Enter / 矢印 / W / J/K/L/M/B/P/S などの fullscreen ショートカットは、
+  overlay 内のボタン focus が残っていても App 側へ転送する。ブックマーク名編集などの文字入力中だけは
+  overlay 側がキーを保持し、Space を文字として入力できるようにする。
 
 **Region 計算とアクティベーション検出**:
 
 `NativeEguiOverlay::compute_hud_regions` が egui run 末尾で表示中の各 UI 要素の rect を集めて返す
 (= 上 hover bar / 下 HUD / right panel / jump panel / VST3 panel / speed popup / bookmark editor /
-normalize blocker / tile overlay / paused center / seek hover thumbnail)。**activation zone** (= bar
+normalize blocker / tile overlay / paused center / seek hover thumbnail / checkmark)。**activation zone** (= bar
 非表示時の hover 検出範囲、画面上下端の帯) は region に **含めない** — 含めると bar 非表示時に VST の
 ノブが上下端と重なったとき入力を奪うため。
 
@@ -250,19 +253,24 @@ src/video/
 | `video-audio-decode` (= `run_audio_decode`) | avcodec decode + swresample、post-seek packet/sample trim、PAUSED/EOF park、EOF drain | `audio_pkt_rx` (`AudioPacketMsg::{Packet, Eof}`) + `audio_ctl_rx` (`AudioControlMsg::Flush`) | `audio_tx` (bounded=32、`AudioFrame`) |
 
 **seek 調停**: `clock.take_seek_request()` を pull するのは demux thread のみ
-(= 旧構造と同じ単一 puller)。`input.seek` 成否を判定後、両 decode thread に
-`Flush { serial, seek_target_secs, trim_before_secs }` を packet queue とは別の control
-channel で enqueue する。decode thread は `select_biased!` で control を優先受信するため、
-packet queue が満杯でも Flush が古い compressed packet の後ろに埋もれない。
-`seek_target_secs` はユーザー要求 target (= timeline / engine anchor 用)、`trim_before_secs`
-は各 worker の post-seek trim 下限。Precise seek と forward retry は video/audio とも
-`trim_before_secs=Some(target)` で target まで preroll drop する。Fast backward は
-video の `trim_before_secs=None` で worker に送り、video worker が `seek_target_secs`
-を使って keyframe preview を 1 枚だけ `is_seek_preview=true` で送った後、target 到達
-frame まで pre-target frame を drop する。preview は `FirstFrameReady` / seek override
-clear に使わないため、A/V は target frame まで Buffering/無音で待ってから再開する。
-audio は Fast でも常に `trim_before_secs=Some(target)`。
-seek 失敗時は両方 `None` で通常 pacing に戻す。
+(= 旧構造と同じ単一 puller)。`input.seek` 成否を判定後、packet queue とは別の
+control channel で video に `Flush { serial, trim_before_secs, frame_step }`、audio に
+`Flush { serial, seek_target_secs, trim_before_secs }` を enqueue する。decode thread は
+`select_biased!` で control を優先受信するため、packet queue が満杯でも Flush が古い
+compressed packet の後ろに埋もれない。
+audio の `seek_target_secs` はユーザー要求 target (= timeline / engine anchor 用)、
+`trim_before_secs` は各 worker の post-seek trim 下限。すべての seek は video/audio とも
+`trim_before_secs=Some(target)` で target まで preroll drop する。target 前の keyframe
+や preroll frame は表示せず、最初に presenter へ届く frame を `FirstFrameReady` /
+seek override clear の対象にする。seek 失敗時は両方 `None` で通常 pacing に戻す。
+frame-step seek だけは video 側 `trim_before_secs=None` と `frame_step=Some(...)` で流し、
+video decoder が decoded PTS を見て base の直前/直後の 1 枚だけを送出する。audio 側は
+基準 PTS まで trim し、停止中の余分な音声 decode を抑える。
+キーリピートや seekbar drag の連続 seek は UI 側で最新 target に coalesce し、直前の
+seek が 1 frame 表示されるか 250ms 経過するまで次の request を発行しない。
+native HUD は `clock.is_seeking()` と `current_seek_serial()` を既存 state として参照し、
+1 seek 世代が 150ms を超えたときだけ中央に「シーク中...」を表示する。表示後は 300ms
+以上保持して短い seek のフリッカを避ける。
 video packet は direct queue が満杯になると demux 側の `pending_video_packets`
 overflow に退避する。seek preroll 中に audio packet send が満杯で待っている場合も、
 audio の timeout 待ちごとにこの video overflow を opportunistic に drain し、
@@ -331,6 +339,53 @@ P キーの perf overlay にも codec / decoder / HW-SW / GPU-CPU / D3D11VA 候�
 AV1 などで `libdav1d` 等の SW decoder が選ばれているのか、H.264/HEVC 等で本来 HW 候補が
 あるのに fallback しているのかを切り分けるための初期診断として使う。
 
+**fast-swap 時の HW decoder lifecycle 制御** (2026-05-13 追加):
+fullscreen 動画から動画へホイール連射で fast-swap を重ねたとき、video decode thread の
+`avcodec_send_packet` が hard-stuck する事象が観察された。原因は旧 fast-swap で残された
+stuck thread が D3D11VA 周辺リソース (AVCodecContext + hw_frames_ctx の surface pool、
+共有 GpuVideoDevice の video processor slot 等) を解放しないまま居座り、新 HW decoder の
+`avcodec_send_packet` が driver 内で永続待機に入る、という contention パターン。
+`VideoPlayer::drop` は `cancel` フラグを Release で立てるだけで `JoinHandle` を保持しない
+ため、FFmpeg 内停止中の旧 thread は cancel を観測できずリソースを返さない。
+
+対策は 2 段構え:
+
+1. **`LIVE_VIDEO_DECODE_THREADS` カウンタによる throttle**
+   `src/video/decoder.rs` のグローバル `AtomicUsize` で生存中の `run_video_decode` 数を
+   追跡する。`VideoDecodeAliveGuard` RAII guard が関数入口で `+1`、関数終了 / panic
+   unwind で確実に `-1` する。`try_start_native_video_fast_swap` /
+   `try_start_video_tile_fast_swap` は `MAX_LIVE_VIDEO_DECODE_THREADS=3` を超えていれば
+   新規 swap を no-op で抑制する。本カウンタは **正常再生中の player の thread も含めた
+   総 live 数**で、stuck/正常を区別しない単純カウント。したがって 3 という閾値は
+   「stuck 3 個」ではなく「現在再生中 1 + transient な fast-swap 中 1〜2」を含む合計上限
+   になる。正常時は old thread が次々と exit するため count は 1〜2 を上下し、throttle に
+   抵触しない。throttle 判定は「target / from がともに動画」と確定した後に行うため、
+   動画→画像のような fast-swap 対象外の navigation は影響を受けない (Codex P1 review 反映)。
+   `true` を返して上位の `open_native_video_fullscreen_from_navigation` が traditional
+   open 経路 (= 更に decoder thread を増やす) に fallback しないようにする。stuck thread
+   が抜けるまでユーザーのホイール event は握り潰される (= 「ホイールが一瞬反応しない」
+   体感) が、SW fallback には**絶対に落とさない**: 個別 open でなら HW で動く動画を勝手
+   に SW に切り替えると seek 性能が大きく劣化するため。
+
+2. **旧 player の eager drop**
+   `start_native_video_source_swap` は `take_native_output` で旧 player から
+   `NativeVideoOutput` を抜いた直後、`build_video_player_for_open` で新 player を作る
+   **前**に `fs_cache.remove(&from_idx)` を呼ぶ。旧 `VideoPlayer::drop` の cancel フラグ
+   設定が新 video decode thread の spawn より前に起き、旧 thread が安全点に居れば
+   早めに自発 exit する。旧コードは末尾まで drop を遅延していたため、新旧 thread の
+   生存期間が build + attach + switch 全工程分だけ不必要に重なっていた。
+
+stuck thread を能動的に殺す手段は無い (FFmpeg context を他 thread から close するのは
+クラッシュリスク)。live count が 3 まで累積した状態 (= 例: stuck 2 + 現在再生中 1) で
+fast-swap は session 内では永続的に no-op になる: その場合ユーザーはアプリ再起動が必要。
+これは通常の使用パターンでは到達しないが、driver bug 等で root cause が直接抜けない
+場合の最終形として記録しておく。
+
+JoinHandle 保持 + background cleanup pool による join-with-timeout は将来追加候補で、
+カウントが永続的に高止まりするときの「stuck と判定して count を強制的にリセットする」
+診断系を追加するときに合わせて入れる。本対策は cancel 観測可能な thread の自発 exit に
+依存して count を回す最小実装。
+
 **pacing 設計**: 既存の Phase 8.K 仕様 (`PACE_LEAD_SECS=0.30` / `AUDIO_SAFE_LO=0.25` /
 `SEEK_BURST_LEAD_MAX_SECS=0.20` / `post_seek_frame_sent` flag / generation race
 check) は **そのまま video decode thread に移植**。動作対象だけが変わる (= 旧構造の
@@ -378,13 +433,20 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   input を開き、最後に表示済みの source pts 近傍をフル解像度 RGBA に変換してから
   既存の CF_DIB clipboard helper へ渡す。メイン decode queue / native presenter の GPU
   surface には触れないため、D3D11VA / CPU fallback / native DComp 経路で同じ操作にできる。
-- 前/次フレーム送りは `VideoPlayer::step_frame()` が `avg_fps` から 1 frame 秒を求め、
-  precise seek + pause を発行する。連続入力中は「最後に表示されたフレーム」ではなく
-  「最後に発行した frame-step target」を基準にして target を積み、seek 完了前の
-  連打 / 長押しでも同じ位置へ再 seek しない。ただし長押し repeat は、発行時点の
-  `displayed_frame_seq` から新しいフレームが 1 枚表示されるまで次 target を出さない。
-  これにより clock target だけが進んで画面が追いつかない状態を避ける。戻り方向は
-  preroll trim が現在フレームへ吸われないよう、1 frame + 最大 4ms 手前を seek target にする。
+- 前/次フレーム送りはスクショ対象フレームを選ぶための機能なので、`avg_fps` 由来の
+  推定秒数をそのまま seek target にせず、メインの動画 decoder に frame-step seek を
+  発行して現在表示 PTS の前後にある実 decoded frame だけを送出させる。D3D11VA が
+  有効な動画では探索自体も HW decode 経路で進むため、別 input / SW decode worker は
+  使わない。前フレーム探索の demux target は base の約 1.25 frame 前に寄せ、FFmpeg の
+  backward seek で target 以前の keyframe に戻ってから base 直前の decoded frame を選ぶ。
+  これにより古い実装のように数秒ぶん余分に decode するケースを避ける。
+  ボタン押下時点でまず現在表示 PTS に pause し、探索中に再生 clock が進んで
+  base frame がずれることを避ける。連続入力中は
+  「最後に表示されたフレーム」ではなく「最後に発行した frame-step target」を基準に
+  次の隣接フレームを探し、seek 完了前の連打 / 長押しでも同じ位置へ再 seek しない。
+  ただし長押し repeat は、発行時点の `displayed_frame_seq` から新しいフレームが 1 枚
+  表示されるまで次 target を出さない。これにより clock target だけが進んで画面が
+  追いつかない状態を避ける。
   `frame_step_active` は通常 pause と UI を分離するための共有フラグで、frame-step pause 中は
   中央の resume controls を出さない。さらに frame-step pause は音声 callback が drain されないため、
   最初の表示フレームで `set_paused_position()` + `clear_seek_target_override()` を実行し、
@@ -587,7 +649,6 @@ pub struct VideoFrame {
     pub data: VideoFrameData,
     pub pts_secs: f64,
     pub seek_serial: u64,
-    pub is_seek_preview: bool,
 }
 
 pub enum VideoFrameData {
@@ -604,8 +665,8 @@ pub enum VideoFrameData {
 ```
 
 `Nv12Direct` variant は **削除** (Phase 2 で導入したが、その経路自体を撤回するため)。
-`is_seek_preview` は Fast relative seek の keyframe preview 用。native/legacy presenter は
-表示だけ行い、`FirstFrameReady` 発火や seek override clear には使わない。
+seek 時の target 前 keyframe / preroll frame は decoder 側で drop されるため、
+`VideoFrame` には readiness から除外する preview 用フラグを持たない。
 
 ## アスペクト比 (SAR) 補正
 
@@ -648,6 +709,17 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
 - **D3d11Frame の所有権**: native presenter thread が channel から受信して自身の Drop
   まで保持。次フレーム到着で旧 frame の Drop が NT HANDLE を `CloseHandle` する
   (= 描画中の HANDLE が close される race を防ぐ)
+- **z-order 復旧**: PrintScreen / Snipping Tool などで foreground が一時的に外部へ
+  移った後、egui 側の黒 backdrop が presenter より前に残る場合がある。UI thread から
+  `SetWindowPos` / `SetForegroundWindow` を直接呼ばず、App が外部 foreground を観測
+  した後に mIV foreground へ戻ったエッジで `RaisePresenterToFront` command を
+  rate-limit 送信し、presenter 所有スレッド側で `HWND_TOP` と foreground / active /
+  focus を再アサートする。
+- **main HWND cloak**: native video fullscreen の entry と video-to-video swap では、
+  presenter HWND が valid になるまで main HWND に `DWMWA_CLOAK` を設定する。これは
+  `IsWindowVisible` を変えないため App::update は継続し、DWM 合成結果からだけ main を
+  外す。presenter HWND が valid になった時点、fullscreen exit、app exit では必ず
+  uncloak し、foreground reclaim が cloaked main HWND を対象にしないようにする。
 
 ### フルスクリーン終了時の foreground 奪還
 
@@ -658,12 +730,14 @@ popup destroy 後に Windows が owner ではなく z-order 順で次の他ア�
 
 これを補正するため、`close_fullscreen` 時点で奪還候補を凍結し
 ([src/app.rs](../src/app.rs) `pending_main_foreground_reclaim*` フィールド群)、
-chrome 復帰の deferred restore に相乗りで `SetForegroundWindow(main_hwnd)` を
+presenter HWND の destroy を確認した時点で `SetForegroundWindow(main_hwnd)` を
 `AttachThreadInput` 併用で呼び戻す ([src/app/native_video.rs](../src/app/native_video.rs)
-`process_native_video_main_chrome_restore`)。
+`process_pending_main_foreground_reclaim`)。native video entry/swap で main HWND を
+cloaked にしていた場合は、`close_fullscreen` 内で先に uncloak してから reclaim 候補を
+保存する。
 
 ガード条件:
-- 動画フルスクリーンを通った時のみ (`native_video_main_chrome_black=true`)
+- 動画フルスクリーンを通った時のみ (`native_video_fullscreen_active_for_main_backdrop()`)
 - close_fullscreen 時点で mIV プロセスが foreground を持っていた場合のみ
   ([src/video/native_window.rs](../src/video/native_window.rs)
   `foreground_belongs_to_current_process_strict`、null/pid=0 の不確定ケースは false)
@@ -679,11 +753,15 @@ chrome 復帰の deferred restore に相乗りで `SetForegroundWindow(main_hwnd
 `None` を渡すのは「呼び出し元が後から `attach_native_output` で output を移植する」
 ことを示す**正常なシグナル**で、エラー扱いしない。
 
-- **fast-swap 経路** (`try_start_video_tile_fast_swap` in [src/app/native_video.rs](../src/app/native_video.rs)):
-  動画タイルモード中のホイールナビゲーションで、旧 player から
-  `take_native_output()` で取り外した output を新 player に `attach_native_output`
-  で移植する。新 player 側の `VideoPlayer::open` には `native_output_config=None`
-  を渡す (= 自前で spawn しない)。
+- **動画→動画 fast-swap 経路** (`try_start_native_video_fast_swap` /
+  `try_start_video_tile_fast_swap` in [src/app/native_video.rs](../src/app/native_video.rs)):
+  通常の動画フルスクリーンナビゲーションと動画タイルモード中のホイールナビゲーションで、
+  旧 player から `take_native_output()` で取り外した output を新 player に
+  `attach_native_output` で移植する。新 player 側の `VideoPlayer::open` には
+  `native_output_config=None` を渡す (= 自前で spawn しない)。通常ナビゲーションは
+  最初の native frame 表示まで `native_video_fast_swap_pending` で連続入力を抑制し、
+  タイルモードは従来どおり `video_tile_swap_pending` で `VideoInfo` 到着後にタイル state を
+  再構築する。
 - **通常経路** (`start_fs_load` in [src/app.rs](../src/app.rs)):
   `native_video_presenter_config(self.main_hwnd, ...)` で config を取得して
   `Some(config)` を渡す。万一 `None` が返った (= モニター情報取得失敗) ときは、
@@ -884,7 +962,7 @@ A/V offset を比較。修正前は累積 −20s 級、修正後は ±数十 ms 
 
 | kind | 説明 | 主な extras |
 |---|---|---|
-| `av_drift` | drift sample (1Hz + `\|offset\|>30ms` の edge、edge は 100ms rate limit) | `video_pts`, `now_secs`, `drift_ms` (= video pacing), `av_offset_ms` (= 体感ズレ、null の時は audio inactive), `audio_lead_ms`, `audio_active`, `big_edge` |
+| `av_drift` | drift sample (1Hz + `\|offset\|>30ms` の edge、edge は 100ms rate limit) | `video_pts`, `now_secs`, `drift_ms` (= video pacing), `av_offset_ms` (= 体感ズレ、null の時は audio inactive または offset 未確定), `audio_lead_ms`, `audio_active`, `big_edge` |
 | `norm_apply_begin` | Norm 操作 (toggle_on / toggle_off / scan_done) の前 snapshot | `fs_idx`, `gain_db`, `reason`, `now`, `video_pts` |
 | `norm_apply_end` | Norm 操作 (`set_normalize_gain` のみ、clear なし) 完了後の snapshot | `fs_idx`, `now` |
 
@@ -923,16 +1001,23 @@ audio_pts_jump` の連鎖と、累積的に成長する負値 `A/V offset` と�
 overlay_draw.rs::draw_native_perf_overlay`) には:
 
 - ヘッダ 2 行目右端: `A/V {offset_ms}` (固定幅 monospace、桁ぶれなし。色: |offset|<5
-  緑 / <20 黄 / >=20 赤)。audio inactive 時は `vid {drift_ms}` (= 旧 av_drift にフォールバック)
+  緑 / <20 黄 / >=20 赤)。audio inactive または seek 直後など offset 未確定時は
+  `vid {drift_ms}` (= 旧 av_drift にフォールバック)
 - ヘッダ 2 行目: `lead {audio_lead_ms}` (audio が master clock から先行している量、
-  通常グレー、|lead|>=50ms で橙)
-- ヘッダ 2 行目: `audio_underrun_active == true` のとき赤 `UNDERRUN` (絵文字は使わない、
-  CLAUDE.md「UI 文字列の Unicode グリフ選定ルール」遵守)
+  通常グレー、|lead|>=50ms で橙)。audio inactive 時は表示しない
+- ヘッダ 2 行目: audio active かつ `audio_underrun_active == true` のとき赤 `UNDERRUN`
+  (絵文字は使わない、CLAUDE.md「UI 文字列の Unicode グリフ選定ルール」遵守)
+- ヘッダ 1 行目: `native {fps}` は graph と同じ直近約 6 秒の visible sample から、
+  `interval_ms` の平均で計算する。停止中など sample が無い時間は分母に入れない。
 - グラフ rect 内: A/V offset をシアン (alpha=200)、Y 軸スケール ±200ms 中心、0ms
   ラインを点線で描画。Norm clear バグ時の `-5000ms` 級 (= 映像が音声より秒オーダーで
   遅れる方向、`offset = video − audio` で負値) は下端で saturate して「異常」のサインとして
   読める。逆向き (= 映像が音声より進む `+` 方向) も同じく上端 saturate
-- グラフ rect 内: underrun 区間に橙背景帯 (= 既存の frame_gap 赤縦線と同じ流儀)
+- グラフ rect 内: 青い折れ線は present 間隔 (`interval_ms`) のブレを表す。frame interval
+  の長短だけでは赤縦線を出さない。
+- グラフ rect 内: 赤縦線は `late_drop` が増えた sample のみ (= 古い frame を表示前に捨てた
+  タイミング) に出す。`drop` カウンタと視覚 marker の意味を揃える。
+- グラフ rect 内: audio active 時の underrun 区間に橙背景帯。audio 側の警告は赤縦線とは分ける。
 
 ### 検証手順 (修正後の正常動作確認)
 

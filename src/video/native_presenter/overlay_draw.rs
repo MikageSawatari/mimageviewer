@@ -9,6 +9,9 @@ use super::{
     NativeOverlayTimelineMarkerKind, NativeOverlayToast, NativeOverlayVst3ChainSlot,
     NativeOverlayVst3Panel, NativeOverlayVst3Slot, NativeOverlayVst3SlotState,
 };
+
+const NATIVE_PERF_GRAPH_SECS: f32 = 6.0;
+
 pub(super) fn draw_native_perf_overlay(
     ctx: &egui::Context,
     overlay_width_points: f32,
@@ -42,9 +45,10 @@ pub(super) fn draw_native_perf_overlay(
                 panel_rect.min + egui::vec2(10.0, 48.0),
                 panel_rect.max - egui::vec2(10.0, 34.0),
             );
+            let display_fps = native_perf_visible_fps(history).unwrap_or(0.0);
             let title = format!(
                 "native {:.1} fps  frames {}  GPU {} CPU {}",
-                latest.actual_fps, latest.presented, latest.gpu, latest.cpu
+                display_fps, latest.presented, latest.gpu, latest.cpu
             );
             painter.text(
                 panel_rect.min + egui::vec2(10.0, 9.0),
@@ -71,13 +75,23 @@ pub(super) fn draw_native_perf_overlay(
             // Norm clear バグなど audio が clock から乖離した場面で値が変わらず、
             // 「音と映像がズレているのに数値が動かない」という体感と乖離する。
             // 詳細は `docs/video-architecture.md` の「A/V drift 計装」節参照。
-            painter.text(
-                panel_rect.min + egui::vec2(10.0, 25.0),
-                egui::Align2::LEFT_TOP,
+            const LEAD_VISIBLE_MIN_WIDTH: f32 = 380.0;
+            const GROUP_GAP: f32 = 24.0; // A/V グループと lead / UNDERRUN グループの間
+            let audio_active = latest.audio_active;
+            let underrun_active = audio_active && latest.audio_underrun_active;
+            let wide_enough_for_status = panel_rect.width() >= LEAD_VISIBLE_MIN_WIDTH;
+            let clock_text = if underrun_active && !wide_enough_for_status {
+                format!("late {:.1}ms", latest.max_late_ms)
+            } else {
                 format!(
                     "clock late {:.1}ms  max dt {:.1}ms",
                     latest.max_late_ms, latest.max_interval_ms
-                ),
+                )
+            };
+            painter.text(
+                panel_rect.min + egui::vec2(10.0, 25.0),
+                egui::Align2::LEFT_TOP,
+                clock_text,
                 egui::FontId::monospace(10.0),
                 egui::Color32::from_rgb(168, 176, 188),
             );
@@ -101,7 +115,8 @@ pub(super) fn draw_native_perf_overlay(
             let display_value = if av_offset_finite {
                 latest.av_offset_ms
             } else {
-                // audio inactive (動画 only) のとき av_drift_ms を表示する。
+                // audio inactive または seek 直後など offset 未確定のときは
+                // video pacing drift にフォールバックする。
                 latest.av_drift_ms
             };
             let display_abs = display_value.abs();
@@ -140,12 +155,14 @@ pub(super) fn draw_native_perf_overlay(
             //
             // ⚠ レイアウト: label "lead" + value_slot (= A/V と同じ 70px slot)。
             // av_label の左端から GROUP_GAP 左に lead value slot の右端を置く。
-            const LEAD_VISIBLE_MIN_WIDTH: f32 = 380.0;
-            const GROUP_GAP: f32 = 24.0; // A/V グループと lead グループの間
-            let show_lead = panel_rect.width() >= LEAD_VISIBLE_MIN_WIDTH;
+            // UNDERRUN は critical warning なので狭幅でも表示し、左の clock 表示を短縮して
+            // 重なりを避ける。lead は通常診断値なので狭幅では省略する。
+            let show_underrun = underrun_active;
+            let show_lead = audio_active && !show_underrun && wide_enough_for_status;
             // av_label の x 位置を保守的に概算 (3 char ≈ 21px)。
             let av_label_left_approx = av_value_left - LABEL_VALUE_GAP - 24.0;
-            let underrun_anchor_x = if show_lead {
+            let status_right = av_label_left_approx - GROUP_GAP;
+            if show_lead {
                 let lead_value_right = av_label_left_approx - GROUP_GAP;
                 let lead_value_left = lead_value_right - VALUE_SLOT_W;
                 let lead_value_text = format!("{:+.1}ms", latest.audio_lead_ms);
@@ -168,17 +185,13 @@ pub(super) fn draw_native_perf_overlay(
                     egui::FontId::monospace(10.0),
                     lead_color,
                 );
-                // UNDERRUN は lead label の更に左に置く (= label 約 4 char 28px 分を引く)
-                lead_value_left - LABEL_VALUE_GAP - 28.0
-            } else {
-                // lead 非表示時は A/V label の左を UNDERRUN の anchor にする。
-                av_label_left_approx
-            };
+            }
 
-            // 右端 3: UNDERRUN (左へ更にオフセット)。絵文字は使わない (CLAUDE.md 遵守)。
-            if latest.audio_underrun_active {
+            // 右側ステータス: UNDERRUN は lead と同じ枠で排他的に描く。
+            // 絵文字は使わない (CLAUDE.md 遵守)。
+            if show_underrun {
                 painter.text(
-                    egui::pos2(underrun_anchor_x - GROUP_GAP, row_y),
+                    egui::pos2(status_right, row_y),
                     egui::Align2::RIGHT_TOP,
                     "UNDERRUN",
                     egui::FontId::monospace(10.0),
@@ -251,7 +264,7 @@ pub(super) fn draw_native_perf_overlay(
 
             if let Some(last) = history.last() {
                 let now = last.arrival;
-                let px_per_sec = graph.width() / 6.0;
+                let px_per_sec = graph.width() / NATIVE_PERF_GRAPH_SECS;
                 let mut prev_interval = None;
                 let mut prev_total = None;
                 let mut prev_drift = None;
@@ -259,18 +272,18 @@ pub(super) fn draw_native_perf_overlay(
                 let clipped = painter.with_clip_rect(graph);
                 for (idx, sample) in history.iter().enumerate() {
                     let age = now.saturating_duration_since(sample.arrival).as_secs_f32();
-                    if age > 6.0 {
+                    if age > NATIVE_PERF_GRAPH_SECS {
                         continue;
                     }
                     let x = graph.max.x - age * px_per_sec;
-                    if (last_draw_x - x).abs() < 0.75 && idx + 1 < history.len() {
+                    if native_perf_should_thin_sample(sample, last_draw_x, x, idx, history.len()) {
                         continue;
                     }
                     last_draw_x = x;
 
-                    // underrun 区間は橙色背景帯 (= 既存の frame_gap 赤縦線と同じパターン
-                    // だが、同一 sample で何度も描画されることを許容して帯にする)。
-                    if sample.audio_underrun_active {
+                    // underrun 区間は橙色背景帯。赤縦線は frame drop 専用なので、
+                    // audio 側の警告は別色で帯として見せる。
+                    if native_perf_sample_has_audio_underrun_band(sample) {
                         clipped.line_segment(
                             [egui::pos2(x, graph.min.y), egui::pos2(x, graph.max.y)],
                             egui::Stroke::new(
@@ -284,7 +297,7 @@ pub(super) fn draw_native_perf_overlay(
                     let total_y = y_for_ms(sample.total_ms);
                     let copy_y = y_for_ms(sample.copy_ms);
                     // サブトラック描画は av_offset (= 体感ズレ) を主とする。audio inactive
-                    // の sample は NaN なので skip (= prev_drift を更新しない)。
+                    // または offset 未確定の sample は NaN なので skip (= prev_drift を更新しない)。
                     let drift_value = if sample.av_offset_ms.is_finite() {
                         Some(sample.av_offset_ms)
                     } else {
@@ -320,7 +333,7 @@ pub(super) fn draw_native_perf_overlay(
                         1.4,
                         egui::Color32::from_rgb(178, 236, 135),
                     );
-                    if native_perf_sample_has_frame_gap(sample) {
+                    if native_perf_sample_has_late_drop(sample) {
                         clipped.line_segment(
                             [egui::pos2(x, graph.min.y), egui::pos2(x, graph.max.y)],
                             egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 95, 95)),
@@ -1031,14 +1044,20 @@ pub(super) fn draw_overlay_vst3_gui_icon(
     );
 }
 
+pub(super) fn native_checkmark_rect(overlay_width_points: f32, top: f32) -> egui::Rect {
+    let radius = 18.0;
+    let center = egui::pos2((overlay_width_points - 30.0).max(radius), top + radius);
+    egui::Rect::from_center_size(center, egui::vec2(radius * 2.2, radius * 2.2))
+}
+
 pub(super) fn draw_native_checkmark(ctx: &egui::Context, overlay_width_points: f32, top: f32) {
     egui::Area::new(egui::Id::new("native_video_checkmark"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
         .show(ctx, |ui| {
             let radius = 18.0;
-            let center = egui::pos2((overlay_width_points - 30.0).max(radius), top + radius);
-            let rect = egui::Rect::from_center_size(center, egui::vec2(radius * 2.2, radius * 2.2));
+            let rect = native_checkmark_rect(overlay_width_points, top);
+            let center = rect.center();
             ui.allocate_rect(rect, egui::Sense::hover());
             let painter = ui.painter();
             painter.circle_filled(
@@ -1089,8 +1108,14 @@ pub(super) fn draw_native_center_status(
             );
             ui.set_min_size(full_rect.size());
             let painter = ui.painter();
-            let box_w = overlay_width_points.clamp(360.0, 720.0);
-            let box_h = if body.is_some() { 132.0 } else { 76.0 };
+            let available_w = (overlay_width_points - 48.0).max(120.0);
+            let box_w = if body.is_some() {
+                overlay_width_points.clamp(360.0, 720.0).min(available_w)
+            } else {
+                let text_w = title.chars().count() as f32 * 18.0 + 72.0;
+                text_w.clamp(180.0, 420.0).min(available_w)
+            };
+            let box_h = if body.is_some() { 132.0 } else { 62.0 };
             let rect = egui::Rect::from_center_size(full_rect.center(), egui::vec2(box_w, box_h));
             painter.rect_filled(
                 rect,
@@ -1103,10 +1128,14 @@ pub(super) fn draw_native_center_status(
                 egui::Color32::from_rgb(238, 238, 238)
             };
             painter.text(
-                egui::pos2(rect.center().x, rect.min.y + 26.0),
+                if body.is_some() {
+                    egui::pos2(rect.center().x, rect.min.y + 26.0)
+                } else {
+                    rect.center()
+                },
                 egui::Align2::CENTER_CENTER,
                 title,
-                egui::FontId::proportional(22.0),
+                egui::FontId::proportional(if body.is_some() { 22.0 } else { 20.0 }),
                 title_color,
             );
             if let Some(body) = body {
@@ -2420,19 +2449,47 @@ where
     Some(values[values.len() / 2].clamp(1.0, EXPECTED_MS_MAX))
 }
 
-pub(super) fn native_perf_sample_has_frame_gap(sample: &NativeOverlayPerfSample) -> bool {
-    let interval = sample.interval_ms;
-    if !interval.is_finite() || interval <= 0.0 {
-        return false;
+pub(super) fn native_perf_visible_fps(history: &[NativeOverlayPerfSample]) -> Option<f32> {
+    let last = history.last()?;
+    let now = last.arrival;
+    let mut prev_visible = false;
+    let mut interval_sum_ms = 0.0_f32;
+    let mut interval_count = 0_u32;
+    for sample in history {
+        let age = now.saturating_duration_since(sample.arrival).as_secs_f32();
+        if age > NATIVE_PERF_GRAPH_SECS {
+            continue;
+        }
+        if prev_visible && sample.interval_ms.is_finite() && sample.interval_ms > 0.0 {
+            interval_sum_ms += sample.interval_ms;
+            interval_count = interval_count.saturating_add(1);
+        }
+        prev_visible = true;
     }
-    let effective = native_perf_effective_interval_ms(sample);
-    let expected = if effective.is_finite() && effective > 1.0 {
-        effective
-    } else {
-        16.67
-    };
-    let threshold = (expected * 1.35).max(expected + 4.0);
-    interval > threshold
+    if interval_count == 0 || interval_sum_ms <= 0.0 {
+        return None;
+    }
+    Some((interval_count as f32 * 1000.0) / interval_sum_ms)
+}
+
+pub(super) fn native_perf_sample_has_late_drop(sample: &NativeOverlayPerfSample) -> bool {
+    sample.late_drop_delta > 0
+}
+
+pub(super) fn native_perf_sample_has_audio_underrun_band(sample: &NativeOverlayPerfSample) -> bool {
+    sample.audio_active && sample.audio_underrun_active
+}
+
+pub(super) fn native_perf_should_thin_sample(
+    sample: &NativeOverlayPerfSample,
+    last_draw_x: f32,
+    x: f32,
+    idx: usize,
+    history_len: usize,
+) -> bool {
+    !native_perf_sample_has_late_drop(sample)
+        && (last_draw_x - x).abs() < 0.75
+        && idx + 1 < history_len
 }
 
 pub(super) fn thumbnail_rgba_key(thumbnail: &NativeOverlayThumbnail) -> u64 {
@@ -3030,5 +3087,68 @@ mod tests {
         assert_eq!(hover_bottom, overlay_h - 48.0);
         assert_eq!(jump.max.y, hover_bottom);
         assert_eq!(meta.max.y, hover_bottom);
+    }
+
+    fn perf_sample(late_drop_delta: u32, interval_ms: f32) -> NativeOverlayPerfSample {
+        NativeOverlayPerfSample {
+            arrival: Instant::now(),
+            interval_ms,
+            total_ms: 0.0,
+            copy_ms: 0.0,
+            present_waitable_ms: 0.0,
+            present_call_ms: 0.0,
+            late_ms: 0.0,
+            late_drop_delta,
+            source_delta_ms: 16.67,
+            playback_speed: 1.0,
+            av_drift_ms: 0.0,
+            av_offset_ms: 0.0,
+            audio_active: true,
+            audio_lead_ms: 0.0,
+            audio_underrun_active: false,
+        }
+    }
+
+    #[test]
+    fn perf_red_marker_follows_drop_delta_not_interval_gap() {
+        assert!(!native_perf_sample_has_late_drop(&perf_sample(0, 73.3)));
+        assert!(native_perf_sample_has_late_drop(&perf_sample(1, 16.7)));
+    }
+
+    #[test]
+    fn perf_thinning_preserves_drop_marker() {
+        let normal = perf_sample(0, 16.7);
+        let dropped = perf_sample(1, 16.7);
+        assert!(native_perf_should_thin_sample(&normal, 100.0, 99.5, 3, 10));
+        assert!(!native_perf_should_thin_sample(
+            &dropped, 100.0, 99.5, 3, 10
+        ));
+    }
+
+    #[test]
+    fn perf_visible_fps_uses_visible_intervals_only() {
+        let base = Instant::now();
+        let mut old = perf_sample(0, 0.0);
+        old.arrival = base;
+        let mut after_gap = perf_sample(0, 7000.0);
+        after_gap.arrival = base + Duration::from_millis(7000);
+        let mut current = perf_sample(0, 16.0);
+        current.arrival = base + Duration::from_millis(7016);
+
+        let fps = native_perf_visible_fps(&[old, after_gap, current]).unwrap();
+        assert!((fps - 62.5).abs() < 0.01, "fps={fps}");
+    }
+
+    #[test]
+    fn perf_underrun_band_requires_active_audio() {
+        let mut audio_active = perf_sample(0, 16.7);
+        audio_active.audio_underrun_active = true;
+        audio_active.audio_active = true;
+        audio_active.av_offset_ms = f32::NAN;
+        let mut audio_inactive = audio_active;
+        audio_inactive.audio_active = false;
+
+        assert!(native_perf_sample_has_audio_underrun_band(&audio_active));
+        assert!(!native_perf_sample_has_audio_underrun_band(&audio_inactive));
     }
 }

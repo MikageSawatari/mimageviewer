@@ -166,21 +166,59 @@ Status:
   `Visible(false)` during active native playback prevents the fullscreen
   viewport's hide/activation transition from briefly revealing the thumbnail
   grid if Windows reorders regular HWND composition for one frame. The backdrop
-  is hidden only by the normal fullscreen-exit path. Because the backdrop
-  remains visible, there is no need for UI-thread z-order polling. The main
-  viewport also draws only a black panel whenever the current fullscreen target
-  is a video and the native presenter is enabled, even before the `VideoPlayer`
-  has populated `fs_cache`, so if Windows transiently exposes the main HWND
-  during activation/z-order churn the thumbnail grid is still masked. The main
-  HWND's DWM caption and border colors are set to black only while native video
-  fullscreen is active, then restored to theme-aware DWM defaults after exit
-  (including the effective Light/Dark mode). The black override is applied
-  after the fullscreen/backdrop viewport has been drawn and restored only after
-  the viewport hide has had a short DWM settling window, so the chrome color
-  change does not lead or trail the fullscreen transition by a visible frame.
-  This avoids white non-client title-bar/border flashes without toggling
-  `ViewportCommand::Decorations`, which can resize the main client area and
-  disturb the thumbnail grid when fullscreen exits.
+  is hidden only by the normal fullscreen-exit path. During startup the UI
+  thread may raise the black egui backdrop above the main HWND by matching its
+  monitor-sized window, stopping the main caption from sitting over the startup
+  curtain while the presenter HWND is still hidden. As an additional guard, the
+  main HWND is temporarily cloaked with `DWMWA_CLOAK` during native-video
+  startup and video-to-video swaps, then uncloaked as soon as the presenter HWND
+  is valid (and always before close-time foreground reclaim). The main viewport
+  itself does not repaint a black panel and its DWM caption/border are not
+  recolored during native-video fullscreen; if cloak or z-order recovery fails,
+  there is no deliberate high-contrast "black client plus normal title bar"
+  repaint on the main HWND, but the cloak remains the primary guard because the
+  backend clear color of an empty main frame is not a reliable visual fallback.
+  This avoids non-client
+  title-bar/border flashes without toggling `ViewportCommand::Decorations`,
+  which can resize the main client area and disturb the thumbnail grid when
+  fullscreen exits.
+- 2026-05-13: the native fullscreen presenter HWND is now created hidden and
+  shown only after the initial DirectComposition tree and black backbuffer have
+  been committed and flushed. This removes the short `WS_EX_NOREDIRECTIONBITMAP`
+  transparent-HWND window where the blackened main HWND's DWM caption buttons
+  could show through before the presenter had real content.
+- 2026-05-13: native-video fullscreen now disables DWM window transitions on the
+  black egui fullscreen backdrop, the native presenter HWND, and the HUD overlay
+  HWND before those windows are shown. Foreground reclaim after closing native
+  video is also decoupled from the delayed main-chrome restore, so the main HWND
+  is claimed as soon as the presenter HWND is destroyed instead of waiting for
+  the 80ms chrome settling window.
+- 2026-05-13: the main HWND caption/border recolor during native-video
+  fullscreen is disabled again. The black backdrop/presenter now masks the
+  client area without forcing DWM to recalculate title-bar glyph contrast, which
+  avoids a visible light/dark caption flip just before the black viewport
+  appears.
+- 2026-05-13: while the native presenter HWND is still hidden, the UI thread now
+  enumerates its own top-level HWNDs, finds the visible fullscreen-sized black
+  egui backdrop, and raises it above the main HWND. This keeps the main caption
+  from momentarily sitting above the black startup curtain before native video
+  starts.
+- 2026-05-13: the main viewport no longer draws a black `CentralPanel` during
+  native-video fullscreen. That fallback masked thumbnails, but when the main
+  HWND leaked above the fullscreen backdrop it produced a high-contrast "black
+  client plus normal title bar" frame. The dedicated fullscreen backdrop remains
+  responsible for the black curtain.
+- 2026-05-13: the native-video black egui fullscreen backdrop is created hidden
+  on its first frame. After the HWND exists, the UI thread applies
+  `DWMWA_TRANSITIONS_FORCEDISABLED` and only then sends `Visible(true)`, so the
+  first show uses the no-transition path instead of Windows' default zoom/fade.
+- 2026-05-13: the main HWND is now cloaked with `DWMWA_CLOAK` while a native
+  video fullscreen is entering or swapping to another video, and uncloaked once
+  the native presenter HWND becomes valid. This removes the remaining one-frame
+  case where the main non-client title bar could be composed above the black
+  fullscreen backdrop before the presenter window took over. The uncloaking path
+  also runs before close-time foreground reclaim and during app shutdown so
+  `SetForegroundWindow` never targets a cloaked main HWND.
 - 2026-05-05: the Rust panic hook is complemented by a Windows native exception
   handler and a UI heartbeat watchdog. Native access violations are appended to
   `panic.log`, while an `App::update` heartbeat gap of more than five seconds is

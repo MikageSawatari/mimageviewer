@@ -13,13 +13,16 @@
 //!
 //! Windows 11 で効きが不安定という報告があるため、失敗は無視 (ベストエフォート)。
 
-use windows::Win32::Foundation::{HWND, LPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_COLOR_DEFAULT, DWMWA_TRANSITIONS_FORCEDISABLED,
-    DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_CLOAK, DWMWA_COLOR_DEFAULT,
+    DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
-use windows::Win32::UI::WindowsAndMessaging::EnumThreadWindows;
+use windows::Win32::UI::WindowsAndMessaging::{
+    EnumThreadWindows, GetWindowRect, HWND_TOP, IsWindowVisible, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SetWindowPos,
+};
 use windows::core::BOOL;
 
 /// 自スレッドの全トップレベルウィンドウに対して DWM トランジションを無効化する。
@@ -47,6 +50,41 @@ pub fn disable_transitions_for_window(hwnd: HWND) {
             std::mem::size_of::<BOOL>() as u32,
         )
     };
+}
+
+pub fn set_window_cloaked(hwnd: HWND, cloaked: bool) -> windows::core::Result<()> {
+    let cloak: i32 = if cloaked { 1 } else { 0 };
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK,
+            &cloak as *const i32 as *const _,
+            std::mem::size_of::<i32>() as u32,
+        )
+    }
+}
+
+pub fn raise_visible_thread_window_matching_rect(main_hwnd: HWND, expected: RECT) -> Option<HWND> {
+    let mut state = RaiseWindowState {
+        main_hwnd,
+        expected,
+        best_hwnd: HWND::default(),
+        best_score: i64::MAX,
+    };
+    unsafe {
+        let tid = GetCurrentThreadId();
+        let state_ptr = &mut state as *mut RaiseWindowState;
+        let _ = EnumThreadWindows(tid, Some(raise_enum_proc), LPARAM(state_ptr as isize));
+        if state.best_hwnd.0.is_null() {
+            return None;
+        }
+        let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+        if SetWindowPos(state.best_hwnd, Some(HWND_TOP), 0, 0, 0, 0, flags).is_ok() {
+            Some(state.best_hwnd)
+        } else {
+            None
+        }
+    }
 }
 
 pub fn set_window_chrome_black(hwnd: HWND) {
@@ -87,4 +125,49 @@ fn set_window_chrome_color(hwnd: HWND, color: u32) {
 unsafe extern "system" fn enum_proc(hwnd: HWND, _lparam: LPARAM) -> BOOL {
     disable_transitions_for_window(hwnd);
     BOOL(1) // TRUE = 列挙続行
+}
+
+struct RaiseWindowState {
+    main_hwnd: HWND,
+    expected: RECT,
+    best_hwnd: HWND,
+    best_score: i64,
+}
+
+unsafe extern "system" fn raise_enum_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let state = unsafe { &mut *(lparam.0 as *mut RaiseWindowState) };
+    if hwnd.0 == state.main_hwnd.0 || !unsafe { IsWindowVisible(hwnd).as_bool() } {
+        return BOOL(1);
+    }
+
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
+        return BOOL(1);
+    }
+
+    let width = (rect.right - rect.left).max(0) as i64;
+    let height = (rect.bottom - rect.top).max(0) as i64;
+    let expected_width = (state.expected.right - state.expected.left).max(0) as i64;
+    let expected_height = (state.expected.bottom - state.expected.top).max(0) as i64;
+    if width <= 0 || height <= 0 || expected_width <= 0 || expected_height <= 0 {
+        return BOOL(1);
+    }
+
+    let cx = state.expected.left + (state.expected.right - state.expected.left) / 2;
+    let cy = state.expected.top + (state.expected.bottom - state.expected.top) / 2;
+    let contains_center = rect.left <= cx && cx < rect.right && rect.top <= cy && cy < rect.bottom;
+    let covers_most_expected = width * height >= (expected_width * expected_height * 2) / 3;
+    if !contains_center || !covers_most_expected {
+        return BOOL(1);
+    }
+
+    let score = (rect.left - state.expected.left).abs() as i64
+        + (rect.top - state.expected.top).abs() as i64
+        + (rect.right - state.expected.right).abs() as i64
+        + (rect.bottom - state.expected.bottom).abs() as i64;
+    if score < state.best_score {
+        state.best_score = score;
+        state.best_hwnd = hwnd;
+    }
+    BOOL(1)
 }

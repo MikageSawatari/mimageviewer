@@ -70,46 +70,6 @@ pub(crate) fn format_playback_speed(speed: f64) -> String {
     }
 }
 
-/// シーク種別 (= 速度と精度のトレードオフ選択)。
-///
-/// **Fast** はユーザー要望 (= ←→キーの体感を速くしたい) に応える hybrid 設計の
-/// 一部。シークバー / ブックマーク / 自動復元など「正確な位置」が要る経路は
-/// **Precise** を使い、ホットキーによる相対シークだけ **Fast** を使う。
-///
-/// どちらも `av_seek_frame(AVSEEK_FLAG_BACKWARD)` で keyframe ≤ target に着地する
-/// (= 共通基底)。違いは **target 到達までの見せ方**:
-///
-/// - **Precise**: video / audio 両方を target まで trim → target ぴったりに再生開始。
-/// - **Fast**: video は keyframe preview を 1 枚だけ表示し、その後 target 到達 frame
-///   までは pre-target frame を drop。audio は target まで trim する。
-///   Codex 2 巡目 P1 助言 (2026-05-01):
-///   audio も trim 無しにすると、keyframe から物理再生する audio の `set_audio_pts`
-///   monotonic guard が clock を target で凍結し、audio が target に追いつくまで
-///   (= 数秒) clock が進まず video pacing も停止する (= 6-7 秒の動画フリーズ)。
-///   Fast では audio は target で準備し、preview frame を readiness から分離することで、
-///   target frame 到着まで Buffering/無音のまま待ってから A/V を同時に再開する。
-///
-/// **target 情報は両モードで `Flush.seek_target_secs = Some(target)` で送る** (Codex
-/// 1 巡目 P1 助言): trim 有無と target 情報を分離管理することで、Fast でも pump が
-/// BufferReady の audio_anchor pts に target を反映でき、Buffering→Playing 入場時の
-/// clock anchor が target に維持される (= timeline 表示が target 固定)。
-///
-/// **Fast モードの視覚的トレードオフ (= 設計の意図)**:
-/// keyframe preview によって「seek した」フィードバックは即時に出す。一方で preview
-/// は `FirstFrameReady` / seek override clear に使わないため、target frame が decode
-/// されるまで engine は Buffering のまま、audio callback は silence を返す。HW decode
-/// なら通常ほぼ一瞬で target に到達し、SW decode / 長 GOP では keyframe 静止画 → target
-/// へのジャンプになる。pre-target frame を連続表示しないので、シーク直後の「早送り」
-/// に見えるスクラブを避けられる。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SeekKind {
-    /// 正確な位置への seek (シークバー / ブックマーク / loop 再生 / EOF replay /
-    /// 自動復元)。preroll decode + trim あり、target ぴったりに着地。
-    Precise,
-    /// 高速 seek (←→ キー)。keyframe preview を 1 枚だけ表示し、target 到達まで待つ。
-    Fast,
-}
-
 /// シーク要求の整合性ある 1 件分。AvClock の `seek_request` Mutex が保護する。
 /// `decoder` モジュールが `take_seek_request()` で取り出す。
 #[derive(Clone, Copy, Debug)]
@@ -117,8 +77,13 @@ pub(super) struct SeekRequest {
     pub target_secs: f64,
     /// シーク世代。request 時点で `seek_serial` から取得・進めた値。
     pub serial: u64,
-    /// シーク種別 (Precise / Fast)。decoder が preroll trim の有無を切替える。
-    pub kind: SeekKind,
+    pub kind: SeekRequestKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SeekRequestKind {
+    Precise,
+    FrameStep { base_secs: f64, direction: i32 },
 }
 
 /// 動画再生用 AV マスタークロック (facade)。
@@ -575,22 +540,12 @@ impl AvClock {
         self.playing.store(playing, Ordering::Release);
     }
 
-    /// シーク要求を出す (= 既定 [`SeekKind::Precise`])。デコーダは
-    /// [`AvClock::take_seek_request`] で取り出す。
+    /// シーク要求を出す。デコーダは [`AvClock::take_seek_request`] で取り出す。
     ///
-    /// シークバー・ブックマーク・loop 再生・EOF replay・自動復元など「正確な位置」が
-    /// 要る経路はこの API を使う。←→ キーのような「速く飛ばしたい」経路は
-    /// [`AvClock::request_seek_with_kind`] に [`SeekKind::Fast`] を渡す。
+    /// 全ての seek は `av_seek_frame(AVSEEK_FLAG_BACKWARD)` で target 以前の keyframe
+    /// へ移動し、video/audio とも target まで preroll trim してから再開する。
+    /// keyframe preview は表示しないため、細かい相対 seek でも映像が逆方向に跳ねない。
     pub fn request_seek(&self, target_secs: f64) {
-        self.request_seek_with_kind(target_secs, SeekKind::Precise);
-    }
-
-    /// シーク種別を明示してシーク要求を出す。
-    ///
-    /// [`SeekKind::Fast`] は keyframe preview を即時表示し、target 到達 frame までは
-    /// readiness を進めない。動画 timeline 表示は target で固定される。
-    /// 詳細は [`SeekKind`] のコメント参照。
-    pub fn request_seek_with_kind(&self, target_secs: f64, kind: SeekKind) {
         let clamped = target_secs.max(0.0);
         // post-EOF seek サポート: tick が EOF を見て pause しないように先にクリア。
         // decoder の EOF wait ループも peek_seek_request_pending で起床する。
@@ -604,13 +559,9 @@ impl AvClock {
         *guard = Some(SeekRequest {
             target_secs: clamped,
             serial: new_serial,
-            kind,
+            kind: SeekRequestKind::Precise,
         });
         if crate::perf::is_enabled() {
-            let kind_str = match kind {
-                SeekKind::Precise => "precise",
-                SeekKind::Fast => "fast",
-            };
             crate::perf::event(
                 "video",
                 "seek_override_set",
@@ -623,7 +574,48 @@ impl AvClock {
                     // `kind` (= イベント種別 = "seek_override_set") と衝突するため、
                     // 単に "kind" にすると JSON シリアライザでどちらかが上書きされ、
                     // ログに残らないケースがあった (実ログで kind=seek_override_set 固定)。
-                    ("seek_kind", serde_json::Value::from(kind_str)),
+                    ("seek_kind", serde_json::Value::from("precise")),
+                ],
+            );
+        }
+    }
+
+    /// メインの動画 decoder で隣接フレームを探す frame-step 専用 seek。
+    ///
+    /// `seek_start_secs` は keyframe へ戻るための demux target、`base_secs` は
+    /// 現在表示中の基準 PTS。UI の seek override は base に固定し、decoder が
+    /// 実際に表示した 1 枚の PTS で後から張り直す。
+    pub fn request_frame_step_seek(&self, seek_start_secs: f64, base_secs: f64, direction: i32) {
+        let seek_start = seek_start_secs.max(0.0);
+        let base = base_secs.max(0.0);
+        let direction = direction.signum();
+        self.eof_reached.store(false, Ordering::Release);
+        let new_serial = self.seek_serial.fetch_add(1, Ordering::AcqRel) + 1;
+        self.seek_override_serial
+            .store(new_serial, Ordering::Release);
+        self.seek_target_override_bits
+            .store(base.to_bits(), Ordering::Release);
+        let mut guard = self.seek_request.lock().unwrap();
+        *guard = Some(SeekRequest {
+            target_secs: seek_start,
+            serial: new_serial,
+            kind: SeekRequestKind::FrameStep {
+                base_secs: base,
+                direction,
+            },
+        });
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "video",
+                "seek_override_set",
+                None,
+                0,
+                &[
+                    ("target", serde_json::Value::from(base)),
+                    ("seek_start", serde_json::Value::from(seek_start)),
+                    ("serial", serde_json::Value::from(new_serial as i64)),
+                    ("seek_kind", serde_json::Value::from("frame_step")),
+                    ("direction", serde_json::Value::from(direction as i64)),
                 ],
             );
         }

@@ -2109,14 +2109,24 @@ impl App {
     #[cfg(windows)]
     fn show_native_video_black_backdrop(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let fs_id = self.fullscreen_viewport_id();
-        let fs_builder = self.build_fullscreen_viewport_builder_with_transparency(false);
         let need_show = !self.fs_viewport_shown;
+        let fs_builder = self.build_fullscreen_viewport_builder_with_transparency(false);
+        let fs_builder = if need_show {
+            // Create the fullscreen backdrop HWND hidden first. The DWM
+            // transition flag can only be applied after the HWND exists, so a
+            // visible initial create can animate before the attribute lands.
+            fs_builder.with_visible(false)
+        } else {
+            fs_builder
+        };
+        let expected_physical_rect = self.fullscreen_backdrop_physical_rect();
         let mut close_fs = false;
         ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
             // Visible な fullscreen viewport なので、native 動画の黒 backdrop 中も
             // IME 状態だけは通常 viewport と同じ入口で更新する。
             self.update_ime_state(ctx);
             if need_show {
+                crate::dwm_transitions::disable_transitions_for_thread_windows();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }
@@ -2152,6 +2162,21 @@ impl App {
                 .frame(egui::Frame::new().fill(egui::Color32::BLACK))
                 .show(ctx, |_ui| {});
         });
+        if self.native_video_presenter_hwnd_for_fs(fs_idx).is_none()
+            && let (Some(main_hwnd), Some(expected)) = (self.main_hwnd, expected_physical_rect)
+        {
+            let raised = crate::dwm_transitions::raise_visible_thread_window_matching_rect(
+                windows::Win32::Foundation::HWND(main_hwnd as *mut _),
+                expected,
+            );
+            if need_show {
+                crate::logger::log(format!(
+                    "[native-video] raised fullscreen backdrop hwnd=0x{:x} main=0x{:x}",
+                    raised.map(|hwnd| hwnd.0 as usize).unwrap_or(0),
+                    main_hwnd as usize
+                ));
+            }
+        }
         self.fs_viewport_shown = true;
         if close_fs {
             self.close_fullscreen();
@@ -2163,6 +2188,19 @@ impl App {
 
     fn build_fullscreen_viewport_builder(&self) -> egui::ViewportBuilder {
         self.build_fullscreen_viewport_builder_with_transparency(true)
+    }
+
+    #[cfg(windows)]
+    fn fullscreen_backdrop_physical_rect(&self) -> Option<windows::Win32::Foundation::RECT> {
+        let center = self.last_outer_rect.map(|r| r.center())?;
+        let ppp = self.last_pixels_per_point;
+        let rect = crate::monitor::get_monitor_logical_rect_at(center.x * ppp, center.y * ppp)?;
+        Some(windows::Win32::Foundation::RECT {
+            left: (rect.min.x * ppp).round() as i32,
+            top: (rect.min.y * ppp).round() as i32,
+            right: (rect.max.x * ppp).round() as i32,
+            bottom: (rect.max.y * ppp).round() as i32,
+        })
     }
 
     fn build_fullscreen_viewport_builder_with_transparency(
@@ -2837,18 +2875,29 @@ impl App {
             if self.slideshow_playing {
                 self.slideshow_playing = false;
             } else {
+                let mut checked_now = None;
                 match self.items.get(fs_idx) {
                     Some(GridItem::Image(_))
                     | Some(GridItem::Video(_))
                     | Some(GridItem::ZipImage { .. })
                     | Some(GridItem::PdfPage { .. }) => {
-                        if self.checked.contains(&fs_idx) {
+                        let checked = if self.checked.contains(&fs_idx) {
                             self.checked.remove(&fs_idx);
+                            false
                         } else {
                             self.checked.insert(fs_idx);
-                        }
+                            true
+                        };
+                        checked_now = Some(checked);
                     }
                     _ => {}
+                }
+                #[cfg(windows)]
+                if let Some(checked) = checked_now
+                    && matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+                    && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
+                {
+                    player.set_native_checked(checked);
                 }
             }
         }
@@ -3254,8 +3303,8 @@ impl App {
                         // Phase 5.5 追加: タイルモード中はオーバーレイのタイルクリック
                         // で seek + close を行うため、background catch-all は完全抑止
                         // (Codex P5.5 H1 反映)。
-                        // Phase 7.I 追加: 一時停止中の中央 2 ボタン (最初から / 続きから)
-                        // の領域を除外。
+                        // Phase 7.I 追加: 動画オープン直後の中央 2 ボタン
+                        // (最初から / 続きから) の領域を除外。
                         let tile_active = self.video_tile_state.is_some();
                         let pos_opt = fs_response.interact_pointer_pos();
                         // 旧 egui HUD は撤去済 (native presenter overlay が代替)。
@@ -3269,7 +3318,7 @@ impl App {
                                     && p.y >= full_rect.min.y + 44.0
                             })
                             .unwrap_or(false);
-                        // 中央 2 ボタン (一時停止時のみ描画) の領域だけを除外。
+                        // 中央 2 ボタン (オープン直後の初回 pause prompt) の領域だけを除外。
                         // 描画条件は native_presenter::draw_native_center_pause_controls
                         // (overlay_draw.rs) と完全に揃える。frame_step 中はボタン非表示
                         // なので除外しない (= ボタン跡地のクリックで toggle_play() が走り
@@ -3280,6 +3329,7 @@ impl App {
                             .map(|p| {
                                 !p.is_playing()
                                     && !p.is_frame_step_active()
+                                    && p.initial_pause_controls_pending()
                                     && p.displayed_frame_seq() > 0
                             })
                             .unwrap_or(false);
@@ -3394,6 +3444,15 @@ impl App {
     // ── ナビゲーション & スライドショー ─────────────────────────────────
 
     pub(crate) fn open_fullscreen_from_fs_navigation(&mut self, ctx: &egui::Context, idx: usize) {
+        #[cfg(windows)]
+        if self.try_start_video_tile_fast_swap(ctx, idx) {
+            return;
+        }
+        #[cfg(windows)]
+        if self.try_start_native_video_fast_swap(ctx, idx) {
+            return;
+        }
+
         #[cfg(windows)]
         let restore_video_tile = self.video_tile_state.is_some();
 
@@ -3520,6 +3579,16 @@ impl App {
             // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、偶発的な
             // input/focus repaint に頼らず明示的に次フレームを起こす。
             ctx.request_repaint();
+        }
+        // fast-swap (動画タイル / native 動画) が進行中なら、swap 機構側が
+        // 表示遷移を完結させるので、handle_fs_navigation 経由の通常 nav 経路は
+        // 二重発火を避けるため早期 return する。
+        #[cfg(windows)]
+        if !close_fs
+            && (self.video_tile_swap_pending.is_some()
+                || self.native_video_fast_swap_pending.is_some())
+        {
+            return;
         }
         // Ctrl+↑↓ はフルスクリーンを保ったまま現在コンテキストの前後へ飛び、
         // 移動先の先頭 image-like を開く。self.selected も合わせて更新するので、

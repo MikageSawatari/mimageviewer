@@ -207,6 +207,8 @@ impl HudOverlayWindow {
                 }
             };
 
+            crate::dwm_transitions::disable_transitions_for_window(hwnd);
+
             // 初期 region は「空」(= 全画面 click-through、bar 非表示時)。
             // 後で `apply_regions` で実 UI rect を入れる。`NULL` を渡すと region
             // 解除 = 全画面復活 → VST が押せなくなる致命バグになるので、必ず

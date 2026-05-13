@@ -110,11 +110,14 @@ pub struct VideoPlayer {
     /// 最後に実際へ表示したフレームの source pts。スクリーンショットとフレーム送りは
     /// 再生クロックではなく「見えているフレーム」を基準にする。
     last_displayed_pts_bits: Arc<AtomicU64>,
-    /// フレーム送りで最後に発行した precise seek target。repeat で次 target を出すとき、
-    /// 表示済み PTS がまだ追いついていなくても発行済み target を基準にできる。
-    frame_step_target_bits: AtomicU64,
+    /// フレーム送りで最後に基準にした表示 PTS。repeat で次 target を出すとき、
+    /// 表示済み PTS がまだ追いついていなくても発行済み base を基準にできる。
+    frame_step_base_bits: AtomicU64,
     /// フレーム送り操作による一時停止中なら true。通常 pause の中央再生 UI と分ける。
     frame_step_active: Arc<AtomicBool>,
+    /// 動画を開いた直後の一時停止状態でだけ、中央の「最初から / 続きから」
+    /// 選択 UI を出すための one-shot フラグ。通常の pause では再点灯させない。
+    initial_pause_controls_pending: Arc<AtomicBool>,
     /// 最後の frame-step seek 発行時点での表示済みフレーム sequence。
     /// 長押し repeat はこの値から `displayed_frame_seq` が進むまで次 target を出さない。
     frame_step_issued_display_seq: AtomicU64,
@@ -162,6 +165,9 @@ pub struct VideoPlayer {
     /// repaint を予約してデコーダ完成を polling 待ちする。長引いたら back off する。
     /// シーク完了 (override が 1 度クリア) で None に戻す。
     seek_inflight_since: Option<std::time::Instant>,
+    /// キーリピート / seekbar drag のような連続ユーザー seek を coalesce する。
+    /// frame-step は専用の latest-wins gate を持つのでここには混ぜない。
+    user_seek_coalesce: Mutex<UserSeekCoalesceState>,
     /// GPU 経路で最新表示フレームの **所有** (= D3d11Frame)。`ui_fullscreen` は
     /// `gpu_latest_info()` 経由で view-only 情報 (handle, dims) を得る。
     /// 次の GPU フレームが到着して置き換わるまで本フィールドが保持し、
@@ -324,6 +330,7 @@ pub(crate) struct SwitchSourcePayload {
     displayed_frame_seq: Arc<AtomicU64>,
     last_displayed_pts_bits: Arc<AtomicU64>,
     frame_step_active: Arc<AtomicBool>,
+    initial_pause_controls_pending: Arc<AtomicBool>,
     duration_secs_bits: Arc<AtomicU64>,
     /// 新ソースの decoder/UI と共有する動的状態 (per-frame プレゼン経路 /
     /// デインターレース)。fast-swap 経路でも presenter の present_stats が
@@ -416,6 +423,13 @@ enum NativeVideoOutputCommand {
     /// CP1-6 までは送る側がないため dead code。CP7 で App から送り始める。
     #[allow(dead_code)]
     RaiseHudToTop,
+    /// native presenter HWND を presenter thread 側で前面・foreground に戻す。
+    ///
+    /// PrintScreen / Snipping Tool などで一度 foreground が外部プロセスへ移ったあと、
+    /// egui 側の黒 backdrop が presenter HWND より前に残ることがある。UI thread から
+    /// `SetWindowPos` / `SetForegroundWindow` すると DWM / presenter thread 待ちで
+    /// 固まるリスクがあるため、command 経由で HWND 所有スレッドに再アサートさせる。
+    RaisePresenterToFront,
 }
 
 #[cfg(windows)]
@@ -426,6 +440,7 @@ struct PresenterSourceState {
     displayed_frame_seq: Arc<AtomicU64>,
     last_displayed_pts_bits: Arc<AtomicU64>,
     frame_step_active: Arc<AtomicBool>,
+    initial_pause_controls_pending: Arc<AtomicBool>,
     duration_secs_bits: Arc<AtomicU64>,
     /// A/V sync drift デバッグ用。fast-swap で旧 source から新 source に payload を
     /// 切り替えるときも同じ Arc を引き継ぎ、grafana 的な時系列が分断されないようにする。
@@ -465,6 +480,7 @@ impl PresenterSourceState {
             displayed_frame_seq: payload.displayed_frame_seq,
             last_displayed_pts_bits: payload.last_displayed_pts_bits,
             frame_step_active: payload.frame_step_active,
+            initial_pause_controls_pending: payload.initial_pause_controls_pending,
             duration_secs_bits: payload.duration_secs_bits,
             audio_diagnostics: payload.audio_diagnostics,
             source_epoch: payload.source_epoch,
@@ -517,6 +533,7 @@ impl NativeVideoOutput {
         displayed_frame_seq: Arc<AtomicU64>,
         last_displayed_pts_bits: Arc<AtomicU64>,
         frame_step_active: Arc<AtomicBool>,
+        initial_pause_controls_pending: Arc<AtomicBool>,
         duration_secs_bits: Arc<AtomicU64>,
         config: NativeVideoOutputConfig,
         dynamic: Arc<crate::video::decoder::VideoDynamicState>,
@@ -551,6 +568,7 @@ impl NativeVideoOutput {
                     displayed_frame_seq,
                     last_displayed_pts_bits,
                     frame_step_active,
+                    initial_pause_controls_pending,
                     duration_secs_bits,
                     config,
                     command_rx,
@@ -776,6 +794,12 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::RaiseHudToTop);
     }
 
+    fn request_presenter_raise(&self) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::RaisePresenterToFront);
+    }
+
     fn set_normalize_overlay_state(
         &self,
         state: crate::video::normalize_types::NormalizeOverlayState,
@@ -984,6 +1008,7 @@ impl NativeFullscreenPresentStats {
             max_interval_ms: self.max_interval_ms,
             av_drift_ms: diag_view.av_drift_ms,
             av_offset_ms: diag_view.av_offset_ms.unwrap_or(f32::NAN),
+            audio_active: diag_view.audio_active,
             audio_lead_ms: diag_view.audio_lead_ms,
             audio_underrun_active: diag_view.audio_underrun_active,
         }
@@ -1189,6 +1214,7 @@ fn run_native_video_output(
     displayed_frame_seq: Arc<AtomicU64>,
     last_displayed_pts_bits: Arc<AtomicU64>,
     frame_step_active: Arc<AtomicBool>,
+    initial_pause_controls_pending: Arc<AtomicBool>,
     duration_secs_bits: Arc<AtomicU64>,
     config: NativeVideoOutputConfig,
     command_rx: std::sync::mpsc::Receiver<NativeVideoOutputCommand>,
@@ -1214,6 +1240,7 @@ fn run_native_video_output(
                 rect: config.rect,
             },
             owner_hwnd: config.owner_hwnd,
+            initially_visible: false,
             close_on_escape: false,
             // This HWND lives on the presenter thread, so WM_QUIT only exits
             // this loop and does not affect eframe's main event loop.
@@ -1221,7 +1248,14 @@ fn run_native_video_output(
             event_tx: Some(presenter_event_tx.clone()),
         },
     )?;
-    hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
+    if cancel.load(Ordering::Acquire) {
+        window.destroy();
+        closed.store(true, Ordering::Release);
+        crate::logger::log(
+            "[native-video] fullscreen presenter startup cancelled before init".to_string(),
+        );
+        return Ok(());
+    }
     // CP7: HUD overlay HWND の有効化判定。
     //   - config.hud_overlay_enabled: App が settings / 環境変数経由で渡してくる ON/OFF。
     //   - 通常は ON (`true`)。
@@ -1257,6 +1291,19 @@ fn run_native_video_output(
             return Err(err);
         }
     };
+    if cancel.load(Ordering::Acquire) {
+        first_presented_out.store(false, Ordering::Release);
+        hwnd_out.store(0, Ordering::Release);
+        hud_hwnd_out.store(0, Ordering::Release);
+        window.destroy();
+        closed.store(true, Ordering::Release);
+        crate::logger::log(
+            "[native-video] fullscreen presenter startup cancelled before show".to_string(),
+        );
+        return Ok(());
+    }
+    let shown = window.show_and_raise();
+    hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
     // HUD HWND が生成されたら App から見えるように atomic に store。
     // CP4 段階 (= hud_event_tx=None) では生成されないので 0 のまま。
     hud_hwnd_out.store(presenter.hud_hwnd(), Ordering::Release);
@@ -1267,8 +1314,9 @@ fn run_native_video_output(
     presenter.set_editor_hwnds_snapshot(config.editor_hwnds_snapshot.clone());
     presenter.set_main_hwnd_for_raise_check(config.main_hwnd_for_raise);
     crate::logger::log(format!(
-        "[native-video] fullscreen presenter started hwnd=0x{:x} rect=({},{} {}x{}) sync_interval={}",
+        "[native-video] fullscreen presenter started hwnd=0x{:x} shown={} rect=({},{} {}x{}) sync_interval={}",
         window.hwnd().0 as usize,
+        shown,
         config.rect.left,
         config.rect.top,
         width,
@@ -1289,6 +1337,9 @@ fn run_native_video_output(
             clock.is_muted(),
             clock.playback_speed(),
             frame_step_active.load(Ordering::Acquire),
+            initial_pause_controls_pending.load(Ordering::Acquire),
+            clock.is_seeking(),
+            clock.current_seek_serial(),
         ) {
             crate::logger::log(format!(
                 "[native-video] initial tile overlay render failed: {err}"
@@ -1303,6 +1354,7 @@ fn run_native_video_output(
         displayed_frame_seq,
         last_displayed_pts_bits,
         frame_step_active,
+        initial_pause_controls_pending,
         duration_secs_bits,
         dynamic,
         audio_diagnostics,
@@ -1525,6 +1577,23 @@ fn run_native_video_output(
                         &mut last_hud_raise_at,
                     );
                 }
+                NativeVideoOutputCommand::RaisePresenterToFront => {
+                    let hwnd = window.hwnd().0 as u64;
+                    let z_ok = crate::video::native_window::bring_to_front(hwnd);
+                    let report = crate::video::native_window::claim_foreground(hwnd);
+                    crate::logger::log(format!(
+                        "[native-video] presenter recover foreground hwnd=0x{hwnd:x} \
+                         z_order={} foreground=0x{:x} post=0x{:x} attach={} \
+                         set_foreground={} set_active={} set_focus={}",
+                        z_ok,
+                        report.foreground_hwnd,
+                        report.post_foreground_hwnd,
+                        report.attach_thread_input_ok,
+                        report.set_foreground_ok,
+                        report.set_active_ok,
+                        report.set_focus_ok,
+                    ));
+                }
                 NativeVideoOutputCommand::SwitchSource { payload } => {
                     native_drain_unpresented_queue(&mut source.queue);
                     let show_preparing_overlay = payload.show_preparing_overlay;
@@ -1691,6 +1760,11 @@ fn run_native_video_output(
                 source.clock.is_muted(),
                 source.clock.playback_speed(),
                 source.frame_step_active.load(Ordering::Acquire),
+                source
+                    .initial_pause_controls_pending
+                    .load(Ordering::Acquire),
+                source.clock.is_seeking(),
+                source.clock.current_seek_serial(),
             );
             let overlay_routing = match presenter.handle_window_events(&native_events) {
                 Ok(outcome) => {
@@ -2007,6 +2081,8 @@ fn run_native_video_output(
         } else if perf_visibility_changed
             || presenter.overlay_needs_render()
             || presenter.overlay_repaint_due(Instant::now())
+            || (source.clock.is_seeking()
+                && last_overlay_tick.elapsed() >= Duration::from_millis(50))
             || (presenter.overlay_wants_periodic_tick()
                 && last_overlay_tick.elapsed() >= Duration::from_millis(250))
         {
@@ -2018,6 +2094,11 @@ fn run_native_video_output(
                 source.clock.is_muted(),
                 source.clock.playback_speed(),
                 source.frame_step_active.load(Ordering::Acquire),
+                source
+                    .initial_pause_controls_pending
+                    .load(Ordering::Acquire),
+                source.clock.is_seeking(),
+                source.clock.current_seek_serial(),
             ) {
                 Ok(outcome) => {
                     for command in outcome.commands {
@@ -2133,6 +2214,7 @@ fn run_native_video_output(
         );
         drop(candidates);
         let mut latest_renderable: Option<VideoFrame> = None;
+        let mut late_drop_delta = 0u32;
         for action in &selection.actions {
             let frame = source
                 .queue
@@ -2149,6 +2231,7 @@ fn run_native_video_output(
                         late_ms,
                         source.queue.len(),
                     );
+                    late_drop_delta = late_drop_delta.saturating_add(1);
                     native_reset_unpresented_frame(frame);
                 }
                 frame_selection::PopAction::Display => {
@@ -2200,7 +2283,8 @@ fn run_native_video_output(
                         .av_drift_ms_bits
                         .store((av_drift_ms as f64).to_bits(), Ordering::Release);
 
-                    // av_offset_ms: audio inactive (動画 only / 音声起動失敗) のとき None。
+                    // av_offset_ms: audio inactive (動画 only / 音声起動失敗) または
+                    // seek / buffer clear 直後の offset 未確定時は None。
                     let av_offset_ms_opt = source
                         .audio_diagnostics
                         .load_audio_audible_pts()
@@ -2213,12 +2297,18 @@ fn run_native_video_output(
                         Ordering::Release,
                     );
                     let audio_lead_ms = source.audio_diagnostics.load_audio_lead_ms();
+                    let audio_active = source.clock.is_audio_active();
 
                     if crate::perf::is_enabled() {
                         let log_now = Instant::now();
-                        // 「big」判定は av_offset (= 体感ズレ) を主とし、audio inactive 時のみ
-                        // 旧 av_drift_ms にフォールバック。
-                        let cur_big_value = av_offset_ms_opt.unwrap_or(av_drift_ms).abs();
+                        // 「big」判定は av_offset (= 体感ズレ) を主とする。audio inactive
+                        // なら旧 av_drift_ms にフォールバックするが、seek / buffer clear
+                        // 直後の offset 未確定中は edge 判定を出さない。
+                        let cur_big_value = match av_offset_ms_opt {
+                            Some(v) => v.abs(),
+                            None if !audio_active => av_drift_ms.abs(),
+                            None => 0.0,
+                        };
                         let big = cur_big_value > 30.0;
                         let big_edge = big && !source.last_av_drift_was_big;
                         source.last_av_drift_was_big = big;
@@ -2245,10 +2335,7 @@ fn run_native_video_output(
                                         "audio_lead_ms",
                                         serde_json::Value::from(audio_lead_ms as f64),
                                     ),
-                                    (
-                                        "audio_active",
-                                        serde_json::Value::from(source.clock.is_audio_active()),
-                                    ),
+                                    ("audio_active", serde_json::Value::from(audio_active)),
                                     ("big_edge", serde_json::Value::from(big_edge)),
                                 ],
                             );
@@ -2268,6 +2355,7 @@ fn run_native_video_output(
                     let diag_view = crate::video::audio_diagnostics::OverlayDiagnostics {
                         av_drift_ms,
                         av_offset_ms: av_offset_ms_opt,
+                        audio_active,
                         audio_lead_ms,
                         audio_underrun_active: underrun_active,
                     };
@@ -2280,10 +2368,12 @@ fn run_native_video_output(
                             present_waitable_ms: outcome.present_waitable_ms as f32,
                             present_call_ms: outcome.present_call_ms as f32,
                             late_ms: late_ms as f32,
+                            late_drop_delta,
                             source_delta_ms: source_delta_ms as f32,
                             playback_speed: source.clock.playback_speed() as f32,
                             av_drift_ms,
                             av_offset_ms: av_offset_ms_opt.unwrap_or(f32::NAN),
+                            audio_active,
                             audio_lead_ms,
                             audio_underrun_active: underrun_active,
                         },
@@ -2310,8 +2400,8 @@ fn run_native_video_output(
                             "first-present",
                         );
                     }
-                    let should_emit_first_frame_ready = !frame.is_seek_preview
-                        && source.first_frame_event_last_epoch != Some(serial);
+                    let should_emit_first_frame_ready =
+                        source.first_frame_event_last_epoch != Some(serial);
                     if should_emit_first_frame_ready {
                         if try_send_native_first_frame_ready(&source.engine_event_tx, serial, pts) {
                             source.first_frame_event_last_epoch = Some(serial);
@@ -2320,19 +2410,20 @@ fn run_native_video_output(
                             source.pending_first_frame_event = Some((serial, pts));
                         }
                     }
-                    if !frame.is_seek_preview {
-                        let now_for_clear = source.clock.now_secs();
-                        let frame_step_active = source.frame_step_active.load(Ordering::Acquire);
-                        if clock::pts_clears_seek_override(pts, now_for_clear) && frame_step_active
-                        {
-                            source.clock.set_paused_position(pts);
-                            source.clock.clear_seek_target_override(serial);
-                        } else if clock::pts_clears_seek_override(pts, now_for_clear)
-                            && !source.clock.is_audio_active()
-                        {
-                            source.clock.set_fallback_anchor(pts);
-                            source.clock.clear_seek_target_override(serial);
-                        }
+                    let now_for_clear = source.clock.now_secs();
+                    let frame_step_active = source.frame_step_active.load(Ordering::Acquire);
+                    if source.clock.is_seeking()
+                        && clock::pts_clears_seek_override(pts, now_for_clear)
+                        && frame_step_active
+                    {
+                        source.clock.set_paused_position(pts);
+                        source.clock.clear_seek_target_override(serial);
+                    } else if clock::pts_clears_seek_override(pts, now_for_clear)
+                        && !frame_step_active
+                        && !source.clock.is_audio_active()
+                    {
+                        source.clock.set_fallback_anchor(pts);
+                        source.clock.clear_seek_target_override(serial);
                     }
                     if crate::perf::is_enabled() {
                         if trace_every_present
@@ -2462,42 +2553,63 @@ fn run_native_video_output(
 /// 吸収して UI tick の空振りを抑える (Phase 8.J)。
 pub(crate) const MAX_RENDER_QUEUE: usize = 24;
 const FRAME_STEP_NO_PENDING_SEQ: u64 = u64::MAX;
+const USER_SEEK_REISSUE_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
 
-pub(crate) fn frame_step_interval_secs(avg_fps: f64) -> f64 {
-    if avg_fps.is_finite() && avg_fps > 1.0 {
-        (1.0 / avg_fps).clamp(1.0 / 240.0, 1.0)
-    } else {
-        1.0 / 30.0
-    }
+#[derive(Debug, Default)]
+struct UserSeekCoalesceState {
+    pending_target_secs: Option<f64>,
+    last_issued_at: Option<std::time::Instant>,
+    last_issued_display_seq: u64,
+}
+
+fn user_seek_ready_to_issue(
+    state: &UserSeekCoalesceState,
+    is_seeking: bool,
+    displayed_seq: u64,
+    now: std::time::Instant,
+) -> bool {
+    !is_seeking
+        || displayed_seq > state.last_issued_display_seq
+        || state
+            .last_issued_at
+            .is_some_and(|issued_at| now.duration_since(issued_at) >= USER_SEEK_REISSUE_AFTER)
 }
 
 fn frame_step_base_secs(
-    pending_step_target: Option<f64>,
+    pending_step_base: Option<f64>,
     last_displayed_pts: Option<f64>,
     current_position: f64,
 ) -> f64 {
-    pending_step_target
+    pending_step_base
         .or(last_displayed_pts)
         .unwrap_or(current_position)
         .max(0.0)
 }
 
-fn frame_step_seek_target_secs(base: f64, step: f64, direction: i32) -> f64 {
-    let direction = direction.signum();
-    if direction < 0 {
-        let backward_bias = (step * 0.25).min(0.004);
-        base - step - backward_bias
+fn frame_step_interval_secs(avg_fps: f64) -> f64 {
+    if avg_fps.is_finite() && avg_fps > 1.0 {
+        (1.0 / avg_fps).clamp(1.0 / 1000.0, 1.0)
     } else {
-        base + step
+        1.0 / 30.0
     }
 }
 
+fn frame_step_seek_start_secs(base: f64, avg_fps: f64, direction: i32) -> f64 {
+    let frame_interval = frame_step_interval_secs(avg_fps);
+    let scan_back_secs = if direction < 0 {
+        (frame_interval * 1.25).clamp(0.002, 0.25)
+    } else {
+        (frame_interval * 8.0).clamp(0.050, 1.0)
+    };
+    (base - scan_back_secs).max(0.0)
+}
+
 fn frame_step_waiting_for_display(
-    pending_step_target: Option<f64>,
+    pending_step_base: Option<f64>,
     issued_display_seq: u64,
     current_display_seq: u64,
 ) -> bool {
-    pending_step_target.is_some()
+    pending_step_base.is_some()
         && issued_display_seq != FRAME_STEP_NO_PENDING_SEQ
         && issued_display_seq == current_display_seq
 }
@@ -2567,8 +2679,9 @@ impl VideoPlayer {
                 first_frame_event_last_epoch: None,
                 displayed_frame_seq: Arc::new(AtomicU64::new(0)),
                 last_displayed_pts_bits: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
-                frame_step_target_bits: AtomicU64::new(f64::NAN.to_bits()),
+                frame_step_base_bits: AtomicU64::new(f64::NAN.to_bits()),
                 frame_step_active: Arc::new(AtomicBool::new(false)),
+                initial_pause_controls_pending: Arc::new(AtomicBool::new(false)),
                 frame_step_issued_display_seq: AtomicU64::new(FRAME_STEP_NO_PENDING_SEQ),
                 decoder_dropped_full_count: Arc::new(AtomicU64::new(0)),
                 ui_dropped_past_count: AtomicU64::new(0),
@@ -2585,6 +2698,7 @@ impl VideoPlayer {
                 loop_target_bits: AtomicU64::new(0u64), // = (0.0_f64).to_bits()
                 eof_loop_quiet_ticks: AtomicU32::new(0),
                 seek_inflight_since: None,
+                user_seek_coalesce: Mutex::new(UserSeekCoalesceState::default()),
                 #[cfg(windows)]
                 gpu_latest: None,
                 #[cfg(windows)]
@@ -2714,6 +2828,7 @@ impl VideoPlayer {
         let displayed_frame_seq = Arc::new(AtomicU64::new(0));
         let last_displayed_pts_bits = Arc::new(AtomicU64::new(f64::NAN.to_bits()));
         let frame_step_active = Arc::new(AtomicBool::new(false));
+        let initial_pause_controls_pending = Arc::new(AtomicBool::new(!autoplay));
         #[cfg(windows)]
         let duration_secs_bits = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
         // 動画は native presenter (独立 HWND + D3D11 swap chain) を必須とする。
@@ -2743,6 +2858,7 @@ impl VideoPlayer {
                     Arc::clone(&displayed_frame_seq),
                     Arc::clone(&last_displayed_pts_bits),
                     Arc::clone(&frame_step_active),
+                    Arc::clone(&initial_pause_controls_pending),
                     Arc::clone(&duration_secs_bits),
                     config,
                     Arc::clone(&dynamic),
@@ -2774,8 +2890,9 @@ impl VideoPlayer {
             first_frame_event_last_epoch: None,
             displayed_frame_seq,
             last_displayed_pts_bits,
-            frame_step_target_bits: AtomicU64::new(f64::NAN.to_bits()),
+            frame_step_base_bits: AtomicU64::new(f64::NAN.to_bits()),
             frame_step_active,
+            initial_pause_controls_pending,
             frame_step_issued_display_seq: AtomicU64::new(FRAME_STEP_NO_PENDING_SEQ),
             #[cfg(windows)]
             duration_secs_bits,
@@ -2799,6 +2916,7 @@ impl VideoPlayer {
             loop_target_bits: AtomicU64::new(0u64),
             eof_loop_quiet_ticks: AtomicU32::new(0),
             seek_inflight_since: None,
+            user_seek_coalesce: Mutex::new(UserSeekCoalesceState::default()),
             #[cfg(windows)]
             gpu_latest: None,
             #[cfg(windows)]
@@ -2957,10 +3075,17 @@ impl VideoPlayer {
         self.engine.lock().unwrap().apply_command(cmd);
     }
 
+    fn clear_initial_pause_controls(&self) {
+        self.initial_pause_controls_pending
+            .store(false, Ordering::Release);
+    }
+
     pub fn toggle_play(&self) {
         // EOF で停止中に Space を押されたら 0 から再生し直す (replay)。
         // 通常の再生中は単純トグル。
         if !self.clock.is_playing() && self.clock.is_eof_reached() {
+            self.clear_pending_user_seek();
+            self.clear_initial_pause_controls();
             self.clear_frame_step_target();
             self.clock.request_seek(0.0);
             self.clear_audio_output_buffer();
@@ -2987,7 +3112,10 @@ impl VideoPlayer {
         // 食い違っていた。
         let new_playing = !self.clock.is_playing();
         if new_playing {
+            self.clear_initial_pause_controls();
             self.clear_frame_step_target();
+        } else {
+            self.clear_pending_user_seek();
         }
         self.clock.set_playing(new_playing);
         self.dispatch_play_pause(new_playing);
@@ -3003,7 +3131,10 @@ impl VideoPlayer {
             self.decode.audio_rx.len()
         ));
         if p {
+            self.clear_initial_pause_controls();
             self.clear_frame_step_target();
+        } else {
+            self.clear_pending_user_seek();
         }
         self.clock.set_playing(p);
         // Phase 9.C: engine 状態も同期。set_playing は外部 API なので呼び出し元が
@@ -3032,9 +3163,79 @@ impl VideoPlayer {
         }
     }
 
+    fn clear_pending_user_seek(&self) {
+        if let Ok(mut state) = self.user_seek_coalesce.lock() {
+            state.pending_target_secs = None;
+        }
+    }
+
+    fn user_seek_base_secs(&self) -> f64 {
+        self.user_seek_coalesce
+            .lock()
+            .ok()
+            .and_then(|state| state.pending_target_secs)
+            .unwrap_or_else(|| self.position())
+    }
+
+    fn issue_user_seek_locked(&self, state: &mut UserSeekCoalesceState, target_secs: f64) {
+        self.clock.request_seek(target_secs);
+        self.clear_audio_output_buffer();
+        self.clear_initial_pause_controls();
+        if !self.clock.is_playing() {
+            self.clock.set_playing(true);
+        }
+        // user 操作 seek は autoplay 強制。
+        // 呼び出し順注意: handle_seek_request → apply_command(Play)
+        // (詳細は toggle_play を参照)。
+        let mut g = self.engine.lock().unwrap();
+        g.handle_seek_request(target_secs);
+        g.apply_command(engine::actor::TransportCommand::Play);
+        state.pending_target_secs = None;
+        state.last_issued_at = Some(std::time::Instant::now());
+        state.last_issued_display_seq = self.displayed_frame_seq.load(Ordering::Acquire);
+    }
+
+    fn request_user_seek(&self, target_secs: f64) {
+        let target = self.clamp_seek_target(target_secs);
+        let mut state = self.user_seek_coalesce.lock().unwrap();
+        let now = std::time::Instant::now();
+        let displayed_seq = self.displayed_frame_seq.load(Ordering::Acquire);
+        if user_seek_ready_to_issue(&state, self.clock.is_seeking(), displayed_seq, now) {
+            self.issue_user_seek_locked(&mut state, target);
+        } else {
+            state.pending_target_secs = Some(target);
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "video",
+                    "user_seek_coalesced",
+                    None,
+                    0,
+                    &[
+                        ("target", serde_json::Value::from(target)),
+                        (
+                            "displayed_seq",
+                            serde_json::Value::from(displayed_seq as i64),
+                        ),
+                    ],
+                );
+            }
+        }
+    }
+
+    fn maybe_issue_pending_user_seek(&self) {
+        let mut state = self.user_seek_coalesce.lock().unwrap();
+        let Some(target) = state.pending_target_secs else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let displayed_seq = self.displayed_frame_seq.load(Ordering::Acquire);
+        if user_seek_ready_to_issue(&state, self.clock.is_seeking(), displayed_seq, now) {
+            self.issue_user_seek_locked(&mut state, target);
+        }
+    }
+
     /// 絶対シーク (シークバークリック / ブックマーク等)。
-    /// **[`SeekKind::Precise`]**: `..target` のキーフレーム + preroll trim で
-    /// target ぴったりに着地。
+    /// target 以前の keyframe から target まで preroll trim し、target ぴったりに着地する。
     /// target は `[0, duration - 0.1s)` にクランプされる。
     /// 一時停止中なら自動的に再生再開する (post-EOF / pause からの seek を
     /// ユーザー操作 1 回で完結させる)。
@@ -3049,19 +3250,7 @@ impl VideoPlayer {
             self.decode.video_rx.len(),
             self.decode.audio_rx.len()
         ));
-        self.clock.request_seek(clamped); // = SeekKind::Precise
-        self.clear_audio_output_buffer();
-        if !self.clock.is_playing() {
-            self.clock.set_playing(true);
-        }
-        // engine の seek_epoch も進めて、AvClock seek_serial と同期させる。
-        // user 操作 seek は autoplay 強制 (AvClock 側で playing=true にしているため整合性)。
-        // 呼び出し順注意: handle_seek_request → apply_command(Play)
-        // (詳細は toggle_play を参照)。
-        let mut g = self.engine.lock().unwrap();
-        g.handle_seek_request(clamped);
-        g.apply_command(engine::actor::TransportCommand::Play);
-        drop(g);
+        self.request_user_seek(clamped);
         crate::logger::log(format!(
             "[video-debug] seek({target_secs:.3}) dispatched: engine_state={} seek_serial={} playing={} video_rx_len={} audio_rx_len={}",
             self.engine_state_name(),
@@ -3073,36 +3262,26 @@ impl VideoPlayer {
     }
 
     /// 相対シーク (←→ ホットキー)。
-    /// **[`SeekKind::Fast`]**: keyframe ≤ target に backward seek し、keyframe preview を
-    /// 1 枚だけ即時表示する。その preview は readiness に使わず、target 到達 frame まで
-    /// A/V は Buffering/無音で待ってから同時に再開する。
+    /// 絶対シークと同じ precise seek を使う。target 前の keyframe preview は表示せず、
+    /// 現在フレームを保ったまま target 到達 frame を待つ。
     /// 一時停止中なら自動的に再生再開する。
     pub fn seek_relative(&self, delta_secs: f64) {
         self.clear_frame_step_target();
-        let cur = self.position();
+        let cur = self.user_seek_base_secs();
         let raw = (cur + delta_secs).max(0.0);
         let target = self.clamp_seek_target(raw);
-        self.clock
-            .request_seek_with_kind(target, clock::SeekKind::Fast);
-        self.clear_audio_output_buffer();
-        if !self.clock.is_playing() {
-            self.clock.set_playing(true);
-        }
-        // user 操作 seek は autoplay 強制。
-        // 呼び出し順注意: handle_seek_request → apply_command(Play)
-        // (詳細は toggle_play を参照)。
-        let mut g = self.engine.lock().unwrap();
-        g.handle_seek_request(target);
-        g.apply_command(engine::actor::TransportCommand::Play);
+        self.request_user_seek(target);
     }
 
     /// フレーム送り用の精密シーク。到着後は必ず一時停止状態に保つ。
     pub fn seek_paused(&self, target_secs: f64) {
+        self.clear_pending_user_seek();
         self.clear_frame_step_target();
         self.seek_paused_internal(target_secs);
     }
 
     fn seek_paused_internal(&self, target_secs: f64) {
+        self.clear_pending_user_seek();
         let clamped = self.clamp_seek_target(target_secs);
         self.clock.request_seek(clamped);
         self.clear_audio_output_buffer();
@@ -3112,30 +3291,73 @@ impl VideoPlayer {
         g.apply_command(engine::actor::TransportCommand::Pause);
     }
 
+    fn seek_paused_frame_step_internal(
+        &self,
+        seek_start_secs: f64,
+        base_secs: f64,
+        direction: i32,
+    ) {
+        self.clear_pending_user_seek();
+        let seek_start = self.clamp_exact_frame_target(seek_start_secs);
+        let base = self.clamp_exact_frame_target(base_secs);
+        self.clock
+            .request_frame_step_seek(seek_start, base, direction);
+        self.clear_audio_output_buffer();
+        self.clock.set_playing(false);
+        self.clock.set_paused_position(base);
+        let mut g = self.engine.lock().unwrap();
+        g.handle_seek_request(base);
+        g.apply_command(engine::actor::TransportCommand::Pause);
+    }
+
     /// 前後 1 フレームへ移動し、一時停止する。
     pub fn step_frame(&self, direction: i32) {
         if direction == 0 {
             return;
         }
-        let pending_step_target = self.frame_step_target();
+        self.clear_pending_user_seek();
+        self.clear_initial_pause_controls();
+        let pending_step_base = self.frame_step_base();
         let displayed_seq = self.displayed_frame_seq.load(Ordering::Acquire);
         let issued_display_seq = self.frame_step_issued_display_seq.load(Ordering::Acquire);
-        if frame_step_waiting_for_display(pending_step_target, issued_display_seq, displayed_seq) {
+        if self.clock.is_seeking()
+            && frame_step_waiting_for_display(pending_step_base, issued_display_seq, displayed_seq)
+        {
             return;
         }
+        let pending_step_base = if pending_step_base.is_some()
+            && issued_display_seq != FRAME_STEP_NO_PENDING_SEQ
+            && issued_display_seq != displayed_seq
+        {
+            None
+        } else {
+            pending_step_base
+        };
         let base = frame_step_base_secs(
-            pending_step_target,
+            pending_step_base,
             self.last_displayed_pts_secs(),
             self.position(),
         );
-        let step = frame_step_interval_secs(self.info.as_ref().map(|i| i.avg_fps).unwrap_or(0.0));
-        let target = self.clamp_seek_target(frame_step_seek_target_secs(base, step, direction));
-        self.frame_step_target_bits
-            .store(target.to_bits(), Ordering::Release);
+        let avg_fps = self.info.as_ref().map(|i| i.avg_fps).unwrap_or(0.0);
+        let direction = direction.signum();
+        let frame_interval = frame_step_interval_secs(avg_fps);
+        if direction < 0 && base <= frame_interval * 0.25 {
+            return;
+        }
+        if direction > 0
+            && self.info.as_ref().is_some_and(|info| {
+                info.duration_secs > 0.0 && base >= info.duration_secs - frame_interval * 1.25
+            })
+        {
+            return;
+        }
+        let seek_start = frame_step_seek_start_secs(base, avg_fps, direction);
+        self.frame_step_base_bits
+            .store(base.to_bits(), Ordering::Release);
         self.frame_step_active.store(true, Ordering::Release);
         self.frame_step_issued_display_seq
             .store(displayed_seq, Ordering::Release);
-        self.seek_paused_internal(target);
+        self.seek_paused_frame_step_internal(seek_start, base, direction);
     }
 
     /// シーク target を `[0, duration - 0.1s)` にクランプする。duration が
@@ -3145,6 +3367,16 @@ impl VideoPlayer {
         if let Some(info) = &self.info {
             if info.duration_secs > 0.2 {
                 return lower.min(info.duration_secs - 0.1);
+            }
+        }
+        lower
+    }
+
+    fn clamp_exact_frame_target(&self, target_secs: f64) -> f64 {
+        let lower = target_secs.max(0.0);
+        if let Some(info) = &self.info {
+            if info.duration_secs > 0.0 {
+                return lower.min(info.duration_secs);
             }
         }
         lower
@@ -3180,8 +3412,8 @@ impl VideoPlayer {
         self.audio_diagnostics.load_av_drift_ms()
     }
 
-    fn frame_step_target(&self) -> Option<f64> {
-        let pts = f64::from_bits(self.frame_step_target_bits.load(Ordering::Acquire));
+    fn frame_step_base(&self) -> Option<f64> {
+        let pts = f64::from_bits(self.frame_step_base_bits.load(Ordering::Acquire));
         if pts.is_finite() {
             Some(pts.max(0.0))
         } else {
@@ -3190,7 +3422,7 @@ impl VideoPlayer {
     }
 
     fn clear_frame_step_target(&self) {
-        self.frame_step_target_bits
+        self.frame_step_base_bits
             .store(f64::NAN.to_bits(), Ordering::Release);
         self.frame_step_active.store(false, Ordering::Release);
         self.frame_step_issued_display_seq
@@ -3199,6 +3431,10 @@ impl VideoPlayer {
 
     pub fn is_frame_step_active(&self) -> bool {
         self.frame_step_active.load(Ordering::Acquire)
+    }
+
+    pub fn initial_pause_controls_pending(&self) -> bool {
+        self.initial_pause_controls_pending.load(Ordering::Acquire)
     }
 
     pub fn duration(&self) -> f64 {
@@ -3336,6 +3572,12 @@ impl VideoPlayer {
         }
     }
 
+    pub fn request_presenter_raise(&self) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.request_presenter_raise();
+        }
+    }
+
     #[cfg(windows)]
     pub fn native_presenter_pending(&self) -> bool {
         self.native_output
@@ -3378,6 +3620,7 @@ impl VideoPlayer {
             displayed_frame_seq: Arc::clone(&self.displayed_frame_seq),
             last_displayed_pts_bits: Arc::clone(&self.last_displayed_pts_bits),
             frame_step_active: Arc::clone(&self.frame_step_active),
+            initial_pause_controls_pending: Arc::clone(&self.initial_pause_controls_pending),
             duration_secs_bits: Arc::clone(&self.duration_secs_bits),
             dynamic: Arc::clone(&self.dynamic),
             audio_diagnostics: Arc::clone(&self.audio_diagnostics),
@@ -3643,6 +3886,8 @@ impl VideoPlayer {
             return None;
         }
 
+        self.maybe_issue_pending_user_seek();
+
         // クロックの今時刻
         let now = self.clock.now_secs();
 
@@ -3704,6 +3949,7 @@ impl VideoPlayer {
                     .store(0, std::sync::atomic::Ordering::Release);
                 let raw = self.loop_target_secs();
                 let target = self.clamp_seek_target(raw);
+                self.clear_pending_user_seek();
                 self.clock.request_seek(target);
                 self.clear_audio_output_buffer();
                 self.clock.set_playing(true);
@@ -3825,6 +4071,7 @@ impl VideoPlayer {
                 // duration を超えないことを保証)。
                 let raw = self.loop_target_secs();
                 let target = self.clamp_seek_target(raw);
+                self.clear_pending_user_seek();
                 self.clock.request_seek(target);
                 self.clear_audio_output_buffer();
                 self.clock.set_playing(true);
@@ -3851,7 +4098,6 @@ impl VideoPlayer {
         let upload_ms: f64 = 0.0;
         if let Some(frame) = latest_renderable {
             let pts_for_log = frame.pts_secs;
-            let is_seek_preview = frame.is_seek_preview;
             // GPU フレームは `gpu_latest` に **所有権ごと** 引き取り、UI は handle を
             // view で参照する。これで前フレームの HANDLE が次フレーム到着まで保持され、
             // 描画中に CloseHandle される race を防ぐ。
@@ -3871,52 +4117,49 @@ impl VideoPlayer {
                          (pts={pts:.3}, serial={serial})"
                         ));
                     }
-                    if !is_seek_preview {
-                        let now_for_clear = self.clock.now_secs();
-                        if clock::pts_clears_seek_override(pts, now_for_clear) {
-                            if self.is_frame_step_active() {
-                                self.clock.set_paused_position(pts);
-                                self.clock.clear_seek_target_override(serial);
-                            } else if self.clock.is_audio_active() {
-                                if self.clock.is_seeking() && crate::perf::is_enabled() {
-                                    crate::perf::event(
-                                        "video",
-                                        "seek_override_wait_audio_gpu",
-                                        None,
-                                        0,
-                                        &[
-                                            ("frame_pts", serde_json::Value::from(pts)),
-                                            ("now", serde_json::Value::from(now_for_clear)),
-                                            (
-                                                "frame_serial",
-                                                serde_json::Value::from(serial as i64),
-                                            ),
-                                        ],
-                                    );
-                                }
-                            } else {
-                                self.clock.set_fallback_anchor(pts);
-                                self.clock.clear_seek_target_override(serial);
+                    let now_for_clear = self.clock.now_secs();
+                    let frame_step_active = self.is_frame_step_active();
+                    if clock::pts_clears_seek_override(pts, now_for_clear) {
+                        if self.clock.is_seeking() && frame_step_active {
+                            self.clock.set_paused_position(pts);
+                            self.clock.clear_seek_target_override(serial);
+                        } else if frame_step_active {
+                            // Exact frame-step is paused while the decoder resolves or after
+                            // its selected frame has already frozen the clock.
+                        } else if self.clock.is_audio_active() {
+                            if self.clock.is_seeking() && crate::perf::is_enabled() {
+                                crate::perf::event(
+                                    "video",
+                                    "seek_override_wait_audio_gpu",
+                                    None,
+                                    0,
+                                    &[
+                                        ("frame_pts", serde_json::Value::from(pts)),
+                                        ("now", serde_json::Value::from(now_for_clear)),
+                                        ("frame_serial", serde_json::Value::from(serial as i64)),
+                                    ],
+                                );
                             }
-                        } else if self.clock.is_seeking() && crate::perf::is_enabled() {
-                            // override 中で frame pts < target - 0.75 (= preroll 不足で
-                            // 解除条件を満たさない経路) を perflog から特定するための診断。
-                            crate::perf::event(
-                                "video",
-                                "seek_override_skip_clear_gpu",
-                                None,
-                                0,
-                                &[
-                                    ("frame_pts", serde_json::Value::from(pts)),
-                                    ("now", serde_json::Value::from(now_for_clear)),
-                                    ("frame_serial", serde_json::Value::from(serial as i64)),
-                                ],
-                            );
+                        } else {
+                            self.clock.set_fallback_anchor(pts);
+                            self.clock.clear_seek_target_override(serial);
                         }
+                    } else if self.clock.is_seeking() && crate::perf::is_enabled() {
+                        // override 中で frame pts < target - 0.75 (= preroll 不足で
+                        // 解除条件を満たさない経路) を perflog から特定するための診断。
+                        crate::perf::event(
+                            "video",
+                            "seek_override_skip_clear_gpu",
+                            None,
+                            0,
+                            &[
+                                ("frame_pts", serde_json::Value::from(pts)),
+                                ("now", serde_json::Value::from(now_for_clear)),
+                                ("frame_serial", serde_json::Value::from(serial as i64)),
+                            ],
+                        );
                     }
-                    if !is_seek_preview {
-                        self.emit_first_frame_event(pts);
-                    }
+                    self.emit_first_frame_event(pts);
                     self.last_displayed_pts_bits
                         .store(pts.to_bits(), Ordering::Release);
                     self.displayed_frame_seq.fetch_add(1, Ordering::Release);
@@ -3932,62 +4175,62 @@ impl VideoPlayer {
                     // 場合に override を消すと、シークバーが target → 元位置にスナップバック
                     // する (= 「← シークが効かない」現象の本質)。target 近傍チェックを
                     // 入れて「シークが物理的に成功した」ときだけ通常クロックに戻す。
-                    if !is_seek_preview {
-                        let now_after = self.clock.now_secs();
-                        if clock::pts_clears_seek_override(frame.pts_secs, now_after) {
-                            // Audio-active playback must let fill_output clear the override only
-                            // when the first audible post-seek samples actually reach the output.
-                            // Clearing from video here starts the visual clock before audio is ready
-                            // and produces AV drift on high-rate files with deep audio queues.
-                            if self.is_frame_step_active() {
-                                self.clock.set_paused_position(frame.pts_secs);
-                                self.clock.clear_seek_target_override(frame.seek_serial);
-                            } else if self.clock.is_audio_active() {
-                                if self.clock.is_seeking() && crate::perf::is_enabled() {
-                                    crate::perf::event(
-                                        "video",
-                                        "seek_override_wait_audio_cpu",
-                                        None,
-                                        0,
-                                        &[
-                                            ("frame_pts", serde_json::Value::from(frame.pts_secs)),
-                                            ("now", serde_json::Value::from(now_after)),
-                                            (
-                                                "frame_serial",
-                                                serde_json::Value::from(frame.seek_serial as i64),
-                                            ),
-                                        ],
-                                    );
-                                }
-                            } else {
-                                self.clock.set_fallback_anchor(frame.pts_secs);
-                                self.clock.clear_seek_target_override(frame.seek_serial);
+                    let now_after = self.clock.now_secs();
+                    let frame_step_active = self.is_frame_step_active();
+                    if clock::pts_clears_seek_override(frame.pts_secs, now_after) {
+                        // Audio-active playback must let fill_output clear the override only
+                        // when the first audible post-seek samples actually reach the output.
+                        // Clearing from video here starts the visual clock before audio is ready
+                        // and produces AV drift on high-rate files with deep audio queues.
+                        if self.clock.is_seeking() && frame_step_active {
+                            self.clock.set_paused_position(frame.pts_secs);
+                            self.clock.clear_seek_target_override(frame.seek_serial);
+                        } else if frame_step_active {
+                            // Keep the frame-step pause anchored even if queued frames arrive
+                            // while the decoder-side adjacent-frame seek is still pending.
+                        } else if self.clock.is_audio_active() {
+                            if self.clock.is_seeking() && crate::perf::is_enabled() {
+                                crate::perf::event(
+                                    "video",
+                                    "seek_override_wait_audio_cpu",
+                                    None,
+                                    0,
+                                    &[
+                                        ("frame_pts", serde_json::Value::from(frame.pts_secs)),
+                                        ("now", serde_json::Value::from(now_after)),
+                                        (
+                                            "frame_serial",
+                                            serde_json::Value::from(frame.seek_serial as i64),
+                                        ),
+                                    ],
+                                );
                             }
-                        } else if self.clock.is_seeking() && crate::perf::is_enabled() {
-                            // CPU 経路の同診断 (GPU 経路と分けて経路別の発火頻度を追える)。
-                            crate::perf::event(
-                                "video",
-                                "seek_override_skip_clear_cpu",
-                                None,
-                                0,
-                                &[
-                                    ("frame_pts", serde_json::Value::from(frame.pts_secs)),
-                                    ("now", serde_json::Value::from(now_after)),
-                                    (
-                                        "frame_serial",
-                                        serde_json::Value::from(frame.seek_serial as i64),
-                                    ),
-                                ],
-                            );
+                        } else {
+                            self.clock.set_fallback_anchor(frame.pts_secs);
+                            self.clock.clear_seek_target_override(frame.seek_serial);
                         }
+                    } else if self.clock.is_seeking() && crate::perf::is_enabled() {
+                        // CPU 経路の同診断 (GPU 経路と分けて経路別の発火頻度を追える)。
+                        crate::perf::event(
+                            "video",
+                            "seek_override_skip_clear_cpu",
+                            None,
+                            0,
+                            &[
+                                ("frame_pts", serde_json::Value::from(frame.pts_secs)),
+                                ("now", serde_json::Value::from(now_after)),
+                                (
+                                    "frame_serial",
+                                    serde_json::Value::from(frame.seek_serial as i64),
+                                ),
+                            ],
+                        );
                     }
                     // CPU フレームの実際の pixel upload は native presenter
                     // (`native_presenter/mod.rs`) が `UpdateSubresource` 経由で行う。
                     // ここに到達する経路は native_output を持たない非 Windows ビルド等
                     // 限定的なケースで、実際の表示は行われない (PTS bookkeeping のみ)。
-                    if !is_seek_preview {
-                        self.emit_first_frame_event(pts_for_log);
-                    }
+                    self.emit_first_frame_event(pts_for_log);
                     self.last_displayed_pts_bits
                         .store(pts_for_log.to_bits(), Ordering::Release);
                     self.displayed_frame_seq.fetch_add(1, Ordering::Release);
@@ -4310,6 +4553,17 @@ mod tests {
     }
 
     #[test]
+    fn frame_step_seek_start_uses_near_base_target_for_backward() {
+        let backward = super::frame_step_seek_start_secs(10.0, 60.0, -1);
+        let expected_backward = 10.0 - (1.0 / 60.0) * 1.25;
+        assert!((backward - expected_backward).abs() < 1.0e-9);
+
+        let forward = super::frame_step_seek_start_secs(10.0, 60.0, 1);
+        assert!(backward > forward);
+        assert!(forward >= 9.0);
+    }
+
+    #[test]
     fn frame_step_base_prefers_pending_target() {
         let base = super::frame_step_base_secs(Some(10.0), Some(20.0), 30.0);
         assert!((base - 10.0).abs() < 1.0e-9);
@@ -4321,17 +4575,6 @@ mod tests {
         assert!((displayed - 20.0).abs() < 1.0e-9);
         let position = super::frame_step_base_secs(None, None, 30.0);
         assert!((position - 30.0).abs() < 1.0e-9);
-    }
-
-    #[test]
-    fn frame_step_seek_target_biases_backward_only() {
-        let step = 1.0 / 60.0;
-        let forward = super::frame_step_seek_target_secs(10.0, step, 1);
-        assert!((forward - (10.0 + step)).abs() < 1.0e-9);
-
-        let backward = super::frame_step_seek_target_secs(10.0, step, -1);
-        assert!(backward < 10.0 - step);
-        assert!((backward - (10.0 - step - 0.004)).abs() < 1.0e-9);
     }
 
     #[test]
@@ -4348,5 +4591,28 @@ mod tests {
             super::FRAME_STEP_NO_PENDING_SEQ,
             42
         ));
+    }
+
+    #[test]
+    fn user_seek_coalesce_waits_while_seek_has_not_displayed() {
+        let now = std::time::Instant::now();
+        let state = super::UserSeekCoalesceState {
+            pending_target_secs: Some(12.0),
+            last_issued_at: Some(now),
+            last_issued_display_seq: 7,
+        };
+        assert!(!super::user_seek_ready_to_issue(&state, true, 7, now));
+    }
+
+    #[test]
+    fn user_seek_coalesce_allows_next_after_first_frame_or_timeout() {
+        let now = std::time::Instant::now();
+        let state = super::UserSeekCoalesceState {
+            pending_target_secs: Some(12.0),
+            last_issued_at: Some(now - super::USER_SEEK_REISSUE_AFTER),
+            last_issued_display_seq: 7,
+        };
+        assert!(super::user_seek_ready_to_issue(&state, true, 8, now));
+        assert!(super::user_seek_ready_to_issue(&state, true, 7, now));
     }
 }

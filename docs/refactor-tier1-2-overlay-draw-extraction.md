@@ -130,7 +130,7 @@ src/video/native_presenter/
 | `native_perf_expected_frame_ms` | 5171 |
 | `native_perf_expected_frame_ms_from_samples` | 5182 |
 | `native_perf_expected_frame_ms_from_values` | 5191 |
-| `native_perf_sample_has_frame_gap` | 5206 |
+| `native_perf_sample_has_late_drop` | 5206 |
 | `native_vst3_chain_slot_tooltip` | 4885 |
 
 ### 関連 enum

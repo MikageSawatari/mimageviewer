@@ -14,6 +14,15 @@ pub(crate) struct PendingPinThumbRefresh {
     pub(crate) started_at: std::time::Instant,
 }
 
+#[cfg(windows)]
+struct NativeVideoSourceSwapStarted {
+    from_idx: usize,
+    target_idx: usize,
+    target_path: std::path::PathBuf,
+    source_epoch: u64,
+    started_at: std::time::Instant,
+}
+
 /// Norm 操作 (toggle ON / OFF / scan 完了) を 1 セットで適用するヘルパー。
 ///
 /// 3 箇所 (`disable_normalize_globally` / `apply_normalize_gain_db_to_player` /
@@ -87,6 +96,7 @@ impl App {
     #[cfg(windows)]
     pub(super) fn ensure_native_video_front(&mut self) {
         if self.fullscreen_idx.is_none() {
+            self.sync_native_video_main_cloak(false);
             if self.native_video_front_synced_hwnd != 0 {
                 // CP7: フルスクリーン解除時に DspBridge 側の owner / hud HWND 登録もクリア。
                 self.dsp_bridge.unregister_fullscreen_owner();
@@ -95,6 +105,7 @@ impl App {
             }
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
+            self.native_video_front_recover_after_external_foreground = false;
             return;
         }
         let (hwnd, hud_hwnd) = self
@@ -120,6 +131,7 @@ impl App {
             }
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
+            self.native_video_front_recover_after_external_foreground = false;
             return;
         }
         let is_new_hwnd = hwnd != self.native_video_front_synced_hwnd;
@@ -127,6 +139,34 @@ impl App {
             // 既存 HWND が継続しているケースでも、HUD HWND は遅延生成されることがあるので
             // bridge 側の登録値が古い (0) のままにならないよう毎フレーム refresh する。
             self.dsp_bridge.set_hud_hwnd(hud_hwnd);
+            self.sync_native_video_main_cloak(false);
+            // PrintScreen / Snipping Tool の範囲選択後に egui 側の黒 backdrop が
+            // presenter HWND より前に残ることがある。外部 foreground を一度観測し、
+            // mIV に戻ったエッジだけで presenter 所有スレッドへ復旧を依頼する。
+            let now = std::time::Instant::now();
+            let foreground_is_ours =
+                crate::video::native_window::foreground_belongs_to_current_process_strict();
+            if !foreground_is_ours {
+                self.native_video_front_recover_after_external_foreground = true;
+            }
+            let presenter_raise_due = self
+                .native_video_front_last_raise
+                .map(|last| now.duration_since(last) >= std::time::Duration::from_millis(250))
+                .unwrap_or(true);
+            if presenter_raise_due
+                && foreground_is_ours
+                && self.native_video_front_recover_after_external_foreground
+            {
+                if let Some(idx) = self.fullscreen_idx {
+                    if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+                        if player.native_presenter_hwnd() == hwnd {
+                            player.request_presenter_raise();
+                            self.native_video_front_last_raise = Some(now);
+                            self.native_video_front_recover_after_external_foreground = false;
+                        }
+                    }
+                }
+            }
             // 実機修正 (2026-05-12 C): VST window が top/bottom bar 帯に重なっていたら
             // ドラッグ/リサイズ終了後に自動で押し出す。`SWP_ASYNCWINDOWPOS` で非同期
             // 送信なので bridge GUI スレッドをブロックしない (= 旧 clamp の crash 回避)。
@@ -143,6 +183,7 @@ impl App {
         // thread.
         self.native_video_front_synced_hwnd = hwnd;
         self.native_video_front_last_raise = Some(std::time::Instant::now());
+        self.native_video_front_recover_after_external_foreground = false;
 
         // CP7: presenter HWND が確定したので、DspBridge に owner / HUD HWND を登録する。
         // - `register_fullscreen_owner(presenter_hwnd)`: VST editor の owner を presenter HWND に
@@ -152,6 +193,7 @@ impl App {
         //   (= `current_gui_owner_hwnd` 内で除外済み)。
         self.dsp_bridge.register_fullscreen_owner(hwnd);
         self.dsp_bridge.set_hud_hwnd(hud_hwnd);
+        self.sync_native_video_main_cloak(false);
         // 実機修正 (2026-05-12 P1 致命的問題): cross-process SetWindowPos(VST_HWND) は
         // bridge GUI スレッドをブロックして bridge 自殺 → VST 全消失。clamp 機能完全削除。
         crate::video::native_window::log_state(hwnd, "synced");
@@ -385,6 +427,23 @@ impl App {
     pub(super) fn sync_native_video_main_chrome(&mut self, active: bool) {
         if active {
             self.native_video_main_chrome_restore_at = None;
+            // The black fullscreen/backdrop HWND now covers the transition by itself.
+            // Do not recolor the main non-client area here: the DWM caption glyph
+            // contrast flip is visible just before the black viewport appears.
+            if self.native_video_main_chrome_black {
+                let dark = matches!(
+                    crate::os_theme::resolve(self.settings.ui_theme),
+                    crate::os_theme::ResolvedTheme::Dark
+                );
+                if let Some(hwnd_raw) = self.main_hwnd {
+                    crate::dwm_transitions::restore_window_chrome_for_theme(
+                        windows::Win32::Foundation::HWND(hwnd_raw as *mut _),
+                        dark,
+                    );
+                }
+                self.native_video_main_chrome_black = false;
+            }
+            return;
         }
         if active == self.native_video_main_chrome_black {
             return;
@@ -406,6 +465,34 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(super) fn sync_native_video_main_cloak(&mut self, cloaked: bool) {
+        if cloaked == self.native_video_main_cloaked {
+            return;
+        }
+        let Some(hwnd_raw) = self.main_hwnd else {
+            crate::logger::log(format!(
+                "[native-video] main cloak skipped cloaked={cloaked} hwnd=<none>"
+            ));
+            return;
+        };
+        let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut _);
+        match crate::dwm_transitions::set_window_cloaked(hwnd, cloaked) {
+            Ok(()) => {
+                self.native_video_main_cloaked = cloaked;
+                crate::logger::log(format!(
+                    "[native-video] main cloak={cloaked} hwnd=0x{hwnd_raw:x}"
+                ));
+            }
+            Err(err) => {
+                crate::logger::log(format!(
+                    "[native-video] main cloak failed cloaked={cloaked} \
+                     hwnd=0x{hwnd_raw:x} err={err:?}"
+                ));
+            }
+        }
+    }
+
+    #[cfg(windows)]
     pub(super) fn schedule_native_video_main_chrome_restore(&mut self) {
         if self.native_video_main_chrome_black {
             self.native_video_main_chrome_restore_at =
@@ -417,6 +504,8 @@ impl App {
 
     #[cfg(windows)]
     pub(super) fn process_native_video_main_chrome_restore(&mut self, ctx: &egui::Context) {
+        self.process_pending_main_foreground_reclaim(ctx);
+
         let Some(deadline) = self.native_video_main_chrome_restore_at else {
             return;
         };
@@ -430,59 +519,66 @@ impl App {
         if now >= deadline {
             self.native_video_main_chrome_restore_at = None;
             self.sync_native_video_main_chrome(false);
-
-            // foreground 奪還 (条件付き)。close_fullscreen 時点で凍結した条件のみ尊重。
-            // Alt+Tab で他アプリが mIV メインと native popup の間に z-order として
-            // 割り込んでいた場合、popup destroy 後に他アプリが前面に残るのを防ぐ。
-            if self.pending_main_foreground_reclaim {
-                let presenter_destroyed = self.pending_main_foreground_reclaim_after_hwnd == 0
-                    || !crate::video::native_window::is_window_alive(
-                        self.pending_main_foreground_reclaim_after_hwnd,
-                    );
-                let force_deadline_passed = self
-                    .pending_main_foreground_reclaim_force_at
-                    .map(|t| now >= t)
-                    .unwrap_or(true);
-                if presenter_destroyed {
-                    if let Some(hwnd_raw) = self.main_hwnd {
-                        let report = crate::video::native_window::claim_foreground(hwnd_raw as u64);
-                        crate::logger::log(format!(
-                            "[native-video] reclaim main foreground hwnd=0x{:x} \
-                             foreground=0x{:x} post=0x{:x} attach={} set_foreground={} \
-                             set_active={} set_focus={}",
-                            hwnd_raw,
-                            report.foreground_hwnd,
-                            report.post_foreground_hwnd,
-                            report.attach_thread_input_ok,
-                            report.set_foreground_ok,
-                            report.set_active_ok,
-                            report.set_focus_ok,
-                        ));
-                    }
-                    self.pending_main_foreground_reclaim = false;
-                    self.pending_main_foreground_reclaim_after_hwnd = 0;
-                    self.pending_main_foreground_reclaim_force_at = None;
-                } else if force_deadline_passed {
-                    crate::logger::log(format!(
-                        "[native-video] reclaim deadline exceeded, skip claim \
-                         presenter_hwnd=0x{:x} still alive",
-                        self.pending_main_foreground_reclaim_after_hwnd
-                    ));
-                    self.pending_main_foreground_reclaim = false;
-                    self.pending_main_foreground_reclaim_after_hwnd = 0;
-                    self.pending_main_foreground_reclaim_force_at = None;
-                } else {
-                    self.native_video_main_chrome_restore_at =
-                        Some(now + std::time::Duration::from_millis(16));
-                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
-                }
-            }
         } else {
             ctx.request_repaint_after(
                 deadline
                     .saturating_duration_since(now)
                     .min(std::time::Duration::from_millis(16)),
             );
+        }
+    }
+
+    #[cfg(windows)]
+    fn process_pending_main_foreground_reclaim(&mut self, ctx: &egui::Context) {
+        if !self.pending_main_foreground_reclaim {
+            return;
+        }
+
+        // foreground 奪還 (条件付き)。close_fullscreen 時点で凍結した条件のみ尊重。
+        // Alt+Tab で他アプリが mIV メインと native popup の間に z-order として
+        // 割り込んでいた場合、popup destroy 後に他アプリが前面に残るのを防ぐ。
+        //
+        // chrome 復元は fullscreen viewport hide の DWM 反映を待つが、foreground
+        // 奪還まで 80ms 待つと、その間だけ外部ウィンドウが見えることがある。
+        let now = std::time::Instant::now();
+        let presenter_destroyed = self.pending_main_foreground_reclaim_after_hwnd == 0
+            || !crate::video::native_window::is_window_alive(
+                self.pending_main_foreground_reclaim_after_hwnd,
+            );
+        let force_deadline_passed = self
+            .pending_main_foreground_reclaim_force_at
+            .map(|t| now >= t)
+            .unwrap_or(true);
+        if presenter_destroyed {
+            if let Some(hwnd_raw) = self.main_hwnd {
+                let report = crate::video::native_window::claim_foreground(hwnd_raw as u64);
+                crate::logger::log(format!(
+                    "[native-video] reclaim main foreground hwnd=0x{:x} \
+                     foreground=0x{:x} post=0x{:x} attach={} set_foreground={} \
+                     set_active={} set_focus={}",
+                    hwnd_raw,
+                    report.foreground_hwnd,
+                    report.post_foreground_hwnd,
+                    report.attach_thread_input_ok,
+                    report.set_foreground_ok,
+                    report.set_active_ok,
+                    report.set_focus_ok,
+                ));
+            }
+            self.pending_main_foreground_reclaim = false;
+            self.pending_main_foreground_reclaim_after_hwnd = 0;
+            self.pending_main_foreground_reclaim_force_at = None;
+        } else if force_deadline_passed {
+            crate::logger::log(format!(
+                "[native-video] reclaim deadline exceeded, skip claim \
+                 presenter_hwnd=0x{:x} still alive",
+                self.pending_main_foreground_reclaim_after_hwnd
+            ));
+            self.pending_main_foreground_reclaim = false;
+            self.pending_main_foreground_reclaim_after_hwnd = 0;
+            self.pending_main_foreground_reclaim_force_at = None;
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
 
@@ -1819,6 +1915,79 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(super) fn poll_native_video_fast_swap(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.native_video_fast_swap_pending.as_ref() else {
+            return;
+        };
+        let target_idx = pending.target_idx;
+        let target_path = pending.target_path.clone();
+        let source_epoch = pending.source_epoch;
+        let started_at = pending.started_at;
+        let deadline = pending.deadline;
+        if self.fullscreen_idx != Some(target_idx) {
+            self.native_video_fast_swap_pending = None;
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        #[derive(Clone, Copy)]
+        enum SwapStatus {
+            Ready,
+            Pending,
+            Timeout,
+            Error,
+            Missing,
+        }
+        let status = match self.fs_cache.get(&target_idx) {
+            Some(FsCacheEntry::Video { player, .. }) if player.path() == &target_path => {
+                if player.error().is_some() {
+                    SwapStatus::Error
+                } else if !player.native_presenter_pending() {
+                    SwapStatus::Ready
+                } else if now >= deadline {
+                    SwapStatus::Timeout
+                } else {
+                    SwapStatus::Pending
+                }
+            }
+            _ => SwapStatus::Missing,
+        };
+        match status {
+            SwapStatus::Ready => {
+                self.native_video_fast_swap_pending = None;
+                crate::logger::log(format!(
+                    "[native-video] fast video swap ready: idx={target_idx} epoch={source_epoch} elapsed_ms={:.1}",
+                    started_at.elapsed().as_secs_f64() * 1000.0
+                ));
+                ctx.request_repaint();
+            }
+            SwapStatus::Pending => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            }
+            SwapStatus::Timeout => {
+                self.native_video_fast_swap_pending = None;
+                crate::logger::log(format!(
+                    "[native-video] fast video swap timeout: idx={target_idx} epoch={source_epoch} elapsed_ms={:.1}",
+                    started_at.elapsed().as_secs_f64() * 1000.0
+                ));
+                ctx.request_repaint();
+            }
+            SwapStatus::Error | SwapStatus::Missing => {
+                self.native_video_fast_swap_pending = None;
+                crate::logger::log(format!(
+                    "[native-video] fast video swap ended before ready: idx={target_idx} epoch={source_epoch} status={}",
+                    match status {
+                        SwapStatus::Error => "error",
+                        SwapStatus::Missing => "missing",
+                        _ => "unknown",
+                    }
+                ));
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    #[cfg(windows)]
     pub(super) fn poll_video_tile_swap(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.video_tile_swap_pending.as_ref() else {
             return;
@@ -2379,6 +2548,9 @@ impl App {
             0x57 if !key.shift && !key.ctrl && !key.repeat => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.seek(0.0);
+                    if !player.is_playing() {
+                        player.toggle_play();
+                    }
                 }
             }
             // Ctrl+Shift+Left / Right: frame step and pause.
@@ -2761,7 +2933,7 @@ impl App {
         fs_idx: usize,
         base_delta: i32,
     ) {
-        if self.video_tile_swap_pending.is_some() {
+        if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
             return;
         }
         if self.fs_nav_is_locked() {
@@ -2793,7 +2965,7 @@ impl App {
         fs_idx: usize,
         delta: i32,
     ) {
-        if self.video_tile_swap_pending.is_some() {
+        if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
             return;
         }
         if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() || delta == 0 {
@@ -2848,32 +3020,29 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn try_start_video_tile_fast_swap(
+    fn start_native_video_source_swap(
         &mut self,
         ctx: &egui::Context,
         target_idx: usize,
-    ) -> bool {
-        if self.video_tile_swap_pending.is_some() {
-            return true;
-        }
+        autoplay_override: Option<bool>,
+        show_preparing_overlay: bool,
+        reason: &'static str,
+    ) -> Option<NativeVideoSourceSwapStarted> {
         let Some(from_idx) = self.fullscreen_idx else {
-            return false;
+            return None;
         };
         if from_idx == target_idx {
-            return true;
-        }
-        if self.video_tile_state.is_none() {
-            return false;
+            return None;
         }
         let Some(GridItem::Video(target_path)) = self.items.get(target_idx).cloned() else {
-            return false;
+            return None;
         };
         if !matches!(self.items.get(from_idx), Some(GridItem::Video(_))) {
-            return false;
+            return None;
         }
 
         crate::logger::log(format!(
-            "[video-tile] fast_swap: from_idx={from_idx} -> target_idx={target_idx} target={}",
+            "[native-video] fast source swap begin: reason={reason} from_idx={from_idx} -> target_idx={target_idx} target={}",
             target_path.display()
         ));
         self.save_all_video_resume_positions();
@@ -2887,19 +3056,34 @@ impl App {
             _ => None,
         };
         let Some(native_output) = native_output else {
-            return false;
+            return None;
         };
 
+        // 旧 player を **新 VideoPlayer / 新 video-decode thread を作る前に** drop する
+        // (2026-05-13 fix)。VideoPlayer::drop は `cancel` フラグを Release で立てるだけで
+        // join しない (= FFmpeg 内停止中の旧 thread は cancel を観測できずに残り続ける)
+        // が、`cancel` をできるだけ早く立てておくと、(1) 旧 thread が安全点に居れば
+        // 早めに自発 exit する、(2) live decoder count の throttle (= 新 swap 抑制)
+        // が新 video decode thread の spawn 前にもう 1 つ古い枠を空けやすくなる、という
+        // 2 つの効果がある。旧コードはここで drop せず末尾の `fs_cache.remove(&from_idx)`
+        // まで遅延していたため、新 video decode thread と旧 thread の生存期間が
+        // build_video_player_for_open + attach + switch_native_source 全工程分だけ
+        // 不必要に重なっていた。
+        if from_idx != target_idx {
+            self.fs_cache.remove(&from_idx);
+        }
+
         let source_epoch = self.next_native_video_source_epoch();
+        let started_at = std::time::Instant::now();
         let mut new_player = self.build_video_player_for_open(
             target_idx,
             target_path.clone(),
             false,
-            Some(false),
+            autoplay_override,
             None,
         );
         new_player.attach_native_output(native_output);
-        let payload = new_player.build_switch_source_payload(source_epoch, true);
+        let payload = new_player.build_switch_source_payload(source_epoch, show_preparing_overlay);
         new_player.switch_native_source(payload);
 
         self.fs_cache.insert(
@@ -2909,19 +3093,9 @@ impl App {
                 load_seq: self.input_seq,
             },
         );
-        self.video_tile_swap_pending = Some(VideoTileSwapPending {
-            target_idx,
-            target_path,
-            source_epoch,
-            started_at: std::time::Instant::now(),
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
-        });
-        self.video_tile_reopen_pending = false;
-        self.video_tile_reopen_deadline = None;
 
         self.open_fullscreen(target_idx);
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
-            player.set_playing(false);
             crate::logger::log(format!(
                 "[video-debug] post-swap state: idx={target_idx} engine_state={} seek_serial={} clock_is_playing={} pos={:.3} video_rx_len={} audio_rx_len={} pending_frames={}",
                 player.engine_state_name(),
@@ -2966,19 +3140,186 @@ impl App {
                 );
             }
         }
-        self.set_native_video_tile_preparing_overlay(target_idx);
+        if show_preparing_overlay {
+            self.set_native_video_tile_preparing_overlay(target_idx);
+        } else if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
+            player.set_native_tile_overlay(None);
+        }
         self.sync_native_video_metadata(target_idx);
         self.sync_native_video_timeline_markers(target_idx);
         self.sync_native_video_vst3_available(target_idx);
         self.sync_native_video_vst3_panel(target_idx);
 
-        if from_idx != target_idx {
-            self.fs_cache.remove(&from_idx);
-        }
+        // (旧 fs_cache.remove(&from_idx) はこの commit で take_native_output 直後に
+        // 移動。詳細は上のコメント参照。)
         crate::logger::log(format!(
-            "[native-video] fast tile swap: from={from_idx} to={target_idx} epoch={source_epoch}"
+            "[native-video] fast source swap queued: reason={reason} from={from_idx} to={target_idx} epoch={source_epoch}"
         ));
         ctx.request_repaint();
+        Some(NativeVideoSourceSwapStarted {
+            from_idx,
+            target_idx,
+            target_path,
+            source_epoch,
+            started_at,
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn try_start_video_tile_fast_swap(
+        &mut self,
+        ctx: &egui::Context,
+        target_idx: usize,
+    ) -> bool {
+        // tile fast-swap も regular fast-swap と同じ video decode thread を spawn する
+        // ため、`try_start_native_video_fast_swap` と同じ live count 上限で抑制する。
+        // ただし throttle は「これは tile fast-swap の候補」と確定したあとに見る
+        // (Codex P1 反映 — tile モード外や画像 target で誤発火しないように)。
+        if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
+            return true;
+        }
+        let Some(from_idx) = self.fullscreen_idx else {
+            return false;
+        };
+        if from_idx == target_idx {
+            return true;
+        }
+        if self.video_tile_state.is_none() {
+            return false;
+        }
+        // tile fast-swap は target/from が動画前提だが、念のため明示チェック。
+        // `start_native_video_source_swap` 内でも同じチェックがあるが、ここで先に判定
+        // しないと下の throttle が誤発火する。
+        if !matches!(self.items.get(target_idx), Some(GridItem::Video(_)))
+            || !matches!(self.items.get(from_idx), Some(GridItem::Video(_)))
+        {
+            return false;
+        }
+
+        const MAX_LIVE_VIDEO_DECODE_THREADS: usize = 3;
+        let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
+            .load(std::sync::atomic::Ordering::Acquire);
+        if live_decoders >= MAX_LIVE_VIDEO_DECODE_THREADS {
+            crate::logger::log(format!(
+                "[native-video] fast tile swap throttled: live_video_decode_threads={live_decoders} max={MAX_LIVE_VIDEO_DECODE_THREADS} target_idx={target_idx}"
+            ));
+            return true;
+        }
+
+        let Some(started) =
+            self.start_native_video_source_swap(ctx, target_idx, Some(false), true, "tile")
+        else {
+            return false;
+        };
+
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
+            player.set_playing(false);
+        }
+        self.video_tile_swap_pending = Some(VideoTileSwapPending {
+            target_idx: started.target_idx,
+            target_path: started.target_path,
+            source_epoch: started.source_epoch,
+            started_at: started.started_at,
+            deadline: started.started_at + std::time::Duration::from_secs(2),
+        });
+        self.video_tile_reopen_pending = false;
+        self.video_tile_reopen_deadline = None;
+        crate::logger::log(format!(
+            "[native-video] fast tile swap: from={} to={} epoch={}",
+            started.from_idx, started.target_idx, started.source_epoch
+        ));
+        true
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn try_start_native_video_fast_swap(
+        &mut self,
+        ctx: &egui::Context,
+        target_idx: usize,
+    ) -> bool {
+        // Gate checks first: 「これは本当に video→video fast-swap の候補か」が確定する
+        // までは throttle 判定もしない。`live_count >= MAX` のときに throttle が早く
+        // 走ると、動画→画像のような fast-swap 対象外の navigation まで握り潰してしまう
+        // (Codex P1 反映)。
+        if self.native_video_fast_swap_pending.is_some() || self.video_tile_swap_pending.is_some() {
+            return true;
+        }
+        if self.video_tile_state.is_some() {
+            return false;
+        }
+        let Some(from_idx) = self.fullscreen_idx else {
+            return false;
+        };
+        if from_idx == target_idx {
+            return true;
+        }
+        // 動画→動画 fast-swap でないなら通常 open 経路に流す。`start_native_video_source_swap`
+        // 内でも同じチェックがあるが、ここで先に判定しないと下の throttle が誤発火する。
+        if !matches!(self.items.get(target_idx), Some(GridItem::Video(_)))
+            || !matches!(self.items.get(from_idx), Some(GridItem::Video(_)))
+        {
+            return false;
+        }
+
+        // fast-swap 連射で HW decoder context (D3D11VA surface pool / video processor
+        // slot) が短時間に重なり、新 video decode thread の `avcodec_send_packet` が
+        // driver 内で永続待機する事象がある (2026-05-13 ログ調査)。`VideoPlayer::drop`
+        // が cancel フラグを立てても、FFmpeg 内停止中の旧 thread は cancel を観測できず
+        // 居座るので、`LIVE_VIDEO_DECODE_THREADS` が上限を超えていれば新 swap を抑制する。
+        //
+        // 上限は「現在再生中 1 + transient swap 中 1〜2」をすべて含めた **総 live 数** で
+        // カウントしている。よって MAX=3 は「stuck 3 個」ではなく「in-flight 合計 3 個」の
+        // 意。stuck と再生中の player を区別しない単純カウントで実装している。
+        const MAX_LIVE_VIDEO_DECODE_THREADS: usize = 3;
+        let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
+            .load(std::sync::atomic::Ordering::Acquire);
+        if live_decoders >= MAX_LIVE_VIDEO_DECODE_THREADS {
+            crate::logger::log(format!(
+                "[native-video] fast video swap throttled: live_video_decode_threads={live_decoders} max={MAX_LIVE_VIDEO_DECODE_THREADS} target_idx={target_idx}"
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "native_video",
+                    "fast_swap_throttled",
+                    None,
+                    0,
+                    &[
+                        (
+                            "live_video_decode_threads",
+                            serde_json::Value::from(live_decoders as i64),
+                        ),
+                        (
+                            "max",
+                            serde_json::Value::from(MAX_LIVE_VIDEO_DECODE_THREADS as i64),
+                        ),
+                        ("target_idx", serde_json::Value::from(target_idx as i64)),
+                    ],
+                );
+            }
+            // 「ホイール event を握り潰す」ため true (= 上位の `open_native_video_fullscreen_from_navigation`
+            // が traditional open に fallback しないようにする)。traditional open は更に
+            // 旧 VideoPlayer を evict + 新 video-decode thread を spawn するので throttle
+            // 中に通すと contention を悪化させる。
+            return true;
+        }
+
+        let Some(started) =
+            self.start_native_video_source_swap(ctx, target_idx, None, false, "navigation")
+        else {
+            return false;
+        };
+
+        self.native_video_fast_swap_pending = Some(NativeVideoFastSwapPending {
+            target_idx: started.target_idx,
+            target_path: started.target_path,
+            source_epoch: started.source_epoch,
+            started_at: started.started_at,
+            deadline: started.started_at + std::time::Duration::from_secs(2),
+        });
+        crate::logger::log(format!(
+            "[native-video] fast video swap: from={} to={} epoch={}",
+            started.from_idx, started.target_idx, started.source_epoch
+        ));
         true
     }
 
@@ -2989,6 +3330,9 @@ impl App {
         idx: usize,
     ) {
         if self.try_start_video_tile_fast_swap(ctx, idx) {
+            return;
+        }
+        if self.try_start_native_video_fast_swap(ctx, idx) {
             return;
         }
         let started = std::time::Instant::now();

@@ -128,6 +128,9 @@ pub enum NativeVideoWindowMode {
 pub struct NativeVideoWindowConfig {
     pub mode: NativeVideoWindowMode,
     pub owner_hwnd: u64,
+    /// `false` の場合、HWND は hidden で作成し、呼び出し側が DComp 初期化後に
+    /// `show_and_raise` で表示する。native fullscreen presenter の透明期間を避けるため。
+    pub initially_visible: bool,
     pub close_on_escape: bool,
     pub post_quit_on_destroy: bool,
     pub event_tx: Option<std::sync::mpsc::Sender<NativeVideoWindowEvent>>,
@@ -138,6 +141,7 @@ impl NativeVideoWindowConfig {
         Self {
             mode: NativeVideoWindowMode::Windowed { width, height },
             owner_hwnd: 0,
+            initially_visible: true,
             close_on_escape: true,
             post_quit_on_destroy: true,
             event_tx: None,
@@ -174,7 +178,10 @@ impl NativeVideoWindow {
 
             let (ex_style, style, x, y, width, height, raise_on_show) = match config.mode {
                 NativeVideoWindowMode::Windowed { width, height } => {
-                    let style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
+                    let mut style = WS_OVERLAPPEDWINDOW;
+                    if config.initially_visible {
+                        style |= WS_VISIBLE;
+                    }
                     let ex_style = WINDOW_EX_STYLE::default();
                     let mut rect = RECT {
                         left: 0,
@@ -195,7 +202,10 @@ impl NativeVideoWindow {
                     )
                 }
                 NativeVideoWindowMode::Borderless { rect } => {
-                    let style = WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
+                    let mut style = WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
+                    if config.initially_visible {
+                        style |= WS_VISIBLE;
+                    }
                     let ex_style = WS_EX_NOREDIRECTIONBITMAP;
                     (
                         ex_style,
@@ -241,10 +251,15 @@ impl NativeVideoWindow {
                     return Err(format!("CreateWindowExW: {err:?}"));
                 }
             };
-            let _ = ShowWindow(hwnd, SW_SHOW);
-            if raise_on_show {
+            crate::dwm_transitions::disable_transitions_for_window(hwnd);
+            if config.initially_visible {
+                let _ = ShowWindow(hwnd, SW_SHOW);
+            }
+            if config.initially_visible && raise_on_show {
                 bring_hwnd_to_front(hwnd);
                 log_window_state("created", hwnd);
+            } else if !config.initially_visible {
+                log_window_state("created-hidden", hwnd);
             }
             Ok(Self { hwnd })
         }
@@ -252,6 +267,22 @@ impl NativeVideoWindow {
 
     pub fn hwnd(&self) -> HWND {
         self.hwnd
+    }
+
+    pub fn show_and_raise(&self) -> bool {
+        if self.hwnd.0.is_null() {
+            return false;
+        }
+        unsafe {
+            if !IsWindow(Some(self.hwnd)).as_bool() {
+                return false;
+            }
+            crate::dwm_transitions::disable_transitions_for_window(self.hwnd);
+            let _ = ShowWindow(self.hwnd, SW_SHOW);
+        }
+        let raised = bring_hwnd_to_front(self.hwnd);
+        log_window_state("shown", self.hwnd);
+        raised
     }
 
     pub fn destroy(&mut self) {

@@ -20,6 +20,7 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM,
     DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
@@ -57,6 +58,46 @@ const SHARED_TEXTURE_CACHE_CAPACITY: usize = 64;
 /// lib にいる native_presenter から bin の `ui_fullscreen` を参照できないため、
 /// シングルソースをここ (lib 側) に置く。
 pub const CURSOR_HIDE_IDLE_SECS: f32 = 3.0;
+const SEEK_STATUS_DELAY: Duration = Duration::from_millis(150);
+const SEEK_STATUS_MIN_VISIBLE: Duration = Duration::from_millis(300);
+
+fn seek_status_visible_for_times(
+    is_seeking: bool,
+    started_at: Option<Instant>,
+    visible_since: Option<Instant>,
+    now: Instant,
+) -> bool {
+    let active_after_delay = is_seeking
+        && started_at.is_some_and(|started| now.duration_since(started) >= SEEK_STATUS_DELAY);
+    let held_after_completion =
+        visible_since.is_some_and(|shown| now.duration_since(shown) < SEEK_STATUS_MIN_VISIBLE);
+    active_after_delay || held_after_completion
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CenterPauseControlsInputs {
+    tile_overlay_visible: bool,
+    is_playing: bool,
+    frame_step_active: bool,
+    initial_pause_controls_pending: bool,
+    first_frame_presented: bool,
+    has_video_error: bool,
+    normalize_scanning: bool,
+}
+
+fn center_pause_controls_visible_for_state(inputs: CenterPauseControlsInputs) -> bool {
+    !inputs.tile_overlay_visible
+        && !inputs.is_playing
+        && !inputs.frame_step_active
+        && inputs.initial_pause_controls_pending
+        && inputs.first_frame_presented
+        && !inputs.has_video_error
+        && !inputs.normalize_scanning
+}
+
+fn center_seek_status_visible(raw_seek_status_visible: bool, paused_center_visible: bool) -> bool {
+    raw_seek_status_visible && !paused_center_visible
+}
 
 pub struct NativePresenterConfig {
     pub hwnd: HWND,
@@ -201,6 +242,12 @@ struct NativeEguiOverlay {
     video_muted: bool,
     video_playback_speed: f64,
     video_frame_step_active: bool,
+    initial_pause_controls_pending: bool,
+    video_is_seeking: bool,
+    video_seek_serial: u64,
+    seek_status_started_at: Option<Instant>,
+    seek_status_visible_since: Option<Instant>,
+    seek_status_visible: bool,
     video_speed_popup_open: bool,
     frame_step_hold: Option<NativeFrameStepHold>,
     video_loop_enabled: bool,
@@ -357,8 +404,12 @@ pub struct NativeOverlayPerfSnapshot {
     pub av_drift_ms: f32,
     /// **ユーザー体感の音映像差** (= video_pts − audio_audible_pts、ms、符号付き)。
     /// + = 映像が音声より進んでいる、− = 映像が音声より遅れている。
-    /// audio inactive (動画 only / 音声起動失敗) 時は `f32::NAN`。
+    /// audio inactive (動画 only / 音声起動失敗) または seek 直後など offset 未確定時は
+    /// `f32::NAN`。audio の有無は `audio_active` を見る。
     pub av_offset_ms: f32,
+    /// audio stream が clock source として active か。`av_offset_ms` は seek 直後に一時
+    /// NaN になるので、lead / underrun の表示可否はこの値で判定する。
+    pub audio_active: bool,
     /// audio が master clock より何 ms 先行しているか (callback 直近値)。
     /// 通常 ≈ 0、Norm clear 後の big jump 直後は 5000+ ms に張り付くことがある。
     pub audio_lead_ms: f32,
@@ -375,6 +426,9 @@ pub struct NativeOverlayPerfSample {
     pub present_waitable_ms: f32,
     pub present_call_ms: f32,
     pub late_ms: f32,
+    /// 本 sample の直前選択で表示前に捨てた frame 数。
+    /// perf graph の赤縦線は frame interval の揺れではなく、この値だけを marker にする。
+    pub late_drop_delta: u32,
     /// PTS delta between consecutive presented frames (= 1/native_fps の生値)。
     /// 再生速度の影響を受けない (= 30fps なら常に 33.33ms)。Y 軸 / gap 判定には
     /// `playback_speed` で割って実 frame interval に正規化したものを使う。
@@ -385,8 +439,11 @@ pub struct NativeOverlayPerfSample {
     /// 本 sample 取得時点の video pacing drift (signed ms、video_pts − master_clock)。
     pub av_drift_ms: f32,
     /// 本 sample 取得時点の **体感音映像差** (signed ms、video_pts − audio_audible_pts)。
-    /// audio inactive 時は `f32::NAN`。グラフのサブトラック描画はこちらを優先。
+    /// audio inactive または seek 直後など offset 未確定時は `f32::NAN`。
+    /// グラフのサブトラック描画はこちらを優先。
     pub av_offset_ms: f32,
+    /// 本 sample 取得時点で audio stream が active だったか。
+    pub audio_active: bool,
     /// 本 sample 取得時点で audio が master clock から先行している量 (ms)。
     /// 通常 ≈ 0、Norm clear 直後は >>0 に張り付く。
     pub audio_lead_ms: f32,
@@ -577,6 +634,7 @@ impl Drop for KeyedMutexReadGuard {
 pub struct NativeOverlayInputRouting {
     pub wants_pointer_input: bool,
     pub wants_keyboard_input: bool,
+    pub text_input_active: bool,
 }
 
 pub struct NativeOverlayInputOutcome {
@@ -598,6 +656,34 @@ impl NativeOverlayInputOutcome {
             hud_regions: Vec::new(),
         }
     }
+}
+
+fn native_video_fullscreen_shortcut_key(
+    key: &crate::video::native_window::NativeVideoKeyEvent,
+) -> bool {
+    if key.alt {
+        return false;
+    }
+    matches!(
+        key.virtual_key,
+        0x0D // Enter
+            | 0x1B // Escape
+            | 0x20 // Space
+            | 0x23 // End
+            | 0x24 // Home
+            | 0x25 // Left
+            | 0x26 // Up
+            | 0x27 // Right
+            | 0x28 // Down
+            | 0x42 // B
+            | 0x4A // J
+            | 0x4B // K
+            | 0x4C // L
+            | 0x4D // M
+            | 0x50 // P
+            | 0x53 // S
+            | 0x57 // W
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -697,10 +783,14 @@ impl NativeOverlayInputRouting {
         use crate::video::native_window::NativeVideoWindowEvent as NativeEvent;
 
         match event {
-            NativeEvent::KeyDown(_)
-            | NativeEvent::KeyUp(_)
-            | NativeEvent::Text(_)
-            | NativeEvent::Ime(_) => !self.wants_keyboard_input,
+            NativeEvent::KeyDown(key) | NativeEvent::KeyUp(key) => {
+                if !self.text_input_active && native_video_fullscreen_shortcut_key(key) {
+                    true
+                } else {
+                    !self.wants_keyboard_input
+                }
+            }
+            NativeEvent::Text(_) | NativeEvent::Ime(_) => !self.wants_keyboard_input,
             NativeEvent::MouseMove(_)
             | NativeEvent::MouseButton(_)
             | NativeEvent::MouseWheel(_)
@@ -1107,6 +1197,7 @@ impl NativeVideoPresenter {
                 surface_height: config.height,
             };
             this.recreate_backbuffer(true)?;
+            this.wait_for_initial_composition_ready();
             log_event(
                 "init",
                 &[
@@ -1120,6 +1211,27 @@ impl NativeVideoPresenter {
             );
             Ok(this)
         }
+    }
+
+    fn wait_for_initial_composition_ready(&self) {
+        let wait_t0 = Instant::now();
+        let commit_ok = unsafe { self._dcomp_device.WaitForCommitCompletion() }.is_ok();
+        let after_commit_ms = wait_t0.elapsed().as_secs_f64() * 1000.0;
+        let flush_ok = unsafe { DwmFlush() }.is_ok();
+        let total_ms = wait_t0.elapsed().as_secs_f64() * 1000.0;
+        crate::logger::log(format!(
+            "native-presenter: initial composition ready commit_ok={commit_ok} \
+             flush_ok={flush_ok} commit_ms={after_commit_ms:.2} total_ms={total_ms:.2}"
+        ));
+        log_event(
+            "initial_composition_ready",
+            &[
+                ("commit_ok", Value::from(commit_ok)),
+                ("flush_ok", Value::from(flush_ok)),
+                ("commit_ms", Value::from(after_commit_ms)),
+                ("total_ms", Value::from(total_ms)),
+            ],
+        );
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {
@@ -1795,6 +1907,9 @@ impl NativeVideoPresenter {
         muted: bool,
         playback_speed: f64,
         frame_step_active: bool,
+        initial_pause_controls_pending: bool,
+        is_seeking: bool,
+        seek_serial: u64,
     ) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.update_video_state(
@@ -1805,6 +1920,9 @@ impl NativeVideoPresenter {
                 muted,
                 playback_speed,
                 frame_step_active,
+                initial_pause_controls_pending,
+                is_seeking,
+                seek_serial,
             );
         }
     }
@@ -1943,6 +2061,9 @@ impl NativeVideoPresenter {
         muted: bool,
         playback_speed: f64,
         frame_step_active: bool,
+        initial_pause_controls_pending: bool,
+        is_seeking: bool,
+        seek_serial: u64,
     ) -> Result<NativeOverlayInputOutcome, String> {
         let outcome = if let Some(overlay) = self.egui_overlay.as_mut() {
             let force_tick_render =
@@ -1955,6 +2076,9 @@ impl NativeVideoPresenter {
                 muted,
                 playback_speed,
                 frame_step_active,
+                initial_pause_controls_pending,
+                is_seeking,
+                seek_serial,
             );
             if force_tick_render {
                 overlay.dirty = true;
@@ -2564,6 +2688,12 @@ impl NativeEguiOverlay {
             video_muted: false,
             video_playback_speed: 1.0,
             video_frame_step_active: false,
+            initial_pause_controls_pending: false,
+            video_is_seeking: false,
+            video_seek_serial: 0,
+            seek_status_started_at: None,
+            seek_status_visible_since: None,
+            seek_status_visible: false,
             video_speed_popup_open: false,
             frame_step_hold: None,
             video_loop_enabled: false,
@@ -2690,6 +2820,9 @@ impl NativeEguiOverlay {
             NativeEvent::KeyDown(key) | NativeEvent::KeyUp(key) => {
                 let modifiers = egui_modifiers(key.shift, key.ctrl, key.alt);
                 self.modifiers = modifiers;
+                if !self.text_input_active() && native_video_fullscreen_shortcut_key(&key) {
+                    return;
+                }
                 if let Some(egui_key) = egui_key_from_virtual_key(key.virtual_key) {
                     let pressed = matches!(event, NativeEvent::KeyDown(_));
                     self.pending_events.push(egui::Event::Key {
@@ -2790,11 +2923,15 @@ impl NativeEguiOverlay {
         muted: bool,
         playback_speed: f64,
         frame_step_active: bool,
+        initial_pause_controls_pending: bool,
+        is_seeking: bool,
+        seek_serial: u64,
     ) {
         let position_secs = finite_nonnegative(position_secs);
         let duration_secs = finite_nonnegative(duration_secs);
         let volume = finite_video_volume(volume);
         let playback_speed = crate::video::clock::clamp_playback_speed(playback_speed);
+        let now = Instant::now();
         let duration_changed = (self.video_duration_secs - duration_secs).abs() > 0.001;
         let position_changed = (self.video_position_secs - position_secs).abs() >= 0.25;
         let playing_changed = self.video_is_playing != is_playing;
@@ -2802,8 +2939,19 @@ impl NativeEguiOverlay {
         let muted_changed = self.video_muted != muted;
         let speed_changed = (self.video_playback_speed - playback_speed).abs() >= 1.0e-6;
         let frame_step_changed = self.video_frame_step_active != frame_step_active;
+        let initial_pause_changed =
+            self.initial_pause_controls_pending != initial_pause_controls_pending;
+        let seeking_changed = self.video_is_seeking != is_seeking;
+        let seek_serial_changed = self.video_seek_serial != seek_serial;
         if !is_playing {
             self.perf_pause_gap_pending = true;
+        }
+        if seeking_changed || (is_seeking && seek_serial_changed) {
+            if is_seeking {
+                self.seek_status_started_at = Some(now);
+            } else {
+                self.seek_status_started_at = None;
+            }
         }
         self.video_position_secs = position_secs;
         self.video_duration_secs = duration_secs;
@@ -2812,6 +2960,9 @@ impl NativeEguiOverlay {
         self.video_muted = muted;
         self.video_playback_speed = playback_speed;
         self.video_frame_step_active = frame_step_active;
+        self.initial_pause_controls_pending = initial_pause_controls_pending;
+        self.video_is_seeking = is_seeking;
+        self.video_seek_serial = seek_serial;
         if speed_changed {
             // 速度変更前のサンプルは旧 playback_speed のまま `perf_history` に残るが、
             // Y 軸スケールと gap 判定は最新サンプル群の median から導出されるため、
@@ -2827,9 +2978,13 @@ impl NativeEguiOverlay {
             || muted_changed
             || speed_changed
             || frame_step_changed
+            || initial_pause_changed
+            || seeking_changed
+            || seek_serial_changed
         {
             self.dirty = true;
         }
+        self.schedule_seek_status_repaint(now);
     }
 
     fn native_pos(&self, x: i32, y: i32) -> egui::Pos2 {
@@ -3027,6 +3182,63 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
+    fn seek_status_visible_at(&self, now: Instant) -> bool {
+        seek_status_visible_for_times(
+            self.video_is_seeking,
+            self.seek_status_started_at,
+            self.seek_status_visible_since,
+            now,
+        )
+    }
+
+    fn schedule_seek_status_repaint(&mut self, now: Instant) {
+        let seek_delay_deadline = self
+            .video_is_seeking
+            .then(|| {
+                self.seek_status_started_at
+                    .and_then(|started| started.checked_add(SEEK_STATUS_DELAY))
+                    .filter(|deadline| *deadline > now)
+            })
+            .flatten();
+        let hold_deadline = self
+            .seek_status_visible_since
+            .and_then(|shown| shown.checked_add(SEEK_STATUS_MIN_VISIBLE))
+            .filter(|deadline| *deadline > now);
+        let deadline = match (seek_delay_deadline, hold_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        if let Some(deadline) = deadline {
+            self.next_repaint_deadline = Some(
+                self.next_repaint_deadline
+                    .map_or(deadline, |current| current.min(deadline)),
+            );
+        }
+    }
+
+    fn update_seek_status_for_render(&mut self, now: Instant) -> bool {
+        let active_after_delay = self.video_is_seeking
+            && self
+                .seek_status_started_at
+                .is_some_and(|started| now.duration_since(started) >= SEEK_STATUS_DELAY);
+        let visible_hold_expired = self
+            .seek_status_visible_since
+            .is_some_and(|shown| now.duration_since(shown) >= SEEK_STATUS_MIN_VISIBLE);
+        if !active_after_delay && visible_hold_expired {
+            self.seek_status_visible_since = None;
+        }
+        if active_after_delay {
+            // Keep this fresh while the slow seek is visible so completion gets the
+            // full minimum hold instead of expiring from the first visible frame.
+            self.seek_status_visible_since = Some(now);
+        }
+        let visible = self.seek_status_visible_at(now);
+        self.seek_status_visible = visible;
+        self.schedule_seek_status_repaint(now);
+        visible
+    }
+
     /// eframe 経由でルーティングされた活動 (Space で pause/resume 等) を反映する。
     /// `push_native_event` を経由しない経路用の明示的な活動通知。
     /// `dirty = true` を立てて次フレームで `render_once` を強制実行し、
@@ -3168,6 +3380,8 @@ impl NativeEguiOverlay {
             || self.toast.is_some()
             || self.video_error.is_some()
             || !self.first_frame_presented
+            || self.video_is_seeking
+            || self.seek_status_visible_since.is_some()
             // カーソル auto-hide のカウントダウン中、および 3 秒経過後でもまだ
             // SetCursor(None) を 1 度も打てていない場合は tick を継続する。
             // - cursor_last_activity が Some && !cursor_hidden:
@@ -3238,7 +3452,7 @@ impl NativeEguiOverlay {
     /// `apply_hud_regions(&regions)` で `SetWindowRgn` に渡されて、HUD HWND の
     /// 物理形状が更新される。
     ///
-    /// **含めるもの (= 実際にクリック可能な UI rect だけ)**:
+    /// **含めるもの (= 表示される UI rect。クリック可能でない受動インジケータも含む)**:
     /// - 上 hover bar (`top_bar_visible()`): 画面上端 0..76pt 帯
     /// - 下 HUD (`hud_visible()`): 画面下端 (H-220)..H pt 帯
     /// - right panel (`right_panel_visible()`): 画面右端の panel rect
@@ -3250,6 +3464,7 @@ impl NativeEguiOverlay {
     /// - tile overlay (`tile_overlay.is_some()`): 全画面 tile grid
     /// - paused center indicator (paused かつ表示中)
     /// - seek hover thumbnail + pin/bookmark (`hover_thumbnail.is_some()`)
+    /// - checkmark indicator (`video_checked`)
     ///
     /// **含めないもの**:
     /// - activation zone (= bar 非表示状態の hover 検出範囲) — VST のノブやメニューが
@@ -3312,14 +3527,26 @@ impl NativeEguiOverlay {
             self.normalize_state.ui_state,
             crate::video::normalize_types::NormalizeUiState::Scanning
         );
+        let raw_seek_status_visible = self.seek_status_visible
+            && !tile_overlay_visible
+            && self.first_frame_presented
+            && self.video_error.is_none();
         // paused_center_visible (= 中央 replay/play ボタンが見えている) も描画側と一致させる
         // (Codex CP5 P2 #2): paused 中の中央ボタンクリックが VST に抜けないように。
-        let paused_center_visible = !tile_overlay_visible
-            && !self.video_is_playing
-            && !self.video_frame_step_active
-            && self.first_frame_presented
-            && self.video_error.is_none()
-            && !normalize_scanning;
+        let paused_center_visible =
+            center_pause_controls_visible_for_state(CenterPauseControlsInputs {
+                tile_overlay_visible,
+                is_playing: self.video_is_playing,
+                frame_step_active: self.video_frame_step_active,
+                initial_pause_controls_pending: self.initial_pause_controls_pending,
+                first_frame_presented: self.first_frame_presented,
+                has_video_error: self.video_error.is_some(),
+                normalize_scanning,
+            });
+        let seek_status_visible =
+            center_seek_status_visible(raw_seek_status_visible, paused_center_visible);
+        let status_visible = !tile_overlay_visible
+            && (self.video_error.is_some() || !self.first_frame_presented || seek_status_visible);
         // **bottom_hud_visible** は描画側 (`render_once`) と完全一致させる。
         // CP5 旧版は `hud_visible()` 単独だったが、Codex CP5 P2 #1 で「top bar や
         // side panel 表示中も bottom HUD が描かれるのに region に下端帯がないと
@@ -3379,6 +3606,31 @@ impl NativeEguiOverlay {
             });
         }
 
+        // Center status (error / preparing / slow seek): `draw_native_center_status`
+        // と同じ box サイズを region に含め、HUD HWND の SetWindowRgn でクリップされないようにする。
+        if status_visible {
+            let has_body = self.video_error.is_some();
+            let title = if has_body {
+                "動画を再生できません".to_owned()
+            } else if !self.first_frame_presented {
+                crate::video::avio_progress::build_preparing_message(self.preparing_status)
+            } else {
+                "シーク中...".to_owned()
+            };
+            let available_w = (width_points - 48.0).max(120.0);
+            let box_w = if has_body {
+                width_points.clamp(360.0, 720.0).min(available_w)
+            } else {
+                let text_w = title.chars().count() as f32 * 18.0 + 72.0;
+                text_w.clamp(180.0, 420.0).min(available_w)
+            };
+            let box_h = if has_body { 132.0 } else { 62.0 };
+            regions.push(rect_to_px(egui::Rect::from_center_size(
+                egui::pos2(width_points * 0.5, height_points * 0.5),
+                egui::vec2(box_w, box_h),
+            )));
+        }
+
         // Right panel 表示中: `native_metadata_panel_rect` の実 rect を使う
         // (= 幅 430pt 上限、top=56pt から hover_bottom まで、Codex CP9 実機 P1 #3 反映)。
         if right_panel_visible_flag {
@@ -3405,6 +3657,17 @@ impl NativeEguiOverlay {
             regions.push(rect_to_px(egui::Rect::from_min_size(
                 egui::pos2(14.0, 14.0),
                 egui::vec2(perf_w, 158.0),
+            )));
+        }
+
+        // Checkmark indicator: passive UI だが、HUD HWND は SetWindowRgn 外の DComp
+        // 描画も OS 側で clip する。右パネル等の region が重なった時だけ見える
+        // regression を避けるため、描画側と同じ rect を小さく追加する。
+        if self.video_checked && !tile_overlay_visible {
+            let top = if panel_chrome_visible { 68.0 } else { 28.0 };
+            regions.push(rect_to_px(self::overlay_draw::native_checkmark_rect(
+                width_points,
+                top,
             )));
         }
 
@@ -3565,7 +3828,12 @@ impl NativeEguiOverlay {
         NativeOverlayInputRouting {
             wants_pointer_input: self.wants_pointer_input,
             wants_keyboard_input: self.wants_keyboard_input,
+            text_input_active: self.text_input_active(),
         }
+    }
+
+    fn text_input_active(&self) -> bool {
+        self.bookmark_title_edit.is_some()
     }
 
     fn hud_visible(&self) -> bool {
@@ -3721,6 +3989,7 @@ impl NativeEguiOverlay {
         }) {
             self.toast = None;
         }
+        let seek_status_active = self.update_seek_status_for_render(render_t0);
         self.sync_hover_thumbnail_texture();
         self.sync_tile_overlay_textures();
         self.sync_jump_entry_textures();
@@ -3783,7 +4052,10 @@ impl NativeEguiOverlay {
         let top_bar_visible = self.top_bar_visible();
         let right_panel_visible = self.right_panel_visible();
         let tile_overlay_visible = tile_overlay.is_some();
-        let status_visible = video_error.is_some() || !first_frame_presented;
+        let raw_seek_status_visible = seek_status_active
+            && !tile_overlay_visible
+            && first_frame_presented
+            && video_error.is_none();
         let toast_visible = toast.is_some();
         let bookmark_title_edit_visible = bookmark_title_edit.is_some();
         let side_panel_visible =
@@ -3795,12 +4067,19 @@ impl NativeEguiOverlay {
             normalize_state_snap.ui_state,
             crate::video::normalize_types::NormalizeUiState::Scanning
         );
-        let paused_center_visible = !tile_overlay_visible
-            && !is_playing
-            && !frame_step_active
-            && first_frame_presented
-            && video_error.is_none()
-            && !normalize_scanning;
+        let paused_center_visible =
+            center_pause_controls_visible_for_state(CenterPauseControlsInputs {
+                tile_overlay_visible,
+                is_playing,
+                frame_step_active,
+                initial_pause_controls_pending: self.initial_pause_controls_pending,
+                first_frame_presented,
+                has_video_error: video_error.is_some(),
+                normalize_scanning,
+            });
+        let seek_status_visible =
+            center_seek_status_visible(raw_seek_status_visible, paused_center_visible);
+        let status_visible = video_error.is_some() || !first_frame_presented || seek_status_visible;
         let bottom_hud_visible = hud_visible || panel_chrome_visible || paused_center_visible;
         let perf_origin = egui::pos2(14.0, 14.0);
         // Codex 2周目 P1: normalize_scanning も overlay_visible / cursor_blocking_overlay_visible
@@ -3936,6 +4215,15 @@ impl NativeEguiOverlay {
                     overlay_width_points,
                     overlay_height_points,
                     &title,
+                    None,
+                    false,
+                );
+            } else if seek_status_visible {
+                draw_native_center_status(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    "シーク中...",
                     None,
                     false,
                 );
@@ -4941,6 +5229,7 @@ impl NativeEguiOverlay {
         } else {
             Instant::now().checked_add(repaint_delay)
         };
+        self.schedule_seek_status_repaint(Instant::now());
         if hud_repaint_debug_enabled() && repaint_delay != Duration::MAX {
             crate::logger::log(format!(
                 "[HUD-DEBUG] egui repaint_delay={:?} pending={} dirty_after_run={}",
@@ -5630,9 +5919,161 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativePixelSample, compare_pixel_probe, compute_video_visual_transform,
-        copy_cpu_rgba_to_swapchain_bgra, metadata_clean_text, sample_cpu_rgba_pixel,
+        NativeOverlayInputRouting, NativePixelSample, compare_pixel_probe,
+        compute_video_visual_transform, copy_cpu_rgba_to_swapchain_bgra, metadata_clean_text,
+        native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel,
     };
+    use crate::video::native_window::{NativeVideoKeyEvent, NativeVideoWindowEvent};
+
+    fn key(virtual_key: u32) -> NativeVideoKeyEvent {
+        NativeVideoKeyEvent {
+            virtual_key,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn native_overlay_routes_shortcuts_even_when_button_has_focus() {
+        let routing = NativeOverlayInputRouting {
+            wants_keyboard_input: true,
+            text_input_active: false,
+            ..Default::default()
+        };
+
+        assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x20))));
+        assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x0D))));
+        assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x41))));
+    }
+
+    #[test]
+    fn native_overlay_keeps_shortcuts_while_text_input_is_active() {
+        let routing = NativeOverlayInputRouting {
+            wants_keyboard_input: true,
+            text_input_active: true,
+            ..Default::default()
+        };
+
+        assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x20))));
+        assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x0D))));
+    }
+
+    #[test]
+    fn native_video_fullscreen_shortcut_key_ignores_alt_combos() {
+        let mut event = key(0x20);
+        assert!(native_video_fullscreen_shortcut_key(&event));
+
+        event.alt = true;
+        assert!(!native_video_fullscreen_shortcut_key(&event));
+    }
+
+    #[test]
+    fn seek_status_waits_for_delay_and_holds_after_completion() {
+        let now = std::time::Instant::now();
+        assert!(!super::seek_status_visible_for_times(
+            true,
+            Some(now),
+            None,
+            now + super::SEEK_STATUS_DELAY / 2
+        ));
+        assert!(super::seek_status_visible_for_times(
+            true,
+            Some(now),
+            None,
+            now + super::SEEK_STATUS_DELAY
+        ));
+        assert!(super::seek_status_visible_for_times(
+            false,
+            None,
+            Some(now),
+            now + super::SEEK_STATUS_MIN_VISIBLE / 2
+        ));
+        assert!(!super::seek_status_visible_for_times(
+            false,
+            None,
+            Some(now),
+            now + super::SEEK_STATUS_MIN_VISIBLE
+        ));
+    }
+
+    #[test]
+    fn seek_status_delay_resets_for_new_seek_generation() {
+        let now = std::time::Instant::now();
+        let second_seek_started = now + std::time::Duration::from_millis(100);
+        assert!(!super::seek_status_visible_for_times(
+            true,
+            Some(second_seek_started),
+            None,
+            now + super::SEEK_STATUS_DELAY
+        ));
+    }
+
+    #[test]
+    fn center_pause_controls_visibility_requires_initial_paused_ready_video() {
+        let base = super::CenterPauseControlsInputs {
+            tile_overlay_visible: false,
+            is_playing: false,
+            frame_step_active: false,
+            initial_pause_controls_pending: true,
+            first_frame_presented: true,
+            has_video_error: false,
+            normalize_scanning: false,
+        };
+        assert!(super::center_pause_controls_visible_for_state(base));
+
+        let cases = [
+            super::CenterPauseControlsInputs {
+                tile_overlay_visible: true,
+                ..base
+            },
+            super::CenterPauseControlsInputs {
+                is_playing: true,
+                ..base
+            },
+            super::CenterPauseControlsInputs {
+                frame_step_active: true,
+                ..base
+            },
+            super::CenterPauseControlsInputs {
+                initial_pause_controls_pending: false,
+                ..base
+            },
+            super::CenterPauseControlsInputs {
+                first_frame_presented: false,
+                ..base
+            },
+            super::CenterPauseControlsInputs {
+                has_video_error: true,
+                ..base
+            },
+            super::CenterPauseControlsInputs {
+                normalize_scanning: true,
+                ..base
+            },
+        ];
+        for inputs in cases {
+            assert!(!super::center_pause_controls_visible_for_state(inputs));
+        }
+    }
+
+    #[test]
+    fn center_seek_status_hides_behind_pause_controls() {
+        assert!(super::center_seek_status_visible(true, false));
+        assert!(!super::center_seek_status_visible(true, true));
+        assert!(!super::center_seek_status_visible(false, false));
+    }
+
+    #[test]
+    fn native_checkmark_rect_matches_top_right_indicator_position() {
+        let rect = super::overlay_draw::native_checkmark_rect(1920.0, 28.0);
+
+        assert!((rect.center().x - 1890.0).abs() < f32::EPSILON);
+        assert!((rect.center().y - 46.0).abs() < f32::EPSILON);
+        assert!((rect.width() - 39.6).abs() < 0.001);
+        assert!((rect.height() - 39.6).abs() < 0.001);
+    }
 
     /// 1:1 SAR では従来の isotropic transform と一致 (regression-safe を保証)。
     #[test]
