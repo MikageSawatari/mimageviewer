@@ -1273,6 +1273,43 @@ awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
   PR（プルリクエスト）の作成は、明示的に指示された場合のみ行う。
 - **デフォルトブランチ**: GitHub 上は `main`、ローカルは `master`。リリース時は両方に push する。
 
+### worktree + Windows junction の地雷 ⚠️
+
+並行作業のため `git worktree add` で別 worktree を切るときに、`vendor/` を main worktree から
+**junction (NTFS reparse point) で共有する設計**を選ぶと、撤収時に災害が起きる:
+
+```
+[NG] git worktree remove で junction ごと再帰削除される事故 (2026-05-13 実害):
+  C:\home\mimageviewer-sqlite\          ← worktree
+    └─ vendor\  (junction → C:\home\mimageviewer\vendor\)
+  ↓ git worktree remove C:\home\mimageviewer-sqlite
+  → git は junction を **通常ディレクトリ扱いで** 中身まで再帰削除
+  → main worktree の C:\home\mimageviewer\vendor\ の中身が全消失
+  → cargo build が pdfium.dll / FFmpeg DLL / ONNX Runtime DLL / Susie ワーカーすべて
+    無いと言って失敗、bootstrap-vendor.sh で再 DL する羽目になる
+```
+
+**ルール**: junction を含む worktree を撤去する前に、**先に junction だけを `Remove-Item` で
+剥がす**こと。`Remove-Item` / `rmdir` は junction を正しく「リンクのみ削除、リンク先は touch
+しない」で扱える:
+
+```powershell
+# Step 1: junction を剥がす (リンク先 = main の vendor/ は無事)
+Remove-Item C:\home\mimageviewer-sqlite\vendor -Force
+
+# Step 2: ここで初めて worktree 削除
+git worktree remove C:\home\mimageviewer-sqlite
+```
+
+**より安全な設計**: そもそも `vendor/` を worktree 間で共有しない。worktree 側でも
+`bash scripts/setup-ffmpeg.sh` 等を流して per-worktree な `vendor/` を持つ方が、撤去時の
+事故リスクがゼロ。disk 容量 (~1GB) より復旧の手間の方が高い。
+
+junction を共有したい場合は **`vendor/` 全体ではなく個別サブディレクトリ単位** (`vendor/pdfium/`,
+`vendor/ffmpeg/`, `vendor/models/`, `vendor/ort/`, `vendor/susie-worker/`) で junction を張る。
+こうしておけば、`git worktree remove` が中身を辿っても worktree 側の各 junction が削除されるだけで
+**main の `vendor/` ディレクトリ自体は touch されない** (junction の親 dir が main 側にあるため)。
+
 ## User: Background
 
 - Comfortable reading C++ but not familiar with Rust's borrow checker details
