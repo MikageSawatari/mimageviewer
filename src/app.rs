@@ -6314,6 +6314,14 @@ impl App {
         if *container == search_results_synthetic_path() {
             return None;
         }
+        // ConvertibleArchive (7z/LZH) を変換キャッシュ ZIP として開いている drill-down 状態
+        // では container = キャッシュ ZIP 実体になっているため、ピンを書いてもユーザーが
+        // 期待する「親フォルダの ConvertibleArchive タイル」には適用されない (キャッシュ
+        // ZIP は他の grid に出現しないので事実上 dead pin になる)。ここでは UI を隠して
+        // 混乱を避ける (Codex Phase D P2 指摘)。
+        if self.archive_source_override.is_some() {
+            return None;
+        }
         // 既存 pin (もしあれば) を引いておく
         let existing_pin = self.folder_thumb_pin_for(container).cloned();
         // 選択中アイテムから source を組み立てる (= 「左クリックで何を pin するか」)
@@ -6400,6 +6408,20 @@ impl App {
         }
     }
 
+    /// 親コンテナの代表サムネピンが書き換わっていたら現フォルダを再ロードして
+    /// グリッドに反映する。`close_fullscreen` と `App::update` (= 毎フレーム) の
+    /// 両方から呼ばれる。dirty が `close_fullscreen` でしか consume されないと、
+    /// グリッドモードで 📌 を押しても次の fullscreen 開閉までグリッドが古いまま
+    /// になる (Codex Phase D P2 指摘)。
+    pub(crate) fn consume_folder_thumb_pin_dirty(&mut self) {
+        if std::mem::take(&mut self.folder_thumb_pin_dirty) {
+            if let Some(cur) = self.current_folder.clone() {
+                self.folder_history.remove(&cur);
+                self.load_folder(cur);
+            }
+        }
+    }
+
     /// アドレスバー 📌 ボタンの右クリック / コンテキストメニューの「解除」ハンドラ。
     pub(crate) fn remove_folder_pin_for_current_container(&mut self) {
         let Some(container) = self.current_folder.clone() else {
@@ -6428,6 +6450,12 @@ impl App {
             return false;
         }
         if container == search_results_synthetic_path() {
+            return false;
+        }
+        // ConvertibleArchive 変換キャッシュ ZIP の drill-down 状態では dead pin になる
+        // ためエントリを出さない (Codex Phase D P2 指摘、`compute_folder_pin_button_state`
+        // と挙動を揃える)。
+        if self.archive_source_override.is_some() {
             return false;
         }
         // ConvertibleArchive: disabled + tooltip
@@ -11971,14 +11999,11 @@ impl App {
             }
         }
         // 親コンテナ (Folder/ZipFile/PdfFile) の代表サムネピンが書き換わっていたら
-        // 同じく現フォルダを再ロードしてグリッドに反映する (= pin の cache key が
-        // 新しい source_id に変わるので catalog miss → ピン target で再生成)。
-        if std::mem::take(&mut self.folder_thumb_pin_dirty) {
-            if let Some(cur) = self.current_folder.clone() {
-                self.folder_history.remove(&cur);
-                self.load_folder(cur);
-            }
-        }
+        // 同じく現フォルダを再ロードしてグリッドに反映する。
+        // close_fullscreen + メインの update 両方から拾うため共通ヘルパー経由
+        // (Codex Phase D P2 指摘: dirty が close_fullscreen でしか consume されず、
+        // グリッドモードで 📌 を押しても次の fullscreen 開閉まで反映されなかった)。
+        self.consume_folder_thumb_pin_dirty();
         // perf: close_fullscreen は fs_cache / ai_upscale_cache / pending スレッドの
         // キャンセル通知を行うため、Ctrl+↑↓ (Fullscreen モード) の sync パスで
         // 実行される。ms を計測してブロックの所在を特定する。
@@ -15688,6 +15713,11 @@ impl eframe::App for App {
 
         // ── アドレスバー ─────────────────────────────────────────────
         let address_nav = self.render_address_bar(ctx);
+        // 📌 ボタン / コンテキストメニューで pin が書き換わっていたら同フレーム
+        // 内でグリッドに反映 (Codex Phase D P2 指摘: dirty が close_fullscreen
+        // でしか consume されないと、グリッドモードでクリックしても次の fs 開閉
+        // までグリッドが更新されない)。
+        self.consume_folder_thumb_pin_dirty();
 
         // ── Ctrl+F: 検索バー表示 ─────────────────────────────────────
         // Ctrl+G (グローバルメタ検索) と相互排他 (docs §10.3):

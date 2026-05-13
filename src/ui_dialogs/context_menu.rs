@@ -278,11 +278,16 @@ impl crate::app::App {
 
                     // ── 代表サムネ固定 (pin) エントリ ──
                     // pin 不能 variant (ZipSeparator / SearchContainer) は無描画。
+                    // 空フォルダの右クリックで合成された `GridItem::Folder(current_folder)`
+                    // も rel="" で pin できないので skip (Codex Phase D P3 指摘: 単独の
+                    // separator だけが残るのを防ぐ)。
                     // ConvertibleArchive は disabled で描画。それ以外は toggle ボタン。
-                    if !matches!(
-                        item,
-                        GridItem::ZipSeparator { .. } | GridItem::SearchContainer { .. }
-                    ) {
+                    if !is_folder_context
+                        && !matches!(
+                            item,
+                            GridItem::ZipSeparator { .. } | GridItem::SearchContainer { .. }
+                        )
+                    {
                         ui.separator();
                         if self.render_folder_pin_menu_entry(ui, &item) {
                             close = true;
