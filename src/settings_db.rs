@@ -1156,10 +1156,17 @@ fn read_vst3_chain_slots(conn: &Connection) -> Result<Vst3ChainPresetSlots, Sett
         Ok((idx, name, gui_visible, video_compact, plugins_json))
     })?;
     let mut out = Vst3ChainPresetSlots::default();
+    let max_slot = out.slots.len();
     for row in rows {
         let (idx, name, gui_visible, video_compact, plugins_json) = row?;
-        if idx < 0 || (idx as usize) >= out.slots.len() {
-            continue;
+        // Codex P2 v9 (2026-05-14): out-of-range slot_index は silently skip せず Corrupted。
+        // skip すると次の save_full DELETE+INSERT で当該 preset 行が永久に消えるため、
+        // plugins_json の壊れ方と同じく上層の bak / JSON fallback に倒す。
+        if idx < 0 || (idx as usize) >= max_slot {
+            return Err(SettingsDbError::Corrupted(format!(
+                "vst3_chain_slots.slot_index out of range: {idx} (max {})",
+                max_slot - 1
+            )));
         }
         // Codex P2 v8 (2026-05-13): plugins_json が壊れていれば slot 全体を捨てるのではなく
         // Corrupted を返して上層の bak / JSON fallback に倒す (= silently empty slot に
@@ -1769,6 +1776,36 @@ mod tests {
         let db = SettingsDb::open(dir.path()).unwrap();
         let err = match db.load_into_settings() {
             Ok(_) => panic!("corrupted UUID should fail load_into_settings"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SettingsDbError::Corrupted(_)),
+            "expected Corrupted, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn out_of_range_vst3_slot_index_returns_corrupted() {
+        // Codex P2 v9 (2026-05-14): vst3_chain_slots.slot_index が 0..=9 を外れた値で
+        // 入っていたら、silently skip せず Corrupted を返す (= 次の save_full で永久消失
+        // する隙を作らない)。
+        let dir = TempDir::new().unwrap();
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+        }
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        conn.execute(
+            "INSERT INTO vst3_chain_slots
+                (slot_index, name, gui_visible, video_compact, plugins_json)
+             VALUES (42, 'oops', 1, 0, '[]')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let err = match db.load_into_settings() {
+            Ok(_) => panic!("out-of-range slot_index should fail load_into_settings"),
             Err(e) => e,
         };
         assert!(
