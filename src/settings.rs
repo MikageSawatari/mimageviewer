@@ -641,6 +641,11 @@ pub struct Settings {
     /// ツールバーに「レーティングフィルタ」セクション (☆|なし 1 2 3 4 5) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_rating: bool,
+    /// アドレスバーに「代表サムネ固定」(📌) ボタンを表示する。左クリックで
+    /// 現在の選択アイテムをフォルダ / ZIP / PDF のサムネに固定 (= toggle)、
+    /// 右クリックで固定解除。既定 true。
+    #[serde(default = "default_true")]
+    pub show_address_bar_folder_pin: bool,
 
     // ── レーティングフィルタ ───────────────────────────────────
     /// レーティングフィルタ (index 0 = 未評価, 1〜5 = ★の数)。
@@ -1381,6 +1386,7 @@ impl Default for Settings {
             show_toolbar_next_folder: true,
             show_toolbar_vst3: true,
             show_toolbar_rating: true,
+            show_address_bar_folder_pin: true,
             rating_filter: default_rating_filter(),
             toolbar_cols_items: default_toolbar_cols_items(),
             toolbar_aspect_items: default_toolbar_aspect_items(),

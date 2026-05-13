@@ -106,6 +106,100 @@ impl FolderPinSource {
     }
 }
 
+/// `GridItem` から `FolderPinSource` を構築する。
+///
+/// `container` は item の親 (= 現在表示中のフォルダ / ZIP / PDF) の絶対パス。
+/// item が container 自身を指している場合 (= ZipImage / PdfPage の zip_path /
+/// pdf_path が container と一致) は `zip_rel` / `pdf_rel` を空文字にする。
+///
+/// 返り値:
+/// - `Some(source)`: ピン留め可能な item
+/// - `None`: ピン留め不可 (`ConvertibleArchive` / `SearchContainer` / `ZipSeparator`
+///   や relative path が取れないケース)
+pub fn source_from_grid_item(
+    container: &Path,
+    item: &crate::grid_item::GridItem,
+) -> Option<FolderPinSource> {
+    use crate::grid_item::GridItem;
+    match item {
+        GridItem::Image(p) => Some(FolderPinSource::File {
+            rel: relative_path_string(container, p)?,
+            kind: FileKind::Image,
+        }),
+        GridItem::Video(p) => Some(FolderPinSource::File {
+            rel: relative_path_string(container, p)?,
+            kind: FileKind::Video,
+        }),
+        GridItem::Folder(p) => Some(FolderPinSource::File {
+            rel: relative_path_string(container, p)?,
+            kind: FileKind::Folder,
+        }),
+        GridItem::ZipFile(p) => Some(FolderPinSource::File {
+            rel: relative_path_string(container, p)?,
+            kind: FileKind::ZipFile,
+        }),
+        GridItem::PdfFile(p) => Some(FolderPinSource::File {
+            rel: relative_path_string(container, p)?,
+            kind: FileKind::PdfFile,
+        }),
+        GridItem::ZipImage {
+            zip_path,
+            entry_name,
+        } => {
+            // container == zip_path: ZIP を仮想フォルダとして開いた状態で
+            // 中のエントリをピンする (zip_rel = "")。
+            // それ以外: 通常はあり得ない (regular フォルダの items に ZipImage は
+            // 入らない)。安全側で None。
+            let zip_rel = if paths_equal(zip_path, container) {
+                String::new()
+            } else {
+                return None;
+            };
+            if entry_name.is_empty() {
+                return None;
+            }
+            Some(FolderPinSource::ZipEntry {
+                zip_rel,
+                entry: entry_name.clone(),
+            })
+        }
+        GridItem::PdfPage {
+            pdf_path, page_num, ..
+        } => {
+            let pdf_rel = if paths_equal(pdf_path, container) {
+                String::new()
+            } else {
+                return None;
+            };
+            Some(FolderPinSource::PdfPage {
+                pdf_rel,
+                page: *page_num,
+            })
+        }
+        // ConvertibleArchive: 7z/LZH は変換完了前に thumb 生成できないので
+        // UI 側で disabled + tooltip 表示する (本関数は None を返すだけ)
+        GridItem::ConvertibleArchive { .. } => None,
+        // ピン対象として意味がないもの
+        GridItem::SearchContainer { .. } | GridItem::ZipSeparator { .. } => None,
+    }
+}
+
+/// container 相対の forward-slash 区切り文字列に正規化する。
+/// container と target が同一パスのときは `None` (= 自分自身は pin できない)。
+fn relative_path_string(container: &Path, target: &Path) -> Option<String> {
+    let rel = target.strip_prefix(container).ok()?;
+    let s = rel.to_string_lossy();
+    if s.is_empty() {
+        return None;
+    }
+    Some(s.replace('\\', "/"))
+}
+
+/// Windows パス比較 (大文字小文字 + slash/backslash 違いを吸収) で同一判定する。
+fn paths_equal(a: &Path, b: &Path) -> bool {
+    crate::path_key::normalize_keep_drive(a) == crate::path_key::normalize_keep_drive(b)
+}
+
 #[derive(Debug)]
 pub enum FolderPinError {
     /// `rel` が空 (File variant のみ。ZipEntry/PdfPage の zip_rel/pdf_rel は空可)。
@@ -1110,6 +1204,128 @@ mod tests {
         assert_eq!(resolved.zip_entry.as_deref(), Some("p01.png"));
         assert!(resolved.source_id.starts_with("zipentry||p01.png|-|"));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn source_from_grid_item_image_in_folder() {
+        use crate::grid_item::GridItem;
+        let container = Path::new(r"C:\Users\me\Photos\Vacation");
+        let item = GridItem::Image(container.join("cover.jpg"));
+        let src = source_from_grid_item(container, &item).expect("pinnable");
+        match src {
+            FolderPinSource::File { rel, kind } => {
+                assert_eq!(rel, "cover.jpg");
+                assert_eq!(kind, FileKind::Image);
+            }
+            _ => panic!("expected File source"),
+        }
+    }
+
+    #[test]
+    fn source_from_grid_item_subfolder_image_normalized_to_forward_slash() {
+        use crate::grid_item::GridItem;
+        let container = Path::new(r"C:\Users\me\Photos");
+        let item = GridItem::Image(container.join("Vacation").join("Day1").join("img.png"));
+        let src = source_from_grid_item(container, &item).expect("pinnable");
+        if let FolderPinSource::File { rel, kind } = src {
+            assert_eq!(rel, "Vacation/Day1/img.png");
+            assert_eq!(kind, FileKind::Image);
+        } else {
+            panic!("expected File source");
+        }
+    }
+
+    #[test]
+    fn source_from_grid_item_zipimage_inside_zip_uses_empty_rel() {
+        use crate::grid_item::GridItem;
+        let container = Path::new(r"C:\Archives\book.zip");
+        let item = GridItem::ZipImage {
+            zip_path: container.to_path_buf(),
+            entry_name: "scan/01.jpg".to_string(),
+        };
+        let src = source_from_grid_item(container, &item).expect("pinnable");
+        match src {
+            FolderPinSource::ZipEntry { zip_rel, entry } => {
+                assert_eq!(zip_rel, "");
+                assert_eq!(entry, "scan/01.jpg");
+            }
+            _ => panic!("expected ZipEntry source"),
+        }
+    }
+
+    #[test]
+    fn source_from_grid_item_zipimage_with_foreign_container_returns_none() {
+        // 通常 path 上は発生しないが、container と zip_path が不一致なら None
+        use crate::grid_item::GridItem;
+        let container = Path::new(r"C:\Photos");
+        let item = GridItem::ZipImage {
+            zip_path: PathBuf::from(r"C:\Archives\book.zip"),
+            entry_name: "01.jpg".to_string(),
+        };
+        assert!(source_from_grid_item(container, &item).is_none());
+    }
+
+    #[test]
+    fn source_from_grid_item_pdfpage_inside_pdf_uses_empty_rel() {
+        use crate::grid_item::GridItem;
+        let container = Path::new(r"C:\Docs\paper.pdf");
+        let item = GridItem::PdfPage {
+            pdf_path: container.to_path_buf(),
+            page_num: 7,
+            content_type: None,
+        };
+        let src = source_from_grid_item(container, &item).expect("pinnable");
+        match src {
+            FolderPinSource::PdfPage { pdf_rel, page } => {
+                assert_eq!(pdf_rel, "");
+                assert_eq!(page, 7);
+            }
+            _ => panic!("expected PdfPage source"),
+        }
+    }
+
+    #[test]
+    fn source_from_grid_item_convertible_archive_returns_none() {
+        use crate::grid_item::GridItem;
+        let container = Path::new(r"C:\Downloads");
+        let item = GridItem::ConvertibleArchive {
+            path: container.join("scan.7z"),
+            format: crate::archive_converter::ArchiveFormat::SevenZ,
+        };
+        assert!(source_from_grid_item(container, &item).is_none());
+    }
+
+    #[test]
+    fn source_from_grid_item_search_container_returns_none() {
+        use crate::grid_item::GridItem;
+        let container = Path::new(r"C:\Photos");
+        let item = GridItem::SearchContainer {
+            path: container.join("inner"),
+            kind: crate::grid_item::SearchContainerKind::Folder,
+            hit_count: 1,
+            representative: None,
+        };
+        assert!(source_from_grid_item(container, &item).is_none());
+    }
+
+    #[test]
+    fn source_from_grid_item_case_insensitive_path_match_for_zip() {
+        // container と zip_path で大文字小文字違い → Windows 上は同一として扱い
+        // zip_rel = "" になる (paths_equal が normalize_keep_drive 比較)
+        use crate::grid_item::GridItem;
+        let container = Path::new(r"C:\Archives\Book.ZIP");
+        let item = GridItem::ZipImage {
+            zip_path: PathBuf::from(r"C:\archives\book.zip"),
+            entry_name: "01.jpg".to_string(),
+        };
+        let src = source_from_grid_item(container, &item).expect("pinnable");
+        match src {
+            FolderPinSource::ZipEntry { zip_rel, entry } => {
+                assert_eq!(zip_rel, "");
+                assert_eq!(entry, "01.jpg");
+            }
+            _ => panic!("expected ZipEntry source"),
+        }
     }
 
     #[test]

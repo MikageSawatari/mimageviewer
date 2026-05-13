@@ -6236,11 +6236,10 @@ impl App {
     }
 
     /// 指定 container の代表サムネピンを `source` に設定 (上書き) し、再ロード予約を立てる。
-    /// UI 側 (Phase D の 📌 ボタン / コンテキストメニュー) からの主エントリポイント。
+    /// UI 側 (アドレスバーの 📌 ボタン / コンテキストメニュー) からの主エントリポイント。
     ///
     /// 戻り値: 書き込みに成功すれば `true`。pin DB 未開 / SQL エラーで失敗時は
     /// `false` でログのみ残す (UI 側はエラー詳細を出さずに「設定できませんでした」を表示)。
-    #[allow(dead_code)] // Phase D で UI から配線される
     pub(crate) fn set_folder_thumb_pin(
         &mut self,
         container: &std::path::Path,
@@ -6266,7 +6265,6 @@ impl App {
     }
 
     /// 指定 container の代表サムネピンを解除する (該当行が無くてもエラーにしない)。
-    #[allow(dead_code)] // Phase D で UI から配線される
     pub(crate) fn remove_folder_thumb_pin(&mut self, container: &std::path::Path) -> bool {
         let Some(db) = self.folder_thumb_pin_db.as_ref() else {
             return false;
@@ -6288,13 +6286,175 @@ impl App {
 
     /// 指定 container に現在のピン情報があれば返す。UI 側で「同じ画像が pin 済みか」
     /// 判定し、トグル動作のためのボタン表示状態を切り替えるのに使う。
-    #[allow(dead_code)] // Phase D で UI から配線される
     pub(crate) fn folder_thumb_pin_for(
         &self,
         container: &std::path::Path,
     ) -> Option<&crate::folder_thumb_pins::FolderPinSource> {
         let key = crate::path_key::normalize_keep_drive(container);
         self.folder_pin_map.get(&key)
+    }
+
+    /// アドレスバー 📌 ボタンの表示状態を算出する (UI 描画から呼ばれる)。
+    ///
+    /// 返り値:
+    /// - `None`: ボタンを描画しない (= 設定 OFF / 検索アグリゲートビュー / current_folder 無し)
+    /// - `Some(state)`: 描画する。`state.enabled = false` の場合は disabled + tooltip 表示
+    pub(crate) fn compute_folder_pin_button_state(
+        &self,
+    ) -> Option<crate::ui_main::FolderPinButtonState> {
+        if !self.settings.show_address_bar_folder_pin {
+            return None;
+        }
+        // Ctrl+G アグリゲートビューでは container 概念が無いので隠す
+        if self.items_are_global_search_view {
+            return None;
+        }
+        // current_folder 未確定 (起動直後 / 検索結果合成パス) は描画しない
+        let container = self.current_folder.as_ref()?;
+        if *container == search_results_synthetic_path() {
+            return None;
+        }
+        // 既存 pin (もしあれば) を引いておく
+        let existing_pin = self.folder_thumb_pin_for(container).cloned();
+        // 選択中アイテムから source を組み立てる (= 「左クリックで何を pin するか」)
+        let selected_source: Option<crate::folder_thumb_pins::FolderPinSource> = self
+            .selected
+            .and_then(|i| self.items.get(i))
+            .and_then(|item| crate::folder_thumb_pins::source_from_grid_item(container, item));
+
+        let selected_item = self.selected.and_then(|i| self.items.get(i));
+        let is_convertible = matches!(selected_item, Some(GridItem::ConvertibleArchive { .. }));
+
+        let matches_current_pin = match (&existing_pin, &selected_source) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+
+        // 描画 + tooltip の決定
+        // 1) ConvertibleArchive 選択中: 「変換後に設定可能」で disabled
+        // 2) 選択無し / pin 不可: 「項目を選択してください」で disabled
+        // 3) 通常: enabled。matches_current_pin で tooltip を分岐
+        let (enabled, tooltip) = if is_convertible {
+            (
+                false,
+                "代表サムネ固定: 変換後に設定可能 (アーカイブを ZIP に変換すると指定できます)"
+                    .to_string(),
+            )
+        } else if selected_source.is_none() {
+            // 既存 pin があるなら右クリックで解除のみ許可する (= enabled、ただし左クリック toggle は
+            // source 無しで no-op)。ボタンとしては enabled で「右クリックで解除」案内を tooltip に。
+            if existing_pin.is_some() {
+                (
+                    true,
+                    "代表サムネ固定済み (右クリックで解除 / 左クリックで再設定するにはアイテムを選択)"
+                        .to_string(),
+                )
+            } else {
+                (
+                    false,
+                    "代表サムネ固定: フォルダ内のアイテムを選択してください".to_string(),
+                )
+            }
+        } else if matches_current_pin {
+            (
+                true,
+                "代表サムネ固定中: 左クリック / 右クリックで解除".to_string(),
+            )
+        } else if existing_pin.is_some() {
+            (
+                true,
+                "選択中のアイテムを代表サムネに変更 (左クリック) / 解除 (右クリック)".to_string(),
+            )
+        } else {
+            (
+                true,
+                "選択中のアイテムを代表サムネに固定 (左クリック)".to_string(),
+            )
+        };
+
+        Some(crate::ui_main::FolderPinButtonState {
+            enabled,
+            tooltip,
+            matches_current_pin,
+        })
+    }
+
+    /// アドレスバー 📌 ボタンの左クリック (toggle) ハンドラ。
+    /// 選択中アイテムが現在の pin と一致 → 解除、不一致 → set。選択無し / 非対応 item → no-op。
+    pub(crate) fn toggle_folder_pin_from_selection(&mut self) {
+        let Some(container) = self.current_folder.clone() else {
+            return;
+        };
+        let Some(item) = self.selected.and_then(|i| self.items.get(i)).cloned() else {
+            return;
+        };
+        let Some(source) = crate::folder_thumb_pins::source_from_grid_item(&container, &item)
+        else {
+            return;
+        };
+        let existing = self.folder_thumb_pin_for(&container).cloned();
+        if existing.as_ref() == Some(&source) {
+            self.remove_folder_thumb_pin(&container);
+        } else {
+            self.set_folder_thumb_pin(&container, source);
+        }
+    }
+
+    /// アドレスバー 📌 ボタンの右クリック / コンテキストメニューの「解除」ハンドラ。
+    pub(crate) fn remove_folder_pin_for_current_container(&mut self) {
+        let Some(container) = self.current_folder.clone() else {
+            return;
+        };
+        self.remove_folder_thumb_pin(&container);
+    }
+
+    /// コンテキストメニューに「代表サムネに固定 / 解除」エントリを追加する。
+    /// アドレスバー 📌 と同じ動作をメニュー経由でも提供する。
+    ///
+    /// 戻り値: メニューが閉じるべきなら `true` (= 操作が走った)。
+    /// `item` の variant が pin 不能 (SearchContainer / ZipSeparator) なら、
+    /// 何も描画せず `false` を返す。ConvertibleArchive は disabled ボタンで描画し、
+    /// クリックされても false。
+    pub(crate) fn render_folder_pin_menu_entry(
+        &mut self,
+        ui: &mut egui::Ui,
+        item: &GridItem,
+    ) -> bool {
+        // 親コンテナ未確定 / Ctrl+G アグリゲートビューでは出さない (= UI 一貫性)
+        let Some(container) = self.current_folder.clone() else {
+            return false;
+        };
+        if self.items_are_global_search_view {
+            return false;
+        }
+        if container == search_results_synthetic_path() {
+            return false;
+        }
+        // ConvertibleArchive: disabled + tooltip
+        if matches!(item, GridItem::ConvertibleArchive { .. }) {
+            ui.add_enabled(false, egui::Button::new("📌 代表サムネに固定"))
+                .on_hover_text("変換後に設定可能 (アーカイブを ZIP に変換すると指定できます)");
+            return false;
+        }
+        let Some(source) = crate::folder_thumb_pins::source_from_grid_item(&container, item) else {
+            return false;
+        };
+        let existing = self.folder_thumb_pin_for(&container).cloned();
+        let is_current = existing.as_ref() == Some(&source);
+        let label = if is_current {
+            "📌 代表サムネ固定を解除"
+        } else {
+            "📌 代表サムネに固定"
+        };
+        if ui.button(label).clicked() {
+            if is_current {
+                self.remove_folder_thumb_pin(&container);
+            } else {
+                self.set_folder_thumb_pin(&container, source);
+            }
+            return true;
+        }
+        false
     }
 
     /// items の idx 参照がまとめて無効になった後に呼ぶ共通クリーンアップ。

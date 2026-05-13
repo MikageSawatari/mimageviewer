@@ -24,6 +24,28 @@ use crate::ui_helpers::{
 // Shift+クリック: threshold (そのバケット以上 ON)。同状態で再クリック → 全 ON
 // 右クリック: コンテキストメニューから同 3 操作 (こちらは toggle せず常に「set」)
 
+/// アドレスバーの 📌 ボタンが受けたクリック種別 (closure 内で `self` への
+/// ミュータブル呼び出しを避けるため、closure を抜けてから dispatch する)。
+#[derive(Clone, Copy)]
+enum PinButtonClick {
+    None,
+    /// 左クリック: 選択 item が現在の pin と一致なら解除、不一致なら set。
+    Toggle,
+    /// 右クリック: 解除。
+    Remove,
+}
+
+/// 📌 ボタン描画用の状態スナップショット。`render_address_bar` 入口で 1 度算出する。
+pub(crate) struct FolderPinButtonState {
+    /// ボタンを enable にして良いか (false なら disabled + tooltip 表示)
+    pub enabled: bool,
+    /// hover 時の tooltip 文字列
+    pub tooltip: String,
+    /// 現在選択中の item が既に container の pin source と一致しているか
+    /// (true: 強調アイコンで「クリックで解除」を示唆)
+    pub matches_current_pin: bool,
+}
+
 #[derive(Clone, Copy)]
 enum RatingFilterOp {
     Toggle,
@@ -944,10 +966,14 @@ impl App {
         // 現在表示中フォルダ / ZIP / PDF のコンテナレーティングを取得。
         // 0 のときは非表示、1〜5 のときは★バッジをアドレス欄の右端に表示する。
         let folder_rating = self.current_folder_rating();
+        // 📌 (代表サムネ固定) ボタンの表示判定 + 状態をあらかじめ計算する。
+        // closure 内で `self` のミュータブル借用が衝突しないように外で確定しておく。
+        let pin_button_info = self.compute_folder_pin_button_state();
         egui::TopBottomPanel::top("address_bar")
             .show(ctx, |ui| -> Option<PathBuf> {
                 ui.add_space(3.0);
                 let mut result = None;
+                let mut pin_click = PinButtonClick::None;
                 ui.horizontal(|ui| {
                     ui.label("フォルダ:");
                     // ★バッジは右寄せで先に配置し、残り幅を TextEdit が埋める。
@@ -964,6 +990,27 @@ impl App {
                             .on_hover_text(
                                 "このフォルダ / ZIP / PDF のレーティング [Shift+F1〜F6]",
                             );
+                            ui.add_space(4.0);
+                        }
+                        // 📌 (代表サムネ固定): right_to_left なので 📁★ より左 (= 入力欄寄り) に置く。
+                        if let Some(info) = pin_button_info.as_ref() {
+                            let label = if info.matches_current_pin {
+                                egui::RichText::new("📌")
+                                    .color(egui::Color32::from_rgb(230, 180, 90))
+                                    .strong()
+                            } else {
+                                egui::RichText::new("📌")
+                            };
+                            let btn = egui::Button::new(label).frame(false);
+                            let resp = ui.add_enabled(info.enabled, btn);
+                            let resp = resp.on_hover_text(info.tooltip.as_str());
+                            if info.enabled {
+                                if resp.clicked() {
+                                    pin_click = PinButtonClick::Toggle;
+                                } else if resp.secondary_clicked() {
+                                    pin_click = PinButtonClick::Remove;
+                                }
+                            }
                             ui.add_space(4.0);
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -984,6 +1031,12 @@ impl App {
                     });
                 });
                 ui.add_space(3.0);
+                // pin ボタンクリックは closure 抜けてから処理する (App ミュータブル借用が必要)
+                match pin_click {
+                    PinButtonClick::Toggle => self.toggle_folder_pin_from_selection(),
+                    PinButtonClick::Remove => self.remove_folder_pin_for_current_container(),
+                    PinButtonClick::None => {}
+                }
                 result
             })
             .inner

@@ -275,6 +275,19 @@ impl crate::app::App {
                             }
                         }
                     }
+
+                    // ── 代表サムネ固定 (pin) エントリ ──
+                    // pin 不能 variant (ZipSeparator / SearchContainer) は無描画。
+                    // ConvertibleArchive は disabled で描画。それ以外は toggle ボタン。
+                    if !matches!(
+                        item,
+                        GridItem::ZipSeparator { .. } | GridItem::SearchContainer { .. }
+                    ) {
+                        ui.separator();
+                        if self.render_folder_pin_menu_entry(ui, &item) {
+                            close = true;
+                        }
+                    }
                 }
 
                 // メニュー外クリックで閉じる
@@ -424,6 +437,17 @@ impl crate::app::App {
                             open_folder_in_explorer(path);
                             close = true;
                         }
+                    }
+                }
+
+                // ── 代表サムネ固定 (pin) エントリ ──
+                if !matches!(
+                    item,
+                    GridItem::ZipSeparator { .. } | GridItem::SearchContainer { .. }
+                ) {
+                    ui.separator();
+                    if self.render_folder_pin_menu_entry(ui, &item) {
+                        close = true;
                     }
                 }
 
