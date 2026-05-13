@@ -26,7 +26,7 @@
 //! 検査を二重で行い、DB が手書きで汚染されていても解決パスがコンテナ外に
 //! 出ないようにする。
 
-use rusqlite::{Connection, Result as SqlResult, params};
+use rusqlite::{params, Connection, Result as SqlResult};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -219,52 +219,67 @@ impl FolderThumbPinDb {
     ///
     /// 戻り値は **container パスの `normalize_keep_drive` キー → source** map。
     /// 呼び出し側は同じキーで lookup する想定。
+    ///
+    /// 入力は重複除去してから 500 件ずつ chunked に IN クエリへ流す
+    /// (SQLite の式ツリー上限・準備済みステートメントのバインド数上限の両方を
+    /// 安全側で避けるため。`rating_db::get_many` と同じ規模感)。
     pub fn lookup_many<I, P>(&self, containers: I) -> HashMap<String, FolderPinSource>
     where
         I: IntoIterator<Item = P>,
         P: AsRef<Path>,
     {
-        let keys: Vec<String> = containers
+        let mut keys: Vec<String> = containers
             .into_iter()
             .map(|p| Self::container_key(p.as_ref()))
             .collect();
         if keys.is_empty() {
             return HashMap::new();
         }
-        // SQLite IN リストを placeholder で組む (?1, ?2, ...)。
-        // 親フォルダ 1 つ分の子セル数なら数百〜千程度を想定。SQLite の限界
-        // (デフォルト SQLITE_MAX_VARIABLE_NUMBER = 32766) には十分収まる。
-        let mut sql = String::from(
-            "SELECT container_key, source_kind, source_rel, source_entry, source_page \
-             FROM folder_thumb_pins WHERE container_key IN (",
-        );
-        for i in 0..keys.len() {
-            if i > 0 {
-                sql.push(',');
-            }
-            sql.push('?');
-        }
-        sql.push(')');
+        keys.sort_unstable();
+        keys.dedup();
 
         let mut out = HashMap::new();
-        let Ok(mut stmt) = self.conn.prepare(&sql) else {
-            return out;
-        };
-        let params: Vec<&dyn rusqlite::ToSql> =
-            keys.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
-        let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            let key: String = row.get(0)?;
-            let kind: String = row.get(1)?;
-            let rel: String = row.get(2)?;
-            let entry: Option<String> = row.get(3)?;
-            let page: Option<i64> = row.get(4)?;
-            Ok((key, kind, rel, entry, page))
-        }) else {
-            return out;
-        };
-        for r in rows.flatten() {
-            if let Some(src) = decode_row(&r.1, &r.2, r.3.as_deref(), r.4) {
-                out.insert(r.0, src);
+        for chunk in keys.chunks(500) {
+            let placeholders = (0..chunk.len())
+                .map(|i| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!(
+                "SELECT container_key, source_kind, source_rel, source_entry, source_page \
+                 FROM folder_thumb_pins WHERE container_key IN ({placeholders})"
+            );
+            let mut stmt = match self.conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "folder_thumb_pins.lookup_many: prepare failed: {e}"
+                    ));
+                    continue;
+                }
+            };
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                let key: String = row.get(0)?;
+                let kind: String = row.get(1)?;
+                let rel: String = row.get(2)?;
+                let entry: Option<String> = row.get(3)?;
+                let page: Option<i64> = row.get(4)?;
+                Ok((key, kind, rel, entry, page))
+            });
+            match rows {
+                Ok(iter) => {
+                    for r in iter.flatten() {
+                        if let Some(src) = decode_row(&r.1, &r.2, r.3.as_deref(), r.4) {
+                            out.insert(r.0, src);
+                        }
+                    }
+                }
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "folder_thumb_pins.lookup_many: query_map failed: {e}"
+                    ));
+                }
             }
         }
         out
@@ -304,7 +319,9 @@ impl FolderThumbPinDb {
     }
 }
 
-/// DB 行から `FolderPinSource` を組み立てる。検査に通らない行は `None`。
+/// DB 行から `FolderPinSource` を組み立てる。検査に通らない行は `None` を返し、
+/// **どの行をなぜ skip したか**を `logger` 経由でログに出す (= ユーザーが DB を
+/// 手書きで触ったり、将来のスキーマ拡張で互換性が崩れた際に診断できるように)。
 fn decode_row(
     kind: &str,
     rel: &str,
@@ -313,34 +330,54 @@ fn decode_row(
 ) -> Option<FolderPinSource> {
     let src = match kind {
         "zipentry" => {
-            let entry = entry?.to_string();
-            if entry.is_empty() {
-                return None;
-            }
+            let entry = match entry {
+                Some(e) if !e.is_empty() => e.to_string(),
+                _ => {
+                    crate::logger::log(format!(
+                        "folder_thumb_pins: skipping zipentry row with empty/NULL entry (rel={rel:?})"
+                    ));
+                    return None;
+                }
+            };
             FolderPinSource::ZipEntry {
                 zip_rel: rel.to_string(),
                 entry,
             }
         }
         "pdfpage" => {
-            let page = page?;
-            if page < 0 || page > u32::MAX as i64 {
-                return None;
-            }
+            let page = match page {
+                Some(p) if (0..=u32::MAX as i64).contains(&p) => p as u32,
+                _ => {
+                    crate::logger::log(format!(
+                        "folder_thumb_pins: skipping pdfpage row with invalid page (rel={rel:?} page={page:?})"
+                    ));
+                    return None;
+                }
+            };
             FolderPinSource::PdfPage {
                 pdf_rel: rel.to_string(),
-                page: page as u32,
+                page,
             }
         }
-        other => {
-            let file_kind = FileKind::from_db_str(other)?;
-            FolderPinSource::File {
+        other => match FileKind::from_db_str(other) {
+            Some(file_kind) => FolderPinSource::File {
                 rel: rel.to_string(),
                 kind: file_kind,
+            },
+            None => {
+                crate::logger::log(format!(
+                    "folder_thumb_pins: skipping row with unknown source_kind={other:?}"
+                ));
+                return None;
             }
-        }
+        },
     };
-    validate_source(&src).ok()?;
+    if let Err(e) = validate_source(&src) {
+        crate::logger::log(format!(
+            "folder_thumb_pins: skipping row that fails validation: {e}"
+        ));
+        return None;
+    }
     Some(src)
 }
 
@@ -730,6 +767,131 @@ mod tests {
         let db = open_in_memory();
         let empty: [&Path; 0] = [];
         assert!(db.lookup_many(empty).is_empty());
+    }
+
+    /// path 検査: Codex P3 (2026-05-13) 指摘の Windows 特有のエッジケースを網羅。
+    /// UNC, verbatim, device, rooted, drive-relative, trailing slash, CurDir 単体。
+    #[test]
+    fn set_rejects_unc_backslash() {
+        let db = open_in_memory();
+        let err = db
+            .set(
+                Path::new("C:/Albums/Trip"),
+                &FolderPinSource::File {
+                    rel: r"\\server\share\file.jpg".to_string(),
+                    kind: FileKind::Image,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, FolderPinError::AbsolutePath(_)));
+    }
+
+    #[test]
+    fn set_rejects_unc_forward_slash() {
+        let db = open_in_memory();
+        let err = db
+            .set(
+                Path::new("C:/Albums/Trip"),
+                &FolderPinSource::File {
+                    rel: "//server/share/file.jpg".to_string(),
+                    kind: FileKind::Image,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, FolderPinError::AbsolutePath(_)));
+    }
+
+    #[test]
+    fn set_rejects_rooted_backslash() {
+        // `\foo` は Windows では "rooted but not absolute"。Component::RootDir で弾く。
+        let db = open_in_memory();
+        let err = db
+            .set(
+                Path::new("C:/Albums/Trip"),
+                &FolderPinSource::File {
+                    rel: r"\foo.jpg".to_string(),
+                    kind: FileKind::Image,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, FolderPinError::AbsolutePath(_)));
+    }
+
+    #[test]
+    fn set_rejects_verbatim_prefix() {
+        let db = open_in_memory();
+        let err = db
+            .set(
+                Path::new("C:/Albums/Trip"),
+                &FolderPinSource::File {
+                    rel: r"\\?\C:\Windows\foo.exe".to_string(),
+                    kind: FileKind::Image,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, FolderPinError::AbsolutePath(_)));
+    }
+
+    #[test]
+    fn set_rejects_device_prefix() {
+        let db = open_in_memory();
+        let err = db
+            .set(
+                Path::new("C:/Albums/Trip"),
+                &FolderPinSource::File {
+                    rel: r"\\.\PhysicalDrive0".to_string(),
+                    kind: FileKind::Image,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, FolderPinError::AbsolutePath(_)));
+    }
+
+    #[test]
+    fn set_rejects_drive_relative_with_subpath() {
+        // `C:foo` は drive-relative (= プロセスの C: のカレントからの相対)。
+        // 危険なので拒否。
+        let db = open_in_memory();
+        let err = db
+            .set(
+                Path::new("C:/Albums/Trip"),
+                &FolderPinSource::File {
+                    rel: "C:foo.jpg".to_string(),
+                    kind: FileKind::Image,
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(err, FolderPinError::DriveLetter(_)));
+    }
+
+    #[test]
+    fn set_allows_trailing_separator() {
+        // `sub/dir/` は単に Normal + Normal なので OK (decode 側で trailing は無視される)。
+        let db = open_in_memory();
+        db.set(
+            Path::new("C:/Albums/Trip"),
+            &FolderPinSource::File {
+                rel: "sub/dir/".to_string(),
+                kind: FileKind::Folder,
+            },
+        )
+        .unwrap();
+        assert!(db.lookup(Path::new("C:/Albums/Trip")).is_some());
+    }
+
+    #[test]
+    fn set_allows_dot_segment_in_middle() {
+        // `./foo.jpg` = `foo.jpg`。CurDir は no-op で許可。
+        let db = open_in_memory();
+        db.set(
+            Path::new("C:/Albums/Trip"),
+            &FolderPinSource::File {
+                rel: "./foo.jpg".to_string(),
+                kind: FileKind::Image,
+            },
+        )
+        .unwrap();
+        assert!(db.lookup(Path::new("C:/Albums/Trip")).is_some());
     }
 
     #[test]
