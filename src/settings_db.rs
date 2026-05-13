@@ -861,7 +861,12 @@ fn read_settings_kv(conn: &Connection) -> Result<Map<String, Value>, SettingsDbE
     let mut map = Map::new();
     for row in rows {
         let (k, raw) = row?;
-        let parsed: Value = serde_json::from_str(&raw)?;
+        // Codex P2 v10 (2026-05-14): settings_kv 行が壊れた JSON だったら Corrupted で返す
+        // (favorites.id / plugins_json と対称)。Serde で返すと Phase 2 の bak fallback 経路に
+        // 拾われない懸念があるため。
+        let parsed: Value = serde_json::from_str(&raw).map_err(|e| {
+            SettingsDbError::Corrupted(format!("settings_kv[{k}] value not valid JSON: {e}"))
+        })?;
         map.insert(k, parsed);
     }
     Ok(map)
@@ -1259,7 +1264,12 @@ fn build_settings_from_db(conn: &Connection) -> Result<Settings, SettingsDbError
         serde_json::to_value(custom_apps)?,
     );
 
-    let settings: Settings = serde_json::from_value(Value::Object(map))?;
+    // Codex P2 v10 (2026-05-14): settings_kv の scalar 形が不正 (例: grid_cols が String) で
+    // from_value が失敗するケースは DB 内容の corruption。Serde で返すと Phase 2 の bak
+    // fallback 経路に拾われない可能性があるため Corrupted に統一する。
+    let settings: Settings = serde_json::from_value(Value::Object(map)).map_err(|e| {
+        SettingsDbError::Corrupted(format!("settings_kv shape mismatch in from_value: {e}"))
+    })?;
     Ok(settings)
 }
 
@@ -1776,6 +1786,63 @@ mod tests {
         let db = SettingsDb::open(dir.path()).unwrap();
         let err = match db.load_into_settings() {
             Ok(_) => panic!("corrupted UUID should fail load_into_settings"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SettingsDbError::Corrupted(_)),
+            "expected Corrupted, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn corrupted_settings_kv_value_returns_corrupted() {
+        // Codex P2 v10 (2026-05-14): settings_kv の value 文字列が JSON として
+        // parse できなければ Corrupted を返す。
+        let dir = TempDir::new().unwrap();
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+        }
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        // settings_kv に壊れた行を 1 つ追加 (= 既存の任意 key を壊すと parse 経路に乗る)。
+        conn.execute(
+            "INSERT INTO settings_kv (key, value) VALUES ('__broken__', 'not json')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let err = match db.load_into_settings() {
+            Ok(_) => panic!("malformed settings_kv value should fail load"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SettingsDbError::Corrupted(_)),
+            "expected Corrupted, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn settings_kv_shape_mismatch_returns_corrupted() {
+        // Codex P2 v10 (2026-05-14): settings_kv の値は valid JSON だが型が違う
+        // (grid_cols が文字列など) ケース。最終 from_value が Serde で落ちる経路を
+        // Corrupted に統一する。
+        let dir = TempDir::new().unwrap();
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+        }
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        // grid_cols は usize として load される。"foo" 文字列だと from_value が落ちる。
+        conn.execute(
+            "UPDATE settings_kv SET value = '\"foo\"' WHERE key = 'grid_cols'",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let err = match db.load_into_settings() {
+            Ok(_) => panic!("shape mismatch should fail load"),
             Err(e) => e,
         };
         assert!(
