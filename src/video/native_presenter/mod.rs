@@ -3274,7 +3274,7 @@ impl NativeEguiOverlay {
     /// `apply_hud_regions(&regions)` で `SetWindowRgn` に渡されて、HUD HWND の
     /// 物理形状が更新される。
     ///
-    /// **含めるもの (= 実際にクリック可能な UI rect だけ)**:
+    /// **含めるもの (= 表示される UI rect。クリック可能でない受動インジケータも含む)**:
     /// - 上 hover bar (`top_bar_visible()`): 画面上端 0..76pt 帯
     /// - 下 HUD (`hud_visible()`): 画面下端 (H-220)..H pt 帯
     /// - right panel (`right_panel_visible()`): 画面右端の panel rect
@@ -3286,6 +3286,7 @@ impl NativeEguiOverlay {
     /// - tile overlay (`tile_overlay.is_some()`): 全画面 tile grid
     /// - paused center indicator (paused かつ表示中)
     /// - seek hover thumbnail + pin/bookmark (`hover_thumbnail.is_some()`)
+    /// - checkmark indicator (`video_checked`)
     ///
     /// **含めないもの**:
     /// - activation zone (= bar 非表示状態の hover 検出範囲) — VST のノブやメニューが
@@ -3441,6 +3442,17 @@ impl NativeEguiOverlay {
             regions.push(rect_to_px(egui::Rect::from_min_size(
                 egui::pos2(14.0, 14.0),
                 egui::vec2(perf_w, 158.0),
+            )));
+        }
+
+        // Checkmark indicator: passive UI だが、HUD HWND は SetWindowRgn 外の DComp
+        // 描画も OS 側で clip する。右パネル等の region が重なった時だけ見える
+        // regression を避けるため、描画側と同じ rect を小さく追加する。
+        if self.video_checked && !tile_overlay_visible {
+            let top = if panel_chrome_visible { 68.0 } else { 28.0 };
+            regions.push(rect_to_px(self::overlay_draw::native_checkmark_rect(
+                width_points,
+                top,
             )));
         }
 
@@ -5719,6 +5731,16 @@ mod tests {
 
         event.alt = true;
         assert!(!native_video_fullscreen_shortcut_key(&event));
+    }
+
+    #[test]
+    fn native_checkmark_rect_matches_top_right_indicator_position() {
+        let rect = super::overlay_draw::native_checkmark_rect(1920.0, 28.0);
+
+        assert!((rect.center().x - 1890.0).abs() < f32::EPSILON);
+        assert!((rect.center().y - 46.0).abs() < f32::EPSILON);
+        assert!((rect.width() - 39.6).abs() < 0.001);
+        assert!((rect.height() - 39.6).abs() < 0.001);
     }
 
     /// 1:1 SAR では従来の isotropic transform と一致 (regression-safe を保証)。

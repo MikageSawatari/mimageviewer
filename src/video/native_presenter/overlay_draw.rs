@@ -1031,14 +1031,20 @@ pub(super) fn draw_overlay_vst3_gui_icon(
     );
 }
 
+pub(super) fn native_checkmark_rect(overlay_width_points: f32, top: f32) -> egui::Rect {
+    let radius = 18.0;
+    let center = egui::pos2((overlay_width_points - 30.0).max(radius), top + radius);
+    egui::Rect::from_center_size(center, egui::vec2(radius * 2.2, radius * 2.2))
+}
+
 pub(super) fn draw_native_checkmark(ctx: &egui::Context, overlay_width_points: f32, top: f32) {
     egui::Area::new(egui::Id::new("native_video_checkmark"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
         .show(ctx, |ui| {
             let radius = 18.0;
-            let center = egui::pos2((overlay_width_points - 30.0).max(radius), top + radius);
-            let rect = egui::Rect::from_center_size(center, egui::vec2(radius * 2.2, radius * 2.2));
+            let rect = native_checkmark_rect(overlay_width_points, top);
+            let center = rect.center();
             ui.allocate_rect(rect, egui::Sense::hover());
             let painter = ui.painter();
             painter.circle_filled(
