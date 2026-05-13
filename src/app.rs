@@ -6116,22 +6116,39 @@ impl App {
                 .map(|pin| pin.thumb_webp)
                 .filter(|b| !b.is_empty());
 
-            let Some(webp) = webp else {
-                // WebP 無し: 既存 seed (旧 pin の残骸) があれば削除して fallback 経路へ。
+            // pinned_key 行を catalog + cache_map から削除する内部 closure。
+            // 「seed できない (WebP 無し / 破損 / SQL エラー)」全ケースで共通に使い、
+            // 旧 pin の WebP が cache_hit で復活しないようにする (Codex Phase C P3 指摘)。
+            // 削除中だけで使うのでローカル変数 + 通常関数として書く方が借用が単純になる。
+            let purge_stale = |pinned_key: &str| -> bool {
                 let stale_exists = cache_map
                     .read()
                     .ok()
-                    .map(|map| map.contains_key(&pinned_key))
+                    .map(|map| map.contains_key(pinned_key))
                     .unwrap_or(false);
-                if stale_exists {
-                    if let Err(e) = cat.delete_one(&pinned_key) {
+                if !stale_exists {
+                    return false;
+                }
+                match cat.delete_one(pinned_key) {
+                    Ok(()) => {
+                        if let Ok(mut map) = cache_map.write() {
+                            map.remove(pinned_key);
+                        }
+                        true
+                    }
+                    Err(e) => {
                         crate::logger::log(format!(
                             "folder_thumb_pin video seed purge failed: {e} ({pinned_key})"
                         ));
-                    } else if let Ok(mut map) = cache_map.write() {
-                        map.remove(&pinned_key);
-                        purged += 1;
+                        false
                     }
+                }
+            };
+
+            let Some(webp) = webp else {
+                // WebP 無し: 既存 seed (旧 pin の残骸) があれば削除して fallback 経路へ。
+                if purge_stale(&pinned_key) {
+                    purged += 1;
                 }
                 continue;
             };
@@ -6156,16 +6173,22 @@ impl App {
                 Ok(true) => {}
                 Ok(false) => {
                     crate::logger::log(format!(
-                        "folder_thumb_pin video seed: invalid WebP for {} (skip)",
+                        "folder_thumb_pin video seed: invalid WebP for {} (purge stale)",
                         resolved.abs_path.display()
                     ));
+                    if purge_stale(&pinned_key) {
+                        purged += 1;
+                    }
                     continue;
                 }
                 Err(e) => {
                     crate::logger::log(format!(
-                        "folder_thumb_pin video seed save failed: {e} ({})",
+                        "folder_thumb_pin video seed save failed: {e} ({}) (purge stale)",
                         resolved.abs_path.display()
                     ));
+                    if purge_stale(&pinned_key) {
+                        purged += 1;
+                    }
                     continue;
                 }
             }
