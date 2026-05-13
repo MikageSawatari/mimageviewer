@@ -11202,13 +11202,14 @@ impl App {
             self.native_video_front_recover_after_external_foreground = false;
             self.native_video_pointer_down = None;
             self.schedule_native_video_main_chrome_restore();
-            // 動画フルスクリーンだった (= chrome を黒くしていた) ときだけ奪還候補。
+            // 動画フルスクリーンだったときだけ奪還候補。
             // mIV が foreground を持っていた瞬間にだけ true にする (ユーザーが他アプリを
             // 意図的に前面にしていたケースで奪い返さないため)。
             // foreground=null/pid=0 の不確定ケースは保守的に false 扱い。
             let foreground_is_ours =
                 crate::video::native_window::foreground_belongs_to_current_process_strict();
-            if self.native_video_main_chrome_black && foreground_is_ours {
+            let native_video_was_active = self.native_video_fullscreen_active_for_main_backdrop();
+            if native_video_was_active && foreground_is_ours {
                 self.pending_main_foreground_reclaim = true;
                 self.pending_main_foreground_reclaim_after_hwnd =
                     self.native_video_presenter_hwnd().unwrap_or(0);
@@ -11218,7 +11219,7 @@ impl App {
                 self.pending_main_foreground_reclaim = false;
                 self.pending_main_foreground_reclaim_after_hwnd = 0;
                 self.pending_main_foreground_reclaim_force_at = None;
-                if self.native_video_main_chrome_black {
+                if native_video_was_active {
                     crate::logger::log(
                         "[native-video] foreground_unknown_or_foreign at close_fullscreen, \
                          skip reclaim"

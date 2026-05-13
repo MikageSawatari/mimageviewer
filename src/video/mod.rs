@@ -1235,6 +1235,14 @@ fn run_native_video_output(
             event_tx: Some(presenter_event_tx.clone()),
         },
     )?;
+    if cancel.load(Ordering::Acquire) {
+        window.destroy();
+        closed.store(true, Ordering::Release);
+        crate::logger::log(
+            "[native-video] fullscreen presenter startup cancelled before init".to_string(),
+        );
+        return Ok(());
+    }
     // CP7: HUD overlay HWND の有効化判定。
     //   - config.hud_overlay_enabled: App が settings / 環境変数経由で渡してくる ON/OFF。
     //   - 通常は ON (`true`)。
@@ -1270,6 +1278,17 @@ fn run_native_video_output(
             return Err(err);
         }
     };
+    if cancel.load(Ordering::Acquire) {
+        first_presented_out.store(false, Ordering::Release);
+        hwnd_out.store(0, Ordering::Release);
+        hud_hwnd_out.store(0, Ordering::Release);
+        window.destroy();
+        closed.store(true, Ordering::Release);
+        crate::logger::log(
+            "[native-video] fullscreen presenter startup cancelled before show".to_string(),
+        );
+        return Ok(());
+    }
     let shown = window.show_and_raise();
     hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
     // HUD HWND が生成されたら App から見えるように atomic に store。

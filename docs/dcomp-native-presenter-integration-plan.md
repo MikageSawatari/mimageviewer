@@ -192,6 +192,11 @@ Status:
   video is also decoupled from the delayed main-chrome restore, so the main HWND
   is claimed as soon as the presenter HWND is destroyed instead of waiting for
   the 80ms chrome settling window.
+- 2026-05-13: the main HWND caption/border recolor during native-video
+  fullscreen is disabled again. The black backdrop/presenter now masks the
+  client area without forcing DWM to recalculate title-bar glyph contrast, which
+  avoids a visible light/dark caption flip just before the black viewport
+  appears.
 - 2026-05-05: the Rust panic hook is complemented by a Windows native exception
   handler and a UI heartbeat watchdog. Native access violations are appended to
   `panic.log`, while an `App::update` heartbeat gap of more than five seconds is

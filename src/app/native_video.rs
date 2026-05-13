@@ -415,6 +415,23 @@ impl App {
     pub(super) fn sync_native_video_main_chrome(&mut self, active: bool) {
         if active {
             self.native_video_main_chrome_restore_at = None;
+            // The black fullscreen/backdrop HWND now covers the transition by itself.
+            // Do not recolor the main non-client area here: the DWM caption glyph
+            // contrast flip is visible just before the black viewport appears.
+            if self.native_video_main_chrome_black {
+                let dark = matches!(
+                    crate::os_theme::resolve(self.settings.ui_theme),
+                    crate::os_theme::ResolvedTheme::Dark
+                );
+                if let Some(hwnd_raw) = self.main_hwnd {
+                    crate::dwm_transitions::restore_window_chrome_for_theme(
+                        windows::Win32::Foundation::HWND(hwnd_raw as *mut _),
+                        dark,
+                    );
+                }
+                self.native_video_main_chrome_black = false;
+            }
+            return;
         }
         if active == self.native_video_main_chrome_black {
             return;
