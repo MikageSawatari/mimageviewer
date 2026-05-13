@@ -1607,6 +1607,55 @@ struct LoadOutcome {
     main_unreadable: bool,
 }
 
+/// Phase 2 (SQLite migration) から呼ぶ migration エントリ。
+///
+/// `main` (`settings.json`) と `main.bak1..bak10` を順に試行し、最初に成功した
+/// `Settings` を返す。`try_load_with_recovery` のラッパだが:
+/// - 副作用 (broken-ts rename / main への copy 書き戻し) は **抑制する** ため、
+///   1 ファイルずつ純粋 read 試行する。migration 経路は読みっぱなしで OK。
+/// - I/O エラー / NotFound と「全 bak 試行で valid Settings ゼロ」は None で返す。
+///
+/// `Phase 2 only`: 通常の Settings::load 経路 (= `try_load_with_recovery`) は
+/// 副作用付きの方が安全 (= 壊れた main を退避して次回 load が clean) なので、
+/// migration はこちらの読み専用版を使う。
+pub(crate) fn read_settings_json_for_migration(main: &Path) -> Option<Settings> {
+    if let LoadFileResult::Ok(s) = try_parse_settings_file(main) {
+        return Some(s);
+    }
+    for n in 1..=BACKUP_COUNT {
+        let bak = backup_path(main, n);
+        if let LoadFileResult::Ok(s) = try_parse_settings_file(&bak) {
+            settings_diag_log(&format!(
+                "settings: migration: loaded {} for SQLite migration",
+                bak.display()
+            ));
+            return Some(s);
+        }
+    }
+    None
+}
+
+/// migration 完了後にリネームすべき旧 JSON ファイル一覧を返す
+/// (settings.json + settings.json.bak1..bak10 のうち実在するもの)。
+pub(crate) fn legacy_json_files_for_migration(main: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if main.exists() {
+        out.push(main.to_path_buf());
+    }
+    for n in 1..=BACKUP_COUNT {
+        let bak = backup_path(main, n);
+        if bak.exists() {
+            out.push(bak);
+        }
+    }
+    out
+}
+
+/// `Settings::path` の公開。Phase 2 migration から `settings.json` パスを参照するのに使う。
+pub(crate) fn legacy_settings_json_path() -> PathBuf {
+    Settings::settings_path()
+}
+
 /// メイン → bak1 → bak2 → … の順で復旧を試みる。
 ///
 /// メインが **パース失敗** (= 内容が壊れている) のときだけ `.broken-<TS>` に rename 退避し、

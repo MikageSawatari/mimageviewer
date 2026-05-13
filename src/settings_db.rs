@@ -496,6 +496,22 @@ impl SettingsDb {
         Ok(())
     }
 
+    /// `schema_meta.migrated_from_json_at = <unix_ts>` を冪等に書く。
+    /// Phase 2 で JSON migration を完了したときに 1 回だけ呼ぶ。既存の row があれば
+    /// 上書きせずそのまま (= 最初の migration 時刻が安定する)。
+    pub fn record_migrated_from_json(&self) -> Result<(), SettingsDbError> {
+        let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        inner.conn.execute(
+            "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('migrated_from_json_at', ?1)",
+            params![ts.to_string()],
+        )?;
+        Ok(())
+    }
+
     /// テスト用: in-memory SQLite を直接開く。
     #[cfg(test)]
     fn open_in_memory_for_test() -> Result<Self, SettingsDbError> {
@@ -1359,14 +1375,397 @@ fn hash_vst3_chain_slots(slots: &Vst3ChainPresetSlots) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Phase 2: quarantine / JSON migration / boot decision tree (spec §5)
+// ---------------------------------------------------------------------------
+
+/// `<data_dir>/settings.db{,-wal,-shm}` を 3 セットで `.corrupted-<ts>` にリネームする。
+///
+/// spec §6.2 に従い、Corrupted 検出時に main DB だけでなく WAL / SHM も一緒に退避する。
+/// これで新しい DB を作り直したときに古い WAL の recovery で誤った内容が混入するのを防ぐ。
+/// ファイルが無いものは無視する (= NotFound はエラーにしない)。
+///
+/// 戻り値: 退避したファイル数 (= 0 でも error にはしない、main が transient missing の
+/// ケースも含むため)。
+pub fn quarantine_db_files(data_dir: &Path) -> usize {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let names = [
+        "settings.db".to_string(),
+        "settings.db-wal".to_string(),
+        "settings.db-shm".to_string(),
+    ];
+    let mut moved = 0usize;
+    for name in &names {
+        let src = data_dir.join(name);
+        if !src.exists() {
+            continue;
+        }
+        let dst = data_dir.join(format!("{name}.corrupted-{ts}"));
+        match std::fs::rename(&src, &dst) {
+            Ok(_) => {
+                log_diag(&format!(
+                    "settings_db: quarantined {} -> {}",
+                    src.display(),
+                    dst.display()
+                ));
+                moved += 1;
+            }
+            Err(e) => {
+                log_diag(&format!(
+                    "settings_db: quarantine failed {} -> {}: {e}",
+                    src.display(),
+                    dst.display()
+                ));
+            }
+        }
+    }
+    moved
+}
+
+/// `<data_dir>` 配下の旧 `settings.json{,.bak1..bak10}` を `.migrated-<ts>` にリネームする。
+///
+/// 戻り値: リネームしたファイル数。リネーム失敗は個別に log するが abort はしない
+/// (= 一部成功 + 一部失敗が起きても migration 全体は通す)。
+fn rename_legacy_json_files(data_dir: &Path) -> usize {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // settings.rs の Settings::settings_path() は data_dir::get() を使うので、テスト時に
+    // tempdir に切り替わっている前提。data_dir 引数とその挙動が同期している必要がある。
+    let main = crate::settings::legacy_settings_json_path();
+    let files = crate::settings::legacy_json_files_for_migration(&main);
+    let mut moved = 0;
+    for src in files {
+        // file_name() で拡張子付き名前を取り、.migrated-<ts> を追加する。
+        let mut name = match src.file_name() {
+            Some(n) => n.to_owned(),
+            None => continue,
+        };
+        name.push(format!(".migrated-{ts}"));
+        let dst = src.with_file_name(name);
+        // dst は data_dir 直下 (settings.rs の path 計算より) なので data_dir 引数を経由しない。
+        // 引数 data_dir はログのコンテキスト用 (= 将来の test 整合性チェック用)。
+        let _ = data_dir;
+        match std::fs::rename(&src, &dst) {
+            Ok(_) => {
+                log_diag(&format!(
+                    "settings_db: migrated json renamed {} -> {}",
+                    src.display(),
+                    dst.display()
+                ));
+                moved += 1;
+            }
+            Err(e) => {
+                log_diag(&format!(
+                    "settings_db: migrate rename failed {} -> {}: {e}",
+                    src.display(),
+                    dst.display()
+                ));
+            }
+        }
+    }
+    moved
+}
+
+/// 旧 `settings.json` (+ bak1..bak10) を読み取り、`<data_dir>/settings.db` を作成して
+/// 内容を保存し、旧 JSON ファイルを `.migrated-<ts>` にリネームする (spec §5 + §7)。
+///
+/// 戻り値:
+/// - `Ok((db, settings))` — migration 成功。Phase 3 caller は `settings` を使う。
+/// - `Err(SettingsDbError)` — JSON が読めない / DB create に失敗 / save に失敗。
+///
+/// 注意: 副作用順序は spec §7 に従い「DB 作成 → save_full → JSON リネーム」。途中で
+/// crash しても旧 JSON が残っているので次回起動でやり直せる (= 二重 migration は
+/// `family が見えるので migrate しない` 分岐で自然に排除される)。
+pub fn migrate_from_settings_json(
+    data_dir: &Path,
+) -> Result<(SettingsDb, Settings), SettingsDbError> {
+    let main = crate::settings::legacy_settings_json_path();
+    let loaded = crate::settings::read_settings_json_for_migration(&main).ok_or_else(|| {
+        log_diag("settings_db: migrate_from_settings_json: no readable JSON found");
+        SettingsDbError::Corrupted("no readable settings.json (or bak) for migration".to_string())
+    })?;
+
+    // 新規 DB を bootstrap。family が見える環境では `create_new` が AlreadyBootstrapped を
+    // 返すので、Phase 2 caller が migrate_from_settings_json を呼ぶ前に
+    // `settings_db_family_exists()` で false を確認している前提。
+    let db = SettingsDb::create_new(data_dir)?;
+    db.save_full(&loaded)?;
+    db.record_migrated_from_json()?;
+    let moved = rename_legacy_json_files(data_dir);
+    log_diag(&format!(
+        "settings_db: migrate_from_settings_json: bootstrap complete, {moved} legacy file(s) renamed"
+    ));
+    Ok((db, loaded))
+}
+
+/// spec §5 の起動時決定木の入口。Phase 3 で `Settings::load` から呼ぶ想定。
+///
+/// 戻り値の `BootOutcome` を見て:
+/// - `settings` を in-memory state として使う
+/// - `db.is_some()` ならその DB が今セッションの永続化先。`save_full` で write する。
+/// - `db.is_none()` (= `suppress_save == true`) なら本セッションは save 抑止する
+///   (現行 `MAIN_UNREADABLE_THIS_SESSION` 相当)。
+///
+/// 副作用: 成功時に `GLOBAL_DB` を初期化する (= 後続の `with_db` がブロックせず動く)。
+/// 失敗時は `GLOBAL_DB` をクリアする (= save 抑止状態)。
+pub fn boot_settings_db(data_dir: &Path) -> BootOutcome {
+    let outcome = boot_settings_db_inner(data_dir);
+    // GLOBAL_DB の同期。Phase 3 で `Settings::save()` が `with_db` 経由で書く。
+    set_global_db(data_dir, outcome.db.clone());
+    outcome
+}
+
+pub struct BootOutcome {
+    /// このセッションで使う Settings。
+    pub settings: Settings,
+    /// 永続化先 DB ハンドル。`None` なら本セッションは save を一切しない (= 残骸保護)。
+    pub db: Option<Arc<SettingsDb>>,
+    /// 起動経路 (telemetry / log 用)。
+    pub source: BootSource,
+}
+
+impl std::fmt::Debug for BootOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BootOutcome")
+            .field("settings", &"<Settings>")
+            .field("db", &self.db.as_ref().map(|_| "<SettingsDb>"))
+            .field("source", &self.source)
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootSource {
+    /// 既存の `settings.db` を開いて load した。
+    LoadedExistingDb,
+    /// 既存 main DB が壊れていたので bak1..bak10 から復旧した。
+    RestoredFromDbBackup,
+    /// `settings.json` から migration して新規 `settings.db` を作った。
+    MigratedFromJson,
+    /// `settings.json` も `settings.db` も無く、clean install として bootstrap した。
+    CleanInstall,
+    /// すべての復旧経路が失敗。Defaults を返し、本セッションでは save を抑止する。
+    FailedFallbackDefault,
+}
+
+fn boot_settings_db_inner(data_dir: &Path) -> BootOutcome {
+    // 1. family が見えるか
+    if settings_db_family_exists(data_dir) {
+        match SettingsDb::open(data_dir) {
+            Ok(db) => match db.load_into_settings() {
+                Ok(settings) => {
+                    log_diag("settings_db: boot: loaded existing settings.db");
+                    return BootOutcome {
+                        settings,
+                        db: Some(Arc::new(db)),
+                        source: BootSource::LoadedExistingDb,
+                    };
+                }
+                Err(e) => {
+                    log_diag(&format!(
+                        "settings_db: boot: load_into_settings failed (will try bak): {e}"
+                    ));
+                    // 続けて Corrupted 経路へ落とす (db ハンドルは drop)。
+                    drop(db);
+                    return boot_recover_from_bak(data_dir);
+                }
+            },
+            Err(SettingsDbError::Corrupted(msg)) => {
+                log_diag(&format!(
+                    "settings_db: boot: main DB corrupted ({msg}); attempting bak recovery"
+                ));
+                return boot_recover_from_bak(data_dir);
+            }
+            Err(SettingsDbError::Transient(e)) => {
+                log_diag(&format!(
+                    "settings_db: boot: main DB transient I/O failure after retries ({e}); \
+                     suppressing save this session"
+                ));
+                return BootOutcome {
+                    settings: Settings::default(),
+                    db: None,
+                    source: BootSource::FailedFallbackDefault,
+                };
+            }
+            Err(SettingsDbError::Permission(e)) => {
+                log_diag(&format!(
+                    "settings_db: boot: permission error opening main DB ({e}); \
+                     suppressing save this session"
+                ));
+                return BootOutcome {
+                    settings: Settings::default(),
+                    db: None,
+                    source: BootSource::FailedFallbackDefault,
+                };
+            }
+            Err(other) => {
+                log_diag(&format!(
+                    "settings_db: boot: unexpected open error: {other}"
+                ));
+                return BootOutcome {
+                    settings: Settings::default(),
+                    db: None,
+                    source: BootSource::FailedFallbackDefault,
+                };
+            }
+        }
+    }
+
+    // 2. family 不在: settings.json があれば migration
+    let json_path = crate::settings::legacy_settings_json_path();
+    let json_exists = std::fs::metadata(&json_path).is_ok()
+        || (1..=10).any(|n| {
+            let bak = {
+                let mut name = json_path
+                    .file_name()
+                    .map(|n| n.to_owned())
+                    .unwrap_or_default();
+                name.push(format!(".bak{n}"));
+                json_path.with_file_name(name)
+            };
+            std::fs::metadata(&bak).is_ok()
+        });
+    if json_exists {
+        match migrate_from_settings_json(data_dir) {
+            Ok((db, settings)) => {
+                log_diag("settings_db: boot: migrated from settings.json");
+                return BootOutcome {
+                    settings,
+                    db: Some(Arc::new(db)),
+                    source: BootSource::MigratedFromJson,
+                };
+            }
+            Err(e) => {
+                log_diag(&format!("settings_db: boot: JSON migration failed: {e}"));
+                return BootOutcome {
+                    settings: Settings::default(),
+                    db: None,
+                    source: BootSource::FailedFallbackDefault,
+                };
+            }
+        }
+    }
+
+    // 3. 何もない: clean install
+    match SettingsDb::create_new(data_dir) {
+        Ok(db) => {
+            let settings = Settings::default();
+            if let Err(e) = db.save_full(&settings) {
+                log_diag(&format!(
+                    "settings_db: boot: clean install save_full failed: {e}; suppressing save"
+                ));
+                return BootOutcome {
+                    settings,
+                    db: None,
+                    source: BootSource::FailedFallbackDefault,
+                };
+            }
+            log_diag("settings_db: boot: clean install");
+            BootOutcome {
+                settings,
+                db: Some(Arc::new(db)),
+                source: BootSource::CleanInstall,
+            }
+        }
+        Err(e) => {
+            log_diag(&format!("settings_db: boot: clean install failed: {e}"));
+            BootOutcome {
+                settings: Settings::default(),
+                db: None,
+                source: BootSource::FailedFallbackDefault,
+            }
+        }
+    }
+}
+
+/// 壊れた main DB の家族を quarantine し、bak1..bak10 を新しい順に試行して復旧する。
+fn boot_recover_from_bak(data_dir: &Path) -> BootOutcome {
+    let moved = quarantine_db_files(data_dir);
+    log_diag(&format!(
+        "settings_db: boot: quarantined {moved} file(s); now scanning bak1..bak10"
+    ));
+    for n in 1..=10 {
+        let bak_name = format!("settings.db.bak{n}");
+        let bak_path = data_dir.join(&bak_name);
+        if !bak_path.exists() {
+            continue;
+        }
+        // bak を main 位置に copy して open する (= rename だと bak が消えるが、再起動時に
+        // 同じ bak をまた使いたい場合があるので copy で残す)。
+        let main_path = settings_db_path(data_dir);
+        if let Err(e) = std::fs::copy(&bak_path, &main_path) {
+            log_diag(&format!(
+                "settings_db: boot: failed to copy {bak_name} -> settings.db: {e}"
+            ));
+            continue;
+        }
+        log_diag(&format!(
+            "settings_db: boot: restored from {bak_name}; opening"
+        ));
+        match SettingsDb::open(data_dir) {
+            Ok(db) => match db.load_into_settings() {
+                Ok(settings) => {
+                    return BootOutcome {
+                        settings,
+                        db: Some(Arc::new(db)),
+                        source: BootSource::RestoredFromDbBackup,
+                    };
+                }
+                Err(e) => {
+                    log_diag(&format!(
+                        "settings_db: boot: restored {bak_name} loads but build_settings_from_db failed: {e}; \
+                         quarantining and trying next bak"
+                    ));
+                    drop(db);
+                    quarantine_db_files(data_dir);
+                    continue;
+                }
+            },
+            Err(e) => {
+                log_diag(&format!(
+                    "settings_db: boot: restored {bak_name} open failed: {e}; \
+                     quarantining and trying next bak"
+                ));
+                quarantine_db_files(data_dir);
+                continue;
+            }
+        }
+    }
+    log_diag("settings_db: boot: bak recovery exhausted; suppressing save this session");
+    BootOutcome {
+        settings: Settings::default(),
+        db: None,
+        source: BootSource::FailedFallbackDefault,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // lazy global (with_db / with_db_result)
 // ---------------------------------------------------------------------------
 
 static GLOBAL_DB: Mutex<Option<(PathBuf, Arc<SettingsDb>)>> = Mutex::new(None);
 
+/// `boot_settings_db` から GLOBAL_DB をセット / クリアする。
+///
+/// `db == Some(arc)` → 次の `with_db` で arc を返す。
+/// `db == None` → save 抑止状態 (= `with_db` は `SaveSuppressed` を返す)。
+pub(crate) fn set_global_db(data_dir: &Path, db: Option<Arc<SettingsDb>>) {
+    if let Ok(mut guard) = GLOBAL_DB.lock() {
+        *guard = db.map(|arc| (data_dir.to_path_buf(), arc));
+    }
+}
+
 /// グローバル `SettingsDb` ハンドルを使って closure を実行する。
 ///
-/// - `data_dir::get()` が test override で変わったら自動的に re-open する
+/// **Phase 2 以降**: `boot_settings_db` が予め global を populate しているので、
+/// `with_db` は populate された Arc を取り出すだけ。Boot 以前 (=旧 Phase 1 互換) や
+/// test override で `data_dir::get()` が変わったケースでは、`SettingsDb::open()` を
+/// lazy に試みる。open に失敗したら `Transient` 等が伝搬する。
+///
 /// - 内部 lock は `Arc<SettingsDb>` を clone する間だけ。closure 実行中は
 ///   global lock を持たない (= 並列 `with_db` がブロックしない)
 pub fn with_db<R>(f: impl FnOnce(&SettingsDb) -> R) -> Result<R, SettingsDbError> {
@@ -1412,7 +1811,50 @@ mod tests {
     use crate::settings::{RecentApp, Settings, TagDef};
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    /// data_dir は process-global なので、`set_test_override` を使う Phase 2 系のテストは
+    /// **同時 1 本** に直列化する。テスト内で必ず取って drop までホールドする。
+    fn data_dir_serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        // poison は無視 (= panic で次のテストもブロックしない)。
+        let mu = LOCK.get_or_init(|| Mutex::new(()));
+        mu.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// data_dir override をテンポラリ dir にセットし、global DB handle もクリアする。
+    /// 返値の guard が drop されると override が解除される。
+    struct DataDirOverrideGuard {
+        _tempdir: TempDir,
+        path: PathBuf,
+        _serial: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl DataDirOverrideGuard {
+        fn new() -> Self {
+            let serial = data_dir_serial();
+            let tempdir = TempDir::new().unwrap();
+            let path = tempdir.path().to_path_buf();
+            crate::data_dir::set_test_override(Some(path.clone()));
+            reset_global_for_test();
+            Self {
+                _tempdir: tempdir,
+                path,
+                _serial: serial,
+            }
+        }
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for DataDirOverrideGuard {
+        fn drop(&mut self) {
+            crate::data_dir::set_test_override(None);
+            reset_global_for_test();
+        }
+    }
 
     fn sample_settings() -> Settings {
         let mut s = Settings::default();
@@ -2176,5 +2618,214 @@ mod tests {
             matches!(err, SettingsDbError::Transient(_)),
             "unknown sqlite code should be promoted to Transient: {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 2: migration / quarantine / boot decision tree
+    //
+    // 以下のテストは `data_dir::set_test_override` を使うので、`data_dir_serial()` で
+    // 直列化する。プロセス内で同時 1 本だけ走る前提。
+    // -----------------------------------------------------------------------
+
+    /// `data_dir` 配下に JSON settings ファイルを書く小さなヘルパ。
+    fn write_legacy_json(dir: &Path, name: &str, settings: &Settings) {
+        let json = serde_json::to_string_pretty(settings).unwrap();
+        std::fs::write(dir.join(name), json).unwrap();
+    }
+
+    #[test]
+    fn quarantine_db_files_renames_family() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        std::fs::write(dir.join("settings.db"), b"data").unwrap();
+        std::fs::write(dir.join("settings.db-wal"), b"wal").unwrap();
+        std::fs::write(dir.join("settings.db-shm"), b"shm").unwrap();
+        let moved = quarantine_db_files(dir);
+        assert_eq!(moved, 3);
+        assert!(!dir.join("settings.db").exists());
+        assert!(!dir.join("settings.db-wal").exists());
+        assert!(!dir.join("settings.db-shm").exists());
+        // .corrupted-<ts> が 3 つ生まれているか read_dir で確認。
+        let mut corrupted = 0;
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.contains(".corrupted-") {
+                corrupted += 1;
+            }
+        }
+        assert_eq!(corrupted, 3);
+    }
+
+    #[test]
+    fn quarantine_db_files_handles_missing() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        // 空 dir で呼んでも error にせず 0 を返すこと。
+        let moved = quarantine_db_files(dir);
+        assert_eq!(moved, 0);
+    }
+
+    #[test]
+    fn migrate_from_settings_json_roundtrip() {
+        // Phase 2 のコア integration test: 旧 settings.json を作って migration を回し、
+        // settings.db に同等内容が入ること + 旧 JSON が .migrated-<ts> にリネームされること。
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let mut original = Settings::default();
+        original.grid_cols = 9;
+        original.thumb_quality = 77;
+        original
+            .favorites
+            .push(FavoriteEntry::new("Pics".into(), PathBuf::from(r"C:\Pics")));
+        original.tags.push(TagDef::new("原神".into()));
+        write_legacy_json(dir, "settings.json", &original);
+        // bak1 も置いて読み比較で main 優先を確認 (= main があれば bak は読まない)。
+        let mut bak = original.clone();
+        bak.grid_cols = 999;
+        write_legacy_json(dir, "settings.json.bak1", &bak);
+
+        let (db, loaded) = migrate_from_settings_json(dir).expect("migration should succeed");
+        // 値ベースで一致確認。
+        assert_eq!(loaded.grid_cols, 9);
+        assert_eq!(loaded.thumb_quality, 77);
+        assert_eq!(loaded.favorites.len(), 1);
+        assert_eq!(loaded.tags.len(), 1);
+        // settings.db が物理的に存在し、再 open で同じ内容が出てくる。
+        assert!(dir.join("settings.db").exists());
+        let reloaded = db.load_into_settings().unwrap();
+        assert_eq!(reloaded.grid_cols, 9);
+        // 旧 JSON ファイルは .migrated-<ts> にリネームされて消えている。
+        assert!(!dir.join("settings.json").exists());
+        assert!(!dir.join("settings.json.bak1").exists());
+        let mut migrated_files = 0;
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.contains(".migrated-") {
+                migrated_files += 1;
+            }
+        }
+        assert_eq!(migrated_files, 2, "main + bak1 should be migrated");
+
+        // schema_meta に migrated_from_json_at が記録されている。
+        let inner = db.inner.lock().unwrap();
+        let ts: String = inner
+            .conn
+            .query_row(
+                "SELECT value FROM schema_meta WHERE key = 'migrated_from_json_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!ts.is_empty(), "migrated_from_json_at must be set");
+    }
+
+    #[test]
+    fn migrate_from_settings_json_uses_bak_when_main_missing() {
+        // settings.json は無いが bak1 だけ残っているケース。
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let mut original = Settings::default();
+        original.grid_cols = 5;
+        write_legacy_json(dir, "settings.json.bak1", &original);
+        let (_db, loaded) = migrate_from_settings_json(dir).expect("bak migration should work");
+        assert_eq!(loaded.grid_cols, 5);
+        assert!(!dir.join("settings.json.bak1").exists());
+    }
+
+    #[test]
+    fn migrate_from_settings_json_no_json_returns_corrupted() {
+        // JSON が一切無い dir では migration は失敗する (= caller は clean install に倒す)。
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let err = match migrate_from_settings_json(dir) {
+            Ok(_) => panic!("expected migration failure on empty dir"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SettingsDbError::Corrupted(_)),
+            "no JSON should map to Corrupted, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn boot_clean_install() {
+        let guard = DataDirOverrideGuard::new();
+        let outcome = boot_settings_db(guard.path());
+        assert_eq!(outcome.source, BootSource::CleanInstall);
+        assert!(outcome.db.is_some());
+        // 続けて with_db 経由でアクセスできる (= GLOBAL_DB が populate されている)。
+        with_db(|db| {
+            let _ = db.load_into_settings().unwrap();
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn boot_loads_existing_db() {
+        let guard = DataDirOverrideGuard::new();
+        let mut s = Settings::default();
+        s.grid_cols = 6;
+        {
+            let db = SettingsDb::create_new(guard.path()).unwrap();
+            db.save_full(&s).unwrap();
+        }
+        let outcome = boot_settings_db(guard.path());
+        assert_eq!(outcome.source, BootSource::LoadedExistingDb);
+        assert_eq!(outcome.settings.grid_cols, 6);
+    }
+
+    #[test]
+    fn boot_migrates_from_json() {
+        let guard = DataDirOverrideGuard::new();
+        let mut s = Settings::default();
+        s.grid_cols = 11;
+        write_legacy_json(guard.path(), "settings.json", &s);
+        let outcome = boot_settings_db(guard.path());
+        assert_eq!(outcome.source, BootSource::MigratedFromJson);
+        assert_eq!(outcome.settings.grid_cols, 11);
+        assert!(!guard.path().join("settings.json").exists());
+        assert!(guard.path().join("settings.db").exists());
+    }
+
+    #[test]
+    fn boot_restores_from_bak_when_main_corrupted() {
+        // bootstrapped DB を作ってから main を壊し、bak1 を別 dir で create_new + save 経由で
+        // 用意して、boot が bak から復旧することを確認する。
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        // 1) main を作って save (bootstrap_complete を立てる)
+        let mut s = Settings::default();
+        s.grid_cols = 21;
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            db.save_full(&s).unwrap();
+            // 2) bak1 として VACUUM INTO で snapshot を取る
+            db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+        }
+        // 3) main を壊す (= NotADatabase になる程度に上書き)。
+        //    WAL / SHM が残っていると open 時に「main は壊れているが WAL から戻る」可能性が
+        //    あるため、まとめて削除しておく。
+        std::fs::remove_file(dir.join("settings.db")).unwrap();
+        std::fs::write(dir.join("settings.db"), b"GARBAGE-NOT-A-SQLITE-DB-CONTENT").unwrap();
+        let _ = std::fs::remove_file(dir.join("settings.db-wal"));
+        let _ = std::fs::remove_file(dir.join("settings.db-shm"));
+        // 4) boot を回す。Corrupted 検出 → quarantine → bak1 から copy → open 成功。
+        let outcome = boot_settings_db(dir);
+        assert_eq!(outcome.source, BootSource::RestoredFromDbBackup);
+        assert_eq!(outcome.settings.grid_cols, 21);
+    }
+
+    #[test]
+    fn boot_failed_returns_default_with_suppress() {
+        // 復旧の bak も json も無い + DB が transient で開けない状況をシミュレートする。
+        // 簡単に作れるシナリオ: 「main は壊れている、bak も無い、json も無い」。
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        std::fs::write(dir.join("settings.db"), b"GARBAGE").unwrap();
+        let outcome = boot_settings_db(dir);
+        assert_eq!(outcome.source, BootSource::FailedFallbackDefault);
+        assert!(outcome.db.is_none());
+        // with_db は「global が空」状態なので、open を試みる → 既存破損ファイルで Corrupted。
+        // (Phase 3 caller はこの状態を save 抑止として扱う。)
     }
 }
