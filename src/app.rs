@@ -15089,6 +15089,20 @@ impl eframe::App for App {
             if native_main_backdrop {
                 self.sync_native_video_main_chrome(true);
                 self.sync_native_video_main_cloak(self.native_video_presenter_hwnd().is_none());
+                // native 動画フルスクリーン中も Ctrl+↑↓ DFS の結果回収は必要。
+                // 早期 return すると line 15336 の poll_folder_nav に到達せず、
+                // start_folder_nav で立てた fs_nav_lock が永続化して以降の
+                // 全ての folder/item nav が死ぬ。`fav_nav` / `toolbar_fav_nav` は
+                // この経路では menubar / toolbar を描画していないので必ず None で OK
+                // (= 競合なし、folder_nav が常に勝つ)。`keyboard_nav` は早期 return より
+                // 前 (line ~15015) で確定済みなので使える。
+                if let Some(result) = self.poll_folder_nav() {
+                    let folder_nav_wins = keyboard_nav.is_none();
+                    if folder_nav_wins {
+                        self.apply_folder_nav_result(ctx, result);
+                        self.chain_folder_nav_if_pending();
+                    }
+                }
                 // Do not paint the main viewport black while the native video
                 // backdrop is taking over. If the main HWND transiently leaks
                 // above the fullscreen backdrop, a black client area makes the
