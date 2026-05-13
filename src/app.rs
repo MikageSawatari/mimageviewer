@@ -20,12 +20,13 @@ pub(crate) type NotifyQueue = (Mutex<Vec<LoadRequest>>, Condvar);
 pub(crate) enum FolderNavMode {
     /// 通常グリッド。DFS 結果をそのまま `load_folder` する。
     Grid,
-    /// フルスクリーン表示中。DFS 結果で `load_folder` 後、先頭/末尾の画像系
+    /// フルスクリーン表示中。DFS 結果で `load_folder` 後、先頭の画像系
     /// アイテムを `open_fullscreen` で再表示する。
     Fullscreen,
     /// お気に入り検索コンテキスト。DFS 結果が root 配下なら `nav_stack` に積んで
     /// `load_folder`、root 外なら `favsearch_navigate_sibling` にフォールバックする。
-    Favsearch { root: PathBuf },
+    /// `fullscreen=true` のときは移動後に先頭の画像系アイテムを再度フルスクリーンで開く。
+    Favsearch { root: PathBuf, fullscreen: bool },
 }
 
 /// DFS スレッドから UI スレッドに送るメッセージ。結果 (Option) と、
@@ -523,19 +524,24 @@ impl FolderNavMode {
     }
 }
 
-/// モードの種類 (variant) のみを比較する。`Favsearch { root }` は root 違いでも
-/// 同一モードとみなす (同一バースト中に root が変わるのはエッジケースだが、
-/// 変わったとしても favsearch 動作は継続するので区別する意味が薄い)。
+/// モードの種類と検索スコープを比較する。Favsearch は root / fullscreen が変わったら
+/// 旧バーストを混ぜず、pending を張り替える。
 fn folder_nav_mode_same_kind(a: &FolderNavMode, b: &FolderNavMode) -> bool {
-    matches!(
-        (a, b),
+    match (a, b) {
         (FolderNavMode::Grid, FolderNavMode::Grid)
-            | (FolderNavMode::Fullscreen, FolderNavMode::Fullscreen)
-            | (
-                FolderNavMode::Favsearch { .. },
-                FolderNavMode::Favsearch { .. }
-            )
-    )
+        | (FolderNavMode::Fullscreen, FolderNavMode::Fullscreen) => true,
+        (
+            FolderNavMode::Favsearch {
+                root: a_root,
+                fullscreen: a_fullscreen,
+            },
+            FolderNavMode::Favsearch {
+                root: b_root,
+                fullscreen: b_fullscreen,
+            },
+        ) => a_root == b_root && a_fullscreen == b_fullscreen,
+        _ => false,
+    }
 }
 
 use eframe::egui;
@@ -2257,8 +2263,8 @@ pub struct App {
     /// 閉じる (Drop) と worker は cancel される。
     pub(crate) trt_install_state: Option<crate::ui_dialogs::trt_install::TrtInstallState>,
     /// フルスクリーン中央のヒントオーバーレイ。
-    /// 最後/最初の画像でさらに進もう/戻ろうとしたとき、または Ctrl+↑↓ で
-    /// 画像のあるフォルダが skip_limit 以内に見つからなかったときに表示する。
+    /// 最後/最初の項目でさらに進もう/戻ろうとしたとき、または Ctrl+↑↓ で
+    /// 画像・動画のあるフォルダが skip_limit 以内に見つからなかったときに表示する。
     pub(crate) fs_boundary_hint: Option<crate::ui_fullscreen::FsBoundaryHint>,
 
     // ── 消しゴム (Erase) モード ───────────────────────────────────
@@ -4380,6 +4386,7 @@ impl App {
     /// お気に入り検索バーを開く (メニューや Ctrl+S から呼ばれる)。
     /// 他の検索バー (Ctrl+F / Ctrl+G) が開いていれば閉じて相互排他を保つ。
     pub(crate) fn open_favsearch(&mut self) {
+        self.cancel_pending_folder_nav();
         self.close_other_search_bars(SearchMode::Favsearch);
         self.favsearch.active = true;
         self.favsearch.focus_request = true;
@@ -4394,6 +4401,7 @@ impl App {
     /// Ctrl+F のローカルメタデータ検索バーを開く。
     /// 他の検索バーが開いていれば閉じる (相互排他)。
     pub(crate) fn open_local_metadata_search(&mut self) {
+        self.cancel_pending_folder_nav();
         self.close_other_search_bars(SearchMode::LocalMeta);
         self.show_search_bar = true;
         self.search_focus_request = true;
@@ -4421,6 +4429,7 @@ impl App {
 
     /// お気に入り検索バーを閉じて、元のフォルダに戻る。
     pub(crate) fn close_favsearch(&mut self) {
+        self.cancel_pending_folder_nav();
         self.favsearch.active = false;
         self.favsearch.has_focus = false;
         self.favsearch.query.clear();
@@ -4460,20 +4469,24 @@ impl App {
         let Some(current) = self.favsearch.nav_stack.last().cloned() else {
             return;
         };
-        self.start_folder_nav(current, forward, FolderNavMode::Favsearch { root });
+        self.start_folder_nav(
+            current,
+            forward,
+            FolderNavMode::Favsearch {
+                root,
+                fullscreen: false,
+            },
+        );
     }
 
-    /// 検索結果の前後アイテムへ移動する (Ctrl+↑↓ 用、`delta` は +1 / -1)。
-    /// スタックがある場合は root (nav_stack[0]) を基準に検索結果内を前後する。
-    /// 移動後は新しい root 1 つだけのスタックになる。
-    pub(crate) fn favsearch_navigate_sibling(&mut self, delta: isize) {
+    fn favsearch_sibling_path(&self, delta: isize) -> Option<PathBuf> {
         let results = &self.favsearch.results_paths;
         if results.is_empty() {
-            return;
+            return None;
         }
         let cur_root = match self.favsearch.nav_stack.first() {
             Some(p) => p.clone(),
-            None => return, // 検索結果リスト上では何もしない
+            None => return None, // 検索結果リスト上では何もしない
         };
         let idx = match results.iter().position(|p| p == &cur_root) {
             Some(i) => i,
@@ -4484,12 +4497,28 @@ impl App {
         };
         let next_idx = idx as isize + delta;
         if next_idx < 0 || next_idx >= results.len() as isize {
-            return; // 端で止める
+            return None; // 端で止める
         }
-        let next_path = results[next_idx as usize].clone();
+        Some(results[next_idx as usize].clone())
+    }
+
+    fn clear_pending_folder_nav_steps(&mut self) {
+        self.pending_folder_nav_steps = 0;
+        self.pending_folder_nav_mode = FolderNavMode::Grid;
+    }
+
+    /// 検索結果の前後アイテムへ移動する (Ctrl+↑↓ 用、`delta` は +1 / -1)。
+    /// スタックがある場合は root (nav_stack[0]) を基準に検索結果内を前後する。
+    /// 移動後は新しい root 1 つだけのスタックになる。
+    pub(crate) fn favsearch_navigate_sibling(&mut self, delta: isize) -> bool {
+        let Some(next_path) = self.favsearch_sibling_path(delta) else {
+            return false;
+        };
+        self.clear_pending_folder_nav_steps();
         self.favsearch.nav_stack = vec![next_path.clone()];
         self.load_folder(next_path);
         self.update_favsearch_address();
+        true
     }
 
     /// BS が押されたときの検索コンテキスト内の「戻る」処理。
@@ -4502,6 +4531,7 @@ impl App {
             return;
         }
         let popped = self.favsearch.nav_stack.pop();
+        self.cancel_pending_folder_nav();
         if let Some(popped_path) = popped {
             if let Some(name) = popped_path.file_name().and_then(|n| n.to_str()) {
                 self.select_after_load = Some(name.to_string());
@@ -5470,8 +5500,7 @@ impl App {
             pending.cancel.store(true, Ordering::Relaxed);
         }
         // モード・累積もリセット (新しい load_folder が走る = 連打バースト中断)
-        self.pending_folder_nav_steps = 0;
-        self.pending_folder_nav_mode = FolderNavMode::Grid;
+        self.clear_pending_folder_nav_steps();
 
         self.cancel_token.store(true, Ordering::Relaxed);
         self.wake_all_workers();
@@ -8198,6 +8227,7 @@ impl App {
         // 検索コンテキスト中は検索結果内での前後移動に置き換える。
         // Ctrl+G 中は file system 遡行を禁止して Ctrl+G の範囲に閉じる
         // (Aggregated 時は Ctrl+↑↓ は no-op、DrilledInto 時は drill-tree DFS)。
+        let in_local_search = self.show_search_bar;
         let in_global_search = self.global_search.active;
         let in_global_search_drilled = in_global_search
             && matches!(
@@ -8212,6 +8242,10 @@ impl App {
                 self.global_search_ctrl_nav(true);
             } else if in_global_search {
                 // Aggregated 中は何もしない (fs ツリー遡行はユーザ期待に反する)
+            } else if in_local_search {
+                // Ctrl+F は現在一覧のフィルタ。フォーカスが外れていても
+                // Ctrl+↑↓ でフォルダ横断せず、検索状態を保つ。
+                self.cancel_pending_folder_nav();
             } else if in_favsearch {
                 self.favsearch_ctrl_nav(true);
             } else if let Some(cur) = self.effective_folder() {
@@ -8226,6 +8260,8 @@ impl App {
                 self.global_search_ctrl_nav(false);
             } else if in_global_search {
                 // Aggregated 中は何もしない
+            } else if in_local_search {
+                self.cancel_pending_folder_nav();
             } else if in_favsearch {
                 self.favsearch_ctrl_nav(false);
             } else if let Some(cur) = self.effective_folder() {
@@ -8234,6 +8270,18 @@ impl App {
         }
 
         None
+    }
+
+    /// 進行中 / 累積中の Ctrl+↑↓ フォルダナビゲーションを破棄する。
+    ///
+    /// 検索モードやフルスクリーン状態などの scope が変わると、古い入力を
+    /// 新しい表示状態へ適用すると分かりにくいので明示的に流す。
+    pub(crate) fn cancel_pending_folder_nav(&mut self) {
+        if let Some(pending) = self.folder_nav_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.clear_pending_folder_nav_steps();
+        self.release_fs_nav_lock();
     }
 
     /// Ctrl+↑↓ のフォルダナビゲーションをバックグラウンドスレッドで開始する。
@@ -8261,7 +8309,7 @@ impl App {
     ) {
         // 連打アキュームレータの上限。キーを離した後に余韻で追加遷移が続くと
         // 体感上「離したのに動く」違和感になるため、溜められる量を制限する。
-        // 5 なら画像フォルダの load_folder (~100ms/step) で 500ms 弱で drain され、
+        // 5 なら画像・動画フォルダの load_folder (~100ms/step) で 500ms 弱で drain され、
         // リピート離脱直後のレスポンスが保たれる。超過分のプレスは捨てる。
         const MAX_PENDING_NAV: i32 = 5;
 
@@ -8464,6 +8512,57 @@ impl App {
         }
     }
 
+    fn reopen_fullscreen_after_folder_nav_load(
+        &mut self,
+        ctx: &egui::Context,
+        forward: bool,
+        restore_video_tile: bool,
+    ) -> &'static str {
+        if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
+            self.fs_nav_after_pdf_enumerate = Some(forward);
+            return "enumerate_defer";
+        }
+        let target_idx = self.find_fullscreen_nav_target();
+        if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
+            self.fs_nav_after_pdf_enumerate = Some(forward);
+            return "enumerate_defer";
+        }
+        if let Some(new_idx) = target_idx {
+            #[cfg(windows)]
+            let target_is_video = matches!(self.items.get(new_idx), Some(GridItem::Video(_)));
+            #[cfg(not(windows))]
+            let _ = restore_video_tile;
+
+            self.open_fullscreen(new_idx);
+            self.selected = Some(new_idx);
+            self.scroll_to_selected = true;
+            self.update_last_selected_image();
+
+            #[cfg(windows)]
+            if restore_video_tile {
+                if target_is_video {
+                    self.video_tile_reopen_pending = true;
+                    self.video_tile_reopen_deadline =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+                    ctx.request_repaint();
+                } else {
+                    self.video_tile_reopen_pending = false;
+                    self.video_tile_reopen_deadline = None;
+                }
+            }
+        } else {
+            // navigate_folder_with_skip は画像ありフォルダを返す前提だが、
+            // レーティングフィルタ等で visible_indices が空の場合はここに来る。
+            // fullscreen は close 済みなので、メインビューポートに
+            // キーボードフォーカスを戻す (旧同期実装と同じ挙動)。
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            // フルスクリーン再オープン無しなら nav ロックを使う相手がいないので
+            // 明示 release (Codex P1)。次の Ctrl+↑↓ がブロックされない。
+            self.release_fs_nav_lock();
+        }
+        "done"
+    }
+
     /// DFS 完了時の後処理。モードに応じて load_folder / open_fullscreen /
     /// favsearch の stack push や sibling fallback を使い分ける。
     fn apply_folder_nav_result(&mut self, ctx: &egui::Context, result: FolderNavResult) {
@@ -8513,10 +8612,41 @@ impl App {
         let Some(path) = result.path else {
             // DFS が尽きた (forward で末尾、backward で先頭に達した等)
             match result.mode {
-                FolderNavMode::Favsearch { .. } => {
+                FolderNavMode::Favsearch { fullscreen, .. } => {
                     // favsearch では DFS 尽きた場合は検索結果の前後アイテムへ
                     let delta: isize = if result.forward { 1 } else { -1 };
-                    self.favsearch_navigate_sibling(delta);
+                    if fullscreen {
+                        #[cfg(windows)]
+                        let restore_video_tile = self.video_tile_state.is_some();
+                        #[cfg(not(windows))]
+                        let restore_video_tile = false;
+                        if let Some(next_path) = self.favsearch_sibling_path(delta) {
+                            self.clear_pending_folder_nav_steps();
+                            self.close_fullscreen();
+                            self.favsearch.nav_stack = vec![next_path.clone()];
+                            self.load_folder(next_path);
+                            self.update_favsearch_address();
+                            let reason = self.reopen_fullscreen_after_folder_nav_load(
+                                ctx,
+                                result.forward,
+                                restore_video_tile,
+                            );
+                            if reason == "enumerate_defer" {
+                                emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
+                                return;
+                            }
+                        } else {
+                            self.fs_boundary_hint =
+                                Some(crate::ui_fullscreen::FsBoundaryHint::SearchEnd {
+                                    forward: result.forward,
+                                    at: std::time::Instant::now(),
+                                });
+                            self.clear_pending_folder_nav_steps();
+                            self.release_fs_nav_lock();
+                        }
+                    } else if !self.favsearch_navigate_sibling(delta) {
+                        self.clear_pending_folder_nav_steps();
+                    }
                 }
                 FolderNavMode::Fullscreen => {
                     // DFS がツリー末端に達した: フルスクリーンは維持して中央にヒントを出す。
@@ -8526,7 +8656,7 @@ impl App {
                             forward: result.forward,
                             at: std::time::Instant::now(),
                         });
-                    self.pending_folder_nav_steps = 0;
+                    self.clear_pending_folder_nav_steps();
                     // items_generation が進まないので poll_fs_nav_lock では解除されない
                     // → 明示的に release して以降の Ctrl+↑↓ を効くようにする (Codex P1)。
                     self.release_fs_nav_lock();
@@ -8536,7 +8666,7 @@ impl App {
             emit_end(apply_t0, apply_seq, apply_mode_tag, "dfs_empty");
             return;
         };
-        // Fullscreen モードで skip_limit 尽きフォールバックの場合は、画像の無い
+        // Fullscreen モードで skip_limit 尽きフォールバックの場合は、画像・動画の無い
         // フォルダへ飛ばしてフルスクリーンが解除されるのを避けるため、現状維持で
         // 中央ヒントを出す。Grid モードは従来通り移動 (段階的に進める導線)。
         if matches!(result.mode, FolderNavMode::Fullscreen) && !result.hit_image_folder {
@@ -8544,7 +8674,7 @@ impl App {
                 forward: result.forward,
                 at: std::time::Instant::now(),
             });
-            self.pending_folder_nav_steps = 0;
+            self.clear_pending_folder_nav_steps();
             // 同上: items_generation 不変のまま return するので明示 release (Codex P1)。
             self.release_fs_nav_lock();
             emit_end(apply_t0, apply_seq, apply_mode_tag, "fs_boundary");
@@ -8557,55 +8687,96 @@ impl App {
                 self.load_folder_with_scan(path, scanned);
             }
             FolderNavMode::Fullscreen => {
+                #[cfg(windows)]
+                let restore_video_tile = self.video_tile_state.is_some();
+                #[cfg(not(windows))]
+                let restore_video_tile = false;
                 // fs_cache / ai_upscale_cache は item index がキーで、
                 // load_folder で items を入れ替えると古い画像を新しい idx で
                 // 誤って引く危険がある。close_fullscreen で一括破棄してから
                 // 新フォルダを読み直す (PDF Critical 予約は open_fullscreen で再取得)。
                 self.close_fullscreen();
                 self.load_folder_with_scan(path, scanned);
-                // PDF / ZIP は enumerate_*_async が非同期なので、load_folder 直後は
-                // items が空のことがある。結果は poll_*_enumerate が受信するので、
-                // そこで fullscreen を開き直す。find_fullscreen_nav_target も内部で
-                // load_folder を呼んで PDF/ZIP に自動進入することがあるため、その前後の
-                // 両方でチェックする (Codex P1: ZIP 非同期化で ZIP への Ctrl+↑↓ fullscreen
-                // 継続が壊れていたのを修正)。
-                if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
-                    self.fs_nav_after_pdf_enumerate = Some(result.forward);
-                    emit_end(apply_t0, apply_seq, apply_mode_tag, "enumerate_defer");
+                let reason = self.reopen_fullscreen_after_folder_nav_load(
+                    ctx,
+                    result.forward,
+                    restore_video_tile,
+                );
+                if reason == "enumerate_defer" {
+                    emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
                     return;
-                }
-                let target_idx = self.find_fullscreen_nav_target();
-                if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
-                    self.fs_nav_after_pdf_enumerate = Some(result.forward);
-                    emit_end(apply_t0, apply_seq, apply_mode_tag, "enumerate_defer");
-                    return;
-                }
-                if let Some(new_idx) = target_idx {
-                    self.open_fullscreen(new_idx);
-                    self.selected = Some(new_idx);
-                    self.scroll_to_selected = true;
-                    self.update_last_selected_image();
-                } else {
-                    // navigate_folder_with_skip は画像ありフォルダを返す前提だが、
-                    // レーティングフィルタ等で visible_indices が空の場合はここに来る。
-                    // fullscreen は close 済みなので、メインビューポートに
-                    // キーボードフォーカスを戻す (旧同期実装と同じ挙動)。
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-                    // フルスクリーン再オープン無しなら nav ロックを使う相手がいないので
-                    // 明示 release (Codex P1)。次の Ctrl+↑↓ がブロックされない。
-                    self.release_fs_nav_lock();
                 }
             }
-            FolderNavMode::Favsearch { root } => {
+            FolderNavMode::Favsearch { root, fullscreen } => {
                 let delta: isize = if result.forward { 1 } else { -1 };
                 if crate::search_index_db::is_under(&path, &root) {
+                    if fullscreen && !result.hit_image_folder {
+                        self.fs_boundary_hint =
+                            Some(crate::ui_fullscreen::FsBoundaryHint::NoImageFolder {
+                                forward: result.forward,
+                                at: std::time::Instant::now(),
+                            });
+                        self.clear_pending_folder_nav_steps();
+                        self.release_fs_nav_lock();
+                        emit_end(apply_t0, apply_seq, apply_mode_tag, "fs_boundary");
+                        return;
+                    }
                     // サブツリー内 — 通常の DFS 移動としてスタックに push
+                    #[cfg(windows)]
+                    let restore_video_tile = fullscreen && self.video_tile_state.is_some();
+                    #[cfg(not(windows))]
+                    let restore_video_tile = false;
                     self.favsearch.nav_stack.push(path.clone());
+                    if fullscreen {
+                        self.close_fullscreen();
+                    }
                     self.load_folder_with_scan(path, scanned);
                     self.update_favsearch_address();
+                    if fullscreen {
+                        let reason = self.reopen_fullscreen_after_folder_nav_load(
+                            ctx,
+                            result.forward,
+                            restore_video_tile,
+                        );
+                        if reason == "enumerate_defer" {
+                            emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
+                            return;
+                        }
+                    }
                 } else {
                     // サブツリー外へ出ようとしている → 検索結果の前後へ移動
-                    self.favsearch_navigate_sibling(delta);
+                    if fullscreen {
+                        #[cfg(windows)]
+                        let restore_video_tile = self.video_tile_state.is_some();
+                        #[cfg(not(windows))]
+                        let restore_video_tile = false;
+                        if let Some(next_path) = self.favsearch_sibling_path(delta) {
+                            self.clear_pending_folder_nav_steps();
+                            self.close_fullscreen();
+                            self.favsearch.nav_stack = vec![next_path.clone()];
+                            self.load_folder(next_path);
+                            self.update_favsearch_address();
+                            let reason = self.reopen_fullscreen_after_folder_nav_load(
+                                ctx,
+                                result.forward,
+                                restore_video_tile,
+                            );
+                            if reason == "enumerate_defer" {
+                                emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
+                                return;
+                            }
+                        } else {
+                            self.fs_boundary_hint =
+                                Some(crate::ui_fullscreen::FsBoundaryHint::SearchEnd {
+                                    forward: result.forward,
+                                    at: std::time::Instant::now(),
+                                });
+                            self.clear_pending_folder_nav_steps();
+                            self.release_fs_nav_lock();
+                        }
+                    } else if !self.favsearch_navigate_sibling(delta) {
+                        self.clear_pending_folder_nav_steps();
+                    }
                 }
             }
         }
@@ -11269,14 +11440,21 @@ impl App {
         // フルスクリーン発起点の Ctrl+↑↓ DFS が走っていたら、ユーザーが
         // フルスクリーンを抜けた = フルスクリーン復帰の意図がなくなったとみなし
         // キャンセルする。apply_folder_nav_result 内の close_fullscreen
-        // (Fullscreen ブランチ) は既に poll で folder_nav_pending を取り出した後
-        // なので self.folder_nav_pending は None = ここでキャンセルされない。
+        // (Fullscreen / Favsearch fullscreen ブランチ) は既に poll で
+        // folder_nav_pending を取り出した後なので、
+        // self.folder_nav_pending は None = ここでキャンセルされない。
         if let Some(pending) = self.folder_nav_pending.as_ref() {
-            if matches!(pending.mode, FolderNavMode::Fullscreen) {
+            if matches!(
+                pending.mode,
+                FolderNavMode::Fullscreen
+                    | FolderNavMode::Favsearch {
+                        fullscreen: true,
+                        ..
+                    }
+            ) {
                 pending.cancel.store(true, Ordering::Relaxed);
                 self.folder_nav_pending = None;
-                self.pending_folder_nav_steps = 0;
-                self.pending_folder_nav_mode = FolderNavMode::Grid;
+                self.clear_pending_folder_nav_steps();
                 // ユーザーが Esc 等で DFS 中にフルスクリーンを抜けた場合、items は
                 // 入れ替わらないので poll_fs_nav_lock では release されない。
                 // ここで明示的に lock / holdover を捨てる (Codex P1)。
@@ -14904,6 +15082,7 @@ impl eframe::App for App {
                 self.close_favsearch();
             }
             if self.show_search_bar {
+                self.cancel_pending_folder_nav();
                 self.show_search_bar = false;
                 self.search_query.clear();
                 self.search_filter = None;
@@ -15133,8 +15312,7 @@ impl eframe::App for App {
                 // 他 nav 源が勝った: 累積をクリアして連打バーストを中断する
                 // (start_loading_items が folder_nav_pending と累積をリセット済みだが、
                 //  folder_nav_result が Some かつ他 nav 優先のケースを拾うため明示)
-                self.pending_folder_nav_steps = 0;
-                self.pending_folder_nav_mode = FolderNavMode::Grid;
+                self.clear_pending_folder_nav_steps();
                 if self.favsearch.active {
                     self.update_favsearch_address();
                 }

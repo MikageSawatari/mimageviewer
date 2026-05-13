@@ -2757,6 +2757,63 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// `find_fullscreen_nav_target`: 動画も image-like として着地点に含める。
+    #[test]
+    fn find_fullscreen_nav_target_can_return_video() {
+        use crate::grid_item::GridItem;
+        let (mut app, _g, _tmp, _l) = setup_app();
+        app.items.push(GridItem::Folder("c:/sub".into()));
+        app.items
+            .push(GridItem::Video(std::path::PathBuf::from("c:/a.mp4")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/b.jpg")));
+        for _ in 0..app.items.len() {
+            app.thumbnails.push(ThumbnailState::Pending);
+        }
+        app.rebuild_visible_indices();
+        assert_eq!(
+            app.find_fullscreen_nav_target(),
+            Some(1),
+            "先頭の image-like が動画なら動画 idx を返す"
+        );
+    }
+
+    #[test]
+    fn folder_nav_mode_same_kind_distinguishes_favsearch_scope() {
+        let root_a = PathBuf::from("c:/fav-a");
+        let root_b = PathBuf::from("c:/fav-b");
+        assert!(folder_nav_mode_same_kind(
+            &FolderNavMode::Favsearch {
+                root: root_a.clone(),
+                fullscreen: false,
+            },
+            &FolderNavMode::Favsearch {
+                root: root_a.clone(),
+                fullscreen: false,
+            },
+        ));
+        assert!(!folder_nav_mode_same_kind(
+            &FolderNavMode::Favsearch {
+                root: root_a.clone(),
+                fullscreen: false,
+            },
+            &FolderNavMode::Favsearch {
+                root: root_a,
+                fullscreen: true,
+            },
+        ));
+        assert!(!folder_nav_mode_same_kind(
+            &FolderNavMode::Favsearch {
+                root: root_b.clone(),
+                fullscreen: true,
+            },
+            &FolderNavMode::Favsearch {
+                root: root_b.join("child"),
+                fullscreen: true,
+            },
+        ));
+    }
+
     /// `poll_fs_nav_lock`: items_generation が進んだあとに新ページのサムネが
     /// Loaded になって初めてロック解除されること。`items_generation` チェックが
     /// 無いと、ナビ発火直後 (まだ items 入れ替え前) で旧ページのサムネが Loaded だと

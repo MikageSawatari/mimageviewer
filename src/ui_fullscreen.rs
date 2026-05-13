@@ -413,9 +413,9 @@ const CHECKMARK_MARGIN: f32 = 16.0;
 const SPREAD_DIVIDER_WIDTH: f32 = 2.0;
 /// フィードバックトースト表示時間（秒）
 const FEEDBACK_TOAST_DURATION: f32 = 1.2;
-/// 境界ヒント（最初/最後の画像に達した案内）の表示時間（秒）
+/// 境界ヒント（最初/最後の項目に達した案内）の表示時間（秒）
 const BOUNDARY_HINT_DURATION: f32 = 2.5;
-/// 画像フォルダが見つからない旨のヒント表示時間（秒）。メッセージが長く
+/// 画像・動画フォルダが見つからない旨のヒント表示時間（秒）。メッセージが長く
 /// ユーザーがフルスクリーンを維持するか Esc で抜けるか判断する時間が要るため、
 /// 境界ヒントより長めに取る。
 const NO_IMAGE_FOLDER_HINT_DURATION: f32 = 4.0;
@@ -450,12 +450,12 @@ pub(crate) struct NavMarker {
 /// フルスクリーン中央のヒントオーバーレイ。
 #[derive(Copy, Clone)]
 pub(crate) enum FsBoundaryHint {
-    /// 最初/最後の画像に到達 (at_end: true=末尾, false=先頭)。
+    /// 最初/最後の項目に到達 (at_end: true=末尾, false=先頭)。
     Edge {
         at_end: bool,
         at: std::time::Instant,
     },
-    /// Ctrl+↑↓ で画像のある次 (forward=true) / 前 (forward=false) のフォルダが
+    /// Ctrl+↑↓ で画像・動画のある次 (forward=true) / 前 (forward=false) のフォルダが
     /// skip_limit 以内に見つからなかった。
     NoImageFolder {
         forward: bool,
@@ -467,6 +467,18 @@ pub(crate) enum FsBoundaryHint {
         forward: bool,
         at: std::time::Instant,
     },
+    /// Ctrl+F active / 検索結果一覧など、現在の scope では Ctrl+↑↓ が移動を
+    /// 開始しないことを知らせる。
+    NavNoOp {
+        reason: FsNavNoOpReason,
+        at: std::time::Instant,
+    },
+}
+
+#[derive(Copy, Clone)]
+pub(crate) enum FsNavNoOpReason {
+    LocalFilterActive,
+    SearchResultList,
 }
 
 impl FsBoundaryHint {
@@ -474,7 +486,8 @@ impl FsBoundaryHint {
         match self {
             FsBoundaryHint::Edge { at, .. }
             | FsBoundaryHint::NoImageFolder { at, .. }
-            | FsBoundaryHint::SearchEnd { at, .. } => *at,
+            | FsBoundaryHint::SearchEnd { at, .. }
+            | FsBoundaryHint::NavNoOp { at, .. } => *at,
         }
     }
 }
@@ -646,7 +659,7 @@ impl App {
 
     /// nav ロックと holdover を強制解除する。`poll_fs_nav_lock` の通常解除条件
     /// (items_generation 進行 + 新ページの tex 用意) に到達しないケース
-    /// (DFS が境界に当たって path=None / 画像フォルダに着地できず !hit_image_folder /
+    /// (DFS が境界に当たって path=None / 画像・動画フォルダに着地できず !hit_image_folder /
     /// ユーザーが Esc でフルスクリーンを抜けて DFS をキャンセル) で明示的に呼ぶ。
     /// これをやらないと `fs_nav_locked_gen` が永続化して以降の Ctrl+↑↓ がすべて
     /// 無視される (Codex P1)。
@@ -1669,7 +1682,7 @@ impl App {
                         // 中で描画される (= `native_presenter/overlay_draw.rs::draw_native_*`)。
                         // eframe ビューポートからは描画しない。
 
-                        // ── 中央の境界ヒント (最初/最後の画像です…) ──
+                        // ── 中央の境界ヒント (最初/最後の項目です…) ──
                         self.draw_boundary_hint(ui, full_rect, ctx);
 
                         // ── スロット保存ダイアログ ──
@@ -3380,7 +3393,7 @@ impl App {
 
     // ── ナビゲーション & スライドショー ─────────────────────────────────
 
-    fn open_fullscreen_from_fs_navigation(&mut self, ctx: &egui::Context, idx: usize) {
+    pub(crate) fn open_fullscreen_from_fs_navigation(&mut self, ctx: &egui::Context, idx: usize) {
         #[cfg(windows)]
         let restore_video_tile = self.video_tile_state.is_some();
 
@@ -3406,6 +3419,90 @@ impl App {
         }
     }
 
+    pub(crate) fn handle_fullscreen_ctrl_nav_context(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        forward: bool,
+        native_toast: bool,
+    ) {
+        if self.fs_nav_is_locked() {
+            return;
+        }
+
+        if self.global_search.active {
+            if matches!(
+                self.global_search.view,
+                crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
+            ) {
+                self.global_search_ctrl_nav_fullscreen(ctx, forward);
+            } else {
+                self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::SearchResultList, native_toast);
+            }
+            return;
+        }
+
+        if self.favsearch.active {
+            let Some(root) = self.favsearch.nav_stack.first().cloned() else {
+                self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::SearchResultList, native_toast);
+                return;
+            };
+            let Some(current) = self.favsearch.nav_stack.last().cloned() else {
+                return;
+            };
+            self.capture_fs_nav_holdover(fs_idx);
+            self.start_folder_nav(
+                current,
+                forward,
+                crate::app::FolderNavMode::Favsearch {
+                    root,
+                    fullscreen: true,
+                },
+            );
+            return;
+        }
+
+        if self.show_search_bar {
+            self.cancel_pending_folder_nav();
+            self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::LocalFilterActive, native_toast);
+            return;
+        }
+
+        if let Some(cur) = self.current_folder.clone() {
+            self.capture_fs_nav_holdover(fs_idx);
+            self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
+        }
+    }
+
+    fn show_fullscreen_nav_noop(
+        &mut self,
+        ctx: &egui::Context,
+        reason: FsNavNoOpReason,
+        native_toast: bool,
+    ) {
+        #[cfg(windows)]
+        if native_toast {
+            self.show_native_video_overlay_toast(Self::nav_noop_title(reason).to_string(), true);
+            self.mark_native_video_hud_activity(ctx);
+            return;
+        }
+
+        #[cfg(not(windows))]
+        let _ = (ctx, native_toast);
+
+        self.fs_boundary_hint = Some(FsBoundaryHint::NavNoOp {
+            reason,
+            at: std::time::Instant::now(),
+        });
+    }
+
+    pub(crate) fn nav_noop_title(reason: FsNavNoOpReason) -> &'static str {
+        match reason {
+            FsNavNoOpReason::LocalFilterActive => "Ctrl+F検索中はフォルダ移動しません",
+            FsNavNoOpReason::SearchResultList => "検索結果を開いてからCtrl+↑↓で移動できます",
+        }
+    }
+
     /// フルスクリーン終了・ナビゲーション・スライドショーを処理する。
     fn handle_fs_navigation(
         &mut self,
@@ -3424,42 +3521,16 @@ impl App {
             // input/focus repaint に頼らず明示的に次フレームを起こす。
             ctx.request_repaint();
         }
-        // Ctrl+↑↓ はフルスクリーンを保ったまま前後フォルダへ飛び、先頭/末尾の
-        // 画像系アイテムを開く。self.selected も合わせて更新するので、ここから
-        // フルスクリーンを閉じたときグリッド側のカーソルが最後に観た画像に残る。
+        // Ctrl+↑↓ はフルスクリーンを保ったまま現在コンテキストの前後へ飛び、
+        // 移動先の先頭 image-like を開く。self.selected も合わせて更新するので、
+        // ここからフルスクリーンを閉じたときグリッド側のカーソルが最後に観た項目に残る。
         //
         // 実装上: `navigate_folder_with_skip` は DFS + `read_dir` で UI スレッドを
         // ブロックし得るので (深い階層だと 100ms 級)、ここでは発火だけ行い、
         // 実際の close_fullscreen / load_folder / open_fullscreen は
         // `apply_folder_nav_result` (FolderNavMode::Fullscreen ブランチ) に任せる。
         if let Some(delta) = ctrl_nav {
-            // 連打時のロック: 直前の Ctrl+↓ で開始したナビの新ページ表示が
-            // まだ準備できていない (= サムネ未ロード or fs_cache 未投入) 間は
-            // 入力を捨てて、画面が「ファイル名だけ次々切り替わる」状態を防ぐ。
-            // 待ちが解除されてから次のキーを押せば確実にサムネ以上が見える。
-            if self.fs_nav_is_locked() {
-                // ignore — 次フレームで poll_fs_nav_lock が解除する
-            } else {
-                let forward = delta > 0;
-                // Ctrl+G 絞り込みビュー中はファイルシステム DFS ではなく検索結果の
-                // NavEntry リスト上を移動する。fs ツリーを跨ぐと「検索結果の外」に
-                // 出てしまうので、検索解除まで Ctrl+G スコープに閉じ込める。
-                if self.global_search.active
-                    && matches!(
-                        self.global_search.view,
-                        crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
-                    )
-                {
-                    self.global_search_ctrl_nav_fullscreen(forward);
-                } else if let Some(cur) = self.current_folder.clone() {
-                    // ナビ発火前に「今出ているテクスチャ」を holdover に退避し、
-                    // items 入れ替えで fs_cache が drop されても画面が真っ白に
-                    // ならないようにする。`capture_fs_nav_holdover` がロック取得時の
-                    // items_generation も同時に記録する (= items 入れ替え前の早期解除を防ぐ)。
-                    self.capture_fs_nav_holdover(fs_idx);
-                    self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Fullscreen);
-                }
-            }
+            self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, delta > 0, false);
         } else if !close_fs {
             if let Some(new_idx) = jump_to {
                 self.open_fullscreen_from_fs_navigation(ctx, new_idx);
@@ -5089,7 +5160,7 @@ impl App {
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
     }
 
-    /// 画面中央に境界ヒント (最初/最後の画像です… / 次のフォルダが見つかりません…) を描画する。
+    /// 画面中央に境界ヒント (最初/最後の項目です… / 次のフォルダが見つかりません…) を描画する。
     fn draw_boundary_hint(
         &mut self,
         ui: &mut egui::Ui,
@@ -5104,6 +5175,7 @@ impl App {
             FsBoundaryHint::Edge { .. } => BOUNDARY_HINT_DURATION,
             FsBoundaryHint::NoImageFolder { .. } => NO_IMAGE_FOLDER_HINT_DURATION,
             FsBoundaryHint::SearchEnd { .. } => NO_IMAGE_FOLDER_HINT_DURATION,
+            FsBoundaryHint::NavNoOp { .. } => BOUNDARY_HINT_DURATION,
         };
         let elapsed = start_time.elapsed().as_secs_f32();
         if elapsed > duration {
@@ -5119,22 +5191,22 @@ impl App {
 
         let (title, body_lines): (&str, Vec<&str>) = match hint {
             FsBoundaryHint::Edge { at_end: true, .. } => (
-                "最後の画像です",
+                "最後の項目です",
                 vec!["[Home] 最初に戻る", "[Ctrl]+[↓] 次のフォルダへ"],
             ),
             FsBoundaryHint::Edge { at_end: false, .. } => (
-                "最初の画像です",
+                "最初の項目です",
                 vec!["[End] 最後に移動", "[Ctrl]+[↑] 前のフォルダへ"],
             ),
             FsBoundaryHint::NoImageFolder { forward: true, .. } => (
-                "次のフォルダに画像が見つかりません",
+                "次のフォルダに画像・動画が見つかりません",
                 vec![
                     "[Esc] でサムネイル一覧に戻り",
                     "[Ctrl]+[↓] で空フォルダを越えて移動できます",
                 ],
             ),
             FsBoundaryHint::NoImageFolder { forward: false, .. } => (
-                "前のフォルダに画像が見つかりません",
+                "前のフォルダに画像・動画が見つかりません",
                 vec![
                     "[Esc] でサムネイル一覧に戻り",
                     "[Ctrl]+[↑] で空フォルダを越えて移動できます",
@@ -5147,6 +5219,20 @@ impl App {
             FsBoundaryHint::SearchEnd { forward: false, .. } => (
                 "最初の検索結果です",
                 vec!["[Esc] で検索を閉じると", "通常のフォルダ移動に戻ります"],
+            ),
+            FsBoundaryHint::NavNoOp {
+                reason: FsNavNoOpReason::LocalFilterActive,
+                ..
+            } => (
+                Self::nav_noop_title(FsNavNoOpReason::LocalFilterActive),
+                vec!["現在の一覧フィルタを維持します"],
+            ),
+            FsBoundaryHint::NavNoOp {
+                reason: FsNavNoOpReason::SearchResultList,
+                ..
+            } => (
+                Self::nav_noop_title(FsNavNoOpReason::SearchResultList),
+                vec!["結果を開くと検索スコープ内で移動できます"],
             ),
         };
 

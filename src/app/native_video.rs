@@ -2414,6 +2414,12 @@ impl App {
                 }
             }
             // Plain Up / Down: navigate files, matching the egui fullscreen path.
+            0x26 if key.ctrl && !key.shift => {
+                self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
+            }
+            0x28 if key.ctrl && !key.shift => {
+                self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
+            }
             0x26 if !key.shift && !key.ctrl => {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, -1);
             }
@@ -2709,7 +2715,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn show_native_video_overlay_toast(&self, text: String, centered: bool) {
+    pub(crate) fn show_native_video_overlay_toast(&self, text: String, centered: bool) {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
@@ -2723,16 +2729,16 @@ impl App {
         match hint {
             crate::ui_fullscreen::FsBoundaryHint::Edge { at_end, .. } => {
                 if at_end {
-                    "最後の画像です".to_string()
+                    "最後の項目です  [Ctrl]+[↓] 次のフォルダへ".to_string()
                 } else {
-                    "最初の画像です".to_string()
+                    "最初の項目です  [Ctrl]+[↑] 前のフォルダへ".to_string()
                 }
             }
             crate::ui_fullscreen::FsBoundaryHint::NoImageFolder { forward, .. } => {
                 if forward {
-                    "次の画像フォルダが見つかりません".to_string()
+                    "次の画像・動画フォルダが見つかりません".to_string()
                 } else {
-                    "前の画像フォルダが見つかりません".to_string()
+                    "前の画像・動画フォルダが見つかりません".to_string()
                 }
             }
             crate::ui_fullscreen::FsBoundaryHint::SearchEnd { forward, .. } => {
@@ -2741,6 +2747,9 @@ impl App {
                 } else {
                     "これ以上前の検索結果はありません".to_string()
                 }
+            }
+            crate::ui_fullscreen::FsBoundaryHint::NavNoOp { reason, .. } => {
+                Self::nav_noop_title(reason).to_string()
             }
         }
     }
@@ -3034,6 +3043,21 @@ impl App {
             self.close_fullscreen();
             return;
         }
+        if !event.double_click && event.down {
+            match event.button {
+                NativeVideoMouseButton::Extra1 => {
+                    self.native_video_pointer_down = None;
+                    self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
+                    return;
+                }
+                NativeVideoMouseButton::Extra2 => {
+                    self.native_video_pointer_down = None;
+                    self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
+                    return;
+                }
+                _ => {}
+            }
+        }
         if event.button != NativeVideoMouseButton::Left {
             return;
         }
@@ -3073,7 +3097,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn mark_native_video_hud_activity(&mut self, ctx: &egui::Context) {
+    pub(crate) fn mark_native_video_hud_activity(&mut self, ctx: &egui::Context) {
         let now = std::time::Instant::now();
         // ネイティブビデオウィンドウのマウス/キー入力は eframe フルスクリーンビューポートの
         // input には現れないため、カーソル auto-hide のアクティビティタイマもここで更新する。

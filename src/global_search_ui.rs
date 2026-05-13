@@ -693,7 +693,7 @@ fn path_is_under_or_eq(child: &Path, ancestor: &Path) -> bool {
     child == ancestor || child.starts_with(ancestor)
 }
 
-/// フルスクリーンで開ける画像系アイテムか。Ctrl+↑↓ の飛び先判定に使う。
+/// フルスクリーンで開ける image-like アイテムか。Ctrl+↑↓ の飛び先判定に使う。
 fn is_fullscreen_target(item: Option<&GridItem>) -> bool {
     matches!(
         item,
@@ -930,6 +930,7 @@ impl App {
         if self.global_search.active {
             return;
         }
+        self.cancel_pending_folder_nav();
         // 他の検索バー (Ctrl+F / Ctrl+S) が開いていれば閉じる (相互排他)
         self.close_other_search_bars(crate::app::SearchMode::Global);
         self.global_search.active = true;
@@ -944,6 +945,7 @@ impl App {
         if !self.global_search.active {
             return;
         }
+        self.cancel_pending_folder_nav();
         // pending があれば SearchHandle の Drop impl で cancel される
         self.global_search.pending = None;
         self.global_search.active = false;
@@ -1230,6 +1232,7 @@ impl App {
     /// 実フォルダ全体ではなく「検索にヒットしたものだけ (+ ヒットを含む子フォルダ)」
     /// を表示する。
     pub(crate) fn drill_into_container(&mut self, container: PathBuf, is_zip: bool) {
+        self.cancel_pending_folder_nav();
         self.global_search.view = GlobalSearchView::DrilledInto {
             container_root: container.clone(),
             current_path: container,
@@ -1247,6 +1250,7 @@ impl App {
             ..
         } = self.global_search.view.clone()
         {
+            self.cancel_pending_folder_nav();
             self.global_search.view = GlobalSearchView::DrilledInto {
                 container_root,
                 current_path: sub_path,
@@ -1285,6 +1289,7 @@ impl App {
             ..
         } = self.global_search.view.clone()
         {
+            self.cancel_pending_folder_nav();
             self.global_search.view = GlobalSearchView::DrilledInto {
                 container_root,
                 current_path: p.to_path_buf(),
@@ -1300,6 +1305,7 @@ impl App {
 
     /// Aggregated view に戻る (drill-down 状態から)。
     pub(crate) fn drill_back_to_aggregated(&mut self) {
+        self.cancel_pending_folder_nav();
         // Ctrl+G drill-back は load_folder を経由しないため、suppression の subtree
         // 外判定が走らない。ユーザー視点では「本から出た」ので復元する (Codex High 指摘)。
         self.restore_rating_filter_suppression();
@@ -1337,6 +1343,7 @@ impl App {
                     // 経路でだけ復元する。
                     // 戻った先 (parent) で「直前に居たサブフォルダ」にカーソル復帰
                     self.global_search.restore_select_path = Some(current_path.clone());
+                    self.cancel_pending_folder_nav();
                     self.global_search.view = GlobalSearchView::DrilledInto {
                         container_root,
                         current_path: parent_pb,
@@ -1353,14 +1360,14 @@ impl App {
     }
 
     /// フルスクリーン中の Ctrl+↑↓: 絞り込みビューの next/prev フォルダに跨って
-    /// 移動し、その先頭 (forward) または末尾 (backward) の画像アイテムを
-    /// そのままフルスクリーンで開く。fs ツリー DFS (start_folder_nav) は検索
+    /// 移動し、その先頭 image-like をそのままフルスクリーンで開く。
+    /// fs ツリー DFS (start_folder_nav) は検索
     /// コンテナの外に出てしまうので、Ctrl+G 中はこちらのルートを使う。
     ///
-    /// 移動先に直接のヒット画像が 1 枚も無い (サブフォルダ配下にしかない) ケースは
-    /// スキップしてさらに次の候補に進む。画像が見つかるまで前後方向に進み、
-    /// フラットリスト全体に画像が無ければ元の位置に戻して何もしない。
-    pub(crate) fn global_search_ctrl_nav_fullscreen(&mut self, forward: bool) {
+    /// 移動先に直接の image-like が無い (サブフォルダ配下にしかない) ケースは
+    /// スキップしてさらに次の候補に進む。対象が見つかるまで前後方向に進み、
+    /// フラットリスト全体に対象が無ければ元の位置に戻して何もしない。
+    pub(crate) fn global_search_ctrl_nav_fullscreen(&mut self, ctx: &egui::Context, forward: bool) {
         let before_view = self.global_search.view.clone();
         loop {
             let prev_view = self.global_search.view.clone();
@@ -1379,21 +1386,14 @@ impl App {
                 return;
             }
             // rebuild_items_from_global_search 済みなので visible_indices を見て
-            // 画像アイテムがあるか判定する。無ければ次の候補へ。
-            let image_idx = if forward {
-                self.visible_indices
-                    .iter()
-                    .copied()
-                    .find(|&i| is_fullscreen_target(self.items.get(i)))
-            } else {
-                self.visible_indices
-                    .iter()
-                    .copied()
-                    .rev()
-                    .find(|&i| is_fullscreen_target(self.items.get(i)))
-            };
+            // image-like アイテムがあるか判定する。無ければ次の候補へ。
+            let image_idx = self
+                .visible_indices
+                .iter()
+                .copied()
+                .find(|&i| is_fullscreen_target(self.items.get(i)));
             if let Some(idx) = image_idx {
-                self.open_fullscreen(idx);
+                self.open_fullscreen_from_fs_navigation(ctx, idx);
                 self.selected = Some(idx);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
@@ -1449,6 +1449,7 @@ impl App {
                 None
             };
             if let Some(next_path) = within {
+                self.cancel_pending_folder_nav();
                 self.global_search.view = GlobalSearchView::DrilledInto {
                     container_root: container_root.clone(),
                     current_path: next_path,
@@ -1476,6 +1477,7 @@ impl App {
             current_path: next.path.clone(),
             is_zip: matches!(next.kind, SearchContainerKind::Zip),
         };
+        self.cancel_pending_folder_nav();
         self.rebuild_items_from_global_search();
     }
 
@@ -1804,6 +1806,7 @@ impl App {
             }
         }
         if query_changed {
+            self.cancel_pending_folder_nav();
             self.global_search.last_change_at = Some(Instant::now());
             // Codex P3 対応: クエリが変わったら drill state を即 Aggregated に戻し、
             // 旧検索の pending / containers / all_hits も直ちに破棄してから空の

@@ -4,6 +4,10 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 画像 (静止画 / アニメーション GIF / PDF / ZIP 内画像) と動画でアサインが
 異なる項目を一覧化し、整合性 / 不整合を明らかにする。
 
+フルスクリーン境界ヒント、Ctrl+S/F/G 検索スコープ、動画タイルモードまで含めた
+横断仕様と現状差分は [fullscreen-navigation-consistency.md](fullscreen-navigation-consistency.md)
+を参照すること。
+
 ## グリッドビュー (フルスクリーン外) 共通
 
 | キー | 動作 |
@@ -53,7 +57,7 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | <kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 30 秒シーク (大きい) | Phase 7.H |
 | <kbd>↑</kbd> / <kbd>↓</kbd> | **前 / 次のファイル** (画像と同じ、マウスホイールと同じ) | Phase 7.H |
 | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 音量 ±20% | |
-| <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 前 / 次のフォルダへ移動 | 画像と共通 |
+| <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 現在コンテキストの前 / 次フォルダまたは検索結果へ移動 | native presenter 経路でも有効 |
 | <kbd>M</kbd> | ミュート トグル | |
 | <kbd>L</kbd> | ループ再生 トグル | |
 | <kbd>B</kbd> | ブックマーク追加 (現在位置 🔖) | |
@@ -69,16 +73,21 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 |---|---|---|---|
 | <kbd>↑</kbd> / <kbd>↓</kbd> | 前 / 次ファイル | 前 / 次ファイル | ✅ 揃った |
 | マウスホイール | 前 / 次ファイル | 前 / 次ファイル | ✅ 揃った |
-| <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 前 / 次フォルダ | 前 / 次フォルダ | ✅ 揃った |
+| <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 前 / 次フォルダまたは検索結果 | 前 / 次フォルダまたは検索結果 | ✅ 揃った |
 | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 前 / 次ファイル (= ↑↓ と同義) | 音量 ±20% | ⚠ 残った差異 (許容、動画プレイヤー慣例) |
 | <kbd>←</kbd> / <kbd>→</kbd> | 前 / 次ファイル | 5 秒シーク | ⚠ 動画プレイヤー慣例 (mpv/VLC/YouTube) で許容 |
 | マウス左クリック | ページめくり | 再生 / 一時停止 | ⚠ 動画プレイヤー慣例で許容 |
 
 ## 設計メモ
 
-- 動画モードで ↑↓ をファイル移動に再アサインするためには、`handle_video_input` で
-  プレーンの ArrowUp/ArrowDown を **consume しない** ことで、後段の
-  `handle_image_keys` 内 `arrow_up`/`arrow_down` (line 1630-1637) に流す。
+- 動画モードで ↑↓ をファイル移動に再アサインする方針は、旧 egui 経路では
+  `handle_video_input` がプレーン ArrowUp/ArrowDown を consume せず後段へ流すことで
+  実現していた。現行 Windows native presenter 経路では
+  `app/native_video.rs::handle_native_video_key_event` が plain ↑↓ を直接
+  `navigate_native_video_fullscreen` に流している。
+- Ctrl+↑↓ も同じ思想で native key handler から
+  `handle_fullscreen_ctrl_nav_context` へ流し、フォルダ / Ctrl+S / Ctrl+G の
+  スコープ解決を画像系と共有する。
 - 5/1/30 秒シークの粒度は動画プレイヤー一般の慣例 (mpv: ←→=5s, Shift+←→=1s,
   ←/→ alone in YouTube=5s, J/L=10s) を踏襲しつつ、modifier で粒度切替できる
   ようにした。

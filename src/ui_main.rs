@@ -1034,6 +1034,7 @@ impl App {
 
                 // × ボタン
                 if ui.small_button("×").on_hover_text("検索を閉じる").clicked() {
+                    self.cancel_pending_folder_nav();
                     self.show_search_bar = false;
                     self.search_query.clear();
                     self.search_filter = None;
@@ -1070,6 +1071,7 @@ impl App {
 
                 // Esc で検索解除（ダイアログが開いていない場合のみ。IME 変換中もスキップ）
                 if !self.any_dialog_open() && escape_pressed {
+                    self.cancel_pending_folder_nav();
                     self.show_search_bar = false;
                     self.search_query.clear();
                     self.search_filter = None;

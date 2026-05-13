@@ -164,8 +164,9 @@ Ctrl+↑↓ は 3 つの起点から発火し、DFS 完了時に異なる後処�
 | モード | 発火元 | DFS 完了時の処理 |
 | --- | --- | --- |
 | `Grid` | `navigate()` の Ctrl+↑↓ (通常グリッド) | `load_folder(p)` のみ |
-| `Fullscreen` | `handle_fs_navigation` の Ctrl+↑↓ (フルスクリーン中) | `close_fullscreen` → `load_folder(p)` → `open_fullscreen(先頭/末尾 image-like idx)` |
-| `Favsearch { root }` | `favsearch_ctrl_nav` (お気に入り検索中) | `is_under(p, root)` が真なら `nav_stack.push + load_folder + update_favsearch_address`、偽なら `favsearch_navigate_sibling(±1)` |
+| `Fullscreen` | `handle_fs_navigation` の Ctrl+↑↓ (フルスクリーン中) | `close_fullscreen` → `load_folder(p)` → `open_fullscreen(先頭 image-like idx)` |
+| `Favsearch { root, fullscreen: false }` | `favsearch_ctrl_nav` (お気に入り検索中) | `is_under(p, root)` が真なら `nav_stack.push + load_folder + update_favsearch_address`、偽なら `favsearch_navigate_sibling(±1)` |
+| `Favsearch { root, fullscreen: true }` | フルスクリーン中の Ctrl+S スコープナビ | 上記に加えて `close_fullscreen` → `open_fullscreen(先頭 image-like idx)` でフルスクリーンを維持 |
 
 実装上の要点:
 
