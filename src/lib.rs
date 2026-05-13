@@ -67,6 +67,7 @@ pub mod search_query;
 pub mod search_walker;
 pub mod search_watcher;
 pub mod settings;
+pub mod settings_db;
 pub mod sidecar;
 pub mod stats;
 pub mod susie_loader;
