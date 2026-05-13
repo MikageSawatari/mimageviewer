@@ -2132,7 +2132,19 @@ impl Settings {
         self.vst3_chain_slots = std::mem::take(&mut src.vst3_chain_slots);
     }
 
+    #[track_caller]
     pub fn save(&self) {
+        // Phase 0 計装: `MIV_SETTINGS_SAVE_TRACE=1` で有効化、save() の caller を
+        // settings.log に記録する。Phase 3 の hot-path 最適化の必要性を実測判定するため。
+        // SQLite 移行完了 (Phase 6) で削除する。
+        if std::env::var_os("MIV_SETTINGS_SAVE_TRACE").is_some() {
+            let caller = std::panic::Location::caller();
+            settings_diag_log(&format!(
+                "settings: save called from {}:{}",
+                caller.file(),
+                caller.line()
+            ));
+        }
         // 起動時に main が I/O エラーで読めなかったケースでは、save() の副作用で
         // main を壊さないために本セッションは一切書き込まない (Codex P2 2026-05-09)。
         // rotate_backups の `settings.json -> bak1` rename が「アクセス不能なだけの
