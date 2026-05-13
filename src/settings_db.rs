@@ -413,6 +413,17 @@ impl SettingsDb {
         if slots_changed {
             write_vst3_chain_slots(&tx, &settings.vst3_chain_slots)?;
         }
+        // Codex P1 v6 (2026-05-13): `bootstrap_complete = '1'` を schema_meta に書く。
+        // この marker が **無いまま** RequireExisting で開かれた DB は「init_schema は
+        // 通ったが最初の save_full 前に crash した状態」と判別され、Corrupted 扱いで
+        // bak / JSON fallback に倒れる (= defaults 上書き事故の追加防御)。
+        // INSERT OR IGNORE で冪等 (= 2 回目以降は no-op)。schema_meta 自体は init_schema
+        // で作成済み。本 marker は **commit と同 transaction 内** で書く必要がある
+        // (= "save_full の中身が永続化された瞬間に marker も付く" 不変条件)。
+        tx.execute(
+            "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('bootstrap_complete', '1')",
+            [],
+        )?;
         // 補足: complex は読み捨ててもよいが、unused 警告を避けるために保持する
         // (= 将来 complex 側だけ partial save する API を追加するときに使う)。
         let _ = complex;
@@ -544,16 +555,22 @@ fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// `RequireExisting` モードで開いた DB が **既に initial schema を持つ既存ファイル** で
-/// あることを保証する。
+/// `RequireExisting` モードで開いた DB が **bootstrap 完了済み** (= 最初の save_full が
+/// 成功して中身が書かれた) 既存ファイルであることを保証する。
 ///
 /// SQLite は空ファイル (0 バイト) や形式上有効な空 DB を `Connection::open` で
-/// 受け付けてしまう。そのまま `init_schema` を走らせて defaults でロードすると、
-/// bak / JSON migration への fallback 経路が奪われる (Codex P3 v5 2026-05-13)。
+/// 受け付けてしまう。`init_schema` だけが走り `save_full` 前に crash したケースも
+/// 「テーブルとスキーマだけ存在し中身ゼロ」になる。そのまま defaults でロードすると
+/// bak / JSON migration への fallback 経路が奪われる
+/// (Codex P3 v5 + P1 v6 2026-05-13)。
 ///
-/// 判定: `schema_meta` テーブルに `schema_version` row が存在するか。Phase 2 以降の
-/// fresh-init は **必ず** `init_schema` でこの row を書き込む契約なので、欠落は
-/// 「partial-init or empty DB」を意味する。
+/// 判定段階:
+/// 1. `schema_meta` テーブルが存在するか (= 完全に空の DB 検出)
+/// 2. `schema_version` row があるか (= init_schema 終了確認、partial-init 検出)
+/// 3. `bootstrap_complete = '1'` row があるか (= 最初の save_full がコミットされたか)
+///
+/// 3 の marker は `save_full` の transaction 内で書く (= 中身と同じ瞬間に永続化される)。
+/// この三段確認で「init_schema 後 / save_full 前に crash」も Corrupted として bak 経路へ。
 fn ensure_existing_db_initialized(conn: &Connection) -> Result<(), SettingsDbError> {
     // schema_meta テーブル自体の存在をまず見る。
     let table_exists: bool = conn
@@ -593,6 +610,31 @@ fn ensure_existing_db_initialized(conn: &Connection) -> Result<(), SettingsDbErr
         log_diag("settings_db: RequireExisting open: schema_version row missing");
         return Err(SettingsDbError::Corrupted(
             "RequireExisting: schema_version row missing".to_string(),
+        ));
+    }
+    // bootstrap_complete marker (Codex P1 v6): save_full が **一度も commit を成功させて
+    // いない** 状態を検出する。`init_schema` だけ通って save_full 前に crash したケースは
+    // schema_version はあるがこの marker は無い。
+    let has_bootstrap: bool = conn
+        .query_row(
+            "SELECT 1 FROM schema_meta WHERE key = 'bootstrap_complete'",
+            [],
+            |_| Ok(true),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(false),
+            _ => Err(e),
+        })
+        .map_err(|e| {
+            classify_rusqlite_error_for_open(e, "ensure_existing_db_initialized:bootstrap")
+        })?;
+    if !has_bootstrap {
+        log_diag(
+            "settings_db: RequireExisting open: bootstrap_complete marker missing \
+             (init_schema ran but no save_full committed)",
+        );
+        return Err(SettingsDbError::Corrupted(
+            "RequireExisting: bootstrap_complete marker missing".to_string(),
         ));
     }
     Ok(())
@@ -1355,10 +1397,13 @@ mod tests {
     #[test]
     fn create_new_creates_missing_db() {
         // `create_new` は CREATE フラグ付きなので、最初に呼んだときに DB を作る。
+        // 続いて save_full を実行することで bootstrap_complete marker が書かれ、
+        // 後続の `open` (= RequireExisting) が成功するようになる。
         let dir = TempDir::new().unwrap();
-        let db = SettingsDb::create_new(dir.path()).unwrap();
-        // 後続の `open` は file 存在で成功する。
-        drop(db);
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+        }
         assert!(dir.path().join("settings.db").exists());
         let _db2 = SettingsDb::open(dir.path()).unwrap();
     }
@@ -1588,6 +1633,36 @@ mod tests {
             matches!(err, SettingsDbError::Corrupted(_)),
             "partial init should be Corrupted, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn require_existing_rejects_init_without_save() {
+        // Codex P1 v6 (2026-05-13): create_new で init_schema は走ったが、最初の
+        // save_full が呼ばれる前に crash 等で終了した状態。schema_version はあるが
+        // bootstrap_complete marker は無い。RequireExisting は Corrupted にすべき。
+        let dir = TempDir::new().unwrap();
+        // create_new は init_schema を走らせて schema_version を書くが、
+        // save_full を呼ばないまま drop すれば bootstrap_complete は付かない。
+        {
+            let _db = SettingsDb::create_new(dir.path()).unwrap();
+            // 意図的に save_full しない。
+        }
+        // settings.db ファイルは存在する。
+        assert!(dir.path().join("settings.db").exists());
+        let err = match SettingsDb::open(dir.path()) {
+            Ok(_) => panic!("init-without-save should not pass RequireExisting"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SettingsDbError::Corrupted(_)),
+            "init-without-save should be Corrupted, got: {err:?}"
+        );
+        // 一度 save_full すれば bootstrap_complete が付き、その後の open は成功する。
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+        }
+        let _ok = SettingsDb::open(dir.path()).expect("after save_full, open should succeed");
     }
 
     #[test]
