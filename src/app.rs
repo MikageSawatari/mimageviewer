@@ -5845,6 +5845,13 @@ impl App {
         if let Some(ref cat) = catalog_arc {
             self.setup_virtual_folder_seed_and_writeback(&source_path, cat, &cache_map);
         }
+        // Phase C: フォルダピンの source が Video の場合、video_pins DB の抽出済み
+        // WebP を folder の pinned cache key (`folderthumb:{dir}#pin:{source_id}`) で
+        // catalog + cache_map にミラーする。これにより worker は pinned_key で
+        // cache_hit して動画フレームをそのまま表示できる (= 動画自身を Shell API で
+        // 取り直す経路を踏まない)。`catalog_existing_keys` には既に pinned 形式が
+        // 含まれているので、直後の delete_missing がこの seed 行を消すことはない。
+        self.seed_folder_video_pin_thumbs(&cache_map, catalog_arc.as_ref());
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -6028,6 +6035,138 @@ impl App {
         // make_load_request からの per-frame DB ヒットを回避する。pin がレアケースで
         // 大半は empty なので、典型的なフォルダで HashMap は数百 bytes に収まる。
         self.refresh_folder_pin_map();
+    }
+
+    /// Phase C: フォルダピンの source が Video のときに、`video_pins` DB の WebP を
+    /// folder の pinned cache key で catalog + cache_map に書き込む。
+    ///
+    /// これを呼んだ直後、worker は通常の cache_hit 経路 (pinned_key で `cache_map`
+    /// を引く) で動画ピンフレームを取り出せる。`apply_folder_thumb_pin` の Video
+    /// 分岐は LoadRequest の `cache_key_override` / `mtime` / `file_size` を target
+    /// 動画のメタデータで埋めるので、ここで書き込んだ catalog 行と整合する。
+    ///
+    /// WebP が見つからない (= video_pin が登録されていない / blob が空) 場合は
+    /// seed をスキップ。worker は cache miss → `resolve_folder_thumb_image` で
+    /// folder 自身の自動代表サムネを生成する経路 (= base_req と同等) に落ちる。
+    fn seed_folder_video_pin_thumbs(
+        &self,
+        cache_map: &Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        >,
+        catalog: Option<&Arc<crate::catalog::CatalogDb>>,
+    ) {
+        if self.folder_pin_map.is_empty() {
+            return;
+        }
+        let Some(video_db) = self.video_pin_db.as_ref() else {
+            return;
+        };
+        let Some(cat) = catalog else {
+            return;
+        };
+        use crate::folder_thumb_pins::{FileKind, FolderPinSource, ResolvedKind};
+        let mut seeded = 0u32;
+        for item in &self.items {
+            let GridItem::Folder(container_path) = item else {
+                continue;
+            };
+            let container_key = crate::path_key::normalize_keep_drive(container_path);
+            let Some(source) = self.folder_pin_map.get(&container_key) else {
+                continue;
+            };
+            // Folder container + File source where kind = Video のみ対象
+            if !matches!(
+                source,
+                FolderPinSource::File {
+                    kind: FileKind::Video,
+                    ..
+                }
+            ) {
+                continue;
+            }
+            let Some(resolved) =
+                crate::folder_thumb_pins::resolve_pin_target(container_path, source)
+            else {
+                continue;
+            };
+            // 念のため (resolve_pin_target は File{Video} → ResolvedKind::Video のはず)
+            if !matches!(resolved.kind, ResolvedKind::Video) {
+                continue;
+            }
+            let Some(pin) = video_db.lookup(&resolved.abs_path) else {
+                continue;
+            };
+            if pin.thumb_webp.is_empty() {
+                continue;
+            }
+            let Some(fname) = container_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let pinned_key = format!(
+                "{}{}{}{}",
+                crate::thumb_loader::CACHE_KEY_FOLDER,
+                fname,
+                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+                resolved.source_id,
+            );
+            // 既存 seed が同じ identity (mtime/size) なら書き直さない (典型ケース)。
+            // 動画ファイルが差し替わった (mtime/size 更新) と video_pin が再生成された
+            // ときは source_id が変わるので、自然に新 pinned_key で seed され、古い
+            // 行は `delete_missing` (existing_keys に新 source_id しか入らない) で
+            // 掃除される。
+            let already_seeded = cache_map
+                .read()
+                .ok()
+                .and_then(|map| {
+                    map.get(&pinned_key).map(|entry| {
+                        entry.mtime == resolved.mtime && entry.file_size == resolved.file_size
+                    })
+                })
+                .unwrap_or(false);
+            if already_seeded {
+                continue;
+            }
+            match cat.save_thumb_bytes(
+                &pinned_key,
+                resolved.mtime,
+                resolved.file_size,
+                None,
+                &pin.thumb_webp,
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    crate::logger::log(format!(
+                        "folder_thumb_pin video seed: invalid WebP for {} (skip)",
+                        resolved.abs_path.display()
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "folder_thumb_pin video seed save failed: {e} ({})",
+                        resolved.abs_path.display()
+                    ));
+                    continue;
+                }
+            }
+            if let Ok(mut map) = cache_map.write() {
+                map.insert(
+                    pinned_key.clone(),
+                    crate::catalog::CacheEntry {
+                        mtime: resolved.mtime,
+                        file_size: resolved.file_size,
+                        jpeg_data: pin.thumb_webp.clone(),
+                        source_dims: None,
+                    },
+                );
+            }
+            seeded += 1;
+        }
+        if seeded > 0 {
+            crate::logger::log(format!(
+                "folder_thumb_pin: seeded {seeded} video pin WebPs into folder cache"
+            ));
+        }
     }
 
     /// 現在 items 中の親コンテナ (Folder/ZipFile/PdfFile) 分のピンを DB から
@@ -16129,8 +16268,7 @@ fn folder_thumb_existing_keys_for(
     let mut keys = vec![base_key.clone()];
     let container_key = crate::path_key::normalize_keep_drive(container_path);
     if let Some(source) = pin_map.get(&container_key) {
-        if let Some(resolved) =
-            crate::folder_thumb_pins::resolve_pin_target(container_path, source)
+        if let Some(resolved) = crate::folder_thumb_pins::resolve_pin_target(container_path, source)
         {
             keys.push(format!(
                 "{}{}{}",
@@ -16191,10 +16329,14 @@ fn pin_source_compatible_with_container(
 /// - `mtime` / `file_size` を target ファイル自身のものに差し替える (= catalog の
 ///   hit 判定が target metadata に対して行われる)。
 ///
-/// Phase B 注意:
-/// - Video pin (`ResolvedKind::Video`) は video worker 経由でないと正しく描画できない
-///   ため、Phase B では **pin なし扱い** で `base_req` を返す。Phase C で start_loading_items
-///   側に folder pin → video の別経路を組む予定。
+/// Phase C 注意:
+/// - Video pin (`ResolvedKind::Video`) は `seed_folder_video_pin_thumbs` が事前に
+///   `video_pins` DB の WebP を `folderthumb:{dir}#pin:{source_id}` で catalog + cache_map
+///   にミラーしているので、worker は通常の cache_hit 経路で動画フレームを取り出せる。
+///   ここで返す LoadRequest は `path = container` (folder) + `cache_key_override =
+///   pinned_key` + `mtime/file_size = 動画のもの` (= seed と整合)。
+///   seed が空 (video_pin 無し) の場合は cache miss → folder 自身の auto-pick に
+///   フォールバック (worker 内 `resolve_folder_thumb_image` が `req.path` = folder で動く)。
 /// - Folder source (`ResolvedKind::Folder`) は target サブフォルダで `FolderRepresentative`
 ///   strategy を実行する。**そのサブフォルダ自身の pin は引かない** ことで再帰を 1 段で
 ///   止める (= サイクル A↔B のような無限ループ防止)。pin_map が今フォルダの 1 階層分の
@@ -16234,17 +16376,45 @@ fn apply_folder_thumb_pin(
     use crate::folder_thumb_pins::ResolvedKind;
     use crate::thumb_loader::ResolveStrategy;
 
-    // Video pin は Phase C で配線。Phase B では fallback。
-    if matches!(resolved.kind, ResolvedKind::Video) {
-        return base_req;
-    }
-
     let pinned_key = format!(
         "{}{}{}",
         base_key,
         crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
         resolved.source_id,
     );
+
+    // Video pin は seed_folder_video_pin_thumbs が `pinned_key` で video_pins WebP を
+    // catalog + cache_map に書き込んでいる前提。worker はそのまま cache_hit で
+    // 動画フレームを取り出す。seed が空 (WebP 無し / blob 空) のときは cache miss →
+    // worker 内で `is_folder_thumb` 判定 (prefix が CACHE_KEY_FOLDER) が成立し、
+    // `resolve_folder_thumb_image(&req.path, ...)` が動いて folder 自身の auto-pick が
+    // pinned_key の下に保存される (= base_req と概ね同じ挙動)。
+    if matches!(resolved.kind, ResolvedKind::Video) {
+        // ZipFile / PdfFile 親コンテナの場合は Video pin は組合せ不可
+        // (`pin_source_compatible_with_container` で弾く) ので、ここに来る container
+        // は必ず Folder 種別。`path = container` のままで worker の prefix 判定が
+        // CACHE_KEY_FOLDER → is_folder_thumb=true となり、cache miss 時に
+        // resolve_folder_thumb_image(folder, sort, depth) が走る。
+        return LoadRequest {
+            path: container.to_path_buf(),
+            zip_entry: None,
+            pdf_page: None,
+            pdf_password: pdf_password.map(String::from),
+            cache_key_override: Some(pinned_key),
+            // mtime/size は target 動画のもの。seed_folder_video_pin_thumbs が同じ
+            // 値で catalog 行を書いているので、worker の cache_hit 比較が成立する。
+            mtime: resolved.mtime,
+            file_size: resolved.file_size,
+            resolve_override: None,
+            folder_thumb_sort: base_req.folder_thumb_sort,
+            folder_thumb_depth: base_req.folder_thumb_depth,
+            idx: base_req.idx,
+            skip_cache: base_req.skip_cache,
+            priority: base_req.priority,
+            input_seq: base_req.input_seq,
+            items_gen: base_req.items_gen,
+        };
+    }
 
     // dispatch field を target 種別ごとに組み立てる。
     let (resolve_override, zip_entry, pdf_page) = match resolved.kind {
@@ -16255,7 +16425,7 @@ fn apply_folder_thumb_pin(
         ResolvedKind::ZipEntry => (None, resolved.zip_entry.clone(), None),
         ResolvedKind::PdfPage => (None, None, resolved.pdf_page),
         // Video は上で early-return 済み
-        ResolvedKind::Video => return base_req,
+        ResolvedKind::Video => unreachable!("Video pin handled above"),
     };
 
     LoadRequest {

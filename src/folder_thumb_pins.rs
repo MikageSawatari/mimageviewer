@@ -26,7 +26,7 @@
 //! 検査を二重で行い、DB が手書きで汚染されていても解決パスがコンテナ外に
 //! 出ないようにする。
 
-use rusqlite::{params, Connection, Result as SqlResult};
+use rusqlite::{Connection, Result as SqlResult, params};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 
@@ -387,12 +387,7 @@ pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<
             } else {
                 container.join(zip_rel)
             };
-            (
-                abs_zip,
-                Some(entry.clone()),
-                None,
-                ResolvedKind::ZipEntry,
-            )
+            (abs_zip, Some(entry.clone()), None, ResolvedKind::ZipEntry)
         }
         FolderPinSource::PdfPage { pdf_rel, page } => {
             let abs_pdf = if pdf_rel.is_empty() {
@@ -1030,10 +1025,7 @@ mod tests {
     fn resolve_pin_target_image_returns_target_metadata() {
         use std::io::Write;
 
-        let tmp = std::env::temp_dir().join(format!(
-            "miv_pin_resolve_test_{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("miv_pin_resolve_test_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let img = tmp.join("cover.jpg");
         let mut f = std::fs::File::create(&img).unwrap();
@@ -1052,17 +1044,19 @@ mod tests {
         assert_eq!(resolved.file_size, b"fake-jpeg-bytes".len() as i64);
         assert!(resolved.source_id.starts_with("image|cover.jpg|-|-|"));
         // source_id に mtime と size が入っている
-        assert!(resolved.source_id.ends_with(&format!("|{}", b"fake-jpeg-bytes".len())));
+        assert!(
+            resolved
+                .source_id
+                .ends_with(&format!("|{}", b"fake-jpeg-bytes".len()))
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn resolve_pin_target_missing_returns_none() {
-        let tmp = std::env::temp_dir().join(format!(
-            "miv_pin_resolve_missing_{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("miv_pin_resolve_missing_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let source = FolderPinSource::File {
             rel: "nope.jpg".to_string(),
@@ -1075,10 +1069,8 @@ mod tests {
     #[test]
     fn resolve_pin_target_pdfpage_carries_page_number() {
         use std::io::Write;
-        let tmp = std::env::temp_dir().join(format!(
-            "miv_pin_resolve_pdfpage_{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("miv_pin_resolve_pdfpage_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let pdf = tmp.join("doc.pdf");
         std::fs::File::create(&pdf)
@@ -1099,10 +1091,8 @@ mod tests {
     #[test]
     fn resolve_pin_target_zipentry_in_container_uses_container_path() {
         use std::io::Write;
-        let tmp = std::env::temp_dir().join(format!(
-            "miv_pin_resolve_zipentry_{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("miv_pin_resolve_zipentry_{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
         let zip = tmp.join("scans.zip");
         std::fs::File::create(&zip)
