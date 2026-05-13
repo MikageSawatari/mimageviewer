@@ -434,6 +434,19 @@ impl Drop for SusieWorkerPool {
 
 static POOL: OnceLock<RwLock<Arc<SusieWorkerPool>>> = OnceLock::new();
 
+/// `init_pool` 完了フラグ + 待機用 Condvar (Codex P2 v14 2026-05-14)。
+///
+/// 旧版は `get_pool()` 側で `POOL.get_or_init(|| empty_pool())` していたため、
+/// `get_pool()` が `init_pool()` より先に呼ばれると **永久に empty_pool が
+/// 採用されてしまう** 競合があった (= main の susie-init background thread より早く
+/// 別 thread から `is_recognized_image_ext` 経由でアクセスするケース)。
+///
+/// 新版は `init_pool()` が完了するまで `get_pool()` を Condvar でブロックする。
+/// 5 秒の timeout で empty_pool fallback に倒し、テストパス (= init_pool 未呼の状態
+/// で `is_recognized_image_ext` を起動する) も hang しないようにする。
+static INIT_DONE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+static INIT_COND: std::sync::Condvar = std::sync::Condvar::new();
+
 /// プールを **明示的に** 初期化する (Phase 4: spec §8.2 2026-05-14)。
 ///
 /// 旧版 `get_pool()` は内部で `Settings::load()` を呼んでいたが、Phase 4 で並列
@@ -447,17 +460,72 @@ pub fn init_pool(enabled: bool, parallel: bool) {
             RwLock::new(Arc::new(empty_pool()))
         }
     });
+    // POOL 設定後に init_done を立てて Condvar を起こす。get_pool の待機者が
+    // 即座に進める。
+    {
+        let mut done = INIT_DONE.lock().unwrap_or_else(|e| e.into_inner());
+        *done = true;
+    }
+    INIT_COND.notify_all();
 }
 
 /// 初期化済みプールへのハンドルを返す (アプリ全体の Susie 経路で使う)。
 ///
-/// **`init_pool()` が事前に呼ばれている前提**。万一それより前に呼ばれた場合は
-/// 安全側として「無効化された (= 空) プール」を遅延初期化して返し、Susie 機能だけ
-/// silently 無効化する (= プロセス全体は引き続き動く)。`Settings::load()` には
-/// 戻さない (= boot race 防止、spec §8.2)。
+/// `init_pool()` がまだ完了していない場合は **完了まで block する** (Codex P2 v14)。
+/// 5 秒以上待っても init_pool が呼ばれなければ、テスト等で誰も init_pool を
+/// 呼ばないケースとして empty_pool に fallback する (= プロセス全体は動くが
+/// Susie 機能は無効化された状態で進行)。`Settings::load()` には戻らない
+/// (= boot race 防止、spec §8.2)。
 pub fn get_pool() -> Arc<SusieWorkerPool> {
-    let lock = POOL.get_or_init(|| RwLock::new(Arc::new(empty_pool())));
-    Arc::clone(&lock.read().unwrap())
+    // Fast-path: 既に init 完了済みなら即時返す。
+    {
+        let done = INIT_DONE.lock().unwrap_or_else(|e| e.into_inner());
+        if *done {
+            // POOL は init_pool で必ず populate されている前提だが、防御的に。
+            if let Some(rwlock) = POOL.get() {
+                return Arc::clone(&rwlock.read().unwrap());
+            }
+        }
+    }
+    // 待機 path: init_pool を待つ。timeout したら empty_pool。
+    // 本番: 5s (= 多プラグイン環境の handshake が完了するまで余裕を見る)
+    // テスト: 100ms (= init_pool 未呼のテスト経路で suite 全体が遅くなるのを防ぐ)
+    const INIT_TIMEOUT_MS: u64 = if cfg!(test) { 100 } else { 5000 };
+    let timeout = std::time::Duration::from_millis(INIT_TIMEOUT_MS);
+    let mut done = INIT_DONE.lock().unwrap_or_else(|e| e.into_inner());
+    while !*done {
+        let (g, result) = INIT_COND
+            .wait_timeout(done, timeout)
+            .unwrap_or_else(|e| {
+                // poison 経路: lock の中身を取り出して timeout 扱いで継続。
+                let g = e.into_inner();
+                let result = g.1;
+                (g.0, result)
+            });
+        done = g;
+        if result.timed_out() && !*done {
+            // timeout: empty_pool で永続化して終わる。
+            crate::logger::log(&format!(
+                "susie_loader: get_pool: init_pool not called within {INIT_TIMEOUT_MS}ms; \
+                 installing empty_pool fallback"
+            ));
+            POOL.get_or_init(|| RwLock::new(Arc::new(empty_pool())));
+            *done = true;
+            break;
+        }
+    }
+    let rwlock = POOL
+        .get()
+        .expect("POOL set by init_pool or timeout fallback");
+    Arc::clone(&rwlock.read().unwrap())
+}
+
+/// テスト用: `INIT_DONE` フラグをリセットして次回 `init_pool` を再走らせる。
+/// 本番では呼ばれない。
+#[cfg(test)]
+pub fn reset_init_for_test() {
+    let mut done = INIT_DONE.lock().unwrap_or_else(|e| e.into_inner());
+    *done = false;
 }
 
 /// プールが既に初期化されていれば `Some` を返す。未初期化なら `None` (spawn しない)。
