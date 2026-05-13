@@ -2824,18 +2824,29 @@ impl App {
             if self.slideshow_playing {
                 self.slideshow_playing = false;
             } else {
+                let mut checked_now = None;
                 match self.items.get(fs_idx) {
                     Some(GridItem::Image(_))
                     | Some(GridItem::Video(_))
                     | Some(GridItem::ZipImage { .. })
                     | Some(GridItem::PdfPage { .. }) => {
-                        if self.checked.contains(&fs_idx) {
+                        let checked = if self.checked.contains(&fs_idx) {
                             self.checked.remove(&fs_idx);
+                            false
                         } else {
                             self.checked.insert(fs_idx);
-                        }
+                            true
+                        };
+                        checked_now = Some(checked);
                     }
                     _ => {}
+                }
+                #[cfg(windows)]
+                if let Some(checked) = checked_now
+                    && matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+                    && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
+                {
+                    player.set_native_checked(checked);
                 }
             }
         }

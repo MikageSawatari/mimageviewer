@@ -577,6 +577,7 @@ impl Drop for KeyedMutexReadGuard {
 pub struct NativeOverlayInputRouting {
     pub wants_pointer_input: bool,
     pub wants_keyboard_input: bool,
+    pub text_input_active: bool,
 }
 
 pub struct NativeOverlayInputOutcome {
@@ -598,6 +599,34 @@ impl NativeOverlayInputOutcome {
             hud_regions: Vec::new(),
         }
     }
+}
+
+fn native_video_fullscreen_shortcut_key(
+    key: &crate::video::native_window::NativeVideoKeyEvent,
+) -> bool {
+    if key.alt {
+        return false;
+    }
+    matches!(
+        key.virtual_key,
+        0x0D // Enter
+            | 0x1B // Escape
+            | 0x20 // Space
+            | 0x23 // End
+            | 0x24 // Home
+            | 0x25 // Left
+            | 0x26 // Up
+            | 0x27 // Right
+            | 0x28 // Down
+            | 0x42 // B
+            | 0x4A // J
+            | 0x4B // K
+            | 0x4C // L
+            | 0x4D // M
+            | 0x50 // P
+            | 0x53 // S
+            | 0x57 // W
+    )
 }
 
 #[derive(Clone, Debug)]
@@ -697,10 +726,14 @@ impl NativeOverlayInputRouting {
         use crate::video::native_window::NativeVideoWindowEvent as NativeEvent;
 
         match event {
-            NativeEvent::KeyDown(_)
-            | NativeEvent::KeyUp(_)
-            | NativeEvent::Text(_)
-            | NativeEvent::Ime(_) => !self.wants_keyboard_input,
+            NativeEvent::KeyDown(key) | NativeEvent::KeyUp(key) => {
+                if !self.text_input_active && native_video_fullscreen_shortcut_key(key) {
+                    true
+                } else {
+                    !self.wants_keyboard_input
+                }
+            }
+            NativeEvent::Text(_) | NativeEvent::Ime(_) => !self.wants_keyboard_input,
             NativeEvent::MouseMove(_)
             | NativeEvent::MouseButton(_)
             | NativeEvent::MouseWheel(_)
@@ -2690,6 +2723,9 @@ impl NativeEguiOverlay {
             NativeEvent::KeyDown(key) | NativeEvent::KeyUp(key) => {
                 let modifiers = egui_modifiers(key.shift, key.ctrl, key.alt);
                 self.modifiers = modifiers;
+                if !self.text_input_active() && native_video_fullscreen_shortcut_key(&key) {
+                    return;
+                }
                 if let Some(egui_key) = egui_key_from_virtual_key(key.virtual_key) {
                     let pressed = matches!(event, NativeEvent::KeyDown(_));
                     self.pending_events.push(egui::Event::Key {
@@ -3565,7 +3601,12 @@ impl NativeEguiOverlay {
         NativeOverlayInputRouting {
             wants_pointer_input: self.wants_pointer_input,
             wants_keyboard_input: self.wants_keyboard_input,
+            text_input_active: self.text_input_active(),
         }
+    }
+
+    fn text_input_active(&self) -> bool {
+        self.bookmark_title_edit.is_some()
     }
 
     fn hud_visible(&self) -> bool {
@@ -5630,9 +5671,55 @@ fn channel_delta(a: u8, b: u8) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NativePixelSample, compare_pixel_probe, compute_video_visual_transform,
-        copy_cpu_rgba_to_swapchain_bgra, metadata_clean_text, sample_cpu_rgba_pixel,
+        NativeOverlayInputRouting, NativePixelSample, compare_pixel_probe,
+        compute_video_visual_transform, copy_cpu_rgba_to_swapchain_bgra, metadata_clean_text,
+        native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel,
     };
+    use crate::video::native_window::{NativeVideoKeyEvent, NativeVideoWindowEvent};
+
+    fn key(virtual_key: u32) -> NativeVideoKeyEvent {
+        NativeVideoKeyEvent {
+            virtual_key,
+            shift: false,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn native_overlay_routes_shortcuts_even_when_button_has_focus() {
+        let routing = NativeOverlayInputRouting {
+            wants_keyboard_input: true,
+            text_input_active: false,
+            ..Default::default()
+        };
+
+        assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x20))));
+        assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x0D))));
+        assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x41))));
+    }
+
+    #[test]
+    fn native_overlay_keeps_shortcuts_while_text_input_is_active() {
+        let routing = NativeOverlayInputRouting {
+            wants_keyboard_input: true,
+            text_input_active: true,
+            ..Default::default()
+        };
+
+        assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x20))));
+        assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x0D))));
+    }
+
+    #[test]
+    fn native_video_fullscreen_shortcut_key_ignores_alt_combos() {
+        let mut event = key(0x20);
+        assert!(native_video_fullscreen_shortcut_key(&event));
+
+        event.alt = true;
+        assert!(!native_video_fullscreen_shortcut_key(&event));
+    }
 
     /// 1:1 SAR では従来の isotropic transform と一致 (regression-safe を保証)。
     #[test]
