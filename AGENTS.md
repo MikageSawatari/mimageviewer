@@ -61,6 +61,11 @@ always-active guidance.
 ## Git
 
 - Keep commits focused and do not include unrelated untracked files.
+- When the user asks to commit, make the requested commit and make sure it is
+  merged into the local `master` branch as part of the same task, unless the
+  user explicitly asks to leave it on a feature/worktree branch or the merge is
+  blocked by conflicts or unrelated dirty worktree changes. Do not push or open
+  a PR unless explicitly requested.
 - Prefer committing completed, coherent chunks promptly, even before the user
   starts manual verification, when the change has been implemented and the
   relevant automated checks pass. This keeps rollback points easy to identify.
