@@ -1369,7 +1369,7 @@ pub(super) fn draw_native_toast(
     overlay_width_points: f32,
     overlay_height_points: f32,
     toast: &NativeOverlayToast,
-) {
+) -> Option<egui::Rect> {
     let elapsed = toast.started_at.elapsed().as_secs_f32();
     let duration = if toast.centered { 2.5 } else { 1.8 };
     let alpha = if elapsed > duration - 0.35 {
@@ -1378,8 +1378,9 @@ pub(super) fn draw_native_toast(
         1.0
     };
     if alpha <= 0.0 {
-        return;
+        return None;
     }
+    let mut drawn_rect = None;
     // interactable(false) でこの Area がクリックイベントを奪わないようにする。
     // 旧: set_min_size で画面全体を Area として確保していたため、トースト表示中は
     //     overlay の他のボタン (ループ / 再生 / etc.) クリックがこの Area に消費されていた。
@@ -1408,13 +1409,23 @@ pub(super) fn draw_native_toast(
                 galley.size().y + padding.y * 2.0,
             );
             let rect = if toast.centered {
-                egui::Rect::from_center_size(full_rect.center(), size)
+                // 中央 (full_rect.center().y) はレジューム picker の二重円
+                // (半径 56) と完全に被る。HUD top バー (上端 ~60px) と picker top
+                // (center_y - 56) の間に収めるため、上から 30% の位置に置く。
+                // 最小 80px は極端に低い窓 (= 30% が HUD バーに食い込む) 用の床。
+                let centered_y = (full_rect.min.y + full_rect.height() * 0.30)
+                    .max(full_rect.min.y + 80.0);
+                egui::Rect::from_center_size(
+                    egui::pos2(full_rect.center().x, centered_y),
+                    size,
+                )
             } else {
                 egui::Rect::from_min_size(
                     egui::pos2(full_rect.max.x - size.x - 20.0, full_rect.min.y + 62.0),
                     size,
                 )
             };
+            drawn_rect = Some(rect.expand(4.0));
             painter.rect_filled(
                 rect,
                 8.0,
@@ -1428,6 +1439,7 @@ pub(super) fn draw_native_toast(
                 egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 255.0) as u8),
             );
         });
+    drawn_rect
 }
 
 /// 音量ノーマライズ スキャン中の進捗パネル (中央表示)。

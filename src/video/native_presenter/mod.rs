@@ -295,6 +295,10 @@ struct NativeEguiOverlay {
     /// 「ボタン上部左右の不要な HUD 入力領域」を作らず VST 入力干渉を最小化する。
     /// `None` なら paused center 非表示。
     last_drawn_paused_center_rects: Option<[egui::Rect; 3]>,
+    /// 直近 egui run で描画した toast の actual rect。
+    /// HUD HWND は `SetWindowRgn` で領域外が物理的に clip されるため、toast も
+    /// region に含めないと他 UI の region に重なった部分だけが見える。
+    last_drawn_toast_rect: Option<egui::Rect>,
     /// 直近 egui run で描画した playback speed popup の actual rect。
     /// speed ボタンは下 HUD 右側にあるため、中央固定の概算 region だと popup が
     /// SetWindowRgn 外に落ちて見えたり、click hit-test が不安定になったりする。
@@ -2723,6 +2727,7 @@ impl NativeEguiOverlay {
             last_drawn_vst3_panel_rect: None,
             last_emitted_vst3_panel_pos: None,
             last_drawn_paused_center_rects: None,
+            last_drawn_toast_rect: None,
             last_drawn_speed_popup_rect: None,
             hover_thumbnail: None,
             hover_texture: None,
@@ -3709,6 +3714,22 @@ impl NativeEguiOverlay {
             }
         }
 
+        if self.toast.is_some() {
+            if let Some(rect) = self.last_drawn_toast_rect {
+                regions.push(rect_to_px(rect));
+            } else {
+                // 初回フレーム fallback: draw_native_toast が actual rect を記録する前に
+                // region 計算だけ走る場合でも、toast が他 UI の region だけに切り抜かれて
+                // 表示されないよう中央帯を確保する。次回描画後は実 rect に置き換わる。
+                let toast_w = width_points.min(760.0).max(320.0);
+                let toast_h = 92.0;
+                regions.push(rect_to_px(egui::Rect::from_center_size(
+                    egui::pos2(width_points * 0.5, height_points * 0.5),
+                    egui::vec2(toast_w, toast_h),
+                )));
+            }
+        }
+
         // VST3 panel: ドラッグ可能化 (= 2026-05-12 A) に伴い、`last_drawn_vst3_panel_rect`
         // (実描画後の actual rect) を優先で region に使う。`None` の場合は `native_vst3_panel_rect`
         // (デフォルト位置) に fallback。これで panel がデフォルト位置にあってもドラッグ後でも
@@ -4141,6 +4162,7 @@ impl NativeEguiOverlay {
         // の実描画 rect を記録して `compute_hud_regions` に渡す。200×200pt 固定 region では
         // ボタン外側 ~29pt + ヒント帯が SetWindowRgn でクリップされる症状の修正。
         let mut last_drawn_paused_center_rects: Option<[egui::Rect; 3]> = None;
+        let mut last_drawn_toast_rect: Option<egui::Rect> = None;
         let mut last_drawn_speed_popup_rect: Option<egui::Rect> = None;
         if !overlay_visible {
             self.set_visual_attached(false)?;
@@ -4318,7 +4340,8 @@ impl NativeEguiOverlay {
                 );
             }
             if let Some(toast) = toast.as_ref() {
-                draw_native_toast(ctx, overlay_width_points, overlay_height_points, toast);
+                last_drawn_toast_rect =
+                    draw_native_toast(ctx, overlay_width_points, overlay_height_points, toast);
             }
             if right_panel_visible && let Some(metadata) = video_metadata.as_ref() {
                 draw_native_metadata_panel(
@@ -5251,6 +5274,7 @@ impl NativeEguiOverlay {
         self.last_drawn_vst3_panel_rect = last_drawn_vst3_panel_rect;
         self.last_emitted_vst3_panel_pos = last_emitted_vst3_panel_pos;
         self.last_drawn_paused_center_rects = last_drawn_paused_center_rects;
+        self.last_drawn_toast_rect = last_drawn_toast_rect;
         self.last_drawn_speed_popup_rect = last_drawn_speed_popup_rect;
         self.video_speed_popup_open = video_speed_popup_open;
         self.frame_step_hold = frame_step_hold;
