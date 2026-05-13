@@ -2626,7 +2626,8 @@ impl App {
             // perform the same item navigation without involving egui input.
             0x26 if key.shift && !key.ctrl => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    let v = (player.volume() + 0.20).min(crate::settings::VIDEO_VOLUME_MAX);
+                    let v =
+                        crate::settings::step_video_volume_by_fader_key_step(player.volume(), 1);
                     player.set_volume(v);
                     self.settings.video_volume = v;
                     self.settings.save();
@@ -2634,7 +2635,8 @@ impl App {
             }
             0x28 if key.shift && !key.ctrl => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    let v = (player.volume() - 0.20).max(0.0);
+                    let v =
+                        crate::settings::step_video_volume_by_fader_key_step(player.volume(), -1);
                     player.set_volume(v);
                     self.settings.video_volume = v;
                     self.settings.save();

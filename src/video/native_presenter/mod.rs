@@ -60,6 +60,7 @@ const SHARED_TEXTURE_CACHE_CAPACITY: usize = 64;
 pub const CURSOR_HIDE_IDLE_SECS: f32 = 3.0;
 const SEEK_STATUS_DELAY: Duration = Duration::from_millis(150);
 const SEEK_STATUS_MIN_VISIBLE: Duration = Duration::from_millis(300);
+const LIMITER_INDICATOR_VISIBLE: Duration = Duration::from_millis(500);
 
 fn seek_status_visible_for_times(
     is_seeking: bool,
@@ -72,6 +73,17 @@ fn seek_status_visible_for_times(
     let held_after_completion =
         visible_since.is_some_and(|shown| now.duration_since(shown) < SEEK_STATUS_MIN_VISIBLE);
     active_after_delay || held_after_completion
+}
+
+fn format_video_volume_db_compact(volume: f64) -> String {
+    let db = crate::settings::video_volume_linear_to_db(volume);
+    if db <= crate::settings::VIDEO_VOLUME_MUTE_DB + 0.05 {
+        "-∞dB".to_string()
+    } else if db.abs() < 0.05 {
+        "0.0dB".to_string()
+    } else {
+        format!("{db:+.1}dB")
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -240,6 +252,8 @@ struct NativeEguiOverlay {
     video_is_playing: bool,
     video_volume: f64,
     video_muted: bool,
+    video_limiter_ceiling_hit_seq: u64,
+    video_limiter_visible_until: Option<Instant>,
     video_playback_speed: f64,
     video_frame_step_active: bool,
     initial_pause_controls_pending: bool,
@@ -1909,6 +1923,7 @@ impl NativeVideoPresenter {
         is_playing: bool,
         volume: f64,
         muted: bool,
+        limiter_ceiling_hit_seq: u64,
         playback_speed: f64,
         frame_step_active: bool,
         initial_pause_controls_pending: bool,
@@ -1922,6 +1937,7 @@ impl NativeVideoPresenter {
                 is_playing,
                 volume,
                 muted,
+                limiter_ceiling_hit_seq,
                 playback_speed,
                 frame_step_active,
                 initial_pause_controls_pending,
@@ -2063,6 +2079,7 @@ impl NativeVideoPresenter {
         is_playing: bool,
         volume: f64,
         muted: bool,
+        limiter_ceiling_hit_seq: u64,
         playback_speed: f64,
         frame_step_active: bool,
         initial_pause_controls_pending: bool,
@@ -2078,6 +2095,7 @@ impl NativeVideoPresenter {
                 is_playing,
                 volume,
                 muted,
+                limiter_ceiling_hit_seq,
                 playback_speed,
                 frame_step_active,
                 initial_pause_controls_pending,
@@ -2690,6 +2708,8 @@ impl NativeEguiOverlay {
             video_is_playing: false,
             video_volume: 1.0,
             video_muted: false,
+            video_limiter_ceiling_hit_seq: 0,
+            video_limiter_visible_until: None,
             video_playback_speed: 1.0,
             video_frame_step_active: false,
             initial_pause_controls_pending: false,
@@ -2926,6 +2946,7 @@ impl NativeEguiOverlay {
         is_playing: bool,
         volume: f64,
         muted: bool,
+        limiter_ceiling_hit_seq: u64,
         playback_speed: f64,
         frame_step_active: bool,
         initial_pause_controls_pending: bool,
@@ -2942,6 +2963,7 @@ impl NativeEguiOverlay {
         let playing_changed = self.video_is_playing != is_playing;
         let volume_changed = (self.video_volume - volume).abs() >= 0.005;
         let muted_changed = self.video_muted != muted;
+        let limiter_changed = self.video_limiter_ceiling_hit_seq != limiter_ceiling_hit_seq;
         let speed_changed = (self.video_playback_speed - playback_speed).abs() >= 1.0e-6;
         let frame_step_changed = self.video_frame_step_active != frame_step_active;
         let initial_pause_changed =
@@ -2963,6 +2985,14 @@ impl NativeEguiOverlay {
         self.video_is_playing = is_playing;
         self.video_volume = volume;
         self.video_muted = muted;
+        if limiter_changed {
+            if limiter_ceiling_hit_seq > self.video_limiter_ceiling_hit_seq {
+                self.video_limiter_visible_until = now.checked_add(LIMITER_INDICATOR_VISIBLE);
+            } else {
+                self.video_limiter_visible_until = None;
+            }
+        }
+        self.video_limiter_ceiling_hit_seq = limiter_ceiling_hit_seq;
         self.video_playback_speed = playback_speed;
         self.video_frame_step_active = frame_step_active;
         self.initial_pause_controls_pending = initial_pause_controls_pending;
@@ -2981,6 +3011,7 @@ impl NativeEguiOverlay {
             || playing_changed
             || volume_changed
             || muted_changed
+            || limiter_changed
             || speed_changed
             || frame_step_changed
             || initial_pause_changed
@@ -2990,6 +3021,7 @@ impl NativeEguiOverlay {
             self.dirty = true;
         }
         self.schedule_seek_status_repaint(now);
+        self.schedule_limiter_indicator_repaint(now);
     }
 
     fn native_pos(&self, x: i32, y: i32) -> egui::Pos2 {
@@ -3222,6 +3254,29 @@ impl NativeEguiOverlay {
         }
     }
 
+    fn limiter_indicator_visible_at(&mut self, now: Instant) -> bool {
+        if let Some(until) = self.video_limiter_visible_until {
+            if now < until {
+                return true;
+            }
+            self.video_limiter_visible_until = None;
+            self.dirty = true;
+        }
+        false
+    }
+
+    fn schedule_limiter_indicator_repaint(&mut self, now: Instant) {
+        if let Some(deadline) = self
+            .video_limiter_visible_until
+            .filter(|deadline| *deadline > now)
+        {
+            self.next_repaint_deadline = Some(
+                self.next_repaint_deadline
+                    .map_or(deadline, |current| current.min(deadline)),
+            );
+        }
+    }
+
     fn update_seek_status_for_render(&mut self, now: Instant) -> bool {
         let active_after_delay = self.video_is_seeking
             && self
@@ -3387,6 +3442,7 @@ impl NativeEguiOverlay {
             || !self.first_frame_presented
             || self.video_is_seeking
             || self.seek_status_visible_since.is_some()
+            || self.video_limiter_visible_until.is_some()
             // カーソル auto-hide のカウントダウン中、および 3 秒経過後でもまだ
             // SetCursor(None) を 1 度も打てていない場合は tick を継続する。
             // - cursor_last_activity が Some && !cursor_hidden:
@@ -4033,6 +4089,7 @@ impl NativeEguiOverlay {
         let frame_step_active = self.video_frame_step_active;
         let volume = self.video_volume;
         let muted = self.video_muted;
+        let limiter_ceiling_hit = self.limiter_indicator_visible_at(render_t0);
         let playback_speed = self.video_playback_speed;
         let checked = self.video_checked;
         let loop_enabled = self.video_loop_enabled;
@@ -4220,12 +4277,8 @@ impl NativeEguiOverlay {
                 // 等) は出す。元実装は早期 return で line 4342 の draw_native_toast に
                 // 到達しなかったため、タイル末尾に達してもユーザーへの feedback がゼロだった。
                 if let Some(toast) = toast.as_ref() {
-                    last_drawn_toast_rect = draw_native_toast(
-                        ctx,
-                        overlay_width_points,
-                        overlay_height_points,
-                        toast,
-                    );
+                    last_drawn_toast_rect =
+                        draw_native_toast(ctx, overlay_width_points, overlay_height_points, toast);
                 }
                 return;
             }
@@ -4598,8 +4651,9 @@ impl NativeEguiOverlay {
                         }
 
                         let time_w = 132.0;
-                        let vol_pct_w = 40.0;
-                        let vol_slider_w = 90.0;
+                        let vol_label_w = 60.0;
+                        let limiter_indicator_w = 14.0;
+                        let vol_slider_w = 144.0;
                         let mute_w = btn_size;
                         let norm_w = btn_size; // 音量ノーマライズボタン (mute と同じサイズ)
                         let speed_w = btn_size * 1.55;
@@ -4613,7 +4667,8 @@ impl NativeEguiOverlay {
                             + gap
                             + vol_slider_w
                             + gap
-                            + vol_pct_w;
+                            + vol_label_w
+                            + limiter_indicator_w;
                         let right_controls_x = hud_rect.max.x - side_pad - right_controls_w;
                         let bar_min_x = x;
                         let bar_max_x = (right_controls_x - gap).max(bar_min_x + 1.0);
@@ -5127,9 +5182,10 @@ impl NativeEguiOverlay {
 
                         painter.rect_filled(vol_rect, 2.0, egui::Color32::from_gray(74));
                         let volume = finite_video_volume(volume);
-                        let max_volume = crate::settings::VIDEO_VOLUME_MAX;
-                        let normal_frac = (1.0 / max_volume) as f32;
-                        let normal_fill_frac = (volume.min(1.0) / max_volume) as f32;
+                        let volume_pos =
+                            crate::settings::video_volume_linear_to_fader_pos(volume) as f32;
+                        let zero_frac = crate::settings::video_volume_db_to_fader_pos(0.0) as f32;
+                        let normal_fill_frac = volume_pos.min(zero_frac);
                         if normal_fill_frac > 0.0 {
                             let normal_fill = egui::Rect::from_min_max(
                                 vol_rect.min,
@@ -5144,15 +5200,14 @@ impl NativeEguiOverlay {
                                 egui::Color32::from_rgb(220, 220, 220),
                             );
                         }
-                        if volume > 1.0 {
-                            let boost_fill_frac = (volume / max_volume) as f32;
+                        if volume_pos > zero_frac {
                             let boost_fill = egui::Rect::from_min_max(
                                 egui::pos2(
-                                    vol_rect.min.x + vol_rect.width() * normal_frac,
+                                    vol_rect.min.x + vol_rect.width() * zero_frac,
                                     vol_rect.min.y,
                                 ),
                                 egui::pos2(
-                                    vol_rect.min.x + vol_rect.width() * boost_fill_frac,
+                                    vol_rect.min.x + vol_rect.width() * volume_pos,
                                     vol_rect.max.y,
                                 ),
                             );
@@ -5162,14 +5217,31 @@ impl NativeEguiOverlay {
                                 egui::Color32::from_rgb(255, 198, 62),
                             );
                         }
-                        let normal_x = vol_rect.min.x + vol_rect.width() * normal_frac;
-                        painter.line_segment(
-                            [
-                                egui::pos2(normal_x, vol_rect.min.y - 3.0),
-                                egui::pos2(normal_x, vol_rect.max.y + 3.0),
-                            ],
-                            egui::Stroke::new(1.0, egui::Color32::from_gray(150)),
-                        );
+                        for &db in &crate::settings::VIDEO_VOLUME_FADER_DB_MARKS {
+                            let frac = crate::settings::video_volume_db_to_fader_pos(db) as f32;
+                            let x = vol_rect.min.x + vol_rect.width() * frac;
+                            let tick_h = if db == 0.0 {
+                                8.0
+                            } else if db > 0.0 {
+                                6.0
+                            } else {
+                                4.0
+                            };
+                            let color = if db == 0.0 {
+                                egui::Color32::from_gray(170)
+                            } else if db > 0.0 {
+                                egui::Color32::from_rgb(220, 170, 70)
+                            } else {
+                                egui::Color32::from_gray(118)
+                            };
+                            painter.line_segment(
+                                [
+                                    egui::pos2(x, vol_rect.center().y - tick_h * 0.5),
+                                    egui::pos2(x, vol_rect.center().y + tick_h * 0.5),
+                                ],
+                                egui::Stroke::new(1.0, color),
+                            );
+                        }
                         let vol_resp = ui.interact(
                             vol_rect.expand2(egui::vec2(0.0, 10.0)),
                             egui::Id::new("native_video_volume"),
@@ -5179,7 +5251,7 @@ impl NativeEguiOverlay {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                         }
                         let vol_resp = vol_resp.on_hover_text(
-                            "音量 (右クリック / ダブルクリックで 100%) [Shift+↑ / Shift+↓]",
+                            "音量 (右クリック / ダブルクリックで 0dB) [Shift+↑ / Shift+↓]",
                         );
                         if vol_resp.secondary_clicked() || vol_resp.double_clicked() {
                             self.last_volume_target = Some(1.0);
@@ -5190,9 +5262,10 @@ impl NativeEguiOverlay {
                         } else if (vol_resp.clicked() || vol_resp.dragged())
                             && let Some(pos) = vol_resp.interact_pointer_pos()
                         {
-                            let value = ((pos.x - vol_rect.min.x) / vol_rect.width())
-                                .clamp(0.0, 1.0) as f64
-                                * max_volume;
+                            let value = crate::settings::video_volume_fader_pos_to_linear(
+                                ((pos.x - vol_rect.min.x) / vol_rect.width()).clamp(0.0, 1.0)
+                                    as f64,
+                            );
                             self.last_volume_target = Some(value);
                             commands.push(NativeOverlayCommand::SetVolume {
                                 volume: value,
@@ -5206,17 +5279,39 @@ impl NativeEguiOverlay {
                                 persist: true,
                             });
                         }
+                        let volume_label = format_video_volume_db_compact(volume);
+                        let volume_label_color = if volume > 1.0 {
+                            egui::Color32::from_rgb(255, 210, 80)
+                        } else {
+                            egui::Color32::from_rgb(238, 238, 238)
+                        };
                         painter.text(
-                            egui::pos2(vol_rect.max.x + gap, text_center_y),
-                            egui::Align2::LEFT_CENTER,
-                            format!("{:>3}%", (volume * 100.0).round() as i32),
+                            egui::pos2(vol_rect.max.x + gap + vol_label_w, text_center_y),
+                            egui::Align2::RIGHT_CENTER,
+                            volume_label,
                             egui::FontId::proportional(13.0),
-                            if volume > 1.0 {
-                                egui::Color32::from_rgb(255, 210, 80)
-                            } else {
-                                egui::Color32::from_rgb(238, 238, 238)
-                            },
+                            volume_label_color,
                         );
+                        let limiter_rect = egui::Rect::from_center_size(
+                            egui::pos2(
+                                vol_rect.max.x + gap + vol_label_w + limiter_indicator_w * 0.5,
+                                center_y,
+                            ),
+                            egui::vec2(limiter_indicator_w, btn_size),
+                        );
+                        if limiter_ceiling_hit {
+                            let limiter_resp = ui.interact(
+                                limiter_rect,
+                                egui::Id::new("native_video_limiter_indicator"),
+                                egui::Sense::hover(),
+                            );
+                            painter.circle_filled(
+                                limiter_rect.center(),
+                                if limiter_resp.hovered() { 4.5 } else { 4.0 },
+                                egui::Color32::from_rgb(255, 72, 72),
+                            );
+                            limiter_resp.on_hover_text("出力リミッターが作動しました");
+                        }
 
                         if cfg!(debug_assertions) {
                             let pointer = pointer_pos
@@ -5263,7 +5358,9 @@ impl NativeEguiOverlay {
         } else {
             Instant::now().checked_add(repaint_delay)
         };
-        self.schedule_seek_status_repaint(Instant::now());
+        let now = Instant::now();
+        self.schedule_seek_status_repaint(now);
+        self.schedule_limiter_indicator_repaint(now);
         if hud_repaint_debug_enabled() && repaint_delay != Duration::MAX {
             crate::logger::log(format!(
                 "[HUD-DEBUG] egui repaint_delay={:?} pending={} dirty_after_run={}",

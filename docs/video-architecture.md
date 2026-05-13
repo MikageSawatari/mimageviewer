@@ -425,10 +425,14 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   `DspBridge::process_block` 経由で bridge プロセスに送り、戻ってきた処理済みサンプルを
   ring buffer に push する (= IPC roundtrip ~1-2ms、AudioBuffer processed queue 100ms
   で吸収)
-- 動画音量は 0〜150% の手動調整。100% 超の分は `audio-pump` で safety limiter の前に
-  preamp gain として掛け、`fill_output` 側の RT 音量は最大 100% に抑える。これにより
-  100% 以下の音量変更は従来通り低レイテンシで、boost 時だけ limiter の 5ms lookahead を
-  PDC latency として扱う。
+- 動画音量は -∞dB〜+18dB の dB フェーダーで手動調整する。保存値は既存互換のため
+  `Settings.video_volume` の線形ゲインのまま保持し、UI で dB フェーダー位置へ相互変換する。
+  0dB 超の分は `audio-pump` で safety limiter の前に preamp gain として掛け、
+  `fill_output` 側の RT 音量は最大 0dB に抑える。これにより 0dB 以下の音量変更は従来通り
+  低レイテンシで、boost 時だけ limiter の 5ms lookahead を PDC latency として扱う。
+  safety limiter が最終出力の ceiling 超過を検出した場合は `AvClock` の sequence を増やし、
+  native HUD の音量表示右側に赤いインジケータを約 500ms 表示する。ユーザー音量が低く、
+  最終出力が ceiling 未満に収まる場合は indicator だけを出さない。
 - 現在フレームのクリップボードコピーは `screenshot.rs` の one-shot worker で別 FFmpeg
   input を開き、最後に表示済みの source pts 近傍をフル解像度 RGBA に変換してから
   既存の CF_DIB clipboard helper へ渡す。メイン decode queue / native presenter の GPU
@@ -778,7 +782,7 @@ cloaked にしていた場合は、`close_fullscreen` 内で先に uncloak し�
 - `Settings.video_rtx_vsr` (= VSR ON/OFF トグル、撤回により不要)
 
 維持する設定項目:
-- `Settings.video_volume` (音量。既定 1.0、手動 boost 上限 1.5)
+- `Settings.video_volume` (音量。既定 1.0 = 0dB、手動 boost 上限は +18dB 相当の線形ゲイン)
 - `Settings.video_loop_mode` (ループ再生モード: Off / Full / Chapter / Bookmark)。
   旧 `Settings.video_loop: bool` は移行用に残存し、`Settings::load()` 内の
   `migrate_legacy_video_loop` で `video_loop=true && video_loop_mode==Off` を Full へ昇格。

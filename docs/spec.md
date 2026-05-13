@@ -157,9 +157,11 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
   bwdif フィルタの動的状態 (適用中 / プログレッシブ / 待機中 / 失敗) の組み合わせ表示。
   HW デコード + デインターレース ON 時は decoder backend が HW のまま、フレーム表示は
   CPU (= D3D11 → CPU 転送 + bwdif + swscale + CPU upload) になる。
-- 動画音量は既定 100%。下部 HUD / Shift+↑↓ / 環境設定から 0〜150% で手動調整でき、
-  音量バーの右クリックまたはダブルクリックで 100% に戻せる。100% 超の boost 部分は
-  HUD で黄色表示し、音声ポンプ側の safety limiter を通す。
+- 動画音量は既定 0dB。下部 HUD / Shift+↑↓ / 環境設定から -∞dB〜+18dB の
+  dB フェーダーで手動調整でき、音量バーの右クリックまたはダブルクリックで 0dB に戻せる。
+  0dB 超の boost 部分は HUD で黄色表示し、音声ポンプ側の safety limiter を通す。
+  safety limiter が最終出力の ceiling 超過を検出した場合は音量表示右側に赤い
+  インジケータを約 500ms 表示する。
 - VST3 が有効なとき、動画再生中の VST3 パネルからチェーンの ON/OFF、個別 GUI 表示、
   動画の右上 1/4 表示を切り替えられる。パネル位置はドラッグ終了時に保存され、
   次回表示時に復元する。解像度やモニター構成変更で画面外になる場合は画面内へ戻す。
@@ -423,7 +425,7 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
 |--------|-----|---------|------|
 | `parallelism` | Parallelism | Auto | 並列読み込みスレッド数 |
 | `folder_skip_limit` | usize | 5 | Ctrl+↑↓ で空フォルダ・画像なし ZIP をスキップする上限（UI 上限 30） |
-| `video_volume` | f64 | 1.0 | 動画再生時の既定音量（0.0〜1.5）。1.0 超は手動 boost として safety limiter 前で適用 |
+| `video_volume` | f64 | 1.0 | 動画再生時の既定音量（線形ゲイン。UI は -∞dB〜+18dB の dB フェーダー）。1.0 超は手動 boost として safety limiter 前で適用 |
 | `video_deinterlace` | VideoDeinterlaceMode | Auto | 動画再生時のデインターレース（Off / Auto / On）。Auto は frame interlaced flag と stream field_order を参照し、Auto/On は FFmpeg bwdif を表示前に適用 |
 | `audio_normalize_enabled` | bool | false | 動画音量ノーマライズのグローバル ON/OFF。ON のとき、open / Norm ボタン押下で per-file 測定値 (`audio_normalize.db`) を引いて -14 LUFS 相当に gain 適用 |
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |

@@ -1413,12 +1413,9 @@ pub(super) fn draw_native_toast(
                 // (半径 56) と完全に被る。HUD top バー (上端 ~60px) と picker top
                 // (center_y - 56) の間に収めるため、上から 30% の位置に置く。
                 // 最小 80px は極端に低い窓 (= 30% が HUD バーに食い込む) 用の床。
-                let centered_y = (full_rect.min.y + full_rect.height() * 0.30)
-                    .max(full_rect.min.y + 80.0);
-                egui::Rect::from_center_size(
-                    egui::pos2(full_rect.center().x, centered_y),
-                    size,
-                )
+                let centered_y =
+                    (full_rect.min.y + full_rect.height() * 0.30).max(full_rect.min.y + 80.0);
+                egui::Rect::from_center_size(egui::pos2(full_rect.center().x, centered_y), size)
             } else {
                 egui::Rect::from_min_size(
                     egui::pos2(full_rect.max.x - size.x - 20.0, full_rect.min.y + 62.0),

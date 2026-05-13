@@ -5581,11 +5581,15 @@ impl App {
             Some(FsCacheEntry::Video { player, .. }) => player.volume(),
             _ => return,
         };
-        // Phase 7.H: 音量は Shift+↑↓ 限定 (= 20% step)。プレーン ↑↓ はファイル移動。
+        // Phase 7.H: 音量は Shift+↑↓ 限定 (= dB fader key step)。プレーン ↑↓ はファイル移動。
         let new_vol = if shift_up {
-            Some((cur_volume + 0.20).min(crate::settings::VIDEO_VOLUME_MAX))
+            Some(crate::settings::step_video_volume_by_fader_key_step(
+                cur_volume, 1,
+            ))
         } else if shift_down {
-            Some((cur_volume - 0.20).max(0.0))
+            Some(crate::settings::step_video_volume_by_fader_key_step(
+                cur_volume, -1,
+            ))
         } else {
             None
         };

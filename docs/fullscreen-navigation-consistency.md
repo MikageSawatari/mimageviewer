@@ -52,7 +52,7 @@ Windows の現行動画フルスクリーンは native presenter 経路。
 | --- | --- |
 | ホイール / plain ↑↓ | 同一 `visible_indices` 内の前後アイテムへ移動 |
 | ←→ | seek。Ctrl+←→ は 30 秒 seek、Shift+←→ は 1 秒 seek |
-| Shift+↑↓ | 音量 ±20% |
+| Shift+↑↓ | 音量を dB フェーダー目盛りの 1/4 幅で上下 |
 | Ctrl+↑↓ | `handle_fullscreen_ctrl_nav_context` 経由で画像系と同じコンテキスト移動 |
 | マウス戻る / 進む | native window / HUD 側の XButton を App 側で Ctrl+↑↓ と同じ経路へ接続 |
 | S | 動画タイルモード ON/OFF |

@@ -8722,10 +8722,7 @@ impl App {
             // native 動画 fullscreen 中は中央ヒントが見えないので toast でも feedback。
             #[cfg(windows)]
             if self.native_video_fullscreen_active_for_main_backdrop() {
-                self.show_native_video_overlay_toast(
-                    Self::native_boundary_hint_text(hint),
-                    true,
-                );
+                self.show_native_video_overlay_toast(Self::native_boundary_hint_text(hint), true);
             }
             self.clear_pending_folder_nav_steps();
             // 同上: items_generation 不変のまま return するので明示 release (Codex P1)。
