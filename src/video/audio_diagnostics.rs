@@ -45,8 +45,9 @@ pub struct AudioDiagnostics {
     /// Norm 操作で audio buffer 経由の big jump (= cap で拘束される現象) のとき、この値が
     /// `master_clock.now_secs()` から大きく乖離する。
     pub audio_audible_pts_bits: AtomicU64,
-    /// `audio_audible_pts_bits` が一度でも書かれたか (= audio active かどうかの軽量フラグ)。
-    /// 動画 only ファイル / cpal 起動失敗ケースを overlay 側で除外するため。
+    /// `audio_audible_pts_bits` が直近 clear 以降に書かれており、audio/video offset
+    /// を計算できるか。動画 only / cpal 起動失敗に加え、seek / buffer clear 直後も
+    /// false になる。audio stream の active 判定には使わない。
     pub audio_audible_pts_valid: AtomicBool,
 
     /// `audio_audible_pts − master_clock.now_secs()` を ms で保持 (`f64::to_bits`)。
@@ -128,7 +129,8 @@ impl AudioDiagnostics {
     }
 
     /// 直近の audio audible PTS (= drain 中の chunk の最新 PTS)。
-    /// `audio_audible_pts_valid` が false なら `None` (= 音声 inactive)。
+    /// `audio_audible_pts_valid` が false なら `None` (= 音声 inactive または
+    /// seek / buffer clear 直後で offset 未確定)。
     pub fn load_audio_audible_pts(&self) -> Option<f64> {
         if !self.audio_audible_pts_valid.load(Ordering::Acquire) {
             return None;
@@ -195,11 +197,11 @@ pub struct OverlayDiagnostics {
 }
 
 impl OverlayDiagnostics {
-    pub fn from(diag: &AudioDiagnostics) -> Self {
+    pub fn from_diagnostics(diag: &AudioDiagnostics, audio_active: bool) -> Self {
         Self {
             av_drift_ms: diag.load_av_drift_ms(),
             av_offset_ms: diag.load_av_offset_ms(),
-            audio_active: diag.load_audio_audible_pts().is_some(),
+            audio_active,
             audio_lead_ms: diag.load_audio_lead_ms(),
             audio_underrun_active: diag.load_underrun_active(),
         }
@@ -264,7 +266,7 @@ mod tests {
             .store((1.25_f64).to_bits(), Ordering::Release);
         diag.audio_audible_pts_valid.store(true, Ordering::Release);
         diag.audio_underrun_active.store(true, Ordering::Release);
-        let view = OverlayDiagnostics::from(&diag);
+        let view = OverlayDiagnostics::from_diagnostics(&diag, true);
         assert!((view.av_drift_ms - (-7.5)).abs() < 0.01);
         assert!(view.audio_active);
         assert!(view.audio_underrun_active);
@@ -303,10 +305,11 @@ mod tests {
             0.0,
             "audio_lead_ms must reset to 0 after clear"
         );
-        // overlay 側も None を観測する
-        let view = OverlayDiagnostics::from(&diag);
+        // overlay 側も offset は None として観測するが、audio stream の active 判定は
+        // caller が clock から明示的に渡す。
+        let view = OverlayDiagnostics::from_diagnostics(&diag, true);
         assert!(view.av_offset_ms.is_none());
-        assert!(!view.audio_active);
+        assert!(view.audio_active);
     }
 
     #[test]

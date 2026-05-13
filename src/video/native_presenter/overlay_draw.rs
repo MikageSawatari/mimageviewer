@@ -75,13 +75,23 @@ pub(super) fn draw_native_perf_overlay(
             // Norm clear バグなど audio が clock から乖離した場面で値が変わらず、
             // 「音と映像がズレているのに数値が動かない」という体感と乖離する。
             // 詳細は `docs/video-architecture.md` の「A/V drift 計装」節参照。
-            painter.text(
-                panel_rect.min + egui::vec2(10.0, 25.0),
-                egui::Align2::LEFT_TOP,
+            const LEAD_VISIBLE_MIN_WIDTH: f32 = 380.0;
+            const GROUP_GAP: f32 = 24.0; // A/V グループと lead / UNDERRUN グループの間
+            let audio_active = latest.audio_active;
+            let underrun_active = audio_active && latest.audio_underrun_active;
+            let wide_enough_for_status = panel_rect.width() >= LEAD_VISIBLE_MIN_WIDTH;
+            let clock_text = if underrun_active && !wide_enough_for_status {
+                format!("late {:.1}ms", latest.max_late_ms)
+            } else {
                 format!(
                     "clock late {:.1}ms  max dt {:.1}ms",
                     latest.max_late_ms, latest.max_interval_ms
-                ),
+                )
+            };
+            painter.text(
+                panel_rect.min + egui::vec2(10.0, 25.0),
+                egui::Align2::LEFT_TOP,
+                clock_text,
                 egui::FontId::monospace(10.0),
                 egui::Color32::from_rgb(168, 176, 188),
             );
@@ -118,7 +128,6 @@ pub(super) fn draw_native_perf_overlay(
                 egui::Color32::from_rgb(255, 112, 112) // 赤
             };
             let av_label = if av_offset_finite { "A/V" } else { "vid" };
-            let audio_active = latest.audio_active;
             // value は padding なし。slot 右端で右寄せ → 文字数変化で左端だけ動く (= label と干渉せず)。
             let av_value_text = format!("{:+.1}ms", display_value);
             let av_value_right = panel_rect.min.x + panel_rect.width() - 10.0;
@@ -146,11 +155,9 @@ pub(super) fn draw_native_perf_overlay(
             //
             // ⚠ レイアウト: label "lead" + value_slot (= A/V と同じ 70px slot)。
             // av_label の左端から GROUP_GAP 左に lead value slot の右端を置く。
-            const LEAD_VISIBLE_MIN_WIDTH: f32 = 380.0;
-            const GROUP_GAP: f32 = 24.0; // A/V グループと lead グループの間
-            let wide_enough_for_status = panel_rect.width() >= LEAD_VISIBLE_MIN_WIDTH;
-            let show_underrun =
-                audio_active && latest.audio_underrun_active && wide_enough_for_status;
+            // UNDERRUN は critical warning なので狭幅でも表示し、左の clock 表示を短縮して
+            // 重なりを避ける。lead は通常診断値なので狭幅では省略する。
+            let show_underrun = underrun_active;
             let show_lead = audio_active && !show_underrun && wide_enough_for_status;
             // av_label の x 位置を保守的に概算 (3 char ≈ 21px)。
             let av_label_left_approx = av_value_left - LABEL_VALUE_GAP - 24.0;

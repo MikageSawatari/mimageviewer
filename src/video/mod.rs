@@ -2284,9 +2284,14 @@ fn run_native_video_output(
 
                     if crate::perf::is_enabled() {
                         let log_now = Instant::now();
-                        // 「big」判定は av_offset (= 体感ズレ) を主とし、audio inactive 時のみ
-                        // 旧 av_drift_ms にフォールバック。
-                        let cur_big_value = av_offset_ms_opt.unwrap_or(av_drift_ms).abs();
+                        // 「big」判定は av_offset (= 体感ズレ) を主とする。audio inactive
+                        // なら旧 av_drift_ms にフォールバックするが、seek / buffer clear
+                        // 直後の offset 未確定中は edge 判定を出さない。
+                        let cur_big_value = match av_offset_ms_opt {
+                            Some(v) => v.abs(),
+                            None if !audio_active => av_drift_ms.abs(),
+                            None => 0.0,
+                        };
                         let big = cur_big_value > 30.0;
                         let big_edge = big && !source.last_av_drift_was_big;
                         source.last_av_drift_was_big = big;
