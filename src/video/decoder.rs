@@ -21,11 +21,77 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, TryRecvError, bounded};
 
 use super::clock::AvClock;
+
+/// 同時に走っている **video decode thread** (= `run_video_decode`) の数。
+///
+/// 2026-05-13 の調査で、fast-swap 連射 (= ホイール連射) で video decode thread の
+/// `avcodec_send_packet` が hard-stuck する事象が確認された。原因は旧 fast-swap で
+/// 残された stuck thread が D3D11VA 周辺リソース (AVCodecContext + hw_frames_ctx の
+/// surface pool、共有 GpuVideoDevice の video processor slot 等) を解放しないまま
+/// 居座り、新 HW decoder の `avcodec_send_packet` が driver 内で永続待機に入る、
+/// という contention パターン。`VideoPlayer::drop` は `cancel` フラグを立てるだけで
+/// `JoinHandle` を保持しないので、FFmpeg 内停止中の thread は cancel を観測できず、
+/// リソースを返さない。
+///
+/// 本カウンタは video decode thread の入口で `+1`、関数終了直前 (RAII guard で
+/// パニック含めて確実に呼ぶ) に `-1` する。`run_decoder` (demux thread) は数えない:
+/// 実際に stuck するのは `avcodec_send_packet` を呼ぶ video decode thread だけで、
+/// demux thread は packet queue が詰まれば普通に停止する (= cancel 観測可能)。
+///
+/// fast-swap 側 (`try_start_native_video_fast_swap`) はこのカウンタを参照し、閾値を
+/// 超えていれば新規 swap を抑制する。
+pub static LIVE_VIDEO_DECODE_THREADS: AtomicUsize = AtomicUsize::new(0);
+
+/// `run_video_decode` の入口で `new()`、関数 return / unwind 時に `drop()` で
+/// `LIVE_VIDEO_DECODE_THREADS` を ±1 する RAII guard。
+pub(crate) struct VideoDecodeAliveGuard;
+
+impl VideoDecodeAliveGuard {
+    pub(crate) fn new() -> Self {
+        let prev = LIVE_VIDEO_DECODE_THREADS.fetch_add(1, Ordering::AcqRel);
+        crate::logger::log(format!(
+            "[decoder-lifecycle] video-decode thread spawn: live_count={}",
+            prev + 1
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "decoder_lifecycle",
+                "video_decode_spawn",
+                None,
+                0,
+                &[("live_count", serde_json::Value::from((prev + 1) as i64))],
+            );
+        }
+        Self
+    }
+}
+
+impl Drop for VideoDecodeAliveGuard {
+    fn drop(&mut self) {
+        let prev = LIVE_VIDEO_DECODE_THREADS.fetch_sub(1, Ordering::AcqRel);
+        crate::logger::log(format!(
+            "[decoder-lifecycle] video-decode thread exit: live_count={}",
+            prev.saturating_sub(1)
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "decoder_lifecycle",
+                "video_decode_exit",
+                None,
+                0,
+                &[(
+                    "live_count",
+                    serde_json::Value::from(prev.saturating_sub(1) as i64),
+                )],
+            );
+        }
+    }
+}
 
 const AUDIO_PACKET_QUEUE_CAP: usize = 64;
 const VIDEO_PACKET_QUEUE_CAP: usize = 32;
@@ -2690,6 +2756,12 @@ fn run_video_decode(
     use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
     use ffmpeg::util::frame::video::Video;
     use ffmpeg_the_third as ffmpeg;
+
+    // LIVE_VIDEO_DECODE_THREADS の生存範囲を関数全体に揃える RAII guard。関数 return /
+    // panic / 早期 return すべてで Drop が走り、`-1` が確実に発火する。fast-swap 側は
+    // 本カウンタを参照して連射時の HW decoder 同時起動数を上限で抑える
+    // (try_start_native_video_fast_swap 参照)。
+    let _alive_guard = VideoDecodeAliveGuard::new();
 
     let mut scaler: Option<ScaleContext> = None;
     let mut scaler_key: Option<(Pixel, u32, u32)> = None;

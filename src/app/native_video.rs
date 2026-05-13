@@ -3050,6 +3050,20 @@ impl App {
             return None;
         };
 
+        // 旧 player を **新 VideoPlayer / 新 video-decode thread を作る前に** drop する
+        // (2026-05-13 fix)。VideoPlayer::drop は `cancel` フラグを Release で立てるだけで
+        // join しない (= FFmpeg 内停止中の旧 thread は cancel を観測できずに残り続ける)
+        // が、`cancel` をできるだけ早く立てておくと、(1) 旧 thread が安全点に居れば
+        // 早めに自発 exit する、(2) live decoder count の throttle (= 新 swap 抑制)
+        // が新 video decode thread の spawn 前にもう 1 つ古い枠を空けやすくなる、という
+        // 2 つの効果がある。旧コードはここで drop せず末尾の `fs_cache.remove(&from_idx)`
+        // まで遅延していたため、新 video decode thread と旧 thread の生存期間が
+        // build_video_player_for_open + attach + switch_native_source 全工程分だけ
+        // 不必要に重なっていた。
+        if from_idx != target_idx {
+            self.fs_cache.remove(&from_idx);
+        }
+
         let source_epoch = self.next_native_video_source_epoch();
         let started_at = std::time::Instant::now();
         let mut new_player = self.build_video_player_for_open(
@@ -3127,9 +3141,8 @@ impl App {
         self.sync_native_video_vst3_available(target_idx);
         self.sync_native_video_vst3_panel(target_idx);
 
-        if from_idx != target_idx {
-            self.fs_cache.remove(&from_idx);
-        }
+        // (旧 fs_cache.remove(&from_idx) はこの commit で take_native_output 直後に
+        // 移動。詳細は上のコメント参照。)
         crate::logger::log(format!(
             "[native-video] fast source swap queued: reason={reason} from={from_idx} to={target_idx} epoch={source_epoch}"
         ));
@@ -3149,6 +3162,10 @@ impl App {
         ctx: &egui::Context,
         target_idx: usize,
     ) -> bool {
+        // tile fast-swap も regular fast-swap と同じ video decode thread を spawn する
+        // ため、`try_start_native_video_fast_swap` と同じ live count 上限で抑制する。
+        // ただし throttle は「これは tile fast-swap の候補」と確定したあとに見る
+        // (Codex P1 反映 — tile モード外や画像 target で誤発火しないように)。
         if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
             return true;
         }
@@ -3161,6 +3178,25 @@ impl App {
         if self.video_tile_state.is_none() {
             return false;
         }
+        // tile fast-swap は target/from が動画前提だが、念のため明示チェック。
+        // `start_native_video_source_swap` 内でも同じチェックがあるが、ここで先に判定
+        // しないと下の throttle が誤発火する。
+        if !matches!(self.items.get(target_idx), Some(GridItem::Video(_)))
+            || !matches!(self.items.get(from_idx), Some(GridItem::Video(_)))
+        {
+            return false;
+        }
+
+        const MAX_LIVE_VIDEO_DECODE_THREADS: usize = 3;
+        let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
+            .load(std::sync::atomic::Ordering::Acquire);
+        if live_decoders >= MAX_LIVE_VIDEO_DECODE_THREADS {
+            crate::logger::log(format!(
+                "[native-video] fast tile swap throttled: live_video_decode_threads={live_decoders} max={MAX_LIVE_VIDEO_DECODE_THREADS} target_idx={target_idx}"
+            ));
+            return true;
+        }
+
         let Some(started) =
             self.start_native_video_source_swap(ctx, target_idx, Some(false), true, "tile")
         else {
@@ -3192,6 +3228,10 @@ impl App {
         ctx: &egui::Context,
         target_idx: usize,
     ) -> bool {
+        // Gate checks first: 「これは本当に video→video fast-swap の候補か」が確定する
+        // までは throttle 判定もしない。`live_count >= MAX` のときに throttle が早く
+        // 走ると、動画→画像のような fast-swap 対象外の navigation まで握り潰してしまう
+        // (Codex P1 反映)。
         if self.native_video_fast_swap_pending.is_some() || self.video_tile_swap_pending.is_some() {
             return true;
         }
@@ -3204,6 +3244,56 @@ impl App {
         if from_idx == target_idx {
             return true;
         }
+        // 動画→動画 fast-swap でないなら通常 open 経路に流す。`start_native_video_source_swap`
+        // 内でも同じチェックがあるが、ここで先に判定しないと下の throttle が誤発火する。
+        if !matches!(self.items.get(target_idx), Some(GridItem::Video(_)))
+            || !matches!(self.items.get(from_idx), Some(GridItem::Video(_)))
+        {
+            return false;
+        }
+
+        // fast-swap 連射で HW decoder context (D3D11VA surface pool / video processor
+        // slot) が短時間に重なり、新 video decode thread の `avcodec_send_packet` が
+        // driver 内で永続待機する事象がある (2026-05-13 ログ調査)。`VideoPlayer::drop`
+        // が cancel フラグを立てても、FFmpeg 内停止中の旧 thread は cancel を観測できず
+        // 居座るので、`LIVE_VIDEO_DECODE_THREADS` が上限を超えていれば新 swap を抑制する。
+        //
+        // 上限は「現在再生中 1 + transient swap 中 1〜2」をすべて含めた **総 live 数** で
+        // カウントしている。よって MAX=3 は「stuck 3 個」ではなく「in-flight 合計 3 個」の
+        // 意。stuck と再生中の player を区別しない単純カウントで実装している。
+        const MAX_LIVE_VIDEO_DECODE_THREADS: usize = 3;
+        let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
+            .load(std::sync::atomic::Ordering::Acquire);
+        if live_decoders >= MAX_LIVE_VIDEO_DECODE_THREADS {
+            crate::logger::log(format!(
+                "[native-video] fast video swap throttled: live_video_decode_threads={live_decoders} max={MAX_LIVE_VIDEO_DECODE_THREADS} target_idx={target_idx}"
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "native_video",
+                    "fast_swap_throttled",
+                    None,
+                    0,
+                    &[
+                        (
+                            "live_video_decode_threads",
+                            serde_json::Value::from(live_decoders as i64),
+                        ),
+                        (
+                            "max",
+                            serde_json::Value::from(MAX_LIVE_VIDEO_DECODE_THREADS as i64),
+                        ),
+                        ("target_idx", serde_json::Value::from(target_idx as i64)),
+                    ],
+                );
+            }
+            // 「ホイール event を握り潰す」ため true (= 上位の `open_native_video_fullscreen_from_navigation`
+            // が traditional open に fallback しないようにする)。traditional open は更に
+            // 旧 VideoPlayer を evict + 新 video-decode thread を spawn するので throttle
+            // 中に通すと contention を悪化させる。
+            return true;
+        }
+
         let Some(started) =
             self.start_native_video_source_swap(ctx, target_idx, None, false, "navigation")
         else {

@@ -339,6 +339,53 @@ P キーの perf overlay にも codec / decoder / HW-SW / GPU-CPU / D3D11VA 候�
 AV1 などで `libdav1d` 等の SW decoder が選ばれているのか、H.264/HEVC 等で本来 HW 候補が
 あるのに fallback しているのかを切り分けるための初期診断として使う。
 
+**fast-swap 時の HW decoder lifecycle 制御** (2026-05-13 追加):
+fullscreen 動画から動画へホイール連射で fast-swap を重ねたとき、video decode thread の
+`avcodec_send_packet` が hard-stuck する事象が観察された。原因は旧 fast-swap で残された
+stuck thread が D3D11VA 周辺リソース (AVCodecContext + hw_frames_ctx の surface pool、
+共有 GpuVideoDevice の video processor slot 等) を解放しないまま居座り、新 HW decoder の
+`avcodec_send_packet` が driver 内で永続待機に入る、という contention パターン。
+`VideoPlayer::drop` は `cancel` フラグを Release で立てるだけで `JoinHandle` を保持しない
+ため、FFmpeg 内停止中の旧 thread は cancel を観測できずリソースを返さない。
+
+対策は 2 段構え:
+
+1. **`LIVE_VIDEO_DECODE_THREADS` カウンタによる throttle**
+   `src/video/decoder.rs` のグローバル `AtomicUsize` で生存中の `run_video_decode` 数を
+   追跡する。`VideoDecodeAliveGuard` RAII guard が関数入口で `+1`、関数終了 / panic
+   unwind で確実に `-1` する。`try_start_native_video_fast_swap` /
+   `try_start_video_tile_fast_swap` は `MAX_LIVE_VIDEO_DECODE_THREADS=3` を超えていれば
+   新規 swap を no-op で抑制する。本カウンタは **正常再生中の player の thread も含めた
+   総 live 数**で、stuck/正常を区別しない単純カウント。したがって 3 という閾値は
+   「stuck 3 個」ではなく「現在再生中 1 + transient な fast-swap 中 1〜2」を含む合計上限
+   になる。正常時は old thread が次々と exit するため count は 1〜2 を上下し、throttle に
+   抵触しない。throttle 判定は「target / from がともに動画」と確定した後に行うため、
+   動画→画像のような fast-swap 対象外の navigation は影響を受けない (Codex P1 review 反映)。
+   `true` を返して上位の `open_native_video_fullscreen_from_navigation` が traditional
+   open 経路 (= 更に decoder thread を増やす) に fallback しないようにする。stuck thread
+   が抜けるまでユーザーのホイール event は握り潰される (= 「ホイールが一瞬反応しない」
+   体感) が、SW fallback には**絶対に落とさない**: 個別 open でなら HW で動く動画を勝手
+   に SW に切り替えると seek 性能が大きく劣化するため。
+
+2. **旧 player の eager drop**
+   `start_native_video_source_swap` は `take_native_output` で旧 player から
+   `NativeVideoOutput` を抜いた直後、`build_video_player_for_open` で新 player を作る
+   **前**に `fs_cache.remove(&from_idx)` を呼ぶ。旧 `VideoPlayer::drop` の cancel フラグ
+   設定が新 video decode thread の spawn より前に起き、旧 thread が安全点に居れば
+   早めに自発 exit する。旧コードは末尾まで drop を遅延していたため、新旧 thread の
+   生存期間が build + attach + switch 全工程分だけ不必要に重なっていた。
+
+stuck thread を能動的に殺す手段は無い (FFmpeg context を他 thread から close するのは
+クラッシュリスク)。live count が 3 まで累積した状態 (= 例: stuck 2 + 現在再生中 1) で
+fast-swap は session 内では永続的に no-op になる: その場合ユーザーはアプリ再起動が必要。
+これは通常の使用パターンでは到達しないが、driver bug 等で root cause が直接抜けない
+場合の最終形として記録しておく。
+
+JoinHandle 保持 + background cleanup pool による join-with-timeout は将来追加候補で、
+カウントが永続的に高止まりするときの「stuck と判定して count を強制的にリセットする」
+診断系を追加するときに合わせて入れる。本対策は cancel 観測可能な thread の自発 exit に
+依存して count を回す最小実装。
+
 **pacing 設計**: 既存の Phase 8.K 仕様 (`PACE_LEAD_SECS=0.30` / `AUDIO_SAFE_LO=0.25` /
 `SEEK_BURST_LEAD_MAX_SECS=0.20` / `post_seek_frame_sent` flag / generation race
 check) は **そのまま video decode thread に移植**。動作対象だけが変わる (= 旧構造の
