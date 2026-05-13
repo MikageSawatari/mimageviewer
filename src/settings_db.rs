@@ -79,6 +79,12 @@ pub enum SettingsDbError {
     Corrupted(String),
     /// 権限エラー (% APPDATA% が ReadOnly 等)。
     Permission(rusqlite::Error),
+    /// `create_new` が呼ばれたが既に bootstrap 済み DB が存在する状態
+    /// (Codex P2 v7 2026-05-13)。Phase 2 の decision tree が family を transient で
+    /// 見逃して clean install 経路に倒れたケースを検出する。**この変種を受けた呼び出し側は
+    /// `save_full` を呼んではならない** (= ユーザー設定の上書きを防ぐ)。`open()` で
+    /// 開き直すか、上層で別の fallback を試す。
+    AlreadyBootstrapped,
     /// その他の rusqlite エラー。
     Rusqlite(rusqlite::Error),
     /// JSON ラウンドトリップ失敗。
@@ -93,6 +99,9 @@ impl std::fmt::Display for SettingsDbError {
             Self::Transient(e) => write!(f, "transient sqlite error: {e}"),
             Self::Corrupted(msg) => write!(f, "settings.db corrupted: {msg}"),
             Self::Permission(e) => write!(f, "permission denied: {e}"),
+            Self::AlreadyBootstrapped => {
+                write!(f, "create_new called on already-bootstrapped settings.db")
+            }
             Self::Rusqlite(e) => write!(f, "sqlite error: {e}"),
             Self::Serde(e) => write!(f, "serde_json error: {e}"),
             Self::Poisoned => write!(f, "settings db mutex poisoned"),
@@ -105,7 +114,7 @@ impl std::error::Error for SettingsDbError {
         match self {
             Self::Transient(e) | Self::Permission(e) | Self::Rusqlite(e) => Some(e),
             Self::Serde(e) => Some(e),
-            Self::Corrupted(_) | Self::Poisoned => None,
+            Self::Corrupted(_) | Self::Poisoned | Self::AlreadyBootstrapped => None,
         }
     }
 }
@@ -336,6 +345,19 @@ impl SettingsDb {
         // 上層に bak 試行を委ねる。
         if mode == OpenMode::RequireExisting {
             ensure_existing_db_initialized(&conn)?;
+        }
+        // Codex P2 v7 (2026-05-13): `CreateNew` が呼ばれたが既存 DB が bootstrap 済みなら、
+        // family の transient miss-detect から「clean install 経路」に誤って倒れている
+        // 可能性が高い。**ここで止めないと続く `save_full(Settings::default())` で
+        // ユーザー設定が上書き全消去される**。Corrupted ではなく専用の `AlreadyBootstrapped`
+        // を返し、Phase 2 caller に「もう `save_full` を呼ぶな、別経路で recover しろ」と
+        // 伝える。
+        if mode == OpenMode::CreateNew && existing_bootstrap_marker_present(&conn)? {
+            log_diag(
+                "settings_db: create_new called on already-bootstrapped DB; \
+                 refusing to clobber (Codex P2 v7)",
+            );
+            return Err(SettingsDbError::AlreadyBootstrapped);
         }
         init_schema(&conn).map_err(|e| classify_rusqlite_error_for_open(e, "init_schema"))?;
 
@@ -638,6 +660,39 @@ fn ensure_existing_db_initialized(conn: &Connection) -> Result<(), SettingsDbErr
         ));
     }
     Ok(())
+}
+
+/// `schema_meta.bootstrap_complete` row が既に存在するか確認する
+/// (Codex P2 v7 2026-05-13)。`schema_meta` テーブル自体が無い場合 (= 完全に空の DB) は
+/// false を返す (= bootstrap 未完了)。
+fn existing_bootstrap_marker_present(conn: &Connection) -> Result<bool, SettingsDbError> {
+    // schema_meta が無いと query が落ちるので、まずテーブル存在チェック。
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'",
+            [],
+            |_| Ok(true),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(false),
+            _ => Err(e),
+        })
+        .map_err(|e| classify_rusqlite_error_for_open(e, "bootstrap_marker:table"))?;
+    if !table_exists {
+        return Ok(false);
+    }
+    let present: bool = conn
+        .query_row(
+            "SELECT 1 FROM schema_meta WHERE key = 'bootstrap_complete'",
+            [],
+            |_| Ok(true),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(false),
+            _ => Err(e),
+        })
+        .map_err(|e| classify_rusqlite_error_for_open(e, "bootstrap_marker:row"))?;
+    Ok(present)
 }
 
 /// `PRAGMA integrity_check(1)` を回し、SQLite エラーは open 系として分類、
@@ -1632,6 +1687,38 @@ mod tests {
         assert!(
             matches!(err, SettingsDbError::Corrupted(_)),
             "partial init should be Corrupted, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn create_new_refuses_already_bootstrapped_db() {
+        // Codex P2 v7 (2026-05-13): family が transient で見えなかったケースで
+        // Phase 2 が誤って clean-install 経路を選び `create_new` を呼んでも、
+        // 既存 DB が bootstrap_complete を持っていれば即座に AlreadyBootstrapped で
+        // 失敗し、続く save_full でユーザー設定が上書き全消去されるのを防ぐ。
+        let dir = TempDir::new().unwrap();
+        // 既存 bootstrapped DB を作る。
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            let mut s = Settings::default();
+            s.grid_cols = 12; // ユーザー設定だと識別できるよう特殊値
+            db.save_full(&s).unwrap();
+        }
+        // ここで再度 `create_new` を呼ぶ → AlreadyBootstrapped。
+        let err = match SettingsDb::create_new(dir.path()) {
+            Ok(_) => panic!("create_new on bootstrapped DB should fail"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SettingsDbError::AlreadyBootstrapped),
+            "expected AlreadyBootstrapped, got: {err:?}"
+        );
+        // 既存内容が無事であることを確認 (= `open` で読めて grid_cols = 12 のまま)。
+        let db = SettingsDb::open(dir.path()).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(
+            loaded.grid_cols, 12,
+            "user settings must survive the refused create_new"
         );
     }
 
