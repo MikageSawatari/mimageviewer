@@ -1592,12 +1592,30 @@ fn boot_settings_db_inner(data_dir: &Path) -> BootOutcome {
                     };
                 }
                 Err(e) => {
-                    log_diag(&format!(
-                        "settings_db: boot: load_into_settings failed (will try bak): {e}"
-                    ));
-                    // 続けて Corrupted 経路へ落とす (db ハンドルは drop)。
+                    // Codex P2 v10 (2026-05-14): Corrupted のときだけ bak 経路に倒す。
+                    // Transient / Permission / Rusqlite (= 非破損) は quarantine しないで
+                    // FailedFallbackDefault + save 抑止に倒す。誤って quarantine すると
+                    // **正常な DB が `.corrupted-*` に飛ばされて永久に失われる**。
                     drop(db);
-                    return boot_recover_from_bak(data_dir);
+                    match e {
+                        SettingsDbError::Corrupted(msg) => {
+                            log_diag(&format!(
+                                "settings_db: boot: load_into_settings reports Corrupted ({msg}); attempting bak recovery"
+                            ));
+                            return boot_recover_from_bak(data_dir);
+                        }
+                        other => {
+                            log_diag(&format!(
+                                "settings_db: boot: load_into_settings non-corruption failure ({other}); \
+                                 suppressing save this session (DB left untouched)"
+                            ));
+                            return BootOutcome {
+                                settings: Settings::default(),
+                                db: None,
+                                source: BootSource::FailedFallbackDefault,
+                            };
+                        }
+                    }
                 }
             },
             Err(SettingsDbError::Corrupted(msg)) => {
@@ -1734,22 +1752,56 @@ fn boot_recover_from_bak(data_dir: &Path) -> BootOutcome {
                     };
                 }
                 Err(e) => {
-                    log_diag(&format!(
-                        "settings_db: boot: restored {bak_name} loads but build_settings_from_db failed: {e}; \
-                         quarantining and trying next bak"
-                    ));
+                    // Codex P2 v10 (2026-05-14): Corrupted のときだけ quarantine + 次の bak。
+                    // Transient / Permission は I/O 状況が悪いだけで bak 自体は無事の可能性が
+                    // 高いので bak chain を勝手に消費せず即座に save 抑止に倒す。
                     drop(db);
-                    quarantine_db_files(data_dir);
-                    continue;
+                    match e {
+                        SettingsDbError::Corrupted(msg) => {
+                            log_diag(&format!(
+                                "settings_db: boot: restored {bak_name} loads as Corrupted ({msg}); \
+                                 quarantining and trying next bak"
+                            ));
+                            quarantine_db_files(data_dir);
+                            continue;
+                        }
+                        other => {
+                            log_diag(&format!(
+                                "settings_db: boot: restored {bak_name} loaded with non-corruption error ({other}); \
+                                 aborting bak chain to preserve remaining backups"
+                            ));
+                            return BootOutcome {
+                                settings: Settings::default(),
+                                db: None,
+                                source: BootSource::FailedFallbackDefault,
+                            };
+                        }
+                    }
                 }
             },
             Err(e) => {
-                log_diag(&format!(
-                    "settings_db: boot: restored {bak_name} open failed: {e}; \
-                     quarantining and trying next bak"
-                ));
-                quarantine_db_files(data_dir);
-                continue;
+                // Codex P2 v10 (2026-05-14): 同上。Corrupted のみ quarantine、その他は abort。
+                match e {
+                    SettingsDbError::Corrupted(msg) => {
+                        log_diag(&format!(
+                            "settings_db: boot: restored {bak_name} open Corrupted ({msg}); \
+                             quarantining and trying next bak"
+                        ));
+                        quarantine_db_files(data_dir);
+                        continue;
+                    }
+                    other => {
+                        log_diag(&format!(
+                            "settings_db: boot: restored {bak_name} open failed with non-corruption error ({other}); \
+                             aborting bak chain to preserve remaining backups"
+                        ));
+                        return BootOutcome {
+                            settings: Settings::default(),
+                            db: None,
+                            source: BootSource::FailedFallbackDefault,
+                        };
+                    }
+                }
             }
         }
     }
