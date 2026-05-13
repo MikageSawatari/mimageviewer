@@ -3432,6 +3432,15 @@ impl App {
 
     fn open_fullscreen_from_fs_navigation(&mut self, ctx: &egui::Context, idx: usize) {
         #[cfg(windows)]
+        if self.try_start_video_tile_fast_swap(ctx, idx) {
+            return;
+        }
+        #[cfg(windows)]
+        if self.try_start_native_video_fast_swap(ctx, idx) {
+            return;
+        }
+
+        #[cfg(windows)]
         let restore_video_tile = self.video_tile_state.is_some();
 
         #[cfg(windows)]
@@ -3473,6 +3482,13 @@ impl App {
             // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、偶発的な
             // input/focus repaint に頼らず明示的に次フレームを起こす。
             ctx.request_repaint();
+        }
+        #[cfg(windows)]
+        if !close_fs
+            && (self.video_tile_swap_pending.is_some()
+                || self.native_video_fast_swap_pending.is_some())
+        {
+            return;
         }
         // Ctrl+↑↓ はフルスクリーンを保ったまま前後フォルダへ飛び、先頭/末尾の
         // 画像系アイテムを開く。self.selected も合わせて更新するので、ここから

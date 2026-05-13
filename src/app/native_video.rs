@@ -14,6 +14,15 @@ pub(crate) struct PendingPinThumbRefresh {
     pub(crate) started_at: std::time::Instant,
 }
 
+#[cfg(windows)]
+struct NativeVideoSourceSwapStarted {
+    from_idx: usize,
+    target_idx: usize,
+    target_path: std::path::PathBuf,
+    source_epoch: u64,
+    started_at: std::time::Instant,
+}
+
 /// Norm 操作 (toggle ON / OFF / scan 完了) を 1 セットで適用するヘルパー。
 ///
 /// 3 箇所 (`disable_normalize_globally` / `apply_normalize_gain_db_to_player` /
@@ -1906,6 +1915,79 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(super) fn poll_native_video_fast_swap(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.native_video_fast_swap_pending.as_ref() else {
+            return;
+        };
+        let target_idx = pending.target_idx;
+        let target_path = pending.target_path.clone();
+        let source_epoch = pending.source_epoch;
+        let started_at = pending.started_at;
+        let deadline = pending.deadline;
+        if self.fullscreen_idx != Some(target_idx) {
+            self.native_video_fast_swap_pending = None;
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        #[derive(Clone, Copy)]
+        enum SwapStatus {
+            Ready,
+            Pending,
+            Timeout,
+            Error,
+            Missing,
+        }
+        let status = match self.fs_cache.get(&target_idx) {
+            Some(FsCacheEntry::Video { player, .. }) if player.path() == &target_path => {
+                if player.error().is_some() {
+                    SwapStatus::Error
+                } else if !player.native_presenter_pending() {
+                    SwapStatus::Ready
+                } else if now >= deadline {
+                    SwapStatus::Timeout
+                } else {
+                    SwapStatus::Pending
+                }
+            }
+            _ => SwapStatus::Missing,
+        };
+        match status {
+            SwapStatus::Ready => {
+                self.native_video_fast_swap_pending = None;
+                crate::logger::log(format!(
+                    "[native-video] fast video swap ready: idx={target_idx} epoch={source_epoch} elapsed_ms={:.1}",
+                    started_at.elapsed().as_secs_f64() * 1000.0
+                ));
+                ctx.request_repaint();
+            }
+            SwapStatus::Pending => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
+            }
+            SwapStatus::Timeout => {
+                self.native_video_fast_swap_pending = None;
+                crate::logger::log(format!(
+                    "[native-video] fast video swap timeout: idx={target_idx} epoch={source_epoch} elapsed_ms={:.1}",
+                    started_at.elapsed().as_secs_f64() * 1000.0
+                ));
+                ctx.request_repaint();
+            }
+            SwapStatus::Error | SwapStatus::Missing => {
+                self.native_video_fast_swap_pending = None;
+                crate::logger::log(format!(
+                    "[native-video] fast video swap ended before ready: idx={target_idx} epoch={source_epoch} status={}",
+                    match status {
+                        SwapStatus::Error => "error",
+                        SwapStatus::Missing => "missing",
+                        _ => "unknown",
+                    }
+                ));
+                ctx.request_repaint();
+            }
+        }
+    }
+
+    #[cfg(windows)]
     pub(super) fn poll_video_tile_swap(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.video_tile_swap_pending.as_ref() else {
             return;
@@ -2842,7 +2924,7 @@ impl App {
         fs_idx: usize,
         base_delta: i32,
     ) {
-        if self.video_tile_swap_pending.is_some() {
+        if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
             return;
         }
         if self.fs_nav_is_locked() {
@@ -2874,7 +2956,7 @@ impl App {
         fs_idx: usize,
         delta: i32,
     ) {
-        if self.video_tile_swap_pending.is_some() {
+        if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
             return;
         }
         if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() || delta == 0 {
@@ -2929,32 +3011,29 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn try_start_video_tile_fast_swap(
+    fn start_native_video_source_swap(
         &mut self,
         ctx: &egui::Context,
         target_idx: usize,
-    ) -> bool {
-        if self.video_tile_swap_pending.is_some() {
-            return true;
-        }
+        autoplay_override: Option<bool>,
+        show_preparing_overlay: bool,
+        reason: &'static str,
+    ) -> Option<NativeVideoSourceSwapStarted> {
         let Some(from_idx) = self.fullscreen_idx else {
-            return false;
+            return None;
         };
         if from_idx == target_idx {
-            return true;
-        }
-        if self.video_tile_state.is_none() {
-            return false;
+            return None;
         }
         let Some(GridItem::Video(target_path)) = self.items.get(target_idx).cloned() else {
-            return false;
+            return None;
         };
         if !matches!(self.items.get(from_idx), Some(GridItem::Video(_))) {
-            return false;
+            return None;
         }
 
         crate::logger::log(format!(
-            "[video-tile] fast_swap: from_idx={from_idx} -> target_idx={target_idx} target={}",
+            "[native-video] fast source swap begin: reason={reason} from_idx={from_idx} -> target_idx={target_idx} target={}",
             target_path.display()
         ));
         self.save_all_video_resume_positions();
@@ -2968,19 +3047,20 @@ impl App {
             _ => None,
         };
         let Some(native_output) = native_output else {
-            return false;
+            return None;
         };
 
         let source_epoch = self.next_native_video_source_epoch();
+        let started_at = std::time::Instant::now();
         let mut new_player = self.build_video_player_for_open(
             target_idx,
             target_path.clone(),
             false,
-            Some(false),
+            autoplay_override,
             None,
         );
         new_player.attach_native_output(native_output);
-        let payload = new_player.build_switch_source_payload(source_epoch, true);
+        let payload = new_player.build_switch_source_payload(source_epoch, show_preparing_overlay);
         new_player.switch_native_source(payload);
 
         self.fs_cache.insert(
@@ -2990,19 +3070,9 @@ impl App {
                 load_seq: self.input_seq,
             },
         );
-        self.video_tile_swap_pending = Some(VideoTileSwapPending {
-            target_idx,
-            target_path,
-            source_epoch,
-            started_at: std::time::Instant::now(),
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(2),
-        });
-        self.video_tile_reopen_pending = false;
-        self.video_tile_reopen_deadline = None;
 
         self.open_fullscreen(target_idx);
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
-            player.set_playing(false);
             crate::logger::log(format!(
                 "[video-debug] post-swap state: idx={target_idx} engine_state={} seek_serial={} clock_is_playing={} pos={:.3} video_rx_len={} audio_rx_len={} pending_frames={}",
                 player.engine_state_name(),
@@ -3047,7 +3117,11 @@ impl App {
                 );
             }
         }
-        self.set_native_video_tile_preparing_overlay(target_idx);
+        if show_preparing_overlay {
+            self.set_native_video_tile_preparing_overlay(target_idx);
+        } else if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
+            player.set_native_tile_overlay(None);
+        }
         self.sync_native_video_metadata(target_idx);
         self.sync_native_video_timeline_markers(target_idx);
         self.sync_native_video_vst3_available(target_idx);
@@ -3057,9 +3131,96 @@ impl App {
             self.fs_cache.remove(&from_idx);
         }
         crate::logger::log(format!(
-            "[native-video] fast tile swap: from={from_idx} to={target_idx} epoch={source_epoch}"
+            "[native-video] fast source swap queued: reason={reason} from={from_idx} to={target_idx} epoch={source_epoch}"
         ));
         ctx.request_repaint();
+        Some(NativeVideoSourceSwapStarted {
+            from_idx,
+            target_idx,
+            target_path,
+            source_epoch,
+            started_at,
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn try_start_video_tile_fast_swap(
+        &mut self,
+        ctx: &egui::Context,
+        target_idx: usize,
+    ) -> bool {
+        if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
+            return true;
+        }
+        let Some(from_idx) = self.fullscreen_idx else {
+            return false;
+        };
+        if from_idx == target_idx {
+            return true;
+        }
+        if self.video_tile_state.is_none() {
+            return false;
+        }
+        let Some(started) =
+            self.start_native_video_source_swap(ctx, target_idx, Some(false), true, "tile")
+        else {
+            return false;
+        };
+
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
+            player.set_playing(false);
+        }
+        self.video_tile_swap_pending = Some(VideoTileSwapPending {
+            target_idx: started.target_idx,
+            target_path: started.target_path,
+            source_epoch: started.source_epoch,
+            started_at: started.started_at,
+            deadline: started.started_at + std::time::Duration::from_secs(2),
+        });
+        self.video_tile_reopen_pending = false;
+        self.video_tile_reopen_deadline = None;
+        crate::logger::log(format!(
+            "[native-video] fast tile swap: from={} to={} epoch={}",
+            started.from_idx, started.target_idx, started.source_epoch
+        ));
+        true
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn try_start_native_video_fast_swap(
+        &mut self,
+        ctx: &egui::Context,
+        target_idx: usize,
+    ) -> bool {
+        if self.native_video_fast_swap_pending.is_some() || self.video_tile_swap_pending.is_some() {
+            return true;
+        }
+        if self.video_tile_state.is_some() {
+            return false;
+        }
+        let Some(from_idx) = self.fullscreen_idx else {
+            return false;
+        };
+        if from_idx == target_idx {
+            return true;
+        }
+        let Some(started) =
+            self.start_native_video_source_swap(ctx, target_idx, None, false, "navigation")
+        else {
+            return false;
+        };
+
+        self.native_video_fast_swap_pending = Some(NativeVideoFastSwapPending {
+            target_idx: started.target_idx,
+            target_path: started.target_path,
+            source_epoch: started.source_epoch,
+            started_at: started.started_at,
+            deadline: started.started_at + std::time::Duration::from_secs(2),
+        });
+        crate::logger::log(format!(
+            "[native-video] fast video swap: from={} to={} epoch={}",
+            started.from_idx, started.target_idx, started.source_epoch
+        ));
         true
     }
 
@@ -3070,6 +3231,9 @@ impl App {
         idx: usize,
     ) {
         if self.try_start_video_tile_fast_swap(ctx, idx) {
+            return;
+        }
+        if self.try_start_native_video_fast_swap(ctx, idx) {
             return;
         }
         let started = std::time::Instant::now();

@@ -163,15 +163,20 @@ presenter 有効時は `VideoPlayer` が `NativeVideoOutput` を持ち、動画�
 egui overlay は専用 HWND 側で表示される。フルスクリーン viewport は黒い backdrop と
 focus/chrome 管理だけを担当する。
 
-動画タイルモード (`video_tile_state`) は再生中動画の `VideoInfo` からタイムスタンプ列を
-作り、`TileThumbnailWorker` が別 FFmpeg input でサムネイルを抽出する。動画から動画への
-ホイール移動でタイルモードが active の場合、Windows native presenter 経路では
-`NativeVideoOutput::SwitchSource` で HWND / D3D11 presenter / overlay を保持したまま
-新しい `VideoPlayer` の source binding に差し替える。`video_tile_swap_pending` 中は
-preparing overlay を出し、新動画の `player.info()` 到着後に新しい `VideoTileState` を
-構築してタイルを progressive に埋める。
+動画から動画へのフルスクリーンナビゲーションでは、Windows native presenter 経路で
+`NativeVideoOutput::SwitchSource` を使い、HWND / D3D11 presenter / overlay を保持したまま
+新しい `VideoPlayer` の source binding に差し替える。通常ナビゲーションでは
+`native_video_fast_swap_pending` が最初の native frame 表示まで連続入力を抑制し、
+タイル用 preparing overlay は出さない。画像⇄動画の遷移はこの fast path の対象外で、
+従来どおり `open_fullscreen` / `start_fs_load` 経路で扱う。
 
-この fast path では保存済み resume 位置を新 `VideoPlayer` に渡すが、autoplay は false
+動画タイルモード (`video_tile_state`) は再生中動画の `VideoInfo` からタイムスタンプ列を
+作り、`TileThumbnailWorker` が別 FFmpeg input でサムネイルを抽出する。タイルモードが
+active の動画→動画ホイール移動でも同じ `SwitchSource` を使うが、
+`video_tile_swap_pending` 中は preparing overlay を出し、新動画の `player.info()` 到着後に
+新しい `VideoTileState` を構築してタイルを progressive に埋める。
+
+タイルモードの fast path では保存済み resume 位置を新 `VideoPlayer` に渡すが、autoplay は false
 に固定する。タイル解除後は resume 位置の静止状態を表示し、特定位置から見たい場合は
 タイルクリックによる seek を使う。タイルクリックは autoplay 設定に関係なく、その位置へ
 seek して再生開始する。切替元の `VideoPlayer` は cpal stream を同期 pause し、audio

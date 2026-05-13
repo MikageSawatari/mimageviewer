@@ -1332,6 +1332,15 @@ pub(crate) struct VideoTileSwapPending {
     pub(crate) deadline: std::time::Instant,
 }
 
+#[cfg(windows)]
+pub(crate) struct NativeVideoFastSwapPending {
+    pub(crate) target_idx: usize,
+    pub(crate) target_path: PathBuf,
+    pub(crate) source_epoch: u64,
+    pub(crate) started_at: std::time::Instant,
+    pub(crate) deadline: std::time::Instant,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct FullscreenVideoMarkerCache {
     pub(crate) fs_idx: usize,
@@ -1852,6 +1861,8 @@ pub struct App {
     pub(crate) video_tile_reopen_deadline: Option<std::time::Instant>,
     #[cfg(windows)]
     pub(crate) video_tile_swap_pending: Option<VideoTileSwapPending>,
+    #[cfg(windows)]
+    pub(crate) native_video_fast_swap_pending: Option<NativeVideoFastSwapPending>,
     #[cfg(windows)]
     pub(crate) native_video_source_epoch_next: u64,
     /// タイルモードのサムネ WebP 永続キャッシュ (Phase 6.D-2、Phase 8.C で絶対 PTS 化)。
@@ -2858,6 +2869,8 @@ impl Default for App {
             video_tile_reopen_deadline: None,
             #[cfg(windows)]
             video_tile_swap_pending: None,
+            #[cfg(windows)]
+            native_video_fast_swap_pending: None,
             #[cfg(windows)]
             native_video_source_epoch_next: 1,
             video_tile_cache,
@@ -11358,6 +11371,7 @@ impl App {
             self.video_tile_reopen_pending = false;
             self.video_tile_reopen_deadline = None;
             self.video_tile_swap_pending = None;
+            self.native_video_fast_swap_pending = None;
         }
         self.reset_erase_mode();
         self.erase_base_cache.clear();
@@ -13497,6 +13511,7 @@ impl App {
         }
         #[cfg(windows)]
         if let Some(fs_idx) = self.fullscreen_idx {
+            self.poll_native_video_fast_swap(ctx);
             self.poll_video_tile_swap(ctx);
             self.sync_native_video_metadata(fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);

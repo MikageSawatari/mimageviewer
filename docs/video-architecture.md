@@ -706,11 +706,15 @@ cloaked にしていた場合は、`close_fullscreen` 内で先に uncloak し�
 `None` を渡すのは「呼び出し元が後から `attach_native_output` で output を移植する」
 ことを示す**正常なシグナル**で、エラー扱いしない。
 
-- **fast-swap 経路** (`try_start_video_tile_fast_swap` in [src/app/native_video.rs](../src/app/native_video.rs)):
-  動画タイルモード中のホイールナビゲーションで、旧 player から
-  `take_native_output()` で取り外した output を新 player に `attach_native_output`
-  で移植する。新 player 側の `VideoPlayer::open` には `native_output_config=None`
-  を渡す (= 自前で spawn しない)。
+- **動画→動画 fast-swap 経路** (`try_start_native_video_fast_swap` /
+  `try_start_video_tile_fast_swap` in [src/app/native_video.rs](../src/app/native_video.rs)):
+  通常の動画フルスクリーンナビゲーションと動画タイルモード中のホイールナビゲーションで、
+  旧 player から `take_native_output()` で取り外した output を新 player に
+  `attach_native_output` で移植する。新 player 側の `VideoPlayer::open` には
+  `native_output_config=None` を渡す (= 自前で spawn しない)。通常ナビゲーションは
+  最初の native frame 表示まで `native_video_fast_swap_pending` で連続入力を抑制し、
+  タイルモードは従来どおり `video_tile_swap_pending` で `VideoInfo` 到着後にタイル state を
+  再構築する。
 - **通常経路** (`start_fs_load` in [src/app.rs](../src/app.rs)):
   `native_video_presenter_config(self.main_hwnd, ...)` で config を取得して
   `Some(config)` を渡す。万一 `None` が返った (= モニター情報取得失敗) ときは、
