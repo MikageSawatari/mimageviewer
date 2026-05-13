@@ -77,6 +77,13 @@ pub(super) struct SeekRequest {
     pub target_secs: f64,
     /// シーク世代。request 時点で `seek_serial` から取得・進めた値。
     pub serial: u64,
+    pub kind: SeekRequestKind,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SeekRequestKind {
+    Precise,
+    FrameStep { base_secs: f64, direction: i32 },
 }
 
 /// 動画再生用 AV マスタークロック (facade)。
@@ -552,6 +559,7 @@ impl AvClock {
         *guard = Some(SeekRequest {
             target_secs: clamped,
             serial: new_serial,
+            kind: SeekRequestKind::Precise,
         });
         if crate::perf::is_enabled() {
             crate::perf::event(
@@ -567,6 +575,47 @@ impl AvClock {
                     // 単に "kind" にすると JSON シリアライザでどちらかが上書きされ、
                     // ログに残らないケースがあった (実ログで kind=seek_override_set 固定)。
                     ("seek_kind", serde_json::Value::from("precise")),
+                ],
+            );
+        }
+    }
+
+    /// メインの動画 decoder で隣接フレームを探す frame-step 専用 seek。
+    ///
+    /// `seek_start_secs` は keyframe へ戻るための demux target、`base_secs` は
+    /// 現在表示中の基準 PTS。UI の seek override は base に固定し、decoder が
+    /// 実際に表示した 1 枚の PTS で後から張り直す。
+    pub fn request_frame_step_seek(&self, seek_start_secs: f64, base_secs: f64, direction: i32) {
+        let seek_start = seek_start_secs.max(0.0);
+        let base = base_secs.max(0.0);
+        let direction = direction.signum();
+        self.eof_reached.store(false, Ordering::Release);
+        let new_serial = self.seek_serial.fetch_add(1, Ordering::AcqRel) + 1;
+        self.seek_override_serial
+            .store(new_serial, Ordering::Release);
+        self.seek_target_override_bits
+            .store(base.to_bits(), Ordering::Release);
+        let mut guard = self.seek_request.lock().unwrap();
+        *guard = Some(SeekRequest {
+            target_secs: seek_start,
+            serial: new_serial,
+            kind: SeekRequestKind::FrameStep {
+                base_secs: base,
+                direction,
+            },
+        });
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "video",
+                "seek_override_set",
+                None,
+                0,
+                &[
+                    ("target", serde_json::Value::from(base)),
+                    ("seek_start", serde_json::Value::from(seek_start)),
+                    ("serial", serde_json::Value::from(new_serial as i64)),
+                    ("seek_kind", serde_json::Value::from("frame_step")),
+                    ("direction", serde_json::Value::from(direction as i64)),
                 ],
             );
         }

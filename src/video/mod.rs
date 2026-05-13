@@ -110,9 +110,9 @@ pub struct VideoPlayer {
     /// 最後に実際へ表示したフレームの source pts。スクリーンショットとフレーム送りは
     /// 再生クロックではなく「見えているフレーム」を基準にする。
     last_displayed_pts_bits: Arc<AtomicU64>,
-    /// フレーム送りで最後に発行した precise seek target。repeat で次 target を出すとき、
-    /// 表示済み PTS がまだ追いついていなくても発行済み target を基準にできる。
-    frame_step_target_bits: AtomicU64,
+    /// フレーム送りで最後に基準にした表示 PTS。repeat で次 target を出すとき、
+    /// 表示済み PTS がまだ追いついていなくても発行済み base を基準にできる。
+    frame_step_base_bits: AtomicU64,
     /// フレーム送り操作による一時停止中なら true。通常 pause の中央再生 UI と分ける。
     frame_step_active: Arc<AtomicBool>,
     /// 最後の frame-step seek 発行時点での表示済みフレーム sequence。
@@ -2395,10 +2395,14 @@ fn run_native_video_output(
                     }
                     let now_for_clear = source.clock.now_secs();
                     let frame_step_active = source.frame_step_active.load(Ordering::Acquire);
-                    if clock::pts_clears_seek_override(pts, now_for_clear) && frame_step_active {
+                    if source.clock.is_seeking()
+                        && clock::pts_clears_seek_override(pts, now_for_clear)
+                        && frame_step_active
+                    {
                         source.clock.set_paused_position(pts);
                         source.clock.clear_seek_target_override(serial);
                     } else if clock::pts_clears_seek_override(pts, now_for_clear)
+                        && !frame_step_active
                         && !source.clock.is_audio_active()
                     {
                         source.clock.set_fallback_anchor(pts);
@@ -2554,41 +2558,41 @@ fn user_seek_ready_to_issue(
             .is_some_and(|issued_at| now.duration_since(issued_at) >= USER_SEEK_REISSUE_AFTER)
 }
 
-pub(crate) fn frame_step_interval_secs(avg_fps: f64) -> f64 {
-    if avg_fps.is_finite() && avg_fps > 1.0 {
-        (1.0 / avg_fps).clamp(1.0 / 240.0, 1.0)
-    } else {
-        1.0 / 30.0
-    }
-}
-
 fn frame_step_base_secs(
-    pending_step_target: Option<f64>,
+    pending_step_base: Option<f64>,
     last_displayed_pts: Option<f64>,
     current_position: f64,
 ) -> f64 {
-    pending_step_target
+    pending_step_base
         .or(last_displayed_pts)
         .unwrap_or(current_position)
         .max(0.0)
 }
 
-fn frame_step_seek_target_secs(base: f64, step: f64, direction: i32) -> f64 {
-    let direction = direction.signum();
-    if direction < 0 {
-        let backward_bias = (step * 0.25).min(0.004);
-        base - step - backward_bias
+fn frame_step_interval_secs(avg_fps: f64) -> f64 {
+    if avg_fps.is_finite() && avg_fps > 1.0 {
+        (1.0 / avg_fps).clamp(1.0 / 1000.0, 1.0)
     } else {
-        base + step
+        1.0 / 30.0
     }
 }
 
+fn frame_step_seek_start_secs(base: f64, avg_fps: f64, direction: i32) -> f64 {
+    let frame_interval = frame_step_interval_secs(avg_fps);
+    let scan_back_secs = if direction < 0 {
+        (frame_interval * 1.25).clamp(0.002, 0.25)
+    } else {
+        (frame_interval * 8.0).clamp(0.050, 1.0)
+    };
+    (base - scan_back_secs).max(0.0)
+}
+
 fn frame_step_waiting_for_display(
-    pending_step_target: Option<f64>,
+    pending_step_base: Option<f64>,
     issued_display_seq: u64,
     current_display_seq: u64,
 ) -> bool {
-    pending_step_target.is_some()
+    pending_step_base.is_some()
         && issued_display_seq != FRAME_STEP_NO_PENDING_SEQ
         && issued_display_seq == current_display_seq
 }
@@ -2658,7 +2662,7 @@ impl VideoPlayer {
                 first_frame_event_last_epoch: None,
                 displayed_frame_seq: Arc::new(AtomicU64::new(0)),
                 last_displayed_pts_bits: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
-                frame_step_target_bits: AtomicU64::new(f64::NAN.to_bits()),
+                frame_step_base_bits: AtomicU64::new(f64::NAN.to_bits()),
                 frame_step_active: Arc::new(AtomicBool::new(false)),
                 frame_step_issued_display_seq: AtomicU64::new(FRAME_STEP_NO_PENDING_SEQ),
                 decoder_dropped_full_count: Arc::new(AtomicU64::new(0)),
@@ -2866,7 +2870,7 @@ impl VideoPlayer {
             first_frame_event_last_epoch: None,
             displayed_frame_seq,
             last_displayed_pts_bits,
-            frame_step_target_bits: AtomicU64::new(f64::NAN.to_bits()),
+            frame_step_base_bits: AtomicU64::new(f64::NAN.to_bits()),
             frame_step_active,
             frame_step_issued_display_seq: AtomicU64::new(FRAME_STEP_NO_PENDING_SEQ),
             #[cfg(windows)]
@@ -3257,31 +3261,72 @@ impl VideoPlayer {
         g.apply_command(engine::actor::TransportCommand::Pause);
     }
 
+    fn seek_paused_frame_step_internal(
+        &self,
+        seek_start_secs: f64,
+        base_secs: f64,
+        direction: i32,
+    ) {
+        self.clear_pending_user_seek();
+        let seek_start = self.clamp_exact_frame_target(seek_start_secs);
+        let base = self.clamp_exact_frame_target(base_secs);
+        self.clock
+            .request_frame_step_seek(seek_start, base, direction);
+        self.clear_audio_output_buffer();
+        self.clock.set_playing(false);
+        self.clock.set_paused_position(base);
+        let mut g = self.engine.lock().unwrap();
+        g.handle_seek_request(base);
+        g.apply_command(engine::actor::TransportCommand::Pause);
+    }
+
     /// 前後 1 フレームへ移動し、一時停止する。
     pub fn step_frame(&self, direction: i32) {
         if direction == 0 {
             return;
         }
         self.clear_pending_user_seek();
-        let pending_step_target = self.frame_step_target();
+        let pending_step_base = self.frame_step_base();
         let displayed_seq = self.displayed_frame_seq.load(Ordering::Acquire);
         let issued_display_seq = self.frame_step_issued_display_seq.load(Ordering::Acquire);
-        if frame_step_waiting_for_display(pending_step_target, issued_display_seq, displayed_seq) {
+        if self.clock.is_seeking()
+            && frame_step_waiting_for_display(pending_step_base, issued_display_seq, displayed_seq)
+        {
             return;
         }
+        let pending_step_base = if pending_step_base.is_some()
+            && issued_display_seq != FRAME_STEP_NO_PENDING_SEQ
+            && issued_display_seq != displayed_seq
+        {
+            None
+        } else {
+            pending_step_base
+        };
         let base = frame_step_base_secs(
-            pending_step_target,
+            pending_step_base,
             self.last_displayed_pts_secs(),
             self.position(),
         );
-        let step = frame_step_interval_secs(self.info.as_ref().map(|i| i.avg_fps).unwrap_or(0.0));
-        let target = self.clamp_seek_target(frame_step_seek_target_secs(base, step, direction));
-        self.frame_step_target_bits
-            .store(target.to_bits(), Ordering::Release);
+        let avg_fps = self.info.as_ref().map(|i| i.avg_fps).unwrap_or(0.0);
+        let direction = direction.signum();
+        let frame_interval = frame_step_interval_secs(avg_fps);
+        if direction < 0 && base <= frame_interval * 0.25 {
+            return;
+        }
+        if direction > 0
+            && self.info.as_ref().is_some_and(|info| {
+                info.duration_secs > 0.0 && base >= info.duration_secs - frame_interval * 1.25
+            })
+        {
+            return;
+        }
+        let seek_start = frame_step_seek_start_secs(base, avg_fps, direction);
+        self.frame_step_base_bits
+            .store(base.to_bits(), Ordering::Release);
         self.frame_step_active.store(true, Ordering::Release);
         self.frame_step_issued_display_seq
             .store(displayed_seq, Ordering::Release);
-        self.seek_paused_internal(target);
+        self.seek_paused_frame_step_internal(seek_start, base, direction);
     }
 
     /// シーク target を `[0, duration - 0.1s)` にクランプする。duration が
@@ -3291,6 +3336,16 @@ impl VideoPlayer {
         if let Some(info) = &self.info {
             if info.duration_secs > 0.2 {
                 return lower.min(info.duration_secs - 0.1);
+            }
+        }
+        lower
+    }
+
+    fn clamp_exact_frame_target(&self, target_secs: f64) -> f64 {
+        let lower = target_secs.max(0.0);
+        if let Some(info) = &self.info {
+            if info.duration_secs > 0.0 {
+                return lower.min(info.duration_secs);
             }
         }
         lower
@@ -3326,8 +3381,8 @@ impl VideoPlayer {
         self.audio_diagnostics.load_av_drift_ms()
     }
 
-    fn frame_step_target(&self) -> Option<f64> {
-        let pts = f64::from_bits(self.frame_step_target_bits.load(Ordering::Acquire));
+    fn frame_step_base(&self) -> Option<f64> {
+        let pts = f64::from_bits(self.frame_step_base_bits.load(Ordering::Acquire));
         if pts.is_finite() {
             Some(pts.max(0.0))
         } else {
@@ -3336,7 +3391,7 @@ impl VideoPlayer {
     }
 
     fn clear_frame_step_target(&self) {
-        self.frame_step_target_bits
+        self.frame_step_base_bits
             .store(f64::NAN.to_bits(), Ordering::Release);
         self.frame_step_active.store(false, Ordering::Release);
         self.frame_step_issued_display_seq
@@ -4027,10 +4082,14 @@ impl VideoPlayer {
                         ));
                     }
                     let now_for_clear = self.clock.now_secs();
+                    let frame_step_active = self.is_frame_step_active();
                     if clock::pts_clears_seek_override(pts, now_for_clear) {
-                        if self.is_frame_step_active() {
+                        if self.clock.is_seeking() && frame_step_active {
                             self.clock.set_paused_position(pts);
                             self.clock.clear_seek_target_override(serial);
+                        } else if frame_step_active {
+                            // Exact frame-step is paused while the decoder resolves or after
+                            // its selected frame has already frozen the clock.
                         } else if self.clock.is_audio_active() {
                             if self.clock.is_seeking() && crate::perf::is_enabled() {
                                 crate::perf::event(
@@ -4081,14 +4140,18 @@ impl VideoPlayer {
                     // する (= 「← シークが効かない」現象の本質)。target 近傍チェックを
                     // 入れて「シークが物理的に成功した」ときだけ通常クロックに戻す。
                     let now_after = self.clock.now_secs();
+                    let frame_step_active = self.is_frame_step_active();
                     if clock::pts_clears_seek_override(frame.pts_secs, now_after) {
                         // Audio-active playback must let fill_output clear the override only
                         // when the first audible post-seek samples actually reach the output.
                         // Clearing from video here starts the visual clock before audio is ready
                         // and produces AV drift on high-rate files with deep audio queues.
-                        if self.is_frame_step_active() {
+                        if self.clock.is_seeking() && frame_step_active {
                             self.clock.set_paused_position(frame.pts_secs);
                             self.clock.clear_seek_target_override(frame.seek_serial);
+                        } else if frame_step_active {
+                            // Keep the frame-step pause anchored even if queued frames arrive
+                            // while the decoder-side adjacent-frame seek is still pending.
                         } else if self.clock.is_audio_active() {
                             if self.clock.is_seeking() && crate::perf::is_enabled() {
                                 crate::perf::event(
@@ -4454,6 +4517,17 @@ mod tests {
     }
 
     #[test]
+    fn frame_step_seek_start_uses_near_base_target_for_backward() {
+        let backward = super::frame_step_seek_start_secs(10.0, 60.0, -1);
+        let expected_backward = 10.0 - (1.0 / 60.0) * 1.25;
+        assert!((backward - expected_backward).abs() < 1.0e-9);
+
+        let forward = super::frame_step_seek_start_secs(10.0, 60.0, 1);
+        assert!(backward > forward);
+        assert!(forward >= 9.0);
+    }
+
+    #[test]
     fn frame_step_base_prefers_pending_target() {
         let base = super::frame_step_base_secs(Some(10.0), Some(20.0), 30.0);
         assert!((base - 10.0).abs() < 1.0e-9);
@@ -4465,17 +4539,6 @@ mod tests {
         assert!((displayed - 20.0).abs() < 1.0e-9);
         let position = super::frame_step_base_secs(None, None, 30.0);
         assert!((position - 30.0).abs() < 1.0e-9);
-    }
-
-    #[test]
-    fn frame_step_seek_target_biases_backward_only() {
-        let step = 1.0 / 60.0;
-        let forward = super::frame_step_seek_target_secs(10.0, step, 1);
-        assert!((forward - (10.0 + step)).abs() < 1.0e-9);
-
-        let backward = super::frame_step_seek_target_secs(10.0, step, -1);
-        assert!(backward < 10.0 - step);
-        assert!((backward - (10.0 - step - 0.004)).abs() < 1.0e-9);
     }
 
     #[test]

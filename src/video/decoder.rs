@@ -35,6 +35,7 @@ const VIDEO_PACKET_OVERFLOW_MAX_BYTES: usize = 64 * 1024 * 1024;
 const DEMUX_PACKET_SEND_WAIT_WARN_MS: f64 = 20.0;
 const DEMUX_PACKET_SEND_TIMEOUT_MS: u64 = 2;
 const VIDEO_PACING_SLEEP_MS: u64 = 1;
+const VIDEO_PREROLL_TRIM_TOLERANCE_SECS: f64 = 0.0005;
 
 fn sleep_video_pacing() {
     std::thread::sleep(std::time::Duration::from_millis(VIDEO_PACING_SLEEP_MS));
@@ -343,7 +344,7 @@ fn frame_best_effort_timestamp(raw: *const ffmpeg_the_third::ffi::AVFrame) -> Op
     }
 }
 
-fn video_frame_timestamp(frame: &ffmpeg_the_third::util::frame::Video) -> Option<i64> {
+pub(crate) fn video_frame_timestamp(frame: &ffmpeg_the_third::util::frame::Video) -> Option<i64> {
     // SAFETY: ffmpeg-the-third exposes the raw AVFrame pointer through an
     // unsafe method; the frame is borrowed and alive for this call.
     let raw = unsafe { frame.as_ptr() };
@@ -414,11 +415,154 @@ enum VideoControlMsg {
     ///
     /// `trim_before_secs` は post-seek preroll trim 用。`Some(t)` で受信側は
     ///   `drop_before_secs = Some(t)` を設定し target ぴったりに着地。
-    ///   seek 失敗時だけ `None` にして trim なし通常 pacing へ戻す。
+    ///   frame-step seek では `frame_step` が前後フレームを選ぶため video trim は
+    ///   `None` にする。seek 失敗時も `None` で trim なし通常 pacing へ戻す。
     Flush {
         serial: u64,
         trim_before_secs: Option<f64>,
+        frame_step: Option<FrameStepDecodeSpec>,
     },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrameStepDecodeSpec {
+    base_secs: f64,
+    direction: i32,
+}
+
+struct FrameStepDecodeState {
+    base_secs: f64,
+    direction: i32,
+    previous: Option<(ffmpeg_the_third::util::frame::video::Video, f64)>,
+}
+
+enum FrameStepSelection {
+    Selected(f64),
+    Skip,
+}
+
+fn abort_frame_step_output(clock: &AvClock, serial: u64, pts_secs: f64, reason: &str) {
+    crate::logger::log(format!(
+        "[video-decode] frame-step output failed: serial={serial} pts={pts_secs:.6} reason={reason}; clearing seek override"
+    ));
+    clock.set_paused_position(pts_secs);
+    clock.clear_seek_target_override(serial);
+    if crate::perf::is_enabled() {
+        crate::perf::event(
+            "video",
+            "frame_step_output_failed",
+            None,
+            0,
+            &[
+                ("serial", serde_json::Value::from(serial as i64)),
+                ("pts", serde_json::Value::from(pts_secs)),
+                ("reason", serde_json::Value::from(reason)),
+            ],
+        );
+    }
+}
+
+fn wait_for_post_seek_video_tx_space(
+    post_seek_frame_sent: bool,
+    video_tx: &Sender<VideoFrame>,
+    video_pkt_rx: &Receiver<VideoPacketMsg>,
+    current_seek_serial: u64,
+    pts_secs: f64,
+    engine_st: u8,
+    clock_seeking: bool,
+    post_seek_tx_full_last_log: &mut Option<std::time::Instant>,
+) -> bool {
+    if !video_tx.is_full() {
+        *post_seek_tx_full_last_log = None;
+        return false;
+    }
+    if post_seek_frame_sent {
+        return false;
+    }
+    let now = std::time::Instant::now();
+    if post_seek_tx_full_last_log
+        .is_none_or(|last| now.duration_since(last) >= std::time::Duration::from_millis(500))
+    {
+        crate::logger::log(format!(
+            "[video-decode] post-seek first frame waiting for video_tx space: serial={current_seek_serial} frame_pts={pts_secs:.3} video_tx_len={} pkt_rx_len={} engine_state={} clock_seeking={clock_seeking}",
+            video_tx.len(),
+            video_pkt_rx.len(),
+            engine_state_code_name(engine_st),
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "video",
+                "post_seek_video_tx_full_wait",
+                None,
+                0,
+                &[
+                    (
+                        "serial",
+                        serde_json::Value::from(current_seek_serial as i64),
+                    ),
+                    ("frame_pts", serde_json::Value::from(pts_secs)),
+                    (
+                        "video_tx_len",
+                        serde_json::Value::from(video_tx.len() as i64),
+                    ),
+                    (
+                        "pkt_rx_len",
+                        serde_json::Value::from(video_pkt_rx.len() as i64),
+                    ),
+                    (
+                        "engine_state",
+                        serde_json::Value::from(engine_state_code_name(engine_st)),
+                    ),
+                    ("clock_seeking", serde_json::Value::from(clock_seeking)),
+                ],
+            );
+        }
+        *post_seek_tx_full_last_log = Some(now);
+    }
+    sleep_video_pacing();
+    true
+}
+
+fn should_bypass_pause_park_for_post_seek_first_frame(
+    clock_seeking: bool,
+    post_seek_frame_sent: bool,
+) -> bool {
+    clock_seeking && !post_seek_frame_sent
+}
+
+impl FrameStepDecodeState {
+    fn new(spec: FrameStepDecodeSpec) -> Self {
+        Self {
+            base_secs: spec.base_secs.max(0.0),
+            direction: spec.direction,
+            previous: None,
+        }
+    }
+
+    fn select(
+        &mut self,
+        frame: &mut ffmpeg_the_third::util::frame::video::Video,
+        pts_secs: f64,
+    ) -> FrameStepSelection {
+        if self.direction < 0 {
+            if pts_secs < self.base_secs - VIDEO_PREROLL_TRIM_TOLERANCE_SECS {
+                let previous =
+                    std::mem::replace(frame, ffmpeg_the_third::util::frame::video::Video::empty());
+                self.previous = Some((previous, pts_secs));
+                return FrameStepSelection::Skip;
+            }
+            if let Some((prev, prev_pts)) = self.previous.take() {
+                *frame = prev;
+                return FrameStepSelection::Selected(prev_pts);
+            }
+            return FrameStepSelection::Selected(pts_secs);
+        }
+
+        if pts_secs <= self.base_secs + VIDEO_PREROLL_TRIM_TOLERANCE_SECS {
+            return FrameStepSelection::Skip;
+        }
+        FrameStepSelection::Selected(pts_secs)
+    }
 }
 
 enum VideoDecodeInput {
@@ -2015,7 +2159,19 @@ fn run_decoder(
             let super::clock::SeekRequest {
                 target_secs,
                 serial,
+                kind,
             } = req;
+            let frame_step = match kind {
+                super::clock::SeekRequestKind::Precise => None,
+                super::clock::SeekRequestKind::FrameStep {
+                    base_secs,
+                    direction,
+                } => Some(FrameStepDecodeSpec {
+                    base_secs,
+                    direction,
+                }),
+            };
+            let display_target_secs = frame_step.map(|spec| spec.base_secs).unwrap_or(target_secs);
             // Phase B: post_seek_frame_sent / drop_before_secs / current_seek_serial は
             // すべて video decode thread のローカル変数として所有される。demux thread は
             // 「seek 要求を受け取り → input.seek() を実行 → 両 decode thread に Flush
@@ -2070,7 +2226,7 @@ fn run_decoder(
                 seek_result = input.seek(target_pts, target_pts..);
             }
             crate::logger::log(format!(
-                "seek: target={target_secs:.3}s serial={serial} result={seek_result:?}"
+                "seek: target={target_secs:.3}s display_target={display_target_secs:.3}s serial={serial} kind={kind:?} result={seek_result:?}"
             ));
             if seek_result.is_err() {
                 // 完全失敗: override を明示解除しないと pace_now が target 固定で
@@ -2104,12 +2260,21 @@ fn run_decoder(
             //     target ぴったりに着地 (post_seek_frame_sent=false で 1 枚目を待機)
             //   - 失敗: None → trim せず通常 pacing
             let seek_target_for_flush = if seek_result.is_ok() {
-                Some(target_secs)
+                Some(display_target_secs)
             } else {
                 None
             };
-            let trim_before = if seek_result.is_ok() {
-                Some(target_secs)
+            let video_trim_before = if seek_result.is_ok() {
+                if frame_step.is_some() {
+                    None
+                } else {
+                    Some(target_secs)
+                }
+            } else {
+                None
+            };
+            let audio_trim_before = if seek_result.is_ok() {
+                Some(display_target_secs)
             } else {
                 None
             };
@@ -2148,7 +2313,8 @@ fn run_decoder(
                 &video_ctl_tx,
                 VideoControlMsg::Flush {
                     serial,
-                    trim_before_secs: trim_before,
+                    trim_before_secs: video_trim_before,
+                    frame_step,
                 },
                 &cancel,
                 "video",
@@ -2163,7 +2329,7 @@ fn run_decoder(
                     AudioControlMsg::Flush {
                         serial,
                         seek_target_secs: seek_target_for_flush,
-                        trim_before_secs: trim_before,
+                        trim_before_secs: audio_trim_before,
                     },
                     &cancel,
                     "audio",
@@ -2178,7 +2344,7 @@ fn run_decoder(
             // frame / sample が set_audio_pts / set_fallback_anchor 経由で自然に
             // 現在位置にアンカーし直す。
             if seek_result.is_ok() {
-                clock.notify_seek_completed(target_secs);
+                clock.notify_seek_completed(display_target_secs);
             } else {
                 clock.reset_audio_bookkeeping_only();
             }
@@ -2188,7 +2354,7 @@ fn run_decoder(
             let _ = engine_event_tx.try_send(crate::video::engine::EngineEvent::Decoder(
                 crate::video::engine::state::DecoderEvent::SeekCompleted {
                     epoch: serial,
-                    actual_pts: target_secs,
+                    actual_pts: display_target_secs,
                 },
             ));
         }
@@ -2484,11 +2650,12 @@ fn run_decoder(
 /// (= drop してカウンタ加算)。`video_pkt_rx` (small bounded queue) は demux ↔ video decode
 /// の逆圧経路として機能する。
 ///
-/// シーク時は demux 側が `VideoControlMsg::Flush { serial, trim_before_secs }`
+/// シーク時は demux 側が `VideoControlMsg::Flush { serial, trim_before_secs, frame_step }`
 /// を control channel に送る。この thread は `Flush` 受領で内部 decoder を
 /// `flush()` し、`current_seek_serial` / `drop_before_secs` / `post_seek_frame_sent`
 /// をリセットする。`drop_before_secs` には `trim_before_secs` が入り、target 前の
-/// frame はすべて drop する。
+/// frame はすべて drop する。frame-step seek では `drop_before_secs` を使わず、
+/// decoded PTS を見ながら base の直前または直後の 1 枚だけを送出する。
 ///
 /// EOF 時は `VideoPacketMsg::Eof` を受け取るが、動画は内部残フレームを失っても
 /// 許容なので drain せず何もしない (旧 `run_decoder` の挙動と同じ)。
@@ -2547,6 +2714,9 @@ fn run_video_decode(
     let mut preroll_reached_logged_for_serial: Option<u64> = None;
     let mut pause_park_last_log: Option<std::time::Instant> = None;
     let mut post_seek_tx_full_last_log: Option<std::time::Instant> = None;
+    let mut frame_step_decode: Option<FrameStepDecodeState> = None;
+    let mut frame_step_selected_pending_clear = false;
+    let mut frame_step_abort_discard_serial: Option<u64> = None;
 
     'outer: loop {
         if cancel.load(Ordering::Acquire) {
@@ -2560,6 +2730,7 @@ fn run_video_decode(
             VideoDecodeInput::Control(VideoControlMsg::Flush {
                 serial,
                 trim_before_secs,
+                frame_step,
             }) => {
                 if stale_drop_burst_count > 0 {
                     crate::logger::log(format!(
@@ -2571,7 +2742,7 @@ fn run_video_decode(
                 let prev_serial = current_seek_serial;
                 let engine_st = engine_state.load(Ordering::Acquire);
                 crate::logger::log(format!(
-                    "[video-decode] flush received: serial={serial} prev_serial={prev_serial} trim_before={trim_before_secs:?} pkt_rx_len={} video_tx_len={} engine_state={}",
+                    "[video-decode] flush received: serial={serial} prev_serial={prev_serial} trim_before={trim_before_secs:?} frame_step={frame_step:?} pkt_rx_len={} video_tx_len={} engine_state={}",
                     video_pkt_rx.len(),
                     video_tx.len(),
                     engine_state_code_name(engine_st)
@@ -2620,13 +2791,16 @@ fn run_video_decode(
                         .store(DEINT_STATUS_PENDING, Ordering::Release);
                 }
                 drop_before_secs = trim_before_secs;
+                frame_step_decode = frame_step.map(FrameStepDecodeState::new);
+                frame_step_selected_pending_clear = false;
+                frame_step_abort_discard_serial = None;
                 first_packet_logged_for_serial = None;
                 preroll_drop_count = 0;
                 preroll_reached_logged_for_serial = None;
                 pause_park_last_log = None;
                 post_seek_tx_full_last_log = None;
-                // trim_before あり → target 到達 frame を post-seek 1 枚目として待つ。
-                post_seek_frame_sent = drop_before_secs.is_none();
+                // trim_before / frame-step あり → target 到達 frame を post-seek 1 枚目として待つ。
+                post_seek_frame_sent = drop_before_secs.is_none() && frame_step_decode.is_none();
                 continue;
             }
             VideoDecodeInput::Packet(VideoPacketMsg::Eof) => {
@@ -2728,11 +2902,47 @@ fn run_video_decode(
                 break 'outer;
             }
             let decode_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
-            let pts = video_frame_timestamp(&frame).unwrap_or(0);
-            let pts_secs = (pts as f64) * video_tb_num / video_tb_den;
+            let pts = match video_frame_timestamp(&frame) {
+                Some(pts) => pts,
+                None if frame_step_decode.is_some() => {
+                    frame = Video::empty();
+                    continue;
+                }
+                None => 0,
+            };
+            let mut pts_secs = (pts as f64) * video_tb_num / video_tb_den;
+            if frame_step_abort_discard_serial == Some(current_seek_serial) {
+                frame = Video::empty();
+                continue;
+            }
+            if frame_step_selected_pending_clear {
+                if clock.is_seeking() {
+                    frame = Video::empty();
+                    continue;
+                }
+                frame_step_selected_pending_clear = false;
+            }
+            let mut frame_step_selected_this_frame = false;
+            if let Some(step) = frame_step_decode.as_mut() {
+                match step.select(&mut frame, pts_secs) {
+                    FrameStepSelection::Selected(selected_pts) => {
+                        pts_secs = selected_pts;
+                        frame_step_decode = None;
+                        frame_step_selected_pending_clear = true;
+                        frame_step_selected_this_frame = true;
+                        crate::logger::log(format!(
+                            "[video-decode] frame-step selected: serial={current_seek_serial} pts={pts_secs:.6}"
+                        ));
+                    }
+                    FrameStepSelection::Skip => {
+                        frame = Video::empty();
+                        continue;
+                    }
+                }
+            }
             // post-seek preroll: target 前のフレームは描画しない
             if let Some(min) = drop_before_secs {
-                if pts_secs + 0.005 < min {
+                if pts_secs + VIDEO_PREROLL_TRIM_TOLERANCE_SECS < min {
                     preroll_drop_count = preroll_drop_count.saturating_add(1);
                     if crate::perf::is_enabled()
                         && (preroll_drop_count == 1 || preroll_drop_count % 30 == 0)
@@ -2908,6 +3118,24 @@ fn run_video_decode(
                                     break;
                                 }
                                 let engine_st = engine_state.load(Ordering::Acquire);
+                                if wait_for_post_seek_video_tx_space(
+                                    post_seek_frame_sent,
+                                    &video_tx,
+                                    &video_pkt_rx,
+                                    current_seek_serial,
+                                    pts_secs,
+                                    engine_st,
+                                    clock.is_seeking(),
+                                    &mut post_seek_tx_full_last_log,
+                                ) {
+                                    continue;
+                                }
+                                if should_bypass_pause_park_for_post_seek_first_frame(
+                                    clock.is_seeking(),
+                                    post_seek_frame_sent,
+                                ) {
+                                    break;
+                                }
                                 if engine_st == crate::video::engine::actor::state_code::PAUSED
                                     || engine_st == crate::video::engine::actor::state_code::EOF
                                 {
@@ -3013,68 +3241,6 @@ fn run_video_decode(
                                     }
                                 }
                                 let ahead = pts_secs - clock.video_pacing_now_secs();
-                                if !post_seek_frame_sent && video_tx.is_full() {
-                                    let now = std::time::Instant::now();
-                                    if post_seek_tx_full_last_log.is_none_or(|last| {
-                                        now.duration_since(last)
-                                            >= std::time::Duration::from_millis(500)
-                                    }) {
-                                        let engine_st = engine_state.load(Ordering::Acquire);
-                                        crate::logger::log(format!(
-                                            "[video-decode] post-seek first frame waiting for video_tx space: serial={current_seek_serial} frame_pts={pts_secs:.3} video_tx_len={} pkt_rx_len={} engine_state={} clock_seeking={}",
-                                            video_tx.len(),
-                                            video_pkt_rx.len(),
-                                            engine_state_code_name(engine_st),
-                                            clock.is_seeking()
-                                        ));
-                                        if crate::perf::is_enabled() {
-                                            crate::perf::event(
-                                                "video",
-                                                "post_seek_video_tx_full_wait",
-                                                None,
-                                                0,
-                                                &[
-                                                    (
-                                                        "serial",
-                                                        serde_json::Value::from(
-                                                            current_seek_serial as i64,
-                                                        ),
-                                                    ),
-                                                    (
-                                                        "frame_pts",
-                                                        serde_json::Value::from(pts_secs),
-                                                    ),
-                                                    (
-                                                        "video_tx_len",
-                                                        serde_json::Value::from(
-                                                            video_tx.len() as i64
-                                                        ),
-                                                    ),
-                                                    (
-                                                        "pkt_rx_len",
-                                                        serde_json::Value::from(
-                                                            video_pkt_rx.len() as i64
-                                                        ),
-                                                    ),
-                                                    (
-                                                        "engine_state",
-                                                        serde_json::Value::from(
-                                                            engine_state_code_name(engine_st),
-                                                        ),
-                                                    ),
-                                                    (
-                                                        "clock_seeking",
-                                                        serde_json::Value::from(clock.is_seeking()),
-                                                    ),
-                                                ],
-                                            );
-                                        }
-                                        post_seek_tx_full_last_log = Some(now);
-                                    }
-                                    sleep_video_pacing();
-                                    continue;
-                                }
-                                post_seek_tx_full_last_log = None;
                                 // Phase 9.E (2026-04-30 fixup): post-seek 1 枚目は
                                 // **audio_buf に関係なく必ず送出** (= override clear に必須)。
                                 // 旧コード (Phase 8.F-9.D) は seek_burst 全体を
@@ -3088,9 +3254,6 @@ fn run_video_decode(
                                 let playback_speed = clock.playback_speed();
                                 let seek_burst_lead = (SEEK_BURST_LEAD_MAX_SECS * playback_speed)
                                     .min(VIDEO_QUEUE_LEAD_CAP_SECS);
-                                if clock.is_seeking() && !post_seek_frame_sent {
-                                    break;
-                                }
                                 if clock.is_seeking()
                                     && !in_audio_escape
                                     && audio_buf < AUDIO_SAFE_HI
@@ -3207,6 +3370,17 @@ fn run_video_decode(
                                     ],
                                 );
                             }
+                            if dropped_full && frame_step_selected_this_frame {
+                                abort_frame_step_output(
+                                    &clock,
+                                    current_seek_serial,
+                                    pts_secs,
+                                    "video_tx_full_gpu",
+                                );
+                                frame_step_abort_discard_serial = Some(current_seek_serial);
+                                frame_step_selected_pending_clear = false;
+                                post_seek_frame_sent = true;
+                            }
                             if send_disconnected {
                                 break 'outer;
                             }
@@ -3235,6 +3409,18 @@ fn run_video_decode(
                         let ret = av_hwframe_transfer_data(sw.as_mut_ptr(), frame.as_ptr(), 0);
                         if ret < 0 {
                             crate::logger::log(format!("av_hwframe_transfer_data failed: {ret}"));
+                            if frame_step_selected_this_frame {
+                                let reason = format!("av_hwframe_transfer_data:{ret}");
+                                abort_frame_step_output(
+                                    &clock,
+                                    current_seek_serial,
+                                    pts_secs,
+                                    &reason,
+                                );
+                                frame_step_abort_discard_serial = Some(current_seek_serial);
+                                frame_step_selected_pending_clear = false;
+                                post_seek_frame_sent = true;
+                            }
                             continue;
                         }
                     }
@@ -3305,6 +3491,17 @@ fn run_video_decode(
                             filtered_owned = Some(filtered);
                         }
                         Ok(None) => {
+                            if frame_step_selected_this_frame {
+                                abort_frame_step_output(
+                                    &clock,
+                                    current_seek_serial,
+                                    pts_secs,
+                                    "deinterlace_no_output",
+                                );
+                                frame_step_abort_discard_serial = Some(current_seek_serial);
+                                frame_step_selected_pending_clear = false;
+                                post_seek_frame_sent = true;
+                            }
                             continue;
                         }
                         Err(e) => {
@@ -3385,6 +3582,17 @@ fn run_video_decode(
                     crate::logger::log(format!(
                         "sws_scale init: SKIP — unsupported input pix_fmt {cur_fmt:?} (would crash swscale av_assert0)"
                     ));
+                    if frame_step_selected_this_frame {
+                        abort_frame_step_output(
+                            &clock,
+                            current_seek_serial,
+                            pts_secs,
+                            "unsupported_swscale_input",
+                        );
+                        frame_step_abort_discard_serial = Some(current_seek_serial);
+                        frame_step_selected_pending_clear = false;
+                        post_seek_frame_sent = true;
+                    }
                     continue;
                 }
                 match ScaleContext::get(
@@ -3403,6 +3611,17 @@ fn run_video_decode(
                     }
                     Err(e) => {
                         crate::logger::log(format!("sws_scale init: {e}"));
+                        if frame_step_selected_this_frame {
+                            abort_frame_step_output(
+                                &clock,
+                                current_seek_serial,
+                                pts_secs,
+                                "swscale_init_failed",
+                            );
+                            frame_step_abort_discard_serial = Some(current_seek_serial);
+                            frame_step_selected_pending_clear = false;
+                            post_seek_frame_sent = true;
+                        }
                         continue;
                     }
                 }
@@ -3411,6 +3630,17 @@ fn run_video_decode(
             let mut rgba = Video::empty();
             if let Err(e) = scaler_ref.run(frame_for_scaler, &mut rgba) {
                 crate::logger::log(format!("sws_scale: {e}"));
+                if frame_step_selected_this_frame {
+                    abort_frame_step_output(
+                        &clock,
+                        current_seek_serial,
+                        pts_secs,
+                        "swscale_run_failed",
+                    );
+                    frame_step_abort_discard_serial = Some(current_seek_serial);
+                    frame_step_selected_pending_clear = false;
+                    post_seek_frame_sent = true;
+                }
                 continue;
             }
             drop(sw_owned);
@@ -3459,11 +3689,29 @@ fn run_video_decode(
                     break;
                 }
                 let engine_st = engine_state.load(Ordering::Acquire);
+                if wait_for_post_seek_video_tx_space(
+                    post_seek_frame_sent,
+                    &video_tx,
+                    &video_pkt_rx,
+                    current_seek_serial,
+                    pts_secs,
+                    engine_st,
+                    clock.is_seeking(),
+                    &mut post_seek_tx_full_last_log,
+                ) {
+                    continue;
+                }
+                if should_bypass_pause_park_for_post_seek_first_frame(
+                    clock.is_seeking(),
+                    post_seek_frame_sent,
+                ) {
+                    break;
+                }
                 if engine_st == crate::video::engine::actor::state_code::PAUSED
                     || engine_st == crate::video::engine::actor::state_code::EOF
                 {
                     let now = std::time::Instant::now();
-                    if pause_park_last_log.map_or(true, |last| {
+                    if pause_park_last_log.is_none_or(|last| {
                         now.duration_since(last) >= std::time::Duration::from_secs(2)
                     }) {
                         crate::logger::log(format!(
@@ -3533,58 +3781,8 @@ fn run_video_decode(
                     }
                 }
                 let ahead = pts_secs - clock.video_pacing_now_secs();
-                if !post_seek_frame_sent && video_tx.is_full() {
-                    let now = std::time::Instant::now();
-                    if post_seek_tx_full_last_log.map_or(true, |last| {
-                        now.duration_since(last) >= std::time::Duration::from_millis(500)
-                    }) {
-                        let engine_st = engine_state.load(Ordering::Acquire);
-                        crate::logger::log(format!(
-                            "[video-decode] post-seek first frame waiting for video_tx space: serial={current_seek_serial} frame_pts={pts_secs:.3} video_tx_len={} pkt_rx_len={} engine_state={} clock_seeking={}",
-                            video_tx.len(),
-                            video_pkt_rx.len(),
-                            engine_state_code_name(engine_st),
-                            clock.is_seeking()
-                        ));
-                        if crate::perf::is_enabled() {
-                            crate::perf::event(
-                                "video",
-                                "post_seek_video_tx_full_wait",
-                                None,
-                                0,
-                                &[
-                                    (
-                                        "serial",
-                                        serde_json::Value::from(current_seek_serial as i64),
-                                    ),
-                                    ("frame_pts", serde_json::Value::from(pts_secs)),
-                                    (
-                                        "video_tx_len",
-                                        serde_json::Value::from(video_tx.len() as i64),
-                                    ),
-                                    (
-                                        "pkt_rx_len",
-                                        serde_json::Value::from(video_pkt_rx.len() as i64),
-                                    ),
-                                    (
-                                        "engine_state",
-                                        serde_json::Value::from(engine_state_code_name(engine_st)),
-                                    ),
-                                    ("clock_seeking", serde_json::Value::from(clock.is_seeking())),
-                                ],
-                            );
-                        }
-                        post_seek_tx_full_last_log = Some(now);
-                    }
-                    sleep_video_pacing();
-                    continue;
-                }
-                post_seek_tx_full_last_log = None;
                 // Phase 9.E: post-seek 1 枚目は audio_buf 不問で必ず送出
                 // (詳細は GPU 経路の同コメント参照、forward seek deadlock 修正)。
-                if clock.is_seeking() && !post_seek_frame_sent {
-                    break;
-                }
                 const VIDEO_QUEUE_LEAD_CAP_SECS: f64 = 0.60;
                 let playback_speed = clock.playback_speed();
                 let seek_burst_lead =
@@ -3634,6 +3832,17 @@ fn run_video_decode(
             }
             if dropped_full {
                 skipped_frame_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if frame_step_selected_this_frame {
+                    abort_frame_step_output(
+                        &clock,
+                        current_seek_serial,
+                        pts_secs,
+                        "video_tx_full_cpu",
+                    );
+                    frame_step_abort_discard_serial = Some(current_seek_serial);
+                    frame_step_selected_pending_clear = false;
+                    post_seek_frame_sent = true;
+                }
             }
             if crate::perf::is_enabled() {
                 crate::perf::event(
@@ -5341,10 +5550,12 @@ fn try_gpu_blit_path(
 mod decoder_candidate_tests {
     use super::{
         AudioControlMsg, AudioDecodeInput, AudioPacketMsg, BwdifFilterKey, DecoderChoice,
-        VideoControlMsg, VideoDecodeInput, VideoPacketMsg, bwdif_filter_key,
-        bwdif_force_all_frames, field_order_is_interlaced, normalize_audio_input_layout,
-        normalize_sar, preferred_video_decoders, recv_audio_decode_input, recv_video_decode_input,
-        selected_video_rate, should_try_deinterlace,
+        FrameStepDecodeSpec, FrameStepDecodeState, FrameStepSelection, VideoControlMsg,
+        VideoDecodeInput, VideoPacketMsg, bwdif_filter_key, bwdif_force_all_frames,
+        field_order_is_interlaced, normalize_audio_input_layout, normalize_sar,
+        preferred_video_decoders, recv_audio_decode_input, recv_video_decode_input,
+        selected_video_rate, should_bypass_pause_park_for_post_seek_first_frame,
+        should_try_deinterlace,
     };
     use crate::settings::VideoDeinterlaceMode;
     use crossbeam_channel::bounded;
@@ -5353,6 +5564,95 @@ mod decoder_candidate_tests {
     use ffmpeg_the_third::codec::Id;
     use ffmpeg_the_third::format::Pixel;
     use ffmpeg_the_third::util::frame::video::Video;
+
+    fn select_frame_step_pts(state: &mut FrameStepDecodeState, pts_secs: f64) -> Option<f64> {
+        let mut frame = Video::empty();
+        match state.select(&mut frame, pts_secs) {
+            FrameStepSelection::Selected(pts) => Some(pts),
+            FrameStepSelection::Skip => None,
+        }
+    }
+
+    fn assert_pts_eq(actual: Option<f64>, expected: f64) {
+        let actual = actual.expect("expected selected frame");
+        assert!((actual - expected).abs() < 1.0e-9, "{actual} != {expected}");
+    }
+
+    #[test]
+    fn frame_step_selects_next_frame_after_base() {
+        let mut state = FrameStepDecodeState::new(FrameStepDecodeSpec {
+            base_secs: 5.0,
+            direction: 1,
+        });
+        assert!(select_frame_step_pts(&mut state, 4.97).is_none());
+        assert!(select_frame_step_pts(&mut state, 5.0).is_none());
+        assert_pts_eq(select_frame_step_pts(&mut state, 5.03), 5.03);
+    }
+
+    #[test]
+    fn frame_step_forward_skips_epsilon_equivalent_frame() {
+        let mut state = FrameStepDecodeState::new(FrameStepDecodeSpec {
+            base_secs: 5.0,
+            direction: 1,
+        });
+        assert!(select_frame_step_pts(&mut state, 5.0001).is_none());
+        assert_pts_eq(select_frame_step_pts(&mut state, 5.03), 5.03);
+    }
+
+    #[test]
+    fn frame_step_selects_previous_frame_when_crossing_base() {
+        let mut state = FrameStepDecodeState::new(FrameStepDecodeSpec {
+            base_secs: 5.0,
+            direction: -1,
+        });
+        assert!(select_frame_step_pts(&mut state, 4.97).is_none());
+        assert_pts_eq(select_frame_step_pts(&mut state, 5.03), 4.97);
+    }
+
+    #[test]
+    fn frame_step_backward_at_start_selects_current_frame() {
+        let mut state = FrameStepDecodeState::new(FrameStepDecodeSpec {
+            base_secs: 0.0,
+            direction: -1,
+        });
+        assert_pts_eq(select_frame_step_pts(&mut state, 0.0), 0.0);
+    }
+
+    #[test]
+    fn frame_step_backward_moves_previous_frame_without_clone() {
+        let mut state = FrameStepDecodeState::new(FrameStepDecodeSpec {
+            base_secs: 5.0,
+            direction: -1,
+        });
+        let mut previous = Video::empty();
+        let previous_ptr = unsafe { previous.as_ptr() };
+        assert!(matches!(
+            state.select(&mut previous, 4.97),
+            FrameStepSelection::Skip
+        ));
+
+        let mut crossing = Video::empty();
+        let crossing_ptr = unsafe { crossing.as_ptr() };
+        assert_ne!(previous_ptr, crossing_ptr);
+        assert!(matches!(
+            state.select(&mut crossing, 5.03),
+            FrameStepSelection::Selected(pts) if (pts - 4.97).abs() < 1.0e-9
+        ));
+        assert_eq!(unsafe { crossing.as_ptr() }, previous_ptr);
+    }
+
+    #[test]
+    fn frame_step_post_seek_first_frame_bypasses_pause_park() {
+        assert!(should_bypass_pause_park_for_post_seek_first_frame(
+            true, false
+        ));
+        assert!(!should_bypass_pause_park_for_post_seek_first_frame(
+            true, true
+        ));
+        assert!(!should_bypass_pause_park_for_post_seek_first_frame(
+            false, false
+        ));
+    }
 
     #[test]
     fn video_decode_recv_prioritizes_control_over_queued_packet() {
@@ -5368,6 +5668,7 @@ mod decoder_candidate_tests {
             .send(VideoControlMsg::Flush {
                 serial: 7,
                 trim_before_secs: Some(7.0),
+                frame_step: None,
             })
             .unwrap();
 

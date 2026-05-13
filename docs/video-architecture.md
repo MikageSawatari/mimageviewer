@@ -254,7 +254,7 @@ src/video/
 
 **seek 調停**: `clock.take_seek_request()` を pull するのは demux thread のみ
 (= 旧構造と同じ単一 puller)。`input.seek` 成否を判定後、packet queue とは別の
-control channel で video に `Flush { serial, trim_before_secs }`、audio に
+control channel で video に `Flush { serial, trim_before_secs, frame_step }`、audio に
 `Flush { serial, seek_target_secs, trim_before_secs }` を enqueue する。decode thread は
 `select_biased!` で control を優先受信するため、packet queue が満杯でも Flush が古い
 compressed packet の後ろに埋もれない。
@@ -263,6 +263,9 @@ audio の `seek_target_secs` はユーザー要求 target (= timeline / engine a
 `trim_before_secs=Some(target)` で target まで preroll drop する。target 前の keyframe
 や preroll frame は表示せず、最初に presenter へ届く frame を `FirstFrameReady` /
 seek override clear の対象にする。seek 失敗時は両方 `None` で通常 pacing に戻す。
+frame-step seek だけは video 側 `trim_before_secs=None` と `frame_step=Some(...)` で流し、
+video decoder が decoded PTS を見て base の直前/直後の 1 枚だけを送出する。audio 側は
+基準 PTS まで trim し、停止中の余分な音声 decode を抑える。
 キーリピートや seekbar drag の連続 seek は UI 側で最新 target に coalesce し、直前の
 seek が 1 frame 表示されるか 250ms 経過するまで次の request を発行しない。
 native HUD は `clock.is_seeking()` と `current_seek_serial()` を既存 state として参照し、
@@ -383,13 +386,20 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   input を開き、最後に表示済みの source pts 近傍をフル解像度 RGBA に変換してから
   既存の CF_DIB clipboard helper へ渡す。メイン decode queue / native presenter の GPU
   surface には触れないため、D3D11VA / CPU fallback / native DComp 経路で同じ操作にできる。
-- 前/次フレーム送りは `VideoPlayer::step_frame()` が `avg_fps` から 1 frame 秒を求め、
-  precise seek + pause を発行する。連続入力中は「最後に表示されたフレーム」ではなく
-  「最後に発行した frame-step target」を基準にして target を積み、seek 完了前の
-  連打 / 長押しでも同じ位置へ再 seek しない。ただし長押し repeat は、発行時点の
-  `displayed_frame_seq` から新しいフレームが 1 枚表示されるまで次 target を出さない。
-  これにより clock target だけが進んで画面が追いつかない状態を避ける。戻り方向は
-  preroll trim が現在フレームへ吸われないよう、1 frame + 最大 4ms 手前を seek target にする。
+- 前/次フレーム送りはスクショ対象フレームを選ぶための機能なので、`avg_fps` 由来の
+  推定秒数をそのまま seek target にせず、メインの動画 decoder に frame-step seek を
+  発行して現在表示 PTS の前後にある実 decoded frame だけを送出させる。D3D11VA が
+  有効な動画では探索自体も HW decode 経路で進むため、別 input / SW decode worker は
+  使わない。前フレーム探索の demux target は base の約 1.25 frame 前に寄せ、FFmpeg の
+  backward seek で target 以前の keyframe に戻ってから base 直前の decoded frame を選ぶ。
+  これにより古い実装のように数秒ぶん余分に decode するケースを避ける。
+  ボタン押下時点でまず現在表示 PTS に pause し、探索中に再生 clock が進んで
+  base frame がずれることを避ける。連続入力中は
+  「最後に表示されたフレーム」ではなく「最後に発行した frame-step target」を基準に
+  次の隣接フレームを探し、seek 完了前の連打 / 長押しでも同じ位置へ再 seek しない。
+  ただし長押し repeat は、発行時点の `displayed_frame_seq` から新しいフレームが 1 枚
+  表示されるまで次 target を出さない。これにより clock target だけが進んで画面が
+  追いつかない状態を避ける。
   `frame_step_active` は通常 pause と UI を分離するための共有フラグで、frame-step pause 中は
   中央の resume controls を出さない。さらに frame-step pause は音声 callback が drain されないため、
   最初の表示フレームで `set_paused_position()` + `clear_seek_target_override()` を実行し、
