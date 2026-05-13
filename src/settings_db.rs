@@ -1619,12 +1619,62 @@ pub fn migrate_from_settings_json(
 ///
 /// 副作用: 成功時に `GLOBAL_DB` を初期化する (= 後続の `with_db` がブロックせず動く)。
 /// 失敗時は `GLOBAL_DB` をクリアする (= save 抑止状態)。
+///
+/// **並列 boot の直列化** (Codex P2 v13b 2026-05-14): spec §8 で並列 `Settings::load()`
+/// は Phase 4 で撲滅予定だが、それまでの間 `BOOT_LOCK` で boot 全体を直列化する。
+/// 2 番目以降の caller は GLOBAL_DB がすでに populate されていれば fast-path で
+/// `LoadedExistingDb` を返し、bootstrap を二重に実行しない。これで「先に走った boot が
+/// migration / clean install を完了する前に後発の boot が AlreadyBootstrapped を見て
+/// FailedFallbackDefault に倒れ、SAVE_SUPPRESSED でセッション全体を poison」する race を
+/// 防ぐ。
 pub fn boot_settings_db(data_dir: &Path) -> BootOutcome {
+    let _boot_guard = BOOT_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+    // Fast-path: 同じ data_dir で既に boot 済みなら、その handle で再 load する。
+    let preexisting: Option<Arc<SettingsDb>> = {
+        let guard = GLOBAL_DB.lock().unwrap_or_else(|p| p.into_inner());
+        guard.as_ref().and_then(|(d, arc)| {
+            if d == data_dir {
+                Some(Arc::clone(arc))
+            } else {
+                None
+            }
+        })
+    };
+    if let Some(arc) = preexisting {
+        match arc.load_into_settings() {
+            Ok(settings) => {
+                log_diag(
+                    "settings_db: boot: GLOBAL_DB already populated; \
+                     returning LoadedExistingDb on fast path",
+                );
+                return BootOutcome {
+                    settings,
+                    db: Some(arc),
+                    source: BootSource::LoadedExistingDb,
+                };
+            }
+            Err(e) => {
+                // Should be extremely rare (DB went bad between boots in the same
+                // process). Fall through to the full decision tree.
+                log_diag(&format!(
+                    "settings_db: boot fast-path load_into_settings failed: {e}; \
+                     falling back to full decision tree"
+                ));
+            }
+        }
+    }
+
     let outcome = boot_settings_db_inner(data_dir);
     // GLOBAL_DB の同期。Phase 3 で `Settings::save()` が `with_db` 経由で書く。
     set_global_db(data_dir, outcome.db.clone());
     outcome
 }
+
+/// Phase 4 までの暫定: `boot_settings_db` 全体を直列化するための lock。
+/// Phase 4 で並列 caller (susie-init / folder_tree / app::default) を撲滅したら
+/// 撤去予定。
+static BOOT_LOCK: Mutex<()> = Mutex::new(());
 
 pub struct BootOutcome {
     /// このセッションで使う Settings。
@@ -3041,6 +3091,36 @@ mod tests {
             matches!(err, SettingsDbError::SaveSuppressed),
             "expected SaveSuppressed, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn concurrent_boots_dont_poison_session() {
+        // Codex P2 v13b (2026-05-14): 並列 Settings::load() (= boot_settings_db) は
+        // Phase 4 で撲滅予定だが、それまでの暫定で BOOT_LOCK + GLOBAL_DB fast-path で
+        // 直列化する。2 番目以降の boot は FailedFallbackDefault に倒れず、
+        // LoadedExistingDb を返すこと。
+        //
+        // テスト方針: data_dir override は process-global なので、本テスト内では
+        // 1 スレッドで boot_settings_db を順番に 2 回呼ぶ。最初は CleanInstall、
+        // 2 回目は GLOBAL_DB fast-path で LoadedExistingDb。これで「2 回目の boot で
+        // AlreadyBootstrapped → FailedFallbackDefault → SAVE_SUPPRESSED」の事故を
+        // 起こさないことを確認する。
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let first = boot_settings_db(dir);
+        assert_eq!(first.source, BootSource::CleanInstall);
+        assert!(first.db.is_some());
+        assert!(!save_suppressed());
+        // 2 回目の boot: GLOBAL_DB に既に Arc があるので fast-path に乗る。
+        let second = boot_settings_db(dir);
+        assert_eq!(
+            second.source,
+            BootSource::LoadedExistingDb,
+            "second boot should hit fast path, not re-run decision tree"
+        );
+        assert!(second.db.is_some());
+        // SAVE_SUPPRESSED は依然 OFF (= 2 回目の boot で poison されない)。
+        assert!(!save_suppressed());
     }
 
     #[test]
