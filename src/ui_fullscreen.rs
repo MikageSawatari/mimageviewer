@@ -3485,16 +3485,6 @@ impl App {
         forward: bool,
         native_toast: bool,
     ) {
-        crate::logger::log(format!(
-            "[ctrl-nav-debug] handle_fullscreen_ctrl_nav_context fs_idx={fs_idx} forward={forward} \
-             native_toast={native_toast} fs_nav_locked={} global_search.active={} \
-             favsearch.active={} show_search_bar={} current_folder={:?}",
-            self.fs_nav_is_locked(),
-            self.global_search.active,
-            self.favsearch.active,
-            self.show_search_bar,
-            self.current_folder.as_ref().map(|p| p.display().to_string()),
-        ));
         if self.fs_nav_is_locked() {
             return;
         }
