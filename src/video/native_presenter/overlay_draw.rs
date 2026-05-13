@@ -1095,8 +1095,14 @@ pub(super) fn draw_native_center_status(
             );
             ui.set_min_size(full_rect.size());
             let painter = ui.painter();
-            let box_w = overlay_width_points.clamp(360.0, 720.0);
-            let box_h = if body.is_some() { 132.0 } else { 76.0 };
+            let available_w = (overlay_width_points - 48.0).max(120.0);
+            let box_w = if body.is_some() {
+                overlay_width_points.clamp(360.0, 720.0).min(available_w)
+            } else {
+                let text_w = title.chars().count() as f32 * 18.0 + 72.0;
+                text_w.clamp(180.0, 420.0).min(available_w)
+            };
+            let box_h = if body.is_some() { 132.0 } else { 62.0 };
             let rect = egui::Rect::from_center_size(full_rect.center(), egui::vec2(box_w, box_h));
             painter.rect_filled(
                 rect,
@@ -1109,10 +1115,14 @@ pub(super) fn draw_native_center_status(
                 egui::Color32::from_rgb(238, 238, 238)
             };
             painter.text(
-                egui::pos2(rect.center().x, rect.min.y + 26.0),
+                if body.is_some() {
+                    egui::pos2(rect.center().x, rect.min.y + 26.0)
+                } else {
+                    rect.center()
+                },
                 egui::Align2::CENTER_CENTER,
                 title,
-                egui::FontId::proportional(22.0),
+                egui::FontId::proportional(if body.is_some() { 22.0 } else { 20.0 }),
                 title_color,
             );
             if let Some(body) = body {

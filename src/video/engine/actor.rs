@@ -953,8 +953,8 @@ mod tests {
         });
         assert_eq!(a.state, EngineState::Buffering);
 
-        // Fast seek preview は FirstFrameReady を発火しない。audio の BufferReady だけが
-        // 先に来ても target frame が届くまでは Buffering のままにする。
+        // audio の BufferReady だけが先に来ても、target frame の FirstFrameReady が
+        // 届くまでは Buffering のままにする。
         a.handle_audio_event(AudioEvent::BufferReady {
             epoch: 1,
             pts: 10.0,

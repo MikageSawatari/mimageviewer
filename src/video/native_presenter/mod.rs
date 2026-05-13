@@ -58,6 +58,21 @@ const SHARED_TEXTURE_CACHE_CAPACITY: usize = 64;
 /// lib にいる native_presenter から bin の `ui_fullscreen` を参照できないため、
 /// シングルソースをここ (lib 側) に置く。
 pub const CURSOR_HIDE_IDLE_SECS: f32 = 3.0;
+const SEEK_STATUS_DELAY: Duration = Duration::from_millis(150);
+const SEEK_STATUS_MIN_VISIBLE: Duration = Duration::from_millis(300);
+
+fn seek_status_visible_for_times(
+    is_seeking: bool,
+    started_at: Option<Instant>,
+    visible_since: Option<Instant>,
+    now: Instant,
+) -> bool {
+    let active_after_delay = is_seeking
+        && started_at.is_some_and(|started| now.duration_since(started) >= SEEK_STATUS_DELAY);
+    let held_after_completion =
+        visible_since.is_some_and(|shown| now.duration_since(shown) < SEEK_STATUS_MIN_VISIBLE);
+    active_after_delay || held_after_completion
+}
 
 pub struct NativePresenterConfig {
     pub hwnd: HWND,
@@ -202,6 +217,11 @@ struct NativeEguiOverlay {
     video_muted: bool,
     video_playback_speed: f64,
     video_frame_step_active: bool,
+    video_is_seeking: bool,
+    video_seek_serial: u64,
+    seek_status_started_at: Option<Instant>,
+    seek_status_visible_since: Option<Instant>,
+    seek_status_visible: bool,
     video_speed_popup_open: bool,
     frame_step_hold: Option<NativeFrameStepHold>,
     video_loop_enabled: bool,
@@ -1851,6 +1871,8 @@ impl NativeVideoPresenter {
         muted: bool,
         playback_speed: f64,
         frame_step_active: bool,
+        is_seeking: bool,
+        seek_serial: u64,
     ) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.update_video_state(
@@ -1861,6 +1883,8 @@ impl NativeVideoPresenter {
                 muted,
                 playback_speed,
                 frame_step_active,
+                is_seeking,
+                seek_serial,
             );
         }
     }
@@ -1999,6 +2023,8 @@ impl NativeVideoPresenter {
         muted: bool,
         playback_speed: f64,
         frame_step_active: bool,
+        is_seeking: bool,
+        seek_serial: u64,
     ) -> Result<NativeOverlayInputOutcome, String> {
         let outcome = if let Some(overlay) = self.egui_overlay.as_mut() {
             let force_tick_render =
@@ -2011,6 +2037,8 @@ impl NativeVideoPresenter {
                 muted,
                 playback_speed,
                 frame_step_active,
+                is_seeking,
+                seek_serial,
             );
             if force_tick_render {
                 overlay.dirty = true;
@@ -2620,6 +2648,11 @@ impl NativeEguiOverlay {
             video_muted: false,
             video_playback_speed: 1.0,
             video_frame_step_active: false,
+            video_is_seeking: false,
+            video_seek_serial: 0,
+            seek_status_started_at: None,
+            seek_status_visible_since: None,
+            seek_status_visible: false,
             video_speed_popup_open: false,
             frame_step_hold: None,
             video_loop_enabled: false,
@@ -2849,11 +2882,14 @@ impl NativeEguiOverlay {
         muted: bool,
         playback_speed: f64,
         frame_step_active: bool,
+        is_seeking: bool,
+        seek_serial: u64,
     ) {
         let position_secs = finite_nonnegative(position_secs);
         let duration_secs = finite_nonnegative(duration_secs);
         let volume = finite_video_volume(volume);
         let playback_speed = crate::video::clock::clamp_playback_speed(playback_speed);
+        let now = Instant::now();
         let duration_changed = (self.video_duration_secs - duration_secs).abs() > 0.001;
         let position_changed = (self.video_position_secs - position_secs).abs() >= 0.25;
         let playing_changed = self.video_is_playing != is_playing;
@@ -2861,8 +2897,17 @@ impl NativeEguiOverlay {
         let muted_changed = self.video_muted != muted;
         let speed_changed = (self.video_playback_speed - playback_speed).abs() >= 1.0e-6;
         let frame_step_changed = self.video_frame_step_active != frame_step_active;
+        let seeking_changed = self.video_is_seeking != is_seeking;
+        let seek_serial_changed = self.video_seek_serial != seek_serial;
         if !is_playing {
             self.perf_pause_gap_pending = true;
+        }
+        if seeking_changed || (is_seeking && seek_serial_changed) {
+            if is_seeking {
+                self.seek_status_started_at = Some(now);
+            } else {
+                self.seek_status_started_at = None;
+            }
         }
         self.video_position_secs = position_secs;
         self.video_duration_secs = duration_secs;
@@ -2871,6 +2916,8 @@ impl NativeEguiOverlay {
         self.video_muted = muted;
         self.video_playback_speed = playback_speed;
         self.video_frame_step_active = frame_step_active;
+        self.video_is_seeking = is_seeking;
+        self.video_seek_serial = seek_serial;
         if speed_changed {
             // 速度変更前のサンプルは旧 playback_speed のまま `perf_history` に残るが、
             // Y 軸スケールと gap 判定は最新サンプル群の median から導出されるため、
@@ -2886,9 +2933,12 @@ impl NativeEguiOverlay {
             || muted_changed
             || speed_changed
             || frame_step_changed
+            || seeking_changed
+            || seek_serial_changed
         {
             self.dirty = true;
         }
+        self.schedule_seek_status_repaint(now);
     }
 
     fn native_pos(&self, x: i32, y: i32) -> egui::Pos2 {
@@ -3086,6 +3136,63 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
+    fn seek_status_visible_at(&self, now: Instant) -> bool {
+        seek_status_visible_for_times(
+            self.video_is_seeking,
+            self.seek_status_started_at,
+            self.seek_status_visible_since,
+            now,
+        )
+    }
+
+    fn schedule_seek_status_repaint(&mut self, now: Instant) {
+        let seek_delay_deadline = self
+            .video_is_seeking
+            .then(|| {
+                self.seek_status_started_at
+                    .and_then(|started| started.checked_add(SEEK_STATUS_DELAY))
+                    .filter(|deadline| *deadline > now)
+            })
+            .flatten();
+        let hold_deadline = self
+            .seek_status_visible_since
+            .and_then(|shown| shown.checked_add(SEEK_STATUS_MIN_VISIBLE))
+            .filter(|deadline| *deadline > now);
+        let deadline = match (seek_delay_deadline, hold_deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        if let Some(deadline) = deadline {
+            self.next_repaint_deadline = Some(
+                self.next_repaint_deadline
+                    .map_or(deadline, |current| current.min(deadline)),
+            );
+        }
+    }
+
+    fn update_seek_status_for_render(&mut self, now: Instant) -> bool {
+        let active_after_delay = self.video_is_seeking
+            && self
+                .seek_status_started_at
+                .is_some_and(|started| now.duration_since(started) >= SEEK_STATUS_DELAY);
+        let visible_hold_expired = self
+            .seek_status_visible_since
+            .is_some_and(|shown| now.duration_since(shown) >= SEEK_STATUS_MIN_VISIBLE);
+        if !active_after_delay && visible_hold_expired {
+            self.seek_status_visible_since = None;
+        }
+        if active_after_delay {
+            // Keep this fresh while the slow seek is visible so completion gets the
+            // full minimum hold instead of expiring from the first visible frame.
+            self.seek_status_visible_since = Some(now);
+        }
+        let visible = self.seek_status_visible_at(now);
+        self.seek_status_visible = visible;
+        self.schedule_seek_status_repaint(now);
+        visible
+    }
+
     /// eframe 経由でルーティングされた活動 (Space で pause/resume 等) を反映する。
     /// `push_native_event` を経由しない経路用の明示的な活動通知。
     /// `dirty = true` を立てて次フレームで `render_once` を強制実行し、
@@ -3227,6 +3334,8 @@ impl NativeEguiOverlay {
             || self.toast.is_some()
             || self.video_error.is_some()
             || !self.first_frame_presented
+            || self.video_is_seeking
+            || self.seek_status_visible_since.is_some()
             // カーソル auto-hide のカウントダウン中、および 3 秒経過後でもまだ
             // SetCursor(None) を 1 度も打てていない場合は tick を継続する。
             // - cursor_last_activity が Some && !cursor_hidden:
@@ -3380,6 +3489,12 @@ impl NativeEguiOverlay {
             && self.first_frame_presented
             && self.video_error.is_none()
             && !normalize_scanning;
+        let seek_status_visible = self.seek_status_visible
+            && !tile_overlay_visible
+            && self.first_frame_presented
+            && self.video_error.is_none();
+        let status_visible = !tile_overlay_visible
+            && (self.video_error.is_some() || !self.first_frame_presented || seek_status_visible);
         // **bottom_hud_visible** は描画側 (`render_once`) と完全一致させる。
         // CP5 旧版は `hud_visible()` 単独だったが、Codex CP5 P2 #1 で「top bar や
         // side panel 表示中も bottom HUD が描かれるのに region に下端帯がないと
@@ -3437,6 +3552,31 @@ impl NativeEguiOverlay {
                 right: width_px,
                 bottom: height_px,
             });
+        }
+
+        // Center status (error / preparing / slow seek): `draw_native_center_status`
+        // と同じ box サイズを region に含め、HUD HWND の SetWindowRgn でクリップされないようにする。
+        if status_visible {
+            let has_body = self.video_error.is_some();
+            let title = if has_body {
+                "動画を再生できません".to_owned()
+            } else if !self.first_frame_presented {
+                crate::video::avio_progress::build_preparing_message(self.preparing_status)
+            } else {
+                "シーク中...".to_owned()
+            };
+            let available_w = (width_points - 48.0).max(120.0);
+            let box_w = if has_body {
+                width_points.clamp(360.0, 720.0).min(available_w)
+            } else {
+                let text_w = title.chars().count() as f32 * 18.0 + 72.0;
+                text_w.clamp(180.0, 420.0).min(available_w)
+            };
+            let box_h = if has_body { 132.0 } else { 62.0 };
+            regions.push(rect_to_px(egui::Rect::from_center_size(
+                egui::pos2(width_points * 0.5, height_points * 0.5),
+                egui::vec2(box_w, box_h),
+            )));
         }
 
         // Right panel 表示中: `native_metadata_panel_rect` の実 rect を使う
@@ -3797,6 +3937,7 @@ impl NativeEguiOverlay {
         }) {
             self.toast = None;
         }
+        let seek_status_active = self.update_seek_status_for_render(render_t0);
         self.sync_hover_thumbnail_texture();
         self.sync_tile_overlay_textures();
         self.sync_jump_entry_textures();
@@ -3859,7 +4000,11 @@ impl NativeEguiOverlay {
         let top_bar_visible = self.top_bar_visible();
         let right_panel_visible = self.right_panel_visible();
         let tile_overlay_visible = tile_overlay.is_some();
-        let status_visible = video_error.is_some() || !first_frame_presented;
+        let seek_status_visible = seek_status_active
+            && !tile_overlay_visible
+            && first_frame_presented
+            && video_error.is_none();
+        let status_visible = video_error.is_some() || !first_frame_presented || seek_status_visible;
         let toast_visible = toast.is_some();
         let bookmark_title_edit_visible = bookmark_title_edit.is_some();
         let side_panel_visible =
@@ -4012,6 +4157,15 @@ impl NativeEguiOverlay {
                     overlay_width_points,
                     overlay_height_points,
                     &title,
+                    None,
+                    false,
+                );
+            } else if seek_status_visible {
+                draw_native_center_status(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    "シーク中...",
                     None,
                     false,
                 );
@@ -5017,6 +5171,7 @@ impl NativeEguiOverlay {
         } else {
             Instant::now().checked_add(repaint_delay)
         };
+        self.schedule_seek_status_repaint(Instant::now());
         if hud_repaint_debug_enabled() && repaint_delay != Duration::MAX {
             crate::logger::log(format!(
                 "[HUD-DEBUG] egui repaint_delay={:?} pending={} dirty_after_run={}",
@@ -5754,6 +5909,47 @@ mod tests {
 
         event.alt = true;
         assert!(!native_video_fullscreen_shortcut_key(&event));
+    }
+
+    #[test]
+    fn seek_status_waits_for_delay_and_holds_after_completion() {
+        let now = std::time::Instant::now();
+        assert!(!super::seek_status_visible_for_times(
+            true,
+            Some(now),
+            None,
+            now + super::SEEK_STATUS_DELAY / 2
+        ));
+        assert!(super::seek_status_visible_for_times(
+            true,
+            Some(now),
+            None,
+            now + super::SEEK_STATUS_DELAY
+        ));
+        assert!(super::seek_status_visible_for_times(
+            false,
+            None,
+            Some(now),
+            now + super::SEEK_STATUS_MIN_VISIBLE / 2
+        ));
+        assert!(!super::seek_status_visible_for_times(
+            false,
+            None,
+            Some(now),
+            now + super::SEEK_STATUS_MIN_VISIBLE
+        ));
+    }
+
+    #[test]
+    fn seek_status_delay_resets_for_new_seek_generation() {
+        let now = std::time::Instant::now();
+        let second_seek_started = now + std::time::Duration::from_millis(100);
+        assert!(!super::seek_status_visible_for_times(
+            true,
+            Some(second_seek_started),
+            None,
+            now + super::SEEK_STATUS_DELAY
+        ));
     }
 
     #[test]
