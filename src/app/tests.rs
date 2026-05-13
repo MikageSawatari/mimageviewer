@@ -429,18 +429,16 @@ fn clamp_dynamic_for_gpu_scales_landscape_oversize() {
 // =======================================================================
 
 /// Phase C 共通 setup。`data_dir::TEST_OVERRIDE` (プロセス全域のグローバル状態) を
-/// 使うテストはすべてここの `PHASE_C_LOCK` と `setup_app()` を経由する。
+/// 使うテストはすべてここの `setup_app()` を経由する。
 ///
-/// 旧実装は 3 つの test モジュールがそれぞれ独自の `PHASE_C_LOCK` を持っていて、
-/// 別モジュール同士で並列実行されると data_dir override が干渉するリスクがあった
-/// (Codex P3 指摘、2026-04)。親モジュールの 1 本に統合して直列化を保証する。
+/// 旧実装はモジュールごとに独自の `PHASE_C_LOCK` を持っていたが、Codex P2 v9b
+/// (2026-05-14) で **process-global な** `crate::data_dir::test_override_lock()` に
+/// 統合した (settings.rs / settings_db.rs と共通)。これで全モジュールの set_test_override
+/// 使用者が単一の Mutex で直列化される。
 #[cfg(test)]
 mod phase_c_support {
     use super::{App, AppTestConfig};
-    use std::sync::Mutex;
     use tempfile::TempDir;
-
-    pub(super) static PHASE_C_LOCK: Mutex<()> = Mutex::new(());
 
     /// テスト終了時に必ず `data_dir::set_test_override(None)` を呼ぶ RAII ガード。
     /// panic 経路でも確実にオーバーライドを解除して後続テストに影響させない。
@@ -461,9 +459,7 @@ mod phase_c_support {
         TempDir,
         std::sync::MutexGuard<'static, ()>,
     ) {
-        let lock = PHASE_C_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let lock = crate::data_dir::test_override_lock();
         let tmp = TempDir::new().expect("tempdir");
         crate::data_dir::set_test_override(Some(tmp.path().to_path_buf()));
         let guard = OverrideGuard;
@@ -2909,8 +2905,8 @@ mod favorite_adjustment_defaults_tests {
         // 触り直しで再度末尾移動しているはず) なので、ここで先に folders[1] を hit させて
         // folders[0] を本当に最古に位置づけ直す。
         app.get_or_open_catalog(&folders[1]); // [1] を末尾へ
-        // この時点で LRU 順は [0, 2, 3, ..., 15, 1] (= 0 が最古)。
-        // 17 個目 folders[16] を入れると [0] が evict される。
+                                              // この時点で LRU 順は [0, 2, 3, ..., 15, 1] (= 0 が最古)。
+                                              // 17 個目 folders[16] を入れると [0] が evict される。
         app.get_or_open_catalog(&folders[16]);
         assert_eq!(app.catalog_cache_order.len(), 16);
         assert!(
@@ -2926,8 +2922,8 @@ mod favorite_adjustment_defaults_tests {
     /// 同じ idx への再投入だけは旧版どおり cancel する。
     #[test]
     fn erase_inpaint_pending_keeps_jobs_for_different_pages() {
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
         let (mut app, _g, _tmp, _l) = setup_app();
         // 2 つの idx (0=左, 1=右) に対して dummy pending を入れる。
         let make_pending = |idx: usize| {

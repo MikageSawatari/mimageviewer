@@ -2979,9 +2979,9 @@ mod tests {
     // Backup / atomic save tests (#1, #2, #3, #4, #5)
     // -----------------------------------------------------------------
 
-    /// data_dir override は OnceLock 状態に書き込むので並列テストで衝突する。
-    /// 以下のテストはこの mutex で直列化する (App テストの PHASE_C_LOCK と同じ思想)。
-    static BACKUP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // 旧 BACKUP_TEST_LOCK (= settings.rs ローカル) は Codex P2 v9b 2026-05-14 で
+    // 削除。data_dir::set_test_override は process-global なので、settings_db.rs /
+    // app/tests.rs と共有の `crate::data_dir::test_override_lock()` に統一する。
 
     struct BackupTestEnv {
         _tmp: tempfile::TempDir,
@@ -2997,7 +2997,7 @@ mod tests {
     }
 
     fn setup_backup_env() -> BackupTestEnv {
-        let lock = BACKUP_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let lock = crate::data_dir::test_override_lock();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         crate::data_dir::set_test_override(Some(tmp.path().to_path_buf()));
         reset_backup_state_for_test();
