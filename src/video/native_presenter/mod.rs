@@ -74,22 +74,27 @@ fn seek_status_visible_for_times(
     active_after_delay || held_after_completion
 }
 
-fn center_pause_controls_visible_for_state(
+#[derive(Clone, Copy, Debug)]
+struct CenterPauseControlsInputs {
     tile_overlay_visible: bool,
     is_playing: bool,
     frame_step_active: bool,
     first_frame_presented: bool,
     has_video_error: bool,
     normalize_scanning: bool,
-    seek_blocks_center: bool,
-) -> bool {
-    !tile_overlay_visible
-        && !is_playing
-        && !frame_step_active
-        && first_frame_presented
-        && !has_video_error
-        && !normalize_scanning
-        && !seek_blocks_center
+}
+
+fn center_pause_controls_visible_for_state(inputs: CenterPauseControlsInputs) -> bool {
+    !inputs.tile_overlay_visible
+        && !inputs.is_playing
+        && !inputs.frame_step_active
+        && inputs.first_frame_presented
+        && !inputs.has_video_error
+        && !inputs.normalize_scanning
+}
+
+fn center_seek_status_visible(raw_seek_status_visible: bool, paused_center_visible: bool) -> bool {
+    raw_seek_status_visible && !paused_center_visible
 }
 
 pub struct NativePresenterConfig {
@@ -3509,21 +3514,23 @@ impl NativeEguiOverlay {
             self.normalize_state.ui_state,
             crate::video::normalize_types::NormalizeUiState::Scanning
         );
-        let seek_status_visible = self.seek_status_visible
+        let raw_seek_status_visible = self.seek_status_visible
             && !tile_overlay_visible
             && self.first_frame_presented
             && self.video_error.is_none();
         // paused_center_visible (= 中央 replay/play ボタンが見えている) も描画側と一致させる
         // (Codex CP5 P2 #2): paused 中の中央ボタンクリックが VST に抜けないように。
-        let paused_center_visible = center_pause_controls_visible_for_state(
-            tile_overlay_visible,
-            self.video_is_playing,
-            self.video_frame_step_active,
-            self.first_frame_presented,
-            self.video_error.is_some(),
-            normalize_scanning,
-            self.video_is_seeking || seek_status_visible,
-        );
+        let paused_center_visible =
+            center_pause_controls_visible_for_state(CenterPauseControlsInputs {
+                tile_overlay_visible,
+                is_playing: self.video_is_playing,
+                frame_step_active: self.video_frame_step_active,
+                first_frame_presented: self.first_frame_presented,
+                has_video_error: self.video_error.is_some(),
+                normalize_scanning,
+            });
+        let seek_status_visible =
+            center_seek_status_visible(raw_seek_status_visible, paused_center_visible);
         let status_visible = !tile_overlay_visible
             && (self.video_error.is_some() || !self.first_frame_presented || seek_status_visible);
         // **bottom_hud_visible** は描画側 (`render_once`) と完全一致させる。
@@ -4031,11 +4038,10 @@ impl NativeEguiOverlay {
         let top_bar_visible = self.top_bar_visible();
         let right_panel_visible = self.right_panel_visible();
         let tile_overlay_visible = tile_overlay.is_some();
-        let seek_status_visible = seek_status_active
+        let raw_seek_status_visible = seek_status_active
             && !tile_overlay_visible
             && first_frame_presented
             && video_error.is_none();
-        let status_visible = video_error.is_some() || !first_frame_presented || seek_status_visible;
         let toast_visible = toast.is_some();
         let bookmark_title_edit_visible = bookmark_title_edit.is_some();
         let side_panel_visible =
@@ -4047,15 +4053,18 @@ impl NativeEguiOverlay {
             normalize_state_snap.ui_state,
             crate::video::normalize_types::NormalizeUiState::Scanning
         );
-        let paused_center_visible = center_pause_controls_visible_for_state(
-            tile_overlay_visible,
-            is_playing,
-            frame_step_active,
-            first_frame_presented,
-            video_error.is_some(),
-            normalize_scanning,
-            self.video_is_seeking || seek_status_visible,
-        );
+        let paused_center_visible =
+            center_pause_controls_visible_for_state(CenterPauseControlsInputs {
+                tile_overlay_visible,
+                is_playing,
+                frame_step_active,
+                first_frame_presented,
+                has_video_error: video_error.is_some(),
+                normalize_scanning,
+            });
+        let seek_status_visible =
+            center_seek_status_visible(raw_seek_status_visible, paused_center_visible);
+        let status_visible = video_error.is_some() || !first_frame_presented || seek_status_visible;
         let bottom_hud_visible = hud_visible || panel_chrome_visible || paused_center_visible;
         let perf_origin = egui::pos2(14.0, 14.0);
         // Codex 2周目 P1: normalize_scanning も overlay_visible / cursor_blocking_overlay_visible
@@ -5987,13 +5996,53 @@ mod tests {
     }
 
     #[test]
-    fn center_pause_controls_hide_while_seek_blocks_center() {
-        assert!(super::center_pause_controls_visible_for_state(
-            false, false, false, true, false, false, false
-        ));
-        assert!(!super::center_pause_controls_visible_for_state(
-            false, false, false, true, false, false, true
-        ));
+    fn center_pause_controls_visibility_requires_paused_ready_video() {
+        let base = super::CenterPauseControlsInputs {
+            tile_overlay_visible: false,
+            is_playing: false,
+            frame_step_active: false,
+            first_frame_presented: true,
+            has_video_error: false,
+            normalize_scanning: false,
+        };
+        assert!(super::center_pause_controls_visible_for_state(base));
+
+        let cases = [
+            super::CenterPauseControlsInputs {
+                tile_overlay_visible: true,
+                ..base
+            },
+            super::CenterPauseControlsInputs {
+                is_playing: true,
+                ..base
+            },
+            super::CenterPauseControlsInputs {
+                frame_step_active: true,
+                ..base
+            },
+            super::CenterPauseControlsInputs {
+                first_frame_presented: false,
+                ..base
+            },
+            super::CenterPauseControlsInputs {
+                has_video_error: true,
+                ..base
+            },
+            super::CenterPauseControlsInputs {
+                normalize_scanning: true,
+                ..base
+            },
+        ];
+        for inputs in cases {
+            assert!(!super::center_pause_controls_visible_for_state(inputs));
+        }
+    }
+
+    #[test]
+    fn center_seek_status_hides_behind_pause_controls() {
+        assert!(super::center_seek_status_visible(true, false));
+        assert!(!super::center_seek_status_visible(true, true));
+        assert!(!super::center_seek_status_visible(false, false));
     }
 
     #[test]
