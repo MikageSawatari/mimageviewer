@@ -596,6 +596,21 @@ fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// bootstrap 済み DB に存在しなければならないテーブル一覧 (Codex P2 v11 2026-05-14)。
+/// 1 つでも消えていたら `init_schema` の `CREATE IF NOT EXISTS` で silently 再作成
+/// される → empty で load → save_full で完全消去、を防ぐために事前検査する。
+const REQUIRED_TABLES_AFTER_BOOTSTRAP: &[&str] = &[
+    "schema_meta",
+    "settings_kv",
+    "favorites",
+    "tags",
+    "video_resume_positions",
+    "vst3_plugins",
+    "vst3_chain_slots",
+    "recent_open_with_apps",
+    "custom_open_with_apps",
+];
+
 /// `RequireExisting` モードで開いた DB が **bootstrap 完了済み** (= 最初の save_full が
 /// 成功して中身が書かれた) 既存ファイルであることを保証する。
 ///
@@ -609,9 +624,11 @@ fn apply_pragmas(conn: &Connection) -> rusqlite::Result<()> {
 /// 1. `schema_meta` テーブルが存在するか (= 完全に空の DB 検出)
 /// 2. `schema_version` row があるか (= init_schema 終了確認、partial-init 検出)
 /// 3. `bootstrap_complete = '1'` row があるか (= 最初の save_full がコミットされたか)
+/// 4. 必須テーブル全部が存在するか (Codex P2 v11 2026-05-14: テーブル単位の消失検出)
 ///
 /// 3 の marker は `save_full` の transaction 内で書く (= 中身と同じ瞬間に永続化される)。
-/// この三段確認で「init_schema 後 / save_full 前に crash」も Corrupted として bak 経路へ。
+/// この四段確認で「init_schema 後 / save_full 前に crash」「個別テーブル消失」のいずれも
+/// Corrupted として bak 経路へ倒す。
 fn ensure_existing_db_initialized(conn: &Connection) -> Result<(), SettingsDbError> {
     // schema_meta テーブル自体の存在をまず見る。
     let table_exists: bool = conn
@@ -677,6 +694,30 @@ fn ensure_existing_db_initialized(conn: &Connection) -> Result<(), SettingsDbErr
         return Err(SettingsDbError::Corrupted(
             "RequireExisting: bootstrap_complete marker missing".to_string(),
         ));
+    }
+    // Codex P2 v11 (2026-05-14): 個別テーブルの消失検出。`init_schema` の
+    // CREATE IF NOT EXISTS が silently 再作成して empty で load される事故を防ぐ。
+    let mut stmt = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")
+        .map_err(|e| classify_rusqlite_error_for_open(e, "ensure_existing_db_initialized:enum"))?;
+    for table in REQUIRED_TABLES_AFTER_BOOTSTRAP {
+        let exists: bool = stmt
+            .query_row([table], |_| Ok(true))
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(false),
+                _ => Err(e),
+            })
+            .map_err(|e| {
+                classify_rusqlite_error_for_open(e, "ensure_existing_db_initialized:table_check")
+            })?;
+        if !exists {
+            log_diag(&format!(
+                "settings_db: RequireExisting open: required table '{table}' missing"
+            ));
+            return Err(SettingsDbError::Corrupted(format!(
+                "RequireExisting: required table '{table}' missing"
+            )));
+        }
     }
     Ok(())
 }
@@ -1786,6 +1827,29 @@ mod tests {
         let db = SettingsDb::open(dir.path()).unwrap();
         let err = match db.load_into_settings() {
             Ok(_) => panic!("corrupted UUID should fail load_into_settings"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SettingsDbError::Corrupted(_)),
+            "expected Corrupted, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn require_existing_rejects_missing_table() {
+        // Codex P2 v11 (2026-05-14): bootstrap 済み DB で必須テーブルの 1 つが消えていたら
+        // Corrupted。init_schema が CREATE IF NOT EXISTS で silently 再作成する経路を塞ぐ。
+        let dir = TempDir::new().unwrap();
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            db.save_full(&Settings::default()).unwrap();
+        }
+        // 直接 SQL で `favorites` テーブルを drop。
+        let conn = rusqlite::Connection::open(dir.path().join("settings.db")).unwrap();
+        conn.execute_batch("DROP TABLE favorites;").unwrap();
+        drop(conn);
+        let err = match SettingsDb::open(dir.path()) {
+            Ok(_) => panic!("missing favorites table should fail RequireExisting"),
             Err(e) => e,
         };
         assert!(
