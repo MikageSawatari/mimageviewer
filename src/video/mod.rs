@@ -2196,6 +2196,7 @@ fn run_native_video_output(
         );
         drop(candidates);
         let mut latest_renderable: Option<VideoFrame> = None;
+        let mut late_drop_delta = 0u32;
         for action in &selection.actions {
             let frame = source
                 .queue
@@ -2212,6 +2213,7 @@ fn run_native_video_output(
                         late_ms,
                         source.queue.len(),
                     );
+                    late_drop_delta = late_drop_delta.saturating_add(1);
                     native_reset_unpresented_frame(frame);
                 }
                 frame_selection::PopAction::Display => {
@@ -2343,6 +2345,7 @@ fn run_native_video_output(
                             present_waitable_ms: outcome.present_waitable_ms as f32,
                             present_call_ms: outcome.present_call_ms as f32,
                             late_ms: late_ms as f32,
+                            late_drop_delta,
                             source_delta_ms: source_delta_ms as f32,
                             playback_speed: source.clock.playback_speed() as f32,
                             av_drift_ms,

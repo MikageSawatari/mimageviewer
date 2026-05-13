@@ -949,7 +949,11 @@ overlay_draw.rs::draw_native_perf_overlay`) には:
   ラインを点線で描画。Norm clear バグ時の `-5000ms` 級 (= 映像が音声より秒オーダーで
   遅れる方向、`offset = video − audio` で負値) は下端で saturate して「異常」のサインとして
   読める。逆向き (= 映像が音声より進む `+` 方向) も同じく上端 saturate
-- グラフ rect 内: underrun 区間に橙背景帯 (= 既存の frame_gap 赤縦線と同じ流儀)
+- グラフ rect 内: 青い折れ線は present 間隔 (`interval_ms`) のブレを表す。frame interval
+  の長短だけでは赤縦線を出さない。
+- グラフ rect 内: 赤縦線は `late_drop` が増えた sample のみ (= 古い frame を表示前に捨てた
+  タイミング) に出す。`drop` カウンタと視覚 marker の意味を揃える。
+- グラフ rect 内: underrun 区間に橙背景帯。audio 側の警告は赤縦線とは分ける。
 
 ### 検証手順 (修正後の正常動作確認)
 

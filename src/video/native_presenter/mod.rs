@@ -396,6 +396,9 @@ pub struct NativeOverlayPerfSample {
     pub present_waitable_ms: f32,
     pub present_call_ms: f32,
     pub late_ms: f32,
+    /// 本 sample の直前選択で表示前に捨てた frame 数。
+    /// perf graph の赤縦線は frame interval の揺れではなく、この値だけを marker にする。
+    pub late_drop_delta: u32,
     /// PTS delta between consecutive presented frames (= 1/native_fps の生値)。
     /// 再生速度の影響を受けない (= 30fps なら常に 33.33ms)。Y 軸 / gap 判定には
     /// `playback_speed` で割って実 frame interval に正規化したものを使う。

@@ -268,8 +268,8 @@ pub(super) fn draw_native_perf_overlay(
                     }
                     last_draw_x = x;
 
-                    // underrun 区間は橙色背景帯 (= 既存の frame_gap 赤縦線と同じパターン
-                    // だが、同一 sample で何度も描画されることを許容して帯にする)。
+                    // underrun 区間は橙色背景帯。赤縦線は frame drop 専用なので、
+                    // audio 側の警告は別色で帯として見せる。
                     if sample.audio_underrun_active {
                         clipped.line_segment(
                             [egui::pos2(x, graph.min.y), egui::pos2(x, graph.max.y)],
@@ -320,7 +320,7 @@ pub(super) fn draw_native_perf_overlay(
                         1.4,
                         egui::Color32::from_rgb(178, 236, 135),
                     );
-                    if native_perf_sample_has_frame_gap(sample) {
+                    if native_perf_sample_has_late_drop(sample) {
                         clipped.line_segment(
                             [egui::pos2(x, graph.min.y), egui::pos2(x, graph.max.y)],
                             egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 95, 95)),
@@ -2436,19 +2436,8 @@ where
     Some(values[values.len() / 2].clamp(1.0, EXPECTED_MS_MAX))
 }
 
-pub(super) fn native_perf_sample_has_frame_gap(sample: &NativeOverlayPerfSample) -> bool {
-    let interval = sample.interval_ms;
-    if !interval.is_finite() || interval <= 0.0 {
-        return false;
-    }
-    let effective = native_perf_effective_interval_ms(sample);
-    let expected = if effective.is_finite() && effective > 1.0 {
-        effective
-    } else {
-        16.67
-    };
-    let threshold = (expected * 1.35).max(expected + 4.0);
-    interval > threshold
+pub(super) fn native_perf_sample_has_late_drop(sample: &NativeOverlayPerfSample) -> bool {
+    sample.late_drop_delta > 0
 }
 
 pub(super) fn thumbnail_rgba_key(thumbnail: &NativeOverlayThumbnail) -> u64 {
@@ -3046,5 +3035,30 @@ mod tests {
         assert_eq!(hover_bottom, overlay_h - 48.0);
         assert_eq!(jump.max.y, hover_bottom);
         assert_eq!(meta.max.y, hover_bottom);
+    }
+
+    fn perf_sample(late_drop_delta: u32, interval_ms: f32) -> NativeOverlayPerfSample {
+        NativeOverlayPerfSample {
+            arrival: Instant::now(),
+            interval_ms,
+            total_ms: 0.0,
+            copy_ms: 0.0,
+            present_waitable_ms: 0.0,
+            present_call_ms: 0.0,
+            late_ms: 0.0,
+            late_drop_delta,
+            source_delta_ms: 16.67,
+            playback_speed: 1.0,
+            av_drift_ms: 0.0,
+            av_offset_ms: 0.0,
+            audio_lead_ms: 0.0,
+            audio_underrun_active: false,
+        }
+    }
+
+    #[test]
+    fn perf_red_marker_follows_drop_delta_not_interval_gap() {
+        assert!(!native_perf_sample_has_late_drop(&perf_sample(0, 73.3)));
+        assert!(native_perf_sample_has_late_drop(&perf_sample(1, 16.7)));
     }
 }
