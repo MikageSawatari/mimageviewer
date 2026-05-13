@@ -1607,20 +1607,43 @@ struct LoadOutcome {
     main_unreadable: bool,
 }
 
+/// Phase 2 migration の `read_settings_json_for_migration` 戻り値
+/// (Codex P1 v11 2026-05-14)。`Option<Settings>` ではなく明示的な enum で返すことで、
+/// caller が「main が transient I/O で読めないだけ」と「main が parse fail で
+/// bak から復旧した」を区別できるようにする。前者は **bak 採用せず即 abort** が
+/// 正解 (= main の本物が次回読めるまで待つ)。
+pub(crate) enum MigrationReadResult {
+    /// main または bak からの読み込みに成功。
+    Loaded(Settings),
+    /// main が IoError で読めなかった。bak には絶対倒れず、上層は migration 自体を
+    /// 諦めて save 抑止に倒す (= 次回ブートで main がまた読めればそこから migration する)。
+    MainUnreadable,
+    /// main も bak も全部 NotFound / ParseError。migration ソースが完全に無い。
+    AllFailed,
+}
+
 /// Phase 2 (SQLite migration) から呼ぶ migration エントリ。
 ///
-/// `main` (`settings.json`) と `main.bak1..bak10` を順に試行し、最初に成功した
-/// `Settings` を返す。`try_load_with_recovery` のラッパだが:
-/// - 副作用 (broken-ts rename / main への copy 書き戻し) は **抑制する** ため、
-///   1 ファイルずつ純粋 read 試行する。migration 経路は読みっぱなしで OK。
-/// - I/O エラー / NotFound と「全 bak 試行で valid Settings ゼロ」は None で返す。
-///
-/// `Phase 2 only`: 通常の Settings::load 経路 (= `try_load_with_recovery`) は
-/// 副作用付きの方が安全 (= 壊れた main を退避して次回 load が clean) なので、
-/// migration はこちらの読み専用版を使う。
-pub(crate) fn read_settings_json_for_migration(main: &Path) -> Option<Settings> {
-    if let LoadFileResult::Ok(s) = try_parse_settings_file(main) {
-        return Some(s);
+/// `main` (`settings.json`) と `main.bak1..bak10` を順に試行する。`try_load_with_recovery`
+/// のラッパだが:
+/// - 副作用 (broken-ts rename / main への copy 書き戻し) は **抑制する**。migration 経路は
+///   読みっぱなしで OK。
+/// - main の I/O エラーは bak フォールバック対象とせず、`MainUnreadable` で返す
+///   (Codex P1 v11 2026-05-14)。main の transient I/O で誤って古い bak から migrate して
+///   main を上書き quarantine する事故を防ぐ。
+/// - main の NotFound / ParseError は bak フォールバックする (= 内容破損 or 真の不在)。
+pub(crate) fn read_settings_json_for_migration(main: &Path) -> MigrationReadResult {
+    match try_parse_settings_file(main) {
+        LoadFileResult::Ok(s) => return MigrationReadResult::Loaded(s),
+        LoadFileResult::IoError => {
+            settings_diag_log(&format!(
+                "settings: migration: main {} unreadable (I/O error); aborting migration",
+                main.display()
+            ));
+            return MigrationReadResult::MainUnreadable;
+        }
+        // NotFound / ParseError は bak へ
+        LoadFileResult::NotFound | LoadFileResult::ParseError => {}
     }
     for n in 1..=BACKUP_COUNT {
         let bak = backup_path(main, n);
@@ -1629,10 +1652,10 @@ pub(crate) fn read_settings_json_for_migration(main: &Path) -> Option<Settings> 
                 "settings: migration: loaded {} for SQLite migration",
                 bak.display()
             ));
-            return Some(s);
+            return MigrationReadResult::Loaded(s);
         }
     }
-    None
+    MigrationReadResult::AllFailed
 }
 
 /// migration 完了後にリネームすべき旧 JSON ファイル一覧を返す

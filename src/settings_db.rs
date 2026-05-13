@@ -1503,10 +1503,29 @@ pub fn migrate_from_settings_json(
     // `data_dir::get()` 経由のパスは一切経由しない。これで data_dir override と
     // 引数が乖離しても DB と JSON が別 dir に分裂しない。
     let main = data_dir.join("settings.json");
-    let mut loaded = crate::settings::read_settings_json_for_migration(&main).ok_or_else(|| {
-        log_diag("settings_db: migrate_from_settings_json: no readable JSON found");
-        SettingsDbError::Corrupted("no readable settings.json (or bak) for migration".to_string())
-    })?;
+    let mut loaded = match crate::settings::read_settings_json_for_migration(&main) {
+        crate::settings::MigrationReadResult::Loaded(s) => s,
+        crate::settings::MigrationReadResult::MainUnreadable => {
+            // Codex P1 v11 (2026-05-14): main が transient I/O 失敗で読めないだけのケースは
+            // **絶対に bak から migrate しない**。Transient で上層に伝えて save 抑止に倒す。
+            // 上層 (boot_settings_db_inner) はこれを FailedFallbackDefault に変換する。
+            log_diag(
+                "settings_db: migrate_from_settings_json: main settings.json transient I/O; \
+                 aborting migration",
+            );
+            // 専用の SettingsDbError variant を新設しない代わりに、Transient で表現する。
+            // ただし rusqlite::Error は要らないので、ダミー Error を入れる。
+            return Err(SettingsDbError::Transient(
+                rusqlite::Error::QueryReturnedNoRows,
+            ));
+        }
+        crate::settings::MigrationReadResult::AllFailed => {
+            log_diag("settings_db: migrate_from_settings_json: no readable JSON found");
+            return Err(SettingsDbError::Corrupted(
+                "no readable settings.json (or bak) for migration".to_string(),
+            ));
+        }
+    };
 
     // Codex P2 v8b-1 (2026-05-14): Settings::load 経路と同じ load-time migrations を
     // 適用してから DB に書く。これをしないと:
@@ -1676,6 +1695,9 @@ fn boot_settings_db_inner(data_dir: &Path) -> BootOutcome {
                 };
             }
             Err(e) => {
+                // Codex P1 v11 (2026-05-14): migration が Transient で abort したケースも
+                // ここに来る。両方とも FailedFallbackDefault に倒すが、log message で
+                // 区別できるようにする (Transient: main が次回読める可能性が高い)。
                 log_diag(&format!("settings_db: boot: JSON migration failed: {e}"));
                 return BootOutcome {
                     settings: Settings::default(),
@@ -2826,6 +2848,34 @@ mod tests {
         let (_db, loaded) = migrate_from_settings_json(dir).expect("bak migration should work");
         assert_eq!(loaded.grid_cols, 5);
         assert!(!dir.join("settings.json.bak1").exists());
+    }
+
+    #[test]
+    fn migrate_aborts_when_main_io_error_even_with_bak() {
+        // Codex P1 v11 (2026-05-14): main が transient I/O 失敗 (この例ではディレクトリと
+        // 同名衝突で `read` が IoError を返す) なら、bak が読めても migration は abort し、
+        // bak を main と誤認した DB を作らない。
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        // settings.json を **ディレクトリ** として作る → std::fs::read は IoError を返す。
+        std::fs::create_dir(dir.join("settings.json")).unwrap();
+        // bak1 は valid な JSON を置く (本来なら復旧候補)。
+        let mut original = Settings::default();
+        original.grid_cols = 7;
+        write_legacy_json(dir, "settings.json.bak1", &original);
+        // migration を試みると Transient で abort する。
+        let err = match migrate_from_settings_json(dir) {
+            Ok(_) => panic!("migration must abort when main is unreadable"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, SettingsDbError::Transient(_)),
+            "expected Transient, got: {err:?}"
+        );
+        // settings.db は **作られていない**。
+        assert!(!dir.join("settings.db").exists());
+        // bak1 は **リネームされていない** (= まだ復旧に使える)。
+        assert!(dir.join("settings.json.bak1").exists());
     }
 
     #[test]
