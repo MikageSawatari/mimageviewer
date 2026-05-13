@@ -2481,7 +2481,7 @@ pub struct App {
     #[cfg(windows)]
     /// 動画フルスクリーン終了時に main_hwnd の foreground 奪還を試みるべきか。
     /// close_fullscreen 時点で「mIV が foreground だった」ときに true、
-    /// process_native_video_main_chrome_restore 完走 / 期限超過で消費する。
+    /// presenter HWND の destroy 確認 / 期限超過で消費する。
     pub(crate) pending_main_foreground_reclaim: bool,
     #[cfg(windows)]
     /// close_fullscreen 時点での native presenter HWND。Drop 完了の判定に使う

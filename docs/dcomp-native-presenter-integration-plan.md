@@ -181,6 +181,17 @@ Status:
   This avoids white non-client title-bar/border flashes without toggling
   `ViewportCommand::Decorations`, which can resize the main client area and
   disturb the thumbnail grid when fullscreen exits.
+- 2026-05-13: the native fullscreen presenter HWND is now created hidden and
+  shown only after the initial DirectComposition tree and black backbuffer have
+  been committed and flushed. This removes the short `WS_EX_NOREDIRECTIONBITMAP`
+  transparent-HWND window where the blackened main HWND's DWM caption buttons
+  could show through before the presenter had real content.
+- 2026-05-13: native-video fullscreen now disables DWM window transitions on the
+  black egui fullscreen backdrop, the native presenter HWND, and the HUD overlay
+  HWND before those windows are shown. Foreground reclaim after closing native
+  video is also decoupled from the delayed main-chrome restore, so the main HWND
+  is claimed as soon as the presenter HWND is destroyed instead of waiting for
+  the 80ms chrome settling window.
 - 2026-05-05: the Rust panic hook is complemented by a Windows native exception
   handler and a UI heartbeat watchdog. Native access violations are appended to
   `panic.log`, while an `App::update` heartbeat gap of more than five seconds is

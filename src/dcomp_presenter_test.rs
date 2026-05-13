@@ -112,6 +112,7 @@ pub fn run(config: DcompPresenterTestConfig) -> Result<(), String> {
             height: config.height,
         },
         owner_hwnd: 0,
+        initially_visible: true,
         close_on_escape: true,
         post_quit_on_destroy: true,
         event_tx: Some(event_tx),

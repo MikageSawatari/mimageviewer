@@ -1227,6 +1227,7 @@ fn run_native_video_output(
                 rect: config.rect,
             },
             owner_hwnd: config.owner_hwnd,
+            initially_visible: false,
             close_on_escape: false,
             // This HWND lives on the presenter thread, so WM_QUIT only exits
             // this loop and does not affect eframe's main event loop.
@@ -1234,7 +1235,6 @@ fn run_native_video_output(
             event_tx: Some(presenter_event_tx.clone()),
         },
     )?;
-    hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
     // CP7: HUD overlay HWND の有効化判定。
     //   - config.hud_overlay_enabled: App が settings / 環境変数経由で渡してくる ON/OFF。
     //   - 通常は ON (`true`)。
@@ -1270,6 +1270,8 @@ fn run_native_video_output(
             return Err(err);
         }
     };
+    let shown = window.show_and_raise();
+    hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
     // HUD HWND が生成されたら App から見えるように atomic に store。
     // CP4 段階 (= hud_event_tx=None) では生成されないので 0 のまま。
     hud_hwnd_out.store(presenter.hud_hwnd(), Ordering::Release);
@@ -1280,8 +1282,9 @@ fn run_native_video_output(
     presenter.set_editor_hwnds_snapshot(config.editor_hwnds_snapshot.clone());
     presenter.set_main_hwnd_for_raise_check(config.main_hwnd_for_raise);
     crate::logger::log(format!(
-        "[native-video] fullscreen presenter started hwnd=0x{:x} rect=({},{} {}x{}) sync_interval={}",
+        "[native-video] fullscreen presenter started hwnd=0x{:x} shown={} rect=({},{} {}x{}) sync_interval={}",
         window.hwnd().0 as usize,
+        shown,
         config.rect.left,
         config.rect.top,
         width,

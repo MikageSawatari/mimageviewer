@@ -20,6 +20,7 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_ALPHA_MODE_IGNORE, DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM,
     DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
@@ -1140,6 +1141,7 @@ impl NativeVideoPresenter {
                 surface_height: config.height,
             };
             this.recreate_backbuffer(true)?;
+            this.wait_for_initial_composition_ready();
             log_event(
                 "init",
                 &[
@@ -1153,6 +1155,27 @@ impl NativeVideoPresenter {
             );
             Ok(this)
         }
+    }
+
+    fn wait_for_initial_composition_ready(&self) {
+        let wait_t0 = Instant::now();
+        let commit_ok = unsafe { self._dcomp_device.WaitForCommitCompletion() }.is_ok();
+        let after_commit_ms = wait_t0.elapsed().as_secs_f64() * 1000.0;
+        let flush_ok = unsafe { DwmFlush() }.is_ok();
+        let total_ms = wait_t0.elapsed().as_secs_f64() * 1000.0;
+        crate::logger::log(format!(
+            "native-presenter: initial composition ready commit_ok={commit_ok} \
+             flush_ok={flush_ok} commit_ms={after_commit_ms:.2} total_ms={total_ms:.2}"
+        ));
+        log_event(
+            "initial_composition_ready",
+            &[
+                ("commit_ok", Value::from(commit_ok)),
+                ("flush_ok", Value::from(flush_ok)),
+                ("commit_ms", Value::from(after_commit_ms)),
+                ("total_ms", Value::from(total_ms)),
+            ],
+        );
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> Result<(), String> {

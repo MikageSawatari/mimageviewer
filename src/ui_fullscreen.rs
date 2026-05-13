@@ -2096,14 +2096,19 @@ impl App {
     #[cfg(windows)]
     fn show_native_video_black_backdrop(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let fs_id = self.fullscreen_viewport_id();
-        let fs_builder = self.build_fullscreen_viewport_builder_with_transparency(false);
         let need_show = !self.fs_viewport_shown;
+        let mut fs_builder = self.build_fullscreen_viewport_builder_with_transparency(false);
+        if need_show {
+            // 初回だけ hidden で作り、DWM transition 抑止を入れてから表示する。
+            fs_builder = fs_builder.with_visible(false);
+        }
         let mut close_fs = false;
         ctx.show_viewport_immediate(fs_id, fs_builder, |ctx, _class| {
             // Visible な fullscreen viewport なので、native 動画の黒 backdrop 中も
             // IME 状態だけは通常 viewport と同じ入口で更新する。
             self.update_ime_state(ctx);
             if need_show {
+                crate::dwm_transitions::disable_transitions_for_thread_windows();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             }

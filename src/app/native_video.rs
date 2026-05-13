@@ -447,6 +447,8 @@ impl App {
 
     #[cfg(windows)]
     pub(super) fn process_native_video_main_chrome_restore(&mut self, ctx: &egui::Context) {
+        self.process_pending_main_foreground_reclaim(ctx);
+
         let Some(deadline) = self.native_video_main_chrome_restore_at else {
             return;
         };
@@ -460,59 +462,66 @@ impl App {
         if now >= deadline {
             self.native_video_main_chrome_restore_at = None;
             self.sync_native_video_main_chrome(false);
-
-            // foreground 奪還 (条件付き)。close_fullscreen 時点で凍結した条件のみ尊重。
-            // Alt+Tab で他アプリが mIV メインと native popup の間に z-order として
-            // 割り込んでいた場合、popup destroy 後に他アプリが前面に残るのを防ぐ。
-            if self.pending_main_foreground_reclaim {
-                let presenter_destroyed = self.pending_main_foreground_reclaim_after_hwnd == 0
-                    || !crate::video::native_window::is_window_alive(
-                        self.pending_main_foreground_reclaim_after_hwnd,
-                    );
-                let force_deadline_passed = self
-                    .pending_main_foreground_reclaim_force_at
-                    .map(|t| now >= t)
-                    .unwrap_or(true);
-                if presenter_destroyed {
-                    if let Some(hwnd_raw) = self.main_hwnd {
-                        let report = crate::video::native_window::claim_foreground(hwnd_raw as u64);
-                        crate::logger::log(format!(
-                            "[native-video] reclaim main foreground hwnd=0x{:x} \
-                             foreground=0x{:x} post=0x{:x} attach={} set_foreground={} \
-                             set_active={} set_focus={}",
-                            hwnd_raw,
-                            report.foreground_hwnd,
-                            report.post_foreground_hwnd,
-                            report.attach_thread_input_ok,
-                            report.set_foreground_ok,
-                            report.set_active_ok,
-                            report.set_focus_ok,
-                        ));
-                    }
-                    self.pending_main_foreground_reclaim = false;
-                    self.pending_main_foreground_reclaim_after_hwnd = 0;
-                    self.pending_main_foreground_reclaim_force_at = None;
-                } else if force_deadline_passed {
-                    crate::logger::log(format!(
-                        "[native-video] reclaim deadline exceeded, skip claim \
-                         presenter_hwnd=0x{:x} still alive",
-                        self.pending_main_foreground_reclaim_after_hwnd
-                    ));
-                    self.pending_main_foreground_reclaim = false;
-                    self.pending_main_foreground_reclaim_after_hwnd = 0;
-                    self.pending_main_foreground_reclaim_force_at = None;
-                } else {
-                    self.native_video_main_chrome_restore_at =
-                        Some(now + std::time::Duration::from_millis(16));
-                    ctx.request_repaint_after(std::time::Duration::from_millis(16));
-                }
-            }
         } else {
             ctx.request_repaint_after(
                 deadline
                     .saturating_duration_since(now)
                     .min(std::time::Duration::from_millis(16)),
             );
+        }
+    }
+
+    #[cfg(windows)]
+    fn process_pending_main_foreground_reclaim(&mut self, ctx: &egui::Context) {
+        if !self.pending_main_foreground_reclaim {
+            return;
+        }
+
+        // foreground 奪還 (条件付き)。close_fullscreen 時点で凍結した条件のみ尊重。
+        // Alt+Tab で他アプリが mIV メインと native popup の間に z-order として
+        // 割り込んでいた場合、popup destroy 後に他アプリが前面に残るのを防ぐ。
+        //
+        // chrome 復元は fullscreen viewport hide の DWM 反映を待つが、foreground
+        // 奪還まで 80ms 待つと、その間だけ外部ウィンドウが見えることがある。
+        let now = std::time::Instant::now();
+        let presenter_destroyed = self.pending_main_foreground_reclaim_after_hwnd == 0
+            || !crate::video::native_window::is_window_alive(
+                self.pending_main_foreground_reclaim_after_hwnd,
+            );
+        let force_deadline_passed = self
+            .pending_main_foreground_reclaim_force_at
+            .map(|t| now >= t)
+            .unwrap_or(true);
+        if presenter_destroyed {
+            if let Some(hwnd_raw) = self.main_hwnd {
+                let report = crate::video::native_window::claim_foreground(hwnd_raw as u64);
+                crate::logger::log(format!(
+                    "[native-video] reclaim main foreground hwnd=0x{:x} \
+                     foreground=0x{:x} post=0x{:x} attach={} set_foreground={} \
+                     set_active={} set_focus={}",
+                    hwnd_raw,
+                    report.foreground_hwnd,
+                    report.post_foreground_hwnd,
+                    report.attach_thread_input_ok,
+                    report.set_foreground_ok,
+                    report.set_active_ok,
+                    report.set_focus_ok,
+                ));
+            }
+            self.pending_main_foreground_reclaim = false;
+            self.pending_main_foreground_reclaim_after_hwnd = 0;
+            self.pending_main_foreground_reclaim_force_at = None;
+        } else if force_deadline_passed {
+            crate::logger::log(format!(
+                "[native-video] reclaim deadline exceeded, skip claim \
+                 presenter_hwnd=0x{:x} still alive",
+                self.pending_main_foreground_reclaim_after_hwnd
+            ));
+            self.pending_main_foreground_reclaim = false;
+            self.pending_main_foreground_reclaim_after_hwnd = 0;
+            self.pending_main_foreground_reclaim_force_at = None;
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
     }
 
