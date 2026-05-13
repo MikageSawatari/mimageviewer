@@ -169,11 +169,15 @@ Status:
   is hidden only by the normal fullscreen-exit path. During startup the UI
   thread may raise the black egui backdrop above the main HWND by matching its
   monitor-sized window, stopping the main caption from sitting over the startup
-  curtain while the presenter HWND is still hidden. The main viewport itself
-  does not repaint a black panel and its DWM caption/border are not recolored
-  during native-video fullscreen; if Windows transiently exposes the main HWND,
-  letting the eframe render pass fall back to the normal theme fill is less
-  visually disruptive than a black client area with the normal title bar on top.
+  curtain while the presenter HWND is still hidden. As an additional guard, the
+  main HWND is temporarily cloaked with `DWMWA_CLOAK` during native-video
+  startup and video-to-video swaps, then uncloaked as soon as the presenter HWND
+  is valid (and always before close-time foreground reclaim). The main viewport
+  itself does not repaint a black panel and its DWM caption/border are not
+  recolored during native-video fullscreen; if cloak or z-order recovery fails,
+  there is no deliberate high-contrast "black client plus normal title bar"
+  repaint on the main HWND, but the cloak remains the primary guard because the
+  backend clear color of an empty main frame is not a reliable visual fallback.
   This avoids non-client
   title-bar/border flashes without toggling `ViewportCommand::Decorations`,
   which can resize the main client area and disturb the thumbnail grid when
@@ -208,6 +212,13 @@ Status:
   on its first frame. After the HWND exists, the UI thread applies
   `DWMWA_TRANSITIONS_FORCEDISABLED` and only then sends `Visible(true)`, so the
   first show uses the no-transition path instead of Windows' default zoom/fade.
+- 2026-05-13: the main HWND is now cloaked with `DWMWA_CLOAK` while a native
+  video fullscreen is entering or swapping to another video, and uncloaked once
+  the native presenter HWND becomes valid. This removes the remaining one-frame
+  case where the main non-client title bar could be composed above the black
+  fullscreen backdrop before the presenter window took over. The uncloaking path
+  also runs before close-time foreground reclaim and during app shutdown so
+  `SetForegroundWindow` never targets a cloaked main HWND.
 - 2026-05-05: the Rust panic hook is complemented by a Windows native exception
   handler and a UI heartbeat watchdog. Native access violations are appended to
   `panic.log`, while an `App::update` heartbeat gap of more than five seconds is

@@ -657,6 +657,11 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
   した後に mIV foreground へ戻ったエッジで `RaisePresenterToFront` command を
   rate-limit 送信し、presenter 所有スレッド側で `HWND_TOP` と foreground / active /
   focus を再アサートする。
+- **main HWND cloak**: native video fullscreen の entry と video-to-video swap では、
+  presenter HWND が valid になるまで main HWND に `DWMWA_CLOAK` を設定する。これは
+  `IsWindowVisible` を変えないため App::update は継続し、DWM 合成結果からだけ main を
+  外す。presenter HWND が valid になった時点、fullscreen exit、app exit では必ず
+  uncloak し、foreground reclaim が cloaked main HWND を対象にしないようにする。
 
 ### フルスクリーン終了時の foreground 奪還
 
@@ -667,12 +672,14 @@ popup destroy 後に Windows が owner ではなく z-order 順で次の他ア�
 
 これを補正するため、`close_fullscreen` 時点で奪還候補を凍結し
 ([src/app.rs](../src/app.rs) `pending_main_foreground_reclaim*` フィールド群)、
-chrome 復帰の deferred restore に相乗りで `SetForegroundWindow(main_hwnd)` を
+presenter HWND の destroy を確認した時点で `SetForegroundWindow(main_hwnd)` を
 `AttachThreadInput` 併用で呼び戻す ([src/app/native_video.rs](../src/app/native_video.rs)
-`process_native_video_main_chrome_restore`)。
+`process_pending_main_foreground_reclaim`)。native video entry/swap で main HWND を
+cloaked にしていた場合は、`close_fullscreen` 内で先に uncloak してから reclaim 候補を
+保存する。
 
 ガード条件:
-- 動画フルスクリーンを通った時のみ (`native_video_main_chrome_black=true`)
+- 動画フルスクリーンを通った時のみ (`native_video_fullscreen_active_for_main_backdrop()`)
 - close_fullscreen 時点で mIV プロセスが foreground を持っていた場合のみ
   ([src/video/native_window.rs](../src/video/native_window.rs)
   `foreground_belongs_to_current_process_strict`、null/pid=0 の不確定ケースは false)

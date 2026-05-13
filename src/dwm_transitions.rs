@@ -15,8 +15,8 @@
 
 use windows::Win32::Foundation::{HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_COLOR_DEFAULT, DWMWA_TRANSITIONS_FORCEDISABLED,
-    DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR, DWMWA_CLOAK, DWMWA_COLOR_DEFAULT,
+    DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
 };
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -50,6 +50,18 @@ pub fn disable_transitions_for_window(hwnd: HWND) {
             std::mem::size_of::<BOOL>() as u32,
         )
     };
+}
+
+pub fn set_window_cloaked(hwnd: HWND, cloaked: bool) -> windows::core::Result<()> {
+    let cloak: i32 = if cloaked { 1 } else { 0 };
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CLOAK,
+            &cloak as *const i32 as *const _,
+            std::mem::size_of::<i32>() as u32,
+        )
+    }
 }
 
 pub fn raise_visible_thread_window_matching_rect(main_hwnd: HWND, expected: RECT) -> Option<HWND> {

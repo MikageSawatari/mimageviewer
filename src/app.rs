@@ -2479,6 +2479,11 @@ pub struct App {
     /// まで theme chrome 復元を少し遅らせるための期限。
     native_video_main_chrome_restore_at: Option<std::time::Instant>,
     #[cfg(windows)]
+    /// Native video fullscreen の startup / video-to-video swap 中だけ main HWND を
+    /// DWM 合成対象から外しているか。`IsWindowVisible` は true のままなので
+    /// winit/eframe の update loop は止まらない。
+    native_video_main_cloaked: bool,
+    #[cfg(windows)]
     /// 動画フルスクリーン終了時に main_hwnd の foreground 奪還を試みるべきか。
     /// close_fullscreen 時点で「mIV が foreground だった」ときに true、
     /// presenter HWND の destroy 確認 / 期限超過で消費する。
@@ -3040,6 +3045,8 @@ impl Default for App {
             native_video_main_chrome_black: false,
             #[cfg(windows)]
             native_video_main_chrome_restore_at: None,
+            #[cfg(windows)]
+            native_video_main_cloaked: false,
             #[cfg(windows)]
             pending_main_foreground_reclaim: false,
             #[cfg(windows)]
@@ -8906,6 +8913,15 @@ impl App {
         // スタックで管理する (画像移動でさらにクリアされる)。
         self.clear_meta_undo();
         self.fullscreen_idx = Some(idx);
+        #[cfg(windows)]
+        let entering_native_video_fullscreen =
+            matches!(self.items.get(idx), Some(GridItem::Video(_)));
+        #[cfg(windows)]
+        if entering_native_video_fullscreen {
+            self.sync_native_video_main_cloak(true);
+        } else {
+            self.sync_native_video_main_cloak(false);
+        }
         // フルスクリーン入場時にカーソル idle タイマをリセット (= 直前まで隠れていた
         // 状態を引き継がないようにする)。前回フルスクリーンを 5 分放置した後に
         // すぐ再入場した場合、Some(<古い時刻>) のままだと 1 フレーム目で
@@ -8914,7 +8930,7 @@ impl App {
         self.cursor_hidden = false;
         self.refresh_fullscreen_video_marker_cache(idx);
         #[cfg(windows)]
-        if self.native_video_fullscreen_active_for_main_backdrop() {
+        if entering_native_video_fullscreen {
             // 黒 chrome は fullscreen/backdrop viewport を描画した後の update 末尾で
             // 適用する。ここで先に DWM chrome だけ変えると、通常ウィンドウの
             // タイトルバーが黒くなってから fullscreen が出る 1-frame race が見える。
@@ -11202,13 +11218,19 @@ impl App {
             self.native_video_front_recover_after_external_foreground = false;
             self.native_video_pointer_down = None;
             self.schedule_native_video_main_chrome_restore();
+            let native_video_was_active = self.native_video_fullscreen_active_for_main_backdrop();
+            if native_video_was_active || self.native_video_main_cloaked {
+                // SetForegroundWindow cannot reliably target a cloaked HWND. Bring
+                // the main window back into DWM composition before scheduling the
+                // foreground reclaim, while the presenter/backdrop still mask it.
+                self.sync_native_video_main_cloak(false);
+            }
             // 動画フルスクリーンだったときだけ奪還候補。
             // mIV が foreground を持っていた瞬間にだけ true にする (ユーザーが他アプリを
             // 意図的に前面にしていたケースで奪い返さないため)。
             // foreground=null/pid=0 の不確定ケースは保守的に false 扱い。
             let foreground_is_ours =
                 crate::video::native_window::foreground_belongs_to_current_process_strict();
-            let native_video_was_active = self.native_video_fullscreen_active_for_main_backdrop();
             if native_video_was_active && foreground_is_ours {
                 self.pending_main_foreground_reclaim = true;
                 self.pending_main_foreground_reclaim_after_hwnd =
@@ -14199,12 +14221,23 @@ impl eframe::App for App {
             >= std::time::Duration::from_secs(1)
         {
             let heartbeat = format!(
-                "[heartbeat] app_update fullscreen={:?} native_main_backdrop={} main_hwnd={:?}",
+                "[heartbeat] app_update fullscreen={:?} native_main_backdrop={} \
+                 native_main_cloaked={} main_hwnd={:?}",
                 self.fullscreen_idx,
                 {
                     #[cfg(windows)]
                     {
                         self.native_video_fullscreen_active_for_main_backdrop()
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        false
+                    }
+                },
+                {
+                    #[cfg(windows)]
+                    {
+                        self.native_video_main_cloaked
                     }
                     #[cfg(not(windows))]
                     {
@@ -14823,6 +14856,7 @@ impl eframe::App for App {
             let native_main_backdrop = self.native_video_fullscreen_active_for_main_backdrop();
             if native_main_backdrop {
                 self.sync_native_video_main_chrome(true);
+                self.sync_native_video_main_cloak(self.native_video_presenter_hwnd().is_none());
                 // Do not paint the main viewport black while the native video
                 // backdrop is taking over. If the main HWND transiently leaks
                 // above the fullscreen backdrop, a black client area makes the
@@ -14830,6 +14864,7 @@ impl eframe::App for App {
                 ctx.request_repaint_after(std::time::Duration::from_millis(16));
                 return;
             }
+            self.sync_native_video_main_cloak(false);
             self.process_native_video_main_chrome_restore(ctx);
         }
 
@@ -15474,6 +15509,7 @@ impl eframe::App for App {
         // query して結果を settings に書き込んでから持続化する順序が必要。
         #[cfg(windows)]
         {
+            self.sync_native_video_main_cloak(false);
             let states = self.snapshot_vst3_states_into_settings();
             let positions = self.snapshot_vst3_window_positions_into_settings();
             if states > 0 || positions > 0 {

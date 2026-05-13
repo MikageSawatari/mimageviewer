@@ -87,6 +87,7 @@ impl App {
     #[cfg(windows)]
     pub(super) fn ensure_native_video_front(&mut self) {
         if self.fullscreen_idx.is_none() {
+            self.sync_native_video_main_cloak(false);
             if self.native_video_front_synced_hwnd != 0 {
                 // CP7: フルスクリーン解除時に DspBridge 側の owner / hud HWND 登録もクリア。
                 self.dsp_bridge.unregister_fullscreen_owner();
@@ -129,6 +130,7 @@ impl App {
             // 既存 HWND が継続しているケースでも、HUD HWND は遅延生成されることがあるので
             // bridge 側の登録値が古い (0) のままにならないよう毎フレーム refresh する。
             self.dsp_bridge.set_hud_hwnd(hud_hwnd);
+            self.sync_native_video_main_cloak(false);
             // PrintScreen / Snipping Tool の範囲選択後に egui 側の黒 backdrop が
             // presenter HWND より前に残ることがある。外部 foreground を一度観測し、
             // mIV に戻ったエッジだけで presenter 所有スレッドへ復旧を依頼する。
@@ -182,6 +184,7 @@ impl App {
         //   (= `current_gui_owner_hwnd` 内で除外済み)。
         self.dsp_bridge.register_fullscreen_owner(hwnd);
         self.dsp_bridge.set_hud_hwnd(hud_hwnd);
+        self.sync_native_video_main_cloak(false);
         // 実機修正 (2026-05-12 P1 致命的問題): cross-process SetWindowPos(VST_HWND) は
         // bridge GUI スレッドをブロックして bridge 自殺 → VST 全消失。clamp 機能完全削除。
         crate::video::native_window::log_state(hwnd, "synced");
@@ -450,6 +453,34 @@ impl App {
             crate::dwm_transitions::restore_window_chrome_for_theme(hwnd, dark);
         }
         self.native_video_main_chrome_black = active;
+    }
+
+    #[cfg(windows)]
+    pub(super) fn sync_native_video_main_cloak(&mut self, cloaked: bool) {
+        if cloaked == self.native_video_main_cloaked {
+            return;
+        }
+        let Some(hwnd_raw) = self.main_hwnd else {
+            crate::logger::log(format!(
+                "[native-video] main cloak skipped cloaked={cloaked} hwnd=<none>"
+            ));
+            return;
+        };
+        let hwnd = windows::Win32::Foundation::HWND(hwnd_raw as *mut _);
+        match crate::dwm_transitions::set_window_cloaked(hwnd, cloaked) {
+            Ok(()) => {
+                self.native_video_main_cloaked = cloaked;
+                crate::logger::log(format!(
+                    "[native-video] main cloak={cloaked} hwnd=0x{hwnd_raw:x}"
+                ));
+            }
+            Err(err) => {
+                crate::logger::log(format!(
+                    "[native-video] main cloak failed cloaked={cloaked} \
+                     hwnd=0x{hwnd_raw:x} err={err:?}"
+                ));
+            }
+        }
     }
 
     #[cfg(windows)]
