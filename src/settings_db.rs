@@ -85,6 +85,10 @@ pub enum SettingsDbError {
     /// `save_full` を呼んではならない** (= ユーザー設定の上書きを防ぐ)。`open()` で
     /// 開き直すか、上層で別の fallback を試す。
     AlreadyBootstrapped,
+    /// 本セッションの save が抑止されている (Codex P2 v8b-3 2026-05-14)。
+    /// `boot_settings_db` が FailedFallbackDefault を返したあとなど。`with_db` が
+    /// この variant を返すと、Phase 3 caller は `save_full` を呼ばずに skip する。
+    SaveSuppressed,
     /// その他の rusqlite エラー。
     Rusqlite(rusqlite::Error),
     /// JSON ラウンドトリップ失敗。
@@ -102,6 +106,7 @@ impl std::fmt::Display for SettingsDbError {
             Self::AlreadyBootstrapped => {
                 write!(f, "create_new called on already-bootstrapped settings.db")
             }
+            Self::SaveSuppressed => write!(f, "save suppressed this session"),
             Self::Rusqlite(e) => write!(f, "sqlite error: {e}"),
             Self::Serde(e) => write!(f, "serde_json error: {e}"),
             Self::Poisoned => write!(f, "settings db mutex poisoned"),
@@ -114,7 +119,10 @@ impl std::error::Error for SettingsDbError {
         match self {
             Self::Transient(e) | Self::Permission(e) | Self::Rusqlite(e) => Some(e),
             Self::Serde(e) => Some(e),
-            Self::Corrupted(_) | Self::Poisoned | Self::AlreadyBootstrapped => None,
+            Self::Corrupted(_)
+            | Self::Poisoned
+            | Self::AlreadyBootstrapped
+            | Self::SaveSuppressed => None,
         }
     }
 }
@@ -1378,19 +1386,30 @@ fn hash_vst3_chain_slots(slots: &Vst3ChainPresetSlots) -> u64 {
 // Phase 2: quarantine / JSON migration / boot decision tree (spec §5)
 // ---------------------------------------------------------------------------
 
-/// `<data_dir>/settings.db{,-wal,-shm}` を 3 セットで `.corrupted-<ts>` にリネームする。
+/// quarantine 名のユニーク化 counter (Codex P2 v8b-4 2026-05-14)。
+/// 同一秒内に複数回 quarantine を呼ぶケース (= bak から復旧 → 再失敗 → quarantine)
+/// で `.corrupted-<ts>` が衝突するのを防ぐ。
+static QUARANTINE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `<data_dir>/settings.db{,-wal,-shm}` を 3 セットで `.corrupted-<ts>-<seq>` にリネームする。
 ///
 /// spec §6.2 に従い、Corrupted 検出時に main DB だけでなく WAL / SHM も一緒に退避する。
 /// これで新しい DB を作り直したときに古い WAL の recovery で誤った内容が混入するのを防ぐ。
 /// ファイルが無いものは無視する (= NotFound はエラーにしない)。
 ///
+/// 同一秒内の複数回呼び出し (= bak から復旧 → 再失敗 → 再 quarantine) で `.corrupted-<ts>`
+/// が衝突して rename が失敗するのを防ぐため、unix epoch 秒 + プロセス内 atomic counter で
+/// suffix を一意化する (Codex P2 v8b-4 2026-05-14)。
+///
 /// 戻り値: 退避したファイル数 (= 0 でも error にはしない、main が transient missing の
 /// ケースも含むため)。
 pub fn quarantine_db_files(data_dir: &Path) -> usize {
+    use std::sync::atomic::Ordering;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let seq = QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
     let names = [
         "settings.db".to_string(),
         "settings.db-wal".to_string(),
@@ -1402,7 +1421,7 @@ pub fn quarantine_db_files(data_dir: &Path) -> usize {
         if !src.exists() {
             continue;
         }
-        let dst = data_dir.join(format!("{name}.corrupted-{ts}"));
+        let dst = data_dir.join(format!("{name}.corrupted-{ts}-{seq}"));
         match std::fs::rename(&src, &dst) {
             Ok(_) => {
                 log_diag(&format!(
@@ -1425,6 +1444,9 @@ pub fn quarantine_db_files(data_dir: &Path) -> usize {
 }
 
 /// `<data_dir>` 配下の旧 `settings.json{,.bak1..bak10}` を `.migrated-<ts>` にリネームする。
+/// `data_dir` 引数を**唯一の真**として使う (= グローバル `data_dir::get()` には依存しない、
+/// Codex P2 v8b-2 2026-05-14)。これで data_dir override と引数が乖離しても DB と JSON が
+/// 別 dir に分裂しない。
 ///
 /// 戻り値: リネームしたファイル数。リネーム失敗は個別に log するが abort はしない
 /// (= 一部成功 + 一部失敗が起きても migration 全体は通す)。
@@ -1433,22 +1455,16 @@ fn rename_legacy_json_files(data_dir: &Path) -> usize {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // settings.rs の Settings::settings_path() は data_dir::get() を使うので、テスト時に
-    // tempdir に切り替わっている前提。data_dir 引数とその挙動が同期している必要がある。
-    let main = crate::settings::legacy_settings_json_path();
+    let main = data_dir.join("settings.json");
     let files = crate::settings::legacy_json_files_for_migration(&main);
     let mut moved = 0;
     for src in files {
-        // file_name() で拡張子付き名前を取り、.migrated-<ts> を追加する。
         let mut name = match src.file_name() {
             Some(n) => n.to_owned(),
             None => continue,
         };
         name.push(format!(".migrated-{ts}"));
         let dst = src.with_file_name(name);
-        // dst は data_dir 直下 (settings.rs の path 計算より) なので data_dir 引数を経由しない。
-        // 引数 data_dir はログのコンテキスト用 (= 将来の test 整合性チェック用)。
-        let _ = data_dir;
         match std::fs::rename(&src, &dst) {
             Ok(_) => {
                 log_diag(&format!(
@@ -1483,11 +1499,21 @@ fn rename_legacy_json_files(data_dir: &Path) -> usize {
 pub fn migrate_from_settings_json(
     data_dir: &Path,
 ) -> Result<(SettingsDb, Settings), SettingsDbError> {
-    let main = crate::settings::legacy_settings_json_path();
-    let loaded = crate::settings::read_settings_json_for_migration(&main).ok_or_else(|| {
+    // Codex P2 v8b-2 (2026-05-14): data_dir 引数を **唯一の真** として使う。
+    // `data_dir::get()` 経由のパスは一切経由しない。これで data_dir override と
+    // 引数が乖離しても DB と JSON が別 dir に分裂しない。
+    let main = data_dir.join("settings.json");
+    let mut loaded = crate::settings::read_settings_json_for_migration(&main).ok_or_else(|| {
         log_diag("settings_db: migrate_from_settings_json: no readable JSON found");
         SettingsDbError::Corrupted("no readable settings.json (or bak) for migration".to_string())
     })?;
+
+    // Codex P2 v8b-1 (2026-05-14): Settings::load 経路と同じ load-time migrations を
+    // 適用してから DB に書く。これをしないと:
+    // - favorites の id が全部 Uuid::nil() で残り PRIMARY KEY 衝突 → save_full 失敗
+    // - 旧 vst3_plugin_path/state が新 Vec に流れない
+    // - 旧 video_loop=true が video_loop_mode に伝わらない
+    crate::settings::apply_load_time_migrations(&mut loaded);
 
     // 新規 DB を bootstrap。family が見える環境では `create_new` が AlreadyBootstrapped を
     // 返すので、Phase 2 caller が migrate_from_settings_json を呼ぶ前に
@@ -1615,20 +1641,12 @@ fn boot_settings_db_inner(data_dir: &Path) -> BootOutcome {
         }
     }
 
-    // 2. family 不在: settings.json があれば migration
-    let json_path = crate::settings::legacy_settings_json_path();
-    let json_exists = std::fs::metadata(&json_path).is_ok()
-        || (1..=10).any(|n| {
-            let bak = {
-                let mut name = json_path
-                    .file_name()
-                    .map(|n| n.to_owned())
-                    .unwrap_or_default();
-                name.push(format!(".bak{n}"));
-                json_path.with_file_name(name)
-            };
-            std::fs::metadata(&bak).is_ok()
-        });
+    // 2. family 不在: settings.json があれば migration。
+    //    Codex P1 v8b (2026-05-14): per-file metadata だけだと AV / cloud sync 等の
+    //    transient NotFound で「JSON 無し」と誤判定して旧 JSON migration を奪う事故が
+    //    起きる。`legacy_json_family_exists` は per-file metadata + read_dir の二経路で
+    //    robust 化されているのでそれを使う。
+    let json_exists = crate::settings::legacy_json_family_exists(data_dir);
     if json_exists {
         match migrate_from_settings_json(data_dir) {
             Ok((db, settings)) => {
@@ -1749,14 +1767,36 @@ fn boot_recover_from_bak(data_dir: &Path) -> BootOutcome {
 
 static GLOBAL_DB: Mutex<Option<(PathBuf, Arc<SettingsDb>)>> = Mutex::new(None);
 
+/// 本セッションの save を完全に抑止するフラグ (Codex P2 v8b-3 2026-05-14)。
+///
+/// `boot_settings_db` が `BootOutcome.db == None` を返すとき (= 全復旧経路が失敗)
+/// にセットする。`with_db` はこのフラグが立っているとき `Transient` の代わりに
+/// `Suppressed` を返し、lazy re-open を試みない。これで Phase 3 で
+/// `Settings::save()` が誤って `with_db` 経由で defaults を書き戻す事故を防ぐ。
+///
+/// Phase 3 で `Settings::save()` 直接側にも対称的なフラグを設ける予定 (=
+/// 旧 `MAIN_UNREADABLE_THIS_SESSION` のセマンティクス継承)。
+static SAVE_SUPPRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 本セッションの save 抑止を強制する / 解除する。
+pub fn set_save_suppressed(suppressed: bool) {
+    SAVE_SUPPRESSED.store(suppressed, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn save_suppressed() -> bool {
+    SAVE_SUPPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `boot_settings_db` から GLOBAL_DB をセット / クリアする。
 ///
-/// `db == Some(arc)` → 次の `with_db` で arc を返す。
-/// `db == None` → save 抑止状態 (= `with_db` は `SaveSuppressed` を返す)。
+/// `db == Some(arc)` → 次の `with_db` で arc を返す。save 抑止フラグもクリア。
+/// `db == None` → save 抑止フラグを立てる (= `with_db` は `Suppressed` を返す)。
 pub(crate) fn set_global_db(data_dir: &Path, db: Option<Arc<SettingsDb>>) {
+    let suppress = db.is_none();
     if let Ok(mut guard) = GLOBAL_DB.lock() {
         *guard = db.map(|arc| (data_dir.to_path_buf(), arc));
     }
+    set_save_suppressed(suppress);
 }
 
 /// グローバル `SettingsDb` ハンドルを使って closure を実行する。
@@ -1766,9 +1806,17 @@ pub(crate) fn set_global_db(data_dir: &Path, db: Option<Arc<SettingsDb>>) {
 /// test override で `data_dir::get()` が変わったケースでは、`SettingsDb::open()` を
 /// lazy に試みる。open に失敗したら `Transient` 等が伝搬する。
 ///
+/// **save 抑止状態** (Codex P2 v8b-3 2026-05-14): `SAVE_SUPPRESSED` が立っている間は
+/// `SettingsDbError::SaveSuppressed` を返し、lazy re-open を試みない。これで
+/// `boot_settings_db` が FailedFallbackDefault を返した後、Phase 3 caller が誤って
+/// defaults を DB に書き戻すのを防ぐ。
+///
 /// - 内部 lock は `Arc<SettingsDb>` を clone する間だけ。closure 実行中は
 ///   global lock を持たない (= 並列 `with_db` がブロックしない)
 pub fn with_db<R>(f: impl FnOnce(&SettingsDb) -> R) -> Result<R, SettingsDbError> {
+    if save_suppressed() {
+        return Err(SettingsDbError::SaveSuppressed);
+    }
     let db_arc: Arc<SettingsDb> = {
         let mut guard = GLOBAL_DB.lock().map_err(|_| SettingsDbError::Poisoned)?;
         let current_dir = crate::data_dir::get();
@@ -1811,20 +1859,14 @@ mod tests {
     use crate::settings::{RecentApp, Settings, TagDef};
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
-
-    /// data_dir は process-global なので、`set_test_override` を使う Phase 2 系のテストは
-    /// **同時 1 本** に直列化する。テスト内で必ず取って drop までホールドする。
-    fn data_dir_serial() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        // poison は無視 (= panic で次のテストもブロックしない)。
-        let mu = LOCK.get_or_init(|| Mutex::new(()));
-        mu.lock().unwrap_or_else(|e| e.into_inner())
-    }
 
     /// data_dir override をテンポラリ dir にセットし、global DB handle もクリアする。
     /// 返値の guard が drop されると override が解除される。
+    ///
+    /// 直列化ロックは `crate::data_dir::test_override_lock()` (= process-global) を
+    /// 使うので、settings.rs / app/tests.rs 等他ファイルのテストとも安全に
+    /// インターロックする (Codex P2 v8b-5 2026-05-14)。
     struct DataDirOverrideGuard {
         _tempdir: TempDir,
         path: PathBuf,
@@ -1833,11 +1875,12 @@ mod tests {
 
     impl DataDirOverrideGuard {
         fn new() -> Self {
-            let serial = data_dir_serial();
+            let serial = crate::data_dir::test_override_lock();
             let tempdir = TempDir::new().unwrap();
             let path = tempdir.path().to_path_buf();
             crate::data_dir::set_test_override(Some(path.clone()));
             reset_global_for_test();
+            set_save_suppressed(false);
             Self {
                 _tempdir: tempdir,
                 path,
@@ -1853,6 +1896,7 @@ mod tests {
         fn drop(&mut self) {
             crate::data_dir::set_test_override(None);
             reset_global_for_test();
+            set_save_suppressed(false);
         }
     }
 
@@ -2825,7 +2869,53 @@ mod tests {
         let outcome = boot_settings_db(dir);
         assert_eq!(outcome.source, BootSource::FailedFallbackDefault);
         assert!(outcome.db.is_none());
-        // with_db は「global が空」状態なので、open を試みる → 既存破損ファイルで Corrupted。
-        // (Phase 3 caller はこの状態を save 抑止として扱う。)
+        // SAVE_SUPPRESSED が立っており、後続の with_db は SaveSuppressed で fail-fast する
+        // (Codex P2 v8b-3 2026-05-14)。
+        assert!(save_suppressed());
+        let err = with_db(|_db| ()).expect_err("with_db should be suppressed");
+        assert!(
+            matches!(err, SettingsDbError::SaveSuppressed),
+            "expected SaveSuppressed, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn boot_clears_save_suppressed_on_success() {
+        // 成功 boot の後は save 抑止が解除されていること (= 直前のテストの状態が残らない)。
+        let guard = DataDirOverrideGuard::new();
+        // 強制的に suppressed 状態を作る → boot が成功して解除されるか確認。
+        set_save_suppressed(true);
+        let outcome = boot_settings_db(guard.path());
+        assert_eq!(outcome.source, BootSource::CleanInstall);
+        assert!(!save_suppressed());
+        with_db(|_db| ()).expect("with_db should succeed after a fresh boot");
+    }
+
+    #[test]
+    fn migrate_applies_load_time_migrations() {
+        // Codex P2 v8b-1 (2026-05-14): nil-UUID favorite が複数あっても save_full が
+        // PRIMARY KEY 衝突しない (= sanitize で個別 UUID が振られる)。
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        // 旧形式の favorite (= 文字列で path だけ書く) を 2 つ持つ JSON を用意。
+        // Settings の Deserialize 実装が Legacy 形式を受け付け、id = Uuid::nil() として
+        // load される (sanitize 前)。
+        let raw = r#"{
+            "favorites": ["C:\\A", "C:\\B"],
+            "vst3_plugin_path": "C:\\X.vst3",
+            "vst3_plugin_state": "AAA"
+        }"#;
+        std::fs::write(dir.join("settings.json"), raw).unwrap();
+        let (_, loaded) =
+            migrate_from_settings_json(dir).expect("migration should succeed with sanitize");
+        assert_eq!(loaded.favorites.len(), 2);
+        // 両方の id が nil でなく、かつ異なることを確認 (sanitize で新規 UUID 発行済み)。
+        assert!(!loaded.favorites[0].id.is_nil());
+        assert!(!loaded.favorites[1].id.is_nil());
+        assert_ne!(loaded.favorites[0].id, loaded.favorites[1].id);
+        // vst3 legacy が Vec に流れていること。
+        assert_eq!(loaded.vst3_plugins.len(), 1);
+        assert_eq!(loaded.vst3_plugin_path, None);
+        assert_eq!(loaded.vst3_plugin_state, None);
     }
 }

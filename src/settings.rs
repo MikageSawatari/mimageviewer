@@ -1636,7 +1636,7 @@ pub(crate) fn read_settings_json_for_migration(main: &Path) -> Option<Settings> 
 }
 
 /// migration 完了後にリネームすべき旧 JSON ファイル一覧を返す
-/// (settings.json + settings.json.bak1..bak10 のうち実在するもの)。
+/// (`main` + `main.bak1..bak10` のうち実在するもの)。
 pub(crate) fn legacy_json_files_for_migration(main: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if main.exists() {
@@ -1651,9 +1651,68 @@ pub(crate) fn legacy_json_files_for_migration(main: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// `Settings::path` の公開。Phase 2 migration から `settings.json` パスを参照するのに使う。
-pub(crate) fn legacy_settings_json_path() -> PathBuf {
-    Settings::settings_path()
+/// `data_dir` 配下に `settings.json` / `settings.json.bak*` が **どれか 1 つでも**
+/// 物理的に存在するかを robust に判定する (Codex P1 v8b 2026-05-14)。
+///
+/// 単一 `metadata()` は AV / cloud sync 等で transient NotFound を返すケースがあり、
+/// それを「JSON 無し」と誤判定すると Phase 2 decision tree が clean-install に倒れて
+/// **旧 settings.json から migration する経路を奪う**。settings_db_family_exists() と
+/// 同様に per-file metadata + read_dir の二経路で確認する。1 つでも見えれば true。
+pub(crate) fn legacy_json_family_exists(data_dir: &Path) -> bool {
+    // 経路 1: per-file metadata
+    let main = data_dir.join("settings.json");
+    if std::fs::metadata(&main).is_ok() {
+        return true;
+    }
+    for n in 1..=BACKUP_COUNT {
+        if std::fs::metadata(&backup_path(&main, n)).is_ok() {
+            return true;
+        }
+    }
+    // 経路 2: read_dir 列挙 — transient NotFound 回避の二段構え。
+    if let Ok(entries) = std::fs::read_dir(data_dir) {
+        for entry in entries.flatten() {
+            if let Some(name) = entry.file_name().to_str() {
+                if name == "settings.json" {
+                    return true;
+                }
+                if let Some(rest) = name.strip_prefix("settings.json.bak") {
+                    if rest.parse::<u32>().is_ok() && rest == rest.trim_start_matches('0') {
+                        // 数値 (canonical 1..10 or 011 等) を許容; .bak0 / .bak100 のような
+                        // 異常値は無視する。
+                        if let Ok(n) = rest.parse::<u32>() {
+                            if (1..=BACKUP_COUNT as u32).contains(&n) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+// 旧 `legacy_settings_json_path()` は Codex P2 v8b-2 (2026-05-14) で削除。Phase 2 の
+// migration / decision tree は data_dir 引数を唯一の真として `data_dir.join("settings.json")`
+// を使うので、`data_dir::get()` 経由のパス計算は不要になった。
+
+/// `Settings::load()` 経路で適用される **load-time migrations** を、外部呼び出し用に
+/// 公開した版 (Codex P2 v8b-1 2026-05-14)。Phase 2 の JSON migration はこの関数を
+/// 介して読み込んだ Settings を正規化してから SQLite に書き込む必要がある。
+/// 正規化せずに DB へ書くと:
+/// - favorites の id = nil (= 旧形式) が複数あると PRIMARY KEY 衝突で save_full が失敗
+/// - vst3_plugin_path/state 旧形式が Vec に流れない
+/// - video_loop=true の旧 bool が video_loop_mode に伝搬しない
+///
+/// `Settings::load()` の中身と同じ migrations を呼ぶ:
+/// 1. `migrate_vst3_legacy`
+/// 2. `migrate_legacy_video_loop`
+/// 3. `sanitize` (favorites の nil UUID 発行、video_volume クランプ等)
+pub(crate) fn apply_load_time_migrations(settings: &mut Settings) {
+    settings.migrate_vst3_legacy();
+    settings.migrate_legacy_video_loop();
+    settings.sanitize();
 }
 
 /// メイン → bak1 → bak2 → … の順で復旧を試みる。

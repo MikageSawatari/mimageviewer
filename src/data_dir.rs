@@ -55,6 +55,17 @@ pub fn set_test_override(path: Option<PathBuf>) {
     }
 }
 
+/// data_dir override を使うテスト群全体を直列化するための共有ロック (Codex P2 v8b
+/// 2026-05-14)。`set_test_override` は process-global なので、同時に使う複数の
+/// テストモジュールがファイル別の Mutex を持つと cross-file race が起きる。
+/// `set_test_override` を使うすべてのテストは入り口で `test_override_lock()` を
+/// 取って guard を持ち続けること。poison は無視 (= panic 後も後続テストを進める)。
+pub fn test_override_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<Mutex<()>> = std::sync::OnceLock::new();
+    let mu = LOCK.get_or_init(|| Mutex::new(()));
+    mu.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// ログ用サブディレクトリ `<data_dir>/logs` を返す。
 pub fn logs_dir() -> PathBuf {
     get().join("logs")
