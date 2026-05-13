@@ -276,19 +276,13 @@ impl crate::app::App {
                         }
                     }
 
-                    // ── 代表サムネ固定 (pin) エントリ ──
-                    // pin 不能 variant (ZipSeparator / SearchContainer) は無描画。
+                    // ── 代表サムネ固定 (pin) エントリ (separator 込み) ──
                     // 空フォルダの右クリックで合成された `GridItem::Folder(current_folder)`
-                    // も rel="" で pin できないので skip (Codex Phase D P3 指摘: 単独の
-                    // separator だけが残るのを防ぐ)。
-                    // ConvertibleArchive は disabled で描画。それ以外は toggle ボタン。
-                    if !is_folder_context
-                        && !matches!(
-                            item,
-                            GridItem::ZipSeparator { .. } | GridItem::SearchContainer { .. }
-                        )
-                    {
-                        ui.separator();
+                    // は rel="" で pin できないので呼ばない (Codex Phase D P3 指摘: 単独の
+                    // separator が残るのを防ぐため呼び出し自体を skip)。
+                    // pin 不能 / アグリゲートビュー / drill-down 等の条件分岐とそれに伴う
+                    // separator 描画は helper 側に集約 (Codex Phase D 再指摘)。
+                    if !is_folder_context {
                         if self.render_folder_pin_menu_entry(ui, &item) {
                             close = true;
                         }
@@ -445,15 +439,10 @@ impl crate::app::App {
                     }
                 }
 
-                // ── 代表サムネ固定 (pin) エントリ ──
-                if !matches!(
-                    item,
-                    GridItem::ZipSeparator { .. } | GridItem::SearchContainer { .. }
-                ) {
-                    ui.separator();
-                    if self.render_folder_pin_menu_entry(ui, &item) {
-                        close = true;
-                    }
+                // ── 代表サムネ固定 (pin) エントリ (separator 込み) ──
+                // 条件分岐とそれに伴う separator 描画は helper 側に集約。
+                if self.render_folder_pin_menu_entry(ui, &item) {
+                    close = true;
                 }
 
                 // メニュー外クリックで閉じる

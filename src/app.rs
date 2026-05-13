@@ -6430,19 +6430,23 @@ impl App {
         self.remove_folder_thumb_pin(&container);
     }
 
-    /// コンテキストメニューに「代表サムネに固定 / 解除」エントリを追加する。
-    /// アドレスバー 📌 と同じ動作をメニュー経由でも提供する。
+    /// コンテキストメニューに「代表サムネに固定 / 解除」エントリ (separator + ボタン)
+    /// を**まとめて**追加する。アドレスバー 📌 と同じ動作をメニュー経由でも提供する。
     ///
-    /// 戻り値: メニューが閉じるべきなら `true` (= 操作が走った)。
-    /// `item` の variant が pin 不能 (SearchContainer / ZipSeparator) なら、
-    /// 何も描画せず `false` を返す。ConvertibleArchive は disabled ボタンで描画し、
-    /// クリックされても false。
+    /// **separator 込みで描画する**ことに注意 (Codex Phase D P3 指摘: 呼び出し側で
+    /// 先に `ui.separator()` を打つと、本関数が早期 return する条件 (アグリゲートビュー
+    /// / 変換 drill-down / pin 不能 variant 等) で孤立 separator が残るバグになる)。
+    /// 本関数は描画が確定する直前まで separator を打たない。
+    ///
+    /// 戻り値: メニューを閉じるべきなら `true` (= ピン書き換え操作が走った)。
+    /// 描画スキップ / disabled / クリック未発生は `false`。
     pub(crate) fn render_folder_pin_menu_entry(
         &mut self,
         ui: &mut egui::Ui,
         item: &GridItem,
     ) -> bool {
-        // 親コンテナ未確定 / Ctrl+G アグリゲートビューでは出さない (= UI 一貫性)
+        // 親コンテナ未確定 / Ctrl+G アグリゲートビュー / 変換キャッシュ drill-down
+        // / pin 不能 variant では一切描画しない (separator も打たない)。
         let Some(container) = self.current_folder.clone() else {
             return false;
         };
@@ -6458,13 +6462,22 @@ impl App {
         if self.archive_source_override.is_some() {
             return false;
         }
-        // ConvertibleArchive: disabled + tooltip
+        // pin 不能 variant: 描画スキップ
+        if matches!(
+            item,
+            GridItem::SearchContainer { .. } | GridItem::ZipSeparator { .. }
+        ) {
+            return false;
+        }
+        // ConvertibleArchive: disabled + tooltip (描画 OK だが返値は常に false)
         if matches!(item, GridItem::ConvertibleArchive { .. }) {
+            ui.separator();
             ui.add_enabled(false, egui::Button::new("📌 代表サムネに固定"))
                 .on_hover_text("変換後に設定可能 (アーカイブを ZIP に変換すると指定できます)");
             return false;
         }
         let Some(source) = crate::folder_thumb_pins::source_from_grid_item(&container, item) else {
+            // rel が空 (= container 自身を指している) などの理由で source 取れず → skip
             return false;
         };
         let existing = self.folder_thumb_pin_for(&container).cloned();
@@ -6474,6 +6487,7 @@ impl App {
         } else {
             "📌 代表サムネに固定"
         };
+        ui.separator();
         if ui.button(label).clicked() {
             if is_current {
                 self.remove_folder_thumb_pin(&container);
@@ -15713,11 +15727,18 @@ impl eframe::App for App {
 
         // ── アドレスバー ─────────────────────────────────────────────
         let address_nav = self.render_address_bar(ctx);
-        // 📌 ボタン / コンテキストメニューで pin が書き換わっていたら同フレーム
+        // 📌 ボタン / グリッドコンテキストメニューで pin が書き換わっていたら同フレーム
         // 内でグリッドに反映 (Codex Phase D P2 指摘: dirty が close_fullscreen
         // でしか consume されないと、グリッドモードでクリックしても次の fs 開閉
         // までグリッドが更新されない)。
-        self.consume_folder_thumb_pin_dirty();
+        //
+        // **fullscreen 中は consume しない**: load_folder は close_fullscreen を呼ぶため、
+        // fullscreen 中の右クリックメニューで pin → ここで即時 reload → fs が予期せず
+        // 閉じてしまう (Codex Phase D P2 再指摘)。fullscreen のときは close_fullscreen
+        // 自身が同じ helper を呼ぶ経路があるので、そちらに委ねる。
+        if self.fullscreen_idx.is_none() {
+            self.consume_folder_thumb_pin_dirty();
+        }
 
         // ── Ctrl+F: 検索バー表示 ─────────────────────────────────────
         // Ctrl+G (グローバルメタ検索) と相互排他 (docs §10.3):
