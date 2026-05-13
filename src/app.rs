@@ -2453,9 +2453,13 @@ pub struct App {
     pub(crate) native_video_front_synced_hwnd: u64,
     #[cfg(windows)]
     /// Native HWND の z-order maintenance を間引くための最終 raise 時刻。
-    /// native 再生中は黒 backdrop も alive なので、mIV が foreground の間だけ
-    /// 16ms pump に合わせて通常の HWND_TOP raise を保つ。
+    /// PrintScreen / Snipping Tool などで foreground が外部へ移った後、mIV に
+    /// 戻ったエッジで presenter HWND を再活性化する recovery を間引く。
     native_video_front_last_raise: Option<std::time::Instant>,
+    #[cfg(windows)]
+    /// native video fullscreen 中に外部プロセスが foreground になったことを観測したか。
+    /// true から mIV foreground へ戻ったタイミングで 1 回だけ activation recovery を送る。
+    native_video_front_recover_after_external_foreground: bool,
     #[cfg(windows)]
     /// 実機修正 (2026-05-12 C): VST GUI window のドラッグ/リサイズ終了検知 + bar
     /// 重なり時の自動位置調整。`HWND -> (last seen rect, last change instant, pending flag)`。
@@ -3030,6 +3034,8 @@ impl Default for App {
             vst_geometry_tracker: std::collections::HashMap::new(),
             #[cfg(windows)]
             native_video_front_last_raise: None,
+            #[cfg(windows)]
+            native_video_front_recover_after_external_foreground: false,
             #[cfg(windows)]
             native_video_main_chrome_black: false,
             #[cfg(windows)]
@@ -11193,6 +11199,7 @@ impl App {
             self.vst3_deferred_video_open = None;
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
+            self.native_video_front_recover_after_external_foreground = false;
             self.native_video_pointer_down = None;
             self.schedule_native_video_main_chrome_restore();
             // 動画フルスクリーンだった (= chrome を黒くしていた) ときだけ奪還候補。
@@ -13481,6 +13488,7 @@ impl App {
         if native_closed_idx.is_some() {
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
+            self.native_video_front_recover_after_external_foreground = false;
             self.close_fullscreen();
             // keep_fullscreen_viewport_alive の cleanup フレーム (Visible(false) 送信) を保証。
             // 修正後の keep_alive はアイドル時ゼロコスト早期 return するため、return 後の

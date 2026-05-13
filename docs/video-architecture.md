@@ -650,9 +650,10 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
   (= 描画中の HANDLE が close される race を防ぐ)
 - **z-order 復旧**: PrintScreen / Snipping Tool などで foreground が一時的に外部へ
   移った後、egui 側の黒 backdrop が presenter より前に残る場合がある。UI thread から
-  `SetWindowPos` / `SetForegroundWindow` を直接呼ばず、mIV が foreground に戻っている
-  間だけ App が `RaisePresenterToFront` command を rate-limit 送信し、presenter
-  所有スレッド側で `HWND_TOP` と foreground / active / focus を再アサートする。
+  `SetWindowPos` / `SetForegroundWindow` を直接呼ばず、App が外部 foreground を観測
+  した後に mIV foreground へ戻ったエッジで `RaisePresenterToFront` command を
+  rate-limit 送信し、presenter 所有スレッド側で `HWND_TOP` と foreground / active /
+  focus を再アサートする。
 
 ### フルスクリーン終了時の foreground 奪還
 

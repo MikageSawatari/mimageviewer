@@ -95,6 +95,7 @@ impl App {
             }
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
+            self.native_video_front_recover_after_external_foreground = false;
             return;
         }
         let (hwnd, hud_hwnd) = self
@@ -120,6 +121,7 @@ impl App {
             }
             self.native_video_front_synced_hwnd = 0;
             self.native_video_front_last_raise = None;
+            self.native_video_front_recover_after_external_foreground = false;
             return;
         }
         let is_new_hwnd = hwnd != self.native_video_front_synced_hwnd;
@@ -128,21 +130,28 @@ impl App {
             // bridge 側の登録値が古い (0) のままにならないよう毎フレーム refresh する。
             self.dsp_bridge.set_hud_hwnd(hud_hwnd);
             // PrintScreen / Snipping Tool の範囲選択後に egui 側の黒 backdrop が
-            // presenter HWND より前に残ることがある。mIV が foreground に戻っている
-            // ときだけ、presenter 所有スレッドへ z-order 再アサートを依頼する。
+            // presenter HWND より前に残ることがある。外部 foreground を一度観測し、
+            // mIV に戻ったエッジだけで presenter 所有スレッドへ復旧を依頼する。
             let now = std::time::Instant::now();
+            let foreground_is_ours =
+                crate::video::native_window::foreground_belongs_to_current_process_strict();
+            if !foreground_is_ours {
+                self.native_video_front_recover_after_external_foreground = true;
+            }
             let presenter_raise_due = self
                 .native_video_front_last_raise
                 .map(|last| now.duration_since(last) >= std::time::Duration::from_millis(250))
                 .unwrap_or(true);
             if presenter_raise_due
-                && crate::video::native_window::foreground_belongs_to_current_process_strict()
+                && foreground_is_ours
+                && self.native_video_front_recover_after_external_foreground
             {
                 if let Some(idx) = self.fullscreen_idx {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
                         if player.native_presenter_hwnd() == hwnd {
                             player.request_presenter_raise();
                             self.native_video_front_last_raise = Some(now);
+                            self.native_video_front_recover_after_external_foreground = false;
                         }
                     }
                 }
@@ -163,6 +172,7 @@ impl App {
         // thread.
         self.native_video_front_synced_hwnd = hwnd;
         self.native_video_front_last_raise = Some(std::time::Instant::now());
+        self.native_video_front_recover_after_external_foreground = false;
 
         // CP7: presenter HWND が確定したので、DspBridge に owner / HUD HWND を登録する。
         // - `register_fullscreen_owner(presenter_hwnd)`: VST editor の owner を presenter HWND に
