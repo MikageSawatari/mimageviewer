@@ -1761,7 +1761,9 @@ pub(super) fn draw_native_top_bar_tile(
                 String::new()
             };
 
-            let sub_text = if interval_secs <= 0.0 && progress_total == 0 {
+            let sub_text = if let Some(open_status) = tile_state.video_open_status {
+                crate::video::avio_progress::build_preparing_message(open_status)
+            } else if interval_secs <= 0.0 && progress_total == 0 {
                 String::from("タイルを準備中...")
             } else if let Some(m) = metadata {
                 format!(
@@ -2314,10 +2316,14 @@ pub(super) fn draw_native_tile_overlay(
             // 描画する。タイルオーバーレイは中央の preparing 文言とグリッドだけを担う。
 
             if state.progress_done == 0 && !state.finished {
+                let message = state
+                    .video_open_status
+                    .map(crate::video::avio_progress::build_preparing_message)
+                    .unwrap_or_else(|| "タイルを準備中...".to_string());
                 painter.text(
                     full_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "動画を準備中...",
+                    message,
                     egui::FontId::proportional(20.0),
                     egui::Color32::from_gray(180),
                 );

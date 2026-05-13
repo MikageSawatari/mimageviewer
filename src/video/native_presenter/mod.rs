@@ -581,6 +581,9 @@ pub struct NativeOverlayTileOverlay {
     // ホイールで動画を切り替えた直後など metadata が None の数フレームでも、
     // 上部バーのタイトル行にファイル名を出すための fallback。
     pub fallback_file_name: String,
+    // S タイル表示中の動画→動画 source swap では通常の center status HUD を
+    // 描画しないため、動画オープン中の AVIO 進捗をタイル overlay 側で持つ。
+    pub video_open_status: Option<crate::video::avio_progress::PreparingStatus>,
 }
 
 impl NativeOverlayTileOverlay {
@@ -589,6 +592,20 @@ impl NativeOverlayTileOverlay {
     }
 
     pub fn preparing_with_filename(file_name: String) -> Self {
+        Self::preparing_with_open_status(
+            file_name,
+            crate::video::avio_progress::PreparingStatus {
+                phase: crate::video::avio_progress::prep_phase::OPENING,
+                bytes_read: 0,
+                file_size: 0,
+            },
+        )
+    }
+
+    pub fn preparing_with_open_status(
+        file_name: String,
+        open_status: crate::video::avio_progress::PreparingStatus,
+    ) -> Self {
         Self {
             interval_secs: 0.0,
             timestamps: Vec::new(),
@@ -600,6 +617,7 @@ impl NativeOverlayTileOverlay {
             finished: false,
             tiles: Vec::new(),
             fallback_file_name: file_name,
+            video_open_status: Some(open_status),
         }
     }
 }
