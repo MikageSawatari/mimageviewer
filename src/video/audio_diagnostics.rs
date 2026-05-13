@@ -58,7 +58,8 @@ pub struct AudioDiagnostics {
     /// **ユーザー体感の音映像差** (video_displayed_pts − audio_audible_pts) ms。
     /// `f64::to_bits` で保持。present 経路で書く。
     /// + 値 = 映像が音声より進んでいる、− 値 = 映像が音声より遅れている (= 普段の不一致報告)。
-    /// audio inactive (動画 only / 音声起動失敗) 時は `f64::NAN`。
+    /// audio inactive (動画 only / 音声起動失敗) または seek 直後など offset 未確定時は
+    /// `f64::NAN`。
     pub av_offset_ms_bits: AtomicU64,
 
     /// callback 末尾で 0/1 切替。pump スレッド / overlay が読む。
@@ -143,7 +144,7 @@ impl AudioDiagnostics {
     }
 
     /// 直近 present 時のユーザー体感音映像差 (video − audio、ms)。
-    /// audio inactive 時は `None`。
+    /// audio inactive または offset 未確定時は `None`。
     pub fn load_av_offset_ms(&self) -> Option<f32> {
         let v = f64::from_bits(self.av_offset_ms_bits.load(Ordering::Acquire));
         if v.is_finite() { Some(v as f32) } else { None }
@@ -182,9 +183,12 @@ impl AudioDiagnostics {
 pub struct OverlayDiagnostics {
     /// video pacing health (= video_pts − master_clock、近 0 = 健全)
     pub av_drift_ms: f32,
-    /// 体感の音映像差 (video − audio、ms、None = audio inactive)。
+    /// 体感の音映像差 (video − audio、ms、None = audio inactive or offset pending)。
     /// 数分再生で気づく「音と映像のズレ」はこの値が変わる。
     pub av_offset_ms: Option<f32>,
+    /// audio stream が clock source として active か。`av_offset_ms` は seek / buffer clear
+    /// 直後に一時 None になるため、HUD の lead / underrun 表示可否はこの値で判定する。
+    pub audio_active: bool,
     /// audio が master clock より何 ms 先行しているか (callback 直近値、デバッグ用)。
     pub audio_lead_ms: f32,
     pub audio_underrun_active: bool,
@@ -195,6 +199,7 @@ impl OverlayDiagnostics {
         Self {
             av_drift_ms: diag.load_av_drift_ms(),
             av_offset_ms: diag.load_av_offset_ms(),
+            audio_active: diag.load_audio_audible_pts().is_some(),
             audio_lead_ms: diag.load_audio_lead_ms(),
             audio_underrun_active: diag.load_underrun_active(),
         }
@@ -255,9 +260,13 @@ mod tests {
         let diag = AudioDiagnostics::new(Instant::now());
         diag.av_drift_ms_bits
             .store((-7.5_f64).to_bits(), Ordering::Release);
+        diag.audio_audible_pts_bits
+            .store((1.25_f64).to_bits(), Ordering::Release);
+        diag.audio_audible_pts_valid.store(true, Ordering::Release);
         diag.audio_underrun_active.store(true, Ordering::Release);
         let view = OverlayDiagnostics::from(&diag);
         assert!((view.av_drift_ms - (-7.5)).abs() < 0.01);
+        assert!(view.audio_active);
         assert!(view.audio_underrun_active);
     }
 
@@ -297,6 +306,7 @@ mod tests {
         // overlay 側も None を観測する
         let view = OverlayDiagnostics::from(&diag);
         assert!(view.av_offset_ms.is_none());
+        assert!(!view.audio_active);
     }
 
     #[test]

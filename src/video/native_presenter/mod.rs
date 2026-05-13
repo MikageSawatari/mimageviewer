@@ -378,8 +378,12 @@ pub struct NativeOverlayPerfSnapshot {
     pub av_drift_ms: f32,
     /// **ユーザー体感の音映像差** (= video_pts − audio_audible_pts、ms、符号付き)。
     /// + = 映像が音声より進んでいる、− = 映像が音声より遅れている。
-    /// audio inactive (動画 only / 音声起動失敗) 時は `f32::NAN`。
+    /// audio inactive (動画 only / 音声起動失敗) または seek 直後など offset 未確定時は
+    /// `f32::NAN`。audio の有無は `audio_active` を見る。
     pub av_offset_ms: f32,
+    /// audio stream が clock source として active か。`av_offset_ms` は seek 直後に一時
+    /// NaN になるので、lead / underrun の表示可否はこの値で判定する。
+    pub audio_active: bool,
     /// audio が master clock より何 ms 先行しているか (callback 直近値)。
     /// 通常 ≈ 0、Norm clear 後の big jump 直後は 5000+ ms に張り付くことがある。
     pub audio_lead_ms: f32,
@@ -409,8 +413,11 @@ pub struct NativeOverlayPerfSample {
     /// 本 sample 取得時点の video pacing drift (signed ms、video_pts − master_clock)。
     pub av_drift_ms: f32,
     /// 本 sample 取得時点の **体感音映像差** (signed ms、video_pts − audio_audible_pts)。
-    /// audio inactive 時は `f32::NAN`。グラフのサブトラック描画はこちらを優先。
+    /// audio inactive または seek 直後など offset 未確定時は `f32::NAN`。
+    /// グラフのサブトラック描画はこちらを優先。
     pub av_offset_ms: f32,
+    /// 本 sample 取得時点で audio stream が active だったか。
+    pub audio_active: bool,
     /// 本 sample 取得時点で audio が master clock から先行している量 (ms)。
     /// 通常 ≈ 0、Norm clear 直後は >>0 に張り付く。
     pub audio_lead_ms: f32,

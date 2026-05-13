@@ -94,7 +94,7 @@ impl AudioOutput {
         // 旧値を残したままにしない。次の present で旧 audio_pts と新 video_pts を比較して
         // 偽の巨大 av_offset が出るのを防ぐ。
         // 次の audio callback が `set_audio_pts` を呼ぶまでは av_offset は NaN
-        // (= overlay は audio inactive として表示、analyzer も Skip する)。
+        // (= overlay / analyzer は体感 A/V offset 未確定として扱う)。
         self.diagnostics.clear_audio_position();
         if let Some((processed, raw_pending, tx_queued, now_at_clear)) = snapshot_for_log {
             crate::perf::event(

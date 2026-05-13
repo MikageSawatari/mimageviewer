@@ -901,7 +901,7 @@ A/V offset を比較。修正前は累積 −20s 級、修正後は ±数十 ms 
 
 | kind | 説明 | 主な extras |
 |---|---|---|
-| `av_drift` | drift sample (1Hz + `\|offset\|>30ms` の edge、edge は 100ms rate limit) | `video_pts`, `now_secs`, `drift_ms` (= video pacing), `av_offset_ms` (= 体感ズレ、null の時は audio inactive), `audio_lead_ms`, `audio_active`, `big_edge` |
+| `av_drift` | drift sample (1Hz + `\|offset\|>30ms` の edge、edge は 100ms rate limit) | `video_pts`, `now_secs`, `drift_ms` (= video pacing), `av_offset_ms` (= 体感ズレ、null の時は audio inactive または offset 未確定), `audio_lead_ms`, `audio_active`, `big_edge` |
 | `norm_apply_begin` | Norm 操作 (toggle_on / toggle_off / scan_done) の前 snapshot | `fs_idx`, `gain_db`, `reason`, `now`, `video_pts` |
 | `norm_apply_end` | Norm 操作 (`set_normalize_gain` のみ、clear なし) 完了後の snapshot | `fs_idx`, `now` |
 
@@ -940,7 +940,8 @@ audio_pts_jump` の連鎖と、累積的に成長する負値 `A/V offset` と�
 overlay_draw.rs::draw_native_perf_overlay`) には:
 
 - ヘッダ 2 行目右端: `A/V {offset_ms}` (固定幅 monospace、桁ぶれなし。色: |offset|<5
-  緑 / <20 黄 / >=20 赤)。audio inactive 時は `vid {drift_ms}` (= 旧 av_drift にフォールバック)
+  緑 / <20 黄 / >=20 赤)。audio inactive または seek 直後など offset 未確定時は
+  `vid {drift_ms}` (= 旧 av_drift にフォールバック)
 - ヘッダ 2 行目: `lead {audio_lead_ms}` (audio が master clock から先行している量、
   通常グレー、|lead|>=50ms で橙)。audio inactive 時は表示しない
 - ヘッダ 2 行目: audio active かつ `audio_underrun_active == true` のとき赤 `UNDERRUN`

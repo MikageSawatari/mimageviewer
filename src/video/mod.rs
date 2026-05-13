@@ -1000,6 +1000,7 @@ impl NativeFullscreenPresentStats {
             max_interval_ms: self.max_interval_ms,
             av_drift_ms: diag_view.av_drift_ms,
             av_offset_ms: diag_view.av_offset_ms.unwrap_or(f32::NAN),
+            audio_active: diag_view.audio_active,
             audio_lead_ms: diag_view.audio_lead_ms,
             audio_underrun_active: diag_view.audio_underrun_active,
         }
@@ -2265,7 +2266,8 @@ fn run_native_video_output(
                         .av_drift_ms_bits
                         .store((av_drift_ms as f64).to_bits(), Ordering::Release);
 
-                    // av_offset_ms: audio inactive (動画 only / 音声起動失敗) のとき None。
+                    // av_offset_ms: audio inactive (動画 only / 音声起動失敗) または
+                    // seek / buffer clear 直後の offset 未確定時は None。
                     let av_offset_ms_opt = source
                         .audio_diagnostics
                         .load_audio_audible_pts()
@@ -2278,6 +2280,7 @@ fn run_native_video_output(
                         Ordering::Release,
                     );
                     let audio_lead_ms = source.audio_diagnostics.load_audio_lead_ms();
+                    let audio_active = source.clock.is_audio_active();
 
                     if crate::perf::is_enabled() {
                         let log_now = Instant::now();
@@ -2310,10 +2313,7 @@ fn run_native_video_output(
                                         "audio_lead_ms",
                                         serde_json::Value::from(audio_lead_ms as f64),
                                     ),
-                                    (
-                                        "audio_active",
-                                        serde_json::Value::from(source.clock.is_audio_active()),
-                                    ),
+                                    ("audio_active", serde_json::Value::from(audio_active)),
                                     ("big_edge", serde_json::Value::from(big_edge)),
                                 ],
                             );
@@ -2333,6 +2333,7 @@ fn run_native_video_output(
                     let diag_view = crate::video::audio_diagnostics::OverlayDiagnostics {
                         av_drift_ms,
                         av_offset_ms: av_offset_ms_opt,
+                        audio_active,
                         audio_lead_ms,
                         audio_underrun_active: underrun_active,
                     };
@@ -2350,6 +2351,7 @@ fn run_native_video_output(
                             playback_speed: source.clock.playback_speed() as f32,
                             av_drift_ms,
                             av_offset_ms: av_offset_ms_opt.unwrap_or(f32::NAN),
+                            audio_active,
                             audio_lead_ms,
                             audio_underrun_active: underrun_active,
                         },

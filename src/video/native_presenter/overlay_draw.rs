@@ -105,7 +105,8 @@ pub(super) fn draw_native_perf_overlay(
             let display_value = if av_offset_finite {
                 latest.av_offset_ms
             } else {
-                // audio inactive (動画 only) のとき av_drift_ms を表示する。
+                // audio inactive または seek 直後など offset 未確定のときは
+                // video pacing drift にフォールバックする。
                 latest.av_drift_ms
             };
             let display_abs = display_value.abs();
@@ -117,7 +118,7 @@ pub(super) fn draw_native_perf_overlay(
                 egui::Color32::from_rgb(255, 112, 112) // 赤
             };
             let av_label = if av_offset_finite { "A/V" } else { "vid" };
-            let audio_active = av_offset_finite;
+            let audio_active = latest.audio_active;
             // value は padding なし。slot 右端で右寄せ → 文字数変化で左端だけ動く (= label と干渉せず)。
             let av_value_text = format!("{:+.1}ms", display_value);
             let av_value_right = panel_rect.min.x + panel_rect.width() - 10.0;
@@ -147,10 +148,14 @@ pub(super) fn draw_native_perf_overlay(
             // av_label の左端から GROUP_GAP 左に lead value slot の右端を置く。
             const LEAD_VISIBLE_MIN_WIDTH: f32 = 380.0;
             const GROUP_GAP: f32 = 24.0; // A/V グループと lead グループの間
-            let show_lead = audio_active && panel_rect.width() >= LEAD_VISIBLE_MIN_WIDTH;
+            let wide_enough_for_status = panel_rect.width() >= LEAD_VISIBLE_MIN_WIDTH;
+            let show_underrun =
+                audio_active && latest.audio_underrun_active && wide_enough_for_status;
+            let show_lead = audio_active && !show_underrun && wide_enough_for_status;
             // av_label の x 位置を保守的に概算 (3 char ≈ 21px)。
             let av_label_left_approx = av_value_left - LABEL_VALUE_GAP - 24.0;
-            let underrun_anchor_x = if show_lead {
+            let status_right = av_label_left_approx - GROUP_GAP;
+            if show_lead {
                 let lead_value_right = av_label_left_approx - GROUP_GAP;
                 let lead_value_left = lead_value_right - VALUE_SLOT_W;
                 let lead_value_text = format!("{:+.1}ms", latest.audio_lead_ms);
@@ -173,17 +178,13 @@ pub(super) fn draw_native_perf_overlay(
                     egui::FontId::monospace(10.0),
                     lead_color,
                 );
-                // UNDERRUN は lead label の更に左に置く (= label 約 4 char 28px 分を引く)
-                lead_value_left - LABEL_VALUE_GAP - 28.0
-            } else {
-                // lead 非表示時は A/V label の左を UNDERRUN の anchor にする。
-                av_label_left_approx
-            };
+            }
 
-            // 右端 3: UNDERRUN (左へ更にオフセット)。絵文字は使わない (CLAUDE.md 遵守)。
-            if audio_active && latest.audio_underrun_active {
+            // 右側ステータス: UNDERRUN は lead と同じ枠で排他的に描く。
+            // 絵文字は使わない (CLAUDE.md 遵守)。
+            if show_underrun {
                 painter.text(
-                    egui::pos2(underrun_anchor_x - GROUP_GAP, row_y),
+                    egui::pos2(status_right, row_y),
                     egui::Align2::RIGHT_TOP,
                     "UNDERRUN",
                     egui::FontId::monospace(10.0),
@@ -289,7 +290,7 @@ pub(super) fn draw_native_perf_overlay(
                     let total_y = y_for_ms(sample.total_ms);
                     let copy_y = y_for_ms(sample.copy_ms);
                     // サブトラック描画は av_offset (= 体感ズレ) を主とする。audio inactive
-                    // の sample は NaN なので skip (= prev_drift を更新しない)。
+                    // または offset 未確定の sample は NaN なので skip (= prev_drift を更新しない)。
                     let drift_value = if sample.av_offset_ms.is_finite() {
                         Some(sample.av_offset_ms)
                     } else {
@@ -2469,7 +2470,7 @@ pub(super) fn native_perf_sample_has_late_drop(sample: &NativeOverlayPerfSample)
 }
 
 pub(super) fn native_perf_sample_has_audio_underrun_band(sample: &NativeOverlayPerfSample) -> bool {
-    sample.av_offset_ms.is_finite() && sample.audio_underrun_active
+    sample.audio_active && sample.audio_underrun_active
 }
 
 pub(super) fn native_perf_should_thin_sample(
@@ -3095,6 +3096,7 @@ mod tests {
             playback_speed: 1.0,
             av_drift_ms: 0.0,
             av_offset_ms: 0.0,
+            audio_active: true,
             audio_lead_ms: 0.0,
             audio_underrun_active: false,
         }
@@ -3134,9 +3136,10 @@ mod tests {
     fn perf_underrun_band_requires_active_audio() {
         let mut audio_active = perf_sample(0, 16.7);
         audio_active.audio_underrun_active = true;
-        audio_active.av_offset_ms = 0.0;
+        audio_active.audio_active = true;
+        audio_active.av_offset_ms = f32::NAN;
         let mut audio_inactive = audio_active;
-        audio_inactive.av_offset_ms = f32::NAN;
+        audio_inactive.audio_active = false;
 
         assert!(native_perf_sample_has_audio_underrun_band(&audio_active));
         assert!(!native_perf_sample_has_audio_underrun_band(&audio_inactive));
