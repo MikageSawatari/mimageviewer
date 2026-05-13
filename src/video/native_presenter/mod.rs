@@ -74,6 +74,24 @@ fn seek_status_visible_for_times(
     active_after_delay || held_after_completion
 }
 
+fn center_pause_controls_visible_for_state(
+    tile_overlay_visible: bool,
+    is_playing: bool,
+    frame_step_active: bool,
+    first_frame_presented: bool,
+    has_video_error: bool,
+    normalize_scanning: bool,
+    seek_blocks_center: bool,
+) -> bool {
+    !tile_overlay_visible
+        && !is_playing
+        && !frame_step_active
+        && first_frame_presented
+        && !has_video_error
+        && !normalize_scanning
+        && !seek_blocks_center
+}
+
 pub struct NativePresenterConfig {
     pub hwnd: HWND,
     pub width: u32,
@@ -3491,18 +3509,21 @@ impl NativeEguiOverlay {
             self.normalize_state.ui_state,
             crate::video::normalize_types::NormalizeUiState::Scanning
         );
-        // paused_center_visible (= 中央 replay/play ボタンが見えている) も描画側と一致させる
-        // (Codex CP5 P2 #2): paused 中の中央ボタンクリックが VST に抜けないように。
-        let paused_center_visible = !tile_overlay_visible
-            && !self.video_is_playing
-            && !self.video_frame_step_active
-            && self.first_frame_presented
-            && self.video_error.is_none()
-            && !normalize_scanning;
         let seek_status_visible = self.seek_status_visible
             && !tile_overlay_visible
             && self.first_frame_presented
             && self.video_error.is_none();
+        // paused_center_visible (= 中央 replay/play ボタンが見えている) も描画側と一致させる
+        // (Codex CP5 P2 #2): paused 中の中央ボタンクリックが VST に抜けないように。
+        let paused_center_visible = center_pause_controls_visible_for_state(
+            tile_overlay_visible,
+            self.video_is_playing,
+            self.video_frame_step_active,
+            self.first_frame_presented,
+            self.video_error.is_some(),
+            normalize_scanning,
+            self.video_is_seeking || seek_status_visible,
+        );
         let status_visible = !tile_overlay_visible
             && (self.video_error.is_some() || !self.first_frame_presented || seek_status_visible);
         // **bottom_hud_visible** は描画側 (`render_once`) と完全一致させる。
@@ -4026,12 +4047,15 @@ impl NativeEguiOverlay {
             normalize_state_snap.ui_state,
             crate::video::normalize_types::NormalizeUiState::Scanning
         );
-        let paused_center_visible = !tile_overlay_visible
-            && !is_playing
-            && !frame_step_active
-            && first_frame_presented
-            && video_error.is_none()
-            && !normalize_scanning;
+        let paused_center_visible = center_pause_controls_visible_for_state(
+            tile_overlay_visible,
+            is_playing,
+            frame_step_active,
+            first_frame_presented,
+            video_error.is_some(),
+            normalize_scanning,
+            self.video_is_seeking || seek_status_visible,
+        );
         let bottom_hud_visible = hud_visible || panel_chrome_visible || paused_center_visible;
         let perf_origin = egui::pos2(14.0, 14.0);
         // Codex 2周目 P1: normalize_scanning も overlay_visible / cursor_blocking_overlay_visible
@@ -5959,6 +5983,16 @@ mod tests {
             Some(second_seek_started),
             None,
             now + super::SEEK_STATUS_DELAY
+        ));
+    }
+
+    #[test]
+    fn center_pause_controls_hide_while_seek_blocks_center() {
+        assert!(super::center_pause_controls_visible_for_state(
+            false, false, false, true, false, false, false
+        ));
+        assert!(!super::center_pause_controls_visible_for_state(
+            false, false, false, true, false, false, true
         ));
     }
 
