@@ -343,6 +343,132 @@ pub(crate) fn set_ui_heartbeat_main_hwnd(hwnd_raw: u64) {
     }
 }
 
+// マウス進む/戻るボタン (Windows) の橋渡し。
+//
+// 5 ボタンマウスの進む/戻るは、ハードウェアやドライバの設定によって以下のいずれかで届く:
+//
+//   1. WM_XBUTTONDOWN/UP (native): winit → egui Extra1/Extra2 — App 側で既に bind 済み
+//   2. WM_APPCOMMAND (mouse driver が APPCOMMAND_BROWSER_BACKWARD/FORWARD を送る経路):
+//      winit はハンドリングしないので egui まで届かない
+//   3. WM_KEYDOWN VK_BROWSER_BACK / VK_BROWSER_FORWARD (mouse driver / AutoHotkey が
+//      keystroke 化して送る経路): winit → egui-winit で `BrowserBack` だけ翻訳され、
+//      `BrowserForward` は egui-winit のマップに無いのでドロップされる
+//
+// (2)(3) は WH_GETMESSAGE スレッドフックで補足し、App::update が消費する atomic
+// カウンタに積む。App 側はこれを既存の Ctrl+↑/↓ ナビゲーション (フォルダ DFS) と
+// 同等に扱う。これにより、上記いずれの経路で届いても等しく動く。
+#[cfg(windows)]
+static MOUSE_NAV_HOOK_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+static PENDING_MOUSE_NAV_BACK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+#[cfg(windows)]
+static PENDING_MOUSE_NAV_FORWARD: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// App::update がフレーム頭で呼ぶ。前フレーム以降に蓄積した進む/戻る押下回数を取り出す。
+/// 戻り値は (back, forward)。non-Windows では常に (0, 0)。
+pub(crate) fn take_pending_mouse_nav() -> (u32, u32) {
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::Ordering;
+        let back = PENDING_MOUSE_NAV_BACK.swap(0, Ordering::AcqRel);
+        let forward = PENDING_MOUSE_NAV_FORWARD.swap(0, Ordering::AcqRel);
+        (back, forward)
+    }
+    #[cfg(not(windows))]
+    {
+        (0, 0)
+    }
+}
+
+#[cfg(windows)]
+unsafe extern "system" fn mouse_nav_hook_proc(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, HC_ACTION, MSG, WM_APPCOMMAND, WM_KEYDOWN, WM_SYSKEYDOWN,
+    };
+    if code == HC_ACTION as i32 {
+        unsafe {
+            let msg_ptr = lparam.0 as *const MSG;
+            if !msg_ptr.is_null() {
+                let msg = &*msg_ptr;
+                match msg.message {
+                    WM_APPCOMMAND => {
+                        // HIWORD(lparam) の下 12 bit が AppCommand。
+                        // APPCOMMAND_BROWSER_BACKWARD = 1, APPCOMMAND_BROWSER_FORWARD = 2
+                        let cmd_word = ((msg.lParam.0 >> 16) & 0xFFFF) as u32;
+                        let app_command = cmd_word & 0xFFF;
+                        match app_command {
+                            1 => {
+                                PENDING_MOUSE_NAV_BACK.fetch_add(1, Ordering::AcqRel);
+                            }
+                            2 => {
+                                PENDING_MOUSE_NAV_FORWARD.fetch_add(1, Ordering::AcqRel);
+                            }
+                            _ => {}
+                        }
+                    }
+                    WM_KEYDOWN | WM_SYSKEYDOWN => {
+                        // VK_BROWSER_BACK = 0xA6, VK_BROWSER_FORWARD = 0xA7
+                        // KEYUP は数えない (1 押下で 1 ナビ)。auto-repeat (lParam bit 30)
+                        // は通すと連続移動できる (キーボードの Ctrl+↑/↓ と同じ感覚)。
+                        let vk = (msg.wParam.0 & 0xFF) as u8;
+                        match vk {
+                            0xA6 => {
+                                PENDING_MOUSE_NAV_BACK.fetch_add(1, Ordering::AcqRel);
+                            }
+                            0xA7 => {
+                                PENDING_MOUSE_NAV_FORWARD.fetch_add(1, Ordering::AcqRel);
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            CallNextHookEx(None, code, wparam, lparam)
+        }
+    } else {
+        unsafe { CallNextHookEx(None, code, wparam, lparam) }
+    }
+}
+
+/// メイン UI スレッドに WH_GETMESSAGE フックを 1 度だけ install する。
+/// App::update が main_hwnd を捕捉した直後に呼ばれる。
+#[cfg(windows)]
+pub(crate) fn install_mouse_nav_hook() {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_GETMESSAGE};
+    if MOUSE_NAV_HOOK_INSTALLED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let tid = unsafe { GetCurrentThreadId() };
+    match unsafe { SetWindowsHookExW(WH_GETMESSAGE, Some(mouse_nav_hook_proc), None, tid) } {
+        Ok(_) => {
+            crate::logger::log(format!(
+                "mouse-nav: WH_GETMESSAGE hook installed on tid={tid} (capture WM_APPCOMMAND \
+                 + VK_BROWSER_BACK/FORWARD for folder navigation)"
+            ));
+        }
+        Err(err) => {
+            crate::logger::log(format!(
+                "mouse-nav: WH_GETMESSAGE hook install failed: {err:?}"
+            ));
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn install_mouse_nav_hook() {}
+
 pub(crate) fn set_ui_heartbeat_suspended(suspended: bool, detail: String) {
     if let Some(state) = UI_HEARTBEAT.get() {
         let now_ms = state.start.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;

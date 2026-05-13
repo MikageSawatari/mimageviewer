@@ -2592,6 +2592,16 @@ impl App {
             0x28 if key.ctrl && !key.shift => {
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
             }
+            // VK_BROWSER_BACK / VK_BROWSER_FORWARD: マウス進む/戻るボタンが Browser_Back/Forward
+            // keystroke として届くケース (mouse driver や AutoHotkey が変換する経路)、または
+            // 上で WM_APPCOMMAND を合成 KeyDown に変換した経路。Ctrl+↑/↓ と同じ DFS ナビと
+            // 等価に扱う。
+            0xA6 => {
+                self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
+            }
+            0xA7 => {
+                self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
+            }
             0x26 if !key.shift && !key.ctrl => {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, -1);
             }

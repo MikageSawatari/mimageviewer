@@ -24,12 +24,13 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MA_ACTIVATEANDEAT, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW,
     SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS,
-    WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
-    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
-    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_WINDOWPOSCHANGED,
-    WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CLIPCHILDREN, WS_CLIPSIBLINGS,
-    WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP, WS_VISIBLE,
+    WM_APPCOMMAND, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
+    WM_RBUTTONUP, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+    WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    WS_VISIBLE,
 };
 use windows::core::w;
 
@@ -547,6 +548,34 @@ unsafe extern "system" fn wnd_proc(
                 let _ = tx.send(NativeVideoWindowEvent::KeyUp(native_key_event(
                     wparam, lparam,
                 )));
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_APPCOMMAND => {
+            // Mouse driver が進む/戻るボタンを APPCOMMAND_BROWSER_BACKWARD/FORWARD で
+            // 送ってくる経路 (Chrome / Explorer 等の標準ナビ経路) を受ける。
+            // HIWORD(lparam) の下 12 bit が AppCommand コード。
+            //  1 = APPCOMMAND_BROWSER_BACKWARD (= 戻る = Ctrl+↑ 相当)
+            //  2 = APPCOMMAND_BROWSER_FORWARD  (= 進む = Ctrl+↓ 相当)
+            let cmd_word = ((lparam.0 >> 16) & 0xFFFF) as u32;
+            let app_command = cmd_word & 0xFFF;
+            let synth_vk = match app_command {
+                1 => Some(0xA6_u32), // VK_BROWSER_BACK
+                2 => Some(0xA7_u32), // VK_BROWSER_FORWARD
+                _ => None,
+            };
+            if let Some(vk) = synth_vk
+                && let Some(tx) = window_state(hwnd).and_then(|s| s.event_tx.as_ref())
+            {
+                let _ = tx.send(NativeVideoWindowEvent::KeyDown(NativeVideoKeyEvent {
+                    virtual_key: vk,
+                    shift: false,
+                    ctrl: false,
+                    alt: false,
+                    repeat: false,
+                }));
+                // WM_APPCOMMAND の規約: 処理した場合 TRUE を返す。
+                return LRESULT(1);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
