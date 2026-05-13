@@ -79,6 +79,7 @@ struct CenterPauseControlsInputs {
     tile_overlay_visible: bool,
     is_playing: bool,
     frame_step_active: bool,
+    initial_pause_controls_pending: bool,
     first_frame_presented: bool,
     has_video_error: bool,
     normalize_scanning: bool,
@@ -88,6 +89,7 @@ fn center_pause_controls_visible_for_state(inputs: CenterPauseControlsInputs) ->
     !inputs.tile_overlay_visible
         && !inputs.is_playing
         && !inputs.frame_step_active
+        && inputs.initial_pause_controls_pending
         && inputs.first_frame_presented
         && !inputs.has_video_error
         && !inputs.normalize_scanning
@@ -240,6 +242,7 @@ struct NativeEguiOverlay {
     video_muted: bool,
     video_playback_speed: f64,
     video_frame_step_active: bool,
+    initial_pause_controls_pending: bool,
     video_is_seeking: bool,
     video_seek_serial: u64,
     seek_status_started_at: Option<Instant>,
@@ -1904,6 +1907,7 @@ impl NativeVideoPresenter {
         muted: bool,
         playback_speed: f64,
         frame_step_active: bool,
+        initial_pause_controls_pending: bool,
         is_seeking: bool,
         seek_serial: u64,
     ) {
@@ -1916,6 +1920,7 @@ impl NativeVideoPresenter {
                 muted,
                 playback_speed,
                 frame_step_active,
+                initial_pause_controls_pending,
                 is_seeking,
                 seek_serial,
             );
@@ -2056,6 +2061,7 @@ impl NativeVideoPresenter {
         muted: bool,
         playback_speed: f64,
         frame_step_active: bool,
+        initial_pause_controls_pending: bool,
         is_seeking: bool,
         seek_serial: u64,
     ) -> Result<NativeOverlayInputOutcome, String> {
@@ -2070,6 +2076,7 @@ impl NativeVideoPresenter {
                 muted,
                 playback_speed,
                 frame_step_active,
+                initial_pause_controls_pending,
                 is_seeking,
                 seek_serial,
             );
@@ -2681,6 +2688,7 @@ impl NativeEguiOverlay {
             video_muted: false,
             video_playback_speed: 1.0,
             video_frame_step_active: false,
+            initial_pause_controls_pending: false,
             video_is_seeking: false,
             video_seek_serial: 0,
             seek_status_started_at: None,
@@ -2915,6 +2923,7 @@ impl NativeEguiOverlay {
         muted: bool,
         playback_speed: f64,
         frame_step_active: bool,
+        initial_pause_controls_pending: bool,
         is_seeking: bool,
         seek_serial: u64,
     ) {
@@ -2930,6 +2939,8 @@ impl NativeEguiOverlay {
         let muted_changed = self.video_muted != muted;
         let speed_changed = (self.video_playback_speed - playback_speed).abs() >= 1.0e-6;
         let frame_step_changed = self.video_frame_step_active != frame_step_active;
+        let initial_pause_changed =
+            self.initial_pause_controls_pending != initial_pause_controls_pending;
         let seeking_changed = self.video_is_seeking != is_seeking;
         let seek_serial_changed = self.video_seek_serial != seek_serial;
         if !is_playing {
@@ -2949,6 +2960,7 @@ impl NativeEguiOverlay {
         self.video_muted = muted;
         self.video_playback_speed = playback_speed;
         self.video_frame_step_active = frame_step_active;
+        self.initial_pause_controls_pending = initial_pause_controls_pending;
         self.video_is_seeking = is_seeking;
         self.video_seek_serial = seek_serial;
         if speed_changed {
@@ -2966,6 +2978,7 @@ impl NativeEguiOverlay {
             || muted_changed
             || speed_changed
             || frame_step_changed
+            || initial_pause_changed
             || seeking_changed
             || seek_serial_changed
         {
@@ -3525,6 +3538,7 @@ impl NativeEguiOverlay {
                 tile_overlay_visible,
                 is_playing: self.video_is_playing,
                 frame_step_active: self.video_frame_step_active,
+                initial_pause_controls_pending: self.initial_pause_controls_pending,
                 first_frame_presented: self.first_frame_presented,
                 has_video_error: self.video_error.is_some(),
                 normalize_scanning,
@@ -4058,6 +4072,7 @@ impl NativeEguiOverlay {
                 tile_overlay_visible,
                 is_playing,
                 frame_step_active,
+                initial_pause_controls_pending: self.initial_pause_controls_pending,
                 first_frame_presented,
                 has_video_error: video_error.is_some(),
                 normalize_scanning,
@@ -5996,11 +6011,12 @@ mod tests {
     }
 
     #[test]
-    fn center_pause_controls_visibility_requires_paused_ready_video() {
+    fn center_pause_controls_visibility_requires_initial_paused_ready_video() {
         let base = super::CenterPauseControlsInputs {
             tile_overlay_visible: false,
             is_playing: false,
             frame_step_active: false,
+            initial_pause_controls_pending: true,
             first_frame_presented: true,
             has_video_error: false,
             normalize_scanning: false,
@@ -6018,6 +6034,10 @@ mod tests {
             },
             super::CenterPauseControlsInputs {
                 frame_step_active: true,
+                ..base
+            },
+            super::CenterPauseControlsInputs {
+                initial_pause_controls_pending: false,
                 ..base
             },
             super::CenterPauseControlsInputs {

@@ -3290,8 +3290,8 @@ impl App {
                         // Phase 5.5 追加: タイルモード中はオーバーレイのタイルクリック
                         // で seek + close を行うため、background catch-all は完全抑止
                         // (Codex P5.5 H1 反映)。
-                        // Phase 7.I 追加: 一時停止中の中央 2 ボタン (最初から / 続きから)
-                        // の領域を除外。
+                        // Phase 7.I 追加: 動画オープン直後の中央 2 ボタン
+                        // (最初から / 続きから) の領域を除外。
                         let tile_active = self.video_tile_state.is_some();
                         let pos_opt = fs_response.interact_pointer_pos();
                         // 旧 egui HUD は撤去済 (native presenter overlay が代替)。
@@ -3305,7 +3305,7 @@ impl App {
                                     && p.y >= full_rect.min.y + 44.0
                             })
                             .unwrap_or(false);
-                        // 中央 2 ボタン (一時停止時のみ描画) の領域だけを除外。
+                        // 中央 2 ボタン (オープン直後の初回 pause prompt) の領域だけを除外。
                         // 描画条件は native_presenter::draw_native_center_pause_controls
                         // (overlay_draw.rs) と完全に揃える。frame_step 中はボタン非表示
                         // なので除外しない (= ボタン跡地のクリックで toggle_play() が走り
@@ -3316,6 +3316,7 @@ impl App {
                             .map(|p| {
                                 !p.is_playing()
                                     && !p.is_frame_step_active()
+                                    && p.initial_pause_controls_pending()
                                     && p.displayed_frame_seq() > 0
                             })
                             .unwrap_or(false);

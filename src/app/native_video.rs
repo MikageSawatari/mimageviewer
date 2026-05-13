@@ -2466,6 +2466,9 @@ impl App {
             0x57 if !key.shift && !key.ctrl && !key.repeat => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.seek(0.0);
+                    if !player.is_playing() {
+                        player.toggle_play();
+                    }
                 }
             }
             // Ctrl+Shift+Left / Right: frame step and pause.

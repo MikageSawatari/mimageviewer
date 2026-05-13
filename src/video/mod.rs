@@ -115,6 +115,9 @@ pub struct VideoPlayer {
     frame_step_base_bits: AtomicU64,
     /// フレーム送り操作による一時停止中なら true。通常 pause の中央再生 UI と分ける。
     frame_step_active: Arc<AtomicBool>,
+    /// 動画を開いた直後の一時停止状態でだけ、中央の「最初から / 続きから」
+    /// 選択 UI を出すための one-shot フラグ。通常の pause では再点灯させない。
+    initial_pause_controls_pending: Arc<AtomicBool>,
     /// 最後の frame-step seek 発行時点での表示済みフレーム sequence。
     /// 長押し repeat はこの値から `displayed_frame_seq` が進むまで次 target を出さない。
     frame_step_issued_display_seq: AtomicU64,
@@ -327,6 +330,7 @@ pub(crate) struct SwitchSourcePayload {
     displayed_frame_seq: Arc<AtomicU64>,
     last_displayed_pts_bits: Arc<AtomicU64>,
     frame_step_active: Arc<AtomicBool>,
+    initial_pause_controls_pending: Arc<AtomicBool>,
     duration_secs_bits: Arc<AtomicU64>,
     /// 新ソースの decoder/UI と共有する動的状態 (per-frame プレゼン経路 /
     /// デインターレース)。fast-swap 経路でも presenter の present_stats が
@@ -436,6 +440,7 @@ struct PresenterSourceState {
     displayed_frame_seq: Arc<AtomicU64>,
     last_displayed_pts_bits: Arc<AtomicU64>,
     frame_step_active: Arc<AtomicBool>,
+    initial_pause_controls_pending: Arc<AtomicBool>,
     duration_secs_bits: Arc<AtomicU64>,
     /// A/V sync drift デバッグ用。fast-swap で旧 source から新 source に payload を
     /// 切り替えるときも同じ Arc を引き継ぎ、grafana 的な時系列が分断されないようにする。
@@ -475,6 +480,7 @@ impl PresenterSourceState {
             displayed_frame_seq: payload.displayed_frame_seq,
             last_displayed_pts_bits: payload.last_displayed_pts_bits,
             frame_step_active: payload.frame_step_active,
+            initial_pause_controls_pending: payload.initial_pause_controls_pending,
             duration_secs_bits: payload.duration_secs_bits,
             audio_diagnostics: payload.audio_diagnostics,
             source_epoch: payload.source_epoch,
@@ -527,6 +533,7 @@ impl NativeVideoOutput {
         displayed_frame_seq: Arc<AtomicU64>,
         last_displayed_pts_bits: Arc<AtomicU64>,
         frame_step_active: Arc<AtomicBool>,
+        initial_pause_controls_pending: Arc<AtomicBool>,
         duration_secs_bits: Arc<AtomicU64>,
         config: NativeVideoOutputConfig,
         dynamic: Arc<crate::video::decoder::VideoDynamicState>,
@@ -561,6 +568,7 @@ impl NativeVideoOutput {
                     displayed_frame_seq,
                     last_displayed_pts_bits,
                     frame_step_active,
+                    initial_pause_controls_pending,
                     duration_secs_bits,
                     config,
                     command_rx,
@@ -1206,6 +1214,7 @@ fn run_native_video_output(
     displayed_frame_seq: Arc<AtomicU64>,
     last_displayed_pts_bits: Arc<AtomicU64>,
     frame_step_active: Arc<AtomicBool>,
+    initial_pause_controls_pending: Arc<AtomicBool>,
     duration_secs_bits: Arc<AtomicU64>,
     config: NativeVideoOutputConfig,
     command_rx: std::sync::mpsc::Receiver<NativeVideoOutputCommand>,
@@ -1328,6 +1337,7 @@ fn run_native_video_output(
             clock.is_muted(),
             clock.playback_speed(),
             frame_step_active.load(Ordering::Acquire),
+            initial_pause_controls_pending.load(Ordering::Acquire),
             clock.is_seeking(),
             clock.current_seek_serial(),
         ) {
@@ -1344,6 +1354,7 @@ fn run_native_video_output(
         displayed_frame_seq,
         last_displayed_pts_bits,
         frame_step_active,
+        initial_pause_controls_pending,
         duration_secs_bits,
         dynamic,
         audio_diagnostics,
@@ -1749,6 +1760,9 @@ fn run_native_video_output(
                 source.clock.is_muted(),
                 source.clock.playback_speed(),
                 source.frame_step_active.load(Ordering::Acquire),
+                source
+                    .initial_pause_controls_pending
+                    .load(Ordering::Acquire),
                 source.clock.is_seeking(),
                 source.clock.current_seek_serial(),
             );
@@ -2080,6 +2094,9 @@ fn run_native_video_output(
                 source.clock.is_muted(),
                 source.clock.playback_speed(),
                 source.frame_step_active.load(Ordering::Acquire),
+                source
+                    .initial_pause_controls_pending
+                    .load(Ordering::Acquire),
                 source.clock.is_seeking(),
                 source.clock.current_seek_serial(),
             ) {
@@ -2664,6 +2681,7 @@ impl VideoPlayer {
                 last_displayed_pts_bits: Arc::new(AtomicU64::new(f64::NAN.to_bits())),
                 frame_step_base_bits: AtomicU64::new(f64::NAN.to_bits()),
                 frame_step_active: Arc::new(AtomicBool::new(false)),
+                initial_pause_controls_pending: Arc::new(AtomicBool::new(false)),
                 frame_step_issued_display_seq: AtomicU64::new(FRAME_STEP_NO_PENDING_SEQ),
                 decoder_dropped_full_count: Arc::new(AtomicU64::new(0)),
                 ui_dropped_past_count: AtomicU64::new(0),
@@ -2810,6 +2828,7 @@ impl VideoPlayer {
         let displayed_frame_seq = Arc::new(AtomicU64::new(0));
         let last_displayed_pts_bits = Arc::new(AtomicU64::new(f64::NAN.to_bits()));
         let frame_step_active = Arc::new(AtomicBool::new(false));
+        let initial_pause_controls_pending = Arc::new(AtomicBool::new(!autoplay));
         #[cfg(windows)]
         let duration_secs_bits = Arc::new(AtomicU64::new(0.0_f64.to_bits()));
         // 動画は native presenter (独立 HWND + D3D11 swap chain) を必須とする。
@@ -2839,6 +2858,7 @@ impl VideoPlayer {
                     Arc::clone(&displayed_frame_seq),
                     Arc::clone(&last_displayed_pts_bits),
                     Arc::clone(&frame_step_active),
+                    Arc::clone(&initial_pause_controls_pending),
                     Arc::clone(&duration_secs_bits),
                     config,
                     Arc::clone(&dynamic),
@@ -2872,6 +2892,7 @@ impl VideoPlayer {
             last_displayed_pts_bits,
             frame_step_base_bits: AtomicU64::new(f64::NAN.to_bits()),
             frame_step_active,
+            initial_pause_controls_pending,
             frame_step_issued_display_seq: AtomicU64::new(FRAME_STEP_NO_PENDING_SEQ),
             #[cfg(windows)]
             duration_secs_bits,
@@ -3054,11 +3075,17 @@ impl VideoPlayer {
         self.engine.lock().unwrap().apply_command(cmd);
     }
 
+    fn clear_initial_pause_controls(&self) {
+        self.initial_pause_controls_pending
+            .store(false, Ordering::Release);
+    }
+
     pub fn toggle_play(&self) {
         // EOF で停止中に Space を押されたら 0 から再生し直す (replay)。
         // 通常の再生中は単純トグル。
         if !self.clock.is_playing() && self.clock.is_eof_reached() {
             self.clear_pending_user_seek();
+            self.clear_initial_pause_controls();
             self.clear_frame_step_target();
             self.clock.request_seek(0.0);
             self.clear_audio_output_buffer();
@@ -3085,6 +3112,7 @@ impl VideoPlayer {
         // 食い違っていた。
         let new_playing = !self.clock.is_playing();
         if new_playing {
+            self.clear_initial_pause_controls();
             self.clear_frame_step_target();
         } else {
             self.clear_pending_user_seek();
@@ -3103,6 +3131,7 @@ impl VideoPlayer {
             self.decode.audio_rx.len()
         ));
         if p {
+            self.clear_initial_pause_controls();
             self.clear_frame_step_target();
         } else {
             self.clear_pending_user_seek();
@@ -3151,6 +3180,7 @@ impl VideoPlayer {
     fn issue_user_seek_locked(&self, state: &mut UserSeekCoalesceState, target_secs: f64) {
         self.clock.request_seek(target_secs);
         self.clear_audio_output_buffer();
+        self.clear_initial_pause_controls();
         if !self.clock.is_playing() {
             self.clock.set_playing(true);
         }
@@ -3286,6 +3316,7 @@ impl VideoPlayer {
             return;
         }
         self.clear_pending_user_seek();
+        self.clear_initial_pause_controls();
         let pending_step_base = self.frame_step_base();
         let displayed_seq = self.displayed_frame_seq.load(Ordering::Acquire);
         let issued_display_seq = self.frame_step_issued_display_seq.load(Ordering::Acquire);
@@ -3400,6 +3431,10 @@ impl VideoPlayer {
 
     pub fn is_frame_step_active(&self) -> bool {
         self.frame_step_active.load(Ordering::Acquire)
+    }
+
+    pub fn initial_pause_controls_pending(&self) -> bool {
+        self.initial_pause_controls_pending.load(Ordering::Acquire)
     }
 
     pub fn duration(&self) -> f64 {
@@ -3585,6 +3620,7 @@ impl VideoPlayer {
             displayed_frame_seq: Arc::clone(&self.displayed_frame_seq),
             last_displayed_pts_bits: Arc::clone(&self.last_displayed_pts_bits),
             frame_step_active: Arc::clone(&self.frame_step_active),
+            initial_pause_controls_pending: Arc::clone(&self.initial_pause_controls_pending),
             duration_secs_bits: Arc::clone(&self.duration_secs_bits),
             dynamic: Arc::clone(&self.dynamic),
             audio_diagnostics: Arc::clone(&self.audio_diagnostics),
