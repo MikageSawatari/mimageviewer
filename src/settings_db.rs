@@ -520,6 +520,68 @@ impl SettingsDb {
         Ok(())
     }
 
+    /// 世代バックアップ (spec §6.1) を 1 回だけ実行する。
+    ///
+    /// プロセス内最初の user save で 1 回だけ呼ぶ前提 (= `BACKUP_DONE_THIS_SESSION`
+    /// に相当するフラグは呼出側で管理)。bootstrap save (= clean install / migration
+    /// 直後の最初の save_full) では呼ばない。
+    ///
+    /// 動作:
+    /// 1. `bak10` を削除 (存在しない場合は無視)
+    /// 2. `bak9` → `bak10`, `bak8` → `bak9`, ..., `bak1` → `bak2` (rename)
+    /// 3. `VACUUM INTO bak1` で現在 DB の snapshot を作成
+    ///
+    /// 1 と 2 の rename 中に crash しても disk 上は seek 可能な状態を保つ
+    /// (= `VACUUM INTO` は別ファイル作成なので main DB は無事)。
+    /// crash 後の再起動では bak1 が「前回 session 開始時の状態」のままになる。
+    pub fn rotate_backups(&self, data_dir: &Path) -> Result<(), SettingsDbError> {
+        let bak = |n: usize| data_dir.join(format!("settings.db.bak{n}"));
+        // 1. bak10 を削除 (存在しなくても OK)。
+        let _ = std::fs::remove_file(bak(10));
+        // 2. bak9 → bak10, bak8 → bak9, ..., bak1 → bak2 (新しい番号 → 古い番号)。
+        for n in (1..10).rev() {
+            let src = bak(n);
+            let dst = bak(n + 1);
+            if src.exists() {
+                if let Err(e) = std::fs::rename(&src, &dst) {
+                    log_diag(&format!(
+                        "settings_db: rotate_backups rename {} -> {} failed: {e}",
+                        src.display(),
+                        dst.display()
+                    ));
+                    // 個別の rename 失敗は abort せず log のみで先に進む
+                    // (= 世代を 1 つスキップしても次の save で再 rotate される)。
+                }
+            }
+        }
+        // 3. VACUUM INTO bak1。target は前段の rename で空になっているはず。
+        //    既存ファイルが残っていたら remove してから VACUUM INTO (= target が
+        //    存在すると SQLite はエラーを返すため)。
+        let bak1 = bak(1);
+        if bak1.exists() {
+            // 旧 bak1 が残っているのは前段 rename が部分失敗した場合のみ。
+            // 上書きしないと VACUUM INTO が落ちるので safe に消す。
+            if let Err(e) = std::fs::remove_file(&bak1) {
+                log_diag(&format!(
+                    "settings_db: rotate_backups: residual bak1 remove failed: {e}"
+                ));
+                return Err(SettingsDbError::Rusqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error {
+                        code: rusqlite::ErrorCode::CannotOpen,
+                        extended_code: 0,
+                    },
+                    Some(format!("bak1 residual cannot be removed: {e}")),
+                )));
+            }
+        }
+        self.backup_to(&bak1)?;
+        log_diag(&format!(
+            "settings_db: rotate_backups: snapshot -> {}",
+            bak1.display()
+        ));
+        Ok(())
+    }
+
     /// テスト用: in-memory SQLite を直接開く。
     #[cfg(test)]
     fn open_in_memory_for_test() -> Result<Self, SettingsDbError> {
