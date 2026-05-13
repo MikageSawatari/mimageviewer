@@ -2495,6 +2495,13 @@ impl App {
         fs_idx: usize,
         key: crate::video::native_window::NativeVideoKeyEvent,
     ) {
+        if matches!(key.virtual_key, 0x26 | 0x28) {
+            crate::logger::log(format!(
+                "[ctrl-nav-debug] handle_native_video_key_event vk=0x{:x} ctrl={} shift={} \
+                 alt={} repeat={} fs_idx={fs_idx}",
+                key.virtual_key, key.ctrl, key.shift, key.alt, key.repeat,
+            ));
+        }
         if key.alt {
             return;
         }
@@ -2587,9 +2594,17 @@ impl App {
             }
             // Plain Up / Down: navigate files, matching the egui fullscreen path.
             0x26 if key.ctrl && !key.shift => {
+                crate::logger::log(format!(
+                    "[ctrl-nav-debug] native_video Ctrl+Up arm hit fs_idx={fs_idx} repeat={}",
+                    key.repeat
+                ));
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
             }
             0x28 if key.ctrl && !key.shift => {
+                crate::logger::log(format!(
+                    "[ctrl-nav-debug] native_video Ctrl+Down arm hit fs_idx={fs_idx} repeat={}",
+                    key.repeat
+                ));
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
             }
             0x26 if !key.shift && !key.ctrl => {
