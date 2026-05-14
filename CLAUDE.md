@@ -1245,20 +1245,37 @@ awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
 
 ## Formatting
 
-- Rust のコード変更後は **編集したファイル限定** で `cargo fmt -- <path/to/file.rs>` を
-  実行してからコミットする。**ワークスペース全体への `cargo fmt` (引数なし / `--all`) は
-  基本かけない** — 編集対象外のファイルが巻き込まれてレビュー時に「触ったつもりのない
-  差分」が増え、commit の論理単位がぼやける。
+- **コミット前に必ずワークスペース全体へ `cargo fmt` をかける** (引数なし)。
+  リポジトリは常に 100% `cargo fmt` 済みの状態を保つので、全体 `cargo fmt` をかけても
+  **編集したファイル以外はゼロ差分**になる (整形すべき箇所が他に残っていないため)。
+  かつての「編集ファイル限定」運用は未整形コードが蓄積していた時期の回避策で、
+  `cargo fmt -- <path>` はそもそもスコープを絞れず (クレート全体を整形する)、
+  実態と乖離していたため全体 fmt に統一した。
 - **`cargo fmt` を回したら同じ作業セッション内でコミットする**。fmt 差分を未コミットの
   まま次セッションに持ち越さない (= 前セッションの leftover が新セッションの編集に
-  混ざる事故の原因。2026-05-12 にこのパターンで `mod.rs` に fmt 残骸が baked-in し、
-  commit を 2 つに分ける作業が発生した)。
-- 既存の未整形ファイルへ意図的に **ワークスペース全体に** `cargo fmt` を適用する場合
-  のみは、機能変更と混ぜず `style: Apply cargo fmt` のような整形専用コミットに分ける。
-- 他の未コミット作業が混ざっている状態では、合意なしにワークスペース全体へ
-  `cargo fmt` をかけない。必要な場合は対象ファイルを限定するか、先に作業を整理する。
-- Claude Code / Codex / 手作業のいずれでも同じ方針を使い、レビュー時に整形差分と
-  ロジック差分が混ざらないようにする。
+  混ざる事故の原因)。通常の編集なら fmt 差分はそのコミットの一部になるだけで、
+  整形専用コミットは不要。
+- **pre-commit フックが番人**: `.git/hooks/pre-commit` が `cargo fmt --check` を回し、
+  未整形コードが混じったコミットを機械的に弾く。Claude Code / Codex / 手作業の
+  どの経路でも効く。フックが無い環境 (新規 clone 等) では以下で再作成する:
+  ```sh
+  cat > .git/hooks/pre-commit <<'HOOK'
+  #!/bin/sh
+  # Keep the repo 100% `cargo fmt` clean. Policy: CLAUDE.md "## Formatting".
+  if ! cargo fmt --check >/dev/null 2>&1; then
+      echo "[pre-commit] Rust code is not formatted. Run 'cargo fmt', then re-stage." >&2
+      cargo fmt --check 2>/dev/null | grep "^Diff in" | sed 's/ at line.*//' | sort -u >&2
+      exit 1
+  fi
+  HOOK
+  chmod +x .git/hooks/pre-commit
+  ```
+  (git worktree は共通 git dir の hooks を共有するので、worktree 側でも自動で効く。)
+- **rustfmt バージョン更新時のみ整形専用コミット**: ツールチェーンを上げると新 rustfmt
+  が既存コードを整形し直すことがある。その場合に限り、機能変更と混ぜず
+  `style: Apply cargo fmt` の単独コミットで吸収する。
+- Claude Code / Codex / 手作業のいずれでも同じ方針を使い、リポジトリを常に
+  整形済みに保つ。
 
 ## Git Workflow
 
