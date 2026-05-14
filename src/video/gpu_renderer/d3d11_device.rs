@@ -96,6 +96,11 @@ pub struct D3d11Frame {
     /// 再利用したときに stale な D3D12 fence をキャッシュしたまま使ってしまうため、
     /// この値で再 open 判定する (Codex P1)。
     pub fence_gen: u64,
+    /// この出力テクスチャ slot の世代 ID。fence と同様、NT shared handle の値は
+    /// slot を evict した後に OS が再利用しうるため、handle 値だけでは presenter の
+    /// `shared_texture_cache` が前動画の stale テクスチャを返してしまう。`shared_handle`
+    /// と組で presenter のキャッシュキーにする。
+    pub shared_texture_gen: u64,
 }
 
 // HANDLE は OS のリソース ID 相当 (= 単純な i64 値) で、所有権を移動する分には
@@ -258,6 +263,10 @@ pub struct BlitOutput {
     pub shared_output_keyed_mutex: Option<IDXGIKeyedMutex>,
     pub shared_output_released_to_reader: Option<Arc<AtomicBool>>,
     pub fence_value: u64,
+    /// この出力テクスチャ slot の世代 ID (`SharedOutputSlot::texture_gen`)。`D3d11Frame`
+    /// に載せて presenter まで運び、`shared_texture_cache` のキーに含めることで
+    /// NT shared handle 値の再利用による stale テクスチャ参照を防ぐ。
+    pub shared_texture_gen: u64,
 }
 
 struct SharedOutputSlot {
@@ -268,6 +277,13 @@ struct SharedOutputSlot {
     format: DXGI_FORMAT,
     in_use: Arc<AtomicBool>,
     released_to_reader: Arc<AtomicBool>,
+    /// プロセス内ユニークな世代 ID。slot 生成ごとに採番する。NT shared handle の値は
+    /// slot を evict (= `CloseHandle`) した後に OS が別 slot 用へ再利用しうるため、
+    /// handle 値だけだと native presenter 側の `shared_texture_cache` が stale な
+    /// テクスチャを返してしまう (= 動画切替で前動画のフレームが 1 枚混入する)。
+    /// `fence_gen` と同じ思想の identity で、これを `D3d11Frame` 経由で presenter まで
+    /// 運び、キャッシュキーに含める。
+    texture_gen: u64,
 }
 
 impl Drop for SharedOutputSlot {
@@ -487,6 +503,7 @@ impl GpuVideoDevice {
             shared_output_keyed_mutex,
             shared_output_released_to_reader,
             km_acquired,
+            shared_texture_gen,
         ) = self.acquire_shared_output(out_w, out_h, out_format)?;
 
         // shared_handle は CreateInputView/OutputView/Blt のいずれかが失敗して `?` で
@@ -696,6 +713,7 @@ impl GpuVideoDevice {
             shared_output_keyed_mutex,
             shared_output_released_to_reader,
             fence_value,
+            shared_texture_gen,
         })
     }
 
@@ -866,9 +884,16 @@ impl GpuVideoDevice {
             Option<IDXGIKeyedMutex>,
             Option<Arc<AtomicBool>>,
             Option<IDXGIKeyedMutex>,
+            // SharedOutputSlot::texture_gen — presenter のテクスチャキャッシュ identity 用。
+            u64,
         ),
         GpuVideoError,
     > {
+        // プロセス内ユニークな共有出力テクスチャ世代 ID。0 は予約 (未設定扱い)、
+        // slot 生成ごとに 1, 2, 3, ... と進む。HANDLE 値は OS が再利用しうるので
+        // 別軸の identity が必要 (fence_gen と同じ理由)。
+        static NEXT_SHARED_TEXTURE_GEN: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(1);
         let wait_started = std::time::Instant::now();
         loop {
             let mut pool = self
@@ -887,6 +912,7 @@ impl GpuVideoDevice {
                     continue;
                 };
                 let released_to_reader = Arc::clone(&slot.released_to_reader);
+                let slot_gen = slot.texture_gen;
                 let Ok(km) = slot.tex.cast::<IDXGIKeyedMutex>() else {
                     return Ok((
                         slot.tex.clone(),
@@ -897,6 +923,7 @@ impl GpuVideoDevice {
                         None,
                         Some(released_to_reader),
                         None,
+                        slot_gen,
                     ));
                 };
                 let expected_released_to_reader = released_to_reader.load(Ordering::Acquire);
@@ -931,6 +958,7 @@ impl GpuVideoDevice {
                         Some(km.clone()),
                         Some(released_to_reader),
                         Some(km),
+                        slot_gen,
                     ));
                 }
                 crate::perf::event(
@@ -987,6 +1015,8 @@ impl GpuVideoDevice {
 
             if pool.len() < OUTPUT_RING_SIZE {
                 let (tex, shared_handle) = self.create_shared_output(w, h, format)?;
+                let slot_gen =
+                    NEXT_SHARED_TEXTURE_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 let in_use = Arc::new(AtomicBool::new(true));
                 let released_to_reader = Arc::new(AtomicBool::new(false));
                 let km_acquired = match tex.cast::<IDXGIKeyedMutex>() {
@@ -1015,6 +1045,7 @@ impl GpuVideoDevice {
                     format,
                     in_use: Arc::clone(&in_use),
                     released_to_reader: Arc::clone(&released_to_reader),
+                    texture_gen: slot_gen,
                 });
                 crate::perf::event(
                     "video",
@@ -1040,6 +1071,7 @@ impl GpuVideoDevice {
                     km_acquired.clone(),
                     Some(released_to_reader),
                     km_acquired,
+                    slot_gen,
                 ));
             }
 

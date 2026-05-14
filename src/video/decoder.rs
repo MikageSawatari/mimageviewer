@@ -1163,6 +1163,13 @@ pub struct VideoFrame {
     pub width: u32,
     pub height: u32,
     pub data: VideoFrameData,
+    /// Sample aspect ratio (= pixel aspect ratio)。1/1 = 正方ピクセル。
+    /// アナモフィック動画 (NTSC DVD 等で SAR=97/80 など) で native presenter が
+    /// 表示比を補正するために使う。`VideoInfo` 経由の `SetVideoSar` コマンドと違い、
+    /// フレームに同梱して presenter thread へ直接届けることで、ソース切替直後の
+    /// 最初のフレームが旧動画の SAR で描かれるのを防ぐ。
+    pub sar_num: u32,
+    pub sar_den: u32,
     /// 提示時刻 (秒)。AvClock との比較に使う。
     pub pts_secs: f64,
     /// シーク世代。これが現行の AvClock seek_serial と異なれば UI は捨てる。
@@ -2260,6 +2267,8 @@ fn run_decoder(
                     video_tb_den,
                     video_fps_num,
                     video_fps_den,
+                    video_sar_num,
+                    video_sar_den,
                     hw_active_initially,
                     deinterlace,
                     video_stream_interlaced,
@@ -2841,6 +2850,8 @@ fn run_video_decode(
     video_tb_den: f64,
     video_fps_num: u32,
     video_fps_den: u32,
+    video_sar_num: u32,
+    video_sar_den: u32,
     hw_active_initially: bool,
     deinterlace: crate::settings::VideoDeinterlaceMode,
     stream_interlaced: bool,
@@ -3215,6 +3226,8 @@ fn run_video_decode(
                         &frame,
                         dst_w,
                         dst_h,
+                        video_sar_num,
+                        video_sar_den,
                         pts_secs,
                         current_seek_serial,
                         &mut first_frame_logged,
@@ -3829,6 +3842,8 @@ fn run_video_decode(
                 width: dst_w,
                 height: dst_h,
                 data: VideoFrameData::Cpu(bgra),
+                sar_num: video_sar_num,
+                sar_den: video_sar_den,
                 pts_secs,
                 seek_serial: current_seek_serial,
             };
@@ -5588,6 +5603,8 @@ fn try_gpu_blit_path(
     frame: &ffmpeg_the_third::util::frame::Video,
     dst_w: u32,
     dst_h: u32,
+    sar_num: u32,
+    sar_den: u32,
     pts_secs: f64,
     current_seek_serial: u64,
     first_frame_logged: &mut bool,
@@ -5680,6 +5697,7 @@ fn try_gpu_blit_path(
     let _ = blit.output_texture;
     let shared_handle = blit.shared_handle;
     let fence_value = blit.fence_value;
+    let shared_texture_gen = blit.shared_texture_gen;
     let fence_shared_handle = gpu_dev.fence_shared_handle();
     let fence_gen = gpu_dev.fence_gen();
 
@@ -5724,11 +5742,14 @@ fn try_gpu_blit_path(
         fence_value,
         fence_shared_handle,
         fence_gen,
+        shared_texture_gen,
     };
     Ok(VideoFrame {
         width: final_w,
         height: final_h,
         data: VideoFrameData::Gpu(d3d11_frame),
+        sar_num,
+        sar_den,
         pts_secs,
         seek_serial: current_seek_serial,
     })

@@ -173,7 +173,10 @@ pub struct NativeVideoPresenter {
     /// drag と誤検出して top bar を hide させるバグを防ぐ。
     lbutton_down_since: Option<Instant>,
     fence_cache: Option<(u64, isize, ID3D11Fence)>,
-    shared_texture_cache: Vec<(u64, ID3D11Texture2D)>,
+    /// 開いた共有出力テクスチャのキャッシュ。キーは `(NT shared handle 値, shared_texture_gen)`。
+    /// `gen` を含める理由は `open_shared_texture` のドキュメントコメント参照
+    /// (= handle 値再利用による前動画フレーム混入の防止)。
+    shared_texture_cache: Vec<((u64, u64), ID3D11Texture2D)>,
     cpu_upload_scratch: Vec<u8>,
     pixel_probe_enabled: bool,
     pixel_probe_strict: bool,
@@ -1385,7 +1388,12 @@ impl NativeVideoPresenter {
         let mut shared_cache_hit = false;
         let path = match &frame.data {
             VideoFrameData::Cpu(bytes) => {
-                self.ensure_video_surface_size(frame.width, frame.height)?;
+                self.ensure_video_geometry(
+                    frame.width,
+                    frame.height,
+                    frame.sar_num,
+                    frame.sar_den,
+                )?;
                 let probe_this_frame = self.pixel_probe_due();
                 let src_probe = if probe_this_frame {
                     Some(sample_cpu_rgba_pixel(
@@ -1448,7 +1456,12 @@ impl NativeVideoPresenter {
                     return Err("D3D11 frame metadata size mismatch".into());
                 }
                 shared_handle = gpu_frame.shared_handle.0 as usize as u64;
-                self.ensure_video_surface_size(gpu_frame.width, gpu_frame.height)?;
+                self.ensure_video_geometry(
+                    gpu_frame.width,
+                    gpu_frame.height,
+                    frame.sar_num,
+                    frame.sar_den,
+                )?;
                 let probe_this_frame = self.pixel_probe_due();
                 let fence = self.open_fence(gpu_frame.fence_gen, gpu_frame.fence_shared_handle)?;
                 let fence_t0 = Instant::now();
@@ -1459,7 +1472,8 @@ impl NativeVideoPresenter {
                 }
                 fence_wait_ms = fence_t0.elapsed().as_secs_f64() * 1000.0;
                 let open_shared_t0 = Instant::now();
-                let (src, cache_hit) = self.open_shared_texture(gpu_frame.shared_handle)?;
+                let (src, cache_hit) = self
+                    .open_shared_texture(gpu_frame.shared_handle, gpu_frame.shared_texture_gen)?;
                 shared_cache_hit = cache_hit;
                 open_shared_ms = open_shared_t0.elapsed().as_secs_f64() * 1000.0;
                 let keyed_mutex_t0 = Instant::now();
@@ -2215,15 +2229,27 @@ impl NativeVideoPresenter {
         Ok(self.fence_cache.as_ref().unwrap().2.clone())
     }
 
+    /// 共有出力テクスチャを `OpenSharedResource1` で開く。結果は `(handle 値, gen)` を
+    /// キーにキャッシュする。
+    ///
+    /// ⚠️ **`gen` をキーに含めるのが必須**: NT shared handle の値は、decoder 側で
+    /// 共有出力 slot を evict (`CloseHandle`) した後に OS が別の slot 用へ再利用しうる。
+    /// handle 値だけでキャッシュすると、動画切替で「前動画のテクスチャ」を stale なまま
+    /// 返してしまい、新動画の再生中に前動画のフレームが 1 枚混入する (2026-05-15 報告の
+    /// frame 225)。`gen` (`SharedOutputSlot::texture_gen`、プロセス内ユニーク・単調増加)
+    /// を組にすることで、handle 値が再利用されても別エントリとして必ず開き直す。
+    /// `open_fence` の `fence_gen` と同じ防御。
     fn open_shared_texture(
         &mut self,
         shared_handle: HANDLE,
+        shared_texture_gen: u64,
     ) -> Result<(ID3D11Texture2D, bool), String> {
         let handle_key = shared_handle.0 as usize as u64;
+        let cache_key = (handle_key, shared_texture_gen);
         if let Some(pos) = self
             .shared_texture_cache
             .iter()
-            .position(|(cached_key, _)| *cached_key == handle_key)
+            .position(|(cached_key, _)| *cached_key == cache_key)
         {
             let texture = self.shared_texture_cache[pos].1.clone();
             if pos != 0 {
@@ -2239,43 +2265,85 @@ impl NativeVideoPresenter {
                 .map_err(|e| format!("OpenSharedResource1 frame texture: {e:?}"))?
         };
         self.shared_texture_cache
-            .insert(0, (handle_key, texture.clone()));
+            .insert(0, (cache_key, texture.clone()));
         if self.shared_texture_cache.len() > SHARED_TEXTURE_CACHE_CAPACITY {
             self.shared_texture_cache.pop();
         }
         Ok((texture, false))
     }
 
-    fn ensure_video_surface_size(&mut self, width: u32, height: u32) -> Result<(), String> {
+    /// 動画フレームの実寸法 + SAR に合わせて swap chain サーフェスと video visual の
+    /// transform を確定する。`present` の先頭で、そのフレーム自身の幅・高さ・SAR を
+    /// 渡して呼ぶ。
+    ///
+    /// SAR は `VideoFrame` に同梱されて presenter thread へ直接届くため、UI tick 経由の
+    /// `SetVideoSar` コマンドより早く・確実に反映される (= ソース切替直後の最初の
+    /// フレームが旧動画の SAR で描かれるのを防ぐ)。
+    ///
+    /// 解像度が変わったときは `ResizeBuffers` で swap chain backbuffer をフレーム実寸へ
+    /// 合わせ、`update_video_visual_transform` で transform を再計算する。`present` 本体は
+    /// この呼び出しの直後に実フレームを copy + `Present` するので、transform commit は
+    /// 実フレームの present より前に確定する。
+    fn ensure_video_geometry(
+        &mut self,
+        width: u32,
+        height: u32,
+        sar_num: u32,
+        sar_den: u32,
+    ) -> Result<(), String> {
         let width = width.max(1);
         let height = height.max(1);
-        if self.surface_width == width && self.surface_height == height {
+        let sar_num = sar_num.max(1);
+        let sar_den = sar_den.max(1);
+        let size_changed = self.surface_width != width || self.surface_height != height;
+        let sar_changed = self.sar_num != sar_num || self.sar_den != sar_den;
+        if !size_changed && !sar_changed {
             return Ok(());
         }
+        // SAR は transform 計算より前に確定させる (= resize 経路の
+        // `update_video_visual_transform` が最初から正しい SAR で計算するように)。
+        self.sar_num = sar_num;
+        self.sar_den = sar_den;
 
-        self.backbuffer = None;
-        unsafe {
-            self.swap_chain
-                .ResizeBuffers(
-                    0,
-                    width,
-                    height,
-                    DXGI_FORMAT_UNKNOWN,
-                    DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
-                )
-                .map_err(|e| format!("IDXGISwapChain::ResizeBuffers video surface: {e:?}"))?;
+        let geom_t0 = Instant::now();
+        if size_changed {
+            self.backbuffer = None;
+            unsafe {
+                self.swap_chain
+                    .ResizeBuffers(
+                        0,
+                        width,
+                        height,
+                        DXGI_FORMAT_UNKNOWN,
+                        DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
+                    )
+                    .map_err(|e| format!("IDXGISwapChain::ResizeBuffers video surface: {e:?}"))?;
+            }
+            self.surface_width = width;
+            self.surface_height = height;
+            // 黒クリアのみ。ここで `Present` はしない (= 黒フレームを 1 枚挟まない)。
+            // 実フレームは呼び出し元の `present` がこの直後に copy + `Present` する。
+            self.recreate_backbuffer(false)?;
         }
-        self.surface_width = width;
-        self.surface_height = height;
-        self.recreate_backbuffer(false)?;
         self.update_video_visual_transform()?;
+        let geom_ms = geom_t0.elapsed().as_secs_f64() * 1000.0;
+        crate::logger::log(format!(
+            "native-presenter: video geometry updated surface={}x{} sar={}/{} \
+             size_changed={size_changed} sar_changed={sar_changed} geom_ms={geom_ms:.2}",
+            self.surface_width, self.surface_height, self.sar_num, self.sar_den
+        ));
         log_event(
-            "surface_resize",
+            "video_geometry",
             &[
                 ("width", Value::from(self.width as i64)),
                 ("height", Value::from(self.height as i64)),
-                ("surface_width", Value::from(width as i64)),
-                ("surface_height", Value::from(height as i64)),
+                ("surface_width", Value::from(self.surface_width as i64)),
+                ("surface_height", Value::from(self.surface_height as i64)),
+                ("sar_num", Value::from(self.sar_num as i64)),
+                ("sar_den", Value::from(self.sar_den as i64)),
+                ("size_changed", Value::from(size_changed)),
+                ("sar_changed", Value::from(sar_changed)),
+                ("geom_ms", Value::from(geom_ms)),
             ],
         );
         Ok(())

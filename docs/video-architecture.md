@@ -150,6 +150,25 @@ NativeVideoPresenter (= 独立 HWND を持つ別スレッド)
     └─ CopyResource → swap chain backbuffer → Present (DComp visual tree 内)
 ```
 
+#### 共有テクスチャ identity (`shared_texture_gen`) — handle 値再利用への防御
+
+`GpuVideoDevice` (アプリ全体で 1 個、全 `VideoPlayer` が `Arc` 共有) は共有出力テクスチャ
+の ring (`shared_output_pool`、最大 24 枚) を持つ。動画切替で解像度が変わると
+`acquire_shared_output` はサイズ違いの slot を evict (`CloseHandle`) し、新サイズの slot を
+`CreateSharedHandle` で作る。このとき **OS は解放直後の NT shared handle 値を新 slot へ
+再利用しうる**。
+
+native presenter は開いた共有テクスチャを `shared_texture_cache` にキャッシュするが、
+これを **handle 値だけでキーにすると、handle 値が再利用されたとき前動画のテクスチャを
+stale なまま返してしまう** (= 動画切替直後に前動画のフレームが 1 枚混入する。2026-05-15
+ユーザー報告)。
+
+対策として `SharedOutputSlot` に **プロセス内ユニーク・単調増加の `texture_gen`** を持たせ、
+`BlitOutput` → `D3d11Frame.shared_texture_gen` → presenter まで運び、`shared_texture_cache`
+のキーを `(handle 値, shared_texture_gen)` の組にする。handle 値が再利用されても
+`texture_gen` が必ず異なるので、別エントリとして開き直す。これは `fence` 側の `fence_gen`
+(同じ handle 値再利用問題への既存対策) と完全に同じ思想。
+
 ### CPU フレームの内部フロー (HW decoder 失敗 / 非対応コーデック時)
 
 ```
@@ -810,14 +829,19 @@ seek 時の target 前 keyframe / preroll frame は decoder 側で drop され�
 (`width × height`) と表示比が一致しない。例えば 720×480 + SAR=97/80 の動画は
 DAR ≈ 1.819:1 (= 16:9) で表示すべきで、square pixel で扱うと縦長になる。
 
-mIV は **decoder で SAR を読み取り → VideoInfo に格納 → native presenter の visual
+mIV は **decoder で SAR を読み取り → 各 `VideoFrame` に同梱 → native presenter の visual
 transform で anisotropic scale として適用する**:
 
 - `decoder.rs` の `normalize_sar(num, den) -> (u32, u32)` で `AVCodecParameters.sample_aspect_ratio`
-  を正規化 (0/0・0/1・負値はすべて 1/1 に倒す)。`VideoInfo { sar_num, sar_den }` で UI 層へ伝搬。
-- `VideoPlayer::tick` で info を初めて受領した時に 1 度だけ `set_native_video_sar(num, den)` を
-  発行 (= mid-stream 変化は無視、bwdif フィルタは frame.aspect_ratio() で keying するので
-  逆インタレース側は引き続き frame-level SAR で動く)。
+  を正規化 (0/0・0/1・負値はすべて 1/1 に倒す)。値は `VideoInfo { sar_num, sar_den }` で UI 層へ
+  伝搬すると同時に、**`VideoFrame { sar_num, sar_den }` として各フレームにも載せる**。
+- presenter は `present()` で受け取ったフレーム自身の SAR を `ensure_video_geometry()` に渡す。
+  これにより SAR は decoder → `video_tx` → presenter thread の **速い経路**で届き、ソース切替
+  (fast-swap) 直後の最初のフレームから正しい SAR で描かれる。`VideoPlayer::tick` 経由の
+  `set_native_video_sar(num, den)` コマンド (= decoder → `info_rx` → UI tick → command channel
+  の遅い経路) は残してあるが、frame 同梱 SAR が先に反映されるため通常は no-op の safety net。
+  mid-stream の SAR 変化は frame 同梱なので自然に追従する (bwdif フィルタも frame.aspect_ratio()
+  で keying)。
 - `NativeVideoPresenter::update_video_visual_transform()` は `compute_video_visual_transform()`
   helper (純粋関数、unit test 6 件あり) で transform 行列を計算する:
   ```
@@ -830,6 +854,29 @@ transform で anisotropic scale として適用する**:
 - swap chain backbuffer / VPP / CPU upload はすべて raw encoded サイズのまま動く
   (= 余計な GPU/CPU 仕事ゼロ、stretch は DComp 側で 1 度だけ走る)。
 - タイルモードのセル比率 (`ui_video_tile.rs`) も同じ SAR を反映する。
+
+### ジオメトリ更新 (`ensure_video_geometry`)
+
+`present()` は毎フレームの先頭で `ensure_video_geometry(width, height, sar_num, sar_den)` を
+呼ぶ。寸法も SAR も変わらなければ即 return。変わったときだけ:
+
+1. **解像度が変わった場合**: `ResizeBuffers` で swap chain backbuffer をフレーム実寸へ
+   合わせ、`recreate_backbuffer(false)` で新 backbuffer を取得 (黒クリアのみ、`Present` しない)。
+2. `update_video_visual_transform()` で `SetTransform2` + `IDCompositionDevice::Commit()`。
+
+呼び出し元の `present` 本体はこの直後に実フレームを copy + `Present` するので、transform の
+commit は実フレームの present より前に program order 上確定する。`video_geometry` perf
+イベントに `size_changed` / `sar_changed` / `geom_ms` を記録する。
+
+> **2026-05-15 の経緯**: 当初は「DComp transform commit と swap chain Present が compositor
+> に原子的にラッチされない」競合を疑い、`ResizeBuffers` 後に黒フレームを 1 枚 present +
+> `WaitForCommitCompletion` + `DwmFlush` で同期する実装を入れていた。しかし実機録画の
+> フレーム解析で、ホイール切替時の「誤位置フレーム」の実体は transform 競合ではなく
+> **共有出力テクスチャ handle 値の再利用による stale テクスチャ参照** (前述の
+> `shared_texture_gen` 節) だと判明。transform 競合フレームは録画中に 1 枚も観測されず、
+> 黒フレーム挿入は (実害の無い仮説への対策である一方) 解像度切替ごとに確実に 1 フレーム
+> 黒を挟む実害を生んでいたため撤去した。`shared_texture_gen` の修正が本質的な方で、
+> ジオメトリ更新経路は素直な `ResizeBuffers` + transform 再計算に戻している。
 
 UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFmpeg の慣例に合わせ
 **encoded サイズのまま** (例: `720×480`)。DAR の併記は将来検討。
