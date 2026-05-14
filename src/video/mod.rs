@@ -1651,6 +1651,14 @@ fn run_native_video_output(
                     presenter.set_overlay_metadata(None);
                     presenter.set_overlay_timeline_markers(Vec::new());
                     presenter.set_overlay_jump_entries(Vec::new());
+                    // hover preview の transient state も新ソース用にクリアする。
+                    // overlay は「直近のサムネ画像を常に描く」ようになったため、
+                    // ここでクリアしないと、ソース切替直後の最初の hover preview で
+                    // 前の動画のサムネが (場合によっては「シーク中」box も出ずに)
+                    // 表示されてしまう。新 player の thumb worker は別 path で
+                    // 改めてサムネを生成するので、None 始まりで問題ない。
+                    presenter.set_overlay_hover_thumbnail(None);
+                    presenter.set_overlay_hover_preview_pinned(false);
                     if source.source_epoch > 0 && source.queue.is_empty() {
                         crate::logger::log(format!(
                             "[native-video] presenter switched source epoch={}",

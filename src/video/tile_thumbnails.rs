@@ -282,8 +282,15 @@ fn run_worker(
             }
             let mut frame = Video::empty();
             while decoder.receive_frame(&mut frame).is_ok() {
-                let pts = frame.pts().unwrap_or(0);
-                let pts_secs = pts as f64 * tb_num / tb_den;
+                // 再生デコーダと同じ best-effort timestamp を使う。PTS 欠落系の
+                // AVI/ASF/古い DivX で `frame.pts()` が None になり、判定が壊れて
+                // 全タイルが EOF まで走るのを防ぐ。timestamp が全く取れない壊れた
+                // ストリームでは seek 直後の最初の frame をそのまま採用する。
+                let Some(ts) = crate::video::decoder::video_frame_timestamp(&frame) else {
+                    got_frame = Some(frame);
+                    break;
+                };
+                let pts_secs = ts as f64 * tb_num / tb_den;
                 // クリックで target_secs にシークしたとき表示される frame と一致
                 // させるため「target_secs 以降の最初の frame」を採用する。以前は
                 // `target_secs - 0.5` で 0.5s 手前の frame を拾っていた。

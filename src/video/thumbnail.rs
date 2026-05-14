@@ -273,11 +273,22 @@ fn run_worker(
         // backward seek 後の keyframe から target_secs に到達する frame まで decode
         // し続ける。decode 数に上限は設けない: 長い GOP (実測 5.5s ≈ 165 frame の
         // 動画あり) でも必ず target のフレームを採用するため。上限を置くと GOP 長に
-        // よってサムネが再生開始位置からずれる。worker は cancel フラグを 1 パケット
-        // ごとに確認するので、別 target への切替時 (= Drop) は自然終了する。
+        // よってサムネが再生開始位置からずれる。
+        // 暴走対策は 2 つ: (1) cancel フラグ (= Drop) で worker 自体を止める、
+        // (2) より新しい hover request (`pending_target_bits` が更新された) を検知
+        // したら現在の decode を捨てて最新 target に乗り換える。上限撤廃後はこの
+        // (2) が無いと、長 GOP / PTS 欠落ファイルで 1 request が EOF まで走り、
+        // スクラブ中の後続 request が全部詰まる。
+        let mut superseded = false;
         for item in input.packets() {
             if cancel.load(Ordering::Acquire) {
                 return;
+            }
+            if pending_target_bits.load(Ordering::Acquire) != PENDING_NONE {
+                // より新しい hover request が来た。現在の decode を捨てて outer
+                // loop に戻り、最新 target を処理する (drain semantics の維持)。
+                superseded = true;
+                break;
             }
             let (stream, packet) = match item {
                 Ok(sp) => sp,
@@ -291,8 +302,15 @@ fn run_worker(
             }
             let mut frame = Video::empty();
             while decoder.receive_frame(&mut frame).is_ok() {
-                let pts = frame.pts().unwrap_or(0);
-                let pts_secs = pts as f64 * tb_num / tb_den;
+                // 再生デコーダと同じ best-effort timestamp を使う。PTS 欠落系の
+                // AVI/ASF/古い DivX で `frame.pts()` が None になり、判定が壊れて
+                // EOF まで走るのを防ぐ。timestamp が全く取れない壊れたストリーム
+                // では seek 直後の最初の frame をそのまま採用する。
+                let Some(ts) = crate::video::decoder::video_frame_timestamp(&frame) else {
+                    got_frame = Some(frame);
+                    break;
+                };
+                let pts_secs = ts as f64 * tb_num / tb_den;
                 // 再生で target_secs にシークしたとき表示される frame と一致させる
                 // ため「target_secs 以降の最初の frame」を採用する。以前は
                 // `target_secs - SECONDS_PER_BUCKET` で 0.5s 手前の frame を拾って
@@ -310,6 +328,9 @@ fn run_worker(
             if got_frame.is_some() {
                 break;
             }
+        }
+        if superseded {
+            continue;
         }
 
         let Some(frame) = got_frame.or(last_frame) else {
