@@ -318,6 +318,13 @@ struct NativeEguiOverlay {
     /// SetWindowRgn 外に落ちて見えたり、click hit-test が不安定になったりする。
     /// `None` なら popup 非表示または未描画。
     last_drawn_speed_popup_rect: Option<egui::Rect>,
+    /// 直近 egui run で描画したブックマーク名編集ダイアログの actual rect。
+    /// 中央モーダルだが、配置は `pos.y = (H - dialog_h) * 0.5` (dialog_h はレイアウト
+    /// 用の過大見積もり) で、実コンテンツ高さとの差でダイアログ中心が画面中心より
+    /// 上にずれる。画面中心固定の概算 region だと上端 (=「ブックマーク名」ラベル) が
+    /// SetWindowRgn でクリップされるため、実描画 rect を region に使う。
+    /// `None` ならダイアログ非表示または未描画。
+    last_drawn_bookmark_editor_rect: Option<egui::Rect>,
     hover_thumbnail: Option<NativeOverlayThumbnail>,
     hover_texture: Option<egui::TextureHandle>,
     hover_texture_key: Option<(u32, u32, u64)>,
@@ -2791,6 +2798,7 @@ impl NativeEguiOverlay {
             last_drawn_paused_center_rects: None,
             last_drawn_toast_rect: None,
             last_drawn_speed_popup_rect: None,
+            last_drawn_bookmark_editor_rect: None,
             hover_thumbnail: None,
             hover_texture: None,
             hover_texture_key: None,
@@ -3872,18 +3880,34 @@ impl NativeEguiOverlay {
             }
         }
 
-        // Bookmark title editor: center modal、概算で 500×100pt。
+        // Bookmark title editor: center modal。`draw_native_bookmark_title_editor` の
+        // 実描画 rect (`last_drawn_bookmark_editor_rect`) をそのまま region にする。
+        //
+        // 旧版は画面中心固定の概算 500×100pt だったが、ダイアログは
+        // `pos.y = (H - dialog_h) * 0.5` (dialog_h=142 はレイアウト用の過大見積もり) に
+        // 配置され、実コンテンツ高さ (~115pt) との差でダイアログ中心が画面中心より
+        // 上にずれる。概算 region は画面中心 + 高さ 100pt だったため、ダイアログ上端
+        // (=「ブックマーク名」ラベル) が SetWindowRgn でクリップされていた
+        // (= 2026-05-14 ユーザー報告「上が欠ける」)。
         if self.bookmark_title_edit.is_some() {
-            let center_x = width_px / 2;
-            let center_y = height_px / 2;
-            let w = to_px(500.0);
-            let h = to_px(100.0);
-            regions.push(RECT {
-                left: (center_x - w / 2).max(0),
-                top: (center_y - h / 2).max(0),
-                right: (center_x + w / 2).min(width_px),
-                bottom: (center_y + h / 2).min(height_px),
+            let rect = self.last_drawn_bookmark_editor_rect.unwrap_or_else(|| {
+                // 初回フレーム fallback: 実描画前は draw 側と同じ式で概算する。
+                // dialog_h=142 は実コンテンツ高さの過大見積もりなので、この rect は
+                // ダイアログ全体を内包する。
+                let dialog_w = 360.0_f32.min((width_points - 32.0).max(260.0));
+                let dialog_h = 142.0;
+                egui::Rect::from_min_size(
+                    egui::pos2(
+                        (width_points - dialog_w) * 0.5,
+                        (height_points - dialog_h) * 0.5,
+                    ),
+                    egui::vec2(dialog_w, dialog_h),
+                )
             });
+            let rect_px = rect_to_px(rect.expand(2.0));
+            if rect_px.left < rect_px.right && rect_px.top < rect_px.bottom {
+                regions.push(rect_px);
+            }
         }
 
         // Normalize progress / scan blocker: 全画面被覆 (= scan 中はモーダル cancel ボタン操作のため)。
@@ -4280,6 +4304,7 @@ impl NativeEguiOverlay {
         let mut last_drawn_paused_center_rects: Option<[egui::Rect; 3]> = None;
         let mut last_drawn_toast_rect: Option<egui::Rect> = None;
         let mut last_drawn_speed_popup_rect: Option<egui::Rect> = None;
+        let mut last_drawn_bookmark_editor_rect: Option<egui::Rect> = None;
         if !overlay_visible {
             self.set_visual_attached(false)?;
             last_seek_target_secs = None;
@@ -4492,7 +4517,7 @@ impl NativeEguiOverlay {
                 );
             }
             if bookmark_title_edit.is_some() {
-                draw_native_bookmark_title_editor(
+                last_drawn_bookmark_editor_rect = draw_native_bookmark_title_editor(
                     ctx,
                     overlay_width_points,
                     overlay_height_points,
@@ -5467,6 +5492,7 @@ impl NativeEguiOverlay {
         self.last_drawn_paused_center_rects = last_drawn_paused_center_rects;
         self.last_drawn_toast_rect = last_drawn_toast_rect;
         self.last_drawn_speed_popup_rect = last_drawn_speed_popup_rect;
+        self.last_drawn_bookmark_editor_rect = last_drawn_bookmark_editor_rect;
         self.video_speed_popup_open = video_speed_popup_open;
         self.frame_step_hold = frame_step_hold;
         self.bookmark_title_edit = bookmark_title_edit;

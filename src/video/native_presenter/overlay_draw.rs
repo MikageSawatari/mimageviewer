@@ -696,15 +696,17 @@ pub(super) fn draw_native_jump_row(
     });
 }
 
+/// 戻り値は実際に描画したダイアログ rect。呼び出し側は `SetWindowRgn` の region に
+/// この rect を使う (中央固定の概算 region だとダイアログ上端がクリップされるため)。
 pub(super) fn draw_native_bookmark_title_editor(
     ctx: &egui::Context,
     overlay_width_points: f32,
     overlay_height_points: f32,
     edit: &mut Option<NativeBookmarkTitleEdit>,
     commands: &mut Vec<NativeOverlayCommand>,
-) {
+) -> Option<egui::Rect> {
     let Some(state) = edit.as_mut() else {
-        return;
+        return None;
     };
     let dialog_w = 360.0_f32.min((overlay_width_points - 32.0).max(260.0));
     let dialog_h = 142.0;
@@ -716,7 +718,7 @@ pub(super) fn draw_native_bookmark_title_editor(
     let mut clear = false;
     let mut cancel = false;
 
-    egui::Area::new(egui::Id::new("native_video_bookmark_title_editor"))
+    let area_response = egui::Area::new(egui::Id::new("native_video_bookmark_title_editor"))
         .order(egui::Order::Foreground)
         .fixed_pos(pos)
         .show(ctx, |ui| {
@@ -766,6 +768,7 @@ pub(super) fn draw_native_bookmark_title_editor(
     } else if cancel {
         *edit = None;
     }
+    Some(area_response.response.rect)
 }
 
 #[derive(Copy, Clone)]
