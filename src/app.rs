@@ -1856,6 +1856,24 @@ pub struct App {
     /// 表示される。B キー / 🔖 ボタンで追加。
     pub(crate) video_bookmark_db: Option<crate::video_bookmarks::VideoBookmarkDb>,
 
+    // ── 親コンテナ (フォルダ/ZIP/PDF) 代表サムネ ピン留め ────────
+    /// 親コンテナの代表サムネを手動で固定するためのピン DB。
+    /// 解決優先度: 1) `folder_thumb_pin_db` の手動ピン → 2) `resolve_folder_thumb_image`
+    /// の自動選定 → 3) アイコン fallback。
+    /// `Arc` 経由で worker thread と共有して、auto-pick 再帰が経由するサブフォルダの
+    /// pin も検出する (pin-aware auto-pick)。内部 `Mutex<Connection>` で
+    /// マルチスレッド安全。
+    pub(crate) folder_thumb_pin_db:
+        Option<std::sync::Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
+    /// 現在ロード済み items の親コンテナごとのピン source キャッシュ。
+    /// `load_folder` 完了時に `lookup_many` で一括取得し、`make_load_request` から
+    /// 同期参照する (per-frame DB アクセス回避)。キーは `normalize_keep_drive(container)`。
+    pub(crate) folder_pin_map:
+        std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    /// 親コンテナのピン書き換えがあったので、次の機会にフォルダを再ロードして
+    /// グリッドサムネに反映する必要があるフラグ (`video_thumb_overrides_dirty` と同じ作法)。
+    pub(crate) folder_thumb_pin_dirty: bool,
+
     // ── 動画タイルモード (Phase 5.5) ─────────────────────────────
     /// S キーでトグルされる動画タイルモード状態。再生中に間隔別にサムネを並べて
     /// クリックでシーク。VideoPlayer 切替で自動破棄 (Drop で worker 終了)。
@@ -2654,6 +2672,13 @@ impl Default for App {
         crate::perf::emit_ms("startup", "db_open_video_pins", 0, t);
 
         let t = std::time::Instant::now();
+        let folder_thumb_pin_db = crate::folder_thumb_pins::FolderThumbPinDb::open()
+            .map(std::sync::Arc::new)
+            .map_err(|e| crate::logger::log(format!("folder_thumb_pin_db open failed: {e}")))
+            .ok();
+        crate::perf::emit_ms("startup", "db_open_folder_thumb_pins", 0, t);
+
+        let t = std::time::Instant::now();
         let video_bookmark_db = crate::video_bookmarks::VideoBookmarkDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_video_bookmarks", 0, t);
 
@@ -2867,6 +2892,9 @@ impl Default for App {
             normalize_ui_states: std::collections::HashMap::new(),
             video_pin_db,
             video_bookmark_db,
+            folder_thumb_pin_db,
+            folder_pin_map: std::collections::HashMap::new(),
+            folder_thumb_pin_dirty: false,
             #[cfg(windows)]
             video_tile_state: None,
             #[cfg(windows)]
@@ -3646,24 +3674,39 @@ impl App {
             }
         }
 
-        // 画像ファイル名集合 (カタログ掃除用キー)
+        // 画像ファイル名集合 (カタログ掃除用キー)。pinned 形式 (`{base}#pin:{source_id}`)
+        // も含めることで、`delete_missing` がピン由来の cache 行を巻き添えで消さない
+        // (Codex Phase B P2 指摘)。pin DB lookup は load_folder 1 回あたり 1 度だけ実行。
+        let pin_map_for_existing: std::collections::HashMap<
+            String,
+            crate::folder_thumb_pins::FolderPinSource,
+        > = if let Some(db) = self.folder_thumb_pin_db.as_ref() {
+            let containers: Vec<&std::path::Path> = items
+                .iter()
+                .filter_map(|it| match it {
+                    GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+                        Some(p.as_path())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if containers.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                db.lookup_many(containers)
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
-            .filter_map(|it| match it {
-                GridItem::Image(p) => p.file_name()?.to_str().map(String::from),
-                GridItem::ZipFile(p) => {
-                    let fname = p.file_name()?.to_str()?;
-                    Some(format!("{}{fname}", CACHE_KEY_ZIP))
-                }
-                GridItem::PdfFile(p) => {
-                    let fname = p.file_name()?.to_str()?;
-                    Some(format!("{}{fname}", CACHE_KEY_PDF))
-                }
-                GridItem::Folder(p) => {
-                    let fname = p.file_name()?.to_str()?;
-                    Some(format!("{}{fname}", CACHE_KEY_FOLDER))
-                }
-                _ => None,
+            .flat_map(|it| {
+                folder_thumb_existing_keys_for(
+                    it,
+                    &pin_map_for_existing,
+                    self.folder_thumb_pin_db.as_deref(),
+                    self.settings.folder_thumb_depth as usize,
+                )
             })
             .collect();
 
@@ -4727,22 +4770,37 @@ impl App {
         self.favsearch.results_paths = results.iter().map(|e| e.path.clone()).collect();
 
         let synthetic = search_results_synthetic_path();
+        // pinned 形式の cache 行も保護対象に入れる (Codex Phase B P2 指摘、load_folder と同様)。
+        let pin_map_for_existing: std::collections::HashMap<
+            String,
+            crate::folder_thumb_pins::FolderPinSource,
+        > = if let Some(db) = self.folder_thumb_pin_db.as_ref() {
+            let containers: Vec<&std::path::Path> = items
+                .iter()
+                .filter_map(|it| match it {
+                    GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+                        Some(p.as_path())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if containers.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                db.lookup_many(containers)
+            }
+        } else {
+            std::collections::HashMap::new()
+        };
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
-            .filter_map(|it| match it {
-                GridItem::Folder(p) => p
-                    .file_name()?
-                    .to_str()
-                    .map(|n| format!("{}{n}", CACHE_KEY_FOLDER)),
-                GridItem::ZipFile(p) => p
-                    .file_name()?
-                    .to_str()
-                    .map(|n| format!("{}{n}", CACHE_KEY_ZIP)),
-                GridItem::PdfFile(p) => p
-                    .file_name()?
-                    .to_str()
-                    .map(|n| format!("{}{n}", CACHE_KEY_PDF)),
-                _ => None,
+            .flat_map(|it| {
+                folder_thumb_existing_keys_for(
+                    it,
+                    &pin_map_for_existing,
+                    self.folder_thumb_pin_db.as_deref(),
+                    self.settings.folder_thumb_depth as usize,
+                )
             })
             .collect();
         self.start_loading_items(
@@ -5806,6 +5864,13 @@ impl App {
         if let Some(ref cat) = catalog_arc {
             self.setup_virtual_folder_seed_and_writeback(&source_path, cat, &cache_map);
         }
+        // Phase C: フォルダピンの source が Video の場合、video_pins DB の抽出済み
+        // WebP を folder の pinned cache key (`folderthumb:{dir}#pin:{source_id}`) で
+        // catalog + cache_map にミラーする。これにより worker は pinned_key で
+        // cache_hit して動画フレームをそのまま表示できる (= 動画自身を Shell API で
+        // 取り直す経路を踏まない)。`catalog_existing_keys` には既に pinned 形式が
+        // 含まれているので、直後の delete_missing がこの seed 行を消すことはない。
+        self.seed_folder_video_pin_thumbs(&cache_map, catalog_arc.as_ref());
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "nav",
@@ -5873,6 +5938,7 @@ impl App {
             heavy_io_queue,
             cache_map,
             catalog_arc,
+            self.folder_thumb_pin_db.clone(),
         );
         if !video_items.is_empty() {
             // Phase 8.B': ピン留めフレームを path → WebP の map で snapshot し
@@ -5985,6 +6051,555 @@ impl App {
         // 既定は「実ビュー」。`replace_search_view_items` (= 合成ビュー経路) は
         // この後で true に上書きする。
         self.items_are_global_search_view = false;
+        // 親コンテナ (Folder/ZipFile/PdfFile) のピン情報を 1 度の lookup_many で取得し、
+        // make_load_request からの per-frame DB ヒットを回避する。pin がレアケースで
+        // 大半は empty なので、典型的なフォルダで HashMap は数百 bytes に収まる。
+        self.refresh_folder_pin_map();
+    }
+
+    /// Phase C: フォルダピンの source が Video のときに、`video_pins` DB の WebP を
+    /// folder の pinned cache key で catalog + cache_map に書き込む。
+    ///
+    /// これを呼んだ直後、worker は通常の cache_hit 経路 (pinned_key で `cache_map`
+    /// を引く) で動画ピンフレームを取り出せる。`apply_folder_thumb_pin` の Video
+    /// 分岐は LoadRequest の `cache_key_override` / `mtime` / `file_size` を target
+    /// 動画のメタデータで埋めるので、ここで書き込んだ catalog 行と整合する。
+    ///
+    /// **stale 行の掃除** (Codex Phase C P2 指摘): `video_pins` に行が無い / 空 blob /
+    /// 復元失敗のときは、過去に seed されていた pinned cache 行 (= 旧 video pin の
+    /// WebP) を catalog + cache_map から **削除** する。これをやらないと、worker が
+    /// 旧 WebP で cache_hit してしまい、auto-pick fallback に落ちない。
+    ///
+    /// **byte 比較** (Codex Phase C P2 指摘): `video_pins.set_pin` は同じ動画 path に
+    /// 対して `pin_pts_secs` / `thumb_webp` を上書き更新する。mtime/size だけ見ると
+    /// 「内容が変わったか」を判定できないので、`jpeg_data` を直接比較して再 seed する。
+    fn seed_folder_video_pin_thumbs(
+        &self,
+        cache_map: &Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        >,
+        catalog: Option<&Arc<crate::catalog::CatalogDb>>,
+    ) {
+        if self.folder_pin_map.is_empty() {
+            return;
+        }
+        let Some(video_db) = self.video_pin_db.as_ref() else {
+            return;
+        };
+        let Some(cat) = catalog else {
+            return;
+        };
+        use crate::folder_thumb_pins::ResolvedKind;
+        let pin_db = self.folder_thumb_pin_db.as_deref();
+        let max_cascade_depth = self.settings.folder_thumb_depth as usize;
+        let mut seeded = 0u32;
+        let mut purged = 0u32;
+        for item in &self.items {
+            let GridItem::Folder(container_path) = item else {
+                continue;
+            };
+            let container_key = crate::path_key::normalize_keep_drive(container_path);
+            let Some(source) = self.folder_pin_map.get(&container_key) else {
+                continue;
+            };
+            // cascade 解決の leaf が Video kind になるケースを対象にする (= Folder→...→Video
+            // の入れ子 pin にも対応)。immediate source が Video でも、Folder→Folder→...→Video
+            // でも leaf が Video なら同じ seed 処理。
+            let lookup = |p: &std::path::Path| pin_db.and_then(|db| db.lookup(p));
+            let Some(resolved) = crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+                container_path,
+                source,
+                lookup,
+                max_cascade_depth,
+            ) else {
+                continue;
+            };
+            if !matches!(resolved.kind, ResolvedKind::Video) {
+                continue;
+            }
+            let Some(fname) = container_path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let pinned_key = format!(
+                "{}{}{}{}",
+                crate::thumb_loader::CACHE_KEY_FOLDER,
+                fname,
+                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+                resolved.source_id,
+            );
+
+            // 取得可能な WebP を確定する。`Some(Vec<u8>)` なら非空 blob 確定。
+            let webp = video_db
+                .lookup(&resolved.abs_path)
+                .map(|pin| pin.thumb_webp)
+                .filter(|b| !b.is_empty());
+
+            // pinned_key 行を catalog + cache_map から削除する内部 closure。
+            // 「seed できない (WebP 無し / 破損 / SQL エラー)」全ケースで共通に使い、
+            // 旧 pin の WebP が cache_hit で復活しないようにする (Codex Phase C P3 指摘)。
+            // 削除中だけで使うのでローカル変数 + 通常関数として書く方が借用が単純になる。
+            let purge_stale = |pinned_key: &str| -> bool {
+                let stale_exists = cache_map
+                    .read()
+                    .ok()
+                    .map(|map| map.contains_key(pinned_key))
+                    .unwrap_or(false);
+                if !stale_exists {
+                    return false;
+                }
+                match cat.delete_one(pinned_key) {
+                    Ok(()) => {
+                        if let Ok(mut map) = cache_map.write() {
+                            map.remove(pinned_key);
+                        }
+                        true
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "folder_thumb_pin video seed purge failed: {e} ({pinned_key})"
+                        ));
+                        false
+                    }
+                }
+            };
+
+            let Some(webp) = webp else {
+                // WebP 無し: 既存 seed (旧 pin の残骸) があれば削除して fallback 経路へ。
+                if purge_stale(&pinned_key) {
+                    purged += 1;
+                }
+                continue;
+            };
+
+            // 既存 seed が完全一致 (mtime/size + bytes) なら書き直さない (典型ケース)。
+            let already_seeded = cache_map
+                .read()
+                .ok()
+                .and_then(|map| {
+                    map.get(&pinned_key).map(|entry| {
+                        entry.mtime == resolved.mtime
+                            && entry.file_size == resolved.file_size
+                            && entry.jpeg_data == webp
+                    })
+                })
+                .unwrap_or(false);
+            if already_seeded {
+                continue;
+            }
+            match cat.save_thumb_bytes(&pinned_key, resolved.mtime, resolved.file_size, None, &webp)
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    crate::logger::log(format!(
+                        "folder_thumb_pin video seed: invalid WebP for {} (purge stale)",
+                        resolved.abs_path.display()
+                    ));
+                    if purge_stale(&pinned_key) {
+                        purged += 1;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "folder_thumb_pin video seed save failed: {e} ({}) (purge stale)",
+                        resolved.abs_path.display()
+                    ));
+                    if purge_stale(&pinned_key) {
+                        purged += 1;
+                    }
+                    continue;
+                }
+            }
+            if let Ok(mut map) = cache_map.write() {
+                map.insert(
+                    pinned_key.clone(),
+                    crate::catalog::CacheEntry {
+                        mtime: resolved.mtime,
+                        file_size: resolved.file_size,
+                        jpeg_data: webp,
+                        source_dims: None,
+                    },
+                );
+            }
+            seeded += 1;
+        }
+        if seeded > 0 || purged > 0 {
+            crate::logger::log(format!(
+                "folder_thumb_pin: video seed = {seeded}, purged stale = {purged}"
+            ));
+        }
+    }
+
+    /// 現在 items 中の親コンテナ (Folder/ZipFile/PdfFile) 分のピン + `current_folder`
+    /// 自身のピンを DB から一括取得して `folder_pin_map` に格納する。pin DB が未開なら no-op。
+    ///
+    /// `current_folder` 自身を含めるのは、アドレスバー 📌 ボタンの `folder_thumb_pin_for
+    /// (current_folder)` が「現在表示中のコンテナがピン留め済みか」を判定するため
+    /// (Codex 最終レビュー P2 指摘)。reload 後に map に入っていないと、トグル / アイコン
+    /// 強調 / tooltip が「未ピン」固定になってしまう。
+    fn refresh_folder_pin_map(&mut self) {
+        self.folder_pin_map.clear();
+        let Some(db) = self.folder_thumb_pin_db.as_ref() else {
+            return;
+        };
+        let mut container_paths: Vec<&std::path::Path> = self
+            .items
+            .iter()
+            .filter_map(|it| match it {
+                GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+                    Some(p.as_path())
+                }
+                _ => None,
+            })
+            .collect();
+        // current_folder 自身も lookup 対象に含める (検索合成パス / アグリゲートビューは除外)。
+        // 子 items 由来のパスとは container_key が異なるので、`apply_folder_thumb_pin` が
+        // 子の解決で誤って自分自身のピンを引くことはない。
+        if let Some(cur) = self.current_folder.as_ref() {
+            if *cur != search_results_synthetic_path()
+                && !self.items_are_global_search_view
+                && !container_paths.iter().any(|p| *p == cur.as_path())
+            {
+                container_paths.push(cur.as_path());
+            }
+        }
+        if container_paths.is_empty() {
+            return;
+        }
+        self.folder_pin_map = db.lookup_many(container_paths);
+    }
+
+    /// 指定 container の代表サムネピンを `source` に設定 (上書き) し、再ロード予約を立てる。
+    /// UI 側 (アドレスバーの 📌 ボタン / コンテキストメニュー) からの主エントリポイント。
+    ///
+    /// 戻り値: 書き込みに成功すれば `true`。pin DB 未開 / SQL エラーで失敗時は
+    /// `false` でログのみ残す (UI 側はエラー詳細を出さずに「設定できませんでした」を表示)。
+    pub(crate) fn set_folder_thumb_pin(
+        &mut self,
+        container: &std::path::Path,
+        source: crate::folder_thumb_pins::FolderPinSource,
+    ) -> bool {
+        let Some(db) = self.folder_thumb_pin_db.as_ref() else {
+            crate::logger::log("folder_thumb_pin: DB not open".to_string());
+            return false;
+        };
+        match db.set(container, &source) {
+            Ok(()) => {
+                let key = crate::path_key::normalize_keep_drive(container);
+                self.folder_pin_map.insert(key, source);
+                self.folder_thumb_pin_dirty = true;
+                crate::logger::log(format!("folder_thumb_pin set: {}", container.display()));
+                true
+            }
+            Err(e) => {
+                crate::logger::log(format!("folder_thumb_pin set failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// 指定 container の代表サムネピンを解除する (該当行が無くてもエラーにしない)。
+    pub(crate) fn remove_folder_thumb_pin(&mut self, container: &std::path::Path) -> bool {
+        let Some(db) = self.folder_thumb_pin_db.as_ref() else {
+            return false;
+        };
+        match db.remove(container) {
+            Ok(()) => {
+                let key = crate::path_key::normalize_keep_drive(container);
+                self.folder_pin_map.remove(&key);
+                self.folder_thumb_pin_dirty = true;
+                crate::logger::log(format!("folder_thumb_pin removed: {}", container.display()));
+                true
+            }
+            Err(e) => {
+                crate::logger::log(format!("folder_thumb_pin remove failed: {e}"));
+                false
+            }
+        }
+    }
+
+    /// 指定 container に現在のピン情報があれば返す。UI 側で「同じ画像が pin 済みか」
+    /// 判定し、トグル動作のためのボタン表示状態を切り替えるのに使う。
+    pub(crate) fn folder_thumb_pin_for(
+        &self,
+        container: &std::path::Path,
+    ) -> Option<&crate::folder_thumb_pins::FolderPinSource> {
+        let key = crate::path_key::normalize_keep_drive(container);
+        self.folder_pin_map.get(&key)
+    }
+
+    /// アドレスバー 📌 ボタンの表示状態を算出する (UI 描画から呼ばれる)。
+    ///
+    /// 返り値:
+    /// - `None`: ボタンを描画しない (= 設定 OFF / 検索アグリゲートビュー / current_folder 無し)
+    /// - `Some(state)`: 描画する。`state.enabled = false` の場合は disabled + tooltip 表示
+    pub(crate) fn compute_folder_pin_button_state(
+        &self,
+    ) -> Option<crate::ui_main::FolderPinButtonState> {
+        if !self.settings.show_address_bar_folder_pin {
+            return None;
+        }
+        // Ctrl+G アグリゲートビューでは container 概念が無いので隠す
+        if self.items_are_global_search_view {
+            return None;
+        }
+        // current_folder 未確定 (起動直後 / 検索結果合成パス) は描画しない
+        let container = self.current_folder.as_ref()?;
+        if *container == search_results_synthetic_path() {
+            return None;
+        }
+        // ConvertibleArchive (7z/LZH) を変換キャッシュ ZIP として開いている drill-down 状態
+        // では container = キャッシュ ZIP 実体になっているため、ピンを書いてもユーザーが
+        // 期待する「親フォルダの ConvertibleArchive タイル」には適用されない (キャッシュ
+        // ZIP は他の grid に出現しないので事実上 dead pin になる)。ここでは UI を隠して
+        // 混乱を避ける (Codex Phase D P2 指摘)。
+        if self.archive_source_override.is_some() {
+            return None;
+        }
+        // 既存 pin (もしあれば) を引いておく
+        let existing_pin = self.folder_thumb_pin_for(container).cloned();
+        // 空フォルダ (= ピン可能なアイテムが 1 つも無い) で、なおかつ既存 pin も無い場合は
+        // ボタン自体を隠す (Codex 最終レビュー P3 指摘: 「空フォルダは対象外」の
+        // ドキュメント記述と挙動を揃える)。既存 pin がある場合は「右クリックで解除」を
+        // 提供したいので隠さない (= ファイルを全部削除した後でもピンを掃除できる)。
+        if self.items.is_empty() && existing_pin.is_none() {
+            return None;
+        }
+        // 選択中アイテムから source を組み立てる (= 「左クリックで何を pin するか」)
+        let selected_source: Option<crate::folder_thumb_pins::FolderPinSource> = self
+            .selected
+            .and_then(|i| self.items.get(i))
+            .and_then(|item| crate::folder_thumb_pins::source_from_grid_item(container, item));
+
+        let selected_item = self.selected.and_then(|i| self.items.get(i));
+        let is_convertible = matches!(selected_item, Some(GridItem::ConvertibleArchive { .. }));
+
+        let matches_current_pin = match (&existing_pin, &selected_source) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        };
+
+        // 描画 + tooltip の決定
+        // 1) ConvertibleArchive 選択中: 「変換後に設定可能」で disabled
+        // 2) 選択無し / pin 不可: 「項目を選択してください」で disabled
+        // 3) 通常: enabled。matches_current_pin で tooltip を分岐
+        let (enabled, tooltip) = if is_convertible {
+            (
+                false,
+                "代表サムネ固定: 変換後に設定可能 (アーカイブを ZIP に変換すると指定できます)"
+                    .to_string(),
+            )
+        } else if selected_source.is_none() {
+            // 既存 pin があるなら右クリックで解除のみ許可する (= enabled、ただし左クリック toggle は
+            // source 無しで no-op)。ボタンとしては enabled で「右クリックで解除」案内を tooltip に。
+            if existing_pin.is_some() {
+                (
+                    true,
+                    "代表サムネ固定済み (右クリックで解除 / 左クリックで再設定するにはアイテムを選択)"
+                        .to_string(),
+                )
+            } else {
+                (
+                    false,
+                    "代表サムネ固定: フォルダ内のアイテムを選択してください".to_string(),
+                )
+            }
+        } else if matches_current_pin {
+            (
+                true,
+                "代表サムネ固定中: 左クリック / 右クリックで解除".to_string(),
+            )
+        } else if existing_pin.is_some() {
+            (
+                true,
+                "選択中のアイテムを代表サムネに変更 (左クリック) / 解除 (右クリック)".to_string(),
+            )
+        } else {
+            (
+                true,
+                "選択中のアイテムを代表サムネに固定 (左クリック)".to_string(),
+            )
+        };
+
+        Some(crate::ui_main::FolderPinButtonState {
+            enabled,
+            tooltip,
+            matches_current_pin,
+        })
+    }
+
+    /// アドレスバー 📌 ボタンの左クリック (toggle) / P キーショートカットのハンドラ。
+    /// 選択中アイテムが現在の pin と一致 → 解除、不一致 → set。
+    ///
+    /// **silent no-op 条件** (`compute_folder_pin_button_state` で UI を隠す条件と整合):
+    /// - `current_folder` 無し / 検索合成パス
+    /// - Ctrl+G アグリゲートビュー (`items_are_global_search_view`)
+    /// - 7z/LZH 変換キャッシュ ZIP の drill-down (`archive_source_override` Some)
+    /// - 選択無し / 選択アイテムが pin 不能 (ConvertibleArchive / SearchContainer /
+    ///   ZipSeparator、または container を指す `rel=""` ケース)
+    ///
+    /// **Video pin の set ガード**: pin 対象が動画でかつ `video_pins` DB に有効な WebP
+    /// (= フルスクリーン HUD でユーザーがピン留めしたフレーム) が無い場合、トースト
+    /// 通知を出して set 自体を拒否する。これをやらないと、worker が auto-pick fallback で
+    /// 親フォルダ自身の代表画を pinned_key 下に保存してしまい、ユーザーから見ると
+    /// 「動画 pin したのにサムネが変わらない」状態になる (= 効果が無い pin)。
+    pub(crate) fn toggle_folder_pin_from_selection(&mut self) {
+        let Some(container) = self.current_folder.clone() else {
+            return;
+        };
+        if container == search_results_synthetic_path() {
+            return;
+        }
+        if self.items_are_global_search_view {
+            return;
+        }
+        if self.archive_source_override.is_some() {
+            return;
+        }
+        let Some(item) = self.selected.and_then(|i| self.items.get(i)).cloned() else {
+            return;
+        };
+        let Some(source) = crate::folder_thumb_pins::source_from_grid_item(&container, &item)
+        else {
+            return;
+        };
+        let existing = self.folder_thumb_pin_for(&container).cloned();
+        if existing.as_ref() == Some(&source) {
+            // 解除は無条件で許可 (DB 上の dead pin を掃除できるように)
+            self.remove_folder_thumb_pin(&container);
+            return;
+        }
+        self.try_set_folder_thumb_pin_with_video_guard(&container, source);
+    }
+
+    /// `set_folder_thumb_pin` の薄いラッパで、**動画 source の場合は video_pins DB に
+    /// 有効な WebP が無ければ拒否**する。worker が auto-pick fallback で「親フォルダ自身の
+    /// 代表画」を pinned_key に保存してしまう dead pin を防ぐ。
+    ///
+    /// 戻り値: 実際に pin が設定できれば `true`。拒否時はトーストを出して `false`。
+    /// 拒否は **set** にのみ適用される (= remove は別経路から直接呼ぶ)。
+    fn try_set_folder_thumb_pin_with_video_guard(
+        &mut self,
+        container: &std::path::Path,
+        source: crate::folder_thumb_pins::FolderPinSource,
+    ) -> bool {
+        if let crate::folder_thumb_pins::FolderPinSource::File {
+            kind: crate::folder_thumb_pins::FileKind::Video,
+            ..
+        } = &source
+        {
+            let abs = container.join(source.rel());
+            let has_webp = self
+                .video_pin_db
+                .as_ref()
+                .and_then(|db| db.lookup(&abs))
+                .map(|pin| !pin.thumb_webp.is_empty())
+                .unwrap_or(false);
+            if !has_webp {
+                self.show_feedback_toast(
+                    "動画内でピン留めされた画像がないため、設定できません\n\
+                     先にフルスクリーンで動画を開き、HUD のピンボタンでフレームを保存してください"
+                        .to_string(),
+                );
+                crate::logger::log(format!(
+                    "folder_thumb_pin: video pin rejected (no WebP) for {}",
+                    abs.display()
+                ));
+                return false;
+            }
+        }
+        self.set_folder_thumb_pin(container, source)
+    }
+
+    /// 親コンテナの代表サムネピンが書き換わっていたら現フォルダを再ロードして
+    /// グリッドに反映する。`close_fullscreen` と `App::update` (= 毎フレーム) の
+    /// 両方から呼ばれる。dirty が `close_fullscreen` でしか consume されないと、
+    /// グリッドモードで 📌 を押しても次の fullscreen 開閉までグリッドが古いまま
+    /// になる (Codex Phase D P2 指摘)。
+    pub(crate) fn consume_folder_thumb_pin_dirty(&mut self) {
+        if std::mem::take(&mut self.folder_thumb_pin_dirty) {
+            if let Some(cur) = self.current_folder.clone() {
+                self.folder_history.remove(&cur);
+                self.load_folder(cur);
+            }
+        }
+    }
+
+    /// アドレスバー 📌 ボタンの右クリック / コンテキストメニューの「解除」ハンドラ。
+    pub(crate) fn remove_folder_pin_for_current_container(&mut self) {
+        let Some(container) = self.current_folder.clone() else {
+            return;
+        };
+        self.remove_folder_thumb_pin(&container);
+    }
+
+    /// コンテキストメニューに「代表サムネに固定 / 解除」エントリ (separator + ボタン)
+    /// を**まとめて**追加する。アドレスバー 📌 と同じ動作をメニュー経由でも提供する。
+    ///
+    /// **separator 込みで描画する**ことに注意 (Codex Phase D P3 指摘: 呼び出し側で
+    /// 先に `ui.separator()` を打つと、本関数が早期 return する条件 (アグリゲートビュー
+    /// / 変換 drill-down / pin 不能 variant 等) で孤立 separator が残るバグになる)。
+    /// 本関数は描画が確定する直前まで separator を打たない。
+    ///
+    /// 戻り値: メニューを閉じるべきなら `true` (= ピン書き換え操作が走った)。
+    /// 描画スキップ / disabled / クリック未発生は `false`。
+    pub(crate) fn render_folder_pin_menu_entry(
+        &mut self,
+        ui: &mut egui::Ui,
+        item: &GridItem,
+    ) -> bool {
+        // 親コンテナ未確定 / Ctrl+G アグリゲートビュー / 変換キャッシュ drill-down
+        // / pin 不能 variant では一切描画しない (separator も打たない)。
+        let Some(container) = self.current_folder.clone() else {
+            return false;
+        };
+        if self.items_are_global_search_view {
+            return false;
+        }
+        if container == search_results_synthetic_path() {
+            return false;
+        }
+        // ConvertibleArchive 変換キャッシュ ZIP の drill-down 状態では dead pin になる
+        // ためエントリを出さない (Codex Phase D P2 指摘、`compute_folder_pin_button_state`
+        // と挙動を揃える)。
+        if self.archive_source_override.is_some() {
+            return false;
+        }
+        // pin 不能 variant: 描画スキップ
+        if matches!(
+            item,
+            GridItem::SearchContainer { .. } | GridItem::ZipSeparator { .. }
+        ) {
+            return false;
+        }
+        // ConvertibleArchive: disabled + tooltip (描画 OK だが返値は常に false)
+        if matches!(item, GridItem::ConvertibleArchive { .. }) {
+            ui.separator();
+            ui.add_enabled(false, egui::Button::new("📌 代表サムネに固定"))
+                .on_hover_text("変換後に設定可能 (アーカイブを ZIP に変換すると指定できます)");
+            return false;
+        }
+        let Some(source) = crate::folder_thumb_pins::source_from_grid_item(&container, item) else {
+            // rel が空 (= container 自身を指している) などの理由で source 取れず → skip
+            return false;
+        };
+        let existing = self.folder_thumb_pin_for(&container).cloned();
+        let is_current = existing.as_ref() == Some(&source);
+        let label = if is_current {
+            "📌 代表サムネ固定を解除"
+        } else {
+            "📌 代表サムネに固定"
+        };
+        ui.separator();
+        if ui.button(label).clicked() {
+            if is_current {
+                self.remove_folder_thumb_pin(&container);
+            } else {
+                self.try_set_folder_thumb_pin_with_video_guard(&container, source);
+            }
+            return true;
+        }
+        false
     }
 
     /// items の idx 参照がまとめて無効になった後に呼ぶ共通クリーンアップ。
@@ -6465,6 +7080,7 @@ impl App {
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
         >,
         catalog_arc: Option<Arc<crate::catalog::CatalogDb>>,
+        pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
     ) {
         let total_threads = self.settings.parallelism.thread_count();
         // I/O ワーカー数: 2 本 (HDD シーク競合と並列性のバランス)
@@ -6501,6 +7117,10 @@ impl App {
             let ks_w = Arc::clone(&keep_start_shared);
             let ke_w = Arc::clone(&keep_end_shared);
             let ve_w = Arc::clone(&visible_end_shared);
+            // pin-aware auto-pick 用に worker thread にも pin DB を共有する。
+            // 内部 Mutex<Connection> で並列読みは serialize されるが、cascade lookup
+            // 件数は典型的に数件程度なので contention は無視できる。
+            let pin_db_w = pin_db.clone();
             let tag = format!("{prefix}{worker_idx}");
 
             std::thread::spawn(move || {
@@ -6615,6 +7235,7 @@ impl App {
                         Some(&cancel_w),
                         &ks_w,
                         &ke_w,
+                        pin_db_w.as_deref(),
                     );
                 }
                 crate::logger::log(format!("  {tag} stopped"));
@@ -7428,6 +8049,8 @@ impl App {
                     self.pdf_current_password.as_deref(),
                     Some(self.settings.folder_thumb_sort),
                     self.settings.folder_thumb_depth,
+                    &self.folder_pin_map,
+                    self.folder_thumb_pin_db.as_deref(),
                 )
             }) else {
                 continue;
@@ -7734,6 +8357,8 @@ impl App {
                     self.pdf_current_password.as_deref(),
                     Some(self.settings.folder_thumb_sort),
                     self.settings.folder_thumb_depth,
+                    &self.folder_pin_map,
+                    self.folder_thumb_pin_db.as_deref(),
                 )
             }) else {
                 continue;
@@ -11529,6 +12154,12 @@ impl App {
                 self.load_folder(cur);
             }
         }
+        // 親コンテナ (Folder/ZipFile/PdfFile) の代表サムネピンが書き換わっていたら
+        // 同じく現フォルダを再ロードしてグリッドに反映する。
+        // close_fullscreen + メインの update 両方から拾うため共通ヘルパー経由
+        // (Codex Phase D P2 指摘: dirty が close_fullscreen でしか consume されず、
+        // グリッドモードで 📌 を押しても次の fullscreen 開閉まで反映されなかった)。
+        self.consume_folder_thumb_pin_dirty();
         // perf: close_fullscreen は fs_cache / ai_upscale_cache / pending スレッドの
         // キャンセル通知を行うため、Ctrl+↑↓ (Fullscreen モード) の sync パスで
         // 実行される。ms を計測してブロックの所在を特定する。
@@ -15262,6 +15893,18 @@ impl eframe::App for App {
 
         // ── アドレスバー ─────────────────────────────────────────────
         let address_nav = self.render_address_bar(ctx);
+        // 📌 ボタン / グリッドコンテキストメニューで pin が書き換わっていたら同フレーム
+        // 内でグリッドに反映 (Codex Phase D P2 指摘: dirty が close_fullscreen
+        // でしか consume されないと、グリッドモードでクリックしても次の fs 開閉
+        // までグリッドが更新されない)。
+        //
+        // **fullscreen 中は consume しない**: load_folder は close_fullscreen を呼ぶため、
+        // fullscreen 中の右クリックメニューで pin → ここで即時 reload → fs が予期せず
+        // 閉じてしまう (Codex Phase D P2 再指摘)。fullscreen のときは close_fullscreen
+        // 自身が同じ helper を呼ぶ経路があるので、そちらに委ねる。
+        if self.fullscreen_idx.is_none() {
+            self.consume_folder_thumb_pin_dirty();
+        }
 
         // ── Ctrl+F: 検索バー表示 ─────────────────────────────────────
         // Ctrl+G (グローバルメタ検索) と相互排他 (docs §10.3):
@@ -15315,6 +15958,32 @@ impl eframe::App for App {
             }
             if deselect {
                 self.checked.clear();
+            }
+        }
+
+        // ── P: 代表サムネ固定トグル (グリッドモード限定) ───────────────
+        // アドレスバー 📌 ボタン左クリックと同等。pin 不能アイテム / 検索アグリゲート /
+        // 変換キャッシュ drill-down / 空フォルダ等は `toggle_folder_pin_from_selection`
+        // 内のガードで silent no-op になる。
+        // フルスクリーン中は P がポストフィルタサイクルと衝突するので fullscreen_idx
+        // が None のときだけ反応する。各種テキスト入力フィールドにフォーカス中も無効。
+        if !self.address_has_focus
+            && !self.search_has_focus
+            && !self.favsearch.has_focus
+            && !self.global_search.has_focus
+            && self.fullscreen_idx.is_none()
+            && !self.any_dialog_open()
+        {
+            let pressed_p = ctx.input_mut(|i| {
+                // Plain P only (no modifier)。Shift+P / Alt+P / Ctrl+P は他用途に
+                // 開放しておく (現状未割当だが将来予約)。
+                !i.modifiers.shift
+                    && !i.modifiers.alt
+                    && !i.modifiers.ctrl
+                    && i.consume_key(egui::Modifiers::NONE, egui::Key::P)
+            });
+            if pressed_p {
+                self.toggle_folder_pin_from_selection();
             }
         }
 
@@ -15856,6 +16525,12 @@ fn interleaved_prefetch_targets(
 }
 
 /// GridItem から LoadRequest を構築する。画像 / ZIP 内画像 / PDF ページ / フォルダ以外は None を返す。
+///
+/// `pin_map` は親コンテナ (Folder/ZipFile/PdfFile) のピン source 一覧で、
+/// `App::folder_pin_map` の参照を渡す。空 HashMap でも構わない (= pin 機能なし相当)。
+/// pin が見つかったコンテナは `apply_folder_thumb_pin` で `LoadRequest` を target
+/// 種別の形に書き換える (cache_key は親 prefix を維持し suffix で identity を載せる)。
+#[allow(clippy::too_many_arguments)]
 fn make_load_request(
     item: &GridItem,
     idx: usize,
@@ -15865,6 +16540,8 @@ fn make_load_request(
     pdf_password: Option<&str>,
     folder_thumb_sort: Option<crate::settings::SortOrder>,
     folder_thumb_depth: u32,
+    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
 ) -> Option<LoadRequest> {
     // 共通フィールド (idx/path/mtime/file_size/skip_cache) 以外は Default (0/None/false)
     // を基底にして差分だけ上書きする。入力 seq / items_gen は後段のエンキューで上書きされる。
@@ -15904,11 +16581,21 @@ fn make_load_request(
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
-            Some(LoadRequest {
+            let base_key = format!("{}{fname}", CACHE_KEY_ZIP);
+            let req = LoadRequest {
                 path: p.clone(),
-                cache_key_override: Some(format!("{}{fname}", CACHE_KEY_ZIP)),
+                cache_key_override: Some(base_key.clone()),
                 ..base
-            })
+            };
+            Some(apply_folder_thumb_pin(
+                req,
+                p,
+                &base_key,
+                ContainerKindForPin::ZipFile,
+                pin_map,
+                pin_db,
+                pdf_password,
+            ))
         }
         GridItem::PdfFile(p) => {
             let fname = p
@@ -15916,13 +16603,23 @@ fn make_load_request(
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
-            Some(LoadRequest {
+            let base_key = format!("{}{fname}", CACHE_KEY_PDF);
+            let req = LoadRequest {
                 path: p.clone(),
                 pdf_page: Some(0),
                 pdf_password: pdf_password.map(String::from),
-                cache_key_override: Some(format!("{}{fname}", CACHE_KEY_PDF)),
+                cache_key_override: Some(base_key.clone()),
                 ..base
-            })
+            };
+            Some(apply_folder_thumb_pin(
+                req,
+                p,
+                &base_key,
+                ContainerKindForPin::PdfFile,
+                pin_map,
+                pin_db,
+                pdf_password,
+            ))
         }
         GridItem::Folder(p) => {
             let fname = p
@@ -15930,13 +16627,23 @@ fn make_load_request(
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
-            Some(LoadRequest {
+            let base_key = format!("{}{fname}", CACHE_KEY_FOLDER);
+            let req = LoadRequest {
                 path: p.clone(),
-                cache_key_override: Some(format!("{}{fname}", CACHE_KEY_FOLDER)),
+                cache_key_override: Some(base_key.clone()),
                 folder_thumb_sort,
                 folder_thumb_depth,
                 ..base
-            })
+            };
+            Some(apply_folder_thumb_pin(
+                req,
+                p,
+                &base_key,
+                ContainerKindForPin::Folder,
+                pin_map,
+                pin_db,
+                pdf_password,
+            ))
         }
         GridItem::SearchContainer {
             representative: Some(rep),
@@ -15965,6 +16672,302 @@ fn make_load_request(
             })
         }
         _ => None,
+    }
+}
+
+/// 1 つの GridItem に対応する catalog cache key を全部 (base + pinned) 返す。
+///
+/// `delete_missing` に渡す `existing_keys` の構築に使う。pinned 形式
+/// (`{base}#pin:{source_id}`) を含めないと、`apply_folder_thumb_pin` が書いた
+/// 行が毎回のフォルダロードで catalog から削除されて再生成が走り続ける
+/// (Codex Phase B P2 指摘)。
+fn folder_thumb_existing_keys_for(
+    item: &GridItem,
+    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    max_cascade_depth: usize,
+) -> Vec<String> {
+    let (container_path, base_key) = match item {
+        GridItem::Image(p) => {
+            // Image はそもそも pinned 経路に乗らないので 1 つだけ。
+            return p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| vec![n.to_string()])
+                .unwrap_or_default();
+        }
+        GridItem::Folder(p) => (p, {
+            let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
+                return Vec::new();
+            };
+            format!("{}{fname}", CACHE_KEY_FOLDER)
+        }),
+        GridItem::ZipFile(p) => (p, {
+            let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
+                return Vec::new();
+            };
+            format!("{}{fname}", CACHE_KEY_ZIP)
+        }),
+        GridItem::PdfFile(p) => (p, {
+            let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
+                return Vec::new();
+            };
+            format!("{}{fname}", CACHE_KEY_PDF)
+        }),
+        _ => return Vec::new(),
+    };
+
+    let mut keys = vec![base_key.clone()];
+    let container_key = crate::path_key::normalize_keep_drive(container_path);
+    if let Some(source) = pin_map.get(&container_key) {
+        // cascade 解決後の leaf source_id を使う (= `apply_folder_thumb_pin` が
+        // 書く pinned_key と同じ)。cascade を考慮せず immediate のままだと、
+        // delete_missing が cascade 由来の cache 行を毎回掃除してしまう。
+        // max_cascade_depth は呼び出し側 (load_folder) が `Settings.folder_thumb_depth`
+        // を渡してくる。
+        if let Some(resolved) =
+            resolve_pin_target_cascaded(container_path, source, pin_db, max_cascade_depth)
+        {
+            keys.push(format!(
+                "{}{}{}",
+                base_key,
+                crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+                resolved.source_id,
+            ));
+        }
+    }
+    keys
+}
+
+/// `apply_folder_thumb_pin` 用の container kind discriminator。
+/// 互換性検査 (container と source の組合せが妥当か) に使う。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContainerKindForPin {
+    Folder,
+    ZipFile,
+    PdfFile,
+}
+
+/// container と source の組合せが妥当か検査する。
+///
+/// 妥当な組合せ:
+/// - **Folder**: 全 source 形を受け入れる (File/ZipEntry/PdfPage)。
+///   - ただし ZipEntry / PdfPage は `*_rel` が **空でない** (= サブの ZIP/PDF を指す) ことを要求。
+/// - **ZipFile**: `ZipEntry { zip_rel: "" }` のみ (= container 自身の中身)
+/// - **PdfFile**: `PdfPage { pdf_rel: "" }` のみ
+fn pin_source_compatible_with_container(
+    container: ContainerKindForPin,
+    source: &crate::folder_thumb_pins::FolderPinSource,
+) -> bool {
+    use crate::folder_thumb_pins::FolderPinSource as S;
+    match (container, source) {
+        // Folder は何でも受け入れる (ただし内側参照 (`_rel==""`) は不可)
+        (ContainerKindForPin::Folder, S::File { .. }) => true,
+        (ContainerKindForPin::Folder, S::ZipEntry { zip_rel, .. }) => !zip_rel.is_empty(),
+        (ContainerKindForPin::Folder, S::PdfPage { pdf_rel, .. }) => !pdf_rel.is_empty(),
+        // ZipFile は内側 ZipEntry のみ
+        (ContainerKindForPin::ZipFile, S::ZipEntry { zip_rel, .. }) => zip_rel.is_empty(),
+        (ContainerKindForPin::ZipFile, _) => false,
+        // PdfFile は内側 PdfPage のみ
+        (ContainerKindForPin::PdfFile, S::PdfPage { pdf_rel, .. }) => pdf_rel.is_empty(),
+        (ContainerKindForPin::PdfFile, _) => false,
+    }
+}
+
+/// cascade 解決: Folder→Folder の pin 連鎖を最終 leaf (非 Folder か pin 無し Folder)
+/// まで辿って `ResolvedPinTarget` を返す。
+///
+/// 動機: A が B (Folder) を pin、B が C (Image) を pin している場合、ユーザーは A の
+/// 親 grid で A のタイルが C を表示することを期待する。cascade なしだと A の pin は
+/// B の auto-pick (= B 内最初の画像) になり、B 自身の pin (= C) を反映できない。
+///
+/// 動作:
+/// - 1 段目: `pin_map` 由来の immediate_source を使う (UI スレッドで lookup 済み)
+/// - 2 段目以降: `pin_db` で直接 DB lookup (cheap single-row)
+/// - 終了条件: 非 Folder kind に到達 / pin 無し Folder に到達 / サイクル検出 /
+///   `max_depth` 超過
+/// - サイクル A↔B の場合は visited HashSet で 2 周目を検知して停止
+///
+/// `max_depth` は `Settings.folder_thumb_depth` (規定 3、範囲 0〜10) と揃える。
+/// pin が無いときに `resolve_folder_thumb_image` がサブフォルダを何階層まで辿るかと
+/// 同じ上限。0 のとき cascade は完全に無効化される (= 旧 Phase B 互換挙動)。
+///
+/// 返値: 最終 leaf の `ResolvedPinTarget`。
+/// - 非 Folder leaf (Image / Video / ZipEntry / PdfPage / ZipFirstImage / PdfFirstPage):
+///   そのまま target として使う
+/// - pin 無し Folder leaf: `FolderRepresentative` strategy で auto-pick する
+fn resolve_pin_target_cascaded(
+    container: &std::path::Path,
+    immediate_source: &crate::folder_thumb_pins::FolderPinSource,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    max_depth: usize,
+) -> Option<crate::folder_thumb_pins::ResolvedPinTarget> {
+    // closure 版に委譲。worker 側 (`resolve_folder_thumb_image`) でも同じヘルパーを
+    // 異なる lookup closure で再利用する。
+    let lookup = |p: &std::path::Path| -> Option<crate::folder_thumb_pins::FolderPinSource> {
+        pin_db.and_then(|db| db.lookup(p))
+    };
+    crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+        container,
+        immediate_source,
+        lookup,
+        max_depth,
+    )
+}
+
+/// 親コンテナ用 `LoadRequest` (Folder/ZipFile/PdfFile) に対し、手動ピンがあれば
+/// target 種別のリクエストに書き換える。
+///
+/// 動作:
+/// - `pin_map` から container のピン source を引く。無ければ `base_req` をそのまま返す。
+/// - **Folder→Folder→... の cascade を最終 leaf まで追跡** (`resolve_pin_target_cascaded`)。
+///   サブフォルダがさらに pin を持っていれば再帰的にそちらの target を採用する。
+/// - target 種別に応じて `path` / `zip_entry` / `pdf_page` / `resolve_override` を上書き。
+/// - `cache_key_override` は `{base_key}#pin:{leaf_source_id}` にし、cascade の leaf 内容が
+///   変わると key も変わって古い WebP を catch しない。
+/// - `mtime` / `file_size` を leaf 自身のものに差し替える (= catalog の hit 判定が leaf
+///   metadata に対して行われる)。
+///
+/// Phase C 注意 (Video pin):
+/// - Video pin (`ResolvedKind::Video`) は `seed_folder_video_pin_thumbs` が事前に
+///   `video_pins` DB の WebP を `folderthumb:{dir}#pin:{source_id}` で catalog + cache_map
+///   にミラーしているので、worker は通常の cache_hit 経路で動画フレームを取り出せる。
+///   ここで返す LoadRequest は `path = container` (folder) + `cache_key_override =
+///   pinned_key` + `mtime/file_size = 動画のもの` (= seed と整合)。
+fn apply_folder_thumb_pin(
+    base_req: LoadRequest,
+    container: &std::path::Path,
+    base_key: &str,
+    container_kind: ContainerKindForPin,
+    pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    pdf_password: Option<&str>,
+) -> LoadRequest {
+    let container_key = crate::path_key::normalize_keep_drive(container);
+    let Some(source) = pin_map.get(&container_key) else {
+        return base_req;
+    };
+    // container / source の不整合を弾く (Codex Phase B P2 指摘)。
+    // UI 経由では発生しないが、DB 行汚染 / 将来のスキーマ変更で起き得る。
+    if !pin_source_compatible_with_container(container_kind, source) {
+        crate::logger::log(format!(
+            "folder_thumb_pin: incompatible source for container {} (kind={:?}, source={:?}) — falling back",
+            container.display(),
+            container_kind,
+            source,
+        ));
+        return base_req;
+    }
+    // cascade 解決: Folder→Folder の pin 連鎖を leaf まで辿る。max_depth は base_req の
+    // folder_thumb_depth (= Settings.folder_thumb_depth) に揃える。pin 無し時の
+    // `resolve_folder_thumb_image` のサブフォルダ探索上限と同じ仕様にして UX を統一する。
+    let Some(resolved) = resolve_pin_target_cascaded(
+        container,
+        source,
+        pin_db,
+        base_req.folder_thumb_depth as usize,
+    ) else {
+        crate::logger::log(format!(
+            "folder_thumb_pin: target unresolved for {} (source={:?}) — falling back to auto-select",
+            container.display(),
+            source,
+        ));
+        return base_req;
+    };
+
+    use crate::folder_thumb_pins::ResolvedKind;
+    use crate::thumb_loader::ResolveStrategy;
+
+    let pinned_key = format!(
+        "{}{}{}",
+        base_key,
+        crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
+        resolved.source_id,
+    );
+    // ネスト時の解決経路を確認するための診断ログ。Folder/ZipFile/PdfFile pin の挙動を
+    // 切り分けやすくする。`mimageviewer.log` の grep `folder_thumb_pin: apply` で
+    // すべての pin 適用箇所を一覧できる。
+    crate::logger::log(format!(
+        "folder_thumb_pin: apply container={} kind={:?} -> resolved={} \
+         (kind={:?} mtime={} size={}) pinned_key=`{}`",
+        container.display(),
+        container_kind,
+        resolved.abs_path.display(),
+        resolved.kind,
+        resolved.mtime,
+        resolved.file_size,
+        pinned_key,
+    ));
+
+    // Video pin は seed_folder_video_pin_thumbs が `pinned_key` で video_pins WebP を
+    // catalog + cache_map に書き込んでいる前提。worker はそのまま cache_hit で
+    // 動画フレームを取り出す。seed が空 (WebP 無し / blob 空) のときは cache miss →
+    // worker 内で `is_folder_thumb` 判定 (prefix が CACHE_KEY_FOLDER) が成立し、
+    // `resolve_folder_thumb_image(&req.path, ...)` が動いて folder 自身の auto-pick が
+    // pinned_key の下に保存される (= base_req と概ね同じ挙動)。
+    if matches!(resolved.kind, ResolvedKind::Video) {
+        // ZipFile / PdfFile 親コンテナの場合は Video pin は組合せ不可
+        // (`pin_source_compatible_with_container` で弾く) ので、ここに来る container
+        // は必ず Folder 種別。`path = container` のままで worker の prefix 判定が
+        // CACHE_KEY_FOLDER → is_folder_thumb=true となり、cache miss 時に
+        // resolve_folder_thumb_image(folder, sort, depth) が走る。
+        //
+        // `skip_cache` は **常に false** (Codex Phase C P1 指摘)。video_pin の WebP は
+        // grid 表示用に既に確定済みで、idle quality-upgrade の「元画像から再 decode」が
+        // 意味を持たない。base_req.skip_cache=true (アップグレード再エンキュー) を継承
+        // すると cache_hit を踏み越えて is_folder_thumb 経路で folder の auto-pick を
+        // pinned_key 下に書き戻してしまい、video frame が消える。
+        return LoadRequest {
+            path: container.to_path_buf(),
+            zip_entry: None,
+            pdf_page: None,
+            pdf_password: pdf_password.map(String::from),
+            cache_key_override: Some(pinned_key),
+            // mtime/size は target 動画のもの。seed_folder_video_pin_thumbs が同じ
+            // 値で catalog 行を書いているので、worker の cache_hit 比較が成立する。
+            mtime: resolved.mtime,
+            file_size: resolved.file_size,
+            resolve_override: None,
+            folder_thumb_sort: base_req.folder_thumb_sort,
+            folder_thumb_depth: base_req.folder_thumb_depth,
+            idx: base_req.idx,
+            skip_cache: false,
+            priority: base_req.priority,
+            input_seq: base_req.input_seq,
+            items_gen: base_req.items_gen,
+        };
+    }
+
+    // dispatch field を target 種別ごとに組み立てる。
+    let (resolve_override, zip_entry, pdf_page) = match resolved.kind {
+        ResolvedKind::Image => (Some(ResolveStrategy::DirectImage), None, None),
+        ResolvedKind::Folder => (Some(ResolveStrategy::FolderRepresentative), None, None),
+        ResolvedKind::ZipFirstImage => (Some(ResolveStrategy::ZipFirstImage), None, None),
+        ResolvedKind::PdfFirstPage => (None, None, Some(0u32)),
+        ResolvedKind::ZipEntry => (None, resolved.zip_entry.clone(), None),
+        ResolvedKind::PdfPage => (None, None, resolved.pdf_page),
+        // Video は上で early-return 済み
+        ResolvedKind::Video => unreachable!("Video pin handled above"),
+    };
+
+    LoadRequest {
+        path: resolved.abs_path,
+        zip_entry,
+        pdf_page,
+        pdf_password: pdf_password.map(String::from),
+        cache_key_override: Some(pinned_key),
+        mtime: resolved.mtime,
+        file_size: resolved.file_size,
+        resolve_override,
+        // フォルダ自動選定パラメータ (sort/depth) は Folder strategy のときだけ意味がある。
+        // base_req から継承するので Folder → Folder の pin で sort/depth が消えない。
+        folder_thumb_sort: base_req.folder_thumb_sort,
+        folder_thumb_depth: base_req.folder_thumb_depth,
+        idx: base_req.idx,
+        skip_cache: base_req.skip_cache,
+        priority: base_req.priority,
+        input_seq: base_req.input_seq,
+        items_gen: base_req.items_gen,
     }
 }
 
@@ -16220,6 +17223,12 @@ pub(crate) fn draw_cell(
     tags: &[String],
     // コンテナセルに出す「フィルタ一致の子孫件数」。None ならバッジ非表示。
     filter_match_count: Option<u32>,
+    // true なら **金色**の「📌」バッジを描画する (= ユーザーが Pin 操作した対象アイテム)。
+    // 「現在表示中の親コンテナの pin source 先 = ユーザーがこのアイテムを選択して P
+    // (or 📌) を押した」状態を示す。アイテム自身が pin 済みコンテナでも、ユーザーが
+    // **そのアイテムに対して** Pin 操作したわけではないので badge は出さない (= 状態の
+    // 二重提示を避け、「badge = 自分が Pin 操作した対象」を 1 対 1 で対応させる)。
+    has_pin: bool,
 ) {
     if !ui.is_rect_visible(rect) {
         return;
@@ -16618,8 +17627,8 @@ pub(crate) fn draw_cell(
         );
     }
 
-    // 左上バッジ列: 補 (ページ個別補正) → 消 (消しゴムマスク) → タグバッジ。
-    // 横並びで、収まらなければ末尾省略。
+    // 左上バッジ列: 補 (ページ個別補正) → 消 (消しゴムマスク) → 📌(金、pin)
+    // → タグバッジ。横並びで、収まらなければ末尾省略。
     {
         let badge_w = 18.0;
         let badge_h = 16.0;
@@ -16648,6 +17657,21 @@ pub(crate) fn draw_cell(
                 "消",
                 egui::FontId::proportional(11.0),
                 egui::Color32::WHITE,
+            );
+            x += badge_w + 2.0;
+        }
+        if has_pin {
+            // 📌 (金色) — ユーザー設定の pin に関わるアイテムの目印。
+            // アドレスバーの 📌 ボタンの色 (RGB 230,180,90) と統一する。
+            let badge_rect =
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(badge_w, badge_h));
+            painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(230, 180, 90));
+            painter.text(
+                badge_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "📌",
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgb(60, 40, 10),
             );
             x += badge_w + 2.0;
         }

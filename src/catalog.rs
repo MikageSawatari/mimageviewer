@@ -198,6 +198,20 @@ impl CatalogDb {
         Ok(true)
     }
 
+    /// 単一エントリを `filename` キーで削除する。該当行が無くてもエラーにしない。
+    ///
+    /// 用途: フォルダ代表ピンが Video を指していたが対応する `video_pins` の WebP が
+    /// 消えた / 空になった場合、`folderthumb:{dir}#pin:...` のキャッシュ行を明示的に
+    /// 削除して worker を auto-pick fallback に落とすため (Codex Phase C P2 指摘)。
+    pub fn delete_one(&self, filename: &str) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "DELETE FROM thumbnails WHERE filename = ?1",
+            params![filename],
+        )?;
+        Ok(())
+    }
+
     /// `existing` に含まれないファイル名の行を削除する（削除済みファイルの掃除）。
     pub fn delete_missing(&self, existing: &HashSet<String>) -> rusqlite::Result<()> {
         let conn = self.conn.lock().unwrap();
@@ -536,6 +550,21 @@ mod tests {
         let map = db.load_all().unwrap();
         assert_eq!(map.len(), 1);
         assert!(map.contains_key("keep.jpg"));
+    }
+
+    #[test]
+    fn catalog_delete_one_removes_only_target() {
+        let db = open_in_memory();
+        db.save("a.jpg", 1, 10, 8, 8, None, b"a").unwrap();
+        db.save("b.jpg", 1, 10, 8, 8, None, b"b").unwrap();
+        db.delete_one("a.jpg").unwrap();
+        let map = db.load_all().unwrap();
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("b.jpg"));
+        assert!(!map.contains_key("a.jpg"));
+        // 二度目の delete (存在しないキー) もエラーにしない
+        db.delete_one("a.jpg").unwrap();
+        db.delete_one("never_existed.jpg").unwrap();
     }
 
     #[test]

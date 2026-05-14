@@ -5563,9 +5563,15 @@ impl App {
         // Phase 5.5: S キーでタイルモード トグル (動画モード限定)。画像モードの
         // S (スライドショー) とは handle_video_input 先行 consume で分離する。
         let tile_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S));
-        // Phase 8.I: P キーでフレームレート オーバーレイのトグル (動画モード限定)。
-        // 画像モードの P (post-filter) とは handle_video_input 先行 consume で分離。
-        let perf_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
+        // F キーでフレームレート / Perf オーバーレイのトグル (動画モード限定)。
+        // 以前 P を使っていたが、P は「現在フレームをピン留め」に再割り当てしたので
+        // 移動した (F = Frames / FPS の mnemonic)。画像モードの F は未使用なので
+        // 競合しない。
+        let perf_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F));
+        // P キーで現在再生位置をピン留め (動画モード限定)。グリッドモードの P
+        // (folder_thumb_pin toggle) と統一した「P = Pin」の mnemonic。画像モードの
+        // P (post-filter cycle) とは handle_video_input 先行 consume で分離する。
+        let pin_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
         // W キー: 頭出し (= seek to 0 + play)。左手で押しやすく、画像モードでも未使用。
         let rewind_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W));
         // J/K: チャプター・ブックマーク・ピンを 1 本のマーカー列にまとめて前後ジャンプ。
@@ -5670,6 +5676,23 @@ impl App {
         }
         if perf_key {
             self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
+        }
+        if pin_key {
+            // P キー: 現在再生位置をピン留め (= HUD の 📌 ボタンと同等)。
+            // 現在 PTS を `set_native_video_pin` に渡す (内部で seek thumbnail を
+            // request + nearest 取得 + WebP encode + video_pins DB に書き込み)。
+            // 既に同位置のピンがあれば SQL の ON CONFLICT で pin_pts/thumb_webp を
+            // 上書きするだけなので idempotent。
+            #[cfg(windows)]
+            {
+                let target = self
+                    .fs_video_player(fs_idx)
+                    .map(|p| p.position())
+                    .unwrap_or(0.0);
+                self.handle_native_video_set_pin_command(ctx, fs_idx, target);
+            }
+            #[cfg(not(windows))]
+            let _ = (ctx, fs_idx);
         }
         if rewind_key && let Some(p) = self.fs_video_player(fs_idx) {
             p.seek(0.0);
