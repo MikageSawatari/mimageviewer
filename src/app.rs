@@ -6074,10 +6074,12 @@ impl App {
     /// 対して `pin_pts_secs` / `thumb_webp` を上書き更新する。mtime/size だけ見ると
     /// 「内容が変わったか」を判定できないので、`jpeg_data` を直接比較して再 seed する。
     ///
-    /// **Codex post-merge P1 対応**: 動画サムネ優先順 (video_pins → sidecar → Shell API)
-    /// を seed にも適用する。これで video_pins に WebP が無くても sidecar や Shell の
-    /// デフォルトサムネが拾えるので、ユーザーが「動画 pin したのに自動選択サムネが
-    /// 出る」状況を解消する。
+    /// **「動画内 PIN 必須」仕様** (Codex post-merge P2 → ユーザー合意): seed が拾うのは
+    /// `video_pins.db` の WebP のみ。一時期 sidecar `image::open` / Shell API 抽出の
+    /// fallback も seed に入れたが、UI スレッドで重く動画 pin 付きフォルダ複数 + Shell
+    /// 遅延でフォルダ移動が固まったため撤去した。動画を folder pin したいユーザーは
+    /// 先にフルスクリーンで `P` キー / HUD でフレームを保存する
+    /// (set 側で `try_set_folder_thumb_pin_with_video_guard` がガード)。
     fn seed_folder_video_pin_thumbs(
         &self,
         cache_map: &Arc<
@@ -8075,6 +8077,7 @@ impl App {
                     self.settings.folder_thumb_depth,
                     &self.folder_pin_map,
                     self.folder_thumb_pin_db.as_deref(),
+                    self.video_pin_db.as_ref(),
                 )
             }) else {
                 continue;
@@ -8383,6 +8386,7 @@ impl App {
                     self.settings.folder_thumb_depth,
                     &self.folder_pin_map,
                     self.folder_thumb_pin_db.as_deref(),
+                    self.video_pin_db.as_ref(),
                 )
             }) else {
                 continue;
@@ -16566,6 +16570,7 @@ fn make_load_request(
     folder_thumb_depth: u32,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    video_pin_db: Option<&crate::video_pins::VideoPinDb>,
 ) -> Option<LoadRequest> {
     // 共通フィールド (idx/path/mtime/file_size/skip_cache) 以外は Default (0/None/false)
     // を基底にして差分だけ上書きする。入力 seq / items_gen は後段のエンキューで上書きされる。
@@ -16618,6 +16623,7 @@ fn make_load_request(
                 ContainerKindForPin::ZipFile,
                 pin_map,
                 pin_db,
+                video_pin_db,
                 pdf_password,
             ))
         }
@@ -16642,6 +16648,7 @@ fn make_load_request(
                 ContainerKindForPin::PdfFile,
                 pin_map,
                 pin_db,
+                video_pin_db,
                 pdf_password,
             ))
         }
@@ -16666,6 +16673,7 @@ fn make_load_request(
                 ContainerKindForPin::Folder,
                 pin_map,
                 pin_db,
+                video_pin_db,
                 pdf_password,
             ))
         }
@@ -16865,6 +16873,12 @@ fn apply_folder_thumb_pin(
     container_kind: ContainerKindForPin,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    // cascade resolve が Video kind に到達したとき、`video_pins.db` に有効な WebP が
+    // あるか確認するために渡す。WebP が無い (= フルスクリーン pin 削除済み / 旧版の
+    // dead pin) 場合は pinned_key の LoadRequest を作らず `base_req` に戻す
+    // (Codex post-merge P2: dead video pin が pinned_key 下に auto-pick を再生成し
+    //  続ける churn を防ぐ)。
+    video_pin_db: Option<&crate::video_pins::VideoPinDb>,
     pdf_password: Option<&str>,
 ) -> LoadRequest {
     let container_key = crate::path_key::normalize_keep_drive(container);
@@ -16925,11 +16939,28 @@ fn apply_folder_thumb_pin(
 
     // Video pin は seed_folder_video_pin_thumbs が `pinned_key` で video_pins WebP を
     // catalog + cache_map に書き込んでいる前提。worker はそのまま cache_hit で
-    // 動画フレームを取り出す。seed が空 (WebP 無し / blob 空) のときは cache miss →
-    // worker 内で `is_folder_thumb` 判定 (prefix が CACHE_KEY_FOLDER) が成立し、
-    // `resolve_folder_thumb_image(&req.path, ...)` が動いて folder 自身の auto-pick が
-    // pinned_key の下に保存される (= base_req と概ね同じ挙動)。
+    // 動画フレームを取り出す。
     if matches!(resolved.kind, ResolvedKind::Video) {
+        // **dead video pin の churn 防止 (Codex post-merge P2)**:
+        // `video_pins.db` に有効な WebP が無い video source は、pinned_key の
+        // LoadRequest を作らず `base_req` に戻す。pinned_key を作ってしまうと、
+        // seed は WebP 無しで seed を skip → worker は cache miss → is_folder_thumb
+        // 経路で folder auto-pick を pinned_key 下に保存 → 次回 seed が purge という
+        // churn が毎ロード走る。base_req に戻せば worker は base_key を使い、
+        // auto-pick は base_key 下に普通に保存され churn しない。
+        // WebP は通常 set 時に `try_set_folder_thumb_pin_with_video_guard` が存在を
+        // 保証するが、フルスクリーンで pin 削除 / 旧版の dead pin で欠落し得る。
+        let has_webp = video_pin_db
+            .and_then(|db| db.lookup(&resolved.abs_path))
+            .map(|pin| !pin.thumb_webp.is_empty())
+            .unwrap_or(false);
+        if !has_webp {
+            crate::logger::log(format!(
+                "folder_thumb_pin: video pin has no WebP ({}) — falling back to base_req",
+                resolved.abs_path.display()
+            ));
+            return base_req;
+        }
         // ZipFile / PdfFile 親コンテナの場合は Video pin は組合せ不可
         // (`pin_source_compatible_with_container` で弾く) ので、ここに来る container
         // は必ず Folder 種別。`path = container` のままで worker の prefix 判定が
