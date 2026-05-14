@@ -619,6 +619,13 @@ overlay の中央 status に「メタデータ読込中...」「ストリーム�
   フレーム取得 (FFmpeg seek 系統は `screenshot.rs` と同じ one-shot 方式)
 - `tile_thumb_cache.rs`: SQLite + WebP の永続キャッシュ。**絶対 PTS をキー**にしているため
   動画の長さが変わっても再ヒットする (Phase 8.C の修正)
+- **抽出幅は `settings::VIDEO_TILE_EXTRACT_WIDTH` (640px) に固定**。列数・モニター解像度・
+  どのモニターで再生するかに依らず常に同じ幅で抽出・保存するので、キャッシュは
+  「動画 × 絶対 PTS」で 1 行に集約され、列数を切り替えても解像感が混ざらない
+  (旧実装は接続モニター最大幅 / 最小列数から導出していたため、列数や候補変更で
+  抽出幅が動き、640/960 が混在し得た)。表示用の `tile_w` / `tile_h` は別途
+  `VideoTileState` が持ち、native overlay が描画時に `tile_rect` へスケールする。
+  抽出幅を表示が超える構成 (横長 4K での 4 列など) は egui の拡大描画で許容する。
 
 タイルモードの UI 描画は `native_presenter/overlay_draw.rs` の以下 2 関数で構成する:
 

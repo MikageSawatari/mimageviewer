@@ -114,21 +114,13 @@ impl App {
         let usable_w = (screen_size.x - 32.0).max(200.0);
         let tile_w = (usable_w / columns as f32).floor().max(40.0) as u32;
         let tile_h = ((tile_w as f64) / aspect).round().max(30.0) as u32;
-        // extract_w は「キャッシュミスしたタイルを新規抽出するときの幅」。基準は
-        // max_screen_w / VIDEO_TILE_EXTRACT_MIN_COLUMNS で、現在の tile_w は下回らない。
-        // キャッシュ lookup は (path, timestamp_ms) のみ・最大幅優先 (tile_thumb_cache.rs)
-        // なので、列数やモニター解像度が変わっても抽出済みサムネは常に共有・再利用される
-        // (描画は egui がタイル矩形へスケール)。extract_w が決めるのは未抽出タイルの保存幅だけ:
-        // - 6 列以上は extract_w が定数 (= max_screen_w/6) に集約 (モニター非依存)
-        // - 4 列など tile_w が基準を超える粗いモードは extract_w = tile_w となり、そこで
-        //   初めて見るタイルだけ大きく抽出 (既存の小さいタイルは再利用し egui が拡大描画)
-        // - 基準を候補の最小値ではなく専用定数にしているのは、候補に 4 を足しただけで
-        //   既定 10 列の新規抽出解像度・メモリまで上がるのを避けるため (Codex P3)
-        // モニター情報が取れない場合のフォールバックは 640px (4K/6 ≈ 640 相当)。
-        let max_screen_w = crate::monitor::max_monitor_pixel_width().unwrap_or(3840) as f32;
-        let extract_min_columns = crate::settings::VIDEO_TILE_EXTRACT_MIN_COLUMNS;
-        let extract_w = ((max_screen_w / extract_min_columns as f32).floor() as u32).max(tile_w);
-        let extract_h = ((extract_w as f64) / aspect).round().max(tile_h as f64) as u32;
+        // 抽出幅は VIDEO_TILE_EXTRACT_WIDTH に固定。列数・モニター解像度・どのモニターで
+        // 再生するかに依らず常に同じ幅で抽出・保存するので、キャッシュは「動画 × 絶対 PTS」で
+        // 1 行に集約され、列数を切り替えても解像感が混ざらない。表示用の tile_w/tile_h は
+        // VideoTileState 経由で native overlay へ渡し、描画時に tile_rect へスケールする
+        // (表示が抽出幅を超える構成では egui が拡大描画 = スクラブ一覧として許容)。
+        let extract_w = crate::settings::VIDEO_TILE_EXTRACT_WIDTH;
+        let extract_h = ((extract_w as f64) / aspect).round().max(1.0) as u32;
 
         // 画面に収まる最大行数を計算。上下に余白 + ファイル名行 (任意) を引く。
         let usable_h = (screen_size.y - 80.0).max(200.0);
