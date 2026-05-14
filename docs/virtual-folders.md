@@ -121,6 +121,13 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
   動画フレームを取り出す。WebP が無い / 失敗時は seed を skip / 旧 seed 行を purge して
   worker を folder auto-pick fallback (`resolve_folder_thumb_image`) に落とす。
   video pin は `skip_cache = false` 固定で idle quality-upgrade の対象外 (WebP IS the source)。
+  - **「動画内 PIN 必須」仕様** (Codex post-merge P2 → ユーザー合意): video source の
+    folder pin は `try_set_folder_thumb_pin_with_video_guard` が **set 時に `video_pins.db`
+    の WebP 有無をチェック**し、無ければトーストで案内して set を拒否する。sidecar
+    `image::open` / Shell API 抽出を seed で同期実行すると、動画 pin 付きフォルダ複数 +
+    Shell 遅延でフォルダ移動が固まるため。これにより seed は軽い DB→DB コピーのみに
+    なり UI スレッドのヒッチが消える。動画を folder pin したいユーザーは先にフルスクリーン
+    で `P` キー / HUD ピンボタンでフレームを保存する。
 - **Folder source の cascade 解決** (v0.9.x+): pin source がサブフォルダ
   (`FolderRepresentative`) の場合、`resolve_pin_target_cascaded` が `folder_thumb_pins.db`
   を順に lookup して **Folder→Folder の pin 連鎖を最終 leaf まで辿る**。例: A が B

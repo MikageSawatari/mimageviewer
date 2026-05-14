@@ -599,36 +599,6 @@ fn stem_lower(path: &std::path::Path) -> String {
         .to_lowercase()
 }
 
-/// 動画ファイルと同名 (stem 一致、拡張子は認識対象画像) の sidecar 画像パスを返す。
-/// `seed_folder_video_pin_thumbs` が folder pin → video のフォールバックチェーンで
-/// `video_pins` WebP の次に試す。スキャンは V の親フォルダ 1 階層のみで、`read_dir` 1 回。
-/// 大文字小文字無視の stem 比較。
-fn find_video_sidecar_image(video_path: &std::path::Path) -> Option<std::path::PathBuf> {
-    let parent = video_path.parent()?;
-    let target_stem = stem_lower(video_path);
-    if target_stem.is_empty() {
-        return None;
-    }
-    let entries = std::fs::read_dir(parent).ok()?;
-    for entry in entries.flatten() {
-        let p = entry.path();
-        let ft = entry.file_type().ok()?;
-        if !ft.is_file() {
-            continue;
-        }
-        if stem_lower(&p) != target_stem {
-            continue;
-        }
-        let Some(ext) = p.extension().and_then(|e| e.to_str()) else {
-            continue;
-        };
-        if crate::folder_tree::is_recognized_image_ext(&ext.to_ascii_lowercase()) {
-            return Some(p);
-        }
-    }
-    None
-}
-
 /// ファイルパスが PNG 拡張子か (大文字小文字無視)。
 fn is_png_path(path: &std::path::Path) -> bool {
     path.extension()
@@ -6127,9 +6097,6 @@ impl App {
         use crate::folder_thumb_pins::ResolvedKind;
         let pin_db = self.folder_thumb_pin_db.as_deref();
         let max_cascade_depth = self.settings.folder_thumb_depth as usize;
-        let use_sidecar = self.settings.video_thumb_use_sidecar_image;
-        let thumb_px = self.settings.thumb_px;
-        let thumb_quality = self.settings.thumb_quality;
         let mut seeded = 0u32;
         let mut purged = 0u32;
         for item in &self.items {
@@ -6166,56 +6133,21 @@ impl App {
                 resolved.source_id,
             );
 
-            // 動画サムネ優先順で WebP を確定する (= 通常の動画タイル表示と同じチェーン):
-            //   1. video_pins.db の WebP (= フルスクリーン HUD でユーザーがピン留めした
-            //      特定フレーム) — 最優先
-            //   2. 同名 sidecar 画像 (Settings.video_thumb_use_sidecar_image=true のみ)
-            //   3. Windows Shell API のデフォルト動画サムネ (1 回試行、retry なし)
-            // どれも取れなかったら None で seed をスキップ (= folder auto-pick に
-            // フォールバック)。
+            // video_pins.db の WebP (= フルスクリーン HUD でユーザーがピン留めした
+            // 特定フレーム) のみを seed する。
+            //
+            // Codex post-merge P2 対応: sidecar 画像の `image::open` / Shell API 呼び出しは
+            // UI スレッドで重く、動画 pin 付きフォルダが複数あると `start_loading_items`
+            // (= フォルダ移動) がブロックする。sidecar / Shell fallback は撤去し、
+            // 「動画を folder pin するには先にフルスクリーンでフレームを保存する」
+            // 仕様にした (set 側で `try_set_folder_thumb_pin_with_video_guard` がガード)。
+            // ここに来る時点で video_pins WebP は必ず存在する想定だが、レース
+            // (フルスクリーンで unpin した直後など) で空になっていることもあるので
+            // `.filter(non-empty)` は残し、空なら下の purge_stale 経路に落とす。
             let webp = video_db
                 .lookup(&resolved.abs_path)
                 .map(|pin| pin.thumb_webp)
-                .filter(|b| !b.is_empty())
-                .or_else(|| {
-                    // sidecar 画像 (V の親フォルダ内で V の stem に一致する画像)
-                    if !use_sidecar {
-                        return None;
-                    }
-                    let sidecar = find_video_sidecar_image(&resolved.abs_path)?;
-                    let img = image::open(&sidecar).ok()?;
-                    let (data, _w, _h) =
-                        crate::catalog::encode_thumb_webp(&img, thumb_px, thumb_quality as f32)?;
-                    crate::logger::log(format!(
-                        "folder_thumb_pin video seed: sidecar source={} video={}",
-                        sidecar.display(),
-                        resolved.abs_path.display(),
-                    ));
-                    Some(data)
-                })
-                .or_else(|| {
-                    // Shell API 1 回試行 (retry 無し、Shell がまだ未抽出なら None)
-                    let shell_size = thumb_px.max(256) as i32;
-                    let (ci, _diag) =
-                        crate::video_thumb::get_video_thumbnail(&resolved.abs_path, shell_size);
-                    let ci = ci?;
-                    let [w, h] = ci.size;
-                    let rgba: Vec<u8> = ci.pixels.iter().flat_map(|c| c.to_array()).collect();
-                    let buf = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(
-                        w as u32, h as u32, rgba,
-                    )?;
-                    let dyn_img = image::DynamicImage::ImageRgba8(buf);
-                    let (data, _w, _h) = crate::catalog::encode_thumb_webp(
-                        &dyn_img,
-                        thumb_px,
-                        thumb_quality as f32,
-                    )?;
-                    crate::logger::log(format!(
-                        "folder_thumb_pin video seed: shell-extracted video={}",
-                        resolved.abs_path.display(),
-                    ));
-                    Some(data)
-                });
+                .filter(|b| !b.is_empty());
 
             // pinned_key 行を catalog + cache_map から削除する内部 closure。
             // 「seed できない (WebP 無し / 破損 / SQL エラー)」全ケースで共通に使い、
@@ -6559,19 +6491,47 @@ impl App {
     /// 有効な WebP が無ければ拒否**する。worker が auto-pick fallback で「親フォルダ自身の
     /// 代表画」を pinned_key に保存してしまう dead pin を防ぐ。
     ///
-    /// 戻り値: 実際に pin が設定できれば `true`。
+    /// 戻り値: 実際に pin が設定できれば `true`。拒否時はトーストを出して `false`。
+    /// 拒否は **set** にのみ適用される (= remove は別経路から直接呼ぶ)。
     ///
-    /// Codex P1 指摘対応: 旧版は Video source の場合に `video_pins` DB に WebP が
-    /// 無いと set を**拒否**していたが、これは「すべての種別をピン留めできる」設計と
-    /// 衝突していた。動画 source も常に set を許可し、サムネ生成側 (`seed_folder_video_
-    /// pin_thumbs`) が **video_pins WebP > sidecar 画像 > Shell API** の優先順
-    /// (= 通常の動画タイル表示と同じチェーン) で代表サムネを決める。これで「ピン留め
-    /// できたりできなかったり」のユーザー混乱を解消する。
+    /// 設計判断 (Codex post-merge P2 → ユーザー合意「動画内 PIN 必須仕様」):
+    /// sidecar `image::open` / Shell API 抽出を `seed_folder_video_pin_thumbs` で
+    /// 同期実行すると、動画 pin 付きフォルダ複数 + Shell 遅延でフォルダ移動が固まる。
+    /// そのため video source は **`video_pins.db` に WebP がある (= フルスクリーンで
+    /// フレームを保存済み) 場合のみ** folder pin を許可する。seed は軽い DB→DB
+    /// コピーだけになり UI ヒッチが完全に消える。フレーム未保存の動画に 📌 すると
+    /// トーストで「フルスクリーンでフレームを保存してください」と案内する。
     fn try_set_folder_thumb_pin_with_video_guard(
         &mut self,
         container: &std::path::Path,
         source: crate::folder_thumb_pins::FolderPinSource,
     ) -> bool {
+        if let crate::folder_thumb_pins::FolderPinSource::File {
+            kind: crate::folder_thumb_pins::FileKind::Video,
+            ..
+        } = &source
+        {
+            let abs = container.join(source.rel());
+            let has_webp = self
+                .video_pin_db
+                .as_ref()
+                .and_then(|db| db.lookup(&abs))
+                .map(|pin| !pin.thumb_webp.is_empty())
+                .unwrap_or(false);
+            if !has_webp {
+                self.show_feedback_toast(
+                    "動画内でピン留めされた画像がないため、設定できません\n\
+                     先にフルスクリーンで動画を開き、HUD のピンボタン (または P キー) で\
+                     フレームを保存してください"
+                        .to_string(),
+                );
+                crate::logger::log(format!(
+                    "folder_thumb_pin: video pin rejected (no WebP) for {}",
+                    abs.display()
+                ));
+                return false;
+            }
+        }
         self.set_folder_thumb_pin(container, source)
     }
 
