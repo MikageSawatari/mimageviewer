@@ -6089,7 +6089,9 @@ impl App {
         let Some(cat) = catalog else {
             return;
         };
-        use crate::folder_thumb_pins::{FileKind, FolderPinSource, ResolvedKind};
+        use crate::folder_thumb_pins::ResolvedKind;
+        let pin_db = self.folder_thumb_pin_db.as_deref();
+        let max_cascade_depth = self.settings.folder_thumb_depth as usize;
         let mut seeded = 0u32;
         let mut purged = 0u32;
         for item in &self.items {
@@ -6100,22 +6102,18 @@ impl App {
             let Some(source) = self.folder_pin_map.get(&container_key) else {
                 continue;
             };
-            // Folder container + File source where kind = Video のみ対象
-            if !matches!(
+            // cascade 解決の leaf が Video kind になるケースを対象にする (= Folder→...→Video
+            // の入れ子 pin にも対応)。immediate source が Video でも、Folder→Folder→...→Video
+            // でも leaf が Video なら同じ seed 処理。
+            let lookup = |p: &std::path::Path| pin_db.and_then(|db| db.lookup(p));
+            let Some(resolved) = crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+                container_path,
                 source,
-                FolderPinSource::File {
-                    kind: FileKind::Video,
-                    ..
-                }
-            ) {
-                continue;
-            }
-            let Some(resolved) =
-                crate::folder_thumb_pins::resolve_pin_target(container_path, source)
-            else {
+                lookup,
+                max_cascade_depth,
+            ) else {
                 continue;
             };
-            // 念のため (resolve_pin_target は File{Video} → ResolvedKind::Video のはず)
             if !matches!(resolved.kind, ResolvedKind::Video) {
                 continue;
             }
