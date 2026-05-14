@@ -2640,28 +2640,24 @@ impl App {
             }
             // Left / Right: same seek granularity as the egui fullscreen path.
             0x25 => {
-                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    let delta = if key.ctrl {
-                        -30.0
-                    } else if key.shift {
-                        -1.0
-                    } else {
-                        -5.0
-                    };
-                    player.seek_relative(delta);
-                }
+                let delta = if key.ctrl {
+                    -30.0
+                } else if key.shift {
+                    -1.0
+                } else {
+                    -5.0
+                };
+                self.native_video_seek_relative_with_hint(fs_idx, delta);
             }
             0x27 => {
-                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    let delta = if key.ctrl {
-                        30.0
-                    } else if key.shift {
-                        1.0
-                    } else {
-                        5.0
-                    };
-                    player.seek_relative(delta);
-                }
+                let delta = if key.ctrl {
+                    30.0
+                } else if key.shift {
+                    1.0
+                } else {
+                    5.0
+                };
+                self.native_video_seek_relative_with_hint(fs_idx, delta);
             }
             // Plain Up / Down: navigate files, matching the egui fullscreen path.
             0x26 if key.ctrl && !key.shift => {
@@ -2987,12 +2983,52 @@ impl App {
 
     #[cfg(windows)]
     pub(crate) fn show_native_video_overlay_toast(&self, text: String, centered: bool) {
+        self.show_native_video_overlay_toast_with_linger(text, centered, None);
+    }
+
+    /// `show_native_video_overlay_toast` の linger 指定版。`linger` が `Some` のとき
+    /// その時間だけトーストを表示し続ける。←→ 押しっぱなしの境界トーストのように
+    /// 「キーを離したら早めに消したい」用途で短い値を渡す。`None` なら従来どおり
+    /// `centered` から既定値 (centered: 2.5s / それ以外: 1.8s) が使われる。
+    #[cfg(windows)]
+    pub(crate) fn show_native_video_overlay_toast_with_linger(
+        &self,
+        text: String,
+        centered: bool,
+        linger: Option<std::time::Duration>,
+    ) {
         let Some(fs_idx) = self.fullscreen_idx else {
             return;
         };
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.show_native_overlay_toast(text, centered);
+            player.show_native_overlay_toast(text, centered, linger);
         }
+    }
+
+    /// ←→ ホットキーの相対シーク。先頭 / 末尾に達してシークが発行されなかった
+    /// 場合 (= `seek_relative` が `AtStart` / `AtEnd` を返した場合) は、
+    /// overlay トーストで「動画先頭です」「動画末尾です」と通知する。
+    /// 末尾でシークを発行すると decoder が target 付近のフレームを返せず
+    /// 「シーク中...」表示が固着するため、ここでシーク自体を抑止している。
+    #[cfg(windows)]
+    fn native_video_seek_relative_with_hint(&self, fs_idx: usize, delta_secs: f64) {
+        let outcome = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.seek_relative(delta_secs),
+            _ => return,
+        };
+        let hint = match outcome {
+            crate::video::RelativeSeekOutcome::Seeked => return,
+            crate::video::RelativeSeekOutcome::AtStart => "動画先頭です",
+            crate::video::RelativeSeekOutcome::AtEnd => "動画末尾です",
+        };
+        // ←→ 押しっぱなしの間は repeat ごとに re-show されて表示が維持され、
+        // キーを離すと linger 経過 (700ms) で早めに消える。通常トーストの
+        // 既定値 (2.5s) のままだとキーを離した後も長く残り続けて煩わしい。
+        self.show_native_video_overlay_toast_with_linger(
+            hint.to_string(),
+            true,
+            Some(std::time::Duration::from_millis(700)),
+        );
     }
 
     #[cfg(windows)]

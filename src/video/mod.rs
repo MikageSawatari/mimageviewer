@@ -165,6 +165,19 @@ pub struct VideoPlayer {
     /// repaint を予約してデコーダ完成を polling 待ちする。長引いたら back off する。
     /// シーク完了 (override が 1 度クリア) で None に戻す。
     seek_inflight_since: Option<std::time::Instant>,
+    /// 「seek が EOF に達したまま完了しない」状態を最初に観測した壁時計時刻。
+    /// `is_seeking() && is_eof_reached()` が継続して true の間だけ `Some`。
+    /// `info.duration_secs` (コンテナ尺) が最終フレーム PTS より後ろのことが多く、
+    /// その付近を target にした seek は backward seek 自体は成功する (= seek 失敗
+    /// 経路の override clear が走らない) のに、video decoder が target 以降の
+    /// フレームを 1 枚も返せず post-seek frame / 音声による override clear 経路も
+    /// 発火しない。結果 `seek_target_override` が固着して「シーク中...」が出続ける。
+    /// この時刻から一定時間 (`SEEK_STUCK_EOF_TIMEOUT`) 経過しても解除されなければ、
+    /// tick 側の保険として override を強制クリアする。`is_eof_reached()` は demux が
+    /// ファイル全体を読み切ったときだけ true (request_seek で一旦クリア) なので、
+    /// 進行中の通常 seek を誤検出しない。
+    /// (詳細は [docs/video-architecture.md] の seek HUD 節を参照。)
+    seek_eof_stuck_since: Option<std::time::Instant>,
     /// キーリピート / seekbar drag のような連続ユーザー seek を coalesce する。
     /// frame-step は専用の latest-wins gate を持つのでここには混ぜない。
     user_seek_coalesce: Mutex<UserSeekCoalesceState>,
@@ -322,6 +335,19 @@ pub enum NativeVideoOutputEvent {
     CancelNormalizeScan,
 }
 
+/// [`VideoPlayer::seek_relative`] の結果。
+/// 境界 (先頭 / 末尾) に達して実シークを発行しなかったケースを呼び出し側が
+/// 検出し、トースト表示に振り替えるために使う。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RelativeSeekOutcome {
+    /// 実シークを発行した (通常)。
+    Seeked,
+    /// 既に動画先頭に居て、これ以上戻れなかった。
+    AtStart,
+    /// 既に動画末尾に居て、これ以上進めなかった。
+    AtEnd,
+}
+
 #[cfg(windows)]
 pub(crate) struct SwitchSourcePayload {
     video_rx: crossbeam_channel::Receiver<VideoFrame>,
@@ -394,6 +420,10 @@ enum NativeVideoOutputCommand {
     ShowToast {
         text: String,
         centered: bool,
+        /// 表示維持時間。`None` のとき presenter 側が `centered` から既定値
+        /// (centered: 2.5s / それ以外: 1.8s) を導く。←→ ホットキーの境界トーストの
+        /// ように「キーを離したら早めに消したい」用途では `Some(短い値)` を渡す。
+        linger: Option<std::time::Duration>,
     },
     SetTileOverlay {
         tile_overlay: Option<native_presenter::NativeOverlayTileOverlay>,
@@ -773,10 +803,12 @@ impl NativeVideoOutput {
             });
     }
 
-    fn show_toast(&self, text: String, centered: bool) {
-        let _ = self
-            .command_tx
-            .send(NativeVideoOutputCommand::ShowToast { text, centered });
+    fn show_toast(&self, text: String, centered: bool, linger: Option<std::time::Duration>) {
+        let _ = self.command_tx.send(NativeVideoOutputCommand::ShowToast {
+            text,
+            centered,
+            linger,
+        });
     }
 
     fn mark_cursor_activity(&self) {
@@ -1555,8 +1587,12 @@ fn run_native_video_output(
                         prep_status,
                     );
                 }
-                NativeVideoOutputCommand::ShowToast { text, centered } => {
-                    presenter.show_overlay_toast(text, centered);
+                NativeVideoOutputCommand::ShowToast {
+                    text,
+                    centered,
+                    linger,
+                } => {
+                    presenter.show_overlay_toast(text, centered, linger);
                 }
                 NativeVideoOutputCommand::SetTileOverlay { tile_overlay } => {
                     presenter.set_overlay_tile_overlay(tile_overlay);
@@ -2702,6 +2738,7 @@ impl VideoPlayer {
                 loop_target_bits: AtomicU64::new(0u64), // = (0.0_f64).to_bits()
                 eof_loop_quiet_ticks: AtomicU32::new(0),
                 seek_inflight_since: None,
+                seek_eof_stuck_since: None,
                 user_seek_coalesce: Mutex::new(UserSeekCoalesceState::default()),
                 #[cfg(windows)]
                 gpu_latest: None,
@@ -2920,6 +2957,7 @@ impl VideoPlayer {
             loop_target_bits: AtomicU64::new(0u64),
             eof_loop_quiet_ticks: AtomicU32::new(0),
             seek_inflight_since: None,
+            seek_eof_stuck_since: None,
             user_seek_coalesce: Mutex::new(UserSeekCoalesceState::default()),
             #[cfg(windows)]
             gpu_latest: None,
@@ -3269,12 +3307,72 @@ impl VideoPlayer {
     /// 絶対シークと同じ precise seek を使う。target 前の keyframe preview は表示せず、
     /// 現在フレームを保ったまま target 到達 frame を待つ。
     /// 一時停止中なら自動的に再生再開する。
-    pub fn seek_relative(&self, delta_secs: f64) {
+    ///
+    /// 既に先頭 / 末尾に居て要求方向へ実質シークできない場合は、シークを発行せず
+    /// [`RelativeSeekOutcome::AtStart`] / [`AtEnd`](RelativeSeekOutcome::AtEnd) を
+    /// 返す。`info.duration_secs` はコンテナ尺で最終フレームより後ろのことが多く、
+    /// 末尾でシークを発行すると decoder が target 付近のフレームを返せず
+    /// 「シーク中...」表示が固着する。呼び出し側はこの戻り値を見て境界トーストに
+    /// 振り替える。
+    ///
+    /// さらに境界を検出した時点で、pending な user seek と seek override を
+    /// 明示クリアする。直前の相対シークが末尾付近を target にして「シーク中...」
+    /// 固着 (= override が通常経路で解除されないまま) になっているケースを、
+    /// この境界判定のタイミングで回収して HUD 表示を正常化するため。
+    pub fn seek_relative(&self, delta_secs: f64) -> RelativeSeekOutcome {
         self.clear_frame_step_target();
         let cur = self.user_seek_base_secs();
         let raw = (cur + delta_secs).max(0.0);
         let target = self.clamp_seek_target(raw);
-        self.request_user_seek(target);
+        // 境界判定。先頭側と末尾側で **判定式そのものが違う** ことに注意。
+        //
+        // - **末尾側** (`delta > 0`): `target <= cur + 許容差`。動画が EOF で停止すると
+        //   `cur` が clamp 上限 (`duration - 0.1`) 付近に張り付くので、許容差は狭くて
+        //   よい。許容差はシーク粒度 (最小 1 秒) より小さく取る必要がある — そうしない
+        //   と未 clamp の前進シーク (`target = cur + delta`) でも条件が成立してしまう。
+        //
+        // - **先頭側** (`delta < 0`): **`cur` の絶対位置**で判定する (`cur <= 許容差`)。
+        //   再生中は `cur` が 0 から離れる方向にしか進まないため「再生開始直後に ← を
+        //   押すと既に cur が 0 から離れていて AtStart にならない」(2026-05 報告)。
+        //   ここで末尾側と同じ `target >= cur - 許容差` 形式を使うと、未 clamp の後退
+        //   シークでは `target = cur - |delta|` なので、許容差 >= シーク粒度 (1 秒) の
+        //   とき **常に成立**してしまい Shift+← (1 秒) が全く動かなくなる (2026-05 報告)。
+        //   絶対位置判定なら粒度に依存せず、「先頭から 1 秒以内なら先頭扱い」で済む。
+        const SEEK_START_BOUNDARY_TOLERANCE_SECS: f64 = 1.0;
+        const SEEK_END_BOUNDARY_TOLERANCE_SECS: f64 = 0.01;
+        let outcome = if delta_secs > 0.0 && target <= cur + SEEK_END_BOUNDARY_TOLERANCE_SECS {
+            RelativeSeekOutcome::AtEnd
+        } else if delta_secs < 0.0 && cur <= SEEK_START_BOUNDARY_TOLERANCE_SECS {
+            RelativeSeekOutcome::AtStart
+        } else {
+            self.request_user_seek(target);
+            return RelativeSeekOutcome::Seeked;
+        };
+        // 境界に達したときの pending / override クリアは **`is_eof_reached()` のときだけ**
+        // 行う (Codex P1 反映)。
+        //
+        // 末尾付近を target にした seek は decoder が target 以降のフレームを返せず、
+        // 通常の override 解除経路 (post-seek フレーム / 音声の消費) が発火しないまま
+        // 固着する。これを掃除するのがこのクリアの目的。だが `cur` は
+        // `user_seek_base_secs()` (= coalesce 中の pending target を優先) なので、
+        // ←→ 押しっぱなしで pending target が clamp に到達すると、**実シークはまだ
+        // 手前を向いている (= 正当な進行中 seek)** のに AtStart/AtEnd になり得る。
+        // ここで無条件にクリアすると、その正当な in-flight seek の override と、
+        // まだ発行されていない pending seek を巻き込んで潰してしまう。
+        //
+        // `is_eof_reached()` は demux がファイル全体を読み切ったときだけ true になり、
+        // 「override がもう post-seek フレームを得られない = 固着」状態と一致する。
+        // false のときは進行中 / pending の seek は正当なので touch しない —
+        // 通常の override 解除経路、または tick 側の保険 (`seek_eof_stuck_since`,
+        // 1200ms) に回収を任せる。
+        // `current_seek_serial()` を completed_serial に渡すことで、直近のシーク
+        // 世代の override だけを CAS で外す (新しいシークが割り込んでいたら何もしない)。
+        if self.clock.is_eof_reached() {
+            self.clear_pending_user_seek();
+            self.clock
+                .clear_seek_target_override(self.clock.current_seek_serial());
+        }
+        outcome
     }
 
     /// フレーム送り用の精密シーク。到着後は必ず一時停止状態に保つ。
@@ -3767,10 +3865,17 @@ impl VideoPlayer {
         }
     }
 
+    /// native overlay にトーストを表示する。`linger` が `Some` のときその時間だけ
+    /// 表示を維持し、`None` のとき presenter が `centered` から既定値を導く。
     #[cfg(windows)]
-    pub fn show_native_overlay_toast(&self, text: String, centered: bool) {
+    pub fn show_native_overlay_toast(
+        &self,
+        text: String,
+        centered: bool,
+        linger: Option<std::time::Duration>,
+    ) {
         if let Some(output) = self.native_output.as_ref() {
-            output.show_toast(text, centered);
+            output.show_toast(text, centered, linger);
         }
     }
 
@@ -3895,14 +4000,67 @@ impl VideoPlayer {
         // クロックの今時刻
         let now = self.clock.now_secs();
 
+        // ── stuck seek (= 末尾より後ろを target にした seek) の保険解除 ──
+        //
+        // `info.duration_secs` はコンテナ尺で最終フレームの PTS より後ろのことが
+        // 多く、その付近を target にした相対シークは backward seek 自体は成功する
+        // (= seek 失敗経路の override clear が走らない) のに、video decoder が
+        // target 以降のフレームを 1 枚も decode できず、post-seek フレーム / 音声の
+        // 消費による override clear 経路も発火しない。結果 `seek_target_override` が
+        // 固着し「シーク中...」が出続ける。
+        //
+        // `seek_relative` の境界判定でも回収するが、それは「次にもう一度 ←→ を
+        // 押す」操作が前提。ここでは tick 側の最終保険として、`is_seeking()` のまま
+        // `is_eof_reached()` (= demux がファイル全体を読み切った) が継続して true で
+        // ある状態が `SEEK_STUCK_EOF_TIMEOUT` 続いたら override を強制クリアする。
+        // - `is_eof_reached()` は `request_seek` で一旦クリアされ、demux が末尾まで
+        //   読み切ったときだけ true になるので、進行中の通常 seek を誤検出しない。
+        // - 通常の near-end seek は post-seek フレームが presenter / tick に届いた
+        //   時点で override が clear され `is_seeking()` が false になるため、この
+        //   timeout に達する前にラッチが解除される。
+        // override をクリアするだけに留め、playing / 位置の更新は後段の既存 EOF
+        // 処理 (native: ループ block / 非 native: line 末尾の EOF block) に任せる。
+        const SEEK_STUCK_EOF_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1200);
+        if self.clock.is_seeking() && self.clock.is_eof_reached() {
+            let stuck_since = *self
+                .seek_eof_stuck_since
+                .get_or_insert_with(std::time::Instant::now);
+            if stuck_since.elapsed() >= SEEK_STUCK_EOF_TIMEOUT {
+                self.seek_eof_stuck_since = None;
+                self.clear_pending_user_seek();
+                let serial = self.clock.current_seek_serial();
+                self.clock.clear_seek_target_override(serial);
+                crate::logger::log(format!(
+                    "[video] stuck seek override force-cleared after {}ms \
+                     (seek target past last frame, serial={serial})",
+                    SEEK_STUCK_EOF_TIMEOUT.as_millis(),
+                ));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "video",
+                        "seek_override_force_clear_eof",
+                        None,
+                        0,
+                        &[("serial", serde_json::Value::from(serial as i64))],
+                    );
+                }
+            }
+        } else {
+            self.seek_eof_stuck_since = None;
+        }
+
         #[cfg(windows)]
         self.pump_native_hover_thumbnail();
 
         #[cfg(windows)]
         if self.native_output.is_some() {
-            // EOF ループ処理: native presenter 経路でも `clock.is_eof_reached()` を見て
-            // ループ seek を発行する。ここで処理しないと line 3246 以降の EOF ブロックには
-            // 到達せずループが効かない (= 既存のフル経路でも同様の前提)。
+            // EOF 処理: native presenter 経路でも `clock.is_eof_reached()` を見て、
+            // ループ ON ならループ seek、ループ OFF なら duration 位置で停止する。
+            // native 経路はこの直後の early return で抜けるため非 native 経路の EOF
+            // block (`set_position_at_eof` + `set_playing(false)`) には到達しない。
+            // ここでループ OFF の停止を処理しないと、is_playing() のままクロックが
+            // duration を超えて進み続ける (= ユーザー報告 2026-05「動画末尾を超えて
+            // 再生が進む」)。
             // ★末尾の音声 drain と最終フレーム表示を待つ★ (Codex P1 第10ラウンド +
             // 第11ラウンド — demux EOF 時点で `is_eof_reached` が立つが、その直後に
             // audio worker が残フレームを drain しており、また pump 内には raw_pending /
@@ -3933,10 +4091,12 @@ impl VideoPlayer {
                 && self.clock.audio_raw_pending_secs() < EOF_DRAIN_AUDIO_QUIET_TOL
                 && self.clock.audio_tx_queued_secs() < EOF_DRAIN_AUDIO_QUIET_TOL;
             let channels_drained = self.audio_rx_len() == 0 && self.video_rx_len() == 0;
+            // `loop_enabled` は **発火条件には含めない** (ループ ON/OFF どちらでも EOF
+            // drain 完了を待つ)。発火後のアクションだけ loop_enabled で分岐する。
+            let loop_enabled = self.loop_enabled.load(std::sync::atomic::Ordering::Acquire);
             let quiet_now = self.clock.is_eof_reached()
                 && !self.clock.is_seeking()
                 && self.is_playing()
-                && self.loop_enabled.load(std::sync::atomic::Ordering::Acquire)
                 && channels_drained
                 && audio_drained;
             let quiet_ticks = if quiet_now {
@@ -3951,15 +4111,29 @@ impl VideoPlayer {
             if quiet_ticks >= EOF_DRAIN_QUIET_TICKS {
                 self.eof_loop_quiet_ticks
                     .store(0, std::sync::atomic::Ordering::Release);
-                let raw = self.loop_target_secs();
-                let target = self.clamp_seek_target(raw);
-                self.clear_pending_user_seek();
-                self.clock.request_seek(target);
-                self.clear_audio_output_buffer();
-                self.clock.set_playing(true);
-                let mut g = self.engine.lock().unwrap();
-                g.handle_seek_request(target);
-                g.apply_command(engine::actor::TransportCommand::Play);
+                if loop_enabled {
+                    // ループ ON: `loop_target_bits` (Full ループは 0.0、CH/BM ループは
+                    // app が書き戻す「現区間の開始秒」) へ seek して再生継続。
+                    let raw = self.loop_target_secs();
+                    let target = self.clamp_seek_target(raw);
+                    self.clear_pending_user_seek();
+                    self.clock.request_seek(target);
+                    self.clear_audio_output_buffer();
+                    self.clock.set_playing(true);
+                    let mut g = self.engine.lock().unwrap();
+                    g.handle_seek_request(target);
+                    g.apply_command(engine::actor::TransportCommand::Play);
+                } else {
+                    // ループ OFF: 末端到達 → duration 位置で凍結して停止。
+                    // 非 native 経路の EOF block (line 末尾) と同じ処理。これが無いと
+                    // native 経路ではクロックが duration を超えて進み続ける。
+                    if let Some(info) = self.info.as_ref() {
+                        if info.duration_secs > 0.0 {
+                            self.clock.set_position_at_eof(info.duration_secs);
+                        }
+                    }
+                    self.clock.set_playing(false);
+                }
             }
             // 動画オープン中 (= 1 フレームも表示されていない) は preparing HUD の
             // 数値を 50ms ごとに更新するため強制 polling (Codex P3 第 13 ラウンド対応)。

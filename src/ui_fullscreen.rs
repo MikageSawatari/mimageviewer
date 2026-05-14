@@ -5611,6 +5611,7 @@ impl App {
         };
 
         // player に作用させる (借用はこの if-let のスコープ内で完結)
+        let mut seek_outcome: Option<crate::video::RelativeSeekOutcome> = None;
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             if enter {
                 player.toggle_play();
@@ -5626,26 +5627,37 @@ impl App {
             //   Shift+←→ = 1 秒 (細かい、フレーム単位調整に近い)
             //   Ctrl+←→ = 30 秒 (大きい、長い動画の早送り用)
             if left {
-                player.seek_relative(-5.0);
+                seek_outcome = Some(player.seek_relative(-5.0));
             }
             if right {
-                player.seek_relative(5.0);
+                seek_outcome = Some(player.seek_relative(5.0));
             }
             if shift_left {
-                player.seek_relative(-1.0);
+                seek_outcome = Some(player.seek_relative(-1.0));
             }
             if shift_right {
-                player.seek_relative(1.0);
+                seek_outcome = Some(player.seek_relative(1.0));
             }
             if ctrl_left {
-                player.seek_relative(-30.0);
+                seek_outcome = Some(player.seek_relative(-30.0));
             }
             if ctrl_right {
-                player.seek_relative(30.0);
+                seek_outcome = Some(player.seek_relative(30.0));
             }
             if let Some(v) = new_vol {
                 player.set_volume(v);
             }
+        }
+        // 先頭 / 末尾に達してシークが発行されなかった場合は境界トーストで通知する
+        // (player 借用が終わってから self を触る)。
+        match seek_outcome {
+            Some(crate::video::RelativeSeekOutcome::AtStart) => {
+                self.show_feedback_toast("動画先頭です".to_string());
+            }
+            Some(crate::video::RelativeSeekOutcome::AtEnd) => {
+                self.show_feedback_toast("動画末尾です".to_string());
+            }
+            Some(crate::video::RelativeSeekOutcome::Seeked) | None => {}
         }
 
         // 設定への反映 (player 借用は終わっているので self.settings を書き換え可能)。

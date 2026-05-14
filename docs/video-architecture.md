@@ -248,7 +248,7 @@ src/video/
 
 | thread 名 | 責務 | 入力 | 出力 |
 |---|---|---|---|
-| `video-demux` (= `run_decoder`) | `Input::packets()` ループ、seek 調停、EOF idle wait、`engine_event_tx` への SeekCompleted 発火 | `Arc<AvClock>` (seek_request) / 動画ファイル | `video_pkt_tx` (bounded=32) / `audio_pkt_tx` (bounded=64) / `video_ctl_tx` / `audio_ctl_tx` |
+| `video-demux` (= `run_decoder`) | `Input::packets()` ループ、seek 調停、EOF idle wait、`engine_event_tx` への SeekCompleted 発火。スレッド本体は `catch_unwind` で囲み、panic は `info_tx(Err)` + `DecoderEvent::Failed` に変換して engine/UI に伝える (無言ハング防止) | `Arc<AvClock>` (seek_request) / 動画ファイル | `video_pkt_tx` (bounded=32) / `audio_pkt_tx` (bounded=64) / `video_ctl_tx` / `audio_ctl_tx` |
 | `video-decode` (= `run_video_decode`) | HW (`D3D11VA`) → GPU blit / SW + swscale、PACE_LEAD=0.30 の pacing、`new_seek_pending` generation race check | `video_pkt_rx` (`VideoPacketMsg::{Packet, Eof}`) + `video_ctl_rx` (`VideoControlMsg::Flush`) | `video_tx` (bounded=24、`VideoFrame`) |
 | `video-audio-decode` (= `run_audio_decode`) | avcodec decode + swresample、post-seek packet/sample trim、PAUSED/EOF park、EOF drain | `audio_pkt_rx` (`AudioPacketMsg::{Packet, Eof}`) + `audio_ctl_rx` (`AudioControlMsg::Flush`) | `audio_tx` (bounded=32、`AudioFrame`) |
 
@@ -271,6 +271,77 @@ seek が 1 frame 表示されるか 250ms 経過するまで次の request を�
 native HUD は `clock.is_seeking()` と `current_seek_serial()` を既存 state として参照し、
 1 seek 世代が 150ms を超えたときだけ中央に「シーク中...」を表示する。表示後は 300ms
 以上保持して短い seek のフリッカを避ける。
+
+**境界 (先頭 / 末尾) での相対シーク抑止**: `VideoPlayer::seek_relative` は既に先頭 /
+末尾に居て要求方向へ実質シークできない場合、シークを発行せず
+`RelativeSeekOutcome::AtStart` / `AtEnd` を返す。`info.duration_secs` はコンテナ尺で
+最終フレームの PTS より後ろのことが多く、末尾でシークを発行すると decoder が target
+付近のフレームを返せないまま EOF に達し、`seek_target_override` が解除されず
+「シーク中...」表示が固着する (= seek 完了の clear 条件が満たされない)。呼び出し側
+(`app/native_video.rs::native_video_seek_relative_with_hint` / `ui_fullscreen.rs`) は
+この戻り値を見て、シークの代わりに「動画先頭です」「動画末尾です」の境界トーストを出す。
+
+境界判定は **先頭側と末尾側で判定式そのものが違う**。
+
+- **末尾側** (`delta > 0`): `target <= cur + SEEK_END_BOUNDARY_TOLERANCE_SECS` (0.01s)。
+  動画が EOF で停止すると `cur` が clamp 上限 (`duration - 0.1`) 付近に張り付くので
+  狭い許容差で単発キーでも拾える。許容差はシーク粒度 (最小 1 秒) より小さく取る必要が
+  ある — そうしないと未 clamp の前進シーク (`target = cur + delta`) でも条件が成立する。
+- **先頭側** (`delta < 0`): **`cur` の絶対位置**で判定する
+  (`cur <= SEEK_START_BOUNDARY_TOLERANCE_SECS`, 1.0s)。再生中は `cur` が 0 から離れる
+  方向にしか進まないため、末尾側と同じ `target >= cur - 許容差` 形式にすると、(a) 狭い
+  許容差では「再生開始直後の ← で一度も `AtStart` にならない」、(b) 許容差をシーク粒度
+  以上に広げると未 clamp の後退シーク (`target = cur - |delta|`) で **常に成立**して
+  Shift+← (1 秒) が全く動かなくなる、という二択になってしまう (どちらも 2026-05 報告)。
+  絶対位置判定なら粒度に依存せず「先頭から 1 秒以内なら先頭扱い」で済む。
+
+加えて `seek_relative` は境界を検出したとき、**`is_eof_reached()` の場合に限り**
+pending な user seek と `seek_target_override` を
+`clear_seek_target_override(current_seek_serial())` で明示クリアする。直前の相対シークが
+末尾付近を target にして既に「シーク中...」固着状態になっているケースを、この境界判定の
+タイミングで回収するため (= 境界トーストと「シーク中...」が同時に出続ける症状の解消)。
+
+`is_eof_reached()` ガードが必須な理由 (Codex P1): 境界判定の `cur` は
+`user_seek_base_secs()` (= coalesce 中の pending target を優先) なので、←→ 押しっぱなし
+で pending target が clamp に到達すると、**実シークはまだ手前を向いている (= 正当な
+進行中 seek)** のに AtStart/AtEnd になり得る。ここで無条件にクリアすると、その正当な
+in-flight seek の override とまだ発行されていない pending seek を巻き込んで潰す。
+`is_eof_reached()` は demux が末尾まで読み切ったとき (= override がもう post-seek
+フレームを得られない固着状態) だけ true になるので、これでガードすれば固着時だけ掃除し、
+進行中 seek は通常経路 / tick 側保険に委ねられる。
+
+**stuck seek の tick 側保険解除**: `seek_relative` の境界回収は「次にもう一度 ←→ を
+押す」操作が前提なので、放置されたままだと「シーク中...」が残り続ける。これを潰す
+最終保険として `VideoPlayer::tick` 冒頭に、`is_seeking() && is_eof_reached()` が
+継続して true である時間を `seek_eof_stuck_since` で計測し、`SEEK_STUCK_EOF_TIMEOUT`
+(1200ms) を超えたら `seek_target_override` を強制クリアする処理を置く。
+`is_eof_reached()` は `request_seek` で一旦クリアされ demux が末尾まで読み切ったとき
+だけ true になるので、進行中の通常 seek は誤検出しない。通常の near-end seek は
+post-seek フレーム到着で override が clear されて `is_seeking()` が false になり、
+timeout に達する前にラッチが解除される。override をクリアするだけで playing / 位置の
+更新は行わず、その後の処理は EOF block (native / 非 native とも `set_position_at_eof`
++ `set_playing(false)`) が seek 固着の解けた状態で引き継ぐ。
+
+**native 経路の EOF 停止**: `tick` の native presenter ブロック (early return する
+`if self.native_output.is_some()`) は、以前は **ループ ON のときのループ seek しか
+処理していなかった**。native 経路はこの early return で抜けるため非 native 経路の
+EOF block (`set_position_at_eof` + `set_playing(false)`) に到達せず、ループ OFF で
+末尾に達すると `is_playing()` が true のままクロックが `duration` を超えて進み続けた
+(2026-05 報告「動画末尾を超えて再生が進む」)。現在は `quiet_now` の発火条件から
+`loop_enabled` を外し (ループ ON/OFF どちらでも EOF drain 完了を待つ)、発火後の
+アクションだけ `loop_enabled` で分岐する: ON ならループ seek、OFF なら
+`set_position_at_eof(duration)` + `set_playing(false)` で duration 位置に凍結停止する。
+これにより seek 固着解除 (上記) / `seek_relative` の境界 override クリアの後も、
+`is_seeking()` が false になり次第この EOF block がクロックを末尾で止める。
+
+**境界トーストの linger**: native overlay の `NativeOverlayToast` は表示維持時間を
+`linger: Duration` フィールドで個別に持つ。`show_toast` の `linger` 引数が `None` の
+ときは `centered` から既定値 (centered: 2.5s / それ以外: 1.8s) を導く (= 従来動作)。
+←→ ホットキーの境界トースト (「動画先頭です」「動画末尾です」) は
+`native_video_seek_relative_with_hint` から `Some(700ms)` を渡す。キーリピート中は
+repeat ごとに re-show されて `started_at` が更新され表示が維持され、キーを離すと
+700ms で消える (通常トーストの 2.5s 据え置きだとキーを離した後も長く残って煩わしい)。
+
 video packet は direct queue が満杯になると demux 側の `pending_video_packets`
 overflow に退避する。seek preroll 中に audio packet send が満杯で待っている場合も、
 audio の timeout 待ちごとにこの video overflow を opportunistic に drain し、

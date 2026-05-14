@@ -384,6 +384,10 @@ struct NativeOverlayToast {
     text: String,
     started_at: Instant,
     centered: bool,
+    /// このトーストを表示し続ける時間。`started_at` からこれを過ぎたら消す。
+    /// `show_toast` で `linger` 指定があればその値、無ければ `centered` から導いた
+    /// 既定値 (centered: 2.5s / それ以外: 1.8s) が入る。
+    linger: Duration,
 }
 
 pub struct NativePresentOutcome {
@@ -2093,9 +2097,14 @@ impl NativeVideoPresenter {
         }
     }
 
-    pub fn show_overlay_toast(&mut self, text: String, centered: bool) {
+    pub fn show_overlay_toast(
+        &mut self,
+        text: String,
+        centered: bool,
+        linger: Option<std::time::Duration>,
+    ) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
-            overlay.show_toast(text, centered);
+            overlay.show_toast(text, centered, linger);
         }
     }
 
@@ -3342,14 +3351,17 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
-    fn show_toast(&mut self, text: String, centered: bool) {
+    fn show_toast(&mut self, text: String, centered: bool, linger: Option<Duration>) {
         if text.trim().is_empty() {
             return;
         }
+        let linger =
+            linger.unwrap_or_else(|| Duration::from_millis(if centered { 2500 } else { 1800 }));
         self.toast = Some(NativeOverlayToast {
             text,
             started_at: Instant::now(),
             centered,
+            linger,
         });
         self.dirty = true;
     }
@@ -4106,10 +4118,11 @@ impl NativeEguiOverlay {
         if self.cursor_last_activity.is_none() {
             self.cursor_last_activity = Some(Instant::now());
         }
-        if self.toast.as_ref().is_some_and(|toast| {
-            toast.started_at.elapsed()
-                > Duration::from_millis(if toast.centered { 2500 } else { 1800 })
-        }) {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| toast.started_at.elapsed() > toast.linger)
+        {
             self.toast = None;
         }
         let seek_status_active = self.update_seek_status_for_render(render_t0);
