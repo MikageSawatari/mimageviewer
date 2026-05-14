@@ -2027,8 +2027,10 @@ impl App {
 
     /// タイル状態構築用の画面サイズ。native presenter の実クライアントサイズを優先し、
     /// 取得できない場合のみメインウィンドウの content rect にフォールバックする。
+    /// タイル生成系の呼び出し元 (native overlay 経路 / egui fullscreen 経路の両方) は
+    /// すべてこの関数を経由すること。
     #[cfg(windows)]
-    fn video_tile_layout_size(&self, fs_idx: usize, ctx: &egui::Context) -> egui::Vec2 {
+    pub(crate) fn video_tile_layout_size(&self, fs_idx: usize, ctx: &egui::Context) -> egui::Vec2 {
         self.native_video_overlay_size_points(fs_idx)
             .unwrap_or_else(|| ctx.content_rect().size())
     }

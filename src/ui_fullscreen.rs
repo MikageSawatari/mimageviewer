@@ -1506,7 +1506,7 @@ impl App {
                                         self.video_tile_reopen_pending = false;
                                         self.video_tile_reopen_deadline = None;
                                     } else {
-                                        let screen = ctx.content_rect().size();
+                                        let screen = self.video_tile_layout_size(fs_idx, ctx);
                                         self.toggle_video_tile_mode(fs_idx, screen);
                                         if self.video_tile_state.is_some() {
                                             self.video_tile_reopen_pending = false;
@@ -1640,7 +1640,7 @@ impl App {
                             // ▦ タイルボタンが押されたら toggle_video_tile_mode に dispatch
                             #[cfg(windows)]
                             if tile_pressed {
-                                let screen = ctx.content_rect().size();
+                                let screen = self.video_tile_layout_size(fs_idx, ctx);
                                 self.toggle_video_tile_mode(fs_idx, screen);
                             }
                             // VST ボタンが押されたら「管理パネル + 全プラグイン GUI」を一斉トグル。
@@ -5669,10 +5669,11 @@ impl App {
             let _ = (ctx, fs_idx);
         }
 
-        // Phase 5.5: S キーでタイルモード トグル。画面サイズは Context 側から取得。
+        // Phase 5.5: S キーでタイルモード トグル。画面サイズは native presenter の
+        // 実クライアントサイズ優先で取得 (取得不可なら content rect にフォールバック)。
         // toggle 内で fs_cache / video_tile_state を借用するので、player 借用後に呼ぶ。
         if tile_key {
-            let screen = ctx.content_rect().size();
+            let screen = self.video_tile_layout_size(fs_idx, ctx);
             self.toggle_video_tile_mode(fs_idx, screen);
         }
         if perf_key {
