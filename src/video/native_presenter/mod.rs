@@ -671,6 +671,13 @@ pub struct NativeOverlayInputRouting {
     pub wants_pointer_input: bool,
     pub wants_keyboard_input: bool,
     pub text_input_active: bool,
+    /// この egui パスが wheel イベントを `WheelNavigate` / `TileColumnsDelta` コマンドへ
+    /// 変換したか。true のとき同じ raw wheel イベントを `Window(MouseWheel)` として App へ
+    /// 二重転送しない (= overlay コマンドと App 側 wheel ハンドラの二重適用を防ぐ)。
+    /// タイルグリッドが `Order::Background` だと grid の余白上で egui の
+    /// `wants_pointer_input()` が false になり、これが無いと Ctrl+ホイールでの列数変更が
+    /// 2 ステップ進んでしまう。
+    pub consumed_wheel: bool,
 }
 
 pub struct NativeOverlayInputOutcome {
@@ -833,10 +840,12 @@ impl NativeOverlayInputRouting {
                 }
             }
             NativeEvent::Text(_) | NativeEvent::Ime(_) => !self.wants_keyboard_input,
-            NativeEvent::MouseMove(_)
-            | NativeEvent::MouseButton(_)
-            | NativeEvent::MouseWheel(_)
-            | NativeEvent::MouseLeave => !self.wants_pointer_input,
+            // overlay が wheel を WheelNavigate / TileColumnsDelta に変換済みなら、
+            // 同じ raw wheel を App へ二重転送しない。
+            NativeEvent::MouseWheel(_) => !self.wants_pointer_input && !self.consumed_wheel,
+            NativeEvent::MouseMove(_) | NativeEvent::MouseButton(_) | NativeEvent::MouseLeave => {
+                !self.wants_pointer_input
+            }
             // 内部処理イベント (presenter thread が直接消費する)。UI 転送しない。
             NativeEvent::GeometryChanged { .. }
             | NativeEvent::DpiChanged { .. }
@@ -3526,8 +3535,19 @@ impl NativeEguiOverlay {
         // native overlay には eframe の repaint callback が無いため、hover UI 表示中は
         // periodic tick で egui pass も回して delay 到達を拾う。
         let commands = self.render_once()?;
+        // overlay が wheel を WheelNavigate / TileColumnsDelta に変換したフレームでは、
+        // 同じ raw wheel イベントを App へ二重転送しないよう routing に印を付ける。
+        let consumed_wheel = commands.iter().any(|c| {
+            matches!(
+                c,
+                NativeOverlayCommand::WheelNavigate { .. }
+                    | NativeOverlayCommand::TileColumnsDelta { .. }
+            )
+        });
+        let mut routing = self.input_routing();
+        routing.consumed_wheel = consumed_wheel;
         Ok(NativeOverlayInputOutcome {
-            routing: self.input_routing(),
+            routing,
             commands,
             hud_regions: self.compute_hud_regions(),
         })
@@ -3930,6 +3950,8 @@ impl NativeEguiOverlay {
             wants_pointer_input: self.wants_pointer_input,
             wants_keyboard_input: self.wants_keyboard_input,
             text_input_active: self.text_input_active(),
+            // consumed_wheel は commands を見て render_if_dirty 側で設定する。
+            ..Default::default()
         }
     }
 
@@ -6084,7 +6106,9 @@ mod tests {
         compute_video_visual_transform, copy_cpu_rgba_to_swapchain_bgra, metadata_clean_text,
         native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel,
     };
-    use crate::video::native_window::{NativeVideoKeyEvent, NativeVideoWindowEvent};
+    use crate::video::native_window::{
+        NativeVideoKeyEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent,
+    };
 
     fn key(virtual_key: u32) -> NativeVideoKeyEvent {
         NativeVideoKeyEvent {
@@ -6094,6 +6118,47 @@ mod tests {
             alt: false,
             repeat: false,
         }
+    }
+
+    fn wheel(ctrl: bool) -> NativeVideoWindowEvent {
+        NativeVideoWindowEvent::MouseWheel(NativeVideoMouseWheelEvent {
+            delta: 120,
+            x: 100,
+            y: 100,
+            shift: false,
+            ctrl,
+        })
+    }
+
+    #[test]
+    fn native_overlay_does_not_double_forward_consumed_wheel() {
+        // overlay が wheel を WheelNavigate / TileColumnsDelta コマンドへ変換済みなら、
+        // wants_pointer_input が false でも raw wheel を App へ転送しない
+        // (= overlay コマンドと App 側 wheel ハンドラの二重適用を防ぐ)。
+        let consumed = NativeOverlayInputRouting {
+            wants_pointer_input: false,
+            consumed_wheel: true,
+            ..Default::default()
+        };
+        assert!(!consumed.should_forward_to_ui(&wheel(true)));
+        assert!(!consumed.should_forward_to_ui(&wheel(false)));
+
+        // 未消費 (= overlay 無効のフォールバック経路など) なら従来どおり
+        // wants_pointer_input 次第で転送する。
+        let fallback = NativeOverlayInputRouting {
+            wants_pointer_input: false,
+            consumed_wheel: false,
+            ..Default::default()
+        };
+        assert!(fallback.should_forward_to_ui(&wheel(true)));
+
+        // overlay UI 上 (wants_pointer_input=true) なら未消費でも転送しない。
+        let over_ui = NativeOverlayInputRouting {
+            wants_pointer_input: true,
+            consumed_wheel: false,
+            ..Default::default()
+        };
+        assert!(!over_ui.should_forward_to_ui(&wheel(true)));
     }
 
     #[test]
