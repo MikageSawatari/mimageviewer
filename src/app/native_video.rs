@@ -3117,6 +3117,10 @@ impl App {
 
         let source_epoch = self.next_native_video_source_epoch();
         let started_at = std::time::Instant::now();
+        // build_video_player_for_open 内で decoder::spawn が走るので、
+        // demux thread の avformat_open_input より前に bump する必要がある
+        // (Codex P2 第 16 ラウンド指摘)。
+        self.activity_gate.bump();
         let mut new_player = self.build_video_player_for_open(
             target_idx,
             target_path.clone(),

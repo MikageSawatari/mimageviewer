@@ -125,6 +125,10 @@ pub fn run_bulk_name_index(
             had_error = true;
             read_dir_logger.log(p, e);
         },
+        // 1 フォルダ内の entries ループ (file_type per entry) でも 64 件ごとに
+        // ActivityGate を見る。huge folder の file_type 連続呼び出しで indexer が
+        // HDD seek を握り続けないようにする。
+        activity_gate,
     );
     if cancel.load(Ordering::Relaxed) {
         summary.cancelled = true;
@@ -159,7 +163,13 @@ pub fn run_bulk_name_index(
         };
         // `collect_index_entries` が per-entry エラー (DirEntry::Err / file_type 失敗) を
         // 検知して had_entry_error=true で返す (Codex P2 第 11 レビュー指摘)。
-        let (children, had_entry_error) = collect_index_entries(entries, "name_bulk_indexer");
+        // yield_check で 64 entry ごとに ActivityGate を見る (動画オープン等で
+        // 中断したいケースの応答性向上)。
+        let (children, had_entry_error) = collect_index_entries(
+            entries,
+            "name_bulk_indexer",
+            activity_gate.map(|g| (g, cancel)),
+        );
         if had_entry_error {
             // **upsert を skip する** (Codex P2 第 12 レビュー指摘):
             // `upsert_children` は親直下を DELETE → INSERT で authoritative replace するので、
@@ -250,10 +260,30 @@ pub fn run_bulk_name_index(
 pub fn collect_index_entries(
     entries: std::fs::ReadDir,
     log_prefix: &str,
+    yield_check: Option<(&crate::activity_gate::ActivityGate, &AtomicBool)>,
 ) -> (Vec<IndexEntry>, bool) {
+    // 数千件規模のフォルダで `file_type()` を per-entry に呼ぶと HDD 上で
+    // 数百 ms-1s 単位の I/O 連続が発生し、その間に動画オープン等の高優先 I/O が
+    // 競合する。64 件ごとに ActivityGate を待ち、ユーザー操作中は次のバッチに
+    // 進まないようにする (= bump から最大 64 entry 分で indexer が停止)。
+    const YIELD_EVERY_N: usize = 64;
     let mut children: Vec<IndexEntry> = Vec::new();
     let mut had_entry_error = false;
+    let mut processed: usize = 0;
     for entry_result in entries {
+        if processed > 0
+            && processed % YIELD_EVERY_N == 0
+            && let Some((gate, cancel)) = yield_check
+        {
+            gate.wait_until_idle(cancel);
+            if cancel.load(Ordering::Relaxed) {
+                // 観測不完全 → 呼び出し側で upsert を skip させる (Codex P2 第 12
+                // レビュー以来の規約)。途中まで集めた children は破棄される。
+                had_entry_error = true;
+                break;
+            }
+        }
+        processed += 1;
         let entry = match entry_result {
             Ok(e) => e,
             Err(e) => {

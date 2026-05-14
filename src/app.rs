@@ -10865,6 +10865,14 @@ impl App {
                 );
                 #[cfg(windows)]
                 let native_config_missing = native_config.is_none();
+                // 動画オープン開始時点で indexer に「いま忙しい」を通知する。
+                // `build_video_player_for_open` 内で `VideoPlayer::open` → `decoder::spawn`
+                // が走り demux thread が即時に `avformat_open_input` を始めるので、
+                // build の **前** で bump しないと初動の数十-数百 ms が gate 無しに
+                // なる (Codex P2 第 16 ラウンド指摘)。入力イベント由来であれば
+                // 既に bump 済みだが、自動オープン経路や直前に bump が無い経路
+                // (fast-swap で再帰的に呼ばれる場合) の保険として明示的に bump する。
+                self.activity_gate.bump();
                 #[allow(unused_mut)]
                 let mut player = self.build_video_player_for_open(
                     idx,
@@ -13689,6 +13697,25 @@ impl App {
                         Some(prev) => prev.min(d),
                         None => d,
                     });
+                }
+                // prepare フェーズ中 (avformat_open_input / find_stream_info 実行中) は
+                // 毎フレーム bump して indexer の I/O を継続的に止める。`DEFAULT_QUIET_MS`
+                // (1000ms) の単発 bump だけでは moov atom が末尾配置で 1 秒を超える
+                // MP4 のときに途中で indexer が再開して HDD seek 衝突する。phase が
+                // DONE になった瞬間 bump が止まり、約 1 秒後に indexer が自然再開する
+                // (= 新規 state や明示解除コードは不要)。
+                //
+                // **error 条件も見る** (Codex P2 第 16 ラウンド指摘):
+                // `input_with_progress` 失敗時は phase が OPENING のまま return し、
+                // 以後 `self.error` だけ立つ。`fail_native_init()` 経路も同様で、
+                // 動画準備は失敗で確定しているのに phase が DONE に進まない。
+                // ここで error の有無も条件に入れないと、壊れた動画 / native init
+                // 失敗後も毎フレーム indexer を止め続ける状態が残る。
+                if player.error().is_none()
+                    && player.prep_progress().phase()
+                        != crate::video::avio_progress::prep_phase::DONE
+                {
+                    self.activity_gate.bump();
                 }
                 #[cfg(windows)]
                 {

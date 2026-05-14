@@ -484,7 +484,7 @@ fn handle_existing_path(
     let parent_refresh_ok = if path_equals(changed_path, favorite_root) {
         true
     } else if let Some(parent) = changed_path.parent() {
-        refresh_parent_listing(favorite_root, db, parent)
+        refresh_parent_listing(favorite_root, db, parent, cancel, activity_gate)
     } else {
         // changed_path に parent が無い (ルートそのもの) — favorite_root 配下なら通常起こらない
         true
@@ -529,7 +529,16 @@ fn handle_existing_path(
 /// いない状態を示し、呼び出し側は subtree prune を skip すべき (Codex P1 第 10
 /// レビュー指摘)。
 #[must_use]
-fn refresh_parent_listing(favorite_root: &Path, db: &SearchIndexDb, parent: &Path) -> bool {
+fn refresh_parent_listing(
+    favorite_root: &Path,
+    db: &SearchIndexDb,
+    parent: &Path,
+    // watcher event の parent refresh も 1 フォルダ規模で huge folder (1万件) が来うる
+    // (Codex P2 第 16 ラウンド指摘)。`collect_index_entries` に gate/cancel を渡し、
+    // entries ループ内で 64 件ごとに yield する。
+    cancel: &AtomicBool,
+    activity_gate: Option<&crate::activity_gate::ActivityGate>,
+) -> bool {
     let entries = match std::fs::read_dir(parent) {
         Ok(e) => e,
         Err(e) => {
@@ -550,7 +559,14 @@ fn refresh_parent_listing(favorite_root: &Path, db: &SearchIndexDb, parent: &Pat
             return false;
         }
     };
-    let (children, had_entry_error) = collect_index_entries(entries, "name_index parent refresh");
+    // parent refresh も huge folder では 1 万件級の file_type が走る。
+    // 動画オープン中などに HDD seek を握り続けないよう yield_check を渡す
+    // (Codex P2 第 16 ラウンド指摘)。
+    let (children, had_entry_error) = collect_index_entries(
+        entries,
+        "name_index parent refresh",
+        activity_gate.map(|g| (g, cancel)),
+    );
     if had_entry_error {
         // **upsert を skip する** (Codex P2 第 12 レビュー指摘):
         // 不完全 children で `upsert_children` を呼ぶと、観測できなかった legit 子エントリが
@@ -560,6 +576,16 @@ fn refresh_parent_listing(favorite_root: &Path, db: &SearchIndexDb, parent: &Pat
             "name_index: skipping upsert_children for parent {} (per-entry error: incomplete observation)",
             parent.display()
         ));
+        return false;
+    }
+    // **upsert 直前 cancel race ガード** (Codex P2 第 17 ラウンド指摘):
+    // `apply_favorite_name_index_change` は `signal_stop()` 後に join を別スレッドへ逃がしてから
+    // `clear_for_favorite` するため、既にここに入っていた supervisor が cancel 後に
+    // upsert を投げると、clear で消した行が再投入される窓が残る。`name_bulk_indexer` 側の
+    // 同種ガード ([src/name_bulk_indexer.rs] の upsert 直前 cancel check) と整合させる。
+    // 小さい親フォルダ (< 64 件) では `collect_index_entries` 内でも cancel に当たらないので
+    // ここで明示的に確認する。
+    if cancel.load(Ordering::Relaxed) {
         return false;
     }
     if let Err(e) = db.upsert_children(favorite_root, parent, &children) {
@@ -604,6 +630,8 @@ fn run_subtree_scan(
                 p.display()
             ));
         },
+        // huge folder の entries ループ内でも 64 件ごとに ActivityGate を見る。
+        activity_gate,
     );
 
     if cancel.load(Ordering::Relaxed) {
@@ -628,8 +656,13 @@ fn run_subtree_scan(
         };
         // `collect_index_entries` が per-entry エラー (DirEntry::Err / file_type 失敗) を
         // 検知して had_entry_error=true で返す (Codex P2 第 11 レビュー指摘)。
-        let (children, had_entry_error) =
-            collect_index_entries(entries, "name_index subtree scan Pass 2");
+        // yield_check で 64 entry ごとに ActivityGate を見る (大きいフォルダの
+        // file_type ループ中でも動画オープン等で indexer を即抑制できる)。
+        let (children, had_entry_error) = collect_index_entries(
+            entries,
+            "name_index subtree scan Pass 2",
+            activity_gate.map(|g| (g, cancel)),
+        );
         if had_entry_error {
             // **upsert を skip する** (Codex P2 第 12 レビュー指摘): 不完全 children で
             // `upsert_children` を呼ぶと観測できなかった legit 子エントリが親直下 DELETE で
@@ -641,6 +674,15 @@ fn run_subtree_scan(
                 folder.display()
             ));
             continue;
+        }
+        // **upsert 直前 cancel race ガード** (Codex P2 第 17 ラウンド指摘):
+        // `apply_favorite_name_index_change` の cancel → `clear_for_favorite` 直後に
+        // 古い supervisor が upsert を投げて clear 済み行を再投入する窓を最小化する。
+        // 小さい子フォルダ (< 64 件) では `collect_index_entries` 内 yield に到達せず
+        // cancel を見ない可能性があるため、ここで明示的に確認する。`name_bulk_indexer`
+        // 側の同種ガードと整合 ([src/name_bulk_indexer.rs] の `Codex P2 race 対策`)。
+        if cancel.load(Ordering::Relaxed) {
+            return SubtreeScanOutcome::Cancelled;
         }
         if let Err(e) = db.upsert_children(favorite_root, folder, &children) {
             had_error = true;

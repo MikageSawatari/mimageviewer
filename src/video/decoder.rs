@@ -1518,6 +1518,67 @@ pub fn spawn(
     }
 }
 
+/// 動画オープン (= prepare) フェーズ中だけ demux thread の CPU 優先度を
+/// `THREAD_PRIORITY_ABOVE_NORMAL` に上げる RAII ガード。Drop で元の優先度に戻す。
+///
+/// 目的: indexer 等のバックグラウンドワーカーが HDD seek を握っているときに、
+/// 動画オープンの moov atom 読み込みが OS スケジューラ上で割り込みやすくする。
+/// `THREAD_PRIORITY_TIME_CRITICAL` まで上げると他タスク (UI 描画含む) が長く
+/// 待たされる懸念があるので AboveNormal で十分。`audio.rs::boost_audio_pump_priority`
+/// と同じ階梯。
+#[cfg(windows)]
+struct DemuxPriorityBoost {
+    handle: windows::Win32::Foundation::HANDLE,
+    prev: windows::Win32::System::Threading::THREAD_PRIORITY,
+    restored: bool,
+}
+
+#[cfg(windows)]
+impl DemuxPriorityBoost {
+    fn begin() -> Option<Self> {
+        use windows::Win32::System::Threading::{
+            GetCurrentThread, GetThreadPriority, SetThreadPriority, THREAD_PRIORITY,
+            THREAD_PRIORITY_ABOVE_NORMAL,
+        };
+        unsafe {
+            let h = GetCurrentThread();
+            // GetThreadPriority は失敗時に i32::MAX (= THREAD_PRIORITY_ERROR_RETURN) を
+            // 返すが、windows crate には定数が無いので magic 値で比較する。
+            // 失敗ケースでは prev に i32::MAX を持つことになり、Drop の
+            // SetThreadPriority(_, i32::MAX) も無効値として失敗するが、副作用は
+            // 「AboveNormal のまま残る」だけで致命的でない。
+            let prev_raw = GetThreadPriority(h);
+            if prev_raw == i32::MAX {
+                crate::logger::log("[demux] GetThreadPriority failed; skipping boost");
+                return None;
+            }
+            if SetThreadPriority(h, THREAD_PRIORITY_ABOVE_NORMAL).is_err() {
+                crate::logger::log("[demux] SetThreadPriority(AboveNormal) failed");
+                return None;
+            }
+            Some(Self {
+                handle: h,
+                prev: THREAD_PRIORITY(prev_raw),
+                restored: false,
+            })
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DemuxPriorityBoost {
+    fn drop(&mut self) {
+        if self.restored {
+            return;
+        }
+        use windows::Win32::System::Threading::SetThreadPriority;
+        unsafe {
+            let _ = SetThreadPriority(self.handle, self.prev);
+        }
+        self.restored = true;
+    }
+}
+
 fn run_decoder(
     path: PathBuf,
     clock: Arc<AvClock>,
@@ -1574,14 +1635,21 @@ fn run_decoder(
     // を切り替え表示する。
     prep_progress.set_phase(crate::video::avio_progress::prep_phase::OPENING);
     let format_input_t0 = std::time::Instant::now();
-    let (mut input, timings) =
+    // prepare フェーズ中だけ demux thread の CPU 優先度を AboveNormal に上げる。
+    // Windows のスケジューラは CPU 優先度が高いスレッドの I/O 要求も優先キューに
+    // 入れやすくなるため、indexer (= 通常優先度) と HDD seek を取り合うときに
+    // 動画 read が割り込みやすくなる。RAII ガードで scope を抜けたら自動復元。
+    let (mut input, timings) = {
+        #[cfg(windows)]
+        let _prep_priority = DemuxPriorityBoost::begin();
         match crate::video::avio_progress::input_with_progress(&path, Arc::clone(&prep_progress)) {
             Ok(v) => v,
             Err(e) => {
                 let _ = info_tx.send(Err(format!("open input: {e}")));
                 return;
             }
-        };
+        }
+    };
     crate::logger::log(format!(
         "[demux] avformat_open_input done in {:.1}ms (cumulative {:.1}ms)",
         timings.open_input_ms,
