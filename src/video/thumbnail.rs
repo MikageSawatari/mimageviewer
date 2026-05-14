@@ -42,6 +42,8 @@ pub const SECONDS_PER_BUCKET: f64 = 0.5;
 /// 1 件のサムネイル (RGBA、`THUMB_W x THUMB_H` 固定とは限らないので w/h を持つ)。
 #[derive(Clone)]
 pub struct Thumbnail {
+    /// 実際にデコードできた frame の PTS (秒)。要求時刻ではなく実フレーム時刻なので、
+    /// UI 側はこれを使って「目標位置と合っているか」を正しく判定できる。
     pub target_secs: f64,
     pub width: u32,
     pub height: u32,
@@ -267,11 +269,12 @@ fn run_worker(
         decoder.flush();
 
         let mut got_frame: Option<Video> = None;
-        let mut video_packets_seen = 0;
-        let mut frames_tried = 0;
-        // video packet を最大 120 個まで処理する (= keyframe → target が
-        // 数秒先でも届く余裕)。subtitle/data ストリームのパケットは数えない
-        // (= take(120) を全 packet で数えると音声/字幕で枠を食い潰すため)。
+        let mut last_frame: Option<Video> = None;
+        // backward seek 後の keyframe から target_secs に到達する frame まで decode
+        // し続ける。decode 数に上限は設けない: 長い GOP (実測 5.5s ≈ 165 frame の
+        // 動画あり) でも必ず target のフレームを採用するため。上限を置くと GOP 長に
+        // よってサムネが再生開始位置からずれる。worker は cancel フラグを 1 パケット
+        // ごとに確認するので、別 target への切替時 (= Drop) は自然終了する。
         for item in input.packets() {
             if cancel.load(Ordering::Acquire) {
                 return;
@@ -283,10 +286,6 @@ fn run_worker(
             if stream.index() != stream_idx {
                 continue;
             }
-            video_packets_seen += 1;
-            if video_packets_seen > 120 {
-                break;
-            }
             if decoder.send_packet(&packet).is_err() {
                 continue;
             }
@@ -294,15 +293,18 @@ fn run_worker(
             while decoder.receive_frame(&mut frame).is_ok() {
                 let pts = frame.pts().unwrap_or(0);
                 let pts_secs = pts as f64 * tb_num / tb_den;
-                if pts_secs >= target_secs - SECONDS_PER_BUCKET {
+                // 再生で target_secs にシークしたとき表示される frame と一致させる
+                // ため「target_secs 以降の最初の frame」を採用する。以前は
+                // `target_secs - SECONDS_PER_BUCKET` で 0.5s 手前の frame を拾って
+                // いた (= ホバーサムネが再生開始位置とずれる一因)。
+                if pts_secs >= target_secs {
                     got_frame = Some(frame);
                     break;
                 }
-                frames_tried += 1;
-                if frames_tried > 60 {
-                    got_frame = Some(frame);
-                    break;
-                }
+                // target 未到達の frame は last_frame として保持。動画末尾付近の
+                // hover で target が最終フレームの pts を超え、EOF まで到達しない
+                // ケースの fallback に使う。
+                last_frame = Some(frame);
                 frame = Video::empty();
             }
             if got_frame.is_some() {
@@ -310,9 +312,18 @@ fn run_worker(
             }
         }
 
-        let Some(frame) = got_frame else {
+        let Some(frame) = got_frame.or(last_frame) else {
             continue;
         };
+        // 実際にデコードできた frame の PTS をサムネに記録する。要求 target_secs を
+        // そのまま保存すると、長い GOP で decode 上限に当たって target 手前の frame
+        // しか取れなかった場合に、UI 側の一致判定 (thumbnail_matches) が「正しい
+        // 時刻のサムネ」と誤認してしまう。実 PTS を持たせれば、ずれている間は
+        // 「シーク中」box が出て誤表示にならない。
+        let frame_pts_secs = frame
+            .pts()
+            .map(|pts| pts as f64 * tb_num / tb_den)
+            .unwrap_or(target_secs);
 
         // HW (D3D11) frame は SW download してから scaler に渡す。SW frame はそのまま。
         let mut sw_holder: Option<Video> = None;
@@ -372,7 +383,7 @@ fn run_worker(
         };
 
         let thumb = Thumbnail {
-            target_secs,
+            target_secs: frame_pts_secs,
             width: dst_w,
             height: dst_h,
             rgba: Arc::new(buf),

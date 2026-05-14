@@ -4926,31 +4926,50 @@ impl NativeEguiOverlay {
                                         (thumb.target_secs - target).abs()
                                             <= crate::video::thumbnail::SECONDS_PER_BUCKET * 2.0
                                     });
-                                if thumbnail_matches {
-                                    if let (Some(texture_id), Some(thumb)) =
-                                        (hover_texture_id, hover_thumbnail.as_ref())
-                                    {
-                                        let fitted = fit_rect_in_rect(
-                                            egui::vec2(thumb.width as f32, thumb.height as f32),
-                                            image_rect,
-                                        );
-                                        painter.image(
-                                            texture_id,
-                                            fitted,
-                                            egui::Rect::from_min_max(
-                                                egui::pos2(0.0, 0.0),
-                                                egui::pos2(1.0, 1.0),
-                                            ),
-                                            egui::Color32::WHITE,
-                                        );
-                                    }
-                                } else {
-                                    painter.text(
+                                // スクラブ中はサムネ画像を消さずに直近の 1 枚を出し
+                                // 続ける。以前は target に合うサムネが無い間「黒地 +
+                                // loading」を出していたため、スクラブ中にサムネ画像と
+                                // 黒地が交互に出てちらついていた。
+                                if let (Some(texture_id), Some(thumb)) =
+                                    (hover_texture_id, hover_thumbnail.as_ref())
+                                {
+                                    let fitted = fit_rect_in_rect(
+                                        egui::vec2(thumb.width as f32, thumb.height as f32),
+                                        image_rect,
+                                    );
+                                    painter.image(
+                                        texture_id,
+                                        fitted,
+                                        egui::Rect::from_min_max(
+                                            egui::pos2(0.0, 0.0),
+                                            egui::pos2(1.0, 1.0),
+                                        ),
+                                        egui::Color32::WHITE,
+                                    );
+                                }
+                                // 目標位置のサムネがまだ揃っていない間は、フルスクリーン
+                                // の「シーク中...」表示と同じ見た目の box を中央に重ねる
+                                // (サムネ未取得時は image_rect の gray 地の上に出る)。
+                                if !thumbnail_matches {
+                                    let font = egui::FontId::proportional(14.0);
+                                    let galley = painter.layout_no_wrap(
+                                        "シーク中".to_owned(),
+                                        font,
+                                        egui::Color32::from_rgb(238, 238, 238),
+                                    );
+                                    let box_rect = egui::Rect::from_center_size(
                                         image_rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        "loading",
-                                        egui::FontId::proportional(12.0),
-                                        egui::Color32::from_gray(150),
+                                        galley.size() + egui::vec2(28.0, 16.0),
+                                    );
+                                    painter.rect_filled(
+                                        box_rect,
+                                        6.0,
+                                        egui::Color32::from_rgba_unmultiplied(0, 0, 0, 214),
+                                    );
+                                    painter.galley(
+                                        box_rect.center() - galley.size() * 0.5,
+                                        galley,
+                                        egui::Color32::PLACEHOLDER,
                                     );
                                 }
 

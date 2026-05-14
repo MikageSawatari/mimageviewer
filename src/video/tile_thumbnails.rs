@@ -260,8 +260,12 @@ fn run_worker(
         decoder.flush();
 
         let mut got_frame: Option<Video> = None;
-        let mut video_packets_seen = 0;
-        let mut frames_tried = 0;
+        let mut last_frame: Option<Video> = None;
+        // backward seek 後の keyframe から target_secs に到達する frame まで decode
+        // し続ける。decode 数に上限は設けない: 長い GOP (実測 5.5s ≈ 165 frame の
+        // 動画あり) でも必ず target のフレームを採用するため。上限を置くと GOP 長に
+        // よってサムネが実位置からずれる。worker は cancel フラグを 1 パケットごとに
+        // 確認するので、別 interval / 動画への切替時は自然終了する。
         for item in input.packets() {
             if cancel.load(Ordering::Acquire) {
                 return;
@@ -273,10 +277,6 @@ fn run_worker(
             if stream.index() != stream_idx {
                 continue;
             }
-            video_packets_seen += 1;
-            if video_packets_seen > 120 {
-                break;
-            }
             if decoder.send_packet(&packet).is_err() {
                 continue;
             }
@@ -284,22 +284,24 @@ fn run_worker(
             while decoder.receive_frame(&mut frame).is_ok() {
                 let pts = frame.pts().unwrap_or(0);
                 let pts_secs = pts as f64 * tb_num / tb_den;
-                if pts_secs >= target_secs - 0.5 {
+                // クリックで target_secs にシークしたとき表示される frame と一致
+                // させるため「target_secs 以降の最初の frame」を採用する。以前は
+                // `target_secs - 0.5` で 0.5s 手前の frame を拾っていた。
+                if pts_secs >= target_secs {
                     got_frame = Some(frame);
                     break;
                 }
-                frames_tried += 1;
-                if frames_tried > 60 {
-                    got_frame = Some(frame);
-                    break;
-                }
+                // target 未到達の frame は last_frame として保持。動画末尾付近の
+                // タイムスタンプで target が最終フレームの pts を超えるケースの
+                // fallback に使う。
+                last_frame = Some(frame);
                 frame = Video::empty();
             }
             if got_frame.is_some() {
                 break;
             }
         }
-        let Some(frame) = got_frame else {
+        let Some(frame) = got_frame.or(last_frame) else {
             continue;
         };
         // HW (D3D11) frame は SW download してから scaler に渡す。SW frame はそのまま。

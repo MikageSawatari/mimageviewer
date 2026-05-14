@@ -692,7 +692,14 @@ overlay の中央 status に「メタデータ読込中...」「ストリーム�
 動画から複数フレームを一括抽出して並べる仕組み。
 
 - `tile_thumbnails.rs`: 一括サムネイル抽出 worker。指定動画から N 個の絶対 PTS で
-  フレーム取得 (FFmpeg seek 系統は `screenshot.rs` と同じ one-shot 方式)
+  フレーム取得 (FFmpeg seek 系統は `screenshot.rs` と同じ one-shot 方式)。
+  backward seek 後は **`pts >= target_secs` の最初のフレーム**を採用する
+  (= 再生で同位置にシークしたとき表示されるフレームと一致させる)。decode 数に
+  上限は設けない — 長尺 GOP でも必ず target に到達するため (上限を置くと GOP 長に
+  よってサムネが実位置からずれる)。EOF まで target に届かない末尾付近のケースは
+  最後にデコードできたフレームを fallback に使う。worker は cancel フラグを
+  1 パケットごとに確認するので別 interval / 動画への切替時は自然終了する。
+  同じ frame-selection は seek hover サムネ `thumbnail.rs` と共通
 - `tile_thumb_cache.rs`: SQLite + WebP の永続キャッシュ。**絶対 PTS をキー**にしているため
   動画の長さが変わっても再ヒットする (Phase 8.C の修正)
 - **抽出幅は `settings::VIDEO_TILE_EXTRACT_WIDTH` (640px) に固定**。列数・モニター解像度・
