@@ -534,6 +534,10 @@ pub fn process_load_request(
     cancel: Option<&Arc<AtomicBool>>,
     keep_start: &Arc<AtomicUsize>,
     keep_end: &Arc<AtomicUsize>,
+    // pin-aware auto-pick 用の DB ハンドル。`resolve_folder_thumb_image` が
+    // recursive auto-pick の各段でサブフォルダの pin を引いて leaf 画像へ
+    // cascade 解決する。`None` のとき従来の純粋 auto-pick になる。
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
 ) {
     // カタログキー:
     // - 通常画像: ファイル名 (例: "foo.jpg")
@@ -649,7 +653,9 @@ pub fn process_load_request(
     };
     let needs_heavy_io = is_folder_thumb || is_zip_thumb;
 
-    // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替え
+    // フォルダサムネイル: フォルダ内の画像を探して代表画像のパスに差し替え。
+    // pin-aware: 再帰中に見つけたサブフォルダに pin があれば cascade 解決して
+    // leaf 画像を採用する (= auto-pick が経由する子フォルダの pin を尊重)。
     let resolved_folder_image = if is_folder_thumb {
         let t_resolve = std::time::Instant::now();
         let img = resolve_folder_thumb_image(
@@ -657,6 +663,7 @@ pub fn process_load_request(
             req.folder_thumb_sort
                 .unwrap_or(crate::settings::SortOrder::Numeric),
             req.folder_thumb_depth,
+            pin_db,
         );
         let resolve_ms = t_resolve.elapsed().as_secs_f64() * 1000.0;
         if resolve_ms > 10.0 {
@@ -859,18 +866,25 @@ pub fn process_load_request(
 /// フォルダ内をスキャンして代表画像のパスを返す。
 /// `sort` で指定されたソート順で並べ、先頭の画像を選ぶ。
 /// 直接の子に画像がなければサブフォルダを再帰的に探索する（最大 `remaining_depth` 階層）。
+///
+/// `pin_db` が `Some` のとき、サブフォルダ再帰の各段で「そのサブフォルダ自身に
+/// folder_thumb_pin が設定されていないか」を確認する。設定されていれば cascade
+/// 解決して leaf 画像があればそれを採用する (= 親 grid に対して**自分の pin を
+/// 連鎖的に伝える**動作)。`None` のときは従来の純粋 auto-pick になる。
 fn resolve_folder_thumb_image(
     folder: &Path,
     sort: crate::settings::SortOrder,
     remaining_depth: u32,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
 ) -> Option<std::path::PathBuf> {
-    let result = resolve_folder_thumb_image_inner(folder, sort, remaining_depth);
+    let result = resolve_folder_thumb_image_inner(folder, sort, remaining_depth, pin_db);
     // pin 経路の切り分け用診断ログ (= 最上位 entry 点のみ。再帰ステップ内側は出さない)
     crate::logger::log(format!(
-        "  resolve_folder_thumb_image: folder={} sort={:?} depth={} -> {}",
+        "  resolve_folder_thumb_image: folder={} sort={:?} depth={} pin_aware={} -> {}",
         folder.display(),
         sort,
         remaining_depth,
+        pin_db.is_some(),
         result
             .as_ref()
             .map(|p| p.display().to_string())
@@ -883,6 +897,7 @@ fn resolve_folder_thumb_image_inner(
     folder: &Path,
     sort: crate::settings::SortOrder,
     remaining_depth: u32,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
 ) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(folder).ok()?;
     let mut images: Vec<(std::path::PathBuf, i64)> = Vec::new();
@@ -938,7 +953,51 @@ fn resolve_folder_thumb_image_inner(
                 )
         });
         for sub in &subdirs {
-            if let Some(img) = resolve_folder_thumb_image_inner(sub, sort, remaining_depth - 1) {
+            // pin-aware: サブフォルダ自身に pin があれば cascade 解決して
+            // leaf 画像を優先採用する。`folder_thumb_depth` を cascade depth 上限と
+            // 兼用する (= 設定値が両方の動作上限になる)。
+            if let Some(db) = pin_db {
+                if let Some(source) = db.lookup(sub) {
+                    let lookup = |p: &std::path::Path| db.lookup(p);
+                    if let Some(resolved) =
+                        crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+                            sub,
+                            &source,
+                            lookup,
+                            remaining_depth as usize,
+                        )
+                    {
+                        use crate::folder_thumb_pins::ResolvedKind;
+                        match resolved.kind {
+                            ResolvedKind::Image => {
+                                return Some(resolved.abs_path);
+                            }
+                            ResolvedKind::Folder => {
+                                // cascade が pin 無し Folder leaf に到達。
+                                // そのフォルダで通常の auto-pick を続ける (pin-aware で)。
+                                if let Some(img) = resolve_folder_thumb_image_inner(
+                                    &resolved.abs_path,
+                                    sort,
+                                    remaining_depth - 1,
+                                    pin_db,
+                                ) {
+                                    return Some(img);
+                                }
+                                // 見つからなければ次のサブフォルダへ
+                                continue;
+                            }
+                            // Video / ZipEntry / PdfPage / ZipFirstImage / PdfFirstPage:
+                            // PathBuf として返せないので、pin を尊重できない。
+                            // 標準再帰にフォールバックする。
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // 標準再帰 (pin 無し or 非 Image/Folder pin)
+            if let Some(img) =
+                resolve_folder_thumb_image_inner(sub, sort, remaining_depth - 1, pin_db)
+            {
                 return Some(img);
             }
         }

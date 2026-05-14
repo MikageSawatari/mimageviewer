@@ -29,6 +29,7 @@
 use rusqlite::{Connection, Result as SqlResult, params};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Mutex;
 
 /// ピン対象のうち通常ファイル / フォルダ系の種別。
 /// (ZipImage / PdfPage は `FolderPinSource::ZipEntry` / `PdfPage` に分離している)
@@ -250,8 +251,14 @@ impl From<rusqlite::Error> for FolderPinError {
 }
 
 /// ピン DB ハンドル。
+///
+/// `Mutex<Connection>` で内部状態を保護することで、`Arc<FolderThumbPinDb>` として
+/// 複数スレッドから共有可能にする (worker 側の `resolve_folder_thumb_image` から
+/// 任意のサブフォルダの pin を引くため)。SQLite 自体の WAL モードと組み合わせて
+/// 読み取り並列性は確保される。Mutex contention は典型ユースケースでは無視できる
+/// (= cascade lookups 数件程度 / フォルダロード)。
 pub struct FolderThumbPinDb {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 impl FolderThumbPinDb {
@@ -263,7 +270,9 @@ impl FolderThumbPinDb {
         }
         let conn = Connection::open(&path)?;
         Self::init_schema(&conn)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     fn db_path() -> PathBuf {
@@ -289,8 +298,8 @@ impl FolderThumbPinDb {
     /// 単一 container 用ピンを取得 (なければ `None`)。
     pub fn lookup(&self, container: &Path) -> Option<FolderPinSource> {
         let key = Self::container_key(container);
-        let mut stmt = self
-            .conn
+        let conn = self.conn.lock().ok()?;
+        let mut stmt = conn
             .prepare_cached(
                 "SELECT source_kind, source_rel, source_entry, source_page \
                  FROM folder_thumb_pins WHERE container_key = ?1",
@@ -333,6 +342,10 @@ impl FolderThumbPinDb {
         keys.dedup();
 
         let mut out = HashMap::new();
+        let conn = match self.conn.lock() {
+            Ok(c) => c,
+            Err(_) => return out,
+        };
         for chunk in keys.chunks(500) {
             let placeholders = (0..chunk.len())
                 .map(|i| format!("?{}", i + 1))
@@ -342,7 +355,7 @@ impl FolderThumbPinDb {
                 "SELECT container_key, source_kind, source_rel, source_entry, source_page \
                  FROM folder_thumb_pins WHERE container_key IN ({placeholders})"
             );
-            let mut stmt = match self.conn.prepare(&sql) {
+            let mut stmt = match conn.prepare(&sql) {
                 Ok(s) => s,
                 Err(e) => {
                     crate::logger::log(format!(
@@ -389,7 +402,11 @@ impl FolderThumbPinDb {
             FolderPinSource::ZipEntry { entry, .. } => (Some(entry.as_str()), None),
             FolderPinSource::PdfPage { page, .. } => (None, Some(*page as i64)),
         };
-        self.conn.execute(
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| FolderPinError::Sql(rusqlite::Error::InvalidQuery))?;
+        conn.execute(
             "INSERT INTO folder_thumb_pins (container_key, source_kind, source_rel, source_entry, source_page) \
              VALUES (?1, ?2, ?3, ?4, ?5) \
              ON CONFLICT(container_key) DO UPDATE SET \
@@ -405,7 +422,11 @@ impl FolderThumbPinDb {
     /// ピンを削除する (該当行が無くてもエラーにはならない)。
     pub fn remove(&self, container: &Path) -> Result<(), rusqlite::Error> {
         let key = Self::container_key(container);
-        self.conn.execute(
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.execute(
             "DELETE FROM folder_thumb_pins WHERE container_key = ?1",
             [&key],
         )?;
@@ -538,6 +559,71 @@ pub fn resolve_pin_target(container: &Path, source: &FolderPinSource) -> Option<
     })
 }
 
+/// cascade 解決の closure 版。`lookup` が `Fn(&Path) -> Option<FolderPinSource>` で、
+/// UI スレッドからは `pin_db.lookup(p)` を、worker スレッドからは `pin_db.lookup(p)` を
+/// (Arc 経由) ラップして渡す。
+///
+/// 仕様: `Folder` kind の resolve 結果を受け取ったら `lookup` でその container 自身の
+/// pin を取り、見つかれば cascade 続行。非 Folder kind に到達 / lookup 失敗 / サイクル /
+/// `max_depth` 超過のいずれかで停止し、最後の `ResolvedPinTarget` を返す。
+///
+/// `max_depth` は **追加 cascade 段数** (= immediate を 0 段目とする)。例えば `max_depth=3`
+/// で A→B→C→D の 3 段 cascade まで追跡可能。`Settings.folder_thumb_depth` と揃える。
+pub fn resolve_pin_target_cascaded_via<F>(
+    container: &Path,
+    immediate_source: &FolderPinSource,
+    lookup: F,
+    max_depth: usize,
+) -> Option<ResolvedPinTarget>
+where
+    F: Fn(&Path) -> Option<FolderPinSource>,
+{
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(crate::path_key::normalize_keep_drive(container));
+    let mut current_container: PathBuf = container.to_path_buf();
+    let mut current_source: FolderPinSource = immediate_source.clone();
+    let mut cascades_remaining = max_depth;
+    loop {
+        let resolved = resolve_pin_target(&current_container, &current_source)?;
+        if !matches!(resolved.kind, ResolvedKind::Folder) {
+            return Some(resolved);
+        }
+        if cascades_remaining == 0 {
+            return Some(resolved);
+        }
+        let next_container = resolved.abs_path.clone();
+        let next_key = crate::path_key::normalize_keep_drive(&next_container);
+        if visited.contains(&next_key) {
+            crate::logger::log(format!(
+                "folder_thumb_pin: cascade cycle at {} — stopping",
+                next_container.display(),
+            ));
+            return Some(resolved);
+        }
+        let Some(next_source) = lookup(&next_container) else {
+            return Some(resolved);
+        };
+        // Folder container の compat 規則 (= 任意の source kind を受け入れるが
+        // ZipEntry/PdfPage の zip_rel/pdf_rel は非空) を inline で適用。
+        let compatible = match &next_source {
+            FolderPinSource::File { .. } => true,
+            FolderPinSource::ZipEntry { zip_rel, .. } => !zip_rel.is_empty(),
+            FolderPinSource::PdfPage { pdf_rel, .. } => !pdf_rel.is_empty(),
+        };
+        if !compatible {
+            crate::logger::log(format!(
+                "folder_thumb_pin: cascade incompatible source at {} — stopping",
+                next_container.display(),
+            ));
+            return Some(resolved);
+        }
+        visited.insert(next_key);
+        current_container = next_container;
+        current_source = next_source;
+        cascades_remaining -= 1;
+    }
+}
+
 /// DB 行から `FolderPinSource` を組み立てる。検査に通らない行は `None` を返し、
 /// **どの行をなぜ skip したか**を `logger` 経由でログに出す (= ユーザーが DB を
 /// 手書きで触ったり、将来のスキーマ拡張で互換性が崩れた際に診断できるように)。
@@ -668,7 +754,9 @@ mod tests {
     fn open_in_memory() -> FolderThumbPinDb {
         let conn = Connection::open_in_memory().expect("memory db");
         FolderThumbPinDb::init_schema(&conn).expect("schema");
-        FolderThumbPinDb { conn }
+        FolderThumbPinDb {
+            conn: Mutex::new(conn),
+        }
     }
 
     #[test]
@@ -943,6 +1031,8 @@ mod tests {
         // lookup 側は decode_row で validate_source を再走するので None を返す。
         let db = open_in_memory();
         db.conn
+            .lock()
+            .unwrap()
             .execute(
                 "INSERT INTO folder_thumb_pins (container_key, source_kind, source_rel, source_entry, source_page) \
                  VALUES (?1, ?2, ?3, NULL, NULL)",

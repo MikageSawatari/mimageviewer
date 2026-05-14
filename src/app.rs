@@ -1860,7 +1860,11 @@ pub struct App {
     /// 親コンテナの代表サムネを手動で固定するためのピン DB。
     /// 解決優先度: 1) `folder_thumb_pin_db` の手動ピン → 2) `resolve_folder_thumb_image`
     /// の自動選定 → 3) アイコン fallback。
-    pub(crate) folder_thumb_pin_db: Option<crate::folder_thumb_pins::FolderThumbPinDb>,
+    /// `Arc` 経由で worker thread と共有して、auto-pick 再帰が経由するサブフォルダの
+    /// pin も検出する (pin-aware auto-pick)。内部 `Mutex<Connection>` で
+    /// マルチスレッド安全。
+    pub(crate) folder_thumb_pin_db:
+        Option<std::sync::Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
     /// 現在ロード済み items の親コンテナごとのピン source キャッシュ。
     /// `load_folder` 完了時に `lookup_many` で一括取得し、`make_load_request` から
     /// 同期参照する (per-frame DB アクセス回避)。キーは `normalize_keep_drive(container)`。
@@ -2669,6 +2673,7 @@ impl Default for App {
 
         let t = std::time::Instant::now();
         let folder_thumb_pin_db = crate::folder_thumb_pins::FolderThumbPinDb::open()
+            .map(std::sync::Arc::new)
             .map_err(|e| crate::logger::log(format!("folder_thumb_pin_db open failed: {e}")))
             .ok();
         crate::perf::emit_ms("startup", "db_open_folder_thumb_pins", 0, t);
@@ -3699,7 +3704,7 @@ impl App {
                 folder_thumb_existing_keys_for(
                     it,
                     &pin_map_for_existing,
-                    self.folder_thumb_pin_db.as_ref(),
+                    self.folder_thumb_pin_db.as_deref(),
                     self.settings.folder_thumb_depth as usize,
                 )
             })
@@ -4793,7 +4798,7 @@ impl App {
                 folder_thumb_existing_keys_for(
                     it,
                     &pin_map_for_existing,
-                    self.folder_thumb_pin_db.as_ref(),
+                    self.folder_thumb_pin_db.as_deref(),
                     self.settings.folder_thumb_depth as usize,
                 )
             })
@@ -5933,6 +5938,7 @@ impl App {
             heavy_io_queue,
             cache_map,
             catalog_arc,
+            self.folder_thumb_pin_db.clone(),
         );
         if !video_items.is_empty() {
             // Phase 8.B': ピン留めフレームを path → WebP の map で snapshot し
@@ -7076,6 +7082,7 @@ impl App {
             std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
         >,
         catalog_arc: Option<Arc<crate::catalog::CatalogDb>>,
+        pin_db: Option<Arc<crate::folder_thumb_pins::FolderThumbPinDb>>,
     ) {
         let total_threads = self.settings.parallelism.thread_count();
         // I/O ワーカー数: 2 本 (HDD シーク競合と並列性のバランス)
@@ -7112,6 +7119,10 @@ impl App {
             let ks_w = Arc::clone(&keep_start_shared);
             let ke_w = Arc::clone(&keep_end_shared);
             let ve_w = Arc::clone(&visible_end_shared);
+            // pin-aware auto-pick 用に worker thread にも pin DB を共有する。
+            // 内部 Mutex<Connection> で並列読みは serialize されるが、cascade lookup
+            // 件数は典型的に数件程度なので contention は無視できる。
+            let pin_db_w = pin_db.clone();
             let tag = format!("{prefix}{worker_idx}");
 
             std::thread::spawn(move || {
@@ -7226,6 +7237,7 @@ impl App {
                         Some(&cancel_w),
                         &ks_w,
                         &ke_w,
+                        pin_db_w.as_deref(),
                     );
                 }
                 crate::logger::log(format!("  {tag} stopped"));
@@ -8040,7 +8052,7 @@ impl App {
                     Some(self.settings.folder_thumb_sort),
                     self.settings.folder_thumb_depth,
                     &self.folder_pin_map,
-                    self.folder_thumb_pin_db.as_ref(),
+                    self.folder_thumb_pin_db.as_deref(),
                 )
             }) else {
                 continue;
@@ -8348,7 +8360,7 @@ impl App {
                     Some(self.settings.folder_thumb_sort),
                     self.settings.folder_thumb_depth,
                     &self.folder_pin_map,
-                    self.folder_thumb_pin_db.as_ref(),
+                    self.folder_thumb_pin_db.as_deref(),
                 )
             }) else {
                 continue;
@@ -16737,56 +16749,17 @@ fn resolve_pin_target_cascaded(
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     max_depth: usize,
 ) -> Option<crate::folder_thumb_pins::ResolvedPinTarget> {
-    use crate::folder_thumb_pins::ResolvedKind;
-    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-    visited.insert(crate::path_key::normalize_keep_drive(container));
-    let mut current_container: std::path::PathBuf = container.to_path_buf();
-    let mut current_source: crate::folder_thumb_pins::FolderPinSource = immediate_source.clone();
-    // immediate (= 1 段目) は無条件に解決、cascade は `max_depth` 回まで Folder leaf を
-    // 追跡する。例:
-    //   max_depth=0: cascade 無し (immediate のみ) — 旧 Phase B 互換
-    //   max_depth=3 (規定): A→B→C→D まで追跡可能 (immediate + 3 段 cascade)
-    let mut cascades_remaining = max_depth;
-    loop {
-        let resolved =
-            crate::folder_thumb_pins::resolve_pin_target(&current_container, &current_source)?;
-        // 非 Folder leaf に到達したら確定。
-        if !matches!(resolved.kind, ResolvedKind::Folder) {
-            return Some(resolved);
-        }
-        // Folder leaf: cascade 残量があり、さらに pin があれば続行。
-        if cascades_remaining == 0 {
-            return Some(resolved);
-        }
-        let Some(db) = pin_db else {
-            return Some(resolved);
-        };
-        let next_container = resolved.abs_path.clone();
-        let next_key = crate::path_key::normalize_keep_drive(&next_container);
-        if visited.contains(&next_key) {
-            crate::logger::log(format!(
-                "folder_thumb_pin: cascade cycle at {} — stopping",
-                next_container.display(),
-            ));
-            return Some(resolved);
-        }
-        let Some(next_source) = db.lookup(&next_container) else {
-            // この Folder には pin が無いので FolderRepresentative で auto-pick する。
-            return Some(resolved);
-        };
-        // container kind は Folder で固定 (cascade は Folder→Folder のみ追跡)
-        if !pin_source_compatible_with_container(ContainerKindForPin::Folder, &next_source) {
-            crate::logger::log(format!(
-                "folder_thumb_pin: cascade incompatible source at {} — stopping",
-                next_container.display(),
-            ));
-            return Some(resolved);
-        }
-        visited.insert(next_key);
-        current_container = next_container;
-        current_source = next_source;
-        cascades_remaining -= 1;
-    }
+    // closure 版に委譲。worker 側 (`resolve_folder_thumb_image`) でも同じヘルパーを
+    // 異なる lookup closure で再利用する。
+    let lookup = |p: &std::path::Path| -> Option<crate::folder_thumb_pins::FolderPinSource> {
+        pin_db.and_then(|db| db.lookup(p))
+    };
+    crate::folder_thumb_pins::resolve_pin_target_cascaded_via(
+        container,
+        immediate_source,
+        lookup,
+        max_depth,
+    )
 }
 
 /// 親コンテナ用 `LoadRequest` (Folder/ZipFile/PdfFile) に対し、手動ピンがあれば
