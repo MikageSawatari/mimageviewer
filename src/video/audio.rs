@@ -315,7 +315,17 @@ fn drain_stale_audio_rx(
 
 const SAFETY_LIMITER_LOOKAHEAD_SECS: f64 = 0.005;
 const SAFETY_LIMITER_RELEASE_SECS: f64 = 0.100;
-const SAFETY_LIMITER_CEILING_DBFS: f32 = -1.0;
+/// セーフティリミッターが信号を抑え込む上限。0 dBFS = フルスケール = 波形表現の上限
+/// そのもの。これを超えた分だけゲインを下げて hard clip を防ぐ。視聴用の保護なので
+/// true peak ヘッドルーム (-1 dBTP 等) は確保しない — それは制作・配信側のガイドライン
+/// であって、再生プレイヤーの義務ではない。
+const SAFETY_LIMITER_CEILING_DBFS: f32 = 0.0;
+/// ピークランプ点灯のしきい値 (ゲインリダクション量)。リミッターが「ceiling に
+/// 触れた瞬間」ではなく、ゲインリダクションがこの dB 以上に達したブロックでだけ
+/// 点灯させる。タイムストレッチ由来の 1 dB 未満の微小オーバーや f32 演算誤差では
+/// 点かず、VST / 音量 boost / normalize boost で実際に gain staging が破綻して
+/// 可聴な抑え込みが起きたときだけ点く。
+const SAFETY_LIMITER_INDICATOR_GR_DB: f32 = 1.0;
 
 /// VST3 チェーン後段と 0dB 超の手動音量 boost の保険用 lookahead limiter。
 ///
@@ -331,6 +341,10 @@ struct SafetyLimiter {
     write_frame: usize,
     gain: f32,
     ceiling: f32,
+    /// ピークランプ点灯のしきい値 (線形ゲイン)。ブロック内で要求ゲイン
+    /// (`target_gain`) がこの値以下になったら `process_block` が true を返す。
+    /// `10^(-SAFETY_LIMITER_INDICATOR_GR_DB / 20)`。
+    indicator_gain_threshold: f32,
     release_coeff: f32,
     sample_rate: u32,
 }
@@ -342,6 +356,7 @@ impl SafetyLimiter {
         let release_coeff =
             (-1.0_f32 / (SAFETY_LIMITER_RELEASE_SECS as f32 * sample_rate as f32)).exp();
         let ceiling = 10.0_f32.powf(SAFETY_LIMITER_CEILING_DBFS / 20.0);
+        let indicator_gain_threshold = 10.0_f32.powf(-SAFETY_LIMITER_INDICATOR_GR_DB / 20.0);
         Self {
             channels,
             lookahead_frames,
@@ -350,6 +365,7 @@ impl SafetyLimiter {
             write_frame: 0,
             gain: 1.0,
             ceiling,
+            indicator_gain_threshold,
             release_coeff,
             sample_rate,
         }
@@ -365,19 +381,21 @@ impl SafetyLimiter {
         self.gain = 1.0;
     }
 
-    /// Returns true when the block would exceed the ceiling after the RT output gain is applied.
-    fn process_block(&mut self, samples: &mut [f32], final_output_gain: f32) -> bool {
+    /// ブロックを処理する。**ゲインリダクション量が `SAFETY_LIMITER_INDICATOR_GR_DB`
+    /// dB 以上に達した** (= 要求ゲインが `indicator_gain_threshold` 以下になった)
+    /// 場合に true を返す。これはピークランプを点灯すべきかの判定で、リミッター本体は
+    /// ceiling を超えた分を常に抑え込む — ランプだけがこのしきい値を持つ。
+    ///
+    /// 判定は音量フェーダー (出力ゲイン) に依存しない。リミッターはフェーダー前段で
+    /// 内部信号に作用するので、戻り値は「内部チェーンが 0 dBFS をどれだけ超えたか」を
+    /// そのまま表す。
+    fn process_block(&mut self, samples: &mut [f32]) -> bool {
         if samples.is_empty() || self.channels == 0 {
             return false;
         }
         debug_assert_eq!(samples.len() % self.channels, 0);
 
-        let final_output_gain = if final_output_gain.is_finite() {
-            final_output_gain.clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        let mut ceiling_hit = false;
+        let mut min_target_gain = 1.0_f32;
         let frames = samples.len() / self.channels;
         for frame in 0..frames {
             let in_base = frame * self.channels;
@@ -394,14 +412,12 @@ impl SafetyLimiter {
                 peak = peak.max(v.abs());
             }
 
-            if peak * final_output_gain > self.ceiling {
-                ceiling_hit = true;
-            }
             let target_gain = if peak > self.ceiling {
                 (self.ceiling / peak).min(1.0)
             } else {
                 1.0
             };
+            min_target_gain = min_target_gain.min(target_gain);
             if target_gain < self.gain {
                 self.gain = target_gain;
             } else {
@@ -413,7 +429,7 @@ impl SafetyLimiter {
             }
             self.write_frame = (self.write_frame + 1) % self.lookahead_frames;
         }
-        ceiling_hit
+        min_target_gain <= self.indicator_gain_threshold
     }
 }
 
@@ -1026,7 +1042,7 @@ fn run_pump(
             let limiter_active =
                 vst_chain_active || pre_limiter_gain > 1.0 || normalize_boost_active;
             if limiter_active {
-                if safety_limiter.process_block(&mut output_samples, clock.output_volume()) {
+                if safety_limiter.process_block(&mut output_samples) {
                     clock.mark_limiter_ceiling_hit();
                 }
                 current_pdc_latency_secs += safety_limiter.latency_secs();
@@ -1778,7 +1794,7 @@ mod tests {
         let mut samples = vec![0.0_f32; 12];
         samples[0] = 0.5;
         samples[1] = -0.5;
-        assert!(!limiter.process_block(&mut samples, 1.0));
+        assert!(!limiter.process_block(&mut samples));
 
         assert!(
             samples[..10].iter().all(|&v| v == 0.0),
@@ -1797,7 +1813,7 @@ mod tests {
         samples[2] = 2.0;
         samples[3] = -2.0;
 
-        assert!(limiter.process_block(&mut samples, 1.0));
+        assert!(limiter.process_block(&mut samples));
 
         let ceiling = limiter.ceiling;
         let max_abs = samples.iter().fold(0.0_f32, |acc, &v| acc.max(v.abs()));
@@ -1812,29 +1828,43 @@ mod tests {
     }
 
     #[test]
-    fn safety_limiter_indicator_respects_final_output_gain() {
+    fn safety_limiter_passes_signal_below_full_scale() {
+        // -1 dBFS ~ 0 dBFS の素材は ceiling (0 dBFS) を超えないので素通し。
+        // 旧 ceiling (-1 dBFS) では抑えられていたケースが、そのまま通ることを確認する。
         let mut limiter = SafetyLimiter::new(1_000, 2);
         let mut samples = vec![0.0_f32; 18];
-        samples[0] = 2.0;
-        samples[1] = -2.0;
+        samples[0] = 0.95; // ≈ -0.45 dBFS
+        samples[1] = -0.95;
+        assert!(!limiter.process_block(&mut samples));
+        assert!((samples[10] - 0.95).abs() < 1e-6);
+        assert!((samples[11] + 0.95).abs() < 1e-6);
+    }
 
-        assert!(!limiter.process_block(&mut samples, 0.1));
-        let ceiling = limiter.ceiling;
+    #[test]
+    fn safety_limiter_indicator_ignores_sub_threshold_overshoot() {
+        // ceiling を ~0.5 dB だけ超えるピーク: リミッターは抑え込むが、ゲイン
+        // リダクションが SAFETY_LIMITER_INDICATOR_GR_DB (1 dB) 未満なので
+        // ピークランプは点かない (タイムストレッチの微小オーバー相当)。
+        let mut limiter = SafetyLimiter::new(1_000, 2);
+        let mut samples = vec![0.0_f32; 18];
+        samples[0] = 1.06;
+        samples[1] = -1.06;
+        assert!(!limiter.process_block(&mut samples));
         let max_abs = samples.iter().fold(0.0_f32, |acc, &v| acc.max(v.abs()));
         assert!(
-            max_abs <= ceiling + 1e-6,
-            "safety limiter should still protect its buffered output"
+            max_abs <= limiter.ceiling + 1e-6,
+            "limiter still protects the output even below the indicator threshold"
         );
     }
 
     #[test]
-    fn safety_limiter_indicator_uses_peak_after_output_gain() {
+    fn safety_limiter_indicator_fires_on_one_db_reduction() {
+        // 1 dB 以上のゲインリダクションを要するピーク → ピークランプ点灯。
         let mut limiter = SafetyLimiter::new(1_000, 2);
         let mut samples = vec![0.0_f32; 18];
-        samples[0] = 2.0;
-        samples[1] = -2.0;
-
-        assert!(limiter.process_block(&mut samples, 0.5));
+        samples[0] = 1.5;
+        samples[1] = -1.5;
+        assert!(limiter.process_block(&mut samples));
     }
 
     #[test]
@@ -1843,14 +1873,14 @@ mod tests {
         let mut first = vec![0.0_f32; 6];
         first[0] = 0.5;
         first[1] = -0.5;
-        assert!(!limiter.process_block(&mut first, 1.0));
+        assert!(!limiter.process_block(&mut first));
         assert!(
             first.iter().all(|&v| v == 0.0),
             "first block is shorter than lookahead, so it should be delayed"
         );
 
         let mut second = vec![0.0_f32; 6];
-        assert!(!limiter.process_block(&mut second, 1.0));
+        assert!(!limiter.process_block(&mut second));
         assert!((second[4] - 0.5).abs() < 1e-6);
         assert!((second[5] + 0.5).abs() < 1e-6);
     }
@@ -1861,7 +1891,7 @@ mod tests {
         let mut loud = vec![0.0_f32; 14];
         loud[0] = 2.0;
         loud[1] = -2.0;
-        assert!(limiter.process_block(&mut loud, 1.0));
+        assert!(limiter.process_block(&mut loud));
         let gain_after_peak = limiter.gain;
         assert!(
             gain_after_peak < 0.6,
@@ -1869,7 +1899,7 @@ mod tests {
         );
 
         let mut quiet = vec![0.0_f32; 200];
-        assert!(!limiter.process_block(&mut quiet, 1.0));
+        assert!(!limiter.process_block(&mut quiet));
         assert!(
             limiter.gain > gain_after_peak,
             "gain should recover across later blocks"
@@ -1881,11 +1911,11 @@ mod tests {
     fn safety_limiter_reset_clears_delay_line() {
         let mut limiter = SafetyLimiter::new(1_000, 2);
         let mut samples = vec![0.5_f32; 12];
-        assert!(!limiter.process_block(&mut samples, 1.0));
+        assert!(!limiter.process_block(&mut samples));
         limiter.reset();
 
         let mut silence = vec![0.0_f32; 12];
-        assert!(!limiter.process_block(&mut silence, 1.0));
+        assert!(!limiter.process_block(&mut silence));
         assert!(
             silence.iter().all(|&v| v == 0.0),
             "reset should prevent old delayed audio from leaking"

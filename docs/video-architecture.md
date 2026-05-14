@@ -501,9 +501,14 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   0dB 超の分は `audio-pump` で safety limiter の前に preamp gain として掛け、
   `fill_output` 側の RT 音量は最大 0dB に抑える。これにより 0dB 以下の音量変更は従来通り
   低レイテンシで、boost 時だけ limiter の 5ms lookahead を PDC latency として扱う。
-  safety limiter が最終出力の ceiling 超過を検出した場合は `AvClock` の sequence を増やし、
-  native HUD の音量表示右側に赤いインジケータを約 500ms 表示する。ユーザー音量が低く、
-  最終出力が ceiling 未満に収まる場合は indicator だけを出さない。
+  safety limiter の ceiling は 0 dBFS (= フルスケール) で、これを超えた分だけゲインを
+  下げて hard clip を防ぐ。**赤いピークインジケータは「ceiling に触れた瞬間」ではなく、
+  ゲインリダクション量が `SAFETY_LIMITER_INDICATOR_GR_DB` (1 dB) 以上に達したブロックで
+  だけ点灯する** — タイムストレッチ由来の 1 dB 未満の微小オーバーや f32 演算誤差では
+  点かず、VST / 音量 boost / normalize boost で実際に gain staging が破綻したときだけ
+  点く。点灯時は `AvClock` の sequence を増やし、native HUD の音量表示右側に約 500ms
+  表示する。判定は音量フェーダーに依存しない (リミッターはフェーダー前段で内部信号に
+  作用するため、戻り値は内部チェーンが 0 dBFS をどれだけ超えたかをそのまま表す)。
 - 現在フレームのクリップボードコピーは `screenshot.rs` の one-shot worker で別 FFmpeg
   input を開き、最後に表示済みの source pts 近傍をフル解像度 RGBA に変換してから
   既存の CF_DIB clipboard helper へ渡す。メイン decode queue / native presenter の GPU

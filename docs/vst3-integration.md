@@ -259,10 +259,12 @@ decoder → audio_rx → audio-pump thread:
   bridge IPC roundtrip (~1-2ms) を AudioBuffer の processed depth (100ms) で吸収する。
 - **VST3 チェーン後段と手動音量 boost には安全 limiter を入れる**。ユーザーが limiter
   プラグインを末尾に挿していない場合、および動画音量を 0dB 超にした場合の保険で、
-  5ms lookahead / -1dBFS ceiling / 100ms release の固定 sample-peak limiter とする。
+  5ms lookahead / 0dBFS ceiling / 100ms release の固定 sample-peak limiter とする。
   true-peak limiter ではないため inter-sample peak は完全保証しないが、視聴時の hard
   clip 保険として扱う。VST3 が無効、active plugin が無く、音量も 0dB 以下の場合は
-  完全に bypass する。
+  完全に bypass する。ピークインジケータは「ceiling に触れた瞬間」ではなく、ゲイン
+  リダクション量が 1dB 以上に達したときだけ点灯する (詳細は
+  [video-architecture.md](video-architecture.md) のリミッター節)。
 - **enable=false なら処理ゼロオーバーヘッド**。frame をそのまま push。
 - **bridge unload 中も音声は流れる**。ロード前は plugin pass-through (= 何もしない)。
 - **block size は decoder のフレームサイズに依存しない**。bridge 側で variable
@@ -445,7 +447,7 @@ CLAUDE.md の「リリース手順チェックリスト」に追記:
 - [ ] Pro-Q 4 等の商用プラグインで音声経路を実機確認
 - [ ] 動画再生中の VST3 パネルから全体表示 / 個別 GUI / bypass が操作できること
 - [ ] settings.db に `vst3_plugins[].state` が保存され、再起動で復元されること
-- [ ] safety limiter 有効時に過大出力が -1dBFS ceiling 以下に抑えられること
+- [ ] safety limiter 有効時に過大出力が 0dBFS ceiling 以下に抑えられること
 # 2026-05 chain bridge migration (実装済)
 
 ⚠️ 旧版「1 bridge per plugin」→「1 bridge per chain」への移行は v0.9.0 リリース前

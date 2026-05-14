@@ -137,7 +137,7 @@ mIV v0.9.0 の VST3 プラグイン処理機能について、**完了 / 進行�
 - [x] VST3 チェーンが active のときだけ、audio-pump 側で後段 safety limiter を適用する。
   - 目的: ユーザーがチェーン末尾に limiter を入れなかった場合の音割れ保険。
   - `cpal` callback ではなく `raw → VST process → processed` の直後で処理し、RT callback に処理を増やさない。
-  - lookahead 5ms、ceiling -1dBFS、release 100ms の固定 sample-peak limiter。
+  - lookahead 5ms、ceiling -1dBFS (現在は 0dBFS に変更済、video-architecture.md 参照)、release 100ms の固定 sample-peak limiter。
   - limiter 遅延は PDC latency に加算し、映像同期に反映する。
 - [ ] peak / gain reduction / OVER 表示は後続。Limiter 自体の保護動作とは独立して追加可能。
 
