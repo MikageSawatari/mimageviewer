@@ -65,7 +65,8 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `app.rs` | `App` 構造体と `eframe::App` 実装。状態遷移の中心 |
 | `app/native_video.rs` | Windows native video presenter から戻る overlay event / key / mouse / marker / VST3 操作の App 側処理 |
 | `app/tests.rs` | `App` 周辺の unit test / App-level 状態機械テスト |
-| `settings.rs` | 設定の JSON 永続化 (`%APPDATA%/mimageviewer/settings.json`) |
+| `settings.rs` | 設定の永続化 API (`Settings::load` / `save`)。Phase 3 で SQLite 経路に切替 (= `settings_db::boot_settings_db` / `with_db_result` 経由)。旧 JSON 経路 (`try_load_with_recovery` / `rotate_backups` / `write_atomic` 等) は `#[allow(dead_code)]` で残置 (将来削除予定) |
+| `settings_db.rs` | 設定永続化 SQLite バックエンド (`%APPDATA%/mimageviewer/settings.db`)。spec §5 の起動決定木 (`boot_settings_db`)、世代バックアップ (`SettingsDb::rotate_backups` で `bak1..bak10`)、JSON migration (`migrate_from_settings_json`)、quarantine (`quarantine_db_files`)、save 抑止フラグ (`save_suppressed`) を提供。詳細は [docs/settings-sqlite-migration.md](settings-sqlite-migration.md) |
 | `data_dir.rs` | `%APPDATA%/mimageviewer/` のパス解決 |
 | `logger.rs` | パフォーマンス分析用ファイルロガー (`mimageviewer.log`) |
 | `stats.rs` | 読み込み統計の集計 |
@@ -201,7 +202,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 
 | ファイル | 内容 | 書き込むモジュール |
 | --- | --- | --- |
-| `settings.json` | アプリ全体設定・グローバルプリセット・保存スロット・お気に入り (`FavoriteEntry { id: Uuid, name, path, auto_index_{structure,metadata,thumbs} }`)・タグ定義 (`Vec<TagDef>`)。**保存はアトミック (.tmp → rename)、起動 1 回ごとに `settings.json.bak1..bak10` に世代退避**。パース失敗時は `.broken-<TS>` に隔離して bak1→bak10 を新→古で試行し復旧。バージョン跨ぎは初回 load で `settings.json.preupgrade-v<old>` にスナップショット。**main が I/O エラー (権限拒否・ロック・ディレクトリ衝突等) で読めなかったセッションでは `Settings::save()` を完全に no-op 化** (= rotate / write_atomic で本物の main を上書きする事故を防ぐ) | `settings.rs` |
+| `settings.db` (SQLite, 2026-05 移行) | アプリ全体設定・グローバルプリセット・保存スロット・お気に入り (`FavoriteEntry { id: Uuid, name, path, auto_index_{structure,metadata,thumbs} }`)・タグ定義 (`Vec<TagDef>`)・VST3 chain 設定 (大型 BLOB)。**SQLite トランザクション + `VACUUM INTO` で `settings.db.bak1..bak10` に世代スナップショット**。Corrupted 検出時は `.corrupted-<ts>-<seq>` 3 セット (main + WAL + SHM) で quarantine、bak1→bak10 を新→古で試行し復旧。バージョン跨ぎは初回 load で `settings.db.preupgrade-v<old>` を `VACUUM INTO` でスナップショット。**Transient I/O / 全復旧失敗時は `MAIN_UNREADABLE_THIS_SESSION` + `settings_db::SAVE_SUPPRESSED` で `Settings::save()` 完全 no-op 化** (= 残骸保護)。旧 `settings.json` は初回起動時に migration して `*.migrated-<ts>` にリネーム済み | `settings.rs` + `settings_db.rs` |
 | `catalog.db` | サムネイル WebP キャッシュ (BLOB) + メタデータ | `catalog.rs` |
 | `rotation.db` | 非破壊回転角 (0/90/180/270) | `rotation_db.rs` |
 | `audio_normalize.db` | 動画ファイル単位のノーマライズ測定値 (integrated LUFS / true peak / 算出ゲイン)。主キー `(path_lower, file_size, mtime_ms, target_lufs_milli)` | `audio_normalize_db.rs` |
@@ -216,7 +217,7 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `pdfium.dll` | 初回起動時に exe から展開 | `main.rs` |
 | `models/*.onnx` | 初回起動時に exe から展開 | `ai/model_manager.rs` |
 | `mimageviewer.log` | 起動ごとに truncate。実行中は 16 MiB 超で `mimageviewer.log.bak` にローテーション | `logger.rs` |
-| `logs/settings.log` | 設定復旧経路の永続診断ログ。**logger 未初期化 (= release ビルドで `--log` なし) でも常に append される独立 sink**。パース失敗 / quarantine / bak 復旧 / preupgrade snapshot / save 抑止のイベントが残る。再現が難しい設定リセット系報告の事後解析用 | `settings.rs` (`settings_diag_log`) |
+| `logs/settings.log` | 設定復旧経路の永続診断ログ。**logger 未初期化 (= release ビルドで `--log` なし) でも常に append される独立 sink**。SQLite open 時の primary code + extended code、bak 復旧の経路、quarantine、preupgrade snapshot、save 抑止のイベントが残る。再現が難しい設定リセット系報告の事後解析用 | `settings.rs` (`settings_diag_log`) + `settings_db.rs` (`log_diag`) |
 
 **パスキーの正規化**: Windows は大文字小文字非区別なので、すべての DB は **小文字化 + バックスラッシュ→スラッシュ** に正規化してから格納する。新しい DB を追加するときも同じ規約に従う (`rotation_db.rs` / `adjustment_db.rs` を参照)。
 

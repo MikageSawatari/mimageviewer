@@ -109,7 +109,8 @@ mimageviewer/
 │   ├── png_metadata.rs      # AI 画像メタデータ読み取り（PNG tEXt/iTXt/zTXt）
 │   ├── exif_reader.rs       # EXIF 読み取り（rexif クレート）
 │   ├── rotation_db.rs       # 回転情報 DB（SQLite、非破壊回転）
-│   ├── settings.rs          # 設定の読み書き（JSON 永続化）
+│   ├── settings.rs          # 設定の読み書き API (Phase 3 で SQLite 経路に切替)
+│   ├── settings_db.rs       # 設定永続化 SQLite バックエンド (settings.db、bak1..bak10 世代、JSON migration、boot decision tree、quarantine)
 │   ├── catalog.rs           # SQLite サムネイルカタログ
 │   ├── folder_tree.rs       # フォルダツリー走査ヘルパー
 │   ├── grid_item.rs         # GridItem（Folder/Image/Video/ZipFile/PdfFile/ZipImage/PdfPage/ZipSeparator）/ ThumbnailState 定義

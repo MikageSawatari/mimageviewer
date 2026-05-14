@@ -3,6 +3,32 @@
 `%APPDATA%\mimageviewer\settings.json` をベースにした現行の設定永続化を、SQLite (`settings.db`)
 に移行する。本ドキュメントは仕様確定版で、Phase 0 から実装着手するための spec。
 
+## ステータス (2026-05-14)
+
+**Phase 0-6 実装完了**。Codex review 計 26 ラウンド通過。894 unit tests / 13 ignored (旧 JSON 経路テスト)。
+
+| Phase | コミット数 | Codex round | 主成果物 |
+|---|---|---|---|
+| 0 | 1 | - | `MIV_SETTINGS_SAVE_TRACE` 計装 (Phase 6 で削除済み) |
+| 1 | 7 | 12 | `SettingsDb` 基本機能 (open / load_into_settings / save_full / backup_to / lazy global)、29 unit tests |
+| 2 | 5 | 6 | `migrate_from_settings_json` / `quarantine_db_files` / `boot_settings_db` 決定木、SAVE_SUPPRESSED フラグ、12 tests |
+| 3 | 3 | 3 | `Settings::load` / `save` を SettingsDb 経由に rewire、`SettingsDb::rotate_backups`、`save_internal_no_rotation` |
+| 4 | 4 | 4 | `folder_tree::FolderTreeOptions`、`susie_loader::init_pool` (2 段階初期化 + 世代カウンタ)、`App::new_from_settings`、並列 `Settings::load()` を main 1 箇所に集約 |
+| 5+6 | 1 | 1 | spec §5 backup migration 確認、Phase 0 計装削除 |
+
+実装ハイライト:
+- ファイル単体の transient I/O 失敗で「全 NotFound → defaults 上書き」する事故を構造的に排除
+- main NotFound は `read_dir` で本当に不在か再確認 (transient なら abort + 保護)
+- create_new は family 可視時 `AlreadyBootstrapped` で fail-fast (= clean install 誤判定での bak 上書き防止)
+- corrupt rows (UUID / plugins_json / out-of-range slot / settings_kv shape) は silently 戻さず `Corrupted` で上層に fallback を委ねる
+- VST3 大型 row は hash skip で 7MB 級の重複 write を排除
+- `bootstrap_complete` marker で「init_schema 後 / save_full 前に crash」した中身ゼロの DB を Corrupted として bak に倒す
+- Susie pool は init/reload 世代カウンタで stale build が user choice を上書きしないようガード
+
+未実施 Phase:
+- **Phase 7**: テスト整備 (Phase 1/2 で既に並行整備済み) + ドキュメント (= 本ファイル + CLAUDE.md + architecture-overview.md + README)。本コミットで完了予定。
+- **Phase 6 (deferred)**: 旧 `*.json` save 経路の物理削除。spec §9 で「数バージョン後に」と明記。現状は `#[allow(dead_code)]` で残置。
+
 ## 1. 動機
 
 ### 1.1 観測された失敗モード
