@@ -1489,24 +1489,49 @@ pub fn spawn(
     std::thread::Builder::new()
         .name("video-demux".into())
         .spawn(move || {
-            run_decoder(
-                path,
-                clock,
-                cancel,
-                target_audio_sample_rate,
-                hw_decode,
-                deinterlace,
-                #[cfg(windows)]
-                gpu_video_device,
-                engine_state,
-                engine_event_tx,
-                video_tx,
-                audio_tx,
-                info_tx,
-                skipped_frame_count,
-                dynamic,
-                prep_progress_for_worker,
-            );
+            // run_decoder の panic を thread 境界で捕捉する。捕捉しないと
+            // デコーダースレッドが無言で死に、`info_tx` に Ok/Err どちらも
+            // 送られず engine が Loading のまま永久固着する (= フルスクリーンに
+            // 「デコード開始中」が出たまま固まる。2026-05-14 の mono WMV 不具合)。
+            // panic.log / mimageviewer.log への記録は panic フックが行うので、
+            // ここでは engine/UI を救出するためのエラー通知だけ行う。
+            let info_tx_for_panic = info_tx.clone();
+            let engine_event_tx_for_panic = engine_event_tx.clone();
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_decoder(
+                    path,
+                    clock,
+                    cancel,
+                    target_audio_sample_rate,
+                    hw_decode,
+                    deinterlace,
+                    #[cfg(windows)]
+                    gpu_video_device,
+                    engine_state,
+                    engine_event_tx,
+                    video_tx,
+                    audio_tx,
+                    info_tx,
+                    skipped_frame_count,
+                    dynamic,
+                    prep_progress_for_worker,
+                );
+            }));
+            if outcome.is_err() {
+                // info 未送信 (= 再生開始前の panic) なら Err を流して open path を
+                // エラー表示に倒す (info_rx の Err 経路 = VideoPlayer.error)。
+                // info 送信済みで bounded(1) が埋まっている場合 try_send は失敗するが、
+                // そのケースは既に再生が始まっているので下の Failed event 側で拾う。
+                let _ = info_tx_for_panic
+                    .try_send(Err("動画の再生中に内部エラーが発生しました".to_string()));
+                // 再生開始後の panic 用: engine を Loading/Playing から Idle へ戻す。
+                let _ =
+                    engine_event_tx_for_panic.try_send(crate::video::engine::EngineEvent::Decoder(
+                        crate::video::engine::state::DecoderEvent::Failed {
+                            reason: "decoder thread panicked".to_string(),
+                        },
+                    ));
+            }
         })
         .expect("spawn video-decode thread");
 
@@ -1818,15 +1843,16 @@ fn run_decoder(
                             let in_fmt = dec.format();
                             let in_rate = dec.rate();
                             // FFmpeg 7.x API: channel_layout → ch_layout, get → get2
-                            let (in_layout, guessed_stereo) = {
+                            let (in_layout, layout_substituted) = {
                                 let raw_in_layout = dec.ch_layout();
                                 normalize_audio_input_layout(raw_in_layout)
                             };
-                            if guessed_stereo {
-                                crate::logger::log(
-                                "audio channel layout unspecified for 2ch stream; guessing stereo"
-                                    .to_string(),
-                            );
+                            if layout_substituted {
+                                crate::logger::log(format!(
+                                    "audio channel layout unspecified ({} ch); substituting default layout \"{}\"",
+                                    in_layout.channels(),
+                                    in_layout.description(),
+                                ));
                                 dec.set_ch_layout(in_layout.clone());
                             }
                             // 出力は f32 packed stereo / target_audio_sample_rate
@@ -4397,9 +4423,14 @@ fn emit_audio_frame(
                 None => return true,
             }
         } else {
-            let (_, guessed_frame_stereo) = normalize_audio_input_layout(frame.ch_layout());
-            if guessed_frame_stereo {
-                frame.set_ch_layout(ffmpeg::ChannelLayout::STEREO);
+            // resampler は `setup` 構築時に正規化済みレイアウトで作られている。
+            // 各 frame の `ch_layout` も未指定なら同じ正規化を適用し、resampler が
+            // 期待する入力レイアウトと一致させる (mono を stereo 扱いするとチャンネル
+            // 解釈ミス / swr_convert_frame エラーになる)。
+            let (frame_layout, frame_layout_substituted) =
+                normalize_audio_input_layout(frame.ch_layout());
+            if frame_layout_substituted {
+                frame.set_ch_layout(frame_layout);
             }
             // ⚠️ output frame を **正しいサイズ**で pre-allocate する。
             //
@@ -4756,14 +4787,31 @@ fn emit_audio_frame(
 fn normalize_audio_input_layout(
     layout: ffmpeg_the_third::ChannelLayout<'_>,
 ) -> (ffmpeg_the_third::ChannelLayout<'static>, bool) {
-    if layout.mask().is_none() && layout.channels() == 2 {
-        (ffmpeg_the_third::ChannelLayout::STEREO, true)
-    } else {
-        (
+    // ffmpeg-the-third の `ResampleContext::get2` は入力レイアウトに対して
+    // `ChannelLayout::mask().unwrap()` を呼ぶ。古い WMV/WMA など一部のファイルは
+    // チャンネル数だけ判明していてレイアウト順が AV_CHANNEL_ORDER_UNSPEC になり、
+    // その場合 `mask()` が `None` を返して get2 内で panic する。panic はデコーダー
+    // スレッドを巻き込んで死なせるため、再生が「デコード開始中」のまま固まる。
+    // mask を持たないレイアウトは、チャンネル数に応じた既定レイアウト (mono/stereo
+    // /5.1 等、いずれも native order で mask あり) へ差し替えてから渡す。
+    if layout.mask().is_some() {
+        return (
             ffmpeg_the_third::ChannelLayout::from(layout.into_owned()),
             false,
-        )
+        );
     }
+    let channels = layout.channels();
+    let substitute = ffmpeg_the_third::ChannelLayout::default_for_channels(channels);
+    if substitute.mask().is_some() {
+        return (substitute, true);
+    }
+    // channels==0 など default_for_channels でも mask が取れない場合の最終手段。
+    let fallback = if channels >= 2 {
+        ffmpeg_the_third::ChannelLayout::STEREO
+    } else {
+        ffmpeg_the_third::ChannelLayout::MONO
+    };
+    (fallback, true)
 }
 
 fn audio_context_layout_summary(ctx: &ffmpeg_the_third::codec::context::Context) -> (u32, String) {
@@ -5847,24 +5895,37 @@ mod decoder_candidate_tests {
     }
 
     #[test]
-    fn unspecified_two_channel_audio_layout_is_guessed_as_stereo() {
-        let (layout, guessed) = normalize_audio_input_layout(ChannelLayout::unspecified(2));
-        assert!(guessed);
+    fn unspecified_mono_audio_layout_is_substituted_with_mono() {
+        // 1ch 未指定レイアウト (古い WMV/WMA で頻出) を生で ResampleContext::get2 に
+        // 渡すと ffmpeg-the-third 内の `mask().unwrap()` で panic する回帰防止。
+        let (layout, substituted) = normalize_audio_input_layout(ChannelLayout::unspecified(1));
+        assert!(substituted);
+        assert!(layout.mask().is_some());
+        assert_eq!(layout.mask(), ChannelLayout::MONO.mask());
+        assert_eq!(layout.channels(), 1);
+    }
+
+    #[test]
+    fn unspecified_two_channel_audio_layout_is_substituted_with_stereo() {
+        let (layout, substituted) = normalize_audio_input_layout(ChannelLayout::unspecified(2));
+        assert!(substituted);
         assert_eq!(layout.mask(), ChannelLayout::STEREO.mask());
     }
 
     #[test]
     fn specified_stereo_audio_layout_is_left_unchanged() {
-        let (layout, guessed) = normalize_audio_input_layout(ChannelLayout::STEREO);
-        assert!(!guessed);
+        let (layout, substituted) = normalize_audio_input_layout(ChannelLayout::STEREO);
+        assert!(!substituted);
         assert_eq!(layout.mask(), ChannelLayout::STEREO.mask());
     }
 
     #[test]
-    fn unspecified_non_stereo_audio_layout_is_not_guessed() {
-        let (layout, guessed) = normalize_audio_input_layout(ChannelLayout::unspecified(6));
-        assert!(!guessed);
-        assert!(layout.mask().is_none());
+    fn unspecified_non_stereo_audio_layout_is_substituted_with_default_layout() {
+        // 6ch 未指定も mask 付きの既定レイアウト (5.1) に差し替えられ、
+        // get2 に渡しても panic しないこと。
+        let (layout, substituted) = normalize_audio_input_layout(ChannelLayout::unspecified(6));
+        assert!(substituted);
+        assert!(layout.mask().is_some());
         assert_eq!(layout.channels(), 6);
     }
 

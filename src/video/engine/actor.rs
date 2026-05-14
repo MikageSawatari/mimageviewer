@@ -509,7 +509,8 @@ impl EngineActor {
                     self.transition_to_eof(duration_secs);
                 }
             }
-            DecoderEvent::Failed { reason: _ } => {
+            DecoderEvent::Failed { reason } => {
+                crate::logger::log(format!("[engine] decoder failed: {reason}"));
                 // 致命的エラー: state を Idle に戻す (run loop は別途 channel close で抜ける)
                 self.transition_to_loading(self.clock.anchor().pts_secs);
                 self.state = EngineState::Idle;
