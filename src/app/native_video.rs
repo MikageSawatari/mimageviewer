@@ -627,7 +627,7 @@ impl App {
                 self.handle_native_video_request_seek_thumbnail(fs_idx, target_secs);
             }
             crate::video::NativeVideoOutputEvent::ToggleTileMode => {
-                let screen = ctx.content_rect().size();
+                let screen = self.video_tile_layout_size(fs_idx, ctx);
                 self.toggle_video_tile_mode(fs_idx, screen);
                 self.sync_native_video_tile_overlay(ctx, fs_idx);
             }
@@ -1987,6 +1987,52 @@ impl App {
         }
     }
 
+    /// native 動画タイルが実際に描画される borderless presenter HWND のクライアント
+    /// 領域サイズを egui points で返す。
+    ///
+    /// タイル枚数 (= `build_video_tile_state_for` の `max_rows` / `pick_interval`) は、
+    /// 描画先と同じ画面サイズを基準に計算しないと「生成枚数 < 敷き詰められる枚数」に
+    /// なって画面上部だけ埋まる。presenter はモニター全面を覆う別 HWND なので、
+    /// `ctx.content_rect()` (= メイン egui ウィンドウ。別モニター / 別サイズになり得る)
+    /// ではなくこの実サイズを使う。HWND 未確定 / 取得失敗時は `None`。
+    #[cfg(windows)]
+    fn native_video_overlay_size_points(&self, fs_idx: usize) -> Option<egui::Vec2> {
+        use windows::Win32::Foundation::{HWND as Win32Hwnd, RECT as Win32Rect};
+        use windows::Win32::UI::HiDpi::GetDpiForWindow;
+        use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+
+        let hwnd = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.native_presenter_hwnd(),
+            _ => 0,
+        };
+        if hwnd == 0 {
+            return None;
+        }
+        let win = Win32Hwnd(hwnd as *mut _);
+        let mut rc = Win32Rect::default();
+        if unsafe { GetClientRect(win, &mut rc) }.is_err() {
+            return None;
+        }
+        let w_px = (rc.right - rc.left).max(0) as f32;
+        let h_px = (rc.bottom - rc.top).max(0) as f32;
+        if w_px < 1.0 || h_px < 1.0 {
+            return None;
+        }
+        // presenter overlay の pixels_per_point は `pixels_per_point_for_hwnd` =
+        // `GetDpiForWindow / 96.0` と同じ計算なので、ここで points に戻すと描画側の
+        // `overlay_*_points` と一致する。
+        let ppp = (unsafe { GetDpiForWindow(win) } as f32 / 96.0).max(0.5);
+        Some(egui::vec2(w_px / ppp, h_px / ppp))
+    }
+
+    /// タイル状態構築用の画面サイズ。native presenter の実クライアントサイズを優先し、
+    /// 取得できない場合のみメインウィンドウの content rect にフォールバックする。
+    #[cfg(windows)]
+    fn video_tile_layout_size(&self, fs_idx: usize, ctx: &egui::Context) -> egui::Vec2 {
+        self.native_video_overlay_size_points(fs_idx)
+            .unwrap_or_else(|| ctx.content_rect().size())
+    }
+
     #[cfg(windows)]
     pub(super) fn poll_video_tile_swap(&mut self, ctx: &egui::Context) {
         let Some(pending) = self.video_tile_swap_pending.as_ref() else {
@@ -2025,7 +2071,7 @@ impl App {
         };
         match status {
             SwapStatus::Ready => {
-                let screen = ctx.content_rect().size();
+                let screen = self.video_tile_layout_size(target_idx, ctx);
                 self.video_tile_state = self.build_video_tile_state_for(target_idx, screen);
                 self.video_tile_swap_pending = None;
                 self.video_tile_reopen_pending = false;
@@ -2085,7 +2131,7 @@ impl App {
                 self.video_tile_reopen_pending = false;
                 self.video_tile_reopen_deadline = None;
             } else {
-                let screen = ctx.content_rect().size();
+                let screen = self.video_tile_layout_size(fs_idx, ctx);
                 self.toggle_video_tile_mode(fs_idx, screen);
                 if self.video_tile_state.is_some() {
                     self.video_tile_reopen_pending = false;
@@ -2729,10 +2775,9 @@ impl App {
                     player.set_native_perf_overlay_visible(self.video_perf_overlay_visible);
                 }
             }
-            // S: tile mode toggle. This still uses the egui context for screen
-            // size until the native overlay owns layout.
+            // S: tile mode toggle.
             0x53 if !key.shift && !key.ctrl && !key.repeat => {
-                let screen = ctx.content_rect().size();
+                let screen = self.video_tile_layout_size(fs_idx, ctx);
                 self.toggle_video_tile_mode(fs_idx, screen);
                 self.sync_native_video_tile_overlay(ctx, fs_idx);
             }
@@ -3049,7 +3094,7 @@ impl App {
         self.video_tile_state = None;
         self.video_tile_swap_pending = None;
         if was_open {
-            let screen = ctx.content_rect().size();
+            let screen = self.video_tile_layout_size(fs_idx, ctx);
             self.toggle_video_tile_mode(fs_idx, screen);
             self.sync_native_video_tile_overlay(ctx, fs_idx);
         }

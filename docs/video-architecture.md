@@ -623,6 +623,15 @@ overlay の中央 status に「メタデータ読込中...」「ストリーム�
 タイルモードの UI 描画は `native_presenter/overlay_draw.rs` の以下 2 関数で構成する:
 
 - `draw_native_tile_overlay` — 中央 preparing 文言とサムネイルグリッドを描画。
+  **`egui::Area` の order は `Order::Background` 固定**。グリッドは全画面を不透明黒で
+  塗り、かつ全画面の click sense を登録するため、chrome (上部バー / toast =
+  `Order::Foreground`) と同じ order に置くと、egui が click されたレイヤを
+  `move_to_top` する仕様により「グリッド背景を 1 回クリック → グリッドが上部バーの
+  上に昇格 → 黒塗りが上部バーを丸ごと隠す」という回帰を起こす。order を分けておけば
+  描画順が固定され `move_to_top` の影響を受けない。Foreground に戻さないこと。
+  あわせて、`render_once` ではタイルモード中 (`tile_overlay.is_some()`) は perf overlay
+  (`Order::Middle`) を描画しない。grid が `Order::Background` の不透明塗りなので、
+  perf を描くと grid の上に乗ってサムネイルと click (seek) を塞ぐため。
 - `draw_native_top_bar_tile` — 通常再生時の `draw_native_top_bar` と同じ 54px の
   上部バーを描画し、タイトル / 解像度 / fps / コーデック / duration / タイル間隔 /
   抽出進捗 (`N/M`) を表示する。右側に 3 ボタン: × (`ToggleTileMode`)、
@@ -643,6 +652,16 @@ overlay の中央 status に「メタデータ読込中...」「ストリーム�
 
 `ui_video_tile.rs` は state 構造体 (`VideoTileState`) と worker spawn
 ロジックだけを持ち、egui 描画関数は v0.9 系で削除済み。
+
+`build_video_tile_state_for` のタイル枚数計算 (`max_rows` / `pick_interval`) は
+**描画先と同じ画面サイズ**を基準にする必要がある。タイルは native presenter
+(モニター全面を覆う別 borderless HWND) に描かれるので、`ctx.content_rect()`
+(= メイン egui ウィンドウ。別モニター / 別サイズになり得る) を渡すと、縦横比が
+食い違うモニター (特に縦長) で「生成枚数 < 敷き詰められる枚数」になり画面上部
+だけ埋まる。`App::video_tile_layout_size` が presenter HWND の `GetClientRect` +
+`GetDpiForWindow` から実クライアントサイズ (points) を取り、取得失敗時のみ
+`ctx.content_rect()` にフォールバックする。タイル生成系の呼び出し元 (S キー /
+▦ ボタン / tile fast-swap / reopen / 列数変更) はすべてこの関数を経由する。
 
 ## 経路選択ロジック (起動時 1 回)
 

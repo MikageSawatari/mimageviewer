@@ -4271,7 +4271,12 @@ impl NativeEguiOverlay {
             if !overlay_visible {
                 return;
             }
-            if perf_visible {
+            // タイルモード中は perf overlay を描かない。タイルグリッドは全画面を
+            // 不透明黒で塗るので、grid が `Order::Background`・perf が `Order::Middle`
+            // だと perf がグリッドの上に乗ってサムネイルとクリック (seek) を塞いでしまう。
+            // 旧実装 (grid = Foreground) でも grid の不透明塗りで perf は隠れていたので、
+            // タイルモードで perf を出さないのは元の見た目と一致する。
+            if perf_visible && tile_overlay.is_none() {
                 draw_native_perf_overlay(
                     ctx,
                     overlay_width_points,

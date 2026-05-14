@@ -2295,8 +2295,14 @@ pub(super) fn draw_native_tile_overlay(
     tile_texture_ids: &HashMap<usize, egui::TextureId>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
+    // タイルグリッドは `Order::Background` で描く。chrome (上バー / toast = Foreground、
+    // perf overlay = Middle) より必ず下に置くため。
+    // grid を Foreground にすると、egui の `Area` は click されたレイヤを `move_to_top`
+    // するので、グリッド背景を 1 回クリックしただけで grid が上バーの上に昇格し、
+    // grid 先頭の全画面不透明黒塗りが上バーを丸ごと隠してしまう (= 上バーのボタンも
+    // 押せなくなる)。Order を分ければ描画順は固定で `move_to_top` の影響を受けない。
     egui::Area::new(egui::Id::new("native_video_tile_overlay"))
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Background)
         .fixed_pos(egui::Pos2::ZERO)
         .show(ctx, |ui| {
             let full_rect = egui::Rect::from_min_size(
