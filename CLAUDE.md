@@ -207,11 +207,44 @@ bash scripts/bootstrap-vendor.sh --force   # 既存ファイルも再取得 (デ
     bash scripts/setup-vst3-sdk.sh
     cmake -S crates/vst3-host -B crates/vst3-host/build -G "Visual Studio 18 2026" -A x64
     cmake --build crates/vst3-host/build --config Release
-    cp crates/vst3-host/build/Release/mimageviewer-vst3-host.exe vendor/vst3-host/
     ```
-    詳細は本書「VST3 host bridge 管理」節を参照
+    CMake target は `vendor/vst3-host/mimageviewer-vst3-host.exe` へ直接出力するので
+    `build/Release/` からの手動 cp は不要。詳細は本書「VST3 host bridge 管理」節を参照。
+    ⚠ **古い別 worktree の exe を流用しないこと**: `crates/vst3-host/` の C++ ソース
+    (`protocol.h` 含む) は頻繁に変わる。IPC プロトコルが現行 Rust 側とずれた exe を
+    使うと bridge が起動直後にクラッシュし、VST3 有効時に動画再生が「激重」になる
+    (2026-05-14 実害)。バージョンが合うか不明なら必ず再ビルドする。
 - **TensorRT pack** (`vendor/tensorrt-cache/`): 開発時には不要。pack 配布作業時
   だけ `scripts/setup-tensorrt-pack.ps1` を回す
+
+### 消えると再取得できないもの — ツリー外バックアップ必須
+
+`bootstrap-vendor.sh` で再取得できる物 (pdfium / ort / ffmpeg / susie) と違い、
+**以下は失うと復旧手段が限られる / 無い**:
+
+- **`vendor/models/*.onnx`** — DL スクリプトが**存在しない**。`%APPDATA%\mimageviewer\
+  models\` (インストール済み環境が展開した物) からコピーするしかない。動く mIV
+  インストールも APPDATA も両方失うと**永久に取得不可**。
+- **`vendor/vst3-host/mimageviewer-vst3-host.exe`** — 再ビルドには VST3 SDK
+  (~490 MB) + cmake が要る。古い exe の流用は上記の通り不可。
+
+そのため `vendor/models/` と `vendor/vst3-host/` は**リポジトリツリー
+(`C:\home\mimageviewer` 配下) の外**へコピーを置く。現在のバックアップ先:
+
+```
+C:\home\mimageviewer_vendor_backup\
+  ├ models\        (*.onnx 一式)
+  └ vst3-host\     (mimageviewer-vst3-host.exe)
+```
+
+- **定期ジョブは不要**。`vendor/` の中身は静的なので、モデル追加や vst3-host を
+  再ビルドした**ときだけ**バックアップを取り直す。
+- **復旧手順**: `vendor/` 消失時、`bootstrap-vendor.sh` を流した後に
+  `cp -r C:/home/mimageviewer_vendor_backup/models vendor/` と
+  `cp -r C:/home/mimageviewer_vendor_backup/vst3-host vendor/` で埋め戻す。
+- **背景**: worktree junction 事故 (本書「Git Workflow」節参照) で `vendor/` は
+  2026-05 に複数回全消失している。再取得可能な物は bootstrap で戻るが、models は
+  戻らないため、この外部バックアップが最後の砦になる。
 
 ### 前提環境変数 / ツール
 
