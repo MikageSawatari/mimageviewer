@@ -712,11 +712,12 @@ fn native_video_fullscreen_shortcut_key(
             | 0x27 // Right
             | 0x28 // Down
             | 0x42 // B
+            | 0x46 // F (perf overlay toggle、v0.9.x で旧 P から移動)
             | 0x4A // J
             | 0x4B // K
             | 0x4C // L
             | 0x4D // M
-            | 0x50 // P
+            | 0x50 // P (pin current frame、v0.9.x で perf から再割り当て)
             | 0x53 // S
             | 0x57 // W
             | 0xA6 // VK_BROWSER_BACK — マウス戻るボタン (driver / AHK 経由)。

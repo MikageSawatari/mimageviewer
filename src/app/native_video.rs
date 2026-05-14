@@ -2712,8 +2712,18 @@ impl App {
                     player.set_native_checked(checked);
                 }
             }
-            // P: perf overlay
+            // P: pin current frame (= HUD 📌 ボタンと同等)。グリッドの P と統一した
+            // 「P = Pin」の mnemonic。v0.9.x で perf overlay の P から再割り当て、
+            // perf overlay は F に移動した。
             0x50 if !key.shift && !key.ctrl && !key.repeat => {
+                let target = self
+                    .fs_video_player(fs_idx)
+                    .map(|p| p.position())
+                    .unwrap_or(0.0);
+                self.handle_native_video_set_pin_command(ctx, fs_idx, target);
+            }
+            // F: perf / framerate overlay toggle (旧 P)。Frames / FPS mnemonic。
+            0x46 if !key.shift && !key.ctrl && !key.repeat => {
                 self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.set_native_perf_overlay_visible(self.video_perf_overlay_visible);
