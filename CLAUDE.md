@@ -1279,7 +1279,7 @@ awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
 **junction (NTFS reparse point) で共有する設計**を選ぶと、撤収時に災害が起きる:
 
 ```
-[NG] git worktree remove で junction ごと再帰削除される事故 (2026-05-13 実害):
+[NG] git worktree remove で junction ごと再帰削除される事故 (2026-05-13 / 2026-05-14 実害):
   C:\home\mimageviewer-sqlite\          ← worktree
     └─ vendor\  (junction → C:\home\mimageviewer\vendor\)
   ↓ git worktree remove C:\home\mimageviewer-sqlite
@@ -1289,26 +1289,46 @@ awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
     無いと言って失敗、bootstrap-vendor.sh で再 DL する羽目になる
 ```
 
-**ルール**: junction を含む worktree を撤去する前に、**先に junction だけを `Remove-Item` で
-剥がす**こと。`Remove-Item` / `rmdir` は junction を正しく「リンクのみ削除、リンク先は touch
-しない」で扱える:
+#### 鉄則: `git worktree remove` を直接呼ばない
+
+**この repo では `git worktree remove` を直接実行しない。必ず
+`scripts/safe-worktree-remove.ps1` を経由する**。文書化だけでは 2026-05-13 → 翌日
+2026-05-14 と連続で事故ったので、機械的に防ぐ仕組みを置いた。
+
+ラッパーが実行する手順:
+1. 対象 worktree を再帰スキャン (junction には**降りない**) して reparse point を列挙
+2. 見つけた junction を `cmd /c rmdir` で **リンクだけ** 削除 (リンク先は無事)
+3. 全部 unlink できてから `git worktree remove <path>` を実行
 
 ```powershell
-# Step 1: junction を剥がす (リンク先 = main の vendor/ は無事)
-Remove-Item C:\home\mimageviewer-sqlite\vendor -Force
+# 全 worktree の junction 状況を一覧 (非破壊)
+.\scripts\safe-worktree-remove.ps1 -Audit
 
-# Step 2: ここで初めて worktree 削除
-git worktree remove C:\home\mimageviewer-sqlite
+# 何が起きるかを確認するだけ (非破壊)
+.\scripts\safe-worktree-remove.ps1 <worktree-path> -DryRun
+
+# 実際に安全に削除
+.\scripts\safe-worktree-remove.ps1 <worktree-path>
+.\scripts\safe-worktree-remove.ps1 <worktree-path> -Force   # dirty worktree 用
 ```
 
-**より安全な設計**: そもそも `vendor/` を worktree 間で共有しない。worktree 側でも
-`bash scripts/setup-ffmpeg.sh` 等を流して per-worktree な `vendor/` を持つ方が、撤去時の
-事故リスクがゼロ。disk 容量 (~1GB) より復旧の手間の方が高い。
+ラッパーは main worktree (= cwd repo) を対象に指定すると refuse する。
 
-junction を共有したい場合は **`vendor/` 全体ではなく個別サブディレクトリ単位** (`vendor/pdfium/`,
-`vendor/ffmpeg/`, `vendor/models/`, `vendor/ort/`, `vendor/susie-worker/`) で junction を張る。
-こうしておけば、`git worktree remove` が中身を辿っても worktree 側の各 junction が削除されるだけで
-**main の `vendor/` ディレクトリ自体は touch されない** (junction の親 dir が main 側にあるため)。
+**Claude セッション中の運用**: worktree を撤収する指示を受けたら、`git worktree remove ...`
+の前に必ず `.\scripts\safe-worktree-remove.ps1 ...` に置換する。`gh`/`git` の他コマンドと
+混ぜて連続実行する場合も同じ。これは取り返しがつかない事故なので例外なし。
+
+#### 設計面の選択肢
+
+**最も安全**: `vendor/` を worktree 間で **共有しない**。新規 worktree でも
+`bash scripts/bootstrap-vendor.sh` を流して per-worktree な `vendor/` を持つ。
+disk 容量 (~1GB) より復旧の手間の方が高い。
+
+**junction 共有が必要な場合**: `vendor/` 全体ではなく **個別サブディレクトリ単位**
+(`vendor/pdfium/`, `vendor/ffmpeg/`, `vendor/models/`, `vendor/ort/`, `vendor/susie-worker/`)
+で junction を張る。こうすれば `git worktree remove` が中身を辿っても worktree 側の各
+junction が削除されるだけで **main の `vendor/` ディレクトリ自体は touch されない**
+(junction の親 dir が main 側にあるため)。それでもラッパー経由で撤去するのが安全。
 
 ## User: Background
 
