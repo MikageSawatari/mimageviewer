@@ -17026,6 +17026,10 @@ pub(crate) fn draw_cell(
     tags: &[String],
     // コンテナセルに出す「フィルタ一致の子孫件数」。None ならバッジ非表示。
     filter_match_count: Option<u32>,
+    // true なら左上に「📌」バッジを描画する (= folder_thumb_pin が設定されている
+    // コンテナ)。サムネ自体が変化しないケースで「ピンは確かに効いている」ことを
+    // ユーザーが視認するための補助 UI。
+    has_folder_pin: bool,
 ) {
     if !ui.is_rect_visible(rect) {
         return;
@@ -17424,8 +17428,8 @@ pub(crate) fn draw_cell(
         );
     }
 
-    // 左上バッジ列: 補 (ページ個別補正) → 消 (消しゴムマスク) → タグバッジ。
-    // 横並びで、収まらなければ末尾省略。
+    // 左上バッジ列: 補 (ページ個別補正) → 消 (消しゴムマスク) → 📌 (folder_thumb_pin)
+    // → タグバッジ。横並びで、収まらなければ末尾省略。
     {
         let badge_w = 18.0;
         let badge_h = 16.0;
@@ -17454,6 +17458,23 @@ pub(crate) fn draw_cell(
                 "消",
                 egui::FontId::proportional(11.0),
                 egui::Color32::WHITE,
+            );
+            x += badge_w + 2.0;
+        }
+        if has_folder_pin {
+            // 📌 バッジ: コンテナ (Folder/ZipFile/PdfFile) に代表サムネピンが
+            // 設定されている目印。サムネイル自体が変化しないケース (自動代表選定と
+            // 同じ画像になった / 動画ピン WebP 未抽出で auto-pick fallback 等) でも
+            // 「ピンは確かに DB に保存されている」をユーザーが視認できる。
+            let badge_rect =
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(badge_w, badge_h));
+            painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(230, 180, 90));
+            painter.text(
+                badge_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "📌",
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgb(60, 40, 10),
             );
             x += badge_w + 2.0;
         }
