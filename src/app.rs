@@ -6410,12 +6410,28 @@ impl App {
         })
     }
 
-    /// アドレスバー 📌 ボタンの左クリック (toggle) ハンドラ。
-    /// 選択中アイテムが現在の pin と一致 → 解除、不一致 → set。選択無し / 非対応 item → no-op。
+    /// アドレスバー 📌 ボタンの左クリック (toggle) / P キーショートカットのハンドラ。
+    /// 選択中アイテムが現在の pin と一致 → 解除、不一致 → set。
+    ///
+    /// **silent no-op 条件** (`compute_folder_pin_button_state` で UI を隠す条件と整合):
+    /// - `current_folder` 無し / 検索合成パス
+    /// - Ctrl+G アグリゲートビュー (`items_are_global_search_view`)
+    /// - 7z/LZH 変換キャッシュ ZIP の drill-down (`archive_source_override` Some)
+    /// - 選択無し / 選択アイテムが pin 不能 (ConvertibleArchive / SearchContainer /
+    ///   ZipSeparator、または container を指す `rel=""` ケース)
     pub(crate) fn toggle_folder_pin_from_selection(&mut self) {
         let Some(container) = self.current_folder.clone() else {
             return;
         };
+        if container == search_results_synthetic_path() {
+            return;
+        }
+        if self.items_are_global_search_view {
+            return;
+        }
+        if self.archive_source_override.is_some() {
+            return;
+        }
         let Some(item) = self.selected.and_then(|i| self.items.get(i)).cloned() else {
             return;
         };
@@ -15815,6 +15831,32 @@ impl eframe::App for App {
             }
             if deselect {
                 self.checked.clear();
+            }
+        }
+
+        // ── P: 代表サムネ固定トグル (グリッドモード限定) ───────────────
+        // アドレスバー 📌 ボタン左クリックと同等。pin 不能アイテム / 検索アグリゲート /
+        // 変換キャッシュ drill-down / 空フォルダ等は `toggle_folder_pin_from_selection`
+        // 内のガードで silent no-op になる。
+        // フルスクリーン中は P がポストフィルタサイクルと衝突するので fullscreen_idx
+        // が None のときだけ反応する。各種テキスト入力フィールドにフォーカス中も無効。
+        if !self.address_has_focus
+            && !self.search_has_focus
+            && !self.favsearch.has_focus
+            && !self.global_search.has_focus
+            && self.fullscreen_idx.is_none()
+            && !self.any_dialog_open()
+        {
+            let pressed_p = ctx.input_mut(|i| {
+                // Plain P only (no modifier)。Shift+P / Alt+P / Ctrl+P は他用途に
+                // 開放しておく (現状未割当だが将来予約)。
+                !i.modifiers.shift
+                    && !i.modifiers.alt
+                    && !i.modifiers.ctrl
+                    && i.consume_key(egui::Modifiers::NONE, egui::Key::P)
+            });
+            if pressed_p {
+                self.toggle_folder_pin_from_selection();
             }
         }
 
