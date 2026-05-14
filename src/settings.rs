@@ -875,7 +875,7 @@ pub struct Settings {
     #[serde(default = "default_true")]
     pub video_thumb_use_sidecar_image: bool,
     /// 動画タイルモードの列数 (Phase 6.D)。タイル中 Ctrl+Wheel で
-    /// 6/10/16/20/26/30 のいずれかに切替可能。値が範囲外なら 10 にクランプ。
+    /// 4/6/10/16/20/26/30 のいずれかに切替可能。値が範囲外なら 10 にクランプ。
     #[serde(default = "default_video_tile_columns")]
     pub video_tile_columns: usize,
 

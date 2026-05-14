@@ -36,6 +36,12 @@ pub fn export_diagnostics_zip() -> Result<PathBuf, String> {
     let mut included = 0usize;
     if let Ok(entries) = std::fs::read_dir(&logs_dir) {
         for entry in entries.flatten() {
+            // デスクトップが取得できず out_dir == logs_dir の fallback 経路では、
+            // たった今作った zip 自身が列挙に出てくる。自分を中に取り込む / 書き込み中の
+            // 中途半端なバイト列を読むのを避けるため除外する。
+            if entry.path() == zip_path {
+                continue;
+            }
             let Ok(ft) = entry.file_type() else {
                 continue;
             };

@@ -154,7 +154,9 @@ fn run_worker(
             .iter()
             .map(|&p| (p * 1000.0).round() as i64)
             .collect();
-        let hits = c.lookup_webp_batch(&path, &ts_ms, video_mtime);
+        // `max_w` (= 固定抽出幅) 未満で保存された旧い行は拡大描画でぼやけるため
+        // miss 扱いにして再抽出させる。
+        let hits = c.lookup_webp_batch(&path, &ts_ms, video_mtime, max_w);
         for (idx, (&pts, webp_opt)) in timestamps.iter().zip(hits.into_iter()).enumerate() {
             if cancel.load(Ordering::Acquire) {
                 return;

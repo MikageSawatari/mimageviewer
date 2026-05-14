@@ -125,19 +125,22 @@ impl TileThumbCache {
     /// キャッシュ ヒットなら WebP バイト列を返す。`video_mtime` が DB と一致しない
     /// 行は古いとみなし削除して `None`。
     ///
-    /// **`tile_w` は意図的にキーに含めない**: 同 `(path, timestamp_ms)` で別 tile_w
-    /// 行が複数あっても、その中で最大の `tile_w` を取って返す (= 列数を増減すると
-    /// tile_w も連動して変わる UI で、別列数で抽出済みのサムネを描画時の egui 側
-    /// リサイズで再利用できる、Phase 8.D)。
+    /// `min_tile_w` 未満の幅で保存された行は無視する。抽出幅が
+    /// `settings::VIDEO_TILE_EXTRACT_WIDTH` に固定される前は列数ごとに抽出幅が変動
+    /// していたため、旧い狭い行 (10/16/20 列モード由来) がそのまま残っている。
+    /// それを現在の固定幅モードで引くと拡大描画でぼやけるので、要求幅を満たさない
+    /// 行は miss 扱いにして再抽出させる。`min_tile_w` 以上の行が複数あれば最大幅を
+    /// 採用する (= 縮小描画の方がシャープ)。
     pub fn lookup_webp(
         &self,
         video_path: &Path,
         timestamp_ms: i64,
         video_mtime: i64,
+        min_tile_w: u32,
     ) -> Option<Vec<u8>> {
         let key = crate::path_key::normalize_keep_drive(video_path);
         let conn = self.conn.lock().ok()?;
-        Self::lookup_with_conn(&conn, &key, timestamp_ms, video_mtime)
+        Self::lookup_with_conn(&conn, &key, timestamp_ms, video_mtime, min_tile_w)
     }
 
     /// 複数の timestamp を 1 度の Mutex 取得で照会するバッチ版。タイル worker の
@@ -148,6 +151,7 @@ impl TileThumbCache {
         video_path: &Path,
         timestamps_ms: &[i64],
         video_mtime: i64,
+        min_tile_w: u32,
     ) -> Vec<Option<Vec<u8>>> {
         let key = crate::path_key::normalize_keep_drive(video_path);
         let Ok(conn) = self.conn.lock() else {
@@ -155,7 +159,7 @@ impl TileThumbCache {
         };
         timestamps_ms
             .iter()
-            .map(|&ts| Self::lookup_with_conn(&conn, &key, ts, video_mtime))
+            .map(|&ts| Self::lookup_with_conn(&conn, &key, ts, video_mtime, min_tile_w))
             .collect()
     }
 
@@ -164,18 +168,20 @@ impl TileThumbCache {
         key: &str,
         timestamp_ms: i64,
         video_mtime: i64,
+        min_tile_w: u32,
     ) -> Option<Vec<u8>> {
-        // 同 (path, timestamp_ms) で複数 tile_w 行があり得るため、最大幅を 1 件取る。
-        // 描画時に egui がタイル矩形へスケーリングするため、tile_w 不一致は問題ない。
+        // 同 (path, timestamp_ms) で複数 tile_w 行があり得るため、`min_tile_w` 以上で
+        // 最大幅の 1 件を取る。要求幅以上なら描画時に egui が縮小スケールするだけで
+        // シャープに出るが、要求幅未満の行を使うと拡大描画でぼやけるため除外する。
         let mut stmt = conn
             .prepare_cached(
                 "SELECT webp, video_mtime FROM video_tile_thumbs
-                  WHERE path = ?1 AND timestamp_ms = ?2
+                  WHERE path = ?1 AND timestamp_ms = ?2 AND tile_w >= ?3
                   ORDER BY tile_w DESC LIMIT 1",
             )
             .ok()?;
         let row: Option<(Vec<u8>, i64)> = stmt
-            .query_row(rusqlite::params![key, timestamp_ms], |r| {
+            .query_row(rusqlite::params![key, timestamp_ms, min_tile_w], |r| {
                 Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
             })
             .ok();
@@ -333,7 +339,7 @@ mod tests {
     fn lookup_missing_returns_none() {
         let db = open_in_memory();
         assert!(
-            db.lookup_webp(Path::new("c:/none.mp4"), 5000, 12345)
+            db.lookup_webp(Path::new("c:/none.mp4"), 5000, 12345, 320)
                 .is_none()
         );
     }
@@ -344,7 +350,7 @@ mod tests {
         let p = Path::new("c:/v.mp4");
         let webp = vec![0xDE, 0xAD, 0xBE, 0xEF];
         db.store_webp(p, 320, 5000, 99, 180, &webp).unwrap();
-        let got = db.lookup_webp(p, 5000, 99).unwrap();
+        let got = db.lookup_webp(p, 5000, 99, 320).unwrap();
         assert_eq!(got, webp);
     }
 
@@ -354,9 +360,9 @@ mod tests {
         let p = Path::new("c:/v.mp4");
         db.store_webp(p, 320, 5000, 100, 180, &[1, 2, 3]).unwrap();
         // mtime 違い → None + 該当行削除
-        assert!(db.lookup_webp(p, 5000, 999).is_none());
+        assert!(db.lookup_webp(p, 5000, 999, 320).is_none());
         // 削除されたので再度 100 で照会しても見つからない
-        assert!(db.lookup_webp(p, 5000, 100).is_none());
+        assert!(db.lookup_webp(p, 5000, 100, 320).is_none());
     }
 
     #[test]
@@ -365,7 +371,7 @@ mod tests {
         let p = Path::new("c:/v.mp4");
         db.store_webp(p, 320, 5000, 100, 180, &[1]).unwrap();
         db.store_webp(p, 320, 5000, 100, 180, &[2, 3]).unwrap();
-        assert_eq!(db.lookup_webp(p, 5000, 100).unwrap(), vec![2, 3]);
+        assert_eq!(db.lookup_webp(p, 5000, 100, 320).unwrap(), vec![2, 3]);
     }
 
     #[test]
@@ -373,7 +379,10 @@ mod tests {
         let db = open_in_memory();
         db.store_webp(Path::new("C:\\V.MP4"), 320, 5000, 100, 180, &[9])
             .unwrap();
-        assert!(db.lookup_webp(Path::new("c:/v.mp4"), 5000, 100).is_some());
+        assert!(
+            db.lookup_webp(Path::new("c:/v.mp4"), 5000, 100, 320)
+                .is_some()
+        );
     }
 
     #[test]
@@ -384,25 +393,28 @@ mod tests {
         let p = Path::new("c:/v.mp4");
         db.store_webp(p, 320, 5000, 100, 180, &[5]).unwrap();
         db.store_webp(p, 320, 10000, 100, 180, &[10]).unwrap();
-        assert_eq!(db.lookup_webp(p, 5000, 100).unwrap(), vec![5]);
-        assert_eq!(db.lookup_webp(p, 10000, 100).unwrap(), vec![10]);
-        assert!(db.lookup_webp(p, 1000, 100).is_none());
+        assert_eq!(db.lookup_webp(p, 5000, 100, 320).unwrap(), vec![5]);
+        assert_eq!(db.lookup_webp(p, 10000, 100, 320).unwrap(), vec![10]);
+        assert!(db.lookup_webp(p, 1000, 100, 320).is_none());
     }
 
     #[test]
-    fn lookup_reuses_across_tile_widths() {
-        // Phase 8.D 動機ケース: 列数増加で tile_w が変わっても、同 pts の既存
-        // キャッシュ (= 別 tile_w) は再利用される (描画時に egui がスケール)。
+    fn lookup_rejects_rows_narrower_than_min() {
+        // 抽出幅固定化 (VIDEO_TILE_EXTRACT_WIDTH) 後の回帰防止: 旧い狭い tile_w 行を
+        // 現在の固定抽出幅で引くと拡大描画でぼやけるため、min_tile_w 未満の行は
+        // miss 扱いにして再抽出させる。
         let db = open_in_memory();
         let p = Path::new("c:/v.mp4");
-        // 列 10 で tile_w=200 のサムネを保存
+        // 旧 10/16/20 列モード相当の狭いサムネ
         db.store_webp(p, 200, 5000, 100, 112, &[7]).unwrap();
-        // 列 16 で tile_w=125 を要求 — 既存の 200 幅サムネが返ってくる
-        let got = db.lookup_webp(p, 5000, 100).unwrap();
-        assert_eq!(got, vec![7]);
-        // 同 pts に複数 tile_w がある場合は最大幅を採用 (= 縮小スケールの方が綺麗)
-        db.store_webp(p, 320, 5000, 100, 180, &[42]).unwrap();
-        assert_eq!(db.lookup_webp(p, 5000, 100).unwrap(), vec![42]);
+        // 現在の固定抽出幅 (640) で要求 → 狭すぎるので miss
+        assert!(db.lookup_webp(p, 5000, 100, 640).is_none());
+        // 要求幅が保存幅以下なら従来どおりヒット
+        assert_eq!(db.lookup_webp(p, 5000, 100, 200).unwrap(), vec![7]);
+        assert_eq!(db.lookup_webp(p, 5000, 100, 100).unwrap(), vec![7]);
+        // 固定抽出幅で抽出し直した行が入れば、要求幅以上の中から最大幅を採用する
+        db.store_webp(p, 640, 5000, 100, 360, &[42]).unwrap();
+        assert_eq!(db.lookup_webp(p, 5000, 100, 640).unwrap(), vec![42]);
     }
 
     #[test]
@@ -503,7 +515,7 @@ mod tests {
         assert_eq!(removed, 0);
         // 他フォルダの行は残っている
         assert!(
-            db.lookup_webp(Path::new("c:/other/x.mp4"), 5000, 100)
+            db.lookup_webp(Path::new("c:/other/x.mp4"), 5000, 100, 320)
                 .is_some()
         );
     }
@@ -520,9 +532,9 @@ mod tests {
         assert_eq!(removed, 2);
         // 削除後も schema は残っているので新規 store/lookup が動く
         db.store_webp(p1, 320, 5000, 100, 180, &[3]).unwrap();
-        assert_eq!(db.lookup_webp(p1, 5000, 100).unwrap(), vec![3]);
+        assert_eq!(db.lookup_webp(p1, 5000, 100, 320).unwrap(), vec![3]);
         // p2 は消えたまま
-        assert!(db.lookup_webp(p2, 5000, 100).is_none());
+        assert!(db.lookup_webp(p2, 5000, 100, 320).is_none());
     }
 
     #[test]
@@ -552,20 +564,20 @@ mod tests {
 
         // 配下 2 件は消えた
         assert!(
-            db.lookup_webp(Path::new("c:/movies/a.mp4"), 5000, 100)
+            db.lookup_webp(Path::new("c:/movies/a.mp4"), 5000, 100, 320)
                 .is_none()
         );
         assert!(
-            db.lookup_webp(Path::new("c:/movies/sub/b.mp4"), 5000, 100)
+            db.lookup_webp(Path::new("c:/movies/sub/b.mp4"), 5000, 100, 320)
                 .is_none()
         );
         // 別フォルダと類似名は残っている
         assert!(
-            db.lookup_webp(Path::new("c:/other/c.mp4"), 5000, 100)
+            db.lookup_webp(Path::new("c:/other/c.mp4"), 5000, 100, 320)
                 .is_some()
         );
         assert!(
-            db.lookup_webp(Path::new("c:/movies_backup/d.mp4"), 5000, 100)
+            db.lookup_webp(Path::new("c:/movies_backup/d.mp4"), 5000, 100, 320)
                 .is_some()
         );
     }
@@ -608,7 +620,7 @@ mod tests {
         let removed = db.clear_for_folder(Path::new("c:/movies")).unwrap();
         assert_eq!(removed, 2);
         assert!(
-            db.lookup_webp(Path::new("c:/other/x.mp4"), 5000, 100)
+            db.lookup_webp(Path::new("c:/other/x.mp4"), 5000, 100, 320)
                 .is_some()
         );
     }
@@ -641,7 +653,7 @@ mod tests {
         let db = TileThumbCache {
             conn: Mutex::new(conn),
         };
-        let got = db.lookup_webp(Path::new("c:/v.mp4"), 10000, 100);
+        let got = db.lookup_webp(Path::new("c:/v.mp4"), 10000, 100, 320);
         assert_eq!(got.as_deref(), Some(&[42u8][..]));
     }
 }
