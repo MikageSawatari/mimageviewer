@@ -1608,29 +1608,16 @@ impl App {
                                 let tags = self.cell_tag_list(idx).to_vec();
                                 let filter_match = self.folder_rating_match(idx);
                                 let filter_match_count = filter_match.map(|(c, _)| c);
-                                // 📌 バッジ (金色、アドレスバーの 📌 と統一色) — ユーザー
-                                // 設定の pin に関わるアイテムの目印。下記いずれかの条件で出す:
-                                //  1. このアイテム自身が pin 済みコンテナ (Folder/ZipFile/PdfFile)
-                                //     → 親グリッドで「この folder/ZIP/PDF のサムネは固定済み」
-                                //  2. 現在表示中の親コンテナの pin source 先
-                                //     → 自グリッドで「これが親に pin したターゲット」
-                                // 入れ子の pin (フォルダ A 内で B を pin、さらに親で A を pin)
-                                // でも 1 個のバッジで表示 (= 2 色の意味の違いをユーザーに
-                                // 問わせない統一表示)。pin_map は load_folder 時に
-                                // lookup_many で一括取得済み。
-                                let has_container_pin = match &self.items[idx] {
-                                    GridItem::Folder(p)
-                                    | GridItem::ZipFile(p)
-                                    | GridItem::PdfFile(p) => {
-                                        let key = crate::path_key::normalize_keep_drive(p);
-                                        self.folder_pin_map.contains_key(&key)
-                                    }
-                                    _ => false,
-                                };
-                                let is_pin_source = if has_container_pin {
-                                    // 重複評価を避ける — どちらかが true なら badge を出すだけ
-                                    false
-                                } else if let Some(cur) = self.current_folder.as_ref() {
+                                // 📌 バッジ (金色) — ユーザーが Pin 操作した対象アイテムの
+                                // 目印。「現在表示中のコンテナの pin source = この item」
+                                // (= ユーザーがこのアイテムを選択して P / 📌 を押した) のとき
+                                // のみ出す。
+                                //
+                                // **「コンテナ自身が pin 済み」の表示は出さない** (= ユーザーから
+                                // 「pin で表示されているサムネ」と「auto-pick で選ばれたサムネ」を
+                                // 区別させないことで、「badge = 自分が Pin 操作した対象」を 1 対 1
+                                // で対応させる)。
+                                let has_pin = if let Some(cur) = self.current_folder.as_ref() {
                                     let cur_key = crate::path_key::normalize_keep_drive(cur);
                                     self.folder_pin_map.get(&cur_key).is_some_and(|pin_src| {
                                         crate::folder_thumb_pins::source_from_grid_item(
@@ -1643,7 +1630,6 @@ impl App {
                                 } else {
                                     false
                                 };
-                                let has_pin = has_container_pin || is_pin_source;
                                 crate::app::draw_cell(
                                     ui,
                                     cell_rect,
