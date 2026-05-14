@@ -689,6 +689,16 @@ unsafe extern "system" fn wnd_proc(
                     native_mouse_button_event(msg, wparam, lparam),
                 ));
             }
+            // WM_XBUTTONUP に対して DefWindowProc に流すと、Windows が
+            // APPCOMMAND_BROWSER_BACKWARD/FORWARD を合成して WM_APPCOMMAND を再送する
+            // ([MS docs: Mouse Input Overview](https://learn.microsoft.com/en-us/windows/win32/inputdev/about-mouse-input))。
+            // 進む/戻るは既に MouseButton(Extra1/Extra2) で処理しているので、その後
+            // WM_APPCOMMAND を本ファイル下の handler が再度拾うと 1 押下 = 2 ナビになる。
+            // TRUE (= 処理済み) を返して APPCOMMAND 合成を抑止 (Codex 2 周目 P2)。
+            // APPCOMMAND 経路は driver / AHK が WM_APPCOMMAND を直接送る場合のみに限定する。
+            if msg == WM_XBUTTONUP {
+                return LRESULT(1);
+            }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
         WM_MOUSEWHEEL => {

@@ -862,6 +862,13 @@ unsafe extern "system" fn hud_wnd_proc(
                     }
                 }
             }
+            // WM_XBUTTONUP は MouseButton(Extra1/Extra2) で既に進む/戻るを処理済み。
+            // DefWindowProc に流すと Windows が APPCOMMAND_BROWSER_BACKWARD/FORWARD を
+            // 合成し、本ファイル下の WM_APPCOMMAND handler が再度 KeyDown(0xA6/0xA7) を
+            // 生成して 1 押下 = 2 ナビになるため、TRUE を返して抑止 (Codex 2 周目 P2)。
+            if msg == WM_XBUTTONUP {
+                return LRESULT(1);
+            }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }
 

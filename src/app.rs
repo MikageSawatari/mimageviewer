@@ -7858,11 +7858,22 @@ impl App {
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
-        // マウスドライバ / AHK 経由で積まれた進む/戻る pending は **early-return より前に
-        // drain** する。検索バー / ダイアログ / IME 変換中などショートカットを止める分岐で
-        // 早期 return すると pending が次フレームに持ち越され、フォーカス解除後に遅れて
-        // Ctrl+↑/↓ として暴発するため (Codex P2)。ブロック中は count を捨てる。
-        let (browser_back_count, browser_forward_count) = crate::take_pending_mouse_nav();
+        // マウスドライバ / AHK 経由で積まれた進む/戻る pending を early-return より前に
+        // drain する。検索バー / ダイアログ / IME 変換中などショートカットを止める分岐で
+        // 早期 return しても、ブロック中の pending は今フレームで破棄したい
+        // (= フォーカス解除後に遅れて Ctrl+↑/↓ として暴発するのを防ぐため、Codex P2)。
+        //
+        // ただし **フルスクリーン中は drain しない**。`App::update` は
+        // `handle_keyboard` → `render_fullscreen_viewport` の順で呼ぶため、ここで先に
+        // drain してしまうと fullscreen の `handle_fs_key_input` 側が pending を見られず、
+        // 画像系フルスクリーンの進む/戻る (= egui Key 経路に出ない WM_APPCOMMAND /
+        // Browser_Forward) が失われる (Codex 2 周目 P2)。fullscreen 中は fullscreen
+        // handler 側で drain する。
+        let (browser_back_count, browser_forward_count) = if self.fullscreen_idx.is_some() {
+            (0, 0)
+        } else {
+            crate::take_pending_mouse_nav()
+        };
 
         // ウィンドウにフォーカスがない場合はキー入力を無視
         let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
