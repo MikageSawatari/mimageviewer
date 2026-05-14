@@ -117,8 +117,10 @@
 
     <h2>設定の保存場所</h2>
     <p>アプリの設定は以下の場所に自動保存されます：</p>
-    <pre><code>%APPDATA%\mimageviewer\settings.json</code></pre>
-    <p>設定ファイルを削除すると、すべての設定が初期値にリセットされます。</p>
+    <pre><code>%APPDATA%\mimageviewer\settings.db</code></pre>
+    <p>設定ファイルを削除すると、すべての設定が初期値にリセットされます。
+    設定は自動的に 10 世代までバックアップされ、万一ファイルが壊れた場合は
+    起動時に自動復旧を試みます。</p>
     <p>起動時のエラーログは <code>%APPDATA%\mimageviewer\logs\</code> に保存されます。
     動作に問題が発生した場合はこのフォルダ内のログファイルをご確認ください。</p>
 

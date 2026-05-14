@@ -141,7 +141,7 @@ Lock 取得順序として `DspBridgeInner` の lock を握ったまま Windows 
 The bridge-owned VST editor surface uses a custom dark title area above the
 plugin child HWND. The title area includes a left-side power button that toggles
 the slot bypass state through the same Rust `DspBridge::set_bypass` path used by
-the VST3 playback panel, so the setting is persisted in `settings.json` and the
+the VST3 playback panel, so the setting is persisted in `settings.db` and the
 normal PDC auto-bypass guard still applies. The right side shows the current
 plugin-reported latency as a separate `ms` readout next to the close button; the
 readout is repainted when the bridge observes `kLatencyChanged`. The right-side
@@ -180,7 +180,7 @@ mimageviewer-core.exe (Rust)
 ├─ src/video/dsp/gui.rs: プラグイン GUI ホスト (Win32 子ウィンドウ)
 │   - フルスクリーン中は WS_EX_TOPMOST で動画の手前に維持
 │   - 各スロットが個別の HWND を持つが、すべて同じ bridge プロセス内で生成される
-└─ Settings (settings.json):
+└─ Settings (settings.db、SQLite):
     - vst3_enabled: bool (default false)
     - vst3_plugins: Vec<Vst3PluginEntry>  ← チェーン定義
     -   .path: String
@@ -294,7 +294,11 @@ bridge IPC のレイテンシ実測 (Phase 0b):
 
 ## 6. 設定永続化
 
-settings.json に以下を保存する:
+`settings.db` (SQLite) に以下を保存する。2026-05 の SQLite 移行後、`vst3_plugins` /
+`vst3_chain_slots` は専用テーブル (`vst3_plugins` / `vst3_chain_slots`) に正規化され、
+それ以外のスカラ設定は `settings_kv` テーブルに JSON 値として格納される
+([settings-sqlite-migration.md](settings-sqlite-migration.md) 参照)。論理的なスキーマは
+従来の JSON と同一なので、以下は等価な JSON 表現として記載する:
 
 ```json
 {
@@ -440,7 +444,7 @@ CLAUDE.md の「リリース手順チェックリスト」に追記:
       (vendor/vst3-host/mimageviewer-vst3-host.exe が更新されている)
 - [ ] Pro-Q 4 等の商用プラグインで音声経路を実機確認
 - [ ] 動画再生中の VST3 パネルから全体表示 / 個別 GUI / bypass が操作できること
-- [ ] settings.json に `vst3_plugins[].state` が保存され、再起動で復元されること
+- [ ] settings.db に `vst3_plugins[].state` が保存され、再起動で復元されること
 - [ ] safety limiter 有効時に過大出力が -1dBFS ceiling 以下に抑えられること
 # 2026-05 chain bridge migration (実装済)
 

@@ -378,33 +378,40 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
 
 ## 8. 設定項目
 
-設定は JSON ファイルとして `%APPDATA%\mimageviewer\settings.json` に自動保存される。
+設定は SQLite データベース `%APPDATA%\mimageviewer\settings.db` に自動保存される
+(2026-05 移行。旧 `settings.json` からは初回起動時に自動 migration し、旧ファイルは
+`settings.json.migrated-<ts>` にリネームされる)。詳細は
+[settings-sqlite-migration.md](settings-sqlite-migration.md) を参照。
 
 ### 永続化と復旧の仕組み
 
-- **アトミック保存**: `settings.json.tmp` に書いてから rename で置き換える
-  (Windows でも `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` 経由で atomic)。
-  書き込み中の電源断・force kill で半端ファイルが残らない。
-- **世代バックアップ (10 世代)**: 起動 1 回につき最初の保存で 1 段ローテートし、
-  `settings.json.bak1`〜`settings.json.bak10` に過去 10 セッション分の
-  スナップショットを保持する。同セッション内の追加保存は main を上書きするだけで
+- **アトミック保存**: SQLite トランザクション内で全テーブルを DELETE+INSERT してから
+  `commit()` する。VST3 chain など大型 row は hash で変更検出し、未変更ならスキップ。
+  書き込み中の電源断・force kill で半端な状態が残らない (= WAL + commit 境界)。
+- **世代バックアップ (10 世代)**: 起動 1 回につき最初の **user save** で 1 段ローテートし、
+  `VACUUM INTO` で `settings.db.bak1`〜`settings.db.bak10` に過去 10 セッション分の
+  consistent な snapshot を保持する。同セッション内の追加保存は in-place 更新のみで
   bak には伝播しない (= 1 起動 = 1 世代)。
-- **自動復旧**: 起動時に main がパース失敗していたら `settings.json.broken-<TS>` に
-  rename 退避し、`bak1`→`bak10` を新→古の順に試行して最初にパース可能なものから復元する。
-  全滅した場合のみビルトイン default に落ちる。`PermissionDenied` 等の I/O エラーは
-  一時的な可能性があるため main を退避せず、bak からの読み出しのみ行う。
-- **I/O エラー時の保存抑止**: 起動時に main が I/O エラーで読めなかったセッションでは、
-  当該セッション中の `Settings::save()` をすべて no-op にする。理由は世代ローテーション
-  が `settings.json -> bak1` rename で **アクセス不能なだけの真の main** を bak1 に
-  置き換えてしまう可能性があるため。永続化はそのセッション分諦め、次回起動でリトライする。
+- **自動復旧**: 起動時に main DB が壊れていたら (`PRAGMA integrity_check` 失敗 /
+  `NotADatabase` / `DatabaseCorrupt`)、`settings.db` / `settings.db-wal` / `settings.db-shm`
+  を 3 セットで `.corrupted-<ts>-<seq>` に quarantine 退避し、`bak1`→`bak10` を新→古の
+  順に試行して最初に開けたものから復元する。全滅した場合のみビルトイン default に落ちる。
+  `DatabaseBusy` / `CannotOpen` 等の transient I/O エラーは 50ms backoff で 3 回 retry し、
+  それでも失敗すれば quarantine せず save 抑止のみ行う (= 一時的なアクセス不能で本物の
+  DB を失わない)。
+- **I/O エラー時の保存抑止**: 起動時に main DB が transient I/O エラーで開けなかった
+  セッション、または全復旧経路が失敗したセッションでは、当該セッション中の
+  `Settings::save()` をすべて no-op にする (`MAIN_UNREADABLE_THIS_SESSION` +
+  `settings_db::SAVE_SUPPRESSED`)。永続化はそのセッション分諦め、次回起動でリトライする。
 - **アップグレード前バックアップ**: 直近に保存したバイナリと現バイナリの
-  バージョンが違うとき、初回 load で現状の `settings.json` を
-  `settings.json.preupgrade-v<old>` に複製する。スキーマ破壊が自動復旧で
+  バージョンが違うとき、初回 load で現状の `settings.db` を `VACUUM INTO` で
+  `settings.db.preupgrade-v<old>` に複製する。スキーマ破壊が自動復旧で
   救えなかった場合の最終ライフライン。同じ前バージョン名の snapshot が既に
   存在するなら上書きしない。
-- **診断ログ**: 復旧経路で起きたイベント (パース失敗 / quarantine / recovery /
-  preupgrade / save 抑止) は **`<data_dir>/logs/settings.log` に常に append** される。
-  release ビルド (= `--log` 不指定) でも残り、ユーザー報告時の調査に使える。
+- **診断ログ**: 復旧経路で起きたイベント (SQLite open エラーの primary/extended code /
+  quarantine / bak recovery / preupgrade / save 抑止) は
+  **`<data_dir>/logs/settings.log` に常に append** される。release ビルド
+  (= `--log` 不指定) でも残り、ユーザー報告時の調査に使える。
 
 ### 8.1 主要設定
 
@@ -591,7 +598,7 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - [x] フォルダツリー深さ優先走査
 - [x] フルスクリーン表示（バイキュービック、プリフェッチ付き）
 - [x] 設定ダイアログ（列数・縦横比・ソート・キャッシュ・ツールバー・環境設定）
-- [x] 設定の永続化（JSON → `%APPDATA%\mimageviewer\settings.json`）
+- [x] 設定の永続化（SQLite → `%APPDATA%\mimageviewer\settings.db`、旧 `settings.json` は初回起動で自動 migration）
 
 ### Phase 1.5（サムネイルカタログ）✅ 完了
 

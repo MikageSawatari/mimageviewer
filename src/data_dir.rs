@@ -124,11 +124,23 @@ fn embedded_file_hash_matches(
     Ok(false)
 }
 
+/// `bytes` を `path` にアトミックに書き出す。
+///
+/// 旧実装は `remove_file(path)` → `rename(tmp, path)` だったが、その間 `path` の実体が
+/// 物理的に存在しない race window があった (spec §11.1)。Rust の `std::fs::rename` は
+/// Windows でも `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` を使うので、既存ファイルへの
+/// 上書きは OS レベルでアトミックに行われる。よって `remove_file` は不要。
+///
+/// `rename` が失敗した場合は tmp ファイルだけ掃除してエラーを返す
+/// (= 元の `path` は手付かずで残る)。
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp_path = tmp_path_for(path);
     std::fs::write(&tmp_path, bytes)?;
-    let _ = std::fs::remove_file(path);
-    std::fs::rename(&tmp_path, path)?;
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        // rename 失敗時は中途半端な tmp を残さない。remove 失敗は無視 (元エラーを優先)。
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
     Ok(())
 }
 

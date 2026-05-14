@@ -53,7 +53,7 @@
     <ul>
       <li>Windows 10 / 11（64ビット）以外の OS では動作しません</li>
       <li>DirectX 12 対応 GPU が必要です。グラフィックドライバーを最新に更新してください</li>
-      <li><code>%APPDATA%\mimageviewer\settings.json</code> が破損している場合は削除してください（設定はリセットされます）</li>
+      <li><code>%APPDATA%\mimageviewer\settings.db</code> が破損している場合、通常はアプリが起動時に自動でバックアップから復旧します。それでも起動しない場合は <code>settings.db</code> を削除してください（設定はリセットされます）</li>
       <li>ウイルス対策ソフトによってブロックされていないか確認してください</li>
     </ul>
 
@@ -159,7 +159,7 @@
           <tr><th>対象</th><th>パス</th></tr>
         </thead>
         <tbody>
-          <tr><td>設定ファイル</td><td><code>%APPDATA%\mimageviewer\settings.json</code></td></tr>
+          <tr><td>設定ファイル</td><td><code>%APPDATA%\mimageviewer\settings.db</code></td></tr>
           <tr><td>回転情報 DB</td><td><code>%APPDATA%\mimageviewer\rotation.db</code></td></tr>
           <tr><td>サムネイルキャッシュ</td><td><code>%APPDATA%\mimageviewer\cache\</code></td></tr>
           <tr><td>すべての設定</td><td><code>%APPDATA%\mimageviewer\</code> フォルダ全体</td></tr>
