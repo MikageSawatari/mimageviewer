@@ -284,9 +284,17 @@ fn run_worker(
             if cancel.load(Ordering::Acquire) {
                 return;
             }
-            if pending_target_bits.load(Ordering::Acquire) != PENDING_NONE {
-                // より新しい hover request が来た。現在の decode を捨てて outer
-                // loop に戻り、最新 target を処理する (drain semantics の維持)。
+            // 別 bucket への新しい hover request が来たら現在の decode を捨てて
+            // outer loop に戻り、最新 target を処理する (drain semantics の維持)。
+            // overlay は target が変わらなくても 250ms ごとに RequestSeekThumbnail
+            // を再送するため、同 bucket の pending では supersede しない — そうしないと
+            // 1 decode が 250ms を超える長 GOP / 重い動画で、同じ target に自分自身を
+            // abort/restart させ続け、サムネが永遠に完成しない。同 bucket の pending は
+            // decode 完了後に outer loop の cache hit で無害に消化される。
+            let pending = pending_target_bits.load(Ordering::Acquire);
+            if pending != PENDING_NONE
+                && bucket_key(f64::from_bits(pending)) != bucket_key(target_secs)
+            {
                 superseded = true;
                 break;
             }
