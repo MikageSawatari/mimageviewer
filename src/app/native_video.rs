@@ -2219,7 +2219,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn handle_native_video_set_pin_command(
+    pub(crate) fn handle_native_video_set_pin_command(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
