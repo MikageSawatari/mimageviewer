@@ -411,8 +411,9 @@ pub(crate) fn paint_transparent_bg(
 const CHECKMARK_MARGIN: f32 = 16.0;
 /// 見開き表示の区切り線の幅 (px)
 const SPREAD_DIVIDER_WIDTH: f32 = 2.0;
-/// フィードバックトースト表示時間（秒）
-const FEEDBACK_TOAST_DURATION: f32 = 1.2;
+/// フィードバックトースト表示時間（秒）。短い確認系トーストの既定値。
+/// 複数行の案内文は `show_feedback_toast_with_duration` で長めを指定する。
+pub(crate) const FEEDBACK_TOAST_DURATION: f32 = 1.2;
 /// 境界ヒント（最初/最後の項目に達した案内）の表示時間（秒）
 const BOUNDARY_HINT_DURATION: f32 = 2.5;
 /// 画像・動画フォルダが見つからない旨のヒント表示時間（秒）。メッセージが長く
@@ -5188,18 +5189,18 @@ impl App {
         full_rect: egui::Rect,
         ctx: &egui::Context,
     ) {
-        let Some((ref text, start_time)) = self.fs_feedback_toast else {
+        let Some((ref text, start_time, duration)) = self.fs_feedback_toast else {
             return;
         };
         let elapsed = start_time.elapsed().as_secs_f32();
-        if elapsed > FEEDBACK_TOAST_DURATION {
+        if elapsed > duration {
             self.fs_feedback_toast = None;
             return;
         }
 
         // フェードアウト (最後の0.3秒)
-        let alpha = if elapsed > FEEDBACK_TOAST_DURATION - 0.3 {
-            ((FEEDBACK_TOAST_DURATION - elapsed) / 0.3).clamp(0.0, 1.0)
+        let alpha = if elapsed > duration - 0.3 {
+            ((duration - elapsed) / 0.3).clamp(0.0, 1.0)
         } else {
             1.0
         };

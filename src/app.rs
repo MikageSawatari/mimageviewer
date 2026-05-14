@@ -2253,9 +2253,11 @@ pub struct App {
     /// Windows IME のキャンセル Escape では Ime::Disabled と Key::Escape が別フレームに
     /// 分かれて届くことがあるため、Ime イベント後 300ms は IME 入力中として扱う。
     pub(crate) ime_last_event_at: Option<std::time::Instant>,
-    /// 右上フィードバック表示: (テキスト, 表示開始時刻)。フルスクリーン / グリッド共通。
-    /// 命名の `fs_` プレフィックスはフルスクリーン専用だった頃の名残。
-    pub(crate) fs_feedback_toast: Option<(String, std::time::Instant)>,
+    /// 右上フィードバック表示: (テキスト, 表示開始時刻, 表示秒数)。
+    /// フルスクリーン / グリッド共通。命名の `fs_` プレフィックスはフルスクリーン
+    /// 専用だった頃の名残。表示秒数はトーストごとに指定でき、短い確認系は既定
+    /// `FEEDBACK_TOAST_DURATION`、複数行の案内文は長めを使う。
+    pub(crate) fs_feedback_toast: Option<(String, std::time::Instant, f32)>,
     /// フルスクリーンでマウスカーソルの最終活動時刻 (移動 / クリック / キー入力)。
     /// パネル / HUD が全て非表示で `CURSOR_HIDE_IDLE_SECS` 経過したらカーソルを隠す。
     /// `None` はまだ活動が記録されていない状態 (= 直前に活動があったとみなしカーソル表示)。
@@ -6521,11 +6523,13 @@ impl App {
                 .map(|pin| !pin.thumb_webp.is_empty())
                 .unwrap_or(false);
             if !has_webp {
-                self.show_feedback_toast(
+                // 2 行の操作ガイドなので既定 1.2 秒では読み切れない。長め (5 秒) で表示。
+                self.show_feedback_toast_with_duration(
                     "動画内でピン留めされた画像がないため、設定できません\n\
                      先にフルスクリーンで動画を開き、HUD のピンボタン (または P キー) で\
                      フレームを保存してください"
                         .to_string(),
+                    5.0,
                 );
                 crate::logger::log(format!(
                     "folder_thumb_pin: video pin rejected (no WebP) for {}",
@@ -13312,11 +13316,19 @@ impl App {
         }
     }
 
-    /// 右上フィードバック表示を設定する。
+    /// 右上フィードバック表示を設定する (既定の表示時間)。
+    /// 短い確認系トースト (レーティング変更 / スロット適用など) 向け。
     pub(crate) fn show_feedback_toast(&mut self, text: String) {
+        self.show_feedback_toast_with_duration(text, crate::ui_fullscreen::FEEDBACK_TOAST_DURATION);
+    }
+
+    /// 右上フィードバック表示を設定する (表示時間を明示指定)。
+    /// 複数行の案内文 (例: 動画 pin の操作ガイド) は既定 1.2 秒では読み切れないため、
+    /// 長め (4〜5 秒) を渡す。
+    pub(crate) fn show_feedback_toast_with_duration(&mut self, text: String, duration_secs: f32) {
         #[cfg(windows)]
         self.show_native_video_overlay_toast(text.clone(), false);
-        self.fs_feedback_toast = Some((text, std::time::Instant::now()));
+        self.fs_feedback_toast = Some((text, std::time::Instant::now(), duration_secs));
     }
 
     /// 指定ページの有効パラメータへの参照を返す。
