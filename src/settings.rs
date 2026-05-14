@@ -1118,7 +1118,8 @@ pub const AUDIO_NORMALIZE_TARGET_LUFS_MILLI_MIN: i32 = -60_000;
 pub const AUDIO_NORMALIZE_TARGET_LUFS_MILLI_MAX: i32 = 0;
 
 /// 動画タイルモード列数の候補 (Phase 6.D)。
-pub const VIDEO_TILE_COLUMN_CANDIDATES: &[usize] = &[6, 10, 16, 20, 26, 30];
+/// 4 は縦長ディスプレイ向け (6 列でもタイルが小さいため)。
+pub const VIDEO_TILE_COLUMN_CANDIDATES: &[usize] = &[4, 6, 10, 16, 20, 26, 30];
 
 fn default_video_tile_columns() -> usize {
     10

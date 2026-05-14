@@ -28,7 +28,7 @@ use crate::app::App;
 use crate::fs_animation::FsCacheEntry;
 use crate::video::tile_thumbnails::TileThumbnailWorker;
 
-// 列数候補は `crate::settings::VIDEO_TILE_COLUMN_CANDIDATES` (= 6/10/16/20/26/30)。
+// 列数候補は `crate::settings::VIDEO_TILE_COLUMN_CANDIDATES` (= 4/6/10/16/20/26/30)。
 // `Settings.video_tile_columns` が source of truth。Ctrl+Wheel で次/前の候補に
 // 切替し、Setting に保存する。
 
