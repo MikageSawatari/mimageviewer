@@ -1859,6 +1859,97 @@ pub(super) fn page_susie_plugins(ui: &mut egui::Ui, state: &mut PreferencesState
     crate::ui_susie_diagnostic::render_diagnostic(ui, &status, &plugins);
 }
 
+/// 開発者 / 診断ページ。
+///
+/// 普通の利用者が「再生できない」「重い」等の不具合をサポートに伝えるとき、
+/// コマンドライン引数や `%APPDATA%` の手探りなしでログを集められるようにする。
+pub(super) fn page_developer(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    ui.label(
+        "不具合をサポートに調べてもらうための診断機能です。\n\
+         通常の利用では設定する必要はありません。",
+    );
+    ui.add_space(12.0);
+
+    // ── 診断情報の書き出し ──────────────────────────────────────
+    ui.label(egui::RichText::new("診断情報").strong());
+    ui.add_space(4.0);
+    ui.label(
+        "動作ログ・エラーログ・(記録していれば) 性能ログを 1 つの zip に\n\
+         まとめてデスクトップに保存します。サポートへはこの zip を送ってください。",
+    );
+    ui.add_space(6.0);
+
+    if ui.button("ログを zip にする").clicked() {
+        // 利用者が明示的に押すボタンなので同期実行で問題ない
+        // (ログは通常数 MB、最大でも数十 MB で deflate 圧縮は速い)。
+        state.diag_export_result = Some(crate::diagnostics::export_diagnostics_zip());
+    }
+
+    match &state.diag_export_result {
+        Some(Ok(path)) => {
+            ui.add_space(6.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(120, 200, 120),
+                format!("保存しました: {}", path.display()),
+            );
+            let parent = path.parent().map(|p| p.to_path_buf());
+            if let Some(parent) = parent {
+                if ui.button("保存先フォルダを開く").clicked() {
+                    open_in_explorer(&parent);
+                }
+            }
+        }
+        Some(Err(msg)) => {
+            ui.add_space(6.0);
+            ui.colored_label(
+                egui::Color32::from_rgb(230, 120, 120),
+                format!("書き出しに失敗しました: {msg}"),
+            );
+        }
+        None => {}
+    }
+
+    ui.add_space(8.0);
+    ui.label(
+        egui::RichText::new("※ zip にはファイル名やフォルダのパスが含まれます。")
+            .weak()
+            .size(11.0),
+    );
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    // ── 性能ログ ────────────────────────────────────────────────
+    ui.label(egui::RichText::new("性能ログ").strong());
+    ui.add_space(4.0);
+    ui.checkbox(
+        &mut state.settings.perf_log_enabled,
+        "性能ログを記録する (次回起動から有効)",
+    )
+    .on_hover_text(
+        "OFF (既定): 性能ログは記録しません。\n\
+         ON: フレーム単位の詳細な性能イベントを記録します。\n\
+         「動作が重い」「カクつく」といった不具合をサポートに調べてもらうときだけ\n\
+         ON にしてください。ログファイルが大きくなるため、普段は OFF のままで\n\
+         問題ありません。変更は次回起動時から反映されます。",
+    );
+
+    ui.add_space(12.0);
+    ui.separator();
+    ui.add_space(6.0);
+
+    ui.label(
+        egui::RichText::new(
+            "※ 動作ログ・エラーログは常に記録されています (古いものは自動的に\n  \
+             整理されるためディスクを圧迫しません)。上の「ログを zip にする」で\n  \
+             まとめて取り出せます。",
+        )
+        .weak()
+        .size(11.0),
+    );
+}
+
 fn open_in_explorer(path: &std::path::Path) {
     // Explorer でフォルダを開く。path が存在しなければ何もしない。
     if !path.exists() {

@@ -814,6 +814,15 @@ pub struct Settings {
     #[serde(default)]
     pub update_check_dismissed_version: Option<String>,
 
+    // ── 開発者 / 診断 ─────────────────────────────────────────────
+    /// 性能ログ (perf_events.jsonl、構造化イベントログ) を記録するか。
+    /// 既定 OFF。フレーム単位のイベントを大量に吐くため常時 ON にはしない。
+    /// 「動作が重い / カクつく」系の不具合をサポートに調べてもらうときだけ ON にする。
+    /// 起動時に 1 度だけ読まれるので、変更は次回起動から有効。
+    /// (`--perf-log` 引数は従来どおり起動直後から全イベントを記録する開発者向け経路。)
+    #[serde(default)]
+    pub perf_log_enabled: bool,
+
     // ── 動画インライン再生 ────────────────────────────────────────
     /// 動画再生時の既定音量 (線形ゲイン 0.0..+18dB 相当)。1.0 を超える値は
     /// 音声ポンプ側で pre-limiter boost として扱う。
@@ -1532,6 +1541,7 @@ impl Default for Settings {
             write_rating_to_xmp: false,
             update_check_enabled: true,
             update_check_dismissed_version: None,
+            perf_log_enabled: false,
             video_volume: default_video_volume(),
             video_autoplay: false,
             video_autoplay_mode: VideoAutoplayMode::default(),

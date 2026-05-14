@@ -14,6 +14,7 @@ pub mod data_dir;
 #[cfg(windows)]
 mod dcomp_presenter_test;
 pub mod delete_worker;
+pub mod diagnostics;
 pub mod dwm_transitions;
 pub mod exif_reader;
 pub mod external_links;
@@ -227,10 +228,24 @@ fn install_panic_log_hook() {
     }));
 }
 
+/// panic.log のローテーション上限。`mimageviewer.log` と違い panic.log は
+/// セッションを跨いで append し続けるため、同じ panic の連発で無制限に
+/// 膨らみ得る。上限を超えたら 1 世代だけ `.bak` に退避して作り直す。
+const MAX_PANIC_LOG_BYTES: u64 = 4 * 1024 * 1024;
+
 fn append_panic_log_entry(msg: &str) {
     let log_dir = data_dir::logs_dir();
     let _ = std::fs::create_dir_all(&log_dir);
     let panic_log = log_dir.join("panic.log");
+    // 追記前にサイズを確認し、上限超過なら panic.log -> panic.log.bak へ
+    // ローテーション (logger.rs の rotate_if_needed と同じ方針)。panic は
+    // 例外的にしか起きないので per-call の metadata syscall は無視できる。
+    let current_len = std::fs::metadata(&panic_log).map(|m| m.len()).unwrap_or(0);
+    if current_len >= MAX_PANIC_LOG_BYTES {
+        let backup = panic_log.with_extension("log.bak");
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::rename(&panic_log, &backup);
+    }
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -627,11 +642,13 @@ fn main() -> eframe::Result {
     #[cfg(windows)]
     install_native_exception_log_hook();
 
-    // デバッグビルドでは常にログ出力。リリースビルドでは --log 引数で有効化
-    let log_enabled = cfg!(debug_assertions) || std::env::args().any(|a| a == "--log");
-    if log_enabled {
-        logger::init();
-    }
+    // 通常ログ (mimageviewer.log) は常時記録する。logger 側が 16MiB で
+    // ローテーション (現行 + .bak の 2 世代) し、起動時に前回分を .prev へ
+    // 退避するためディスク使用量は上限固定で、長時間連続起動でも問題ない。
+    // 旧仕様ではリリースビルドで `--log` 引数が必要だったが、「不具合が起きる
+    // 前に有効化していないと痕跡が残らない」問題があったため常時 ON に変更。
+    // `--log` 引数は後方互換のため受け付けるが現在は no-op。
+    logger::init();
 
     // --perf-log: 構造化イベントログ (JSON Lines) を有効化する。
     // 無指定時は `perf::is_enabled()` が false のまま、全 perf::event 呼出しが即 return。
@@ -732,6 +749,15 @@ fn main() -> eframe::Result {
     let t = Instant::now();
     let saved = settings::Settings::load();
     emit_startup("settings_load", Some(t));
+
+    // 設定 (開発者タブ) で性能ログが ON なら、ここで perf を有効化する。
+    // `perf::init_with_path` の START / FILE は OnceLock なので、CLI の `--perf-log`
+    // で既に有効化済みなら 2 回目の呼び出しは no-op。逆に CLI 未指定でこの設定だけ
+    // ON のときは、ここが実初期化になる (= 起動直後の数イベントだけは取り逃すが、
+    // 利用者が「重い」系の調査で必要とする nav / scroll / 再生のイベントは網羅できる)。
+    if saved.perf_log_enabled && !perf::is_enabled() {
+        perf::init_with_path(true, Some(prog_start), None);
+    }
 
     // Susie プラグインワーカープール: バックグラウンドで初期化する
     // (プラグインが多いと handshake に数百ms かかる可能性があるため、

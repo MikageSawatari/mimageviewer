@@ -410,8 +410,9 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
   存在するなら上書きしない。
 - **診断ログ**: 復旧経路で起きたイベント (SQLite open エラーの primary/extended code /
   quarantine / bak recovery / preupgrade / save 抑止) は
-  **`<data_dir>/logs/settings.log` に常に append** される。release ビルド
-  (= `--log` 不指定) でも残り、ユーザー報告時の調査に使える。
+  **`<data_dir>/logs/settings.log` に常に append** される。logger の初期化状態に
+  依存しない独立 sink なので、起動ごく初期の設定復旧フェーズでも確実に残り、
+  ユーザー報告時の調査に使える。
 
 ### 8.1 主要設定
 
@@ -576,6 +577,37 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
   - ページ・コンテナ両方に同じフィルタが適用される (フォルダ一覧を★絞り込みできる)
   - 検索フィルタと AND 結合
 - Ctrl+A: 現在のフィルタで表示中のアイテム（画像/ZIP画像/PDFページ/動画）を全てチェックに入れる
+
+### 8.8 開発者 / 診断
+
+不具合報告時に、利用者がコマンドライン引数や `%APPDATA%` の手探りをせずに
+ログを集められるようにするための機能群。
+
+- **動作ログ (`mimageviewer.log`) は常時記録**: 旧仕様ではリリースビルドで
+  `--log` 引数を付けないと記録されなかったが、「不具合が起きる前に有効化して
+  いないと痕跡が残らない」問題があったため常時 ON にした。`--log` 引数は後方互換で
+  受け付けるが現在は no-op。`logger.rs` が 16 MiB で `mimageviewer.log.bak` に
+  ローテーションし、起動時に前回分を `mimageviewer.log.prev` に退避するため、
+  長時間連続起動でもディスク使用量は上限固定。
+- **`panic.log` のローテーション**: panic フックが書く `panic.log` は
+  セッションを跨いで append し続けるため、同じ panic の連発で無制限に膨らみ得た。
+  4 MiB 超で `panic.log.bak` に 1 世代退避してから作り直す (`main.rs`
+  `append_panic_log_entry`)。
+- **`perf_log_enabled`** (bool, デフォルト false): 性能ログ
+  (`perf_events.jsonl`、構造化イベントログ) を記録するかの設定。フレーム単位の
+  イベントを大量に吐くため常時 ON にはしない。起動時に 1 度だけ読まれ、ON なら
+  `Settings::load()` 後に `perf::init_with_path` を呼んで有効化する
+  (`perf::init` の START/FILE は `OnceLock` なので `--perf-log` 指定済みなら no-op)。
+  変更は次回起動から反映。`--perf-log` 引数は従来どおり起動直後から全イベントを
+  記録する開発者向け経路。
+- **環境設定「開発者」タブ** (`PreferencesPage::Developer`): 上記 `perf_log_enabled`
+  のトグルと、「ログを zip にする」ボタンを置く。
+- **診断 zip 書き出し** (`diagnostics.rs` `export_diagnostics_zip`): logs ディレクトリの
+  ログ群 (動作ログ・`panic.log`・`settings.log`・worker ログ・現行 `perf_events.jsonl`)
+  と `system_info.txt` (バージョン/OS/GPU) を 1 つの zip にまとめ、デスクトップ
+  (`SHGetKnownFolderPath(FOLDERID_Desktop)` で解決) に
+  `mImageViewer_diag_<日時>.zip` として保存する。rotate 済みの perf 世代
+  (`perf_events.1.jsonl` 等) は巨大なので除外する。
 
 ---
 

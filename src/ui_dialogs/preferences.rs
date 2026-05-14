@@ -53,6 +53,8 @@ pub(crate) enum PreferencesPage {
     Video,
     /// VST3 プラグイン設定 (= 有効化 + チェーン編集)
     Vst3,
+    /// 開発者 / 診断 (ログ zip 書き出し・性能ログ)
+    Developer,
 }
 
 impl PreferencesPage {
@@ -78,6 +80,7 @@ impl PreferencesPage {
             Self::UpdateCheck => "更新確認",
             Self::Video => "動画再生",
             Self::Vst3 => "VST3 プラグイン",
+            Self::Developer => "開発者",
         }
     }
 }
@@ -177,6 +180,12 @@ const TREE: &[TreeCategory] = &[
         page: Some(PreferencesPage::Vst3),
         children: &[],
     },
+    // 開発者 / 診断 (ログ zip 書き出し・性能ログ記録)
+    TreeCategory {
+        label: "開発者",
+        page: Some(PreferencesPage::Developer),
+        children: &[],
+    },
 ];
 
 // ── 一時編集状態 ────────────────────────────────────────────────
@@ -255,6 +264,10 @@ pub(crate) struct PreferencesState {
     /// `dsp_bridge` から毎フレーム refresh される (= ON/OFF が即座に反映)。
     #[cfg(windows)]
     pub vst3_auto_bypassed: Vec<(String, f64)>,
+
+    /// 開発者タブ「ログを zip にする」ボタンの直近の実行結果。
+    /// `Ok(path)` なら作成した zip パス、`Err(msg)` なら失敗理由を表示する。
+    pub diag_export_result: Option<Result<std::path::PathBuf, String>>,
 }
 
 impl PreferencesState {
@@ -335,6 +348,7 @@ impl PreferencesState {
             vst3_show_unusable: false,
             #[cfg(windows)]
             vst3_auto_bypassed: Vec::new(),
+            diag_export_result: None,
         }
     }
 }
@@ -801,6 +815,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::UpdateCheck => page_update_check(ui, state),
         PreferencesPage::Video => page_video(ui, state),
         PreferencesPage::Vst3 => page_vst3(ui, state),
+        PreferencesPage::Developer => page_developer(ui, state),
     }
 }
 
