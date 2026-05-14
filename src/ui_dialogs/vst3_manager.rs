@@ -235,7 +235,7 @@ impl App {
                 }
                 ui.colored_label(
                     egui::Color32::from_rgb(230, 180, 80),
-                    "VST3 機能は環境設定→動画 タブから\n有効にしてください。",
+                    "VST3 機能は環境設定→VST3 プラグイン タブから\n有効にしてください。",
                 );
                 return;
             }
