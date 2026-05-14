@@ -2347,19 +2347,11 @@ impl Settings {
     /// (`BACKUP_DONE_THIS_SESSION`)、それ以降は in-place で `save_full` のみ実行する。
     /// `MAIN_UNREADABLE_THIS_SESSION` または `settings_db::save_suppressed()` が立って
     /// いれば一切書き込まない。
-    #[track_caller]
+    ///
+    /// Phase 6 (2026-05-14) で `MIV_SETTINGS_SAVE_TRACE` の Phase 0 計装は削除済み。
+    /// Phase 0 の実測結果から hot-path upsert API (e.g. `upsert_video_resume_position`) が
+    /// 必要かどうかは future Phase 7 で検討する。
     pub fn save(&self) {
-        // Phase 0 計装: `MIV_SETTINGS_SAVE_TRACE=1` で有効化、save() の caller を
-        // settings.log に記録する。Phase 3 の hot-path 最適化の必要性を実測判定するため。
-        // SQLite 移行完了 (Phase 6) で削除する。
-        if std::env::var_os("MIV_SETTINGS_SAVE_TRACE").is_some() {
-            let caller = std::panic::Location::caller();
-            settings_diag_log(&format!(
-                "settings: save called from {}:{}",
-                caller.file(),
-                caller.line()
-            ));
-        }
         self.save_internal(/* allow_rotation = */ true);
     }
 
