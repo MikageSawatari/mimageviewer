@@ -5,7 +5,9 @@
 
 ## ステータス (2026-05-14)
 
-**Phase 0-6 実装完了**。Codex review 計 26 ラウンド通過。894 unit tests / 13 ignored (旧 JSON 経路テスト)。
+**Phase 0-7 実装完了**。Codex review 計 27 ラウンド通過。894 unit tests pass / 13 ignored
+(うち 12 は旧 JSON 経路の `#[ignore]` テスト、1 は SQLite 移行とは無関係の post_filter
+性能テスト)。
 
 | Phase | コミット数 | Codex round | 主成果物 |
 |---|---|---|---|
@@ -15,6 +17,7 @@
 | 3 | 3 | 3 | `Settings::load` / `save` を SettingsDb 経由に rewire、`SettingsDb::rotate_backups`、`save_internal_no_rotation` |
 | 4 | 4 | 4 | `folder_tree::FolderTreeOptions`、`susie_loader::init_pool` (2 段階初期化 + 世代カウンタ)、`App::new_from_settings`、並列 `Settings::load()` を main 1 箇所に集約 |
 | 5+6 | 1 | 1 | spec §5 backup migration 確認、Phase 0 計装削除 |
+| 7 | 1 | 1 | ドキュメント更新 (本書 + CLAUDE.md + docs/architecture-overview.md + README.md) |
 
 実装ハイライト:
 - ファイル単体の transient I/O 失敗で「全 NotFound → defaults 上書き」する事故を構造的に排除
@@ -25,9 +28,16 @@
 - `bootstrap_complete` marker で「init_schema 後 / save_full 前に crash」した中身ゼロの DB を Corrupted として bak に倒す
 - Susie pool は init/reload 世代カウンタで stale build が user choice を上書きしないようガード
 
-未実施 Phase:
-- **Phase 7**: テスト整備 (Phase 1/2 で既に並行整備済み) + ドキュメント (= 本ファイル + CLAUDE.md + architecture-overview.md + README)。本コミットで完了予定。
-- **Phase 6 (deferred)**: 旧 `*.json` save 経路の物理削除。spec §9 で「数バージョン後に」と明記。現状は `#[allow(dead_code)]` で残置。
+将来の delete (本ロードマップ外):
+- **旧 `*.json` save 経路の物理削除**: spec §9 Phase 6 で「数バージョン後に」と明記。
+  現状は `try_load_with_recovery` / `rotate_backups` / `write_atomic` / `quarantine_path` /
+  `preupgrade_path` / `LoadOutcome` / `Settings::settings_path` / `log_disk_snapshot` /
+  `log_one_file_snapshot` / `any_settings_file_exists` を `#[allow(dead_code)]` で残置。
+  数バージョン後 (= 旧 JSON → SQLite 移行を経験したユーザーの settings.db が安定したことを
+  確認してから) `.migrated-<ts>` リネーム経路ごと撤去する。
+- **Phase 0 計装の再投入 (hot-path upsert API)**: Phase 0 の `MIV_SETTINGS_SAVE_TRACE`
+  実測結果を踏まえ、`upsert_video_resume_position` 等の差分 row write API を追加するかを
+  別途検討する (Phase 6 で計装は一旦撤去済み、必要なら再導入)。
 
 ## 1. 動機
 
