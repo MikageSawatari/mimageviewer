@@ -157,6 +157,22 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
         &mut s.show_toolbar_folder,
         "フォルダ (アドレスバー、別の場所に表示)",
     );
+    // 代表サムネ固定 (📌) ボタンはアドレスバーの一部だが、機能としては独立した
+    // 切り替えを提供する (= 自動代表サムネで運用するユーザー向けに非表示にできる)。
+    ui.add_enabled(
+        s.show_toolbar_folder,
+        egui::Checkbox::new(
+            &mut s.show_address_bar_folder_pin,
+            "└ 代表サムネ固定 (📌) ボタンを表示",
+        ),
+    )
+    .on_hover_text(
+        "アドレスバーの 📌 ボタンで、選択中のアイテムを\
+         フォルダ / ZIP / PDF の代表サムネに固定できます。\n\
+         左クリック: 設定 / 同じ項目で再クリック解除\n\
+         右クリック: 解除\n\
+         右クリックメニューからも操作できます。",
+    );
 }
 
 pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -926,18 +942,19 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.checkbox(&mut s.video_start_muted, "起動直後はミュートで開始");
 
     ui.add_space(8.0);
-    let mut vol_pct = (s.video_volume * 100.0).round() as i32;
-    let max_vol_pct = (crate::settings::VIDEO_VOLUME_MAX * 100.0).round() as i32;
-    if ui
-        .add(
-            egui::Slider::new(&mut vol_pct, 0..=max_vol_pct)
-                .text("既定音量 (%)")
+    ui.horizontal(|ui| {
+        let mut vol_pos = crate::settings::video_volume_linear_to_fader_pos(s.video_volume);
+        let response = ui.add(
+            egui::Slider::new(&mut vol_pos, 0.0..=1.0)
+                .text("既定音量")
+                .show_value(false)
                 .clamping(egui::SliderClamping::Always),
-        )
-        .changed()
-    {
-        s.video_volume = crate::settings::clamp_video_volume(vol_pct as f64 / 100.0);
-    }
+        );
+        if response.changed() {
+            s.video_volume = crate::settings::video_volume_fader_pos_to_linear(vol_pos);
+        }
+        ui.label(crate::settings::format_video_volume_db(s.video_volume));
+    });
 
     ui.add_space(12.0);
     ui.separator();

@@ -411,8 +411,9 @@ pub(crate) fn paint_transparent_bg(
 const CHECKMARK_MARGIN: f32 = 16.0;
 /// 見開き表示の区切り線の幅 (px)
 const SPREAD_DIVIDER_WIDTH: f32 = 2.0;
-/// フィードバックトースト表示時間（秒）
-const FEEDBACK_TOAST_DURATION: f32 = 1.2;
+/// フィードバックトースト表示時間（秒）。短い確認系トーストの既定値。
+/// 複数行の案内文は `show_feedback_toast_with_duration` で長めを指定する。
+pub(crate) const FEEDBACK_TOAST_DURATION: f32 = 1.2;
 /// 境界ヒント（最初/最後の項目に達した案内）の表示時間（秒）
 const BOUNDARY_HINT_DURATION: f32 = 2.5;
 /// 画像・動画フォルダが見つからない旨のヒント表示時間（秒）。メッセージが長く
@@ -2398,6 +2399,11 @@ impl App {
         fs_idx: usize,
         is_spread_double: bool,
     ) -> FsKeyAction {
+        // マウスドライバ / AHK 経由で積まれた進む/戻る pending は **early-return より前に
+        // drain** する。フォーカス無し / モーダル表示中で早期 return すると pending が
+        // 次フレームに持ち越されて誤発火するため (Codex P2)。ブロック中は count を捨てる。
+        let (browser_back_count, browser_forward_count) = crate::take_pending_mouse_nav();
+
         let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         let mut action = FsKeyAction {
             close: false,
@@ -2474,9 +2480,13 @@ impl App {
         // Shift+矢印（スプレッドナビ）にも対応するため、修飾キーを問わず消費
         let ctrl_d = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowDown));
         let ctrl_u = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowUp));
-        // マウス戻る/進む (Extra1/Extra2) を Ctrl+↑/↓ と等価に扱う
+        // マウス戻る/進む (Extra1/Extra2 = native XButton) を Ctrl+↑/↓ と等価に扱う。
         let mouse_back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1));
         let mouse_forward = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra2));
+        // WM_APPCOMMAND / VK_BROWSER_BACK/FORWARD 経路 (上で関数頭で drain 済み) を消費。
+        // 詳細は main.rs の `install_mouse_nav_hook` 参照。
+        let browser_back = browser_back_count > 0;
+        let browser_forward = browser_forward_count > 0;
         let arrow_right = ctx.input_mut(|i| {
             !video_horizontal_arrow_key
                 && (i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
@@ -2922,10 +2932,10 @@ impl App {
             action.nav_delta = self.spread_nav_delta(-1, shift_held);
             self.slideshow_playing = false;
         }
-        if ctrl_d || mouse_forward {
+        if ctrl_d || mouse_forward || browser_forward {
             action.ctrl_nav = Some(1);
         }
-        if ctrl_u || mouse_back {
+        if ctrl_u || mouse_back || browser_back {
             action.ctrl_nav = Some(-1);
         }
 
@@ -3485,16 +3495,6 @@ impl App {
         forward: bool,
         native_toast: bool,
     ) {
-        crate::logger::log(format!(
-            "[ctrl-nav-debug] handle_fullscreen_ctrl_nav_context fs_idx={fs_idx} forward={forward} \
-             native_toast={native_toast} fs_nav_locked={} global_search.active={} \
-             favsearch.active={} show_search_bar={} current_folder={:?}",
-            self.fs_nav_is_locked(),
-            self.global_search.active,
-            self.favsearch.active,
-            self.show_search_bar,
-            self.current_folder.as_ref().map(|p| p.display().to_string()),
-        ));
         if self.fs_nav_is_locked() {
             return;
         }
@@ -5189,18 +5189,18 @@ impl App {
         full_rect: egui::Rect,
         ctx: &egui::Context,
     ) {
-        let Some((ref text, start_time)) = self.fs_feedback_toast else {
+        let Some((ref text, start_time, duration)) = self.fs_feedback_toast else {
             return;
         };
         let elapsed = start_time.elapsed().as_secs_f32();
-        if elapsed > FEEDBACK_TOAST_DURATION {
+        if elapsed > duration {
             self.fs_feedback_toast = None;
             return;
         }
 
         // フェードアウト (最後の0.3秒)
-        let alpha = if elapsed > FEEDBACK_TOAST_DURATION - 0.3 {
-            ((FEEDBACK_TOAST_DURATION - elapsed) / 0.3).clamp(0.0, 1.0)
+        let alpha = if elapsed > duration - 0.3 {
+            ((duration - elapsed) / 0.3).clamp(0.0, 1.0)
         } else {
             1.0
         };
@@ -5564,9 +5564,15 @@ impl App {
         // Phase 5.5: S キーでタイルモード トグル (動画モード限定)。画像モードの
         // S (スライドショー) とは handle_video_input 先行 consume で分離する。
         let tile_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S));
-        // Phase 8.I: P キーでフレームレート オーバーレイのトグル (動画モード限定)。
-        // 画像モードの P (post-filter) とは handle_video_input 先行 consume で分離。
-        let perf_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
+        // F キーでフレームレート / Perf オーバーレイのトグル (動画モード限定)。
+        // 以前 P を使っていたが、P は「現在フレームをピン留め」に再割り当てしたので
+        // 移動した (F = Frames / FPS の mnemonic)。画像モードの F は未使用なので
+        // 競合しない。
+        let perf_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F));
+        // P キーで現在再生位置をピン留め (動画モード限定)。グリッドモードの P
+        // (folder_thumb_pin toggle) と統一した「P = Pin」の mnemonic。画像モードの
+        // P (post-filter cycle) とは handle_video_input 先行 consume で分離する。
+        let pin_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
         // W キー: 頭出し (= seek to 0 + play)。左手で押しやすく、画像モードでも未使用。
         let rewind_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W));
         // J/K: チャプター・ブックマーク・ピンを 1 本のマーカー列にまとめて前後ジャンプ。
@@ -5591,11 +5597,15 @@ impl App {
             Some(FsCacheEntry::Video { player, .. }) => player.volume(),
             _ => return,
         };
-        // Phase 7.H: 音量は Shift+↑↓ 限定 (= 20% step)。プレーン ↑↓ はファイル移動。
+        // Phase 7.H: 音量は Shift+↑↓ 限定 (= dB fader key step)。プレーン ↑↓ はファイル移動。
         let new_vol = if shift_up {
-            Some((cur_volume + 0.20).min(crate::settings::VIDEO_VOLUME_MAX))
+            Some(crate::settings::step_video_volume_by_fader_key_step(
+                cur_volume, 1,
+            ))
         } else if shift_down {
-            Some((cur_volume - 0.20).max(0.0))
+            Some(crate::settings::step_video_volume_by_fader_key_step(
+                cur_volume, -1,
+            ))
         } else {
             None
         };
@@ -5667,6 +5677,23 @@ impl App {
         }
         if perf_key {
             self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
+        }
+        if pin_key {
+            // P キー: 現在再生位置をピン留め (= HUD の 📌 ボタンと同等)。
+            // 現在 PTS を `set_native_video_pin` に渡す (内部で seek thumbnail を
+            // request + nearest 取得 + WebP encode + video_pins DB に書き込み)。
+            // 既に同位置のピンがあれば SQL の ON CONFLICT で pin_pts/thumb_webp を
+            // 上書きするだけなので idempotent。
+            #[cfg(windows)]
+            {
+                let target = self
+                    .fs_video_player(fs_idx)
+                    .map(|p| p.position())
+                    .unwrap_or(0.0);
+                self.handle_native_video_set_pin_command(ctx, fs_idx, target);
+            }
+            #[cfg(not(windows))]
+            let _ = (ctx, fs_idx);
         }
         if rewind_key && let Some(p) = self.fs_video_player(fs_idx) {
             p.seek(0.0);

@@ -82,6 +82,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `grid_item.rs` | `GridItem` 列挙型と `ThumbnailState` (Pending/Loaded/Failed/Evicted) |
 | `thumb_loader.rs` | サムネイル並列ロード (WebP キャッシュ生成含む) |
 | `catalog.rs` | SQLite サムネイルキャッシュ (`%APPDATA%/mimageviewer/catalog.db`) |
+| `folder_thumb_pins.rs` | 親コンテナ (Folder/ZipFile/PdfFile) の代表サムネ手動ピン DB (`%APPDATA%/mimageviewer/folder_thumb_pins.db`)。`apply_folder_thumb_pin` が cache key に `#pin:{source_id}` suffix を載せて pin の identity を表現、Video ピンは `seed_folder_video_pin_thumbs` で `video_pins` から WebP を catalog に seed する |
 
 ### 仮想フォルダ (ZIP/PDF) / フォーマット
 
@@ -213,6 +214,8 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `adjustment.db` | フォルダ別プリセット 4 種 + ページ別プリセット割当 | `adjustment_db.rs` |
 | `mask.db` | 消しゴムマスク (deflate 圧縮 1bit/pixel) | `mask_db.rs` |
 | `spread.db` | フォルダ別見開きモード | `spread_db.rs` |
+| `folder_thumb_pins.db` | 親コンテナ (Folder/ZipFile/PdfFile) の代表サムネ手動ピン。container_key 主キー (= normalize_keep_drive 済みパス) で 1 行 1 コンテナ、source は kind + container 相対 rel + (zipentry の) entry / (pdfpage の) page。`apply_folder_thumb_pin` が cache key suffix `#pin:{source_id}` で identity を表現 | `folder_thumb_pins.rs` |
+| `video_pins.db` | ユーザーがフルスクリーン HUD で指定した動画フレームの抽出 WebP。`(path, pin_pts_secs, thumb_webp)`。folder thumb pin の source が動画のときは `seed_folder_video_pin_thumbs` が起動時にこの WebP を catalog にミラー seed する | `video_pins.rs` |
 | `pdf_passwords` | PDF パスワード (DPAPI 暗号化) | `pdf_passwords.rs` |
 | `pdfium.dll` | 初回起動時に exe から展開 | `main.rs` |
 | `models/*.onnx` | 初回起動時に exe から展開 | `ai/model_manager.rs` |

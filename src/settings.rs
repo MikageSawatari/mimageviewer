@@ -641,6 +641,11 @@ pub struct Settings {
     /// ツールバーに「レーティングフィルタ」セクション (☆|なし 1 2 3 4 5) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_rating: bool,
+    /// アドレスバーに「代表サムネ固定」(📌) ボタンを表示する。左クリックで
+    /// 現在の選択アイテムをフォルダ / ZIP / PDF のサムネに固定 (= toggle)、
+    /// 右クリックで固定解除。既定 true。
+    #[serde(default = "default_true")]
+    pub show_address_bar_folder_pin: bool,
 
     // ── レーティングフィルタ ───────────────────────────────────
     /// レーティングフィルタ (index 0 = 未評価, 1〜5 = ★の数)。
@@ -810,8 +815,8 @@ pub struct Settings {
     pub update_check_dismissed_version: Option<String>,
 
     // ── 動画インライン再生 ────────────────────────────────────────
-    /// 動画再生時の既定音量 (0.0-1.5)。1.0 を超える値は音声ポンプ側で
-    /// pre-limiter boost として扱う。
+    /// 動画再生時の既定音量 (線形ゲイン 0.0..+18dB 相当)。1.0 を超える値は
+    /// 音声ポンプ側で pre-limiter boost として扱う。
     #[serde(default = "default_video_volume")]
     pub video_volume: f64,
     /// フルスクリーン化時に自動再生を開始するか (旧: bool)。
@@ -978,16 +983,127 @@ pub struct Vst3ChainPresetSlots {
     pub slots: [Option<Vst3ChainPresetSlot>; 10],
 }
 
-/// 動画音量の既定値。100% (= boost なし)。
+/// 動画音量の既定値。0dB (= boost なし)。
 pub const VIDEO_VOLUME_DEFAULT: f64 = 1.0;
-/// 動画音量の上限。150% は +3.5dB 程度の手動 boost。
-pub const VIDEO_VOLUME_MAX: f64 = 1.5;
+/// 動画音量フェーダーのミュート端。UI では -∞dB と表示し、内部ゲインは 0.0 にする。
+pub const VIDEO_VOLUME_MUTE_DB: f64 = -80.0;
+/// 動画音量の上限。+18dB は約 794% の手動 boost。
+pub const VIDEO_VOLUME_MAX_DB: f64 = 18.0;
+/// 動画音量の上限を線形ゲインで保持する。既存 settings.json 互換のため保存値は線形。
+pub const VIDEO_VOLUME_MAX: f64 = 7.943_282_347_242_816;
+/// HUD / 設定 UI の dB フェーダー目盛り。隣接目盛り間を線形補間する。
+pub const VIDEO_VOLUME_FADER_DB_MARKS: [f64; 10] = [
+    -80.0, -60.0, -40.0, -20.0, -10.0, -5.0, 0.0, 6.0, 12.0, 18.0,
+];
+/// キーボード音量変更は表示目盛り間をさらにこの数で分割する。
+pub const VIDEO_VOLUME_KEY_STEPS_PER_FADER_MARK: usize = 4;
 
 pub fn clamp_video_volume(value: f64) -> f64 {
     if value.is_finite() {
         value.clamp(0.0, VIDEO_VOLUME_MAX)
     } else {
         VIDEO_VOLUME_DEFAULT
+    }
+}
+
+pub fn video_volume_db_to_linear(db: f64) -> f64 {
+    if !db.is_finite() {
+        return VIDEO_VOLUME_DEFAULT;
+    }
+    let db = db.clamp(VIDEO_VOLUME_MUTE_DB, VIDEO_VOLUME_MAX_DB);
+    if db <= VIDEO_VOLUME_MUTE_DB {
+        0.0
+    } else {
+        clamp_video_volume(10.0_f64.powf(db / 20.0))
+    }
+}
+
+pub fn video_volume_linear_to_db(value: f64) -> f64 {
+    let value = clamp_video_volume(value);
+    if value <= 0.0 {
+        VIDEO_VOLUME_MUTE_DB
+    } else {
+        (20.0 * value.log10()).clamp(VIDEO_VOLUME_MUTE_DB, VIDEO_VOLUME_MAX_DB)
+    }
+}
+
+pub fn video_volume_db_to_fader_pos(db: f64) -> f64 {
+    let db = if db.is_finite() {
+        db.clamp(VIDEO_VOLUME_MUTE_DB, VIDEO_VOLUME_MAX_DB)
+    } else {
+        0.0
+    };
+    let marks = &VIDEO_VOLUME_FADER_DB_MARKS;
+    if db <= marks[0] {
+        return 0.0;
+    }
+    let last = marks.len() - 1;
+    if db >= marks[last] {
+        return 1.0;
+    }
+    for i in 0..last {
+        let lo = marks[i];
+        let hi = marks[i + 1];
+        if db >= lo && db <= hi {
+            let local = (db - lo) / (hi - lo);
+            return (i as f64 + local) / last as f64;
+        }
+    }
+    video_volume_db_to_fader_pos(0.0)
+}
+
+pub fn video_volume_fader_pos_to_db(pos: f64) -> f64 {
+    let pos = if pos.is_finite() {
+        pos.clamp(0.0, 1.0)
+    } else {
+        video_volume_db_to_fader_pos(0.0)
+    };
+    let marks = &VIDEO_VOLUME_FADER_DB_MARKS;
+    let last = marks.len() - 1;
+    if pos <= 0.0 {
+        return marks[0];
+    }
+    if pos >= 1.0 {
+        return marks[last];
+    }
+    let scaled = pos * last as f64;
+    let i = scaled.floor() as usize;
+    let local = scaled - i as f64;
+    marks[i] + (marks[i + 1] - marks[i]) * local
+}
+
+pub fn video_volume_linear_to_fader_pos(value: f64) -> f64 {
+    video_volume_db_to_fader_pos(video_volume_linear_to_db(value))
+}
+
+pub fn video_volume_fader_pos_to_linear(pos: f64) -> f64 {
+    video_volume_db_to_linear(video_volume_fader_pos_to_db(pos))
+}
+
+pub fn step_video_volume_by_fader_key_step(value: f64, direction: i32) -> f64 {
+    if direction == 0 {
+        return clamp_video_volume(value);
+    }
+    let total_steps =
+        (VIDEO_VOLUME_FADER_DB_MARKS.len() - 1) * VIDEO_VOLUME_KEY_STEPS_PER_FADER_MARK;
+    let scaled = video_volume_linear_to_fader_pos(value) * total_steps as f64;
+    let step = if direction > 0 {
+        (scaled + 1.0e-9).floor() as i32 + 1
+    } else {
+        (scaled - 1.0e-9).ceil() as i32 - 1
+    };
+    let step = step.clamp(0, total_steps as i32) as usize;
+    video_volume_fader_pos_to_linear(step as f64 / total_steps as f64)
+}
+
+pub fn format_video_volume_db(value: f64) -> String {
+    let db = video_volume_linear_to_db(value);
+    if db <= VIDEO_VOLUME_MUTE_DB + 0.05 {
+        "-∞ dB".to_string()
+    } else if db.abs() < 0.05 {
+        "0 dB".to_string()
+    } else {
+        format!("{db:+.1} dB")
     }
 }
 
@@ -1381,6 +1497,7 @@ impl Default for Settings {
             show_toolbar_next_folder: true,
             show_toolbar_vst3: true,
             show_toolbar_rating: true,
+            show_address_bar_folder_pin: true,
             rating_filter: default_rating_filter(),
             toolbar_cols_items: default_toolbar_cols_items(),
             toolbar_aspect_items: default_toolbar_aspect_items(),
@@ -2795,13 +2912,74 @@ mod tests {
     #[test]
     fn sanitize_clamps_video_volume_to_manual_boost_range() {
         let mut s = Settings::default();
-        s.video_volume = 2.0;
+        s.video_volume = 10.0;
         s.sanitize();
         assert_eq!(s.video_volume, VIDEO_VOLUME_MAX);
 
         s.video_volume = -0.5;
         s.sanitize();
         assert_eq!(s.video_volume, 0.0);
+    }
+
+    #[test]
+    fn video_volume_db_helpers_map_fader_marks() {
+        assert_eq!(video_volume_db_to_linear(VIDEO_VOLUME_MUTE_DB), 0.0);
+        assert!((video_volume_db_to_linear(0.0) - 1.0).abs() < 1.0e-12);
+        assert!((video_volume_db_to_linear(6.0) - 1.9952623149688795).abs() < 1.0e-12);
+        assert!((video_volume_db_to_linear(12.0) - 3.981_071_705_534_972_2).abs() < 1.0e-12);
+        assert!((video_volume_db_to_linear(18.0) - VIDEO_VOLUME_MAX).abs() < 1.0e-12);
+
+        assert!((video_volume_linear_to_db(1.0) - 0.0).abs() < 1.0e-12);
+        assert!((video_volume_linear_to_db(VIDEO_VOLUME_MAX) - 18.0).abs() < 1.0e-12);
+        assert_eq!(video_volume_linear_to_db(0.0), VIDEO_VOLUME_MUTE_DB);
+
+        for &mark in &VIDEO_VOLUME_FADER_DB_MARKS {
+            let pos = video_volume_db_to_fader_pos(mark);
+            assert!((video_volume_fader_pos_to_db(pos) - mark).abs() < 1.0e-9);
+            let linear = video_volume_db_to_linear(mark);
+            let roundtrip =
+                video_volume_fader_pos_to_linear(video_volume_linear_to_fader_pos(linear));
+            assert!((roundtrip - linear).abs() < 1.0e-9);
+        }
+    }
+
+    #[test]
+    fn video_volume_step_uses_quarter_fader_mark_steps() {
+        let mut up = 1.0;
+        for _ in 0..4 {
+            up = step_video_volume_by_fader_key_step(up, 1);
+        }
+        assert!(
+            (up - video_volume_db_to_linear(6.0)).abs() < 1.0e-12,
+            "four key steps above 0dB should reach the next visible mark"
+        );
+
+        let mut down = 1.0;
+        for _ in 0..4 {
+            down = step_video_volume_by_fader_key_step(down, -1);
+        }
+        assert!(
+            (down - video_volume_db_to_linear(-5.0)).abs() < 1.0e-12,
+            "four key steps below 0dB should reach the next visible mark"
+        );
+        assert!(
+            (step_video_volume_by_fader_key_step(1.0, 1) - video_volume_db_to_linear(1.5)).abs()
+                < 1.0e-12
+        );
+        assert_eq!(step_video_volume_by_fader_key_step(0.0, -1), 0.0);
+
+        let mut high = video_volume_db_to_linear(12.0);
+        for _ in 0..4 {
+            high = step_video_volume_by_fader_key_step(high, 1);
+        }
+        assert_eq!(
+            high, VIDEO_VOLUME_MAX,
+            "four key steps above +12dB should reach +18dB"
+        );
+        assert_eq!(
+            step_video_volume_by_fader_key_step(VIDEO_VOLUME_MAX, 1),
+            VIDEO_VOLUME_MAX
+        );
     }
 
     #[test]

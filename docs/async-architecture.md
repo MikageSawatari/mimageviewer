@@ -605,6 +605,32 @@ fn dispatcher(queue: Arc<(Mutex<JobQueue>, Condvar)>, resource: Resource) {
 
 ---
 
+## 5.6 親コンテナ代表サムネピン (folder thumb pin) の UI スレッド経路
+
+`folder_thumb_pins.db` のアクセスは **UI スレッド同期**で行うが、各操作は cheap な
+single-row I/O に収めてあるため `cargo run --perf-log` でも hitches を起こさない。
+
+| 操作 | スレッド | 頻度 | 内容 |
+| --- | --- | --- | --- |
+| `lookup_many` | UI (load_folder 内) | フォルダロード 1 回ごと | 親コンテナ N 件分のピンを 500 件 chunked IN クエリで一括取得し `App::folder_pin_map: HashMap` に格納。N=数百でも `<5ms` |
+| `set` / `remove` | UI (アドレスバー 📌 / 右クリックメニュー) | ユーザー操作 1 回ごと | single-row INSERT/DELETE。`folder_thumb_pin_dirty = true` を立てるだけで再ロードは別経路 |
+| `apply_folder_thumb_pin` の `pin_map.get(&key)` | UI (`make_load_request`) | 親コンテナアイテム 1 つにつき 1 回 | DB ヒットなし (HashMap lookup のみ)。pin source 解決時に **追加で 1 回 `std::fs::metadata`** (target ファイル) を取る点だけ注意 — Folder pin source でサブフォルダを再帰探索する場合は worker thread 側の `resolve_folder_thumb_image` に委譲する |
+| `seed_folder_video_pin_thumbs` | UI (load_folder 内) | フォルダロード 1 回ごと | folder_pin_map の Video pin だけ走査 → `video_pins.db` lookup → 既存 cache_map と byte 比較 → 差分があるときだけ `catalog.save_thumb_bytes` (single-row UPSERT)。典型的なフォルダで 0〜数件しか該当しない |
+
+**再ロードトリガ**: 書き換え反映は `App::consume_folder_thumb_pin_dirty` が
+`folder_thumb_pin_dirty` を take して `load_folder` を呼ぶ。これは `App::update` の
+`render_address_bar` 直後 (= fullscreen でないとき) と `close_fullscreen` の両方から
+拾うので、UI クリックの 1 フレーム後にグリッドへ反映される (egui の auto repaint と
+連動)。fullscreen 中は load_folder が close_fullscreen を呼ぶため、抜けるまで dirty を
+保留する (Codex Phase D P2 指摘の対応)。
+
+**Codex Phase D P2 (drill-down dead pin) 対応**: `archive_source_override.is_some()`
+(= 7z/LZH の変換キャッシュ ZIP を drill-down 中) では UI 経路の `compute_folder_pin_
+button_state` / `render_folder_pin_menu_entry` が `None`/false を返してエントリ自体を
+出さない。キャッシュ ZIP に書いてもユーザーに到達しないため。
+
+---
+
 ## 6. 参考 (実測値)
 
 `docs/bench-scroll-report.md` に詳細あり。要点:

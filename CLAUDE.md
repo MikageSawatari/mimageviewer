@@ -113,6 +113,7 @@ mimageviewer/
 │   ├── settings_db.rs       # 設定永続化 SQLite バックエンド (settings.db、bak1..bak10 世代、JSON migration、boot decision tree、quarantine)
 │   ├── catalog.rs           # SQLite サムネイルカタログ
 │   ├── folder_tree.rs       # フォルダツリー走査ヘルパー
+│   ├── folder_thumb_pins.rs # 親コンテナ（Folder/ZipFile/PdfFile）の代表サムネ手動ピン DB（v0.9.x、`#pin:` cache key suffix で identity を表現）
 │   ├── grid_item.rs         # GridItem（Folder/Image/Video/ZipFile/PdfFile/ZipImage/PdfPage/ZipSeparator）/ ThumbnailState 定義
 │   ├── thumb_loader.rs      # サムネイル並列ロード
 │   ├── wic_decoder.rs       # WIC 画像デコード（HEIC/AVIF/JXL/TIFF/RAW）
@@ -1273,6 +1274,63 @@ awk '/^codex$/{found=1; next} found' /tmp/codex-out.txt
   unrelated dirty worktree により安全に merge できない場合は止めて状況を報告する。push や
   PR（プルリクエスト）の作成は、明示的に指示された場合のみ行う。
 - **デフォルトブランチ**: GitHub 上は `main`、ローカルは `master`。リリース時は両方に push する。
+
+### worktree + Windows junction の地雷 ⚠️
+
+並行作業のため `git worktree add` で別 worktree を切るときに、`vendor/` を main worktree から
+**junction (NTFS reparse point) で共有する設計**を選ぶと、撤収時に災害が起きる:
+
+```
+[NG] git worktree remove で junction ごと再帰削除される事故 (2026-05-13 / 2026-05-14 実害):
+  C:\home\mimageviewer-sqlite\          ← worktree
+    └─ vendor\  (junction → C:\home\mimageviewer\vendor\)
+  ↓ git worktree remove C:\home\mimageviewer-sqlite
+  → git は junction を **通常ディレクトリ扱いで** 中身まで再帰削除
+  → main worktree の C:\home\mimageviewer\vendor\ の中身が全消失
+  → cargo build が pdfium.dll / FFmpeg DLL / ONNX Runtime DLL / Susie ワーカーすべて
+    無いと言って失敗、bootstrap-vendor.sh で再 DL する羽目になる
+```
+
+#### 鉄則: `git worktree remove` を直接呼ばない
+
+**この repo では `git worktree remove` を直接実行しない。必ず
+`scripts/safe-worktree-remove.ps1` を経由する**。文書化だけでは 2026-05-13 → 翌日
+2026-05-14 と連続で事故ったので、機械的に防ぐ仕組みを置いた。
+
+ラッパーが実行する手順:
+1. 対象 worktree を再帰スキャン (junction には**降りない**) して reparse point を列挙
+2. 見つけた junction を `cmd /c rmdir` で **リンクだけ** 削除 (リンク先は無事)
+3. 全部 unlink できてから `git worktree remove <path>` を実行
+
+```powershell
+# 全 worktree の junction 状況を一覧 (非破壊)
+.\scripts\safe-worktree-remove.ps1 -Audit
+
+# 何が起きるかを確認するだけ (非破壊)
+.\scripts\safe-worktree-remove.ps1 <worktree-path> -DryRun
+
+# 実際に安全に削除
+.\scripts\safe-worktree-remove.ps1 <worktree-path>
+.\scripts\safe-worktree-remove.ps1 <worktree-path> -Force   # dirty worktree 用
+```
+
+ラッパーは main worktree (= cwd repo) を対象に指定すると refuse する。
+
+**Claude セッション中の運用**: worktree を撤収する指示を受けたら、`git worktree remove ...`
+の前に必ず `.\scripts\safe-worktree-remove.ps1 ...` に置換する。`gh`/`git` の他コマンドと
+混ぜて連続実行する場合も同じ。これは取り返しがつかない事故なので例外なし。
+
+#### 設計面の選択肢
+
+**最も安全**: `vendor/` を worktree 間で **共有しない**。新規 worktree でも
+`bash scripts/bootstrap-vendor.sh` を流して per-worktree な `vendor/` を持つ。
+disk 容量 (~1GB) より復旧の手間の方が高い。
+
+**junction 共有が必要な場合**: `vendor/` 全体ではなく **個別サブディレクトリ単位**
+(`vendor/pdfium/`, `vendor/ffmpeg/`, `vendor/models/`, `vendor/ort/`, `vendor/susie-worker/`)
+で junction を張る。こうすれば `git worktree remove` が中身を辿っても worktree 側の各
+junction が削除されるだけで **main の `vendor/` ディレクトリ自体は touch されない**
+(junction の親 dir が main 側にあるため)。それでもラッパー経由で撤去するのが安全。
 
 ## User: Background
 

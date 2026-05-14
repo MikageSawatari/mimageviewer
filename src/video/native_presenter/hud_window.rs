@@ -64,20 +64,20 @@ use windows::Win32::UI::WindowsAndMessaging::{
     DestroyWindow, GWLP_USERDATA, GetWindowLongPtrW, HTCLIENT, HTTRANSPARENT, HWND_TOPMOST,
     IsWindow, MA_NOACTIVATE, RegisterClassExW, SW_SHOWNA, SWP_NOACTIVATE, SWP_NOMOVE,
     SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    WINDOWPOS, WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST, WM_RBUTTONDBLCLK,
-    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_WINDOWPOSCHANGING, WM_XBUTTONDBLCLK,
-    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WINDOWPOS, WM_APPCOMMAND, WM_CANCELMODE, WM_CAPTURECHANGED, WM_DESTROY, WM_DPICHANGED,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP,
+    WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_NCHITTEST,
+    WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETCURSOR, WM_WINDOWPOSCHANGING,
+    WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSEXW, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{IDC_ARROW, LoadCursorW};
 use windows::core::PCWSTR;
 use windows::core::w;
 
 use crate::video::native_window::{
-    NativeVideoMouseButton, NativeVideoMouseButtonEvent, NativeVideoMouseEvent,
-    NativeVideoMouseWheelEvent, NativeVideoWindowEvent,
+    NativeVideoKeyEvent, NativeVideoMouseButton, NativeVideoMouseButtonEvent,
+    NativeVideoMouseEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent,
 };
 
 /// HUD overlay HWND の生成設定。
@@ -861,6 +861,46 @@ unsafe extern "system" fn hud_wnd_proc(
                         let _ = ReleaseCapture();
                     }
                 }
+            }
+            // WM_XBUTTONUP は MouseButton(Extra1/Extra2) で既に進む/戻るを処理済み。
+            // DefWindowProc に流すと Windows が APPCOMMAND_BROWSER_BACKWARD/FORWARD を
+            // 合成し、本ファイル下の WM_APPCOMMAND handler が再度 KeyDown(0xA6/0xA7) を
+            // 生成して 1 押下 = 2 ナビになるため、TRUE を返して抑止 (Codex 2 周目 P2)。
+            if msg == WM_XBUTTONUP {
+                return LRESULT(1);
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        WM_APPCOMMAND => {
+            // 通常は HUD の WM_XBUTTONUP 後に `DefWindowProcW` が APPCOMMAND を生成し、
+            // 親 (presenter) HWND へ昇格して presenter wndproc 側で拾われる。ただし
+            // pathological case として、mouse driver が HUD HWND へ `SendMessage(WM_APPCOMMAND, ...)`
+            // を直接送ってくる経路がありうる (= HUD は sibling top-level なので親への
+            // 自動 forward は起きない)。その際にも UI 側にナビゲーションを届けるため、
+            // ここで合成 KeyDown(0xA6/0xA7) に変換して event_tx に流す
+            // (= presenter 側のハンドラと同一の経路、Codex P2)。
+            let cmd_word = ((lparam.0 >> 16) & 0xFFFF) as u32;
+            let app_command = cmd_word & 0xFFF;
+            let synth_vk = match app_command {
+                1 => Some(0xA6_u32), // APPCOMMAND_BROWSER_BACKWARD → VK_BROWSER_BACK
+                2 => Some(0xA7_u32), // APPCOMMAND_BROWSER_FORWARD  → VK_BROWSER_FORWARD
+                _ => None,
+            };
+            if let Some(vk) = synth_vk
+                && let Some(state) = window_state(hwnd)
+            {
+                let _ = state
+                    .event_tx
+                    .send(NativeVideoWindowEvent::KeyDown(NativeVideoKeyEvent {
+                        virtual_key: vk,
+                        shift: false,
+                        ctrl: false,
+                        alt: false,
+                        repeat: false,
+                    }));
+                // WM_APPCOMMAND の規約: 処理した場合 TRUE を返す。
+                return LRESULT(1);
             }
             unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
         }

@@ -2110,8 +2110,15 @@ impl App {
         let tile_overlay = if let Some(state) = self.video_tile_state.as_ref() {
             if state.video_path != current_path {
                 if swap_pending_for_current {
+                    let open_status = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+                        FsCacheEntry::Video { player, .. } => {
+                            Some(player.prep_progress().snapshot())
+                        }
+                        _ => None,
+                    });
                     Some(Self::native_video_tile_preparing_overlay_for_path(
                         &current_path,
+                        open_status,
                     ))
                 } else {
                     clear_state = true;
@@ -2154,6 +2161,7 @@ impl App {
                     finished,
                     tiles,
                     fallback_file_name,
+                    video_open_status: None,
                 })
             }
         } else if swap_pending_for_current {
@@ -2162,12 +2170,23 @@ impl App {
                 .as_ref()
                 .map(|pending| pending.target_path.clone())
                 .unwrap_or_else(|| current_path.clone());
+            let open_status = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+                FsCacheEntry::Video { player, .. } if player.path() == &target_path => {
+                    Some(player.prep_progress().snapshot())
+                }
+                _ => None,
+            });
             Some(Self::native_video_tile_preparing_overlay_for_path(
                 &target_path,
+                open_status,
             ))
         } else if self.video_tile_reopen_pending {
             Some(Self::native_video_tile_preparing_overlay_for_path(
                 &current_path,
+                self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+                    FsCacheEntry::Video { player, .. } => Some(player.prep_progress().snapshot()),
+                    _ => None,
+                }),
             ))
         } else {
             None
@@ -2185,21 +2204,32 @@ impl App {
     #[cfg(windows)]
     pub(super) fn native_video_tile_preparing_overlay_for_path(
         path: &std::path::Path,
+        open_status: Option<crate::video::avio_progress::PreparingStatus>,
     ) -> crate::video::native_presenter::NativeOverlayTileOverlay {
         let file_name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_string();
-        crate::video::native_presenter::NativeOverlayTileOverlay::preparing_with_filename(file_name)
+        if let Some(open_status) = open_status {
+            crate::video::native_presenter::NativeOverlayTileOverlay::preparing_with_open_status(
+                file_name,
+                open_status,
+            )
+        } else {
+            crate::video::native_presenter::NativeOverlayTileOverlay::preparing_with_filename(
+                file_name,
+            )
+        }
     }
 
     #[cfg(windows)]
     pub(super) fn set_native_video_tile_preparing_overlay(&self, fs_idx: usize) {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             let path = player.path().clone();
+            let open_status = player.prep_progress().snapshot();
             player.set_native_tile_overlay(Some(
-                Self::native_video_tile_preparing_overlay_for_path(&path),
+                Self::native_video_tile_preparing_overlay_for_path(&path, Some(open_status)),
             ));
         }
     }
@@ -2219,7 +2249,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn handle_native_video_set_pin_command(
+    pub(crate) fn handle_native_video_set_pin_command(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
@@ -2495,13 +2525,6 @@ impl App {
         fs_idx: usize,
         key: crate::video::native_window::NativeVideoKeyEvent,
     ) {
-        if matches!(key.virtual_key, 0x26 | 0x28) {
-            crate::logger::log(format!(
-                "[ctrl-nav-debug] handle_native_video_key_event vk=0x{:x} ctrl={} shift={} \
-                 alt={} repeat={} fs_idx={fs_idx}",
-                key.virtual_key, key.ctrl, key.shift, key.alt, key.repeat,
-            ));
-        }
         if key.alt {
             return;
         }
@@ -2594,17 +2617,19 @@ impl App {
             }
             // Plain Up / Down: navigate files, matching the egui fullscreen path.
             0x26 if key.ctrl && !key.shift => {
-                crate::logger::log(format!(
-                    "[ctrl-nav-debug] native_video Ctrl+Up arm hit fs_idx={fs_idx} repeat={}",
-                    key.repeat
-                ));
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
             }
             0x28 if key.ctrl && !key.shift => {
-                crate::logger::log(format!(
-                    "[ctrl-nav-debug] native_video Ctrl+Down arm hit fs_idx={fs_idx} repeat={}",
-                    key.repeat
-                ));
+                self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
+            }
+            // VK_BROWSER_BACK / VK_BROWSER_FORWARD: マウス進む/戻るボタンが Browser_Back/Forward
+            // keystroke として届くケース (mouse driver や AutoHotkey が変換する経路)、または
+            // 上で WM_APPCOMMAND を合成 KeyDown に変換した経路。Ctrl+↑/↓ と同じ DFS ナビと
+            // 等価に扱う。
+            0xA6 => {
+                self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, false, true);
+            }
+            0xA7 => {
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
             }
             0x26 if !key.shift && !key.ctrl => {
@@ -2641,7 +2666,8 @@ impl App {
             // perform the same item navigation without involving egui input.
             0x26 if key.shift && !key.ctrl => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    let v = (player.volume() + 0.20).min(crate::settings::VIDEO_VOLUME_MAX);
+                    let v =
+                        crate::settings::step_video_volume_by_fader_key_step(player.volume(), 1);
                     player.set_volume(v);
                     self.settings.video_volume = v;
                     self.settings.save();
@@ -2649,7 +2675,8 @@ impl App {
             }
             0x28 if key.shift && !key.ctrl => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    let v = (player.volume() - 0.20).max(0.0);
+                    let v =
+                        crate::settings::step_video_volume_by_fader_key_step(player.volume(), -1);
                     player.set_volume(v);
                     self.settings.video_volume = v;
                     self.settings.save();
@@ -2685,8 +2712,18 @@ impl App {
                     player.set_native_checked(checked);
                 }
             }
-            // P: perf overlay
+            // P: pin current frame (= HUD 📌 ボタンと同等)。グリッドの P と統一した
+            // 「P = Pin」の mnemonic。v0.9.x で perf overlay の P から再割り当て、
+            // perf overlay は F に移動した。
             0x50 if !key.shift && !key.ctrl && !key.repeat => {
+                let target = self
+                    .fs_video_player(fs_idx)
+                    .map(|p| p.position())
+                    .unwrap_or(0.0);
+                self.handle_native_video_set_pin_command(ctx, fs_idx, target);
+            }
+            // F: perf / framerate overlay toggle (旧 P)。Frames / FPS mnemonic。
+            0x46 if !key.shift && !key.ctrl && !key.repeat => {
                 self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.set_native_perf_overlay_visible(self.video_perf_overlay_visible);
@@ -3090,6 +3127,10 @@ impl App {
 
         let source_epoch = self.next_native_video_source_epoch();
         let started_at = std::time::Instant::now();
+        // build_video_player_for_open 内で decoder::spawn が走るので、
+        // demux thread の avformat_open_input より前に bump する必要がある
+        // (Codex P2 第 16 ラウンド指摘)。
+        self.activity_gate.bump();
         let mut new_player = self.build_video_player_for_open(
             target_idx,
             target_path.clone(),

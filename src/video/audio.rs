@@ -317,7 +317,7 @@ const SAFETY_LIMITER_LOOKAHEAD_SECS: f64 = 0.005;
 const SAFETY_LIMITER_RELEASE_SECS: f64 = 0.100;
 const SAFETY_LIMITER_CEILING_DBFS: f32 = -1.0;
 
-/// VST3 チェーン後段と 100% 超の手動音量 boost の保険用 lookahead limiter。
+/// VST3 チェーン後段と 0dB 超の手動音量 boost の保険用 lookahead limiter。
 ///
 /// ユーザーがチェーン末尾に limiter を入れていない場合でも、過大出力が WASAPI /
 /// OS mixer 側で hard clip するのを避けるための最終安全網。制作向け limiter ではなく
@@ -365,12 +365,19 @@ impl SafetyLimiter {
         self.gain = 1.0;
     }
 
-    fn process_block(&mut self, samples: &mut [f32]) {
+    /// Returns true when the block would exceed the ceiling after the RT output gain is applied.
+    fn process_block(&mut self, samples: &mut [f32], final_output_gain: f32) -> bool {
         if samples.is_empty() || self.channels == 0 {
-            return;
+            return false;
         }
         debug_assert_eq!(samples.len() % self.channels, 0);
 
+        let final_output_gain = if final_output_gain.is_finite() {
+            final_output_gain.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let mut ceiling_hit = false;
         let frames = samples.len() / self.channels;
         for frame in 0..frames {
             let in_base = frame * self.channels;
@@ -387,6 +394,9 @@ impl SafetyLimiter {
                 peak = peak.max(v.abs());
             }
 
+            if peak * final_output_gain > self.ceiling {
+                ceiling_hit = true;
+            }
             let target_gain = if peak > self.ceiling {
                 (self.ceiling / peak).min(1.0)
             } else {
@@ -403,6 +413,7 @@ impl SafetyLimiter {
             }
             self.write_frame = (self.write_frame + 1) % self.lookahead_frames;
         }
+        ceiling_hit
     }
 }
 
@@ -1009,13 +1020,15 @@ fn run_pump(
                 }
             }
             // Phase 2-B: normalize gain が +側 (>1.0) のときも safety_limiter を通す。
-            // VST3 無効 + 音量100%以下 + normalize +20dB のケースで clip を防ぐ。
+            // VST3 無効 + 音量0dB以下 + normalize +20dB のケースで clip を防ぐ。
             // 下げ方向 (<1.0) は clip 不可なので limiter 不要 (5ms latency 節約)。
             let normalize_boost_active = normalize_gain > 1.0 + f32::EPSILON;
             let limiter_active =
                 vst_chain_active || pre_limiter_gain > 1.0 || normalize_boost_active;
             if limiter_active {
-                safety_limiter.process_block(&mut output_samples);
+                if safety_limiter.process_block(&mut output_samples, clock.output_volume()) {
+                    clock.mark_limiter_ceiling_hit();
+                }
                 current_pdc_latency_secs += safety_limiter.latency_secs();
             } else {
                 safety_limiter.reset();
@@ -1765,7 +1778,7 @@ mod tests {
         let mut samples = vec![0.0_f32; 12];
         samples[0] = 0.5;
         samples[1] = -0.5;
-        limiter.process_block(&mut samples);
+        assert!(!limiter.process_block(&mut samples, 1.0));
 
         assert!(
             samples[..10].iter().all(|&v| v == 0.0),
@@ -1784,7 +1797,7 @@ mod tests {
         samples[2] = 2.0;
         samples[3] = -2.0;
 
-        limiter.process_block(&mut samples);
+        assert!(limiter.process_block(&mut samples, 1.0));
 
         let ceiling = limiter.ceiling;
         let max_abs = samples.iter().fold(0.0_f32, |acc, &v| acc.max(v.abs()));
@@ -1799,19 +1812,45 @@ mod tests {
     }
 
     #[test]
+    fn safety_limiter_indicator_respects_final_output_gain() {
+        let mut limiter = SafetyLimiter::new(1_000, 2);
+        let mut samples = vec![0.0_f32; 18];
+        samples[0] = 2.0;
+        samples[1] = -2.0;
+
+        assert!(!limiter.process_block(&mut samples, 0.1));
+        let ceiling = limiter.ceiling;
+        let max_abs = samples.iter().fold(0.0_f32, |acc, &v| acc.max(v.abs()));
+        assert!(
+            max_abs <= ceiling + 1e-6,
+            "safety limiter should still protect its buffered output"
+        );
+    }
+
+    #[test]
+    fn safety_limiter_indicator_uses_peak_after_output_gain() {
+        let mut limiter = SafetyLimiter::new(1_000, 2);
+        let mut samples = vec![0.0_f32; 18];
+        samples[0] = 2.0;
+        samples[1] = -2.0;
+
+        assert!(limiter.process_block(&mut samples, 0.5));
+    }
+
+    #[test]
     fn safety_limiter_keeps_delay_across_blocks() {
         let mut limiter = SafetyLimiter::new(1_000, 2);
         let mut first = vec![0.0_f32; 6];
         first[0] = 0.5;
         first[1] = -0.5;
-        limiter.process_block(&mut first);
+        assert!(!limiter.process_block(&mut first, 1.0));
         assert!(
             first.iter().all(|&v| v == 0.0),
             "first block is shorter than lookahead, so it should be delayed"
         );
 
         let mut second = vec![0.0_f32; 6];
-        limiter.process_block(&mut second);
+        assert!(!limiter.process_block(&mut second, 1.0));
         assert!((second[4] - 0.5).abs() < 1e-6);
         assert!((second[5] + 0.5).abs() < 1e-6);
     }
@@ -1822,7 +1861,7 @@ mod tests {
         let mut loud = vec![0.0_f32; 14];
         loud[0] = 2.0;
         loud[1] = -2.0;
-        limiter.process_block(&mut loud);
+        assert!(limiter.process_block(&mut loud, 1.0));
         let gain_after_peak = limiter.gain;
         assert!(
             gain_after_peak < 0.6,
@@ -1830,7 +1869,7 @@ mod tests {
         );
 
         let mut quiet = vec![0.0_f32; 200];
-        limiter.process_block(&mut quiet);
+        assert!(!limiter.process_block(&mut quiet, 1.0));
         assert!(
             limiter.gain > gain_after_peak,
             "gain should recover across later blocks"
@@ -1842,11 +1881,11 @@ mod tests {
     fn safety_limiter_reset_clears_delay_line() {
         let mut limiter = SafetyLimiter::new(1_000, 2);
         let mut samples = vec![0.5_f32; 12];
-        limiter.process_block(&mut samples);
+        assert!(!limiter.process_block(&mut samples, 1.0));
         limiter.reset();
 
         let mut silence = vec![0.0_f32; 12];
-        limiter.process_block(&mut silence);
+        assert!(!limiter.process_block(&mut silence, 1.0));
         assert!(
             silence.iter().all(|&v| v == 0.0),
             "reset should prevent old delayed audio from leaking"

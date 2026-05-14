@@ -1335,6 +1335,7 @@ fn run_native_video_output(
             clock.is_playing(),
             clock.volume(),
             clock.is_muted(),
+            clock.limiter_ceiling_hit_seq(),
             clock.playback_speed(),
             frame_step_active.load(Ordering::Acquire),
             initial_pause_controls_pending.load(Ordering::Acquire),
@@ -1758,6 +1759,7 @@ fn run_native_video_output(
                 source.clock.is_playing(),
                 source.clock.volume(),
                 source.clock.is_muted(),
+                source.clock.limiter_ceiling_hit_seq(),
                 source.clock.playback_speed(),
                 source.frame_step_active.load(Ordering::Acquire),
                 source
@@ -2092,6 +2094,7 @@ fn run_native_video_output(
                 source.clock.is_playing(),
                 source.clock.volume(),
                 source.clock.is_muted(),
+                source.clock.limiter_ceiling_hit_seq(),
                 source.clock.playback_speed(),
                 source.frame_step_active.load(Ordering::Acquire),
                 source
@@ -2628,7 +2631,8 @@ impl VideoPlayer {
     /// ファイルオープン自体はワーカースレッド内で非同期に行うので、UI スレッドは
     /// ブロックされない。
     ///
-    /// `initial_volume` は 0.0-1.5。1.0 超は音声ポンプ側の手動 boost として扱う。
+    /// `initial_volume` は線形ゲイン (0.0..+18dB 相当)。1.0 超は音声ポンプ側の
+    /// 手動 boost として扱う。
     /// `resume_secs` を指定すると、最初の動画情報受領後に自動的にその位置へシークする。
     /// `hw_decode` が true なら D3D11VA HW デコードを試行 (失敗時は SW にフォールバック)。
     /// VST3 プラグイン処理用の DspBridge は `dsp_bridge` 引数で渡す。

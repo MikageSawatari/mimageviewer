@@ -51,6 +51,32 @@ Failed は単発の終端ステート。デコードエラー時のみ。
 2. mpsc で (idx, ColorImage, from_cache, source_dims) を送信
 ```
 
+### 1.3.1 親コンテナの代表サムネ — 優先順位
+
+親コンテナ (Folder/ZipFile/PdfFile) の代表サムネは次の順で決まる:
+
+1. **手動ピン (`folder_thumb_pins.db`)** — ユーザーがアドレスバー 📌 ボタンや
+   右クリックメニュー「📌 代表サムネに固定」で指定した子アイテム。`make_load_request`
+   の `apply_folder_thumb_pin` が `LoadRequest` を target アイテム用に書き換え、cache
+   key は `{base_key}#pin:{source_id}` に変わる (source_id = kind/rel/entry/page/
+   mtime/size の compact 表現)。pin の付け替えや target ファイルの変更で
+   source_id が自動的に変わるので古い WebP を catch しない。詳細:
+   [virtual-folders.md §3.1.1](virtual-folders.md#311-親コンテナの代表サムネピン-folder-thumb-pinv09x)。
+2. **自動代表選定 (`resolve_folder_thumb_image`)** — Settings の `folder_thumb_sort`
+   (Numeric / Modified / etc.) + `folder_thumb_depth` (再帰深さ) で先頭画像を選び、
+   通常のサムネ生成パイプラインに乗せる。pin が無い場合の既定動作。
+3. **フォルダ / ZIP / PDF アイコン fallback** — 中身が空 / 全部エラーで上 2 段が失敗
+   したときの最終フォールバック。`grid_item.rs` の draw_cell でアイコン表示。
+
+**Video ピンの特殊経路**: pin source が動画の場合は `seed_folder_video_pin_thumbs`
+が起動時に `video_pins` DB の抽出済み WebP を pinned cache key として catalog にミラー
+seed する。worker は通常の cache_hit で取り出すので、Shell API を再呼び出ししない。
+`skip_cache = false` 固定で idle quality-upgrade の対象外。**動画 folder pin は
+`video_pins.db` に WebP がある (= フルスクリーンで `P` キー / HUD でフレーム保存済み)
+場合のみ set 可能** — sidecar / Shell 抽出を UI スレッドで同期実行しないための仕様
+(Codex post-merge P2)。詳細:
+[virtual-folders.md §3.1.1](virtual-folders.md#311-親コンテナの代表サムネピン-folder-thumb-pinv09x)。
+
 ### 1.4 表示時の変換
 
 サムネイルには以下が適用される:

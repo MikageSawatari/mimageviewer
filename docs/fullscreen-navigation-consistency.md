@@ -52,7 +52,7 @@ Windows の現行動画フルスクリーンは native presenter 経路。
 | --- | --- |
 | ホイール / plain ↑↓ | 同一 `visible_indices` 内の前後アイテムへ移動 |
 | ←→ | seek。Ctrl+←→ は 30 秒 seek、Shift+←→ は 1 秒 seek |
-| Shift+↑↓ | 音量 ±20% |
+| Shift+↑↓ | 音量を dB フェーダー目盛りの 1/4 幅で上下 |
 | Ctrl+↑↓ | `handle_fullscreen_ctrl_nav_context` 経由で画像系と同じコンテキスト移動 |
 | マウス戻る / 進む | native window / HUD 側の XButton を App 側で Ctrl+↑↓ と同じ経路へ接続 |
 | S | 動画タイルモード ON/OFF |
@@ -201,6 +201,25 @@ no-op 案内は段階を分ける:
   フルスクリーン維持を分ける。
 - native 動画の XButton は Win32 / HUD で `Extra1/Extra2` に変換済みなので、
   App 側 handler で Ctrl+↑↓ と同じ経路に送る。
+- マウス進む/戻るボタンは、ハードウェアやドライバの設定によって以下の 3 経路の
+  いずれでも届きうる。mIV はすべて同じフォルダ DFS ナビへ集約する。
+  1. **WM_XBUTTONDOWN** (native 5 ボタンマウス標準): winit → egui の
+     `PointerButton::Extra1/Extra2` として届く。`handle_keyboard` / `update_fullscreen` /
+     native video `handle_native_video_mouse_button` が直接 bind 済み。
+  2. **WM_APPCOMMAND** (mouse driver / Microsoft IntelliPoint 系が APPCOMMAND_BROWSER_BACKWARD/FORWARD を送る経路、または `WM_XBUTTONUP` を未処理にした際に `DefWindowProc` が自動昇格): winit はハンドリングしないため、mIV が自前で拾う。
+     - **メインウィンドウ**: `src/main.rs` の `install_mouse_nav_hook` が `WH_GETMESSAGE`
+       フックで観測し、グローバル atomic `PENDING_MOUSE_NAV_BACK/FORWARD` に積む。
+       `App::take_pending_mouse_nav` を介して `handle_keyboard` / `update_fullscreen` が
+       消費し、既存の `ctrl_up/down` 経路に OR 合成。
+     - **native 動画 HWND**: `src/video/native_window.rs` の wndproc が `WM_APPCOMMAND`
+       を `NativeVideoWindowEvent::KeyDown(vk=0xA6 or 0xA7)` に変換して event_tx に流す。
+  3. **WM_KEYDOWN VK_BROWSER_BACK (0xA6) / VK_BROWSER_FORWARD (0xA7)** (mouse driver や
+     AutoHotkey がキーストローク化して送る経路): egui-winit は `Key::BrowserBack` のみ
+     翻訳し `BrowserForward` は drop するため、mIV は (2) と同じ `WH_GETMESSAGE` フック /
+     native video wndproc の前段で VK を直接拾って同じ atomic / 合成 KeyDown 経路に流す。
+
+  この多経路サポートは、Chrome / Edge / Explorer が「どの経路でも進む/戻る」ができる
+  ユーザー体験と揃えるための実装。実機検証は本書 §7 の手動 sweep に含まれる。
 - 動画タイルは動画→動画なら source 差し替えまたは reopen pending で維持し、
   画像 / ZIP / PDF へ出たら閉じる。閉じた後の暗黙復帰はしない。
 - native overlay の `FsBoundaryHint` 相当中央表示は未実装。必要になったら

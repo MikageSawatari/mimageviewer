@@ -45,6 +45,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::time::Duration;
 
 use ffmpeg::ffi::{
     AVFMT_FLAG_CUSTOM_IO, AVIOContext, AVSEEK_SIZE, av_free, av_malloc, avformat_alloc_context,
@@ -67,6 +68,8 @@ const AVERROR_EIO: i32 = -5;
 const AVSEEK_FORCE: i32 = 0x20000;
 
 const READ_BUF_SZ: usize = 32 * 1024;
+const MAX_DEBUG_VIDEO_PREP_DELAY_MS: u64 = 60_000;
+const MAX_DEBUG_AVIO_READ_DELAY_MS: u64 = 250;
 
 /// 動画オープン (= demux thread 入口) のフェーズ識別子。HUD のメッセージ切替に使う。
 pub mod prep_phase {
@@ -189,6 +192,24 @@ pub fn build_preparing_message(status: PreparingStatus) -> String {
     }
 }
 
+fn parse_debug_delay_ms(value: Option<&str>, max_ms: u64) -> Option<Duration> {
+    let raw = value?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let ms = raw.parse::<u64>().ok()?;
+    if ms == 0 {
+        return None;
+    }
+    Some(Duration::from_millis(ms.min(max_ms)))
+}
+
+fn debug_delay_from_env(name: &str, max_ms: u64) -> Option<Duration> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| parse_debug_delay_ms(Some(&value), max_ms))
+}
+
 /// `avio_alloc_context` の opaque に詰める Rust 側の状態。
 struct ProgressIoState {
     file: File,
@@ -196,6 +217,8 @@ struct ProgressIoState {
     progress: Arc<PreparingProgress>,
     /// ファイルサイズ。`AVSEEK_SIZE` で即返すためにキャッシュしておく。
     file_size: u64,
+    /// デバッグ用: 準備フェーズ中だけ read callback を遅くする。
+    debug_read_delay: Option<Duration>,
 }
 
 extern "C" fn read_cb(opaque: *mut c_void, buf: *mut u8, buf_size: i32) -> i32 {
@@ -209,6 +232,12 @@ extern "C" fn read_cb(opaque: *mut c_void, buf: *mut u8, buf_size: i32) -> i32 {
         Ok(0) => AVERROR_EOF,
         Ok(n) => {
             state.progress.add_bytes(n as u64);
+            if n > 0
+                && state.progress.phase() != prep_phase::DONE
+                && let Some(delay) = state.debug_read_delay
+            {
+                std::thread::sleep(delay);
+            }
             n as i32
         }
         Err(e) => {
@@ -290,6 +319,23 @@ pub fn input_with_progress(
     path: &Path,
     progress: Arc<PreparingProgress>,
 ) -> Result<(InputWithProgress, PhaseTimings), String> {
+    // デバッグ用: 実機で動画準備中 HUD を観察しやすくするため、demux worker だけを
+    // 意図的に待たせる。UI スレッドは poll を続け、native presenter 側は
+    // `phase=OPENING` の準備中表示を描ける。
+    progress.set_phase(prep_phase::OPENING);
+    if let Ok(meta) = std::fs::metadata(path) {
+        progress.set_file_size(meta.len());
+    }
+    if let Some(delay) = debug_delay_from_env(
+        "MIV_DEBUG_VIDEO_PREP_DELAY_MS",
+        MAX_DEBUG_VIDEO_PREP_DELAY_MS,
+    ) {
+        crate::logger::log(format!(
+            "input_with_progress: MIV_DEBUG_VIDEO_PREP_DELAY_MS={}ms",
+            delay.as_millis()
+        ));
+        std::thread::sleep(delay);
+    }
     // 診断スイッチ (Codex 第 14 ラウンド助言): 環境変数 `MIV_DISABLE_AVIO_PROGRESS=1` で
     // custom AVIO 経路を skip して旧 `ffmpeg::format::input` に直接フォールバックする。
     // 再現確認時に「進捗を諦めて再生だけ戻す」切り分けに使う。
@@ -358,6 +404,14 @@ fn try_open_with_custom_avio(
     progress.set_file_size(file_size);
     // 念のため phase を OPENING に確定 (呼び出し側で先に set されていれば no-op)
     progress.set_phase(prep_phase::OPENING);
+    let debug_read_delay =
+        debug_delay_from_env("MIV_DEBUG_AVIO_READ_DELAY_MS", MAX_DEBUG_AVIO_READ_DELAY_MS);
+    if let Some(delay) = debug_read_delay {
+        crate::logger::log(format!(
+            "input_with_progress: MIV_DEBUG_AVIO_READ_DELAY_MS={}ms/read while preparing",
+            delay.as_millis()
+        ));
+    }
 
     // av_malloc で AVIO バッファを確保 (FFmpeg ownership)
     let buf = unsafe { av_malloc(READ_BUF_SZ) as *mut u8 };
@@ -369,6 +423,7 @@ fn try_open_with_custom_avio(
         file,
         progress: Arc::clone(&progress),
         file_size,
+        debug_read_delay,
     });
     let opaque = Box::into_raw(state) as *mut c_void;
 
@@ -710,6 +765,26 @@ mod tests {
         assert!(s.contains("100.0 MB / 100.0 MB"), "got: {s}");
         // 反対のオーバーフロー表示 (300 / 100) が出ないこと
         assert!(!s.contains("300.0 MB"), "expected clamping, got: {s}");
+    }
+
+    #[test]
+    fn parse_debug_delay_ms_ignores_missing_empty_zero_and_invalid() {
+        assert_eq!(parse_debug_delay_ms(None, 100), None);
+        assert_eq!(parse_debug_delay_ms(Some(""), 100), None);
+        assert_eq!(parse_debug_delay_ms(Some(" 0 "), 100), None);
+        assert_eq!(parse_debug_delay_ms(Some("abc"), 100), None);
+    }
+
+    #[test]
+    fn parse_debug_delay_ms_accepts_and_clamps_positive_values() {
+        assert_eq!(
+            parse_debug_delay_ms(Some("25"), 100),
+            Some(Duration::from_millis(25))
+        );
+        assert_eq!(
+            parse_debug_delay_ms(Some("250"), 100),
+            Some(Duration::from_millis(100))
+        );
     }
 
     #[test]

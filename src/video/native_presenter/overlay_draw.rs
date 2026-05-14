@@ -1413,12 +1413,9 @@ pub(super) fn draw_native_toast(
                 // (半径 56) と完全に被る。HUD top バー (上端 ~60px) と picker top
                 // (center_y - 56) の間に収めるため、上から 30% の位置に置く。
                 // 最小 80px は極端に低い窓 (= 30% が HUD バーに食い込む) 用の床。
-                let centered_y = (full_rect.min.y + full_rect.height() * 0.30)
-                    .max(full_rect.min.y + 80.0);
-                egui::Rect::from_center_size(
-                    egui::pos2(full_rect.center().x, centered_y),
-                    size,
-                )
+                let centered_y =
+                    (full_rect.min.y + full_rect.height() * 0.30).max(full_rect.min.y + 80.0);
+                egui::Rect::from_center_size(egui::pos2(full_rect.center().x, centered_y), size)
             } else {
                 egui::Rect::from_min_size(
                     egui::pos2(full_rect.max.x - size.x - 20.0, full_rect.min.y + 62.0),
@@ -1764,7 +1761,9 @@ pub(super) fn draw_native_top_bar_tile(
                 String::new()
             };
 
-            let sub_text = if interval_secs <= 0.0 && progress_total == 0 {
+            let sub_text = if let Some(open_status) = tile_state.video_open_status {
+                crate::video::avio_progress::build_preparing_message(open_status)
+            } else if interval_secs <= 0.0 && progress_total == 0 {
                 String::from("タイルを準備中...")
             } else if let Some(m) = metadata {
                 format!(
@@ -2317,10 +2316,14 @@ pub(super) fn draw_native_tile_overlay(
             // 描画する。タイルオーバーレイは中央の preparing 文言とグリッドだけを担う。
 
             if state.progress_done == 0 && !state.finished {
+                let message = state
+                    .video_open_status
+                    .map(crate::video::avio_progress::build_preparing_message)
+                    .unwrap_or_else(|| "タイルを準備中...".to_string());
                 painter.text(
                     full_rect.center(),
                     egui::Align2::CENTER_CENTER,
-                    "動画を準備中...",
+                    message,
                     egui::FontId::proportional(20.0),
                     egui::Color32::from_gray(180),
                 );

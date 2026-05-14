@@ -295,7 +295,7 @@ fn last_descendant_dir(path: &Path, opts: FolderTreeOptions) -> PathBuf {
 
 /// path 以下のすべてのサブフォルダ（path 自身を含む）を再帰的に収集する。
 pub fn walk_dirs_recursive(path: &Path, out: &mut Vec<PathBuf>, cancel: &AtomicBool) {
-    walk_dirs_recursive_with_progress(path, out, cancel, &mut |_| {}, &mut |_, _| {});
+    walk_dirs_recursive_with_progress(path, out, cancel, &mut |_| {}, &mut |_, _| {}, None);
 }
 
 /// `walk_dirs_recursive` の進捗通知付きバージョン。
@@ -305,12 +305,18 @@ pub fn walk_dirs_recursive(path: &Path, out: &mut Vec<PathBuf>, cancel: &AtomicB
 /// `name_bulk_indexer` 等の利用者に集中させ、他用途 (キャッシュ作成等) には影響させない
 /// ため — Codex P2 レビュー指摘)。`on_visit` 同様にスロットリング (rate limit) は
 /// 呼び出し側の責務。
+///
+/// `yield_check` を渡すと、各ディレクトリの entries ループ内で 64 件ごとに
+/// `ActivityGate::wait_until_idle` を呼ぶ。大量ファイル (1 フォルダ 10000+ 件) を
+/// 持つフォルダの file_type 連続呼び出し中でも、UI 操作 (動画オープン等) で
+/// 64 entry 以内に indexer が停止する。
 pub fn walk_dirs_recursive_with_progress(
     path: &Path,
     out: &mut Vec<PathBuf>,
     cancel: &AtomicBool,
     on_visit: &mut dyn FnMut(&Path),
     on_error: &mut dyn FnMut(&Path, &std::io::Error),
+    yield_check: Option<&crate::activity_gate::ActivityGate>,
 ) {
     if cancel.load(Ordering::Relaxed) {
         return;
@@ -328,10 +334,22 @@ pub fn walk_dirs_recursive_with_progress(
     out.push(path.to_path_buf());
     match std::fs::read_dir(path) {
         Ok(entries) => {
+            const YIELD_EVERY_N: usize = 64;
+            let mut processed: usize = 0;
             for entry in entries.flatten() {
                 if cancel.load(Ordering::Relaxed) {
                     return;
                 }
+                if processed > 0
+                    && processed % YIELD_EVERY_N == 0
+                    && let Some(gate) = yield_check
+                {
+                    gate.wait_until_idle(cancel);
+                    if cancel.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
+                processed += 1;
                 // file_type() で GetFileAttributes syscall を避ける (scan_directory と同様)
                 let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
                 if is_dir {
@@ -341,6 +359,7 @@ pub fn walk_dirs_recursive_with_progress(
                         cancel,
                         on_visit,
                         on_error,
+                        yield_check,
                     );
                 }
             }

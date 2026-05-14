@@ -149,10 +149,13 @@ pub struct AvClock {
     /// decoder が EOF (= demux 末端) に到達したか。post-EOF seek を検出する。
     /// `notify_eof_reached` で立て、`request_seek` / `clear_eof_reached` で降ろす。
     eof_reached: AtomicBool,
-    /// 音量 (0.0-1.0、f64 bits)。
+    /// 動画音量の線形ゲイン (0.0..+18dB 相当、f64 bits)。
     volume_bits: AtomicU64,
     /// ミュート。
     muted: AtomicBool,
+    /// safety limiter が最終出力 ceiling 超過を検出した回数。
+    /// audio-pump thread が増やし、UI thread / native overlay が差分を一時表示する。
+    limiter_ceiling_hit_seq: AtomicU64,
     /// 音量ノーマライズの線形ゲイン (f64 bits)。1.0 = 素通し、>1.0 = boost、<1.0 = attenuation。
     /// `[10^(-24/20), 10^(24/20)]` (= 約 0.063 〜 15.85) にクランプされる。
     /// 状態判定 (Off / OnApplied / OnUnmeasured) はこの値で行わず、App 側の
@@ -243,6 +246,7 @@ impl AvClock {
                 crate::settings::clamp_video_volume(initial_volume).to_bits(),
             ),
             muted: AtomicBool::new(false),
+            limiter_ceiling_hit_seq: AtomicU64::new(0),
             normalize_gain_bits: AtomicU64::new(1.0_f64.to_bits()),
         }
     }
@@ -836,7 +840,7 @@ impl AvClock {
         self.muted.store(m, Ordering::Release);
     }
 
-    /// RT 出力コールバックで掛ける音量 (mute 中は 0、100% 超 boost はここでは掛けない)。
+    /// RT 出力コールバックで掛ける音量 (mute 中は 0、0dB 超 boost はここでは掛けない)。
     pub fn output_volume(&self) -> f32 {
         if self.is_muted() {
             0.0
@@ -845,9 +849,17 @@ impl AvClock {
         }
     }
 
-    /// 音声ポンプ側で safety limiter の前に掛ける boost。100% 以下では 1.0。
+    /// 音声ポンプ側で safety limiter の前に掛ける boost。0dB 以下では 1.0。
     pub fn pre_limiter_gain(&self) -> f32 {
         self.volume().max(1.0) as f32
+    }
+
+    pub fn limiter_ceiling_hit_seq(&self) -> u64 {
+        self.limiter_ceiling_hit_seq.load(Ordering::Acquire)
+    }
+
+    pub fn mark_limiter_ceiling_hit(&self) {
+        self.limiter_ceiling_hit_seq.fetch_add(1, Ordering::AcqRel);
     }
 
     /// 音量ノーマライズ用の線形ゲイン (1.0 = 素通し)。
@@ -922,14 +934,28 @@ mod tests {
 
     #[test]
     fn volume_supports_manual_boost_but_caps_rt_output_gain() {
-        let clock = AvClock::new(2.0, Arc::new(AtomicU64::new(0)));
+        let clock = AvClock::new(10.0, Arc::new(AtomicU64::new(0)));
         assert!((clock.volume() - crate::settings::VIDEO_VOLUME_MAX).abs() < 1.0e-9);
         assert!((clock.output_volume() - 1.0).abs() < 1.0e-6);
-        assert!((clock.pre_limiter_gain() - 1.5).abs() < 1.0e-6);
+        assert!(
+            (clock.pre_limiter_gain() - crate::settings::VIDEO_VOLUME_MAX as f32).abs() < 1.0e-6
+        );
 
         clock.set_muted(true);
         assert_eq!(clock.output_volume(), 0.0);
-        assert!((clock.pre_limiter_gain() - 1.5).abs() < 1.0e-6);
+        assert!(
+            (clock.pre_limiter_gain() - crate::settings::VIDEO_VOLUME_MAX as f32).abs() < 1.0e-6
+        );
+    }
+
+    #[test]
+    fn limiter_ceiling_hit_sequence_increments_on_hit() {
+        let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+        assert_eq!(clock.limiter_ceiling_hit_seq(), 0);
+        clock.mark_limiter_ceiling_hit();
+        assert_eq!(clock.limiter_ceiling_hit_seq(), 1);
+        clock.mark_limiter_ceiling_hit();
+        assert_eq!(clock.limiter_ceiling_hit_seq(), 2);
     }
 
     #[test]

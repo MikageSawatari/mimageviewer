@@ -34,6 +34,7 @@ pub mod exif_reader;
 pub mod external_links;
 pub mod fast_resize;
 pub mod folder_rating_counter;
+pub mod folder_thumb_pins;
 pub mod folder_tree;
 pub mod fts_index;
 pub mod fts_meta;

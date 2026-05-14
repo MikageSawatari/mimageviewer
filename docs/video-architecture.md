@@ -425,10 +425,14 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   `DspBridge::process_block` 経由で bridge プロセスに送り、戻ってきた処理済みサンプルを
   ring buffer に push する (= IPC roundtrip ~1-2ms、AudioBuffer processed queue 100ms
   で吸収)
-- 動画音量は 0〜150% の手動調整。100% 超の分は `audio-pump` で safety limiter の前に
-  preamp gain として掛け、`fill_output` 側の RT 音量は最大 100% に抑える。これにより
-  100% 以下の音量変更は従来通り低レイテンシで、boost 時だけ limiter の 5ms lookahead を
-  PDC latency として扱う。
+- 動画音量は -∞dB〜+18dB の dB フェーダーで手動調整する。保存値は既存互換のため
+  `Settings.video_volume` の線形ゲインのまま保持し、UI で dB フェーダー位置へ相互変換する。
+  0dB 超の分は `audio-pump` で safety limiter の前に preamp gain として掛け、
+  `fill_output` 側の RT 音量は最大 0dB に抑える。これにより 0dB 以下の音量変更は従来通り
+  低レイテンシで、boost 時だけ limiter の 5ms lookahead を PDC latency として扱う。
+  safety limiter が最終出力の ceiling 超過を検出した場合は `AvClock` の sequence を増やし、
+  native HUD の音量表示右側に赤いインジケータを約 500ms 表示する。ユーザー音量が低く、
+  最終出力が ceiling 未満に収まる場合は indicator だけを出さない。
 - 現在フレームのクリップボードコピーは `screenshot.rs` の one-shot worker で別 FFmpeg
   input を開き、最後に表示済みの source pts 近傍をフル解像度 RGBA に変換してから
   既存の CF_DIB clipboard helper へ渡す。メイン decode queue / native presenter の GPU
@@ -590,6 +594,22 @@ overlay bounds に clamp するため、解像度・DPI・モニター構成が�
 - 経緯と設計判断は [docs/dcomp-native-presenter-integration-plan.md](dcomp-native-presenter-integration-plan.md)
   に詳細あり (Phase A〜D の段階的移行)
 
+#### 動画オープン準備中 HUD のデバッグ環境変数
+
+`src/video/avio_progress.rs` は custom AVIO で `avformat_open_input` /
+`avformat_find_stream_info` の進捗を `PreparingProgress` に反映し、native presenter
+overlay の中央 status に「メタデータ読込中...」「ストリーム解析中...」を表示する。
+高速な SSD / OS cache では表示が一瞬で終わるため、実機確認用に以下のデバッグ環境変数を持つ。
+どちらも **demux worker だけ**を待たせ、UI thread は止めない。
+
+- `MIV_DEBUG_VIDEO_PREP_DELAY_MS=<ms>`: `phase=OPENING` と file size を設定した直後、
+  open 開始前に固定 sleep する。最大 60000ms に clamp。
+- `MIV_DEBUG_AVIO_READ_DELAY_MS=<ms>`: custom AVIO の read callback ごとに sleep する。
+  `phase != DONE` の準備中だけ有効で、open 完了後の通常 packet 読み込みは遅くしない。
+  1 read あたり最大 250ms に clamp。
+- `MIV_DISABLE_AVIO_PROGRESS=1`: custom AVIO を使わず旧 `ffmpeg::format::input(&path)`
+  へ直接フォールバックする切り分け用。進捗バイト数は取れないが、再生可否の確認に使う。
+
 #### `tile_thumbnails.rs` / `tile_thumb_cache.rs`
 
 フルスクリーン中の **タイルモード** (`S` キー / ホバーバー ▦ ボタン) で使う、
@@ -613,6 +633,13 @@ overlay bounds に clamp するため、解像度・DPI・モニター構成が�
   出すための fallback。`sync_native_video_tile_overlay` が `state.video_path` から
   詰める。`preparing_with_filename(name)` コンストラクタで preparing 状態にも値を
   通す。
+- S タイル表示中は `NativeEguiOverlay::render_once` がタイル overlay を描画して早期
+  return するため、通常の center status HUD (`PreparingStatus` →
+  `build_preparing_message`) は描画されない。動画→動画の tile fast-swap では
+  `NativeOverlayTileOverlay::video_open_status` に `player.prep_progress().snapshot()`
+  を詰め、タイル overlay 側で「メタデータ読込中...」「ストリーム解析中...」を表示する。
+  実際のタイル抽出待ち (`video_open_status == None`) は「タイルを準備中...」として
+  動画オープン待ちと区別する。
 
 `ui_video_tile.rs` は state 構造体 (`VideoTileState`) と worker spawn
 ロジックだけを持ち、egui 描画関数は v0.9 系で削除済み。
@@ -778,7 +805,7 @@ cloaked にしていた場合は、`close_fullscreen` 内で先に uncloak し�
 - `Settings.video_rtx_vsr` (= VSR ON/OFF トグル、撤回により不要)
 
 維持する設定項目:
-- `Settings.video_volume` (音量。既定 1.0、手動 boost 上限 1.5)
+- `Settings.video_volume` (音量。既定 1.0 = 0dB、手動 boost 上限は +18dB 相当の線形ゲイン)
 - `Settings.video_loop_mode` (ループ再生モード: Off / Full / Chapter / Bookmark)。
   旧 `Settings.video_loop: bool` は移行用に残存し、`Settings::load()` 内の
   `migrate_legacy_video_loop` で `video_loop=true && video_loop_mode==Off` を Full へ昇格。

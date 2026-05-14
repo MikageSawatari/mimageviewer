@@ -275,6 +275,18 @@ impl crate::app::App {
                             }
                         }
                     }
+
+                    // ── 代表サムネ固定 (pin) エントリ (separator 込み) ──
+                    // 空フォルダの右クリックで合成された `GridItem::Folder(current_folder)`
+                    // は rel="" で pin できないので呼ばない (Codex Phase D P3 指摘: 単独の
+                    // separator が残るのを防ぐため呼び出し自体を skip)。
+                    // pin 不能 / アグリゲートビュー / drill-down 等の条件分岐とそれに伴う
+                    // separator 描画は helper 側に集約 (Codex Phase D 再指摘)。
+                    if !is_folder_context {
+                        if self.render_folder_pin_menu_entry(ui, &item) {
+                            close = true;
+                        }
+                    }
                 }
 
                 // メニュー外クリックで閉じる
@@ -425,6 +437,12 @@ impl crate::app::App {
                             close = true;
                         }
                     }
+                }
+
+                // ── 代表サムネ固定 (pin) エントリ (separator 込み) ──
+                // 条件分岐とそれに伴う separator 描画は helper 側に集約。
+                if self.render_folder_pin_menu_entry(ui, &item) {
+                    close = true;
                 }
 
                 // メニュー外クリックで閉じる
