@@ -3695,7 +3695,14 @@ impl App {
         };
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
-            .flat_map(|it| folder_thumb_existing_keys_for(it, &pin_map_for_existing))
+            .flat_map(|it| {
+                folder_thumb_existing_keys_for(
+                    it,
+                    &pin_map_for_existing,
+                    self.folder_thumb_pin_db.as_ref(),
+                    self.settings.folder_thumb_depth as usize,
+                )
+            })
             .collect();
 
         // 訪問時自動索引化は廃止。「名前」フル索引化 ON のお気に入りのみ
@@ -4782,7 +4789,14 @@ impl App {
         };
         let existing_keys: std::collections::HashSet<String> = items
             .iter()
-            .flat_map(|it| folder_thumb_existing_keys_for(it, &pin_map_for_existing))
+            .flat_map(|it| {
+                folder_thumb_existing_keys_for(
+                    it,
+                    &pin_map_for_existing,
+                    self.folder_thumb_pin_db.as_ref(),
+                    self.settings.folder_thumb_depth as usize,
+                )
+            })
             .collect();
         self.start_loading_items(
             synthetic,
@@ -8026,6 +8040,7 @@ impl App {
                     Some(self.settings.folder_thumb_sort),
                     self.settings.folder_thumb_depth,
                     &self.folder_pin_map,
+                    self.folder_thumb_pin_db.as_ref(),
                 )
             }) else {
                 continue;
@@ -8333,6 +8348,7 @@ impl App {
                     Some(self.settings.folder_thumb_sort),
                     self.settings.folder_thumb_depth,
                     &self.folder_pin_map,
+                    self.folder_thumb_pin_db.as_ref(),
                 )
             }) else {
                 continue;
@@ -16460,6 +16476,7 @@ fn make_load_request(
     folder_thumb_sort: Option<crate::settings::SortOrder>,
     folder_thumb_depth: u32,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
 ) -> Option<LoadRequest> {
     // 共通フィールド (idx/path/mtime/file_size/skip_cache) 以外は Default (0/None/false)
     // を基底にして差分だけ上書きする。入力 seq / items_gen は後段のエンキューで上書きされる。
@@ -16511,6 +16528,7 @@ fn make_load_request(
                 &base_key,
                 ContainerKindForPin::ZipFile,
                 pin_map,
+                pin_db,
                 pdf_password,
             ))
         }
@@ -16534,6 +16552,7 @@ fn make_load_request(
                 &base_key,
                 ContainerKindForPin::PdfFile,
                 pin_map,
+                pin_db,
                 pdf_password,
             ))
         }
@@ -16557,6 +16576,7 @@ fn make_load_request(
                 &base_key,
                 ContainerKindForPin::Folder,
                 pin_map,
+                pin_db,
                 pdf_password,
             ))
         }
@@ -16599,6 +16619,8 @@ fn make_load_request(
 fn folder_thumb_existing_keys_for(
     item: &GridItem,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    max_cascade_depth: usize,
 ) -> Vec<String> {
     let (container_path, base_key) = match item {
         GridItem::Image(p) => {
@@ -16633,7 +16655,13 @@ fn folder_thumb_existing_keys_for(
     let mut keys = vec![base_key.clone()];
     let container_key = crate::path_key::normalize_keep_drive(container_path);
     if let Some(source) = pin_map.get(&container_key) {
-        if let Some(resolved) = crate::folder_thumb_pins::resolve_pin_target(container_path, source)
+        // cascade 解決後の leaf source_id を使う (= `apply_folder_thumb_pin` が
+        // 書く pinned_key と同じ)。cascade を考慮せず immediate のままだと、
+        // delete_missing が cascade 由来の cache 行を毎回掃除してしまう。
+        // max_cascade_depth は呼び出し側 (load_folder) が `Settings.folder_thumb_depth`
+        // を渡してくる。
+        if let Some(resolved) =
+            resolve_pin_target_cascaded(container_path, source, pin_db, max_cascade_depth)
         {
             keys.push(format!(
                 "{}{}{}",
@@ -16681,37 +16709,112 @@ fn pin_source_compatible_with_container(
     }
 }
 
+/// cascade 解決: Folder→Folder の pin 連鎖を最終 leaf (非 Folder か pin 無し Folder)
+/// まで辿って `ResolvedPinTarget` を返す。
+///
+/// 動機: A が B (Folder) を pin、B が C (Image) を pin している場合、ユーザーは A の
+/// 親 grid で A のタイルが C を表示することを期待する。cascade なしだと A の pin は
+/// B の auto-pick (= B 内最初の画像) になり、B 自身の pin (= C) を反映できない。
+///
+/// 動作:
+/// - 1 段目: `pin_map` 由来の immediate_source を使う (UI スレッドで lookup 済み)
+/// - 2 段目以降: `pin_db` で直接 DB lookup (cheap single-row)
+/// - 終了条件: 非 Folder kind に到達 / pin 無し Folder に到達 / サイクル検出 /
+///   `max_depth` 超過
+/// - サイクル A↔B の場合は visited HashSet で 2 周目を検知して停止
+///
+/// `max_depth` は `Settings.folder_thumb_depth` (規定 3、範囲 0〜10) と揃える。
+/// pin が無いときに `resolve_folder_thumb_image` がサブフォルダを何階層まで辿るかと
+/// 同じ上限。0 のとき cascade は完全に無効化される (= 旧 Phase B 互換挙動)。
+///
+/// 返値: 最終 leaf の `ResolvedPinTarget`。
+/// - 非 Folder leaf (Image / Video / ZipEntry / PdfPage / ZipFirstImage / PdfFirstPage):
+///   そのまま target として使う
+/// - pin 無し Folder leaf: `FolderRepresentative` strategy で auto-pick する
+fn resolve_pin_target_cascaded(
+    container: &std::path::Path,
+    immediate_source: &crate::folder_thumb_pins::FolderPinSource,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
+    max_depth: usize,
+) -> Option<crate::folder_thumb_pins::ResolvedPinTarget> {
+    use crate::folder_thumb_pins::ResolvedKind;
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    visited.insert(crate::path_key::normalize_keep_drive(container));
+    let mut current_container: std::path::PathBuf = container.to_path_buf();
+    let mut current_source: crate::folder_thumb_pins::FolderPinSource = immediate_source.clone();
+    // immediate (= 1 段目) は無条件に解決、cascade は `max_depth` 回まで Folder leaf を
+    // 追跡する。例:
+    //   max_depth=0: cascade 無し (immediate のみ) — 旧 Phase B 互換
+    //   max_depth=3 (規定): A→B→C→D まで追跡可能 (immediate + 3 段 cascade)
+    let mut cascades_remaining = max_depth;
+    loop {
+        let resolved =
+            crate::folder_thumb_pins::resolve_pin_target(&current_container, &current_source)?;
+        // 非 Folder leaf に到達したら確定。
+        if !matches!(resolved.kind, ResolvedKind::Folder) {
+            return Some(resolved);
+        }
+        // Folder leaf: cascade 残量があり、さらに pin があれば続行。
+        if cascades_remaining == 0 {
+            return Some(resolved);
+        }
+        let Some(db) = pin_db else {
+            return Some(resolved);
+        };
+        let next_container = resolved.abs_path.clone();
+        let next_key = crate::path_key::normalize_keep_drive(&next_container);
+        if visited.contains(&next_key) {
+            crate::logger::log(format!(
+                "folder_thumb_pin: cascade cycle at {} — stopping",
+                next_container.display(),
+            ));
+            return Some(resolved);
+        }
+        let Some(next_source) = db.lookup(&next_container) else {
+            // この Folder には pin が無いので FolderRepresentative で auto-pick する。
+            return Some(resolved);
+        };
+        // container kind は Folder で固定 (cascade は Folder→Folder のみ追跡)
+        if !pin_source_compatible_with_container(ContainerKindForPin::Folder, &next_source) {
+            crate::logger::log(format!(
+                "folder_thumb_pin: cascade incompatible source at {} — stopping",
+                next_container.display(),
+            ));
+            return Some(resolved);
+        }
+        visited.insert(next_key);
+        current_container = next_container;
+        current_source = next_source;
+        cascades_remaining -= 1;
+    }
+}
+
 /// 親コンテナ用 `LoadRequest` (Folder/ZipFile/PdfFile) に対し、手動ピンがあれば
 /// target 種別のリクエストに書き換える。
 ///
 /// 動作:
 /// - `pin_map` から container のピン source を引く。無ければ `base_req` をそのまま返す。
-/// - target を `resolve_pin_target` で解決。target ファイルが存在しなければ
-///   無効ピンと判断し `base_req` をそのまま返す (= 自動選定に fall back)。
+/// - **Folder→Folder→... の cascade を最終 leaf まで追跡** (`resolve_pin_target_cascaded`)。
+///   サブフォルダがさらに pin を持っていれば再帰的にそちらの target を採用する。
 /// - target 種別に応じて `path` / `zip_entry` / `pdf_page` / `resolve_override` を上書き。
-/// - `cache_key_override` は `{base_key}#pin:{source_id}` にし、pin の identity が
-///   target 変更で必ず変わるようにする (古い WebP を catch しない)。
-/// - `mtime` / `file_size` を target ファイル自身のものに差し替える (= catalog の
-///   hit 判定が target metadata に対して行われる)。
+/// - `cache_key_override` は `{base_key}#pin:{leaf_source_id}` にし、cascade の leaf 内容が
+///   変わると key も変わって古い WebP を catch しない。
+/// - `mtime` / `file_size` を leaf 自身のものに差し替える (= catalog の hit 判定が leaf
+///   metadata に対して行われる)。
 ///
-/// Phase C 注意:
+/// Phase C 注意 (Video pin):
 /// - Video pin (`ResolvedKind::Video`) は `seed_folder_video_pin_thumbs` が事前に
 ///   `video_pins` DB の WebP を `folderthumb:{dir}#pin:{source_id}` で catalog + cache_map
 ///   にミラーしているので、worker は通常の cache_hit 経路で動画フレームを取り出せる。
 ///   ここで返す LoadRequest は `path = container` (folder) + `cache_key_override =
 ///   pinned_key` + `mtime/file_size = 動画のもの` (= seed と整合)。
-///   seed が空 (video_pin 無し) の場合は cache miss → folder 自身の auto-pick に
-///   フォールバック (worker 内 `resolve_folder_thumb_image` が `req.path` = folder で動く)。
-/// - Folder source (`ResolvedKind::Folder`) は target サブフォルダで `FolderRepresentative`
-///   strategy を実行する。**そのサブフォルダ自身の pin は引かない** ことで再帰を 1 段で
-///   止める (= サイクル A↔B のような無限ループ防止)。pin_map が今フォルダの 1 階層分の
-///   container だけを持っている前提と整合。
 fn apply_folder_thumb_pin(
     base_req: LoadRequest,
     container: &std::path::Path,
     base_key: &str,
     container_kind: ContainerKindForPin,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
+    pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     pdf_password: Option<&str>,
 ) -> LoadRequest {
     let container_key = crate::path_key::normalize_keep_drive(container);
@@ -16729,7 +16832,15 @@ fn apply_folder_thumb_pin(
         ));
         return base_req;
     }
-    let Some(resolved) = crate::folder_thumb_pins::resolve_pin_target(container, source) else {
+    // cascade 解決: Folder→Folder の pin 連鎖を leaf まで辿る。max_depth は base_req の
+    // folder_thumb_depth (= Settings.folder_thumb_depth) に揃える。pin 無し時の
+    // `resolve_folder_thumb_image` のサブフォルダ探索上限と同じ仕様にして UX を統一する。
+    let Some(resolved) = resolve_pin_target_cascaded(
+        container,
+        source,
+        pin_db,
+        base_req.folder_thumb_depth as usize,
+    ) else {
         crate::logger::log(format!(
             "folder_thumb_pin: target unresolved for {} (source={:?}) — falling back to auto-select",
             container.display(),

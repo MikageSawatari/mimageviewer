@@ -121,10 +121,20 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
   動画フレームを取り出す。WebP が無い / 失敗時は seed を skip / 旧 seed 行を purge して
   worker を folder auto-pick fallback (`resolve_folder_thumb_image`) に落とす。
   video pin は `skip_cache = false` 固定で idle quality-upgrade の対象外 (WebP IS the source)。
-- **Folder source の再帰クリップ**: pin source がサブフォルダ (`FolderRepresentative`)
-  の場合、worker はそのサブフォルダで `resolve_folder_thumb_image` を 1 段だけ走らせる
-  (= サブフォルダ自身の pin は引かない)。pin_map が 1 階層分しか持たない前提と整合し、
-  A↔B のサイクル無限ループを構造的に防ぐ。
+- **Folder source の cascade 解決** (v0.9.x+): pin source がサブフォルダ
+  (`FolderRepresentative`) の場合、`resolve_pin_target_cascaded` が `folder_thumb_pins.db`
+  を順に lookup して **Folder→Folder の pin 連鎖を最終 leaf まで辿る**。例: A が B
+  (Folder) を pin、B が C (Image) を pin → A の親グリッドでの A のタイルは C を表示する。
+  cascade の段数上限は `Settings.folder_thumb_depth` (規定 3、範囲 0〜10) に揃える
+  (= `resolve_folder_thumb_image` のサブフォルダ探索深度と同じ仕様)。
+  - サイクル検出: `visited` HashSet で normalize_keep_drive 済みパスを記録。A↔B 循環は
+    2 周目で検知して停止し、その時点の Folder を `FolderRepresentative` で auto-pick する。
+  - 0 を指定すると cascade は無効化される (= 旧 Phase B 互換挙動)。
+  - `pinned_key` は **cascade leaf の source_id** を埋める。連鎖途中の pin が書き換わると
+    leaf の identity が変わって cache key も変わるので、stale cache を catch しない。
+  - `folder_thumb_existing_keys_for` も同じ cascade を実行して existing_keys に leaf
+    pinned_key を含める。これをしないと delete_missing が cascade 由来の cache 行を
+    毎ロード掃除してしまう (Phase D 後のバグ修正 / 二重実装で識別)。
 - **container/source の compat check**: `pin_source_compatible_with_container`
   で DB 汚染や将来の schema 拡張による不整合 (ZipFile container に PdfPage source 等) を
   弾き、`base_req` にフォールバックする。
