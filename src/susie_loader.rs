@@ -452,16 +452,35 @@ static INIT_COND: std::sync::Condvar = std::sync::Condvar::new();
 /// 旧版 `get_pool()` は内部で `Settings::load()` を呼んでいたが、Phase 4 で並列
 /// `Settings::load()` を撲滅するため、`main.rs` の起動シーケンスから一度だけ呼ぶ
 /// `init_pool(enabled, parallel)` に分離した。複数回呼ぶと最初の値が採用される。
+///
+/// **2 段階初期化** (Codex P2 v14b 2026-05-14):
+/// 1. **Cheap install**: `POOL.get_or_init` で `RwLock<Arc<empty_pool>>` を **即座に**
+///    入れる。OnceLock の init closure は数 µs で完了するので、他スレッドの
+///    `OnceLock::get_or_init` が待たされない。
+/// 2. **Heavy build**: `SusieWorkerPool::start` を OnceLock の **外側で** 実行する。
+///    worker handshake が hang しても OnceLock は既に populate 済みなので、
+///    `get_pool()` の timeout fallback (= 別の `get_or_init` 呼び出し) は即時 return できる。
+/// 3. **Swap**: 完成したプールを `RwLock` に書き込む。
+/// 4. **Notify**: `INIT_DONE = true` で待機者を起こす。
+///
+/// このため、handshake hang 中の状態は「OnceLock = Some(empty_pool)、INIT_DONE = false」となる。
+/// `get_pool()` の待機者は INIT_TIMEOUT (= 5s) 後に empty_pool を取って先へ進める。
+/// 後で hang が解けた場合は swap が走り、それ以降の `get_pool()` 呼び出しは real pool を見る。
 pub fn init_pool(enabled: bool, parallel: bool) {
-    POOL.get_or_init(|| {
-        if enabled {
-            RwLock::new(Arc::new(SusieWorkerPool::start(parallel)))
-        } else {
-            RwLock::new(Arc::new(empty_pool()))
-        }
-    });
-    // POOL 設定後に init_done を立てて Condvar を起こす。get_pool の待機者が
-    // 即座に進める。
+    // Step 1: cheap empty install.
+    let rwlock = POOL.get_or_init(|| RwLock::new(Arc::new(empty_pool())));
+    // Step 2: heavy build outside the OnceLock init.
+    let pool = if enabled {
+        SusieWorkerPool::start(parallel)
+    } else {
+        empty_pool()
+    };
+    // Step 3: swap real pool in.
+    {
+        let mut writer = rwlock.write().unwrap_or_else(|e| e.into_inner());
+        *writer = Arc::new(pool);
+    }
+    // Step 4: signal.
     {
         let mut done = INIT_DONE.lock().unwrap_or_else(|e| e.into_inner());
         *done = true;
