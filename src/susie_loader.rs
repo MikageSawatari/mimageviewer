@@ -447,6 +447,18 @@ static POOL: OnceLock<RwLock<Arc<SusieWorkerPool>>> = OnceLock::new();
 static INIT_DONE: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 static INIT_COND: std::sync::Condvar = std::sync::Condvar::new();
 
+/// `init_pool` / `reload` 操作の世代カウンタ (Codex P2 v14c 2026-05-14)。
+///
+/// 各操作の入口で `fetch_add(1)` して自分の世代をスナップショットし、heavy build
+/// 完了後の swap 直前に `load()` で再確認する。値が変わっていれば「自分のビルド中に
+/// 別の操作 (reload や 2 重 init) が走った」ことを意味するので、こちらの swap は
+/// 諦めて build 物を捨てる。
+///
+/// このおかげで「main の susie-init thread が startup settings で build 中、ユーザーが
+/// Preferences で reload して別 pool を入れる、その後 startup build が完了して
+/// ユーザー設定を **上書き** してしまう」事故を防ぐ。
+static INIT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// プールを **明示的に** 初期化する (Phase 4: spec §8.2 2026-05-14)。
 ///
 /// 旧版 `get_pool()` は内部で `Settings::load()` を呼んでいたが、Phase 4 で並列
@@ -467,6 +479,9 @@ static INIT_COND: std::sync::Condvar = std::sync::Condvar::new();
 /// `get_pool()` の待機者は INIT_TIMEOUT (= 5s) 後に empty_pool を取って先へ進める。
 /// 後で hang が解けた場合は swap が走り、それ以降の `get_pool()` 呼び出しは real pool を見る。
 pub fn init_pool(enabled: bool, parallel: bool) {
+    use std::sync::atomic::Ordering;
+    // Step 0: 世代スナップショット (Codex P2 v14c 2026-05-14)。
+    let my_gen = INIT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     // Step 1: cheap empty install.
     let rwlock = POOL.get_or_init(|| RwLock::new(Arc::new(empty_pool())));
     // Step 2: heavy build outside the OnceLock init.
@@ -475,12 +490,19 @@ pub fn init_pool(enabled: bool, parallel: bool) {
     } else {
         empty_pool()
     };
-    // Step 3: swap real pool in.
-    {
+    // Step 3: 世代再確認 + swap。reload や別の init_pool が走っていれば
+    // 自分の build 物は捨てる (= ユーザー choice / 最新値を尊重)。
+    if INIT_GENERATION.load(Ordering::SeqCst) == my_gen {
         let mut writer = rwlock.write().unwrap_or_else(|e| e.into_inner());
         *writer = Arc::new(pool);
+    } else {
+        crate::logger::log(
+            "susie_loader: init_pool: generation moved during build; \
+             discarding stale pool (reload won)",
+        );
+        drop(pool);
     }
-    // Step 4: signal.
+    // Step 4: signal (= swap したかどうかに関わらず、起動完了状態にする)。
     {
         let mut done = INIT_DONE.lock().unwrap_or_else(|e| e.into_inner());
         *done = true;
@@ -572,15 +594,40 @@ pub fn supports_extension(ext_lower: &str) -> bool {
 }
 
 /// プラグインフォルダ更新 / 並列オプション変更時にワーカープールを再起動する。
+///
+/// 世代カウンタを上げてから build → swap する (Codex P2 v14c)。並行する
+/// `init_pool` (= main の startup thread が build 中) が swap しようとしても、
+/// 世代不一致で諦めるので user 設定が上書きされない。
+///
+/// reload 自体が複数回呼ばれたケースでも、最後の reload が世代の最新値を持って
+/// swap するので「ユーザーが連続変更したときも最後の choice が反映される」性質を
+/// 維持する。
 pub fn reload(enabled: bool, parallel: bool) {
+    use std::sync::atomic::Ordering;
+    let my_gen = INIT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let lock = POOL.get_or_init(|| RwLock::new(Arc::new(empty_pool())));
     let new_pool = if enabled {
         SusieWorkerPool::start(parallel)
     } else {
         empty_pool()
     };
-    // 旧プールの Drop がここで走る
-    *lock.write().unwrap() = Arc::new(new_pool);
+    if INIT_GENERATION.load(Ordering::SeqCst) == my_gen {
+        // 旧プールの Drop がここで走る
+        *lock.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(new_pool);
+    } else {
+        crate::logger::log(
+            "susie_loader: reload: generation moved during build; \
+             discarding stale pool (later reload won)",
+        );
+        drop(new_pool);
+    }
+    // reload は init_pool より後に呼ばれる前提だが、念のため起動完了状態に
+    // しておく (= init_pool が呼ばれずに reload だけのケースでも get_pool が即時返る)。
+    {
+        let mut done = INIT_DONE.lock().unwrap_or_else(|e| e.into_inner());
+        *done = true;
+    }
+    INIT_COND.notify_all();
 }
 
 // ─────────────────────────────────────────────────────────────────
