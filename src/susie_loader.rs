@@ -535,14 +535,12 @@ pub fn get_pool() -> Arc<SusieWorkerPool> {
     let timeout = std::time::Duration::from_millis(INIT_TIMEOUT_MS);
     let mut done = INIT_DONE.lock().unwrap_or_else(|e| e.into_inner());
     while !*done {
-        let (g, result) = INIT_COND
-            .wait_timeout(done, timeout)
-            .unwrap_or_else(|e| {
-                // poison 経路: lock の中身を取り出して timeout 扱いで継続。
-                let g = e.into_inner();
-                let result = g.1;
-                (g.0, result)
-            });
+        let (g, result) = INIT_COND.wait_timeout(done, timeout).unwrap_or_else(|e| {
+            // poison 経路: lock の中身を取り出して timeout 扱いで継続。
+            let g = e.into_inner();
+            let result = g.1;
+            (g.0, result)
+        });
         done = g;
         if result.timed_out() && !*done {
             // timeout: empty_pool で永続化して終わる。
