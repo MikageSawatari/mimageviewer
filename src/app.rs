@@ -7858,6 +7858,12 @@ impl App {
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
+        // マウスドライバ / AHK 経由で積まれた進む/戻る pending は **early-return より前に
+        // drain** する。検索バー / ダイアログ / IME 変換中などショートカットを止める分岐で
+        // 早期 return すると pending が次フレームに持ち越され、フォーカス解除後に遅れて
+        // Ctrl+↑/↓ として暴発するため (Codex P2)。ブロック中は count を捨てる。
+        let (browser_back_count, browser_forward_count) = crate::take_pending_mouse_nav();
+
         // ウィンドウにフォーカスがない場合はキー入力を無視
         let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         if !has_focus {
@@ -7937,9 +7943,8 @@ impl App {
             )
         });
 
-        // マウスドライバが WM_APPCOMMAND / VK_BROWSER_BACK/FORWARD で送る経路を消費。
-        // 詳細は main.rs の `install_mouse_nav_hook` 参照。
-        let (browser_back_count, browser_forward_count) = crate::take_pending_mouse_nav();
+        // マウスドライバが WM_APPCOMMAND / VK_BROWSER_BACK/FORWARD で送る経路 (上で
+        // 関数頭で drain 済み) を消費。詳細は main.rs の `install_mouse_nav_hook` 参照。
         let browser_back = browser_back_count > 0;
         let browser_forward = browser_forward_count > 0;
 

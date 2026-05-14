@@ -2398,6 +2398,11 @@ impl App {
         fs_idx: usize,
         is_spread_double: bool,
     ) -> FsKeyAction {
+        // マウスドライバ / AHK 経由で積まれた進む/戻る pending は **early-return より前に
+        // drain** する。フォーカス無し / モーダル表示中で早期 return すると pending が
+        // 次フレームに持ち越されて誤発火するため (Codex P2)。ブロック中は count を捨てる。
+        let (browser_back_count, browser_forward_count) = crate::take_pending_mouse_nav();
+
         let has_focus = ctx.input(|i| i.viewport().focused).unwrap_or(true);
         let mut action = FsKeyAction {
             close: false,
@@ -2477,9 +2482,8 @@ impl App {
         // マウス戻る/進む (Extra1/Extra2 = native XButton) を Ctrl+↑/↓ と等価に扱う。
         let mouse_back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1));
         let mouse_forward = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra2));
-        // WM_APPCOMMAND / VK_BROWSER_BACK/FORWARD 経路 (mouse driver や AHK が送る) も同等に消費。
+        // WM_APPCOMMAND / VK_BROWSER_BACK/FORWARD 経路 (上で関数頭で drain 済み) を消費。
         // 詳細は main.rs の `install_mouse_nav_hook` 参照。
-        let (browser_back_count, browser_forward_count) = crate::take_pending_mouse_nav();
         let browser_back = browser_back_count > 0;
         let browser_forward = browser_forward_count > 0;
         let arrow_right = ctx.input_mut(|i| {

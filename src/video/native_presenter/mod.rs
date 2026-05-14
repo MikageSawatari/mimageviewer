@@ -719,6 +719,11 @@ fn native_video_fullscreen_shortcut_key(
             | 0x50 // P
             | 0x53 // S
             | 0x57 // W
+            | 0xA6 // VK_BROWSER_BACK — マウス戻るボタン (driver / AHK 経由)。
+                   // overlay が wants_keyboard_input でも fullscreen ショートカットとして
+                   // App ハンドラへ流す (= マウスナビゲーションが overlay text input 等で
+                   // 殺されないようにする、Codex P2)。
+            | 0xA7 // VK_BROWSER_FORWARD — 同上。
     )
 }
 
@@ -6096,6 +6101,10 @@ mod tests {
         assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x20))));
         assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x0D))));
         assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x41))));
+        // マウス進む/戻る (VK_BROWSER_BACK/FORWARD) も overlay が keyboard を欲しがる
+        // 状態 (text input 以外) でも fullscreen ショートカットとして App 側へ流す (Codex P2)。
+        assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0xA6))));
+        assert!(routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0xA7))));
     }
 
     #[test]
@@ -6108,6 +6117,9 @@ mod tests {
 
         assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x20))));
         assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0x0D))));
+        // text_input_active 中はマウス進む/戻るも UI 側へ流さない (= text 編集の邪魔をしない)。
+        assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0xA6))));
+        assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0xA7))));
     }
 
     #[test]
