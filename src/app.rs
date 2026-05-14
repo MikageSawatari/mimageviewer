@@ -17170,13 +17170,13 @@ pub(crate) fn draw_cell(
     tags: &[String],
     // コンテナセルに出す「フィルタ一致の子孫件数」。None ならバッジ非表示。
     filter_match_count: Option<u32>,
-    // true なら **金色**の「📌」バッジを描画する (= このアイテム自身が pin 済みコンテナ)。
-    // 「このフォルダ / ZIP / PDF のサムネはユーザー指定で固定されている」状態を示す。
-    has_container_pin: bool,
-    // true なら **青色**の「📌」バッジを描画する (= このアイテムは現コンテナの
-    // pin source 先)。「親 (= 現在表示中のフォルダ) のサムネとして自分が指定されている」
-    // 状態を示す。`has_container_pin` と両方 true のときは 2 つ並べる。
-    is_pin_source: bool,
+    // true なら **金色**の「📌」バッジを描画する (= ユーザー設定の pin に関わるアイテム)。
+    // 以下のどちらかの条件で立つ:
+    //  1. このアイテム自身が pin 済みコンテナ (Folder/ZipFile/PdfFile が pin される)
+    //  2. このアイテムは現コンテナの pin source 先 (= 親の代表に指定されている)
+    // 両条件が同時に成立しても 1 個のバッジで表示 (= ユーザーから「2 色の意味の違い」を
+    // 問われないように統一)。
+    has_pin: bool,
 ) {
     if !ui.is_rect_visible(rect) {
         return;
@@ -17575,9 +17575,8 @@ pub(crate) fn draw_cell(
         );
     }
 
-    // 左上バッジ列: 補 (ページ個別補正) → 消 (消しゴムマスク) → 📌(金、container_pin)
-    // → 📌(青、pin_source) → タグバッジ。横並びで、収まらなければ末尾省略。
-    // 2 つの 📌 は意味が違うので **必ず別の色** で並列表示する (両方立つ入れ子ケースあり)。
+    // 左上バッジ列: 補 (ページ個別補正) → 消 (消しゴムマスク) → 📌(金、pin)
+    // → タグバッジ。横並びで、収まらなければ末尾省略。
     {
         let badge_w = 18.0;
         let badge_h = 16.0;
@@ -17609,8 +17608,9 @@ pub(crate) fn draw_cell(
             );
             x += badge_w + 2.0;
         }
-        if has_container_pin {
-            // 📌 (金色) — 「このコンテナ自身が pin 済み」。中のサムネが固定されている。
+        if has_pin {
+            // 📌 (金色) — ユーザー設定の pin に関わるアイテムの目印。
+            // アドレスバーの 📌 ボタンの色 (RGB 230,180,90) と統一する。
             let badge_rect =
                 egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(badge_w, badge_h));
             painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(230, 180, 90));
@@ -17620,23 +17620,6 @@ pub(crate) fn draw_cell(
                 "📌",
                 egui::FontId::proportional(11.0),
                 egui::Color32::from_rgb(60, 40, 10),
-            );
-            x += badge_w + 2.0;
-        }
-        if is_pin_source {
-            // 📌 (青色) — 「このアイテムは親コンテナの pin source」。
-            // = 親のサムネとして自分が指定されている状態。
-            // has_container_pin と両方立つケースがあるので 2 つ並べる
-            // (例: pin 元かつ自分も pin 済みの入れ子コンテナ)。
-            let badge_rect =
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(badge_w, badge_h));
-            painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(90, 160, 230));
-            painter.text(
-                badge_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "📌",
-                egui::FontId::proportional(11.0),
-                egui::Color32::from_rgb(15, 30, 60),
             );
             x += badge_w + 2.0;
         }
