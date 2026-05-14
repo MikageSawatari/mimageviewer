@@ -206,7 +206,12 @@ pub struct GpuVideoDevice {
     /// 呼ぶための ID3D11VideoContext1 view (= `video_context` と同一オブジェクトの cast)。
     video_context1: ID3D11VideoContext1,
     /// processor + enumerator のキャッシュ。同一 (in_size, out_size, format) なら使い回す。
-    processor_cache: std::cell::RefCell<Option<ProcessorState>>,
+    /// `Mutex` であること自体が correctness 要件: 動画切替時は旧 decoder thread が
+    /// detached のまま生きており、新 decoder thread と同じ `Arc<GpuVideoDevice>` を
+    /// 共有して同時に `blit` を呼ぶ。`RefCell` だと並行 borrow で panic する
+    /// (2026-05-14 実害: ホイール連続切替で「デコード開始中」固着)。`blit` は
+    /// このロックを処理全体で保持するので、結果的に並行 blit 全体が直列化される。
+    processor_cache: Mutex<Option<ProcessorState>>,
     shared_output_pool: Mutex<Vec<SharedOutputSlot>>,
     shared_output_pool_wait: Mutex<()>,
     shared_output_pool_cv: Arc<Condvar>,
@@ -382,7 +387,7 @@ impl GpuVideoDevice {
             video_device,
             video_context,
             video_context1,
-            processor_cache: std::cell::RefCell::new(None),
+            processor_cache: Mutex::new(None),
             shared_output_pool: Mutex::new(Vec::new()),
             shared_output_pool_wait: Mutex::new(()),
             shared_output_pool_cv: Arc::new(Condvar::new()),
@@ -457,7 +462,7 @@ impl GpuVideoDevice {
             input_fps_num,
             input_fps_den,
         )?;
-        let cache = self.processor_cache.borrow();
+        let cache = self.processor_cache.lock().unwrap();
         let state = cache.as_ref().expect("ensured above");
 
         // 3. 出力先を 2 段構成にする (vsr_probe で driver 仕様確定):
@@ -715,7 +720,7 @@ impl GpuVideoDevice {
             (input_fps_num, input_fps_den)
         };
 
-        let cur = self.processor_cache.borrow();
+        let cur = self.processor_cache.lock().unwrap();
         if let Some(s) = cur.as_ref() {
             if s.in_w == in_w
                 && s.in_h == in_h
@@ -756,7 +761,7 @@ impl GpuVideoDevice {
                 .CreateVideoProcessor(&enumerator, 0)
                 .map_err(|e| GpuVideoError::ProcessorCreate(format!("{e:?}")))?
         };
-        *self.processor_cache.borrow_mut() = Some(ProcessorState {
+        *self.processor_cache.lock().unwrap() = Some(ProcessorState {
             enumerator,
             processor,
             in_w,
