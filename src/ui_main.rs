@@ -1608,15 +1608,17 @@ impl App {
                                 let tags = self.cell_tag_list(idx).to_vec();
                                 let filter_match = self.folder_rating_match(idx);
                                 let filter_match_count = filter_match.map(|(c, _)| c);
-                                // 📌 バッジを 2 種類のケースで出す:
-                                //  1. **コンテナ自身が pin 済み**: Folder/ZipFile/PdfFile に
-                                //     代表サムネピンが設定されている (= 親フォルダ視点)
-                                //  2. **現コンテナの pin source**: 現在表示中のフォルダ /
-                                //     ZIP / PDF の pin が指している子アイテム (= 自分視点)。
-                                //     ユーザーが「自分が pin した側」を視覚的に確認できる。
-                                // pin_map は load_folder 時に lookup_many で一括取得済み
-                                // (per-cell DB アクセスなし)。
-                                let has_folder_pin = match &self.items[idx] {
+                                // 📌 バッジを 2 種類で出す (色で区別):
+                                //  1. **金色 📌 (has_container_pin)**: そのアイテム自身が
+                                //     pin 済みコンテナ (Folder/ZipFile/PdfFile)。そのサムネ
+                                //     が親グリッドでユーザー指定で固定表示されていることを示す。
+                                //  2. **青色 📌 (is_pin_source)**: 現在表示中の親コンテナの
+                                //     pin source 先。自分が「親のサムネとして指定されている」
+                                //     ことを示す。
+                                // 入れ子の pin (フォルダ A の中で B を pin、さらに親で A を
+                                // pin) では両方立つので **2 つ並列表示**する。pin_map は
+                                // load_folder 時に lookup_many で一括取得済み。
+                                let has_container_pin = match &self.items[idx] {
                                     GridItem::Folder(p)
                                     | GridItem::ZipFile(p)
                                     | GridItem::PdfFile(p) => {
@@ -1625,10 +1627,8 @@ impl App {
                                     }
                                     _ => false,
                                 };
-                                let is_pin_source = if has_folder_pin {
-                                    // 既にコンテナ側で出すので二重表示しない
-                                    false
-                                } else if let Some(cur) = self.current_folder.as_ref() {
+                                let is_pin_source = if let Some(cur) = self.current_folder.as_ref()
+                                {
                                     let cur_key = crate::path_key::normalize_keep_drive(cur);
                                     self.folder_pin_map.get(&cur_key).is_some_and(|pin_src| {
                                         crate::folder_thumb_pins::source_from_grid_item(
@@ -1641,7 +1641,6 @@ impl App {
                                 } else {
                                     false
                                 };
-                                let show_pin_badge = has_folder_pin || is_pin_source;
                                 crate::app::draw_cell(
                                     ui,
                                     cell_rect,
@@ -1656,7 +1655,8 @@ impl App {
                                     adjusted_tex,
                                     &tags,
                                     filter_match_count,
-                                    show_pin_badge,
+                                    has_container_pin,
+                                    is_pin_source,
                                 );
                                 // 小さい右下バッジに限らずセル全体をホバー領域にして
                                 // ★内訳 tooltip を出す。

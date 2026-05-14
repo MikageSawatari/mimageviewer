@@ -6419,6 +6419,12 @@ impl App {
     /// - 7z/LZH 変換キャッシュ ZIP の drill-down (`archive_source_override` Some)
     /// - 選択無し / 選択アイテムが pin 不能 (ConvertibleArchive / SearchContainer /
     ///   ZipSeparator、または container を指す `rel=""` ケース)
+    ///
+    /// **Video pin の set ガード**: pin 対象が動画でかつ `video_pins` DB に有効な WebP
+    /// (= フルスクリーン HUD でユーザーがピン留めしたフレーム) が無い場合、トースト
+    /// 通知を出して set 自体を拒否する。これをやらないと、worker が auto-pick fallback で
+    /// 親フォルダ自身の代表画を pinned_key 下に保存してしまい、ユーザーから見ると
+    /// 「動画 pin したのにサムネが変わらない」状態になる (= 効果が無い pin)。
     pub(crate) fn toggle_folder_pin_from_selection(&mut self) {
         let Some(container) = self.current_folder.clone() else {
             return;
@@ -6441,10 +6447,50 @@ impl App {
         };
         let existing = self.folder_thumb_pin_for(&container).cloned();
         if existing.as_ref() == Some(&source) {
+            // 解除は無条件で許可 (DB 上の dead pin を掃除できるように)
             self.remove_folder_thumb_pin(&container);
-        } else {
-            self.set_folder_thumb_pin(&container, source);
+            return;
         }
+        self.try_set_folder_thumb_pin_with_video_guard(&container, source);
+    }
+
+    /// `set_folder_thumb_pin` の薄いラッパで、**動画 source の場合は video_pins DB に
+    /// 有効な WebP が無ければ拒否**する。worker が auto-pick fallback で「親フォルダ自身の
+    /// 代表画」を pinned_key に保存してしまう dead pin を防ぐ。
+    ///
+    /// 戻り値: 実際に pin が設定できれば `true`。拒否時はトーストを出して `false`。
+    /// 拒否は **set** にのみ適用される (= remove は別経路から直接呼ぶ)。
+    fn try_set_folder_thumb_pin_with_video_guard(
+        &mut self,
+        container: &std::path::Path,
+        source: crate::folder_thumb_pins::FolderPinSource,
+    ) -> bool {
+        if let crate::folder_thumb_pins::FolderPinSource::File {
+            kind: crate::folder_thumb_pins::FileKind::Video,
+            ..
+        } = &source
+        {
+            let abs = container.join(source.rel());
+            let has_webp = self
+                .video_pin_db
+                .as_ref()
+                .and_then(|db| db.lookup(&abs))
+                .map(|pin| !pin.thumb_webp.is_empty())
+                .unwrap_or(false);
+            if !has_webp {
+                self.show_feedback_toast(
+                    "動画内でピン留めされた画像がないため、設定できません\n\
+                     先にフルスクリーンで動画を開き、HUD のピンボタンでフレームを保存してください"
+                        .to_string(),
+                );
+                crate::logger::log(format!(
+                    "folder_thumb_pin: video pin rejected (no WebP) for {}",
+                    abs.display()
+                ));
+                return false;
+            }
+        }
+        self.set_folder_thumb_pin(container, source)
     }
 
     /// 親コンテナの代表サムネピンが書き換わっていたら現フォルダを再ロードして
@@ -6531,7 +6577,7 @@ impl App {
             if is_current {
                 self.remove_folder_thumb_pin(&container);
             } else {
-                self.set_folder_thumb_pin(&container, source);
+                self.try_set_folder_thumb_pin_with_video_guard(&container, source);
             }
             return true;
         }
@@ -17040,10 +17086,13 @@ pub(crate) fn draw_cell(
     tags: &[String],
     // コンテナセルに出す「フィルタ一致の子孫件数」。None ならバッジ非表示。
     filter_match_count: Option<u32>,
-    // true なら左上に「📌」バッジを描画する (= folder_thumb_pin が設定されている
-    // コンテナ)。サムネ自体が変化しないケースで「ピンは確かに効いている」ことを
-    // ユーザーが視認するための補助 UI。
-    has_folder_pin: bool,
+    // true なら **金色**の「📌」バッジを描画する (= このアイテム自身が pin 済みコンテナ)。
+    // 「このフォルダ / ZIP / PDF のサムネはユーザー指定で固定されている」状態を示す。
+    has_container_pin: bool,
+    // true なら **青色**の「📌」バッジを描画する (= このアイテムは現コンテナの
+    // pin source 先)。「親 (= 現在表示中のフォルダ) のサムネとして自分が指定されている」
+    // 状態を示す。`has_container_pin` と両方 true のときは 2 つ並べる。
+    is_pin_source: bool,
 ) {
     if !ui.is_rect_visible(rect) {
         return;
@@ -17442,8 +17491,9 @@ pub(crate) fn draw_cell(
         );
     }
 
-    // 左上バッジ列: 補 (ページ個別補正) → 消 (消しゴムマスク) → 📌 (folder_thumb_pin)
-    // → タグバッジ。横並びで、収まらなければ末尾省略。
+    // 左上バッジ列: 補 (ページ個別補正) → 消 (消しゴムマスク) → 📌(金、container_pin)
+    // → 📌(青、pin_source) → タグバッジ。横並びで、収まらなければ末尾省略。
+    // 2 つの 📌 は意味が違うので **必ず別の色** で並列表示する (両方立つ入れ子ケースあり)。
     {
         let badge_w = 18.0;
         let badge_h = 16.0;
@@ -17475,11 +17525,8 @@ pub(crate) fn draw_cell(
             );
             x += badge_w + 2.0;
         }
-        if has_folder_pin {
-            // 📌 バッジ: コンテナ (Folder/ZipFile/PdfFile) に代表サムネピンが
-            // 設定されている目印。サムネイル自体が変化しないケース (自動代表選定と
-            // 同じ画像になった / 動画ピン WebP 未抽出で auto-pick fallback 等) でも
-            // 「ピンは確かに DB に保存されている」をユーザーが視認できる。
+        if has_container_pin {
+            // 📌 (金色) — 「このコンテナ自身が pin 済み」。中のサムネが固定されている。
             let badge_rect =
                 egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(badge_w, badge_h));
             painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(230, 180, 90));
@@ -17489,6 +17536,23 @@ pub(crate) fn draw_cell(
                 "📌",
                 egui::FontId::proportional(11.0),
                 egui::Color32::from_rgb(60, 40, 10),
+            );
+            x += badge_w + 2.0;
+        }
+        if is_pin_source {
+            // 📌 (青色) — 「このアイテムは親コンテナの pin source」。
+            // = 親のサムネとして自分が指定されている状態。
+            // has_container_pin と両方立つケースがあるので 2 つ並べる
+            // (例: pin 元かつ自分も pin 済みの入れ子コンテナ)。
+            let badge_rect =
+                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(badge_w, badge_h));
+            painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(90, 160, 230));
+            painter.text(
+                badge_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "📌",
+                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgb(15, 30, 60),
             );
             x += badge_w + 2.0;
         }
