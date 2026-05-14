@@ -16701,6 +16701,20 @@ fn apply_folder_thumb_pin(
         crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
         resolved.source_id,
     );
+    // ネスト時の解決経路を確認するための診断ログ。Folder/ZipFile/PdfFile pin の挙動を
+    // 切り分けやすくする。`mimageviewer.log` の grep `folder_thumb_pin: apply` で
+    // すべての pin 適用箇所を一覧できる。
+    crate::logger::log(format!(
+        "folder_thumb_pin: apply container={} kind={:?} -> resolved={} \
+         (kind={:?} mtime={} size={}) pinned_key=`{}`",
+        container.display(),
+        container_kind,
+        resolved.abs_path.display(),
+        resolved.kind,
+        resolved.mtime,
+        resolved.file_size,
+        pinned_key,
+    ));
 
     // Video pin は seed_folder_video_pin_thumbs が `pinned_key` で video_pins WebP を
     // catalog + cache_map に書き込んでいる前提。worker はそのまま cache_hit で

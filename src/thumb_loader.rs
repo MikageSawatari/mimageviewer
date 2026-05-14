@@ -864,6 +864,26 @@ fn resolve_folder_thumb_image(
     sort: crate::settings::SortOrder,
     remaining_depth: u32,
 ) -> Option<std::path::PathBuf> {
+    let result = resolve_folder_thumb_image_inner(folder, sort, remaining_depth);
+    // pin 経路の切り分け用診断ログ (= 最上位 entry 点のみ。再帰ステップ内側は出さない)
+    crate::logger::log(format!(
+        "  resolve_folder_thumb_image: folder={} sort={:?} depth={} -> {}",
+        folder.display(),
+        sort,
+        remaining_depth,
+        result
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+    ));
+    result
+}
+
+fn resolve_folder_thumb_image_inner(
+    folder: &Path,
+    sort: crate::settings::SortOrder,
+    remaining_depth: u32,
+) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(folder).ok()?;
     let mut images: Vec<(std::path::PathBuf, i64)> = Vec::new();
     let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
@@ -918,7 +938,7 @@ fn resolve_folder_thumb_image(
                 )
         });
         for sub in &subdirs {
-            if let Some(img) = resolve_folder_thumb_image(sub, sort, remaining_depth - 1) {
+            if let Some(img) = resolve_folder_thumb_image_inner(sub, sort, remaining_depth - 1) {
                 return Some(img);
             }
         }
@@ -1216,7 +1236,7 @@ pub fn load_one_cached(
                     }
                 }
                 crate::logger::log(format!(
-                    "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms encode={encode_ms:>5.1}ms  {display_name}"
+                    "    idx={idx:>4} decode={decode_ms:>6.1}ms display={display_ms:>5.1}ms encode={encode_ms:>5.1}ms  {display_name}  -> save_key=`{name}`"
                 ));
             }
             None => {
