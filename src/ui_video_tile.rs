@@ -114,20 +114,19 @@ impl App {
         let usable_w = (screen_size.x - 32.0).max(200.0);
         let tile_w = (usable_w / columns as f32).floor().max(40.0) as u32;
         let tile_h = ((tile_w as f64) / aspect).round().max(30.0) as u32;
-        // 抽出幅は **接続モニター中の最大幅 / 最小列数** に固定する。
-        // - 列数を下げる (= タイル拡大) ときに拡大スケール → ぼやけを避ける
-        // - 列数を上げる (= タイル縮小) ときは縮小スケールで詳細維持
-        // - マルチモニターで FS 幅が違ってもキャッシュ再利用可 (= ユーザー環境の
-        //   最大解像度モニターを基準にすると、どのモニター上で再生しても同じ
-        //   tile_w で抽出された 1 つのキャッシュ行に集約される)
+        // 抽出幅は **接続モニター中の最大幅 / `VIDEO_TILE_EXTRACT_MIN_COLUMNS`** を
+        // 基準にし、現在の tile_w を下回らないようにする (`.max(tile_w)`)。
+        // - 6 列以上は extract_w が定数になり、列数を変えても同じキャッシュ行を共有
+        // - tile_w が基準を超える粗いモード (4 列など) では extract_w = tile_w となり、
+        //   そのモードを使ったときだけ専用サイズで抽出 (拡大ぼやけは出ない)
+        // - 基準を候補の最小値ではなく専用定数にしているのは、候補に 4 を足しただけで
+        //   既定 10 列の抽出解像度・メモリまで上がるのを避けるため (Codex P3)
+        // - マルチモニターで FS 幅が違ってもキャッシュ再利用可
         // native overlay の描画スケールは tile_rect に合わせて適用するので描画側は
         // 再抽出不要。モニター情報が取れない場合のフォールバックは 640px (4K/6 ≈ 640 相当)。
         let max_screen_w = crate::monitor::max_monitor_pixel_width().unwrap_or(3840) as f32;
-        let min_columns = *crate::settings::VIDEO_TILE_COLUMN_CANDIDATES
-            .iter()
-            .min()
-            .unwrap_or(&6);
-        let extract_w = ((max_screen_w / min_columns as f32).floor() as u32).max(tile_w);
+        let extract_min_columns = crate::settings::VIDEO_TILE_EXTRACT_MIN_COLUMNS;
+        let extract_w = ((max_screen_w / extract_min_columns as f32).floor() as u32).max(tile_w);
         let extract_h = ((extract_w as f64) / aspect).round().max(tile_h as f64) as u32;
 
         // 画面に収まる最大行数を計算。上下に余白 + ファイル名行 (任意) を引く。

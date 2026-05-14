@@ -1121,6 +1121,14 @@ pub const AUDIO_NORMALIZE_TARGET_LUFS_MILLI_MAX: i32 = 0;
 /// 4 は縦長ディスプレイ向け (6 列でもタイルが小さいため)。
 pub const VIDEO_TILE_COLUMN_CANDIDATES: &[usize] = &[4, 6, 10, 16, 20, 26, 30];
 
+/// タイルサムネイル抽出幅の基準となる「最小列数」。表示列数の候補とは独立。
+/// 候補の最小値 (`VIDEO_TILE_COLUMN_CANDIDATES.iter().min()`) を直接使うと、
+/// 候補に小さい値 (4 等) を足しただけで既定 10 列でも抽出解像度・RGBA メモリが
+/// 全体的に跳ね上がる (4K で 640px → 960px ≈ 2.25x)。6 に固定すると 6 列以上は
+/// 従来どおり 1 行のキャッシュを共有し、4 列など粗いモードは `extract_w` の
+/// `.max(tile_w)` 経由で「そのモードを使ったときだけ」専用サイズで抽出される。
+pub const VIDEO_TILE_EXTRACT_MIN_COLUMNS: usize = 6;
+
 fn default_video_tile_columns() -> usize {
     10
 }
