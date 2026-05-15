@@ -1242,10 +1242,28 @@ impl App {
         // chrome 復元は fullscreen viewport hide の DWM 反映を待つが、foreground
         // 奪還まで 80ms 待つと、その間だけ外部ウィンドウが見えることがある。
         let now = std::time::Instant::now();
-        let presenter_destroyed = self.pending_main_foreground_reclaim_after_hwnd == 0
-            || !crate::video::native_window::is_window_alive(
+        // T30 (Claude R3-10): `pending_main_foreground_reclaim_after_hwnd == 0` を
+        // 「presenter は既に消えた」と扱うと、ESC で fullscreen を materialize 前に閉じた
+        // ケース (= close_fullscreen 時点で presenter HWND がまだ作られていない) で即
+        // claim_foreground が発火し、その直後に materialize する presenter の
+        // SetForegroundWindow と競合する。
+        //
+        // 修正: hwnd==0 は「不明状態 (close_fullscreen 時点で未 materialize)」として
+        // presenter_destroyed=false 扱いにし、`force_deadline` (close_fullscreen 後 200ms)
+        // 経由でのみ reclaim ログを出して skip する。
+        //
+        // 注意: close_fullscreen 時に hwnd==0 で snapshot した場合、その後 presenter が
+        // materialize → destroy しても本コードは hwnd==0 のままなので detect できない
+        // (= force_deadline 経由の skip に必ず流れる)。snapshot 時に hwnd!=0 だったケース
+        // のみ `is_window_alive` で精密に destroy 検出する。close_fullscreen 後に presenter
+        // 側で SetForegroundWindow が走ってもユーザー操作で奪回できるので、これで十分。
+        let presenter_destroyed = if self.pending_main_foreground_reclaim_after_hwnd != 0 {
+            !crate::video::native_window::is_window_alive(
                 self.pending_main_foreground_reclaim_after_hwnd,
-            );
+            )
+        } else {
+            false
+        };
         let force_deadline_passed = self
             .pending_main_foreground_reclaim_force_at
             .map(|t| now >= t)
@@ -1270,9 +1288,14 @@ impl App {
             self.pending_main_foreground_reclaim_after_hwnd = 0;
             self.pending_main_foreground_reclaim_force_at = None;
         } else if force_deadline_passed {
+            let status = if self.pending_main_foreground_reclaim_after_hwnd == 0 {
+                "unknown (never materialized)"
+            } else {
+                "still alive"
+            };
             crate::logger::log(format!(
                 "[native-video] reclaim deadline exceeded, skip claim \
-                 presenter_hwnd=0x{:x} still alive",
+                 presenter_hwnd=0x{:x} status={status}",
                 self.pending_main_foreground_reclaim_after_hwnd
             ));
             self.pending_main_foreground_reclaim = false;
