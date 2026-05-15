@@ -1259,17 +1259,50 @@ fn run_pump(
             (secs, audible, buf.pump_seek_serial)
         };
         if processed_secs >= READY_THRESHOLD_SECS {
-            let report_pts = match pump_anchor_target_secs {
-                Some(target) => cur_audible_pts.max(target),
-                None => cur_audible_pts,
-            };
-            let _ = engine_event_tx.try_send(crate::video::engine::EngineEvent::Audio(
-                crate::video::engine::state::AudioEvent::BufferReady {
-                    epoch: cur_serial,
-                    pts: report_pts,
-                    wall_now: std::time::Instant::now(),
-                },
-            ));
+            // T15 (Codex R-VENG-001): BufferReady を **engine が待っている state でのみ** 送る。
+            // 旧コードは Playing 中も pump loop ごと (audio frame rate ≈ 100-200Hz) に
+            // BufferReady を try_send していた。engine 側はそれを epoch < current 早期 return
+            // で no-op 処理するが、64-cap bounded lane を埋めてしまい、UI stall 中に
+            // `SeekCompleted` / `FirstFrameReady` 等 one-shot critical event が
+            // `try_send` → `Full` で **silently drop** される race を作っていた
+            // (= state が Seeking で固着し audio mute する症状)。
+            //
+            // BufferReady は readiness latch を埋める edge-style gate。engine が **Buffering
+            // または Loading** で待っているときだけ意味がある:
+            //   - Loading: 起動直後 / 動画切替直後。FirstFrameReady と並行して latch を埋める
+            //   - Buffering: post-seek の readiness 待ち、open 後の autoplay 等
+            //   - Seeking: ❌ 含めない (Codex P1 2026-05-16)。`SeekCompleted` 受領で engine は
+            //     latch を reset しつつ Buffering に遷移するため、Seeking 中の BufferReady は
+            //     latch を「埋めて即 reset」される dead write。むしろ lane を浪費して
+            //     SeekCompleted の前で詰まらせる原因になる
+            //   - Playing/Paused/Eof: ❌ 含めない (latch 既セット or 不要、handler 早期 return)
+            //
+            // 再 buffering (`BufferStarved → Buffering`) は現状 production code で
+            // BufferStarved 発火経路がないため (v0.9.0 時点で enum 定義 + handler + tests
+            // のみ)、再 open 不要。将来 BufferStarved を実装する場合はその時点で本 gate も
+            // 見直す。
+            //
+            // さらに stale-epoch check: `cur_serial != clock.current_seek_serial()` (= pump
+            // が新世代 seek を観測する前に古い世代の processed buffer を見ている) のときは
+            // 送らない。engine 側 `epoch < current_seek_epoch` で discard される dead event を
+            // sender で先に弾く (lane の節約)。
+            let engine_st = engine_state.load(Ordering::Acquire);
+            let engine_waiting_for_ready =
+                matches!(engine_st, state_code::LOADING | state_code::BUFFERING);
+            let live_serial = clock.current_seek_serial();
+            if engine_waiting_for_ready && cur_serial == live_serial {
+                let report_pts = match pump_anchor_target_secs {
+                    Some(target) => cur_audible_pts.max(target),
+                    None => cur_audible_pts,
+                };
+                let _ = engine_event_tx.try_send(crate::video::engine::EngineEvent::Audio(
+                    crate::video::engine::state::AudioEvent::BufferReady {
+                        epoch: cur_serial,
+                        pts: report_pts,
+                        wall_now: std::time::Instant::now(),
+                    },
+                ));
+            }
         }
 
         // ── A/V drift instrumentation: 1Hz snapshot + edge JSONL emit (Codex P1 ① 反映) ──
