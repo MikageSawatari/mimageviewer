@@ -3670,6 +3670,30 @@ impl VideoPlayer {
         lower
     }
 
+    /// loop seek (= EOF からの自動ループ再開) 専用 target clamp。
+    ///
+    /// 通常の `clamp_seek_target` は `duration - 0.1` で頭打ちにするが、loop 用にこれを
+    /// 使うと「loop_target_secs が duration 付近」のとき即 EOF → loop 再発火 → ... が
+    /// 48ms 単位で繰り返される **スタッターループ** になる (T16, Claude R1-3)。
+    /// Chapter / Bookmark ループの開始秒がたまたま末尾付近に設定された (例: 90 秒動画で
+    /// チャプター開始が 89.5 秒) ケースで実害があった。
+    ///
+    /// 残再生 window が `SAFE_LOOP_MIN_REMAINING_SECS` (= 1.0 秒) 未満になる loop target は
+    /// 0.0 に強制フォールバックする。これによりループは「全長を最初から」になり、stutter が
+    /// 解消する (= ユーザー意図とは違う挙動だが、stutter loop よりは害が少ない無難な選択)。
+    fn clamp_loop_seek_target(&self, target_secs: f64) -> f64 {
+        const SAFE_LOOP_MIN_REMAINING_SECS: f64 = 1.0;
+        let clamped = self.clamp_seek_target(target_secs);
+        if let Some(info) = &self.info {
+            if info.duration_secs > 0.0
+                && (info.duration_secs - clamped) < SAFE_LOOP_MIN_REMAINING_SECS
+            {
+                return 0.0;
+            }
+        }
+        clamped
+    }
+
     fn clamp_exact_frame_target(&self, target_secs: f64) -> f64 {
         let lower = target_secs.max(0.0);
         if let Some(info) = &self.info {
@@ -3810,7 +3834,7 @@ impl VideoPlayer {
 
     /// EOF / 境界 tick からループ復帰先として使う秒値を atomic で書き込む。
     /// **入力サニタイズ**: `NaN` / `inf` は `0.0` に、負値は `0.0` にクランプする。
-    /// 上限 (= duration) クランプは EOF 経路で `clamp_seek_target` を再度通すので
+    /// 上限 (= duration) クランプは EOF 経路で `clamp_loop_seek_target` を再度通すので
     /// ここでは行わない (info() 未到着時に duration が 0 で潰されるのを避けるため)。
     pub fn set_loop_target_secs(&self, secs: f64) {
         let safe = if secs.is_finite() { secs.max(0.0) } else { 0.0 };
@@ -3819,7 +3843,8 @@ impl VideoPlayer {
     }
 
     /// 現在の loop seek target (秒) を読む。値はサニタイズ済み (`set_loop_target_secs`)
-    /// だが duration クランプは未適用。EOF 経路では追加で `clamp_seek_target` を通す。
+    /// だが duration クランプ + stutter loop 安全弁は未適用。EOF 経路では追加で
+    /// `clamp_loop_seek_target` を通す (T16, 2026-05-16)。
     pub fn loop_target_secs(&self) -> f64 {
         f64::from_bits(
             self.loop_target_bits
@@ -4331,8 +4356,10 @@ impl VideoPlayer {
                 if loop_enabled {
                     // ループ ON: `loop_target_bits` (Full ループは 0.0、CH/BM ループは
                     // app が書き戻す「現区間の開始秒」) へ seek して再生継続。
+                    // T16: `clamp_loop_seek_target` で「末尾近すぎる target は 0 に倒す」
+                    // 安全弁を通し、48ms ごとの stutter loop を回避する。
                     let raw = self.loop_target_secs();
-                    let target = self.clamp_seek_target(raw);
+                    let target = self.clamp_loop_seek_target(raw);
                     self.clear_pending_user_seek();
                     self.clock.request_seek(target);
                     self.clear_audio_output_buffer();
@@ -4462,10 +4489,10 @@ impl VideoPlayer {
             if self.loop_enabled.load(std::sync::atomic::Ordering::Acquire) {
                 // ループ再生 ON: `loop_target_bits` (= app が書き戻している
                 // 「現区間の開始秒」 / Full ループでは 0.0) にシークし続行。
-                // duration クランプは clamp_seek_target に通す (info() 到着済みなら
-                // duration を超えないことを保証)。
+                // T16: `clamp_loop_seek_target` で「末尾近すぎる target は 0 に倒す」
+                // 安全弁を通し、duration 直前 loop での stutter (48ms ごと再発火) を回避。
                 let raw = self.loop_target_secs();
-                let target = self.clamp_seek_target(raw);
+                let target = self.clamp_loop_seek_target(raw);
                 self.clear_pending_user_seek();
                 self.clock.request_seek(target);
                 self.clear_audio_output_buffer();
