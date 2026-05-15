@@ -1629,7 +1629,15 @@ fn run_native_video_output(
                     error,
                     prep_status,
                 } => {
-                    if first_frame_presented || error.is_some() {
+                    // Playback status is driven from the UI thread and can lag behind
+                    // a queued SwitchSource command. During deferred wheel navigation
+                    // the shared NativeVideoOutput may still report the previous
+                    // source as presented until the presenter thread consumes
+                    // SwitchSource, so clearing the navigation preview here can expose
+                    // the previous video frame for one compositor pass. Keep preview
+                    // lifetime tied to the actual present path; errors still clear it
+                    // so the failure HUD can be seen.
+                    if error.is_some() {
                         presenter.set_overlay_navigation_preview(None);
                     }
                     presenter.set_overlay_playback_status(

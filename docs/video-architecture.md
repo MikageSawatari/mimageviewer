@@ -524,9 +524,12 @@ hard-stuck。固着動画では video decode thread が `first packet for serial
    ファイル名バーにする。これにより静止画ホイール移動に近い「移動先を文字/静止画で
    確認できる」状態を保ちつつ、decoder create/drop は 120ms quiet 後の最新 target
    だけに絞る。プレビューは `SwitchSource` 発行時点では消さず、新 source の最初の
-   frame が native presenter に `Present` された時点で消す。これにより decoder
-   startup 中に旧 source の最後の frame が一瞬露出するのを避ける。タイル fast-swap は既存の `video_tile_swap_pending` が UI 期待と
-   異なるため、この 120ms coalesce の対象外とする。
+   frame が native presenter に `Present` された時点で消す。`SetPlaybackStatus` は
+   UI thread 由来で、pending 中の共有 `NativeVideoOutput` が旧 source の
+   `first_frame_presented=true` を一時的に返すことがあるため、preview の clear 条件に
+   使わない。これにより decoder startup 中に旧 source の最後の frame が一瞬露出するのを
+   避ける。タイル fast-swap は既存の `video_tile_swap_pending` が UI 期待と異なるため、
+   この 120ms coalesce の対象外とする。
 
    **UI thread での待ち合わせは導入しない** (2026-05-15、Codex 指摘 #1 反映): 一時的に
    `wait_for_live_decoders_below(max, timeout)` で 5-10ms polling sleep する helper を
