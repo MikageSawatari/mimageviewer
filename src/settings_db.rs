@@ -85,6 +85,12 @@ pub enum SettingsDbError {
     /// `save_full` を呼んではならない** (= ユーザー設定の上書きを防ぐ)。`open()` で
     /// 開き直すか、上層で別の fallback を試す。
     AlreadyBootstrapped,
+    /// `create_new` が呼ばれたが家族の有無を確定できなかった (T06 v0.9.0):
+    /// metadata が NotFound 以外のエラーを返す or `read_dir` 自体が失敗したケース。
+    /// AV / cloud sync / 権限の一時的影響で誤って clean install 経路に倒れて
+    /// ユーザー設定を defaults で上書きするのを防ぐため、ここで一旦止めて
+    /// セッションを save 抑止に倒す。
+    AmbiguousFamilyPresence,
     /// 本セッションの save が抑止されている (Codex P2 v8b-3 2026-05-14)。
     /// `boot_settings_db` が FailedFallbackDefault を返したあとなど。`with_db` が
     /// この variant を返すと、Phase 3 caller は `save_full` を呼ばずに skip する。
@@ -106,6 +112,11 @@ impl std::fmt::Display for SettingsDbError {
             Self::AlreadyBootstrapped => {
                 write!(f, "create_new called on already-bootstrapped settings.db")
             }
+            Self::AmbiguousFamilyPresence => write!(
+                f,
+                "settings.db family presence is ambiguous (read_dir or metadata failed); \
+                 refusing to bootstrap to avoid clobbering existing user data"
+            ),
             Self::SaveSuppressed => write!(f, "save suppressed this session"),
             Self::Rusqlite(e) => write!(f, "sqlite error: {e}"),
             Self::Serde(e) => write!(f, "serde_json error: {e}"),
@@ -122,6 +133,7 @@ impl std::error::Error for SettingsDbError {
             Self::Corrupted(_)
             | Self::Poisoned
             | Self::AlreadyBootstrapped
+            | Self::AmbiguousFamilyPresence
             | Self::SaveSuppressed => None,
         }
     }
@@ -202,7 +214,7 @@ fn is_transient_error(e: &SettingsDbError) -> bool {
 /// settings.rs の関数を pub にすると lib との二重定義になる + Phase 6 で
 /// 削除予定の経路が増えるため、ここでは独立した実装を持つ (両者が同じ
 /// settings.log に append するのは意図的)。
-fn log_diag(msg: &str) {
+pub(crate) fn log_diag(msg: &str) {
     use std::io::Write;
     crate::logger::log(msg);
     let path = crate::data_dir::logs_dir().join("settings.log");
@@ -297,17 +309,45 @@ impl SettingsDb {
     ///    既に存在すれば `AlreadyBootstrapped` (= 既存ユーザー設定を握っている DB を
     ///    save_full(Default::default()) で消すのを防ぐ)。
     pub fn create_new(data_dir: &Path) -> Result<Self, SettingsDbError> {
-        // Codex P2 v8: open より前に family pre-check。bak / WAL / SHM が見えるなら
-        // (= "clean install" を選んだ前提が崩れているなら) 即座に AlreadyBootstrapped で
-        // 失敗し、上層は bak / 旧 JSON への fallback を試みる。
-        if settings_db_family_exists(data_dir) {
-            log_diag(
-                "settings_db: create_new pre-check: family is visible; \
-                 refusing to clobber existing setup (Codex P2 v8)",
-            );
-            return Err(SettingsDbError::AlreadyBootstrapped);
+        // T06 (v0.9.0): tri-state pre-check。`Present` は従来通り `AlreadyBootstrapped`、
+        // `Ambiguous` (metadata の non-NotFound エラーや read_dir 失敗) は判定不能なので
+        // 新規 `AmbiguousFamilyPresence` で fail-fast。両方 Ok を消すことで、AV / cloud
+        // sync の transient ノイズで `settings.db` を defaults で上書きする事故を防ぐ。
+        match settings_db_family_presence(data_dir) {
+            FamilyPresence::Present => {
+                log_diag(
+                    "settings_db: create_new pre-check: family is visible; \
+                     refusing to clobber existing setup",
+                );
+                return Err(SettingsDbError::AlreadyBootstrapped);
+            }
+            FamilyPresence::Ambiguous => {
+                log_diag(
+                    "settings_db: create_new pre-check: family presence ambiguous \
+                     (metadata or read_dir transient failure); refusing to bootstrap",
+                );
+                return Err(SettingsDbError::AmbiguousFamilyPresence);
+            }
+            FamilyPresence::ConfirmedAbsent => {}
         }
-        Self::open_with_mode(data_dir, OpenMode::CreateNew)
+        // T06 (v0.9.0): open 中の任意の段階 (PRAGMA / integrity / init_schema) で失敗した
+        // 場合、`Connection::open_with_flags` が既に settings.db (+ -wal / -shm) を
+        // ファイルシステムに作っている可能性がある。これを残すと次回起動で family が
+        // 見えてしまい quarantine 経路に倒れる → 旧 JSON migration が遠回りに。
+        // ここでまとめて掃除しておく (= save_full 前の orphan を最小化)。
+        //
+        // ただし `AlreadyBootstrapped` は **既存の実 DB** が見つかったことを意味する
+        // (pre-check が transient I/O で family を見落としていたケース)。これを消すと
+        // ユーザー設定を失う。AlreadyBootstrapped だけは cleanup を skip する
+        // (Codex P1 round 2 反映)。
+        match Self::open_with_mode(data_dir, OpenMode::CreateNew) {
+            Ok(db) => Ok(db),
+            Err(SettingsDbError::AlreadyBootstrapped) => Err(SettingsDbError::AlreadyBootstrapped),
+            Err(e) => {
+                cleanup_orphan_db_after_failed_bootstrap(data_dir);
+                Err(e)
+            }
+        }
     }
 
     fn open_with_mode(data_dir: &Path, mode: OpenMode) -> Result<Self, SettingsDbError> {
@@ -606,31 +646,119 @@ pub fn settings_db_path(data_dir: &Path) -> PathBuf {
     data_dir.join("settings.db")
 }
 
-/// `settings.db` family (本体 + WAL/SHM + bak1..bak10) のいずれかが物理的に
-/// 存在するか。
+/// Ambiguous を Ambiguous と判定する前のリトライ回数 (T06 v0.9.0 Codex P2 反映)。
+/// AV / cloud sync の一瞬の blip が原因なら 1-2 リトライで Present / ConfirmedAbsent に
+/// 落ち着くケースが多いので、ユーザーに「save 抑止セッション」を強いる前に試行する。
+const FAMILY_PRESENCE_RETRY_ATTEMPTS: u32 = 3;
+const FAMILY_PRESENCE_RETRY_BACKOFF_MS: u64 = 80;
+
+/// `settings_db_family_presence` を `Ambiguous` が出るうちは最大 N 回リトライする。
+/// `Present` / `ConfirmedAbsent` に落ち着いたら即返す。
+pub fn settings_db_family_presence_with_retry(data_dir: &Path) -> FamilyPresence {
+    for attempt in 0..FAMILY_PRESENCE_RETRY_ATTEMPTS {
+        let presence = settings_db_family_presence(data_dir);
+        if presence != FamilyPresence::Ambiguous {
+            if attempt > 0 {
+                log_diag(&format!(
+                    "settings_db: family presence stabilized to {presence:?} on attempt {}",
+                    attempt + 1
+                ));
+            }
+            return presence;
+        }
+        if attempt + 1 < FAMILY_PRESENCE_RETRY_ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(
+                FAMILY_PRESENCE_RETRY_BACKOFF_MS,
+            ));
+        }
+    }
+    FamilyPresence::Ambiguous
+}
+
+/// 家族存在判定の三状態 (T06 v0.9.0)。bool で「無い」と返していた経路を
+/// `ConfirmedAbsent` / `Ambiguous` に分割し、Ambiguous の場合は decision tree が
+/// 「clean install で defaults を書く」誤判定を起こさず save 抑止に倒せるようにする。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FamilyPresence {
+    /// 家族のいずれか 1 つ以上が物理的に確認できた。
+    Present,
+    /// 全 metadata が NotFound + `read_dir` が成功 + マッチするエントリゼロ。
+    /// 「本当に何も無い」と断定できた状態 (= clean install 経路へ進める)。
+    ConfirmedAbsent,
+    /// per-file metadata が NotFound 以外のエラーを返した、もしくは `read_dir`
+    /// 自体が失敗 / iterator が途中で error を返したケース。判定不能なので
+    /// 上層は save 抑止 + 既存データ保護に倒す。
+    Ambiguous,
+}
+
+/// `settings.db` family (本体 + WAL/SHM + bak1..bak10) の存在を tri-state で判定する
+/// (T06 v0.9.0)。bool 版 (`settings_db_family_exists`) は本関数の `Present` をラップする
+/// 後方互換 wrapper。
 ///
-/// 単一 `metadata()` だと transient NotFound で誤判定するので per-file metadata と
-/// `read_dir` 両経路で確認する (spec §5)。1 つでも見えれば true。
-pub fn settings_db_family_exists(data_dir: &Path) -> bool {
-    // 経路 1: per-file metadata
+/// `Ambiguous` の根拠:
+/// - per-file `metadata` が NotFound 以外のエラー (PermissionDenied / 一時 I/O 等) を返した
+/// - `read_dir` 自体が NotFound 以外のエラーを返した
+/// - `read_dir` の iterator が途中で error を返した
+///
+/// `read_dir` が NotFound (= data_dir 自体が存在しない) のケースは ConfirmedAbsent と
+/// 同等に扱う (新規環境の clean install を許可するため。data_dir が ambiguous なら
+/// per-file metadata 側で先に Ambiguous が立つ)。
+pub fn settings_db_family_presence(data_dir: &Path) -> FamilyPresence {
+    let mut ambiguous = false;
     let candidates = family_filenames();
     for name in &candidates {
         let p = data_dir.join(name);
-        if std::fs::metadata(&p).is_ok() {
-            return true;
+        match std::fs::metadata(&p) {
+            Ok(_) => return FamilyPresence::Present,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => ambiguous = true,
         }
     }
-    // 経路 2: read_dir で列挙
-    if let Ok(entries) = std::fs::read_dir(data_dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if is_family_filename(name) {
-                    return true;
+    // 経路 2: read_dir 列挙 — entry ごとに error を許容しないため flatten() を使わない。
+    match std::fs::read_dir(data_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(e) => {
+                        if let Some(name) = e.file_name().to_str()
+                            && is_family_filename(name)
+                        {
+                            return FamilyPresence::Present;
+                        }
+                    }
+                    Err(_) => ambiguous = true,
                 }
             }
+            if ambiguous {
+                FamilyPresence::Ambiguous
+            } else {
+                FamilyPresence::ConfirmedAbsent
+            }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // data_dir 自体が無い: 新規環境とみなして clean install を許可。
+            if ambiguous {
+                FamilyPresence::Ambiguous
+            } else {
+                FamilyPresence::ConfirmedAbsent
+            }
+        }
+        Err(_) => FamilyPresence::Ambiguous,
     }
-    false
+}
+
+/// `settings.db` family (本体 + WAL/SHM + bak1..bak10) のいずれかが物理的に
+/// 存在するか。
+///
+/// 後方互換 wrapper: `settings_db_family_presence(d) == Present` のシュガー。
+/// `Ambiguous` を「家族なし」とは扱いたくないため、ブール判定では false を返す
+/// (= 呼び出し側が判定不能を `Present` と誤認しないように、保守的に false 寄り)。
+/// 新規コードは `settings_db_family_presence` で三状態を見ること。
+pub fn settings_db_family_exists(data_dir: &Path) -> bool {
+    matches!(
+        settings_db_family_presence(data_dir),
+        FamilyPresence::Present
+    )
 }
 
 fn family_filenames() -> Vec<String> {
@@ -1457,33 +1585,175 @@ static QUARANTINE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 ///
 /// spec §6.2 に従い、Corrupted 検出時に main DB だけでなく WAL / SHM も一緒に退避する。
 /// これで新しい DB を作り直したときに古い WAL の recovery で誤った内容が混入するのを防ぐ。
+/// T06 (v0.9.0): `create_new` 中 / `save_full` の最初のコミット前に失敗した場合に、
+/// `Connection::open_with_flags` (SQLITE_OPEN_CREATE) や apply_pragmas が作った
+/// `settings.db` + `-wal` + `-shm` を **bootstrap_complete マーカー無し** の状態で
+/// 残さずに掃除する。
+///
+/// これをしないと次回起動で `settings_db_family_exists` が true を返し、
+/// `boot_recover_from_bak` が orphan を quarantine するために 1 ブート分余計に
+/// `.corrupted-<ts>` を生成する。さらに JSON migration 経路では legacy JSON が
+/// 無傷でも family が「true」になるため、quarantine 経由でしか migration を
+/// 再試行できなくなる (旧データは保存されるが UX が悪化)。
+///
+/// **Defense-in-depth** (Codex P1 round 3 反映): 削除前に必ず DB をプローブして
+/// `bootstrap_complete` マーカーが「**確実に欠落**」している場合のみ削除する。
+/// pre-check が family を見落とした (transient) せいで実 DB に対して `create_new` が
+/// 呼ばれ、`open_with_mode` が apply_pragmas / integrity_check 段階で transient エラーを
+/// 返したケースで、誤って実 DB を消す事故を防ぐ。マーカーの読み取り自体が失敗した
+/// (権限・破損等) 場合も「断定不能 → 触らない」に倒す。次回起動の `ensure_existing_db_initialized`
+/// が改めて Corrupted 判定して quarantine 経路に倒すので、データロスにはならない。
+///
+/// `Path::exists()` は permission denied で false を返すため不採用。`remove_file` を
+/// 直接呼び、NotFound は no-op、その他は警告 log のみで継続する (外部ツールが
+/// 一瞬掴んでいるケースも想定して fatal にしない)。
+fn cleanup_orphan_db_after_failed_bootstrap(data_dir: &Path) {
+    match probe_bootstrap_marker(data_dir) {
+        BootstrapMarkerProbe::ConfirmedAbsent => {
+            // safe to delete
+        }
+        BootstrapMarkerProbe::Present => {
+            log_diag(
+                "settings_db: skipping orphan cleanup: bootstrap_complete marker present \
+                 (pre-check likely missed a real DB; preserving it for next boot)",
+            );
+            return;
+        }
+        BootstrapMarkerProbe::Unknown => {
+            log_diag(
+                "settings_db: skipping orphan cleanup: bootstrap marker readback failed; \
+                 preserving files for next boot to classify (quarantine if truly Corrupted)",
+            );
+            return;
+        }
+    }
+    // Codex P2 round 3: 削除順序を sidecar (-wal / -shm) → main にする。理由:
+    // main を先に消して sidecar の削除が AV / ロックで失敗すると、次回起動で
+    // 「main 無し + sidecar 残り」状態になり、`settings_db_family_presence` が
+    // sidecar を検出して `Present` を返す → `SettingsDb::open` は main 不在で
+    // CannotOpen → Transient 扱い → `FailedFallbackDefault` で **save 抑止が永久化**。
+    // sidecar 先削除なら、sidecar 失敗で main を残す判断ができる:
+    // - sidecar 全部成功 → main 削除 → clean state
+    // - sidecar 1 つでも失敗 → main を残す → 次回起動の classifier が marker 欠落で
+    //   Corrupted 判定 → quarantine 経路に正常に倒せる
+    let mut sidecar_failure = false;
+    for name in ["settings.db-wal", "settings.db-shm"] {
+        let p = data_dir.join(name);
+        match std::fs::remove_file(&p) {
+            Ok(_) => log_diag(&format!(
+                "settings_db: removed orphan {} after failed bootstrap",
+                p.display()
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                sidecar_failure = true;
+                log_diag(&format!(
+                    "settings_db: failed to remove orphan sidecar {}: {e} \
+                     (keeping main file too so next boot can classify and quarantine)",
+                    p.display()
+                ));
+            }
+        }
+    }
+    if sidecar_failure {
+        return;
+    }
+    let main = settings_db_path(data_dir);
+    match std::fs::remove_file(&main) {
+        Ok(_) => log_diag(&format!(
+            "settings_db: removed orphan {} after failed bootstrap",
+            main.display()
+        )),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log_diag(&format!(
+            "settings_db: failed to remove orphan {}: {e} (next boot may quarantine it)",
+            main.display()
+        )),
+    }
+}
+
+/// `<data_dir>/settings.db` の `schema_meta` テーブルから `bootstrap_complete` 行が
+/// **確実に欠落** しているかを READ_ONLY オープンで判定する (T06 v0.9.0)。
+///
+/// 戻り値:
+/// - `Present`: marker 行が見つかった (= 実 bootstrap 済み DB、絶対に消さない)
+/// - `ConfirmedAbsent`: 開けて schema_meta 検索した結果 row が無かった (= orphan)
+/// - `Unknown`: ファイルが無い / 開けない / SQL が走らなかった等、断定不能
+///   (= 触らない方が安全。次回起動が classifier で正しく扱う)
+fn probe_bootstrap_marker(data_dir: &Path) -> BootstrapMarkerProbe {
+    use rusqlite::OpenFlags;
+    let path = settings_db_path(data_dir);
+    // ファイルが無いなら cleanup は no-op になるので Unknown でも実害なし。
+    let conn = match Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    ) {
+        Ok(c) => c,
+        Err(_) => return BootstrapMarkerProbe::Unknown,
+    };
+    match conn.query_row(
+        "SELECT 1 FROM schema_meta WHERE key = 'bootstrap_complete'",
+        [],
+        |_| Ok(true),
+    ) {
+        Ok(true) => BootstrapMarkerProbe::Present,
+        Ok(false) => BootstrapMarkerProbe::Unknown, // 到達しないが念のため
+        Err(rusqlite::Error::QueryReturnedNoRows) => BootstrapMarkerProbe::ConfirmedAbsent,
+        Err(_) => BootstrapMarkerProbe::Unknown,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapMarkerProbe {
+    Present,
+    ConfirmedAbsent,
+    Unknown,
+}
+
 /// ファイルが無いものは無視する (= NotFound はエラーにしない)。
 ///
 /// 同一秒内の複数回呼び出し (= bak から復旧 → 再失敗 → 再 quarantine) で `.corrupted-<ts>`
 /// が衝突して rename が失敗するのを防ぐため、unix epoch 秒 + プロセス内 atomic counter で
 /// suffix を一意化する (Codex P2 v8b-4 2026-05-14)。
 ///
-/// 戻り値: 退避したファイル数 (= 0 でも error にはしない、main が transient missing の
-/// ケースも含むため)。
-pub fn quarantine_db_files(data_dir: &Path) -> usize {
+/// **削除順序** (T06 Codex P2 round 4 反映): sidecar (-wal / -shm) → main の順で
+/// 退避する。main を先に動かして sidecar の rename が AV / ロックで失敗すると、
+/// 次回起動で「main 無し + sidecar 残り」状態 → family_exists が Present、しかし
+/// `SettingsDb::open` は main 不在で CannotOpen を返し save 抑止が永久化する。
+/// sidecar 先退避で 1 つでも失敗すれば main を残し、次回起動の classifier が
+/// 改めて Corrupted 判定して quarantine を retry できる。
+///
+/// `Path::exists()` は permission denied で false を返すため使わない (= NotFound と
+/// 真の不在を区別できないので、rename の戻り値で NotFound を直接判定する)。
+///
+/// 戻り値 (T06 Codex P2 round 5 反映): `QuarantineResult { moved, complete }`。
+/// `complete == false` は sidecar 退避が失敗して **main をあえて残したまま** 中断した
+/// 状態を意味する。caller (`boot_recover_from_bak`) はこれを受けて bak 復旧に進まず
+/// 即座に save 抑止に倒す必要がある (= stale sidecar が新しい main と組み合わさる
+/// 事故を防ぐ)。
+pub fn quarantine_db_files(data_dir: &Path) -> QuarantineResult {
     use std::sync::atomic::Ordering;
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let seq = QUARANTINE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let names = [
-        "settings.db".to_string(),
-        "settings.db-wal".to_string(),
-        "settings.db-shm".to_string(),
-    ];
-    let mut moved = 0usize;
-    for name in &names {
+    quarantine_with_suffix(data_dir, &format!("{ts}-{seq}"))
+}
+
+/// `quarantine_db_files` の suffix 注入可能版。テストから決定的に dst パスを予測する
+/// 用途 + production は `{ts}-{seq}` を渡す。pub ではなく crate-private。
+pub(crate) fn quarantine_with_suffix(data_dir: &Path, suffix: &str) -> QuarantineResult {
+    // T06 Codex P2 round 6 反映: **all-or-nothing rollback** で partial-move 状態を
+    // ディスクに残さない。`-wal` だけ動いて `-shm` / main が動かなかった状態を残すと、
+    // 次回起動で SQLite が main を開いて WAL 不在のため checkpoint 済み内容 (= stale)
+    // を silently load する事故が起きる。本関数は失敗時に successful rename を逆順で
+    // 復元してから `complete=false` を返す。
+    let mut moved_pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // 順序: sidecar → main。失敗したら moved_pairs を逆順で undo。
+    for name in ["settings.db-wal", "settings.db-shm", "settings.db"] {
         let src = data_dir.join(name);
-        if !src.exists() {
-            continue;
-        }
-        let dst = data_dir.join(format!("{name}.corrupted-{ts}-{seq}"));
+        let dst = data_dir.join(format!("{name}.corrupted-{suffix}"));
         match std::fs::rename(&src, &dst) {
             Ok(_) => {
                 log_diag(&format!(
@@ -1491,18 +1761,56 @@ pub fn quarantine_db_files(data_dir: &Path) -> usize {
                     src.display(),
                     dst.display()
                 ));
-                moved += 1;
+                moved_pairs.push((src, dst));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 元から無い: no-op、moved_pairs に積まない (undo の対象でもない)
             }
             Err(e) => {
                 log_diag(&format!(
-                    "settings_db: quarantine failed {} -> {}: {e}",
+                    "settings_db: quarantine rename failed at {}: {e}; rolling back \
+                     {} successful rename(s) to restore original family state",
                     src.display(),
-                    dst.display()
+                    moved_pairs.len()
                 ));
+                // 逆順で undo: dst → src へ rename し直す (best-effort)
+                for (orig_src, orig_dst) in moved_pairs.iter().rev() {
+                    match std::fs::rename(orig_dst, orig_src) {
+                        Ok(_) => log_diag(&format!(
+                            "settings_db: quarantine rollback restored {}",
+                            orig_src.display()
+                        )),
+                        Err(rollback_err) => log_diag(&format!(
+                            "settings_db: PERSISTENT-DISK-INCONSISTENCY: quarantine rollback FAILED \
+                             {} -> {}: {rollback_err}. Family is now in partial-move state. \
+                             Save will be suppressed; next boot will retry. If the problem \
+                             persists, the user must manually move .corrupted-* files back.",
+                            orig_dst.display(),
+                            orig_src.display()
+                        )),
+                    }
+                }
+                return QuarantineResult {
+                    moved: 0,
+                    complete: false,
+                };
             }
         }
     }
-    moved
+    QuarantineResult {
+        moved: moved_pairs.len(),
+        complete: true,
+    }
+}
+
+/// T06 Codex P2 round 5: `quarantine_db_files` の戻り値。`complete == false` は
+/// sidecar または main の rename が失敗して family が不整合のまま残った状態を示す。
+/// caller (boot_recover_from_bak) は **bak 復旧経路に進んではならない** (stale sidecar が
+/// 新しい main と混在して corruption を引き起こす危険を避ける)。
+#[derive(Debug, Clone, Copy)]
+pub struct QuarantineResult {
+    pub moved: usize,
+    pub complete: bool,
 }
 
 /// `<data_dir>` 配下の旧 `settings.json{,.bak1..bak10}` を `.migrated-<ts>` にリネームする。
@@ -1600,7 +1908,14 @@ pub fn migrate_from_settings_json(
     // 返すので、Phase 2 caller が migrate_from_settings_json を呼ぶ前に
     // `settings_db_family_exists()` で false を確認している前提。
     let db = SettingsDb::create_new(data_dir)?;
-    db.save_full(&loaded)?;
+    // T06 (v0.9.0): save_full が失敗すると bootstrap_complete 未書き込みの orphan が残り、
+    // 次回起動で family=true → quarantine 経由でしか migration を再試行できなくなる。
+    // ここで db を先に drop してから orphan を削除する (Windows でファイルロック回避)。
+    if let Err(e) = db.save_full(&loaded) {
+        drop(db);
+        cleanup_orphan_db_after_failed_bootstrap(data_dir);
+        return Err(e);
+    }
     db.record_migrated_from_json()?;
     let moved = rename_legacy_json_files(data_dir);
     log_diag(&format!(
@@ -1710,8 +2025,26 @@ pub enum BootSource {
 }
 
 fn boot_settings_db_inner(data_dir: &Path) -> BootOutcome {
-    // 1. family が見えるか
-    if settings_db_family_exists(data_dir) {
+    // T06 (v0.9.0): tri-state で family を判定する。`Ambiguous` (metadata の non-NotFound
+    // エラーや read_dir 自体の失敗) は **decision tree を一切進めず** save 抑止に倒す。
+    // bool で false に潰すと、AV / 権限の一時的影響で「JSON 無し」「DB 無し」と誤判定し
+    // clean install 経路に倒れて defaults でユーザー設定を上書きする事故が起きる。
+    //
+    // `_with_retry` 版を使い、一瞬の AV / cloud sync blip では `Ambiguous` を確定させない
+    // (3 回試行 + 80ms backoff)。
+    let db_presence = settings_db_family_presence_with_retry(data_dir);
+    if db_presence == FamilyPresence::Ambiguous {
+        log_diag(
+            "settings_db: boot: DB family presence ambiguous (metadata / read_dir transient \
+             failure); suppressing save this session to avoid clobbering existing user data",
+        );
+        return BootOutcome {
+            settings: Settings::default(),
+            db: None,
+            source: BootSource::FailedFallbackDefault,
+        };
+    }
+    if db_presence == FamilyPresence::Present {
         match SettingsDb::open(data_dir) {
             Ok(db) => match db.load_into_settings() {
                 Ok(settings) => {
@@ -1790,13 +2123,23 @@ fn boot_settings_db_inner(data_dir: &Path) -> BootOutcome {
         }
     }
 
-    // 2. family 不在: settings.json があれば migration。
-    //    Codex P1 v8b (2026-05-14): per-file metadata だけだと AV / cloud sync 等の
-    //    transient NotFound で「JSON 無し」と誤判定して旧 JSON migration を奪う事故が
-    //    起きる。`legacy_json_family_exists` は per-file metadata + read_dir の二経路で
-    //    robust 化されているのでそれを使う。
-    let json_exists = crate::settings::legacy_json_family_exists(data_dir);
-    if json_exists {
+    // 2. DB family は ConfirmedAbsent。legacy `settings.json` を tri-state + retry で判定。
+    //    T06 (v0.9.0): `Ambiguous` は「JSON 無し」と扱わない (= 旧データを破棄しない)。
+    //    AV / cloud sync の transient で metadata エラーが返るケースを clean install に
+    //    倒すと、ユーザーの実設定が defaults で永久消失する。
+    let json_presence = crate::settings::legacy_json_family_presence_with_retry(data_dir);
+    if json_presence == FamilyPresence::Ambiguous {
+        log_diag(
+            "settings_db: boot: legacy settings.json family presence ambiguous; \
+             suppressing save this session to avoid clobbering",
+        );
+        return BootOutcome {
+            settings: Settings::default(),
+            db: None,
+            source: BootSource::FailedFallbackDefault,
+        };
+    }
+    if json_presence == FamilyPresence::Present {
         match migrate_from_settings_json(data_dir) {
             Ok((db, settings)) => {
                 log_diag("settings_db: boot: migrated from settings.json");
@@ -1828,6 +2171,10 @@ fn boot_settings_db_inner(data_dir: &Path) -> BootOutcome {
                 log_diag(&format!(
                     "settings_db: boot: clean install save_full failed: {e}; suppressing save"
                 ));
+                // T06 (v0.9.0): save_full 失敗の orphan を掃除する。残すと次回起動で
+                // family=true に見えて quarantine 経由になり .corrupted-<ts> を生む。
+                drop(db);
+                cleanup_orphan_db_after_failed_bootstrap(data_dir);
                 return BootOutcome {
                     settings,
                     db: None,
@@ -1854,9 +2201,27 @@ fn boot_settings_db_inner(data_dir: &Path) -> BootOutcome {
 
 /// 壊れた main DB の家族を quarantine し、bak1..bak10 を新しい順に試行して復旧する。
 fn boot_recover_from_bak(data_dir: &Path) -> BootOutcome {
-    let moved = quarantine_db_files(data_dir);
+    let result = quarantine_db_files(data_dir);
+    // T06 Codex P2 round 5: quarantine が不完全 (sidecar 退避失敗で main を残した、
+    // または main 退避失敗) のまま bak 復旧に進むと、新しい main (bak1 を copy したもの)
+    // が残った stale -wal / -shm を読みに行って corruption を起こす危険がある。
+    // 安全側に倒して bak 復旧を skip し、save 抑止のまま次回起動の retry に委ねる。
+    if !result.complete {
+        log_diag(&format!(
+            "settings_db: boot: quarantine incomplete ({moved} moved); \
+             skipping bak restore to avoid mixing stale sidecars with restored main; \
+             suppressing save this session",
+            moved = result.moved
+        ));
+        return BootOutcome {
+            settings: Settings::default(),
+            db: None,
+            source: BootSource::FailedFallbackDefault,
+        };
+    }
     log_diag(&format!(
-        "settings_db: boot: quarantined {moved} file(s); now scanning bak1..bak10"
+        "settings_db: boot: quarantined {moved} file(s); now scanning bak1..bak10",
+        moved = result.moved
     ));
     for n in 1..=10 {
         let bak_name = format!("settings.db.bak{n}");
@@ -1896,7 +2261,21 @@ fn boot_recover_from_bak(data_dir: &Path) -> BootOutcome {
                                 "settings_db: boot: restored {bak_name} loads as Corrupted ({msg}); \
                                  quarantining and trying next bak"
                             ));
-                            quarantine_db_files(data_dir);
+                            let r = quarantine_db_files(data_dir);
+                            if !r.complete {
+                                // T06 Codex P2 round 5: quarantine incomplete でも次の bak に
+                                // 進むと、新 bak1 の copy が古い -wal / -shm と組み合わさる。
+                                // 安全側で abort。
+                                log_diag(
+                                    "settings_db: boot: quarantine incomplete during bak retry; \
+                                     aborting bak chain",
+                                );
+                                return BootOutcome {
+                                    settings: Settings::default(),
+                                    db: None,
+                                    source: BootSource::FailedFallbackDefault,
+                                };
+                            }
                             continue;
                         }
                         other => {
@@ -1921,7 +2300,18 @@ fn boot_recover_from_bak(data_dir: &Path) -> BootOutcome {
                             "settings_db: boot: restored {bak_name} open Corrupted ({msg}); \
                              quarantining and trying next bak"
                         ));
-                        quarantine_db_files(data_dir);
+                        let r = quarantine_db_files(data_dir);
+                        if !r.complete {
+                            log_diag(
+                                "settings_db: boot: quarantine incomplete during bak retry; \
+                                 aborting bak chain",
+                            );
+                            return BootOutcome {
+                                settings: Settings::default(),
+                                db: None,
+                                source: BootSource::FailedFallbackDefault,
+                            };
+                        }
                         continue;
                     }
                     other => {
@@ -2733,6 +3123,241 @@ mod tests {
         assert!(settings_db_family_exists(dir.path()));
     }
 
+    // T06 (v0.9.0): tri-state family presence tests
+
+    #[test]
+    fn family_presence_present_when_main_db_visible() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("settings.db"), b"x").unwrap();
+        assert_eq!(
+            settings_db_family_presence(dir.path()),
+            FamilyPresence::Present
+        );
+    }
+
+    #[test]
+    fn family_presence_confirmed_absent_in_clean_data_dir() {
+        let dir = TempDir::new().unwrap();
+        assert_eq!(
+            settings_db_family_presence(dir.path()),
+            FamilyPresence::ConfirmedAbsent
+        );
+    }
+
+    #[test]
+    fn family_presence_confirmed_absent_when_data_dir_does_not_exist() {
+        // data_dir 自体が無い場合: 新規環境とみなして ConfirmedAbsent。
+        let dir = TempDir::new().unwrap();
+        let nonexistent = dir.path().join("never_created");
+        assert_eq!(
+            settings_db_family_presence(&nonexistent),
+            FamilyPresence::ConfirmedAbsent
+        );
+    }
+
+    #[test]
+    fn family_presence_present_detects_bak_files() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("settings.db.bak5"), b"x").unwrap();
+        assert_eq!(
+            settings_db_family_presence(dir.path()),
+            FamilyPresence::Present
+        );
+    }
+
+    #[test]
+    fn family_presence_ignores_non_family_files() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("unrelated.json"), b"x").unwrap();
+        std::fs::write(dir.path().join("settings.db.bak0"), b"x").unwrap(); // out of range
+        std::fs::write(dir.path().join("settings.db.bak11"), b"x").unwrap(); // out of range
+        assert_eq!(
+            settings_db_family_presence(dir.path()),
+            FamilyPresence::ConfirmedAbsent
+        );
+    }
+
+    #[test]
+    fn cleanup_orphan_db_removes_main_wal_shm_when_marker_absent() {
+        // T06: bootstrap_complete 未書き込みの orphan を削除する。
+        // defense-in-depth (Codex P1 round 3) で marker 検証が入ったため、テストには
+        // 「marker が無い実 SQLite ファイル」が必要。`create_new` だけ呼んで `save_full`
+        // を呼ばないと正しくその状態が作れる。
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        drop(db); // marker 書かれていない状態でファイルを残す
+        let main = dir.path().join("settings.db");
+        assert!(main.exists());
+        // bak は orphan ではないので残るべき
+        std::fs::write(dir.path().join("settings.db.bak1"), b"valuable bak").unwrap();
+
+        cleanup_orphan_db_after_failed_bootstrap(dir.path());
+
+        assert!(!main.exists(), "main orphan should be removed");
+        // bak は cleanup の責務外で touch されない
+        assert!(dir.path().join("settings.db.bak1").exists());
+    }
+
+    #[test]
+    fn cleanup_orphan_db_handles_missing_files() {
+        // 全部 NotFound でも error にならない (no-op)。
+        let dir = TempDir::new().unwrap();
+        cleanup_orphan_db_after_failed_bootstrap(dir.path());
+        // panic / 例外なし
+    }
+
+    #[test]
+    fn create_new_refuses_on_ambiguous_via_dedicated_error() {
+        // FamilyPresence::Ambiguous を擬似的に再現するのは難しい (実際の I/O 失敗が必要)
+        // ため、ここでは AmbiguousFamilyPresence error 文字列が想定通り表示されることだけ
+        // 確認する。実発火の検証は手動 / 統合テストで。
+        let err = SettingsDbError::AmbiguousFamilyPresence;
+        let msg = format!("{err}");
+        assert!(msg.contains("ambiguous"), "{msg}");
+        assert!(msg.contains("refusing"), "{msg}");
+    }
+
+    #[test]
+    fn probe_bootstrap_marker_finds_marker_in_real_db() {
+        let dir = TempDir::new().unwrap();
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        db.save_full(&sample_settings()).unwrap();
+        drop(db);
+        assert_eq!(
+            probe_bootstrap_marker(dir.path()),
+            BootstrapMarkerProbe::Present
+        );
+    }
+
+    #[test]
+    fn probe_bootstrap_marker_returns_unknown_when_db_missing() {
+        let dir = TempDir::new().unwrap();
+        // settings.db を一切作らない
+        assert_eq!(
+            probe_bootstrap_marker(dir.path()),
+            BootstrapMarkerProbe::Unknown
+        );
+    }
+
+    #[test]
+    fn probe_bootstrap_marker_returns_unknown_for_corrupt_file() {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("settings.db"), b"not a real sqlite db").unwrap();
+        // SQLite が開けない (header mismatch) → query 不能 → Unknown を強制したい
+        assert_eq!(
+            probe_bootstrap_marker(dir.path()),
+            BootstrapMarkerProbe::Unknown
+        );
+    }
+
+    /// T06 Codex P2 round 3 回帰: sidecar 削除失敗で main が残ること。
+    /// AV / ロックで -wal の削除が失敗するシナリオの代用として、sidecar をディレクトリ
+    /// として作る (ファイルとして remove_file できない)。
+    #[test]
+    fn cleanup_keeps_main_when_sidecar_removal_fails() {
+        let dir = TempDir::new().unwrap();
+        // 正規 create_new で marker 欠落 orphan を作る
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        drop(db);
+        let main = dir.path().join("settings.db");
+        assert!(main.exists());
+
+        // -wal が存在しない場合は NotFound でスキップされるため、テストの邪魔に
+        // ならない。-shm をディレクトリにして remove_file を失敗させる。
+        let shm = dir.path().join("settings.db-shm");
+        // 既存 -shm があれば消してから dir を作る (SQLite が事前に作っているかも)
+        let _ = std::fs::remove_file(&shm);
+        std::fs::create_dir(&shm).unwrap();
+
+        cleanup_orphan_db_after_failed_bootstrap(dir.path());
+
+        // sidecar 削除失敗で main は残るはず
+        assert!(
+            main.exists(),
+            "main DB must be preserved when sidecar removal fails (next boot will classify and quarantine)"
+        );
+        // 後片付け: テスト用の dir を消す
+        let _ = std::fs::remove_dir(&shm);
+    }
+
+    /// T06 Codex P1 round 3 回帰: cleanup の defense-in-depth。pre-check 経由でなく
+    /// cleanup 関数を直接呼んでも、bootstrap_complete マーカーがある DB は削除しない。
+    /// この経路は実コードでは `try_open_once` が apply_pragmas / integrity_check 等で
+    /// transient エラーを返したケースに相当する (= pre-check 見落とし + 実 DB 存在)。
+    #[test]
+    fn cleanup_does_not_delete_real_db_with_bootstrap_marker() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            db.save_full(&sample_settings()).unwrap();
+        }
+        let main_path = dir.path().join("settings.db");
+        let initial_size = std::fs::metadata(&main_path).unwrap().len();
+        assert!(initial_size > 0);
+
+        // pre-check / open_with_mode を経由せず、cleanup を直接呼ぶ
+        cleanup_orphan_db_after_failed_bootstrap(dir.path());
+
+        // 実 DB は無傷
+        assert_eq!(
+            std::fs::metadata(&main_path).unwrap().len(),
+            initial_size,
+            "real bootstrapped DB must NOT be deleted by cleanup"
+        );
+        let _ = SettingsDb::open(dir.path()).expect("DB still openable after cleanup");
+    }
+
+    /// T06 Codex P1 round 3 回帰: 逆ケース。bootstrap_complete マーカーを欠く orphan
+    /// (= `create_new` が schema 適用までは成功したが `save_full` 前に失敗した状態) は
+    /// cleanup で削除される。
+    #[test]
+    fn cleanup_removes_orphan_db_without_bootstrap_marker() {
+        let dir = TempDir::new().unwrap();
+        // `create_new` だけ呼んで `save_full` を呼ばない → schema はあるが marker 無し
+        let db = SettingsDb::create_new(dir.path()).unwrap();
+        drop(db);
+        let main_path = dir.path().join("settings.db");
+        assert!(main_path.exists());
+
+        cleanup_orphan_db_after_failed_bootstrap(dir.path());
+
+        assert!(
+            !main_path.exists(),
+            "orphan DB without bootstrap marker should be removed"
+        );
+    }
+
+    /// T06 Codex P1 round 2 回帰: pre-check が family を見落とした状態で `create_new`
+    /// → `open_with_mode` が `AlreadyBootstrapped` を返したとき、cleanup を skip する
+    /// (= 既存の正常な DB を消さない) ことを確認する。
+    #[test]
+    fn create_new_already_bootstrapped_does_not_delete_existing_db() {
+        let dir = TempDir::new().unwrap();
+        // 1. 通常ルートで bootstrap 済み DB を作る
+        {
+            let db = SettingsDb::create_new(dir.path()).unwrap();
+            db.save_full(&sample_settings()).unwrap();
+        }
+        let main_path = dir.path().join("settings.db");
+        let initial_size = std::fs::metadata(&main_path).unwrap().len();
+        assert!(initial_size > 0);
+
+        // 2. 同じ data_dir で create_new を再実行する。pre-check の tri-state は
+        //    Present を検出して即 AlreadyBootstrapped を返すはず (cleanup なし)
+        match SettingsDb::create_new(dir.path()) {
+            Ok(_) => panic!("create_new should refuse, got Ok"),
+            Err(SettingsDbError::AlreadyBootstrapped) => {} // OK
+            Err(other) => panic!("expected AlreadyBootstrapped, got: {other:?}"),
+        }
+
+        // 3. 実 DB ファイルは無傷
+        let after_size = std::fs::metadata(&main_path).unwrap().len();
+        assert_eq!(initial_size, after_size, "valid DB must NOT be removed");
+
+        // 4. 中身も読み戻せる (内容が破壊されていない)
+        let _ = SettingsDb::open(dir.path()).expect("DB still openable");
+    }
+
     #[test]
     fn backup_to_creates_snapshot() {
         // `sample_settings()` は呼ぶたびに新規 UUID を振るので、save 用と比較用で
@@ -2870,8 +3495,9 @@ mod tests {
         std::fs::write(dir.join("settings.db"), b"data").unwrap();
         std::fs::write(dir.join("settings.db-wal"), b"wal").unwrap();
         std::fs::write(dir.join("settings.db-shm"), b"shm").unwrap();
-        let moved = quarantine_db_files(dir);
-        assert_eq!(moved, 3);
+        let result = quarantine_db_files(dir);
+        assert_eq!(result.moved, 3);
+        assert!(result.complete);
         assert!(!dir.join("settings.db").exists());
         assert!(!dir.join("settings.db-wal").exists());
         assert!(!dir.join("settings.db-shm").exists());
@@ -2890,9 +3516,56 @@ mod tests {
     fn quarantine_db_files_handles_missing() {
         let guard = DataDirOverrideGuard::new();
         let dir = guard.path();
-        // 空 dir で呼んでも error にせず 0 を返すこと。
-        let moved = quarantine_db_files(dir);
-        assert_eq!(moved, 0);
+        // 空 dir で呼んでも error にせず 0 / complete=true を返すこと。
+        let result = quarantine_db_files(dir);
+        assert_eq!(result.moved, 0);
+        assert!(result.complete);
+    }
+
+    // T06 Codex P2 round 4: quarantine が sidecar 先に処理することの直接確認は
+    // Windows では rename 失敗の安定した注入手段が無いため (ディレクトリも rename 可能、
+    // ロック注入には Windows API が必要)、code review で担保する。
+    // sidecar 失敗時の main 保持の対称的振る舞いは `cleanup_keeps_main_when_sidecar_removal_fails`
+    // で remove_file 版を検証済み。両者は同じ早期 return パターンを使う。
+
+    /// T06 Codex P2 round 6: quarantine 失敗時の rollback を**確定的に**検証する。
+    /// `quarantine_with_suffix` を test-only でエクスポートし、dst パスを予測可能にして、
+    /// main の予定 dst パスに先回りで非空ディレクトリを置く。fs::rename は dst が非空 dir
+    /// だと失敗 (Windows: ERROR_ACCESS_DENIED、Linux: ENOTEMPTY) なので、main 段階で
+    /// 必ず失敗 → 既に成功していた -wal / -shm が rollback されるはず。
+    #[test]
+    fn quarantine_rolls_back_when_main_rename_fails() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        std::fs::write(dir.join("settings.db"), b"data").unwrap();
+        std::fs::write(dir.join("settings.db-wal"), b"wal").unwrap();
+        std::fs::write(dir.join("settings.db-shm"), b"shm").unwrap();
+        // main の予定 dst パスに **空でないディレクトリ** を先回りで置いて rename を失敗
+        // させる。fs::rename は dst が非空 dir だと失敗する。
+        let suffix = "test-rollback";
+        let blocker_dir = dir.join(format!("settings.db.corrupted-{suffix}"));
+        std::fs::create_dir(&blocker_dir).unwrap();
+        std::fs::write(blocker_dir.join("blocker"), b"blocker").unwrap();
+
+        let result = quarantine_with_suffix(dir, suffix);
+
+        assert!(
+            !result.complete,
+            "main rename must fail when dst is a non-empty directory"
+        );
+        // rollback で全部戻っていること
+        assert!(dir.join("settings.db").exists(), "main untouched");
+        assert!(
+            dir.join("settings.db-wal").exists(),
+            "wal rolled back to original"
+        );
+        assert!(
+            dir.join("settings.db-shm").exists(),
+            "shm rolled back to original"
+        );
+        // 後片付け
+        let _ = std::fs::remove_file(blocker_dir.join("blocker"));
+        let _ = std::fs::remove_dir(&blocker_dir);
     }
 
     #[test]

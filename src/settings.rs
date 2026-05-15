@@ -1886,46 +1886,87 @@ pub(crate) fn legacy_json_files_for_migration(main: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// `data_dir` 配下に `settings.json` / `settings.json.bak*` が **どれか 1 つでも**
-/// 物理的に存在するかを robust に判定する (Codex P1 v8b 2026-05-14)。
-///
-/// 単一 `metadata()` は AV / cloud sync 等で transient NotFound を返すケースがあり、
-/// それを「JSON 無し」と誤判定すると Phase 2 decision tree が clean-install に倒れて
-/// **旧 settings.json から migration する経路を奪う**。settings_db_family_exists() と
-/// 同様に per-file metadata + read_dir の二経路で確認する。1 つでも見えれば true。
-pub(crate) fn legacy_json_family_exists(data_dir: &Path) -> bool {
-    // 経路 1: per-file metadata
-    let main = data_dir.join("settings.json");
-    if std::fs::metadata(&main).is_ok() {
-        return true;
-    }
-    for n in 1..=BACKUP_COUNT {
-        if std::fs::metadata(&backup_path(&main, n)).is_ok() {
-            return true;
+/// `legacy_json_family_presence` を `Ambiguous` が出るうちは最大 N 回リトライする
+/// (T06 v0.9.0 Codex P2 反映)。AV / cloud sync の一瞬の blip 対応。
+pub(crate) fn legacy_json_family_presence_with_retry(
+    data_dir: &Path,
+) -> crate::settings_db::FamilyPresence {
+    use crate::settings_db::FamilyPresence;
+    const ATTEMPTS: u32 = 3;
+    const BACKOFF_MS: u64 = 80;
+    for attempt in 0..ATTEMPTS {
+        let presence = legacy_json_family_presence(data_dir);
+        if presence != FamilyPresence::Ambiguous {
+            if attempt > 0 {
+                crate::settings_db::log_diag(&format!(
+                    "settings: legacy_json family presence stabilized to {presence:?} on attempt {}",
+                    attempt + 1
+                ));
+            }
+            return presence;
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(std::time::Duration::from_millis(BACKOFF_MS));
         }
     }
-    // 経路 2: read_dir 列挙 — transient NotFound 回避の二段構え。
-    if let Ok(entries) = std::fs::read_dir(data_dir) {
-        for entry in entries.flatten() {
-            if let Some(name) = entry.file_name().to_str() {
-                if name == "settings.json" {
-                    return true;
-                }
-                if let Some(rest) = name.strip_prefix("settings.json.bak") {
-                    if rest.parse::<u32>().is_ok() && rest == rest.trim_start_matches('0') {
-                        // 数値 (canonical 1..10 or 011 等) を許容; .bak0 / .bak100 のような
-                        // 異常値は無視する。
-                        if let Ok(n) = rest.parse::<u32>() {
-                            if (1..=BACKUP_COUNT as u32).contains(&n) {
-                                return true;
+    FamilyPresence::Ambiguous
+}
+
+/// 旧 `settings.json` 家族の存在を tri-state で判定する (T06 v0.9.0)。
+/// `settings_db::FamilyPresence` と同じセマンティクス: per-file metadata の NotFound 以外
+/// エラー or `read_dir` の non-NotFound 失敗を `Ambiguous` として上層に返し、decision tree
+/// が「JSON 無し → clean install」に誤って倒れて旧データを破棄するのを防ぐ。
+pub(crate) fn legacy_json_family_presence(data_dir: &Path) -> crate::settings_db::FamilyPresence {
+    use crate::settings_db::FamilyPresence;
+    let mut ambiguous = false;
+    let main = data_dir.join("settings.json");
+    let candidates =
+        std::iter::once(main.clone()).chain((1..=BACKUP_COUNT).map(|n| backup_path(&main, n)));
+    for p in candidates {
+        match std::fs::metadata(&p) {
+            Ok(_) => return FamilyPresence::Present,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => ambiguous = true,
+        }
+    }
+    // 経路 2: read_dir 列挙 (flatten() を使わず entry error を Ambiguous に拾う)。
+    match std::fs::read_dir(data_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(e) => {
+                        if let Some(name) = e.file_name().to_str() {
+                            if name == "settings.json" {
+                                return FamilyPresence::Present;
+                            }
+                            if let Some(rest) = name.strip_prefix("settings.json.bak")
+                                && rest.parse::<u32>().is_ok()
+                                && rest == rest.trim_start_matches('0')
+                                && let Ok(n) = rest.parse::<u32>()
+                                && (1..=BACKUP_COUNT as u32).contains(&n)
+                            {
+                                return FamilyPresence::Present;
                             }
                         }
                     }
+                    Err(_) => ambiguous = true,
                 }
             }
+            if ambiguous {
+                FamilyPresence::Ambiguous
+            } else {
+                FamilyPresence::ConfirmedAbsent
+            }
         }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if ambiguous {
+                FamilyPresence::Ambiguous
+            } else {
+                FamilyPresence::ConfirmedAbsent
+            }
+        }
+        Err(_) => FamilyPresence::Ambiguous,
     }
-    false
 }
 
 // 旧 `legacy_settings_json_path()` は Codex P2 v8b-2 (2026-05-14) で削除。Phase 2 の

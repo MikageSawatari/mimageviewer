@@ -387,14 +387,20 @@ pub fn load_into_settings(&self) -> Result<Settings, SettingsDbError> {
 
 ## 5. 起動時の決定木
 
+T06 (v0.9.0) で bool 判定から tri-state (`FamilyPresence::{Present, ConfirmedAbsent,
+Ambiguous}`) + brief retry に置き換えた。AV / cloud sync の一瞬の I/O blip で
+「ファイル無し」と誤判定して clean install に倒れる事故 (= 旧データを defaults で
+上書き) を防ぐ。
+
 ```
 SettingsDb::open() の判定フロー
 ─────────────────────────────────────────────────────
-settings_db_family_exists(data_dir) で family の物理存在をチェック
+settings_db_family_presence_with_retry(data_dir) で family を tri-state 判定
 ※ family = settings.db, settings.db-wal, settings.db-shm, settings.db.bak1..bak10
 ※ 判定は per-file metadata + read_dir の二経路で robust 化
+※ Ambiguous は 3 回試行 + 80ms backoff で stabilize を試みる
 
-├─ family が見える (= 既存 DB あり)
+├─ Present (= family が見える)
 │   → SettingsDb::open(settings.db) を試行
 │   ├─ Success → integrity_check OK?
 │   │       ├─ YES → 通常 load → hash 同期 → 完了
@@ -402,25 +408,39 @@ settings_db_family_exists(data_dir) で family の物理存在をチェック
 │   ├─ Transient failure
 │   │   (DatabaseBusy / DatabaseLocked / CannotOpen / SystemIoFailure)
 │   │   → 50ms backoff で最大 3 回 retry
-│   │   → それでも失敗 → MAIN_UNREADABLE_THIS_SESSION=true + Default 返却 + save 抑止
+│   │   → それでも失敗 → FailedFallbackDefault + save 抑止
 │   │   ※ settings.json への fallback は **絶対にしない** (新 DB 変更巻き戻し防止)
-│   └─ Corrupted (NotADatabase / DatabaseCorrupt / integrity_check 失敗)
+│   └─ Corrupted (NotADatabase / DatabaseCorrupt / integrity_check 失敗 /
+│                 bootstrap_complete marker 欠落)
 │       → quarantine: settings.db, .db-wal, .db-shm を 3 セットで .corrupted-<ts> リネーム
 │       → settings.db.bak1, bak2, ... を新しい順に試行
-│       → 全滅 → MAIN_UNREADABLE_THIS_SESSION=true + Default 返却 + save 抑止
+│       → 全滅 → FailedFallbackDefault + save 抑止
 │
-└─ family が見えない
-    ├─ settings.json が存在? (旧バージョンからの初回起動)
-    │   ├─ YES → JSON migration:
-    │   │   1. try_load_with_recovery(settings.json) で読む (現行ロジック流用)
-    │   │   2. 新規 settings.db を作成 + schema 適用
-    │   │   3. SettingsDb::save_full(&loaded) で初期化 (rotation 走らせない)
-    │   │   4. settings.json → settings.json.migrated-<ts>
-    │   │   5. settings.json.bak1..bak10 → settings.json.bakN.migrated-<ts>
-    │   └─ NO → clean install:
-    │       1. 新規 settings.db を作成 + schema 適用
-    │       2. SettingsDb::save_full(&Settings::default()) で初期化
-    │       3. bak rotation は最初の user save まで遅延
+├─ Ambiguous (= metadata の non-NotFound エラーや read_dir 失敗が続いた)
+│   → FailedFallbackDefault + save 抑止 で immediate 返却
+│   ※ defaults で書き込まないので、状況が改善した次回起動で正しく family を発見できる
+│
+└─ ConfirmedAbsent (= 全 metadata NotFound + (read_dir 成功 / data_dir NotFound))
+    → legacy_json_family_presence_with_retry(data_dir) を判定
+    ├─ Present (= settings.json が存在、旧バージョンからの初回起動)
+    │   → JSON migration:
+    │   1. try_load_with_recovery(settings.json) で読む
+    │   2. 新規 settings.db を作成 + schema 適用 (= create_new)
+    │   3. SettingsDb::save_full(&loaded) で bootstrap_complete マーカーと共に永続化
+    │      ※ save_full 失敗時は drop(db) + cleanup_orphan_db_after_failed_bootstrap で
+    │         settings.db / -wal / -shm を削除して FailedFallbackDefault に倒す
+    │         (T06: orphan を残すと次回起動の family=Present 判定が quarantine 経路に倒れる)
+    │   4. settings.json → settings.json.migrated-<ts>
+    │   5. settings.json.bak1..bak10 → settings.json.bakN.migrated-<ts>
+    │
+    ├─ Ambiguous → FailedFallbackDefault + save 抑止 (= JSON を破棄しない)
+    │
+    └─ ConfirmedAbsent (= 旧 JSON も無い)
+        → clean install:
+        1. 新規 settings.db を作成 + schema 適用
+        2. SettingsDb::save_full(&Settings::default()) で初期化
+           ※ 失敗時は migration 経路と同じく orphan cleanup + FailedFallbackDefault
+        3. bak rotation は最初の user save まで遅延
 ```
 
 ### 5.1 SQLite エラー分類
@@ -476,20 +496,53 @@ VACUUM INTO は SQLite が**新規 .db ファイルに consistent な snapshot �
 ### 6.2 .db-wal / .db-shm の扱い
 
 - backup 対象には含めない (VACUUM INTO は wal/shm の内容を統合して 1 つの .db に書き出す)
-- quarantine 時は **3 つセットで** リネーム (古い wal を新 DB の recovery で誤読しないため):
+- quarantine は **all-or-nothing rollback** で 3 つセットを atomic にリネームする
+  (T06 v0.9.0):
   ```
-  settings.db      → settings.db.corrupted-<ts>
-  settings.db-wal  → settings.db-wal.corrupted-<ts>
-  settings.db-shm  → settings.db-shm.corrupted-<ts>
+  順序: -wal → -shm → main
+  suffix: <ts>-<seq>  (秒精度 + プロセス内 atomic カウンタで衝突回避)
+
+  settings.db-wal  → settings.db-wal.corrupted-<ts>-<seq>
+  settings.db-shm  → settings.db-shm.corrupted-<ts>-<seq>
+  settings.db      → settings.db.corrupted-<ts>-<seq>
   ```
+  途中で 1 つでも rename が失敗すると、**既に成功していた rename を逆順で undo** して
+  家族を元の状態に戻し、`QuarantineResult { moved: 0, complete: false }` を返す。
+  これで「-wal だけ動いて main が残った」partial-move 状態を disk に残さず、次回起動で
+  SQLite が main を WAL 不在で開き stale checkpoint を silently load する事故を防ぐ。
+
+  rollback 自体が失敗した稀な状況 (= 永続的な I/O 障害) では `PERSISTENT-DISK-INCONSISTENCY`
+  ログを出し、`complete: false` を返す。caller (`boot_recover_from_bak`) は bak 復旧経路に
+  進まず即 `FailedFallbackDefault` で save 抑止に倒れる。ユーザーが手動で `.corrupted-*` を
+  整理すれば次回起動で正常復旧可能。
 
 ### 6.3 復旧失敗時の挙動
 
-`bak1..bak10` を順に試して全滅した場合:
-- `MAIN_UNREADABLE_THIS_SESSION = true` を立てる
+`bak1..bak10` を順に試して全滅した場合、または quarantine が `complete: false` で返った場合:
+- `set_save_suppressed(true)` を立てる
 - `Settings::default()` を返す
 - セッション中の `Settings::save()` は全て suppress (= disk 上の残骸を保護)
-- 次回起動時に手動復旧 (= `.corrupted-<ts>` の調査) ができる状態を維持
+- 次回起動時に手動復旧 (= `.corrupted-<ts>-<seq>` の調査) ができる状態を維持
+
+### 6.4 失敗 bootstrap の orphan cleanup
+
+`SettingsDb::create_new` または `save_full` が **bootstrap_complete マーカーを書く前**に
+失敗すると、SQLite が `Connection::open_with_flags(SQLITE_OPEN_CREATE)` で作った
+`settings.db` (+ `-wal` / `-shm`) が **marker 無し orphan** としてディスクに残る。
+次回起動で family が見えてしまい quarantine 経由でしか migration を再試行できなくなる
+(旧 JSON は無傷だが UX 劣化)。
+
+`cleanup_orphan_db_after_failed_bootstrap(data_dir)` がこれを掃除する (T06 v0.9.0):
+- 削除前に `probe_bootstrap_marker(data_dir)` で **marker の確実な欠落** を確認
+  - `Present` → 削除しない (= pre-check が見落とした実 DB を保護)
+  - `ConfirmedAbsent` → 削除する
+  - `Unknown` (file 不在 / open 失敗 / query エラー) → 削除しない (= safe-by-default)
+- 削除順序は sidecar (`-wal` / `-shm`) → main。sidecar 削除に失敗したら main を残し、
+  次回起動の classifier が改めて Corrupted 判定して quarantine 経路に倒せる
+  (= 「main 無し + sidecar 残り」のロック状態を作らない)
+- 呼び出し箇所: `SettingsDb::create_new` の open 失敗 (ただし `AlreadyBootstrapped` は除外)、
+  `migrate_from_settings_json` の save_full 失敗、`boot_settings_db_inner` clean install の
+  save_full 失敗
 
 ## 7. 移行された JSON ファイルの扱い
 
@@ -565,7 +618,8 @@ Phase 0 のパッチコードは Phase 6 (実装後) で削除する。
 - `save_full()` (transaction + DELETE+INSERT + hash skip + commit 成功時 hash 更新)
 - `backup_to()` (VACUUM INTO ラッパー)
 - `with_db` / `with_db_result` の lazy global
-- `settings_db_family_exists()`
+- `settings_db_family_presence()` / `settings_db_family_presence_with_retry()`
+  (T06 v0.9.0 で bool ベースの `*_exists()` を tri-state に置き換え)
 - unit tests: in-memory SQLite でラウンドトリップ、hash skip 動作、エラー分類
 
 ### Phase 2: JSON migration (~0.5 日)
