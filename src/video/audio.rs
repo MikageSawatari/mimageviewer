@@ -484,8 +484,15 @@ pub fn start(
         .default_output_config()
         .map_err(|e| format!("default_output_config: {e}"))?;
     let sample_rate = supported.sample_rate().0;
+    let device_default_channels = supported.channels();
 
     // Stereo packed f32 で固定 (decoder 側 swresample に合わせる)。
+    // WASAPI Shared モードの auto-mix で 5.1 / 7.1 デバイスでも 2 ch 出力できる
+    // ケースが多いが、デバイス / driver 設定によっては失敗する (T19, Claude R3-1
+    // 2026-05-16)。デフォルトが mono の特殊デバイスでも build に失敗しうる。
+    //
+    // 失敗時のエラー文言にデバイス既定 channel 数を含めて、ユーザーが Windows の
+    // 「サウンドの設定」から既定形式を 2ch ステレオに切り替えれば直ることを示す。
     let channels: u16 = 2;
     let config = cpal::StreamConfig {
         channels,
@@ -556,7 +563,14 @@ pub fn start(
             |err| crate::logger::log(format!("cpal output stream error: {err}")),
             None,
         )
-        .map_err(|e| format!("build_output_stream: {e}"))?;
+        .map_err(|e| {
+            format!(
+                "build_output_stream: {e} \
+                 (デバイスの既定形式: {device_default_channels}ch、mIV は 2ch ステレオで出力します。\
+                 失敗する場合は Windows サウンド設定 → 既定のデバイス → プロパティ → 詳細 で\
+                 「2ch 16/24 bit ステレオ」を選択してください)"
+            )
+        })?;
 
     stream.play().map_err(|e| format!("stream.play: {e}"))?;
 
@@ -809,7 +823,17 @@ fn run_pump(
             if should_reset_plugins {
                 #[cfg(windows)]
                 if let Some(b) = &dsp_bridge {
-                    if b.is_enabled() && b.active_slot_count() > 0 {
+                    // T20 (Claude R3-3): cancel check を `reset_plugins_sync` 前に挟む。
+                    // `reset_plugins_sync` は bridge ごとに最大 2 秒の timeout を持ち、複数
+                    // bridge が active な状態で動画切替 → AudioOutput::drop が起きると、
+                    // pump が reset 待ちで 4-8 秒進めなくなる。Drop は side-thread join に
+                    // 切り替え済 (`audio-output-drop-join`) なので UI は freeze しないが、
+                    // pump exit が遅れて次の動画で audio 再起動が遅延する。cancel check で
+                    // shutdown 中は reset を skip して即 exit させる。
+                    if !cancel.load(Ordering::Acquire)
+                        && b.is_enabled()
+                        && b.active_slot_count() > 0
+                    {
                         b.reset_plugins_sync();
                     }
                 }
@@ -1428,10 +1452,16 @@ fn run_pump(
         }
     }
     // ── 終了時の silence flush (= 既存) ──
+    // T20 (Codex P2 2026-05-16): cancel が立っているときは flush_silence をスキップする。
+    // `flush_silence(480, 10)` は 10 反復で各反復 200ms timeout = 最大 2 秒ブロック。
+    // 通常終了 (= 動画 EOF / 停止) では tail silence を吐き切る価値があるが、cancel 経由
+    // (= 動画切替 / Drop) では即 exit したいので skip。
     #[cfg(windows)]
-    if let Some(b) = &dsp_bridge {
-        if b.is_enabled() && b.active_slot_count() > 0 {
-            b.flush_silence(480, 10);
+    if !cancel.load(Ordering::Acquire) {
+        if let Some(b) = &dsp_bridge {
+            if b.is_enabled() && b.active_slot_count() > 0 {
+                b.flush_silence(480, 10);
+            }
         }
     }
     crate::logger::log("audio-pump terminated");
