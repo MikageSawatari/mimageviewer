@@ -4163,7 +4163,15 @@ impl VideoPlayer {
                         self.info = Some(info);
                     }
                     Err(e) => {
+                        // T13 (Claude R-VENG-3): info_rx Err 経路でも他経路と同じく
+                        // `shutdown_workers_for_error()` を呼ぶ。これを忘れると decoder
+                        // panic / fatal の通知後も audio cpal stream / native presenter
+                        // thread / thumbnail worker が Drop まで残り、UI が動画切替後も
+                        // 旧 worker のリソース (= D3D11 keyed mutex, FFmpeg context) を
+                        // 抱え続ける。他 2 経路 (init_error / decode_failed) はすぐ下で
+                        // 同じ手順を踏んでいる。
                         self.error = Some(e);
+                        self.shutdown_workers_for_error();
                         return None;
                     }
                 }
