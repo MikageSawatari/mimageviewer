@@ -487,23 +487,54 @@ hard-stuck。固着動画では video decode thread が `first packet for serial
    `SRWLOCK` を使う (`SRWLOCK::default()` = `SRWLOCK_INIT`)。`acquire_shared_output`
    (最大 500ms wait) は lock の外で済ませ、FFmpeg decode を不必要に長くブロックしない。
 
-2. **`LIVE_VIDEO_DECODE_THREADS` カウンタによる throttle**
+2. **`LIVE_VIDEO_DECODE_THREADS` カウンタによる throttle + 待ち合わせ**
    `src/video/decoder.rs` のグローバル `AtomicUsize` で生存中の `run_video_decode` 数を
    追跡する。`VideoDecodeAliveGuard` RAII guard が関数入口で `+1`、関数終了 / panic
    unwind で確実に `-1` する。`try_start_native_video_fast_swap` /
-   `try_start_video_tile_fast_swap` は `MAX_LIVE_VIDEO_DECODE_THREADS=2` を超えていれば
-   (= `>= 2`) 新規 swap を no-op で抑制する。本カウンタは **正常再生中の player の thread も
+   `try_start_video_tile_fast_swap` は `MAX_LIVE_VIDEO_DECODE_THREADS=1` を超えていれば
+   (= `>= 1`) 新 decoder を即時 spawn しない。本カウンタは **正常再生中の player の thread も
    含めた総 live 数**。健全な thread は cancel 観測後すぐ exit するので、swap 開始時点では
-   通常 `live_count=1` (現在再生中の 1 個だけ)。swap 開始時点で 2 以上なら直前の swap の旧
-   thread がまだ exit していない = stuck/遅延の兆候。2026-05-15 に閾値を 3 → 2 へ厳格化
-   (#1 の直列化で hard-stuck 自体は防げる前提だが belt-and-suspenders)。throttle 判定は
+   通常 `live_count=1` (現在再生中の 1 個だけ)。2026-05-15 の実機ログで、
+   `live_count=2` (= 旧 decoder と新 decoder が重なる状態) でも `send_packet` /
+   keyed mutex 待ちが秒単位に伸び、最終的に DXGI device removed へ進むことを確認した。
+   複数 HW decode 自体は一般に可能だが、mIV の fast-swap は decoder create/drop と
+   shared-output 回収が密に重なるため、安定性優先で閾値を 1 にした。throttle 判定は
    「target / from がともに動画」と確定した後に行うため、動画→画像のような fast-swap
-   対象外の navigation は影響を受けない (Codex P1 review 反映)。`true` を返して上位の
-   `open_native_video_fullscreen_from_navigation` が traditional open 経路 (= 更に
-   decoder thread を増やす) に fallback しないようにする。stuck thread が抜けるまで
-   ユーザーのホイール event は握り潰される (= 「ホイールが一瞬反応しない」体感) が、
+   対象外の navigation は影響を受けない (Codex P1 review 反映)。動画→動画で上限到達時は
+   `NativeVideoSourceSwapPending` に積む。旧 player から `NativeVideoOutput` だけを
+   退避し、旧 decoder には cancel を立てて `fs_cache` から drop する。native presenter
+   HWND / DComp tree はそのまま表示し、`App::update` で `LIVE_VIDEO_DECODE_THREADS` が
+   0 になるのを待ってから新 `VideoPlayer` を作り、退避した `NativeVideoOutput` に
+   `SwitchSource` を送る。これにより **同時 HW decoder 1 本**のまま、normal open
+   fallback で旧 presenter が閉じる 150-300ms の穴 (背後アプリちらつき / 黒画面) を
+   作らず最新 target へ切り替えられる。旧 thread が抜けるまでユーザーには
+   「切り替えが少し待つ」体感が出るが、
    SW fallback には**絶対に落とさない**: 個別 open でなら HW で動く動画を勝手に SW に
    切り替えると seek 性能が大きく劣化するため。
+
+   2026-05-15 の長時間ホイール試験では、同時 decoder 数を 1 にしても
+   **中間 target ごとに decoder create/drop が走る**だけで D3D11VA / shared-output
+   経路が荒れ、65 秒で `video_decode_spawn=162`、`shared_output_pool_grow/evict`
+   が各約 400 回、最終的に `CreateOutputView: E_OUTOFMEMORY` が出た。通常の
+   動画→動画ナビゲーションは `NativeVideoSourceSwapPending` を常に経由し、
+   `requested_at` から 120ms の quiet period を待ってから最新 target だけを open
+   する。ホイール連射中は pending の `target_idx` を更新するだけで decoder を作らず、
+   現在の native presenter は最後の正常フレームを表示し続ける。タイル fast-swap は
+   既存の `video_tile_swap_pending` が UI 期待と異なるため、この 120ms coalesce の
+   対象外とする。
+
+   **UI thread での待ち合わせは導入しない** (2026-05-15、Codex 指摘 #1 反映): 一時的に
+   `wait_for_live_decoders_below(max, timeout)` で 5-10ms polling sleep する helper を
+   導入したが、UI thread での同期 sleep はホイール連射時の応答性を悪化させたため撤回。
+   - **fast-swap (両系統)**: 非ブロッキングな `load` 判定のみ。閾値以上なら新 decoder
+     自体は開始せず、`NativeVideoSourceSwapPending` で旧 native presenter を保持したまま
+     空きを待つ。
+   - **通常 open** (`start_fs_load` → `build_video_player_for_open`):
+     `LIVE_VIDEO_DECODE_THREADS >= MAX_LIVE_VIDEO_DECODE_THREADS` かつ HW decode 有効なら `NativeVideoOpenPending`
+     に積み、後続 `App::update` tick で再判定する。UI thread は sleep / join しない。
+     live decoder 数が下がった時点で `start_fs_load` を再開し、10 秒下がらなければ
+     `regular_open_deferred_timeout` を出して fullscreen を閉じる。これにより
+     ESC 後の通常 open が `live_count=3/4` まで decoder を増やす経路を塞ぐ。
 
 3. **旧 player の eager drop**
    `start_native_video_source_swap` は `take_native_output` で旧 player から
@@ -523,6 +554,196 @@ JoinHandle 保持 + background cleanup pool による join-with-timeout は将�
 カウントが永続的に高止まりするときの「stuck と判定して count を強制的にリセットする」
 診断系を追加するときに合わせて入れる。本対策は cancel 観測可能な thread の自発 exit に
 依存して count を回す最小実装。
+
+**`get_hw_format` 候補選択** (Codex 解析 2026-05-15、別件の固着の根因):
+当初の `get_hw_format` callback は「D3D11 が候補に無いとき先頭候補に fallback」していた。
+だが `fmt_list` の先頭は `DXVA2_VLD` / `CUDA` / `VAAPI` / `VULKAN` のような **別の
+HW pixel format** であることがある。それを返すと FFmpeg は「mIV が選んだ HW format に
+対応する `hw_device_ctx` が無い」状態となり、`avcodec_send_packet` が AVERROR(ENOSYS)
+("Function not implemented") を**無限に**返し続ける (実測: 1 再生で 4158 件のログ + UI が
+「準備中」のまま固着)。本実装は D3D11 のみ受け入れ、無ければ `AV_PIX_FMT_NONE` を返して
+明示的に decoder 初期化を失敗させる。SW フォールバックは行わない (ユーザーポリシー:
+シーク体感が大きく劣化するためアプリ判断での SW 切替は禁止)。
+
+**`send_packet` エラー分類と thread exit** (Codex 助言 + P1 review 2026-05-15):
+旧コードは `send_packet` エラー時に一律 `continue` で全パケットを処理し続けていたため、
+HW decode 初期化失敗 (上記 `get_hw_format` 経路や GPU resource pressure) があっても
+decode thread は exit しなかった。結果として `LIVE_VIDEO_DECODE_THREADS` が減らず、
+fast-swap throttle が永遠に refuse 状態のままになり「動画が一切切り替わらない」
+固着につながった。
+
+本実装はエラー種別で分岐する:
+
+- **EAGAIN** (AVERROR(EAGAIN) = errno 11): 致命ではない。decoder 内部の output buffer が
+  満杯で「先に `receive_frame` で drain しろ」の意味。packet を `pending_resend_packet:
+  Option<(u64, Packet)>` に **保存時の seek serial 付きで** 保持し、同 iteration で
+  `receive_frame` ループに進んで drain、次 iteration の頭で recv を skip して再送する。
+  **再送前に seek 進行チェック**: `pending_serial != current_seek_serial` か
+  `pending_serial != clock.current_seek_serial()` (= UI 側で `request_seek` 済だが Flush
+  はまだ ctl_rx 経由で到着していない過渡状態) なら pending を破棄して通常 recv 経路に
+  戻し、Flush を確実に処理させる (Codex P1 2026-05-15)。これを怠ると stale な packet を
+  flush 前の decoder に注ぎ込んで「seek 後に古いフレームが混ざる」再発要因になる。
+  Flush ハンドラも `pending_resend_packet = None` で同様の防御 (双方向のガード)。
+  致命系カウンタには加算しない。
+- **致命系** (ENOSYS / EINVAL / External / その他): `MAX_CONSECUTIVE_SEND_PACKET_ERRORS=5`
+  で連続失敗を打ち切り、`send_packet_exhausted` perf event を出して thread を exit。
+  `receive_frame` で 1 枚でも取れたらカウンタリセット (transient な driver pressure を許容)。
+
+これにより:
+- 高負荷時の EAGAIN を「decode 失敗」と誤判定しなくなる
+- 致命系は確実に thread が exit し、LIVE カウンタが減って fast-swap throttle が再び通る
+- thread exit 時に `AvClock::set_decode_failed(true)` で上位に通知。`VideoPlayer::tick()`
+  がこのフラグを `error` に転写し、native overlay の「準備中」表示を
+  「動画のハードウェアデコードに失敗しました」に切り替える。
+
+**GPU resource pressure 対策と容量設計** (Codex 助言 2026-05-15):
+fast-swap 連発時 (= 解像度違い動画をホイールで連射) に `wgpu Out of Memory` panic が
+観測された (実測 82 秒で OOM)。perf log 解析で:
+- `shared_output_pool_grow=692 / evict=668` (45 秒で全 pool が 15 回入れ替わるペース)
+- 同一動画再生中の grow が 633/692 (= 同サイズで 23↔24 を oscillation)
+- 最終的に `DwmPresent` が 1 秒ブロック → wgpu allocation 失敗 → panic
+
+真因は wgpu 自体ではなく **D3D11 側 (`shared_output_pool` + `shared_texture_cache` +
+`retired_video_surfaces`) が adapter memory を圧迫し、後段の wgpu allocation が
+失敗した** こと (Codex 補正)。本来の対策は容量設計の統合 + pressure 時 degradation:
+
+| パラメータ | 旧値 | 新値 | 4K BGRA での想定上限 |
+|---|---|---|---|
+| `OUTPUT_RING_SIZE` (D3D11 共有 pool) | 24 | **16** | ~512 MB |
+| `RETIRED_VIDEO_SURFACE_DEPTH` (swap chain 世代) | 3 | **1** | ~95 MB (旧 ~380 MB) |
+| `SHARED_TEXTURE_CACHE_CAPACITY` (presenter 側) | 64 | **8** | ~256 MB (旧 ~2 GB) |
+| `video_tx` capacity (decoder → presenter) | 24 | **8** | (pool slot 占有) |
+| `MAX_NATIVE_SOURCE_QUEUE` (presenter 内) | 無制限 | **8** | (pool slot 占有) |
+
+加えて `SwitchSource` ハンドラで `presenter.clear_shared_texture_cache()` を呼び、
+動画切替時に前動画の共有 texture キャッシュを即時破棄する (4K で 1 動画 ~256 MB を
+解放)。
+
+**`source.queue` の back-pressure**: 旧コードは `video_rx.try_recv()` を空になるまで
+drain して queue に積み込んでいたため queue が 23 frame まで肥大化。`MAX_NATIVE_SOURCE_QUEUE`
+で cap し、超えたら drain を停止することで `video_tx` (cap=8) に逆圧をかける。decoder
+側は `try_send` 失敗で古い frame を drop / 待機して自然に pacing する。
+
+**`GpuVideoError::ResourcePressure` バリアント** (新規追加):
+shared output pool exhausted、`E_OUTOFMEMORY` (0x8007000E)、
+`D3D11_ERROR_TOO_MANY_UNIQUE_VIEW_OBJECTS` (0x887C0003)、`TOO_MANY_UNIQUE_STATE_OBJECTS`
+(0x887C0001) 等を `Blt` から分離。`is_resource_pressure()` で判定可能。`E_OUTOFMEMORY`
+は以下の経路すべてで振り分ける (Codex P1-2 review 2026-05-15):
+- `acquire_shared_output` の pool exhausted (500ms timeout)
+- `create_intermediate_rt` の `CreateTexture2D`
+- `acquire_shared_output` 内の `create_shared_output` の `CreateTexture2D`
+- `ensure_processor` の `CreateVideoProcessorEnumerator` / `CreateVideoProcessor`
+- `blit_nv12_to_rgba` の `CreateInputView` / `CreateOutputView` / `VideoProcessorBlt`
+
+**First-frame watchdog + ResourcePressure 連続上限 + recv timeout** (Codex 助言 B/4
+2026-05-15、Buffering 固着の fail-fast):
+実機テストで「decode thread が `LIVE_VIDEO_DECODE_THREADS` を詰めたまま自発 exit せず、
+ESC 後の再 open でも live_count が累積して全 fast-swap が refuse される」固着が観測された。
+原因は decode thread が `recv` で永久 block (両 channel 無音) または ResourcePressure
+drop を無限ループするケースで、`send_packet_exhausted` (5 連続失敗) 経路を踏まないため。
+
+対策 3 層:
+
+1. **recv timeout 化**: `recv_video_decode_input` を `recv_video_decode_input_with_timeout`
+   に置換し、`RECV_TIMEOUT=500ms` で必ず loop 頭に戻る。両 channel 無音でも cancel /
+   watchdog の評価ができる。
+
+2. **First-frame watchdog**: `'outer: loop` の頭で `!first_frame_delivered &&
+   watchdog_start.elapsed() >= FIRST_FRAME_TIMEOUT (10s)` なら `set_decode_failed(true)`
+   + `break 'outer`。`first_frame_delivered` は `video_tx.try_send` 成功後にだけ立てる。
+   `first_frame` perf event を出しただけ、または GPU blit 成功後に queue full で落ちた
+   だけでは watchdog を解除しない。何かしらの理由で 10 秒以内に first frame が
+   `video_tx` に届かない thread を確実に exit させる。`LIVE_VIDEO_DECODE_THREADS`
+   カウンタが解放され、後続 open が通る。perf event `first_frame_timeout`。
+
+3. **ResourcePressure 連続上限**: `MAX_CONSECUTIVE_RESOURCE_PRESSURE=60` (≒ 30fps で
+   2 秒分) を超えたら `set_decode_failed(true)` + `break 'outer`。最初の frame 前に
+   drop だけが続くケースの fail-fast。GPU path 成功 (`try_send` Ok) で counter リセット。
+   perf event `resource_pressure_exhausted`。
+
+**Regular open pending** (Codex 助言 2、2026-05-15):
+`start_fs_load` の動画専用パスは、古い video cache entry を drop して cancel を先に立てた後、
+HW decode 有効かつ `LIVE_VIDEO_DECODE_THREADS >= MAX_LIVE_VIDEO_DECODE_THREADS` なら `VideoPlayer::open` を呼ばず
+`NativeVideoOpenPending` をセットする。pending 中は 100ms 以下の cadence で `App::update`
+から `LIVE_VIDEO_DECODE_THREADS` を再判定し、空いたら同じ idx / path / from_grid intent で
+open を再開する。新しい動画要求が来たら pending は最新 1 件に置き換える。ESC /
+fullscreen exit / items 差し替えで stale になった pending は破棄する。
+
+perf event:
+- `regular_open_deferred`: live decoder 上限で通常 open を保留
+- `regular_open_deferred_start`: 保留していた open を開始
+- `regular_open_deferred_timeout`: 10 秒待っても空かず中止
+
+**Fullscreen source-swap pending** (2026-05-15、同時 HW decoder 1 本運用の表示穴対策):
+動画→動画の fullscreen / tile fast-swap で `LIVE_VIDEO_DECODE_THREADS >=
+MAX_LIVE_VIDEO_DECODE_THREADS` の場合、normal open 経路へ fallback しない。normal open
+は旧 `VideoPlayer` と一緒に native presenter も閉じるため、新 presenter が起動して
+最初の frame を present するまで 150-300ms 程度 fullscreen が抜け、背後のアプリや
+黒画面が見える。
+
+代わりに `NativeVideoSourceSwapPending` を使う:
+
+1. 旧 `VideoPlayer` から `take_native_output()` で `NativeVideoOutput` を抜き、App 側の
+   pending に退避する。
+2. 旧 `VideoPlayer` は `fs_cache` から drop して decoder / audio を cancel する。
+3. pending 中も `ensure_native_video_front` / fullscreen backdrop 判定 /
+   `native_video_presenter_hwnd()` は退避した native output の HWND を presenter として扱い、
+   DspBridge owner / main cloak の同期を維持する。`fs_cache` には一時的に target idx の
+   `VideoPlayer` が存在しないため、ここを `fs_cache` だけで判定すると main HWND cloak と
+   黒 backdrop raise が毎フレーム走り、HUD とシークバーだけ進む黒画面になる。
+4. `App::update` で live decoder 数が空いたら新 `VideoPlayer` を作り、
+   `attach_native_output()` + `SwitchSource` で同じ presenter HWND に新 source を接続する。
+
+pending 中にさらに動画へ移動した場合は target だけを最新へ更新する。画像へ移動した場合は
+pending を破棄し、通常の fullscreen 遷移に戻す。perf event:
+- `source_swap_deferred`: source-swap を保留
+- `source_swap_deferred_update`: pending 中の target 更新
+- `source_swap_deferred_start`: 保留していた source-swap を開始
+- `source_swap_deferred_timeout`: 10 秒待っても旧 decoder が抜けず中止
+
+**`SharedOutputSlotGuard` (slot 解放 RAII guard)** (Codex P1-1 review 2026-05-15):
+`acquire_shared_output` は内部で `in_use=true` + keyed mutex `AcquireSync(0)` した slot を
+9-tuple で返す。後段の `CreateInputView` / `CreateOutputView` / `VideoProcessorBlt` /
+`Signal` が `?` で早期 return すると、`D3d11Frame` が作られないため `Drop` で
+`in_use=false` が走らず **slot が永久占有 (LEAK)** していた。`ResourcePressure` を frame
+drop に倒したことでこの失敗パスが日常的に踏まれるようになり、pool slot を 1 つずつ消費
+していって最終的に「常時 pool exhausted」状態 → 新動画が「準備中」のまま固着する症状を
+発生させていた (実機テスト 2026-05-15 で `live_video_decode_threads` が 4 まで累積し
+回復不能になることを観測)。
+
+`SharedOutputSlotGuard` を acquire 直後に作り、状態を 2 フェーズで追跡:
+- Phase A (`holding_write_key=true`): `acquire` 後 ～ `ReleaseSync(1)` 前。失敗時 Drop で
+  `ReleaseSync(0)` + `in_use=false` + condvar notify。
+- Phase B (`holding_write_key=false`): `ReleaseSync(1)` 成功直後。write key は reader
+  側に渡っているので、Drop では `ReleaseSync` を呼ばず `in_use=false` のみ。次回 acquire は
+  `recover_shared_output_keyed_mutex` 経由で `released_to_reader=true` の slot を取り戻す。
+
+成功時は `BlitOutput` 返却直前に `slot_guard.disarm()` で armed=false にし、slot
+ownership を `D3d11Frame::Drop` へ移譲する。診断用 perf event `shared_output_drop_unfinished`
+が armed のまま Drop された場合に emit される (= leak 復旧を観測可能)。
+
+**Pressure 時の degradation = frame drop に統一** (Codex 助言、旧 CPU readback 廃止):
+`try_gpu_blit_path` が `GpuVideoError::ResourcePressure` を返したら、decoder 側は
+**CPU readback fallback を採らず frame を drop して continue する**。CPU 経路は
+`av_hwframe_transfer_data` + `swscale` + GPU upload を要求し、pressure 中の adapter
+memory をさらに食って OOM 連鎖を加速させる (= スパイラル)。frame 1 枚を捨てる方が
+体感上はるかに軽傷。perf event は `video_decode/frame_dropped_resource_pressure`。
+通常の GPU エラー (一過性) は従来通り CPU fallback で救う。
+
+**`drain_full_hit` perf event の rate-limit**:
+旧コードは demux drain 失敗のたびに perf event を吐いていたため、1 セッションで
+417,515 件を観測。perf log 自体の I/O が UI 応答性を悪化させていた。200ms 連続発火
+抑制を入れて、集計目的としては十分な粒度に絞る (= 状態変化は `queue_state` event で
+別途記録される)。
+
+**SW フォールバック禁止 (HW 要求時)** (Codex P1 2026-05-15):
+当初 `preferred_video_decoders` の default candidate は `allow_sw_fallback: true` のまま
+だったため、`get_hw_format` を D3D11-only にしても decoder candidate 側で HW init/open
+失敗時に SW decoder で開く path が残っていた = ドキュメントと実装の不整合。本実装は
+default candidate の `allow_sw_fallback` を `!hw_decode_requested` に変更し、HW 要求時は
+SW へ落とさず open エラー扱いにする。HW 非要求 (= 設定で HW disabled) のときだけ SW で
+開く (= 元から SW 要求の経路なので問題なし)。ユーザーポリシー (= シーク体感を損なう
+SW 切替の禁止) を実装で担保する。
 
 **pacing 設計**: 既存の Phase 8.K 仕様 (`PACE_LEAD_SECS=0.30` / `AUDIO_SAFE_LO=0.25` /
 `SEEK_BURST_LEAD_MAX_SECS=0.20` / `post_seek_frame_sent` flag / generation race
@@ -806,6 +1027,22 @@ overlay の中央 status に「メタデータ読込中...」「ストリーム�
   を詰め、タイル overlay 側で「メタデータ読込中...」「ストリーム解析中...」を表示する。
   実際のタイル抽出待ち (`video_open_status == None`) は「タイルを準備中...」として
   動画オープン待ちと区別する。
+- `video_tile_mode_active` は「ユーザーが S でタイルモードを開いている」という mode flag。
+  `video_tile_state` は worker / サムネ snapshot を持つ実体 state で、source-swap 中や
+  metadata 未到着では一時的に `None` になりうる。mode と state を混同すると、動画切替中の
+  path mismatch で `video_tile_state` を捨てた瞬間に、タイルモード自体まで無音で解除される。
+- `video_tile_reopen_pending` は「タイル表示中に動画を切り替えたが、次動画の info がまだ無い」
+  場合の短期 retry 予約。通常のホイールナビゲーション (`WheelNavigate` /
+  `try_start_native_video_fast_swap` / `NativeVideoSourceSwapPending` の `reason=navigation`)
+  では、`video_tile_mode_active == false` なら `cancel_stale_video_tile_reopen()` で必ず
+  破棄する。これを怠ると、過去の tile timeout / reopen 予約が残り、ホイール移動だけで
+  突然タイル画面へ戻る。
+- `open_native_video_fullscreen_from_navigation()` は `try_start_video_tile_fast_swap()` を
+  通常 fast-swap より先に呼ぶため、tile fast-swap 側は **最初に tile context
+  (`video_tile_mode_active` or `video_tile_swap_pending`) を確認してから** `NativeVideoSourceSwapPending`
+  を見ること。順序を逆にすると、通常動画モードで `reason=navigation` の source-swap
+  pending 中に次のホイールが来た時、tile 側が pending を横取りして `reason=tile` に
+  書き換え、ホイール移動だけでタイル画面に入る。
 
 `ui_video_tile.rs` は state 構造体 (`VideoTileState`) と worker spawn
 ロジックだけを持ち、egui 描画関数は v0.9 系で削除済み。
@@ -919,7 +1156,8 @@ transform で anisotropic scale として適用する**:
      **1 回の `Commit`** で適用。DComp は 1 Commit のバッチを原子的に適用するので、
      compositor から見ると「旧 swap chain + 旧 transform (整合)」→「新 swap chain
      (フレーム投入済み) + 新 transform (整合)」と一気に切り替わる。
-  5. `wait_for_video_transform_commit` (`WaitForCommitCompletion`) で Commit 反映を待つ。
+  5. `wait_for_video_transform_commit` (`WaitForCommitCompletion` + `DwmFlush`) で
+     Commit が DWM 側の表示 tick まで反映されるのを待つ。
   6. 旧 swap chain を `retired_video_surfaces` (深さ `RETIRED_VIDEO_SURFACE_DEPTH`) へ
      移して遅延破棄。
 
@@ -929,8 +1167,10 @@ transform で anisotropic scale として適用する**:
 swap chain `Present` は compositor に原子的にラッチされないため、`WaitForCommitCompletion`
 だけでは「新フレーム + 旧 transform」の混在を防ぎ切れなかった (2026-05-15、複数回の実機録画で
 確認)。新 swap chain を**フレーム投入済みにしてから 1 Commit で content+transform を同時
-差し替える**ことで、`ResizeBuffers` を使わず中間状態を構造的にゼロにする。`DwmFlush` も
-不要 (中間状態が無いので refresh を強制する必要がない)。
+差し替える**ことで、`ResizeBuffers` を使わず中間状態を構造的にゼロにする。さらに
+2026-05-15 の実機検証で `WaitForCommitCompletion` だけでは 3840→1920 の縮小 swap 時に
+新 content が旧 transform で 1 refresh 見えることがあったため、黒フレームを挿入せず
+`DwmFlush` だけを追加して DWM 側の反映まで同期する。
 
 **旧 surface の遅延破棄**: `SetContent` 切替後も DComp/DWM がしばらく旧 content を参照
 しうるため、旧 swap chain を即 drop せず `retired_video_surfaces` に数世代分残す。
@@ -938,6 +1178,12 @@ swap chain `Present` は compositor に原子的にラッチされないため�
 
 `video_surface_swap` perf イベントに `surface_width/height` / `sar` / `geom_ms` /
 `commit_sync_ms` / `retired_len` を記録する。
+
+動画→動画 source swap では native presenter HWND / DComp tree を維持するため、
+`App::open_fullscreen` は既存 presenter HWND がある場合にメイン HWND を再 cloak しない。
+メイン HWND の `DWMWA_CLOAK` true→false をホイール切替ごとに挟むと、OBS には映らない
+物理画面側の DWM / MPO 合成面のちらつきとして見えることがあるため、初回動画入場時だけ
+cloak を使い、presenter 継続中の source swap は presenter 内の visual 更新だけで完結させる。
 
 UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFmpeg の慣例に合わせ
 **encoded サイズのまま** (例: `720×480`)。DAR の併記は将来検討。
@@ -1127,6 +1373,31 @@ master_clock は wall-rate cap で audio に追従できないことがあり、
 clock に追従しているが (= pacing は 0)、audio は clock より数秒先行している (= lead が
 +5000ms 級)、結果としてユーザーは「映像が音声より数秒遅れて見える」(= offset が
 −5000ms 級) と感じる。
+
+### `AudioOutput::drop` の pump join は UI thread をブロックしない
+
+`AudioOutput::drop` は (a) `cancel` フラグ + `shutdown_tx` で pump 停止を要求、
+(b) cpal `Stream` を pause + drop、(c) pump thread を join、の 3 段で終了する。
+
+(c) を **同期 join** で行うと、pump 自身が back-pressure deadlock (decoder/engine
+side の停滞で `audio_tx` を drain できず、demux も詰まる連鎖) に陥っていた場合に
+**UI thread が無期限ブロックする**。2026-05-15 に Escape で fullscreen を抜けた際
+「応答なし」14 秒の実害が観測された (`fs_cache.clear()` → `Drop for VideoPlayer` →
+`AudioOutput::drop` の経路)。
+
+そこで pump の join を **専用 thread に spawn して切り離す**:
+
+```rust
+if let Some(p) = self.pump.take() {
+    let _ = std::thread::Builder::new()
+        .name("audio-output-drop-join".to_string())
+        .spawn(move || { let _ = p.join(); });
+}
+```
+
+`NativeVideoOutput::drop` で先行採用していたパターンと揃える。万一 pump が exit
+できなくても join thread が park 状態で残るだけで UI には影響しない。pause + drop
+で cpal callback は確実に止まっているので音は二重再生されない。
 
 ### audio buffer clear の atomic 整合性
 

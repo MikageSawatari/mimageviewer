@@ -23,6 +23,33 @@ struct NativeVideoSourceSwapStarted {
     started_at: std::time::Instant,
 }
 
+#[cfg(windows)]
+pub(crate) struct NativeVideoOpenPending {
+    pub(crate) idx: usize,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) from_grid: bool,
+    pub(crate) requested_at: std::time::Instant,
+    pub(crate) deadline: std::time::Instant,
+    pub(crate) input_seq: u64,
+}
+
+#[cfg(windows)]
+const NATIVE_VIDEO_NAV_SWAP_DEBOUNCE_MS: u64 = 120;
+
+#[cfg(windows)]
+pub(crate) struct NativeVideoSourceSwapPending {
+    pub(crate) from_idx: usize,
+    pub(crate) target_idx: usize,
+    pub(crate) target_path: std::path::PathBuf,
+    pub(crate) native_output: crate::video::NativeVideoOutput,
+    pub(crate) autoplay_override: Option<bool>,
+    pub(crate) show_preparing_overlay: bool,
+    pub(crate) reason: &'static str,
+    pub(crate) requested_at: std::time::Instant,
+    pub(crate) deadline: std::time::Instant,
+    pub(crate) input_seq: u64,
+}
+
 /// Norm 操作 (toggle ON / OFF / scan 完了) を 1 セットで適用するヘルパー。
 ///
 /// 3 箇所 (`disable_normalize_globally` / `apply_normalize_gain_db_to_player` /
@@ -94,6 +121,504 @@ pub(super) fn apply_normalize_gain_with_perf(
 
 impl App {
     #[cfg(windows)]
+    pub(super) fn defer_native_video_open_if_decoder_busy(
+        &mut self,
+        idx: usize,
+        path: &std::path::Path,
+        from_grid: bool,
+    ) -> bool {
+        if !self.settings.video_hw_decode {
+            return false;
+        }
+        let max_live_video_decode_threads = crate::video::decoder::MAX_LIVE_VIDEO_DECODE_THREADS;
+        let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
+            .load(std::sync::atomic::Ordering::Acquire);
+        if live_decoders < max_live_video_decode_threads {
+            return false;
+        }
+
+        let now = std::time::Instant::now();
+        self.native_video_open_pending = Some(NativeVideoOpenPending {
+            idx,
+            path: path.to_path_buf(),
+            from_grid,
+            requested_at: now,
+            deadline: now + std::time::Duration::from_secs(10),
+            input_seq: self.input_seq,
+        });
+        crate::logger::log(format!(
+            "[native-video] defer regular open: idx={idx} live_video_decode_threads={live_decoders} max={max_live_video_decode_threads}"
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "native_video",
+                "regular_open_deferred",
+                None,
+                self.input_seq,
+                &[
+                    ("idx", serde_json::Value::from(idx as i64)),
+                    (
+                        "live_video_decode_threads",
+                        serde_json::Value::from(live_decoders as i64),
+                    ),
+                    (
+                        "max",
+                        serde_json::Value::from(max_live_video_decode_threads as i64),
+                    ),
+                ],
+            );
+        }
+        true
+    }
+
+    #[cfg(windows)]
+    pub(super) fn poll_native_video_open_pending(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.native_video_open_pending.as_ref() else {
+            return;
+        };
+        let idx = pending.idx;
+        let path = pending.path.clone();
+        let from_grid = pending.from_grid;
+        let requested_at = pending.requested_at;
+        let deadline = pending.deadline;
+        let input_seq = pending.input_seq;
+
+        if self.fullscreen_idx != Some(idx)
+            || !matches!(self.items.get(idx), Some(GridItem::Video(p)) if p == &path)
+            || self.fs_cache.contains_key(&idx)
+        {
+            self.native_video_open_pending = None;
+            return;
+        }
+
+        let max_live_video_decode_threads = crate::video::decoder::MAX_LIVE_VIDEO_DECODE_THREADS;
+        let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
+            .load(std::sync::atomic::Ordering::Acquire);
+        if live_decoders < max_live_video_decode_threads {
+            self.native_video_open_pending = None;
+            self.fs_open_intent_from_grid = from_grid;
+            crate::logger::log(format!(
+                "[native-video] resume deferred regular open: idx={idx} waited_ms={:.1} live_video_decode_threads={live_decoders}",
+                requested_at.elapsed().as_secs_f64() * 1000.0
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "native_video",
+                    "regular_open_deferred_start",
+                    None,
+                    input_seq,
+                    &[
+                        ("idx", serde_json::Value::from(idx as i64)),
+                        (
+                            "wait_ms",
+                            serde_json::Value::from(requested_at.elapsed().as_secs_f64() * 1000.0),
+                        ),
+                        (
+                            "live_video_decode_threads",
+                            serde_json::Value::from(live_decoders as i64),
+                        ),
+                    ],
+                );
+            }
+            self.start_fs_load(idx);
+            ctx.request_repaint();
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            self.native_video_open_pending = None;
+            crate::logger::log(format!(
+                "[native-video] deferred regular open timeout: idx={idx} waited_ms={:.1} live_video_decode_threads={live_decoders}",
+                requested_at.elapsed().as_secs_f64() * 1000.0
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "native_video",
+                    "regular_open_deferred_timeout",
+                    None,
+                    input_seq,
+                    &[
+                        ("idx", serde_json::Value::from(idx as i64)),
+                        (
+                            "wait_ms",
+                            serde_json::Value::from(requested_at.elapsed().as_secs_f64() * 1000.0),
+                        ),
+                        (
+                            "live_video_decode_threads",
+                            serde_json::Value::from(live_decoders as i64),
+                        ),
+                    ],
+                );
+            }
+            self.show_feedback_toast("前の動画デコード終了待ちがタイムアウトしました".to_string());
+            self.close_fullscreen();
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint_after(
+                deadline
+                    .saturating_duration_since(now)
+                    .min(std::time::Duration::from_millis(100)),
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn defer_native_video_source_swap_until_decoder_free(
+        &mut self,
+        ctx: &egui::Context,
+        target_idx: usize,
+        autoplay_override: Option<bool>,
+        show_preparing_overlay: bool,
+        reason: &'static str,
+    ) -> bool {
+        let target_path = match self.items.get(target_idx).cloned() {
+            Some(GridItem::Video(path)) => path,
+            _ => {
+                // pending 中に画像などへ移動した場合は、保持していた native presenter を
+                // 解放して通常の fullscreen 遷移に任せる。
+                self.native_video_source_swap_pending = None;
+                return false;
+            }
+        };
+        let now = std::time::Instant::now();
+
+        if reason != "tile" {
+            self.cancel_stale_video_tile_reopen(Some(target_idx), "deferred-update");
+        }
+        if let Some(pending) = self.native_video_source_swap_pending.as_mut() {
+            pending.target_idx = target_idx;
+            pending.target_path = target_path;
+            pending.autoplay_override = autoplay_override;
+            pending.show_preparing_overlay = show_preparing_overlay;
+            pending.reason = reason;
+            pending.requested_at = now;
+            pending.deadline = now + std::time::Duration::from_secs(10);
+            pending.input_seq = self.input_seq;
+            self.fullscreen_idx = Some(target_idx);
+            self.refresh_fullscreen_video_marker_cache(target_idx);
+            crate::logger::log(format!(
+                "[native-video] update deferred source swap: reason={reason} target_idx={target_idx}"
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "native_video",
+                    "source_swap_deferred_update",
+                    None,
+                    self.input_seq,
+                    &[
+                        ("target_idx", serde_json::Value::from(target_idx as i64)),
+                        ("reason", serde_json::Value::from(reason)),
+                    ],
+                );
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+            return true;
+        }
+
+        let Some(from_idx) = self.fullscreen_idx else {
+            return false;
+        };
+        if from_idx == target_idx {
+            return true;
+        }
+        if !matches!(self.items.get(from_idx), Some(GridItem::Video(_))) {
+            return false;
+        }
+
+        self.save_all_video_resume_positions();
+        let native_output = match self.fs_cache.get_mut(&from_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                player.pause_audio_output();
+                player.set_playing(false);
+                player.clear_audio_output_buffer();
+                player.take_native_output()
+            }
+            _ => None,
+        };
+        let Some(native_output) = native_output else {
+            return false;
+        };
+        if reason != "tile" {
+            self.cancel_stale_video_tile_reopen(Some(from_idx), "deferred-start");
+        }
+
+        // 同時 HW decoder 数 1 運用では、旧 decoder の終了を待つ必要がある。
+        // ただし NativeVideoOutput はここで App 側に退避し、presenter HWND / DComp
+        // tree は生かしたままにする。normal open に落として旧 VideoPlayer ごと落とすと、
+        // presenter HWND が消える 150-300ms の穴で背後のアプリや黒画面が見える。
+        if from_idx != target_idx {
+            self.fs_cache.remove(&from_idx);
+        }
+        self.native_video_open_pending = None;
+        self.fullscreen_idx = Some(target_idx);
+        self.refresh_fullscreen_video_marker_cache(target_idx);
+        self.native_video_source_swap_pending = Some(NativeVideoSourceSwapPending {
+            from_idx,
+            target_idx,
+            target_path,
+            native_output,
+            autoplay_override,
+            show_preparing_overlay,
+            reason,
+            requested_at: now,
+            deadline: now + std::time::Duration::from_secs(10),
+            input_seq: self.input_seq,
+        });
+        crate::logger::log(format!(
+            "[native-video] defer source swap: reason={reason} from_idx={from_idx} -> target_idx={target_idx}"
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "native_video",
+                "source_swap_deferred",
+                None,
+                self.input_seq,
+                &[
+                    ("from_idx", serde_json::Value::from(from_idx as i64)),
+                    ("target_idx", serde_json::Value::from(target_idx as i64)),
+                    ("reason", serde_json::Value::from(reason)),
+                ],
+            );
+        }
+        ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        true
+    }
+
+    #[cfg(windows)]
+    fn drain_native_video_source_swap_pending_events(&mut self, ctx: &egui::Context) {
+        let Some((fs_idx, events)) =
+            self.native_video_source_swap_pending
+                .as_ref()
+                .map(|pending| {
+                    (
+                        self.fullscreen_idx.unwrap_or(pending.target_idx),
+                        pending.native_output.drain_events(),
+                    )
+                })
+        else {
+            return;
+        };
+        for (_epoch, event) in events {
+            match event {
+                crate::video::NativeVideoOutputEvent::Window(event) => {
+                    self.handle_native_video_window_event(ctx, fs_idx, event);
+                }
+                crate::video::NativeVideoOutputEvent::WheelNavigate { delta } => {
+                    self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
+                }
+                crate::video::NativeVideoOutputEvent::CloseFullscreen => {
+                    self.close_fullscreen();
+                    return;
+                }
+                _ => {}
+            }
+            if self.native_video_source_swap_pending.is_none() {
+                return;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(super) fn poll_native_video_source_swap_pending(&mut self, ctx: &egui::Context) {
+        self.drain_native_video_source_swap_pending_events(ctx);
+
+        let Some(pending) = self.native_video_source_swap_pending.as_ref() else {
+            return;
+        };
+        let target_idx = pending.target_idx;
+        let target_path = pending.target_path.clone();
+        let requested_at = pending.requested_at;
+        let deadline = pending.deadline;
+        let input_seq = pending.input_seq;
+        let reason = pending.reason;
+
+        if self.fullscreen_idx != Some(target_idx)
+            || !matches!(self.items.get(target_idx), Some(GridItem::Video(path)) if path == &target_path)
+        {
+            self.native_video_source_swap_pending = None;
+            return;
+        }
+
+        if pending.native_output.is_closed() {
+            self.native_video_source_swap_pending = None;
+            crate::logger::log(format!(
+                "[native-video] deferred source swap aborted: presenter closed target_idx={target_idx}"
+            ));
+            self.show_feedback_toast("動画プレゼンターが閉じられました".to_string());
+            self.close_fullscreen();
+            return;
+        }
+
+        if reason == "navigation" {
+            let debounce = std::time::Duration::from_millis(NATIVE_VIDEO_NAV_SWAP_DEBOUNCE_MS);
+            let elapsed = requested_at.elapsed();
+            if elapsed < debounce {
+                ctx.request_repaint_after(debounce - elapsed);
+                return;
+            }
+        }
+
+        let max_live_video_decode_threads = crate::video::decoder::MAX_LIVE_VIDEO_DECODE_THREADS;
+        let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
+            .load(std::sync::atomic::Ordering::Acquire);
+        if live_decoders >= max_live_video_decode_threads {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                self.native_video_source_swap_pending = None;
+                crate::logger::log(format!(
+                    "[native-video] deferred source swap timeout: reason={reason} target_idx={target_idx} waited_ms={:.1} live_video_decode_threads={live_decoders}",
+                    requested_at.elapsed().as_secs_f64() * 1000.0
+                ));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "native_video",
+                        "source_swap_deferred_timeout",
+                        None,
+                        input_seq,
+                        &[
+                            ("target_idx", serde_json::Value::from(target_idx as i64)),
+                            (
+                                "wait_ms",
+                                serde_json::Value::from(
+                                    requested_at.elapsed().as_secs_f64() * 1000.0,
+                                ),
+                            ),
+                            (
+                                "live_video_decode_threads",
+                                serde_json::Value::from(live_decoders as i64),
+                            ),
+                            ("reason", serde_json::Value::from(reason)),
+                        ],
+                    );
+                }
+                self.show_feedback_toast(
+                    "前の動画デコード終了待ちがタイムアウトしました".to_string(),
+                );
+                self.close_fullscreen();
+            } else {
+                ctx.request_repaint_after(
+                    deadline
+                        .saturating_duration_since(now)
+                        .min(std::time::Duration::from_millis(50)),
+                );
+            }
+            return;
+        }
+
+        let pending = match self.native_video_source_swap_pending.take() {
+            Some(pending) => pending,
+            None => return,
+        };
+        let NativeVideoSourceSwapPending {
+            from_idx,
+            target_idx,
+            target_path,
+            native_output,
+            autoplay_override,
+            show_preparing_overlay,
+            reason,
+            requested_at,
+            input_seq,
+            ..
+        } = pending;
+
+        let source_epoch = self.next_native_video_source_epoch();
+        let started_at = std::time::Instant::now();
+        self.activity_gate.bump();
+        let mut new_player = self.build_video_player_for_open(
+            target_idx,
+            target_path.clone(),
+            false,
+            autoplay_override,
+            None,
+        );
+        new_player.attach_native_output(native_output);
+        let payload = new_player.build_switch_source_payload(source_epoch, show_preparing_overlay);
+        new_player.switch_native_source(payload);
+
+        self.fs_cache.insert(
+            target_idx,
+            FsCacheEntry::Video {
+                player: Box::new(new_player),
+                load_seq: self.input_seq,
+            },
+        );
+        self.open_fullscreen(target_idx);
+
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
+            crate::logger::log(format!(
+                "[video-debug] post-deferred-swap state: idx={target_idx} engine_state={} seek_serial={} clock_is_playing={} pos={:.3} video_rx_len={} audio_rx_len={} pending_frames={}",
+                player.engine_state_name(),
+                player.current_seek_serial(),
+                player.is_playing(),
+                player.position(),
+                player.video_rx_len(),
+                player.audio_rx_len(),
+                player.pending_frames()
+            ));
+        }
+
+        if show_preparing_overlay {
+            self.set_native_video_tile_preparing_overlay(target_idx);
+        } else if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
+            player.set_native_tile_overlay(None);
+        }
+        self.sync_native_video_metadata(target_idx);
+        self.sync_native_video_timeline_markers(target_idx);
+        self.sync_native_video_vst3_available(target_idx);
+        self.sync_native_video_vst3_panel(target_idx);
+
+        if reason == "tile" {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
+                player.set_playing(false);
+            }
+            self.video_tile_mode_active = true;
+            self.video_tile_swap_pending = Some(VideoTileSwapPending {
+                target_idx,
+                target_path: target_path.clone(),
+                source_epoch,
+                started_at,
+                deadline: started_at + std::time::Duration::from_secs(2),
+            });
+            self.video_tile_reopen_pending = false;
+            self.video_tile_reopen_deadline = None;
+        } else {
+            self.native_video_fast_swap_pending = Some(NativeVideoFastSwapPending {
+                target_idx,
+                target_path: target_path.clone(),
+                source_epoch,
+                started_at,
+                deadline: started_at + std::time::Duration::from_secs(2),
+            });
+        }
+
+        crate::logger::log(format!(
+            "[native-video] deferred source swap queued: reason={reason} from={from_idx} to={target_idx} epoch={source_epoch} waited_ms={:.1}",
+            requested_at.elapsed().as_secs_f64() * 1000.0
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "native_video",
+                "source_swap_deferred_start",
+                None,
+                input_seq,
+                &[
+                    ("from_idx", serde_json::Value::from(from_idx as i64)),
+                    ("target_idx", serde_json::Value::from(target_idx as i64)),
+                    ("source_epoch", serde_json::Value::from(source_epoch as i64)),
+                    (
+                        "wait_ms",
+                        serde_json::Value::from(requested_at.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("reason", serde_json::Value::from(reason)),
+                ],
+            );
+        }
+        ctx.request_repaint();
+    }
+
+    #[cfg(windows)]
     pub(super) fn ensure_native_video_front(&mut self) {
         if self.fullscreen_idx.is_none() {
             self.sync_native_video_main_cloak(false);
@@ -110,17 +635,21 @@ impl App {
         }
         let (hwnd, hud_hwnd) = self
             .fullscreen_idx
-            .and_then(|idx| self.fs_cache.get(&idx))
-            .and_then(|entry| match entry {
-                FsCacheEntry::Video { player, .. } => {
-                    let hwnd = player.native_presenter_hwnd();
-                    if hwnd == 0 {
-                        None
-                    } else {
-                        Some((hwnd, player.native_hud_hwnd()))
-                    }
-                }
-                _ => None,
+            .and_then(|idx| {
+                self.pending_native_video_output_hwnds_for_fs(idx)
+                    .or_else(|| {
+                        self.fs_cache.get(&idx).and_then(|entry| match entry {
+                            FsCacheEntry::Video { player, .. } => {
+                                let hwnd = player.native_presenter_hwnd();
+                                if hwnd == 0 {
+                                    None
+                                } else {
+                                    Some((hwnd, player.native_hud_hwnd()))
+                                }
+                            }
+                            _ => None,
+                        })
+                    })
             })
             .unwrap_or((0, 0));
         if hwnd == 0 {
@@ -157,7 +686,13 @@ impl App {
                 && foreground_is_ours
                 && self.native_video_front_recover_after_external_foreground
             {
-                if let Some(idx) = self.fullscreen_idx {
+                if let Some(pending) = self.native_video_source_swap_pending.as_ref() {
+                    if pending.native_output.hwnd() == hwnd {
+                        pending.native_output.request_presenter_raise();
+                        self.native_video_front_last_raise = Some(now);
+                        self.native_video_front_recover_after_external_foreground = false;
+                    }
+                } else if let Some(idx) = self.fullscreen_idx {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
                         if player.native_presenter_hwnd() == hwnd {
                             player.request_presenter_raise();
@@ -392,27 +927,55 @@ impl App {
 
     #[cfg(windows)]
     pub(super) fn native_video_presenter_hwnd_for_focus_guard(&self) -> bool {
-        self.fullscreen_idx
-            .and_then(|idx| self.fs_cache.get(&idx))
-            .is_some_and(|entry| match entry {
-                FsCacheEntry::Video { player, .. } => {
-                    player.native_presenter_hwnd() != 0 || player.native_presenter_pending()
-                }
-                _ => false,
+        self.fullscreen_idx.is_some_and(|idx| {
+            self.pending_native_video_output_active_for_fs(idx)
+                || self.fs_cache.get(&idx).is_some_and(|entry| match entry {
+                    FsCacheEntry::Video { player, .. } => {
+                        player.native_presenter_hwnd() != 0 || player.native_presenter_pending()
+                    }
+                    _ => false,
+                })
+        })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn pending_native_video_output_active_for_fs(&self, fs_idx: usize) -> bool {
+        self.native_video_source_swap_pending
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.target_idx == fs_idx && !pending.native_output.is_closed()
+            })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn pending_native_video_output_hwnds_for_fs(
+        &self,
+        fs_idx: usize,
+    ) -> Option<(u64, u64)> {
+        self.native_video_source_swap_pending
+            .as_ref()
+            .filter(|pending| pending.target_idx == fs_idx && !pending.native_output.is_closed())
+            .and_then(|pending| {
+                let hwnd = pending.native_output.hwnd();
+                (hwnd != 0).then_some((hwnd, pending.native_output.hud_hwnd()))
             })
     }
 
     #[cfg(windows)]
     pub(super) fn native_video_presenter_hwnd(&self) -> Option<u64> {
-        self.fullscreen_idx
-            .and_then(|idx| self.fs_cache.get(&idx))
-            .and_then(|entry| match entry {
-                FsCacheEntry::Video { player, .. } => {
-                    let hwnd = player.native_presenter_hwnd();
-                    (hwnd != 0).then_some(hwnd)
-                }
-                _ => None,
-            })
+        self.fullscreen_idx.and_then(|idx| {
+            self.pending_native_video_output_hwnds_for_fs(idx)
+                .map(|(hwnd, _)| hwnd)
+                .or_else(|| {
+                    self.fs_cache.get(&idx).and_then(|entry| match entry {
+                        FsCacheEntry::Video { player, .. } => {
+                            let hwnd = player.native_presenter_hwnd();
+                            (hwnd != 0).then_some(hwnd)
+                        }
+                        _ => None,
+                    })
+                })
+        })
     }
 
     #[cfg(windows)]
@@ -765,7 +1328,7 @@ impl App {
                 self.handle_native_video_mouse_button(ctx, fs_idx, button);
             }
             crate::video::native_window::NativeVideoWindowEvent::MouseWheel(wheel) => {
-                if wheel.ctrl && self.video_tile_state.is_some() {
+                if wheel.ctrl && self.video_tile_mode_active {
                     let delta = if wheel.delta > 0 { -1 } else { 1 };
                     self.adjust_native_video_tile_columns(ctx, fs_idx, delta);
                 } else if !wheel.ctrl {
@@ -854,11 +1417,10 @@ impl App {
                 );
             }
             player.seek(target_secs);
-            self.video_tile_state = None;
-            self.video_tile_swap_pending = None;
             player.set_native_tile_overlay(None);
-            self.mark_native_video_hud_activity(ctx);
         }
+        self.close_video_tile_mode();
+        self.mark_native_video_hud_activity(ctx);
         self.apply_loop_mode_to_player(fs_idx);
     }
 
@@ -2074,6 +2636,7 @@ impl App {
         match status {
             SwapStatus::Ready => {
                 let screen = self.video_tile_layout_size(target_idx, ctx);
+                self.video_tile_mode_active = true;
                 self.video_tile_state = self.build_video_tile_state_for(target_idx, screen);
                 self.video_tile_swap_pending = None;
                 self.video_tile_reopen_pending = false;
@@ -2092,6 +2655,7 @@ impl App {
             SwapStatus::Timeout => {
                 self.video_tile_swap_pending = None;
                 self.video_tile_state = None;
+                self.video_tile_mode_active = true;
                 self.video_tile_reopen_pending = true;
                 self.video_tile_reopen_deadline = Some(now + std::time::Duration::from_secs(3));
                 self.set_native_video_tile_preparing_overlay(target_idx);
@@ -2102,13 +2666,64 @@ impl App {
                 ctx.request_repaint();
             }
             SwapStatus::Error | SwapStatus::Missing => {
+                let status_label = match status {
+                    SwapStatus::Error => "error",
+                    SwapStatus::Missing => "missing",
+                    _ => "unknown",
+                };
+                let error_text = self
+                    .fs_cache
+                    .get(&target_idx)
+                    .and_then(|entry| match entry {
+                        FsCacheEntry::Video { player, .. } if player.path() == &target_path => {
+                            player.error().map(str::to_owned)
+                        }
+                        _ => None,
+                    });
                 self.video_tile_swap_pending = None;
                 self.video_tile_state = None;
+                // A failed/temporarily missing video open should not implicitly leave S tile mode.
+                // During rapid wheel navigation the target can fail to produce metadata for a few
+                // frames (or be an unsupported video), but the next wheel tick should still use the
+                // tile fast-swap path instead of falling back to normal fullscreen navigation.
+                self.video_tile_mode_active = true;
+                self.video_tile_reopen_pending = true;
+                self.video_tile_reopen_deadline = Some(now + std::time::Duration::from_secs(3));
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
-                    player.set_native_tile_overlay(None);
+                    player.set_native_tile_overlay(Some(
+                        Self::native_video_tile_preparing_overlay_for_path(
+                            &target_path,
+                            Some(player.prep_progress().snapshot()),
+                        ),
+                    ));
                 }
+                crate::logger::log(format!(
+                    "[native-video] fast tile swap ended before ready: idx={target_idx} epoch={source_epoch} status={status_label} keep_mode=true error={}",
+                    error_text.unwrap_or_default()
+                ));
                 ctx.request_repaint();
             }
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn cancel_stale_video_tile_reopen(&mut self, fs_idx: Option<usize>, reason: &str) {
+        if self.video_tile_mode_active {
+            return;
+        }
+        let had_pending = self.video_tile_reopen_pending || self.video_tile_swap_pending.is_some();
+        self.video_tile_reopen_pending = false;
+        self.video_tile_reopen_deadline = None;
+        self.video_tile_swap_pending = None;
+        if let Some(idx) = fs_idx {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+                player.set_native_tile_overlay(None);
+            }
+        }
+        if had_pending {
+            crate::logger::log(format!(
+                "[video-tile] cancel stale reopen: reason={reason} fs_idx={fs_idx:?}"
+            ));
         }
     }
 
@@ -2124,7 +2739,9 @@ impl App {
             return;
         };
 
-        if self.video_tile_reopen_pending && self.video_tile_state.is_none() {
+        if (self.video_tile_mode_active || self.video_tile_reopen_pending)
+            && self.video_tile_state.is_none()
+        {
             let now = std::time::Instant::now();
             let deadline = *self
                 .video_tile_reopen_deadline
@@ -2133,9 +2750,15 @@ impl App {
                 self.video_tile_reopen_pending = false;
                 self.video_tile_reopen_deadline = None;
             } else {
+                crate::logger::log(format!(
+                    "[video-tile] reopen pending: fs_idx={fs_idx} active={} remaining_ms={:.1}",
+                    self.video_tile_mode_active,
+                    deadline.saturating_duration_since(now).as_secs_f64() * 1000.0
+                ));
                 let screen = self.video_tile_layout_size(fs_idx, ctx);
-                self.toggle_video_tile_mode(fs_idx, screen);
+                self.video_tile_state = self.build_video_tile_state_for(fs_idx, screen);
                 if self.video_tile_state.is_some() {
+                    self.video_tile_mode_active = true;
                     self.video_tile_reopen_pending = false;
                     self.video_tile_reopen_deadline = None;
                 } else {
@@ -2169,8 +2792,24 @@ impl App {
                         open_status,
                     ))
                 } else {
+                    crate::logger::log(format!(
+                        "[video-tile] stale state path mismatch: fs_idx={fs_idx} old={} current={} -> keep mode and rebuild",
+                        state.video_path.display(),
+                        current_path.display()
+                    ));
                     clear_state = true;
-                    None
+                    self.video_tile_reopen_pending = true;
+                    self.video_tile_reopen_deadline =
+                        Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
+                    Some(Self::native_video_tile_preparing_overlay_for_path(
+                        &current_path,
+                        self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
+                            FsCacheEntry::Video { player, .. } => {
+                                Some(player.prep_progress().snapshot())
+                            }
+                            _ => None,
+                        }),
+                    ))
                 }
             } else {
                 let snapshot = state.worker.snapshot();
@@ -3074,6 +3713,9 @@ impl App {
         if self.fs_nav_is_locked() {
             return;
         }
+        if !self.video_tile_mode_active {
+            self.cancel_stale_video_tile_reopen(Some(fs_idx), "wheel-navigation");
+        }
         let nav_delta = self.spread_nav_delta(base_delta, false);
         if let Some(new_idx) = crate::ui_helpers::adjacent_navigable_idx(
             &self.items,
@@ -3123,7 +3765,7 @@ impl App {
         if next_cols == current {
             return;
         }
-        let was_open = self.video_tile_state.is_some();
+        let was_open = self.video_tile_mode_active;
         crate::logger::log(format!(
             "[video-tile] adjust_columns: fs_idx={fs_idx} delta={delta} columns {current}->{next_cols} was_open={was_open}"
         ));
@@ -3133,7 +3775,7 @@ impl App {
         self.video_tile_swap_pending = None;
         if was_open {
             let screen = self.video_tile_layout_size(fs_idx, ctx);
-            self.toggle_video_tile_mode(fs_idx, screen);
+            self.video_tile_state = self.build_video_tile_state_for(fs_idx, screen);
             self.sync_native_video_tile_overlay(ctx, fs_idx);
         }
         self.mark_native_video_hud_activity(ctx);
@@ -3314,17 +3956,26 @@ impl App {
         // ため、`try_start_native_video_fast_swap` と同じ live count 上限で抑制する。
         // ただし throttle は「これは tile fast-swap の候補」と確定したあとに見る
         // (Codex P1 反映 — tile モード外や画像 target で誤発火しないように)。
-        if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
-            return true;
-        }
         let Some(from_idx) = self.fullscreen_idx else {
             return false;
         };
         if from_idx == target_idx {
             return true;
         }
-        if self.video_tile_state.is_none() {
+        if !self.video_tile_mode_active && self.video_tile_swap_pending.is_none() {
             return false;
+        }
+        if self.native_video_source_swap_pending.is_some() {
+            return self.defer_native_video_source_swap_until_decoder_free(
+                ctx,
+                target_idx,
+                Some(false),
+                true,
+                "tile",
+            );
+        }
+        if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
+            return true;
         }
         // tile fast-swap は target/from が動画前提だが、念のため明示チェック。
         // `start_native_video_source_swap` 内でも同じチェックがあるが、ここで先に判定
@@ -3335,16 +3986,21 @@ impl App {
             return false;
         }
 
-        // throttle 上限。詳細は `try_start_native_video_fast_swap` 側のコメント参照
-        // (2026-05-15 に 3 → 2 へ厳格化)。
-        const MAX_LIVE_VIDEO_DECODE_THREADS: usize = 2;
+        // throttle 上限。詳細は `try_start_native_video_fast_swap` 側のコメント参照。
         let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
             .load(std::sync::atomic::Ordering::Acquire);
-        if live_decoders >= MAX_LIVE_VIDEO_DECODE_THREADS {
+        let max_live_video_decode_threads = crate::video::decoder::MAX_LIVE_VIDEO_DECODE_THREADS;
+        if live_decoders >= max_live_video_decode_threads {
             crate::logger::log(format!(
-                "[native-video] fast tile swap throttled: live_video_decode_threads={live_decoders} max={MAX_LIVE_VIDEO_DECODE_THREADS} target_idx={target_idx}"
+                "[native-video] fast tile swap throttled: live_video_decode_threads={live_decoders} max={max_live_video_decode_threads} target_idx={target_idx}"
             ));
-            return true;
+            return self.defer_native_video_source_swap_until_decoder_free(
+                ctx,
+                target_idx,
+                Some(false),
+                true,
+                "tile",
+            );
         }
 
         let Some(started) =
@@ -3356,6 +4012,7 @@ impl App {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
             player.set_playing(false);
         }
+        self.video_tile_mode_active = true;
         self.video_tile_swap_pending = Some(VideoTileSwapPending {
             target_idx: started.target_idx,
             target_path: started.target_path,
@@ -3382,12 +4039,22 @@ impl App {
         // までは throttle 判定もしない。`live_count >= MAX` のときに throttle が早く
         // 走ると、動画→画像のような fast-swap 対象外の navigation まで握り潰してしまう
         // (Codex P1 反映)。
+        if self.native_video_source_swap_pending.is_some() {
+            return self.defer_native_video_source_swap_until_decoder_free(
+                ctx,
+                target_idx,
+                None,
+                false,
+                "navigation",
+            );
+        }
         if self.native_video_fast_swap_pending.is_some() || self.video_tile_swap_pending.is_some() {
             return true;
         }
-        if self.video_tile_state.is_some() {
+        if self.video_tile_mode_active {
             return false;
         }
+        self.cancel_stale_video_tile_reopen(self.fullscreen_idx, "native-fast-swap");
         let Some(from_idx) = self.fullscreen_idx else {
             return false;
         };
@@ -3408,19 +4075,26 @@ impl App {
         // が cancel フラグを立てても、FFmpeg 内停止中の旧 thread は cancel を観測できず
         // 居座るので、`LIVE_VIDEO_DECODE_THREADS` が上限を超えていれば新 swap を抑制する。
         //
-        // 上限は「現在再生中 1 + transient swap 中 1〜2」をすべて含めた **総 live 数** で
-        // カウントしている。健全な thread は cancel 観測後すぐ exit するので、swap 開始
-        // 時点では通常 live_count=1 (= 現在再生中の 1 個だけ)。swap 開始時点で 2 以上なら
-        // 直前の swap の旧 thread がまだ exit していない = stuck/遅延の兆候なので、
-        // MAX=2 (= `>= 2` で抑制) で新規 HW fast-swap を起動しない (2026-05-15、D3D11VA
-        // context 直列化と合わせた belt-and-suspenders。直列化で hard-stuck 自体は
-        // 防げる前提だが、万一に備えて throttle も厳格化する)。
-        const MAX_LIVE_VIDEO_DECODE_THREADS: usize = 2;
+        // 上限は「現在再生中の 1 個」も含めた **総 live 数** でカウントしている。
+        // 2026-05-15 の実機ログで、旧 decoder と新 decoder が重なっただけでも
+        // D3D11VA / shared texture / keyed mutex 経路が秒単位に詰まり、最終的に
+        // DXGI device removed へ進むことを確認した。mIV の fast-swap は decoder
+        // create/drop と shared-output 回収が密に重なるため、安定性優先で
+        // `MAX_LIVE_VIDEO_DECODE_THREADS=1` (= `>= 1` で抑制) とし、旧 decoder の
+        // exit を待ってから次の HW decode を開始する。
+        // UI thread をブロックする待ち合わせは禁止 (Codex 指摘 #1、2026-05-15)。
+        // `>= MAX` のときは旧 player から NativeVideoOutput だけを退避し、
+        // presenter HWND / DComp tree を表示したまま `NativeVideoSourceSwapPending` で
+        // live=0 を待つ。normal open へ fallback すると旧 presenter が先に閉じ、
+        // 新 presenter が出るまで背後のアプリや黒画面が 150-300ms 見えるため。
+        // これにより「同時 HW decoder は 1 本」のまま、fullscreen を消さずに最新
+        // target へ進められる。
         let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
             .load(std::sync::atomic::Ordering::Acquire);
-        if live_decoders >= MAX_LIVE_VIDEO_DECODE_THREADS {
+        let max_live_video_decode_threads = crate::video::decoder::MAX_LIVE_VIDEO_DECODE_THREADS;
+        if live_decoders >= max_live_video_decode_threads {
             crate::logger::log(format!(
-                "[native-video] fast video swap throttled: live_video_decode_threads={live_decoders} max={MAX_LIVE_VIDEO_DECODE_THREADS} target_idx={target_idx}"
+                "[native-video] fast video swap throttled: live_video_decode_threads={live_decoders} max={max_live_video_decode_threads} target_idx={target_idx}"
             ));
             if crate::perf::is_enabled() {
                 crate::perf::event(
@@ -3435,37 +4109,34 @@ impl App {
                         ),
                         (
                             "max",
-                            serde_json::Value::from(MAX_LIVE_VIDEO_DECODE_THREADS as i64),
+                            serde_json::Value::from(max_live_video_decode_threads as i64),
                         ),
                         ("target_idx", serde_json::Value::from(target_idx as i64)),
                     ],
                 );
             }
-            // 「ホイール event を握り潰す」ため true (= 上位の `open_native_video_fullscreen_from_navigation`
-            // が traditional open に fallback しないようにする)。traditional open は更に
-            // 旧 VideoPlayer を evict + 新 video-decode thread を spawn するので throttle
-            // 中に通すと contention を悪化させる。
-            return true;
+            return self.defer_native_video_source_swap_until_decoder_free(
+                ctx,
+                target_idx,
+                None,
+                false,
+                "navigation",
+            );
         }
 
-        let Some(started) =
-            self.start_native_video_source_swap(ctx, target_idx, None, false, "navigation")
-        else {
-            return false;
-        };
-
-        self.native_video_fast_swap_pending = Some(NativeVideoFastSwapPending {
-            target_idx: started.target_idx,
-            target_path: started.target_path,
-            source_epoch: started.source_epoch,
-            started_at: started.started_at,
-            deadline: started.started_at + std::time::Duration::from_secs(2),
-        });
-        crate::logger::log(format!(
-            "[native-video] fast video swap: from={} to={} epoch={}",
-            started.from_idx, started.target_idx, started.source_epoch
-        ));
-        true
+        // Even when the decoder slot is free, do not create/drop a decoder for every
+        // intermediate wheel target. Rapid navigation can still create hundreds of
+        // D3D11VA decoders and shared-output textures per minute with only one live
+        // decoder at a time, which is enough to hit driver/resource pressure. Keep
+        // the existing native presenter visible and coalesce wheel movement; the
+        // pending target is updated by `defer_native_video_source_swap_until_decoder_free`.
+        self.defer_native_video_source_swap_until_decoder_free(
+            ctx,
+            target_idx,
+            None,
+            false,
+            "navigation",
+        )
     }
 
     #[cfg(windows)]
@@ -3482,7 +4153,7 @@ impl App {
         }
         let started = std::time::Instant::now();
         let from_idx = self.fullscreen_idx;
-        let restore_video_tile = self.video_tile_state.is_some();
+        let restore_video_tile = self.video_tile_mode_active;
         let restore_target_is_video = matches!(self.items.get(idx), Some(GridItem::Video(_)));
         crate::logger::log(format!(
             "[native-video] wheel navigation open: from={from_idx:?} to={idx} tile_restore={restore_video_tile} target_video={restore_target_is_video}"
@@ -3494,13 +4165,17 @@ impl App {
                 self.set_native_video_tile_preparing_overlay(current_idx);
             }
             if restore_target_is_video {
+                self.video_tile_mode_active = true;
                 self.video_tile_reopen_pending = true;
                 self.video_tile_reopen_deadline =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
             } else {
+                self.video_tile_mode_active = false;
                 self.video_tile_reopen_pending = false;
                 self.video_tile_reopen_deadline = None;
             }
+        } else {
+            self.cancel_stale_video_tile_reopen(from_idx, "wheel-open");
         }
 
         self.open_fullscreen(idx);
@@ -3508,6 +4183,7 @@ impl App {
         if restore_video_tile && restore_target_is_video {
             self.set_native_video_tile_preparing_overlay(idx);
         } else if restore_video_tile {
+            self.video_tile_mode_active = false;
             self.video_tile_reopen_pending = false;
             self.video_tile_reopen_deadline = None;
         }

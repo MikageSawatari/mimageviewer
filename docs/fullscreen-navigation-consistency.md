@@ -168,6 +168,12 @@ no-op 案内は段階を分ける:
 一度タイルモードを閉じて画像系フルスクリーンへ出た後は、次に動画へ移動してもタイルへ
 自動復帰しない。タイルに戻るにはユーザーが明示的に S を押す。
 
+動画→動画の source swap が一時的に `Error` / `Missing` になった場合も、S タイルモードは
+暗黙に解除しない。ホイール連打中は未対応動画や metadata 未取得の過渡状態をまたぐことがあり、
+そこで `video_tile_mode_active` を落とすと次のホイール入力が通常 fullscreen navigation に
+流れてタイル表示が勝手に消えるため。代わりに preparing overlay を維持し、次の動画 target へ
+進む入力も tile fast-swap 経路で処理する。
+
 ## 4. 残っている改善候補
 
 | 改善候補 | 関連箇所 |
@@ -220,7 +226,8 @@ no-op 案内は段階を分ける:
 
   この多経路サポートは、Chrome / Edge / Explorer が「どの経路でも進む/戻る」ができる
   ユーザー体験と揃えるための実装。実機検証は本書 §7 の手動 sweep に含まれる。
-- 動画タイルは動画→動画なら source 差し替えまたは reopen pending で維持し、
+- 動画タイルは動画→動画なら `video_tile_mode_active` を維持したまま source 差し替え
+  または reopen pending で復元し、`video_tile_state` が一時的に無くなってもモードは落とさない。
   画像 / ZIP / PDF へ出たら閉じる。閉じた後の暗黙復帰はしない。
 - native overlay の `FsBoundaryHint` 相当中央表示は未実装。必要になったら
   toast MVP から分離して実装する。

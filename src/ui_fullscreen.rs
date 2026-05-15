@@ -1494,7 +1494,7 @@ impl App {
                             // 要求 (S キーの遷移) のリトライだけはここで処理する。
                             #[cfg(windows)]
                             {
-                                if self.video_tile_reopen_pending
+                                if (self.video_tile_mode_active || self.video_tile_reopen_pending)
                                     && self.video_tile_state.is_none()
                                 {
                                     let now = std::time::Instant::now();
@@ -1507,8 +1507,10 @@ impl App {
                                         self.video_tile_reopen_deadline = None;
                                     } else {
                                         let screen = self.video_tile_layout_size(fs_idx, ctx);
-                                        self.toggle_video_tile_mode(fs_idx, screen);
+                                        self.video_tile_state =
+                                            self.build_video_tile_state_for(fs_idx, screen);
                                         if self.video_tile_state.is_some() {
+                                            self.video_tile_mode_active = true;
                                             self.video_tile_reopen_pending = false;
                                             self.video_tile_reopen_deadline = None;
                                         } else {
@@ -1602,7 +1604,7 @@ impl App {
                                 state.image_dims
                             };
                             #[cfg(windows)]
-                            let tile_active = self.video_tile_state.is_some();
+                            let tile_active = self.video_tile_mode_active;
                             #[cfg(not(windows))]
                             let tile_active = false;
                             let mut tile_pressed = false;
@@ -2079,6 +2081,9 @@ impl App {
     /// フルスクリーンビューポートの ViewportBuilder を構築する。
     #[cfg(windows)]
     fn native_video_presenter_hwnd_for_fs(&self, fs_idx: usize) -> Option<u64> {
+        if let Some((hwnd, _)) = self.pending_native_video_output_hwnds_for_fs(fs_idx) {
+            return Some(hwnd);
+        }
         match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
                 let hwnd = player.native_presenter_hwnd();
@@ -2095,6 +2100,12 @@ impl App {
 
     #[cfg(windows)]
     fn native_video_presenter_pending_for_fs(&self, fs_idx: usize) -> bool {
+        if self.pending_native_video_output_active_for_fs(fs_idx) {
+            let Some((hwnd, _)) = self.pending_native_video_output_hwnds_for_fs(fs_idx) else {
+                return true;
+            };
+            return self.native_video_front_synced_hwnd != hwnd;
+        }
         match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
                 if player.native_presenter_pending() {
@@ -3132,7 +3143,7 @@ impl App {
         // 動画タイルモード中でも Ctrl なし Wheel は前後アイテム移動に使う。
         // Ctrl+Wheel はタイル overlay 側の列数切替に渡すため、ここでは消費しない。
         #[cfg(windows)]
-        let in_video_tile = self.video_tile_state.is_some();
+        let in_video_tile = self.video_tile_mode_active;
         #[cfg(not(windows))]
         let in_video_tile = false;
         let wheel_y = ctx.input(|i| i.raw_scroll_delta.y);
@@ -3315,7 +3326,7 @@ impl App {
                         // (Codex P5.5 H1 反映)。
                         // Phase 7.I 追加: 動画オープン直後の中央 2 ボタン
                         // (最初から / 続きから) の領域を除外。
-                        let tile_active = self.video_tile_state.is_some();
+                        let tile_active = self.video_tile_mode_active;
                         let pos_opt = fs_response.interact_pointer_pos();
                         // 旧 egui HUD は撤去済 (native presenter overlay が代替)。
                         // egui main window 側で intercept すべき HUD 矩形は無いので常に false。
@@ -3464,12 +3475,14 @@ impl App {
         }
 
         #[cfg(windows)]
-        let restore_video_tile = self.video_tile_state.is_some();
+        let restore_video_tile = self.video_tile_mode_active;
 
         #[cfg(windows)]
         if restore_video_tile {
             self.video_tile_state = None;
             self.video_tile_swap_pending = None;
+        } else {
+            self.cancel_stale_video_tile_reopen(self.fullscreen_idx, "fs-navigation");
         }
 
         self.open_fullscreen(idx);
@@ -3477,11 +3490,13 @@ impl App {
         #[cfg(windows)]
         {
             if restore_video_tile && matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+                self.video_tile_mode_active = true;
                 self.video_tile_reopen_pending = true;
                 self.video_tile_reopen_deadline =
                     Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                 ctx.request_repaint();
             } else if restore_video_tile {
+                self.video_tile_mode_active = false;
                 self.video_tile_reopen_pending = false;
                 self.video_tile_reopen_deadline = None;
             }
@@ -5582,7 +5597,7 @@ impl App {
         // タイルモード中は ESC でも閉じれるようにする (= 一般的な「全画面モード解除」)。
         // ただし ESC は元々フルスクリーン全体を閉じるキーなので、タイルモード中だけ
         // 横取りする。
-        let escape_for_tile = self.video_tile_state.is_some()
+        let escape_for_tile = self.video_tile_mode_active
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
 
         if shift_enter {
@@ -5797,8 +5812,7 @@ impl App {
         // ESC は タイルモード中のみキャッチして close。フルスクリーン解脱は呼び出し側
         // (handle_image_keys 後段) の通常 ESC で扱う。
         if escape_for_tile {
-            self.video_tile_state = None;
-            self.video_tile_swap_pending = None;
+            self.close_video_tile_mode();
         }
 
         // Phase 5.4.1: ブックマーク追加。現在位置 + 動画パスを取得して DB に挿入。

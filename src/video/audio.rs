@@ -170,9 +170,18 @@ impl Drop for AudioOutput {
             let _ = stream.pause();
             drop(stream);
         }
-        // 3. pump を join (cancel + shutdown signal で 100ms 以内に終了)
+        // 3. pump を join。通常は cancel + shutdown signal で 100ms 以内に終了するが、
+        //    decoder/engine 側の back-pressure デッドロック等で pump が動けないと join が
+        //    無限ブロックして UI thread を固める (2026-05-15、Escape 後の "応答なし"
+        //    14秒の正体)。`NativeVideoOutput::drop` と同じく **専用 thread で join** に
+        //    付け替え、Drop は即時返す。万一 pump が exit しなくても thread は単に
+        //    残るだけで UI には影響しない。
         if let Some(p) = self.pump.take() {
-            let _ = p.join();
+            let _ = std::thread::Builder::new()
+                .name("audio-output-drop-join".to_string())
+                .spawn(move || {
+                    let _ = p.join();
+                });
         }
     }
 }

@@ -54,7 +54,18 @@ use windows::core::Interface;
 
 /// 出力テクスチャのリングバッファサイズ。decoder が書き → UI が読む間
 /// に少なくとも 2 枚 in-flight を許す。
-const OUTPUT_RING_SIZE: usize = 24;
+/// 共有出力テクスチャ pool の上限スロット数。各 slot は 1 枚の D3D11 ID3D11Texture2D
+/// (NT shared) を保持し、4K BGRA で約 32 MB / 1080p で約 8 MB を adapter memory に使う。
+///
+/// 2026-05-15 (Codex 助言): 旧 24 → 16 に縮小。fast-swap 連発時に解像度違いで
+/// evict + grow が大量に走り、`shared_texture_cache` (presenter 側 cap=8) や
+/// `retired_video_surfaces` (depth=1) と合わせて adapter memory が枯渇 →
+/// `wgpu Out of Memory` panic を発生させていた。16 にすることで 4K で
+/// pool 単独最大 ~512 MB を上限化する。`source.queue` (`MAX_NATIVE_SOURCE_QUEUE=8`)
+/// + presenter 側で消費されるので 16 でも slot 枯渇は起きにくいが、pool exhausted
+/// 時は `GpuVideoError::ResourcePressure` で frame drop に落とす (CPU readback fallback
+/// は **しない** = pressure を悪化させる)。
+const OUTPUT_RING_SIZE: usize = 16;
 
 /// 1 フレームの GPU 出力。
 ///
@@ -168,6 +179,110 @@ impl Drop for D3d11Frame {
     }
 }
 
+/// `acquire_shared_output` で取得した slot を、`blit_nv12_to_rgba` の途中で
+/// 早期 return (= `?`) されても確実に解放するための RAII guard。
+///
+/// 2026-05-15 (Codex P1): 旧コードは `acquire_shared_output` で `in_use=true` + keyed
+/// mutex AcquireSync(0) した後、CreateInputView / CreateOutputView / VideoProcessorBlt /
+/// Signal のいずれかが `?` で失敗すると `D3d11Frame` が作られないため `in_use=false`
+/// が呼ばれず、**slot が永久占有 (= LEAK)** する状態だった。`ResourcePressure` を
+/// frame drop に倒したことで失敗パスが日常的に踏まれるようになり、pool slot が枯渇する
+/// 度に新しい decoder が「準備中」のまま固着する症状が観測された。
+///
+/// 本 guard は acquire 直後に作り、成功して `BlitOutput` を返す直前に `disarm()` を
+/// 呼ぶ。途中で `?` 早期 return すると `Drop` で slot を返却する。状態:
+///   - `holding_write_key=true` (= ReleaseSync(1) 前): `ReleaseSync(0)` で write key を戻し、
+///     `in_use=false` + notify する。
+///   - `holding_write_key=false` (= ReleaseSync(1) 成功後、Signal 失敗等): write key は
+///     既に reader 側 (`released_to_reader=true`)。`ReleaseSync` は呼ばず in_use のみ戻す。
+///     次回 acquire で `recover_shared_output_keyed_mutex` 経由で key=1 を取り戻す。
+struct SharedOutputSlotGuard {
+    in_use: Option<Arc<AtomicBool>>,
+    notify: Option<Arc<Condvar>>,
+    keyed_mutex: Option<IDXGIKeyedMutex>,
+    /// true = まだ write key (=0) を保有中。false = ReleaseSync(1) 済 (reader に渡した)。
+    holding_write_key: bool,
+    /// false にすると Drop で何もしない (= 成功 handoff 用)。
+    armed: bool,
+}
+
+impl SharedOutputSlotGuard {
+    fn new(
+        in_use: Option<Arc<AtomicBool>>,
+        notify: Option<Arc<Condvar>>,
+        keyed_mutex: Option<IDXGIKeyedMutex>,
+        had_write_key: bool,
+    ) -> Self {
+        // pool 由来 slot のみ guard 対象 (= in_use が Some)。create_shared_output の
+        // 非 pool 経路 (= acquire 失敗 / km cast 失敗時) は in_use=None で armed=false
+        // 相当の動作にする。
+        let armed = in_use.is_some();
+        Self {
+            in_use,
+            notify,
+            keyed_mutex,
+            holding_write_key: had_write_key,
+            armed,
+        }
+    }
+
+    /// ReleaseSync(1) が成功した直後に呼ぶ。write key は reader 側に渡ったので、
+    /// 以降の Drop では ReleaseSync(0) を呼ばない。
+    fn mark_released_to_reader(&mut self) {
+        self.holding_write_key = false;
+    }
+
+    /// `BlitOutput` を返す直前に呼ぶ。slot ownership が `D3d11Frame` に移ったので
+    /// Drop では何もしない。
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SharedOutputSlotGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if self.holding_write_key {
+            if let Some(km) = self.keyed_mutex.as_ref() {
+                // 失敗時の writer-side release: 次の acquire が AcquireSync(0) で取れる
+                // 状態に戻す。失敗しても致命ではない (= 次の acquire は
+                // recover_shared_output_keyed_mutex で取り戻せる) のでログだけ。
+                unsafe {
+                    if let Err(e) = km.ReleaseSync(0) {
+                        crate::logger::log(format!(
+                            "[shared-output] guard ReleaseSync(0) failed: {e:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        if let Some(in_use) = self.in_use.as_ref() {
+            in_use.store(false, Ordering::Release);
+        }
+        if let Some(notify) = self.notify.as_ref() {
+            notify.notify_one();
+        }
+        crate::logger::log(format!(
+            "[shared-output] slot guard released slot without handoff: holding_write_key={}",
+            self.holding_write_key
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "video",
+                "shared_output_drop_unfinished",
+                None,
+                0,
+                &[(
+                    "holding_write_key",
+                    serde_json::Value::from(self.holding_write_key),
+                )],
+            );
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum GpuVideoError {
     DeviceCreate(String),
@@ -177,6 +292,43 @@ pub enum GpuVideoError {
     TextureCreate(String),
     SharedHandle(String),
     Blt(String),
+    /// GPU リソース圧迫 (shared output pool 枯渇、`E_OUTOFMEMORY=0x8007000E`、
+    /// `D3D11_ERROR_TOO_MANY_UNIQUE_VIEW_OBJECTS` など回復不能な resource pressure 系
+    /// エラー、2026-05-15 追加)。decoder 側はこのバリアントを受けたら **CPU readback
+    /// fallback してはいけない** (= 内部 swscale + GPU upload で adapter memory を
+    /// さらに圧迫し OOM 連鎖を加速させる)。frame drop / 短い backoff に倒す。
+    ResourcePressure(String),
+}
+
+impl GpuVideoError {
+    /// `ResourcePressure` バリアントか判定。decoder 側で CPU fallback を抑止する用途。
+    pub fn is_resource_pressure(&self) -> bool {
+        matches!(self, Self::ResourcePressure(_))
+    }
+
+    /// `windows::core::Error` の HRESULT が GPU resource pressure 系か判定。
+    ///   - `E_OUTOFMEMORY (0x8007000E)` = adapter / system memory 不足
+    ///   - `D3D11_ERROR_TOO_MANY_UNIQUE_VIEW_OBJECTS (0x887C0003)` = 内部 view object pool 枯渇
+    ///   - `D3D11_ERROR_TOO_MANY_UNIQUE_STATE_OBJECTS (0x887C0001)` = state object pool 枯渇
+    ///   - `DXGI_ERROR_DEVICE_REMOVED (0x887A0005)` は別軸 (device lost) なので含めない
+    ///
+    /// 2026-05-15: 旧コードの `0x88790007` は誤値 (Codex P2 review)。`windows::Win32::
+    /// Graphics::Direct3D11::D3D11_ERROR_TOO_MANY_UNIQUE_VIEW_OBJECTS` の実際の HRESULT は
+    /// `0x887C0003`。
+    pub fn hresult_is_resource_pressure(err: &windows::core::Error) -> bool {
+        let code = err.code().0 as u32;
+        matches!(code, 0x8007000E | 0x887C0001 | 0x887C0003)
+    }
+
+    /// `windows::core::Error` を `ResourcePressure` か `Blt` に振り分ける helper
+    /// (CreateInputView / CreateOutputView / Blt 用)。
+    fn from_blt_hresult(label: &str, err: windows::core::Error) -> Self {
+        if GpuVideoError::hresult_is_resource_pressure(&err) {
+            Self::ResourcePressure(format!("{label}: {err:?}"))
+        } else {
+            Self::Blt(format!("{label}: {err:?}"))
+        }
+    }
 }
 
 impl std::fmt::Display for GpuVideoError {
@@ -189,6 +341,7 @@ impl std::fmt::Display for GpuVideoError {
             Self::TextureCreate(s) => write!(f, "CreateTexture2D failed: {s}"),
             Self::SharedHandle(s) => write!(f, "CreateSharedHandle failed: {s}"),
             Self::Blt(s) => write!(f, "VideoProcessorBlt failed: {s}"),
+            Self::ResourcePressure(s) => write!(f, "GPU resource pressure: {s}"),
         }
     }
 }
@@ -566,6 +719,16 @@ impl GpuVideoDevice {
             shared_texture_gen,
         ) = self.acquire_shared_output(out_w, out_h, out_format)?;
 
+        // Codex P1 (2026-05-15): acquire 直後に guard を作り、以降の `?` 早期 return で
+        // 必ず slot を返却するようにする (= ReleaseSync(0) + in_use=false + notify)。
+        // 旧コードは CreateInputView/OutputView/Blt/Signal の失敗で slot を永久占有していた。
+        let mut slot_guard = SharedOutputSlotGuard::new(
+            shared_output_in_use.clone(),
+            shared_output_notify.clone(),
+            km_acquired.clone(),
+            km_acquired.is_some(),
+        );
+
         // shared_handle は CreateInputView/OutputView/Blt のいずれかが失敗して `?` で
         // 早期リターンされても close する必要がある (Codex P2)。BlitOutput を返す直前で
         // disarm() してリーク防止責任を呼び出し側 (D3d11Frame::Drop) に移譲する。
@@ -600,7 +763,7 @@ impl GpuVideoDevice {
                     &in_view_desc,
                     Some(&mut in_view),
                 )
-                .map_err(|e| GpuVideoError::Blt(format!("CreateInputView: {e:?}")))?;
+                .map_err(|e| GpuVideoError::from_blt_hresult("CreateInputView", e))?;
         }
         let in_view = in_view.ok_or_else(|| GpuVideoError::Blt("InputView null".into()))?;
 
@@ -620,7 +783,7 @@ impl GpuVideoDevice {
                     &out_view_desc,
                     Some(&mut out_view),
                 )
-                .map_err(|e| GpuVideoError::Blt(format!("CreateOutputView: {e:?}")))?;
+                .map_err(|e| GpuVideoError::from_blt_hresult("CreateOutputView", e))?;
         }
         let out_view = out_view.ok_or_else(|| GpuVideoError::Blt("OutputView null".into()))?;
 
@@ -726,7 +889,7 @@ impl GpuVideoDevice {
                         out_h,
                         out_format,
                     ));
-                    GpuVideoError::Blt(format!("Blt: {e:?}"))
+                    GpuVideoError::from_blt_hresult("Blt", e)
                 })?;
             // Blt 完了後、中間テクスチャ (NT/KM なし) の内容を NT|KM 共有テクスチャに
             // コピーする。同 D3D11 device 内 GPU copy なので latency は ~0.1ms オーダ。
@@ -749,8 +912,12 @@ impl GpuVideoDevice {
             if let Some(km) = km_acquired {
                 if let Err(e) = km.ReleaseSync(1) {
                     crate::logger::log(format!("KeyedMutex ReleaseSync(1) failed: {e:?}"));
+                    // guard armed のまま return → Drop で ReleaseSync(0) + in_use=false。
                     return Err(GpuVideoError::Blt(format!("KeyedMutex ReleaseSync: {e:?}")));
                 }
+                // write key を reader 側に渡した → 以降 guard 経路で ReleaseSync(0) を
+                // 呼んではいけない (Codex P1)。
+                slot_guard.mark_released_to_reader();
                 if let Some(released) = &shared_output_released_to_reader {
                     released.store(true, Ordering::Release);
                 }
@@ -773,6 +940,9 @@ impl GpuVideoDevice {
 
         // 全成功: HANDLE 所有権を BlitOutput → D3d11Frame に移譲する。以降 guard が drop
         // しても close は走らない (= D3d11Frame::Drop の責任になる)。
+        // 同様に slot_guard も disarm: in_use=false / ReleaseSync は D3d11Frame::Drop と
+        // reader 側に責任移譲する (Codex P1 2026-05-15)。
+        slot_guard.disarm();
         Ok(BlitOutput {
             output_texture: out_tex,
             shared_handle,
@@ -841,12 +1011,27 @@ impl GpuVideoDevice {
         let enumerator = unsafe {
             self.video_device
                 .CreateVideoProcessorEnumerator(&content_desc)
-                .map_err(|e| GpuVideoError::EnumeratorCreate(format!("{e:?}")))?
+                .map_err(|e| {
+                    // E_OUTOFMEMORY 等は ResourcePressure に振り分け (Codex P1 2026-05-15)。
+                    if GpuVideoError::hresult_is_resource_pressure(&e) {
+                        GpuVideoError::ResourcePressure(format!(
+                            "CreateVideoProcessorEnumerator: {e:?}"
+                        ))
+                    } else {
+                        GpuVideoError::EnumeratorCreate(format!("{e:?}"))
+                    }
+                })?
         };
         let processor = unsafe {
             self.video_device
                 .CreateVideoProcessor(&enumerator, 0)
-                .map_err(|e| GpuVideoError::ProcessorCreate(format!("{e:?}")))?
+                .map_err(|e| {
+                    if GpuVideoError::hresult_is_resource_pressure(&e) {
+                        GpuVideoError::ResourcePressure(format!("CreateVideoProcessor: {e:?}"))
+                    } else {
+                        GpuVideoError::ProcessorCreate(format!("{e:?}"))
+                    }
+                })?
         };
         *self.processor_cache.lock().unwrap() = Some(ProcessorState {
             enumerator,
@@ -893,9 +1078,17 @@ impl GpuVideoDevice {
             self.device
                 .CreateTexture2D(&desc, None, Some(&mut tex))
                 .map_err(|e| {
-                    GpuVideoError::TextureCreate(format!(
-                        "intermediate {w}x{h} format={format:?} bind=0x{bind_flags:X}: {e:?}"
-                    ))
+                    // E_OUTOFMEMORY (0x8007000E) など pressure 系は ResourcePressure に
+                    // 振り分け、decoder 側で CPU fallback させない (Codex P1 2026-05-15)。
+                    if GpuVideoError::hresult_is_resource_pressure(&e) {
+                        GpuVideoError::ResourcePressure(format!(
+                            "CreateTexture2D intermediate {w}x{h} format={format:?}: {e:?}"
+                        ))
+                    } else {
+                        GpuVideoError::TextureCreate(format!(
+                            "intermediate {w}x{h} format={format:?} bind=0x{bind_flags:X}: {e:?}"
+                        ))
+                    }
                 })?;
         }
         tex.ok_or_else(|| GpuVideoError::TextureCreate("intermediate null".into()))
@@ -1146,7 +1339,11 @@ impl GpuVideoDevice {
 
             drop(pool);
             if wait_started.elapsed() >= std::time::Duration::from_millis(500) {
-                return Err(GpuVideoError::Blt(
+                // 2026-05-15: `Blt` → `ResourcePressure` に変更。decoder 側は
+                // この variant を受けたら CPU readback fallback せず frame drop に
+                // 落とす (CPU fallback は内部 swscale + GPU upload で adapter memory
+                // をさらに食い OOM 連鎖を加速させる、Codex 助言)。
+                return Err(GpuVideoError::ResourcePressure(
                     "shared output pool exhausted waiting for free slot".into(),
                 ));
             }
@@ -1201,10 +1398,19 @@ impl GpuVideoDevice {
             self.device
                 .CreateTexture2D(&desc, None, Some(&mut tex))
                 .map_err(|e| {
-                    GpuVideoError::TextureCreate(format!(
-                        "shared_output {w}x{h} format={format:?} bind=0x{bind_flags:X} \
-                         misc=0x{misc_flags:X}: {e:?}"
-                    ))
+                    // E_OUTOFMEMORY (0x8007000E) など pressure 系は ResourcePressure に振り分け
+                    // (Codex 助言 2026-05-15)。CreateTexture2D は adapter memory 枯渇で
+                    // E_OUTOFMEMORY を返すので、CPU fallback に逃がさず frame drop させる。
+                    if GpuVideoError::hresult_is_resource_pressure(&e) {
+                        GpuVideoError::ResourcePressure(format!(
+                            "CreateTexture2D shared_output {w}x{h} format={format:?}: {e:?}"
+                        ))
+                    } else {
+                        GpuVideoError::TextureCreate(format!(
+                            "shared_output {w}x{h} format={format:?} bind=0x{bind_flags:X} \
+                             misc=0x{misc_flags:X}: {e:?}"
+                        ))
+                    }
                 })?;
         }
         let tex = tex.ok_or_else(|| GpuVideoError::TextureCreate("null texture".into()))?;

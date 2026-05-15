@@ -657,14 +657,14 @@ impl NativeVideoOutput {
         })
     }
 
-    fn hwnd(&self) -> u64 {
+    pub(crate) fn hwnd(&self) -> u64 {
         self.hwnd.load(Ordering::Acquire)
     }
 
     /// HUD overlay HWND (= bars / interactive UI 用の独立 top-level)。
     /// CP4 以降で presenter thread が store する。store されていなければ 0。
     #[allow(dead_code)]
-    fn hud_hwnd(&self) -> u64 {
+    pub(crate) fn hud_hwnd(&self) -> u64 {
         self.hud_hwnd.load(Ordering::Acquire)
     }
 
@@ -672,7 +672,7 @@ impl NativeVideoOutput {
         self.first_presented.load(Ordering::Acquire)
     }
 
-    fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::Acquire)
     }
 
@@ -826,7 +826,7 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::RaiseHudToTop);
     }
 
-    fn request_presenter_raise(&self) {
+    pub(crate) fn request_presenter_raise(&self) {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::RaisePresenterToFront);
@@ -841,7 +841,7 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::SetNormalizeOverlayState { state });
     }
 
-    fn drain_events(&self) -> Vec<(u64, NativeVideoOutputEvent)> {
+    pub(crate) fn drain_events(&self) -> Vec<(u64, NativeVideoOutputEvent)> {
         let Ok(rx) = self.event_rx.lock() else {
             return Vec::new();
         };
@@ -1466,6 +1466,14 @@ fn run_native_video_output(
     // 前回検証で frame 114 の混入が止まることが確認された cap=4 を採用する (fence の
     // 真のゲート効果は変わらず、stall 時のフットプリントだけ旧来比へ戻す)。
     const NATIVE_PRESENT_RETIRE_CAP: usize = 4;
+    /// presenter 側 `source.queue` の最大長 (Codex 助言、2026-05-15)。旧コードは
+    /// `video_rx.try_recv()` を空になるまで drain して queue に積み込んでいたため、
+    /// 高負荷 / pool exhausted 時に queue が 23 まで肥大化 → present_retire / shared
+    /// pool / cache 合算で adapter memory が枯渇し wgpu OOM していた。queue を 8 で
+    /// cap し、超えたら decoder 側に back-pressure を返す (= video_tx (cap=8) が満杯に
+    /// なって decoder が `try_send` 失敗 → 古い frame を drop して新 frame に置換)。
+    /// 30fps で約 270ms 分 = pacing 上は十分。
+    const MAX_NATIVE_SOURCE_QUEUE: usize = 8;
     while !cancel.load(Ordering::Acquire) {
         // `FirstFrameReady` is what lets the engine leave Buffering after a seek.
         // The engine event channel can be temporarily full during seek bursts, so
@@ -1670,6 +1678,11 @@ fn run_native_video_output(
                             present_retire.pop_front();
                         }
                     }
+                    // 旧 source の `shared_texture_cache` (presenter 側 D3D11 共有 texture
+                    // キャッシュ、4K で 32 MB/枚) を即時破棄し adapter memory を解放する
+                    // (Codex 助言 2026-05-15、wgpu OOM 対策)。新 source は新 shared_handle で
+                    // 再キャッシュされる。
+                    presenter.clear_shared_texture_cache();
                     let show_preparing_overlay = payload.show_preparing_overlay;
                     source = PresenterSourceState::new(*payload);
                     first_presented_out.store(false, Ordering::Release);
@@ -2204,7 +2217,17 @@ fn run_native_video_output(
             source.pending_first_frame_event = None;
             source.last_present_source_pts = None;
         }
-        while let Ok(frame) = source.video_rx.try_recv() {
+        // `video_rx` を drain して `source.queue` に積む。Codex 助言 (2026-05-15) で、
+        // queue が `MAX_NATIVE_SOURCE_QUEUE` を超えた時点で drain を **停止**する。
+        // 旧コードは `video_rx` を空になるまで drain して queue を 23 frame まで
+        // 肥大化させ、shared pool + cache + retired_video_surfaces 合算で adapter memory
+        // を枯渇させ wgpu OOM を発生させていた。drain を止めると `video_tx` (cap=8) が
+        // 満杯になり、decoder 側で `try_send` 失敗 → 古い frame を drop または park
+        // することで自然な back-pressure が成立する。
+        while source.queue.len() < MAX_NATIVE_SOURCE_QUEUE {
+            let Ok(frame) = source.video_rx.try_recv() else {
+                break;
+            };
             if frame.seek_serial < clock_serial {
                 native_reset_unpresented_frame(frame);
                 continue;
@@ -3662,6 +3685,13 @@ impl VideoPlayer {
         self.clock.set_muted(m);
     }
 
+    /// 動画 decode thread が致命的なエラーで exit したかを返す。
+    /// `tick()` はこのフラグを `error` に転写し、native overlay の
+    /// 「準備中」を失敗表示へ切り替える (Codex P2 2026-05-15)。
+    pub fn decode_failed(&self) -> bool {
+        self.clock.decode_failed()
+    }
+
     /// 音量ノーマライズの線形ゲイン (1.0 = 素通し)。
     pub fn normalize_gain(&self) -> f64 {
         self.clock.normalize_gain()
@@ -4092,6 +4122,12 @@ impl VideoPlayer {
                     self.shutdown_workers_for_error();
                 }
             }
+        }
+
+        #[cfg(windows)]
+        if self.error.is_none() && self.clock.decode_failed() {
+            self.error = Some("動画のハードウェアデコードに失敗しました".to_string());
+            self.shutdown_workers_for_error();
         }
 
         if self.error.is_some() {

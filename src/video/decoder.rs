@@ -47,6 +47,15 @@ use super::clock::AvClock;
 /// 超えていれば新規 swap を抑制する。
 pub static LIVE_VIDEO_DECODE_THREADS: AtomicUsize = AtomicUsize::new(0);
 
+/// Native video open / fast-swap が同時に生かす video decode thread の上限。
+///
+/// 2026-05-15 の実機ログで、NVIDIA D3D11VA + shared texture + keyed mutex 経路は
+/// 旧 decoder と新 decoder が重なっただけでも `send_packet` / keyed mutex 待ちが
+/// 秒単位に伸び、最終的に DXGI device removed へ進むことを確認した。複数 HW decode
+/// 自体は一般に可能だが、mIV の fast-swap は decoder create/drop と presenter の
+/// shared-output 回収が密に重なるため、安定性優先で同時数を 1 に制限する。
+pub const MAX_LIVE_VIDEO_DECODE_THREADS: usize = 1;
+
 /// `run_video_decode` の入口で `new()`、関数 return / unwind 時に `drop()` で
 /// `LIVE_VIDEO_DECODE_THREADS` を ±1 する RAII guard。
 pub(crate) struct VideoDecodeAliveGuard;
@@ -92,6 +101,22 @@ impl Drop for VideoDecodeAliveGuard {
         }
     }
 }
+
+// 2026-05-15: 一時的に `wait_for_live_decoders_below` (UI thread で 5-10ms polling
+// sleep して live count が落ちるのを待つ helper) を導入したが、UI thread での同期
+// sleep は応答性を悪化させる (Codex 指摘 #1)。helper ごと撤去し、UI 経路は非ブロッキング
+// 判定 (`LIVE_VIDEO_DECODE_THREADS.load`) + perf event 計装に統一する。
+//
+// 「前 decoder の exit を待ってから新 decoder を spawn する」の効果は、UI thread で
+// 同期 wait せず、`App::update` の後続 tick で再判定する pending に寄せる。
+// 通常 open は `NativeVideoOpenPending`、動画→動画の fullscreen source-swap は
+// `NativeVideoSourceSwapPending` を使い、live decoder 数が上限以上の間は新 decoder を
+// 作らない。
+//   1. 旧 player を build の前に eager drop (source-swap pending では NativeVideoOutput
+//      だけ退避し、presenter HWND は表示したまま維持)
+//   2. D3D11VA SRWLOCK で context 直列化 (実装済、ハードスタックそのものは防げる)
+//   3. fast-swap は live >= max なら source-swap pending に積む
+//   4. 通常 open は live >= max なら `NativeVideoOpenPending` に積み、空くまで spawn しない
 
 const AUDIO_PACKET_QUEUE_CAP: usize = 64;
 const VIDEO_PACKET_QUEUE_CAP: usize = 32;
@@ -636,19 +661,34 @@ enum VideoDecodeInput {
     Packet(VideoPacketMsg),
 }
 
-fn recv_video_decode_input(
+/// `recv_video_decode_input_with_timeout` の timeout 版。指定時間内に何も来なければ
+/// `Some(None)` を返す。
+/// disconnect なら `None`、入力ありなら `Some(Some(input))`。
+///
+/// 2026-05-15 (Codex B 助言): first-frame watchdog で cancel チェックを定期的に行えるよう、
+/// recv を timeout 化する。timeout 経過後に呼出側 (`run_video_decode`) で経過時間を見て
+/// 一定時間 frame ゼロなら `set_decode_failed(true)` + thread exit する。
+fn recv_video_decode_input_with_timeout(
     video_ctl_rx: &Receiver<VideoControlMsg>,
     video_pkt_rx: &Receiver<VideoPacketMsg>,
-) -> Option<VideoDecodeInput> {
+    timeout: std::time::Duration,
+) -> Option<Option<VideoDecodeInput>> {
     match video_ctl_rx.try_recv() {
-        Ok(msg) => return Some(VideoDecodeInput::Control(msg)),
+        Ok(msg) => return Some(Some(VideoDecodeInput::Control(msg))),
         Err(TryRecvError::Empty) => {}
         Err(TryRecvError::Disconnected) => return None,
     }
 
     crossbeam_channel::select_biased! {
-        recv(video_ctl_rx) -> msg => msg.ok().map(VideoDecodeInput::Control),
-        recv(video_pkt_rx) -> msg => msg.ok().map(VideoDecodeInput::Packet),
+        recv(video_ctl_rx) -> msg => match msg {
+            Ok(m) => Some(Some(VideoDecodeInput::Control(m))),
+            Err(_) => None,
+        },
+        recv(video_pkt_rx) -> msg => match msg {
+            Ok(m) => Some(Some(VideoDecodeInput::Packet(m))),
+            Err(_) => None,
+        },
+        default(timeout) => Some(None),
     }
 }
 
@@ -763,41 +803,78 @@ fn pending_video_pts_span_ms(pending_video_packets: &VecDeque<QueuedVideoPacket>
     }
 }
 
+/// 直近の `drain_full_hit` perf event を emit した時刻 (= rate-limit 用)。
+///
+/// 2026-05-15 (Codex 助言): 旧コードは毎 drain 失敗で event を吐いていたため、
+/// 1 セッションで 417,515 件を観測。perf log 自体の I/O が UI を重くしていた。
+/// **200ms 以下の連続発火を抑制** する。状態変化 (= queue_state が変わる) は
+/// `queue_state` event で別途記録されるので、drain_full_hit は集計目的だけに
+/// 留めて構わない。
+static DRAIN_FULL_HIT_LAST_AT_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+const DRAIN_FULL_HIT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 fn emit_demux_drain_full_hit(
     pending_video_packets: &VecDeque<QueuedVideoPacket>,
     pending_video_packet_bytes: usize,
     video_pkt_tx_len: usize,
     seek_serial: u64,
 ) {
-    if crate::perf::is_enabled() {
-        crate::perf::event(
-            "demux",
-            "drain_full_hit",
-            None,
-            0,
-            &[
-                (
-                    "pending_video_packets",
-                    serde_json::Value::from(pending_video_packets.len() as i64),
-                ),
-                (
-                    "pending_video_bytes",
-                    serde_json::Value::from(pending_video_packet_bytes as i64),
-                ),
-                (
-                    "video_pkt_tx_len",
-                    serde_json::Value::from(video_pkt_tx_len as i64),
-                ),
-                (
-                    "pending_video_pts_span_ms",
-                    pending_video_pts_span_ms(pending_video_packets)
-                        .map(serde_json::Value::from)
-                        .unwrap_or(serde_json::Value::Null),
-                ),
-                ("seek_serial", serde_json::Value::from(seek_serial as i64)),
-            ],
-        );
+    if !crate::perf::is_enabled() {
+        return;
     }
+    // rate limit: 直前の emit から MIN_INTERVAL 経たないうちはスキップ。
+    // CAS で 1 thread だけ通す (= 過剰 emit を抑える)。Instant は cross-thread で
+    // 使いにくいので nanos の monotonic clock を AtomicU64 で持つ簡易実装。
+    let now_nanos = {
+        use std::sync::OnceLock;
+        static START: OnceLock<std::time::Instant> = OnceLock::new();
+        let start = START.get_or_init(std::time::Instant::now);
+        start.elapsed().as_nanos() as u64
+    };
+    let last = DRAIN_FULL_HIT_LAST_AT_NANOS.load(std::sync::atomic::Ordering::Acquire);
+    if now_nanos.saturating_sub(last) < DRAIN_FULL_HIT_MIN_INTERVAL.as_nanos() as u64 {
+        return;
+    }
+    // CAS で last を更新できなければ別 thread が先に出した → 自分はスキップ。
+    if DRAIN_FULL_HIT_LAST_AT_NANOS
+        .compare_exchange(
+            last,
+            now_nanos,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return;
+    }
+    crate::perf::event(
+        "demux",
+        "drain_full_hit",
+        None,
+        0,
+        &[
+            (
+                "pending_video_packets",
+                serde_json::Value::from(pending_video_packets.len() as i64),
+            ),
+            (
+                "pending_video_bytes",
+                serde_json::Value::from(pending_video_packet_bytes as i64),
+            ),
+            (
+                "video_pkt_tx_len",
+                serde_json::Value::from(video_pkt_tx_len as i64),
+            ),
+            (
+                "pending_video_pts_span_ms",
+                pending_video_pts_span_ms(pending_video_packets)
+                    .map(serde_json::Value::from)
+                    .unwrap_or(serde_json::Value::Null),
+            ),
+            ("seek_serial", serde_json::Value::from(seek_serial as i64)),
+        ],
+    );
 }
 
 fn emit_demux_queue_state(
@@ -1480,9 +1557,13 @@ pub fn spawn(
     // Phase 8.J: 8 → 24 に増やす。
     // - GPU 経路: 1 frame = HANDLE+メタのみ、メモリコスト無視
     // - CPU 経路: 1080p RGBA × 24 = 192MB (= 許容範囲)
-    // 30fps で 800ms 分 buffer できるので、Phase 8.G で残った micro-burst の
-    // 350-400ms stall + HDD random read 100-300ms スパイクの両方を吸収。
-    let (video_tx, video_rx) = bounded::<VideoFrame>(24);
+    // 2026-05-15 (Codex 助言): 旧 cap=24 → 8 に縮小。24 だと presenter 側
+    // `source.queue` (旧 cap なし) と合わせて最大 47 frame 分の `OUTPUT_RING_SIZE`
+    // slot を占有し、共有 pool (= 16) を超えて pool exhausted → CPU readback
+    // fallback → adapter memory 悪化 → wgpu OOM の連鎖を生んでいた。8 にすることで
+    // 30fps で約 270ms 分の buffer。micro-burst stall は保持 (= presenter 側 queue が
+    // 別途吸収する)、大きな stall は frame drop で潔く諦める方向に倒す。
+    let (video_tx, video_rx) = bounded::<VideoFrame>(8);
     let (audio_tx, audio_rx) = bounded::<AudioFrame>(32);
     let (info_tx, info_rx) = bounded::<Result<VideoInfo, String>>(1);
 
@@ -1815,8 +1896,8 @@ fn run_decoder(
     // (key に width/height を含めるのは、HW のサーフェス内部寸法と display 寸法が
     // 異なる場合や mid-stream で resolution change が起きた場合に
     // ScaleContext::run が `InputChanged` で全 frame skip に陥るのを防ぐため。)
-    // Phase B: scaler / scaler_key / first_frame_logged はすべて run_video_decode の
-    // ローカル変数として所有される (= デコーダ + GPU パスは別 thread)。
+    // Phase B: scaler / scaler_key / first_frame_event_logged はすべて
+    // run_video_decode のローカル変数として所有される (= デコーダ + GPU パスは別 thread)。
 
     // ── 音声ストリーム選択 (任意) ──
     let audio_setup = match input.streams().best(MediaType::Audio) {
@@ -2880,7 +2961,8 @@ fn run_video_decode(
             .deinterlace_status
             .store(DEINT_STATUS_INACTIVE, Ordering::Release);
     }
-    let mut first_frame_logged = false;
+    let mut first_frame_event_logged = false;
+    let mut first_frame_delivered = false;
     let mut current_seek_serial: u64 = 0;
     let mut drop_before_secs: Option<f64> = None;
     let mut post_seek_frame_sent: bool = true;
@@ -2894,160 +2976,146 @@ fn run_video_decode(
     let mut frame_step_decode: Option<FrameStepDecodeState> = None;
     let mut frame_step_selected_pending_clear = false;
     let mut frame_step_abort_discard_serial: Option<u64> = None;
+    // `send_packet` 連続失敗カウンタ (Codex 解析 2026-05-15)。
+    // HW decoder 初期化失敗で `get_hw_format` が AV_PIX_FMT_NONE を返した場合や、
+    // GPU resource pressure で D3D11 surface 取得が失敗した場合に `avcodec_send_packet`
+    // が AVERROR(ENOSYS) 等を返し続ける。旧コードは `continue` で全パケットを流していたため
+    // 1 動画につきエラーログが数千回 (実測 4158 回) 出て decode が永遠に進まなかった。
+    // 連続 N 回**致命**失敗で thread を exit させ、LIVE_VIDEO_DECODE_THREADS を減らして
+    // 上位の throttle 判定が正しく機能するようにする。1 個 decode 成功 (= receive_frame
+    // 1 枚以上) でリセット。**EAGAIN は致命ではない** (decoder 内部 buffer が満杯で
+    // 「先に receive_frame で drain しろ」の意味、Codex P1 2026-05-15) のでカウンタを
+    // 触らず、packet を `pending_resend_packet` に保持して次 iteration で再送する。
+    const MAX_CONSECUTIVE_SEND_PACKET_ERRORS: u32 = 5;
+    let mut consecutive_send_packet_errors: u32 = 0;
+    // pending packet には保存時の seek serial を attach する (Codex P1 2026-05-15)。
+    // 消費前に `clock.current_seek_serial()` および local `current_seek_serial` と
+    // 一致するか確認し、seek が進行中 (= live serial が先行) なら packet を破棄して
+    // 通常 recv 経路に戻る (= Flush を確実に処理する)。
+    let mut pending_resend_packet: Option<(u64, ffmpeg_the_third::Packet)> = None;
+
+    // First-frame watchdog (Codex B 助言 2026-05-15): 規定時間内に最初の frame が
+    // `video_tx` に届かない場合、decoder が hung していると判定して `set_decode_failed(true)`
+    // + thread exit する。これにより:
+    //   1. UI が「準備中」のまま無期限固着するのを防ぐ (上位で decode_failed を polling)
+    //   2. `LIVE_VIDEO_DECODE_THREADS` カウンタが解放され、後続の動画 open が通る
+    //   3. 旧 video_ctl_rx / video_pkt_rx が `select!` で永久 block しても回避可能
+    //      (= recv に timeout を入れた)
+    //
+    // ConsecPressureCounter は ResourcePressure 連続発生時の fail-fast 用 (Codex 4)。
+    const FIRST_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+    const MAX_CONSECUTIVE_RESOURCE_PRESSURE: u32 = 60;
+    let watchdog_start = std::time::Instant::now();
+    let mut consecutive_resource_pressure: u32 = 0;
 
     'outer: loop {
         if cancel.load(Ordering::Acquire) {
             break;
         }
-        let msg = match recv_video_decode_input(&video_ctl_rx, &video_pkt_rx) {
-            Some(m) => m,
-            None => break, // demux thread exited → channel disconnect
-        };
-        let packet = match msg {
-            VideoDecodeInput::Control(VideoControlMsg::Flush {
-                serial,
-                trim_before_secs,
-                frame_step,
-            }) => {
-                if stale_drop_burst_count > 0 {
-                    crate::logger::log(format!(
-                        "[video-decode] stale packet burst drained before flush: count={stale_drop_burst_count} next_serial={serial} live_serial={}",
-                        clock.current_seek_serial()
-                    ));
-                    stale_drop_burst_count = 0;
-                }
-                let prev_serial = current_seek_serial;
-                let engine_st = engine_state.load(Ordering::Acquire);
-                crate::logger::log(format!(
-                    "[video-decode] flush received: serial={serial} prev_serial={prev_serial} trim_before={trim_before_secs:?} frame_step={frame_step:?} pkt_rx_len={} video_tx_len={} engine_state={}",
-                    video_pkt_rx.len(),
-                    video_tx.len(),
-                    engine_state_code_name(engine_st)
-                ));
+        // EAGAIN で前回 send が拒否された packet があれば、新規 recv より優先して再送に
+        // 回す (Codex P1 2026-05-15)。ただし下記のいずれかなら破棄して recv 経路へ:
+        //   1. local `current_seek_serial` と pending serial が不一致 (本来起き得ない
+        //      だが defensive)
+        //   2. `clock.current_seek_serial()` が local より先行 = seek 要求が UI 側で
+        //      発火済 (request_seek で先 increment、Flush は demux 経由で遅れて到着)。
+        //      この場合 pending を保持したまま再送すると stale packet を flush 前の
+        //      decoder に注ぎ込み、seek 後に古いフレームが混ざるリスクがある。
+        // 通常 recv 経路に戻すと、ctl_rx に積まれた Flush が既存の match arm で
+        // 処理されて `current_seek_serial` が追い付く。
+        // First-frame watchdog (Codex B 2026-05-15): まだ first frame が video_tx に
+        // 届いていない場合、
+        // 経過時間が FIRST_FRAME_TIMEOUT を超えていたら decode_failed を立てて exit する。
+        // 旧 thread が `recv` で永久ブロックして `LIVE_VIDEO_DECODE_THREADS` を詰める症状の
+        // 対策 (= 実機 2026-05-15 で live_count=4 まで累積した固着の根本対策)。
+        if !first_frame_delivered && watchdog_start.elapsed() >= FIRST_FRAME_TIMEOUT {
+            crate::logger::log(format!(
+                "[video-decode] first-frame watchdog timeout after {:.1}s, exiting thread",
+                watchdog_start.elapsed().as_secs_f64()
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "video_decode",
+                    "first_frame_timeout",
+                    None,
+                    current_seek_serial,
+                    &[(
+                        "elapsed_secs",
+                        serde_json::Value::from(watchdog_start.elapsed().as_secs_f64()),
+                    )],
+                );
+            }
+            clock.set_decode_failed(true);
+            break 'outer;
+        }
+
+        let packet = if let Some((pending_serial, p)) = pending_resend_packet.take() {
+            let live_serial = clock.current_seek_serial();
+            if pending_serial != current_seek_serial || pending_serial != live_serial {
                 if crate::perf::is_enabled() {
                     crate::perf::event(
-                        "video",
-                        "flush_received",
+                        "video_decode",
+                        "pending_packet_dropped_for_seek",
                         None,
-                        0,
+                        current_seek_serial,
                         &[
-                            ("serial", serde_json::Value::from(serial as i64)),
-                            ("prev_serial", serde_json::Value::from(prev_serial as i64)),
                             (
-                                "trim_before",
-                                trim_before_secs
-                                    .map(serde_json::Value::from)
-                                    .unwrap_or(serde_json::Value::Null),
+                                "pending_serial",
+                                serde_json::Value::from(pending_serial as i64),
                             ),
-                            (
-                                "pkt_rx_len",
-                                serde_json::Value::from(video_pkt_rx.len() as i64),
-                            ),
-                            (
-                                "video_tx_len",
-                                serde_json::Value::from(video_tx.len() as i64),
-                            ),
-                            (
-                                "engine_state",
-                                serde_json::Value::from(engine_state_code_name(engine_st)),
-                            ),
+                            ("live_serial", serde_json::Value::from(live_serial as i64)),
                         ],
                     );
                 }
-                video_decoder.flush();
-                current_seek_serial = serial;
-                // bwdif keeps a tiny temporal window. Drop it on seek so the
-                // first post-seek frame cannot be compared with pre-seek data.
-                deinterlacer = None;
-                // seek 直後は次の bwdif 判定が走るまで状態が確定しない。Failed は
-                // 永続するので保持、それ以外は Pending に戻して UI の「待機中」
-                // 表示を一時的に避ける。
-                if !deinterlace_failure_logged && deinterlace.is_enabled() {
-                    dynamic
-                        .deinterlace_status
-                        .store(DEINT_STATUS_PENDING, Ordering::Release);
-                }
-                drop_before_secs = trim_before_secs;
-                frame_step_decode = frame_step.map(FrameStepDecodeState::new);
-                frame_step_selected_pending_clear = false;
-                frame_step_abort_discard_serial = None;
-                first_packet_logged_for_serial = None;
-                preroll_drop_count = 0;
-                preroll_reached_logged_for_serial = None;
-                pause_park_last_log = None;
-                post_seek_tx_full_last_log = None;
-                // trim_before / frame-step あり → target 到達 frame を post-seek 1 枚目として待つ。
-                post_seek_frame_sent = drop_before_secs.is_none() && frame_step_decode.is_none();
+                // pending は take() で既に破棄済。continue で recv 経路に流れて Flush を処理。
                 continue;
             }
-            VideoDecodeInput::Packet(VideoPacketMsg::Eof) => {
-                // 動画は EOF で内部 frame を失っても許容 (旧 run_decoder と同じ挙動)。
-                // 何もせず次の Packet/Flush/disconnect を待つ。
-                crate::logger::log(format!(
-                    "[video-decode] eof received: serial={current_seek_serial} pkt_rx_len={} video_tx_len={} engine_state={}",
-                    video_pkt_rx.len(),
-                    video_tx.len(),
-                    engine_state_code_name(engine_state.load(Ordering::Acquire))
-                ));
-                continue;
-            }
-            VideoDecodeInput::Packet(VideoPacketMsg::Packet { serial, packet }) => {
-                let live_seek_serial = clock.current_seek_serial();
-                if serial != current_seek_serial || serial != live_seek_serial {
-                    stale_drop_burst_count = stale_drop_burst_count.saturating_add(1);
-                    if crate::perf::is_enabled() {
-                        let reason = if serial != live_seek_serial {
-                            "live_seek_advanced"
-                        } else {
-                            "decoder_serial_mismatch"
-                        };
-                        crate::perf::event(
-                            "video",
-                            "stale_packet_drop",
-                            None,
-                            0,
-                            &[
-                                ("reason", serde_json::Value::from(reason)),
-                                ("packet_serial", serde_json::Value::from(serial as i64)),
-                                (
-                                    "decoder_serial",
-                                    serde_json::Value::from(current_seek_serial as i64),
-                                ),
-                                (
-                                    "live_serial",
-                                    serde_json::Value::from(live_seek_serial as i64),
-                                ),
-                            ],
-                        );
+            p
+        } else {
+            // recv は timeout 付きで呼ぶ。timeout で抜けた場合は watchdog + cancel チェックの
+            // ために 'outer の頭に戻る (= packet 待ちで永久ブロックさせない)。
+            let msg = match recv_video_decode_input_with_timeout(
+                &video_ctl_rx,
+                &video_pkt_rx,
+                RECV_TIMEOUT,
+            ) {
+                Some(Some(m)) => m,
+                Some(None) => continue, // timeout → watchdog 再評価
+                None => break,          // demux thread exited → channel disconnect
+            };
+            match msg {
+                VideoDecodeInput::Control(VideoControlMsg::Flush {
+                    serial,
+                    trim_before_secs,
+                    frame_step,
+                }) => {
+                    if stale_drop_burst_count > 0 {
+                        crate::logger::log(format!(
+                            "[video-decode] stale packet burst drained before flush: count={stale_drop_burst_count} next_serial={serial} live_serial={}",
+                            clock.current_seek_serial()
+                        ));
+                        stale_drop_burst_count = 0;
                     }
-                    continue;
-                }
-                if stale_drop_burst_count > 0 {
+                    let prev_serial = current_seek_serial;
+                    let engine_st = engine_state.load(Ordering::Acquire);
                     crate::logger::log(format!(
-                        "[video-decode] stale packet burst ended: count={stale_drop_burst_count} serial={serial} live_serial={live_seek_serial} pkt_rx_len={}",
-                        video_pkt_rx.len()
-                    ));
-                    stale_drop_burst_count = 0;
-                }
-                if first_packet_logged_for_serial != Some(serial) {
-                    let packet_pts = packet_timestamp(&packet)
-                        .map(|pts| (pts as f64) * video_tb_num / video_tb_den);
-                    crate::logger::log(format!(
-                        "[video-decode] first packet for serial={serial}: pts={packet_pts:?} pkt_rx_len={} video_tx_len={}",
+                        "[video-decode] flush received: serial={serial} prev_serial={prev_serial} trim_before={trim_before_secs:?} frame_step={frame_step:?} pkt_rx_len={} video_tx_len={} engine_state={}",
                         video_pkt_rx.len(),
-                        video_tx.len()
+                        video_tx.len(),
+                        engine_state_code_name(engine_st)
                     ));
                     if crate::perf::is_enabled() {
                         crate::perf::event(
                             "video",
-                            "first_packet_for_serial",
+                            "flush_received",
                             None,
                             0,
                             &[
                                 ("serial", serde_json::Value::from(serial as i64)),
+                                ("prev_serial", serde_json::Value::from(prev_serial as i64)),
                                 (
-                                    "packet_pts",
-                                    packet_pts
+                                    "trim_before",
+                                    trim_before_secs
                                         .map(serde_json::Value::from)
                                         .unwrap_or(serde_json::Value::Null),
                                 ),
@@ -3059,32 +3127,239 @@ fn run_video_decode(
                                     "video_tx_len",
                                     serde_json::Value::from(video_tx.len() as i64),
                                 ),
+                                (
+                                    "engine_state",
+                                    serde_json::Value::from(engine_state_code_name(engine_st)),
+                                ),
                             ],
                         );
                     }
-                    first_packet_logged_for_serial = Some(serial);
+                    video_decoder.flush();
+                    current_seek_serial = serial;
+                    // seek 後は古い serial の packet を再送しない。EAGAIN で保持していた
+                    // packet があれば破棄 (Codex P1 2026-05-15)。
+                    pending_resend_packet = None;
+                    consecutive_send_packet_errors = 0;
+                    // bwdif keeps a tiny temporal window. Drop it on seek so the
+                    // first post-seek frame cannot be compared with pre-seek data.
+                    deinterlacer = None;
+                    // seek 直後は次の bwdif 判定が走るまで状態が確定しない。Failed は
+                    // 永続するので保持、それ以外は Pending に戻して UI の「待機中」
+                    // 表示を一時的に避ける。
+                    if !deinterlace_failure_logged && deinterlace.is_enabled() {
+                        dynamic
+                            .deinterlace_status
+                            .store(DEINT_STATUS_PENDING, Ordering::Release);
+                    }
+                    drop_before_secs = trim_before_secs;
+                    frame_step_decode = frame_step.map(FrameStepDecodeState::new);
+                    frame_step_selected_pending_clear = false;
+                    frame_step_abort_discard_serial = None;
+                    first_packet_logged_for_serial = None;
+                    preroll_drop_count = 0;
+                    preroll_reached_logged_for_serial = None;
+                    pause_park_last_log = None;
+                    post_seek_tx_full_last_log = None;
+                    // trim_before / frame-step あり → target 到達 frame を post-seek 1 枚目として待つ。
+                    post_seek_frame_sent =
+                        drop_before_secs.is_none() && frame_step_decode.is_none();
+                    continue;
                 }
-                packet
+                VideoDecodeInput::Packet(VideoPacketMsg::Eof) => {
+                    // 動画は EOF で内部 frame を失っても許容 (旧 run_decoder と同じ挙動)。
+                    // 何もせず次の Packet/Flush/disconnect を待つ。
+                    crate::logger::log(format!(
+                        "[video-decode] eof received: serial={current_seek_serial} pkt_rx_len={} video_tx_len={} engine_state={}",
+                        video_pkt_rx.len(),
+                        video_tx.len(),
+                        engine_state_code_name(engine_state.load(Ordering::Acquire))
+                    ));
+                    continue;
+                }
+                VideoDecodeInput::Packet(VideoPacketMsg::Packet { serial, packet }) => {
+                    let live_seek_serial = clock.current_seek_serial();
+                    if serial != current_seek_serial || serial != live_seek_serial {
+                        stale_drop_burst_count = stale_drop_burst_count.saturating_add(1);
+                        if crate::perf::is_enabled() {
+                            let reason = if serial != live_seek_serial {
+                                "live_seek_advanced"
+                            } else {
+                                "decoder_serial_mismatch"
+                            };
+                            crate::perf::event(
+                                "video",
+                                "stale_packet_drop",
+                                None,
+                                0,
+                                &[
+                                    ("reason", serde_json::Value::from(reason)),
+                                    ("packet_serial", serde_json::Value::from(serial as i64)),
+                                    (
+                                        "decoder_serial",
+                                        serde_json::Value::from(current_seek_serial as i64),
+                                    ),
+                                    (
+                                        "live_serial",
+                                        serde_json::Value::from(live_seek_serial as i64),
+                                    ),
+                                ],
+                            );
+                        }
+                        continue;
+                    }
+                    if stale_drop_burst_count > 0 {
+                        crate::logger::log(format!(
+                            "[video-decode] stale packet burst ended: count={stale_drop_burst_count} serial={serial} live_serial={live_seek_serial} pkt_rx_len={}",
+                            video_pkt_rx.len()
+                        ));
+                        stale_drop_burst_count = 0;
+                    }
+                    if first_packet_logged_for_serial != Some(serial) {
+                        let packet_pts = packet_timestamp(&packet)
+                            .map(|pts| (pts as f64) * video_tb_num / video_tb_den);
+                        crate::logger::log(format!(
+                            "[video-decode] first packet for serial={serial}: pts={packet_pts:?} pkt_rx_len={} video_tx_len={}",
+                            video_pkt_rx.len(),
+                            video_tx.len()
+                        ));
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "video",
+                                "first_packet_for_serial",
+                                None,
+                                0,
+                                &[
+                                    ("serial", serde_json::Value::from(serial as i64)),
+                                    (
+                                        "packet_pts",
+                                        packet_pts
+                                            .map(serde_json::Value::from)
+                                            .unwrap_or(serde_json::Value::Null),
+                                    ),
+                                    (
+                                        "pkt_rx_len",
+                                        serde_json::Value::from(video_pkt_rx.len() as i64),
+                                    ),
+                                    (
+                                        "video_tx_len",
+                                        serde_json::Value::from(video_tx.len() as i64),
+                                    ),
+                                ],
+                            );
+                        }
+                        first_packet_logged_for_serial = Some(serial);
+                    }
+                    packet
+                }
             }
         };
 
         let send_t0 = std::time::Instant::now();
         if let Err(e) = video_decoder.send_packet(&packet) {
-            crate::logger::log(format!("video send_packet: {e}"));
-            continue;
+            // EAGAIN は致命ではない — decoder 内部の output buffer が満杯で
+            // 「先に receive_frame で drain しろ」の意味 (Codex P1 2026-05-15)。
+            // packet を `pending_resend_packet` に保持して、この iteration で
+            // receive_frame ループに進んで drain し、次 iteration の頭で再送する。
+            let is_eagain = matches!(
+                &e,
+                ffmpeg::Error::Other { errno } if *errno == EAGAIN_ERRNO
+            );
+            if is_eagain {
+                // serial を attach して保存。次 iteration の頭で seek mismatch check が
+                // 入り、stale な再送を防ぐ (Codex P1 2026-05-15)。
+                pending_resend_packet = Some((current_seek_serial, packet));
+                if crate::perf::is_enabled() {
+                    crate::perf::event(
+                        "video_decode",
+                        "send_packet_eagain",
+                        None,
+                        current_seek_serial,
+                        &[],
+                    );
+                }
+                // 致命系カウンタは触らない。受信ループに進む (drain) — `packet` を
+                // 使わないので borrow は終わっている。
+            } else {
+                // 致命系: ENOSYS / EINVAL / External 等。連続失敗で thread を exit。
+                consecutive_send_packet_errors += 1;
+                crate::logger::log(format!(
+                    "video send_packet: {e} (consecutive_errors={consecutive_send_packet_errors})"
+                ));
+                if consecutive_send_packet_errors >= MAX_CONSECUTIVE_SEND_PACKET_ERRORS {
+                    // HW decode 初期化が壊れている (例: D3D11 が候補に無く `get_hw_format`
+                    // が AV_PIX_FMT_NONE を返した、GPU resource pressure で内部 surface
+                    // 取得が連続失敗、等) と判断して decode thread を exit させる。
+                    // SW フォールバックはしない (ユーザーポリシー)。上位は frame が
+                    // 来ないので「準備中」のままになるが、`LIVE_VIDEO_DECODE_THREADS` の
+                    // カウンタが減るので throttle が正しく機能し、他動画への navigation は
+                    // 通る (= UI 全体は固まらない、Codex 解析 2026-05-15 反映)。
+                    // `AvClock::set_decode_failed(true)` で上位 UI に伝える (Codex P2)。
+                    crate::logger::log(format!(
+                        "[video-decode] send_packet exhausted: {consecutive_send_packet_errors} consecutive errors, exiting thread"
+                    ));
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "video_decode",
+                            "send_packet_exhausted",
+                            None,
+                            current_seek_serial,
+                            &[(
+                                "consecutive_errors",
+                                serde_json::Value::from(consecutive_send_packet_errors as i64),
+                            )],
+                        );
+                    }
+                    clock.set_decode_failed(true);
+                    break 'outer;
+                }
+                continue;
+            }
+        } else {
+            // packet 投入成功 → 致命系 counter リセット (EAGAIN は前段で別管理)。
+            consecutive_send_packet_errors = 0;
         }
+        // EAGAIN 経路または送信成功時は receive_frame ループに進む。
+        // 1 枚でも取れたら error カウンタは更にリセット (= 後段の receive ループ内で行う)。
         // `avcodec_send_packet` は HW decode 経路で D3D11 device context を内部使用する。
         // fast-swap 連射時に複数 decoder + presenter blit が同 context を並行使用すると
         // driver 内で hard-stuck する事象があった (D3D11VA context 直列化で対策済み)。
-        // 万一再発したときに「send_packet がどれだけ遅い/止まっているか」をログで
-        // 切り分けられるよう、異常に遅い send_packet を 1 行警告する (Codex 助言)。
+        // 万一再発したときに「send_packet がどれだけ遅い/止まっているか」を切り分け
+        // られるよう、20ms 超の send_packet は perf event で記録 (Codex 助言)。
+        // 健全な HW decode は通常 < 5ms なので、20ms 超は contention の兆候。
+        // 100ms 超は従来通り logger にも 1 行警告を残す (運用時の grep 用)。
         let send_packet_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
+        if send_packet_ms > 20.0 && crate::perf::is_enabled() {
+            crate::perf::event(
+                "video_decode",
+                "slow_send_packet",
+                None,
+                current_seek_serial,
+                &[
+                    ("ms", serde_json::Value::from(send_packet_ms)),
+                    (
+                        "pkt_rx_len",
+                        serde_json::Value::from(video_pkt_rx.len() as i64),
+                    ),
+                    (
+                        "video_tx_len",
+                        serde_json::Value::from(video_tx.len() as i64),
+                    ),
+                    (
+                        "live_decoders",
+                        serde_json::Value::from(
+                            LIVE_VIDEO_DECODE_THREADS.load(Ordering::Acquire) as i64
+                        ),
+                    ),
+                ],
+            );
+        }
         if send_packet_ms > 100.0 {
             crate::logger::log(format!(
                 "[video-decode] slow send_packet: {send_packet_ms:.1}ms serial={current_seek_serial} \
-                 pkt_rx_len={} video_tx_len={}",
+                 pkt_rx_len={} video_tx_len={} live_decoders={}",
                 video_pkt_rx.len(),
-                video_tx.len()
+                video_tx.len(),
+                LIVE_VIDEO_DECODE_THREADS.load(Ordering::Acquire),
             ));
         }
         let mut frame = Video::empty();
@@ -3092,6 +3367,10 @@ fn run_video_decode(
             if cancel.load(Ordering::Acquire) {
                 break 'outer;
             }
+            // receive_frame が成功 = decoder は前進している。連続エラーカウンタを
+            // リセットして transient な send_packet エラー (driver の一時的な
+            // resource pressure 等) を許容する (Codex 助言 2026-05-15)。
+            consecutive_send_packet_errors = 0;
             let decode_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
             let pts = match video_frame_timestamp(&frame) {
                 Some(pts) => pts,
@@ -3244,12 +3523,15 @@ fn run_video_decode(
                         video_sar_den,
                         pts_secs,
                         current_seek_serial,
-                        &mut first_frame_logged,
+                        &mut first_frame_event_logged,
                         hw_active_initially,
                         video_fps_num,
                         video_fps_den,
                     ) {
                         Ok(gpu_frame_out) => {
+                            // GPU blit 自体は成功したので、ResourcePressure の連続カウントは
+                            // ここで切る。video_tx が満杯で落ちる場合は別の back-pressure。
+                            consecutive_resource_pressure = 0;
                             // ── デコーダのペーシング (GPU 経路) ──
                             // (詳細コメントは旧 run_decoder GPU 経路コメント参照、
                             //  Phase 8.K の PACE_LEAD=0.30 / post_seek_frame_sent /
@@ -3512,6 +3794,7 @@ fn run_video_decode(
                                 Ok(()) => {
                                     last_enqueued_pts = pts_secs;
                                     post_seek_frame_sent = true;
+                                    first_frame_delivered = true;
                                 }
                                 Err(TrySendError::Full(mut frame_out)) => {
                                     dropped_full = true;
@@ -3580,6 +3863,68 @@ fn run_video_decode(
                             continue;
                         }
                         Err(e) => {
+                            // 2026-05-15 (Codex 助言): pool exhausted / E_OUTOFMEMORY 等の
+                            // `ResourcePressure` 系は CPU readback fallback **しない**。
+                            // CPU 経路は av_hwframe_transfer_data + swscale + GPU upload
+                            // を要求し、adapter memory をさらに食って OOM 連鎖を加速する。
+                            // pressure 中はフレームを潔く drop し、pacing は次フレームで回復させる。
+                            // 通常の GPU 失敗 (= 一過性のエラー) は従来通り CPU fallback。
+                            if e.is_resource_pressure() {
+                                consecutive_resource_pressure += 1;
+                                crate::logger::log(format!(
+                                    "GPU path failed (resource pressure, consec={consecutive_resource_pressure}), dropping frame: {e}"
+                                ));
+                                if crate::perf::is_enabled() {
+                                    crate::perf::event(
+                                        "video_decode",
+                                        "frame_dropped_resource_pressure",
+                                        None,
+                                        current_seek_serial,
+                                        &[
+                                            ("error", serde_json::Value::from(format!("{e}"))),
+                                            ("pts_secs", serde_json::Value::from(pts_secs)),
+                                            (
+                                                "consecutive",
+                                                serde_json::Value::from(
+                                                    consecutive_resource_pressure as i64,
+                                                ),
+                                            ),
+                                        ],
+                                    );
+                                }
+                                // Codex 4 助言 (2026-05-15): 連続 ResourcePressure 上限を
+                                // 超えたら decode_failed として exit。「first frame が
+                                // 出ないまま drop だけが続く」Buffering 固着の fail-fast。
+                                // 60 回 (≒ 30fps で 2 秒分、24fps で 2.5 秒分) を超えたら
+                                // pool が回復する見込みは低いと判定する。
+                                if consecutive_resource_pressure
+                                    >= MAX_CONSECUTIVE_RESOURCE_PRESSURE
+                                {
+                                    crate::logger::log(format!(
+                                        "[video-decode] resource pressure exhausted: {consecutive_resource_pressure} consecutive drops, exiting thread"
+                                    ));
+                                    if crate::perf::is_enabled() {
+                                        crate::perf::event(
+                                            "video_decode",
+                                            "resource_pressure_exhausted",
+                                            None,
+                                            current_seek_serial,
+                                            &[(
+                                                "consecutive",
+                                                serde_json::Value::from(
+                                                    consecutive_resource_pressure as i64,
+                                                ),
+                                            )],
+                                        );
+                                    }
+                                    clock.set_decode_failed(true);
+                                    break 'outer;
+                                }
+                                // この frame は捨てて次の packet 処理に進む
+                                continue;
+                            }
+                            // 一過性エラー: counter リセット (= pressure ではないので)
+                            consecutive_resource_pressure = 0;
                             crate::logger::log(format!(
                                 "GPU path failed, fallback to CPU readback: {e}"
                             ));
@@ -3727,7 +4072,7 @@ fn run_video_decode(
             let cur_w = frame_for_scaler.width();
             let cur_h = frame_for_scaler.height();
             let cur_key = (cur_fmt, cur_w, cur_h);
-            if !first_frame_logged {
+            if !first_frame_event_logged {
                 let actual_path = if matches!(frame.format(), Pixel::D3D11) {
                     "hw_d3d11va"
                 } else if hw_active_initially {
@@ -3757,7 +4102,7 @@ fn run_video_decode(
                         ],
                     );
                 }
-                first_frame_logged = true;
+                first_frame_event_logged = true;
             }
             if scaler.is_none() || scaler_key != Some(cur_key) {
                 // 2026-05-12 crash 解析: swscale_8.dll の sws_init_context (= 本呼出の内部)
@@ -4024,6 +4369,7 @@ fn run_video_decode(
             if !dropped_full && send_result.is_ok() {
                 last_enqueued_pts = pts_secs;
                 post_seek_frame_sent = true;
+                first_frame_delivered = true;
             }
             if dropped_full {
                 skipped_frame_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -5201,7 +5547,11 @@ fn preferred_video_decoders(
     candidates.push(VideoDecoderCandidate {
         choice: DecoderChoice::Default,
         reason: "default",
-        allow_sw_fallback: true,
+        // HW 要求時は SW フォールバックを禁止 (Codex P1 2026-05-15、ユーザーポリシー:
+        // 「アプリの都合で SW デコードに切り替えることはしない」)。HW 初期化や open に
+        // 失敗したら open エラー扱いにする。HW 非要求 (= 設定で HW disabled) なら
+        // 最初から SW しか試さないので SW 許可。
+        allow_sw_fallback: !hw_decode_requested,
     });
     candidates
 }
@@ -5518,8 +5868,21 @@ fn try_init_d3d11va_for_codec(
     }
 }
 
-/// `AVCodecContext.get_format` コールバック。D3D11 が候補にあれば選択、無ければ
-/// 先頭の SW フォーマットにフォールバックして libavcodec を SW デコードに退避させる。
+/// `AVCodecContext.get_format` コールバック。D3D11 のみ受け入れる。
+///
+/// **重要** (Codex 解析 2026-05-15): 旧実装は D3D11 が候補に無いとき「先頭候補」に
+/// fallback していたが、その先頭は `DXVA2_VLD` / `CUDA` / `VAAPI` / `VULKAN` のような
+/// **別の HW pixel format** のことがある。それを返すと FFmpeg は「対応する
+/// hw_device_ctx が無い HW format を選んだ」状態になり、以降の `avcodec_send_packet`
+/// が AVERROR(ENOSYS) (= "Function not implemented") を**無限に**返し続ける
+/// (実測: 1 再生で 4158 回ログ)。これは hard-stuck と見分けが付かず、UI が固まる原因。
+///
+/// 本実装は D3D11 が無ければ `AV_PIX_FMT_NONE` を返して FFmpeg に decode 失敗を
+/// 伝える。上位の `send_packet` 連続失敗ハンドラが decode thread を exit させる。
+/// SW フォールバックは行わない (ユーザーポリシー: シーク体感が大きく劣化するため
+/// アプリ判断での SW 切替は禁止)。HW decode 不可なコーデックは open 時点で
+/// `hw_device_ctx` を attach しない path に分岐済みなので、このコールバックが
+/// 呼ばれている時点で HW 専用設計。
 unsafe extern "C" fn get_hw_format(
     _ctx: *mut ffmpeg_the_third::ffi::AVCodecContext,
     fmt_list: *const ffmpeg_the_third::ffi::AVPixelFormat,
@@ -5530,23 +5893,21 @@ unsafe extern "C" fn get_hw_format(
     }
     unsafe {
         let mut p = fmt_list;
-        let mut first = AVPixelFormat::AV_PIX_FMT_NONE;
-        let mut idx = 0;
         while *p != AVPixelFormat::AV_PIX_FMT_NONE {
-            if idx == 0 {
-                first = *p;
-            }
             if *p == AVPixelFormat::AV_PIX_FMT_D3D11 {
                 return AVPixelFormat::AV_PIX_FMT_D3D11;
             }
             p = p.add(1);
-            idx += 1;
         }
-        crate::logger::log(format!(
-            "HW: get_format: D3D11 not in candidate list, falling back to {first:?}"
-        ));
-        first
     }
+    crate::logger::log(
+        "HW: get_format: D3D11 not in candidate list; refusing HW decode (no SW fallback per policy)"
+            .to_string(),
+    );
+    if crate::perf::is_enabled() {
+        crate::perf::event("video_decode", "hw_format_refused", None, 0, &[]);
+    }
+    AVPixelFormat::AV_PIX_FMT_NONE
 }
 
 fn clamp_dims(w: u32, h: u32, max_dim: u32) -> (u32, u32) {
@@ -5621,7 +5982,7 @@ fn try_gpu_blit_path(
     sar_den: u32,
     pts_secs: f64,
     current_seek_serial: u64,
-    first_frame_logged: &mut bool,
+    first_frame_event_logged: &mut bool,
     hw_active_initially: bool,
     fps_num: u32,
     fps_den: u32,
@@ -5716,7 +6077,7 @@ fn try_gpu_blit_path(
     let fence_gen = gpu_dev.fence_gen();
 
     // perf: 初回フレームは GPU 経路を明示
-    if !*first_frame_logged && crate::perf::is_enabled() {
+    if !*first_frame_event_logged && crate::perf::is_enabled() {
         crate::perf::event(
             "video",
             "first_frame",
@@ -5736,7 +6097,7 @@ fn try_gpu_blit_path(
                 ("hw_active", serde_json::Value::from(hw_active_initially)),
             ],
         );
-        *first_frame_logged = true;
+        *first_frame_event_logged = true;
     }
 
     let d3d11_frame = crate::video::gpu_renderer::D3d11Frame {
@@ -5776,7 +6137,7 @@ mod decoder_candidate_tests {
         FrameStepDecodeSpec, FrameStepDecodeState, FrameStepSelection, VideoControlMsg,
         VideoDecodeInput, VideoPacketMsg, bwdif_filter_key, bwdif_force_all_frames,
         field_order_is_interlaced, normalize_audio_input_layout, normalize_sar,
-        preferred_video_decoders, recv_audio_decode_input, recv_video_decode_input,
+        preferred_video_decoders, recv_audio_decode_input, recv_video_decode_input_with_timeout,
         selected_video_rate, should_bypass_pause_park_for_post_seek_first_frame,
         should_try_deinterlace,
     };
@@ -5895,7 +6256,14 @@ mod decoder_candidate_tests {
             })
             .unwrap();
 
-        match recv_video_decode_input(&ctl_rx, &pkt_rx).unwrap() {
+        match recv_video_decode_input_with_timeout(
+            &ctl_rx,
+            &pkt_rx,
+            std::time::Duration::from_millis(100),
+        )
+        .unwrap()
+        .unwrap()
+        {
             VideoDecodeInput::Control(VideoControlMsg::Flush { serial, .. }) => {
                 assert_eq!(serial, 7);
             }
@@ -5970,7 +6338,20 @@ mod decoder_candidate_tests {
             let candidates = preferred_video_decoders(id, true);
             assert_eq!(candidates.len(), 1, "{id:?}");
             assert_eq!(candidates[0].choice, DecoderChoice::Default);
-            assert!(candidates[0].allow_sw_fallback);
+            // HW 要求時は SW fallback 禁止 (Codex P1 2026-05-15)。
+            assert!(!candidates[0].allow_sw_fallback, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn h264_hevc_allow_sw_fallback_when_hw_not_requested() {
+        for id in [Id::H264, Id::HEVC] {
+            let candidates = preferred_video_decoders(id, false);
+            assert_eq!(candidates.len(), 1, "{id:?}");
+            assert_eq!(candidates[0].choice, DecoderChoice::Default);
+            // HW 非要求 (= 設定で HW OFF) なら SW のみ。fallback 自体は使わないが、
+            // 候補単体に SW で開く許可は与える。
+            assert!(candidates[0].allow_sw_fallback, "{id:?}");
         }
     }
 
@@ -6001,7 +6382,8 @@ mod decoder_candidate_tests {
         assert_eq!(candidates[0].choice, DecoderChoice::ByName("av1"));
         assert!(!candidates[0].allow_sw_fallback);
         assert_eq!(candidates[1].choice, DecoderChoice::Default);
-        assert!(candidates[1].allow_sw_fallback);
+        // HW 要求時は default candidate でも SW fallback 禁止 (Codex P1 2026-05-15)。
+        assert!(!candidates[1].allow_sw_fallback);
     }
 
     #[test]
@@ -6015,6 +6397,15 @@ mod decoder_candidate_tests {
     #[test]
     fn vp9_uses_default_only_even_with_hw() {
         let candidates = preferred_video_decoders(Id::VP9, true);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].choice, DecoderChoice::Default);
+        // HW 要求時は SW fallback 禁止 (Codex P1 2026-05-15)。
+        assert!(!candidates[0].allow_sw_fallback);
+    }
+
+    #[test]
+    fn vp9_without_hw_uses_default_only_with_sw_allowed() {
+        let candidates = preferred_video_decoders(Id::VP9, false);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].choice, DecoderChoice::Default);
         assert!(candidates[0].allow_sw_fallback);

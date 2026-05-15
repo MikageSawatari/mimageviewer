@@ -26,16 +26,35 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11DeviceContext, ID3D11VideoContext, ID3D11VideoDevice,
 };
 use windows::Win32::System::Threading::{
-    AcquireSRWLockExclusive, ReleaseSRWLockExclusive, SRWLOCK,
+    AcquireSRWLockExclusive, ReleaseSRWLockExclusive, SRWLOCK, TryAcquireSRWLockExclusive,
 };
 use windows::core::Interface;
 
 use super::d3d11_device::{GpuVideoDevice, GpuVideoError};
 
+/// D3D11VA lock/unlock callback の呼出回数 (= API レベル直列化が機能している証拠の
+/// 取得用、2026-05-15 追加)。perf log に詳細イベントを出すと頻度が高すぎるので、
+/// **contention が観測されたときだけ** perf event を出す (= `TryAcquire` 失敗時)。
+/// 集計値は perf log でなく `state` イベントで定期的に dump する用途を想定。
+///
+/// `lock_calls`: FFmpeg からの lock callback 呼出総数 (uncontended 含む)
+/// `lock_contended`: 上記のうち `TryAcquire` が即時取得に失敗した回数
+/// `lock_total_wait_ns`: 競合時の cumulative wait time (nanoseconds)
+pub static D3D11VA_LOCK_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static D3D11VA_LOCK_CONTENDED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static D3D11VA_LOCK_TOTAL_WAIT_NS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// FFmpeg D3D11VA の `lock` callback。`lock_ctx` は `GpuVideoDevice::d3d_lock_ptr()`
 /// (= `*mut SRWLOCK`)。FFmpeg は内部で `ID3D11DeviceContext` / `ID3D11VideoContext` を
 /// 触る前にこれを、触り終えたら `unlock` を呼ぶ。`blit_nv12_to_rgba` 側も同じ SRWLOCK を
 /// 握るので、FFmpeg decode と blit の context 操作が直列化される。
+///
+/// **検証用計装** (2026-05-15): まず `TryAcquireSRWLockExclusive` で即時取得を試み、
+/// 失敗したら本当に競合した時間を計測する。健全な状態 (= 直列化が機能している)
+/// では `lock_contended` は限りなく 0 に近いはず。stuck 調査時は perf log の
+/// `d3d11va_lock_contended` イベントの頻度と wait time を見る。
 ///
 /// SAFETY: `lock_ctx` は `GpuVideoDevice::d3d_lock` (= `SRWLOCK`) の生ポインタ。
 /// `GpuVideoDevice` は本 hw_device_ctx より長生きする (`Arc`、アプリ全体で 1 個)。
@@ -43,7 +62,52 @@ unsafe extern "C" fn d3d11va_lock(lock_ctx: *mut c_void) {
     if lock_ctx.is_null() {
         return;
     }
+    D3D11VA_LOCK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // 高頻度 callback なので perf overhead を避けるため、まず `TryAcquire` で即時
+    // 取得を試みる。`TryAcquireSRWLockExclusive` は競合時に即 FALSE で返る
+    // (= block しない)。FALSE 時のみ実 wait を計測して perf log に出す。
+    let acquired = unsafe { TryAcquireSRWLockExclusive(lock_ctx as *mut SRWLOCK) };
+    if acquired {
+        return;
+    }
+    D3D11VA_LOCK_CONTENDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let t0 = std::time::Instant::now();
     unsafe { AcquireSRWLockExclusive(lock_ctx as *mut SRWLOCK) };
+    let wait_ns = t0.elapsed().as_nanos() as u64;
+    D3D11VA_LOCK_TOTAL_WAIT_NS.fetch_add(wait_ns, std::sync::atomic::Ordering::Relaxed);
+    // 5ms 超の競合のみ perf event に上げる (= 短い競合は集計値で十分)。
+    let wait_ms = (wait_ns as f64) / 1_000_000.0;
+    if wait_ms > 5.0 && crate::perf::is_enabled() {
+        crate::perf::event(
+            "video_decode",
+            "d3d11va_lock_contended",
+            None,
+            0,
+            &[
+                ("wait_ms", serde_json::Value::from(wait_ms)),
+                (
+                    "lock_calls_total",
+                    serde_json::Value::from(
+                        D3D11VA_LOCK_CALLS.load(std::sync::atomic::Ordering::Relaxed) as i64,
+                    ),
+                ),
+                (
+                    "lock_contended_total",
+                    serde_json::Value::from(
+                        D3D11VA_LOCK_CONTENDED.load(std::sync::atomic::Ordering::Relaxed) as i64,
+                    ),
+                ),
+                (
+                    "live_decoders",
+                    serde_json::Value::from(
+                        crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            as i64,
+                    ),
+                ),
+            ],
+        );
+    }
 }
 
 /// FFmpeg D3D11VA の `unlock` callback。`d3d11va_lock` の対。

@@ -59,18 +59,28 @@ impl App {
     /// 確認していること (= `state.is_video` 分岐内から呼ぶ)。
     #[cfg(windows)]
     pub(crate) fn toggle_video_tile_mode(&mut self, fs_idx: usize, screen_size: egui::Vec2) {
-        if self.video_tile_state.is_some() {
+        if self.video_tile_mode_active {
             self.close_video_tile_mode();
             return;
         }
+        self.video_tile_mode_active = true;
         self.video_tile_state = self.build_video_tile_state_for(fs_idx, screen_size);
+        crate::logger::log(format!(
+            "[video-tile] mode open: fs_idx={fs_idx} state_ready={}",
+            self.video_tile_state.is_some()
+        ));
     }
 
     #[cfg(windows)]
     pub(crate) fn close_video_tile_mode(&mut self) -> bool {
-        let was_open = self.video_tile_state.is_some()
+        let was_open = self.video_tile_mode_active
+            || self.video_tile_state.is_some()
             || self.video_tile_swap_pending.is_some()
             || self.video_tile_reopen_pending;
+        if was_open {
+            crate::logger::log("[video-tile] mode close".to_string());
+        }
+        self.video_tile_mode_active = false;
         self.video_tile_state = None;
         self.video_tile_swap_pending = None;
         self.video_tile_reopen_pending = false;

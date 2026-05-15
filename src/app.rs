@@ -1878,6 +1878,8 @@ pub struct App {
     /// S キーでトグルされる動画タイルモード状態。再生中に間隔別にサムネを並べて
     /// クリックでシーク。VideoPlayer 切替で自動破棄 (Drop で worker 終了)。
     #[cfg(windows)]
+    pub(crate) video_tile_mode_active: bool,
+    #[cfg(windows)]
     pub(crate) video_tile_state: Option<crate::ui_video_tile::VideoTileState>,
     #[cfg(windows)]
     pub(crate) video_tile_reopen_pending: bool,
@@ -1887,6 +1889,10 @@ pub struct App {
     pub(crate) video_tile_swap_pending: Option<VideoTileSwapPending>,
     #[cfg(windows)]
     pub(crate) native_video_fast_swap_pending: Option<NativeVideoFastSwapPending>,
+    #[cfg(windows)]
+    pub(crate) native_video_open_pending: Option<native_video::NativeVideoOpenPending>,
+    #[cfg(windows)]
+    pub(crate) native_video_source_swap_pending: Option<native_video::NativeVideoSourceSwapPending>,
     #[cfg(windows)]
     pub(crate) native_video_source_epoch_next: u64,
     /// タイルモードのサムネ WebP 永続キャッシュ (Phase 6.D-2、Phase 8.C で絶対 PTS 化)。
@@ -2912,6 +2918,8 @@ impl App {
             folder_pin_map: std::collections::HashMap::new(),
             folder_thumb_pin_dirty: false,
             #[cfg(windows)]
+            video_tile_mode_active: false,
+            #[cfg(windows)]
             video_tile_state: None,
             #[cfg(windows)]
             video_tile_reopen_pending: false,
@@ -2921,6 +2929,10 @@ impl App {
             video_tile_swap_pending: None,
             #[cfg(windows)]
             native_video_fast_swap_pending: None,
+            #[cfg(windows)]
+            native_video_open_pending: None,
+            #[cfg(windows)]
+            native_video_source_swap_pending: None,
             #[cfg(windows)]
             native_video_source_epoch_next: 1,
             video_tile_cache,
@@ -9275,11 +9287,13 @@ impl App {
             #[cfg(windows)]
             if restore_video_tile {
                 if target_is_video {
+                    self.video_tile_mode_active = true;
                     self.video_tile_reopen_pending = true;
                     self.video_tile_reopen_deadline =
                         Some(std::time::Instant::now() + std::time::Duration::from_secs(3));
                     ctx.request_repaint();
                 } else {
+                    self.video_tile_mode_active = false;
                     self.video_tile_reopen_pending = false;
                     self.video_tile_reopen_deadline = None;
                 }
@@ -9351,7 +9365,7 @@ impl App {
                     let delta: isize = if result.forward { 1 } else { -1 };
                     if fullscreen {
                         #[cfg(windows)]
-                        let restore_video_tile = self.video_tile_state.is_some();
+                        let restore_video_tile = self.video_tile_mode_active;
                         #[cfg(not(windows))]
                         let restore_video_tile = false;
                         if let Some(next_path) = self.favsearch_sibling_path(delta) {
@@ -9446,7 +9460,7 @@ impl App {
             }
             FolderNavMode::Fullscreen => {
                 #[cfg(windows)]
-                let restore_video_tile = self.video_tile_state.is_some();
+                let restore_video_tile = self.video_tile_mode_active;
                 #[cfg(not(windows))]
                 let restore_video_tile = false;
                 // fs_cache / ai_upscale_cache は item index がキーで、
@@ -9489,7 +9503,7 @@ impl App {
                     }
                     // サブツリー内 — 通常の DFS 移動としてスタックに push
                     #[cfg(windows)]
-                    let restore_video_tile = fullscreen && self.video_tile_state.is_some();
+                    let restore_video_tile = fullscreen && self.video_tile_mode_active;
                     #[cfg(not(windows))]
                     let restore_video_tile = false;
                     self.favsearch.nav_stack.push(path.clone());
@@ -9513,7 +9527,7 @@ impl App {
                     // サブツリー外へ出ようとしている → 検索結果の前後へ移動
                     if fullscreen {
                         #[cfg(windows)]
-                        let restore_video_tile = self.video_tile_state.is_some();
+                        let restore_video_tile = self.video_tile_mode_active;
                         #[cfg(not(windows))]
                         let restore_video_tile = false;
                         if let Some(next_path) = self.favsearch_sibling_path(delta) {
@@ -9849,7 +9863,15 @@ impl App {
             matches!(self.items.get(idx), Some(GridItem::Video(_)));
         #[cfg(windows)]
         if entering_native_video_fullscreen {
-            self.sync_native_video_main_cloak(true);
+            // Video-to-video source swaps keep the native presenter HWND alive.
+            // Re-cloaking the main HWND for those swaps creates an unnecessary
+            // DWM state transition on every wheel tick and can leak as a
+            // physical-screen-only flicker even though OBS/window capture misses it.
+            if self.native_video_presenter_hwnd().is_none() {
+                self.sync_native_video_main_cloak(true);
+            } else {
+                self.sync_native_video_main_cloak(false);
+            }
         } else {
             self.sync_native_video_main_cloak(false);
         }
@@ -11467,6 +11489,37 @@ impl App {
         autoplay_override: Option<bool>,
         #[cfg(windows)] native_output_config: Option<crate::video::NativeVideoOutputConfig>,
     ) -> crate::video::VideoPlayer {
+        // 通常 open の spawn 制限は呼び出し側 (`start_fs_load` →
+        // `defer_native_video_open_if_decoder_busy`) で行う。ここに到達した時点では
+        // live decoder 数が上限未満か、HW decode 無効の経路。ここでは診断用に
+        // open 開始時点の live 数を記録するだけにする。
+        let live_before = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
+            .load(std::sync::atomic::Ordering::Acquire);
+        let regular_open_pressure_threshold = crate::video::decoder::MAX_LIVE_VIDEO_DECODE_THREADS;
+        if live_before >= regular_open_pressure_threshold {
+            crate::logger::log(format!(
+                "[native-video] regular open with live_video_decode_threads={live_before} >= {regular_open_pressure_threshold}: pending gate should normally defer this open"
+            ));
+        }
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "native_video",
+                "regular_open_begin",
+                None,
+                0,
+                &[
+                    (
+                        "live_video_decode_threads",
+                        serde_json::Value::from(live_before as i64),
+                    ),
+                    (
+                        "pressure_suspected",
+                        serde_json::Value::from(live_before >= regular_open_pressure_threshold),
+                    ),
+                ],
+            );
+        }
+
         let vol = crate::settings::clamp_video_volume(self.settings.video_volume);
         let autoplay = autoplay_override.unwrap_or_else(|| {
             video_autoplay_for_open(
@@ -11538,10 +11591,14 @@ impl App {
             if !self.fs_cache.contains_key(&idx) {
                 let from_grid = std::mem::take(&mut self.fs_open_intent_from_grid);
                 #[cfg(windows)]
+                if self.defer_native_video_open_if_decoder_busy(idx, &vp, from_grid) {
+                    return;
+                }
+                #[cfg(windows)]
                 let native_config = native_video_presenter_config(
                     self.main_hwnd,
                     self.video_perf_overlay_visible,
-                    self.video_tile_reopen_pending,
+                    self.video_tile_mode_active || self.video_tile_reopen_pending,
                     self.settings.vst3_enabled,
                     self.checked.contains(&idx),
                     // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
@@ -12307,10 +12364,13 @@ impl App {
         #[cfg(windows)]
         {
             self.video_tile_state = None;
+            self.video_tile_mode_active = false;
             self.video_tile_reopen_pending = false;
             self.video_tile_reopen_deadline = None;
             self.video_tile_swap_pending = None;
             self.native_video_fast_swap_pending = None;
+            self.native_video_open_pending = None;
+            self.native_video_source_swap_pending = None;
         }
         self.reset_erase_mode();
         self.erase_base_cache.clear();
@@ -12320,7 +12380,40 @@ impl App {
         }
         self.fs_pending.clear();
         self.fs_early_dims.clear();
+        // 2026-05-15: fs_cache.clear() は内部で `Drop for VideoPlayer` → `Drop for
+        // NativeVideoOutput` → `Drop for AudioOutput` の連鎖を起こし、各 Drop で
+        // worker thread の join (cancel + 待ち) が走る。back-pressure deadlock や
+        // GPU stuck 状態だと UI thread が無期限ブロックする可能性があるので、
+        // 所要時間を perf event に記録して "応答なし" の発生位置を切り分け可能にする
+        // (Codex 助言 #3)。エントリ数も合わせて記録。
+        let fc_drop_t0 = std::time::Instant::now();
+        let fc_drop_count = self.fs_cache.len();
         self.fs_cache.clear();
+        let fc_drop_ms = fc_drop_t0.elapsed().as_secs_f64() * 1000.0;
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "nav",
+                "close_fullscreen_fs_cache_clear",
+                None,
+                cf_seq,
+                &[
+                    ("ms", serde_json::Value::from(fc_drop_ms)),
+                    ("entries", serde_json::Value::from(fc_drop_count as i64)),
+                    (
+                        "live_decoders",
+                        serde_json::Value::from(
+                            crate::video::decoder::LIVE_VIDEO_DECODE_THREADS.load(Ordering::Acquire)
+                                as i64,
+                        ),
+                    ),
+                ],
+            );
+        }
+        if fc_drop_ms > 50.0 {
+            crate::logger::log(format!(
+                "[close-fullscreen] fs_cache.clear took {fc_drop_ms:.1}ms entries={fc_drop_count}"
+            ));
+        }
         // backlog はフォルダ外の画像 ColorImage を保持しているため、閉じたら破棄する。
         // 保持していると次フォルダで同 idx に違う画像が割当たって表示が化ける。
         self.fs_upload_backlog.clear();
@@ -14475,6 +14568,10 @@ impl App {
         if self.fullscreen_idx.is_some() && self.settings.vst3_enabled {
             self.vst3_pump_gui_signals();
         }
+        #[cfg(windows)]
+        self.poll_native_video_source_swap_pending(ctx);
+        #[cfg(windows)]
+        self.poll_native_video_open_pending(ctx);
         #[cfg(windows)]
         if let Some(fs_idx) = self.fullscreen_idx {
             self.poll_native_video_fast_swap(ctx);

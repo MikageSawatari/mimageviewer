@@ -51,7 +51,14 @@ use self::overlay_draw::*;
 
 pub mod hud_window;
 
-const SHARED_TEXTURE_CACHE_CAPACITY: usize = 64;
+/// `shared_texture_cache` (presenter 側 `OpenSharedResource1` キャッシュ) の上限。
+///
+/// 2026-05-15 (Codex 助言): 旧 64 → 8 に縮小、SwitchSource ハンドラで `.clear()` も
+/// 追加。cap=64 は `OpenSharedResource1` の再呼び出しを減らすためだが、各エントリは
+/// D3D11 共有 texture を保持して adapter memory を圧迫していた (4K で 32 MB/枚)。
+/// 単一動画の通常再生では 1-3 個の slot が周回するのみで cap=8 で十分。動画切替
+/// (SwitchSource) ごとに clear して旧動画分のキャッシュを残さない。
+const SHARED_TEXTURE_CACHE_CAPACITY: usize = 8;
 
 /// パネル / HUD が全て隠れた状態でこの秒数経過したらマウスカーソルを非表示にする。
 /// `ui_fullscreen` (eframe) と `native_presenter` (D3D11 + 別 egui_ctx) で共有する。
@@ -230,7 +237,14 @@ impl Drop for RetiredVideoSurface {
 
 /// 旧 video swap chain を保持する世代数。`SetContent` 切替後、DComp/DWM が旧 content を
 /// 参照しなくなるまでの猶予 + presenter の非同期 GPU コピー完了の猶予を兼ねる。
-const RETIRED_VIDEO_SURFACE_DEPTH: usize = 3;
+///
+/// 2026-05-15 (Codex 助言): 旧 3 → 1 に縮小。swap chain は `BufferCount=3` なので
+/// 4K で 1 個約 95 MB。depth=3 だと active + retired 4 個で 4K 単独 ~380 MB の
+/// adapter memory を占有していた。fast-swap で前動画分も加わると数 GB 級になり
+/// `wgpu Out of Memory` panic に直結。depth=1 でも次フレームまで旧 surface は
+/// 保持されるので「片チャンネル切替の瞬間に旧 surface が GPU 上に必要」要件を
+/// 満たす (`SetContent` の Commit が DComp に届くまで 1 frame 程度のラグ)。
+const RETIRED_VIDEO_SURFACE_DEPTH: usize = 1;
 
 struct NativeBlackBackground {
     swap_chain: IDXGISwapChain1,
@@ -1627,7 +1641,7 @@ impl NativeVideoPresenter {
                 .map_err(|e| format!("IDCompositionDevice::Commit (surface swap): {e:?}"))?;
         }
 
-        // 5. Commit が composition engine に処理され切るまで待つ (DwmFlush は使わない)。
+        // 5. Commit が DWM の compositor tick まで反映され切るまで待つ。
         let commit_sync_ms = self.wait_for_video_transform_commit();
 
         // 6. Commit 成功。ここで初めて `self.*` を新 surface へ確定する (一括更新)。
@@ -1950,6 +1964,30 @@ impl NativeVideoPresenter {
         self.copy_fence
             .as_ref()
             .map(|fence| unsafe { fence.GetCompletedValue() })
+    }
+
+    /// `shared_texture_cache` を全エントリ破棄する。各 entry は D3D11 `OpenSharedResource1`
+    /// で開いた共有 texture を保持しており、4K で約 32 MB / 1080p で 8 MB を adapter
+    /// memory に占有する。動画切替 (`SwitchSource`) 時は前動画の texture を残しても
+    /// 二度と参照されないので即時破棄する (Codex 助言、2026-05-15)。残ったエントリは
+    /// 次の `open_shared_texture` 呼出で再生成される (1-2ms オーバーヘッド、許容範囲)。
+    pub fn clear_shared_texture_cache(&mut self) {
+        let cleared = self.shared_texture_cache.len();
+        self.shared_texture_cache.clear();
+        if cleared > 0 {
+            crate::logger::log(format!(
+                "[native-presenter] shared_texture_cache cleared on source switch (entries={cleared})"
+            ));
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "native_presenter",
+                    "shared_texture_cache_cleared",
+                    None,
+                    0,
+                    &[("entries", serde_json::Value::from(cleared as i64))],
+                );
+            }
+        }
     }
 
     /// HUD overlay HWND の生 u64 値。HUD HWND が生成されていなければ 0。
@@ -2655,13 +2693,15 @@ impl NativeVideoPresenter {
     /// 旧 swap chain を `retired_video_surfaces` へ移して以降の present に進む時点で、
     /// DComp は確実に新 swap chain を指している。
     ///
-    /// `DwmFlush` は意図的に呼ばない: 原子的差し替えでは中間状態が無いので refresh を
-    /// 強制する必要がなく、`DwmFlush` はむしろ余計な 1 refresh ぶんの待ちを足すだけ。
+    /// `WaitForCommitCompletion` だけでは、実機で 3840→1920 のような縮小 swap 時に
+    /// 新 content が旧 transform で 1 refresh 見えることがあった。黒フレームは挿入せず、
+    /// `DwmFlush` で DWM 側の表示反映まで同期して content / transform のペアを固定する。
     /// 戻り値は待ちに要した時間 (ms)。
     fn wait_for_video_transform_commit(&self) -> f64 {
         let t0 = Instant::now();
         unsafe {
             let _ = self._dcomp_device.WaitForCommitCompletion();
+            let _ = DwmFlush();
         }
         t0.elapsed().as_secs_f64() * 1000.0
     }

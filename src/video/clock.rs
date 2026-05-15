@@ -149,6 +149,11 @@ pub struct AvClock {
     /// decoder が EOF (= demux 末端) に到達したか。post-EOF seek を検出する。
     /// `notify_eof_reached` で立て、`request_seek` / `clear_eof_reached` で降ろす。
     eof_reached: AtomicBool,
+    /// 動画 decode thread が致命的なエラー (例: HW decode 初期化失敗、connect-stuck)
+    /// で exit したか。`set_decode_failed(true)` で立てる。UI 側は `decode_failed()` を
+    /// polling して「準備中…」表示の代わりに「再生に失敗しました」を出すなど
+    /// エラー状態をユーザーに通知できる (Codex P2 2026-05-15)。
+    decode_failed: AtomicBool,
     /// 動画音量の線形ゲイン (0.0..+18dB 相当、f64 bits)。
     volume_bits: AtomicU64,
     /// ミュート。
@@ -242,6 +247,7 @@ impl AvClock {
             audio_tx_accounting_epoch: AtomicU64::new(0),
             audio_active: AtomicBool::new(false),
             eof_reached: AtomicBool::new(false),
+            decode_failed: AtomicBool::new(false),
             volume_bits: AtomicU64::new(
                 crate::settings::clamp_video_volume(initial_volume).to_bits(),
             ),
@@ -639,6 +645,15 @@ impl AvClock {
     }
     pub fn is_eof_reached(&self) -> bool {
         self.eof_reached.load(Ordering::Acquire)
+    }
+    /// video decode thread が致命的なエラーで exit したことを通知する。
+    /// `set_decode_failed(true)` 後、`VideoPlayer::tick()` が `decode_failed()` を
+    /// 取り込んで `error` に転写する (Codex P2 2026-05-15)。
+    pub fn set_decode_failed(&self, failed: bool) {
+        self.decode_failed.store(failed, Ordering::Release);
+    }
+    pub fn decode_failed(&self) -> bool {
+        self.decode_failed.load(Ordering::Acquire)
     }
     /// decoder の EOF wait が seek 要求を非破壊で確認するための peek。
     pub fn peek_seek_request_pending(&self) -> bool {
