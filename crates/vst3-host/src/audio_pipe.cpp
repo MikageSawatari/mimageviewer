@@ -34,6 +34,13 @@ bool AudioPipe::attach(const std::string& shm_name,
                         std::string& error_out) {
     detach();
 
+    // T08 (v0.9.0): shm_size 自体の sanity check を最初に。header と 2 本の ring が
+    // 全部入らなければそもそも何もできない。
+    if (shm_size < sizeof(ShmHeader)) {
+        error_out = "shm_size too small for ShmHeader";
+        return false;
+    }
+
     auto wshm = to_wide(shm_name);
     shm_handle_ = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, wshm.c_str());
     if (!shm_handle_) {
@@ -50,10 +57,64 @@ bool AudioPipe::attach(const std::string& shm_name,
     shm_size_ = shm_size;
     header_ = reinterpret_cast<ShmHeader*>(shm_base_);
 
+    // T08 (v0.9.0): header の中身を **ポインタ算術より前** に検証する。攻撃者やバグが
+    // capacity = 0 や巨大値、channels の不正値を書いていた場合、`out_ring_ = in_ring_ +
+    // header_->capacity` が out-of-bounds ポインタを生み、後段の `% header_->capacity` が
+    // ゼロ除算クラッシュやマップ範囲外読み書きを起こす。
+    //
+    // 厳密一致 (= block_size * channels * 8) は将来の ring サイズ変更を縛るので不採用。
+    // 「整合的に使える境界」だけを最小条件として課す。
+    const uint32_t capacity = header_->capacity;
+    const uint32_t channels = header_->channels;
+    const uint32_t block_size = header_->block_size;
+    constexpr uint32_t kMaxCapacitySamples = 16u * 1024u * 1024u; // 16 MiB samples (= 64 MiB stereo)
+    if (capacity == 0 || capacity > kMaxCapacitySamples) {
+        error_out = "ShmHeader.capacity out of range (0 or > 16 MiB samples)";
+        detach();
+        return false;
+    }
+    // T08 (v0.9.0) Codex P3 反映: bridge audio_loop は現在ハードコードで stereo を
+    // 前提に処理する (main.cpp の固定 channel 数経路)。mono サポートは v0.10 以降に
+    // 揃ってから許可するため、ここでは厳格に channels == 2 を要求する。`cached_channels_`
+    // の値もこの validate を通った後の `channels` を保持する。
+    if (channels != 2) {
+        error_out = "ShmHeader.channels must be 2 (mono not yet supported)";
+        detach();
+        return false;
+    }
+    // channels が 2 固定なので、capacity も偶数でなければ stereo frame の整数倍にならない。
+    if (capacity % 2 != 0) {
+        error_out = "ShmHeader.capacity must be even (stereo frame boundary)";
+        detach();
+        return false;
+    }
+    if (block_size == 0) {
+        error_out = "ShmHeader.block_size is zero";
+        detach();
+        return false;
+    }
+    // ring 1 つ分の最低サイズ = block_size * channels (= 1 ブロックぶん入る)
+    if (capacity < static_cast<uint64_t>(block_size) * channels) {
+        error_out = "ShmHeader.capacity smaller than one block";
+        detach();
+        return false;
+    }
+    // mapping 全体に header + 2 本の ring が収まるか (u64 で overflow 回避)
+    const uint64_t total_bytes =
+        static_cast<uint64_t>(sizeof(ShmHeader)) +
+        static_cast<uint64_t>(2u) * static_cast<uint64_t>(capacity) * sizeof(float);
+    if (total_bytes > shm_size_) {
+        error_out = "ShmHeader.capacity overruns the mapped shm region";
+        detach();
+        return false;
+    }
+    cached_capacity_ = capacity;
+    cached_channels_ = channels;
+
     // ring 配置: header の直後に in_ring、その後に out_ring
     auto* base = reinterpret_cast<uint8_t*>(shm_base_);
     in_ring_ = reinterpret_cast<float*>(base + sizeof(ShmHeader));
-    out_ring_ = in_ring_ + header_->capacity;
+    out_ring_ = in_ring_ + cached_capacity_;
 
     auto wsi = to_wide(sig_in_name);
     sig_in_ = OpenEventW(EVENT_ALL_ACCESS, FALSE, wsi.c_str());
@@ -81,6 +142,8 @@ void AudioPipe::detach() {
     header_ = nullptr;
     in_ring_ = nullptr;
     out_ring_ = nullptr;
+    cached_capacity_ = 0;
+    cached_channels_ = 0;
 }
 
 bool AudioPipe::read_in(float* out, uint32_t num_samples, uint32_t timeout_ms) {
@@ -100,8 +163,8 @@ bool AudioPipe::read_in(float* out, uint32_t num_samples, uint32_t timeout_ms) {
         avail = w_pos - r_pos;
     }
 
-    // ring 読み出し
-    uint32_t cap = header_->capacity;
+    // ring 読み出し (T08: validate 済み cached_capacity_ を使う)
+    uint32_t cap = cached_capacity_;
     for (uint32_t i = 0; i < num_samples; ++i) {
         out[i] = in_ring_[(r_pos + i) % cap];
     }
@@ -128,7 +191,7 @@ uint32_t AudioPipe::read_in_available(float* out, uint32_t max_samples, uint32_t
     }
 
     uint32_t to_read = std::min(avail, max_samples);
-    uint32_t cap = header_->capacity;
+    uint32_t cap = cached_capacity_;
     for (uint32_t i = 0; i < to_read; ++i) {
         out[i] = in_ring_[(r_pos + i) % cap];
     }
@@ -141,7 +204,7 @@ bool AudioPipe::write_out(const float* in, uint32_t num_samples, uint32_t timeou
     auto& w = *reinterpret_cast<std::atomic<uint32_t>*>(&header_->out_write);
     auto& r = *reinterpret_cast<std::atomic<uint32_t>*>(&header_->out_read);
 
-    uint32_t cap = header_->capacity;
+    uint32_t cap = cached_capacity_;
     uint32_t w_pos = w.load(std::memory_order_relaxed);
     uint32_t r_pos = r.load(std::memory_order_acquire);
     uint32_t free_space = cap - (w_pos - r_pos);

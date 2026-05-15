@@ -25,12 +25,17 @@ HostApplication::HostApplication() {
     plug_iface_support_ = Steinberg::owned(new Vst::PlugInterfaceSupport);
 }
 
-// FUnknown の addRef/release は単純 atomic ref count
+// FUnknown の addRef/release は atomic ref count (T10 v0.9.0)。
+// VST3 プラグインは任意スレッドから addRef/release を呼びうるため、
+// std::atomic + acq_rel ordering で正しく動作させる。release の戻り値が 0 に
+// なった瞬間に delete this する古典的 COM-style refcount。
 Steinberg::uint32 PLUGIN_API HostApplication::addRef() {
-    return static_cast<Steinberg::uint32>(++ref_count_);
+    auto prev = ref_count_.fetch_add(1, std::memory_order_acq_rel);
+    return static_cast<Steinberg::uint32>(prev + 1);
 }
 Steinberg::uint32 PLUGIN_API HostApplication::release() {
-    auto cnt = --ref_count_;
+    auto prev = ref_count_.fetch_sub(1, std::memory_order_acq_rel);
+    auto cnt = prev - 1;
     if (cnt == 0) {
         delete this;
         return 0;

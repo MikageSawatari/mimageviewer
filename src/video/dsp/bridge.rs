@@ -27,6 +27,15 @@ use windows::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObj
 #[cfg(windows)]
 use windows::core::{HSTRING, PCWSTR};
 
+/// T09 (v0.9.0): bridge と Rust 側の **IPC プロトコルバージョン**。`crates/vst3-host/
+/// include/protocol.h` の `PROTOCOL_VERSION` と必ず一致させること。version mismatch は
+/// hello/ready のハンドシェイクで両端から検出して握りつぶさない。
+///
+/// **bump 1 → 2** (T09 round 4): 旧 bridge は version 比較を no-op で握り潰していたので
+/// 1 のままだと stale bridge を検出できなかった。2 へ上げることで v0.8.x 以前の
+/// `mimageviewer-vst3-host.exe` (version=1 を返すだけ) を新 Rust 側で reject できる。
+pub const PROTOCOL_VERSION: u32 = 2;
+
 /// shared memory header — C++ 側 `crates/vst3-host/include/protocol.h::ShmHeader` と
 /// **同一バイナリレイアウト**でなければならない (cache line aligned 64 byte)。
 #[repr(C)]
@@ -271,6 +280,13 @@ struct SharedMemory {
     base: MEMORY_MAPPED_VIEW_ADDRESS,
     size: u64,
     name: String,
+    // T08 (v0.9.0) Codex P2 反映: `open_audio_pipe` で header に書いた直後の値を
+    // ここへキャッシュする。`push_audio` / `pull_audio` / `preferred_transfer_samples`
+    // は本フィールドのみを参照し、共有メモリ越しの `read_unaligned` を毎回しない。
+    // C++ 側の `AudioPipe::cached_capacity_` と対称。
+    cached_capacity: u32,
+    cached_channels: u32,
+    cached_block_size: u32,
 }
 
 #[cfg(windows)]
@@ -798,6 +814,9 @@ impl Bridge {
                 base,
                 size: shm_size,
                 name: shm_name.clone(),
+                cached_capacity: capacity,
+                cached_channels: 2,
+                cached_block_size: block_size,
             });
 
             // events
@@ -852,9 +871,11 @@ impl Bridge {
             .sig_in
             .as_ref()
             .ok_or_else(|| std::io::Error::other("sig_in missing"))?;
+        // T08 (v0.9.0) Codex P2: capacity は cached を使用。共有メモリの値を毎回
+        // 読み直さない (= mid-flight 改変や TOCTOU を排除)。
+        let cap = shm.cached_capacity;
         unsafe {
             let header = shm.base.Value as *mut ShmHeader;
-            let cap = std::ptr::addr_of!((*header).capacity).read_unaligned();
             let in_ring =
                 (shm.base.Value as *mut u8).add(std::mem::size_of::<ShmHeader>()) as *mut f32;
 
@@ -879,6 +900,13 @@ impl Bridge {
     /// frame at once would wrap and overwrite the input ring before the bridge process can consume
     /// it, which sounds like a short fragment looping. Keep each IPC transfer at the bridge's
     /// native audio block size.
+    ///
+    /// T07 (v0.9.0): `timeout_ms` は **call 全体の deadline**。旧版は per-chunk 100ms で、
+    /// `4096 / 960 ≒ 5` 個の chunk に分かれた呼び出しは最悪 500ms ブロックして cpal の
+    /// アンダーランを誘発していた。新しいセマンティクスでは entry 時に deadline を 1 回計算し、
+    /// 残時間で次の push/pull を行う。さらに short read / timeout で zero-fill して `Ok` を
+    /// 返していた旧挙動を廃止し、`Err(TimedOut)` を伝播する (= caller が連続失敗で
+    /// auto-disable に倒せるようにする)。
     #[cfg(windows)]
     pub fn process_audio_blocking(
         &self,
@@ -892,16 +920,40 @@ impl Bridge {
                 "src/dst length mismatch",
             ));
         }
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
         let chunk_samples = self.preferred_transfer_samples();
         let mut offset = 0;
         while offset < src.len() {
+            // T07 (v0.9.0) Codex P1 round 2 反映: deadline を **push_audio の前にも**
+            // 確認する。expired 状態で push を続けると、bridge が次 block を待っているとき
+            // stale chunk を enqueue して pipe pairing がずれる (= 後続が "Ok with wrong
+            // audio" で counter リセットされる desync race を縮める)。
+            if std::time::Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "process_audio_blocking deadline exceeded before push at offset {offset}/{}",
+                        src.len()
+                    ),
+                ));
+            }
             let end = (offset + chunk_samples).min(src.len());
             self.push_audio(&src[offset..end])?;
-            let n = self.pull_audio(&mut dst[offset..end], timeout_ms)?;
-            if n < end - offset {
-                for o in &mut dst[offset + n..end] {
-                    *o = 0.0;
-                }
+            // 残時間で pull する。0 になっていたら即 TimedOut。
+            let now = std::time::Instant::now();
+            let remaining_ms = if now >= deadline {
+                0
+            } else {
+                (deadline - now).as_millis().min(u32::MAX as u128) as u32
+            };
+            let want = end - offset;
+            let n = self.pull_audio(&mut dst[offset..end], remaining_ms)?;
+            if n < want {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("process_audio_blocking pulled {n} of {want} samples within deadline"),
+                ));
             }
             offset = end;
         }
@@ -913,12 +965,10 @@ impl Bridge {
         let Some(shm) = self.shm.as_ref() else {
             return 960;
         };
-        unsafe {
-            let header = shm.base.Value as *mut ShmHeader;
-            let block_size = std::ptr::addr_of!((*header).block_size).read_unaligned() as usize;
-            let channels = std::ptr::addr_of!((*header).channels).read_unaligned() as usize;
-            (block_size.saturating_mul(channels).max(2) / 2) * 2
-        }
+        // T08 (v0.9.0) Codex P2: cached_block_size / cached_channels を使う。
+        let block_size = shm.cached_block_size as usize;
+        let channels = shm.cached_channels as usize;
+        (block_size.saturating_mul(channels).max(2) / 2) * 2
     }
 
     /// bridge から host への音声読み出し (= out_ring から pop、sig_out を待つ)。
@@ -949,10 +999,11 @@ impl Bridge {
         }
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms as u64);
+        // T08 (v0.9.0) Codex P2: cached_capacity を使用 (mid-flight 改変・TOCTOU 排除)
+        let cap = shm.cached_capacity;
         let mut total_taken: u32 = 0;
         unsafe {
             let header = shm.base.Value as *mut ShmHeader;
-            let cap = std::ptr::addr_of!((*header).capacity).read_unaligned();
             let out_ring = (shm.base.Value as *mut u8)
                 .add(std::mem::size_of::<ShmHeader>())
                 .add((cap as usize) * 4) as *mut f32;

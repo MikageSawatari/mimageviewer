@@ -771,15 +771,45 @@ impl DspBridge {
                     crate::logger::log(format!("[vst3-bridge] {line}"));
                 })
                 .map_err(|e| format!("bridge spawn 失敗: {e}"))?;
-                bridge
-                    .send(&Cmd::Hello { version: 1 })
-                    .map_err(|e| format!("hello send: {e}"))?;
+                if let Err(e) = bridge.send(&Cmd::Hello {
+                    version: crate::video::dsp::bridge::PROTOCOL_VERSION,
+                }) {
+                    let reason = format!("hello send: {e}");
+                    self.disable_with_reason(Some(reason.clone()));
+                    return Err(reason);
+                }
                 match bridge.recv() {
-                    Ok(Event::Ready { .. }) => {}
-                    Ok(other) => {
-                        return Err(format!("予期しないイベント (ready 待ち): {other:?}"));
+                    Ok(Event::Ready { version }) => {
+                        // T09 (v0.9.0): bridge exe が古い・新しすぎる場合は
+                        // PROTOCOL_VERSION 不一致で握りつぶさず spawn を失敗させる。
+                        // Codex P2 round 6: 単に Err を返すだけだと per-plugin skip 扱いで
+                        // chain が is_enabled() のまま放置される。明示的に
+                        // `disable_with_reason` してセッション全体を止める。
+                        if version != crate::video::dsp::bridge::PROTOCOL_VERSION {
+                            let reason = format!(
+                                "VST3 bridge protocol version mismatch (bridge reported {version}, mIV expects {})",
+                                crate::video::dsp::bridge::PROTOCOL_VERSION
+                            );
+                            self.disable_with_reason(Some(reason.clone()));
+                            return Err(reason);
+                        }
                     }
-                    Err(e) => return Err(format!("ready recv: {e}")),
+                    Ok(Event::Error { detail }) => {
+                        // T09 (v0.9.0): bridge 側が version mismatch / その他で error を返した
+                        let reason = format!("VST3 bridge handshake error: {detail}");
+                        self.disable_with_reason(Some(reason.clone()));
+                        return Err(reason);
+                    }
+                    Ok(other) => {
+                        let reason = format!("予期しないイベント (ready 待ち): {other:?}");
+                        self.disable_with_reason(Some(reason.clone()));
+                        return Err(reason);
+                    }
+                    Err(e) => {
+                        let reason = format!("ready recv: {e}");
+                        self.disable_with_reason(Some(reason.clone()));
+                        return Err(reason);
+                    }
                 }
                 bridge
                     .open_audio_pipe(plugin_path, sample_rate, block_size, initial_state)
@@ -864,10 +894,14 @@ impl DspBridge {
             let silence = vec![0.0f32; n];
             let mut dst = vec![0.0f32; n];
             for _ in 0..20 {
-                if bridge_arc.push_audio(&silence).is_err() {
-                    break;
-                }
-                if bridge_arc.pull_audio(&mut dst, 200).is_err() {
+                // T07 (v0.9.0) Codex P2: `push_audio` + `pull_audio` の pair で
+                // `pull_audio` が short read を Ok(n<dst.len()) で返すケースを
+                // 見落としていた。`process_audio_blocking` を使えば
+                // short read は Err 化される (deadline 内に揃わなければ TimedOut)。
+                if bridge_arc
+                    .process_audio_blocking(&silence, &mut dst, 200)
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -1070,10 +1104,10 @@ impl DspBridge {
         let mut dst = vec![0.0f32; n];
         for b in &bridges {
             for _ in 0..blocks {
-                if b.push_audio(&silence).is_err() {
-                    break;
-                }
-                if b.pull_audio(&mut dst, 200).is_err() {
+                // T07 (v0.9.0) Codex P2: short read を Err 化するため
+                // `process_audio_blocking` を使う (pair 呼び出しでは Ok(0<want) を
+                // 見逃していた)。
+                if b.process_audio_blocking(&silence, &mut dst, 200).is_err() {
                     break;
                 }
             }

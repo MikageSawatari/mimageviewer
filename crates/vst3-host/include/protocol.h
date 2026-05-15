@@ -10,7 +10,7 @@
 // stdin がクローズされたら bridge は graceful shutdown する。
 //
 // ### 親 → bridge (要求):
-//   {"cmd":"hello","version":1}
+//   {"cmd":"hello","version":2}
 //   {"cmd":"open","plugin_path":"<UTF-8 絶対パス>","sample_rate":48000,"block_size":480}
 //   {"cmd":"set_param","id":<u32>,"value":<f64 [0..1]>}
 //   {"cmd":"reset"}                 // 再生位置変更 / プラグイン状態リセット
@@ -18,7 +18,7 @@
 //   {"cmd":"shutdown"}              // bridge 終了
 //
 // ### bridge → 親 (応答 / 通知):
-//   {"event":"ready","version":1,"shm_name":"<Windows 名前付きオブジェクト>",
+//   {"event":"ready","version":2,"shm_name":"<Windows 名前付きオブジェクト>",
 //    "shm_size":<u64>,"sig_in":"<event名>","sig_out":"<event名>"}
 //   {"event":"loaded","plugin_name":"<UTF-8>","latency_samples":<u32>,
 //    "params":[{"id":<u32>,"name":"<UTF-8>","default":<f64>}, ...]}
@@ -75,7 +75,11 @@ struct ShmHeader {
 static_assert(sizeof(ShmHeader) == 272,
               "ShmHeader must be 272 bytes to match Rust side");
 
-constexpr uint32_t PROTOCOL_VERSION = 1;
+// T09 (v0.9.0) bump 1 → 2: 旧 bridge は version 比較を no-op で握り潰していたため
+// 1 のままだと「無視されていた hello が黙って通る」状態だった。2 へ上げることで、
+// v0.8.x 以前の bridge exe (= version=1 を返すだけ) は新 Rust 側の比較で reject され、
+// stale bridge による IPC スキーマ不整合を検出できる。
+constexpr uint32_t PROTOCOL_VERSION = 2;
 
 // 制御メッセージの最大長。
 // 通常は 1 KB 未満だが、`plugin_state` event (= IComponent::getState チャンク) は

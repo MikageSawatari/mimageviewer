@@ -698,6 +698,23 @@ fn run_pump(
 
     let mut activated = false;
     let mut last_seen_seek_serial: u64 = 0;
+    // T07 (v0.9.0): VST3 bridge wedge auto-disable のための連続失敗カウンタ。
+    // `process_block` が連続 N 回 (= 約 N * block_duration ms の停滞) 失敗したら
+    // `disable_with_reason` でセッション中の VST3 を切る。閾値は Codex 助言 (= ~250ms
+    // 相当の連続失敗) を反映して 3 回とする。
+    //
+    // **Counter reset の hysteresis** (Codex P1 round 2 反映): 単に「1 回成功でリセット」
+    // すると、partial pipe desync 状態で偶然 Ok を返す block が間に挟まったときに
+    // counter がゼロに戻ってしまい、auto-disable に至らない。`HEALTHY_RESET` 回連続で
+    // 成功して初めて counter をリセットする。
+    #[cfg(windows)]
+    const VST3_CONSECUTIVE_FAILURE_DISABLE: u32 = 3;
+    #[cfg(windows)]
+    const VST3_HEALTHY_RESET: u32 = 5;
+    #[cfg(windows)]
+    let mut vst3_consecutive_failures: u32 = 0;
+    #[cfg(windows)]
+    let mut vst3_consecutive_successes: u32 = 0;
     // The VST bridge persists across videos, while each new VideoPlayer starts
     // its seek serial at 0. Reset plugins on the first valid frame too, not only
     // when the serial increases, so previous-video delay/ring tails cannot leak.
@@ -1010,25 +1027,82 @@ fn run_pump(
             ) = if let Some(b) = &dsp_bridge {
                 if b.is_enabled() && b.active_slot_count() > 0 {
                     fx_out.resize(stretched.samples.len(), 0.0);
-                    let success = b.process_block(&stretched.samples, &mut fx_out).is_ok();
-                    if !success {
-                        crate::logger::log("vst3 process_block failed");
-                    }
-                    let total_lat_samples = b.total_latency_samples();
-                    let lat_secs = if total_lat_samples > 0 {
-                        total_lat_samples as f64 / sample_rate as f64
-                    } else {
-                        0.0
-                    };
+                    let process_result = b.process_block(&stretched.samples, &mut fx_out);
+                    let success = process_result.is_ok();
                     if success {
+                        // 連続成功カウンタを進め、`HEALTHY_RESET` 回連続成功でようやく
+                        // 失敗カウンタをリセット (= partial desync 中の偶発 Ok で counter が
+                        // 不当にゼロ戻りするのを防ぐ)
+                        vst3_consecutive_successes = vst3_consecutive_successes.saturating_add(1);
+                        if vst3_consecutive_successes >= VST3_HEALTHY_RESET {
+                            vst3_consecutive_failures = 0;
+                        }
+                        let total_lat_samples = b.total_latency_samples();
+                        let lat_secs = if total_lat_samples > 0 {
+                            total_lat_samples as f64 / sample_rate as f64
+                        } else {
+                            0.0
+                        };
                         (fx_out.clone(), lat_secs, true)
                     } else {
-                        (stretched.samples.clone(), lat_secs, true)
+                        // T07 (v0.9.0): VST3 process_block 失敗時の dry fallback
+                        // を **PDC=0 + vst_chain_active=false** にする。旧コードは
+                        // VST latency を残したまま dry サンプルを流していたので、
+                        // dry にも PDC 補正が掛かって timing がずれていた。
+                        // 連続失敗カウンタを進めて、閾値に達したら auto-disable。
+                        vst3_consecutive_failures = vst3_consecutive_failures.saturating_add(1);
+                        vst3_consecutive_successes = 0;
+                        // ログ rate-limit: 最初の失敗と 10 回ごとに出す
+                        if vst3_consecutive_failures == 1 || vst3_consecutive_failures % 10 == 0 {
+                            crate::logger::log(format!(
+                                "vst3 process_block failed (consecutive #{}): {}",
+                                vst3_consecutive_failures,
+                                process_result.unwrap_err()
+                            ));
+                        }
+                        // T07 (v0.9.0) Codex P1 round 3 反映: 閾値 trigger は `>=` を使う +
+                        // chain が現に enabled なときだけ disable を呼ぶ + 呼んだら counter を
+                        // 0 にリセットする。
+                        //
+                        // `==` だけだと:
+                        //   1. failures が threshold (3) に到達 → disable
+                        //   2. ユーザーが GUI から re-enable
+                        //   3. 次の失敗で counter が threshold+1 に → `==` を満たさず
+                        //      二度と auto-disable が走らない
+                        // という穴ができる。`>=` + counter reset で再 enable 後も正しく動く。
+                        if vst3_consecutive_failures >= VST3_CONSECUTIVE_FAILURE_DISABLE
+                            && b.is_enabled()
+                        {
+                            crate::logger::log(format!(
+                                "vst3 process_block has failed {} consecutive times; \
+                                 auto-disabling VST3 chain for this session",
+                                vst3_consecutive_failures
+                            ));
+                            b.disable_with_reason(Some(format!(
+                                "VST3 chain wedged after {} consecutive process_block failures; auto-disabled for this session",
+                                vst3_consecutive_failures
+                            )));
+                            vst3_consecutive_failures = 0;
+                        }
+                        // 注 (Codex P1 round 3 限界事項): HEALTHY_RESET の hysteresis は
+                        // 「N 回 Ok 連続 → 正常復帰」と heuristic 判定する。pipe-pairing drift
+                        // (= tail of previous + head of current の偶発 Ok 連発) は構造的に
+                        // 検出できない。完全な解決には bridge との discard/reset handshake が
+                        // 必要で v0.10 で導入予定。drift 継続なら結局再 fail → 再 disable で
+                        // 救う。
+                        (stretched.samples.clone(), 0.0, false)
                     }
                 } else {
+                    // bridge は enable だが active slot が無い: dry 通過。
+                    // active slot 不在のフレームは "成功でも失敗でもない"。counter は
+                    // そのまま (= 一度 wedge 警告状態に入ったらユーザーが GUI で
+                    // bypass を切る/再有効化するまで保つ)。
                     (stretched.samples.clone(), 0.0, false)
                 }
             } else {
+                // dsp_bridge ハンドル自体が無い: VST3 サポートが無効化されている。
+                vst3_consecutive_failures = 0;
+                vst3_consecutive_successes = 0;
                 (stretched.samples.clone(), 0.0, false)
             };
             #[cfg(not(windows))]

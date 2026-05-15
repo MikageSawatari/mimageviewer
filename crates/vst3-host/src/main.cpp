@@ -720,6 +720,19 @@ private:
     bool handle_message(const std::string& msg) {
         std::string cmd = extract_string_field(msg, "cmd");
         if (cmd == "hello") {
+            // T09 (v0.9.0): 受信した version を **必ず比較する**。host (mIV) と bridge exe
+            // の PROTOCOL_VERSION が一致しなければ structured error を返して graceful exit。
+            // ハンドシェイクを no-op にしていると、古い bridge exe で IPC スキーマが
+            // 変わった場合に黙って動作不能になる事故が起きる。
+            uint64_t their_version = extract_number_field(msg, "version");
+            if (their_version != PROTOCOL_VERSION) {
+                send_event_error(
+                    "protocol version mismatch: host requested v" +
+                    std::to_string(their_version) +
+                    ", bridge speaks v" + std::to_string(PROTOCOL_VERSION) +
+                    " (rebuild crates/vst3-host or update mIV)");
+                return false;
+            }
             std::string reply = "{\"event\":\"ready\",\"version\":" +
                                 std::to_string(PROTOCOL_VERSION) + "}";
             write_message(reply);

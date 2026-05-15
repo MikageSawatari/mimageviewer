@@ -210,17 +210,29 @@ where
 
 #[cfg(windows)]
 fn probe_plugin_with_bridge(exe: &Path, plugin_path: &Path) -> Result<ProbeResult, String> {
-    use super::bridge::{Bridge, Cmd, Event};
+    use super::bridge::{Bridge, Cmd, Event, PROTOCOL_VERSION};
 
     let bridge = Bridge::spawn(exe, |line| {
         crate::logger::log(format!("[vst3-probe] {line}"));
     })
     .map_err(|e| format!("bridge spawn: {e}"))?;
     bridge
-        .send(&Cmd::Hello { version: 1 })
+        .send(&Cmd::Hello {
+            version: PROTOCOL_VERSION,
+        })
         .map_err(|e| format!("hello send: {e}"))?;
     match bridge.recv_timeout(std::time::Duration::from_secs(3)) {
-        Ok(Event::Ready { .. }) => {}
+        Ok(Event::Ready { version }) => {
+            // T09 (v0.9.0): protocol mismatch を握りつぶさない
+            if version != PROTOCOL_VERSION {
+                return Err(format!(
+                    "VST3 bridge protocol version mismatch (bridge reported {version}, mIV expects {PROTOCOL_VERSION})"
+                ));
+            }
+        }
+        Ok(Event::Error { detail }) => {
+            return Err(format!("VST3 bridge handshake error: {detail}"));
+        }
         Ok(other) => return Err(format!("unexpected ready event: {other:?}")),
         Err(e) => return Err(format!("ready recv: {e}")),
     }

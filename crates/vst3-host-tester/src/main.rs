@@ -276,13 +276,29 @@ impl TesterApp {
             };
             match Bridge::spawn(&self.bridge_exe_path, stderr_cb) {
                 Ok(mut br) => {
-                    if let Err(e) = br.send(&Cmd::Hello { version: 1 }) {
+                    // T09 (v0.9.0) round 4: PROTOCOL_VERSION は 2 にbump 済み。tester も
+                    // 同じ定数を使い、Ready の version を比較する (= stale bridge / 古い
+                    // tester の組み合わせを早期検出)。
+                    if let Err(e) = br.send(&Cmd::Hello {
+                        version: bridge::PROTOCOL_VERSION,
+                    }) {
                         self.log(format!("bridge hello send failed: {e}"));
                         return;
                     }
                     match br.recv() {
                         Ok(Event::Ready { version }) => {
+                            if version != bridge::PROTOCOL_VERSION {
+                                self.log(format!(
+                                    "bridge protocol version mismatch (bridge=v{version}, tester=v{})",
+                                    bridge::PROTOCOL_VERSION
+                                ));
+                                return;
+                            }
                             self.log(format!("bridge ready (protocol v{version})"));
+                        }
+                        Ok(Event::Error { detail }) => {
+                            self.log(format!("bridge handshake error: {detail}"));
+                            return;
                         }
                         Ok(other) => {
                             self.log(format!("unexpected event: {other:?}"));

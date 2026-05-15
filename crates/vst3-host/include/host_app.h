@@ -41,7 +41,12 @@ public:
     Steinberg::uint32 PLUGIN_API release() override;
 
 private:
-    Steinberg::int32 ref_count_ = 1;
+    // T10 (v0.9.0): atomic 化。VST3 プラグインは addRef / release を任意スレッド
+    // (UI / audio / plugin worker) から呼びうるので、plain int32 だと torn read で
+    // 早期 delete (host UAF) や leak を起こす。`std::atomic<int32>` で正しい行儀にする。
+    // (ComponentHandler / PlugFrame は `DECLARE_FUNKNOWN_METHODS` 経由で SDK の atomic
+    // 実装を使うので影響なし。本クラスだけが手書き refcount だった。)
+    std::atomic<Steinberg::int32> ref_count_{1};
     Steinberg::IPtr<Steinberg::Vst::PlugInterfaceSupport> plug_iface_support_;
 };
 

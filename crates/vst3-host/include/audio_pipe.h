@@ -78,6 +78,14 @@ private:
     ShmHeader* header_ = nullptr;
     float* in_ring_ = nullptr;   // header の直後
     float* out_ring_ = nullptr;  // in_ring の直後
+    // T08 (v0.9.0) Codex P2 反映: header から読んだ値を attach() で validate した直後に
+    // ここへキャッシュする。read_in / write_out は **本フィールドのみ** を modulo / 距離
+    // 計算に使い、`header_->capacity` を毎回読み直さない。これで攻撃者・バグが header の
+    // capacity を mid-flight で書き換えても out-of-bounds 計算には伝播しない (defense
+    // in depth)。SPSC 規則上、parent は capacity を attach 後に書き換えない契約なので
+    // 通常時のセマンティクスは変わらない。
+    uint32_t cached_capacity_ = 0;
+    uint32_t cached_channels_ = 0;
 };
 
 }  // namespace miv
