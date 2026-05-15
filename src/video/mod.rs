@@ -1454,6 +1454,8 @@ fn run_native_video_output(
     let mut first_present_probe_logged = false;
     let mut native_events = Vec::new();
     let trace_every_present = std::env::var_os("MIV_NATIVE_VIDEO_PRESENT_TRACE").is_some();
+    let mut pending_navigation_preview_clear_at: Option<Instant> = None;
+    const NAVIGATION_PREVIEW_CLEAR_DELAY: Duration = Duration::from_millis(40);
     // present 済みの VideoFrame を遅延解放するためのリングバッファ。
     // presenter の `CopySubresourceRegion` は非同期 (GPU に積むだけ) なので、present 直後に
     // `VideoFrame` (= `D3d11Frame`) を drop すると共有出力 slot が即 producer に再利用され、
@@ -1507,6 +1509,30 @@ fn run_native_video_output(
             break;
         }
         let now = Instant::now();
+        if pending_navigation_preview_clear_at.is_some_and(|deadline| now >= deadline) {
+            pending_navigation_preview_clear_at = None;
+            presenter.set_overlay_navigation_preview(None);
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "native_presenter",
+                    "navigation_preview_clear",
+                    None,
+                    0,
+                    &[
+                        (
+                            "source_epoch",
+                            serde_json::Value::from(source.source_epoch as i64),
+                        ),
+                        (
+                            "delay_ms",
+                            serde_json::Value::from(
+                                NAVIGATION_PREVIEW_CLEAR_DELAY.as_secs_f64() * 1000.0,
+                            ),
+                        ),
+                    ],
+                );
+            }
+        }
         if now < startup_probe_until
             && now.duration_since(last_startup_probe) >= Duration::from_millis(250)
         {
@@ -1638,6 +1664,7 @@ fn run_native_video_output(
                     // lifetime tied to the actual present path; errors still clear it
                     // so the failure HUD can be seen.
                     if error.is_some() {
+                        pending_navigation_preview_clear_at = None;
                         presenter.set_overlay_navigation_preview(None);
                     }
                     presenter.set_overlay_playback_status(
@@ -1657,6 +1684,7 @@ fn run_native_video_output(
                     presenter.set_overlay_tile_overlay(tile_overlay);
                 }
                 NativeVideoOutputCommand::SetNavigationPreview { preview } => {
+                    pending_navigation_preview_clear_at = None;
                     presenter.set_overlay_navigation_preview(preview);
                 }
                 NativeVideoOutputCommand::MarkCursorActivity => {
@@ -1714,6 +1742,7 @@ fn run_native_video_output(
                     let show_preparing_overlay = payload.show_preparing_overlay;
                     source = PresenterSourceState::new(*payload);
                     first_presented_out.store(false, Ordering::Release);
+                    pending_navigation_preview_clear_at = None;
                     // ソース切替時は新動画のオープン前なので prep_status は初期値で送る。
                     // 直後に decoder thread が format::input を始めると、次の tick で
                     // 新しい snapshot が押し込まれ、HUD 文言が更新される。
@@ -2521,12 +2550,17 @@ fn run_native_video_output(
                         last_summary_log = Instant::now();
                     }
                     source.displayed_frame_seq.fetch_add(1, Ordering::Release);
-                    first_presented_out.store(true, Ordering::Release);
+                    let first_present_for_source =
+                        !first_presented_out.swap(true, Ordering::AcqRel);
                     // Keep the deferred-navigation preview covering the old source until
                     // the first frame from the new source has actually reached the
-                    // presenter. Clearing it at SwitchSource time exposes the previous
-                    // source for a frame or two during decoder startup.
-                    presenter.set_overlay_navigation_preview(None);
+                    // presenter and has had a short compositor window to latch.
+                    // Clearing it at SwitchSource time or immediately after Present can
+                    // expose the previous source for one compositor pass.
+                    if first_present_for_source {
+                        pending_navigation_preview_clear_at =
+                            Some(Instant::now() + NAVIGATION_PREVIEW_CLEAR_DELAY);
+                    }
                     if !first_present_probe_logged {
                         first_present_probe_logged = true;
                         crate::logger::log(format!(
