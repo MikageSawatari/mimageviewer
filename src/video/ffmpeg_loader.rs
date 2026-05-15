@@ -4,20 +4,23 @@
 //! `ffmpeg-the-third` は MSVC import library 経由でリンクされるため、
 //! Windows ローダが exe をプロセスにロードする時点 (= Rust コードが走るより前) に
 //! `avcodec-61.dll` などを解決する必要がある。PDFium / ONNX Runtime のように
-//! 「include_bytes! → 起動後に APPDATA 展開 → 動的ロード」する方式は使えない
-//! (Rust コードが起動する前にローダが走るため間に合わない)。
-//!
+//! 「include_bytes! → 起動後に APPDATA 展開 → 動的ロード」する方式は本体 (core)
+//! では使えない (Rust コードが起動する前にローダが走るため間に合わない)。
 //! `/DELAYLOAD` (delay-load DLL) も検証したが、rustc 経由の link.exe 呼び出しでは
 //! Delay Import Directory が空のまま生成され、警告も出ないため動作しない
 //! (詳細は `build.rs` 上部のコメントと CLAUDE.md「FFmpeg LGPL DLL 管理」節)。
 //!
-//! 妥協策として、`build.rs` が `vendor/ffmpeg/bin/*.dll` を `target/{debug,release}/`
-//! に自動コピーする。配布時は exe と FFmpeg DLL を同じフォルダに置く必要がある:
+//! そこでランチャー + 本体の 2 段構成を採る:
 //!
-//! - インストーラ (Inno Setup): `installer/mimageviewer.iss` で FFmpeg DLL を
-//!   インストール先にコピーする。
-//! - 単体配布: `mimageviewer.exe` + `avcodec-61.dll` + `avformat-61.dll` +
-//!   `avutil-59.dll` + `avfilter-10.dll` + `swscale-8.dll` + `swresample-5.dll`。
+//! - 配布する `mimageviewer.exe` (= launcher、`crates/launcher/`) が FFmpeg 6 DLL
+//!   と本体 `mimageviewer-core.exe` を `include_bytes!` で内包する。
+//! - 起動時に launcher が `%APPDATA%/mimageviewer/runtime/<version>/` へ全ファイルを
+//!   展開し、その場所から core を spawn する。
+//! - core は exe と同じディレクトリに DLL が並んでいるので Windows ローダの
+//!   標準検索順 (exe 同居が最優先) で確実に解決される。
+//!
+//! 開発時に直接 `target/release/mimageviewer-core.exe` を起動したい場合は
+//! `Copy-Item vendor/ffmpeg/bin/*.dll target/release/` で同じ配置を再現する。
 //!
 //! 本モジュールは「DLL が exe と同じ場所にあるか」を確認してログに出すだけ
 //! (実体ロードは Windows ローダが既に行っている)。

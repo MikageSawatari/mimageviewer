@@ -42,7 +42,7 @@ dual-window approach.
 - **Parallel loading**: `rayon` (dedicated thread pool per folder load)
 - **Thumbnail cache**: SQLite via `rusqlite` (bundled), WebP encoding via `webp` crate
 - **Video thumbnails**: Windows Shell API (IShellItemImageFactory)
-- **Video inline playback**: `ffmpeg-the-third` クレート + FFmpeg LGPL shared DLL (BtbN ビルド) + `cpal` (WASAPI Shared 音声出力)。フルスクリーンで動画を MP4 / MKV / MOV / AVI / WMV / MPG / MPEG / HEVC / AV1 として再生する。`avcodec/avformat/avutil/swscale/swresample` の 5 DLL を `include_bytes!` で exe に埋め込み、初回起動時に `%APPDATA%/mimageviewer/ffmpeg/` に展開して `SetDllDirectoryW` 経由で動的ロード。ビルドに libclang (LLVM/Clang) が必要。詳細は「FFmpeg LGPL DLL 管理」節を参照
+- **Video inline playback**: `ffmpeg-the-third` クレート + FFmpeg LGPL shared DLL (BtbN ビルド) + `cpal` (WASAPI Shared 音声出力)。フルスクリーンで動画を MP4 / MKV / MOV / AVI / WMV / MPG / MPEG / HEVC / AV1 として再生する。`avcodec / avformat / avutil / avfilter / swscale / swresample` の 6 DLL を launcher (`crates/launcher/`) が `include_bytes!` で内包し、初回起動時に `%APPDATA%/mimageviewer/runtime/<version>/` へ展開して本体 (`mimageviewer-core.exe`) を spawn する。本体側は exe と同じディレクトリの DLL を Windows ローダが解決するだけで個別ロード処理は持たない。ビルドに libclang (LLVM/Clang) が必要。詳細は「FFmpeg LGPL DLL 管理」節を参照
 - **ZIP support**: `zip` crate
 - **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み) + マルチプロセスワーカープール (3 プロセス並列レンダリング)
 - **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
@@ -121,7 +121,7 @@ mimageviewer/
 │   ├── os_theme.rs          # UI テーマ（System/Light/Dark）Windows レジストリ連携（v0.7.0）
 │   ├── video/               # 動画インライン再生 (FFmpeg LGPL DLL)
 │   │   ├── mod.rs           # VideoPlayer 公開 API (open / tick / seek / volume…)
-│   │   ├── ffmpeg_loader.rs # DLL を APPDATA に展開し SetDllDirectoryW で検索パス設定
+│   │   ├── ffmpeg_loader.rs # DLL が exe と同居しているかを検証してログ出力 (展開・ロード自体は launcher と Windows ローダが担当)
 │   │   ├── decoder.rs       # 動画/音声デコード worker (avformat/avcodec/swscale/swresample)
 │   │   ├── audio.rs         # cpal (WASAPI) 経由の音声出力 + ring buffer
 │   │   ├── clock.rs         # AvClock (薄い互換 facade、内部は engine/ に委譲)
@@ -165,7 +165,7 @@ mimageviewer/
 │   │   └── mimageviewer-susie32.exe  # include_bytes! で exe に埋め込まれ、
 │   │                                 # 初回起動時に APPDATA へ自動展開
 │   └── ffmpeg/              # FFmpeg LGPL shared build (.gitignore、setup-ffmpeg.sh で取得)
-│       ├── bin/             # avcodec/avformat/avutil/swscale/swresample DLL
+│       ├── bin/             # avcodec/avformat/avutil/avfilter/swscale/swresample DLL
 │       ├── include/         # ffmpeg-the-third のビルド時参照 (FFMPEG_DIR)
 │       ├── lib/             # import library (.lib)
 │       └── LICENSE.txt      # LGPLv3-or-later 本文 (ソフトウェア情報に転載する)
@@ -623,8 +623,8 @@ bash scripts/setup-ffmpeg.sh check     # 新版があるか確認のみ
 - 取得元: [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases)
   の `ffmpeg-n7.1*-win64-lgpl-shared-7.1.zip`
 - 出力先:
-  - `vendor/ffmpeg/bin/{avcodec,avformat,avutil,swscale,swresample}-*.dll`
-    — `include_bytes!` で exe に埋め込み
+  - `vendor/ffmpeg/bin/{avcodec,avformat,avutil,avfilter,swscale,swresample}-*.dll`
+    — launcher の `include_bytes!` で `mimageviewer.exe` に埋め込み
   - `vendor/ffmpeg/include/`, `vendor/ffmpeg/lib/`
     — `ffmpeg-the-third` の build.rs が `FFMPEG_DIR` 経由で参照
     (`.cargo/config.toml` に `FFMPEG_DIR=vendor/ffmpeg` を設定済み)
@@ -664,7 +664,7 @@ target/release/mimageviewer-core.exe     # 本体 (内包される実体、単�
 ```
 
 `mimageviewer.exe` をダブルクリックすると:
-1. 初回のみ `%APPDATA%\mimageviewer\runtime\0.8.2\` に core + 5 DLL を展開
+1. 初回のみ `%APPDATA%\mimageviewer\runtime\<CARGO_PKG_VERSION>\` (例: `runtime\0.9.0\`) に core + 6 DLL を展開
 2. core が spawn されて自身のウィンドウを開く
 3. 動画フォルダで動画をダブルクリック → フルスクリーンでインライン再生開始
 

@@ -211,22 +211,17 @@ pub fn open(...) -> Self {
 ```
 
 `VideoPlayer::open` は `start_fs_load` から呼ばれ、その大元は `App::open_fullscreen`
-(UI thread)。動画を **初めて** 開いたときに以下が UI thread で実行される:
+(UI thread)。**v0.9.0 のランチャー方式**では FFmpeg DLL の展開 (`include_bytes!` →
+`%APPDATA%/mimageviewer/runtime/<version>/` へ書き出し) は **launcher プロセスが**
+core 起動前に完了させており、DLL のロードは Windows ローダが core の `CreateProcess`
+時点で行う。したがって core 内の `ffmpeg_loader::init` は実態としてはログ出力のみで、
+UI スレッドが I/O や `LoadLibrary` を実行することはない。
 
-1. FFmpeg DLL を APPDATA に展開 (= `include_bytes!` のバイト列を `std::fs::write`)
-2. `SetDllDirectoryW` 呼び出し
-3. `LoadLibrary` で 5 個の DLL をロード
+**コスト**: 0.1ms 程度 (`OnceLock` の取得 + `current_exe()` + 6 個の `Path::exists`)。
+初回フルスクリーン open 時にも 1ms 未満。
 
-**コスト**: 初回 100ms〜数百 ms (DLL 展開 + ロード)。**ランチャー側ではなく core
-側で初回フルスクリーン open 時に走る**。
-
-ただし v0.9.0 のランチャー方式では起動時に core spawn されているので、core 自身は
-DLL を **既に隣同居している前提**で `LoadLibrary` できる (= 展開コストはゼロ、
-ロードのみ ~10ms)。実害は小さいが、新規ユーザーが初めて動画を開くと UI が一瞬止まる
-可能性。
-
-**判断**: 🟡 計測ベースで判断。`startup.video_init_load_dlls` perf event を追加して
-実機計測 → 50ms 超なら start_fs_load 前段で worker 化を検討。リリース blocker ではない。
+**判断**: 🟢 問題なし。launcher 方式に切り替えた時点で UI スレッドからの DLL 展開と
+`LoadLibrary` は構造的に排除されている。リリース blocker ではない。
 
 ---
 

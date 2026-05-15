@@ -13,9 +13,12 @@
 //! repaint hint だけを扱う。
 //!
 //! ## 配布要件
-//! `vendor/ffmpeg/bin/*.dll` (BtbN LGPL shared build) を `include_bytes!` で
-//! exe に埋め込み、初回起動時に `%APPDATA%/mimageviewer/ffmpeg/` へ展開する
-//! ([`ffmpeg_loader::init`])。VC++ 再頒布可能パッケージ非依存。
+//! `vendor/ffmpeg/bin/*.dll` (BtbN LGPL shared build、6 DLL) は配布用 launcher
+//! (`crates/launcher/`) が `include_bytes!` で内包し、初回起動時に
+//! `%APPDATA%/mimageviewer/runtime/<version>/` へ展開してから本体 (`mimageviewer-core.exe`)
+//! を spawn する。本モジュールの [`ffmpeg_loader::init`] は exe と同じディレクトリに
+//! DLL が存在するかをログで確認するだけで、ロード自体は Windows ローダが行う
+//! (詳細は CLAUDE.md「FFmpeg LGPL DLL 管理」節)。VC++ 再頒布可能パッケージ非依存。
 //!
 //! ## ライセンス
 //! FFmpeg LGPLv3-or-later build。動的リンク + ソフトウェア情報への通知 + ソース提供

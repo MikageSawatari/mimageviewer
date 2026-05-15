@@ -240,7 +240,7 @@ src/video/
 │   ├── state.rs            # EngineState / DecoderEvent / AudioEvent / ReadinessLatch (357 行)
 │   ├── clock.rs            # MasterClock + ClockAnchor (純粋な値オブジェクト) (292 行)
 │   └── audio_bookkeeping.rs # 音声バッファ会計 (atomic、単独で unit test 可) (316 行)
-├── ffmpeg_loader.rs        # DLL extraction + LoadLibrary (57 行)
+├── ffmpeg_loader.rs        # exe 同居 DLL のログ検証 (展開は launcher、ロードは Windows ローダ) (57 行)
 ├── screenshot.rs           # 現在フレームのクリップボードコピー用 one-shot RGBA 抽出 (173 行)
 ├── thumbnail.rs            # シーク先サムネイル取得 worker (361 行)
 ├── tile_thumbnails.rs      # タイルモード用一括サムネイル抽出 worker (384 行)
@@ -1342,9 +1342,11 @@ Phase 2 で `handle_native_video_output_event` (= 入力イベント反映)、Ph
 
 ## 配布要件
 
-- FFmpeg LGPL shared build (`avcodec`/`avformat`/`avutil`/`avfilter`/`swscale`/`swresample`) を
-  `include_bytes!` で exe に埋め込み、`%APPDATA%/mimageviewer/ffmpeg/` に展開
-- `SetDllDirectoryW` で動的ロード
+- FFmpeg LGPL shared build (`avcodec` / `avformat` / `avutil` / `avfilter` / `swscale` /
+  `swresample`、6 DLL) を **launcher (`crates/launcher/`)** が `include_bytes!` で
+  内包し、初回起動時に `%APPDATA%/mimageviewer/runtime/<version>/` へ展開してから
+  本体 (`mimageviewer-core.exe`) を spawn する (本体は通常リンクなので Windows
+  ローダの標準解決経路に乗る)
 - LGPL ライセンス通知をソフトウェア情報パネルに掲載
 - ライセンス本文 `vendor/ffmpeg/LICENSE.txt` をリリース成果物に同梱
 - 詳細は CLAUDE.md「FFmpeg LGPL DLL 管理」節

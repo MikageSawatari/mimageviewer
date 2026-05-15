@@ -15,8 +15,9 @@
 #   vendor/ffmpeg/LICENSE.txt
 #   vendor/ffmpeg/VERSION
 #
-# DLL は include_bytes! で exe に埋め込まれ、初回起動時に
-# %APPDATA%/mimageviewer/ffmpeg/ へ展開される (PDFium / ONNX Runtime と同じ流儀)。
+# 6 DLL は launcher (`crates/launcher/`) が include_bytes! で内包し、起動時に
+# %APPDATA%/mimageviewer/runtime/<version>/ へ展開してから本体 (mimageviewer-core.exe)
+# を spawn する。本体は通常リンクなので Windows ローダが exe 同居 DLL を解決する。
 # ヘッダ・lib は ffmpeg-the-third のビルド時に FFMPEG_DIR 経由で参照される。
 #
 # ライセンス:

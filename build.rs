@@ -7,7 +7,8 @@ fn main() {
     //
     // 本体 (`mimageviewer-core.exe`) は配布物としては直接使われず、ランチャー
     // (`crates/launcher/`、`mimageviewer.exe` を生成) が `include_bytes!` で
-    // core と FFmpeg DLL 5 つを内包し、起動時に `%APPDATA%\mimageviewer\runtime\<v>\`
+    // core と FFmpeg DLL 6 つ (avcodec / avformat / avutil / avfilter / swscale /
+    // swresample) を内包し、起動時に `%APPDATA%\mimageviewer\runtime\<v>\`
     // に展開して core を spawn する。
     //
     // 開発時に直接 `target/release/mimageviewer-core.exe` を実行したいときは、
@@ -23,13 +24,21 @@ fn main() {
 
     #[cfg(target_os = "windows")]
     {
+        // VS_FIXEDFILEINFO は winresource が CARGO_PKG_VERSION_{MAJOR,MINOR,PATCH}
+        // から自動で 0.9.0.0 を埋める。文字列版 (ファイルプロパティに表示される) も
+        // 揃えるため CARGO_PKG_VERSION から導出する (以前は "0.1.0.0" 決め打ちで
+        // クラッシュダンプ / サポート画面で「v0.1.0.0」と表示されていた)。
+        let version_str = format!("{}.0", env!("CARGO_PKG_VERSION"));
         let mut res = winresource::WindowsResource::new();
         res.set("FileDescription", "mImageViewer");
         res.set("ProductName", "mImageViewer");
-        res.set("FileVersion", "0.1.0.0");
-        res.set("ProductVersion", "0.1.0.0");
-        res.set("LegalCopyright", "Copyright (C) 2025 Mikage Sawatari");
-        res.set("OriginalFilename", "mimageviewer.exe");
+        res.set("FileVersion", &version_str);
+        res.set("ProductVersion", &version_str);
+        res.set("LegalCopyright", "Copyright (C) 2026 Mikage Sawatari");
+        // 本バイナリは内部実体 `mimageviewer-core.exe` であり、配布する
+        // `mimageviewer.exe` は別途 launcher が生成する。OriginalFilename は
+        // PE リソースのファイル名識別なので core 側はそれに合わせる。
+        res.set("OriginalFilename", "mimageviewer-core.exe");
 
         // アイコンファイルが存在する場合のみ埋め込む
         if std::path::Path::new("assets/icon.ico").exists() {

@@ -1,21 +1,24 @@
 [package]
 name = "mimageviewer-launcher"
-version = "0.8.2"
-edition = "2024"
+# workspace ルート (`Cargo.toml` の `[workspace.package]`) と version を同期する。
+# launcher は `%APPDATA%/mimageviewer/runtime/<version>/` を抽出先に使うため、
+# 本体と launcher の version が乖離すると旧 runtime dir に新本体を上書きする事故になる。
+version.workspace = true
+edition.workspace = true
 publish = false
-rust-version = "1.88"
+rust-version.workspace = true
 
 # 配布する `mimageviewer.exe` を生成する小さなランチャークレート。
 #
 # 役割:
-#   - 本体 `mimageviewer-core.exe` と FFmpeg LGPL shared DLL 5 ファイルを
+#   - 本体 `mimageviewer-core.exe` と FFmpeg LGPL shared DLL 6 ファイルを
 #     `include_bytes!` で内包する (本クレートの src/main.rs 参照)
 #   - 初回起動時に `%APPDATA%\mimageviewer\runtime\<version>\` へ展開
 #   - core を `std::process::Command::spawn` で起動 → ランチャー即終了
 #
 # FFmpeg API は呼ばないので Windows ローダの DLL 解決問題を完全に回避する。
 # 本体クレート (`mimageviewer-core.exe`) は ffmpeg-the-third を import library
-# 経由で使うが、それは展開後の同じディレクトリに 5 DLL があれば確実に解決される。
+# 経由で使うが、それは展開後の同じディレクトリに 6 DLL があれば確実に解決される。
 #
 # ビルド前提: 本パッケージは `target/release/mimageviewer-core.exe` を
 # `include_bytes!` で参照するため、core を先にビルドしておく必要がある。

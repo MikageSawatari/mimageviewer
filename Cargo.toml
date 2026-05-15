@@ -1,12 +1,22 @@
 [workspace]
 members = ["crates/susie-worker", "crates/launcher", "crates/vst3-host-tester", "tools/png2mag"]
 
-[package]
-name = "mimageviewer"
+# 配布バイナリ (本体 = `mimageviewer-core.exe` + launcher = `mimageviewer.exe`) の
+# バージョンは workspace 経由で 1 箇所で管理する。launcher は `%APPDATA%/mimageviewer/
+# runtime/<version>/` を抽出先に使うので、本体とランチャーの version が乖離すると
+# 旧バージョンの runtime dir に新本体を上書きしてしまう。susie-worker / vst3-host-tester
+# / png2mag は独立した内部ヘルパーなので workspace inherit せず個別管理。
+[workspace.package]
 version = "0.9.0"
 edition = "2024"
 # let-chain (Rust 1.88 で安定化) を本体・サブクレート共通で使っているため明示。
 rust-version = "1.88"
+
+[package]
+name = "mimageviewer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 # 本体 exe のバイナリ名は `mimageviewer-core` (= 内部実体)。
 # 配布する `mimageviewer.exe` は別途 `crates/launcher/` のランチャーが生成する。
@@ -119,10 +129,12 @@ ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 semver = "1"
 # 動画インライン再生 (フルスクリーンで MP4/MKV/MOV/AVI/WMV/MPG/MPEG を再生)。
 # BtbN の FFmpeg LGPL shared build を vendor/ffmpeg/ に置き、FFMPEG_DIR で参照する
-# (.cargo/config.toml に env で指定済み)。DLL は include_bytes! で exe に埋め込み、
-# 初回起動時に %APPDATA%/mimageviewer/ffmpeg/ に展開して動的ロードする。
+# (.cargo/config.toml に env で指定済み)。本体 (`mimageviewer-core.exe`) は通常リンク
+# だが、配布時は launcher (`mimageviewer.exe`) が 6 DLL (avcodec / avformat / avutil /
+# avfilter / swscale / swresample) を include_bytes! で内包し、起動時に
+# `%APPDATA%/mimageviewer/runtime/<version>/` へ展開してから core を spawn する。
 # *-sys のビルドに libclang (LLVM/Clang) が必要。詳細は CLAUDE.md の
-# 「FFmpeg セットアップ」節を参照。
+# 「FFmpeg LGPL DLL 管理」節を参照。
 ffmpeg-the-third = { version = "3", default-features = false, features = ["codec", "filter", "format", "software-resampling", "software-scaling"] }
 # 動画の音声出力 (Windows では WASAPI Shared モード)。
 cpal = "0.16"

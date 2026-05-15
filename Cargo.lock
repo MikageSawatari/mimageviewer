@@ -3549,7 +3549,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-launcher"
-version = "0.8.2"
+version = "0.9.0"
 dependencies = [
  "sha2",
  "windows 0.61.3",
