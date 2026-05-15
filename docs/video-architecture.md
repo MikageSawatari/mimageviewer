@@ -187,9 +187,17 @@ GPU fence で保証され、時間ベースのヒューリスティックでは�
 
 fence 未作成の環境 (`copy_fence_completed_value()` が `None`) や Signal 失敗
 (`copy_fence_value == 0`) のフレームは fence ゲートでは解放せず、深さキャップ
-`NATIVE_PRESENT_RETIRE_CAP` のみで解放する (= 時間ベースに縮退、旧挙動と等価)。キャップは
-fence が万一 stall したときの上限も兼ねる (共有プール枯渇の防止)。`fullscreen_present`
-perf イベントの `retire_queue_len` で長さを観測できる (fence が効いていれば通常 1〜3)。
+`NATIVE_PRESENT_RETIRE_CAP = 4` のみで解放する (= 時間ベースに縮退、旧挙動と等価)。キャップは
+fence が万一 stall したときの上限も兼ねるが、**stall 時のフットプリント (= 共有出力プール
+24 slot のうち retire が占める数) を 4 に抑える**ことで、decoder の in-flight (~10-15) と
+合わせてもプールに余裕が残るようにしている (2026-05-15 に 8 から 4 へ縮小: cap=8 では
+stall 時にプール枯渇 → CPU readback フォールバック → スパイラル悪化の実害があったため)。
+`fullscreen_present` perf イベントの `retire_queue_len` で長さを観測できる (fence が
+効いていれば通常 1〜3)。
+
+`SwitchSource` 受信時にも fence ゲート付きで opportunistic に解放する: rapid swap で
+OLD source 由来の retire エントリが滞留して共有出力プールを圧迫するのを防ぐ。未完コピーは
+fence ゲートにより解放されないので、frame 114 系の race を再導入しない。
 
 ### CPU フレームの内部フロー (HW decoder 失敗 / 非対応コーデック時)
 

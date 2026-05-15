@@ -1458,7 +1458,14 @@ fn run_native_video_output(
     // キャップは fence が万一 stall したときの上限も兼ねる (= 共有プール枯渇の防止)。
     let mut present_retire: std::collections::VecDeque<(VideoFrame, u64)> =
         std::collections::VecDeque::new();
-    const NATIVE_PRESENT_RETIRE_CAP: usize = 8;
+    // cap は **fence stall 時のフォールバック上限**。fence が機能していれば retire は
+    // 通常 1〜3 で推移するのでこの値は影響しないが、stall すると `cap` 個の slot が
+    // 共有出力プールから占有される。プールは 24 slot、decoder in-flight が ~10-15 なので
+    // cap=4 で残 ~5-10 slot 余裕、cap=8 だと ~1-6 まで圧迫されて rapid swap 時にプール
+    // 枯渇 → CPU readback フォールバック → スパイラル悪化 (2026-05-15 報告)。
+    // 前回検証で frame 114 の混入が止まることが確認された cap=4 を採用する (fence の
+    // 真のゲート効果は変わらず、stall 時のフットプリントだけ旧来比へ戻す)。
+    const NATIVE_PRESENT_RETIRE_CAP: usize = 4;
     while !cancel.load(Ordering::Acquire) {
         // `FirstFrameReady` is what lets the engine leave Buffering after a seek.
         // The engine event channel can be temporarily full during seek bursts, so
@@ -1652,6 +1659,17 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SwitchSource { payload } => {
                     native_drain_unpresented_queue(&mut source.queue);
+                    // present_retire の OLD source 由来エントリのうち fence が完了したものを
+                    // 解放する (rapid swap で旧 slot が retire に滞留して共有出力プールを
+                    // 圧迫するのを防ぐ)。fence ゲート付きなので未完コピーは解放しない (安全)。
+                    if let Some(completed) = presenter.copy_fence_completed_value() {
+                        while present_retire
+                            .front()
+                            .is_some_and(|(_, value)| *value != 0 && *value <= completed)
+                        {
+                            present_retire.pop_front();
+                        }
+                    }
                     let show_preparing_overlay = payload.show_preparing_overlay;
                     source = PresenterSourceState::new(*payload);
                     first_presented_out.store(false, Ordering::Release);
