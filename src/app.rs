@@ -2455,6 +2455,12 @@ pub struct App {
     /// Resume 位置サムネの生成要求を同じ PTS で重複投入しないための session-local 記録。
     #[cfg(windows)]
     pub(crate) video_resume_thumb_last_request: std::collections::HashMap<String, i64>,
+    /// ホイール動画ナビゲーション preview 用の session-local RGBA cache。
+    /// `video_resume_thumbs` は WebP で永続化するが、wheel update ごとに UI thread で
+    /// WebP を再 decode すると連続入力中の CPU spike になるため、直近数件だけ保持する。
+    #[cfg(windows)]
+    pub(crate) video_resume_preview_cache:
+        std::collections::VecDeque<native_video::VideoResumePreviewCacheEntry>,
 
     /// フォルダ側サイドカー (`mimageviewer.dat`) のメモリ表現。キーはフォルダの絶対パス。
     /// 中央 DB への書き込みと同じタイミングで更新し、フォルダ切替・終了・5 秒アイドル時に flush する。
@@ -3101,6 +3107,8 @@ impl App {
             video_resume_last_save: None,
             #[cfg(windows)]
             video_resume_thumb_last_request: std::collections::HashMap::new(),
+            #[cfg(windows)]
+            video_resume_preview_cache: std::collections::VecDeque::new(),
             sidecars: std::collections::HashMap::new(),
             tray_controller: None,
             window_visible: true,

@@ -30,7 +30,9 @@
 //! );
 //! ```
 //! `video_resume_thumbs` はホイール動画ナビゲーション中の静止画プレビュー用で、
-//! 動画 1 本につき最新 resume 位置の 1 行だけを upsert する。
+//! 動画 1 本につき最新 resume 位置の 1 行だけを upsert する。`tile_w` は
+//! 品質判定用の列で、主キーには含めない。同じ動画で resume 位置や抽出幅が
+//! 変わっても、行が増殖せず上書きされるようにするため。
 //!
 //! ## v1 → v2 マイグレーション
 //!
@@ -215,28 +217,42 @@ impl TileThumbCache {
         let conn = self.conn.lock().ok()?;
         let mut stmt = conn
             .prepare_cached(
-                "SELECT timestamp_ms, webp, video_mtime FROM video_resume_thumbs
-                  WHERE path = ?1 AND tile_w >= ?2
+                "SELECT timestamp_ms, webp, video_mtime, tile_w FROM video_resume_thumbs
+                  WHERE path = ?1
                   LIMIT 1",
             )
             .ok()?;
-        let row: Option<(i64, Vec<u8>, i64)> = stmt
-            .query_row(rusqlite::params![key, min_tile_w], |r| {
+        let row: Option<(i64, Vec<u8>, i64, i64)> = stmt
+            .query_row(rusqlite::params![&key], |r| {
                 Ok((
                     r.get::<_, i64>(0)?,
                     r.get::<_, Vec<u8>>(1)?,
                     r.get::<_, i64>(2)?,
+                    r.get::<_, i64>(3)?,
                 ))
             })
             .ok();
         match row {
-            Some((timestamp_ms, webp, mtime)) if mtime == video_mtime => Some((timestamp_ms, webp)),
-            Some(_) => {
+            Some((timestamp_ms, webp, mtime, tile_w))
+                if mtime == video_mtime && tile_w >= i64::from(min_tile_w) =>
+            {
+                Some((timestamp_ms, webp))
+            }
+            Some((_timestamp_ms, _webp, mtime, tile_w)) => {
                 drop(stmt);
-                let _ = conn.execute(
-                    "DELETE FROM video_resume_thumbs WHERE path = ?1 AND video_mtime != ?2",
-                    rusqlite::params![key, video_mtime],
-                );
+                let _ = if mtime != video_mtime {
+                    conn.execute(
+                        "DELETE FROM video_resume_thumbs WHERE path = ?1 AND video_mtime != ?2",
+                        rusqlite::params![key, video_mtime],
+                    )
+                } else if tile_w < i64::from(min_tile_w) {
+                    conn.execute(
+                        "DELETE FROM video_resume_thumbs WHERE path = ?1 AND tile_w < ?2",
+                        rusqlite::params![key, min_tile_w],
+                    )
+                } else {
+                    Ok(0)
+                };
                 None
             }
             None => None,
@@ -512,7 +528,24 @@ mod tests {
         let p = Path::new("c:/v.mp4");
         db.store_resume_webp(p, 640, 5000, 100, 360, &[1]).unwrap();
         assert!(db.lookup_resume_webp(p, 100, 1280).is_none());
+        let row_count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM video_resume_thumbs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(row_count, 0);
+
+        db.store_resume_webp(p, 1280, 5000, 100, 720, &[1]).unwrap();
         assert!(db.lookup_resume_webp(p, 999, 640).is_none());
+        let row_count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM video_resume_thumbs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(row_count, 0);
+
         assert!(db.lookup_resume_webp(p, 100, 640).is_none());
     }
 

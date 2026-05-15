@@ -60,6 +60,19 @@ pub(crate) struct NativeVideoSourceSwapPending {
     pub(crate) input_seq: u64,
 }
 
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct VideoResumePreviewCacheEntry {
+    pub(crate) path_key: String,
+    pub(crate) timestamp_ms: i64,
+    pub(crate) video_mtime: i64,
+    pub(crate) min_tile_w: u32,
+    pub(crate) thumbnail: crate::video::native_presenter::NativeOverlayTileThumbnail,
+}
+
+#[cfg(windows)]
+const VIDEO_RESUME_PREVIEW_SESSION_CACHE_CAP: usize = 8;
+
 /// Norm 操作 (toggle ON / OFF / scan 完了) を 1 セットで適用するヘルパー。
 ///
 /// 3 箇所 (`disable_normalize_globally` / `apply_normalize_gain_db_to_player` /
@@ -150,7 +163,7 @@ impl App {
 
     #[cfg(windows)]
     fn lookup_video_resume_preview_thumbnail(
-        &self,
+        &mut self,
         path: &std::path::Path,
     ) -> Option<crate::video::native_presenter::NativeOverlayTileThumbnail> {
         let key = crate::adjustment_db::normalize_path(path);
@@ -159,28 +172,49 @@ impl App {
             return None;
         }
         let timestamp_ms = (pts * 1000.0).round() as i64;
-        let cache = self.video_tile_cache.as_ref()?;
         let video_mtime = Self::video_mtime_secs(path);
-        let (cached_timestamp_ms, webp) = cache.lookup_resume_webp(
-            path,
-            video_mtime,
-            crate::settings::VIDEO_RESUME_PREVIEW_EXTRACT_WIDTH,
-        )?;
+        let min_tile_w = crate::settings::VIDEO_RESUME_PREVIEW_EXTRACT_WIDTH;
+        if let Some(pos) = self.video_resume_preview_cache.iter().position(|entry| {
+            entry.path_key == key
+                && entry.timestamp_ms == timestamp_ms
+                && entry.video_mtime == video_mtime
+                && entry.min_tile_w == min_tile_w
+        }) {
+            let entry = self.video_resume_preview_cache.remove(pos)?;
+            let thumbnail = entry.thumbnail.clone();
+            self.video_resume_preview_cache.push_front(entry);
+            return Some(thumbnail);
+        }
+        let cache = self.video_tile_cache.as_ref()?;
+        let (cached_timestamp_ms, webp) =
+            cache.lookup_resume_webp(path, video_mtime, min_tile_w)?;
         if cached_timestamp_ms != timestamp_ms {
             return None;
         }
         let (width, height, rgba) = crate::catalog::decode_thumb_to_rgba(&webp)?;
-        Some(crate::video::native_presenter::NativeOverlayTileThumbnail {
+        let thumbnail = crate::video::native_presenter::NativeOverlayTileThumbnail {
             target_secs: pts,
             width,
             height,
             rgba: std::sync::Arc::new(rgba),
-        })
+        };
+        self.video_resume_preview_cache
+            .push_front(VideoResumePreviewCacheEntry {
+                path_key: key,
+                timestamp_ms,
+                video_mtime,
+                min_tile_w,
+                thumbnail: thumbnail.clone(),
+            });
+        while self.video_resume_preview_cache.len() > VIDEO_RESUME_PREVIEW_SESSION_CACHE_CAP {
+            self.video_resume_preview_cache.pop_back();
+        }
+        Some(thumbnail)
     }
 
     #[cfg(windows)]
     fn native_video_navigation_preview_for_path(
-        &self,
+        &mut self,
         path: &std::path::Path,
     ) -> crate::video::native_presenter::NativeOverlayNavigationPreview {
         let file_name = path

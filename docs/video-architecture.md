@@ -548,9 +548,14 @@ hard-stuck。固着動画では video decode thread が `first packet for serial
    `video_resume_thumbs` テーブルへ upsert する。タイル一覧用の
    `video_tile_thumbs(path, tile_w, timestamp_ms)` とは別テーブルにする理由は、
    resume 位置が数秒ごとに変わるたびタイル用 timestamp 行を増やさないため。
+   `video_resume_thumbs` は `path` を primary key にし、`tile_w` は品質判定列として
+   使う。lookup 時に mtime 不一致または現在の preview 幅より狭い行を見つけた場合は
+   その場で削除し、古い/低品質な 1 行が残って次回生成を妨げないようにする。
    preview 抽出幅は `VIDEO_RESUME_PREVIEW_EXTRACT_WIDTH` (= 1280) で、4K/8K 原寸
    RGBA を overlay へアップロードして VRAM pressure を再発させない一方、全画面
-   背景として動画識別に十分な解像度を確保する。
+   背景として動画識別に十分な解像度を確保する。wheel update 中に同じ動画/PTS の
+   WebP を UI thread で繰り返し decode しないよう、App は直近 8 件だけ session-local
+   RGBA preview cache を持つ。永続 DB は WebP のままなので、起動をまたぐメモリ増加はない。
 
 3. **旧 player の eager drop**
    `start_native_video_source_swap` は `take_native_output` で旧 player から
