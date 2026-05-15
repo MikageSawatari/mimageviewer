@@ -23,8 +23,20 @@
 //! 安定 Rust では未提供。代わりに `Mutex<ClockAnchor>` で保護し、`now_secs()` は
 //! Mutex を取って anchor を読み出した後で `Instant::now()` を計算する。
 //! - Mutex のロック時間は `Instant::now()` 1 回 + 数算術 = ~100 ns 程度
-//! - cpal RT callback も `now_secs()` を呼ばない (= EngineActor が events 経由で
-//!   anchor を更新するだけ)。RT 経路に Mutex は触れない。
+//! - **現状の制約** (T17, Claude R2-1 2026-05-16): 旧コメントは「cpal RT callback は
+//!   `now_secs()` を呼ばない」「RT 経路に Mutex は触れない」と書いていたが、実装は
+//!   それと矛盾している:
+//!     - `src/video/audio.rs::fill_output` (RT callback) は 1 回の callback で
+//!       `AvClock::now_secs()` を 2 回 + `set_audio_pts*` を 1 回呼ぶ
+//!     - `AvClock::now_secs()` は内部で `master_clock.anchor()` を経由するので
+//!       Mutex を 1 回 acquire する (playing 経路は anchor + master_clock.now_secs で 2 回)
+//!     - 結果として **fill_output 1 回あたり ~5 Mutex acquire**。EngineActor /
+//!       UI tick / decoder pacing と奪い合う `Mutex<ClockAnchor>` を RT が踏む
+//! - 現状実害は観測されていない (lock hold time ~100 ns、競合稀) が、これは
+//!   **過渡的な状態**。v0.10 で `ClockAnchor` の seqlock / atomic-bit-pack 化を行い、
+//!   RT を真の lock-free にする計画
+//! - それまでの間は本ドキュメントを参照点として、Mutex hold time を増やす変更
+//!   (= anchor 計算に I/O / システムコール / heavy 算術を入れる) は禁止
 //!
 //! ## anchor の publish 順序
 //! `set_anchor` は内部で Mutex を取って anchor を全置換する。Mutex Release は
