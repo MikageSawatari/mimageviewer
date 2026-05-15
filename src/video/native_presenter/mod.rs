@@ -192,7 +192,36 @@ pub struct NativeVideoPresenter {
     height: u32,
     surface_width: u32,
     surface_height: u32,
+    /// 動画フレームの解像度が変わったとき、新しい swap chain を作るための DXGI factory。
+    /// `new()` 生成時のものを保持する。
+    factory: IDXGIFactory2,
+    /// 解像度変更で差し替えた旧 video swap chain を遅延破棄するためのキュー。
+    /// `SetContent` で新 swap chain に切り替えた後も DComp / DWM 側がしばらく旧 content を
+    /// 参照しうるため、即 drop せず数世代分保持する (Codex 助言)。
+    retired_video_surfaces: VecDeque<RetiredVideoSurface>,
 }
+
+/// 解像度変更で差し替えた旧 video swap chain。`retired_video_surfaces` で遅延保持し、
+/// キューから押し出されたタイミングで Drop される (= swap chain + waitable を解放)。
+struct RetiredVideoSurface {
+    _swap_chain: IDXGISwapChain1,
+    waitable: HANDLE,
+    _backbuffer: Option<ID3D11Texture2D>,
+}
+
+impl Drop for RetiredVideoSurface {
+    fn drop(&mut self) {
+        if !self.waitable.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.waitable);
+            }
+        }
+    }
+}
+
+/// 旧 video swap chain を保持する世代数。`SetContent` 切替後、DComp/DWM が旧 content を
+/// 参照しなくなるまでの猶予 + presenter の非同期 GPU コピー完了の猶予を兼ねる。
+const RETIRED_VIDEO_SURFACE_DEPTH: usize = 3;
 
 struct NativeBlackBackground {
     swap_chain: IDXGISwapChain1,
@@ -404,6 +433,19 @@ pub struct NativePresentOutcome {
     pub path: &'static str,
     pub shared_handle: u64,
     pub shared_cache_hit: bool,
+    /// この present で参照した共有出力テクスチャの世代 ID (GPU 経路のみ、CPU 経路は 0)。
+    pub shared_texture_gen: u64,
+    /// この present で参照した GPU frame の fence value (GPU 経路のみ、CPU 経路は 0)。
+    pub fence_value: u64,
+    /// この present 完了後の video swap chain サーフェスサイズ。
+    pub surface_width: u32,
+    pub surface_height: u32,
+    /// この present でフレーム実寸 / SAR が変わり transform を更新したか。
+    pub geometry_changed: bool,
+    /// この present で解像度変更により video swap chain を原子的に差し替えたか。
+    pub surface_swapped: bool,
+    /// 差し替え時の `WaitForCommitCompletion` 待ち時間 (ms)。差し替えが無ければ 0。
+    pub commit_sync_ms: f64,
     pub wait_ms: f64,
     pub wait_timed_out: bool,
     pub fence_wait_ms: f64,
@@ -416,6 +458,22 @@ pub struct NativePresentOutcome {
     pub present_waitable_ms: f64,
     pub present_call_ms: f64,
     pub present_ms: f64,
+}
+
+/// `copy_frame_into_backbuffer` の戻り値。GPU / CPU いずれの経路でフレームを
+/// backbuffer へコピーしたかと、その計測値をまとめる。
+struct FrameCopyMetrics {
+    path: &'static str,
+    shared_handle: u64,
+    shared_cache_hit: bool,
+    shared_texture_gen: u64,
+    fence_value: u64,
+    fence_wait_ms: f64,
+    open_shared_ms: f64,
+    keyed_mutex_ms: f64,
+    keyed_mutex_cast_ms: f64,
+    keyed_mutex_acquire_ms: f64,
+    copy_call_ms: f64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1260,6 +1318,8 @@ impl NativeVideoPresenter {
                 height: config.height,
                 surface_width: config.width,
                 surface_height: config.height,
+                factory,
+                retired_video_surfaces: VecDeque::new(),
             };
             this.recreate_backbuffer(true)?;
             this.wait_for_initial_composition_ready();
@@ -1371,29 +1431,322 @@ impl NativeVideoPresenter {
         frame: &VideoFrame,
         sync_interval: u32,
     ) -> Result<NativePresentOutcome, String> {
+        let new_w = frame.width.max(1);
+        let new_h = frame.height.max(1);
+        let new_sar_num = frame.sar_num.max(1);
+        let new_sar_den = frame.sar_den.max(1);
+        let size_changed = self.surface_width != new_w || self.surface_height != new_h;
+
+        if size_changed {
+            // 解像度変更: 新 swap chain を別途用意して原子的に差し替える。
+            self.present_with_surface_swap(
+                frame,
+                sync_interval,
+                new_w,
+                new_h,
+                new_sar_num,
+                new_sar_den,
+            )
+        } else {
+            // 解像度は不変。既存 swap chain をそのまま再利用する。
+            self.present_reusing_surface(frame, sync_interval, new_sar_num, new_sar_den)
+        }
+    }
+
+    /// 解像度不変時の present。既存の `swap_chain` / `backbuffer` をそのまま使う。
+    /// SAR だけ変わった場合は transform を再計算する (swap chain content は正しいので
+    /// 中間状態は生じない)。
+    fn present_reusing_surface(
+        &mut self,
+        frame: &VideoFrame,
+        sync_interval: u32,
+        new_sar_num: u32,
+        new_sar_den: u32,
+    ) -> Result<NativePresentOutcome, String> {
         let wait_t0 = Instant::now();
         let wait_result = unsafe { WaitForSingleObject(self.waitable, 100) };
         let wait_ms = wait_t0.elapsed().as_secs_f64() * 1000.0;
-        let present_waitable_ms = wait_ms;
         let timed_out = wait_result == WAIT_TIMEOUT;
 
+        let sar_changed = self.sar_num != new_sar_num || self.sar_den != new_sar_den;
+        if sar_changed {
+            // SAR だけ変わった (= 同一解像度で SAR 違いの動画へ切替)。swap chain の
+            // サイズは正しいので transform を作り直すだけでよい。
+            self.sar_num = new_sar_num;
+            self.sar_den = new_sar_den;
+            self.update_video_visual_transform()?;
+        }
+
         let copy_t0 = Instant::now();
-        let mut fence_wait_ms = 0.0;
-        let mut open_shared_ms = 0.0;
-        let mut keyed_mutex_ms = 0.0;
-        let mut keyed_mutex_cast_ms = 0.0;
-        let mut keyed_mutex_acquire_ms = 0.0;
-        let copy_call_ms;
-        let mut shared_handle = 0;
-        let mut shared_cache_hit = false;
-        let path = match &frame.data {
+        let backbuffer = self
+            .backbuffer
+            .clone()
+            .ok_or_else(|| "native presenter backbuffer is not initialized".to_string())?;
+        let copy = self.copy_frame_into_backbuffer(frame, &backbuffer)?;
+        let copy_ms = copy_t0.elapsed().as_secs_f64() * 1000.0;
+
+        let present_t0 = Instant::now();
+        let hr = unsafe { self.swap_chain.Present(sync_interval, Default::default()) };
+        if hr.is_err() {
+            return Err(format!("IDXGISwapChain::Present: {hr:?}"));
+        }
+        let present_call_ms = present_t0.elapsed().as_secs_f64() * 1000.0;
+
+        Ok(NativePresentOutcome {
+            path: copy.path,
+            shared_handle: copy.shared_handle,
+            shared_cache_hit: copy.shared_cache_hit,
+            shared_texture_gen: copy.shared_texture_gen,
+            fence_value: copy.fence_value,
+            surface_width: self.surface_width,
+            surface_height: self.surface_height,
+            geometry_changed: sar_changed,
+            surface_swapped: false,
+            commit_sync_ms: 0.0,
+            wait_ms,
+            wait_timed_out: timed_out,
+            fence_wait_ms: copy.fence_wait_ms,
+            open_shared_ms: copy.open_shared_ms,
+            keyed_mutex_ms: copy.keyed_mutex_ms,
+            keyed_mutex_cast_ms: copy.keyed_mutex_cast_ms,
+            keyed_mutex_acquire_ms: copy.keyed_mutex_acquire_ms,
+            copy_call_ms: copy.copy_call_ms,
+            copy_ms,
+            present_waitable_ms: wait_ms,
+            present_call_ms,
+            present_ms: present_call_ms,
+        })
+    }
+
+    /// 解像度変更時の present。**新しい video swap chain を別途生成し、最初の正しい
+    /// フレームを `Present` 済みにしてから、`SetContent` + `SetTransform2` を 1 回の
+    /// `Commit` で原子的に差し替える**。旧 swap chain は Commit まで visual に
+    /// 繋がったまま (= 正しい映像のまま) なので、黒や「左上にずれた中間フレーム」が
+    /// 一切表示されない。`ResizeBuffers` (旧 content を破棄する) は使わない。
+    ///
+    /// 旧 swap chain は `WaitForCommitCompletion` 後も即 drop せず `retired_video_surfaces`
+    /// に数世代分残す (DComp/DWM がまだ旧 content を参照しうるため。Codex 助言)。
+    fn present_with_surface_swap(
+        &mut self,
+        frame: &VideoFrame,
+        sync_interval: u32,
+        new_w: u32,
+        new_h: u32,
+        new_sar_num: u32,
+        new_sar_den: u32,
+    ) -> Result<NativePresentOutcome, String> {
+        let geom_t0 = Instant::now();
+        // 1. 新 swap chain + backbuffer を用意する。ここでは visual には繋がない。
+        let (new_swap_chain, new_waitable) = self.create_video_swap_chain(new_w, new_h)?;
+        let new_backbuffer = self.create_swap_chain_backbuffer(&new_swap_chain)?;
+
+        // 2. 最初のフレームを新 backbuffer へコピーする。
+        let copy_t0 = Instant::now();
+        let copy = self.copy_frame_into_backbuffer(frame, &new_backbuffer)?;
+        let copy_ms = copy_t0.elapsed().as_secs_f64() * 1000.0;
+
+        // 3. 新 swap chain を Present (= 新 swap chain は「正しいフレーム投入済み」状態)。
+        let present_t0 = Instant::now();
+        unsafe { new_swap_chain.Present(sync_interval, Default::default()) }
+            .ok()
+            .map_err(|e| format!("IDXGISwapChain::Present (new surface): {e:?}"))?;
+        let present_call_ms = present_t0.elapsed().as_secs_f64() * 1000.0;
+
+        // 4. content + transform を 1 回の Commit で原子的に差し替える。旧 swap chain は
+        //    この Commit が反映されるまで visual に繋がったまま (= 正しい映像のまま)。
+        //
+        //    ⚠️ transform はローカル値 (new_*) から計算し、`self.*` はまだ touch しない。
+        //    `SetContent` / `SetTransform2` / `Commit` のいずれかが失敗して `?` で早期
+        //    return しても、presenter の状態 (`surface_width/height`, `sar_num/den`,
+        //    `swap_chain`, `backbuffer`) は旧 surface のまま完全に一貫している。さもないと
+        //    「`surface_*` だけ新サイズに進み swap_chain は旧のまま」という不整合に陥り、
+        //    次回以降の `present` が `present_reusing_surface` 経路へ誤って入って固着する
+        //    (Codex P2)。`self.*` の更新は Commit 成功後 (手順 6) に一括で行う。
+        let (m11, m22, offset_x, offset_y) = compute_video_visual_transform(
+            new_w,
+            new_h,
+            self.width,
+            self.height,
+            new_sar_num,
+            new_sar_den,
+            self.video_compact,
+        );
+        let transform = Matrix3x2 {
+            M11: m11,
+            M12: 0.0,
+            M21: 0.0,
+            M22: m22,
+            M31: offset_x,
+            M32: offset_y,
+        };
+        unsafe {
+            self._video_visual
+                .SetContent(&new_swap_chain)
+                .map_err(|e| format!("IDCompositionVisual::SetContent (surface swap): {e:?}"))?;
+            self._video_visual
+                .SetTransform2(&transform)
+                .map_err(|e| format!("IDCompositionVisual::SetTransform2 (surface swap): {e:?}"))?;
+            self._dcomp_device
+                .Commit()
+                .map_err(|e| format!("IDCompositionDevice::Commit (surface swap): {e:?}"))?;
+        }
+
+        // 5. Commit が composition engine に処理され切るまで待つ (DwmFlush は使わない)。
+        let commit_sync_ms = self.wait_for_video_transform_commit();
+
+        // 6. Commit 成功。ここで初めて `self.*` を新 surface へ確定する (一括更新)。
+        self.sar_num = new_sar_num;
+        self.sar_den = new_sar_den;
+        self.surface_width = new_w;
+        self.surface_height = new_h;
+        let old_swap_chain = std::mem::replace(&mut self.swap_chain, new_swap_chain);
+        let old_waitable = std::mem::replace(&mut self.waitable, new_waitable);
+        let old_backbuffer = self.backbuffer.replace(new_backbuffer);
+        self.retired_video_surfaces.push_back(RetiredVideoSurface {
+            _swap_chain: old_swap_chain,
+            waitable: old_waitable,
+            _backbuffer: old_backbuffer,
+        });
+        while self.retired_video_surfaces.len() > RETIRED_VIDEO_SURFACE_DEPTH {
+            self.retired_video_surfaces.pop_front();
+        }
+
+        let geom_ms = geom_t0.elapsed().as_secs_f64() * 1000.0;
+        crate::logger::log(format!(
+            "native-presenter: video surface swapped to {new_w}x{new_h} sar={}/{} \
+             geom_ms={geom_ms:.2} commit_sync_ms={commit_sync_ms:.2}",
+            self.sar_num, self.sar_den
+        ));
+        log_event(
+            "video_surface_swap",
+            &[
+                ("surface_width", Value::from(new_w as i64)),
+                ("surface_height", Value::from(new_h as i64)),
+                ("sar_num", Value::from(self.sar_num as i64)),
+                ("sar_den", Value::from(self.sar_den as i64)),
+                ("geom_ms", Value::from(geom_ms)),
+                ("commit_sync_ms", Value::from(commit_sync_ms)),
+                (
+                    "retired_len",
+                    Value::from(self.retired_video_surfaces.len() as i64),
+                ),
+            ],
+        );
+
+        Ok(NativePresentOutcome {
+            path: copy.path,
+            shared_handle: copy.shared_handle,
+            shared_cache_hit: copy.shared_cache_hit,
+            shared_texture_gen: copy.shared_texture_gen,
+            fence_value: copy.fence_value,
+            surface_width: self.surface_width,
+            surface_height: self.surface_height,
+            geometry_changed: true,
+            surface_swapped: true,
+            commit_sync_ms,
+            wait_ms: 0.0,
+            wait_timed_out: false,
+            fence_wait_ms: copy.fence_wait_ms,
+            open_shared_ms: copy.open_shared_ms,
+            keyed_mutex_ms: copy.keyed_mutex_ms,
+            keyed_mutex_cast_ms: copy.keyed_mutex_cast_ms,
+            keyed_mutex_acquire_ms: copy.keyed_mutex_acquire_ms,
+            copy_call_ms: copy.copy_call_ms,
+            copy_ms,
+            present_waitable_ms: 0.0,
+            present_call_ms,
+            present_ms: present_call_ms,
+        })
+    }
+
+    /// 新しい video swap chain を生成する (`new()` の生成ロジックと同一)。
+    /// 戻り値は `(swap_chain, frame-latency waitable)`。
+    fn create_video_swap_chain(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> Result<(IDXGISwapChain1, HANDLE), String> {
+        let width = width.max(1);
+        let height = height.max(1);
+        let desc = DXGI_SWAP_CHAIN_DESC1 {
+            Width: width,
+            Height: height,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            Stereo: false.into(),
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
+            BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
+            BufferCount: 3,
+            Scaling: DXGI_SCALING_STRETCH,
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            AlphaMode: DXGI_ALPHA_MODE_IGNORE,
+            Flags: DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT.0 as u32,
+        };
+        unsafe {
+            let swap_chain = self
+                .factory
+                .CreateSwapChainForComposition(&self.d3d_device1, &desc, None::<&IDXGIOutput>)
+                .map_err(|e| format!("CreateSwapChainForComposition video: {e:?}"))?;
+            let swap_chain2: IDXGISwapChain2 = swap_chain
+                .cast()
+                .map_err(|e| format!("cast IDXGISwapChain2 video: {e:?}"))?;
+            swap_chain2
+                .SetMaximumFrameLatency(1)
+                .map_err(|e| format!("SetMaximumFrameLatency video: {e:?}"))?;
+            let waitable = swap_chain2.GetFrameLatencyWaitableObject();
+            Ok((swap_chain, waitable))
+        }
+    }
+
+    /// 指定 swap chain の backbuffer を取得して黒クリアして返す (`Present` はしない)。
+    fn create_swap_chain_backbuffer(
+        &self,
+        swap_chain: &IDXGISwapChain1,
+    ) -> Result<ID3D11Texture2D, String> {
+        let backbuffer: ID3D11Texture2D = unsafe {
+            swap_chain
+                .GetBuffer(0)
+                .map_err(|e| format!("IDXGISwapChain::GetBuffer (new surface): {e:?}"))?
+        };
+        let mut backbuffer_view = None;
+        unsafe {
+            self.d3d_device1
+                .CreateRenderTargetView(&backbuffer, None, Some(&mut backbuffer_view))
+                .map_err(|e| format!("CreateRenderTargetView (new surface): {e:?}"))?;
+        }
+        let backbuffer_view: ID3D11RenderTargetView = backbuffer_view
+            .ok_or_else(|| "CreateRenderTargetView returned null (new surface)".to_string())?;
+        unsafe {
+            self.d3d_context
+                .ClearRenderTargetView(&backbuffer_view, &[0.0, 0.0, 0.0, 1.0]);
+        }
+        Ok(backbuffer)
+    }
+
+    /// 1 フレームを指定 backbuffer へコピーする (GPU 共有テクスチャ経路 / CPU upload 経路)。
+    /// `present_reusing_surface` と `present_with_surface_swap` の両方から使う共通処理。
+    fn copy_frame_into_backbuffer(
+        &mut self,
+        frame: &VideoFrame,
+        backbuffer: &ID3D11Texture2D,
+    ) -> Result<FrameCopyMetrics, String> {
+        let mut metrics = FrameCopyMetrics {
+            path: "",
+            shared_handle: 0,
+            shared_cache_hit: false,
+            shared_texture_gen: 0,
+            fence_value: 0,
+            fence_wait_ms: 0.0,
+            open_shared_ms: 0.0,
+            keyed_mutex_ms: 0.0,
+            keyed_mutex_cast_ms: 0.0,
+            keyed_mutex_acquire_ms: 0.0,
+            copy_call_ms: 0.0,
+        };
+        match &frame.data {
             VideoFrameData::Cpu(bytes) => {
-                self.ensure_video_geometry(
-                    frame.width,
-                    frame.height,
-                    frame.sar_num,
-                    frame.sar_den,
-                )?;
                 let probe_this_frame = self.pixel_probe_due();
                 let src_probe = if probe_this_frame {
                     Some(sample_cpu_rgba_pixel(
@@ -1411,10 +1764,6 @@ impl NativeVideoPresenter {
                     frame.width,
                     frame.height,
                 )?;
-                let backbuffer = self
-                    .backbuffer
-                    .as_ref()
-                    .ok_or_else(|| "native presenter backbuffer is not initialized".to_string())?;
                 unsafe {
                     let copy_call_t0 = Instant::now();
                     self.d3d_context.UpdateSubresource(
@@ -1425,7 +1774,7 @@ impl NativeVideoPresenter {
                         frame.width.saturating_mul(4),
                         0,
                     );
-                    copy_call_ms = copy_call_t0.elapsed().as_secs_f64() * 1000.0;
+                    metrics.copy_call_ms = copy_call_t0.elapsed().as_secs_f64() * 1000.0;
                     if probe_this_frame {
                         let backbuffer_probe =
                             self.sample_texture_pixel(backbuffer, "backbuffer")?;
@@ -1446,7 +1795,7 @@ impl NativeVideoPresenter {
                         }
                     }
                 }
-                "cpu_upload"
+                metrics.path = "cpu_upload";
             }
             VideoFrameData::Gpu(gpu_frame) => {
                 if gpu_frame.ten_bit {
@@ -1455,13 +1804,9 @@ impl NativeVideoPresenter {
                 if gpu_frame.width != frame.width || gpu_frame.height != frame.height {
                     return Err("D3D11 frame metadata size mismatch".into());
                 }
-                shared_handle = gpu_frame.shared_handle.0 as usize as u64;
-                self.ensure_video_geometry(
-                    gpu_frame.width,
-                    gpu_frame.height,
-                    frame.sar_num,
-                    frame.sar_den,
-                )?;
+                metrics.shared_handle = gpu_frame.shared_handle.0 as usize as u64;
+                metrics.shared_texture_gen = gpu_frame.shared_texture_gen;
+                metrics.fence_value = gpu_frame.fence_value;
                 let probe_this_frame = self.pixel_probe_due();
                 let fence = self.open_fence(gpu_frame.fence_gen, gpu_frame.fence_shared_handle)?;
                 let fence_t0 = Instant::now();
@@ -1470,20 +1815,20 @@ impl NativeVideoPresenter {
                         .Wait(&fence, gpu_frame.fence_value)
                         .map_err(|e| format!("D3D11 fence wait: {e:?}"))?;
                 }
-                fence_wait_ms = fence_t0.elapsed().as_secs_f64() * 1000.0;
+                metrics.fence_wait_ms = fence_t0.elapsed().as_secs_f64() * 1000.0;
                 let open_shared_t0 = Instant::now();
                 let (src, cache_hit) = self
                     .open_shared_texture(gpu_frame.shared_handle, gpu_frame.shared_texture_gen)?;
-                shared_cache_hit = cache_hit;
-                open_shared_ms = open_shared_t0.elapsed().as_secs_f64() * 1000.0;
+                metrics.shared_cache_hit = cache_hit;
+                metrics.open_shared_ms = open_shared_t0.elapsed().as_secs_f64() * 1000.0;
                 let keyed_mutex_t0 = Instant::now();
                 let keyed_mutex = self.acquire_source_keyed_mutex(
                     &src,
                     gpu_frame.shared_output_released_to_reader.clone(),
                 )?;
-                keyed_mutex_ms = keyed_mutex_t0.elapsed().as_secs_f64() * 1000.0;
-                keyed_mutex_cast_ms = keyed_mutex.cast_ms;
-                keyed_mutex_acquire_ms = keyed_mutex.acquire_ms;
+                metrics.keyed_mutex_ms = keyed_mutex_t0.elapsed().as_secs_f64() * 1000.0;
+                metrics.keyed_mutex_cast_ms = keyed_mutex.cast_ms;
+                metrics.keyed_mutex_acquire_ms = keyed_mutex.acquire_ms;
                 let _keyed_mutex_guard = keyed_mutex.guard;
                 let src_probe = if probe_this_frame {
                     Some(self.sample_texture_pixel(&src, "source")?)
@@ -1491,13 +1836,6 @@ impl NativeVideoPresenter {
                     None
                 };
                 unsafe {
-                    let backbuffer = self
-                        .backbuffer
-                        .as_ref()
-                        .ok_or_else(|| {
-                            "native presenter backbuffer is not initialized".to_string()
-                        })?
-                        .clone();
                     let dst_res: ID3D11Resource = backbuffer
                         .cast()
                         .map_err(|e| format!("cast backbuffer resource: {e:?}"))?;
@@ -1523,15 +1861,15 @@ impl NativeVideoPresenter {
                         0,
                         Some(&copy_box),
                     );
-                    copy_call_ms = copy_call_t0.elapsed().as_secs_f64() * 1000.0;
+                    metrics.copy_call_ms = copy_call_t0.elapsed().as_secs_f64() * 1000.0;
                     if probe_this_frame {
                         let backbuffer_probe =
-                            self.sample_texture_pixel(&backbuffer, "backbuffer")?;
+                            self.sample_texture_pixel(backbuffer, "backbuffer")?;
                         self.log_pixel_probe(
                             "d3d11_shared",
                             gpu_frame.fence_gen,
                             gpu_frame.fence_value,
-                            fence_wait_ms,
+                            metrics.fence_wait_ms,
                             src_probe,
                             Some(backbuffer_probe),
                         );
@@ -1544,34 +1882,10 @@ impl NativeVideoPresenter {
                         }
                     }
                 }
-                "d3d11_shared"
+                metrics.path = "d3d11_shared";
             }
-        };
-        let copy_ms = copy_t0.elapsed().as_secs_f64() * 1000.0;
-        let present_t0 = Instant::now();
-        let hr = unsafe { self.swap_chain.Present(sync_interval, Default::default()) };
-        if hr.is_err() {
-            return Err(format!("IDXGISwapChain::Present: {hr:?}"));
         }
-        let present_call_ms = present_t0.elapsed().as_secs_f64() * 1000.0;
-        let present_ms = present_call_ms;
-        Ok(NativePresentOutcome {
-            path,
-            shared_handle,
-            shared_cache_hit,
-            wait_ms,
-            wait_timed_out: timed_out,
-            fence_wait_ms,
-            open_shared_ms,
-            keyed_mutex_ms,
-            keyed_mutex_cast_ms,
-            keyed_mutex_acquire_ms,
-            copy_call_ms,
-            copy_ms,
-            present_waitable_ms,
-            present_call_ms,
-            present_ms,
-        })
+        Ok(metrics)
     }
 
     /// HUD overlay HWND の生 u64 値。HUD HWND が生成されていなければ 0。
@@ -2272,81 +2586,20 @@ impl NativeVideoPresenter {
         Ok((texture, false))
     }
 
-    /// 動画フレームの実寸法 + SAR に合わせて swap chain サーフェスと video visual の
-    /// transform を確定する。`present` の先頭で、そのフレーム自身の幅・高さ・SAR を
-    /// 渡して呼ぶ。
+    /// `present_with_surface_swap` の `Commit` 直後に呼ぶ。content + transform の Commit が
+    /// composition engine に処理され切るまで presenter thread を待たせる。これにより
+    /// 旧 swap chain を `retired_video_surfaces` へ移して以降の present に進む時点で、
+    /// DComp は確実に新 swap chain を指している。
     ///
-    /// SAR は `VideoFrame` に同梱されて presenter thread へ直接届くため、UI tick 経由の
-    /// `SetVideoSar` コマンドより早く・確実に反映される (= ソース切替直後の最初の
-    /// フレームが旧動画の SAR で描かれるのを防ぐ)。
-    ///
-    /// 解像度が変わったときは `ResizeBuffers` で swap chain backbuffer をフレーム実寸へ
-    /// 合わせ、`update_video_visual_transform` で transform を再計算する。`present` 本体は
-    /// この呼び出しの直後に実フレームを copy + `Present` するので、transform commit は
-    /// 実フレームの present より前に確定する。
-    fn ensure_video_geometry(
-        &mut self,
-        width: u32,
-        height: u32,
-        sar_num: u32,
-        sar_den: u32,
-    ) -> Result<(), String> {
-        let width = width.max(1);
-        let height = height.max(1);
-        let sar_num = sar_num.max(1);
-        let sar_den = sar_den.max(1);
-        let size_changed = self.surface_width != width || self.surface_height != height;
-        let sar_changed = self.sar_num != sar_num || self.sar_den != sar_den;
-        if !size_changed && !sar_changed {
-            return Ok(());
+    /// `DwmFlush` は意図的に呼ばない: 原子的差し替えでは中間状態が無いので refresh を
+    /// 強制する必要がなく、`DwmFlush` はむしろ余計な 1 refresh ぶんの待ちを足すだけ。
+    /// 戻り値は待ちに要した時間 (ms)。
+    fn wait_for_video_transform_commit(&self) -> f64 {
+        let t0 = Instant::now();
+        unsafe {
+            let _ = self._dcomp_device.WaitForCommitCompletion();
         }
-        // SAR は transform 計算より前に確定させる (= resize 経路の
-        // `update_video_visual_transform` が最初から正しい SAR で計算するように)。
-        self.sar_num = sar_num;
-        self.sar_den = sar_den;
-
-        let geom_t0 = Instant::now();
-        if size_changed {
-            self.backbuffer = None;
-            unsafe {
-                self.swap_chain
-                    .ResizeBuffers(
-                        0,
-                        width,
-                        height,
-                        DXGI_FORMAT_UNKNOWN,
-                        DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT,
-                    )
-                    .map_err(|e| format!("IDXGISwapChain::ResizeBuffers video surface: {e:?}"))?;
-            }
-            self.surface_width = width;
-            self.surface_height = height;
-            // 黒クリアのみ。ここで `Present` はしない (= 黒フレームを 1 枚挟まない)。
-            // 実フレームは呼び出し元の `present` がこの直後に copy + `Present` する。
-            self.recreate_backbuffer(false)?;
-        }
-        self.update_video_visual_transform()?;
-        let geom_ms = geom_t0.elapsed().as_secs_f64() * 1000.0;
-        crate::logger::log(format!(
-            "native-presenter: video geometry updated surface={}x{} sar={}/{} \
-             size_changed={size_changed} sar_changed={sar_changed} geom_ms={geom_ms:.2}",
-            self.surface_width, self.surface_height, self.sar_num, self.sar_den
-        ));
-        log_event(
-            "video_geometry",
-            &[
-                ("width", Value::from(self.width as i64)),
-                ("height", Value::from(self.height as i64)),
-                ("surface_width", Value::from(self.surface_width as i64)),
-                ("surface_height", Value::from(self.surface_height as i64)),
-                ("sar_num", Value::from(self.sar_num as i64)),
-                ("sar_den", Value::from(self.sar_den as i64)),
-                ("size_changed", Value::from(size_changed)),
-                ("sar_changed", Value::from(sar_changed)),
-                ("geom_ms", Value::from(geom_ms)),
-            ],
-        );
-        Ok(())
+        t0.elapsed().as_secs_f64() * 1000.0
     }
 
     fn update_video_visual_transform(&self) -> Result<(), String> {

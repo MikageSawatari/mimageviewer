@@ -1440,6 +1440,21 @@ fn run_native_video_output(
     let mut first_present_probe_logged = false;
     let mut native_events = Vec::new();
     let trace_every_present = std::env::var_os("MIV_NATIVE_VIDEO_PRESENT_TRACE").is_some();
+    // present 済みの VideoFrame を数フレーム遅延解放するためのリングバッファ。
+    // presenter の `CopySubresourceRegion` は非同期 (GPU に積むだけ) なので、present 直後に
+    // `VideoFrame` (= `D3d11Frame`) を drop すると共有出力 slot が即 producer に再利用され、
+    // presenter 側のコピーが source texture を読み終える前に上書きされうる (= 別フレーム
+    // 混入。2026-05-15 frame 114)。
+    //
+    // ⚠️ これは **時間ベースの緩和** であって GPU コピー完了の保証ではない: present から
+    // `NATIVE_PRESENT_RETIRE_DEPTH` フレーム後には通常 GPU コピーは完了している、という
+    // 経験則に基づく。GPU stall がこの深さを超えると再発しうる。確実化するなら presenter
+    // 側で `CopySubresourceRegion` 後に D3D11 query/fence を積み、完了確認後に解放する形が
+    // 必要 (Codex P2、将来課題)。現状は実機で frame 114 系の混入が止まることを確認済みの
+    // 最小実装。
+    let mut present_retire: std::collections::VecDeque<VideoFrame> =
+        std::collections::VecDeque::new();
+    const NATIVE_PRESENT_RETIRE_DEPTH: usize = 4;
     while !cancel.load(Ordering::Acquire) {
         // `FirstFrameReady` is what lets the engine leave Buffering after a seek.
         // The engine event channel can be temporarily full during seek bursts, so
@@ -2473,7 +2488,11 @@ fn run_native_video_output(
                         source.clock.clear_seek_target_override(serial);
                     }
                     if crate::perf::is_enabled() {
+                        // geometry 変更 (= swap chain 差し替え) の present は毎回出す。
+                        // 左上ずれ / 別フレーム混入はこのタイミングで起きるため、推測でなく
+                        // ログで切り分けられるようにする (Codex 助言)。
                         if trace_every_present
+                            || outcome.geometry_changed
                             || total_ms > 4.0
                             || last_present_log.elapsed() > Duration::from_secs(1)
                         {
@@ -2485,6 +2504,42 @@ fn run_native_video_output(
                                 0,
                                 &[
                                     ("pts", serde_json::Value::from(pts)),
+                                    (
+                                        "source_epoch",
+                                        serde_json::Value::from(source.source_epoch as i64),
+                                    ),
+                                    ("seek_serial", serde_json::Value::from(serial as i64)),
+                                    ("frame_width", serde_json::Value::from(frame.width as i64)),
+                                    ("frame_height", serde_json::Value::from(frame.height as i64)),
+                                    (
+                                        "surface_width",
+                                        serde_json::Value::from(outcome.surface_width as i64),
+                                    ),
+                                    (
+                                        "surface_height",
+                                        serde_json::Value::from(outcome.surface_height as i64),
+                                    ),
+                                    (
+                                        "shared_texture_gen",
+                                        serde_json::Value::from(outcome.shared_texture_gen),
+                                    ),
+                                    ("fence_value", serde_json::Value::from(outcome.fence_value)),
+                                    (
+                                        "geometry_changed",
+                                        serde_json::Value::from(outcome.geometry_changed),
+                                    ),
+                                    (
+                                        "surface_swapped",
+                                        serde_json::Value::from(outcome.surface_swapped),
+                                    ),
+                                    (
+                                        "commit_sync_ms",
+                                        serde_json::Value::from(outcome.commit_sync_ms),
+                                    ),
+                                    (
+                                        "retire_queue_len",
+                                        serde_json::Value::from(present_retire.len() as i64),
+                                    ),
                                     (
                                         "queue_len",
                                         serde_json::Value::from(source.queue.len() as i64),
@@ -2542,6 +2597,13 @@ fn run_native_video_output(
                                 ],
                             );
                         }
+                    }
+                    // present 済みフレームを即 drop せず数フレーム遅延解放する
+                    // (= 共有出力 slot を GPU コピー完了まで握り続ける)。詳細は
+                    // `present_retire` 宣言箇所のコメント参照。
+                    present_retire.push_back(frame);
+                    while present_retire.len() > NATIVE_PRESENT_RETIRE_DEPTH {
+                        present_retire.pop_front();
                     }
                 }
                 Err(err) => {

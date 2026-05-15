@@ -169,6 +169,19 @@ stale なまま返してしまう** (= 動画切替直後に前動画のフレ�
 `texture_gen` が必ず異なるので、別エントリとして開き直す。これは `fence` 側の `fence_gen`
 (同じ handle 値再利用問題への既存対策) と完全に同じ思想。
 
+#### present 済みフレームの遅延解放 (`present_retire`)
+
+presenter の `CopySubresourceRegion` は **非同期** (GPU コマンドキューに積むだけ) なので、
+`present` 直後に `VideoFrame` (= `D3d11Frame`) を drop すると共有出力 slot の `in_use` が
+即 `false` になり、producer (decoder) がその slot を再取得して上書きしうる。presenter 側の
+GPU コピーがまだ source texture を読み終えていないと、別フレームの内容が混入する
+(2026-05-15、別動画フレームの 1 枚混入)。
+
+対策として `run_native_video_output` は present 済みの `VideoFrame` を即 drop せず、
+`present_retire` リングバッファ (深さ `NATIVE_PRESENT_RETIRE_DEPTH`) に数フレーム保持して
+から drop する。これにより slot の `in_use` 解放が数フレーム遅延し、その間に GPU コピーが
+完了する。`fullscreen_present` perf イベントの `retire_queue_len` で長さを観測できる。
+
 ### CPU フレームの内部フロー (HW decoder 失敗 / 非対応コーデック時)
 
 ```
@@ -855,28 +868,41 @@ transform で anisotropic scale として適用する**:
   (= 余計な GPU/CPU 仕事ゼロ、stretch は DComp 側で 1 度だけ走る)。
 - タイルモードのセル比率 (`ui_video_tile.rs`) も同じ SAR を反映する。
 
-### ジオメトリ更新 (`ensure_video_geometry`)
+### ジオメトリ更新 — swap chain の原子的差し替え
 
-`present()` は毎フレームの先頭で `ensure_video_geometry(width, height, sar_num, sar_den)` を
-呼ぶ。寸法も SAR も変わらなければ即 return。変わったときだけ:
+`present()` は毎フレームの先頭でフレーム実寸・SAR を見て分岐する:
 
-1. **解像度が変わった場合**: `ResizeBuffers` で swap chain backbuffer をフレーム実寸へ
-   合わせ、`recreate_backbuffer(false)` で新 backbuffer を取得 (黒クリアのみ、`Present` しない)。
-2. `update_video_visual_transform()` で `SetTransform2` + `IDCompositionDevice::Commit()`。
+- **解像度不変** (`present_reusing_surface`): 既存の `swap_chain` / `backbuffer` をそのまま
+  再利用。SAR だけ変わった場合は `update_video_visual_transform` で transform を作り直す
+  (swap chain content は正しいので中間状態は生じない)。
+- **解像度変更** (`present_with_surface_swap`): **新しい video swap chain を別途生成し、
+  原子的に差し替える**。手順:
+  1. `create_video_swap_chain` で新 swap chain + backbuffer を生成 (まだ visual には繋がない)。
+  2. 最初の正しいフレームを新 backbuffer へ copy。
+  3. 新 swap chain を `Present` (= 新 swap chain は「正しいフレーム投入済み」状態)。
+  4. `_video_visual.SetContent(新 swap chain)` + `SetTransform2(新 transform)` を
+     **1 回の `Commit`** で適用。DComp は 1 Commit のバッチを原子的に適用するので、
+     compositor から見ると「旧 swap chain + 旧 transform (整合)」→「新 swap chain
+     (フレーム投入済み) + 新 transform (整合)」と一気に切り替わる。
+  5. `wait_for_video_transform_commit` (`WaitForCommitCompletion`) で Commit 反映を待つ。
+  6. 旧 swap chain を `retired_video_surfaces` (深さ `RETIRED_VIDEO_SURFACE_DEPTH`) へ
+     移して遅延破棄。
 
-呼び出し元の `present` 本体はこの直後に実フレームを copy + `Present` するので、transform の
-commit は実フレームの present より前に program order 上確定する。`video_geometry` perf
-イベントに `size_changed` / `sar_changed` / `geom_ms` を記録する。
+**なぜ原子的差し替えか**: 旧実装は同一 swap chain に `ResizeBuffers` をかけていたが、
+`ResizeBuffers` は旧 content を破棄するため「未提示」の中間状態が生じ、そこを compositor が
+拾うと黒や「左上にずれた縮小フレーム」が 1 フレーム見えた。さらに DComp transform commit と
+swap chain `Present` は compositor に原子的にラッチされないため、`WaitForCommitCompletion`
+だけでは「新フレーム + 旧 transform」の混在を防ぎ切れなかった (2026-05-15、複数回の実機録画で
+確認)。新 swap chain を**フレーム投入済みにしてから 1 Commit で content+transform を同時
+差し替える**ことで、`ResizeBuffers` を使わず中間状態を構造的にゼロにする。`DwmFlush` も
+不要 (中間状態が無いので refresh を強制する必要がない)。
 
-> **2026-05-15 の経緯**: 当初は「DComp transform commit と swap chain Present が compositor
-> に原子的にラッチされない」競合を疑い、`ResizeBuffers` 後に黒フレームを 1 枚 present +
-> `WaitForCommitCompletion` + `DwmFlush` で同期する実装を入れていた。しかし実機録画の
-> フレーム解析で、ホイール切替時の「誤位置フレーム」の実体は transform 競合ではなく
-> **共有出力テクスチャ handle 値の再利用による stale テクスチャ参照** (前述の
-> `shared_texture_gen` 節) だと判明。transform 競合フレームは録画中に 1 枚も観測されず、
-> 黒フレーム挿入は (実害の無い仮説への対策である一方) 解像度切替ごとに確実に 1 フレーム
-> 黒を挟む実害を生んでいたため撤去した。`shared_texture_gen` の修正が本質的な方で、
-> ジオメトリ更新経路は素直な `ResizeBuffers` + transform 再計算に戻している。
+**旧 surface の遅延破棄**: `SetContent` 切替後も DComp/DWM がしばらく旧 content を参照
+しうるため、旧 swap chain を即 drop せず `retired_video_surfaces` に数世代分残す。
+`RetiredVideoSurface` の Drop が swap chain + frame-latency waitable を解放する。
+
+`video_surface_swap` perf イベントに `surface_width/height` / `sar` / `geom_ms` /
+`commit_sync_ms` / `retired_len` を記録する。
 
 UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFmpeg の慣例に合わせ
 **encoded サイズのまま** (例: `720×480`)。DAR の併記は将来検討。
