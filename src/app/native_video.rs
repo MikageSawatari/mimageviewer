@@ -627,7 +627,6 @@ impl App {
             ..
         } = pending;
 
-        native_output.set_navigation_preview(None);
         let source_epoch = self.next_native_video_source_epoch();
         let started_at = std::time::Instant::now();
         self.activity_gate.bump();

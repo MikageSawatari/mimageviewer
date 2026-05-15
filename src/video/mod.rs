@@ -1629,6 +1629,9 @@ fn run_native_video_output(
                     error,
                     prep_status,
                 } => {
+                    if first_frame_presented || error.is_some() {
+                        presenter.set_overlay_navigation_preview(None);
+                    }
                     presenter.set_overlay_playback_status(
                         first_frame_presented,
                         error,
@@ -1715,7 +1718,6 @@ fn run_native_video_output(
                             file_size: 0,
                         },
                     );
-                    presenter.set_overlay_navigation_preview(None);
                     presenter.set_overlay_metadata(None);
                     presenter.set_overlay_timeline_markers(Vec::new());
                     presenter.set_overlay_jump_entries(Vec::new());
@@ -2512,6 +2514,11 @@ fn run_native_video_output(
                     }
                     source.displayed_frame_seq.fetch_add(1, Ordering::Release);
                     first_presented_out.store(true, Ordering::Release);
+                    // Keep the deferred-navigation preview covering the old source until
+                    // the first frame from the new source has actually reached the
+                    // presenter. Clearing it at SwitchSource time exposes the previous
+                    // source for a frame or two during decoder startup.
+                    presenter.set_overlay_navigation_preview(None);
                     if !first_present_probe_logged {
                         first_present_probe_logged = true;
                         crate::logger::log(format!(
