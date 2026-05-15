@@ -37,7 +37,8 @@ Instead:
 3. On resume, skip completed segments and continue from the next source position.
 4. At finalization, concatenate video segments into a final temporary file.
 5. Mux/copy source audio into the final output when audio support is enabled.
-6. Write the normal `.miv.json` sidecar and atomically publish `<stem>.miv.mkv`.
+6. Stage the `.miv.json` sidecar, atomically publish `<stem>.miv.mkv`, then atomically
+   commit the sidecar (see Data Integrity section for the 3-phase publication detail).
 
 This makes each completed segment durable. A crash loses only the currently running
 segment.
@@ -648,12 +649,22 @@ or derived item using the existing derived pairing logic.
 
 - Manifest writes are atomic.
 - Segment completion is two-phase: close file -> validate -> rename -> manifest update.
-- Final publication is two-phase: write final `.part` -> write sidecar -> rename final.
+- Final publication is three-phase (T05 in v0.9.0): write new sidecar to `.json.staged`
+  via `save_json_atomic` -> `fs::rename` `.part` -> `.miv.mkv` (atomic publish, replaces
+  any existing) -> `fs::rename` `.json.staged` -> `.miv.json` (atomic commit, replaces
+  any existing). The old sidecar stays visible until step 3 so there is no
+  sidecar-missing window even if the process crashes mid-publish. On first-time
+  publish (no old pair) + sidecar commit failure, the new video is rolled back to
+  `.part` so retry is not blocked by the `output_path.exists() && !overwrite` guard.
 - If finalization fails, keep work dir and mark task `failed` so the user can retry without
   redoing completed segments.
-- If source identity no longer matches, mark task failed with `failure_reason: "stale_source"`;
-  do not resume.
-- If options differ from the existing manifest, require restart into a clean work dir.
+- If source identity no longer matches (file_name / size / head_tail_sha256 / time_base),
+  mark task failed with `failure_reason: StaleSource`; do not resume. (T04 in v0.9.0:
+  `validate_manifest_matches_job` runs immediately after the manifest is loaded from
+  disk in `run_segmented_video_only`.)
+- If options differ from the existing manifest (scale / model / quality / container /
+  codec / encoder / output dimensions), mark task failed with `failure_reason: PlanDrift`;
+  do not resume. Cancel-with-delete-artifacts clears the work dir for restart.
 
 Log these events to `mimageviewer.log` with task id, source path, and segment index where
 applicable:
@@ -701,7 +712,8 @@ applicable:
 
 - Harden video segment concat and timestamp continuity.
 - Implement one-pass final mux/copy when possible; document and test any two-step fallback.
-- Write existing `.miv.json` sidecar only after final output succeeds.
+- Stage the `.miv.json` sidecar, then `fs::rename` the `.mkv` to publish, then
+  `fs::rename` the staged sidecar to commit (3-phase, see Data Integrity).
 - Manual test: output duration, playback speed, audio presence, seeking.
 
 ### Phase E: Queue UI

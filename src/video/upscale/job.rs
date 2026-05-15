@@ -13,11 +13,12 @@ use crate::ai::{ModelKind, model_manager::ModelManager, runtime::AiRuntime};
 
 use super::manifest::{
     JobManifest, ManifestOptions, ManifestOutput, ManifestSource, PlannedSegment, SegmentEntry,
-    SegmentPlan, SegmentPlanState, SegmentPlanStrategy, SegmentState, TimeBase,
+    SegmentPlan, SegmentPlanState, SegmentPlanStrategy, SegmentState, TimeBase, save_json_atomic,
 };
 use super::paths::{
-    final_part_path_for, manifest_path_for, segment_file_name, segment_part_file_name,
-    segment_part_path, segment_path, segments_dir_for, work_dir_for, worker_segment_part_path,
+    MANIFEST_FILE_NAME, final_part_path_for, manifest_path_for, segment_file_name,
+    segment_part_file_name, segment_part_path, segment_path, segments_dir_for, work_dir_for,
+    worker_segment_part_path,
 };
 use super::sidecar::{
     EncodeInfo, OutputInfo, UpscaleInfo, VideoUpscaleSidecar, derived_sidecar_path_for,
@@ -305,6 +306,31 @@ pub fn run_job(
     crate::video::ffmpeg_loader::init()?;
     ffmpeg::init().map_err(|e| format!("FFmpeg init failed: {e}"))?;
 
+    // T05: 前回 run が publish 中にクラッシュ (プロセス強制終了 / 電源断 / OS kill)
+    // した場合の orphan state を掃除してから先に進む。残しておくと直後の
+    // `output_path.exists() && !overwrite` ガードに引っかかって retry が
+    // dead-end する。
+    recover_interrupted_publish(&job);
+
+    // T05: クラッシュが publish 完了 (step 3 commit 済み) と queue の mark_done の
+    // 間で起きると、pair は healthy なまま task state は Running → 再起動時に
+    // Queued へ復帰 → retry がここに到達する。pair が現 job と完全一致するなら
+    // 「既に完了済み」として早期 Ok を返し、work_dir をクリーンアップする。
+    //
+    // overwrite=true の場合は短絡しない: ユーザーが明示的に「上書きしてやり直し」を
+    // 選んだ意図を尊重する (出力が壊れている疑いがある等、ユーザーが healthy に見える
+    // pair を信じない判断をしうる)。
+    if !job.options.overwrite
+        && let Some(()) = detect_existing_completed_pair(&job)
+    {
+        cleanup_work_dir_after_completion(&job);
+        crate::logger::log(format!(
+            "[VideoUpscale] healthy completed pair detected at run_job entry; treating as done: {}",
+            job.output_path.display()
+        ));
+        return Ok(job.output_path);
+    }
+
     if job.output_path.exists() && !job.options.overwrite {
         return Err(format!(
             "出力ファイルがすでに存在します: {}",
@@ -337,16 +363,243 @@ pub fn run_job(
     let finalize_result = result?;
 
     if cancel.load(Ordering::Relaxed) {
+        let _ = fs::remove_file(&part_path);
         return Err("キャンセルされました".to_owned());
     }
 
-    if job.output_path.exists() {
-        fs::remove_file(&job.output_path)
-            .map_err(|e| format!("既存の出力ファイルを削除できません: {e}"))?;
+    // T05: 最終公開を 3-phase atomic で行う (詳細は `publish_finalized_outputs` の
+    // doc-comment 参照):
+    //   (1) `save_json_atomic` で `<stem>.miv.json.staged` を書き出し
+    //   (2) `fs::rename` で part_path → `<stem>.miv.mkv` を atomic 公開
+    //   (3) `fs::rename` で staged → `<stem>.miv.json` を atomic commit
+    // `std::fs::rename` は Windows でも Linux でも既存ファイルを atomic 置き換え
+    // するので、overwrite モードでも race window を作らない。失敗時のロールバックも
+    // ヘルパー内で完結している。
+    //
+    // 失敗時 publish_result.is_err() で part_path を削除するが、work_dir の Done
+    // segment は残るので retry は encode 部分をスキップして publish からやり直せる。
+    let publish_result =
+        publish_finalized_outputs(&job, &part_path, &finalize_result, model_kind, out_w, out_h);
+    if publish_result.is_err() {
+        let _ = fs::remove_file(&part_path);
     }
-    fs::rename(&part_path, &job.output_path)
-        .map_err(|e| format!("出力ファイルの確定に失敗しました: {e}"))?;
+    publish_result?;
 
+    cleanup_work_dir_after_completion(&job);
+
+    Ok(job.output_path)
+}
+
+/// T05: 既存の `.miv.mkv` + `.miv.json` ペアが現 `job` の意図と完全一致するなら
+/// `Some(())` を返す (= 過去 run が publish 完了済みで、queue だけが mark_done を
+/// 取りこぼした状態)。一致条件 (Codex P3 反映で encode 全フィールド追加):
+/// - 本編が非空 (`metadata.len() > 0`)
+/// - sidecar が schema/JSON 上正しい
+/// - sidecar の source identity (file_name + size + head_tail_sha256) が現 source と一致
+/// - sidecar の scale / model / output dims / output.path が現 job と一致
+/// - sidecar の encode 全フィールド (container/codec/encoder/quality_level/crf/preset/
+///   pixel_format) が現 job と一致
+///
+/// 一致しない場合は通常の `output_path.exists() && !overwrite` ガード経由で fall through。
+/// 注: `miv.version` (アプリのバージョン) は意図的に比較しない — アプリ更新だけで
+/// 完了済み出力を invalidate したくないため。
+fn detect_existing_completed_pair(job: &VideoUpscaleJob) -> Option<()> {
+    if !job.sidecar_path.exists() {
+        return None;
+    }
+    // 本編が非空であることを確認 (0 byte の壊れたファイルを「完了済み」扱いしない)
+    let video_len = std::fs::metadata(&job.output_path).ok()?.len();
+    if video_len == 0 {
+        return None;
+    }
+    let text = std::fs::read_to_string(&job.sidecar_path).ok()?;
+    let sidecar: VideoUpscaleSidecar = serde_json::from_str(&text).ok()?;
+    if !sidecar.is_valid_for_source(&job.source_path).ok()? {
+        return None;
+    }
+    // upscale 側
+    if sidecar.upscale.scale != job.options.scale.factor() {
+        return None;
+    }
+    if sidecar.upscale.model != job.options.model.model_kind().as_str() {
+        return None;
+    }
+    // encode 側 (現状ハードコードだが drift 検出のため全比較)
+    if sidecar.encode.quality_level != job.options.quality.level() {
+        return None;
+    }
+    if sidecar.encode.crf != job.options.quality.crf() {
+        return None;
+    }
+    if sidecar.encode.preset != job.options.quality.preset() {
+        return None;
+    }
+    if sidecar.encode.pixel_format != job.options.quality.pixel_format_name() {
+        return None;
+    }
+    if sidecar.encode.container != "mkv" {
+        return None;
+    }
+    if sidecar.encode.video_codec != "av1" {
+        return None;
+    }
+    if sidecar.encode.encoder != "libsvtav1" {
+        return None;
+    }
+    // output 側
+    let (expected_w, expected_h) = job.info.output_size(job.options.scale);
+    if sidecar.output.width != expected_w || sidecar.output.height != expected_h {
+        return None;
+    }
+    let expected_filename = job.output_path.file_name()?.to_string_lossy().into_owned();
+    if sidecar.output.path != expected_filename {
+        return None;
+    }
+    Some(())
+}
+
+fn cleanup_work_dir_after_completion(job: &VideoUpscaleJob) {
+    let work_dir = work_dir_for(&job.source_path);
+    if work_dir.exists() {
+        if let Err(e) = fs::remove_dir_all(&work_dir) {
+            crate::logger::log(format!(
+                "[VideoUpscale] 作業フォルダの削除に失敗しました (継続): {} {e}",
+                work_dir.display()
+            ));
+        }
+    }
+}
+
+/// T05: `work_dir` が「現 `job` と一致する manifest を持ち、計画上の **全** segment が
+/// 実ファイル付きで Done 状態である」かを判定する。`recover_interrupted_publish` が
+/// orphan video を削除して良いかの安全条件 (Codex round 6 反映で強化)。
+///
+/// interrupted publish は必ず「全 segment 完了 → final concat/mux → step 2 video rename」
+/// の後に発生する。つまり orphan video が観測されるなら計画上の全 segment が必ず
+/// reusable 状態のはず。1 segment だけ Done な partial 状態の work_dir + どこかから
+/// 紛れ込んだ無関係 .miv.mkv (例: ユーザーが手動配置) を「interrupted publish」と
+/// 誤認して削除しないように、強い条件を要求する。
+///
+/// 四重チェック:
+/// 1. manifest が読めて schema 一致
+/// 2. manifest が現 job と意味的に一致 (`validate_manifest_matches_job` と同じ)
+/// 3. plan が complete (= 全 segment が確定済み)
+/// 4. **計画上の全 segment** が `segment_done_and_reusable` を通過 (= state が Done で
+///    実ファイルサイズが manifest 記録と一致)
+fn work_dir_has_reusable_segments_for(job: &VideoUpscaleJob) -> bool {
+    let work_dir = work_dir_for(&job.source_path);
+    if !work_dir.exists() {
+        return false;
+    }
+    let manifest_path = work_dir.join(MANIFEST_FILE_NAME);
+    let Ok(manifest) = JobManifest::load(&manifest_path) else {
+        return false;
+    };
+    if !manifest.is_supported_schema() {
+        return false;
+    }
+    if validate_manifest_matches_job(&manifest, job).is_err() {
+        return false;
+    }
+    if !manifest.plan_is_complete() {
+        return false;
+    }
+    let Some(plan) = manifest.plan.as_ref() else {
+        return false;
+    };
+    if plan.segments.is_empty() {
+        return false;
+    }
+    plan.segments
+        .iter()
+        .all(|planned| segment_done_and_reusable(&manifest, &work_dir, planned.index))
+}
+
+/// T05: 前回 run がクラッシュした際の orphan state を掃除する。3-phase publish の
+/// 途中 (step 2 完了後・step 3 完了前) でプロセスが kill されると以下の orphan が
+/// 残りうる:
+/// - `<stem>.miv.json.staged`: 常に orphan (commit に失敗してそのまま残った)
+/// - `<stem>.miv.mkv` (sidecar が無い): step 2 完了直後にクラッシュした場合の
+///   新本編。元 pair が無かった初回出力ケースだけが該当する (overwrite モードでは
+///   旧 sidecar が残っているはずなので mismatched pair として next retry が
+///   handle する)
+///
+/// 後者は `work_dir` がまだあれば segment 再利用で速やかに再 publish できるので
+/// 削除して clean state にする。`work_dir` が既にない場合 (ユーザーが手動掃除した
+/// 等) は触らない — そのケースで本編を消すと数時間分の作業が消えるため、ユーザー
+/// 判断に委ねる。
+fn recover_interrupted_publish(job: &VideoUpscaleJob) {
+    // .json.staged は常に orphan (publish 中の中間ファイルで、最終配置先ではない)
+    let staged = job.sidecar_path.with_extension("json.staged");
+    if staged.exists() {
+        match fs::remove_file(&staged) {
+            Ok(_) => crate::logger::log(format!(
+                "[VideoUpscale] removed orphan staged sidecar from interrupted publish: {}",
+                staged.display()
+            )),
+            Err(e) => crate::logger::log(format!(
+                "[VideoUpscale] failed to remove orphan staged sidecar {}: {e}",
+                staged.display()
+            )),
+        }
+    }
+
+    // 本編はあるが sidecar が無い → 初回出力 publish 中クラッシュの可能性。
+    // 削除は **manifest が現 job と一致し、かつ再利用可能な Done segment
+    // (実ファイルサイズが manifest 記録と一致するもの) が 1 つ以上ある** 場合のみ。
+    // そうでなければ数時間分の encode を消すリスクがあるため、ログのみ出して
+    // ユーザー判断に委ねる。
+    if job.output_path.exists()
+        && !job.sidecar_path.exists()
+        && work_dir_has_reusable_segments_for(job)
+    {
+        match fs::remove_file(&job.output_path) {
+            Ok(_) => crate::logger::log(format!(
+                "[VideoUpscale] removed orphan video from interrupted publish (validated Done segments let next run re-publish quickly): {}",
+                job.output_path.display()
+            )),
+            Err(e) => crate::logger::log(format!(
+                "[VideoUpscale] failed to remove orphan video {}: {e}",
+                job.output_path.display()
+            )),
+        }
+    } else if job.output_path.exists() && !job.sidecar_path.exists() {
+        crate::logger::log(format!(
+            "[VideoUpscale] orphan video at {} without validated reusable segments; preserving for user inspection (manual sidecar regeneration or delete required to retry)",
+            job.output_path.display()
+        ));
+    }
+}
+
+/// run_job の最終フェーズ: 新 sidecar を staging → 本編 rename (atomic publish) →
+/// staged sidecar を commit (atomic replace)、の 3 段。`std::fs::rename` は Windows
+/// でも Linux でも既存ファイルを atomic に置き換えるため、旧 pair を明示削除せずに
+/// 上書き可能。旧 sidecar は step 3 完了まで自然に visible で居続けるので、
+/// 仮にプロセスが途中でクラッシュしても sidecar 不可視窓は発生しない。
+///
+/// 旧設計 (v0.8 以前) は (1) 本編 rename → (2) 非 atomic な sidecar write の順で、
+/// 中間でクラッシュすると本編が公開済み + sidecar 欠落の orphan ペアを作っていた
+/// (overwrite=false で retry が `出力ファイルがすでに存在します` ガードで止まる
+/// dead-end になる)。T05 で sidecar 先行 → atomic に変更したのが本関数。
+///
+/// 失敗モードとロールバック (Codex P2 反映):
+/// - **staging 失敗**: 何も触らずに `Err`。
+/// - **本編 rename 失敗**: staged を削除して `Err`。旧 pair は無傷。
+/// - **sidecar commit 失敗**:
+///   - 旧 pair が存在した場合 → 本編は新しくなったが旧 sidecar は自然に visible のまま
+///     残るので「新本編 + 旧 sidecar」mismatched pair になる (sidecar dims が古い)。
+///     次回再実行で全体が atomic に再構築されるので self-healing。
+///   - 旧 pair が存在しなかった場合 (初回出力) → 新本編を `.part` に戻してロールバック。
+///     これをしないと retry が `output_path.exists() && !overwrite` ガードで止まる
+///     dead-end になる。
+fn publish_finalized_outputs(
+    job: &VideoUpscaleJob,
+    part_path: &Path,
+    finalize_result: &FinalizeResult,
+    model_kind: ModelKind,
+    out_w: u32,
+    out_h: u32,
+) -> Result<(), String> {
     let source = source_info_for(&job.source_path)
         .map_err(|e| format!("元動画の情報を取得できません: {e}"))?;
     let sidecar = VideoUpscaleSidecar::new(
@@ -375,22 +628,46 @@ pub fn run_job(
             height: out_h,
         },
     );
-    let json = serde_json::to_string_pretty(&sidecar)
-        .map_err(|e| format!("sidecar JSONの作成に失敗しました: {e}"))?;
-    fs::write(&job.sidecar_path, json)
+
+    // Step 1: 新 sidecar を staging パスへ書き込む (atomic、まだユーザー可視の場所にはない)。
+    let staged_sidecar_path = job.sidecar_path.with_extension("json.staged");
+    save_json_atomic(&staged_sidecar_path, &sidecar)
         .map_err(|e| format!("sidecar JSONの保存に失敗しました: {e}"))?;
 
-    let work_dir = work_dir_for(&job.source_path);
-    if work_dir.exists() {
-        if let Err(e) = fs::remove_dir_all(&work_dir) {
-            crate::logger::log(format!(
-                "[VideoUpscale] 作業フォルダの削除に失敗しました (継続): {} {e}",
-                work_dir.display()
-            ));
-        }
+    // 旧本編の有無を覚えておく (step 3 失敗時に本編をロールバックするか判断するため)。
+    // 旧本編なし → 新本編は孤立すると retry guard を dead-end させるので rollback。
+    // 旧本編あり → overwrite=true 経由でしか到達できないので retry も overwrite=true で
+    // 走り直しできるため rollback 不要 (新本編 + 旧 sidecar の mismatched pair で残す)。
+    let had_old_video = job.output_path.exists();
+
+    // Step 2: 本編を atomic rename で公開 (Windows/Linux とも MOVEFILE_REPLACE_EXISTING
+    // 相当で既存を atomic 置換)。
+    if let Err(e) = fs::rename(part_path, &job.output_path) {
+        let _ = fs::remove_file(&staged_sidecar_path);
+        return Err(format!("出力ファイルの確定に失敗しました: {e}"));
     }
 
-    Ok(job.output_path)
+    // Step 3: 新 sidecar を commit (staged → final、atomic replace)。
+    if let Err(e) = fs::rename(&staged_sidecar_path, &job.sidecar_path) {
+        let _ = fs::remove_file(&staged_sidecar_path);
+        // 旧本編が無かった (初回出力 or 旧 sidecar のみ残った異常状態) なら新本編を
+        // `.part` に戻してロールバック。これをしないと output_path に新本編が孤立し、
+        // 次回 retry が `output_path.exists() && !overwrite` ガードに弾かれて dead-end する。
+        // 旧本編があった場合は overwrite モード必須 (start of run_job のガード経由) なので
+        // retry も overwrite=true で来るため dead-end しない → 新本編を残して
+        // 旧 sidecar (atomic replace 未実施なのでまだ visible) との mismatched pair に。
+        if !had_old_video {
+            if let Err(rollback_err) = fs::rename(&job.output_path, part_path) {
+                crate::logger::log(format!(
+                    "[VideoUpscale] sidecar commit + video rollback failed: \
+                     sidecar={e}, rollback={rollback_err}"
+                ));
+            }
+        }
+        return Err(format!("sidecar JSONのコミットに失敗しました: {e}"));
+    }
+
+    Ok(())
 }
 
 fn probe_video_info(path: &Path) -> Result<VideoInfo, String> {
@@ -617,14 +894,23 @@ fn run_segmented_video_only(
         .map_err(|e| format!("segment作業フォルダを作成できません: {e}"))?;
 
     let manifest_path = manifest_path_for(&job.source_path);
-    let mut manifest = if manifest_path.exists() {
-        JobManifest::load(&manifest_path)
-            .map_err(|e| format!("failed to load segment manifest: {e}"))?
+    let (mut manifest, was_loaded_from_disk) = if manifest_path.exists() {
+        let m = JobManifest::load(&manifest_path)
+            .map_err(|e| format!("failed to load segment manifest: {e}"))?;
+        (m, true)
     } else {
-        create_initial_manifest(job)?
+        (create_initial_manifest(job)?, false)
     };
     if !manifest.is_supported_schema() {
         return Err("unsupported segment manifest schema".to_owned());
+    }
+    // T04: 既存 manifest を再開する前に、現在の job (source / 出力サイズ / オプション)
+    // と一致しているかを必ず検証する。同名で内容が異なるソースに差し替えた、もしくは
+    // 解像度・品質・モデルを変えて retry した場合に、旧 segment と新 segment を
+    // 無言で concat して破損動画を作るのを防ぐ。新規 manifest (just created from job)
+    // は定義上一致するので validation はスキップして余分な hash 計算を避ける。
+    if was_loaded_from_disk {
+        validate_manifest_matches_job(&manifest, job)?;
     }
     ensure_plan(job, &mut manifest, cancel)?;
     manifest
@@ -1023,6 +1309,101 @@ fn run_segments_parallel(
     if let Some(err) = first_error {
         return Err(err);
     }
+    Ok(())
+}
+
+/// T04 (v0.9.0): 既存 manifest を再開する前に、`job` が表す現在の入力/出力/オプションと
+/// 一致しているかを検証する。一致しなければ `Err` を返す。エラー文字列は
+/// `ui_dialogs::video_upscale::failure_reason_from_error_text` が `StaleSource` /
+/// `PlanDrift` に分類できるキーワード (`"stale source"` / `"segment plan drift"`) を含む。
+///
+/// 検証項目:
+/// - **Source identity**: `file_name` / `size` / `head_tail_sha256` / `time_base` を現在の
+///   ファイルと比較。`mtime_unix_ms` はクラウド同期ツールが本体を変えずに書き換える
+///   ことがあるため意図的に**比較しない** (sidecar.rs と同じ方針)。
+/// - **Output dims**: manifest 記録の width × height が現 `job.info.output_size(scale)`
+///   と一致するか。
+/// - **Options**: scale / model / quality_level / container / video_codec / encoder の
+///   すべてを比較。container/video_codec/encoder は現状ハードコードだが、比較するだけ
+///   なので将来の drift にも追従できる。
+///
+/// 失敗時、呼び出し側 (`run_segmented_video_only`) はそのまま `Err` を伝搬し、UI 側で
+/// 失敗タスクとして表示される。ユーザーは Cancel (work_dir 削除) → 再登録で
+/// 進められる。本関数は work_dir を自動削除しない (= false positive で数時間分の
+/// 完了 segment を失う事故を避けるため、ユーザー明示判断を必須にする)。
+fn validate_manifest_matches_job(
+    manifest: &JobManifest,
+    job: &VideoUpscaleJob,
+) -> Result<(), String> {
+    let current = source_info_for(&job.source_path)
+        .map_err(|e| format!("stale source: failed to read source info: {e}"))?;
+    if manifest.source.file_name != current.file_name {
+        return Err(format!(
+            "stale source: file name changed (manifest={}, current={})",
+            manifest.source.file_name, current.file_name
+        ));
+    }
+    if manifest.source.size != current.size {
+        return Err(format!(
+            "stale source: size changed (manifest={}B, current={}B)",
+            manifest.source.size, current.size
+        ));
+    }
+    if manifest.source.head_tail_sha256 != current.head_tail_sha256 {
+        return Err("stale source: head/tail content hash mismatch".to_owned());
+    }
+    if manifest.source.time_base != job.info.source_time_base {
+        return Err("segment plan drift: source time base changed".to_owned());
+    }
+
+    let (expected_w, expected_h) = job.info.output_size(job.options.scale);
+    if manifest.output.width != expected_w || manifest.output.height != expected_h {
+        return Err(format!(
+            "segment plan drift: output dimensions changed (manifest={}x{}, current={}x{})",
+            manifest.output.width, manifest.output.height, expected_w, expected_h
+        ));
+    }
+
+    let expected_scale = job.options.scale.factor();
+    if manifest.options.scale != expected_scale {
+        return Err(format!(
+            "segment plan drift: scale changed (manifest={}, current={})",
+            manifest.options.scale, expected_scale
+        ));
+    }
+    let expected_model = job.options.model.model_kind().as_str();
+    if manifest.options.model != expected_model {
+        return Err(format!(
+            "segment plan drift: model changed (manifest={}, current={})",
+            manifest.options.model, expected_model
+        ));
+    }
+    let expected_quality = job.options.quality.level();
+    if manifest.options.quality_level != expected_quality {
+        return Err(format!(
+            "segment plan drift: quality level changed (manifest={}, current={})",
+            manifest.options.quality_level, expected_quality
+        ));
+    }
+    if manifest.options.container != "mkv" {
+        return Err(format!(
+            "segment plan drift: container changed (manifest={}, current=mkv)",
+            manifest.options.container
+        ));
+    }
+    if manifest.options.video_codec != "av1" {
+        return Err(format!(
+            "segment plan drift: video codec changed (manifest={}, current=av1)",
+            manifest.options.video_codec
+        ));
+    }
+    if manifest.options.encoder != "libsvtav1" {
+        return Err(format!(
+            "segment plan drift: encoder changed (manifest={}, current=libsvtav1)",
+            manifest.options.encoder
+        ));
+    }
+
     Ok(())
 }
 
@@ -2547,5 +2928,704 @@ mod tests {
         manifest.segments[0].size = 3;
         manifest.segments[0].state = SegmentState::Failed;
         assert!(!segment_done_and_reusable(&manifest, &work_dir, 0));
+    }
+
+    /// T04: 現 source の `source_info` を読み取り、`test_job` と整合する manifest と
+    /// `VideoUpscaleJob` のペアを作る。テスト本体はこのペアの片方を改変して
+    /// `validate_manifest_matches_job` の失敗経路を確認する。
+    fn matched_job_and_manifest(temp: &tempfile::TempDir) -> (VideoUpscaleJob, JobManifest) {
+        let source = temp.path().join("clip.mp4");
+        fs::write(&source, b"some video content for validate testing").unwrap();
+        let source_info = source_info_for(&source).unwrap();
+
+        let mut job = test_job(Some(120));
+        job.source_path = source;
+        job.output_path = temp.path().join("clip.miv.mkv");
+        job.sidecar_path = temp.path().join("clip.miv.json");
+
+        let (out_w, out_h) = job.info.output_size(job.options.scale);
+
+        let manifest = JobManifest::new(
+            uuid::Uuid::new_v4(),
+            ManifestSource {
+                file_name: source_info.file_name,
+                size: source_info.size,
+                mtime_unix_ms: source_info.mtime_unix_ms,
+                head_tail_sha256: source_info.head_tail_sha256,
+                time_base: job.info.source_time_base,
+            },
+            ManifestOutput {
+                final_path: PathBuf::from("clip.miv.mkv"),
+                sidecar_path: PathBuf::from("clip.miv.json"),
+                width: out_w,
+                height: out_h,
+            },
+            ManifestOptions {
+                scale: job.options.scale.factor(),
+                model: job.options.model.model_kind().as_str().to_owned(),
+                quality_level: job.options.quality.level(),
+                container: "mkv".to_owned(),
+                video_codec: "av1".to_owned(),
+                encoder: "libsvtav1".to_owned(),
+            },
+            120,
+        );
+
+        (job, manifest)
+    }
+
+    #[test]
+    fn validate_passes_for_matching_job_and_manifest() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, manifest) = matched_job_and_manifest(&temp);
+        assert!(validate_manifest_matches_job(&manifest, &job).is_ok());
+    }
+
+    #[test]
+    fn validate_ignores_mtime_drift() {
+        // sync tools rewrite mtime; head_tail_sha256 / size catch real content change.
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, mut manifest) = matched_job_and_manifest(&temp);
+        manifest.source.mtime_unix_ms = 0;
+        assert!(validate_manifest_matches_job(&manifest, &job).is_ok());
+        manifest.source.mtime_unix_ms = u64::MAX;
+        assert!(validate_manifest_matches_job(&manifest, &job).is_ok());
+    }
+
+    #[test]
+    fn validate_detects_stale_source_on_size_change() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, mut manifest) = matched_job_and_manifest(&temp);
+        manifest.source.size += 1;
+        let err = validate_manifest_matches_job(&manifest, &job).unwrap_err();
+        assert!(err.contains("stale source"), "{err}");
+        assert!(err.contains("size changed"), "{err}");
+    }
+
+    #[test]
+    fn validate_detects_stale_source_on_content_hash_change() {
+        // Source overwritten with different content of same size (file_name + size match).
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, manifest) = matched_job_and_manifest(&temp);
+        fs::write(&job.source_path, b"some video XXXXXXX for validate testing").unwrap();
+        let err = validate_manifest_matches_job(&manifest, &job).unwrap_err();
+        assert!(err.contains("stale source"), "{err}");
+        assert!(err.contains("hash mismatch"), "{err}");
+    }
+
+    #[test]
+    fn validate_detects_stale_source_on_file_name_change() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, mut manifest) = matched_job_and_manifest(&temp);
+        manifest.source.file_name = "renamed.mp4".to_owned();
+        let err = validate_manifest_matches_job(&manifest, &job).unwrap_err();
+        assert!(err.contains("stale source"), "{err}");
+        assert!(err.contains("file name changed"), "{err}");
+    }
+
+    #[test]
+    fn validate_detects_plan_drift_on_time_base_change() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, mut manifest) = matched_job_and_manifest(&temp);
+        manifest.source.time_base = TimeBase::new(1, 30_000);
+        let err = validate_manifest_matches_job(&manifest, &job).unwrap_err();
+        assert!(err.contains("segment plan drift"), "{err}");
+        assert!(err.contains("time base"), "{err}");
+    }
+
+    #[test]
+    fn validate_detects_plan_drift_on_output_dim_change() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, mut manifest) = matched_job_and_manifest(&temp);
+        manifest.output.width += 1;
+        let err = validate_manifest_matches_job(&manifest, &job).unwrap_err();
+        assert!(err.contains("segment plan drift"), "{err}");
+        assert!(err.contains("dimensions"), "{err}");
+    }
+
+    #[test]
+    fn validate_detects_plan_drift_on_scale_change() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, mut manifest) = matched_job_and_manifest(&temp);
+        manifest.options.scale = 4;
+        let err = validate_manifest_matches_job(&manifest, &job).unwrap_err();
+        assert!(err.contains("segment plan drift"), "{err}");
+        assert!(err.contains("scale"), "{err}");
+    }
+
+    #[test]
+    fn validate_detects_plan_drift_on_model_change() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, mut manifest) = matched_job_and_manifest(&temp);
+        manifest.options.model = "different_model".to_owned();
+        let err = validate_manifest_matches_job(&manifest, &job).unwrap_err();
+        assert!(err.contains("segment plan drift"), "{err}");
+        assert!(err.contains("model"), "{err}");
+    }
+
+    #[test]
+    fn validate_detects_plan_drift_on_quality_change() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, mut manifest) = matched_job_and_manifest(&temp);
+        manifest.options.quality_level = 1;
+        let err = validate_manifest_matches_job(&manifest, &job).unwrap_err();
+        assert!(err.contains("segment plan drift"), "{err}");
+        assert!(err.contains("quality"), "{err}");
+    }
+
+    #[test]
+    fn validate_detects_plan_drift_on_encoder_field_change() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, mut manifest) = matched_job_and_manifest(&temp);
+        manifest.options.encoder = "x265".to_owned();
+        let err = validate_manifest_matches_job(&manifest, &job).unwrap_err();
+        assert!(err.contains("segment plan drift"), "{err}");
+        assert!(err.contains("encoder"), "{err}");
+    }
+
+    #[test]
+    fn validate_detects_plan_drift_on_container_change() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, mut manifest) = matched_job_and_manifest(&temp);
+        manifest.options.container = "mp4".to_owned();
+        let err = validate_manifest_matches_job(&manifest, &job).unwrap_err();
+        assert!(err.contains("segment plan drift"), "{err}");
+        assert!(err.contains("container"), "{err}");
+    }
+
+    #[test]
+    fn validate_detects_plan_drift_on_video_codec_change() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, mut manifest) = matched_job_and_manifest(&temp);
+        manifest.options.video_codec = "h264".to_owned();
+        let err = validate_manifest_matches_job(&manifest, &job).unwrap_err();
+        assert!(err.contains("segment plan drift"), "{err}");
+        assert!(err.contains("video codec"), "{err}");
+    }
+
+    /// 各検証エラー文字列が `ui_dialogs::video_upscale::failure_reason_from_error_text`
+    /// の分類器で正しく `StaleSource` / `PlanDrift` に振り分けられることを確認する。
+    /// 分類器のロジックそのもの (lower.contains の連鎖) はそちらのテストでカバーされる
+    /// 想定だが、validate 側が出すキーワードがそこに通る前提を毎リリースで確認する。
+    #[test]
+    fn validate_errors_contain_classifier_keywords() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, mut manifest) = matched_job_and_manifest(&temp);
+
+        manifest.source.size += 1;
+        let stale_err = validate_manifest_matches_job(&manifest, &job).unwrap_err();
+        assert!(stale_err.to_lowercase().contains("stale"));
+
+        manifest.source.size -= 1;
+        manifest.options.scale = 4;
+        let drift_err = validate_manifest_matches_job(&manifest, &job).unwrap_err();
+        let lower = drift_err.to_lowercase();
+        assert!(lower.contains("plan_drift") || lower.contains("segment plan drift"));
+    }
+
+    #[test]
+    fn validate_detects_stale_source_when_file_missing() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (mut job, manifest) = matched_job_and_manifest(&temp);
+        job.source_path = temp.path().join("does_not_exist.mp4");
+        let err = validate_manifest_matches_job(&manifest, &job).unwrap_err();
+        assert!(err.contains("stale source"), "{err}");
+        assert!(err.contains("failed to read source info"), "{err}");
+    }
+
+    /// T05: publish_finalized_outputs の成功・ロールバック挙動。
+    fn test_finalize_result() -> FinalizeResult {
+        FinalizeResult {
+            audio_sidecar_value: "copy",
+        }
+    }
+
+    #[test]
+    fn publish_creates_pair_when_none_exists() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        let part_path = temp.path().join("clip.miv.mkv.part");
+        fs::write(&part_path, b"new video bytes").unwrap();
+
+        assert!(!job.output_path.exists());
+        assert!(!job.sidecar_path.exists());
+
+        publish_finalized_outputs(
+            &job,
+            &part_path,
+            &test_finalize_result(),
+            ModelKind::UpscaleRealEsrGeneralV3,
+            640,
+            480,
+        )
+        .unwrap();
+
+        assert!(job.output_path.exists(), "video should be published");
+        assert!(job.sidecar_path.exists(), "sidecar should be published");
+        assert!(!part_path.exists(), "part_path consumed by rename");
+        // staged を残さない
+        assert!(!job.sidecar_path.with_extension("json.staged").exists());
+    }
+
+    #[test]
+    fn publish_overwrites_existing_pair_atomically() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        // 旧 pair をあらかじめ用意
+        fs::write(&job.output_path, b"OLD video bytes").unwrap();
+        fs::write(&job.sidecar_path, b"{\"schema\":99,\"old\":true}").unwrap();
+        let part_path = temp.path().join("clip.miv.mkv.part");
+        fs::write(&part_path, b"NEW video bytes").unwrap();
+
+        publish_finalized_outputs(
+            &job,
+            &part_path,
+            &test_finalize_result(),
+            ModelKind::UpscaleRealEsrGeneralV3,
+            640,
+            480,
+        )
+        .unwrap();
+
+        let video = fs::read(&job.output_path).unwrap();
+        assert_eq!(video, b"NEW video bytes");
+        let sidecar_text = fs::read_to_string(&job.sidecar_path).unwrap();
+        assert!(
+            sidecar_text.contains("\"schema\""),
+            "new sidecar should be JSON: {sidecar_text}"
+        );
+        assert!(
+            !sidecar_text.contains("\"old\""),
+            "old sidecar should be replaced: {sidecar_text}"
+        );
+        assert!(!part_path.exists());
+        assert!(!job.sidecar_path.with_extension("json.staged").exists());
+    }
+
+    #[test]
+    fn publish_returns_err_and_preserves_old_pair_when_video_rename_fails() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        // 旧 pair をあらかじめ用意
+        fs::write(&job.output_path, b"OLD video bytes").unwrap();
+        let old_sidecar_text = "{\"schema\":99,\"old\":true}";
+        fs::write(&job.sidecar_path, old_sidecar_text).unwrap();
+        // part_path を意図的に作らない → fs::rename が NotFound で失敗する
+        let part_path = temp.path().join("clip.miv.mkv.part");
+        assert!(!part_path.exists());
+
+        let err = publish_finalized_outputs(
+            &job,
+            &part_path,
+            &test_finalize_result(),
+            ModelKind::UpscaleRealEsrGeneralV3,
+            640,
+            480,
+        )
+        .unwrap_err();
+        assert!(err.contains("出力ファイルの確定に失敗"), "{err}");
+
+        // step 2 失敗 + 旧 pair 無傷: 旧本編・旧 sidecar は触っていない
+        let video = fs::read(&job.output_path).unwrap();
+        assert_eq!(video, b"OLD video bytes", "old video must be intact");
+        let sidecar = fs::read_to_string(&job.sidecar_path).unwrap();
+        assert_eq!(sidecar, old_sidecar_text, "old sidecar must be intact");
+        // staged は cleanup されている
+        assert!(!job.sidecar_path.with_extension("json.staged").exists());
+    }
+
+    #[test]
+    fn recover_clears_orphan_staged_sidecar() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        let staged = job.sidecar_path.with_extension("json.staged");
+        fs::write(&staged, b"{\"orphan\":true}").unwrap();
+        assert!(staged.exists());
+
+        recover_interrupted_publish(&job);
+        assert!(
+            !staged.exists(),
+            "staged orphan should be removed at run_job start"
+        );
+    }
+
+    /// `work_dir` に「現 job と一致する manifest + plan complete + 全 planned segment が
+    /// 実ファイル付き Done」な状態を構築する。`recover_interrupted_publish` が orphan
+    /// video を削除して安全な条件 (manifest match + plan complete + all reusable) を満たす。
+    fn populate_work_dir_with_reusable_done_segment(job: &VideoUpscaleJob) {
+        let work_dir = work_dir_for(&job.source_path);
+        fs::create_dir_all(segments_dir_for(&work_dir)).unwrap();
+        let segment_file = segment_path(&work_dir, 0);
+        let segment_bytes = b"segment bytes";
+        fs::write(&segment_file, segment_bytes).unwrap();
+        let source = source_info_for(&job.source_path).unwrap();
+        let (out_w, out_h) = job.info.output_size(job.options.scale);
+        let mut manifest = JobManifest::new(
+            uuid::Uuid::new_v4(),
+            ManifestSource {
+                file_name: source.file_name,
+                size: source.size,
+                mtime_unix_ms: source.mtime_unix_ms,
+                head_tail_sha256: source.head_tail_sha256,
+                time_base: job.info.source_time_base,
+            },
+            ManifestOutput {
+                final_path: PathBuf::from("clip.miv.mkv"),
+                sidecar_path: PathBuf::from("clip.miv.json"),
+                width: out_w,
+                height: out_h,
+            },
+            ManifestOptions {
+                scale: job.options.scale.factor(),
+                model: job.options.model.model_kind().as_str().to_owned(),
+                quality_level: job.options.quality.level(),
+                container: "mkv".to_owned(),
+                video_codec: "av1".to_owned(),
+                encoder: "libsvtav1".to_owned(),
+            },
+            120,
+        );
+        manifest.plan = Some(SegmentPlan {
+            strategy: SegmentPlanStrategy::FrameBased,
+            state: SegmentPlanState::Complete,
+            scan_progress_pts: None,
+            segments: vec![PlannedSegment {
+                index: 0,
+                target_start_frame: 0,
+                target_end_frame_exclusive: 120,
+                target_start_pts: 0,
+                target_end_pts: 120,
+                seek_start_frame: 0,
+                seek_start_pts: 0,
+            }],
+        });
+        manifest.segments.push(SegmentEntry {
+            index: 0,
+            path: PathBuf::from("segments/000000.mkv"),
+            state: SegmentState::Done,
+            output_frame_start: 0,
+            output_frame_count: 120,
+            output_total_pts_ticks: 5000,
+            output_time_base: TimeBase::new(1, 1000),
+            source_start_pts: 0,
+            source_last_pts: 119,
+            size: segment_bytes.len() as u64,
+            mtime_unix_ms: 0,
+            worker_id: None,
+            worker_pid: None,
+            worker_started_unix_ms: None,
+        });
+        manifest
+            .save_atomic(&work_dir.join(MANIFEST_FILE_NAME))
+            .unwrap();
+    }
+
+    #[test]
+    fn recover_clears_first_time_orphan_video_when_work_dir_has_reusable_segments() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        fs::write(&job.output_path, b"orphan video bytes").unwrap();
+        assert!(!job.sidecar_path.exists());
+        populate_work_dir_with_reusable_done_segment(&job);
+
+        recover_interrupted_publish(&job);
+        assert!(
+            !job.output_path.exists(),
+            "orphan video should be removed when manifest matches + reusable Done segment exists"
+        );
+    }
+
+    #[test]
+    fn recover_preserves_orphan_video_when_only_subset_of_planned_segments_done() {
+        // Codex round 6: plan に 2 segments、片方だけ Done な状態。
+        // interrupted publish なら全 segments 完了済みのはず → 片方だけ Done な状態は
+        // ユーザーが encoding 中に kill した状態であり、orphan video は無関係な
+        // 紛れ込み (= 削除してはいけない)。
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        fs::write(&job.output_path, b"valuable orphan").unwrap();
+
+        // 上の helper をベースにして 2 segment plan に書き換える
+        let work_dir = work_dir_for(&job.source_path);
+        populate_work_dir_with_reusable_done_segment(&job);
+        let manifest_path = work_dir.join(MANIFEST_FILE_NAME);
+        let mut manifest = JobManifest::load(&manifest_path).unwrap();
+        // plan に 2 つ目を追加
+        if let Some(plan) = manifest.plan.as_mut() {
+            plan.segments.push(PlannedSegment {
+                index: 1,
+                target_start_frame: 120,
+                target_end_frame_exclusive: 240,
+                target_start_pts: 120,
+                target_end_pts: 240,
+                seek_start_frame: 120,
+                seek_start_pts: 120,
+            });
+        }
+        manifest.save_atomic(&manifest_path).unwrap();
+
+        recover_interrupted_publish(&job);
+        assert!(
+            job.output_path.exists(),
+            "orphan must be preserved when not all planned segments are reusable"
+        );
+    }
+
+    #[test]
+    fn recover_preserves_orphan_video_when_segment_file_size_mismatches_manifest() {
+        // P2 (Codex round 5): Done だが実ファイルサイズが manifest 記録と不一致な
+        // segment は再利用できない → orphan を削除しない。
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        fs::write(&job.output_path, b"valuable orphan").unwrap();
+        populate_work_dir_with_reusable_done_segment(&job);
+        // segment ファイルを切り詰めて manifest 記録のサイズと不一致にする
+        let segment_file = segment_path(&work_dir_for(&job.source_path), 0);
+        fs::write(&segment_file, b"truncated").unwrap();
+
+        recover_interrupted_publish(&job);
+        assert!(
+            job.output_path.exists(),
+            "orphan video must be preserved when segment file size diverges from manifest"
+        );
+    }
+
+    #[test]
+    fn recover_preserves_orphan_video_when_manifest_does_not_match_job() {
+        // P2 (Codex round 5): manifest が現 job と source/options が一致しない場合は
+        // 再利用できない → orphan を削除しない。
+        let temp = tempfile::TempDir::new().unwrap();
+        let (mut job, _) = matched_job_and_manifest(&temp);
+        fs::write(&job.output_path, b"valuable orphan").unwrap();
+        populate_work_dir_with_reusable_done_segment(&job);
+        // populate 後に scale を変更 → manifest と job が drift
+        job.options.scale = VideoUpscaleScale::X4;
+
+        recover_interrupted_publish(&job);
+        assert!(
+            job.output_path.exists(),
+            "orphan video must be preserved when manifest doesn't match current job"
+        );
+    }
+
+    #[test]
+    fn recover_preserves_orphan_video_when_no_work_dir() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        fs::write(&job.output_path, b"valuable orphan video").unwrap();
+        let work_dir = work_dir_for(&job.source_path);
+        assert!(!work_dir.exists());
+
+        recover_interrupted_publish(&job);
+        assert!(
+            job.output_path.exists(),
+            "orphan video must be preserved when work_dir is missing"
+        );
+    }
+
+    #[test]
+    fn recover_preserves_orphan_video_when_work_dir_is_empty() {
+        // P2 (Codex round 4): work_dir.exists() だけでは「Done segment あり」を
+        // 保証しない。空 work_dir では orphan を削除しない。
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        fs::write(&job.output_path, b"valuable orphan video").unwrap();
+        let work_dir = work_dir_for(&job.source_path);
+        fs::create_dir_all(&work_dir).unwrap();
+        // manifest も segment も無い
+
+        recover_interrupted_publish(&job);
+        assert!(
+            job.output_path.exists(),
+            "orphan video must be preserved when work_dir has no reusable segments"
+        );
+    }
+
+    #[test]
+    fn detect_existing_pair_rejects_zero_byte_video() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        fs::write(&job.output_path, b"").unwrap();
+        write_matching_sidecar(&job);
+        assert!(
+            detect_existing_completed_pair(&job).is_none(),
+            "0-byte video must not be treated as completed"
+        );
+    }
+
+    #[test]
+    fn recover_preserves_orphan_video_when_manifest_has_no_done_segments() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        fs::write(&job.output_path, b"valuable orphan video").unwrap();
+        let work_dir = work_dir_for(&job.source_path);
+        fs::create_dir_all(segments_dir_for(&work_dir)).unwrap();
+        let mut manifest = test_manifest(120);
+        manifest.segments.push(SegmentEntry {
+            index: 0,
+            path: PathBuf::from("segments/000000.mkv"),
+            state: SegmentState::Pending, // not Done
+            output_frame_start: 0,
+            output_frame_count: 0,
+            output_total_pts_ticks: 0,
+            output_time_base: TimeBase::new(1, 1000),
+            source_start_pts: 0,
+            source_last_pts: 0,
+            size: 0,
+            mtime_unix_ms: 0,
+            worker_id: None,
+            worker_pid: None,
+            worker_started_unix_ms: None,
+        });
+        manifest
+            .save_atomic(&work_dir.join(MANIFEST_FILE_NAME))
+            .unwrap();
+
+        recover_interrupted_publish(&job);
+        assert!(
+            job.output_path.exists(),
+            "orphan video must be preserved when no Done segments exist"
+        );
+    }
+
+    #[test]
+    fn recover_does_not_touch_healthy_pair() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        fs::write(&job.output_path, b"video").unwrap();
+        fs::write(&job.sidecar_path, b"{\"healthy\":true}").unwrap();
+
+        recover_interrupted_publish(&job);
+        assert!(job.output_path.exists());
+        assert!(job.sidecar_path.exists());
+    }
+
+    /// T05: pair が現 job と一致する場合の `detect_existing_completed_pair` を helper で構築。
+    /// 一致条件を 1 つだけ変えることで個別フィールドの不一致テストを書きやすくする。
+    fn write_matching_sidecar(job: &VideoUpscaleJob) {
+        let source = source_info_for(&job.source_path).unwrap();
+        let (out_w, out_h) = job.info.output_size(job.options.scale);
+        let sidecar = VideoUpscaleSidecar::new(
+            source,
+            UpscaleInfo {
+                scale: job.options.scale.factor(),
+                model: job.options.model.model_kind().as_str().to_owned(),
+            },
+            EncodeInfo {
+                container: "mkv".to_owned(),
+                video_codec: "av1".to_owned(),
+                encoder: "libsvtav1".to_owned(),
+                quality_level: job.options.quality.level(),
+                crf: job.options.quality.crf(),
+                preset: job.options.quality.preset(),
+                pixel_format: job.options.quality.pixel_format_name().to_owned(),
+                audio: "copy".to_owned(),
+            },
+            OutputInfo {
+                path: job
+                    .output_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap(),
+                width: out_w,
+                height: out_h,
+            },
+        );
+        save_json_atomic(&job.sidecar_path, &sidecar).unwrap();
+    }
+
+    #[test]
+    fn detect_existing_pair_recognizes_matching_pair() {
+        // P2-3: crash 後 + queue mark_done 前のシナリオ。pair が現 job と一致するなら
+        // 既完了として早期 Ok する。
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        fs::write(&job.output_path, b"video bytes").unwrap();
+        write_matching_sidecar(&job);
+
+        assert!(detect_existing_completed_pair(&job).is_some());
+    }
+
+    #[test]
+    fn detect_existing_pair_rejects_when_only_one_side_present() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        fs::write(&job.output_path, b"video").unwrap();
+        // sidecar 無し
+        assert!(detect_existing_completed_pair(&job).is_none());
+
+        // 逆: sidecar あり、video 無し
+        fs::remove_file(&job.output_path).unwrap();
+        write_matching_sidecar(&job);
+        assert!(detect_existing_completed_pair(&job).is_none());
+    }
+
+    #[test]
+    fn detect_existing_pair_rejects_stale_sidecar_source() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        fs::write(&job.output_path, b"video").unwrap();
+        write_matching_sidecar(&job);
+        // sidecar 書き込み後にソースを差し替え → head_tail_sha256 不一致
+        fs::write(
+            &job.source_path,
+            b"different source content for validate testing",
+        )
+        .unwrap();
+        assert!(detect_existing_completed_pair(&job).is_none());
+    }
+
+    #[test]
+    fn detect_existing_pair_rejects_on_scale_drift() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (mut job, _) = matched_job_and_manifest(&temp);
+        fs::write(&job.output_path, b"video").unwrap();
+        write_matching_sidecar(&job);
+        // sidecar 書き込み後に job 側の scale を変える
+        job.options.scale = VideoUpscaleScale::X4;
+        assert!(detect_existing_completed_pair(&job).is_none());
+    }
+
+    #[test]
+    fn detect_existing_pair_rejects_corrupt_sidecar_json() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        fs::write(&job.output_path, b"video").unwrap();
+        fs::write(&job.sidecar_path, b"{ corrupt JSON").unwrap();
+        assert!(detect_existing_completed_pair(&job).is_none());
+    }
+
+    /// T05 P2 修正の核: 初回出力 (旧 pair なし) で本編 rename が失敗するケース。
+    /// staged sidecar が削除されること + 新本編が孤立して output_path に残らない
+    /// ことを確認する (= 次回 retry の overwrite=false ガードに弾かれない)。
+    #[test]
+    fn publish_does_not_leak_video_or_staged_on_first_time_video_rename_failure() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let (job, _) = matched_job_and_manifest(&temp);
+        // 旧 pair を**作らない** (= 初回出力シミュレーション)
+        assert!(!job.output_path.exists());
+        assert!(!job.sidecar_path.exists());
+        // part_path も作らない → step 2 (fs::rename) が NotFound で失敗
+        let part_path = temp.path().join("clip.miv.mkv.part");
+
+        let err = publish_finalized_outputs(
+            &job,
+            &part_path,
+            &test_finalize_result(),
+            ModelKind::UpscaleRealEsrGeneralV3,
+            640,
+            480,
+        )
+        .unwrap_err();
+        assert!(err.contains("出力ファイルの確定に失敗"), "{err}");
+        assert!(
+            !job.output_path.exists(),
+            "no new video should be left behind"
+        );
+        assert!(
+            !job.sidecar_path.exists(),
+            "no new sidecar should be left behind"
+        );
+        assert!(!job.sidecar_path.with_extension("json.staged").exists());
     }
 }
