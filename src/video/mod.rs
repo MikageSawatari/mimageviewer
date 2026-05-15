@@ -2775,6 +2775,11 @@ fn run_native_video_output(
     }
     first_presented_out.store(false, Ordering::Release);
     hwnd_out.store(0, Ordering::Release);
+    // T27 (Claude R3-7): cancel 経路 (line 1335, 1346) は hud_hwnd_out=0 をクリアするが、
+    // 正常終了 (= WM_QUIT loop exit) では従来クリアし忘れていた。destroy 済 stale HUD
+    // HWND が `dsp_bridge.set_hud_hwnd(...)` で渡されたままになり、raise allowlist に
+    // 数フレーム残って次の動画開始直後の foreground 切替を阻害していた。
+    hud_hwnd_out.store(0, Ordering::Release);
     window.destroy();
     closed.store(true, Ordering::Release);
     crate::logger::log("[native-video] fullscreen presenter stopped".to_string());

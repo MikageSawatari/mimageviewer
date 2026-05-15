@@ -3676,8 +3676,22 @@ impl App {
         // が `user_hidden=false` を clear する)。
         self.dsp_bridge.set_all_guis_topmost(opening);
         std::sync::Arc::clone(&self.dsp_bridge).set_all_guis_visible_async(opening);
-        self.settings.vst3_gui_visible = opening;
-        self.settings.save();
+        // T23 (Claude R3-11): bridge が `Disabled` / `Error` のときは settings 永続化を
+        // スキップする。bridge 死亡時に opening=true で save すると次回起動時に「VST3 GUI
+        // 表示」設定が残り、bridge 再起動時に予期せず全 GUI が一斉に開く違和感がある。
+        // 「ユーザーが今操作した結果が表に出ていない」ときは settings を変えない方針。
+        if matches!(
+            self.dsp_bridge.state(),
+            crate::video::dsp::DspState::Enabled
+        ) {
+            self.settings.vst3_gui_visible = opening;
+            self.settings.save();
+        } else {
+            crate::logger::log(format!(
+                "toggle_native_video_vst3_gui: bridge state={:?}, skipping settings save",
+                self.dsp_bridge.state()
+            ));
+        }
     }
 
     #[cfg(windows)]

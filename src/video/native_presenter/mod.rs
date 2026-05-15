@@ -1423,8 +1423,11 @@ impl NativeVideoPresenter {
         if self.width == width && self.height == height {
             return Ok(());
         }
-        self.width = width;
-        self.height = height;
+        // T26 (Codex P2 2026-05-16): self.width/height は **inner resize がすべて成功した後** に
+        // 更新する。途中で失敗すると self.width だけ更新されて size 一致になり、次回同 size
+        // 呼び出しで early-return → 失敗が永久に残る。子側 (`_background`, overlays) は
+        // 自身の backbuffer.is_some() で個別に retry できる (T26 子側の fix) ので、外側は
+        // 子の Ok を全部見届けるまで自分の state を進めない方針にする。
         self._background
             .resize(&self.d3d_device1, &self.d3d_context, width, height)?;
         self.update_video_visual_transform()?;
@@ -1440,6 +1443,9 @@ impl NativeVideoPresenter {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.resize(width, height)?;
         }
+        // 全 inner resize 成功で初めて self.width/height を進める。
+        self.width = width;
+        self.height = height;
         log_event(
             "resize",
             &[
@@ -3058,7 +3064,11 @@ impl NativeBlackBackground {
     ) -> Result<(), String> {
         let width = width.max(1);
         let height = height.max(1);
-        if self.width == width && self.height == height {
+        // T26 (Claude R3-6): backbuffer が None なら early-return しない。前回 `recreate_backbuffer`
+        // が失敗した直後だと size マッチでも backbuffer=None で固着しており、ここを通さないと
+        // half-dead 状態が永久に続く。ResizeBuffers は同 size を渡しても基本 no-op なので
+        // 二重呼び出しでも安全。
+        if self.width == width && self.height == height && self.backbuffer.is_some() {
             return Ok(());
         }
         self.render_target = None;
@@ -6412,7 +6422,9 @@ impl NativeTestOverlay {
     ) -> Result<(), String> {
         let width = width.max(1);
         let height = height.max(1);
-        if self.width == width && self.height == height {
+        // T26 (Claude R3-6): backbuffer None なら early-return しない。background swap chain と
+        // 同じ理由で、前回 `recreate_backbuffer` 失敗時の half-dead 固着を回避する。
+        if self.width == width && self.height == height && self.backbuffer.is_some() {
             return Ok(());
         }
         self.render_target = None;
