@@ -191,10 +191,12 @@ focus/chrome 管理だけを担当する。
 
 動画から動画へのフルスクリーンナビゲーションでは、Windows native presenter 経路で
 `NativeVideoOutput::SwitchSource` を使い、HWND / D3D11 presenter / overlay を保持したまま
-新しい `VideoPlayer` の source binding に差し替える。通常ナビゲーションでは
-`native_video_fast_swap_pending` が最初の native frame 表示まで連続入力を抑制し、
-タイル用 preparing overlay は出さない。画像⇄動画の遷移はこの fast path の対象外で、
-従来どおり `open_fullscreen` / `start_fs_load` 経路で扱う。
+新しい `VideoPlayer` の source binding に差し替える。通常ナビゲーションでは 120ms の
+quiet period を置き、その間は decoder を作らず `NativeOverlayNavigationPreview` が
+移動先ファイル名と保存済み resume サムネ (無ければ黒背景) を表示する。quiet period 後に
+最新 target だけを open し、`native_video_fast_swap_pending` が最初の native frame 表示まで
+連続入力を抑制する。画像⇄動画の遷移はこの fast path の対象外で、従来どおり
+`open_fullscreen` / `start_fs_load` 経路で扱う。
 
 動画タイルモード (`video_tile_state`) は再生中動画の `VideoInfo` からタイムスタンプ列を
 作り、`TileThumbnailWorker` が別 FFmpeg input でサムネイルを抽出する。タイルモードが

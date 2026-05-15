@@ -19,7 +19,18 @@
 //! );
 //! CREATE INDEX IF NOT EXISTS idx_video_tile_thumbs_path
 //!    ON video_tile_thumbs(path);
+//!
+//! CREATE TABLE IF NOT EXISTS video_resume_thumbs (
+//!     path         TEXT NOT NULL PRIMARY KEY,
+//!     tile_w       INTEGER NOT NULL,
+//!     timestamp_ms INTEGER NOT NULL,
+//!     tile_h       INTEGER NOT NULL,
+//!     webp         BLOB NOT NULL,
+//!     video_mtime  INTEGER NOT NULL
+//! );
 //! ```
+//! `video_resume_thumbs` はホイール動画ナビゲーション中の静止画プレビュー用で、
+//! 動画 1 本につき最新 resume 位置の 1 行だけを upsert する。
 //!
 //! ## v1 → v2 マイグレーション
 //!
@@ -101,6 +112,19 @@ impl TileThumbCache {
                     ON video_tile_thumbs(path);
                  COMMIT;",
             )?;
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS video_resume_thumbs (
+                    path         TEXT NOT NULL,
+                    tile_w       INTEGER NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    tile_h       INTEGER NOT NULL,
+                    webp         BLOB NOT NULL,
+                    video_mtime  INTEGER NOT NULL,
+                    PRIMARY KEY (path)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_video_resume_thumbs_path
+                    ON video_resume_thumbs(path);",
+            )?;
             return Ok(());
         }
         conn.execute_batch(
@@ -116,6 +140,21 @@ impl TileThumbCache {
              CREATE INDEX IF NOT EXISTS idx_video_tile_thumbs_path
                 ON video_tile_thumbs(path);",
         )
+        .and_then(|_| {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS video_resume_thumbs (
+                    path         TEXT NOT NULL,
+                    tile_w       INTEGER NOT NULL,
+                    timestamp_ms INTEGER NOT NULL,
+                    tile_h       INTEGER NOT NULL,
+                    webp         BLOB NOT NULL,
+                    video_mtime  INTEGER NOT NULL,
+                    PRIMARY KEY (path)
+                 );
+                 CREATE INDEX IF NOT EXISTS idx_video_resume_thumbs_path
+                    ON video_resume_thumbs(path);",
+            )
+        })
     }
 
     fn db_path() -> PathBuf {
@@ -161,6 +200,47 @@ impl TileThumbCache {
             .iter()
             .map(|&ts| Self::lookup_with_conn(&conn, &key, ts, video_mtime, min_tile_w))
             .collect()
+    }
+
+    /// Resume プレビュー用の「動画 1 本につき最新 1 枚」キャッシュを取得する。
+    /// 戻り値は `(timestamp_ms, webp)`。呼び出し側が現在の resume 位置と timestamp を
+    /// 照合し、ずれていれば black fallback にする。
+    pub fn lookup_resume_webp(
+        &self,
+        video_path: &Path,
+        video_mtime: i64,
+        min_tile_w: u32,
+    ) -> Option<(i64, Vec<u8>)> {
+        let key = crate::path_key::normalize_keep_drive(video_path);
+        let conn = self.conn.lock().ok()?;
+        let mut stmt = conn
+            .prepare_cached(
+                "SELECT timestamp_ms, webp, video_mtime FROM video_resume_thumbs
+                  WHERE path = ?1 AND tile_w >= ?2
+                  LIMIT 1",
+            )
+            .ok()?;
+        let row: Option<(i64, Vec<u8>, i64)> = stmt
+            .query_row(rusqlite::params![key, min_tile_w], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, Vec<u8>>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })
+            .ok();
+        match row {
+            Some((timestamp_ms, webp, mtime)) if mtime == video_mtime => Some((timestamp_ms, webp)),
+            Some(_) => {
+                drop(stmt);
+                let _ = conn.execute(
+                    "DELETE FROM video_resume_thumbs WHERE path = ?1 AND video_mtime != ?2",
+                    rusqlite::params![key, video_mtime],
+                );
+                None
+            }
+            None => None,
+        }
     }
 
     fn lookup_with_conn(
@@ -228,6 +308,33 @@ impl TileThumbCache {
         Ok(())
     }
 
+    /// Resume プレビュー用の WebP を保存する。同じ `path` は常に上書きされる
+    /// ため、再生を続けても動画 1 本あたり最新 1 行に保たれる。
+    pub fn store_resume_webp(
+        &self,
+        video_path: &Path,
+        tile_w: u32,
+        timestamp_ms: i64,
+        video_mtime: i64,
+        tile_h: u32,
+        webp: &[u8],
+    ) -> Result<(), rusqlite::Error> {
+        let key = crate::path_key::normalize_keep_drive(video_path);
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        conn.execute(
+            "INSERT INTO video_resume_thumbs
+                (path, tile_w, timestamp_ms, tile_h, webp, video_mtime)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(path) DO UPDATE SET
+                tile_w = ?2, timestamp_ms = ?3, tile_h = ?4, webp = ?5, video_mtime = ?6",
+            rusqlite::params![key, tile_w, timestamp_ms, tile_h, webp, video_mtime],
+        )?;
+        Ok(())
+    }
+
     /// 動画 1 ファイル分のキャッシュを削除 (= 動画ファイル削除時 cleanup 用、未配線)。
     #[allow(dead_code)]
     pub fn clear_for(&self, video_path: &Path) -> Result<(), rusqlite::Error> {
@@ -237,6 +344,7 @@ impl TileThumbCache {
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         conn.execute("DELETE FROM video_tile_thumbs WHERE path = ?1", [&key])?;
+        conn.execute("DELETE FROM video_resume_thumbs WHERE path = ?1", [&key])?;
         Ok(())
     }
 
@@ -249,7 +357,8 @@ impl TileThumbCache {
             .conn
             .lock()
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
-        let removed = conn.execute("DELETE FROM video_tile_thumbs", [])?;
+        let removed = conn.execute("DELETE FROM video_tile_thumbs", [])?
+            + conn.execute("DELETE FROM video_resume_thumbs", [])?;
         // VACUUM は autocommit 外で実行 (DELETE は execute() の単発なのでこの時点で
         // 既に commit 済み)。VACUUM 失敗は致命的ではないので log だけ残して継続。
         if let Err(e) = conn.execute_batch("VACUUM") {
@@ -276,6 +385,10 @@ impl TileThumbCache {
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         let removed = conn.execute(
             "DELETE FROM video_tile_thumbs \
+             WHERE substr(path, 1, length(?1)) = ?1",
+            rusqlite::params![prefix],
+        )? + conn.execute(
+            "DELETE FROM video_resume_thumbs \
              WHERE substr(path, 1, length(?1)) = ?1",
             rusqlite::params![prefix],
         )?;
@@ -372,6 +485,35 @@ mod tests {
         db.store_webp(p, 320, 5000, 100, 180, &[1]).unwrap();
         db.store_webp(p, 320, 5000, 100, 180, &[2, 3]).unwrap();
         assert_eq!(db.lookup_webp(p, 5000, 100, 320).unwrap(), vec![2, 3]);
+    }
+
+    #[test]
+    fn resume_store_keeps_one_row_per_path() {
+        let db = open_in_memory();
+        let p = Path::new("c:/v.mp4");
+        db.store_resume_webp(p, 1280, 5000, 100, 720, &[1]).unwrap();
+        db.store_resume_webp(p, 1280, 9000, 100, 720, &[2, 3])
+            .unwrap();
+        let (timestamp_ms, webp) = db.lookup_resume_webp(p, 100, 1280).unwrap();
+        assert_eq!(timestamp_ms, 9000);
+        assert_eq!(webp, vec![2, 3]);
+        let row_count: i64 = db
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM video_resume_thumbs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(row_count, 1);
+    }
+
+    #[test]
+    fn resume_lookup_rejects_narrow_or_stale_rows() {
+        let db = open_in_memory();
+        let p = Path::new("c:/v.mp4");
+        db.store_resume_webp(p, 640, 5000, 100, 360, &[1]).unwrap();
+        assert!(db.lookup_resume_webp(p, 100, 1280).is_none());
+        assert!(db.lookup_resume_webp(p, 999, 640).is_none());
+        assert!(db.lookup_resume_webp(p, 100, 640).is_none());
     }
 
     #[test]

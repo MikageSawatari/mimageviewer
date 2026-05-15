@@ -387,6 +387,8 @@ struct NativeEguiOverlay {
     jump_entries: Vec<NativeOverlayJumpEntry>,
     bookmark_title_edit: Option<NativeBookmarkTitleEdit>,
     video_metadata: Option<NativeOverlayMetadata>,
+    navigation_preview: Option<NativeOverlayNavigationPreview>,
+    navigation_preview_texture: Option<(u64, egui::TextureHandle)>,
     tile_overlay: Option<NativeOverlayTileOverlay>,
     tile_textures: HashMap<usize, (u64, egui::TextureHandle)>,
     jump_textures: HashMap<usize, (u64, egui::TextureHandle)>,
@@ -667,6 +669,13 @@ pub struct NativeOverlayTileThumbnail {
     pub width: u32,
     pub height: u32,
     pub rgba: Arc<Vec<u8>>,
+}
+
+#[derive(Clone)]
+pub struct NativeOverlayNavigationPreview {
+    pub file_name: String,
+    pub subtitle: String,
+    pub thumbnail: Option<NativeOverlayTileThumbnail>,
 }
 
 #[derive(Clone)]
@@ -2474,6 +2483,15 @@ impl NativeVideoPresenter {
         }
     }
 
+    pub fn set_overlay_navigation_preview(
+        &mut self,
+        preview: Option<NativeOverlayNavigationPreview>,
+    ) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_navigation_preview(preview);
+        }
+    }
+
     pub fn set_overlay_loop_enabled(&mut self, enabled: bool) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_loop_enabled(enabled);
@@ -3231,6 +3249,8 @@ impl NativeEguiOverlay {
             jump_entries: Vec::new(),
             bookmark_title_edit: None,
             video_metadata: None,
+            navigation_preview: None,
+            navigation_preview_texture: None,
             tile_overlay: None,
             tile_textures: HashMap::new(),
             jump_textures: HashMap::new(),
@@ -3810,6 +3830,17 @@ impl NativeEguiOverlay {
         self.dirty = true;
     }
 
+    fn set_navigation_preview(&mut self, preview: Option<NativeOverlayNavigationPreview>) {
+        if self.navigation_preview.is_none() && preview.is_none() {
+            return;
+        }
+        if preview.is_none() {
+            self.navigation_preview_texture = None;
+        }
+        self.navigation_preview = preview;
+        self.dirty = true;
+    }
+
     fn sync_hover_thumbnail_texture(&mut self) {
         let Some(thumbnail) = self.hover_thumbnail.as_ref() else {
             self.hover_texture = None;
@@ -3836,6 +3867,41 @@ impl NativeEguiOverlay {
         );
         self.hover_texture = Some(texture);
         self.hover_texture_key = Some(key);
+    }
+
+    fn sync_navigation_preview_texture(&mut self) {
+        let Some(preview) = self.navigation_preview.as_ref() else {
+            self.navigation_preview_texture = None;
+            return;
+        };
+        let Some(thumbnail) = preview.thumbnail.as_ref() else {
+            self.navigation_preview_texture = None;
+            return;
+        };
+        let key = (Arc::as_ptr(&thumbnail.rgba) as usize as u64)
+            ^ (thumbnail.rgba.len() as u64)
+            ^ ((thumbnail.width as u64) << 32)
+            ^ thumbnail.height as u64
+            ^ thumbnail.target_secs.to_bits();
+        if self
+            .navigation_preview_texture
+            .as_ref()
+            .is_some_and(|(cached_key, _)| *cached_key == key)
+        {
+            return;
+        }
+        let size = [thumbnail.width as usize, thumbnail.height as usize];
+        if size[0] == 0 || size[1] == 0 || thumbnail.rgba.len() != size[0] * size[1] * 4 {
+            self.navigation_preview_texture = None;
+            return;
+        }
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(size, thumbnail.rgba.as_ref());
+        let texture = self.egui_ctx.load_texture(
+            "native_video_navigation_preview",
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
+        self.navigation_preview_texture = Some((key, texture));
     }
 
     fn sync_tile_overlay_textures(&mut self) {
@@ -3911,6 +3977,7 @@ impl NativeEguiOverlay {
             || self.right_panel_visible()
             || self.vst3_panel_visible()
             || self.perf_visible
+            || self.navigation_preview.is_some()
             || self.tile_overlay.is_some()
             || self.hover_preview_target_secs.is_some()
             || self.frame_step_hold.is_some()
@@ -4066,19 +4133,23 @@ impl NativeEguiOverlay {
         // 描画側の visibility 判定をローカルで再現 (`mod.rs:3084` 周辺の `render_once` と整合)。
         // tile overlay 表示中は通常 HUD UI が非表示 (= tile grid モード) なので region も別系統。
         let tile_overlay_visible = self.tile_overlay.is_some();
+        let navigation_preview_visible = self.navigation_preview.is_some();
         let top_bar_visible_flag = self.top_bar_visible;
         let right_panel_visible_flag = self.right_panel_visible();
         let jump_panel_visible_flag = self.jump_panel_visible;
-        let side_panel_visible =
-            !tile_overlay_visible && (jump_panel_visible_flag || right_panel_visible_flag);
-        let panel_chrome_visible =
-            !tile_overlay_visible && (top_bar_visible_flag || side_panel_visible);
+        let side_panel_visible = !tile_overlay_visible
+            && !navigation_preview_visible
+            && (jump_panel_visible_flag || right_panel_visible_flag);
+        let panel_chrome_visible = !tile_overlay_visible
+            && !navigation_preview_visible
+            && (top_bar_visible_flag || side_panel_visible);
         let normalize_scanning = matches!(
             self.normalize_state.ui_state,
             crate::video::normalize_types::NormalizeUiState::Scanning
         );
         let raw_seek_status_visible = self.seek_status_visible
             && !tile_overlay_visible
+            && !navigation_preview_visible
             && self.first_frame_presented
             && self.video_error.is_none();
         // paused_center_visible (= 中央 replay/play ボタンが見えている) も描画側と一致させる
@@ -4096,6 +4167,7 @@ impl NativeEguiOverlay {
         let seek_status_visible =
             center_seek_status_visible(raw_seek_status_visible, paused_center_visible);
         let status_visible = !tile_overlay_visible
+            && !navigation_preview_visible
             && (self.video_error.is_some() || !self.first_frame_presented || seek_status_visible);
         // **bottom_hud_visible** は描画側 (`render_once`) と完全一致させる。
         // CP5 旧版は `hud_visible()` 単独だったが、Codex CP5 P2 #1 で「top bar や
@@ -4213,7 +4285,7 @@ impl NativeEguiOverlay {
         // Checkmark indicator: passive UI だが、HUD HWND は SetWindowRgn 外の DComp
         // 描画も OS 側で clip する。右パネル等の region が重なった時だけ見える
         // regression を避けるため、描画側と同じ rect を小さく追加する。
-        if self.video_checked && !tile_overlay_visible {
+        if self.video_checked && !tile_overlay_visible && !navigation_preview_visible {
             let top = if panel_chrome_visible { 68.0 } else { 28.0 };
             regions.push(rect_to_px(self::overlay_draw::native_checkmark_rect(
                 width_points,
@@ -4348,8 +4420,8 @@ impl NativeEguiOverlay {
             });
         }
 
-        // Tile overlay: 全画面 tile grid。
-        if self.tile_overlay.is_some() {
+        // Navigation preview / tile overlay: HUD HWND 全面で静止画または tile grid を描く。
+        if navigation_preview_visible || self.tile_overlay.is_some() {
             regions.push(RECT {
                 left: 0,
                 top: 0,
@@ -4576,6 +4648,7 @@ impl NativeEguiOverlay {
         }
         let seek_status_active = self.update_seek_status_for_render(render_t0);
         self.sync_hover_thumbnail_texture();
+        self.sync_navigation_preview_texture();
         self.sync_tile_overlay_textures();
         self.sync_jump_entry_textures();
         let ppp = self.pixels_per_point;
@@ -4613,6 +4686,11 @@ impl NativeEguiOverlay {
         let jump_entries = self.jump_entries.clone();
         let mut bookmark_title_edit = self.bookmark_title_edit.take();
         let video_metadata = self.video_metadata.clone();
+        let navigation_preview = self.navigation_preview.clone();
+        let navigation_preview_texture_id = self
+            .navigation_preview_texture
+            .as_ref()
+            .map(|(_, texture)| texture.id());
         // 音量ノーマライズ overlay state (Copy 型なので clone 不要)
         let normalize_state_snap = self.normalize_state;
         let vst3_panel = self.vst3_panel.clone();
@@ -4638,15 +4716,20 @@ impl NativeEguiOverlay {
         let top_bar_visible = self.top_bar_visible();
         let right_panel_visible = self.right_panel_visible();
         let tile_overlay_visible = tile_overlay.is_some();
+        let navigation_preview_visible = navigation_preview.is_some();
         let raw_seek_status_visible = seek_status_active
             && !tile_overlay_visible
+            && !navigation_preview_visible
             && first_frame_presented
             && video_error.is_none();
         let toast_visible = toast.is_some();
         let bookmark_title_edit_visible = bookmark_title_edit.is_some();
-        let side_panel_visible =
-            !tile_overlay_visible && (jump_panel_visible || right_panel_visible);
-        let panel_chrome_visible = !tile_overlay_visible && (top_bar_visible || side_panel_visible);
+        let side_panel_visible = !tile_overlay_visible
+            && !navigation_preview_visible
+            && (jump_panel_visible || right_panel_visible);
+        let panel_chrome_visible = !tile_overlay_visible
+            && !navigation_preview_visible
+            && (top_bar_visible || side_panel_visible);
         // Codex P1: Scanning 中は paused_center を出さない (スキャン用に pause している
         // のがバレないため + clickハンドラ TogglePlay/CloseFullscreen を抑制)。
         let normalize_scanning = matches!(
@@ -4671,11 +4754,12 @@ impl NativeEguiOverlay {
         // Codex 2周目 P1: normalize_scanning も overlay_visible / cursor_blocking_overlay_visible
         // に含める。さもないと HUD/Toast 等が出ていない状態で `if !overlay_visible { return; }`
         // 早期 return に入って progress UI まで到達しない。
-        let overlay_visible = tile_overlay_visible
+        let overlay_visible = navigation_preview_visible
+            || tile_overlay_visible
             || bottom_hud_visible
             || panel_chrome_visible
             || perf_visible
-            || (!tile_overlay_visible && checked)
+            || (!tile_overlay_visible && !navigation_preview_visible && checked)
             || status_visible
             || toast_visible
             || bookmark_title_edit_visible
@@ -4698,7 +4782,8 @@ impl NativeEguiOverlay {
         let in_bottom_activation_zone = pointer_pos
             .map(|p| p.y >= overlay_height_points - 220.0)
             .unwrap_or(false);
-        let cursor_blocking_overlay_visible = tile_overlay_visible
+        let cursor_blocking_overlay_visible = navigation_preview_visible
+            || tile_overlay_visible
             || bottom_hud_visible
             || panel_chrome_visible
             || status_visible
@@ -4761,7 +4846,7 @@ impl NativeEguiOverlay {
             // だと perf がグリッドの上に乗ってサムネイルとクリック (seek) を塞いでしまう。
             // 旧実装 (grid = Foreground) でも grid の不透明塗りで perf は隠れていたので、
             // タイルモードで perf を出さないのは元の見た目と一致する。
-            if perf_visible && tile_overlay.is_none() {
+            if perf_visible && tile_overlay.is_none() && navigation_preview.is_none() {
                 draw_native_perf_overlay(
                     ctx,
                     overlay_width_points,
@@ -4790,6 +4875,21 @@ impl NativeEguiOverlay {
                 // タイル表示中も境界トースト (= 「最後の項目です」「次のフォルダが見つかりません」
                 // 等) は出す。元実装は早期 return で line 4342 の draw_native_toast に
                 // 到達しなかったため、タイル末尾に達してもユーザーへの feedback がゼロだった。
+                if let Some(toast) = toast.as_ref() {
+                    last_drawn_toast_rect =
+                        draw_native_toast(ctx, overlay_width_points, overlay_height_points, toast);
+                }
+                return;
+            }
+            if let Some(preview) = navigation_preview.as_ref() {
+                draw_native_navigation_preview(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    preview,
+                    navigation_preview_texture_id,
+                    &mut commands,
+                );
                 if let Some(toast) = toast.as_ref() {
                     last_drawn_toast_rect =
                         draw_native_toast(ctx, overlay_width_points, overlay_height_points, toast);

@@ -37,6 +37,16 @@ pub(crate) struct NativeVideoOpenPending {
 const NATIVE_VIDEO_NAV_SWAP_DEBOUNCE_MS: u64 = 120;
 
 #[cfg(windows)]
+pub(crate) fn video_mtime_secs_for_resume_thumb(path: &std::path::Path) -> i64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(windows)]
 pub(crate) struct NativeVideoSourceSwapPending {
     pub(crate) from_idx: usize,
     pub(crate) target_idx: usize,
@@ -120,6 +130,81 @@ pub(super) fn apply_normalize_gain_with_perf(
 }
 
 impl App {
+    #[cfg(windows)]
+    fn video_mtime_secs(path: &std::path::Path) -> i64 {
+        video_mtime_secs_for_resume_thumb(path)
+    }
+
+    #[cfg(windows)]
+    fn format_navigation_preview_time(secs: f64) -> String {
+        let secs = secs.max(0.0).round() as u64;
+        let h = secs / 3600;
+        let m = (secs % 3600) / 60;
+        let s = secs % 60;
+        if h > 0 {
+            format!("{h}:{m:02}:{s:02}")
+        } else {
+            format!("{m}:{s:02}")
+        }
+    }
+
+    #[cfg(windows)]
+    fn lookup_video_resume_preview_thumbnail(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<crate::video::native_presenter::NativeOverlayTileThumbnail> {
+        let key = crate::adjustment_db::normalize_path(path);
+        let pts = *self.settings.video_resume_positions.get(&key)?;
+        if !pts.is_finite() || pts < super::VIDEO_RESUME_MIN_POSITION_SECS {
+            return None;
+        }
+        let timestamp_ms = (pts * 1000.0).round() as i64;
+        let cache = self.video_tile_cache.as_ref()?;
+        let video_mtime = Self::video_mtime_secs(path);
+        let (cached_timestamp_ms, webp) = cache.lookup_resume_webp(
+            path,
+            video_mtime,
+            crate::settings::VIDEO_RESUME_PREVIEW_EXTRACT_WIDTH,
+        )?;
+        if cached_timestamp_ms != timestamp_ms {
+            return None;
+        }
+        let (width, height, rgba) = crate::catalog::decode_thumb_to_rgba(&webp)?;
+        Some(crate::video::native_presenter::NativeOverlayTileThumbnail {
+            target_secs: pts,
+            width,
+            height,
+            rgba: std::sync::Arc::new(rgba),
+        })
+    }
+
+    #[cfg(windows)]
+    fn native_video_navigation_preview_for_path(
+        &self,
+        path: &std::path::Path,
+    ) -> crate::video::native_presenter::NativeOverlayNavigationPreview {
+        let file_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("video")
+            .to_string();
+        let thumbnail = self.lookup_video_resume_preview_thumbnail(path);
+        let subtitle = if let Some(thumbnail) = thumbnail.as_ref() {
+            format!(
+                "保存済み位置 {} を表示中 - 再生準備中...",
+                Self::format_navigation_preview_time(thumbnail.target_secs)
+            )
+        } else {
+            "プレビュー未保存 - 再生準備中...".to_string()
+        };
+        crate::video::native_presenter::NativeOverlayNavigationPreview {
+            file_name,
+            subtitle,
+            thumbnail,
+        }
+    }
+
     #[cfg(windows)]
     pub(super) fn defer_native_video_open_if_decoder_busy(
         &mut self,
@@ -282,11 +367,22 @@ impl App {
             }
         };
         let now = std::time::Instant::now();
+        let navigation_preview = if reason == "navigation" {
+            Some(self.native_video_navigation_preview_for_path(&target_path))
+        } else {
+            None
+        };
 
         if reason != "tile" {
             self.cancel_stale_video_tile_reopen(Some(target_idx), "deferred-update");
         }
-        if let Some(pending) = self.native_video_source_swap_pending.as_mut() {
+        if self.native_video_source_swap_pending.is_some() {
+            self.fullscreen_idx = Some(target_idx);
+            self.refresh_fullscreen_video_marker_cache(target_idx);
+            let pending = self
+                .native_video_source_swap_pending
+                .as_mut()
+                .expect("checked is_some above");
             pending.target_idx = target_idx;
             pending.target_path = target_path;
             pending.autoplay_override = autoplay_override;
@@ -295,8 +391,9 @@ impl App {
             pending.requested_at = now;
             pending.deadline = now + std::time::Duration::from_secs(10);
             pending.input_seq = self.input_seq;
-            self.fullscreen_idx = Some(target_idx);
-            self.refresh_fullscreen_video_marker_cache(target_idx);
+            pending
+                .native_output
+                .set_navigation_preview(navigation_preview);
             crate::logger::log(format!(
                 "[native-video] update deferred source swap: reason={reason} target_idx={target_idx}"
             ));
@@ -339,6 +436,7 @@ impl App {
         let Some(native_output) = native_output else {
             return false;
         };
+        native_output.set_navigation_preview(navigation_preview);
         if reason != "tile" {
             self.cancel_stale_video_tile_reopen(Some(from_idx), "deferred-start");
         }
@@ -436,12 +534,16 @@ impl App {
         if self.fullscreen_idx != Some(target_idx)
             || !matches!(self.items.get(target_idx), Some(GridItem::Video(path)) if path == &target_path)
         {
-            self.native_video_source_swap_pending = None;
+            if let Some(pending) = self.native_video_source_swap_pending.take() {
+                pending.native_output.set_navigation_preview(None);
+            }
             return;
         }
 
         if pending.native_output.is_closed() {
-            self.native_video_source_swap_pending = None;
+            if let Some(pending) = self.native_video_source_swap_pending.take() {
+                pending.native_output.set_navigation_preview(None);
+            }
             crate::logger::log(format!(
                 "[native-video] deferred source swap aborted: presenter closed target_idx={target_idx}"
             ));
@@ -465,7 +567,9 @@ impl App {
         if live_decoders >= max_live_video_decode_threads {
             let now = std::time::Instant::now();
             if now >= deadline {
-                self.native_video_source_swap_pending = None;
+                if let Some(pending) = self.native_video_source_swap_pending.take() {
+                    pending.native_output.set_navigation_preview(None);
+                }
                 crate::logger::log(format!(
                     "[native-video] deferred source swap timeout: reason={reason} target_idx={target_idx} waited_ms={:.1} live_video_decode_threads={live_decoders}",
                     requested_at.elapsed().as_secs_f64() * 1000.0
@@ -523,6 +627,7 @@ impl App {
             ..
         } = pending;
 
+        native_output.set_navigation_preview(None);
         let source_epoch = self.next_native_video_source_epoch();
         let started_at = std::time::Instant::now();
         self.activity_gate.bump();

@@ -26,6 +26,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::tile_thumb_cache::TileThumbCache;
 
+#[derive(Clone, Copy)]
+enum CacheWriteKind {
+    Tile,
+    Resume,
+}
+
+#[derive(Clone)]
+struct CacheTarget {
+    cache: Arc<TileThumbCache>,
+    write_kind: CacheWriteKind,
+}
+
+impl CacheTarget {
+    fn tile(cache: Arc<TileThumbCache>) -> Self {
+        Self {
+            cache,
+            write_kind: CacheWriteKind::Tile,
+        }
+    }
+
+    fn resume(cache: Arc<TileThumbCache>) -> Self {
+        Self {
+            cache,
+            write_kind: CacheWriteKind::Resume,
+        }
+    }
+}
+
 /// 1 タイル分の抽出結果。
 #[derive(Clone)]
 pub struct TileThumbnail {
@@ -79,7 +107,7 @@ impl TileThumbnailWorker {
                     max_h,
                     worker_state,
                     worker_cancel.clone(),
-                    cache,
+                    cache.map(CacheTarget::tile),
                     video_mtime,
                 );
                 worker_finished.store(true, Ordering::Release);
@@ -114,6 +142,40 @@ impl TileThumbnailWorker {
     }
 }
 
+/// `TileThumbnailWorker` の永続キャッシュ書き込み部分だけを使う one-shot worker。
+///
+/// Resume プレビュー用に「最後に表示した 1 フレーム」を後追い保存する用途。呼び出し側は
+/// JoinHandle を保持しないが、通常の tile worker と同じ `run_worker` を使うため、既に
+/// キャッシュ済みなら FFmpeg input を開かず即終了する。
+pub fn spawn_resume_cache_warmup(
+    path: PathBuf,
+    target_secs: f64,
+    max_w: u32,
+    max_h: u32,
+    cache: Arc<TileThumbCache>,
+    video_mtime: i64,
+) {
+    if !target_secs.is_finite() || target_secs < 0.0 {
+        return;
+    }
+    let state = Arc::new(Mutex::new(vec![None]));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let _ = std::thread::Builder::new()
+        .name("video-resume-thumb".into())
+        .spawn(move || {
+            run_worker(
+                path,
+                vec![target_secs],
+                max_w,
+                max_h,
+                state,
+                cancel,
+                Some(CacheTarget::resume(cache)),
+                video_mtime,
+            );
+        });
+}
+
 impl Drop for TileThumbnailWorker {
     fn drop(&mut self) {
         // UI スレッドから join を待つと数百 ms ブロックする
@@ -134,7 +196,7 @@ fn run_worker(
     max_h: u32,
     state: Arc<Mutex<Vec<Option<TileThumbnail>>>>,
     cancel: Arc<AtomicBool>,
-    cache: Option<Arc<TileThumbCache>>,
+    cache: Option<CacheTarget>,
     video_mtime: i64,
 ) {
     use ffmpeg::format::Pixel;
@@ -154,9 +216,20 @@ fn run_worker(
             .iter()
             .map(|&p| (p * 1000.0).round() as i64)
             .collect();
-        // `max_w` (= 固定抽出幅) 未満で保存された旧い行は拡大描画でぼやけるため
-        // miss 扱いにして再抽出させる。
-        let hits = c.lookup_webp_batch(&path, &ts_ms, video_mtime, max_w);
+        let hits: Vec<Option<Vec<u8>>> = match c.write_kind {
+            CacheWriteKind::Tile => c.cache.lookup_webp_batch(&path, &ts_ms, video_mtime, max_w),
+            CacheWriteKind::Resume => {
+                let resume_hit = c.cache.lookup_resume_webp(&path, video_mtime, max_w);
+                ts_ms
+                    .iter()
+                    .map(|&ts| {
+                        resume_hit
+                            .as_ref()
+                            .and_then(|(hit_ts, webp)| (*hit_ts == ts).then(|| webp.clone()))
+                    })
+                    .collect()
+            }
+        };
         for (idx, (&pts, webp_opt)) in timestamps.iter().zip(hits.into_iter()).enumerate() {
             if cancel.load(Ordering::Acquire) {
                 return;
@@ -374,9 +447,21 @@ fn run_worker(
             // q=70: グリッドサムネと同等品位、サイズ優先
             let webp_bytes = encoder.encode(70.0).to_vec();
             let timestamp_ms = (target_secs * 1000.0).round() as i64;
-            if let Err(e) =
-                c.store_webp(&path, max_w, timestamp_ms, video_mtime, dst_h, &webp_bytes)
-            {
+            let store_result = match c.write_kind {
+                CacheWriteKind::Tile => {
+                    c.cache
+                        .store_webp(&path, max_w, timestamp_ms, video_mtime, dst_h, &webp_bytes)
+                }
+                CacheWriteKind::Resume => c.cache.store_resume_webp(
+                    &path,
+                    max_w,
+                    timestamp_ms,
+                    video_mtime,
+                    dst_h,
+                    &webp_bytes,
+                ),
+            };
+            if let Err(e) = store_result {
                 crate::logger::log(format!("video-tile-thumb cache store failed: {e}"));
             }
         }

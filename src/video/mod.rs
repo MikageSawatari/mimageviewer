@@ -429,6 +429,10 @@ enum NativeVideoOutputCommand {
         tile_overlay: Option<native_presenter::NativeOverlayTileOverlay>,
     },
     #[allow(dead_code)]
+    SetNavigationPreview {
+        preview: Option<native_presenter::NativeOverlayNavigationPreview>,
+    },
+    #[allow(dead_code)]
     SwitchSource {
         payload: Box<SwitchSourcePayload>,
     },
@@ -774,6 +778,16 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetTileOverlay { tile_overlay });
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_navigation_preview(
+        &self,
+        preview: Option<native_presenter::NativeOverlayNavigationPreview>,
+    ) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetNavigationPreview { preview });
     }
 
     #[allow(dead_code)]
@@ -1631,6 +1645,9 @@ fn run_native_video_output(
                 NativeVideoOutputCommand::SetTileOverlay { tile_overlay } => {
                     presenter.set_overlay_tile_overlay(tile_overlay);
                 }
+                NativeVideoOutputCommand::SetNavigationPreview { preview } => {
+                    presenter.set_overlay_navigation_preview(preview);
+                }
                 NativeVideoOutputCommand::MarkCursorActivity => {
                     presenter.mark_overlay_cursor_activity();
                 }
@@ -1698,6 +1715,7 @@ fn run_native_video_output(
                             file_size: 0,
                         },
                     );
+                    presenter.set_overlay_navigation_preview(None);
                     presenter.set_overlay_metadata(None);
                     presenter.set_overlay_timeline_markers(Vec::new());
                     presenter.set_overlay_jump_entries(Vec::new());

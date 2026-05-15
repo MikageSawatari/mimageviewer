@@ -2452,6 +2452,9 @@ pub struct App {
 
     /// 動画再生位置の自動保存タイマ (5 秒間隔)。
     pub(crate) video_resume_last_save: Option<std::time::Instant>,
+    /// Resume 位置サムネの生成要求を同じ PTS で重複投入しないための session-local 記録。
+    #[cfg(windows)]
+    pub(crate) video_resume_thumb_last_request: std::collections::HashMap<String, i64>,
 
     /// フォルダ側サイドカー (`mimageviewer.dat`) のメモリ表現。キーはフォルダの絶対パス。
     /// 中央 DB への書き込みと同じタイミングで更新し、フォルダ切替・終了・5 秒アイドル時に flush する。
@@ -3096,6 +3099,8 @@ impl App {
             perf_last_flush: None,
             fs_painted_last: None,
             video_resume_last_save: None,
+            #[cfg(windows)]
+            video_resume_thumb_last_request: std::collections::HashMap::new(),
             sidecars: std::collections::HashMap::new(),
             tray_controller: None,
             window_visible: true,
@@ -14409,14 +14414,94 @@ impl App {
     /// 通常はフルスクリーン中の 1 つだけが入っている (動画は先読みしないため)。
     pub(crate) fn save_all_video_resume_positions(&mut self) {
         let mut updates: Vec<(String, f64, f64)> = Vec::new();
+        #[cfg(windows)]
+        let mut thumb_requests: Vec<(std::path::PathBuf, String, f64)> = Vec::new();
         for entry in self.fs_cache.values() {
             if let FsCacheEntry::Video { player, .. } = entry {
                 let key = crate::adjustment_db::normalize_path(player.path());
-                updates.push((key, player.position(), player.duration()));
+                let pos = player
+                    .last_displayed_pts_secs()
+                    .unwrap_or_else(|| player.position());
+                #[cfg(windows)]
+                thumb_requests.push((player.path().clone(), key.clone(), pos));
+                updates.push((key, pos, player.duration()));
             }
         }
         for (key, pos, dur) in updates {
-            save_video_resume_position(&mut self.settings.video_resume_positions, key, pos, dur);
+            let kept = save_video_resume_position(
+                &mut self.settings.video_resume_positions,
+                key.clone(),
+                pos,
+                dur,
+            );
+            #[cfg(windows)]
+            if !kept {
+                self.video_resume_thumb_last_request.remove(&key);
+            }
+        }
+        #[cfg(windows)]
+        for (path, key, pos) in thumb_requests {
+            if self.settings.video_resume_positions.contains_key(&key) {
+                self.maybe_schedule_video_resume_thumbnail(&path, &key, pos);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn maybe_schedule_video_resume_thumbnail(
+        &mut self,
+        path: &std::path::Path,
+        key: &str,
+        position_secs: f64,
+    ) {
+        if !position_secs.is_finite() || position_secs < VIDEO_RESUME_MIN_POSITION_SECS {
+            return;
+        }
+        let Some(cache) = self.video_tile_cache.clone() else {
+            return;
+        };
+        let timestamp_ms = (position_secs * 1000.0).round() as i64;
+        if self
+            .video_resume_thumb_last_request
+            .get(key)
+            .is_some_and(|prev| *prev == timestamp_ms)
+        {
+            return;
+        }
+        let video_mtime = crate::app::native_video::video_mtime_secs_for_resume_thumb(path);
+        if cache
+            .lookup_resume_webp(
+                path,
+                video_mtime,
+                crate::settings::VIDEO_RESUME_PREVIEW_EXTRACT_WIDTH,
+            )
+            .is_some_and(|(hit_timestamp_ms, _)| hit_timestamp_ms == timestamp_ms)
+        {
+            self.video_resume_thumb_last_request
+                .insert(key.to_string(), timestamp_ms);
+            return;
+        }
+        self.video_resume_thumb_last_request
+            .insert(key.to_string(), timestamp_ms);
+        crate::video::tile_thumbnails::spawn_resume_cache_warmup(
+            path.to_path_buf(),
+            position_secs,
+            crate::settings::VIDEO_RESUME_PREVIEW_EXTRACT_WIDTH,
+            crate::settings::VIDEO_RESUME_PREVIEW_EXTRACT_WIDTH,
+            cache,
+            video_mtime,
+        );
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "video",
+                "resume_thumb_request",
+                None,
+                self.input_seq,
+                &[
+                    ("timestamp_ms", serde_json::Value::from(timestamp_ms)),
+                    ("path", serde_json::Value::from(path.display().to_string())),
+                ],
+            );
         }
     }
 
@@ -14539,7 +14624,10 @@ impl App {
                 }
                 if do_save {
                     let path_key = crate::adjustment_db::normalize_path(player.path());
-                    updates.push((path_key, player.position(), player.duration()));
+                    let pos = player
+                        .last_displayed_pts_secs()
+                        .unwrap_or_else(|| player.position());
+                    updates.push((path_key, pos, player.duration()));
                 }
             }
         }
@@ -14611,12 +14699,16 @@ impl App {
         if do_save {
             self.video_resume_last_save = Some(now);
             for (key, pos, dur) in updates {
-                save_video_resume_position(
+                let kept = save_video_resume_position(
                     &mut self.settings.video_resume_positions,
-                    key,
+                    key.clone(),
                     pos,
                     dur,
                 );
+                #[cfg(windows)]
+                if !kept {
+                    self.video_resume_thumb_last_request.remove(&key);
+                }
             }
         }
         if let Some(d) = next_repaint {
@@ -17935,16 +18027,17 @@ fn save_video_resume_position(
     key: String,
     position: f64,
     duration: f64,
-) {
+) -> bool {
     if position < VIDEO_RESUME_MIN_POSITION_SECS {
         map.remove(&key);
-        return;
+        return false;
     }
     if duration > 0.0 && position >= duration - VIDEO_RESUME_END_GUARD_SECS {
         map.remove(&key);
-        return;
+        return false;
     }
     map.insert(key, position);
+    true
 }
 
 fn draw_filter_match_badge(painter: &egui::Painter, cell_rect: egui::Rect, count: u32) {

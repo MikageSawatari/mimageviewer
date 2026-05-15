@@ -1137,6 +1137,10 @@ pub const VIDEO_TILE_COLUMN_CANDIDATES: &[usize] = &[4, 6, 10, 16, 20, 26, 30];
 /// 縦長モニターでの 4 列 (表示 ~540px) も縮小表示でシャープ。横長 4K での 4 列
 /// (表示 ~960px) だけ ~1.5x の拡大描画になるが、スクラブ一覧用途として許容する。
 pub const VIDEO_TILE_EXTRACT_WIDTH: u32 = 640;
+/// ホイール動画ナビゲーション中に表示する resume プレビューの抽出幅。
+/// タイル一覧より大きめにしつつ、4K/8K 原寸 RGBA を overlay にアップロードして
+/// GPU/VRAM 圧迫を再発させない上限にする。
+pub const VIDEO_RESUME_PREVIEW_EXTRACT_WIDTH: u32 = 1280;
 
 fn default_video_tile_columns() -> usize {
     10

@@ -519,9 +519,12 @@ hard-stuck。固着動画では video decode thread が `first packet for serial
    動画→動画ナビゲーションは `NativeVideoSourceSwapPending` を常に経由し、
    `requested_at` から 120ms の quiet period を待ってから最新 target だけを open
    する。ホイール連射中は pending の `target_idx` を更新するだけで decoder を作らず、
-   現在の native presenter は最後の正常フレームを表示し続ける。タイル fast-swap は
-   既存の `video_tile_swap_pending` が UI 期待と異なるため、この 120ms coalesce の
-   対象外とする。
+   既存 native presenter に `NativeOverlayNavigationPreview` を表示する。プレビューは
+   resume 位置の自動保存サムネがあればそれを全画面 fit で出し、無ければ黒背景 +
+   ファイル名バーにする。これにより静止画ホイール移動に近い「移動先を文字/静止画で
+   確認できる」状態を保ちつつ、decoder create/drop は 120ms quiet 後の最新 target
+   だけに絞る。タイル fast-swap は既存の `video_tile_swap_pending` が UI 期待と
+   異なるため、この 120ms coalesce の対象外とする。
 
    **UI thread での待ち合わせは導入しない** (2026-05-15、Codex 指摘 #1 反映): 一時的に
    `wait_for_live_decoders_below(max, timeout)` で 5-10ms polling sleep する helper を
@@ -535,6 +538,17 @@ hard-stuck。固着動画では video decode thread が `first packet for serial
      live decoder 数が下がった時点で `start_fs_load` を再開し、10 秒下がらなければ
      `regular_open_deferred_timeout` を出して fullscreen を閉じる。これにより
      ESC 後の通常 open が `live_count=3/4` まで decoder を増やす経路を塞ぐ。
+
+   **Resume プレビューサムネ**:
+   `save_all_video_resume_positions()` は `VideoPlayer::last_displayed_pts_secs()`
+   (無ければ clock position) を resume 位置として保存し、同時に
+   `TileThumbCache::store_resume_webp()` で動画 1 本につき最新 1 枚の WebP を
+   `video_resume_thumbs` テーブルへ upsert する。タイル一覧用の
+   `video_tile_thumbs(path, tile_w, timestamp_ms)` とは別テーブルにする理由は、
+   resume 位置が数秒ごとに変わるたびタイル用 timestamp 行を増やさないため。
+   preview 抽出幅は `VIDEO_RESUME_PREVIEW_EXTRACT_WIDTH` (= 1280) で、4K/8K 原寸
+   RGBA を overlay へアップロードして VRAM pressure を再発させない一方、全画面
+   背景として動画識別に十分な解像度を確保する。
 
 3. **旧 player の eager drop**
    `start_native_video_source_swap` は `take_native_output` で旧 player から

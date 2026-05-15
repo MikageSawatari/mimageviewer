@@ -4,10 +4,11 @@ use std::time::{Duration, Instant};
 
 use super::{
     NativeBookmarkTitleEdit, NativeFrameStepHold, NativeOverlayCommand, NativeOverlayJumpEntry,
-    NativeOverlayMetadata, NativeOverlayPerfSample, NativeOverlayPerfSnapshot,
-    NativeOverlayThumbnail, NativeOverlayTileOverlay, NativeOverlayTimelineMarker,
-    NativeOverlayTimelineMarkerKind, NativeOverlayToast, NativeOverlayVst3ChainSlot,
-    NativeOverlayVst3Panel, NativeOverlayVst3Slot, NativeOverlayVst3SlotState,
+    NativeOverlayMetadata, NativeOverlayNavigationPreview, NativeOverlayPerfSample,
+    NativeOverlayPerfSnapshot, NativeOverlayThumbnail, NativeOverlayTileOverlay,
+    NativeOverlayTimelineMarker, NativeOverlayTimelineMarkerKind, NativeOverlayToast,
+    NativeOverlayVst3ChainSlot, NativeOverlayVst3Panel, NativeOverlayVst3Slot,
+    NativeOverlayVst3SlotState,
 };
 
 const NATIVE_PERF_GRAPH_SECS: f32 = 6.0;
@@ -1837,6 +1838,88 @@ pub(super) fn draw_native_top_bar_tile(
                 false,
                 "サムネ列数を減らす [Ctrl+ホイール上]",
                 NativeOverlayCommand::TileColumnsDelta { delta: -1 },
+                commands,
+            );
+        });
+}
+
+pub(super) fn draw_native_navigation_preview(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    preview: &NativeOverlayNavigationPreview,
+    preview_texture_id: Option<egui::TextureId>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) {
+    egui::Area::new(egui::Id::new("native_video_navigation_preview"))
+        .order(egui::Order::Background)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let full_rect = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(overlay_width_points, overlay_height_points),
+            );
+            ui.set_min_size(full_rect.size());
+            let painter = ui.painter();
+            painter.rect_filled(full_rect, 0.0, egui::Color32::BLACK);
+            let _ = ui.interact(
+                full_rect,
+                egui::Id::new("native_video_navigation_preview_bg"),
+                egui::Sense::click(),
+            );
+
+            if let (Some(texture_id), Some(thumbnail)) =
+                (preview_texture_id, preview.thumbnail.as_ref())
+            {
+                let img_w = thumbnail.width.max(1) as f32;
+                let img_h = thumbnail.height.max(1) as f32;
+                let scale = (overlay_width_points / img_w)
+                    .min(overlay_height_points / img_h)
+                    .max(0.0);
+                let dst_size = egui::vec2(img_w * scale, img_h * scale);
+                let dst_rect = egui::Rect::from_center_size(full_rect.center(), dst_size);
+                painter.image(
+                    texture_id,
+                    dst_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+        });
+
+    egui::Area::new(egui::Id::new("native_video_navigation_preview_top_bar"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(egui::Pos2::ZERO)
+        .show(ctx, |ui| {
+            let rect =
+                egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(overlay_width_points, 54.0));
+            ui.set_min_size(rect.size());
+            let painter = ui.painter().clone();
+            draw_top_bar_background(&painter, overlay_width_points);
+            let title = if preview.file_name.trim().is_empty() {
+                "video"
+            } else {
+                preview.file_name.as_str()
+            };
+            draw_top_bar_text_lines(&painter, title, &preview.subtitle, 88, 120);
+
+            let btn_size = 28.0;
+            let gap = 8.0;
+            let mut x = overlay_width_points - 12.0 - btn_size;
+            let y = 13.0;
+            draw_native_top_button(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                btn_size,
+                btn_size,
+                gap,
+                "native_preview_top_close",
+                NativeTopButtonGlyph::Close,
+                false,
+                "動画を終了",
+                NativeOverlayCommand::CloseFullscreen,
                 commands,
             );
         });
