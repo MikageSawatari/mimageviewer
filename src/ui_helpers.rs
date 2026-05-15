@@ -598,20 +598,20 @@ pub fn boundary_navigable_idx(
 // 外部連携
 // -----------------------------------------------------------------------
 
-/// パスに関連付けられたデフォルトアプリケーション（外部プレイヤー）で開く。
+/// パスに関連付けられたデフォルトアプリケーションで開く (動画は外部プレイヤー、
+/// ディレクトリは Explorer)。
+///
+/// 内部は `opener::open` 経由で Windows の `ShellExecuteW` を直接呼ぶ。パスは
+/// `lpFile` に wide-string データとして渡るので、`cmd /c start ...` のように
+/// シェルメタ文字 (`&` `^` `|` `"` 等) を含むファイル名がコマンドとして解釈される
+/// ことはない。`cmd.exe` のコンソールウィンドウも出ない。
+///
+/// セキュリティ: ファイル名は信頼境界の外なので、シェル経由で起動してはならない。
 pub fn open_external_player(path: &Path) {
-    let path_str = path.to_string_lossy().into_owned();
-    crate::logger::log(format!("open_external_player: {path_str}"));
-    // ShellExecute 相当: cmd.exe のコンソールウィンドウが一瞬見える問題を回避するため
-    // CREATE_NO_WINDOW フラグを付与する
-    let mut cmd = std::process::Command::new("cmd");
-    cmd.args(["/c", "start", "", &path_str]);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    crate::logger::log(format!("open_external_player: {}", path.display()));
+    if let Err(e) = opener::open(path) {
+        crate::logger::log(format!("open_external_player failed: {e}"));
     }
-    let _ = cmd.spawn();
 }
 
 /// URL をデフォルトブラウザで開く。
