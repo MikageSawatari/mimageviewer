@@ -2546,7 +2546,7 @@ fn run_native_video_output(
                     let frame_step_active = source.frame_step_active.load(Ordering::Acquire);
                     if source.clock.is_seeking()
                         && clock::pts_clears_seek_override(pts, now_for_clear)
-                        && frame_step_active
+                        && (frame_step_active || !source.clock.is_playing())
                     {
                         source.clock.set_paused_position(pts);
                         source.clock.clear_seek_target_override(serial);

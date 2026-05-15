@@ -556,6 +556,10 @@ hard-stuck。固着動画では video decode thread が `first packet for serial
    背景として動画識別に十分な解像度を確保する。wheel update 中に同じ動画/PTS の
    WebP を UI thread で繰り返し decode しないよう、App は直近 8 件だけ session-local
    RGBA preview cache を持つ。永続 DB は WebP のままなので、起動をまたぐメモリ増加はない。
+   autoplay=false の open-time resume は、native presenter が最初の post-seek frame を
+   `Present` した時点でその PTS に凍結し、seek override を解除する。音声あり動画では
+   pause 中に audio callback が drain されないため、音声側の override 解除を待つと
+   `clock.is_seeking()` が残り、数フレームだけ映像が進んで見えるため。
 
 3. **旧 player の eager drop**
    `start_native_video_source_swap` は `take_native_output` で旧 player から
