@@ -48,7 +48,8 @@ use windows::Win32::Graphics::Dxgi::Common::{
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIKeyedMutex, IDXGIResource1};
 use windows::Win32::System::Threading::{
-    AcquireSRWLockExclusive, ReleaseSRWLockExclusive, SRWLOCK,
+    CRITICAL_SECTION, DeleteCriticalSection, EnterCriticalSection, InitializeCriticalSection,
+    LeaveCriticalSection,
 };
 use windows::core::Interface;
 
@@ -367,12 +368,19 @@ pub struct GpuVideoDevice {
     /// `VideoProcessorSetStreamColorSpace1` / `VideoProcessorSetOutputColorSpace1` を
     /// 呼ぶための ID3D11VideoContext1 view (= `video_context` と同一オブジェクトの cast)。
     video_context1: ID3D11VideoContext1,
-    /// processor + enumerator のキャッシュ。同一 (in_size, out_size, format) なら使い回す。
-    /// `Mutex` であること自体が correctness 要件: 動画切替時は旧 decoder thread が
-    /// detached のまま生きており、新 decoder thread と同じ `Arc<GpuVideoDevice>` を
-    /// 共有して同時に `blit` を呼ぶ。`RefCell` だと並行 borrow で panic する
-    /// (2026-05-14 実害: ホイール連続切替で「デコード開始中」固着)。`blit` は
-    /// このロックを処理全体で保持するので、結果的に並行 blit 全体が直列化される。
+    /// processor + enumerator のキャッシュ。同一 (in_size, out_size, format, fps) なら
+    /// 使い回す。
+    ///
+    /// `Mutex` の役割: 動画切替時は旧 decoder thread が detached のまま生きており、新
+    /// decoder thread と同じ `Arc<GpuVideoDevice>` を共有して同時に `ensure_processor` を
+    /// 呼ぶ。`RefCell` だと並行 borrow で panic する (2026-05-14 実害: ホイール連続切替で
+    /// 「デコード開始中」固着)。**この Mutex はキャッシュ slot の参照を直列化するだけで、
+    /// blit 全体の同期は別途 `d3d_lock` (CRITICAL_SECTION) が担う**。
+    ///
+    /// 旧コメント (= 「blit はこのロックを処理全体で保持する」) は 2026-05-16 の TOCTOU
+    /// 修正で誤りになった: `ensure_processor` は owned `ProcessorState` (COM AddRef clone)
+    /// を返して即ロックを離し、caller は cache の現値に依存せず自前の COM ptr で blit する
+    /// (Codex P2 2026-05-16)。Cache は last-writer-wins の純粋な performance cache。
     processor_cache: Mutex<Option<ProcessorState>>,
     shared_output_pool: Mutex<Vec<SharedOutputSlot>>,
     shared_output_pool_wait: Mutex<()>,
@@ -391,20 +399,30 @@ pub struct GpuVideoDevice {
     /// wgpu 側は `fence_gen` で再 open 判定する。
     fence_gen: u64,
     /// `ID3D11DeviceContext` / `ID3D11VideoContext` の同時呼び出しを直列化するための
-    /// SRWLOCK。**FFmpeg の D3D11VA decode (`avcodec_send_packet` / `receive_frame` が
-    /// 内部で device context を触る) と `blit_nv12_to_rgba` の immediate context 操作が
-    /// 同じ `ID3D11DeviceContext` を共有している**ため、両者を直列化しないと driver 内で
-    /// hard-stuck する (fast-swap 連射で実害。本ファイル冒頭の `LIVE_VIDEO_DECODE_THREADS`
-    /// コメント参照)。`processor_cache: Mutex` は blit 同士しか直列化せず FFmpeg 側を
-    /// 守れない。
+    /// **再入可能 (recursive)** lock。**FFmpeg の D3D11VA decode (`avcodec_send_packet` /
+    /// `receive_frame` が内部で device context を触る) と `blit_nv12_to_rgba` の immediate
+    /// context 操作が同じ `ID3D11DeviceContext` を共有している**ため、両者を直列化しないと
+    /// driver 内で hard-stuck する (fast-swap 連射で実害。本ファイル冒頭の
+    /// `LIVE_VIDEO_DECODE_THREADS` コメント参照)。`processor_cache: Mutex` は blit 同士しか
+    /// 直列化せず FFmpeg 側を守れない。
     ///
-    /// FFmpeg には `AVD3D11VADeviceContext.lock/unlock` callback でこの SRWLOCK を
-    /// 渡し (`ffmpeg_d3d11.rs`)、`blit_nv12_to_rgba` の context 操作区間も `lock_d3d_context`
-    /// で同じ SRWLOCK を握る。C callback 跨ぎで lock/unlock を別々に呼ぶ必要があるため
-    /// RAII guard を返せない `SRWLOCK` を使う。`SRWLOCK::default()` (= 全 0) が
-    /// `SRWLOCK_INIT` で有効な初期状態。`&self` 経由で内部可変するため `UnsafeCell` で包む
-    /// (`GpuVideoDevice` の `unsafe impl Sync` がこの共有可変を保証する)。
-    d3d_lock: UnsafeCell<SRWLOCK>,
+    /// FFmpeg には `AVD3D11VADeviceContext.lock/unlock` callback でこの CS を渡し
+    /// (`ffmpeg_d3d11.rs`)、`blit_nv12_to_rgba` の context 操作区間も `lock_d3d_context`
+    /// で同じ CS を握る。
+    ///
+    /// **なぜ `CRITICAL_SECTION` (= 再入可能) か** (Codex P1 2026-05-16): FFmpeg の
+    /// `vendor/ffmpeg/include/libavutil/hwcontext_d3d11va.h:91` が明示的に "The underlying
+    /// lock must be recursive." と規定している。旧 `SRWLOCK` 実装は再入不可で、FFmpeg が
+    /// lock 内で再帰的に lock を取る経路ができた瞬間に self-deadlock する (= ABI 契約違反)。
+    /// 現状の FFmpeg では再帰経路が観測されていないが、将来のバージョン更新 / コーデック
+    /// 経路で踏みうるため契約を守る。
+    ///
+    /// **なぜ `Box`** (Codex P3 2026-05-16): `CRITICAL_SECTION` は MSDN が「初期化後に移動
+    /// してはいけない」と明記している (内部に自身の DebugInfo 等への参照を抱える可能性が
+    /// あるため)。`Arc<GpuVideoDevice>` でも `Arc::try_unwrap` で中身を取り出される可能性が
+    /// あるので、CS 単体を heap pin して安全側に倒す。`UnsafeCell` で内部可変を表現し、
+    /// `GpuVideoDevice` の `unsafe impl Sync` がこの共有を保証する。
+    d3d_lock: Box<UnsafeCell<CRITICAL_SECTION>>,
 }
 
 /// 入力動画の色空間ヒント。FFmpeg の transfer characteristic から決定し、
@@ -468,6 +486,14 @@ impl Drop for SharedOutputSlot {
     }
 }
 
+/// VPP enumerator + processor とそのキャッシュキー (= 入出力寸法 / format / fps)。
+///
+/// **Clone は cheap な COM AddRef** (`windows-rs` の `Interface::clone()` は内部で AddRef)。
+/// `ensure_processor` は cache hit / miss どちらでも本構造体を **値で返却** することで、
+/// caller (= `blit_nv12_to_rgba`) は処理中に他スレッドが `processor_cache` を上書きしても
+/// 影響を受けない (Codex P2 2026-05-16 TOCTOU 対策)。各スレッドが自前の AddRef'd ptr を
+/// 持ち、Drop で対称的に Release する。
+#[derive(Clone)]
 struct ProcessorState {
     enumerator: ID3D11VideoProcessorEnumerator,
     processor: ID3D11VideoProcessor,
@@ -484,9 +510,35 @@ struct ProcessorState {
     fps_den: u32,
 }
 
-/// `GpuVideoDevice::lock_d3d_context` が返す RAII guard。Drop で SRWLOCK を release する。
+impl ProcessorState {
+    /// 与えられた入出力パラメータが本キャッシュエントリと一致するか判定。
+    fn matches(
+        &self,
+        in_w: u32,
+        in_h: u32,
+        in_format: DXGI_FORMAT,
+        out_w: u32,
+        out_h: u32,
+        out_format: DXGI_FORMAT,
+        fps_num: u32,
+        fps_den: u32,
+    ) -> bool {
+        self.in_w == in_w
+            && self.in_h == in_h
+            && self.in_format == in_format
+            && self.out_w == out_w
+            && self.out_h == out_h
+            && self.out_format == out_format
+            && self.fps_num == fps_num
+            && self.fps_den == fps_den
+    }
+}
+
+/// `GpuVideoDevice::lock_d3d_context` が返す RAII guard。Drop で CRITICAL_SECTION を
+/// `LeaveCriticalSection` する。同一スレッドからの再入は CS の owner-thread counter で
+/// 安全に処理される (= recursive lock 規約)。
 struct D3dContextGuard<'a> {
-    lock: *mut SRWLOCK,
+    lock: *mut CRITICAL_SECTION,
     _marker: std::marker::PhantomData<&'a GpuVideoDevice>,
 }
 
@@ -495,7 +547,7 @@ impl Drop for D3dContextGuard<'_> {
         // SAFETY: `lock` は `GpuVideoDevice::d3d_lock` の生ポインタ。guard の寿命は
         // `&self` 借用 (`PhantomData`) に縛られており、その間 `GpuVideoDevice` は生存。
         unsafe {
-            ReleaseSRWLockExclusive(self.lock);
+            LeaveCriticalSection(self.lock);
         }
     }
 }
@@ -584,6 +636,16 @@ impl GpuVideoDevice {
         static NEXT_FENCE_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let fence_gen = NEXT_FENCE_GEN.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
 
+        // CRITICAL_SECTION の初期化。MSDN は「初期化後に移動するな」と明記しているので
+        // Box で heap pin してから InitializeCriticalSection を呼ぶ。`Drop` で
+        // `DeleteCriticalSection` する責任は本構造体にある (Codex P1 2026-05-16)。
+        let d3d_lock = Box::new(UnsafeCell::new(unsafe {
+            std::mem::zeroed::<CRITICAL_SECTION>()
+        }));
+        unsafe {
+            InitializeCriticalSection(d3d_lock.get());
+        }
+
         Ok(Arc::new(Self {
             device,
             context,
@@ -599,7 +661,7 @@ impl GpuVideoDevice {
             fence_shared_handle,
             next_fence_value: std::sync::atomic::AtomicU64::new(0),
             fence_gen,
-            d3d_lock: UnsafeCell::new(SRWLOCK::default()),
+            d3d_lock,
         }))
     }
 
@@ -619,23 +681,25 @@ impl GpuVideoDevice {
         &self.context
     }
 
-    /// D3D11VA context 直列化用 SRWLOCK の生ポインタ。`ffmpeg_d3d11.rs` が
+    /// D3D11VA context 直列化用 CRITICAL_SECTION の生ポインタ。`ffmpeg_d3d11.rs` が
     /// `AVD3D11VADeviceContext.lock_ctx` に渡す。`GpuVideoDevice` はアプリ全体で 1 個・
     /// `Arc` で寿命管理されており、FFmpeg の hw_device_ctx (AVBufferRef) より長生きする
     /// ので、このポインタは AVBufferRef の寿命中ずっと有効。
-    pub fn d3d_lock_ptr(&self) -> *mut SRWLOCK {
+    pub fn d3d_lock_ptr(&self) -> *mut CRITICAL_SECTION {
         self.d3d_lock.get()
     }
 
     /// `blit_nv12_to_rgba` の context 操作区間で握る RAII guard を返す。FFmpeg の
-    /// D3D11VA lock/unlock callback と同じ SRWLOCK なので、FFmpeg decode と blit の
-    /// `ID3D11DeviceContext` / `ID3D11VideoContext` 操作が直列化される。
+    /// D3D11VA lock/unlock callback と同じ CRITICAL_SECTION なので、FFmpeg decode と blit の
+    /// `ID3D11DeviceContext` / `ID3D11VideoContext` 操作が直列化される。CS は再入可能
+    /// なので、blit 側スレッドが lock を取った状態で FFmpeg callback に降りても deadlock
+    /// しない。
     fn lock_d3d_context(&self) -> D3dContextGuard<'_> {
-        // SAFETY: SRWLOCK は共有ポインタ越しの並行 Acquire/Release を前提に設計された
-        // OS プリミティブ。`UnsafeCell` で内部可変を表現し、`GpuVideoDevice` の
-        // `unsafe impl Sync` がこの共有を保証する。
+        // SAFETY: CRITICAL_SECTION は OS プリミティブで、`InitializeCriticalSection` 後は
+        // 共有ポインタ越しの並行 Enter/Leave が安全。`Box` で heap pin、`UnsafeCell` で
+        // 内部可変を表現し、`GpuVideoDevice` の `unsafe impl Sync` がこの共有を保証する。
         unsafe {
-            AcquireSRWLockExclusive(self.d3d_lock.get());
+            EnterCriticalSection(self.d3d_lock.get());
         }
         D3dContextGuard {
             lock: self.d3d_lock.get(),
@@ -680,8 +744,10 @@ impl GpuVideoDevice {
         // display texture format.
         let out_format = DXGI_FORMAT_B8G8R8A8_UNORM;
 
-        // 2. processor / enumerator を確保 (キャッシュ)
-        self.ensure_processor(
+        // 2. processor / enumerator を確保。owned ProcessorState を持ち帰ることで、
+        //    cache を他スレッドが上書きしても本 blit は自前の AddRef'd ptr で完結する
+        //    (Codex P2 2026-05-16: ensure-and-use TOCTOU 防止)。
+        let state = self.ensure_processor(
             in_w,
             in_h,
             in_format,
@@ -691,8 +757,6 @@ impl GpuVideoDevice {
             input_fps_num,
             input_fps_den,
         )?;
-        let cache = self.processor_cache.lock().unwrap();
-        let state = cache.as_ref().expect("ensured above");
 
         // 3. 出力先を 2 段構成にする (vsr_probe で driver 仕様確定):
         //    - 中間 RT テクスチャ (NT/KM なし) → VideoProcessorBlt の宛先
@@ -736,8 +800,8 @@ impl GpuVideoDevice {
 
         // ここから先は `ID3D11VideoContext` / `ID3D11DeviceContext` を触る。FFmpeg の
         // D3D11VA decode (`avcodec_send_packet` 等) が同じ context を別スレッドから
-        // 並行使用しうるため、`d3d_lock` SRWLOCK で直列化する (FFmpeg 側は
-        // `AVD3D11VADeviceContext.lock/unlock` callback で同じ SRWLOCK を握る)。
+        // 並行使用しうるため、`d3d_lock` (CRITICAL_SECTION、recursive) で直列化する
+        // (FFmpeg 側は `AVD3D11VADeviceContext.lock/unlock` callback で同じ CS を握る)。
         // `acquire_shared_output` (最大 500ms wait しうる) は **この lock の外**で
         // 済ませてあるので、FFmpeg decode を不必要に長くブロックしない。guard は
         // 関数末尾 (BlitOutput 返却まで) で drop される。
@@ -956,6 +1020,16 @@ impl GpuVideoDevice {
         })
     }
 
+    /// processor / enumerator を確保する。Cache hit なら既存 state の AddRef clone を、miss
+    /// なら新規作成してから clone を cache に書き戻して返す。
+    ///
+    /// **TOCTOU 防止** (Codex P2 2026-05-16): 旧シグネチャ `Result<(), _>` + 呼び出し側で
+    /// `processor_cache.lock()` 再フェッチ、というパターンは、ensure 中に他スレッドが cache
+    /// を上書きすると後続の `state.enumerator/processor` が別動画用のものになる race を
+    /// 持っていた (= 1-slot cache。`Mutex` だけでは ensure-and-use を atomic にできない)。
+    /// 本関数が値で返すことで、cache 上書き race があっても **caller は自分の AddRef'd
+    /// state を hold して blit する**ので影響なし。Cache は純粋な write-through の
+    /// パフォーマンス cache (last writer wins) になる。
     fn ensure_processor(
         &self,
         in_w: u32,
@@ -966,7 +1040,7 @@ impl GpuVideoDevice {
         out_format: DXGI_FORMAT,
         input_fps_num: u32,
         input_fps_den: u32,
-    ) -> Result<(), GpuVideoError> {
+    ) -> Result<ProcessorState, GpuVideoError> {
         // ContentDesc の InputFrameRate に実 fps を渡す。ドライバは内部スケジューラで
         // フレームレートを参照している可能性があり、嘘値 (60/1 ハードコード) を渡すと
         // mid-stream で「規定外コンテンツ」と判定されることがある。
@@ -977,21 +1051,22 @@ impl GpuVideoDevice {
             (input_fps_num, input_fps_den)
         };
 
-        let cur = self.processor_cache.lock().unwrap();
-        if let Some(s) = cur.as_ref() {
-            if s.in_w == in_w
-                && s.in_h == in_h
-                && s.in_format == in_format
-                && s.out_w == out_w
-                && s.out_h == out_h
-                && s.out_format == out_format
-                && s.fps_num == fps_num
-                && s.fps_den == fps_den
-            {
-                return Ok(());
+        // Cache hit: clone (= AddRef) して即返却。CreateVideoProcessor* の重い call を回避。
+        {
+            let cur = self.processor_cache.lock().unwrap();
+            if let Some(s) = cur.as_ref() {
+                if s.matches(
+                    in_w, in_h, in_format, out_w, out_h, out_format, fps_num, fps_den,
+                ) {
+                    return Ok(s.clone());
+                }
             }
         }
-        drop(cur);
+
+        // Cache miss / drift: 新規作成。COM 呼び出しは数 ms - 数十 ms かかりうるので
+        // cache lock は **保持しない**。複数スレッドが同時 miss すると最後の writer が
+        // cache を上書きするが、各スレッドは自前の owned state を返却するので correctness
+        // 上問題なし (= last writer wins キャッシュ)。
         let content_desc = D3D11_VIDEO_PROCESSOR_CONTENT_DESC {
             InputFrameFormat: D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
             InputFrameRate: DXGI_RATIONAL {
@@ -1033,7 +1108,7 @@ impl GpuVideoDevice {
                     }
                 })?
         };
-        *self.processor_cache.lock().unwrap() = Some(ProcessorState {
+        let new_state = ProcessorState {
             enumerator,
             processor,
             in_w,
@@ -1044,8 +1119,10 @@ impl GpuVideoDevice {
             out_format,
             fps_num,
             fps_den,
-        });
-        Ok(())
+        };
+        // 自スレッド分の owned state は keep、cache には clone を書き戻す。
+        *self.processor_cache.lock().unwrap() = Some(new_state.clone());
+        Ok(new_state)
     }
 
     /// 中間テクスチャ (= NT shared フラグなし、純粋に D3D11 内部の RT)。
@@ -1436,6 +1513,26 @@ impl Drop for GpuVideoDevice {
                 let _ = windows::Win32::Foundation::CloseHandle(self.fence_shared_handle);
             }
         }
+        // CRITICAL_SECTION は `InitializeCriticalSection` で kernel リソース (DebugInfo 等)
+        // を確保しうるので、対応する `DeleteCriticalSection` で必ず解放する (Codex P1
+        // 2026-05-16)。
+        //
+        // **Drop タイミングの安全性** (Codex P1 2026-05-16): FFmpeg の D3D11VA cleanup は
+        // 最終 av_buffer_unref → AVHWDeviceContext free 時点で内部 hwframes の teardown を
+        // 走らせ、`lock`/`unlock` callback を呼びうる (`hwcontext_d3d11va.h` の "lock also
+        // protect access to the internal staging texture" より)。AVHWDeviceContext の
+        // 最終 ref を持つのは `AVCodecContext.hw_device_ctx` (= video_decoder の内部参照)。
+        // よって「video_decoder が drop される時点で CS が valid であること」が要件。
+        //
+        // この要件を満たすため、`run_video_decode` の引数順を
+        // `gpu_video_device → video_decoder → _hw_device` にしてある (= 関数 return 時の
+        // drop 順は逆: `_hw_device → video_decoder → gpu_video_device`。Arc が最後に drop
+        // されて Arc refcount=0 でここに到達するときには既に video_decoder の FFmpeg
+        // teardown は完了している)。詳細は `decoder.rs::run_video_decode` 冒頭の
+        // コメント参照。
+        unsafe {
+            DeleteCriticalSection(self.d3d_lock.get());
+        }
     }
 }
 
@@ -1444,3 +1541,128 @@ impl Drop for GpuVideoDevice {
 // ただし ID3D11DeviceContext の **同時呼び出し** は未定義動作 → 利用側で Mutex 化すること。
 unsafe impl Send for GpuVideoDevice {}
 unsafe impl Sync for GpuVideoDevice {}
+
+#[cfg(test)]
+mod tests {
+    //! `SharedOutputSlotGuard` の状態遷移テスト (T12: GPU blit 失敗時の slot leak 防止)。
+    //!
+    //! 実 D3D11 デバイスを持たずに guard の `armed` / `holding_write_key` / `in_use` の
+    //! 振る舞いだけを確認する。`IDXGIKeyedMutex` は `None` で通せば `Drop` が
+    //! ReleaseSync 経路に入らないので、テストでも安全に状態遷移を検証できる。
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    /// Guard を armed (= in_use=Some) で drop すると、`in_use=false` に戻し、`notify_one`
+    /// を呼ぶ。`?` 早期 return 経路をシミュレートしたもの (Codex P1 2026-05-15 の主因)。
+    #[test]
+    fn slot_guard_drop_armed_releases_in_use() {
+        let in_use = Arc::new(AtomicBool::new(true));
+        let notify = Arc::new(Condvar::new());
+        // keyed_mutex=None → guard は ReleaseSync を試みない (= 純粋に bookkeeping のみ)。
+        let guard = SharedOutputSlotGuard::new(
+            Some(Arc::clone(&in_use)),
+            Some(Arc::clone(&notify)),
+            None,
+            true, // holding_write_key
+        );
+        drop(guard);
+        assert!(
+            !in_use.load(Ordering::Acquire),
+            "in_use must be reset to false after armed guard drop"
+        );
+    }
+
+    /// `mark_released_to_reader` 後に drop した場合も `in_use` は戻されるが、
+    /// `holding_write_key=false` 経路を通る (= ReleaseSync は呼ばない)。
+    #[test]
+    fn slot_guard_drop_after_mark_released() {
+        let in_use = Arc::new(AtomicBool::new(true));
+        let notify = Arc::new(Condvar::new());
+        let mut guard = SharedOutputSlotGuard::new(
+            Some(Arc::clone(&in_use)),
+            Some(Arc::clone(&notify)),
+            None,
+            true,
+        );
+        guard.mark_released_to_reader();
+        drop(guard);
+        // ReleaseSync 経路には入らないが in_use は戻る (slot 自体は presenter が消費するまで
+        // reader 側に渡っているので、in_use は false にして次回 acquire を許可する)。
+        assert!(
+            !in_use.load(Ordering::Acquire),
+            "in_use must be reset to false even after mark_released_to_reader"
+        );
+    }
+
+    /// `disarm()` 後に drop した場合は guard は no-op (= ownership が `BlitOutput` /
+    /// `D3d11Frame` に移譲されたケース)。`in_use` は true のままで、`D3d11Frame::Drop` が
+    /// 後で false に戻す責任を持つ。
+    #[test]
+    fn slot_guard_disarm_keeps_in_use_for_handoff() {
+        let in_use = Arc::new(AtomicBool::new(true));
+        let notify = Arc::new(Condvar::new());
+        let guard = SharedOutputSlotGuard::new(
+            Some(Arc::clone(&in_use)),
+            Some(Arc::clone(&notify)),
+            None,
+            true,
+        );
+        guard.disarm(); // self を consume、armed=false で drop。
+        assert!(
+            in_use.load(Ordering::Acquire),
+            "in_use must remain true after disarm (ownership handed to BlitOutput)"
+        );
+    }
+
+    /// `in_use=None` の非 pool 経路 (= `create_shared_output` フォールバック等で
+    /// `acquire_shared_output` 由来でない slot) は guard が initially disarmed なので
+    /// drop しても副作用なし。
+    #[test]
+    fn slot_guard_non_pool_path_is_disarmed() {
+        let guard = SharedOutputSlotGuard::new(None, None, None, false);
+        // disarm() しなくても drop は no-op (in_use=None → armed=false)。
+        drop(guard);
+        // assertion: no panic、no side effect。
+    }
+
+    /// guard が drop 後の状態を 2 回試行しても二重解放しない (= 念のための idempotency 確認)。
+    /// `in_use` が他経路で再 true にされていても、guard 自体は consume されているので
+    /// 2 回目の drop は起きない (= compile error にはなる)。代わりに連続 acquire/release を
+    /// シミュレート: 2 つの guard をそれぞれ作って drop する。
+    #[test]
+    fn slot_guard_two_independent_acquires() {
+        let in_use = Arc::new(AtomicBool::new(false));
+        let notify = Arc::new(Condvar::new());
+        // 1st acquire: armed → drop → in_use=false。
+        in_use.store(true, Ordering::Release);
+        {
+            let g1 = SharedOutputSlotGuard::new(
+                Some(Arc::clone(&in_use)),
+                Some(Arc::clone(&notify)),
+                None,
+                true,
+            );
+            drop(g1);
+        }
+        assert!(
+            !in_use.load(Ordering::Acquire),
+            "1st guard must reset in_use"
+        );
+        // 2nd acquire: 同じ AtomicBool を再利用しても期待通り動く。
+        in_use.store(true, Ordering::Release);
+        {
+            let g2 = SharedOutputSlotGuard::new(
+                Some(Arc::clone(&in_use)),
+                Some(Arc::clone(&notify)),
+                None,
+                true,
+            );
+            g2.disarm(); // handoff 模擬。
+        }
+        assert!(
+            in_use.load(Ordering::Acquire),
+            "2nd guard disarmed → in_use stays true"
+        );
+    }
+}

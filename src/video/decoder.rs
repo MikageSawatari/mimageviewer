@@ -2329,10 +2329,14 @@ fn run_decoder(
             .name("video-decode".into())
             .spawn(move || {
                 run_video_decode(
-                    video_decoder,
-                    _hw_device,
+                    // gpu_video_device を **最初**に渡すことで、関数内 drop 順を
+                    // `_hw_device → video_decoder → gpu_video_device` (= 反転で最後)
+                    // にする。FFmpeg cleanup が CS を握る間 Arc を生かす (Codex P1
+                    // 2026-05-16)。詳細は run_video_decode 冒頭のコメント参照。
                     #[cfg(windows)]
                     gpu_video_device_v,
+                    video_decoder,
+                    _hw_device,
                     video_pkt_rx,
                     video_ctl_rx,
                     video_tx_for_thread,
@@ -2911,11 +2915,28 @@ fn run_decoder(
 /// 許容なので drain せず何もしない (旧 `run_decoder` の挙動と同じ)。
 #[allow(clippy::too_many_arguments)]
 fn run_video_decode(
-    mut video_decoder: ffmpeg_the_third::decoder::Video,
-    _hw_device: Option<HwDevice>,
+    // **Drop order 注意** (Codex P1 2026-05-16): `gpu_video_device` を **最初** に宣言し、
+    // 関数 return / panic 時に「逆生成順」で drop されるとき **最後** に落ちるようにする。
+    // Rust の関数パラメータは宣言順に作成され、reverse-creation-order で drop される
+    // ため、宣言順を `gpu_video_device → video_decoder → _hw_device → ...` にすると
+    // 実 drop 順は `..._hw_device → video_decoder → gpu_video_device` になる。
+    //
+    // `video_decoder` の `AVCodecContext` は内部で `av_buffer_ref(hw_device_ctx)` 経由で
+    // `AVHWDeviceContext` への参照を保持しており、video_decoder.drop の中で
+    // `avcodec_free_context` が走るまで release されない。FFmpeg の D3D11VA cleanup は
+    // この最終 free 時点で内部 hwframes 等の teardown で **lock/unlock callback を呼びうる**
+    // (`hwcontext_d3d11va.h` の docstring 「lock also protect access to the internal staging
+    // texture」より)。callback は `GpuVideoDevice::d3d_lock` (= CRITICAL_SECTION) を握りに
+    // 行くので、その時点で Arc が drop されて CS が DeleteCriticalSection 済みだと UB。
+    //
+    // 旧並び (`video_decoder` を最初に宣言) では gpu_video_device Arc が先に drop され、
+    // 最後の Arc だった場合に CS が削除された状態で video_decoder.drop が FFmpeg teardown を
+    // 起動する経路があった。本並びでその race を構造的に防ぐ。
     #[cfg(windows)] gpu_video_device: Option<
         std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
     >,
+    mut video_decoder: ffmpeg_the_third::decoder::Video,
+    _hw_device: Option<HwDevice>,
     video_pkt_rx: Receiver<VideoPacketMsg>,
     video_ctl_rx: Receiver<VideoControlMsg>,
     video_tx: Sender<VideoFrame>,
