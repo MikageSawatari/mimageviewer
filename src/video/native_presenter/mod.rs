@@ -12,9 +12,9 @@ use windows::Win32::Graphics::Direct3D::{
 };
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BOX, D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_FLAG,
-    D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
-    D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11Device1, ID3D11Device5,
-    ID3D11DeviceContext, ID3D11DeviceContext1, ID3D11DeviceContext4, ID3D11Fence,
+    D3D11_FENCE_FLAG_NONE, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE, D3D11_SDK_VERSION,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING, D3D11CreateDevice, ID3D11Device, ID3D11Device1,
+    ID3D11Device5, ID3D11DeviceContext, ID3D11DeviceContext1, ID3D11DeviceContext4, ID3D11Fence,
     ID3D11RenderTargetView, ID3D11Resource, ID3D11Texture2D, ID3D11View,
 };
 use windows::Win32::Graphics::DirectComposition::{
@@ -173,6 +173,15 @@ pub struct NativeVideoPresenter {
     /// drag と誤検出して top bar を hide させるバグを防ぐ。
     lbutton_down_since: Option<Instant>,
     fence_cache: Option<(u64, isize, ID3D11Fence)>,
+    /// presenter 自前の D3D11 fence。`copy_frame_into_backbuffer` のフレームコピー後に
+    /// `Signal` して値を進める。`run_native_video_output` 側の `present_retire` は
+    /// `copy_fence_completed_value()` を見て、コピーが GPU 上で完了したフレームだけを
+    /// 解放する (= 共有出力 slot を「presenter のコピー完了後」に返す保証)。
+    /// fence 作成に失敗した環境では `None` で、`present_retire` は時間ベースの depth
+    /// キャップにフォールバックする。
+    copy_fence: Option<ID3D11Fence>,
+    /// `copy_fence` に次に `Signal` する値 (1, 2, 3, ... と単調増加)。
+    copy_fence_value: u64,
     /// 開いた共有出力テクスチャのキャッシュ。キーは `(NT shared handle 値, shared_texture_gen)`。
     /// `gen` を含める理由は `open_shared_texture` のドキュメントコメント参照
     /// (= handle 値再利用による前動画フレーム混入の防止)。
@@ -437,6 +446,9 @@ pub struct NativePresentOutcome {
     pub shared_texture_gen: u64,
     /// この present で参照した GPU frame の fence value (GPU 経路のみ、CPU 経路は 0)。
     pub fence_value: u64,
+    /// このフレームコピーの GPU 完了に対応する presenter copy fence の値。
+    /// `present_retire` がこの値の到達を見てフレームを解放する。fence 未作成時は 0。
+    pub copy_fence_value: u64,
     /// この present 完了後の video swap chain サーフェスサイズ。
     pub surface_width: u32,
     pub surface_height: u32,
@@ -474,6 +486,10 @@ struct FrameCopyMetrics {
     keyed_mutex_cast_ms: f64,
     keyed_mutex_acquire_ms: f64,
     copy_call_ms: f64,
+    /// このコピーの GPU 完了に対応する presenter copy fence の値。`present_retire` は
+    /// `copy_fence_completed_value() >= この値` になったフレームだけを解放する。
+    /// fence 未作成時は 0 (= ゲートに使わない、depth キャップのみ)。
+    copy_fence_value: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1280,6 +1296,23 @@ impl NativeVideoPresenter {
                 .Commit()
                 .map_err(|e| format!("IDCompositionDevice::Commit: {e:?}"))?;
 
+            // presenter 自前の copy fence。フレームコピーの GPU 完了を `present_retire` 側で
+            // 待ち合わせるために使う。作成失敗は致命的ではない (= `present_retire` が時間
+            // ベース depth キャップへフォールバック) ので、Err にせず None で続行する。
+            let copy_fence: Option<ID3D11Fence> = {
+                let mut fence = None;
+                match d3d_device5.CreateFence(0, D3D11_FENCE_FLAG_NONE, &mut fence) {
+                    Ok(()) => fence,
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "native-presenter: copy fence CreateFence failed ({e:?}); \
+                             present_retire falls back to depth cap"
+                        ));
+                        None
+                    }
+                }
+            };
+
             let mut this = Self {
                 swap_chain,
                 waitable,
@@ -1305,6 +1338,8 @@ impl NativeVideoPresenter {
                 last_logged_region_hash: None,
                 lbutton_down_since: None,
                 fence_cache: None,
+                copy_fence,
+                copy_fence_value: 0,
                 shared_texture_cache: Vec::new(),
                 cpu_upload_scratch: Vec::new(),
                 pixel_probe_enabled: std::env::var_os("MIV_NATIVE_VIDEO_PIXEL_PROBE").is_some(),
@@ -1498,6 +1533,7 @@ impl NativeVideoPresenter {
             shared_cache_hit: copy.shared_cache_hit,
             shared_texture_gen: copy.shared_texture_gen,
             fence_value: copy.fence_value,
+            copy_fence_value: copy.copy_fence_value,
             surface_width: self.surface_width,
             surface_height: self.surface_height,
             geometry_changed: sar_changed,
@@ -1639,6 +1675,7 @@ impl NativeVideoPresenter {
             shared_cache_hit: copy.shared_cache_hit,
             shared_texture_gen: copy.shared_texture_gen,
             fence_value: copy.fence_value,
+            copy_fence_value: copy.copy_fence_value,
             surface_width: self.surface_width,
             surface_height: self.surface_height,
             geometry_changed: true,
@@ -1744,6 +1781,7 @@ impl NativeVideoPresenter {
             keyed_mutex_cast_ms: 0.0,
             keyed_mutex_acquire_ms: 0.0,
             copy_call_ms: 0.0,
+            copy_fence_value: 0,
         };
         match &frame.data {
             VideoFrameData::Cpu(bytes) => {
@@ -1885,7 +1923,33 @@ impl NativeVideoPresenter {
                 metrics.path = "d3d11_shared";
             }
         }
+        // フレームコピー (UpdateSubresource / CopySubresourceRegion) を GPU タイムライン上で
+        // 待ち合わせるための fence signal。`run_native_video_output` 側の `present_retire` が
+        // `copy_fence_completed_value()` でこの値の到達を見て、コピーが GPU 上で完了した
+        // フレームだけ共有出力 slot を解放する (= presenter のコピー完了前に producer が
+        // slot を再利用して上書きするレースを構造的に塞ぐ)。
+        if let Some(fence) = self.copy_fence.as_ref() {
+            self.copy_fence_value += 1;
+            let value = self.copy_fence_value;
+            unsafe {
+                match self.d3d_context4.Signal(fence, value) {
+                    Ok(()) => metrics.copy_fence_value = value,
+                    Err(e) => crate::logger::log(format!(
+                        "native-presenter: copy fence Signal({value}) failed: {e:?}"
+                    )),
+                }
+            }
+        }
         Ok(metrics)
+    }
+
+    /// presenter copy fence の現在の完了値。`run_native_video_output` の `present_retire` が
+    /// これを見て「コピーが GPU 上で完了したフレーム」を判定する。fence 未作成時は
+    /// `u64::MAX` を返さず `None` を返し、呼び出し側は depth キャップのみで運用する。
+    pub fn copy_fence_completed_value(&self) -> Option<u64> {
+        self.copy_fence
+            .as_ref()
+            .map(|fence| unsafe { fence.GetCompletedValue() })
     }
 
     /// HUD overlay HWND の生 u64 値。HUD HWND が生成されていなければ 0。

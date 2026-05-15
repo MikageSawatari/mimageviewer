@@ -178,9 +178,18 @@ GPU コピーがまだ source texture を読み終えていないと、別フレ
 (2026-05-15、別動画フレームの 1 枚混入)。
 
 対策として `run_native_video_output` は present 済みの `VideoFrame` を即 drop せず、
-`present_retire` リングバッファ (深さ `NATIVE_PRESENT_RETIRE_DEPTH`) に数フレーム保持して
-から drop する。これにより slot の `in_use` 解放が数フレーム遅延し、その間に GPU コピーが
-完了する。`fullscreen_present` perf イベントの `retire_queue_len` で長さを観測できる。
+`present_retire` リングバッファに `(VideoFrame, copy_fence_value)` で保持する。presenter は
+自前の `ID3D11Fence` (`copy_fence`) を持ち、`copy_frame_into_backbuffer` のコピー後に
+`Signal` して値を進める (`outcome.copy_fence_value`)。`present_retire` は
+`presenter.copy_fence_completed_value()` がその値へ到達した = **コピーが GPU 上で完了した**
+フレームだけを解放する。これで「presenter のコピー完了後に共有出力 slot を返す」ことが
+GPU fence で保証され、時間ベースのヒューリスティックではなくなる。
+
+fence 未作成の環境 (`copy_fence_completed_value()` が `None`) や Signal 失敗
+(`copy_fence_value == 0`) のフレームは fence ゲートでは解放せず、深さキャップ
+`NATIVE_PRESENT_RETIRE_CAP` のみで解放する (= 時間ベースに縮退、旧挙動と等価)。キャップは
+fence が万一 stall したときの上限も兼ねる (共有プール枯渇の防止)。`fullscreen_present`
+perf イベントの `retire_queue_len` で長さを観測できる (fence が効いていれば通常 1〜3)。
 
 ### CPU フレームの内部フロー (HW decoder 失敗 / 非対応コーデック時)
 

@@ -1440,21 +1440,25 @@ fn run_native_video_output(
     let mut first_present_probe_logged = false;
     let mut native_events = Vec::new();
     let trace_every_present = std::env::var_os("MIV_NATIVE_VIDEO_PRESENT_TRACE").is_some();
-    // present 済みの VideoFrame を数フレーム遅延解放するためのリングバッファ。
+    // present 済みの VideoFrame を遅延解放するためのリングバッファ。
     // presenter の `CopySubresourceRegion` は非同期 (GPU に積むだけ) なので、present 直後に
     // `VideoFrame` (= `D3d11Frame`) を drop すると共有出力 slot が即 producer に再利用され、
     // presenter 側のコピーが source texture を読み終える前に上書きされうる (= 別フレーム
     // 混入。2026-05-15 frame 114)。
     //
-    // ⚠️ これは **時間ベースの緩和** であって GPU コピー完了の保証ではない: present から
-    // `NATIVE_PRESENT_RETIRE_DEPTH` フレーム後には通常 GPU コピーは完了している、という
-    // 経験則に基づく。GPU stall がこの深さを超えると再発しうる。確実化するなら presenter
-    // 側で `CopySubresourceRegion` 後に D3D11 query/fence を積み、完了確認後に解放する形が
-    // 必要 (Codex P2、将来課題)。現状は実機で frame 114 系の混入が止まることを確認済みの
-    // 最小実装。
-    let mut present_retire: std::collections::VecDeque<VideoFrame> =
+    // 各エントリは `(VideoFrame, copy_fence_value)`。presenter は frame コピー後に自前の
+    // copy fence を `Signal` し、その値を `outcome.copy_fence_value` で返す。ここでは
+    // `presenter.copy_fence_completed_value()` がその値へ到達した (= コピーが GPU 上で
+    // 完了した) フレームだけを解放する。これにより「presenter のコピー完了後に共有出力
+    // slot を返す」ことが保証され、時間ベースのヒューリスティックではなくなる。
+    //
+    // fence 未作成の環境 (`copy_fence_completed_value()` が `None`) や Signal 失敗
+    // (`copy_fence_value == 0`) のフレームは fence ゲートでは解放せず、
+    // `NATIVE_PRESENT_RETIRE_CAP` の depth キャップのみで解放する (時間ベースに縮退)。
+    // キャップは fence が万一 stall したときの上限も兼ねる (= 共有プール枯渇の防止)。
+    let mut present_retire: std::collections::VecDeque<(VideoFrame, u64)> =
         std::collections::VecDeque::new();
-    const NATIVE_PRESENT_RETIRE_DEPTH: usize = 4;
+    const NATIVE_PRESENT_RETIRE_CAP: usize = 8;
     while !cancel.load(Ordering::Acquire) {
         // `FirstFrameReady` is what lets the engine leave Buffering after a seek.
         // The engine event channel can be temporarily full during seek bursts, so
@@ -2598,11 +2602,22 @@ fn run_native_video_output(
                             );
                         }
                     }
-                    // present 済みフレームを即 drop せず数フレーム遅延解放する
-                    // (= 共有出力 slot を GPU コピー完了まで握り続ける)。詳細は
-                    // `present_retire` 宣言箇所のコメント参照。
-                    present_retire.push_back(frame);
-                    while present_retire.len() > NATIVE_PRESENT_RETIRE_DEPTH {
+                    // present 済みフレームを遅延解放する。詳細は `present_retire` 宣言箇所
+                    // のコメント参照。
+                    present_retire.push_back((frame, outcome.copy_fence_value));
+                    // copy fence が到達したフレームを解放する (= GPU コピー完了を保証)。
+                    // `value == 0` (fence 未作成 / Signal 失敗) は fence ゲートでは扱わず、
+                    // 下の depth キャップに委ねる。
+                    if let Some(completed) = presenter.copy_fence_completed_value() {
+                        while present_retire
+                            .front()
+                            .is_some_and(|(_, value)| *value != 0 && *value <= completed)
+                        {
+                            present_retire.pop_front();
+                        }
+                    }
+                    // 安全キャップ: fence 未作成 / stall 時の上限。これを超えたら強制解放。
+                    while present_retire.len() > NATIVE_PRESENT_RETIRE_CAP {
                         present_retire.pop_front();
                     }
                 }
