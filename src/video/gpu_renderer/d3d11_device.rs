@@ -15,6 +15,7 @@
 //! D3D11 / VideoDevice の作成は **失敗してもパニックしない**。失敗時は呼び出し側に
 //! `Err` を返し、呼び出し側は SW (CPU readback + swscale) 経路にフォールバックする。
 
+use std::cell::UnsafeCell;
 use std::ptr;
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -46,6 +47,9 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
 use windows::Win32::Graphics::Dxgi::{IDXGIKeyedMutex, IDXGIResource1};
+use windows::Win32::System::Threading::{
+    AcquireSRWLockExclusive, ReleaseSRWLockExclusive, SRWLOCK,
+};
 use windows::core::Interface;
 
 /// 出力テクスチャのリングバッファサイズ。decoder が書き → UI が読む間
@@ -233,6 +237,21 @@ pub struct GpuVideoDevice {
     /// したまま使ってしまう (= sync race 復活、または永久 Wait)。
     /// wgpu 側は `fence_gen` で再 open 判定する。
     fence_gen: u64,
+    /// `ID3D11DeviceContext` / `ID3D11VideoContext` の同時呼び出しを直列化するための
+    /// SRWLOCK。**FFmpeg の D3D11VA decode (`avcodec_send_packet` / `receive_frame` が
+    /// 内部で device context を触る) と `blit_nv12_to_rgba` の immediate context 操作が
+    /// 同じ `ID3D11DeviceContext` を共有している**ため、両者を直列化しないと driver 内で
+    /// hard-stuck する (fast-swap 連射で実害。本ファイル冒頭の `LIVE_VIDEO_DECODE_THREADS`
+    /// コメント参照)。`processor_cache: Mutex` は blit 同士しか直列化せず FFmpeg 側を
+    /// 守れない。
+    ///
+    /// FFmpeg には `AVD3D11VADeviceContext.lock/unlock` callback でこの SRWLOCK を
+    /// 渡し (`ffmpeg_d3d11.rs`)、`blit_nv12_to_rgba` の context 操作区間も `lock_d3d_context`
+    /// で同じ SRWLOCK を握る。C callback 跨ぎで lock/unlock を別々に呼ぶ必要があるため
+    /// RAII guard を返せない `SRWLOCK` を使う。`SRWLOCK::default()` (= 全 0) が
+    /// `SRWLOCK_INIT` で有効な初期状態。`&self` 経由で内部可変するため `UnsafeCell` で包む
+    /// (`GpuVideoDevice` の `unsafe impl Sync` がこの共有可変を保証する)。
+    d3d_lock: UnsafeCell<SRWLOCK>,
 }
 
 /// 入力動画の色空間ヒント。FFmpeg の transfer characteristic から決定し、
@@ -310,6 +329,22 @@ struct ProcessorState {
     /// 0/0 はフォールバック判定後の値 (60/1 等) を保持。
     fps_num: u32,
     fps_den: u32,
+}
+
+/// `GpuVideoDevice::lock_d3d_context` が返す RAII guard。Drop で SRWLOCK を release する。
+struct D3dContextGuard<'a> {
+    lock: *mut SRWLOCK,
+    _marker: std::marker::PhantomData<&'a GpuVideoDevice>,
+}
+
+impl Drop for D3dContextGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: `lock` は `GpuVideoDevice::d3d_lock` の生ポインタ。guard の寿命は
+        // `&self` 借用 (`PhantomData`) に縛られており、その間 `GpuVideoDevice` は生存。
+        unsafe {
+            ReleaseSRWLockExclusive(self.lock);
+        }
+    }
 }
 
 impl GpuVideoDevice {
@@ -411,6 +446,7 @@ impl GpuVideoDevice {
             fence_shared_handle,
             next_fence_value: std::sync::atomic::AtomicU64::new(0),
             fence_gen,
+            d3d_lock: UnsafeCell::new(SRWLOCK::default()),
         }))
     }
 
@@ -428,6 +464,30 @@ impl GpuVideoDevice {
 
     pub fn raw_context(&self) -> &ID3D11DeviceContext {
         &self.context
+    }
+
+    /// D3D11VA context 直列化用 SRWLOCK の生ポインタ。`ffmpeg_d3d11.rs` が
+    /// `AVD3D11VADeviceContext.lock_ctx` に渡す。`GpuVideoDevice` はアプリ全体で 1 個・
+    /// `Arc` で寿命管理されており、FFmpeg の hw_device_ctx (AVBufferRef) より長生きする
+    /// ので、このポインタは AVBufferRef の寿命中ずっと有効。
+    pub fn d3d_lock_ptr(&self) -> *mut SRWLOCK {
+        self.d3d_lock.get()
+    }
+
+    /// `blit_nv12_to_rgba` の context 操作区間で握る RAII guard を返す。FFmpeg の
+    /// D3D11VA lock/unlock callback と同じ SRWLOCK なので、FFmpeg decode と blit の
+    /// `ID3D11DeviceContext` / `ID3D11VideoContext` 操作が直列化される。
+    fn lock_d3d_context(&self) -> D3dContextGuard<'_> {
+        // SAFETY: SRWLOCK は共有ポインタ越しの並行 Acquire/Release を前提に設計された
+        // OS プリミティブ。`UnsafeCell` で内部可変を表現し、`GpuVideoDevice` の
+        // `unsafe impl Sync` がこの共有を保証する。
+        unsafe {
+            AcquireSRWLockExclusive(self.d3d_lock.get());
+        }
+        D3dContextGuard {
+            lock: self.d3d_lock.get(),
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// 入力 NV12 / P010 テクスチャを RGBA 共有テクスチャに blit する。
@@ -510,6 +570,15 @@ impl GpuVideoDevice {
         // 早期リターンされても close する必要がある (Codex P2)。BlitOutput を返す直前で
         // disarm() してリーク防止責任を呼び出し側 (D3d11Frame::Drop) に移譲する。
         // Shared output handles are owned by `shared_output_pool` and reused.
+
+        // ここから先は `ID3D11VideoContext` / `ID3D11DeviceContext` を触る。FFmpeg の
+        // D3D11VA decode (`avcodec_send_packet` 等) が同じ context を別スレッドから
+        // 並行使用しうるため、`d3d_lock` SRWLOCK で直列化する (FFmpeg 側は
+        // `AVD3D11VADeviceContext.lock/unlock` callback で同じ SRWLOCK を握る)。
+        // `acquire_shared_output` (最大 500ms wait しうる) は **この lock の外**で
+        // 済ませてあるので、FFmpeg decode を不必要に長くブロックしない。guard は
+        // 関数末尾 (BlitOutput 返却まで) で drop される。
+        let _d3d_guard = self.lock_d3d_context();
 
         // 4. 入力 view を作成
         let mut in_view: Option<ID3D11VideoProcessorInputView> = None;

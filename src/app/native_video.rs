@@ -3335,7 +3335,9 @@ impl App {
             return false;
         }
 
-        const MAX_LIVE_VIDEO_DECODE_THREADS: usize = 3;
+        // throttle 上限。詳細は `try_start_native_video_fast_swap` 側のコメント参照
+        // (2026-05-15 に 3 → 2 へ厳格化)。
+        const MAX_LIVE_VIDEO_DECODE_THREADS: usize = 2;
         let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
             .load(std::sync::atomic::Ordering::Acquire);
         if live_decoders >= MAX_LIVE_VIDEO_DECODE_THREADS {
@@ -3407,9 +3409,13 @@ impl App {
         // 居座るので、`LIVE_VIDEO_DECODE_THREADS` が上限を超えていれば新 swap を抑制する。
         //
         // 上限は「現在再生中 1 + transient swap 中 1〜2」をすべて含めた **総 live 数** で
-        // カウントしている。よって MAX=3 は「stuck 3 個」ではなく「in-flight 合計 3 個」の
-        // 意。stuck と再生中の player を区別しない単純カウントで実装している。
-        const MAX_LIVE_VIDEO_DECODE_THREADS: usize = 3;
+        // カウントしている。健全な thread は cancel 観測後すぐ exit するので、swap 開始
+        // 時点では通常 live_count=1 (= 現在再生中の 1 個だけ)。swap 開始時点で 2 以上なら
+        // 直前の swap の旧 thread がまだ exit していない = stuck/遅延の兆候なので、
+        // MAX=2 (= `>= 2` で抑制) で新規 HW fast-swap を起動しない (2026-05-15、D3D11VA
+        // context 直列化と合わせた belt-and-suspenders。直列化で hard-stuck 自体は
+        // 防げる前提だが、万一に備えて throttle も厳格化する)。
+        const MAX_LIVE_VIDEO_DECODE_THREADS: usize = 2;
         let live_decoders = crate::video::decoder::LIVE_VIDEO_DECODE_THREADS
             .load(std::sync::atomic::Ordering::Acquire);
         if live_decoders >= MAX_LIVE_VIDEO_DECODE_THREADS {

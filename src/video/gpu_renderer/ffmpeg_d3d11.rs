@@ -16,7 +16,6 @@
 //! ずれは crash を生むので、フィールド順序とサイズは FFmpeg upstream を参照。
 
 use std::os::raw::c_void;
-use std::ptr;
 use std::sync::Arc;
 
 use ffmpeg_the_third::ffi::{
@@ -26,9 +25,36 @@ use ffmpeg_the_third::ffi::{
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11DeviceContext, ID3D11VideoContext, ID3D11VideoDevice,
 };
+use windows::Win32::System::Threading::{
+    AcquireSRWLockExclusive, ReleaseSRWLockExclusive, SRWLOCK,
+};
 use windows::core::Interface;
 
 use super::d3d11_device::{GpuVideoDevice, GpuVideoError};
+
+/// FFmpeg D3D11VA の `lock` callback。`lock_ctx` は `GpuVideoDevice::d3d_lock_ptr()`
+/// (= `*mut SRWLOCK`)。FFmpeg は内部で `ID3D11DeviceContext` / `ID3D11VideoContext` を
+/// 触る前にこれを、触り終えたら `unlock` を呼ぶ。`blit_nv12_to_rgba` 側も同じ SRWLOCK を
+/// 握るので、FFmpeg decode と blit の context 操作が直列化される。
+///
+/// SAFETY: `lock_ctx` は `GpuVideoDevice::d3d_lock` (= `SRWLOCK`) の生ポインタ。
+/// `GpuVideoDevice` は本 hw_device_ctx より長生きする (`Arc`、アプリ全体で 1 個)。
+unsafe extern "C" fn d3d11va_lock(lock_ctx: *mut c_void) {
+    if lock_ctx.is_null() {
+        return;
+    }
+    unsafe { AcquireSRWLockExclusive(lock_ctx as *mut SRWLOCK) };
+}
+
+/// FFmpeg D3D11VA の `unlock` callback。`d3d11va_lock` の対。
+///
+/// SAFETY: `d3d11va_lock` と同じ。
+unsafe extern "C" fn d3d11va_unlock(lock_ctx: *mut c_void) {
+    if lock_ctx.is_null() {
+        return;
+    }
+    unsafe { ReleaseSRWLockExclusive(lock_ctx as *mut SRWLOCK) };
+}
 
 /// `libavutil/hwcontext_d3d11va.h` の `AVD3D11VADeviceContext` を手動で再現。
 /// FFmpeg 7.x で観測されているレイアウト。
@@ -108,9 +134,13 @@ pub unsafe fn create_ffmpeg_hw_device_ctx(
         (*d3d11_ctx).device_context = context_ptr;
         (*d3d11_ctx).video_device = video_dev_ptr;
         (*d3d11_ctx).video_context = video_ctx_ptr;
-        (*d3d11_ctx).lock = None;
-        (*d3d11_ctx).unlock = None;
-        (*d3d11_ctx).lock_ctx = ptr::null_mut();
+        // lock/unlock callback で `GpuVideoDevice::d3d_lock` (SRWLOCK) を握らせる。
+        // これにより FFmpeg の D3D11VA decode (`avcodec_send_packet` 等が内部で device
+        // context を触る) と mIV 側 `blit_nv12_to_rgba` の context 操作が同じ SRWLOCK で
+        // 直列化され、fast-swap 連射時の driver hard-stuck を防ぐ。
+        (*d3d11_ctx).lock = Some(d3d11va_lock);
+        (*d3d11_ctx).unlock = Some(d3d11va_unlock);
+        (*d3d11_ctx).lock_ctx = gpu_dev.d3d_lock_ptr() as *mut c_void;
         addref_com(device_ptr);
         addref_com(context_ptr);
         addref_com(video_dev_ptr);

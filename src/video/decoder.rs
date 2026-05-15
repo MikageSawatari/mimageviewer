@@ -3073,6 +3073,20 @@ fn run_video_decode(
             crate::logger::log(format!("video send_packet: {e}"));
             continue;
         }
+        // `avcodec_send_packet` は HW decode 経路で D3D11 device context を内部使用する。
+        // fast-swap 連射時に複数 decoder + presenter blit が同 context を並行使用すると
+        // driver 内で hard-stuck する事象があった (D3D11VA context 直列化で対策済み)。
+        // 万一再発したときに「send_packet がどれだけ遅い/止まっているか」をログで
+        // 切り分けられるよう、異常に遅い send_packet を 1 行警告する (Codex 助言)。
+        let send_packet_ms = send_t0.elapsed().as_secs_f64() * 1000.0;
+        if send_packet_ms > 100.0 {
+            crate::logger::log(format!(
+                "[video-decode] slow send_packet: {send_packet_ms:.1}ms serial={current_seek_serial} \
+                 pkt_rx_len={} video_tx_len={}",
+                video_pkt_rx.len(),
+                video_tx.len()
+            ));
+        }
         let mut frame = Video::empty();
         while video_decoder.receive_frame(&mut frame).is_ok() {
             if cancel.load(Ordering::Acquire) {
