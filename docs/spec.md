@@ -259,6 +259,8 @@ ViX（32bit旧来アプリ）の使い勝手を継承しつつ、Rustによる�
 
 MP4, AVI, MOV, MKV, WMV, MPG, MPEG。フルスクリーン再生では FFmpeg LGPL DLL
 バックエンドを使い、対応環境では D3D11VA ハードウェアデコードを利用する。
+D3D11VA 非対応 codec は CPU デコードで再生し、D3D11VA 対応 codec の HW 経路失敗は
+SW fallback で隠さず再生エラーとして表示する。
 
 ### 5.2 自動除外
 
@@ -462,6 +464,7 @@ Ctrl+S / Ctrl+G のスコープ解決を共通化している。横断仕様は
 | `parallelism` | Parallelism | Auto | 並列読み込みスレッド数 |
 | `folder_skip_limit` | usize | 5 | Ctrl+↑↓ で空フォルダ・画像なし ZIP をスキップする上限（UI 上限 30） |
 | `video_volume` | f64 | 1.0 | 動画再生時の既定音量（線形ゲイン。UI は -∞dB〜+18dB の dB フェーダー）。1.0 超は手動 boost として safety limiter 前で適用 |
+| `video_hw_decode` | bool | true | Windows D3D11VA ハードウェアデコードを試みる。D3D11VA 非対応 codec は CPU デコード、D3D11VA 対応 codec の HW 経路失敗は再生エラー |
 | `video_deinterlace` | VideoDeinterlaceMode | Auto | 動画再生時のデインターレース（Off / Auto / On）。Auto は frame interlaced flag と stream field_order を参照し、Auto/On は FFmpeg bwdif を表示前に適用 |
 | `audio_normalize_enabled` | bool | false | 動画音量ノーマライズのグローバル ON/OFF。ON のとき、open / Norm ボタン押下で per-file 測定値 (`audio_normalize.db`) を引いて -14 LUFS 相当に gain 適用 |
 | `audio_normalize_target_lufs_milli` | i32 | -14000 | ノーマライズのターゲット音量 (LUFS の千分の一単位、整数。-14000 = -14.000 LUFS = YouTube/Spotify 相当)。使用時は `[-60_000, 0]` にクランプ |

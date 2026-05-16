@@ -2877,7 +2877,8 @@ impl VideoPlayer {
     /// `initial_volume` は線形ゲイン (0.0..+18dB 相当)。1.0 超は音声ポンプ側の
     /// 手動 boost として扱う。
     /// `resume_secs` を指定すると、最初の動画情報受領後に自動的にその位置へシークする。
-    /// `hw_decode` が true なら D3D11VA HW デコードを試行 (失敗時は SW にフォールバック)。
+    /// `hw_decode` が true なら D3D11VA HW デコードを試行する。D3D11VA 非対応 codec は
+    /// SW で開き、D3D11VA 対応 codec の HW 初期化 / open 失敗はエラーにする。
     /// VST3 プラグイン処理用の DspBridge は `dsp_bridge` 引数で渡す。
     /// `None` または `is_enabled()=false` なら audio-pump はパススルー。
     /// `is_enabled()=true` のときは pump thread で `bridge.process_block` を呼ぶ。

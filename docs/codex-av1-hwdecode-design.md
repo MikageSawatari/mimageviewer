@@ -25,8 +25,10 @@ codec=h264 decoder=h264 hw_requested=true d3d11va_supported=true hw_active_initi
 
 ## 目的
 
-AV1 で D3D11VA HW decode を利用できる環境では HW decode を優先し、利用できない環境では
-従来通り `libdav1d` / SW decode に自動 fallback する。
+AV1 で D3D11VA HW decode を利用できる環境では HW decode を優先する。解決済み候補の
+どれも D3D11VA config を持たない環境では `libdav1d` / SW decode を使うが、D3D11VA
+対応候補の HW 初期化 / open 失敗は SW fallback で隠さず再生エラーとして扱う
+(2026-05-16 の fallback policy 修正後の方針)。
 
 副目的:
 

@@ -874,12 +874,12 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(4.0);
     ui.label(
         "GPU の動画デコード機能 (Direct3D 11) を使って HEVC / 4K 動画の CPU 負荷を下げます。\n\
-         ドライバ非対応や初期化失敗の場合は自動的に CPU デコードに切り替わります。",
+         D3D11VA 非対応のコーデックは CPU デコードで再生し、対応コーデックの初期化失敗はエラーとして表示します。",
     );
     ui.add_space(6.0);
     ui.checkbox(&mut s.video_hw_decode, "ハードウェアデコードを有効にする")
         .on_hover_text(
-            "ON (既定): 対応コーデックは GPU でデコード (失敗時は CPU に自動フォールバック)。\n\
+            "ON (既定): 対応コーデックは GPU でデコード。D3D11VA 非対応コーデックは CPU でデコード。\n\
          OFF: 常に CPU でデコード。\n\
          切り替え後は次に開く動画から反映されます。",
         );

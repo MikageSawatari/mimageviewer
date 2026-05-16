@@ -857,7 +857,8 @@ pub struct Settings {
     /// 動画末尾近く (残り 5 秒以内) は 0 にリセットして "次回最初から" の挙動。
     #[serde(default)]
     pub video_resume_positions: std::collections::HashMap<String, f64>,
-    /// ハードウェアデコードを利用するか (Windows D3D11VA)。失敗時は自動的に SW にフォールバック。
+    /// ハードウェアデコードを利用するか (Windows D3D11VA)。D3D11VA 非対応 codec は
+    /// SW で再生し、D3D11VA 対応 codec の HW 初期化 / open 失敗はエラーとして扱う。
     /// HEVC / 4K 動画の CPU 負荷を大きく下げるため既定 ON。GPU ドライバの不具合等で
     /// HW 経路だけ問題が出る場合は環境設定から OFF に切り替えて回避できる。
     #[serde(default = "default_true")]

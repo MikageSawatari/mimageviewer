@@ -126,7 +126,8 @@
       <span class="box-icon">💡</span>
       <div class="box-body">
         音声は WASAPI 共有モード経由 (cpal)。ハードウェア デコード (D3D11VA) は環境設定の
-        「動画」ページで有効化できます。失敗時は自動で SW デコードに fall-back します。
+        「動画」ページで有効化できます。D3D11VA 非対応の古いコーデックは SW デコードで再生し、
+        D3D11VA 対応コーデックの HW 経路失敗は再生エラーとして表示します。
       </div>
     </div>
 

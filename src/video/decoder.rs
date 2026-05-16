@@ -1821,8 +1821,9 @@ fn run_decoder(
     let video_field_order = video_params_owned.field_order();
     let video_stream_interlaced = field_order_is_interlaced(video_field_order);
     // ── HW デコード初期化 (D3D11VA) ──
-    // 失敗時は黙って SW デコードに落ちる。`hw_device` を _hw_device で持って Drop 時に
-    // unref されるようにし、AVCodecContext は内部でさらに ref を取るので競合しない。
+    // D3D11VA config を持つ decoder は HW 経路だけを試し、HW 初期化 / open 失敗を
+    // アプリ側不具合として表面化させる。D3D11VA config がそもそも無い codec は
+    // 通常の SW decoder で開く。
     //
     // gpu_video_device が利用可能な場合は **mIV 側で作成した D3D11 デバイス** を
     // FFmpeg に渡して共有する (= HW デコーダの NV12 出力と ID3D11VideoProcessor が
@@ -5550,7 +5551,10 @@ enum DecoderChoice {
 struct VideoDecoderCandidate {
     choice: DecoderChoice,
     reason: &'static str,
-    allow_sw_fallback: bool,
+    /// Whether this candidate may be opened as a software decoder when the
+    /// global policy permits SW decode. AV1's native decoder is inserted only
+    /// as an HW-preferred candidate, so keep it HW-only and let Default handle SW.
+    allow_sw_decode: bool,
 }
 
 fn preferred_video_decoders(
@@ -5562,19 +5566,25 @@ fn preferred_video_decoders(
         candidates.push(VideoDecoderCandidate {
             choice: DecoderChoice::ByName("av1"),
             reason: "av1_hw_preferred",
-            allow_sw_fallback: false,
+            allow_sw_decode: false,
         });
     }
     candidates.push(VideoDecoderCandidate {
         choice: DecoderChoice::Default,
         reason: "default",
-        // HW 要求時は SW フォールバックを禁止 (Codex P1 2026-05-15、ユーザーポリシー:
-        // 「アプリの都合で SW デコードに切り替えることはしない」)。HW 初期化や open に
-        // 失敗したら open エラー扱いにする。HW 非要求 (= 設定で HW disabled) なら
-        // 最初から SW しか試さないので SW 許可。
-        allow_sw_fallback: !hw_decode_requested,
+        // Default decoder は SW でも開ける。ただし HW 要求時に実際の SW 試行を許すかは、
+        // 解決済み候補の D3D11VA 対応有無を見て open_video_decoder_with_candidates で決める。
+        allow_sw_decode: true,
     });
     candidates
+}
+
+fn candidate_allows_sw_decode(
+    candidate: VideoDecoderCandidate,
+    hw_decode_requested: bool,
+    any_d3d11va_candidate: bool,
+) -> bool {
+    candidate.allow_sw_decode && (!hw_decode_requested || !any_d3d11va_candidate)
 }
 
 fn clone_codec_parameters(
@@ -5622,6 +5632,7 @@ fn open_video_decoder_with_candidates(
 ) -> Result<OpenedVideoDecoder, String> {
     let candidates = preferred_video_decoders(codec_id, hw_decode_requested);
     let mut errors = Vec::<String>::new();
+    let mut resolved_candidates = Vec::<ResolvedVideoDecoderCandidate>::new();
 
     for candidate in candidates {
         let Some(codec) = resolve_video_decoder_candidate(codec_id, candidate) else {
@@ -5634,11 +5645,33 @@ fn open_video_decoder_with_candidates(
         };
         let decoder_name = codec.name().to_string();
         let hw_probe = probe_d3d11va_for_codec(codec);
+        resolved_candidates.push(ResolvedVideoDecoderCandidate {
+            candidate,
+            codec,
+            decoder_name,
+            hw_probe,
+        });
+    }
+
+    let any_d3d11va_candidate = hw_decode_requested
+        && resolved_candidates
+            .iter()
+            .any(|resolved| resolved.hw_probe.d3d11va_supported);
+
+    for resolved in resolved_candidates {
+        let ResolvedVideoDecoderCandidate {
+            candidate,
+            codec,
+            decoder_name,
+            hw_probe,
+        } = resolved;
+        let allow_sw_decode =
+            candidate_allows_sw_decode(candidate, hw_decode_requested, any_d3d11va_candidate);
         crate::logger::log(format!(
             "video decoder candidate: codec={} decoder={decoder_name} reason={} allow_sw_fallback={} hw_requested={hw_decode_requested} d3d11va_supported={} d3d11va_config={}",
             codec_id.name(),
             candidate.reason,
-            candidate.allow_sw_fallback,
+            allow_sw_decode,
             hw_probe.d3d11va_supported,
             hw_probe.d3d11va_config,
         ));
@@ -5680,7 +5713,7 @@ fn open_video_decoder_with_candidates(
                             candidate.reason
                         ));
                         errors.push(format!("{decoder_name}: open_hw: {e}"));
-                        if !candidate.allow_sw_fallback {
+                        if !allow_sw_decode {
                             continue;
                         }
                     }
@@ -5691,22 +5724,21 @@ fn open_video_decoder_with_candidates(
                     codec_id.name(),
                     candidate.reason
                 ));
-                if !candidate.allow_sw_fallback {
+                if !allow_sw_decode {
                     errors.push(format!("{decoder_name}: hw_init"));
                     continue;
                 }
             }
-        } else if hw_decode_requested && !candidate.allow_sw_fallback {
+        } else if hw_decode_requested && any_d3d11va_candidate {
             crate::logger::log(format!(
-                "video decoder candidate failed: codec={} decoder={decoder_name} reason={} stage=hw_probe",
+                "video decoder candidate skipped: codec={} decoder={decoder_name} reason={} stage=hw_probe_no_d3d11va",
                 codec_id.name(),
                 candidate.reason
             ));
-            errors.push(format!("{decoder_name}: no_d3d11va"));
             continue;
         }
 
-        if candidate.allow_sw_fallback {
+        if allow_sw_decode {
             let ctx =
                 ffmpeg_the_third::codec::context::Context::from_parameters(video_params.clone())
                     .map_err(|e| format!("{decoder_name}: context_sw: {e}"))?;
@@ -5737,6 +5769,13 @@ fn open_video_decoder_with_candidates(
     }
 
     Err(errors.join("; "))
+}
+
+struct ResolvedVideoDecoderCandidate {
+    candidate: VideoDecoderCandidate,
+    codec: ffmpeg_the_third::Codec,
+    decoder_name: String,
+    hw_probe: D3d11vaProbe,
 }
 
 /// 指定 decoder について、D3D11VA の候補を列挙する。
@@ -6157,10 +6196,10 @@ mod decoder_candidate_tests {
         AudioControlMsg, AudioDecodeInput, AudioPacketMsg, BwdifFilterKey, DecoderChoice,
         FrameStepDecodeSpec, FrameStepDecodeState, FrameStepSelection, VideoControlMsg,
         VideoDecodeInput, VideoPacketMsg, bwdif_filter_key, bwdif_force_all_frames,
-        field_order_is_interlaced, normalize_audio_input_layout, normalize_sar,
-        preferred_video_decoders, recv_audio_decode_input, recv_video_decode_input_with_timeout,
-        selected_video_rate, should_bypass_pause_park_for_post_seek_first_frame,
-        should_try_deinterlace,
+        candidate_allows_sw_decode, field_order_is_interlaced, normalize_audio_input_layout,
+        normalize_sar, preferred_video_decoders, recv_audio_decode_input,
+        recv_video_decode_input_with_timeout, selected_video_rate,
+        should_bypass_pause_park_for_post_seek_first_frame, should_try_deinterlace,
     };
     use crate::settings::VideoDeinterlaceMode;
     use crossbeam_channel::bounded;
@@ -6359,8 +6398,11 @@ mod decoder_candidate_tests {
             let candidates = preferred_video_decoders(id, true);
             assert_eq!(candidates.len(), 1, "{id:?}");
             assert_eq!(candidates[0].choice, DecoderChoice::Default);
-            // HW 要求時は SW fallback 禁止 (Codex P1 2026-05-15)。
-            assert!(!candidates[0].allow_sw_fallback, "{id:?}");
+            assert!(candidates[0].allow_sw_decode, "{id:?}");
+            assert!(
+                !candidate_allows_sw_decode(candidates[0], true, true),
+                "{id:?}"
+            );
         }
     }
 
@@ -6370,10 +6412,20 @@ mod decoder_candidate_tests {
             let candidates = preferred_video_decoders(id, false);
             assert_eq!(candidates.len(), 1, "{id:?}");
             assert_eq!(candidates[0].choice, DecoderChoice::Default);
-            // HW 非要求 (= 設定で HW OFF) なら SW のみ。fallback 自体は使わないが、
-            // 候補単体に SW で開く許可は与える。
-            assert!(candidates[0].allow_sw_fallback, "{id:?}");
+            assert!(
+                candidate_allows_sw_decode(candidates[0], false, false),
+                "{id:?}"
+            );
         }
+    }
+
+    #[test]
+    fn hw_requested_allows_sw_when_no_d3d11va_candidate_exists() {
+        let candidates = preferred_video_decoders(Id::MSMPEG4V2, true);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].choice, DecoderChoice::Default);
+        assert!(candidates[0].allow_sw_decode);
+        assert!(candidate_allows_sw_decode(candidates[0], true, false));
     }
 
     #[test]
@@ -6401,10 +6453,11 @@ mod decoder_candidate_tests {
         let candidates = preferred_video_decoders(Id::AV1, true);
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].choice, DecoderChoice::ByName("av1"));
-        assert!(!candidates[0].allow_sw_fallback);
+        assert!(!candidates[0].allow_sw_decode);
         assert_eq!(candidates[1].choice, DecoderChoice::Default);
-        // HW 要求時は default candidate でも SW fallback 禁止 (Codex P1 2026-05-15)。
-        assert!(!candidates[1].allow_sw_fallback);
+        assert!(candidates[1].allow_sw_decode);
+        assert!(!candidate_allows_sw_decode(candidates[0], true, false));
+        assert!(!candidate_allows_sw_decode(candidates[1], true, true));
     }
 
     #[test]
@@ -6412,7 +6465,7 @@ mod decoder_candidate_tests {
         let candidates = preferred_video_decoders(Id::AV1, false);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].choice, DecoderChoice::Default);
-        assert!(candidates[0].allow_sw_fallback);
+        assert!(candidate_allows_sw_decode(candidates[0], false, false));
     }
 
     #[test]
@@ -6420,8 +6473,7 @@ mod decoder_candidate_tests {
         let candidates = preferred_video_decoders(Id::VP9, true);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].choice, DecoderChoice::Default);
-        // HW 要求時は SW fallback 禁止 (Codex P1 2026-05-15)。
-        assert!(!candidates[0].allow_sw_fallback);
+        assert!(!candidate_allows_sw_decode(candidates[0], true, true));
     }
 
     #[test]
@@ -6429,7 +6481,7 @@ mod decoder_candidate_tests {
         let candidates = preferred_video_decoders(Id::VP9, false);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].choice, DecoderChoice::Default);
-        assert!(candidates[0].allow_sw_fallback);
+        assert!(candidate_allows_sw_decode(candidates[0], false, false));
     }
 
     #[test]

@@ -15,7 +15,7 @@ NVIDIA RTX VSR 関連の Phase 2 (DComp overlay) を撤回した後の **最終�
 |---|---|
 | ★★★ | 4K HEVC を **30/60fps カクつかず再生** (= zero-copy GPU 経路必須) |
 | ★★★ | フォーマット網羅 (MP4/MKV/MOV/AVI/WMV/MPG/MPEG with H.264/HEVC/AV1/VP9 等) |
-| ★★ | リモートデスクトップでも再生継続 (= GPU 経路が取れなければ自動 fallback) |
+| ★★ | リモートデスクトップでも再生継続 (= 表示 GPU 経路が取れなければ CPU upload 経路を使う) |
 | ★★ | 配布 LGPL 互換 (FFmpeg LGPL shared build を `include_bytes!` で同梱、動的リンク) |
 | ★ | unsafe は `gpu_renderer/` モジュール内に局所化、外部 API は safe |
 
@@ -442,15 +442,20 @@ channel disconnect で recv() 抜け → exit。demux thread が両 decode threa
 **audio → video** の順で `join()` する (cpal stream の bookkeeping を Drop より前に
 完了させたい)。
 
-**HW デコード fallback**: `try_init_d3d11va` 失敗 → SW デコードに fallback。`HwDevice`
-は AVBufferRef の RAII ラッパーで、`unsafe impl Send for HwDevice` を付けて video
-decode thread に move する (= AVBufferRef refcount は thread-safe)。SW 再試行時は
-`_hw_device = None` で None 状態に置き換える。
+**HW / SW デコード選択**: `hw_decode` 有効時でも、対象 decoder が D3D11VA config を
+持たない codec は最初から SW decoder で開く。一方、D3D11VA config を持つ codec は
+HW 経路だけを試し、HW device 初期化 / decoder open / decode 途中の致命失敗を SW
+fallback で隠さずエラーとして扱う。これにより古い `msmpeg4v2` 等の HW 非対応 codec は
+再生可能に保ちつつ、H.264 / HEVC / AV1 / VP9 など HW 対応候補がある動画では
+「個別 open なら HW で動くはずのものが勝手に SW へ落ちる」回帰を防ぐ。`HwDevice`
+は AVBufferRef の RAII ラッパーで、video decode thread に move して保持する
+(= AVBufferRef refcount は thread-safe)。
 
 **AV1 decoder 選択**: `hw_decode` 有効時、AV1 は既定 decoder (`libdav1d` になり得る)
-の前に native `av1` decoder を HW 専用 candidate として試す。native `av1` が存在しない、
-D3D11VA config を持たない、HW device 初期化や open に失敗した場合は既定 decoder に戻り、
-従来通り SW decode する。H.264 / HEVC 等は既定 decoder 1 個だけを使い、既存経路を維持する。
+の前に native `av1` decoder を HW 専用 candidate として試す。解決済み候補のどれかが
+D3D11VA config を持つ場合は HW のみ、全候補が D3D11VA config を持たない場合だけ
+既定 decoder で SW decode する。H.264 / HEVC 等は既定 decoder 1 個だけを使い、同じ
+HW/SW 選択規則を適用する。
 
 **HW デコード診断**: open 時に stream codec id (`h264` / `hevc` / `av1` / `vp9`
 等)、FFmpeg が選択した decoder 名、D3D11VA HW config の有無、実際に初期化を試みた
@@ -592,8 +597,10 @@ HW pixel format** であることがある。それを返すと FFmpeg は「mIV
 対応する `hw_device_ctx` が無い」状態となり、`avcodec_send_packet` が AVERROR(ENOSYS)
 ("Function not implemented") を**無限に**返し続ける (実測: 1 再生で 4158 件のログ + UI が
 「準備中」のまま固着)。本実装は D3D11 のみ受け入れ、無ければ `AV_PIX_FMT_NONE` を返して
-明示的に decoder 初期化を失敗させる。SW フォールバックは行わない (ユーザーポリシー:
-シーク体感が大きく劣化するためアプリ判断での SW 切替は禁止)。
+明示的に decoder 初期化を失敗させる。このケースは「D3D11VA config を持つ decoder の
+HW 初期化後に、FFmpeg から期待した D3D11 frame が返らない」異常なので SW
+フォールバックは行わない (ユーザーポリシー: シーク体感が大きく劣化するため
+アプリ判断での SW 切替は禁止)。
 
 **`send_packet` エラー分類と thread exit** (Codex 助言 + P1 review 2026-05-15):
 旧コードは `send_packet` エラー時に一律 `continue` で全パケットを処理し続けていたため、
@@ -766,14 +773,15 @@ memory をさらに食って OOM 連鎖を加速させる (= スパイラル)。
 抑制を入れて、集計目的としては十分な粒度に絞る (= 状態変化は `queue_state` event で
 別途記録される)。
 
-**SW フォールバック禁止 (HW 要求時)** (Codex P1 2026-05-15):
-当初 `preferred_video_decoders` の default candidate は `allow_sw_fallback: true` のまま
-だったため、`get_hw_format` を D3D11-only にしても decoder candidate 側で HW init/open
-失敗時に SW decoder で開く path が残っていた = ドキュメントと実装の不整合。本実装は
-default candidate の `allow_sw_fallback` を `!hw_decode_requested` に変更し、HW 要求時は
-SW へ落とさず open エラー扱いにする。HW 非要求 (= 設定で HW disabled) のときだけ SW で
-開く (= 元から SW 要求の経路なので問題なし)。ユーザーポリシー (= シーク体感を損なう
-SW 切替の禁止) を実装で担保する。
+**SW fallback policy (HW 要求時)** (2026-05-16 修正):
+当初 `preferred_video_decoders` の default candidate は常に SW fallback を許していたため、
+`get_hw_format` を D3D11-only にしても HW init/open 失敗時に SW decoder で開く path が
+残っていた。2026-05-15 にこれを一律禁止したが、`msmpeg4v2` のように D3D11VA config を
+そもそも持たない codec まで再生不能になる過剰修正だった。現行実装は
+`open_video_decoder_with_candidates` で候補を先に解決し、D3D11VA config を持つ候補が
+1 つでもあれば SW fallback を禁止する。候補が 1 つも D3D11VA config を持たない場合は、
+HW 非対応 codec と判断して SW decoder で開く。HW 非要求 (= 設定で HW disabled) のときも
+最初から SW で開く。
 
 **pacing 設計**: 既存の Phase 8.K 仕様 (`PACE_LEAD_SECS=0.30` / `AUDIO_SAFE_LO=0.25` /
 `SEEK_BURST_LEAD_MAX_SECS=0.20` / `post_seek_frame_sent` flag / generation race
@@ -1091,8 +1099,8 @@ overlay の中央 status に「メタデータ読込中...」「ストリーム�
 
 `src/main.rs` で以下を実行する。`GpuVideoDevice` は decoder の HW デコード + native
 presenter への NT-shared blit に使うので、wgpu backend の種別とは独立に常に作成を
-試みる。失敗時は decoder が SW デコード + CPU upload に自動 fallback (どちらの
-経路でも native presenter が描画する)。
+試みる。失敗時は D3D11VA 共有 blit を使わず、SW decode または FFmpeg 側 HW decode からの
+CPU upload 経路で native presenter が描画する。
 
 ```rust
 let backend = rs.adapter.get_info().backend;
@@ -1356,11 +1364,12 @@ Phase 2 で `handle_native_video_output_event` (= 入力イベント反映)、Ph
 - 通常: `cargo build --release --bin mimageviewer-core`
 - ベンチ: `cargo run --release --bin bench_thumbs` (動画関係なし)
 - 実機検証: 4K HEVC ファイルを動画フォルダに置いてフルスクリーン再生、滑らかさ目視
-- リモデ検証: RDP 経由で起動して動画を開く。HW デコード (`D3D11VA`) が失敗するなら
-  decoder が SW デコード + CPU upload に自動 fallback して native presenter が描画
-  するので、1080p 程度なら再生できる。`mimageviewer.log` に `GPU video device: failed
-  (will fallback to CPU readback)` と出ているか、または `decoder` のログで HW 候補に
-  落ちているか確認する。
+- リモデ検証: RDP 経由で起動して動画を開く。表示 GPU 経路が使えない場合でも
+  CPU upload 経路で native presenter が描画することを確認する。D3D11VA 対応 codec の
+  HW decoder 初期化 / open 失敗は再生エラーとして扱い、D3D11VA 非対応 codec は
+  SW decoder で再生する。`mimageviewer.log` に `GPU video device: failed
+  (will fallback to CPU readback)` と出ているか、または `decoder` のログで
+  `decode_path=sw` / `decode_path=hw_d3d11va` が期待通りか確認する。
 - native presenter 起動失敗時の挙動: `GetMonitorInfoW` 失敗や thread 生成エラーが
   起きると `VideoPlayer.error` に日本語のエラー文言が入り、フルスクリーンに赤字で
   「動画を再生できません: ...」が表示される (= 旧 egui presenter フォールバックは無い)。
