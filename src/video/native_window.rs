@@ -161,10 +161,18 @@ struct WindowState {
     ime_preediting: bool,
 }
 
-impl NativeVideoWindow {
-    pub fn create(config: NativeVideoWindowConfig) -> Result<Self, String> {
-        unsafe {
-            let hmodule = GetModuleHandleW(None).map_err(|e| format!("GetModuleHandleW: {e:?}"))?;
+/// T31 (Codex P2 / 2026-05-16): クラス登録を 1 回に集約し、戻り値を見て
+/// `ERROR_CLASS_ALREADY_EXISTS` 以外のエラーは propagation する。旧コードは
+/// `RegisterClassW` を `create()` ごとに呼んで戻り値を捨てていたため、
+/// (a) 多重起動時の競合ログが拾えない (b) 真のエラーが見過ごされる、の 2 問題
+/// があった。`OnceLock<Result<(), String>>` でアトミック初期化する。
+fn register_native_video_window_class() -> Result<(), String> {
+    use std::sync::OnceLock;
+    static REGISTER_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    REGISTER_RESULT
+        .get_or_init(|| unsafe {
+            let hmodule = GetModuleHandleW(None)
+                .map_err(|e| format!("GetModuleHandleW for native video window class: {e:?}"))?;
             let hinstance = HINSTANCE(hmodule.0);
             let cursor = LoadCursorW(None, IDC_ARROW).ok();
             let wc = WNDCLASSW {
@@ -175,7 +183,25 @@ impl NativeVideoWindow {
                 lpszClassName: w!("mIVNativeVideoWindow"),
                 ..Default::default()
             };
-            RegisterClassW(&wc);
+            if RegisterClassW(&wc) == 0 {
+                let err = std::io::Error::last_os_error();
+                // ERROR_CLASS_ALREADY_EXISTS = 1410 は同一プロセス内で他経路から
+                // 同名クラスが先に登録された場合に出る。挙動上は OK。
+                if err.raw_os_error() != Some(1410) {
+                    return Err(format!("RegisterClassW NativeVideoWindow: {err:?}"));
+                }
+            }
+            Ok(())
+        })
+        .clone()
+}
+
+impl NativeVideoWindow {
+    pub fn create(config: NativeVideoWindowConfig) -> Result<Self, String> {
+        register_native_video_window_class()?;
+        unsafe {
+            let hmodule = GetModuleHandleW(None).map_err(|e| format!("GetModuleHandleW: {e:?}"))?;
+            let hinstance = HINSTANCE(hmodule.0);
 
             let (ex_style, style, x, y, width, height, raise_on_show) = match config.mode {
                 NativeVideoWindowMode::Windowed { width, height } => {

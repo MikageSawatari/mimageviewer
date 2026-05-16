@@ -360,45 +360,43 @@ struct WindowState {
 }
 
 fn register_window_class() -> Result<(), String> {
-    use std::sync::Once;
-    static REGISTER_ONCE: Once = Once::new();
-    static mut RESULT: Result<(), String> = Ok(());
-
-    REGISTER_ONCE.call_once(|| unsafe {
-        let hmodule = match GetModuleHandleW(None) {
-            Ok(h) => h,
-            Err(err) => {
-                RESULT = Err(format!("GetModuleHandleW for HUD class: {err:?}"));
-                return;
+    // T31 (Codex P2 / 2026-05-16): 旧 `Once + static mut RESULT` を `OnceLock` 化。
+    // `static mut` の `static_mut_refs` lint 抑制を解除し、結果クローンも `get_or_init`
+    // 経由で safe Rust になる。挙動 (1 回登録 + ERROR_CLASS_ALREADY_EXISTS 許容) は不変。
+    use std::sync::OnceLock;
+    static REGISTER_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    REGISTER_RESULT
+        .get_or_init(|| unsafe {
+            let hmodule = match GetModuleHandleW(None) {
+                Ok(h) => h,
+                Err(err) => {
+                    return Err(format!("GetModuleHandleW for HUD class: {err:?}"));
+                }
+            };
+            // 実機修正 (2026-05-12): カーソル消失バグ対策として `hCursor = IDC_ARROW`
+            // を明示設定 (Codex 助言 #3 反映)。`hCursor` が未設定だと、HUD region 内に
+            // cursor が入ったとき OS が「cursor 未指定」と判断して非表示にすることがある。
+            // WM_SETCURSOR のフォールバックと併用 (double-safety)。
+            let class_cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
+            let class = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
+                lpfnWndProc: Some(hud_wnd_proc),
+                hInstance: hmodule.into(),
+                lpszClassName: HUD_CLASS_NAME,
+                hCursor: class_cursor,
+                ..Default::default()
+            };
+            if RegisterClassExW(&class) == 0 {
+                let err = std::io::Error::last_os_error();
+                // ERROR_CLASS_ALREADY_EXISTS = 1410 は無視 (= 別 thread 由来等)。
+                if err.raw_os_error() != Some(1410) {
+                    return Err(format!("RegisterClassExW HUD: {err:?}"));
+                }
             }
-        };
-        // 実機修正 (2026-05-12): カーソル消失バグ対策として `hCursor = IDC_ARROW`
-        // を明示設定 (Codex 助言 #3 反映)。`hCursor` が未設定だと、HUD region 内に
-        // cursor が入ったとき OS が「cursor 未指定」と判断して非表示にすることがある。
-        // WM_SETCURSOR のフォールバックと併用 (double-safety)。
-        let class_cursor = LoadCursorW(None, IDC_ARROW).unwrap_or_default();
-        let class = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS,
-            lpfnWndProc: Some(hud_wnd_proc),
-            hInstance: hmodule.into(),
-            lpszClassName: HUD_CLASS_NAME,
-            hCursor: class_cursor,
-            ..Default::default()
-        };
-        if RegisterClassExW(&class) == 0 {
-            let err = std::io::Error::last_os_error();
-            // ERROR_CLASS_ALREADY_EXISTS = 1410 は無視 (= 別 thread 由来等)。
-            if err.raw_os_error() != Some(1410) {
-                RESULT = Err(format!("RegisterClassExW HUD: {err:?}"));
-            }
-        }
-    });
-
-    #[allow(static_mut_refs)]
-    unsafe {
-        RESULT.clone()
-    }
+            Ok(())
+        })
+        .clone()
 }
 
 /// `SetWindowRgn` の wrap。空 `regions` は `CreateRectRgn(0, 0, 0, 0)` 1 個の region を

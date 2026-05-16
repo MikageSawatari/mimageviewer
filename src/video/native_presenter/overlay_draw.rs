@@ -1094,6 +1094,32 @@ pub(super) fn draw_native_checkmark(ctx: &egui::Context, overlay_width_points: f
         });
 }
 
+/// `draw_native_center_status` で描画する box の論理 rect を返す共通 helper (T28)。
+///
+/// region 計算 (HUD HWND `SetWindowRgn` 用) と描画関数 (`draw_native_center_status`) の
+/// 両方が同じ式で box サイズを決める必要があり、これまでは 2 箇所重複していて
+/// 片方だけ変えると HUD region < 描画 box でテキスト端が clip されていた
+/// (Codex P2 / T28、2026-05-16)。
+pub(super) fn native_center_status_rect(
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    title: &str,
+    has_body: bool,
+) -> egui::Rect {
+    let available_w = (overlay_width_points - 48.0).max(120.0);
+    let box_w = if has_body {
+        overlay_width_points.clamp(360.0, 720.0).min(available_w)
+    } else {
+        let text_w = title.chars().count() as f32 * 18.0 + 72.0;
+        text_w.clamp(180.0, 420.0).min(available_w)
+    };
+    let box_h = if has_body { 132.0 } else { 62.0 };
+    egui::Rect::from_center_size(
+        egui::pos2(overlay_width_points * 0.5, overlay_height_points * 0.5),
+        egui::vec2(box_w, box_h),
+    )
+}
+
 pub(super) fn draw_native_center_status(
     ctx: &egui::Context,
     overlay_width_points: f32,
@@ -1112,15 +1138,12 @@ pub(super) fn draw_native_center_status(
             );
             ui.set_min_size(full_rect.size());
             let painter = ui.painter();
-            let available_w = (overlay_width_points - 48.0).max(120.0);
-            let box_w = if body.is_some() {
-                overlay_width_points.clamp(360.0, 720.0).min(available_w)
-            } else {
-                let text_w = title.chars().count() as f32 * 18.0 + 72.0;
-                text_w.clamp(180.0, 420.0).min(available_w)
-            };
-            let box_h = if body.is_some() { 132.0 } else { 62.0 };
-            let rect = egui::Rect::from_center_size(full_rect.center(), egui::vec2(box_w, box_h));
+            let rect = native_center_status_rect(
+                overlay_width_points,
+                overlay_height_points,
+                title,
+                body.is_some(),
+            );
             painter.rect_filled(
                 rect,
                 8.0,

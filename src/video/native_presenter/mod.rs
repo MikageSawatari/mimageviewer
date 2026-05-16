@@ -4240,6 +4240,7 @@ impl NativeEguiOverlay {
 
         // Center status (error / preparing / slow seek): `draw_native_center_status`
         // と同じ box サイズを region に含め、HUD HWND の SetWindowRgn でクリップされないようにする。
+        // T28: box サイズ計算は `native_center_status_rect` ヘルパーに集約 (重複式の防止)。
         if status_visible {
             let has_body = self.video_error.is_some();
             let title = if has_body {
@@ -4249,18 +4250,13 @@ impl NativeEguiOverlay {
             } else {
                 "シーク中...".to_owned()
             };
-            let available_w = (width_points - 48.0).max(120.0);
-            let box_w = if has_body {
-                width_points.clamp(360.0, 720.0).min(available_w)
-            } else {
-                let text_w = title.chars().count() as f32 * 18.0 + 72.0;
-                text_w.clamp(180.0, 420.0).min(available_w)
-            };
-            let box_h = if has_body { 132.0 } else { 62.0 };
-            regions.push(rect_to_px(egui::Rect::from_center_size(
-                egui::pos2(width_points * 0.5, height_points * 0.5),
-                egui::vec2(box_w, box_h),
-            )));
+            let status_rect = self::overlay_draw::native_center_status_rect(
+                width_points,
+                height_points,
+                &title,
+                has_body,
+            );
+            regions.push(rect_to_px(status_rect));
         }
 
         // Right panel 表示中: `native_metadata_panel_rect` の実 rect を使う
