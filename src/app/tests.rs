@@ -3183,3 +3183,84 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod file_operation_selection_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+
+    fn push_item(app: &mut App, item: GridItem) -> usize {
+        app.items.push(item);
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.items.len() - 1
+    }
+
+    #[test]
+    fn checked_file_operation_paths_include_real_files_and_skip_virtual_pages() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+
+        let folder = push_item(&mut app, GridItem::Folder(PathBuf::from(r"C:\books")));
+        let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
+        let video = push_item(&mut app, GridItem::Video(PathBuf::from(r"C:\books\a.mp4")));
+        let zip = push_item(
+            &mut app,
+            GridItem::ZipFile(PathBuf::from(r"C:\books\a.zip")),
+        );
+        let pdf = push_item(
+            &mut app,
+            GridItem::PdfFile(PathBuf::from(r"C:\books\a.pdf")),
+        );
+        let archive = push_item(
+            &mut app,
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from(r"C:\books\a.7z"),
+                format: ArchiveFormat::SevenZ,
+            },
+        );
+        let zip_page = push_item(
+            &mut app,
+            GridItem::ZipImage {
+                zip_path: PathBuf::from(r"C:\books\a.zip"),
+                entry_name: "p001.jpg".to_owned(),
+            },
+        );
+        let pdf_page = push_item(
+            &mut app,
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+                page_num: 0,
+                content_type: None,
+            },
+        );
+
+        for idx in [folder, image, video, zip, pdf, archive, zip_page, pdf_page] {
+            app.checked.insert(idx);
+        }
+
+        let mut paths = app.collect_checked_paths();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from(r"C:\books\a.7z"),
+                PathBuf::from(r"C:\books\a.jpg"),
+                PathBuf::from(r"C:\books\a.mp4"),
+                PathBuf::from(r"C:\books\a.pdf"),
+                PathBuf::from(r"C:\books\a.zip"),
+            ]
+        );
+
+        let targets = app.collect_checked_indexed_paths();
+        assert_eq!(
+            targets,
+            vec![
+                (archive, PathBuf::from(r"C:\books\a.7z")),
+                (pdf, PathBuf::from(r"C:\books\a.pdf")),
+                (zip, PathBuf::from(r"C:\books\a.zip")),
+                (video, PathBuf::from(r"C:\books\a.mp4")),
+                (image, PathBuf::from(r"C:\books\a.jpg")),
+            ],
+            "delete targets are sorted by descending index and exclude folders/virtual pages",
+        );
+    }
+}

@@ -7350,18 +7350,13 @@ impl App {
             .items
             .iter()
             .enumerate()
-            .filter_map(|(i, item)| match item {
-                crate::grid_item::GridItem::Image(p)
-                | crate::grid_item::GridItem::Video(p)
-                | crate::grid_item::GridItem::ZipFile(p)
-                | crate::grid_item::GridItem::PdfFile(p) => {
-                    if success_set.contains(p.as_path()) {
-                        Some(i)
-                    } else {
-                        None
-                    }
+            .filter_map(|(i, item)| {
+                let path = item.file_operation_path()?;
+                if success_set.contains(path) {
+                    Some(i)
+                } else {
+                    None
                 }
-                _ => None,
             })
             .collect();
         idxs.sort_unstable_by(|a, b| b.cmp(a));
@@ -9172,16 +9167,10 @@ impl App {
                         (new_pos, old_pos)
                     };
                     for vp in start..=end {
-                        if let Some(&idx) = vi.get(vp) {
-                            match self.items.get(idx) {
-                                Some(GridItem::Image(_))
-                                | Some(GridItem::Video(_))
-                                | Some(GridItem::ZipImage { .. })
-                                | Some(GridItem::PdfPage { .. }) => {
-                                    self.checked.insert(idx);
-                                }
-                                _ => {}
-                            }
+                        if let Some(&idx) = vi.get(vp)
+                            && self.items.get(idx).is_some_and(|it| it.is_checkable())
+                        {
+                            self.checked.insert(idx);
                         }
                     }
                 }
@@ -9198,17 +9187,8 @@ impl App {
                 if let Some(idx) = self.selected {
                     if self.checked.contains(&idx) {
                         self.checked.remove(&idx);
-                    } else {
-                        // フォルダ・セパレータはチェック対象外
-                        match self.items.get(idx) {
-                            Some(GridItem::Image(_))
-                            | Some(GridItem::Video(_))
-                            | Some(GridItem::ZipImage { .. })
-                            | Some(GridItem::PdfPage { .. }) => {
-                                self.checked.insert(idx);
-                            }
-                            _ => {}
-                        }
+                    } else if self.items.get(idx).is_some_and(|it| it.is_checkable()) {
+                        self.checked.insert(idx);
                     }
                 }
             }
@@ -10256,10 +10236,11 @@ impl App {
             let paths = if !self.checked.is_empty() {
                 self.collect_checked_paths()
             } else if let Some(idx) = self.selected {
-                match self.items.get(idx) {
-                    Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => vec![p.clone()],
-                    _ => vec![],
-                }
+                self.items
+                    .get(idx)
+                    .and_then(GridItem::file_operation_path)
+                    .map(|p| vec![p.to_path_buf()])
+                    .unwrap_or_default()
             } else {
                 vec![]
             };

@@ -192,26 +192,60 @@ impl crate::app::App {
                                 close = true;
                             }
                         }
-                        GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+                        GridItem::Folder(p) => {
                             if ui.button("パスをコピー").clicked() {
                                 ctx.copy_text(p.to_string_lossy().to_string());
                                 close = true;
                             }
-                            if matches!(item, GridItem::Folder(_)) {
-                                if ui.button("エクスプローラで開く").clicked() {
-                                    let _ = std::process::Command::new("explorer")
-                                        .arg(p.as_os_str())
-                                        .spawn();
-                                    close = true;
+                            if ui.button("エクスプローラで開く").clicked() {
+                                let _ = std::process::Command::new("explorer")
+                                    .arg(p.as_os_str())
+                                    .spawn();
+                                close = true;
+                            }
+                            ui.separator();
+                            if ui.button("ペースト (Ctrl+V)").clicked() {
+                                if let Some(ref folder) = self.current_folder {
+                                    let rx = paste_files_from_clipboard(folder);
+                                    self.paste_pending.push(rx);
                                 }
-                            } else {
-                                if ui.button("フォルダを開く").clicked() {
-                                    open_folder_in_explorer(p);
-                                    close = true;
-                                }
-                                // ── アプリケーションで開く (ZipFile/PdfFile) ──
-                                ui.separator();
-                                let _ = self.render_open_with_menu(ui, p, &mut close);
+                                close = true;
+                            }
+                        }
+                        GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
+                            if ui.button("パスをコピー").clicked() {
+                                ctx.copy_text(p.to_string_lossy().to_string());
+                                close = true;
+                            }
+                            if ui.button("ファイル名をコピー").clicked() {
+                                let name = p
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                ctx.copy_text(name);
+                                close = true;
+                            }
+                            if ui.button("コピー").clicked() {
+                                copy_files_to_clipboard(&[p.clone()]);
+                                close = true;
+                            }
+                            if ui.button("カット").clicked() {
+                                cut_files_to_clipboard(&[p.clone()]);
+                                close = true;
+                            }
+                            if ui.button("フォルダを開く").clicked() {
+                                open_folder_in_explorer(p);
+                                close = true;
+                            }
+                            // ── アプリケーションで開く (ZipFile/PdfFile) ──
+                            ui.separator();
+                            let _ = self.render_open_with_menu(ui, p, &mut close);
+                            ui.separator();
+                            if ui.button("削除 (ゴミ箱)").clicked() {
+                                self.delete_targets = vec![(idx, p.clone())];
+                                self.show_delete_confirm = true;
+                                close = true;
                             }
                             ui.separator();
                             if ui.button("ペースト (Ctrl+V)").clicked() {
@@ -269,8 +303,39 @@ impl crate::app::App {
                                 ctx.copy_text(path.to_string_lossy().to_string());
                                 close = true;
                             }
+                            if ui.button("ファイル名をコピー").clicked() {
+                                let name = path
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .unwrap_or("")
+                                    .to_string();
+                                ctx.copy_text(name);
+                                close = true;
+                            }
+                            if ui.button("コピー").clicked() {
+                                copy_files_to_clipboard(&[path.clone()]);
+                                close = true;
+                            }
+                            if ui.button("カット").clicked() {
+                                cut_files_to_clipboard(&[path.clone()]);
+                                close = true;
+                            }
                             if ui.button("フォルダを開く").clicked() {
                                 open_folder_in_explorer(path);
+                                close = true;
+                            }
+                            ui.separator();
+                            if ui.button("削除 (ゴミ箱)").clicked() {
+                                self.delete_targets = vec![(idx, path.clone())];
+                                self.show_delete_confirm = true;
+                                close = true;
+                            }
+                            ui.separator();
+                            if ui.button("ペースト (Ctrl+V)").clicked() {
+                                if let Some(ref folder) = self.current_folder {
+                                    let rx = paste_files_from_clipboard(folder);
+                                    self.paste_pending.push(rx);
+                                }
                                 close = true;
                             }
                         }
@@ -563,25 +628,19 @@ impl crate::app::App {
     pub(crate) fn collect_checked_paths(&self) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         for &idx in &self.checked {
-            match self.items.get(idx) {
-                Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => {
-                    paths.push(p.clone());
-                }
-                _ => {}
+            if let Some(path) = self.items.get(idx).and_then(GridItem::file_operation_path) {
+                paths.push(path.to_path_buf());
             }
         }
         paths
     }
 
     /// チェック済みアイテムの (idx, path) を収集する (降順ソート)。
-    fn collect_checked_indexed_paths(&self) -> Vec<(usize, PathBuf)> {
+    pub(crate) fn collect_checked_indexed_paths(&self) -> Vec<(usize, PathBuf)> {
         let mut targets: Vec<(usize, PathBuf)> = Vec::new();
         for &idx in &self.checked {
-            match self.items.get(idx) {
-                Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => {
-                    targets.push((idx, p.clone()));
-                }
-                _ => {}
+            if let Some(path) = self.items.get(idx).and_then(GridItem::file_operation_path) {
+                targets.push((idx, path.to_path_buf()));
             }
         }
         // 降順ソート (削除時にインデックスがずれないよう後ろから削除)
@@ -718,9 +777,13 @@ impl crate::app::App {
             self.show_delete_confirm = true;
         } else if let Some(idx) = self.selected {
             // 単一選択
-            let path = match self.items.get(idx) {
-                Some(GridItem::Image(p)) | Some(GridItem::Video(p)) => p.clone(),
-                _ => return,
+            let Some(path) = self
+                .items
+                .get(idx)
+                .and_then(GridItem::file_operation_path)
+                .map(|p| p.to_path_buf())
+            else {
+                return;
             };
             self.delete_targets = vec![(idx, path)];
             self.show_delete_confirm = true;

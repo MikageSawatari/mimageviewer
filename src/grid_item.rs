@@ -169,16 +169,30 @@ impl GridItem {
         }
     }
 
-    /// チェックボックスで選択できるアイテムか (画像・動画・ZIP 内画像・PDF ページ)。
-    /// フォルダ・ZIP/PDF ファイル・ZIP セパレータはナビゲーション用なので対象外。
+    /// ファイル整理系の操作 (コピー / カット / 削除) の対象になる実ファイルのパス。
+    ///
+    /// フォルダは OS / エクスプローラ側で扱う領分として、このアプリの複数選択
+    /// ファイル操作からは除外する。ZIP/PDF 本体や変換前アーカイブは仮想フォルダ
+    /// としても開けるが、ファイル整理では実ファイルとして扱う。
+    pub fn file_operation_path(&self) -> Option<&Path> {
+        match self {
+            Self::Image(p)
+            | Self::Video(p)
+            | Self::ZipFile(p)
+            | Self::PdfFile(p)
+            | Self::ConvertibleArchive { path: p, .. } => Some(p),
+            _ => None,
+        }
+    }
+
+    /// チェックボックスで選択できるアイテムか。
+    ///
+    /// 画像・動画・ZIP/PDF 内ページに加えて、フォルダ以外の実ファイル
+    /// (ZIP/PDF 本体、変換前アーカイブ) もファイル整理のために対象にする。
+    /// フォルダ・ZIP セパレータ・検索集約コンテナは対象外。
     pub fn is_checkable(&self) -> bool {
-        matches!(
-            self,
-            GridItem::Image(_)
-                | GridItem::Video(_)
-                | GridItem::ZipImage { .. }
-                | GridItem::PdfPage { .. }
-        )
+        self.file_operation_path().is_some()
+            || matches!(self, Self::ZipImage { .. } | Self::PdfPage { .. })
     }
 
     /// パフォーマンス計装用の相関キー文字列を返す。
@@ -334,5 +348,92 @@ mod tests {
         // ルートパスの場合、file_name() は None → ""
         let item = GridItem::Folder(PathBuf::from(r"C:\"));
         assert_eq!(item.name(), "");
+    }
+
+    #[test]
+    fn checkable_includes_real_files_except_folders() {
+        assert!(!GridItem::Folder(PathBuf::from(r"C:\books")).is_checkable());
+        assert!(GridItem::Image(PathBuf::from(r"C:\books\a.jpg")).is_checkable());
+        assert!(GridItem::Video(PathBuf::from(r"C:\books\a.mp4")).is_checkable());
+        assert!(GridItem::ZipFile(PathBuf::from(r"C:\books\a.zip")).is_checkable());
+        assert!(GridItem::PdfFile(PathBuf::from(r"C:\books\a.pdf")).is_checkable());
+        assert!(
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from(r"C:\books\a.7z"),
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            }
+            .is_checkable()
+        );
+        assert!(
+            GridItem::ZipImage {
+                zip_path: PathBuf::from(r"C:\books\a.zip"),
+                entry_name: "p001.jpg".to_owned(),
+            }
+            .is_checkable()
+        );
+        assert!(
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+                page_num: 0,
+                content_type: None,
+            }
+            .is_checkable()
+        );
+        assert!(
+            !GridItem::ZipSeparator {
+                dir_display: "chapter".to_owned(),
+            }
+            .is_checkable()
+        );
+        assert!(
+            !GridItem::SearchContainer {
+                path: PathBuf::from(r"C:\books"),
+                kind: SearchContainerKind::Folder,
+                hit_count: 3,
+                representative: None,
+            }
+            .is_checkable()
+        );
+    }
+
+    #[test]
+    fn file_operation_path_is_only_for_movable_files() {
+        assert!(
+            GridItem::Folder(PathBuf::from(r"C:\books"))
+                .file_operation_path()
+                .is_none()
+        );
+        assert!(
+            GridItem::ZipImage {
+                zip_path: PathBuf::from(r"C:\books\a.zip"),
+                entry_name: "p001.jpg".to_owned(),
+            }
+            .file_operation_path()
+            .is_none()
+        );
+        assert!(
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+                page_num: 0,
+                content_type: None,
+            }
+            .file_operation_path()
+            .is_none()
+        );
+
+        let zip = GridItem::ZipFile(PathBuf::from(r"C:\books\a.zip"));
+        assert_eq!(
+            zip.file_operation_path()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("a.zip")
+        );
+        let pdf = GridItem::PdfFile(PathBuf::from(r"C:\books\a.pdf"));
+        assert_eq!(
+            pdf.file_operation_path()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str()),
+            Some("a.pdf")
+        );
     }
 }
