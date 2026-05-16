@@ -29,6 +29,8 @@ pub mod catalog;
 pub mod data_dir;
 pub mod delete_worker;
 #[cfg(windows)]
+pub mod dwm_iconic_thumbnail;
+#[cfg(windows)]
 pub mod dwm_transitions;
 pub mod exif_reader;
 pub mod external_links;

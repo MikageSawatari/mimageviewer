@@ -188,6 +188,10 @@ ui_fullscreen.rs::render_fullscreen_viewport
 presenter 有効時は `VideoPlayer` が `NativeVideoOutput` を持ち、動画フレームと
 egui overlay は専用 HWND 側で表示される。フルスクリーン viewport は黒い backdrop と
 focus/chrome 管理だけを担当する。
+Windows のタスクバー hover preview は main HWND を対象にするため、動画 fullscreen 中は
+`dwm_iconic_thumbnail.rs` が DWM iconic thumbnail/live preview を main HWND に供給する。
+フレーム抽出は worker thread 上の `video::screenshot::capture_frame` で粗く更新し、
+DWM の WndProc 要求内では cached bitmap だけを返す。
 
 動画から動画へのフルスクリーンナビゲーションでは、Windows native presenter 経路で
 `NativeVideoOutput::SwitchSource` を使い、HWND / D3D11 presenter / overlay を保持したまま

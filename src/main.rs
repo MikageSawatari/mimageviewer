@@ -15,6 +15,8 @@ pub mod data_dir;
 mod dcomp_presenter_test;
 pub mod delete_worker;
 pub mod diagnostics;
+#[cfg(windows)]
+pub mod dwm_iconic_thumbnail;
 pub mod dwm_transitions;
 pub mod exif_reader;
 pub mod external_links;

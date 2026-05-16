@@ -12714,6 +12714,9 @@ impl App {
                 // foreground reclaim, while the presenter/backdrop still mask it.
                 self.sync_native_video_main_cloak(false);
             }
+            if native_video_was_active && let Some(hwnd_raw) = self.main_hwnd {
+                crate::dwm_iconic_thumbnail::sync_video_source(hwnd_raw as u64, None);
+            }
             // 動画フルスクリーンだったときだけ奪還候補。
             // mIV が foreground を持っていた瞬間にだけ true にする (ユーザーが他アプリを
             // 意図的に前面にしていたケースで奪い返さないため)。
@@ -16500,6 +16503,8 @@ impl eframe::App for App {
         let t_render_fullscreen_viewport = frame_t0.elapsed();
         #[cfg(windows)]
         self.ensure_native_video_front();
+        #[cfg(windows)]
+        self.sync_native_video_iconic_thumbnail();
         #[cfg(windows)]
         {
             // CP7: `DspBridge::hud_raise_hook` から流れてきた raise 要求を drain して

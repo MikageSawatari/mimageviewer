@@ -1345,6 +1345,19 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
   `IsWindowVisible` を変えないため App::update は継続し、DWM 合成結果からだけ main を
   外す。presenter HWND が valid になった時点、fullscreen exit、app exit では必ず
   uncloak し、foreground reclaim が cloaked main HWND を対象にしないようにする。
+- **タスクバー hover preview**: taskbar entry は main HWND 側に残る一方、動画フレームは
+  owned popup の native presenter HWND に描かれる。そのため Windows の標準 DWM capture では
+  main/fullscreen backdrop の黒だけが thumbnail 化されうる。`src/dwm_iconic_thumbnail.rs` が
+  動画 fullscreen 中だけ main HWND に `DWMWA_FORCE_ICONIC_REPRESENTATION` /
+  `DWMWA_HAS_ICONIC_BITMAP` を設定し、`WM_DWMSENDICONICTHUMBNAIL` /
+  `WM_DWMSENDICONICLIVEPREVIEWBITMAP` に cached bitmap で応答する。bitmap は
+  `video::screenshot::capture_frame` を worker thread で実行して最大 960px の
+  1-slot RGBA cache として保持する。初回は先読みし、その後は DWM から preview 要求が来て
+  cache の 1 秒 bucket が古いときだけ更新する。DWM が bitmap を保持して次要求を省略する
+  ケースに備え、直近で preview 要求を受けた後の短い grace 中は App update 側でも stale
+  bucket を検出して worker を起こす。WndProc 内では decode / seek をせず、cache から
+  要求サイズの HBITMAP を作るだけにする。live preview は 4K 環境での HBITMAP 作成コストを
+  抑えるため 1920x1080 以内に収める。
 
 ### フルスクリーン終了時の foreground 奪還
 

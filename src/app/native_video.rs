@@ -1174,6 +1174,36 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(super) fn sync_native_video_iconic_thumbnail(&mut self) {
+        let Some(hwnd_raw) = self.main_hwnd else {
+            return;
+        };
+        let source = self.fullscreen_idx.and_then(|fs_idx| {
+            if !matches!(self.items.get(fs_idx), Some(GridItem::Video(_))) {
+                return None;
+            }
+            if let Some(pending) = self.native_video_source_swap_pending.as_ref() {
+                if pending.target_idx == fs_idx && !pending.native_output.is_closed() {
+                    return Some(crate::dwm_iconic_thumbnail::VideoIconicSource {
+                        path: pending.target_path.clone(),
+                        target_secs: 0.0,
+                    });
+                }
+            }
+            match self.fs_cache.get(&fs_idx) {
+                Some(FsCacheEntry::Video { player, .. }) if player.error().is_none() => {
+                    Some(crate::dwm_iconic_thumbnail::VideoIconicSource {
+                        path: player.path().clone(),
+                        target_secs: player.screenshot_target_secs(),
+                    })
+                }
+                _ => None,
+            }
+        });
+        crate::dwm_iconic_thumbnail::sync_video_source(hwnd_raw as u64, source);
+    }
+
+    #[cfg(windows)]
     pub(super) fn sync_native_video_main_chrome(&mut self, active: bool) {
         if active {
             self.native_video_main_chrome_restore_at = None;
