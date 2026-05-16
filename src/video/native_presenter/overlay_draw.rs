@@ -12,6 +12,8 @@ use super::{
 };
 
 const NATIVE_PERF_GRAPH_SECS: f32 = 6.0;
+const NATIVE_PERF_AV_OFFSET_NORMAL_MS: f32 = 100.0;
+const NATIVE_PERF_AV_OFFSET_SEVERE_MS: f32 = 500.0;
 
 pub(super) fn draw_native_perf_overlay(
     ctx: &egui::Context,
@@ -120,14 +122,7 @@ pub(super) fn draw_native_perf_overlay(
                 // video pacing drift にフォールバックする。
                 latest.av_drift_ms
             };
-            let display_abs = display_value.abs();
-            let av_color = if display_abs < 5.0 {
-                egui::Color32::from_rgb(154, 236, 178) // 緑
-            } else if display_abs < 20.0 {
-                egui::Color32::from_rgb(255, 220, 120) // 黄
-            } else {
-                egui::Color32::from_rgb(255, 112, 112) // 赤
-            };
+            let av_color = native_perf_av_value_color(display_value);
             let av_label = if av_offset_finite { "A/V" } else { "vid" };
             // value は padding なし。slot 右端で右寄せ → 文字数変化で左端だけ動く (= label と干渉せず)。
             let av_value_text = format!("{:+.1}ms", display_value);
@@ -2603,6 +2598,17 @@ pub(super) fn native_perf_visible_fps(history: &[NativeOverlayPerfSample]) -> Op
     Some((interval_count as f32 * 1000.0) / interval_sum_ms)
 }
 
+pub(super) fn native_perf_av_value_color(value_ms: f32) -> egui::Color32 {
+    let abs = value_ms.abs();
+    if !abs.is_finite() || abs < NATIVE_PERF_AV_OFFSET_NORMAL_MS {
+        egui::Color32::from_rgb(168, 176, 188)
+    } else if abs < NATIVE_PERF_AV_OFFSET_SEVERE_MS {
+        egui::Color32::from_rgb(255, 152, 60)
+    } else {
+        egui::Color32::from_rgb(255, 112, 112)
+    }
+}
+
 pub(super) fn native_perf_sample_has_late_drop(sample: &NativeOverlayPerfSample) -> bool {
     sample.late_drop_delta > 0
 }
@@ -3344,6 +3350,25 @@ mod tests {
 
         let fps = native_perf_visible_fps(&[old, after_gap, current]).unwrap();
         assert!((fps - 62.5).abs() < 0.01, "fps={fps}");
+    }
+
+    #[test]
+    fn perf_av_value_color_keeps_normal_jitter_gray() {
+        let gray = egui::Color32::from_rgb(168, 176, 188);
+        assert_eq!(native_perf_av_value_color(0.0), gray);
+        assert_eq!(native_perf_av_value_color(19.9), gray);
+        assert_eq!(native_perf_av_value_color(-99.9), gray);
+        assert_eq!(native_perf_av_value_color(f32::NAN), gray);
+    }
+
+    #[test]
+    fn perf_av_value_color_warns_only_outside_normal_range() {
+        let warning = egui::Color32::from_rgb(255, 152, 60);
+        let severe = egui::Color32::from_rgb(255, 112, 112);
+        assert_eq!(native_perf_av_value_color(100.0), warning);
+        assert_eq!(native_perf_av_value_color(-499.9), warning);
+        assert_eq!(native_perf_av_value_color(500.0), severe);
+        assert_eq!(native_perf_av_value_color(-5000.0), severe);
     }
 
     #[test]

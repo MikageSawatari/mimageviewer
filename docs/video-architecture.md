@@ -1699,8 +1699,9 @@ audio_pts_jump` の連鎖と、累積的に成長する負値 `A/V offset` と�
 フルスクリーン再生中に P キーで開く既存の perf overlay (`src/video/native_presenter/
 overlay_draw.rs::draw_native_perf_overlay`) には:
 
-- ヘッダ 2 行目右端: `A/V {offset_ms}` (固定幅 monospace、桁ぶれなし。色: |offset|<5
-  緑 / <20 黄 / >=20 赤)。audio inactive または seek 直後など offset 未確定時は
+- ヘッダ 2 行目右端: `A/V {offset_ms}` (固定幅 monospace、桁ぶれなし。色: |offset|<100ms
+  灰 / <500ms 橙 / >=500ms 赤)。通常再生中の数十 ms 級の揺れは灰色のままにする。
+  audio inactive または seek 直後など offset 未確定時は
   `vid {drift_ms}` (= 旧 av_drift にフォールバック)
 - ヘッダ 2 行目: `lead {audio_lead_ms}` (audio が master clock から先行している量、
   通常グレー、|lead|>=50ms で橙)。audio inactive 時は表示しない
@@ -1739,7 +1740,7 @@ overlay_draw.rs::draw_native_perf_overlay`) には:
 1. `cargo build --release` → `target/release/mimageviewer.exe --perf-log` で起動
 2. 動画フォルダで動画をフルスクリーン再生 → P キーで perf overlay
 3. **シナリオ A (連続再生 5 分)**: A/V シアン線が 0ms 中心で安定、underrun 帯なし、
-   ヘッダ "A/V" が緑のままなら正常
+   ヘッダ "A/V" が灰色のままなら正常
 4. **シナリオ B (Norm 操作 5 回 ON/OFF)** — 修正後の期待動作:
    - A/V offset がほぼ動かない (= ±数十 ms に収まる、±5000ms 級にならない)
    - audio lead もほぼ動かない (= 0 近辺、+5000ms 級にならない)
