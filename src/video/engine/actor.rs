@@ -211,6 +211,13 @@ impl EngineActor {
     /// `Playing` への遷移。anchor を **先に** 書いてから state を Release で publish。
     /// monotonic guard は anchor の PTS / 現 epoch でリセット (= Playing 入場直後の
     /// AudioRendered がこの anchor 周辺の小さい pts でも受け入れられるように)。
+    ///
+    /// **AvClock 同期** (2026-05 root fix): 内部 MasterClock 更新と同時に
+    /// `AvClock::engine_start_playing` を呼んで「playing=true + 同 anchor」を published
+    /// する。これで presenter / decoder が読む `AvClock::now_secs()` も同じ瞬間に
+    /// 進み始める (= 旧実装は `VideoPlayer::open` 直後に `clock.set_playing(autoplay)` で
+    /// AvClock だけ先行起動していたため、Playing 遷移前の ~300ms 間に extrapolation が
+    /// 暴走 → late_drop + decoder dropped_full の冒頭ヒッチを誘発していた)。
     fn transition_to_playing(&mut self, anchor: ClockAnchor) {
         let anchor = anchor.with_speed(self.playback_speed);
         debug_assert!(
@@ -223,6 +230,7 @@ impl EngineActor {
         self.state = EngineState::Playing;
         self.published_state
             .store(state_code::PLAYING, Ordering::Release);
+        self.av_clock.engine_start_playing(anchor);
     }
 
     /// `Paused` への遷移 (= 凍結 anchor)。
@@ -232,6 +240,7 @@ impl EngineActor {
         self.state = EngineState::Paused;
         self.published_state
             .store(state_code::PAUSED, Ordering::Release);
+        self.av_clock.engine_freeze_at(pts);
     }
 
     /// `Buffering` への遷移。**epoch は進めない** (= 既に handle_seek_request で進めた値、
@@ -256,6 +265,7 @@ impl EngineActor {
         self.state = EngineState::Buffering;
         self.published_state
             .store(state_code::BUFFERING, Ordering::Release);
+        self.av_clock.engine_freeze_at(pts);
     }
 
     /// `Seeking` への遷移。target で凍結。**epoch は handle_seek_request で進める**。
@@ -265,6 +275,7 @@ impl EngineActor {
         self.state = EngineState::Seeking { target_secs };
         self.published_state
             .store(state_code::SEEKING, Ordering::Release);
+        self.av_clock.engine_freeze_at(target_secs);
     }
 
     /// `Loading` への遷移 (= 0 で凍結 or resume 値で凍結)。
@@ -274,6 +285,7 @@ impl EngineActor {
         self.state = EngineState::Loading;
         self.published_state
             .store(state_code::LOADING, Ordering::Release);
+        self.av_clock.engine_freeze_at(pts);
     }
 
     /// `Eof` への遷移 (= duration で凍結)。
@@ -283,6 +295,7 @@ impl EngineActor {
         self.state = EngineState::Eof;
         self.published_state
             .store(state_code::EOF, Ordering::Release);
+        self.av_clock.engine_freeze_at(duration);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -1904,5 +1917,165 @@ mod tests {
             "published target should match handle_seek_request arg"
         );
         assert_eq!(a.state, EngineState::Seeking { target_secs: 20.0 });
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // AvClock 同期 (2026-05 root fix): EngineActor の transition_to_* で AvClock の
+    // playing フラグと anchor が一致して進行することを構造的に保証する。
+    // ──────────────────────────────────────────────────────────────
+
+    /// テスト helper: EngineActor を構築して `av_clock` の `Arc` を返す
+    /// (= テストから直接観察できるように)。
+    fn fresh_actor_with_av_clock(opts: OpenOptions) -> (EngineActor, Arc<AvClock>) {
+        let seek_serial = Arc::new(AtomicU64::new(0));
+        let initial_volume = opts.initial_volume;
+        let av_clock = Arc::new(AvClock::new(initial_volume, seek_serial.clone()));
+        let actor = EngineActor::new(opts, seek_serial, Arc::clone(&av_clock));
+        (actor, av_clock)
+    }
+
+    #[test]
+    fn fresh_engine_leaves_av_clock_frozen_and_not_playing() {
+        // 旧コードは `VideoPlayer::open` 直後に `clock.set_playing(autoplay)` を呼んで
+        // AvClock の wall extrapolation を開始していたが、現在はそれを撤去している。
+        // EngineActor が `begin_loading` / `transition_to_*` でしか AvClock を触らないので、
+        // 構築直後は Frozen + playing=false が維持される。
+        let (_, av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
+        assert!(!av_clock.is_playing());
+        assert!((av_clock.now_secs() - 0.0).abs() < 1e-9);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            (av_clock.now_secs() - 0.0).abs() < 1e-9,
+            "av_clock must not extrapolate while EngineActor hasn't transitioned to Playing"
+        );
+    }
+
+    #[test]
+    fn begin_loading_freezes_av_clock_at_resume_pts() {
+        // resume 値がある場合、begin_loading → transition_to_loading(resume)
+        // で AvClock も resume pts で frozen になる。
+        let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions {
+            resume_secs: Some(42.5),
+            ..Default::default()
+        });
+        actor.begin_loading();
+        assert!(!av_clock.is_playing());
+        assert!((av_clock.now_secs() - 42.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn transition_to_playing_starts_av_clock_extrapolation() {
+        // EngineActor::transition_to_playing → av_clock.engine_start_playing で
+        // AvClock も playing=true + Audio source anchor になる。
+        let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
+        let anchor = ClockAnchor::audio(10.0, Instant::now());
+        actor.transition_to_playing(anchor);
+        assert!(av_clock.is_playing());
+        // 直後はほぼ anchor pts (= 10.0)。
+        let now = av_clock.now_secs();
+        assert!(
+            (now - 10.0).abs() < 0.05,
+            "AvClock should be near anchor pts right after transition, got {now}"
+        );
+        // 少し待ったら extrapolation で進む。
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let later = av_clock.now_secs();
+        assert!(
+            later > 10.02,
+            "AvClock should extrapolate past 10.02 after 30ms, got {later}"
+        );
+    }
+
+    #[test]
+    fn transition_to_paused_freezes_av_clock() {
+        let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
+        // まず Playing にして extrapolation 開始。
+        actor.transition_to_playing(ClockAnchor::audio(5.0, Instant::now()));
+        assert!(av_clock.is_playing());
+        // Pause すると AvClock も freeze + playing=false。
+        actor.transition_to_paused(7.0);
+        assert!(!av_clock.is_playing());
+        assert!((av_clock.now_secs() - 7.0).abs() < 1e-9);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!(
+            (av_clock.now_secs() - 7.0).abs() < 1e-9,
+            "AvClock must stay frozen at paused pts"
+        );
+    }
+
+    #[test]
+    fn transition_to_buffering_freezes_av_clock_at_specified_pts() {
+        let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
+        actor.transition_to_playing(ClockAnchor::audio(3.0, Instant::now()));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Buffering に入ると AvClock も指定 pts で frozen + playing=false
+        actor.transition_to_buffering(15.0);
+        assert!(!av_clock.is_playing());
+        assert!((av_clock.now_secs() - 15.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn transition_to_seeking_freezes_av_clock_at_target() {
+        let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
+        actor.transition_to_playing(ClockAnchor::audio(1.0, Instant::now()));
+        actor.handle_seek_request(50.0);
+        // Seeking 状態で AvClock は target で frozen、playing=false。
+        assert_eq!(actor.state, EngineState::Seeking { target_secs: 50.0 });
+        assert!(!av_clock.is_playing());
+        assert!((av_clock.now_secs() - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn transition_to_eof_freezes_av_clock_at_duration() {
+        let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
+        actor.transition_to_playing(ClockAnchor::wall(0.0, Instant::now()));
+        actor.transition_to_eof(120.5);
+        assert!(!av_clock.is_playing());
+        assert!((av_clock.now_secs() - 120.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn open_to_buffering_then_playing_drives_av_clock_through_lifecycle() {
+        // 通常 open シナリオ (= 動画再生開始直後ヒッチの根本修正): begin_loading の
+        // 間 AvClock は Frozen のままで進まない。FirstFrameReady + BufferReady が
+        // 揃った瞬間に Playing 入場、ここで初めて extrapolation 開始。
+        let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
+        actor.begin_loading();
+        // Loading 中: AvClock は frozen at 0
+        assert!(!av_clock.is_playing());
+        assert!((av_clock.now_secs() - 0.0).abs() < 1e-9);
+
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 30.0,
+            has_audio: true,
+        });
+        // Buffering: 依然 AvClock は frozen at 0
+        assert!(!av_clock.is_playing());
+        assert!((av_clock.now_secs() - 0.0).abs() < 1e-9);
+
+        // 模擬的に「presenter からの FirstFrameReady 着信前 wall 経過」を入れる
+        // (= 旧コードはこの間 AvClock が暴走していた)。
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(
+            (av_clock.now_secs() - 0.0).abs() < 1e-9,
+            "AvClock must not advance during Buffering wait"
+        );
+
+        // FirstFrameReady → buffer_ready 揃って Playing 入場。
+        actor.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+        actor.handle_audio_event(AudioEvent::BufferReady {
+            epoch: 0,
+            pts: 0.05,
+            wall_now: Instant::now(),
+        });
+        assert_eq!(actor.state, EngineState::Playing);
+        assert!(av_clock.is_playing());
+        // anchor pts は audio_anchor の 0.05。直後ほぼそのまま。
+        let now = av_clock.now_secs();
+        assert!(
+            (now - 0.05).abs() < 0.05,
+            "AvClock should be near anchor pts (0.05) right after Playing, got {now}"
+        );
     }
 }

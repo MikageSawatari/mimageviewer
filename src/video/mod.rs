@@ -3070,7 +3070,20 @@ impl VideoPlayer {
             }
         };
 
-        clock.set_playing(autoplay);
+        // 2026-05 root fix: AvClock の playing フラグはここでは触らない。
+        // 旧コードは `clock.set_playing(autoplay)` で AvClock の wall extrapolation を
+        // 即起動していたが、`EngineActor` 側が `Loading/Buffering = Frozen` の状態機械を
+        // 持っている設計と二重管理になっており、presenter / decoder の参照する
+        // `AvClock::now_secs()` だけが先行して進み、Playing 遷移までの ~300ms に
+        // - presenter 側: 冒頭 frame に対する不当な late_drop
+        // - decoder 側: queue full → 冒頭 14 frame の `dropped_full` 連発
+        // を引き起こしていた (= 「動画再生開始直後の一瞬カクつき」)。
+        //
+        // 現在: AvClock は Frozen(0)/playing=false のまま据え置き、`EngineActor::begin_loading`
+        // → 各 `transition_to_*` が `engine_freeze_at` / `engine_start_playing` で AvClock を
+        // 同期する。autoplay 意図は `EngineActor::opts.autoplay` が単独で保持し、
+        // `try_transition_from_buffering` の最後で Playing / Paused を選ぶ。
+        let _ = autoplay; // intent は EngineActor 経由で配線済 (= OpenOptions.autoplay)
 
         // シーク先サムネ抽出ワーカー (失敗してもメイン再生は続行)
         let thumb_worker = Some(ThumbnailWorker::spawn(path.clone()));

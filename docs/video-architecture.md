@@ -899,6 +899,41 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
     自動判別。詳細は [docs/video-engine-redesign.md] の「counter consolidation」節。
   - **再生制御の互換複製** (`playing` / `audio_active` / `eof_reached` / `seek_request` / `seek_target_override`): `EngineActor` の `published_state` (`Arc<AtomicU8>`) と並列管理されている **複製**。新規コードはこれらを AvClock からは読まず、EngineActor 経由で取得すること (source of truth は EngineActor)。
   - **AvClock 単独で保持しているレガシー所有状態** (`volume` / `muted`): TransportCommand::SetVolume / SetMuted は EngineActor 側では no-op で、現状 `audio.rs` が `clock.output_volume()` / `clock.pre_limiter_gain()` を直接読んでいる。これらは将来的に `EngineActor` (もしくは独立の `VolumeController`) に移すべきだが、Phase 4 時点では AvClock が source of truth のまま。
+
+- **不変条件: `AvClock::playing` フラグは EngineActor 経由でしか書かない** (2026-05 root fix):
+  - `EngineActor::transition_to_playing` → `AvClock::engine_start_playing(anchor)` で
+    `playing=true` + 指定 anchor を atomic に設定
+  - `transition_to_paused` / `transition_to_buffering` / `transition_to_seeking` /
+    `transition_to_loading` / `transition_to_eof` → `AvClock::engine_freeze_at(pts)` で
+    `playing=false` + Frozen anchor at pts を atomic に設定
+  - 旧コードは `VideoPlayer::open` 直後に `clock.set_playing(autoplay)` を呼んで
+    AvClock の wall extrapolation を即時起動していたが、`EngineActor` 側で
+    `Loading/Buffering = Frozen` を保証する設計と二重管理になっており、Playing 遷移までの
+    ~300ms 間に AvClock だけ extrapolation が進み、presenter / decoder が読む
+    `now_secs()` が現実の audible 位置より大幅に先行していた。この結果:
+    - presenter 側: 起動直後の queue 内 frame が「∼290ms 遅刻」と誤判定されて
+      late_drop (= 動画再生開始直後の冒頭フリーズ)
+    - decoder 側: queue 満杯 + `dropped_full` 連発で続く 0.5 秒分のフレームが消失
+  - 現在は `VideoPlayer::open` 直後に AvClock を一切触らず、`EngineActor::begin_loading`
+    → 各 `transition_to_*` が `engine_freeze_at` / `engine_start_playing` を呼ぶ単一経路に
+    統一されている。`VideoPlayer::set_playing` / `toggle_play` などのレガシー呼び出し点は
+    `dispatch_play_pause` 経由で `engine.apply_command(Play/Pause)` を発行し、結局
+    EngineActor の transition を経由して AvClock を更新する形になる。直接の
+    `clock.set_playing(...)` 呼び出しは互換のため残っているが、新規コードからは追加しない。
+
+- **不変条件: 非 PLAYING 中の decoder は `video_tx` 満杯時に drop せず block する**
+  (2026-05 root fix の補完):
+  - `decoder.rs::run_video_decode` の GPU/CPU 両経路の `video_tx.try_send` が `Full` を
+    返したとき、`engine_state == PLAYING` なら従来通り drop (= 意図的 backpressure)、
+    それ以外 (= Loading/Buffering/Seeking) では cancel / seek-aware で 5ms スリープ
+    して retry する。
+  - 旧挙動: 即 drop。起動直後の `presenter 起動待ち` 期間に decoder が高速生産すると
+    queue (cap=8) を瞬時に溢れさせ、続く ~14 frame が `dropped_full` で消えていた。
+    presenter が起動した時点で queue 内に飛び石状にしか frame が残らず、視認できる
+    「冒頭スロー再生 → ジャンプ」になる。
+  - 現在は presenter が 1 frame 取り出すたびに decoder が 1 frame push する直列化が
+    成立し、起動直後でもフレーム列が連続性を保つ。Playing 中の drop 経路はそのまま
+    残してあるので、定常時の遅刻追従挙動は不変。
 - `playback_speed` は AvClock と EngineActor の anchor speed に伝搬し、`now_secs()` は
   source timeline を `speed` 倍で進める。速度変更時は現在 PTS で anchor を張り直し、
   `audio_tx_accounting_epoch` を進めて旧速度で enqueue 済みの tx 会計を無効化する。

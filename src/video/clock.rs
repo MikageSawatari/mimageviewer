@@ -456,6 +456,46 @@ impl AvClock {
         );
     }
 
+    /// **EngineActor 専用**: `Buffering` / `Seeking` / `Loading` / `Paused` / `Eof` の
+    /// いずれかに遷移したときに呼ぶ。anchor を指定 pts で Frozen にし、`playing` フラグを
+    /// false に下げる。`now_secs()` は pts をそのまま返すようになり、wall extrapolation が
+    /// 止まる (= presenter / decoder が「未起動状態の clock を進行中と誤認」しなくなる)。
+    ///
+    /// 既存 `set_playing(false)` との違い:
+    /// - `set_playing(false)`: 現 `now_secs()` (= extrapolation 結果) で freeze する。
+    ///   `EngineActor` の transition が指定する **正確な pts** を維持できない。
+    /// - `engine_freeze_at(pts)`: 指定 pts で freeze する。`EngineActor` の MasterClock
+    ///   と AvClock が完全に一致する。
+    pub fn engine_freeze_at(&self, pts_secs: f64) {
+        let pts = pts_secs.max(0.0);
+        self.master_clock
+            .set_anchor(ClockAnchor::frozen_at(pts).with_speed(self.playback_speed()));
+        // anchor を先に Frozen に書いてから playing=false (= now_secs が anchor.pts_secs
+        // を返す状態) に降ろす。順序を逆にすると、playing=false → anchor 書き換え前の
+        // ごく短い間に extrapolation 結果がリークする可能性がある。
+        self.playing.store(false, Ordering::Release);
+    }
+
+    /// **EngineActor 専用**: `Playing` 遷移時に呼ぶ。anchor を指定値 (Audio/Wall source)
+    /// に置き換え、`playing` フラグを true に上げる。`now_secs()` が anchor source に
+    /// 応じた extrapolation を返すようになる。
+    ///
+    /// 呼び出し元の責務:
+    /// - anchor.source は `ClockSource::Audio` または `ClockSource::Wall` (Frozen 不可)。
+    ///   debug_assert! で検査する。
+    /// - anchor.wall_at_anchor は「Playing 入場の今」(= Instant::now())。BufferReady
+    ///   時点の古い wall を使わない (= Codex P2-1、actor.rs::try_transition_from_buffering
+    ///   のコメント参照)。
+    pub fn engine_start_playing(&self, anchor: ClockAnchor) {
+        debug_assert!(
+            !matches!(anchor.source, ClockSource::Frozen),
+            "engine_start_playing requires non-Frozen anchor"
+        );
+        let anchor = anchor.with_speed(self.playback_speed());
+        self.master_clock.set_anchor(anchor);
+        self.playing.store(true, Ordering::Release);
+    }
+
     /// 真の音声フレームが pump に到達した時に呼ぶ。これで `audio_active = true`
     /// になり、`now_secs()` が audio master モードに切り替わる。
     pub fn notify_audio_active(&self) {
@@ -1004,5 +1044,69 @@ mod tests {
         assert_eq!(clock.normalize_gain(), 1.0);
         clock.set_normalize_gain(0.0);
         assert_eq!(clock.normalize_gain(), 1.0);
+    }
+
+    #[test]
+    fn engine_freeze_at_sets_playing_false_and_freezes_anchor() {
+        let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+        // 初期値は playing=false なので一旦明示的に立てる (= 後で false に戻ることを確認)。
+        clock.engine_start_playing(ClockAnchor::audio(2.0, Instant::now()));
+        assert!(clock.is_playing());
+        // engine_freeze_at で指定 pts に凍結。
+        clock.engine_freeze_at(5.0);
+        assert!(!clock.is_playing());
+        assert!((clock.now_secs() - 5.0).abs() < 1.0e-9);
+        // wall が経過しても extrapolation しない (= 旧 set_playing(false) 互換動作の確認)。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!((clock.now_secs() - 5.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn engine_freeze_at_clamps_negative_pts() {
+        let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+        clock.engine_freeze_at(-3.0);
+        assert!((clock.now_secs() - 0.0).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn engine_start_playing_sets_playing_true_and_extrapolates() {
+        let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+        assert!(!clock.is_playing());
+        let t0 = Instant::now();
+        clock.engine_start_playing(ClockAnchor::audio(10.0, t0));
+        assert!(clock.is_playing());
+        // 直後はほぼ anchor pts (= 10.0)。
+        let now = clock.now_secs();
+        assert!(
+            (now - 10.0).abs() < 0.05,
+            "expected ~10.0 just after start, got {now}"
+        );
+        // 少し待ったら extrapolation で進む (= Frozen ではなく Audio source)。
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let later = clock.now_secs();
+        assert!(
+            later > 10.02,
+            "expected extrapolation past 10.02, got {later}"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "engine_start_playing requires non-Frozen anchor")]
+    fn engine_start_playing_panics_on_frozen_anchor() {
+        let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+        clock.engine_start_playing(ClockAnchor::frozen_at(5.0));
+    }
+
+    #[test]
+    fn fresh_clock_is_frozen_and_not_playing() {
+        // 構築直後は AvClock::new で playing=false / anchor=Frozen(0)。
+        // VideoPlayer::open が clock.set_playing(autoplay) を呼ばなくなった後でも、
+        // engine が transition_to_playing するまでは now_secs が 0 で固定される
+        // という不変条件を構造的に保証する。
+        let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+        assert!(!clock.is_playing());
+        assert!((clock.now_secs() - 0.0).abs() < 1.0e-9);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert!((clock.now_secs() - 0.0).abs() < 1.0e-9);
     }
 }

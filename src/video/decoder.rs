@@ -3812,22 +3812,57 @@ fn run_video_decode(
                             let pts_gap = pts_secs - last_enqueued_pts;
                             let mut dropped_full = false;
                             let mut send_disconnected = false;
-                            match video_tx.try_send(gpu_frame_out) {
-                                Ok(()) => {
-                                    last_enqueued_pts = pts_secs;
-                                    post_seek_frame_sent = true;
-                                    first_frame_delivered = true;
-                                }
-                                Err(TrySendError::Full(mut frame_out)) => {
-                                    dropped_full = true;
-                                    if let VideoFrameData::Gpu(gpu) = &mut frame_out.data {
-                                        gpu.reset_unpresented_shared_output();
+                            // 2026-05 root fix: 非 PLAYING (= Loading/Buffering/Seeking) で
+                            // queue 満杯時は drop せず、cancel / seek-aware で短く wait する。
+                            // 旧挙動: 即 drop → 起動直後に冒頭 14 frame が dropped_full、
+                            // 1 枚目→2 枚目の present 間隔が 770ms 超に拡大していた。
+                            // Playing 中の drop は意図的な backpressure として温存する
+                            // (= 遅れ気味の presenter に追従するため最新を保持する)。
+                            let mut frame_holder: Option<VideoFrame> = Some(gpu_frame_out);
+                            while let Some(item) = frame_holder.take() {
+                                match video_tx.try_send(item) {
+                                    Ok(()) => {
+                                        last_enqueued_pts = pts_secs;
+                                        post_seek_frame_sent = true;
+                                        first_frame_delivered = true;
+                                        break;
                                     }
-                                    skipped_frame_count
-                                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                }
-                                Err(TrySendError::Disconnected(_)) => {
-                                    send_disconnected = true;
+                                    Err(TrySendError::Full(mut returned)) => {
+                                        let engine_st_inner = engine_state.load(Ordering::Acquire);
+                                        let is_playing = engine_st_inner
+                                            == crate::video::engine::actor::state_code::PLAYING;
+                                        if is_playing {
+                                            dropped_full = true;
+                                            if let VideoFrameData::Gpu(gpu) = &mut returned.data {
+                                                gpu.reset_unpresented_shared_output();
+                                            }
+                                            skipped_frame_count
+                                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            break;
+                                        }
+                                        if cancel.load(Ordering::Acquire) {
+                                            send_disconnected = true;
+                                            // shared output handle のリーク防止 (presenter に
+                                            // 渡らないまま discard する)。
+                                            if let VideoFrameData::Gpu(gpu) = &mut returned.data {
+                                                gpu.reset_unpresented_shared_output();
+                                            }
+                                            break;
+                                        }
+                                        if clock.current_seek_serial() != current_seek_serial {
+                                            new_seek_pending = true;
+                                            if let VideoFrameData::Gpu(gpu) = &mut returned.data {
+                                                gpu.reset_unpresented_shared_output();
+                                            }
+                                            break;
+                                        }
+                                        frame_holder = Some(returned);
+                                        std::thread::sleep(std::time::Duration::from_millis(5));
+                                    }
+                                    Err(TrySendError::Disconnected(_)) => {
+                                        send_disconnected = true;
+                                        break;
+                                    }
                                 }
                             }
                             if crate::perf::is_enabled() {
@@ -3881,6 +3916,12 @@ fn run_video_decode(
                             }
                             if send_disconnected {
                                 break 'outer;
+                            }
+                            // 2026-05 root fix 関連: 送出 retry 中に新世代 seek を観測した
+                            // 場合は次の outer iteration で再 dispatch する (= 既存の
+                            // pacing-loop new_seek_pending check と等価扱い)。
+                            if new_seek_pending {
+                                continue 'outer;
                             }
                             continue;
                         }
@@ -4386,26 +4427,55 @@ fn run_video_decode(
 
             let pts_gap = pts_secs - last_enqueued_pts;
             use crossbeam_channel::TrySendError;
-            let send_result = video_tx.try_send(frame_out);
-            let dropped_full = matches!(&send_result, Err(TrySendError::Full(_)));
-            if !dropped_full && send_result.is_ok() {
-                last_enqueued_pts = pts_secs;
-                post_seek_frame_sent = true;
-                first_frame_delivered = true;
-            }
-            if dropped_full {
-                skipped_frame_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                if frame_step_selected_this_frame {
-                    abort_frame_step_output(
-                        &clock,
-                        current_seek_serial,
-                        pts_secs,
-                        "video_tx_full_cpu",
-                    );
-                    frame_step_abort_discard_serial = Some(current_seek_serial);
-                    frame_step_selected_pending_clear = false;
-                    post_seek_frame_sent = true;
+            // 2026-05 root fix: GPU 経路と同じ理屈で、非 PLAYING (= Loading/Buffering/
+            // Seeking) では queue 満杯時に drop せず cancel / seek-aware で短く wait。
+            // Playing 中の drop は意図的な backpressure として温存する。
+            let mut dropped_full = false;
+            let mut send_disconnected = false;
+            let mut frame_holder: Option<VideoFrame> = Some(frame_out);
+            while let Some(item) = frame_holder.take() {
+                match video_tx.try_send(item) {
+                    Ok(()) => {
+                        last_enqueued_pts = pts_secs;
+                        post_seek_frame_sent = true;
+                        first_frame_delivered = true;
+                        break;
+                    }
+                    Err(TrySendError::Full(returned)) => {
+                        let engine_st_inner = engine_state.load(Ordering::Acquire);
+                        let is_playing =
+                            engine_st_inner == crate::video::engine::actor::state_code::PLAYING;
+                        if is_playing {
+                            dropped_full = true;
+                            skipped_frame_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            // CPU 経路は GPU shared output を持たないので reset 不要。
+                            drop(returned);
+                            break;
+                        }
+                        if cancel.load(Ordering::Acquire) {
+                            send_disconnected = true;
+                            drop(returned);
+                            break;
+                        }
+                        if clock.current_seek_serial() != current_seek_serial {
+                            new_seek_pending = true;
+                            drop(returned);
+                            break;
+                        }
+                        frame_holder = Some(returned);
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(TrySendError::Disconnected(_)) => {
+                        send_disconnected = true;
+                        break;
+                    }
                 }
+            }
+            if dropped_full && frame_step_selected_this_frame {
+                abort_frame_step_output(&clock, current_seek_serial, pts_secs, "video_tx_full_cpu");
+                frame_step_abort_discard_serial = Some(current_seek_serial);
+                frame_step_selected_pending_clear = false;
+                post_seek_frame_sent = true;
             }
             if crate::perf::is_enabled() {
                 crate::perf::event(
@@ -4447,8 +4517,13 @@ fn run_video_decode(
                     ],
                 );
             }
-            if let Err(TrySendError::Disconnected(_)) = send_result {
+            if send_disconnected {
                 break 'outer;
+            }
+            // GPU 経路と同じく、送出 retry 中に新世代 seek を観測した場合は次の
+            // outer iteration で再 dispatch する。
+            if new_seek_pending {
+                continue 'outer;
             }
         }
     }
