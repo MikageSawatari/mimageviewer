@@ -3329,6 +3329,16 @@ impl VideoPlayer {
         self.clock.is_playing()
     }
 
+    /// 「ユーザーが再生したいと思っているか」の intent。
+    /// `is_playing()` は engine が `Playing` state にあるか (= AvClock が実際に進んで
+    /// いるか) を返すが、これは Loading/Buffering/Seeking 中は autoplay=true でも
+    /// false になる。UI 側の `toggle_play` / `set_playing` のような「ユーザー操作の
+    /// 方向決定」には intent を読む必要がある (Codex P2 2026-05-17、詳細は
+    /// `EngineActor::autoplay_intent` の doc コメント参照)。
+    pub fn intent_playing(&self) -> bool {
+        self.engine.lock().unwrap().autoplay_intent()
+    }
+
     pub fn playback_speed(&self) -> f64 {
         self.clock.playback_speed()
     }
@@ -3373,6 +3383,12 @@ impl VideoPlayer {
     pub fn toggle_play(&self) {
         // EOF で停止中に Space を押されたら 0 から再生し直す (replay)。
         // 通常の再生中は単純トグル。
+        //
+        // **EOF 判定は AvClock 直読** (Codex P2 2026-05-17 補足): engine は
+        // `DecoderEvent::EofReached` を受け取らないため Eof state にならない (= 配線未完)。
+        // 代わりに `mod.rs` の EOF block (L4456 / L4593) が `clock.set_playing(false)` を
+        // 直接呼ぶので、EOF 時は `is_playing()=false && is_eof_reached()=true` の組み合わせ
+        // でのみ検出できる。intent (= opts.autoplay) は EOF を知らないので使えない。
         if !self.clock.is_playing() && self.clock.is_eof_reached() {
             self.clear_pending_user_seek();
             self.clear_initial_pause_controls();
@@ -3399,16 +3415,13 @@ impl VideoPlayer {
             g.apply_command(engine::actor::TransportCommand::Play);
             return;
         }
-        // Phase 9.C (2026-04-30): engine state machine も pause/play 同期する。
-        // 旧コードは clock.is_playing flag だけ更新していたため、engine state は
-        // Playing のまま固定で、perf overlay の warmup 区間表示にも反映されず、
-        // EngineState::parks_decoder() が立たないので decoder 側の pause-park 経路と
-        // 食い違っていた。
-        // 2026-05 root fix: AvClock の playing flag は engine 経由で更新するため、
-        // 直書き `clock.set_playing(...)` は撤去。`dispatch_play_pause` が
-        // `apply_command(Play/Pause)` を発行し、handle_play/handle_pause が
-        // transition_to_playing / transition_to_paused 経由で AvClock を同期する。
-        let new_playing = !self.clock.is_playing();
+        // 非 EOF: **intent 基準で方向決定** (Codex P2 2026-05-17)。
+        // `is_playing()` は engine state=Playing のときだけ true なので、
+        // Loading/Buffering/Seeking 中 (autoplay=true) に Space を押すと
+        // `!is_playing()=true` から「再生したい」と誤判定して Pause→Play の往復になる。
+        // intent_playing() は engine の autoplay 意図を直接読むので、準備中 + autoplay=true
+        // でも `intent_playing()=true` となり、Space で正しく Pause へ遷移する。
+        let new_playing = !self.intent_playing();
         if new_playing {
             self.clear_initial_pause_controls();
             self.clear_frame_step_target();
@@ -3419,9 +3432,17 @@ impl VideoPlayer {
     }
 
     pub fn set_playing(&self, p: bool) {
-        let prev = self.clock.is_playing();
+        // **intent 基準で dispatch 判定** (Codex P2 2026-05-17): 旧版は
+        // `prev = self.clock.is_playing()` を見ていたが、`is_playing()` は engine state
+        // が Playing のときだけ true なので、Loading/Buffering/Seeking 中 (autoplay=true)
+        // に `set_playing(false)` が呼ばれても `prev=false, p=false` で dispatch skip
+        // → autoplay=true のまま準備完了し勝手に再生開始するバグになる。
+        // `intent_playing()` を見れば「現状再生したいか」が分かるので、UI の意図と
+        // engine の意図がずれているとき正しく dispatch する。
+        let prev_intent = self.intent_playing();
         crate::logger::log(format!(
-            "[video-debug] set_playing({p}) called: prev_playing={prev} engine_state={} seek_serial={} video_rx_len={} audio_rx_len={}",
+            "[video-debug] set_playing({p}) called: prev_intent={prev_intent} is_playing={} engine_state={} seek_serial={} video_rx_len={} audio_rx_len={}",
+            self.clock.is_playing(),
             self.engine_state_name(),
             self.clock.current_seek_serial(),
             self.decode.video_rx.len(),
@@ -3433,18 +3454,21 @@ impl VideoPlayer {
         } else {
             self.clear_pending_user_seek();
         }
-        // 2026-05 root fix: 直書き `clock.set_playing(p)` は撤去。AvClock の playing
-        // フラグは engine 経由で更新する (= `dispatch_play_pause` →
-        // `apply_command(Play/Pause)` → `transition_to_*` → `engine_start_playing` /
-        // `engine_freeze_at`)。`apply_command` は idempotent なので prev == p でも
-        // 安全だが、観測可能な状態変化が無いケースは dispatch をスキップする。
-        if prev != p {
+        // **EOF replay 特例**: 配線未完のため engine は EofReached を受け取らず
+        // `opts.autoplay` が EOF を跨いでも変わらない。よって「autoplay=true で
+        // EOF に達した状態」では `prev_intent=true, p=true` で dispatch skip 扱い
+        // になるが、ユーザーが play ボタンを押したときは replay (= 0 から再生) を
+        // 期待する。EOF + p=true は強制 dispatch することで handle_play の Eof arm
+        // (= seek 0 + autoplay 強制) を発火させる。
+        let force_dispatch = p && self.clock.is_eof_reached();
+        if prev_intent != p || force_dispatch {
             self.dispatch_play_pause(p);
         }
         crate::logger::log(format!(
-            "[video-debug] set_playing({p}) done: engine_state={} playing={} seek_serial={}",
+            "[video-debug] set_playing({p}) done: engine_state={} playing={} intent={} seek_serial={}",
             self.engine_state_name(),
             self.clock.is_playing(),
+            self.intent_playing(),
             self.clock.current_seek_serial()
         ));
     }
@@ -4459,7 +4483,14 @@ impl VideoPlayer {
             // 動画オープン中 (= 1 フレームも表示されていない) は preparing HUD の
             // 数値を 50ms ごとに更新するため強制 polling (Codex P3 第 13 ラウンド対応)。
             // egui スリープを防ぎ、`set_native_playback_status` が tick ごとに発火する。
-            let preparing = self.displayed_frame_seq.load(Ordering::Relaxed) == 0;
+            //
+            // **engine_state も含む** (Codex P1 2026-05-17): 1 枚目表示済みでも engine が
+            // Loading/Buffering/Seeking なら BufferReady などの readiness event 待ちが
+            // engine_event_rx に積まれている可能性がある。次の tick が走らないと
+            // drain_engine_events に到達せず transition_to_playing が永久に発火しない
+            // 固着バグを構造的に塞ぐ。
+            let preparing =
+                self.displayed_frame_seq.load(Ordering::Relaxed) == 0 || self.is_engine_preparing();
             return if self.is_playing() || self.clock.is_seeking() {
                 Some(std::time::Duration::from_millis(16))
             } else if preparing {
@@ -4794,7 +4825,10 @@ impl VideoPlayer {
         // 要求しないと egui がスリープして bytes_read が増えても overlay に届かない。
         // 50ms 間隔で polling すれば、HUD の数値は概ね 50ms ごとに更新される
         // (= 体感は十分滑らか、CPU 負担も無視できる)。
-        let preparing = self.displayed_frame_seq.load(Ordering::Relaxed) == 0;
+        // **engine_state も含む** (Codex P1 2026-05-17、上記 native 経路と同じ理由):
+        // 1 枚目表示済みでも engine が Loading/Buffering/Seeking なら preparing 扱い。
+        let preparing =
+            self.displayed_frame_seq.load(Ordering::Relaxed) == 0 || self.is_engine_preparing();
         if self.is_playing() || seek_in_flight_for_display || preparing {
             let mut due = next_due.unwrap_or_else(|| std::time::Duration::from_millis(33));
             if seek_in_flight_for_display && displayed_pts.is_none() {
@@ -4899,6 +4933,25 @@ impl VideoPlayer {
 
     pub fn engine_state_name(&self) -> &'static str {
         engine_state_code_name(self.engine_state_code())
+    }
+
+    /// engine が readiness 待ちの遷移中か (= Loading / Buffering / Seeking)。
+    /// `tick()` の `preparing` 判定で「次の tick を 50ms 後に予約する」かを決める用途。
+    ///
+    /// **重要** (Codex P1 2026-05-17): 旧コードは `displayed_frame_seq == 0` だけを
+    /// preparing 扱いにしていたが、`FirstFrameReady` が audio の `BufferReady` より先に
+    /// 届くケース (= h264 hot GOP + cpal の 70ms 音声起動遅延) で 1 枚目表示後すぐ
+    /// preparing=false となり、tick が repaint を予約せず engine が Buffering で固着
+    /// していた。`BufferReady` イベントは engine_event_rx に積まれるが、次の UI tick が
+    /// 走らないと `drain_engine_events` に到達しないため、transition_to_playing が
+    /// 発火せず「1 枚目だけ出てそのまま静止」という症状になる。
+    pub fn is_engine_preparing(&self) -> bool {
+        matches!(
+            self.engine_state_code(),
+            engine::actor::state_code::LOADING
+                | engine::actor::state_code::BUFFERING
+                | engine::actor::state_code::SEEKING
+        )
     }
 
     pub fn current_seek_serial(&self) -> u64 {

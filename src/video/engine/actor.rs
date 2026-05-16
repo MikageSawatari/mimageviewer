@@ -204,6 +204,20 @@ impl EngineActor {
         self.seek_serial.load(Ordering::Acquire)
     }
 
+    /// 「ユーザー (もしくは autoplay) が再生したいと思っているか」の意図を返す。
+    /// `handle_play` / `handle_pause` が `opts.autoplay` を更新するので、これが現時点の
+    /// intent。
+    ///
+    /// **`AvClock::is_playing()` との違い** (Codex P2 2026-05-17): 旧コードでは
+    /// `AvClock::is_playing()` が「再生意図」と「実際にクロックが進んでいるか」を兼ねていたが、
+    /// 2026-05 の root fix 後は `AvClock::is_playing()` は engine の `Playing` state を
+    /// 厳密に反映するようになった。Loading/Buffering/Seeking 中は autoplay=true でも
+    /// `is_playing()=false` となるため、UI 側で「ユーザーが Space を押した = pause したい」
+    /// 判定をするには **intent** を読む必要がある。
+    pub fn autoplay_intent(&self) -> bool {
+        self.opts.autoplay
+    }
+
     // ──────────────────────────────────────────────────────────────
     // 状態遷移 helper (= anchor → state の publish 順を強制)
     // ──────────────────────────────────────────────────────────────
@@ -2184,5 +2198,112 @@ mod tests {
             (frozen - 7.5).abs() < 0.1,
             "BufferStarved should freeze AvClock at audible position (~7.5), got {frozen}"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Codex P2 2026-05-17: autoplay_intent は「ユーザー / autoplay の再生意図」を返し、
+    // engine state が Loading/Buffering/Seeking でも intent を反映する。
+    // is_playing() (= AvClock physical playing) との分離を構造的に検証する。
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn autoplay_intent_reflects_open_options() {
+        let (actor_true, _) = fresh_actor_with_av_clock(OpenOptions {
+            autoplay: true,
+            ..Default::default()
+        });
+        assert!(actor_true.autoplay_intent());
+
+        let (actor_false, _) = fresh_actor_with_av_clock(OpenOptions {
+            autoplay: false,
+            ..Default::default()
+        });
+        assert!(!actor_false.autoplay_intent());
+    }
+
+    #[test]
+    fn autoplay_intent_true_during_buffering() {
+        // 動画準備中 (= Buffering で readiness 待ち) でも autoplay=true 意図は
+        // intent として保たれる。`AvClock::is_playing()` は false でも
+        // intent_playing() は true。
+        let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions {
+            autoplay: true,
+            ..Default::default()
+        });
+        actor.begin_loading();
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 30.0,
+            has_audio: true,
+        });
+        // この時点で Buffering 入場、AvClock は Frozen
+        assert_eq!(actor.state, EngineState::Buffering);
+        assert!(
+            !av_clock.is_playing(),
+            "AvClock should be frozen during Buffering"
+        );
+        assert!(
+            actor.autoplay_intent(),
+            "autoplay_intent should remain true during Buffering"
+        );
+    }
+
+    #[test]
+    fn handle_pause_during_buffering_clears_autoplay_intent() {
+        // Buffering 中に handle_pause が来ても、intent (= opts.autoplay) は false に
+        // 落ちる。Buffering 完了時に Paused に入る (= try_transition_from_buffering の
+        // autoplay 分岐)。
+        let (mut actor, _) = fresh_actor_with_av_clock(OpenOptions {
+            autoplay: true,
+            ..Default::default()
+        });
+        actor.begin_loading();
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 30.0,
+            has_audio: true,
+        });
+        assert!(actor.autoplay_intent());
+        actor.apply_command(TransportCommand::Pause);
+        // state は Buffering のままだが intent は false に降りた
+        assert_eq!(actor.state, EngineState::Buffering);
+        assert!(
+            !actor.autoplay_intent(),
+            "Pause during Buffering should clear autoplay intent"
+        );
+        // ready 揃ったら Paused に入る (autoplay=false の効果)
+        actor.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+        actor.handle_audio_event(AudioEvent::BufferReady {
+            epoch: 0,
+            pts: 0.05,
+            wall_now: Instant::now(),
+        });
+        assert_eq!(actor.state, EngineState::Paused);
+    }
+
+    #[test]
+    fn handle_play_during_buffering_keeps_autoplay_intent_true() {
+        // begin_loading 時の opts.autoplay=false でも、Play 命令で intent=true に上がる。
+        let (mut actor, _) = fresh_actor_with_av_clock(OpenOptions {
+            autoplay: false,
+            ..Default::default()
+        });
+        actor.begin_loading();
+        actor.handle_decoder_event(DecoderEvent::InfoReceived {
+            epoch: 0,
+            duration_secs: 30.0,
+            has_audio: true,
+        });
+        assert!(!actor.autoplay_intent());
+        actor.apply_command(TransportCommand::Play);
+        assert!(actor.autoplay_intent());
+        // ready 揃ったら Playing に入る (autoplay=true の効果)
+        actor.handle_decoder_event(DecoderEvent::FirstFrameReady { epoch: 0, pts: 0.0 });
+        actor.handle_audio_event(AudioEvent::BufferReady {
+            epoch: 0,
+            pts: 0.05,
+            wall_now: Instant::now(),
+        });
+        assert_eq!(actor.state, EngineState::Playing);
     }
 }
