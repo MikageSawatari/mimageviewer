@@ -235,6 +235,31 @@ fn run_vst3_startup_load(
     }
 }
 
+/// 名前索引 OFF 遷移時の「supervisor join 完了 → search_index_db クリア」を実行する
+/// 共通ヘルパー (T53 + Codex P3 / 2026-05-16)。
+///
+/// 自由関数として extract する理由: `apply_favorite_name_index_change` の旧コードでは
+/// `std::thread::Builder::spawn(closure)` の closure 内に clear ロジックを直書きしていた
+/// が、`spawn` は失敗時に closure を実行せずに drop するだけなので、spawn 失敗パスでは
+/// clear が永久に走らない不具合があった。channel handoff (= spawn 成功時) と sync 呼び出し
+/// (= spawn 失敗時) の両方から本関数を呼ぶ構造に変えることで、どちらの経路でも join → clear
+/// の順序を保ったまま、必ず両方が実行される。
+fn run_name_index_off_completion(
+    handle: crate::name_index_supervisor::NameIndexSupervisorHandle,
+    clear_target: Option<(Arc<crate::search_index_db::SearchIndexDb>, PathBuf)>,
+) {
+    // Drop 内で cancel 再送 + thread.join() が走る (= bulk scan が止まるまで待つ)。
+    drop(handle);
+    if let Some((db, path)) = clear_target {
+        if let Err(e) = db.clear_for_favorite(&path) {
+            crate::logger::log(format!(
+                "favorites: clear name index for {} failed (post-join): {e}",
+                path.display()
+            ));
+        }
+    }
+}
+
 /// 非同期で走っている `navigate_folder_with_skip` ワーカーの状態。
 pub(crate) struct FolderNavPending {
     /// DFS キャンセル用トークン。連打の累積・モード切替・フォルダ強制切替で立てる。
@@ -3763,6 +3788,8 @@ impl App {
                     &pin_map_for_existing,
                     self.folder_thumb_pin_db.as_deref(),
                     self.settings.folder_thumb_depth as usize,
+                    // 通常 load_folder 経路は basename ベース (= 同じ親内なので unique)
+                    false,
                 )
             })
             .collect();
@@ -3837,26 +3864,42 @@ impl App {
         };
         if let Some(handle) = existing_handle {
             handle.signal_stop();
-            let join_and_clear = move || {
-                drop(handle);
-                if let Some((db, path)) = clear_target {
-                    if let Err(e) = db.clear_for_favorite(&path) {
-                        crate::logger::log(format!(
-                            "favorites: clear name index for {} failed (post-join): {e}",
-                            path.display()
-                        ));
-                    }
-                }
-            };
-            if let Err(e) = std::thread::Builder::new()
+            // T53 + Codex post-merge P3 (2026-05-16): spawn 失敗時に closure 内のロジック
+            // が走らない問題を回避する。`std::thread::Builder::spawn` は失敗時 closure を
+            // **実行せずに drop** するだけなので、closure 内に `clear_for_favorite` を入れて
+            // しまうと spawn 失敗時に索引クリアが永久に行われない (= 低頻度だが OFF 後にも
+            // 行が残る)。
+            //
+            // mpsc 経由でハンドル + clear_target を background worker に手渡しする構造に
+            // すれば、spawn 成功時は worker が同じ処理を行い、spawn 失敗時は handle と
+            // clear_target が外側に残るので main thread で同期実行できる。**どちらの経路
+            // でも join → clear の順序は保たれる**。
+            let (tx, rx) = mpsc::channel::<(
+                crate::name_index_supervisor::NameIndexSupervisorHandle,
+                Option<(
+                    Arc<crate::search_index_db::SearchIndexDb>,
+                    std::path::PathBuf,
+                )>,
+            )>();
+            let spawn_result = std::thread::Builder::new()
                 .name(format!("name-index-joiner-{}", fav_id.as_simple()))
-                .spawn(join_and_clear)
-            {
-                crate::logger::log(format!(
-                    "name-index-joiner spawn failed, sync join instead: {e}"
-                ));
-                // spawn 失敗時は closure が現スレッドで drop される (= UI ブロックするが
-                // join + clear の順序は保たれる)
+                .spawn(move || {
+                    if let Ok((handle, target)) = rx.recv() {
+                        run_name_index_off_completion(handle, target);
+                    }
+                });
+            match spawn_result {
+                Ok(_) => {
+                    // worker が rx.recv で待機中。ここで handle + clear_target を譲渡。
+                    let _ = tx.send((handle, clear_target));
+                }
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "name-index-joiner spawn failed, sync join instead: {e}"
+                    ));
+                    drop(tx); // rx もすでに drop 済 (closure dropped by failed spawn)
+                    run_name_index_off_completion(handle, clear_target);
+                }
             }
         } else if let Some((db, path)) = clear_target {
             // 既存 supervisor が居なかった場合 (= 既に OFF だが clear を念のため呼ぶ
@@ -4892,6 +4935,9 @@ impl App {
                     &pin_map_for_existing,
                     self.folder_thumb_pin_db.as_deref(),
                     self.settings.folder_thumb_depth as usize,
+                    // T54 follow-on: 検索結果は full-path ベース (= 異なる親フォルダの
+                    // 同名コンテナが共存しうるので basename だと衝突する)
+                    true,
                 )
             })
             .collect();
@@ -6191,6 +6237,14 @@ impl App {
         use crate::folder_thumb_pins::ResolvedKind;
         let pin_db = self.folder_thumb_pin_db.as_deref();
         let max_cascade_depth = self.settings.folder_thumb_depth as usize;
+        // T54 follow-on (Codex post-merge / 2026-05-16): 検索結果コンテキストでは
+        // make_load_request が full-path ベースの cache key を使うので、seed 側も同じ key で
+        // WebP を書き込まないと cache hit せず、auto-pick が pinned_key 下に上書きで保存
+        // される churn が発生する (= ユーザー視点では「pin したフォルダのサムネが
+        // 検索結果上だけ別の画像になる」)。`container_cache_base_key` を経由して
+        // 両側で同じキーを共有させる。
+        let use_full_path_keys =
+            self.current_folder.as_deref() == Some(search_results_synthetic_path().as_path());
         let mut seeded = 0u32;
         let mut purged = 0u32;
         for item in &self.items {
@@ -6216,13 +6270,12 @@ impl App {
             if !matches!(resolved.kind, ResolvedKind::Video) {
                 continue;
             }
-            let Some(fname) = container_path.file_name().and_then(|n| n.to_str()) else {
+            let Some(base_key) = container_cache_base_key(item, use_full_path_keys) else {
                 continue;
             };
             let pinned_key = format!(
-                "{}{}{}{}",
-                crate::thumb_loader::CACHE_KEY_FOLDER,
-                fname,
+                "{}{}{}",
+                base_key,
                 crate::thumb_loader::CACHE_KEY_PIN_SUFFIX,
                 resolved.source_id,
             );
@@ -16867,6 +16920,35 @@ fn interleaved_prefetch_targets(
 /// pin が見つかったコンテナは `apply_folder_thumb_pin` で `LoadRequest` を target
 /// 種別の形に書き換える (cache_key は親 prefix を維持し suffix で identity を載せる)。
 #[allow(clippy::too_many_arguments)]
+/// Container (Folder/ZipFile/PdfFile) の catalog cache 基底キー (`folderthumb:...` /
+/// `zipthumb:...` / `pdfthumb:...`) を組み立てる共通ヘルパー (T54 + Codex follow-on / 2026-05-16)。
+///
+/// `use_full_path` が `true` のときは basename ではなく full path 文字列を使う。
+/// これは Ctrl+S 検索結果 (= 複数フォルダの同名コンテナが同一リストに混在しうる) で衝突を
+/// 避けるために必要。`make_load_request` / `apply_folder_thumb_pin` (= 読み出し側) と
+/// `seed_folder_video_pin_thumbs` / `folder_thumb_existing_keys_for` (= 書き込み / 掃除側)
+/// が **必ず同じ関数を呼ぶ** ことで、key 構築の重複と乖離を構造的に防ぐ。
+///
+/// Image / ZipImage / PdfPage 等 container 以外には対応しない (= 呼び出し側で
+/// match して使い分け)。`None` が返るのは `file_name` が UTF-8 で取れなかった
+/// 極端なケースのみ。
+fn container_cache_base_key(item: &GridItem, use_full_path: bool) -> Option<String> {
+    let (path, prefix) = match item {
+        GridItem::Folder(p) => (p, CACHE_KEY_FOLDER),
+        GridItem::ZipFile(p) => (p, CACHE_KEY_ZIP),
+        GridItem::PdfFile(p) => (p, CACHE_KEY_PDF),
+        _ => return None,
+    };
+    if use_full_path {
+        // PathBuf::to_string_lossy はゼロ alloc な Cow を返すが、format! でどうせ
+        // 文字列を作るので素直に String 化する。
+        Some(format!("{}{}", prefix, path.to_string_lossy()))
+    } else {
+        let fname = path.file_name().and_then(|n| n.to_str())?;
+        Some(format!("{prefix}{fname}"))
+    }
+}
+
 fn make_load_request(
     item: &GridItem,
     idx: usize,
@@ -16919,17 +17001,8 @@ fn make_load_request(
         GridItem::ZipFile(p) => {
             // zip_entry は None のままにしておき、ワーカー側でキャッシュミス時に
             // 遅延解決する (UI スレッドで ZIP を開く I/O を避けるため)。
-            let fname = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            // T54: 検索結果コンテキストでは full path 込みのキーで衝突回避
-            let base_key = if use_full_path_keys {
-                format!("{}{}", CACHE_KEY_ZIP, p.to_string_lossy())
-            } else {
-                format!("{}{fname}", CACHE_KEY_ZIP)
-            };
+            // T54: container_cache_base_key で full_path / basename を統一管理
+            let base_key = container_cache_base_key(item, use_full_path_keys)?;
             let req = LoadRequest {
                 path: p.clone(),
                 cache_key_override: Some(base_key.clone()),
@@ -16947,17 +17020,7 @@ fn make_load_request(
             ))
         }
         GridItem::PdfFile(p) => {
-            let fname = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            // T54: 検索結果コンテキストでは full path 込みのキーで衝突回避
-            let base_key = if use_full_path_keys {
-                format!("{}{}", CACHE_KEY_PDF, p.to_string_lossy())
-            } else {
-                format!("{}{fname}", CACHE_KEY_PDF)
-            };
+            let base_key = container_cache_base_key(item, use_full_path_keys)?;
             let req = LoadRequest {
                 path: p.clone(),
                 pdf_page: Some(0),
@@ -16977,17 +17040,7 @@ fn make_load_request(
             ))
         }
         GridItem::Folder(p) => {
-            let fname = p
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_string();
-            // T54: 検索結果コンテキストでは full path 込みのキーで衝突回避
-            let base_key = if use_full_path_keys {
-                format!("{}{}", CACHE_KEY_FOLDER, p.to_string_lossy())
-            } else {
-                format!("{}{fname}", CACHE_KEY_FOLDER)
-            };
+            let base_key = container_cache_base_key(item, use_full_path_keys)?;
             let req = LoadRequest {
                 path: p.clone(),
                 cache_key_override: Some(base_key.clone()),
@@ -17047,8 +17100,13 @@ fn folder_thumb_existing_keys_for(
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     max_cascade_depth: usize,
+    // T54 follow-on (Codex post-merge / 2026-05-16): make_load_request と同じく
+    // 検索結果コンテキストでは full-path 込みキーを使う。`delete_missing` の存続キー
+    // 集合と make_load_request の読み書きキーが乖離しないように、必ず同じ helper
+    // (`container_cache_base_key`) を経由する。
+    use_full_path_keys: bool,
 ) -> Vec<String> {
-    let (container_path, base_key) = match item {
+    let container_path = match item {
         GridItem::Image(p) => {
             // Image はそもそも pinned 経路に乗らないので 1 つだけ。
             return p
@@ -17057,25 +17115,11 @@ fn folder_thumb_existing_keys_for(
                 .map(|n| vec![n.to_string()])
                 .unwrap_or_default();
         }
-        GridItem::Folder(p) => (p, {
-            let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
-                return Vec::new();
-            };
-            format!("{}{fname}", CACHE_KEY_FOLDER)
-        }),
-        GridItem::ZipFile(p) => (p, {
-            let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
-                return Vec::new();
-            };
-            format!("{}{fname}", CACHE_KEY_ZIP)
-        }),
-        GridItem::PdfFile(p) => (p, {
-            let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
-                return Vec::new();
-            };
-            format!("{}{fname}", CACHE_KEY_PDF)
-        }),
+        GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => p,
         _ => return Vec::new(),
+    };
+    let Some(base_key) = container_cache_base_key(item, use_full_path_keys) else {
+        return Vec::new();
     };
 
     let mut keys = vec![base_key.clone()];

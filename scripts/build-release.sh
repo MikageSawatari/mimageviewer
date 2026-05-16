@@ -95,12 +95,19 @@ cargo build --release -p mimageviewer-launcher --bin mimageviewer "$@"
 # T56: APPDATA 上の展開済み VST3 bridge cache を削除して、次回起動時に新 bridge を
 # 展開させる。これをしないと開発機が旧 bridge を握り続け、再ビルドした bridge が
 # 反映されない実害があった (PowerShell 版と同等の処理)。
-APPDATA_VST3_BRIDGE="$APPDATA/mimageviewer/vst3/mimageviewer-vst3-host.exe"
-APPDATA_VST3_BRIDGE_HASH="$APPDATA/mimageviewer/vst3/mimageviewer-vst3-host.exe.sha256"
-for cache in "$APPDATA_VST3_BRIDGE" "$APPDATA_VST3_BRIDGE_HASH"; do
-    if [ -n "${APPDATA:-}" ] && [ -f "$cache" ]; then
-        if rm -f "$cache"; then
-            echo "[build-release] removed stale extracted VST3 bridge cache: $cache"
+#
+# Codex post-merge P3 (2026-05-16): 旧コードは `set -u` 下で `$APPDATA/...` を先に展開
+# していたため、`APPDATA` 未設定の CI / 非標準 shell でこの行で即座に unbound variable
+# エラーになって落ちていた (= release build 自体は成功しているのに最後だけ exit 1)。
+# `${APPDATA:-}` guard を最初に評価し、未設定なら掃除をスキップして正常 exit する。
+if [ -n "${APPDATA:-}" ]; then
+    APPDATA_VST3_BRIDGE="$APPDATA/mimageviewer/vst3/mimageviewer-vst3-host.exe"
+    APPDATA_VST3_BRIDGE_HASH="$APPDATA/mimageviewer/vst3/mimageviewer-vst3-host.exe.sha256"
+    for cache in "$APPDATA_VST3_BRIDGE" "$APPDATA_VST3_BRIDGE_HASH"; do
+        if [ -f "$cache" ]; then
+            if rm -f "$cache"; then
+                echo "[build-release] removed stale extracted VST3 bridge cache: $cache"
+            fi
         fi
-    fi
-done
+    done
+fi
