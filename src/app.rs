@@ -16913,13 +16913,6 @@ fn interleaved_prefetch_targets(
     out
 }
 
-/// GridItem から LoadRequest を構築する。画像 / ZIP 内画像 / PDF ページ / フォルダ以外は None を返す。
-///
-/// `pin_map` は親コンテナ (Folder/ZipFile/PdfFile) のピン source 一覧で、
-/// `App::folder_pin_map` の参照を渡す。空 HashMap でも構わない (= pin 機能なし相当)。
-/// pin が見つかったコンテナは `apply_folder_thumb_pin` で `LoadRequest` を target
-/// 種別の形に書き換える (cache_key は親 prefix を維持し suffix で identity を載せる)。
-#[allow(clippy::too_many_arguments)]
 /// Container (Folder/ZipFile/PdfFile) の catalog cache 基底キー (`folderthumb:...` /
 /// `zipthumb:...` / `pdfthumb:...`) を組み立てる共通ヘルパー (T54 + Codex follow-on / 2026-05-16)。
 ///
@@ -16949,6 +16942,13 @@ fn container_cache_base_key(item: &GridItem, use_full_path: bool) -> Option<Stri
     }
 }
 
+/// GridItem から LoadRequest を構築する。画像 / ZIP 内画像 / PDF ページ / フォルダ以外は None を返す。
+///
+/// `pin_map` は親コンテナ (Folder/ZipFile/PdfFile) のピン source 一覧で、
+/// `App::folder_pin_map` の参照を渡す。空 HashMap でも構わない (= pin 機能なし相当)。
+/// pin が見つかったコンテナは `apply_folder_thumb_pin` で `LoadRequest` を target
+/// 種別の形に書き換える (cache_key は親 prefix を維持し suffix で identity を載せる)。
+#[allow(clippy::too_many_arguments)]
 fn make_load_request(
     item: &GridItem,
     idx: usize,
