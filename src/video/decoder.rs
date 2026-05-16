@@ -5608,8 +5608,8 @@ impl Drop for HwDevice {
     }
 }
 
-// HwDevice は単独で thread を渡らないが、`run_decoder` の所有スコープ内で持つだけ
-// なので Send/Sync は不要。明示的に impl しない。
+// HwDevice は `OpenedVideoDecoder` / `AuxVideoDecoder` と一緒に decoder thread へ
+// move される。所有者は常に 1 thread なので Send のみ実装し、Sync は持たせない。
 
 struct OpenedVideoDecoder {
     decoder: ffmpeg_the_third::decoder::Video,
@@ -5622,6 +5622,71 @@ struct OpenedVideoDecoder {
 struct D3d11vaProbe {
     d3d11va_supported: bool,
     d3d11va_config: String,
+}
+
+/// Hover seek thumbnails and similar auxiliary extraction paths need the same
+/// D3D11VA setup as playback, but they are not part of playback fast-swap
+/// lifecycle accounting. This wrapper keeps the FFmpeg decoder and the
+/// optional HW device reference together without exposing `HwDevice` outside
+/// this module.
+pub(crate) struct AuxVideoDecoder {
+    // Struct fields are dropped in declaration order. Drop the decoder before
+    // the helper AVBufferRef so FFmpeg tears down its AVCodecContext while our
+    // original HW device ref is still alive.
+    decoder: ffmpeg_the_third::decoder::Video,
+    _hw_device: Option<HwDevice>,
+    decoder_name: String,
+    hw_decode_active: bool,
+    d3d11va_supported: bool,
+    d3d11va_config: String,
+}
+
+impl AuxVideoDecoder {
+    fn from_opened(opened: OpenedVideoDecoder) -> Self {
+        let OpenedVideoDecoder {
+            decoder,
+            hw_device,
+            decoder_name,
+            hw_probe,
+        } = opened;
+        let hw_decode_active = hw_device.is_some();
+        Self {
+            decoder,
+            _hw_device: hw_device,
+            decoder_name,
+            hw_decode_active,
+            d3d11va_supported: hw_probe.d3d11va_supported,
+            d3d11va_config: hw_probe.d3d11va_config,
+        }
+    }
+
+    pub(crate) fn decoder_mut(&mut self) -> &mut ffmpeg_the_third::decoder::Video {
+        &mut self.decoder
+    }
+
+    pub(crate) fn width(&self) -> u32 {
+        self.decoder.width()
+    }
+
+    pub(crate) fn height(&self) -> u32 {
+        self.decoder.height()
+    }
+
+    pub(crate) fn decoder_name(&self) -> &str {
+        &self.decoder_name
+    }
+
+    pub(crate) fn hw_decode_active(&self) -> bool {
+        self.hw_decode_active
+    }
+
+    pub(crate) fn d3d11va_supported(&self) -> bool {
+        self.d3d11va_supported
+    }
+
+    pub(crate) fn d3d11va_config(&self) -> &str {
+        &self.d3d11va_config
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5671,7 +5736,7 @@ fn candidate_allows_sw_decode(
     candidate.allow_sw_decode && (!hw_decode_requested || !any_d3d11va_candidate)
 }
 
-fn clone_codec_parameters(
+pub(crate) fn clone_codec_parameters(
     params: &ffmpeg_the_third::codec::ParametersRef<'_>,
 ) -> Result<ffmpeg_the_third::codec::Parameters, String> {
     let mut cloned = ffmpeg_the_third::codec::Parameters::new();
@@ -5855,6 +5920,62 @@ fn open_video_decoder_with_candidates(
     }
 
     Err(errors.join("; "))
+}
+
+/// Open a video decoder for auxiliary extraction paths such as seek hover
+/// thumbnails. Unlike playback, auxiliary output is best-effort UI metadata:
+/// prefer D3D11VA when available, but fall back to SW decode if HW setup/open
+/// fails so thumbnails still appear.
+pub(crate) fn open_aux_video_decoder_with_fallback(
+    video_params: &ffmpeg_the_third::codec::Parameters,
+    codec_id: ffmpeg_the_third::codec::Id,
+    hw_preferred: bool,
+    log_label: &str,
+) -> Result<AuxVideoDecoder, String> {
+    if hw_preferred {
+        #[cfg(windows)]
+        let hw_result = open_video_decoder_with_candidates(video_params, codec_id, true, None);
+        #[cfg(not(windows))]
+        let hw_result: Result<OpenedVideoDecoder, String> =
+            Err("D3D11VA auxiliary decode is only available on Windows".to_string());
+
+        match hw_result {
+            Ok(opened) => {
+                let decode_path = if opened.hw_device.is_some() {
+                    "hw_d3d11va"
+                } else {
+                    "sw"
+                };
+                crate::logger::log(format!(
+                    "{log_label}: auxiliary decoder selected: codec={} decoder={} decode_path={decode_path} d3d11va_supported={} d3d11va_config={}",
+                    codec_id.name(),
+                    opened.decoder_name,
+                    opened.hw_probe.d3d11va_supported,
+                    opened.hw_probe.d3d11va_config,
+                ));
+                return Ok(AuxVideoDecoder::from_opened(opened));
+            }
+            Err(hw_err) => {
+                crate::logger::log(format!(
+                    "{log_label}: auxiliary HW decoder failed; falling back to SW: codec={} err={hw_err}",
+                    codec_id.name()
+                ));
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    let opened = open_video_decoder_with_candidates(video_params, codec_id, false, None)?;
+    #[cfg(not(windows))]
+    let opened = open_video_decoder_with_candidates(video_params, codec_id, false)?;
+    crate::logger::log(format!(
+        "{log_label}: auxiliary decoder selected: codec={} decoder={} decode_path=sw d3d11va_supported={} d3d11va_config={}",
+        codec_id.name(),
+        opened.decoder_name,
+        opened.hw_probe.d3d11va_supported,
+        opened.hw_probe.d3d11va_config,
+    ));
+    Ok(AuxVideoDecoder::from_opened(opened))
 }
 
 struct ResolvedVideoDecoderCandidate {

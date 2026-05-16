@@ -282,6 +282,14 @@ src/video/
 見ようとしている target を最優先し、jump panel 側の未取得サムネ要求は送らない。
 hover していない時も marker warmup は bucket 単位で短時間の再送を抑制し、毎フレーム
 同じ miss を投げて hover request を supersede し続ける状態を作らない。
+worker は初回 cache miss で長寿命の補助デコーダを lazy-open する。動画設定で HW decode
+が有効な場合は FFmpeg-owned D3D11VA device を優先し、出力は既存の
+`prepare_frame_for_swscale` で CPU readback して RGBA サムネイルへ変換する。main player
+の `GpuVideoDevice` は共有しないため、scrub 中の補助 decode が本編の D3D lock を奪わず、
+HW 初期化・readback 失敗時はサムネ worker 内だけで SW decode にフォールバックする。
+この補助デコーダは fast-swap の `LIVE_VIDEO_DECODE_THREADS` には数えない。このカウンタは
+本編 decoder create/drop の同時重なりを抑えるためのもので、VideoPlayer 常駐の seek
+thumbnail decoder を入れると動画→動画 fast-swap が恒常的に詰まるため。
 左 jump panel の pin/bookmark/chapter サムネは、worker で一度取得できた時点で WebP
 として永続化する。pin は既存の `video_pins.db`、bookmark は
 `video_bookmarks.thumb_webp`、埋め込み chapter は動画 file identity + chapter start

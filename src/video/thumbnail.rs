@@ -3,9 +3,11 @@
 //! ## 設計
 //!
 //! メインの `decoder` とは **完全に独立** したワーカースレッドが、同じ動画ファイルを
-//! 別の [`ffmpeg::format::Input`] で開き、要求された `target_secs` の前後の keyframe を
-//! 1 枚だけデコード → `swscale` で `THUMB_W x THUMB_H` の RGBA に変換 → キャッシュ
-//! に格納する。
+//! 別の [`ffmpeg::format::Input`] で開き、初回 cache miss で長寿命の補助デコーダを
+//! 生成する。動画設定で HW decode が有効なら FFmpeg-owned D3D11VA を優先し、
+//! 初期化や readback に失敗した場合は SW decode にフォールバックする。要求された
+//! `target_secs` の前後の keyframe から 1 枚だけデコードし、`swscale` で
+//! `THUMB_W x THUMB_H` の RGBA に変換 → キャッシュに格納する。
 //!
 //! UI スレッドは [`ThumbnailWorker::request`] で「この target_secs のサムネが欲しい」
 //! と通知し、[`ThumbnailWorker::nearest`] で結果を受け取る。worker は busy なら新しい
@@ -24,7 +26,7 @@
 //! about 92 MB.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -111,7 +113,7 @@ impl ThumbnailWorker {
     /// 内部で `ffmpeg::format::input` を別途開くので、メインデコーダの状態には影響しない。
     /// 失敗しても `Some(worker)` を返し、worker thread 内で諦めて即終了する
     /// (UI 側はサムネが返らないだけ)。
-    pub fn spawn(path: PathBuf) -> Self {
+    pub fn spawn(path: PathBuf, hw_decode: bool) -> Self {
         let (wake_tx, wake_rx) = bounded::<()>(1);
         let pending_target_bits = Arc::new(AtomicU64::new(PENDING_NONE));
         let state = Arc::new(Mutex::new(ThumbnailState::new()));
@@ -123,7 +125,14 @@ impl ThumbnailWorker {
         let thread = std::thread::Builder::new()
             .name("video-thumb".into())
             .spawn(move || {
-                run_worker(path, wake_rx, worker_pending, worker_state, worker_cancel);
+                run_worker(
+                    path,
+                    hw_decode,
+                    wake_rx,
+                    worker_pending,
+                    worker_state,
+                    worker_cancel,
+                );
             })
             .ok();
 
@@ -163,70 +172,250 @@ impl Drop for ThumbnailWorker {
     }
 }
 
+enum DecodeOutcome {
+    Ready(Thumbnail),
+    Superseded,
+    NoFrame,
+}
+
+struct SeekThumbnailDecoder {
+    input: ffmpeg_the_third::format::context::Input,
+    stream_idx: usize,
+    tb_num: f64,
+    tb_den: f64,
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    scaler: Option<ffmpeg_the_third::software::scaling::Context>,
+    scaler_src_fmt: Option<ffmpeg_the_third::format::Pixel>,
+    decoder: crate::video::decoder::AuxVideoDecoder,
+}
+
+impl SeekThumbnailDecoder {
+    fn open(path: &Path, hw_preferred: bool) -> Result<Self, String> {
+        use ffmpeg::media::Type as MediaType;
+        use ffmpeg_the_third as ffmpeg;
+
+        ffmpeg::init().map_err(|e| format!("ffmpeg init failed: {e}"))?;
+        let input = ffmpeg::format::input(path).map_err(|e| format!("open input failed: {e}"))?;
+        let video_stream = input
+            .streams()
+            .best(MediaType::Video)
+            .ok_or_else(|| "video stream not found".to_string())?;
+        let stream_idx = video_stream.index();
+        let time_base = video_stream.time_base();
+        let tb_num = time_base.numerator() as f64;
+        let tb_den = time_base.denominator() as f64;
+        let params_ref = video_stream.parameters();
+        let params = crate::video::decoder::clone_codec_parameters(&params_ref)?;
+        let codec_id = params.id();
+
+        let decoder = crate::video::decoder::open_aux_video_decoder_with_fallback(
+            &params,
+            codec_id,
+            hw_preferred,
+            "video-thumb",
+        )?;
+        let src_w = decoder.width();
+        let src_h = decoder.height();
+        let (dst_w, dst_h) = fit_within(src_w, src_h, THUMB_W, THUMB_H);
+        crate::logger::log(format!(
+            "video-thumb: decoder ready codec={} decoder={} decode_path={} d3d11va_supported={} d3d11va_config={} src_size={}x{} dst_size={}x{}",
+            codec_id.name(),
+            decoder.decoder_name(),
+            if decoder.hw_decode_active() {
+                "hw_d3d11va"
+            } else {
+                "sw"
+            },
+            decoder.d3d11va_supported(),
+            decoder.d3d11va_config(),
+            src_w,
+            src_h,
+            dst_w,
+            dst_h,
+        ));
+
+        Ok(Self {
+            input,
+            stream_idx,
+            tb_num,
+            tb_den,
+            src_w,
+            src_h,
+            dst_w,
+            dst_h,
+            scaler: None,
+            scaler_src_fmt: None,
+            decoder,
+        })
+    }
+
+    fn hw_decode_active(&self) -> bool {
+        self.decoder.hw_decode_active()
+    }
+
+    fn decode_path(&self) -> &'static str {
+        if self.hw_decode_active() {
+            "hw_d3d11va"
+        } else {
+            "sw"
+        }
+    }
+
+    fn decode_thumbnail(
+        &mut self,
+        target_secs: f64,
+        pending_target_bits: &AtomicU64,
+        cancel: &AtomicBool,
+    ) -> Result<DecodeOutcome, String> {
+        use ffmpeg::format::Pixel;
+        use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
+        use ffmpeg::util::frame::video::Video;
+        use ffmpeg_the_third as ffmpeg;
+
+        let target_pts = (target_secs * 1_000_000.0) as i64;
+        let seek_ok = unsafe {
+            use ffmpeg::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
+            av_seek_frame(
+                self.input.as_mut_ptr(),
+                -1,
+                target_pts,
+                AVSEEK_FLAG_BACKWARD as i32,
+            ) >= 0
+        };
+        if !seek_ok {
+            return Ok(DecodeOutcome::NoFrame);
+        }
+        self.decoder.decoder_mut().flush();
+
+        let mut got_frame: Option<Video> = None;
+        let mut last_frame: Option<Video> = None;
+        let mut superseded = false;
+
+        // backward seek 後の keyframe から target_secs に到達する frame まで decode
+        // し続ける。長い GOP でも正しい時刻に近いサムネを返すため decode 数に
+        // 固定上限は置かず、cancel と新 request による supersede で止める。
+        for item in self.input.packets() {
+            if cancel.load(Ordering::Acquire) {
+                return Ok(DecodeOutcome::Superseded);
+            }
+            // overlay は同 bucket に同じ request を再送することがあるため、別 bucket
+            // だけを supersede とみなす。同 bucket は完了後の cache hit で消化する。
+            let pending = pending_target_bits.load(Ordering::Acquire);
+            if pending != PENDING_NONE
+                && bucket_key(f64::from_bits(pending)) != bucket_key(target_secs)
+            {
+                superseded = true;
+                break;
+            }
+
+            let (stream, packet) = match item {
+                Ok(sp) => sp,
+                Err(_) => break,
+            };
+            if stream.index() != self.stream_idx {
+                continue;
+            }
+            if self.decoder.decoder_mut().send_packet(&packet).is_err() {
+                continue;
+            }
+            let mut frame = Video::empty();
+            while self.decoder.decoder_mut().receive_frame(&mut frame).is_ok() {
+                let Some(ts) = crate::video::decoder::video_frame_timestamp(&frame) else {
+                    got_frame = Some(frame);
+                    break;
+                };
+                let pts_secs = ts as f64 * self.tb_num / self.tb_den;
+                if pts_secs >= target_secs {
+                    got_frame = Some(frame);
+                    break;
+                }
+                last_frame = Some(frame);
+                frame = Video::empty();
+            }
+            if got_frame.is_some() {
+                break;
+            }
+        }
+        if superseded {
+            return Ok(DecodeOutcome::Superseded);
+        }
+
+        let Some(frame) = got_frame.or(last_frame) else {
+            return Ok(DecodeOutcome::NoFrame);
+        };
+        let frame_pts_secs = crate::video::decoder::video_frame_timestamp(&frame)
+            .map(|pts| pts as f64 * self.tb_num / self.tb_den)
+            .unwrap_or(target_secs);
+
+        // HW (D3D11) frame は SW download してから scaler に渡す。SW frame はそのまま。
+        let mut sw_holder: Option<Video> = None;
+        let frame_for_scaler =
+            crate::video::swscale_helpers::prepare_frame_for_swscale(&frame, &mut sw_holder)
+                .map_err(|e| e.to_string())?;
+
+        let cur_src_fmt = frame_for_scaler.format();
+        if self.scaler.is_none() || self.scaler_src_fmt != Some(cur_src_fmt) {
+            crate::logger::log(format!(
+                "video-thumb: -> ScaleContext::get src_fmt={cur_src_fmt:?} src_size={}x{} dst_size={}x{}",
+                self.src_w, self.src_h, self.dst_w, self.dst_h
+            ));
+            let scaler = ScaleContext::get(
+                cur_src_fmt,
+                self.src_w,
+                self.src_h,
+                Pixel::RGBA,
+                self.dst_w,
+                self.dst_h,
+                ScaleFlags::BILINEAR,
+            )
+            .map_err(|e| format!("sws_scale init failed: {e}"))?;
+            self.scaler = Some(scaler);
+            self.scaler_src_fmt = Some(cur_src_fmt);
+            crate::logger::log("video-thumb: <- ScaleContext::get ok");
+        }
+
+        let scaler_ref = self.scaler.as_mut().expect("scaler initialized above");
+        let mut rgba = Video::empty();
+        scaler_ref
+            .run(frame_for_scaler, &mut rgba)
+            .map_err(|e| format!("sws_scale failed: {e}"))?;
+
+        let stride = rgba.stride(0);
+        let needed = (self.dst_w * 4) as usize;
+        let plane = rgba.data(0);
+        let buf: Vec<u8> = if stride == needed {
+            plane[..needed * self.dst_h as usize].to_vec()
+        } else {
+            let mut out = Vec::with_capacity(needed * self.dst_h as usize);
+            for row in 0..self.dst_h as usize {
+                let start = row * stride;
+                out.extend_from_slice(&plane[start..start + needed]);
+            }
+            out
+        };
+
+        Ok(DecodeOutcome::Ready(Thumbnail {
+            target_secs: frame_pts_secs,
+            width: self.dst_w,
+            height: self.dst_h,
+            rgba: Arc::new(buf),
+        }))
+    }
+}
+
 fn run_worker(
     path: PathBuf,
+    hw_decode: bool,
     wake_rx: crossbeam_channel::Receiver<()>,
     pending_target_bits: Arc<AtomicU64>,
     state: Arc<Mutex<ThumbnailState>>,
     cancel: Arc<AtomicBool>,
 ) {
-    use ffmpeg::format::Pixel;
-    use ffmpeg::media::Type as MediaType;
-    use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
-    use ffmpeg::util::frame::video::Video;
-    use ffmpeg_the_third as ffmpeg;
-
-    if let Err(e) = ffmpeg::init() {
-        crate::logger::log(format!("video-thumb: ffmpeg init failed: {e}"));
-        return;
-    }
-
-    let mut input = match ffmpeg::format::input(&path) {
-        Ok(i) => i,
-        Err(e) => {
-            crate::logger::log(format!("video-thumb: open input failed: {e}"));
-            return;
-        }
-    };
-    let video_stream = match input.streams().best(MediaType::Video) {
-        Some(s) => s,
-        None => return,
-    };
-    let stream_idx = video_stream.index();
-    let time_base = video_stream.time_base();
-    let tb_num = time_base.numerator() as f64;
-    let tb_den = time_base.denominator() as f64;
-    let params = video_stream.parameters();
-
-    let codec_ctx = match ffmpeg::codec::context::Context::from_parameters(params) {
-        Ok(c) => c,
-        Err(e) => {
-            crate::logger::log(format!("video-thumb: codec ctx failed: {e}"));
-            return;
-        }
-    };
-    let mut decoder = match codec_ctx.decoder().video() {
-        Ok(d) => d,
-        Err(e) => {
-            crate::logger::log(format!("video-thumb: decoder open failed: {e}"));
-            return;
-        }
-    };
-    let src_w = decoder.width();
-    let src_h = decoder.height();
-
-    // アスペクト比を保ちつつ最大 THUMB_W x THUMB_H に収める
-    let (dst_w, dst_h) = fit_within(src_w, src_h, THUMB_W, THUMB_H);
-
-    // `decoder.format()` ベースで scaler を事前構築すると、HW accel が auto-attach
-    // された場合に `Pixel::D3D11` が返って swscale の `av_assert0` → `abort()` で
-    // プロセスごと落ちる (2026-05-12 crash 解析、`ucrtbase!abort` で fast fail)。
-    // 代わりに **最初の frame を取った後、`frame.format()` で scaler を lazy 構築**
-    // する方式に切り替える。HW frame は `prepare_frame_for_swscale` で
-    // `av_hwframe_transfer_data` 経由で SW download してから swscale に渡す。
-    // これにより HW decode の高速性を維持しつつ swscale av_assert0 を回避できる。
-    let mut scaler: Option<ScaleContext> = None;
-    let mut scaler_src_fmt: Option<Pixel> = None;
+    let mut decoder: Option<SeekThumbnailDecoder> = None;
+    let mut hw_decode_failed = false;
 
     while !cancel.load(Ordering::Acquire) {
         // 起床通知を 100ms タイムアウトで待つ。タイムアウトでも cancel 再確認のため continue。
@@ -252,171 +441,88 @@ fn run_worker(
             continue;
         }
 
-        // backward seek + 1 フレームだけデコード
-        let target_pts = (target_secs * 1_000_000.0) as i64;
-        let seek_ok = unsafe {
-            use ffmpeg::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
-            av_seek_frame(
-                input.as_mut_ptr(),
-                -1,
-                target_pts,
-                AVSEEK_FLAG_BACKWARD as i32,
-            ) >= 0
-        };
-        if !seek_ok {
-            continue;
-        }
-        decoder.flush();
-
-        let mut got_frame: Option<Video> = None;
-        let mut last_frame: Option<Video> = None;
-        // backward seek 後の keyframe から target_secs に到達する frame まで decode
-        // し続ける。decode 数に上限は設けない: 長い GOP (実測 5.5s ≈ 165 frame の
-        // 動画あり) でも必ず target のフレームを採用するため。上限を置くと GOP 長に
-        // よってサムネが再生開始位置からずれる。
-        // 暴走対策は 2 つ: (1) cancel フラグ (= Drop) で worker 自体を止める、
-        // (2) より新しい hover request (`pending_target_bits` が更新された) を検知
-        // したら現在の decode を捨てて最新 target に乗り換える。上限撤廃後はこの
-        // (2) が無いと、長 GOP / PTS 欠落ファイルで 1 request が EOF まで走り、
-        // スクラブ中の後続 request が全部詰まる。
-        let mut superseded = false;
-        for item in input.packets() {
-            if cancel.load(Ordering::Acquire) {
-                return;
-            }
-            // 別 bucket への新しい hover request が来たら現在の decode を捨てて
-            // outer loop に戻り、最新 target を処理する (drain semantics の維持)。
-            // overlay は target が変わらなくても 250ms ごとに RequestSeekThumbnail
-            // を再送するため、同 bucket の pending では supersede しない — そうしないと
-            // 1 decode が 250ms を超える長 GOP / 重い動画で、同じ target に自分自身を
-            // abort/restart させ続け、サムネが永遠に完成しない。同 bucket の pending は
-            // decode 完了後に outer loop の cache hit で無害に消化される。
-            let pending = pending_target_bits.load(Ordering::Acquire);
-            if pending != PENDING_NONE
-                && bucket_key(f64::from_bits(pending)) != bucket_key(target_secs)
-            {
-                superseded = true;
-                break;
-            }
-            let (stream, packet) = match item {
-                Ok(sp) => sp,
-                Err(_) => break,
-            };
-            if stream.index() != stream_idx {
-                continue;
-            }
-            if decoder.send_packet(&packet).is_err() {
-                continue;
-            }
-            let mut frame = Video::empty();
-            while decoder.receive_frame(&mut frame).is_ok() {
-                // 再生デコーダと同じ best-effort timestamp を使う。PTS 欠落系の
-                // AVI/ASF/古い DivX で `frame.pts()` が None になり、判定が壊れて
-                // EOF まで走るのを防ぐ。timestamp が全く取れない壊れたストリーム
-                // では seek 直後の最初の frame をそのまま採用する。
-                let Some(ts) = crate::video::decoder::video_frame_timestamp(&frame) else {
-                    got_frame = Some(frame);
-                    break;
-                };
-                let pts_secs = ts as f64 * tb_num / tb_den;
-                // 再生で target_secs にシークしたとき表示される frame と一致させる
-                // ため「target_secs 以降の最初の frame」を採用する。以前は
-                // `target_secs - SECONDS_PER_BUCKET` で 0.5s 手前の frame を拾って
-                // いた (= ホバーサムネが再生開始位置とずれる一因)。
-                if pts_secs >= target_secs {
-                    got_frame = Some(frame);
-                    break;
-                }
-                // target 未到達の frame は last_frame として保持。動画末尾付近の
-                // hover で target が最終フレームの pts を超え、EOF まで到達しない
-                // ケースの fallback に使う。
-                last_frame = Some(frame);
-                frame = Video::empty();
-            }
-            if got_frame.is_some() {
-                break;
-            }
-        }
-        if superseded {
-            continue;
-        }
-
-        let Some(frame) = got_frame.or(last_frame) else {
-            continue;
-        };
-        // 実際にデコードできた frame の PTS をサムネに記録する。要求 target_secs を
-        // そのまま保存すると、長い GOP で decode 上限に当たって target 手前の frame
-        // しか取れなかった場合に、UI 側の一致判定 (thumbnail_matches) が「正しい
-        // 時刻のサムネ」と誤認してしまう。実 PTS を持たせれば、ずれている間は
-        // 「シーク中」box が出て誤表示にならない。
-        let frame_pts_secs = frame
-            .pts()
-            .map(|pts| pts as f64 * tb_num / tb_den)
-            .unwrap_or(target_secs);
-
-        // HW (D3D11) frame は SW download してから scaler に渡す。SW frame はそのまま。
-        let mut sw_holder: Option<Video> = None;
-        let frame_for_scaler = match crate::video::swscale_helpers::prepare_frame_for_swscale(
-            &frame,
-            &mut sw_holder,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                crate::logger::log(format!("video-thumb: {e}"));
-                continue;
-            }
-        };
-        // scaler を lazy 構築 / src_fmt 変化時に再構築。
-        let cur_src_fmt = frame_for_scaler.format();
-        if scaler.is_none() || scaler_src_fmt != Some(cur_src_fmt) {
-            crate::logger::log(format!(
-                "video-thumb: -> ScaleContext::get src_fmt={cur_src_fmt:?} src_size={src_w}x{src_h} dst_size={dst_w}x{dst_h}"
-            ));
-            match ScaleContext::get(
-                cur_src_fmt,
-                src_w,
-                src_h,
-                Pixel::RGBA,
-                dst_w,
-                dst_h,
-                ScaleFlags::BILINEAR,
-            ) {
-                Ok(s) => {
-                    scaler = Some(s);
-                    scaler_src_fmt = Some(cur_src_fmt);
-                    crate::logger::log("video-thumb: <- ScaleContext::get ok");
-                }
+        if decoder.is_none() {
+            let use_hw = hw_decode && !hw_decode_failed;
+            decoder = match SeekThumbnailDecoder::open(&path, use_hw) {
+                Ok(decoder) => Some(decoder),
                 Err(e) => {
-                    crate::logger::log(format!("video-thumb: sws_scale init failed: {e}"));
-                    continue;
+                    crate::logger::log(format!("video-thumb: decoder open failed: {e}"));
+                    return;
+                }
+            };
+        }
+
+        let decode_t0 = std::time::Instant::now();
+        let mut decode_path = decoder
+            .as_ref()
+            .map(|decoder| decoder.decode_path())
+            .unwrap_or("unknown")
+            .to_string();
+        let decode_result = decoder
+            .as_mut()
+            .expect("decoder opened above")
+            .decode_thumbnail(target_secs, &pending_target_bits, &cancel);
+        let outcome = match decode_result {
+            Ok(outcome) => outcome,
+            Err(e)
+                if decoder
+                    .as_ref()
+                    .is_some_and(|decoder| decoder.hw_decode_active()) =>
+            {
+                crate::logger::log(format!(
+                    "video-thumb: HW decode failed; retrying with SW: {e}"
+                ));
+                hw_decode_failed = true;
+                decoder = None;
+                let mut sw_decoder = match SeekThumbnailDecoder::open(&path, false) {
+                    Ok(decoder) => decoder,
+                    Err(open_err) => {
+                        crate::logger::log(format!(
+                            "video-thumb: SW fallback open failed: {open_err}"
+                        ));
+                        continue;
+                    }
+                };
+                decode_path = sw_decoder.decode_path().to_string();
+                match sw_decoder.decode_thumbnail(target_secs, &pending_target_bits, &cancel) {
+                    Ok(outcome) => {
+                        decoder = Some(sw_decoder);
+                        outcome
+                    }
+                    Err(sw_err) => {
+                        crate::logger::log(format!("video-thumb: SW fallback failed: {sw_err}"));
+                        decoder = Some(sw_decoder);
+                        continue;
+                    }
                 }
             }
-        }
-        let scaler_ref = scaler.as_mut().expect("scaler initialized above");
-        let mut rgba = Video::empty();
-        if scaler_ref.run(frame_for_scaler, &mut rgba).is_err() {
-            continue;
-        }
-        let stride = rgba.stride(0);
-        let needed = (dst_w * 4) as usize;
-        let plane = rgba.data(0);
-        let buf: Vec<u8> = if stride == needed {
-            plane[..needed * dst_h as usize].to_vec()
-        } else {
-            let mut out = Vec::with_capacity(needed * dst_h as usize);
-            for row in 0..dst_h as usize {
-                let start = row * stride;
-                out.extend_from_slice(&plane[start..start + needed]);
+            Err(e) => {
+                crate::logger::log(format!("video-thumb: decode failed: {e}"));
+                continue;
             }
-            out
         };
 
-        let thumb = Thumbnail {
-            target_secs: frame_pts_secs,
-            width: dst_w,
-            height: dst_h,
-            rgba: Arc::new(buf),
+        let DecodeOutcome::Ready(thumb) = outcome else {
+            continue;
         };
+        if crate::perf::is_enabled() {
+            let path_key = path.display().to_string();
+            crate::perf::event(
+                "video_thumb",
+                "ready",
+                Some(&path_key),
+                0,
+                &[
+                    ("target_secs", serde_json::Value::from(target_secs)),
+                    ("actual_secs", serde_json::Value::from(thumb.target_secs)),
+                    (
+                        "decode_ms",
+                        serde_json::Value::from(decode_t0.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("decode_path", serde_json::Value::from(decode_path)),
+                ],
+            );
+        }
         state.lock().unwrap().insert(key, thumb);
     }
     crate::logger::log("video-thumb: terminated");

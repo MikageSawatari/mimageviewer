@@ -3109,7 +3109,7 @@ impl VideoPlayer {
         let _ = autoplay; // intent は EngineActor 経由で配線済 (= OpenOptions.autoplay)
 
         // シーク先サムネ抽出ワーカー (失敗してもメイン再生は続行)
-        let thumb_worker = Some(ThumbnailWorker::spawn(path.clone()));
+        let thumb_worker = Some(ThumbnailWorker::spawn(path.clone(), hw_decode));
         let displayed_frame_seq = Arc::new(AtomicU64::new(0));
         let last_displayed_pts_bits = Arc::new(AtomicU64::new(f64::NAN.to_bits()));
         let frame_step_active = Arc::new(AtomicBool::new(false));
