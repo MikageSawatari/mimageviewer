@@ -863,6 +863,10 @@ pub struct Settings {
     /// 動画末尾近く (残り 5 秒以内) は 0 にリセットして "次回最初から" の挙動。
     #[serde(default)]
     pub video_resume_positions: std::collections::HashMap<String, f64>,
+    /// 一覧から明示的に動画を開いたとき、保存済み resume 位置を使わず先頭から開くか。
+    /// フルスクリーン中のホイール / キー移動では既存どおり resume 位置を使う。
+    #[serde(default)]
+    pub video_grid_open_starts_from_beginning: bool,
     /// ハードウェアデコードを利用するか (Windows D3D11VA)。D3D11VA 非対応 codec は
     /// SW で再生し、D3D11VA 対応 codec の HW 初期化 / open 失敗はエラーとして扱う。
     /// HEVC / 4K 動画の CPU 負荷を大きく下げるため既定 ON。GPU ドライバの不具合等で
@@ -1560,6 +1564,7 @@ impl Default for Settings {
             video_loop_mode: VideoLoopMode::default(),
             video_start_muted: false,
             video_resume_positions: std::collections::HashMap::new(),
+            video_grid_open_starts_from_beginning: false,
             video_hw_decode: true,
             video_deinterlace: VideoDeinterlaceMode::default(),
             video_thumb_use_sidecar_image: true,
@@ -2746,6 +2751,7 @@ mod tests {
         assert_eq!(loaded.thumb_quality, 75);
         assert_eq!(loaded.video_volume, VIDEO_VOLUME_DEFAULT);
         assert_eq!(loaded.video_deinterlace, VideoDeinterlaceMode::Auto);
+        assert!(!loaded.video_grid_open_starts_from_beginning);
         assert!(loaded.favorites.is_empty());
     }
 

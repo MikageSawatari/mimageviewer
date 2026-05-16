@@ -144,6 +144,16 @@ fn video_autoplay_for_open_treats_grid_open_as_play_intent() {
 }
 
 #[test]
+fn video_resume_for_open_can_ignore_grid_open_only() {
+    let saved = Some(42.0);
+
+    assert_eq!(video_resume_for_open(saved, true, false), saved);
+    assert_eq!(video_resume_for_open(saved, false, true), saved);
+    assert_eq!(video_resume_for_open(saved, true, true), None);
+    assert_eq!(video_resume_for_open(None, true, true), None);
+}
+
+#[test]
 fn rating_filter_container_uses_all_6_buckets() {
     let folder = GridItem::Folder(PathBuf::from("/a"));
     // ★なし OFF → 未評価フォルダも隠れる (「★5 のみ表示」が実際に効くために必要)

@@ -960,8 +960,17 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.separator();
     ui.add_space(8.0);
 
-    ui.label(egui::RichText::new("再生位置の記憶").strong());
+    ui.label(egui::RichText::new("レジューム再生").strong());
     ui.add_space(4.0);
+    ui.checkbox(
+        &mut s.video_grid_open_starts_from_beginning,
+        "一覧から開いたときは最初から再生する",
+    )
+    .on_hover_text(
+        "ON: サムネイル一覧からダブルクリック / Enter で開いた動画は、保存済み再生位置があっても先頭から再生します。\n\
+         ホイール / ↑↓ などフルスクリーン中の動画移動では、従来どおり保存済み位置から再開します。",
+    );
+    ui.add_space(6.0);
     let count = s.video_resume_positions.len();
     ui.label(format!(
         "現在 {count} 件の動画について再生位置を記憶しています。\n\

@@ -11976,8 +11976,14 @@ impl App {
         });
         let play_test_start = play_test_for_video.and_then(|state| state.config.start_secs);
         let play_test_mute = play_test_for_video.is_some_and(|state| state.config.mute);
-        let resume = play_test_start
-            .or_else(|| self.settings.video_resume_positions.get(&path_key).copied());
+        let saved_resume = self.settings.video_resume_positions.get(&path_key).copied();
+        let resume = play_test_start.or_else(|| {
+            video_resume_for_open(
+                saved_resume,
+                from_grid,
+                self.settings.video_grid_open_starts_from_beginning,
+            )
+        });
         let video_hw_decode = self.settings.video_hw_decode;
         let video_deinterlace = self.settings.video_deinterlace;
         let initial_normalize_lookup = if self.settings.audio_normalize_enabled {
@@ -18769,6 +18775,18 @@ fn video_autoplay_for_open(
         crate::settings::VideoAutoplayMode::Always => true,
         crate::settings::VideoAutoplayMode::OnlyFromGrid
         | crate::settings::VideoAutoplayMode::Off => from_grid,
+    }
+}
+
+fn video_resume_for_open(
+    saved_resume: Option<f64>,
+    from_grid: bool,
+    grid_open_starts_from_beginning: bool,
+) -> Option<f64> {
+    if from_grid && grid_open_starts_from_beginning {
+        None
+    } else {
+        saved_resume
     }
 }
 

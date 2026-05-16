@@ -596,6 +596,10 @@ hard-stuck。固着動画では video decode thread が `first packet for serial
    背景として動画識別に十分な解像度を確保する。wheel update 中に同じ動画/PTS の
    WebP を UI thread で繰り返し decode しないよう、App は直近 8 件だけ session-local
    RGBA preview cache を持つ。永続 DB は WebP のままなので、起動をまたぐメモリ増加はない。
+   `video_grid_open_starts_from_beginning` が ON の場合、一覧からの通常 open (`from_grid=true`)
+   だけは保存済み resume 秒を `VideoPlayer::open` に渡さず先頭から開く。ホイール /
+   キー移動や fast-swap は `from_grid=false` のため、誤移動から戻れるよう従来どおり
+   resume 秒と preview を使う。
    autoplay=false の open-time resume は、native presenter が最初の post-seek frame を
    `Present` した時点でその PTS に凍結し、seek override を解除する。音声あり動画では
    pause 中に audio callback が drain されないため、音声側の override 解除を待つと
