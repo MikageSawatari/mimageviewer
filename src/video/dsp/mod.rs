@@ -148,6 +148,18 @@ pub struct DspBridge {
     /// / `set_all_guis_app_active` / `send_chain_z_order` 等) の末尾で発火する。
     /// hook 側は unbounded mpsc に `send` するだけの非ブロッキング処理を行う。
     hud_raise_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    /// チェーン再構築の単調世代カウンタ (Codex R-VST-001 / T21、2026-05-16)。
+    ///
+    /// `kick_off_vst3_chain_rebuild` / `kick_off_vst3_startup_load` がワーカーを spawn
+    /// する直前に `bump_chain_rebuild_gen()` で増分し、ワーカーは自分の `my_gen` と
+    /// `current_chain_rebuild_gen()` を要所で比較する。新しい rebuild 要求が来ると
+    /// 旧 worker は次のチェックポイントで諦めて exit する (= "last request wins")。
+    ///
+    /// チェックポイントの粒度: disable 前 / enable 後 / 各 add_plugin 前 / 末尾の
+    /// set_all_guis_visible 前。チェーン中盤で見捨てられる worker は (a) 既に enable
+    /// 済みなら新 worker が disable で wipe するため副作用なし、(b) 既に add 済みの
+    /// プラグインも新 worker の disable→add ループで上書きされる。
+    chain_rebuild_gen: AtomicU64,
 }
 
 struct DspBridgeInner {
@@ -246,7 +258,30 @@ impl DspBridge {
             hud_hwnd: AtomicU64::new(0),
             editor_hwnds: Arc::new(std::sync::RwLock::new(std::collections::HashSet::new())),
             hud_raise_hook: Mutex::new(None),
+            chain_rebuild_gen: AtomicU64::new(0),
         })
+    }
+
+    /// チェーン再構築世代を 1 つ進め、新しい世代値を返す (T21 / R-VST-001)。
+    ///
+    /// 戻り値は spawn する worker が「自分の generation」として保持する値。
+    /// 後続の要求が再度 bump すると現在値が増え、worker は `is_chain_rebuild_stale`
+    /// で stale を検出して exit する。AcqRel で全体順序を確立する (= 後続の
+    /// `add_plugin` 等が古い worker から visible にならないように)。
+    pub fn bump_chain_rebuild_gen(&self) -> u64 {
+        // fetch_add は前の値を返すので +1 して新世代を作る。
+        self.chain_rebuild_gen.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// 現在のチェーン再構築世代を返す (T21 / R-VST-001)。
+    pub fn current_chain_rebuild_gen(&self) -> u64 {
+        self.chain_rebuild_gen.load(Ordering::Acquire)
+    }
+
+    /// `my_gen` が古い世代ならば true。worker は要所で呼んで stale 検出する。
+    #[inline]
+    pub fn is_chain_rebuild_stale(&self, my_gen: u64) -> bool {
+        self.current_chain_rebuild_gen() != my_gen
     }
 
     pub fn set_main_hwnd(&self, hwnd: u64) {

@@ -164,9 +164,17 @@ fn run_vst3_startup_load(
     bridge: std::sync::Arc<crate::video::dsp::DspBridge>,
     plugins: Vec<crate::settings::Vst3PluginEntry>,
     progress: Arc<Mutex<String>>,
+    my_gen: u64,
 ) {
     if let Ok(mut p) = progress.lock() {
         *p = "VST3 プラグインを初期化中…".to_string();
+    }
+    // T21 (Codex R-VST-001): 後続の chain rebuild が来たら諦める。
+    if bridge.is_chain_rebuild_stale(my_gen) {
+        crate::logger::log(format!(
+            "[VST3 startup] gen={my_gen} stale before enable, skipping"
+        ));
+        return;
     }
     if let Err(e) = bridge.enable() {
         crate::logger::log(format!("vst3 startup enable failed: {e}"));
@@ -178,6 +186,14 @@ fn run_vst3_startup_load(
     let sample_rate = crate::video::audio::default_output_sample_rate().unwrap_or(48_000);
     let total = plugins.len();
     for (idx, entry) in plugins.into_iter().enumerate() {
+        if bridge.is_chain_rebuild_stale(my_gen) {
+            crate::logger::log(format!(
+                "[VST3 startup] gen={my_gen} stale at plugin {}/{}, dropping remaining",
+                idx + 1,
+                total
+            ));
+            return;
+        }
         if let Ok(mut p) = progress.lock() {
             *p = format!("VST3 プラグインを初期化中… ({}/{})", idx + 1, total);
         }
@@ -3907,10 +3923,13 @@ impl App {
         let worker_progress = Arc::clone(&progress);
         let (tx, rx) = mpsc::channel();
         let started_at = std::time::Instant::now();
+        // T21 (Codex R-VST-001): 起動 load と chain rebuild の interleave 防止。
+        // 起動 load も世代を取り、後続 rebuild が来たら諦める。
+        let my_gen = bridge.bump_chain_rebuild_gen();
         let spawn_result = std::thread::Builder::new()
             .name("vst3-startup-load".to_string())
             .spawn(move || {
-                run_vst3_startup_load(bridge, plugins, worker_progress);
+                run_vst3_startup_load(bridge, plugins, worker_progress, my_gen);
                 let _ = tx.send(());
             });
         match spawn_result {

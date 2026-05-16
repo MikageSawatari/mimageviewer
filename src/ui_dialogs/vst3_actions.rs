@@ -248,10 +248,25 @@ impl App {
         let bridge = self.dsp_bridge.clone();
         let plugins = self.settings.vst3_plugins.clone();
         let gui_visible = self.settings.vst3_gui_visible;
+        // T21 (Codex R-VST-001): 連続 rebuild / startup load との interleave 防止。
+        // bump で「私が新主」を宣言し、worker は要所で stale 検出して exit する。
+        let my_gen = bridge.bump_chain_rebuild_gen();
         std::thread::Builder::new()
             .name("vst3-chain-rebuild".into())
             .spawn(move || {
+                if bridge.is_chain_rebuild_stale(my_gen) {
+                    crate::logger::log(format!(
+                        "[VST3 chain-rebuild] gen={my_gen} stale before disable, skipping"
+                    ));
+                    return;
+                }
                 bridge.disable();
+                if bridge.is_chain_rebuild_stale(my_gen) {
+                    crate::logger::log(format!(
+                        "[VST3 chain-rebuild] gen={my_gen} stale after disable, skipping enable"
+                    ));
+                    return;
+                }
                 if let Err(e) = bridge.enable() {
                     crate::logger::log(format!("vst3 chain-rebuild enable: {e}"));
                     return;
@@ -259,6 +274,12 @@ impl App {
                 let sample_rate =
                     crate::video::audio::default_output_sample_rate().unwrap_or(48_000);
                 for entry in plugins {
+                    if bridge.is_chain_rebuild_stale(my_gen) {
+                        crate::logger::log(format!(
+                            "[VST3 chain-rebuild] gen={my_gen} stale mid-chain, dropping remaining add_plugin"
+                        ));
+                        return;
+                    }
                     if let Err(e) = bridge.add_plugin(
                         &entry.path,
                         sample_rate,
@@ -274,6 +295,12 @@ impl App {
                             entry.path
                         ));
                     }
+                }
+                if bridge.is_chain_rebuild_stale(my_gen) {
+                    crate::logger::log(format!(
+                        "[VST3 chain-rebuild] gen={my_gen} stale before gui show, skipping"
+                    ));
+                    return;
                 }
                 if gui_visible {
                     bridge.set_all_guis_visible(true);
