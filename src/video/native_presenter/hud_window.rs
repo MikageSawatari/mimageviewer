@@ -202,6 +202,25 @@ impl HudOverlayWindow {
                     //     (= HWND が無効なので `GetWindowLongPtrW` も使えない)。
                     // 安全側に倒して **state_ptr を leak** する。`CreateWindowExW` の
                     // 失敗は通常レアなのでメモリリークは許容範囲。
+                    //
+                    // T32 (Codex P2 / 2026-05-16): リトライ累積を検知できるように
+                    // プロセス全体のリーク回数を atomic で記録する。ログ初回 + 10/100/1000
+                    // 件単位で警告を吐く。「リーク許容」の前提が破綻していたら検出する。
+                    static LEAK_COUNT: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(0);
+                    let prev = LEAK_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let total = prev + 1;
+                    if total == 1
+                        || total == 10
+                        || total == 100
+                        || total == 1000
+                        || total % 1000 == 0
+                    {
+                        crate::logger::log(format!(
+                            "[HUD WindowState leak] CreateWindowExW failed; leaked {total} WindowState box(es) total ({} bytes/box) — error: {err:?}",
+                            std::mem::size_of::<WindowState>(),
+                        ));
+                    }
                     let _ = state_ptr;
                     return Err(format!("CreateWindowExW HUD: {err:?}"));
                 }

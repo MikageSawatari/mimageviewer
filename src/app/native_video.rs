@@ -1350,6 +1350,12 @@ impl App {
             crate::video::NativeVideoOutputEvent::RequestSeekThumbnail { target_secs } => {
                 self.handle_native_video_request_seek_thumbnail(fs_idx, target_secs);
             }
+            crate::video::NativeVideoOutputEvent::ClearSeekThumbnail => {
+                // T35: hover が外れた。pump_native_hover_thumbnail の永久リトライを止める
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    player.clear_native_hover_thumbnail();
+                }
+            }
             crate::video::NativeVideoOutputEvent::ToggleTileMode => {
                 let screen = self.video_tile_layout_size(fs_idx, ctx);
                 self.toggle_video_tile_mode(fs_idx, screen);
@@ -4049,6 +4055,13 @@ impl App {
                 load_seq: self.input_seq,
             },
         );
+
+        // T36 (Codex R-VNORM-001): 通常 open 経路は `app.rs::open_fullscreen → ...` が
+        // `init_normalize_state_for_opened_video(target_idx)` を呼ぶが、fast-swap で
+        // `fs_cache` に直接 insert した場合 `open_fullscreen` 内の cache-hit 分岐で
+        // この初期化がスキップされ、ノーマライズ DB lookup + UI 状態セットが走らない。
+        // ここで明示的に init を呼ぶ ことで Settings ON+DB hit 時に gain も即適用される。
+        self.init_normalize_state_for_opened_video(target_idx);
 
         self.open_fullscreen(target_idx);
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {

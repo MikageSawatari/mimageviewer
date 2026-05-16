@@ -863,6 +863,9 @@ pub enum NativeOverlayCommand {
     RequestSeekThumbnail {
         target_secs: f64,
     },
+    /// hover が外れて seek thumbnail 要求がもう不要 (T35)。
+    /// Player 側で `clear_native_hover_thumbnail` を呼んで pump の永久リトライを止める。
+    ClearSeekThumbnail,
     ToggleTileMode,
     TogglePerfOverlay,
     ToggleVst3Gui,
@@ -6016,6 +6019,13 @@ impl NativeEguiOverlay {
         self.last_seek_target_secs = last_seek_target_secs;
         self.last_thumbnail_request_secs = last_thumbnail_request_secs;
         self.last_thumbnail_request_at = last_thumbnail_request_at;
+        // T35: hover_preview_target_secs が Some → None に遷移したら clear イベントを
+        // 送って player 側の pump_native_hover_thumbnail 永久リトライを止める
+        let had_hover = self.hover_preview_target_secs.is_some();
+        let has_hover = hover_preview_target_secs.is_some();
+        if had_hover && !has_hover {
+            commands.push(NativeOverlayCommand::ClearSeekThumbnail);
+        }
         self.hover_preview_target_secs = hover_preview_target_secs;
         self.last_drawn_preview_rect = last_drawn_preview_rect;
         self.last_drawn_vst3_panel_rect = last_drawn_vst3_panel_rect;

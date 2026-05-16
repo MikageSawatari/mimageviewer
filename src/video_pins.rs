@@ -10,9 +10,17 @@
 //! CREATE TABLE IF NOT EXISTS video_pins (
 //!     path        TEXT PRIMARY KEY,        -- 動画ファイルの正規化パス
 //!     pin_pts_secs REAL NOT NULL,          -- ピン位置 (秒)
-//!     thumb_webp  BLOB                     -- 抽出済フレーム (WebP、表示用)
+//!     thumb_webp  BLOB,                    -- 抽出済フレーム (WebP、表示用)
+//!     thumb_pts_secs REAL                  -- 上記 WebP が抽出された pts (T37、`pin_pts_secs`
+//!                                          --   と異なれば pending)
 //! );
 //! ```
+//!
+//! `thumb_pts_secs` は v0.9.0 で導入 (T37 / Codex R-VPIN-001)。`set_pin` で空 WebP が
+//! 渡されたとき、旧 `thumb_webp` を保持しつつ NULL に落として「ピン位置と画像が不一致」
+//! を機械可読化する。`pending_pin_thumb_refresh` (= `app/native_video.rs`) が thumb worker
+//! 完了で `set_pin_thumb` を呼ぶと両者が一致する状態に戻る。リリース前のスキーマ追加
+//! (= データ移行は不要)。
 //!
 //! # 状態 (Phase 5.3 時点)
 //!
@@ -33,6 +41,22 @@ pub struct VideoPin {
     pub pin_pts_secs: f64,
     /// 抽出済みの WebP バイト列 (グリッドサムネにそのまま decode して使う)。
     pub thumb_webp: Vec<u8>,
+    /// `thumb_webp` が抽出された pts (T37 / Codex R-VPIN-001)。
+    /// - `Some(x)`: WebP は pts=x の frame から抽出済。`x == pin_pts_secs` なら整合。
+    /// - `None`: WebP の所属 pts 不明 (= 旧スキーマ行、または set_pin で webp 未指定の
+    ///   pending 状態)。consumer 側は「整合性不明 / pending」として扱う。
+    pub thumb_pts_secs: Option<f64>,
+}
+
+impl VideoPin {
+    /// `thumb_webp` が `pin_pts_secs` と整合しているか。
+    /// `false` の場合は thumb worker が新サムネを抽出中の pending 状態
+    /// (= 古い画像を仮表示中、近く更新される)。grid 側はこれで「読み込み中」表示を分岐できる。
+    #[allow(dead_code)]
+    pub fn thumb_is_current(&self) -> bool {
+        self.thumb_pts_secs
+            .is_some_and(|t| (t - self.pin_pts_secs).abs() < 1e-3)
+    }
 }
 
 /// 動画ピン DB ハンドル。Phase 5.3 時点ではスキーマだけ用意し、API は no-op。
@@ -53,9 +77,14 @@ impl VideoPinDb {
             "CREATE TABLE IF NOT EXISTS video_pins (
                 path TEXT PRIMARY KEY,
                 pin_pts_secs REAL NOT NULL,
-                thumb_webp BLOB
+                thumb_webp BLOB,
+                thumb_pts_secs REAL
             )",
         )?;
+        // T37: v0.9.0 リリース前の dev 環境 (= 上記 CREATE TABLE が `thumb_pts_secs`
+        // 無しで先に作られた行があるかもしれない) に備えて `ALTER TABLE ADD COLUMN`
+        // も冪等に流す。失敗 (= 既に存在) は無視。リリース後は CREATE 一発で済む。
+        let _ = conn.execute("ALTER TABLE video_pins ADD COLUMN thumb_pts_secs REAL", []);
         Ok(Self { conn })
     }
 
@@ -83,14 +112,18 @@ impl VideoPinDb {
         let key = crate::path_key::normalize_keep_drive(video_path);
         let mut stmt = self
             .conn
-            .prepare_cached("SELECT pin_pts_secs, thumb_webp FROM video_pins WHERE path = ?1")
+            .prepare_cached(
+                "SELECT pin_pts_secs, thumb_webp, thumb_pts_secs FROM video_pins WHERE path = ?1",
+            )
             .ok()?;
         stmt.query_row([&key], |row| {
             let pin_pts_secs: f64 = row.get(0)?;
             let thumb_webp: Vec<u8> = row.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default();
+            let thumb_pts_secs: Option<f64> = row.get::<_, Option<f64>>(2)?;
             Ok(VideoPin {
                 pin_pts_secs,
                 thumb_webp,
+                thumb_pts_secs,
             })
         })
         .ok()
@@ -119,16 +152,31 @@ impl VideoPinDb {
         } else {
             Some(thumb_webp)
         };
+        // T37: WebP が新しく渡ってきた場合だけ thumb_pts_secs を pin_pts_secs と
+        // 同期させる。空 WebP (= 旧サムネ温存) では thumb_pts_secs を NULL に落として
+        // 「画像が新 pin_pts と不一致 (pending)」を機械可読化する。pending_pin_thumb_refresh
+        // が後で完了 WebP を持って set_pin を呼べば再び整合状態へ戻る。
+        let thumb_pts_for_set: Option<f64> = if blob.is_some() {
+            Some(pin_pts_secs)
+        } else {
+            None
+        };
         self.conn.execute(
-            "INSERT INTO video_pins (path, pin_pts_secs, thumb_webp) VALUES (?1, ?2, ?3)
+            "INSERT INTO video_pins (path, pin_pts_secs, thumb_webp, thumb_pts_secs)
+             VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(path) DO UPDATE SET
                 pin_pts_secs = excluded.pin_pts_secs,
                 thumb_webp = CASE
                     WHEN excluded.thumb_webp IS NOT NULL AND length(excluded.thumb_webp) > 0
                         THEN excluded.thumb_webp
                     ELSE video_pins.thumb_webp
+                END,
+                thumb_pts_secs = CASE
+                    WHEN excluded.thumb_webp IS NOT NULL AND length(excluded.thumb_webp) > 0
+                        THEN excluded.thumb_pts_secs
+                    ELSE NULL
                 END",
-            rusqlite::params![key, pin_pts_secs, blob],
+            rusqlite::params![key, pin_pts_secs, blob, thumb_pts_for_set],
         )?;
         Ok(())
     }
@@ -155,7 +203,8 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS video_pins (
                 path TEXT PRIMARY KEY,
                 pin_pts_secs REAL NOT NULL,
-                thumb_webp BLOB
+                thumb_webp BLOB,
+                thumb_pts_secs REAL
             )",
         )
         .expect("schema");
@@ -236,5 +285,51 @@ mod tests {
             .unwrap();
         // 大文字小文字違い + スラッシュ違いでも同じレコードにヒットすること
         assert!(db.lookup(Path::new("c:/videos/a.mp4")).is_some());
+    }
+
+    /// T37: 新規 path で WebP 付きピン → thumb_pts_secs が pin_pts_secs と同じ値で記録される。
+    #[test]
+    fn t37_new_pin_with_webp_records_thumb_pts() {
+        let db = open_in_memory();
+        let p = Path::new("C:/v.mp4");
+        db.set_pin(p, 12.5, &[1, 2, 3]).unwrap();
+        let got = db.lookup(p).expect("present");
+        assert_eq!(got.thumb_pts_secs, Some(12.5));
+        assert!(got.thumb_is_current());
+    }
+
+    /// T37: 空 WebP で pts のみ更新したケース → thumb_pts_secs が NULL に落ち、
+    /// thumb_is_current() が false (= pending) を返す。
+    #[test]
+    fn t37_empty_webp_clears_thumb_pts() {
+        let db = open_in_memory();
+        let p = Path::new("C:/v.mp4");
+        db.set_pin(p, 1.0, &[1, 2, 3]).unwrap();
+        // 新位置にピン留めしたがサムネがまだ準備中
+        db.set_pin(p, 5.0, &[]).unwrap();
+        let got = db.lookup(p).expect("present");
+        assert!((got.pin_pts_secs - 5.0).abs() < 1e-9);
+        // 旧 WebP は温存
+        assert_eq!(got.thumb_webp, vec![1, 2, 3]);
+        // thumb_pts_secs は NULL (= pending) → thumb_is_current は false
+        assert_eq!(got.thumb_pts_secs, None);
+        assert!(!got.thumb_is_current());
+    }
+
+    /// T37: pending 状態の後、worker が新 WebP を持ってきたら整合状態に戻る。
+    #[test]
+    fn t37_pending_resolves_when_webp_lands() {
+        let db = open_in_memory();
+        let p = Path::new("C:/v.mp4");
+        db.set_pin(p, 1.0, &[0xAA]).unwrap();
+        db.set_pin(p, 5.0, &[]).unwrap();
+        // pending 中
+        assert!(!db.lookup(p).unwrap().thumb_is_current());
+        // worker 完了で新 WebP 入る
+        db.set_pin(p, 5.0, &[0xBB]).unwrap();
+        let got = db.lookup(p).unwrap();
+        assert_eq!(got.thumb_pts_secs, Some(5.0));
+        assert_eq!(got.thumb_webp, vec![0xBB]);
+        assert!(got.thumb_is_current());
     }
 }

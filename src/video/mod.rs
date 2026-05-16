@@ -265,6 +265,8 @@ pub enum NativeVideoOutputEvent {
     RequestSeekThumbnail {
         target_secs: f64,
     },
+    /// hover が外れて hover thumbnail 要求がもう不要 (T35)。
+    ClearSeekThumbnail,
     ToggleTileMode,
     TogglePerfOverlay,
     ToggleVst3Gui,
@@ -1202,6 +1204,7 @@ fn send_native_overlay_command(
         Command::RequestSeekThumbnail { target_secs } => {
             NativeVideoOutputEvent::RequestSeekThumbnail { target_secs }
         }
+        Command::ClearSeekThumbnail => NativeVideoOutputEvent::ClearSeekThumbnail,
         Command::ToggleTileMode => NativeVideoOutputEvent::ToggleTileMode,
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
         Command::ToggleVst3Gui => NativeVideoOutputEvent::ToggleVst3Gui,
@@ -1970,6 +1973,14 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::RequestSeekThumbnail { target_secs },
+                                );
+                            }
+                            // T35: hover が外れた合図を player に伝える
+                            crate::video::native_presenter::NativeOverlayCommand::ClearSeekThumbnail => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ClearSeekThumbnail,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ToggleTileMode => {
@@ -3238,6 +3249,12 @@ impl VideoPlayer {
         } else {
             return;
         };
+        // T35 (Codex R-VTT-005): hover request は seek bar の右端で
+        // `duration * frac` を渡すことが多く、container duration ぴったりだと
+        // 最終 video frame の PTS を超えてサムネ抽出が EOF まで走る。
+        // `clamp_seek_target` で同じ `duration - 0.1` クランプを適用してから渡す
+        // (= 再生 seek と同じ可達領域に正規化)。
+        let target_secs = self.clamp_seek_target(target_secs);
         self.request_seek_thumbnail(target_secs);
         if let Ok(mut target) = self.native_hover_thumbnail_target_secs.lock() {
             let old_bucket = target.map(crate::video::thumbnail::bucket_key);
@@ -3248,6 +3265,22 @@ impl VideoPlayer {
                 *sent = None;
             }
             *target = Some(target_secs);
+        }
+    }
+
+    /// HUD hover が外れたときに hover thumbnail 要求を明示的にクリアする (T35)。
+    /// クリアしないと `pump_native_hover_thumbnail` が「最後の target_secs」を保持し、
+    /// 後続フレームでサムネ抽出を再要求し続けてしまう (= 永久リトライ)。
+    #[cfg(windows)]
+    pub fn clear_native_hover_thumbnail(&self) {
+        if let Ok(mut target) = self.native_hover_thumbnail_target_secs.lock() {
+            *target = None;
+        }
+        if let Ok(mut sent) = self.native_hover_thumbnail_sent_key.lock() {
+            *sent = None;
+        }
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_hover_thumbnail(None);
         }
     }
 

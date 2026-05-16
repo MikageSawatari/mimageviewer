@@ -97,7 +97,7 @@ impl TileThumbnailWorker {
         let worker_state = state.clone();
         let worker_cancel = cancel.clone();
         let worker_finished = finished.clone();
-        let thread = std::thread::Builder::new()
+        let thread = match std::thread::Builder::new()
             .name("video-tile-thumbs".into())
             .spawn(move || {
                 run_worker(
@@ -111,8 +111,20 @@ impl TileThumbnailWorker {
                     video_mtime,
                 );
                 worker_finished.store(true, Ordering::Release);
-            })
-            .ok();
+            }) {
+            Ok(handle) => Some(handle),
+            Err(e) => {
+                // T33 (Codex R-VTT-001): spawn 失敗時に finished=false のままだと
+                // tile overlay が unfinished 状態のまま 80ms ごとに repaint を要求し続ける
+                // (= 永久再描画ループ)。finished=true でループを終わらせ、ログで原因を残す。
+                // state は空のまま (= 全 slot None) で「タイル無し」表示になる。
+                crate::logger::log(format!(
+                    "[tile thumbnails] worker spawn failed: {e} — overlay will stay empty"
+                ));
+                finished.store(true, Ordering::Release);
+                None
+            }
+        };
 
         Self {
             state,
