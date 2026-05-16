@@ -1,7 +1,15 @@
 [target.x86_64-pc-windows-msvc]
+# rust-lld (toolchain 同梱の LLD) を MSVC link.exe の代わりに使う。
+# 本体 release rebuild が link.exe ベースで 79s → rust-lld + Cargo.toml の
+# `incremental = true` の合計効果で 41s に短縮 (-48%)。
+# 戻す場合はこの行をコメントアウトすれば link.exe に戻る。詳細経緯はコミットログ参照。
+linker = "rust-lld.exe"
 rustflags = ["-C", "target-feature=+crt-static"]
 
 [target.i686-pc-windows-msvc]
+# Susie 32bit ワーカー用。x86_64 側と同じく rust-lld を使う。
+# 32bit MSVC + crt-static でも問題なくリンクできることを確認済み。
+linker = "rust-lld.exe"
 rustflags = ["-C", "target-feature=+crt-static"]
 
 # ffmpeg-the-third (ffmpeg-sys-the-third) が FFmpeg のヘッダ・import library を見つける

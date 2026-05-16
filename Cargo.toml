@@ -155,6 +155,12 @@ opt-level = 3
 lto = "thin"
 codegen-units = 16
 strip = true
+# 差分ビルド (本体 1 ファイル変更後の rebuild) を高速化する。
+# 初回 / clean ビルドは変わらないが、2 回目以降は LLVM codegen の差分実行が効いて
+# 大幅短縮 (実測: 本体 79s → 41s、rust-lld 切替との合計効果)。
+# target/release/incremental/ に追加キャッシュを作るので target/ サイズが数 GB 増える。
+# 配布バイナリの実行時性能差はほぼ無し (Cargo book でも release-incremental は許容範囲とされる)。
+incremental = true
 
 # クラッシュ解析専用: release ビルドだが Rust シンボル + line table を残す版。
 # 本番 release は触らず、WER ダンプから Rust 関数名 / ソース行を取りたいときだけ使う。
