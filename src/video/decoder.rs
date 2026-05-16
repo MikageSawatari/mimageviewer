@@ -1392,6 +1392,9 @@ pub struct VideoInfo {
     /// Compact debug summary of the decoder's D3D11VA-capable HW configs.
     pub d3d11va_config: String,
     pub audio_codec: Option<String>,
+    /// 音声ストリーム単体の平均ビットレート (bps)。`AVCodecParameters::bit_rate` を流す。
+    /// 0 のときは未知 (Opus / FLAC や VBR 設定でコンテナに記録されていないケース)。
+    pub audio_bit_rate_bps: i64,
     pub has_audio: bool,
     /// HW デコードが実際に有効化されたか (sw / hw_d3d11va)。
     pub hw_decode_active: bool,
@@ -1906,6 +1909,8 @@ fn run_decoder(
             let idx = audio_stream.index();
             let tb = audio_stream.time_base();
             let params = audio_stream.parameters();
+            // params は `from_parameters` で消費されるので、ビットレートはここで先に取る。
+            let audio_bit_rate_bps = params.bit_rate();
             // 2026-05-12 crash 解析: audio decoder open 前後のネイティブ FFmpeg 呼出 (codec
             // ctx alloc / avcodec_open2) で 0xc0000409 が出る可能性もあるので、各ステップを
             // log で挟む。次回 crash 時の末尾切れ位置で犯人を絞り込む。
@@ -1989,6 +1994,7 @@ fn run_decoder(
                                     decoder: dec,
                                     resampler: rs,
                                     codec_name: audio_codec_name,
+                                    bit_rate_bps: audio_bit_rate_bps,
                                 }),
                                 Err(e) => {
                                     crate::logger::log(format!(
@@ -2097,6 +2103,7 @@ fn run_decoder(
         d3d11va_supported: hw_probe.d3d11va_supported,
         d3d11va_config: hw_probe.d3d11va_config.clone(),
         audio_codec: audio_setup.as_ref().map(|a| a.codec_name.clone()),
+        audio_bit_rate_bps: audio_setup.as_ref().map(|a| a.bit_rate_bps).unwrap_or(0),
         has_audio,
         hw_decode_active: hw_active_initially,
         gpu_path_active,
@@ -5583,6 +5590,7 @@ struct AudioSetup {
     decoder: ffmpeg_the_third::decoder::Audio,
     resampler: ffmpeg_the_third::software::resampling::Context,
     codec_name: String,
+    bit_rate_bps: i64,
 }
 
 /// `av_hwdevice_ctx_create` で確保した AVBufferRef を保持し、Drop で `av_buffer_unref`

@@ -2506,6 +2506,7 @@ impl App {
                 video_codec: info.video_codec.clone(),
                 video_decoder: info.video_decoder.clone(),
                 audio_codec: info.audio_codec.clone(),
+                audio_bit_rate_bps: info.audio_bit_rate_bps,
                 avg_fps: info.avg_fps,
                 bit_rate_bps: info.bit_rate_bps,
                 chapter_count: info.chapters.len(),

@@ -607,6 +607,8 @@ pub struct NativeOverlayMetadata {
     pub video_codec: String,
     pub video_decoder: String,
     pub audio_codec: Option<String>,
+    /// 音声ストリーム単体の平均ビットレート (bps)。0 のときは未知。
+    pub audio_bit_rate_bps: i64,
     pub avg_fps: f64,
     pub bit_rate_bps: i64,
     pub chapter_count: usize,

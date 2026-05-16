@@ -2314,6 +2314,17 @@ pub(super) fn draw_native_metadata_panel(
                 metadata.deinterlace_status,
                 metadata.interlace_detected,
             );
+            let audio_label = match metadata.audio_codec.as_deref() {
+                Some(codec) if metadata.audio_bit_rate_bps > 0 => {
+                    format!(
+                        "{} ({})",
+                        codec,
+                        format_bitrate(metadata.audio_bit_rate_bps)
+                    )
+                }
+                Some(codec) => codec.to_string(),
+                None => "なし".to_string(),
+            };
             let mut rows = vec![
                 ("ファイル", metadata.file_name.clone()),
                 ("タイトル", title.to_string()),
@@ -2323,25 +2334,12 @@ pub(super) fn draw_native_metadata_panel(
                     metadata.original_url.clone().unwrap_or_default(),
                 ),
                 ("説明", metadata.description.clone().unwrap_or_default()),
-                (
-                    "動画",
-                    format!(
-                        "{}x{}  {}  {}",
-                        metadata.width,
-                        metadata.height,
-                        format_fps(metadata.avg_fps),
-                        metadata.video_codec
-                    ),
-                ),
+                ("解像度", format!("{}x{}", metadata.width, metadata.height)),
+                ("フレームレート", format_fps(metadata.avg_fps)),
+                ("コーデック", metadata.video_codec.clone()),
                 ("デコーダ", metadata.video_decoder.clone()),
-                (
-                    "音声",
-                    metadata
-                        .audio_codec
-                        .clone()
-                        .unwrap_or_else(|| "なし".to_string()),
-                ),
-                ("ビットレート", format_bitrate(metadata.bit_rate_bps)),
+                ("音声", audio_label),
+                ("総ビットレート", format_bitrate(metadata.bit_rate_bps)),
                 ("長さ", format_overlay_time(metadata.duration_secs)),
                 ("チャプター", metadata.chapter_count.to_string()),
                 ("GPU経路", gpu_path_kind.to_string()),
