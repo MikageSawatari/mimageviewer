@@ -6903,7 +6903,7 @@ impl App {
     }
 
     /// アドレスバー 📌 ボタンの左クリック (toggle) / P キーショートカットのハンドラ。
-    /// 選択中アイテムが現在の pin と一致 → 解除、不一致 → set。
+    /// 指定アイテムが現在の pin と一致 → 解除、不一致 → set。
     ///
     /// **silent no-op 条件** (`compute_folder_pin_button_state` で UI を隠す条件と整合):
     /// - `current_folder` 無し / 検索合成パス
@@ -6917,7 +6917,7 @@ impl App {
     /// 通知を出して set 自体を拒否する。これをやらないと、worker が auto-pick fallback で
     /// 親フォルダ自身の代表画を pinned_key 下に保存してしまい、ユーザーから見ると
     /// 「動画 pin したのにサムネが変わらない」状態になる (= 効果が無い pin)。
-    pub(crate) fn toggle_folder_pin_from_selection(&mut self) {
+    pub(crate) fn toggle_folder_pin_for_idx(&mut self, idx: usize) {
         let Some(container) = self.current_folder.clone() else {
             return;
         };
@@ -6930,7 +6930,7 @@ impl App {
         if self.archive_source_override.is_some() {
             return;
         }
-        let Some(item) = self.selected.and_then(|i| self.items.get(i)).cloned() else {
+        let Some(item) = self.items.get(idx).cloned() else {
             return;
         };
         let Some(source) = crate::folder_thumb_pins::source_from_grid_item(&container, &item)
@@ -6944,6 +6944,14 @@ impl App {
             return;
         }
         self.try_set_folder_thumb_pin_with_video_guard(&container, source);
+    }
+
+    /// アドレスバー 📌 ボタンの左クリック (toggle) / グリッド P キーショートカットのハンドラ。
+    pub(crate) fn toggle_folder_pin_from_selection(&mut self) {
+        let Some(idx) = self.selected else {
+            return;
+        };
+        self.toggle_folder_pin_for_idx(idx);
     }
 
     /// `set_folder_thumb_pin` の薄いラッパで、**動画 source の場合は video_pins DB に
@@ -16713,12 +16721,12 @@ impl eframe::App for App {
             }
         }
 
-        // ── P: 代表サムネ固定トグル (グリッドモード限定) ───────────────
+        // ── P: 代表サムネ固定トグル (グリッドモード) ───────────────
         // アドレスバー 📌 ボタン左クリックと同等。pin 不能アイテム / 検索アグリゲート /
         // 変換キャッシュ drill-down / 空フォルダ等は `toggle_folder_pin_from_selection`
         // 内のガードで silent no-op になる。
-        // フルスクリーン中は P がポストフィルタサイクルと衝突するので fullscreen_idx
-        // が None のときだけ反応する。各種テキスト入力フィールドにフォーカス中も無効。
+        // フルスクリーン中の P は fullscreen key handler 側で現在表示中アイテムの
+        // 代表サムネ固定として処理する。ここではグリッド表示中だけ反応する。
         if !self.address_has_focus
             && !self.search_has_focus
             && !self.favsearch.has_focus
@@ -16727,7 +16735,7 @@ impl eframe::App for App {
             && !self.any_dialog_open()
         {
             let pressed_p = ctx.input_mut(|i| {
-                // Plain P only (no modifier)。Shift+P / Alt+P / Ctrl+P は他用途に
+                // Plain P only (no modifier)。修飾キー付き P は他用途に
                 // 開放しておく (現状未割当だが将来予約)。
                 !i.modifiers.shift
                     && !i.modifiers.alt

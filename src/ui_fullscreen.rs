@@ -210,6 +210,7 @@ fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
             | egui::Key::K
             | egui::Key::B
             | egui::Key::P
+            | egui::Key::T
             | egui::Key::I
             | egui::Key::Z
             | egui::Key::R
@@ -2536,6 +2537,17 @@ impl App {
         let key_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::E));
         // B: 透過画像の背景サイクル。消しゴムモードでは ui_erase が B (筆ツール) を既に消費している。
         let key_b_bg = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B));
+        // P: 現在表示中アイテムを親コンテナの代表サムネに固定 / 解除。
+        // 動画フルスクリーンの P は handle_video_input が先に「現在フレームをピン留め」として
+        // consume するため、ここでは静止画系アイテムだけを対象にする。
+        let current_item_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+        let key_p_pin = !current_item_is_video
+            && ctx.input_mut(|i| {
+                !i.modifiers.shift
+                    && !i.modifiers.alt
+                    && !i.modifiers.ctrl
+                    && i.consume_key(egui::Modifiers::NONE, egui::Key::P)
+            });
 
         // Shift+F1-F5: 開いている画像が属するコンテナ (フォルダ / ZIP / PDF) に
         // レーティング / Shift+F6: コンテナレーティング解除。
@@ -2572,6 +2584,9 @@ impl App {
                 self.show_feedback_toast(format!("[{}]", "★".repeat(stars as usize)));
             }
         }
+        if key_p_pin {
+            self.toggle_folder_pin_for_idx(fs_idx);
+        }
 
         // F7/F8: マスクスロット 1/2 をフルスクリーン表示のまま現ページに適用
         // (消しゴムモードに入らず、1 キーで inpaint までを一気に実行)
@@ -2605,12 +2620,13 @@ impl App {
         let key_u = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::U));
         // N キー: AI デノイズサイクル
         let key_n = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::N));
-        // P / Shift+P / Alt+P: ポストフィルタ (レトロ系) サイクル (次 / 前 / なしリセット)
-        // Ctrl+F はグリッドで検索に使っているため避けて Alt 修飾を採用。
-        // 同様に Alt+P → Shift+P → P の順で consume (matches_logically 対策)。
-        let key_p_alt = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::P));
-        let key_p_shift = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::P));
-        let key_p = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
+        // T / Shift+T / Alt+T: ポストフィルタ (レトロ系) サイクル (次 / 前 / なしリセット)
+        // P はグリッド / 動画フルスクリーンのピン留めに統一する。F は動画の FPS/Perf 表示に
+        // 使っているため、ポストフィルタは T (Tone / posT filter) に割り当てる。
+        // 同様に Alt+T → Shift+T → T の順で consume (matches_logically 対策)。
+        let key_t_alt = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::T));
+        let key_t_shift = ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::T));
+        let key_t = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::T));
 
         // Ctrl+数字キー: 保存スロットからロード
         // (Shift+数字はキー配列によって記号化され egui::Key::Num1 等にマッチしないため CTRL を採用)
@@ -2746,9 +2762,9 @@ impl App {
             });
         }
 
-        // P / Shift+P / Alt+P: ポストフィルタの次/前/なしへ切替。
+        // T / Shift+T / Alt+T: ポストフィルタの次/前/なしへ切替。
         // AI 再実行は発生させないため色調キャッシュのみクリア。
-        if key_p || key_p_shift || key_p_alt {
+        if key_t || key_t_shift || key_t_alt {
             let scope = self.resolve_adjust_scope(fs_idx);
             let mut params = self.effective_params(fs_idx).clone();
             let all = crate::adjustment::PostFilter::ALL;
@@ -2756,16 +2772,16 @@ impl App {
                 .iter()
                 .position(|f| *f == params.post_filter)
                 .unwrap_or(0);
-            let next_idx = if key_p_alt {
+            let next_idx = if key_t_alt {
                 0
-            } else if key_p_shift {
+            } else if key_t_shift {
                 (cur + all.len() - 1) % all.len()
             } else {
                 (cur + 1) % all.len()
             };
             let next = all[next_idx];
             params.post_filter = next;
-            self.show_feedback_toast(format!("[P: {} / {}]", scope.label(), next.display_label()));
+            self.show_feedback_toast(format!("[T: {} / {}]", scope.label(), next.display_label()));
             self.capture_adjust_full(
                 format!("ポストフィルタ: {}", next.display_label()),
                 |app| {
@@ -5586,7 +5602,7 @@ impl App {
         let perf_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F));
         // P キーで現在再生位置をピン留め (動画モード限定)。グリッドモードの P
         // (folder_thumb_pin toggle) と統一した「P = Pin」の mnemonic。画像モードの
-        // P (post-filter cycle) とは handle_video_input 先行 consume で分離する。
+        // ポストフィルタは T に移動済み。
         let pin_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
         // W キー: 頭出し (= seek to 0 + play)。左手で押しやすく、画像モードでも未使用。
         let rewind_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W));

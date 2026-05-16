@@ -380,7 +380,7 @@ fn draw_sliders(
     // ── ポストフィルタ (レトロ系 + 写真系エフェクト) ──
     ui.add_space(12.0);
     ui.label(
-        egui::RichText::new("ポストフィルタ [P: 次 / Shift+P: 前 / Alt+P: リセット]")
+        egui::RichText::new("ポストフィルタ [T: 次 / Shift+T: 前 / Alt+T: リセット]")
             .size(SECTION_FONT)
             .color(LABEL_COLOR),
     );

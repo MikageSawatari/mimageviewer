@@ -17,7 +17,7 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | <kbd>Ctrl</kbd>+<kbd>↓</kbd> | 次のフォルダへ (DFS pre-order) |
 | <kbd>F1</kbd>〜<kbd>F5</kbd> | レーティング 1〜5 |
 | <kbd>F6</kbd> | レーティング解除 |
-| <kbd>P</kbd> | 選択中アイテムを現在のコンテナの代表サムネに固定 / 解除 (toggle、アドレスバー 📌 の左クリックと同等)。pin 不能アイテム / 検索アグリゲート / 変換キャッシュ drill-down では silent no-op。**フルスクリーンでは P はポストフィルタサイクルなのでモードで衝突しない** |
+| <kbd>P</kbd> | 選択中アイテムを現在のコンテナの代表サムネに固定 / 解除 (toggle、アドレスバー 📌 の左クリックと同等)。pin 不能アイテム / 検索アグリゲート / 変換キャッシュ drill-down では silent no-op。**動画フルスクリーンの P と合わせて P = Pin に統一** |
 
 ## フルスクリーン共通 (画像 / 動画とも)
 
@@ -44,7 +44,9 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | <kbd>Shift</kbd> (押しっぱ) | ルーペ |
 | <kbd>B</kbd> | 透過背景色サイクル |
 | <kbd>E</kbd> | 消しゴムモード開始 / 確定 |
+| <kbd>P</kbd> | 現在表示中アイテムを現在のコンテナの代表サムネに固定 / 解除 |
 | <kbd>U</kbd> / <kbd>Shift</kbd>+<kbd>U</kbd> / <kbd>Alt</kbd>+<kbd>U</kbd> | AI モデル 次 / 前 / リセット |
+| <kbd>T</kbd> / <kbd>Shift</kbd>+<kbd>T</kbd> / <kbd>Alt</kbd>+<kbd>T</kbd> | ポストフィルタ 次 / 前 / 標準 (リセット) |
 | <kbd>Enter</kbd> | (動画ボタンが映る場合のみ) 外部プレイヤー |
 
 ## 動画 フルスクリーン (Phase 7.H 適用後)

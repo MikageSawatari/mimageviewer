@@ -576,7 +576,7 @@ MI-GAN / diffusion に渡す最終マスクと、オーバーレイ描画に使�
   (= `set_favorite_default` / `clear_favorite_default` / `copy_params_to_global` /
   `clear_page_params` 経由)
 - ホットキー: U / Shift+U / Alt+U (アップスケール循環)、N (デノイズトグル)、
-  P / Shift+P / Alt+P (ポストフィルタ循環)、Q / Ctrl+Backspace (個別解除)
+  T / Shift+T / Alt+T (ポストフィルタ循環)、Q / Ctrl+Backspace (個別解除)
 - 保存スロット適用: Ctrl+1〜9 / Ctrl+0、左パネルのスロットボタン
 
 ### スコープ表現 ([`AdjustUndoScope`](../src/undo_stack.rs))
