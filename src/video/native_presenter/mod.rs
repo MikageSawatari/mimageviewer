@@ -2010,7 +2010,6 @@ impl NativeVideoPresenter {
 
     /// HUD overlay HWND の生 u64 値。HUD HWND が生成されていなければ 0。
     /// `run_native_video_output` が `hud_hwnd_out` に store するための accessor。
-    #[allow(dead_code)]
     pub fn hud_hwnd(&self) -> u64 {
         self.hud_window
             .as_ref()
@@ -2019,22 +2018,20 @@ impl NativeVideoPresenter {
     }
 
     /// HUD overlay HWND を最前面に上げ直す。**allowlist 判定なしの low-level API**。
-    /// 通常は `try_raise_hud_to_top` を使って allowlist 判定を通す (Codex CP7 P1 #1 反映)。
+    /// 通常は `try_raise_hud_to_top` を使って allowlist 判定を通すこと。
     /// このメソッドは内部 (= `try_raise_hud_to_top`) からのみ呼ばれる想定で `pub` にしているが、
     /// 直接呼ぶと VST popup / mIV 設定ダイアログが foreground でも raise してしまうので注意。
-    #[allow(dead_code)]
     pub fn raise_hud_to_top(&self) {
         if let Some(hud) = self.hud_window.as_ref() {
             hud.raise_to_top();
         }
     }
 
-    /// HUD overlay HWND を最前面に上げ直す。**allowlist 判定込み版** (CP7 P1 #1 反映)。
+    /// HUD overlay HWND を最前面に上げ直す。**allowlist 判定込み版**。
     /// `RaiseHudToTop` command / `RequestRaiseHud` event / polling のすべての raise 経路で
     /// これを呼ぶ。`foreground_allows_hud_raise` が false (= VST popup / file dialog /
     /// mIV 設定ダイアログ等が foreground) のとき raise を skip して `false` を返す。
     /// 成功時は `true` を返す。HUD HWND が無いフォールバック経路でも `false`。
-    #[allow(dead_code)]
     pub fn try_raise_hud_to_top(&self, presenter_hwnd: u64) -> bool {
         if self.hud_window.is_none() {
             return false;
@@ -2068,7 +2065,6 @@ impl NativeVideoPresenter {
 
     /// HUD HWND の geometry (= 位置・サイズ) を mirror する。`GeometryChanged` 受信時に
     /// presenter loop から呼ぶ。HUD HWND が無いなら no-op。
-    #[allow(dead_code)]
     pub fn set_hud_geometry(&self, x: i32, y: i32, w: u32, h: u32) {
         if let Some(hud) = self.hud_window.as_ref() {
             hud.set_geometry(x, y, w, h);
@@ -2084,19 +2080,17 @@ impl NativeVideoPresenter {
         self.hud_regions.as_ref().map(std::sync::Arc::clone)
     }
 
-    /// HUD HWND の `SetWindowRgn` を `regions` に合わせて更新する。CP5 で
+    /// HUD HWND の `SetWindowRgn` を `regions` に合わせて更新する。
     /// `NativeEguiOverlay::run` 末尾から `regions` 計算後に呼ばれる。
-    #[allow(dead_code)]
     pub fn apply_hud_regions(&mut self, regions: &[RECT]) {
         if let Some(hud) = self.hud_window.as_mut() {
             hud.apply_regions(regions);
         }
     }
 
-    /// CP8: HUD HWND の `WM_DPICHANGED` を受けて overlay の pixels_per_point を更新する。
+    /// HUD HWND の `WM_DPICHANGED` を受けて overlay の pixels_per_point を更新する。
     /// `dirty = true` 化されるので次フレームの render で region 物理ピクセル換算が新 DPI 基準になる。
     /// 戻り値: 値が変わったかどうか。
-    #[allow(dead_code)]
     pub fn set_overlay_pixels_per_point(&mut self, ppp: f32) -> bool {
         self.egui_overlay
             .as_mut()
@@ -2104,7 +2098,7 @@ impl NativeVideoPresenter {
             .unwrap_or(false)
     }
 
-    /// CP8 (Codex CP8 P2 反映): **overlay (egui_wgpu) の surface だけ** を resize する。
+    /// **overlay (egui_wgpu) の surface だけ** を resize する。
     /// presenter 全体 (= background / video transform / swap chain) は触らない。
     ///
     /// `DpiChanged` 経由で HUD HWND の `suggested_rect` に合わせて overlay surface を
@@ -2114,7 +2108,6 @@ impl NativeVideoPresenter {
     ///
     /// 通常の `resize(width, height)` は presenter 全体を resize するので、
     /// `WM_WINDOWPOSCHANGED` 経由で presenter HWND 自身の geometry が変わったときに使う。
-    #[allow(dead_code)]
     pub fn resize_overlay_surface_only(&mut self, width: u32, height: u32) -> Result<(), String> {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.resize(width, height)?;
@@ -2122,10 +2115,9 @@ impl NativeVideoPresenter {
         Ok(())
     }
 
-    /// CP6: HUD raise 判定で参照する `editor_hwnds` snapshot を登録する。
-    /// CP7 で App が `dsp_bridge.editor_hwnds_snapshot()` を渡してくる。
+    /// HUD raise 判定で参照する `editor_hwnds` snapshot を登録する。
+    /// App が `dsp_bridge.editor_hwnds_snapshot()` を渡してくる。
     /// `None` のとき raise 判定は強制 false (= raise burst を起動しない)。
-    #[allow(dead_code)]
     pub fn set_editor_hwnds_snapshot(
         &mut self,
         snapshot: Option<std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>>,
@@ -2133,29 +2125,27 @@ impl NativeVideoPresenter {
         self.editor_hwnds_snapshot = snapshot;
     }
 
-    /// CP6: `foreground_allows_hud_raise` 判定用の既知 mIV HWND (= main HWND) を登録。
+    /// `foreground_allows_hud_raise` 判定用の既知 mIV HWND (= main HWND) を登録。
     /// presenter HWND と HUD HWND は presenter 自身が知っているので、外部から
-    /// 渡すのは main HWND だけ。CP7 で App が設定する。
-    #[allow(dead_code)]
+    /// 渡すのは main HWND だけ。
     pub fn set_main_hwnd_for_raise_check(&mut self, main_hwnd: u64) {
         self.main_hwnd_for_raise = main_hwnd;
     }
 
-    /// CP6: presenter thread loop から 50ms 周期で呼ばれる cursor polling。
+    /// presenter thread loop から 50ms 周期で呼ばれる cursor polling。
     /// 戻り値: `true` なら呼び出し側で `raise_hud_to_top()` + retry burst を起動すべき。
-    /// HUD HWND が無い (= CP4 フォールバック経路 / CP7 で flip 前) なら何もせず `false`。
+    /// HUD HWND が無い (= フォールバック経路) なら何もせず `false`。
     ///
     /// 役割:
     ///   1. `GetCursorPos` + `ScreenToClient(presenter_hwnd)` で cursor の presenter 座標を取得。
-    ///   2. presenter HWND の client rect 範囲チェック (= 別モニターに移ったケースは弾く、
-    ///      Codex 4 P1/P2 #3): 範囲外なら一度だけ synthetic `MouseLeave` を流して以降何もしない。
+    ///   2. presenter HWND の client rect 範囲チェック (= 別モニターに移ったケースは弾く):
+    ///      範囲外なら一度だけ synthetic `MouseLeave` を流して以降何もしない。
     ///   3. 範囲内: 直近 80ms 以内に HUD/presenter wndproc 経由の本物 `WM_MOUSEMOVE` が
     ///      届いていなければ synthetic `MouseMove` を overlay の `push_native_event` に流す
     ///      (= region 外 cursor でも hover 表示遷移を成立させる)。
     ///   4. cursor が activation zone (= 上端 0..76pt / 下端 H-220..H pt) 内、かつ
     ///      `editor_hwnds_snapshot` から `foreground_allows_hud_raise` が true を返した場合、
     ///      raise を要求する (= 戻り値 true)。判定不能なら false で skip。
-    #[allow(dead_code)]
     pub fn cursor_polling_tick(
         &mut self,
         presenter_hwnd: u64,

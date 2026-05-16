@@ -80,22 +80,19 @@ fn engine_state_code_name(code: u8) -> &'static str {
 pub struct VideoPlayer {
     path: PathBuf,
     clock: Arc<AvClock>,
-    /// Phase 3b で導入された state machine actor。Phase 3c+ で decoder/audio events を
-    /// 流し込み、Phase 3d で AvClock の状態系メソッドを EngineActor 主導に置き換える。
-    /// Phase 3b 時点では `begin_loading()` を呼んだ状態で保持されるが、actor の state
-    /// 遷移は Phase 3c で配線完了後に有効化する (= 現在は AvClock が引き続き source of truth)。
-    #[allow(dead_code)]
+    /// 動画再生の state machine actor。state (Loading / Buffering / Playing / Paused /
+    /// EOF) の source of truth は本 actor。tick で `engine_event_rx` を drain して
+    /// `apply_command` を呼ぶ。再生クロック (current_secs / wall extrapolation) は
+    /// 引き続き `AvClock` 側が持つ。
     engine: Arc<Mutex<EngineActor>>,
-    /// Phase 9.B: EngineActor の `published_state` を Mutex なしで読むための clone。
-    /// perf overlay が warmup 区間 (= state ≠ Playing) を表示するときに使う。
+    /// EngineActor の `published_state` を Mutex なしで読むための clone。perf overlay
+    /// が warmup 区間 (= state ≠ Playing) を表示するときに使う。
     engine_state_atomic: Arc<AtomicU8>,
-    /// Phase 3c で追加。decoder/audio thread から push される events を tick で
-    /// drain して engine に dispatch する。capacity 64 (= burst tolerance、
-    /// drop 不可なので unbounded 寄りの bounded)。
+    /// decoder/audio thread から push される events を tick で drain して engine に
+    /// dispatch する。capacity 64 (= burst tolerance、drop 不可なので unbounded 寄りの bounded)。
     engine_event_rx: crossbeam_channel::Receiver<EngineEvent>,
     /// 同 channel の sender (decoder/audio に clone して渡す)。
-    /// VideoPlayer 自身が `tick` 内で UI thread からも push する経路を持つために保持。
-    #[allow(dead_code)]
+    /// VideoPlayer 自身が `tick` 内で UI thread からも push する経路で保持。
     engine_event_tx: crossbeam_channel::Sender<EngineEvent>,
     /// `InfoReceived` を engine に 1 度だけ流すためのフラグ。tick で info_rx から
     /// info を取り出した直後に発火し、以降は false で抑止する。
@@ -433,6 +430,8 @@ enum NativeVideoOutputCommand {
     SetTileOverlay {
         tile_overlay: Option<native_presenter::NativeOverlayTileOverlay>,
     },
+    // SetNavigationPreview/SwitchSource は `app/` 経由でのみ構築される (= bin 専属の
+    // `app` 経路。lib.rs では `app` が stub のため lib 視点では dead variant)。
     #[allow(dead_code)]
     SetNavigationPreview {
         preview: Option<native_presenter::NativeOverlayNavigationPreview>,
@@ -458,9 +457,6 @@ enum NativeVideoOutputCommand {
     /// `WM_WINDOWPOSCHANGING` などから発火される。presenter thread が pop して
     /// 即時 → 16ms → 64ms の short retry burst で `SetWindowPos(hud, HWND_TOPMOST, ...)`
     /// を呼ぶ (VST IPC が非同期で z-order を動かしても拾えるように)。
-    ///
-    /// CP1-6 までは送る側がないため dead code。CP7 で App から送り始める。
-    #[allow(dead_code)]
     RaiseHudToTop,
     /// native presenter HWND を presenter thread 側で前面・foreground に戻す。
     ///
@@ -549,6 +545,7 @@ pub(crate) struct NativeVideoOutput {
     first_presented: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     perf_overlay_visible: Arc<AtomicBool>,
+    /// app/native_video.rs (bin 専属) からのみ参照されるため lib build では dead に見える。
     #[allow(dead_code)]
     source_epoch: Arc<AtomicU64>,
     last_vst3_available: AtomicBool,
@@ -671,8 +668,8 @@ impl NativeVideoOutput {
     }
 
     /// HUD overlay HWND (= bars / interactive UI 用の独立 top-level)。
-    /// CP4 以降で presenter thread が store する。store されていなければ 0。
-    #[allow(dead_code)]
+    /// presenter thread が `HudOverlayWindow::create` 成功時に store する。
+    /// HUD HWND が生成されていない (フォールバック経路) なら 0。
     pub(crate) fn hud_hwnd(&self) -> u64 {
         self.hud_hwnd.load(Ordering::Acquire)
     }
@@ -975,7 +972,6 @@ impl NativeFullscreenPresentStats {
         self.max_interval_ms = self.max_interval_ms.max(interval_ms);
     }
 
-    #[allow(dead_code)]
     fn record_late_drop(&mut self, pts: f64, late_ms: f64, queue_len: usize) {
         self.late_drop += 1;
         crate::perf::event(
@@ -1108,7 +1104,6 @@ fn native_video_env_flag_enabled(name: &str, default: bool) -> bool {
 /// 値が `0` / `false` / `off` / `no` のとき true、それ以外は false (= 未設定 / その他)。
 /// 「default off で 1/true/on/yes で有効化」する `native_video_env_flag_enabled` と異なり、
 /// 「default on で 0/false/off/no で無効化」する用途に使う。
-#[allow(dead_code)]
 fn native_video_env_flag_disabled(name: &str) -> bool {
     std::env::var(name)
         .map(|v| {
@@ -3908,10 +3903,9 @@ impl VideoPlayer {
     /// CP4 で presenter thread が `HudOverlayWindow::create` 成功時に store する。
     /// store されていなければ 0。
     ///
-    /// CP7 で App から `dsp_bridge.set_hud_hwnd(...)` 経由で bridge にも教える
-    /// 経路で使う (= raise allowlist の「mIV 既知 HWND」判定)。
+    /// `dsp_bridge.set_hud_hwnd(...)` 経由で bridge にも教える経路で使う
+    /// (= raise allowlist の「mIV 既知 HWND」判定)。
     #[cfg(windows)]
-    #[allow(dead_code)]
     pub fn native_hud_hwnd(&self) -> u64 {
         self.native_output
             .as_ref()
@@ -3954,6 +3948,9 @@ impl VideoPlayer {
             .unwrap_or(false)
     }
 
+    // VideoPlayer の native_video 系メソッド群は `app/native_video.rs` (bin 専属) からのみ
+    // 呼ばれるため、lib build (`src/lib.rs` の `app` は constants のみの stub) では
+    // dead に見える。bin (mimageviewer-core) では正常に使用されている。
     #[cfg(windows)]
     #[allow(dead_code)]
     pub(crate) fn native_source_epoch(&self) -> Option<u64> {
@@ -4873,9 +4870,6 @@ impl VideoPlayer {
     /// 防御的に呼ぶ — `closed=true` を Acquire load で観測した時点で、writer の
     /// init_error 書き込み (Release-before) が必ず可視なので、ここで take すれば
     /// tick との二重 race も含めて確実に拾える。冪等。
-    ///
-    /// `app` module は bin 専属で lib からは見えないので、lib 単独 build では
-    /// caller 不在に見える。
     #[cfg(windows)]
     #[allow(dead_code)]
     pub(crate) fn consume_native_init_error(&mut self) {
@@ -4900,10 +4894,6 @@ impl VideoPlayer {
     /// `VideoPlayer::open(..., native_output_config=None)` は fast-swap 経路で
     /// 意図的に呼ばれるシグナルなので open() 内ではエラー扱いしない。実エラー
     /// 判定は呼び出し元の責務。
-    ///
-    /// 呼び出し元 (`src/app.rs:start_fs_load`) は lib crate からは見えない
-    /// (`src/lib.rs` の `app` は stub) ため、lib build では未使用に見える。
-    /// `attach_native_output` と同じ理由で `#[allow(dead_code)]` を付与する。
     #[cfg(windows)]
     #[allow(dead_code)]
     pub(crate) fn fail_native_init(&mut self, message: String) {
