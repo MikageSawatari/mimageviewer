@@ -308,7 +308,7 @@ fn native_video_key_events_from_ctx(
     })
 }
 
-/// 補正ショートカット (U/P/N) のスコープ。どの層を書き換えるかを表す。
+/// 補正ショートカット (U/T/N) のスコープ。どの層を書き換えるかを表す。
 /// 解決 (`App::resolve_adjust_scope`) と書き込み (`App::write_params_for_scope`) は
 /// App 側にメソッドとして実装され、ここには enum 定義とラベルだけ置く。
 #[derive(Clone, Copy)]

@@ -2145,7 +2145,7 @@ pub struct App {
     /// fullscreen から動画を切り替えた時 (= fs_cache から Video エントリが消える時) に
     /// クリアされる。
     pub(crate) last_loop_pos: std::collections::HashMap<usize, (f64, u64)>,
-    /// 動画再生中の FPS / フレーム間隔オーバーレイ (P キーで トグル)。
+    /// 動画再生中の FPS / フレーム間隔オーバーレイ (F キーでトグル)。
     pub(crate) video_perf_overlay_visible: bool,
 
     // ── レーティング DB ──────────────────────────────────────────

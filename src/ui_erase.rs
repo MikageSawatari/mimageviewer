@@ -508,6 +508,7 @@ impl App {
             egui::Key::G,
             egui::Key::M,
             egui::Key::P,
+            egui::Key::T,
             egui::Key::U,
             egui::Key::N,
             egui::Key::F1,
