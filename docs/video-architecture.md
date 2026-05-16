@@ -1655,6 +1655,12 @@ pause 中でも audio-pump は最大 ~100ms の `processed` を旧 gain で先�
 raw→processed 先読みを一時停止し、旧 gain の `processed` を作らない。cpal callback 側も
 同フラグ中は silence を返して buffer を drain しない。scan 完了 / cancel / error 後に
 再生 intent を復帰してから解除し、その時点の Norm gain で preroll を再開する。
+source-swap / `fs_cache` evict で旧 `VideoPlayer` を drop するときは、同じ fs_idx の
+`NormalizeScanState` も cancel + cleanup する。これを怠ると次動画の deferred scan が
+`normalize_state.is_some()` で開始できず、`audio_preroll_suspended` が解除されないまま
+Buffering に残る。なお deferred scan を開始できなかった場合は保険として再生 intent と
+preroll suspension を復帰し、未補正でも再生不能にしない。全体 OFF も in-flight scan を
+cancel して同じ復帰処理を行う。
 
 修正前の旧仕様 (= Norm でも `clear_audio_output_buffer` を呼んでいた頃) は、
 `raw_pending` 5 秒分を捨てて audio audible PTS が clock から 5 秒先行し、

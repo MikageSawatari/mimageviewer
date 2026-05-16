@@ -10403,13 +10403,18 @@ impl App {
                             self.start_normalize_scan_for_deferred_play_intent(idx);
                         #[cfg(not(windows))]
                         let started_normalize_scan = false;
-                        if !started_normalize_scan
-                            && let Some(FsCacheEntry::Video { player, .. }) =
-                                self.fs_cache.get(&idx)
-                        {
-                            player.set_playing(true);
+                        if !started_normalize_scan {
                             #[cfg(windows)]
-                            self.maybe_start_normalize_scan_for_play_intent(idx);
+                            {
+                                self.resume_deferred_normalize_playback_without_scan(idx);
+                                self.maybe_start_normalize_scan_for_play_intent(idx);
+                            }
+                            #[cfg(not(windows))]
+                            if let Some(FsCacheEntry::Video { player, .. }) =
+                                self.fs_cache.get(&idx)
+                            {
+                                player.set_playing(true);
+                            }
                         }
                     }
                     crate::logger::log(format!("  video cache hit idx={idx} → resume playback"));
@@ -12049,6 +12054,8 @@ impl App {
             if !other_video_idxs.is_empty() {
                 self.save_all_video_resume_positions();
                 for k in other_video_idxs {
+                    #[cfg(windows)]
+                    self.cleanup_normalize_state_for_fs_idx(k);
                     self.fs_cache.remove(&k);
                 }
             }
@@ -12107,7 +12114,9 @@ impl App {
                 self.init_normalize_state_for_opened_video(idx);
                 #[cfg(windows)]
                 if start_normalize_scan_before_play {
-                    self.start_normalize_scan_for_deferred_play_intent(idx);
+                    if !self.start_normalize_scan_for_deferred_play_intent(idx) {
+                        self.resume_deferred_normalize_playback_without_scan(idx);
+                    }
                 } else {
                     self.maybe_start_normalize_scan_for_play_intent(idx);
                 }
@@ -12601,6 +12610,19 @@ impl App {
 
         // 退避前に動画の再生位置を保存 (退避された Video エントリは drop で消える)
         self.save_all_video_resume_positions();
+        #[cfg(windows)]
+        {
+            let evicted_video_idxs: Vec<usize> = self
+                .fs_cache
+                .iter()
+                .filter_map(|(k, v)| {
+                    (!keep_set.contains(k) && matches!(v, FsCacheEntry::Video { .. })).then_some(*k)
+                })
+                .collect();
+            for idx in evicted_video_idxs {
+                self.cleanup_normalize_state_for_fs_idx(idx);
+            }
+        }
         // KEEP 範囲外のテクスチャを破棄（VRAM 節約）
         self.fs_cache.retain(|k, _| keep_set.contains(k));
 

@@ -520,6 +520,7 @@ impl App {
         // tree は生かしたままにする。normal open に落として旧 VideoPlayer ごと落とすと、
         // presenter HWND が消える 150-300ms の穴で背後のアプリや黒画面が見える。
         if from_idx != target_idx {
+            self.cleanup_normalize_state_for_fs_idx(from_idx);
             self.fs_cache.remove(&from_idx);
         }
         self.native_video_open_pending = None;
@@ -725,7 +726,9 @@ impl App {
         self.init_normalize_state_for_opened_video(target_idx);
         self.open_fullscreen(target_idx);
         if start_normalize_scan_before_play {
-            self.start_normalize_scan_for_deferred_play_intent(target_idx);
+            if !self.start_normalize_scan_for_deferred_play_intent(target_idx) {
+                self.resume_deferred_normalize_playback_without_scan(target_idx);
+            }
         } else {
             self.maybe_start_normalize_scan_for_play_intent(target_idx);
         }
@@ -1697,8 +1700,19 @@ impl App {
             self.mark_native_video_hud_activity(ctx);
             return;
         }
+        let scanning_this_video = self
+            .normalize_state
+            .as_ref()
+            .map(|state| state.fs_idx == fs_idx)
+            .unwrap_or(false);
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.toggle_play();
+            if will_request_play && player.audio_preroll_suspended() && !scanning_this_video {
+                crate::logger::log(format!(
+                    "[native-video] resume playback after deferred normalize scan was unavailable idx={fs_idx}"
+                ));
+                player.set_audio_preroll_suspended(false);
+            }
             self.mark_native_video_hud_activity(ctx);
             self.maybe_start_normalize_scan_for_play_intent(fs_idx);
         }
@@ -2025,10 +2039,6 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) {
             return;
         }
-        // [Scanning] 中は無効
-        if self.normalize_state.is_some() {
-            return;
-        }
         self.disable_normalize_globally();
         self.mark_native_video_hud_activity(ctx);
     }
@@ -2069,6 +2079,17 @@ impl App {
     #[cfg(windows)]
     pub(super) fn disable_normalize_globally(&mut self) {
         use crate::video::normalize_types::NormalizeUiState;
+        if let Some(state) = self.normalize_state.take() {
+            state.cancel();
+            if state.was_playing {
+                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&state.fs_idx) {
+                    if player.path() == state.file_path.as_path() {
+                        player.set_playing(true);
+                        player.set_audio_preroll_suspended(false);
+                    }
+                }
+            }
+        }
         self.settings.audio_normalize_enabled = false;
         self.settings.save();
         self.normalize_auto_scan_suppressed.clear();
@@ -2167,6 +2188,24 @@ impl App {
         }
         self.start_normalize_scan_inner(fs_idx, Some(true));
         true
+    }
+
+    /// 再生前スキャンを開始できなかった場合の保険。
+    ///
+    /// 旧動画の scan がまだ残っているなどの理由で guard に弾かれても、player を
+    /// audio_preroll_suspended のままにすると再生・seek が進まなくなる。未補正で
+    /// 再生を始められる状態に戻し、次の機会の自動 scan に任せる。
+    #[cfg(windows)]
+    pub(super) fn resume_deferred_normalize_playback_without_scan(&mut self, fs_idx: usize) {
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            if player.audio_preroll_suspended() {
+                crate::logger::log(format!(
+                    "[native-video] deferred normalize scan not started; resume playback idx={fs_idx}"
+                ));
+            }
+            player.set_playing(true);
+            player.set_audio_preroll_suspended(false);
+        }
     }
 
     #[cfg(windows)]
@@ -4354,6 +4393,7 @@ impl App {
         // build_video_player_for_open + attach + switch_native_source 全工程分だけ
         // 不必要に重なっていた。
         if from_idx != target_idx {
+            self.cleanup_normalize_state_for_fs_idx(from_idx);
             self.fs_cache.remove(&from_idx);
         }
 
@@ -4392,7 +4432,9 @@ impl App {
 
         self.open_fullscreen(target_idx);
         if start_normalize_scan_before_play {
-            self.start_normalize_scan_for_deferred_play_intent(target_idx);
+            if !self.start_normalize_scan_for_deferred_play_intent(target_idx) {
+                self.resume_deferred_normalize_playback_without_scan(target_idx);
+            }
         } else {
             self.maybe_start_normalize_scan_for_play_intent(target_idx);
         }

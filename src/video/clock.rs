@@ -1034,6 +1034,16 @@ mod tests {
     }
 
     #[test]
+    fn audio_preroll_suspended_round_trip() {
+        let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
+        assert!(!clock.audio_preroll_suspended());
+        clock.set_audio_preroll_suspended(true);
+        assert!(clock.audio_preroll_suspended());
+        clock.set_audio_preroll_suspended(false);
+        assert!(!clock.audio_preroll_suspended());
+    }
+
+    #[test]
     fn normalize_gain_clamps_to_24db_range() {
         let clock = AvClock::new(1.0, Arc::new(AtomicU64::new(0)));
         // +30dB を入れても +24dB に丸められる
