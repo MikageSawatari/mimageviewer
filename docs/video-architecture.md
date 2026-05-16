@@ -906,6 +906,13 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   - `transition_to_paused` / `transition_to_buffering` / `transition_to_seeking` /
     `transition_to_loading` / `transition_to_eof` → `AvClock::engine_freeze_at(pts)` で
     `playing=false` + Frozen anchor at pts を atomic に設定
+  - **publish 順序の制約** (Codex P2 2026-05-17): 各 `transition_to_*` 内で
+    `av_clock.engine_*` の呼び出しは `published_state.store(..., Release)` の **前** に
+    置く。decoder / presenter は `engine_state.load(Acquire)` で外部 visible state を
+    観察するため、Acquire-Release のメモリ順により「PLAYING 観測時には AvClock の
+    新 anchor が必ず visible」「非 Playing 観測時には AvClock の Frozen が必ず visible」
+    が保証される。逆順だと「state=Playing かつ AvClock はまだ Frozen」の極小 window で
+    decoder の `ahead` 判定が暴走しうる。
   - 旧コードは `VideoPlayer::open` 直後に `clock.set_playing(autoplay)` を呼んで
     AvClock の wall extrapolation を即時起動していたが、`EngineActor` 側で
     `Loading/Buffering = Frozen` を保証する設計と二重管理になっており、Playing 遷移までの
@@ -916,10 +923,28 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
     - decoder 側: queue 満杯 + `dropped_full` 連発で続く 0.5 秒分のフレームが消失
   - 現在は `VideoPlayer::open` 直後に AvClock を一切触らず、`EngineActor::begin_loading`
     → 各 `transition_to_*` が `engine_freeze_at` / `engine_start_playing` を呼ぶ単一経路に
-    統一されている。`VideoPlayer::set_playing` / `toggle_play` などのレガシー呼び出し点は
-    `dispatch_play_pause` 経由で `engine.apply_command(Play/Pause)` を発行し、結局
-    EngineActor の transition を経由して AvClock を更新する形になる。直接の
-    `clock.set_playing(...)` 呼び出しは互換のため残っているが、新規コードからは追加しない。
+    統一されている。`VideoPlayer::set_playing` / `toggle_play` / `seek_paused_internal` /
+    `seek_paused_frame_step_internal` / `issue_user_seek_locked` および EOF loop replay 経路の
+    レガシー直書き `clock.set_playing(...)` は **撤去済** で、`dispatch_play_pause` /
+    `apply_command(Play/Pause)` / `handle_seek_request + apply_command` 経由で engine を
+    通る経路に統一されている。
+
+- **既知の例外** (EOF stop): 上記不変条件には **2 箇所だけ例外がある** —
+  `VideoPlayer::tick` 内の native 経路 EOF block と非 native 経路 EOF block
+  (`info.duration_secs > 0` で `clock.set_position_at_eof(duration)` + `clock.set_playing(false)`
+  を呼ぶ箇所)。現状 `decoder.rs` は `DecoderEvent::EofReached` を `engine_event_tx` に
+  流していないため、`EngineActor::transition_to_eof` → `engine_freeze_at(duration)`
+  経路は production code では発火しない (= test code でのみカバー)。EofReached を
+  engine_event_tx に流す改修を入れたら、この 2 箇所の直書きも撤去可能。同様に
+  `BufferStarved` / `AudioRendered` / `AudioInactive` も engine に流れていないため、
+  `EngineActor::handle_audio_event` の対応 arm は production では dead path。
+  - `handle_audio_event(AudioRendered)` 経路が動かないことの実害は
+    [src/video/engine/actor.rs] の `handle_pause` / `BufferStarved` /
+    `apply_command(SeekRelative)` / `apply_command(SetSpeed)` で吸収している。
+    これらは「現在 PTS」が必要だが、内部 `self.clock` (= MasterClock) は
+    `AudioRendered` 不在で audio 駆動の更新が来ないため、`self.av_clock.now_secs()`
+    を読む compat shim に切り替えている。AudioRendered 配線完了後は
+    `self.clock.now_secs()` でも等価になる。
 
 - **不変条件: 非 PLAYING 中の decoder は `video_tx` 満杯時に drop せず block する**
   (2026-05 root fix の補完):

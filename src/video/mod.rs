@@ -3374,7 +3374,11 @@ impl VideoPlayer {
             self.clear_frame_step_target();
             self.clock.request_seek(0.0);
             self.clear_audio_output_buffer();
-            self.clock.set_playing(true);
+            // 2026-05 root fix: `clock.set_playing(true)` の直書きは撤去。
+            // 続く `handle_seek_request` → `apply_command(Play)` → engine 内部で
+            // transition_to_seeking → transition_to_buffering → transition_to_playing
+            // が走り、その中で `av_clock.engine_start_playing` が AvClock を更新する。
+            //
             // engine 側にも seek を伝えて epoch を同期させる。user 操作の seek は
             // autoplay 強制 (= seek 後に Paused にならないように)。
             //
@@ -3395,6 +3399,10 @@ impl VideoPlayer {
         // Playing のまま固定で、perf overlay の warmup 区間表示にも反映されず、
         // EngineState::parks_decoder() が立たないので decoder 側の pause-park 経路と
         // 食い違っていた。
+        // 2026-05 root fix: AvClock の playing flag は engine 経由で更新するため、
+        // 直書き `clock.set_playing(...)` は撤去。`dispatch_play_pause` が
+        // `apply_command(Play/Pause)` を発行し、handle_play/handle_pause が
+        // transition_to_playing / transition_to_paused 経由で AvClock を同期する。
         let new_playing = !self.clock.is_playing();
         if new_playing {
             self.clear_initial_pause_controls();
@@ -3402,7 +3410,6 @@ impl VideoPlayer {
         } else {
             self.clear_pending_user_seek();
         }
-        self.clock.set_playing(new_playing);
         self.dispatch_play_pause(new_playing);
     }
 
@@ -3421,10 +3428,11 @@ impl VideoPlayer {
         } else {
             self.clear_pending_user_seek();
         }
-        self.clock.set_playing(p);
-        // Phase 9.C: engine 状態も同期。set_playing は外部 API なので呼び出し元が
-        // 既に engine.apply_command を呼んでいるケースがあるが、apply_command は
-        // idempotent (= 既に Playing で Play を受けても no-op) なので安全。
+        // 2026-05 root fix: 直書き `clock.set_playing(p)` は撤去。AvClock の playing
+        // フラグは engine 経由で更新する (= `dispatch_play_pause` →
+        // `apply_command(Play/Pause)` → `transition_to_*` → `engine_start_playing` /
+        // `engine_freeze_at`)。`apply_command` は idempotent なので prev == p でも
+        // 安全だが、観測可能な状態変化が無いケースは dispatch をスキップする。
         if prev != p {
             self.dispatch_play_pause(p);
         }
@@ -3466,9 +3474,8 @@ impl VideoPlayer {
         self.clock.request_seek(target_secs);
         self.clear_audio_output_buffer();
         self.clear_initial_pause_controls();
-        if !self.clock.is_playing() {
-            self.clock.set_playing(true);
-        }
+        // 2026-05 root fix: `clock.set_playing(true)` の直書きは撤去。続く
+        // `apply_command(Play)` が transition_to_playing 経由で AvClock を起動する。
         // user 操作 seek は autoplay 強制。
         // 呼び出し順注意: handle_seek_request → apply_command(Play)
         // (詳細は toggle_play を参照)。
@@ -3630,7 +3637,10 @@ impl VideoPlayer {
         let clamped = self.clamp_seek_target(target_secs);
         self.clock.request_seek(clamped);
         self.clear_audio_output_buffer();
-        self.clock.set_playing(false);
+        // 2026-05 root fix: `clock.set_playing(false)` の直書きは撤去。続く
+        // `apply_command(Pause)` が transition_to_seeking → transition_to_paused
+        // (== handle_seek_request 直後の Seeking state、その後の SeekCompleted +
+        // FirstFrameReady で Paused 入場) 経由で AvClock を freeze する。
         let mut g = self.engine.lock().unwrap();
         g.handle_seek_request(clamped);
         g.apply_command(engine::actor::TransportCommand::Pause);
@@ -3648,7 +3658,12 @@ impl VideoPlayer {
         self.clock
             .request_frame_step_seek(seek_start, base, direction);
         self.clear_audio_output_buffer();
-        self.clock.set_playing(false);
+        // 2026-05 root fix: `clock.set_playing(false)` の直書きは撤去 (上記
+        // seek_paused_internal と同じ理由)。
+        // `clock.set_paused_position(base)` は frame-step 固有の表示位置上書きで、
+        // engine の transition_to_seeking が `engine_freeze_at(base)` を呼ぶのと
+        // 同じ pts に揃うので冗長だが、frame-step 経路の即時応答性 (= engine 経路の
+        // mpsc/Mutex 飛び越し) を保つために残す。
         self.clock.set_paused_position(base);
         let mut g = self.engine.lock().unwrap();
         g.handle_seek_request(base);
@@ -4412,7 +4427,8 @@ impl VideoPlayer {
                     self.clear_pending_user_seek();
                     self.clock.request_seek(target);
                     self.clear_audio_output_buffer();
-                    self.clock.set_playing(true);
+                    // 2026-05 root fix: `clock.set_playing(true)` 直書きは撤去
+                    // (engine 経由で更新)。
                     let mut g = self.engine.lock().unwrap();
                     g.handle_seek_request(target);
                     g.apply_command(engine::actor::TransportCommand::Play);
@@ -4420,6 +4436,13 @@ impl VideoPlayer {
                     // ループ OFF: 末端到達 → duration 位置で凍結して停止。
                     // 非 native 経路の EOF block (line 末尾) と同じ処理。これが無いと
                     // native 経路ではクロックが duration を超えて進み続ける。
+                    //
+                    // ⚠️ 例外: ここの `clock.set_playing(false)` 直書きは **残す**
+                    // (Codex P3 2026-05-17 の指摘)。現状 decoder は
+                    // `DecoderEvent::EofReached` を engine に流しておらず (= 配線未完)、
+                    // engine の `transition_to_eof` → `av_clock.engine_freeze_at(duration)`
+                    // 経路は production code では発火しない。EofReached を
+                    // engine_event_tx に流す改修が入ったら、この直書きも撤去可能。
                     if let Some(info) = self.info.as_ref() {
                         if info.duration_secs > 0.0 {
                             self.clock.set_position_at_eof(info.duration_secs);
@@ -4545,7 +4568,8 @@ impl VideoPlayer {
                 self.clear_pending_user_seek();
                 self.clock.request_seek(target);
                 self.clear_audio_output_buffer();
-                self.clock.set_playing(true);
+                // 2026-05 root fix: `clock.set_playing(true)` 直書きは撤去
+                // (engine 経由で更新)。
                 // engine 側の epoch も同期 (= AvClock seek_serial と engine
                 // current_seek_epoch の不整合を防ぐ)。loop 周回も autoplay 強制。
                 // 呼び出し順注意: handle_seek_request → apply_command(Play)
@@ -4555,6 +4579,11 @@ impl VideoPlayer {
                 g.apply_command(engine::actor::TransportCommand::Play);
             } else {
                 // 末端到達 → duration 位置に進めて停止 (シークバー右端を確実にする)。
+                //
+                // ⚠️ 例外: ここの `clock.set_playing(false)` 直書きは **残す**
+                // (Codex P3 2026-05-17 の指摘)。native 経路の同等ブロック (上記
+                // `is_native_playing` 分岐内) と同じ理由: decoder の EofReached が
+                // engine に流れていない (配線未完)。
                 if let Some(info) = &self.info {
                     if info.duration_secs > 0.0 {
                         self.clock.set_position_at_eof(info.duration_secs);

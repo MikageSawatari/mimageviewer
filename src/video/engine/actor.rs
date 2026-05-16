@@ -218,6 +218,13 @@ impl EngineActor {
     /// 進み始める (= 旧実装は `VideoPlayer::open` 直後に `clock.set_playing(autoplay)` で
     /// AvClock だけ先行起動していたため、Playing 遷移前の ~300ms 間に extrapolation が
     /// 暴走 → late_drop + decoder dropped_full の冒頭ヒッチを誘発していた)。
+    ///
+    /// **publish 順序** (Codex P2 2026-05-17): `av_clock.engine_start_playing` を必ず
+    /// `published_state.store(PLAYING, Release)` の **前** に呼ぶ。decoder は
+    /// `engine_state.load(Acquire)` で PLAYING を観測すると drop-on-full モードに
+    /// 切り替えるため、逆順だと「state=Playing かつ AvClock はまだ Frozen」の極小窓で
+    /// ahead 判定が暴走する。Acquire-Release のメモリ順により、PLAYING 観測時には
+    /// 必ず AvClock の新 anchor も visible になる。
     fn transition_to_playing(&mut self, anchor: ClockAnchor) {
         let anchor = anchor.with_speed(self.playback_speed);
         debug_assert!(
@@ -228,19 +235,23 @@ impl EngineActor {
         self.last_audio_epoch = self.current_seek_epoch();
         self.clock.set_anchor(anchor);
         self.state = EngineState::Playing;
+        // ⚠️ 順序固定: AvClock 更新 → published_state.store。詳細は doc コメント参照。
+        self.av_clock.engine_start_playing(anchor);
         self.published_state
             .store(state_code::PLAYING, Ordering::Release);
-        self.av_clock.engine_start_playing(anchor);
     }
 
     /// `Paused` への遷移 (= 凍結 anchor)。
+    /// `av_clock.engine_freeze_at` は `published_state.store(PAUSED, Release)` の前に
+    /// 呼ぶ (= 非 Playing 観測時に AvClock がまだ extrapolation していない不変条件、
+    /// Codex P2 2026-05-17、詳細は `transition_to_playing` の doc コメント)。
     fn transition_to_paused(&mut self, pts: f64) {
         self.clock
             .set_anchor(ClockAnchor::frozen_at(pts).with_speed(self.playback_speed));
         self.state = EngineState::Paused;
+        self.av_clock.engine_freeze_at(pts);
         self.published_state
             .store(state_code::PAUSED, Ordering::Release);
-        self.av_clock.engine_freeze_at(pts);
     }
 
     /// `Buffering` への遷移。**epoch は進めない** (= 既に handle_seek_request で進めた値、
@@ -263,9 +274,10 @@ impl EngineActor {
         self.clock
             .set_anchor(ClockAnchor::frozen_at(pts).with_speed(self.playback_speed));
         self.state = EngineState::Buffering;
+        // ⚠️ 順序固定 (Codex P2 2026-05-17): AvClock freeze → state publish。
+        self.av_clock.engine_freeze_at(pts);
         self.published_state
             .store(state_code::BUFFERING, Ordering::Release);
-        self.av_clock.engine_freeze_at(pts);
     }
 
     /// `Seeking` への遷移。target で凍結。**epoch は handle_seek_request で進める**。
@@ -273,9 +285,10 @@ impl EngineActor {
         self.clock
             .set_anchor(ClockAnchor::frozen_at(target_secs).with_speed(self.playback_speed));
         self.state = EngineState::Seeking { target_secs };
+        // ⚠️ 順序固定 (Codex P2 2026-05-17): AvClock freeze → state publish。
+        self.av_clock.engine_freeze_at(target_secs);
         self.published_state
             .store(state_code::SEEKING, Ordering::Release);
-        self.av_clock.engine_freeze_at(target_secs);
     }
 
     /// `Loading` への遷移 (= 0 で凍結 or resume 値で凍結)。
@@ -283,9 +296,10 @@ impl EngineActor {
         self.clock
             .set_anchor(ClockAnchor::frozen_at(pts).with_speed(self.playback_speed));
         self.state = EngineState::Loading;
+        // ⚠️ 順序固定 (Codex P2 2026-05-17): AvClock freeze → state publish。
+        self.av_clock.engine_freeze_at(pts);
         self.published_state
             .store(state_code::LOADING, Ordering::Release);
-        self.av_clock.engine_freeze_at(pts);
     }
 
     /// `Eof` への遷移 (= duration で凍結)。
@@ -293,9 +307,10 @@ impl EngineActor {
         self.clock
             .set_anchor(ClockAnchor::frozen_at(duration).with_speed(self.playback_speed));
         self.state = EngineState::Eof;
+        // ⚠️ 順序固定 (Codex P2 2026-05-17): AvClock freeze → state publish。
+        self.av_clock.engine_freeze_at(duration);
         self.published_state
             .store(state_code::EOF, Ordering::Release);
-        self.av_clock.engine_freeze_at(duration);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -330,7 +345,15 @@ impl EngineActor {
                 self.handle_seek_request(target_secs);
             }
             TransportCommand::SeekRelative { delta_secs } => {
-                let target = (self.clock.now_secs() + delta_secs).max(0.0);
+                // **AvClock 経由で現在位置を読む** (Codex P1 2026-05-17): 内部 MasterClock
+                // は `AudioRendered` を受け取らないと audio 駆動で進まないが、本コードベース
+                // では `fill_output` が AvClock を直接更新するだけで EngineActor には
+                // event を流していない (= 配線未完)。互換策として、現在位置を必要とする
+                // 4 箇所 (`SeekRelative` / `SetSpeed` / `handle_pause` /
+                // `handle_audio_event(BufferStarved)`) は AvClock から読む。
+                // 配線完了後 (= AudioRendered を engine_event_tx に流すように修正後) は
+                // self.clock.now_secs() でも同等になる予定。
+                let target = (self.av_clock.now_secs() + delta_secs).max(0.0);
                 self.handle_seek_request(target);
             }
             TransportCommand::SetSpeed { speed } => {
@@ -342,7 +365,8 @@ impl EngineActor {
                 if (self.playback_speed - speed).abs() <= 1.0e-9 {
                     return;
                 }
-                let pts_now = self.clock.now_secs();
+                // 現在位置取得は AvClock 経由 (上記 SeekRelative のコメント参照)。
+                let pts_now = self.av_clock.now_secs();
                 let mut anchor = self.clock.anchor();
                 anchor.pts_secs = pts_now;
                 anchor.wall_at_anchor = Instant::now();
@@ -406,8 +430,13 @@ impl EngineActor {
         self.opts.autoplay = false;
         match self.state {
             EngineState::Playing => {
-                // 現在の再生位置を凍結
-                let pts = self.clock.now_secs();
+                // 現在の再生位置を凍結。**AvClock 経由で読む** (Codex P1 2026-05-17):
+                // 内部 MasterClock は `AudioRendered` 配線未完で audio 駆動で進まない
+                // ため、`self.clock.now_secs()` を使うと「直前の transition_to_playing
+                // で張った anchor からの wall extrapolation」になり、実際の audible 位置
+                // (= AvClock が audio callback で進んだ値) より進んだ古い PTS で freeze
+                // する事故が起きる。compat shim として AvClock から読む。
+                let pts = self.av_clock.now_secs();
                 self.transition_to_paused(pts);
             }
             EngineState::Loading | EngineState::Buffering | EngineState::Seeking { .. } => {
@@ -588,7 +617,9 @@ impl EngineActor {
                 // Playing 中で audio が枯渇したら Buffering に戻して再 preroll。
                 // latch も自動 reset (= transition_to_buffering 内で実施)。
                 if matches!(self.state, EngineState::Playing) {
-                    let pts = self.clock.now_secs();
+                    // 現在位置は AvClock 経由 (上記 handle_pause のコメント参照、
+                    // AudioRendered 配線未完の compat shim)。
+                    let pts = self.av_clock.now_secs();
                     self.transition_to_buffering(pts);
                 }
             }
@@ -2076,6 +2107,82 @@ mod tests {
         assert!(
             (now - 0.05).abs() < 0.05,
             "AvClock should be near anchor pts (0.05) right after Playing, got {now}"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Codex P1 2026-05-17: AudioRendered 配線未完 compat shim の検証。
+    // 内部 MasterClock が audio 駆動で更新されなくても、handle_pause / BufferStarved /
+    // SeekRelative / SetSpeed は AvClock 経由で現在位置を読むので、外部 (audio callback)
+    // が AvClock を進めていればその値で freeze / 計算される。
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn handle_pause_freezes_at_av_clock_position_not_internal_clock() {
+        // Playing 入場後、内部 MasterClock の anchor は (0.0, t0)。AudioRendered 配線が
+        // ない production を模擬するため、actor には何も流さず、代わりに AvClock 側だけ
+        // 進める (= audio callback の代行)。
+        // `set_audio_pts` は wall-rate cap (≒ 1.02x) があり瞬間ジャンプできないため、
+        // PDC latency 等で使う bypass 用 `set_audio_pts_jump` を使う (= テストでは
+        // 実 audio callback の数百回呼び出しを 1 回に圧縮した等価)。
+        let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
+        actor.has_audio = true;
+        actor.transition_to_playing(ClockAnchor::audio(0.0, Instant::now()));
+        av_clock.set_audio_pts_jump(5.0); // audio が pts=5s に到達した状態
+
+        // handle_pause が AvClock を読むことの検証: freeze pts ≒ 5.0 になる。
+        // もし self.clock.now_secs() を読んでいたら、内部 anchor (0.0) + 経過 wall (<1ms)
+        // ≒ 0 で freeze してしまい、AvClock を 5.0 → 0 に巻き戻すバグになる。
+        actor.handle_pause();
+        assert_eq!(actor.state, EngineState::Paused);
+        assert!(!av_clock.is_playing());
+        let frozen = av_clock.now_secs();
+        assert!(
+            (frozen - 5.0).abs() < 0.1,
+            "handle_pause should freeze AvClock at its current audible position (~5.0), got {frozen}"
+        );
+    }
+
+    #[test]
+    fn seek_relative_uses_av_clock_position_as_base() {
+        // SeekRelative は現在位置 + delta を seek target にする。AudioRendered 配線が
+        // ないので internal clock は古いまま (anchor の wall extrapolation のみ)、
+        // AvClock は audio 経由で進んだ位置を持つ。target 計算は AvClock 経由でないと
+        // 大きく外れる。
+        let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
+        actor.has_audio = true;
+        actor.transition_to_playing(ClockAnchor::audio(0.0, Instant::now()));
+        av_clock.set_audio_pts_jump(10.0); // audio が pts=10s に到達した状態
+        actor.apply_command(TransportCommand::SeekRelative { delta_secs: 3.0 });
+        // target ≒ 13.0 で seek されているはず。
+        match actor.state {
+            EngineState::Seeking { target_secs } => {
+                assert!(
+                    (target_secs - 13.0).abs() < 0.1,
+                    "SeekRelative target should be ~13.0 (= 10.0 + 3.0), got {target_secs}"
+                );
+            }
+            other => panic!("expected Seeking after SeekRelative, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn buffer_starved_freezes_at_av_clock_position() {
+        // BufferStarved → 現在位置で Buffering 入場。AvClock の現在位置で frozen
+        // になるべき (= 内部 clock の古い値ではない)。
+        let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
+        actor.has_audio = true;
+        actor.transition_to_playing(ClockAnchor::audio(0.0, Instant::now()));
+        av_clock.set_audio_pts_jump(7.5);
+
+        actor.handle_audio_event(AudioEvent::BufferStarved {
+            epoch: actor.current_seek_epoch(),
+        });
+        assert_eq!(actor.state, EngineState::Buffering);
+        let frozen = av_clock.now_secs();
+        assert!(
+            (frozen - 7.5).abs() < 0.1,
+            "BufferStarved should freeze AvClock at audible position (~7.5), got {frozen}"
         );
     }
 }
