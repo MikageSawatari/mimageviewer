@@ -2446,6 +2446,15 @@ impl NativeVideoPresenter {
         }
     }
 
+    /// 動画ソース切替時に perf overlay の履歴 / pause gap pending / 最新スナップショットを
+    /// クリアする。`SwitchSource` ハンドラの周辺 reset 群と同じパターン。詳細は
+    /// `NativeEguiOverlay::reset_perf` の doc コメント参照。
+    pub fn reset_overlay_perf(&mut self) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.reset_perf();
+        }
+    }
+
     pub fn set_overlay_hover_thumbnail(&mut self, thumbnail: Option<NativeOverlayThumbnail>) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_hover_thumbnail(thumbnail);
@@ -3581,6 +3590,20 @@ impl NativeEguiOverlay {
         }
         if self.perf_visible && self.perf_last_dirty.elapsed() >= Duration::from_millis(100) {
             self.perf_last_dirty = Instant::now();
+            self.dirty = true;
+        }
+    }
+
+    /// 動画ソース切替 (= `SwitchSource`) で呼ぶ。前ソースの perf 履歴がそのまま
+    /// 残っていると、新ソースの fps / interval が混じった median で Y 軸が
+    /// 算出され、新サンプルが溜まってきた頃に Y スケールがガクッと切り替わる
+    /// (= ユーザー報告「動画切替後しばらくしてグラフ形状が突然変わる」)。
+    /// `speed_changed` 経路と同じ理由でクリアする。
+    fn reset_perf(&mut self) {
+        self.perf_history.clear();
+        self.perf_pause_gap_pending = false;
+        self.perf_latest = NativeOverlayPerfSnapshot::default();
+        if self.perf_visible {
             self.dirty = true;
         }
     }

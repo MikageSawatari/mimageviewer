@@ -1635,6 +1635,22 @@ overlay_draw.rs::draw_native_perf_overlay`) には:
   タイミング) に出す。`drop` カウンタと視覚 marker の意味を揃える。
 - グラフ rect 内: audio active 時の underrun 区間に橙背景帯。audio 側の警告は赤縦線とは分ける。
 
+**リセット規約**: perf 履歴 (`perf_history` / `perf_pause_gap_pending` / `perf_latest`) は
+以下のタイミングで明示的にクリアする。median ベースの Y 軸スケールが旧サンプルを引きずって
+新ソース投入後に遅れて再スケールする (= ユーザー体感「動画切替後しばらくしてグラフ形状が
+突然変わる」) のを防ぐため。
+
+- **`SwitchSource` ハンドラ** (`video/mod.rs`): 動画ソース切替時。同尺の別動画や同じ動画
+  ループ復帰でも確実に発火させたいので、`update_video_state` の `duration_changed` 経由
+  ではなく `presenter.reset_overlay_perf()` を SwitchSource ハンドラから直接呼ぶ。
+  既存の `set_overlay_metadata(None)` / `set_overlay_timeline_markers(Vec::new())` などと
+  同列のリセット群として扱う。
+- **`update_video_state` の `speed_changed` 経由** (`native_presenter/mod.rs`):
+  再生速度変更時。`source_delta_ms / playback_speed` で導出する `effective_interval_ms` が
+  変わるので、旧速度ベースのサンプルを混ぜると median が誤った値になる。こちらは
+  `perf_history.clear()` を直接書いている既存経路 (= SwitchSource ではないので別経路として
+  必要)。
+
 ### 検証手順 (修正後の正常動作確認)
 
 1. `cargo build --release` → `target/release/mimageviewer.exe --perf-log` で起動

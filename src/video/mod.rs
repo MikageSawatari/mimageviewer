@@ -1759,6 +1759,11 @@ fn run_native_video_output(
                     presenter.set_overlay_metadata(None);
                     presenter.set_overlay_timeline_markers(Vec::new());
                     presenter.set_overlay_jump_entries(Vec::new());
+                    // 前ソースの perf 履歴 (interval_ms / source_delta_ms / av_offset_ms)
+                    // が残ったまま新ソースの最初のサンプルが入ると、median ベースの Y 軸が
+                    // 古い fps を引きずって新サンプル蓄積後にガクッと切り替わる。新動画は
+                    // 解像度 / fps / 同期特性が違う前提なので、ここで明示クリアする。
+                    presenter.reset_overlay_perf();
                     // hover preview の transient state も新ソース用にクリアする。
                     // overlay は「直近のサムネ画像を常に描く」ようになったため、
                     // ここでクリアしないと、ソース切替直後の最初の hover preview で
