@@ -52,6 +52,9 @@ pub struct VideoTileState {
     pub tile_w: u32,
     pub tile_h: u32,
     pub columns: usize,
+    /// キーボード操作用カーソル。タイルを開いた時点の再生位置より後ろにある
+    /// 最初のタイルから開始し、←→ / Ctrl+←→ で移動する。
+    pub selected_idx: usize,
 }
 
 impl App {
@@ -165,6 +168,8 @@ impl App {
         let cache = self.video_tile_cache.clone();
         // worker には extract サイズ (= 最大列幅) を渡す。描画用の tile_w/tile_h は
         // VideoTileState に持って native overlay 側の描画でスケーリングに使う。
+        let selected_idx =
+            tile_index_after_position(&timestamps, player.position()).unwrap_or_default();
         let worker = TileThumbnailWorker::spawn(
             path.clone(),
             timestamps.clone(),
@@ -181,7 +186,67 @@ impl App {
             tile_w,
             tile_h,
             columns,
+            selected_idx,
         })
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn selected_video_tile_target_secs(&self, fs_idx: usize) -> Option<f64> {
+        if self.fullscreen_idx != Some(fs_idx) || !self.video_tile_mode_active {
+            return None;
+        }
+        let state = self.video_tile_state.as_ref()?;
+        state.timestamps.get(state.selected_idx).copied()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn move_video_tile_cursor(&mut self, fs_idx: usize, delta: isize) -> bool {
+        if self.fullscreen_idx != Some(fs_idx) || !self.video_tile_mode_active || delta == 0 {
+            return false;
+        }
+        let Some(state) = self.video_tile_state.as_mut() else {
+            return false;
+        };
+        let Some(next) = move_tile_selection(state.selected_idx, state.timestamps.len(), delta)
+        else {
+            return false;
+        };
+        if next == state.selected_idx {
+            return false;
+        }
+        state.selected_idx = next;
+        true
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn handle_video_tile_cursor_key(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        ctrl: bool,
+        left: bool,
+    ) -> bool {
+        let columns = self
+            .video_tile_state
+            .as_ref()
+            .map(|state| state.columns.max(1))
+            .unwrap_or(1);
+        let step = (if ctrl { columns } else { 1 }) as isize;
+        let delta = if left { -step } else { step };
+        let moved = self.move_video_tile_cursor(fs_idx, delta);
+        if moved {
+            self.sync_native_video_tile_overlay(ctx, fs_idx);
+        }
+        moved
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn play_selected_video_tile(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
+        let Some(target_secs) = self.selected_video_tile_target_secs(fs_idx) else {
+            return false;
+        };
+        self.handle_native_video_tile_seek_command(ctx, fs_idx, target_secs);
+        true
     }
 }
 
@@ -209,6 +274,32 @@ fn generate_timestamps(duration_secs: f64, interval_secs: f64, max_count: usize)
         t += interval_secs;
     }
     out
+}
+
+const TILE_CURSOR_POSITION_EPSILON_SECS: f64 = 0.05;
+
+fn tile_index_after_position(timestamps: &[f64], position_secs: f64) -> Option<usize> {
+    if timestamps.is_empty() {
+        return None;
+    }
+    let position = if position_secs.is_finite() {
+        position_secs.max(0.0)
+    } else {
+        0.0
+    };
+    timestamps
+        .iter()
+        .position(|&pts| pts > position + TILE_CURSOR_POSITION_EPSILON_SECS)
+        .or_else(|| timestamps.len().checked_sub(1))
+}
+
+fn move_tile_selection(current: usize, len: usize, delta: isize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    let max_idx = len - 1;
+    let current = current.min(max_idx);
+    Some((current as isize + delta).clamp(0, max_idx as isize) as usize)
 }
 
 #[cfg(test)]
@@ -257,5 +348,29 @@ mod tests {
         let ts = generate_timestamps(3600.0, 1.0, 10);
         assert_eq!(ts.len(), 10);
         assert!((ts[9] - 9.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn tile_cursor_starts_at_first_thumbnail_after_position() {
+        let ts = [0.0, 5.0, 10.0, 15.0];
+        assert_eq!(tile_index_after_position(&ts, 4.9), Some(1));
+        assert_eq!(tile_index_after_position(&ts, 5.0), Some(2));
+        assert_eq!(tile_index_after_position(&ts, 99.0), Some(3));
+    }
+
+    #[test]
+    fn tile_cursor_defensive_inputs() {
+        assert_eq!(tile_index_after_position(&[], 0.0), None);
+        assert_eq!(tile_index_after_position(&[5.0, 10.0], f64::NAN), Some(0));
+        assert_eq!(tile_index_after_position(&[5.0, 10.0], -3.0), Some(0));
+    }
+
+    #[test]
+    fn move_tile_selection_clamps_to_edges() {
+        assert_eq!(move_tile_selection(2, 5, 1), Some(3));
+        assert_eq!(move_tile_selection(2, 5, -1), Some(1));
+        assert_eq!(move_tile_selection(2, 5, 10), Some(4));
+        assert_eq!(move_tile_selection(2, 5, -10), Some(0));
+        assert_eq!(move_tile_selection(0, 0, 1), None);
     }
 }

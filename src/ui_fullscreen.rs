@@ -5549,20 +5549,67 @@ impl App {
         let enter = !shift_held_now
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
         // Phase 7.H シーク粒度: ←→=5 秒、Shift+←→=1 秒、Ctrl+←→=30 秒。
+        // タイル中は seek せずカーソル移動に切り替える。Ctrl 併用時だけ 1 行分移動。
         // ↑↓ は consume せず後段の image arrow_up/down (= 前後ファイル) に流す
         // (= マウスホイールと整合)。Shift+↑↓ だけ動画モードで音量に使う。
-        let ctrl_shift_left = ctx.input_mut(|i| {
-            i.consume_key(
-                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                egui::Key::ArrowLeft,
-            )
-        });
-        let ctrl_shift_right = ctx.input_mut(|i| {
-            i.consume_key(
-                egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-                egui::Key::ArrowRight,
-            )
-        });
+        let tile_active_for_keyboard = self.video_tile_mode_active;
+        let tile_left_ctrl = if tile_active_for_keyboard {
+            ctx.input_mut(|i| {
+                if i.consume_key(
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    egui::Key::ArrowLeft,
+                ) {
+                    Some(true)
+                } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowLeft) {
+                    Some(true)
+                } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowLeft) {
+                    Some(false)
+                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft) {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        let tile_right_ctrl = if tile_active_for_keyboard {
+            ctx.input_mut(|i| {
+                if i.consume_key(
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    egui::Key::ArrowRight,
+                ) {
+                    Some(true)
+                } else if i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowRight) {
+                    Some(true)
+                } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::ArrowRight) {
+                    Some(false)
+                } else if i.consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight) {
+                    Some(false)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        let tile_left = tile_left_ctrl.is_some();
+        let ctrl_shift_left = tile_left_ctrl.is_none()
+            && tile_right_ctrl.is_none()
+            && ctx.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    egui::Key::ArrowLeft,
+                )
+            });
+        let ctrl_shift_right = tile_left_ctrl.is_none()
+            && tile_right_ctrl.is_none()
+            && ctx.input_mut(|i| {
+                i.consume_key(
+                    egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+                    egui::Key::ArrowRight,
+                )
+            });
         let frame_step_key = ctrl_shift_left || ctrl_shift_right;
         let ctrl_shift_held_now = ctx.input(|i| i.modifiers.ctrl && i.modifiers.shift);
         let shift_left = !frame_step_key
@@ -5620,6 +5667,14 @@ impl App {
             if let Some(p) = video_path {
                 open_external_player(p);
             }
+            return;
+        }
+        if enter && self.video_tile_mode_active {
+            self.play_selected_video_tile(ctx, fs_idx);
+            return;
+        }
+        if let Some(ctrl) = tile_left_ctrl.or(tile_right_ctrl) {
+            self.handle_video_tile_cursor_key(ctx, fs_idx, ctrl, tile_left);
             return;
         }
 

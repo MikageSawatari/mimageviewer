@@ -51,13 +51,14 @@ Windows の現行動画フルスクリーンは native presenter 経路。
 | 操作 | 現状 |
 | --- | --- |
 | ホイール / plain ↑↓ | 同一 `visible_indices` 内の前後アイテムへ移動 |
-| ←→ | seek。Ctrl+←→ は 30 秒 seek、Shift+←→ は 1 秒 seek |
+| ←→ | seek。Ctrl+←→ は 30 秒 seek、Shift+←→ は 1 秒 seek。S タイルモード中は seek せずタイルカーソル移動、Ctrl+←→ は 1 行分移動、Enter でカーソル位置から再生 |
 | Shift+↑↓ | 音量を dB フェーダー目盛りの 1/4 幅で上下 |
 | Ctrl+↑↓ | `handle_fullscreen_ctrl_nav_context` 経由で画像系と同じコンテキスト移動 |
 | マウス戻る / 進む | native window / HUD 側の XButton を App 側で Ctrl+↑↓ と同じ経路へ接続 |
 | S | 動画タイルモード ON/OFF |
 | S タイルモード中のホイール | 前後アイテムへ移動。移動先も動画なら native presenter を保持して source 差し替え |
 | S タイルモード中の Ctrl+ホイール | タイル列数変更 |
+| S タイルモード中の ←→ / Ctrl+←→ / Enter | 青枠のタイルカーソルを 1 タイル / 1 行分移動し、Enter で再生開始。S / Esc で閉じるだけなら seek しない |
 | 同一一覧の先頭 / 末尾 | native overlay toast で「最初/最後の項目です」+ Ctrl+↑↓ の案内を表示 |
 | Ctrl+G / Ctrl+S スコープ | `handle_fullscreen_ctrl_nav_context` 経由で検索スコープ移動に入る |
 

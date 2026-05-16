@@ -691,6 +691,8 @@ pub struct NativeOverlayTileOverlay {
     pub progress_total: usize,
     pub finished: bool,
     pub tiles: Vec<Option<NativeOverlayTileThumbnail>>,
+    /// Keyboard cursor shown while tile mode is open. None is used for preparing overlays.
+    pub selected_idx: Option<usize>,
     // ホイールで動画を切り替えた直後など metadata が None の数フレームでも、
     // 上部バーのタイトル行にファイル名を出すための fallback。
     pub fallback_file_name: String,
@@ -729,6 +731,7 @@ impl NativeOverlayTileOverlay {
             progress_total: 0,
             finished: false,
             tiles: Vec::new(),
+            selected_idx: None,
             fallback_file_name: file_name,
             video_open_status: Some(open_status),
         }

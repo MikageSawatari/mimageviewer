@@ -1620,7 +1620,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn handle_native_video_tile_seek_command(
+    pub(crate) fn handle_native_video_tile_seek_command(
         &mut self,
         ctx: &egui::Context,
         fs_idx: usize,
@@ -3287,7 +3287,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn sync_native_video_tile_overlay(&mut self, ctx: &egui::Context, fs_idx: usize) {
+    pub(crate) fn sync_native_video_tile_overlay(&mut self, ctx: &egui::Context, fs_idx: usize) {
         let current_path = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) if player.error().is_none() => {
                 Some(player.path().clone())
@@ -3406,6 +3406,11 @@ impl App {
                     progress_total,
                     finished,
                     tiles,
+                    selected_idx: state
+                        .timestamps
+                        .len()
+                        .checked_sub(1)
+                        .map(|max| state.selected_idx.min(max)),
                     fallback_file_name,
                     video_open_status: None,
                 })
@@ -3795,6 +3800,10 @@ impl App {
                     crate::ui_helpers::open_external_player(player.path());
                 }
             }
+            // Enter in tile mode: start playback from the keyboard cursor.
+            0x0D if !key.shift && !key.ctrl && !key.repeat && self.video_tile_mode_active => {
+                self.play_selected_video_tile(ctx, fs_idx);
+            }
             // Enter: play / pause.
             0x0D if !key.shift && !key.ctrl && !key.repeat => {
                 self.handle_native_video_toggle_play_command(ctx, fs_idx);
@@ -3826,6 +3835,11 @@ impl App {
                     player.seek(0.0);
                 }
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
+            }
+            // Tile mode: left/right move the keyboard cursor instead of seeking
+            // behind the opaque tile grid. Ctrl moves by one visible row.
+            0x25 | 0x27 if self.video_tile_mode_active => {
+                self.handle_video_tile_cursor_key(ctx, fs_idx, key.ctrl, key.virtual_key == 0x25);
             }
             // Ctrl+Shift+Left / Right: frame step and pause.
             0x25 if key.ctrl && key.shift => {

@@ -2457,6 +2457,9 @@ pub(super) fn draw_native_tile_overlay(
             };
             let tile_h = (tile_w * aspect_h).round().max(30.0);
             let grid_top = 56.0;
+            let selected_idx = state
+                .selected_idx
+                .filter(|idx| *idx < state.timestamps.len());
 
             for idx in 0..state.timestamps.len() {
                 let col = idx % columns;
@@ -2513,6 +2516,14 @@ pub(super) fn draw_native_tile_overlay(
                         tile_rect.expand(1.0),
                         4.0,
                         egui::Stroke::new(2.0, egui::Color32::from_rgb(235, 235, 235)),
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                if selected_idx == Some(idx) {
+                    painter.rect_stroke(
+                        tile_rect.expand(2.0),
+                        5.0,
+                        egui::Stroke::new(3.0, egui::Color32::from_rgb(80, 170, 255)),
                         egui::StrokeKind::Inside,
                     );
                 }
