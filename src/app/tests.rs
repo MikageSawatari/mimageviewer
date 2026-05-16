@@ -3194,6 +3194,65 @@ mod favorite_adjustment_defaults_tests {
     }
 }
 
+#[cfg(all(test, windows))]
+mod native_video_rating_key_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+
+    fn native_key(
+        virtual_key: u32,
+        shift: bool,
+    ) -> crate::video::native_window::NativeVideoKeyEvent {
+        crate::video::native_window::NativeVideoKeyEvent {
+            virtual_key,
+            shift,
+            ctrl: false,
+            alt: false,
+            repeat: false,
+        }
+    }
+
+    fn push_video(app: &mut App, path: PathBuf) -> usize {
+        app.items.push(GridItem::Video(path));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.rebuild_visible_indices();
+        app.items.len() - 1
+    }
+
+    #[test]
+    fn native_video_fkeys_rate_current_video() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_video(&mut app, PathBuf::from(r"C:\clips\movie.mp4"));
+        app.fullscreen_idx = Some(idx);
+
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x72, false)); // F3
+        assert_eq!(app.get_rating(idx), 3);
+
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x75, false)); // F6
+        assert_eq!(app.get_rating(idx), 0);
+    }
+
+    #[test]
+    fn native_video_shift_fkeys_rate_current_container() {
+        let (mut app, _g, _tmp, _l) = setup_app();
+        let ctx = egui::Context::default();
+        let folder = PathBuf::from(r"C:\clips");
+        app.current_folder = Some(folder.clone());
+        let idx = push_video(&mut app, folder.join("movie.mp4"));
+        app.fullscreen_idx = Some(idx);
+
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x74, true)); // Shift+F5
+        let key = crate::adjustment_db::normalize_path(&folder);
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 5);
+        assert_eq!(app.current_folder_rating_cache, Some(5));
+
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x75, true)); // Shift+F6
+        assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
+        assert_eq!(app.current_folder_rating_cache, Some(0));
+    }
+}
+
 #[cfg(test)]
 mod file_operation_selection_tests {
     use super::phase_c_support::setup_app;

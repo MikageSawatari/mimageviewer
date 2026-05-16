@@ -335,7 +335,7 @@ c:\folder-1\a を表示中に Ctrl+↑ → c:\folder-1 へ（最初の子なの�
 | Shift + ←↑→↓ | 範囲選択（移動元～移動先を一括チェック） |
 | Ctrl + クリック | チェック可能なアイテムをチェック（複数選択） |
 | R / L | 選択画像を右 / 左に回転 |
-| F1〜F5 | 選択アイテム（またはチェック済み一括）に★1〜★5 のレーティングを付与。画像・ZIP 内画像・PDF ページに加え、フォルダ・ZIP・PDF 本体（コンテナ★）も対象 |
+| F1〜F5 | 選択アイテム（またはチェック済み一括）に★1〜★5 のレーティングを付与。画像・動画・ZIP 内画像・PDF ページに加え、フォルダ・ZIP・PDF 本体（コンテナ★）も対象 |
 | F6 | レーティング解除（0 に戻す） |
 | Shift+F1〜F5 | 現在一覧表示中のフォルダ / ZIP / PDF 本体にコンテナ★を付与 |
 | Shift+F6 | 現在一覧表示中のコンテナ★を解除 |
@@ -583,10 +583,10 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 ### 8.7 レーティング
 
 - 対象:
-  - ページ単位 (`is_ratable`): 通常画像 / ZIP 内画像 / PDF ページ
+  - 単一ファイル単位 (`is_rating_leaf`): 通常画像 / 動画 / ZIP 内画像 / PDF ページ
   - コンテナ (`is_container_ratable`): フォルダ / ZIP ファイル / PDF ファイル本体
   - ページとコンテナは独立に管理される (同じ `rating.db` だがキー形式が異なるので衝突しない)
-  - 動画・ZipSeparator・ConvertibleArchive は対象外
+  - ZipSeparator・ConvertibleArchive は対象外
 - 付与:
   - F1〜F5（★1〜★5）、F6 で解除。グリッドでは選択/チェック済み (`ratable_targets` = `accepts_rating`) に、フルスクリーンでは表示中ページに適用
   - Shift+F1〜F5 / Shift+F6: `current_folder` (現在一覧表示中のフォルダ / ZIP / PDF 本体) にコンテナ★を付与 / 解除。グリッド・フルスクリーン両方で動作
