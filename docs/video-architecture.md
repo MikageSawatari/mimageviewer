@@ -278,10 +278,16 @@ src/video/
 順で導入された。
 
 `thumbnail.rs` の `ThumbnailWorker` は seek hover preview と左 jump panel
-(pin/bookmark/chapter) のサムネイル warmup で共有する。hover 中はユーザーが現在
-見ようとしている target を最優先し、jump panel 側の未取得サムネ要求は送らない。
-hover していない時も marker warmup は bucket 単位で短時間の再送を抑制し、毎フレーム
-同じ miss を投げて hover request を supersede し続ける状態を作らない。
+(pin/bookmark/chapter) のサムネイル warmup で共有する。hover 側を最優先する条件は
+**「hover thumb が worker キャッシュにまだ無い (= worker が hover 用に busy)」のときだけ**
+で、すでに hover thumb がキャッシュ済みなら worker は idle 扱いで marker warmup を
+進める。旧版は `native_hover_thumbnail_target_secs` が `Some` であるだけで marker を
+suppress していたが、cursor が seek bar から hover サムネ自身に乗ったときの
+`hover_preview_target_secs` 固定 (`overlay_draw.rs` 側の挙動) で sticky 化し、新規
+bookmark のサムネ warmup が動画再 open まで永久に飢える事故 (2026-05-16 報告) があった
+ためフィルタを厳格化した。hover していない時も marker warmup は bucket 単位で短時間
+の再送を抑制し、毎フレーム同じ miss を投げて hover request を supersede し続ける状態を
+作らない。
 worker は初回 cache miss で長寿命の補助デコーダを lazy-open する。動画設定で HW decode
 が有効な場合は FFmpeg-owned D3D11VA device を優先し、出力は既存の
 `prepare_frame_for_swscale` で CPU readback して RGBA サムネイルへ変換する。main player

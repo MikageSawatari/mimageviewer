@@ -3281,26 +3281,34 @@ impl VideoPlayer {
     }
 
     /// Native jump panel の marker サムネ warmup 枠を 1 件消費する。
-    /// hover preview と worker を共有しているため、hover 中は marker 側から割り込まない。
-    /// 同じ bucket の miss も短時間は再送せず、毎フレームの上書きループを防ぐ。
+    /// hover preview と worker を共有しているため、hover が **まだ満たされていない間** は
+    /// marker 側から割り込まない (= 現在見ようとしているプレビューを最優先)。hover thumb
+    /// がすでに worker キャッシュに入っていれば worker は idle なので、marker warmup を
+    /// 進めてよい。同じ bucket の miss は短時間は再送せず、毎フレームの上書きループを防ぐ。
     /// 戻り値 true は「この marker を処理対象にしたので、このフレームでは後続 marker を
-    /// 要求しない」という意味。実際に request を送った場合だけでなく、hover 中や retry
+    /// 要求しない」という意味。実際に request を送った場合だけでなく、hover 未満足や retry
     /// 抑制中も true を返す。
     pub fn request_marker_thumbnail_warmup(&self, target_secs: f64) -> bool {
         if !target_secs.is_finite() || target_secs < 0.0 {
             return false;
         }
+        if self.thumb_worker.is_none() {
+            return true;
+        }
+        // hover が **未満足のとき** だけ marker を抑制する。
+        // 過去には hover target が Some であるだけで suppress していたが、
+        // `clear_native_hover_thumbnail` が届かない経路 (e.g., cursor が seek bar から
+        // hover サムネ自体に乗ると `seek_resp.hovered()` が外れても target_secs は固定
+        // — overlay_draw.rs の挙動) で sticky になり、新規 bookmark のサムネが
+        // 動画再 open まで永久に warmup されない問題があった (2026-05-16 報告)。
         #[cfg(windows)]
-        if self
+        if let Some(hover_target) = self
             .native_hover_thumbnail_target_secs
             .lock()
             .ok()
             .and_then(|target| *target)
-            .is_some()
+            && self.nearest_seek_thumbnail(hover_target).is_none()
         {
-            return true;
-        }
-        if self.thumb_worker.is_none() {
             return true;
         }
 
