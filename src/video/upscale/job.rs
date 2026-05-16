@@ -353,6 +353,42 @@ pub fn run_job(
         ));
     }
 
+    // T40 (Codex P2 / 2026-05-16): 出力先のディスク容量を概算して preflight する。
+    // 数時間走った末に ENOSPC で死ぬのを避け、UI 上で「容量不足」(= NoSpace) として
+    // 即座に表示する。`estimate_required_bytes` は v0.9.0 時点で 1.25x / 1.5x マージン
+    // 込み。`has_enough_space` が `Ok(None)` (= 非 Windows / unsupported) なら preflight
+    // をスキップしてランタイム検出に頼る。
+    {
+        let estimate = super::disk::estimate_required_bytes(
+            out_w,
+            out_h,
+            job.info.estimated_frames.unwrap_or(0),
+            0.8, // bits-per-pixel-per-frame (= 約 0.1 byte/px、高ビットレート目安)
+            false,
+        );
+        // 出力先の親 dir を query (= ドライブ容量を見る)。final output 側を優先
+        let probe_path = job
+            .output_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        match super::disk::has_enough_space(&probe_path, estimate.required_bytes) {
+            Ok(Some(true)) | Ok(None) => {}
+            Ok(Some(false)) => {
+                return Err(format!(
+                    "ディスク容量が不足しています: 必要 {} MB、ドライブ {} の空き容量が不足",
+                    estimate.required_bytes / (1024 * 1024),
+                    probe_path.display()
+                ));
+            }
+            Err(e) => {
+                crate::logger::log(format!(
+                    "[VideoUpscale] disk preflight check failed (continuing): {e}"
+                ));
+            }
+        }
+    }
+
     let part_path = final_part_path_for(&job.source_path);
     let _ = fs::remove_file(&part_path);
     let result =
@@ -911,6 +947,28 @@ fn run_segmented_video_only(
     // は定義上一致するので validation はスキップして余分な hash 計算を避ける。
     if was_loaded_from_disk {
         validate_manifest_matches_job(&manifest, job)?;
+        // T38: クラッシュ / process kill 後に Running 状態で残った segment を Pending
+        // に戻し、`.part.<worker_id>` orphan ファイルも掃除する。再起動した本プロセスの
+        // pid とは別の owner pid を「死亡」とみなす (= pid 再利用は started_ms で
+        // 判別しない簡易判定。後発 process が同じ pid を引いた場合でも自分の管理下に
+        // ない segment は Pending 化して再 spawn する方が安全)。
+        let current_pid = std::process::id();
+        let n_reset = manifest.reset_stale_running_segments(|pid, _started_ms| pid == current_pid);
+        if n_reset > 0 {
+            crate::logger::log(format!(
+                "[VideoUpscale] reset {n_reset} stale Running segment(s) after process restart"
+            ));
+            for seg in manifest
+                .segments
+                .iter()
+                .filter(|s| s.state == SegmentState::Pending)
+            {
+                cleanup_segment_parts(&work_dir, seg.index);
+            }
+            manifest
+                .save_atomic(&manifest_path)
+                .map_err(|e| format!("failed to save segment manifest: {e}"))?;
+        }
     }
     ensure_plan(job, &mut manifest, cancel)?;
     manifest
@@ -992,6 +1050,16 @@ fn run_segmented_video_only(
         if cancel.load(Ordering::Relaxed) {
             let _ = fs::remove_file(&seg_part);
             return Err("キャンセルされました".to_owned());
+        }
+        // T39 (Codex P2 / 2026-05-16): 0 フレームのセグメントは Done として publish しない。
+        // FFmpeg seek 後に対象範囲を超えるなどで encode 0 frame の "header だけ MKV" が
+        // `validate_segment_file` (= len()>0 のみ) を通過し、永久 reuse される事故を防ぐ。
+        if encoded.frame_count == 0 {
+            let _ = fs::remove_file(&seg_part);
+            return Err(format!(
+                "segment {} produced 0 frames (FFmpeg seek likely landed past the segment range)",
+                planned.index
+            ));
         }
         validate_segment_file(&seg_part)?;
 
@@ -1184,6 +1252,15 @@ fn run_segments_parallel(
                     progress_mode,
                 )
                 .and_then(|encoded| {
+                    // T39: 0 フレームは Done に上げない (`validate_segment_file` は
+                    // len()>0 だけ見るので header だけの空 MKV を弾けない)
+                    if encoded.frame_count == 0 {
+                        let _ = fs::remove_file(&worker_part);
+                        return Err(format!(
+                            "segment {} produced 0 frames (FFmpeg seek likely landed past the segment range)",
+                            worker_planned.index
+                        ));
+                    }
                     let planned_count = worker_planned
                         .target_end_frame_exclusive
                         .saturating_sub(worker_planned.target_start_frame);
@@ -1927,6 +2004,21 @@ fn concat_video_segments(
     let mut cumulative_offset = 0_i64;
     let mut packet_count = 0_u64;
 
+    // T41 (Codex P2 / 2026-05-16): 本ループは segment ごとに「直前の packet 末尾を
+    // 起点に offset を加算」する CFR 結合 (= 入力 PTS を rescale → 累積 offset 加算)
+    // のため、**VFR 動画は無言で CFR 変換される**。各 segment の plan 段階で
+    // `output_total_pts_ticks = frame_count * (1/fps)` を使う設計のため、出力動画の
+    // duration は「入力 frame 数 × 一定 fps」になる。元動画が VFR (= packet PTS の間隔が
+    // 一定でない、コマ落ち / 可変 fps カメラ) でも出力 fps は plan の fps_num/fps_den で
+    // 平準化される。
+    //
+    // 実害: (a) duration が元動画と微妙に異なる (b) plan 段階の fps が元 stream の
+    // avg_frame_rate を使うので、可変 fps の動画では音声同期が drift する。
+    //
+    // 真の修正は「各 segment の packet PTS をそのまま採用 + segment 間のシームレス連結」で、
+    // 実装には output_total_pts_ticks の計算を実 packet timing から導出する変更が要る。
+    // v0.10 で対応予定。本 v0.9.0 では「VFR は CFR に flatten される」挙動を明示する
+    // コメントで運用する (= ユーザー報告で気付けるように)。
     for segment in done_segments {
         check_finalize_cancel(cancel, packet_count)?;
         let path = work_dir.join(&segment.path);
