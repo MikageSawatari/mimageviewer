@@ -16533,6 +16533,12 @@ impl eframe::App for App {
         if self.video_upscale_running.is_some() {
             reasons.push("video_upscale_running");
         }
+        // AI upscale worker は別スレッドで完了するが、完了通知は UI thread の
+        // poll_ai_upscale() で取り込む。静止フルスクリーン中に egui が寝ると
+        // upscale_end 済みの結果が次のユーザー入力まで job_ready にならず、
+        // 先読みバーが数秒止まって見えるため、pending 中だけ低頻度に起こす。
+        let ai_upscale_poll_delay =
+            (!self.ai_upscale_pending.is_empty()).then_some(std::time::Duration::from_millis(33));
         // `keep_fullscreen_viewport_alive` の cleanup フレーム保証 (Codex P2 — 統一安全網)。
         // close_fullscreen が App::update 内のどこで呼ばれても、次フレームで keep_alive の
         // "Visible(false) 送信" 経路が確実に走るよう repaint を要求する。アイドル時の
@@ -16543,7 +16549,7 @@ impl eframe::App for App {
         if fs_cleanup_pending {
             reasons.push("fs_viewport_cleanup");
         }
-        let idle_upgrade_delay = if reasons.is_empty() {
+        let idle_upgrade_delay = if reasons.is_empty() && ai_upscale_poll_delay.is_none() {
             self.thumb_idle_upgrade_recheck_delay()
         } else {
             None
@@ -16551,6 +16557,8 @@ impl eframe::App for App {
 
         if !reasons.is_empty() {
             ctx.request_repaint();
+        } else if let Some(delay) = ai_upscale_poll_delay {
+            ctx.request_repaint_after(delay);
         } else if let Some(delay) = idle_upgrade_delay {
             ctx.request_repaint_after(delay);
         }
@@ -16562,6 +16570,8 @@ impl eframe::App for App {
         if crate::perf::is_enabled() {
             let action = if !reasons.is_empty() {
                 "request_repaint"
+            } else if ai_upscale_poll_delay.is_some() {
+                "request_repaint_after_ai_upscale"
             } else if idle_upgrade_delay.is_some() {
                 "request_repaint_after_idle_upgrade"
             } else {
