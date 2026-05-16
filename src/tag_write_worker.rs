@@ -188,7 +188,15 @@ impl TagWriteHandle {
 
 impl Drop for TagWriteHandle {
     fn drop(&mut self) {
+        // T55 (Codex R-TAG-001 / 2026-05-16): on_exit → App::drop → ここの流れで、
+        // worker が在庫ジョブ (XMP 書き込み + Tantivy commit) を drain し切るのを
+        // 待つ。旧コードは shutdown フラグだけ立てて join せずにスレッドを detach
+        // していたため、終了直前にキューされたタグ変更が永久に失われる事故 (rating
+        // worker 側は既に同パターンで join 済み、不整合) になっていた。
         self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(thread) = self._thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 

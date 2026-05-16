@@ -138,7 +138,12 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp_path = tmp_path_for(path);
     std::fs::write(&tmp_path, bytes)?;
 
-    let _ = std::fs::remove_file(path);
+    // T57 (Codex P2 / 2026-05-16): 旧コードは `remove_file(path)` → `rename(tmp, path)` の
+    // 2 ステップで、削除と rename の間に他プロセスが path を開くと「ファイル無し」を見る
+    // race window があった。`data_dir.rs` は同じ pattern を 65bde65c で削除済。`std::fs::
+    // rename` は Windows でも同名既存ファイルを atomic replace するので remove_file は不要
+    // (version-scoped runtime dir のおかげで発火確率は低かったが、他所で修正済の旧パターン
+    // を残さないために統一する)。
     std::fs::rename(&tmp_path, path)?;
     Ok(())
 }
