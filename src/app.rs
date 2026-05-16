@@ -3820,14 +3820,51 @@ impl App {
         // 数百 ms ブロックする。signal_stop で cancel は立ててから、実際の join は
         // バックグラウンドスレッドに逃がす。spawn 失敗時は closure が現スレッドで drop
         // されるので同期 join にフォールバックする (UI ブロックするが整合性は保たれる)。
-        if let Some(handle) = self.name_index_supervisors.remove(&fav_id) {
+        //
+        // T53 (Codex R-SEARCH-002 / 2026-05-16): OFF 遷移の `clear_for_favorite` は
+        // **必ず supervisor の join 完了後**に走らせる。旧コードは joiner スレッドを
+        // spawn した直後に UI スレッドで clear を呼んでいたため、supervisor の最後の
+        // upsert が DB mutex 待ち中に clear が走り、その後 upsert が完了して OFF 後の
+        // 索引にゴーストレコードを残す race があった。new_on=false 経路では clear を
+        // joiner closure 内に移し、join 完了後 (= in-flight upsert 全消化後) に走らせる。
+        let existing_handle = self.name_index_supervisors.remove(&fav_id);
+        let clear_target = if !new_on {
+            self.search_index_db
+                .as_ref()
+                .map(|db| (Arc::clone(db), fav_path.to_path_buf()))
+        } else {
+            None
+        };
+        if let Some(handle) = existing_handle {
             handle.signal_stop();
+            let join_and_clear = move || {
+                drop(handle);
+                if let Some((db, path)) = clear_target {
+                    if let Err(e) = db.clear_for_favorite(&path) {
+                        crate::logger::log(format!(
+                            "favorites: clear name index for {} failed (post-join): {e}",
+                            path.display()
+                        ));
+                    }
+                }
+            };
             if let Err(e) = std::thread::Builder::new()
                 .name(format!("name-index-joiner-{}", fav_id.as_simple()))
-                .spawn(move || drop(handle))
+                .spawn(join_and_clear)
             {
                 crate::logger::log(format!(
                     "name-index-joiner spawn failed, sync join instead: {e}"
+                ));
+                // spawn 失敗時は closure が現スレッドで drop される (= UI ブロックするが
+                // join + clear の順序は保たれる)
+            }
+        } else if let Some((db, path)) = clear_target {
+            // 既存 supervisor が居なかった場合 (= 既に OFF だが clear を念のため呼ぶ
+            // / 起動直後の冪等処理) はそのまま同期 clear。
+            if let Err(e) = db.clear_for_favorite(&path) {
+                crate::logger::log(format!(
+                    "favorites: clear name index for {} failed: {e}",
+                    path.display()
                 ));
             }
         }
@@ -3847,11 +3884,6 @@ impl App {
                 Some(Arc::clone(&self.activity_gate)),
             );
             self.name_index_supervisors.insert(fav_id, handle);
-        } else if let Err(e) = db.clear_for_favorite(fav_path) {
-            crate::logger::log(format!(
-                "favorites: clear name index for {} failed: {e}",
-                fav_path.display()
-            ));
         }
     }
 
@@ -8127,6 +8159,9 @@ impl App {
             let Some((mtime, file_size)) = self.image_metas.get(i).copied().flatten() else {
                 continue;
             };
+            // T54: Ctrl+S 検索結果は full-path キーで衝突回避
+            let use_full_path_keys =
+                self.current_folder.as_deref() == Some(search_results_synthetic_path().as_path());
             let Some(mut req) = self.items.get(i).and_then(|item| {
                 make_load_request(
                     item,
@@ -8140,6 +8175,7 @@ impl App {
                     &self.folder_pin_map,
                     self.folder_thumb_pin_db.as_deref(),
                     self.video_pin_db.as_ref(),
+                    use_full_path_keys,
                 )
             }) else {
                 continue;
@@ -8436,6 +8472,9 @@ impl App {
             let Some((mtime, file_size)) = self.image_metas.get(i).copied().flatten() else {
                 continue;
             };
+            // T54: Ctrl+S 検索結果は full-path キーで衝突回避 (= idle upgrade も同じく)
+            let use_full_path_keys =
+                self.current_folder.as_deref() == Some(search_results_synthetic_path().as_path());
             let Some(mut req) = self.items.get(i).and_then(|item| {
                 make_load_request(
                     item,
@@ -8449,6 +8488,7 @@ impl App {
                     &self.folder_pin_map,
                     self.folder_thumb_pin_db.as_deref(),
                     self.video_pin_db.as_ref(),
+                    use_full_path_keys,
                 )
             }) else {
                 continue;
@@ -16829,6 +16869,12 @@ fn make_load_request(
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
     video_pin_db: Option<&crate::video_pins::VideoPinDb>,
+    // T54 (Codex R-SEARCH-001 / 2026-05-16): Ctrl+S 結果のように「複数フォルダの
+    // 同名コンテナが同一リストに混在しうる」コンテキストでは、basename だけの
+    // cache key (`folderthumb:cover` / `zipthumb:cover.zip` 等) が衝突して別フォルダの
+    // サムネを誤表示する。`true` を渡すと full path を含むキーを使う。
+    // 通常閲覧 (= 同一親フォルダ内なので basename ユニーク) は `false` で OK。
+    use_full_path_keys: bool,
 ) -> Option<LoadRequest> {
     // 共通フィールド (idx/path/mtime/file_size/skip_cache) 以外は Default (0/None/false)
     // を基底にして差分だけ上書きする。入力 seq / items_gen は後段のエンキューで上書きされる。
@@ -16868,7 +16914,12 @@ fn make_load_request(
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
-            let base_key = format!("{}{fname}", CACHE_KEY_ZIP);
+            // T54: 検索結果コンテキストでは full path 込みのキーで衝突回避
+            let base_key = if use_full_path_keys {
+                format!("{}{}", CACHE_KEY_ZIP, p.to_string_lossy())
+            } else {
+                format!("{}{fname}", CACHE_KEY_ZIP)
+            };
             let req = LoadRequest {
                 path: p.clone(),
                 cache_key_override: Some(base_key.clone()),
@@ -16891,7 +16942,12 @@ fn make_load_request(
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
-            let base_key = format!("{}{fname}", CACHE_KEY_PDF);
+            // T54: 検索結果コンテキストでは full path 込みのキーで衝突回避
+            let base_key = if use_full_path_keys {
+                format!("{}{}", CACHE_KEY_PDF, p.to_string_lossy())
+            } else {
+                format!("{}{fname}", CACHE_KEY_PDF)
+            };
             let req = LoadRequest {
                 path: p.clone(),
                 pdf_page: Some(0),
@@ -16916,7 +16972,12 @@ fn make_load_request(
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
-            let base_key = format!("{}{fname}", CACHE_KEY_FOLDER);
+            // T54: 検索結果コンテキストでは full path 込みのキーで衝突回避
+            let base_key = if use_full_path_keys {
+                format!("{}{}", CACHE_KEY_FOLDER, p.to_string_lossy())
+            } else {
+                format!("{}{fname}", CACHE_KEY_FOLDER)
+            };
             let req = LoadRequest {
                 path: p.clone(),
                 cache_key_override: Some(base_key.clone()),

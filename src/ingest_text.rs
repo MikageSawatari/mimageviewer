@@ -213,7 +213,15 @@ fn read_video_metadata_raw(path: &Path) -> Option<String> {
     use ffmpeg_the_third as ffmpeg;
 
     ffmpeg::init().ok()?;
-    let input = ffmpeg::format::input(path).ok()?;
+    // T52 (Codex P2 / 2026-05-16): network mount や stall ファイルに引きずられて
+    // ingester worker thread が永久ブロックするのを防ぐため、open に 10 秒 deadline
+    // の interrupt callback を付ける。動画プレイヤー経路 (avio_progress.rs) と同じ
+    // パターン (= deadline 超過で callback が `true` を返し avformat_open_input が
+    // abort される)。10s は最初の packet 読み取りまで含む。
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let input =
+        ffmpeg::format::input_with_interrupt(path, move || std::time::Instant::now() >= deadline)
+            .ok()?;
     let mut parts: Vec<String> = Vec::new();
     push_metadata_value(&mut parts, &input, &["title", "TITLE"]);
     push_metadata_value(&mut parts, &input, &["artist", "ARTIST", "author"]);
