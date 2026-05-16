@@ -164,6 +164,24 @@ fn rating_tooltip(idx: usize) -> String {
     }
 }
 
+fn counts_as_thumbnail_item(item: &GridItem) -> bool {
+    !matches!(item, GridItem::ZipSeparator { .. })
+}
+
+fn thumbnail_count_label(items: &[GridItem], visible_indices: &[usize]) -> String {
+    let total = items
+        .iter()
+        .filter(|item| counts_as_thumbnail_item(item))
+        .count();
+    let visible = visible_indices
+        .iter()
+        .filter_map(|&idx| items.get(idx))
+        .filter(|item| counts_as_thumbnail_item(item))
+        .count();
+    let width = total.max(1).to_string().len();
+    format!("({:>width$}/{})", visible, total, width = width)
+}
+
 /// ★フィルタのボタン 1 個を描画し、状態が変わったら true を返す。
 /// `enabled = false` の間はクリックを無視し、見た目も disabled スタイルで描画する。
 ///
@@ -966,6 +984,12 @@ impl App {
         // 現在表示中フォルダ / ZIP / PDF のコンテナレーティングを取得。
         // 0 のときは非表示、1〜5 のときは★バッジをアドレス欄の右端に表示する。
         let folder_rating = self.current_folder_rating();
+        let thumbnail_count = (!self.global_search.active
+            && !self.favsearch.active
+            && !self.items_are_global_search_view
+            && self.search_filter.is_none()
+            && self.search_pending.is_none())
+        .then(|| thumbnail_count_label(&self.items, &self.visible_indices));
         // 📌 (代表サムネ固定) ボタンの表示判定 + 状態をあらかじめ計算する。
         // closure 内で `self` のミュータブル借用が衝突しないように外で確定しておく。
         let pin_button_info = self.compute_folder_pin_button_state();
@@ -1011,6 +1035,16 @@ impl App {
                                     pin_click = PinButtonClick::Remove;
                                 }
                             }
+                            ui.add_space(4.0);
+                        }
+                        if let Some(count) = thumbnail_count.as_ref() {
+                            ui.label(
+                                egui::RichText::new(count.as_str())
+                                    .size(11.0)
+                                    .monospace()
+                                    .color(egui::Color32::from_gray(140)),
+                            )
+                            .on_hover_text("表示中のサムネイル数 / 全サムネイル数");
                             ui.add_space(4.0);
                         }
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
@@ -1784,6 +1818,30 @@ impl App {
 #[cfg(test)]
 mod rating_filter_op_tests {
     use super::*;
+
+    #[test]
+    fn thumbnail_count_label_pads_visible_to_total_digits() {
+        let items: Vec<GridItem> = (0..100)
+            .map(|i| GridItem::Image(PathBuf::from(format!("img_{i}.jpg"))))
+            .collect();
+        let visible_indices: Vec<usize> = (0..20).collect();
+
+        assert_eq!(thumbnail_count_label(&items, &visible_indices), "( 20/100)");
+    }
+
+    #[test]
+    fn thumbnail_count_label_ignores_zip_separators() {
+        let items = vec![
+            GridItem::Image(PathBuf::from("a.jpg")),
+            GridItem::ZipSeparator {
+                dir_display: "chapter".to_string(),
+            },
+            GridItem::Image(PathBuf::from("b.jpg")),
+        ];
+        let visible_indices = vec![0, 1];
+
+        assert_eq!(thumbnail_count_label(&items, &visible_indices), "(1/2)");
+    }
 
     #[test]
     fn is_solo_detects_single_on_bucket() {
