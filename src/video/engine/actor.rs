@@ -2333,6 +2333,29 @@ mod tests {
     }
 
     #[test]
+    fn eof_reached_with_zero_duration_still_freezes_av_clock() {
+        // duration_secs == 0 のコンテナ (= ストリーミング系で長さ取得不能) でも
+        // EofReached は機能する。caller (= mod.rs の EOF block) が
+        // `clock.now_secs()` を fallback に渡すケースを想定したテスト
+        // (Codex P2 2026-05-18 退行修正)。
+        let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
+        actor.transition_to_playing(ClockAnchor::audio(0.0, Instant::now()));
+        // duration_secs=0 を渡しても EofReached は通常通り transition_to_eof を呼ぶ。
+        actor.handle_decoder_event(DecoderEvent::EofReached {
+            epoch: actor.current_seek_epoch(),
+            duration_secs: 0.0,
+        });
+        assert_eq!(actor.state, EngineState::Eof);
+        assert_eq!(actor.published_state_code(), state_code::EOF);
+        assert!(
+            !av_clock.is_playing(),
+            "AvClock should freeze (playing=false) even with duration_secs=0"
+        );
+        // Frozen anchor は pts=0.0 (= caller が 0 を渡したので)
+        assert!((av_clock.now_secs() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn play_from_eof_state_triggers_replay_seek_to_zero() {
         // EOF stop 後に Play 命令が来ると handle_play の Eof arm が走り、
         // handle_seek_request(0.0) で epoch++ + state=Seeking{0.0} に遷移する。

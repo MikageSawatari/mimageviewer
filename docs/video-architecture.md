@@ -368,20 +368,23 @@ in-flight seek の override とまだ発行されていない pending seek を�
 だけ true になるので、進行中の通常 seek は誤検出しない。通常の near-end seek は
 post-seek フレーム到着で override が clear されて `is_seeking()` が false になり、
 timeout に達する前にラッチが解除される。override をクリアするだけで playing / 位置の
-更新は行わず、その後の処理は EOF block (native / 非 native とも `set_position_at_eof`
-+ `set_playing(false)`) が seek 固着の解けた状態で引き継ぐ。
+更新は行わず、その後の処理は EOF block (native / 非 native とも下記の
+`handle_decoder_event(EofReached)` 同期呼び出し) が seek 固着の解けた状態で引き継ぐ。
 
 **native 経路の EOF 停止**: `tick` の native presenter ブロック (early return する
 `if self.native_output.is_some()`) は、以前は **ループ ON のときのループ seek しか
 処理していなかった**。native 経路はこの early return で抜けるため非 native 経路の
-EOF block (`set_position_at_eof` + `set_playing(false)`) に到達せず、ループ OFF で
-末尾に達すると `is_playing()` が true のままクロックが `duration` を超えて進み続けた
-(2026-05 報告「動画末尾を超えて再生が進む」)。現在は `quiet_now` の発火条件から
-`loop_enabled` を外し (ループ ON/OFF どちらでも EOF drain 完了を待つ)、発火後の
-アクションだけ `loop_enabled` で分岐する: ON ならループ seek、OFF なら
-`set_position_at_eof(duration)` + `set_playing(false)` で duration 位置に凍結停止する。
+EOF block にも到達せず、ループ OFF で末尾に達すると `is_playing()` が true のまま
+クロックが `duration` を超えて進み続けた (2026-05 報告「動画末尾を超えて再生が進む」)。
+現在は `quiet_now` の発火条件から `loop_enabled` を外し (ループ ON/OFF どちらでも
+EOF drain 完了を待つ)、発火後のアクションだけ `loop_enabled` で分岐する: ON なら
+ループ seek、OFF なら `engine.handle_decoder_event(DecoderEvent::EofReached { ... })`
+を同期呼び出しして engine state=Eof + AvClock Frozen(duration) + playing=false を
+atomic に確定する (詳細は `## AvClock の状態管理` の「EofReached の同期配線」を参照)。
 これにより seek 固着解除 (上記) / `seek_relative` の境界 override クリアの後も、
 `is_seeking()` が false になり次第この EOF block がクロックを末尾で止める。
+`duration_secs == 0 / 不明` のコンテナでは `clock.now_secs()` を fallback に使い、
+duration が取れないファイルでも EOF で必ず停止する。
 
 **境界トーストの linger**: native overlay の `NativeOverlayToast` は表示維持時間を
 `linger: Duration` フィールドで個別に持つ。`show_toast` の `linger` 引数が `None` の

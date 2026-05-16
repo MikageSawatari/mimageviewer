@@ -3384,11 +3384,13 @@ impl VideoPlayer {
         // EOF で停止中に Space を押されたら 0 から再生し直す (replay)。
         // 通常の再生中は単純トグル。
         //
-        // **EOF 判定は AvClock 直読** (Codex P2 2026-05-17 補足): engine は
-        // `DecoderEvent::EofReached` を受け取らないため Eof state にならない (= 配線未完)。
-        // 代わりに `mod.rs` の EOF block (L4456 / L4593) が `clock.set_playing(false)` を
-        // 直接呼ぶので、EOF 時は `is_playing()=false && is_eof_reached()=true` の組み合わせ
-        // でのみ検出できる。intent (= opts.autoplay) は EOF を知らないので使えない。
+        // **EOF 判定** (2026-05-18 update): EofReached は engine に同期配線され、EOF 到達時に
+        // engine.state=Eof + AvClock playing=false + is_eof_reached=true が atomic に確定する。
+        // 「`!is_playing() && is_eof_reached()`」は engine_state==Eof と等価で、EOF 検出条件
+        // として有効。`apply_command(Play)` の Eof arm 経由でも replay できる
+        // (= `set_playing(true)` 経路) が、user の Space 入力は user seek 経路で
+        // epoch 競合なく扱いたいので、ここでは明示的に `request_seek(0)` + `handle_seek_request(0)`
+        // + `apply_command(Play)` を発行する。
         if !self.clock.is_playing() && self.clock.is_eof_reached() {
             self.clear_pending_user_seek();
             self.clear_initial_pause_controls();
@@ -3454,12 +3456,13 @@ impl VideoPlayer {
         } else {
             self.clear_pending_user_seek();
         }
-        // **EOF replay 特例**: 配線未完のため engine は EofReached を受け取らず
-        // `opts.autoplay` が EOF を跨いでも変わらない。よって「autoplay=true で
-        // EOF に達した状態」では `prev_intent=true, p=true` で dispatch skip 扱い
-        // になるが、ユーザーが play ボタンを押したときは replay (= 0 から再生) を
-        // 期待する。EOF + p=true は強制 dispatch することで handle_play の Eof arm
-        // (= seek 0 + autoplay 強制) を発火させる。
+        // **EOF replay 特例**: EofReached が engine に配線された後 (2026-05-18) は
+        // engine.state=Eof / opts.autoplay は handle_pause で false に降ろされない限り
+        // true を維持する。「autoplay=true で EOF に達した状態」では
+        // `prev_intent=true, p=true` で通常なら dispatch skip 扱いになるが、ユーザーが
+        // play ボタンを押したときは replay (= 0 から再生) を期待する。EOF + p=true は
+        // 強制 dispatch することで `handle_play` の Eof arm (= `handle_seek_request(0)` +
+        // autoplay 強制) を発火させ replay する。
         let force_dispatch = p && self.clock.is_eof_reached();
         if prev_intent != p || force_dispatch {
             self.dispatch_play_pause(p);
@@ -4476,16 +4479,26 @@ impl VideoPlayer {
                     // 特例 (= handle_play の Eof arm) が発火せず replay できなかった
                     // (Codex P2-2 2026-05-17)。同期呼び出しで state を Eof に正しく
                     // 遷移させることでこの不整合を解消する。
-                    if let Some(info) = self.info.as_ref()
-                        && info.duration_secs > 0.0
-                    {
-                        let mut g = self.engine.lock().unwrap();
-                        let cur_epoch = g.current_seek_epoch();
-                        g.handle_decoder_event(engine::state::DecoderEvent::EofReached {
-                            epoch: cur_epoch,
-                            duration_secs: info.duration_secs,
-                        });
-                    }
+                    //
+                    // **duration_secs 不明 fallback** (Codex P2 2026-05-18): 旧 set_playing
+                    // 直書きは duration 不明でも常に呼ばれていたので、duration 取れない
+                    // ファイル (= ストリーミング系 / コンテナが duration を持たない種)
+                    // でも EOF で停止していた。新コードで `duration_secs > 0` のときだけ
+                    // EofReached を発火していると engine.state が Playing のまま残り、
+                    // tick が無限に回り続ける退行になる。`duration_secs == 0` の場合は
+                    // 現在位置 (= AvClock.now_secs) で freeze する。
+                    let duration_for_eof = self
+                        .info
+                        .as_ref()
+                        .map(|info| info.duration_secs)
+                        .filter(|d| *d > 0.0)
+                        .unwrap_or_else(|| self.clock.now_secs().max(0.0));
+                    let mut g = self.engine.lock().unwrap();
+                    let cur_epoch = g.current_seek_epoch();
+                    g.handle_decoder_event(engine::state::DecoderEvent::EofReached {
+                        epoch: cur_epoch,
+                        duration_secs: duration_for_eof,
+                    });
                 }
             }
             // 動画オープン中 (= 1 フレームも表示されていない) は preparing HUD の
@@ -4625,16 +4638,19 @@ impl VideoPlayer {
                 // 末端到達 → engine に EofReached を同期的に流し、state=Eof +
                 // AvClock freeze(duration) + playing=false を atomic に確定する。
                 // native 経路と同じ理由・処理 (詳細はそちらの doc コメント参照)。
-                if let Some(info) = self.info.as_ref()
-                    && info.duration_secs > 0.0
-                {
-                    let mut g = self.engine.lock().unwrap();
-                    let cur_epoch = g.current_seek_epoch();
-                    g.handle_decoder_event(engine::state::DecoderEvent::EofReached {
-                        epoch: cur_epoch,
-                        duration_secs: info.duration_secs,
-                    });
-                }
+                // duration_secs == 0 の fallback も同じ。
+                let duration_for_eof = self
+                    .info
+                    .as_ref()
+                    .map(|info| info.duration_secs)
+                    .filter(|d| *d > 0.0)
+                    .unwrap_or_else(|| self.clock.now_secs().max(0.0));
+                let mut g = self.engine.lock().unwrap();
+                let cur_epoch = g.current_seek_epoch();
+                g.handle_decoder_event(engine::state::DecoderEvent::EofReached {
+                    epoch: cur_epoch,
+                    duration_secs: duration_for_eof,
+                });
             }
         }
 
