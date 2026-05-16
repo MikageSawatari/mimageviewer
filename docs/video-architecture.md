@@ -277,6 +277,19 @@ src/video/
 分割) → Phase 3 (state machine 配線) → Phase 4 (薄い facade 化を最終形として固定) の
 順で導入された。
 
+`thumbnail.rs` の `ThumbnailWorker` は seek hover preview と左 jump panel
+(pin/bookmark/chapter) のサムネイル warmup で共有する。hover 中はユーザーが現在
+見ようとしている target を最優先し、jump panel 側の未取得サムネ要求は送らない。
+hover していない時も marker warmup は bucket 単位で短時間の再送を抑制し、毎フレーム
+同じ miss を投げて hover request を supersede し続ける状態を作らない。
+左 jump panel の pin/bookmark/chapter サムネは、worker で一度取得できた時点で WebP
+として永続化する。pin は既存の `video_pins.db`、bookmark は
+`video_bookmarks.thumb_webp`、埋め込み chapter は動画 file identity + chapter start
+をキーにした `video_chapter_thumbs.db` を使い、次回以降の fullscreen open では
+`FullscreenVideoMarkerCache` にデコード済み RGBA を載せて即表示する。DB の WebP
+BLOB 読み出しと WebP→RGBA decode は `video-marker-thumbs` worker で行い、UI thread
+側は pin/bookmark の軽量メタ (pts/title) だけを同期取得する。
+
 ### 各ファイルの責務
 
 #### `mod.rs` (`VideoPlayer`)

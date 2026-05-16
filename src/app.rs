@@ -1389,11 +1389,177 @@ pub(crate) struct NativeVideoFastSwapPending {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct VideoMarkerCachedThumbnail {
+    pub(crate) target_secs: f64,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rgba: Arc<Vec<u8>>,
+}
+
+impl VideoMarkerCachedThumbnail {
+    #[cfg(windows)]
+    pub(crate) fn to_native_overlay_thumbnail(
+        &self,
+    ) -> crate::video::native_presenter::NativeOverlayThumbnail {
+        crate::video::native_presenter::NativeOverlayThumbnail {
+            target_secs: self.target_secs,
+            width: self.width,
+            height: self.height,
+            rgba: Arc::clone(&self.rgba),
+        }
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn from_native_overlay_thumbnail(
+        target_secs: f64,
+        thumbnail: &crate::video::native_presenter::NativeOverlayThumbnail,
+    ) -> Option<Self> {
+        if !target_secs.is_finite() || target_secs < 0.0 {
+            return None;
+        }
+        let expected_len = thumbnail.width as usize * thumbnail.height as usize * 4;
+        if thumbnail.width == 0 || thumbnail.height == 0 || thumbnail.rgba.len() != expected_len {
+            return None;
+        }
+        Some(Self {
+            target_secs,
+            width: thumbnail.width,
+            height: thumbnail.height,
+            rgba: Arc::clone(&thumbnail.rgba),
+        })
+    }
+}
+
+fn decode_video_marker_cached_thumbnail(
+    target_secs: f64,
+    webp: &[u8],
+) -> Option<VideoMarkerCachedThumbnail> {
+    if !target_secs.is_finite() || target_secs < 0.0 || webp.is_empty() {
+        return None;
+    }
+    let (width, height, rgba) = crate::catalog::decode_thumb_to_rgba(webp)?;
+    let expected_len = width as usize * height as usize * 4;
+    if width == 0 || height == 0 || rgba.len() != expected_len {
+        return None;
+    }
+    Some(VideoMarkerCachedThumbnail {
+        target_secs,
+        width,
+        height,
+        rgba: Arc::new(rgba),
+    })
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct FullscreenVideoMarkerCache {
     pub(crate) fs_idx: usize,
     pub(crate) path: PathBuf,
     pub(crate) pin_pts: Option<f64>,
+    pub(crate) pin_thumbnail: Option<VideoMarkerCachedThumbnail>,
+    pub(crate) pin_thumb_current: bool,
     pub(crate) bookmarks: Vec<crate::video_bookmarks::VideoBookmarkMeta>,
+    pub(crate) bookmark_thumbnails: std::collections::HashMap<i64, VideoMarkerCachedThumbnail>,
+    pub(crate) chapter_thumbnails: std::collections::HashMap<i64, VideoMarkerCachedThumbnail>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FullscreenVideoMarkerSnapshot {
+    pub(crate) pin_pts: Option<f64>,
+    pub(crate) pin_thumbnail: Option<VideoMarkerCachedThumbnail>,
+    pub(crate) pin_thumb_current: bool,
+    pub(crate) bookmarks: Vec<crate::video_bookmarks::VideoBookmarkMeta>,
+    pub(crate) bookmark_thumbnails: std::collections::HashMap<i64, VideoMarkerCachedThumbnail>,
+    pub(crate) chapter_thumbnails: std::collections::HashMap<i64, VideoMarkerCachedThumbnail>,
+}
+
+impl From<&FullscreenVideoMarkerCache> for FullscreenVideoMarkerSnapshot {
+    fn from(value: &FullscreenVideoMarkerCache) -> Self {
+        Self {
+            pin_pts: value.pin_pts,
+            pin_thumbnail: value.pin_thumbnail.clone(),
+            pin_thumb_current: value.pin_thumb_current,
+            bookmarks: value.bookmarks.clone(),
+            bookmark_thumbnails: value.bookmark_thumbnails.clone(),
+            chapter_thumbnails: value.chapter_thumbnails.clone(),
+        }
+    }
+}
+
+pub(crate) struct FullscreenVideoMarkerThumbDecodePending {
+    pub(crate) fs_idx: usize,
+    pub(crate) path: PathBuf,
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) rx: mpsc::Receiver<FullscreenVideoMarkerThumbDecodeResult>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct FullscreenVideoMarkerThumbDecodeResult {
+    pub(crate) fs_idx: usize,
+    pub(crate) path: PathBuf,
+    pub(crate) pin_pts: Option<f64>,
+    pub(crate) pin_thumbnail: Option<VideoMarkerCachedThumbnail>,
+    pub(crate) pin_thumb_current: bool,
+    pub(crate) bookmark_thumbnails: std::collections::HashMap<i64, VideoMarkerCachedThumbnail>,
+    pub(crate) chapter_thumbnails: std::collections::HashMap<i64, VideoMarkerCachedThumbnail>,
+}
+
+fn run_fullscreen_video_marker_thumb_decode(
+    fs_idx: usize,
+    path: PathBuf,
+    cancel: Arc<AtomicBool>,
+) -> FullscreenVideoMarkerThumbDecodeResult {
+    let mut result = FullscreenVideoMarkerThumbDecodeResult {
+        fs_idx,
+        path: path.clone(),
+        pin_pts: None,
+        pin_thumbnail: None,
+        pin_thumb_current: false,
+        bookmark_thumbnails: std::collections::HashMap::new(),
+        chapter_thumbnails: std::collections::HashMap::new(),
+    };
+    if cancel.load(Ordering::Relaxed) {
+        return result;
+    }
+    if let Ok(db) = crate::video_pins::VideoPinDb::open()
+        && let Some(pin) = db.lookup(&path)
+    {
+        result.pin_pts = Some(pin.pin_pts_secs);
+        result.pin_thumb_current = pin.thumb_is_current();
+        result.pin_thumbnail =
+            decode_video_marker_cached_thumbnail(pin.pin_pts_secs, &pin.thumb_webp);
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return result;
+    }
+    if let Ok(db) = crate::video_bookmarks::VideoBookmarkDb::open() {
+        for bookmark in db.list(&path) {
+            if cancel.load(Ordering::Relaxed) {
+                return result;
+            }
+            if let Some(thumbnail) =
+                decode_video_marker_cached_thumbnail(bookmark.pts_secs, &bookmark.thumb_webp)
+            {
+                result.bookmark_thumbnails.insert(bookmark.id, thumbnail);
+            }
+        }
+    }
+    if cancel.load(Ordering::Relaxed) {
+        return result;
+    }
+    if let Ok(db) = crate::video_chapter_thumbs::VideoChapterThumbDb::open() {
+        for chapter in db.list(&path) {
+            if cancel.load(Ordering::Relaxed) {
+                return result;
+            }
+            let key = crate::video_chapter_thumbs::chapter_start_key(chapter.start_secs);
+            if let Some(thumbnail) =
+                decode_video_marker_cached_thumbnail(chapter.start_secs, &chapter.thumb_webp)
+            {
+                result.chapter_thumbnails.insert(key, thumbnail);
+            }
+        }
+    }
+    result
 }
 
 pub struct App {
@@ -1896,6 +2062,10 @@ pub struct App {
     /// ユーザーが任意位置に付けた付箋。フルスクリーン左パネルにジャンプサムネとして
     /// 表示される。B キー / 🔖 ボタンで追加。
     pub(crate) video_bookmark_db: Option<crate::video_bookmarks::VideoBookmarkDb>,
+    /// 動画埋め込みチャプターのジャンプパネル用サムネイル DB。
+    /// チャプター自体は動画メタデータ由来なので、サムネだけ mIV 側で path + file identity
+    /// + chapter start をキーに永続化する。
+    pub(crate) video_chapter_thumb_db: Option<crate::video_chapter_thumbs::VideoChapterThumbDb>,
 
     // ── 親コンテナ (フォルダ/ZIP/PDF) 代表サムネ ピン留め ────────
     /// 親コンテナの代表サムネを手動で固定するためのピン DB。
@@ -1962,6 +2132,10 @@ pub struct App {
     /// フルスクリーン動画のピン / ブックマークキャッシュ。
     /// `App::update` とシークバー描画中に SQLite SELECT を毎フレーム走らせない。
     pub(crate) fullscreen_video_marker_cache: Option<FullscreenVideoMarkerCache>,
+    /// 動画 marker サムネイル DB (WebP) の読み出し / decode worker。
+    /// marker の pts / title など軽量メタは同期で入れ、BLOB と image decode はここで受ける。
+    pub(crate) fullscreen_video_marker_thumb_decode_pending:
+        Option<FullscreenVideoMarkerThumbDecodePending>,
     /// 動画ループ境界 tick の baseline (= 直前 tick の `(position_secs, current_seek_serial)`)。
     /// CH/BM ループモードで「次境界跨ぎ」を検出するために `tick_native_video_loop_boundary` が
     /// fs_idx ごとに維持する。serial 変化や巻き戻りで baseline 更新のみを行い、誤爆 seek を防ぐ。
@@ -2755,6 +2929,10 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_video_bookmarks", 0, t);
 
         let t = std::time::Instant::now();
+        let video_chapter_thumb_db = crate::video_chapter_thumbs::VideoChapterThumbDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_video_chapter_thumbs", 0, t);
+
+        let t = std::time::Instant::now();
         let video_tile_cache = crate::video::tile_thumb_cache::TileThumbCache::open()
             .ok()
             .map(std::sync::Arc::new);
@@ -2964,6 +3142,7 @@ impl App {
             normalize_ui_states: std::collections::HashMap::new(),
             video_pin_db,
             video_bookmark_db,
+            video_chapter_thumb_db,
             folder_thumb_pin_db,
             folder_pin_map: std::collections::HashMap::new(),
             folder_thumb_pin_dirty: false,
@@ -2991,6 +3170,7 @@ impl App {
             #[cfg(windows)]
             pending_pin_thumb_refresh: None,
             fullscreen_video_marker_cache: None,
+            fullscreen_video_marker_thumb_decode_pending: None,
             last_loop_pos: std::collections::HashMap::new(),
             video_perf_overlay_visible: false,
             rating_db,
@@ -3266,23 +3446,30 @@ impl App {
             if self.fullscreen_idx == Some(fs_idx) {
                 self.fullscreen_video_marker_cache = None;
             }
+            self.cancel_fullscreen_video_marker_thumb_decode();
             return;
         };
-        let pin_pts = self
-            .video_pin_db
+        let mut cache = self.build_fullscreen_video_marker_cache_light(fs_idx, path.clone());
+        if let Some(prev) = self
+            .fullscreen_video_marker_cache
             .as_ref()
-            .and_then(|db| db.lookup_pts(&path));
-        let bookmarks = self
-            .video_bookmark_db
-            .as_ref()
-            .map(|db| db.list_marker_entries(&path))
-            .unwrap_or_default();
-        self.fullscreen_video_marker_cache = Some(FullscreenVideoMarkerCache {
-            fs_idx,
-            path,
-            pin_pts,
-            bookmarks,
-        });
+            .filter(|prev| prev.fs_idx == fs_idx && prev.path == path)
+        {
+            if prev.pin_pts == cache.pin_pts {
+                cache.pin_thumbnail = prev.pin_thumbnail.clone();
+            }
+            let valid_bookmark_ids: std::collections::HashSet<i64> =
+                cache.bookmarks.iter().map(|bookmark| bookmark.id).collect();
+            cache.bookmark_thumbnails = prev
+                .bookmark_thumbnails
+                .iter()
+                .filter(|(id, _)| valid_bookmark_ids.contains(id))
+                .map(|(id, thumb)| (*id, thumb.clone()))
+                .collect();
+            cache.chapter_thumbnails = prev.chapter_thumbnails.clone();
+        }
+        self.fullscreen_video_marker_cache = Some(cache);
+        self.start_fullscreen_video_marker_thumb_decode(fs_idx, path);
     }
 
     pub(crate) fn ensure_fullscreen_video_marker_cache(&mut self, fs_idx: usize) {
@@ -3311,22 +3498,143 @@ impl App {
         fs_idx: usize,
         path: &Path,
     ) -> (Option<f64>, Vec<crate::video_bookmarks::VideoBookmarkMeta>) {
+        let snapshot = self.fullscreen_video_marker_cached_snapshot(fs_idx, path);
+        (snapshot.pin_pts, snapshot.bookmarks)
+    }
+
+    pub(crate) fn fullscreen_video_marker_cached_snapshot(
+        &self,
+        fs_idx: usize,
+        path: &Path,
+    ) -> FullscreenVideoMarkerSnapshot {
         if let Some(cache) = self.fullscreen_video_marker_cache.as_ref()
             && cache.fs_idx == fs_idx
             && cache.path == path
         {
-            return (cache.pin_pts, cache.bookmarks.clone());
+            return FullscreenVideoMarkerSnapshot::from(cache);
         }
-        let pin_pts = self
+        FullscreenVideoMarkerSnapshot::from(
+            &self.build_fullscreen_video_marker_cache_light(fs_idx, path.to_path_buf()),
+        )
+    }
+
+    fn build_fullscreen_video_marker_cache_light(
+        &self,
+        fs_idx: usize,
+        path: PathBuf,
+    ) -> FullscreenVideoMarkerCache {
+        let pin = self
             .video_pin_db
             .as_ref()
-            .and_then(|db| db.lookup_pts(path));
+            .and_then(|db| db.lookup_meta(&path));
+        let (pin_pts, pin_thumb_current) = pin
+            .as_ref()
+            .map(|pin| (Some(pin.pin_pts_secs), pin.thumb_is_current()))
+            .unwrap_or((None, false));
         let bookmarks = self
             .video_bookmark_db
             .as_ref()
-            .map(|db| db.list_marker_entries(path))
+            .map(|db| db.list_marker_entries(&path))
             .unwrap_or_default();
-        (pin_pts, bookmarks)
+        FullscreenVideoMarkerCache {
+            fs_idx,
+            path,
+            pin_pts,
+            pin_thumbnail: None,
+            pin_thumb_current,
+            bookmarks,
+            bookmark_thumbnails: std::collections::HashMap::new(),
+            chapter_thumbnails: std::collections::HashMap::new(),
+        }
+    }
+
+    fn cancel_fullscreen_video_marker_thumb_decode(&mut self) {
+        if let Some(pending) = self.fullscreen_video_marker_thumb_decode_pending.take() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn start_fullscreen_video_marker_thumb_decode(&mut self, fs_idx: usize, path: PathBuf) {
+        self.cancel_fullscreen_video_marker_thumb_decode();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = Arc::clone(&cancel);
+        let path_worker = path.clone();
+        let (tx, rx) = mpsc::channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("video-marker-thumbs".to_string())
+            .spawn(move || {
+                let result = run_fullscreen_video_marker_thumb_decode(
+                    fs_idx,
+                    path_worker,
+                    Arc::clone(&cancel_worker),
+                );
+                if !cancel_worker.load(Ordering::Relaxed) {
+                    let _ = tx.send(result);
+                }
+            });
+        if let Err(e) = spawn_result {
+            crate::logger::log(format!(
+                "video marker thumb decode worker spawn failed: {e}"
+            ));
+            return;
+        }
+        self.fullscreen_video_marker_thumb_decode_pending =
+            Some(FullscreenVideoMarkerThumbDecodePending {
+                fs_idx,
+                path,
+                cancel,
+                rx,
+            });
+    }
+
+    pub(crate) fn poll_fullscreen_video_marker_thumb_decode(&mut self, ctx: &egui::Context) {
+        let msg = match self
+            .fullscreen_video_marker_thumb_decode_pending
+            .as_ref()
+            .map(|pending| pending.rx.try_recv())
+        {
+            Some(Ok(result)) => Some(Ok(result)),
+            Some(Err(mpsc::TryRecvError::Empty)) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                return;
+            }
+            Some(Err(mpsc::TryRecvError::Disconnected)) => Some(Err(())),
+            None => return,
+        };
+        let Some(pending) = self.fullscreen_video_marker_thumb_decode_pending.take() else {
+            return;
+        };
+        pending.cancel.store(true, Ordering::Relaxed);
+        let Ok(result) = msg.unwrap_or(Err(())) else {
+            return;
+        };
+        if result.fs_idx != pending.fs_idx || result.path != pending.path {
+            return;
+        }
+        let Some(cache) = self
+            .fullscreen_video_marker_cache
+            .as_mut()
+            .filter(|cache| cache.fs_idx == result.fs_idx && cache.path == result.path)
+        else {
+            return;
+        };
+        if result.pin_pts == cache.pin_pts {
+            if cache.pin_thumbnail.is_none() || !cache.pin_thumb_current {
+                cache.pin_thumbnail = result.pin_thumbnail;
+            }
+            cache.pin_thumb_current |= result.pin_thumb_current;
+        }
+        let valid_bookmark_ids: std::collections::HashSet<i64> =
+            cache.bookmarks.iter().map(|bookmark| bookmark.id).collect();
+        for (id, thumbnail) in result.bookmark_thumbnails {
+            if valid_bookmark_ids.contains(&id) {
+                cache.bookmark_thumbnails.entry(id).or_insert(thumbnail);
+            }
+        }
+        for (key, thumbnail) in result.chapter_thumbnails {
+            cache.chapter_thumbnails.entry(key).or_insert(thumbnail);
+        }
+        ctx.request_repaint();
     }
 
     /// パフォーマンス計装用の input_seq を +1 してユーザー入力イベントを記録する。
@@ -12452,6 +12760,7 @@ impl App {
         }
         self.fullscreen_idx = None;
         self.fullscreen_video_marker_cache = None;
+        self.cancel_fullscreen_video_marker_thumb_decode();
         #[cfg(windows)]
         {
             self.pending_pin_thumb_refresh = None;
@@ -14642,6 +14951,7 @@ impl App {
         if let Some(idx) = self.fullscreen_idx {
             self.ensure_fullscreen_video_marker_cache(idx);
         }
+        self.poll_fullscreen_video_marker_thumb_decode(ctx);
 
         // 表示用 mode (= ユーザー設定値) は HUD ボタン表示にそのまま使う。
         // 再生挙動用 (= 「実際にループするか」) は per-video の has_ch / has_bm から導出する

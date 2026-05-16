@@ -59,6 +59,21 @@ impl VideoPin {
     }
 }
 
+/// WebP BLOB を読まずに扱うピンの軽量メタデータ。
+#[derive(Clone, Debug)]
+pub struct VideoPinMeta {
+    pub pin_pts_secs: f64,
+    pub thumb_pts_secs: Option<f64>,
+}
+
+impl VideoPinMeta {
+    #[allow(dead_code)]
+    pub fn thumb_is_current(&self) -> bool {
+        self.thumb_pts_secs
+            .is_some_and(|t| (t - self.pin_pts_secs).abs() < 1e-3)
+    }
+}
+
 /// 動画ピン DB ハンドル。Phase 5.3 時点ではスキーマだけ用意し、API は no-op。
 pub struct VideoPinDb {
     #[allow(dead_code)]
@@ -103,6 +118,22 @@ impl VideoPinDb {
             .prepare_cached("SELECT pin_pts_secs FROM video_pins WHERE path = ?1")
             .ok()?;
         stmt.query_row([&key], |row| row.get::<_, f64>(0)).ok()
+    }
+
+    /// WebP BLOB を読まずに、左ジャンプパネルやループ判定で必要なピンメタだけ返す。
+    pub fn lookup_meta(&self, video_path: &Path) -> Option<VideoPinMeta> {
+        let key = crate::path_key::normalize_keep_drive(video_path);
+        let mut stmt = self
+            .conn
+            .prepare_cached("SELECT pin_pts_secs, thumb_pts_secs FROM video_pins WHERE path = ?1")
+            .ok()?;
+        stmt.query_row([&key], |row| {
+            Ok(VideoPinMeta {
+                pin_pts_secs: row.get(0)?,
+                thumb_pts_secs: row.get::<_, Option<f64>>(1)?,
+            })
+        })
+        .ok()
     }
 
     /// 動画パスに対応するピン情報を取得。Phase 5.3 ではスキーマ通りに読みに行くが、
@@ -226,6 +257,19 @@ mod tests {
         let got = db.lookup(p).expect("present");
         assert!((got.pin_pts_secs - 12.5).abs() < 1e-9);
         assert_eq!(got.thumb_webp, blob);
+    }
+
+    #[test]
+    fn lookup_meta_skips_webp_blob() {
+        let db = open_in_memory();
+        let p = Path::new("C:/Videos/Movie.MP4");
+        db.set_pin(p, 12.5, &[1, 2, 3]).expect("set");
+
+        let meta = db.lookup_meta(p).expect("meta");
+
+        assert!((meta.pin_pts_secs - 12.5).abs() < 1e-9);
+        assert_eq!(meta.thumb_pts_secs, Some(12.5));
+        assert!(meta.thumb_is_current());
     }
 
     #[test]

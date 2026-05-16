@@ -140,6 +140,10 @@ pub struct VideoPlayer {
     error: Option<String>,
     /// シーク先サムネ抽出ワーカー。Drop で停止する。
     thumb_worker: Option<ThumbnailWorker>,
+    /// Native jump panel の pin/bookmark/chapter サムネ warmup を bucket 単位で抑制する。
+    /// hover preview と同じ `ThumbnailWorker` を共有するため、marker 側の毎フレーム再要求が
+    /// hover 要求を上書きし続けないようにする。
+    marker_thumbnail_warmup_requests: Mutex<std::collections::HashMap<i64, std::time::Instant>>,
     /// 未来フレーム (pts > clock now) のキュー。channel から pull した順に末尾に push、
     /// front から `pts <= now + small_margin` のものを取り出して表示。FIFO 連続性を保つことで
     /// 高 fps コンテンツでも display が channel head の far-future にジャンプしない。
@@ -2805,6 +2809,7 @@ fn run_native_video_output(
 pub(crate) const MAX_RENDER_QUEUE: usize = 24;
 const FRAME_STEP_NO_PENDING_SEQ: u64 = u64::MAX;
 const USER_SEEK_REISSUE_AFTER: std::time::Duration = std::time::Duration::from_millis(250);
+const MARKER_THUMBNAIL_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Debug, Default)]
 struct UserSeekCoalesceState {
@@ -2944,6 +2949,7 @@ impl VideoPlayer {
                 info: None,
                 error: Some(format!("FFmpeg DLL のロードに失敗しました: {e}")),
                 thumb_worker: None,
+                marker_thumbnail_warmup_requests: Mutex::new(std::collections::HashMap::new()),
                 future_frames: std::collections::VecDeque::new(),
                 pending_resume_secs: None,
                 last_seen_seek_serial: 0,
@@ -3176,6 +3182,7 @@ impl VideoPlayer {
             info: None,
             error: native_init_error,
             thumb_worker,
+            marker_thumbnail_warmup_requests: Mutex::new(std::collections::HashMap::new()),
             future_frames: std::collections::VecDeque::new(),
             pending_resume_secs: resume_secs,
             last_seen_seek_serial: 0,
@@ -3251,9 +3258,54 @@ impl VideoPlayer {
 
     /// シークホバー位置のサムネを要求する。debounce はワーカー側 (drain) で実施。
     pub fn request_seek_thumbnail(&self, target_secs: f64) {
+        if !target_secs.is_finite() || target_secs < 0.0 {
+            return;
+        }
         if let Some(w) = &self.thumb_worker {
             w.request(target_secs);
         }
+    }
+
+    /// Native jump panel の marker サムネ warmup 枠を 1 件消費する。
+    /// hover preview と worker を共有しているため、hover 中は marker 側から割り込まない。
+    /// 同じ bucket の miss も短時間は再送せず、毎フレームの上書きループを防ぐ。
+    /// 戻り値 true は「この marker を処理対象にしたので、このフレームでは後続 marker を
+    /// 要求しない」という意味。実際に request を送った場合だけでなく、hover 中や retry
+    /// 抑制中も true を返す。
+    pub fn request_marker_thumbnail_warmup(&self, target_secs: f64) -> bool {
+        if !target_secs.is_finite() || target_secs < 0.0 {
+            return false;
+        }
+        #[cfg(windows)]
+        if self
+            .native_hover_thumbnail_target_secs
+            .lock()
+            .ok()
+            .and_then(|target| *target)
+            .is_some()
+        {
+            return true;
+        }
+        if self.thumb_worker.is_none() {
+            return true;
+        }
+
+        let key = crate::video::thumbnail::bucket_key(target_secs);
+        let now = std::time::Instant::now();
+        {
+            let Ok(mut warmups) = self.marker_thumbnail_warmup_requests.lock() else {
+                return true;
+            };
+            if warmups
+                .get(&key)
+                .is_some_and(|last| now.duration_since(*last) < MARKER_THUMBNAIL_RETRY_AFTER)
+            {
+                return true;
+            }
+            warmups.insert(key, now);
+        }
+        self.request_seek_thumbnail(target_secs);
+        true
     }
 
     #[cfg(windows)]

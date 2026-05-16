@@ -512,10 +512,12 @@ pub(super) fn draw_native_jump_panel(
                         });
                         ui.add_space(3.0);
                         for (idx, entry) in section_entries {
+                            let time_text = format_native_jump_entry_time(entry, entries);
                             draw_native_jump_row(
                                 ui,
                                 idx,
                                 entry,
+                                &time_text,
                                 jump_texture_ids,
                                 bookmark_title_edit,
                                 commands,
@@ -531,6 +533,7 @@ pub(super) fn draw_native_jump_row(
     ui: &mut egui::Ui,
     idx: usize,
     entry: &NativeOverlayJumpEntry,
+    time_text: &str,
     jump_texture_ids: &HashMap<usize, egui::TextureId>,
     bookmark_title_edit: &mut Option<NativeBookmarkTitleEdit>,
     commands: &mut Vec<NativeOverlayCommand>,
@@ -595,7 +598,7 @@ pub(super) fn draw_native_jump_row(
         painter.text(
             egui::pos2(text_x + 36.0, row_rect.min.y + 14.0),
             egui::Align2::LEFT_CENTER,
-            format_overlay_time(entry.pts_secs),
+            time_text,
             egui::FontId::proportional(12.0),
             egui::Color32::from_rgb(232, 232, 232),
         );
@@ -3119,6 +3122,45 @@ pub(super) fn format_overlay_time(secs: f64) -> String {
     }
 }
 
+pub(super) fn format_overlay_time_millis(secs: f64) -> String {
+    let total_ms = (finite_nonnegative(secs) * 1000.0).round() as u64;
+    let total_secs = total_ms / 1000;
+    let ms = total_ms % 1000;
+    let h = total_secs / 3600;
+    let m = (total_secs % 3600) / 60;
+    let s = total_secs % 60;
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}.{ms:03}")
+    } else {
+        format!("{m}:{s:02}.{ms:03}")
+    }
+}
+
+fn overlay_time_rounded_second_key(secs: f64) -> u64 {
+    finite_nonnegative(secs).round() as u64
+}
+
+fn overlay_time_has_millis(secs: f64) -> bool {
+    ((finite_nonnegative(secs) * 1000.0).round() as u64) % 1000 != 0
+}
+
+pub(super) fn format_native_jump_entry_time(
+    entry: &NativeOverlayJumpEntry,
+    entries: &[NativeOverlayJumpEntry],
+) -> String {
+    let second_key = overlay_time_rounded_second_key(entry.pts_secs);
+    let same_second_count = entries
+        .iter()
+        .filter(|other| overlay_time_rounded_second_key(other.pts_secs) == second_key)
+        .take(2)
+        .count();
+    if overlay_time_has_millis(entry.pts_secs) || same_second_count > 1 {
+        format_overlay_time_millis(entry.pts_secs)
+    } else {
+        format_overlay_time(entry.pts_secs)
+    }
+}
+
 pub(super) fn format_tile_interval(secs: f64) -> String {
     let secs = finite_nonnegative(secs);
     if secs >= 60.0 {
@@ -3215,6 +3257,43 @@ mod tests {
         assert_eq!(hover_bottom, overlay_h - 48.0);
         assert_eq!(jump.max.y, hover_bottom);
         assert_eq!(meta.max.y, hover_bottom);
+    }
+
+    fn jump_entry(pts_secs: f64) -> NativeOverlayJumpEntry {
+        NativeOverlayJumpEntry {
+            pts_secs,
+            kind: NativeOverlayTimelineMarkerKind::Chapter,
+            title: None,
+            bookmark_id: None,
+            thumbnail: None,
+        }
+    }
+
+    #[test]
+    fn native_jump_time_uses_millis_for_fractional_or_duplicate_seconds() {
+        let entries = vec![
+            jump_entry(80.0),
+            jump_entry(80.04),
+            jump_entry(597.88),
+            jump_entry(600.0),
+        ];
+
+        assert_eq!(
+            format_native_jump_entry_time(&entries[0], &entries),
+            "1:20.000"
+        );
+        assert_eq!(
+            format_native_jump_entry_time(&entries[1], &entries),
+            "1:20.040"
+        );
+        assert_eq!(
+            format_native_jump_entry_time(&entries[2], &entries),
+            "9:57.880"
+        );
+        assert_eq!(
+            format_native_jump_entry_time(&entries[3], &entries),
+            "10:00"
+        );
     }
 
     fn perf_sample(late_drop_delta: u32, interval_ms: f32) -> NativeOverlayPerfSample {

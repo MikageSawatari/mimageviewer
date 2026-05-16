@@ -84,6 +84,7 @@ pub mod update_check;
 #[cfg(windows)]
 pub mod video;
 pub mod video_bookmarks;
+pub mod video_chapter_thumbs;
 pub mod video_pins;
 pub mod wic_decoder;
 pub mod xmp_reader;

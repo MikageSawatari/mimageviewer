@@ -50,6 +50,16 @@ pub struct VideoBookmarkMeta {
     pub title: Option<String>,
 }
 
+impl From<&VideoBookmark> for VideoBookmarkMeta {
+    fn from(value: &VideoBookmark) -> Self {
+        Self {
+            id: value.id,
+            pts_secs: value.pts_secs,
+            title: value.title.clone(),
+        }
+    }
+}
+
 /// ブックマーク列から、ループ境界として使う「区間の開始秒」を **正規化済み Vec** で返す。
 /// finite + nonneg + sort + dedup (1us 単位)。`start_at` / `first_boundary_after` は
 /// この正規化を前提に動く。
@@ -221,6 +231,18 @@ impl VideoBookmarkDb {
         Ok(())
     }
 
+    /// 既存ブックマークのジャンプパネル用サムネイルを更新する。
+    pub fn update_thumb(&self, id: i64, thumb_webp: &[u8]) -> Result<(), rusqlite::Error> {
+        if thumb_webp.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "UPDATE video_bookmarks SET thumb_webp = ?1 WHERE id = ?2",
+            rusqlite::params![thumb_webp, id],
+        )?;
+        Ok(())
+    }
+
     /// 個別削除 (id = `add` の戻り値)。
     #[allow(dead_code)]
     pub fn remove(&self, id: i64) -> Result<(), rusqlite::Error> {
@@ -345,6 +367,18 @@ mod tests {
         db.update_title(id, Some("   ")).unwrap();
         let list = db.list(p);
         assert!(list[0].title.is_none());
+    }
+
+    #[test]
+    fn update_thumb_sets_existing_blob() {
+        let db = open_in_memory();
+        let p = Path::new("C:/v.mp4");
+        let id = db.add(p, 1.0, None, &[]).unwrap();
+
+        db.update_thumb(id, &[9, 8, 7]).unwrap();
+
+        let list = db.list(p);
+        assert_eq!(list[0].thumb_webp, vec![9, 8, 7]);
     }
 
     #[test]

@@ -15,6 +15,46 @@ pub(crate) struct PendingPinThumbRefresh {
 }
 
 #[cfg(windows)]
+enum MarkerThumbSave {
+    Pin {
+        pts_secs: f64,
+        thumb_webp: Vec<u8>,
+        cached: VideoMarkerCachedThumbnail,
+    },
+    Bookmark {
+        id: i64,
+        thumb_webp: Vec<u8>,
+        cached: VideoMarkerCachedThumbnail,
+    },
+    Chapter {
+        pts_secs: f64,
+        thumb_webp: Vec<u8>,
+        cached: VideoMarkerCachedThumbnail,
+    },
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum MarkerThumbSaveTarget {
+    Pin,
+    Bookmark { id: i64 },
+    Chapter,
+}
+
+#[cfg(windows)]
+fn encode_native_overlay_thumbnail_webp(
+    thumbnail: &crate::video::native_presenter::NativeOverlayThumbnail,
+) -> Option<Vec<u8>> {
+    let expected_len = thumbnail.width as usize * thumbnail.height as usize * 4;
+    if thumbnail.width == 0 || thumbnail.height == 0 || thumbnail.rgba.len() != expected_len {
+        return None;
+    }
+    let encoder = webp::Encoder::from_rgba(&thumbnail.rgba, thumbnail.width, thumbnail.height);
+    let webp = encoder.encode(75.0).to_vec();
+    (!webp.is_empty()).then_some(webp)
+}
+
+#[cfg(windows)]
 struct NativeVideoSourceSwapStarted {
     from_idx: usize,
     target_idx: usize,
@@ -2377,68 +2417,71 @@ impl App {
     #[cfg(windows)]
     pub(crate) fn sync_native_video_timeline_markers(&mut self, fs_idx: usize) {
         self.ensure_fullscreen_video_marker_cache(fs_idx);
-        let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
-            return;
+        let (path, chapters) = {
+            let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+                return;
+            };
+            if player.error().is_some() {
+                return;
+            };
+            (
+                player.path().clone(),
+                player
+                    .info()
+                    .map(|info| info.chapters.clone())
+                    .unwrap_or_default(),
+            )
         };
-        if player.error().is_some() {
-            return;
-        };
-        let path = player.path().clone();
-        let chapters = player
-            .info()
-            .map(|info| info.chapters.clone())
-            .unwrap_or_default();
         let mut markers: Vec<crate::video::native_presenter::NativeOverlayTimelineMarker> =
             Vec::new();
-        let mut entries: Vec<crate::video::native_presenter::NativeOverlayJumpEntry> = Vec::new();
-        let (pin_pts, bookmarks) = self.fullscreen_video_marker_snapshot(fs_idx, &path);
+        let mut entries: Vec<JumpEntryWork> = Vec::new();
+        let snapshot = self.fullscreen_video_marker_cached_snapshot(fs_idx, &path);
 
-        let requested_thumb = std::cell::Cell::new(false);
-        let make_thumbnail =
-            |pts_secs: f64| -> Option<crate::video::native_presenter::NativeOverlayThumbnail> {
-                if let Some(thumb) = player.nearest_seek_thumbnail(pts_secs) {
-                    Some(crate::video::native_presenter::NativeOverlayThumbnail {
-                        target_secs: thumb.target_secs,
-                        width: thumb.width,
-                        height: thumb.height,
-                        rgba: thumb.rgba,
-                    })
-                } else {
-                    if !requested_thumb.replace(true) {
-                        player.request_seek_thumbnail(pts_secs);
-                    }
-                    None
-                }
-            };
+        struct JumpEntryWork {
+            entry: crate::video::native_presenter::NativeOverlayJumpEntry,
+            cached: Option<VideoMarkerCachedThumbnail>,
+            refresh_cached: bool,
+            save_target: MarkerThumbSaveTarget,
+        }
 
-        if let Some(pts_secs) = pin_pts {
+        if let Some(pts_secs) = snapshot.pin_pts {
             markers.push(
                 crate::video::native_presenter::NativeOverlayTimelineMarker {
                     pts_secs,
                     kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Pin,
                 },
             );
-            entries.push(crate::video::native_presenter::NativeOverlayJumpEntry {
-                pts_secs,
-                kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Pin,
-                title: Some("代表フレーム".to_string()),
-                bookmark_id: None,
-                thumbnail: make_thumbnail(pts_secs),
+            entries.push(JumpEntryWork {
+                entry: crate::video::native_presenter::NativeOverlayJumpEntry {
+                    pts_secs,
+                    kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Pin,
+                    title: Some("代表フレーム".to_string()),
+                    bookmark_id: None,
+                    thumbnail: None,
+                },
+                cached: snapshot.pin_thumbnail.clone(),
+                refresh_cached: !snapshot.pin_thumb_current,
+                save_target: MarkerThumbSaveTarget::Pin,
             });
         }
-        for bookmark in bookmarks {
+        for bookmark in snapshot.bookmarks {
             markers.push(
                 crate::video::native_presenter::NativeOverlayTimelineMarker {
                     pts_secs: bookmark.pts_secs,
                     kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Bookmark,
                 },
             );
-            entries.push(crate::video::native_presenter::NativeOverlayJumpEntry {
-                pts_secs: bookmark.pts_secs,
-                kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Bookmark,
-                title: bookmark.title.clone(),
-                bookmark_id: Some(bookmark.id),
-                thumbnail: make_thumbnail(bookmark.pts_secs),
+            entries.push(JumpEntryWork {
+                entry: crate::video::native_presenter::NativeOverlayJumpEntry {
+                    pts_secs: bookmark.pts_secs,
+                    kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Bookmark,
+                    title: bookmark.title.clone(),
+                    bookmark_id: Some(bookmark.id),
+                    thumbnail: None,
+                },
+                cached: snapshot.bookmark_thumbnails.get(&bookmark.id).cloned(),
+                refresh_cached: false,
+                save_target: MarkerThumbSaveTarget::Bookmark { id: bookmark.id },
             });
         }
         for chapter in chapters {
@@ -2448,12 +2491,18 @@ impl App {
                     kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Chapter,
                 },
             );
-            entries.push(crate::video::native_presenter::NativeOverlayJumpEntry {
-                pts_secs: chapter.start_secs,
-                kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Chapter,
-                title: chapter.title.clone(),
-                bookmark_id: None,
-                thumbnail: make_thumbnail(chapter.start_secs),
+            let chapter_key = crate::video_chapter_thumbs::chapter_start_key(chapter.start_secs);
+            entries.push(JumpEntryWork {
+                entry: crate::video::native_presenter::NativeOverlayJumpEntry {
+                    pts_secs: chapter.start_secs,
+                    kind: crate::video::native_presenter::NativeOverlayTimelineMarkerKind::Chapter,
+                    title: chapter.title.clone(),
+                    bookmark_id: None,
+                    thumbnail: None,
+                },
+                cached: snapshot.chapter_thumbnails.get(&chapter_key).cloned(),
+                refresh_cached: false,
+                save_target: MarkerThumbSaveTarget::Chapter,
             });
         }
         markers.retain(|marker| marker.pts_secs.is_finite() && marker.pts_secs >= 0.0);
@@ -2462,14 +2511,189 @@ impl App {
                 .partial_cmp(&b.pts_secs)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        entries.retain(|entry| entry.pts_secs.is_finite() && entry.pts_secs >= 0.0);
+        entries.retain(|work| work.entry.pts_secs.is_finite() && work.entry.pts_secs >= 0.0);
         entries.sort_by(|a, b| {
-            a.pts_secs
-                .partial_cmp(&b.pts_secs)
+            a.entry
+                .pts_secs
+                .partial_cmp(&b.entry.pts_secs)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        player.set_native_timeline_markers(markers);
-        player.set_native_jump_entries(entries);
+
+        let mut pending_saves = Vec::new();
+        let output_entries = {
+            let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
+                return;
+            };
+            let requested_thumb = std::cell::Cell::new(false);
+            let mut make_thumbnail =
+                |pts_secs: f64,
+                 cached: Option<&VideoMarkerCachedThumbnail>,
+                 refresh_cached: bool,
+                 save_target: MarkerThumbSaveTarget|
+                 -> Option<crate::video::native_presenter::NativeOverlayThumbnail> {
+                    if refresh_cached || cached.is_none() {
+                        if let Some(thumb) = player.nearest_seek_thumbnail(pts_secs) {
+                            let native = crate::video::native_presenter::NativeOverlayThumbnail {
+                                target_secs: thumb.target_secs,
+                                width: thumb.width,
+                                height: thumb.height,
+                                rgba: thumb.rgba,
+                            };
+                            if let (Some(thumb_webp), Some(cached_thumb)) = (
+                                encode_native_overlay_thumbnail_webp(&native),
+                                VideoMarkerCachedThumbnail::from_native_overlay_thumbnail(
+                                    pts_secs, &native,
+                                ),
+                            ) {
+                                pending_saves.push(match save_target {
+                                    MarkerThumbSaveTarget::Pin => MarkerThumbSave::Pin {
+                                        pts_secs,
+                                        thumb_webp,
+                                        cached: cached_thumb,
+                                    },
+                                    MarkerThumbSaveTarget::Bookmark { id } => {
+                                        MarkerThumbSave::Bookmark {
+                                            id,
+                                            thumb_webp,
+                                            cached: cached_thumb,
+                                        }
+                                    }
+                                    MarkerThumbSaveTarget::Chapter => MarkerThumbSave::Chapter {
+                                        pts_secs,
+                                        thumb_webp,
+                                        cached: cached_thumb,
+                                    },
+                                });
+                            }
+                            return Some(native);
+                        }
+                        if !requested_thumb.get() {
+                            requested_thumb.set(player.request_marker_thumbnail_warmup(pts_secs));
+                        }
+                    }
+                    cached.map(VideoMarkerCachedThumbnail::to_native_overlay_thumbnail)
+                };
+            entries
+                .into_iter()
+                .map(|mut work| {
+                    work.entry.thumbnail = make_thumbnail(
+                        work.entry.pts_secs,
+                        work.cached.as_ref(),
+                        work.refresh_cached,
+                        work.save_target,
+                    );
+                    work.entry
+                })
+                .collect::<Vec<_>>()
+        };
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_timeline_markers(markers);
+            player.set_native_jump_entries(output_entries);
+        }
+        for save in pending_saves {
+            self.persist_native_video_marker_thumbnail(fs_idx, &path, save);
+        }
+    }
+
+    #[cfg(windows)]
+    fn persist_native_video_marker_thumbnail(
+        &mut self,
+        fs_idx: usize,
+        path: &std::path::Path,
+        save: MarkerThumbSave,
+    ) {
+        match save {
+            MarkerThumbSave::Pin {
+                pts_secs,
+                thumb_webp,
+                cached,
+            } => {
+                let Some(db) = self.video_pin_db.as_ref() else {
+                    return;
+                };
+                match db.set_pin(path, pts_secs, &thumb_webp) {
+                    Ok(()) => {
+                        self.video_thumb_overrides_dirty = true;
+                        if let Some(cache) = self
+                            .fullscreen_video_marker_cache
+                            .as_mut()
+                            .filter(|cache| cache.fs_idx == fs_idx && cache.path.as_path() == path)
+                        {
+                            cache.pin_pts = Some(pts_secs);
+                            cache.pin_thumbnail = Some(cached);
+                            cache.pin_thumb_current = true;
+                        }
+                        crate::logger::log(format!(
+                            "video marker thumb cached: pin pts={pts_secs:.2}s webp={}B {}",
+                            thumb_webp.len(),
+                            path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                        ));
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!("video marker pin thumb cache failed: {e}"))
+                    }
+                }
+            }
+            MarkerThumbSave::Bookmark {
+                id,
+                thumb_webp,
+                cached,
+            } => {
+                let Some(db) = self.video_bookmark_db.as_ref() else {
+                    return;
+                };
+                match db.update_thumb(id, &thumb_webp) {
+                    Ok(()) => {
+                        if let Some(cache) = self
+                            .fullscreen_video_marker_cache
+                            .as_mut()
+                            .filter(|cache| cache.fs_idx == fs_idx && cache.path.as_path() == path)
+                        {
+                            cache.bookmark_thumbnails.insert(id, cached);
+                        }
+                        crate::logger::log(format!(
+                            "video marker thumb cached: bookmark id={id} webp={}B {}",
+                            thumb_webp.len(),
+                            path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                        ));
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!("video marker bookmark thumb cache failed: {e}"))
+                    }
+                }
+            }
+            MarkerThumbSave::Chapter {
+                pts_secs,
+                thumb_webp,
+                cached,
+            } => {
+                let Some(db) = self.video_chapter_thumb_db.as_ref() else {
+                    return;
+                };
+                match db.set(path, pts_secs, &thumb_webp) {
+                    Ok(()) => {
+                        if let Some(cache) = self
+                            .fullscreen_video_marker_cache
+                            .as_mut()
+                            .filter(|cache| cache.fs_idx == fs_idx && cache.path.as_path() == path)
+                        {
+                            cache.chapter_thumbnails.insert(
+                                crate::video_chapter_thumbs::chapter_start_key(pts_secs),
+                                cached,
+                            );
+                        }
+                        crate::logger::log(format!(
+                            "video marker thumb cached: chapter pts={pts_secs:.2}s webp={}B {}",
+                            thumb_webp.len(),
+                            path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                        ));
+                    }
+                    Err(e) => {
+                        crate::logger::log(format!("video marker chapter thumb cache failed: {e}"))
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(windows)]
