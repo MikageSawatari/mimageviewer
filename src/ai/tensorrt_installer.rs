@@ -39,7 +39,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -70,11 +70,33 @@ const PACK_BASE_URL_ENV: &str = "MIV_TRT_PACK_BASE_URL";
 
 /// 実際に DL に使う base URL を返す。env var が立っていればそちら、なければ既定値。
 /// 末尾の `/` は呼び出し側が `format!("{}/{}", base, name)` で連結するので付けない。
+///
+/// T47 (Codex P2 / 2026-05-16): release ビルドでは `MIV_TRT_PACK_BASE_URL` の override を
+/// **無視**する。理由: 任意 `http://` (= 平文) URL からの DLL DL は `LoadLibrary` 経由で
+/// 任意コード実行ベクタになる。ローカル開発の `python -m http.server` 用 override は
+/// debug ビルド (= `cfg(debug_assertions)`) でのみ受け入れる。manifest の発行者認証
+/// (= 公開鍵署名検証) は v0.10 で本格対応。今は (a) リリースは固定 `https://github.com/...`
+/// (b) Mark-of-the-Web 検証は OS 任せ、で運用する。
 fn pack_base_url() -> String {
-    match std::env::var(PACK_BASE_URL_ENV) {
-        Ok(v) if !v.trim().is_empty() => v.trim_end_matches('/').to_string(),
-        _ => DEFAULT_PACK_BASE_URL.to_string(),
+    #[cfg(debug_assertions)]
+    {
+        match std::env::var(PACK_BASE_URL_ENV) {
+            Ok(v) if !v.trim().is_empty() => return v.trim_end_matches('/').to_string(),
+            _ => {}
+        }
     }
+    #[cfg(not(debug_assertions))]
+    {
+        // T47: release では env override を無視する。設定されていたらログで通知。
+        if let Ok(v) = std::env::var(PACK_BASE_URL_ENV) {
+            if !v.trim().is_empty() {
+                crate::logger::log(format!(
+                    "[TRT install] ignoring {PACK_BASE_URL_ENV}={v:?} in release build (security: only the embedded https URL is accepted)"
+                ));
+            }
+        }
+    }
+    DEFAULT_PACK_BASE_URL.to_string()
 }
 
 /// HTTP timeout (秒)。GitHub Releases CDN の応答時間に余裕を持たせる。
@@ -751,6 +773,11 @@ fn try_download_one(
 
 /// engine zip を開いて `tensorrt-engines/<model>/<file>` に展開する。
 /// zip 内パスは `<model_name>/<file>` のフラット 2 階層を想定 (build_trt_pack.rs と整合)。
+///
+/// T49 (Codex P2 / 2026-05-16): 各 entry を **per-file atomic** (`.part-engine` →
+/// `rename`) で書き出す。途中 cancel / disk full / 読み込みエラーで失敗した場合、
+/// 既に作った `.part-engine` を全部消してから Err を返す。これで「半分展開済みの engine
+/// ディレクトリが完成扱いされる」事故を防ぐ。
 fn extract_engine_zip(
     zip_path: &Path,
     cancel: &Arc<AtomicBool>,
@@ -762,19 +789,34 @@ fn extract_engine_zip(
     let file = fs::File::open(zip_path).map_err(|e| format!("open engine zip: {e}"))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("read zip: {e}"))?;
     let total = archive.len();
+    // T49: 中途半端な .part-engine をロールバックするための累積リスト
+    let mut staged_parts: Vec<PathBuf> = Vec::new();
+    let cleanup_staged = |paths: &[PathBuf]| {
+        for path in paths {
+            let _ = fs::remove_file(path);
+        }
+    };
     for i in 0..total {
-        check_cancel(cancel)?;
+        if let Err(e) = check_cancel(cancel) {
+            cleanup_staged(&staged_parts);
+            return Err(e);
+        }
         let _ = tx.send(InstallProgress::ExtractingEngine {
             entry_index: i,
             total,
         });
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| format!("zip entry {i}: {e}"))?;
+        let mut entry = match archive.by_index(i) {
+            Ok(e) => e,
+            Err(e) => {
+                cleanup_staged(&staged_parts);
+                return Err(format!("zip entry {i}: {e}"));
+            }
+        };
         // zip-slip 対策: enclosed_name で `..` 含むパスを reject。
         let rel_path = match entry.enclosed_name() {
             Some(p) => p.to_owned(),
             None => {
+                cleanup_staged(&staged_parts);
                 return Err(format!(
                     "engine zip の entry [{}] が不正なパスです",
                     entry.name()
@@ -786,11 +828,44 @@ fn extract_engine_zip(
         }
         let dst = engine_root.join(&rel_path);
         if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("mkdir engine subdir: {e}"))?;
+            if let Err(e) = fs::create_dir_all(parent) {
+                cleanup_staged(&staged_parts);
+                return Err(format!("mkdir engine subdir: {e}"));
+            }
         }
-        let mut out = fs::File::create(&dst).map_err(|e| format!("create engine file: {e}"))?;
-        std::io::copy(&mut entry, &mut out)
-            .map_err(|e| format!("extract {}: {e}", rel_path.display()))?;
+        // T49: per-file atomic: tmp に書いてから rename
+        let part = dst.with_extension(format!(
+            "{}.part-engine",
+            dst.extension().and_then(|s| s.to_str()).unwrap_or("engine")
+        ));
+        staged_parts.push(part.clone());
+        let mut out = match fs::File::create(&part) {
+            Ok(f) => f,
+            Err(e) => {
+                cleanup_staged(&staged_parts);
+                return Err(format!("create engine file: {e}"));
+            }
+        };
+        if let Err(e) = std::io::copy(&mut entry, &mut out) {
+            cleanup_staged(&staged_parts);
+            return Err(format!("extract {}: {e}", rel_path.display()));
+        }
+        if let Err(e) = out.sync_all() {
+            cleanup_staged(&staged_parts);
+            return Err(format!("sync engine file: {e}"));
+        }
+        drop(out);
+        // 既存ファイルがあれば削除してから rename (Windows の `fs::rename` は既存
+        // 上書きを保証しないので明示的に消す)
+        if dst.exists() {
+            let _ = fs::remove_file(&dst);
+        }
+        if let Err(e) = fs::rename(&part, &dst) {
+            cleanup_staged(&staged_parts);
+            return Err(format!("rename engine file: {e}"));
+        }
+        // rename 成功したのでこの part は staged から除外
+        staged_parts.pop();
     }
     Ok(())
 }

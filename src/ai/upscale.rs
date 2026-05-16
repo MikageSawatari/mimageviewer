@@ -613,23 +613,38 @@ fn run_tile_inference(
     crop_w: usize,
     crop_h: usize,
 ) -> Result<(TileOutput, InferBreakdown), AiError> {
-    if runtime.should_route_to_worker(model_kind) {
+    let worker_route = runtime.should_route_to_worker(model_kind);
+    if worker_route {
         // TRT ワーカー経路: tensor_build / extract / shm 転送はワーカー内で完結
         let t_run = std::time::Instant::now();
-        let (shape, raw) = runtime.infer_via_worker(model_kind, &input)?;
-        let session_run_ms = t_run.elapsed().as_secs_f64() * 1000.0;
-
-        let (output, post_copy_ms) = build_tile_output(&raw, &shape, crop_w, crop_h)?;
-        Ok((
-            output,
-            InferBreakdown {
-                tensor_build_ms: 0.0,   // ワーカー内部、計測されない
-                session_run_ms,         // ワーカー往復時間 (内部 GPU + IPC overhead)
-                tensor_extract_ms: 0.0, // ワーカー内部
-                post_copy_ms,
-            },
-        ))
-    } else {
+        match runtime.infer_via_worker(model_kind, &input) {
+            Ok((shape, raw)) => {
+                let session_run_ms = t_run.elapsed().as_secs_f64() * 1000.0;
+                let (output, post_copy_ms) = build_tile_output(&raw, &shape, crop_w, crop_h)?;
+                return Ok((
+                    output,
+                    InferBreakdown {
+                        tensor_build_ms: 0.0,   // ワーカー内部、計測されない
+                        session_run_ms,         // ワーカー往復時間 (内部 GPU + IPC overhead)
+                        tensor_extract_ms: 0.0, // ワーカー内部
+                        post_copy_ms,
+                    },
+                ));
+            }
+            Err(e) => {
+                // T51 (Codex P2 / 2026-05-16): worker 由来エラーで in-flight upscale 全体を
+                // 中断するのではなく、このタイルだけ DirectML フォールバックで再 inference する。
+                // worker mark_dead 自体は trt_worker_pool の `classify_io_error` が担当 (T48)。
+                // mark_dead 後の次回 `should_route_to_worker` は false を返すので、以降のタイルは
+                // 全てローカル DirectML 経由になる。
+                crate::logger::log(format!(
+                    "[AI upscale] TRT worker failed for tile ({model_kind:?}): {e} — DirectML フォールバックを試行"
+                ));
+                // fall through to the local DirectML branch below
+            }
+        }
+    }
+    {
         // ローカル DirectML 経路 (既存)
         let t0 = std::time::Instant::now();
         let input_tensor = ort::value::Tensor::from_array(input)

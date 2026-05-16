@@ -384,15 +384,25 @@ impl TrtWorkerPool {
     }
 
     /// 内部 send_cmd 呼び出しのエラー文字列が「子プロセスが死んだ」ことを示すかを判定。
-    /// 該当パターン (`stdin write` / `stdout read` / EOF) なら mark_dead して true。
-    /// 該当しない (子の `ok=false` レスポンス等) なら false。
+    /// 該当パターン (`stdin write` / `stdout read` / EOF / 応答 timeout) なら mark_dead する。
+    /// 該当しない (子の `ok=false` レスポンス等) なら no-op。
+    ///
+    /// T48 (Codex R-AI-002 / 2026-05-16): 旧コードは `"stdin write"` / `"stdout read"` /
+    /// `"worker stdout が EOF"` のみマッチで、`"worker 応答 timeout"` および
+    /// `"worker stdout reader thread が終了している"` をマッチしなかった。
+    /// 結果: 10s timeout 後も worker が生存扱いで、次の infer() が SHM cross-process
+    /// data race + IPC レスポンスズレを起こした。これらも fatal として mark_dead する。
     fn classify_io_error(&self, err: &str) {
         // I/O が壊れているパターンは IPC 上の文字列 prefix で検出する
         // (read_resp_line / send_cmd で使われるエラーメッセージと一致させる)
         let killed = err.starts_with("stdin write")
             || err.starts_with("stdin flush")
             || err.starts_with("stdout read")
-            || err.contains("worker stdout が EOF");
+            || err.contains("worker stdout が EOF")
+            // T48: timeout / reader disconnect は子の生死が不明な状態 (= prove unsafe)
+            // 以降の infer() で SHM や IPC を共有すると次の応答が 1 個ズレるので fatal 扱いにする。
+            || err.contains("worker 応答 timeout")
+            || err.contains("worker stdout reader thread が終了している");
         if killed {
             self.mark_dead();
             crate::logger::log(format!(

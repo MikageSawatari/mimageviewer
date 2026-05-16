@@ -56,12 +56,54 @@ pub fn pack_ort_dll_path() -> PathBuf {
     pack_dir().join("onnxruntime.dll")
 }
 
-/// TensorRT pack がインストール済みかを判定する。
+/// TensorRT pack のインストール状態 (T46 / Codex R-AI-001、2026-05-16)。
 ///
-/// Phase 1: sentinel ファイル + 主要 DLL の存在確認だけ。
-/// Phase 2: pack version 検証 (INSTALL_OK 内 version vs EXPECTED_TRT_PACK_VERSION) を追加。
-pub fn is_pack_installed() -> bool {
+/// `is_pack_installed()` の bool では区別できなかった「version mismatch」「JSON 壊れ」
+/// を UI / runtime 側で分岐できるよう細分化する。`Stale` の場合は再 install を促す
+/// バナーを出す、`Corrupt` の場合は手動削除を案内する、等の使い分けが可能になる。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PackStatus {
+    /// sentinel・DLL 揃いかつ INSTALL_OK の version が EXPECTED_TRT_PACK_VERSION と一致。
+    Valid,
+    /// sentinel か必須 DLL が無い。
+    Missing,
+    /// version mismatch (INSTALL_OK の version != EXPECTED_TRT_PACK_VERSION)。
+    /// pack v(N) を入れて mIV を更新した場合に発生。再 install で復旧。
+    Stale(u32),
+    /// INSTALL_OK JSON のパース失敗、または必須フィールド欠落。
+    Corrupt(String),
+}
+
+/// pack の現状を返す (T46)。`is_pack_installed()` はこの結果を bool 化したラッパー。
+pub fn pack_status() -> PackStatus {
     let sentinel = install_sentinel_path();
     let ort_dll = pack_ort_dll_path();
-    sentinel.exists() && ort_dll.exists()
+    if !sentinel.exists() || !ort_dll.exists() {
+        return PackStatus::Missing;
+    }
+    let raw = match std::fs::read_to_string(&sentinel) {
+        Ok(s) => s,
+        Err(e) => return PackStatus::Corrupt(format!("INSTALL_OK read failed: {e}")),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => return PackStatus::Corrupt(format!("INSTALL_OK JSON parse failed: {e}")),
+    };
+    let version = match value.get("version").and_then(|v| v.as_u64()) {
+        Some(v) => v as u32,
+        None => return PackStatus::Corrupt("INSTALL_OK missing 'version' field".to_owned()),
+    };
+    if version != EXPECTED_TRT_PACK_VERSION {
+        return PackStatus::Stale(version);
+    }
+    PackStatus::Valid
+}
+
+/// TensorRT pack がインストール済みかを判定する。
+///
+/// T46: 旧 phase 1 (sentinel + DLL 存在のみ) では pack v(N) を入れた状態で
+/// mIV を更新したときに stale pack をロードしようとして「spawn failed」になっていた。
+/// 現実装は `pack_status() == Valid` をチェックする。
+pub fn is_pack_installed() -> bool {
+    matches!(pack_status(), PackStatus::Valid)
 }
