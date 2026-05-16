@@ -5553,7 +5553,8 @@ struct VideoDecoderCandidate {
     reason: &'static str,
     /// Whether this candidate may be opened as a software decoder when the
     /// global policy permits SW decode. AV1's native decoder is inserted only
-    /// as an HW-preferred candidate, so keep it HW-only and let Default handle SW.
+    /// as an HW-preferred candidate, so keep it HW-only and leave SW decode to
+    /// other candidates when policy permits it.
     allow_sw_decode: bool,
 }
 
@@ -5667,6 +5668,8 @@ fn open_video_decoder_with_candidates(
         } = resolved;
         let allow_sw_decode =
             candidate_allows_sw_decode(candidate, hw_decode_requested, any_d3d11va_candidate);
+        // Keep the legacy log key for existing log searches and parsers; the
+        // value now reports the final SW decode allowance for this candidate.
         crate::logger::log(format!(
             "video decoder candidate: codec={} decoder={decoder_name} reason={} allow_sw_fallback={} hw_requested={hw_decode_requested} d3d11va_supported={} d3d11va_config={}",
             codec_id.name(),
