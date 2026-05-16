@@ -16764,7 +16764,9 @@ impl eframe::App for App {
         #[cfg(windows)]
         {
             self.sync_native_video_main_cloak(false);
-            let states = self.snapshot_vst3_states_into_settings();
+            // T22: 終了経路は早く抜けたい (ユーザーが close ボタンを押した文脈) ので 2 秒
+            // で打ち切る。timeout した slot は前回保存の state を保持する
+            let states = self.snapshot_vst3_states_into_settings(std::time::Duration::from_secs(2));
             let positions = self.snapshot_vst3_window_positions_into_settings();
             if states > 0 || positions > 0 {
                 self.settings.save();

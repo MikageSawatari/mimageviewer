@@ -991,6 +991,25 @@ impl DspBridge {
     /// shutdown / settings.save 経由で呼ばれるので UI 同期 hot-path には乗らない。
     /// bypass の slot も query する (= 内部 state はあるので保存対象)。
     pub fn snapshot_all_plugin_states(&self) -> Vec<(String, String)> {
+        // T22 (Codex R-VST-003): 旧 API はテスト・worker thread から呼ばれていた経路の互換。
+        // 10 秒の総枠を内部で持つ (= 旧 1秒×10 slot と同じ最悪値)。UI スレッドは
+        // 必ず `snapshot_all_plugin_states_with_deadline` を呼ぶこと。
+        self.snapshot_all_plugin_states_with_deadline(std::time::Duration::from_secs(10))
+    }
+
+    /// 総時間 deadline を上限とする snapshot バリアント (T22 / Codex R-VST-003)。
+    ///
+    /// chain bridge では stdout/event stream を共有するため per-slot query は順次実行
+    /// しかできないが、UI スレッドから呼ぶ場合は 10 slot × 1秒 タイムアウトで最大
+    /// 10 秒のフリーズに化けていた。本 API は `total_deadline` を渡し、残り時間で
+    /// per-slot timeout を min(残り, 1秒) に絞り込む。残りが切れた slot は skip。
+    ///
+    /// UI スレッドからは 2 秒、終了 / disable 経路は 1 秒程度を推奨。worker thread から
+    /// 呼ぶ場合 (= chain rebuild 内) は 10 秒など長め。
+    pub fn snapshot_all_plugin_states_with_deadline(
+        &self,
+        total_deadline: std::time::Duration,
+    ) -> Vec<(String, String)> {
         if !self.is_enabled() {
             return Vec::new();
         }
@@ -1006,17 +1025,33 @@ impl DspBridge {
         if bridges.is_empty() {
             return Vec::new();
         }
-        let timeout = std::time::Duration::from_secs(1);
-        // Chain bridge では stdout/event stream を共有するため、slot state は順番に取得する。
-        let mut out = Vec::with_capacity(bridges.len());
-        for (path, bridge, slot_id) in bridges {
-            match bridge.query_state_sync_slot(slot_id, timeout) {
+        let started = std::time::Instant::now();
+        let per_slot_cap = std::time::Duration::from_secs(1);
+        let total = bridges.len();
+        let mut out = Vec::with_capacity(total);
+        let mut skipped: usize = 0;
+        for (idx, (path, bridge, slot_id)) in bridges.into_iter().enumerate() {
+            let elapsed = started.elapsed();
+            if elapsed >= total_deadline {
+                skipped = total - idx;
+                break;
+            }
+            let remaining = total_deadline - elapsed;
+            let slot_timeout = remaining.min(per_slot_cap);
+            match bridge.query_state_sync_slot(slot_id, slot_timeout) {
                 Ok(state) => out.push((path, state)),
                 Err(e) => crate::logger::log(format!(
                     "[VST3] snapshot_all_plugin_states: query failed for '{}': {e}",
                     path,
                 )),
             }
+        }
+        if skipped > 0 {
+            crate::logger::log(format!(
+                "[VST3] snapshot_all_plugin_states: total deadline {}ms exceeded, {} slot(s) skipped (= 最新 state は前回値を保持)",
+                total_deadline.as_millis(),
+                skipped,
+            ));
         }
         out
     }

@@ -34,11 +34,20 @@ impl App {
     /// `self.settings.vst3_enabled == false` だが、bridge 側 plugin はまだ生きている。
     /// この経路でも snapshot を取りたい (= teardown 前) ので、settings ではなく bridge の
     /// runtime 状態をガードに使う (Codex P2-1、2026-05-01)。
-    pub(crate) fn snapshot_vst3_states_into_settings(&mut self) -> usize {
+    ///
+    /// **total deadline** (T22 / Codex R-VST-003): UI スレッドからは 2 秒、終了 /
+    /// disable 経路は 1 秒、worker thread からは 10 秒を推奨。10 slot × 1 秒の
+    /// per-slot timeout で UI が最大 10 秒フリーズする旧挙動を防ぐ。
+    pub(crate) fn snapshot_vst3_states_into_settings(
+        &mut self,
+        total_deadline: std::time::Duration,
+    ) -> usize {
         if !self.dsp_bridge.is_enabled() {
             return 0;
         }
-        let snapshots = self.dsp_bridge.snapshot_all_plugin_states();
+        let snapshots = self
+            .dsp_bridge
+            .snapshot_all_plugin_states_with_deadline(total_deadline);
         let mut updated = 0;
         for (path, state) in snapshots {
             if let Some(entry) = self.find_vst3_entry_mut(&path) {
@@ -145,7 +154,8 @@ impl App {
             return;
         }
 
-        let states = self.snapshot_vst3_states_into_settings();
+        // T22: UI スレッドから呼ばれるので 2 秒に制限。timeout した slot は前回値を保持
+        let states = self.snapshot_vst3_states_into_settings(std::time::Duration::from_secs(2));
         let positions = self.snapshot_vst3_window_positions_into_settings();
         let visibility = self.snapshot_vst3_gui_visibility_into_settings();
         let existing_name = self.settings.vst3_chain_slots.slots[slot_idx]
@@ -239,7 +249,9 @@ impl App {
             return;
         }
         if snapshot_runtime {
-            let states = self.snapshot_vst3_states_into_settings();
+            // T22: chain rebuild は UI スレッドの hot-path で呼ばれる (preferences 適用直後 / preset 切替)
+            // ので 2 秒に制限。長尺取得が必要な専用 worker thread 経路ではない
+            let states = self.snapshot_vst3_states_into_settings(std::time::Duration::from_secs(2));
             let positions = self.snapshot_vst3_window_positions_into_settings();
             if states > 0 || positions > 0 {
                 self.settings.save();
