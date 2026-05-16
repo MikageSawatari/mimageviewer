@@ -2054,6 +2054,9 @@ pub struct App {
     /// stale 防止のため close_fullscreen / fs_cache evict / フォルダ再ロードで cleanup する。
     pub(crate) normalize_ui_states:
         std::collections::HashMap<usize, crate::video::normalize_types::NormalizeUiState>,
+    /// ユーザーキャンセル / スキャン失敗後に、同じ fullscreen セッションで自動スキャンを
+    /// 即再発火させないための fs_idx 集合。手動 Norm クリックでは再試行できる。
+    pub(crate) normalize_auto_scan_suppressed: std::collections::HashSet<usize>,
 
     // ── 動画ピン / ブックマーク DB ───────────────────────────
     /// 動画フレーム ピン留め DB (= ユーザーが固定したフレーム = 動画グリッドサムネ
@@ -3140,6 +3143,7 @@ impl App {
             audio_normalize_db,
             normalize_state: None,
             normalize_ui_states: std::collections::HashMap::new(),
+            normalize_auto_scan_suppressed: std::collections::HashSet::new(),
             video_pin_db,
             video_bookmark_db,
             video_chapter_thumb_db,
@@ -10393,10 +10397,20 @@ impl App {
                     {
                         self.vst3_deferred_video_open = None;
                     }
-                    if grid_open_intent
-                        && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx)
-                    {
-                        player.set_playing(true);
+                    if grid_open_intent {
+                        #[cfg(windows)]
+                        let started_normalize_scan =
+                            self.start_normalize_scan_for_deferred_play_intent(idx);
+                        #[cfg(not(windows))]
+                        let started_normalize_scan = false;
+                        if !started_normalize_scan
+                            && let Some(FsCacheEntry::Video { player, .. }) =
+                                self.fs_cache.get(&idx)
+                        {
+                            player.set_playing(true);
+                            #[cfg(windows)]
+                            self.maybe_start_normalize_scan_for_play_intent(idx);
+                        }
                     }
                     crate::logger::log(format!("  video cache hit idx={idx} → resume playback"));
                 } else {
@@ -11921,7 +11935,7 @@ impl App {
         from_grid: bool,
         autoplay_override: Option<bool>,
         #[cfg(windows)] native_output_config: Option<crate::video::NativeVideoOutputConfig>,
-    ) -> crate::video::VideoPlayer {
+    ) -> (crate::video::VideoPlayer, bool) {
         // 通常 open の spawn 制限は呼び出し側 (`start_fs_load` →
         // `defer_native_video_open_if_decoder_busy`) で行う。ここに到達した時点では
         // live decoder 数が上限未満か、HW decode 無効の経路。ここでは診断用に
@@ -11972,10 +11986,27 @@ impl App {
             .or_else(|| self.settings.video_resume_positions.get(&path_key).copied());
         let video_hw_decode = self.settings.video_hw_decode;
         let video_deinterlace = self.settings.video_deinterlace;
+        let initial_normalize_lookup = if self.settings.audio_normalize_enabled {
+            let target_milli = self.settings.clamped_audio_normalize_target_lufs_milli();
+            self.audio_normalize_db
+                .as_ref()
+                .and_then(|db| db.lookup(&vp, target_milli))
+        } else {
+            None
+        };
+        let initial_normalize_gain = initial_normalize_lookup
+            .as_ref()
+            .map(|result| 10.0_f64.powf(result.gain_db as f64 / 20.0))
+            .unwrap_or(1.0);
+        let start_normalize_scan_before_play =
+            self.settings.audio_normalize_enabled && initial_normalize_lookup.is_none() && autoplay;
+        let open_autoplay = autoplay && !start_normalize_scan_before_play;
         let player = crate::video::VideoPlayer::open(
             vp,
             vol,
-            autoplay,
+            initial_normalize_gain,
+            start_normalize_scan_before_play,
+            open_autoplay,
             resume,
             video_hw_decode,
             video_deinterlace,
@@ -11994,7 +12025,7 @@ impl App {
         if self.settings.video_start_muted || play_test_mute || self.video_session_muted {
             player.set_muted(true);
         }
-        player
+        (player, start_normalize_scan_before_play)
     }
 
     pub(crate) fn start_fs_load(&mut self, idx: usize) {
@@ -12049,14 +12080,15 @@ impl App {
                 // (fast-swap で再帰的に呼ばれる場合) の保険として明示的に bump する。
                 self.activity_gate.bump();
                 #[allow(unused_mut)]
-                let mut player = self.build_video_player_for_open(
-                    idx,
-                    vp,
-                    from_grid,
-                    None,
-                    #[cfg(windows)]
-                    native_config,
-                );
+                let (mut player, start_normalize_scan_before_play) = self
+                    .build_video_player_for_open(
+                        idx,
+                        vp,
+                        from_grid,
+                        None,
+                        #[cfg(windows)]
+                        native_config,
+                    );
                 #[cfg(windows)]
                 if native_config_missing {
                     player.fail_native_init(
@@ -12073,6 +12105,12 @@ impl App {
                 );
                 #[cfg(windows)]
                 self.init_normalize_state_for_opened_video(idx);
+                #[cfg(windows)]
+                if start_normalize_scan_before_play {
+                    self.start_normalize_scan_for_deferred_play_intent(idx);
+                } else {
+                    self.maybe_start_normalize_scan_for_play_intent(idx);
+                }
             }
             return;
         }

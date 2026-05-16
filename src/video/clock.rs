@@ -146,6 +146,9 @@ pub struct AvClock {
     /// false なら `now_secs()` はフォールバック wall clock を使う (= MasterClock の
     /// `ClockSource::Wall`)。
     audio_active: AtomicBool,
+    /// 測定前の音量ノーマライズなど、再生開始前に audio-pump の処理済み先読みを一時停止する。
+    /// true の間は audio-pump が raw→processed 変換を止め、解除後に現行 gain で preroll する。
+    audio_preroll_suspended: AtomicBool,
     /// decoder が EOF (= demux 末端) に到達したか。post-EOF seek を検出する。
     /// `notify_eof_reached` で立て、`request_seek` / `clear_eof_reached` で降ろす。
     eof_reached: AtomicBool,
@@ -246,6 +249,7 @@ impl AvClock {
             playback_speed_update_lock: Mutex::new(()),
             audio_tx_accounting_epoch: AtomicU64::new(0),
             audio_active: AtomicBool::new(false),
+            audio_preroll_suspended: AtomicBool::new(false),
             eof_reached: AtomicBool::new(false),
             decode_failed: AtomicBool::new(false),
             volume_bits: AtomicU64::new(
@@ -926,6 +930,16 @@ impl AvClock {
     pub fn set_normalize_gain(&self, gain: f64) {
         self.normalize_gain_bits
             .store(clamp_normalize_gain(gain).to_bits(), Ordering::Release);
+    }
+
+    /// audio-pump の先読み停止フラグ。解除後の raw→processed はその時点の Norm gain を使う。
+    pub fn audio_preroll_suspended(&self) -> bool {
+        self.audio_preroll_suspended.load(Ordering::Acquire)
+    }
+
+    pub fn set_audio_preroll_suspended(&self, suspended: bool) {
+        self.audio_preroll_suspended
+            .store(suspended, Ordering::Release);
     }
 }
 

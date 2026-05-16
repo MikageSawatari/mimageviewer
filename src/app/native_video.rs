@@ -704,7 +704,7 @@ impl App {
         let source_epoch = self.next_native_video_source_epoch();
         let started_at = std::time::Instant::now();
         self.activity_gate.bump();
-        let mut new_player = self.build_video_player_for_open(
+        let (mut new_player, start_normalize_scan_before_play) = self.build_video_player_for_open(
             target_idx,
             target_path.clone(),
             false,
@@ -722,7 +722,13 @@ impl App {
                 load_seq: self.input_seq,
             },
         );
+        self.init_normalize_state_for_opened_video(target_idx);
         self.open_fullscreen(target_idx);
+        if start_normalize_scan_before_play {
+            self.start_normalize_scan_for_deferred_play_intent(target_idx);
+        } else {
+            self.maybe_start_normalize_scan_for_play_intent(target_idx);
+        }
 
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
             crate::logger::log(format!(
@@ -1564,13 +1570,20 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
             return;
         }
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+        let did_seek = if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
+        {
             player.seek(target_secs);
             self.mark_native_video_hud_activity(ctx);
-        }
+            true
+        } else {
+            false
+        };
         // CH/BM ループモード時、seek 後に loop_target_secs を再計算する
         // (= 新位置の chapter/bookmark 開始秒に揃える)。
         self.apply_loop_mode_to_player(fs_idx);
+        if did_seek {
+            self.maybe_start_normalize_scan_for_play_intent(fs_idx);
+        }
     }
 
     #[cfg(windows)]
@@ -1583,7 +1596,8 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
             return;
         }
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+        let did_seek = if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
+        {
             crate::logger::log(format!(
                 "[native-video] tile seek command: idx={fs_idx} target={target_secs:.3} engine_state={} seek_serial={} playing={} pos={:.3} video_rx_len={} audio_rx_len={}",
                 player.engine_state_name(),
@@ -1625,10 +1639,16 @@ impl App {
             }
             player.seek(target_secs);
             player.set_native_tile_overlay(None);
-        }
+            true
+        } else {
+            false
+        };
         self.close_video_tile_mode();
         self.mark_native_video_hud_activity(ctx);
         self.apply_loop_mode_to_player(fs_idx);
+        if did_seek {
+            self.maybe_start_normalize_scan_for_play_intent(fs_idx);
+        }
     }
 
     #[cfg(windows)]
@@ -1656,6 +1676,7 @@ impl App {
             self.mark_native_video_hud_activity(ctx);
             // 0 への seek は loop_target も chapter/bookmark の最初の区間に揃える
             self.apply_loop_mode_to_player(fs_idx);
+            self.maybe_start_normalize_scan_for_play_intent(fs_idx);
         }
     }
 
@@ -1668,9 +1689,18 @@ impl App {
         if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
             return;
         }
+        let will_request_play = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => !player.intent_playing(),
+            _ => false,
+        };
+        if will_request_play && self.start_normalize_scan_for_deferred_play_intent(fs_idx) {
+            self.mark_native_video_hud_activity(ctx);
+            return;
+        }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.toggle_play();
             self.mark_native_video_hud_activity(ctx);
+            self.maybe_start_normalize_scan_for_play_intent(fs_idx);
         }
     }
 
@@ -2017,10 +2047,12 @@ impl App {
         }
         if let Some(state) = self.normalize_state.take() {
             state.cancel();
+            self.normalize_auto_scan_suppressed.insert(state.fs_idx);
             // 元再生状態に復帰
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&state.fs_idx) {
                 if state.was_playing {
                     player.set_playing(true);
+                    player.set_audio_preroll_suspended(false);
                 }
             }
             self.normalize_ui_states.insert(
@@ -2039,6 +2071,7 @@ impl App {
         use crate::video::normalize_types::NormalizeUiState;
         self.settings.audio_normalize_enabled = false;
         self.settings.save();
+        self.normalize_auto_scan_suppressed.clear();
         let fs_idxs: Vec<usize> = self.fs_cache.keys().copied().collect();
         for idx in fs_idxs {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
@@ -2103,22 +2136,77 @@ impl App {
         }
     }
 
+    /// ノーマライズ ON + 未測定 + 再生 intent が立っている動画だけ、自動スキャンを開始する。
+    ///
+    /// 再生中の seek / play toggle / open 直後など複数経路から呼ぶため、ここで冪等性を
+    /// 一元的に守る。ユーザーキャンセルやスキャン失敗後は、この fullscreen セッション中の
+    /// 自動再発火を抑止し、手動 Norm クリックだけで再試行できるようにする。
+    #[cfg(windows)]
+    pub(super) fn maybe_start_normalize_scan_for_play_intent(&mut self, fs_idx: usize) -> bool {
+        if !self.normalize_auto_scan_base_ready(fs_idx) {
+            return false;
+        }
+        let should_scan = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.intent_playing(),
+            _ => false,
+        };
+        if !should_scan {
+            return false;
+        }
+        self.start_normalize_scan_inner(fs_idx, None);
+        true
+    }
+
+    /// 未測定動画をこれから再生する場合に、再生開始前の一瞬の未補正音を避けるため
+    /// player は paused intent + audio preroll suspended のまま scan を開始し、
+    /// 完了後に再生 intent と preroll を復帰する。
+    #[cfg(windows)]
+    pub(super) fn start_normalize_scan_for_deferred_play_intent(&mut self, fs_idx: usize) -> bool {
+        if !self.normalize_auto_scan_base_ready(fs_idx) {
+            return false;
+        }
+        self.start_normalize_scan_inner(fs_idx, Some(true));
+        true
+    }
+
+    #[cfg(windows)]
+    fn normalize_auto_scan_base_ready(&self, fs_idx: usize) -> bool {
+        use crate::video::normalize_types::NormalizeUiState;
+        self.settings.audio_normalize_enabled
+            && self.fullscreen_idx == Some(fs_idx)
+            && self.normalize_state.is_none()
+            && !self.normalize_auto_scan_suppressed.contains(&fs_idx)
+            && self.normalize_ui_states.get(&fs_idx).copied()
+                == Some(NormalizeUiState::OnUnmeasured)
+            && matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { .. }))
+    }
+
     /// スキャン worker thread を起動。再生中なら一時停止 → スキャン → poll で完了検知。
     #[cfg(windows)]
     pub(super) fn start_normalize_scan(&mut self, fs_idx: usize) {
+        self.start_normalize_scan_inner(fs_idx, None);
+    }
+
+    #[cfg(windows)]
+    fn start_normalize_scan_inner(&mut self, fs_idx: usize, was_playing_override: Option<bool>) {
         use crate::video::normalize_types::NormalizeUiState;
         let (path, was_playing) = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
-                (player.path().to_path_buf(), player.is_playing())
+                let was_playing = was_playing_override.unwrap_or_else(|| player.intent_playing());
+                (player.path().to_path_buf(), was_playing)
             }
             _ => return,
         };
+        self.normalize_auto_scan_suppressed.remove(&fs_idx);
         // 既存 state を捨てる (cancel を立てておく) — 通常は is_some() で弾かれているが defensive
         if let Some(prev) = self.normalize_state.take() {
             prev.cancel();
         }
         // 再生中なら一時停止
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            if was_playing_override == Some(true) {
+                player.set_audio_preroll_suspended(true);
+            }
             if was_playing {
                 player.set_playing(false);
             }
@@ -2149,10 +2237,12 @@ impl App {
                 if was_playing {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                         player.set_playing(true);
+                        player.set_audio_preroll_suspended(false);
                     }
                 }
                 self.normalize_ui_states
                     .insert(fs_idx, NormalizeUiState::OnUnmeasured);
+                self.normalize_auto_scan_suppressed.insert(fs_idx);
                 return;
             }
         };
@@ -2199,6 +2289,7 @@ impl App {
                 if let Some(db) = self.audio_normalize_db.as_ref() {
                     let _ = db.upsert(&state.file_path, &result);
                 }
+                self.normalize_auto_scan_suppressed.remove(&state.fs_idx);
                 if still_valid {
                     if let Some(FsCacheEntry::Video { player, .. }) =
                         self.fs_cache.get(&state.fs_idx)
@@ -2213,6 +2304,7 @@ impl App {
                         );
                         if state.was_playing {
                             player.set_playing(true);
+                            player.set_audio_preroll_suspended(false);
                         }
                     }
                     self.normalize_ui_states.insert(
@@ -2230,6 +2322,7 @@ impl App {
                 if let Some(Ok(crate::app::normalize::NormalizeMessage::Error(ref m))) = msg {
                     crate::logger::log(format!("normalize-scan error: {m}"));
                 }
+                self.normalize_auto_scan_suppressed.insert(state.fs_idx);
                 // DB に書かない、グローバル ON は維持、UI 状態を OnUnmeasured に戻す
                 if still_valid {
                     if let Some(FsCacheEntry::Video { player, .. }) =
@@ -2237,6 +2330,7 @@ impl App {
                     {
                         if state.was_playing {
                             player.set_playing(true);
+                            player.set_audio_preroll_suspended(false);
                         }
                     }
                     self.normalize_ui_states
@@ -2253,6 +2347,7 @@ impl App {
     #[cfg(windows)]
     pub(super) fn cleanup_normalize_state_for_fs_idx(&mut self, fs_idx: usize) {
         self.normalize_ui_states.remove(&fs_idx);
+        self.normalize_auto_scan_suppressed.remove(&fs_idx);
         // 同 fs_idx のスキャン中なら state を持ち去って捨てる (= 新規スキャン即開始可能に)
         let should_drop = self
             .normalize_state
@@ -2271,6 +2366,7 @@ impl App {
     #[cfg(windows)]
     pub(super) fn init_normalize_state_for_opened_video(&mut self, fs_idx: usize) {
         use crate::video::normalize_types::NormalizeUiState;
+        self.normalize_auto_scan_suppressed.remove(&fs_idx);
         let path = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => player.path().to_path_buf(),
             _ => return,
@@ -3632,9 +3728,7 @@ impl App {
             }
             // Enter: play / pause.
             0x0D if !key.shift && !key.ctrl && !key.repeat => {
-                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    player.toggle_play();
-                }
+                self.handle_native_video_toggle_play_command(ctx, fs_idx);
             }
             // Escape: close native fullscreen. If the native overlay has a text
             // editor focused this key is not forwarded here, so dialog editing
@@ -3662,6 +3756,7 @@ impl App {
                     // を立てるので、追加 `toggle_play()` は不要 (Codex P2-1 2026-05-17)。
                     player.seek(0.0);
                 }
+                self.maybe_start_normalize_scan_for_play_intent(fs_idx);
             }
             // Ctrl+Shift+Left / Right: frame step and pause.
             0x25 if key.ctrl && key.shift => {
@@ -3854,6 +3949,7 @@ impl App {
                 }
                 // CH/BM ループ中ならマーカージャンプ後に loop_target を更新
                 self.apply_loop_mode_to_player(fs_idx);
+                self.maybe_start_normalize_scan_for_play_intent(fs_idx);
                 let direction = if next { "次の" } else { "前の" };
                 let kind_label = match marker.kind {
                     crate::ui_fullscreen::NavMarkerKind::Chapter => "チャプター",
@@ -3889,6 +3985,7 @@ impl App {
                     player.seek(0.0);
                 }
                 self.apply_loop_mode_to_player(fs_idx);
+                self.maybe_start_normalize_scan_for_play_intent(fs_idx);
                 // native presenter 経路では overlay 上にトーストを出す (= HUD と整合)
                 self.show_native_video_overlay_toast(
                     format!("{} 動画先頭", crate::ui_helpers::format_hms(0.0)),
@@ -4057,13 +4154,16 @@ impl App {
     /// 末尾でシークを発行すると decoder が target 付近のフレームを返せず
     /// 「シーク中...」表示が固着するため、ここでシーク自体を抑止している。
     #[cfg(windows)]
-    fn native_video_seek_relative_with_hint(&self, fs_idx: usize, delta_secs: f64) {
+    fn native_video_seek_relative_with_hint(&mut self, fs_idx: usize, delta_secs: f64) {
         let outcome = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => player.seek_relative(delta_secs),
             _ => return,
         };
         let hint = match outcome {
-            crate::video::RelativeSeekOutcome::Seeked => return,
+            crate::video::RelativeSeekOutcome::Seeked => {
+                self.maybe_start_normalize_scan_for_play_intent(fs_idx);
+                return;
+            }
             crate::video::RelativeSeekOutcome::AtStart => "動画先頭です",
             crate::video::RelativeSeekOutcome::AtEnd => "動画末尾です",
         };
@@ -4263,7 +4363,7 @@ impl App {
         // demux thread の avformat_open_input より前に bump する必要がある
         // (Codex P2 第 16 ラウンド指摘)。
         self.activity_gate.bump();
-        let mut new_player = self.build_video_player_for_open(
+        let (mut new_player, start_normalize_scan_before_play) = self.build_video_player_for_open(
             target_idx,
             target_path.clone(),
             false,
@@ -4286,10 +4386,16 @@ impl App {
         // `init_normalize_state_for_opened_video(target_idx)` を呼ぶが、fast-swap で
         // `fs_cache` に直接 insert した場合 `open_fullscreen` 内の cache-hit 分岐で
         // この初期化がスキップされ、ノーマライズ DB lookup + UI 状態セットが走らない。
-        // ここで明示的に init を呼ぶ ことで Settings ON+DB hit 時に gain も即適用される。
+        // 初期 gain は `build_video_player_for_open` で open 前に渡し、ここでは UI 状態と
+        // 抑止状態を新しい動画に同期する。
         self.init_normalize_state_for_opened_video(target_idx);
 
         self.open_fullscreen(target_idx);
+        if start_normalize_scan_before_play {
+            self.start_normalize_scan_for_deferred_play_intent(target_idx);
+        } else {
+            self.maybe_start_normalize_scan_for_play_intent(target_idx);
+        }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&target_idx) {
             crate::logger::log(format!(
                 "[video-debug] post-swap state: idx={target_idx} engine_state={} seek_serial={} clock_is_playing={} pos={:.3} video_rx_len={} audio_rx_len={} pending_frames={}",
@@ -4670,9 +4776,7 @@ impl App {
         if !click_like || self.settings.vst3_gui_visible {
             return;
         }
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            player.toggle_play();
-        }
+        self.handle_native_video_toggle_play_command(ctx, fs_idx);
     }
 
     #[cfg(windows)]

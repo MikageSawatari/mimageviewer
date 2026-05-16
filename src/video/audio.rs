@@ -1005,6 +1005,13 @@ fn run_pump(
             }
         }
 
+        if clock.audio_preroll_suspended() {
+            if let Ok(buf) = buffer.lock() {
+                publish_buffer_secs(&buf, &clock);
+            }
+            continue;
+        }
+
         // ── raw → VST process → processed loop ──
         // mutex を持たずに VST process_block を呼ぶ (Codex P2-B):
         // 1. lock → pop raw_pending → unlock
@@ -1628,6 +1635,12 @@ fn fill_output(
                 );
             }
         }
+        out.fill(0.0);
+        return;
+    }
+
+    if clock.audio_preroll_suspended() {
+        publish_buffer_secs(&buf, clock);
         out.fill(0.0);
         return;
     }

@@ -2886,6 +2886,10 @@ impl VideoPlayer {
     ///
     /// `initial_volume` は線形ゲイン (0.0..+18dB 相当)。1.0 超は音声ポンプ側の
     /// 手動 boost として扱う。
+    /// `initial_normalize_gain` は線形ゲイン (1.0 = 素通し)。open 前に DB hit が
+    /// 分かっている場合、音声ワーカー起動前に設定して最初の chunk から反映する。
+    /// `initial_audio_preroll_suspended` が true の間は、測定前 Norm などのために
+    /// audio-pump の raw→processed 先読みを一時停止する。
     /// `resume_secs` を指定すると、最初の動画情報受領後に自動的にその位置へシークする。
     /// `hw_decode` が true なら D3D11VA HW デコードを試行する。D3D11VA 非対応 codec は
     /// SW で開き、D3D11VA 対応 codec の HW 初期化 / open 失敗はエラーにする。
@@ -2895,6 +2899,8 @@ impl VideoPlayer {
     pub fn open(
         path: PathBuf,
         initial_volume: f64,
+        initial_normalize_gain: f64,
+        initial_audio_preroll_suspended: bool,
         autoplay: bool,
         resume_secs: Option<f64>,
         hw_decode: bool,
@@ -2912,6 +2918,8 @@ impl VideoPlayer {
             // 共有 seek_serial を 1 個作り、AvClock と EngineActor 双方に clone を渡す。
             let seek_serial = Arc::new(AtomicU64::new(0));
             let dummy_clock = Arc::new(AvClock::new(initial_volume, seek_serial.clone()));
+            dummy_clock.set_normalize_gain(initial_normalize_gain);
+            dummy_clock.set_audio_preroll_suspended(initial_audio_preroll_suspended);
             let engine = Arc::new(Mutex::new(EngineActor::new(
                 OpenOptions {
                     initial_volume,
@@ -2989,6 +2997,10 @@ impl VideoPlayer {
         // 規律で同期」設計を撤去)。詳細は EngineActor.seek_serial の doc コメント参照。
         let seek_serial = Arc::new(AtomicU64::new(0));
         let clock = Arc::new(AvClock::new(initial_volume, seek_serial.clone()));
+        // DB hit 済みの Norm gain は audio pump 起動前に入れる。open / source-swap 直後の
+        // 最初の processed chunk から反映されるので、旧 gain の一瞬の鳴りを避けられる。
+        clock.set_normalize_gain(initial_normalize_gain);
+        clock.set_audio_preroll_suspended(initial_audio_preroll_suspended);
         let cancel = Arc::new(AtomicBool::new(false));
 
         // A/V sync drift デバッグ用 atomic bundle。audio.rs (cpal callback / pump) と
@@ -3212,10 +3224,12 @@ impl VideoPlayer {
             player.shutdown_workers_for_error();
         }
         crate::logger::log(format!(
-            "[video-debug] VideoPlayer::open done path={} autoplay={} volume={:.2} engine_state={} resume_secs={:?} video_rx_len={} audio_rx_len={}",
+            "[video-debug] VideoPlayer::open done path={} autoplay={} volume={:.2} normalize_gain={:.3} audio_preroll_suspended={} engine_state={} resume_secs={:?} video_rx_len={} audio_rx_len={}",
             player.path.display(),
             autoplay,
             initial_volume,
+            player.normalize_gain(),
+            player.audio_preroll_suspended(),
             player.engine_state_name(),
             player.pending_resume_secs,
             player.decode.video_rx.len(),
@@ -3958,6 +3972,14 @@ impl VideoPlayer {
     /// `src/app/native_video.rs::apply_normalize_gain_with_perf` を参照。
     pub fn set_normalize_gain(&self, gain: f64) {
         self.clock.set_normalize_gain(gain);
+    }
+
+    pub fn audio_preroll_suspended(&self) -> bool {
+        self.clock.audio_preroll_suspended()
+    }
+
+    pub fn set_audio_preroll_suspended(&self, suspended: bool) {
+        self.clock.set_audio_preroll_suspended(suspended);
     }
 
     /// 音量ノーマライズの UI 状態 + 進捗 snapshot を native overlay に配信する。

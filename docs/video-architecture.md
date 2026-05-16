@@ -1628,6 +1628,33 @@ Norm では `set_normalize_gain` の atomic store のみ行い、`processed` / `
 `audio_tx_queued` のいずれも触らない。新 gain は `raw_pending` を経由した次の chunk
 から自然に適用される (= 既存 `processed` の最大 ~100ms は旧 gain で鳴り続けるが、
 A/V offset は連続性を保つ)。
+ただし open / source-swap 時点で `audio_normalize.db` の測定値が見つかる場合は、
+`build_video_player_for_open` で `VideoPlayer::open` に初期 Norm gain を渡し、音声ワーカー
+起動前の `AvClock` に設定する。これにより再生開始直後の最初の processed chunk から
+測定済み gain が使われ、動画切り替え時に旧 gain の音が一瞬鳴ることを避ける。
+
+グローバル Norm が ON で `audio_normalize.db` に測定値が無い動画は、open / source swap /
+seek / play toggle 等で `VideoPlayer::intent_playing()` が true になった時点で自動スキャンを
+開始する。判定は `maybe_start_normalize_scan_for_play_intent` に集約し、
+`OnUnmeasured` / fullscreen 中 / スキャン未実行 / auto-scan 抑止なし、の条件を満たす場合だけ
+`start_normalize_scan` へ進む。スキャン開始時の再開可否も `is_playing()` ではなく
+`intent_playing()` を保存するため、Loading / Buffering 中の autoplay でも scan 完了後に再生を
+正しく再開できる。ユーザーキャンセルや scan 失敗後は fs_idx 単位で自動再発火を抑止し、
+手動 Norm クリックだけで再試行できる。抑止は fs_idx 単位で保持し、同 fs_idx への新規
+open / source swap、fullscreen 終了、または全体 OFF で解除する。
+
+未測定かつ open/source-swap 時点で autoplay する動画は、`VideoPlayer::open` へ渡す
+autoplay を一時的に false にしてから fs_cache に挿入し、`init_normalize_state_for_opened_video`
+後に `start_normalize_scan_for_deferred_play_intent` で scan を開始する。この経路では
+`NormalizeScanState.was_playing=true` を明示しておくため、測定完了後は本来の autoplay /
+resume 意図に戻るが、測定前の未補正音は再生されない。キャッシュ hit の動画を grid から
+再開する場合や、停止中の未測定動画をクリック / Enter で再生する場合も同じ deferred-play
+scan 経路を使う。
+pause 中でも audio-pump は最大 ~100ms の `processed` を旧 gain で先読みできるため、
+測定前再生待ちの間は `AvClock::audio_preroll_suspended` を立てて audio-pump の
+raw→processed 先読みを一時停止し、旧 gain の `processed` を作らない。cpal callback 側も
+同フラグ中は silence を返して buffer を drain しない。scan 完了 / cancel / error 後に
+再生 intent を復帰してから解除し、その時点の Norm gain で preroll を再開する。
 
 修正前の旧仕様 (= Norm でも `clear_audio_output_buffer` を呼んでいた頃) は、
 `raw_pending` 5 秒分を捨てて audio audible PTS が clock から 5 秒先行し、
