@@ -576,9 +576,24 @@ impl SettingsDb {
     /// crash 後の再起動では bak1 が「前回 session 開始時の状態」のままになる。
     pub fn rotate_backups(&self, data_dir: &Path) -> Result<(), SettingsDbError> {
         let bak = |n: usize| data_dir.join(format!("settings.db.bak{n}"));
-        // 1. bak10 を削除 (存在しなくても OK)。
+        // T42 (Codex P2 / 2026-05-16): 旧コードは "bak1 → bak2, ... → bak10 rotate
+        // → VACUUM INTO bak1" の順で、9 連 rename 直後に disk-full 等で VACUUM INTO
+        // が失敗すると bak1 が空白になりチェーンに穴が空いた (= 直近世代が消失)。
+        // 新フロー:
+        //   1. まず VACUUM INTO を temp 名 (settings.db.bak.tmp-snapshot) に書き出す。
+        //      失敗してもまだ bak1..bak10 は元の状態で保たれる。
+        //   2. temp snapshot が手に入ってから bak10 削除 + bak1..bak9 を bak2..bak10 へ
+        //      rotate。
+        //   3. temp snapshot を bak1 に rename (atomic-replace、failure 時は temp を
+        //      残してログのみで返す)。
+        // これで「rotate 完了 + snapshot 失敗」のチェーン穴を構造的に作らない。
+        let snapshot_tmp = data_dir.join("settings.db.bak.tmp-snapshot");
+        // 念のため: 前回 crash で残った snapshot_tmp は消す
+        let _ = std::fs::remove_file(&snapshot_tmp);
+        // 1. VACUUM INTO temp_snapshot。ここで失敗したらまだ既存 bak1..bak10 は無事。
+        self.backup_to(&snapshot_tmp)?;
+        // 2. bak10 を削除 → bak9 → bak10, ..., bak1 → bak2 (新→古の rename)。
         let _ = std::fs::remove_file(bak(10));
-        // 2. bak9 → bak10, bak8 → bak9, ..., bak1 → bak2 (新しい番号 → 古い番号)。
         for n in (1..10).rev() {
             let src = bak(n);
             let dst = bak(n + 1);
@@ -594,17 +609,15 @@ impl SettingsDb {
                 }
             }
         }
-        // 3. VACUUM INTO bak1。target は前段の rename で空になっているはず。
-        //    既存ファイルが残っていたら remove してから VACUUM INTO (= target が
-        //    存在すると SQLite はエラーを返すため)。
+        // 3. temp snapshot を bak1 に rename。前段 rename で bak1 は空のはずだが、
+        //    残っている場合は事前 remove (= rename の安全性確保)。
         let bak1 = bak(1);
         if bak1.exists() {
-            // 旧 bak1 が残っているのは前段 rename が部分失敗した場合のみ。
-            // 上書きしないと VACUUM INTO が落ちるので safe に消す。
             if let Err(e) = std::fs::remove_file(&bak1) {
                 log_diag(&format!(
                     "settings_db: rotate_backups: residual bak1 remove failed: {e}"
                 ));
+                // snapshot は temp に残るので次の rotate 時にリトライ可能
                 return Err(SettingsDbError::Rusqlite(rusqlite::Error::SqliteFailure(
                     rusqlite::ffi::Error {
                         code: rusqlite::ErrorCode::CannotOpen,
@@ -614,7 +627,21 @@ impl SettingsDb {
                 )));
             }
         }
-        self.backup_to(&bak1)?;
+        if let Err(e) = std::fs::rename(&snapshot_tmp, &bak1) {
+            log_diag(&format!(
+                "settings_db: rotate_backups: rename {} -> {} failed: {e}",
+                snapshot_tmp.display(),
+                bak1.display()
+            ));
+            // snapshot_tmp は手元に残るので、ユーザーが手動復旧できる
+            return Err(SettingsDbError::Rusqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::CannotOpen,
+                    extended_code: 0,
+                },
+                Some(format!("snapshot tmp rename to bak1 failed: {e}")),
+            )));
+        }
         log_diag(&format!(
             "settings_db: rotate_backups: snapshot -> {}",
             bak1.display()
@@ -1963,6 +1990,12 @@ pub fn boot_settings_db(data_dir: &Path) -> BootOutcome {
                     "settings_db: boot: GLOBAL_DB already populated; \
                      returning LoadedExistingDb on fast path",
                 );
+                // T45 (Codex P2 / 2026-05-16): slow path は `set_global_db` 経由で
+                // SAVE_SUPPRESSED をクリアするが fast-path は GLOBAL_DB 更新だけで
+                // クリアフラグが残る不整合 (前回 session が SaveSuppressed で抜けた
+                // ケースで次回も save 抑止が継続する潜在 bug)。`set_global_db` を
+                // 経由して suppress=false を確実にする。
+                set_global_db(data_dir, Some(Arc::clone(&arc)));
                 return BootOutcome {
                     settings,
                     db: Some(arc),
@@ -2369,9 +2402,14 @@ pub fn save_suppressed() -> bool {
 /// `db == None` → save 抑止フラグを立てる (= `with_db` は `Suppressed` を返す)。
 pub(crate) fn set_global_db(data_dir: &Path, db: Option<Arc<SettingsDb>>) {
     let suppress = db.is_none();
-    if let Ok(mut guard) = GLOBAL_DB.lock() {
-        *guard = db.map(|arc| (data_dir.to_path_buf(), arc));
-    }
+    // T44 (Codex P2 / 2026-05-16): poison を握り潰さず recover する。`with_db` は
+    // poison を `SettingsDbError::Poisoned` で扱うが、ここで諦めて何もしない設計だと
+    // (a) GLOBAL_DB が古い db のまま残ってしまう (b) SAVE_SUPPRESSED が更新されず、
+    // save 経路と boot 経路の挙動が乖離する。`unwrap_or_else(|p| p.into_inner())` で
+    // poison から復旧して必ず GLOBAL_DB を書き換える (= 整合性を優先)。
+    let mut guard = GLOBAL_DB.lock().unwrap_or_else(|p| p.into_inner());
+    *guard = db.map(|arc| (data_dir.to_path_buf(), arc));
+    drop(guard);
     set_save_suppressed(suppress);
 }
 
@@ -2398,8 +2436,28 @@ pub fn with_db<R>(f: impl FnOnce(&SettingsDb) -> R) -> Result<R, SettingsDbError
         let current_dir = crate::data_dir::get();
         let need_reopen = guard.as_ref().map(|(d, _)| d) != Some(&current_dir);
         if need_reopen {
-            let new_db = SettingsDb::open(&current_dir)?;
-            *guard = Some((current_dir.clone(), Arc::new(new_db)));
+            // T43 (Codex P2 / 2026-05-16): data_dir 切替後の lazy re-open は
+            // boot decision tree (bak fallback / JSON migration / quarantine) を
+            // バイパスする非対称。本番動線で data_dir は process 中に変わらず、test
+            // override (`reset_global_for_test`) でクリアされた場合のみ Some(current_dir)
+            // != guard.dir になる想定。ここで `SettingsDb::open` を直叩きすると、
+            // 壊れた DB を quarantine しないまま握ってしまう (= save が壊れた DB に書く)。
+            // boot を経由するため `boot_settings_db_inner` を呼んで結果を set_global_db
+            // 経由で GLOBAL_DB に反映する。
+            log_diag(&format!(
+                "settings_db: with_db: data_dir changed (was={:?}, new={}); routing through boot decision tree",
+                guard.as_ref().map(|(d, _)| d.display().to_string()),
+                current_dir.display(),
+            ));
+            // boot inner は global lock を握り直そうとするので、ここで guard を一度 drop してから呼ぶ
+            drop(guard);
+            let outcome = boot_settings_db_inner(&current_dir);
+            set_global_db(&current_dir, outcome.db.clone());
+            if save_suppressed() {
+                return Err(SettingsDbError::SaveSuppressed);
+            }
+            // 再取得
+            guard = GLOBAL_DB.lock().map_err(|_| SettingsDbError::Poisoned)?;
         }
         // unwrap: 直前で必ず Some を入れている、または既に Some。
         Arc::clone(&guard.as_ref().expect("just set or already Some").1)
