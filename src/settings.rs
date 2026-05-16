@@ -260,9 +260,13 @@ impl SortOrder {
     /// `name_a`/`name_b` はファイル名（拡張子付き）、`mtime_a`/`mtime_b` は更新日時。
     /// `natural_key` は番号順ソート用のキー生成関数。
     ///
-    /// 日付ソートで mtime が等しい場合はファイル名昇順で tiebreak する。`mtime_secs`
-    /// は秒精度なので、同一秒に作成・更新されたファイル群が `read_dir` 順 (FS 依存で
-    /// 不安定) に並ぶのを防ぐ。
+    /// 日付ソートで mtime が等しい場合、および番号順で natural key が等しい場合は
+    /// ファイル名昇順で tiebreak する。
+    /// - `mtime_secs` は秒精度なので、同一秒に作成・更新されたファイル群が
+    ///   `read_dir` 順 (FS 依存で不安定) に並ぶのを防ぐ。
+    /// - 番号順の natural key は記号・空白を除去するため `foo-bar1` / `foobar1` /
+    ///   `foo bar1` のように記号差だけが違うファイルが同値になる。tiebreak が無いと
+    ///   このグループ内で `read_dir` 列挙順がそのまま残り、表示が不安定になる。
     pub fn compare<K: Ord>(
         self,
         name_a: &str,
@@ -273,7 +277,9 @@ impl SortOrder {
     ) -> std::cmp::Ordering {
         match self {
             Self::FileName => name_a.to_lowercase().cmp(&name_b.to_lowercase()),
-            Self::Numeric => natural_key(name_a).cmp(&natural_key(name_b)),
+            Self::Numeric => natural_key(name_a)
+                .cmp(&natural_key(name_b))
+                .then_with(|| name_a.to_lowercase().cmp(&name_b.to_lowercase())),
             Self::DateAsc => mtime_a
                 .cmp(&mtime_b)
                 .then_with(|| name_a.to_lowercase().cmp(&name_b.to_lowercase())),
@@ -2695,6 +2701,41 @@ mod tests {
         assert_eq!(loaded.thumb_quality, original.thumb_quality);
         assert_eq!(loaded.cache_threshold_ms, original.cache_threshold_ms);
         assert_eq!(loaded.prefetch_back, original.prefetch_back);
+    }
+
+    #[test]
+    fn numeric_sort_tiebreaks_on_lowercase_filename() {
+        // 記号差のみのファイル名は natural key が一致するので、tiebreak が
+        // 無いと FS の `read_dir` 列挙順依存になる。`SortOrder::Numeric` は
+        // ファイル名 lowercase の昇順で安定化させる。
+        use crate::ui_helpers::natural_sort_key;
+        let mut names = vec![
+            "foobar1.jpg",
+            "foo-bar1.jpg",
+            "foo bar1.jpg",
+            "foo#bar1.jpg",
+        ];
+        names.sort_by(|a, b| SortOrder::Numeric.compare(a, 0, b, 0, natural_sort_key));
+        // ASCII: ' ' (0x20) < '#' (0x23) < '-' (0x2D) < 'b' (0x62)
+        assert_eq!(
+            names,
+            vec![
+                "foo bar1.jpg",
+                "foo#bar1.jpg",
+                "foo-bar1.jpg",
+                "foobar1.jpg",
+            ]
+        );
+    }
+
+    #[test]
+    fn numeric_sort_groups_hash_and_plain_numbers_together() {
+        // `#1.jpg` と `1.jpg` の natural key を一致させ、tiebreak で並ぶ。
+        // ASCII: '#' (0x23) < '1' (0x31) なので `#1.jpg` が先。
+        use crate::ui_helpers::natural_sort_key;
+        let mut names = vec!["1.jpg", "#1.jpg", "2.jpg"];
+        names.sort_by(|a, b| SortOrder::Numeric.compare(a, 0, b, 0, natural_sort_key));
+        assert_eq!(names, vec!["#1.jpg", "1.jpg", "2.jpg"]);
     }
 
     #[test]

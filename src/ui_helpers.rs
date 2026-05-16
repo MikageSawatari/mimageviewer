@@ -250,6 +250,15 @@ pub fn estimated_file_badge_width(inner: egui::Rect) -> f32 {
 /// 自然順ソート用のキーを返す。
 /// ファイル名を「テキスト部分」と「数字部分」に分割し、
 /// 数字部分は数値として比較するので 1 < 2 < 9 < 10 < 11 となる。
+///
+/// テキスト部分は記号・空白・句読点を除去して英数字 (ASCII letter / CJK 等を含む
+/// `char::is_alphanumeric`) のみを残してから比較する。これにより
+/// `foo#1.jpg` と `foo# 2.jpg` のように区切り記号や空白の有無が混在しても
+/// 番号本体で比較される (空白の有無で `# 2` が `#10` の後ろに回るのを防ぐ)。
+///
+/// 全文字が記号で構成された区間は空文字列になるため、そのチャンクは破棄する
+/// (`#1.jpg` と `1.jpg` の natural key を一致させ、最終順序は呼び出し側の
+/// tiebreak (`SortOrder::compare`) に委ねる)。
 pub fn natural_sort_key(name: &str) -> Vec<NaturalChunk> {
     let name_lower = name.to_lowercase();
     let mut chunks = Vec::new();
@@ -264,10 +273,18 @@ pub fn natural_sort_key(name: &str) -> Vec<NaturalChunk> {
             chunks.push(NaturalChunk::Num(n));
         } else {
             let mut text = String::new();
-            while chars.peek().map(|ch| !ch.is_ascii_digit()).unwrap_or(false) {
-                text.push(chars.next().unwrap());
+            while let Some(&ch) = chars.peek() {
+                if ch.is_ascii_digit() {
+                    break;
+                }
+                chars.next();
+                if ch.is_alphanumeric() {
+                    text.push(ch);
+                }
             }
-            chunks.push(NaturalChunk::Text(text));
+            if !text.is_empty() {
+                chunks.push(NaturalChunk::Text(text));
+            }
         }
     }
     chunks
@@ -895,6 +912,48 @@ mod tests {
         let a = natural_sort_key("apple");
         let b = natural_sort_key("banana");
         assert!(a < b);
+    }
+
+    #[test]
+    fn natural_sort_key_ignores_whitespace_between_marker_and_number() {
+        // `#` の後ろの空白の有無で番号比較に到達できないと
+        // `# 1` が `#68` の後ろに回ってしまう問題への回帰テスト。
+        let a = natural_sort_key("カードキャプターさくら# 1.mp4");
+        let b = natural_sort_key("カードキャプターさくら#68.mp4");
+        assert!(a < b);
+    }
+
+    #[test]
+    fn natural_sort_key_ignores_symbols_in_text_chunks() {
+        // 記号・空白は除去して比較されるので、区切り文字違いは数字本体で並ぶ。
+        let mut names = vec!["foo#10.jpg", "foo# 2.jpg", "foo_1.jpg", "foo-3.jpg"];
+        names.sort_by(|a, b| natural_sort_key(a).cmp(&natural_sort_key(b)));
+        assert_eq!(
+            names,
+            vec!["foo_1.jpg", "foo# 2.jpg", "foo-3.jpg", "foo#10.jpg"]
+        );
+    }
+
+    #[test]
+    fn natural_sort_key_drops_empty_text_chunks() {
+        // 記号だけで構成される区間は Text("") として残らず破棄される。
+        // 結果として、ファイル先頭が記号で始まる `#1.jpg` も先頭記号がない
+        // `1.jpg` と natural key が完全に一致する (最終順序は
+        // SortOrder::compare の tiebreak に委ねる)。
+        assert_eq!(natural_sort_key("#1.jpg"), natural_sort_key("1.jpg"));
+        // 記号差だけのファイル名同士も natural key として同値になる。
+        assert_eq!(
+            natural_sort_key("foo-bar1.jpg"),
+            natural_sort_key("foobar1.jpg"),
+        );
+        assert_eq!(
+            natural_sort_key("foo bar1.jpg"),
+            natural_sort_key("foo#bar1.jpg"),
+        );
+        // 数字の間に挟まる記号は数字を分離するため、`1#2.jpg` (=Num(1),Num(2))
+        // と `12.jpg` (=Num(12)) は別キーになる。記号除去はあくまで
+        // テキスト区間内の正規化であって、数字チャンクの結合は行わない。
+        assert_ne!(natural_sort_key("1#2.jpg"), natural_sort_key("12.jpg"));
     }
 
     #[test]
