@@ -2306,4 +2306,65 @@ mod tests {
         });
         assert_eq!(actor.state, EngineState::Playing);
     }
+
+    // ──────────────────────────────────────────────────────────────
+    // Codex 2026-05-17 残作業: DecoderEvent::EofReached を engine に流す配線。
+    // EOF stop の二重管理を解消し、Eof state での Play 命令が replay として動作する
+    // ことを構造的に保証する。
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn eof_reached_freezes_av_clock_and_publishes_eof_state() {
+        // EofReached を受けると engine が Eof state に遷移、AvClock も
+        // Frozen(duration) + playing=false になる。これで mod.rs 側の直書き
+        // set_position_at_eof / set_playing(false) が不要になる。
+        let (mut actor, av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
+        actor.transition_to_playing(ClockAnchor::audio(0.0, Instant::now()));
+        assert!(av_clock.is_playing());
+
+        actor.handle_decoder_event(DecoderEvent::EofReached {
+            epoch: actor.current_seek_epoch(),
+            duration_secs: 60.0,
+        });
+        assert_eq!(actor.state, EngineState::Eof);
+        assert_eq!(actor.published_state_code(), state_code::EOF);
+        assert!(!av_clock.is_playing());
+        assert!((av_clock.now_secs() - 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn play_from_eof_state_triggers_replay_seek_to_zero() {
+        // EOF stop 後に Play 命令が来ると handle_play の Eof arm が走り、
+        // handle_seek_request(0.0) で epoch++ + state=Seeking{0.0} に遷移する。
+        // = `VideoPlayer::set_playing(true)` の EOF replay 動作の基礎。
+        let (mut actor, _av_clock) = fresh_actor_with_av_clock(OpenOptions::default());
+        actor.transition_to_playing(ClockAnchor::audio(0.0, Instant::now()));
+        actor.handle_decoder_event(DecoderEvent::EofReached {
+            epoch: actor.current_seek_epoch(),
+            duration_secs: 60.0,
+        });
+        assert_eq!(actor.state, EngineState::Eof);
+        let epoch_before = actor.current_seek_epoch();
+
+        // Play 命令 → Eof arm → handle_seek_request(0)
+        actor.apply_command(TransportCommand::Play);
+        match actor.state {
+            EngineState::Seeking { target_secs } => {
+                assert!(
+                    (target_secs - 0.0).abs() < 1e-9,
+                    "EOF replay should seek to 0.0, got {target_secs}"
+                );
+            }
+            other => panic!("expected Seeking{{0.0}} after Play from Eof, got {other:?}"),
+        }
+        assert!(
+            actor.autoplay_intent(),
+            "Play from Eof should set autoplay=true (= will reach Playing after readiness)"
+        );
+        assert_eq!(
+            actor.current_seek_epoch(),
+            epoch_before + 1,
+            "EOF replay seek should advance epoch by exactly 1"
+        );
+    }
 }

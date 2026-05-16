@@ -4462,22 +4462,30 @@ impl VideoPlayer {
                     g.handle_seek_request(target);
                     g.apply_command(engine::actor::TransportCommand::Play);
                 } else {
-                    // ループ OFF: 末端到達 → duration 位置で凍結して停止。
-                    // 非 native 経路の EOF block (line 末尾) と同じ処理。これが無いと
-                    // native 経路ではクロックが duration を超えて進み続ける。
+                    // ループ OFF: 末端到達 → engine に `EofReached` を **同期的に** 渡す。
+                    // engine の `transition_to_eof(duration)` が走り:
+                    //   - 内部 MasterClock を Frozen(duration) に
+                    //   - state = Eof / published_state.store(EOF, Release)
+                    //   - av_clock.engine_freeze_at(duration) で AvClock も
+                    //     Frozen(duration) + playing=false に
+                    // が atomic に行われる。
                     //
-                    // ⚠️ 例外: ここの `clock.set_playing(false)` 直書きは **残す**
-                    // (Codex P3 2026-05-17 の指摘)。現状 decoder は
-                    // `DecoderEvent::EofReached` を engine に流しておらず (= 配線未完)、
-                    // engine の `transition_to_eof` → `av_clock.engine_freeze_at(duration)`
-                    // 経路は production code では発火しない。EofReached を
-                    // engine_event_tx に流す改修が入ったら、この直書きも撤去可能。
-                    if let Some(info) = self.info.as_ref() {
-                        if info.duration_secs > 0.0 {
-                            self.clock.set_position_at_eof(info.duration_secs);
-                        }
+                    // 旧コードは直接 `clock.set_position_at_eof(duration)` +
+                    // `clock.set_playing(false)` を呼んでいたが、engine 側 state は
+                    // Playing のままで二重管理になり、`set_playing(true)` の EOF replay
+                    // 特例 (= handle_play の Eof arm) が発火せず replay できなかった
+                    // (Codex P2-2 2026-05-17)。同期呼び出しで state を Eof に正しく
+                    // 遷移させることでこの不整合を解消する。
+                    if let Some(info) = self.info.as_ref()
+                        && info.duration_secs > 0.0
+                    {
+                        let mut g = self.engine.lock().unwrap();
+                        let cur_epoch = g.current_seek_epoch();
+                        g.handle_decoder_event(engine::state::DecoderEvent::EofReached {
+                            epoch: cur_epoch,
+                            duration_secs: info.duration_secs,
+                        });
                     }
-                    self.clock.set_playing(false);
                 }
             }
             // 動画オープン中 (= 1 フレームも表示されていない) は preparing HUD の
@@ -4614,18 +4622,19 @@ impl VideoPlayer {
                 g.handle_seek_request(target);
                 g.apply_command(engine::actor::TransportCommand::Play);
             } else {
-                // 末端到達 → duration 位置に進めて停止 (シークバー右端を確実にする)。
-                //
-                // ⚠️ 例外: ここの `clock.set_playing(false)` 直書きは **残す**
-                // (Codex P3 2026-05-17 の指摘)。native 経路の同等ブロック (上記
-                // `is_native_playing` 分岐内) と同じ理由: decoder の EofReached が
-                // engine に流れていない (配線未完)。
-                if let Some(info) = &self.info {
-                    if info.duration_secs > 0.0 {
-                        self.clock.set_position_at_eof(info.duration_secs);
-                    }
+                // 末端到達 → engine に EofReached を同期的に流し、state=Eof +
+                // AvClock freeze(duration) + playing=false を atomic に確定する。
+                // native 経路と同じ理由・処理 (詳細はそちらの doc コメント参照)。
+                if let Some(info) = self.info.as_ref()
+                    && info.duration_secs > 0.0
+                {
+                    let mut g = self.engine.lock().unwrap();
+                    let cur_epoch = g.current_seek_epoch();
+                    g.handle_decoder_event(engine::state::DecoderEvent::EofReached {
+                        epoch: cur_epoch,
+                        duration_secs: info.duration_secs,
+                    });
                 }
-                self.clock.set_playing(false);
             }
         }
 

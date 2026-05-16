@@ -5724,10 +5724,9 @@ impl App {
             let _ = (ctx, fs_idx);
         }
         if rewind_key && let Some(p) = self.fs_video_player(fs_idx) {
+            // `seek(0.0)` は内部で `apply_command(Play)` を発行し autoplay intent を
+            // 立てるので、追加 `toggle_play()` は不要 (Codex P2-1 2026-05-17)。
             p.seek(0.0);
-            if !p.is_playing() {
-                p.toggle_play();
-            }
         }
 
         // 何らかの動画ショートカット入力があれば HUD のフェードタイマをリセット

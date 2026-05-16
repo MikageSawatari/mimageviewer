@@ -929,22 +929,29 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
     `apply_command(Play/Pause)` / `handle_seek_request + apply_command` 経由で engine を
     通る経路に統一されている。
 
-- **既知の例外** (EOF stop): 上記不変条件には **2 箇所だけ例外がある** —
-  `VideoPlayer::tick` 内の native 経路 EOF block と非 native 経路 EOF block
-  (`info.duration_secs > 0` で `clock.set_position_at_eof(duration)` + `clock.set_playing(false)`
-  を呼ぶ箇所)。現状 `decoder.rs` は `DecoderEvent::EofReached` を `engine_event_tx` に
-  流していないため、`EngineActor::transition_to_eof` → `engine_freeze_at(duration)`
-  経路は production code では発火しない (= test code でのみカバー)。EofReached を
-  engine_event_tx に流す改修を入れたら、この 2 箇所の直書きも撤去可能。同様に
-  `BufferStarved` / `AudioRendered` / `AudioInactive` も engine に流れていないため、
-  `EngineActor::handle_audio_event` の対応 arm は production では dead path。
-  - `handle_audio_event(AudioRendered)` 経路が動かないことの実害は
-    [src/video/engine/actor.rs] の `handle_pause` / `BufferStarved` /
-    `apply_command(SeekRelative)` / `apply_command(SetSpeed)` で吸収している。
-    これらは「現在 PTS」が必要だが、内部 `self.clock` (= MasterClock) は
-    `AudioRendered` 不在で audio 駆動の更新が来ないため、`self.av_clock.now_secs()`
-    を読む compat shim に切り替えている。AudioRendered 配線完了後は
-    `self.clock.now_secs()` でも等価になる。
+- **EofReached の同期配線** (2026-05-18 完了): `VideoPlayer::tick` 内の native 経路 /
+  非 native 経路の EOF block 2 箇所は、ループ OFF (= 末端到達 → 停止) のとき
+  `engine.handle_decoder_event(DecoderEvent::EofReached { duration_secs })` を
+  **同期的に** 呼ぶ。これで engine が `transition_to_eof(duration)` を実行し、
+  state=Eof + `av_clock.engine_freeze_at(duration)` が atomic に確定する。旧版は
+  `clock.set_position_at_eof(duration)` + `clock.set_playing(false)` を直書きしていて
+  engine state が Playing のまま残るため、`VideoPlayer::set_playing(true)` の EOF
+  replay 経路で `handle_play` の Eof arm に到達できず `Playing` no-op に落ちて
+  replay できないバグになっていた。同期配線で engine state を Eof に正しく遷移
+  させることで replay 経路が動作するようになる。ループ ON 経路は従来通り
+  `clock.request_seek + handle_seek_request + apply_command(Play)` で seek-and-play
+  を発行する (= engine が Seeking → Buffering → Playing を踏む)。
+
+- **残りの暫定処置** (`AudioRendered` / `BufferStarved` / `AudioInactive`):
+  これら 3 つの `AudioEvent` は依然として production code から engine に流れていない。
+  `EngineActor::handle_audio_event` の該当 arm は test code でのみカバー。実害は
+  [src/video/engine/actor.rs] の `handle_pause` / `apply_command(SeekRelative)` /
+  `apply_command(SetSpeed)` / `handle_audio_event(BufferStarved)` の同期処理が
+  「現在 PTS」を必要とするときに `self.clock.now_secs()` (= 内部 MasterClock、
+  `AudioRendered` 不在で audio 駆動の更新が来ない) ではなく `self.av_clock.now_secs()`
+  を読む compat shim で吸収している。`AudioRendered` 配線完了後は `self.clock.now_secs()`
+  でも等価になるが、優先度は低い (= 互換 shim で実害無し、配線変更は audio.rs 周辺の
+  大きな改修になる)。
 
 - **不変条件: 非 PLAYING 中の decoder は `video_tx` 満杯時に drop せず block する**
   (2026-05 root fix の補完):

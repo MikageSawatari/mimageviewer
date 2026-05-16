@@ -1602,10 +1602,12 @@ impl App {
         }
         let did_seek = if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
         {
+            // `seek(0.0)` は内部で `apply_command(Play)` を発行し autoplay intent を
+            // 立てるので、追加の `toggle_play()` は不要 (Codex P2-1 2026-05-17)。
+            // 旧コードは `if !is_playing() { toggle_play() }` で「念のため再生」を
+            // 意図していたが、intent ベースの toggle_play (= 2026-05 修正) では
+            // `intent_playing()=true` を見て Pause に反転していたバグ。
             player.seek(0.0);
-            if !player.is_playing() {
-                player.toggle_play();
-            }
             true
         } else {
             false
@@ -3431,10 +3433,9 @@ impl App {
             // W: seek to start and play.
             0x57 if !key.shift && !key.ctrl && !key.repeat => {
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                    // `seek(0.0)` 自体が `apply_command(Play)` 経由で autoplay intent
+                    // を立てるので、追加 `toggle_play()` は不要 (Codex P2-1 2026-05-17)。
                     player.seek(0.0);
-                    if !player.is_playing() {
-                        player.toggle_play();
-                    }
                 }
             }
             // Ctrl+Shift+Left / Right: frame step and pause.
