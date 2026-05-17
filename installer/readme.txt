@@ -39,7 +39,13 @@ GPU アクセラレーションによるサムネイルグリッド表示を特�
   - PDF 表示（PDF 表示エンジン内蔵、パスワード付き対応）
   - RAW / HEIC / AVIF / JPEG XL 表示（Windows WIC 経由）
   - Susie 画像プラグイン（.spi、32bit）対応
-  - 動画サムネイル表示（MP4 / AVI / MKV 等）
+  - 動画インライン再生（MP4 / MKV / MOV / AVI / WMV / MPG / HEVC / AV1 等、
+    GPU ハードウェアデコード対応、シーク / 倍速再生 / タイル モード /
+    ブックマーク / チャプター / ラウドネス ノーマライズ）
+  - VST3 プラグイン処理（動画音声をリアルタイムにメーター / EQ 等へ通す）
+  - AI 動画アップスケール（オフライン処理、長尺対応の再開機能付き）
+  - NVIDIA GPU 向け TensorRT 高速化（DirectML 比 1.4〜4.5 倍）
+  - レーティング（★1〜5、フォルダ単位のコンテナ★、フィルタ）
   - お気に入りフォルダ、カスタマイズ可能ツールバー
   - UI テーマ（システム / ライト / ダーク）
   - タスクトレイ常駐（バックグラウンドで索引を最新に維持）
@@ -121,7 +127,7 @@ Windows の「設定」→「アプリ」→「インストールされている
 
     %APPDATA%\mimageviewer\
 
-  - settings.json    : アプリケーション設定
+  - settings.db      : アプリケーション設定（SQLite、10 世代の自動バックアップ付き）
   - cache\           : サムネイルキャッシュ（SQLite）
   - models\          : AI 用 ONNX モデル（初回展開）
   - logs\            : エラーログ
@@ -152,6 +158,7 @@ Windows の「設定」→「アプリ」→「インストールされている
   - eframe / egui (MIT or Apache-2.0): Rerun Technologies
   - FFmpeg (LGPLv3-or-later): FFmpeg project
     Source and license notes: https://mikage.to/mimageviewer/
+  - Steinberg VST3 SDK (MIT): Steinberg Media Technologies GmbH
 
 AI モデルは各配布元のライセンスに従います。詳細は
 オンラインマニュアル（下記）を参照してください。
