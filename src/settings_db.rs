@@ -3162,16 +3162,19 @@ mod tests {
         // (= 物理的に rename / delete) して bak chain に倒す or 再度 create_new。
         // 本テストは「open が Corrupted を返す」までで終わらせる (= recovery 部分は
         // Phase 2 で family pre-check 経由になるため Phase 1 の単体テスト範囲外)。
-        let dir = TempDir::new().unwrap();
+        // 2026-05-17: 失敗経路の `log_diag` が `data_dir::get()` を呼ぶので、
+        // `DataDirOverrideGuard` で TEST_OVERRIDE を立てて default() panic ガードを回避する。
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
         // create_new は init_schema を走らせて schema_version を書くが、
         // save_full を呼ばないまま drop すれば bootstrap_complete は付かない。
         {
-            let _db = SettingsDb::create_new(dir.path()).unwrap();
+            let _db = SettingsDb::create_new(dir).unwrap();
             // 意図的に save_full しない。
         }
         // settings.db ファイルは存在する。
-        assert!(dir.path().join("settings.db").exists());
-        let err = match SettingsDb::open(dir.path()) {
+        assert!(dir.join("settings.db").exists());
+        let err = match SettingsDb::open(dir) {
             Ok(_) => panic!("init-without-save should not pass RequireExisting"),
             Err(e) => e,
         };
@@ -3180,12 +3183,12 @@ mod tests {
             "init-without-save should be Corrupted, got: {err:?}"
         );
         // 復旧: 残骸を物理削除 → create_new + save_full で再 bootstrap → open 成功。
-        std::fs::remove_file(dir.path().join("settings.db")).unwrap();
+        std::fs::remove_file(dir.join("settings.db")).unwrap();
         {
-            let db = SettingsDb::create_new(dir.path()).unwrap();
+            let db = SettingsDb::create_new(dir).unwrap();
             db.save_full(&Settings::default()).unwrap();
         }
-        let _ok = SettingsDb::open(dir.path()).expect("after rebootstrap, open should succeed");
+        let _ok = SettingsDb::open(dir).expect("after rebootstrap, open should succeed");
     }
 
     #[test]
@@ -3464,11 +3467,14 @@ mod tests {
         // Codex P1 (2026-05-13) 対応: open / PRAGMA / integrity_check / init_schema の
         // どの段階で NotADatabase が surface しても `Corrupted` に分類されるべき。
         // `Rusqlite` や `Transient` で逃げる挙動は許容しない。
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("settings.db");
+        // 2026-05-17: 失敗経路の `log_diag` が `data_dir::get()` を呼ぶので、
+        // `DataDirOverrideGuard` で TEST_OVERRIDE を立てて default() panic ガードを回避する。
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let path = dir.join("settings.db");
         // 「SQLite ヘッダではない」16 バイトを書く。
         std::fs::write(&path, b"NOT A SQLITE DB!").unwrap();
-        let err = match SettingsDb::open(dir.path()) {
+        let err = match SettingsDb::open(dir) {
             Ok(_) => panic!("should fail to open a non-sqlite file"),
             Err(e) => e,
         };

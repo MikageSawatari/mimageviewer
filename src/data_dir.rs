@@ -114,22 +114,30 @@ pub fn logs_dir() -> PathBuf {
 
 fn default() -> PathBuf {
     // 2026-05-17 事故ガード (cfg(test)): テストで `set_test_override(Some(temp))` を
-    // 呼び忘れたまま `data_dir::get()` に落ちると、ここで本物の %APPDATA%\mimageviewer
-    // を返してしまい、後段の Settings::load() / with_db() がユーザーの本番 settings.db
-    // を上書きする経路に入る (実害: 2026-05-16 夜の cargo test 中に発生)。
-    // テストでは default() に到達した時点で fail-fast させて、override を書き忘れた
-    // unit test を機械的に検出する。本番ビルドでは従来どおり %APPDATA% を返す。
+    // 呼び忘れたまま `data_dir::get()` に落ちると、本物の %APPDATA%\mimageviewer に
+    // SettingsDb の open/save や `log_diag` の append が流れ込み、ユーザーの本番
+    // settings.db / settings.log を汚染する経路に入る (実害: 2026-05-16 夜の
+    // cargo test 中に発生)。
     //
-    // integration tests (tests/*.rs) はリンク時に `cfg(test)` が false の lib を
-    // 使うのでこの panic は発火しない。代わりに、library 公開 API は data_dir
-    // パラメータを明示的に受け取る (`IndexerManager::new_at` 等) ので、
-    // `data_dir::get()` には到達しない設計。
+    // 主防御は `settings_db::with_db` の data_dir 不一致検知で `SaveSuppressed` に
+    // 倒すこと。default() 側はそれと別の二重防御として、**cfg(test) ではプロセス毎の
+    // sandbox temp dir を返す**。これで:
+    //   - 本物の %APPDATA% を絶対に触らない (= 汚染ゼロ)
+    //   - panic で test を片っ端から落とさない (= log_diag のような副次的な
+    //     get() 呼び出しを許容)
+    //   - sandbox 内で何が書かれてもプロセス終了時に自動消滅
+    //
+    // 厳格に書き忘れを検出したい場合は、test 側で明示的に `TestDataDirGuard` または
+    // `DataDirOverrideGuard` を取って override をセットすること。
     #[cfg(test)]
-    panic!(
-        "data_dir::default() reached in cfg(test) build. Tests must call \
-         data_dir::set_test_override(Some(temp_dir)) before any code path that hits \
-         data_dir::get() — otherwise the test would touch the real %APPDATA%."
-    );
+    {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "mimageviewer-cfg-test-sandbox-{}",
+            std::process::id()
+        ));
+        p
+    }
     #[cfg(not(test))]
     {
         let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());

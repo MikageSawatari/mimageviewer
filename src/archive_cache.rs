@@ -477,19 +477,17 @@ fn remove_cache_file_and_dirs(zip_path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
-
-    fn fresh_data_dir() -> TempDir {
-        let tmp = TempDir::new().unwrap();
-        // テストごとに DATA_DIR は上書きできないので、OnceLock の初回 set 狙い。
-        // 既に設定されていれば current DATA_DIR を尊重する。
-        crate::data_dir::DATA_DIR.set(tmp.path().to_path_buf()).ok();
-        tmp
-    }
 
     #[test]
     fn schema_and_roundtrip() {
-        let _guard = fresh_data_dir();
+        // 2026-05-17: 旧版は `DATA_DIR.set(...).ok()` で OnceLock を直接叩いていたが、
+        // (a) 2 回目以降の set は silently 失敗するので並列テストで古い (= 既に削除済み)
+        //     temp dir を握ったまま動く、(b) TEST_OVERRIDE を使う他テストと並列実行すると
+        //     `data_dir::get()` は TEST_OVERRIDE を優先するので DATA_DIR は無効化される、
+        // という二重の問題があった (Codex P1 / 2026-05-17 指摘で発覚)。
+        // `TestDataDirGuard` は `test_override_lock` で他の override 系テストと直列化し、
+        // TEST_OVERRIDE 経由で temp dir を渡すので両方解決する。
+        let _guard = crate::data_dir::TestDataDirGuard::new();
         let db = ArchiveCacheDb::open().unwrap();
         assert!(db.list_all().unwrap().is_empty());
         assert_eq!(db.total_size().unwrap(), 0);
