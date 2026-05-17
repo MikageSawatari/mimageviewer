@@ -88,26 +88,14 @@ impl App {
             return;
         }
 
-        // 2026-05-17 Codex P1 対応: Terminal 結果を表示中は親ウィンドウを **描画しない**。
-        // 親の `.open(&mut open)` の [x] が活きていると、ユーザーがそれを押した瞬間に
-        // 状態がリセットされて強制終了誘導の dialog が消えてしまう (= SAVE_SUPPRESSED
-        // が立ったまま + GLOBAL_DB drop 後の状態で操作続行できる抜け道)。Terminal の
-        // 結果 dialog だけを描画してユーザーを終了ボタン以外の経路に逃がさない。
-        let is_terminal_result = matches!(
-            self.settings_restore_state.result,
-            Some(ActionResult::FailedTerminal { .. })
-        );
-        if is_terminal_result {
-            self.show_settings_restore_result_dialog(ctx);
-            return;
-        }
-
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
 
-        // 確認ダイアログを出している間は escape を「メイン閉じる」に使わない
-        // (= 確認ダイアログ側のキャンセル扱いにしたい)。
+        // 確認ダイアログ / 結果ダイアログを出している間は escape を「メイン閉じる」
+        // に使わない (= 子側のキャンセル扱いにしたい)。結果ダイアログは `egui::Modal`
+        // で背景入力をブロックするので、親側の [x] も内部的にクリックされない
+        // (2026-05-17 Codex P2 round 2 対応)。
         let confirm_open = self.settings_restore_state.pending.is_some();
         let result_open = self.settings_restore_state.result.is_some();
 
@@ -126,7 +114,8 @@ impl App {
             self.settings_restore_state = SettingsRestoreState::default();
         }
 
-        // 確認 / 完了の各ダイアログ (Recoverable 結果はここで描画)。
+        // 確認 / 完了の各ダイアログ。結果ダイアログは `egui::Modal` で背景全部を
+        // ブロックするので、Terminal でも Recoverable でも背景 UI 操作は不可能。
         self.show_settings_restore_confirm_dialog(ctx);
         self.show_settings_restore_result_dialog(ctx);
     }
@@ -222,7 +211,6 @@ impl App {
             return;
         }
         let mut closing = false;
-        let escape_pressed = self.dialog_escape_pressed(ctx);
 
         // self の借用を避けるため、必要情報を先に取り出してから描画する。
         let result_ref = self
@@ -233,38 +221,41 @@ impl App {
         let kind = result_kind(result_ref);
         let (title, lines) = build_result_body(result_ref);
 
-        let mut window_open = true;
-        // Terminal はユーザーが閉じる以外の経路を絶対に踏ませない (= [x] / Esc を
-        // 無効化する)。`open` 引数を渡さないことで [x] ボタンを消し、escape も拾わない。
-        let mut win = egui::Window::new(title).collapsible(false).resizable(false);
-        if kind != ResultKind::FailedTerminal {
-            win = win.open(&mut window_open);
-        }
-        win.show(ctx, |ui| {
-            for line in lines {
-                if kind != ResultKind::Success {
-                    ui.colored_label(egui::Color32::from_rgb(0xc0, 0x40, 0x40), line);
-                } else {
-                    ui.label(line);
+        // 2026-05-17 Codex P2 round 2 対応: `egui::Modal` で背景 UI を完全にブロック
+        // する。`egui::Window` だとモーダルでないので、ユーザーがダイアログを閉じずに
+        // 背景の通常 UI を操作できてしまい、Terminal の「続行不可」分類が画面上は
+        // 機能しなかった。Modal なら backdrop が背景クリックを全部吸う + 背景フォーカスを
+        // 完全に奪う。
+        let response =
+            egui::Modal::new(egui::Id::new("settings_restore_result_modal")).show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                ui.heading(title);
+                ui.add_space(8.0);
+                for line in lines {
+                    if kind != ResultKind::Success {
+                        ui.colored_label(egui::Color32::from_rgb(0xc0, 0x40, 0x40), line);
+                    } else {
+                        ui.label(line);
+                    }
                 }
-            }
-            ui.add_space(8.0);
-            ui.separator();
-            ui.add_space(4.0);
-            let button_label = match kind {
-                ResultKind::Success => "アプリを終了",
-                ResultKind::FailedRecoverable => "閉じる",
-                ResultKind::FailedTerminal => "アプリを終了して再起動を促す",
-            };
-            ui.horizontal(|ui| {
-                if ui.button(button_label).clicked() {
-                    closing = true;
-                }
+                ui.add_space(8.0);
+                ui.separator();
+                ui.add_space(4.0);
+                let button_label = match kind {
+                    ResultKind::Success => "アプリを終了",
+                    ResultKind::FailedRecoverable => "閉じる",
+                    ResultKind::FailedTerminal => "アプリを終了して再起動を促す",
+                };
+                ui.horizontal(|ui| {
+                    if ui.button(button_label).clicked() {
+                        closing = true;
+                    }
+                });
             });
-        });
 
-        // Recoverable のみ [x] / Esc で閉じる経路を許可。Terminal はボタン経由のみ。
-        if kind != ResultKind::FailedTerminal && (!window_open || escape_pressed) {
+        // Recoverable のみ backdrop クリック / Esc を「閉じる」として受け付ける。
+        // Terminal は backdrop / Esc も無効 (= ボタンクリックでしか抜けられない)。
+        if kind == ResultKind::FailedRecoverable && response.should_close() {
             closing = true;
         }
 

@@ -303,20 +303,23 @@ pub fn restore_from(
 
     // 4. **bak 復元** のときだけ、稼働中の SQLite で `PRAGMA wal_checkpoint(TRUNCATE)`
     //    を走らせて WAL の全 frame を main に統合する。これで `settings.db` 自体が
-    //    self-contained になり、後段の rename が失敗しても「未 checkpoint の WAL
-    //    データが消える」事故を避けられる (Codex P2 / 2026-05-17 対応)。
+    //    self-contained になり、後段の rename / WAL 削除が失敗しても「未 checkpoint の
+    //    WAL データが消える」事故を避けられる (Codex P2 / 2026-05-17 対応)。
     //
     //    `Current` (= WAL 破棄が user 意図) では checkpoint しない (= 破棄したい
     //    WAL データを main に統合してしまうと操作意図に反する)。
     //
-    //    checkpoint 失敗は best-effort で吸収。失敗しても以降のフローは続行できる
-    //    (= 最悪のケースで未 checkpoint 分の data loss が起きるが、user は restore で
-    //    どのみちその WAL を捨てる意図でいるため致命的ではない)。
+    //    **checkpoint 失敗は strict 扱い** (Codex P1 round 3 / 2026-05-17): busy 戻り値
+    //    も検査して「実は何も checkpoint されていない」状態を弾く。失敗時は何もファイル
+    //    を触っていないので suppress を巻き戻して Recoverable で return する。
+    //    (旧版は best-effort + log だったが、checkpoint 不完全のまま WAL を削除すると
+    //    user の直近設定が永久に失われる。)
     if !source.is_current() {
         if let Err(e) = crate::settings_db::checkpoint_global_db() {
-            crate::logger::log(format!(
-                "[settings_restore] pre-restore wal_checkpoint failed (proceeding anyway): {e}"
-            ));
+            crate::settings_db::set_save_suppressed(false);
+            return Err(RestoreFailure::Recoverable(RestoreError::ValidationFailed(
+                format!("復元前の WAL チェックポイント (PRAGMA wal_checkpoint) に失敗: {e}"),
+            )));
         }
     }
 
@@ -328,9 +331,26 @@ pub fn restore_from(
     //    後段の retry で吸収する。
     crate::settings_db::set_global_db(data_dir, None);
 
-    // 6. settings.db を atomic rename で差し替える (current 選択時は no-op)。
-    //    失敗時の状態: main 未変更 + checkpoint 済み (= データ完全)。suppress を巻き戻して
-    //    Recoverable で return。次回 with_db が lazy boot で同じ settings.db を再 open する。
+    // 6. **WAL/SHM を strict に削除** (Codex P1 round 3): 旧版は bak 復元時 best-effort
+    //    だったが、`VACUUM INTO` で作った bak と旧 WAL の組み合わせでは salt mismatch
+    //    が効かず、新 main + 旧 WAL の状態で SQLite が旧 WAL の行を **再適用** する
+    //    ケースがある (= 復元が部分巻き戻る)。canonical 名から確実に外してから main
+    //    rename に進む。
+    //
+    //    main は未変更なので失敗時は Recoverable: suppress を巻き戻して、次回 with_db
+    //    が lazy boot で同じ settings.db を再 open する (= checkpoint 済みなのでデータ無傷)。
+    if let Err(e) = drop_wal_sidecars_strict(data_dir) {
+        crate::settings_db::set_save_suppressed(false);
+        return Err(RestoreFailure::Recoverable(e));
+    }
+
+    // 7. settings.db を atomic rename で差し替える (Current 選択時は no-op)。
+    //    Current のときは「main を保ったまま WAL/SHM 破棄」が user 意図そのものなので、
+    //    ここで何もせず success に倒す。
+    //
+    //    bak 復元の rename 失敗時: main 未変更 + checkpoint 済み + WAL/SHM 削除済み =
+    //    user の元の設定は main にまるごと残っている状態。suppress を巻き戻して Recoverable
+    //    return する (次回 with_db lazy boot で main 再 open、データ無傷)。
     if !source.is_current() {
         let src_path = data_dir.join(source.filename());
         let main_path = data_dir.join("settings.db");
@@ -338,22 +358,6 @@ pub fn restore_from(
             crate::settings_db::set_save_suppressed(false);
             return Err(RestoreFailure::Recoverable(e));
         }
-    }
-    // ⚠️ ここから先は main 差し替え後 (bak 復元) / 重要な WAL 破棄前 (Current) なので、
-    //    失敗は Terminal: 続けて操作するとアプリの in-memory state と disk が乖離する。
-
-    // 7. WAL/SHM を破棄する。挙動は復元元によって変える:
-    //    - **bak 復元**: 失敗は best-effort で吸収 (= 旧 WAL は salt mismatch で SQLite が
-    //      無視するので、新 main の整合性は崩れない)。stale な file が disk に残るだけ。
-    //    - **Current**: WAL 破棄が user 意図そのもの。失敗したら Recoverable で
-    //      return (suppress 巻き戻し)。main は未変更なので、再試行可能。
-    if source.is_current() {
-        if let Err(e) = drop_wal_sidecars_strict(data_dir) {
-            crate::settings_db::set_save_suppressed(false);
-            return Err(RestoreFailure::Recoverable(e));
-        }
-    } else {
-        drop_wal_sidecars_best_effort(data_dir);
     }
 
     Ok(RestoreReport { snapshot_paths })
@@ -511,34 +515,12 @@ fn replace_file_atomic_with_retry(src: &Path, dst: &Path) -> Result<(), RestoreE
     }
 }
 
-/// WAL/SHM を retry 付きで削除する。NotFound は成功扱い。失敗は **log のみで吸収**。
-///
-/// bak 復元成功後の WAL/SHM 整理に使う。新 main + 旧 WAL が残っても SQLite の WAL
-/// salt mismatch で旧 WAL は無視されるので、stale な file が disk に残るだけで動作には
-/// 影響しない (= ベストエフォートで OK)。
-fn drop_wal_sidecars_best_effort(data_dir: &Path) {
-    for name in ["settings.db-wal", "settings.db-shm"] {
-        let p = data_dir.join(name);
-        let result =
-            retry_io(
-                10,
-                std::time::Duration::from_millis(50),
-                || match std::fs::remove_file(&p) {
-                    Ok(()) => Ok(()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                    Err(e) => Err(e),
-                },
-            );
-        if let Err(e) = result {
-            crate::logger::log(format!(
-                "[settings_restore] stale sidecar {} could not be removed (proceeding): {e}",
-                p.display()
-            ));
-        }
-    }
-}
-
 /// WAL/SHM を retry 付きで削除する。NotFound は成功扱い。最後まで残ったら error。
+///
+/// 2026-05-17 Codex P1 round 3 対応: 旧版で bak 復元時に best-effort 削除に倒していた
+/// 経路は廃止した。理由は、`VACUUM INTO` で作った bak と旧 WAL の組み合わせでは WAL
+/// salt mismatch ガードが効かず、SQLite が旧 WAL の行を新 main に再適用しうるため。
+/// canonical 名から確実に削除できたことを担保してから rename に進む。
 fn drop_wal_sidecars_strict(data_dir: &Path) -> Result<(), RestoreError> {
     for name in ["settings.db-wal", "settings.db-shm"] {
         let p = data_dir.join(name);

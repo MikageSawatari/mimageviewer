@@ -534,11 +534,34 @@ impl SettingsDb {
     /// 2026-05-17 Codex P2 対応で追加。`settings_restore::restore_from` の atomic rename
     /// 直前に呼べば、main が self-contained になるので、rename 失敗時に「未 checkpoint
     /// の WAL データ消失」事故を避けられる。
+    ///
+    /// **戻り値の検査** (2026-05-17 Codex P1 round 2): SQLite の `PRAGMA wal_checkpoint`
+    /// は `(busy, log, checkpointed)` の 3 列を返す。`execute_batch` だとこの行を
+    /// 取りこぼして「busy で実は何も checkpoint されていない」を見逃す。`query_row`
+    /// で busy を読み取り、`busy != 0` なら `Transient` で fail する (= 呼び出し側は
+    /// retry または abort を判断できる)。
     pub fn checkpoint_truncate(&self) -> Result<(), SettingsDbError> {
         let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
-        inner
-            .conn
-            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        let (busy, log, checkpointed): (i64, i64, i64) =
+            inner
+                .conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+        if busy != 0 {
+            // 別 reader/writer が WAL を握っていて TRUNCATE できなかった。
+            // restore 系の呼び出し元は「main が self-contained でないかも」を意味するので
+            // ここで abort してもらう。Transient ラップで分類する。
+            return Err(SettingsDbError::Transient(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error {
+                    code: rusqlite::ErrorCode::DatabaseBusy,
+                    extended_code: 0,
+                },
+                Some(format!(
+                    "wal_checkpoint(TRUNCATE) busy=1 log={log} checkpointed={checkpointed}"
+                )),
+            )));
+        }
         Ok(())
     }
 
