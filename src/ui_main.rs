@@ -514,6 +514,13 @@ impl App {
                         ui.close();
                     }
                     ui.separator();
+                    if ui.button("設定の復元…").clicked() {
+                        // 2026-05-17: settings.db のバックアップから復元する UI。
+                        // 起動時の自動 boot recovery で救えなかった場合、ユーザーが
+                        // 過去 10 世代を選んで巻き戻せるようにする (= 完全リセットも可)。
+                        self.open_settings_restore_dialog();
+                        ui.close();
+                    }
                     if ui.button("環境設定…").clicked() {
                         self.show_preferences = true;
                         ui.close();

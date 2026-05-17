@@ -788,7 +788,9 @@ pub fn settings_db_family_exists(data_dir: &Path) -> bool {
     )
 }
 
-fn family_filenames() -> Vec<String> {
+/// `settings.db` family の正準ファイル名一覧。
+/// `settings_restore` モジュールも同じ家族定義に依存するので `pub(crate)` 公開。
+pub(crate) fn family_filenames() -> Vec<String> {
     let mut v = vec![
         "settings.db".to_string(),
         "settings.db-wal".to_string(),
@@ -2502,6 +2504,59 @@ pub fn reset_global_for_test() {
 }
 
 // ---------------------------------------------------------------------------
+// テスト用 RAII guard (crate 内の他モジュールからも使える)
+// ---------------------------------------------------------------------------
+
+/// data_dir override をテンポラリ dir にセットし、global DB handle と
+/// SAVE_SUPPRESSED フラグもクリアする RAII ガード。
+///
+/// `data_dir::TestDataDirGuard` (TEST_OVERRIDE と lock しか触らない軽量版) と
+/// 違い、こちらは settings_db の global 状態もリセットするので、`SettingsDb` /
+/// `with_db` を触るテスト向け。drop で全部巻き戻る。
+///
+/// 直列化ロックは `crate::data_dir::test_override_lock()` (= process-global) を
+/// 使うので、settings.rs / app/tests.rs 等他ファイルのテストとも安全に
+/// インターロックする (Codex P2 v8b-5 2026-05-14)。
+///
+/// 2026-05-17: `settings_restore` モジュールのテストからも使えるよう、旧 `mod tests`
+/// 内のプライベート定義から `pub(crate)` 公開へ昇格。
+#[cfg(test)]
+pub(crate) struct DataDirOverrideGuard {
+    _tempdir: tempfile::TempDir,
+    path: PathBuf,
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl DataDirOverrideGuard {
+    pub(crate) fn new() -> Self {
+        let serial = crate::data_dir::test_override_lock();
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let path = tempdir.path().to_path_buf();
+        crate::data_dir::set_test_override(Some(path.clone()));
+        reset_global_for_test();
+        set_save_suppressed(false);
+        Self {
+            _tempdir: tempdir,
+            path,
+            _serial: serial,
+        }
+    }
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(test)]
+impl Drop for DataDirOverrideGuard {
+    fn drop(&mut self) {
+        crate::data_dir::set_test_override(None);
+        reset_global_for_test();
+        set_save_suppressed(false);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
 
@@ -2512,45 +2567,6 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use tempfile::TempDir;
-
-    /// data_dir override をテンポラリ dir にセットし、global DB handle もクリアする。
-    /// 返値の guard が drop されると override が解除される。
-    ///
-    /// 直列化ロックは `crate::data_dir::test_override_lock()` (= process-global) を
-    /// 使うので、settings.rs / app/tests.rs 等他ファイルのテストとも安全に
-    /// インターロックする (Codex P2 v8b-5 2026-05-14)。
-    struct DataDirOverrideGuard {
-        _tempdir: TempDir,
-        path: PathBuf,
-        _serial: std::sync::MutexGuard<'static, ()>,
-    }
-
-    impl DataDirOverrideGuard {
-        fn new() -> Self {
-            let serial = crate::data_dir::test_override_lock();
-            let tempdir = TempDir::new().unwrap();
-            let path = tempdir.path().to_path_buf();
-            crate::data_dir::set_test_override(Some(path.clone()));
-            reset_global_for_test();
-            set_save_suppressed(false);
-            Self {
-                _tempdir: tempdir,
-                path,
-                _serial: serial,
-            }
-        }
-        fn path(&self) -> &Path {
-            &self.path
-        }
-    }
-
-    impl Drop for DataDirOverrideGuard {
-        fn drop(&mut self) {
-            crate::data_dir::set_test_override(None);
-            reset_global_for_test();
-            set_save_suppressed(false);
-        }
-    }
 
     fn sample_settings() -> Settings {
         let mut s = Settings::default();

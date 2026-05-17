@@ -1818,6 +1818,12 @@ pub struct App {
     /// 統合環境設定の一時編集状態
     pub(crate) pref_state: Option<crate::ui_dialogs::preferences::PreferencesState>,
 
+    // ── 設定の復元ダイアログ ───────────────────────────────────────
+    /// `設定` メニュー →「設定の復元…」で開くダイアログの可視フラグ。
+    pub(crate) show_settings_restore: bool,
+    /// 復元ダイアログの状態 (一覧キャッシュ + 確認/結果のステート機械)。
+    pub(crate) settings_restore_state: crate::ui_dialogs::settings_restore::SettingsRestoreState,
+
     // ── 複数選択 ──────────────────────────────────────────────────
     /// チェック済みアイテムの集合 (スペースキーで追加/削除)
     pub(crate) checked: std::collections::HashSet<usize>,
@@ -3058,6 +3064,9 @@ impl App {
             open_folder_input: String::new(),
             open_folder_error: None,
             show_preferences: false,
+            show_settings_restore: false,
+            settings_restore_state:
+                crate::ui_dialogs::settings_restore::SettingsRestoreState::default(),
             pref_state: None,
             checked: std::collections::HashSet::new(),
             context_menu_idx: None,
@@ -16583,6 +16592,7 @@ impl eframe::App for App {
         self.show_thumb_quality_dialog_window(ctx);
         self.show_thumb_quality_fullscreen_overlay(ctx);
         self.show_preferences_dialog(ctx);
+        self.show_settings_restore_dialog(ctx);
         // VST3 プラグイン管理ウィンドウ + チェーンエディタ。
         // ⚠️ フルスクリーン中はフルスクリーンビューポート側で描画する (= ui_fullscreen.rs)。
         //    両方のビューポートで描画すると egui::Window の位置が二重管理になり、

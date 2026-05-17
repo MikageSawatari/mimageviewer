@@ -61,6 +61,7 @@ pub mod search_walker;
 pub mod search_watcher;
 pub mod settings;
 pub mod settings_db;
+pub mod settings_restore;
 pub mod sidecar;
 pub mod single_instance;
 pub mod spread_db;
