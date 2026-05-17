@@ -869,13 +869,20 @@ impl App {
             // bridge 側の登録値が古い (0) のままにならないよう毎フレーム refresh する。
             self.dsp_bridge.set_hud_hwnd(hud_hwnd);
             self.sync_native_video_main_cloak(false);
-            // PrintScreen / Snipping Tool の範囲選択後に egui 側の黒 backdrop が
-            // presenter HWND より前に残ることがある。外部 foreground を一度観測し、
-            // mIV に戻ったエッジだけで presenter 所有スレッドへ復旧を依頼する。
+            // PrintScreen / Snipping Tool の範囲選択後や native startup の競合で
+            // egui 側の黒 backdrop が presenter HWND より前に残ることがある。
+            // UI thread から presenter HWND を直接 SetWindowPos せず、復旧が必要な
+            // foreground 状態を観測したら presenter 所有スレッドへ依頼する。
             let now = std::time::Instant::now();
+            let foreground_hwnd = crate::video::native_window::foreground_hwnd();
             let foreground_is_ours =
                 crate::video::native_window::foreground_belongs_to_current_process_strict();
+            let foreground_is_presenter =
+                foreground_hwnd == hwnd || (hud_hwnd != 0 && foreground_hwnd == hud_hwnd);
+            let internal_foreground_needs_recover = foreground_is_ours && !foreground_is_presenter;
             if !foreground_is_ours {
+                self.native_video_front_recover_after_external_foreground = true;
+            } else if internal_foreground_needs_recover {
                 self.native_video_front_recover_after_external_foreground = true;
             }
             let presenter_raise_due = self
@@ -886,20 +893,32 @@ impl App {
                 && foreground_is_ours
                 && self.native_video_front_recover_after_external_foreground
             {
+                let recover_reason = if internal_foreground_needs_recover {
+                    "internal-foreground"
+                } else {
+                    "external-return"
+                };
+                let mut requested = false;
                 if let Some(pending) = self.native_video_source_swap_pending.as_ref() {
                     if pending.native_output.hwnd() == hwnd {
                         pending.native_output.request_presenter_raise();
-                        self.native_video_front_last_raise = Some(now);
-                        self.native_video_front_recover_after_external_foreground = false;
+                        requested = true;
                     }
                 } else if let Some(idx) = self.fullscreen_idx {
                     if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
                         if player.native_presenter_hwnd() == hwnd {
                             player.request_presenter_raise();
-                            self.native_video_front_last_raise = Some(now);
-                            self.native_video_front_recover_after_external_foreground = false;
+                            requested = true;
                         }
                     }
+                }
+                if requested {
+                    crate::logger::log(format!(
+                        "[native-video] request presenter recover reason={} hwnd=0x{:x} foreground=0x{:x} hud=0x{:x}",
+                        recover_reason, hwnd, foreground_hwnd, hud_hwnd
+                    ));
+                    self.native_video_front_last_raise = Some(now);
+                    self.native_video_front_recover_after_external_foreground = false;
                 }
             }
             // 実機修正 (2026-05-12 C): VST window が top/bottom bar 帯に重なっていたら

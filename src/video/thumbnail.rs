@@ -5,8 +5,8 @@
 //! メインの `decoder` とは **完全に独立** したワーカースレッドが、同じ動画ファイルを
 //! 別の [`ffmpeg::format::Input`] で開き、初回 cache miss で長寿命の補助デコーダを
 //! 生成する。動画設定で HW decode が有効なら FFmpeg-owned D3D11VA を優先し、
-//! 初期化や readback に失敗した場合は SW decode にフォールバックする。要求された
-//! `target_secs` の前後の keyframe から 1 枚だけデコードし、`swscale` で
+//! 初期化や readback、または `get_format` 起因の `send_packet` 失敗時は SW decode に
+//! フォールバックする。要求された `target_secs` の前後の keyframe から 1 枚だけデコードし、`swscale` で
 //! `THUMB_W x THUMB_H` の RGBA に変換 → キャッシュに格納する。
 //!
 //! UI スレッドは [`ThumbnailWorker::request`] で「この target_secs のサムネが欲しい」
@@ -293,6 +293,7 @@ impl SeekThumbnailDecoder {
         let mut got_frame: Option<Video> = None;
         let mut last_frame: Option<Video> = None;
         let mut superseded = false;
+        let hw_decode_active = self.hw_decode_active();
 
         // backward seek 後の keyframe から target_secs に到達する frame まで decode
         // し続ける。長い GOP でも正しい時刻に近いサムネを返すため decode 数に
@@ -318,7 +319,10 @@ impl SeekThumbnailDecoder {
             if stream.index() != self.stream_idx {
                 continue;
             }
-            if self.decoder.decoder_mut().send_packet(&packet).is_err() {
+            if let Err(e) = self.decoder.decoder_mut().send_packet(&packet) {
+                if hw_decode_active {
+                    return Err(format!("HW send_packet failed: {e}"));
+                }
                 continue;
             }
             let mut frame = Video::empty();

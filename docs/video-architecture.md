@@ -293,6 +293,10 @@ worker は初回 cache miss で長寿命の補助デコーダを lazy-open す�
 `prepare_frame_for_swscale` で CPU readback して RGBA サムネイルへ変換する。main player
 の `GpuVideoDevice` は共有しないため、scrub 中の補助 decode が本編の D3D lock を奪わず、
 HW 初期化・readback 失敗時はサムネ worker 内だけで SW decode にフォールバックする。
+また、D3D11VA decoder open 後に `get_format` が D3D11 を候補に出さず
+`send_packet` が失敗した場合も、補助 decoder だけを SW で開き直して同じ target を
+再試行する。本編再生の startup fallback と同じく、シークバー hover サムネだけが
+空になる Baseline H.264 などのケースを救うため。
 この補助デコーダは fast-swap の `LIVE_VIDEO_DECODE_THREADS` には数えない。このカウンタは
 本編 decoder create/drop の同時重なりを抑えるためのもので、VideoPlayer 常駐の seek
 thumbnail decoder を入れると動画→動画 fast-swap が恒常的に詰まるため。
@@ -474,12 +478,14 @@ channel disconnect で recv() 抜け → exit。demux thread が両 decode threa
 
 **HW / SW デコード選択**: `hw_decode` 有効時でも、対象 decoder が D3D11VA config を
 持たない codec は最初から SW decoder で開く。一方、D3D11VA config を持つ codec は
-HW 経路だけを試し、HW device 初期化 / decoder open / decode 途中の致命失敗を SW
-fallback で隠さずエラーとして扱う。これにより古い `msmpeg4v2` 等の HW 非対応 codec は
-再生可能に保ちつつ、H.264 / HEVC / AV1 / VP9 など HW 対応候補がある動画では
-「個別 open なら HW で動くはずのものが勝手に SW へ落ちる」回帰を防ぐ。`HwDevice`
-は AVBufferRef の RAII ラッパーで、video decode thread に move して保持する
-(= AVBufferRef refcount は thread-safe)。
+まず HW 経路を試し、HW device 初期化 / decoder open / 最初のフレーム表示後の
+decode 途中の致命失敗を SW fallback で隠さずエラーとして扱う。例外として、最初の
+フレーム前の `get_format` で D3D11 が候補に出なかった場合だけ、FFmpeg がそのストリームを
+HW 非対応と判定したものとして SW decoder で 1 回開き直す。これにより
+古い `msmpeg4v2` 等の HW 非対応 codec は再生可能に保ちつつ、H.264 / HEVC / AV1 / VP9
+など HW 対応候補がある動画では「個別 open なら HW で動くはずのものが勝手に SW へ落ちる」
+回帰を防ぐ。`HwDevice` は AVBufferRef の RAII ラッパーで、video decode thread に
+move して保持する (= AVBufferRef refcount は thread-safe)。
 
 **AV1 decoder 選択**: `hw_decode` 有効時、AV1 は既定 decoder (`libdav1d` になり得る)
 の前に native `av1` decoder を HW 専用 candidate として試す。解決済み候補のどれかが
@@ -631,14 +637,16 @@ HW pixel format** であることがある。それを返すと FFmpeg は「mIV
 対応する `hw_device_ctx` が無い」状態となり、`avcodec_send_packet` が AVERROR(ENOSYS)
 ("Function not implemented") を**無限に**返し続ける (実測: 1 再生で 4158 件のログ + UI が
 「準備中」のまま固着)。本実装は D3D11 のみ受け入れ、無ければ `AV_PIX_FMT_NONE` を返して
-明示的に decoder 初期化を失敗させる。このケースは「D3D11VA config を持つ decoder の
-HW 初期化後に、FFmpeg から期待した D3D11 frame が返らない」異常なので SW
-フォールバックは行わない (ユーザーポリシー: シーク体感が大きく劣化するため
-アプリ判断での SW 切替は禁止)。
+明示的に decoder 初期化を失敗させる。2026-05-17 以降は、この拒否を
+`HwFormatProbeState` に記録し、最初のフレーム前に限り SW decoder で 1 回だけ開き直す。
+`get_format` は decoder open から初回 packet 投入までの間にも複数回呼ばれ得るため、
+「以前 D3D11 が提示されたか」ではなく「最初のフレーム前に D3D11 非提示の候補リストが
+返ったか」を startup 互換性判定として扱う。最初のフレーム表示後の失敗は resource
+pressure 等の runtime HW failure とみなし、SW フォールバックは行わない。
 
 **`send_packet` エラー分類と thread exit** (Codex 助言 + P1 review 2026-05-15):
 旧コードは `send_packet` エラー時に一律 `continue` で全パケットを処理し続けていたため、
-HW decode 初期化失敗 (上記 `get_hw_format` 経路や GPU resource pressure) があっても
+HW decode runtime 失敗 (GPU resource pressure 等) があっても
 decode thread は exit しなかった。結果として `LIVE_VIDEO_DECODE_THREADS` が減らず、
 fast-swap throttle が永遠に refuse 状態のままになり「動画が一切切り替わらない」
 固着につながった。
@@ -816,6 +824,18 @@ memory をさらに食って OOM 連鎖を加速させる (= スパイラル)。
 1 つでもあれば SW fallback を禁止する。候補が 1 つも D3D11VA config を持たない場合は、
 HW 非対応 codec と判断して SW decoder で開く。HW 非要求 (= 設定で HW disabled) のときも
 最初から SW で開く。
+
+2026-05-17 追加: `get_format` で D3D11 が候補リストに出なかった場合は、自前の
+profile / SPS ルールではなく FFmpeg の候補リストを信頼する。最初のフレーム前に
+D3D11 非提示の `get_format` を観測して `send_packet` が失敗したときだけ SW decoder を
+開き直し、同じ packet を再送する。最初のフレーム表示後の失敗は従来通り HW runtime
+failure として扱い、フォールバックしない。
+
+2026-05-17 追加: MPEG-PS などで最初の video PTS が 0.30s の Buffering lookahead を
+超えている場合、Frozen clock のまま初回フレーム送出前に pacing 待ちへ入ると、
+engine が `FirstFrameReady` を受け取れず Buffering から進めない。startup の最初の
+1 枚だけは pacing を bypass して `video_tx` へ送る。これにより初回表示と
+Buffering→Playing の readiness を先に成立させ、2 枚目以降は通常の PACE_LEAD 管理に戻す。
 
 **pacing 設計**: 既存の Phase 8.K 仕様 (`PACE_LEAD_SECS=0.30` / `AUDIO_SAFE_LO=0.25` /
 `SEEK_BURST_LEAD_MAX_SECS=0.20` / `post_seek_frame_sent` flag / generation race
@@ -1345,7 +1365,9 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
   `SetWindowPos` / `SetForegroundWindow` を直接呼ばず、App が外部 foreground を観測
   した後に mIV foreground へ戻ったエッジで `RaisePresenterToFront` command を
   rate-limit 送信し、presenter 所有スレッド側で `HWND_TOP` と foreground / active /
-  focus を再アサートする。
+  focus を再アサートする。また startup 競合などで foreground が同一プロセス内の
+  fullscreen 黒 backdrop / main HWND に残った場合も、presenter / HUD 以外が foreground
+  なら同じ rate-limit 経路で presenter 所有スレッドへ復旧を依頼する。
 - **main HWND cloak**: native video fullscreen の entry と video-to-video swap では、
   presenter HWND が valid になるまで main HWND に `DWMWA_CLOAK` を設定する。これは
   `IsWindowVisible` を変えないため App::update は継続し、DWM 合成結果からだけ main を

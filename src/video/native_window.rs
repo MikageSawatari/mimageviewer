@@ -350,6 +350,10 @@ pub fn foreground_belongs_to_current_process() -> bool {
     }
 }
 
+pub fn foreground_hwnd() -> u64 {
+    unsafe { GetForegroundWindow().0 as u64 }
+}
+
 /// `foreground_belongs_to_current_process` の保守的版。
 /// foreground=null / pid=0 の不確定ケースは false を返す
 /// (= 「mIV が前面と確信できない」場合は奪還しない)。

@@ -21,7 +21,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use crossbeam_channel::{Receiver, SendTimeoutError, Sender, TryRecvError, bounded};
 
@@ -619,6 +619,10 @@ fn should_bypass_pause_park_for_post_seek_first_frame(
     post_seek_frame_sent: bool,
 ) -> bool {
     clock_seeking && !post_seek_frame_sent
+}
+
+fn should_bypass_pacing_for_startup_first_frame(first_frame_delivered: bool) -> bool {
+    !first_frame_delivered
 }
 
 impl FrameStepDecodeState {
@@ -1529,9 +1533,12 @@ pub struct DecodeHandles {
 /// `target_audio_sample_rate` は音声出力デバイスのサンプルレート (cpal 側で決定)。
 /// 通常 48000。
 ///
-/// `hw_decode` が true なら D3D11VA HW デコードを試行する。コーデック非対応 / デバイス
-/// 初期化失敗 / get_format で SW 形式が返った場合は **黙って SW にフォールバック**
-/// する (perf log の `video.open.decode_path` で実際の経路を確認可能)。
+/// `hw_decode` が true なら D3D11VA HW デコードを試行する。D3D11VA config を持たない
+/// codec は通常の SW 経路を使う。D3D11VA config がある decoder ではまず HW で開き、
+/// HW device 初期化 / decoder open 失敗は失敗扱いにする。例外として、最初のフレーム前の
+/// `get_format` で D3D11 が候補に出なかった場合だけ、FFmpeg がそのストリームを HW 非対応と
+/// 判定したものとして SW で 1 回開き直す。D3D11 が候補に出た後の runtime HW 失敗は、
+/// 従来通りフォールバックせず失敗扱いにする。
 /// `engine_state` は `EngineActor::published_state_handle()` で取得した
 /// `Arc<AtomicU8>` (Phase 3d)。pacing loop で `state == Playing` のときだけ
 /// audio_buf escape を有効化する。
@@ -1883,6 +1890,7 @@ fn run_decoder(
     let video_decoder = opened_video.decoder;
     let video_decoder_name = opened_video.decoder_name;
     let hw_probe = opened_video.hw_probe;
+    let hw_format_probe = opened_video.hw_format_probe;
     let hw_active_initially = opened_video.hw_device.is_some();
     let _hw_device = opened_video.hw_device;
     let src_w = video_decoder.width();
@@ -2338,13 +2346,17 @@ fn run_decoder(
             .spawn(move || {
                 run_video_decode(
                     // gpu_video_device を **最初**に渡すことで、関数内 drop 順を
-                    // `_hw_device → video_decoder → gpu_video_device` (= 反転で最後)
-                    // にする。FFmpeg cleanup が CS を握る間 Arc を生かす (Codex P1
-                    // 2026-05-16)。詳細は run_video_decode 冒頭のコメント参照。
+                    // `_hw_device → video_decoder → hw_format_probe → gpu_video_device`
+                    // (= 反転で最後) にする。FFmpeg cleanup が CS を握る間 Arc と
+                    // get_format probe を生かす (Codex P1 2026-05-16)。詳細は
+                    // run_video_decode 冒頭のコメント参照。
                     #[cfg(windows)]
                     gpu_video_device_v,
+                    hw_format_probe,
                     video_decoder,
                     _hw_device,
+                    video_params_owned,
+                    codec_id,
                     video_pkt_rx,
                     video_ctl_rx,
                     video_tx_for_thread,
@@ -2371,7 +2383,8 @@ fn run_decoder(
             .expect("spawn video-decode thread")
     };
     // この時点で run_decoder = demux thread として再構成される。video_decoder /
-    // _hw_device / gpu_video_device / video_tx はすべて video decode thread が所有。
+    // _hw_device / hw_format_probe / gpu_video_device / video_tx はすべて video decode
+    // thread が所有。
     // 以下のループは demux + seek 調停 + EOF idle wait に専念する。
 
     // ── デコードループ (demux thread) ──
@@ -2926,8 +2939,9 @@ fn run_video_decode(
     // **Drop order 注意** (Codex P1 2026-05-16): `gpu_video_device` を **最初** に宣言し、
     // 関数 return / panic 時に「逆生成順」で drop されるとき **最後** に落ちるようにする。
     // Rust の関数パラメータは宣言順に作成され、reverse-creation-order で drop される
-    // ため、宣言順を `gpu_video_device → video_decoder → _hw_device → ...` にすると
-    // 実 drop 順は `..._hw_device → video_decoder → gpu_video_device` になる。
+    // ため、宣言順を `gpu_video_device → hw_format_probe → video_decoder → hw_device → ...`
+    // にすると、実 drop 順は `... → hw_device → video_decoder → hw_format_probe
+    // → gpu_video_device` になる。
     //
     // `video_decoder` の `AVCodecContext` は内部で `av_buffer_ref(hw_device_ctx)` 経由で
     // `AVHWDeviceContext` への参照を保持しており、video_decoder.drop の中で
@@ -2943,8 +2957,11 @@ fn run_video_decode(
     #[cfg(windows)] gpu_video_device: Option<
         std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>,
     >,
+    mut hw_format_probe: Option<Arc<HwFormatProbeState>>,
     mut video_decoder: ffmpeg_the_third::decoder::Video,
-    _hw_device: Option<HwDevice>,
+    mut hw_device: Option<HwDevice>,
+    video_params: ffmpeg_the_third::codec::Parameters,
+    codec_id: ffmpeg_the_third::codec::Id,
     video_pkt_rx: Receiver<VideoPacketMsg>,
     video_ctl_rx: Receiver<VideoControlMsg>,
     video_tx: Sender<VideoFrame>,
@@ -3006,10 +3023,13 @@ fn run_video_decode(
     let mut frame_step_selected_pending_clear = false;
     let mut frame_step_abort_discard_serial: Option<u64> = None;
     // `send_packet` 連続失敗カウンタ (Codex 解析 2026-05-15)。
-    // HW decoder 初期化失敗で `get_hw_format` が AV_PIX_FMT_NONE を返した場合や、
-    // GPU resource pressure で D3D11 surface 取得が失敗した場合に `avcodec_send_packet`
-    // が AVERROR(ENOSYS) 等を返し続ける。旧コードは `continue` で全パケットを流していたため
-    // 1 動画につきエラーログが数千回 (実測 4158 回) 出て decode が永遠に進まなかった。
+    // GPU resource pressure で D3D11 surface 取得が失敗した場合などに
+    // `avcodec_send_packet` が AVERROR(ENOSYS) 等を返し続ける。旧コードは `continue`
+    // で全パケットを流していたため、1 動画につきエラーログが数千回 (実測 4158 回)
+    // 出て decode が永遠に進まなかった。
+    // `get_hw_format` が D3D11 を候補に出さなかったケースは、最初のフレーム前に限り
+    // FFmpeg のストリーム互換性判定として扱い、下の send_packet error branch で SW を
+    // 1 回だけ開き直す。
     // 連続 N 回**致命**失敗で thread を exit させ、LIVE_VIDEO_DECODE_THREADS を減らして
     // 上位の throttle 判定が正しく機能するようにする。1 個 decode 成功 (= receive_frame
     // 1 枚以上) でリセット。**EAGAIN は致命ではない** (decoder 内部 buffer が満杯で
@@ -3017,6 +3037,8 @@ fn run_video_decode(
     // 触らず、packet を `pending_resend_packet` に保持して次 iteration で再送する。
     const MAX_CONSECUTIVE_SEND_PACKET_ERRORS: u32 = 5;
     let mut consecutive_send_packet_errors: u32 = 0;
+    let mut hw_format_sw_fallback_attempted = false;
+    let mut hw_format_sw_fallback_active = false;
     // pending packet には保存時の seek serial を attach する (Codex P1 2026-05-15)。
     // 消費前に `clock.current_seek_serial()` および local `current_seek_serial` と
     // 一致するか確認し、seek が進行中 (= live serial が先行) なら packet を破棄して
@@ -3035,7 +3057,7 @@ fn run_video_decode(
     const FIRST_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     const RECV_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
     const MAX_CONSECUTIVE_RESOURCE_PRESSURE: u32 = 60;
-    let watchdog_start = std::time::Instant::now();
+    let mut watchdog_start = std::time::Instant::now();
     let mut consecutive_resource_pressure: u32 = 0;
 
     'outer: loop {
@@ -3309,17 +3331,101 @@ fn run_video_decode(
                 // 致命系カウンタは触らない。受信ループに進む (drain) — `packet` を
                 // 使わないので borrow は終わっている。
             } else {
+                if hw_device.is_some()
+                    && should_retry_sw_after_hw_format_refusal(
+                        hw_active_initially,
+                        first_frame_delivered,
+                        hw_format_sw_fallback_attempted,
+                        hw_format_probe.as_deref(),
+                    )
+                {
+                    hw_format_sw_fallback_attempted = true;
+                    let (callbacks, d3d11_offered, d3d11_refused) =
+                        hw_format_probe.as_deref().map_or((0, 0, 0), |probe| {
+                            (
+                                probe.callback_count(),
+                                probe.d3d11_offered_count(),
+                                probe.d3d11_refused_count(),
+                            )
+                        });
+                    crate::logger::log(format!(
+                        "[video-decode] get_format did not offer D3D11 before first frame; reopening SW decoder: codec={} send_packet_err={e} callbacks={callbacks} d3d11_offered={d3d11_offered} d3d11_refused={d3d11_refused}",
+                        codec_id.name()
+                    ));
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "video_decode",
+                            "hw_format_sw_retry",
+                            None,
+                            current_seek_serial,
+                            &[
+                                ("codec", serde_json::Value::from(codec_id.name())),
+                                ("callbacks", serde_json::Value::from(callbacks as i64)),
+                                (
+                                    "d3d11_offered",
+                                    serde_json::Value::from(d3d11_offered as i64),
+                                ),
+                                (
+                                    "d3d11_refused",
+                                    serde_json::Value::from(d3d11_refused as i64),
+                                ),
+                            ],
+                        );
+                    }
+                    let reopened_result = {
+                        #[cfg(windows)]
+                        {
+                            open_video_decoder_with_candidates(
+                                &video_params,
+                                codec_id,
+                                false,
+                                gpu_video_device.as_ref(),
+                            )
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            open_video_decoder_with_candidates(&video_params, codec_id, false)
+                        }
+                    };
+                    match reopened_result {
+                        Ok(reopened) => {
+                            let decoder_name = reopened.decoder_name.clone();
+                            let new_hw_probe = reopened.hw_probe.clone();
+                            // Drop the old decoder while the old get_format probe and HW
+                            // device reference are still alive, then release the HW side.
+                            video_decoder = reopened.decoder;
+                            hw_format_probe = reopened.hw_format_probe;
+                            hw_device = reopened.hw_device;
+                            hw_format_sw_fallback_active = true;
+                            consecutive_send_packet_errors = 0;
+                            watchdog_start = std::time::Instant::now();
+                            pending_resend_packet = Some((current_seek_serial, packet));
+                            crate::logger::log(format!(
+                                "[video-decode] SW decoder reopened after get_format refusal: codec={} decoder={decoder_name} d3d11va_supported={} d3d11va_config={}",
+                                codec_id.name(),
+                                new_hw_probe.d3d11va_supported,
+                                new_hw_probe.d3d11va_config
+                            ));
+                            continue;
+                        }
+                        Err(open_err) => {
+                            crate::logger::log(format!(
+                                "[video-decode] SW decoder reopen failed after get_format refusal: codec={} err={open_err}",
+                                codec_id.name()
+                            ));
+                        }
+                    }
+                }
                 // 致命系: ENOSYS / EINVAL / External 等。連続失敗で thread を exit。
                 consecutive_send_packet_errors += 1;
                 crate::logger::log(format!(
                     "video send_packet: {e} (consecutive_errors={consecutive_send_packet_errors})"
                 ));
                 if consecutive_send_packet_errors >= MAX_CONSECUTIVE_SEND_PACKET_ERRORS {
-                    // HW decode 初期化が壊れている (例: D3D11 が候補に無く `get_hw_format`
-                    // が AV_PIX_FMT_NONE を返した、GPU resource pressure で内部 surface
-                    // 取得が連続失敗、等) と判断して decode thread を exit させる。
-                    // SW フォールバックはしない (ユーザーポリシー)。上位は frame が
-                    // 来ないので「準備中」のままになるが、`LIVE_VIDEO_DECODE_THREADS` の
+                    // HW decode が runtime に壊れている (D3D11 は候補に出たが GPU resource
+                    // pressure で内部 surface 取得が連続失敗、等) と判断して decode thread
+                    // を exit させる。ここでは SW フォールバックしない (ユーザーポリシー)。
+                    // 上位は frame が来ないので「準備中」のままになるが、`LIVE_VIDEO_DECODE_THREADS` の
                     // カウンタが減るので throttle が正しく機能し、他動画への navigation は
                     // 通る (= UI 全体は固まらない、Codex 解析 2026-05-15 反映)。
                     // `AvClock::set_decode_failed(true)` で上位 UI に伝える (Codex P2)。
@@ -3633,6 +3739,11 @@ fn run_video_decode(
                                     &mut post_seek_tx_full_last_log,
                                 ) {
                                     continue;
+                                }
+                                if should_bypass_pacing_for_startup_first_frame(
+                                    first_frame_delivered,
+                                ) {
+                                    break;
                                 }
                                 if should_bypass_pause_park_for_post_seek_first_frame(
                                     clock.is_seeking(),
@@ -4145,6 +4256,8 @@ fn run_video_decode(
             if !first_frame_event_logged {
                 let actual_path = if matches!(frame.format(), Pixel::D3D11) {
                     "hw_d3d11va"
+                } else if hw_format_sw_fallback_active {
+                    "sw_after_hw_format_refused"
                 } else if hw_active_initially {
                     "sw_fallback_after_hw_init"
                 } else {
@@ -4153,6 +4266,10 @@ fn run_video_decode(
                 if actual_path == "sw_fallback_after_hw_init" {
                     crate::logger::log(format!(
                         "video decode_path: HW init succeeded but first frame is SW (pix_fmt={cur_fmt:?})"
+                    ));
+                } else if actual_path == "sw_after_hw_format_refused" {
+                    crate::logger::log(format!(
+                        "video decode_path: get_format refused D3D11, first frame is SW (pix_fmt={cur_fmt:?})"
                     ));
                 }
                 if crate::perf::is_enabled() {
@@ -4310,6 +4427,9 @@ fn run_video_decode(
                     &mut post_seek_tx_full_last_log,
                 ) {
                     continue;
+                }
+                if should_bypass_pacing_for_startup_first_frame(first_frame_delivered) {
+                    break;
                 }
                 if should_bypass_pause_park_for_post_seek_first_frame(
                     clock.is_seeking(),
@@ -5593,11 +5713,62 @@ struct AudioSetup {
     bit_rate_bps: i64,
 }
 
+/// FFmpeg の `get_format` callback が D3D11 を候補に出したかどうかを記録する。
+/// callback は FFmpeg 内部 thread ではなく decode thread から呼ばれる想定だが、
+/// `AVCodecContext.opaque` 経由の共有参照なので atomic にしておく。
+#[derive(Debug, Default)]
+struct HwFormatProbeState {
+    callback_count: AtomicU32,
+    d3d11_offered_count: AtomicU32,
+    d3d11_refused_count: AtomicU32,
+}
+
+impl HwFormatProbeState {
+    fn record_d3d11_offered(&self) {
+        self.callback_count.fetch_add(1, Ordering::Relaxed);
+        self.d3d11_offered_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_d3d11_refused(&self) {
+        self.callback_count.fetch_add(1, Ordering::Relaxed);
+        self.d3d11_refused_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn d3d11_refused(&self) -> bool {
+        self.d3d11_refused_count.load(Ordering::Relaxed) > 0
+    }
+
+    fn callback_count(&self) -> u32 {
+        self.callback_count.load(Ordering::Relaxed)
+    }
+
+    fn d3d11_offered_count(&self) -> u32 {
+        self.d3d11_offered_count.load(Ordering::Relaxed)
+    }
+
+    fn d3d11_refused_count(&self) -> u32 {
+        self.d3d11_refused_count.load(Ordering::Relaxed)
+    }
+}
+
+fn should_retry_sw_after_hw_format_refusal(
+    hw_active_initially: bool,
+    first_frame_delivered: bool,
+    fallback_attempted: bool,
+    probe: Option<&HwFormatProbeState>,
+) -> bool {
+    hw_active_initially
+        && !first_frame_delivered
+        && !fallback_attempted
+        && probe.map_or(false, HwFormatProbeState::d3d11_refused)
+}
+
 /// `av_hwdevice_ctx_create` で確保した AVBufferRef を保持し、Drop で `av_buffer_unref`
 /// する RAII ラッパー。AVCodecContext は内部で別途 `av_buffer_ref` するので、ここで
 /// drop しても codec 側のライフタイムには影響しない (refcount 管理)。
 struct HwDevice {
     buf_ref: *mut ffmpeg_the_third::ffi::AVBufferRef,
+    format_probe: Option<Arc<HwFormatProbeState>>,
 }
 
 impl Drop for HwDevice {
@@ -5612,7 +5783,10 @@ impl Drop for HwDevice {
 // move される。所有者は常に 1 thread なので Send のみ実装し、Sync は持たせない。
 
 struct OpenedVideoDecoder {
+    // Drop decoder before the probe Arc and HW helper ref if this wrapper is
+    // dropped intact. AVCodecContext.opaque points at the probe allocation.
     decoder: ffmpeg_the_third::decoder::Video,
+    hw_format_probe: Option<Arc<HwFormatProbeState>>,
     hw_device: Option<HwDevice>,
     decoder_name: String,
     hw_probe: D3d11vaProbe,
@@ -5631,9 +5805,10 @@ struct D3d11vaProbe {
 /// this module.
 pub(crate) struct AuxVideoDecoder {
     // Struct fields are dropped in declaration order. Drop the decoder before
-    // the helper AVBufferRef so FFmpeg tears down its AVCodecContext while our
-    // original HW device ref is still alive.
+    // the probe Arc and helper AVBufferRef so FFmpeg tears down its AVCodecContext
+    // while AVCodecContext.opaque and the original HW device ref are still alive.
     decoder: ffmpeg_the_third::decoder::Video,
+    _hw_format_probe: Option<Arc<HwFormatProbeState>>,
     _hw_device: Option<HwDevice>,
     decoder_name: String,
     hw_decode_active: bool,
@@ -5645,6 +5820,7 @@ impl AuxVideoDecoder {
     fn from_opened(opened: OpenedVideoDecoder) -> Self {
         let OpenedVideoDecoder {
             decoder,
+            hw_format_probe,
             hw_device,
             decoder_name,
             hw_probe,
@@ -5652,6 +5828,7 @@ impl AuxVideoDecoder {
         let hw_decode_active = hw_device.is_some();
         Self {
             decoder,
+            _hw_format_probe: hw_format_probe,
             _hw_device: hw_device,
             decoder_name,
             hw_decode_active,
@@ -5843,6 +6020,7 @@ fn open_video_decoder_with_candidates(
                 }
             };
             if let Some(hw_device) = hw_device {
+                let hw_format_probe = hw_device.format_probe.clone();
                 match ctx.decoder().open_as(codec).and_then(|o| o.video()) {
                     Ok(decoder) => {
                         crate::logger::log(format!(
@@ -5852,6 +6030,7 @@ fn open_video_decoder_with_candidates(
                         ));
                         return Ok(OpenedVideoDecoder {
                             decoder,
+                            hw_format_probe,
                             hw_device: Some(hw_device),
                             decoder_name,
                             hw_probe,
@@ -5902,6 +6081,7 @@ fn open_video_decoder_with_candidates(
                     ));
                     return Ok(OpenedVideoDecoder {
                         decoder,
+                        hw_format_probe: None,
                         hw_device: None,
                         decoder_name,
                         hw_probe,
@@ -6126,12 +6306,17 @@ fn try_init_d3d11va_for_codec(
             return None;
         }
         (*avctx).hw_device_ctx = new_ref;
+        let format_probe = Arc::new(HwFormatProbeState::default());
+        (*avctx).opaque = Arc::as_ptr(&format_probe) as *mut std::ffi::c_void;
         (*avctx).get_format = Some(get_hw_format);
 
         crate::logger::log(format!(
             "HW: D3D11VA initialized for decoder {codec_name_for_log}"
         ));
-        Some(HwDevice { buf_ref })
+        Some(HwDevice {
+            buf_ref,
+            format_probe: Some(format_probe),
+        })
     }
 }
 
@@ -6145,36 +6330,69 @@ fn try_init_d3d11va_for_codec(
 /// (実測: 1 再生で 4158 回ログ)。これは hard-stuck と見分けが付かず、UI が固まる原因。
 ///
 /// 本実装は D3D11 が無ければ `AV_PIX_FMT_NONE` を返して FFmpeg に decode 失敗を
-/// 伝える。上位の `send_packet` 連続失敗ハンドラが decode thread を exit させる。
-/// SW フォールバックは行わない (ユーザーポリシー: シーク体感が大きく劣化するため
-/// アプリ判断での SW 切替は禁止)。HW decode 不可なコーデックは open 時点で
-/// `hw_device_ctx` を attach しない path に分岐済みなので、このコールバックが
-/// 呼ばれている時点で HW 専用設計。
+/// 伝えつつ、`AVCodecContext.opaque` の [`HwFormatProbeState`] に拒否を記録する。
+/// 上位は「最初のフレーム前に D3D11 が候補に出なかった `get_format` があった」
+/// 場合だけ、FFmpeg がストリーム単位で HW 非対応と判断したものとして SW で 1 回
+/// 開き直す。最初のフレーム表示後の失敗は runtime HW 失敗として扱い、
+/// フォールバックしない。
 unsafe extern "C" fn get_hw_format(
-    _ctx: *mut ffmpeg_the_third::ffi::AVCodecContext,
+    ctx: *mut ffmpeg_the_third::ffi::AVCodecContext,
     fmt_list: *const ffmpeg_the_third::ffi::AVPixelFormat,
 ) -> ffmpeg_the_third::ffi::AVPixelFormat {
     use ffmpeg_the_third::ffi::AVPixelFormat;
+    let probe = unsafe { hw_format_probe_from_context(ctx) };
     if fmt_list.is_null() {
+        if let Some(probe) = probe {
+            probe.record_d3d11_refused();
+        }
+        crate::logger::log("HW: get_format: null candidate list; refusing HW decode".to_string());
         return AVPixelFormat::AV_PIX_FMT_NONE;
     }
+    let mut formats = Vec::new();
     unsafe {
         let mut p = fmt_list;
         while *p != AVPixelFormat::AV_PIX_FMT_NONE {
+            formats.push(format!("{:?}", *p));
             if *p == AVPixelFormat::AV_PIX_FMT_D3D11 {
+                if let Some(probe) = probe {
+                    probe.record_d3d11_offered();
+                }
                 return AVPixelFormat::AV_PIX_FMT_D3D11;
             }
             p = p.add(1);
         }
     }
-    crate::logger::log(
-        "HW: get_format: D3D11 not in candidate list; refusing HW decode (no SW fallback per policy)"
-            .to_string(),
-    );
+    if let Some(probe) = probe {
+        probe.record_d3d11_refused();
+    }
+    let formats = if formats.is_empty() {
+        "empty".to_string()
+    } else {
+        formats.join(",")
+    };
+    crate::logger::log(format!(
+        "HW: get_format: D3D11 not in candidate list; refusing HW decode formats={formats}"
+    ));
     if crate::perf::is_enabled() {
-        crate::perf::event("video_decode", "hw_format_refused", None, 0, &[]);
+        crate::perf::event(
+            "video_decode",
+            "hw_format_refused",
+            None,
+            0,
+            &[("formats", serde_json::Value::from(formats))],
+        );
     }
     AVPixelFormat::AV_PIX_FMT_NONE
+}
+
+unsafe fn hw_format_probe_from_context(
+    ctx: *mut ffmpeg_the_third::ffi::AVCodecContext,
+) -> Option<&'static HwFormatProbeState> {
+    if ctx.is_null() {
+        return None;
+    }
+    let ptr = unsafe { (*ctx).opaque as *const HwFormatProbeState };
+    unsafe { ptr.as_ref() }
 }
 
 fn clamp_dims(w: u32, h: u32, max_dim: u32) -> (u32, u32) {
@@ -6401,12 +6619,14 @@ fn try_gpu_blit_path(
 mod decoder_candidate_tests {
     use super::{
         AudioControlMsg, AudioDecodeInput, AudioPacketMsg, BwdifFilterKey, DecoderChoice,
-        FrameStepDecodeSpec, FrameStepDecodeState, FrameStepSelection, VideoControlMsg,
-        VideoDecodeInput, VideoPacketMsg, bwdif_filter_key, bwdif_force_all_frames,
-        candidate_allows_sw_decode, field_order_is_interlaced, normalize_audio_input_layout,
-        normalize_sar, preferred_video_decoders, recv_audio_decode_input,
-        recv_video_decode_input_with_timeout, selected_video_rate,
-        should_bypass_pause_park_for_post_seek_first_frame, should_try_deinterlace,
+        FrameStepDecodeSpec, FrameStepDecodeState, FrameStepSelection, HwFormatProbeState,
+        VideoControlMsg, VideoDecodeInput, VideoPacketMsg, bwdif_filter_key,
+        bwdif_force_all_frames, candidate_allows_sw_decode, field_order_is_interlaced,
+        normalize_audio_input_layout, normalize_sar, preferred_video_decoders,
+        recv_audio_decode_input, recv_video_decode_input_with_timeout, selected_video_rate,
+        should_bypass_pacing_for_startup_first_frame,
+        should_bypass_pause_park_for_post_seek_first_frame,
+        should_retry_sw_after_hw_format_refusal, should_try_deinterlace,
     };
     use crate::settings::VideoDeinterlaceMode;
     use crossbeam_channel::bounded;
@@ -6503,6 +6723,12 @@ mod decoder_candidate_tests {
         assert!(!should_bypass_pause_park_for_post_seek_first_frame(
             false, false
         ));
+    }
+
+    #[test]
+    fn startup_first_frame_bypasses_pacing() {
+        assert!(should_bypass_pacing_for_startup_first_frame(false));
+        assert!(!should_bypass_pacing_for_startup_first_frame(true));
     }
 
     #[test]
@@ -6633,6 +6859,60 @@ mod decoder_candidate_tests {
         assert_eq!(candidates[0].choice, DecoderChoice::Default);
         assert!(candidates[0].allow_sw_decode);
         assert!(candidate_allows_sw_decode(candidates[0], true, false));
+    }
+
+    #[test]
+    fn hw_format_refusal_retries_sw_only_before_first_frame() {
+        let probe = HwFormatProbeState::default();
+        assert!(!should_retry_sw_after_hw_format_refusal(
+            true,
+            false,
+            false,
+            Some(&probe)
+        ));
+
+        probe.record_d3d11_refused();
+        assert!(should_retry_sw_after_hw_format_refusal(
+            true,
+            false,
+            false,
+            Some(&probe)
+        ));
+        assert!(!should_retry_sw_after_hw_format_refusal(
+            true,
+            true,
+            false,
+            Some(&probe)
+        ));
+        assert!(!should_retry_sw_after_hw_format_refusal(
+            true,
+            false,
+            true,
+            Some(&probe)
+        ));
+        assert!(!should_retry_sw_after_hw_format_refusal(
+            false,
+            false,
+            false,
+            Some(&probe)
+        ));
+    }
+
+    #[test]
+    fn hw_format_refusal_retries_even_after_prior_d3d11_offer_before_first_frame() {
+        let probe = HwFormatProbeState::default();
+        probe.record_d3d11_offered();
+        probe.record_d3d11_refused();
+
+        assert_eq!(probe.callback_count(), 2);
+        assert_eq!(probe.d3d11_offered_count(), 1);
+        assert_eq!(probe.d3d11_refused_count(), 1);
+        assert!(should_retry_sw_after_hw_format_refusal(
+            true,
+            false,
+            false,
+            Some(&probe)
+        ));
     }
 
     #[test]
