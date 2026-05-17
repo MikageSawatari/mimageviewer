@@ -54,7 +54,17 @@ pub(crate) enum ActionResult {
     ResetOk {
         report: ResetReport,
     },
-    Failed {
+    /// 何もファイルを触っていない or 完全 rollback 済みの失敗。
+    /// アプリは続行可。ダイアログを閉じればユーザーは普通に使える。
+    /// 2026-05-17 Codex P2 対応で `Failed` を 2 つに分割。
+    FailedRecoverable {
+        action_label: String,
+        error: String,
+    },
+    /// `set_global_db(None)` 後の失敗。SQLite ハンドルが落ちている + SAVE_SUPPRESSED
+    /// が立ったままで、続けて操作すると挙動が崩れる。アプリを **強制終了** + 再起動を
+    /// 促す。
+    FailedTerminal {
         action_label: String,
         error: String,
     },
@@ -175,22 +185,19 @@ impl App {
                     source: source.clone(),
                     report,
                 },
-                Err(e) => ActionResult::Failed {
-                    action_label: format!("「{}」からの復元", source.label()),
-                    error: e.to_string(),
-                },
+                Err(failure) => {
+                    failure_to_action_result(failure, format!("「{}」からの復元", source.label()))
+                }
             },
             PendingAction::FullReset => match settings_restore::full_reset(&dir) {
                 Ok(report) => ActionResult::ResetOk { report },
-                Err(e) => ActionResult::Failed {
-                    action_label: "完全リセット".to_string(),
-                    error: e.to_string(),
-                },
+                Err(failure) => failure_to_action_result(failure, "完全リセット".to_string()),
             },
         };
         crate::logger::log(format!(
-            "[settings_restore] action executed: {}",
-            describe_pending(&pending)
+            "[settings_restore] action executed: {} -> {}",
+            describe_pending(&pending),
+            describe_result(&result)
         ));
         self.settings_restore_state.pending = None;
         self.settings_restore_state.result = Some(result);
@@ -200,7 +207,6 @@ impl App {
         if self.settings_restore_state.result.is_none() {
             return;
         }
-        // 結果ダイアログでは閉じる ([x] / Esc / OK) でアプリ終了する。
         let mut closing = false;
         let escape_pressed = self.dialog_escape_pressed(ctx);
 
@@ -210,58 +216,106 @@ impl App {
             .result
             .as_ref()
             .expect("just checked is_some");
-        let (title, lines, is_error) = build_result_body(result_ref);
+        let kind = result_kind(result_ref);
+        let (title, lines) = build_result_body(result_ref);
 
         let mut window_open = true;
-        egui::Window::new(title)
-            .open(&mut window_open)
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                for line in lines {
-                    if is_error {
-                        ui.colored_label(egui::Color32::from_rgb(0xc0, 0x40, 0x40), line);
-                    } else {
-                        ui.label(line);
-                    }
-                }
-                ui.add_space(8.0);
-                ui.separator();
-                ui.add_space(4.0);
-                let button_label = if is_error {
-                    "閉じる"
+        // Terminal はユーザーが閉じる以外の経路を絶対に踏ませない (= [x] / Esc を
+        // 無効化する)。`open` 引数を渡さないことで [x] ボタンを消し、escape も拾わない。
+        let mut win = egui::Window::new(title).collapsible(false).resizable(false);
+        if kind != ResultKind::FailedTerminal {
+            win = win.open(&mut window_open);
+        }
+        win.show(ctx, |ui| {
+            for line in lines {
+                if kind != ResultKind::Success {
+                    ui.colored_label(egui::Color32::from_rgb(0xc0, 0x40, 0x40), line);
                 } else {
-                    "アプリを終了"
-                };
-                ui.horizontal(|ui| {
-                    if ui.button(button_label).clicked() {
-                        closing = true;
-                    }
-                });
+                    ui.label(line);
+                }
+            }
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(4.0);
+            let button_label = match kind {
+                ResultKind::Success => "アプリを終了",
+                ResultKind::FailedRecoverable => "閉じる",
+                ResultKind::FailedTerminal => "アプリを終了して再起動を促す",
+            };
+            ui.horizontal(|ui| {
+                if ui.button(button_label).clicked() {
+                    closing = true;
+                }
             });
+        });
 
-        if !window_open || escape_pressed {
+        // Recoverable のみ [x] / Esc で閉じる経路を許可。Terminal はボタン経由のみ。
+        if kind != ResultKind::FailedTerminal && (!window_open || escape_pressed) {
             closing = true;
         }
 
         if closing {
-            let is_error = matches!(
-                self.settings_restore_state.result,
-                Some(ActionResult::Failed { .. })
-            );
             self.settings_restore_state.result = None;
-            if is_error {
-                // 失敗時はアプリを終了しない (= ユーザーが状況を確認できるよう留まる)。
-                self.show_settings_restore = false;
-                self.settings_restore_state = SettingsRestoreState::default();
-            } else {
-                // 成功時は終了。`shutdown_requested` を立てて tray 常駐の close
-                // 横取りを通過させる ([src/ui_main.rs] の「終了」ボタンと同じ方式)。
-                self.shutdown_requested
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            match kind {
+                ResultKind::FailedRecoverable => {
+                    // 状態は無傷、アプリ続行可。ダイアログを閉じるだけ。
+                    self.show_settings_restore = false;
+                    self.settings_restore_state = SettingsRestoreState::default();
+                }
+                ResultKind::Success | ResultKind::FailedTerminal => {
+                    // 成功 or Terminal failure: どちらもアプリを終了する。
+                    // Terminal failure は handle 落ち + SAVE_SUPPRESSED で続行不可なので
+                    // 強制的に終了させて次回起動時にクリーンに再 open させる。
+                    // `shutdown_requested` を立てて tray 常駐の close 横取りを通す
+                    // ([src/ui_main.rs] の「終了」ボタンと同じ方式)。
+                    self.shutdown_requested
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResultKind {
+    Success,
+    FailedRecoverable,
+    FailedTerminal,
+}
+
+fn result_kind(result: &ActionResult) -> ResultKind {
+    match result {
+        ActionResult::RestoreOk { .. } | ActionResult::ResetOk { .. } => ResultKind::Success,
+        ActionResult::FailedRecoverable { .. } => ResultKind::FailedRecoverable,
+        ActionResult::FailedTerminal { .. } => ResultKind::FailedTerminal,
+    }
+}
+
+fn failure_to_action_result(
+    failure: settings_restore::RestoreFailure,
+    action_label: String,
+) -> ActionResult {
+    let error = failure.to_string();
+    if failure.is_terminal() {
+        ActionResult::FailedTerminal {
+            action_label,
+            error,
+        }
+    } else {
+        ActionResult::FailedRecoverable {
+            action_label,
+            error,
+        }
+    }
+}
+
+fn describe_result(result: &ActionResult) -> &'static str {
+    match result {
+        ActionResult::RestoreOk { .. } => "ok(restore)",
+        ActionResult::ResetOk { .. } => "ok(reset)",
+        ActionResult::FailedRecoverable { .. } => "failed(recoverable)",
+        ActionResult::FailedTerminal { .. } => "failed(terminal)",
     }
 }
 
@@ -272,7 +326,7 @@ fn describe_pending(action: &PendingAction) -> String {
     }
 }
 
-fn build_result_body(result: &ActionResult) -> (&'static str, Vec<String>, bool) {
+fn build_result_body(result: &ActionResult) -> (&'static str, Vec<String>) {
     match result {
         ActionResult::RestoreOk { source, report } => {
             let mut lines = vec![format!(
@@ -283,7 +337,7 @@ fn build_result_body(result: &ActionResult) -> (&'static str, Vec<String>, bool)
             lines.push(
                 "「アプリを終了」を押すとアプリを閉じます。次回起動時に反映されます。".to_string(),
             );
-            ("復元が完了しました", lines, false)
+            ("復元が完了しました", lines)
         }
         ActionResult::ResetOk { report } => {
             let mut lines = vec![format!(
@@ -295,9 +349,9 @@ fn build_result_body(result: &ActionResult) -> (&'static str, Vec<String>, bool)
                 "「アプリを終了」を押すとアプリを閉じます。次回起動時は初期状態になります。"
                     .to_string(),
             );
-            ("リセットが完了しました", lines, false)
+            ("リセットが完了しました", lines)
         }
-        ActionResult::Failed {
+        ActionResult::FailedRecoverable {
             action_label,
             error,
         } => {
@@ -306,10 +360,28 @@ fn build_result_body(result: &ActionResult) -> (&'static str, Vec<String>, bool)
                 String::new(),
                 error.clone(),
                 String::new(),
-                "ファイルが他のプロセスにロックされていないか確認し、もう一度試してください。"
+                "設定ファイルは変更されていません。もう一度試すか、別の世代を選んでください。"
                     .to_string(),
             ];
-            ("エラー", lines, true)
+            ("エラー", lines)
+        }
+        ActionResult::FailedTerminal {
+            action_label,
+            error,
+        } => {
+            let lines = vec![
+                format!("{action_label} の途中で致命的なエラーが発生しました。"),
+                String::new(),
+                error.clone(),
+                String::new(),
+                "設定ファイルが不整合な状態になっている可能性があります。\
+                 アプリを終了して再起動してください。"
+                    .to_string(),
+                "操作前の状態は `before-restore-*` という名前で残してあります。\
+                 設定フォルダ内で確認できます。"
+                    .to_string(),
+            ];
+            ("致命的なエラー", lines)
         }
     }
 }

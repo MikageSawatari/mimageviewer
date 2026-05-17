@@ -119,6 +119,42 @@ impl From<std::io::Error> for RestoreError {
     }
 }
 
+/// 失敗の重大度。UI 側で「閉じる」 (= recoverable) と「アプリを終了して再起動」
+/// (= terminal) のどちらに倒すかの分類に使う (Codex P2 / 2026-05-17 対応)。
+///
+/// - `Recoverable`: まだ何もファイルを触っていない or 触ったが完全に rollback 済み。
+///   `SAVE_SUPPRESSED` も巻き戻しているので、ユーザーはダイアログを閉じてアプリを
+///   続けて使える。
+/// - `Terminal`: `set_global_db(None)` で SQLite ハンドルを落としたあと、または
+///   `settings.db` 関連を変更した後の失敗。`SAVE_SUPPRESSED` は立ったままで、
+///   in-memory `Settings` も disk と乖離している。続けて操作すると挙動が壊れるので、
+///   アプリを **強制終了** して再起動を促す。
+#[derive(Debug)]
+pub enum RestoreFailure {
+    Recoverable(RestoreError),
+    Terminal(RestoreError),
+}
+
+impl RestoreFailure {
+    pub fn error(&self) -> &RestoreError {
+        match self {
+            RestoreFailure::Recoverable(e) | RestoreFailure::Terminal(e) => e,
+        }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        matches!(self, RestoreFailure::Terminal(_))
+    }
+}
+
+impl std::fmt::Display for RestoreFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error().fmt(f)
+    }
+}
+
+impl std::error::Error for RestoreFailure {}
+
 // ──────────────────────────────────────────────────────────────────────
 // 一覧
 // ──────────────────────────────────────────────────────────────────────
@@ -228,37 +264,40 @@ fn count_table(conn: &Connection, table: &str) -> Result<usize, String> {
 ///   atomic rename が Windows でロックされないようにする)。
 /// - `SAVE_SUPPRESSED = true` を立てて、以降の `with_db` 経由 save を全部止める。
 ///
-/// 失敗時の保証:
-/// - **検証 (`validate_backup`) が落ちた場合**: settings.db は無傷、SAVE_SUPPRESSED は
-///   触らない (= ユーザーがそのまま操作を続けられる)。
-/// - **snapshot 取得が落ちた場合**: settings.db は無傷、SAVE_SUPPRESSED は巻き戻す。
-/// - **GLOBAL_DB を落とした後にファイル操作が落ちた場合**: settings.db を不正な状態に
-///   残さないよう、`.restoring-tmp` の中間ファイルを掃除してから error を返す。
-///   この時点で SAVE_SUPPRESSED は維持する (= GLOBAL_DB 既に閉じているのに save が
-///   走ると with_db が lazy boot して同じ問題を再発させるリスクがあるため)。
+/// 失敗の分類 (Codex P2 / 2026-05-17 対応):
+/// - `RestoreFailure::Recoverable`: validate / snapshot 失敗 (= まだファイルを触って
+///   いない)。`SAVE_SUPPRESSED` を rollback し、settings.db も無傷。ユーザーは
+///   ダイアログを閉じてそのままアプリを使い続けられる。
+/// - `RestoreFailure::Terminal`: `set_global_db(None)` 後 (= 既に SQLite ハンドルを
+///   落とした) の失敗。`SAVE_SUPPRESSED` は立ったまま、in-memory `Settings` も disk と
+///   乖離する。続けて操作すると挙動が崩れるので、UI 側で **強制終了 + 再起動** を促す。
 ///
-/// 復元成功後に caller は **必ずアプリを終了** すること。in-memory の `Settings`
-/// は古いままなので、続けて UI 操作 → save() が走ると、せっかく差し替えた
-/// `settings.db` を defaults で踏み潰してしまう (`with_db` の data_dir mismatch ガード
-/// で多くは止まるが、抑止の方が確実)。
-pub fn restore_from(data_dir: &Path, source: &BackupSource) -> Result<RestoreReport, RestoreError> {
+/// **削除順** (Codex P1 / 2026-05-17 対応): WAL/SHM を **先** に削除してから
+/// `settings.db` を atomic rename で差し替える。逆順だと「新 main + 旧 WAL」の混合
+/// 状態で失敗 return → アプリが続行 → 次回起動時に SQLite が salt mismatch で
+/// confused になる可能性がある。WAL/SHM 削除が失敗した場合は **main 未変更** なので
+/// 退路がある (= 次回起動で同じ settings.db を再 open するだけ)。
+pub fn restore_from(
+    data_dir: &Path,
+    source: &BackupSource,
+) -> Result<RestoreReport, RestoreFailure> {
     // 1. 検証: 復元元が `SettingsDb::open + load_into_settings` まで通るか。
     //    壊れた bak (= sqlite として開けるが load 段階で Corrupted になる、e.g.
     //    settings_kv JSON 破損 / UUID 不正 / 必須テーブル欠落) を選んで「復元
     //    完了 → 次回起動で fail」 になるのを防ぐ。Codex P3 (2026-05-17) 対応。
-    validate_backup(data_dir, source)?;
+    validate_backup(data_dir, source).map_err(RestoreFailure::Recoverable)?;
 
     // 2. ここから抑止フラグを立てる。以降の with_db 経由の save は全部止まる。
     crate::settings_db::set_save_suppressed(true);
 
     // 3. 現状家族を退避。ここで失敗したら settings.db は無傷なので
-    //    suppress を巻き戻して return (Codex P2 対応)。
+    //    suppress を巻き戻して Recoverable で return。
     let ts = unix_seconds_now();
     let snapshot_paths = match snapshot_current_family(data_dir, ts) {
         Ok(s) => s,
         Err(e) => {
             crate::settings_db::set_save_suppressed(false);
-            return Err(e);
+            return Err(RestoreFailure::Recoverable(e));
         }
     };
 
@@ -267,19 +306,26 @@ pub fn restore_from(data_dir: &Path, source: &BackupSource) -> Result<RestoreRep
     //    クローンされている可能性があるが、SAVE_SUPPRESSED が立っているので
     //    新規の with_db は走らず、in-flight のは数 ms で終わる前提
     //    (本アプリの save は user 操作起点で長時間 hold しない)。万一残っていても
-    //    後段の rename リトライで吸収する (= Codex P1 対応)。
+    //    後段の retry で吸収する。
+    //    ⚠️ ここから先の失敗はすべて Terminal: アプリ強制終了 → 次回 clean re-open。
     crate::settings_db::set_global_db(data_dir, None);
 
-    // 5. settings.db を atomic rename で差し替える (current 選択時は no-op)。
+    // 5. WAL/SHM を **先に** 削除する (Codex P1 対応)。retry で「まだロック中」を
+    //    吸収。NotFound は OK、最後まで残ったら Terminal error として返す。
+    //    main は未変更なので、次回起動時に同じ settings.db を再 open するだけで済む。
+    if let Err(e) = drop_wal_sidecars_strict(data_dir) {
+        return Err(RestoreFailure::Terminal(e));
+    }
+
+    // 6. settings.db を atomic rename で差し替える (current 選択時は no-op)。
+    //    rename は atomic なので main は「旧 / 新」のどちらかの完成状態しか取らない。
     if !source.is_current() {
         let src_path = data_dir.join(source.filename());
         let main_path = data_dir.join("settings.db");
-        replace_file_atomic_with_retry(&src_path, &main_path)?;
+        if let Err(e) = replace_file_atomic_with_retry(&src_path, &main_path) {
+            return Err(RestoreFailure::Terminal(e));
+        }
     }
-
-    // 6. WAL/SHM を確実に削除する。retry で「まだロック中」を吸収。
-    //    削除確認に失敗したら error として返す (= Codex P1: "破棄できたことを保証")。
-    drop_wal_sidecars_strict(data_dir)?;
 
     Ok(RestoreReport { snapshot_paths })
 }
@@ -288,8 +334,16 @@ pub fn restore_from(data_dir: &Path, source: &BackupSource) -> Result<RestoreRep
 /// 削除前に同じ `before-restore-<ts>` パターンで退避 (= ユーザーが間違えて
 /// 押した場合の救済材料を残す)。
 ///
+/// **削除順** (Codex P1 / 2026-05-17 対応): `bak10..bak1` → `-shm` → `-wal` →
+/// `settings.db` **最後**。途中失敗で settings.db が残れば次回起動が普通に通り、
+/// ユーザーが再試行できる。逆順 (= main 最初) だと「main 不在 + family 残」状態で
+/// 次回起動が `FailedFallbackDefault` (= 永久 save 抑止) に倒れる詰みパターンを作る。
+///
+/// 失敗の分類: `restore_from` と同じ。snapshot 前は `Recoverable`、`set_global_db(None)`
+/// 後は `Terminal`。
+///
 /// 削除後、次回起動は `boot_settings_db_inner` で clean install 経路に入る。
-pub fn full_reset(data_dir: &Path) -> Result<ResetReport, RestoreError> {
+pub fn full_reset(data_dir: &Path) -> Result<ResetReport, RestoreFailure> {
     crate::settings_db::set_save_suppressed(true);
 
     let ts = unix_seconds_now();
@@ -297,16 +351,16 @@ pub fn full_reset(data_dir: &Path) -> Result<ResetReport, RestoreError> {
         Ok(s) => s,
         Err(e) => {
             crate::settings_db::set_save_suppressed(false);
-            return Err(e);
+            return Err(RestoreFailure::Recoverable(e));
         }
     };
 
     // GLOBAL_DB を落として SQLite ハンドルを閉じる (= remove_file がロック失敗
-    // するのを避ける、Codex P1 対応)。
+    // するのを避ける)。⚠️ ここから先の失敗はすべて Terminal。
     crate::settings_db::set_global_db(data_dir, None);
 
     let mut deleted: Vec<PathBuf> = Vec::new();
-    for name in crate::settings_db::family_filenames() {
+    for name in family_deletion_order_main_last() {
         let p = data_dir.join(&name);
         let res = retry_io(
             10,
@@ -320,7 +374,7 @@ pub fn full_reset(data_dir: &Path) -> Result<ResetReport, RestoreError> {
         match res {
             Ok(true) => deleted.push(p),
             Ok(false) => {}
-            Err(e) => return Err(RestoreError::Io(e)),
+            Err(e) => return Err(RestoreFailure::Terminal(RestoreError::Io(e))),
         }
     }
 
@@ -328,6 +382,19 @@ pub fn full_reset(data_dir: &Path) -> Result<ResetReport, RestoreError> {
         snapshot_paths,
         deleted,
     })
+}
+
+/// `full_reset` 用の削除順。`settings.db` を **最後** にして、途中失敗時の
+/// 「main 不在 + family 残」を防ぐ (Codex P1 / 2026-05-17 対応)。
+fn family_deletion_order_main_last() -> Vec<String> {
+    let mut v: Vec<String> = (1..=10)
+        .rev()
+        .map(|n| format!("settings.db.bak{n}"))
+        .collect();
+    v.push("settings.db-shm".to_string());
+    v.push("settings.db-wal".to_string());
+    v.push("settings.db".to_string());
+    v
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -635,11 +702,16 @@ mod tests {
         // bak1 として「sqlite ヘッダではない」16 バイトを書く (= open 段階で Corrupted)。
         std::fs::write(dir.join("settings.db.bak1"), b"NOT A SQLITE DB!").unwrap();
 
-        let err = restore_from(dir, &BackupSource::Bak(1))
+        let failure = restore_from(dir, &BackupSource::Bak(1))
             .expect_err("壊れた bak は validate で弾かれる");
+        // Recoverable で、内訳は ValidationFailed (= 何もファイルを触っていない失敗)。
         assert!(
-            matches!(err, RestoreError::ValidationFailed(_)),
-            "expected ValidationFailed, got: {err:?}"
+            !failure.is_terminal(),
+            "validate 失敗は Recoverable (= アプリ続行可) であるべき"
+        );
+        assert!(
+            matches!(failure.error(), RestoreError::ValidationFailed(_)),
+            "expected ValidationFailed, got: {failure:?}"
         );
 
         // settings.db は無傷で original を読み返せる。
@@ -653,6 +725,28 @@ mod tests {
             "validate 失敗で save 抑止が残ると、続けて操作したユーザーの save が \
              silently no-op になる"
         );
+    }
+
+    /// 2026-05-17 Codex P1 対応: `full_reset` の削除順は **main 最後**。
+    /// 万一途中で失敗しても settings.db が残るので、次回起動が `FailedFallbackDefault`
+    /// に倒れない (= 永久 save 抑止の詰みパターンを防ぐ)。
+    #[test]
+    fn full_reset_deletion_order_keeps_main_last() {
+        let order = family_deletion_order_main_last();
+        // 末尾は必ず settings.db。
+        assert_eq!(order.last().map(String::as_str), Some("settings.db"));
+        // main は 1 度だけ登場 (= 順序リストに重複なし)。
+        let main_count = order.iter().filter(|n| n.as_str() == "settings.db").count();
+        assert_eq!(main_count, 1);
+        // bak10 は main より前。
+        let bak10_idx = order.iter().position(|n| n == "settings.db.bak10").unwrap();
+        let main_idx = order.iter().position(|n| n == "settings.db").unwrap();
+        assert!(bak10_idx < main_idx, "bak10 は main より前に消す");
+        // -wal / -shm も main より前。
+        let wal_idx = order.iter().position(|n| n == "settings.db-wal").unwrap();
+        let shm_idx = order.iter().position(|n| n == "settings.db-shm").unwrap();
+        assert!(wal_idx < main_idx);
+        assert!(shm_idx < main_idx);
     }
 
     /// `current` を選んだケースでは bak の中身に依存しないので validate は skip。
