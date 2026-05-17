@@ -88,6 +88,20 @@ impl App {
             return;
         }
 
+        // 2026-05-17 Codex P1 対応: Terminal 結果を表示中は親ウィンドウを **描画しない**。
+        // 親の `.open(&mut open)` の [x] が活きていると、ユーザーがそれを押した瞬間に
+        // 状態がリセットされて強制終了誘導の dialog が消えてしまう (= SAVE_SUPPRESSED
+        // が立ったまま + GLOBAL_DB drop 後の状態で操作続行できる抜け道)。Terminal の
+        // 結果 dialog だけを描画してユーザーを終了ボタン以外の経路に逃がさない。
+        let is_terminal_result = matches!(
+            self.settings_restore_state.result,
+            Some(ActionResult::FailedTerminal { .. })
+        );
+        if is_terminal_result {
+            self.show_settings_restore_result_dialog(ctx);
+            return;
+        }
+
         let mut open = true;
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let dialog_pos = ctx.content_rect().min + egui::vec2(60.0, 40.0);
@@ -112,7 +126,7 @@ impl App {
             self.settings_restore_state = SettingsRestoreState::default();
         }
 
-        // 確認 / 完了の各ダイアログ。
+        // 確認 / 完了の各ダイアログ (Recoverable 結果はここで描画)。
         self.show_settings_restore_confirm_dialog(ctx);
         self.show_settings_restore_result_dialog(ctx);
     }
@@ -268,6 +282,11 @@ impl App {
                     // 強制的に終了させて次回起動時にクリーンに再 open させる。
                     // `shutdown_requested` を立てて tray 常駐の close 横取りを通す
                     // ([src/ui_main.rs] の「終了」ボタンと同じ方式)。
+                    //
+                    // 親ダイアログも閉じる: viewport close は 1-2 frame 遅延するので、
+                    // その間に親ウィンドウが flicker するのを防ぐ。
+                    self.show_settings_restore = false;
+                    self.settings_restore_state = SettingsRestoreState::default();
                     self.shutdown_requested
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);

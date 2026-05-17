@@ -528,6 +528,20 @@ impl SettingsDb {
         Ok(())
     }
 
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` を実行する。WAL の全 frame を main に
+    /// 統合 + WAL ファイルを 0 バイトに truncate する。
+    ///
+    /// 2026-05-17 Codex P2 対応で追加。`settings_restore::restore_from` の atomic rename
+    /// 直前に呼べば、main が self-contained になるので、rename 失敗時に「未 checkpoint
+    /// の WAL データ消失」事故を避けられる。
+    pub fn checkpoint_truncate(&self) -> Result<(), SettingsDbError> {
+        let inner = self.inner.lock().map_err(|_| SettingsDbError::Poisoned)?;
+        inner
+            .conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        Ok(())
+    }
+
     /// `VACUUM INTO` で snapshot を作成する。
     ///
     /// `target` が存在しないことを呼び出し側で保証する (SQLite の VACUUM INTO は
@@ -2490,6 +2504,28 @@ pub fn with_db_result<X>(
     f: impl FnOnce(&SettingsDb) -> Result<X, SettingsDbError>,
 ) -> Result<X, SettingsDbError> {
     with_db(f).and_then(std::convert::identity)
+}
+
+/// 稼働中の `GLOBAL_DB` (= 開いている SQLite ハンドル) で
+/// `PRAGMA wal_checkpoint(TRUNCATE)` を実行し、WAL の内容を main に統合 + WAL を
+/// 0 バイトに truncate する。
+///
+/// 2026-05-17 Codex P2 対応で追加。`settings_restore::restore_from` が bak から
+/// 復元する直前に呼んで `settings.db` を self-contained にしておけば、後段の
+/// atomic rename が失敗しても「main は最新で、WAL 消失による直近設定の巻き戻り」
+/// が起きない。
+///
+/// `with_db` は通らず GLOBAL_DB から直接 Arc を取り出すので、`SAVE_SUPPRESSED` の
+/// 影響を受けない。`GLOBAL_DB` が None (= まだ boot していない) なら no-op。
+pub fn checkpoint_global_db() -> Result<(), SettingsDbError> {
+    let arc: Option<Arc<SettingsDb>> = {
+        let guard = GLOBAL_DB.lock().unwrap_or_else(|p| p.into_inner());
+        guard.as_ref().map(|(_, a)| Arc::clone(a))
+    };
+    if let Some(arc) = arc {
+        arc.checkpoint_truncate()?;
+    }
+    Ok(())
 }
 
 /// テスト用: グローバル DB ハンドルをクリアする。

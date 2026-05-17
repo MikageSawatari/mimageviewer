@@ -301,30 +301,59 @@ pub fn restore_from(
         }
     };
 
-    // 4. GLOBAL_DB を None にして、生きている SQLite ハンドルを drop する。
+    // 4. **bak 復元** のときだけ、稼働中の SQLite で `PRAGMA wal_checkpoint(TRUNCATE)`
+    //    を走らせて WAL の全 frame を main に統合する。これで `settings.db` 自体が
+    //    self-contained になり、後段の rename が失敗しても「未 checkpoint の WAL
+    //    データが消える」事故を避けられる (Codex P2 / 2026-05-17 対応)。
+    //
+    //    `Current` (= WAL 破棄が user 意図) では checkpoint しない (= 破棄したい
+    //    WAL データを main に統合してしまうと操作意図に反する)。
+    //
+    //    checkpoint 失敗は best-effort で吸収。失敗しても以降のフローは続行できる
+    //    (= 最悪のケースで未 checkpoint 分の data loss が起きるが、user は restore で
+    //    どのみちその WAL を捨てる意図でいるため致命的ではない)。
+    if !source.is_current() {
+        if let Err(e) = crate::settings_db::checkpoint_global_db() {
+            crate::logger::log(format!(
+                "[settings_restore] pre-restore wal_checkpoint failed (proceeding anyway): {e}"
+            ));
+        }
+    }
+
+    // 5. GLOBAL_DB を None にして、生きている SQLite ハンドルを drop する。
     //    SettingsDb の Arc が他 (= 別スレッドの with_db closure 内) に
     //    クローンされている可能性があるが、SAVE_SUPPRESSED が立っているので
     //    新規の with_db は走らず、in-flight のは数 ms で終わる前提
     //    (本アプリの save は user 操作起点で長時間 hold しない)。万一残っていても
     //    後段の retry で吸収する。
-    //    ⚠️ ここから先の失敗はすべて Terminal: アプリ強制終了 → 次回 clean re-open。
     crate::settings_db::set_global_db(data_dir, None);
 
-    // 5. WAL/SHM を **先に** 削除する (Codex P1 対応)。retry で「まだロック中」を
-    //    吸収。NotFound は OK、最後まで残ったら Terminal error として返す。
-    //    main は未変更なので、次回起動時に同じ settings.db を再 open するだけで済む。
-    if let Err(e) = drop_wal_sidecars_strict(data_dir) {
-        return Err(RestoreFailure::Terminal(e));
-    }
-
     // 6. settings.db を atomic rename で差し替える (current 選択時は no-op)。
-    //    rename は atomic なので main は「旧 / 新」のどちらかの完成状態しか取らない。
+    //    失敗時の状態: main 未変更 + checkpoint 済み (= データ完全)。suppress を巻き戻して
+    //    Recoverable で return。次回 with_db が lazy boot で同じ settings.db を再 open する。
     if !source.is_current() {
         let src_path = data_dir.join(source.filename());
         let main_path = data_dir.join("settings.db");
         if let Err(e) = replace_file_atomic_with_retry(&src_path, &main_path) {
-            return Err(RestoreFailure::Terminal(e));
+            crate::settings_db::set_save_suppressed(false);
+            return Err(RestoreFailure::Recoverable(e));
         }
+    }
+    // ⚠️ ここから先は main 差し替え後 (bak 復元) / 重要な WAL 破棄前 (Current) なので、
+    //    失敗は Terminal: 続けて操作するとアプリの in-memory state と disk が乖離する。
+
+    // 7. WAL/SHM を破棄する。挙動は復元元によって変える:
+    //    - **bak 復元**: 失敗は best-effort で吸収 (= 旧 WAL は salt mismatch で SQLite が
+    //      無視するので、新 main の整合性は崩れない)。stale な file が disk に残るだけ。
+    //    - **Current**: WAL 破棄が user 意図そのもの。失敗したら Recoverable で
+    //      return (suppress 巻き戻し)。main は未変更なので、再試行可能。
+    if source.is_current() {
+        if let Err(e) = drop_wal_sidecars_strict(data_dir) {
+            crate::settings_db::set_save_suppressed(false);
+            return Err(RestoreFailure::Recoverable(e));
+        }
+    } else {
+        drop_wal_sidecars_best_effort(data_dir);
     }
 
     Ok(RestoreReport { snapshot_paths })
@@ -478,6 +507,33 @@ fn replace_file_atomic_with_retry(src: &Path, dst: &Path) -> Result<(), RestoreE
             // rename 失敗 → tmp を掃除。`dst` は無傷 (rename は atomic)。
             let _ = std::fs::remove_file(&tmp);
             Err(RestoreError::Io(e))
+        }
+    }
+}
+
+/// WAL/SHM を retry 付きで削除する。NotFound は成功扱い。失敗は **log のみで吸収**。
+///
+/// bak 復元成功後の WAL/SHM 整理に使う。新 main + 旧 WAL が残っても SQLite の WAL
+/// salt mismatch で旧 WAL は無視されるので、stale な file が disk に残るだけで動作には
+/// 影響しない (= ベストエフォートで OK)。
+fn drop_wal_sidecars_best_effort(data_dir: &Path) {
+    for name in ["settings.db-wal", "settings.db-shm"] {
+        let p = data_dir.join(name);
+        let result =
+            retry_io(
+                10,
+                std::time::Duration::from_millis(50),
+                || match std::fs::remove_file(&p) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                },
+            );
+        if let Err(e) = result {
+            crate::logger::log(format!(
+                "[settings_restore] stale sidecar {} could not be removed (proceeding): {e}",
+                p.display()
+            ));
         }
     }
 }
@@ -725,6 +781,60 @@ mod tests {
             "validate 失敗で save 抑止が残ると、続けて操作したユーザーの save が \
              silently no-op になる"
         );
+    }
+
+    /// 2026-05-17 Codex P2 対応: bak 復元の冒頭で `wal_checkpoint(TRUNCATE)` を走らせて
+    /// `settings.db` を self-contained にする。これで rename 失敗時に「未 checkpoint の
+    /// WAL データが消える」事故を避けられる。
+    ///
+    /// 直接テストできるのは「Bak 復元成功後に WAL が残っていない」+「復元後の main
+    /// に最新データがある」の組合せで、checkpoint が走ったことの間接的な観測になる。
+    #[test]
+    fn restore_from_bak_checkpoints_wal_before_swap() {
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+
+        // bak1 に "古い state" を用意。
+        let old_state = {
+            let mut s = Settings::default();
+            s.add_favorite("old".into(), std::path::PathBuf::from(r"C:\old"));
+            s
+        };
+        {
+            let db = SettingsDb::create_new(dir).unwrap();
+            db.save_full(&old_state).unwrap();
+            db.backup_to(&dir.join("settings.db.bak1")).unwrap();
+        }
+        // 実 app 状態を再現: boot で GLOBAL_DB を populate し、追加 save を走らせて
+        // WAL に未 checkpoint frame を作る。
+        let outcome = crate::settings_db::boot_settings_db(dir);
+        assert!(outcome.db.is_some());
+        // 何回か save を回す。これで WAL に frame が積まれる (sqlite のデフォルト
+        // auto-checkpoint 閾値 = 1000 page / 約 4MB なので、数回の save では発火しない)。
+        let mut newer = old_state.clone();
+        for i in 0..5 {
+            newer.add_favorite(format!("new{i}"), std::path::PathBuf::from("C:\\new"));
+            crate::settings_db::with_db_result(|db| db.save_full(&newer)).unwrap();
+        }
+        // 本番では `GLOBAL_DB` が Arc の唯一の所有者なので、`outcome.db` の clone を
+        // drop して同じ状況を作る。これを残すと `set_global_db(None)` が Arc を落とし
+        // きれず、Windows で rename が PermissionDenied になる。
+        drop(outcome);
+
+        // 復元実行 (bak1 = 古い state へ戻す)。
+        // 復元成功 = checkpoint も無事に走ったとみなす (= 失敗してもベストエフォートで
+        // 続行するが、ここでは本番想定のスムーズな成功経路を見たい)。
+        let report = restore_from(dir, &BackupSource::Bak(1)).expect("checkpoint + 復元は成功する");
+        assert!(!report.snapshot_paths.is_empty());
+
+        // 復元後の WAL は最終的に消える (bak 復元の best-effort delete 経路でも、
+        // 同プロセス内ならハンドルが drop 済みで削除が通る前提)。
+        assert!(!dir.join("settings.db-wal").exists());
+
+        // 復元後の main = bak1 = old_state。
+        let db = SettingsDb::open(dir).unwrap();
+        let loaded = db.load_into_settings().unwrap();
+        assert_eq!(loaded.favorites.len(), old_state.favorites.len());
     }
 
     /// 2026-05-17 Codex P1 対応: `full_reset` の削除順は **main 最後**。
