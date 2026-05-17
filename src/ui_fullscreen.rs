@@ -1421,6 +1421,8 @@ impl App {
                         // ── 透過背景インジケータ (B キー変更直後のみフェード表示) ──
                         self.draw_fs_transparent_bg_indicator(ui, full_rect);
                         self.draw_original_preview_indicator(ui, full_rect, state.original_preview_active);
+                        self.sync_slideshow_anchor_for_frame(ctx, fs_idx, &state);
+                        self.draw_slideshow_progress_indicator(ui, full_rect, ctx);
                         fs_overlay_ms = overlay_t0.elapsed().as_secs_f64() * 1000.0;
 
                         // ── 動画 (エラー / 「準備中」のみ) ──
@@ -1614,6 +1616,7 @@ impl App {
                                 cfg!(windows) && is_video_mode && self.settings.vst3_enabled;
                             let vst3_panel_open = self.show_vst3_manager;
                             let mut vst3_pressed = false;
+                            let slideshow_was_playing = self.slideshow_playing;
                             Self::draw_fs_hover_bar(
                                 ui, ctx, full_rect,
                                 &state.location_display,
@@ -1640,6 +1643,9 @@ impl App {
                                 vst3_panel_open,
                                 &mut vst3_pressed,
                             );
+                            if !slideshow_was_playing && self.slideshow_playing {
+                                self.schedule_next_slideshow_from_now();
+                            }
                             // ▦ タイルボタンが押されたら toggle_video_tile_mode に dispatch
                             #[cfg(windows)]
                             if tile_pressed {
@@ -2902,8 +2908,7 @@ impl App {
                     | Some(GridItem::PdfPage { .. })
             ) {
                 self.slideshow_playing = true;
-                self.slideshow_next_at = std::time::Instant::now()
-                    + std::time::Duration::from_secs_f32(self.settings.slideshow_interval_secs);
+                self.schedule_next_slideshow_from_now();
             }
         }
 
@@ -3480,6 +3485,56 @@ impl App {
 
     // ── ナビゲーション & スライドショー ─────────────────────────────────
 
+    fn slideshow_interval_duration(&self) -> std::time::Duration {
+        let secs = self.settings.slideshow_interval_secs;
+        let secs = if secs.is_finite() {
+            secs.clamp(0.5, 30.0)
+        } else {
+            3.0
+        };
+        std::time::Duration::from_secs_f32(secs)
+    }
+
+    fn schedule_next_slideshow_from_now(&mut self) {
+        self.slideshow_next_at = std::time::Instant::now() + self.slideshow_interval_duration();
+        self.slideshow_anchor_idx = self.fullscreen_idx;
+    }
+
+    fn current_slideshow_frame_ready(&self, fs_idx: usize, state: &FsFrameState) -> bool {
+        if state.is_video || state.separator_text.is_some() {
+            return false;
+        }
+        let has_own_thumb = matches!(
+            self.thumbnails.get(fs_idx),
+            Some(ThumbnailState::Loaded { .. })
+        );
+        state.tex.is_some() || has_own_thumb || state.fs_load_failed
+    }
+
+    fn sync_slideshow_anchor_for_frame(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        state: &FsFrameState,
+    ) {
+        if !self.slideshow_playing {
+            return;
+        }
+        let ready = self.current_slideshow_frame_ready(fs_idx, state);
+        if self.slideshow_anchor_idx == Some(fs_idx) {
+            if !ready {
+                self.slideshow_anchor_idx = None;
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+            return;
+        }
+        if ready {
+            self.schedule_next_slideshow_from_now();
+        } else {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
     pub(crate) fn open_fullscreen_from_fs_navigation(&mut self, ctx: &egui::Context, idx: usize) {
         #[cfg(windows)]
         if self.try_start_video_tile_fast_swap(ctx, idx) {
@@ -3676,44 +3731,58 @@ impl App {
         // ── スライドショー タイマー ──
         if self.slideshow_playing && !close_fs {
             let now = std::time::Instant::now();
-            if now >= self.slideshow_next_at {
-                if let Some(cur) = self.fullscreen_idx {
-                    let slide_delta = self.spread_nav_delta(1, false);
-                    let next = crate::ui_helpers::adjacent_navigable_idx(
-                        &self.items,
-                        &self.visible_indices,
-                        cur,
-                        slide_delta,
-                    );
-                    // 末尾到達時は先頭の画像系アイテムへループ。
-                    // 画像系がひとつも無い場合はスライドショーを停止 (安全側、
-                    // 旧実装の `unwrap_or(0)` で非画像アイテムへ飛ぶ事故を防ぐ)。
-                    let target = next.or_else(|| {
-                        self.visible_indices.iter().copied().find(|&i| {
-                            matches!(
-                                self.items.get(i),
-                                Some(GridItem::Image(_))
-                                    | Some(GridItem::ZipImage { .. })
-                                    | Some(GridItem::PdfPage { .. })
-                            )
-                        })
-                    });
-                    match target {
-                        Some(idx) => {
-                            self.open_fullscreen_from_fs_navigation(ctx, idx);
-                            self.selected = Some(idx);
-                            self.scroll_to_selected = true;
-                        }
-                        None => {
-                            self.slideshow_playing = false;
+            let anchored = self
+                .fullscreen_idx
+                .is_some_and(|idx| self.slideshow_anchor_idx == Some(idx));
+            if !anchored {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            } else {
+                if now >= self.slideshow_next_at {
+                    let mut advanced = false;
+                    if let Some(cur) = self.fullscreen_idx {
+                        let slide_delta = self.spread_nav_delta(1, false);
+                        let next = crate::ui_helpers::adjacent_navigable_idx(
+                            &self.items,
+                            &self.visible_indices,
+                            cur,
+                            slide_delta,
+                        );
+                        // 末尾到達時は先頭の画像系アイテムへループ。
+                        // 画像系がひとつも無い場合はスライドショーを停止 (安全側、
+                        // 旧実装の `unwrap_or(0)` で非画像アイテムへ飛ぶ事故を防ぐ)。
+                        let target = next.or_else(|| {
+                            self.visible_indices.iter().copied().find(|&i| {
+                                matches!(
+                                    self.items.get(i),
+                                    Some(GridItem::Image(_))
+                                        | Some(GridItem::ZipImage { .. })
+                                        | Some(GridItem::PdfPage { .. })
+                                )
+                            })
+                        });
+                        match target {
+                            Some(idx) => {
+                                self.slideshow_anchor_idx = None;
+                                self.open_fullscreen_from_fs_navigation(ctx, idx);
+                                self.selected = Some(idx);
+                                self.scroll_to_selected = true;
+                                advanced = true;
+                            }
+                            None => {
+                                self.slideshow_playing = false;
+                                self.slideshow_anchor_idx = None;
+                            }
                         }
                     }
+                    if advanced {
+                        ctx.request_repaint();
+                    }
                 }
-                self.slideshow_next_at =
-                    now + std::time::Duration::from_secs_f32(self.settings.slideshow_interval_secs);
+                if self.slideshow_playing {
+                    let remaining = self.slideshow_next_at.saturating_duration_since(now);
+                    ctx.request_repaint_after(remaining.min(std::time::Duration::from_millis(100)));
+                }
             }
-            let remaining = self.slideshow_next_at.saturating_duration_since(now);
-            ctx.request_repaint_after(remaining);
         }
     }
 
@@ -3989,6 +4058,67 @@ impl App {
         painter.rect_filled(bg, 4.0, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 190));
         painter.galley(pos, galley, egui::Color32::WHITE);
         ui.ctx().request_repaint();
+    }
+
+    fn draw_slideshow_progress_indicator(
+        &self,
+        ui: &egui::Ui,
+        full_rect: egui::Rect,
+        ctx: &egui::Context,
+    ) {
+        if !self.slideshow_playing {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        let interval = self.slideshow_interval_duration();
+        let interval_secs = interval.as_secs_f32().max(0.001);
+        let anchored = self
+            .fullscreen_idx
+            .is_some_and(|idx| self.slideshow_anchor_idx == Some(idx));
+        let progress = if anchored {
+            let remaining = self.slideshow_next_at.saturating_duration_since(now);
+            ((interval_secs - remaining.as_secs_f32()) / interval_secs).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+
+        let painter = ui.painter();
+        let center = egui::pos2(full_rect.max.x - 22.0, full_rect.min.y + 22.0);
+        let radius = 8.0;
+        painter.circle_stroke(
+            center,
+            radius,
+            egui::Stroke::new(1.2, egui::Color32::from_white_alpha(42)),
+        );
+
+        if progress > 0.0 {
+            let start = -std::f32::consts::FRAC_PI_2;
+            let sweep = std::f32::consts::TAU * progress;
+            let segments = ((36.0 * progress).ceil() as usize).clamp(2, 36);
+            let mut points = Vec::with_capacity(segments + 1);
+            for i in 0..=segments {
+                let t = i as f32 / segments as f32;
+                let angle = start + sweep * t;
+                points.push(egui::pos2(
+                    center.x + radius * angle.cos(),
+                    center.y + radius * angle.sin(),
+                ));
+            }
+            painter.add(egui::Shape::line(
+                points,
+                egui::Stroke::new(2.0, egui::Color32::from_white_alpha(120)),
+            ));
+        }
+
+        let repaint = if anchored {
+            self.slideshow_next_at
+                .saturating_duration_since(now)
+                .min(std::time::Duration::from_millis(100))
+        } else {
+            std::time::Duration::from_millis(100)
+        };
+        ctx.request_repaint_after(repaint);
     }
 
     /// ルーペ (局所拡大) 描画。

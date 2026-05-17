@@ -2214,6 +2214,8 @@ pub struct App {
     pub(crate) slideshow_playing: bool,
     /// 次の画像に切り替える時刻
     pub(crate) slideshow_next_at: std::time::Instant,
+    /// `slideshow_next_at` がどのフルスクリーン item の表示開始から数えているか。
+    pub(crate) slideshow_anchor_idx: Option<usize>,
 
     // ── フルスクリーンビューポート ─────────────────────────────
     /// フルスクリーンビューポートが現在表示中か（Visible+Focus 送信済み）
@@ -3192,6 +3194,7 @@ impl App {
             spread_popup_open: false,
             slideshow_playing: false,
             slideshow_next_at: std::time::Instant::now(),
+            slideshow_anchor_idx: None,
             fs_viewport_shown: false,
             fs_viewport_recreate_after_hide: false,
             fs_viewport_generation: 0,
@@ -12842,6 +12845,7 @@ impl App {
         // フルスクリーン中の Undo スタックはここで破棄。グリッドに戻ったら新しい操作を積む。
         self.clear_meta_undo();
         self.slideshow_playing = false;
+        self.slideshow_anchor_idx = None;
         self.fs_opened_at = None;
         self.fs_focus_grace_elapsed = false;
         self.fs_prev_focused = false;
