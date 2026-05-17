@@ -1139,7 +1139,9 @@ overlay の中央 status に「メタデータ読込中...」「ストリーム�
 動画から複数フレームを一括抽出して並べる仕組み。
 
 - `tile_thumbnails.rs`: 一括サムネイル抽出 worker。指定動画から N 個の絶対 PTS で
-  フレーム取得 (FFmpeg seek 系統は `screenshot.rs` と同じ one-shot 方式)。
+  フレーム取得。`settings.video_hw_decode` が有効なら seek hover サムネと同じ
+  補助 D3D11VA decoder を優先し、HW 初期化 / decode 失敗時は worker 内で SW decode
+  にフォールバックする。FFmpeg seek 系統は `screenshot.rs` と同じ one-shot 方式。
   backward seek 後は **`pts >= target_secs` の最初のフレーム**を採用する
   (= 再生で同位置にシークしたとき表示されるフレームと一致させる)。decode 数に
   上限は設けない — 長尺 GOP でも必ず target に到達するため (上限を置くと GOP 長に

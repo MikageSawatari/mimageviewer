@@ -5,13 +5,16 @@
 //! 「N 個のタイムスタンプを順に処理して全部保持」という用途には合わない。
 //!
 //! 本モジュールは:
-//! - `spawn(path, timestamps, max_w, max_h)` で N 個 (例: 10x10 = 100) のフレームを
-//!   バックグラウンドで順番に抽出する。
+//! - `spawn(path, timestamps, max_w, max_h, hw_decode, ...)` で N 個
+//!   (例: 10x10 = 100) のフレームをバックグラウンドで順番に抽出する。
 //! - メインデコーダー (= 再生用) と独立した `ffmpeg::format::Input` を別途 open
 //!   するので、再生中の動画を停めずに動く。
+//! - `hw_decode` が true ならシークバーのサムネイルと同じ補助 D3D11VA デコーダを
+//!   優先し、初期化 / decode 失敗時はワーカー内で SW デコードにフォールバックする。
 //! - 結果は `Arc<Mutex<Vec<Option<TileThumbnail>>>>` に蓄積され、UI は `snapshot()`
 //!   で共有 read。
-//! - 完了 (= 全 timestamps 処理) または cancel で thread 終了。Drop で確実に join。
+//! - 完了 (= 全 timestamps 処理) または cancel で thread 終了。Drop は cancel を立て、
+//!   UI スレッドを止めないよう worker の自然終了に任せる。
 //!
 //! ## キャッシュ寿命
 //! 1 つの `TileThumbnailWorker` は (動画 path, interval_secs, max_w/h) のキーで
@@ -86,6 +89,7 @@ impl TileThumbnailWorker {
         timestamps: Vec<f64>,
         max_w: u32,
         max_h: u32,
+        hw_decode: bool,
         cache: Option<Arc<TileThumbCache>>,
         video_mtime: i64,
     ) -> Self {
@@ -105,10 +109,12 @@ impl TileThumbnailWorker {
                     timestamps,
                     max_w,
                     max_h,
+                    hw_decode,
                     worker_state,
                     worker_cancel.clone(),
                     cache.map(CacheTarget::tile),
                     video_mtime,
+                    "video-tile-thumb",
                 );
                 worker_finished.store(true, Ordering::Release);
             }) {
@@ -180,10 +186,14 @@ pub fn spawn_resume_cache_warmup(
                 vec![target_secs],
                 max_w,
                 max_h,
+                // Resume preview saves a single frame opportunistically; keep it on SW
+                // decode so a background warmup does not pay HW setup cost or contend with playback.
+                false,
                 state,
                 cancel,
                 Some(CacheTarget::resume(cache)),
                 video_mtime,
+                "video-resume-thumb",
             );
         });
 }
@@ -206,15 +216,13 @@ fn run_worker(
     timestamps: Vec<f64>,
     max_w: u32,
     max_h: u32,
+    hw_decode: bool,
     state: Arc<Mutex<Vec<Option<TileThumbnail>>>>,
     cancel: Arc<AtomicBool>,
     cache: Option<CacheTarget>,
     video_mtime: i64,
+    log_label: &'static str,
 ) {
-    use ffmpeg::format::Pixel;
-    use ffmpeg::media::Type as MediaType;
-    use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
-    use ffmpeg::util::frame::video::Video;
     use ffmpeg_the_third as ffmpeg;
 
     // 起動直後にキャッシュをまとめてチェックして state に load。残った None スロット
@@ -265,7 +273,7 @@ fn run_worker(
     }
 
     if let Err(e) = ffmpeg::init() {
-        crate::logger::log(format!("video-tile-thumb: ffmpeg init failed: {e}"));
+        crate::logger::log(format!("{log_label}: ffmpeg init failed: {e}"));
         return;
     }
     // 全スロット既にキャッシュから埋まっているなら ffmpeg open 自体スキップ。
@@ -275,49 +283,10 @@ fn run_worker(
             return;
         }
     }
-    let mut input = match ffmpeg::format::input(&path) {
-        Ok(i) => i,
-        Err(e) => {
-            crate::logger::log(format!("video-tile-thumb: open input failed: {e}"));
-            return;
-        }
-    };
-    let video_stream = match input.streams().best(MediaType::Video) {
-        Some(s) => s,
-        None => return,
-    };
-    let stream_idx = video_stream.index();
-    let time_base = video_stream.time_base();
-    let tb_num = time_base.numerator() as f64;
-    let tb_den = time_base.denominator() as f64;
-    let params = video_stream.parameters();
+    let mut decoder: Option<TileThumbnailDecoder> = None;
+    let mut hw_decode_failed = false;
 
-    let codec_ctx = match ffmpeg::codec::context::Context::from_parameters(params) {
-        Ok(c) => c,
-        Err(e) => {
-            crate::logger::log(format!("video-tile-thumb: codec ctx failed: {e}"));
-            return;
-        }
-    };
-    let mut decoder = match codec_ctx.decoder().video() {
-        Ok(d) => d,
-        Err(e) => {
-            crate::logger::log(format!("video-tile-thumb: decoder open failed: {e}"));
-            return;
-        }
-    };
-    let src_w = decoder.width();
-    let src_h = decoder.height();
-    let (dst_w, dst_h) = fit_within(src_w, src_h, max_w, max_h);
-    // `decoder.format()` ベースの事前 scaler 構築は HW accel attach 時に
-    // `Pixel::D3D11` を返して swscale `av_assert0` → `abort()` を踏むため、
-    // **最初の frame を取った後の `frame.format()` で scaler を lazy 構築** する
-    // 方式に切り替える。HW frame は `prepare_frame_for_swscale` で SW download。
-    // 詳細は `src/video/swscale_helpers.rs` のドキュメントコメント参照。
-    let mut scaler: Option<ScaleContext> = None;
-    let mut scaler_src_fmt: Option<Pixel> = None;
-
-    for (idx, &target_secs) in timestamps.iter().enumerate() {
+    'timestamps: for (idx, &target_secs) in timestamps.iter().enumerate() {
         if cancel.load(Ordering::Acquire) {
             return;
         }
@@ -328,45 +297,222 @@ fn run_worker(
                 continue;
             }
         }
-        // backward seek + 1 frame
+        let thumb = loop {
+            if decoder.is_none() {
+                let use_hw = hw_decode && !hw_decode_failed;
+                decoder = match TileThumbnailDecoder::open(&path, max_w, max_h, use_hw, log_label) {
+                    Ok(decoder) => Some(decoder),
+                    Err(e) => {
+                        crate::logger::log(format!("{log_label}: decoder open failed: {e}"));
+                        return;
+                    }
+                };
+            }
+            let decode_result = decoder
+                .as_mut()
+                .expect("decoder opened above")
+                .decode_thumbnail(target_secs, &cancel, log_label);
+            match decode_result {
+                Ok(Some(thumb)) => break Some(thumb),
+                Ok(None) => break None,
+                Err(e)
+                    if decoder
+                        .as_ref()
+                        .is_some_and(TileThumbnailDecoder::hw_decode_active) =>
+                {
+                    crate::logger::log(format!(
+                        "{log_label}: HW decode failed; retrying with SW: {e}"
+                    ));
+                    hw_decode_failed = true;
+                    decoder = None;
+                    continue;
+                }
+                Err(e) => {
+                    crate::logger::log(format!("{log_label}: decode failed: {e}"));
+                    break None;
+                }
+            }
+        };
+        let Some(thumb) = thumb else {
+            continue;
+        };
+        // Phase 6.D-2: 抽出済 RGBA を WebP に encode してキャッシュに書く
+        // (失敗しても extraction 経路は止まらない)。Phase 8.C: 絶対 PTS キー化。
+        if let Some(c) = cache.as_ref() {
+            let encoder =
+                webp::Encoder::from_rgba(thumb.rgba.as_slice(), thumb.width, thumb.height);
+            // q=70: グリッドサムネと同等品位、サイズ優先
+            let webp_bytes = encoder.encode(70.0).to_vec();
+            let timestamp_ms = (target_secs * 1000.0).round() as i64;
+            let store_result = match c.write_kind {
+                CacheWriteKind::Tile => c.cache.store_webp(
+                    &path,
+                    max_w,
+                    timestamp_ms,
+                    video_mtime,
+                    thumb.height,
+                    &webp_bytes,
+                ),
+                CacheWriteKind::Resume => c.cache.store_resume_webp(
+                    &path,
+                    max_w,
+                    timestamp_ms,
+                    video_mtime,
+                    thumb.height,
+                    &webp_bytes,
+                ),
+            };
+            if let Err(e) = store_result {
+                crate::logger::log(format!("{log_label}: cache store failed: {e}"));
+            }
+        }
+
+        if let Ok(mut s) = state.lock() {
+            if idx < s.len() {
+                s[idx] = Some(thumb);
+            }
+        }
+        if cancel.load(Ordering::Acquire) {
+            break 'timestamps;
+        }
+    }
+}
+
+struct TileThumbnailDecoder {
+    input: ffmpeg_the_third::format::context::Input,
+    stream_idx: usize,
+    tb_num: f64,
+    tb_den: f64,
+    src_w: u32,
+    src_h: u32,
+    dst_w: u32,
+    dst_h: u32,
+    scaler: Option<ffmpeg_the_third::software::scaling::Context>,
+    scaler_src_fmt: Option<ffmpeg_the_third::format::Pixel>,
+    decoder: crate::video::decoder::AuxVideoDecoder,
+}
+
+impl TileThumbnailDecoder {
+    fn open(
+        path: &std::path::Path,
+        max_w: u32,
+        max_h: u32,
+        hw_preferred: bool,
+        log_label: &str,
+    ) -> Result<Self, String> {
+        use ffmpeg::media::Type as MediaType;
+        use ffmpeg_the_third as ffmpeg;
+
+        let input = ffmpeg::format::input(path).map_err(|e| format!("open input failed: {e}"))?;
+        let video_stream = input
+            .streams()
+            .best(MediaType::Video)
+            .ok_or_else(|| "video stream not found".to_string())?;
+        let stream_idx = video_stream.index();
+        let time_base = video_stream.time_base();
+        let tb_num = time_base.numerator() as f64;
+        let tb_den = time_base.denominator() as f64;
+        let params_ref = video_stream.parameters();
+        let params = crate::video::decoder::clone_codec_parameters(&params_ref)?;
+        let codec_id = params.id();
+        let decoder = crate::video::decoder::open_aux_video_decoder_with_fallback(
+            &params,
+            codec_id,
+            hw_preferred,
+            log_label,
+        )?;
+        let src_w = decoder.width();
+        let src_h = decoder.height();
+        let (dst_w, dst_h) = fit_within(src_w, src_h, max_w, max_h);
+        crate::logger::log(format!(
+            "{log_label}: decoder ready codec={} decoder={} decode_path={} d3d11va_supported={} d3d11va_config={} src_size={}x{} dst_size={}x{}",
+            codec_id.name(),
+            decoder.decoder_name(),
+            if decoder.hw_decode_active() {
+                "hw_d3d11va"
+            } else {
+                "sw"
+            },
+            decoder.d3d11va_supported(),
+            decoder.d3d11va_config(),
+            src_w,
+            src_h,
+            dst_w,
+            dst_h,
+        ));
+
+        Ok(Self {
+            input,
+            stream_idx,
+            tb_num,
+            tb_den,
+            src_w,
+            src_h,
+            dst_w,
+            dst_h,
+            scaler: None,
+            scaler_src_fmt: None,
+            decoder,
+        })
+    }
+
+    fn hw_decode_active(&self) -> bool {
+        self.decoder.hw_decode_active()
+    }
+
+    fn decode_thumbnail(
+        &mut self,
+        target_secs: f64,
+        cancel: &AtomicBool,
+        log_label: &str,
+    ) -> Result<Option<TileThumbnail>, String> {
+        use ffmpeg::format::Pixel;
+        use ffmpeg::software::scaling::{Context as ScaleContext, Flags as ScaleFlags};
+        use ffmpeg::util::frame::video::Video;
+        use ffmpeg_the_third as ffmpeg;
+
         let target_pts = (target_secs * 1_000_000.0) as i64;
         let seek_ok = unsafe {
             use ffmpeg::ffi::{AVSEEK_FLAG_BACKWARD, av_seek_frame};
             av_seek_frame(
-                input.as_mut_ptr(),
+                self.input.as_mut_ptr(),
                 -1,
                 target_pts,
                 AVSEEK_FLAG_BACKWARD as i32,
             ) >= 0
         };
         if !seek_ok {
-            continue;
+            return Ok(None);
         }
-        decoder.flush();
+        self.decoder.decoder_mut().flush();
 
         let mut got_frame: Option<Video> = None;
         let mut last_frame: Option<Video> = None;
+        let hw_decode_active = self.hw_decode_active();
         // backward seek 後の keyframe から target_secs に到達する frame まで decode
         // し続ける。decode 数に上限は設けない: 長い GOP (実測 5.5s ≈ 165 frame の
         // 動画あり) でも必ず target のフレームを採用するため。上限を置くと GOP 長に
         // よってサムネが実位置からずれる。worker は cancel フラグを 1 パケットごとに
         // 確認するので、別 interval / 動画への切替時は自然終了する。
-        for item in input.packets() {
+        for item in self.input.packets() {
             if cancel.load(Ordering::Acquire) {
-                return;
+                return Ok(None);
             }
             let (stream, packet) = match item {
                 Ok(sp) => sp,
                 Err(_) => break,
             };
-            if stream.index() != stream_idx {
+            if stream.index() != self.stream_idx {
                 continue;
             }
-            if decoder.send_packet(&packet).is_err() {
+            if let Err(e) = self.decoder.decoder_mut().send_packet(&packet) {
+                if hw_decode_active {
+                    return Err(format!("HW send_packet failed: {e}"));
+                }
                 continue;
             }
             let mut frame = Video::empty();
-            while decoder.receive_frame(&mut frame).is_ok() {
+            while self.decoder.decoder_mut().receive_frame(&mut frame).is_ok() {
                 // 再生デコーダと同じ best-effort timestamp を使う。PTS 欠落系の
                 // AVI/ASF/古い DivX で `frame.pts()` が None になり、判定が壊れて
                 // 全タイルが EOF まで走るのを防ぐ。timestamp が全く取れない壊れた
@@ -375,7 +521,7 @@ fn run_worker(
                     got_frame = Some(frame);
                     break;
                 };
-                let pts_secs = ts as f64 * tb_num / tb_den;
+                let pts_secs = ts as f64 * self.tb_num / self.tb_den;
                 // クリックで target_secs にシークしたとき表示される frame と一致
                 // させるため「target_secs 以降の最初の frame」を採用する。以前は
                 // `target_secs - 0.5` で 0.5s 手前の frame を拾っていた。
@@ -394,101 +540,62 @@ fn run_worker(
             }
         }
         let Some(frame) = got_frame.or(last_frame) else {
-            continue;
+            return Ok(None);
         };
         // HW (D3D11) frame は SW download してから scaler に渡す。SW frame はそのまま。
         let mut sw_holder: Option<Video> = None;
-        let frame_for_scaler = match crate::video::swscale_helpers::prepare_frame_for_swscale(
-            &frame,
-            &mut sw_holder,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                crate::logger::log(format!("video-tile-thumb: {e}"));
-                continue;
-            }
-        };
-        // scaler を lazy 構築 / src_fmt 変化時に再構築。
+        let frame_for_scaler =
+            crate::video::swscale_helpers::prepare_frame_for_swscale(&frame, &mut sw_holder)
+                .map_err(|e| e.to_string())?;
+        // `decoder.format()` ベースの事前 scaler 構築は HW accel attach 時に
+        // `Pixel::D3D11` を返して swscale `av_assert0` → `abort()` を踏むため、
+        // **最初の frame を取った後の `frame.format()` で scaler を lazy 構築** する。
         let cur_src_fmt = frame_for_scaler.format();
-        if scaler.is_none() || scaler_src_fmt != Some(cur_src_fmt) {
+        if self.scaler.is_none() || self.scaler_src_fmt != Some(cur_src_fmt) {
             crate::logger::log(format!(
-                "video-tile-thumb: -> ScaleContext::get src_fmt={cur_src_fmt:?} src_size={src_w}x{src_h} dst_size={dst_w}x{dst_h}"
+                "{log_label}: -> ScaleContext::get src_fmt={cur_src_fmt:?} src_size={}x{} dst_size={}x{}",
+                self.src_w, self.src_h, self.dst_w, self.dst_h
             ));
-            match ScaleContext::get(
+            let scaler = ScaleContext::get(
                 cur_src_fmt,
-                src_w,
-                src_h,
+                self.src_w,
+                self.src_h,
                 Pixel::RGBA,
-                dst_w,
-                dst_h,
+                self.dst_w,
+                self.dst_h,
                 ScaleFlags::BILINEAR,
-            ) {
-                Ok(s) => {
-                    scaler = Some(s);
-                    scaler_src_fmt = Some(cur_src_fmt);
-                    crate::logger::log("video-tile-thumb: <- ScaleContext::get ok");
-                }
-                Err(e) => {
-                    crate::logger::log(format!("video-tile-thumb: sws_scale init failed: {e}"));
-                    continue;
-                }
-            }
+            )
+            .map_err(|e| format!("sws_scale init failed: {e}"))?;
+            self.scaler = Some(scaler);
+            self.scaler_src_fmt = Some(cur_src_fmt);
+            crate::logger::log(format!("{log_label}: <- ScaleContext::get ok"));
         }
-        let scaler_ref = scaler.as_mut().expect("scaler initialized above");
+        let scaler_ref = self.scaler.as_mut().expect("scaler initialized above");
         let mut rgba = Video::empty();
-        if scaler_ref.run(frame_for_scaler, &mut rgba).is_err() {
-            continue;
-        }
+        scaler_ref
+            .run(frame_for_scaler, &mut rgba)
+            .map_err(|e| format!("sws_scale failed: {e}"))?;
+
         let stride = rgba.stride(0);
-        let needed = (dst_w * 4) as usize;
+        let needed = (self.dst_w * 4) as usize;
         let plane = rgba.data(0);
         let buf: Vec<u8> = if stride == needed {
-            plane[..needed * dst_h as usize].to_vec()
+            plane[..needed * self.dst_h as usize].to_vec()
         } else {
-            let mut out = Vec::with_capacity(needed * dst_h as usize);
-            for row in 0..dst_h as usize {
+            let mut out = Vec::with_capacity(needed * self.dst_h as usize);
+            for row in 0..self.dst_h as usize {
                 let start = row * stride;
                 out.extend_from_slice(&plane[start..start + needed]);
             }
             out
         };
-        // Phase 6.D-2: 抽出済 RGBA を WebP に encode してキャッシュに書く
-        // (失敗しても extraction 経路は止まらない)。Phase 8.C: 絶対 PTS キー化。
-        if let Some(c) = cache.as_ref() {
-            let encoder = webp::Encoder::from_rgba(&buf, dst_w, dst_h);
-            // q=70: グリッドサムネと同等品位、サイズ優先
-            let webp_bytes = encoder.encode(70.0).to_vec();
-            let timestamp_ms = (target_secs * 1000.0).round() as i64;
-            let store_result = match c.write_kind {
-                CacheWriteKind::Tile => {
-                    c.cache
-                        .store_webp(&path, max_w, timestamp_ms, video_mtime, dst_h, &webp_bytes)
-                }
-                CacheWriteKind::Resume => c.cache.store_resume_webp(
-                    &path,
-                    max_w,
-                    timestamp_ms,
-                    video_mtime,
-                    dst_h,
-                    &webp_bytes,
-                ),
-            };
-            if let Err(e) = store_result {
-                crate::logger::log(format!("video-tile-thumb cache store failed: {e}"));
-            }
-        }
 
-        let thumb = TileThumbnail {
+        Ok(Some(TileThumbnail {
             pts_secs: target_secs,
-            width: dst_w,
-            height: dst_h,
+            width: self.dst_w,
+            height: self.dst_h,
             rgba: Arc::new(buf),
-        };
-        if let Ok(mut s) = state.lock() {
-            if idx < s.len() {
-                s[idx] = Some(thumb);
-            }
-        }
+        }))
     }
 }
 

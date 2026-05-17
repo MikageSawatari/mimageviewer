@@ -175,6 +175,7 @@ impl App {
             timestamps.clone(),
             extract_w,
             extract_h,
+            self.settings.video_hw_decode,
             cache,
             video_mtime,
         );
