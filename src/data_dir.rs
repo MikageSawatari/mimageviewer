@@ -66,14 +66,75 @@ pub fn test_override_lock() -> std::sync::MutexGuard<'static, ()> {
     mu.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// 軽量な data_dir override 用 RAII ガード (test only)。`settings_db` を触らない
+/// テスト (e.g. `archive_cache::cache_zip_path_uses_basename`) から呼ぶ。
+///
+/// 2026-05-17 事故ガード対応 (`data_dir::default()` の `cfg(test)` panic) を回避するため、
+/// `data_dir::get()` を呼ぶ全ての unit test は入り口でこのガードを取って TEST_OVERRIDE
+/// を設定すること。Drop で override 解除 + lock 解放。
+///
+/// `settings_db` の `DataDirOverrideGuard` (= GLOBAL_DB / SAVE_SUPPRESSED もリセット)
+/// と違って **TEST_OVERRIDE と lock しか触らない** ので、settings DB を使うテストには
+/// 機能不足。settings DB に触るテストは `settings_db` 側のガードを使うこと。
+#[cfg(test)]
+pub struct TestDataDirGuard {
+    _tmp: tempfile::TempDir,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TestDataDirGuard {
+    pub fn new() -> Self {
+        let lock = test_override_lock();
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        set_test_override(Some(tmp.path().to_path_buf()));
+        Self {
+            _tmp: tmp,
+            _lock: lock,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn path(&self) -> &Path {
+        self._tmp.path()
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestDataDirGuard {
+    fn drop(&mut self) {
+        set_test_override(None);
+    }
+}
+
 /// ログ用サブディレクトリ `<data_dir>/logs` を返す。
 pub fn logs_dir() -> PathBuf {
     get().join("logs")
 }
 
 fn default() -> PathBuf {
-    let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(appdata).join("mimageviewer")
+    // 2026-05-17 事故ガード (cfg(test)): テストで `set_test_override(Some(temp))` を
+    // 呼び忘れたまま `data_dir::get()` に落ちると、ここで本物の %APPDATA%\mimageviewer
+    // を返してしまい、後段の Settings::load() / with_db() がユーザーの本番 settings.db
+    // を上書きする経路に入る (実害: 2026-05-16 夜の cargo test 中に発生)。
+    // テストでは default() に到達した時点で fail-fast させて、override を書き忘れた
+    // unit test を機械的に検出する。本番ビルドでは従来どおり %APPDATA% を返す。
+    //
+    // integration tests (tests/*.rs) はリンク時に `cfg(test)` が false の lib を
+    // 使うのでこの panic は発火しない。代わりに、library 公開 API は data_dir
+    // パラメータを明示的に受け取る (`IndexerManager::new_at` 等) ので、
+    // `data_dir::get()` には到達しない設計。
+    #[cfg(test)]
+    panic!(
+        "data_dir::default() reached in cfg(test) build. Tests must call \
+         data_dir::set_test_override(Some(temp_dir)) before any code path that hits \
+         data_dir::get() — otherwise the test would touch the real %APPDATA%."
+    );
+    #[cfg(not(test))]
+    {
+        let appdata = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(appdata).join("mimageviewer")
+    }
 }
 
 /// `include_bytes!` で埋め込んだファイルを指定パスに展開する。

@@ -505,6 +505,9 @@ mod tests {
 
     #[test]
     fn cache_zip_path_uses_basename() {
+        // 2026-05-17: `cache_zip_path_for` 内部の `cache_root()` が `data_dir::get()` を
+        // 呼ぶので、`cfg(test)` の panic ガード回避のため override を立てる。
+        let _g = crate::data_dir::TestDataDirGuard::new();
         let p = cache_zip_path_for(Path::new(r"C:\archives\manga_vol01.7z"));
         assert!(p.to_string_lossy().ends_with("manga_vol01.zip"));
     }

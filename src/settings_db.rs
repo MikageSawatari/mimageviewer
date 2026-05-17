@@ -2416,14 +2416,24 @@ pub(crate) fn set_global_db(data_dir: &Path, db: Option<Arc<SettingsDb>>) {
 /// グローバル `SettingsDb` ハンドルを使って closure を実行する。
 ///
 /// **Phase 2 以降**: `boot_settings_db` が予め global を populate しているので、
-/// `with_db` は populate された Arc を取り出すだけ。Boot 以前 (=旧 Phase 1 互換) や
-/// test override で `data_dir::get()` が変わったケースでは、`SettingsDb::open()` を
-/// lazy に試みる。open に失敗したら `Transient` 等が伝搬する。
+/// `with_db` は populate された Arc を取り出すだけ。`GLOBAL_DB` が **None** の
+/// ケース (= 旧 Phase 1 互換、または test setup が `reset_global_for_test` で
+/// クリアした直後) では boot decision tree を経由して lazy に populate する。
 ///
 /// **save 抑止状態** (Codex P2 v8b-3 2026-05-14): `SAVE_SUPPRESSED` が立っている間は
 /// `SettingsDbError::SaveSuppressed` を返し、lazy re-open を試みない。これで
 /// `boot_settings_db` が FailedFallbackDefault を返した後、Phase 3 caller が誤って
 /// defaults を DB に書き戻すのを防ぐ。
+///
+/// **data_dir 変更検知** (2026-05-17 事故対応): `GLOBAL_DB` が `Some(old_dir, _)` を
+/// 保持しているのに `data_dir::get()` が別 dir を返した場合、process 中に data_dir が
+/// **入れ替わった** ことを意味する。本番では DATA_DIR が `OnceLock` で固定されており
+/// 起き得ない。test override の不整合 (TEST_OVERRIDE をクリアしたのに GLOBAL_DB に旧
+/// dir の handle が残った状態) で発生する。旧仕様はここで `boot_settings_db_inner` を
+/// new dir に対して再実行し、結果を GLOBAL_DB に差し替えてから caller の save_full を
+/// 続行していたが、これだと「test 用 in-memory state を本番 APPDATA の settings.db に
+/// 書き出す」事故が起きる (2026-05-16 夜、cargo test 中に実害)。fail-fast に倒して
+/// `SAVE_SUPPRESSED` を永続的に立てる。
 ///
 /// - 内部 lock は `Arc<SettingsDb>` を clone する間だけ。closure 実行中は
 ///   global lock を持たない (= 並列 `with_db` がブロックしない)
@@ -2434,33 +2444,41 @@ pub fn with_db<R>(f: impl FnOnce(&SettingsDb) -> R) -> Result<R, SettingsDbError
     let db_arc: Arc<SettingsDb> = {
         let mut guard = GLOBAL_DB.lock().map_err(|_| SettingsDbError::Poisoned)?;
         let current_dir = crate::data_dir::get();
-        let need_reopen = guard.as_ref().map(|(d, _)| d) != Some(&current_dir);
-        if need_reopen {
-            // T43 (Codex P2 / 2026-05-16): data_dir 切替後の lazy re-open は
-            // boot decision tree (bak fallback / JSON migration / quarantine) を
-            // バイパスする非対称。本番動線で data_dir は process 中に変わらず、test
-            // override (`reset_global_for_test`) でクリアされた場合のみ Some(current_dir)
-            // != guard.dir になる想定。ここで `SettingsDb::open` を直叩きすると、
-            // 壊れた DB を quarantine しないまま握ってしまう (= save が壊れた DB に書く)。
-            // boot を経由するため `boot_settings_db_inner` を呼んで結果を set_global_db
-            // 経由で GLOBAL_DB に反映する。
+        // `GLOBAL_DB` の状態を 3 ケースに分類する:
+        //   (a) None                       → lazy first boot (test setup 直後など)
+        //   (b) Some((d, _)) where d == c  → 既に populate 済み、そのまま使う
+        //   (c) Some((d, _)) where d != c  → data_dir 変更検知、fail-fast
+        let mismatched_old: Option<PathBuf> = match guard.as_ref() {
+            Some((d, _)) if d != &current_dir => Some(d.clone()),
+            _ => None,
+        };
+        if let Some(old_dir) = mismatched_old {
+            // (c) data_dir が process 内で入れ替わった = 異常状態。
+            // 詳細は関数 doc の "data_dir 変更検知" 節参照。
             log_diag(&format!(
-                "settings_db: with_db: data_dir changed (was={:?}, new={}); routing through boot decision tree",
-                guard.as_ref().map(|(d, _)| d.display().to_string()),
+                "settings_db: with_db: data_dir changed (was={}, new={}); \
+                 refusing to re-route — set_save_suppressed and return SaveSuppressed",
+                old_dir.display(),
                 current_dir.display(),
             ));
-            // boot inner は global lock を握り直そうとするので、ここで guard を一度 drop してから呼ぶ
+            drop(guard);
+            set_save_suppressed(true);
+            return Err(SettingsDbError::SaveSuppressed);
+        }
+        if guard.is_none() {
+            // (a) GLOBAL_DB が空 → 初回 lazy boot。boot decision tree を経由する。
+            // (本番では main の Settings::load() が事前に populate するので
+            //  この経路は test 専用。)
             drop(guard);
             let outcome = boot_settings_db_inner(&current_dir);
             set_global_db(&current_dir, outcome.db.clone());
             if save_suppressed() {
                 return Err(SettingsDbError::SaveSuppressed);
             }
-            // 再取得
             guard = GLOBAL_DB.lock().map_err(|_| SettingsDbError::Poisoned)?;
         }
-        // unwrap: 直前で必ず Some を入れている、または既に Some。
-        Arc::clone(&guard.as_ref().expect("just set or already Some").1)
+        // (b) 既に populate 済み、または上で populate したので必ず Some。
+        Arc::clone(&guard.as_ref().expect("populated above or already Some").1)
     };
     Ok(f(&db_arc))
 }
@@ -2653,8 +2671,11 @@ mod tests {
         // Codex P2 v3 (2026-05-13): family が見える / 見えないに関わらず、main DB が
         // 存在しない状態で `SettingsDb::open()` を呼んでも **空の DB を作って成功させない**。
         // 必ず Transient で失敗し、上層の save 抑止経路に届くこと。
-        let dir = TempDir::new().unwrap();
-        let err = match SettingsDb::open(dir.path()) {
+        // 2026-05-17: DataDirOverrideGuard で TEST_OVERRIDE を立てて log_diag が
+        // data_dir::default() の panic ガードに当たらないようにする。
+        let guard = DataDirOverrideGuard::new();
+        let dir = guard.path();
+        let err = match SettingsDb::open(dir) {
             Ok(_) => panic!("open() should not create a new DB when main is missing"),
             Err(e) => e,
         };
@@ -2663,7 +2684,7 @@ mod tests {
             "expected Transient (file missing), got: {err:?}"
         );
         // 副作用として settings.db を物理的に作っていないことを確認 (= CREATE フラグなし)。
-        assert!(!dir.path().join("settings.db").exists());
+        assert!(!dir.join("settings.db").exists());
     }
 
     #[test]
@@ -3460,6 +3481,10 @@ mod tests {
     #[test]
     fn classify_open_error_categories() {
         // Codex P1 (2026-05-13) 補強: 分類関数の挙動が spec §5.1 と一致するか直接確認する。
+        // 2026-05-17: 後段で `classify_rusqlite_error_for_open` を呼ぶと内部で `log_diag`
+        // → `data_dir::get()` が走るので、`DataDirOverrideGuard` で TEST_OVERRIDE を立てて
+        // default() の panic ガードを回避する。
+        let _guard = DataDirOverrideGuard::new();
         fn make_err(code: rusqlite::ErrorCode) -> rusqlite::Error {
             rusqlite::Error::SqliteFailure(
                 rusqlite::ffi::Error {
@@ -3865,6 +3890,44 @@ mod tests {
         assert_eq!(outcome.source, BootSource::CleanInstall);
         assert!(!save_suppressed());
         with_db(|_db| ()).expect("with_db should succeed after a fresh boot");
+    }
+
+    /// 2026-05-17 事故ガード回帰テスト: `with_db` は `GLOBAL_DB` の dir と
+    /// `data_dir::get()` の不一致を検出したら `SaveSuppressed` を返し、
+    /// `SAVE_SUPPRESSED` を永続的に立てること。旧仕様の「new dir に re-boot して
+    /// 再ルートする」は本番 APPDATA を defaults で踏み潰す事故 (2026-05-16 夜) を
+    /// 起こすので塞いだ。
+    #[test]
+    fn with_db_data_dir_mismatch_suppresses_save() {
+        // 1) 最初の dir で boot して GLOBAL_DB = Some((dir_a, db_a)) にする。
+        let guard_a = DataDirOverrideGuard::new();
+        let outcome = boot_settings_db(guard_a.path());
+        assert_eq!(outcome.source, BootSource::CleanInstall);
+        assert!(outcome.db.is_some());
+        assert!(!save_suppressed());
+
+        // 2) GLOBAL_DB は (dir_a, _) のまま、`TEST_OVERRIDE` だけ別 dir に差し替える。
+        //    DataDirOverrideGuard::Drop は GLOBAL_DB を None にしてしまうので、ここでは
+        //    `set_test_override` だけを直接呼んで「TEST_OVERRIDE と GLOBAL_DB が
+        //    不一致」状態を意図的に作る。
+        let tmp_b = tempfile::TempDir::new().expect("tempdir b");
+        crate::data_dir::set_test_override(Some(tmp_b.path().to_path_buf()));
+
+        // 3) with_db を呼ぶと "data_dir changed" 検知で SaveSuppressed を返すこと。
+        let err = with_db(|_db| ()).expect_err("with_db should refuse mismatched data_dir");
+        assert!(
+            matches!(err, SettingsDbError::SaveSuppressed),
+            "expected SaveSuppressed, got: {err:?}"
+        );
+        // 4) `SAVE_SUPPRESSED` は立ったままで、続く with_db も即 fail する。
+        assert!(save_suppressed());
+        let err2 = with_db(|_db| ()).expect_err("after suppression, with_db keeps failing");
+        assert!(matches!(err2, SettingsDbError::SaveSuppressed));
+
+        // 5) `guard_a` の Drop で GLOBAL_DB / TEST_OVERRIDE / SAVE_SUPPRESSED が片付く。
+        //    GLOBAL_DB は dir_a の handle を持ったまま test を抜けるので、Drop が
+        //    `reset_global_for_test()` で確実にクリアする必要がある (旧 app/tests.rs
+        //    の OverrideGuard はこれを呼んでおらず、2026-05-17 事故の遠因だった)。
     }
 
     #[test]

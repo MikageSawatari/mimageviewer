@@ -450,25 +450,63 @@ mod phase_c_support {
     use super::{App, AppTestConfig};
     use tempfile::TempDir;
 
-    /// テスト終了時に必ず `data_dir::set_test_override(None)` を呼ぶ RAII ガード。
+    /// テスト終了時に `data_dir::set_test_override(None)` + `reset_global_for_test()` +
+    /// `set_save_suppressed(false)` を呼ぶ RAII ガード。
     /// panic 経路でも確実にオーバーライドを解除して後続テストに影響させない。
+    ///
+    /// 2026-05-17 事故ガード: 旧版は `set_test_override(None)` のみで、`GLOBAL_DB` の
+    /// 旧 dir handle が残った状態で `App` の drop 中の save が `with_db` で
+    /// data_dir 不一致を踏む経路があった。`settings_db::DataDirOverrideGuard` (こちらも
+    /// `reset_global_for_test` + `set_save_suppressed(false)` を呼ぶ) と挙動を揃える。
     pub(super) struct OverrideGuard;
     impl Drop for OverrideGuard {
         fn drop(&mut self) {
             crate::data_dir::set_test_override(None);
+            crate::settings_db::reset_global_for_test();
+            crate::settings_db::set_save_suppressed(false);
         }
     }
 
-    /// TempDir を data_dir として差し替え、空の settings で App を構築する。
-    /// TempDir / OverrideGuard / App は declared order と逆順で drop されるので、
-    /// App (supervisor join 含む) → OverrideGuard (data_dir clear) → TempDir (削除)
-    /// の正しい順序で片付く。
-    pub(super) fn setup_app() -> (
-        App,
-        OverrideGuard,
-        TempDir,
-        std::sync::MutexGuard<'static, ()>,
-    ) {
+    /// TempDir を data_dir として差し替え、空の settings で App を構築した結果を保持する。
+    ///
+    /// **フィールドの宣言順がそのまま drop 順** (Rust spec: struct fields are dropped in
+    /// declaration order)。`App` を最先頭に置いて supervisor join まで完了させたあとで
+    /// `OverrideGuard` (TEST_OVERRIDE クリア) → `TempDir` (削除) → `MutexGuard` (lock 解放)
+    /// の順に片付く。
+    ///
+    /// 2026-05-17 事故ガード: 旧 `setup_app()` は `(App, OverrideGuard, TempDir, MutexGuard)`
+    /// のタプル戻りだったが、`let app = setup_app();` の tuple destructure は
+    /// **右から左** に drop するので、実際は `_l → _tmp → _g → app` の順だった。これだと
+    /// `OverrideGuard` が `App` より先に drop して `TEST_OVERRIDE = None` になり、その後の
+    /// `App::drop()` で動く supervisor / worker の最終 save が `with_db` で「data_dir が
+    /// temp → APPDATA に変わった」と検知して本番 settings.db を defaults で上書きする事故が
+    /// 起きた。`with_db` 側にも fail-fast ガード ([crate::settings_db]) を入れてあるが、
+    /// 二重防御として drop 順自体を fix している。
+    pub(super) struct AppTestEnv {
+        pub app: App,
+        _guard: OverrideGuard,
+        /// Test 本体から `app.tmp.path()` の形でアクセスできるよう公開している
+        /// (App には `tmp` フィールドが無いので名前衝突しない)。
+        pub tmp: TempDir,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    /// `app.foo()` / `app.field` / `&mut app` を `App` への deref coercion で
+    /// 透過させる。これで旧 `let (mut app, ...) = setup_app();` パターンを
+    /// `let mut app = setup_app();` に書き換えるだけで他の test body は変更不要。
+    impl std::ops::Deref for AppTestEnv {
+        type Target = App;
+        fn deref(&self) -> &App {
+            &self.app
+        }
+    }
+    impl std::ops::DerefMut for AppTestEnv {
+        fn deref_mut(&mut self) -> &mut App {
+            &mut self.app
+        }
+    }
+
+    pub(super) fn setup_app() -> AppTestEnv {
         let lock = crate::data_dir::test_override_lock();
         let tmp = TempDir::new().expect("tempdir");
         crate::data_dir::set_test_override(Some(tmp.path().to_path_buf()));
@@ -478,7 +516,12 @@ mod phase_c_support {
             settings: None,
         };
         let app = App::new_for_test(config);
-        (app, guard, tmp, lock)
+        AppTestEnv {
+            app,
+            _guard: guard,
+            tmp,
+            _lock: lock,
+        }
     }
 }
 
@@ -490,7 +533,7 @@ mod phase_c_key_tests {
     /// ベースライン: 新規 App はどの検索バーも開いていないこと。
     #[test]
     fn new_app_has_no_search_bar_open() {
-        let (app, _g, _tmp, _l) = setup_app();
+        let app = setup_app();
         assert!(!app.show_search_bar, "Ctrl+F bar must be closed");
         assert!(!app.favsearch.active, "Ctrl+S bar must be closed");
         assert!(!app.global_search.active, "Ctrl+G bar must be closed");
@@ -499,7 +542,7 @@ mod phase_c_key_tests {
     /// Ctrl+F 相当の起動ヘルパを呼ぶと Ctrl+F バーのみが立ち、他 2 つは閉じたままであること。
     #[test]
     fn open_local_metadata_search_activates_only_ctrl_f() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.open_local_metadata_search();
         assert!(app.show_search_bar);
         assert!(!app.favsearch.active);
@@ -509,7 +552,7 @@ mod phase_c_key_tests {
     /// Ctrl+S 相当の起動ヘルパを呼ぶと Ctrl+S バーのみが立つこと。
     #[test]
     fn open_favsearch_activates_only_ctrl_s() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.open_favsearch();
         assert!(!app.show_search_bar);
         assert!(app.favsearch.active);
@@ -519,7 +562,7 @@ mod phase_c_key_tests {
     /// Ctrl+G 相当の起動ヘルパを呼ぶと Ctrl+G バーのみが立つこと。
     #[test]
     fn open_global_search_activates_only_ctrl_g() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.open_global_search();
         assert!(!app.show_search_bar);
         assert!(!app.favsearch.active);
@@ -530,7 +573,7 @@ mod phase_c_key_tests {
     /// Ctrl+F だけが残ること (相互排他、2026-04 バグ回帰ガード)。
     #[test]
     fn ctrl_f_closes_ctrl_s_and_ctrl_g() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.open_favsearch();
         app.open_global_search();
         assert!(!app.favsearch.active, "Ctrl+G should have closed Ctrl+S");
@@ -545,7 +588,7 @@ mod phase_c_key_tests {
     /// Ctrl+S だけが残ること (回帰)。
     #[test]
     fn ctrl_s_closes_ctrl_f() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.open_local_metadata_search();
         assert!(app.show_search_bar);
         app.open_favsearch();
@@ -558,7 +601,7 @@ mod phase_c_key_tests {
     /// Ctrl+G だけが残ること (回帰)。
     #[test]
     fn ctrl_g_closes_ctrl_f() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.open_local_metadata_search();
         app.open_global_search();
         assert!(app.global_search.active);
@@ -570,7 +613,7 @@ mod phase_c_key_tests {
     /// `execute_favsearch` が UI と整合を取るために filter を None にクリアする。
     #[test]
     fn favsearch_clears_stale_favorite_filter() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         // 存在しない UUID を filter に立てて search を走らせる
         let bogus = uuid::Uuid::new_v4();
         app.favsearch.favorite_filter = Some(bogus);
@@ -586,7 +629,7 @@ mod phase_c_key_tests {
     /// いなくなったら、`spawn_global_search` が filter を None にクリアする。
     #[test]
     fn global_search_clears_stale_favorite_filter() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let bogus = uuid::Uuid::new_v4();
         app.global_search.active = true;
         app.global_search.filters.favorite = Some(bogus);
@@ -604,7 +647,7 @@ mod phase_c_key_tests {
     /// 2026-04 報告「検索バーが 2 つでることがあった」の総合回帰ガード。
     #[test]
     fn at_most_one_search_bar_ever_active() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let check_invariant = |app: &App, label: &str| {
             let count = [
                 app.show_search_bar,
@@ -673,7 +716,7 @@ mod phase_c_drill_nav_tests {
     /// スキップして検索結果に戻ってしまう。
     #[test]
     fn bs_after_opening_pdf_in_drilled_returns_to_folder_not_aggregated() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let folder_path = std::path::PathBuf::from("C:/fav/scansnap");
         let pdf_path = folder_path.join("doc.pdf");
 
@@ -723,7 +766,7 @@ mod phase_c_drill_nav_tests {
     /// advance_drilled_current_path 経路を通る想定)。
     #[test]
     fn bs_after_opening_zip_in_drilled_returns_to_folder_not_aggregated() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let folder_path = std::path::PathBuf::from("C:/fav/archives");
         let zip_path = folder_path.join("album.zip");
 
@@ -758,7 +801,7 @@ mod phase_c_drill_nav_tests {
     #[test]
     fn ctrl_down_at_container_end_jumps_to_next_container_root() {
         use crate::global_search_ui::GlobalSearchView;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.global_search.active = true;
 
         // コンテナ A: 直接ヒット 2 件 (件数で先頭になる)。
@@ -823,7 +866,7 @@ mod phase_c_drill_nav_tests {
     #[test]
     fn ctrl_down_within_container_descends_dfs() {
         use crate::global_search_ui::GlobalSearchView;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.global_search.active = true;
         // コンテナ root に直接ヒット + サブフォルダにもヒット。
         // parent_container 単位で見ると "root" と "root/sub" の 2 コンテナだが、
@@ -874,7 +917,7 @@ mod phase_c_drill_nav_tests {
     fn drilled_unrated_subfolder_hidden_when_unrated_filter_off() {
         use crate::global_search::GlobalHit;
         use crate::grid_item::GridItem;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/sub_unrated/a.jpg".into(),
@@ -918,7 +961,7 @@ mod phase_c_drill_nav_tests {
     #[test]
     fn unrated_folder_hidden_in_normal_view_under_star_only_filter() {
         use crate::grid_item::GridItem;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.items
             .push(GridItem::Folder(std::path::PathBuf::from("c:/some/folder")));
         let mut rf = [false; 6];
@@ -953,7 +996,7 @@ mod phase_c_drill_nav_tests {
     #[test]
     fn shift_f6_clears_current_folder_rating_when_visible_indices_empty() {
         use crate::grid_item::{GridItem, ThumbnailState};
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let folder = std::path::PathBuf::from("c:/pics");
         let image = folder.join("a.jpg");
         let key = crate::adjustment_db::normalize_path(&folder);
@@ -990,7 +1033,7 @@ mod phase_c_drill_nav_tests {
     #[test]
     fn ctrl_z_undoes_current_folder_rating_when_visible_indices_empty() {
         use crate::grid_item::{GridItem, ThumbnailState};
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let folder = std::path::PathBuf::from("c:/pics");
         let image = folder.join("a.jpg");
         let key = crate::adjustment_db::normalize_path(&folder);
@@ -1023,7 +1066,7 @@ mod phase_c_drill_nav_tests {
     fn bs_back_to_aggregated_restores_cursor_on_previous_container() {
         use crate::global_search::GlobalHit;
         use crate::grid_item::GridItem;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         // 2 つの SearchContainer を accumulate (folder_b の方を開く想定)
         app.global_search.active = true;
         app.global_search.accumulate_hit(&GlobalHit {
@@ -1064,7 +1107,7 @@ mod phase_c_drill_nav_tests {
     #[test]
     fn drill_back_within_suppression_anchor_keeps_filter_disabled() {
         use crate::global_search::GlobalHit;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         // ★5 フィルタ ON
         let mut rf = [false; 6];
         rf[5] = true;
@@ -1115,7 +1158,7 @@ mod phase_c_drill_nav_tests {
     #[test]
     fn streaming_rebuild_preserves_selected_and_checked_by_content_key() {
         use crate::grid_item::GridItem;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let initial = vec![
             GridItem::Image(std::path::PathBuf::from("c:/a.jpg")),
             GridItem::Image(std::path::PathBuf::from("c:/b.jpg")),
@@ -1155,7 +1198,7 @@ mod phase_c_drill_nav_tests {
     #[test]
     fn streaming_rebuild_clears_selected_when_item_disappears() {
         use crate::grid_item::GridItem;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let initial = vec![
             GridItem::Image(std::path::PathBuf::from("c:/a.jpg")),
             GridItem::Image(std::path::PathBuf::from("c:/b.jpg")),
@@ -1178,7 +1221,7 @@ mod phase_c_drill_nav_tests {
     #[test]
     fn rating_change_in_real_view_does_not_rebuild_search_items() {
         use crate::grid_item::GridItem;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         // Ctrl+G 中に実体ビュー (例: PDF を開いた直後の状態) を install_new_items 経由で構築
         app.global_search.active = true;
         let pdf_pages = vec![
@@ -1217,7 +1260,7 @@ mod phase_c_drill_nav_tests {
     /// drilled view が空にならない。
     #[test]
     fn search_container_drill_in_suppresses_rating_filter_when_container_starred() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         // ★5 フィルタ ON
         let mut rf = [false; 6];
         rf[5] = true;
@@ -1253,7 +1296,7 @@ mod phase_c_drill_nav_tests {
     /// Codex P2 スコープ外: コンテナ★が現フィルタを通らない場合は suppression しない。
     #[test]
     fn search_container_drill_in_does_not_suppress_when_rating_does_not_match() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         // ★5 フィルタ ON
         let mut rf = [false; 6];
         rf[5] = true;
@@ -1278,7 +1321,7 @@ mod phase_c_drill_nav_tests {
     #[test]
     fn rating_change_updates_global_search_hit_stars_snapshot() {
         use crate::global_search::GlobalHit;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.global_search.active = true;
         // 単一画像を accumulate (★3 で受信)
         app.global_search.accumulate_hit(&GlobalHit {
@@ -1311,7 +1354,7 @@ mod phase_c_drill_nav_tests {
     fn drilled_subfolder_badge_matches_normal_folder_semantics() {
         use crate::global_search::GlobalHit;
         use crate::grid_item::GridItem;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.global_search.active = true;
         // /root/sub に: ★なし 2 件、★2 が 1 件、★4 が 1 件 を accumulate
         app.global_search.accumulate_hit(&GlobalHit {
@@ -1375,7 +1418,7 @@ mod phase_c_drill_nav_tests {
     #[test]
     fn bs_back_falls_back_to_first_visible_when_target_missing() {
         use crate::global_search::GlobalHit;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/folder_a/x.jpg".into(),
@@ -1404,7 +1447,7 @@ mod phase_c_drill_nav_tests {
     fn bs_back_within_drilled_restores_cursor_on_previous_subfolder() {
         use crate::global_search::GlobalHit;
         use crate::grid_item::GridItem;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.global_search.active = true;
         // /root/sub1/x.jpg と /root/sub2/y.jpg のヒットを accumulate
         app.global_search.accumulate_hit(&GlobalHit {
@@ -1441,7 +1484,7 @@ mod phase_c_drill_nav_tests {
     /// view に影響しないこと (no-op)。
     #[test]
     fn advance_drilled_is_noop_when_not_in_drilled_view() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         assert!(matches!(
             app.global_search.view,
             GlobalSearchView::Aggregated
@@ -1476,7 +1519,7 @@ mod phase_c_drill_address_tests {
     /// 旧実装は raw PDF パス (`d:/.../...pdf`) が入っていた (2026-04 バグ)。
     #[test]
     fn address_shows_breadcrumb_after_opening_pdf_in_drilled() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let folder_path = std::path::PathBuf::from("d:/oldpc_backup/data2/scansnap");
         let pdf_path = folder_path.join("衛藤ヒロユキ_魔法陣グルグル01_ipad.pdf");
 
@@ -1545,7 +1588,7 @@ mod phase_c_drill_address_tests {
     /// address を書き換えないこと (本番経路で raw path が壊れない回帰ガード)。
     #[test]
     fn update_address_is_noop_when_ctrl_g_inactive() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.address = "C:/some/folder".to_string();
         app.update_global_search_address();
         assert_eq!(
@@ -1557,7 +1600,7 @@ mod phase_c_drill_address_tests {
     /// Aggregated 状態 → breadcrumb は N 件表示で、raw パスには戻らないこと。
     #[test]
     fn aggregated_address_shows_hit_count_not_raw_path() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.last_executed = "グルグル".to_string();
         app.global_search.accumulate_hit(&GlobalHit {
@@ -1583,7 +1626,7 @@ mod phase_c_drill_address_tests {
     /// address の件数表示にも検索中を出す。
     #[test]
     fn aggregated_address_marks_unsettled_results_as_searching() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.global_search.active = true;
         app.global_search.query = "グルグル".to_string();
         app.global_search.last_executed.clear();
@@ -1627,7 +1670,7 @@ mod favorite_adjustment_defaults_tests {
     /// effective_params は「個別 → お気に入り → global」の順で解決する。
     #[test]
     fn cascade_individual_beats_favorite_beats_global() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let fav = FavoriteEntry::new("test".to_string(), PathBuf::from("C:/pics"));
         let fav_id = fav.id;
         app.settings.favorites.push(fav);
@@ -1657,7 +1700,7 @@ mod favorite_adjustment_defaults_tests {
     /// 入れ子お気に入りでは最も近い祖先 (パス最長) が優先される。
     #[test]
     fn nested_favorite_picks_nearest_ancestor() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let outer = FavoriteEntry::new("outer".to_string(), PathBuf::from("C:/pics"));
         let inner = FavoriteEntry::new("inner".to_string(), PathBuf::from("C:/pics/ai"));
         let inner_id = inner.id;
@@ -1676,7 +1719,7 @@ mod favorite_adjustment_defaults_tests {
     /// resolve_adjust_scope は個別 > favorite > global の順に層を報告する。
     #[test]
     fn resolve_adjust_scope_picks_effective_layer() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
         let fav_id = fav.id;
         app.settings.favorites.push(fav);
@@ -1700,7 +1743,7 @@ mod favorite_adjustment_defaults_tests {
     /// 冗長なので自動的に解除され、スコープは FavoriteDefault になる (Codex P2 回帰)。
     #[test]
     fn set_favorite_default_collapses_redundant_page_override() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
         let fav_id = fav.id;
         app.settings.favorites.push(fav);
@@ -1733,7 +1776,7 @@ mod favorite_adjustment_defaults_tests {
     /// clear_favorite_default でそのお気に入り配下の、global と同値な個別もまとめて解除される。
     #[test]
     fn clear_favorite_default_collapses_overrides_matching_global() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
         let fav_id = fav.id;
         app.settings.favorites.push(fav);
@@ -1761,7 +1804,7 @@ mod favorite_adjustment_defaults_tests {
     /// 冗長判定を行う。お気に入り標準と一致する params を渡しても個別は作られない。
     #[test]
     fn set_page_params_drops_individual_when_matching_favorite_default() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
         let fav_id = fav.id;
         app.settings.favorites.push(fav);
@@ -1786,7 +1829,7 @@ mod favorite_adjustment_defaults_tests {
     /// ページ個別補正の Undo/Redo: 1 回スライダーを動かして Ctrl+Z で戻る、Ctrl+Y で戻し直し。
     #[test]
     fn page_adjustment_undo_redo_round_trip() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/a.jpg");
 
         // 初期: 個別なし
@@ -1821,7 +1864,7 @@ mod favorite_adjustment_defaults_tests {
     /// Undo するとお気に入り標準は元に戻り、かつ削除された個別ページも復元される。
     #[test]
     fn favorite_default_undo_restores_pruned_page_overrides() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let fav = FavoriteEntry::new("t".to_string(), PathBuf::from("C:/pics"));
         let fav_id = fav.id;
         app.settings.favorites.push(fav);
@@ -1867,7 +1910,7 @@ mod favorite_adjustment_defaults_tests {
     /// Codex P2 回帰: バルク操作 (apply_to_all / clear_all) も Undo に積まれる。
     #[test]
     fn bulk_apply_clear_all_pages_pushes_undo_entry() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let idx_a = push_image(&mut app, "C:/pics/a.jpg");
         let idx_b = push_image(&mut app, "C:/pics/b.jpg");
 
@@ -1905,7 +1948,7 @@ mod favorite_adjustment_defaults_tests {
     /// ぶら下がっていた redo は無効化される)。
     #[test]
     fn new_adjustment_op_clears_redo_stack() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let idx = push_image(&mut app, "C:/pics/a.jpg");
 
         // 操作 1: brightness=10
@@ -1933,7 +1976,7 @@ mod favorite_adjustment_defaults_tests {
     /// `is_meaningful` 抑止: 何も変化しない write_op は Undo に積まれない。
     #[test]
     fn no_op_write_does_not_push_undo() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let _idx = push_image(&mut app, "C:/pics/a.jpg");
         let undo_len_before = app.meta_undo.undo_len();
 
@@ -1951,7 +1994,7 @@ mod favorite_adjustment_defaults_tests {
     /// が `capture_adjust_full` でラップされ、N 枚の個別設定が 1 回の Ctrl+Z で全て戻る。
     #[test]
     fn grid_slot_apply_is_undoable() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let idx_a = push_image(&mut app, "C:/pics/a.jpg");
         let idx_b = push_image(&mut app, "C:/pics/b.jpg");
         // ratable_page_targets は visible_indices で絞るのでテストで埋めておく
@@ -1990,7 +2033,7 @@ mod favorite_adjustment_defaults_tests {
     /// before/after** で作られる。これにより Ctrl+Z が真の逆操作になる。
     #[test]
     fn tag_undo_uses_worker_actual_disk_state_not_optimistic_prediction() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let path = PathBuf::from("C:/pics/a.jpg");
 
         // 1) 操作開始: pending を register
@@ -2032,7 +2075,7 @@ mod favorite_adjustment_defaults_tests {
     /// 「実ディスクは変わっていないのに書き戻し命令が飛ぶ」事故を防ぐ)。
     #[test]
     fn tag_undo_skips_failed_writes() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let path_ok = PathBuf::from("C:/pics/ok.jpg");
 
         let tx = app.next_tag_tx_id();
@@ -2062,7 +2105,7 @@ mod favorite_adjustment_defaults_tests {
     /// 全件失敗した場合は Undo entry が積まれない (空エントリの抑止)。
     #[test]
     fn tag_undo_all_failed_pushes_no_entry() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let tx = app.next_tag_tx_id();
         app.register_pending_tag_op(tx, "all fail".into(), 2);
 
@@ -2078,7 +2121,7 @@ mod favorite_adjustment_defaults_tests {
     /// Ctrl+Z は真の disk 状態に戻る (#A は保持される)。
     #[test]
     fn tag_undo_chain_does_not_destroy_external_tags() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let path = PathBuf::from("C:/pics/a.jpg");
 
         // 操作 1: 外部で #A 付与済みの状態で mIV が #B トグル
@@ -2139,7 +2182,7 @@ mod favorite_adjustment_defaults_tests {
     /// 静かに drop し、Undo stack には影響しない。
     #[test]
     fn tag_undo_orphan_result_after_boundary_does_not_push() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let tx = app.next_tag_tx_id();
         app.register_pending_tag_op(tx, "abandoned".into(), 1);
 
@@ -2164,7 +2207,7 @@ mod favorite_adjustment_defaults_tests {
     /// N 枚の個別設定が 1 回の Ctrl+Z で全て復元される。
     #[test]
     fn grid_clear_selection_is_undoable() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let idx_a = push_image(&mut app, "C:/pics/a.jpg");
         let idx_b = push_image(&mut app, "C:/pics/b.jpg");
         app.visible_indices = vec![idx_a, idx_b];
@@ -2202,7 +2245,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn select_after_load_overrides_folder_history() {
         use crate::grid_item::GridItem;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.items.push(GridItem::Folder("c:/root/folderA".into()));
         app.items.push(GridItem::Folder("c:/root/folderB".into()));
         app.rebuild_visible_indices();
@@ -2235,7 +2278,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn try_select_after_load_returns_false_on_missing_name() {
         use crate::grid_item::GridItem;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.items.push(GridItem::Folder("c:/root/folderA".into()));
         app.rebuild_visible_indices();
         app.selected = None;
@@ -2256,7 +2299,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn close_fullscreen_restores_grid_cursor_to_current_video() {
         use crate::grid_item::GridItem;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
         app.items
@@ -2293,7 +2336,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn video_rating_roundtrips_through_rating_db() {
         use crate::grid_item::GridItem;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         // Video アイテムを 1 件登録
         app.items.push(GridItem::Video(std::path::PathBuf::from(
             "C:/clips/movie.mp4",
@@ -2345,7 +2388,7 @@ mod favorite_adjustment_defaults_tests {
     fn reset_erase_mode_restores_saved_spread_state() {
         use crate::grid_item::GridItem;
         use crate::settings::SpreadMode;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         // ペア: idx 0 (left), idx 1 (right) を仮想的に保存している状態を組み立てる。
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
@@ -2387,7 +2430,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn reset_erase_mode_leaves_spread_state_untouched_when_single_entry() {
         use crate::settings::SpreadMode;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.spread_mode = SpreadMode::Single;
         app.erase_spread_ctx = None;
         app.erase_mode = true;
@@ -2410,10 +2453,10 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn seed_virtual_folder_first_thumb_copies_pdf_thumb_from_parent() {
         use crate::grid_item::GridItem;
-        let (mut app, _g, tmp, _l) = setup_app();
+        let mut app = setup_app();
         // 親フォルダと PDF パスを準備 (実ファイルは要らない、catalog DB のキーだけが
         // 関心事)。
-        let parent_dir = tmp.path().join("parent");
+        let parent_dir = app.tmp.path().join("parent");
         std::fs::create_dir_all(&parent_dir).unwrap();
         let pdf_path = parent_dir.join("foo.pdf");
 
@@ -2491,8 +2534,8 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn seed_virtual_folder_first_thumb_no_parent_entry_is_noop() {
         use crate::grid_item::GridItem;
-        let (mut app, _g, tmp, _l) = setup_app();
-        let parent_dir = tmp.path().join("parent2");
+        let mut app = setup_app();
+        let parent_dir = app.tmp.path().join("parent2");
         std::fs::create_dir_all(&parent_dir).unwrap();
         let pdf_path = parent_dir.join("missing.pdf");
         let cache_dir = crate::catalog::default_cache_dir();
@@ -2523,8 +2566,8 @@ mod favorite_adjustment_defaults_tests {
     /// が親 catalog の `pdfthumb:foo.pdf` 行に WebP データを書き戻すこと。
     #[test]
     fn fire_virtual_folder_writeback_mirrors_to_parent() {
-        let (mut app, _g, tmp, _l) = setup_app();
-        let parent_dir = tmp.path().join("parent3");
+        let mut app = setup_app();
+        let parent_dir = app.tmp.path().join("parent3");
         std::fs::create_dir_all(&parent_dir).unwrap();
         let _pdf_path = parent_dir.join("bar.pdf");
         let cache_dir = crate::catalog::default_cache_dir();
@@ -2592,8 +2635,8 @@ mod favorite_adjustment_defaults_tests {
     /// クリアするだけにする (= 別フォルダに飛んで戻ったときの誤発火防止)。
     #[test]
     fn fire_virtual_folder_writeback_drops_stale_generation() {
-        let (mut app, _g, tmp, _l) = setup_app();
-        let parent_dir = tmp.path().join("parent4");
+        let mut app = setup_app();
+        let parent_dir = app.tmp.path().join("parent4");
         std::fs::create_dir_all(&parent_dir).unwrap();
         let cache_dir = crate::catalog::default_cache_dir();
         let parent_db_arc =
@@ -2630,8 +2673,8 @@ mod favorite_adjustment_defaults_tests {
     /// finalize シグナルが届かないため永続的に再発火しない、その場で諦める。
     #[test]
     fn fire_virtual_folder_writeback_clears_when_cache_map_empty() {
-        let (mut app, _g, tmp, _l) = setup_app();
-        let parent_dir = tmp.path().join("parent_empty");
+        let mut app = setup_app();
+        let parent_dir = app.tmp.path().join("parent_empty");
         std::fs::create_dir_all(&parent_dir).unwrap();
         let cache_dir = crate::catalog::default_cache_dir();
         let parent_db_arc =
@@ -2666,8 +2709,8 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn seed_skips_cache_map_when_parent_thumb_undecodable() {
         use crate::grid_item::GridItem;
-        let (mut app, _g, tmp, _l) = setup_app();
-        let parent_dir = tmp.path().join("parent_corrupt");
+        let mut app = setup_app();
+        let parent_dir = app.tmp.path().join("parent_corrupt");
         std::fs::create_dir_all(&parent_dir).unwrap();
         let pdf_path = parent_dir.join("corrupt.pdf");
         let cache_dir = crate::catalog::default_cache_dir();
@@ -2707,9 +2750,9 @@ mod favorite_adjustment_defaults_tests {
     /// DB には何も書き込まない。
     #[test]
     fn save_thumb_bytes_returns_false_for_undecodable() {
-        let (_app, _g, tmp, _l) = setup_app();
+        let app = setup_app();
         let cache_dir = crate::catalog::default_cache_dir();
-        let dir = tmp.path().join("save_thumb_test");
+        let dir = app.tmp.path().join("save_thumb_test");
         std::fs::create_dir_all(&dir).unwrap();
         let db = crate::catalog::CatalogDb::open(&cache_dir, &dir).unwrap();
         let bad: Vec<u8> = b"DEADBEEF-NOT-AN-IMAGE".to_vec();
@@ -2726,7 +2769,7 @@ mod favorite_adjustment_defaults_tests {
     /// その経路で本ヘルパが呼ばれることを別途確認する必要がある。
     #[test]
     fn release_fs_nav_lock_clears_both_fields() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.fs_nav_locked_gen = Some(42);
         app.fs_holdover_tex = None; // None でも問題ない
         app.release_fs_nav_lock();
@@ -2743,7 +2786,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn find_fullscreen_nav_target_returns_first_image() {
         use crate::grid_item::GridItem;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         // 並び: Folder, Image_a, Image_b, Image_c (visible_indices は items 全部)
         app.items.push(GridItem::Folder("c:/sub".into()));
         app.items
@@ -2767,7 +2810,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn find_fullscreen_nav_target_can_return_video() {
         use crate::grid_item::GridItem;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.items.push(GridItem::Folder("c:/sub".into()));
         app.items
             .push(GridItem::Video(std::path::PathBuf::from("c:/a.mp4")));
@@ -2828,7 +2871,7 @@ mod favorite_adjustment_defaults_tests {
     #[test]
     fn poll_fs_nav_lock_waits_for_items_generation_bump() {
         use crate::grid_item::{GridItem, ThumbnailState};
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let ctx = egui::Context::default();
         let dummy_tex = ctx.load_texture(
             "test_dummy",
@@ -2887,11 +2930,11 @@ mod favorite_adjustment_defaults_tests {
     /// 本キャッシュの回帰ガード。
     #[test]
     fn catalog_cache_reuses_arc_for_same_folder_and_evicts_oldest() {
-        let (mut app, _g, tmp, _l) = setup_app();
+        let mut app = setup_app();
         // tmp 配下に 18 個 (LRU 上限 16 を 2 つ超える) のフォルダを作る。
         let mut folders: Vec<std::path::PathBuf> = Vec::new();
         for i in 0..18 {
-            let p = tmp.path().join(format!("cat_{i:02}"));
+            let p = app.tmp.path().join(format!("cat_{i:02}"));
             std::fs::create_dir_all(&p).unwrap();
             folders.push(p);
         }
@@ -2934,7 +2977,7 @@ mod favorite_adjustment_defaults_tests {
     fn erase_inpaint_pending_keeps_jobs_for_different_pages() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         // 2 つの idx (0=左, 1=右) に対して dummy pending を入れる。
         let make_pending = |idx: usize| {
             let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
@@ -2988,7 +3031,7 @@ mod favorite_adjustment_defaults_tests {
     fn switch_erase_target_in_spread_moves_to_other_page_keeping_ctx() {
         use crate::grid_item::GridItem;
         use crate::settings::SpreadMode;
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         app.items
             .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
         app.items
@@ -3031,7 +3074,7 @@ mod favorite_adjustment_defaults_tests {
     /// Ctrl+G の検索入力欄で BS が `close_global_search` に流れて入力が破壊される。
     #[test]
     fn shortcuts_are_blocked_while_search_text_input_has_focus() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         // 全フォーカスフラグが false の初期状態ではブロックされない。
         assert!(!app.shortcuts_blocked_by_text_input());
         // Ctrl+F バー
@@ -3066,8 +3109,8 @@ mod favorite_adjustment_defaults_tests {
         use crate::grid_item::{GridItem, ThumbnailState};
         use std::sync::atomic::AtomicBool;
 
-        let (mut app, _g, tmp, _l) = setup_app();
-        let folder = tmp.path().join("delete_test_folder");
+        let mut app = setup_app();
+        let folder = app.tmp.path().join("delete_test_folder");
         std::fs::create_dir_all(&folder).unwrap();
         let target_path = folder.join("a.jpg");
         std::fs::write(&target_path, b"dummy").unwrap();
@@ -3122,7 +3165,7 @@ mod favorite_adjustment_defaults_tests {
     /// 左ページに +30 を設定 → 右ページにコピー → 右ページの effective が +30 になる。
     #[test]
     fn copy_spread_adjust_left_to_right() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let left = push_image(&mut app, "C:/pics/a.jpg");
         let right = push_image(&mut app, "C:/pics/b.jpg");
         app.set_page_params(left, params_with_brightness(30.0));
@@ -3143,7 +3186,7 @@ mod favorite_adjustment_defaults_tests {
     /// カスケード解決に任せる (DB が無駄に増えない)。
     #[test]
     fn copy_spread_adjust_clears_when_matches_default() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let left = push_image(&mut app, "C:/pics/a.jpg");
         let right = push_image(&mut app, "C:/pics/b.jpg");
         // 左はデフォルト (= global_preset = identity) のまま、右に +30 を設定。
@@ -3167,7 +3210,7 @@ mod favorite_adjustment_defaults_tests {
     /// Redo (Ctrl+Y) で再度コピーされる。
     #[test]
     fn copy_spread_adjust_undo_redo() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let left = push_image(&mut app, "C:/pics/a.jpg");
         let right = push_image(&mut app, "C:/pics/b.jpg");
         app.set_page_params(left, params_with_brightness(30.0));
@@ -3221,7 +3264,7 @@ mod native_video_rating_key_tests {
 
     #[test]
     fn native_video_fkeys_rate_current_video() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let ctx = egui::Context::default();
         let idx = push_video(&mut app, PathBuf::from(r"C:\clips\movie.mp4"));
         app.fullscreen_idx = Some(idx);
@@ -3235,7 +3278,7 @@ mod native_video_rating_key_tests {
 
     #[test]
     fn native_video_shift_fkeys_rate_current_container() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
         let ctx = egui::Context::default();
         let folder = PathBuf::from(r"C:\clips");
         app.current_folder = Some(folder.clone());
@@ -3266,7 +3309,7 @@ mod file_operation_selection_tests {
 
     #[test]
     fn checked_file_operation_paths_include_real_files_and_skip_virtual_pages() {
-        let (mut app, _g, _tmp, _l) = setup_app();
+        let mut app = setup_app();
 
         let folder = push_item(&mut app, GridItem::Folder(PathBuf::from(r"C:\books")));
         let image = push_item(&mut app, GridItem::Image(PathBuf::from(r"C:\books\a.jpg")));
