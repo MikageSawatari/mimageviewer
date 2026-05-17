@@ -58,7 +58,7 @@ Windows の現行動画フルスクリーンは native presenter 経路。
 | S | 動画タイルモード ON/OFF |
 | S タイルモード中のホイール | 前後アイテムへ移動。移動先も動画なら native presenter を保持して source 差し替え |
 | S タイルモード中の Ctrl+ホイール | タイル列数変更 |
-| S タイルモード中の ←→ / Ctrl+←→ / Enter | 青枠のタイルカーソルを 1 タイル / 1 行分移動し、Enter で再生開始。S / Esc で閉じるだけなら seek しない |
+| S タイルモード中の ←→ / Ctrl+←→ / Enter | 強調表示されたタイルカーソルを 1 タイル / 1 行分移動し、Enter で再生開始。S / Esc で閉じるだけなら seek しない |
 | 同一一覧の先頭 / 末尾 | native overlay toast で「最初/最後の項目です」+ Ctrl+↑↓ の案内を表示 |
 | Ctrl+G / Ctrl+S スコープ | `handle_fullscreen_ctrl_nav_context` 経由で検索スコープ移動に入る |
 

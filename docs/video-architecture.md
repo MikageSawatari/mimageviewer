@@ -1140,6 +1140,8 @@ overlay の中央 status に「メタデータ読込中...」「ストリーム�
 タイルモードの UI 描画は `native_presenter/overlay_draw.rs` の以下 2 関数で構成する:
 
 - `draw_native_tile_overlay` — 中央 preparing 文言とサムネイルグリッドを描画。
+  選択中のキーボードカーソルは、サムネイルだけでなく下の時刻ラベルまで含むセル背景を
+  黄橙系で強調し、時刻は暗色文字で描く。
   **`egui::Area` の order は `Order::Background` 固定**。グリッドは全画面を不透明黒で
   塗り、かつ全画面の click sense を登録するため、chrome (上部バー / toast =
   `Order::Foreground`) と同じ order に置くと、egui が click されたレイヤを

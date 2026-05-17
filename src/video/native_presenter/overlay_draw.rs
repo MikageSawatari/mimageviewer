@@ -2442,6 +2442,9 @@ pub(super) fn draw_native_tile_overlay(
 
             let columns = state.columns.max(1);
             let label_h = 16.0;
+            let label_text_y_offset = 3.0;
+            let cell_pad = 3.0;
+            let cell_bottom_pad = 5.0;
             let gap_x = 6.0;
             let gap_y = 6.0;
             let grid_left = 16.0;
@@ -2468,10 +2471,22 @@ pub(super) fn draw_native_tile_overlay(
                 let y0 = grid_top + (tile_h + label_h + gap_y) * row as f32;
                 let tile_rect =
                     egui::Rect::from_min_size(egui::pos2(x0, y0), egui::vec2(tile_w, tile_h));
-                if tile_rect.max.y > overlay_height_points - 20.0 {
+                if tile_rect.max.y > overlay_height_points - (label_h + cell_bottom_pad) {
                     continue;
                 }
+                let label_rect = egui::Rect::from_min_max(
+                    egui::pos2(tile_rect.min.x, tile_rect.max.y),
+                    egui::pos2(tile_rect.max.x, tile_rect.max.y + label_h),
+                );
+                let cell_rect = egui::Rect::from_min_max(
+                    tile_rect.min - egui::vec2(cell_pad, cell_pad),
+                    label_rect.max + egui::vec2(cell_pad, cell_bottom_pad),
+                );
+                let selected = selected_idx == Some(idx);
 
+                if selected {
+                    painter.rect_filled(cell_rect, 6.0, egui::Color32::from_rgb(255, 194, 62));
+                }
                 painter.rect_filled(tile_rect, 4.0, egui::Color32::from_rgb(28, 28, 32));
                 if let Some(texture_id) = tile_texture_ids.get(&idx) {
                     painter.image(
@@ -2498,15 +2513,19 @@ pub(super) fn draw_native_tile_overlay(
 
                 let pts = state.timestamps.get(idx).copied().unwrap_or(0.0);
                 painter.text(
-                    egui::pos2(tile_rect.center().x, tile_rect.max.y + label_h * 0.5),
+                    label_rect.center() + egui::vec2(0.0, label_text_y_offset),
                     egui::Align2::CENTER_CENTER,
                     format_overlay_time(pts),
                     egui::FontId::proportional(12.0),
-                    egui::Color32::from_rgb(220, 220, 220),
+                    if selected {
+                        egui::Color32::from_rgb(28, 22, 8)
+                    } else {
+                        egui::Color32::from_rgb(220, 220, 220)
+                    },
                 );
 
                 let resp = ui.interact(
-                    tile_rect,
+                    cell_rect,
                     egui::Id::new(("native_video_tile", idx)),
                     egui::Sense::click(),
                 );
@@ -2519,11 +2538,17 @@ pub(super) fn draw_native_tile_overlay(
                         egui::StrokeKind::Inside,
                     );
                 }
-                if selected_idx == Some(idx) {
+                if selected {
                     painter.rect_stroke(
-                        tile_rect.expand(2.0),
+                        tile_rect.expand(1.0),
                         5.0,
-                        egui::Stroke::new(3.0, egui::Color32::from_rgb(80, 170, 255)),
+                        egui::Stroke::new(2.0, egui::Color32::from_rgb(28, 22, 8)),
+                        egui::StrokeKind::Inside,
+                    );
+                    painter.rect_stroke(
+                        cell_rect,
+                        6.0,
+                        egui::Stroke::new(3.0, egui::Color32::from_rgb(255, 223, 96)),
                         egui::StrokeKind::Inside,
                     );
                 }
