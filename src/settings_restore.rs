@@ -337,6 +337,8 @@ pub fn restore_from(
     //    ケースがある (= 復元が部分巻き戻る)。canonical 名から確実に外してから main
     //    rename に進む。
     //
+    //    削除は SHM → WAL の順で行う。WAL は「未 checkpoint 分」を持つ本体なので
+    //    最後に消し、途中失敗で Recoverable へ戻る場合に WAL 適用後の現行状態を残す。
     //    main は未変更なので失敗時は Recoverable: suppress を巻き戻して、次回 with_db
     //    が lazy boot で同じ settings.db を再 open する (= checkpoint 済みなのでデータ無傷)。
     if let Err(e) = drop_wal_sidecars_strict(data_dir) {
@@ -522,7 +524,7 @@ fn replace_file_atomic_with_retry(src: &Path, dst: &Path) -> Result<(), RestoreE
 /// salt mismatch ガードが効かず、SQLite が旧 WAL の行を新 main に再適用しうるため。
 /// canonical 名から確実に削除できたことを担保してから rename に進む。
 fn drop_wal_sidecars_strict(data_dir: &Path) -> Result<(), RestoreError> {
-    for name in ["settings.db-wal", "settings.db-shm"] {
+    for name in sidecar_deletion_order_wal_last() {
         let p = data_dir.join(name);
         let result =
             retry_io(
@@ -539,6 +541,10 @@ fn drop_wal_sidecars_strict(data_dir: &Path) -> Result<(), RestoreError> {
         }
     }
     Ok(())
+}
+
+fn sidecar_deletion_order_wal_last() -> [&'static str; 2] {
+    ["settings.db-shm", "settings.db-wal"]
 }
 
 fn retry_io<F, T>(
@@ -839,6 +845,14 @@ mod tests {
         let shm_idx = order.iter().position(|n| n == "settings.db-shm").unwrap();
         assert!(wal_idx < main_idx);
         assert!(shm_idx < main_idx);
+    }
+
+    /// Current 復元では WAL 破棄がデータ破棄そのものなので、WAL は最後に消す。
+    /// SHM 削除で失敗した場合は WAL が残り、Recoverable として現行状態へ戻れる。
+    #[test]
+    fn sidecar_deletion_order_keeps_wal_last() {
+        let order = sidecar_deletion_order_wal_last();
+        assert_eq!(order, ["settings.db-shm", "settings.db-wal"]);
     }
 
     /// `current` を選んだケースでは bak の中身に依存しないので validate は skip。
