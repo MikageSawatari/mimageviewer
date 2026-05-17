@@ -149,7 +149,7 @@ ui_fullscreen.rs::render_fullscreen_viewport
     ├─ テクスチャ選択 (後述の優先順位)
     ├─ spread_mode に応じて 1 枚 or 2 枚並べる
     ├─ rotation + zoom + pan + free_rotation を合成して描画
-    └─ update_prefetch_window(idx)     # 前後数枚を先読み / 範囲外を解放
+    └─ update_prefetch_window(idx)     # フィルタ後の前後数枚を先読み / 範囲外を解放
 ```
 
 **`keep_fullscreen_viewport_alive`** はフルスクリーン非アクティブ時 (`fullscreen_idx == None`)
@@ -157,6 +157,10 @@ ui_fullscreen.rs::render_fullscreen_viewport
 する責務を持つ。それ以外のアイドルでは何もしない (2026-05-10、hidden viewport 維持コスト削減)。
 代償として `close_fullscreen` 後の再入場で 1x1 → フルサイズの DWM 遷移フラッシュが毎回出る。
 詳細は [docs/ui-responsiveness.md §9](ui-responsiveness.md) を参照。
+
+フルスクリーンの先読み対象は、`items` 全体ではなく `visible_indices` 由来の display list から
+作る。★フィルタや Ctrl+F で一覧が疎になっているときも、スライドショー / 前後移動と同じ
+次候補を先読みし、フィルタで隠れた画像は対象にしない。
 
 ### 2.2 ロードスレッド
 

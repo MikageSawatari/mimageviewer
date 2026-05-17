@@ -113,6 +113,61 @@ fn scan_directory_keeps_sources_when_upscaled_stem_is_ambiguous() {
     );
 }
 
+#[test]
+fn fullscreen_prefetch_candidates_respect_visible_indices() {
+    use crate::grid_item::GridItem;
+
+    let items = vec![
+        GridItem::Image(PathBuf::from("c:/a.jpg")),
+        GridItem::Image(PathBuf::from("c:/hidden.jpg")),
+        GridItem::Video(PathBuf::from("c:/clip.mp4")),
+        GridItem::ZipImage {
+            zip_path: PathBuf::from("c:/book.zip"),
+            entry_name: "p01.jpg".to_string(),
+        },
+        GridItem::PdfPage {
+            pdf_path: PathBuf::from("c:/scan.pdf"),
+            page_num: 0,
+            content_type: None,
+        },
+        GridItem::Folder(PathBuf::from("c:/sub")),
+    ];
+    let visible_indices = vec![0, 2, 3, 4, 5];
+
+    let image_indices = App::collect_image_indices_from(&items, &visible_indices);
+    assert_eq!(
+        image_indices,
+        vec![0, 3, 4],
+        "フィルタで隠れた画像 idx=1 や動画/フォルダはフルスクリーン画像先読み対象にしない"
+    );
+
+    assert_eq!(
+        interleaved_prefetch_targets(&image_indices, 0, image_indices.len(), 1, 0),
+        vec![3],
+        "現在 idx=0 の次候補は raw idx=1 ではなく、表示中一覧で次の画像 idx=3"
+    );
+}
+
+#[test]
+fn fullscreen_keep_set_keeps_current_image_when_filtered_out() {
+    use crate::grid_item::GridItem;
+
+    let mut app = phase_c_support::setup_app();
+    app.items = vec![
+        GridItem::Image(PathBuf::from("c:/a.jpg")),
+        GridItem::Image(PathBuf::from("c:/filtered-out.jpg")),
+        GridItem::Image(PathBuf::from("c:/b.jpg")),
+    ];
+    app.visible_indices = vec![0, 2];
+
+    let keep = app.compute_keep_set(1);
+    assert!(
+        keep.contains(&1),
+        "フルスクリーン中の現在画像がフィルタ外でも派生キャッシュは保持する"
+    );
+    assert_eq!(keep.len(), 1);
+}
+
 // ── passes_rating_filter (コンテナ/画像/Video の挙動) ──
 
 #[test]

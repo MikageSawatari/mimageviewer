@@ -12595,7 +12595,7 @@ impl App {
     /// settings の prefetch_back / prefetch_forward に従って先読みを開始し、
     /// ウィンドウ外のキャッシュ・読み込みを破棄する。
     fn update_prefetch_window(&mut self, current_idx: usize) {
-        let image_indices = Self::collect_image_indices(&self.items);
+        let image_indices = self.collect_image_indices();
         let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
             return;
         };
@@ -12673,17 +12673,26 @@ impl App {
         }
     }
 
-    /// items の中の画像アイテム (通常 + ZIP 内) の item_idx 一覧を返す（先読みウィンドウ用）
-    fn collect_image_indices(items: &[GridItem]) -> Vec<usize> {
-        items
+    /// `visible_indices` の中の画像アイテム (通常 + ZIP 内 + PDF) の item_idx 一覧を返す。
+    ///
+    /// フルスクリーンの前後移動 / スライドショーはフィルタ後の `visible_indices` を
+    /// 使うため、先読みも同じ display list に揃える。★フィルタや Ctrl+F で疎な一覧に
+    /// なっても、非表示の raw idx を先読みしない。
+    fn collect_image_indices(&self) -> Vec<usize> {
+        Self::collect_image_indices_from(&self.items, &self.visible_indices)
+    }
+
+    fn collect_image_indices_from(items: &[GridItem], visible_indices: &[usize]) -> Vec<usize> {
+        visible_indices
             .iter()
-            .enumerate()
-            .filter_map(|(i, item)| {
+            .copied()
+            .filter(|&i| {
                 matches!(
-                    item,
-                    GridItem::Image(_) | GridItem::ZipImage { .. } | GridItem::PdfPage { .. }
+                    items.get(i),
+                    Some(GridItem::Image(_))
+                        | Some(GridItem::ZipImage { .. })
+                        | Some(GridItem::PdfPage { .. })
                 )
-                .then_some(i)
             })
             .collect()
     }
@@ -13538,9 +13547,13 @@ impl App {
 
     /// 先読み範囲内の item_idx 集合を計算する。
     fn compute_keep_set(&self, current_idx: usize) -> std::collections::HashSet<usize> {
-        let image_indices = Self::collect_image_indices(&self.items);
+        let image_indices = self.collect_image_indices();
         let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
-            return std::collections::HashSet::new();
+            // フルスクリーン表示中に★/Ctrl+Fフィルタが変わり、現在ページが
+            // visible_indices から外れても、表示中ページの派生キャッシュは守る。
+            let mut keep = std::collections::HashSet::new();
+            keep.insert(current_idx);
+            return keep;
         };
         let n = image_indices.len();
         let keep_back = self.settings.prefetch_back + 1;
@@ -13575,7 +13588,7 @@ impl App {
 
     /// AI 先読み対象の item_idx を前方優先（+1..+pf_forward, -1..-pf_back）で返す。
     pub(crate) fn ai_prefetch_targets(&self, current_idx: usize) -> Vec<usize> {
-        let image_indices = Self::collect_image_indices(&self.items);
+        let image_indices = self.collect_image_indices();
         let Some(pos) = image_indices.iter().position(|&i| i == current_idx) else {
             return Vec::new();
         };
