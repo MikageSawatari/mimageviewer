@@ -3501,8 +3501,8 @@ impl App {
     }
 
     fn current_slideshow_frame_ready(&self, fs_idx: usize, state: &FsFrameState) -> bool {
-        if state.is_video || state.separator_text.is_some() {
-            return false;
+        if state.separator_text.is_some() {
+            return true;
         }
         let has_own_thumb = matches!(
             self.thumbnails.get(fs_idx),
@@ -3518,6 +3518,11 @@ impl App {
         state: &FsFrameState,
     ) {
         if !self.slideshow_playing {
+            return;
+        }
+        if state.is_video {
+            self.slideshow_playing = false;
+            self.slideshow_anchor_idx = None;
             return;
         }
         let ready = self.current_slideshow_frame_ready(fs_idx, state);
