@@ -9,7 +9,9 @@ pub mod archive_cache;
 pub mod archive_converter;
 pub mod audio_normalize_db;
 pub mod cache_maintenance;
+pub mod capture;
 pub mod catalog;
+pub mod compare_wgpu;
 pub mod data_dir;
 #[cfg(windows)]
 mod dcomp_presenter_test;

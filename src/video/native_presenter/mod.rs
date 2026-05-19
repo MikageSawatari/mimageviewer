@@ -324,6 +324,7 @@ struct NativeEguiOverlay {
     /// 「BM 設定 + BM 無し動画」のとき、`video_loop_enabled` は effective から導出した
     /// bool が入るが、`video_loop_mode` は表示用に Bookmark のまま維持する。
     video_loop_mode: crate::settings::VideoLoopMode,
+    video_continuous_mode: crate::video::VideoContinuousMode,
     video_checked: bool,
     vst3_available: bool,
     vst3_panel: Option<NativeOverlayVst3Panel>,
@@ -835,6 +836,7 @@ fn native_video_fullscreen_shortcut_key(
             | 0x27 // Right
             | 0x28 // Down
             | 0x42 // B
+            | 0x43 // C (comparison-view no-op in video fullscreen)
             | 0x46 // F (perf overlay toggle、v0.9.x で旧 P から移動)
             | 0x4A // J
             | 0x4B // K
@@ -843,6 +845,7 @@ fn native_video_fullscreen_shortcut_key(
             | 0x50 // P (pin current frame、v0.9.x で perf から再割り当て)
             | 0x53 // S
             | 0x57 // W
+            | 0x58 // X (comparison-view no-op in video fullscreen)
             | 0x70 // F1 (rating)
             | 0x71 // F2 (rating)
             | 0x72 // F3 (rating)
@@ -924,6 +927,7 @@ pub enum NativeOverlayCommand {
         direction: i32,
     },
     ToggleLoop,
+    ToggleContinuous,
     AddBookmarkAt {
         target_secs: f64,
     },
@@ -2524,6 +2528,12 @@ impl NativeVideoPresenter {
         }
     }
 
+    pub fn set_overlay_continuous_mode(&mut self, mode: crate::video::VideoContinuousMode) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_continuous_mode(mode);
+        }
+    }
+
     pub fn set_overlay_checked(&mut self, checked: bool) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_checked(checked);
@@ -3237,6 +3247,7 @@ impl NativeEguiOverlay {
             frame_step_hold: None,
             video_loop_enabled: false,
             video_loop_mode: crate::settings::VideoLoopMode::Off,
+            video_continuous_mode: crate::video::VideoContinuousMode::Off,
             video_checked: false,
             vst3_available: false,
             vst3_panel: None,
@@ -3691,6 +3702,14 @@ impl NativeEguiOverlay {
             return;
         }
         self.video_loop_mode = mode;
+        self.dirty = true;
+    }
+
+    fn set_continuous_mode(&mut self, mode: crate::video::VideoContinuousMode) {
+        if self.video_continuous_mode == mode {
+            return;
+        }
+        self.video_continuous_mode = mode;
         self.dirty = true;
     }
 
@@ -4708,6 +4727,7 @@ impl NativeEguiOverlay {
         let checked = self.video_checked;
         let loop_enabled = self.video_loop_enabled;
         let loop_mode = self.video_loop_mode;
+        let continuous_mode = self.video_continuous_mode;
         let first_frame_presented = self.first_frame_presented;
         let video_error = self.video_error.clone();
         let preparing_status = self.preparing_status;
@@ -5171,14 +5191,18 @@ impl NativeEguiOverlay {
                         // 「BM 設定 + BM 無し動画」では loop_enabled は true (Full と等価) でも
                         // ボタン表示は BM のまま (active 背景 + BM 装飾) になる。
                         use crate::settings::VideoLoopMode;
-                        let mode_active = !matches!(loop_mode, VideoLoopMode::Off);
+                        let continuous_active = continuous_mode.is_enabled();
+                        let mode_active =
+                            !continuous_active && !matches!(loop_mode, VideoLoopMode::Off);
                         draw_overlay_button_bg(
                             painter,
                             loop_rect,
-                            loop_resp.hovered(),
+                            loop_resp.hovered() && !continuous_active,
                             mode_active,
                         );
-                        let icon_color = if mode_active {
+                        let icon_color = if continuous_active {
+                            egui::Color32::from_gray(120)
+                        } else if mode_active {
                             egui::Color32::from_rgb(170, 230, 255)
                         } else {
                             egui::Color32::from_rgb(238, 238, 238)
@@ -5226,18 +5250,51 @@ impl NativeEguiOverlay {
                                 );
                             }
                         }
-                        let hover_text = match loop_mode {
-                            VideoLoopMode::Off => "ループ再生 [L]",
-                            VideoLoopMode::Full => "ループ: 全体 [L]",
-                            VideoLoopMode::Chapter => "ループ: チャプター [L]",
-                            VideoLoopMode::Bookmark => "ループ: ブックマーク [L]",
+                        let hover_text = if continuous_active {
+                            "連続再生中はループ無効"
+                        } else {
+                            match loop_mode {
+                                VideoLoopMode::Off => "ループ再生 [L]",
+                                VideoLoopMode::Full => "ループ: 全体 [L]",
+                                VideoLoopMode::Chapter => "ループ: チャプター [L]",
+                                VideoLoopMode::Bookmark => "ループ: ブックマーク [L]",
+                            }
                         };
                         let loop_resp = loop_resp.on_hover_text(hover_text);
-                        if loop_resp.clicked() {
+                        if loop_resp.clicked() && !continuous_active {
                             commands.push(NativeOverlayCommand::ToggleLoop);
                         }
                         let _ = loop_enabled; // mode_active ベース描画なので未使用
                         x = loop_rect.max.x + gap;
+
+                        let continuous_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, center_y - btn_size * 0.5),
+                            egui::vec2(btn_size, btn_size),
+                        );
+                        let continuous_resp = ui.interact(
+                            continuous_rect,
+                            egui::Id::new("native_video_continuous"),
+                            egui::Sense::click(),
+                        );
+                        draw_overlay_button_bg(
+                            painter,
+                            continuous_rect,
+                            continuous_resp.hovered(),
+                            continuous_active,
+                        );
+                        draw_overlay_continuous_icon(painter, continuous_rect, continuous_mode);
+                        let continuous_hover = match continuous_mode {
+                            crate::video::VideoContinuousMode::Off => "連続再生",
+                            crate::video::VideoContinuousMode::Continuous => "連続再生: 末尾で停止",
+                            crate::video::VideoContinuousMode::ContinuousLoop => {
+                                "連続再生: 末尾で先頭へ"
+                            }
+                        };
+                        let continuous_resp = continuous_resp.on_hover_text(continuous_hover);
+                        if continuous_resp.clicked() {
+                            commands.push(NativeOverlayCommand::ToggleContinuous);
+                        }
+                        x = continuous_rect.max.x + gap;
 
                         let prev_frame_rect = egui::Rect::from_min_size(
                             egui::pos2(x, center_y - btn_size * 0.5),
@@ -5271,8 +5328,9 @@ impl NativeEguiOverlay {
                             false,
                         );
                         draw_overlay_camera_icon(painter, screenshot_rect);
-                        let screenshot_resp =
-                            screenshot_resp.on_hover_text("現在フレームをクリップボードにコピー");
+                        let screenshot_resp = screenshot_resp.on_hover_text(
+                            "クリック: クリップボードにコピー\nCtrl+S: ファイル保存",
+                        );
                         if screenshot_resp.clicked() {
                             commands.push(NativeOverlayCommand::CopyFrameToClipboard);
                         }

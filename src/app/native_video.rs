@@ -81,6 +81,8 @@ pub(crate) struct NativeVideoOpenPending {
     pub(crate) idx: usize,
     pub(crate) path: std::path::PathBuf,
     pub(crate) from_grid: bool,
+    pub(crate) autoplay_override: Option<bool>,
+    pub(crate) ignore_resume: bool,
     pub(crate) requested_at: std::time::Instant,
     pub(crate) deadline: std::time::Instant,
     pub(crate) input_seq: u64,
@@ -106,6 +108,7 @@ pub(crate) struct NativeVideoSourceSwapPending {
     pub(crate) target_path: std::path::PathBuf,
     pub(crate) native_output: crate::video::NativeVideoOutput,
     pub(crate) autoplay_override: Option<bool>,
+    pub(crate) ignore_resume: bool,
     pub(crate) show_preparing_overlay: bool,
     pub(crate) reason: &'static str,
     pub(crate) requested_at: std::time::Instant,
@@ -298,6 +301,8 @@ impl App {
         idx: usize,
         path: &std::path::Path,
         from_grid: bool,
+        autoplay_override: Option<bool>,
+        ignore_resume: bool,
     ) -> bool {
         if !self.settings.video_hw_decode {
             return false;
@@ -314,6 +319,8 @@ impl App {
             idx,
             path: path.to_path_buf(),
             from_grid,
+            autoplay_override,
+            ignore_resume,
             requested_at: now,
             deadline: now + std::time::Duration::from_secs(10),
             input_seq: self.input_seq,
@@ -351,6 +358,8 @@ impl App {
         let idx = pending.idx;
         let path = pending.path.clone();
         let from_grid = pending.from_grid;
+        let autoplay_override = pending.autoplay_override;
+        let ignore_resume = pending.ignore_resume;
         let requested_at = pending.requested_at;
         let deadline = pending.deadline;
         let input_seq = pending.input_seq;
@@ -369,6 +378,8 @@ impl App {
         if live_decoders < max_live_video_decode_threads {
             self.native_video_open_pending = None;
             self.fs_open_intent_from_grid = from_grid;
+            self.fs_video_open_autoplay_override = autoplay_override;
+            self.fs_video_open_ignore_resume_once = ignore_resume;
             crate::logger::log(format!(
                 "[native-video] resume deferred regular open: idx={idx} waited_ms={:.1} live_video_decode_threads={live_decoders}",
                 requested_at.elapsed().as_secs_f64() * 1000.0
@@ -441,6 +452,7 @@ impl App {
         ctx: &egui::Context,
         target_idx: usize,
         autoplay_override: Option<bool>,
+        ignore_resume: bool,
         show_preparing_overlay: bool,
         reason: &'static str,
     ) -> bool {
@@ -473,6 +485,7 @@ impl App {
             pending.target_idx = target_idx;
             pending.target_path = target_path;
             pending.autoplay_override = autoplay_override;
+            pending.ignore_resume = ignore_resume;
             pending.show_preparing_overlay = show_preparing_overlay;
             pending.reason = reason;
             pending.requested_at = now;
@@ -545,6 +558,7 @@ impl App {
             target_path,
             native_output,
             autoplay_override,
+            ignore_resume,
             show_preparing_overlay,
             reason,
             requested_at: now,
@@ -708,6 +722,7 @@ impl App {
             target_path,
             native_output,
             autoplay_override,
+            ignore_resume,
             show_preparing_overlay,
             reason,
             requested_at,
@@ -723,6 +738,7 @@ impl App {
             target_path.clone(),
             false,
             autoplay_override,
+            ignore_resume,
             None,
         );
         new_player.attach_native_output(native_output);
@@ -1535,6 +1551,9 @@ impl App {
             crate::video::NativeVideoOutputEvent::ToggleLoop => {
                 self.handle_native_video_toggle_loop_command(ctx, fs_idx);
             }
+            crate::video::NativeVideoOutputEvent::ToggleContinuous => {
+                self.cycle_video_continuous_mode_common(ctx, fs_idx);
+            }
             crate::video::NativeVideoOutputEvent::SetVolume { volume, persist } => {
                 self.handle_native_video_set_volume_command(ctx, fs_idx, volume, persist);
             }
@@ -1827,6 +1846,11 @@ impl App {
     /// CH/BM 段階は当該動画にデータが無いとき自動でスキップする。
     /// 設定保存 → effective mode を再計算して player に反映 → トースト → HUD activity 更新。
     pub(crate) fn cycle_native_video_loop_common(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.video_continuous_mode.is_enabled() {
+            self.show_native_video_overlay_toast("連続再生中はループ無効".to_string(), false);
+            self.mark_native_video_hud_activity(ctx);
+            return;
+        }
         // Phase 1: チャプター / ブックマークの有無を取得 (player から snapshot)
         let (path, has_ch) = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
@@ -1867,6 +1891,15 @@ impl App {
     /// 各種 seek 後 (J/K, ←/→, シークバー, タイル seek, マーカージャンプ),
     /// ブックマーク CRUD 直後, ナビゲーション後。
     pub(crate) fn apply_loop_mode_to_player(&mut self, fs_idx: usize) {
+        if self.video_continuous_mode.is_enabled() {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.set_loop_enabled(false);
+                player.set_native_loop_enabled(false);
+                player.set_native_loop_mode(self.settings.video_loop_mode);
+                player.set_native_continuous_mode(self.video_continuous_mode);
+            }
+            return;
+        }
         // Phase 1: player から必要データを snapshot して borrow を即解放
         let (path, chapter_starts, pos, serial) = {
             let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
@@ -1908,6 +1941,7 @@ impl App {
             player.set_native_loop_mode(display_mode); // HUD 表示は user intent
             #[cfg(windows)]
             player.set_native_loop_enabled(enabled); // 互換のため残す
+            player.set_native_continuous_mode(self.video_continuous_mode);
         }
         self.last_loop_pos.insert(fs_idx, (pos, serial));
     }
@@ -1918,6 +1952,9 @@ impl App {
     /// 手動 seek (シークバー/J/K/←/→/タイル) は serial 変化で検出して baseline 更新のみに
     /// 切り替え、誤爆 seek を防ぐ (Codex P1 第2ラウンド)。
     pub(crate) fn tick_native_video_loop_boundary(&mut self, fs_idx: usize) {
+        if self.video_continuous_mode.is_enabled() {
+            return;
+        }
         let display_mode = self.settings.video_loop_mode;
         // 早期 return: HUD 表示は CH/BM でも、effective が Off/Full なら何もしない
         // (= データ無し動画では境界 tick が発火しない)。
@@ -4029,6 +4066,14 @@ impl App {
                     player.set_native_perf_overlay_visible(self.video_perf_overlay_visible);
                 }
             }
+            // Ctrl+S: save current video frame to the capture folder.
+            0x53 if !key.shift && key.ctrl && !key.repeat => {
+                self.save_video_frame_to_file(ctx, fs_idx);
+            }
+            // X / C: comparison view is static-image only. Consume as silent no-op.
+            0x43 | 0x58 if !key.ctrl && !key.repeat => {
+                hud_activity = false;
+            }
             // S: tile mode toggle.
             0x53 if !key.shift && !key.ctrl && !key.repeat => {
                 let screen = self.video_tile_layout_size(fs_idx, ctx);
@@ -4458,6 +4503,7 @@ impl App {
         ctx: &egui::Context,
         target_idx: usize,
         autoplay_override: Option<bool>,
+        ignore_resume: bool,
         show_preparing_overlay: bool,
         reason: &'static str,
     ) -> Option<NativeVideoSourceSwapStarted> {
@@ -4518,6 +4564,7 @@ impl App {
             target_path.clone(),
             false,
             autoplay_override,
+            ignore_resume,
             None,
         );
         new_player.attach_native_output(native_output);
@@ -4642,6 +4689,7 @@ impl App {
                 ctx,
                 target_idx,
                 Some(false),
+                false,
                 true,
                 "tile",
             );
@@ -4670,13 +4718,14 @@ impl App {
                 ctx,
                 target_idx,
                 Some(false),
+                false,
                 true,
                 "tile",
             );
         }
 
         let Some(started) =
-            self.start_native_video_source_swap(ctx, target_idx, Some(false), true, "tile")
+            self.start_native_video_source_swap(ctx, target_idx, Some(false), false, true, "tile")
         else {
             return false;
         };
@@ -4706,6 +4755,8 @@ impl App {
         &mut self,
         ctx: &egui::Context,
         target_idx: usize,
+        autoplay_override: Option<bool>,
+        ignore_resume: bool,
     ) -> bool {
         // Gate checks first: 「これは本当に video→video fast-swap の候補か」が確定する
         // までは throttle 判定もしない。`live_count >= MAX` のときに throttle が早く
@@ -4715,7 +4766,8 @@ impl App {
             return self.defer_native_video_source_swap_until_decoder_free(
                 ctx,
                 target_idx,
-                None,
+                autoplay_override,
+                ignore_resume,
                 false,
                 "navigation",
             );
@@ -4790,7 +4842,8 @@ impl App {
             return self.defer_native_video_source_swap_until_decoder_free(
                 ctx,
                 target_idx,
-                None,
+                autoplay_override,
+                ignore_resume,
                 false,
                 "navigation",
             );
@@ -4805,7 +4858,8 @@ impl App {
         self.defer_native_video_source_swap_until_decoder_free(
             ctx,
             target_idx,
-            None,
+            autoplay_override,
+            ignore_resume,
             false,
             "navigation",
         )
@@ -4817,10 +4871,21 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) {
+        self.open_native_video_fullscreen_from_navigation_with_options(ctx, idx, None, false);
+    }
+
+    #[cfg(windows)]
+    pub(super) fn open_native_video_fullscreen_from_navigation_with_options(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        autoplay_override: Option<bool>,
+        ignore_resume: bool,
+    ) {
         if self.try_start_video_tile_fast_swap(ctx, idx) {
             return;
         }
-        if self.try_start_native_video_fast_swap(ctx, idx) {
+        if self.try_start_native_video_fast_swap(ctx, idx, autoplay_override, ignore_resume) {
             return;
         }
         let started = std::time::Instant::now();
@@ -4850,6 +4915,8 @@ impl App {
             self.cancel_stale_video_tile_reopen(from_idx, "wheel-open");
         }
 
+        self.fs_video_open_autoplay_override = autoplay_override;
+        self.fs_video_open_ignore_resume_once = ignore_resume;
         self.open_fullscreen(idx);
 
         if restore_video_tile && restore_target_is_video {

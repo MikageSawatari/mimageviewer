@@ -19,6 +19,7 @@
 //! しまう」誤認を避けるため明示。
 
 use eframe::egui;
+use std::sync::Arc;
 
 use crate::app::App;
 use crate::fs_animation::FsCacheEntry;
@@ -66,6 +67,13 @@ const BAR_BUTTON_GAP: f32 = 4.0;
 const CHECKMARK_RADIUS: f32 = 18.0;
 /// 透過画像背景の市松 1 タイルサイズ (px)
 const CHECKER_TILE_PX: f32 = 16.0;
+
+#[derive(Clone, Copy)]
+enum ComparePreparedTextureKind {
+    Pinned,
+    Current,
+    Diff,
+}
 
 #[cfg(windows)]
 struct NativeFocusClaim {
@@ -209,9 +217,11 @@ fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
             | egui::Key::J
             | egui::Key::K
             | egui::Key::B
+            | egui::Key::C
             | egui::Key::P
             | egui::Key::T
             | egui::Key::I
+            | egui::Key::X
             | egui::Key::Z
             | egui::Key::R
     )
@@ -264,6 +274,7 @@ fn native_video_vk_from_egui_key(key: egui::Key) -> Option<u32> {
         egui::Key::ArrowRight => 0x27,
         egui::Key::ArrowDown => 0x28,
         egui::Key::B => 0x42,
+        egui::Key::C => 0x43,
         egui::Key::J => 0x4A,
         egui::Key::K => 0x4B,
         egui::Key::L => 0x4C,
@@ -271,6 +282,7 @@ fn native_video_vk_from_egui_key(key: egui::Key) -> Option<u32> {
         egui::Key::P => 0x50,
         egui::Key::S => 0x53,
         egui::Key::W => 0x57,
+        egui::Key::X => 0x58,
         _ => return None,
     })
 }
@@ -1304,10 +1316,14 @@ impl App {
                         // ── 分析/補正モード: 見開き中は無効 ──
                         // 分析モードは画像エリアを左側に制限する（右パネルと重ならないよう）。
                         // 補正モードは左パネルを画像の上にオーバーレイする（画像位置は移動しない）。
+                        let compare_wipe_active = matches!(
+                            self.compare_view_mode,
+                            crate::app::CompareViewMode::Wipe { .. }
+                        );
                         let analysis_active = self.analysis_mode && !is_spread_double;
                         // 補正パネルは見開き Double でも使えるようにする (左右独立補正 + コピー)。
                         // 編集対象 (画面上の左/右) は `adjust_spread_target` で切替。
-                        let adjustment_active = self.adjustment_mode;
+                        let adjustment_active = self.adjustment_mode && !compare_wipe_active;
                         // VST3 動画コンパクト表示モード: 動画のときだけ右上 1/4 に縮小し、
                         // 残った左下 3/4 をプラグイン GUI 用に空ける。動画でない (画像/PDF)
                         // ときは無視する (= プラグインで分析するのは動画なので)。
@@ -1366,26 +1382,155 @@ impl App {
                                             self.fs_painted_last = Some((fs_idx, cur_id, entry_seq));
                                         }
                                     }
-                                    let bg_style = self.fs_bg_style(ctx);
-                                    Self::draw_fs_image(
-                                        ui, image_rect,
-                                        state.tex.as_ref(), state.thumb_tex.as_ref(),
-                                        state.is_video, state.vst3_waiting_for_video,
-                                        state.fs_load_failed, fs_rotation, zp,
-                                        free_rot, &bg_style, &state.location_display,
+                                    let compare_mode = self.compare_view_mode;
+                                    let compare_requested = !matches!(
+                                        compare_mode,
+                                        crate::app::CompareViewMode::Off
                                     );
+                                    if compare_requested {
+                                        self.ensure_compare_prepared_pair(ctx, fs_idx);
+                                    }
+                                    if compare_requested
+                                        && self.draw_compare_prepared_mode(
+                                            ui,
+                                            ctx,
+                                            image_rect,
+                                            compare_mode,
+                                            zp,
+                                        )
+                                    {
+                                        // 比較表示側で描画済み。
+                                    } else if matches!(
+                                        compare_mode,
+                                        crate::app::CompareViewMode::PinnedNormal
+                                    ) {
+                                        let compare_tex = self.ensure_compare_pinned_texture(ctx);
+                                        if let Some(tex) = compare_tex.as_ref() {
+                                            let bg_style = self.fs_bg_style(ctx);
+                                            Self::draw_compare_pinned_image(
+                                                ui, image_rect, tex, zp, &bg_style, None,
+                                            );
+                                        }
+                                    } else {
+                                        let fallback_compare_tex = if matches!(
+                                            compare_mode,
+                                            crate::app::CompareViewMode::Wipe { .. }
+                                        ) {
+                                            self.ensure_compare_pinned_texture(ctx)
+                                        } else {
+                                            None
+                                        };
+                                        let bg_style = self.fs_bg_style(ctx);
+                                        Self::draw_fs_image(
+                                            ui, image_rect,
+                                            state.tex.as_ref(), state.thumb_tex.as_ref(),
+                                            state.is_video, state.vst3_waiting_for_video,
+                                            state.fs_load_failed, fs_rotation, zp,
+                                            free_rot, &bg_style, &state.location_display,
+                                        );
+                                        if let crate::app::CompareViewMode::Wipe { fraction } =
+                                            compare_mode
+                                        {
+                                            if let Some(tex) = fallback_compare_tex.as_ref() {
+                                                let wipe_x = image_rect.left()
+                                                    + image_rect.width()
+                                                        * fraction.clamp(0.05, 0.95);
+                                                let clip = egui::Rect::from_min_max(
+                                                    image_rect.min,
+                                                    egui::pos2(wipe_x, image_rect.max.y),
+                                                );
+                                                Self::draw_compare_pinned_image(
+                                                    ui,
+                                                    image_rect,
+                                                    tex,
+                                                    zp,
+                                                    &bg_style,
+                                                    Some(clip),
+                                                );
+                                                Self::draw_compare_wipe_line(
+                                                    ui, image_rect, fraction,
+                                                );
+                                            }
+                                        }
+                                    }
                                     // 単一表示時は見開きレイアウトキャッシュを破棄
                                     self.fs_spread_layout = None;
                                 }
                                 SpreadPair::Double { left, right } => {
-                                    self.draw_fs_spread(
-                                        ui,
-                                        ctx,
-                                        image_rect,
-                                        left,
-                                        right,
-                                        state.original_preview_active,
+                                    let compare_mode = self.compare_view_mode;
+                                    let zoom_pan = self.fs_zoom_pan();
+                                    let compare_requested = !matches!(
+                                        compare_mode,
+                                        crate::app::CompareViewMode::Off
                                     );
+                                    if compare_requested {
+                                        self.ensure_compare_prepared_pair(ctx, fs_idx);
+                                    }
+                                    if compare_requested
+                                        && self.draw_compare_prepared_mode(
+                                            ui,
+                                            ctx,
+                                            image_rect,
+                                            compare_mode,
+                                            zoom_pan,
+                                        )
+                                    {
+                                        self.fs_spread_layout = None;
+                                    } else if matches!(
+                                        compare_mode,
+                                        crate::app::CompareViewMode::PinnedNormal
+                                    ) {
+                                        let compare_tex = self.ensure_compare_pinned_texture(ctx);
+                                        if let Some(tex) = compare_tex.as_ref() {
+                                            let bg_style = self.fs_bg_style(ctx);
+                                            Self::draw_compare_pinned_image(
+                                                ui, image_rect, tex, zoom_pan, &bg_style, None,
+                                            );
+                                            self.fs_spread_layout = None;
+                                        }
+                                    } else {
+                                        let fallback_compare_tex = if matches!(
+                                            compare_mode,
+                                            crate::app::CompareViewMode::Wipe { .. }
+                                        ) {
+                                            self.ensure_compare_pinned_texture(ctx)
+                                        } else {
+                                            None
+                                        };
+                                        self.draw_fs_spread(
+                                            ui,
+                                            ctx,
+                                            image_rect,
+                                            left,
+                                            right,
+                                            state.original_preview_active,
+                                        );
+                                        if let crate::app::CompareViewMode::Wipe { fraction } =
+                                            compare_mode
+                                        {
+                                            if let Some(tex) = fallback_compare_tex.as_ref() {
+                                                let bg_style = self.fs_bg_style(ctx);
+                                                let wipe_x = image_rect.left()
+                                                    + image_rect.width()
+                                                        * fraction.clamp(0.05, 0.95);
+                                                let clip = egui::Rect::from_min_max(
+                                                    image_rect.min,
+                                                    egui::pos2(wipe_x, image_rect.max.y),
+                                                );
+                                                Self::draw_compare_pinned_image(
+                                                    ui,
+                                                    image_rect,
+                                                    tex,
+                                                    zoom_pan,
+                                                    &bg_style,
+                                                    Some(clip),
+                                                );
+                                                Self::draw_compare_wipe_line(
+                                                    ui, image_rect, fraction,
+                                                );
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1423,6 +1568,9 @@ impl App {
                         self.draw_original_preview_indicator(ui, full_rect, state.original_preview_active);
                         self.sync_slideshow_anchor_for_frame(ctx, fs_idx, &state);
                         self.draw_slideshow_progress_indicator(ui, full_rect, ctx);
+                        if !state.is_video {
+                            self.draw_compare_pin_indicator(ui, full_rect, ctx);
+                        }
                         fs_overlay_ms = overlay_t0.elapsed().as_secs_f64() * 1000.0;
 
                         // ── 動画 (エラー / 「準備中」のみ) ──
@@ -1538,7 +1686,7 @@ impl App {
                             if !is_spread_double {
                                 self.draw_metadata_panel_forced(ui, ctx, full_rect);
                             }
-                        } else if !is_spread_double {
+                        } else if !is_spread_double && !compare_wipe_active {
                             // ── メタデータパネル（通常モード：TABキー固定 or 右端ホバー）──
                             let right_panel_visible =
                                 self.draw_metadata_panel(ui, ctx, full_rect);
@@ -1616,6 +1764,7 @@ impl App {
                                 cfg!(windows) && is_video_mode && self.settings.vst3_enabled;
                             let vst3_panel_open = self.show_vst3_manager;
                             let mut vst3_pressed = false;
+                            let mut copy_capture_pressed = false;
                             let slideshow_was_playing = self.slideshow_playing;
                             Self::draw_fs_hover_bar(
                                 ui, ctx, full_rect,
@@ -1642,7 +1791,11 @@ impl App {
                                 show_vst3_button,
                                 vst3_panel_open,
                                 &mut vst3_pressed,
+                                &mut copy_capture_pressed,
                             );
+                            if copy_capture_pressed {
+                                self.copy_image_capture_to_clipboard(fs_idx);
+                            }
                             if !slideshow_was_playing && self.slideshow_playing {
                                 self.schedule_next_slideshow_from_now();
                             }
@@ -2533,6 +2686,23 @@ impl App {
         });
         // Space: スライドショー関連 (変数名の紛らわしさ回避のため key_space)
         let key_space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+        let key_ctrl_s_capture = !is_video_fs
+            && self.fs_context_menu_idx.is_none()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S));
+        let key_compare_x = !is_video_fs
+            && self.fs_context_menu_idx.is_none()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::X));
+        let key_compare_alt_c = !is_video_fs
+            && self.fs_context_menu_idx.is_none()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::C));
+        let key_compare_shift_c = !is_video_fs
+            && self.fs_context_menu_idx.is_none()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::C));
+        let key_compare_c = !is_video_fs
+            && self.fs_context_menu_idx.is_none()
+            && !key_compare_alt_c
+            && !key_compare_shift_c
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::C));
         // S: スライドショー 再生/停止 (旧 P キー、左手で押しやすいよう S に移行)
         let key_s = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S));
         let key_r = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R));
@@ -2825,7 +2995,24 @@ impl App {
             }
         }
 
-        if esc {
+        if key_compare_x {
+            self.toggle_compare_pin_from_current(ctx, fs_idx);
+        }
+        if key_compare_c {
+            self.toggle_compare_pinned_view(ctx, fs_idx);
+        }
+        if key_compare_shift_c {
+            self.toggle_compare_wipe_mode(ctx, fs_idx);
+        }
+        if key_compare_alt_c {
+            self.toggle_compare_diff_mode(ctx, fs_idx);
+        }
+
+        if esc && self.compare_view_mode.is_overlay() {
+            self.compare_view_mode = crate::app::CompareViewMode::Off;
+            self.compare_wipe_dragging = false;
+            self.show_feedback_toast("[比較: Normal]".to_string());
+        } else if esc {
             action.close = true;
         }
         // 見開きダブル表示中は I/Z/R/L を無効化
@@ -2893,6 +3080,10 @@ impl App {
                 // 1回目のE: マスクモード開始
                 self.enter_erase_mode(fs_idx);
             }
+        }
+
+        if key_ctrl_s_capture {
+            self.save_image_capture_to_file(ctx, fs_idx);
         }
 
         // S: スライドショー開始/停止トグル (旧 P、左手で押しやすいよう S へ移行)
@@ -3007,6 +3198,54 @@ impl App {
 
     // ── ホイール & クリック ──────────────────────────────────────────────
 
+    fn handle_compare_wipe_drag(&mut self, ctx: &egui::Context, image_rect: egui::Rect) -> bool {
+        let crate::app::CompareViewMode::Wipe { fraction } = self.compare_view_mode else {
+            self.compare_wipe_dragging = false;
+            return false;
+        };
+        if image_rect.width() <= 1.0 {
+            return false;
+        }
+
+        let (primary_pressed, primary_down, primary_released, pointer_pos) = ctx.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.primary_released(),
+                i.pointer.interact_pos().or_else(|| i.pointer.hover_pos()),
+            )
+        });
+        if primary_released {
+            let was_dragging = self.compare_wipe_dragging;
+            self.compare_wipe_dragging = false;
+            return was_dragging;
+        }
+
+        let line_x = image_rect.left() + image_rect.width() * fraction.clamp(0.05, 0.95);
+        let hit = pointer_pos
+            .map(|p| image_rect.contains(p) && (p.x - line_x).abs() <= 14.0)
+            .unwrap_or(false);
+        if hit {
+            ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+        }
+        if primary_pressed && hit {
+            self.compare_wipe_dragging = true;
+        }
+        if self.compare_wipe_dragging && primary_down {
+            if let Some(pos) = pointer_pos {
+                let new_fraction =
+                    ((pos.x - image_rect.left()) / image_rect.width()).clamp(0.05, 0.95);
+                self.compare_view_mode = crate::app::CompareViewMode::Wipe {
+                    fraction: new_fraction,
+                };
+                ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
+                ctx.request_repaint();
+            }
+            return true;
+        }
+        false
+    }
+
     /// ホイールとクリックを処理し、(nav_delta, close) を返す。
     fn handle_fs_wheel_and_click(
         &mut self,
@@ -3101,6 +3340,11 @@ impl App {
             }
         }
 
+        let compare_wipe_active = matches!(
+            self.compare_view_mode,
+            crate::app::CompareViewMode::Wipe { .. }
+        );
+
         // ── ホイール ──
         // パネル領域内ではホイールナビゲーションを抑制
         let panel_w = METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
@@ -3113,11 +3357,14 @@ impl App {
             i.pointer
                 .hover_pos()
                 .map(|p| {
-                    let in_right = p.x > panel_left
+                    let in_right = !compare_wipe_active
+                        && p.x > panel_left
                         && p.y >= 60.0
                         && (has_right_panel || p.x > hover_threshold);
-                    let in_left =
-                        self.adjustment_mode && p.x < full_rect.min.x + left_panel_w && p.y >= 60.0;
+                    let in_left = !compare_wipe_active
+                        && self.adjustment_mode
+                        && p.x < full_rect.min.x + left_panel_w
+                        && p.y >= 60.0;
                     in_right || in_left
                 })
                 .unwrap_or(false)
@@ -3128,7 +3375,11 @@ impl App {
         // 加えて、消しゴムモードに入る前から adjustment_mode が立っていると、消しゴムパネルが
         // 左端を占有している間 edge_hover が常に true 扱いになり off へ遷移できないので、
         // 強制的に落とす。
-        if self.erase_mode {
+        if compare_wipe_active {
+            if self.adjustment_mode && !self.adjustment_dragging {
+                self.adjustment_mode = false;
+            }
+        } else if self.erase_mode {
             self.adjustment_mode = false;
         } else {
             let edge_hover = ctx.input(|i| {
@@ -3150,6 +3401,15 @@ impl App {
             {
                 self.adjustment_mode = false;
             }
+        }
+
+        let compare_drag_rect = if self.analysis_mode && !is_spread_double {
+            analysis_image_rect(full_rect)
+        } else {
+            full_rect
+        };
+        if !cursor_in_panel && self.handle_compare_wipe_drag(ctx, compare_drag_rect) {
+            return (0, false);
         }
 
         // ── 中ボタン (ホイール押し込み) ドラッグでズーム ──
@@ -3546,7 +3806,7 @@ impl App {
             return;
         }
         #[cfg(windows)]
-        if self.try_start_native_video_fast_swap(ctx, idx) {
+        if self.try_start_native_video_fast_swap(ctx, idx, None, false) {
             return;
         }
 
@@ -3963,6 +4223,413 @@ impl App {
                 20.0,
             );
         }
+    }
+
+    fn ensure_compare_pinned_texture(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<egui::TextureHandle> {
+        let slot = self.pinned_compare_slot.as_mut()?;
+        if slot.texture.is_none() {
+            let tex = ctx.load_texture(
+                format!(
+                    "compare_pin_{}_{}x{}",
+                    slot.source_idx, slot.source_size[0], slot.source_size[1]
+                ),
+                slot.pixels.as_ref().clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            slot.texture = Some(tex);
+        }
+        slot.texture.clone()
+    }
+
+    fn compare_prepared_pair_matches(&self, fs_idx: usize) -> bool {
+        let Some(slot) = self.pinned_compare_slot.as_ref() else {
+            return false;
+        };
+        self.compare_prepared_pair.as_ref().is_some_and(|pair| {
+            pair.current_idx == fs_idx && pair.pinned_source_idx == slot.source_idx
+        })
+    }
+
+    fn ensure_compare_prepared_pair(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
+        let Some(slot) = self.pinned_compare_slot.as_ref() else {
+            return false;
+        };
+        if self.compare_prepared_pair_matches(fs_idx) {
+            return true;
+        }
+        if self
+            .compare_prepare_pending
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.current_idx == fs_idx && pending.pinned_source_idx == slot.source_idx
+            })
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return false;
+        }
+
+        let pinned_source_idx = slot.source_idx;
+        let pinned_size = slot.source_size;
+        let pinned_pixels = Arc::clone(&slot.pixels);
+        let current_work = match self.prepare_capture_pixel_work(fs_idx) {
+            Ok(work) => work,
+            Err(err) => {
+                self.compare_view_mode = crate::app::CompareViewMode::Off;
+                self.compare_wipe_dragging = false;
+                self.show_feedback_toast(err);
+                return false;
+            }
+        };
+        self.compare_prepared_pair = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("compare-prepare".into())
+            .spawn(move || {
+                let result = crate::capture::run_pixel_work(current_work).and_then(
+                    |(_basename, width, height, current_rgba)| {
+                        let pinned_source_rgba =
+                            crate::capture::color_image_to_rgba(pinned_pixels.as_ref());
+                        let pinned_rgba = crate::capture::align_rgba_to_canvas_lanczos(
+                            pinned_size[0] as u32,
+                            pinned_size[1] as u32,
+                            &pinned_source_rgba,
+                            width,
+                            height,
+                        )?;
+                        let diff_rgba = crate::capture::diff_rgba_color(
+                            width,
+                            height,
+                            &pinned_rgba,
+                            &current_rgba,
+                        )?;
+                        Ok(crate::app::ComparePrepareResult {
+                            current_idx: fs_idx,
+                            pinned_source_idx,
+                            width,
+                            height,
+                            pinned_rgba,
+                            current_rgba,
+                            diff_rgba,
+                        })
+                    },
+                );
+                let _ = tx.send(result);
+            });
+
+        match thread {
+            Ok(_) => {
+                self.compare_prepare_pending = Some(crate::app::ComparePreparePending {
+                    current_idx: fs_idx,
+                    pinned_source_idx,
+                    rx,
+                });
+                self.show_feedback_toast("比較表示を準備中".to_string());
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(err) => {
+                self.show_feedback_toast(format!("比較 worker を開始できません: {err}"));
+            }
+        }
+        false
+    }
+
+    fn ensure_compare_prepared_texture(
+        &mut self,
+        ctx: &egui::Context,
+        kind: ComparePreparedTextureKind,
+    ) -> Option<egui::TextureHandle> {
+        let pair = self.compare_prepared_pair.as_mut()?;
+        let key = pair.key;
+        let target_size = pair.target_size;
+        let (slot, pixels, label) = match kind {
+            ComparePreparedTextureKind::Pinned => (
+                &mut pair.pinned_texture,
+                Arc::clone(&pair.pinned_pixels),
+                "pinned",
+            ),
+            ComparePreparedTextureKind::Current => (
+                &mut pair.current_texture,
+                Arc::clone(&pair.current_pixels),
+                "current",
+            ),
+            ComparePreparedTextureKind::Diff => (
+                &mut pair.diff_texture,
+                Arc::clone(&pair.diff_pixels),
+                "diff",
+            ),
+        };
+        if slot.is_none() {
+            let tex = ctx.load_texture(
+                format!(
+                    "compare_prepared_{}_{}_{}x{}",
+                    label, key, target_size[0], target_size[1]
+                ),
+                pixels.as_ref().clone(),
+                egui::TextureOptions::LINEAR,
+            );
+            *slot = Some(tex);
+        }
+        slot.clone()
+    }
+
+    fn compare_image_draw_rect(
+        full_rect: egui::Rect,
+        image_size: [usize; 2],
+        zoom_pan: Option<(f32, egui::Vec2)>,
+    ) -> Option<egui::Rect> {
+        let tex_size = egui::vec2(image_size[0] as f32, image_size[1] as f32);
+        if tex_size.x <= 0.0
+            || tex_size.y <= 0.0
+            || full_rect.width() <= 0.0
+            || full_rect.height() <= 0.0
+        {
+            return None;
+        }
+        let fit_scale = (full_rect.width() / tex_size.x).min(full_rect.height() / tex_size.y);
+        let (total_scale, center) = match zoom_pan {
+            Some((zoom, pan)) => (fit_scale * zoom, full_rect.center() + pan),
+            None => (fit_scale, full_rect.center()),
+        };
+        Some(egui::Rect::from_center_size(center, tex_size * total_scale))
+    }
+
+    #[cfg(windows)]
+    fn compare_shader_shape(
+        &self,
+        image_rect: egui::Rect,
+        pair: &crate::app::ComparePreparedPair,
+        mode: crate::compare_wgpu::CompareShaderMode,
+        wipe_fraction: f32,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+    ) -> Option<(egui::Rect, egui::Shape)> {
+        let target_format = self.wgpu_render_state.as_ref()?.target_format;
+        let draw_rect = Self::compare_image_draw_rect(image_rect, pair.target_size, zoom_pan)?;
+        let callback = crate::compare_wgpu::CompareShaderCallback {
+            key: pair.key,
+            width: pair.target_size[0] as u32,
+            height: pair.target_size[1] as u32,
+            pinned_rgba: Arc::clone(&pair.pinned_rgba),
+            current_rgba: Arc::clone(&pair.current_rgba),
+            mode,
+            wipe_fraction,
+            target_format,
+        };
+        Some((
+            draw_rect,
+            egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(draw_rect, callback)),
+        ))
+    }
+
+    #[cfg(not(windows))]
+    fn compare_shader_shape(
+        &self,
+        _image_rect: egui::Rect,
+        _pair: &crate::app::ComparePreparedPair,
+        _mode: crate::compare_wgpu::CompareShaderMode,
+        _wipe_fraction: f32,
+        _zoom_pan: Option<(f32, egui::Vec2)>,
+    ) -> Option<(egui::Rect, egui::Shape)> {
+        None
+    }
+
+    fn draw_compare_prepared_mode(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        mode: crate::app::CompareViewMode,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+    ) -> bool {
+        if self.compare_prepared_pair.is_none() {
+            return false;
+        }
+
+        let shader_shape = self
+            .compare_prepared_pair
+            .as_ref()
+            .and_then(|pair| match mode {
+                crate::app::CompareViewMode::Wipe { fraction } => self.compare_shader_shape(
+                    image_rect,
+                    pair,
+                    crate::compare_wgpu::CompareShaderMode::Wipe,
+                    fraction,
+                    zoom_pan,
+                ),
+                crate::app::CompareViewMode::Diff => self.compare_shader_shape(
+                    image_rect,
+                    pair,
+                    crate::compare_wgpu::CompareShaderMode::Diff,
+                    0.5,
+                    zoom_pan,
+                ),
+                _ => None,
+            });
+        if let Some((draw_rect, shape)) = shader_shape {
+            let bg_style = self.fs_bg_style(ctx);
+            paint_transparent_bg(ui.painter(), draw_rect, &bg_style);
+            ui.painter().add(shape);
+            if let crate::app::CompareViewMode::Wipe { fraction } = mode {
+                Self::draw_compare_wipe_line(ui, image_rect, fraction);
+            }
+            return true;
+        }
+
+        match mode {
+            crate::app::CompareViewMode::PinnedNormal => {
+                let tex =
+                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Pinned);
+                let Some(tex) = tex.as_ref() else {
+                    return false;
+                };
+                let bg_style = self.fs_bg_style(ctx);
+                Self::draw_compare_pinned_image(ui, image_rect, tex, zoom_pan, &bg_style, None);
+                true
+            }
+            crate::app::CompareViewMode::Wipe { fraction } => {
+                let current =
+                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Current);
+                let pinned =
+                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Pinned);
+                let (Some(current), Some(pinned)) = (current.as_ref(), pinned.as_ref()) else {
+                    return false;
+                };
+                let bg_style = self.fs_bg_style(ctx);
+                Self::draw_compare_pinned_image(ui, image_rect, current, zoom_pan, &bg_style, None);
+                let wipe_x = image_rect.left() + image_rect.width() * fraction.clamp(0.05, 0.95);
+                let clip =
+                    egui::Rect::from_min_max(image_rect.min, egui::pos2(wipe_x, image_rect.max.y));
+                Self::draw_compare_pinned_image(
+                    ui,
+                    image_rect,
+                    pinned,
+                    zoom_pan,
+                    &bg_style,
+                    Some(clip),
+                );
+                Self::draw_compare_wipe_line(ui, image_rect, fraction);
+                true
+            }
+            crate::app::CompareViewMode::Diff => {
+                let tex =
+                    self.ensure_compare_prepared_texture(ctx, ComparePreparedTextureKind::Diff);
+                let Some(tex) = tex.as_ref() else {
+                    return false;
+                };
+                let bg_style = self.fs_bg_style(ctx);
+                Self::draw_compare_pinned_image(ui, image_rect, tex, zoom_pan, &bg_style, None);
+                true
+            }
+            crate::app::CompareViewMode::Off => false,
+        }
+    }
+
+    fn draw_compare_pinned_image(
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        tex: &egui::TextureHandle,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+        bg_style: &FsBgStyle<'_>,
+        clip_rect: Option<egui::Rect>,
+    ) {
+        let Some(img_rect) =
+            Self::compare_image_draw_rect(full_rect, [tex.size()[0], tex.size()[1]], zoom_pan)
+        else {
+            return;
+        };
+        let clip = clip_rect
+            .map(|r| r.intersect(full_rect))
+            .unwrap_or(full_rect);
+        let painter = ui.painter().with_clip_rect(clip);
+        paint_transparent_bg(&painter, img_rect, bg_style);
+        painter.image(
+            tex.id(),
+            img_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+    }
+
+    fn draw_compare_wipe_line(ui: &mut egui::Ui, image_rect: egui::Rect, fraction: f32) {
+        let x = image_rect.left() + image_rect.width() * fraction.clamp(0.05, 0.95);
+        ui.painter().line_segment(
+            [
+                egui::pos2(x, image_rect.top()),
+                egui::pos2(x, image_rect.bottom()),
+            ],
+            egui::Stroke::new(2.0, egui::Color32::from_white_alpha(150)),
+        );
+    }
+
+    fn draw_compare_pin_indicator(
+        &mut self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        ctx: &egui::Context,
+    ) {
+        let Some(display_name) = self
+            .pinned_compare_slot
+            .as_ref()
+            .map(|slot| slot.display_name.clone())
+        else {
+            return;
+        };
+        let tex = self.ensure_compare_pinned_texture(ctx);
+
+        let max_label_chars = 28usize;
+        let label = if display_name.chars().count() > max_label_chars {
+            let mut s: String = display_name.chars().take(max_label_chars).collect();
+            s.push('…');
+            format!("比較中: {s}")
+        } else {
+            format!("比較中: {display_name}")
+        };
+        let font = egui::FontId::proportional(13.0);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(label, font, egui::Color32::WHITE);
+        let thumb_size = egui::vec2(72.0, 54.0);
+        let width = (thumb_size.x + 10.0 + galley.size().x).min(full_rect.width() - 32.0);
+        let panel_size = egui::vec2(width + 16.0, thumb_size.y + 16.0);
+        let panel_rect = egui::Rect::from_min_size(
+            egui::pos2(
+                full_rect.max.x - panel_size.x - 18.0,
+                full_rect.max.y - panel_size.y - 18.0,
+            ),
+            panel_size,
+        );
+        ui.painter().rect_filled(
+            panel_rect,
+            4.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 185),
+        );
+        let thumb_rect =
+            egui::Rect::from_min_size(panel_rect.min + egui::vec2(8.0, 8.0), thumb_size);
+        ui.painter().rect_filled(
+            thumb_rect,
+            2.0,
+            egui::Color32::from_rgba_unmultiplied(35, 35, 35, 230),
+        );
+        if let Some(tex) = tex.as_ref() {
+            let tex_size = tex.size_vec2();
+            if tex_size.x > 0.0 && tex_size.y > 0.0 {
+                let scale = (thumb_rect.width() / tex_size.x).min(thumb_rect.height() / tex_size.y);
+                let draw_rect = egui::Rect::from_center_size(thumb_rect.center(), tex_size * scale);
+                ui.painter().image(
+                    tex.id(),
+                    draw_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+        let text_pos = egui::pos2(
+            thumb_rect.max.x + 10.0,
+            panel_rect.center().y - galley.size().y * 0.5,
+        );
+        ui.painter().galley(text_pos, galley, egui::Color32::WHITE);
     }
 
     /// 16×16 の市松テクスチャを lazy 生成する。
@@ -4679,6 +5346,7 @@ impl App {
         show_vst3_button: bool,
         vst3_panel_open: bool,
         vst3_pressed: &mut bool,
+        copy_capture_pressed: &mut bool,
     ) {
         let hover_in_top = ctx.input(|i| {
             i.pointer
@@ -4736,6 +5404,28 @@ impl App {
             *nav_delta = 0;
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+
+        // 📷 キャプチャコピー (画像のみ)。Ctrl+S のファイル保存と同じ snapshot 経路を使う。
+        if !is_video {
+            let camera_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_capture_copy_btn",
+                |hovered| bar_button_bg(hovered, false),
+                false,
+                |p, c, r| draw_camera_icon(p, c, r),
+            );
+            let camera_resp =
+                camera_resp.on_hover_text("クリック: クリップボードにコピー\nCtrl+S: ファイル保存");
+            if camera_resp.clicked() {
+                *copy_capture_pressed = true;
+            }
+            if camera_resp.hovered() {
+                *nav_delta = 0;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        }
 
         // VST ボタン: 動画モード + VST3 機能 ON のときだけ表示。
         // クリックで管理パネルを開く / 閉じる。management panel は egui::Window で
@@ -5361,6 +6051,7 @@ impl App {
         let elapsed = start_time.elapsed().as_secs_f32();
         if elapsed > duration {
             self.fs_feedback_toast = None;
+            self.fs_feedback_toast_reveal_path = None;
             return;
         }
 
@@ -5400,6 +6091,22 @@ impl App {
             font,
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 255.0) as u8),
         );
+
+        if let Some(path) = self.fs_feedback_toast_reveal_path.clone() {
+            let resp = ui
+                .interact(
+                    toast_rect,
+                    egui::Id::new("feedback_toast_reveal_capture"),
+                    egui::Sense::click(),
+                )
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("クリックで保存ファイルを表示");
+            if resp.clicked() {
+                crate::capture::reveal_path_async(path);
+                self.fs_feedback_toast = None;
+                self.fs_feedback_toast_reveal_path = None;
+            }
+        }
 
         // フェードアウト中は 30fps で再描画
         ctx.request_repaint_after(std::time::Duration::from_millis(33));
@@ -5611,6 +6318,453 @@ impl App {
             .ok();
     }
 
+    pub(crate) fn save_video_frame_to_file(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.capture_pending.is_some() {
+            self.show_feedback_toast("キャプチャ保存中です".to_string());
+            return;
+        }
+
+        let Some((path, target_secs)) = self.fs_video_player(fs_idx).and_then(|player| {
+            if player.error().is_some() || player.info().is_none() {
+                None
+            } else {
+                Some((player.path().clone(), player.screenshot_target_secs()))
+            }
+        }) else {
+            self.show_feedback_toast("動画フレームを保存できません".to_string());
+            return;
+        };
+
+        let output_dir = self.capture_output_dir_path();
+        let format = self.settings.capture_format;
+        let basename = crate::capture::basename_for_path(&path);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker_path = path.clone();
+        let thread = std::thread::Builder::new()
+            .name("video-frame-save".into())
+            .spawn(move || {
+                let result = match crate::video::screenshot::capture_frame(&worker_path, target_secs)
+                {
+                    Ok(frame) => {
+                        crate::logger::log(format!(
+                            "video frame captured for save: target={:.3}s decoded_target={:.3}s {}x{} {}",
+                            target_secs,
+                            frame.target_secs,
+                            frame.width,
+                            frame.height,
+                            worker_path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                        ));
+                        crate::capture::save_rgba_unique(
+                            &output_dir,
+                            &basename,
+                            format,
+                            frame.width,
+                            frame.height,
+                            &frame.rgba,
+                        )
+                    }
+                    Err(err) => Err(format!("動画フレーム取得に失敗しました: {err}")),
+                };
+                let _ = tx.send(result);
+            });
+
+        match thread {
+            Ok(_) => {
+                self.capture_pending = Some(crate::app::CapturePending { rx });
+                self.show_feedback_toast(format!("動画フレームを保存中 ({})", format.label()));
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(err) => {
+                self.show_feedback_toast(format!("保存 worker を開始できません: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn toggle_compare_pin_from_current(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.compare_pin_pending.is_some() {
+            self.show_feedback_toast("比較画像を準備中です".to_string());
+            return;
+        }
+
+        if self
+            .pinned_compare_slot
+            .as_ref()
+            .is_some_and(|slot| slot.source_idx == fs_idx)
+        {
+            self.pinned_compare_slot = None;
+            self.compare_view_mode = crate::app::CompareViewMode::Off;
+            self.compare_pin_load_pending = None;
+            self.compare_prepare_pending = None;
+            self.compare_prepared_pair = None;
+            self.compare_wipe_dragging = false;
+            self.show_feedback_toast("比較画像を解除しました".to_string());
+            ctx.request_repaint();
+            return;
+        }
+
+        let work = match self.prepare_capture_pixel_work(fs_idx) {
+            Ok(work) => work,
+            Err(err) => {
+                self.show_feedback_toast(err);
+                return;
+            }
+        };
+        self.start_compare_pin_work(ctx, fs_idx, work);
+    }
+
+    pub(crate) fn start_compare_pin_single(&mut self, ctx: &egui::Context, idx: usize) {
+        let work = match self.prepare_capture_pixel_job(idx) {
+            Ok(job) => crate::capture::CapturePixelWork::Single(job),
+            Err(err) => {
+                self.show_feedback_toast(err);
+                return;
+            }
+        };
+        self.start_compare_pin_work(ctx, idx, work);
+    }
+
+    fn start_compare_pin_work(
+        &mut self,
+        ctx: &egui::Context,
+        source_idx: usize,
+        work: crate::capture::CapturePixelWork,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("compare-pin".into())
+            .spawn(move || {
+                let result =
+                    crate::capture::run_pixel_work(work).map(|(basename, width, height, rgba)| {
+                        crate::app::ComparePinResult {
+                            basename,
+                            width,
+                            height,
+                            rgba,
+                        }
+                    });
+                let _ = tx.send(result);
+            });
+
+        match thread {
+            Ok(_) => {
+                self.compare_pin_load_pending = None;
+                self.compare_prepare_pending = None;
+                self.compare_prepared_pair = None;
+                self.compare_pin_pending = Some(crate::app::ComparePinPending { source_idx, rx });
+                self.show_feedback_toast("比較画像を準備中".to_string());
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(err) => {
+                self.show_feedback_toast(format!("比較 worker を開始できません: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn toggle_compare_pin_from_grid_selection(&mut self, ctx: &egui::Context) {
+        let Some(idx) = self.selected else {
+            self.show_feedback_toast("比較画像にする画像を選択してください".to_string());
+            return;
+        };
+        if !matches!(
+            self.items.get(idx),
+            Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. })
+        ) {
+            self.show_feedback_toast("このアイテムは比較画像に設定できません".to_string());
+            return;
+        }
+
+        if self.compare_pin_pending.is_some() {
+            self.show_feedback_toast("比較画像を準備中です".to_string());
+            return;
+        }
+
+        if self
+            .pinned_compare_slot
+            .as_ref()
+            .is_some_and(|slot| slot.source_idx == idx)
+        {
+            self.toggle_compare_pin_from_current(ctx, idx);
+            return;
+        }
+
+        let Some(source_key) = self.metadata_cache_key(idx) else {
+            self.show_feedback_toast("このアイテムは比較画像に設定できません".to_string());
+            return;
+        };
+
+        match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { .. }) | Some(FsCacheEntry::Animated { .. }) => {
+                self.start_compare_pin_single(ctx, idx);
+            }
+            Some(FsCacheEntry::Failed) => {
+                self.show_feedback_toast("比較画像を読み込めませんでした".to_string());
+            }
+            _ => {
+                if self.compare_pin_pending.is_some() {
+                    self.show_feedback_toast("比較画像を準備中です".to_string());
+                    return;
+                }
+                self.compare_pin_load_pending = Some(crate::app::ComparePinLoadPending {
+                    source_idx: idx,
+                    source_key,
+                });
+                if !self.fs_pending.contains_key(&idx) {
+                    self.start_fs_load(idx);
+                }
+                self.show_feedback_toast("比較画像を読み込み中".to_string());
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+
+    pub(crate) fn toggle_compare_pinned_view(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.pinned_compare_slot.is_none() {
+            self.show_feedback_toast("比較画像が未設定です。X で設定してください".to_string());
+            return;
+        }
+        self.compare_view_mode = match self.compare_view_mode {
+            crate::app::CompareViewMode::PinnedNormal => crate::app::CompareViewMode::Off,
+            crate::app::CompareViewMode::Off => crate::app::CompareViewMode::PinnedNormal,
+            crate::app::CompareViewMode::Wipe { .. } => crate::app::CompareViewMode::Off,
+            crate::app::CompareViewMode::Diff => crate::app::CompareViewMode::Off,
+        };
+        self.compare_wipe_dragging = false;
+        if matches!(
+            self.compare_view_mode,
+            crate::app::CompareViewMode::PinnedNormal
+        ) {
+            self.ensure_compare_prepared_pair(ctx, fs_idx);
+        }
+        let label = match self.compare_view_mode {
+            crate::app::CompareViewMode::PinnedNormal => "[比較: ピン表示]",
+            _ => "[比較: 現在表示]",
+        };
+        self.show_feedback_toast(label.to_string());
+    }
+
+    pub(crate) fn toggle_compare_wipe_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.pinned_compare_slot.is_none() {
+            self.show_feedback_toast("比較画像が未設定です。X で設定してください".to_string());
+            return;
+        }
+        self.compare_view_mode = match self.compare_view_mode {
+            crate::app::CompareViewMode::Wipe { .. } => crate::app::CompareViewMode::Off,
+            _ => crate::app::CompareViewMode::Wipe { fraction: 0.5 },
+        };
+        self.compare_wipe_dragging = false;
+        if matches!(
+            self.compare_view_mode,
+            crate::app::CompareViewMode::Wipe { .. }
+        ) {
+            self.ensure_compare_prepared_pair(ctx, fs_idx);
+        }
+        let label = match self.compare_view_mode {
+            crate::app::CompareViewMode::Wipe { .. } => "[比較: Wipe]",
+            _ => "[比較: Normal]",
+        };
+        self.show_feedback_toast(label.to_string());
+    }
+
+    pub(crate) fn toggle_compare_diff_mode(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.pinned_compare_slot.is_none() {
+            self.show_feedback_toast("比較画像が未設定です。X で設定してください".to_string());
+            return;
+        }
+        self.compare_view_mode = match self.compare_view_mode {
+            crate::app::CompareViewMode::Diff => crate::app::CompareViewMode::Off,
+            _ => crate::app::CompareViewMode::Diff,
+        };
+        self.compare_wipe_dragging = false;
+        if matches!(self.compare_view_mode, crate::app::CompareViewMode::Diff) {
+            self.ensure_compare_prepared_pair(ctx, fs_idx);
+        }
+        let label = match self.compare_view_mode {
+            crate::app::CompareViewMode::Diff => "[比較: Diff]",
+            _ => "[比較: Normal]",
+        };
+        self.show_feedback_toast(label.to_string());
+    }
+
+    pub(crate) fn save_image_capture_to_file(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.capture_pending.is_some() {
+            self.show_feedback_toast("キャプチャ保存中です".to_string());
+            return;
+        }
+
+        let work = match self.prepare_capture_pixel_work(fs_idx) {
+            Ok(work) => work,
+            Err(err) => {
+                self.show_feedback_toast(err);
+                return;
+            }
+        };
+        let format = self.settings.capture_format;
+        let output_dir = self.capture_output_dir_path();
+        let jpeg_matte =
+            crate::capture::JpegMatte::from_fs_transparent_bg_mode(self.fs_transparent_bg_mode);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let thread = std::thread::Builder::new()
+            .name("image-capture-save".into())
+            .spawn(move || {
+                let result = crate::capture::run_pixel_work(work).and_then(
+                    |(basename, width, height, rgba)| {
+                        crate::capture::save_rgba_unique_with_matte(
+                            &output_dir,
+                            &basename,
+                            format,
+                            jpeg_matte,
+                            width,
+                            height,
+                            &rgba,
+                        )
+                    },
+                );
+                let _ = tx.send(result);
+            });
+
+        match thread {
+            Ok(_) => {
+                self.capture_pending = Some(crate::app::CapturePending { rx });
+                self.show_feedback_toast(format!("キャプチャを保存中 ({})", format.label()));
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+            Err(err) => {
+                self.show_feedback_toast(format!("保存 worker を開始できません: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn copy_image_capture_to_clipboard(&mut self, fs_idx: usize) {
+        let work = match self.prepare_capture_pixel_work(fs_idx) {
+            Ok(work) => work,
+            Err(err) => {
+                self.show_feedback_toast(err);
+                return;
+            }
+        };
+        let clipboard_seq = crate::ui_dialogs::context_menu::reserve_clipboard_write_sequence();
+        std::thread::Builder::new()
+            .name("image-capture-clipboard".into())
+            .spawn(move || match crate::capture::run_pixel_work(work) {
+                Ok((_basename, width, height, rgba)) => {
+                    crate::ui_dialogs::context_menu::copy_rgba_image_to_clipboard_async_seq(
+                        width,
+                        height,
+                        rgba,
+                        clipboard_seq,
+                    );
+                }
+                Err(err) => {
+                    crate::logger::log(format!("image capture clipboard failed: {err}"));
+                }
+            })
+            .ok();
+        self.show_feedback_toast("キャプチャをクリップボードへコピー中".to_string());
+    }
+
+    fn prepare_capture_pixel_work(
+        &mut self,
+        idx: usize,
+    ) -> Result<crate::capture::CapturePixelWork, String> {
+        match self.resolve_spread_pair(idx) {
+            SpreadPair::Single => self
+                .prepare_capture_pixel_job(idx)
+                .map(crate::capture::CapturePixelWork::Single),
+            SpreadPair::Double { left, right } => {
+                let left_job = self.prepare_capture_pixel_job(left)?;
+                let right_job = self.prepare_capture_pixel_job(right)?;
+                let basename = crate::capture::basename_from_text(&format!(
+                    "{}_{}",
+                    left_job.basename, right_job.basename
+                ));
+                Ok(crate::capture::CapturePixelWork::Spread {
+                    basename,
+                    left: left_job,
+                    right: right_job,
+                })
+            }
+        }
+    }
+
+    fn prepare_capture_pixel_job(
+        &self,
+        idx: usize,
+    ) -> Result<crate::capture::CapturePixelJob, String> {
+        let basename = self
+            .capture_basename_for_idx(idx)
+            .ok_or_else(|| "このアイテムはキャプチャ保存できません".to_string())?;
+
+        if !self.post_filter_bypassed
+            && let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx)
+        {
+            return Ok(crate::capture::CapturePixelJob::already_adjusted(
+                basename,
+                pixels.clone(),
+            ));
+        }
+
+        let bg = self.effective_upscale_bg_mode();
+        let source = if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
+            self.ai_upscale_cache
+                .get(&(idx, bg))
+                .or_else(|| self.fs_cache.get(&idx))
+        } else {
+            self.fs_cache.get(&idx)
+        };
+        let Some(FsCacheEntry::Static { pixels, .. }) = source else {
+            if let Some(FsCacheEntry::Animated {
+                frame_pixels,
+                current_frame,
+                ..
+            }) = source
+            {
+                let Some(pixels) = frame_pixels.get(*current_frame) else {
+                    return Err("アニメーションフレームを取得できません".to_string());
+                };
+                return Ok(crate::capture::CapturePixelJob::already_adjusted(
+                    basename,
+                    pixels.clone(),
+                ));
+            }
+            return Err("画像の読み込み完了後に保存してください".to_string());
+        };
+
+        Ok(crate::capture::CapturePixelJob::needs_adjustment(
+            basename,
+            pixels.clone(),
+            self.effective_params(idx).clone(),
+        ))
+    }
+
+    fn capture_basename_for_idx(&self, idx: usize) -> Option<String> {
+        let item = self.items.get(idx)?;
+        match item {
+            GridItem::Image(path) => Some(crate::capture::basename_for_path(path)),
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => {
+                let zip = crate::capture::basename_for_path(zip_path);
+                let entry_name = crate::zip_loader::entry_basename(entry_name);
+                let entry = std::path::Path::new(entry_name)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(crate::capture::basename_from_text)
+                    .unwrap_or_else(|| "entry".to_string());
+                Some(format!("{zip}_{entry}"))
+            }
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => {
+                let pdf = crate::capture::basename_for_path(pdf_path);
+                Some(format!("{pdf}_p{:04}", page_num + 1))
+            }
+            _ => None,
+        }
+    }
+
     /// 動画のチャプター開始 / ブックマーク / ピンを 1 本の Vec に集約し pts 昇順で返す。
     /// シークバー描画 (マーカー縦線) と J/K ジャンプの両方が同じソースを使う。
     pub(crate) fn collect_video_nav_markers(&mut self, fs_idx: usize) -> Vec<NavMarker> {
@@ -5774,6 +6928,7 @@ impl App {
         // Phase 5.4.1: B キーで現在位置にブックマーク追加 (動画モード限定)。
         // 画像モードの B (透過背景循環) とは handle_video_input 先行 consume で分離。
         let bookmark_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B));
+        let save_frame_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S));
         // Phase 5.5: S キーでタイルモード トグル (動画モード限定)。画像モードの
         // S (スライドショー) とは handle_video_input 先行 consume で分離する。
         let tile_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S));
@@ -5786,6 +6941,12 @@ impl App {
         // (folder_thumb_pin toggle) と統一した「P = Pin」の mnemonic。画像モードの
         // ポストフィルタは T に移動済み。
         let pin_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
+        // 比較ビューは静止画 / ZIP / PDF 限定。動画では passthrough させず silent no-op として消費する。
+        let compare_x = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::X));
+        let compare_alt_c = ctx.input_mut(|i| i.consume_key(egui::Modifiers::ALT, egui::Key::C));
+        let compare_shift_c =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::C));
+        let compare_c = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::C));
         // W キー: 頭出し (= seek to 0 + play)。左手で押しやすく、画像モードでも未使用。
         let rewind_key = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::W));
         // J/K: チャプター・ブックマーク・ピンを 1 本のマーカー列にまとめて前後ジャンプ。
@@ -5810,6 +6971,13 @@ impl App {
         }
         if let Some(ctrl) = tile_left_ctrl.or(tile_right_ctrl) {
             self.handle_video_tile_cursor_key(ctx, fs_idx, ctrl, tile_left);
+            return;
+        }
+        if save_frame_key {
+            self.save_video_frame_to_file(ctx, fs_idx);
+            return;
+        }
+        if compare_x || compare_alt_c || compare_shift_c || compare_c {
             return;
         }
 

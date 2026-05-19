@@ -46,6 +46,11 @@ pub const CACHE_KEY_ZIP: &str = "zipthumb:";
 pub const CACHE_KEY_PDF: &str = "pdfthumb:";
 /// カタログ内のフォルダサムネイル用キャッシュキープレフィックス
 pub const CACHE_KEY_FOLDER: &str = "folderthumb:";
+/// フォルダ代表サムネの自動選定アルゴリズム世代。
+///
+/// cache key に含めることで、番号順などの選定ロジックを変えたときだけ古い代表
+/// サムネを避けて再スキャンする。フォルダ内容の変更を毎回検査する目的ではない。
+pub const FOLDER_THUMB_AUTO_ALGO_VERSION: u32 = 2;
 
 /// 親コンテナ (フォルダ / ZIP / PDF) に手動ピンが付いているときに、cache key の
 /// 後ろに `#pin:` 区切りで pin の identity を埋め込む (docs/virtual-folders.md §3.1)。
@@ -75,6 +80,26 @@ pub enum ResolveStrategy {
 /// placeholder mtime=0 で相手の thumb を読み込んでしまうため、**コンテナ path 丸ごと**
 /// をキーに含める。通常フォルダ閲覧とは別空間なので互いを上書きしない。
 pub const CACHE_KEY_SEARCH_REP: &str = "searchrep:";
+
+/// フォルダ代表サムネの自動選定用 cache key を組み立てる。
+///
+/// `identity` はフォルダ名または full path。ソート種別・探索深度・アルゴリズム世代を
+/// key に含め、設定やロジックが変わったときだけ古い自動代表サムネを読まないようにする。
+pub fn folder_thumb_auto_cache_key(
+    identity: &str,
+    sort: crate::settings::SortOrder,
+    depth: u32,
+) -> String {
+    let sort_token = match sort {
+        crate::settings::SortOrder::FileName => "name",
+        crate::settings::SortOrder::Numeric => "numeric",
+        crate::settings::SortOrder::DateAsc => "date-asc",
+        crate::settings::SortOrder::DateDesc => "date-desc",
+    };
+    format!(
+        "{CACHE_KEY_FOLDER}auto-v{FOLDER_THUMB_AUTO_ALGO_VERSION}:{sort_token}:d{depth}:{identity}"
+    )
+}
 
 // -----------------------------------------------------------------------
 // 共通型
@@ -864,8 +889,9 @@ pub fn process_load_request(
 }
 
 /// フォルダ内をスキャンして代表画像のパスを返す。
-/// `sort` で指定されたソート順で並べ、先頭の画像を選ぶ。
-/// 直接の子に画像がなければサブフォルダを再帰的に探索する（最大 `remaining_depth` 階層）。
+/// `sort` で指定されたソート順でフォルダブロックと画像ブロックをそれぞれ並べ、
+/// サムネイル一覧に近い順序 (フォルダ → 画像) で最初に見つかった画像を選ぶ。
+/// サブフォルダ再帰は最大 `remaining_depth` 階層。
 ///
 /// `pin_db` が `Some` のとき、サブフォルダ再帰の各段で「そのサブフォルダ自身に
 /// folder_thumb_pin が設定されていないか」を確認する。設定されていれば cascade
@@ -901,7 +927,7 @@ fn resolve_folder_thumb_image_inner(
 ) -> Option<std::path::PathBuf> {
     let entries = std::fs::read_dir(folder).ok()?;
     let mut images: Vec<(std::path::PathBuf, i64)> = Vec::new();
-    let mut subdirs: Vec<std::path::PathBuf> = Vec::new();
+    let mut subdirs: Vec<(std::path::PathBuf, i64)> = Vec::new();
 
     for entry in entries.flatten() {
         // entry.file_type() は FindFirstFile/FindNextFile の戻り値キャッシュを再利用するので
@@ -913,7 +939,11 @@ fn resolve_folder_thumb_image_inner(
         };
         let p = entry.path();
         if ft.is_dir() {
-            subdirs.push(p);
+            let mtime = entry
+                .metadata()
+                .ok()
+                .map_or(0, |m| crate::ui_helpers::mtime_secs(&m));
+            subdirs.push((p, mtime));
         } else if ft.is_file() {
             if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                 if crate::folder_tree::is_recognized_image_ext(&ext.to_ascii_lowercase()) {
@@ -927,32 +957,15 @@ fn resolve_folder_thumb_image_inner(
         }
     }
 
-    // このフォルダに画像があればソートして先頭を返す
-    if !images.is_empty() {
-        images.sort_by(|(a, a_mt), (b, b_mt)| {
+    // サムネイル一覧はフォルダブロックを画像より先に出すため、代表サムネも
+    // キャッシュミス時の自動選定ではサブフォルダを先に辿る。
+    if remaining_depth > 0 {
+        subdirs.sort_by(|(a, a_mt), (b, b_mt)| {
             let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
             let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
             sort.compare(an, *a_mt, bn, *b_mt, crate::ui_helpers::natural_sort_key)
         });
-        return Some(images.into_iter().next().unwrap().0);
-    }
-
-    // 画像がなく、まだ深く探索できるならサブフォルダを再帰探索
-    if remaining_depth > 0 {
-        // サブフォルダを名前順にソートして、最初に画像が見つかったものを採用
-        subdirs.sort_by(|a, b| {
-            a.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("")
-                .to_lowercase()
-                .cmp(
-                    &b.file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_lowercase(),
-                )
-        });
-        for sub in &subdirs {
+        for (sub, _) in &subdirs {
             // pin-aware: サブフォルダ自身に pin があれば cascade 解決して
             // leaf 画像を優先採用する。`folder_thumb_depth` を cascade depth 上限と
             // 兼用する (= 設定値が両方の動作上限になる)。
@@ -1001,6 +1014,15 @@ fn resolve_folder_thumb_image_inner(
                 return Some(img);
             }
         }
+    }
+
+    if !images.is_empty() {
+        images.sort_by(|(a, a_mt), (b, b_mt)| {
+            let an = a.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let bn = b.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            sort.compare(an, *a_mt, bn, *b_mt, crate::ui_helpers::natural_sort_key)
+        });
+        return Some(images.into_iter().next().unwrap().0);
     }
 
     None
@@ -1337,8 +1359,9 @@ pub fn load_one_cached(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::settings::CachePolicy;
+    use crate::settings::{CachePolicy, SortOrder};
     use std::path::PathBuf;
+    use tempfile::TempDir;
 
     fn make_decision(policy: CachePolicy, threshold_ms: u32, size_bytes: u64) -> CacheDecision {
         CacheDecision {
@@ -1431,6 +1454,62 @@ mod tests {
         d.webp_always = false;
         let webp = PathBuf::from("img.webp");
         assert!(!d.should_cache(&webp, 100, 0.0, 0.0));
+    }
+
+    #[test]
+    fn folder_thumb_auto_cache_key_includes_policy_version() {
+        let numeric = folder_thumb_auto_cache_key("folder", SortOrder::Numeric, 3);
+        let name = folder_thumb_auto_cache_key("folder", SortOrder::FileName, 3);
+        let depth = folder_thumb_auto_cache_key("folder", SortOrder::Numeric, 4);
+
+        assert!(numeric.starts_with(CACHE_KEY_FOLDER));
+        assert!(numeric.contains("auto-v2:numeric:d3:folder"));
+        assert_ne!(numeric, name);
+        assert_ne!(numeric, depth);
+    }
+
+    #[test]
+    fn resolve_folder_thumb_sorts_subdirs_numerically() {
+        let tmp = TempDir::new().unwrap();
+        let dir10 = tmp.path().join("dir10");
+        let dir2 = tmp.path().join("dir2");
+        std::fs::create_dir_all(&dir10).unwrap();
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir10.join("a.jpg"), b"not decoded").unwrap();
+        let expected = dir2.join("a.jpg");
+        std::fs::write(&expected, b"not decoded").unwrap();
+
+        let picked = resolve_folder_thumb_image(tmp.path(), SortOrder::Numeric, 1, None);
+
+        assert_eq!(picked, Some(expected));
+    }
+
+    #[test]
+    fn resolve_folder_thumb_prefers_folder_block_before_direct_images() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("01-sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let expected = sub.join("09.jpg");
+        std::fs::write(&expected, b"not decoded").unwrap();
+        std::fs::write(tmp.path().join("00.jpg"), b"not decoded").unwrap();
+
+        let picked = resolve_folder_thumb_image(tmp.path(), SortOrder::Numeric, 1, None);
+
+        assert_eq!(picked, Some(expected));
+    }
+
+    #[test]
+    fn resolve_folder_thumb_depth_zero_uses_direct_images() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("01-sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("00.jpg"), b"not decoded").unwrap();
+        let expected = tmp.path().join("01.jpg");
+        std::fs::write(&expected, b"not decoded").unwrap();
+
+        let picked = resolve_folder_thumb_image(tmp.path(), SortOrder::Numeric, 0, None);
+
+        assert_eq!(picked, Some(expected));
     }
 }
 

@@ -149,6 +149,59 @@ fn fullscreen_prefetch_candidates_respect_visible_indices() {
 }
 
 #[test]
+fn next_video_search_uses_visible_indices_and_skips_non_video_items() {
+    use crate::grid_item::GridItem;
+
+    let items = vec![
+        GridItem::Video(PathBuf::from("c:/a.mp4")),
+        GridItem::Image(PathBuf::from("c:/a.jpg")),
+        GridItem::ZipImage {
+            zip_path: PathBuf::from("c:/book.zip"),
+            entry_name: "p01.jpg".to_string(),
+        },
+        GridItem::PdfPage {
+            pdf_path: PathBuf::from("c:/scan.pdf"),
+            page_num: 0,
+            content_type: None,
+        },
+        GridItem::Video(PathBuf::from("c:/b.mp4")),
+        GridItem::Folder(PathBuf::from("c:/sub")),
+        GridItem::ZipSeparator {
+            dir_display: "chapter".to_string(),
+        },
+    ];
+    let visible_indices = vec![0, 1, 2, 3, 4, 5, 6];
+
+    assert_eq!(
+        App::find_next_video_in_visible_indices_from(&items, &visible_indices, 0, false),
+        Some(4),
+        "画像 / ZIP 内画像 / PDF ページ / フォルダ / セパレータを飛ばして次の動画を選ぶ"
+    );
+    assert_eq!(
+        App::find_next_video_in_visible_indices_from(&items, &visible_indices, 4, false),
+        None,
+        "末尾側に動画が無ければ Continuous は停止する"
+    );
+    assert_eq!(
+        App::find_next_video_in_visible_indices_from(&items, &visible_indices, 4, true),
+        Some(0),
+        "ContinuousLoop は visible_indices の先頭側へ wrap する"
+    );
+
+    let filtered = vec![4];
+    assert_eq!(
+        App::find_next_video_in_visible_indices_from(&items, &filtered, 4, true),
+        Some(4),
+        "表示リストに動画 1 本だけなら同じ動画を繰り返す"
+    );
+    assert_eq!(
+        App::find_next_video_in_visible_indices_from(&items, &[1, 2, 3], 4, true),
+        None,
+        "現在動画が表示リスト外で、wrap しても動画候補が無ければ None"
+    );
+}
+
+#[test]
 fn fullscreen_keep_set_keeps_current_image_when_filtered_out() {
     use crate::grid_item::GridItem;
 

@@ -53,6 +53,7 @@ pub enum FsCacheEntry {
     },
     Animated {
         frames: Vec<(egui::TextureHandle, f64)>, // (texture, delay_secs)
+        frame_pixels: Vec<std::sync::Arc<egui::ColorImage>>,
         current_frame: usize,
         next_frame_at: f64, // ctx.input(|i| i.time) 基準
         /// Static と同じく perf 相関用の load_seq。

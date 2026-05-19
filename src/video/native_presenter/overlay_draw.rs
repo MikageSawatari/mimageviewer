@@ -2992,6 +2992,98 @@ pub(super) fn draw_overlay_loop_icon(
     ));
 }
 
+pub(super) fn draw_overlay_continuous_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    mode: crate::video::VideoContinuousMode,
+) {
+    fn draw_triangle(painter: &egui::Painter, c: egui::Pos2, w: f32, h: f32, color: egui::Color32) {
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                egui::pos2(c.x + w * 0.45, c.y),
+                egui::pos2(c.x - w * 0.45, c.y - h * 0.5),
+                egui::pos2(c.x - w * 0.45, c.y + h * 0.5),
+            ],
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
+    fn draw_arrow_head(
+        painter: &egui::Painter,
+        tip: egui::Pos2,
+        dir: egui::Vec2,
+        size: f32,
+        color: egui::Color32,
+    ) {
+        let dir = dir.normalized();
+        let normal = egui::vec2(-dir.y, dir.x);
+        let base = tip - dir * size;
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                tip,
+                base + normal * size * 0.55,
+                base - normal * size * 0.55,
+            ],
+            color,
+            egui::Stroke::NONE,
+        ));
+    }
+
+    let c = rect.center();
+    let side = rect.width().min(rect.height());
+    let base = egui::Color32::from_rgb(238, 238, 238);
+    let accent = egui::Color32::from_rgb(35, 175, 225);
+    let stroke = egui::Stroke::new((side * 0.055).max(1.25), base);
+    let row_gap = side * 0.24;
+    let y0 = c.y - row_gap;
+    let y1 = c.y;
+    let y2 = c.y + row_gap;
+    let line_x0 = c.x - side * 0.12;
+    let line_x1 = c.x + side * 0.08;
+    let dot_x = c.x - side * 0.34;
+    let dot_r = side * 0.035;
+
+    draw_triangle(
+        painter,
+        egui::pos2(dot_x, y0),
+        side * 0.22,
+        side * 0.25,
+        base,
+    );
+    painter.line_segment([egui::pos2(line_x0, y0), egui::pos2(line_x1, y0)], stroke);
+    for y in [y1, y2] {
+        painter.circle_filled(egui::pos2(dot_x, y), dot_r, base);
+        painter.line_segment([egui::pos2(line_x0, y), egui::pos2(line_x1, y)], stroke);
+    }
+
+    let arrow_stroke = egui::Stroke::new((side * 0.075).max(1.65), accent);
+    let arrow_size = side * 0.15;
+    match mode {
+        crate::video::VideoContinuousMode::Off => {}
+        crate::video::VideoContinuousMode::Continuous => {
+            let elbow_x = c.x + side * 0.40;
+            let start = egui::pos2(line_x1 + side * 0.10, y0);
+            let elbow = egui::pos2(elbow_x, y0);
+            let tip = egui::pos2(elbow_x, y1 + side * 0.13);
+            painter.line_segment([start, elbow], arrow_stroke);
+            painter.line_segment([elbow, tip], arrow_stroke);
+            draw_arrow_head(painter, tip, egui::vec2(0.0, 1.0), arrow_size, accent);
+        }
+        crate::video::VideoContinuousMode::ContinuousLoop => {
+            let right_x = c.x + side * 0.43;
+            let tail_x = line_x1 + side * 0.10;
+            let tip = egui::pos2(line_x1 + side * 0.06, y0);
+            let top_right = egui::pos2(right_x, y0);
+            let bottom_right = egui::pos2(right_x, y2);
+            let bottom_start = egui::pos2(tail_x, y2);
+            painter.line_segment([bottom_start, bottom_right], arrow_stroke);
+            painter.line_segment([bottom_right, top_right], arrow_stroke);
+            painter.line_segment([top_right, tip], arrow_stroke);
+            draw_arrow_head(painter, tip, egui::vec2(-1.0, 0.0), arrow_size, accent);
+        }
+    }
+}
+
 pub(super) fn draw_overlay_bookmark_icon(
     painter: &egui::Painter,
     c: egui::Pos2,

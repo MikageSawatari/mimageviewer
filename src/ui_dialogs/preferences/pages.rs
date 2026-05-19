@@ -192,6 +192,65 @@ pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
 }
 
+pub(super) fn page_capture(ui: &mut egui::Ui, state: &mut PreferencesState) {
+    let s = &mut state.settings;
+
+    ui.label("Ctrl+S で保存するキャプチャの形式と保存先を設定します。");
+    ui.add_space(8.0);
+
+    egui::ComboBox::from_label("保存形式")
+        .selected_text(s.capture_format.label())
+        .show_ui(ui, |ui| {
+            for format in [
+                crate::capture::CaptureFormat::Png,
+                crate::capture::CaptureFormat::Jpeg95,
+                crate::capture::CaptureFormat::Jpeg85,
+                crate::capture::CaptureFormat::Jpeg75,
+            ] {
+                ui.selectable_value(&mut s.capture_format, format, format.label());
+            }
+        });
+
+    ui.add_space(8.0);
+    ui.label("保存先フォルダ");
+    ui.horizontal(|ui| {
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut state.capture_output_dir_input)
+                .desired_width(360.0)
+                .hint_text(crate::capture::default_output_dir().display().to_string()),
+        );
+        if response.changed() {
+            let trimmed = state.capture_output_dir_input.trim();
+            s.capture_output_dir = if trimmed.is_empty() {
+                None
+            } else {
+                Some(std::path::PathBuf::from(trimmed))
+            };
+        }
+        if ui.button("既定に戻す").clicked() {
+            state.capture_output_dir_input.clear();
+            s.capture_output_dir = None;
+        }
+        if ui.button("フォルダを開く").clicked() {
+            let dir = s
+                .capture_output_dir
+                .clone()
+                .unwrap_or_else(crate::capture::default_output_dir);
+            crate::capture::open_output_dir_async(dir);
+        }
+    });
+
+    let effective = s
+        .capture_output_dir
+        .clone()
+        .unwrap_or_else(crate::capture::default_output_dir);
+    ui.label(
+        egui::RichText::new(format!("実際の保存先: {}", effective.display()))
+            .size(11.0)
+            .color(egui::Color32::from_gray(140)),
+    );
+}
+
 pub(super) fn page_parallelism(ui: &mut egui::Ui, state: &mut PreferencesState) {
     let s = &mut state.settings;
     let is_auto = s.parallelism == Parallelism::Auto;

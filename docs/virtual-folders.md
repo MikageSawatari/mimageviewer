@@ -89,13 +89,14 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 | GridItem | `zip_entry` | `pdf_page` | `cache_key_override` | サムネ取得方法 |
 | --- | --- | --- | --- | --- |
 | Image | None | None | なし | ファイル直接デコード |
-| Folder | None | None | `folderthumb:{dirname}` | 再帰的に代表画像を探してデコード |
+| Folder | None | None | `folderthumb:auto-vN:{sort}:d{depth}:{dirname}` | 再帰的に代表画像を探してデコード |
 | ZipFile | None | None | `zipthumb:{filename}` | `zip_loader::read_first_image_bytes` で先頭画像 |
 | PdfFile | None | Some(0) | `pdfthumb:{filename}` | PDF ワーカーでページ 0 をレンダリング |
 | ZipImage | Some(entry) | None | なし (entry が自動キー) | ZIP からエントリバイト → decode |
 | PdfPage | None | Some(page) | `pdf_page_cache_key(page)` | PDF ワーカーでそのページをレンダリング |
 
-**キャッシュキーの命名規則**を勝手に変えないこと。既存キャッシュが全部無効になる。
+**キャッシュキーの命名規則**を勝手に変えないこと。Folder 自動代表は選定
+アルゴリズム世代を明示して、意図したロジック変更時だけ既存キャッシュを外す。
 
 #### 3.1.1 親コンテナの代表サムネピン (folder thumb pin、v0.9.x)
 
@@ -219,11 +220,17 @@ Folder/ZipFile/PdfFile のサムネイルはそれぞれ別ロジックで「代
 
 | 容器 | 実装 | 「先頭」の定義 |
 | --- | --- | --- |
-| Folder | `folder_tree.rs` で再帰走査 | ソート順設定 (`folder_thumb_sort`) と深さ制限 (`folder_thumb_depth`) に従う |
+| Folder | `thumb_loader::resolve_folder_thumb_image` で再帰走査 | cache miss 時に、サムネイル一覧に近い順序としてサブフォルダを `folder_thumb_sort` で先に辿り、見つからなければ直接画像を同じ sort で選ぶ。深さは `folder_thumb_depth` |
 | ZipFile | `zip_loader::read_first_image_bytes` | エントリ名の昇順で最初の画像拡張子 |
 | PdfFile | PDF ワーカーでページ 0 を固定取得 | 常に `page_num = 0` |
 
-ここは歴史的にバラバラに実装されていて、統一できていない。触るなら 3 箇所まとめて。
+Folder 自動代表の cache key には自動選定アルゴリズム版・`folder_thumb_sort`・
+`folder_thumb_depth` を含める。キャッシュヒット時は表示速度を優先して毎回の
+再スキャンはしないが、選定ロジックや設定が変わったときは古い自動代表 WebP を
+読まずに再生成される。特定画像を厳密に使いたい場合は folder thumb pin を使う。
+
+ここは歴史的にバラバラに実装されていて、完全には統一できていない。触るなら
+3 箇所まとめて確認する。
 
 ---
 

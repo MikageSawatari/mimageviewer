@@ -683,6 +683,14 @@ pub struct Settings {
     #[serde(default = "default_slideshow_interval")]
     pub slideshow_interval_secs: f32,
 
+    // ── キャプチャ保存 ──────────────────────────────────────────
+    /// Ctrl+S キャプチャ保存先。None のときは OS の Pictures/mimageviewer を使う。
+    #[serde(default)]
+    pub capture_output_dir: Option<PathBuf>,
+    /// Ctrl+S キャプチャ保存形式。
+    #[serde(default)]
+    pub capture_format: crate::capture::CaptureFormat,
+
     // ── 見開き表示 ──────────────────────────────────────────
     /// デフォルトの見開き表示モード
     #[serde(default)]
@@ -1519,6 +1527,8 @@ impl Default for Settings {
             skip_duplicate_images: true,
             image_ext_priority: default_image_ext_priority(),
             slideshow_interval_secs: default_slideshow_interval(),
+            capture_output_dir: None,
+            capture_format: crate::capture::CaptureFormat::default(),
             default_spread_mode: SpreadMode::default(),
             ui_theme: UiTheme::default(),
             tags: Vec::new(),

@@ -103,6 +103,7 @@
           <tr><td><kbd>R</kbd></td><td>選択画像を右に回転</td></tr>
           <tr><td><kbd>L</kbd></td><td>選択画像を左に回転</td></tr>
           <tr><td><kbd>P</kbd></td><td>選択中のアイテムを現在のフォルダ / ZIP / PDF の代表サムネイルに固定 / 解除（アドレスバー <span aria-hidden="true">📌</span> ボタンの左クリックと同じ動作）。詳しくは <a href="grid.html#folder-thumb-pin">代表サムネイルを手動で指定する</a> を参照</td></tr>
+          <tr><td><kbd>X</kbd></td><td>選択中の画像・ZIP 内画像・PDF ページを比較スロットへピン留め / 解除</td></tr>
         </tbody>
       </table>
     </div>
@@ -250,7 +251,12 @@
           <tr><td><kbd>E</kbd></td><td>消しゴムモード開始 / マスクを確定して AI 補完実行（<a href="erase.html">詳細</a>）</td></tr>
           <tr><td><kbd>I</kbd> / <kbd>Tab</kbd></td><td>メタデータパネルの固定表示切り替え</td></tr>
           <tr><td><kbd>S</kbd></td><td>スライドショー 再生 / 停止</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>画像フルスクリーン中：現在表示中の画像・アニメーション現在フレーム・ZIP 内画像・PDF ページをキャプチャ保存フォルダへ保存</td></tr>
           <tr><td><kbd>P</kbd></td><td>画像フルスクリーン中：現在表示中のアイテムを現在のフォルダ / ZIP / PDF の代表サムネイルに固定 / 解除。グリッドの P と統一した「P = Pin」</td></tr>
+          <tr><td><kbd>X</kbd></td><td>画像フルスクリーン中：現在表示中の画像・ZIP 内画像・PDF ページを比較スロットへピン留め / 解除</td></tr>
+          <tr><td><kbd>C</kbd></td><td>画像フルスクリーン中：比較スロットのピン画像と現在画像をトグル表示</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>C</kbd></td><td>画像フルスクリーン中：Wipe 比較を ON/OFF（左=ピン、右=現在。縦線はドラッグ可能）</td></tr>
+          <tr><td><kbd>Alt</kbd>+<kbd>C</kbd></td><td>画像フルスクリーン中：差分比較を ON/OFF（RGB チャンネルごとの差分を色付きで強調表示）</td></tr>
           <tr><td><kbd>Space</kbd></td><td>スライドショー再生中：停止 ／ 停止中：チェック ON/OFF（動画でも同じ）</td></tr>
           <tr><td><kbd>Enter</kbd></td><td>動画フルスクリーン中：再生 / 一時停止トグル</td></tr>
           <tr><td><kbd>Shift</kbd>+<kbd>Enter</kbd></td><td>動画を外部プレイヤーで開く</td></tr>
@@ -261,6 +267,8 @@
           <tr><td><kbd>Ctrl</kbd>+<kbd>←</kbd> / <kbd>→</kbd>（タイル中）</td><td>強調カーソルを 1 行分移動。<kbd>Shift</kbd> はタイル中の左右移動では無視</td></tr>
           <tr><td><kbd>Enter</kbd>（タイル中）</td><td>強調カーソルの位置から再生</td></tr>
           <tr><td><kbd>P</kbd></td><td>動画フルスクリーン中：現在再生位置のフレームをピン留め（= HUD の <span aria-hidden="true">📌</span> ボタンと同じ）。グリッドの P（代表サムネ固定）と統一した「P = Pin」</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>動画フルスクリーン中：現在フレームをキャプチャ保存フォルダへ保存</td></tr>
+          <tr><td>HUD 連続再生ボタン</td><td>動画フルスクリーン中：オフ → 連続再生 → 連続再生 + ループを切替。連続再生中は <kbd>L</kbd> のループ切替は無効</td></tr>
           <tr><td><kbd>F</kbd></td><td>動画フルスクリーン中：Perf / フレームレートオーバーレイの ON/OFF</td></tr>
           <tr><td><kbd>←</kbd> / <kbd>→</kbd></td><td>動画フルスクリーン中：5 秒シーク（前 / 次）</td></tr>
           <tr><td><kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd></td><td>動画フルスクリーン中：1 秒シーク（細かい調整）</td></tr>

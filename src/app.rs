@@ -149,6 +149,86 @@ pub(crate) struct UpdateCheckPending {
     pub(crate) manual: bool,
 }
 
+pub(crate) struct CapturePending {
+    pub(crate) rx: mpsc::Receiver<Result<PathBuf, String>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum CompareViewMode {
+    Off,
+    PinnedNormal,
+    Wipe { fraction: f32 },
+    Diff,
+}
+
+impl Default for CompareViewMode {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+impl CompareViewMode {
+    pub(crate) fn is_overlay(self) -> bool {
+        matches!(self, Self::Wipe { .. } | Self::Diff)
+    }
+}
+
+pub(crate) struct PinnedCompareSlot {
+    pub(crate) pixels: Arc<egui::ColorImage>,
+    pub(crate) texture: Option<egui::TextureHandle>,
+    pub(crate) display_name: String,
+    pub(crate) source_idx: usize,
+    pub(crate) source_size: [usize; 2],
+}
+
+pub(crate) struct ComparePinResult {
+    pub(crate) basename: String,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) rgba: Vec<u8>,
+}
+
+pub(crate) struct ComparePinPending {
+    pub(crate) source_idx: usize,
+    pub(crate) rx: mpsc::Receiver<Result<ComparePinResult, String>>,
+}
+
+pub(crate) struct ComparePinLoadPending {
+    pub(crate) source_idx: usize,
+    pub(crate) source_key: String,
+}
+
+pub(crate) struct ComparePreparedPair {
+    pub(crate) key: u64,
+    pub(crate) current_idx: usize,
+    pub(crate) pinned_source_idx: usize,
+    pub(crate) target_size: [usize; 2],
+    pub(crate) pinned_rgba: Arc<Vec<u8>>,
+    pub(crate) current_rgba: Arc<Vec<u8>>,
+    pub(crate) pinned_pixels: Arc<egui::ColorImage>,
+    pub(crate) current_pixels: Arc<egui::ColorImage>,
+    pub(crate) diff_pixels: Arc<egui::ColorImage>,
+    pub(crate) pinned_texture: Option<egui::TextureHandle>,
+    pub(crate) current_texture: Option<egui::TextureHandle>,
+    pub(crate) diff_texture: Option<egui::TextureHandle>,
+}
+
+pub(crate) struct ComparePrepareResult {
+    pub(crate) current_idx: usize,
+    pub(crate) pinned_source_idx: usize,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) pinned_rgba: Vec<u8>,
+    pub(crate) current_rgba: Vec<u8>,
+    pub(crate) diff_rgba: Vec<u8>,
+}
+
+pub(crate) struct ComparePreparePending {
+    pub(crate) current_idx: usize,
+    pub(crate) pinned_source_idx: usize,
+    pub(crate) rx: mpsc::Receiver<Result<ComparePrepareResult, String>>,
+}
+
 /// 起動オーバーレイ用の `StartupProgressHook` を作る共通ヘルパー。
 /// `IndexerManager::new` が各 sub-step の前に呼び、Mutex 内の文字列を更新する。
 fn make_progress_hook(progress: Arc<Mutex<String>>) -> crate::indexer_manager::StartupProgressHook {
@@ -593,9 +673,7 @@ use crate::folder_tree::{
 };
 
 // キャッシュキー定数は thumb_loader.rs に定義 (ベンチマーク bin からも参照するため)
-pub(crate) use crate::thumb_loader::{
-    CACHE_KEY_FOLDER, CACHE_KEY_PDF, CACHE_KEY_SEARCH_REP, CACHE_KEY_ZIP,
-};
+pub(crate) use crate::thumb_loader::{CACHE_KEY_PDF, CACHE_KEY_SEARCH_REP, CACHE_KEY_ZIP};
 
 /// レーティングフィルタを 1 アイテムに適用し、可視かを返す。
 ///
@@ -1860,6 +1938,17 @@ pub struct App {
     /// PowerShell 経由の paste が完了する前に reload しても無駄走査になるため、
     /// 完了通知を待ってから再読込する (docs/ui-responsiveness.md §4)。
     pub(crate) paste_pending: Vec<std::sync::mpsc::Receiver<()>>,
+    /// Ctrl+S / キャプチャ保存の worker 完了待ち。
+    pub(crate) capture_pending: Option<CapturePending>,
+    /// X / C 比較ビューのピン留めスロット。CPU pixels を正とし、texture は派生物。
+    pub(crate) pinned_compare_slot: Option<PinnedCompareSlot>,
+    pub(crate) compare_view_mode: CompareViewMode,
+    pub(crate) compare_pin_load_pending: Option<ComparePinLoadPending>,
+    pub(crate) compare_pin_pending: Option<ComparePinPending>,
+    pub(crate) compare_prepare_pending: Option<ComparePreparePending>,
+    pub(crate) compare_prepared_pair: Option<ComparePreparedPair>,
+    pub(crate) compare_prepared_next_key: u64,
+    pub(crate) compare_wipe_dragging: bool,
     /// フォルダ読み込み後に選択するアイテム名（BS で親に戻るとき等）
     pub(crate) select_after_load: Option<String>,
 
@@ -2130,6 +2219,12 @@ pub struct App {
     /// `open_fullscreen` 経由で動画を実際に open するときに
     /// `mem::take` で取り出して reset される (= 1 度だけ有効)。
     pub(crate) fs_open_intent_from_grid: bool,
+    /// 次に開く動画だけ autoplay 設定を上書きする one-shot state。
+    /// 連続再生の自動遷移ではユーザー設定に関わらず再生開始するために使う。
+    pub(crate) fs_video_open_autoplay_override: Option<bool>,
+    /// 次に開く動画だけ resume 位置を無視して先頭から開く one-shot state。
+    /// 連続再生の自動遷移では前回視聴位置ではなく 0 秒から再生する。
+    pub(crate) fs_video_open_ignore_resume_once: bool,
     /// 動画ピン留めの書き換えがあったので、フルスクリーン解除時 / 次回 grid 表示時
     /// に動画サムネ オーバーライド map を再構築する必要があるフラグ (Phase 8.B')。
     pub(crate) video_thumb_overrides_dirty: bool,
@@ -2151,6 +2246,13 @@ pub struct App {
     /// fullscreen から動画を切り替えた時 (= fs_cache から Video エントリが消える時) に
     /// クリアされる。
     pub(crate) last_loop_pos: std::collections::HashMap<usize, (f64, u64)>,
+    /// 動画連続再生モード。既存ループ設定とは排他で、アプリ再起動では保持しない
+    /// session-only state として扱う。
+    pub(crate) video_continuous_mode: crate::video::VideoContinuousMode,
+    /// 同じ EOF を複数フレーム連続で処理しないための `(fs_idx, seek_serial)` 記録。
+    /// `source_epoch` ではなく `AvClock::current_seek_serial()` を使うことで、同一動画を
+    /// seek(0) で再生し直した場合も次の EOF は別イベントとして扱える。
+    pub(crate) video_continuous_last_eof: Option<(usize, u64)>,
     /// 動画再生中の FPS / フレーム間隔オーバーレイ (F キーでトグル)。
     pub(crate) video_perf_overlay_visible: bool,
 
@@ -2490,6 +2592,9 @@ pub struct App {
     /// 専用だった頃の名残。表示秒数はトーストごとに指定でき、短い確認系は既定
     /// `FEEDBACK_TOAST_DURATION`、複数行の案内文は長めを使う。
     pub(crate) fs_feedback_toast: Option<(String, std::time::Instant, f32)>,
+    /// フィードバックトーストをクリックしたときに Explorer で選択表示する対象。
+    /// 通常トーストでは None。キャプチャ保存成功時だけ Some にする。
+    pub(crate) fs_feedback_toast_reveal_path: Option<PathBuf>,
     /// フルスクリーンでマウスカーソルの最終活動時刻 (移動 / クリック / キー入力)。
     /// パネル / HUD が全て非表示で `CURSOR_HIDE_IDLE_SECS` 経過したらカーソルを隠す。
     /// `None` はまだ活動が記録されていない状態 (= 直前に活動があったとみなしカーソル表示)。
@@ -3079,6 +3184,15 @@ impl App {
             delete_targets: Vec::new(),
             pending_reload: false,
             paste_pending: Vec::new(),
+            capture_pending: None,
+            pinned_compare_slot: None,
+            compare_view_mode: CompareViewMode::Off,
+            compare_pin_load_pending: None,
+            compare_pin_pending: None,
+            compare_prepare_pending: None,
+            compare_prepared_pair: None,
+            compare_prepared_next_key: 1,
+            compare_wipe_dragging: false,
             select_after_load: None,
             video_thumb_overrides: std::collections::HashMap::new(),
             show_rotation_reset_confirm: false,
@@ -3181,12 +3295,16 @@ impl App {
             native_video_source_epoch_next: 1,
             video_tile_cache,
             fs_open_intent_from_grid: false,
+            fs_video_open_autoplay_override: None,
+            fs_video_open_ignore_resume_once: false,
             video_thumb_overrides_dirty: false,
             #[cfg(windows)]
             pending_pin_thumb_refresh: None,
             fullscreen_video_marker_cache: None,
             fullscreen_video_marker_thumb_decode_pending: None,
             last_loop_pos: std::collections::HashMap::new(),
+            video_continuous_mode: crate::video::VideoContinuousMode::Off,
+            video_continuous_last_eof: None,
             video_perf_overlay_visible: false,
             rating_db,
             rating_cache: std::collections::HashMap::new(),
@@ -3290,6 +3408,7 @@ impl App {
             ime_composing: false,
             ime_last_event_at: None,
             fs_feedback_toast: None,
+            fs_feedback_toast_reveal_path: None,
             cursor_last_activity: None,
             cursor_hidden: false,
             video_playback_speed: 1.0,
@@ -4111,7 +4230,8 @@ impl App {
                     it,
                     &pin_map_for_existing,
                     self.folder_thumb_pin_db.as_deref(),
-                    self.settings.folder_thumb_depth as usize,
+                    Some(self.settings.folder_thumb_sort),
+                    self.settings.folder_thumb_depth,
                     // 通常 load_folder 経路は basename ベース (= 同じ親内なので unique)
                     false,
                 )
@@ -5258,7 +5378,8 @@ impl App {
                     it,
                     &pin_map_for_existing,
                     self.folder_thumb_pin_db.as_deref(),
-                    self.settings.folder_thumb_depth as usize,
+                    Some(self.settings.folder_thumb_sort),
+                    self.settings.folder_thumb_depth,
                     // T54 follow-on: 検索結果は full-path ベース (= 異なる親フォルダの
                     // 同名コンテナが共存しうるので basename だと衝突する)
                     true,
@@ -6327,7 +6448,7 @@ impl App {
             self.setup_virtual_folder_seed_and_writeback(&source_path, cat, &cache_map);
         }
         // Phase C: フォルダピンの source が Video の場合、video_pins DB の抽出済み
-        // WebP を folder の pinned cache key (`folderthumb:{dir}#pin:{source_id}`) で
+        // WebP を folder の pinned cache key (`folderthumb:auto-v...#pin:{source_id}`) で
         // catalog + cache_map にミラーする。これにより worker は pinned_key で
         // cache_hit して動画フレームをそのまま表示できる (= 動画自身を Shell API で
         // 取り直す経路を踏まない)。`catalog_existing_keys` には既に pinned 形式が
@@ -6594,7 +6715,12 @@ impl App {
             if !matches!(resolved.kind, ResolvedKind::Video) {
                 continue;
             }
-            let Some(base_key) = container_cache_base_key(item, use_full_path_keys) else {
+            let Some(base_key) = container_cache_base_key(
+                item,
+                use_full_path_keys,
+                Some(self.settings.folder_thumb_sort),
+                self.settings.folder_thumb_depth,
+            ) else {
                 continue;
             };
             let pinned_key = format!(
@@ -7412,6 +7538,219 @@ impl App {
         if self.paste_pending.len() < before {
             self.pending_reload = true;
         }
+    }
+
+    pub(crate) fn poll_capture_pending(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.capture_pending.as_ref() else {
+            return;
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("キャプチャ保存が中断されました".to_string())
+            }
+        };
+        self.capture_pending = None;
+        match result {
+            Ok(path) => {
+                crate::logger::log(format!("capture saved: {}", path.display()));
+                self.show_capture_saved_toast(path);
+            }
+            Err(err) => {
+                crate::logger::log(format!("capture save failed: {err}"));
+                self.show_feedback_toast(format!("保存できません: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn poll_compare_pin_pending(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.compare_pin_pending.as_ref() else {
+            return;
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("比較画像の準備が中断されました".to_string())
+            }
+        };
+        let source_idx = pending.source_idx;
+        self.compare_pin_pending = None;
+        self.compare_pin_load_pending = None;
+        match result {
+            Ok(result) => {
+                let expected = result.width as usize * result.height as usize * 4;
+                if result.rgba.len() != expected {
+                    self.show_feedback_toast("比較画像のサイズが不正です".to_string());
+                    return;
+                }
+                let pixels = egui::ColorImage::from_rgba_unmultiplied(
+                    [result.width as usize, result.height as usize],
+                    &result.rgba,
+                );
+                let display_name = result.basename;
+                self.pinned_compare_slot = Some(PinnedCompareSlot {
+                    source_size: pixels.size,
+                    pixels: Arc::new(pixels),
+                    texture: None,
+                    display_name: display_name.clone(),
+                    source_idx,
+                });
+                self.compare_view_mode = CompareViewMode::Off;
+                self.compare_prepare_pending = None;
+                self.compare_prepared_pair = None;
+                self.compare_wipe_dragging = false;
+                self.show_feedback_toast(format!("比較画像を設定: {display_name}"));
+                ctx.request_repaint();
+            }
+            Err(err) => {
+                crate::logger::log(format!("compare pin failed: {err}"));
+                self.show_feedback_toast(format!("比較画像を設定できません: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn poll_compare_pin_load_pending(&mut self, ctx: &egui::Context) {
+        let Some((source_idx, source_key)) = self
+            .compare_pin_load_pending
+            .as_ref()
+            .map(|pending| (pending.source_idx, pending.source_key.clone()))
+        else {
+            return;
+        };
+
+        let Some(current_key) = self.metadata_cache_key(source_idx) else {
+            self.compare_pin_load_pending = None;
+            return;
+        };
+        if current_key != source_key {
+            self.compare_pin_load_pending = None;
+            return;
+        }
+
+        if self.compare_pin_pending.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+
+        match self.fs_cache.get(&source_idx) {
+            Some(FsCacheEntry::Static { .. }) | Some(FsCacheEntry::Animated { .. }) => {
+                self.compare_pin_load_pending = None;
+                self.start_compare_pin_single(ctx, source_idx);
+            }
+            Some(FsCacheEntry::Failed) => {
+                self.compare_pin_load_pending = None;
+                self.show_feedback_toast("比較画像を読み込めませんでした".to_string());
+            }
+            Some(FsCacheEntry::Video { .. }) => {
+                self.compare_pin_load_pending = None;
+                self.show_feedback_toast("動画は比較画像に設定できません".to_string());
+            }
+            None => {
+                if !self.fs_pending.contains_key(&source_idx) {
+                    self.start_fs_load(source_idx);
+                }
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+
+    pub(crate) fn poll_compare_prepare_pending(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.compare_prepare_pending.as_ref() else {
+            return;
+        };
+        let result = match pending.rx.try_recv() {
+            Ok(result) => result,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                return;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("比較表示の準備が中断されました".to_string())
+            }
+        };
+        let pending_current_idx = pending.current_idx;
+        let pending_pinned_source_idx = pending.pinned_source_idx;
+        self.compare_prepare_pending = None;
+
+        match result {
+            Ok(result) => {
+                if result.current_idx != pending_current_idx
+                    || result.pinned_source_idx != pending_pinned_source_idx
+                {
+                    return;
+                }
+                if !self
+                    .pinned_compare_slot
+                    .as_ref()
+                    .is_some_and(|slot| slot.source_idx == result.pinned_source_idx)
+                {
+                    return;
+                }
+                let expected = result.width as usize * result.height as usize * 4;
+                if result.pinned_rgba.len() != expected
+                    || result.current_rgba.len() != expected
+                    || result.diff_rgba.len() != expected
+                {
+                    self.show_feedback_toast("比較表示のサイズが不正です".to_string());
+                    return;
+                }
+
+                let pinned_pixels = egui::ColorImage::from_rgba_unmultiplied(
+                    [result.width as usize, result.height as usize],
+                    &result.pinned_rgba,
+                );
+                let current_pixels = egui::ColorImage::from_rgba_unmultiplied(
+                    [result.width as usize, result.height as usize],
+                    &result.current_rgba,
+                );
+                let diff_pixels = egui::ColorImage::from_rgba_unmultiplied(
+                    [result.width as usize, result.height as usize],
+                    &result.diff_rgba,
+                );
+                let key = self.compare_prepared_next_key;
+                self.compare_prepared_next_key =
+                    self.compare_prepared_next_key.wrapping_add(1).max(1);
+                self.compare_prepared_pair = Some(ComparePreparedPair {
+                    key,
+                    current_idx: result.current_idx,
+                    pinned_source_idx: result.pinned_source_idx,
+                    target_size: [result.width as usize, result.height as usize],
+                    pinned_rgba: Arc::new(result.pinned_rgba),
+                    current_rgba: Arc::new(result.current_rgba),
+                    pinned_pixels: Arc::new(pinned_pixels),
+                    current_pixels: Arc::new(current_pixels),
+                    diff_pixels: Arc::new(diff_pixels),
+                    pinned_texture: None,
+                    current_texture: None,
+                    diff_texture: None,
+                });
+                ctx.request_repaint();
+            }
+            Err(err) => {
+                crate::logger::log(format!("compare prepare failed: {err}"));
+                self.show_feedback_toast(format!("比較表示を準備できません: {err}"));
+            }
+        }
+    }
+
+    pub(crate) fn capture_output_dir_path(&self) -> PathBuf {
+        self.settings
+            .capture_output_dir
+            .clone()
+            .unwrap_or_else(crate::capture::default_output_dir)
+    }
+
+    pub(crate) fn open_capture_output_dir(&mut self) {
+        let output_dir = self.capture_output_dir_path();
+        crate::capture::open_output_dir_async(output_dir);
     }
 
     /// 変換済みアーカイブキャッシュ管理ダイアログのワーカー完了を拾う。
@@ -9205,6 +9544,19 @@ impl App {
                 }
             }
 
+            // X: サムネイル一覧から比較スロットへピン留め。
+            // Ctrl+X のファイルカットとは競合させないため、修飾キーなしのみ拾う。
+            let compare_pin_key = ctx.input_mut(|i| {
+                !i.modifiers.ctrl
+                    && !i.modifiers.shift
+                    && !i.modifiers.alt
+                    && !i.modifiers.mac_cmd
+                    && i.consume_key(egui::Modifiers::NONE, egui::Key::X)
+            });
+            if compare_pin_key {
+                self.toggle_compare_pin_from_grid_selection(ctx);
+            }
+
             // L/R: 選択画像を回転
             if key_r {
                 if let Some(idx) = self.selected {
@@ -10296,6 +10648,7 @@ impl App {
         // スタックで管理する (画像移動でさらにクリアされる)。
         self.clear_meta_undo();
         self.fullscreen_idx = Some(idx);
+        self.video_continuous_last_eof = None;
         #[cfg(windows)]
         let entering_native_video_fullscreen =
             matches!(self.items.get(idx), Some(GridItem::Video(_)));
@@ -10359,7 +10712,10 @@ impl App {
         // ページ切替時に補正キャッシュをクリア（前ページの補正結果を残さない）
         // ただし ai_upscale_cache は消さない（再処理が重いため）
         self.adjustment_cache.remove(&idx);
+        self.invalidate_compare_prepared_for_idx(idx);
         let grid_open_intent = std::mem::take(&mut self.fs_open_intent_from_grid);
+        let video_autoplay_override = self.fs_video_open_autoplay_override;
+        let video_ignore_resume_once = self.fs_video_open_ignore_resume_once;
 
         // 画像切り替え時にズーム/パン/キャッシュをリセット
         self.analysis_zoom = 1.0;
@@ -10394,9 +10750,21 @@ impl App {
                 // start_fs_load の早期分岐で GridItem::Video を検出し、
                 // FsCacheEntry::Video を fs_cache に挿入する。
                 if self.fs_cache.contains_key(&idx) {
+                    self.fs_video_open_autoplay_override = None;
+                    self.fs_video_open_ignore_resume_once = false;
                     #[cfg(windows)]
                     {
                         self.vst3_deferred_video_open = None;
+                    }
+                    if video_ignore_resume_once {
+                        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+                            player.seek(0.0);
+                        }
+                    }
+                    if video_autoplay_override == Some(true) {
+                        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+                            player.set_playing(true);
+                        }
                     }
                     if grid_open_intent {
                         #[cfg(windows)]
@@ -11940,6 +12308,7 @@ impl App {
         vp: PathBuf,
         from_grid: bool,
         autoplay_override: Option<bool>,
+        ignore_resume: bool,
         #[cfg(windows)] native_output_config: Option<crate::video::NativeVideoOutputConfig>,
     ) -> (crate::video::VideoPlayer, bool) {
         // 通常 open の spawn 制限は呼び出し側 (`start_fs_load` →
@@ -11989,13 +12358,17 @@ impl App {
         let play_test_start = play_test_for_video.and_then(|state| state.config.start_secs);
         let play_test_mute = play_test_for_video.is_some_and(|state| state.config.mute);
         let saved_resume = self.settings.video_resume_positions.get(&path_key).copied();
-        let resume = play_test_start.or_else(|| {
-            video_resume_for_open(
-                saved_resume,
-                from_grid,
-                self.settings.video_grid_open_starts_from_beginning,
-            )
-        });
+        let resume = if ignore_resume {
+            play_test_start
+        } else {
+            play_test_start.or_else(|| {
+                video_resume_for_open(
+                    saved_resume,
+                    from_grid,
+                    self.settings.video_grid_open_starts_from_beginning,
+                )
+            })
+        };
         let video_hw_decode = self.settings.video_hw_decode;
         let video_deinterlace = self.settings.video_deinterlace;
         let initial_normalize_lookup = if self.settings.audio_normalize_enabled {
@@ -12068,8 +12441,16 @@ impl App {
             }
             if !self.fs_cache.contains_key(&idx) {
                 let from_grid = std::mem::take(&mut self.fs_open_intent_from_grid);
+                let autoplay_override = self.fs_video_open_autoplay_override.take();
+                let ignore_resume = std::mem::take(&mut self.fs_video_open_ignore_resume_once);
                 #[cfg(windows)]
-                if self.defer_native_video_open_if_decoder_busy(idx, &vp, from_grid) {
+                if self.defer_native_video_open_if_decoder_busy(
+                    idx,
+                    &vp,
+                    from_grid,
+                    autoplay_override,
+                    ignore_resume,
+                ) {
                     return;
                 }
                 #[cfg(windows)]
@@ -12099,7 +12480,8 @@ impl App {
                         idx,
                         vp,
                         from_grid,
-                        None,
+                        autoplay_override,
+                        ignore_resume,
                         #[cfg(windows)]
                         native_config,
                     );
@@ -12848,6 +13230,7 @@ impl App {
         // 次回フルスクリーンで別動画を開いたときに古い baseline を引き継いで誤爆 seek を
         // 起こさないため。
         self.last_loop_pos.clear();
+        self.video_continuous_last_eof = None;
         self.fs_viewport_recreate_after_hide = true;
         // 次回フルスクリーン入場時に古い活動時刻 / hidden 状態を引き継がないようクリア。
         self.cursor_last_activity = None;
@@ -13260,6 +13643,7 @@ impl App {
             // (そのまま残ると次回来訪時に低解像度の補正結果が使われてしまう)。
             // 表示中かつ現在の bg と一致するもののみ、AI 結果に対して色調補正を即座に適用（チラつき防止）
             self.adjustment_cache.remove(&idx);
+            self.invalidate_compare_prepared_for_idx(idx);
             if self.fullscreen_idx == Some(idx) && self.effective_upscale_bg_mode() == bg {
                 self.apply_sync_adjustment(ctx, idx, &pixels);
             }
@@ -13968,6 +14352,23 @@ impl App {
         #[cfg(windows)]
         self.show_native_video_overlay_toast(text.clone(), false);
         self.fs_feedback_toast = Some((text, std::time::Instant::now(), duration_secs));
+        self.fs_feedback_toast_reveal_path = None;
+    }
+
+    pub(crate) fn show_capture_saved_toast(&mut self, path: PathBuf) {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("capture")
+            .to_string();
+        #[cfg(windows)]
+        self.show_native_video_overlay_toast(format!("保存しました: {name}"), false);
+        self.fs_feedback_toast = Some((
+            format!("保存しました: {name}"),
+            std::time::Instant::now(),
+            crate::ui_fullscreen::FEEDBACK_TOAST_DURATION,
+        ));
+        self.fs_feedback_toast_reveal_path = Some(path);
     }
 
     /// 指定ページの有効パラメータへの参照を返す。
@@ -14076,6 +14477,7 @@ impl App {
         // Undo/Redo 経路 (apply_adjustment_change_to_app) もここを通って正しく invalidate される。
         // AI キャッシュは ai_settings_eq 差分判定が必要なので呼び出し側に任せる。
         self.adjustment_cache.remove(&idx);
+        self.invalidate_compare_prepared_for_idx(idx);
         self.thumb_adjust_tex.remove(&idx);
     }
 
@@ -14096,6 +14498,7 @@ impl App {
         }
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_adjust(rel));
         self.adjustment_cache.remove(&idx);
+        self.invalidate_compare_prepared_for_idx(idx);
         self.thumb_adjust_tex.remove(&idx);
         if !old_params.ai_settings_eq(&new_params) {
             self.purge_upscale_for_idx(idx);
@@ -14582,11 +14985,32 @@ impl App {
         self.apply_sync_adjustment(ctx, idx, &pixels);
     }
 
+    pub(crate) fn invalidate_compare_prepared_for_idx(&mut self, idx: usize) {
+        let prepared_affected = self
+            .compare_prepared_pair
+            .as_ref()
+            .is_some_and(|pair| pair.current_idx == idx || pair.pinned_source_idx == idx);
+        let pending_affected = self
+            .compare_prepare_pending
+            .as_ref()
+            .is_some_and(|pending| pending.current_idx == idx || pending.pinned_source_idx == idx);
+        if prepared_affected {
+            self.compare_prepared_pair = None;
+        }
+        if pending_affected {
+            self.compare_prepare_pending = None;
+        }
+        if prepared_affected || pending_affected {
+            self.compare_wipe_dragging = false;
+        }
+    }
+
     /// 指定ページの補正関連キャッシュをクリアする。
     /// 色調パラメータ変更時は adjustment_cache のみクリア。
     /// AI モデル設定変更時は ai_upscale_cache もクリアする。
     pub(crate) fn clear_adjustment_caches(&mut self, idx: usize) {
         self.adjustment_cache.remove(&idx);
+        self.invalidate_compare_prepared_for_idx(idx);
         // サムネ側の補正済みテクスチャも同時に落とす (ピクセルは保持)。
         // 次フレーム以降 maybe_apply_thumb_adjustment で再生成される。
         self.thumb_adjust_tex.remove(&idx);
@@ -14599,6 +15023,9 @@ impl App {
     pub(crate) fn clear_all_color_caches(&mut self) {
         self.adjustment_cache.clear();
         self.thumb_adjust_tex.clear();
+        self.compare_prepare_pending = None;
+        self.compare_prepared_pair = None;
+        self.compare_wipe_dragging = false;
     }
 
     /// サムネイル補正を同期適用する (色調のみ、post_filter は対象外)。
@@ -14686,6 +15113,7 @@ impl App {
     /// AI モデル設定が変わった場合に AI キャッシュを含めてクリアする。
     pub(crate) fn clear_all_adjustment_and_ai_caches(&mut self, idx: usize) {
         self.adjustment_cache.remove(&idx);
+        self.invalidate_compare_prepared_for_idx(idx);
         // サムネ側の補正済みテクスチャも該当 idx のみクリア (色調系と同じ粒度)。
         self.thumb_adjust_tex.remove(&idx);
         self.ai_upscale_cache.clear();
@@ -14884,15 +15312,18 @@ impl App {
                     }
                 }
                 FsLoadResult::Animated(frames) => {
+                    let mut frame_pixels = Vec::with_capacity(frames.len());
                     let textures: Vec<(egui::TextureHandle, f64)> = frames
                         .into_iter()
                         .enumerate()
                         .map(|(fi, (ci, delay))| {
+                            let pixels = std::sync::Arc::new(ci);
                             let handle = ctx.load_texture(
                                 format!("fs_{key}_f{fi}"),
-                                ci,
+                                pixels.as_ref().clone(),
                                 egui::TextureOptions::LINEAR,
                             );
+                            frame_pixels.push(pixels);
                             (handle, delay)
                         })
                         .collect();
@@ -14900,6 +15331,7 @@ impl App {
                     let first_delay = textures.first().map(|(_, d)| *d).unwrap_or(0.1);
                     FsCacheEntry::Animated {
                         frames: textures,
+                        frame_pixels,
                         current_frame: 0,
                         next_frame_at: now + first_delay,
                         load_seq,
@@ -15018,6 +15450,136 @@ impl App {
         }
     }
 
+    pub(crate) fn find_next_video_in_visible_indices_from(
+        items: &[GridItem],
+        visible_indices: &[usize],
+        current_idx: usize,
+        wrap: bool,
+    ) -> Option<usize> {
+        let is_video = |idx: usize| matches!(items.get(idx), Some(GridItem::Video(_)));
+        let Some(pos) = visible_indices.iter().position(|&idx| idx == current_idx) else {
+            return wrap
+                .then(|| visible_indices.iter().copied().find(|&idx| is_video(idx)))
+                .flatten();
+        };
+
+        for &idx in visible_indices.iter().skip(pos + 1) {
+            if is_video(idx) {
+                return Some(idx);
+            }
+        }
+        if wrap {
+            for &idx in visible_indices.iter().take(pos + 1) {
+                if is_video(idx) {
+                    return Some(idx);
+                }
+            }
+        }
+        None
+    }
+
+    fn find_next_video_in_visible_indices(&self, current_idx: usize, wrap: bool) -> Option<usize> {
+        Self::find_next_video_in_visible_indices_from(
+            &self.items,
+            &self.visible_indices,
+            current_idx,
+            wrap,
+        )
+    }
+
+    pub(crate) fn cycle_video_continuous_mode_common(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return;
+        }
+        self.video_continuous_mode = self.video_continuous_mode.cycle();
+        self.video_continuous_last_eof = None;
+        let mode = self.video_continuous_mode;
+        if mode.is_enabled() {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.set_loop_enabled(false);
+                #[cfg(windows)]
+                player.set_native_loop_enabled(false);
+            }
+        } else {
+            #[cfg(windows)]
+            self.apply_loop_mode_to_player(fs_idx);
+        }
+        #[cfg(windows)]
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_native_continuous_mode(mode);
+        }
+        let toast = mode.label().to_string();
+        #[cfg(windows)]
+        {
+            self.show_native_video_overlay_toast(toast, false);
+            self.mark_native_video_hud_activity(ctx);
+        }
+        #[cfg(not(windows))]
+        {
+            self.show_feedback_toast(toast);
+            let _ = ctx;
+        }
+    }
+
+    fn handle_video_continuous_eof(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        seek_serial: u64,
+    ) {
+        let mode = self.video_continuous_mode;
+        if !mode.is_enabled() || self.fullscreen_idx != Some(fs_idx) {
+            return;
+        }
+        #[cfg(windows)]
+        if self.video_tile_mode_active {
+            return;
+        }
+        let eof_key = (fs_idx, seek_serial);
+        if self.video_continuous_last_eof == Some(eof_key) {
+            return;
+        }
+        self.video_continuous_last_eof = Some(eof_key);
+
+        let Some(next_idx) = self.find_next_video_in_visible_indices(fs_idx, mode.wraps()) else {
+            #[cfg(windows)]
+            self.show_native_video_overlay_toast(
+                "フォルダ末尾です (Ctrl+↓ で次フォルダ)".to_string(),
+                false,
+            );
+            #[cfg(not(windows))]
+            self.show_feedback_toast("フォルダ末尾です (Ctrl+↓ で次フォルダ)".to_string());
+            return;
+        };
+
+        if next_idx == fs_idx {
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.seek(0.0);
+                player.set_playing(true);
+            }
+            return;
+        }
+
+        #[cfg(windows)]
+        self.open_native_video_fullscreen_from_navigation_with_options(
+            ctx,
+            next_idx,
+            Some(true),
+            true,
+        );
+        #[cfg(not(windows))]
+        {
+            let _ = ctx;
+            self.fs_video_open_autoplay_override = Some(true);
+            self.fs_video_open_ignore_resume_once = true;
+            self.open_fullscreen(next_idx);
+        }
+    }
+
     pub(crate) fn poll_video(&mut self, ctx: &egui::Context) {
         let poll_started = std::time::Instant::now();
         let mut next_repaint: Option<std::time::Duration> = None;
@@ -15041,6 +15603,12 @@ impl App {
         // 再生挙動用 (= 「実際にループするか」) は per-video の has_ch / has_bm から導出する
         // effective_mode の bool に置換する (Codex P1 — display と effective を分離)。
         let display_mode = self.settings.video_loop_mode;
+        let continuous_mode = self.video_continuous_mode;
+        let continuous_enabled = continuous_mode.is_enabled();
+        #[cfg(windows)]
+        let continuous_tile_active = self.video_tile_mode_active;
+        #[cfg(not(windows))]
+        let continuous_tile_active = false;
 
         #[cfg(windows)]
         let mut native_closed_idx: Option<usize> = None;
@@ -15051,6 +15619,7 @@ impl App {
         #[cfg(windows)]
         let mut native_events: Vec<(usize, u64, crate::video::NativeVideoOutputEvent)> = Vec::new();
         let mut active_video_indices: Vec<usize> = Vec::new();
+        let mut continuous_eof_events: Vec<(usize, u64)> = Vec::new();
         for (idx, entry) in self.fs_cache.iter_mut() {
             if let FsCacheEntry::Video { player, .. } = entry {
                 // チャプター / ブックマーク有無を判定 (cache 直読み、DB クエリ無し)
@@ -15065,12 +15634,15 @@ impl App {
                     .map(|c| !c.bookmarks.is_empty())
                     .unwrap_or(false);
                 let eff = crate::settings::effective_loop_mode(display_mode, has_ch, has_bm);
-                let enabled = !matches!(eff, crate::settings::VideoLoopMode::Off);
+                let enabled =
+                    !continuous_enabled && !matches!(eff, crate::settings::VideoLoopMode::Off);
                 player.set_loop_enabled(enabled);
                 #[cfg(windows)]
                 player.set_native_loop_enabled(enabled);
                 #[cfg(windows)]
                 player.set_native_loop_mode(display_mode); // HUD は user intent
+                #[cfg(windows)]
+                player.set_native_continuous_mode(continuous_mode);
                 // loop_target_secs は apply_loop_mode_to_player / boundary tick で維持済み。
                 // ここでは触らない (毎 tick 上書きすると再生中のセクションループが崩れる)。
                 active_video_indices.push(*idx);
@@ -15143,6 +15715,12 @@ impl App {
                         .unwrap_or_else(|| player.position());
                     updates.push((path_key, pos, player.duration()));
                 }
+                if continuous_enabled
+                    && !continuous_tile_active
+                    && player.engine_state_code() == crate::video::engine::actor::state_code::EOF
+                {
+                    continuous_eof_events.push((*idx, player.current_seek_serial()));
+                }
             }
         }
         #[cfg(windows)]
@@ -15155,12 +15733,17 @@ impl App {
         for (idx, epoch, event) in native_events {
             self.handle_native_video_output_event(ctx, idx, epoch, event);
         }
+        for (idx, serial) in continuous_eof_events {
+            self.handle_video_continuous_eof(ctx, idx, serial);
+        }
         // Phase 3: 入力イベント (= seek / ToggleLoop / pause) 反映後に CH/BM ループ境界 tick。
         // 順序が重要 (Codex P2 第4ラウンド): native_events を先に処理することで、
         // 直近の手動 seek が serial 変化として可視化され、誤爆 seek を防げる。
         #[cfg(windows)]
-        for idx in &active_video_indices {
-            self.tick_native_video_loop_boundary(*idx);
+        if !self.video_continuous_mode.is_enabled() {
+            for idx in &active_video_indices {
+                self.tick_native_video_loop_boundary(*idx);
+            }
         }
         // ピン留め時に thumb worker キャッシュが空だった場合、後続フレームで完了を
         // ポーリングして DB のサムネ BLOB を埋める。
@@ -16370,8 +16953,19 @@ impl eframe::App for App {
         self.poll_tag_prewarm_results();
         self.poll_delete_pending();
         self.poll_paste_pending();
+        self.poll_capture_pending(ctx);
+        self.poll_compare_pin_load_pending(ctx);
+        self.poll_compare_pin_pending(ctx);
+        self.poll_compare_prepare_pending(ctx);
         if !self.paste_pending.is_empty() {
             ctx.request_repaint();
+        }
+        if self.capture_pending.is_some()
+            || self.compare_pin_load_pending.is_some()
+            || self.compare_pin_pending.is_some()
+            || self.compare_prepare_pending.is_some()
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         self.poll_cache_maint_pending();
         self.poll_archive_cache_maint_pending();
@@ -17312,6 +17906,7 @@ fn interleaved_prefetch_targets(
 
 /// Container (Folder/ZipFile/PdfFile) の catalog cache 基底キー (`folderthumb:...` /
 /// `zipthumb:...` / `pdfthumb:...`) を組み立てる共通ヘルパー (T54 + Codex follow-on / 2026-05-16)。
+/// Folder の自動代表キーには選定アルゴリズム版・ソート種別・探索深度を含める。
 ///
 /// `use_full_path` が `true` のときは basename ではなく full path 文字列を使う。
 /// これは Ctrl+S 検索結果 (= 複数フォルダの同名コンテナが同一リストに混在しうる) で衝突を
@@ -17322,9 +17917,26 @@ fn interleaved_prefetch_targets(
 /// Image / ZipImage / PdfPage 等 container 以外には対応しない (= 呼び出し側で
 /// match して使い分け)。`None` が返るのは `file_name` が UTF-8 で取れなかった
 /// 極端なケースのみ。
-fn container_cache_base_key(item: &GridItem, use_full_path: bool) -> Option<String> {
+fn container_cache_base_key(
+    item: &GridItem,
+    use_full_path: bool,
+    folder_thumb_sort: Option<crate::settings::SortOrder>,
+    folder_thumb_depth: u32,
+) -> Option<String> {
     let (path, prefix) = match item {
-        GridItem::Folder(p) => (p, CACHE_KEY_FOLDER),
+        GridItem::Folder(p) => {
+            let identity = if use_full_path {
+                p.to_string_lossy().into_owned()
+            } else {
+                p.file_name().and_then(|n| n.to_str())?.to_string()
+            };
+            let sort = folder_thumb_sort.unwrap_or(crate::settings::SortOrder::Numeric);
+            return Some(crate::thumb_loader::folder_thumb_auto_cache_key(
+                &identity,
+                sort,
+                folder_thumb_depth,
+            ));
+        }
         GridItem::ZipFile(p) => (p, CACHE_KEY_ZIP),
         GridItem::PdfFile(p) => (p, CACHE_KEY_PDF),
         _ => return None,
@@ -17399,7 +18011,12 @@ fn make_load_request(
             // zip_entry は None のままにしておき、ワーカー側でキャッシュミス時に
             // 遅延解決する (UI スレッドで ZIP を開く I/O を避けるため)。
             // T54: container_cache_base_key で full_path / basename を統一管理
-            let base_key = container_cache_base_key(item, use_full_path_keys)?;
+            let base_key = container_cache_base_key(
+                item,
+                use_full_path_keys,
+                folder_thumb_sort,
+                folder_thumb_depth,
+            )?;
             let req = LoadRequest {
                 path: p.clone(),
                 cache_key_override: Some(base_key.clone()),
@@ -17417,7 +18034,12 @@ fn make_load_request(
             ))
         }
         GridItem::PdfFile(p) => {
-            let base_key = container_cache_base_key(item, use_full_path_keys)?;
+            let base_key = container_cache_base_key(
+                item,
+                use_full_path_keys,
+                folder_thumb_sort,
+                folder_thumb_depth,
+            )?;
             let req = LoadRequest {
                 path: p.clone(),
                 pdf_page: Some(0),
@@ -17437,7 +18059,12 @@ fn make_load_request(
             ))
         }
         GridItem::Folder(p) => {
-            let base_key = container_cache_base_key(item, use_full_path_keys)?;
+            let base_key = container_cache_base_key(
+                item,
+                use_full_path_keys,
+                folder_thumb_sort,
+                folder_thumb_depth,
+            )?;
             let req = LoadRequest {
                 path: p.clone(),
                 cache_key_override: Some(base_key.clone()),
@@ -17496,7 +18123,8 @@ fn folder_thumb_existing_keys_for(
     item: &GridItem,
     pin_map: &std::collections::HashMap<String, crate::folder_thumb_pins::FolderPinSource>,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
-    max_cascade_depth: usize,
+    folder_thumb_sort: Option<crate::settings::SortOrder>,
+    folder_thumb_depth: u32,
     // T54 follow-on (Codex post-merge / 2026-05-16): make_load_request と同じく
     // 検索結果コンテキストでは full-path 込みキーを使う。`delete_missing` の存続キー
     // 集合と make_load_request の読み書きキーが乖離しないように、必ず同じ helper
@@ -17515,7 +18143,12 @@ fn folder_thumb_existing_keys_for(
         GridItem::Folder(p) | GridItem::ZipFile(p) | GridItem::PdfFile(p) => p,
         _ => return Vec::new(),
     };
-    let Some(base_key) = container_cache_base_key(item, use_full_path_keys) else {
+    let Some(base_key) = container_cache_base_key(
+        item,
+        use_full_path_keys,
+        folder_thumb_sort,
+        folder_thumb_depth,
+    ) else {
         return Vec::new();
     };
 
@@ -17525,10 +18158,10 @@ fn folder_thumb_existing_keys_for(
         // cascade 解決後の leaf source_id を使う (= `apply_folder_thumb_pin` が
         // 書く pinned_key と同じ)。cascade を考慮せず immediate のままだと、
         // delete_missing が cascade 由来の cache 行を毎回掃除してしまう。
-        // max_cascade_depth は呼び出し側 (load_folder) が `Settings.folder_thumb_depth`
+        // folder_thumb_depth は呼び出し側 (load_folder) が `Settings.folder_thumb_depth`
         // を渡してくる。
         if let Some(resolved) =
-            resolve_pin_target_cascaded(container_path, source, pin_db, max_cascade_depth)
+            resolve_pin_target_cascaded(container_path, source, pin_db, folder_thumb_depth as usize)
         {
             keys.push(format!(
                 "{}{}{}",
@@ -17632,7 +18265,7 @@ fn resolve_pin_target_cascaded(
 ///
 /// Phase C 注意 (Video pin):
 /// - Video pin (`ResolvedKind::Video`) は `seed_folder_video_pin_thumbs` が事前に
-///   `video_pins` DB の WebP を `folderthumb:{dir}#pin:{source_id}` で catalog + cache_map
+///   `video_pins` DB の WebP を `folderthumb:auto-v...#pin:{source_id}` で catalog + cache_map
 ///   にミラーしているので、worker は通常の cache_hit 経路で動画フレームを取り出せる。
 ///   ここで返す LoadRequest は `path = container` (folder) + `cache_key_override =
 ///   pinned_key` + `mtime/file_size = 動画のもの` (= seed と整合)。

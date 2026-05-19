@@ -77,6 +77,40 @@ fn engine_state_code_name(code: u8) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum VideoContinuousMode {
+    #[default]
+    Off,
+    Continuous,
+    ContinuousLoop,
+}
+
+impl VideoContinuousMode {
+    pub fn cycle(self) -> Self {
+        match self {
+            Self::Off => Self::Continuous,
+            Self::Continuous => Self::ContinuousLoop,
+            Self::ContinuousLoop => Self::Off,
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    pub fn wraps(self) -> bool {
+        matches!(self, Self::ContinuousLoop)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "連続再生: OFF",
+            Self::Continuous => "連続再生",
+            Self::ContinuousLoop => "連続再生 + ループ",
+        }
+    }
+}
+
 pub struct VideoPlayer {
     path: PathBuf,
     clock: Arc<AvClock>,
@@ -304,6 +338,7 @@ pub enum NativeVideoOutputEvent {
     TogglePlay,
     ToggleMute,
     ToggleLoop,
+    ToggleContinuous,
     SetVolume {
         volume: f64,
         persist: bool,
@@ -400,6 +435,9 @@ enum NativeVideoOutputCommand {
     /// 「BM モード設定 + BM 無し動画」のとき、ボタン表示は BM のまま、挙動は Full と等価。
     SetLoopMode {
         mode: crate::settings::VideoLoopMode,
+    },
+    SetContinuousMode {
+        mode: VideoContinuousMode,
     },
     SetVst3Available {
         available: bool,
@@ -742,6 +780,12 @@ impl NativeVideoOutput {
         let _ = self
             .command_tx
             .send(NativeVideoOutputCommand::SetLoopMode { mode });
+    }
+
+    fn set_continuous_mode(&self, mode: VideoContinuousMode) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SetContinuousMode { mode });
     }
 
     fn set_vst3_available(&self, available: bool) {
@@ -1240,6 +1284,7 @@ fn send_native_overlay_command(
         Command::CopyFrameToClipboard => NativeVideoOutputEvent::CopyFrameToClipboard,
         Command::FrameStep { direction } => NativeVideoOutputEvent::FrameStep { direction },
         Command::ToggleLoop => NativeVideoOutputEvent::ToggleLoop,
+        Command::ToggleContinuous => NativeVideoOutputEvent::ToggleContinuous,
         Command::AddBookmarkAt { target_secs } => {
             NativeVideoOutputEvent::AddBookmarkAt { target_secs }
         }
@@ -1631,6 +1676,9 @@ fn run_native_video_output(
                 }
                 NativeVideoOutputCommand::SetLoopMode { mode } => {
                     presenter.set_overlay_loop_mode(mode);
+                }
+                NativeVideoOutputCommand::SetContinuousMode { mode } => {
+                    presenter.set_overlay_continuous_mode(mode);
                 }
                 NativeVideoOutputCommand::SetVst3Available { available } => {
                     presenter.set_overlay_vst3_available(available);
@@ -2117,6 +2165,13 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::ToggleLoop,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleContinuous => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ToggleContinuous,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::SetVolume {
@@ -4215,6 +4270,13 @@ impl VideoPlayer {
     pub fn set_native_loop_mode(&self, mode: crate::settings::VideoLoopMode) {
         if let Some(output) = self.native_output.as_ref() {
             output.set_loop_mode(mode);
+        }
+    }
+
+    #[cfg(windows)]
+    pub fn set_native_continuous_mode(&self, mode: VideoContinuousMode) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.set_continuous_mode(mode);
         }
     }
 

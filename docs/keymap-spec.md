@@ -18,6 +18,7 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | <kbd>F1</kbd>〜<kbd>F5</kbd> | レーティング 1〜5 |
 | <kbd>F6</kbd> | レーティング解除 |
 | <kbd>P</kbd> | 選択中アイテムを現在のコンテナの代表サムネに固定 / 解除 (toggle、アドレスバー 📌 の左クリックと同等)。pin 不能アイテム / 検索アグリゲート / 変換キャッシュ drill-down では silent no-op。**動画フルスクリーンの P と合わせて P = Pin に統一** |
+| <kbd>X</kbd> | 選択中の画像 / ZIP 内画像 / PDF ページを比較スロットへピン留め / 同じ画像なら解除 |
 
 ## フルスクリーン共通 (画像 / 動画とも)
 
@@ -47,8 +48,13 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | <kbd>B</kbd> | 透過背景色サイクル |
 | <kbd>E</kbd> | 消しゴムモード開始 / 確定 |
 | <kbd>P</kbd> | 現在表示中アイテムを現在のコンテナの代表サムネに固定 / 解除 |
+| <kbd>X</kbd> | 現在表示中を比較スロットへピン留め / 同じ画像なら解除 |
+| <kbd>C</kbd> | 比較スロットのピン画像と現在画像をトグル表示 |
+| <kbd>Shift</kbd>+<kbd>C</kbd> | Wipe 比較を ON/OFF (左=ピン、右=現在) |
+| <kbd>Alt</kbd>+<kbd>C</kbd> | 差分比較を ON/OFF (RGB チャンネルごとの差分を色付きで強調表示) |
 | <kbd>U</kbd> / <kbd>Shift</kbd>+<kbd>U</kbd> / <kbd>Alt</kbd>+<kbd>U</kbd> | AI モデル 次 / 前 / リセット |
 | <kbd>T</kbd> / <kbd>Shift</kbd>+<kbd>T</kbd> / <kbd>Alt</kbd>+<kbd>T</kbd> | ポストフィルタ 次 / 前 / 標準 (リセット) |
+| <kbd>Ctrl</kbd>+<kbd>S</kbd> | 現在画像 / アニメーション現在フレーム / ZIP 内画像 / PDF ページをキャプチャ保存フォルダへ保存 |
 | <kbd>Enter</kbd> | (動画ボタンが映る場合のみ) 外部プレイヤー |
 
 ## 動画 フルスクリーン (Phase 7.H 適用後)
@@ -67,9 +73,12 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 音量を dB フェーダー目盛りの 1/4 幅で上下 | |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 現在コンテキストの前 / 次フォルダまたは検索結果へ移動 | native presenter 経路でも有効 |
 | <kbd>M</kbd> | ミュート トグル | |
-| <kbd>L</kbd> | ループ再生 トグル | |
+| <kbd>L</kbd> | ループ再生 トグル | 連続再生 ON 中は無効化し、「連続再生中はループ無効」を表示 |
 | <kbd>B</kbd> | ブックマーク追加 (現在位置 🔖) | |
 | <kbd>S</kbd> | タイルモード ON/OFF | |
+| HUD 連続再生ボタン | オフ → 連続再生 → 連続再生 + ループを循環 | ループ再生とは排他。アプリ再起動時は OFF |
+| <kbd>Ctrl</kbd>+<kbd>S</kbd> | 現在フレームをキャプチャ保存フォルダへ保存 | v0.10 MVP。egui / native presenter 両経路で有効 |
+| <kbd>X</kbd> / <kbd>C</kbd> / <kbd>Shift</kbd>+<kbd>C</kbd> / <kbd>Alt</kbd>+<kbd>C</kbd> | 比較ビュー対象外のため silent no-op | native presenter 経路でも passthrough しない |
 | <kbd>P</kbd> | 現在再生位置をピン留め (= HUD 📌 ボタンと同等) | v0.9.x、グリッドの P (folder_thumb_pin toggle) と統一した「P = Pin」 |
 | <kbd>F</kbd> | Perf / フレームレート オーバーレイ トグル | v0.9.x、以前は P。P を Pin に再割り当てしたため F (Frames) へ移動 |
 | <kbd>Esc</kbd> (タイル中) | タイルモード解除 | |

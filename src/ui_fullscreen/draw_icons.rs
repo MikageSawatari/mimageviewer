@@ -150,6 +150,21 @@ pub(super) fn draw_tile_grid_icon(painter: &egui::Painter, c: egui::Pos2, r: f32
     }
 }
 
+pub(super) fn draw_camera_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let white = egui::Color32::WHITE;
+    let stroke = egui::Stroke::new(1.8, white);
+    let body =
+        egui::Rect::from_center_size(c + egui::vec2(0.0, r * 0.18), egui::vec2(r * 1.75, r * 1.2));
+    painter.rect_stroke(body, 2.0, stroke, egui::StrokeKind::Inside);
+    let hump = egui::Rect::from_min_size(
+        egui::pos2(body.min.x + r * 0.25, body.min.y - r * 0.32),
+        egui::vec2(r * 0.72, r * 0.34),
+    );
+    painter.rect_filled(hump, 1.2, white);
+    painter.circle_stroke(body.center(), r * 0.38, stroke);
+    painter.circle_filled(body.center(), r * 0.15, white);
+}
+
 pub(super) fn draw_analysis_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     let white = egui::Color32::WHITE;
     let stroke = egui::Stroke::new(1.8, white);

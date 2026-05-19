@@ -45,11 +45,30 @@ pub fn apply_resolved(ctx: &egui::Context, resolved: ResolvedTheme) {
         ResolvedTheme::Dark => egui::ThemePreference::Dark,
     };
     ctx.set_theme(preference);
+    apply_scrollbar_visibility_style(ctx);
 }
 
 /// 選択されたテーマを `ctx` に適用する (`resolve` + `apply_resolved`)。
 pub fn apply(ctx: &egui::Context, theme: UiTheme) {
     apply_resolved(ctx, resolve(theme));
+}
+
+/// mImageViewer 向けにスクロールバーだけを少し見つけやすくする。
+///
+/// 色味は egui のテーマ既定に任せ、幅と opacity だけを調整する。
+fn apply_scrollbar_visibility_style(ctx: &egui::Context) {
+    ctx.style_mut(|style| {
+        let scroll = &mut style.spacing.scroll;
+        scroll.bar_width = 10.0;
+        scroll.floating_width = 8.0;
+        scroll.floating_allocated_width = 0.0;
+        scroll.dormant_background_opacity = 0.10;
+        scroll.active_background_opacity = 0.20;
+        scroll.interact_background_opacity = 0.30;
+        scroll.dormant_handle_opacity = 0.45;
+        scroll.active_handle_opacity = 0.65;
+        scroll.interact_handle_opacity = 0.80;
+    });
 }
 
 /// `UiTheme` を解決した結果が Dark かを返す (System の場合は OS 設定に追従)。
@@ -192,6 +211,27 @@ mod tests {
         assert!(
             ratio >= 7.0,
             "Fullscreen white on black contrast = {ratio:.2} (< 7.0 AAA)",
+        );
+    }
+
+    #[test]
+    fn apply_resolved_keeps_scrollbars_visible_without_widget_color_changes() {
+        let ctx = egui::Context::default();
+        apply_resolved(&ctx, ResolvedTheme::Light);
+
+        let style = ctx.style();
+        let scroll = &style.spacing.scroll;
+        assert_eq!(scroll.bar_width, 10.0);
+        assert_eq!(scroll.floating_width, 8.0);
+        assert!(scroll.dormant_handle_opacity >= 0.40);
+        assert!(scroll.active_handle_opacity >= scroll.dormant_handle_opacity);
+        assert!(scroll.interact_handle_opacity >= scroll.active_handle_opacity);
+        assert!(scroll.interact_handle_opacity <= 0.80);
+
+        let default_light = egui::Visuals::light();
+        assert_eq!(
+            style.visuals.widgets.inactive.bg_fill,
+            default_light.widgets.inactive.bg_fill,
         );
     }
 

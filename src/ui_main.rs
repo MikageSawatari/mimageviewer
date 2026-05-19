@@ -302,6 +302,10 @@ impl App {
                         self.open_local_metadata_search();
                         ui.close();
                     }
+                    if ui.button("キャプチャ保存フォルダを開く").clicked() {
+                        self.open_capture_output_dir();
+                        ui.close();
+                    }
                     ui.separator();
                     if ui.button("終了").clicked() {
                         // トレイ常駐設定 ON のときでも [×] ではなく明示終了なので、

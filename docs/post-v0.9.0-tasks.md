@@ -8,7 +8,8 @@ v0.9.0 リリース時点 (2026-05-16) で残った全件をここに集約す�
 - **A. v0.9.0 から v0.10 に持ち越した P2** — v0.9.0 で triage / sign-off は済んでいるが、
   実コード fix が landed していないもの。リリースブロッカ候補だったが、修正規模が大きいか
   doc-only の暫定対応にとどめたため v0.10 に持ち越し。優先度は本ドキュメント内で最上位
-  (5 件、うち T41 は v0.9.0 で doc コメントのみ追加、残り 4 件は完全未着手)。
+  (5 件、うち T14 は 2026-05-18 に解決済み、T41 は v0.9.0 で doc コメントのみ追加、
+  残り 3 件は完全未着手)。
 - **B. P3 (T58〜T121)** — 「望ましい」修正。実害シナリオは稀 or 単発トラブルで済むが、品質の
   底上げに価値がある項目。
 - **C. リファクタ負債 (R-1〜R-10)** — 巨大モジュール分割やテスト整理。コードの保守性向上が
@@ -20,16 +21,16 @@ v0.9.0 リリース時点 (2026-05-16) で残った全件をここに集約す�
 
 ## A. v0.9.0 から v0.10 に持ち越した P2 (リリースブロッカ候補)
 
-### A-1. T14 [P2→v0.10][Compat][C+X] EOF 状態が EngineActor に伝わらない 🛑
-- 場所: `src/video/decoder.rs:2840`, `src/video/engine/actor.rs:497`, `src/video/mod.rs:4135,4270`
-- 問題: demux EOF は `clock.notify_eof_reached()` するが `DecoderEvent::EofReached` を送らず。
-  `EngineActor` の `EofReached` ハンドラ + テストが死にコード。`engine_state_atomic` が EOF 後も
-  `Playing` のまま (perf/HUD 診断に影響)
-- v0.9.0 で延期した理由: EOF 遷移と audio drain latch を同時に組まないと末尾 50ms 程度の audio
-  欠落になる。`AudioEvent::DrainComplete` 新シグナル + audio pump / RT callback の改修が必要
-- 修正方針: EngineActor の state machine に「Eof は audio drain 完了後にのみ遷移」する drain
-  latch を追加。完了したら engine_state_atomic を Eof に published。loop seek 経路 (現状ハード
-  コード) との一本化も検討
+### A-1. T14 [P2→v0.10][Compat][C+X] EOF 状態が EngineActor に伝わらない ✅ 解決済み (2026-05-18)
+- 対応場所: `src/video/mod.rs`, `src/video/engine/actor.rs`, `docs/video-architecture.md`
+- 解決内容: native / non-native 両経路の EOF drain 完了後に
+  `EngineActor::handle_decoder_event(DecoderEvent::EofReached { epoch, duration_secs })` を同期的に呼ぶ。
+  これにより `engine_state_atomic` は EOF 後に `state_code::EOF` を publish し、App 側から
+  `VideoPlayer::engine_state_code()` で EOF 到達を検出できる。
+- テスト: `eof_reached_freezes_av_clock_and_publishes_eof_state` など、EngineActor の EOF 遷移と
+  stale epoch discard を検証する unit test を追加済み。
+- 補足: v0.10 の動画連続再生はこの解決済み経路を前提にする。将来 audio drain / loop seek の
+  さらなる一本化余地はあるが、EOF 状態 publish 自体は未解決ブロッカではない。
 
 ### A-2. T24 [P2→v0.10][Safety][C] wndproc 内 `&'static mut WindowState` aliasing 🛑
 - 場所: `src/video/native_presenter/hud_window.rs:637`, `native_window.rs:841`
@@ -234,10 +235,10 @@ v0.9.0 リリース時点 (2026-05-16) で残った全件をここに集約す�
 
 | カテゴリ | 件数 |
 |----------|------|
-| A. v0.9.0 持ち越し P2 | 5 件 |
+| A. v0.9.0 持ち越し P2 | 5 件 (未解決 4 件) |
 | D. v0.9.0 部分対応の follow-on | 7 件 |
 | B. P3 (T58〜T121) | 64 件 |
 | C. リファクタ負債 (R-1〜R-10) | 10 件 |
-| **合計** | **86 件** |
+| **合計** | **86 件 (未解決 85 件)** |
 
 着手順は A → D → B (重要度高い順) → C を推奨。

@@ -64,7 +64,12 @@ Failed は単発の終端ステート。デコードエラー時のみ。
    [virtual-folders.md §3.1.1](virtual-folders.md#311-親コンテナの代表サムネピン-folder-thumb-pinv09x)。
 2. **自動代表選定 (`resolve_folder_thumb_image`)** — Settings の `folder_thumb_sort`
    (Numeric / Modified / etc.) + `folder_thumb_depth` (再帰深さ) で先頭画像を選び、
-   通常のサムネ生成パイプラインに乗せる。pin が無い場合の既定動作。
+   通常のサムネ生成パイプラインに乗せる。pin が無い場合の既定動作。キャッシュ
+   ヒット時は表示速度を優先して毎回の再スキャンは行わないが、cache key には
+   自動選定アルゴリズム版・sort・depth を含めるため、番号順ロジックや設定が
+   変わったときは自然にミスして再スキャンされる。キャッシュミス時の Folder
+   自動選定は、サムネイル一覧に近い順序として「サブフォルダ (sort 順) →
+   直接画像 (sort 順)」で候補を辿る。
 3. **フォルダ / ZIP / PDF アイコン fallback** — 中身が空 / 全部エラーで上 2 段が失敗
    したときの最終フォールバック。`grid_item.rs` の draw_cell でアイコン表示。
 

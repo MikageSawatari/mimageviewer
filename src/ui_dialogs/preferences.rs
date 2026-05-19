@@ -30,6 +30,7 @@ pub(crate) enum PreferencesPage {
     Thumbnail,
     Toolbar,
     Slideshow,
+    Capture,
     Parallelism,
     Prefetch,
     GpuMemory,
@@ -64,6 +65,7 @@ impl PreferencesPage {
             Self::Thumbnail => "サムネイル",
             Self::Toolbar => "ツールバー",
             Self::Slideshow => "スライドショー",
+            Self::Capture => "キャプチャ保存",
             Self::Parallelism => "並列読み込み",
             Self::Prefetch => "先読み",
             Self::GpuMemory => "GPUメモリ",
@@ -104,6 +106,7 @@ const TREE: &[TreeCategory] = &[
             PreferencesPage::Thumbnail,
             PreferencesPage::Toolbar,
             PreferencesPage::Slideshow,
+            PreferencesPage::Capture,
         ],
     },
     TreeCategory {
@@ -200,6 +203,7 @@ pub(crate) struct PreferencesState {
 
     // ページ固有の一時状態
     pub manual_threads: usize,
+    pub capture_output_dir_input: String,
     pub exif_add_tag_input: String,
     /// EXIF タグ設定で折りたたみ中のグループ。`HashSet` に入っているものが折りたたみ。
     pub exif_collapsed_groups: HashSet<crate::exif_reader::TagGroup>,
@@ -315,6 +319,11 @@ impl PreferencesState {
             selected: PreferencesPage::Thumbnail,
             expanded,
             manual_threads,
+            capture_output_dir_input: s
+                .capture_output_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
             exif_add_tag_input: String::new(),
             exif_collapsed_groups: HashSet::new(),
             exif_scroll_to_added: None,
@@ -802,6 +811,7 @@ fn draw_page(ui: &mut egui::Ui, state: &mut PreferencesState, enter_pressed: boo
         PreferencesPage::Thumbnail => page_thumbnail(ui, state),
         PreferencesPage::Toolbar => page_toolbar(ui, state),
         PreferencesPage::Slideshow => page_slideshow(ui, state),
+        PreferencesPage::Capture => page_capture(ui, state),
         PreferencesPage::Parallelism => page_parallelism(ui, state),
         PreferencesPage::Prefetch => page_prefetch(ui, state),
         PreferencesPage::GpuMemory => page_gpu_memory(ui, state),
