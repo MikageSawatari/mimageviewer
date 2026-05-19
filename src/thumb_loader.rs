@@ -50,6 +50,7 @@ pub const CACHE_KEY_FOLDER: &str = "folderthumb:";
 ///
 /// cache key に含めることで、番号順などの選定ロジックを変えたときだけ古い代表
 /// サムネを避けて再スキャンする。フォルダ内容の変更を毎回検査する目的ではない。
+/// 旧 `folderthumb:{dirname}` 形式を v1 相当とみなし、明示版は v2 から始める。
 pub const FOLDER_THUMB_AUTO_ALGO_VERSION: u32 = 2;
 
 /// 親コンテナ (フォルダ / ZIP / PDF) に手動ピンが付いているときに、cache key の
@@ -925,6 +926,16 @@ fn resolve_folder_thumb_image_inner(
     remaining_depth: u32,
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
 ) -> Option<std::path::PathBuf> {
+    fn mtime_for_sort(entry: &std::fs::DirEntry, sort: crate::settings::SortOrder) -> i64 {
+        match sort {
+            crate::settings::SortOrder::DateAsc | crate::settings::SortOrder::DateDesc => entry
+                .metadata()
+                .ok()
+                .map_or(0, |m| crate::ui_helpers::mtime_secs(&m)),
+            crate::settings::SortOrder::FileName | crate::settings::SortOrder::Numeric => 0,
+        }
+    }
+
     let entries = std::fs::read_dir(folder).ok()?;
     let mut images: Vec<(std::path::PathBuf, i64)> = Vec::new();
     let mut subdirs: Vec<(std::path::PathBuf, i64)> = Vec::new();
@@ -939,18 +950,12 @@ fn resolve_folder_thumb_image_inner(
         };
         let p = entry.path();
         if ft.is_dir() {
-            let mtime = entry
-                .metadata()
-                .ok()
-                .map_or(0, |m| crate::ui_helpers::mtime_secs(&m));
+            let mtime = mtime_for_sort(&entry, sort);
             subdirs.push((p, mtime));
         } else if ft.is_file() {
             if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
                 if crate::folder_tree::is_recognized_image_ext(&ext.to_ascii_lowercase()) {
-                    let mtime = entry
-                        .metadata()
-                        .ok()
-                        .map_or(0, |m| crate::ui_helpers::mtime_secs(&m));
+                    let mtime = mtime_for_sort(&entry, sort);
                     images.push((p, mtime));
                 }
             }
@@ -1480,6 +1485,26 @@ mod tests {
         std::fs::write(&expected, b"not decoded").unwrap();
 
         let picked = resolve_folder_thumb_image(tmp.path(), SortOrder::Numeric, 1, None);
+
+        assert_eq!(picked, Some(expected));
+    }
+
+    #[test]
+    fn resolve_folder_thumb_sorts_subdirs_by_date_desc() {
+        let tmp = TempDir::new().unwrap();
+        let old_dir = tmp.path().join("old");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("a.jpg"), b"not decoded").unwrap();
+
+        // mtime_secs は秒精度なので、日付順の差が確実に出るまで待つ。
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+
+        let new_dir = tmp.path().join("new");
+        std::fs::create_dir_all(&new_dir).unwrap();
+        let expected = new_dir.join("a.jpg");
+        std::fs::write(&expected, b"not decoded").unwrap();
+
+        let picked = resolve_folder_thumb_image(tmp.path(), SortOrder::DateDesc, 1, None);
 
         assert_eq!(picked, Some(expected));
     }

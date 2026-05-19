@@ -18020,6 +18020,8 @@ fn make_load_request(
             let req = LoadRequest {
                 path: p.clone(),
                 cache_key_override: Some(base_key.clone()),
+                folder_thumb_sort,
+                folder_thumb_depth,
                 ..base
             };
             Some(apply_folder_thumb_pin(
@@ -18045,6 +18047,8 @@ fn make_load_request(
                 pdf_page: Some(0),
                 pdf_password: pdf_password.map(String::from),
                 cache_key_override: Some(base_key.clone()),
+                folder_thumb_sort,
+                folder_thumb_depth,
                 ..base
             };
             Some(apply_folder_thumb_pin(

@@ -89,7 +89,7 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 | GridItem | `zip_entry` | `pdf_page` | `cache_key_override` | サムネ取得方法 |
 | --- | --- | --- | --- | --- |
 | Image | None | None | なし | ファイル直接デコード |
-| Folder | None | None | `folderthumb:auto-vN:{sort}:d{depth}:{dirname}` | 再帰的に代表画像を探してデコード |
+| Folder | None | None | `folderthumb:auto-vN:{sort}:d{depth}:{dirname-or-fullpath}` | 再帰的に代表画像を探してデコード |
 | ZipFile | None | None | `zipthumb:{filename}` | `zip_loader::read_first_image_bytes` で先頭画像 |
 | PdfFile | None | Some(0) | `pdfthumb:{filename}` | PDF ワーカーでページ 0 をレンダリング |
 | ZipImage | Some(entry) | None | なし (entry が自動キー) | ZIP からエントリバイト → decode |
@@ -220,7 +220,7 @@ Folder/ZipFile/PdfFile のサムネイルはそれぞれ別ロジックで「代
 
 | 容器 | 実装 | 「先頭」の定義 |
 | --- | --- | --- |
-| Folder | `thumb_loader::resolve_folder_thumb_image` で再帰走査 | cache miss 時に、サムネイル一覧に近い順序としてサブフォルダを `folder_thumb_sort` で先に辿り、見つからなければ直接画像を同じ sort で選ぶ。深さは `folder_thumb_depth` |
+| Folder | `thumb_loader::resolve_folder_thumb_image` で再帰走査 | cache miss 時に、グリッドのブロック順に揃えてサブフォルダを `folder_thumb_sort` で先に辿り、見つからなければ直接画像を同じ sort で選ぶ。深さは `folder_thumb_depth` |
 | ZipFile | `zip_loader::read_first_image_bytes` | エントリ名の昇順で最初の画像拡張子 |
 | PdfFile | PDF ワーカーでページ 0 を固定取得 | 常に `page_num = 0` |
 

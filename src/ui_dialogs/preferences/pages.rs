@@ -1506,7 +1506,10 @@ pub(super) fn page_folder(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.add_space(12.0);
     ui.label(egui::RichText::new("フォルダサムネイル探索").strong());
     ui.add_space(4.0);
-    ui.label("フォルダの代表画像を探すとき、サブフォルダを何階層まで探索するか。\n0 にすると直接の子ファイルのみ使用します。");
+    ui.label(
+        "フォルダの代表画像を探すとき、サブフォルダを何階層まで探索するか。\n\
+         1 以上ではサブフォルダ内の画像を直接の子ファイルより優先します。0 にすると直接の子ファイルのみ使用します。",
+    );
     ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.label("サブフォルダ探索階層:");

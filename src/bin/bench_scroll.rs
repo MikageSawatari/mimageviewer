@@ -29,8 +29,8 @@ use mimageviewer::grid_item::GridItem;
 use mimageviewer::settings::{CachePolicy, SortOrder};
 use mimageviewer::stats::ThumbStats;
 use mimageviewer::thumb_loader::{
-    CACHE_KEY_FOLDER, CACHE_KEY_PDF, CACHE_KEY_ZIP, CacheDecision, LoadRequest, ThumbMsg,
-    process_load_request,
+    CACHE_KEY_PDF, CACHE_KEY_ZIP, CacheDecision, LoadRequest, ThumbMsg,
+    folder_thumb_auto_cache_key, process_load_request,
 };
 use mimageviewer::ui_helpers::{mtime_secs, natural_sort_key};
 
@@ -332,11 +332,17 @@ fn make_load_request(
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_string();
+            let folder_thumb_sort = SortOrder::Numeric;
+            let folder_thumb_depth = 3;
             Some(LoadRequest {
                 path: p.clone(),
-                cache_key_override: Some(format!("{CACHE_KEY_FOLDER}{fname}")),
-                folder_thumb_sort: Some(SortOrder::Numeric),
-                folder_thumb_depth: 3,
+                cache_key_override: Some(folder_thumb_auto_cache_key(
+                    &fname,
+                    folder_thumb_sort,
+                    folder_thumb_depth,
+                )),
+                folder_thumb_sort: Some(folder_thumb_sort),
+                folder_thumb_depth,
                 ..base
             })
         }
