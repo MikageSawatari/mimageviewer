@@ -1715,6 +1715,22 @@ impl NativeVideoPresenter {
                 ),
             ],
         );
+        crate::gpu_info::emit_vram_trace(
+            "video_surface_swap",
+            "after_video_swap_chain_replace",
+            &[
+                ("surface_width", Value::from(new_w as i64)),
+                ("surface_height", Value::from(new_h as i64)),
+                (
+                    "retired_video_surfaces_len",
+                    Value::from(self.retired_video_surfaces.len() as i64),
+                ),
+                (
+                    "shared_texture_cache_len",
+                    Value::from(self.shared_texture_cache.len() as i64),
+                ),
+            ],
+        );
 
         Ok(NativePresentOutcome {
             path: copy.path,
@@ -2021,6 +2037,18 @@ impl NativeVideoPresenter {
                 );
             }
         }
+    }
+
+    pub fn shared_texture_cache_len(&self) -> usize {
+        self.shared_texture_cache.len()
+    }
+
+    pub fn retired_video_surface_len(&self) -> usize {
+        self.retired_video_surfaces.len()
+    }
+
+    pub fn surface_size(&self) -> (u32, u32) {
+        (self.surface_width, self.surface_height)
     }
 
     /// HUD overlay HWND の生 u64 値。HUD HWND が生成されていなければ 0。

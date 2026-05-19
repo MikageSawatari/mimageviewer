@@ -153,7 +153,7 @@ NativeVideoPresenter (= 独立 HWND を持つ別スレッド)
 #### 共有テクスチャ identity (`shared_texture_gen`) — handle 値再利用への防御
 
 `GpuVideoDevice` (アプリ全体で 1 個、全 `VideoPlayer` が `Arc` 共有) は共有出力テクスチャ
-の ring (`shared_output_pool`、最大 24 枚) を持つ。動画切替で解像度が変わると
+の ring (`shared_output_pool`、最大 16 枚) を持つ。動画切替で解像度が変わると
 `acquire_shared_output` はサイズ違いの slot を evict (`CloseHandle`) し、新サイズの slot を
 `CreateSharedHandle` で作る。このとき **OS は解放直後の NT shared handle 値を新 slot へ
 再利用しうる**。
@@ -189,7 +189,7 @@ fence 未作成の環境 (`copy_fence_completed_value()` が `None`) や Signal 
 (`copy_fence_value == 0`) のフレームは fence ゲートでは解放せず、深さキャップ
 `NATIVE_PRESENT_RETIRE_CAP = 4` のみで解放する (= 時間ベースに縮退、旧挙動と等価)。キャップは
 fence が万一 stall したときの上限も兼ねるが、**stall 時のフットプリント (= 共有出力プール
-24 slot のうち retire が占める数) を 4 に抑える**ことで、decoder の in-flight (~10-15) と
+16 slot のうち retire が占める数) を 4 に抑える**ことで、decoder の in-flight (~10-15) と
 合わせてもプールに余裕が残るようにしている (2026-05-15 に 8 から 4 へ縮小: cap=8 では
 stall 時にプール枯渇 → CPU readback フォールバック → スパイラル悪化の実害があったため)。
 `fullscreen_present` perf イベントの `retire_queue_len` で長さを観測できる (fence が
@@ -1671,6 +1671,84 @@ A/V offset を比較。修正前は累積 −20s 級、修正後は ±数十 ms 
 | `underrun_end` | pump (callback edge) | silence 出力終了 (active true → false) | `edge_wall_ns`, `edge_age_ms` |
 | `audio_pts_jump` | pump (callback edge) | `set_audio_pts` 大ジャンプ (\|requested\|>5ms or cap 乖離) | `requested_pts`, `prev_now`, `after_now`, `requested_delta_ms`, `applied_delta_ms`, `edge_wall_ns`, `edge_age_ms` |
 | `buffer_clear` | UI スレッド (`clear_audio_output_buffer`) | seek / fast-swap / shutdown 共通の汎用名。旧版では Norm でも発火していたが 2026-05-11 に削除 (= 5+ 秒 A/V offset バグの直接原因だったため) | `processed_secs_before`, `raw_pending_secs_before`, `audio_tx_queued_before`, `now_secs_at_clear` |
+
+#### `cat = "gpu_memory"`
+
+`--perf-log` 有効時だけ、動画 native presenter 経路の VRAM 診断として出す。
+DXGI (`IDXGIAdapter3::QueryVideoMemoryInfo`) のプロセス単位 local/non-local usage と、
+WDDM `GPU Process Memory` performance counter の current process dedicated/shared usage
+を併記する。DirectComposition / DWM 経由の accounting は両者でずれることがあるため、
+`dxgi_*` と `process_*` は相互検算用として扱う。UI thread から発火する
+`native_output_drop` は計測自体のヒッチを避けるため PDH を省略し、`pdh_skipped=true`
+を付ける。
+
+| kind | 発火元 | 説明 | 主な extras |
+|---|---|---|---|
+| `snapshot` | native presenter loop 1Hz | 再生中の定期サンプル | `dxgi_local_current_mib`, `process_dedicated_mib`, `source_epoch`, `source_queue_len`, `present_retire_len`, `shared_texture_cache_len`, `retired_video_surfaces_len` |
+| `switch_source_begin` | `SwitchSource` 受信直後 | 旧 source queue / retire を drain する前 | 同上 |
+| `switch_source_after_clear` | `SwitchSource` 中 | queue drain + completed retire 解放 + `shared_texture_cache.clear()` 後 | 同上 |
+| `switch_source_attached` | `SwitchSource` 中 | 新 source を presenter に接続した直後 | 同上 |
+| `deferred` | `SwitchSource` 後 | 切替 250ms / 1s / 3s 後の遅延解放確認 | `reason=switch_source_250ms` 等、同上 |
+| `video_surface_swap` | `NativeVideoPresenter::present_with_surface_swap` | 動画解像度変更で swap chain を差し替えた直後 | `surface_width`, `surface_height`, `retired_video_surfaces_len` |
+| `native_output_drop` / `native_output_drop_join` | `NativeVideoOutput::drop` | detached join 型 shutdown が完了しているかの確認 | `join_ok` (join 後のみ), `pdh_skipped` |
+| `idxgi_trim_invoked` | D3D11VA decoder teardown | `--perf-log` 測定時だけ `IDXGIDevice3::Trim()` を呼んだ直後 | `trim_ok`, `trim_error`, `tracking_ref_released`, `estimated_pool_mib`, `pdh_skipped=true` |
+
+`video.shared_output_pool_grow` / `video.shared_output_pool_evict` には
+`pool_in_use`, `pool_estimated_bytes`, `pool_estimated_mib` も載せる。これは
+`shared_output_pool` 自体の見積もり量であり、D3D11 driver / WDDM が内部で保持する
+allocator cache までは含まない。
+
+#### `cat = "d3d11va_hwframes"`
+
+`--perf-log` 有効時だけ、D3D11VA decoder が実際に使った FFmpeg
+`AVHWFramesContext` を観測する。FFmpeg が `hw_device_ctx` から内部生成する
+frames context は直接所有していないため、free callback の差し替えは行わず、届いた
+`AVFrame.hw_frames_ctx` と decoder teardown 直前の `AVCodecContext.hw_frames_ctx` を読む。
+`hw_frames_ctx_ref` は `AVBufferRef*`、`hw_frames_ctx` はその `data` が指す実体
+`AVHWFramesContext*`。dedup は実体 pointer 側で行う。
+
+| kind | 発火元 | 説明 | 主な extras |
+|---|---|---|---|
+| `observed` | D3D11VA frame の初回受信 | 新しい `AVHWFramesContext*` を初めて見た時 | `hw_frames_ctx_ref`, `hw_frames_ctx`, `ref_count`, `initial_pool_size`, `format`, `sw_format`, `width`, `height`, `estimated_pool_mib` |
+| `teardown_begin` | video decode thread 終了直前 | `AVCodecContext` / `HwDevice` を明示 drop する直前 | 同上, `hw_device_present`, `observed_hw_frames_ctx_count` |
+
+`estimated_pool_mib` は `initial_pool_size × width × height × sw_format` からの理論下限で、
+D3D11 driver の alignment / tiling による上乗せは含まない。teardown 前後は
+`gpu_memory.d3d11va_decoder_teardown` で DXGI-only snapshot を出し、
+`before_video_decoder_drop` → `after_video_decoder_drop_before_hw_device_drop` →
+`after_video_decoder_and_hw_device_drop_before_tracking_ref_drop` →
+`after_hw_frames_tracking_ref_drop` の 4 点で usage が戻るかを確認する。
+drop 後の refcount を安全に読むため、teardown 計測中だけ観測用 `AVBufferRef` を 1 本保持する。
+この間の `ref_count` には観測用参照が含まれるため、`ref_count_excluding_tracking_ref` も併記する。
+`tracking_ref_held=true` は「この snapshot 時点で観測用参照を保持中」、
+`tracking_ref_released=true` は「直前に観測用参照を drop 済み」を表す。teardown の
+VRAM snapshot は PDH ノイズを避けるため DXGI-only (`pdh_skipped=true`) で出す。
+`--perf-log` 測定時は stage 4 の直後に `IDXGIDevice3::Trim()` を実験的に呼び、
+`gpu_memory.idxgi_trim_invoked` で直後の DXGI usage を記録する。通常起動では呼ばない。
+
+#### `cat = "hwframes_pool"`
+
+`GpuVideoDevice` は D3D11VA の `AVHWFramesContext` を bounded LRU で保持し、
+同じ coded dimensions / pixel format / pool size / D3D11 bind flags の動画へ fast-swap するときは
+FFmpeg に初期化済み context の `av_buffer_ref()` を渡す。これは NVIDIA D3D11 driver が
+短時間の hwframes pool 作成/破棄を local VRAM で即時再利用しない挙動を避けるための
+再利用キャッシュで、上限は 6 entries または推定 512 MiB。推定値は
+`estimated_pool_mib` と同じ理論下限であり、driver alignment 分は含まない。
+cached frames context は作成時に使った `AVHWDeviceContext` への参照も保持するため、
+cache eviction または `GpuVideoDevice` drop までその FFmpeg device context は生存する。
+これは意図した参照保持で、eviction 時の `av_buffer_unref()` で解放される。将来
+D3D11 device-lost recovery を実装する場合は、device を差し替える前に
+`hwframes_pool` を clear する必要がある。
+
+| kind | 発火元 | 説明 | 主な extras |
+|---|---|---|---|
+| `acquire` | FFmpeg `get_format` callback | D3D11VA hwframes context の cache hit/miss | `result=hit/miss/...`, `coded_w`, `coded_h`, `format`, `sw_format`, `initial_pool_size`, `bind_flags`, `misc_flags`, `estimated_pool_mib`, `pool_entries_before/after`, `pool_total_mib_before/after`, `cache_ref_count` |
+| `evict` | cache capacity / device drop | LRU eviction または device drop 時の明示 clear | `reason=capacity/stale_ref/gpu_video_device_drop`, key fields, `pool_entries_before`, `pool_total_mib_before` |
+| `attach_fallback` | FFmpeg `get_format` callback | cache 経路で ctx を渡せず FFmpeg 自動生成へ戻した | `error` |
+
+`cache_ref_count` は event emit 時点の cached `AVBufferRef` refcount。通常は
+cache 自身の 1 本 + decoder に渡した 1 本で `2` になる。`2` より大きい値が継続する場合は、
+古い decoder が長く生存している、または同時 decoder が重なっている可能性を見る。
 
 ### Norm ボタン関連の判定
 

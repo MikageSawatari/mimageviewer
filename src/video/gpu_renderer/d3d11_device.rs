@@ -22,6 +22,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 
+use ffmpeg_the_third::ffi::{AVBufferRef, AVCodecContext, AVPixelFormat};
 use windows::Win32::Foundation::{HANDLE, HMODULE};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_HARDWARE, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
@@ -46,12 +47,14 @@ use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020, DXGI_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM,
     DXGI_RATIONAL, DXGI_SAMPLE_DESC,
 };
-use windows::Win32::Graphics::Dxgi::{IDXGIKeyedMutex, IDXGIResource1};
+use windows::Win32::Graphics::Dxgi::{IDXGIDevice3, IDXGIKeyedMutex, IDXGIResource1};
 use windows::Win32::System::Threading::{
     CRITICAL_SECTION, DeleteCriticalSection, EnterCriticalSection, InitializeCriticalSection,
     LeaveCriticalSection,
 };
 use windows::core::Interface;
+
+use super::ffmpeg_d3d11::HwFramesPool;
 
 /// 出力テクスチャのリングバッファサイズ。decoder が書き → UI が読む間
 /// に少なくとも 2 枚 in-flight を許す。
@@ -382,6 +385,14 @@ pub struct GpuVideoDevice {
     /// を返して即ロックを離し、caller は cache の現値に依存せず自前の COM ptr で blit する
     /// (Codex P2 2026-05-16)。Cache は last-writer-wins の純粋な performance cache。
     processor_cache: Mutex<Option<ProcessorState>>,
+    /// D3D11VA decoder surface pools keyed by FFmpeg's coded dimensions and
+    /// frame format. This avoids repeated Texture2DArray allocations when
+    /// fast-swapping between videos that share the same HW decode layout.
+    ///
+    /// If D3D11 device-lost recovery is added later, clear this pool before
+    /// replacing the device; cached frames contexts hold COM refs to the device
+    /// that created them.
+    hw_frames_pool: Mutex<HwFramesPool>,
     shared_output_pool: Mutex<Vec<SharedOutputSlot>>,
     shared_output_pool_wait: Mutex<()>,
     shared_output_pool_cv: Arc<Condvar>,
@@ -486,6 +497,13 @@ impl Drop for SharedOutputSlot {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SharedOutputPoolStats {
+    len: usize,
+    in_use: usize,
+    estimated_bytes: u64,
+}
+
 /// VPP enumerator + processor とそのキャッシュキー (= 入出力寸法 / format / fps)。
 ///
 /// **Clone は cheap な COM AddRef** (`windows-rs` の `Interface::clone()` は内部で AddRef)。
@@ -553,6 +571,33 @@ impl Drop for D3dContextGuard<'_> {
 }
 
 impl GpuVideoDevice {
+    fn shared_output_slot_estimated_bytes(slot: &SharedOutputSlot) -> u64 {
+        let bytes_per_pixel = match slot.format {
+            DXGI_FORMAT_B8G8R8A8_UNORM => 4,
+            _ => 4,
+        };
+        (slot.width as u64)
+            .saturating_mul(slot.height as u64)
+            .saturating_mul(bytes_per_pixel)
+    }
+
+    fn shared_output_pool_stats(pool: &[SharedOutputSlot]) -> SharedOutputPoolStats {
+        let mut in_use = 0usize;
+        let mut estimated_bytes = 0u64;
+        for slot in pool {
+            if slot.in_use.load(Ordering::Acquire) {
+                in_use += 1;
+            }
+            estimated_bytes =
+                estimated_bytes.saturating_add(Self::shared_output_slot_estimated_bytes(slot));
+        }
+        SharedOutputPoolStats {
+            len: pool.len(),
+            in_use,
+            estimated_bytes,
+        }
+    }
+
     /// D3D11 デバイス + ビデオデバイスを作成する。失敗時はフォールバックを呼び出し側で
     /// 処理する想定。
     pub fn new() -> Result<Arc<Self>, GpuVideoError> {
@@ -654,6 +699,7 @@ impl GpuVideoDevice {
             video_context,
             video_context1,
             processor_cache: Mutex::new(None),
+            hw_frames_pool: Mutex::new(HwFramesPool::default()),
             shared_output_pool: Mutex::new(Vec::new()),
             shared_output_pool_wait: Mutex::new(()),
             shared_output_pool_cv: Arc::new(Condvar::new()),
@@ -679,6 +725,41 @@ impl GpuVideoDevice {
 
     pub fn raw_context(&self) -> &ID3D11DeviceContext {
         &self.context
+    }
+
+    /// Acquire an initialized D3D11VA AVHWFramesContext for FFmpeg decode.
+    ///
+    /// SAFETY: Call only from FFmpeg's `get_format` callback, with the same
+    /// `AVCodecContext` and a hardware pixel format from that callback's
+    /// candidate list.
+    pub unsafe fn acquire_cached_d3d11va_hw_frames_ctx(
+        &self,
+        avctx: *mut AVCodecContext,
+        device_ref: *mut AVBufferRef,
+        hw_pix_fmt: AVPixelFormat,
+    ) -> Result<*mut AVBufferRef, String> {
+        unsafe {
+            self.hw_frames_pool
+                .lock()
+                .map_err(|_| "hw_frames_pool mutex poisoned".to_string())?
+                .acquire_for_decoder(avctx, device_ref, hw_pix_fmt)
+        }
+    }
+
+    /// Ask WDDM to trim cached video-memory allocations for this D3D11 device.
+    ///
+    /// This is a diagnostic hook for D3D11VA teardown. It should be called from
+    /// worker/presenter code paths only; doing this on the UI thread could turn
+    /// driver cache reuse into a visible hitch.
+    pub fn trim_dxgi_memory(&self) -> Result<(), String> {
+        let dxgi_device3: IDXGIDevice3 = self
+            .device
+            .cast()
+            .map_err(|e| format!("cast IDXGIDevice3: {e:?}"))?;
+        unsafe {
+            dxgi_device3.Trim();
+        }
+        Ok(())
     }
 
     /// D3D11VA context 直列化用 CRITICAL_SECTION の生ポインタ。`ffmpeg_d3d11.rs` が
@@ -1331,6 +1412,9 @@ impl GpuVideoDevice {
                         && !slot.in_use.load(Ordering::Acquire)
                 }) {
                     let evicted = pool.remove(pos);
+                    let evicted_estimated_bytes =
+                        Self::shared_output_slot_estimated_bytes(&evicted);
+                    let pool_stats = Self::shared_output_pool_stats(&pool);
                     crate::perf::event(
                         "video",
                         "shared_output_pool_evict",
@@ -1341,7 +1425,37 @@ impl GpuVideoDevice {
                             ("height", serde_json::Value::from(evicted.height as i64)),
                             ("requested_width", serde_json::Value::from(w as i64)),
                             ("requested_height", serde_json::Value::from(h as i64)),
-                            ("pool_len", serde_json::Value::from(pool.len() as i64)),
+                            ("pool_len", serde_json::Value::from(pool_stats.len as i64)),
+                            (
+                                "pool_in_use",
+                                serde_json::Value::from(pool_stats.in_use as i64),
+                            ),
+                            (
+                                "pool_estimated_bytes",
+                                serde_json::Value::from(pool_stats.estimated_bytes),
+                            ),
+                            (
+                                "pool_estimated_mib",
+                                serde_json::Value::from(pool_stats.estimated_bytes / (1024 * 1024)),
+                            ),
+                            (
+                                "evicted_estimated_bytes",
+                                serde_json::Value::from(evicted_estimated_bytes),
+                            ),
+                            (
+                                "evicted_estimated_mib",
+                                serde_json::Value::from(evicted_estimated_bytes / (1024 * 1024)),
+                            ),
+                            (
+                                "evicted_format",
+                                serde_json::Value::from(format!("{:?}", evicted.format)),
+                            ),
+                            (
+                                "requested_estimated_bytes",
+                                serde_json::Value::from(
+                                    (w as u64).saturating_mul(h as u64).saturating_mul(4),
+                                ),
+                            ),
                             (
                                 "shared_handle",
                                 serde_json::Value::from(evicted.shared_handle.0 as usize as u64),
@@ -1386,6 +1500,7 @@ impl GpuVideoDevice {
                     released_to_reader: Arc::clone(&released_to_reader),
                     texture_gen: slot_gen,
                 });
+                let pool_stats = Self::shared_output_pool_stats(&pool);
                 crate::perf::event(
                     "video",
                     "shared_output_pool_grow",
@@ -1394,7 +1509,26 @@ impl GpuVideoDevice {
                     &[
                         ("width", serde_json::Value::from(w as i64)),
                         ("height", serde_json::Value::from(h as i64)),
-                        ("pool_len", serde_json::Value::from(pool.len() as i64)),
+                        ("pool_len", serde_json::Value::from(pool_stats.len as i64)),
+                        (
+                            "pool_in_use",
+                            serde_json::Value::from(pool_stats.in_use as i64),
+                        ),
+                        (
+                            "pool_estimated_bytes",
+                            serde_json::Value::from(pool_stats.estimated_bytes),
+                        ),
+                        (
+                            "pool_estimated_mib",
+                            serde_json::Value::from(pool_stats.estimated_bytes / (1024 * 1024)),
+                        ),
+                        (
+                            "slot_estimated_bytes",
+                            serde_json::Value::from(
+                                (w as u64).saturating_mul(h as u64).saturating_mul(4),
+                            ),
+                        ),
+                        ("format", serde_json::Value::from(format!("{format:?}"))),
                         (
                             "shared_handle",
                             serde_json::Value::from(shared_handle.0 as usize as u64),
@@ -1504,6 +1638,10 @@ impl GpuVideoDevice {
 
 impl Drop for GpuVideoDevice {
     fn drop(&mut self) {
+        match self.hw_frames_pool.get_mut() {
+            Ok(pool) => pool.clear("gpu_video_device_drop"),
+            Err(poisoned) => poisoned.into_inner().clear("gpu_video_device_drop"),
+        }
         // fence の NT shared handle は CreateSharedHandle で取得しており、本構造体が
         // 唯一の所有者。device drop タイミングで close する。D3D12 側で OpenSharedHandle
         // 経由で得た ID3D12Fence COM オブジェクトは内部参照を持っているので、ここで

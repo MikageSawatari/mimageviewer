@@ -920,13 +920,31 @@ impl NativeVideoOutput {
 #[cfg(windows)]
 impl Drop for NativeVideoOutput {
     fn drop(&mut self) {
+        crate::gpu_info::emit_vram_trace_with_options(
+            "native_output_drop",
+            "before_cancel",
+            &[],
+            false,
+        );
         self.cancel.store(true, Ordering::Release);
         if let Some(thread) = self.thread.take() {
-            let _ = std::thread::Builder::new()
+            match std::thread::Builder::new()
                 .name("native-video-output-drop-join".to_string())
                 .spawn(move || {
-                    let _ = thread.join();
-                });
+                    let join_ok = thread.join().is_ok();
+                    crate::gpu_info::emit_vram_trace(
+                        "native_output_drop_join",
+                        "after_presenter_thread_join",
+                        &[("join_ok", serde_json::Value::from(join_ok))],
+                    );
+                }) {
+                Ok(_) => {}
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "native video output drop join spawn failed: {e:?}"
+                    ));
+                }
+            }
         }
     }
 }
@@ -1130,6 +1148,58 @@ fn native_drain_unpresented_queue(queue: &mut std::collections::VecDeque<VideoFr
 #[cfg(not(windows))]
 fn native_drain_unpresented_queue(queue: &mut std::collections::VecDeque<VideoFrame>) {
     queue.clear();
+}
+
+#[cfg(windows)]
+fn emit_native_vram_trace(
+    kind: &str,
+    reason: &str,
+    source: &PresenterSourceState,
+    presenter: &native_presenter::NativeVideoPresenter,
+    present_retire_len: usize,
+) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    let (surface_width, surface_height) = presenter.surface_size();
+    crate::gpu_info::emit_vram_trace(
+        kind,
+        reason,
+        &[
+            (
+                "source_epoch",
+                serde_json::Value::from(source.source_epoch as i64),
+            ),
+            (
+                "source_queue_len",
+                serde_json::Value::from(source.queue.len() as i64),
+            ),
+            (
+                "video_rx_len",
+                serde_json::Value::from(source.video_rx.len() as i64),
+            ),
+            (
+                "present_retire_len",
+                serde_json::Value::from(present_retire_len as i64),
+            ),
+            (
+                "shared_texture_cache_len",
+                serde_json::Value::from(presenter.shared_texture_cache_len() as i64),
+            ),
+            (
+                "retired_video_surfaces_len",
+                serde_json::Value::from(presenter.retired_video_surface_len() as i64),
+            ),
+            (
+                "surface_width",
+                serde_json::Value::from(surface_width as i64),
+            ),
+            (
+                "surface_height",
+                serde_json::Value::from(surface_height as i64),
+            ),
+        ],
+    );
 }
 
 /// 環境変数を「真偽値」として読む。`""`/`"0"`/`"false"`/`"off"`/`"no"`
@@ -1463,6 +1533,10 @@ fn run_native_video_output(
     let mut last_present_log = Instant::now();
     let mut last_overlay_tick = Instant::now();
     let mut last_source_state_probe = Instant::now();
+    let mut last_vram_trace = run_started
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or(run_started);
+    let mut vram_trace_deadlines: Vec<(Instant, &'static str)> = Vec::new();
     // CP6: cursor polling 用 state。HUD 経路 (= CP7 で hud_event_tx=Some) のときだけ
     // 機能する。フォールバック経路では `presenter.cursor_polling_tick` が早期 return。
     let mut last_cursor_poll: Option<Instant> = None;
@@ -1540,6 +1614,13 @@ fn run_native_video_output(
     /// なって decoder が `try_send` 失敗 → 古い frame を drop して新 frame に置換)。
     /// 30fps で約 270ms 分 = pacing 上は十分。
     const MAX_NATIVE_SOURCE_QUEUE: usize = 8;
+    emit_native_vram_trace(
+        "native_presenter_started",
+        "after_presenter_init",
+        &source,
+        &presenter,
+        present_retire.len(),
+    );
     while !cancel.load(Ordering::Acquire) {
         // `FirstFrameReady` is what lets the engine leave Buffering after a seek.
         // The engine event channel can be temporarily full during seek bursts, so
@@ -1559,6 +1640,33 @@ fn run_native_video_output(
             break;
         }
         let now = Instant::now();
+        if crate::perf::is_enabled() {
+            if now.duration_since(last_vram_trace) >= Duration::from_secs(1) {
+                emit_native_vram_trace(
+                    "snapshot",
+                    "native_loop_1hz",
+                    &source,
+                    &presenter,
+                    present_retire.len(),
+                );
+                last_vram_trace = now;
+            }
+            let mut i = 0usize;
+            while i < vram_trace_deadlines.len() {
+                if now >= vram_trace_deadlines[i].0 {
+                    let (_, reason) = vram_trace_deadlines.swap_remove(i);
+                    emit_native_vram_trace(
+                        "deferred",
+                        reason,
+                        &source,
+                        &presenter,
+                        present_retire.len(),
+                    );
+                } else {
+                    i += 1;
+                }
+            }
+        }
         if pending_navigation_preview_clear_at.is_some_and(|deadline| now >= deadline) {
             pending_navigation_preview_clear_at = None;
             presenter.set_overlay_navigation_preview(None);
@@ -1775,6 +1883,13 @@ fn run_native_video_output(
                     ));
                 }
                 NativeVideoOutputCommand::SwitchSource { payload } => {
+                    emit_native_vram_trace(
+                        "switch_source_begin",
+                        "before_drain_old_source",
+                        &source,
+                        &presenter,
+                        present_retire.len(),
+                    );
                     native_drain_unpresented_queue(&mut source.queue);
                     // present_retire の OLD source 由来エントリのうち fence が完了したものを
                     // 解放する (rapid swap で旧 slot が retire に滞留して共有出力プールを
@@ -1792,8 +1907,35 @@ fn run_native_video_output(
                     // (Codex 助言 2026-05-15、wgpu OOM 対策)。新 source は新 shared_handle で
                     // 再キャッシュされる。
                     presenter.clear_shared_texture_cache();
+                    emit_native_vram_trace(
+                        "switch_source_after_clear",
+                        "after_drain_retire_and_shared_cache_clear",
+                        &source,
+                        &presenter,
+                        present_retire.len(),
+                    );
                     let show_preparing_overlay = payload.show_preparing_overlay;
                     source = PresenterSourceState::new(*payload);
+                    emit_native_vram_trace(
+                        "switch_source_attached",
+                        "after_new_source_attached",
+                        &source,
+                        &presenter,
+                        present_retire.len(),
+                    );
+                    let switch_trace_now = Instant::now();
+                    vram_trace_deadlines.push((
+                        switch_trace_now + Duration::from_millis(250),
+                        "switch_source_250ms",
+                    ));
+                    vram_trace_deadlines.push((
+                        switch_trace_now + Duration::from_secs(1),
+                        "switch_source_1s",
+                    ));
+                    vram_trace_deadlines.push((
+                        switch_trace_now + Duration::from_secs(3),
+                        "switch_source_3s",
+                    ));
                     first_presented_out.store(false, Ordering::Release);
                     pending_navigation_preview_clear_at = None;
                     // ソース切替時は新動画のオープン前なので prep_status は初期値で送る。
@@ -2819,7 +2961,21 @@ fn run_native_video_output(
         }
     }
 
+    emit_native_vram_trace(
+        "native_presenter_exit_begin",
+        "before_exit_drain",
+        &source,
+        &presenter,
+        present_retire.len(),
+    );
     native_drain_unpresented_queue(&mut source.queue);
+    emit_native_vram_trace(
+        "native_presenter_exit_after_drain",
+        "after_exit_drain",
+        &source,
+        &presenter,
+        present_retire.len(),
+    );
     source.present_stats.emit_summary(run_started.elapsed());
     crate::logger::log(format!(
         "[native-video] startup probe summary: probes={} first_present_logged={}",
@@ -2850,6 +3006,13 @@ fn run_native_video_output(
     // HWND が `dsp_bridge.set_hud_hwnd(...)` で渡されたままになり、raise allowlist に
     // 数フレーム残って次の動画開始直後の foreground 切替を阻害していた。
     hud_hwnd_out.store(0, Ordering::Release);
+    emit_native_vram_trace(
+        "native_presenter_before_destroy",
+        "before_window_destroy",
+        &source,
+        &presenter,
+        present_retire.len(),
+    );
     window.destroy();
     closed.store(true, Ordering::Release);
     crate::logger::log("[native-video] fullscreen presenter stopped".to_string());

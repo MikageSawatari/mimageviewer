@@ -19,8 +19,9 @@ use std::os::raw::c_void;
 use std::sync::Arc;
 
 use ffmpeg_the_third::ffi::{
-    AVBufferRef, AVHWDeviceContext, AVHWDeviceType, av_buffer_ref, av_buffer_unref,
-    av_hwdevice_ctx_alloc, av_hwdevice_ctx_init,
+    AVBufferRef, AVCodecContext, AVHWDeviceContext, AVHWDeviceType, AVHWFramesContext,
+    AVPixelFormat, av_buffer_get_ref_count, av_buffer_ref, av_buffer_unref, av_hwdevice_ctx_alloc,
+    av_hwdevice_ctx_init, av_hwframe_ctx_init, avcodec_get_hw_frames_parameters,
 };
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11DeviceContext, ID3D11VideoContext, ID3D11VideoDevice,
@@ -31,6 +32,9 @@ use windows::Win32::System::Threading::{
 use windows::core::Interface;
 
 use super::d3d11_device::{GpuVideoDevice, GpuVideoError};
+
+const HW_FRAMES_POOL_MAX_ENTRIES: usize = 6;
+const HW_FRAMES_POOL_BUDGET_BYTES: u64 = 512 * 1024 * 1024;
 
 /// D3D11VA lock/unlock callback の呼出回数 (= API レベル直列化が機能している証拠の
 /// 取得用、2026-05-15 追加)。perf log に詳細イベントを出すと頻度が高すぎるので、
@@ -150,6 +154,20 @@ struct AVD3D11VADeviceContext {
     lock_ctx: *mut c_void,
 }
 
+/// `libavutil/hwcontext_d3d11va.h` の `AVD3D11VAFramesContext`。
+///
+/// Cache key には FFmpeg が設定した BindFlags / MiscFlags も含める。現状は
+/// D3D11_BIND_DECODER が中心だが、将来 FFmpeg 側の条件が変わった時に異なる
+/// pool を誤共有しないため。
+#[repr(C)]
+#[allow(dead_code, non_snake_case)]
+struct AVD3D11VAFramesContext {
+    texture: *mut c_void,
+    BindFlags: u32,
+    MiscFlags: u32,
+    texture_infos: *mut c_void,
+}
+
 /// `GpuVideoDevice` を共有する `AVBufferRef*` (= AVHWDeviceContext) を作る。
 ///
 /// 戻り値の `AVBufferRef*` は **caller 所有** (FFmpeg 慣習)。
@@ -238,6 +256,337 @@ pub unsafe fn create_ffmpeg_hw_device_ctx(
 #[allow(dead_code)]
 pub unsafe fn ref_for_codec(src: *mut AVBufferRef) -> *mut AVBufferRef {
     unsafe { av_buffer_ref(src) }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct HwFramesKey {
+    format: AVPixelFormat,
+    sw_format: AVPixelFormat,
+    width: i32,
+    height: i32,
+    initial_pool_size: i32,
+    bind_flags: u32,
+    misc_flags: u32,
+}
+
+impl HwFramesKey {
+    unsafe fn from_frames_ref(frames_ref: *mut AVBufferRef) -> Option<Self> {
+        if frames_ref.is_null() {
+            return None;
+        }
+        let ctx = unsafe { (*frames_ref).data as *const AVHWFramesContext };
+        if ctx.is_null() {
+            return None;
+        }
+        let ctx = unsafe { &*ctx };
+        let (bind_flags, misc_flags) = if ctx.hwctx.is_null() {
+            (0, 0)
+        } else {
+            let d3d11_frames = ctx.hwctx as *const AVD3D11VAFramesContext;
+            unsafe { ((*d3d11_frames).BindFlags, (*d3d11_frames).MiscFlags) }
+        };
+        Some(Self {
+            format: ctx.format,
+            sw_format: ctx.sw_format,
+            width: ctx.width,
+            height: ctx.height,
+            initial_pool_size: ctx.initial_pool_size,
+            bind_flags,
+            misc_flags,
+        })
+    }
+
+    fn estimated_pool_bytes(&self) -> u64 {
+        if self.width <= 0 || self.height <= 0 || self.initial_pool_size <= 0 {
+            return 0;
+        }
+        let Some((num, den)) = d3d11va_surface_bytes_per_pixel_ratio(self.sw_format) else {
+            return 0;
+        };
+        (self.width as u64)
+            .saturating_mul(self.height as u64)
+            .saturating_mul(num)
+            .saturating_mul(self.initial_pool_size as u64)
+            / den
+    }
+
+    fn fields(&self) -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            (
+                "format",
+                serde_json::Value::from(format!("{:?}", self.format)),
+            ),
+            (
+                "sw_format",
+                serde_json::Value::from(format!("{:?}", self.sw_format)),
+            ),
+            ("coded_w", serde_json::Value::from(self.width as i64)),
+            ("coded_h", serde_json::Value::from(self.height as i64)),
+            (
+                "initial_pool_size",
+                serde_json::Value::from(self.initial_pool_size as i64),
+            ),
+            (
+                "estimated_pool_mib",
+                serde_json::Value::from(self.estimated_pool_bytes() / (1024 * 1024)),
+            ),
+            (
+                "bind_flags",
+                serde_json::Value::from(self.bind_flags as u64),
+            ),
+            (
+                "misc_flags",
+                serde_json::Value::from(self.misc_flags as u64),
+            ),
+        ]
+    }
+}
+
+struct HwFramesPoolEntry {
+    key: HwFramesKey,
+    frames_ref: *mut AVBufferRef,
+    estimated_bytes: u64,
+    last_used: u64,
+}
+
+impl Drop for HwFramesPoolEntry {
+    fn drop(&mut self) {
+        unsafe {
+            av_buffer_unref(&mut self.frames_ref);
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct HwFramesPool {
+    entries: Vec<HwFramesPoolEntry>,
+    use_clock: u64,
+}
+
+impl HwFramesPool {
+    pub(super) unsafe fn acquire_for_decoder(
+        &mut self,
+        avctx: *mut AVCodecContext,
+        device_ref: *mut AVBufferRef,
+        hw_pix_fmt: AVPixelFormat,
+    ) -> Result<*mut AVBufferRef, String> {
+        if avctx.is_null() {
+            return Err("null AVCodecContext".to_string());
+        }
+        if device_ref.is_null() {
+            return Err("null hw_device_ctx".to_string());
+        }
+
+        let mut params_ref: *mut AVBufferRef = std::ptr::null_mut();
+        let ret = unsafe {
+            avcodec_get_hw_frames_parameters(avctx, device_ref, hw_pix_fmt, &mut params_ref)
+        };
+        if ret < 0 || params_ref.is_null() {
+            if crate::perf::is_enabled() {
+                crate::perf::event(
+                    "hwframes_pool",
+                    "acquire",
+                    None,
+                    0,
+                    &[
+                        ("result", serde_json::Value::from("parameters_failed")),
+                        ("ret", serde_json::Value::from(ret as i64)),
+                    ],
+                );
+            }
+            return Err(format!("avcodec_get_hw_frames_parameters failed: {ret}"));
+        }
+
+        let key = match unsafe { HwFramesKey::from_frames_ref(params_ref) } {
+            Some(key) => key,
+            None => {
+                unsafe { av_buffer_unref(&mut params_ref) };
+                return Err("avcodec_get_hw_frames_parameters returned invalid frames ctx".into());
+            }
+        };
+        let pool_entries_before = self.entries.len();
+        let pool_total_before = self.total_estimated_bytes();
+        self.use_clock = self.use_clock.wrapping_add(1);
+        let use_clock = self.use_clock;
+
+        if let Some(index) = self.entries.iter().position(|entry| entry.key == key) {
+            let entry = &mut self.entries[index];
+            let out_ref = unsafe { av_buffer_ref(entry.frames_ref) };
+            if !out_ref.is_null() {
+                entry.last_used = use_clock;
+                let cache_ref_count = unsafe { av_buffer_get_ref_count(entry.frames_ref) };
+                unsafe { av_buffer_unref(&mut params_ref) };
+                self.emit_acquire_event(
+                    "hit",
+                    key,
+                    pool_entries_before,
+                    pool_total_before,
+                    cache_ref_count,
+                    None,
+                );
+                return Ok(out_ref);
+            }
+
+            let stale = self.entries.remove(index);
+            self.emit_evict_event("stale_ref", &stale);
+            drop(stale);
+        }
+
+        let ret = unsafe { av_hwframe_ctx_init(params_ref) };
+        if ret < 0 {
+            unsafe { av_buffer_unref(&mut params_ref) };
+            self.emit_acquire_event(
+                "init_failed",
+                key,
+                pool_entries_before,
+                pool_total_before,
+                0,
+                Some(ret),
+            );
+            return Err(format!("av_hwframe_ctx_init failed: {ret}"));
+        }
+
+        let out_ref = unsafe { av_buffer_ref(params_ref) };
+        if out_ref.is_null() {
+            unsafe { av_buffer_unref(&mut params_ref) };
+            self.emit_acquire_event(
+                "ref_failed",
+                key,
+                pool_entries_before,
+                pool_total_before,
+                0,
+                None,
+            );
+            return Err("av_buffer_ref for decoder hw_frames_ctx failed".to_string());
+        }
+
+        let cache_ref_count = unsafe { av_buffer_get_ref_count(params_ref) };
+        self.entries.push(HwFramesPoolEntry {
+            key,
+            frames_ref: params_ref,
+            estimated_bytes: key.estimated_pool_bytes(),
+            last_used: use_clock,
+        });
+        self.emit_acquire_event(
+            "miss",
+            key,
+            pool_entries_before,
+            pool_total_before,
+            cache_ref_count,
+            None,
+        );
+        self.evict_if_needed(key);
+        Ok(out_ref)
+    }
+
+    pub(super) fn clear(&mut self, reason: &'static str) {
+        if self.entries.is_empty() {
+            return;
+        }
+        let entries = std::mem::take(&mut self.entries);
+        for entry in entries {
+            self.emit_evict_event(reason, &entry);
+            drop(entry);
+        }
+    }
+
+    fn total_estimated_bytes(&self) -> u64 {
+        self.entries
+            .iter()
+            .map(|entry| entry.estimated_bytes)
+            .sum::<u64>()
+    }
+
+    fn evict_if_needed(&mut self, keep_key: HwFramesKey) {
+        loop {
+            let total = self.total_estimated_bytes();
+            if self.entries.len() <= HW_FRAMES_POOL_MAX_ENTRIES
+                && total <= HW_FRAMES_POOL_BUDGET_BYTES
+            {
+                break;
+            }
+            let Some((index, _)) = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| entry.key != keep_key)
+                .min_by_key(|(_, entry)| entry.last_used)
+            else {
+                break;
+            };
+            let evicted = self.entries.remove(index);
+            self.emit_evict_event("capacity", &evicted);
+            drop(evicted);
+        }
+    }
+
+    fn emit_acquire_event(
+        &self,
+        result: &'static str,
+        key: HwFramesKey,
+        pool_entries_before: usize,
+        pool_total_before: u64,
+        cache_ref_count: i32,
+        ret: Option<i32>,
+    ) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let mut fields = key.fields();
+        fields.push(("result", serde_json::Value::from(result)));
+        fields.push((
+            "pool_entries_before",
+            serde_json::Value::from(pool_entries_before as i64),
+        ));
+        fields.push((
+            "pool_total_mib_before",
+            serde_json::Value::from(pool_total_before / (1024 * 1024)),
+        ));
+        fields.push((
+            "pool_entries_after",
+            serde_json::Value::from(self.entries.len() as i64),
+        ));
+        fields.push((
+            "pool_total_mib_after",
+            serde_json::Value::from(self.total_estimated_bytes() / (1024 * 1024)),
+        ));
+        fields.push((
+            "cache_ref_count",
+            serde_json::Value::from(cache_ref_count as i64),
+        ));
+        if let Some(ret) = ret {
+            fields.push(("ret", serde_json::Value::from(ret as i64)));
+        }
+        crate::perf::event("hwframes_pool", "acquire", None, 0, &fields);
+    }
+
+    fn emit_evict_event(&self, reason: &'static str, entry: &HwFramesPoolEntry) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let mut fields = entry.key.fields();
+        fields.push(("reason", serde_json::Value::from(reason)));
+        fields.push((
+            "pool_entries_before",
+            serde_json::Value::from(self.entries.len() as i64),
+        ));
+        fields.push((
+            "pool_total_mib_before",
+            serde_json::Value::from(self.total_estimated_bytes() / (1024 * 1024)),
+        ));
+        crate::perf::event("hwframes_pool", "evict", None, 0, &fields);
+    }
+}
+
+fn d3d11va_surface_bytes_per_pixel_ratio(pix_fmt: AVPixelFormat) -> Option<(u64, u64)> {
+    match pix_fmt {
+        AVPixelFormat::AV_PIX_FMT_NV12 => Some((3, 2)),
+        AVPixelFormat::AV_PIX_FMT_P010LE
+        | AVPixelFormat::AV_PIX_FMT_P010BE
+        | AVPixelFormat::AV_PIX_FMT_P016LE
+        | AVPixelFormat::AV_PIX_FMT_P016BE => Some((3, 1)),
+        _ => None,
+    }
 }
 
 /// COM の AddRef を呼ぶ。`windows::core::Interface::as_raw()` は ref を増やさないため、

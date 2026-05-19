@@ -279,6 +279,338 @@ pub fn query_vram_summary_mib() -> Option<u64> {
     query_primary_gpu_vram_bytes().map(|b| b / (1024 * 1024))
 }
 
+/// DXGI の video memory snapshot。
+///
+/// `IDXGIAdapter3::QueryVideoMemoryInfo` の `CurrentUsage` / `Budget` は、
+/// 呼び出し元プロセスに対する WDDM の video memory accounting。Task Manager の
+/// GPU ページに近いプロセス寄りの値だが、DWM/DirectComposition 共有資源では
+/// performance counter 側の値とずれることがある。
+#[derive(Debug, Clone, Copy)]
+pub struct DxgiVideoMemorySnapshot {
+    pub local_budget_bytes: u64,
+    pub local_current_usage_bytes: u64,
+    pub local_available_for_reservation_bytes: u64,
+    pub local_current_reservation_bytes: u64,
+    pub nonlocal_budget_bytes: u64,
+    pub nonlocal_current_usage_bytes: u64,
+    pub nonlocal_available_for_reservation_bytes: u64,
+    pub nonlocal_current_reservation_bytes: u64,
+}
+
+/// WDDM の `GPU Process Memory` performance counter から見た現在プロセスの値。
+///
+/// Windows の Task Manager と同じ系統のカウンタなので、DWM/DirectComposition の
+/// accounting では物理 VRAM を超えるような値が返ることがある。これは resident bytes
+/// そのものではなく、プロセス別 attribution の診断値として扱う。
+#[derive(Debug, Clone, Copy)]
+pub struct GpuProcessMemorySnapshot {
+    pub dedicated_usage_bytes: u64,
+    pub shared_usage_bytes: u64,
+}
+
+#[cfg(windows)]
+static VRAM_TRACE_DXGI_FAILURE_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[cfg(windows)]
+static VRAM_TRACE_PDH_FAILURE_LOGGED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+pub fn query_dxgi_video_memory_snapshot() -> Option<DxgiVideoMemorySnapshot> {
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+        DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, DXGI_QUERY_VIDEO_MEMORY_INFO, IDXGIAdapter1,
+        IDXGIAdapter3, IDXGIFactory1,
+    };
+    use windows::core::Interface;
+
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        for i in 0u32..8 {
+            let adapter1: IDXGIAdapter1 = match factory.EnumAdapters1(i) {
+                Ok(a) => a,
+                Err(_) => break,
+            };
+            let desc = adapter1.GetDesc1().ok()?;
+            let flags = desc.Flags as i32;
+            if (flags & DXGI_ADAPTER_FLAG_SOFTWARE.0) != 0 || desc.DedicatedVideoMemory == 0 {
+                continue;
+            }
+            let adapter3: IDXGIAdapter3 = adapter1.cast().ok()?;
+            let mut local = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            let mut nonlocal = DXGI_QUERY_VIDEO_MEMORY_INFO::default();
+            adapter3
+                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &mut local)
+                .ok()?;
+            adapter3
+                .QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &mut nonlocal)
+                .ok()?;
+            return Some(DxgiVideoMemorySnapshot {
+                local_budget_bytes: local.Budget,
+                local_current_usage_bytes: local.CurrentUsage,
+                local_available_for_reservation_bytes: local.AvailableForReservation,
+                local_current_reservation_bytes: local.CurrentReservation,
+                nonlocal_budget_bytes: nonlocal.Budget,
+                nonlocal_current_usage_bytes: nonlocal.CurrentUsage,
+                nonlocal_available_for_reservation_bytes: nonlocal.AvailableForReservation,
+                nonlocal_current_reservation_bytes: nonlocal.CurrentReservation,
+            });
+        }
+        None
+    }
+}
+
+#[cfg(not(windows))]
+pub fn query_dxgi_video_memory_snapshot() -> Option<DxgiVideoMemorySnapshot> {
+    None
+}
+
+#[cfg(windows)]
+pub fn query_current_process_gpu_process_memory_bytes() -> Option<GpuProcessMemorySnapshot> {
+    let pid = std::process::id();
+    let dedicated = query_gpu_process_memory_counter_bytes("Dedicated Usage", pid)?;
+    let shared = query_gpu_process_memory_counter_bytes("Shared Usage", pid)?;
+    Some(GpuProcessMemorySnapshot {
+        dedicated_usage_bytes: dedicated,
+        shared_usage_bytes: shared,
+    })
+}
+
+#[cfg(not(windows))]
+pub fn query_current_process_gpu_process_memory_bytes() -> Option<GpuProcessMemorySnapshot> {
+    None
+}
+
+#[cfg(windows)]
+fn query_gpu_process_memory_counter_bytes(counter_name: &str, pid: u32) -> Option<u64> {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::Performance::{
+        PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_LARGE,
+        PDH_HCOUNTER, PDH_HQUERY, PDH_MORE_DATA, PdhAddEnglishCounterW, PdhCloseQuery,
+        PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
+    };
+    use windows::core::PCWSTR;
+
+    struct QueryGuard(PDH_HQUERY);
+    impl Drop for QueryGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = PdhCloseQuery(self.0);
+            }
+        }
+    }
+
+    unsafe {
+        let mut query = PDH_HQUERY::default();
+        if PdhOpenQueryW(PCWSTR::null(), 0, &mut query) != 0 {
+            return None;
+        }
+        let _guard = QueryGuard(query);
+
+        let path = format!(r"\GPU Process Memory(*)\{counter_name}");
+        let wide_path: Vec<u16> = OsStr::new(&path).encode_wide().chain([0]).collect();
+        let mut counter = PDH_HCOUNTER::default();
+        if PdhAddEnglishCounterW(query, PCWSTR(wide_path.as_ptr()), 0, &mut counter) != 0 {
+            return None;
+        }
+
+        // Memory counters are instantaneous, but a second collection makes PDH's
+        // wildcard expansion more reliable on some Windows builds.
+        let _ = PdhCollectQueryData(query);
+        let _ = PdhCollectQueryData(query);
+
+        let mut buffer_size = 0u32;
+        let mut item_count = 0u32;
+        let status = PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_LARGE,
+            &mut buffer_size,
+            &mut item_count,
+            None,
+        );
+        if status != PDH_MORE_DATA || buffer_size == 0 || item_count == 0 {
+            return None;
+        }
+
+        let mut buffer = vec![0u8; buffer_size as usize];
+        let item_ptr = buffer.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
+        if PdhGetFormattedCounterArrayW(
+            counter,
+            PDH_FMT_LARGE,
+            &mut buffer_size,
+            &mut item_count,
+            Some(item_ptr),
+        ) != 0
+        {
+            return None;
+        }
+
+        let target_prefix = format!("pid_{pid}_").to_ascii_lowercase();
+        let target_exact = format!("pid_{pid}").to_ascii_lowercase();
+        let items = std::slice::from_raw_parts(item_ptr, item_count as usize);
+        let mut total = 0u64;
+        for item in items {
+            let Some(name) = pdh_pwstr_to_string(item.szName) else {
+                continue;
+            };
+            let name = name.to_ascii_lowercase();
+            if name != target_exact && !name.starts_with(&target_prefix) {
+                continue;
+            }
+            if item.FmtValue.CStatus != PDH_CSTATUS_VALID_DATA
+                && item.FmtValue.CStatus != PDH_CSTATUS_NEW_DATA
+            {
+                continue;
+            }
+            let value = item.FmtValue.Anonymous.largeValue;
+            if value > 0 {
+                total = total.saturating_add(value as u64);
+            }
+        }
+        Some(total)
+    }
+}
+
+#[cfg(windows)]
+unsafe fn pdh_pwstr_to_string(ptr: windows::core::PWSTR) -> Option<String> {
+    let raw = ptr.0;
+    if raw.is_null() {
+        return None;
+    }
+    let mut len = 0usize;
+    while unsafe { *raw.add(len) } != 0 {
+        len += 1;
+        if len > 1024 {
+            return None;
+        }
+    }
+    Some(String::from_utf16_lossy(unsafe {
+        std::slice::from_raw_parts(raw, len)
+    }))
+}
+
+#[cfg(windows)]
+fn log_vram_trace_query_failures(dxgi_ok: bool, pdh_ok: bool, include_pdh: bool) {
+    use std::sync::atomic::Ordering;
+
+    if !dxgi_ok && !VRAM_TRACE_DXGI_FAILURE_LOGGED.swap(true, Ordering::Relaxed) {
+        crate::logger::log("VRAM trace: DXGI QueryVideoMemoryInfo failed".to_string());
+    }
+    if include_pdh && !pdh_ok && !VRAM_TRACE_PDH_FAILURE_LOGGED.swap(true, Ordering::Relaxed) {
+        crate::logger::log("VRAM trace: PDH GPU Process Memory query failed".to_string());
+    }
+}
+
+#[cfg(not(windows))]
+fn log_vram_trace_query_failures(_dxgi_ok: bool, _pdh_ok: bool, _include_pdh: bool) {}
+
+/// `--perf-log` 有効時に VRAM 診断イベントを出す。
+///
+/// `kind` は呼び出し地点、`reason` は詳細理由。イベントカテゴリは `gpu_memory`。
+pub fn emit_vram_trace(kind: &str, reason: &str, extras: &[(&str, serde_json::Value)]) {
+    emit_vram_trace_with_options(kind, reason, extras, true);
+}
+
+/// `--perf-log` 有効時に VRAM 診断イベントを出す。
+///
+/// `include_pdh=false` の場合は比較的重い PDH query を省略する。UI thread から
+/// 呼ばれる drop 経路など、計測自体のヒッチを避けたい地点で使う。
+pub fn emit_vram_trace_with_options(
+    kind: &str,
+    reason: &str,
+    extras: &[(&str, serde_json::Value)],
+    include_pdh: bool,
+) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    let dxgi = query_dxgi_video_memory_snapshot();
+    let process = if include_pdh {
+        query_current_process_gpu_process_memory_bytes()
+    } else {
+        None
+    };
+    log_vram_trace_query_failures(dxgi.is_some(), process.is_some(), include_pdh);
+    let mut fields = Vec::with_capacity(32 + extras.len());
+    fields.push(("reason", serde_json::Value::from(reason)));
+    fields.push((
+        "process_id",
+        serde_json::Value::from(std::process::id() as i64),
+    ));
+    fields.push(("dxgi_ok", serde_json::Value::from(dxgi.is_some())));
+    fields.push(("pdh_ok", serde_json::Value::from(process.is_some())));
+    fields.push(("pdh_skipped", serde_json::Value::from(!include_pdh)));
+    if let Some(s) = dxgi {
+        fields.push((
+            "dxgi_local_current_bytes",
+            serde_json::Value::from(s.local_current_usage_bytes),
+        ));
+        fields.push((
+            "dxgi_local_current_mib",
+            serde_json::Value::from(s.local_current_usage_bytes / (1024 * 1024)),
+        ));
+        fields.push((
+            "dxgi_local_budget_bytes",
+            serde_json::Value::from(s.local_budget_bytes),
+        ));
+        fields.push((
+            "dxgi_local_budget_mib",
+            serde_json::Value::from(s.local_budget_bytes / (1024 * 1024)),
+        ));
+        fields.push((
+            "dxgi_local_available_for_reservation_bytes",
+            serde_json::Value::from(s.local_available_for_reservation_bytes),
+        ));
+        fields.push((
+            "dxgi_local_current_reservation_bytes",
+            serde_json::Value::from(s.local_current_reservation_bytes),
+        ));
+        fields.push((
+            "dxgi_nonlocal_current_bytes",
+            serde_json::Value::from(s.nonlocal_current_usage_bytes),
+        ));
+        fields.push((
+            "dxgi_nonlocal_current_mib",
+            serde_json::Value::from(s.nonlocal_current_usage_bytes / (1024 * 1024)),
+        ));
+        fields.push((
+            "dxgi_nonlocal_budget_bytes",
+            serde_json::Value::from(s.nonlocal_budget_bytes),
+        ));
+        fields.push((
+            "dxgi_nonlocal_available_for_reservation_bytes",
+            serde_json::Value::from(s.nonlocal_available_for_reservation_bytes),
+        ));
+        fields.push((
+            "dxgi_nonlocal_current_reservation_bytes",
+            serde_json::Value::from(s.nonlocal_current_reservation_bytes),
+        ));
+    }
+    if let Some(s) = process {
+        fields.push((
+            "process_dedicated_bytes",
+            serde_json::Value::from(s.dedicated_usage_bytes),
+        ));
+        fields.push((
+            "process_dedicated_mib",
+            serde_json::Value::from(s.dedicated_usage_bytes / (1024 * 1024)),
+        ));
+        fields.push((
+            "process_shared_bytes",
+            serde_json::Value::from(s.shared_usage_bytes),
+        ));
+        fields.push((
+            "process_shared_mib",
+            serde_json::Value::from(s.shared_usage_bytes / (1024 * 1024)),
+        ));
+    }
+    for (key, value) in extras {
+        fields.push((*key, value.clone()));
+    }
+    crate::perf::event("gpu_memory", kind, None, 0, &fields);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

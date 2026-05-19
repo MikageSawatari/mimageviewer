@@ -3017,6 +3017,7 @@ fn run_video_decode(
     let mut first_packet_logged_for_serial: Option<u64> = None;
     let mut preroll_drop_count: u64 = 0;
     let mut preroll_reached_logged_for_serial: Option<u64> = None;
+    let mut observed_hw_frames_ctx: Vec<usize> = Vec::new();
     let mut pause_park_last_log: Option<std::time::Instant> = None;
     let mut post_seek_tx_full_last_log: Option<std::time::Instant> = None;
     let mut frame_step_decode: Option<FrameStepDecodeState> = None;
@@ -3622,6 +3623,45 @@ fn run_video_decode(
             // 出力は NT 共有 ID3D11Texture2D で wgpu (egui) 側から sample される。
             #[cfg(windows)]
             if matches!(frame.format(), Pixel::D3D11) {
+                let frame_hwframes_snapshot = d3d11va_hwframes_snapshot_from_frame(&frame);
+                if let Some(snapshot) = frame_hwframes_snapshot.as_ref() {
+                    if !observed_hw_frames_ctx.contains(&snapshot.ctx_ptr) {
+                        observed_hw_frames_ctx.push(snapshot.ctx_ptr);
+                        let decoder_snapshot =
+                            d3d11va_hwframes_snapshot_from_decoder(&video_decoder);
+                        emit_d3d11va_hwframes_event(
+                            "observed",
+                            "first_frame_for_hw_frames_ctx",
+                            current_seek_serial,
+                            Some(snapshot),
+                            &[
+                                ("codec", serde_json::Value::from(codec_id.name())),
+                                (
+                                    "decoder_hw_frames_ctx",
+                                    serde_json::Value::from(
+                                        decoder_snapshot
+                                            .as_ref()
+                                            .map_or(0u64, |s| s.ctx_ptr as u64),
+                                    ),
+                                ),
+                                (
+                                    "decoder_hw_frames_ctx_ref",
+                                    serde_json::Value::from(
+                                        decoder_snapshot
+                                            .as_ref()
+                                            .map_or(0u64, |s| s.ref_ptr as u64),
+                                    ),
+                                ),
+                                ("dst_w", serde_json::Value::from(dst_w as i64)),
+                                ("dst_h", serde_json::Value::from(dst_h as i64)),
+                                (
+                                    "observed_count",
+                                    serde_json::Value::from(observed_hw_frames_ctx.len() as i64),
+                                ),
+                            ],
+                        );
+                    }
+                }
                 let deinterlace_wants_cpu = should_try_deinterlace(
                     deinterlace,
                     frame.is_interlaced(),
@@ -4654,6 +4694,129 @@ fn run_video_decode(
             }
         }
     }
+
+    let hw_device_present_before_drop = hw_device.is_some();
+    let should_trace_hw_teardown =
+        hw_active_initially || hw_device_present_before_drop || !observed_hw_frames_ctx.is_empty();
+    let hwframes_tracker = if should_trace_hw_teardown {
+        D3d11vaHwFramesRefTracker::from_decoder(&video_decoder)
+    } else {
+        None
+    };
+    let teardown_snapshot = if should_trace_hw_teardown {
+        hwframes_tracker
+            .as_ref()
+            .and_then(D3d11vaHwFramesRefTracker::snapshot)
+            .or_else(|| d3d11va_hwframes_snapshot_from_decoder(&video_decoder))
+    } else {
+        None
+    };
+    let tracking_ref_held = hwframes_tracker.is_some();
+    if should_trace_hw_teardown {
+        let extras = d3d11va_teardown_extras(
+            codec_id.name(),
+            hw_device_present_before_drop,
+            observed_hw_frames_ctx.len(),
+            tracking_ref_held,
+            false,
+            teardown_snapshot.as_ref(),
+        );
+        emit_d3d11va_hwframes_event(
+            "teardown_begin",
+            "before_video_decoder_drop",
+            current_seek_serial,
+            teardown_snapshot.as_ref(),
+            &extras,
+        );
+        emit_d3d11va_decoder_teardown_vram(
+            "before_video_decoder_drop",
+            teardown_snapshot.as_ref(),
+            &extras,
+        );
+    }
+    drop(video_decoder);
+    if should_trace_hw_teardown {
+        let after_decoder_snapshot = hwframes_tracker
+            .as_ref()
+            .and_then(D3d11vaHwFramesRefTracker::snapshot)
+            .or_else(|| teardown_snapshot.clone());
+        let extras = d3d11va_teardown_extras(
+            codec_id.name(),
+            hw_device_present_before_drop,
+            observed_hw_frames_ctx.len(),
+            tracking_ref_held,
+            false,
+            after_decoder_snapshot.as_ref(),
+        );
+        emit_d3d11va_decoder_teardown_vram(
+            "after_video_decoder_drop_before_hw_device_drop",
+            after_decoder_snapshot.as_ref(),
+            &extras,
+        );
+    }
+    drop(hw_device);
+    if should_trace_hw_teardown {
+        let after_hw_device_snapshot = hwframes_tracker
+            .as_ref()
+            .and_then(D3d11vaHwFramesRefTracker::snapshot)
+            .or_else(|| teardown_snapshot.clone());
+        let extras = d3d11va_teardown_extras(
+            codec_id.name(),
+            false,
+            observed_hw_frames_ctx.len(),
+            tracking_ref_held,
+            false,
+            after_hw_device_snapshot.as_ref(),
+        );
+        emit_d3d11va_decoder_teardown_vram(
+            "after_video_decoder_and_hw_device_drop_before_tracking_ref_drop",
+            after_hw_device_snapshot.as_ref(),
+            &extras,
+        );
+        let after_hw_device_static_snapshot = after_hw_device_snapshot
+            .as_ref()
+            .map(D3d11vaHwFramesSnapshot::without_ref_count);
+        drop(hwframes_tracker);
+        let extras = d3d11va_teardown_extras(
+            codec_id.name(),
+            false,
+            observed_hw_frames_ctx.len(),
+            false,
+            tracking_ref_held,
+            after_hw_device_static_snapshot.as_ref(),
+        );
+        emit_d3d11va_decoder_teardown_vram(
+            "after_hw_frames_tracking_ref_drop",
+            after_hw_device_static_snapshot.as_ref(),
+            &extras,
+        );
+        #[cfg(windows)]
+        if crate::perf::is_enabled() {
+            let trim_result = gpu_video_device
+                .as_ref()
+                .map(|gpu| gpu.trim_dxgi_memory())
+                .unwrap_or_else(|| Err("gpu_video_device_absent".to_string()));
+            let mut trim_extras = d3d11va_teardown_extras(
+                codec_id.name(),
+                false,
+                observed_hw_frames_ctx.len(),
+                false,
+                tracking_ref_held,
+                after_hw_device_static_snapshot.as_ref(),
+            );
+            trim_extras.push(("trim_ok", serde_json::Value::from(trim_result.is_ok())));
+            if let Err(err) = trim_result {
+                trim_extras.push(("trim_error", serde_json::Value::from(err)));
+            }
+            crate::gpu_info::emit_vram_trace_with_options(
+                "idxgi_trim_invoked",
+                "after_hw_frames_tracking_ref_drop",
+                &trim_extras,
+                false,
+            );
+        }
+    }
+    drop(hw_format_probe);
 }
 
 /// Phase A: 音声 decode + resample + AudioFrame 送出を担う独立スレッド。
@@ -5716,14 +5879,37 @@ struct AudioSetup {
 /// FFmpeg の `get_format` callback が D3D11 を候補に出したかどうかを記録する。
 /// callback は FFmpeg 内部 thread ではなく decode thread から呼ばれる想定だが、
 /// `AVCodecContext.opaque` 経由の共有参照なので atomic にしておく。
-#[derive(Debug, Default)]
 struct HwFormatProbeState {
     callback_count: AtomicU32,
     d3d11_offered_count: AtomicU32,
     d3d11_refused_count: AtomicU32,
+    #[cfg(windows)]
+    gpu_video_device: Option<std::sync::Weak<crate::video::gpu_renderer::GpuVideoDevice>>,
+}
+
+impl Default for HwFormatProbeState {
+    fn default() -> Self {
+        Self {
+            callback_count: AtomicU32::new(0),
+            d3d11_offered_count: AtomicU32::new(0),
+            d3d11_refused_count: AtomicU32::new(0),
+            #[cfg(windows)]
+            gpu_video_device: None,
+        }
+    }
 }
 
 impl HwFormatProbeState {
+    #[cfg(windows)]
+    fn with_gpu_video_device(
+        gpu_video_device: Option<&Arc<crate::video::gpu_renderer::GpuVideoDevice>>,
+    ) -> Self {
+        Self {
+            gpu_video_device: gpu_video_device.map(Arc::downgrade),
+            ..Self::default()
+        }
+    }
+
     fn record_d3d11_offered(&self) {
         self.callback_count.fetch_add(1, Ordering::Relaxed);
         self.d3d11_offered_count.fetch_add(1, Ordering::Relaxed);
@@ -5749,6 +5935,38 @@ impl HwFormatProbeState {
     fn d3d11_refused_count(&self) -> u32 {
         self.d3d11_refused_count.load(Ordering::Relaxed)
     }
+
+    #[cfg(windows)]
+    unsafe fn attach_cached_hw_frames_ctx(
+        &self,
+        avctx: *mut ffmpeg_the_third::ffi::AVCodecContext,
+        hw_pix_fmt: ffmpeg_the_third::ffi::AVPixelFormat,
+    ) -> Result<(), String> {
+        let Some(gpu_video_device) = self
+            .gpu_video_device
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+        else {
+            return Err("shared GpuVideoDevice unavailable".to_string());
+        };
+        if avctx.is_null() {
+            return Err("null AVCodecContext".to_string());
+        }
+        let device_ref = unsafe { (*avctx).hw_device_ctx };
+        if device_ref.is_null() {
+            return Err("AVCodecContext.hw_device_ctx is null".to_string());
+        }
+        let frames_ref = unsafe {
+            gpu_video_device.acquire_cached_d3d11va_hw_frames_ctx(avctx, device_ref, hw_pix_fmt)
+        }?;
+        let old_ref = unsafe { (*avctx).hw_frames_ctx };
+        if !old_ref.is_null() {
+            let mut old_ref = old_ref;
+            unsafe { ffmpeg_the_third::ffi::av_buffer_unref(&mut old_ref) };
+        }
+        unsafe { (*avctx).hw_frames_ctx = frames_ref };
+        Ok(())
+    }
 }
 
 fn should_retry_sw_after_hw_format_refusal(
@@ -5761,6 +5979,260 @@ fn should_retry_sw_after_hw_format_refusal(
         && !first_frame_delivered
         && !fallback_attempted
         && probe.map_or(false, HwFormatProbeState::d3d11_refused)
+}
+
+#[derive(Clone, Debug)]
+struct D3d11vaHwFramesSnapshot {
+    ref_ptr: usize,
+    ctx_ptr: usize,
+    ref_count: Option<i32>,
+    initial_pool_size: i32,
+    format: String,
+    sw_format: String,
+    width: i32,
+    height: i32,
+    estimated_pool_bytes: Option<u64>,
+}
+
+impl D3d11vaHwFramesSnapshot {
+    fn without_ref_count(&self) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.ref_count = None;
+        snapshot
+    }
+
+    fn fields(&self) -> Vec<(&'static str, serde_json::Value)> {
+        let mut fields = vec![
+            (
+                "hw_frames_ctx_ref",
+                serde_json::Value::from(self.ref_ptr as u64),
+            ),
+            (
+                "hw_frames_ctx",
+                serde_json::Value::from(self.ctx_ptr as u64),
+            ),
+            (
+                "initial_pool_size",
+                serde_json::Value::from(self.initial_pool_size as i64),
+            ),
+            ("format", serde_json::Value::from(self.format.clone())),
+            ("sw_format", serde_json::Value::from(self.sw_format.clone())),
+            ("width", serde_json::Value::from(self.width as i64)),
+            ("height", serde_json::Value::from(self.height as i64)),
+        ];
+        if let Some(ref_count) = self.ref_count {
+            fields.push(("ref_count", serde_json::Value::from(ref_count as i64)));
+        }
+        if let Some(bytes) = self.estimated_pool_bytes {
+            fields.push(("estimated_pool_bytes", serde_json::Value::from(bytes)));
+            fields.push((
+                "estimated_pool_mib",
+                serde_json::Value::from(bytes / (1024 * 1024)),
+            ));
+        }
+        fields
+    }
+}
+
+fn d3d11va_surface_bytes_per_pixel_ratio(
+    pix_fmt: ffmpeg_the_third::ffi::AVPixelFormat,
+) -> Option<(u64, u64)> {
+    use ffmpeg_the_third::ffi::AVPixelFormat;
+    match pix_fmt {
+        AVPixelFormat::AV_PIX_FMT_NV12 => Some((3, 2)),
+        AVPixelFormat::AV_PIX_FMT_P010LE
+        | AVPixelFormat::AV_PIX_FMT_P010BE
+        | AVPixelFormat::AV_PIX_FMT_P016LE
+        | AVPixelFormat::AV_PIX_FMT_P016BE => Some((3, 1)),
+        _ => None,
+    }
+}
+
+fn d3d11va_hwframes_snapshot_from_ref(
+    hw_frames_ref: *mut ffmpeg_the_third::ffi::AVBufferRef,
+) -> Option<D3d11vaHwFramesSnapshot> {
+    if hw_frames_ref.is_null() {
+        return None;
+    }
+    let ctx = unsafe { (*hw_frames_ref).data as *const ffmpeg_the_third::ffi::AVHWFramesContext };
+    if ctx.is_null() {
+        return None;
+    }
+    let ctx_ptr = ctx as usize;
+    let ctx = unsafe { &*ctx };
+    let estimated_pool_bytes = if ctx.initial_pool_size > 0 && ctx.width > 0 && ctx.height > 0 {
+        d3d11va_surface_bytes_per_pixel_ratio(ctx.sw_format).map(|(num, den)| {
+            (ctx.width as u64)
+                .saturating_mul(ctx.height as u64)
+                .saturating_mul(num)
+                .saturating_mul(ctx.initial_pool_size as u64)
+                / den
+        })
+    } else {
+        None
+    };
+    Some(D3d11vaHwFramesSnapshot {
+        ref_ptr: hw_frames_ref as usize,
+        ctx_ptr,
+        ref_count: Some(unsafe { ffmpeg_the_third::ffi::av_buffer_get_ref_count(hw_frames_ref) }),
+        initial_pool_size: ctx.initial_pool_size,
+        format: format!("{:?}", ctx.format),
+        sw_format: format!("{:?}", ctx.sw_format),
+        width: ctx.width,
+        height: ctx.height,
+        estimated_pool_bytes,
+    })
+}
+
+fn d3d11va_hwframes_snapshot_from_decoder(
+    decoder: &ffmpeg_the_third::decoder::Video,
+) -> Option<D3d11vaHwFramesSnapshot> {
+    let avctx = unsafe { decoder.as_ptr() };
+    if avctx.is_null() {
+        return None;
+    }
+    d3d11va_hwframes_snapshot_from_ref(unsafe { (*avctx).hw_frames_ctx })
+}
+
+fn d3d11va_hwframes_snapshot_from_frame(
+    frame: &ffmpeg_the_third::util::frame::video::Video,
+) -> Option<D3d11vaHwFramesSnapshot> {
+    let avframe = unsafe { frame.as_ptr() };
+    if avframe.is_null() {
+        return None;
+    }
+    d3d11va_hwframes_snapshot_from_ref(unsafe { (*avframe).hw_frames_ctx })
+}
+
+struct D3d11vaHwFramesRefTracker {
+    buf_ref: *mut ffmpeg_the_third::ffi::AVBufferRef,
+}
+
+impl D3d11vaHwFramesRefTracker {
+    fn from_decoder(decoder: &ffmpeg_the_third::decoder::Video) -> Option<Self> {
+        let avctx = unsafe { decoder.as_ptr() };
+        if avctx.is_null() {
+            return None;
+        }
+        let src = unsafe { (*avctx).hw_frames_ctx };
+        if src.is_null() {
+            return None;
+        }
+        let buf_ref = unsafe { ffmpeg_the_third::ffi::av_buffer_ref(src) };
+        if buf_ref.is_null() {
+            None
+        } else {
+            Some(Self { buf_ref })
+        }
+    }
+
+    fn snapshot(&self) -> Option<D3d11vaHwFramesSnapshot> {
+        d3d11va_hwframes_snapshot_from_ref(self.buf_ref)
+    }
+}
+
+impl Drop for D3d11vaHwFramesRefTracker {
+    fn drop(&mut self) {
+        unsafe {
+            ffmpeg_the_third::ffi::av_buffer_unref(&mut self.buf_ref);
+        }
+    }
+}
+
+fn emit_d3d11va_hwframes_event(
+    event: &'static str,
+    reason: &'static str,
+    seek_serial: u64,
+    snapshot: Option<&D3d11vaHwFramesSnapshot>,
+    extras: &[(&'static str, serde_json::Value)],
+) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    let mut fields = Vec::with_capacity(8 + extras.len());
+    fields.push(("reason", serde_json::Value::from(reason)));
+    fields.push(("present", serde_json::Value::from(snapshot.is_some())));
+    if let Some(snapshot) = snapshot {
+        fields.extend(snapshot.fields());
+    }
+    for (key, value) in extras {
+        fields.push((*key, value.clone()));
+    }
+    crate::perf::event("d3d11va_hwframes", event, None, seek_serial, &fields);
+}
+
+fn d3d11va_teardown_extras(
+    codec: &str,
+    hw_device_present: bool,
+    observed_hw_frames_ctx_count: usize,
+    tracking_ref_held: bool,
+    tracking_ref_released: bool,
+    snapshot: Option<&D3d11vaHwFramesSnapshot>,
+) -> Vec<(&'static str, serde_json::Value)> {
+    let mut extras = vec![
+        ("codec", serde_json::Value::from(codec)),
+        (
+            "hw_device_present",
+            serde_json::Value::from(hw_device_present),
+        ),
+        (
+            "observed_hw_frames_ctx_count",
+            serde_json::Value::from(observed_hw_frames_ctx_count as i64),
+        ),
+        (
+            "tracking_ref_held",
+            serde_json::Value::from(tracking_ref_held),
+        ),
+        (
+            "tracking_ref_released",
+            serde_json::Value::from(tracking_ref_released),
+        ),
+    ];
+    if tracking_ref_held {
+        if let Some(ref_count) = snapshot.and_then(|s| s.ref_count) {
+            extras.push((
+                "ref_count_excluding_tracking_ref",
+                serde_json::Value::from(ref_count.saturating_sub(1) as i64),
+            ));
+        }
+    }
+    extras
+}
+
+#[cfg(windows)]
+fn emit_d3d11va_decoder_teardown_vram(
+    reason: &'static str,
+    snapshot: Option<&D3d11vaHwFramesSnapshot>,
+    extras: &[(&'static str, serde_json::Value)],
+) {
+    if !crate::perf::is_enabled() {
+        return;
+    }
+    let mut fields = Vec::with_capacity(8 + extras.len());
+    fields.push((
+        "hw_frames_ctx_present",
+        serde_json::Value::from(snapshot.is_some()),
+    ));
+    if let Some(snapshot) = snapshot {
+        fields.extend(snapshot.fields());
+    }
+    for (key, value) in extras {
+        fields.push((*key, value.clone()));
+    }
+    crate::gpu_info::emit_vram_trace_with_options(
+        "d3d11va_decoder_teardown",
+        reason,
+        &fields,
+        false,
+    );
+}
+
+#[cfg(not(windows))]
+fn emit_d3d11va_decoder_teardown_vram(
+    _reason: &'static str,
+    _snapshot: Option<&D3d11vaHwFramesSnapshot>,
+    _extras: &[(&'static str, serde_json::Value)],
+) {
 }
 
 /// `av_hwdevice_ctx_create` で確保した AVBufferRef を保持し、Drop で `av_buffer_unref`
@@ -6235,13 +6707,16 @@ fn try_init_d3d11va_for_codec(
         //    gpu_video_device があれば mIV の D3D11 デバイスを共有、なければ FFmpeg
         //    が新デバイスを作る (= 旧経路)。
         #[cfg(windows)]
-        let buf_ref: *mut AVBufferRef = if let Some(gpu_dev) = gpu_video_device {
+        let (buf_ref, hw_frames_cache_gpu): (
+            *mut AVBufferRef,
+            Option<&std::sync::Arc<crate::video::gpu_renderer::GpuVideoDevice>>,
+        ) = if let Some(gpu_dev) = gpu_video_device {
             match crate::video::gpu_renderer::create_ffmpeg_hw_device_ctx(gpu_dev) {
                 Ok(b) => {
                     crate::logger::log(format!(
                         "HW: D3D11VA shared with GpuVideoDevice for decoder {codec_name_for_log}"
                     ));
-                    b
+                    (b, Some(gpu_dev))
                 }
                 Err(e) => {
                     crate::logger::log(format!(
@@ -6261,7 +6736,7 @@ fn try_init_d3d11va_for_codec(
                         ));
                         return None;
                     }
-                    buf
+                    (buf, None)
                 }
             }
         } else {
@@ -6277,7 +6752,7 @@ fn try_init_d3d11va_for_codec(
                 crate::logger::log(format!("HW: av_hwdevice_ctx_create(D3D11VA) failed: {ret}"));
                 return None;
             }
-            buf
+            (buf, None)
         };
         #[cfg(not(windows))]
         let buf_ref: *mut AVBufferRef = {
@@ -6306,6 +6781,11 @@ fn try_init_d3d11va_for_codec(
             return None;
         }
         (*avctx).hw_device_ctx = new_ref;
+        #[cfg(windows)]
+        let format_probe = Arc::new(HwFormatProbeState::with_gpu_video_device(
+            hw_frames_cache_gpu,
+        ));
+        #[cfg(not(windows))]
         let format_probe = Arc::new(HwFormatProbeState::default());
         (*avctx).opaque = Arc::as_ptr(&format_probe) as *mut std::ffi::c_void;
         (*avctx).get_format = Some(get_hw_format);
@@ -6356,6 +6836,21 @@ unsafe extern "C" fn get_hw_format(
             if *p == AVPixelFormat::AV_PIX_FMT_D3D11 {
                 if let Some(probe) = probe {
                     probe.record_d3d11_offered();
+                    #[cfg(windows)]
+                    if let Err(err) = probe.attach_cached_hw_frames_ctx(ctx, *p) {
+                        crate::logger::log(format!(
+                            "HW: get_format: cached D3D11VA hwframes unavailable; using FFmpeg auto setup: {err}"
+                        ));
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "hwframes_pool",
+                                "attach_fallback",
+                                None,
+                                0,
+                                &[("error", serde_json::Value::from(err))],
+                            );
+                        }
+                    }
                 }
                 return AVPixelFormat::AV_PIX_FMT_D3D11;
             }
