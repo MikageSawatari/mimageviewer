@@ -581,8 +581,11 @@ fn dispatcher(queue: Arc<(Mutex<JobQueue>, Condvar)>, resource: Resource) {
   `installer/mimageviewer.iss` の `AppMutex` と一致させることで、インストーラが自動で
   「閉じてください」ダイアログを出してくれる (常駐中に DLL 上書きが失敗するのを防ぐ)。
 - **ウィンドウ hide/show**: `App::maybe_intercept_close` が `viewport().close_requested()`
-  を検出して `ViewportCommand::CancelClose` + `Visible(false)` に差し替える。トレイ
-  メニュー「開く」やトレイアイコン左クリックで `Visible(true)` + `Focus`。
+  を検出して `ViewportCommand::CancelClose` に差し替え、Win32 `ShowWindow(SW_HIDE)`
+  で隠す。`ViewportCommand::Visible(false)` は eframe/winit の `App::update` を止め、
+  トレイメニューから復帰できなくなるため使わない。トレイメニュー「開く」や
+  トレイアイコン左クリックはトレイスレッド側から `ShowWindow(SW_SHOW)` +
+  `SetForegroundWindow` を直接呼ぶ。
 - **インデクサ throttle**: `hide_to_tray` から `IndexerManager::set_io_throttled(true)`。
   `GlobalIoSemaphore` の実効 permit を 1 に絞るため、ユーザーが選んだ速度プロファイル
   (Low/Medium/High) に関係なく常駐中は 1 permit 相当になる。`show_from_tray` で解除。
@@ -590,8 +593,15 @@ fn dispatcher(queue: Arc<(Mutex<JobQueue>, Condvar)>, resource: Resource) {
   `hide_to_tray` から `ActivityGate::set_paused(true)`。既存の `wait_until_idle` は
   paused 中ループブロックし、`show_from_tray` で解除されると通常動作に戻る。
   **cancel は paused を貫通** させる (アプリ終了時に supervisor スレッドが固まらないため)。
-- **GPU リソース解放**: `App::release_gpu_resources` が `thumbnails[*] = Evicted` や
-  `fs_cache.clear()` 等で `TextureHandle` を drop。ウィンドウ復帰後は通常ロード経路で再取得。
+- **動画 / GPU リソース解放**: `hide_to_tray` はまず
+  `release_media_session_for_tray` で fullscreen / video セッションを
+  `close_fullscreen()` 経路へ流す。これにより再生位置保存、`VideoPlayer` /
+  `NativeVideoOutput` drop、source-swap pending、VST3 owner、ノーマライズ状態の
+  cleanup を通常の Esc 終了と同じ順序で行う。その後 `App::release_gpu_resources` が
+  `thumbnails[*] = Evicted` や `fs_cache.clear()` 等で残りの `TextureHandle` を drop し、
+  Windows では `GpuVideoDevice::release_idle_pools()` で D3D11VA frames pool / idle
+  shared output pool / video processor cache も空にする。VST3 bridge / plugin chain は
+  復帰遅延と状態巻き戻りを避けるため停止しない。ウィンドウ復帰後は通常ロード経路で再取得。
 - **UI heartbeat watchdog**: `App::update` は SW_HIDE 中に止まるため、`hide_to_tray` で
   watchdog を suspended にし、復帰時に resume する。これにより正常なトレイ常駐を
   `panic.log` の `UI THREAD HANG suspected` として記録し続けない。

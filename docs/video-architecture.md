@@ -1356,6 +1356,10 @@ UI に出す解像度表記 (動画情報パネル等) は MediaInfo / VLC / FFm
 - **VideoPlayer の Drop**: `cancel.store(true)` → decoder thread が exit、`audio.take()` で cpal stream 停止
 - **VideoPlayer.shutdown() の用途**: 動画切替時に Drop より早く audio を切るため (= 残音を防ぐ)
 - **GpuVideoDevice の Drop**: D3D11 リソース全解放、fence の NT shared handle を `CloseHandle`
+- **GpuVideoDevice::release_idle_pools()**: タスクトレイ格納時の residency 削減用。process-wide
+  D3D11 device 自体は残しつつ、`hw_frames_pool`、`in_use=false` の `shared_output_pool` slot、
+  `processor_cache` を解放する。次回動画再生時は通常の acquire 経路で lazy に再作成される。
+  VST3 bridge / plugin chain は停止しない。
 - **NativeVideoPresenter** (= `VideoPlayer::open` 時に 1 個生成、`VideoPlayer` Drop で停止):
   独立 Win32 HWND + 自前 D3D11 swap chain + DComp visual tree を所有。decoder からの
   VideoFrame を専用 thread で pull → present。
@@ -1692,6 +1696,7 @@ WDDM `GPU Process Memory` performance counter の current process dedicated/shar
 | `video_surface_swap` | `NativeVideoPresenter::present_with_surface_swap` | 動画解像度変更で swap chain を差し替えた直後 | `surface_width`, `surface_height`, `retired_video_surfaces_len` |
 | `native_output_drop` / `native_output_drop_join` | `NativeVideoOutput::drop` | detached join 型 shutdown が完了しているかの確認 | `join_ok` (join 後のみ), `pdh_skipped` |
 | `idxgi_trim_invoked` | D3D11VA decoder teardown | `--perf-log` 測定時だけ `IDXGIDevice3::Trim()` を呼んだ直後 | `trim_ok`, `trim_error`, `tracking_ref_released`, `estimated_pool_mib`, `pdh_skipped=true` |
+| `gpu_idle_pools_release` | タスクトレイ格納時 | `GpuVideoDevice::release_idle_pools()` で idle shared output slot / processor cache を解放した結果 | `shared_before_len`, `shared_after_len`, `shared_released_slots`, `shared_released_mib`, `processor_cache_cleared` |
 
 `video.shared_output_pool_grow` / `video.shared_output_pool_evict` には
 `pool_in_use`, `pool_estimated_bytes`, `pool_estimated_mib` も載せる。これは
@@ -1743,7 +1748,7 @@ D3D11 device-lost recovery を実装する場合は、device を差し替える�
 | kind | 発火元 | 説明 | 主な extras |
 |---|---|---|---|
 | `acquire` | FFmpeg `get_format` callback | D3D11VA hwframes context の cache hit/miss | `result=hit/miss/...`, `coded_w`, `coded_h`, `format`, `sw_format`, `initial_pool_size`, `bind_flags`, `misc_flags`, `estimated_pool_mib`, `pool_entries_before/after`, `pool_total_mib_before/after`, `cache_ref_count` |
-| `evict` | cache capacity / device drop | LRU eviction または device drop 時の明示 clear | `reason=capacity/stale_ref/gpu_video_device_drop`, key fields, `pool_entries_before`, `pool_total_mib_before` |
+| `evict` | cache capacity / device drop / tray hide | LRU eviction または明示 clear | `reason=capacity/stale_ref/gpu_video_device_drop/tray_hide`, key fields, `pool_entries_before`, `pool_total_mib_before` |
 | `attach_fallback` | FFmpeg `get_format` callback | cache 経路で ctx を渡せず FFmpeg 自動生成へ戻した | `error` |
 
 `cache_ref_count` は event emit 時点の cached `AVBufferRef` refcount。通常は

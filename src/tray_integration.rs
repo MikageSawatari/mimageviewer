@@ -9,6 +9,14 @@ use eframe::egui;
 use crate::app::App;
 use crate::tray::TrayEvent;
 
+fn should_close_fullscreen_for_tray(
+    fullscreen_open: bool,
+    fs_cache_has_video: bool,
+    native_video_pending: bool,
+) -> bool {
+    fullscreen_open || fs_cache_has_video || native_video_pending
+}
+
 impl App {
     /// 設定状態に応じてタスクトレイコントローラの起動 / 停止を同期する。
     /// - 設定 ON + tray_controller=None + HWND 取得済み → 起動
@@ -128,6 +136,11 @@ impl App {
             }
         }
 
+        // 動画 / フルスクリーンの実セッションは、単なる fs_cache.clear ではなく
+        // close_fullscreen 経路で閉じる。これにより再生位置保存、native presenter、
+        // source-swap pending、VST3 owner、ノーマライズ状態の後片付けを一括で通す。
+        self.release_media_session_for_tray();
+
         // I/O throttle: 他アプリへの帯域影響を抑える
         if let Some(mgr) = self.indexer_manager.as_ref() {
             mgr.set_io_throttled(true);
@@ -173,6 +186,38 @@ impl App {
         crate::logger::log("tray: App state synced after restore");
     }
 
+    /// トレイ格納時に、動画 / フルスクリーン表示が握っている重いリソースを解放する。
+    ///
+    /// `release_gpu_resources` の `fs_cache.clear()` だけでも `VideoPlayer` は drop されるが、
+    /// フルスクリーン状態機械の cleanup を通らないと native presenter の退避状態や
+    /// normalize UI state などが残りうる。既存のフルスクリーン終了経路へ寄せる。
+    fn release_media_session_for_tray(&mut self) {
+        let fs_cache_has_video = self
+            .fs_cache
+            .values()
+            .any(|entry| matches!(entry, crate::fs_animation::FsCacheEntry::Video { .. }));
+        #[cfg(windows)]
+        let native_video_pending = self.native_video_open_pending.is_some()
+            || self.native_video_source_swap_pending.is_some()
+            || self.native_video_fast_swap_pending.is_some()
+            || self.video_tile_swap_pending.is_some();
+        #[cfg(not(windows))]
+        let native_video_pending = false;
+
+        if should_close_fullscreen_for_tray(
+            self.fullscreen_idx.is_some(),
+            fs_cache_has_video,
+            native_video_pending,
+        ) {
+            crate::logger::log(format!(
+                "tray: closing fullscreen/media session before residency \
+                 fullscreen={:?} fs_video={} native_pending={}",
+                self.fullscreen_idx, fs_cache_has_video, native_video_pending
+            ));
+            self.close_fullscreen();
+        }
+    }
+
     /// GPU テクスチャキャッシュを破棄する (VRAM 解放目的)。
     ///
     /// ウィンドウ復帰後は通常のロード経路で再取得されるので、描画には影響なし
@@ -194,6 +239,10 @@ impl App {
         }
         // フルスクリーン画像キャッシュ (最大サイズ源、20MP RGBA ≈ 80MB/枚)
         self.fs_cache.clear();
+        #[cfg(windows)]
+        if let Some(device) = self.gpu_video_device.as_ref() {
+            device.release_idle_pools();
+        }
         self.ai_upscale_cache.clear();
         self.adjustment_cache.clear();
         // 補正済みサムネテクスチャ
@@ -329,5 +378,26 @@ impl App {
         }
         // イベント drop を考慮し、必ず atomic から最新状態を reconcile する (Codex P3)。
         self.reconcile_pause_state();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_close_fullscreen_for_tray;
+
+    #[test]
+    fn tray_residency_closes_fullscreen_sessions() {
+        assert!(should_close_fullscreen_for_tray(true, false, false));
+    }
+
+    #[test]
+    fn tray_residency_closes_video_resources_without_fullscreen_flag() {
+        assert!(should_close_fullscreen_for_tray(false, true, false));
+        assert!(should_close_fullscreen_for_tray(false, false, true));
+    }
+
+    #[test]
+    fn tray_residency_leaves_plain_grid_sessions_open() {
+        assert!(!should_close_fullscreen_for_tray(false, false, false));
     }
 }

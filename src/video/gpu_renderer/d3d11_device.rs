@@ -746,6 +746,95 @@ impl GpuVideoDevice {
         }
     }
 
+    /// Release idle video GPU pools while keeping the process-wide D3D11 device alive.
+    ///
+    /// Used when the app is hidden to the task tray: active decoder / presenter resources
+    /// are closed first through `close_fullscreen`, then this drops reusable caches that
+    /// otherwise stay resident until process exit. Slots still marked `in_use` are left
+    /// alone because their corresponding frame/presenter ownership has not been returned.
+    pub fn release_idle_pools(&self) {
+        match self.hw_frames_pool.lock() {
+            Ok(mut pool) => pool.clear("tray_hide"),
+            Err(poisoned) => poisoned.into_inner().clear("tray_hide"),
+        }
+
+        let processor_cache_cleared = match self.processor_cache.lock() {
+            Ok(mut cache) => cache.take().is_some(),
+            Err(poisoned) => poisoned.into_inner().take().is_some(),
+        };
+
+        let (shared_before, shared_after) = match self.shared_output_pool.lock() {
+            Ok(mut pool) => {
+                let before = Self::shared_output_pool_stats(&pool);
+                pool.retain(|slot| slot.in_use.load(Ordering::Acquire));
+                let after = Self::shared_output_pool_stats(&pool);
+                (before, after)
+            }
+            Err(poisoned) => {
+                let mut pool = poisoned.into_inner();
+                let before = Self::shared_output_pool_stats(&pool);
+                pool.retain(|slot| slot.in_use.load(Ordering::Acquire));
+                let after = Self::shared_output_pool_stats(&pool);
+                (before, after)
+            }
+        };
+        self.shared_output_pool_cv.notify_all();
+
+        let released_slots = shared_before.len.saturating_sub(shared_after.len);
+        let released_bytes = shared_before
+            .estimated_bytes
+            .saturating_sub(shared_after.estimated_bytes);
+        if released_slots > 0 || processor_cache_cleared {
+            crate::logger::log(format!(
+                "GpuVideoDevice: released idle pools for tray hide \
+                 shared_slots={} shared_estimated_mib={} processor_cache_cleared={}",
+                released_slots,
+                released_bytes / (1024 * 1024),
+                processor_cache_cleared
+            ));
+        }
+        crate::perf::event(
+            "video",
+            "gpu_idle_pools_release",
+            None,
+            0,
+            &[
+                (
+                    "shared_before_len",
+                    serde_json::Value::from(shared_before.len as i64),
+                ),
+                (
+                    "shared_after_len",
+                    serde_json::Value::from(shared_after.len as i64),
+                ),
+                (
+                    "shared_before_in_use",
+                    serde_json::Value::from(shared_before.in_use as i64),
+                ),
+                (
+                    "shared_after_in_use",
+                    serde_json::Value::from(shared_after.in_use as i64),
+                ),
+                (
+                    "shared_released_slots",
+                    serde_json::Value::from(released_slots as i64),
+                ),
+                (
+                    "shared_released_bytes",
+                    serde_json::Value::from(released_bytes),
+                ),
+                (
+                    "shared_released_mib",
+                    serde_json::Value::from(released_bytes / (1024 * 1024)),
+                ),
+                (
+                    "processor_cache_cleared",
+                    serde_json::Value::from(processor_cache_cleared),
+                ),
+            ],
+        );
+    }
+
     /// Ask WDDM to trim cached video-memory allocations for this D3D11 device.
     ///
     /// This is a diagnostic hook for D3D11VA teardown. It should be called from
