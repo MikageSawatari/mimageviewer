@@ -55,6 +55,20 @@ fn encode_native_overlay_thumbnail_webp(
 }
 
 #[cfg(windows)]
+fn encode_native_overlay_tile_thumbnail_webp(
+    thumbnail: &crate::video::native_presenter::NativeOverlayTileThumbnail,
+) -> Option<Vec<u8>> {
+    let expected_len = thumbnail.width as usize * thumbnail.height as usize * 4;
+    if thumbnail.width == 0 || thumbnail.height == 0 || thumbnail.rgba.len() != expected_len {
+        return None;
+    }
+    let encoder =
+        webp::Encoder::from_rgba(thumbnail.rgba.as_slice(), thumbnail.width, thumbnail.height);
+    let webp = encoder.encode(75.0).to_vec();
+    (!webp.is_empty()).then_some(webp)
+}
+
+#[cfg(windows)]
 fn native_rating_stars_from_fkey(virtual_key: u32) -> u8 {
     match virtual_key {
         0x70 => 1, // F1
@@ -1467,6 +1481,11 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::TileSeek { target_secs } => {
                 self.handle_native_video_tile_seek_command(ctx, fs_idx, target_secs);
+            }
+            crate::video::NativeVideoOutputEvent::TileHover { index } => {
+                if self.select_video_tile_cursor(fs_idx, index) {
+                    self.sync_native_video_tile_overlay(ctx, fs_idx);
+                }
             }
             crate::video::NativeVideoOutputEvent::WheelNavigate { delta } => {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
@@ -3583,6 +3602,23 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn handle_native_video_set_tile_pin_command(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> bool {
+        if self.fullscreen_idx != Some(fs_idx) || self.ime_input_active() {
+            return false;
+        }
+        let Some((target_secs, webp)) = self.selected_native_video_tile_pin_payload(fs_idx) else {
+            return false;
+        };
+        self.set_native_video_pin_with_webp(fs_idx, target_secs, webp);
+        self.mark_native_video_hud_activity(ctx);
+        true
+    }
+
+    #[cfg(windows)]
     pub(super) fn handle_native_video_delete_bookmark_command(
         &mut self,
         ctx: &egui::Context,
@@ -3696,14 +3732,28 @@ impl App {
 
     #[cfg(windows)]
     pub(super) fn set_native_video_pin(&mut self, fs_idx: usize, target_secs: f64) {
+        self.set_native_video_pin_with_webp(fs_idx, target_secs, None);
+    }
+
+    #[cfg(windows)]
+    fn set_native_video_pin_with_webp(
+        &mut self,
+        fs_idx: usize,
+        target_secs: f64,
+        preencoded_webp: Option<Vec<u8>>,
+    ) {
         let snapshot = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => {
                 if player.error().is_some() || player.info().is_none() {
                     None
                 } else {
                     let pts = finite_video_target_secs(target_secs, player.duration());
-                    player.request_seek_thumbnail(pts);
-                    let thumb = player.nearest_seek_thumbnail(pts);
+                    let thumb = if preencoded_webp.is_some() {
+                        None
+                    } else {
+                        player.request_seek_thumbnail(pts);
+                        player.nearest_seek_thumbnail(pts)
+                    };
                     Some((player.path().clone(), pts, thumb))
                 }
             }
@@ -3716,13 +3766,15 @@ impl App {
             crate::logger::log("video pin: DB not open".to_string());
             return;
         };
-        let webp = thumb
-            .as_ref()
-            .map(|t| {
-                let encoder = webp::Encoder::from_rgba(&t.rgba, t.width, t.height);
-                encoder.encode(75.0).to_vec()
-            })
-            .unwrap_or_default();
+        let webp = preencoded_webp.unwrap_or_else(|| {
+            thumb
+                .as_ref()
+                .map(|t| {
+                    let encoder = webp::Encoder::from_rgba(&t.rgba, t.width, t.height);
+                    encoder.encode(75.0).to_vec()
+                })
+                .unwrap_or_default()
+        });
         let webp_len = webp.len();
         let webp_was_empty = webp.is_empty();
         match db.set_pin(&path, pts, &webp) {
@@ -3756,6 +3808,36 @@ impl App {
             }
             Err(e) => crate::logger::log(format!("video pin set failed: {e}")),
         }
+    }
+
+    #[cfg(windows)]
+    fn selected_native_video_tile_pin_payload(
+        &self,
+        fs_idx: usize,
+    ) -> Option<(f64, Option<Vec<u8>>)> {
+        if self.fullscreen_idx != Some(fs_idx) || !self.video_tile_mode_active {
+            return None;
+        }
+        let state = self.video_tile_state.as_ref()?;
+        let selected_idx = state
+            .selected_idx
+            .min(state.timestamps.len().checked_sub(1)?);
+        let pts = state.timestamps.get(selected_idx).copied()?;
+        let webp = state
+            .worker
+            .get(selected_idx)
+            .as_ref()
+            .map(
+                |thumb| crate::video::native_presenter::NativeOverlayTileThumbnail {
+                    target_secs: thumb.pts_secs,
+                    width: thumb.width,
+                    height: thumb.height,
+                    rgba: std::sync::Arc::clone(&thumb.rgba),
+                },
+            )
+            .as_ref()
+            .and_then(encode_native_overlay_tile_thumbnail_webp);
+        Some((pts, webp))
     }
 
     /// `tick_native_video_loop_boundary` 直後に呼ばれ、`set_native_video_pin` で
@@ -4047,6 +4129,16 @@ impl App {
                 };
                 if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                     player.set_native_checked(checked);
+                }
+            }
+            // P: pin the selected tile while tile mode is open; otherwise pin
+            // the current frame (= HUD 📌 button).
+            0x50 if !key.shift && !key.ctrl && !key.repeat && self.video_tile_mode_active => {
+                // If tile metadata is not ready or contains no timestamps, tile-mode P is an
+                // intentional no-op; falling back to current playback position would pin a
+                // different frame than the highlighted tile UI suggests.
+                if !self.handle_native_video_set_tile_pin_command(ctx, fs_idx) {
+                    hud_activity = false;
                 }
             }
             // P: pin current frame (= HUD 📌 ボタンと同等)。グリッドの P と統一した

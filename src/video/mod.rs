@@ -291,6 +291,9 @@ pub enum NativeVideoOutputEvent {
     TileSeek {
         target_secs: f64,
     },
+    TileHover {
+        index: usize,
+    },
     WheelNavigate {
         delta: i32,
     },
@@ -1312,6 +1315,7 @@ fn send_native_overlay_command(
     let event = match command {
         Command::Seek { target_secs } => NativeVideoOutputEvent::Seek { target_secs },
         Command::TileSeek { target_secs } => NativeVideoOutputEvent::TileSeek { target_secs },
+        Command::TileHover { index } => NativeVideoOutputEvent::TileHover { index },
         Command::WheelNavigate { delta } => NativeVideoOutputEvent::WheelNavigate { delta },
         Command::TileColumnsDelta { delta } => NativeVideoOutputEvent::TileColumnsDelta { delta },
         Command::RequestSeekThumbnail { target_secs } => {
@@ -2140,6 +2144,15 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::TileSeek { target_secs },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::TileHover {
+                                index,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::TileHover { index },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::WheelNavigate {

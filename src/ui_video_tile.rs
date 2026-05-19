@@ -220,6 +220,21 @@ impl App {
     }
 
     #[cfg(windows)]
+    pub(crate) fn select_video_tile_cursor(&mut self, fs_idx: usize, selected_idx: usize) -> bool {
+        if self.fullscreen_idx != Some(fs_idx) || !self.video_tile_mode_active {
+            return false;
+        }
+        let Some(state) = self.video_tile_state.as_mut() else {
+            return false;
+        };
+        if selected_idx >= state.timestamps.len() || selected_idx == state.selected_idx {
+            return false;
+        }
+        state.selected_idx = selected_idx;
+        true
+    }
+
+    #[cfg(windows)]
     pub(crate) fn handle_video_tile_cursor_key(
         &mut self,
         ctx: &egui::Context,

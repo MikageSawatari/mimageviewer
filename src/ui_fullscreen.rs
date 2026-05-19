@@ -1205,6 +1205,7 @@ impl App {
                 if need_show {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
                 }
 
                 // 他アプリからフォーカスが戻ってきた瞬間を記録。
@@ -1239,6 +1240,9 @@ impl App {
                 });
                 if cursor_active {
                     self.cursor_last_activity = Some(std::time::Instant::now());
+                    if self.cursor_hidden {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+                    }
                     self.cursor_hidden = false;
                 }
 
@@ -1887,6 +1891,9 @@ impl App {
                     if !clean {
                         // UI が出ている間はタイマを today に戻して countdown を停止。
                         self.cursor_last_activity = Some(std::time::Instant::now());
+                        if self.cursor_hidden {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
+                        }
                         self.cursor_hidden = false;
                     }
                     let idle = self
@@ -1895,6 +1902,9 @@ impl App {
                         .unwrap_or(0.0);
                     let threshold = crate::video::native_presenter::CURSOR_HIDE_IDLE_SECS;
                     if clean && (idle >= threshold || self.cursor_hidden) {
+                        if !self.cursor_hidden {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(false));
+                        }
                         ctx.set_cursor_icon(egui::CursorIcon::None);
                         self.cursor_hidden = true;
                     } else if clean {
@@ -7081,18 +7091,23 @@ impl App {
             self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
         }
         if pin_key {
-            // P キー: 現在再生位置をピン留め (= HUD の 📌 ボタンと同等)。
-            // 現在 PTS を `set_native_video_pin` に渡す (内部で seek thumbnail を
-            // request + nearest 取得 + WebP encode + video_pins DB に書き込み)。
-            // 既に同位置のピンがあれば SQL の ON CONFLICT で pin_pts/thumb_webp を
-            // 上書きするだけなので idempotent。
+            // P キー: タイルモード中は選択中タイル、それ以外は現在再生位置を
+            // ピン留め (= HUD の 📌 ボタンと同等)。
             #[cfg(windows)]
             {
-                let target = self
-                    .fs_video_player(fs_idx)
-                    .map(|p| p.position())
-                    .unwrap_or(0.0);
-                self.handle_native_video_set_pin_command(ctx, fs_idx, target);
+                if self.video_tile_mode_active {
+                    self.handle_native_video_set_tile_pin_command(ctx, fs_idx);
+                } else {
+                    // 現在 PTS を `set_native_video_pin` に渡す (内部で seek thumbnail を
+                    // request + nearest 取得 + WebP encode + video_pins DB に書き込み)。
+                    // 既に同位置のピンがあれば SQL の ON CONFLICT で pin_pts/thumb_webp を
+                    // 上書きするだけなので idempotent。
+                    let target = self
+                        .fs_video_player(fs_idx)
+                        .map(|p| p.position())
+                        .unwrap_or(0.0);
+                    self.handle_native_video_set_pin_command(ctx, fs_idx, target);
+                }
             }
             #[cfg(not(windows))]
             let _ = (ctx, fs_idx);

@@ -868,6 +868,9 @@ pub enum NativeOverlayCommand {
     TileSeek {
         target_secs: f64,
     },
+    TileHover {
+        index: usize,
+    },
     WheelNavigate {
         delta: i32,
     },

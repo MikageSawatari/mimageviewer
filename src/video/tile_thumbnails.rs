@@ -146,6 +146,12 @@ impl TileThumbnailWorker {
         self.state.lock().unwrap().clone()
     }
 
+    /// 指定スロットだけを clone して返す。P キーで選択タイルを pin するような
+    /// 単発操作では、全スロット snapshot よりこちらを使う。
+    pub fn get(&self, idx: usize) -> Option<TileThumbnail> {
+        self.state.lock().unwrap().get(idx).cloned().flatten()
+    }
+
     /// (完了済み数, 総数) を返す。UI のプログレスバー用。
     pub fn progress(&self) -> (usize, usize) {
         let s = self.state.lock().unwrap();

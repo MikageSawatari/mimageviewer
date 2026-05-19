@@ -217,6 +217,10 @@ quiet period を置き、その間は decoder を作らず `NativeOverlayNavigat
 active の動画→動画ホイール移動でも同じ `SwitchSource` を使うが、
 `video_tile_swap_pending` 中は preparing overlay を出し、新動画の `player.info()` 到着後に
 新しい `VideoTileState` を構築してタイルを progressive に埋める。
+タイルモード中の P は、選択中タイル (マウス hover 中なら hover タイルへ同期した
+タイルカーソル) の timestamp と抽出済み RGBA を `video_pins.db` へ書き込み、
+その動画の代表フレームとして使う。タイル画像がまだ未抽出なら、通常の動画 P と同じ
+seek thumbnail 待ちの保険経路にフォールバックする。
 
 タイルモードの fast path では保存済み resume 位置を新 `VideoPlayer` に渡すが、autoplay は false
 に固定する。タイル解除後は resume 位置の静止状態を表示し、特定位置から見たい場合は
@@ -224,6 +228,11 @@ active の動画→動画ホイール移動でも同じ `SwitchSource` を使う
 seek して再生開始する。切替元の `VideoPlayer` は cpal stream を同期 pause し、audio
 buffer を明示クリアしてから native presenter を渡し、前動画の処理済み音声が短く漏れる
 のを抑える。
+
+静止画フルスクリーンでも、動画再生中と同じ idle タイマ (`CURSOR_HIDE_IDLE_SECS`) を使う。
+UI / パネル / ダイアログが出ていない状態でマウス・キー入力が止まると `CursorIcon::None`
+に加えて viewport の `CursorVisible(false)` を送るため、スライドショー再生中も OS カーソルが
+画面上に残らない。入力または UI 表示が戻ったら `CursorVisible(true)` で復帰する。
 
 #### 2.2.2 右パネルへの動的状態反映
 
