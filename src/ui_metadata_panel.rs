@@ -60,12 +60,14 @@ impl App {
         if !force_show {
             let hover_threshold = full_rect.max.x - full_rect.width() * 0.25;
 
-            // ホバー判定: 画面右 1/4
+            // ホバー判定: 画面右 1/4。カーソル非表示中は最後の座標が stale なので、
+            // 実入力でカーソルが復帰するまでは passive hover でパネルを開かない。
             let hover_in_right = ctx.input(|i| {
-                i.pointer
-                    .hover_pos()
-                    .map(|p| p.x > hover_threshold)
-                    .unwrap_or(false)
+                !self.cursor_hidden
+                    && i.pointer
+                        .hover_pos()
+                        .map(|p| p.x > hover_threshold)
+                        .unwrap_or(false)
             });
 
             let visible = self.show_metadata_panel || hover_in_right;

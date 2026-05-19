@@ -10670,6 +10670,9 @@ impl App {
         // 状態を引き継がないようにする)。前回フルスクリーンを 5 分放置した後に
         // すぐ再入場した場合、Some(<古い時刻>) のままだと 1 フレーム目で
         // 「3 秒以上経過」と判定されカーソルが即時消える事故を防ぐ。
+        // NOTE: この無条件リセットは「新規入場」向け。スライドショーのタイマー送りなど、
+        // ユーザー入力ではない fullscreen 内自動ナビは cursor 状態を保存・復元する
+        // `open_fullscreen_from_slideshow_navigation` のようなラッパーを通すこと。
         self.cursor_last_activity = Some(std::time::Instant::now());
         self.cursor_hidden = false;
         self.refresh_fullscreen_video_marker_cache(idx);

@@ -1796,6 +1796,7 @@ impl App {
                                 vst3_panel_open,
                                 &mut vst3_pressed,
                                 &mut copy_capture_pressed,
+                                self.cursor_hidden,
                             );
                             if copy_capture_pressed {
                                 self.copy_image_capture_to_clipboard(fs_idx);
@@ -3363,22 +3364,27 @@ impl App {
         let has_right_panel = self.show_metadata_panel;
         let left_panel_w =
             crate::ui_adjustment_panel::LEFT_PANEL_WIDTH.min(full_rect.width() * 0.3);
-        let cursor_in_panel = ctx.input(|i| {
-            i.pointer
-                .hover_pos()
-                .map(|p| {
-                    let in_right = !compare_wipe_active
-                        && p.x > panel_left
-                        && p.y >= 60.0
-                        && (has_right_panel || p.x > hover_threshold);
-                    let in_left = !compare_wipe_active
-                        && self.adjustment_mode
-                        && p.x < full_rect.min.x + left_panel_w
-                        && p.y >= 60.0;
-                    in_right || in_left
-                })
-                .unwrap_or(false)
-        });
+        // When the OS cursor is hidden, egui still exposes the last hover position.
+        // Treat that position as stale and block passive hover side effects until a
+        // real input event revives the cursor.
+        let passive_hover_enabled = !self.cursor_hidden;
+        let cursor_in_panel = passive_hover_enabled
+            && ctx.input(|i| {
+                i.pointer
+                    .hover_pos()
+                    .map(|p| {
+                        let in_right = !compare_wipe_active
+                            && p.x > panel_left
+                            && p.y >= 60.0
+                            && (has_right_panel || p.x > hover_threshold);
+                        let in_left = !compare_wipe_active
+                            && self.adjustment_mode
+                            && p.x < full_rect.min.x + left_panel_w
+                            && p.y >= 60.0;
+                        in_right || in_left
+                    })
+                    .unwrap_or(false)
+            });
 
         // 左端・上端・右端のホバーでオーバーレイ（上バー＋左パネル＋右パネル）を同時表示/非表示
         // 消しゴムモード中は自前のパネルを左端に描いているためエッジ発火を抑制する。
@@ -3392,16 +3398,17 @@ impl App {
         } else if self.erase_mode {
             self.adjustment_mode = false;
         } else {
-            let edge_hover = ctx.input(|i| {
-                i.pointer
-                    .hover_pos()
-                    .map(|p| {
-                        p.y < 60.0  // 上端
+            let edge_hover = passive_hover_enabled
+                && ctx.input(|i| {
+                    i.pointer
+                        .hover_pos()
+                        .map(|p| {
+                            p.y < 60.0  // 上端
                     || p.x < full_rect.min.x + full_rect.width() * 0.05  // 左端5%
                     || p.x > full_rect.max.x - full_rect.width() * 0.05 // 右端5%
-                    })
-                    .unwrap_or(false)
-            });
+                        })
+                        .unwrap_or(false)
+                });
             if edge_hover && !self.analysis_mode {
                 self.adjustment_mode = true;
             } else if !cursor_in_panel
@@ -3849,6 +3856,29 @@ impl App {
         }
     }
 
+    fn open_fullscreen_from_slideshow_navigation(&mut self, ctx: &egui::Context, idx: usize) {
+        let cursor_last_activity = self.cursor_last_activity;
+        let cursor_hidden = self.cursor_hidden;
+        self.open_fullscreen_from_fs_navigation(ctx, idx);
+        // `open_fullscreen` resets cursor idleness for a new fullscreen entry. Slideshow
+        // advances are timer-driven fullscreen-internal navigation, so keep the idle
+        // countdown/hidden state continuous across image changes; otherwise every slide
+        // briefly revives the OS cursor.
+        self.cursor_last_activity = cursor_last_activity;
+        self.cursor_hidden = cursor_hidden;
+        if cursor_hidden {
+            // The per-frame hide loop is skipped while panels/HUD are visible; assert the
+            // OS cursor state here so timer-driven slides cannot flash it back on.
+            // This helper runs after `show_viewport_immediate`, so target the fullscreen
+            // viewport explicitly rather than the root viewport context.
+            ctx.send_viewport_cmd_to(
+                self.fullscreen_viewport_id(),
+                egui::ViewportCommand::CursorVisible(false),
+            );
+            ctx.set_cursor_icon(egui::CursorIcon::None);
+        }
+    }
+
     pub(crate) fn handle_fullscreen_ctrl_nav_context(
         &mut self,
         ctx: &egui::Context,
@@ -4038,7 +4068,7 @@ impl App {
                         match target {
                             Some(idx) => {
                                 self.slideshow_anchor_idx = None;
-                                self.open_fullscreen_from_fs_navigation(ctx, idx);
+                                self.open_fullscreen_from_slideshow_navigation(ctx, idx);
                                 self.selected = Some(idx);
                                 self.scroll_to_selected = true;
                                 advanced = true;
@@ -5293,8 +5323,13 @@ impl App {
     /// 超えたらマウスカーソルを `CursorIcon::None` で非表示にする。
     fn fs_ui_is_clean(&self, ctx: &egui::Context, full_rect: egui::Rect, _is_video: bool) -> bool {
         let pointer = ctx.input(|i| i.pointer.hover_pos());
-        let in_top = pointer.is_some_and(|p| p.y < TOP_BAR_HOVER_Y);
-        let in_right = pointer.is_some_and(|p| p.x > full_rect.max.x - full_rect.width() * 0.25);
+        // Once the cursor is hidden, the last hover position is stale until a real input
+        // event arrives. Do not let that passive position keep hover UI "visible" and
+        // immediately revive the OS cursor after slideshow advances.
+        let passive_hover_enabled = !self.cursor_hidden;
+        let in_top = passive_hover_enabled && pointer.is_some_and(|p| p.y < TOP_BAR_HOVER_Y);
+        let in_right = passive_hover_enabled
+            && pointer.is_some_and(|p| p.x > full_rect.max.x - full_rect.width() * 0.25);
         // 動画再生中の HUD / speed popup は native presenter overlay 側で管理されるため
         // egui main window のカーソル可視判定からは除外する (= 旧 egui HUD は撤去済)。
         !in_top
@@ -5357,12 +5392,14 @@ impl App {
         vst3_panel_open: bool,
         vst3_pressed: &mut bool,
         copy_capture_pressed: &mut bool,
+        cursor_hidden: bool,
     ) {
         let hover_in_top = ctx.input(|i| {
-            i.pointer
-                .hover_pos()
-                .map(|p| p.y < TOP_BAR_HOVER_Y)
-                .unwrap_or(false)
+            !cursor_hidden
+                && i.pointer
+                    .hover_pos()
+                    .map(|p| p.y < TOP_BAR_HOVER_Y)
+                    .unwrap_or(false)
         });
         // adjustment_mode がオンならオーバーレイとして常に表示
         if !hover_in_top && !force_show && !*spread_popup_open && !*adjustment_mode {
