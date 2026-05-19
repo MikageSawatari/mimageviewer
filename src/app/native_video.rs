@@ -1482,11 +1482,6 @@ impl App {
             crate::video::NativeVideoOutputEvent::TileSeek { target_secs } => {
                 self.handle_native_video_tile_seek_command(ctx, fs_idx, target_secs);
             }
-            crate::video::NativeVideoOutputEvent::TileHover { index } => {
-                if self.select_video_tile_cursor(fs_idx, index) {
-                    self.sync_native_video_tile_overlay(ctx, fs_idx);
-                }
-            }
             crate::video::NativeVideoOutputEvent::WheelNavigate { delta } => {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
             }

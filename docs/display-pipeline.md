@@ -217,8 +217,8 @@ quiet period を置き、その間は decoder を作らず `NativeOverlayNavigat
 active の動画→動画ホイール移動でも同じ `SwitchSource` を使うが、
 `video_tile_swap_pending` 中は preparing overlay を出し、新動画の `player.info()` 到着後に
 新しい `VideoTileState` を構築してタイルを progressive に埋める。
-タイルモード中の P は、選択中タイル (マウス hover 中なら hover タイルへ同期した
-タイルカーソル) の timestamp と抽出済み RGBA を `video_pins.db` へ書き込み、
+タイルモード中の P は、キーボード操作で選択中のタイルカーソル位置の timestamp と
+抽出済み RGBA を `video_pins.db` へ書き込み、
 その動画の代表フレームとして使う。タイル画像がまだ未抽出なら、通常の動画 P と同じ
 seek thumbnail 待ちの保険経路にフォールバックする。
 

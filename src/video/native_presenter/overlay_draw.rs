@@ -2531,9 +2531,6 @@ pub(super) fn draw_native_tile_overlay(
                 );
                 if resp.hovered() {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    if selected_idx != Some(idx) {
-                        commands.push(NativeOverlayCommand::TileHover { index: idx });
-                    }
                     painter.rect_stroke(
                         tile_rect.expand(1.0),
                         4.0,
