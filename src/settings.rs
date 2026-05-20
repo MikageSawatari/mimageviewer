@@ -851,6 +851,9 @@ pub struct Settings {
     /// 音声ポンプ側で pre-limiter boost として扱う。
     #[serde(default = "default_video_volume")]
     pub video_volume: f64,
+    /// 動画再生速度。HUD の速度ボタンから変更され、動画切替 / アプリ再起動後も維持する。
+    #[serde(default = "default_video_playback_speed")]
+    pub video_playback_speed: f64,
     /// フルスクリーン化時に自動再生を開始するか (旧: bool)。
     /// Phase 7.J で `VideoAutoplayMode` に拡張。現在の UI は
     /// Off / Always の 2 択で、OnlyFromGrid は旧設定互換として Off に正規化する。
@@ -872,9 +875,18 @@ pub struct Settings {
     /// マイグレーションされる。
     #[serde(default)]
     pub video_loop_mode: VideoLoopMode,
+    /// 動画フルスクリーン時の連続再生モード。既存ループ設定とは排他で、
+    /// ON の間は実再生ループを無効化し、連続再生を優先する。
+    #[serde(default)]
+    pub video_continuous_mode: crate::video::VideoContinuousMode,
     /// 起動時にミュートで開始するか (オフィス環境などでの保険)。
     #[serde(default)]
     pub video_start_muted: bool,
+    /// HUD のミュートボタン / M キーで最後に選んだ動画ミュート状態。
+    /// `video_start_muted` は起動時だけ true 方向に効く安全スイッチで、こちらは
+    /// 起動後の動画切替と次回起動へ引き継ぐ現在のミュート状態。
+    #[serde(default)]
+    pub video_muted: bool,
     /// 動画ファイルごとの最終再生位置 (絶対パス → 秒)。
     /// `VideoPlayer::open` 時に自動 resume、5 秒ごと + drop 時に保存。
     /// 動画末尾近く (残り 5 秒以内) は 0 にリセットして "次回最初から" の挙動。
@@ -1363,6 +1375,10 @@ fn default_video_volume() -> f64 {
     VIDEO_VOLUME_DEFAULT
 }
 
+fn default_video_playback_speed() -> f64 {
+    1.0
+}
+
 /// グリッド列数の最小値
 pub const MIN_GRID_COLS: usize = 1;
 /// グリッド列数の最大値
@@ -1580,11 +1596,14 @@ impl Default for Settings {
             update_check_dismissed_version: None,
             perf_log_enabled: false,
             video_volume: default_video_volume(),
+            video_playback_speed: default_video_playback_speed(),
             video_autoplay: false,
             video_autoplay_mode: VideoAutoplayMode::default(),
             video_loop: false,
             video_loop_mode: VideoLoopMode::default(),
+            video_continuous_mode: crate::video::VideoContinuousMode::default(),
             video_start_muted: false,
+            video_muted: false,
             video_resume_positions: std::collections::HashMap::new(),
             video_grid_open_starts_from_beginning: false,
             video_hw_decode: true,
@@ -2341,11 +2360,14 @@ impl Settings {
         let autoplay_mode_migrated =
             settings.video_autoplay_mode == VideoAutoplayMode::OnlyFromGrid;
         let video_volume_before_sanitize = settings.video_volume;
+        let video_playback_speed_before_sanitize = settings.video_playback_speed;
         let vst3_migrated = settings.migrate_vst3_legacy();
         let video_loop_migrated = settings.migrate_legacy_video_loop();
         settings.sanitize();
         let video_volume_sanitized =
             (settings.video_volume - video_volume_before_sanitize).abs() > 1.0e-9;
+        let video_playback_speed_sanitized =
+            (settings.video_playback_speed - video_playback_speed_before_sanitize).abs() > 1.0e-9;
 
         // バージョン跨ぎの安全網 (#4) を SQLite 版に置換:
         // - 旧版は `settings.json` を `settings.json.preupgrade-v<old>` に std::fs::copy
@@ -2395,6 +2417,7 @@ impl Settings {
             || autoplay_mode_migrated
             || video_loop_migrated
             || video_volume_sanitized
+            || video_playback_speed_sanitized
             || version_changed
         {
             settings.save_internal_no_rotation();
@@ -2458,6 +2481,8 @@ impl Settings {
         // 区別できない)。ここでは mode を source of truth として bool を導出する片方向のみ。
         self.video_loop = !matches!(self.video_loop_mode, VideoLoopMode::Off);
         self.video_volume = clamp_video_volume(self.video_volume);
+        self.video_playback_speed =
+            crate::video::clock::clamp_playback_speed(self.video_playback_speed);
 
         // v0.8 マイグレーション: お気に入りの UUID が nil なら発行する。
         // 旧形式 / id フィールド欠落時は deserialize で Uuid::nil() が入っているので、
@@ -2779,6 +2804,12 @@ mod tests {
         assert_eq!(loaded.thumb_px, 512);
         assert_eq!(loaded.thumb_quality, 75);
         assert_eq!(loaded.video_volume, VIDEO_VOLUME_DEFAULT);
+        assert_eq!(loaded.video_playback_speed, 1.0);
+        assert_eq!(
+            loaded.video_continuous_mode,
+            crate::video::VideoContinuousMode::Off
+        );
+        assert!(!loaded.video_muted);
         assert_eq!(loaded.video_deinterlace, VideoDeinterlaceMode::Auto);
         assert!(!loaded.video_grid_open_starts_from_beginning);
         assert!(loaded.favorites.is_empty());
@@ -2804,6 +2835,22 @@ mod tests {
         s.folder_skip_limit = 999;
         s.sanitize();
         assert_eq!(s.folder_skip_limit, 30);
+    }
+
+    #[test]
+    fn sanitize_clamps_video_playback_speed() {
+        let mut s = Settings::default();
+        s.video_playback_speed = 999.0;
+        s.sanitize();
+        assert_eq!(
+            s.video_playback_speed,
+            crate::video::clock::MAX_PLAYBACK_SPEED
+        );
+
+        let mut s = Settings::default();
+        s.video_playback_speed = f64::NAN;
+        s.sanitize();
+        assert_eq!(s.video_playback_speed, 1.0);
     }
 
     #[test]

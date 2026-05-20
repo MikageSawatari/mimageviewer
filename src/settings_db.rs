@@ -2659,6 +2659,9 @@ mod tests {
         resume.insert(r"C:\v\b.mkv".to_string(), 3600.25);
         s.video_resume_positions = resume;
         s.video_grid_open_starts_from_beginning = true;
+        s.video_playback_speed = 1.75;
+        s.video_continuous_mode = crate::video::VideoContinuousMode::ContinuousLoop;
+        s.video_muted = true;
         s.recent_open_with_apps = vec![RecentApp {
             display_name: "Editor".to_string(),
             exe_path: r"C:\bin\edit.exe".to_string(),

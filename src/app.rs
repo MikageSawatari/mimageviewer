@@ -2277,8 +2277,7 @@ pub struct App {
     /// fullscreen から動画を切り替えた時 (= fs_cache から Video エントリが消える時) に
     /// クリアされる。
     pub(crate) last_loop_pos: std::collections::HashMap<usize, (f64, u64)>,
-    /// 動画連続再生モード。既存ループ設定とは排他で、アプリ再起動では保持しない
-    /// session-only state として扱う。
+    /// 動画連続再生モード。既存ループ設定とは排他で、settings に保存して再起動後も復元する。
     pub(crate) video_continuous_mode: crate::video::VideoContinuousMode,
     /// 同じ EOF を複数フレーム連続で処理しないための `(fs_idx, seek_serial)` 記録。
     /// `source_epoch` ではなく `AvClock::current_seek_serial()` を使うことで、同一動画を
@@ -2637,9 +2636,10 @@ pub struct App {
     /// 毎フレーム set_cursor_icon を呼ばないと cursor 状態が消えるため、`cursor_hidden`
     /// が true の間は毎フレーム None を打ち続ける)。
     pub(crate) cursor_hidden: bool,
-    /// 動画倍速再生のセッション内設定。settings には保存しない。
+    /// 動画倍速再生の現在設定。HUD 操作時は settings.video_playback_speed に保存する。
     pub(crate) video_playback_speed: f64,
-    /// 動画ミュートのセッション内状態。settings には保存せず、次の VideoPlayer 作成時に引き継ぐ。
+    /// 動画ミュートのセッション内状態。HUD 操作時は settings.video_muted に保存し、
+    /// 次の VideoPlayer 作成時にも引き継ぐ。
     pub(crate) video_session_muted: bool,
     /// TRT worker クラッシュ / 起動失敗の通知バナー (Phase 3 Step 5)。
     /// `AiRuntime::take_worker_notice()` を update 毎にポーリングし、`Some` を
@@ -3024,6 +3024,10 @@ impl App {
             .ai_upscale_model_override
             .as_deref()
             .and_then(crate::ai::ModelKind::from_str);
+        let video_playback_speed =
+            crate::video::clock::clamp_playback_speed(settings.video_playback_speed);
+        let video_continuous_mode = settings.video_continuous_mode;
+        let video_session_muted = settings.video_start_muted || settings.video_muted;
         // 操作中はバックグラウンドインデクサを一時停止するためのゲート。
         // IndexerManager / name_index_supervisor の両方に `Arc` で共有される。
         let activity_gate = Arc::new(crate::activity_gate::ActivityGate::new(
@@ -3339,7 +3343,7 @@ impl App {
             fullscreen_video_marker_cache: None,
             fullscreen_video_marker_thumb_decode_pending: None,
             last_loop_pos: std::collections::HashMap::new(),
-            video_continuous_mode: crate::video::VideoContinuousMode::Off,
+            video_continuous_mode,
             video_continuous_last_eof: None,
             video_perf_overlay_visible: false,
             rating_db,
@@ -3447,8 +3451,8 @@ impl App {
             fs_feedback_toast_reveal_path: None,
             cursor_last_activity: None,
             cursor_hidden: false,
-            video_playback_speed: 1.0,
-            video_session_muted: false,
+            video_playback_speed,
+            video_session_muted,
             trt_worker_notice: None,
             trt_auto_restart_attempts: 0,
             trt_restart_in_flight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -12513,13 +12517,17 @@ impl App {
         }
     }
 
-    /// 現在動画の mute を反転してセッション状態にも反映する。
+    /// 現在動画の mute を反転し、セッション状態と次回起動用の保存状態にも反映する。
     /// 戻り値は `fs_idx` が生きている動画エントリだったかを表す。
     pub(crate) fn toggle_video_session_mute_for_fs_idx(&mut self, fs_idx: usize) -> bool {
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             let muted = !player.is_muted();
             player.set_muted(muted);
             self.video_session_muted = muted;
+            if self.settings.video_muted != muted {
+                self.settings.video_muted = muted;
+                self.settings.save();
+            }
             true
         } else {
             false
@@ -12634,7 +12642,7 @@ impl App {
             native_output_config,
         );
         player.set_playback_speed(self.video_playback_speed);
-        if self.settings.video_start_muted || play_test_mute || self.video_session_muted {
+        if play_test_mute || self.video_session_muted {
             player.set_muted(true);
         }
         (player, start_normalize_scan_before_play)
@@ -15725,6 +15733,10 @@ impl App {
         self.video_continuous_mode = self.video_continuous_mode.cycle();
         self.video_continuous_last_eof = None;
         let mode = self.video_continuous_mode;
+        if self.settings.video_continuous_mode != mode {
+            self.settings.video_continuous_mode = mode;
+            self.settings.save();
+        }
         if mode.is_enabled() {
             if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
                 player.set_loop_enabled(false);

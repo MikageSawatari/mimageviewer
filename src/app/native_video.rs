@@ -2621,6 +2621,10 @@ impl App {
         }
         let speed = crate::video::clock::clamp_playback_speed(speed);
         self.video_playback_speed = speed;
+        if (self.settings.video_playback_speed - speed).abs() > 1.0e-9 {
+            self.settings.video_playback_speed = speed;
+            self.settings.save();
+        }
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
             player.set_playback_speed(speed);
             self.mark_native_video_hud_activity(ctx);

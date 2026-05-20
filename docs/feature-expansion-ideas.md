@@ -513,8 +513,9 @@ Codex 第 1 ラウンドレビュー指摘「Alt+C 差分は WGSL custom shader 
 ### 3.5 永続化
 
 - セッション中はモードを維持
-- アプリ再起動で「連続再生オフ」に戻す (倍速再生の挙動と統一)
-- これは Codex レビュー観点 (現案であり、要確認)
+- `Settings.video_continuous_mode` に保存し、アプリ再起動後も復元する
+- 2026-05-20 変更: ループ / 音量 / ミュート / 倍速 / Norm と同じく、
+  HUD で選ぶ再生プリファレンスとして保存対象にした
 
 ### 3.6 エッジケース
 
@@ -531,9 +532,9 @@ Codex 第 1 ラウンドレビュー指摘「Alt+C 差分は WGSL custom shader 
 
 ### 3.7 実装方針
 
-- 既存の `VideoLoopMode` enum とは別に、session-only の `VideoContinuousMode` enum を追加:
+- 既存の `VideoLoopMode` enum とは別に、`VideoContinuousMode` enum を追加:
   - `Off`, `Continuous`, `ContinuousLoop`
-  - 永続化しないため `Settings` には入れず、`App` の runtime state として保持する
+  - `Settings.video_continuous_mode` に保存し、`App` の runtime state へ起動時に復元する
 - `poll_video` で `video_continuous_mode != Off` の間は `player.set_loop_enabled(false)` を優先し、
   既存 `VideoLoopMode` は「設定値として保持するが、再生挙動には使わない」状態にする
 - EOF は `VideoPlayer::tick()` が現在どおり drain 完了後に engine state を `Eof` に遷移させる。
@@ -566,7 +567,7 @@ Codex 第 1 ラウンドレビュー指摘「Alt+C 差分は WGSL custom shader 
 ### 3.8 残課題 / レビュー観点
 
 - [x] HUD ボタンの位置: ループボタンの右隣に追加
-- [x] 連続再生モードのアプリ再起動時の挙動: `Settings` には入れず、起動時はオフ
+- [x] 連続再生モードのアプリ再起動時の挙動: `Settings.video_continuous_mode` に保存して復元
 - [x] 「連続再生中はループ無効」の disabled 表示: ループボタンをグレーアウトして残す
 - [ ] フォルダ末尾の停止時に「Ctrl+↓ で次フォルダ」案内トーストは既存と同じか専用文言にするか
 - [ ] フォルダに動画が 1 本だけのときの連続+ループは違和感あるか (現案: 違和感許容)
@@ -575,7 +576,7 @@ Codex 第 1 ラウンドレビュー指摘「Alt+C 差分は WGSL custom shader 
 ### 3.9 実装状況 (2026-05-19)
 
 - `crate::video::VideoContinuousMode` (`Off` / `Continuous` / `ContinuousLoop`) を追加し、`App`
-  の session state として保持。`Settings` には保存しない
+  の runtime state と `Settings.video_continuous_mode` に保持
 - native HUD に連続再生ボタンを追加。押下で 3 モードを循環し、状態は
   `NativeVideoOutputCommand::SetContinuousMode` で overlay に同期
 - アイコンは「プレイリスト + 現在行の再生マーク」を基本形にし、連続再生は次行への矢印、

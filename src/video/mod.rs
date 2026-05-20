@@ -77,7 +77,7 @@ fn engine_state_code_name(code: u8) -> &'static str {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum VideoContinuousMode {
     #[default]
     Off,

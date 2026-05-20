@@ -10,7 +10,7 @@ Claude Code 案は参考にしたが、現在のコードと合わない箇所�
 - 音声タイムストレッチは **Signalsmith Stretch** を採用する。
 - 音声はピッチを維持する。主な評価軸は音楽よりもセリフの聞き取りやすさとする。
 - VST3 には「タイムストレッチ後の等倍サンプル列」を渡す。
-- 速度は `settings.json` に保存しない。アプリ起動中だけ保持し、動画を切り替えても維持する。再起動時は 1.0x に戻す。
+- 速度は設定に保存する。動画を切り替えても、アプリ再起動後も維持する。
 - UI はシークバー下部 HUD に速度ボタンを追加し、クリックで速度候補を選択できるポップアップを出す。
 
 ## 2. Claude Code 案から修正する点
@@ -49,12 +49,13 @@ UI に表示する速度は次の 11 段階とする。
 - 画面端ではポップアップ位置を clamp し、シークバーや時間表示に重ならないようにする。
 - legacy egui path と native overlay path の両方に実装する。
 
-### 3.3 セッション保持
+### 3.3 設定への保持
 
-- `App` 側に `video_playback_speed: f64` を追加し、初期値は 1.0 にする。
+- `Settings` 側に `video_playback_speed: f64` を追加し、初期値は 1.0 にする。
+- `App` 側にも `video_playback_speed: f64` を保持し、起動時に `Settings` から復元する。
 - 動画を開き直した直後に、現在の `video_playback_speed` を新しい `VideoPlayer` に適用する。
-- 速度変更イベントを受けたら `App.video_playback_speed` と `VideoPlayer` の両方を更新する。
-- 設定ファイルには保存しない。
+- 速度変更イベントを受けたら `App.video_playback_speed` / `Settings.video_playback_speed` /
+  `VideoPlayer` を更新し、設定へ保存する。
 
 ## 4. アーキテクチャ
 
@@ -311,7 +312,8 @@ fn draw_video_speed_button(
 ) -> Option<f64>
 ```
 
-戻り値が `Some(speed)` のとき、`App.video_playback_speed` と `VideoPlayer` を更新する。
+戻り値が `Some(speed)` のとき、`App.video_playback_speed` / `Settings.video_playback_speed` /
+`VideoPlayer` を更新する。
 
 ### 6.2 native overlay path
 
@@ -339,7 +341,7 @@ native overlay の state に `playback_speed: f64` を追加し、UI thread か�
 | `src/video/engine/actor.rs` | `TransportCommand::SetSpeed` を実装し、内部 `MasterClock` の速度を更新 |
 | `src/video/native_presenter.rs` | native HUD 速度 UI、イベント、present delay 修正 |
 | `src/ui_fullscreen.rs` | legacy HUD 速度 UI |
-| `src/app.rs` | session speed の保持、動画切替時の再適用 |
+| `src/app.rs` | speed の保持と設定保存、動画切替時の再適用 |
 | `docs/video-architecture.md` | 実装後に倍速再生の構造を追記 |
 | `docs/video-engine-redesign.md` | 実装後に Phase 4 speed 配線の完了状態を更新 |
 | `htdocs/mimageviewer/manual/video.html` | 実装後に操作説明を追記 |
@@ -375,10 +377,10 @@ native overlay の state に `playback_speed: f64` を追加し、UI thread か�
 
 ### Phase 4: UI
 
-1. `App.video_playback_speed` を追加する。
+1. `Settings.video_playback_speed` と `App.video_playback_speed` を追加する。
 2. legacy HUD に速度ボタンとポップアップを追加する。
 3. native overlay に同じ UI とイベントを追加する。
-4. 動画切替時に session speed を再適用する。
+4. 動画切替時に保存済み speed を再適用する。
 
 ### Phase 5: documentation と manual
 
