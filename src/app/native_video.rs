@@ -899,6 +899,13 @@ impl App {
             // bridge 側の登録値が古い (0) のままにならないよう毎フレーム refresh する。
             self.dsp_bridge.set_hud_hwnd(hud_hwnd);
             self.sync_native_video_main_cloak(false);
+            // in-window モードでは presenter は main HWND の子なので foreground は
+            // 常に main で正しい。fullscreen 用の foreground 復旧 / VST overlap 調整は
+            // 不要かつ有害 (250ms ごとの AttachThreadInput churn が resize 追従を
+            // 不安定化させる) なので早期 return する。
+            if crate::app::video_in_main_window_enabled() {
+                return;
+            }
             // PrintScreen / Snipping Tool の範囲選択後や native startup の競合で
             // egui 側の黒 backdrop が presenter HWND より前に残ることがある。
             // UI thread から presenter HWND を直接 SetWindowPos せず、復旧が必要な

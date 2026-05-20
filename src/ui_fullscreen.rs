@@ -1131,19 +1131,30 @@ impl App {
         self.poll_prefetch(ctx);
 
         // ── 状態の事前計算 ──
+        // in-window モード (`MIV_VIDEO_IN_MAIN_WINDOW`) では presenter child が
+        // main window のクライアント領域に直接描画するので、フルスクリーンの
+        // 黒 backdrop viewport は作らない。作ると別 top-level window が foreground を
+        // 奪い、(1) 画面全体が黒くなる (2) presenter HWND への click が
+        // WM_MOUSEACTIVATE/MA_ACTIVATEANDEAT で食われる、の 2 つの実害が出る。
         #[cfg(windows)]
         if self.native_video_backdrop_target_for_fs(fs_idx) {
-            self.show_native_video_black_backdrop(ctx, fs_idx);
+            if !crate::app::video_in_main_window_enabled() {
+                self.show_native_video_black_backdrop(ctx, fs_idx);
+            }
             return;
         }
         #[cfg(windows)]
         if self.native_video_presenter_pending_for_fs(fs_idx) {
-            self.show_native_video_black_backdrop(ctx, fs_idx);
+            if !crate::app::video_in_main_window_enabled() {
+                self.show_native_video_black_backdrop(ctx, fs_idx);
+            }
             return;
         }
         #[cfg(windows)]
         if self.native_video_presenter_hwnd_for_fs(fs_idx).is_some() {
-            self.show_native_video_black_backdrop(ctx, fs_idx);
+            if !crate::app::video_in_main_window_enabled() {
+                self.show_native_video_black_backdrop(ctx, fs_idx);
+            }
             return;
         }
 

@@ -1489,7 +1489,10 @@ impl NativeVideoPresenter {
         // 子の Ok を全部見届けるまで自分の state を進めない方針にする。
         self._background
             .resize(&self.d3d_device1, &self.d3d_context, width, height)?;
-        self.update_video_visual_transform()?;
+        // 新しい `width`/`height` を明示的に渡す。`self.width`/`self.height` は本関数の
+        // 末尾で初めて更新されるため、ここで `self.width` を読むと 1 resize 前のサイズで
+        // transform を計算してしまう。
+        self.update_video_visual_transform(width, height)?;
         if let Some(overlay) = self.test_overlay.as_mut() {
             overlay.resize(
                 &self.d3d_device1,
@@ -1522,7 +1525,7 @@ impl NativeVideoPresenter {
             return Ok(());
         }
         self.video_compact = compact;
-        self.update_video_visual_transform()?;
+        self.update_video_visual_transform(self.width, self.height)?;
         log_event(
             "video_compact",
             &[("compact", Value::from(self.video_compact))],
@@ -1538,7 +1541,7 @@ impl NativeVideoPresenter {
         }
         self.sar_num = num;
         self.sar_den = den;
-        self.update_video_visual_transform()?;
+        self.update_video_visual_transform(self.width, self.height)?;
         log_event(
             "video_sar",
             &[
@@ -1597,7 +1600,7 @@ impl NativeVideoPresenter {
             // サイズは正しいので transform を作り直すだけでよい。
             self.sar_num = new_sar_num;
             self.sar_den = new_sar_den;
-            self.update_video_visual_transform()?;
+            self.update_video_visual_transform(self.width, self.height)?;
         }
 
         let copy_t0 = Instant::now();
@@ -2855,12 +2858,16 @@ impl NativeVideoPresenter {
         t0.elapsed().as_secs_f64() * 1000.0
     }
 
-    fn update_video_visual_transform(&self) -> Result<(), String> {
+    /// `win_w` / `win_h` は明示引数。`self.width` / `self.height` を直接読まないのは、
+    /// `resize()` が `self.width` を**末尾で**更新するため (= 呼び出し時点では 1 resize
+    /// 前の値)。stale なサイズで transform を計算すると最大化/復元/ドラッグの追従が
+    /// 1 ステップ遅れる (2026-05 修正)。
+    fn update_video_visual_transform(&self, win_w: u32, win_h: u32) -> Result<(), String> {
         let (m11, m22, offset_x, offset_y) = compute_video_visual_transform(
             self.surface_width,
             self.surface_height,
-            self.width,
-            self.height,
+            win_w,
+            win_h,
             self.sar_num,
             self.sar_den,
             self.video_compact,

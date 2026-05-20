@@ -279,6 +279,10 @@ pub struct NativeVideoOutputConfig {
     /// `true` で HUD HWND を作成し、VST より前面に bars を出す。万が一の regression に備えて
     /// 環境変数 `MIV_HUD_OVERLAY=0` で強制 off できるよう App 側で配線する。
     pub hud_overlay_enabled: bool,
+    /// Phase 0 spike: `true` のとき presenter HWND を `owner_hwnd` の子
+    /// (`WS_CHILD`) として生成し、owner のクライアント領域に重ねて in-window
+    /// 再生する。`false` のとき従来どおりモニタ全面の borderless popup。
+    pub in_main_window: bool,
 }
 
 #[cfg(windows)]
@@ -681,6 +685,10 @@ impl NativeVideoOutput {
                     thread_hud_hwnd.store(0, Ordering::Release);
                     thread_closed.store(true, Ordering::Release);
                 }
+                // presenter thread 終了: in-window child HWND の登録を解除する
+                // (handle 再利用時に main window subclass が無関係な window を
+                // resize するのを防ぐ)。
+                crate::video::native_window::set_in_window_video_child(0);
             }) {
             Ok(thread) => thread,
             Err(err) => {
@@ -1372,6 +1380,51 @@ fn send_native_overlay_command(
     send_native_output_event(tx, source_epoch, event);
 }
 
+/// Phase 0 in-window モード: child presenter HWND を親 (main HWND) のクライアント
+/// 領域へ貼り直す。child は親の移動・最小化には自動追従するが**リサイズには
+/// 追従しない**ため、親クライアントサイズを polling してここで `SetWindowPos`
+/// する。サイズが変わったら新サイズを返す。変化なし / 取得失敗 / 親最小化
+/// (0x0) のときは `current` をそのまま返す。`SetWindowPos` は child の
+/// `WM_WINDOWPOSCHANGED` を発火し、既存の `GeometryChanged` → `resize` 経路に乗る。
+#[cfg(windows)]
+fn reflow_child_to_parent_client(
+    child: windows::Win32::Foundation::HWND,
+    parent_hwnd_raw: u64,
+    current: (u32, u32),
+) -> (u32, u32) {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClientRect, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
+    };
+    if parent_hwnd_raw == 0 {
+        return current;
+    }
+    let parent = HWND(parent_hwnd_raw as *mut _);
+    let mut rc = RECT::default();
+    if unsafe { GetClientRect(parent, &mut rc) }.is_err() {
+        return current;
+    }
+    let w = (rc.right - rc.left).max(0) as u32;
+    let h = (rc.bottom - rc.top).max(0) as u32;
+    // 親が最小化されると 0x0 が返る。child は親に追従して自動で hide されるので
+    // ここでは触らず、復元時の poll で正しいサイズへ戻す。
+    if w == 0 || h == 0 || (w, h) == current {
+        return current;
+    }
+    unsafe {
+        let _ = SetWindowPos(
+            child,
+            None,
+            0,
+            0,
+            w as i32,
+            h as i32,
+            SWP_NOACTIVATE | SWP_NOZORDER,
+        );
+    }
+    (w, h)
+}
+
 #[cfg(windows)]
 fn run_native_video_output(
     video_rx: crossbeam_channel::Receiver<VideoFrame>,
@@ -1402,8 +1455,10 @@ fn run_native_video_output(
     let (presenter_event_tx, presenter_event_rx) = std::sync::mpsc::channel();
     let mut window = crate::video::native_window::NativeVideoWindow::create(
         crate::video::native_window::NativeVideoWindowConfig {
-            mode: crate::video::native_window::NativeVideoWindowMode::Borderless {
-                rect: config.rect,
+            mode: if config.in_main_window {
+                crate::video::native_window::NativeVideoWindowMode::Child { rect: config.rect }
+            } else {
+                crate::video::native_window::NativeVideoWindowMode::Borderless { rect: config.rect }
             },
             owner_hwnd: config.owner_hwnd,
             initially_visible: false,
@@ -1499,6 +1554,19 @@ fn run_native_video_output(
             return;
         }
         let shown = window.show_and_raise();
+        if config.in_main_window {
+            // in-window モード: child は show_and_raise が NOACTIVATE で表示するので
+            // フォーカスを持たない。キーボード入力は presenter child の wndproc が
+            // 処理する (fullscreen の presenter HWND と同じ経路) ため、明示的に
+            // フォーカスを当てる。
+            unsafe {
+                use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+                let _ = SetFocus(Some(window.hwnd()));
+            }
+            // main window のリサイズサブクラスがこの child を同期リサイズできるよう
+            // child HWND を登録する。
+            crate::video::native_window::set_in_window_video_child(window.hwnd().0 as u64);
+        }
         hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
         // HUD HWND が生成されたら App から見えるように atomic に store。
         // CP4 段階 (= hud_event_tx=None) では生成されないので 0 のまま。
@@ -1586,6 +1654,10 @@ fn run_native_video_output(
     // CP6: cursor polling 用 state。HUD 経路 (= CP7 で hud_event_tx=Some) のときだけ
     // 機能する。フォールバック経路では `presenter.cursor_polling_tick` が早期 return。
     let mut last_cursor_poll: Option<Instant> = None;
+    // in-window モード: 親 (main HWND) のクライアントサイズを毎ループ監視し、
+    // 変化したら child presenter HWND を貼り直すための直近サイズ state。child は
+    // 親の移動・最小化には自動追従するが、リサイズには自動追従しないため。
+    let mut last_parent_client_size: (u32, u32) = (width, height);
     let mut last_native_mouse_at: Option<Instant> = None;
     let mut pointer_present_synthetic: bool = false;
     // CP6: HUD raise の retry burst スケジュール。`RaiseHudToTop` command / `RequestRaiseHud`
@@ -2038,6 +2110,18 @@ fn run_native_video_output(
                     }
                 }
             }
+        }
+        // in-window モード: event drain の直前に親 (main HWND) クライアント矩形を
+        // 見て child を貼り直す。child は親のリサイズに自動追従しないため毎ループ
+        // 監視する。**drain の直前**に置くことで、SetWindowPos が同期発火させる
+        // WM_WINDOWPOSCHANGED → GeometryChanged を同じループ反復で drain・処理でき、
+        // resize 追従の 1 反復ぶんの遅延を無くす (maximize の「1 つ前」対策)。
+        if config.in_main_window {
+            last_parent_client_size = reflow_child_to_parent_client(
+                window.hwnd(),
+                config.owner_hwnd,
+                last_parent_client_size,
+            );
         }
         native_events.clear();
         while let Ok(event) = presenter_event_rx.try_recv() {

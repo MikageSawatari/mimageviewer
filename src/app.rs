@@ -2898,6 +2898,10 @@ pub struct App {
     /// winit/eframe の update loop は止まらない。
     native_video_main_cloaked: bool,
     #[cfg(windows)]
+    /// in-window モードで main HWND のリサイズサブクラスを install 済みか
+    /// (一度きりの install を保証する)。
+    in_window_resize_subclass_installed: bool,
+    #[cfg(windows)]
     /// 動画フルスクリーン終了時に main_hwnd の foreground 奪還を試みるべきか。
     /// close_fullscreen 時点で「mIV が foreground だった」ときに true、
     /// presenter HWND の destroy 確認 / 期限超過で消費する。
@@ -3531,6 +3535,8 @@ impl App {
             native_video_main_chrome_restore_at: None,
             #[cfg(windows)]
             native_video_main_cloaked: false,
+            #[cfg(windows)]
+            in_window_resize_subclass_installed: false,
             #[cfg(windows)]
             pending_main_foreground_reclaim: false,
             #[cfg(windows)]
@@ -10886,7 +10892,12 @@ impl App {
             // Re-cloaking the main HWND for those swaps creates an unnecessary
             // DWM state transition on every wheel tick and can leak as a
             // physical-screen-only flicker even though OBS/window capture misses it.
-            if self.native_video_presenter_hwnd().is_none() {
+            //
+            // Phase 0 in-window モード (`MIV_VIDEO_IN_MAIN_WINDOW`): presenter は
+            // main HWND の子として client 領域に重なるので main は cloak しない
+            // (cloak すると親ごと DWM 合成から外れて子も消える)。
+            let in_main_window = video_in_main_window_enabled();
+            if !in_main_window && self.native_video_presenter_hwnd().is_none() {
                 self.sync_native_video_main_cloak(true);
             } else {
                 self.sync_native_video_main_cloak(false);
@@ -17379,8 +17390,28 @@ impl eframe::App for App {
         {
             let native_main_backdrop = self.native_video_fullscreen_active_for_main_backdrop();
             if native_main_backdrop {
+                // in-window モード: main HWND をサブクラス化し、親の WM_SIZE を
+                // child presenter HWND の同期リサイズへ繋ぐ (一度だけ install)。
+                if video_in_main_window_enabled() && !self.in_window_resize_subclass_installed {
+                    if let Some(main_hwnd) = self.main_hwnd {
+                        if crate::video::native_window::install_in_window_resize_subclass(
+                            main_hwnd as u64,
+                        ) {
+                            self.in_window_resize_subclass_installed = true;
+                            crate::logger::log(
+                                "[native-video] in-window resize subclass installed".to_string(),
+                            );
+                        }
+                    }
+                }
                 self.sync_native_video_main_chrome(true);
-                self.sync_native_video_main_cloak(self.native_video_presenter_hwnd().is_none());
+                // in-window モードでは presenter は main HWND の子なので main を
+                // cloak しない。cloak すると親ごと DWM 合成から外れ、起動直後に
+                // main が一瞬消えて背後のアプリが見えてしまう。fullscreen のみ、
+                // presenter HWND が valid になるまで cloak してちらつきを隠す。
+                let cloak =
+                    !video_in_main_window_enabled() && self.native_video_presenter_hwnd().is_none();
+                self.sync_native_video_main_cloak(cloak);
                 // native 動画フルスクリーン中も Ctrl+↑↓ DFS の結果回収は必要。
                 // 早期 return すると line 15336 の poll_folder_nav に到達せず、
                 // start_folder_nav で立てた fs_nav_lock が永続化して以降の
@@ -19732,6 +19763,17 @@ fn video_resume_for_open(
     }
 }
 
+/// Phase 0 spike gate: `MIV_VIDEO_IN_MAIN_WINDOW` が設定されていれば true。
+/// 動画を従来のモニタ全面 fullscreen ではなく、main window のクライアント
+/// 領域に重ねた子ウィンドウ (`WS_CHILD`) で再生する (in-window モード)。
+/// 起動時に 1 度だけ評価してキャッシュする。
+#[cfg(windows)]
+pub(crate) fn video_in_main_window_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("MIV_VIDEO_IN_MAIN_WINDOW").is_some())
+}
+
 #[cfg(windows)]
 fn native_video_presenter_config(
     main_hwnd: Option<isize>,
@@ -19744,34 +19786,52 @@ fn native_video_presenter_config(
     >,
     main_hwnd_for_raise: u64,
 ) -> Option<crate::video::NativeVideoOutputConfig> {
-    use windows::Win32::Foundation::HWND;
+    use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::Graphics::Gdi::{
         GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
     };
+    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
     let hwnd = HWND(main_hwnd.unwrap_or_default() as *mut _);
-    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-    let mut info = MONITORINFO {
-        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-        ..Default::default()
+    // Phase 0 spike: `MIV_VIDEO_IN_MAIN_WINDOW` が立っていると、presenter を
+    // モニタ全面 borderless ではなく main HWND の子 (`WS_CHILD`) として
+    // クライアント領域に重ねる (in-window 再生)。
+    let in_main_window = video_in_main_window_enabled();
+    let rect = if in_main_window {
+        // 子ウィンドウの rect は親クライアント座標。client 全面を覆う。
+        let mut client = RECT::default();
+        if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
+            crate::logger::log(
+                "[native-video] in-main-window: GetClientRect failed; native presenter cannot start",
+            );
+            return None;
+        }
+        client
+    } else {
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            // None を返すと、呼び出し元 (`start_fs_load`) が `player.fail_native_init()`
+            // で error を立てて UI に「読込失敗」を表示させる。
+            // (fast-swap 経路は意図的に None を渡すため、ここの None と区別するために
+            // 「呼び出し元が config を期待していたか」を呼び出し元側で判断している)
+            crate::logger::log(
+                "[native-video] GetMonitorInfoW failed; native presenter cannot start, video will fail to open",
+            );
+            return None;
+        }
+        info.rcMonitor
     };
-    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
-        // None を返すと、呼び出し元 (`start_fs_load`) が `player.fail_native_init()`
-        // で error を立てて UI に「読込失敗」を表示させる。
-        // (fast-swap 経路は意図的に None を渡すため、ここの None と区別するために
-        // 「呼び出し元が config を期待していたか」を呼び出し元側で判断している)
-        crate::logger::log(
-            "[native-video] GetMonitorInfoW failed; native presenter cannot start, video will fail to open",
-        );
-        return None;
-    }
     let sync_interval = std::env::var("MIV_NATIVE_VIDEO_SYNC_INTERVAL")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(1)
         .min(4);
     Some(crate::video::NativeVideoOutputConfig {
-        rect: info.rcMonitor,
+        rect,
         owner_hwnd: main_hwnd.unwrap_or_default() as u64,
         sync_interval,
         perf_overlay_visible,
@@ -19780,9 +19840,11 @@ fn native_video_presenter_config(
         checked,
         editor_hwnds_snapshot,
         main_hwnd_for_raise,
-        // CP7: HUD overlay HWND を default で有効化。`MIV_HUD_OVERLAY=0` で off にできる
-        // (= run_native_video_output 側で env var もチェック)。
-        hud_overlay_enabled: true,
+        // in-main-window では topmost な HUD overlay HWND を使わず、presenter の
+        // DComp tree に egui overlay を載せる従来フォールバック経路を使う。
+        // fullscreen では従来どおり HUD HWND を有効化 (`MIV_HUD_OVERLAY=0` で off)。
+        hud_overlay_enabled: !in_main_window,
+        in_main_window,
     })
 }
 

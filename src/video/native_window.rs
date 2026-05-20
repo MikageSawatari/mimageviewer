@@ -16,19 +16,21 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
     TrackMouseEvent, VK_CONTROL, VK_MENU, VK_SHIFT,
 };
+use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
-    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWLP_USERDATA, GetClientRect,
-    GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId,
-    HTCLIENT, HWND_TOP, IDC_ARROW, IsWindow, IsWindowVisible, LoadCursorW, MA_ACTIVATE,
-    MA_ACTIVATEANDEAT, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage, RegisterClassW, SW_SHOW,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW, SetForegroundWindow,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS,
-    WM_APPCOMMAND, WM_CHAR, WM_CLOSE, WM_DESTROY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
-    WM_IME_SETCONTEXT, WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN,
-    WM_RBUTTONUP, WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_STYLE, GWLP_USERDATA,
+    GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
+    GetWindowThreadProcessId, HTCLIENT, HWND_TOP, IDC_ARROW, IsWindow, IsWindowVisible,
+    LoadCursorW, MA_ACTIVATE, MA_ACTIVATEANDEAT, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage,
+    RegisterClassW, SW_SHOW, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOWPOS, WM_APPCOMMAND, WM_CHAR, WM_CLOSE,
+    WM_DESTROY, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION, WM_IME_SETCONTEXT,
+    WM_IME_STARTCOMPOSITION, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP,
+    WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEACTIVATE, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SIZE,
+    WM_WINDOWPOSCHANGED, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_CHILD,
     WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_EX_NOREDIRECTIONBITMAP, WS_OVERLAPPEDWINDOW, WS_POPUP,
     WS_VISIBLE,
 };
@@ -122,8 +124,19 @@ pub struct NativeVideoMouseWheelEvent {
 
 #[derive(Clone, Copy, Debug)]
 pub enum NativeVideoWindowMode {
-    Windowed { width: u32, height: u32 },
-    Borderless { rect: RECT },
+    Windowed {
+        width: u32,
+        height: u32,
+    },
+    Borderless {
+        rect: RECT,
+    },
+    /// メインウィンドウのクライアント領域に重ねる子ウィンドウ (`WS_CHILD`)。
+    /// `rect` は親 (= `NativeVideoWindowConfig.owner_hwnd`) のクライアント座標。
+    /// in-window 動画再生 (Phase 0) で使う。
+    Child {
+        rect: RECT,
+    },
 }
 
 pub struct NativeVideoWindowConfig {
@@ -196,9 +209,84 @@ fn register_native_video_window_class() -> Result<(), String> {
         .clone()
 }
 
+/// in-window モードの presenter child HWND。main window のサブクラスプロシージャが
+/// 親リサイズ時にこの HWND を同期リサイズする。presenter thread が child publish 時に
+/// 登録し、presenter thread 終了時に 0 へクリアする。
+static IN_WINDOW_VIDEO_CHILD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// presenter thread から in-window child HWND を登録 / 解除する (`0` で解除)。
+pub fn set_in_window_video_child(hwnd: u64) {
+    IN_WINDOW_VIDEO_CHILD.store(hwnd, std::sync::atomic::Ordering::SeqCst);
+}
+
+const IN_WINDOW_RESIZE_SUBCLASS_ID: usize = 0x6D69_7631; // "miv1"
+
+/// main window をサブクラス化し、`WM_SIZE` のたびに in-window presenter child を
+/// 親クライアント領域へリサイズする。最大化 / 復元 / リサイズドラッグのすべてで
+/// child が親に追従する (presenter thread の polling と違い、親の `WM_SIZE` を
+/// 直接フックするので取りこぼし・遅延がない)。同じ `(proc, id)` の再登録は
+/// `SetWindowSubclass` 側で冪等。
+pub fn install_in_window_resize_subclass(main_hwnd: u64) -> bool {
+    if main_hwnd == 0 {
+        return false;
+    }
+    unsafe {
+        SetWindowSubclass(
+            HWND(main_hwnd as *mut _),
+            Some(in_window_resize_subclass_proc),
+            IN_WINDOW_RESIZE_SUBCLASS_ID,
+            0,
+        )
+        .as_bool()
+    }
+}
+
+/// main window サブクラスプロシージャ。`WM_SIZE` を受けたら登録済みの in-window
+/// child を親クライアント領域へリサイズする。`SWP_ASYNCWINDOWPOS` で UI スレッドを
+/// ブロックせずに presenter スレッドへ要求を post する。それ以外のメッセージは素通し。
+unsafe extern "system" fn in_window_resize_subclass_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _id: usize,
+    _ref_data: usize,
+) -> LRESULT {
+    if msg == WM_SIZE {
+        let child = IN_WINDOW_VIDEO_CHILD.load(std::sync::atomic::Ordering::SeqCst);
+        if child != 0 {
+            let child_hwnd = HWND(child as *mut _);
+            unsafe {
+                if IsWindow(Some(child_hwnd)).as_bool() {
+                    let mut rc = RECT::default();
+                    if GetClientRect(hwnd, &mut rc).is_ok() {
+                        let w = (rc.right - rc.left).max(1);
+                        let h = (rc.bottom - rc.top).max(1);
+                        let _ = SetWindowPos(
+                            child_hwnd,
+                            None,
+                            0,
+                            0,
+                            w,
+                            h,
+                            SWP_NOACTIVATE | SWP_NOZORDER | SWP_ASYNCWINDOWPOS,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
+}
+
 impl NativeVideoWindow {
     pub fn create(config: NativeVideoWindowConfig) -> Result<Self, String> {
         register_native_video_window_class()?;
+        if matches!(config.mode, NativeVideoWindowMode::Child { .. }) && config.owner_hwnd == 0 {
+            return Err(
+                "Child native video window requires a parent HWND, but owner_hwnd is 0".to_string(),
+            );
+        }
         unsafe {
             let hmodule = GetModuleHandleW(None).map_err(|e| format!("GetModuleHandleW: {e:?}"))?;
             let hinstance = HINSTANCE(hmodule.0);
@@ -242,6 +330,26 @@ impl NativeVideoWindow {
                         rect.right - rect.left,
                         rect.bottom - rect.top,
                         true,
+                    )
+                }
+                NativeVideoWindowMode::Child { rect } => {
+                    // in-window 再生: presenter HWND を main HWND の子にする。
+                    // 親クライアント座標で配置し、親に自動クリップ・自動移動させる。
+                    let mut style = WS_CHILD | WS_CLIPSIBLINGS | WS_CLIPCHILDREN;
+                    if config.initially_visible {
+                        style |= WS_VISIBLE;
+                    }
+                    // 子には WS_EX_NOREDIRECTIONBITMAP を付けない (Chromium の child
+                    // compositor window と同じ。DComp target は子 HWND でも作れる)。
+                    let ex_style = WINDOW_EX_STYLE::default();
+                    (
+                        ex_style,
+                        style,
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                        false,
                     )
                 }
             };
@@ -553,7 +661,13 @@ unsafe extern "system" fn wnd_proc(
             let hit_test = (lparam.0 & 0xFFFF) as u32;
             let trigger_msg = ((lparam.0 >> 16) & 0xFFFF) as u32;
             let is_left = trigger_msg == WM_LBUTTONDOWN || trigger_msg == WM_LBUTTONDBLCLK;
-            if hit_test == HTCLIENT as u32 && is_left {
+            // in-window モードの child window では MA_ACTIVATEANDEAT を使わない。
+            // child + 別スレッド parent の構成だと WM_MOUSEACTIVATE が毎クリック
+            // 飛んでくるため、ANDEAT だと左クリックが恒久的に食われる (右クリックは
+            // MA_ACTIVATE なので通る)。child は常に main window 内にいるので
+            // 「フォーカス復帰クリックを 1 回食う」挙動が不要。常に MA_ACTIVATE で通す。
+            let is_child = unsafe { (GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_CHILD.0) != 0 };
+            if !is_child && hit_test == HTCLIENT as u32 && is_left {
                 LRESULT(MA_ACTIVATEANDEAT as isize)
             } else {
                 LRESULT(MA_ACTIVATE as isize)
