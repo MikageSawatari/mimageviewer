@@ -7,13 +7,19 @@
 # 使い方:
 #   bash scripts/perf_smoke.sh
 #
-# このスクリプトは mImageViewer をフォアグラウンドで起動するだけ。実際のシナリオ操作
-# (Ctrl+↓ 連打 / Ctrl+G で検索 / Ctrl+W で閉じる) はユーザーが手動で行う。終了後に
+# このスクリプトは mImageViewer (core) をフォアグラウンドで起動するだけ。実際のシナリオ
+# 操作 (Ctrl+↓ 連打 / Ctrl+G で検索 / 完全終了) はユーザーが手動で行う。終了後に
 # %APPDATA%\mimageviewer\logs\perf_events.jsonl を analyze_perf.py に流して結果を出す。
+#
+# 配布用 mimageviewer.exe はランチャーで、core を spawn した直後に自身は終了するため
+# フォアグラウンド待機に使えない。よってここでは mimageviewer-core.exe を直接起動する。
+# core は FFmpeg を import library リンクしているので、起動前に vendor/ffmpeg/bin の
+# DLL を target/release へコピーする (CLAUDE.md「開発時に core を直接起動したいとき」参照)。
 
 set -euo pipefail
 
-EXE="target/release/mimageviewer.exe"
+RELEASE_DIR="target/release"
+EXE="$RELEASE_DIR/mimageviewer-core.exe"
 LOG_DIR_WIN="${APPDATA:-$USERPROFILE/AppData/Roaming}/mimageviewer/logs"
 PERF_LOG="$LOG_DIR_WIN/perf_events.jsonl"
 THRESHOLD_MS=${PERF_HITCH_MS:-16}
@@ -23,13 +29,23 @@ if [[ ! -x "$EXE" ]]; then
     exit 2
 fi
 
+# core は FFmpeg DLL を import library リンクしているため、Windows ローダが exe ロード時に
+# 解決できるよう vendor/ffmpeg/bin の DLL を exe と同じディレクトリへ置く。
+FFMPEG_BIN="vendor/ffmpeg/bin"
+if ! ls "$FFMPEG_BIN"/*.dll >/dev/null 2>&1; then
+    echo "ERROR: $FFMPEG_BIN に FFmpeg DLL がありません。bash scripts/setup-ffmpeg.sh を実行してください。" >&2
+    exit 2
+fi
+cp "$FFMPEG_BIN"/*.dll "$RELEASE_DIR"/
+echo "(FFmpeg DLL を $RELEASE_DIR へコピーしました)"
+
 echo "=== perf smoke ==="
-echo "1. mImageViewer を --perf-log 付きで起動します。"
+echo "1. mImageViewer (core) を --perf-log 付きで起動します。"
 echo "2. 以下のシナリオを **手動で** こなしてください:"
 echo "   a) 任意のフォルダを開く (Ctrl+Shift+O 等)"
 echo "   b) Ctrl+↓ を 5 回押下 (フォルダ間移動)"
 echo "   c) Ctrl+G で検索バーを開き、何か入力 → Enter"
-echo "   d) ウィンドウを閉じる ([×] で OK、トレイ常駐になっても問題なし)"
+echo "   d) アプリを完全に終了する (トレイ常駐 ON ならトレイアイコン → 終了)"
 echo "3. プロセス終了後、perf_events.jsonl を解析します。"
 echo
 echo "perf-log: $PERF_LOG"
