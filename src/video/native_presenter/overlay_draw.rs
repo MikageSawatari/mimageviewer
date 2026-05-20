@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::ui_helpers::HoverTipExt;
+
 use super::{
     NativeBookmarkTitleEdit, NativeFrameStepHold, NativeOverlayCommand, NativeOverlayJumpEntry,
     NativeOverlayMetadata, NativeOverlayNavigationPreview, NativeOverlayPerfSample,
@@ -425,7 +427,7 @@ pub(super) fn draw_native_jump_panel(
                 7.0,
                 egui::Color32::from_rgb(140, 245, 170),
             );
-            let pin_resp = pin_resp.on_hover_text("現在位置をピン留め");
+            let pin_resp = pin_resp.hover_tip_dark("現在位置をピン留め");
             if pin_resp.clicked() {
                 commands.push(NativeOverlayCommand::SetPinAt {
                     target_secs: position_secs,
@@ -448,7 +450,7 @@ pub(super) fn draw_native_jump_panel(
                 7.0,
                 egui::Color32::from_rgb(255, 220, 82),
             );
-            let bm_resp = bm_resp.on_hover_text("現在位置をブックマーク [B]");
+            let bm_resp = bm_resp.hover_tip_dark("現在位置をブックマーク [B]");
             if bm_resp.clicked() {
                 commands.push(NativeOverlayCommand::AddBookmarkAt {
                     target_secs: position_secs,
@@ -630,7 +632,7 @@ pub(super) fn draw_native_jump_row(
                     egui::Color32::from_rgb(225, 210, 150)
                 },
             );
-            let edit_resp = edit_resp.on_hover_text("ブックマーク名を編集");
+            let edit_resp = edit_resp.hover_tip_dark("ブックマーク名を編集");
             if edit_resp.clicked() {
                 edit_clicked = true;
                 *bookmark_title_edit = Some(NativeBookmarkTitleEdit {
@@ -657,7 +659,7 @@ pub(super) fn draw_native_jump_row(
                 egui::FontId::monospace(12.0),
                 egui::Color32::from_rgb(240, 190, 190),
             );
-            let delete_resp = delete_resp.on_hover_text("ブックマークを削除");
+            let delete_resp = delete_resp.hover_tip_dark("ブックマークを削除");
             if delete_resp.clicked() {
                 delete_clicked = true;
                 commands.push(NativeOverlayCommand::DeleteBookmark { id });
@@ -680,7 +682,7 @@ pub(super) fn draw_native_jump_row(
                 egui::FontId::monospace(12.0),
                 egui::Color32::from_rgb(240, 190, 190),
             );
-            let delete_resp = delete_resp.on_hover_text("ピン留めを解除");
+            let delete_resp = delete_resp.hover_tip_dark("ピン留めを解除");
             if delete_resp.clicked() {
                 delete_clicked = true;
                 commands.push(NativeOverlayCommand::DeletePin);
@@ -806,7 +808,7 @@ pub(super) fn draw_native_top_button(
         NativeTopButtonGlyph::Vst3 => draw_overlay_vst3_top_icon(painter, rect),
         NativeTopButtonGlyph::Close => draw_overlay_close_icon(painter, rect),
     }
-    let resp = resp.on_hover_text(tooltip);
+    let resp = resp.hover_tip_dark(tooltip);
     if resp.clicked() {
         commands.push(command);
     }
@@ -826,7 +828,7 @@ pub(super) fn draw_native_frame_step_button(
     let resp = ui.interact(rect, egui::Id::new(id), egui::Sense::click());
     draw_overlay_button_bg(painter, rect, resp.hovered(), false);
     draw_overlay_frame_step_icon(painter, rect, direction);
-    let resp = resp.on_hover_text(tooltip);
+    let resp = resp.hover_tip_dark(tooltip);
     let primary_down = ui.ctx().input(|i| i.pointer.primary_down());
     let held_from_this_button = hold
         .as_ref()
@@ -1227,14 +1229,14 @@ pub(super) fn draw_native_center_pause_controls(
                     egui::Id::new("native_center_replay"),
                     egui::Sense::click(),
                 )
-                .on_hover_text("最初から再生 [W]");
+                .hover_tip_dark("最初から再生 [W]");
             let play_resp = ui
                 .interact(
                     play_rect,
                     egui::Id::new("native_center_play"),
                     egui::Sense::click(),
                 )
-                .on_hover_text("続きから再生 [Enter]");
+                .hover_tip_dark("続きから再生 [Enter]");
 
             for (rect, hovered) in [
                 (replay_rect, replay_resp.hovered()),
@@ -1576,7 +1578,7 @@ pub(super) fn draw_native_normalize_progress(
                 egui::FontId::proportional(20.0),
                 cancel_color,
             );
-            let cancel_resp = cancel_resp.on_hover_text("キャンセル [ESC]");
+            let cancel_resp = cancel_resp.hover_tip_dark("キャンセル [ESC]");
             if cancel_resp.clicked() || ui.ctx().input(|i| i.key_pressed(egui::Key::Escape)) {
                 commands.push(NativeOverlayCommand::CancelNormalizeScan);
             }
@@ -2029,14 +2031,14 @@ pub(super) fn draw_native_vst3_panel(
                     ui.label(egui::RichText::new("動画").small());
                     let full_resp = ui.selectable_label(!panel.video_compact, "フル");
                     if full_resp
-                        .on_hover_text("動画をフルスクリーン全体に表示します")
+                        .hover_tip_dark("動画をフルスクリーン全体に表示します")
                         .clicked()
                     {
                         commands.push(NativeOverlayCommand::SetVst3VideoCompact { compact: false });
                     }
                     let compact_resp = ui.selectable_label(panel.video_compact, "右上 1/4");
                     if compact_resp
-                        .on_hover_text("動画を右上 1/4 に縮小し、プラグイン GUI の領域を空けます")
+                        .hover_tip_dark("動画を右上 1/4 に縮小し、プラグイン GUI の領域を空けます")
                         .clicked()
                     {
                         commands.push(NativeOverlayCommand::SetVst3VideoCompact { compact: true });
@@ -2082,7 +2084,7 @@ pub(super) fn draw_native_vst3_panel(
                                 chain.name.is_some(),
                                 egui::Button::new(chain.key_label.clone()).small(),
                             )
-                            .on_hover_text(native_vst3_chain_slot_tooltip(chain));
+                            .hover_tip_dark(native_vst3_chain_slot_tooltip(chain));
                         if response.clicked() {
                             commands.push(NativeOverlayCommand::Vst3LoadChainSlot {
                                 slot_idx: chain.idx,
@@ -2095,7 +2097,7 @@ pub(super) fn draw_native_vst3_panel(
                     for chain in &panel.chain_slots {
                         let response = ui
                             .add(egui::Button::new(chain.key_label.clone()).small())
-                            .on_hover_text(native_vst3_chain_slot_tooltip(chain));
+                            .hover_tip_dark(native_vst3_chain_slot_tooltip(chain));
                         if response.clicked() {
                             commands.push(NativeOverlayCommand::Vst3SaveChainSlot {
                                 slot_idx: chain.idx,
@@ -2153,7 +2155,7 @@ pub(super) fn draw_native_vst3_slot_row(
             !slot.placeholder,
             egui::Checkbox::new(&mut enabled, truncate_overlay_text(&label, 42)),
         );
-        if checkbox.on_hover_text("ON/OFF を切り替えます").changed() {
+        if checkbox.hover_tip_dark("ON/OFF を切り替えます").changed() {
             commands.push(NativeOverlayCommand::Vst3SetBypass {
                 idx: slot.idx,
                 path: slot.path.clone(),
@@ -2208,7 +2210,7 @@ pub(super) fn draw_native_vst3_slot_row(
                 !slot.placeholder,
             );
             if response
-                .on_hover_text(if slot.gui_visible {
+                .hover_tip_dark(if slot.gui_visible {
                     "プラグイン GUI を閉じる"
                 } else {
                     "プラグイン GUI を表示"

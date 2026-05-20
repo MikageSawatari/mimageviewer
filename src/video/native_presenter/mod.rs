@@ -44,6 +44,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::Interface;
 use windows_numerics::Matrix3x2;
 
+use crate::ui_helpers::HoverTipExt;
 use crate::video::decoder::{VideoFrame, VideoFrameData};
 
 mod overlay_draw;
@@ -5170,7 +5171,7 @@ impl NativeEguiOverlay {
                         draw_overlay_button_bg(painter, replay_rect, replay_resp.hovered(), false);
                         draw_overlay_replay_icon(painter, replay_rect.center(), btn_size * 0.36);
                         let replay_resp =
-                            replay_resp.on_hover_text("最初から再生 (頭出し + 即再生) [W]");
+                            replay_resp.hover_tip_dark("最初から再生 (頭出し + 即再生) [W]");
                         if replay_resp.clicked() {
                             commands.push(NativeOverlayCommand::SeekToStartAndPlay);
                         }
@@ -5191,7 +5192,7 @@ impl NativeEguiOverlay {
                         } else {
                             draw_overlay_play_icon(painter, play_rect.center(), btn_size * 0.38);
                         }
-                        let play_resp = play_resp.on_hover_text(if is_playing {
+                        let play_resp = play_resp.hover_tip_dark(if is_playing {
                             "一時停止 [Enter]"
                         } else {
                             "再生 [Enter]"
@@ -5288,7 +5289,7 @@ impl NativeEguiOverlay {
                                 VideoLoopMode::Bookmark => "ループ: ブックマーク [L]",
                             }
                         };
-                        let loop_resp = loop_resp.on_hover_text(hover_text);
+                        let loop_resp = loop_resp.hover_tip_dark(hover_text);
                         if loop_resp.clicked() && !continuous_active {
                             commands.push(NativeOverlayCommand::ToggleLoop);
                         }
@@ -5318,7 +5319,7 @@ impl NativeEguiOverlay {
                                 "連続再生: 末尾で先頭へ"
                             }
                         };
-                        let continuous_resp = continuous_resp.on_hover_text(continuous_hover);
+                        let continuous_resp = continuous_resp.hover_tip_dark(continuous_hover);
                         if continuous_resp.clicked() {
                             commands.push(NativeOverlayCommand::ToggleContinuous);
                         }
@@ -5356,7 +5357,7 @@ impl NativeEguiOverlay {
                             false,
                         );
                         draw_overlay_camera_icon(painter, screenshot_rect);
-                        let screenshot_resp = screenshot_resp.on_hover_text(
+                        let screenshot_resp = screenshot_resp.hover_tip_dark(
                             "クリック: クリップボードにコピー\nCtrl+S: ファイル保存",
                         );
                         if screenshot_resp.clicked() {
@@ -5673,7 +5674,7 @@ impl NativeEguiOverlay {
                                         egui::Color32::from_rgb(118, 214, 255)
                                     },
                                 );
-                                let pin_resp = pin_resp.on_hover_text(if hover_preview_pinned {
+                                let pin_resp = pin_resp.hover_tip_dark(if hover_preview_pinned {
                                     "この位置でピン留めを上書き"
                                 } else {
                                     "この位置をピン留め"
@@ -5705,7 +5706,7 @@ impl NativeEguiOverlay {
                                     },
                                 );
                                 let bookmark_resp =
-                                    bookmark_resp.on_hover_text(if hover_preview_bookmarked {
+                                    bookmark_resp.hover_tip_dark(if hover_preview_bookmarked {
                                         "ブックマーク済み [B]"
                                     } else {
                                         "ブックマークを追加 [B]"
@@ -5748,7 +5749,7 @@ impl NativeEguiOverlay {
                         }
                         if !video_speed_popup_open {
                             speed_resp = speed_resp
-                                .on_hover_text("再生速度 (右クリック / ダブルクリックで x1)");
+                                .hover_tip_dark("再生速度 (右クリック / ダブルクリックで x1)");
                         }
                         if video_speed_popup_open {
                             use crate::video::clock::{
@@ -5860,7 +5861,7 @@ impl NativeEguiOverlay {
                             btn_size * 0.46,
                             muted,
                         );
-                        let mute_resp = mute_resp.on_hover_text(if muted {
+                        let mute_resp = mute_resp.hover_tip_dark(if muted {
                             "ミュート解除 [M]"
                         } else {
                             "ミュート [M]"
@@ -5923,7 +5924,7 @@ impl NativeEguiOverlay {
                             egui::FontId::proportional(11.0),
                             norm_color,
                         );
-                        let norm_resp = norm_resp.on_hover_text(norm_hover_label);
+                        let norm_resp = norm_resp.hover_tip_dark(norm_hover_label);
                         if !is_scanning {
                             if norm_resp.clicked() {
                                 commands.push(NativeOverlayCommand::ToggleNormalize);
@@ -6002,7 +6003,7 @@ impl NativeEguiOverlay {
                         if vol_resp.hovered() {
                             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal);
                         }
-                        let vol_resp = vol_resp.on_hover_text(
+                        let vol_resp = vol_resp.hover_tip_dark(
                             "音量 (右クリック / ダブルクリックで 0dB) [Shift+↑ / Shift+↓]",
                         );
                         if vol_resp.secondary_clicked() || vol_resp.double_clicked() {
@@ -6062,7 +6063,7 @@ impl NativeEguiOverlay {
                                 if limiter_resp.hovered() { 4.5 } else { 4.0 },
                                 egui::Color32::from_rgb(255, 72, 72),
                             );
-                            limiter_resp.on_hover_text("出力リミッターが作動しました");
+                            limiter_resp.hover_tip_dark("出力リミッターが作動しました");
                         }
 
                         if cfg!(debug_assertions) {
