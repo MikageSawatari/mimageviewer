@@ -3497,7 +3497,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "base64",
  "cpal",
@@ -3549,7 +3549,7 @@ dependencies = [
 
 [[package]]
 name = "mimageviewer-launcher"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "sha2",
  "windows 0.61.3",
