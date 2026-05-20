@@ -6191,11 +6191,11 @@ impl App {
         let (title, body_lines): (&str, Vec<&str>) = match hint {
             FsBoundaryHint::Edge { at_end: true, .. } => (
                 "最後の項目です",
-                vec!["[Home] 最初に戻る", "[Ctrl]+[↓] 次のフォルダへ"],
+                vec!["[Home] 最初に戻る", "[Ctrl]+[↓] ツリー順で次へ"],
             ),
             FsBoundaryHint::Edge { at_end: false, .. } => (
                 "最初の項目です",
-                vec!["[End] 最後に移動", "[Ctrl]+[↑] 前のフォルダへ"],
+                vec!["[End] 最後に移動", "[Ctrl]+[↑] ツリー順で前へ"],
             ),
             FsBoundaryHint::NoImageFolder { forward: true, .. } => (
                 "次のフォルダに画像・動画が見つかりません",

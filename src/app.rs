@@ -9,6 +9,25 @@ use std::sync::{
 mod native_video;
 pub(crate) mod normalize;
 
+const MAX_FOLDER_NAV_STACK: usize = 100;
+const MAX_RECENT_FOLDERS: usize = 20;
+
+#[derive(Clone)]
+pub(crate) struct FolderNavHistorySnapshot {
+    back_stack: Vec<PathBuf>,
+    forward_stack: Vec<PathBuf>,
+    recent_folders: Vec<PathBuf>,
+    suppress_record_once: bool,
+    favsearch_nav_stack: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FolderOpenOutcome {
+    Loaded,
+    ConversionDialogOpened,
+    Ignored,
+}
+
 /// Condvar 付きキュー: ワーカーはキューが空のとき sleep ポーリングではなく wait() で待機し、
 /// push 側が notify_one() で起こす。
 pub(crate) type NotifyQueue = (Mutex<Vec<LoadRequest>>, Condvar);
@@ -1809,6 +1828,8 @@ pub struct App {
 
     // ── お気に入り編集ポップアップ ────────────────────────────────
     pub(crate) show_favorites_editor: bool,
+    /// お気に入り編集ダイアログ内で削除確認中の favorite id。
+    pub(crate) favorite_delete_confirm: Option<uuid::Uuid>,
     /// インデックスサイズ表示用のキャッシュ。ダイアログ open 時に計算し、
     /// close で None に戻す。毎フレーム `std::fs::metadata` + `read_dir` を
     /// 叩かないようにするため。
@@ -2059,6 +2080,16 @@ pub struct App {
     // ── アドレスバーフォーカス管理 ───────────────────────────────
     /// true のときアドレスバーが入力中 → キーショートカットを無効化
     pub(crate) address_has_focus: bool,
+
+    // ── フォルダ移動履歴（戻る/進む + 履歴メニュー）───────────────
+    /// フォルダ移動履歴の戻るスタック。末尾が次に戻る先。
+    pub(crate) folder_nav_back_stack: Vec<PathBuf>,
+    /// フォルダ移動履歴の進むスタック。末尾が次に進む先。
+    pub(crate) folder_nav_forward_stack: Vec<PathBuf>,
+    /// 履歴メニュー用の最近開いたフォルダ。先頭が最新。
+    pub(crate) recent_folders: Vec<PathBuf>,
+    /// 履歴戻る/進むで発生する次回 load_folder は通常履歴に積まない。
+    pub(crate) suppress_folder_nav_record_once: bool,
 
     // ── フォルダ履歴（スクロール位置・選択状態の復元用）────────────
     /// フォルダパス → (scroll_offset_y, selected_idx)
@@ -3147,6 +3178,7 @@ impl App {
             items_generation: 0,
             items_are_global_search_view: false,
             show_favorites_editor: false,
+            favorite_delete_confirm: None,
             favorites_index_size_cache: None,
             favorites_index_count_cache: None,
             favorites_index_refresh_rx: None,
@@ -3242,6 +3274,10 @@ impl App {
             metadata_show_raw_workflow: false,
             exif_sections_open: std::collections::HashMap::new(),
             address_has_focus: false,
+            folder_nav_back_stack: Vec::new(),
+            folder_nav_forward_stack: Vec::new(),
+            recent_folders: Vec::new(),
+            suppress_folder_nav_record_once: false,
             folder_history: std::collections::HashMap::new(),
             show_search_bar: false,
             search_query: String::new(),
@@ -3905,6 +3941,139 @@ impl App {
             .or_else(|| self.current_folder.clone())
     }
 
+    fn push_folder_nav_stack(stack: &mut Vec<PathBuf>, path: PathBuf) {
+        if stack
+            .last()
+            .is_some_and(|last| crate::folder_tree::path_eq(last, &path))
+        {
+            return;
+        }
+        stack.push(path);
+        if stack.len() > MAX_FOLDER_NAV_STACK {
+            stack.remove(0);
+        }
+    }
+
+    pub(crate) fn remember_recent_folder(&mut self, path: &Path) {
+        self.recent_folders
+            .retain(|p| !crate::folder_tree::path_eq(p, path));
+        self.recent_folders.insert(0, path.to_path_buf());
+        self.recent_folders.truncate(MAX_RECENT_FOLDERS);
+    }
+
+    /// `load_folder*` 入口で呼ぶ。現在地から `target` への遷移を履歴に記録する。
+    ///
+    /// ここで扱う履歴はスクロール復元用の `folder_history` とは別物で、
+    /// ユーザーがフォルダバーの ←/→ や履歴メニューで辿るためのもの。
+    fn record_folder_nav_transition(&mut self, target: &Path) {
+        if self
+            .current_folder
+            .as_ref()
+            .is_some_and(|current| crate::folder_tree::path_eq(current, target))
+        {
+            self.suppress_folder_nav_record_once = false;
+            return;
+        }
+
+        self.remember_recent_folder(target);
+
+        if std::mem::take(&mut self.suppress_folder_nav_record_once) {
+            return;
+        }
+
+        let Some(current) = self.effective_folder() else {
+            return;
+        };
+        if crate::folder_tree::path_eq(&current, target) {
+            return;
+        }
+
+        Self::push_folder_nav_stack(&mut self.folder_nav_back_stack, current);
+        self.folder_nav_forward_stack.clear();
+    }
+
+    pub(crate) fn folder_nav_history_snapshot(&self) -> FolderNavHistorySnapshot {
+        FolderNavHistorySnapshot {
+            back_stack: self.folder_nav_back_stack.clone(),
+            forward_stack: self.folder_nav_forward_stack.clone(),
+            recent_folders: self.recent_folders.clone(),
+            suppress_record_once: self.suppress_folder_nav_record_once,
+            favsearch_nav_stack: self.favsearch.nav_stack.clone(),
+        }
+    }
+
+    pub(crate) fn restore_folder_nav_history(&mut self, snapshot: FolderNavHistorySnapshot) {
+        self.folder_nav_back_stack = snapshot.back_stack;
+        self.folder_nav_forward_stack = snapshot.forward_stack;
+        self.recent_folders = snapshot.recent_folders;
+        self.suppress_folder_nav_record_once = snapshot.suppress_record_once;
+        self.favsearch.nav_stack = snapshot.favsearch_nav_stack;
+    }
+
+    pub(crate) fn attach_archive_convert_nav_history_rollback(
+        &mut self,
+        snapshot: FolderNavHistorySnapshot,
+    ) {
+        if let Some(state) = self.archive_convert.as_mut() {
+            state.nav_history_rollback = Some(snapshot);
+        }
+    }
+
+    pub(crate) fn clear_archive_convert_nav_history_rollback(&mut self) {
+        if let Some(state) = self.archive_convert.as_mut() {
+            state.nav_history_rollback = None;
+        }
+    }
+
+    pub(crate) fn folder_history_back_target(&self) -> Option<&PathBuf> {
+        self.folder_nav_back_stack.last()
+    }
+
+    pub(crate) fn folder_history_forward_target(&self) -> Option<&PathBuf> {
+        self.folder_nav_forward_stack.last()
+    }
+
+    pub(crate) fn recent_folder_entries(&self) -> &[PathBuf] {
+        &self.recent_folders
+    }
+
+    pub(crate) fn navigate_folder_history_back(&mut self) -> Option<PathBuf> {
+        let target = self.folder_nav_back_stack.pop()?;
+        if let Some(current) = self.effective_folder()
+            && !crate::folder_tree::path_eq(&current, &target)
+        {
+            Self::push_folder_nav_stack(&mut self.folder_nav_forward_stack, current);
+        }
+        self.suppress_folder_nav_record_once = true;
+        Some(target)
+    }
+
+    /// お気に入り追加対象として扱える現在地。お気に入りは検索/索引のルートに
+    /// なるため、実ディレクトリだけを許可し、ZIP/PDF/変換キャッシュは対象外にする。
+    pub(crate) fn current_favorite_target(&self) -> Option<PathBuf> {
+        if self.archive_source_override.is_some()
+            || self.current_folder_last_mtime.is_none()
+            || self.pdf_enumerate_pending.is_some()
+            || self.zip_enumerate_pending.is_some()
+            || self.show_pdf_password_dialog
+            || self.pdf_password_pending_path.is_some()
+        {
+            return None;
+        }
+        self.current_folder.clone()
+    }
+
+    pub(crate) fn navigate_folder_history_forward(&mut self) -> Option<PathBuf> {
+        let target = self.folder_nav_forward_stack.pop()?;
+        if let Some(current) = self.effective_folder()
+            && !crate::folder_tree::path_eq(&current, &target)
+        {
+            Self::push_folder_nav_stack(&mut self.folder_nav_back_stack, current);
+        }
+        self.suppress_folder_nav_record_once = true;
+        Some(target)
+    }
+
     /// 現在のフォルダを再読み込みする。変換済みアーカイブ閲覧中 (キャッシュ ZIP を
     /// `current_folder` に、元 7z/LZH を `archive_source_override` に持っている状態)
     /// は再読み込み後も override/address を元 7z/LZH に戻し、UI コンテキストを維持する。
@@ -4022,6 +4191,38 @@ impl App {
         self.load_folder_with_scan(path, None);
     }
 
+    /// 通常のフォルダ / ZIP / PDF はそのまま開き、変換対応アーカイブ (7z/LZH)
+    /// は有効なキャッシュがあれば元パス表示を維持したまま開く。未変換なら既存の
+    /// 変換確認ダイアログを出す。
+    pub(crate) fn load_folder_or_convert_archive(&mut self, path: PathBuf) -> FolderOpenOutcome {
+        let format = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(crate::archive_converter::ArchiveFormat::from_extension);
+        if path.is_file()
+            && let Some(format) = format
+        {
+            if let Some(cached) = self.try_archive_cache_lookup(&path) {
+                if self
+                    .effective_folder()
+                    .is_some_and(|cur| crate::folder_tree::path_eq(&cur, &path))
+                {
+                    self.suppress_folder_nav_record_once = true;
+                }
+                self.open_archive_via_cache(path, cached);
+                return FolderOpenOutcome::Loaded;
+            } else {
+                return if self.request_archive_convert(path, format) {
+                    FolderOpenOutcome::ConversionDialogOpened
+                } else {
+                    FolderOpenOutcome::Ignored
+                };
+            }
+        }
+        self.load_folder(path);
+        FolderOpenOutcome::Loaded
+    }
+
     /// 事前スキャン済みディレクトリを受け取れる load_folder の本体。
     /// Ctrl+↑↓ の DFS スレッドが `scan_directory` を済ませている場合、
     /// `pre_scan=Some(...)` を渡すことで UI スレッドの read_dir (= 最大 179ms)
@@ -4052,6 +4253,15 @@ impl App {
                 ],
             );
         }
+        let folder_changes = self
+            .current_folder
+            .as_ref()
+            .map(|current| !crate::folder_tree::path_eq(current, &path))
+            .unwrap_or(true);
+        if folder_changes {
+            self.clear_archive_convert_nav_history_rollback();
+        }
+        self.record_folder_nav_transition(&path);
         // パスが .zip / .pdf ファイルなら仮想フォルダとして開く
         if path.is_file() {
             let ext = path
@@ -5461,6 +5671,8 @@ impl App {
         self.scroll_offset_y = 0.0;
         self.current_folder = Some(zip_path.clone());
         self.current_folder_rating_cache = None;
+        self.current_folder_last_mtime = None;
+        self.current_folder_signature = None;
         self.address = zip_path.to_string_lossy().to_string();
         self.update_global_search_address();
         // items_generation はここでは進めない。PDF と同じく、async enumerate 完了後に
@@ -6087,6 +6299,13 @@ impl App {
         video_items: Vec<(usize, PathBuf, u64)>,
         folder_signature: Option<u64>,
     ) {
+        let previous_folder = self.current_folder.clone();
+        let previous_archive_source_override = self.archive_source_override.clone();
+        let preserve_archive_source_override = previous_archive_source_override.is_some()
+            && previous_folder
+                .as_ref()
+                .is_some_and(|prev| crate::folder_tree::path_eq(prev, &source_path));
+
         // 通常フォルダ / ZIP / 検索結果など PDF 以外への遷移では、残存する PDF
         // enumerate pending を無効化する。放置すると遅れて届いた結果を
         // `poll_pdf_enumerate` が適用して現在表示を古い PDF 仮想フォルダに戻す。
@@ -6188,10 +6407,9 @@ impl App {
         self.reset_folder_rating_counts();
         // ★フィルタ suppression scope の判定: anchor の subtree 外に出たら復元する。
         // 判定は current_folder 反映直後に行うため、`effective_folder()` が最新値を返す。
-        // archive_source_override は呼び出し元で再設定されるまで None なので、
-        // 7z/LZH キャッシュ閲覧中の判定はここでは current_folder=cache_zip 基準になる。
-        // `archive_convert` 経由のケースでは後段で override が設定され、次回 load_folder
-        // 時にもう一度評価されるため最終的に一致する。
+        // 7z/LZH キャッシュ ZIP の async enumerate 完了時は、呼び出し元が設定した
+        // archive_source_override がまだ生きているため、ユーザー視点の元アーカイブ
+        // パスを基準に判定できる。
         self.maybe_restore_rating_filter_if_out_of_scope();
         // 外部更新の自動反映で使う mtime。ディレクトリ実体のみ (ZIP / PDF / 検索合成は
         // 仮想フォルダなのでファイル追加イベントの対象外)。metadata 失敗時は None のまま。
@@ -6208,13 +6426,19 @@ impl App {
             .is_some()
             .then_some(folder_signature)
             .flatten();
-        self.address = source_path.to_string_lossy().to_string();
+        if preserve_archive_source_override {
+            if let Some(src) = previous_archive_source_override {
+                self.address = src.to_string_lossy().to_string();
+                self.archive_source_override = Some(src);
+            }
+        } else {
+            self.address = source_path.to_string_lossy().to_string();
+            self.archive_source_override = None;
+        }
         // Ctrl+G 絞り込みビュー中はブレッドクラム形式を維持する
         // (2026-04 ユーザー報告: PDF 開くと raw パスに戻ってしまうバグ)。
         // no-op: Ctrl+G 非アクティブ / Aggregated 時は何もしない。
         self.update_global_search_address();
-        // 通常ロードでは変換済みアーカイブ override を解除 (呼び出し元が後で再設定する)。
-        self.archive_source_override = None;
         self.selected = None;
         self.scroll_offset_y = 0.0;
         self.scroll_to_selected = false;
@@ -17498,30 +17722,69 @@ impl eframe::App for App {
             }
         } else {
             // folder_nav が未完了 or 他の高優先 nav 源が勝ったケース
-            let navigate = fav_nav
-                .or(toolbar_fav_nav)
-                .or(keyboard_nav)
-                .or(address_nav)
-                .or(open_folder_nav)
-                .or(context_nav)
-                .or(grid_nav);
+            let higher_priority_nav = fav_nav.or(toolbar_fav_nav).or(keyboard_nav);
+            let mut history_nav_rollback = None;
+            let navigate = if higher_priority_nav.is_some() {
+                higher_priority_nav
+            } else if let Some(nav) = address_nav {
+                match nav {
+                    crate::ui_main::AddressBarNav::Direct(path) => Some(path),
+                    crate::ui_main::AddressBarNav::HistoryBack => {
+                        let snapshot = self.folder_nav_history_snapshot();
+                        let target = self.navigate_folder_history_back();
+                        if target.is_some() {
+                            history_nav_rollback = Some(snapshot);
+                        }
+                        target
+                    }
+                    crate::ui_main::AddressBarNav::HistoryForward => {
+                        let snapshot = self.folder_nav_history_snapshot();
+                        let target = self.navigate_folder_history_forward();
+                        if target.is_some() {
+                            history_nav_rollback = Some(snapshot);
+                        }
+                        target
+                    }
+                }
+            } else {
+                open_folder_nav.or(context_nav).or(grid_nav)
+            };
             if let Some(p) = navigate {
-                // 検索コンテキスト中の前方ナビゲーションはスタックに積む
-                // (BS は favsearch_back 経由で navigate には流れないので二重 push にならない)
+                let favsearch_rollback = if self.favsearch.active {
+                    Some(self.folder_nav_history_snapshot())
+                } else {
+                    None
+                };
+                // 検索コンテキスト中の前方ナビゲーションはスタックに積む。
+                // 実 load が保留/失敗した場合は snapshot で元に戻す。
                 if self.favsearch.active {
                     self.favsearch.nav_stack.push(p.clone());
                 }
+                let open_target = p.clone();
+                let open_outcome = self.load_folder_or_convert_archive(p);
                 // Ctrl+G 絞り込みビュー中に container (PDF/ZIP/サブフォルダ) を開いたら
                 // current_path を進めておく。BS で「PDF ページ → ヒット一覧 →
                 // Aggregated」の 2 段階で戻れるようにする修正 (2026-04 ユーザー報告)。
-                // Aggregated / inactive では no-op。
-                self.advance_drilled_current_path(&p);
-                self.load_folder(p);
+                // 変換確認ダイアログで実ナビゲーションが保留された場合は、キャンセル時に
+                // 位置だけ進んだ扱いにならないようここでは進めない。
+                if matches!(open_outcome, FolderOpenOutcome::Loaded) {
+                    self.advance_drilled_current_path(&open_target);
+                }
+                let rollback = history_nav_rollback.or(favsearch_rollback);
+                match (open_outcome, rollback) {
+                    (FolderOpenOutcome::ConversionDialogOpened, Some(snapshot)) => {
+                        self.attach_archive_convert_nav_history_rollback(snapshot);
+                    }
+                    (FolderOpenOutcome::Ignored, Some(snapshot)) => {
+                        self.restore_folder_nav_history(snapshot);
+                    }
+                    _ => {}
+                }
                 // 他 nav 源が勝った: 累積をクリアして連打バーストを中断する
                 // (start_loading_items が folder_nav_pending と累積をリセット済みだが、
                 //  folder_nav_result が Some かつ他 nav 優先のケースを拾うため明示)
                 self.clear_pending_folder_nav_steps();
-                if self.favsearch.active {
+                if self.favsearch.active && matches!(open_outcome, FolderOpenOutcome::Loaded) {
                     self.update_favsearch_address();
                 }
             }

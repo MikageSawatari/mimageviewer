@@ -625,17 +625,20 @@ pub struct Settings {
     /// ツールバーに「タグ」セクションを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_tags: bool,
-    /// アドレスバー (フォルダ入力行) を表示する
+    /// フォルダバー (フォルダ入力行) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_folder: bool,
-    /// ツールバーに「上のフォルダへ」ボタンを表示する
+    /// フォルダバーに「履歴を戻る/進む」ボタンを表示する。
+    #[serde(default = "default_true")]
+    pub show_address_bar_history_nav: bool,
+    /// フォルダバーに「親フォルダへ」ボタンを表示する
     #[serde(default = "default_true")]
     pub show_toolbar_parent_button: bool,
-    /// ツールバーに「前のフォルダへ」ボタンを表示する (Phase 5.8)。
+    /// フォルダバーに「ツリー順で前のフォルダへ」ボタンを表示する (Phase 5.8)。
     /// 既定 true、Ctrl+↑ と等価。
     #[serde(default = "default_true")]
     pub show_toolbar_prev_folder: bool,
-    /// ツールバーに「次のフォルダへ」ボタンを表示する (Phase 5.8)。
+    /// フォルダバーに「ツリー順で次のフォルダへ」ボタンを表示する (Phase 5.8)。
     /// 既定 true、Ctrl+↓ と等価。
     #[serde(default = "default_true")]
     pub show_toolbar_next_folder: bool,
@@ -647,7 +650,13 @@ pub struct Settings {
     /// ツールバーに「レーティングフィルタ」セクション (☆|なし 1 2 3 4 5) を表示する
     #[serde(default = "default_true")]
     pub show_toolbar_rating: bool,
-    /// アドレスバーに「代表サムネ固定」(📌) ボタンを表示する。左クリックで
+    /// フォルダバーに「お気に入り追加 / 設定」(♡/♥) ボタンを表示する。
+    #[serde(default = "default_true")]
+    pub show_address_bar_favorite_button: bool,
+    /// フォルダバーに「最近開いたフォルダ」履歴メニューを表示する。
+    #[serde(default = "default_true")]
+    pub show_address_bar_history_menu: bool,
+    /// フォルダバーに「代表サムネ固定」(📌) ボタンを表示する。左クリックで
     /// 現在の選択アイテムをフォルダ / ZIP / PDF のサムネに固定 (= toggle)、
     /// 右クリックで固定解除。既定 true。
     #[serde(default = "default_true")]
@@ -1535,11 +1544,14 @@ impl Default for Settings {
             show_toolbar_favorites: true,
             show_toolbar_tags: true,
             show_toolbar_folder: true,
+            show_address_bar_history_nav: true,
             show_toolbar_parent_button: true,
             show_toolbar_prev_folder: true,
             show_toolbar_next_folder: true,
             show_toolbar_vst3: true,
             show_toolbar_rating: true,
+            show_address_bar_favorite_button: true,
+            show_address_bar_history_menu: true,
             show_address_bar_folder_pin: true,
             rating_filter: default_rating_filter(),
             toolbar_cols_items: default_toolbar_cols_items(),
@@ -2702,6 +2714,13 @@ mod tests {
         assert!(s.thumb_idle_upgrade);
         assert!(s.show_toolbar_favorites);
         assert!(s.show_toolbar_folder);
+        assert!(s.show_address_bar_history_nav);
+        assert!(s.show_toolbar_parent_button);
+        assert!(s.show_toolbar_prev_folder);
+        assert!(s.show_toolbar_next_folder);
+        assert!(s.show_address_bar_favorite_button);
+        assert!(s.show_address_bar_history_menu);
+        assert!(s.show_address_bar_folder_pin);
     }
 
     // -- Settings JSON roundtrip --

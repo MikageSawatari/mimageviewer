@@ -4463,9 +4463,9 @@ impl App {
         match hint {
             crate::ui_fullscreen::FsBoundaryHint::Edge { at_end, .. } => {
                 if at_end {
-                    "最後の項目です  [Ctrl]+[↓] 次のフォルダへ".to_string()
+                    "最後の項目です  [Ctrl]+[↓] ツリー順で次へ".to_string()
                 } else {
-                    "最初の項目です  [Ctrl]+[↑] 前のフォルダへ".to_string()
+                    "最初の項目です  [Ctrl]+[↑] ツリー順で前へ".to_string()
                 }
             }
             crate::ui_fullscreen::FsBoundaryHint::NoImageFolder { forward, .. } => {

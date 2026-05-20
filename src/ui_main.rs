@@ -1,9 +1,9 @@
 //! メイン画面の UI コンポーネント描画。
 //!
-//! `App::update()` から呼ばれるメニューバー・ツールバー・アドレスバー・
+//! `App::update()` から呼ばれるメニューバー・ツールバー・フォルダバー・
 //! グリッド・進捗オーバーレイ・選択情報オーバーレイの描画メソッドを集約。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use eframe::egui;
@@ -24,7 +24,7 @@ use crate::ui_helpers::{
 // Shift+クリック: threshold (そのバケット以上 ON)。同状態で再クリック → 全 ON
 // 右クリック: コンテキストメニューから同 3 操作 (こちらは toggle せず常に「set」)
 
-/// アドレスバーの 📌 ボタンが受けたクリック種別 (closure 内で `self` への
+/// フォルダバーの 📌 ボタンが受けたクリック種別 (closure 内で `self` への
 /// ミュータブル呼び出しを避けるため、closure を抜けてから dispatch する)。
 #[derive(Clone, Copy)]
 enum PinButtonClick {
@@ -33,6 +33,33 @@ enum PinButtonClick {
     Toggle,
     /// 右クリック: 解除。
     Remove,
+}
+
+pub(crate) enum AddressBarNav {
+    Direct(PathBuf),
+    HistoryBack,
+    HistoryForward,
+}
+
+#[derive(Clone, Copy)]
+enum FavoriteButtonClick {
+    None,
+    Add,
+    Edit,
+}
+
+fn resolve_folder_bar_nav_path(path: &Path) -> Option<PathBuf> {
+    let convertible_archive = path.is_file()
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(crate::archive_converter::ArchiveFormat::from_extension)
+            .is_some();
+    if convertible_archive {
+        Some(path.to_path_buf())
+    } else {
+        crate::folder_tree::resolve_openable_path(path)
+    }
 }
 
 /// 📌 ボタン描画用の状態スナップショット。`render_address_bar` 入口で 1 度算出する。
@@ -317,13 +344,17 @@ impl App {
                 });
 
                 ui.menu_button("お気に入り", |ui| {
-                    // このフォルダを追加 (クリック時は名称入力ダイアログを開く)
-                    let can_add = self.current_folder.is_some();
+                    // このフォルダを追加 (クリック時は名称入力ダイアログを開く)。
+                    // お気に入りは索引ルートになるため、ZIP/PDF/変換キャッシュではなく
+                    // 実ディレクトリだけを対象にする。
+                    let favorite_target = self.current_favorite_target();
+                    let can_add = favorite_target.is_some();
                     if ui
                         .add_enabled(can_add, egui::Button::new("このフォルダを追加…"))
+                        .on_disabled_hover_text("お気に入りに追加できるのは実フォルダのみです")
                         .clicked()
                     {
-                        if let Some(ref folder) = self.current_folder.clone() {
+                        if let Some(folder) = favorite_target.clone() {
                             // 既定の名前はフォルダ名から補完
                             let default_name = folder
                                 .file_name()
@@ -331,7 +362,7 @@ impl App {
                                 .unwrap_or("")
                                 .to_string();
                             self.fav_add_name_input = default_name;
-                            self.fav_add_target = Some(folder.clone());
+                            self.fav_add_target = Some(folder);
                             self.show_fav_add_dialog = true;
                         }
                         ui.close();
@@ -699,18 +730,8 @@ impl App {
         let show_aspect = !tb_aspects.is_empty();
         let show_sort = !tb_sorts.is_empty();
         let show_favs = self.settings.show_toolbar_favorites;
-        let show_parent = self.settings.show_toolbar_parent_button;
-        let show_prev_folder = self.settings.show_toolbar_prev_folder;
-        let show_next_folder = self.settings.show_toolbar_next_folder;
         let show_rating = self.settings.show_toolbar_rating;
-        let any_toolbar_section = show_cols
-            || show_aspect
-            || show_sort
-            || show_favs
-            || show_parent
-            || show_prev_folder
-            || show_next_folder
-            || show_rating;
+        let any_toolbar_section = show_cols || show_aspect || show_sort || show_favs || show_rating;
 
         if !any_toolbar_section {
             return None;
@@ -718,9 +739,6 @@ impl App {
 
         let mut toolbar_fav_nav: Option<PathBuf> = None;
         let mut toolbar_sort_changed = false;
-        let mut toolbar_parent_nav = false;
-        let mut toolbar_prev_folder_nav = false;
-        let mut toolbar_next_folder_nav = false;
         let mut toolbar_rating_changed = false;
         let mut toolbar_tag_click: Option<String> = None;
 
@@ -728,46 +746,6 @@ impl App {
             ui.add_space(2.0);
             ui.horizontal_wrapped(|ui| {
                 let mut first_section = true;
-                if show_parent {
-                    let has_parent = self
-                        .current_folder
-                        .as_ref()
-                        .and_then(|p| p.parent())
-                        .is_some();
-                    if ui
-                        .add_enabled(has_parent, egui::Button::new("⬆"))
-                        .on_hover_text("上のフォルダへ [BS]")
-                        .clicked()
-                    {
-                        toolbar_parent_nav = true;
-                    }
-                    first_section = false;
-                }
-                // Phase 5.8: 前のフォルダ / 次のフォルダ ボタン (= Ctrl+↑↓ と等価)。
-                // 「上」と区別するため、塗りつぶし三角 ▲▼ を使う (= 親フォルダボタン
-                // の輪郭三角 ⬆ とは形が違う)。
-                if show_prev_folder {
-                    let has_current = self.current_folder.is_some();
-                    if ui
-                        .add_enabled(has_current, egui::Button::new("▲"))
-                        .on_hover_text("前のフォルダへ [Ctrl+↑]")
-                        .clicked()
-                    {
-                        toolbar_prev_folder_nav = true;
-                    }
-                    first_section = false;
-                }
-                if show_next_folder {
-                    let has_current = self.current_folder.is_some();
-                    if ui
-                        .add_enabled(has_current, egui::Button::new("▼"))
-                        .on_hover_text("次のフォルダへ [Ctrl+↓]")
-                        .clicked()
-                    {
-                        toolbar_next_folder_nav = true;
-                    }
-                    first_section = false;
-                }
                 // ツールバー VST ボタンは v0.9.0 開発中に削除 (= ユーザー要望 2026-04
                 // 「ツールバーの VST ボタンも不要になったので削除」)。
                 // VST3 プラグインのプレイバックパネルは動画再生中にホバーバー側の
@@ -918,32 +896,6 @@ impl App {
             ui.add_space(2.0);
         });
 
-        // 親フォルダへ移動
-        if toolbar_parent_nav {
-            if let Some(ref cur) = self.current_folder.clone() {
-                if let Some(parent) = cur.parent() {
-                    self.select_after_load = cur
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .map(|s| s.to_string());
-                    return Some(parent.to_path_buf());
-                }
-            }
-        }
-
-        // Phase 5.8: 前 / 次フォルダ ボタンは Ctrl+↑↓ と同じ DFS をキック。
-        // start_folder_nav は in-flight の連打もまとめてくれる。
-        if toolbar_prev_folder_nav {
-            if let Some(cur) = self.current_folder.clone() {
-                self.start_folder_nav(cur, false, crate::app::FolderNavMode::Grid);
-            }
-        }
-        if toolbar_next_folder_nav {
-            if let Some(cur) = self.current_folder.clone() {
-                self.start_folder_nav(cur, true, crate::app::FolderNavMode::Grid);
-            }
-        }
-
         // ツールバーのソート変更は borrow の関係で遅延実行
         if toolbar_sort_changed {
             if let Some(path) = self.current_folder.clone() {
@@ -982,16 +934,32 @@ impl App {
         toolbar_fav_nav
     }
 
-    // ── アドレスバー ─────────────────────────────────────────────────
+    // ── フォルダバー ─────────────────────────────────────────────────
 
-    /// アドレスバーを描画し、Enter で確定されたパスを返す。
-    pub(crate) fn render_address_bar(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
+    /// フォルダバーを描画し、Enter や履歴ボタンで確定されたナビゲーションを返す。
+    pub(crate) fn render_address_bar(&mut self, ctx: &egui::Context) -> Option<AddressBarNav> {
         if !self.settings.show_toolbar_folder {
             self.address_has_focus = false;
             return None;
         }
 
         let enter_pressed = self.dialog_enter_pressed(ctx);
+        let effective_folder = self.effective_folder();
+        let has_current = effective_folder.is_some();
+        let parent_target = effective_folder
+            .as_ref()
+            .and_then(|p| p.parent().map(|parent| parent.to_path_buf()));
+        let back_target = self.folder_history_back_target().cloned();
+        let forward_target = self.folder_history_forward_target().cloned();
+        let recent_folders: Vec<PathBuf> = self.recent_folder_entries().to_vec();
+        let favorite_target = self.current_favorite_target();
+        let current_is_favorite = favorite_target.as_ref().is_some_and(|p| {
+            self.settings
+                .favorites
+                .iter()
+                .any(|fav| crate::folder_tree::path_eq(&fav.path, p))
+        });
+
         // 現在表示中フォルダ / ZIP / PDF のコンテナレーティングを取得。
         // 0 のときは非表示、1〜5 のときは★バッジをアドレス欄の右端に表示する。
         let folder_rating = self.current_folder_rating();
@@ -1005,12 +973,89 @@ impl App {
         // closure 内で `self` のミュータブル借用が衝突しないように外で確定しておく。
         let pin_button_info = self.compute_folder_pin_button_state();
         egui::TopBottomPanel::top("address_bar")
-            .show(ctx, |ui| -> Option<PathBuf> {
+            .show(ctx, |ui| -> Option<AddressBarNav> {
                 ui.add_space(3.0);
                 let mut result = None;
                 let mut pin_click = PinButtonClick::None;
+                let mut favorite_click = FavoriteButtonClick::None;
+                let mut tree_nav: Option<bool> = None;
                 ui.horizontal(|ui| {
                     ui.label("フォルダ:");
+                    let show_history_nav = self.settings.show_address_bar_history_nav;
+                    let show_parent = self.settings.show_toolbar_parent_button;
+                    let show_tree_nav = self.settings.show_toolbar_prev_folder
+                        || self.settings.show_toolbar_next_folder;
+
+                    if show_history_nav {
+                        let back_hover = back_target
+                            .as_ref()
+                            .map(|p| format!("フォルダ履歴を戻る\n{}", p.to_string_lossy()))
+                            .unwrap_or_else(|| "フォルダ履歴を戻る".to_string());
+                        if ui
+                            .add_enabled(back_target.is_some(), egui::Button::new("←"))
+                            .on_hover_text(back_hover)
+                            .clicked()
+                        {
+                            result = Some(AddressBarNav::HistoryBack);
+                        }
+                        let forward_hover = forward_target
+                            .as_ref()
+                            .map(|p| format!("フォルダ履歴を進む\n{}", p.to_string_lossy()))
+                            .unwrap_or_else(|| "フォルダ履歴を進む".to_string());
+                        if ui
+                            .add_enabled(forward_target.is_some(), egui::Button::new("→"))
+                            .on_hover_text(forward_hover)
+                            .clicked()
+                        {
+                            result = Some(AddressBarNav::HistoryForward);
+                        }
+                    }
+
+                    if show_history_nav && (show_parent || show_tree_nav) {
+                        ui.separator();
+                    }
+
+                    if show_parent {
+                        let parent_hover = parent_target
+                            .as_ref()
+                            .map(|p| format!("親フォルダへ [BS]\n{}", p.to_string_lossy()))
+                            .unwrap_or_else(|| "親フォルダへ [BS]".to_string());
+                        if ui
+                            .add_enabled(parent_target.is_some(), egui::Button::new("⬆"))
+                            .on_hover_text(parent_hover)
+                            .clicked()
+                            && let (Some(cur), Some(parent)) =
+                                (effective_folder.as_ref(), parent_target.as_ref())
+                        {
+                            self.select_after_load = cur
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map(|s| s.to_string());
+                            result = Some(AddressBarNav::Direct(parent.clone()));
+                        }
+                    }
+
+                    if show_tree_nav {
+                        if ui
+                            .add_enabled(has_current, egui::Button::new("▲"))
+                            .on_hover_text("ツリー順で前のフォルダへ [Ctrl+↑]")
+                            .clicked()
+                        {
+                            tree_nav = Some(false);
+                        }
+                        if ui
+                            .add_enabled(has_current, egui::Button::new("▼"))
+                            .on_hover_text("ツリー順で次のフォルダへ [Ctrl+↓]")
+                            .clicked()
+                        {
+                            tree_nav = Some(true);
+                        }
+                    }
+
+                    if show_history_nav || show_parent || show_tree_nav {
+                        ui.separator();
+                    }
+
                     // ★バッジは右寄せで先に配置し、残り幅を TextEdit が埋める。
                     // right_to_left レイアウトで ★ → TextEdit の順に追加すると、
                     // TextEdit は available width いっぱいに広がる。
@@ -1025,6 +1070,16 @@ impl App {
                             .on_hover_text(
                                 "このフォルダ / ZIP / PDF のレーティング [Shift+F1〜F6]",
                             );
+                            ui.add_space(4.0);
+                        }
+                        if let Some(count) = thumbnail_count.as_ref() {
+                            ui.label(
+                                egui::RichText::new(count.as_str())
+                                    .size(11.0)
+                                    .monospace()
+                                    .color(egui::Color32::from_gray(140)),
+                            )
+                            .on_hover_text("表示中のサムネイル数 / 全サムネイル数");
                             ui.add_space(4.0);
                         }
                         // 📌 (代表サムネ固定): right_to_left なので 📁★ より左 (= 入力欄寄り) に置く。
@@ -1048,16 +1103,77 @@ impl App {
                             }
                             ui.add_space(4.0);
                         }
-                        if let Some(count) = thumbnail_count.as_ref() {
-                            ui.label(
-                                egui::RichText::new(count.as_str())
-                                    .size(11.0)
-                                    .monospace()
-                                    .color(egui::Color32::from_gray(140)),
-                            )
-                            .on_hover_text("表示中のサムネイル数 / 全サムネイル数");
+
+                        if self.settings.show_address_bar_history_menu {
+                            ui.menu_button("履歴▼", |ui| {
+                                let menu_width =
+                                    (ctx.content_rect().width() * 0.72).clamp(560.0, 1100.0);
+                                ui.set_min_width(menu_width);
+                                let mut shown = 0usize;
+                                for path in &recent_folders {
+                                    if effective_folder
+                                        .as_ref()
+                                        .is_some_and(|cur| crate::folder_tree::path_eq(cur, path))
+                                    {
+                                        continue;
+                                    }
+                                    let full = path.to_string_lossy().to_string();
+                                    let button =
+                                        egui::Button::new(egui::RichText::new(&full).monospace())
+                                            .wrap_mode(egui::TextWrapMode::Extend);
+                                    if ui.add(button).on_hover_text(&full).clicked() {
+                                        if let Some(resolved) = resolve_folder_bar_nav_path(path) {
+                                            result = Some(AddressBarNav::Direct(resolved));
+                                        }
+                                        ui.close();
+                                    }
+                                    shown += 1;
+                                    if shown >= 20 {
+                                        break;
+                                    }
+                                }
+                                if shown == 0 {
+                                    ui.label(egui::RichText::new("履歴はありません").weak());
+                                }
+                            })
+                            .response
+                            .on_hover_text("最近開いたフォルダ");
                             ui.add_space(4.0);
                         }
+
+                        if self.settings.show_address_bar_favorite_button {
+                            let (label, tooltip) = if current_is_favorite {
+                                (
+                                    egui::RichText::new("♥")
+                                        .color(egui::Color32::from_rgb(230, 110, 130))
+                                        .strong(),
+                                    "このフォルダのお気に入り設定を開く",
+                                )
+                            } else if favorite_target.is_none() {
+                                (
+                                    egui::RichText::new("♡").weak(),
+                                    "お気に入りに追加できるのは実フォルダのみです",
+                                )
+                            } else {
+                                (egui::RichText::new("♡"), "このフォルダをお気に入りに追加…")
+                            };
+                            if ui
+                                .add_enabled(
+                                    favorite_target.is_some(),
+                                    egui::Button::new(label).frame(false),
+                                )
+                                .on_hover_text(tooltip)
+                                .clicked()
+                            {
+                                favorite_click = if current_is_favorite {
+                                    FavoriteButtonClick::Edit
+                                } else {
+                                    FavoriteButtonClick::Add
+                                };
+                            }
+                            ui.add_space(4.0);
+                        }
+
                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                             let resp = ui.add(
                                 egui::TextEdit::singleline(&mut self.address)
@@ -1066,10 +1182,8 @@ impl App {
                             self.address_has_focus = resp.has_focus();
                             if resp.lost_focus() && enter_pressed {
                                 let p = PathBuf::from(&self.address);
-                                if let Some(resolved) =
-                                    crate::folder_tree::resolve_openable_path(&p)
-                                {
-                                    result = Some(resolved);
+                                if let Some(resolved) = resolve_folder_bar_nav_path(&p) {
+                                    result = Some(AddressBarNav::Direct(resolved));
                                 }
                             }
                         });
@@ -1081,6 +1195,29 @@ impl App {
                     PinButtonClick::Toggle => self.toggle_folder_pin_from_selection(),
                     PinButtonClick::Remove => self.remove_folder_pin_for_current_container(),
                     PinButtonClick::None => {}
+                }
+                match favorite_click {
+                    FavoriteButtonClick::Add => {
+                        if let Some(folder) = favorite_target.clone() {
+                            let default_name = folder
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("")
+                                .to_string();
+                            self.fav_add_name_input = default_name;
+                            self.fav_add_target = Some(folder);
+                            self.show_fav_add_dialog = true;
+                        }
+                    }
+                    FavoriteButtonClick::Edit => {
+                        self.show_favorites_editor = true;
+                    }
+                    FavoriteButtonClick::None => {}
+                }
+                if let Some(forward) = tree_nav
+                    && let Some(cur) = effective_folder.clone()
+                {
+                    self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Grid);
                 }
                 result
             })

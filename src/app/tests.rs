@@ -792,6 +792,279 @@ mod phase_c_key_tests {
     }
 }
 
+#[cfg(test)]
+mod phase_c_folder_nav_history_tests {
+    use crate::archive_converter::ArchiveFormat;
+    use crate::grid_item::GridItem;
+
+    use super::phase_c_support::setup_app;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::time::SystemTime;
+
+    #[test]
+    fn folder_history_back_forward_does_not_duplicate_history_edges() {
+        let mut app = setup_app();
+        let a = PathBuf::from(r"C:\miv-test\a");
+        let b = PathBuf::from(r"C:\miv-test\b");
+
+        app.current_folder = Some(a.clone());
+        app.record_folder_nav_transition(&b);
+        app.current_folder = Some(b.clone());
+
+        assert_eq!(app.folder_nav_back_stack, vec![a.clone()]);
+        assert!(app.folder_nav_forward_stack.is_empty());
+        assert_eq!(app.recent_folders.first(), Some(&b));
+
+        assert_eq!(app.navigate_folder_history_back(), Some(a.clone()));
+        app.record_folder_nav_transition(&a);
+        app.current_folder = Some(a.clone());
+
+        assert_eq!(app.folder_nav_back_stack, Vec::<PathBuf>::new());
+        assert_eq!(app.folder_nav_forward_stack, vec![b.clone()]);
+        assert_eq!(app.recent_folders.first(), Some(&a));
+
+        assert_eq!(app.navigate_folder_history_forward(), Some(b.clone()));
+        app.record_folder_nav_transition(&b);
+        app.current_folder = Some(b.clone());
+
+        assert_eq!(app.folder_nav_back_stack, vec![a]);
+        assert!(app.folder_nav_forward_stack.is_empty());
+        assert_eq!(app.recent_folders.first(), Some(&b));
+    }
+
+    #[test]
+    fn converted_archive_keeps_source_path_after_zip_enumerate_finishes() {
+        let mut app = setup_app();
+        let original_dir = app.tmp.path().join("share/18/dmm/comic");
+        std::fs::create_dir_all(&original_dir).unwrap();
+        let source = original_dir.join("d_pa3584.lzh");
+        std::fs::write(&source, b"lzh").unwrap();
+
+        let cache_dir = app.tmp.path().join(
+            "archive_cache/06/06f8ea1bcfd0219996db21aed88f7f7fd83df7dd68f7cf9ad805b50f1e7dfcf2",
+        );
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let cached_zip = cache_dir.join("d_pa3584.zip");
+        std::fs::write(&cached_zip, b"zip").unwrap();
+
+        app.current_folder = Some(cached_zip.clone());
+        app.archive_source_override = Some(source.clone());
+        app.address = source.to_string_lossy().to_string();
+
+        app.start_loading_items(
+            cached_zip.clone(),
+            vec![GridItem::ZipImage {
+                zip_path: cached_zip.clone(),
+                entry_name: "page001.jpg".to_string(),
+            }],
+            vec![None],
+            HashSet::new(),
+            Vec::new(),
+            None,
+        );
+
+        assert_eq!(app.current_folder.as_ref(), Some(&cached_zip));
+        assert_eq!(app.archive_source_override.as_ref(), Some(&source));
+        assert_eq!(app.effective_folder(), Some(source.clone()));
+        assert_eq!(app.address, source.to_string_lossy().to_string());
+        assert!(
+            !app.address.contains("archive_cache"),
+            "UI address must not leak the converted cache ZIP path"
+        );
+        assert_eq!(
+            app.effective_folder()
+                .and_then(|p| p.parent().map(|parent| parent.to_path_buf())),
+            Some(original_dir),
+            "BS should resolve to the source archive's parent, not the cache directory"
+        );
+    }
+
+    #[test]
+    fn converted_archive_reload_does_not_record_cache_zip_in_folder_history() {
+        let mut app = setup_app();
+        let source = PathBuf::from(r"E:\share\18\dmm\comic\d_pa3584.lzh");
+        let cached_zip = PathBuf::from(
+            r"C:\Users\mikag\AppData\Roaming\mimageviewer\archive_cache\06\hash\d_pa3584.zip",
+        );
+        let previous = PathBuf::from(r"E:\share\18\dmm");
+        let forward = PathBuf::from(r"E:\share\18\dmm\next");
+        let recent = PathBuf::from(r"E:\share\18\dmm\recent");
+
+        app.current_folder = Some(cached_zip.clone());
+        app.archive_source_override = Some(source);
+        app.folder_nav_back_stack = vec![previous.clone()];
+        app.folder_nav_forward_stack = vec![forward.clone()];
+        app.recent_folders = vec![recent.clone()];
+
+        app.record_folder_nav_transition(&cached_zip);
+
+        assert_eq!(app.folder_nav_back_stack, vec![previous]);
+        assert_eq!(app.folder_nav_forward_stack, vec![forward]);
+        assert_eq!(app.recent_folders, vec![recent]);
+    }
+
+    #[test]
+    fn cancelled_history_navigation_to_unconverted_archive_restores_stacks() {
+        let mut app = setup_app();
+        let a = PathBuf::from(r"C:\miv-test\a");
+        let current = PathBuf::from(r"C:\miv-test\current");
+        let archive = app.tmp.path().join("book.lzh");
+        std::fs::write(&archive, b"lzh").unwrap();
+
+        app.current_folder = Some(current.clone());
+        app.folder_nav_back_stack = vec![a.clone(), archive.clone()];
+        app.folder_nav_forward_stack = Vec::new();
+        app.recent_folders = vec![current.clone()];
+
+        let snapshot = app.folder_nav_history_snapshot();
+        assert_eq!(app.navigate_folder_history_back(), Some(archive.clone()));
+        assert_eq!(app.folder_nav_back_stack, vec![a.clone()]);
+        assert_eq!(app.folder_nav_forward_stack, vec![current.clone()]);
+        assert!(app.suppress_folder_nav_record_once);
+
+        let (_tx, rx) = mpsc::channel();
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: archive.clone(),
+            format: ArchiveFormat::Lzh,
+            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            rx,
+            pending_nav: None,
+            nav_history_rollback: None,
+        });
+        app.attach_archive_convert_nav_history_rollback(snapshot);
+        let rollback = app
+            .archive_convert
+            .as_ref()
+            .and_then(|state| state.nav_history_rollback.clone())
+            .expect("history rollback snapshot should be attached to the convert dialog");
+        app.archive_convert = None;
+        app.restore_folder_nav_history(rollback);
+
+        assert_eq!(app.folder_nav_back_stack, vec![a, archive]);
+        assert!(app.folder_nav_forward_stack.is_empty());
+        assert_eq!(app.recent_folders, vec![current]);
+        assert!(!app.suppress_folder_nav_record_once);
+    }
+
+    #[test]
+    fn cancelled_conversion_restores_favsearch_nav_stack() {
+        let mut app = setup_app();
+        let root = PathBuf::from(r"C:\miv-test\search-root");
+        let current = PathBuf::from(r"C:\miv-test\search-root\current");
+        let archive = app.tmp.path().join("book.lzh");
+        std::fs::write(&archive, b"lzh").unwrap();
+
+        app.favsearch.active = true;
+        app.favsearch.nav_stack = vec![root.clone(), current.clone()];
+        let snapshot = app.folder_nav_history_snapshot();
+        app.favsearch.nav_stack.push(archive.clone());
+
+        let (_tx, rx) = mpsc::channel();
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: archive,
+            format: ArchiveFormat::Lzh,
+            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            rx,
+            pending_nav: None,
+            nav_history_rollback: None,
+        });
+        app.attach_archive_convert_nav_history_rollback(snapshot);
+        let rollback = app
+            .archive_convert
+            .as_ref()
+            .and_then(|state| state.nav_history_rollback.clone())
+            .expect("history rollback snapshot should be attached to the convert dialog");
+        app.archive_convert = None;
+        app.restore_folder_nav_history(rollback);
+
+        assert_eq!(app.favsearch.nav_stack, vec![root, current]);
+    }
+
+    #[test]
+    fn successful_navigation_clears_stale_archive_convert_rollback() {
+        let mut app = setup_app();
+        let previous = PathBuf::from(r"C:\miv-test\previous");
+        app.folder_nav_back_stack = vec![previous];
+        let snapshot = app.folder_nav_history_snapshot();
+        let (_tx, rx) = mpsc::channel();
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: PathBuf::from(r"C:\miv-test\book.lzh"),
+            format: ArchiveFormat::Lzh,
+            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            rx,
+            pending_nav: None,
+            nav_history_rollback: Some(snapshot),
+        });
+
+        let target = app.tmp.path().join("loaded");
+        std::fs::create_dir_all(&target).unwrap();
+        app.load_folder(target);
+
+        assert!(
+            app.archive_convert
+                .as_ref()
+                .map(|state| state.nav_history_rollback.is_none())
+                .unwrap_or(true),
+            "successful navigation should make an old conversion-dialog rollback inert"
+        );
+    }
+
+    #[test]
+    fn same_folder_reload_keeps_archive_convert_rollback() {
+        let mut app = setup_app();
+        let current = app.tmp.path().join("current");
+        std::fs::create_dir_all(&current).unwrap();
+
+        app.current_folder = Some(current.clone());
+        app.folder_nav_back_stack = vec![PathBuf::from(r"C:\miv-test\previous")];
+        let snapshot = app.folder_nav_history_snapshot();
+        let (_tx, rx) = mpsc::channel();
+        app.archive_convert = Some(crate::ui_dialogs::archive_convert::ArchiveConvertState {
+            src_path: PathBuf::from(r"C:\miv-test\book.lzh"),
+            format: ArchiveFormat::Lzh,
+            phase: crate::ui_dialogs::archive_convert::ArchiveConvertPhase::Scanning,
+            rx,
+            pending_nav: None,
+            nav_history_rollback: Some(snapshot),
+        });
+
+        app.load_folder(current);
+
+        assert!(
+            app.archive_convert
+                .as_ref()
+                .and_then(|state| state.nav_history_rollback.as_ref())
+                .is_some(),
+            "same-folder reload should not discard conversion-dialog rollback"
+        );
+    }
+
+    #[test]
+    fn favorite_target_is_available_only_for_real_directory_context() {
+        let mut app = setup_app();
+        let dir = app.tmp.path().join("images");
+        std::fs::create_dir_all(&dir).unwrap();
+        app.current_folder = Some(dir.clone());
+        app.current_folder_last_mtime = Some(SystemTime::now());
+        assert_eq!(app.current_favorite_target(), Some(dir));
+
+        let zip = app.tmp.path().join("book.zip");
+        std::fs::write(&zip, b"zip").unwrap();
+        app.current_folder = Some(zip);
+        app.current_folder_last_mtime = None;
+        assert_eq!(app.current_favorite_target(), None);
+
+        let source = app.tmp.path().join("book.lzh");
+        let cached_zip = app.tmp.path().join("archive_cache/book.zip");
+        app.current_folder = Some(cached_zip);
+        app.archive_source_override = Some(source);
+        app.current_folder_last_mtime = None;
+        assert_eq!(app.current_favorite_target(), None);
+    }
+}
+
 // =======================================================================
 // Phase C (App-level) - Ctrl+G drill ナビゲーション状態機械テスト
 //

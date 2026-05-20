@@ -57,22 +57,62 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     );
     ui.add_space(6.0);
 
-    // Phase 6.E: 設定の表示順を画面上のツールバーの左→右の並びに揃える。
-    // 画面の順:
-    //   上のフォルダ ⬆ → 前 ▲ → 次 ▼ → 列 → 比率 → ソート → ★ → お気に入り
-    //   → タグ → (フォルダアドレスバー、別位置)
-
-    ui.checkbox(
-        &mut s.show_toolbar_parent_button,
-        "上のフォルダへ (⬆ ボタン)",
+    // Phase 6.E 以降、フォルダ移動系はアドレス欄と同じ行の「フォルダバー」に集約。
+    ui.label(egui::RichText::new("フォルダバー").strong());
+    ui.checkbox(&mut s.show_toolbar_folder, "フォルダ入力欄を表示");
+    ui.add_enabled(
+        s.show_toolbar_folder,
+        egui::Checkbox::new(
+            &mut s.show_address_bar_history_nav,
+            "└ 履歴の戻る/進むボタン (←/→)",
+        ),
+    )
+    .on_hover_text("移動したフォルダの履歴をブラウザのように戻る / 進むできます。");
+    ui.add_enabled(
+        s.show_toolbar_folder,
+        egui::Checkbox::new(&mut s.show_toolbar_parent_button, "└ 親フォルダボタン (⬆)"),
     );
-    ui.checkbox(
-        &mut s.show_toolbar_prev_folder,
-        "前のフォルダへ (▲ ボタン、Ctrl+↑ と同じ動作)",
+    let mut show_tree_nav = s.show_toolbar_prev_folder || s.show_toolbar_next_folder;
+    if ui
+        .add_enabled(
+            s.show_toolbar_folder,
+            egui::Checkbox::new(&mut show_tree_nav, "└ ツリー順の前/次フォルダボタン (▲/▼)"),
+        )
+        .on_hover_text("Ctrl+↑/↓ と同じく、深さ優先のツリー順で前後のフォルダへ移動します。")
+        .changed()
+    {
+        s.show_toolbar_prev_folder = show_tree_nav;
+        s.show_toolbar_next_folder = show_tree_nav;
+    }
+    ui.add_enabled(
+        s.show_toolbar_folder,
+        egui::Checkbox::new(
+            &mut s.show_address_bar_favorite_button,
+            "└ お気に入り追加/設定ボタン (♡/♥)",
+        ),
     );
-    ui.checkbox(
-        &mut s.show_toolbar_next_folder,
-        "次のフォルダへ (▼ ボタン、Ctrl+↓ と同じ動作)",
+    ui.add_enabled(
+        s.show_toolbar_folder,
+        egui::Checkbox::new(
+            &mut s.show_address_bar_history_menu,
+            "└ 最近開いたフォルダ履歴メニュー",
+        ),
+    );
+    // 代表サムネ固定 (📌) ボタンはフォルダバーの一部だが、機能としては独立した
+    // 切り替えを提供する (= 自動代表サムネで運用するユーザー向けに非表示にできる)。
+    ui.add_enabled(
+        s.show_toolbar_folder,
+        egui::Checkbox::new(
+            &mut s.show_address_bar_folder_pin,
+            "└ 代表サムネ固定 (📌) ボタン",
+        ),
+    )
+    .on_hover_text(
+        "フォルダバーの 📌 ボタンで、選択中のアイテムを\
+         フォルダ / ZIP / PDF の代表サムネに固定できます。\n\
+         左クリック: 設定 / 同じ項目で再クリック解除\n\
+         右クリック: 解除\n\
+         右クリックメニューからも操作できます。",
     );
     // (旧) VST3 ツールバーボタン: v0.9.0 開発中に削除。動画再生中はホバーバーから
     // パネルを開く運用に統一。settings の `show_toolbar_vst3` は legacy フラグとして残るが
@@ -147,32 +187,6 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.checkbox(&mut s.show_toolbar_rating, "レーティング (★ フィルタ)");
     ui.checkbox(&mut s.show_toolbar_favorites, "お気に入り");
     ui.checkbox(&mut s.show_toolbar_tags, "タグ");
-
-    ui.add_space(6.0);
-    ui.separator();
-    ui.add_space(2.0);
-    // フォルダ (アドレスバー) は他のツールバーセクションと別位置 (= ツールバー
-    // とは別のアドレスバー帯) に出るので、最後にまとめて表示。
-    ui.checkbox(
-        &mut s.show_toolbar_folder,
-        "フォルダ (アドレスバー、別の場所に表示)",
-    );
-    // 代表サムネ固定 (📌) ボタンはアドレスバーの一部だが、機能としては独立した
-    // 切り替えを提供する (= 自動代表サムネで運用するユーザー向けに非表示にできる)。
-    ui.add_enabled(
-        s.show_toolbar_folder,
-        egui::Checkbox::new(
-            &mut s.show_address_bar_folder_pin,
-            "└ 代表サムネ固定 (📌) ボタンを表示",
-        ),
-    )
-    .on_hover_text(
-        "アドレスバーの 📌 ボタンで、選択中のアイテムを\
-         フォルダ / ZIP / PDF の代表サムネに固定できます。\n\
-         左クリック: 設定 / 同じ項目で再クリック解除\n\
-         右クリック: 解除\n\
-         右クリックメニューからも操作できます。",
-    );
 }
 
 pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {

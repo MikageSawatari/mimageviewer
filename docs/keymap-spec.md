@@ -13,11 +13,11 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | キー | 動作 |
 |---|---|
 | <kbd>Backspace</kbd> | 親フォルダへ |
-| <kbd>Ctrl</kbd>+<kbd>↑</kbd> | 前のフォルダへ (DFS pre-order、画像なしフォルダは skip_limit までスキップ) |
-| <kbd>Ctrl</kbd>+<kbd>↓</kbd> | 次のフォルダへ (DFS pre-order) |
+| <kbd>Ctrl</kbd>+<kbd>↑</kbd> | ツリー順で前のフォルダへ (DFS pre-order、画像なしフォルダは skip_limit までスキップ) |
+| <kbd>Ctrl</kbd>+<kbd>↓</kbd> | ツリー順で次のフォルダへ (DFS pre-order) |
 | <kbd>F1</kbd>〜<kbd>F5</kbd> | レーティング 1〜5 |
 | <kbd>F6</kbd> | レーティング解除 |
-| <kbd>P</kbd> | 選択中アイテムを現在のコンテナの代表サムネに固定 / 解除 (toggle、アドレスバー 📌 の左クリックと同等)。pin 不能アイテム / 検索アグリゲート / 変換キャッシュ drill-down では silent no-op。**動画フルスクリーンの P と合わせて P = Pin に統一** |
+| <kbd>P</kbd> | 選択中アイテムを現在のコンテナの代表サムネに固定 / 解除 (toggle、フォルダバー 📌 の左クリックと同等)。pin 不能アイテム / 検索アグリゲート / 変換キャッシュ drill-down では silent no-op。**動画フルスクリーンの P と合わせて P = Pin に統一** |
 | <kbd>X</kbd> | 選択中の画像 / ZIP 内画像 / PDF ページを比較スロットへピン留め / 同じ画像なら解除 |
 
 ## フルスクリーン共通 (画像 / 動画とも)

@@ -77,6 +77,9 @@ pub(crate) struct ArchiveConvertState {
     /// 変換完了後にメイン UI がナビゲーションに使うキャッシュ ZIP パス。
     /// `update()` が毎フレーム見に行き、Some なら `load_folder` を呼んでクリアする。
     pub pending_nav: Option<PathBuf>,
+    /// 履歴の戻る/進むから未変換アーカイブに入ろうとしてダイアログが出た場合、
+    /// キャンセル時に戻る/進むスタックをクリック前へ戻すためのスナップショット。
+    pub nav_history_rollback: Option<crate::app::FolderNavHistorySnapshot>,
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -101,16 +104,19 @@ impl App {
     /// pending_nav 経路は `show_archive_convert_dialog` 内で直接処理する
     /// (そちらは `archive_convert` のライフサイクルと絡むため)。
     pub(crate) fn open_archive_via_cache(&mut self, src: PathBuf, cached_zip: PathBuf) {
-        self.load_folder(cached_zip);
+        self.load_folder(cached_zip.clone());
         self.address = src.to_string_lossy().to_string();
+        self.recent_folders
+            .retain(|p| !crate::folder_tree::path_eq(p, &cached_zip));
+        self.remember_recent_folder(&src);
         self.archive_source_override = Some(src);
     }
 
     /// 変換ダイアログを開始する (スキャン fase から)。
     /// 既に別のダイアログが動作中なら無視 (二重起動防止)。
-    pub(crate) fn request_archive_convert(&mut self, src: PathBuf, format: ArchiveFormat) {
+    pub(crate) fn request_archive_convert(&mut self, src: PathBuf, format: ArchiveFormat) -> bool {
         if self.archive_convert.is_some() {
-            return;
+            return false;
         }
         let (tx, rx) = mpsc::channel();
         let src_for_scan = src.clone();
@@ -124,7 +130,9 @@ impl App {
             phase: ArchiveConvertPhase::Scanning,
             rx,
             pending_nav: None,
+            nav_history_rollback: None,
         });
+        true
     }
 
     /// 毎フレーム呼ばれるダイアログ描画・メッセージ処理のエントリポイント。
@@ -153,10 +161,16 @@ impl App {
                 // その後 override に元パスを書き戻すことで、UI 表示は元ファイルの場所のままに保つ。
                 let src = self.archive_convert.as_ref().map(|s| s.src_path.clone());
                 self.archive_convert = None;
-                self.load_folder(nav);
+                self.load_folder(nav.clone());
                 if let Some(src) = src {
                     self.address = src.to_string_lossy().to_string();
+                    self.recent_folders
+                        .retain(|p| !crate::folder_tree::path_eq(p, &nav));
+                    self.remember_recent_folder(&src);
                     self.archive_source_override = Some(src);
+                }
+                if self.favsearch.active {
+                    self.update_favsearch_address();
                 }
                 return;
             }
@@ -321,7 +335,14 @@ impl App {
                     cancel.store(true, Ordering::Relaxed);
                 }
             }
+            let nav_history_rollback = self
+                .archive_convert
+                .as_ref()
+                .and_then(|state| state.nav_history_rollback.clone());
             self.archive_convert = None;
+            if let Some(snapshot) = nav_history_rollback {
+                self.restore_folder_nav_history(snapshot);
+            }
         }
     }
 
@@ -367,7 +388,11 @@ impl App {
                 }
                 ArchiveConvertMsg::ConvertDone(Err(ConvertError::Cancelled)) => {
                     // ユーザーキャンセルならダイアログを即閉じる
+                    let nav_history_rollback = state.nav_history_rollback.clone();
                     self.archive_convert = None;
+                    if let Some(snapshot) = nav_history_rollback {
+                        self.restore_folder_nav_history(snapshot);
+                    }
                     return;
                 }
                 ArchiveConvertMsg::ConvertDone(Err(e)) => {

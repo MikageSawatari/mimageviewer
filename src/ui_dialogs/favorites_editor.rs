@@ -537,7 +537,7 @@ impl App {
                                                 swap = Some((i, i + 1));
                                             }
                                             if ui.button("削除").clicked() {
-                                                remove = Some(i);
+                                                self.favorite_delete_confirm = Some(fav_id);
                                             }
                                         });
                                         ui.end_row();
@@ -719,7 +719,7 @@ impl App {
                     ctx.request_repaint_after(Duration::from_millis(100));
                 }
 
-                if escape_pressed {
+                if escape_pressed && self.favorite_delete_confirm.is_none() {
                     close_requested = true;
                 }
 
@@ -732,6 +732,64 @@ impl App {
                     }
                 });
             });
+
+        // ── 削除確認 ────────────────────────────────────────────────
+        if let Some(fav_id) = self.favorite_delete_confirm {
+            let target = self
+                .settings
+                .favorites
+                .iter()
+                .find(|fav| fav.id == fav_id)
+                .map(|fav| (fav.name.clone(), fav.path.clone()));
+            if let Some((name, path)) = target {
+                let mut close_confirm = false;
+                let mut confirmed = false;
+                let response = egui::Modal::new(egui::Id::new("favorite_delete_confirm_modal"))
+                    .show(ctx, |ui| {
+                        ui.set_min_width(420.0);
+                        ui.heading("お気に入りを削除");
+                        ui.add_space(8.0);
+                        ui.label(format!("「{name}」をお気に入りから削除します。"));
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(path.to_string_lossy())
+                                .monospace()
+                                .weak(),
+                        );
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "名前索引・メタデータ索引・お気に入り標準設定も解除されます。",
+                            )
+                            .weak(),
+                        );
+                        ui.add_space(8.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("削除").clicked() {
+                                confirmed = true;
+                                close_confirm = true;
+                            }
+                            if ui.button("キャンセル").clicked() {
+                                close_confirm = true;
+                            }
+                        });
+                    });
+                if confirmed {
+                    remove = self
+                        .settings
+                        .favorites
+                        .iter()
+                        .position(|fav| fav.id == fav_id);
+                }
+                if close_confirm || response.should_close() {
+                    self.favorite_delete_confirm = None;
+                }
+            } else {
+                self.favorite_delete_confirm = None;
+            }
+        }
 
         // ── スワップ / 削除 / フラグ変更を反映 ──
         // 並び替えは副作用なし (UI 順の入れ替えだけ)。削除は supervisor drop と
@@ -782,6 +840,7 @@ impl App {
 
         if close_requested || !open {
             self.show_favorites_editor = false;
+            self.favorite_delete_confirm = None;
             self.favorites_index_size_cache = None;
             self.favorites_index_count_cache = None;
             // 走行中の worker は drop で rx を切るだけ。worker は send 後に
