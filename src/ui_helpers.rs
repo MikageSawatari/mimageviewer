@@ -9,6 +9,8 @@
 
 use std::path::Path;
 
+use eframe::egui;
+
 use crate::grid_item::GridItem;
 
 /// エラー表示の標準テキスト色。
@@ -38,6 +40,80 @@ pub(crate) const PROGRESS_NORMAL_COLOR: eframe::egui::Color32 =
 #[allow(dead_code)]
 pub(crate) const PROGRESS_UPGRADE_COLOR: eframe::egui::Color32 =
     eframe::egui::Color32::from_rgb(100, 170, 240);
+
+/// ツールチップをマウスカーソル（矢印）と重ならない位置まで下げる上下オフセット。
+///
+/// egui 既定の `on_hover_text` はウィジェット直下 4px に出るため、画面上部の
+/// ツールバーやフルスクリーン上部バーではカーソル画像にツールチップが隠れて
+/// 読みづらい。標準の矢印カーソルはホットスポット（先端）から下へ ~20px 伸びる
+/// ので、それを確実に越える値にしてカーソルの下へ逃がす。
+#[allow(dead_code)]
+pub(crate) const TOOLTIP_CURSOR_GAP: f32 = 28.0;
+
+/// フルスクリーン（黒背景）用のツールチップ枠。動画 HUD（egui 既定の dark
+/// テーマ）と同じ見た目になるよう `Visuals::dark()` から一度だけ生成して使い回す。
+#[allow(dead_code)]
+fn dark_tooltip_frame() -> egui::Frame {
+    static FRAME: std::sync::OnceLock<egui::Frame> = std::sync::OnceLock::new();
+    FRAME
+        .get_or_init(|| {
+            let style = egui::Style {
+                visuals: egui::Visuals::dark(),
+                ..egui::Style::default()
+            };
+            egui::Frame::popup(&style)
+        })
+        .clone()
+}
+
+/// ツールチップをカーソルのホットスポット基準で下方向にずらして表示する。
+#[allow(dead_code)]
+fn show_offset_tooltip(tip: egui::Tooltip<'_>, dark: bool, text: impl Into<egui::WidgetText>) {
+    let mut tip = tip.at_pointer().gap(TOOLTIP_CURSOR_GAP);
+    if dark {
+        tip.popup = tip.popup.frame(dark_tooltip_frame());
+    }
+    tip.show(|ui| {
+        // 動的な内容で Area が縮まないよう最大幅を固定する（egui issue #5167）。
+        ui.set_max_width(ui.spacing().tooltip_width);
+        if dark {
+            *ui.visuals_mut() = egui::Visuals::dark();
+        }
+        ui.add(egui::Label::new(text));
+    });
+}
+
+/// `egui::Response` にカーソルと重ならないツールチップを足す拡張トレイト。
+///
+/// egui 標準の `on_hover_text` はウィジェット直下 4px に固定表示するため、
+/// 画面上部のバーではカーソルの下に隠れてしまう。これらはツールチップを
+/// カーソルのホットスポット基準で下へずらす（[`TOOLTIP_CURSOR_GAP`]）。
+#[allow(dead_code)]
+pub(crate) trait HoverTipExt {
+    /// `on_hover_text` の差し替え。配色は現在の UI テーマに従う（メイン画面向け）。
+    fn hover_tip(self, text: impl Into<egui::WidgetText>) -> Self;
+    /// `hover_tip` の暗色固定版。フルスクリーン（黒背景）向け。
+    fn hover_tip_dark(self, text: impl Into<egui::WidgetText>) -> Self;
+    /// `on_disabled_hover_text` の差し替え（disabled なウィジェット用）。
+    fn hover_tip_disabled(self, text: impl Into<egui::WidgetText>) -> Self;
+}
+
+impl HoverTipExt for egui::Response {
+    fn hover_tip(self, text: impl Into<egui::WidgetText>) -> Self {
+        show_offset_tooltip(egui::Tooltip::for_enabled(&self), false, text);
+        self
+    }
+
+    fn hover_tip_dark(self, text: impl Into<egui::WidgetText>) -> Self {
+        show_offset_tooltip(egui::Tooltip::for_enabled(&self), true, text);
+        self
+    }
+
+    fn hover_tip_disabled(self, text: impl Into<egui::WidgetText>) -> Self {
+        show_offset_tooltip(egui::Tooltip::for_disabled(&self), false, text);
+        self
+    }
+}
 
 // -----------------------------------------------------------------------
 // F1〜F6 のレーティングキー

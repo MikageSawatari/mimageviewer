@@ -14,7 +14,8 @@ use crate::grid_item::{GridItem, ThumbnailState};
 // インライン再生)。フォルダ系は別途同モジュールから直接呼んでいる箇所がある。
 
 use crate::ui_helpers::{
-    PROGRESS_BG_COLOR, PROGRESS_LABEL_COLOR, PROGRESS_NORMAL_COLOR, PROGRESS_UPGRADE_COLOR,
+    HoverTipExt, PROGRESS_BG_COLOR, PROGRESS_LABEL_COLOR, PROGRESS_NORMAL_COLOR,
+    PROGRESS_UPGRADE_COLOR,
 };
 
 // ── ★フィルタのツールバー挙動 (Ctrl/Shift/右クリック) ─────────────────
@@ -229,7 +230,7 @@ fn draw_rating_filter_button(
             enabled,
             egui::Button::selectable(sel, rating_button_label(idx)),
         )
-        .on_hover_text(rating_tooltip(idx));
+        .hover_tip(rating_tooltip(idx));
     let mut changed = false;
     if enabled && resp.clicked() {
         let mods = ui.input(|i| i.modifiers);
@@ -351,7 +352,7 @@ impl App {
                     let can_add = favorite_target.is_some();
                     if ui
                         .add_enabled(can_add, egui::Button::new("このフォルダを追加…"))
-                        .on_disabled_hover_text("お気に入りに追加できるのは実フォルダのみです")
+                        .hover_tip_disabled("お気に入りに追加できるのは実フォルダのみです")
                         .clicked()
                     {
                         if let Some(folder) = favorite_target.clone() {
@@ -453,7 +454,7 @@ impl App {
                                 "選択中のファイルから mIV タグをクリア ({selection_count})"
                             )),
                         )
-                        .on_hover_text(
+                        .hover_tip(
                             "`#` で始まる dc:subject 要素のみ削除します。\n\
                              他ソフトで付けたタグ (#なし) は触りません。",
                         )
@@ -622,7 +623,7 @@ impl App {
                                 )
                                 .fill(egui::Color32::from_rgb(40, 70, 40)),
                             )
-                            .on_hover_text(
+                            .hover_tip(
                                 "新しいバージョンがリリースされています。\n\
                                      クリックで詳細を表示します。",
                             );
@@ -813,7 +814,7 @@ impl App {
                     // (egui の sense)、有効な「★:」ラベル側に乗せる。
                     let star_label = ui.label("★:");
                     if aggregated_search {
-                        star_label.on_hover_text(
+                        star_label.hover_tip(
                             "検索結果のコンテナ一覧では★フィルタは適用できません。\nコンテナを開くと有効になります。",
                         );
                     }
@@ -839,7 +840,7 @@ impl App {
                                 egui::RichText::new("★一時解除中")
                                     .color(egui::Color32::from_rgb(200, 140, 40)),
                             )
-                            .on_hover_text("コンテナ自身の★で開いたため一時解除中です。\n親へ戻るか、このバッジをクリックで復元。");
+                            .hover_tip("コンテナ自身の★で開いたため一時解除中です。\n親へ戻るか、このバッジをクリックで復元。");
                         if resp.clicked() && self.restore_rating_filter_suppression() {
                             toolbar_rating_changed = true;
                         }
@@ -861,7 +862,7 @@ impl App {
                                 current.as_ref().map(|c| c == &fav.path).unwrap_or(false);
                             if ui
                                 .selectable_label(selected, &fav.name)
-                                .on_hover_text(fav.path.to_string_lossy())
+                                .hover_tip(fav.path.to_string_lossy())
                                 .clicked()
                             {
                                 toolbar_fav_nav = Some(fav.path.clone());
@@ -993,7 +994,7 @@ impl App {
                             .unwrap_or_else(|| "フォルダ履歴を戻る".to_string());
                         if ui
                             .add_enabled(back_target.is_some(), egui::Button::new("←"))
-                            .on_hover_text(back_hover)
+                            .hover_tip(back_hover)
                             .clicked()
                         {
                             result = Some(AddressBarNav::HistoryBack);
@@ -1004,7 +1005,7 @@ impl App {
                             .unwrap_or_else(|| "フォルダ履歴を進む".to_string());
                         if ui
                             .add_enabled(forward_target.is_some(), egui::Button::new("→"))
-                            .on_hover_text(forward_hover)
+                            .hover_tip(forward_hover)
                             .clicked()
                         {
                             result = Some(AddressBarNav::HistoryForward);
@@ -1022,7 +1023,7 @@ impl App {
                             .unwrap_or_else(|| "親フォルダへ [BS]".to_string());
                         if ui
                             .add_enabled(parent_target.is_some(), egui::Button::new("⬆"))
-                            .on_hover_text(parent_hover)
+                            .hover_tip(parent_hover)
                             .clicked()
                             && let (Some(cur), Some(parent)) =
                                 (effective_folder.as_ref(), parent_target.as_ref())
@@ -1038,14 +1039,14 @@ impl App {
                     if show_tree_nav {
                         if ui
                             .add_enabled(has_current, egui::Button::new("▲"))
-                            .on_hover_text("ツリー順で前のフォルダへ [Ctrl+↑]")
+                            .hover_tip("ツリー順で前のフォルダへ [Ctrl+↑]")
                             .clicked()
                         {
                             tree_nav = Some(false);
                         }
                         if ui
                             .add_enabled(has_current, egui::Button::new("▼"))
-                            .on_hover_text("ツリー順で次のフォルダへ [Ctrl+↓]")
+                            .hover_tip("ツリー順で次のフォルダへ [Ctrl+↓]")
                             .clicked()
                         {
                             tree_nav = Some(true);
@@ -1067,9 +1068,7 @@ impl App {
                                     .color(egui::Color32::from_rgb(130, 170, 220))
                                     .strong(),
                             )
-                            .on_hover_text(
-                                "このフォルダ / ZIP / PDF のレーティング [Shift+F1〜F6]",
-                            );
+                            .hover_tip("このフォルダ / ZIP / PDF のレーティング [Shift+F1〜F6]");
                             ui.add_space(4.0);
                         }
                         if let Some(count) = thumbnail_count.as_ref() {
@@ -1079,7 +1078,7 @@ impl App {
                                     .monospace()
                                     .color(egui::Color32::from_gray(140)),
                             )
-                            .on_hover_text("表示中のサムネイル数 / 全サムネイル数");
+                            .hover_tip("表示中のサムネイル数 / 全サムネイル数");
                             ui.add_space(4.0);
                         }
                         // 📌 (代表サムネ固定): right_to_left なので 📁★ より左 (= 入力欄寄り) に置く。
@@ -1093,7 +1092,7 @@ impl App {
                             };
                             let btn = egui::Button::new(label).frame(false);
                             let resp = ui.add_enabled(info.enabled, btn);
-                            let resp = resp.on_hover_text(info.tooltip.as_str());
+                            let resp = resp.hover_tip(info.tooltip.as_str());
                             if info.enabled {
                                 if resp.clicked() {
                                     pin_click = PinButtonClick::Toggle;
@@ -1121,7 +1120,7 @@ impl App {
                                     let button =
                                         egui::Button::new(egui::RichText::new(&full).monospace())
                                             .wrap_mode(egui::TextWrapMode::Extend);
-                                    if ui.add(button).on_hover_text(&full).clicked() {
+                                    if ui.add(button).hover_tip(&full).clicked() {
                                         if let Some(resolved) = resolve_folder_bar_nav_path(path) {
                                             result = Some(AddressBarNav::Direct(resolved));
                                         }
@@ -1137,7 +1136,7 @@ impl App {
                                 }
                             })
                             .response
-                            .on_hover_text("最近開いたフォルダ");
+                            .hover_tip("最近開いたフォルダ");
                             ui.add_space(4.0);
                         }
 
@@ -1162,7 +1161,7 @@ impl App {
                                     favorite_target.is_some(),
                                     egui::Button::new(label).frame(false),
                                 )
-                                .on_hover_text(tooltip)
+                                .hover_tip(tooltip)
                                 .clicked()
                             {
                                 favorite_click = if current_is_favorite {
@@ -1268,7 +1267,7 @@ impl App {
                 }
 
                 // × ボタン
-                if ui.small_button("×").on_hover_text("検索を閉じる").clicked() {
+                if ui.small_button("×").hover_tip("検索を閉じる").clicked() {
                     self.cancel_pending_folder_nav();
                     self.show_search_bar = false;
                     self.search_query.clear();
@@ -1390,7 +1389,7 @@ impl App {
                     query_changed = true;
                 }
 
-                if ui.small_button("×").on_hover_text("検索を閉じる").clicked() {
+                if ui.small_button("×").hover_tip("検索を閉じる").clicked() {
                     close_requested = true;
                 }
 

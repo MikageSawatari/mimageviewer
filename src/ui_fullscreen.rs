@@ -26,7 +26,7 @@ use crate::fs_animation::FsCacheEntry;
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::pdf_loader::PdfPageContentType;
 use crate::settings::SpreadMode;
-use crate::ui_helpers::open_external_player;
+use crate::ui_helpers::{HoverTipExt, open_external_player};
 
 mod draw_icons;
 use self::draw_icons::*;
@@ -5443,7 +5443,7 @@ impl App {
             false, // active 状態なし
             |p, c, r| draw_close_icon(p, c, r),
         );
-        let close_resp = close_resp.on_hover_text("閉じる [Esc]");
+        let close_resp = close_resp.hover_tip_dark("閉じる [Esc]");
         if close_resp.clicked() {
             *close_fs = true;
         }
@@ -5463,8 +5463,8 @@ impl App {
                 false,
                 |p, c, r| draw_camera_icon(p, c, r),
             );
-            let camera_resp =
-                camera_resp.on_hover_text("クリック: クリップボードにコピー\nCtrl+S: ファイル保存");
+            let camera_resp = camera_resp
+                .hover_tip_dark("クリック: クリップボードにコピー\nCtrl+S: ファイル保存");
             if camera_resp.clicked() {
                 *copy_capture_pressed = true;
             }
@@ -5487,7 +5487,7 @@ impl App {
                 vst3_panel_open,
                 |p, c, _r| draw_vst_text_label(p, c),
             );
-            let vst_resp = vst_resp.on_hover_text(if vst3_panel_open {
+            let vst_resp = vst_resp.hover_tip_dark(if vst3_panel_open {
                 "VST3 プラグイン管理を閉じる"
             } else {
                 "VST3 プラグイン管理を開く"
@@ -5512,7 +5512,7 @@ impl App {
                 tile_active,
                 |p, c, r| draw_tile_grid_icon(p, c, r),
             );
-            let tile_resp = tile_resp.on_hover_text(if tile_active {
+            let tile_resp = tile_resp.hover_tip_dark(if tile_active {
                 "タイルモード解除 [S]"
             } else {
                 "タイルモード [S]"
@@ -5548,9 +5548,9 @@ impl App {
                 },
             );
             let play_resp = if *slideshow_playing {
-                play_resp.on_hover_text("スライドショー停止")
+                play_resp.hover_tip_dark("スライドショー停止")
             } else {
-                play_resp.on_hover_text("スライドショー")
+                play_resp.hover_tip_dark("スライドショー")
             };
             if play_resp.clicked() {
                 *slideshow_playing = !*slideshow_playing;
@@ -5572,7 +5572,7 @@ impl App {
                 false,
                 |p, c, r| draw_rotate_icon(p, c, r, true),
             );
-            let rcw_resp = rcw_resp.on_hover_text("右回転 [R]");
+            let rcw_resp = rcw_resp.hover_tip_dark("右回転 [R]");
             if rcw_resp.clicked() {
                 *rotate_cw = true;
             }
@@ -5590,7 +5590,7 @@ impl App {
                 false,
                 |p, c, r| draw_rotate_icon(p, c, r, false),
             );
-            let rccw_resp = rccw_resp.on_hover_text("左回転 [L]");
+            let rccw_resp = rccw_resp.hover_tip_dark("左回転 [L]");
             if rccw_resp.clicked() {
                 *rotate_ccw = true;
             }
@@ -5610,7 +5610,7 @@ impl App {
             *show_info,
             |p, c, r| draw_info_icon(p, c, r),
         );
-        let info_resp = info_resp.on_hover_text("メタデータ [I / Tab]");
+        let info_resp = info_resp.hover_tip_dark("メタデータ [I / Tab]");
         if info_resp.clicked() {
             *show_info = !*show_info;
         }
@@ -5630,7 +5630,7 @@ impl App {
                 *show_analysis,
                 |p, c, r| draw_analysis_icon(p, c, r),
             );
-            let analysis_resp = analysis_resp.on_hover_text("分析ツール [Z]");
+            let analysis_resp = analysis_resp.hover_tip_dark("分析ツール [Z]");
             if analysis_resp.clicked() {
                 *show_analysis = !*show_analysis;
             }
@@ -5654,7 +5654,7 @@ impl App {
                 spread_active,
                 |p, c, r| draw_spread_icon(p, c, r, sm),
             );
-            let spread_resp = spread_resp.on_hover_text("見開き設定 [1-5]");
+            let spread_resp = spread_resp.hover_tip_dark("見開き設定 [1-5]");
             spread_resp_rect = spread_resp.rect;
             if spread_resp.clicked() {
                 *spread_popup_open = !*spread_popup_open;
@@ -5799,7 +5799,7 @@ impl App {
             } else {
                 "画像補正"
             };
-            let resp = resp.on_hover_text(tooltip);
+            let resp = resp.hover_tip_dark(tooltip);
             if resp.clicked() {
                 *adjustment_mode = !*adjustment_mode;
             }
@@ -6147,7 +6147,7 @@ impl App {
                     egui::Sense::click(),
                 )
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("クリックで保存ファイルを表示");
+                .hover_tip_dark("クリックで保存ファイルを表示");
             if resp.clicked() {
                 crate::capture::reveal_path_async(path);
                 self.fs_feedback_toast = None;
