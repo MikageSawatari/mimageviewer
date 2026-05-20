@@ -176,6 +176,11 @@ pub struct NativeVideoPresenter {
     /// CP9 実機 debug: 直近 log した region hash。`MIV_HUD_DEBUG=1` のとき
     /// region 変化時に 1 回だけログ出力するための重複抑制用。
     last_logged_region_hash: Option<u64>,
+    /// Last HUD HWND region hash published by the presenter. Tracked separately
+    /// from `last_logged_region_hash` because debug logging may be disabled.
+    last_hud_region_hash: Option<u64>,
+    /// Whether the last published HUD HWND region list was empty.
+    last_hud_regions_empty: bool,
     /// 実機修正 (2026-05-12 P1 #3): 直近 LBUTTON down が検出された時刻。
     /// external_drag 判定に 100ms の delay を入れることで「short click」を
     /// drag と誤検出して top bar を hide させるバグを防ぐ。
@@ -263,6 +268,8 @@ struct NativeTestOverlay {
     render_target: Option<ID3D11RenderTargetView>,
     width: u32,
     height: u32,
+    /// true = MPO 防止用の完全透明カバー (テストパターンを描かず透明のまま present)。
+    transparent: bool,
 }
 
 struct NativeEguiOverlay {
@@ -1313,7 +1320,17 @@ impl NativeVideoPresenter {
                 }
             }
 
+            // Route A — MPO ちらつき修正 (v0.9.2): 動画 visual の真上に完全透明な
+            // 全画面カバー visual を常駐させる。presenter HWND の内容が「動画 swap
+            // chain 単独」でなくなり、DWM が動画をハードウェアオーバーレイ面 (MPO)
+            // へ昇格できなくなる。これにより、トースト / HUD 出現時の MPO プレーン
+            // 降格遷移で動画フレームが 1 フレームずれて見える不具合が解消する。
+            // カバーは premultiplied alpha の (0,0,0,0) なので表示は一切変わらない。
+            // `MIV_DISABLE_MPO_COVER` で無効化できる (= 万一カバーが特定 GPU /
+            // ドライバで問題を起こした場合のエスケープハッチ)。
+            let mpo_cover_enabled = std::env::var_os("MIV_DISABLE_MPO_COVER").is_none();
             let test_overlay = if config.test_overlay && egui_overlay.is_none() {
+                // デバッグ用の可視テストパターン (従来機能、明示指定時のみ)。
                 let overlay = NativeTestOverlay::new(
                     &factory,
                     &d3d_device,
@@ -1323,10 +1340,31 @@ impl NativeVideoPresenter {
                     &dcomp_device,
                     config.width,
                     config.height,
+                    false,
                 )?;
                 root_visual
                     .AddVisual(&overlay._visual, true, &video_visual)
                     .map_err(|e| format!("IDCompositionVisual::AddVisual overlay: {e:?}"))?;
+                Some(overlay)
+            } else if mpo_cover_enabled {
+                // 本番: MPO 防止の透明カバー。
+                let overlay = NativeTestOverlay::new(
+                    &factory,
+                    &d3d_device,
+                    &d3d_device1,
+                    &d3d_context,
+                    &d3d_context1,
+                    &dcomp_device,
+                    config.width,
+                    config.height,
+                    true,
+                )?;
+                root_visual
+                    .AddVisual(&overlay._visual, true, &video_visual)
+                    .map_err(|e| format!("IDCompositionVisual::AddVisual mpo cover: {e:?}"))?;
+                crate::logger::log(
+                    "[native-video] MPO-defeat transparent cover enabled".to_string(),
+                );
                 Some(overlay)
             } else {
                 None
@@ -1378,6 +1416,8 @@ impl NativeVideoPresenter {
                 editor_hwnds_snapshot: None,
                 main_hwnd_for_raise: 0,
                 last_logged_region_hash: None,
+                last_hud_region_hash: None,
+                last_hud_regions_empty: true,
                 lbutton_down_since: None,
                 fence_cache: None,
                 copy_fence,
@@ -2397,9 +2437,23 @@ impl NativeVideoPresenter {
     /// 入力を取り続ける (= VST に入力が抜けない) regression を引き起こす。
     /// HUD HWND が無い (フォールバック経路) なら両方 no-op。
     fn publish_hud_regions(&mut self, outcome: &NativeOverlayInputOutcome) {
+        let hud_region_hash = self
+            .hud_window
+            .as_ref()
+            .map(|_| hud_window::hash_regions_for_debug(&outcome.hud_regions));
+        let hud_region_changed = hud_region_hash
+            .map(|new_hash| self.last_hud_region_hash != Some(new_hash))
+            .unwrap_or(false);
+        let hud_regions_empty = outcome.hud_regions.is_empty();
+        let toast_active = self
+            .egui_overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.toast.is_some());
+
         // CP9 実機 debug log: `MIV_HUD_DEBUG=1` で起動したら region 変化を log する。
         if hud_debug_enabled() && self.hud_window.is_some() {
-            let new_hash = hud_window::hash_regions_for_debug(&outcome.hud_regions);
+            let new_hash = hud_region_hash
+                .unwrap_or_else(|| hud_window::hash_regions_for_debug(&outcome.hud_regions));
             if self.last_logged_region_hash != Some(new_hash) {
                 self.last_logged_region_hash = Some(new_hash);
                 let rects_str: String = outcome
@@ -2440,6 +2494,25 @@ impl NativeVideoPresenter {
             }
         }
         self.apply_hud_regions(&outcome.hud_regions);
+        if let Some(new_hash) = hud_region_hash {
+            if hud_region_changed {
+                log_event(
+                    "hud_region_publish",
+                    &[
+                        ("region_hash", Value::from(new_hash)),
+                        (
+                            "region_count",
+                            Value::from(outcome.hud_regions.len() as i64),
+                        ),
+                        ("regions_empty", Value::from(hud_regions_empty)),
+                        ("was_empty", Value::from(self.last_hud_regions_empty)),
+                        ("toast_active", Value::from(toast_active)),
+                    ],
+                );
+            }
+            self.last_hud_region_hash = Some(new_hash);
+            self.last_hud_regions_empty = hud_regions_empty;
+        }
     }
 
     pub fn update_overlay_video_state(
@@ -6477,6 +6550,7 @@ impl NativeTestOverlay {
         dcomp_device: &IDCompositionDevice,
         width: u32,
         height: u32,
+        transparent: bool,
     ) -> Result<Self, String> {
         let desc = DXGI_SWAP_CHAIN_DESC1 {
             Width: width.max(1),
@@ -6515,15 +6589,21 @@ impl NativeTestOverlay {
             render_target: None,
             width: width.max(1),
             height: height.max(1),
+            transparent,
         };
         this.recreate_backbuffer(d3d_device1, d3d_context)?;
-        this.draw_test_pattern(d3d_context, d3d_context1)?;
+        if transparent {
+            this.present_transparent()?;
+        } else {
+            this.draw_test_pattern(d3d_context, d3d_context1)?;
+        }
         log_event(
             "overlay_init",
             &[
                 ("width", Value::from(this.width as i64)),
                 ("height", Value::from(this.height as i64)),
                 ("alpha_mode", Value::from("premultiplied")),
+                ("transparent", Value::from(transparent)),
             ],
         );
         Ok(this)
@@ -6560,7 +6640,11 @@ impl NativeTestOverlay {
         self.width = width;
         self.height = height;
         self.recreate_backbuffer(d3d_device1, d3d_context)?;
-        self.draw_test_pattern(d3d_context, d3d_context1)?;
+        if self.transparent {
+            self.present_transparent()?;
+        } else {
+            self.draw_test_pattern(d3d_context, d3d_context1)?;
+        }
         Ok(())
     }
 
@@ -6631,6 +6715,18 @@ impl NativeTestOverlay {
                 ("height", Value::from(self.height as i64)),
             ],
         );
+        Ok(())
+    }
+
+    /// MPO 防止カバー用: 透明クリア済み backbuffer を 1 度だけ present する。
+    /// `recreate_backbuffer` が既に `[0,0,0,0]` でクリア済みなので present のみ行う。
+    fn present_transparent(&self) -> Result<(), String> {
+        unsafe {
+            self.swap_chain
+                .Present(1, Default::default())
+                .ok()
+                .map_err(|e| format!("overlay transparent Present: {e:?}"))?;
+        }
         Ok(())
     }
 }

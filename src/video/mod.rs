@@ -1468,27 +1468,73 @@ fn run_native_video_output(
         );
         return Ok(());
     }
-    let shown = window.show_and_raise();
-    hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
-    // HUD HWND が生成されたら App から見えるように atomic に store。
-    // CP4 段階 (= hud_event_tx=None) では生成されないので 0 のまま。
-    hud_hwnd_out.store(presenter.hud_hwnd(), Ordering::Release);
-
     // CP7: cursor polling の raise allowlist 判定で使う state を presenter に渡す。
     // `editor_hwnds_snapshot` が `None` のときは raise 判定で常に false (= polling では
     // raise 起動しない、ただし click-through 自体は SetWindowRgn で機能する)。
     presenter.set_editor_hwnds_snapshot(config.editor_hwnds_snapshot.clone());
     presenter.set_main_hwnd_for_raise_check(config.main_hwnd_for_raise);
     crate::logger::log(format!(
-        "[native-video] fullscreen presenter started hwnd=0x{:x} shown={} rect=({},{} {}x{}) sync_interval={}",
+        "[native-video] fullscreen presenter initialized hidden hwnd=0x{:x} rect=({},{} {}x{}) sync_interval={}",
         window.hwnd().0 as usize,
-        shown,
         config.rect.left,
         config.rect.top,
         width,
         height,
         config.sync_interval
     ));
+    let mut presenter_window_published = false;
+    fn publish_presenter_window(
+        window: &crate::video::native_window::NativeVideoWindow,
+        hwnd_out: &Arc<AtomicU64>,
+        hud_hwnd_out: &Arc<AtomicU64>,
+        hud_hwnd: u64,
+        config: &NativeVideoOutputConfig,
+        width: u32,
+        height: u32,
+        run_started: Instant,
+        reason: &'static str,
+        published: &mut bool,
+    ) {
+        if *published {
+            return;
+        }
+        let shown = window.show_and_raise();
+        hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
+        // HUD HWND が生成されたら App から見えるように atomic に store。
+        // CP4 段階 (= hud_event_tx=None) では生成されないので 0 のまま。
+        hud_hwnd_out.store(hud_hwnd, Ordering::Release);
+        *published = true;
+        crate::logger::log(format!(
+            "[native-video] fullscreen presenter started hwnd=0x{:x} shown={} reason={} elapsed_ms={:.1} rect=({},{} {}x{}) sync_interval={}",
+            window.hwnd().0 as usize,
+            shown,
+            reason,
+            run_started.elapsed().as_secs_f64() * 1000.0,
+            config.rect.left,
+            config.rect.top,
+            width,
+            height,
+            config.sync_interval
+        ));
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "native_presenter",
+                "window_publish",
+                None,
+                0,
+                &[
+                    ("shown", serde_json::Value::from(shown)),
+                    ("reason", serde_json::Value::from(reason)),
+                    (
+                        "elapsed_ms",
+                        serde_json::Value::from(run_started.elapsed().as_secs_f64() * 1000.0),
+                    ),
+                    ("width", serde_json::Value::from(width as i64)),
+                    ("height", serde_json::Value::from(height as i64)),
+                ],
+            );
+        }
+    }
     presenter.set_overlay_vst3_available(config.vst3_available);
     presenter.set_overlay_checked(config.checked);
     if config.initial_tile_overlay {
@@ -2765,6 +2811,20 @@ fn run_native_video_output(
                         last_summary_log = Instant::now();
                     }
                     source.displayed_frame_seq.fetch_add(1, Ordering::Release);
+                    if !presenter_window_published {
+                        publish_presenter_window(
+                            &window,
+                            &hwnd_out,
+                            &hud_hwnd_out,
+                            presenter.hud_hwnd(),
+                            &config,
+                            width,
+                            height,
+                            run_started,
+                            "first-present",
+                            &mut presenter_window_published,
+                        );
+                    }
                     let first_present_for_source =
                         !first_presented_out.swap(true, Ordering::AcqRel);
                     // Keep the deferred-navigation preview covering the old source until
