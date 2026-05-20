@@ -70,13 +70,16 @@ fn dark_tooltip_frame() -> egui::Frame {
         .clone()
 }
 
-/// 現在のマウスカーソル画像がホットスポットから下へ何ピクセル張り出して
-/// いるかを物理ピクセルで返す。tooltip をカーソルの真下に重ならず置くための実測値。
+/// 現在のマウスカーソル画像がホットスポットから上下それぞれへ何ピクセル
+/// 張り出しているかを物理ピクセルで `(上, 下)` の順に返す。
 ///
-/// アクセシビリティ設定でカーソルを拡大しているユーザーや高 DPI でも正しい
-/// 値になるよう、固定値ではなく実際のカーソルビットマップから測る。
+/// 矢印カーソルはホットスポットが先端付近にあるので「上」はほぼ 0 だが、
+/// `ResizeHorizontal` のようにホットスポットが中央寄りの形状ではカーソル画像が
+/// 上にも伸びる。tooltip を上下どちらへ反転配置してもカーソルと重ねないために
+/// 両方向を測る。固定値ではなく実際のカーソルビットマップから測るので、
+/// アクセシビリティ設定での拡大や高 DPI でも正しい。
 #[allow(dead_code)]
-fn cursor_below_extent_physical() -> Option<f32> {
+fn cursor_extent_physical() -> Option<(f32, f32)> {
     use std::ffi::c_void;
     use windows::Win32::Graphics::Gdi::{BITMAP, DeleteObject, GetObjectW, HGDIOBJ};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -102,7 +105,11 @@ fn cursor_below_extent_physical() -> Option<f32> {
                 std::mem::size_of::<BITMAP>() as i32,
                 Some(&mut bmp as *mut BITMAP as *mut c_void),
             );
-            (written != 0).then(|| (bmp.bmHeight - ii.yHotspot as i32).max(0) as f32)
+            (written != 0).then(|| {
+                let above = (ii.yHotspot as i32).max(0);
+                let below = (bmp.bmHeight - above).max(0);
+                (above as f32, below as f32)
+            })
         } else {
             None
         };
@@ -120,17 +127,18 @@ fn cursor_below_extent_physical() -> Option<f32> {
 
 /// 現在のカーソル位置を基準に「カーソル画像の縦の占有範囲」を表すアンカー矩形を作る。
 ///
-/// この矩形の真下に tooltip を出せばカーソルの真下、真上に出せばホットスポットの
-/// 真上になり、egui がどちらに反転配置してもカーソルと重ならない。
+/// この矩形の真下に tooltip を出せばカーソル画像の下端の外、真上に出せば上端の
+/// 外になり、egui がどちらへ反転配置してもカーソルと重ならない。
 #[allow(dead_code)]
 fn cursor_anchor_rect(ctx: &egui::Context) -> Option<egui::Rect> {
     let pos = ctx.pointer_hover_pos()?;
-    let below = match cursor_below_extent_physical() {
-        Some(px) => px / ctx.pixels_per_point(),
-        None => CURSOR_FALLBACK_EXTENT,
+    let ppp = ctx.pixels_per_point();
+    let (above, below) = match cursor_extent_physical() {
+        Some((a, b)) => (a / ppp, b / ppp),
+        None => (0.0, CURSOR_FALLBACK_EXTENT),
     };
     Some(egui::Rect::from_min_max(
-        pos,
+        egui::pos2(pos.x, pos.y - above),
         egui::pos2(pos.x, pos.y + below),
     ))
 }
