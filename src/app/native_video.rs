@@ -982,7 +982,11 @@ impl App {
         // - `set_hud_hwnd(hud_hwnd)`: HUD HWND を「raise allowlist の mIV 既知 HWND」として登録
         //   (= `foreground_allows_hud_raise` で許可される)。**owner 候補には絶対に出さない**
         //   (= `current_gui_owner_hwnd` 内で除外済み)。
-        self.dsp_bridge.register_fullscreen_owner(hwnd);
+        // in-window モードでは VST editor の owner を presenter にしない
+        // (WS_CHILD を owner にすると z-order/focus が壊れる。Codex P3)。
+        if !crate::app::video_in_main_window_enabled() {
+            self.dsp_bridge.register_fullscreen_owner(hwnd);
+        }
         self.dsp_bridge.set_hud_hwnd(hud_hwnd);
         self.sync_native_video_main_cloak(false);
         // 実機修正 (2026-05-12 P1 致命的問題): cross-process SetWindowPos(VST_HWND) は
@@ -3010,11 +3014,11 @@ impl App {
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return;
         };
-        player.set_native_vst3_available(self.settings.vst3_enabled);
+        // in-window モードでは VST3 GUI を対象外にする (presenter が WS_CHILD のため)。
+        let vst3_ok = self.settings.vst3_enabled && !crate::app::video_in_main_window_enabled();
+        player.set_native_vst3_available(vst3_ok);
         player.set_native_video_compact(
-            self.settings.vst3_enabled
-                && self.settings.vst3_gui_visible
-                && self.settings.vst3_video_compact,
+            vst3_ok && self.settings.vst3_gui_visible && self.settings.vst3_video_compact,
         );
     }
 

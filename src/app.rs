@@ -13367,7 +13367,10 @@ impl App {
             // foreground=null/pid=0 の不確定ケースは保守的に false 扱い。
             let foreground_is_ours =
                 crate::video::native_window::foreground_belongs_to_current_process_strict();
-            if native_video_was_active && foreground_is_ours {
+            // in-window モードでは presenter は main の子で、close 時も main が
+            // foreground のまま。fullscreen 用の foreground 奪還は不要なのでスキップ
+            // (Codex P2)。
+            if native_video_was_active && foreground_is_ours && !video_in_main_window_enabled() {
                 self.pending_main_foreground_reclaim = true;
                 self.pending_main_foreground_reclaim_after_hwnd =
                     self.native_video_presenter_hwnd().unwrap_or(0);
@@ -19836,7 +19839,9 @@ fn native_video_presenter_config(
         sync_interval,
         perf_overlay_visible,
         initial_tile_overlay,
-        vst3_available,
+        // in-window モードでは VST3 GUI を対象外にする (presenter が WS_CHILD のため
+        // VST editor の owner にすると z-order/focus が壊れる。音声処理は別途継続)。
+        vst3_available: vst3_available && !in_main_window,
         checked,
         editor_hwnds_snapshot,
         main_hwnd_for_raise,

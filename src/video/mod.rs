@@ -685,10 +685,6 @@ impl NativeVideoOutput {
                     thread_hud_hwnd.store(0, Ordering::Release);
                     thread_closed.store(true, Ordering::Release);
                 }
-                // presenter thread 終了: in-window child HWND の登録を解除する
-                // (handle 再利用時に main window subclass が無関係な window を
-                // resize するのを防ぐ)。
-                crate::video::native_window::set_in_window_video_child(0);
             }) {
             Ok(thread) => thread,
             Err(err) => {

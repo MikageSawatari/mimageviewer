@@ -20,7 +20,7 @@ use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
     AdjustWindowRectEx, CREATESTRUCTW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT,
     CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW, GWL_STYLE, GWLP_USERDATA,
-    GetClientRect, GetCursorPos, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect,
+    GetClientRect, GetCursorPos, GetForegroundWindow, GetParent, GetWindowLongPtrW, GetWindowRect,
     GetWindowThreadProcessId, HTCLIENT, HWND_TOP, IDC_ARROW, IsWindow, IsWindowVisible,
     LoadCursorW, MA_ACTIVATE, MA_ACTIVATEANDEAT, MSG, PM_REMOVE, PeekMessageW, PostQuitMessage,
     RegisterClassW, SW_SHOW, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
@@ -257,7 +257,11 @@ unsafe extern "system" fn in_window_resize_subclass_proc(
         if child != 0 {
             let child_hwnd = HWND(child as *mut _);
             unsafe {
-                if IsWindow(Some(child_hwnd)).as_bool() {
+                // handle 再利用への防御 (Codex P2): child が生きていて、かつその親が
+                // いま resize されている `hwnd` であるときだけリサイズする。
+                let is_our_child = IsWindow(Some(child_hwnd)).as_bool()
+                    && GetParent(child_hwnd).is_ok_and(|p| p == hwnd);
+                if is_our_child {
                     let mut rc = RECT::default();
                     if GetClientRect(hwnd, &mut rc).is_ok() {
                         let w = (rc.right - rc.left).max(1);
@@ -426,6 +430,17 @@ impl NativeVideoWindow {
         }
         unsafe {
             if IsWindow(Some(self.hwnd)).as_bool() {
+                // in-window child の global 登録を DestroyWindow の **前** に解除する。
+                // 「DestroyWindow 後・解除前」の窓で main の WM_SIZE が来ると、再利用
+                // された handle を subclass が掴む恐れがあるため (Codex P2)。CAS で
+                // 「自分の HWND のときだけ」0 にする (fullscreen window では global は
+                // 別値/0 なので no-op)。
+                let _ = IN_WINDOW_VIDEO_CHILD.compare_exchange(
+                    self.hwnd.0 as u64,
+                    0,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                );
                 let _ = DestroyWindow(self.hwnd);
             }
         }
