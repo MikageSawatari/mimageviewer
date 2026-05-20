@@ -41,14 +41,18 @@ pub(crate) const PROGRESS_NORMAL_COLOR: eframe::egui::Color32 =
 pub(crate) const PROGRESS_UPGRADE_COLOR: eframe::egui::Color32 =
     eframe::egui::Color32::from_rgb(100, 170, 240);
 
-/// ツールチップをマウスカーソル（矢印）と重ならない位置まで下げる上下オフセット。
+/// tooltip と実際のカーソル形状の境界の間に空ける隙間（論理 px）。
 ///
-/// egui 既定の `on_hover_text` はウィジェット直下 4px に出るため、画面上部の
-/// ツールバーやフルスクリーン上部バーではカーソル画像にツールチップが隠れて
-/// 読みづらい。標準の矢印カーソルはホットスポット（先端）から下へ ~20px 伸びる
-/// ので、それを確実に越える値にしてカーソルの下へ逃がす。
+/// tooltip はカーソル画像の真下（または上に出る場合はホットスポットの真上）に
+/// 置き、その境界からこのぶんだけ離す。下に出るときも上に出るときも同じ値で
+/// よいよう、アンカーをカーソルの実寸に合わせる（[`cursor_anchor_rect`]）。
 #[allow(dead_code)]
-pub(crate) const TOOLTIP_CURSOR_GAP: f32 = 28.0;
+const TOOLTIP_GAP: f32 = 6.0;
+
+/// カーソル形状を取得できなかったときのフォールバック。ホットスポットから
+/// 下方向への張り出し量（論理 px）。標準サイズの矢印カーソル相当。
+#[allow(dead_code)]
+const CURSOR_FALLBACK_EXTENT: f32 = 34.0;
 
 /// フルスクリーン（黒背景）用のツールチップ枠。動画 HUD（egui 既定の dark
 /// テーマ）と同じ見た目になるよう `Visuals::dark()` から一度だけ生成して使い回す。
@@ -66,10 +70,93 @@ fn dark_tooltip_frame() -> egui::Frame {
         .clone()
 }
 
-/// ツールチップをカーソルのホットスポット基準で下方向にずらして表示する。
+/// 現在のマウスカーソル画像がホットスポットから下へ何ピクセル張り出して
+/// いるかを物理ピクセルで返す。tooltip をカーソルの真下に重ならず置くための実測値。
+///
+/// アクセシビリティ設定でカーソルを拡大しているユーザーや高 DPI でも正しい
+/// 値になるよう、固定値ではなく実際のカーソルビットマップから測る。
 #[allow(dead_code)]
-fn show_offset_tooltip(tip: egui::Tooltip<'_>, dark: bool, text: impl Into<egui::WidgetText>) {
-    let mut tip = tip.at_pointer().gap(TOOLTIP_CURSOR_GAP);
+fn cursor_below_extent_physical() -> Option<f32> {
+    use std::ffi::c_void;
+    use windows::Win32::Graphics::Gdi::{BITMAP, DeleteObject, GetObjectW, HGDIOBJ};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CURSOR_SHOWING, CURSORINFO, GetCursorInfo, GetIconInfo, HICON, ICONINFO,
+    };
+
+    unsafe {
+        let mut ci = CURSORINFO {
+            cbSize: std::mem::size_of::<CURSORINFO>() as u32,
+            ..Default::default()
+        };
+        GetCursorInfo(&mut ci).ok()?;
+        if (ci.flags.0 & CURSOR_SHOWING.0) == 0 || ci.hCursor.0.is_null() {
+            return None;
+        }
+        let mut ii = ICONINFO::default();
+        GetIconInfo(HICON(ci.hCursor.0), &mut ii).ok()?;
+
+        let extent = if !ii.hbmColor.0.is_null() {
+            let mut bmp = BITMAP::default();
+            let written = GetObjectW(
+                HGDIOBJ(ii.hbmColor.0),
+                std::mem::size_of::<BITMAP>() as i32,
+                Some(&mut bmp as *mut BITMAP as *mut c_void),
+            );
+            (written != 0).then(|| (bmp.bmHeight - ii.yHotspot as i32).max(0) as f32)
+        } else {
+            None
+        };
+
+        // GetIconInfo が複製したビットマップは呼び出し側で解放する。
+        if !ii.hbmColor.0.is_null() {
+            let _ = DeleteObject(HGDIOBJ(ii.hbmColor.0));
+        }
+        if !ii.hbmMask.0.is_null() {
+            let _ = DeleteObject(HGDIOBJ(ii.hbmMask.0));
+        }
+        extent
+    }
+}
+
+/// 現在のカーソル位置を基準に「カーソル画像の縦の占有範囲」を表すアンカー矩形を作る。
+///
+/// この矩形の真下に tooltip を出せばカーソルの真下、真上に出せばホットスポットの
+/// 真上になり、egui がどちらに反転配置してもカーソルと重ならない。
+#[allow(dead_code)]
+fn cursor_anchor_rect(ctx: &egui::Context) -> Option<egui::Rect> {
+    let pos = ctx.pointer_hover_pos()?;
+    let below = match cursor_below_extent_physical() {
+        Some(px) => px / ctx.pixels_per_point(),
+        None => CURSOR_FALLBACK_EXTENT,
+    };
+    Some(egui::Rect::from_min_max(
+        pos,
+        egui::pos2(pos.x, pos.y + below),
+    ))
+}
+
+/// hover 中のウィジェットだけカーソル実寸を計測する（毎フレーム全ウィジェットで
+/// OS 呼び出しをしないためのゲート）。
+#[allow(dead_code)]
+fn anchor_for(resp: &egui::Response) -> Option<egui::Rect> {
+    resp.contains_pointer()
+        .then(|| cursor_anchor_rect(&resp.ctx))
+        .flatten()
+}
+
+/// tooltip をカーソル画像の外側へずらして表示する共通処理。
+#[allow(dead_code)]
+fn show_offset_tooltip(
+    tip: egui::Tooltip<'_>,
+    dark: bool,
+    anchor: Option<egui::Rect>,
+    text: impl Into<egui::WidgetText>,
+) {
+    let mut tip = tip.gap(TOOLTIP_GAP);
+    match anchor {
+        Some(rect) => tip.popup = tip.popup.anchor(rect),
+        None => tip = tip.at_pointer(),
+    }
     if dark {
         tip.popup = tip.popup.frame(dark_tooltip_frame());
     }
@@ -86,8 +173,8 @@ fn show_offset_tooltip(tip: egui::Tooltip<'_>, dark: bool, text: impl Into<egui:
 /// `egui::Response` にカーソルと重ならないツールチップを足す拡張トレイト。
 ///
 /// egui 標準の `on_hover_text` はウィジェット直下 4px に固定表示するため、
-/// 画面上部のバーではカーソルの下に隠れてしまう。これらはツールチップを
-/// カーソルのホットスポット基準で下へずらす（[`TOOLTIP_CURSOR_GAP`]）。
+/// 画面上部のバーではカーソルの下に隠れてしまう。これらは tooltip を実際の
+/// カーソル形状の外側（下に出るときは真下、上に出るときは真上）へ逃がす。
 #[allow(dead_code)]
 pub(crate) trait HoverTipExt {
     /// `on_hover_text` の差し替え。配色は現在の UI テーマに従う（メイン画面向け）。
@@ -100,17 +187,20 @@ pub(crate) trait HoverTipExt {
 
 impl HoverTipExt for egui::Response {
     fn hover_tip(self, text: impl Into<egui::WidgetText>) -> Self {
-        show_offset_tooltip(egui::Tooltip::for_enabled(&self), false, text);
+        let anchor = anchor_for(&self);
+        show_offset_tooltip(egui::Tooltip::for_enabled(&self), false, anchor, text);
         self
     }
 
     fn hover_tip_dark(self, text: impl Into<egui::WidgetText>) -> Self {
-        show_offset_tooltip(egui::Tooltip::for_enabled(&self), true, text);
+        let anchor = anchor_for(&self);
+        show_offset_tooltip(egui::Tooltip::for_enabled(&self), true, anchor, text);
         self
     }
 
     fn hover_tip_disabled(self, text: impl Into<egui::WidgetText>) -> Self {
-        show_offset_tooltip(egui::Tooltip::for_disabled(&self), false, text);
+        let anchor = anchor_for(&self);
+        show_offset_tooltip(egui::Tooltip::for_disabled(&self), false, anchor, text);
         self
     }
 }
