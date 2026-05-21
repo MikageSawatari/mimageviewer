@@ -1136,23 +1136,39 @@ impl App {
         // 黒 backdrop viewport は作らない。作ると別 top-level window が foreground を
         // 奪い、(1) 画面全体が黒くなる (2) presenter HWND への click が
         // WM_MOUSEACTIVATE/MA_ACTIVATEANDEAT で食われる、の 2 つの実害が出る。
+        // Plan B: ウィンドウ / 全画面トグル進行中の黒 backdrop 抑止フラグを、
+        // presenter スレッドが新 HWND を publish したら (= HWND が変化したら) 解除する。
+        // 期限超過 (切替失敗時の保険) でも解除する。
+        #[cfg(windows)]
+        if let Some((prev_hwnd, deadline)) = self.native_video_pending_mode_switch {
+            let cur = self.native_video_presenter_hwnd().unwrap_or(0);
+            if (cur != 0 && cur != prev_hwnd) || std::time::Instant::now() >= deadline {
+                self.native_video_pending_mode_switch = None;
+            }
+        }
         #[cfg(windows)]
         if self.native_video_backdrop_target_for_fs(fs_idx) {
-            if !self.native_video_in_window_active {
+            if !self.native_video_in_window_active
+                && self.native_video_pending_mode_switch.is_none()
+            {
                 self.show_native_video_black_backdrop(ctx, fs_idx);
             }
             return;
         }
         #[cfg(windows)]
         if self.native_video_presenter_pending_for_fs(fs_idx) {
-            if !self.native_video_in_window_active {
+            if !self.native_video_in_window_active
+                && self.native_video_pending_mode_switch.is_none()
+            {
                 self.show_native_video_black_backdrop(ctx, fs_idx);
             }
             return;
         }
         #[cfg(windows)]
         if self.native_video_presenter_hwnd_for_fs(fs_idx).is_some() {
-            if !self.native_video_in_window_active {
+            if !self.native_video_in_window_active
+                && self.native_video_pending_mode_switch.is_none()
+            {
                 self.show_native_video_black_backdrop(ctx, fs_idx);
             }
             return;

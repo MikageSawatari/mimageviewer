@@ -488,6 +488,13 @@ enum NativeVideoOutputCommand {
     SwitchSource {
         payload: Box<SwitchSourcePayload>,
     },
+    /// Plan B: デコーダ / 音声 / clock (= `source`) を保持したまま、presenter
+    /// ウィンドウ (HWND + DComp) だけをウィンドウ内再生 ⇔ 全画面で作り直す。
+    /// `app/` 経由 (bin 専属) でのみ構築されるため lib build では dead に見える。
+    #[allow(dead_code)]
+    SwitchWindowMode {
+        in_window: bool,
+    },
     /// eframe 経由のキー入力 (= `show_native_video_black_backdrop` で受け取って
     /// `handle_native_video_key_event` に流すパス) など、native presenter HWND の
     /// `push_native_event` を経由しない活動を伝搬する。NativeEguiOverlay の
@@ -856,6 +863,15 @@ impl NativeVideoOutput {
             .send(NativeVideoOutputCommand::SwitchSource {
                 payload: Box::new(payload),
             });
+    }
+
+    /// Plan B: ウィンドウ内再生 ⇔ 全画面のライブ切替を presenter スレッドへ依頼する。
+    /// `source` (デコーダ / 音声 / clock) は保持され、HWND + DComp のみ作り直される。
+    #[allow(dead_code)]
+    fn switch_window_mode(&self, in_window: bool) {
+        let _ = self
+            .command_tx
+            .send(NativeVideoOutputCommand::SwitchWindowMode { in_window });
     }
 
     fn set_playback_status(
@@ -1424,6 +1440,44 @@ fn reflow_child_to_parent_client(
     (w, h)
 }
 
+/// Plan B: ウィンドウ / 全画面トグル先の presenter ウィンドウ矩形を求める。
+/// `in_window` のとき親 (main HWND) のクライアント矩形 (child 配置用、親クライアント
+/// 座標)、全画面のとき owner が乗っているモニタの矩形 (borderless 配置用、仮想
+/// スクリーン座標)。`native_video_presenter_config` の rect 算出と等価。取得失敗
+/// 時は `None` を返し、呼び出し側 (`SwitchWindowMode` ハンドラ) は切替を中止する。
+#[cfg(windows)]
+fn compute_switch_window_rect(
+    owner_hwnd: u64,
+    in_window: bool,
+) -> Option<windows::Win32::Foundation::RECT> {
+    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+    if owner_hwnd == 0 {
+        return None;
+    }
+    let hwnd = HWND(owner_hwnd as *mut _);
+    if in_window {
+        let mut client = RECT::default();
+        if unsafe { GetClientRect(hwnd, &mut client) }.is_err() {
+            return None;
+        }
+        Some(client)
+    } else {
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+            return None;
+        }
+        Some(info.rcMonitor)
+    }
+}
+
 #[cfg(windows)]
 fn run_native_video_output(
     video_rx: crossbeam_channel::Receiver<VideoFrame>,
@@ -1537,12 +1591,26 @@ fn run_native_video_output(
         config.sync_interval
     ));
     let mut presenter_window_published = false;
+    // Plan B: ウィンドウ / 全画面トグル (`SwitchWindowMode`) で presenter を作り直す
+    // とき、新 presenter に再適用するための現行状態。`config.*` は初期値しか持たない
+    // ため、command で更新されうる値はここで追跡する。
+    //   - `cur_in_window`: 現在のモード (窓生成分岐 / 親矩形 poll / publish で参照)。
+    //   - `cur_checked` / `cur_vst3_available`: HUD ボタン状態 (`SetChecked` /
+    //     `SetVst3Available` は `NativeVideoOutput` 側で dedup されるため、再構築後の
+    //     新 presenter には command が来ない可能性がある → ここから直接再適用する)。
+    //   - `cur_sar`: anamorphic 補正の SAR。`SetVideoSar` は info 到着時に 1 度だけ
+    //     送られるので、再構築後は新 presenter へ手動で再適用する必要がある。
+    let mut cur_in_window = config.in_main_window;
+    let mut cur_checked = config.checked;
+    let mut cur_vst3_available = config.vst3_available;
+    let mut cur_sar: Option<(u32, u32)> = None;
     fn publish_presenter_window(
         window: &crate::video::native_window::NativeVideoWindow,
         hwnd_out: &Arc<AtomicU64>,
         hud_hwnd_out: &Arc<AtomicU64>,
         hud_hwnd: u64,
         config: &NativeVideoOutputConfig,
+        in_window: bool,
         width: u32,
         height: u32,
         run_started: Instant,
@@ -1553,7 +1621,7 @@ fn run_native_video_output(
             return;
         }
         let shown = window.show_and_raise();
-        if config.in_main_window {
+        if in_window {
             // in-window モード: child は show_and_raise が NOACTIVATE で表示するので
             // フォーカスを持たない。キーボード入力は presenter child の wndproc が
             // 処理する (fullscreen の presenter HWND と同じ経路) ため、明示的に
@@ -1906,9 +1974,11 @@ fn run_native_video_output(
                     presenter.set_overlay_continuous_mode(mode);
                 }
                 NativeVideoOutputCommand::SetVst3Available { available } => {
+                    cur_vst3_available = available;
                     presenter.set_overlay_vst3_available(available);
                 }
                 NativeVideoOutputCommand::SetChecked { checked } => {
+                    cur_checked = checked;
                     presenter.set_overlay_checked(checked);
                 }
                 NativeVideoOutputCommand::SetVideoCompact { compact } => {
@@ -1919,6 +1989,7 @@ fn run_native_video_output(
                     }
                 }
                 NativeVideoOutputCommand::SetVideoSar { num, den } => {
+                    cur_sar = Some((num, den));
                     if let Err(err) = presenter.set_video_sar(num, den) {
                         crate::logger::log(format!(
                             "[native-video] set sar transform failed: {err}"
@@ -2108,6 +2179,188 @@ fn run_native_video_output(
                         source.last_present_source_pts = None;
                     }
                 }
+                NativeVideoOutputCommand::SwitchWindowMode { in_window } => {
+                    if in_window == cur_in_window {
+                        // 同一モードへの切替は no-op (Codex #6)。
+                    } else if let Some(new_rect) =
+                        compute_switch_window_rect(config.owner_hwnd, in_window)
+                    {
+                        let new_width = (new_rect.right - new_rect.left).max(1) as u32;
+                        let new_height = (new_rect.bottom - new_rect.top).max(1) as u32;
+                        let new_mode = if in_window {
+                            crate::video::native_window::NativeVideoWindowMode::Child {
+                                rect: new_rect,
+                            }
+                        } else {
+                            crate::video::native_window::NativeVideoWindowMode::Borderless {
+                                rect: new_rect,
+                            }
+                        };
+                        let new_window_result =
+                            crate::video::native_window::NativeVideoWindow::create(
+                                crate::video::native_window::NativeVideoWindowConfig {
+                                    mode: new_mode,
+                                    owner_hwnd: config.owner_hwnd,
+                                    initially_visible: false,
+                                    close_on_escape: false,
+                                    post_quit_on_destroy: true,
+                                    event_tx: Some(presenter_event_tx.clone()),
+                                },
+                            );
+                        match new_window_result {
+                            Ok(new_window) => {
+                                // in-window は HUD HWND を使わず presenter の DComp tree に
+                                // overlay を載せる。fullscreen は独立 HUD HWND を使う。
+                                let new_hud_enabled = !in_window
+                                    && !native_video_env_flag_disabled("MIV_HUD_OVERLAY");
+                                let new_hud_event_tx = if new_hud_enabled {
+                                    Some(presenter_event_tx.clone())
+                                } else {
+                                    None
+                                };
+                                let new_presenter_result =
+                                    crate::video::native_presenter::NativeVideoPresenter::new(
+                                        crate::video::native_presenter::NativePresenterConfig {
+                                            hwnd: new_window.hwnd(),
+                                            width: new_width,
+                                            height: new_height,
+                                            test_overlay: std::env::var_os(
+                                                "MIV_NATIVE_VIDEO_TEST_OVERLAY",
+                                            )
+                                            .is_some(),
+                                            egui_overlay: native_video_env_flag_enabled(
+                                                "MIV_NATIVE_VIDEO_EGUI_OVERLAY",
+                                                true,
+                                            ),
+                                            hud_event_tx: new_hud_event_tx,
+                                        },
+                                    );
+                                match new_presenter_result {
+                                    Ok(mut new_presenter) => {
+                                        // 新 presenter に現行状態を再適用する。
+                                        new_presenter.set_editor_hwnds_snapshot(
+                                            config.editor_hwnds_snapshot.clone(),
+                                        );
+                                        new_presenter.set_main_hwnd_for_raise_check(
+                                            config.main_hwnd_for_raise,
+                                        );
+                                        new_presenter.set_overlay_vst3_available(
+                                            cur_vst3_available && !in_window,
+                                        );
+                                        new_presenter.set_overlay_checked(cur_checked);
+                                        if let Some((sar_num, sar_den)) = cur_sar {
+                                            if let Err(err) =
+                                                new_presenter.set_video_sar(sar_num, sar_den)
+                                            {
+                                                crate::logger::log(format!(
+                                                    "[native-video] switch mode: \
+                                                     set_video_sar failed: {err}"
+                                                ));
+                                            }
+                                        }
+                                        // 表示前に 1 フレーム present して新ウィンドウを
+                                        // 現在フレームで埋める (黒画面 / 別フレーム混入の
+                                        // 防止 = Codex #3 二段階スワップの prime 相当)。
+                                        let primed = if let Some((frame, _)) = present_retire.back()
+                                        {
+                                            new_presenter
+                                                .present(frame, config.sync_interval)
+                                                .is_ok()
+                                        } else if let Some(frame) = source.queue.front() {
+                                            new_presenter
+                                                .present(frame, config.sync_interval)
+                                                .is_ok()
+                                        } else {
+                                            false
+                                        };
+                                        // 旧 present_retire を旧 presenter の copy fence で
+                                        // 解決してから旧 presenter を破棄する (Codex #2、
+                                        // fence は presenter 固有)。未完了分はキャップ
+                                        // (NATIVE_PRESENT_RETIRE_CAP) で数フレーム内に
+                                        // 自然解放される。
+                                        if let Some(completed) =
+                                            presenter.copy_fence_completed_value()
+                                        {
+                                            while present_retire
+                                                .front()
+                                                .is_some_and(|(_, v)| *v != 0 && *v <= completed)
+                                            {
+                                                present_retire.pop_front();
+                                            }
+                                        }
+                                        // window / presenter をスワップ。
+                                        let mut old_window =
+                                            std::mem::replace(&mut window, new_window);
+                                        let old_presenter =
+                                            std::mem::replace(&mut presenter, new_presenter);
+                                        // 新ウィンドウを表示。旧ウィンドウはまだ生きて
+                                        // いるので、ここまで旧フレームが見えたまま
+                                        // (= 表示ギャップなし)。
+                                        let shown = window.show_and_raise();
+                                        if in_window {
+                                            unsafe {
+                                                use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+                                                let _ = SetFocus(Some(window.hwnd()));
+                                            }
+                                            crate::video::native_window::set_in_window_video_child(
+                                                window.hwnd().0 as u64,
+                                            );
+                                        }
+                                        // hwnd を旧→新へ publish (0 を経由しないので
+                                        // App 側の cloak 判定が誤発火しない = Codex #5)。
+                                        hwnd_out.store(window.hwnd().0 as u64, Ordering::Release);
+                                        hud_hwnd_out.store(presenter.hud_hwnd(), Ordering::Release);
+                                        presenter_window_published = true;
+                                        // 旧ウィンドウは WM_QUIT を出さずに破棄する
+                                        // (Codex #1: post_quit_on_destroy を落とさないと
+                                        // presenter ループ自体が終了してしまう)。
+                                        old_window.destroy_silent();
+                                        drop(old_presenter);
+                                        cur_in_window = in_window;
+                                        last_parent_client_size = (new_width, new_height);
+                                        // 旧ウィンドウ由来の stale な native event /
+                                        // HUD raise / cursor polling 状態を破棄する
+                                        // (Codex #6: source_epoch が同じため epoch
+                                        // チェックでは弾けない)。
+                                        native_events.clear();
+                                        while presenter_event_rx.try_recv().is_ok() {}
+                                        hud_raise_deadlines.clear();
+                                        last_hud_raise_at = None;
+                                        last_cursor_poll = None;
+                                        last_native_mouse_at = None;
+                                        pointer_present_synthetic = false;
+                                        crate::logger::log(format!(
+                                            "[native-video] window mode switched \
+                                             in_window={in_window} hwnd=0x{:x} \
+                                             {new_width}x{new_height} shown={shown} \
+                                             primed={primed}",
+                                            window.hwnd().0 as usize,
+                                        ));
+                                    }
+                                    Err(err) => {
+                                        let mut nw = new_window;
+                                        nw.destroy_silent();
+                                        crate::logger::log(format!(
+                                            "[native-video] window mode switch aborted: \
+                                             presenter rebuild failed: {err}"
+                                        ));
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                crate::logger::log(format!(
+                                    "[native-video] window mode switch aborted: \
+                                     window create failed: {err}"
+                                ));
+                            }
+                        }
+                    } else {
+                        crate::logger::log(
+                            "[native-video] window mode switch aborted: rect compute failed"
+                                .to_string(),
+                        );
+                    }
+                }
             }
         }
         // in-window モード: event drain の直前に親 (main HWND) クライアント矩形を
@@ -2115,7 +2368,7 @@ fn run_native_video_output(
         // 監視する。**drain の直前**に置くことで、SetWindowPos が同期発火させる
         // WM_WINDOWPOSCHANGED → GeometryChanged を同じループ反復で drain・処理でき、
         // resize 追従の 1 反復ぶんの遅延を無くす (maximize の「1 つ前」対策)。
-        if config.in_main_window {
+        if cur_in_window {
             last_parent_client_size = reflow_child_to_parent_client(
                 window.hwnd(),
                 config.owner_hwnd,
@@ -2909,6 +3162,7 @@ fn run_native_video_output(
                             &hud_hwnd_out,
                             presenter.hud_hwnd(),
                             &config,
+                            cur_in_window,
                             width,
                             height,
                             run_started,
@@ -4513,6 +4767,17 @@ impl VideoPlayer {
     pub(crate) fn switch_native_source(&self, payload: SwitchSourcePayload) {
         if let Some(output) = self.native_output.as_ref() {
             output.switch_source(payload);
+        }
+    }
+
+    /// Plan B: ウィンドウ内再生 ⇔ 全画面のライブ切替。`source` (デコーダ / 音声 /
+    /// clock) を保持したまま presenter ウィンドウだけを作り直すため、音声途切れや
+    /// フレーム混入が起きない (Plan A の close+reopen を置き換える)。
+    #[cfg(windows)]
+    #[allow(dead_code)]
+    pub(crate) fn switch_native_window_mode(&self, in_window: bool) {
+        if let Some(output) = self.native_output.as_ref() {
+            output.switch_window_mode(in_window);
         }
     }
 

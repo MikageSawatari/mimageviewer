@@ -446,6 +446,24 @@ impl NativeVideoWindow {
         }
         self.hwnd = HWND::default();
     }
+
+    /// `destroy()` と同じだが、`WM_DESTROY` で `PostQuitMessage` を出さない。
+    /// Plan B のウィンドウ / 全画面トグルで旧 presenter ウィンドウを破棄するとき、
+    /// presenter スレッドのメッセージループを `WM_QUIT` で誤って終了させないために
+    /// 使う。`DestroyWindow` の前に `WindowState.post_quit_on_destroy` を落とす。
+    pub fn destroy_silent(&mut self) {
+        if self.hwnd.0.is_null() {
+            return;
+        }
+        unsafe {
+            if IsWindow(Some(self.hwnd)).as_bool() {
+                if let Some(state) = window_state_mut(self.hwnd) {
+                    state.post_quit_on_destroy = false;
+                }
+            }
+        }
+        self.destroy();
+    }
 }
 
 pub fn bring_to_front(hwnd_raw: u64) -> bool {

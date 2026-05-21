@@ -1222,7 +1222,7 @@ impl App {
     }
 
     #[cfg(windows)]
-    pub(super) fn native_video_presenter_hwnd(&self) -> Option<u64> {
+    pub(crate) fn native_video_presenter_hwnd(&self) -> Option<u64> {
         self.fullscreen_idx.and_then(|idx| {
             self.pending_native_video_output_hwnds_for_fs(idx)
                 .map(|(hwnd, _)| hwnd)
@@ -1458,8 +1458,11 @@ impl App {
         }
     }
 
-    /// 動画 HUD のウィンドウ / 全画面トグル。設定をフリップして永続化し、現在の
-    /// 動画を再生位置を保ったまま反対モードで開き直す (Plan A: close + reopen)。
+    /// 動画 HUD のウィンドウ / 全画面トグル (Plan B: デコーダ保持)。設定をフリップ
+    /// して永続化し、`SwitchWindowMode` コマンドで presenter ウィンドウ (HWND +
+    /// DComp) だけを作り直す。`source` (デコーダ / 音声 / clock) は presenter
+    /// スレッド側で保持されるため、Plan A の close+reopen で起きていた音声途切れ・
+    /// 別フレーム混入が起きない。
     #[cfg(windows)]
     pub(super) fn toggle_video_window_mode(&mut self) {
         let Some(idx) = self.fullscreen_idx else {
@@ -1468,28 +1471,49 @@ impl App {
         if !matches!(self.items.get(idx), Some(GridItem::Video(_))) {
             return;
         }
-        // close で player が drop される前に再生状態を捕捉する。
-        let was_playing = match self.fs_cache.get(&idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player.is_playing(),
-            _ => true,
-        };
+        // タイルモード中はトグル不可 (HUD ボタンも非表示)。防御的に弾く。
+        if self.video_tile_mode_active {
+            return;
+        }
+        let new_in_window = !self.settings.video_in_window_mode;
         // モードをフリップして永続化。
-        self.settings.video_in_window_mode = !self.settings.video_in_window_mode;
+        self.settings.video_in_window_mode = new_in_window;
         self.settings.save();
-        crate::logger::log(format!(
-            "[native-video] toggle window mode -> in_window={}",
-            self.settings.video_in_window_mode
+        // toggle 時点の presenter HWND を控える (= 黒 backdrop 抑止の解除判定用)。
+        let prev_hwnd = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.native_presenter_hwnd(),
+            _ => 0,
+        };
+        // App 側の現行モード追跡を即時更新する。毎フレームのレンダリング分岐
+        // (backdrop viewport の有無 / cloak 判定 / VST scope) はこのフラグを見る。
+        // presenter スレッドはコマンドを数 ms 後に処理するが、その間も全画面 popup
+        // か旧 child のどちらかが画面を覆っているため見た目のギャップは生じない。
+        self.native_video_in_window_active = new_in_window;
+        // 新 HWND が publish されるまで全画面用の黒 backdrop を抑止する
+        // (詳細は `native_video_pending_mode_switch` フィールドの doc 参照)。
+        self.native_video_pending_mode_switch = Some((
+            prev_hwnd,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
         ));
-        // close で再生位置が resume map に保存される (drop で presenter/decoder も停止)。
-        self.close_fullscreen();
-        // 即座に再オープンするので close 由来の foreground 奪還はキャンセルする。
-        self.pending_main_foreground_reclaim = false;
-        self.pending_main_foreground_reclaim_after_hwnd = 0;
-        self.pending_main_foreground_reclaim_force_at = None;
-        // 反対モードで開き直す。fs_open_intent_from_grid は立てない (= from_grid=false
-        // → resume 位置が採用される)。再生状態は autoplay override で引き継ぐ。
-        self.fs_video_open_autoplay_override = Some(was_playing);
-        self.open_fullscreen(idx);
+        // presenter HWND が作り直されるので front 同期を強制リセットする。新 HWND が
+        // publish されると `ensure_native_video_front` が is_new_hwnd 経路で
+        // owner / HUD 登録をやり直す (Codex #4)。
+        self.native_video_front_synced_hwnd = 0;
+        self.native_video_front_last_raise = None;
+        self.native_video_front_recover_after_external_foreground = false;
+        if new_in_window {
+            // in-window では VST を対象外にするため、全画面 owner 登録を解除する
+            // (Codex #4)。VST availability / panel は毎フレームの sync_* で false 化。
+            self.dsp_bridge.unregister_fullscreen_owner();
+        }
+        // presenter スレッドへライブ切替を依頼 (decoder/audio/clock は保持)。
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+            player.switch_native_window_mode(new_in_window);
+        }
+        crate::logger::log(format!(
+            "[native-video] toggle window mode (plan B) -> in_window={new_in_window} \
+             prev_hwnd=0x{prev_hwnd:x}"
+        ));
     }
 
     #[cfg(windows)]

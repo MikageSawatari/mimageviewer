@@ -2907,6 +2907,14 @@ pub struct App {
     /// 毎フレームの native-video 分岐はこれを参照する (= 設定値ではなく実モード)。
     pub(crate) native_video_in_window_active: bool,
     #[cfg(windows)]
+    /// Plan B: ウィンドウ / 全画面トグル (`SwitchWindowMode`) の進行中フラグ。
+    /// `Some((toggle 時点の presenter HWND, タイムアウト期限))`。presenter スレッドが
+    /// 新 HWND を publish するまで (= HWND が変化するまで)、`render_fullscreen_viewport`
+    /// で全画面用の黒 backdrop viewport を抑止する。抑止しないと →全画面 切替の
+    /// 数フレーム、旧 child がまだ動画を映している上に黒 backdrop が被さって
+    /// 黒画面が一瞬見えてしまう。期限超過 (切替失敗時の保険) でも解除する。
+    pub(crate) native_video_pending_mode_switch: Option<(u64, std::time::Instant)>,
+    #[cfg(windows)]
     /// 動画フルスクリーン終了時に main_hwnd の foreground 奪還を試みるべきか。
     /// close_fullscreen 時点で「mIV が foreground だった」ときに true、
     /// presenter HWND の destroy 確認 / 期限超過で消費する。
@@ -3544,6 +3552,8 @@ impl App {
             in_window_resize_subclass_installed: false,
             #[cfg(windows)]
             native_video_in_window_active: false,
+            #[cfg(windows)]
+            native_video_pending_mode_switch: None,
             #[cfg(windows)]
             pending_main_foreground_reclaim: false,
             #[cfg(windows)]
@@ -10905,6 +10915,8 @@ impl App {
             // 外れて子も消える)。今回開く presenter のモードを設定値から確定し、
             // 毎フレームの native-video 分岐が参照する「実モード」として記録する。
             self.native_video_in_window_active = self.settings.video_in_window_mode;
+            // 新しい presenter を開くので、進行中だったトグル切替状態はクリアする。
+            self.native_video_pending_mode_switch = None;
             let in_main_window = self.native_video_in_window_active;
             if !in_main_window && self.native_video_presenter_hwnd().is_none() {
                 self.sync_native_video_main_cloak(true);
@@ -15989,24 +16001,28 @@ impl App {
                 }
             }
         }
+        // in-window モードでは presenter は WS_CHILD なので VST GUI の owner には
+        // しない (z-order / focus が壊れる)。VST owner 同期は全画面モード限定
+        // (Codex #4: Plan B の SwitchWindowMode で child HWND に切り替わった瞬間に
+        //  VST owner が誤って child を指さないようガードする)。
         #[cfg(windows)]
-        if native_owner_hwnd != 0 && native_owner_hwnd != self.native_video_owner_synced_hwnd {
+        if !self.native_video_in_window_active
+            && native_owner_hwnd != 0
+            && native_owner_hwnd != self.native_video_owner_synced_hwnd
+        {
             self.dsp_bridge
                 .set_existing_guis_owner_to_hwnd(native_owner_hwnd);
             self.native_video_owner_synced_hwnd = native_owner_hwnd;
         }
         #[cfg(windows)]
         for (idx, epoch, event) in native_events {
-            // CloseFullscreen / ToggleWindowMode はこのバッチが属していた presenter を
-            // 破棄する (toggle は close + reopen)。以降のイベントは破棄済み presenter
-            // 由来なので、新しい presenter に誤適用しないようバッチを打ち切る
-            // (Codex P2: 新 presenter は source_epoch=0 から始まり、古い epoch=0 の
-            // イベントと区別できないため)。
-            let terminal = matches!(
-                event,
-                crate::video::NativeVideoOutputEvent::CloseFullscreen
-                    | crate::video::NativeVideoOutputEvent::ToggleWindowMode
-            );
+            // CloseFullscreen はこのバッチが属していた presenter を破棄する。以降の
+            // イベントは破棄済み presenter 由来なので、新しい presenter に誤適用しない
+            // ようバッチを打ち切る (Codex P2: 新 presenter は source_epoch=0 から始まり、
+            // 古い epoch=0 のイベントと区別できないため)。
+            // ToggleWindowMode (Plan B) は presenter を破棄せず `SwitchWindowMode`
+            // コマンドを送るだけで source_epoch も変わらないため terminal ではない。
+            let terminal = matches!(event, crate::video::NativeVideoOutputEvent::CloseFullscreen);
             self.handle_native_video_output_event(ctx, idx, epoch, event);
             if terminal {
                 break;
