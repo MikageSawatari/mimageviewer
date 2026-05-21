@@ -636,6 +636,20 @@ pub fn pump_thread_messages() -> bool {
     quit
 }
 
+/// `thread::sleep` の message 対応版。最大 `ms` ミリ秒待つが、呼び出しスレッドの
+/// メッセージキューに何か届いた時点でタイムアウト前でも即座に返る。これにより
+/// presenter スレッドのアイドル待機中に来た `WM_WINDOWPOSCHANGED` (リサイズ) 等を
+/// 1 アイドル周期ぶん待たずに拾える。返ったあとは呼び出し側が通常どおりループ先頭で
+/// `pump_thread_messages` する前提 (この関数自体はメッセージを除去しない)。
+pub fn sleep_until_message(ms: u32) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MWMO_INPUTAVAILABLE, MsgWaitForMultipleObjectsEx, QS_ALLINPUT,
+    };
+    unsafe {
+        let _ = MsgWaitForMultipleObjectsEx(None, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+    }
+}
+
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
     msg: u32,

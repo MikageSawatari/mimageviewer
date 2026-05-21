@@ -2695,7 +2695,8 @@ fn run_native_video_output(
         if !source.clock.is_playing() && !source.clock.is_seeking() && !waiting_for_first_frame {
             source.last_present_wall = None;
             source.last_present_source_pts = None;
-            std::thread::sleep(Duration::from_millis(8));
+            // message 対応待機: 一時停止中でもリサイズ等のメッセージで即起床する。
+            crate::video::native_window::sleep_until_message(8);
             continue;
         }
 
@@ -3087,7 +3088,7 @@ fn run_native_video_output(
                 Err(err) => {
                     crate::logger::log(format!("[native-video] present failed: {err}"));
                     native_reset_unpresented_frame(frame);
-                    std::thread::sleep(Duration::from_millis(16));
+                    crate::video::native_window::sleep_until_message(16);
                 }
             }
         } else {
@@ -3097,7 +3098,9 @@ fn run_native_video_output(
                 .front()
                 .map(|front| (((front.pts_secs - now) / speed) * 500.0).clamp(1.0, 8.0) as u64)
                 .unwrap_or(1);
-            std::thread::sleep(Duration::from_millis(wait_ms));
+            // message 対応待機: フレーム待ちのアイドル中でもリサイズ等のメッセージで
+            // 即起床し、presenter ループが素早く WM を処理できるようにする。
+            crate::video::native_window::sleep_until_message(wait_ms as u32);
         }
     }
 
