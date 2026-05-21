@@ -4162,7 +4162,12 @@ impl NativeEguiOverlay {
             //     なって render が走らずカーソルが消えない、というバグを防ぐ)
             // - cursor_hidden = true: 既に隠した → 次の活動 / overlay 表示まで tick 不要。
             //   push_native_event 側で活動検出時に cursor_hidden を false に戻して tick を再開する。
-            || (self.cursor_last_activity.is_some() && !self.cursor_hidden)
+            // cursor が presenter の外 (in-window モードの main リサイズ枠など) に
+            // あるときは cursor 管理をしないので、auto-hide 用の周期 tick も不要
+            // (Codex P3: これが無いと cursor 外置きで overlay が永久 tick する)。
+            || (self.cursor_last_activity.is_some()
+                && !self.cursor_hidden
+                && self.cursor_within_focus_window())
     }
 
     fn repaint_due(&self, now: Instant) -> bool {

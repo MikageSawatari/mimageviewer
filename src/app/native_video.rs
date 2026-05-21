@@ -3027,7 +3027,12 @@ impl App {
         let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) else {
             return;
         };
-        let panel = self.build_native_video_vst3_panel();
+        // in-window モードでは VST3 を対象外にするため panel を出さない (Codex P2)。
+        let panel = if crate::app::video_in_main_window_enabled() {
+            None
+        } else {
+            self.build_native_video_vst3_panel()
+        };
         player.set_native_vst3_panel(panel);
     }
 
