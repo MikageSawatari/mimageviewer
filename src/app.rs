@@ -15911,7 +15911,9 @@ impl App {
                 // ここでは触らない (毎 tick 上書きすると再生中のセクションループが崩れる)。
                 active_video_indices.push(*idx);
                 #[cfg(windows)]
-                player.set_native_vst3_available(self.settings.vst3_enabled);
+                player.set_native_vst3_available(
+                    self.settings.vst3_enabled && !self.native_video_in_window_active,
+                );
                 #[cfg(windows)]
                 player.set_native_checked(self.checked.contains(idx));
                 if let Some(d) = player.tick(ctx) {
@@ -15995,7 +15997,20 @@ impl App {
         }
         #[cfg(windows)]
         for (idx, epoch, event) in native_events {
+            // CloseFullscreen / ToggleWindowMode はこのバッチが属していた presenter を
+            // 破棄する (toggle は close + reopen)。以降のイベントは破棄済み presenter
+            // 由来なので、新しい presenter に誤適用しないようバッチを打ち切る
+            // (Codex P2: 新 presenter は source_epoch=0 から始まり、古い epoch=0 の
+            // イベントと区別できないため)。
+            let terminal = matches!(
+                event,
+                crate::video::NativeVideoOutputEvent::CloseFullscreen
+                    | crate::video::NativeVideoOutputEvent::ToggleWindowMode
+            );
             self.handle_native_video_output_event(ctx, idx, epoch, event);
+            if terminal {
+                break;
+            }
         }
         for (idx, serial) in continuous_eof_events {
             self.handle_video_continuous_eof(ctx, idx, serial);
