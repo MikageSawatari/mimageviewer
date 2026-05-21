@@ -6263,8 +6263,16 @@ impl NativeEguiOverlay {
         } else {
             full_output.platform_output.cursor_icon
         };
-        self.update_cursor_icon(resolved_cursor_icon);
-        self.cursor_hidden = cursor_should_hide;
+        // in-window モードで cursor が presenter child の外 (= main window の
+        // リサイズ枠やタイトルバー) にあるときは SetCursor しない。さもないと
+        // presenter が毎フレーム IDC_ARROW を打ち、main 側のリサイズカーソルと
+        // 交互にちらつく。fullscreen では focus_hwnd がモニタ全面なので常に内側
+        // 判定 = 従来動作。
+        let cursor_over_presenter = self.cursor_within_focus_window();
+        if cursor_over_presenter {
+            self.update_cursor_icon(resolved_cursor_icon);
+        }
+        self.cursor_hidden = cursor_should_hide && cursor_over_presenter;
 
         let shape_count = full_output.shapes.len();
         for (id, image_delta) in &full_output.textures_delta.set {
@@ -6396,6 +6404,30 @@ impl NativeEguiOverlay {
             let _ = ImmSetCompositionWindow(himc, &composition_form);
             let _ = ImmSetCandidateWindow(himc, &candidate_form);
             let _ = ImmReleaseContext(self.focus_hwnd, himc);
+        }
+    }
+
+    /// cursor の現在位置が `focus_hwnd` のクライアント矩形内かを返す。in-window
+    /// モードで presenter child の外 (main のリサイズ枠 / タイトルバー等) に出たら
+    /// cursor 管理を止める判定に使う。取得失敗時は true (= 従来どおり管理を継続) に
+    /// 倒す。fullscreen では focus_hwnd がモニタ全面なので常に true。
+    fn cursor_within_focus_window(&self) -> bool {
+        use windows::Win32::Foundation::{POINT, RECT};
+        use windows::Win32::Graphics::Gdi::ScreenToClient;
+        use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, GetCursorPos};
+        unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_err() {
+                return true;
+            }
+            if !ScreenToClient(self.focus_hwnd, &mut pt).as_bool() {
+                return true;
+            }
+            let mut rc = RECT::default();
+            if GetClientRect(self.focus_hwnd, &mut rc).is_err() {
+                return true;
+            }
+            pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
         }
     }
 
