@@ -1475,6 +1475,12 @@ impl App {
         if self.video_tile_mode_active {
             return;
         }
+        // 直前の切替がまだ presenter スレッドで処理中なら無視する (連打防止。
+        // 同時に複数の SwitchWindowMode を投げないことで、失敗時 revert の
+        // 対象モードが一意に定まる = Codex P3)。
+        if self.native_video_pending_mode_switch.is_some() {
+            return;
+        }
         let new_in_window = !self.settings.video_in_window_mode;
         // モードをフリップして永続化。
         self.settings.video_in_window_mode = new_in_window;
@@ -1513,6 +1519,28 @@ impl App {
         crate::logger::log(format!(
             "[native-video] toggle window mode (plan B) -> in_window={new_in_window} \
              prev_hwnd=0x{prev_hwnd:x}"
+        ));
+    }
+
+    /// Plan B: presenter スレッドが `SwitchWindowMode` の window/presenter 再構築に
+    /// 失敗したとき (`WindowModeSwitchFailed` イベント受信時) に呼ぶ。`toggle_*` は
+    /// 楽観的にモードを反転済みなので、ここで元モードへ戻す。presenter 側は旧
+    /// window/presenter をそのまま生かしているため、App 側を旧モードへ揃え直せば
+    /// 状態が一致する (Codex P2)。
+    #[cfg(windows)]
+    pub(super) fn revert_failed_window_mode_switch(&mut self) {
+        // toggle で反転済みの設定を元へ戻す。
+        let reverted = !self.settings.video_in_window_mode;
+        self.settings.video_in_window_mode = reverted;
+        self.settings.save();
+        self.native_video_in_window_active = reverted;
+        self.native_video_pending_mode_switch = None;
+        // presenter HWND は変わっていない (旧 window が生存) が、front 同期を
+        // リセットして ensure_native_video_front に owner / HUD 登録をやり直させる。
+        self.native_video_front_synced_hwnd = 0;
+        self.native_video_front_last_raise = None;
+        crate::logger::log(format!(
+            "[native-video] window mode switch failed; reverted to in_window={reverted}"
         ));
     }
 
@@ -1584,6 +1612,9 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::ToggleWindowMode => {
                 self.toggle_video_window_mode();
+            }
+            crate::video::NativeVideoOutputEvent::WindowModeSwitchFailed => {
+                self.revert_failed_window_mode_switch();
             }
             crate::video::NativeVideoOutputEvent::SetVst3PanelVisible { visible } => {
                 self.set_native_video_vst3_panel_visible(visible);

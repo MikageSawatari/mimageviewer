@@ -312,6 +312,9 @@ pub enum NativeVideoOutputEvent {
     CloseFullscreen,
     /// 動画 HUD のトグルボタン: ウィンドウ内再生 ⇔ 全画面 を切り替える。
     ToggleWindowMode,
+    /// Plan B: `SwitchWindowMode` の window/presenter 再構築に失敗した。App は
+    /// トグル時に楽観的にモードを反転済みなので、これを受けて元モードへ revert する。
+    WindowModeSwitchFailed,
     SetVst3PanelVisible {
         visible: bool,
     },
@@ -2258,6 +2261,43 @@ fn run_native_video_output(
                                                 ));
                                             }
                                         }
+                                        // 表示前に overlay の再生状態を流し込んで描画させる
+                                        // (Codex P2: これをしないと新 overlay は既定状態
+                                        // = `first_frame_presented=false` で 1 フレーム
+                                        // 「準備中」HUD が出てしまう)。metadata / markers は
+                                        // App が毎フレーム再送するので 1 フレーム後に追従。
+                                        new_presenter.set_overlay_playback_status(
+                                            first_presented_out.load(Ordering::Acquire),
+                                            None,
+                                            crate::video::avio_progress::PreparingStatus {
+                                                phase:
+                                                    crate::video::avio_progress::prep_phase::DONE,
+                                                bytes_read: 0,
+                                                file_size: 0,
+                                            },
+                                        );
+                                        if let Err(err) = new_presenter.tick_overlay_video_state(
+                                            source.clock.now_secs(),
+                                            f64::from_bits(
+                                                source.duration_secs_bits.load(Ordering::Acquire),
+                                            ),
+                                            source.clock.is_playing(),
+                                            source.clock.volume(),
+                                            source.clock.is_muted(),
+                                            source.clock.limiter_ceiling_hit_seq(),
+                                            source.clock.playback_speed(),
+                                            source.frame_step_active.load(Ordering::Acquire),
+                                            source
+                                                .initial_pause_controls_pending
+                                                .load(Ordering::Acquire),
+                                            source.clock.is_seeking(),
+                                            source.clock.current_seek_serial(),
+                                        ) {
+                                            crate::logger::log(format!(
+                                                "[native-video] switch mode: \
+                                                 overlay prime render failed: {err}"
+                                            ));
+                                        }
                                         // 表示前に 1 フレーム present して新ウィンドウを
                                         // 現在フレームで埋める (黒画面 / 別フレーム混入の
                                         // 防止 = Codex #3 二段階スワップの prime 相当)。
@@ -2316,6 +2356,17 @@ fn run_native_video_output(
                                         // presenter ループ自体が終了してしまう)。
                                         old_window.destroy_silent();
                                         drop(old_presenter);
+                                        // 残った present_retire エントリは旧 presenter の
+                                        // copy fence で採番されている。新 presenter の
+                                        // fence timeline とは無関係なので fence 値を 0
+                                        // (= 「fence 未追跡、depth cap でのみ解放」) に
+                                        // 上書きする (Codex P1)。旧 presenter は drop 済みで
+                                        // そのコピーは完了しているため、cap
+                                        // (NATIVE_PRESENT_RETIRE_CAP) で数フレーム内に
+                                        // 安全に解放される。
+                                        for entry in present_retire.iter_mut() {
+                                            entry.1 = 0;
+                                        }
                                         cur_in_window = in_window;
                                         last_parent_client_size = (new_width, new_height);
                                         // 旧ウィンドウ由来の stale な native event /
@@ -2344,6 +2395,10 @@ fn run_native_video_output(
                                             "[native-video] window mode switch aborted: \
                                              presenter rebuild failed: {err}"
                                         ));
+                                        let _ = ui_event_tx.send((
+                                            source.source_epoch,
+                                            NativeVideoOutputEvent::WindowModeSwitchFailed,
+                                        ));
                                     }
                                 }
                             }
@@ -2352,6 +2407,10 @@ fn run_native_video_output(
                                     "[native-video] window mode switch aborted: \
                                      window create failed: {err}"
                                 ));
+                                let _ = ui_event_tx.send((
+                                    source.source_epoch,
+                                    NativeVideoOutputEvent::WindowModeSwitchFailed,
+                                ));
                             }
                         }
                     } else {
@@ -2359,6 +2418,10 @@ fn run_native_video_output(
                             "[native-video] window mode switch aborted: rect compute failed"
                                 .to_string(),
                         );
+                        let _ = ui_event_tx.send((
+                            source.source_epoch,
+                            NativeVideoOutputEvent::WindowModeSwitchFailed,
+                        ));
                     }
                 }
             }
