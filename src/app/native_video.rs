@@ -1475,32 +1475,25 @@ impl App {
         if self.video_tile_mode_active {
             return;
         }
-        // 直前の切替がまだ presenter スレッドで処理中なら無視する (連打防止。
-        // 同時に複数の SwitchWindowMode を投げないことで、失敗時 revert の
-        // 対象モードが一意に定まる = Codex P3)。
-        if self.native_video_pending_mode_switch.is_some() {
-            return;
+        // 直前のトグルから ~500ms 以内なら無視する (連打防止 = Codex P3)。
+        // SwitchWindowMode の window/presenter 再構築は ~300-400ms かかるため、
+        // この間に複数投げると再構築がスタックし、失敗時 revert の対象モードも
+        // 曖昧になる。再構築が確実に一段落する 500ms をデバウンス幅にする。
+        if let Some(last) = self.native_video_last_mode_toggle_at {
+            if last.elapsed() < std::time::Duration::from_millis(500) {
+                return;
+            }
         }
+        self.native_video_last_mode_toggle_at = Some(std::time::Instant::now());
         let new_in_window = !self.settings.video_in_window_mode;
         // モードをフリップして永続化。
         self.settings.video_in_window_mode = new_in_window;
         self.settings.save();
-        // toggle 時点の presenter HWND を控える (= 黒 backdrop 抑止の解除判定用)。
-        let prev_hwnd = match self.fs_cache.get(&idx) {
-            Some(FsCacheEntry::Video { player, .. }) => player.native_presenter_hwnd(),
-            _ => 0,
-        };
         // App 側の現行モード追跡を即時更新する。毎フレームのレンダリング分岐
         // (backdrop viewport の有無 / cloak 判定 / VST scope) はこのフラグを見る。
         // presenter スレッドはコマンドを数 ms 後に処理するが、その間も全画面 popup
         // か旧 child のどちらかが画面を覆っているため見た目のギャップは生じない。
         self.native_video_in_window_active = new_in_window;
-        // 新 HWND が publish されるまで全画面用の黒 backdrop を抑止する
-        // (詳細は `native_video_pending_mode_switch` フィールドの doc 参照)。
-        self.native_video_pending_mode_switch = Some((
-            prev_hwnd,
-            std::time::Instant::now() + std::time::Duration::from_secs(2),
-        ));
         // presenter HWND が作り直されるので front 同期を強制リセットする。新 HWND が
         // publish されると `ensure_native_video_front` が is_new_hwnd 経路で
         // owner / HUD 登録をやり直す (Codex #4)。
@@ -1517,8 +1510,7 @@ impl App {
             player.switch_native_window_mode(new_in_window);
         }
         crate::logger::log(format!(
-            "[native-video] toggle window mode (plan B) -> in_window={new_in_window} \
-             prev_hwnd=0x{prev_hwnd:x}"
+            "[native-video] toggle window mode (plan B) -> in_window={new_in_window}"
         ));
     }
 
@@ -1534,7 +1526,8 @@ impl App {
         self.settings.video_in_window_mode = reverted;
         self.settings.save();
         self.native_video_in_window_active = reverted;
-        self.native_video_pending_mode_switch = None;
+        // 再度のトグルを即許可するため、デバウンスのタイムスタンプもクリアする。
+        self.native_video_last_mode_toggle_at = None;
         // presenter HWND は変わっていない (旧 window が生存) が、front 同期を
         // リセットして ensure_native_video_front に owner / HUD 登録をやり直させる。
         self.native_video_front_synced_hwnd = 0;

@@ -2907,13 +2907,10 @@ pub struct App {
     /// 毎フレームの native-video 分岐はこれを参照する (= 設定値ではなく実モード)。
     pub(crate) native_video_in_window_active: bool,
     #[cfg(windows)]
-    /// Plan B: ウィンドウ / 全画面トグル (`SwitchWindowMode`) の進行中フラグ。
-    /// `Some((toggle 時点の presenter HWND, タイムアウト期限))`。presenter スレッドが
-    /// 新 HWND を publish するまで (= HWND が変化するまで)、`render_fullscreen_viewport`
-    /// で全画面用の黒 backdrop viewport を抑止する。抑止しないと →全画面 切替の
-    /// 数フレーム、旧 child がまだ動画を映している上に黒 backdrop が被さって
-    /// 黒画面が一瞬見えてしまう。期限超過 (切替失敗時の保険) でも解除する。
-    pub(crate) native_video_pending_mode_switch: Option<(u64, std::time::Instant)>,
+    /// Plan B: 直近のウィンドウ / 全画面トグル時刻。`SwitchWindowMode` の
+    /// window/presenter 再構築は ~300-400ms かかるため、この間の連打を弾いて
+    /// 再構築のスタックと失敗 revert の対象モード曖昧化を防ぐ (Codex P3)。
+    native_video_last_mode_toggle_at: Option<std::time::Instant>,
     #[cfg(windows)]
     /// 動画フルスクリーン終了時に main_hwnd の foreground 奪還を試みるべきか。
     /// close_fullscreen 時点で「mIV が foreground だった」ときに true、
@@ -3553,7 +3550,7 @@ impl App {
             #[cfg(windows)]
             native_video_in_window_active: false,
             #[cfg(windows)]
-            native_video_pending_mode_switch: None,
+            native_video_last_mode_toggle_at: None,
             #[cfg(windows)]
             pending_main_foreground_reclaim: false,
             #[cfg(windows)]
@@ -10915,8 +10912,6 @@ impl App {
             // 外れて子も消える)。今回開く presenter のモードを設定値から確定し、
             // 毎フレームの native-video 分岐が参照する「実モード」として記録する。
             self.native_video_in_window_active = self.settings.video_in_window_mode;
-            // 新しい presenter を開くので、進行中だったトグル切替状態はクリアする。
-            self.native_video_pending_mode_switch = None;
             let in_main_window = self.native_video_in_window_active;
             if !in_main_window && self.native_video_presenter_hwnd().is_none() {
                 self.sync_native_video_main_cloak(true);

@@ -1131,45 +1131,26 @@ impl App {
         self.poll_prefetch(ctx);
 
         // ── 状態の事前計算 ──
-        // in-window モード (`MIV_VIDEO_IN_MAIN_WINDOW`) では presenter child が
-        // main window のクライアント領域に直接描画するので、フルスクリーンの
-        // 黒 backdrop viewport は作らない。作ると別 top-level window が foreground を
-        // 奪い、(1) 画面全体が黒くなる (2) presenter HWND への click が
-        // WM_MOUSEACTIVATE/MA_ACTIVATEANDEAT で食われる、の 2 つの実害が出る。
-        // Plan B: ウィンドウ / 全画面トグル進行中の黒 backdrop 抑止フラグを、
-        // presenter スレッドが新 HWND を publish したら (= HWND が変化したら) 解除する。
-        // 期限超過 (切替失敗時の保険) でも解除する。
-        #[cfg(windows)]
-        if let Some((prev_hwnd, deadline)) = self.native_video_pending_mode_switch {
-            let cur = self.native_video_presenter_hwnd().unwrap_or(0);
-            if (cur != 0 && cur != prev_hwnd) || std::time::Instant::now() >= deadline {
-                self.native_video_pending_mode_switch = None;
-            }
-        }
+        // 動画フルスクリーンの黒 backdrop は **presenter HWND が未確定の起動中だけ**
+        // 出す純粋な「起動カバー」。fresh open で presenter が立ち上がるまでの黒画面を
+        // 隠すのが唯一の役目で、popup HWND が確定したら隠して viewport を破棄させる
+        // (presenter popup 自身が黒背景 DComp visual を持つので backdrop は不要)。
+        //   - in-window モード: presenter child が main のクライアント領域に直接
+        //     描画するので backdrop は出さない (出すと別 top-level window が
+        //     foreground を奪い画面全体が黒くなる)。
+        //   - Plan B のウィンドウ / 全画面トグル: popup は常に HWND 確定済み
+        //     (`hwnd_ready`) なので backdrop は一切出さない。これにより backdrop の
+        //     破棄・再生成 (= 白フラッシュ / 黒被り) がトグルで起きない。
         #[cfg(windows)]
         if self.native_video_backdrop_target_for_fs(fs_idx) {
-            if !self.native_video_in_window_active
-                && self.native_video_pending_mode_switch.is_none()
-            {
+            let hwnd_ready = self.native_video_presenter_hwnd_for_fs(fs_idx).is_some();
+            let startup_cover = !self.native_video_in_window_active
+                && !hwnd_ready
+                && self.native_video_presenter_pending_for_fs(fs_idx);
+            if startup_cover {
                 self.show_native_video_black_backdrop(ctx, fs_idx);
-            }
-            return;
-        }
-        #[cfg(windows)]
-        if self.native_video_presenter_pending_for_fs(fs_idx) {
-            if !self.native_video_in_window_active
-                && self.native_video_pending_mode_switch.is_none()
-            {
-                self.show_native_video_black_backdrop(ctx, fs_idx);
-            }
-            return;
-        }
-        #[cfg(windows)]
-        if self.native_video_presenter_hwnd_for_fs(fs_idx).is_some() {
-            if !self.native_video_in_window_active
-                && self.native_video_pending_mode_switch.is_none()
-            {
-                self.show_native_video_black_backdrop(ctx, fs_idx);
+            } else {
+                self.hide_native_video_black_backdrop_if_shown(ctx);
             }
             return;
         }
@@ -2314,6 +2295,25 @@ impl App {
             }
             _ => false,
         }
+    }
+
+    /// 動画フルスクリーンの黒 backdrop viewport が生きていれば、DWM フェードを
+    /// 抑止しつつ 1 フレームで隠して破棄させる。`fs_viewport_shown` が false の
+    /// ときは **何もしない** — 死んでいる viewport を `show_viewport_immediate` で
+    /// 復活させてしまうと、`need_show=false` 経路で可視のまま再生成され、白い
+    /// クラス背景がフラッシュするため (Plan B トグルで実害、2026-05-22)。
+    /// `keep_fullscreen_viewport_alive` の cleanup と同じ手順。
+    #[cfg(windows)]
+    fn hide_native_video_black_backdrop_if_shown(&mut self, ctx: &egui::Context) {
+        if !self.fs_viewport_shown {
+            return;
+        }
+        let fs_id = self.fullscreen_viewport_id();
+        let fs_builder = self.build_fullscreen_viewport_builder().with_visible(false);
+        ctx.show_viewport_immediate(fs_id, fs_builder, |_ctx, _class| {});
+        crate::dwm_transitions::disable_transitions_for_thread_windows();
+        ctx.send_viewport_cmd_to(fs_id, egui::ViewportCommand::Visible(false));
+        self.fs_viewport_shown = false;
     }
 
     #[cfg(windows)]
