@@ -1138,21 +1138,21 @@ impl App {
         // WM_MOUSEACTIVATE/MA_ACTIVATEANDEAT で食われる、の 2 つの実害が出る。
         #[cfg(windows)]
         if self.native_video_backdrop_target_for_fs(fs_idx) {
-            if !crate::app::video_in_main_window_enabled() {
+            if !self.native_video_in_window_active {
                 self.show_native_video_black_backdrop(ctx, fs_idx);
             }
             return;
         }
         #[cfg(windows)]
         if self.native_video_presenter_pending_for_fs(fs_idx) {
-            if !crate::app::video_in_main_window_enabled() {
+            if !self.native_video_in_window_active {
                 self.show_native_video_black_backdrop(ctx, fs_idx);
             }
             return;
         }
         #[cfg(windows)]
         if self.native_video_presenter_hwnd_for_fs(fs_idx).is_some() {
-            if !crate::app::video_in_main_window_enabled() {
+            if !self.native_video_in_window_active {
                 self.show_native_video_black_backdrop(ctx, fs_idx);
             }
             return;

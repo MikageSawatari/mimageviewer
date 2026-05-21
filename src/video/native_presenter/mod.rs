@@ -892,6 +892,8 @@ pub enum NativeOverlayCommand {
     TogglePerfOverlay,
     ToggleVst3Gui,
     CloseFullscreen,
+    /// 動画 HUD のトグルボタン: ウィンドウ内再生 ⇔ 全画面 を切り替える。
+    ToggleWindowMode,
     SetVst3PanelVisible {
         visible: bool,
     },

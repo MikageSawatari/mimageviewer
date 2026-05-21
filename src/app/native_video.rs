@@ -903,7 +903,7 @@ impl App {
             // 常に main で正しい。fullscreen 用の foreground 復旧 / VST overlap 調整は
             // 不要かつ有害 (250ms ごとの AttachThreadInput churn が resize 追従を
             // 不安定化させる) なので早期 return する。
-            if crate::app::video_in_main_window_enabled() {
+            if self.native_video_in_window_active {
                 return;
             }
             // PrintScreen / Snipping Tool の範囲選択後や native startup の競合で
@@ -984,7 +984,7 @@ impl App {
         //   (= `current_gui_owner_hwnd` 内で除外済み)。
         // in-window モードでは VST editor の owner を presenter にしない
         // (WS_CHILD を owner にすると z-order/focus が壊れる。Codex P3)。
-        if !crate::app::video_in_main_window_enabled() {
+        if !self.native_video_in_window_active {
             self.dsp_bridge.register_fullscreen_owner(hwnd);
         }
         self.dsp_bridge.set_hud_hwnd(hud_hwnd);
@@ -1458,6 +1458,40 @@ impl App {
         }
     }
 
+    /// 動画 HUD のウィンドウ / 全画面トグル。設定をフリップして永続化し、現在の
+    /// 動画を再生位置を保ったまま反対モードで開き直す (Plan A: close + reopen)。
+    #[cfg(windows)]
+    pub(super) fn toggle_video_window_mode(&mut self) {
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        if !matches!(self.items.get(idx), Some(GridItem::Video(_))) {
+            return;
+        }
+        // close で player が drop される前に再生状態を捕捉する。
+        let was_playing = match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.is_playing(),
+            _ => true,
+        };
+        // モードをフリップして永続化。
+        self.settings.video_in_window_mode = !self.settings.video_in_window_mode;
+        self.settings.save();
+        crate::logger::log(format!(
+            "[native-video] toggle window mode -> in_window={}",
+            self.settings.video_in_window_mode
+        ));
+        // close で再生位置が resume map に保存される (drop で presenter/decoder も停止)。
+        self.close_fullscreen();
+        // 即座に再オープンするので close 由来の foreground 奪還はキャンセルする。
+        self.pending_main_foreground_reclaim = false;
+        self.pending_main_foreground_reclaim_after_hwnd = 0;
+        self.pending_main_foreground_reclaim_force_at = None;
+        // 反対モードで開き直す。fs_open_intent_from_grid は立てない (= from_grid=false
+        // → resume 位置が採用される)。再生状態は autoplay override で引き継ぐ。
+        self.fs_video_open_autoplay_override = Some(was_playing);
+        self.open_fullscreen(idx);
+    }
+
     #[cfg(windows)]
     pub(super) fn handle_native_video_output_event(
         &mut self,
@@ -1523,6 +1557,9 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::CloseFullscreen => {
                 self.close_fullscreen();
+            }
+            crate::video::NativeVideoOutputEvent::ToggleWindowMode => {
+                self.toggle_video_window_mode();
             }
             crate::video::NativeVideoOutputEvent::SetVst3PanelVisible { visible } => {
                 self.set_native_video_vst3_panel_visible(visible);
@@ -3015,7 +3052,7 @@ impl App {
             return;
         };
         // in-window モードでは VST3 GUI を対象外にする (presenter が WS_CHILD のため)。
-        let vst3_ok = self.settings.vst3_enabled && !crate::app::video_in_main_window_enabled();
+        let vst3_ok = self.settings.vst3_enabled && !self.native_video_in_window_active;
         player.set_native_vst3_available(vst3_ok);
         player.set_native_video_compact(
             vst3_ok && self.settings.vst3_gui_visible && self.settings.vst3_video_compact,
@@ -3028,7 +3065,7 @@ impl App {
             return;
         };
         // in-window モードでは VST3 を対象外にするため panel を出さない (Codex P2)。
-        let panel = if crate::app::video_in_main_window_enabled() {
+        let panel = if self.native_video_in_window_active {
             None
         } else {
             self.build_native_video_vst3_panel()

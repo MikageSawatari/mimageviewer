@@ -2902,6 +2902,11 @@ pub struct App {
     /// (一度きりの install を保証する)。
     in_window_resize_subclass_installed: bool,
     #[cfg(windows)]
+    /// 現在アクティブな動画 presenter のモード (true = in-window child /
+    /// false = モニタ全面 fullscreen)。open_fullscreen で settings から確定し、
+    /// 毎フレームの native-video 分岐はこれを参照する (= 設定値ではなく実モード)。
+    pub(crate) native_video_in_window_active: bool,
+    #[cfg(windows)]
     /// 動画フルスクリーン終了時に main_hwnd の foreground 奪還を試みるべきか。
     /// close_fullscreen 時点で「mIV が foreground だった」ときに true、
     /// presenter HWND の destroy 確認 / 期限超過で消費する。
@@ -3537,6 +3542,8 @@ impl App {
             native_video_main_cloaked: false,
             #[cfg(windows)]
             in_window_resize_subclass_installed: false,
+            #[cfg(windows)]
+            native_video_in_window_active: false,
             #[cfg(windows)]
             pending_main_foreground_reclaim: false,
             #[cfg(windows)]
@@ -10893,10 +10900,12 @@ impl App {
             // DWM state transition on every wheel tick and can leak as a
             // physical-screen-only flicker even though OBS/window capture misses it.
             //
-            // Phase 0 in-window モード (`MIV_VIDEO_IN_MAIN_WINDOW`): presenter は
-            // main HWND の子として client 領域に重なるので main は cloak しない
-            // (cloak すると親ごと DWM 合成から外れて子も消える)。
-            let in_main_window = video_in_main_window_enabled();
+            // in-window モード: presenter は main HWND の子として client 領域に
+            // 重なるので main は cloak しない (cloak すると親ごと DWM 合成から
+            // 外れて子も消える)。今回開く presenter のモードを設定値から確定し、
+            // 毎フレームの native-video 分岐が参照する「実モード」として記録する。
+            self.native_video_in_window_active = self.settings.video_in_window_mode;
+            let in_main_window = self.native_video_in_window_active;
             if !in_main_window && self.native_video_presenter_hwnd().is_none() {
                 self.sync_native_video_main_cloak(true);
             } else {
@@ -12709,6 +12718,7 @@ impl App {
                     // CP7: HUD raise の allowlist 用 snapshot を `DspBridge` から clone して渡す。
                     Some(self.dsp_bridge.editor_hwnds_snapshot()),
                     self.main_hwnd.unwrap_or(0) as u64,
+                    self.native_video_in_window_active,
                 );
                 #[cfg(windows)]
                 let native_config_missing = native_config.is_none();
@@ -13370,7 +13380,8 @@ impl App {
             // in-window モードでは presenter は main の子で、close 時も main が
             // foreground のまま。fullscreen 用の foreground 奪還は不要なのでスキップ
             // (Codex P2)。
-            if native_video_was_active && foreground_is_ours && !video_in_main_window_enabled() {
+            if native_video_was_active && foreground_is_ours && !self.native_video_in_window_active
+            {
                 self.pending_main_foreground_reclaim = true;
                 self.pending_main_foreground_reclaim_after_hwnd =
                     self.native_video_presenter_hwnd().unwrap_or(0);
@@ -17395,7 +17406,7 @@ impl eframe::App for App {
             if native_main_backdrop {
                 // in-window モード: main HWND をサブクラス化し、親の WM_SIZE を
                 // child presenter HWND の同期リサイズへ繋ぐ (一度だけ install)。
-                if video_in_main_window_enabled() && !self.in_window_resize_subclass_installed {
+                if self.native_video_in_window_active && !self.in_window_resize_subclass_installed {
                     if let Some(main_hwnd) = self.main_hwnd {
                         if crate::video::native_window::install_in_window_resize_subclass(
                             main_hwnd as u64,
@@ -17412,8 +17423,8 @@ impl eframe::App for App {
                 // cloak しない。cloak すると親ごと DWM 合成から外れ、起動直後に
                 // main が一瞬消えて背後のアプリが見えてしまう。fullscreen のみ、
                 // presenter HWND が valid になるまで cloak してちらつきを隠す。
-                let cloak =
-                    !video_in_main_window_enabled() && self.native_video_presenter_hwnd().is_none();
+                let cloak = !self.native_video_in_window_active
+                    && self.native_video_presenter_hwnd().is_none();
                 self.sync_native_video_main_cloak(cloak);
                 // native 動画フルスクリーン中も Ctrl+↑↓ DFS の結果回収は必要。
                 // 早期 return すると line 15336 の poll_folder_nav に到達せず、
@@ -19766,17 +19777,6 @@ fn video_resume_for_open(
     }
 }
 
-/// Phase 0 spike gate: `MIV_VIDEO_IN_MAIN_WINDOW` が設定されていれば true。
-/// 動画を従来のモニタ全面 fullscreen ではなく、main window のクライアント
-/// 領域に重ねた子ウィンドウ (`WS_CHILD`) で再生する (in-window モード)。
-/// 起動時に 1 度だけ評価してキャッシュする。
-#[cfg(windows)]
-pub(crate) fn video_in_main_window_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("MIV_VIDEO_IN_MAIN_WINDOW").is_some())
-}
-
 #[cfg(windows)]
 fn native_video_presenter_config(
     main_hwnd: Option<isize>,
@@ -19788,6 +19788,7 @@ fn native_video_presenter_config(
         std::sync::Arc<std::sync::RwLock<std::collections::HashSet<u64>>>,
     >,
     main_hwnd_for_raise: u64,
+    in_window: bool,
 ) -> Option<crate::video::NativeVideoOutputConfig> {
     use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::Graphics::Gdi::{
@@ -19796,10 +19797,10 @@ fn native_video_presenter_config(
     use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
     let hwnd = HWND(main_hwnd.unwrap_or_default() as *mut _);
-    // Phase 0 spike: `MIV_VIDEO_IN_MAIN_WINDOW` が立っていると、presenter を
-    // モニタ全面 borderless ではなく main HWND の子 (`WS_CHILD`) として
-    // クライアント領域に重ねる (in-window 再生)。
-    let in_main_window = video_in_main_window_enabled();
+    // 呼び出し元 (open_fullscreen / start_fs_load) が settings から確定したモードを
+    // 受け取る。true なら presenter を main HWND の子 (`WS_CHILD`) として client
+    // 領域に重ねる (in-window 再生)、false ならモニタ全面 borderless (fullscreen)。
+    let in_main_window = in_window;
     let rect = if in_main_window {
         // 子ウィンドウの rect は親クライアント座標。client 全面を覆う。
         let mut client = RECT::default();

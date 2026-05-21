@@ -780,6 +780,7 @@ pub(super) enum NativeTopButtonGlyph {
     PerfGraph,
     Vst3,
     Close,
+    WindowToggle,
 }
 
 pub(super) fn draw_native_top_button(
@@ -807,6 +808,7 @@ pub(super) fn draw_native_top_button(
         NativeTopButtonGlyph::PerfGraph => draw_overlay_perf_graph_icon(painter, rect),
         NativeTopButtonGlyph::Vst3 => draw_overlay_vst3_top_icon(painter, rect),
         NativeTopButtonGlyph::Close => draw_overlay_close_icon(painter, rect),
+        NativeTopButtonGlyph::WindowToggle => draw_overlay_window_toggle_icon(painter, rect),
     }
     let resp = resp.hover_tip_dark(tooltip);
     if resp.clicked() {
@@ -1016,6 +1018,27 @@ pub(super) fn draw_overlay_close_icon(painter: &egui::Painter, rect: egui::Rect)
     let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(242, 242, 242));
     painter.line_segment([c + egui::vec2(-r, -r), c + egui::vec2(r, r)], stroke);
     painter.line_segment([c + egui::vec2(r, -r), c + egui::vec2(-r, r)], stroke);
+}
+
+/// ウィンドウ / 全画面 切り替えボタンのアイコン。タイトルバー付きの矩形 (= 一般的な
+/// 「ウィンドウ」表現) を線で描く。トグルなので状態非依存の固定アイコン。
+pub(super) fn draw_overlay_window_toggle_icon(painter: &egui::Painter, rect: egui::Rect) {
+    let c = rect.center();
+    let s = rect.width().min(rect.height()) * 0.30;
+    let stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(242, 242, 242));
+    let win = egui::Rect::from_center_size(c, egui::vec2(s * 2.0, s * 1.7));
+    painter.line_segment([win.left_top(), win.right_top()], stroke);
+    painter.line_segment([win.right_top(), win.right_bottom()], stroke);
+    painter.line_segment([win.right_bottom(), win.left_bottom()], stroke);
+    painter.line_segment([win.left_bottom(), win.left_top()], stroke);
+    let title_y = win.top() + s * 0.55;
+    painter.line_segment(
+        [
+            egui::pos2(win.left(), title_y),
+            egui::pos2(win.right(), title_y),
+        ],
+        stroke,
+    );
 }
 
 pub(super) fn draw_overlay_vst3_gui_icon(
@@ -1682,6 +1705,21 @@ pub(super) fn draw_native_top_bar(
                 false,
                 "動画を終了",
                 NativeOverlayCommand::CloseFullscreen,
+                commands,
+            );
+            draw_native_top_button(
+                ui,
+                &painter,
+                &mut x,
+                y,
+                btn_size,
+                btn_size,
+                gap,
+                "native_top_window_toggle",
+                NativeTopButtonGlyph::WindowToggle,
+                false,
+                "ウィンドウ / 全画面 切り替え",
+                NativeOverlayCommand::ToggleWindowMode,
                 commands,
             );
             draw_native_top_button(

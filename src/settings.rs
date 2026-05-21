@@ -918,6 +918,11 @@ pub struct Settings {
     /// 4/6/10/16/20/26/30 のいずれかに切替可能。値が範囲外なら 10 にクランプ。
     #[serde(default = "default_video_tile_columns")]
     pub video_tile_columns: usize,
+    /// 動画フルスクリーンを「メインウィンドウ内ウィンドウ再生」(in-window) で
+    /// 行うか。false = 従来のモニタ全面フルスクリーン。動画 HUD のウィンドウ /
+    /// 全画面トグルボタンで切り替え、ここに永続化する。
+    #[serde(default)]
+    pub video_in_window_mode: bool,
 
     // ── VST3 プラグイン処理 (v0.9.0+) ──
     //
@@ -1610,6 +1615,7 @@ impl Default for Settings {
             video_deinterlace: VideoDeinterlaceMode::default(),
             video_thumb_use_sidecar_image: true,
             video_tile_columns: default_video_tile_columns(),
+            video_in_window_mode: false,
             vst3_enabled: false,
             vst3_plugins: Vec::new(),
             vst3_plugin_path: None,

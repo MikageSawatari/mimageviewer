@@ -310,6 +310,8 @@ pub enum NativeVideoOutputEvent {
     TogglePerfOverlay,
     ToggleVst3Gui,
     CloseFullscreen,
+    /// 動画 HUD のトグルボタン: ウィンドウ内再生 ⇔ 全画面 を切り替える。
+    ToggleWindowMode,
     SetVst3PanelVisible {
         visible: bool,
     },
@@ -1326,6 +1328,7 @@ fn send_native_overlay_command(
         Command::TogglePerfOverlay => NativeVideoOutputEvent::TogglePerfOverlay,
         Command::ToggleVst3Gui => NativeVideoOutputEvent::ToggleVst3Gui,
         Command::CloseFullscreen => NativeVideoOutputEvent::CloseFullscreen,
+        Command::ToggleWindowMode => NativeVideoOutputEvent::ToggleWindowMode,
         Command::SetVst3PanelVisible { visible } => {
             NativeVideoOutputEvent::SetVst3PanelVisible { visible }
         }
@@ -2329,6 +2332,13 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::CloseFullscreen,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ToggleWindowMode => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ToggleWindowMode,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::SetVst3PanelVisible {
