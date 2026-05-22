@@ -2073,10 +2073,12 @@ impl App {
             return;
         }
 
-        let name = self
+        // フルパスを表示する (ファイル名だけだとセル幅の表示と大差なく、置き場所が
+        // 分かりにくいため)。長いパスは下の折り返し表示で複数行に展開する。
+        let path = self
             .items
             .get(idx)
-            .map(|it| it.name().to_string())
+            .map(|it| it.display_path())
             .unwrap_or_default();
         // 元画像のピクセル寸法 (ThumbnailState::Loaded.source_dims から取得)
         let dims_str = match self.thumbnails.get(idx) {
@@ -2087,8 +2089,8 @@ impl App {
             _ => None,
         };
         let text = match dims_str {
-            Some(d) => format!("{}   {}", d, name),
-            None => name,
+            Some(d) => format!("{}   {}", d, path),
+            None => path,
         };
 
         // セル幅で配置: セルの左下を基点、セル幅に合わせる
@@ -2105,14 +2107,24 @@ impl App {
                         let inner_width = (cell_w - 12.0).max(40.0);
                         ui.set_min_width(inner_width);
                         ui.set_max_width(inner_width);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(text)
-                                    .color(egui::Color32::WHITE)
-                                    .monospace(),
-                            )
-                            .truncate(),
+                        // フルパスをセル幅で折り返し、最大 3 行まで表示する。
+                        // パスは空白の無い長い連結文字列なので break_anywhere で
+                        // セグメント途中でも改行させる。3 行を超える分は末尾を
+                        // overflow_character (…) で省略する。
+                        let mut job = egui::text::LayoutJob::single_section(
+                            text,
+                            egui::TextFormat {
+                                font_id: egui::TextStyle::Monospace.resolve(ui.style()),
+                                color: egui::Color32::WHITE,
+                                ..Default::default()
+                            },
                         );
+                        job.wrap.max_width = inner_width;
+                        job.wrap.max_rows = 3;
+                        job.wrap.break_anywhere = true;
+                        job.wrap.overflow_character = Some('…');
+                        let galley = ui.painter().layout_job(job);
+                        ui.add(egui::Label::new(galley));
                     });
             });
     }

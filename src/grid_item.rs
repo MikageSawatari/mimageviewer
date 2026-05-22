@@ -169,6 +169,32 @@ impl GridItem {
         }
     }
 
+    /// 選択情報オーバーレイなどで表示するフルパス文字列。
+    /// - 通常ファイル / フォルダ / コンテナ: パスそのまま
+    /// - ZipImage: "<zip>:<entry>"
+    /// - PdfPage: "<pdf>:Page N" (1-indexed)
+    /// - ZipSeparator: ディレクトリ表示名
+    pub fn display_path(&self) -> String {
+        match self {
+            GridItem::Folder(p)
+            | GridItem::Image(p)
+            | GridItem::Video(p)
+            | GridItem::ZipFile(p)
+            | GridItem::PdfFile(p) => p.display().to_string(),
+            GridItem::ConvertibleArchive { path, .. } | GridItem::SearchContainer { path, .. } => {
+                path.display().to_string()
+            }
+            GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            } => format!("{}:{}", zip_path.display(), entry_name),
+            GridItem::PdfPage {
+                pdf_path, page_num, ..
+            } => format!("{}:Page {}", pdf_path.display(), page_num + 1),
+            GridItem::ZipSeparator { dir_display } => dir_display.clone(),
+        }
+    }
+
     /// ファイル整理系の操作 (コピー / カット / 削除) の対象になる実ファイルのパス。
     ///
     /// フォルダは OS / エクスプローラ側で扱う領分として、このアプリの複数選択
