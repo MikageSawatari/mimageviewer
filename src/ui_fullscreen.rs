@@ -911,6 +911,26 @@ fn analysis_image_rect(full_rect: egui::Rect) -> egui::Rect {
     )
 }
 
+/// 補正パネル (adjustment panel) のオーバーレイ矩形を返す。
+///
+/// 設計幅 `LEFT_PANEL_WIDTH` (260px) のまま画像に重ねる。以前は
+/// `full_rect.width() * 0.3` で縮小していたが、in-window 表示の狭い窓では
+/// 設計幅を下回り、中の文字が折り返し・重なって崩れた (窓幅は min_inner_size で
+/// 640 以上に保証されるため縮小は不要)。
+///
+/// 描画 (`draw_adjustment_panel`) と当たり判定 (ホバー閉じ / ホイール /
+/// クリック抑制) は必ずこの関数の rect を使うこと。幅がずれると「見えているのに
+/// 枠外扱い」になり、パネルが閉じる・操作がページ送りに化ける。
+fn adjustment_panel_rect(full_rect: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_max(
+        egui::pos2(full_rect.min.x, full_rect.min.y + TOP_BAR_HEIGHT),
+        egui::pos2(
+            full_rect.min.x + crate::ui_adjustment_panel::LEFT_PANEL_WIDTH,
+            full_rect.max.y,
+        ),
+    )
+}
+
 /// VST3 コンパクト表示モード時の動画表示領域 (= 右上 1/4 = 幅・高さ各 1/2)。
 /// 残った左下 3/4 は黒背景のままなのでプラグイン GUI ウィンドウを置きやすい。
 fn vst3_compact_image_rect(full_rect: egui::Rect) -> egui::Rect {
@@ -1710,12 +1730,8 @@ impl App {
                             }
                         } else if adjustment_active {
                             // ── オーバーレイモード: 左パネル + 右パネル 同時表示 ──
-                            // 上部ホバーバーと重ならないよう、左パネルは上部バーの下から開始する。
-                            let panel_w = crate::ui_adjustment_panel::LEFT_PANEL_WIDTH.min(full_rect.width() * 0.3);
-                            let panel_rect = egui::Rect::from_min_max(
-                                egui::pos2(full_rect.min.x, full_rect.min.y + TOP_BAR_HEIGHT),
-                                egui::pos2(full_rect.min.x + panel_w, full_rect.max.y),
-                            );
+                            // 描画と当たり判定で同じ rect を使う (adjustment_panel_rect 参照)。
+                            let panel_rect = adjustment_panel_rect(full_rect);
                             self.draw_adjustment_panel(ui, panel_rect, state.image_dims);
                             // 右側にメタデータパネルも同時表示（show_metadata_panel の状態に関係なく）
                             if !is_spread_double {
@@ -3481,8 +3497,8 @@ impl App {
         let panel_left = full_rect.max.x - panel_w;
         let hover_threshold = full_rect.max.x - full_rect.width() * 0.25;
         let has_right_panel = self.show_metadata_panel;
-        let left_panel_w =
-            crate::ui_adjustment_panel::LEFT_PANEL_WIDTH.min(full_rect.width() * 0.3);
+        // 当たり判定は描画と同じ rect を使う (adjustment_panel_rect 参照)。
+        let left_panel_right = adjustment_panel_rect(full_rect).max.x;
         // When the OS cursor is hidden, egui still exposes the last hover position.
         // Treat that position as stale and block passive hover side effects until a
         // real input event revives the cursor.
@@ -3498,7 +3514,7 @@ impl App {
                             && (has_right_panel || p.x > hover_threshold);
                         let in_left = !compare_wipe_active
                             && self.adjustment_mode
-                            && p.x < full_rect.min.x + left_panel_w
+                            && p.x < left_panel_right
                             && p.y >= 60.0;
                         in_right || in_left
                     })
@@ -3816,10 +3832,7 @@ impl App {
                                         > full_rect.max.x
                                             - METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
                                 let in_left_panel = self.adjustment_mode
-                                    && pos.x
-                                        < full_rect.min.x
-                                            + crate::ui_adjustment_panel::LEFT_PANEL_WIDTH
-                                                .min(full_rect.width() * 0.3)
+                                    && pos.x < adjustment_panel_rect(full_rect).max.x
                                     && pos.y >= 60.0;
                                 if !in_right_panel && !in_left_panel {
                                     let base = if pos.x > full_rect.center().x { 1 } else { -1 };
@@ -5990,12 +6003,23 @@ impl App {
             };
             let max_x = next_x - 12.0 - info_w;
             let avail_width = (max_x - (bar_rect.min.x + 12.0)).max(40.0);
-            let galley = ui.painter().layout(
+            // パス文字列は 1 行に切り詰める (溢れは末尾を省略)。折り返すと上バー
+            // (TOP_BAR_HEIGHT=44px) を超えて下の補正パネルに食い込むため
+            // (狭い in-window 表示で顕著)。
+            let mut job = egui::text::LayoutJob::single_section(
                 location_display.to_string(),
-                egui::FontId::proportional(13.0),
-                egui::Color32::from_gray(200),
-                avail_width,
+                egui::TextFormat {
+                    font_id: egui::FontId::proportional(13.0),
+                    color: egui::Color32::from_gray(200),
+                    ..Default::default()
+                },
             );
+            job.wrap = egui::text::TextWrapping {
+                max_width: avail_width,
+                max_rows: 1,
+                ..Default::default()
+            };
+            let galley = ui.painter().layout_job(job);
             let text_y = bar_rect.center().y - galley.size().y * 0.5;
             ui.painter().galley(
                 egui::pos2(bar_rect.min.x + 12.0, text_y),

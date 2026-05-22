@@ -787,6 +787,12 @@ fn main() -> eframe::Result {
             .filter(|size| sane_window_size(*size))
             .unwrap_or(default_size)
     });
+    // 最小サイズ未満では UI が破綻するため、保存値・--window-size 由来でも下限を強制する
+    // (with_min_inner_size は対話的リサイズのみを制限し、初期 inner_size は clamp しない)。
+    let size = [
+        size[0].max(MIN_INNER_SIZE[0]),
+        size[1].max(MIN_INNER_SIZE[1]),
+    ];
 
     let t = Instant::now();
     let icon = Arc::new(load_icon());
@@ -795,6 +801,7 @@ fn main() -> eframe::Result {
     let mut viewport = egui::ViewportBuilder::default()
         .with_title("mimageviewer")
         .with_inner_size(size)
+        .with_min_inner_size(MIN_INNER_SIZE)
         .with_icon(icon);
 
     // --window-size 指定時は位置を画面左上寄りに固定（保存済み位置は無視）
@@ -1054,6 +1061,11 @@ fn parse_play_test_config() -> Option<app::PlayTestConfig> {
         skip_vst3: has_arg("--play-test-skip-vst3"),
     })
 }
+
+/// メインウィンドウの最小 inner サイズ (論理ポイント)。これ以下ではアドレスバーの
+/// ウィジェットが重なり、in-window 表示の消しゴムパネル (非スクロール、高さ約 572px)
+/// が下端で切れる。
+const MIN_INNER_SIZE: [f32; 2] = [640.0, 580.0];
 
 fn sane_window_size(size: [f32; 2]) -> bool {
     size[0].is_finite()
