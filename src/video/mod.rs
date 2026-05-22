@@ -312,9 +312,18 @@ pub enum NativeVideoOutputEvent {
     CloseFullscreen,
     /// 動画 HUD のトグルボタン: ウィンドウ内再生 ⇔ 全画面 を切り替える。
     ToggleWindowMode,
-    /// Plan B: `SwitchWindowMode` の window/presenter 再構築に失敗した。App は
-    /// トグル時に楽観的にモードを反転済みなので、これを受けて元モードへ revert する。
-    WindowModeSwitchFailed,
+    /// Plan B: `SwitchWindowMode` の window/presenter 再構築が成功した。App は
+    /// これを受けて `native_video_in_window_active` (= 実モード) を更新する。
+    /// `request_id` で古い切替の取りこぼしイベントを弾く。
+    WindowModeSwitched {
+        request_id: u64,
+        in_window: bool,
+    },
+    /// Plan B: `SwitchWindowMode` の window/presenter 再構築に失敗した。presenter は
+    /// 旧 window/presenter を生かしたままなので、App は永続設定を元モードへ revert する。
+    WindowModeSwitchFailed {
+        request_id: u64,
+    },
     SetVst3PanelVisible {
         visible: bool,
     },
@@ -496,6 +505,9 @@ enum NativeVideoOutputCommand {
     /// `app/` 経由 (bin 専属) でのみ構築されるため lib build では dead に見える。
     #[allow(dead_code)]
     SwitchWindowMode {
+        /// App が採番する単調増加リクエスト ID。presenter は完了/失敗イベントに
+        /// この ID を echo し、App は古い ID のイベントを無視できる (連打/遅延対策)。
+        request_id: u64,
         in_window: bool,
     },
     /// eframe 経由のキー入力 (= `show_native_video_black_backdrop` で受け取って
@@ -871,10 +883,13 @@ impl NativeVideoOutput {
     /// Plan B: ウィンドウ内再生 ⇔ 全画面のライブ切替を presenter スレッドへ依頼する。
     /// `source` (デコーダ / 音声 / clock) は保持され、HWND + DComp のみ作り直される。
     #[allow(dead_code)]
-    fn switch_window_mode(&self, in_window: bool) {
+    fn switch_window_mode(&self, request_id: u64, in_window: bool) {
         let _ = self
             .command_tx
-            .send(NativeVideoOutputCommand::SwitchWindowMode { in_window });
+            .send(NativeVideoOutputCommand::SwitchWindowMode {
+                request_id,
+                in_window,
+            });
     }
 
     fn set_playback_status(
@@ -2182,9 +2197,20 @@ fn run_native_video_output(
                         source.last_present_source_pts = None;
                     }
                 }
-                NativeVideoOutputCommand::SwitchWindowMode { in_window } => {
+                NativeVideoOutputCommand::SwitchWindowMode {
+                    request_id,
+                    in_window,
+                } => {
                     if in_window == cur_in_window {
-                        // 同一モードへの切替は no-op (Codex #6)。
+                        // 同一モードへの切替は no-op。App が pending を解除できるよう
+                        // 成功イベントだけは返す (Codex #6 + request_id プロトコル)。
+                        let _ = ui_event_tx.send((
+                            source.source_epoch,
+                            NativeVideoOutputEvent::WindowModeSwitched {
+                                request_id,
+                                in_window,
+                            },
+                        ));
                     } else if let Some(new_rect) =
                         compute_switch_window_rect(config.owner_hwnd, in_window)
                     {
@@ -2387,6 +2413,13 @@ fn run_native_video_output(
                                              primed={primed}",
                                             window.hwnd().0 as usize,
                                         ));
+                                        let _ = ui_event_tx.send((
+                                            source.source_epoch,
+                                            NativeVideoOutputEvent::WindowModeSwitched {
+                                                request_id,
+                                                in_window,
+                                            },
+                                        ));
                                     }
                                     Err(err) => {
                                         let mut nw = new_window;
@@ -2397,7 +2430,9 @@ fn run_native_video_output(
                                         ));
                                         let _ = ui_event_tx.send((
                                             source.source_epoch,
-                                            NativeVideoOutputEvent::WindowModeSwitchFailed,
+                                            NativeVideoOutputEvent::WindowModeSwitchFailed {
+                                                request_id,
+                                            },
                                         ));
                                     }
                                 }
@@ -2409,7 +2444,7 @@ fn run_native_video_output(
                                 ));
                                 let _ = ui_event_tx.send((
                                     source.source_epoch,
-                                    NativeVideoOutputEvent::WindowModeSwitchFailed,
+                                    NativeVideoOutputEvent::WindowModeSwitchFailed { request_id },
                                 ));
                             }
                         }
@@ -2420,7 +2455,7 @@ fn run_native_video_output(
                         );
                         let _ = ui_event_tx.send((
                             source.source_epoch,
-                            NativeVideoOutputEvent::WindowModeSwitchFailed,
+                            NativeVideoOutputEvent::WindowModeSwitchFailed { request_id },
                         ));
                     }
                 }
@@ -4838,9 +4873,9 @@ impl VideoPlayer {
     /// フレーム混入が起きない (Plan A の close+reopen を置き換える)。
     #[cfg(windows)]
     #[allow(dead_code)]
-    pub(crate) fn switch_native_window_mode(&self, in_window: bool) {
+    pub(crate) fn switch_native_window_mode(&self, request_id: u64, in_window: bool) {
         if let Some(output) = self.native_output.as_ref() {
-            output.switch_window_mode(in_window);
+            output.switch_window_mode(request_id, in_window);
         }
     }
 

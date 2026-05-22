@@ -1458,11 +1458,17 @@ impl App {
         }
     }
 
-    /// 動画 HUD のウィンドウ / 全画面トグル (Plan B: デコーダ保持)。設定をフリップ
-    /// して永続化し、`SwitchWindowMode` コマンドで presenter ウィンドウ (HWND +
+    /// 動画 HUD のウィンドウ / 全画面トグル (Plan B: デコーダ保持)。永続設定を
+    /// フリップし、`SwitchWindowMode` コマンドで presenter ウィンドウ (HWND +
     /// DComp) だけを作り直す。`source` (デコーダ / 音声 / clock) は presenter
     /// スレッド側で保持されるため、Plan A の close+reopen で起きていた音声途切れ・
     /// 別フレーム混入が起きない。
+    ///
+    /// `native_video_in_window_active` (= 実モード) はここでは**触らない**。presenter が
+    /// 再構築を完了して `WindowModeSwitched` を返したとき `apply_window_mode_switched`
+    /// で更新する。これにより再構築中も App は「実際に画面に出ているウィンドウ」の
+    /// モードを指し続け、旧 child HWND を fullscreen / VST owner と誤認しない
+    /// (Codex P1)。`request_id` で遅延イベントの誤適用を防ぐ (Codex P2)。
     #[cfg(windows)]
     pub(super) fn toggle_video_window_mode(&mut self) {
         let Some(idx) = self.fullscreen_idx else {
@@ -1475,65 +1481,74 @@ impl App {
         if self.video_tile_mode_active {
             return;
         }
-        // 直前のトグルから ~500ms 以内なら無視する (連打防止 = Codex P3)。
-        // SwitchWindowMode の window/presenter 再構築は ~300-400ms かかるため、
-        // この間に複数投げると再構築がスタックし、失敗時 revert の対象モードも
-        // 曖昧になる。再構築が確実に一段落する 500ms をデバウンス幅にする。
-        if let Some(last) = self.native_video_last_mode_toggle_at {
-            if last.elapsed() < std::time::Duration::from_millis(500) {
+        // 進行中のトグルがあれば無視する (連打防止 = Codex P2/P3)。deadline 超過は
+        // presenter 無応答時の保険 — 過ぎていれば古い pending を捨てて続行する。
+        if let Some(pending) = self.native_video_mode_switch {
+            if std::time::Instant::now() < pending.deadline {
                 return;
             }
+            crate::logger::log(format!(
+                "[native-video] window mode switch request {} timed out; allowing new toggle",
+                pending.request_id
+            ));
         }
-        self.native_video_last_mode_toggle_at = Some(std::time::Instant::now());
         let new_in_window = !self.settings.video_in_window_mode;
-        // モードをフリップして永続化。
+        // 永続設定だけフリップ。実モード (`native_video_in_window_active`) は成功
+        // イベントまで据え置く (上記 doc 参照)。
         self.settings.video_in_window_mode = new_in_window;
         self.settings.save();
-        // App 側の現行モード追跡を即時更新する。毎フレームのレンダリング分岐
-        // (backdrop viewport の有無 / cloak 判定 / VST scope) はこのフラグを見る。
-        // presenter スレッドはコマンドを数 ms 後に処理するが、その間も全画面 popup
-        // か旧 child のどちらかが画面を覆っているため見た目のギャップは生じない。
-        self.native_video_in_window_active = new_in_window;
-        // presenter HWND が作り直されるので front 同期を強制リセットする。新 HWND が
-        // publish されると `ensure_native_video_front` が is_new_hwnd 経路で
+        self.native_video_mode_switch_seq = self.native_video_mode_switch_seq.wrapping_add(1);
+        let request_id = self.native_video_mode_switch_seq;
+        self.native_video_mode_switch = Some(super::NativeVideoModeSwitchPending {
+            request_id,
+            target_in_window: new_in_window,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+        });
+        // presenter スレッドへライブ切替を依頼 (decoder/audio/clock は保持)。
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
+            player.switch_native_window_mode(request_id, new_in_window);
+        }
+        crate::logger::log(format!(
+            "[native-video] toggle window mode (plan B) request={request_id} \
+             -> target in_window={new_in_window}"
+        ));
+    }
+
+    /// Plan B: presenter から `WindowModeSwitched` (切替成功) を受けたときに呼ぶ。
+    /// App 側の実モード (`native_video_in_window_active`) を新モードへ更新し、
+    /// presenter HWND が作り直されたことに伴う front 同期 / VST owner の再設定を行う。
+    #[cfg(windows)]
+    fn apply_window_mode_switched(&mut self, in_window: bool) {
+        self.native_video_in_window_active = in_window;
+        self.native_video_mode_switch = None;
+        // presenter HWND が作り直されたので front 同期を強制リセットする。新 HWND は
+        // publish 済みなので、次の ensure_native_video_front が is_new_hwnd 経路で
         // owner / HUD 登録をやり直す (Codex #4)。
         self.native_video_front_synced_hwnd = 0;
         self.native_video_front_last_raise = None;
         self.native_video_front_recover_after_external_foreground = false;
-        if new_in_window {
+        if in_window {
             // in-window では VST を対象外にするため、全画面 owner 登録を解除する
             // (Codex #4)。VST availability / panel は毎フレームの sync_* で false 化。
             self.dsp_bridge.unregister_fullscreen_owner();
         }
-        // presenter スレッドへライブ切替を依頼 (decoder/audio/clock は保持)。
-        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
-            player.switch_native_window_mode(new_in_window);
-        }
         crate::logger::log(format!(
-            "[native-video] toggle window mode (plan B) -> in_window={new_in_window}"
+            "[native-video] window mode switch applied -> in_window={in_window}"
         ));
     }
 
-    /// Plan B: presenter スレッドが `SwitchWindowMode` の window/presenter 再構築に
-    /// 失敗したとき (`WindowModeSwitchFailed` イベント受信時) に呼ぶ。`toggle_*` は
-    /// 楽観的にモードを反転済みなので、ここで元モードへ戻す。presenter 側は旧
-    /// window/presenter をそのまま生かしているため、App 側を旧モードへ揃え直せば
-    /// 状態が一致する (Codex P2)。
+    /// Plan B: presenter から `WindowModeSwitchFailed` を受けたときに呼ぶ。presenter は
+    /// 旧 window/presenter を生かしたままなので、`toggle` でフリップした永続設定だけを
+    /// 元へ戻す。`native_video_in_window_active` (実モード) はトグル時に触っていない
+    /// ため変更不要 (= 既に実際のモードを指している、Codex P2)。
     #[cfg(windows)]
-    pub(super) fn revert_failed_window_mode_switch(&mut self) {
-        // toggle で反転済みの設定を元へ戻す。
-        let reverted = !self.settings.video_in_window_mode;
+    fn revert_failed_window_mode_switch(&mut self, target_in_window: bool) {
+        let reverted = !target_in_window;
         self.settings.video_in_window_mode = reverted;
         self.settings.save();
-        self.native_video_in_window_active = reverted;
-        // 再度のトグルを即許可するため、デバウンスのタイムスタンプもクリアする。
-        self.native_video_last_mode_toggle_at = None;
-        // presenter HWND は変わっていない (旧 window が生存) が、front 同期を
-        // リセットして ensure_native_video_front に owner / HUD 登録をやり直させる。
-        self.native_video_front_synced_hwnd = 0;
-        self.native_video_front_last_raise = None;
+        self.native_video_mode_switch = None;
         crate::logger::log(format!(
-            "[native-video] window mode switch failed; reverted to in_window={reverted}"
+            "[native-video] window mode switch failed; reverted setting to in_window={reverted}"
         ));
     }
 
@@ -1606,8 +1621,31 @@ impl App {
             crate::video::NativeVideoOutputEvent::ToggleWindowMode => {
                 self.toggle_video_window_mode();
             }
-            crate::video::NativeVideoOutputEvent::WindowModeSwitchFailed => {
-                self.revert_failed_window_mode_switch();
+            crate::video::NativeVideoOutputEvent::WindowModeSwitched {
+                request_id,
+                in_window,
+            } => match self.native_video_mode_switch {
+                Some(pending) if pending.request_id == request_id => {
+                    self.apply_window_mode_switched(in_window);
+                }
+                _ => {
+                    crate::logger::log(format!(
+                        "[native-video] stale WindowModeSwitched ignored: request={request_id}"
+                    ));
+                }
+            },
+            crate::video::NativeVideoOutputEvent::WindowModeSwitchFailed { request_id } => {
+                match self.native_video_mode_switch {
+                    Some(pending) if pending.request_id == request_id => {
+                        self.revert_failed_window_mode_switch(pending.target_in_window);
+                    }
+                    _ => {
+                        crate::logger::log(format!(
+                            "[native-video] stale WindowModeSwitchFailed ignored: \
+                             request={request_id}"
+                        ));
+                    }
+                }
             }
             crate::video::NativeVideoOutputEvent::SetVst3PanelVisible { visible } => {
                 self.set_native_video_vst3_panel_visible(visible);

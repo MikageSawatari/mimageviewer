@@ -1659,6 +1659,20 @@ fn run_fullscreen_video_marker_thumb_decode(
     result
 }
 
+/// Plan B: 進行中のウィンドウ / 全画面トグル 1 件の状態。`toggle_video_window_mode`
+/// が生成し、presenter から `request_id` 一致の `WindowModeSwitched` /
+/// `WindowModeSwitchFailed` イベントが届くまで保持する。
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+pub(crate) struct NativeVideoModeSwitchPending {
+    /// このトグルのリクエスト ID (presenter がイベントに echo する)。
+    pub request_id: u64,
+    /// 切替先モード (true = in-window / false = fullscreen)。
+    pub target_in_window: bool,
+    /// presenter 無応答時の保険。これを過ぎたら pending を捨てて次トグルを許可する。
+    pub deadline: std::time::Instant,
+}
+
 pub struct App {
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
@@ -2907,10 +2921,14 @@ pub struct App {
     /// 毎フレームの native-video 分岐はこれを参照する (= 設定値ではなく実モード)。
     pub(crate) native_video_in_window_active: bool,
     #[cfg(windows)]
-    /// Plan B: 直近のウィンドウ / 全画面トグル時刻。`SwitchWindowMode` の
-    /// window/presenter 再構築は ~300-400ms かかるため、この間の連打を弾いて
-    /// 再構築のスタックと失敗 revert の対象モード曖昧化を防ぐ (Codex P3)。
-    native_video_last_mode_toggle_at: Option<std::time::Instant>,
+    /// Plan B: 進行中のウィンドウ / 全画面トグル。`Some` の間は次のトグルを無視し
+    /// (連打防止)、presenter からの `WindowModeSwitched` / `WindowModeSwitchFailed`
+    /// イベントを `request_id` で照合する。これにより遅延イベントが別リクエストを
+    /// 巻き戻す事故を防ぐ (Codex P2)。`deadline` 超過は presenter 無応答時の保険。
+    native_video_mode_switch: Option<NativeVideoModeSwitchPending>,
+    #[cfg(windows)]
+    /// `native_video_mode_switch` の `request_id` 採番用の単調増加カウンタ。
+    native_video_mode_switch_seq: u64,
     #[cfg(windows)]
     /// 動画フルスクリーン終了時に main_hwnd の foreground 奪還を試みるべきか。
     /// close_fullscreen 時点で「mIV が foreground だった」ときに true、
@@ -3550,7 +3568,9 @@ impl App {
             #[cfg(windows)]
             native_video_in_window_active: false,
             #[cfg(windows)]
-            native_video_last_mode_toggle_at: None,
+            native_video_mode_switch: None,
+            #[cfg(windows)]
+            native_video_mode_switch_seq: 0,
             #[cfg(windows)]
             pending_main_foreground_reclaim: false,
             #[cfg(windows)]
@@ -10912,6 +10932,8 @@ impl App {
             // 外れて子も消える)。今回開く presenter のモードを設定値から確定し、
             // 毎フレームの native-video 分岐が参照する「実モード」として記録する。
             self.native_video_in_window_active = self.settings.video_in_window_mode;
+            // 新しい presenter を開くので、進行中だったトグル切替 pending は破棄する。
+            self.native_video_mode_switch = None;
             let in_main_window = self.native_video_in_window_active;
             if !in_main_window && self.native_video_presenter_hwnd().is_none() {
                 self.sync_native_video_main_cloak(true);
