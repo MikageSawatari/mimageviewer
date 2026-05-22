@@ -10921,27 +10921,33 @@ impl App {
         let entering_native_video_fullscreen =
             matches!(self.items.get(idx), Some(GridItem::Video(_)));
         #[cfg(windows)]
-        if entering_native_video_fullscreen {
-            // Video-to-video source swaps keep the native presenter HWND alive.
-            // Re-cloaking the main HWND for those swaps creates an unnecessary
-            // DWM state transition on every wheel tick and can leak as a
-            // physical-screen-only flicker even though OBS/window capture misses it.
-            //
-            // in-window モード: presenter は main HWND の子として client 領域に
-            // 重なるので main は cloak しない (cloak すると親ごと DWM 合成から
-            // 外れて子も消える)。今回開く presenter のモードを設定値から確定し、
-            // 毎フレームの native-video 分岐が参照する「実モード」として記録する。
+        {
+            // フルスクリーン入場時に「このセッションが in-window モードか」を
+            // 設定値から確定する。動画 (native presenter) でも静止画 (embedded
+            // 描画) でも採用し、毎フレームの分岐が参照する「実モード」として
+            // 記録する。これにより in-window 動画 ⇔ 静止画をホイールで往復しても
+            // モードが一貫する。
             self.native_video_in_window_active = self.settings.video_in_window_mode;
-            // 新しい presenter を開くので、進行中だったトグル切替 pending は破棄する。
+            // 新しい fullscreen を開くので、進行中だったトグル切替 pending は破棄する。
             self.native_video_mode_switch = None;
-            let in_main_window = self.native_video_in_window_active;
-            if !in_main_window && self.native_video_presenter_hwnd().is_none() {
-                self.sync_native_video_main_cloak(true);
+            if entering_native_video_fullscreen {
+                // Video-to-video source swaps keep the native presenter HWND alive.
+                // Re-cloaking the main HWND for those swaps creates an unnecessary
+                // DWM state transition on every wheel tick and can leak as a
+                // physical-screen-only flicker even though OBS/window capture misses it.
+                //
+                // in-window モード: presenter は main HWND の子として client 領域に
+                // 重なるので main は cloak しない (cloak すると親ごと DWM 合成から
+                // 外れて子も消える)。
+                let in_main_window = self.native_video_in_window_active;
+                if !in_main_window && self.native_video_presenter_hwnd().is_none() {
+                    self.sync_native_video_main_cloak(true);
+                } else {
+                    self.sync_native_video_main_cloak(false);
+                }
             } else {
                 self.sync_native_video_main_cloak(false);
             }
-        } else {
-            self.sync_native_video_main_cloak(false);
         }
         // フルスクリーン入場時にカーソル idle タイマをリセット (= 直前まで隠れていた
         // 状態を引き継がないようにする)。前回フルスクリーンを 5 分放置した後に
@@ -17422,9 +17428,15 @@ impl eframe::App for App {
             let native_video_presenter_active = self.native_video_presenter_hwnd_for_focus_guard();
             #[cfg(not(windows))]
             let native_video_presenter_active = false;
+            // in-window 静止画フルスクリーンはメインウィンドウ自身に描画している。
+            // メインがフォーカスを持つのは正常状態なので、ここで閉じてはいけない。
+            #[cfg(windows)]
+            let embedded_still = self.fullscreen_embedded_still_active();
+            #[cfg(not(windows))]
+            let embedded_still = false;
             let main_has_focus =
                 self.fs_focus_grace_elapsed && ctx.input(|i| i.viewport().focused).unwrap_or(false);
-            if main_has_focus && !native_video_presenter_active {
+            if main_has_focus && !native_video_presenter_active && !embedded_still {
                 self.close_fullscreen();
             }
         }
@@ -17449,6 +17461,12 @@ impl eframe::App for App {
         //  `ensure_native_video_front_ms`)。既存の `fullscreen_viewport_ms` は集計用に残す。
         self.keep_fullscreen_viewport_alive(ctx);
         let t_keep_fullscreen_viewport = frame_t0.elapsed();
+        // in-window 静止画フルスクリーンは render_fullscreen_viewport が main ctx に
+        // 直接 CentralPanel を描く。描画前に判定を控え、後段でグリッド描画を抑止する
+        // (描画後だと handle_fs_navigation の close で fullscreen_idx が None になり
+        //  判定が崩れるため、呼び出し直前にキャプチャする)。
+        #[cfg(windows)]
+        let embedded_fs_active = self.fullscreen_embedded_still_active();
         self.render_fullscreen_viewport(ctx);
         let t_render_fullscreen_viewport = frame_t0.elapsed();
         #[cfg(windows)]
@@ -17520,6 +17538,21 @@ impl eframe::App for App {
             }
             self.sync_native_video_main_cloak(false);
             self.process_native_video_main_chrome_restore(ctx);
+
+            // ── in-window 静止画フルスクリーン ──
+            // render_fullscreen_viewport が main ctx に CentralPanel を描いたので、
+            // グリッド UI (menubar/toolbar/grid) を描くと CentralPanel が二重になる。
+            // native 動画 backdrop ブロック (上) と同じくここでグリッド描画を飛ばす。
+            if embedded_fs_active {
+                // Ctrl+↑↓ DFS の結果回収だけは行う (native 動画ブロックと同じ理由)。
+                if let Some(result) = self.poll_folder_nav() {
+                    if keyboard_nav.is_none() {
+                        self.apply_folder_nav_result(ctx, result);
+                        self.chain_folder_nav_if_pending();
+                    }
+                }
+                return;
+            }
         }
 
         // 補正パネルでスライダーをドラッグ中に true → release で false の遷移を検知し、

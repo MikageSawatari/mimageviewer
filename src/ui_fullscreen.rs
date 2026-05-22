@@ -1183,7 +1183,22 @@ impl App {
         let prev_foreground_hwnd = self.fs_prev_foreground_hwnd;
 
         // ── ビューポート構築 ──
+        // in-window モード中は静止画を専用 viewport ではなくメインウィンドウの
+        // egui ctx に直接描画する (embedded)。本関数冒頭で動画は early-return
+        // 済みなので、ここに来る fs_idx は常に非動画。
+        #[cfg(windows)]
+        let embedded = self.fullscreen_embedded_still_active();
+        #[cfg(not(windows))]
+        let embedded = false;
+        let main_ctx = ctx;
+        #[cfg(windows)]
+        if embedded && self.fs_viewport_shown {
+            // 万一 viewport モードから embedded へ切り替わったら、残った
+            // フルスクリーン viewport を隠してから embedded 描画へ移る。
+            self.hide_native_video_black_backdrop_if_shown(ctx);
+        }
         let fs_builder = self.build_fullscreen_viewport_builder();
+        let fs_id = self.fullscreen_viewport_id();
         let need_show = !self.fs_viewport_shown;
         let fs_viewport_t0 = std::time::Instant::now();
         let mut fs_setup_ms = 0.0_f64;
@@ -1201,16 +1216,20 @@ impl App {
         // 黒 backdrop のみ。ここで GPU 経路かどうかを区別する必要は無い。
         let fs_state_gpu_video = false;
 
-        ctx.show_viewport_immediate(
-            self.fullscreen_viewport_id(),
-            fs_builder,
-            |ctx, _class| {
+        {
+            let mut render_fs_body = |ctx: &egui::Context, embedded: bool| {
                 let closure_t0 = std::time::Instant::now();
                 let setup_t0 = std::time::Instant::now();
                 // フルスクリーンビューポート内のイベントで IME 状態を更新する
-                // (メインビューポートとは別のイベントキューなのでここで呼ぶ必要がある)
-                self.update_ime_state(ctx);
-                if need_show {
+                // (メインビューポートとは別のイベントキューなのでここで呼ぶ必要がある)。
+                // embedded のときは ctx = main ctx で、IME 状態は update() 冒頭で
+                // 既に更新済みなので二重処理しない。
+                if !embedded {
+                    self.update_ime_state(ctx);
+                }
+                if need_show && !embedded {
+                    // embedded のときは専用 viewport を作らないので Visible/Focus は
+                    // 送らない (main ウィンドウは既に表示・フォーカス済み)。
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     ctx.send_viewport_cmd(egui::ViewportCommand::CursorVisible(true));
@@ -1258,16 +1277,20 @@ impl App {
                 // 消費するとイベントが見えなくなるため)。マウス移動は操作と見なさない。
                 if self.fs_boundary_hint.is_some() {
                     had_user_input_in_frame = ctx.input(|i| {
-                        i.events.iter().any(|e| matches!(
-                            e,
-                            egui::Event::Key { pressed: true, .. }
-                                | egui::Event::PointerButton { pressed: true, .. }
-                                | egui::Event::MouseWheel { .. }
-                        ))
+                        i.events.iter().any(|e| {
+                            matches!(
+                                e,
+                                egui::Event::Key { pressed: true, .. }
+                                    | egui::Event::PointerButton { pressed: true, .. }
+                                    | egui::Event::MouseWheel { .. }
+                            )
+                        })
                     });
                 }
 
-                if ctx.input(|i| i.viewport().close_requested()) {
+                if !embedded && ctx.input(|i| i.viewport().close_requested()) {
+                    // embedded のときの close_requested は main ウィンドウの × =
+                    // アプリ終了要求。フルスクリーン解除ではないので拾わない。
                     close_fs = true;
                 }
                 fs_setup_ms = setup_t0.elapsed().as_secs_f64() * 1000.0;
@@ -1938,8 +1961,17 @@ impl App {
 
                 self.fs_prev_foreground_hwnd = current_foreground_hwnd();
                 fs_closure_ms = closure_t0.elapsed().as_secs_f64() * 1000.0;
-            },
-        );
+            };
+            if embedded {
+                // in-window 静止画: メインウィンドウの egui ctx に直接描画する。
+                render_fs_body(main_ctx, true);
+            } else {
+                // 従来: 専用フルスクリーン viewport を出してそこに描画する。
+                main_ctx.show_viewport_immediate(fs_id, fs_builder, |vp_ctx, _class| {
+                    render_fs_body(vp_ctx, false);
+                });
+            }
+        }
         let fs_viewport_ms = fs_viewport_t0.elapsed().as_secs_f64() * 1000.0;
         if crate::perf::is_enabled() && fs_viewport_ms > 8.0 {
             let fs_outer_ms = (fs_viewport_ms - fs_closure_ms).max(0.0);
@@ -2006,7 +2038,11 @@ impl App {
             );
         }
 
-        self.fs_viewport_shown = true;
+        if !embedded {
+            // embedded のときは専用 viewport を作っていないので shown フラグは
+            // 立てない (close 後の viewport 後始末も走らせない)。
+            self.fs_viewport_shown = true;
+        }
 
         // ── ナビゲーション & スライドショー処理 ──
         self.handle_fs_navigation(ctx, close_fs, ctrl_nav, nav_delta, jump_to, fs_idx);
@@ -2275,6 +2311,21 @@ impl App {
     #[cfg(windows)]
     fn native_video_backdrop_target_for_fs(&self, fs_idx: usize) -> bool {
         matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
+    }
+
+    /// in-window モードで静止画 (= 非動画) フルスクリーンを表示中かどうか。
+    ///
+    /// true のとき `render_fullscreen_viewport` は専用 viewport ではなく
+    /// メインウィンドウの egui ctx に直接 CentralPanel を描く (embedded)。
+    /// 動画は native presenter (独立 / 子 HWND) 経路なのでここでは除外する。
+    /// これにより in-window 動画 ⇔ 静止画をホイールで往復しても画面モードが
+    /// 全画面↔ウィンドウで切り替わらず、一貫して main ウィンドウ内に収まる。
+    #[cfg(windows)]
+    pub(crate) fn fullscreen_embedded_still_active(&self) -> bool {
+        self.native_video_in_window_active
+            && self
+                .fullscreen_idx
+                .is_some_and(|idx| !matches!(self.items.get(idx), Some(GridItem::Video(_))))
     }
 
     #[cfg(windows)]
@@ -2563,6 +2614,14 @@ impl App {
         let Some(fs_idx) = self.fullscreen_idx else {
             return false;
         };
+        // in-window 静止画 (embedded) では本体 (render_fullscreen_viewport) の
+        // handle_fs_key_input が同じ main ctx 上で直接キーを処理する。ここでも
+        // 処理するとナビが二重発火するので委譲する。true を返して
+        // handle_keyboard / handle_clipboard_shortcuts (= グリッド用) を抑止する。
+        #[cfg(windows)]
+        if self.fullscreen_embedded_still_active() {
+            return true;
+        }
         let Some(keys) = fullscreen_shortcut_event_summary(ctx) else {
             return false;
         };
