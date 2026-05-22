@@ -7300,6 +7300,15 @@ impl App {
         }
         if perf_key {
             self.video_perf_overlay_visible = !self.video_perf_overlay_visible;
+            // perf overlay は native presenter が描画する。フラグを反転するだけでなく、
+            // presenter 側の AtomicBool にも伝搬しないと表示が切り替わらない。native
+            // HWND 経由の handle_native_video_key_event は伝搬しているが、こちらの
+            // egui 経路 (= main ウィンドウにフォーカスがある in-window モード等) でも
+            // 同じ更新を行う必要がある。
+            #[cfg(windows)]
+            if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+                player.set_native_perf_overlay_visible(self.video_perf_overlay_visible);
+            }
         }
         if pin_key {
             // P キー: タイルモード中は選択中タイル、それ以外は現在再生位置を
