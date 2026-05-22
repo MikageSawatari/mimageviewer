@@ -3,7 +3,9 @@
 グリッドのサムネイルを掴んで、エクスプローラや他アプリへ **ドラッグ＆ドロップでファイルを
 コピー** できるようにする機能の設計ドキュメント。
 
-このドキュメントは **実装前のレビュー用**。コードはまだ書いていない (調査のみ完了)。
+**状態**: 実装済み (2026-05-22)。`src/file_drag.rs` 新規 + `grid_item.rs` /
+`app.rs` / `ui_main.rs` 改修 + ユニットテスト 8 件。`cargo check` / `cargo test`
+通過。残るのは §8.2 の実機検証 (Q3 / Q5〜Q8)。
 
 **改訂履歴**:
 
@@ -17,6 +19,29 @@
   `SHParseDisplayName` 失敗を黙ってスキップせず件数をトーストで明示する仕様に変更
   (§5.1 / §5.5b。戻り値を `DragOutcome` 構造体化)、`native_drag_just_finished` を
   `SHDoDragDrop` 到達時のみ立てるよう修正 (§5.5b)。
+- 2026-05-22: Codex レビュー第 3 回を反映。主な修正点 — 混在選択トーストを
+  ドラッグ完了後に表示する設計へ変更 (`pending_native_drag` を `PendingNativeDrag`
+  構造体化。§5.3 / §5.4 / §5.5b。トースト文言も「コピー」→「ドラッグ対象に
+  しました」へ)、ドラッグ開始を primary button 限定に
+  (`drag_started_by(PointerButton::Primary)`。§5.4)、`SHParseDisplayName` /
+  `BindToHandler` の `None` を `Option::<IBindCtx>::None` と型注釈明示 (§4.2 / §5.1)、
+  `DragOutcome` に `effect` / `error` を追加し COM ステップ別失敗を区別 (§5.1)、
+  `decide_drag_payload` の payload 順序を index 昇順に確定 (§5.4.2)。
+- 2026-05-22: 実装完了。設計どおり `src/file_drag.rs` 新規 + `grid_item.rs`
+  (`drag_source_path`) / `app.rs` (`PendingNativeDrag` / フレーム冒頭リセット /
+  末尾実行 / `emit_drag_result_toasts`) / `ui_main.rs` (`DragDecision` /
+  `decide_drag_payload` / `handle_cell_interaction` の D&D 検出) を実装。
+  実装中の判断で `SHParseDisplayName` / `BindToHandler` の null `IBindCtx` は
+  `None::<&IBindCtx>` (= `Option<&IBindCtx>`)、`SHDoDragDrop` の null `IDropSource`
+  は `None::<&IDropSource>` で渡す形に確定 (windows-core 0.61 の `Param` は
+  `Option<&T>` に実装されているため。本文 §4.2 / §5.1 の `Option::<IBindCtx>::None`
+  表記は厳密には `&` 付きが正)。ユニットテスト 8 件追加、`cargo check` / `cargo
+  test` / `cargo fmt` 通過。
+- 2026-05-22: Codex レビュー第 4 回 (実装レビュー) を反映。P2 — COM 失敗 / 未開始時に
+  混在選択の `post_drag_toast` が出て「成功したかのように」誤解させる問題を修正。
+  `emit_drag_result_toasts` を `(outcome: Option<&DragOutcome>, post_drag_toast)`
+  シグネチャに変更し、失敗・未開始を最優先で通知して `post_drag_toast` を抑止する
+  (§5.5b)。P3 — `docs/README.md` 索引の「実装前のレビュー用」表記を実装済みに更新。
 
 ## 1. 背景・動機
 
@@ -59,7 +84,7 @@
 | --- | --- | --- |
 | メインウィンドウ HWND | `App::main_hwnd: Option<isize>` ([app.rs:2872](../src/app.rs)) | 初フレームで `frame.window_handle()` から取得済 ([app.rs:16853](../src/app.rs)) |
 | `windows` crate 0.61 + 必要 feature | [Cargo.toml:37-70](../Cargo.toml) | `Win32_System_Ole` / `_Com` / `_Com_StructuredStorage` / `_UI_Shell` / `_UI_Shell_Common` / `_System_Memory` すべて有効 |
-| ドラッグ対象パス判定 | `GridItem::file_operation_path()` ([grid_item.rs:177](../src/grid_item.rs)) | 実ファイルパス抽出。ただしフォルダを除外しているので拡張が必要 (§5.1) |
+| ドラッグ対象パス判定 | `GridItem::file_operation_path()` ([grid_item.rs:177](../src/grid_item.rs)) | 実ファイルパス抽出。ただしフォルダを除外しているので拡張が必要 (§5.2) |
 | 複数選択モデル | `App::checked: HashSet<usize>` | チェックボックス選択。`collect_checked_paths()` で実ファイルパス収集 |
 | セルのクリック処理 | `App::handle_cell_interaction()` ([ui_main.rs:1474](../src/ui_main.rs)) | 現状 `egui::Sense::click()` |
 | クリップボード経由コピー | `copy_files_to_clipboard()` ([context_menu.rs:825](../src/ui_dialogs/context_menu.rs)) | **PowerShell 経由なので D&D には流用不可** (後述) |
@@ -93,17 +118,21 @@ Windows の D&D ソース側は本来:
 
 ```
 各 PathBuf
-  → SHParseDisplayName()           → *mut ITEMIDLIST (PIDL)
-  → SHCreateShellItemArrayFromIDLists(&pidls) → IShellItemArray
-  → array.BindToHandler(None, &BHID_DataObject) → IDataObject   ← 完成済み
-  → SHDoDragDrop(hwnd, &dataobject, None, DROPEFFECT_COPY)      ← ドラッグ開始
+  → SHParseDisplayName(.., Option::<IBindCtx>::None, ..)        → *mut ITEMIDLIST (PIDL)
+  → SHCreateShellItemArrayFromIDLists(&pidls)                   → IShellItemArray
+  → array.BindToHandler(Option::<IBindCtx>::None, &BHID_DataObject) → IDataObject  ← 完成済み
+  → SHDoDragDrop(hwnd, &dataobject, Option::<IDropSource>::None, DROPEFFECT_COPY)  ← ドラッグ開始
 ```
+
+`None` を渡す引数 (`IBindCtx` / `IDropSource`) はいずれも型推論が効かないため、
+`Option::<T>::None` の形で**型を明示**する (§5.1 / §4.3)。
 
 この `IDataObject` は `CF_HDROP` に加え、シェル形式 (`CFSTR_SHELLIDLIST` 等) も保持するため
 **エクスプローラへのドロップも他アプリへのドロップも正しく動く**。`SHDoDragDrop` は
 既定のドラッグ画像・ドロップカーソルも自動で提供する。
 
-**自前 COM インターフェース実装はゼロ。** 追加クレート・追加 Cargo feature も不要。
+**自前 COM インターフェース実装はゼロ。** 追加クレートは不要。追加 Cargo feature も
+**primary path (§4.2) では不要** (フォールバック §4.4 を採る場合のみありうる。§9 参照)。
 
 ### 4.3 windows crate 0.61 での API 確認結果
 
@@ -169,20 +198,54 @@ where P1: Param<IDataObject>, P2: Param<IDropSource>;
 pub fn start_file_drag(hwnd: isize, paths: &[std::path::PathBuf]) -> DragOutcome;
 
 /// `start_file_drag` の結果。呼び出し側 (§5.5b) はこれを見て
-/// ポインタリセットの要否と失敗トーストの要否を判断する。
-#[derive(Debug, Clone, Copy)]
+/// ポインタリセットの要否・失敗トーストの要否・ログ出力内容を判断する。
+#[derive(Debug, Clone)]
 pub struct DragOutcome {
-    /// `SHDoDragDrop` まで到達したか。**true のときだけ** §5.5(a) のポインタ
-    /// リセットが要る (到達しなければ winit が通常どおり WM_LBUTTONUP を受ける)。
+    /// `SHDoDragDrop` を実際に呼んだか。**true のときだけ** §5.5(a) の
+    /// ポインタリセットが要る (到達しなければ winit が通常どおり
+    /// WM_LBUTTONUP を受ける)。`SHDoDragDrop` が HRESULT エラーを返した
+    /// 場合でも「呼んだ = モーダルループに入った」ので true。
     pub started: bool,
     /// `SHParseDisplayName` に失敗したパス数 (0 が正常)。>0 ならトーストで明示する。
     pub failed_paths: usize,
+    /// `SHDoDragDrop` の結果 DROPEFFECT。`started == true` かつ成功時のみ `Some`。
+    /// `DROPEFFECT_COPY` ならコピー成立、`DROPEFFECT_NONE` ならキャンセル
+    /// (ドロップ先なしで離した / Esc)。ログ・将来のトースト出し分け用。
+    pub effect: Option<DROPEFFECT>,
+    /// COM 各ステップで失敗した場合のエラー。正常時は `None`。
+    pub error: Option<FileDragError>,
+}
+
+/// `start_file_drag` の COM ステップ別エラー。どこで失敗したかを呼び出し側が
+/// 区別できるようにする (主にログの切り分け用)。
+#[derive(Debug, Clone)]
+pub enum FileDragError {
+    /// `SHParseDisplayName` が全パスで失敗した (ドラッグ対象が 1 件も作れない)。
+    AllPathsUnresolved,
+    /// `SHCreateShellItemArrayFromIDLists` が失敗した。
+    ShellArrayCreate(windows_core::HRESULT),
+    /// `IShellItemArray::BindToHandler(BHID_DataObject)` が失敗した。
+    BindToHandler(windows_core::HRESULT),
+    /// `SHDoDragDrop` 自体が HRESULT エラーを返した (モーダルループには入っている)。
+    DoDragDrop(windows_core::HRESULT),
 }
 ```
 
+`DragOutcome` の組み合わせ早見表 (呼び出し側 §5.5b の分岐根拠):
+
+| 状況 | `started` | `effect` | `error` |
+| --- | --- | --- | --- |
+| `paths` 空 | false | None | None |
+| `SHParseDisplayName` 全滅 | false | None | `AllPathsUnresolved` |
+| 配列生成 / BindToHandler 失敗 | false | None | `ShellArrayCreate` / `BindToHandler` |
+| ドラッグ → ドロップ成立 | true | `Some(COPY)` | None |
+| ドラッグ → キャンセル | true | `Some(NONE)` | None |
+| `SHDoDragDrop` が HRESULT エラー | true | None | `DoDragDrop` |
+
 処理手順:
 
-1. `paths` が空なら `DragOutcome { started: false, failed_paths: 0 }` を返す。
+1. `paths` が空なら `DragOutcome { started: false, failed_paths: 0, effect: None,
+   error: None }` を返す。
 2. **COM 初期化は行わない** (採用方針、§6.3 参照)。`start_file_drag` は UI スレッド
    (= winit のイベントループスレッド) からのみ呼ばれ、winit 0.30.13 がウィンドウ作成時に
    `OleInitialize` → `RegisterDragDrop` 済みなので、このスレッドは既に STA。
@@ -192,25 +255,37 @@ pub struct DragOutcome {
    取る」義務が生じる。これを取り違えると winit の COM 寿命を壊すため、**そもそも呼ばない**
    のが安全。万一どうしても自前初期化が要ると判明した場合は、RAII ガード
    (`Drop` で必ず対応する `OleUninitialize` を呼ぶ型) に必ず包む。
-3. 各 `PathBuf` を UTF-16 (`\0` 終端) 化し、`SHParseDisplayName` で `*mut ITEMIDLIST` を取得。
+3. 各 `PathBuf` を UTF-16 (`\0` 終端) 化し、
+   `SHParseDisplayName(pwstr, Option::<IBindCtx>::None, &mut pidl, 0, &mut attrs)` で
+   `*mut ITEMIDLIST` を取得。第 2 引数の `IBindCtx` は不要なので渡さないが、`None` 単独だと
+   型推論が効かないため **`Option::<IBindCtx>::None` と型を明示**する。
    **失敗を黙ってスキップしない** (§5.4.2 の「黙って一部だけ」回避方針と揃える。
    実ファイルが parse 失敗するのは「選択後ドラッグ前にファイルが消えた」等の異常系):
    失敗したパス数を数えて `DragOutcome.failed_paths` に載せる。成功した PIDL だけで
    ドラッグを続行し、呼び出し側 (§5.5b) が失敗件数をトーストで明示する。
    全パスが失敗したら以降の手順をスキップして
-   `DragOutcome { started: false, failed_paths: paths.len() }` を返す。
-4. `SHCreateShellItemArrayFromIDLists(&pidls)` で `IShellItemArray` を作る。
+   `DragOutcome { started: false, failed_paths: paths.len(), effect: None,
+   error: Some(FileDragError::AllPathsUnresolved) }` を返す。
+4. `SHCreateShellItemArrayFromIDLists(&pidls)` で `IShellItemArray` を作る。失敗したら
+   `error: Some(FileDragError::ShellArrayCreate(hr))`、`started: false` で return
+   (PIDL 解放は手順 5 と同じく漏れなく行う)。
 5. 取得した PIDL を `CoTaskMemFree` で順に解放 (配列側がコピー済みなので安全)。
    早期 return する経路でも漏れなく解放するよう、ガード型か明示的な解放順序で組む。
-6. `array.BindToHandler(None, &BHID_DataObject)` で `IDataObject` を得る。
+6. `array.BindToHandler(Option::<IBindCtx>::None, &BHID_DataObject)` で `IDataObject` を
+   得る。第 1 引数の `IBindCtx` も手順 3 と同じく `Option::<IBindCtx>::None` と型を明示。
+   失敗したら `error: Some(FileDragError::BindToHandler(hr))`、`started: false` で return。
 7. `SHDoDragDrop(Some(HWND(hwnd as *mut _)), &data, Option::<IDropSource>::None,
    DROPEFFECT_COPY)` を呼ぶ。**ここでブロック** (ドロップ/キャンセルまで戻らない)。
-8. `SHDoDragDrop` の戻り値 (`DROPEFFECT`) はログに出すだけ。
-   `DragOutcome { started: true, failed_paths: <手順 3 の失敗数> }` を返す。
+8. `SHDoDragDrop` の戻り値で分岐:
+   - `Ok(effect)` → `DragOutcome { started: true, failed_paths: <手順 3 の失敗数>,
+     effect: Some(effect), error: None }`。`effect` はログに出す。
+   - `Err(e)` → `DragOutcome { started: true, failed_paths: <手順 3 の失敗数>,
+     effect: None, error: Some(FileDragError::DoDragDrop(e.code())) }`。
+     **`started` は true** — モーダルループに入ったのでポインタリセットは必要。
 
 `#[cfg(windows)]` でガードし、非 Windows では
-`DragOutcome { started: false, failed_paths: 0 }` を返す空実装 (他のプラットフォーム
-分岐に揃える)。
+`DragOutcome { started: false, failed_paths: 0, effect: None, error: None }` を返す
+空実装 (他のプラットフォーム分岐に揃える)。
 
 ### 5.2 `GridItem` にドラッグ対象パス抽出を追加 (約 15 行)
 
@@ -241,18 +316,30 @@ ConvertibleArchive が `Some`、ZipImage/PdfPage/ZipSeparator/**SearchContainer*
 (§2) をテストで固定し、将来含める変更時にこのテストが「意図的な仕様変更」の
 明示ポイントになる。
 
-### 5.3 `App` への状態追加 (約 5 行)
+### 5.3 `App` への状態追加 (約 10 行)
 
 ```rust
-/// この値が Some の間、フレーム末尾で start_file_drag を実行する。
+/// フレーム末尾で実行する native ドラッグの予約。
 /// egui closure 内から SHDoDragDrop を直接呼べない (self 借用衝突・再入) ための受け渡し。
-pub(crate) pending_native_drag: Option<Vec<PathBuf>>,
+pub(crate) pending_native_drag: Option<PendingNativeDrag>,
 /// 直前フレームで native ドラッグを実行した。次フレーム冒頭で egui の
 /// ポインタ状態をリセットするためのフラグ (§6.1)。
 pub(crate) native_drag_just_finished: bool,
+
+/// `pending_native_drag` の中身。
+pub(crate) struct PendingNativeDrag {
+    /// ドラッグするファイル / フォルダの実パス群 (index 昇順、§5.4.2)。空ではない。
+    pub paths: Vec<PathBuf>,
+    /// 混在選択 (実ファイル + 仮想アイテム) で除外が発生したとき、
+    /// **ドラッグ完了後**に出すトースト文言。除外なしなら None。
+    /// drag_started() の時点でトーストを出すと、同じ update 末尾の SHDoDragDrop が
+    /// 長時間ブロックする間にトーストの表示期限が切れてしまう (§5.4.3 / Codex 第 3 回)。
+    pub post_drag_toast: Option<String>,
+}
 ```
 
-`Default` impl で両方初期化。
+`Default` impl で `pending_native_drag` を `None`、`native_drag_just_finished` を
+`false` に初期化。
 
 ### 5.4 `ui_main.rs` — ドラッグ検出 (約 70 行)
 
@@ -261,14 +348,20 @@ pub(crate) native_drag_just_finished: bool,
 `clicked()` / `double_clicked()` / `secondary_clicked()` は `click_and_drag()` でも従来通り
 発火するので、選択・フルスクリーン化・右クリックメニューは壊れない。
 
-#### 5.4.1 modifier の扱い (選択操作との非競合)
+#### 5.4.1 ボタン / modifier の扱い (選択操作との非競合)
+
+**primary button 限定** (Codex 第 3 回指摘): ドラッグ開始は
+`response.drag_started_by(egui::PointerButton::Primary)` で判定する。素の
+`drag_started()` は右ボタン / 中ボタンのドラッグでも true になりうる。右ドラッグは
+コンテキストメニュー (`secondary_clicked()`)、中ドラッグはスクロール等と紛れるため、
+**左ボタンのドラッグだけを native D&D の起点にする**。
 
 既存の複数選択は `if response.clicked()` 内で Ctrl+クリック (トグル) / Shift+クリック
 (範囲) を処理している ([ui_main.rs:1483-1529](../src/ui_main.rs))。egui では
 **`clicked()` と `drag_started()` は相互排他** — ポインタが閾値以上動けば `drag_started()`、
 動かなければ `clicked()` のどちらか一方しか発火しない。したがって:
 
-- **ドラッグ送出は modifier の有無に関わらず `drag_started()` で開始する。**
+- **ドラッグ送出は modifier の有無に関わらず `drag_started_by(Primary)` で開始する。**
   mIV は COPY 限定 (§6.4) なので、Ctrl (コピー強制) / Shift (移動強制) を握っていても
   挙動は変わらない。OS 側がカーソル装飾を変える程度。
 - Ctrl+クリック / Shift+クリックによる選択操作は `clicked()` 側のまま不変。drag とは
@@ -285,11 +378,16 @@ pub(crate) native_drag_just_finished: bool,
 `filter_map` で実ファイルだけ拾うと、ユーザーには **「選択したうち一部しかコピー
 されなかった」** ように見え危険。明示仕様にする。
 
-`drag_started()` 時、セル `idx` について:
+`drag_started_by(Primary)` 検出時、セル `idx` について:
+
+**payload の順序** (Codex 第 3 回指摘): `App::checked` は `HashSet<usize>` で反復順が
+不定。ドラッグ対象パス列は必ず **`checked` の index を昇順ソートしてから** 構築する。
+index 昇順 = `items` 配列の並び順 = 通常フォルダでは現在のソート順なので、ユーザーから
+見て自然な順になり、`decide_drag_payload()` のユニットテストも安定する。
 
 **(A) `idx` が複数選択の一部 (`self.checked.contains(&idx)`) の場合**
 
-`checked` 全件を 2 群に分割する:
+`checked` の index を昇順ソートし、各 item を 2 群に分割する:
 
 - `draggable`: `drag_source_path()` が `Some` のもの (実ファイル/実フォルダ)
 - `virtual_excluded`: 仮想アイテム (`ZipImage` / `PdfPage`)
@@ -297,13 +395,21 @@ pub(crate) native_drag_just_finished: bool,
 判定:
 
 - `draggable` が空 → ドラッグ開始しない。トースト「ドラッグできる実ファイルが
-  選択されていません」。
+  選択されていません」を**即時**表示してよい (ドラッグが走らない = `SHDoDragDrop` の
+  ブロックが無いため期限切れの心配がない)。
 - `virtual_excluded` が非空 (= 混在選択) → **`draggable` をドラッグしつつ、除外を
-  明示するトースト**を出す: 「仮想フォルダ内の N 件は除外しました (実ファイル M 件を
-  コピー)」。"黙って一部だけ" を避けるのが目的。Codex が挙げた 2 案
-  (「ドラッグ不可+トースト」/「除外を明示」) のうち **後者を採用** — 実ファイルは
-  確実にコピーでき、かつ除外をユーザーが認識できる。
-- 混在なし → `draggable` をそのままドラッグ。
+  明示するトースト**を出す。Codex が挙げた 2 案 (「ドラッグ不可+トースト」/「除外を
+  明示」) のうち **後者を採用** — 実ファイルは確実に送出でき、かつ除外をユーザーが
+  認識できる。
+  - ⚠ このトーストは `drag_started()` 時点では出さず、`PendingNativeDrag.post_drag_toast`
+    に積んで **ドラッグ完了後** (`SHDoDragDrop` が戻った後) に出す。`drag_started()` で
+    即時に出すと、同じ update 末尾の `SHDoDragDrop` が長時間ブロックする間にトーストの
+    表示期限が切れ、ユーザーが見られない (Codex 第 3 回指摘)。
+  - 文言は「`<N>` 件のフォルダ内画像は除外しました。実ファイル `<M>` 件をドラッグ
+    対象にしました」程度にする。**「コピーしました」とは書かない** — ユーザーが
+    ドロップ前にキャンセルした場合に嘘になるため (`SHDoDragDrop` の結果に関わらず
+    出る文言なので、確定している「ドラッグ対象にした」事実だけを述べる)。
+- 混在なし → `draggable` をそのままドラッグ。`post_drag_toast` は `None`。
 
 **(B) `idx` が複数選択に含まれない場合**
 
@@ -320,25 +426,39 @@ pub(crate) native_drag_just_finished: bool,
 #### 5.4.3 受け渡し
 
 egui closure 内で `SHDoDragDrop` は呼べない (`self` の借用衝突・再入リスク) ので、
-決定したパス群を `self.pending_native_drag` に積むだけ。実行は §5.5(b)。
+決定した内容を `self.pending_native_drag` に積むだけ。実行は §5.5(b)。
+
+`decide_drag_payload` は §5.4.2 のロジックを純粋関数的にまとめた新規ヘルパで、
+3 値の enum を返す:
 
 ```rust
-if response.drag_started() {
-    // §5.4.2 のロジックでパス群とトースト要否を決定
-    let decision = self.decide_drag_payload(idx);   // 新規ヘルパ
-    if let Some(paths) = decision.paths {            // 空でないことは内部で保証
-        self.pending_native_drag = Some(paths);
-    }
-    if let Some(msg) = decision.toast {
-        self.show_feedback_toast(msg);
+enum DragDecision {
+    /// ドラッグを開始する。paths は空でない (index 昇順、§5.4.2)。
+    Start { paths: Vec<PathBuf>, post_drag_toast: Option<String> },
+    /// ドラッグはしないが即時トーストを出す (全仮想選択など)。
+    ImmediateToast(String),
+    /// 何もしない (単体の仮想アイテム / セパレータ / SearchContainer を掴んだ no-op)。
+    None,
+}
+
+// handle_cell_interaction 内:
+if response.drag_started_by(egui::PointerButton::Primary) {
+    match self.decide_drag_payload(idx) {
+        DragDecision::Start { paths, post_drag_toast } => {
+            self.pending_native_drag = Some(PendingNativeDrag { paths, post_drag_toast });
+        }
+        DragDecision::ImmediateToast(msg) => self.show_feedback_toast(msg),
+        DragDecision::None => {}
     }
 }
 ```
 
 `decide_drag_payload` を独立メソッドにして `#[cfg(test)]` でユニットテスト可能にする
-(混在選択 / 全仮想 / 単体実ファイル / 単体仮想 の各分岐)。
+(混在選択 / 全仮想 / 単体実ファイル / 単体仮想 / 未チェック item / payload が index
+昇順か、の各分岐)。混在選択の `post_drag_toast` 文言もこのヘルパが組み立てるので、
+文言の検証もユニットテストで固定できる。
 
-### 5.5 `app.rs` — フレーム末尾で実行 + ポインタリセット (約 30 行)
+### 5.5 `app.rs` — フレーム末尾で実行 + ポインタリセット (約 50 行)
 
 `App::update()` ([app.rs:16812](../src/app.rs)) で:
 
@@ -360,38 +480,54 @@ if std::mem::take(&mut self.native_drag_just_finished) {
 **(b) フレーム末尾** — 全パネル描画後 (egui closure を全部抜けた後) に実行:
 
 ```rust
-if let Some(paths) = self.pending_native_drag.take() {
+if let Some(PendingNativeDrag { paths, post_drag_toast }) = self.pending_native_drag.take() {
     match self.main_hwnd {
         Some(hwnd) => {
             let outcome = crate::file_drag::start_file_drag(hwnd, &paths); // モーダルブロック
-            // SHDoDragDrop に到達したときだけポインタリセットが要る。
-            // ドラッグ未開始 (paths 全滅等) なら winit が通常どおり
-            // WM_LBUTTONUP を受け取るので、リセットすると逆に副作用が無駄に出る。
+
+            // SHDoDragDrop に到達したときだけポインタリセットが要る (§5.1 / §6.1)。
+            // 未到達 (paths 全滅・COM 失敗) なら winit が通常どおり WM_LBUTTONUP を
+            // 受け取るので、リセットすると §6.1 の副作用が無駄に出る。
             if outcome.started {
                 self.native_drag_just_finished = true;
-            } else {
-                crate::logger::log("file_drag: drag did not start");
             }
-            // SHParseDisplayName 失敗を黙って捨てない (§5.1 手順 3)。
-            if outcome.failed_paths > 0 {
-                self.show_feedback_toast(format!(
-                    "{} 件のファイルはドラッグできませんでした",
-                    outcome.failed_paths,
-                ));
+            // COM ステップ別エラーはログに残す (DragOutcome.error で切り分け済み)。
+            if let Some(err) = &outcome.error {
+                crate::logger::log(&format!("file_drag: {err:?}"));
             }
+            // 結果トーストは「ここで」= SHDoDragDrop が戻った後に出す。
+            // drag_started() 時点で出すと SHDoDragDrop のブロック中に表示期限が
+            // 切れる (§5.4.2 / Codex 第 3 回)。失敗・未開始時は emit_drag_result_toasts
+            // 側が post_drag_toast を抑止する (Codex 第 4 回 P2)。
+            self.emit_drag_result_toasts(Some(&outcome), post_drag_toast);
         }
         None => {
             // 初フレーム前など main_hwnd 未取得。ドラッグ自体が走らないので
-            // ポインタリセットも不要。ログだけ残す。
+            // ポインタリセットも不要。
             crate::logger::log("file_drag: main_hwnd unavailable, drag skipped");
+            self.emit_drag_result_toasts(None, post_drag_toast);
         }
     }
     ctx.request_repaint();
 }
 ```
 
-`SHDoDragDrop` 呼び出し時点でマウスボタンはまだ押下中 (このフレームで `drag_started` が
-出たばかり) なので、`DoDragDrop` の前提 (ボタン押下中に呼ぶ) を満たす。
+`emit_drag_result_toasts(outcome: Option<&DragOutcome>, post_drag_toast: Option<String>)`
+は小さなヘルパ。**失敗・未開始を最優先で通知する** (Codex 第 4 回 P2):
+
+- `outcome` が `None` (main HWND 未取得) → 「ファイルのドラッグを開始できませんでした」。
+- `outcome.error` が `Some`、または `outcome.started == false` → ドラッグが実際に
+  始まっていない / COM 失敗。「ドラッグを開始できませんでした」(未開始) または
+  「ドラッグ中にエラーが発生しました」(`started == true` で `SHDoDragDrop` がエラー) を
+  出し、**`post_drag_toast` は抑止する**。抑止しないと「実ファイル N 件をドラッグ対象に
+  しました」だけが出て、実際は始まっていないのに成功したかのように誤解させる。
+- 正常時のみ → 除外トースト (`post_drag_toast`) と「N 件はドラッグできませんでした」
+  (`failed_paths > 0`) を、2 連続 `show_feedback_toast` で上書きし合わないよう
+  **1 本のメッセージに連結**して出す。
+
+`SHDoDragDrop` 呼び出し時点でマウスボタンはまだ押下中 (このフレームで
+`drag_started_by(Primary)` が出たばかり) なので、`DoDragDrop` の前提 (ボタン押下中に
+呼ぶ) を満たす。
 
 `native_drag_just_finished` を立てるのは `outcome.started == true` のときだけ
 (Codex レビュー第 2 回指摘)。`main_hwnd` 未取得や `start_file_drag` がドラッグを
@@ -407,8 +543,8 @@ tooltip の 1 フレーム乱れ) だけが無駄に出てしまう。
 **自身で消費**する (マウスを `SetCapture` し、ウィンドウプロシージャに up を渡さない)。
 そのため winit はボタン解放を観測できず、egui は「左ボタンが押下中のまま」と誤認する。
 
-放置すると、次にマウスを動かしたとき別セル上で `drag_started()` が誤発火し
-**幽霊ドラッグ** が起きる。
+放置すると、次にマウスを動かしたとき別セル上で `drag_started_by(Primary)` が誤発火し
+**幽霊ドラッグ** が起きる (primary ボタンが押下中のままと誤認されるため)。
 
 **対策は 2 段構えで、両方とも §5.5(a) の実装手順に含める** (Codex レビュー第 2 回指摘):
 
@@ -437,7 +573,8 @@ tooltip / カーソル追従に副作用が出うる (実害は 1 フレーム�
   より副作用が小さいが、eframe の `update` から raw input へ注入する口が限られるため
   実装はやや手間。
 - **`drag_started` の 1 フレームガード**: native drag 直後の 1 フレームだけ
-  `drag_started()` を無視する。幽霊ドラッグ「再発火」だけは確実に防げる。
+  §5.4 の `drag_started_by(Primary)` 判定を無視する。幽霊ドラッグ「再発火」だけは
+  確実に防げる。
 - **native drag 進行中/直後フラグでの抑止**: `native_drag_just_finished` が立っている
   間は §5.4 のドラッグ検出自体をスキップする (上記ガードの一般化)。
 
@@ -491,8 +628,8 @@ tooltip / カーソル追従に副作用が出うる (実害は 1 フレーム�
 - **複数フォルダの同時ドラッグ**: 現状の `checked` 設計では不可。やるなら
   `is_checkable()` にフォルダを含める設計変更が別途必要。
 
-初版スコープは「単体フォルダ + 複数ファイル」とし、複数フォルダ同時は将来課題。
-→ §8 Q4。
+初版スコープは「単体フォルダ + 複数ファイル」とし、複数フォルダ同時は将来課題
+(`is_checkable()` にフォルダを含める設計変更は本機能のスコープ外)。
 
 ### 6.6 ScrollArea のドラッグスクロールとの競合
 
@@ -518,7 +655,9 @@ OS モーダル操作のため `egui_kittest` スナップショットテスト�
 - `GridItem::drag_source_path()`: Folder/Image/Video/ZipFile/PdfFile/ConvertibleArchive が
   `Some`、ZipImage/PdfPage/ZipSeparator/SearchContainer が `None`。
 - `decide_drag_payload()` (§5.4.3): 単体実ファイル / 単体仮想 / 複数実ファイル /
-  混在選択 (実 + 仮想) / 全仮想 の各分岐で、ドラッグ対象パスとトースト要否が仕様通りか。
+  混在選択 (実 + 仮想) / 全仮想 / 未チェック item の各分岐で、`DragDecision` の種別・
+  ドラッグ対象パス・`post_drag_toast` 文言が仕様通りか。payload が **index 昇順**で
+  並ぶことも検証する (§5.4.2)。
 
 ### 手動テスト (実機)
 
@@ -596,11 +735,11 @@ OS モーダル操作なので自動化不可。以下を実機で確認する�
 
 | 項目 | 規模 |
 | --- | --- |
-| 新規 `src/file_drag.rs` (COM 糊コード) | 約 100〜150 行 |
+| 新規 `src/file_drag.rs` (COM 糊 + `DragOutcome` / `FileDragError`) | 約 120〜170 行 |
 | `grid_item.rs` `drag_source_path()` + テスト | 約 30 行 |
-| `app.rs` 状態追加 + フレーム末尾実行 (失敗ハンドリング込み) + ポインタリセット | 約 55 行 |
-| `ui_main.rs` ドラッグ検出 + `decide_drag_payload()` + テスト | 約 70 行 |
-| **合計** | **約 255〜305 行、新規モジュール 1 本** |
+| `app.rs` 状態追加 (`PendingNativeDrag`) + フレーム末尾実行 + `emit_drag_result_toasts` + ポインタリセット | 約 65 行 |
+| `ui_main.rs` ドラッグ検出 + `DragDecision` / `decide_drag_payload()` + テスト | 約 80 行 |
+| **合計** | **約 295〜345 行、新規モジュール 1 本** |
 
 - 追加クレート: **なし**
 - 追加 Cargo feature: **§4.2 の primary path なら不要**。§4.4 のフォールバック

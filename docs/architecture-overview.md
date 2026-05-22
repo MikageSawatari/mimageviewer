@@ -165,6 +165,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `gpu_info.rs` | GPU 情報取得 (VRAM サイズ等、キャッシュ容量の自動決定に使用) |
 | `monitor.rs` | モニター情報取得 (DPI 等) |
 | `open_with.rs` | 外部アプリで開く |
+| `file_drag.rs` | グリッドからエクスプローラ等へのファイル D&D 送出 (シェル `IDataObject` + `SHDoDragDrop`)。`docs/file-drag-drop-design.md` |
 | `os_theme.rs` | Windows の「アプリ用の色」(レジストリ) を検出し、egui::Visuals へ適用。初回起動時に `Settings::ui_theme` の初期値を決める |
 
 ---

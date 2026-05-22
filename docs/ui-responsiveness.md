@@ -178,6 +178,18 @@ wgpu の queue.write_texture が走る。20MP RGBA (78MB) で 26-58ms かかる�
 - [ ] **測定**: 追加後に実機で `--perf-log` を取り、`python scripts/analyze_perf.py
       <path> nav hitches` で悪化してないか確認。
 
+### 4.1 意図的な例外: native ファイル D&D のモーダルブロック
+
+ファイル D&D 送出 (`src/file_drag.rs::start_file_drag`) は `SHDoDragDrop` を UI
+スレッドで呼び、ドロップ完了 / キャンセルまで戻らない。`App::update` がその間
+ブロックするが、これは **§1 の禁止対象ではない** — バックグラウンド I/O ではなく、
+ユーザーが明示的に開始したモーダル操作であり、エクスプローラ含め全アプリ共通の
+標準挙動 (ドラッグ元ウィンドウはドラッグ中固まって見えるのが正常)。`SHDoDragDrop`
+自体が独自メッセージループを回すため OS レベルの応答性は保たれる。worker 化は
+不可能 (`DoDragDrop` 系は呼び出しスレッドにマウスキャプチャを要求する)。
+詳細は `docs/file-drag-drop-design.md` §6.2。perf ログを汚さないよう、実行は
+`update` 末尾 (frame_total 計測の後) に置いている。
+
 ---
 
 ## 5. 既知のパターン: Ctrl+↑↓ 引っかかり (2026-04 解決済み)

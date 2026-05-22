@@ -1657,6 +1657,21 @@ pub(crate) struct NativeVideoModeSwitchPending {
     pub deadline: std::time::Instant,
 }
 
+/// フレーム末尾で実行する native ファイル D&D の予約。
+///
+/// egui closure 内から `SHDoDragDrop` を直接呼べない (self 借用衝突・再入) ため、
+/// `handle_cell_interaction` で内容を決めてここに積み、`update` 末尾で実行する。
+/// 設計は `docs/file-drag-drop-design.md` §5.3 / §5.5。
+pub(crate) struct PendingNativeDrag {
+    /// ドラッグするファイル / フォルダの実パス群 (index 昇順)。空ではない。
+    pub paths: Vec<PathBuf>,
+    /// 混在選択 (実ファイル + 仮想アイテム) で除外が発生したとき、ドラッグ完了後に
+    /// 出すトースト文言。除外なしなら `None`。`drag_started` 時点で出すと、同じ
+    /// `update` 末尾の `SHDoDragDrop` がブロックする間にトーストの表示期限が
+    /// 切れてしまうため、完了後まで遅延させる。
+    pub post_drag_toast: Option<String>,
+}
+
 pub struct App {
     pub(crate) address: String,
     pub(crate) current_folder: Option<PathBuf>,
@@ -2854,6 +2869,13 @@ pub struct App {
     /// `ViewportCommand::Visible(false)` を使うと eframe が update を呼ばなくなり
     /// トレイメニューから復帰できなくなるため、Win32 直叩きに切り替えた。
     pub(crate) main_hwnd: Option<isize>,
+    /// フレーム末尾で実行する native ファイル D&D の予約 (`docs/file-drag-drop-design.md`)。
+    pub(crate) pending_native_drag: Option<PendingNativeDrag>,
+    /// 直前フレームで native ドラッグ (`SHDoDragDrop`) を実行したか。
+    /// `SHDoDragDrop` がドラッグ終了の WM_LBUTTONUP を内部消費し winit に届かない
+    /// ため、egui のポインタ状態が固着する。このフラグが立っている 1 フレームは
+    /// 冒頭でポインタ状態をリセットし、ドラッグ検出もスキップする (§6.1)。
+    pub(crate) native_drag_just_finished: bool,
     #[cfg(windows)]
     /// Native fullscreen presenter の HWND を最後に VST bridge owner として同期した値。
     /// set_chain_owner は cross-process IPC なので、毎フレーム送らないための guard。
@@ -3531,6 +3553,8 @@ impl App {
             update_check_last_spawn: None,
             show_update_dialog: false,
             main_hwnd: None,
+            pending_native_drag: None,
+            native_drag_just_finished: false,
             #[cfg(windows)]
             native_video_owner_synced_hwnd: 0,
             #[cfg(windows)]
@@ -14654,6 +14678,55 @@ impl App {
         self.fs_feedback_toast_reveal_path = None;
     }
 
+    /// native ファイル D&D 完了後のトーストをまとめて出す。
+    ///
+    /// `outcome` が `None` のときは main HWND 未取得などでドラッグ自体が走らなかった
+    /// ケース。`Some` でも COM 失敗 / 未開始がありうる。
+    ///
+    /// 失敗・未開始を最優先で通知する: ドラッグが実際に始まっていないのに混在選択の
+    /// 除外通知 (`post_drag_toast` =「実ファイル N 件をドラッグ対象にしました」) を出すと
+    /// 「コピーできた」と誤解させるため、その場合は `post_drag_toast` を抑止して
+    /// 「ドラッグを開始できませんでした」を出す (Codex P2)。
+    ///
+    /// 正常時は、除外通知とパス解決失敗通知が両方該当するレアケースでも
+    /// `show_feedback_toast` を 2 回呼ぶと後者が前者を上書きするため、1 本に連結する
+    /// (docs/file-drag-drop-design.md §5.5b)。
+    pub(crate) fn emit_drag_result_toasts(
+        &mut self,
+        outcome: Option<&crate::file_drag::DragOutcome>,
+        post_drag_toast: Option<String>,
+    ) {
+        let Some(o) = outcome else {
+            // main HWND 未取得などでドラッグが走らなかった。
+            self.show_feedback_toast("ファイルのドラッグを開始できませんでした".to_string());
+            return;
+        };
+
+        if o.error.is_some() || !o.started {
+            // COM 失敗 or 未到達 → 失敗を最優先で通知し、post_drag_toast は抑止する。
+            let msg = if o.started {
+                "ファイルのドラッグ中にエラーが発生しました"
+            } else {
+                "ファイルのドラッグを開始できませんでした"
+            };
+            self.show_feedback_toast(msg.to_string());
+            return;
+        }
+
+        // 正常にドラッグが走った。除外通知 + パス解決失敗通知をまとめて出す。
+        let failed_msg = (o.failed_paths > 0)
+            .then(|| format!("{} 件のファイルはドラッグできませんでした", o.failed_paths));
+        let combined = match (post_drag_toast, failed_msg) {
+            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+        if let Some(msg) = combined {
+            self.show_feedback_toast(msg);
+        }
+    }
+
     pub(crate) fn show_capture_saved_toast(&mut self, path: PathBuf) {
         let name = path
             .file_name()
@@ -17185,6 +17258,18 @@ impl eframe::App for App {
             ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
 
+        // 直前フレームで native ファイル D&D を実行した場合、egui のポインタ状態を
+        // リセットする。SHDoDragDrop はドラッグ終了の WM_LBUTTONUP を内部消費し
+        // winit に届けないため、放置すると egui が「左ボタン押下中」と誤認して
+        // 幽霊ドラッグが起きる (docs/file-drag-drop-design.md §6.1)。
+        // フラグ自体はこのフレーム末尾で消費する (= ドラッグ検出も 1 フレーム抑止)。
+        if self.native_drag_just_finished {
+            ctx.input_mut(|i| i.pointer = egui::PointerState::default());
+            // PointerState は raw 入力状態のみ。egui の interaction 層
+            // (dragged_id / potential_drag_id) は別管理なので明示的に止める。
+            ctx.stop_dragging();
+        }
+
         // メインビューポートの IME 状態を更新 (ここで Ime イベントを拾う)。
         // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。
         self.update_ime_state(ctx);
@@ -18300,6 +18385,44 @@ impl eframe::App for App {
                     ),
                 ],
             );
+        }
+
+        // ── native ファイル D&D の実行 (docs/file-drag-drop-design.md §5.5b) ──
+        // 全パネル描画後・perf ログ後に実行する。SHDoDragDrop はモーダルブロック
+        // するので、frame_total の計測外に置いて perf ログを汚さない。
+        if let Some(PendingNativeDrag {
+            paths,
+            post_drag_toast,
+        }) = self.pending_native_drag.take()
+        {
+            match self.main_hwnd {
+                Some(hwnd) => {
+                    // SHDoDragDrop が戻る (ドロップ完了 or キャンセル) までブロックする。
+                    let outcome = crate::file_drag::start_file_drag(hwnd, &paths);
+                    // SHDoDragDrop に到達したときだけポインタリセットが要る (§6.1)。
+                    // 未到達ならフラグを立てない (winit が WM_LBUTTONUP を正常受信)。
+                    if outcome.started {
+                        self.native_drag_just_finished = true;
+                    }
+                    if let Some(err) = &outcome.error {
+                        crate::logger::log(format!("file_drag: outcome error: {err:?}"));
+                    }
+                    // 結果トーストはここ (= SHDoDragDrop 完了後) で出す。drag_started
+                    // 時点で出すとブロック中に表示期限が切れる (§5.4.2)。失敗・未開始時は
+                    // emit_drag_result_toasts 側が post_drag_toast を抑止する (Codex P2)。
+                    self.emit_drag_result_toasts(Some(&outcome), post_drag_toast);
+                }
+                None => {
+                    // 初フレーム前など main_hwnd 未取得。ドラッグは走らない。
+                    crate::logger::log("file_drag: main_hwnd unavailable, drag skipped");
+                    self.emit_drag_result_toasts(None, post_drag_toast);
+                }
+            }
+            ctx.request_repaint();
+        } else if self.native_drag_just_finished {
+            // 直前フレームが「ドラッグ実行フレーム」だった。このフレーム冒頭で
+            // ポインタリセットを済ませたのでフラグを消費する (§6.1)。
+            self.native_drag_just_finished = false;
         }
     }
 

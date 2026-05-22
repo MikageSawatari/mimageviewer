@@ -296,6 +296,80 @@ fn draw_rating_filter_button(
     changed
 }
 
+// ── native ファイル D&D (ドラッグでコピー送出) ───────────────────────
+// 設計: docs/file-drag-drop-design.md §5.4
+
+/// ドラッグ開始セルから「何をドラッグするか」を表す決定。
+pub(crate) enum DragDecision {
+    /// ドラッグを開始する。`paths` は空でない (index 昇順)。
+    Start {
+        paths: Vec<PathBuf>,
+        /// 混在選択で仮想アイテムを除外したときの、ドラッグ完了後トースト文言。
+        /// 除外なしなら `None`。
+        post_drag_toast: Option<String>,
+    },
+    /// ドラッグはしないが即時トーストを出す (全選択が仮想アイテムだった等)。
+    ImmediateToast(String),
+    /// 何もしない (単体の仮想アイテム / セパレータ / 検索コンテナを掴んだ no-op)。
+    None,
+}
+
+/// ドラッグ開始セル `idx` から、何をドラッグするかを決める純粋関数。
+///
+/// - `idx` が複数選択 (`checked`) の一部 → checked 全件 (index 昇順) の実ファイルを
+///   ドラッグ対象にする。仮想アイテム (`ZipImage` / `PdfPage`) が混在していれば除外し、
+///   完了後トーストで件数を明示する。実ファイルが 0 件なら即時トーストのみ。
+/// - `idx` が複数選択外 → エクスプローラ流に、掴んだ単体だけをドラッグ
+///   (実ファイル / 実フォルダのとき)。仮想アイテム等なら no-op。
+///
+/// 純粋関数にして `App` 構築なしでユニットテストできるようにしている。
+pub(crate) fn decide_drag_payload(
+    items: &[GridItem],
+    checked: &std::collections::HashSet<usize>,
+    idx: usize,
+) -> DragDecision {
+    if checked.contains(&idx) {
+        // checked は HashSet で反復順が不定。index 昇順で安定させる
+        // (= items の並び順 = 表示順)。
+        let mut indices: Vec<usize> = checked.iter().copied().collect();
+        indices.sort_unstable();
+        let mut paths: Vec<PathBuf> = Vec::new();
+        let mut virtual_excluded = 0usize;
+        for &i in &indices {
+            let Some(item) = items.get(i) else { continue };
+            if let Some(p) = item.drag_source_path() {
+                paths.push(p.to_path_buf());
+            } else if matches!(item, GridItem::ZipImage { .. } | GridItem::PdfPage { .. }) {
+                virtual_excluded += 1;
+            }
+        }
+        if paths.is_empty() {
+            return DragDecision::ImmediateToast(
+                "ドラッグできる実ファイルが選択されていません".to_string(),
+            );
+        }
+        let post_drag_toast = (virtual_excluded > 0).then(|| {
+            format!(
+                "{} 件のフォルダ内画像は除外しました。実ファイル {} 件をドラッグ対象にしました",
+                virtual_excluded,
+                paths.len(),
+            )
+        });
+        DragDecision::Start {
+            paths,
+            post_drag_toast,
+        }
+    } else {
+        match items.get(idx).and_then(GridItem::drag_source_path) {
+            Some(p) => DragDecision::Start {
+                paths: vec![p.to_path_buf()],
+                post_drag_toast: None,
+            },
+            None => DragDecision::None,
+        }
+    }
+}
+
 impl App {
     // ── メニューバー ─────────────────────────────────────────────────
 
@@ -1545,7 +1619,9 @@ impl App {
         cell_rect: egui::Rect,
         idx: usize,
     ) -> Option<PathBuf> {
-        let response = ui.interact(cell_rect, ui.id().with(idx), egui::Sense::click());
+        // click_and_drag: clicked() / double_clicked() / secondary_clicked() は従来通り
+        // 発火しつつ、drag_started_by(Primary) で native ファイル D&D を開始できる。
+        let response = ui.interact(cell_rect, ui.id().with(idx), egui::Sense::click_and_drag());
         let mut nav = None;
         if response.clicked() {
             let ctrl = ctx.input(|i| i.modifiers.ctrl);
@@ -1663,6 +1739,26 @@ impl App {
             self.update_last_selected_image();
             self.context_menu_idx = Some(idx);
             self.context_menu_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
+        }
+
+        // ── native ファイル D&D の開始検出 (docs/file-drag-drop-design.md §5.4) ──
+        // primary (左) ボタンのドラッグだけを起点にする。native drag 直後の
+        // 1 フレームは抑止 (幽霊ドラッグ防止の保険、§6.1)。
+        if !self.native_drag_just_finished && response.drag_started_by(egui::PointerButton::Primary)
+        {
+            match decide_drag_payload(&self.items, &self.checked, idx) {
+                DragDecision::Start {
+                    paths,
+                    post_drag_toast,
+                } => {
+                    self.pending_native_drag = Some(crate::app::PendingNativeDrag {
+                        paths,
+                        post_drag_toast,
+                    });
+                }
+                DragDecision::ImmediateToast(msg) => self.show_feedback_toast(msg),
+                DragDecision::None => {}
+            }
         }
         nav
     }
@@ -2243,5 +2339,121 @@ mod compute_cell_size_tests {
     fn cols_zero_falls_back_to_one() {
         let (w, _) = compute_cell_size(800.0, 0, 1.0).expect("Some");
         assert_eq!(w, 800.0);
+    }
+}
+
+#[cfg(test)]
+mod decide_drag_payload_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn img(p: &str) -> GridItem {
+        GridItem::Image(PathBuf::from(p))
+    }
+    fn zip_img(zip: &str, entry: &str) -> GridItem {
+        GridItem::ZipImage {
+            zip_path: PathBuf::from(zip),
+            entry_name: entry.to_string(),
+        }
+    }
+
+    #[test]
+    fn single_real_file_not_checked() {
+        let items = vec![img(r"C:\a.jpg"), img(r"C:\b.jpg")];
+        let checked = HashSet::new();
+        match decide_drag_payload(&items, &checked, 1) {
+            DragDecision::Start {
+                paths,
+                post_drag_toast,
+            } => {
+                assert_eq!(paths, vec![PathBuf::from(r"C:\b.jpg")]);
+                assert!(post_drag_toast.is_none());
+            }
+            _ => panic!("expected Start"),
+        }
+    }
+
+    #[test]
+    fn single_folder_not_checked_is_draggable() {
+        let items = vec![GridItem::Folder(PathBuf::from(r"C:\dir"))];
+        let checked = HashSet::new();
+        match decide_drag_payload(&items, &checked, 0) {
+            DragDecision::Start { paths, .. } => {
+                assert_eq!(paths, vec![PathBuf::from(r"C:\dir")]);
+            }
+            _ => panic!("expected Start"),
+        }
+    }
+
+    #[test]
+    fn single_virtual_item_is_noop() {
+        let items = vec![zip_img(r"C:\a.zip", "p1.jpg")];
+        let checked = HashSet::new();
+        assert!(matches!(
+            decide_drag_payload(&items, &checked, 0),
+            DragDecision::None
+        ));
+    }
+
+    #[test]
+    fn multi_selection_all_real_in_index_order() {
+        let items = vec![img(r"C:\a.jpg"), img(r"C:\b.jpg"), img(r"C:\c.jpg")];
+        // HashSet の反復順は不定。payload が index 昇順に並ぶことを検証する。
+        let checked: HashSet<usize> = [2, 0, 1].into_iter().collect();
+        match decide_drag_payload(&items, &checked, 2) {
+            DragDecision::Start {
+                paths,
+                post_drag_toast,
+            } => {
+                assert_eq!(
+                    paths,
+                    vec![
+                        PathBuf::from(r"C:\a.jpg"),
+                        PathBuf::from(r"C:\b.jpg"),
+                        PathBuf::from(r"C:\c.jpg"),
+                    ]
+                );
+                assert!(post_drag_toast.is_none());
+            }
+            _ => panic!("expected Start"),
+        }
+    }
+
+    #[test]
+    fn mixed_selection_excludes_virtual_with_toast() {
+        let items = vec![
+            img(r"C:\a.jpg"),
+            zip_img(r"C:\b.zip", "p1.jpg"),
+            img(r"C:\c.jpg"),
+        ];
+        let checked: HashSet<usize> = [0, 1, 2].into_iter().collect();
+        match decide_drag_payload(&items, &checked, 0) {
+            DragDecision::Start {
+                paths,
+                post_drag_toast,
+            } => {
+                // 仮想アイテム (idx 1) は除外され実ファイルだけ残る。
+                assert_eq!(
+                    paths,
+                    vec![PathBuf::from(r"C:\a.jpg"), PathBuf::from(r"C:\c.jpg")]
+                );
+                // 除外があったので完了後トーストが付く。
+                assert!(post_drag_toast.is_some());
+            }
+            _ => panic!("expected Start"),
+        }
+    }
+
+    #[test]
+    fn all_virtual_selection_is_immediate_toast() {
+        let items = vec![
+            zip_img(r"C:\a.zip", "p1.jpg"),
+            zip_img(r"C:\a.zip", "p2.jpg"),
+        ];
+        let checked: HashSet<usize> = [0, 1].into_iter().collect();
+        assert!(matches!(
+            decide_drag_payload(&items, &checked, 0),
+            DragDecision::ImmediateToast(_)
+        ));
     }
 }

@@ -185,6 +185,27 @@ impl GridItem {
         }
     }
 
+    /// D&D (ドラッグでコピー送出) で送出できる実ファイル / 実フォルダのパス。
+    ///
+    /// [`Self::file_operation_path`] との違いは `Folder` を含むこと。エクスプローラ
+    /// などへドラッグするときはフォルダごとコピーできてよい。対象外:
+    /// - `ZipImage` / `PdfPage` — 仮想フォルダ内でディスク上に実体がない
+    /// - `ZipSeparator` — 擬似アイテム
+    /// - `SearchContainer` — 検索集約 UI のコンテナ。`path` は実フォルダ / ZIP を
+    ///   指すが、初版スコープ外 (`docs/file-drag-drop-design.md` §2)。将来含める
+    ///   場合はここに 1 分岐足す。
+    pub fn drag_source_path(&self) -> Option<&Path> {
+        match self {
+            Self::Folder(p)
+            | Self::Image(p)
+            | Self::Video(p)
+            | Self::ZipFile(p)
+            | Self::PdfFile(p)
+            | Self::ConvertibleArchive { path: p, .. } => Some(p),
+            _ => None,
+        }
+    }
+
     /// チェックボックスで選択できるアイテムか。
     ///
     /// 画像・動画・ZIP/PDF 内ページに加えて、フォルダ以外の実ファイル
@@ -434,6 +455,84 @@ mod tests {
                 .and_then(|p| p.file_name())
                 .and_then(|n| n.to_str()),
             Some("a.pdf")
+        );
+    }
+
+    #[test]
+    fn drag_source_path_includes_folders_and_real_files() {
+        // 実フォルダ / 実ファイルは Some。file_operation_path と違い Folder も含む。
+        assert!(
+            GridItem::Folder(PathBuf::from(r"C:\books"))
+                .drag_source_path()
+                .is_some()
+        );
+        assert!(
+            GridItem::Image(PathBuf::from(r"C:\books\a.jpg"))
+                .drag_source_path()
+                .is_some()
+        );
+        assert!(
+            GridItem::Video(PathBuf::from(r"C:\books\a.mp4"))
+                .drag_source_path()
+                .is_some()
+        );
+        assert!(
+            GridItem::ZipFile(PathBuf::from(r"C:\books\a.zip"))
+                .drag_source_path()
+                .is_some()
+        );
+        assert!(
+            GridItem::PdfFile(PathBuf::from(r"C:\books\a.pdf"))
+                .drag_source_path()
+                .is_some()
+        );
+        assert!(
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from(r"C:\books\a.7z"),
+                format: crate::archive_converter::ArchiveFormat::SevenZ,
+            }
+            .drag_source_path()
+            .is_some()
+        );
+    }
+
+    #[test]
+    fn drag_source_path_excludes_virtual_and_pseudo_items() {
+        // 仮想フォルダ内 / 擬似アイテム / 検索集約コンテナは None。
+        assert!(
+            GridItem::ZipImage {
+                zip_path: PathBuf::from(r"C:\books\a.zip"),
+                entry_name: "p001.jpg".to_owned(),
+            }
+            .drag_source_path()
+            .is_none()
+        );
+        assert!(
+            GridItem::PdfPage {
+                pdf_path: PathBuf::from(r"C:\books\a.pdf"),
+                page_num: 0,
+                content_type: None,
+            }
+            .drag_source_path()
+            .is_none()
+        );
+        assert!(
+            GridItem::ZipSeparator {
+                dir_display: "chapter".to_owned(),
+            }
+            .drag_source_path()
+            .is_none()
+        );
+        // SearchContainer は path を持つが初版スコープ外 (docs §2)。
+        assert!(
+            GridItem::SearchContainer {
+                path: PathBuf::from(r"C:\books"),
+                kind: SearchContainerKind::Folder,
+                hit_count: 3,
+                representative: None,
+            }
+            .drag_source_path()
+            .is_none()
         );
     }
 }
