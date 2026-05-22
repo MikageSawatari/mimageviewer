@@ -312,9 +312,11 @@ impl SearchIndexDb {
     }
 
     /// 部分一致検索 (大文字小文字無視)。結果は表示名で昇順ソート済み。
-    /// `favorite_roots` が空の場合は全件対象。`mode` で include トークン結合を AND/OR 切替。
-    /// `kind` が `Some(k)` のときは種別 (フォルダ/ZIP/PDF) で AND 絞り込みする
-    /// (Ctrl+S 種別フィルタ、docs/search-container-item-redesign.md §4.2)。
+    /// `favorite_roots` が空の場合は (種別フィルタを除き) 全 favorite 対象。
+    /// `mode` で include トークン結合を AND/OR 切替。
+    /// `kind` が `Some(k)` のときは種別で AND 絞り込みする。`None` ("すべて") でも
+    /// 動画 (VideoFile) は常に除外し、Folder/ZIP/PDF だけ返す
+    /// (Ctrl+S 種別フィルタ、docs/search-container-item-redesign.md §4.2 / §task#4)。
     ///
     /// クエリ構文は `search_query::parse` を参照。トークンごとに
     /// `name LIKE ?` / `name NOT LIKE ?` を生成し、include は `mode` で結合、
@@ -363,10 +365,14 @@ impl SearchIndexDb {
             where_clauses.push(format!("favorite_root IN ({placeholders})"));
         }
 
-        // 種別フィルタ (Ctrl+S §4.2)。Some(k) のとき kind 列で AND 絞り込みする。
+        // 種別フィルタ (Ctrl+S §4.2)。動画はコンテナ索引の対象外 (§task#4) なので、
+        // Some(k) なら指定種別だけ、None ("すべて") でも VideoFile を除外して
+        // Folder/ZIP/PDF だけ返す。旧バージョンが書いた VideoFile 行が DB に
+        // 残っていてもクエリ側で弾く (kind 値は enum 由来の定数なのでリテラル埋め込み可)。
         let kind_val: Option<i64> = kind.map(|k| k as i64);
-        if kind_val.is_some() {
-            where_clauses.push("kind = ?".to_string());
+        match kind_val {
+            Some(_) => where_clauses.push("kind = ?".to_string()),
+            None => where_clauses.push(format!("kind <> {}", IndexKind::VideoFile as i64)),
         }
 
         let where_sql = if where_clauses.is_empty() {
@@ -770,11 +776,12 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].kind, IndexKind::ZipFile);
 
+        // 動画はコンテナ索引の対象外: 旧 DB 由来の VideoFile 行があっても
+        // kind=None ("すべて") の検索結果には出てこない (§task#4)。
         let results = db
             .search(".mp4", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].kind, IndexKind::VideoFile);
+        assert!(results.is_empty(), "動画はコンテナ検索結果から除外される");
 
         // 大文字小文字無視
         let results = db
@@ -859,14 +866,24 @@ mod tests {
                 entry(r"C:\Fav\photos", "photos", IndexKind::Folder),
                 entry(r"C:\Fav\photos.zip", "photos.zip", IndexKind::ZipFile),
                 entry(r"C:\Fav\photos.pdf", "photos.pdf", IndexKind::PdfFile),
+                // 旧バージョン由来の VideoFile 行を混ぜておく (§task#4 のクエリ側除外を検証)。
+                entry(r"C:\Fav\photos.mp4", "photos.mp4", IndexKind::VideoFile),
             ],
         )
         .unwrap();
-        // kind=None → 全種別ヒット
+        // kind=None → 動画を除いた 3 種別のみ (VideoFile 行はクエリで弾かれる)
         let all = db
             .search("photos", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
-        assert_eq!(all.len(), 3, "kind=None なら 3 種別すべて");
+        assert_eq!(
+            all.len(),
+            3,
+            "kind=None でも動画は除外され Folder/ZIP/PDF の 3 種別"
+        );
+        assert!(
+            all.iter().all(|e| e.kind != IndexKind::VideoFile),
+            "結果に VideoFile が混ざらない"
+        );
         // kind=Some(ZipFile) → ZIP のみ
         let zips = db
             .search(
@@ -889,6 +906,67 @@ mod tests {
             .unwrap();
         assert_eq!(folders.len(), 1);
         assert_eq!(folders[0].kind, IndexKind::Folder);
+    }
+
+    #[test]
+    fn search_kind_filter_combined_with_favorites_excludes_and_or() {
+        // バインド順序の回帰検出: include(OR) → exclude → favorite_roots → kind を
+        // すべて同時に使い、SQL のプレースホルダと params_vec が一致していることを確認する。
+        let db = open_mem();
+        let fav1 = PathBuf::from(r"C:\Fav1");
+        let fav2 = PathBuf::from(r"C:\Fav2");
+        let fav3 = PathBuf::from(r"C:\Fav3");
+        db.upsert_children(
+            &fav1,
+            &fav1,
+            &[
+                entry(r"C:\Fav1\photos.zip", "photos.zip", IndexKind::ZipFile),
+                entry(r"C:\Fav1\photos.pdf", "photos.pdf", IndexKind::PdfFile),
+                entry(
+                    r"C:\Fav1\docs-draft.zip",
+                    "docs-draft.zip",
+                    IndexKind::ZipFile,
+                ),
+            ],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav2,
+            &fav2,
+            &[entry(r"C:\Fav2\docs.zip", "docs.zip", IndexKind::ZipFile)],
+        )
+        .unwrap();
+        db.upsert_children(
+            &fav3,
+            &fav3,
+            &[entry(
+                r"C:\Fav3\photos.zip",
+                "photos.zip",
+                IndexKind::ZipFile,
+            )],
+        )
+        .unwrap();
+
+        // include=photos OR docs, exclude=draft, roots=[fav1,fav2], kind=ZipFile
+        let results = db
+            .search(
+                "photos docs -draft",
+                &[fav1.clone(), fav2.clone()],
+                Some(IndexKind::ZipFile),
+                crate::search_query::MatchMode::Or,
+            )
+            .unwrap();
+        let names: Vec<&str> = results.iter().map(|e| e.display_name.as_str()).collect();
+        assert_eq!(
+            results.len(),
+            2,
+            "photos.zip(fav1) と docs.zip(fav2) のみ: {names:?}"
+        );
+        assert!(names.contains(&"photos.zip"), "{names:?}");
+        assert!(names.contains(&"docs.zip"), "{names:?}");
+        // docs-draft.zip は exclude、photos.pdf は kind 不一致、fav3 は roots 外。
+        assert!(!names.contains(&"docs-draft.zip"));
+        assert!(!names.contains(&"photos.pdf"));
     }
 
     #[test]

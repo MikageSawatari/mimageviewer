@@ -233,6 +233,14 @@ fn watcher_indexes_deep_subtree_added_after_initial() {
         FS_EVENT_TIMEOUT,
         "name index picks up deep ZIP/PDF added after initial scan (apply_single_change recursion)",
     );
+    // ZIP/PDF が見えた時点で subtree scan は走り終えている。同じ marker の動画 (.mp4) が
+    // 索引化されていないことを確認する (§task#4: 動画はコンテナ索引の対象外)。
+    let after = name_index_search(&db, "very_deep_marker_added", &roots);
+    assert!(
+        after.iter().all(|e| e.kind != IndexKind::VideoFile),
+        "深いサブツリー追加でも .mp4 は索引化されない: {:?}",
+        after.iter().map(|e| &e.display_name).collect::<Vec<_>>()
+    );
     // 中間フォルダもヒット
     wait_for_name_index_hits(
         &db,
