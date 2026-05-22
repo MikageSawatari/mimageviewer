@@ -230,6 +230,7 @@ pub fn name_index_search(
     db.search(
         query,
         favorite_roots,
+        None,
         mimageviewer::search_query::MatchMode::And,
     )
     .expect("search_index_db::search")

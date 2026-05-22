@@ -443,7 +443,12 @@ mod tests {
 
         // 深い場所の ZIP / PDF は検索ヒット (動画は除外)
         let leaf = db
-            .search("leaf", &[root.clone()], crate::search_query::MatchMode::And)
+            .search(
+                "leaf",
+                &[root.clone()],
+                None,
+                crate::search_query::MatchMode::And,
+            )
             .unwrap();
         assert_eq!(
             leaf.len(),

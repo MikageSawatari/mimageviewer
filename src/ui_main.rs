@@ -1369,12 +1369,11 @@ impl App {
         egui::TopBottomPanel::top("favsearch_bar").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label("検索:");
+                ui.label("コンテナ検索:");
                 let response = ui.add_sized(
                     [320.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.favsearch.query).hint_text(
-                        r#"お気に入り配下のフォルダ/ZIP/PDF/動画名 (AND / -除外 / "…")"#,
-                    ),
+                    egui::TextEdit::singleline(&mut self.favsearch.query)
+                        .hint_text(r#"フォルダ・ZIP・PDF をコンテナ名で探す (AND / -除外 / "…")"#),
                 );
 
                 if self.favsearch.focus_request {
@@ -1428,6 +1427,41 @@ impl App {
                         // ドロップダウン変更は即再実行。クエリが空なら execute_favsearch が早期 return する。
                         query_changed = true;
                         // last_executed と現 query が一致していても再実行するよう last_executed を空に倒す。
+                        self.favsearch.last_executed.clear();
+                    }
+                }
+
+                // ── 種別フィルタ (§4.2) ──
+                // コンテナ検索は フォルダ / ZIP / PDF が対象 (動画はコンテナではないので無し)。
+                {
+                    use crate::search_index_db::IndexKind;
+                    let current = self.favsearch.kind_filter;
+                    let label_for = |opt: Option<IndexKind>| -> &'static str {
+                        match opt {
+                            None => "すべての種別",
+                            Some(IndexKind::Folder) => "フォルダ",
+                            Some(IndexKind::ZipFile) => "ZIP",
+                            Some(IndexKind::PdfFile) => "PDF",
+                            Some(IndexKind::VideoFile) => "動画",
+                        }
+                    };
+                    let mut next = current;
+                    egui::ComboBox::from_id_salt("favsearch_kind")
+                        .selected_text(label_for(current))
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
+                            for choice in [
+                                None,
+                                Some(IndexKind::Folder),
+                                Some(IndexKind::ZipFile),
+                                Some(IndexKind::PdfFile),
+                            ] {
+                                ui.selectable_value(&mut next, choice, label_for(choice));
+                            }
+                        });
+                    if next != current {
+                        self.favsearch.kind_filter = next;
+                        query_changed = true;
                         self.favsearch.last_executed.clear();
                     }
                 }

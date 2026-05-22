@@ -791,7 +791,7 @@ mod tests {
     }
 
     fn count_hits(db: &SearchIndexDb, q: &str, roots: &[PathBuf]) -> usize {
-        db.search(q, roots, MatchMode::And).unwrap().len()
+        db.search(q, roots, None, MatchMode::And).unwrap().len()
     }
 
     /// B4 の本懐: 深い `marker.zip` の Remove イベントしか届かないケースで、

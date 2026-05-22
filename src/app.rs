@@ -1437,6 +1437,9 @@ pub(crate) struct FavSearchState {
     pub favorite_filter: Option<uuid::Uuid>,
     /// OR 検索モード (docs §20)。`true` なら include トークンを OR 結合 (NOT は常に AND)。
     pub or_mode: bool,
+    /// 種別フィルタ (None = すべて、Some(k) = フォルダ / ZIP / PDF のいずれかに限定)。
+    /// docs/search-container-item-redesign.md §4.2。
+    pub kind_filter: Option<crate::search_index_db::IndexKind>,
 }
 
 impl FavSearchState {
@@ -5540,13 +5543,14 @@ impl App {
         let (tx, rx) = mpsc::channel();
 
         let mode: crate::search_query::MatchMode = self.favsearch.or_mode.into();
+        let kind_filter = self.favsearch.kind_filter;
         std::thread::Builder::new()
             .name("favsearch-db".to_string())
             .spawn(move || {
                 if cancel_w.load(Ordering::Relaxed) {
                     return;
                 }
-                let result = db.search(&query, &fav_roots, mode);
+                let result = db.search(&query, &fav_roots, kind_filter, mode);
                 // キャンセル後の送信は無意味なので捨てる (UI 側 pending も None に戻っている)
                 if cancel_w.load(Ordering::Relaxed) {
                     return;

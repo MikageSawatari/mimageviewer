@@ -313,6 +313,8 @@ impl SearchIndexDb {
 
     /// 部分一致検索 (大文字小文字無視)。結果は表示名で昇順ソート済み。
     /// `favorite_roots` が空の場合は全件対象。`mode` で include トークン結合を AND/OR 切替。
+    /// `kind` が `Some(k)` のときは種別 (フォルダ/ZIP/PDF) で AND 絞り込みする
+    /// (Ctrl+S 種別フィルタ、docs/search-container-item-redesign.md §4.2)。
     ///
     /// クエリ構文は `search_query::parse` を参照。トークンごとに
     /// `name LIKE ?` / `name NOT LIKE ?` を生成し、include は `mode` で結合、
@@ -321,6 +323,7 @@ impl SearchIndexDb {
         &self,
         query: &str,
         favorite_roots: &[PathBuf],
+        kind: Option<IndexKind>,
         mode: crate::search_query::MatchMode,
     ) -> rusqlite::Result<Vec<IndexEntry>> {
         let tokens = crate::search_query::parse(query);
@@ -360,6 +363,12 @@ impl SearchIndexDb {
             where_clauses.push(format!("favorite_root IN ({placeholders})"));
         }
 
+        // 種別フィルタ (Ctrl+S §4.2)。Some(k) のとき kind 列で AND 絞り込みする。
+        let kind_val: Option<i64> = kind.map(|k| k as i64);
+        if kind_val.is_some() {
+            where_clauses.push("kind = ?".to_string());
+        }
+
         let where_sql = if where_clauses.is_empty() {
             "1=1".to_string()
         } else {
@@ -376,7 +385,8 @@ impl SearchIndexDb {
 
         let mut stmt = conn.prepare(&sql)?;
 
-        // バインドを WHERE 節と同じ順序で積む: include (まとめて) → exclude (1 個ずつ) → お気に入り。
+        // バインドを WHERE 節と同じ順序で積む: include (まとめて) → exclude (1 個ずつ)
+        // → お気に入り → 種別。
         let mut params_vec: Vec<&dyn rusqlite::ToSql> = Vec::new();
         for s in &include_binds {
             params_vec.push(s as &dyn rusqlite::ToSql);
@@ -386,6 +396,9 @@ impl SearchIndexDb {
         }
         for s in &fav_norm_strs {
             params_vec.push(s as &dyn rusqlite::ToSql);
+        }
+        if let Some(ref kv) = kind_val {
+            params_vec.push(kv as &dyn rusqlite::ToSql);
         }
 
         let rows = stmt.query_map(params_vec.as_slice(), |row| {
@@ -746,26 +759,26 @@ mod tests {
         assert_eq!(db.total_count().unwrap(), 4);
 
         let results = db
-            .search("alp", &[], crate::search_query::MatchMode::And)
+            .search("alp", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].display_name, "alpha");
 
         let results = db
-            .search(".zip", &[], crate::search_query::MatchMode::And)
+            .search(".zip", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].kind, IndexKind::ZipFile);
 
         let results = db
-            .search(".mp4", &[], crate::search_query::MatchMode::And)
+            .search(".mp4", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].kind, IndexKind::VideoFile);
 
         // 大文字小文字無視
         let results = db
-            .search("BETA", &[], crate::search_query::MatchMode::And)
+            .search("BETA", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
         assert_eq!(results.len(), 1);
     }
@@ -805,7 +818,7 @@ mod tests {
         )
         .unwrap();
         let all = db
-            .search("", &[], crate::search_query::MatchMode::And)
+            .search("", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
         assert_eq!(all.len(), 3);
         let names: Vec<&str> = all.iter().map(|e| e.display_name.as_str()).collect();
@@ -829,9 +842,53 @@ mod tests {
         db.clear_for_favorite(&fav1).unwrap();
         assert_eq!(db.total_count().unwrap(), 1);
         let results = db
-            .search("", &[], crate::search_query::MatchMode::And)
+            .search("", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
         assert_eq!(results[0].display_name, "b");
+    }
+
+    #[test]
+    fn search_filters_by_kind() {
+        // Ctrl+S 種別フィルタ (§4.2): kind=Some(k) で kind 列を AND 絞り込みする。
+        let db = open_mem();
+        let fav = PathBuf::from(r"C:\Fav");
+        db.upsert_children(
+            &fav,
+            &fav,
+            &[
+                entry(r"C:\Fav\photos", "photos", IndexKind::Folder),
+                entry(r"C:\Fav\photos.zip", "photos.zip", IndexKind::ZipFile),
+                entry(r"C:\Fav\photos.pdf", "photos.pdf", IndexKind::PdfFile),
+            ],
+        )
+        .unwrap();
+        // kind=None → 全種別ヒット
+        let all = db
+            .search("photos", &[], None, crate::search_query::MatchMode::And)
+            .unwrap();
+        assert_eq!(all.len(), 3, "kind=None なら 3 種別すべて");
+        // kind=Some(ZipFile) → ZIP のみ
+        let zips = db
+            .search(
+                "photos",
+                &[],
+                Some(IndexKind::ZipFile),
+                crate::search_query::MatchMode::And,
+            )
+            .unwrap();
+        assert_eq!(zips.len(), 1);
+        assert_eq!(zips[0].kind, IndexKind::ZipFile);
+        // kind=Some(Folder) → フォルダのみ
+        let folders = db
+            .search(
+                "photos",
+                &[],
+                Some(IndexKind::Folder),
+                crate::search_query::MatchMode::And,
+            )
+            .unwrap();
+        assert_eq!(folders.len(), 1);
+        assert_eq!(folders[0].kind, IndexKind::Folder);
     }
 
     #[test]
@@ -855,6 +912,7 @@ mod tests {
             .search(
                 "match",
                 &[fav1.clone()],
+                None,
                 crate::search_query::MatchMode::And,
             )
             .unwrap();
@@ -879,20 +937,30 @@ mod tests {
 
         // AND: 両方含むもの
         let r = db
-            .search("alpha beta", &[], crate::search_query::MatchMode::And)
+            .search("alpha beta", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].display_name, "alpha_beta");
 
         // 片方しかないと落ちる
         let r = db
-            .search("alpha epsilon", &[], crate::search_query::MatchMode::And)
+            .search(
+                "alpha epsilon",
+                &[],
+                None,
+                crate::search_query::MatchMode::And,
+            )
             .unwrap();
         assert_eq!(r.len(), 0);
 
         // OR モードなら片方だけでも拾える
         let r = db
-            .search("alpha epsilon", &[], crate::search_query::MatchMode::Or)
+            .search(
+                "alpha epsilon",
+                &[],
+                None,
+                crate::search_query::MatchMode::Or,
+            )
             .unwrap();
         let names: Vec<&str> = r.iter().map(|e| e.display_name.as_str()).collect();
         assert!(names.contains(&"alpha_beta"));
@@ -916,7 +984,7 @@ mod tests {
         .unwrap();
 
         let r = db
-            .search("image -bad", &[], crate::search_query::MatchMode::And)
+            .search("image -bad", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
         let names: Vec<&str> = r.iter().map(|e| e.display_name.as_str()).collect();
         assert!(names.contains(&"good_image"));
@@ -943,7 +1011,12 @@ mod tests {
 
         // "klee nsfw -sleep" OR → (klee OR nsfw) AND (NOT sleep)
         let r = db
-            .search("klee nsfw -sleep", &[], crate::search_query::MatchMode::Or)
+            .search(
+                "klee nsfw -sleep",
+                &[],
+                None,
+                crate::search_query::MatchMode::Or,
+            )
             .unwrap();
         let names: Vec<&str> = r.iter().map(|e| e.display_name.as_str()).collect();
         assert!(names.contains(&"klee"));
@@ -970,7 +1043,12 @@ mod tests {
         .unwrap();
 
         let r = db
-            .search(r#""hello world""#, &[], crate::search_query::MatchMode::And)
+            .search(
+                r#""hello world""#,
+                &[],
+                None,
+                crate::search_query::MatchMode::And,
+            )
             .unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].display_name, "hello world");
@@ -993,7 +1071,7 @@ mod tests {
 
         // `_` はワイルドカードではなくリテラルの underscore として扱う
         let r = db
-            .search("100_", &[], crate::search_query::MatchMode::And)
+            .search("100_", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
         let names: Vec<&str> = r.iter().map(|e| e.display_name.as_str()).collect();
         assert_eq!(names, vec!["100_percent"]);
@@ -1111,11 +1189,11 @@ mod tests {
         assert_eq!(n, 2);
 
         let r = db
-            .search("y.zip", &[], crate::search_query::MatchMode::And)
+            .search("y.zip", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
         assert_eq!(r.len(), 1, "foobar 配下の y.zip は残るべき");
         let r = db
-            .search("foobar", &[], crate::search_query::MatchMode::And)
+            .search("foobar", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
         assert_eq!(r.len(), 1, "foobar Folder 行も残るべき");
     }
@@ -1145,11 +1223,11 @@ mod tests {
         assert_eq!(n, 1, "literal な foo_% のみ消える (LIKE 評価されない)");
 
         let r = db
-            .search("fooXY", &[], crate::search_query::MatchMode::And)
+            .search("fooXY", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
         assert_eq!(r.len(), 1, "fooXY は残るべき (LIKE 評価で巻き込まれない)");
         let r = db
-            .search("foo%bar", &[], crate::search_query::MatchMode::And)
+            .search("foo%bar", &[], None, crate::search_query::MatchMode::And)
             .unwrap();
         assert_eq!(r.len(), 1, "foo%bar は残るべき (LIKE 評価で巻き込まれない)");
     }
@@ -1190,6 +1268,7 @@ mod tests {
             .search(
                 "x.zip",
                 &[fav_parent.clone()],
+                None,
                 crate::search_query::MatchMode::And,
             )
             .unwrap();
@@ -1200,6 +1279,7 @@ mod tests {
             .search(
                 "x.zip",
                 &[fav_child.clone()],
+                None,
                 crate::search_query::MatchMode::And,
             )
             .unwrap();
@@ -1303,20 +1383,30 @@ mod tests {
 
         // target_subtree のみが消え、other_sibling と FavB は残る
         assert!(
-            db.search("target_subtree", &[], crate::search_query::MatchMode::And)
-                .unwrap()
-                .is_empty(),
+            db.search(
+                "target_subtree",
+                &[],
+                None,
+                crate::search_query::MatchMode::And
+            )
+            .unwrap()
+            .is_empty(),
             "target_subtree は消えるべき"
         );
         assert_eq!(
-            db.search("other_sibling", &[], crate::search_query::MatchMode::And)
-                .unwrap()
-                .len(),
+            db.search(
+                "other_sibling",
+                &[],
+                None,
+                crate::search_query::MatchMode::And
+            )
+            .unwrap()
+            .len(),
             1,
             "subtree 外の sibling は残る"
         );
         assert_eq!(
-            db.search("x", &[], crate::search_query::MatchMode::And)
+            db.search("x", &[], None, crate::search_query::MatchMode::And)
                 .unwrap()
                 .len(),
             1,
