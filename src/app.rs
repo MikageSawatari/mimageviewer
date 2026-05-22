@@ -872,26 +872,38 @@ fn run_metadata_search(
                 }
             }
             GridItem::PdfFile(path) => {
-                // PDF: まずファイル名、外れたら document info も見る (§4.1.1)。
-                // すべて (All) のときは短絡評価で不要な IPC を避ける。
-                let name_hit =
-                    use_name && crate::search_query::matches_with_mode(tokens, &item.name(), mode);
-                if name_hit {
-                    matches.insert(idx);
-                } else if use_pdf_meta {
-                    // 保護 PDF でパスワード未保存なら get_document_info は失敗 →
-                    // その PDF はファイル名のみで判定済み (= 非マッチ扱い)。
-                    let password = pdf_passwords.get(path);
-                    if let Ok(info) =
-                        crate::pdf_loader::get_document_info(path, password.as_deref())
-                    {
-                        let doc_text = info.as_search_text();
-                        if !doc_text.is_empty()
-                            && crate::search_query::matches_with_mode(tokens, &doc_text, mode)
-                        {
+                // PDF: ファイル名 + PDF document info を 1 つの hay にまとめて判定する
+                // (§4.1.1)。filename と title をまたぐクエリや exclude トークンを
+                // 正しく扱うため、Image/Video と同じ combined-hay 方式にする
+                // (2 つの hay を別々に matches すると "scan invoice" や
+                // "scan -draft" を取りこぼす — Codex P2)。まずファイル名だけで
+                // 部分判定し、結論が出れば document info の IPC を省く。
+                let name = item.name();
+                let name_hay: &str = if use_name { &name } else { "" };
+                if use_pdf_meta {
+                    match crate::search_query::decide_partial_with_mode(tokens, name_hay, mode) {
+                        crate::search_query::PartialResult::Decided(true) => {
                             matches.insert(idx);
                         }
+                        crate::search_query::PartialResult::Decided(false) => {}
+                        crate::search_query::PartialResult::NeedsMore => {
+                            // 保護 PDF でパスワード未保存なら get_document_info は
+                            // 失敗 → doc_text 空 = ファイル名のみで判定 (= 非マッチ)。
+                            let password = pdf_passwords.get(path);
+                            let doc_text =
+                                crate::pdf_loader::get_document_info(path, password.as_deref())
+                                    .map(|info| info.as_search_text())
+                                    .unwrap_or_default();
+                            let hay = hay_of(&doc_text, name_hay, None);
+                            if crate::search_query::matches_with_mode(tokens, &hay, mode) {
+                                matches.insert(idx);
+                            }
+                        }
                     }
+                } else if use_name && crate::search_query::matches_with_mode(tokens, name_hay, mode)
+                {
+                    // PDF メタが検索対象外 → ファイル名のみで照合。
+                    matches.insert(idx);
                 }
             }
             GridItem::Image(_) | GridItem::Video(_) => {

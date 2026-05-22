@@ -3915,6 +3915,27 @@ mod ctrl_f_structural_filter_tests {
     }
 
     #[test]
+    fn pdf_file_metadata_target_matches_conclusively_by_filename() {
+        // §4.1.1: 検索対象に PDF メタを含む (All) ときでも、ファイル名だけで
+        // 判定が確定するクエリ ("sunset" がファイル名にあり除外語なし →
+        // decide_partial が Decided(true)) は document info の IPC を経由せず
+        // ヒットする。単一アイテムにして NeedsMore→IPC 経路に入らないようにする。
+        let items = vec![GridItem::PdfFile(PathBuf::from(r"C:\g\sunset report.pdf"))];
+        let m = run_ctrl_f("sunset", &items, crate::fts_index::SearchTarget::All);
+        assert_eq!(m, std::collections::HashSet::from([0]));
+    }
+
+    #[test]
+    fn pdf_file_metadata_target_honors_filename_exclude() {
+        // 除外トークンがファイル名に出現したら、PDF メタ対象 (All) でも
+        // その時点で非マッチが確定する (combined-hay 方式の回帰ガード:
+        // 旧実装はファイル名と doc info を別 hay で照合し exclude を取りこぼした)。
+        let items = vec![GridItem::PdfFile(PathBuf::from(r"C:\g\draft.pdf"))];
+        let m = run_ctrl_f("-draft", &items, crate::fts_index::SearchTarget::All);
+        assert!(m.is_empty(), "ファイル名に除外語がある PDF は出ない");
+    }
+
+    #[test]
     fn search_container_always_kept() {
         // SearchContainer は Ctrl+F と Ctrl+G が排他なので通常出現しないが、
         // 防御的に常に残す。
