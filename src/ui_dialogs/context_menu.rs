@@ -821,6 +821,13 @@ fn clipboard_seq_is_latest(my_seq: u64) -> bool {
     CLIPBOARD_SEQ.load(std::sync::atomic::Ordering::Relaxed) == my_seq
 }
 
+/// Path を PowerShell の単一引用符文字列リテラル (`'...'`、内部の `'` を `''` へ
+/// エスケープ) に変換する。clipboard / paste / drop のスクリプト生成で共用。
+#[cfg(windows)]
+fn ps_quote(path: &std::path::Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
+}
+
 /// ファイルをクリップボードにコピー (エクスプローラのコピーと同等)。
 pub fn copy_files_to_clipboard(paths: &[PathBuf]) {
     #[cfg(windows)]
@@ -829,11 +836,11 @@ pub fn copy_files_to_clipboard(paths: &[PathBuf]) {
             return;
         }
         let my_seq = bump_clipboard_seq();
-        let paths_str: Vec<String> = paths
+        let arr = paths
             .iter()
-            .map(|p| format!("'{}'", p.to_string_lossy().replace('\'', "''")))
-            .collect();
-        let arr = paths_str.join(",");
+            .map(|p| ps_quote(p))
+            .collect::<Vec<_>>()
+            .join(",");
         let script = format!(
             "Add-Type -AssemblyName System.Windows.Forms\n\
              $col = New-Object System.Collections.Specialized.StringCollection\n\
@@ -856,11 +863,11 @@ pub fn cut_files_to_clipboard(paths: &[PathBuf]) {
             return;
         }
         let my_seq = bump_clipboard_seq();
-        let paths_str: Vec<String> = paths
+        let arr = paths
             .iter()
-            .map(|p| format!("'{}'", p.to_string_lossy().replace('\'', "''")))
-            .collect();
-        let arr = paths_str.join(",");
+            .map(|p| ps_quote(p))
+            .collect::<Vec<_>>()
+            .join(",");
         let script = format!(
             "Add-Type -AssemblyName System.Windows.Forms\n\
              $col = New-Object System.Collections.Specialized.StringCollection\n\
@@ -1065,7 +1072,7 @@ pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) -> mpsc::Receiv
     let (tx, rx) = mpsc::channel();
     #[cfg(windows)]
     {
-        let dest = dest_folder.to_string_lossy().replace('\'', "''");
+        let dest = ps_quote(dest_folder);
         let script = format!(
             "Add-Type -AssemblyName System.Windows.Forms\n\
              $data = [System.Windows.Forms.Clipboard]::GetDataObject()\n\
@@ -1080,9 +1087,9 @@ pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) -> mpsc::Receiv
              }}\n\
              foreach ($f in $files) {{\n\
                if ($isMove) {{\n\
-                 Move-Item -Path $f -Destination '{dest}' -Force\n\
+                 Move-Item -Path $f -Destination {dest} -Force\n\
                }} else {{\n\
-                 Copy-Item -Path $f -Destination '{dest}' -Force -Recurse\n\
+                 Copy-Item -Path $f -Destination {dest} -Force -Recurse\n\
                }}\n\
              }}\n\
              if ($isMove) {{ [System.Windows.Forms.Clipboard]::Clear() }}\n"
@@ -1115,14 +1122,14 @@ pub fn copy_paths_into_folder(
             drop(tx); // receiver は即 Disconnected → poll 側は完了扱い
             return rx;
         }
-        let dest = dest_folder.to_string_lossy().replace('\'', "''");
+        let dest = ps_quote(dest_folder);
         let list = paths
             .iter()
-            .map(|p| format!("'{}'", p.to_string_lossy().replace('\'', "''")))
+            .map(|p| ps_quote(p))
             .collect::<Vec<_>>()
             .join(",");
         let script = format!(
-            "$dest = '{dest}'\n\
+            "$dest = {dest}\n\
              foreach ($f in @({list})) {{\n\
             \x20 Copy-Item -LiteralPath $f -Destination $dest -Force -Recurse -ErrorAction SilentlyContinue\n\
              }}\n"

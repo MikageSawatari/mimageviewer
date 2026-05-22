@@ -57,6 +57,12 @@
   ドライブルート / UNC 共有ルート (`Path::file_name()` が `None`) を素通りさせていた
   バグを修正 (`C:\A` 表示中の `C:\` ドロップ等)。ルートのときは `dest` 自体がルート
   配下かで判定。ユニットテスト 3 件追加 (合計 10 件)。
+- 2026-05-22: 3 エージェント並列コードレビューの指摘を反映。`DragOutcome` の
+  `effect` フィールドはどの呼び出し側も読まない死に状態だったため削除 (内部ログには
+  残る)。`DragOutcome` の 6 箇所のリテラル構築を `not_started` / `failed_before_start`
+  / `after_modal` コンストラクタに集約。`context_menu.rs` の PowerShell パスクォート
+  重複 (4 箇所) を `ps_quote` ヘルパーに統合。`update()` のドロップ取り込みを「ドロップ
+  無しなら空チェックのみ」に変更し毎フレームの `Vec` 確保を回避。
 
 ## 1. 背景・動機
 
@@ -215,7 +221,7 @@ where P1: Param<IDataObject>, P2: Param<IDropSource>;
 pub fn start_file_drag(hwnd: isize, paths: &[std::path::PathBuf]) -> DragOutcome;
 
 /// `start_file_drag` の結果。呼び出し側 (§5.5b) はこれを見て
-/// ポインタリセットの要否・失敗トーストの要否・ログ出力内容を判断する。
+/// ポインタリセットの要否・失敗トーストの要否を判断する。
 #[derive(Debug, Clone)]
 pub struct DragOutcome {
     /// `SHDoDragDrop` を実際に呼んだか。**true のときだけ** §5.5(a) の
@@ -225,13 +231,13 @@ pub struct DragOutcome {
     pub started: bool,
     /// `SHParseDisplayName` に失敗したパス数 (0 が正常)。>0 ならトーストで明示する。
     pub failed_paths: usize,
-    /// `SHDoDragDrop` の結果 DROPEFFECT。`started == true` かつ成功時のみ `Some`。
-    /// `DROPEFFECT_COPY` ならコピー成立、`DROPEFFECT_NONE` ならキャンセル
-    /// (ドロップ先なしで離した / Esc)。ログ・将来のトースト出し分け用。
-    pub effect: Option<DROPEFFECT>,
     /// COM 各ステップで失敗した場合のエラー。正常時は `None`。
     pub error: Option<FileDragError>,
 }
+// 構築は private コンストラクタ経由: not_started() / failed_before_start(failed,
+// error) / after_modal(failed, error)。started を取り違えないようにするため。
+// SHDoDragDrop の結果 DROPEFFECT (コピー成立 / キャンセル) は内部ログにのみ出す
+// — 呼び出し側に渡しても消費されなかったため DragOutcome には保持しない。
 
 /// `start_file_drag` の COM ステップ別エラー。どこで失敗したかを呼び出し側が
 /// 区別できるようにする (主にログの切り分け用)。
@@ -250,19 +256,17 @@ pub enum FileDragError {
 
 `DragOutcome` の組み合わせ早見表 (呼び出し側 §5.5b の分岐根拠):
 
-| 状況 | `started` | `effect` | `error` |
-| --- | --- | --- | --- |
-| `paths` 空 | false | None | None |
-| `SHParseDisplayName` 全滅 | false | None | `AllPathsUnresolved` |
-| 配列生成 / BindToHandler 失敗 | false | None | `ShellArrayCreate` / `BindToHandler` |
-| ドラッグ → ドロップ成立 | true | `Some(COPY)` | None |
-| ドラッグ → キャンセル | true | `Some(NONE)` | None |
-| `SHDoDragDrop` が HRESULT エラー | true | None | `DoDragDrop` |
+| 状況 | `started` | `error` |
+| --- | --- | --- |
+| `paths` 空 | false | None |
+| `SHParseDisplayName` 全滅 | false | `AllPathsUnresolved` |
+| 配列生成 / BindToHandler 失敗 | false | `ShellArrayCreate` / `BindToHandler` |
+| ドラッグ → ドロップ成立 or キャンセル | true | None |
+| `SHDoDragDrop` が HRESULT エラー | true | `DoDragDrop` |
 
 処理手順:
 
-1. `paths` が空なら `DragOutcome { started: false, failed_paths: 0, effect: None,
-   error: None }` を返す。
+1. `paths` が空なら `DragOutcome::not_started()` を返す。
 2. **COM 初期化は行わない** (採用方針、§6.3 参照)。`start_file_drag` は UI スレッド
    (= winit のイベントループスレッド) からのみ呼ばれ、winit 0.30.13 がウィンドウ作成時に
    `OleInitialize` → `RegisterDragDrop` 済みなので、このスレッドは既に STA。
@@ -281,27 +285,25 @@ pub enum FileDragError {
    失敗したパス数を数えて `DragOutcome.failed_paths` に載せる。成功した PIDL だけで
    ドラッグを続行し、呼び出し側 (§5.5b) が失敗件数をトーストで明示する。
    全パスが失敗したら以降の手順をスキップして
-   `DragOutcome { started: false, failed_paths: paths.len(), effect: None,
-   error: Some(FileDragError::AllPathsUnresolved) }` を返す。
+   `DragOutcome::failed_before_start(paths.len(), FileDragError::AllPathsUnresolved)`
+   を返す。
 4. `SHCreateShellItemArrayFromIDLists(&pidls)` で `IShellItemArray` を作る。失敗したら
-   `error: Some(FileDragError::ShellArrayCreate(hr))`、`started: false` で return
-   (PIDL 解放は手順 5 と同じく漏れなく行う)。
+   `DragOutcome::failed_before_start(failed, FileDragError::ShellArrayCreate(hr))` で
+   return (PIDL 解放は手順 5 と同じく漏れなく行う)。
 5. 取得した PIDL を `CoTaskMemFree` で順に解放 (配列側がコピー済みなので安全)。
    早期 return する経路でも漏れなく解放するよう、ガード型か明示的な解放順序で組む。
 6. `array.BindToHandler(Option::<IBindCtx>::None, &BHID_DataObject)` で `IDataObject` を
    得る。第 1 引数の `IBindCtx` も手順 3 と同じく `Option::<IBindCtx>::None` と型を明示。
-   失敗したら `error: Some(FileDragError::BindToHandler(hr))`、`started: false` で return。
+   失敗したら `DragOutcome::failed_before_start(failed, FileDragError::BindToHandler(hr))`。
 7. `SHDoDragDrop(Some(HWND(hwnd as *mut _)), &data, Option::<IDropSource>::None,
    DROPEFFECT_COPY)` を呼ぶ。**ここでブロック** (ドロップ/キャンセルまで戻らない)。
-8. `SHDoDragDrop` の戻り値で分岐:
-   - `Ok(effect)` → `DragOutcome { started: true, failed_paths: <手順 3 の失敗数>,
-     effect: Some(effect), error: None }`。`effect` はログに出す。
-   - `Err(e)` → `DragOutcome { started: true, failed_paths: <手順 3 の失敗数>,
-     effect: None, error: Some(FileDragError::DoDragDrop(e.code())) }`。
+8. `SHDoDragDrop` の戻り値で分岐 (いずれも `started: true`):
+   - `Ok(effect)` → `effect` (コピー成立 / キャンセル) をログに出し、
+     `DragOutcome::after_modal(failed, None)`。
+   - `Err(e)` → `DragOutcome::after_modal(failed, Some(FileDragError::DoDragDrop(e.code())))`。
      **`started` は true** — モーダルループに入ったのでポインタリセットは必要。
 
-`#[cfg(windows)]` でガードし、非 Windows では
-`DragOutcome { started: false, failed_paths: 0, effect: None, error: None }` を返す
+`#[cfg(windows)]` でガードし、非 Windows では `DragOutcome::not_started()` を返す
 空実装 (他のプラットフォーム分岐に揃える)。
 
 ### 5.2 `GridItem` にドラッグ対象パス抽出を追加 (約 15 行)

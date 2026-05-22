@@ -15,7 +15,7 @@
 use std::path::{Path, PathBuf};
 
 /// `start_file_drag` の結果。呼び出し側はこれを見て、ポインタリセットの要否・
-/// 失敗トーストの要否・ログ出力内容を判断する (`docs/file-drag-drop-design.md` §5.1)。
+/// 失敗トーストの要否を判断する (`docs/file-drag-drop-design.md` §5.1)。
 #[derive(Debug, Clone)]
 pub struct DragOutcome {
     /// `SHDoDragDrop` を実際に呼んだか。true のときだけドラッグ後のポインタ
@@ -25,10 +25,6 @@ pub struct DragOutcome {
     pub started: bool,
     /// `SHParseDisplayName` に失敗したパス数 (0 が正常)。>0 ならトーストで明示する。
     pub failed_paths: usize,
-    /// `SHDoDragDrop` の結果 DROPEFFECT の生ビット。`started == true` かつ成功時のみ
-    /// `Some`。1 (`DROPEFFECT_COPY`) ならコピー成立、0 (`DROPEFFECT_NONE`) なら
-    /// キャンセル。
-    pub effect: Option<u32>,
     /// COM 各ステップで失敗した場合のエラー。正常時は `None`。
     pub error: Option<FileDragError>,
 }
@@ -39,8 +35,25 @@ impl DragOutcome {
         Self {
             started: false,
             failed_paths: 0,
-            effect: None,
             error: None,
+        }
+    }
+
+    /// `SHDoDragDrop` へ到達する前に失敗した結果 (`started = false`)。
+    fn failed_before_start(failed_paths: usize, error: FileDragError) -> Self {
+        Self {
+            started: false,
+            failed_paths,
+            error: Some(error),
+        }
+    }
+
+    /// `SHDoDragDrop` を呼んだ後の結果 (`started = true`、`error` は HRESULT エラー時のみ)。
+    fn after_modal(failed_paths: usize, error: Option<FileDragError>) -> Self {
+        Self {
+            started: true,
+            failed_paths,
+            error,
         }
     }
 }
@@ -115,12 +128,7 @@ pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
 
     if pidls.is_empty() {
         crate::logger::log("file_drag: all paths failed SHParseDisplayName");
-        return DragOutcome {
-            started: false,
-            failed_paths,
-            effect: None,
-            error: Some(FileDragError::AllPathsUnresolved),
-        };
+        return DragOutcome::failed_before_start(failed_paths, FileDragError::AllPathsUnresolved);
     }
 
     // 2. PIDL 配列から IShellItemArray を作る。
@@ -131,12 +139,10 @@ pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
             crate::logger::log(format!(
                 "file_drag: SHCreateShellItemArrayFromIDLists failed: {e}"
             ));
-            return DragOutcome {
-                started: false,
+            return DragOutcome::failed_before_start(
                 failed_paths,
-                effect: None,
-                error: Some(FileDragError::ShellArrayCreate(e.code().0)),
-            };
+                FileDragError::ShellArrayCreate(e.code().0),
+            );
         }
     };
     // 配列が PIDL をコピー済みなので、ここで元の PIDL を解放してよい。
@@ -148,12 +154,10 @@ pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
             Ok(d) => d,
             Err(e) => {
                 crate::logger::log(format!("file_drag: BindToHandler failed: {e}"));
-                return DragOutcome {
-                    started: false,
+                return DragOutcome::failed_before_start(
                     failed_paths,
-                    effect: None,
-                    error: Some(FileDragError::BindToHandler(e.code().0)),
-                };
+                    FileDragError::BindToHandler(e.code().0),
+                );
             }
         };
 
@@ -167,21 +171,11 @@ pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
     match unsafe { SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, DROPEFFECT_COPY) } {
         Ok(effect) => {
             crate::logger::log(format!("file_drag: SHDoDragDrop done effect={}", effect.0));
-            DragOutcome {
-                started: true,
-                failed_paths,
-                effect: Some(effect.0),
-                error: None,
-            }
+            DragOutcome::after_modal(failed_paths, None)
         }
         Err(e) => {
             crate::logger::log(format!("file_drag: SHDoDragDrop failed: {e}"));
-            DragOutcome {
-                started: true,
-                failed_paths,
-                effect: None,
-                error: Some(FileDragError::DoDragDrop(e.code().0)),
-            }
+            DragOutcome::after_modal(failed_paths, Some(FileDragError::DoDragDrop(e.code().0)))
         }
     }
 }
@@ -213,7 +207,7 @@ fn copy_target_inside_src(src: &Path, dest: &Path) -> bool {
     // (`C:\` や `\\server\share`、`file_name()` == None) のときは basename が無く
     // コピー先を一意化できないため、`dest` 自体をコピー先領域とみなす — `dest` が
     // ルート配下 (= 同じドライブ / 共有) なら `Copy-Item -Recurse` は生成中の
-    // フォルダを再走査して無限再帰する (Codex 第 6 回 P1: root path の取りこぼし)。
+    // フォルダを再走査して無限再帰する。
     let target = match src.file_name() {
         Some(name) => dest.join(name),
         None => dest.to_path_buf(),
@@ -232,7 +226,7 @@ mod recurse_guard_tests {
 
     #[test]
     fn dest_under_src_is_recursive() {
-        // C:\A\B 表示中に C:\A をドロップ (Codex P1 の例)。
+        // C:\A\B 表示中に C:\A をドロップ → コピー先 C:\A\B\A は src 配下。
         assert!(copy_target_inside_src(
             Path::new(r"C:\A"),
             Path::new(r"C:\A\B")
@@ -293,7 +287,7 @@ mod recurse_guard_tests {
     #[test]
     fn drive_root_into_subdir_is_recursive() {
         // C:\A 表示中に ドライブルート C:\ をドロップ。file_name() == None でも
-        // dest が src 配下なので拒否されること (Codex 第 6 回 P1)。
+        // dest が src 配下なので拒否されること。
         assert!(copy_target_inside_src(
             Path::new(r"C:\"),
             Path::new(r"C:\A")

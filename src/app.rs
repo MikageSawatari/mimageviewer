@@ -17340,15 +17340,16 @@ impl eframe::App for App {
         self.update_ime_state(ctx);
 
         // エクスプローラ等から mIV へドロップされたファイルを現在のフォルダへコピーする
-        // (mIV → 外部 のドラッグ送出と対称の受け取り方向)。
-        let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .filter_map(|f| f.path.clone())
-                .collect()
-        });
-        if !dropped_paths.is_empty() {
+        // (mIV → 外部 のドラッグ送出と対称の受け取り方向)。毎フレーム走るので、
+        // ドロップが無い通常フレームでは空チェックだけで抜ける (Vec を確保しない)。
+        if ctx.input(|i| !i.raw.dropped_files.is_empty()) {
+            let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .filter_map(|f| f.path.clone())
+                    .collect()
+            });
             self.handle_external_file_drop(dropped_paths);
         }
 
@@ -18497,6 +18498,9 @@ impl eframe::App for App {
                 }
             }
             ctx.request_repaint();
+            // 連続ドラッグ (このフレームでまた drag が積まれた場合) は started で
+            // フラグが再び立つ。else 節に来ないので消費されず、次フレームも冒頭
+            // リセットが走る — これは意図どおり。
         } else if self.native_drag_just_finished {
             // 直前フレームが「ドラッグ実行フレーム」だった。このフレーム冒頭で
             // ポインタリセットを済ませたのでフラグを消費する (§6.1)。
