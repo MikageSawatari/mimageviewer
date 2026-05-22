@@ -863,6 +863,14 @@ impl App {
             self.native_video_front_recover_after_external_foreground = false;
             return;
         }
+        // Plan B: モード切替の進行中は presenter HWND が作り直される最中。新 HWND が
+        // publish 済みでも `WindowModeSwitched` 未処理のフレームでは実モード
+        // (`native_video_in_window_active`) が旧いままなので、ここで owner / HUD を
+        // 登録すると新 child HWND を fullscreen / VST owner と誤認しうる (Codex 再 P1)。
+        // 切替完了 (`apply_window_mode_switched`) 後の次フレームで再 sync される。
+        if self.native_video_mode_switch.is_some() {
+            return;
+        }
         let (hwnd, hud_hwnd) = self
             .fullscreen_idx
             .and_then(|idx| {
@@ -1517,10 +1525,11 @@ impl App {
     /// Plan B: presenter から `WindowModeSwitched` (切替成功) を受けたときに呼ぶ。
     /// App 側の実モード (`native_video_in_window_active`) を新モードへ更新し、
     /// presenter HWND が作り直されたことに伴う front 同期 / VST owner の再設定を行う。
+    /// `native_video_mode_switch` (pending) の解除は呼び出し側が request_id 照合の
+    /// うえで行う (stale イベントでも実モードだけは反映するため = Codex 再 P2)。
     #[cfg(windows)]
     fn apply_window_mode_switched(&mut self, in_window: bool) {
         self.native_video_in_window_active = in_window;
-        self.native_video_mode_switch = None;
         // presenter HWND が作り直されたので front 同期を強制リセットする。新 HWND は
         // publish 済みなので、次の ensure_native_video_front が is_new_hwnd 経路で
         // owner / HUD 登録をやり直す (Codex #4)。
@@ -1624,16 +1633,25 @@ impl App {
             crate::video::NativeVideoOutputEvent::WindowModeSwitched {
                 request_id,
                 in_window,
-            } => match self.native_video_mode_switch {
-                Some(pending) if pending.request_id == request_id => {
-                    self.apply_window_mode_switched(in_window);
-                }
-                _ => {
+            } => {
+                // presenter は自分のモードについて source of truth。request_id が
+                // 一致しなくても (timeout 後の遅延イベント等) 実モードだけは反映する。
+                // さもないと presenter が実際に切替済みなのに App の
+                // native_video_in_window_active だけ古いまま残る (Codex 再 P2)。
+                let matches_pending = matches!(
+                    self.native_video_mode_switch,
+                    Some(p) if p.request_id == request_id
+                );
+                self.apply_window_mode_switched(in_window);
+                if matches_pending {
+                    self.native_video_mode_switch = None;
+                } else {
                     crate::logger::log(format!(
-                        "[native-video] stale WindowModeSwitched ignored: request={request_id}"
+                        "[native-video] WindowModeSwitched request={request_id} did not match \
+                         pending; applied actual mode in_window={in_window} anyway"
                     ));
                 }
-            },
+            }
             crate::video::NativeVideoOutputEvent::WindowModeSwitchFailed { request_id } => {
                 match self.native_video_mode_switch {
                     Some(pending) if pending.request_id == request_id => {
@@ -3138,7 +3156,10 @@ impl App {
             return;
         };
         // in-window モードでは VST3 GUI を対象外にする (presenter が WS_CHILD のため)。
-        let vst3_ok = self.settings.vst3_enabled && !self.native_video_in_window_active;
+        // モード切替の進行中も実モード未確定なので保守的に false にする (Codex 再 P1)。
+        let vst3_ok = self.settings.vst3_enabled
+            && !self.native_video_in_window_active
+            && self.native_video_mode_switch.is_none();
         player.set_native_vst3_available(vst3_ok);
         player.set_native_video_compact(
             vst3_ok && self.settings.vst3_gui_visible && self.settings.vst3_video_compact,
@@ -3151,7 +3172,9 @@ impl App {
             return;
         };
         // in-window モードでは VST3 を対象外にするため panel を出さない (Codex P2)。
-        let panel = if self.native_video_in_window_active {
+        // モード切替の進行中も実モード未確定なので panel は出さない (Codex 再 P1)。
+        let panel = if self.native_video_in_window_active || self.native_video_mode_switch.is_some()
+        {
             None
         } else {
             self.build_native_video_vst3_panel()

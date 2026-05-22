@@ -15941,7 +15941,11 @@ impl App {
                 active_video_indices.push(*idx);
                 #[cfg(windows)]
                 player.set_native_vst3_available(
-                    self.settings.vst3_enabled && !self.native_video_in_window_active,
+                    self.settings.vst3_enabled
+                        && !self.native_video_in_window_active
+                        // モード切替の進行中は presenter HWND 再構築中で実モードが
+                        // 未確定。VST availability は保守的に false にする (Codex P1)。
+                        && self.native_video_mode_switch.is_none(),
                 );
                 #[cfg(windows)]
                 player.set_native_checked(self.checked.contains(idx));
@@ -16022,8 +16026,12 @@ impl App {
         // しない (z-order / focus が壊れる)。VST owner 同期は全画面モード限定
         // (Codex #4: Plan B の SwitchWindowMode で child HWND に切り替わった瞬間に
         //  VST owner が誤って child を指さないようガードする)。
+        // さらに、モード切替の進行中 (`native_video_mode_switch` Some) は presenter が
+        // 新 HWND を publish 済みでも `WindowModeSwitched` 未処理で実モードが旧いまま
+        // のフレームがあるため、その間は owner 同期自体を止める (Codex 再 P1)。
         #[cfg(windows)]
         if !self.native_video_in_window_active
+            && self.native_video_mode_switch.is_none()
             && native_owner_hwnd != 0
             && native_owner_hwnd != self.native_video_owner_synced_hwnd
         {
@@ -16069,6 +16077,21 @@ impl App {
         self.poll_native_video_source_swap_pending(ctx);
         #[cfg(windows)]
         self.poll_native_video_open_pending(ctx);
+        // Plan B: presenter 無応答でモード切替 pending が滞留すると VST owner /
+        // availability 同期が永久停止するため、deadline 超過の pending は明示的に
+        // 破棄する (Codex 再 P2: presenter が応答するなら遅延 WindowModeSwitched が
+        // 後から実モードを反映する)。
+        #[cfg(windows)]
+        if let Some(pending) = self.native_video_mode_switch {
+            if std::time::Instant::now() >= pending.deadline {
+                crate::logger::log(format!(
+                    "[native-video] window mode switch request {} timed out \
+                     (no presenter event); clearing pending",
+                    pending.request_id
+                ));
+                self.native_video_mode_switch = None;
+            }
+        }
         #[cfg(windows)]
         if let Some(fs_idx) = self.fullscreen_idx {
             self.poll_native_video_fast_swap(ctx);
