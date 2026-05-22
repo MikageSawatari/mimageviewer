@@ -94,6 +94,22 @@ pub(super) fn draw_close_icon(painter: &egui::Painter, c: egui::Pos2, _r: f32) {
     );
 }
 
+/// ウィンドウ / 全画面 切り替えアイコン (タイトルバー付きウィンドウ枠)。
+/// native 動画 HUD の `draw_overlay_window_toggle_icon` と見た目を揃える。
+pub(super) fn draw_window_toggle_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
+    let win = egui::Rect::from_center_size(c, egui::vec2(r * 1.85, r * 1.5));
+    painter.rect_stroke(win, 1.0, stroke, egui::StrokeKind::Inside);
+    let title_y = win.top() + r * 0.46;
+    painter.line_segment(
+        [
+            egui::pos2(win.left(), title_y),
+            egui::pos2(win.right(), title_y),
+        ],
+        stroke,
+    );
+}
+
 /// 一時停止アイコン (2本の縦線) を描画する。
 pub(super) fn draw_pause_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     let bar_w = r * 0.3;

@@ -774,7 +774,7 @@ impl App {
             .map(|(id, _)| self.adjustment_favorite_params.contains_key(id))
             .unwrap_or(false);
         let under_favorite = fav_info.is_some();
-        actions_child.vertical(|ui| {
+        let actions_resp = actions_child.vertical(|ui| {
             let wide = egui::vec2(panel_rect.width() - 20.0, 24.0);
             if ui
                 .add(egui::Button::new("このフォルダの全画像に適用").min_size(wide))
@@ -839,12 +839,18 @@ impl App {
         });
 
         // ── レイアウト計算: スライダー領域と保存スロット領域 ──
-        let content_top = buttons_y + buttons_h + 6.0;
+        // content_top はアクションボタン群の **実測高さ**で決める。お気に入り名が
+        // 長い / パネルが狭いとお気に入りボタンのラベルが 2 行に折り返し、固定見積りの
+        // buttons_h ではスクロール領域がボタンに食い込む (実機報告 2026-05-22)。
+        let actual_buttons_h = actions_resp.response.rect.height();
+        let content_top = buttons_y + actual_buttons_h + 6.0;
         // 保存スロット: 5行×2列 + ラベル + マージン
         let slots_height = 5.0 * 26.0 + 28.0;
+        // 極端に低いパネルでも content_rect が負の高さにならないようクランプ。
+        let content_bottom = (panel_rect.max.y - slots_height).max(content_top);
         let content_rect = egui::Rect::from_min_max(
             egui::pos2(panel_rect.min.x, content_top),
-            egui::pos2(panel_rect.max.x, panel_rect.max.y - slots_height),
+            egui::pos2(panel_rect.max.x, content_bottom),
         );
         let mut scroll_child = child.new_child(egui::UiBuilder::new().max_rect(content_rect));
 

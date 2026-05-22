@@ -1531,6 +1531,30 @@ impl App {
         ));
     }
 
+    /// 静止画フルスクリーンのウィンドウ / 全画面 表示を切り替える。
+    ///
+    /// 静止画は egui の描画先 (embedded CentralPanel ⇔ 専用フルスクリーン
+    /// viewport) を切り替えるだけで、動画の Plan B のような presenter
+    /// (HWND + DComp) 再構築は不要。設定と実モードフラグを同期フリップし、
+    /// 次フレームの `render_fullscreen_viewport` が新モードで描画し直す。
+    /// 永続設定 `video_in_window_mode` は動画と共有する単一の「in-window
+    /// モード」設定で、動画 HUD のトグルと同じ値を切り替える。
+    #[cfg(windows)]
+    pub(crate) fn toggle_still_window_mode(&mut self) {
+        let in_window = !self.settings.video_in_window_mode;
+        self.settings.video_in_window_mode = in_window;
+        self.native_video_in_window_active = in_window;
+        self.settings.save();
+        // embedded → viewport では新 viewport がフォーカスを取るまで数フレーム
+        // main にフォーカスが残る。focus 起因の自動クローズ (update() の
+        // フォーカスガード) を抑止するため grace を張り直す (open_fullscreen と同じ)。
+        self.fs_opened_at = Some(std::time::Instant::now());
+        self.fs_focus_grace_elapsed = false;
+        crate::logger::log(format!(
+            "[fs] still-image window mode toggled -> in_window={in_window}"
+        ));
+    }
+
     /// Plan B: presenter から `WindowModeSwitched` (切替成功) を受けたときに呼ぶ。
     /// App 側の実モード (`native_video_in_window_active`) を新モードへ更新し、
     /// presenter HWND が作り直されたことに伴う front 同期 / VST owner の再設定を行う。

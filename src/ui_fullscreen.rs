@@ -1800,6 +1800,11 @@ impl App {
                             let vst3_panel_open = self.show_vst3_manager;
                             let mut vst3_pressed = false;
                             let mut copy_capture_pressed = false;
+                            let mut window_mode_pressed = false;
+                            // ウィンドウ / 全画面 切り替えボタン: 静止画フルスクリーン
+                            // (= 非動画、Windows) のときだけ出す。動画は native HUD 側に
+                            // 専用トグルがある。
+                            let show_window_toggle = cfg!(windows) && !is_video_mode;
                             let slideshow_was_playing = self.slideshow_playing;
                             Self::draw_fs_hover_bar(
                                 ui, ctx, full_rect,
@@ -1827,10 +1832,18 @@ impl App {
                                 vst3_panel_open,
                                 &mut vst3_pressed,
                                 &mut copy_capture_pressed,
+                                show_window_toggle,
+                                embedded,
+                                &mut window_mode_pressed,
                                 self.cursor_hidden,
                             );
                             if copy_capture_pressed {
                                 self.copy_image_capture_to_clipboard(fs_idx);
+                            }
+                            // ウィンドウ / 全画面 切り替えボタンが押された。
+                            #[cfg(windows)]
+                            if window_mode_pressed {
+                                self.toggle_still_window_mode();
                             }
                             if !slideshow_was_playing && self.slideshow_playing {
                                 self.schedule_next_slideshow_from_now();
@@ -5492,6 +5505,11 @@ impl App {
         vst3_panel_open: bool,
         vst3_pressed: &mut bool,
         copy_capture_pressed: &mut bool,
+        // ウィンドウ / 全画面 切り替えボタン (× の左)。show=表示するか、
+        // in_window=現在 in-window 表示中か、pressed=クリックされたか。
+        show_window_toggle: bool,
+        in_window_mode: bool,
+        window_mode_pressed: &mut bool,
         cursor_hidden: bool,
     ) {
         let hover_in_top = ctx.input(|i| {
@@ -5551,6 +5569,33 @@ impl App {
             *nav_delta = 0;
         }
         next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+
+        // ⊞ ウィンドウ / 全画面 切り替えボタン (× の左)。
+        // native 動画 HUD のトグルボタンと同じ役割を、静止画フルスクリーンの
+        // egui ホバーバーに置く。
+        if show_window_toggle {
+            let wm_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_window_mode_btn",
+                |hovered| bar_button_bg(hovered, in_window_mode),
+                in_window_mode,
+                |p, c, r| draw_window_toggle_icon(p, c, r),
+            );
+            let wm_resp = wm_resp.hover_tip_dark(if in_window_mode {
+                "全画面表示に切り替え"
+            } else {
+                "ウィンドウ内表示に切り替え"
+            });
+            if wm_resp.clicked() {
+                *window_mode_pressed = true;
+            }
+            if wm_resp.hovered() {
+                *nav_delta = 0;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        }
 
         // 📷 キャプチャコピー (画像のみ)。Ctrl+S のファイル保存と同じ snapshot 経路を使う。
         if !is_video {
