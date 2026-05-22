@@ -878,6 +878,9 @@ impl App {
 
         let (changed, is_dragging) = egui::ScrollArea::vertical()
             .max_height(content_rect.height())
+            // 既定の min_scrolled_height (64px) を外す。短いウィンドウで
+            // content_rect が極小のとき 64px 確保されると保存スロットに食い込むため。
+            .min_scrolled_height(0.0)
             .show(&mut scroll_child, |ui| {
                 ui.set_width(panel_rect.width() - 20.0);
                 ui.add_space(8.0);

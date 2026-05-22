@@ -1844,6 +1844,12 @@ impl App {
                             #[cfg(windows)]
                             if window_mode_pressed {
                                 self.toggle_still_window_mode();
+                                // 描画先 (embedded ⇔ 専用 viewport) の切替は次フレームの
+                                // render_fullscreen_viewport で起きる。静止画は
+                                // handle_fs_repaint が自発 repaint しないので、ルート
+                                // ビューポートの次フレームを明示要求する。さもないと
+                                // モード切替が次の入力まで反映されない (Codex P2)。
+                                ctx.request_repaint_of(egui::ViewportId::ROOT);
                             }
                             if !slideshow_was_playing && self.slideshow_playing {
                                 self.schedule_next_slideshow_from_now();
