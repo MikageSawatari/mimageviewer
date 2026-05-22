@@ -1081,7 +1081,19 @@ park 中も `seek_serial` 変化は即時に検知し、stale packet を捨て�
   `WM_LBUTTONDOWN` を `wnd_proc` に dispatch しないので、再生 toggle (App 経路の
   `handle_native_video_mouse_button` / overlay 経路の `primary_clicked`) どちらも
   発火せず、画像フルスクリーンの `fs_suppress_primary_until_release` と同等の
-  挙動になる (HTCLIENT 上の左クリックのみ対象、右/中ボタンはそのまま通す)
+  挙動になる (HTCLIENT 上の左クリックのみ対象、右/中ボタンはそのまま通す)。
+  ANDEAT 判定はウィンドウ種別で 2 通りある:
+  - **フルスクリーン (top-level popup HWND)**: `WM_MOUSEACTIVATE` は「非アクティブ
+    状態へのクリック」= 復帰クリックのときだけ届くので、HTCLIENT 左クリックを
+    無条件で ANDEAT する。
+  - **in-window 再生 (`WS_CHILD`、親 main window が別スレッド)**: `WM_MOUSEACTIVATE`
+    が毎クリック届くため無条件 ANDEAT にすると通常の再生クリックまで食われる。
+    `foreground_belongs_to_current_process_strict()` で「`WM_MOUSEACTIVATE` 受信
+    時点の foreground が mIV プロセスだと確証できるか」を見て、確証できないとき
+    だけ ANDEAT する。真の復帰クリックはアクティブ化遷移中で
+    `GetForegroundWindow()==NULL`、mIV が既に前面での通常クリックは foreground が
+    有効な mIV HWND になる (実機ログで確認)。NULL を「ours」とみなす非 strict 版
+    だと復帰クリックを取りこぼすので strict 版を使う
 
 責務は単一 (= 単純な入力 marshalling)。設計上の懸念はなし。
 

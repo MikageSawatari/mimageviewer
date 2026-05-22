@@ -708,13 +708,29 @@ unsafe extern "system" fn wnd_proc(
             let hit_test = (lparam.0 & 0xFFFF) as u32;
             let trigger_msg = ((lparam.0 >> 16) & 0xFFFF) as u32;
             let is_left = trigger_msg == WM_LBUTTONDOWN || trigger_msg == WM_LBUTTONDBLCLK;
-            // in-window モードの child window では MA_ACTIVATEANDEAT を使わない。
-            // child + 別スレッド parent の構成だと WM_MOUSEACTIVATE が毎クリック
-            // 飛んでくるため、ANDEAT だと左クリックが恒久的に食われる (右クリックは
-            // MA_ACTIVATE なので通る)。child は常に main window 内にいるので
-            // 「フォーカス復帰クリックを 1 回食う」挙動が不要。常に MA_ACTIVATE で通す。
             let is_child = unsafe { (GetWindowLongPtrW(hwnd, GWL_STYLE) as u32 & WS_CHILD.0) != 0 };
-            if !is_child && hit_test == HTCLIENT as u32 && is_left {
+            let want_eat = hit_test == HTCLIENT as u32 && is_left;
+            // popup (フルスクリーン) はトップレベルウィンドウなので、WM_MOUSEACTIVATE は
+            // 「非アクティブ状態へのクリック」= フォーカス復帰クリックのときだけ届く。
+            // 従来どおり HTCLIENT 上の左クリックを無条件で ANDEAT する。
+            //
+            // in-window モードの child window は親 (main window) が別スレッドのため
+            // WM_MOUSEACTIVATE が毎クリック届く。無条件 ANDEAT だと通常の再生クリック
+            // まで全部食われるので、「この WM_MOUSEACTIVATE 時点の foreground が mIV
+            // プロセスのものだと確証できないとき」だけ ANDEAT する。実機ログ (2026-05)
+            // で確認した挙動:
+            //   - 真の復帰クリック: アクティブ化遷移中で GetForegroundWindow()==NULL
+            //   - mIV が既に前面での通常クリック: foreground は有効な mIV の HWND
+            // foreground_belongs_to_current_process_strict() は NULL / pid0 を「ours で
+            // ない」と判定するので、復帰クリックだけを正しく ANDEAT できる (NULL を
+            // 「ours」とみなす非 strict 版だと復帰クリックを取りこぼす)。
+            let foreground_is_ours = foreground_belongs_to_current_process_strict();
+            let eat = if is_child {
+                want_eat && !foreground_is_ours
+            } else {
+                want_eat
+            };
+            if eat {
                 LRESULT(MA_ACTIVATEANDEAT as isize)
             } else {
                 LRESULT(MA_ACTIVATE as isize)
