@@ -15,9 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::folder_tree::{
-    SUPPORTED_VIDEO_EXTENSIONS, is_apple_double, walk_dirs_recursive_with_progress,
-};
+use crate::folder_tree::{is_apple_double, walk_dirs_recursive_with_progress};
 use crate::indexer_progress::ProgressReporter;
 use crate::search_index_db::{IndexEntry, IndexKind, SearchIndexDb};
 
@@ -137,7 +135,7 @@ pub fn run_bulk_name_index(
     summary.folders_visited = found.len();
     let total_folders = found.len();
 
-    // Pass 2: 各フォルダ直下の Folder / ZipFile / PdfFile / VideoFile を集めて upsert
+    // Pass 2: 各フォルダ直下の Folder / ZipFile / PdfFile を集めて upsert (動画は除外 §4.2)
     for (i, folder) in found.iter().enumerate() {
         // フォルダ 1 つ分を処理してから次でまた判定 (gate + cancel 両対応)。
         if crate::activity_gate::wait_and_check_cancel(activity_gate, cancel) {
@@ -339,15 +337,14 @@ pub fn classify_name_index_kind(
         return None;
     }
     let ext = path.extension().and_then(|e| e.to_str())?;
+    // 動画はコンテナではないので、コンテナ索引 (Ctrl+S) の対象から外す
+    // (docs/search-container-item-redesign.md §4.2)。動画はアイテム索引 (Ctrl+G)
+    // で扱う。`IndexKind::VideoFile` variant 自体は stale 行の読み取り用に残すが、
+    // 書き込み経路 (= ここ) では生成しない。
     if ext.eq_ignore_ascii_case("zip") {
         Some(IndexKind::ZipFile)
     } else if ext.eq_ignore_ascii_case("pdf") {
         Some(IndexKind::PdfFile)
-    } else if SUPPORTED_VIDEO_EXTENSIONS
-        .iter()
-        .any(|video_ext| ext.eq_ignore_ascii_case(video_ext))
-    {
-        Some(IndexKind::VideoFile)
     } else {
         None
     }
@@ -423,10 +420,10 @@ mod tests {
     /// 既存 `bulk_collects_folders_zips_pdfs_and_ignores_other_files` は depth 2 までしか
     /// カバーしていなかった。
     #[test]
-    fn bulk_indexes_zip_pdf_video_at_depth_three() {
+    fn bulk_indexes_zip_pdf_at_depth_three() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().join("fav");
-        // root/a/b/c/leaf.zip と leaf.pdf と leaf.mp4
+        // root/a/b/c/leaf.zip と leaf.pdf。leaf.mp4 はコンテナ索引対象外 (§4.2)。
         let c = root.join("a").join("b").join("c");
         mkdir(&c);
         touch(&c.join("leaf.zip"));
@@ -440,23 +437,22 @@ mod tests {
         // folders_visited = root + a + b + c = 4
         assert_eq!(summary.folders_visited, 4);
         // entries_written: root直下=a(Folder)=1, a直下=b(Folder)=1, b直下=c(Folder)=1,
-        //                  c直下=leaf.zip + leaf.pdf + leaf.mp4 = 3  → 合計 6
-        assert_eq!(summary.entries_written, 6);
+        //                  c直下=leaf.zip + leaf.pdf = 2 (mp4 は除外) → 合計 5
+        assert_eq!(summary.entries_written, 5);
         assert!(!summary.cancelled);
 
-        // 深い場所の ZIP / PDF / 動画も検索ヒット
+        // 深い場所の ZIP / PDF は検索ヒット (動画は除外)
         let leaf = db
             .search("leaf", &[root.clone()], crate::search_query::MatchMode::And)
             .unwrap();
         assert_eq!(
             leaf.len(),
-            3,
-            "leaf.zip + leaf.pdf + leaf.mp4 が 3 件ヒット"
+            2,
+            "leaf.zip + leaf.pdf が 2 件ヒット (leaf.mp4 は除外)"
         );
         let kinds: Vec<IndexKind> = leaf.iter().map(|e| e.kind).collect();
         assert!(kinds.contains(&IndexKind::ZipFile));
         assert!(kinds.contains(&IndexKind::PdfFile));
-        assert!(kinds.contains(&IndexKind::VideoFile));
     }
 
     #[test]

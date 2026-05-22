@@ -638,7 +638,7 @@ fn run_subtree_scan(
         return SubtreeScanOutcome::Cancelled;
     }
 
-    // Pass 2: 各フォルダ直下の Folder/ZipFile/PdfFile/VideoFile を upsert
+    // Pass 2: 各フォルダ直下の Folder/ZipFile/PdfFile を upsert (動画は除外 §4.2)
     for folder in &subtree_folders {
         if crate::activity_gate::wait_and_check_cancel(activity_gate, cancel) {
             return SubtreeScanOutcome::Cancelled;
