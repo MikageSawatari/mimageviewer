@@ -325,7 +325,7 @@ impl App {
                         self.show_open_folder_dialog = true;
                         ui.close();
                     }
-                    if ui.button("メタデータ検索 (Ctrl+F)").clicked() {
+                    if ui.button("現在地フィルタ (Ctrl+F)").clicked() {
                         // 相互排他は open_local_metadata_search 内で (Ctrl+S/Ctrl+G を閉じる)
                         self.open_local_metadata_search();
                         ui.close();
@@ -375,14 +375,14 @@ impl App {
                         ui.close();
                     }
 
-                    // 名前で検索 (Ctrl+S)
-                    if ui.button("名前で検索 (Ctrl+S)").clicked() {
+                    // コンテナ検索 (Ctrl+S)
+                    if ui.button("コンテナ検索 (Ctrl+S)").clicked() {
                         self.open_favsearch();
                         ui.close();
                     }
 
-                    // メタデータ検索 (Ctrl+G)
-                    if ui.button("メタデータ検索 (Ctrl+G)").clicked() {
+                    // アイテム検索 (Ctrl+G)
+                    if ui.button("アイテム検索 (Ctrl+G)").clicked() {
                         // 相互排他は toggle_global_search 内で
                         self.toggle_global_search();
                         ui.close();
@@ -1260,11 +1260,15 @@ impl App {
         egui::TopBottomPanel::top("search_bar").show(ctx, |ui| {
             ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.label("検索:");
+                ui.label("検索:").on_hover_text(
+                    "現在地フィルタ (Ctrl+F): 今開いているフォルダ / ZIP の表示中\n\
+                     アイテムを名前やメタ情報で絞り込みます (索引不要・再帰なし)。",
+                );
                 let response = ui.add_sized(
                     [320.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.search_query)
-                        .hint_text(r#"このフォルダ内のメタデータ (AND / -除外 / "…")"#),
+                    egui::TextEdit::singleline(&mut self.search_query).hint_text(
+                        r#"現在地のアイテムを名前やメタ情報で絞り込み (AND / -除外 / "…")"#,
+                    ),
                 );
 
                 // フォーカスリクエスト

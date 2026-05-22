@@ -133,7 +133,7 @@ fn open_stores_with_rebuild_sync(
     progress: Option<&StartupProgressHook>,
 ) -> Option<(Arc<FtsMetaDb>, Arc<FtsIndex>)> {
     if let Some(p) = progress {
-        p("メタ索引データベースを開いています…");
+        p("アイテム索引データベースを開いています…");
     }
     let t_meta = std::time::Instant::now();
     let meta_db = match FtsMetaDb::open_at(&data_dir.join("fts_meta.db")) {
@@ -268,7 +268,7 @@ impl IndexerManager {
         // supervisor が走る前に status != ok の残留行を整理する。dispatcher 経由で
         // Interactive 優先度で submit する (起動直後で他ジョブはほぼ無い)。
         if let Some(p) = progress.as_ref() {
-            p("メタ索引を整理中…");
+            p("アイテム索引を整理中…");
         }
         let t_recon = std::time::Instant::now();
         let report = match run_reconciliation_via_dispatcher(&meta_db, &fts, &writer, favorites) {

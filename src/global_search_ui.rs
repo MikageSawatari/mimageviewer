@@ -1614,8 +1614,8 @@ impl App {
     }
 
     /// Ctrl+G アドレスバー表示を現在の view に合わせて更新する。
-    /// - Aggregated: `🌐 全検索: "query" (N 件)`
-    /// - DrilledInto: `🌐 全検索: "query" > container_name > sub_path...`
+    /// - Aggregated: `🌐 アイテム検索: "query" (N 件)`
+    /// - DrilledInto: `🌐 アイテム検索: "query" > container_name > sub_path...`
     pub(crate) fn update_global_search_address(&mut self) {
         if !self.global_search.active {
             return;
@@ -1634,11 +1634,11 @@ impl App {
                     self.global_search.all_hits.len()
                 };
                 if query.is_empty() {
-                    self.address = "🌐 全検索".to_string();
+                    self.address = "🌐 アイテム検索".to_string();
                 } else if self.global_search.is_searching() {
-                    self.address = format!("🌐 全検索: \"{query}\"  ({n} 件 / 検索中)");
+                    self.address = format!("🌐 アイテム検索: \"{query}\"  ({n} 件 / 検索中)");
                 } else {
-                    self.address = format!("🌐 全検索: \"{query}\"  ({n} 件)");
+                    self.address = format!("🌐 アイテム検索: \"{query}\"  ({n} 件)");
                 }
             }
             GlobalSearchView::DrilledInto {
@@ -1671,7 +1671,10 @@ impl App {
                 } else {
                     ""
                 };
-                self.address = format!("🌐 全検索: \"{query}\" > {}{suffix}", segs.join(" > "));
+                self.address = format!(
+                    "🌐 アイテム検索: \"{query}\" > {}{suffix}",
+                    segs.join(" > ")
+                );
             }
         }
     }
@@ -1712,15 +1715,17 @@ impl App {
                 });
             }
             ui.horizontal(|ui| {
-                ui.label("検索:").on_hover_text(
-                    "Ctrl+G はお気に入りの「メタ情報索引」を使って検索します。\n\
-                     メタ情報索引が作成されていないお気に入りは対象になりません。\n\
-                     お気に入り編集で「メタ情報を索引化する」を有効にしてください。",
+                ui.label("アイテム検索:").on_hover_text(
+                    "Ctrl+G はお気に入りの「アイテム索引」を使い、画像 / PDF / 動画を\n\
+                     ファイル名・タグ・EXIF・AI プロンプト等で横断検索します。\n\
+                     アイテム索引が作成されていないお気に入りは対象になりません。\n\
+                     お気に入り編集で「アイテムを索引化する」を有効にしてください。",
                 );
                 let response = ui.add_sized(
                     [320.0, 20.0],
-                    egui::TextEdit::singleline(&mut self.global_search.query)
-                        .hint_text(r#"お気に入り配下のメタデータ (AND / -除外 / "…")"#),
+                    egui::TextEdit::singleline(&mut self.global_search.query).hint_text(
+                        r#"画像・PDF・動画をファイル名やメタ情報で検索 (AND / -除外 / "…")"#,
+                    ),
                 );
                 if self.global_search.focus_request {
                     self.global_search.focus_request = false;

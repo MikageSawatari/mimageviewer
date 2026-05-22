@@ -294,9 +294,7 @@ impl App {
 
                         // インデックスのディスク使用量とファイル件数。直前の refresh 区間で
                         // 計算済み (1.5s 間隔)。close 時に両方破棄。
-                        let sizes = self
-                            .favorites_index_size_cache
-                            .unwrap_or_default();
+                        let sizes = self.favorites_index_size_cache.unwrap_or_default();
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new("💾 インデックスサイズ:")
@@ -305,7 +303,7 @@ impl App {
                             );
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "名前索引 {} ({}件)",
+                                    "コンテナ索引 {} ({}件)",
                                     format_bytes(sizes.name_index_db),
                                     format_count(name_total)
                                 ))
@@ -313,13 +311,13 @@ impl App {
                                 .color(egui::Color32::from_gray(150)),
                             )
                             .on_hover_text(
-                                "search_index.db (名前索引) のディスク使用量 (WAL/SHM 込み) と総件数。\n\
-                                 お気に入りごとの ファイル / フォルダ名インデックス。",
+                                "コンテナ索引のディスク使用量 (WAL/SHM 込み) と総件数。\n\
+                                 お気に入り配下のフォルダ / ZIP / PDF を名前で横断検索 (Ctrl+S)。",
                             );
                             ui.separator();
                             ui.label(
                                 egui::RichText::new(format!(
-                                    "メタ索引 {} + {} ({}件)",
+                                    "アイテム索引 {} + {} ({}件)",
                                     format_bytes(sizes.fts_meta_db),
                                     format_bytes(sizes.fts_index_dir),
                                     format_count(meta_total)
@@ -328,10 +326,9 @@ impl App {
                                 .color(egui::Color32::from_gray(150)),
                             )
                             .on_hover_text(
-                                "メタ索引のディスク使用量 (WAL/SHM 込み)。\n\
-                                 ・fts_meta.db: 正規化済みの検索対象テキスト (EXIF / XMP /\n\
-                                   PNG AI プロンプト / タグ) を格納。大量画像で数 GB になる\n\
-                                 ・fts_index/: Tantivy 全文検索インデックス (バイグラム索引)",
+                                "アイテム索引のディスク使用量 (WAL/SHM 込み)。\n\
+                                 お気に入り配下の画像 / PDF / 動画を、ファイル名・タグ・\n\
+                                 EXIF・AI プロンプト等で横断検索 (Ctrl+G)。",
                             );
                         });
                     });
@@ -397,8 +394,8 @@ impl App {
                 } else {
                     ui.label(
                         egui::RichText::new(
-                            "お気に入りは以下を索引化して、名前検索 (Ctrl+S) ・\
-                             メタデータ検索 (Ctrl+G) できます。\
+                            "お気に入りは以下を索引化して、コンテナ検索 (Ctrl+S) ・\
+                             アイテム検索 (Ctrl+G) できます。\
                              チェックを入れた項目はこの場で 1 回全走査し、以降は\
                              ファイルの変更監視と起動時スキャンで自動更新します。",
                         )
@@ -421,20 +418,18 @@ impl App {
                                     // ── ヘッダ (6→5 列に圧縮、状態は各索引列にインライン) ──
                                     ui.label(egui::RichText::new("表示名").strong());
                                     ui.label(egui::RichText::new("パス").strong());
-                                    ui.label(egui::RichText::new("名前索引 (Ctrl+S)").strong())
+                                    ui.label(egui::RichText::new("コンテナ索引 (Ctrl+S)").strong())
                                         .on_hover_text(
-                                            "フォルダ / ZIP / PDF / 画像のファイル名を検索\n\
-                                             ✅ = 索引あり / ⏳ = バルク作成中",
+                                            "フォルダ / ZIP / PDF を名前で横断検索\n\
+                                         ✅ = 索引あり / ⏳ = バルク作成中",
                                         );
-                                    ui.label(
-                                        egui::RichText::new("メタデータ索引 (Ctrl+F / Ctrl+G)")
-                                            .strong(),
-                                    )
-                                    .on_hover_text(
-                                        "AI プロンプト / EXIF / XMP を検索\n\
+                                    ui.label(egui::RichText::new("アイテム索引 (Ctrl+G)").strong())
+                                        .on_hover_text(
+                                            "画像 / PDF / 動画をファイル名・タグ・EXIF・\n\
+                                         AI プロンプト等で横断検索\n\
                                          ✅ 監視中 = 初期スキャン完了 + ファイルの変更を追従\n\
                                          ⏳ スキャン中 = アクティブスキャン実行中",
-                                    );
+                                        );
                                     ui.label(egui::RichText::new("操作").strong());
                                     ui.end_row();
 
@@ -498,8 +493,7 @@ impl App {
                                         // メタデータ索引: チェック + 状態インライン
                                         ui.horizontal(|ui| {
                                             let meta_resp = ui.checkbox(
-                                                &mut self.settings.favorites[i]
-                                                    .auto_index_metadata,
+                                                &mut self.settings.favorites[i].auto_index_metadata,
                                                 "",
                                             );
                                             if meta_resp.changed() {
@@ -551,7 +545,7 @@ impl App {
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         ui.label(egui::RichText::new("一括操作:").weak());
-                        if ui.button("名前 全ON").clicked() {
+                        if ui.button("コンテナ 全ON").clicked() {
                             for f in &mut self.settings.favorites {
                                 if !f.auto_index_structure {
                                     f.auto_index_structure = true;
@@ -560,7 +554,7 @@ impl App {
                                 }
                             }
                         }
-                        if ui.button("名前 全OFF").clicked() {
+                        if ui.button("コンテナ 全OFF").clicked() {
                             for f in &mut self.settings.favorites {
                                 if f.auto_index_structure {
                                     f.auto_index_structure = false;
@@ -569,7 +563,7 @@ impl App {
                                 }
                             }
                         }
-                        if ui.button("メタ 全ON").clicked() {
+                        if ui.button("アイテム 全ON").clicked() {
                             for f in &mut self.settings.favorites {
                                 if !f.auto_index_metadata {
                                     f.auto_index_metadata = true;
@@ -578,7 +572,7 @@ impl App {
                                 }
                             }
                         }
-                        if ui.button("メタ 全OFF").clicked() {
+                        if ui.button("アイテム 全OFF").clicked() {
                             for f in &mut self.settings.favorites {
                                 if f.auto_index_metadata {
                                     f.auto_index_metadata = false;
@@ -651,10 +645,8 @@ impl App {
                         .map(|(t, _)| t.elapsed() >= ETA_DISPLAY_INTERVAL)
                         .unwrap_or(true);
                     if eta_stale {
-                        self.favorites_total_eta_cache = Some((
-                            std::time::Instant::now(),
-                            aggregate_total_eta(&all_etas),
-                        ));
+                        self.favorites_total_eta_cache =
+                            Some((std::time::Instant::now(), aggregate_total_eta(&all_etas)));
                     }
                     let total_eta_text = self
                         .favorites_total_eta_cache
@@ -759,7 +751,7 @@ impl App {
                         ui.add_space(8.0);
                         ui.label(
                             egui::RichText::new(
-                                "名前索引・メタデータ索引・お気に入り標準設定も解除されます。",
+                                "コンテナ索引・アイテム索引・お気に入り標準設定も解除されます。",
                             )
                             .weak(),
                         );

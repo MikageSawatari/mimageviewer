@@ -5900,7 +5900,7 @@ impl App {
 
         // アドレスバーを即座に更新 (ローディング中であることを示す)
         self.address = pdf_path.to_string_lossy().to_string();
-        // Ctrl+G 絞り込みビュー中なら生の PDF パスを「🌐 全検索: "query" > scansnap >
+        // Ctrl+G 絞り込みビュー中なら生の PDF パスを「🌐 アイテム検索: "query" > scansnap >
         // ファイル名.pdf」のブレッドクラム形式で上書きし直す (2026-04 ユーザー報告)。
         // no-op: Ctrl+G 非アクティブ / Aggregated 時は何もしない。
         self.update_global_search_address();

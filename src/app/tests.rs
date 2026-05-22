@@ -1921,7 +1921,7 @@ mod phase_c_drill_nav_tests {
 // =======================================================================
 // Phase C - Ctrl+G drill view アドレスバー表示テスト (2026-04 報告)
 //
-// 期待: "🌐 全検索: \"グルグル\" > scansnap > 衛藤ヒロユキ_魔法陣グルグル01_ipad.pdf"
+// 期待: "🌐 アイテム検索: \"グルグル\" > scansnap > 衛藤ヒロユキ_魔法陣グルグル01_ipad.pdf"
 // バグ: PDF を開くと raw パス "d:/oldpc_backup/data2/scansnap/衛藤..._ipad.pdf"
 // が address に書かれて、ブレッドクラムが失われる。
 //
@@ -1936,7 +1936,7 @@ mod phase_c_drill_address_tests {
     use crate::global_search::GlobalHit;
 
     /// Ctrl+G drill-in → PDF を開いた時点で address がブレッドクラム表示
-    /// (`🌐 全検索: "query" > container > filename.pdf`) になること。
+    /// (`🌐 アイテム検索: "query" > container > filename.pdf`) になること。
     /// 旧実装は raw PDF パス (`d:/.../...pdf`) が入っていた (2026-04 バグ)。
     #[test]
     fn address_shows_breadcrumb_after_opening_pdf_in_drilled() {
@@ -1984,7 +1984,7 @@ mod phase_c_drill_address_tests {
             app.address
         );
         assert!(
-            app.address.contains("🌐 全検索"),
+            app.address.contains("🌐 アイテム検索"),
             "breadcrumb prefix 欠落: {}",
             app.address
         );
@@ -2034,7 +2034,7 @@ mod phase_c_drill_address_tests {
         // Aggregated のまま update_global_search_address
         app.update_global_search_address();
         assert!(
-            app.address.contains("🌐 全検索"),
+            app.address.contains("🌐 アイテム検索"),
             "Aggregated でも prefix は付く: {}",
             app.address
         );
