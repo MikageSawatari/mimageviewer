@@ -17544,19 +17544,29 @@ impl eframe::App for App {
             // グリッド UI (menubar/toolbar/grid) を描くと CentralPanel が二重になる。
             // native 動画 backdrop ブロック (上) と同じくここでグリッド描画を飛ばす。
             if embedded_fs_active {
-                // Ctrl+↑↓ DFS の結果回収だけは行う (native 動画ブロックと同じ理由)。
+                // Ctrl+↑↓ DFS の結果回収 (native 動画ブロックと同じ理由)。
                 if let Some(result) = self.poll_folder_nav() {
                     if keyboard_nav.is_none() {
                         self.apply_folder_nav_result(ctx, result);
                         self.chain_folder_nav_if_pending();
                     }
                 }
-                // グリッド描画 tail を飛ばすので tail の「pending 中 repaint」も
-                // 失われる。folder nav worker は別スレッドで完了し start_folder_nav は
-                // repaint を要求しないため、静止画フルスクリーンで egui が寝ると
-                // 結果を次の入力まで回収できない。走行中は明示的に repaint する
-                // (Codex P2、tail の folder_nav_pending repaint と同じ意図)。
-                if self.folder_nav_pending.is_some() {
+                // apply_folder_nav_result が PDF/ZIP に着地した場合、列挙ワーカー結果の
+                // 回収はグリッド描画 tail の poll_*_enumerate が担う。embedded 早期
+                // return は tail を飛ばすので、ここでも最低限の回収を行う (Codex P2)。
+                self.poll_pdf_enumerate();
+                self.poll_zip_enumerate();
+                // グリッド描画 tail を飛ばすので tail の「pending 中 repaint」も失われる。
+                // folder nav / PDF・ZIP 列挙ワーカーは別スレッドで完了し repaint を
+                // 要求しないため、静止画フルスクリーンで egui が寝ると結果を次の入力まで
+                // 回収できない。pending 中・当フレームで items が入れ替わったときは
+                // 明示的に repaint する (tail の pending repaint と同じ意図)。
+                if self.folder_nav_pending.is_some()
+                    || self.pdf_enumerate_pending.is_some()
+                    || self.zip_enumerate_pending.is_some()
+                    || self.fs_nav_after_pdf_enumerate.is_some()
+                    || self.items_generation != items_gen_pre_late
+                {
                     ctx.request_repaint();
                 }
                 return;
