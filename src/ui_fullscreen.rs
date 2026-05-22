@@ -219,6 +219,7 @@ fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
             | egui::Key::B
             | egui::Key::C
             | egui::Key::P
+            | egui::Key::F
             | egui::Key::T
             | egui::Key::I
             | egui::Key::X
@@ -275,6 +276,7 @@ fn native_video_vk_from_egui_key(key: egui::Key) -> Option<u32> {
         egui::Key::ArrowDown => 0x28,
         egui::Key::B => 0x42,
         egui::Key::C => 0x43,
+        egui::Key::F => 0x46,
         egui::Key::J => 0x4A,
         egui::Key::K => 0x4B,
         egui::Key::L => 0x4C,
