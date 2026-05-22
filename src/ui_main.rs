@@ -1234,6 +1234,21 @@ impl App {
             return;
         }
 
+        // §4.1.1: PDF のページ表示中は Ctrl+F を無効化する。バーが開いたまま PDF を
+        // 開いた場合はここで閉じる (ショートカット側は app.rs で抑止済み)。
+        if self.grid_is_pdf_pages() {
+            self.show_search_bar = false;
+            self.search_query.clear();
+            self.search_filter = None;
+            self.search_has_focus = false;
+            self.cancel_search_pending();
+            self.rebuild_visible_indices();
+            return;
+        }
+
+        // §4.1.2: ZIP 表示中は検索対象をファイル名フィルタに固定する。
+        let zip_view = self.grid_is_zip_entries();
+
         // Enter は **raw** で読む。`dialog_enter_pressed` は IME 変換直後 300ms の
         // グレース中も false を返すため、日本語で「おはよう[Enter]」と確定兼送信した
         // ケースで検索が走らず、代わりにグリッドの Enter ショートカット (フルスクリーン)
@@ -1281,22 +1296,34 @@ impl App {
                 }
 
                 // ── 検索対象ドロップダウン (§19.7) ──
-                let current =
-                    crate::global_search_ui::TargetChoice::from_target(&self.search_target);
-                let mut next = current;
-                egui::ComboBox::from_id_salt("ctrl_f_search_target")
-                    .selected_text(current.label())
-                    .width(160.0)
-                    .show_ui(ui, |ui| {
-                        for &choice in crate::global_search_ui::TARGET_CHOICES {
-                            ui.selectable_value(&mut next, choice, choice.label());
-                        }
+                if zip_view {
+                    // §4.1.2: ZIP 内はファイル名フィルタ固定。ドロップダウンは無効化
+                    // して「ファイル名」を表示する (メタ系を選んでも無反応な
+                    // 分かりにくさを防ぐ)。
+                    ui.add_enabled_ui(false, |ui| {
+                        egui::ComboBox::from_id_salt("ctrl_f_search_target")
+                            .selected_text("ファイル名")
+                            .width(160.0)
+                            .show_ui(ui, |_ui| {});
                     });
-                if next != current {
-                    self.search_target = next.to_target();
-                    // クエリが空でなければ即再検索
-                    if !self.search_query.trim().is_empty() {
-                        self.execute_search();
+                } else {
+                    let current =
+                        crate::global_search_ui::TargetChoice::from_target(&self.search_target);
+                    let mut next = current;
+                    egui::ComboBox::from_id_salt("ctrl_f_search_target")
+                        .selected_text(current.label())
+                        .width(160.0)
+                        .show_ui(ui, |ui| {
+                            for &choice in crate::global_search_ui::TARGET_CHOICES {
+                                ui.selectable_value(&mut next, choice, choice.label());
+                            }
+                        });
+                    if next != current {
+                        self.search_target = next.to_target();
+                        // クエリが空でなければ即再検索
+                        if !self.search_query.trim().is_empty() {
+                            self.execute_search();
+                        }
                     }
                 }
 
@@ -1327,22 +1354,19 @@ impl App {
                     );
                 } else if let Some(ref filter) = self.search_filter {
                     ui.separator();
-                    let image_count = filter
+                    // 構造アイテム (Folder/ZIP/PDF) も一貫して絞れるようになったので
+                    // (§4.1)、可視マッチ全体を「X/Y 件」で数える。グループ見出しの
+                    // separator は件数に含めない。
+                    let countable = |it: &crate::grid_item::GridItem| {
+                        !matches!(it, crate::grid_item::GridItem::ZipSeparator { .. })
+                    };
+                    let total = self.items.iter().filter(|it| countable(it)).count();
+                    let matched = filter
                         .iter()
-                        .filter(|&&i| {
-                            matches!(
-                                self.items.get(i),
-                                Some(crate::grid_item::GridItem::Image(_))
-                            )
-                        })
-                        .count();
-                    let total_images = self
-                        .items
-                        .iter()
-                        .filter(|it| matches!(it, crate::grid_item::GridItem::Image(_)))
+                        .filter(|&&i| self.items.get(i).is_some_and(|it| countable(it)))
                         .count();
                     ui.label(
-                        egui::RichText::new(format!("{image_count}/{total_images} 件"))
+                        egui::RichText::new(format!("{matched}/{total} 件"))
                             .size(11.0)
                             .color(egui::Color32::from_gray(140)),
                     );

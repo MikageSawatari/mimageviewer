@@ -16,6 +16,11 @@ use windows_dpapi::{Scope, decrypt_data, encrypt_data};
 // -----------------------------------------------------------------------
 
 /// PDF パスワードの暗号化ストア。
+///
+/// `Clone` は Ctrl+F の PDF document info 照合 (`run_metadata_search`) が
+/// ワーカースレッドへストアごと渡せるようにするため。中身は小さな
+/// `HashMap<String, String>` 1 個なので clone コストは無視できる。
+#[derive(Clone)]
 pub struct PdfPasswordStore {
     /// path_hash → base64-encoded DPAPI-encrypted password
     entries: HashMap<String, String>,
@@ -84,5 +89,15 @@ impl PdfPasswordStore {
         let mut hasher = Sha256::new();
         hasher.update(normalized.as_bytes());
         format!("{:x}", hasher.finalize())
+    }
+}
+
+#[cfg(test)]
+impl PdfPasswordStore {
+    /// テスト用: ディスク (data_dir) に触れない空ストア。
+    pub fn empty_for_test() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
     }
 }

@@ -3799,3 +3799,132 @@ mod file_operation_selection_tests {
         );
     }
 }
+
+/// Ctrl+F (run_metadata_search) の構造アイテム絞り込み (task #6 / §4.1)。
+#[cfg(test)]
+mod ctrl_f_structural_filter_tests {
+    use super::*;
+
+    /// Ctrl+F メタ検索ワーカーを items + query + target で叩き、ヒットした
+    /// items idx 集合を返すヘルパー。実ファイル / PDF IPC には触れない。
+    fn run_ctrl_f(
+        query: &str,
+        items: &[GridItem],
+        target: crate::fts_index::SearchTarget,
+    ) -> std::collections::HashSet<usize> {
+        let tokens = crate::search_query::parse(query);
+        let xmp: std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>> =
+            std::collections::HashMap::new();
+        let pw = crate::pdf_passwords::PdfPasswordStore::empty_for_test();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        match run_metadata_search(
+            &tokens,
+            items,
+            &xmp,
+            None,
+            &pw,
+            &target,
+            crate::search_query::MatchMode::And,
+            &cancel,
+        ) {
+            SearchThreadResult::Done { matches, .. } => matches,
+        }
+    }
+
+    #[test]
+    fn structural_items_filtered_by_name() {
+        // §4.1: フォルダ / ZIP / 変換対象アーカイブもファイル名で一貫して絞り込む。
+        let items = vec![
+            GridItem::Folder(PathBuf::from(r"C:\g\sunset beach")),
+            GridItem::Folder(PathBuf::from(r"C:\g\documents")),
+            GridItem::ZipFile(PathBuf::from(r"C:\g\sunset.zip")),
+            GridItem::ZipFile(PathBuf::from(r"C:\g\misc.zip")),
+            GridItem::ConvertibleArchive {
+                path: PathBuf::from(r"C:\g\sunset old.7z"),
+                format: ArchiveFormat::SevenZ,
+            },
+        ];
+        let m = run_ctrl_f("sunset", &items, crate::fts_index::SearchTarget::All);
+        assert_eq!(
+            m,
+            std::collections::HashSet::from([0, 2, 4]),
+            "名前に sunset を含むフォルダ / ZIP / アーカイブだけ残る"
+        );
+    }
+
+    #[test]
+    fn structural_items_hidden_when_target_lacks_filename() {
+        // §4.1: 検索対象が EXIF など「構造アイテムが持たない次元」だけなら、
+        // 構造アイテムは全件非表示になる。
+        let items = vec![
+            GridItem::Folder(PathBuf::from(r"C:\g\sunset")),
+            GridItem::ZipFile(PathBuf::from(r"C:\g\sunset.zip")),
+        ];
+        let target = crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Exif]);
+        let m = run_ctrl_f("sunset", &items, target);
+        assert!(
+            m.is_empty(),
+            "ファイル名次元を含まない target では構造アイテムは出ない: {m:?}"
+        );
+    }
+
+    #[test]
+    fn zip_separator_visible_only_when_group_has_match() {
+        // §4.1: separator は付随グループに可視 ZipImage が残るときだけ表示する。
+        let zip = PathBuf::from(r"C:\g\book.zip");
+        let items = vec![
+            GridItem::ZipSeparator {
+                dir_display: "(root)".into(),
+            },
+            GridItem::ZipImage {
+                zip_path: zip.clone(),
+                entry_name: "sunset01.png".into(),
+            },
+            GridItem::ZipImage {
+                zip_path: zip.clone(),
+                entry_name: "cat.jpg".into(),
+            },
+            GridItem::ZipSeparator {
+                dir_display: "chapter2".into(),
+            },
+            GridItem::ZipImage {
+                zip_path: zip.clone(),
+                entry_name: "dog.jpg".into(),
+            },
+        ];
+        let m = run_ctrl_f("sunset", &items, crate::fts_index::SearchTarget::All);
+        assert!(m.contains(&1), "ヒットした ZipImage は表示");
+        assert!(m.contains(&0), "ヒットを含むグループの separator は表示");
+        assert!(!m.contains(&2), "不一致 ZipImage は非表示");
+        assert!(!m.contains(&3), "可視アイテムが残らない separator は非表示");
+        assert!(!m.contains(&4), "不一致 ZipImage は非表示");
+    }
+
+    #[test]
+    fn pdf_file_matches_by_filename() {
+        // §4.1.1: PDF はまずファイル名で照合する。target にメタ系を含めない
+        // ことで document info IPC を経由しない純粋な名前照合パスを検証する。
+        let items = vec![
+            GridItem::PdfFile(PathBuf::from(r"C:\g\sunset report.pdf")),
+            GridItem::PdfFile(PathBuf::from(r"C:\g\invoice.pdf")),
+        ];
+        let target =
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename]);
+        let m = run_ctrl_f("sunset", &items, target);
+        assert_eq!(m, std::collections::HashSet::from([0]));
+    }
+
+    #[test]
+    fn search_container_always_kept() {
+        // SearchContainer は Ctrl+F と Ctrl+G が排他なので通常出現しないが、
+        // 防御的に常に残す。
+        let items = vec![GridItem::SearchContainer {
+            path: PathBuf::from(r"C:\g\unrelated"),
+            kind: crate::grid_item::SearchContainerKind::Folder,
+            hit_count: 3,
+            representative: None,
+        }];
+        let m = run_ctrl_f("zzz", &items, crate::fts_index::SearchTarget::All);
+        assert!(m.contains(&0), "SearchContainer は常に表示");
+    }
+}

@@ -744,13 +744,6 @@ fn is_png_path(path: &std::path::Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("png"))
 }
 
-/// ZIP エントリ名が PNG 拡張子か (大文字小文字無視)。
-fn is_png_entry(entry_name: &str) -> bool {
-    entry_name
-        .rsplit_once('.')
-        .is_some_and(|(_, e)| e.eq_ignore_ascii_case("png"))
-}
-
 /// フルスクリーン画像のメタデータ (AI プロンプト / EXIF / XMP) を読み込むワーカー本体。
 /// ZipImage は ZIP エントリを 1 回だけ開いて 3 パーサー間で bytes を共有する。
 /// それ以外 (Image / Video) はファイルを直接パーサーに渡す。パーサー側で
@@ -829,24 +822,41 @@ fn run_metadata_search(
     items: &[GridItem],
     xmp_snapshot: &std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
     _fts_meta: Option<&std::sync::Arc<crate::fts_meta::FtsMetaDb>>,
+    pdf_passwords: &crate::pdf_passwords::PdfPasswordStore,
     target: &crate::fts_index::SearchTarget,
     mode: crate::search_query::MatchMode,
     cancel: &AtomicBool,
 ) -> SearchThreadResult {
-    // INDEX_VERSION=5 で fts_meta.db に原文が無くなったため、Ctrl+F は fast path を
-    // 持たず常に on-demand (PNG/EXIF/XMP/PDF/動画メタ/dc:subject 直読み) で判定する。表示中の
-    // 数十〜数千件しか触らないので体感影響は小さい。PDF の target=PdfMeta 絞り込みは
-    // off になり、お気に入り未登録の PDF を Ctrl+F する動線に合わせて「常に表示」扱い。
+    // Ctrl+F (現在地フィルタ) はインデックスを使わず、表示中アイテムを on-demand に
+    // 判定する (docs/search-container-item-redesign.md §4.1)。構造アイテム
+    // (Folder / ZipFile / PdfFile / ZipImage) も「持っている次元」で一貫して
+    // 絞り込む: ファイル名は全種別が持ち、PDF は document info も持つ。
     let mut matches: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut xmp_additions: Vec<(String, Option<crate::xmp_reader::XmpTweetInfo>)> = Vec::new();
     let mut additions_lookup: std::collections::HashMap<
         String,
         Option<crate::xmp_reader::XmpTweetInfo>,
     > = std::collections::HashMap::new();
-    let mut zip_png_groups: std::collections::HashMap<PathBuf, Vec<(usize, String)>> =
-        std::collections::HashMap::new();
 
-    // Pass 1: 構造アイテム + ZIP/PDF 系 (cheap な分類のみ、I/O なし)
+    // §19 target フィルタ: target が含むソースだけを判定対象にする。
+    let use_name = target.includes(crate::fts_index::SourceKind::Filename);
+    let use_png = target.includes(crate::fts_index::SourceKind::PngPrompt);
+    let use_exif = target.includes(crate::fts_index::SourceKind::Exif);
+    let use_xmp = target.includes(crate::fts_index::SourceKind::XmpTweet);
+    let use_video_meta = target.includes(crate::fts_index::SourceKind::VideoMeta);
+    let use_tags = target.includes(crate::fts_index::SourceKind::Tags);
+    let use_pdf_meta = target.includes(crate::fts_index::SourceKind::PdfMeta);
+    // Image / Video の fallback 経路は name/png/exif/xmp/video_meta/tags のいずれかが
+    // 対象でないと結果が常に空になる。PdfMeta-only 等で無駄な per-file 走査を避ける。
+    // Tags も含めておかないと target=Tags のとき未インデックス画像が全件 skip される。
+    let fallback_contributes =
+        use_name || use_png || use_exif || use_xmp || use_video_meta || use_tags;
+
+    // Pass 1: 構造アイテム + ZIP 内画像 (名前照合中心、PDF のみ document info I/O)。
+    // 構造アイテムも一貫して絞り込む (§4.1): 名前がマッチしないものは非表示にする。
+    // 検索対象がファイル名次元を含まない (EXIF / タグ単独指定) なら構造アイテムは
+    // 全件非表示になる ("タグで絞ったらタグを持つアイテムだけ残る" = 正しい挙動)。
+    let mut zip_separators: Vec<usize> = Vec::new();
     for (idx, item) in items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return SearchThreadResult::Done {
@@ -855,57 +865,82 @@ fn run_metadata_search(
             };
         }
         match item {
-            GridItem::Folder(_)
-            | GridItem::ZipFile(_)
-            | GridItem::ConvertibleArchive { .. }
-            | GridItem::ZipSeparator { .. }
-            | GridItem::SearchContainer { .. }
-            | GridItem::PdfFile(_) => {
-                // PDF は fast path 廃止に伴い、ナビ用途を壊さないために常に残す。
-                matches.insert(idx);
+            GridItem::Folder(_) | GridItem::ZipFile(_) | GridItem::ConvertibleArchive { .. } => {
+                // フォルダ / ZIP / 変換対象アーカイブ: ファイル名 (basename) で照合。
+                if use_name && crate::search_query::matches_with_mode(tokens, &item.name(), mode) {
+                    matches.insert(idx);
+                }
+            }
+            GridItem::PdfFile(path) => {
+                // PDF: まずファイル名、外れたら document info も見る (§4.1.1)。
+                // すべて (All) のときは短絡評価で不要な IPC を避ける。
+                let name_hit =
+                    use_name && crate::search_query::matches_with_mode(tokens, &item.name(), mode);
+                if name_hit {
+                    matches.insert(idx);
+                } else if use_pdf_meta {
+                    // 保護 PDF でパスワード未保存なら get_document_info は失敗 →
+                    // その PDF はファイル名のみで判定済み (= 非マッチ扱い)。
+                    let password = pdf_passwords.get(path);
+                    if let Ok(info) =
+                        crate::pdf_loader::get_document_info(path, password.as_deref())
+                    {
+                        let doc_text = info.as_search_text();
+                        if !doc_text.is_empty()
+                            && crate::search_query::matches_with_mode(tokens, &doc_text, mode)
+                        {
+                            matches.insert(idx);
+                        }
+                    }
+                }
             }
             GridItem::Image(_) | GridItem::Video(_) => {
-                // Pass 2 で処理
+                // Pass 2 で処理 (on-demand メタ読み取り)。
             }
-            GridItem::ZipImage {
-                zip_path,
-                entry_name,
-            } => {
-                if is_png_entry(entry_name) {
-                    zip_png_groups
-                        .entry(zip_path.clone())
-                        .or_default()
-                        .push((idx, entry_name.clone()));
-                } else {
+            GridItem::ZipImage { entry_name, .. } => {
+                // §4.1.2: ZIP 内画像は常にファイル名 (エントリ basename) のみで照合。
+                // ZIP を開いてメタを読む経路 (旧 Pass 3) は廃止した。
+                if use_name {
                     let name = crate::zip_loader::entry_basename(entry_name);
                     if crate::search_query::matches_with_mode(tokens, name, mode) {
                         matches.insert(idx);
                     }
                 }
             }
+            GridItem::ZipSeparator { .. } => {
+                // 付随グループに可視アイテムが残るかを Pass 1 完了後に判定する。
+                zip_separators.push(idx);
+            }
             GridItem::PdfPage { .. } => {
-                if crate::search_query::matches_with_mode(tokens, &item.name(), mode) {
+                // PDF ページ表示中は Ctrl+F 自体を無効化する (§4.1.1) ため通常は
+                // ここに来ない。防御的に "Page N" のファイル名照合だけ残す。
+                if use_name && crate::search_query::matches_with_mode(tokens, &item.name(), mode) {
                     matches.insert(idx);
                 }
+            }
+            GridItem::SearchContainer { .. } => {
+                // Ctrl+F と Ctrl+G は排他なので通常出現しない。防御的に常に残す。
+                matches.insert(idx);
             }
         }
     }
 
-    // Pass 2: Image/Video — cheap hay で決まらなければ XMP / 動画メタを lazy 読み取り (ファイル I/O)
-    //
-    // §19 target フィルタ対応: target が全ソース (All) なら従来挙動。単一ソース選択時は
-    // そのソース由来の文字列だけで hay を作り、非対象ソースの I/O もスキップする。
-    let use_name = target.includes(crate::fts_index::SourceKind::Filename);
-    let use_png = target.includes(crate::fts_index::SourceKind::PngPrompt);
-    let use_exif = target.includes(crate::fts_index::SourceKind::Exif);
-    let use_xmp = target.includes(crate::fts_index::SourceKind::XmpTweet);
-    let use_video_meta = target.includes(crate::fts_index::SourceKind::VideoMeta);
-    let use_tags = target.includes(crate::fts_index::SourceKind::Tags);
-    // 画像 / Video 用の fallback 経路は name/png/exif/xmp/video_meta/tags のいずれかが対象でないと
-    // 計算結果が常に空になる。PdfMeta-only 等で無駄な per-file 走査を避ける。
-    // Tags も含めておかないと、target=Tags のときに未インデックス画像が全件 skip される。
-    let fallback_contributes =
-        use_name || use_png || use_exif || use_xmp || use_video_meta || use_tags;
+    // ZipSeparator: 付随する ZIP グループ (separator の次〜次の separator 手前) に
+    // 可視 ZipImage が残るときだけ表示する (§4.1)。ZIP 表示中のグリッドは
+    // separator と ZipImage だけで構成されるため、Pass 1 完了時点でグループの
+    // 可視判定は確定している。
+    for &sep_idx in &zip_separators {
+        let group_has_visible = ((sep_idx + 1)..items.len())
+            .take_while(|&probe| !matches!(items[probe], GridItem::ZipSeparator { .. }))
+            .any(|probe| matches.contains(&probe));
+        if group_has_visible {
+            matches.insert(sep_idx);
+        }
+    }
+
+    // Pass 2: Image / Video — cheap hay で決まらなければ XMP / 動画メタを lazy 読み取り
+    // (ファイル I/O)。target フィルタの use_* / fallback_contributes は Pass 1 の
+    // 手前で算出済み。単一ソース選択時はそのソース由来の文字列だけで hay を作る。
     for (idx, item) in items.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             return SearchThreadResult::Done {
@@ -999,72 +1034,6 @@ fn run_metadata_search(
                 }
                 let hay = hay_of(&extended_meta, name_for_hay, xmp_opt.as_ref());
                 if crate::search_query::matches_with_mode(tokens, &hay, mode) {
-                    matches.insert(idx);
-                }
-            }
-        }
-    }
-
-    // Pass 3: ZIP 内 PNG — ZIP を 1 回開いてまとめて処理 (ファイル I/O)
-    // target が Filename/PngPrompt/XmpTweet を一つも含まない場合は hay が確定で空になり
-    // ヒット不可なので、ZIP を開く前に全スキップする。
-    let zip_entry_needs_bytes = use_png || use_xmp;
-    if fallback_contributes {
-        for (zip_path, entries) in zip_png_groups {
-            if cancel.load(Ordering::Relaxed) {
-                return SearchThreadResult::Done {
-                    matches,
-                    xmp_additions,
-                };
-            }
-            // バイト読み取りが不要 (name だけで判定) なら archive は開かない。
-            let mut direct_archive = if zip_entry_needs_bytes {
-                crate::zip_loader::open_archive(&zip_path).ok()
-            } else {
-                None
-            };
-            for (idx, entry_name) in entries {
-                if cancel.load(Ordering::Relaxed) {
-                    return SearchThreadResult::Done {
-                        matches,
-                        xmp_additions,
-                    };
-                }
-                let (meta_text, xmp) = if zip_entry_needs_bytes {
-                    let is_nested = entry_name.to_ascii_lowercase().contains(".zip/");
-                    let bytes_result = if is_nested {
-                        crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
-                    } else if let Some(archive) = direct_archive.as_mut() {
-                        crate::zip_loader::read_entry_from_archive(archive, &entry_name)
-                    } else {
-                        crate::zip_loader::read_entry_bytes(&zip_path, &entry_name)
-                    };
-                    match bytes_result {
-                        Ok(bytes) => {
-                            let png = if use_png {
-                                crate::png_metadata::build_searchable_from_bytes(&bytes)
-                            } else {
-                                String::new()
-                            };
-                            let xmp = if use_xmp {
-                                crate::xmp_reader::read_tweet_info_from_bytes(&bytes)
-                            } else {
-                                None
-                            };
-                            (png, xmp)
-                        }
-                        Err(_) => (String::new(), None),
-                    }
-                } else {
-                    (String::new(), None)
-                };
-                let entry_name_str = crate::zip_loader::entry_basename(&entry_name);
-                let name_for_hay = if use_name { entry_name_str } else { "" };
-                if crate::search_query::matches_with_mode(
-                    tokens,
-                    &hay_of(&meta_text, name_for_hay, xmp.as_ref()),
-                    mode,
-                ) {
                     matches.insert(idx);
                 }
             }
@@ -11484,6 +11453,9 @@ impl App {
         // 専用で、スレッドは自分が読み取った分は `xmp_additions` で UI に返す。
         let items_snapshot = self.items.clone();
         let xmp_snapshot = self.xmp_cache.clone();
+        // PDF document info 照合 (§4.1.1) はワーカースレッドで保存済みパスワードを
+        // 引く。ストアごと clone してスレッドへ渡す (decrypt は照合対象 PDF だけ遅延)。
+        let pdf_passwords = self.pdf_passwords.clone();
         // INDEX_VERSION=5 で fts_meta から原文 (`*_norm`) が無くなったため、Ctrl+F は
         // 表示中アイテムを on-demand 経路 (PNG / EXIF / XMP / dc:subject 直読み) で
         // 判定する。`run_metadata_search` は引数として fts_meta を受け取るが現在は
@@ -11492,7 +11464,14 @@ impl App {
             .indexer_manager
             .as_ref()
             .map(|mgr| mgr.clone_fts_meta());
-        let target = self.search_target.clone();
+        // §4.1.2: ZIP 表示中は検索対象をファイル名に固定する。ユーザーが選んだ
+        // self.search_target (メタ系) はそのまま保持し、ここでの override は
+        // ZIP グリッドに限る (通常フォルダに戻れば元の target で検索される)。
+        let target = if self.grid_is_zip_entries() {
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Filename])
+        } else {
+            self.search_target.clone()
+        };
         let mode: crate::search_query::MatchMode = self.search_or_mode.into();
         let cancel = Arc::new(AtomicBool::new(false));
         let cancel_w = Arc::clone(&cancel);
@@ -11508,6 +11487,7 @@ impl App {
                     &items_snapshot,
                     &xmp_snapshot,
                     fts_meta_clone.as_ref(),
+                    &pdf_passwords,
                     &target,
                     mode,
                     &cancel_w,
@@ -11524,6 +11504,27 @@ impl App {
         if let Some(pending) = self.search_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// グリッドが PDF のページ表示で構成されているか (= PDF を開いている)。
+    /// PDF ページは連番の合成名しか持たず検索の意味が無いため、true のとき
+    /// Ctrl+F を無効化する (docs/search-container-item-redesign.md §4.1.1)。
+    pub(crate) fn grid_is_pdf_pages(&self) -> bool {
+        self.items
+            .iter()
+            .any(|it| matches!(it, crate::grid_item::GridItem::PdfPage { .. }))
+    }
+
+    /// グリッドが ZIP 内エントリで構成されているか (= ZIP を開いている)。
+    /// ZIP 内では Ctrl+F をファイル名フィルタに固定する (§4.1.2)。
+    pub(crate) fn grid_is_zip_entries(&self) -> bool {
+        self.items.iter().any(|it| {
+            matches!(
+                it,
+                crate::grid_item::GridItem::ZipImage { .. }
+                    | crate::grid_item::GridItem::ZipSeparator { .. }
+            )
+        })
     }
 
     /// in-flight 検索の結果を非同期に受信する。
@@ -17678,12 +17679,16 @@ impl eframe::App for App {
         //     run_metadata_search が SearchContainer を常に一致扱いするためフィルタ不能になる
         //   - Codex P2 #2: `has_focus` だけだと Ctrl+G active でグリッドにフォーカスが
         //     落ちた状態で Ctrl+F が通ってしまう → `active` も条件に入れる
+        // §4.1.1: PDF のページ表示中は Ctrl+F 自体を無効化する (連番ページ名を
+        // 絞っても得るものが無いため)。グリッドが PdfPage で構成されるときは
+        // ショートカットを無反応にする (検索バーは render_search_bar 側で閉じる)。
         if !self.address_has_focus
             && self.fullscreen_idx.is_none()
             && !self.any_dialog_open()
             && !self.favsearch.has_focus
             && !self.global_search.has_focus
             && !self.global_search.active
+            && !self.grid_is_pdf_pages()
         {
             let ctrl_f = ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F));
             if ctrl_f {
