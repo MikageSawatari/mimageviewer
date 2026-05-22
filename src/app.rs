@@ -7799,6 +7799,71 @@ impl App {
         self.current_folder_signature = None;
     }
 
+    /// エクスプローラ等から mIV ウィンドウへドロップされたファイルを、現在表示中の
+    /// 実フォルダへコピーする (mIV → 外部 のドラッグ送出と対称の受け取り方向)。
+    ///
+    /// コピー先は `current_favorite_target()` — 実ディレクトリ表示中だけ `Some`。
+    /// ただし Ctrl+G / Ctrl+S の検索結果ビューは `current_folder` を直前の実フォルダの
+    /// まま残すため、それだけだと「直前のフォルダ」へ誤コピーしてしまう。検索結果
+    /// 表示中は明示的に拒否する (Codex P2)。
+    ///
+    /// ドロップされたディレクトリが表示中フォルダの祖先 / 自身だと `Copy-Item -Recurse`
+    /// が生成中のフォルダを再走査して無限再帰になる。該当ディレクトリはコピー対象から
+    /// 除外する (Codex P1、`file_drag::dir_copy_would_recurse`)。
+    ///
+    /// 完了時のフォルダ再読み込みは `poll_paste_pending` が `pending_reload` を立てて行う。
+    pub(crate) fn handle_external_file_drop(&mut self, paths: Vec<PathBuf>) {
+        if paths.is_empty() {
+            return;
+        }
+        // 検索結果ビュー (Ctrl+G 合成 / Ctrl+S favsearch) は current_folder が直前の
+        // 実フォルダのまま残る。コピー先が曖昧なので拒否する。
+        let in_search_view = self.items_are_global_search_view || self.favsearch.on_results_grid();
+        let dest = if in_search_view {
+            None
+        } else {
+            self.current_favorite_target()
+        };
+        let Some(dest) = dest else {
+            let msg = if in_search_view {
+                "検索結果の表示中はファイルをドロップできません"
+            } else if self.current_folder.is_some() {
+                "ZIP / PDF を表示中はファイルをドロップできません"
+            } else {
+                "コピー先のフォルダがありません"
+            };
+            self.show_feedback_toast(msg.to_string());
+            return;
+        };
+        // ドロップ先と自己再帰になるディレクトリ (表示中フォルダの祖先 / 自身) を除外。
+        let mut to_copy: Vec<PathBuf> = Vec::with_capacity(paths.len());
+        let mut recursive_skipped = 0usize;
+        for p in paths {
+            if p.is_dir() && crate::file_drag::dir_copy_would_recurse(&p, &dest) {
+                recursive_skipped += 1;
+            } else {
+                to_copy.push(p);
+            }
+        }
+        if to_copy.is_empty() {
+            self.show_feedback_toast(
+                "ドロップ先フォルダ自身またはその親フォルダはコピーできません".to_string(),
+            );
+            return;
+        }
+        let n = to_copy.len();
+        let rx = crate::ui_dialogs::context_menu::copy_paths_into_folder(to_copy, &dest);
+        self.paste_pending.push(rx);
+        let msg = if recursive_skipped > 0 {
+            format!(
+                "{n} 件のファイルをコピーしています… ({recursive_skipped} 件はドロップ先と重なるため除外)"
+            )
+        } else {
+            format!("{n} 件のファイルをコピーしています…")
+        };
+        self.show_feedback_toast(msg);
+    }
+
     /// PowerShell ペースト worker の完了を拾い、完了ごとに `pending_reload` を立てる。
     /// worker はデタッチ実行なので受信チャネル Disconnected == 完了とみなす (send か drop いずれも).
     pub(crate) fn poll_paste_pending(&mut self) {
@@ -17273,6 +17338,19 @@ impl eframe::App for App {
         // メインビューポートの IME 状態を更新 (ここで Ime イベントを拾う)。
         // フルスクリーンビューポートは別イベントキューなので render_fullscreen_viewport 内で別途呼ぶ。
         self.update_ime_state(ctx);
+
+        // エクスプローラ等から mIV へドロップされたファイルを現在のフォルダへコピーする
+        // (mIV → 外部 のドラッグ送出と対称の受け取り方向)。
+        let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
+        });
+        if !dropped_paths.is_empty() {
+            self.handle_external_file_drop(dropped_paths);
+        }
 
         // 入力があればバックグラウンドインデクサを一時停止させる。
         // `keys_down` は「今押されている」セットなので、Ctrl や Shift を指で押しっぱなしに

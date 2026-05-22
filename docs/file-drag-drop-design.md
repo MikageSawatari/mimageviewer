@@ -42,6 +42,21 @@
   `emit_drag_result_toasts` を `(outcome: Option<&DragOutcome>, post_drag_toast)`
   シグネチャに変更し、失敗・未開始を最優先で通知して `post_drag_toast` を抑止する
   (§5.5b)。P3 — `docs/README.md` 索引の「実装前のレビュー用」表記を実装済みに更新。
+- 2026-05-22: 受け取り方向 (エクスプローラ → mIV へのドロップ → 現在フォルダへ
+  コピー) を追加実装。当初 §2 で「対象外」としていたが、送出と対称の操作として
+  ユーザー要望で対応。詳細は §11。`app.rs` (`handle_external_file_drop` + `update`
+  での `dropped_files` 取り込み) と `context_menu.rs` (`copy_paths_into_folder`)。
+- 2026-05-22: Codex レビュー第 5 回 (受け取り実装レビュー) を反映。P1 — 表示中
+  フォルダがドロップ元の子孫だと `Copy-Item -Recurse` が自己再帰で無限増殖する
+  バグを修正 (`file_drag::dir_copy_would_recurse` ガード + ユニットテスト 7 件)。
+  P2 — Ctrl+G / Ctrl+S 検索結果ビュー表示中は `current_folder` が直前の実フォルダの
+  ままで誤コピーするため、`items_are_global_search_view` / `favsearch.on_results_grid()`
+  を明示チェックして拒否。P3 — `handle_external_file_drop` に紛れ込んでいた
+  `poll_paste_pending` の doc comment を元に戻した。§11 を更新。
+- 2026-05-22: Codex レビュー第 6 回 P1 を反映。再帰ガード `copy_target_inside_src` が
+  ドライブルート / UNC 共有ルート (`Path::file_name()` が `None`) を素通りさせていた
+  バグを修正 (`C:\A` 表示中の `C:\` ドロップ等)。ルートのときは `dest` 自体がルート
+  配下かで判定。ユニットテスト 3 件追加 (合計 10 件)。
 
 ## 1. 背景・動機
 
@@ -75,8 +90,10 @@
   足すだけ)。→ §5.2。
 - 画像 **データ** (ビットマップ) のドラッグ送出: ファイルパス (`CF_HDROP`) のみ。
   ビットマップ D&D は将来課題。
-- ドラッグ **受け取り** (他アプリから mIV へのドロップ): 本機能とは別。対象外。
 - 移動 (MOVE) セマンティクス: §6.4 参照。
+
+> **ドラッグ受け取り (他アプリ → mIV へのドロップ)** は当初「対象外」としていたが、
+> 送出と対称の操作として後日実装した。詳細は §11。
 
 ## 3. 既存コードの足場 (調査結果)
 
@@ -768,3 +785,54 @@ CLAUDE.md「コード修正時のドキュメント同時更新」に従い、�
 - `docs/README.md` — 本ドキュメントへのリンク (索引)
 - `htdocs/mimageviewer/manual/` — ユーザー向けマニュアルに操作説明
 - `htdocs/mimageviewer/index.html` — 製品ページの機能一覧
+
+## 11. 受け取り方向 (エクスプローラ → mIV へのドロップ)
+
+§1〜§10 は **送出** (mIV → 外部) の設計。ここでは後日追加した **受け取り** 方向を扱う。
+
+### 11.1 仕様
+
+- エクスプローラ等から mIV ウィンドウへファイル / フォルダをドロップすると、**現在
+  表示中の実フォルダへコピー** する (送出と対称の「ファイル整理」操作)。
+- コピー先は `App::current_favorite_target()` — 実ディレクトリ表示中だけ `Some`。
+  ZIP / PDF / 変換アーカイブ表示中は `None` で **トーストで拒否**。
+- **検索結果ビュー (Ctrl+G 合成 / Ctrl+S favsearch) も拒否** する。これらは
+  `current_folder` を直前の実フォルダのまま残すため、`current_favorite_target()` だけ
+  だと「直前のフォルダ」へ誤コピーしてしまう。`items_are_global_search_view` /
+  `favsearch.on_results_grid()` を明示的にチェックして拒否する (Codex 第 5 回 P2)。
+- **自己再帰ガード**: ドロップされたディレクトリが表示中フォルダ (= コピー先) の
+  祖先または自身だと、`Copy-Item -Recurse` が生成中のフォルダを再走査して無限増殖
+  する (例: `C:\A\B` 表示中に `C:\A` をドロップ → `C:\A\B\A\B\A...`)。該当ディレクトリは
+  コピー対象から除外する (Codex 第 5 回 P1)。ドライブルート / UNC 共有ルート
+  (`C:\` や `\\server\share`、`Path::file_name()` が `None`) は basename が無く
+  コピー先を一意化できないため、`dest` 自体がルート配下かで判定する (Codex 第 6 回 P1)。
+- 操作は **コピーのみ** (送出と同じ方針)。同名既存は上書き (`Copy-Item -Force`、
+  既存の Ctrl+V ペーストと同挙動)。
+
+### 11.2 実装
+
+送出と違い COM ドラッグソースは不要。winit が `with_drag_and_drop` 既定 true で
+mIV ウィンドウを OS のドロップターゲットに登録済みで、eframe が
+`RawInput.dropped_files` にパスを届ける。よって実装は「それを読んで処理する」だけ。
+
+- `App::update` で `ctx.input(|i| i.raw.dropped_files)` を読み、`path` のあるものを
+  収集 → `handle_external_file_drop`。
+- `handle_external_file_drop`:
+  1. 検索結果ビュー (`items_are_global_search_view` / `favsearch.on_results_grid()`) なら
+     拒否トースト。
+  2. `current_favorite_target()` が `None` (ZIP/PDF 等) なら拒否トースト。
+  3. ドロップ済みパスのうち、ディレクトリかつ `file_drag::dir_copy_would_recurse()` が
+     true のもの (= 自己再帰になる祖先/自身) を除外。残り 0 件なら拒否トースト。
+  4. 残りをコピー worker に渡す (`paste_pending` に積む)。除外があればトーストに件数を付記。
+- `file_drag::dir_copy_would_recurse(src, dest)`: 両パスを `canonicalize` 正規化し、
+  コピー先 `dest/basename(src)` が `src` 自身または配下かを小文字化 + コンポーネント
+  単位の前方一致で判定する。純粋判定部 `copy_target_inside_src` はユニットテスト済み。
+- コピーは `ui_dialogs::context_menu::copy_paths_into_folder` — `paste_files_from_clipboard`
+  と同型の PowerShell worker (`Copy-Item -LiteralPath -Recurse -Force`)。完了時の
+  再読み込みは既存の `poll_paste_pending` (`pending_reload` を立てる) を再利用。
+
+### 11.3 送出との非干渉
+
+`SHDoDragDrop` (送出) と winit の `RegisterDragDrop` (受け取り) は独立。送出実装は
+受け取りを壊さない (送出追加前から受け取りの下地はあったが、それを読むコードが
+無かっただけ)。

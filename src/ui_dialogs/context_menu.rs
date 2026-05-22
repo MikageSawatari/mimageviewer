@@ -1097,6 +1097,46 @@ pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) -> mpsc::Receiv
     rx
 }
 
+/// 指定パス群を `dest_folder` へコピーする（エクスプローラ → mIV のドロップ受け取り用）。
+///
+/// クリップボード経由ではなくパスを直接受け取る点が [`paste_files_from_clipboard`] と
+/// 異なる。同じく PowerShell worker で実行し、完了を `rx` で 1 回通知する。フォルダの
+/// ドロップにも対応するため `-Recurse`、コピー先に同名が既存なら上書き（`-Force`、
+/// paste と同じ挙動）。同一ファイルをそれ自身へコピーするケース（コピー先と同じ
+/// フォルダから掴んだ場合）は `-ErrorAction SilentlyContinue` で握りつぶす。
+pub fn copy_paths_into_folder(
+    paths: Vec<PathBuf>,
+    dest_folder: &std::path::Path,
+) -> mpsc::Receiver<()> {
+    let (tx, rx) = mpsc::channel();
+    #[cfg(windows)]
+    {
+        if paths.is_empty() {
+            drop(tx); // receiver は即 Disconnected → poll 側は完了扱い
+            return rx;
+        }
+        let dest = dest_folder.to_string_lossy().replace('\'', "''");
+        let list = paths
+            .iter()
+            .map(|p| format!("'{}'", p.to_string_lossy().replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let script = format!(
+            "$dest = '{dest}'\n\
+             foreach ($f in @({list})) {{\n\
+            \x20 Copy-Item -LiteralPath $f -Destination $dest -Force -Recurse -ErrorAction SilentlyContinue\n\
+             }}\n"
+        );
+        run_ps_script_async(script, Some(tx));
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (paths, dest_folder);
+        let _ = tx; // drop — receiver will get Disconnected
+    }
+    rx
+}
+
 /// PowerShell スクリプトを一時ファイル経由で worker スレッドで実行する共通ヘルパー。
 /// -STA (クリップボード API 必須) / -ExecutionPolicy Bypass / CREATE_NO_WINDOW で実行。
 /// スクリプトは UTF-8 BOM 付きで書き出す（日本語パス対応）。

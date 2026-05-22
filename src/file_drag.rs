@@ -12,7 +12,7 @@
 //! `start_file_drag` は `SHDoDragDrop` が戻る (ドロップ完了 or キャンセル) まで
 //! ブロックする。UI スレッドから、かつマウスボタン押下中に呼ぶこと。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// `start_file_drag` の結果。呼び出し側はこれを見て、ポインタリセットの要否・
 /// 失敗トーストの要否・ログ出力内容を判断する (`docs/file-drag-drop-design.md` §5.1)。
@@ -190,4 +190,132 @@ pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
 #[cfg(not(windows))]
 pub fn start_file_drag(_hwnd: isize, _paths: &[PathBuf]) -> DragOutcome {
     DragOutcome::not_started()
+}
+
+/// ディレクトリ `src` を `dest` 直下へコピーすると無限再帰になるかを判定する。
+///
+/// `Copy-Item -Recurse` は `src` のツリーを走査しつつ `dest/basename(src)` へ複製する。
+/// コピー先 `dest/basename(src)` が `src` 自身または `src` 配下にあると、生成された
+/// ばかりのフォルダを再び走査対象に拾い `dest/.../basename(src)/...` が無限に増殖する
+/// (例: `C:\A\B` 表示中に `C:\A` をドロップ → `C:\A\B\A\B\A...`)。
+///
+/// 実パスを `canonicalize` で正規化 (失敗時はそのまま) してから判定する。エクスプローラ
+/// → mIV のドロップ受け取り (`App::handle_external_file_drop`) で使う。
+pub fn dir_copy_would_recurse(src: &Path, dest: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    copy_target_inside_src(&canon(src), &canon(dest))
+}
+
+/// `dir_copy_would_recurse` の純粋判定部 (正規化済みパス前提、ユニットテスト用)。
+/// コピー先が `src` 自身または `src` 配下なら `true`。
+fn copy_target_inside_src(src: &Path, dest: &Path) -> bool {
+    // コピー先パス。通常のディレクトリは `dest/basename(src)`。`src` がルート
+    // (`C:\` や `\\server\share`、`file_name()` == None) のときは basename が無く
+    // コピー先を一意化できないため、`dest` 自体をコピー先領域とみなす — `dest` が
+    // ルート配下 (= 同じドライブ / 共有) なら `Copy-Item -Recurse` は生成中の
+    // フォルダを再走査して無限再帰する (Codex 第 6 回 P1: root path の取りこぼし)。
+    let target = match src.file_name() {
+        Some(name) => dest.join(name),
+        None => dest.to_path_buf(),
+    };
+    // Windows はパス大小無視。両辺を小文字化し、コンポーネント単位で前方一致を見る
+    // (`Path::starts_with` はコンポーネント境界で判定するので `C:\AB` は `C:\A` 配下に
+    // ならない)。
+    let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+    lower(&target).starts_with(lower(src))
+}
+
+#[cfg(all(test, windows))]
+mod recurse_guard_tests {
+    use super::copy_target_inside_src;
+    use std::path::Path;
+
+    #[test]
+    fn dest_under_src_is_recursive() {
+        // C:\A\B 表示中に C:\A をドロップ (Codex P1 の例)。
+        assert!(copy_target_inside_src(
+            Path::new(r"C:\A"),
+            Path::new(r"C:\A\B")
+        ));
+    }
+
+    #[test]
+    fn dropping_folder_onto_itself_is_recursive() {
+        assert!(copy_target_inside_src(
+            Path::new(r"C:\X\sub"),
+            Path::new(r"C:\X\sub")
+        ));
+    }
+
+    #[test]
+    fn dropping_direct_child_back_is_recursive() {
+        // C:\X 表示中にその子 C:\X\sub をドロップ → コピー先が src 自身。
+        assert!(copy_target_inside_src(
+            Path::new(r"C:\X\sub"),
+            Path::new(r"C:\X")
+        ));
+    }
+
+    #[test]
+    fn unrelated_folders_are_safe() {
+        assert!(!copy_target_inside_src(
+            Path::new(r"C:\Y\photos"),
+            Path::new(r"C:\X")
+        ));
+    }
+
+    #[test]
+    fn deeper_descendant_is_safe() {
+        // C:\X 表示中に C:\X\a\sub をドロップ → コピー先 C:\X\sub は src 配下でない。
+        assert!(!copy_target_inside_src(
+            Path::new(r"C:\X\a\sub"),
+            Path::new(r"C:\X")
+        ));
+    }
+
+    #[test]
+    fn case_insensitive_detection() {
+        assert!(copy_target_inside_src(
+            Path::new(r"C:\A"),
+            Path::new(r"c:\a\b")
+        ));
+    }
+
+    #[test]
+    fn component_boundary_prefix_is_safe() {
+        // C:\ABC は C:\A の子ではない (コンポーネント境界)。
+        assert!(!copy_target_inside_src(
+            Path::new(r"C:\A"),
+            Path::new(r"C:\ABC")
+        ));
+    }
+
+    #[test]
+    fn drive_root_into_subdir_is_recursive() {
+        // C:\A 表示中に ドライブルート C:\ をドロップ。file_name() == None でも
+        // dest が src 配下なので拒否されること (Codex 第 6 回 P1)。
+        assert!(copy_target_inside_src(
+            Path::new(r"C:\"),
+            Path::new(r"C:\A")
+        ));
+    }
+
+    #[test]
+    fn unc_share_root_into_subdir_is_recursive() {
+        // \\server\share 表示中に 共有ルート \\server\share をドロップ。
+        assert!(copy_target_inside_src(
+            Path::new(r"\\server\share"),
+            Path::new(r"\\server\share\A")
+        ));
+    }
+
+    #[test]
+    fn drive_root_into_other_drive_is_safe() {
+        // C:\ を D:\X へ → 別ドライブなので自己再帰しない (巨大コピーではあるが
+        // 再帰ガードの対象外)。
+        assert!(!copy_target_inside_src(
+            Path::new(r"C:\"),
+            Path::new(r"D:\X")
+        ));
+    }
 }
