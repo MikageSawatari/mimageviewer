@@ -23,6 +23,7 @@
 | --- | --- |
 | [spec.md](spec.md) | アプリ全体の仕様書 (設定項目・機能一覧) |
 | [feature-expansion-ideas.md](feature-expansion-ideas.md) | v0.10 候補 3 機能 (キャプチャ保存 / 比較ビュー / 動画連続再生) + スクロールバー視認性改善 の詳細仕様。Codex 第 2 ラウンドレビュー反映済、実装状況と設計メモを併記 |
+| [file-drag-drop-design.md](file-drag-drop-design.md) | グリッドからエクスプローラ等へファイルをドラッグ送出 (コピー) する機能の実装設計。シェル `IDataObject` + `SHDoDragDrop` 方式。実装前のレビュー用 |
 
 ## 設計メモ (特定領域の詳細)
 
