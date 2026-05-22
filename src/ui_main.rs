@@ -897,7 +897,12 @@ impl App {
 
         // ツールバーのソート変更は borrow の関係で遅延実行
         if toolbar_sort_changed {
-            if let Some(path) = self.current_folder.clone() {
+            // Ctrl+G 検索結果ビュー (一覧 / ドリルイン) では、メインのソート変更を
+            // 検索結果の並べ替えに反映する (§4.3.3)。実フォルダを再ロードすると
+            // Ctrl+G ビューから抜けてしまうため load_folder は使わない。
+            if self.global_search.active && self.items_are_global_search_view {
+                self.rebuild_items_from_global_search();
+            } else if let Some(path) = self.current_folder.clone() {
                 self.folder_history.remove(&path);
                 self.load_folder(path);
             }

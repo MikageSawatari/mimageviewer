@@ -1414,18 +1414,33 @@ impl App {
         if !self.global_search.active {
             return;
         }
+        self.cancel_pending_folder_nav();
         if let Some(d) = self.global_search.drill.clone() {
-            self.cancel_pending_folder_nav();
+            // 既にドリルイン中: current_path を開いた PDF/ZIP/サブフォルダへ進める。
             self.global_search.drill = Some(DrillState {
                 current_path: p.to_path_buf(),
                 ..d
             });
-            // 新しい current_path をブレッドクラムに反映。load_pdf_as_folder 等が
-            // 後で self.address を raw パスで上書きするが、そこでも再度
-            // `update_global_search_address` を呼んで元に戻す構造にしているので
-            // 最終的にこのブレッドクラムが表示される。
-            self.update_global_search_address();
+        } else {
+            // 一覧 (Flat) ビューから直接 PDF を開いたケース (Codex P2)。
+            // container_root = current_path = p の 1 段ドリルを確立しておくと、
+            // BS 1 回で drill_back_to_top → 一覧ビューへ戻れる。これをしないと
+            // drill=None のまま BS が close_global_search に流れて検索ごと閉じる。
+            let is_zip = p
+                .extension()
+                .map(|e| e.eq_ignore_ascii_case("zip"))
+                .unwrap_or(false);
+            self.global_search.drill = Some(DrillState {
+                container_root: p.to_path_buf(),
+                current_path: p.to_path_buf(),
+                is_zip,
+            });
         }
+        // 新しい current_path をブレッドクラムに反映。load_pdf_as_folder 等が
+        // 後で self.address を raw パスで上書きするが、そこでも再度
+        // `update_global_search_address` を呼んで元に戻す構造にしているので
+        // 最終的にこのブレッドクラムが表示される。
+        self.update_global_search_address();
     }
 
     /// トップレベル (一覧 or 集約) に戻る (drill-down 状態から)。
@@ -2508,6 +2523,48 @@ mod tests {
         let (items, _) = build_flat_items(&state, crate::settings::SortOrder::FileName, &rf);
         assert_eq!(items.len(), 1);
         assert!(matches!(&items[0], GridItem::Image(p) if p.ends_with("keep.jpg")));
+    }
+
+    /// build_flat_items: SortOrder::DateDesc / DateAsc が GlobalHit.mtime を使って
+    /// ソートする (§4.3.3、§5.2)。
+    #[test]
+    fn build_flat_items_sorts_by_mtime_for_date_order() {
+        let mut state = GlobalSearchState::default();
+        state.accumulate_hit(&GlobalHit {
+            path: "c:/a/mid.jpg".into(),
+            score: 1.0,
+            mtime: 200,
+            stars: 0,
+        });
+        state.accumulate_hit(&GlobalHit {
+            path: "c:/a/new.jpg".into(),
+            score: 1.0,
+            mtime: 300,
+            stars: 0,
+        });
+        state.accumulate_hit(&GlobalHit {
+            path: "c:/a/old.jpg".into(),
+            score: 1.0,
+            mtime: 100,
+            stars: 0,
+        });
+        let names = |items: &[GridItem]| -> Vec<String> {
+            items
+                .iter()
+                .map(|it| match it {
+                    GridItem::Image(p) => p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    _ => String::new(),
+                })
+                .collect()
+        };
+        let (desc, _) = build_flat_items(&state, crate::settings::SortOrder::DateDesc, &[true; 6]);
+        assert_eq!(names(&desc), vec!["new.jpg", "mid.jpg", "old.jpg"]);
+        let (asc, _) = build_flat_items(&state, crate::settings::SortOrder::DateAsc, &[true; 6]);
+        assert_eq!(names(&asc), vec!["old.jpg", "mid.jpg", "new.jpg"]);
     }
 
     /// 多階層のフォルダ構造の一部だけがヒットしたとき、drill-in でヒットを含む

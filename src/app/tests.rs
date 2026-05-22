@@ -1884,16 +1884,37 @@ mod phase_c_drill_nav_tests {
     }
 
     /// Ctrl+G が非アクティブな状態で advance_drilled_current_path を呼んでも
-    /// view に影響しないこと (no-op)。
+    /// drill state に影響しないこと (no-op)。
     #[test]
-    fn advance_drilled_is_noop_when_not_in_drilled_view() {
+    fn advance_drilled_is_noop_when_global_search_inactive() {
         let mut app = setup_app();
         assert!(app.global_search.drill.is_none());
         app.advance_drilled_current_path(std::path::Path::new("C:/anything.pdf"));
         assert!(
             app.global_search.drill.is_none(),
-            "ドリルインしていないときの advance は no-op であるべき"
+            "Ctrl+G 非アクティブ時の advance は no-op であるべき"
         );
+    }
+
+    /// 一覧 (Flat) ビューから PDF を開いたとき、advance_drilled_current_path が
+    /// container_root = current_path = pdf の 1 段ドリルを確立し、BS 1 回で一覧へ
+    /// 戻れること (Codex P2)。
+    #[test]
+    fn advance_drilled_from_flat_establishes_single_level_drill() {
+        let mut app = setup_app();
+        app.global_search.active = true;
+        let pdf = std::path::PathBuf::from("c:/fav/doc.pdf");
+        app.advance_drilled_current_path(&pdf);
+        match &app.global_search.drill {
+            Some(d) => {
+                assert_eq!(d.container_root, pdf);
+                assert_eq!(d.current_path, pdf);
+            }
+            None => panic!("一覧から PDF を開いたら 1 段ドリルが確立されるべき"),
+        }
+        // BS 1 回でトップレベル (一覧) へ戻る
+        app.drill_back_one_level();
+        assert!(app.global_search.drill.is_none(), "BS 1 回で一覧へ戻る");
     }
 }
 

@@ -6956,8 +6956,7 @@ impl App {
         // される churn が発生する (= ユーザー視点では「pin したフォルダのサムネが
         // 検索結果上だけ別の画像になる」)。`container_cache_base_key` を経由して
         // 両側で同じキーを共有させる。
-        let use_full_path_keys =
-            self.current_folder.as_deref() == Some(search_results_synthetic_path().as_path());
+        let use_full_path_keys = self.use_full_path_cache_keys();
         let mut seeded = 0u32;
         let mut purged = 0u32;
         for item in &self.items {
@@ -9147,8 +9146,7 @@ impl App {
                 continue;
             };
             // T54: Ctrl+S 検索結果は full-path キーで衝突回避
-            let use_full_path_keys =
-                self.current_folder.as_deref() == Some(search_results_synthetic_path().as_path());
+            let use_full_path_keys = self.use_full_path_cache_keys();
             let Some(mut req) = self.items.get(i).and_then(|item| {
                 make_load_request(
                     item,
@@ -9460,8 +9458,7 @@ impl App {
                 continue;
             };
             // T54: Ctrl+S 検索結果は full-path キーで衝突回避 (= idle upgrade も同じく)
-            let use_full_path_keys =
-                self.current_folder.as_deref() == Some(search_results_synthetic_path().as_path());
+            let use_full_path_keys = self.use_full_path_cache_keys();
             let Some(mut req) = self.items.get(i).and_then(|item| {
                 make_load_request(
                     item,
@@ -18386,6 +18383,28 @@ fn container_cache_base_key(
     }
 }
 
+impl App {
+    /// サムネイル cache key に full-path を使うべきコンテキストか。
+    ///
+    /// Ctrl+S 検索結果 (synthetic フォルダ) と Ctrl+G 検索結果ビュー (一覧 / 集約 /
+    /// ドリルイン) では、複数フォルダの同名アイテムが 1 リストに混在しうるため、
+    /// basename ベースの cache key だと別フォルダのサムネを誤表示し、catalog も
+    /// 汚染する (Codex P1)。このメソッドが true を返すコンテキストでは
+    /// `make_load_request` が full-path を含むキーを使う。サムネ読み出し側と
+    /// seed 側で必ず同じ判定を共有すること。
+    pub(crate) fn use_full_path_cache_keys(&self) -> bool {
+        self.current_folder.as_deref() == Some(search_results_synthetic_path().as_path())
+            || self.items_are_global_search_view
+    }
+}
+
+/// 検索結果ビュー (Ctrl+S / Ctrl+G) の画像用 full-path cache key (Codex P1)。
+/// basename だと複数フォルダの同名画像が衝突する。full path は `:` `/` を含むので
+/// 通常の basename キー・コンテナキー (`folderthumb:` 等) と自然に区別される。
+fn image_full_path_cache_key(path: &std::path::Path) -> String {
+    format!("imgthumb:{}", path.to_string_lossy())
+}
+
 /// GridItem から LoadRequest を構築する。画像 / ZIP 内画像 / PDF ページ / フォルダ以外は None を返す。
 ///
 /// `pin_map` は親コンテナ (Folder/ZipFile/PdfFile) のピン source 一覧で、
@@ -18422,10 +18441,16 @@ fn make_load_request(
         ..Default::default()
     };
     match item {
-        GridItem::Image(p) => Some(LoadRequest {
-            path: p.clone(),
-            ..base
-        }),
+        GridItem::Image(p) => {
+            // 検索結果ビューでは複数フォルダの同名画像が混在しうるので、basename では
+            // なく full-path ベースの cache key を使う (Codex P1)。
+            let cache_key_override = use_full_path_keys.then(|| image_full_path_cache_key(p));
+            Some(LoadRequest {
+                path: p.clone(),
+                cache_key_override,
+                ..base
+            })
+        }
         GridItem::ZipImage {
             zip_path,
             entry_name,
