@@ -263,6 +263,12 @@ fn walk_dir_recursive(
         // ZIP はアイテム索引 (Ctrl+G) の対象外。候補に含めないことで、既存の ZIP doc は
         // 3-way diff で「FS になし + DB あり」と判定され to_delete に落ちて Tantivy から
         // 消える (docs/search-container-item-redesign.md §3.2)。
+        // `is_recognized_image_ext` は Susie プラグインが申告した拡張子も画像扱いにする
+        // ため、アーカイブ系 Susie プラグインが "zip" を申告しても確実に除外できるよう、
+        // 拡張子分類より前に明示的に弾く (Codex P2)。
+        if ext == "zip" {
+            continue;
+        }
         let kind = if ext == "pdf" {
             CandidateKind::Pdf
         } else if folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
@@ -484,6 +490,31 @@ mod tests {
         assert_eq!(r.total_scanned, 1);
         assert_eq!(r.unchanged, 1);
         assert_eq!(r.to_delete, vec![dead_key]);
+    }
+
+    #[test]
+    fn existing_zip_with_stale_db_row_goes_to_delete() {
+        // 移行シナリオ: 旧版が索引した ZIP の fts_meta 行が残った状態で、ZIP ファイル
+        // 自体は FS に存在し続ける。walker は ZIP を候補にしないので 3-way diff で
+        // to_delete に落ち、ingest worker が Tantivy から掃除する (§3.2、Codex P3)。
+        let fav = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("z");
+        fs::create_dir_all(&root).unwrap();
+        make_file(&root, "album.zip", b"PK");
+        let zip_key = normalize_path(&root.join("album.zip"));
+        // 旧版が入れた ZIP 行を seed する
+        db.upsert_meta_ok(&zip_key, fav, &root, IndexKind::Zip, 1, 1)
+            .unwrap();
+
+        let r = scan_sync(fav, &root, &db);
+        assert_eq!(r.total_scanned, 0, "ZIP は候補にならない");
+        assert!(r.to_ingest.is_empty());
+        assert_eq!(
+            r.to_delete,
+            vec![zip_key],
+            "stale な ZIP 行が to_delete に落ちる"
+        );
     }
 
     #[test]

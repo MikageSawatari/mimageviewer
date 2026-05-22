@@ -610,6 +610,12 @@ fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<
         .to_ascii_lowercase();
     // ZIP はアイテム索引の対象外 (§3.2)。ext==zip は None を返し、呼び出し側の
     // upsert→remove フォールバックで既存 ZIP doc が索引から掃除される。
+    // `is_recognized_image_ext` は Susie プラグイン申告の拡張子も拾うため、
+    // アーカイブ系 Susie プラグインが "zip" を申告しても確実に弾けるよう、
+    // 拡張子分類より前に明示的に reject する (Codex P2)。
+    if ext == "zip" {
+        return None;
+    }
     let kind = if ext == "pdf" {
         search_walker::CandidateKind::Pdf
     } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
@@ -617,7 +623,7 @@ fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<
     } else if crate::folder_tree::is_recognized_image_ext(&ext) {
         search_walker::CandidateKind::Image
     } else {
-        // 非対応ファイルは無視 (ZIP / typography 違い / notify が .tmp 等を拾う場合)
+        // 非対応ファイルは無視 (typography 違い / notify が .tmp 等を拾う場合)
         return None;
     };
     // Apple Double 除外
@@ -680,6 +686,29 @@ mod tests {
 
     fn write_image(dir: &Path, name: &str) {
         fs::write(dir.join(name), b"pretend-image").unwrap();
+    }
+
+    /// ZIP はアイテム索引の対象外なので、notify 差分追従の候補ビルダは ZIP に対し
+    /// None を返す。呼び出し側はこれを upsert→remove フォールバックに流し、既存
+    /// ZIP doc を索引から掃除する (§3.2、Codex P3)。
+    #[test]
+    fn build_candidate_from_path_rejects_zip() {
+        let tmp = TempDir::new().unwrap();
+        let zip = tmp.path().join("album.zip");
+        fs::write(&zip, b"PK").unwrap();
+        let zip_key = crate::search_index_db::normalize_path(&zip);
+        assert!(
+            build_candidate_from_path(&zip, zip_key).is_none(),
+            "ZIP は候補にならない"
+        );
+        // 回帰確認: 画像は従来どおり候補になる
+        let jpg = tmp.path().join("photo.jpg");
+        fs::write(&jpg, b"x").unwrap();
+        let jpg_key = crate::search_index_db::normalize_path(&jpg);
+        assert!(
+            build_candidate_from_path(&jpg, jpg_key).is_some(),
+            "画像は候補になる"
+        );
     }
 
     /// supervisor の初期スキャンが走り、stats に結果が反映されることを確認する。

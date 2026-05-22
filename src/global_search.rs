@@ -93,7 +93,7 @@ pub struct GlobalHit {
 /// Ctrl+G 検索ワーカーに渡すフィルタ (§19 ドロップダウン UI と対応)。
 #[derive(Debug, Clone, Default)]
 pub struct SearchScope {
-    /// タイプドロップダウン "フォルダ / ZIP / PDF / 画像"。空 `Vec` は呼び出し側で弾くこと。
+    /// タイプドロップダウン "画像 / PDF / 動画"。空 `Vec` は呼び出し側で弾くこと。
     pub kinds: Option<Vec<IndexKind>>,
     /// 検索対象ドロップダウン "EXIF / XMP / ..."。既定は `All`。
     pub target: SearchTarget,
