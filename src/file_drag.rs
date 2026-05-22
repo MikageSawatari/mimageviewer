@@ -27,6 +27,10 @@ pub struct DragOutcome {
     pub failed_paths: usize,
     /// COM 各ステップで失敗した場合のエラー。正常時は `None`。
     pub error: Option<FileDragError>,
+    /// ドロップが実際に成立したか (`SHDoDragDrop` の effect が NONE 以外)。
+    /// キャンセル (Esc / 無効ターゲット上で離す) のときは false。呼び出し側が
+    /// 「mIV 自身のウィンドウへ落ちた」判定をするのに使う。
+    pub dropped: bool,
 }
 
 impl DragOutcome {
@@ -36,6 +40,7 @@ impl DragOutcome {
             started: false,
             failed_paths: 0,
             error: None,
+            dropped: false,
         }
     }
 
@@ -45,15 +50,17 @@ impl DragOutcome {
             started: false,
             failed_paths,
             error: Some(error),
+            dropped: false,
         }
     }
 
     /// `SHDoDragDrop` を呼んだ後の結果 (`started = true`、`error` は HRESULT エラー時のみ)。
-    fn after_modal(failed_paths: usize, error: Option<FileDragError>) -> Self {
+    fn after_modal(failed_paths: usize, error: Option<FileDragError>, dropped: bool) -> Self {
         Self {
             started: true,
             failed_paths,
             error,
+            dropped,
         }
     }
 }
@@ -171,11 +178,17 @@ pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
     match unsafe { SHDoDragDrop(Some(hwnd), &data, None::<&IDropSource>, DROPEFFECT_COPY) } {
         Ok(effect) => {
             crate::logger::log(format!("file_drag: SHDoDragDrop done effect={}", effect.0));
-            DragOutcome::after_modal(failed_paths, None)
+            // effect が NONE (0) 以外ならドロップ成立。Esc キャンセルや無効ターゲット上で
+            // 離した場合は NONE。
+            DragOutcome::after_modal(failed_paths, None, effect.0 != 0)
         }
         Err(e) => {
             crate::logger::log(format!("file_drag: SHDoDragDrop failed: {e}"));
-            DragOutcome::after_modal(failed_paths, Some(FileDragError::DoDragDrop(e.code().0)))
+            DragOutcome::after_modal(
+                failed_paths,
+                Some(FileDragError::DoDragDrop(e.code().0)),
+                false,
+            )
         }
     }
 }

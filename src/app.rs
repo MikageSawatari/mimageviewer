@@ -2876,6 +2876,12 @@ pub struct App {
     /// ため、egui のポインタ状態が固着する。このフラグが立っている 1 フレームは
     /// 冒頭でポインタ状態をリセットし、ドラッグ検出もスキップする (§6.1)。
     pub(crate) native_drag_just_finished: bool,
+    /// mIV 自身のドラッグがこの mIV ウィンドウ上へ落とされた (跳ね返り) ことを示す。
+    /// `SHDoDragDrop` 完了時にドロップ座標が mIV ウィンドウ上なら立て、直後フレームの
+    /// `dropped_files` 受け取りで消費する。これで mIV 内 D&D は受け取り扱いにせず、
+    /// 同じフォルダへの無用なコピーを防ぐ。エクスプローラ等からのドロップはこの経路に
+    /// 乗らないので通常どおり受け取れる。
+    pub(crate) internal_drop_pending: bool,
     #[cfg(windows)]
     /// Native fullscreen presenter の HWND を最後に VST bridge owner として同期した値。
     /// set_chain_owner は cross-process IPC なので、毎フレーム送らないための guard。
@@ -3555,6 +3561,7 @@ impl App {
             main_hwnd: None,
             pending_native_drag: None,
             native_drag_just_finished: false,
+            internal_drop_pending: false,
             #[cfg(windows)]
             native_video_owner_synced_hwnd: 0,
             #[cfg(windows)]
@@ -7797,6 +7804,33 @@ impl App {
             }
         }
         self.current_folder_signature = None;
+    }
+
+    /// 現在のマウスカーソル位置のウィンドウが `hwnd` (= mIV メインウィンドウ) かを返す。
+    /// native ドラッグの落下先が mIV 自身かを `SHDoDragDrop` 完了時に判定するのに使う。
+    #[cfg(windows)]
+    fn cursor_over_window(hwnd: isize) -> bool {
+        use windows::Win32::Foundation::{HWND, POINT};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GA_ROOT, GetAncestor, GetCursorPos, WindowFromPoint,
+        };
+        unsafe {
+            let mut pt = POINT::default();
+            if GetCursorPos(&mut pt).is_err() {
+                return false;
+            }
+            let under = WindowFromPoint(pt);
+            if under.0.is_null() {
+                return false;
+            }
+            // 子ウィンドウ上に落ちてもルートで比較する。
+            GetAncestor(under, GA_ROOT) == HWND(hwnd as *mut core::ffi::c_void)
+        }
+    }
+
+    #[cfg(not(windows))]
+    fn cursor_over_window(_hwnd: isize) -> bool {
+        false
     }
 
     /// エクスプローラ等から mIV ウィンドウへドロップされたファイルを、現在表示中の
@@ -17343,14 +17377,21 @@ impl eframe::App for App {
         // (mIV → 外部 のドラッグ送出と対称の受け取り方向)。毎フレーム走るので、
         // ドロップが無い通常フレームでは空チェックだけで抜ける (Vec を確保しない)。
         if ctx.input(|i| !i.raw.dropped_files.is_empty()) {
-            let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
-                i.raw
-                    .dropped_files
-                    .iter()
-                    .filter_map(|f| f.path.clone())
-                    .collect()
-            });
-            self.handle_external_file_drop(dropped_paths);
+            // mIV 自身のドラッグが mIV ウィンドウ上へ落ちた跳ね返り (グリッド上での
+            // クリックずれ等) なら受け取らない。フラグの消費は dropped_files が来た
+            // 時点で必ず行う — パスが空に潰れても stale で残さない (Codex P2)。
+            if std::mem::take(&mut self.internal_drop_pending) {
+                crate::logger::log("file_drop: ignored (mIV-internal drag bounce-back)");
+            } else {
+                let dropped_paths: Vec<PathBuf> = ctx.input(|i| {
+                    i.raw
+                        .dropped_files
+                        .iter()
+                        .filter_map(|f| f.path.clone())
+                        .collect()
+                });
+                self.handle_external_file_drop(dropped_paths);
+            }
         }
 
         // 入力があればバックグラウンドインデクサを一時停止させる。
@@ -18482,6 +18523,11 @@ impl eframe::App for App {
                     // 未到達ならフラグを立てない (winit が WM_LBUTTONUP を正常受信)。
                     if outcome.started {
                         self.native_drag_just_finished = true;
+                        // ドロップが成立し、かつ落下先が mIV 自身のウィンドウなら、
+                        // 直後の dropped_files (跳ね返り) を受け取らないよう印を付ける。
+                        if outcome.dropped && Self::cursor_over_window(hwnd) {
+                            self.internal_drop_pending = true;
+                        }
                     }
                     if let Some(err) = &outcome.error {
                         crate::logger::log(format!("file_drag: outcome error: {err:?}"));
