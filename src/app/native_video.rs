@@ -1501,6 +1501,15 @@ impl App {
             ));
         }
         let new_in_window = !self.settings.video_in_window_mode;
+        // フルスクリーン → ウィンドウ 切替時、VST3 GUI が表示中なら自動で隠す。
+        // in-window モードは VST を対象外にするため、VST GUI ウィンドウ (owner は
+        // フルスクリーン presenter HWND) を残したまま切り替えると、owner HWND の
+        // 破棄で VST ウィンドウが宙に浮いて残骸表示になる。presenter がまだ
+        // フルスクリーン (= VST owner HWND が有効) なうちに、VST ボタン 1 回ぶんと
+        // 同じ hide を行う (`toggle_native_video_vst3_gui` は表示中なら hide 方向)。
+        if new_in_window && self.show_vst3_manager {
+            self.toggle_native_video_vst3_gui();
+        }
         // 永続設定だけフリップ。実モード (`native_video_in_window_active`) は成功
         // イベントまで据え置く (上記 doc 参照)。
         self.settings.video_in_window_mode = new_in_window;
