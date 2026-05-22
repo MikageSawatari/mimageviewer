@@ -200,6 +200,14 @@ fn original_preview_shortcut_held(ctx: &egui::Context) -> bool {
     ctx.input(|i| i.key_down(egui::Key::Num0))
 }
 
+/// メインビューポート経由のフルスクリーンキー処理 (`handle_fullscreen_root_key_input`)
+/// を起動するかどうかを判定する「プローブ」。押されたキーがこの集合に無いフレームは
+/// 実ハンドラ (`handle_fs_key_input` → 動画は `handle_video_input`) を一切呼ばない。
+///
+/// ⚠️ 再発防止: フルスクリーンのショートカットキーを追加・変更したら **必ずここにも
+/// 追加する**。漏らすと、専用フルスクリーン viewport ではなくメインウィンドウに
+/// フォーカスがある経路 (in-window 動画再生など) でそのキーだけ無反応になる。
+/// 2026-05 に perf オーバーレイを P→F へ移した際、プローブへの F 追加漏れで実害が出た。
 fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
     matches!(
         key,
@@ -207,6 +215,8 @@ fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
             | egui::Key::ArrowRight
             | egui::Key::ArrowUp
             | egui::Key::ArrowDown
+            | egui::Key::Home
+            | egui::Key::End
             | egui::Key::W
             | egui::Key::Enter
             | egui::Key::Escape
@@ -225,6 +235,12 @@ fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
             | egui::Key::X
             | egui::Key::Z
             | egui::Key::R
+            | egui::Key::F1
+            | egui::Key::F2
+            | egui::Key::F3
+            | egui::Key::F4
+            | egui::Key::F5
+            | egui::Key::F6
     )
 }
 
@@ -262,6 +278,12 @@ fn fullscreen_shortcut_event_summary(ctx: &egui::Context) -> Option<String> {
     }
 }
 
+/// egui のキーを native 動画キーイベントの仮想キーコードへ変換する。起動直後の
+/// 黒 backdrop 表示中 (presenter HWND 未確定) に egui 経由で来たキーを
+/// `handle_native_video_key_event` へ渡すために使う。
+///
+/// ⚠️ 上の `is_fullscreen_shortcut_probe_key` と対で更新すること。動画フルスクリーンの
+/// ショートカットを追加・変更したら、プローブとこの変換表の両方に足す必要がある。
 #[cfg(windows)]
 fn native_video_vk_from_egui_key(key: egui::Key) -> Option<u32> {
     Some(match key {
@@ -285,6 +307,12 @@ fn native_video_vk_from_egui_key(key: egui::Key) -> Option<u32> {
         egui::Key::S => 0x53,
         egui::Key::W => 0x57,
         egui::Key::X => 0x58,
+        egui::Key::F1 => 0x70,
+        egui::Key::F2 => 0x71,
+        egui::Key::F3 => 0x72,
+        egui::Key::F4 => 0x73,
+        egui::Key::F5 => 0x74,
+        egui::Key::F6 => 0x75,
         _ => return None,
     })
 }
