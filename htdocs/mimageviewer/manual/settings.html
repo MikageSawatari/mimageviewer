@@ -175,15 +175,15 @@
       </div>
     </div>
 
-    <h2 id="search-index">検索インデックス（お気に入り → 編集）</h2>
-    <p>お気に入りごとに「名前索引」「メタ索引」の ON/OFF チェックを個別に設定できます
+    <h2 id="search-index">検索索引（お気に入り → 編集）</h2>
+    <p>お気に入りごとに「コンテナ索引」「アイテム索引」の ON/OFF チェックを個別に設定できます
     (お気に入り → 編集 で開くダイアログ内)。<strong>どちらも既定は OFF</strong>で、ON に
-    切り替えた時点で配下を再帰的に走査してインデックスを作成します。以降は自動監視で
+    切り替えた時点で配下を再帰的に走査して索引を作成します。以降は自動監視で
     追従されます。</p>
     <ul>
-      <li><strong>名前索引</strong> — <kbd>Ctrl</kbd>+<kbd>S</kbd> の対象。
-          フォルダ / ZIP / PDF / 動画の名前を記録。DB: <code>%APPDATA%\mimageviewer\search_index.db</code></li>
-      <li><strong>メタ索引</strong> — <kbd>Ctrl</kbd>+<kbd>G</kbd> /
+      <li><strong>コンテナ索引</strong> — <kbd>Ctrl</kbd>+<kbd>S</kbd> (コンテナ検索) の対象。
+          フォルダ / ZIP / PDF の名前を記録。DB: <code>%APPDATA%\mimageviewer\search_index.db</code></li>
+      <li><strong>アイテム索引</strong> — <kbd>Ctrl</kbd>+<kbd>G</kbd> (アイテム検索) /
           グリッドのタグバッジ / タグ書き込み後の即時反映で使用。画像・PDF・動画の全文メタデータ
           (ファイル名・EXIF・XMP・AI プロンプト・PDF メタ・動画メタ・タグ) を記録。
           DB: <code>%APPDATA%\mimageviewer\fts_meta.db</code> +
@@ -712,7 +712,7 @@
           <tr><td>★レーティング DB</td><td><code>%APPDATA%\mimageviewer\rating.db</code></td><td>ページ単位（A）</td></tr>
           <tr><td>見開き設定 DB</td><td><code>%APPDATA%\mimageviewer\spread.db</code></td><td>フォルダ単位（A）</td></tr>
           <tr><td>PDF パスワード DB</td><td><code>%APPDATA%\mimageviewer\pdf_passwords.json</code></td><td>ファイル単位（A）</td></tr>
-          <tr><td>お気に入り検索インデックス</td><td><code>%APPDATA%\mimageviewer\search_index.db</code></td><td>フォルダ単位（B）</td></tr>
+          <tr><td>コンテナ索引 (Ctrl+S)</td><td><code>%APPDATA%\mimageviewer\search_index.db</code></td><td>フォルダ単位（B）</td></tr>
           <tr><td>サムネイルキャッシュ</td><td><code>%APPDATA%\mimageviewer\cache\</code>（WebP 形式）</td><td>フォルダ単位（A）</td></tr>
           <tr><td>動画タイル サムネ キャッシュ</td><td><code>%APPDATA%\mimageviewer\video_tile_thumbs.db</code>（動画のタイム ライン サムネ。<kbd>S</kbd> キーで開ける動画タイル モード用）</td><td>動画 ファイル単位（A）</td></tr>
           <tr><td>変換済みアーカイブキャッシュ</td><td><code>%APPDATA%\mimageviewer\archive_cache\</code>（変換済み ZIP）+ <code>archive_cache.db</code>（マッピング）</td><td>ファイル単位（A）</td></tr>

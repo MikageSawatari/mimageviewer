@@ -11,11 +11,22 @@ mimageviewer の検索システム (Ctrl+S / Ctrl+F / Ctrl+G + タグ機能) の
 
 ### 1.1 3 つの検索モード
 
-| ショートカット | 用途 | スコープ | 実装経路 |
-| --- | --- | --- | --- |
-| **Ctrl+S** | フォルダ / ZIP / PDF / 動画名の横断検索 | お気に入り配下 (再帰) | `search_index.db` (SQLite LIKE) |
-| **Ctrl+F** | ローカルメタ検索 | 現在グリッドに表示中の画像 / PDF / 動画 (非再帰) | worker 上の on-demand メタ読み取り |
-| **Ctrl+G** | グローバルメタ検索 | お気に入り配下 (画像 / PDF / 動画、ZIP 内画像含む、再帰) | Tantivy bigram 候補絞り込み + STORED 原文 post-filter の streaming |
+検索は「コンテナを探す」「アイテムを探す」「今いる場所を絞る」の 3 軸に整理
+されている。設計の意図と全体方針は
+[search-container-item-redesign.md](search-container-item-redesign.md) が正典。
+
+| ショートカット | 呼称 | 用途 | スコープ | 実装経路 |
+| --- | --- | --- | --- | --- |
+| **Ctrl+S** | コンテナ検索 | フォルダ / ZIP / PDF を名前で横断検索 | お気に入り配下 (再帰) | コンテナ索引 `search_index.db` (SQLite LIKE) |
+| **Ctrl+F** | 現在地フィルタ | 現グリッドの表示中アイテムを名前 / メタ情報で絞り込み | 現在グリッド (非再帰・索引なし) | worker 上の on-demand 判定 |
+| **Ctrl+G** | アイテム検索 | 画像 / PDF / 動画を名前 / タグ / EXIF / AI プロンプト等で横断検索 | お気に入り配下 (再帰) | アイテム索引 (Tantivy bigram) 候補絞り込み + STORED 原文 post-filter の streaming |
+
+- **動画はコンテナ索引 (Ctrl+S) の対象外** — 動画はアイテムなので Ctrl+G で扱う。
+- **ZIP はアイテム索引 (Ctrl+G) の対象外** — ZIP はコンテナなので Ctrl+S で扱う。
+  ZIP 内画像のメタ検索はどのモードでも行わない (§4.6)。
+- **Ctrl+F は索引を使わない** — 現グリッドの表示中アイテム (構造アイテム含む) を
+  その場で判定する。構造アイテム (Folder / ZIP / PDF) もファイル名で一貫して
+  絞り込む (§5.2)。
 
 3 つは UI 上で排他表示される (同時に 2 本開かない)。回帰ガードは
 `src/app.rs::phase_c_key_tests`。
@@ -118,7 +129,11 @@ separator は `search_norm::ZIP_ENTRY_SEP` = U+001F Unit Separator) を通す。
 
 ## 4. インデクサパイプライン
 
-### 4.1 メタ索引 (Ctrl+F / Ctrl+G 用)
+### 4.1 アイテム索引 (Ctrl+G 用)
+
+画像 / PDF / 動画を、ファイル名・タグ・EXIF・AI プロンプト等で横断検索する
+ための索引。Ctrl+G が使う。Ctrl+F (現在地フィルタ) はこの索引を使わず、
+表示中アイテムを on-demand に判定する (§5.2)。
 
 ```
 App 起動
@@ -198,23 +213,28 @@ reconcile が `IndexWriter` を奪い合って失敗する)。
 VACUUM 等の housekeeping は起動経路から外し、全 supervisor が初期 scan を完了して
 idle になった最初のフレームで `spawn_housekeeping` から別スレッドで走らせる。
 
-### 4.4 名前索引 (Ctrl+S 用)
+### 4.4 コンテナ索引 (Ctrl+S 用)
 
-メタ索引とは別系統:
+アイテム索引とは別系統。フォルダ / ZIP / PDF を「名前で探せるコンテナ」として
+登録する:
 
 ```
 NameIndexSupervisor (1 お気に入り 1 本):
-  1. name_bulk_indexer::run_bulk_name_index  …… フォルダ / ZIP / PDF / 動画の再帰列挙
+  1. name_bulk_indexer::run_bulk_name_index  …… フォルダ / ZIP / PDF の再帰列挙
   2. SearchIndexDb::upsert_children で差分反映 (INSERT OR REPLACE)
   3. FsWatcher でイベント受信 → name_index_supervisor::apply_single_change が
      try_exists() ベースで判定し、新規ディレクトリなら subtree 再帰 upsert、
      削除なら ancestor chain prune + delete_subtree を実行 (詳細は §4.5)
 ```
 
-- メタ側と違い書き込み先が SQLite 単独なので複数お気に入りの supervisor は
+- アイテム索引側と違い書き込み先が SQLite 単独なので複数お気に入りの supervisor は
   真の並列で動ける (Tantivy writer 単一制約がない)。
-- 画像個別は扱わない (画像の名前は Ctrl+F / Ctrl+G 側で拾う)。動画ファイル名は
-  グリッド上で通常アイテムとして扱うため Ctrl+S の名前索引にも登録する。
+- 画像個別は扱わない (画像の名前はアイテム索引 / Ctrl+G 側で拾う)。
+- **動画はコンテナ索引の対象外** — 動画はコンテナではなくアイテムなので、
+  `classify_name_index_kind` は動画拡張子に対して `None` を返し、`SearchIndexDb` の
+  `kind` 列にも `VideoFile` を書かない。`search()` は `kind=None` ("すべて") でも
+  クエリ側で `VideoFile` を弾くので、旧バージョンが書いた行が残っていても
+  Ctrl+S 結果には出ない (docs/search-container-item-redesign.md §4.2 / task#4)。
 
 ### 4.5 FsWatcher と debounce、`apply_single_change` の挙動
 
@@ -280,13 +300,21 @@ SMB / NAS では `ReadDirectoryChangesW` が発火しないケースがあるの
 
 ### 4.6 ZIP 対応のスコープ
 
-- ZIP ファイル自体: ファイル名として index される
-- ZIP 内画像: ingest の対象 (fts_meta.db の path は `<zippath>\u{1F}<entry>` 正規化、
-  `search_norm::ZIP_ENTRY_SEP`)
-- ネスト ZIP: 外側 ZIP を 1 回だけ開いて全エントリを連続 ingest。内側 ZIP の
-  バイト列キャッシュは ingest 用 context では 1 レベルに制限 (RAM 暴走防止)
-- ZIP ファイル自体の mtime 変化 = 全エントリ再 ingest (ZIP 内 mtime は個別取得
-  コストが高いため)
+**ZIP はコンテナであり、アイテム索引 (Ctrl+G) の対象外。** ZIP ファイル名での
+横断検索はコンテナ索引 (Ctrl+S) が担う。
+
+- ZIP ファイル自体: アイテム索引には登録しない。`search_walker` は ZIP を
+  `fs_map` に入れない (`CandidateKind::Zip` を作らない) ので、過去バージョンが
+  登録した ZIP doc は 3-way diff で「FS になし + DB あり」と判定され `to_delete`
+  に落ちて Tantivy から消える (docs/search-container-item-redesign.md §3.2 / task#1)。
+- ZIP 内画像: **どのモードでもメタ検索しない**。アイテム索引は ingest せず、
+  Ctrl+F も ZIP 表示中はファイル名フィルタのみ (§5.2、同 §4.1.2)。ZIP は seek
+  不可でエントリごとの伸張コストが高く、生成画像を ZIP 保管する需要も低いため。
+- `fts_index` schema の `zip_entry` フィールドや `global_search_ui` の
+  `split_zip_hit_path` / `build_drilled_zip_items` は将来 ZIP 内アイテム ingest を
+  行う場合の足場として残してあるが、現状の経路からは到達しない。
+- ZIP 内画像のメタ検索が必要になったら、walker の ZIP 内列挙 + ZIP 専用 ingest
+  context を伴う独立した後続プロジェクトで扱う。
 
 ### 4.7 PDF 対応のスコープ
 
@@ -332,38 +360,64 @@ commit した最新原文を旧値で潰してしまうため、上記 #2 / #3 �
 
 ## 5. クエリ実行パス
 
-### 5.1 Ctrl+S — 構造 (フォルダ/ZIP/PDF/動画) 名検索
+### 5.1 Ctrl+S — コンテナ (フォルダ / ZIP / PDF) 名検索
 
 ```
 UI (render_favsearch_bar)
   → execute_favsearch (spawn worker thread)
-    → SearchIndexDb::search(query, favorite_roots, mode)
+    → SearchIndexDb::search(query, favorite_roots, kind, mode)
          SQL: SELECT ... FROM entries WHERE
-              favorite_root IN (...) AND
               include 群を mode に応じて AND / OR 結合した LIKE
               AND exclude 群の NOT LIKE
-  → poll_favsearch が結果を受け取り GridItem::Folder/ZipFile/PdfFile/Video に展開
+              AND favorite_root IN (...)
+              AND 種別フィルタ:
+                  kind=Some(k) なら kind = ?
+                  kind=None    なら kind <> VideoFile
+  → poll_favsearch が結果を受け取り GridItem::Folder/ZipFile/PdfFile に展開
 ```
+
+- `kind` 引数は Ctrl+S バーの「種別」ドロップダウン (すべて / フォルダ / ZIP / PDF)。
+- 動画はコンテナ索引の対象外 (§4.4)。`kind=None` ("すべて") でもクエリ側で
+  `VideoFile` を弾くので、旧バージョン由来の VideoFile 行が残っていても結果に出ない。
+- バインド順は include → exclude → favorite_roots → kind。
 
 Tantivy は通さない。SQLite LIKE の方が対象件数 (フォルダ構造の粒度) に対して
 速く、実装もシンプル。
 
-### 5.2 Ctrl+F — ローカルメタ検索 (現在表示中の一覧のみ)
+### 5.2 Ctrl+F — 現在地フィルタ (現グリッドの表示中アイテムのみ)
 
 ```
 UI (render_search_bar)
-  → run_metadata_search(tokens, items, xmp_cache, fts_meta, target, mode, cancel)
-       1. 表示中 items から検索対象 path (画像 / PDF / 動画) を集め、normalize_path で正規化
-       2. 画像 / 動画は target に応じて必要なメタだけを on-demand で読む
-          (PNG tEXt / EXIF / XMP / 動画コンテナメタ / dc:subject)
-       3. ZIP 内 PNG は ZIP を 1 回だけ開き、対象エントリをまとめて on-demand 判定
-       4. 合格 path を HashSet<usize> に反映 (search_filter)
+  → run_metadata_search(tokens, items, xmp_cache, fts_meta, pdf_passwords,
+                        target, mode, cancel)
+    Pass 1 (構造アイテム + ZIP 内画像、名前照合中心):
+       - Folder / ZipFile / ConvertibleArchive … ファイル名 (basename) で照合
+       - PdfFile … まずファイル名、外れたら PDF document info も見る
+         (target が PDF メタを含むとき。get_document_info の IPC、
+          保存済みパスワードは pdf_passwords から、PDF 境界でのみ cancel)
+       - ZipImage … ファイル名のみ (ZIP を開いてメタを読む経路は持たない)
+       - ZipSeparator … 付随グループに可視 ZipImage が残るときだけ表示
+    Pass 2 (Image / Video、on-demand メタ):
+       - target に応じて必要なメタだけ読む (PNG tEXt / EXIF / XMP /
+         動画コンテナメタ / dc:subject)
+    → 合格 idx を HashSet<usize> に反映 (search_filter)
 ```
 
-**Tantivy を経由しない理由**: 対象が表示中の数十〜数千件に限定されるので、
-bigram 候補絞り込みより on-demand で必要なソースだけを読む方が
-(a) 検索漏れゼロ、(b) Ctrl+F の「今見えている一覧」だけに閉じられる、(c) 実装が単純。
-重い読み取りは worker スレッド上で行い、UI スレッドでは実行しない。
+- **構造アイテムも一貫して絞り込む**: フォルダ / ZIP / PDF も「持っている次元」
+  (ファイル名、PDF は document info も) で判定する。検索対象がファイル名次元を
+  含まない (EXIF / タグ単独指定) なら構造アイテムは全件非表示になる。
+- **PDF のページ表示中は Ctrl+F 自体を無効化** (`grid_is_pdf_pages`): 連番の
+  合成ページ名を絞っても意味が無いため、ショートカットを無反応にし開いた
+  バーも閉じる。
+- **ZIP 表示中は検索対象をファイル名に固定** (`grid_is_zip_entries`): ZIP 内
+  画像のメタ検索は行わない (§4.6)。
+- 件数バッジは可視マッチ全体を「X/Y 件」で数える (separator は除く)。
+
+**インデックスを使わない理由**: 対象が表示中の数十〜数千件に限定されるので、
+on-demand で必要なソースだけを読む方が (a) 検索漏れゼロ、(b)「今見えている
+一覧」だけに閉じられる、(c) 実装が単純。重い読み取りは worker スレッド上で
+行い、UI スレッドでは実行しない。詳細は
+[search-container-item-redesign.md](search-container-item-redesign.md) §4.1。
 
 ### 5.3 Ctrl+G — グローバルメタ検索 (streaming)
 
@@ -394,8 +448,13 @@ UI (global_search_ui::render_global_search_bar)
   [UI] 毎フレーム:
     → poll_global_search が try_recv ループで Batch を受信
     → push_grid_item_pending で items + thumbnails をセット拡張
-    → Aggregated ビュー (ContainerHit の集計) / DrilledInto ビュー (階層内絞込)
-      を rebuild_global_search_items が再構築
+    → rebuild_global_search_items が現在のビューに合わせて items を再構築:
+        - Flat (一覧)      … 全ヒットを画像 / PDF / 動画として平坦に並べる
+        - Aggregated (集約) … ContainerHit ごとに SearchContainer へ集計
+        - DrilledInto       … 集約からコンテナを 1 つ開いた階層内絞込
+      ビューは GlobalSearchState の drill / aggregate / aggregate_auto から
+      導出される。ヒット数が閾値を超えると一覧 → 集約へ自動切替する
+      (ユーザーが結果を操作した後はロックして勝手に切り替えない)。
     → pending が残っていれば ctx.request_repaint()
 ```
 
