@@ -27,6 +27,7 @@ pub mod audio_normalize_db;
 pub mod cache_maintenance;
 pub mod capture;
 pub mod catalog;
+pub mod changelog_markdown;
 pub mod compare_wgpu;
 pub mod data_dir;
 pub mod delete_worker;

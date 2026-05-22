@@ -291,3 +291,43 @@ fn susie_diagnostic_ready_with_plugins_dark() {
         plugins,
     );
 }
+
+// ---------------------------------------------------------------------------
+// 更新履歴 (GitHub release body) の Markdown 描画スナップショット
+// ---------------------------------------------------------------------------
+
+/// バージョン更新ダイアログに表示する release body の代表サンプル。
+/// 見出し / 箇条書き / ネスト / `**強調**` / `` `コード` `` / `<kbd>キー</kbd>` を網羅し、
+/// 整形描画 ([mimageviewer::changelog_markdown]) の見た目を回帰検出できるようにする。
+fn changelog_body_fixture() -> &'static str {
+    "### v0.9.1\n\
+     - **キャプチャ保存**: 画像フルスクリーン中に <kbd>Ctrl</kbd>+<kbd>S</kbd> を押すと、\
+     表示中の画像を保存できます。保存形式は環境設定の `キャプチャ保存` ページで設定します\n\
+     - **比較ビュー**: <kbd>X</kbd> でピン留めし、<kbd>C</kbd> でトグル表示します\n\
+     \u{0020}\u{0020}- <kbd>Shift</kbd>+<kbd>C</kbd> で左右に並べたワイプ比較\n\
+     - 設定ファイル `settings.db` は初回起動時に自動移行されます"
+}
+
+#[test]
+fn changelog_markdown_light() {
+    snapshot_with_theme(
+        "changelog_markdown_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| {
+            ui.set_width(440.0);
+            mimageviewer::changelog_markdown::render(ui, changelog_body_fixture());
+        },
+    );
+}
+
+#[test]
+fn changelog_markdown_dark() {
+    snapshot_with_theme(
+        "changelog_markdown_dark",
+        mimageviewer::os_theme::ResolvedTheme::Dark,
+        |ui| {
+            ui.set_width(440.0);
+            mimageviewer::changelog_markdown::render(ui, changelog_body_fixture());
+        },
+    );
+}

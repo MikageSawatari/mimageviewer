@@ -1,8 +1,7 @@
 //! 「新しいバージョンがあります」ダイアログ。
 //!
 //! - 起動時 / 定期 (24h) / 手動の更新チェック結果がここに集約される
-//! - body (Markdown) はそのままプレーンテキスト表示する (egui には組み込み Markdown
-//!   レンダラがないため、ScrollArea で折りたたんで原文を見せる方針)
+//! - body (GitHub release の Markdown) は [crate::changelog_markdown] で整形描画する
 //! - 「リリースページを開く」「閉じる」「このバージョンの通知をオフ」の 3 ボタン
 
 use crate::app::App;
@@ -81,13 +80,10 @@ impl App {
                         ui.add_space(2.0);
                         egui::ScrollArea::vertical()
                             .id_salt("update_body_scroll")
-                            .max_height(200.0)
+                            .max_height(240.0)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                // 本文は読みやすさ優先で色オプションを外し、テーマの
-                                // 既定テキスト色 (Light/Dark どちらでも十分なコントラスト)
-                                // に従わせる。
-                                ui.label(egui::RichText::new(&info.body).size(12.0));
+                                crate::changelog_markdown::render(ui, &info.body);
                             });
                     }
                     ui.add_space(8.0);

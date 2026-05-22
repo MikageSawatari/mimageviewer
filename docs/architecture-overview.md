@@ -129,6 +129,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `ui_dialogs/preferences.rs` | 環境設定ダイアログの状態、App 連携、ツリー / ページ dispatch |
 | `ui_dialogs/preferences/pages.rs` | 環境設定の各 `page_*` 描画関数 |
 | `ui_susie_diagnostic.rs` | Susie プラグイン診断パネルの描画。環境設定の「Susie プラグイン」ページから切り出し、`PoolStatus` 各バリアントごとにメッセージ・配色を出し分け。`egui_kittest` のスナップショットテスト対象 |
+| `changelog_markdown.rs` | 更新履歴 (GitHub release body) の Markdown サブセット描画。バージョン更新ダイアログ (`ui_dialogs/update_notice.rs`) から呼ばれ、見出し / 箇条書き / `**強調**` / `` `コード` `` / `<kbd>キー</kbd>` を整形。`egui_kittest` のスナップショットテスト対象 |
 
 ### 検索 / インデクサ / タグ
 

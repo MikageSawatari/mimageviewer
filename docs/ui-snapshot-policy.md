@@ -35,7 +35,8 @@ tests/
 └── snapshots/                  # 期待スナップショット PNG (コミット対象)
     ├── smoke_label_and_button_light.png
     ├── smoke_label_and_button_dark.png
-    ├── susie_diagnostic_*.png  # Susie プラグイン診断 UI
+    ├── susie_diagnostic_*.png    # Susie プラグイン診断 UI
+    ├── changelog_markdown_*.png  # 更新履歴 Markdown の整形描画
     └── ...
 ```
 
@@ -47,6 +48,7 @@ tests/
 破綻する)。代わりに、以下のような純粋な描画関数を対象にする:
 
 - `ui_susie_diagnostic::render_diagnostic(ui, status, plugins)`
+- `changelog_markdown::render(ui, body)` — 更新履歴 Markdown サブセットの整形描画
 - 必要に応じて `ui_helpers` などから切り出した整形系関数
 
 UI コードをスナップショットしたい場合は、まずロジックを `fn foo(ui, args) -> ()`
