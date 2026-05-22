@@ -37,7 +37,11 @@ impl crate::app::App {
 
         let has_checked = !self.checked.is_empty();
         let checked_count = self.checked.len();
-        let nav: Option<PathBuf> = None;
+        let mut nav: Option<PathBuf> = None;
+        // 「フォルダに移動」で検索 (Ctrl+G / Ctrl+S) を抜けて nav するフラグ。
+        let mut nav_exits_search = false;
+        // 検索結果ビュー中だけ「フォルダに移動」を出す。
+        let in_search = self.global_search.active || self.favsearch.active;
         let mut close = false;
 
         // 記録済みの座標に固定表示
@@ -163,6 +167,11 @@ impl crate::app::App {
                                 open_folder_in_explorer(p);
                                 close = true;
                             }
+                            if in_search && ui.button("フォルダに移動").clicked() {
+                                nav = parent_folder_for_nav(p);
+                                nav_exits_search = nav.is_some();
+                                close = true;
+                            }
                             // ── アプリケーションで開く ──
                             ui.separator();
                             let _ = self.render_open_with_menu(ui, p, &mut close);
@@ -203,6 +212,14 @@ impl crate::app::App {
                                     .spawn();
                                 close = true;
                             }
+                            if in_search
+                                && !is_folder_context
+                                && ui.button("フォルダに移動").clicked()
+                            {
+                                nav = Some(native_nav_path(p));
+                                nav_exits_search = true;
+                                close = true;
+                            }
                             ui.separator();
                             if ui.button("ペースト (Ctrl+V)").clicked() {
                                 if let Some(ref folder) = self.current_folder {
@@ -236,6 +253,11 @@ impl crate::app::App {
                             }
                             if ui.button("フォルダを開く").clicked() {
                                 open_folder_in_explorer(p);
+                                close = true;
+                            }
+                            if in_search && ui.button("フォルダに移動").clicked() {
+                                nav = parent_folder_for_nav(p);
+                                nav_exits_search = nav.is_some();
                                 close = true;
                             }
                             // ── アプリケーションで開く (ZipFile/PdfFile) ──
@@ -284,6 +306,11 @@ impl crate::app::App {
                                 ctx.copy_text(path.to_string_lossy().to_string());
                                 close = true;
                             }
+                            if in_search && ui.button("フォルダに移動").clicked() {
+                                nav = Some(native_nav_path(path));
+                                nav_exits_search = true;
+                                close = true;
+                            }
                         }
                         GridItem::PdfPage {
                             pdf_path, page_num, ..
@@ -322,6 +349,11 @@ impl crate::app::App {
                             }
                             if ui.button("フォルダを開く").clicked() {
                                 open_folder_in_explorer(path);
+                                close = true;
+                            }
+                            if in_search && ui.button("フォルダに移動").clicked() {
+                                nav = parent_folder_for_nav(path);
+                                nav_exits_search = nav.is_some();
                                 close = true;
                             }
                             ui.separator();
@@ -366,6 +398,24 @@ impl crate::app::App {
         if close || !open {
             self.context_menu_idx = None;
             self.cached_handlers = None;
+        }
+
+        // 「フォルダに移動」: 検索結果から実フォルダへ飛ぶ操作なので、検索 (Ctrl+G /
+        // Ctrl+S) を抜けてから nav する。saved_folder の復帰で旧フォルダへ無駄な
+        // ロードが走らないよう、先に saved_folder を捨てる (toolbar_fav_nav と同じ手順)。
+        if nav_exits_search {
+            if self.global_search.active {
+                self.global_search.saved_folder = None;
+                self.close_global_search();
+            }
+            if self.favsearch.active {
+                self.favsearch.saved_folder = None;
+                self.close_favsearch();
+            }
+            // 検索から実フォルダへの意図的なジャンプなので、戻る履歴には積まない。
+            // 特に Ctrl+S は current_folder が合成パス (__search_results__) のままで、
+            // これを記録すると「戻る」で実在しないフォルダに飛んでしまう。
+            self.suppress_folder_nav_record_once = true;
         }
 
         nav
@@ -1231,12 +1281,27 @@ fn run_ps_script_inner(
 }
 
 /// ファイルの親フォルダをエクスプローラで開き、ファイルを選択する。
+/// 検索結果由来のパスは正規化形 (小文字・スラッシュ区切り) なので、グリッド側の
+/// 通常パスと揃うよう区切り文字をバックスラッシュに変換する。
+fn native_nav_path(path: &std::path::Path) -> PathBuf {
+    PathBuf::from(path.to_string_lossy().replace('/', "\\"))
+}
+
+/// 検索結果アイテムのパスから、ネイティブ形式 (バックスラッシュ区切り) の親フォルダを返す。
+fn parent_folder_for_nav(path: &std::path::Path) -> Option<PathBuf> {
+    Some(native_nav_path(path.parent()?))
+}
+
 fn open_folder_in_explorer(path: &std::path::Path) {
     #[cfg(windows)]
     {
+        // `explorer /select,` は区切り文字にバックスラッシュを要求する。検索結果由来の
+        // パスは正規化形 (スラッシュ区切り) のことがあり、その場合 explorer がパスを
+        // 解決できず既定フォルダ (OneDrive 等) を開いてしまう。
+        let native = path.to_string_lossy().replace('/', "\\");
         let _ = std::process::Command::new("explorer")
             .arg("/select,")
-            .arg(path.as_os_str())
+            .arg(&native)
             .spawn();
     }
     #[cfg(not(windows))]
