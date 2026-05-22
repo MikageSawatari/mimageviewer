@@ -2,11 +2,13 @@
 
 ## 0. このドキュメントの位置づけ
 
-- **提案ドキュメント (未採用)**。「動画フルスクリーンウィンドウを、メインウィンドウの
-  中で再生できるようにする」機能の実装方針を Claude Code がまとめたもの。
-- 同じ機能について **Codex でも別途検討中**であり、後で両案を比較するための叩き台。
-- 採用が決まるまで `docs/README.md` の索引には**登録しない**(競合提案のため)。
-  採用後に索引へ移し、必要なら `video-architecture.md` に統合する。
+- **実装済み (2026-05)**。「動画フルスクリーンウィンドウを、メインウィンドウの
+  中で再生できるようにする」機能を、提案検討から実装完了までまとめた作業ドキュメント。
+- **現行仕様の正典は [docs/video-architecture.md](video-architecture.md) の
+  「ウィンドウ内表示モード (in-window モード)」節**。仕様を確認したいだけならそちらを
+  読むこと。本書は設計検討の経緯と実装ハンドオフ (§11) を残す歴史記録。
+- §1〜§10 は提案・設計検討フェーズの記録。最終実装は WS_CHILD 方式 + Plan B
+  (デコーダ保持トグル) + 静止画 embedded 描画に収束した (詳細は §11)。
 - 調査時点のコード参照は関数名を主アンカーにしている (行番号は変動しうる)。
 - **2026-05-20 改訂**: Codex 案 (`docs/codex-main-window-native-video-plan.md`) と
   突き合わせ、初版 §2 の「WS_CHILD は DComp 制約で不可」という記述が**誤り**だったため
@@ -472,10 +474,17 @@ WS_CHILD 方式 (§2 (B)) で in-window 動画再生を実装し、Plan B (デ�
 | `039f4a06` | Codex review (request_id プロトコル): desired/actual モード分離 |
 | `d59255be` | Codex 再 review: 切替中の VST owner 同期抑止 + timeout 後の stale 成功反映 |
 | `0887b23d` | →ウィンドウ切替時に VST3 GUI を自動非表示 (残骸ウィンドウ防止) |
+| `285983e0` | docs: Plan B 完了マーク + タスク #15 計画記録 |
+| `a88458eb` | 静止画のウィンドウモード対応 (in-window 中は静止画を main ctx に embedded 描画) |
+| `3f371732` | Codex review 対応 (folder nav repaint / embedded 判定の許可リスト化) |
+| `2b66bb0e` | 静止画ホバーバーにウィンドウ/全画面トグルボタン追加 + 補正パネル重なり修正 |
+| `6fe64bdc` | Codex review 対応 (トグル後 repaint / 補正パネル ScrollArea min height) |
 
-正式 UI: `Settings.video_in_window_mode` (既定 false=fullscreen) + HUD の × の左の
-トグルボタン。Plan B は `source` (decoder/audio/clock) を保持したまま window +
-`NativeVideoPresenter` だけを作り直すため、トグルで音声が途切れない。
+正式 UI: `Settings.video_in_window_mode` (既定 false=fullscreen) + 動画 HUD の × の
+左のトグルボタン + 静止画ホバーバーの ⊞ トグルボタン。Plan B は `source`
+(decoder/audio/clock) を保持したまま window + `NativeVideoPresenter` だけを作り直す
+ため、トグルで音声が途切れない。静止画は描画先 (embedded ⇔ 専用 viewport) を
+切り替えるだけの同期トグル。
 
 **設計メモ (Plan B 実装で固まった要点)**:
 - `NativeVideoOutputCommand::SwitchWindowMode { request_id, in_window }` →
@@ -489,60 +498,28 @@ WS_CHILD 方式 (§2 (B)) で in-window 動画再生を実装し、Plan B (デ�
 - 黒 backdrop (`fullscreen_viewport_id()` の egui viewport) は presenter HWND が
   未確定の起動中だけ出す「起動カバー専用」。トグルでは出さない。
 
-### 11.2 次の作業 = タスク #15: 静止画のウィンドウモード対応
+### 11.2 タスク #15: 静止画のウィンドウモード対応 — 完了
 
-**目的**: in-window モード (`native_video_in_window_active == true`) のとき、
-静止画 (Image / ZipImage / PdfPage) を**メインウィンドウのクライアント領域内**に
-表示する (= グリッドを覆って全面表示)。現状は静止画が常に独立した全画面 egui
-viewport (`fullscreen_viewport_id()`) で表示されるため、in-window 動画 ⇔ 静止画を
-ホイール切替すると画面モードが全画面↔ウィンドウで切り替わって使いづらい。
+in-window モードのとき静止画 (Image / ZipImage / PdfPage / ZipSeparator) を専用
+viewport ではなくメインウィンドウの egui ctx に直接 (embedded) 描画する対応。
+コミット `a88458eb` / `3f371732` / `2b66bb0e` / `6fe64bdc`。実機検証済み。
 
-**採用方針 (Option A — メインウィンドウの egui に直接描画)**:
-全画面の静止画 UI は現状 `render_fullscreen_viewport` (`src/ui_fullscreen.rs`
-~L1204) の `ctx.show_viewport_immediate(fullscreen_viewport_id(), …)` クロージャ内で
-構築される。in-window モードではこの UI を**メインウィンドウの `ctx` に直接**描画
-する (別 viewport を作らない)。別ウィンドウを追跡する案は drag 追従ラグが出る /
-egui viewport を WS_CHILD 化できない、で却下。
+要点 (詳細は [video-architecture.md](video-architecture.md)「ウィンドウ内表示モード」節):
+- `render_fullscreen_viewport` の描画本体を `render_fs_body(ctx, embedded)`
+  クロージャ化し、embedded なら main ctx へ直接、それ以外は従来どおり
+  `show_viewport_immediate`。viewport 専用処理は `!embedded` でガード。
+- `App::update` は embedded 静止画フルスクリーン中グリッド UI を描かず early-return。
+- 静止画ホバーバーに ⊞ ウィンドウ/全画面トグルボタンを追加 (`toggle_still_window_mode`
+  = 同期フリップ)。
+- 副修正: 画像補正パネルのアクションボタン高さを実測してスクロール領域の重なりを解消。
 
-**実装ステップ**:
-1. `render_fullscreen_viewport` (`src/ui_fullscreen.rs` L1123-):
-   - 関数冒頭で `let main_ctx = ctx;` を控える。
-   - `show_viewport_immediate` のクロージャ本体を再利用可能な
-     `let mut render_fs_body = |ctx: &egui::Context, embedded: bool| { … };` に
-     ラップする (本体は既に `ctx` を使うのでパラメータ名を `ctx` にすれば本体は
-     ほぼ無改変)。
-   - dispatch: `native_video_in_window_active && fs_idx が静止画` →
-     `render_fs_body(main_ctx, true)`。それ以外 →
-     `main_ctx.show_viewport_immediate(fs_id, fs_builder, |vp_ctx, _| render_fs_body(vp_ctx, false))`。
-   - `embedded` のとき viewport 専用処理をガード: `need_show` の
-     `Visible(true)`/`Focus` 送信をスキップ、`close_requested → close_fs` を
-     スキップ (メインウィンドウの閉じる要求はアプリ終了であって全画面解除では
-     ない)。`CursorVisible` はメインウィンドウにも有効なので残す。
-   - 関数冒頭の 3 つの native-video backdrop early-return はそのまま (動画は
-     native presenter 経路、本タスクは静止画のみ)。
-2. メイン `update()` (`src/app.rs` ~L16819、グリッド描画 + `render_fullscreen_viewport`
-   呼び出し ~L17452): embedded 静止画フルスクリーン中はグリッド UI
-   (メニューバー/ツールバー/グリッド CentralPanel) を描かない (embedded 経路が
-   メイン `ctx` に画像を描くため)。native-video backdrop ブロック (~L17418) が
-   モデル。並列の分岐を足す。
-3. `keep_fullscreen_viewport_alive`: in-window 静止画では fs viewport を作らない
-   ので `fs_viewport_shown` は false のまま → cleanup は early-return。stale state
-   が無いか確認。
-4. エッジケース: in-window で 動画→静止画 ホイール (native child を畳んで静止画を
-   embedded 描画)、静止画→動画 (embedded UI を畳んで native child を作る)。embedded
-   時のカーソル / キーボード / Esc 閉じ / ナビゲーションが正しく動くこと。
+### 11.3 タスク #16: ドキュメント更新 — 完了
 
-**リスク**: `render_fullscreen_viewport` は最も事故の多い表示パイプライン
-(`docs/display-pipeline.md`) の ~1100 行関数。`embedded` フラグで viewport 専用
-処理だけを正確にガードすること。メイン update のグリッド抑止が通常のグリッド利用
-/ native 動画フルスクリーンを壊さないこと。実装後は一塊で Codex レビュー推奨。
-
-### 11.3 タスク #15 の後 = タスク #16: ドキュメント更新
-
-`docs/video-in-window-playback-claude.md` (本書) の §0 は「提案 / 未採用」のまま
-なので実装済み仕様へ書き換える。`docs/video-architecture.md`・`docs/spec.md`・
-`docs/keymap-spec.md` (従来の Shift+Enter 外部プレイヤー記述)・`htdocs` マニュアル/
-製品ページを実装後仕様へ寄せる。Codex 再レビュー P3 として指摘済み。
+本書 §0 を「実装済み」へ更新。`docs/video-architecture.md` に
+「ウィンドウ内表示モード (in-window モード)」節を新設し現行仕様の正典とした。
+`docs/spec.md` §4.1、`htdocs` のマニュアル (video.html / fullscreen.html)・
+製品ページ (index.html) を実装後仕様へ更新。`docs/keymap-spec.md` の Shift+Enter
+記述はウィンドウモードと無関係 (= 外部プレイヤーのまま) で変更不要だった。
 
 ### 11.4 ビルド・レビュー手順
 

@@ -1444,6 +1444,82 @@ cloaked にしていた場合は、`close_fullscreen` 内で先に uncloak し�
   presenter thread 内の遅延 init エラーは別系統 (`consume_native_init_error`)
   で `tick()` 中に取り込む。
 
+## ウィンドウ内表示モード (in-window モード)
+
+フルスクリーン表示には 2 つの配置モードがあり、`Settings.video_in_window_mode`
+(既定 false) で切り替える。両モードは「動画 native presenter の置き場所」と
+「静止画フルスクリーンの egui 描画先」の両方に効く。
+
+| | フルスクリーンモード (既定) | in-window モード |
+| --- | --- | --- |
+| 動画 presenter HWND | ボーダレス `WS_POPUP`、モニタ全面 | `WS_CHILD`、main HWND のクライアント矩形に重ねる |
+| 静止画フルスクリーン | 専用の egui フルスクリーン viewport | main ウィンドウの egui ctx に直接描画 (embedded) |
+| main HWND | presenter 起動まで cloak | cloak しない (子が main に重なる) |
+
+設定は動画・静止画で共有する単一の「in-window モード」フラグ。動画 HUD のトグル
+ボタンと静止画ホバーバーの ⊞ トグルボタンはどちらもこの 1 つの設定を切り替える。
+
+### `native_video_in_window_active` — 実モードフラグ
+
+`Settings.video_in_window_mode` は「ユーザー設定」、`App.native_video_in_window_active`
+は「いま実際に画面に出ているモード」を表す。両者は普段一致するが、動画のライブ
+切り替え中 (Plan B、下記) だけ一時的にずれる。毎フレームの分岐 (動画 presenter /
+静止画 embedded / cloak / VST owner) は **実モードフラグ**を見る。
+
+`open_fullscreen` は入場時に全アイテム種別で `native_video_in_window_active =
+settings.video_in_window_mode` を確定する。これにより in-window 動画 ⇔ 静止画を
+ホイールで往復してもモードが一貫する。
+
+### 動画のライブ切り替え (Plan B = デコーダ保持トグル)
+
+動画再生中にモードを切り替えるとき、`source` (デコーダ / 音声 / clock) を生かした
+まま **window + `NativeVideoPresenter` だけを作り直す**。close+reopen 方式 (Plan A)
+で起きていた音声途切れ・別フレーム混入を回避するため。
+
+- `toggle_video_window_mode` ([src/app/native_video.rs](../src/app/native_video.rs))
+  が `Settings.video_in_window_mode` をフリップし、`request_id` 付きの
+  `NativeVideoOutputCommand::SwitchWindowMode` を presenter スレッドへ送る。
+- presenter スレッド (`run_native_video_output` in [src/video/mod.rs](../src/video/mod.rs))
+  が hidden な新 window + presenter を組み立て、状態 (再生位置 / overlay / VST /
+  checked / SAR) を移してから旧 window と入れ替え、`WindowModeSwitched`
+  / `WindowModeSwitchFailed` を `request_id` 付きで返す。
+- App は `request_id` で遅延 / 連打イベントを弾く。`native_video_in_window_active`
+  は切り替え進行中は据え置き、`WindowModeSwitched` 受信時に `apply_window_mode_switched`
+  で更新する (= 旧 child HWND を fullscreen / VST owner と誤認しない)。
+- 切り替え進行中 (`native_video_mode_switch` Some) は `ensure_native_video_front` /
+  VST owner 同期 / VST availability を全停止する。
+
+### 静止画の embedded 描画
+
+in-window モードのとき、静止画 (Image / ZipImage / PdfPage / ZipSeparator) は
+**専用 viewport を作らず main ウィンドウの egui ctx に直接** CentralPanel を描く。
+
+- 判定: `App::fullscreen_embedded_still_active()`
+  ([src/ui_fullscreen.rs](../src/ui_fullscreen.rs)) = `native_video_in_window_active`
+  かつ `fullscreen_idx` が静止画系アイテム。
+- `render_fullscreen_viewport` は描画本体を `render_fs_body(ctx, embedded)`
+  クロージャにまとめ、embedded のときは main ctx に直接、それ以外は従来どおり
+  `show_viewport_immediate` で専用 viewport に描く。viewport 専用処理
+  (Visible/Focus 送信・main ウィンドウの close_requested・別キューの IME 更新・
+  `fs_viewport_shown`) は `!embedded` でガードする。
+- `App::update` は embedded 静止画フルスクリーン描画中、グリッド UI
+  (メニューバー / ツールバー / グリッド) を描かず early-return する
+  (= main ctx に CentralPanel が二重に積まれるのを防ぐ。native 動画 backdrop
+  ブロックと同じ構造)。
+- 動画は本経路を通らない (= native presenter で描画)。静止画専用。
+
+### 静止画モードの同期トグル
+
+静止画は egui の描画先を切り替えるだけで非同期の presenter 再構築が要らないため、
+`toggle_still_window_mode` ([src/app/native_video.rs](../src/app/native_video.rs))
+が `video_in_window_mode` と `native_video_in_window_active` を**同期フリップ**し、
+次フレームの `render_fullscreen_viewport` が新モードで描画し直す。embedded → 専用
+viewport へ切り替わる間に新 viewport がフォーカスを取るまで数フレーム main に
+フォーカスが残るため、フォーカス起因の自動クローズを抑止する grace を張り直す。
+
+トグル UI: 動画は native HUD のトグルボタン (× の左)、静止画は egui ホバーバーの
+⊞ ボタン (× の左)。
+
 ## 設定との関係
 
 整理後、削除する設定項目:
@@ -1459,6 +1535,9 @@ cloaked にしていた場合は、`close_fullscreen` 内で先に uncloak し�
 - `Settings.video_resume_position` (シーク位置の永続化、ファイル単位)
 - `Settings.video_hw_decode` (HW デコードを試みるかのフラグ、トラブルシュート用)
 - `Settings.video_deinterlace` (Off / Auto / On。CPU 経路で FFmpeg `bwdif=mode=send_frame` を適用。Auto は frame interlaced flag と stream field_order を参照)
+- `Settings.video_in_window_mode` (フルスクリーン / in-window モードの切り替え。
+  既定 false = フルスクリーン。動画・静止画で共有する単一フラグ。詳細は
+  「ウィンドウ内表示モード (in-window モード)」節)
 
 ### ループ再生 4 段階モードの実装メモ
 
