@@ -17551,6 +17551,14 @@ impl eframe::App for App {
                         self.chain_folder_nav_if_pending();
                     }
                 }
+                // グリッド描画 tail を飛ばすので tail の「pending 中 repaint」も
+                // 失われる。folder nav worker は別スレッドで完了し start_folder_nav は
+                // repaint を要求しないため、静止画フルスクリーンで egui が寝ると
+                // 結果を次の入力まで回収できない。走行中は明示的に repaint する
+                // (Codex P2、tail の folder_nav_pending repaint と同じ意図)。
+                if self.folder_nav_pending.is_some() {
+                    ctx.request_repaint();
+                }
                 return;
             }
         }

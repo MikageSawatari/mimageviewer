@@ -2320,12 +2320,26 @@ impl App {
     /// 動画は native presenter (独立 / 子 HWND) 経路なのでここでは除外する。
     /// これにより in-window 動画 ⇔ 静止画をホイールで往復しても画面モードが
     /// 全画面↔ウィンドウで切り替わらず、一貫して main ウィンドウ内に収まる。
+    ///
+    /// 判定はフルスクリーンで表示しうる静止画系アイテム
+    /// (Image / ZipImage / PdfPage / ZipSeparator) の **明示的な許可リスト**で行う。
+    /// 「非 Video なら何でも embedded」にすると、`fullscreen_idx` が範囲外や
+    /// コンテナ (Folder/ZipFile/PdfFile) を指す異常時に embedded 扱いになり、
+    /// `update()` がグリッド描画を抑止して黒画面に閉じ込められる恐れがあるため。
     #[cfg(windows)]
     pub(crate) fn fullscreen_embedded_still_active(&self) -> bool {
         self.native_video_in_window_active
-            && self
-                .fullscreen_idx
-                .is_some_and(|idx| !matches!(self.items.get(idx), Some(GridItem::Video(_))))
+            && self.fullscreen_idx.is_some_and(|idx| {
+                matches!(
+                    self.items.get(idx),
+                    Some(
+                        GridItem::Image(_)
+                            | GridItem::ZipImage { .. }
+                            | GridItem::PdfPage { .. }
+                            | GridItem::ZipSeparator { .. }
+                    )
+                )
+            })
     }
 
     #[cfg(windows)]
