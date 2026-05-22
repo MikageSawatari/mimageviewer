@@ -447,14 +447,15 @@ Codex 案はこの WS_CHILD を第一候補に据え、child+DComp の実機ス�
 
 ---
 
-## 11. 実装状況と引き継ぎ (2026-05-21 / コンテキスト compaction 用)
+## 11. 実装状況と引き継ぎ (2026-05-22 更新 / コンテキスト compaction 用)
 
 この §11 は実装セッションの状況メモ。compaction 後はまずここを読むこと。
 
 ### 11.1 完了済み (master にコミット済み、push はまだ)
 
-WS_CHILD 方式 (§2 (B)) を採用して実装。in-window 動画再生 + ウィンドウ/全画面
-トグルまで動作している。コミット (古い順):
+WS_CHILD 方式 (§2 (B)) で in-window 動画再生を実装し、Plan B (デコーダ保持トグル)
+まで完了。実機検証済み (音声途切れ無し・ちらつき無し・VST 自動非表示・連打 OK)。
+コミット (古い順):
 
 | commit | 内容 |
 |---|---|
@@ -463,97 +464,85 @@ WS_CHILD 方式 (§2 (B)) を採用して実装。in-window 動画再生 + ウ�
 | `2a90d3fb` | presenter ループのアイドル待機を message 対応化 (resize 追従改善) |
 | `c95cc0a1` | main リサイズ枠でのカーソルちらつき修正 |
 | `09bda6a8` | Codex review #2 対応 (VST panel scope-out、cursor-gate idle tick) |
-| `10e3ed13` | ウィンドウ/全画面トグル機能 (永続設定 + HUD ボタン、Plan A = close+reopen) |
+| `10e3ed13` | ウィンドウ/全画面トグル機能 (Plan A = close+reopen) |
 | `e969f7db` | Codex review #3 対応 (toggle 後の stale event、VST per-frame 公開) |
+| `cf2a67cb` | **Plan B**: デコーダ保持トグル (`SwitchWindowMode`、window+presenter のみ再構築) |
+| `33eeb398` | Codex review (Plan B) #1-3 対応 (fence 0 化 / 失敗イベント / overlay prime) |
+| `5754c257` | →全画面トグル時の白/黒フラッシュ修正 (黒 backdrop を起動カバー専用化) |
+| `039f4a06` | Codex review (request_id プロトコル): desired/actual モード分離 |
+| `d59255be` | Codex 再 review: 切替中の VST owner 同期抑止 + timeout 後の stale 成功反映 |
+| `0887b23d` | →ウィンドウ切替時に VST3 GUI を自動非表示 (残骸ウィンドウ防止) |
 
-実機検証済み: in-window 再生・最大化/リサイズ追従・左右クリック・キーボード・
-トグルボタン・モード永続化、すべて OK。env 変数ゲートは廃止済みで、
-`Settings.video_in_window_mode` (既定 false=fullscreen) + HUD の × の左のトグル
-ボタンが正式 UI。
+正式 UI: `Settings.video_in_window_mode` (既定 false=fullscreen) + HUD の × の左の
+トグルボタン。Plan B は `source` (decoder/audio/clock) を保持したまま window +
+`NativeVideoPresenter` だけを作り直すため、トグルで音声が途切れない。
 
-**既知の不満点 (= 次の作業の動機)**: トグル時に decoder/audio を再起動するため、
-切り替えのたびに **音声が一瞬途切れ + 別フレームが一瞬混入** する (Plan A の代償)。
+**設計メモ (Plan B 実装で固まった要点)**:
+- `NativeVideoOutputCommand::SwitchWindowMode { request_id, in_window }` →
+  presenter スレッドが window+presenter を再構築 → `WindowModeSwitched
+  { request_id, in_window }` / `WindowModeSwitchFailed { request_id }` を返す。
+- App は `request_id` で遅延/連打イベントを弾く。`native_video_in_window_active`
+  (= 実モード) はトグル時に触らず、`WindowModeSwitched` 受信時に更新する
+  (= 旧 child HWND を fullscreen/VST owner と誤認しないため)。
+- 切替進行中 (`native_video_mode_switch` Some) は `ensure_native_video_front` /
+  VST owner 同期 / VST availability を全停止する。
+- 黒 backdrop (`fullscreen_viewport_id()` の egui viewport) は presenter HWND が
+  未確定の起動中だけ出す「起動カバー専用」。トグルでは出さない。
 
-### 11.2 次の作業 = Plan B: デコーダ保持トグル (タスク #14)
+### 11.2 次の作業 = タスク #15: 静止画のウィンドウモード対応
 
-**presenter スレッド (`run_native_video_output` in `src/video/mod.rs`) で、
-`source` (decoder 出力チャネル/clock) を保持したまま `window` + `presenter`
-(HWND/DComp) だけを作り直す。** これで decoder/audio は無傷 → 音声途切れ・
-フレーム混入が消える。Codex も方針を支持済み (下記6点の対応込み)。
+**目的**: in-window モード (`native_video_in_window_active == true`) のとき、
+静止画 (Image / ZipImage / PdfPage) を**メインウィンドウのクライアント領域内**に
+表示する (= グリッドを覆って全面表示)。現状は静止画が常に独立した全画面 egui
+viewport (`fullscreen_viewport_id()`) で表示されるため、in-window 動画 ⇔ 静止画を
+ホイール切替すると画面モードが全画面↔ウィンドウで切り替わって使いづらい。
 
-#### `run_native_video_output` の構造 (Explore 済み、行番号は目安)
+**採用方針 (Option A — メインウィンドウの egui に直接描画)**:
+全画面の静止画 UI は現状 `render_fullscreen_viewport` (`src/ui_fullscreen.rs`
+~L1204) の `ctx.show_viewport_immediate(fullscreen_viewport_id(), …)` クロージャ内で
+構築される。in-window モードではこの UI を**メインウィンドウの `ctx` に直接**描画
+する (別 viewport を作らない)。別ウィンドウを追跡する案は drag 追従ラグが出る /
+egui viewport を WS_CHILD 化できない、で却下。
 
-- `window` = `let mut` (`NativeVideoWindow::create`、~L1455-1470、mode は
-  `Child{rect}` / `Borderless{rect}`)。`width`/`height` は `config.rect` から (~L1452)。
-- `presenter` = `let mut` (`NativeVideoPresenter::new(NativePresenterConfig{...})`、
-  ~L1493-1502)。`hud_overlay_enabled`/`hud_event_tx` は ~L1484-1492 で決定。
-- `source` = `let mut PresenterSourceState::new(SwitchSourcePayload{video_rx,
-  clock, engine_event_tx, ...})` (~L1630)。
-- post-creation: `set_editor_hwnds_snapshot`/`set_main_hwnd_for_raise_check`
-  (~L1528)、`set_overlay_vst3_available`/`set_overlay_checked` (~L1605)。
-- `publish_presenter_window` nested fn (~L1540-1604): `show_and_raise` +
-  in-window なら `SetFocus`+`set_in_window_video_child` + `hwnd_out`/`hud_hwnd_out`
-  store。`config.in_main_window` を読むので Plan B では現モードを渡すよう要改修。
-- main loop `while !cancel...` (~L1741)。command drain
-  `while let Ok(command) = command_rx.try_recv()` (~L1882) の match。
-- **`SwitchSource{payload}` アーム (~L2002-2110) が「mid-thread 差し替え」の
-  テンプレート** — `source` を入れ替える。Plan B の `SwitchWindowMode` は
-  その鏡像 (window+presenter を入れ替え)。
-- thread 終了 cleanup ~L3155、`window.destroy()` ~L3169。
-- `config` は read-only 借用。`config.in_main_window` を読む箇所: 窓生成 (~L1457)、
-  `publish_presenter_window` (~L1556)、親矩形 poll (~L2118)。これらを可変ローカル
-  `cur_in_window` に置換する必要あり。
-- 既存の in-window 補助コード: `reflow_child_to_parent_client` (親クライアント
-  矩形 poll で child を resize)、`sleep_until_message` (message 対応待機)、
-  `native_window.rs` の `IN_WINDOW_VIDEO_CHILD` static + サブクラス。
+**実装ステップ**:
+1. `render_fullscreen_viewport` (`src/ui_fullscreen.rs` L1123-):
+   - 関数冒頭で `let main_ctx = ctx;` を控える。
+   - `show_viewport_immediate` のクロージャ本体を再利用可能な
+     `let mut render_fs_body = |ctx: &egui::Context, embedded: bool| { … };` に
+     ラップする (本体は既に `ctx` を使うのでパラメータ名を `ctx` にすれば本体は
+     ほぼ無改変)。
+   - dispatch: `native_video_in_window_active && fs_idx が静止画` →
+     `render_fs_body(main_ctx, true)`。それ以外 →
+     `main_ctx.show_viewport_immediate(fs_id, fs_builder, |vp_ctx, _| render_fs_body(vp_ctx, false))`。
+   - `embedded` のとき viewport 専用処理をガード: `need_show` の
+     `Visible(true)`/`Focus` 送信をスキップ、`close_requested → close_fs` を
+     スキップ (メインウィンドウの閉じる要求はアプリ終了であって全画面解除では
+     ない)。`CursorVisible` はメインウィンドウにも有効なので残す。
+   - 関数冒頭の 3 つの native-video backdrop early-return はそのまま (動画は
+     native presenter 経路、本タスクは静止画のみ)。
+2. メイン `update()` (`src/app.rs` ~L16819、グリッド描画 + `render_fullscreen_viewport`
+   呼び出し ~L17452): embedded 静止画フルスクリーン中はグリッド UI
+   (メニューバー/ツールバー/グリッド CentralPanel) を描かない (embedded 経路が
+   メイン `ctx` に画像を描くため)。native-video backdrop ブロック (~L17418) が
+   モデル。並列の分岐を足す。
+3. `keep_fullscreen_viewport_alive`: in-window 静止画では fs viewport を作らない
+   ので `fs_viewport_shown` は false のまま → cleanup は early-return。stale state
+   が無いか確認。
+4. エッジケース: in-window で 動画→静止画 ホイール (native child を畳んで静止画を
+   embedded 描画)、静止画→動画 (embedded UI を畳んで native child を作る)。embedded
+   時のカーソル / キーボード / Esc 閉じ / ナビゲーションが正しく動くこと。
 
-#### 実装ステップ
+**リスク**: `render_fullscreen_viewport` は最も事故の多い表示パイプライン
+(`docs/display-pipeline.md`) の ~1100 行関数。`embedded` フラグで viewport 専用
+処理だけを正確にガードすること。メイン update のグリッド抑止が通常のグリッド利用
+/ native 動画フルスクリーンを壊さないこと。実装後は一塊で Codex レビュー推奨。
 
-1. 窓+presenter 生成を再利用可能な関数へ抽出。モード/rect/width/height を可変化。
-2. `NativeVideoOutputCommand::SwitchWindowMode { in_window: bool }` を新設
-   (`src/video/mod.rs` の `NativeVideoOutputCommand` enum)。
-3. presenter スレッドの command match に `SwitchWindowMode` アームを追加 →
-   新モードの rect を計算 (in-window=`GetClientRect(owner)`、fullscreen=
-   `GetMonitorInfoW`) → 窓+presenter 再構築 → `cur_in_window`/width/height 更新 →
-   hwnd 再 publish → overlay 状態を新 presenter に再適用。
-4. `VideoPlayer` に `switch_window_mode(in_window)` を追加 (command 送信)。
-5. App の `toggle_video_window_mode` (`src/app/native_video.rs`) を
-   close+reopen から「設定フリップ + `native_video_in_window_active` フリップ +
-   `switch_window_mode` 送信」に置換。
+### 11.3 タスク #15 の後 = タスク #16: ドキュメント更新
 
-#### Codex レビューで指摘された必須対応 6点 (Plan B 実装時に織り込む)
-
-1. **旧窓 destroy が `WM_QUIT` を post** し presenter ループが終了してしまう
-   (`NativeVideoWindow` は `post_quit_on_destroy: true`、`WM_DESTROY` で
-   `PostQuitMessage`)。再構築用に「WM_QUIT を出さない destroy」経路が必要
-   (`NativeVideoWindow` に setter か silent-destroy メソッド)。
-2. **`present_retire` を旧 presenter で解決してから drop** する。retire は
-   `copy_fence_value` keyed で fence は旧 presenter 固有。`SwitchSource` ハンドラ
-   と同じ drain を再構築前に。`shared_texture_cache` も旧コピー完了後にクリア。
-3. **二段階スワップ推奨**: 新 (hidden) を先に作ってから旧を破棄 →
-   フラッシュ耐性 + D3D/DComp 生成失敗時のロールバック。
-4. HWND 中途変更には **App 側の明示クリーンアップ**が要る: fullscreen owner /
-   HUD 登録の解除、`native_video_front_synced_hwnd` リセット、VST owner の
-   mode 対応 (`app.rs` の `native_owner_hwnd` sync ~L15993 が
-   `!native_video_in_window_active` で未ガード)。
-5. 毎フレーム cloak 判定だけでは in-window→fullscreen で **1フレーム cloak 漏れ**
-   (旧 child HWND が非0のまま)。旧 teardown 前に `hwnd_out=0` publish + repaint
-   要求で明示シーケンス。
-6. 再構築後に **stale なイベント/コマンドを drain** (`presenter_event_rx`、
-   HUD raise deadline、cursor polling 状態)。同 `source_epoch` なので epoch
-   チェックでは防げない。同一モードへの `SwitchWindowMode` は no-op。
-
-ビデオキュー/音声: 再生中はデコーダが `try_send` (満杯時 drop) なので音声は
-継続、映像は一瞬フリーズ後にキャッチアップするだけ — 永続問題にはならない
-(Codex 確認済み)。
-
-### 11.3 Plan B の後
-
-- **タスク #15: 静止画のウィンドウモード対応**。動画⇔静止画をホイール切替した
-  とき、静止画は fullscreen のみで画面モードが切り替わり使いづらい。静止画表示も
-  in-window 対応させる (`video_in_window_mode` 設定時は静止画もメインウィンドウ内)。
-- **タスク #16: ドキュメント更新** (`docs/video-architecture.md`・`docs/spec.md`・
-  `htdocs` マニュアル/製品ページ)。Plan B + 静止画対応が固まってから。
+`docs/video-in-window-playback-claude.md` (本書) の §0 は「提案 / 未採用」のまま
+なので実装済み仕様へ書き換える。`docs/video-architecture.md`・`docs/spec.md`・
+`docs/keymap-spec.md` (従来の Shift+Enter 外部プレイヤー記述)・`htdocs` マニュアル/
+製品ページを実装後仕様へ寄せる。Codex 再レビュー P3 として指摘済み。
 
 ### 11.4 ビルド・レビュー手順
 
@@ -563,7 +552,7 @@ WS_CHILD 方式 (§2 (B)) を採用して実装。in-window 動画再生 + ウ�
 - 実機検証はユーザーが行う (env 変数なしで `target/release/mimageviewer-core.exe`)。
 - 一塊ごとに Codex レビュー: `codex exec --sandbox read-only -o <file>
   "Review the changes since <commit>..." < /dev/null`。次回基準コミットは
-  `e969f7db` (= Plan B のコミット群をレビュー)。
+  `0887b23d` (= タスク #15 のコミット群をレビュー)。
 
 ### 11.5 未コミットの leftover (注意)
 
