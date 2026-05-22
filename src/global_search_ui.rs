@@ -36,7 +36,7 @@ use crate::indexer_manager::SearchHandle;
 pub struct GlobalSearchFilters {
     /// None = 登録済み全お気に入りを対象。Some(id) なら単一 favorite に限定。
     pub favorite: Option<Uuid>,
-    /// None = 全タイプ (folder/image/zip/pdf)。Some(k) で単一種別に限定。
+    /// None = 全タイプ (画像/PDF/動画)。Some(k) で単一種別に限定。
     pub kind: Option<IndexKind>,
     /// 検索対象ソース。既定は All (= 全ソース OR)。
     pub target: SearchTarget,
@@ -116,11 +116,11 @@ pub const TARGET_CHOICES: &[TargetChoice] = &[
     TargetChoice::Only(SourceKind::Tags),
 ];
 
+// アイテム検索 (Ctrl+G) の対象は 画像 / PDF / 動画。フォルダ・ZIP はコンテナなので
+// コンテナ検索 (Ctrl+S) 側で扱う (docs/search-container-item-redesign.md §3.2, §6)。
 pub const KIND_CHOICES: &[Option<IndexKind>] = &[
     None,
-    Some(IndexKind::Folder),
     Some(IndexKind::Image),
-    Some(IndexKind::Zip),
     Some(IndexKind::Pdf),
     Some(IndexKind::Video),
 ];

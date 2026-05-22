@@ -541,10 +541,11 @@ fn apply_single_change(
             // candidate が作れない (= ファイルが存在しない) ケースは
             //   - rename 元 (search_watcher が From を Remove にマップし損ねた場合)
             //   - Upsert 直後に削除された race
-            //   - ファイル種別が対象外 (非画像/ZIP/PDF)
+            //   - ファイル種別が対象外 (非画像/PDF/動画 — ZIP もここに含む §3.2)
             // のいずれか。前 2 者では旧エントリを残すと索引がゴミになる。
             // 安全側に倒し、候補が作れなければ Remove 経路にフォールバックする。
-            // (種別外は DB に元から入らない想定なので delete 空振りになるだけ)。
+            // (種別外は通常 DB に行が無く delete 空振りだが、ZIP は旧版が入れた
+            //  行をこの経路で掃除できる)。
             let Some(cand) = build_candidate_from_path(&path, key.clone()) else {
                 let ingest_stats = match session.apply(
                     vec![],
@@ -607,16 +608,16 @@ fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let kind = if ext == "zip" {
-        search_walker::CandidateKind::Zip
-    } else if ext == "pdf" {
+    // ZIP はアイテム索引の対象外 (§3.2)。ext==zip は None を返し、呼び出し側の
+    // upsert→remove フォールバックで既存 ZIP doc が索引から掃除される。
+    let kind = if ext == "pdf" {
         search_walker::CandidateKind::Pdf
     } else if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
         search_walker::CandidateKind::Video
     } else if crate::folder_tree::is_recognized_image_ext(&ext) {
         search_walker::CandidateKind::Image
     } else {
-        // 非対応ファイルは無視 (typography 違い、notify が .tmp 等を拾う場合も)
+        // 非対応ファイルは無視 (ZIP / typography 違い / notify が .tmp 等を拾う場合)
         return None;
     };
     // Apple Double 除外
@@ -690,7 +691,7 @@ mod tests {
         fs::create_dir_all(&fav_root).unwrap();
         write_image(&fav_root, "a.jpg");
         write_image(&fav_root, "b.jpg");
-        write_image(&fav_root, "archive.zip");
+        write_image(&fav_root, "c.jpg");
 
         let fav_id = Uuid::new_v4();
         let handle = spawn(

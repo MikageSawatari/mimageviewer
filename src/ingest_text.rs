@@ -378,14 +378,6 @@ pub fn build_per_source_for_pdf(display_name: &str, info_text: &str) -> PerSourc
     }
 }
 
-/// ファイル名のみ (ZIP など、メタを展開しないフォールバック) の最小版。
-pub fn build_per_source_name_only(display_name: &str) -> PerSourceText {
-    PerSourceText {
-        name: normalize_for_match(display_name),
-        ..PerSourceText::default()
-    }
-}
-
 fn append_exif(out: &mut String, info: &crate::exif_reader::ExifInfo) {
     for (_group, tags) in &info.sections {
         for (_name, value) in tags {

@@ -14,9 +14,10 @@
 //! ## 本モジュールのスコープ (§16 step 6)
 //!
 //! - FS walker + 3-way diff の計算のみ
-//! - ZIP 内エントリの列挙や、メタ抽出・Tantivy commit は **このモジュールの責務外**
+//! - メタ抽出・Tantivy commit は **このモジュールの責務外**
 //!   (Ingest Worker = §16 step 9 に切り出す)
-//! - ZIP ファイルは「1 ZIP = 1 ingest 候補」として扱い、内容が変わったかは mtime/size で判定する
+//! - ZIP はアイテム索引 (Ctrl+G) の対象外なので候補に含めない
+//!   (docs/search-container-item-redesign.md §3.2)。ZIP のコンテナ検索は Ctrl+S 専属。
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,7 +31,7 @@ use crate::indexer_progress::ProgressReporter;
 use crate::io_semaphore::{GlobalIoSemaphore, IoPriority};
 use crate::search_index_db::normalize_path;
 
-/// 1 候補ファイル (通常画像 / ZIP / PDF)。
+/// 1 候補ファイル (通常画像 / PDF / 動画)。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CandidateFile {
     /// 絶対パス (表示・I/O 用)
@@ -46,8 +47,6 @@ pub struct CandidateFile {
 pub enum CandidateKind {
     /// ネイティブ対応画像 (Susie プラグイン拡張含む)
     Image,
-    /// ZIP アーカイブ (中身は Ingest Worker が後で展開)
-    Zip,
     /// PDF (v1 は document info のみ ingest、本文は対象外)
     Pdf,
     /// 動画 (ファイル名 + mXD XMP + sidecar tags + container metadata)
@@ -261,9 +260,10 @@ fn walk_dir_recursive(
             .unwrap_or("")
             .to_ascii_lowercase();
 
-        let kind = if ext == "zip" {
-            CandidateKind::Zip
-        } else if ext == "pdf" {
+        // ZIP はアイテム索引 (Ctrl+G) の対象外。候補に含めないことで、既存の ZIP doc は
+        // 3-way diff で「FS になし + DB あり」と判定され to_delete に落ちて Tantivy から
+        // 消える (docs/search-container-item-redesign.md §3.2)。
+        let kind = if ext == "pdf" {
             CandidateKind::Pdf
         } else if folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) {
             CandidateKind::Video
@@ -382,19 +382,22 @@ mod tests {
         make_file(&root, "a.jpg", b"xx");
         make_file(&root, "b.png", b"yy");
         make_file(&root, "ignore.txt", b"zz");
+        // ZIP はアイテム索引の対象外なので候補にならない (§3.2)
         make_file(&root, "archive.zip", b"PK");
         make_file(&root, "doc.pdf", b"%PDF");
         make_file(&root, "clip.mp4", b"fake mp4");
 
         let r = scan_sync(fav, &root, &db);
-        assert_eq!(r.total_scanned, 5, "jpg+png+zip+pdf+mp4 の 5 つ");
-        assert_eq!(r.to_ingest.len(), 5);
+        assert_eq!(
+            r.total_scanned, 4,
+            "jpg+png+pdf+mp4 の 4 つ (zip/txt は除外)"
+        );
+        assert_eq!(r.to_ingest.len(), 4);
         assert_eq!(r.unchanged, 0);
         assert!(r.to_delete.is_empty());
 
         let kinds: Vec<_> = r.to_ingest.iter().map(|c| c.kind).collect();
         assert!(kinds.contains(&CandidateKind::Image));
-        assert!(kinds.contains(&CandidateKind::Zip));
         assert!(kinds.contains(&CandidateKind::Pdf));
         assert!(kinds.contains(&CandidateKind::Video));
     }

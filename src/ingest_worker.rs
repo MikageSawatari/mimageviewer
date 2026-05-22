@@ -34,8 +34,9 @@
 //!
 //! ## v1 スコープ
 //!
-//! - FS 上の画像 / ZIP ファイル自体 / PDF ファイル自体の ingest
-//! - ZIP 内エントリの展開 ingest は **本モジュールの責務外** (§7.7 の ZIP 専用 context で別途)
+//! - FS 上の画像 / PDF ファイル / 動画ファイルの ingest
+//! - ZIP はアイテム索引 (Ctrl+G) の対象外。walker が候補に含めないので本モジュールにも
+//!   到達しない (docs/search-container-item-redesign.md §3.2)
 //! - PDFium document info の取り込みは §16 step 17 (別モジュール)
 
 use std::path::PathBuf;
@@ -240,7 +241,6 @@ impl<'a> IngestSession<'a> {
             let _permit = io_sem.acquire(priority);
             let built = match cand.kind {
                 CandidateKind::Image => self.build_doc_for_image(&cand),
-                CandidateKind::Zip => self.build_doc_for_name_only(&cand),
                 CandidateKind::Pdf => self.build_doc_for_pdf(&cand),
                 CandidateKind::Video => self.build_doc_for_video(&cand),
             };
@@ -318,24 +318,6 @@ impl<'a> IngestSession<'a> {
         let norms = crate::ingest_text::build_per_source_for_pdf(&name, &info_text);
         // PDF は container="fs" 扱い (v1)
         self.build_doc(cand, Container::Fs, IndexKind::Pdf, norms)
-    }
-
-    /// ZIP / PDF の最小 ingest (ファイル名 + 基本メタのみ)。
-    fn build_doc_for_name_only(&self, cand: &CandidateFile) -> Result<IndexDoc, String> {
-        let name = cand
-            .abs_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("")
-            .to_string();
-        let norms = crate::ingest_text::build_per_source_name_only(&name);
-        let (container, kind) = match cand.kind {
-            CandidateKind::Zip => (Container::Zip, IndexKind::Zip),
-            CandidateKind::Pdf => (Container::Fs, IndexKind::Pdf),
-            CandidateKind::Video => (Container::Fs, IndexKind::Video),
-            _ => (Container::Fs, IndexKind::Image),
-        };
-        self.build_doc(cand, container, kind, norms)
     }
 
     /// IndexDoc ビルド。SQLite には触れず Tantivy 投入用の構造体のみ返す。
@@ -537,52 +519,6 @@ mod tests {
         let searcher = fts.searcher();
         let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
         assert_eq!(hits.len(), 0);
-    }
-
-    #[test]
-    fn zip_file_ingested_as_container() {
-        let (tmp, meta, fts) = setup();
-        let fav = Uuid::new_v4();
-        let session = IngestSession::new(fav, tmp.path().to_path_buf(), &meta, &fts);
-        let writer = crate::fts_writer_dispatcher::FtsWriterDispatcher::start(
-            fts.writer().unwrap(),
-            std::sync::Arc::clone(&fts),
-        );
-        let sem = GlobalIoSemaphore::new(2);
-        let cancel = AtomicBool::new(false);
-
-        let mut cand = make_image_file(tmp.path(), "album.zip");
-        cand.kind = CandidateKind::Zip;
-        let key = cand.key.clone();
-        let stats = session
-            .apply(
-                vec![cand],
-                vec![],
-                &writer,
-                &sem,
-                IoPriority::Low,
-                &cancel,
-                None,
-            )
-            .unwrap();
-        assert_eq!(stats.ingested_ok, 1);
-        let row = meta.get(&key).unwrap().unwrap();
-        assert_eq!(row.status, FileStatus::Ok);
-        // ZIP ファイル名が Tantivy 側 (`name` STORED) でヒットすること
-        let favs = [fav];
-        let q = fts_index::build_bigram_and_query(
-            fts.fields(),
-            &["album"],
-            &crate::fts_index::QueryFilters {
-                favorite_ids: Some(&favs),
-                ..Default::default()
-            },
-        )
-        .unwrap();
-        fts.reload_reader().unwrap();
-        let searcher = fts.searcher();
-        let hits = fts_index::search_page(&searcher, fts.fields(), &q, 0, 10).unwrap();
-        assert!(!hits.is_empty(), "Tantivy 側でヒットする");
     }
 
     #[test]

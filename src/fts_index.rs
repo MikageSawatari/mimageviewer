@@ -212,6 +212,10 @@ pub struct IndexDoc {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Container {
     Fs,
+    /// ZIP 内エントリ。アイテム索引は ZIP 内画像を ingest しないため、現状この variant を
+    /// 構築する経路は無い。`container` / `zip_entry` スキーマフィールドと対になる将来用の
+    /// 足場として残す (docs/search-container-item-redesign.md §3.2)。
+    #[allow(dead_code)]
     Zip,
 }
 impl Container {
