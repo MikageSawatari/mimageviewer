@@ -2152,6 +2152,41 @@ impl NativeVideoPresenter {
         true
     }
 
+    /// navigation preview / tile overlay が HUD HWND の region を全画面化してよいか。
+    ///
+    /// 連続再生 EOF などで mIV がバックグラウンドのまま動画が切り替わると、
+    /// `compute_hud_regions` は navigation preview / tile overlay 表示中に HUD HWND の
+    /// region を全画面化する。HUD HWND は `WS_EX_TOPMOST` なので、その状態だと前面の
+    /// 他アプリの上を黒い全画面プレビュー / tile grid が一瞬覆ってしまう
+    /// (2026-05 ユーザー報告)。raise allowlist と同じ `foreground_allows_hud_raise` で
+    /// 前面が mIV (presenter / HUD / main / VST editor) のときだけ全画面 region を
+    /// 許可する。`editor_hwnds_snapshot` が未登録のときは空集合で評価し、
+    /// presenter / HUD / main が前面なら許可する (raise 経路と違い、ここで false 固定に
+    /// すると VST 未使用時に navigation preview が一切出なくなるため)。
+    fn foreground_allows_fullscreen_overlay(&self) -> bool {
+        let editor_hwnds = self
+            .editor_hwnds_snapshot
+            .as_ref()
+            .and_then(|arc| arc.read().ok().map(|guard| guard.clone()))
+            .unwrap_or_default();
+        let presenter_hwnd = self
+            .egui_overlay
+            .as_ref()
+            .map(|overlay| overlay.focus_hwnd.0 as u64)
+            .unwrap_or(0);
+        let hud_hwnd = self
+            .hud_window
+            .as_ref()
+            .map(|hud| hud.hwnd().0 as u64)
+            .unwrap_or(0);
+        crate::video::dsp::foreground_allows_hud_raise(
+            presenter_hwnd,
+            hud_hwnd,
+            self.main_hwnd_for_raise,
+            &editor_hwnds,
+        )
+    }
+
     /// HUD HWND の geometry (= 位置・サイズ) を mirror する。`GeometryChanged` 受信時に
     /// presenter loop から呼ぶ。HUD HWND が無いなら no-op。
     pub fn set_hud_geometry(&self, x: i32, y: i32, w: u32, h: u32) {
@@ -2442,14 +2477,33 @@ impl NativeVideoPresenter {
     /// 入力を取り続ける (= VST に入力が抜けない) regression を引き起こす。
     /// HUD HWND が無い (フォールバック経路) なら両方 no-op。
     fn publish_hud_regions(&mut self, outcome: &NativeOverlayInputOutcome) {
+        // 連続再生 EOF などで mIV がバックグラウンドのまま動画が切り替わると、
+        // navigation preview / tile overlay は `compute_hud_regions` で HUD HWND の
+        // region を全画面化する。HUD HWND は `WS_EX_TOPMOST` なので、その状態だと
+        // 前面の他アプリの上を黒い全画面プレビュー / tile grid が一瞬覆ってしまう。
+        // 前面が mIV でなければ region を空にして HUD を穴のまま (= 不可視 /
+        // click-through) に保つ。preview / tile が消えるか mIV が前面へ戻れば、
+        // 次の publish で `compute_hud_regions` の結果へ自動的に戻る。
+        let fullscreen_overlay_active = self.egui_overlay.as_ref().is_some_and(|overlay| {
+            overlay.navigation_preview.is_some() || overlay.tile_overlay.is_some()
+        });
+        let suppress_fullscreen_regions = fullscreen_overlay_active
+            && self.hud_window.is_some()
+            && !self.foreground_allows_fullscreen_overlay();
+        let empty_regions: Vec<RECT> = Vec::new();
+        let regions: &[RECT] = if suppress_fullscreen_regions {
+            &empty_regions
+        } else {
+            &outcome.hud_regions
+        };
         let hud_region_hash = self
             .hud_window
             .as_ref()
-            .map(|_| hud_window::hash_regions_for_debug(&outcome.hud_regions));
+            .map(|_| hud_window::hash_regions_for_debug(regions));
         let hud_region_changed = hud_region_hash
             .map(|new_hash| self.last_hud_region_hash != Some(new_hash))
             .unwrap_or(false);
-        let hud_regions_empty = outcome.hud_regions.is_empty();
+        let hud_regions_empty = regions.is_empty();
         let toast_active = self
             .egui_overlay
             .as_ref()
@@ -2457,12 +2511,11 @@ impl NativeVideoPresenter {
 
         // CP9 実機 debug log: `MIV_HUD_DEBUG=1` で起動したら region 変化を log する。
         if hud_debug_enabled() && self.hud_window.is_some() {
-            let new_hash = hud_region_hash
-                .unwrap_or_else(|| hud_window::hash_regions_for_debug(&outcome.hud_regions));
+            let new_hash =
+                hud_region_hash.unwrap_or_else(|| hud_window::hash_regions_for_debug(regions));
             if self.last_logged_region_hash != Some(new_hash) {
                 self.last_logged_region_hash = Some(new_hash);
-                let rects_str: String = outcome
-                    .hud_regions
+                let rects_str: String = regions
                     .iter()
                     .map(|r| {
                         format!(
@@ -2478,7 +2531,7 @@ impl NativeVideoPresenter {
                 if let Some(overlay) = self.egui_overlay.as_ref() {
                     crate::logger::log(format!(
                         "[HUD-DEBUG] regions changed n={} ptr={:?} top_bar={} hud_vis={} right={} jump={} vst3={} thumb={} pin={} rects=[{}]",
-                        outcome.hud_regions.len(),
+                        regions.len(),
                         overlay.pointer_pos,
                         overlay.top_bar_visible,
                         overlay.hud_visible(),
@@ -2495,20 +2548,17 @@ impl NativeVideoPresenter {
 
         if let Some(regions_arc) = self.hud_regions.as_ref() {
             if let Ok(mut guard) = regions_arc.lock() {
-                guard.regions = outcome.hud_regions.clone();
+                guard.regions = regions.to_vec();
             }
         }
-        self.apply_hud_regions(&outcome.hud_regions);
+        self.apply_hud_regions(regions);
         if let Some(new_hash) = hud_region_hash {
             if hud_region_changed {
                 log_event(
                     "hud_region_publish",
                     &[
                         ("region_hash", Value::from(new_hash)),
-                        (
-                            "region_count",
-                            Value::from(outcome.hud_regions.len() as i64),
-                        ),
+                        ("region_count", Value::from(regions.len() as i64)),
                         ("regions_empty", Value::from(hud_regions_empty)),
                         ("was_empty", Value::from(self.last_hud_regions_empty)),
                         ("toast_active", Value::from(toast_active)),

@@ -98,6 +98,17 @@ bar の hover 表示は presenter thread の **50ms 周期 `GetCursorPos` pollin
 activation zone 内なら HUD raise burst をエンキューする (= VST 手動クリックで HUD が裏に回ったあとの
 復帰経路)。
 
+**全画面 overlay region の foreground ガード**: navigation preview (動画→動画 swap 中の
+プレビュー) と tile overlay は `compute_hud_regions` で HUD HWND の region を**全画面**にする
+(= 黒背景プレビュー / tile grid を HUD HWND 全面に描くため)。HUD HWND は `WS_EX_TOPMOST` なので、
+**mIV がバックグラウンドのまま** これが起きると前面の他アプリの上に黒い全画面が一瞬被さる
+(2026-05 ユーザー報告。連続再生で EOF 自動遷移したときに顕著)。これを防ぐため
+`publish_hud_regions` は、navigation preview / tile overlay が active かつ
+`foreground_allows_hud_raise` (= 前面が presenter / HUD / main / VST editor か) が false の
+ときに region を空に差し替える。HUD は穴のまま (= 不可視 / click-through) になり、preview / tile が
+消えるか mIV が前面へ戻れば次の publish で通常 region に戻る。動画切替・SwitchSource 自体は
+止めない (= 旧 presenter を閉じる normal open fallback の黒画面・背後ちらつきを再発させない)。
+
 **Z-order 再アサート (HUD raise burst)**:
 
 VST z-order 操作の各経路 (`set_all_guis_topmost` / `set_all_guis_visible_blocking` /
