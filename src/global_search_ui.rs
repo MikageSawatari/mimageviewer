@@ -131,15 +131,37 @@ const DEBOUNCE_MS: u64 = 300;
 const MAX_EVENTS_PER_FRAME: usize = 8;
 /// ContainerHit の再ソート間隔 (チラつき防止、docs §10.4.3)。
 const RESORT_INTERVAL_MS: u64 = 1000;
+/// Ctrl+G 一覧ビューが自動で集約ビューへ切り替わる総ヒット数の閾値
+/// (docs/search-container-item-redesign.md §4.3.2)。
+const AGGREGATE_AUTO_THRESHOLD: usize = 1000;
 
-/// Ctrl+G のビュー状態 (docs §10.3 [2]-[3])。
+/// Ctrl+G の drill-down 状態。コンテナにドリルインしているときだけ `Some` で保持される
+/// (docs/search-container-item-redesign.md §4.3.2)。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DrillState {
+    /// ドリルインの起点 (SearchContainer のパス)
+    pub container_root: PathBuf,
+    /// 現在地 (container_root と同じか、その配下の子フォルダ)
+    pub current_path: PathBuf,
+    /// container が ZIP ファイルか
+    pub is_zip: bool,
+}
+
+/// Ctrl+G の実効ビュー (docs/search-container-item-redesign.md §4.3.1)。
+///
+/// このenum は状態として保持しない。`GlobalSearchState` の `aggregate` / `drill` から
+/// [`GlobalSearchState::view`] で導出される。`drill` を None にするだけで `aggregate`
+/// に応じて一覧 / 集約へ正しく戻れる、という導出モデルにすることでドリルバックの
+/// 戻り先を別途覚える必要をなくしている。
 ///
 /// DrilledInto 時は「現在地 (current_path) 直下に落ちるヒット + ヒットを含む子フォルダ」
 /// だけを表示する (ヒットが 1 件もない枝は枝刈り)。Ctrl+↑↓ はこの枝刈り済みツリー
 /// 上で移動する。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GlobalSearchView {
-    /// トップレベル集約表示。SearchContainer セルがヒット件数降順で並ぶ
+    /// 一覧 (Flat): 全ヒットを個々のサムネイルで平置きする。
+    Flat,
+    /// 集約 (Aggregated): SearchContainer セルがヒット件数降順で並ぶ。
     Aggregated,
     /// drill-down 中。
     /// - `container_root`: ドリルインの起点 (SearchContainer のパス)
@@ -174,8 +196,16 @@ pub struct GlobalSearchState {
     pub containers: HashMap<PathBuf, ContainerHit>,
     /// 生の全ヒット (drill-down 時に container でフィルタするため保持)
     pub all_hits: Vec<GlobalHit>,
-    /// 現在のビューモード (Aggregated or DrilledInto)
-    pub view: GlobalSearchView,
+    /// 集約トグルの状態 (false = 一覧, true = 集約)。`drill` が Some のときは
+    /// ドリルインビューが優先されるので、この値は「ドリルバック先」を決める。
+    pub aggregate: bool,
+    /// `aggregate` がまだ自動制御下か (true) / ユーザーが固定したか (false)。
+    /// ストリーミング中にヒット数が閾値を超えると自動で集約へ切り替わるが、
+    /// ユーザーがトグル操作・結果操作・ドリルインをした時点で false に倒れる
+    /// (docs/search-container-item-redesign.md §4.3.2)。
+    pub aggregate_auto: bool,
+    /// drill-down 状態。コンテナにドリルインしていれば Some。
+    pub drill: Option<DrillState>,
     /// streaming 経過統計
     pub total_valid: usize,
     pub total_scanned: usize,
@@ -211,7 +241,9 @@ impl Default for GlobalSearchState {
             pending: None,
             containers: HashMap::new(),
             all_hits: Vec::new(),
-            view: GlobalSearchView::Aggregated,
+            aggregate: false,
+            aggregate_auto: true,
+            drill: None,
             total_valid: 0,
             total_scanned: 0,
             done: false,
@@ -285,13 +317,41 @@ impl GlobalSearchState {
             && (self.pending.is_some() || self.query != self.last_executed)
     }
 
+    /// 実効ビューを `aggregate` / `drill` から導出する (§4.3.1)。
+    pub(crate) fn view(&self) -> GlobalSearchView {
+        if let Some(d) = &self.drill {
+            GlobalSearchView::DrilledInto {
+                container_root: d.container_root.clone(),
+                current_path: d.current_path.clone(),
+                is_zip: d.is_zip,
+            }
+        } else if self.aggregate {
+            GlobalSearchView::Aggregated
+        } else {
+            GlobalSearchView::Flat
+        }
+    }
+
+    /// ストリーミング中の自動ビュー切替 (§4.3.2)。`aggregate_auto` が立っている間は
+    /// 総ヒット数が閾値を超えたら集約ビューへ自動で切り替える。`total_valid` は
+    /// 増加一方なので実質「一覧 → 集約」の一方向遷移。ユーザーがトグル操作・結果
+    /// 操作・ドリルインをすると `aggregate_auto` が false に倒れ、以降は手動操作のみ。
+    pub(crate) fn maybe_auto_switch_aggregate(&mut self) {
+        if self.aggregate_auto {
+            self.aggregate = self.total_valid > AGGREGATE_AUTO_THRESHOLD;
+        }
+    }
+
     /// 新規検索を開始する (既存 pending があれば cancel してから)。
     pub fn reset_for_new_query(&mut self) {
         // SearchHandle は Drop で cancel するので、take() だけで OK
         self.pending = None;
         self.containers.clear();
         self.all_hits.clear();
-        self.view = GlobalSearchView::Aggregated; // 新クエリで drill state もリセット
+        // 新クエリは一覧から開始し、自動切替を再有効化、drill state もリセット (§4.3.2)。
+        self.aggregate = false;
+        self.aggregate_auto = true;
+        self.drill = None;
         self.total_valid = 0;
         self.total_scanned = 0;
         self.done = false;
@@ -550,6 +610,61 @@ pub(crate) fn build_aggregated_items(
     // placeholder があっても何も起きない。
     let placeholder = Some((0_i64, 0_i64));
     let image_metas: Vec<Option<(i64, i64)>> = vec![placeholder; items.len()];
+    (items, image_metas)
+}
+
+/// Flat (一覧) view の items + image_metas を組み立てる
+/// (docs/search-container-item-redesign.md §4.3.1)。
+///
+/// `state.all_hits` を走査して各ヒットを `GridItem::{Image, PdfFile, Video}` に変換し、
+/// メインの `sort_order` で一律ソートする。ZIP 内画像ヒットはアイテム索引に存在しない
+/// が (§3.2)、stale な索引が残るケースに備えて防御的にスキップする。
+/// `build_drilled_items` と同じく placeholder image_metas を使い、UI スレッドでの
+/// `fs::metadata` 同期呼び出しは避ける。
+pub(crate) fn build_flat_items(
+    state: &GlobalSearchState,
+    sort_order: crate::settings::SortOrder,
+    rating_filter: &[bool; 6],
+) -> (Vec<GridItem>, Vec<Option<(i64, i64)>>) {
+    let rf_active = !rating_filter.iter().all(|&b| b);
+    // (GridItem, basename, mtime) を集めてからまとめてソートする。
+    let mut rows: Vec<(GridItem, String, i64)> = Vec::with_capacity(state.all_hits.len());
+    for h in &state.all_hits {
+        // ZIP 内エントリはアイテム索引対象外 (§3.2)。stale index 対策で防御的にスキップ。
+        if is_zip_hit_path(&h.path) {
+            continue;
+        }
+        if rf_active && !rating_passes_for_stars(h.stars, rating_filter) {
+            continue;
+        }
+        let p = PathBuf::from(&h.path);
+        let ext = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let item = match ext.as_str() {
+            "pdf" => GridItem::PdfFile(p.clone()),
+            // ZIP ファイル自体もアイテム索引対象外 (§3.2)。防御的にスキップ。
+            "zip" => continue,
+            _ if crate::folder_tree::SUPPORTED_VIDEO_EXTENSIONS.contains(&ext.as_str()) => {
+                GridItem::Video(p.clone())
+            }
+            _ => GridItem::Image(p.clone()),
+        };
+        let basename = p
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_string();
+        rows.push((item, basename, h.mtime));
+    }
+    rows.sort_by(|a, b| {
+        sort_order.compare(&a.1, a.2, &b.1, b.2, crate::ui_helpers::natural_sort_key)
+    });
+    let placeholder = Some((0_i64, 0_i64));
+    let image_metas: Vec<Option<(i64, i64)>> = vec![placeholder; rows.len()];
+    let items: Vec<GridItem> = rows.into_iter().map(|(it, _, _)| it).collect();
     (items, image_metas)
 }
 
@@ -957,7 +1072,9 @@ impl App {
         // 開くと、検索前なのに戻るボタンや古い drill-down UI が残る可能性があった。
         self.global_search.containers.clear();
         self.global_search.all_hits.clear();
-        self.global_search.view = GlobalSearchView::Aggregated;
+        self.global_search.drill = None;
+        self.global_search.aggregate = false;
+        self.global_search.aggregate_auto = true;
         self.global_search.query.clear();
         self.global_search.last_executed.clear();
         self.global_search.reject_message = None;
@@ -1043,6 +1160,15 @@ impl App {
     pub(crate) fn poll_global_search_events(&mut self, ctx: &egui::Context) {
         if self.global_search.done {
             return;
+        }
+        // 検索結果への操作 (セル選択 / スクロール) を検出したら自動ビュー切替を止める
+        // (§4.3.2 (b))。閾値による自動切替はストリーミング中しか起きないので、done 後に
+        // early return する本関数の冒頭で 1 箇所だけ判定すれば足りる。
+        if self.global_search.aggregate_auto
+            && self.global_search.drill.is_none()
+            && (self.selected.is_some() || self.scroll_offset_y > 0.5)
+        {
+            self.global_search.aggregate_auto = false;
         }
         // rx を clone してから global_search の他フィールドを可変借用可能にする
         // (crossbeam-channel の Receiver は Clone 可能)
@@ -1180,9 +1306,18 @@ impl App {
         // (Ctrl+↑↓) が `sort_containers_with_mode` を Newer/Older ソートを mtime=None
         // で走らせてしまう。view に関わらず rebuild の入口で populate しておく
         // (done 未達なら関数内で no-op)。
+        // ストリーミング中の自動ビュー切替 (一覧 ⇄ 集約) を rebuild の都度評価する
+        // (§4.3.2)。aggregate_auto が下りていれば no-op。
+        self.global_search.maybe_auto_switch_aggregate();
         ensure_container_mtime_populated(&mut self.global_search);
         let rating_filter = self.settings.rating_filter;
-        let (items, image_metas) = match self.global_search.view.clone() {
+        let sort_order = self.settings.sort_order;
+        let (items, image_metas) = match self.global_search.view() {
+            GlobalSearchView::Flat => {
+                // 一覧ビューはサブフォルダバッジを使わない。残骸を破棄する。
+                self.search_drilled_folder_counts.clear();
+                build_flat_items(&self.global_search, sort_order, &rating_filter)
+            }
             GlobalSearchView::Aggregated => {
                 // Aggregated ではサブフォルダのバッジ計算なし。残骸を破棄する。
                 self.search_drilled_folder_counts.clear();
@@ -1233,29 +1368,25 @@ impl App {
     /// を表示する。
     pub(crate) fn drill_into_container(&mut self, container: PathBuf, is_zip: bool) {
         self.cancel_pending_folder_nav();
-        self.global_search.view = GlobalSearchView::DrilledInto {
+        // ドリルインはユーザーの明示操作 → 自動ビュー切替を止める (§4.3.2 (c))。
+        self.global_search.aggregate_auto = false;
+        self.global_search.drill = Some(DrillState {
             container_root: container.clone(),
             current_path: container,
             is_zip,
-        };
+        });
         self.rebuild_items_from_global_search();
     }
 
     /// 絞り込みビューで子フォルダのセルをクリックしたとき、そのフォルダに潜る。
     /// container_root と is_zip は不変、current_path だけ更新する。
     pub(crate) fn drill_into_subfolder(&mut self, sub_path: PathBuf) {
-        if let GlobalSearchView::DrilledInto {
-            container_root,
-            is_zip,
-            ..
-        } = self.global_search.view.clone()
-        {
+        if let Some(d) = self.global_search.drill.clone() {
             self.cancel_pending_folder_nav();
-            self.global_search.view = GlobalSearchView::DrilledInto {
-                container_root,
+            self.global_search.drill = Some(DrillState {
                 current_path: sub_path,
-                is_zip,
-            };
+                ..d
+            });
             self.rebuild_items_from_global_search();
         }
     }
@@ -1283,18 +1414,12 @@ impl App {
         if !self.global_search.active {
             return;
         }
-        if let GlobalSearchView::DrilledInto {
-            container_root,
-            is_zip,
-            ..
-        } = self.global_search.view.clone()
-        {
+        if let Some(d) = self.global_search.drill.clone() {
             self.cancel_pending_folder_nav();
-            self.global_search.view = GlobalSearchView::DrilledInto {
-                container_root,
+            self.global_search.drill = Some(DrillState {
                 current_path: p.to_path_buf(),
-                is_zip,
-            };
+                ..d
+            });
             // 新しい current_path をブレッドクラムに反映。load_pdf_as_folder 等が
             // 後で self.address を raw パスで上書きするが、そこでも再度
             // `update_global_search_address` を呼んで元に戻す構造にしているので
@@ -1303,20 +1428,18 @@ impl App {
         }
     }
 
-    /// Aggregated view に戻る (drill-down 状態から)。
-    pub(crate) fn drill_back_to_aggregated(&mut self) {
+    /// トップレベル (一覧 or 集約) に戻る (drill-down 状態から)。
+    /// 戻り先は `aggregate` の値で決まる (§4.3.2 の導出モデル)。
+    pub(crate) fn drill_back_to_top(&mut self) {
         self.cancel_pending_folder_nav();
         // Ctrl+G drill-back は load_folder を経由しないため、suppression の subtree
         // 外判定が走らない。ユーザー視点では「本から出た」ので復元する (Codex High 指摘)。
         self.restore_rating_filter_suppression();
-        // 戻った先 (Aggregated) で当該 SearchContainer にカーソルを再選択する。
-        if let GlobalSearchView::DrilledInto {
-            ref container_root, ..
-        } = self.global_search.view
-        {
-            self.global_search.restore_select_path = Some(container_root.clone());
+        // 戻った先で当該 SearchContainer にカーソルを再選択する。
+        if let Some(d) = &self.global_search.drill {
+            self.global_search.restore_select_path = Some(d.container_root.clone());
         }
-        self.global_search.view = GlobalSearchView::Aggregated;
+        self.global_search.drill = None;
         self.rebuild_items_from_global_search();
     }
 
@@ -1324,38 +1447,33 @@ impl App {
     /// - current_path == container_root: Aggregated ビューに戻る
     /// - container_root の下に居る: 親フォルダに戻る
     pub(crate) fn drill_back_one_level(&mut self) {
-        if let GlobalSearchView::DrilledInto {
-            container_root,
-            current_path,
-            is_zip,
-        } = self.global_search.view.clone()
-        {
-            if current_path == container_root {
-                self.drill_back_to_aggregated();
-            } else if let Some(parent) = current_path.parent() {
-                let parent_pb = parent.to_path_buf();
-                // container_root 外へは出さない (出るなら Aggregated に戻る)
-                if parent_pb.starts_with(&container_root) {
-                    // suppression anchor (= 開いたコンテナ) の subtree 内に
-                    // 留まっているので、★一時解除を維持する (Codex P2)。
-                    // 「本の中で上の階層へ戻った」だけで未評価の中身が再非表示に
-                    // なると挙動が一貫しない。完全に外へ出る (= drill_back_to_aggregated)
-                    // 経路でだけ復元する。
-                    // 戻った先 (parent) で「直前に居たサブフォルダ」にカーソル復帰
-                    self.global_search.restore_select_path = Some(current_path.clone());
-                    self.cancel_pending_folder_nav();
-                    self.global_search.view = GlobalSearchView::DrilledInto {
-                        container_root,
-                        current_path: parent_pb,
-                        is_zip,
-                    };
-                    self.rebuild_items_from_global_search();
-                } else {
-                    self.drill_back_to_aggregated();
-                }
+        let Some(d) = self.global_search.drill.clone() else {
+            return;
+        };
+        if d.current_path == d.container_root {
+            self.drill_back_to_top();
+        } else if let Some(parent) = d.current_path.parent() {
+            let parent_pb = parent.to_path_buf();
+            // container_root 外へは出さない (出るならトップレベルに戻る)
+            if parent_pb.starts_with(&d.container_root) {
+                // suppression anchor (= 開いたコンテナ) の subtree 内に
+                // 留まっているので、★一時解除を維持する (Codex P2)。
+                // 「本の中で上の階層へ戻った」だけで未評価の中身が再非表示に
+                // なると挙動が一貫しない。完全に外へ出る (= drill_back_to_top)
+                // 経路でだけ復元する。
+                // 戻った先 (parent) で「直前に居たサブフォルダ」にカーソル復帰
+                self.global_search.restore_select_path = Some(d.current_path.clone());
+                self.cancel_pending_folder_nav();
+                self.global_search.drill = Some(DrillState {
+                    current_path: parent_pb,
+                    ..d
+                });
+                self.rebuild_items_from_global_search();
             } else {
-                self.drill_back_to_aggregated();
+                self.drill_back_to_top();
             }
+        } else {
+            self.drill_back_to_top();
         }
     }
 
@@ -1368,14 +1486,16 @@ impl App {
     /// スキップしてさらに次の候補に進む。対象が見つかるまで前後方向に進み、
     /// フラットリスト全体に対象が無ければ元の位置に戻して何もしない。
     pub(crate) fn global_search_ctrl_nav_fullscreen(&mut self, ctx: &egui::Context, forward: bool) {
-        let before_view = self.global_search.view.clone();
+        // global_search_ctrl_nav が動かすのは drill state だけなので、進めたかは
+        // drill の変化で判定する。
+        let before_drill = self.global_search.drill.clone();
         loop {
-            let prev_view = self.global_search.view.clone();
+            let prev_drill = self.global_search.drill.clone();
             self.global_search_ctrl_nav(forward);
-            if self.global_search.view == prev_view {
-                // これ以上進めない → 元の view に戻す (fs_cache を綺麗に戻すため再 rebuild)
-                if self.global_search.view != before_view {
-                    self.global_search.view = before_view;
+            if self.global_search.drill == prev_drill {
+                // これ以上進めない → 元の drill に戻す (fs_cache を綺麗に戻すため再 rebuild)
+                if self.global_search.drill != before_drill {
+                    self.global_search.drill = before_drill;
                     self.rebuild_items_from_global_search();
                 }
                 // 「最後/最初の検索結果です」ヒントを中央に表示
@@ -1411,14 +1531,11 @@ impl App {
     /// (docs §10.3 Ctrl+↑↓ が全ヒットを 1 本のフラットリストとして巡回する)。
     /// 全体の先頭/末端まで行ったらそこで停止 (循環はしない)。
     pub(crate) fn global_search_ctrl_nav(&mut self, forward: bool) {
-        let (container_root, current_path) = match self.global_search.view.clone() {
-            GlobalSearchView::DrilledInto {
-                container_root,
-                current_path,
-                ..
-            } => (container_root, current_path),
-            _ => return,
+        let Some(d) = self.global_search.drill.clone() else {
+            return;
         };
+        let container_root = d.container_root;
+        let current_path = d.current_path;
 
         // 現コンテナを Aggregated と同じ並び順で求め、その中での位置を取る。
         let containers =
@@ -1450,11 +1567,11 @@ impl App {
             };
             if let Some(next_path) = within {
                 self.cancel_pending_folder_nav();
-                self.global_search.view = GlobalSearchView::DrilledInto {
+                self.global_search.drill = Some(DrillState {
                     container_root: container_root.clone(),
                     current_path: next_path,
                     is_zip: false,
-                };
+                });
                 self.rebuild_items_from_global_search();
                 return;
             }
@@ -1472,11 +1589,11 @@ impl App {
             return;
         };
         let next = &containers[next_idx];
-        self.global_search.view = GlobalSearchView::DrilledInto {
+        self.global_search.drill = Some(DrillState {
             container_root: next.path.clone(),
             current_path: next.path.clone(),
             is_zip: matches!(next.kind, SearchContainerKind::Zip),
-        };
+        });
         self.cancel_pending_folder_nav();
         self.rebuild_items_from_global_search();
     }
@@ -1493,9 +1610,14 @@ impl App {
         } else {
             self.global_search.last_executed.clone()
         };
-        match self.global_search.view.clone() {
-            GlobalSearchView::Aggregated => {
-                let n = self.global_search.containers.len();
+        match self.global_search.view() {
+            GlobalSearchView::Flat | GlobalSearchView::Aggregated => {
+                // 集約時はコンテナ数、一覧時はヒット数を件数として表示する。
+                let n = if self.global_search.aggregate {
+                    self.global_search.containers.len()
+                } else {
+                    self.global_search.all_hits.len()
+                };
                 if query.is_empty() {
                     self.address = "🌐 全検索".to_string();
                 } else if self.global_search.is_searching() {
@@ -1551,15 +1673,14 @@ impl App {
         let mut query_changed = false;
         let mut filter_changed = false;
         let mut sort_changed = false;
+        let mut toggle_changed = false;
 
         let mut drill_back = false;
         egui::TopBottomPanel::top("global_search_bar").show(ctx, |ui| {
             ui.add_space(2.0);
             // 絞り込みビュー中は「← 戻る」+ 現在地を検索バーの **上** の行に表示する
             // (下の検索バーの入力欄位置が他のモードとブレないようにするため)
-            if let GlobalSearchView::DrilledInto { current_path, .. } =
-                self.global_search.view.clone()
-            {
+            if let Some(d) = self.global_search.drill.clone() {
                 ui.horizontal(|ui| {
                     if ui
                         .button("←")
@@ -1569,7 +1690,7 @@ impl App {
                         drill_back = true;
                     }
                     ui.label(
-                        egui::RichText::new(format!("📁 {}", current_path.display()))
+                        egui::RichText::new(format!("📁 {}", d.current_path.display()))
                             .size(11.0)
                             .color(egui::Color32::from_gray(150)),
                     );
@@ -1752,10 +1873,31 @@ impl App {
                     filter_changed = true;
                 }
 
-                // ── ソート切替 (Aggregated ビューのみ) ──
+                // ── 集約トグル (一覧 ⇄ 集約) ──
+                // ドリルイン中は出さない (上の行に「← 戻る」が出る)。
+                if self.global_search.drill.is_none() {
+                    ui.separator();
+                    let agg = self.global_search.aggregate;
+                    if ui
+                        .selectable_label(agg, "集約")
+                        .on_hover_text(
+                            "ヒットを親フォルダ単位でまとめて表示します。\n\
+                             ヒット数が多いと自動で ON になります。",
+                        )
+                        .clicked()
+                    {
+                        self.global_search.aggregate = !agg;
+                        // 手動操作なので以降は自動切替しない (§4.3.2 (a))。
+                        self.global_search.aggregate_auto = false;
+                        toggle_changed = true;
+                    }
+                }
+
+                // ── ソート切替 (集約ビューのみ) ──
                 // 件数バッジの右側で「ソート: <現在のモード>」のドロップダウンを出す。
-                // DrilledInto 中は Aggregated のソートが影響しないので隠す。
-                if matches!(self.global_search.view, GlobalSearchView::Aggregated)
+                // 一覧 / DrilledInto 中は集約のソートが影響しないので隠す。
+                if self.global_search.drill.is_none()
+                    && self.global_search.aggregate
                     && !self.global_search.containers.is_empty()
                 {
                     ui.separator();
@@ -1808,11 +1950,14 @@ impl App {
         if query_changed {
             self.cancel_pending_folder_nav();
             self.global_search.last_change_at = Some(Instant::now());
-            // Codex P3 対応: クエリが変わったら drill state を即 Aggregated に戻し、
+            // Codex P3 対応: クエリが変わったら drill state を即リセットし、
             // 旧検索の pending / containers / all_hits も直ちに破棄してから空の
-            // Aggregated view として rebuild する (debounce 完了までの間、旧結果で
+            // 一覧ビューとして rebuild する (debounce 完了までの間、旧結果で
             // drill-back 判定が残ったり、旧クエリでの rebuild race が起きないように)。
-            self.global_search.view = GlobalSearchView::Aggregated;
+            // 新クエリなので自動ビュー切替も再有効化する (§4.3.2)。
+            self.global_search.drill = None;
+            self.global_search.aggregate = false;
+            self.global_search.aggregate_auto = true;
             self.global_search.pending = None; // SearchHandle::Drop で cancel
             self.global_search.containers.clear();
             self.global_search.all_hits.clear();
@@ -1830,6 +1975,10 @@ impl App {
         }
         if sort_changed {
             // ソート変更はクエリ再実行不要 — items を並べ替えるだけ。
+            self.rebuild_items_from_global_search();
+        }
+        if toggle_changed {
+            // 集約トグルの切替は items を作り直すだけ (クエリ再実行不要)。
             self.rebuild_items_from_global_search();
         }
     }
@@ -1939,16 +2088,19 @@ mod tests {
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/b/1.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/b/2.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/c/1.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         assert_eq!(state.containers.len(), 2);
@@ -2001,16 +2153,59 @@ mod tests {
     #[test]
     fn drill_state_transitions_roundtrip() {
         let mut state = GlobalSearchState::default();
-        assert_eq!(state.view, GlobalSearchView::Aggregated);
-        state.view = GlobalSearchView::DrilledInto {
+        // 既定は一覧ビュー (§4.3.2)
+        assert_eq!(state.view(), GlobalSearchView::Flat);
+        state.drill = Some(DrillState {
             container_root: PathBuf::from("c:/photos"),
             current_path: PathBuf::from("c:/photos"),
             is_zip: false,
-        };
-        assert!(matches!(state.view, GlobalSearchView::DrilledInto { .. }));
+        });
+        assert!(matches!(state.view(), GlobalSearchView::DrilledInto { .. }));
         // クエリリセットで drill state もリセットされる契約
         state.reset_for_new_query();
-        assert_eq!(state.view, GlobalSearchView::Aggregated);
+        assert_eq!(state.view(), GlobalSearchView::Flat);
+    }
+
+    #[test]
+    fn aggregate_toggle_and_drill_derive_view() {
+        let mut state = GlobalSearchState::default();
+        // drill なし + aggregate=false → 一覧
+        assert_eq!(state.view(), GlobalSearchView::Flat);
+        // drill なし + aggregate=true → 集約
+        state.aggregate = true;
+        assert_eq!(state.view(), GlobalSearchView::Aggregated);
+        // drill が立っていれば aggregate の値に関わらずドリルイン優先
+        state.drill = Some(DrillState {
+            container_root: PathBuf::from("c:/a"),
+            current_path: PathBuf::from("c:/a"),
+            is_zip: false,
+        });
+        assert!(matches!(state.view(), GlobalSearchView::DrilledInto { .. }));
+        // drill を外すと aggregate に応じた戻り先 (ここでは集約) になる
+        state.drill = None;
+        assert_eq!(state.view(), GlobalSearchView::Aggregated);
+    }
+
+    #[test]
+    fn auto_switch_to_aggregate_above_threshold() {
+        let mut state = GlobalSearchState::default();
+        // 既定: 一覧 + 自動制御下
+        assert!(!state.aggregate);
+        assert!(state.aggregate_auto);
+        // 閾値ちょうどでは切り替わらない
+        state.total_valid = AGGREGATE_AUTO_THRESHOLD;
+        state.maybe_auto_switch_aggregate();
+        assert!(!state.aggregate);
+        // 閾値超で集約へ自動切替
+        state.total_valid = AGGREGATE_AUTO_THRESHOLD + 1;
+        state.maybe_auto_switch_aggregate();
+        assert!(state.aggregate);
+        // ユーザーが固定したら (aggregate_auto=false) 以降は自動で動かない
+        state.aggregate_auto = false;
+        state.aggregate = false;
+        state.total_valid = AGGREGATE_AUTO_THRESHOLD * 100;
+        state.maybe_auto_switch_aggregate();
+        assert!(!state.aggregate, "aggregate_auto=false なら自動切替しない");
     }
 
     #[test]
@@ -2021,13 +2216,14 @@ mod tests {
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/1.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
-        state.view = GlobalSearchView::DrilledInto {
+        state.drill = Some(DrillState {
             container_root: PathBuf::from("c:/a"),
             current_path: PathBuf::from("c:/a"),
             is_zip: false,
-        };
+        });
         state.done = true;
         state.truncated = true;
         state.total_valid = 42;
@@ -2038,7 +2234,7 @@ mod tests {
 
         assert!(state.all_hits.is_empty());
         assert!(state.containers.is_empty());
-        assert_eq!(state.view, GlobalSearchView::Aggregated);
+        assert_eq!(state.view(), GlobalSearchView::Flat);
         assert!(!state.done);
         assert!(!state.truncated);
         assert_eq!(state.total_valid, 0);
@@ -2069,16 +2265,19 @@ mod tests {
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/1.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/a/2.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/b/x.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         // containers は 2 つに集約されているが、all_hits は 3 つ保持
@@ -2092,16 +2291,19 @@ mod tests {
         state.accumulate_hit(&GlobalHit {
             path: zip_hit("c:/album.zip", "0001.jpg"),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: zip_hit("c:/album.zip", "0002.jpg"),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         state.accumulate_hit(&GlobalHit {
             path: "c:/photos/x.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         let zip = state
@@ -2123,16 +2325,19 @@ mod tests {
             GlobalHit {
                 path: "C:/root/a.jpg".into(),
                 score: 1.0,
+                mtime: 0,
                 stars: 0,
             },
             GlobalHit {
                 path: "C:/root/sub/b.jpg".into(),
                 score: 1.0,
+                mtime: 0,
                 stars: 0,
             },
             GlobalHit {
                 path: "C:/root/sub/deeper/c.jpg".into(),
                 score: 1.0,
+                mtime: 0,
                 stars: 0,
             },
         ];
@@ -2153,6 +2358,7 @@ mod tests {
         let hits = vec![GlobalHit {
             path: "C:/root/yes/found.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         }];
         let got = collect_hit_folders_dfs(&hits, &PathBuf::from("C:/root"));
@@ -2177,6 +2383,7 @@ mod tests {
             state.accumulate_hit(&GlobalHit {
                 path: p.into(),
                 score: 1.0,
+                mtime: 0,
                 stars: 0,
             });
         }
@@ -2218,6 +2425,7 @@ mod tests {
             state.accumulate_hit(&GlobalHit {
                 path: p.into(),
                 score: 1.0,
+                mtime: 0,
                 stars: 0,
             });
         }
@@ -2234,6 +2442,72 @@ mod tests {
             })
             .collect();
         assert_eq!(kinds, vec!["PdfFile", "ZipFile", "Image", "Image"]);
+    }
+
+    /// build_flat_items: 全ヒットを sort_order で一律ソートし、拡張子で
+    /// Image / PdfFile / Video に分類する。ZIP 系ヒットは除外する (§3.2、§4.3.1)。
+    #[test]
+    fn build_flat_items_sorts_classifies_and_skips_zip() {
+        let mut state = GlobalSearchState::default();
+        for p in ["c:/a/2.jpg", "c:/b/1.png", "c:/c/doc.pdf", "c:/d/clip.mp4"] {
+            state.accumulate_hit(&GlobalHit {
+                path: p.into(),
+                score: 1.0,
+                mtime: 0,
+                stars: 0,
+            });
+        }
+        // ZIP 内エントリ + ZIP ファイル自体は一覧に出さない
+        state.accumulate_hit(&GlobalHit {
+            path: zip_hit("c:/e/album.zip", "x.jpg"),
+            score: 1.0,
+            mtime: 0,
+            stars: 0,
+        });
+        state.accumulate_hit(&GlobalHit {
+            path: "c:/f/plain.zip".into(),
+            score: 1.0,
+            mtime: 0,
+            stars: 0,
+        });
+        let (items, metas) =
+            build_flat_items(&state, crate::settings::SortOrder::FileName, &[true; 6]);
+        assert_eq!(items.len(), 4, "ZIP 系 2 件は除外される");
+        assert_eq!(items.len(), metas.len());
+        // ファイル名順: 1.png → 2.jpg → clip.mp4 → doc.pdf
+        let kinds: Vec<&str> = items
+            .iter()
+            .map(|it| match it {
+                GridItem::Image(_) => "Image",
+                GridItem::PdfFile(_) => "PdfFile",
+                GridItem::Video(_) => "Video",
+                _ => "Other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["Image", "Image", "Video", "PdfFile"]);
+    }
+
+    /// build_flat_items: rating_filter で個々のヒットを絞れる (一覧ビューでは★有効、§6)。
+    #[test]
+    fn build_flat_items_applies_rating_filter() {
+        let mut state = GlobalSearchState::default();
+        state.accumulate_hit(&GlobalHit {
+            path: "c:/a/keep.jpg".into(),
+            score: 1.0,
+            mtime: 0,
+            stars: 3,
+        });
+        state.accumulate_hit(&GlobalHit {
+            path: "c:/a/drop.jpg".into(),
+            score: 1.0,
+            mtime: 0,
+            stars: 1,
+        });
+        let mut rf = [false; 6];
+        rf[3] = true;
+        let (items, _) = build_flat_items(&state, crate::settings::SortOrder::FileName, &rf);
+        assert_eq!(items.len(), 1);
+        assert!(matches!(&items[0], GridItem::Image(p) if p.ends_with("keep.jpg")));
     }
 
     /// 多階層のフォルダ構造の一部だけがヒットしたとき、drill-in でヒットを含む
@@ -2258,12 +2532,14 @@ mod tests {
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/year2024/jan/matches/X.png".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         // 上記以外にもヒットを入れておく (別枝が干渉しないことを確認)
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/year2024/jan/matches/Y.png".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
 
@@ -2317,6 +2593,7 @@ mod tests {
             state.accumulate_hit(&GlobalHit {
                 path: p,
                 score: 1.0,
+                mtime: 0,
                 stars: 0,
             });
         }
@@ -2352,33 +2629,39 @@ mod tests {
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/keep.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/drop_low.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 1,
         });
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/drop_unrated.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         // sub_keep: ★3 が 1 件含まれる → バッジ 1
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/sub_keep/a.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/sub_keep/b.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 1,
         });
         // sub_drop: ★3 ヒットなし → 枝刈り
         state.accumulate_hit(&GlobalHit {
             path: "C:/root/sub_drop/a.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
 
@@ -2403,6 +2686,7 @@ mod tests {
             state.accumulate_hit(&GlobalHit {
                 path: p.into(),
                 score: 1.0,
+                mtime: 0,
                 stars: 0,
             });
         }
@@ -2420,11 +2704,13 @@ mod tests {
         state.accumulate_hit(&GlobalHit {
             path: format!("c:/archives/target.zip{sep}keep.jpg"),
             score: 1.0,
+            mtime: 0,
             stars: 3,
         });
         state.accumulate_hit(&GlobalHit {
             path: format!("c:/archives/target.zip{sep}drop.jpg"),
             score: 1.0,
+            mtime: 0,
             stars: 1,
         });
         let mut rf = [false; 6];

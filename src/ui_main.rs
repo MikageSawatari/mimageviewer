@@ -806,10 +806,8 @@ impl App {
                     // ドリルイン後は file list + サブフォルダ件数の両方に反映するので
                     // enable に戻す。
                     let aggregated_search = self.global_search.active
-                        && matches!(
-                            self.global_search.view,
-                            crate::global_search_ui::GlobalSearchView::Aggregated
-                        );
+                        && self.global_search.drill.is_none()
+                        && self.global_search.aggregate;
                     // hover ヒントは disable 中の widget では拾われにくいので
                     // (egui の sense)、有効な「★:」ラベル側に乗せる。
                     let star_label = ui.label("★:");
@@ -1535,12 +1533,7 @@ impl App {
                     // Ctrl+G 絞り込みビューでは「ヒットを含む子フォルダ」を Folder として
                     // 並べているので、通常の load_folder ではなく絞り込みをさらに 1 段潜る
                     // 経路に流す (docs §10.3 [3] 絞り込みビュー)。
-                    if self.global_search.active
-                        && matches!(
-                            self.global_search.view,
-                            crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
-                        )
-                    {
+                    if self.global_search.active && self.global_search.drill.is_some() {
                         self.drill_into_subfolder(p.clone());
                     } else {
                         let p = p.clone();

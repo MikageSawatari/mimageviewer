@@ -4023,12 +4023,11 @@ impl App {
         }
 
         if self.global_search.active {
-            if matches!(
-                self.global_search.view,
-                crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
-            ) {
+            if self.global_search.drill.is_some() {
                 self.global_search_ctrl_nav_fullscreen(ctx, forward);
             } else {
+                // 一覧ビューはグリッドに実画像が並ぶので通常のフルスクリーン前後移動が
+                // 使える。フォルダ横断 (Ctrl+↑↓) の概念は無いので no-op ヒントを出す。
                 self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::SearchResultList, native_toast);
             }
             return;

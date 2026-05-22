@@ -1075,7 +1075,7 @@ mod phase_c_folder_nav_history_tests {
 //
 // 原因: PDF/ZIP を開いても `global_search.view.DrilledInto.current_path` が
 // 更新されず、drill_back_one_level が「current_path == container_root」を
-// 根拠に drill_back_to_aggregated を直接呼ぶ。
+// 根拠に drill_back_to_top を直接呼ぶ。
 //
 // 修正: container (PDF/ZIP/Folder) を開く時点で current_path をその path に
 // 進めておく。BS 時は drill_back_one_level が親へ戻す動作になり、
@@ -1093,7 +1093,7 @@ mod phase_c_drill_nav_tests {
     /// の 2 段階 BS で辿れる状態になること。
     ///
     /// 修正前: PDF を開いても current_path=folder_path のままなので、
-    /// drill_back_one_level が即 drill_back_to_aggregated を呼び、ヒット一覧を
+    /// drill_back_one_level が即 drill_back_to_top を呼び、ヒット一覧を
     /// スキップして検索結果に戻ってしまう。
     #[test]
     fn bs_after_opening_pdf_in_drilled_returns_to_folder_not_aggregated() {
@@ -1107,12 +1107,13 @@ mod phase_c_drill_nav_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: format!("{}/doc.pdf", folder_path.display()).to_lowercase(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         // コンテナへ drill-in (SearchContainer を Enter 相当)
         app.drill_into_container(folder_path.clone(), false);
         assert!(matches!(
-            app.global_search.view,
+            app.global_search.view(),
             GlobalSearchView::DrilledInto { ref current_path, .. }
                 if current_path == &folder_path
         ));
@@ -1123,23 +1124,23 @@ mod phase_c_drill_nav_tests {
 
         // 1 段目 BS: PDF ページ → drilled folder view (ヒット一覧)
         app.drill_back_one_level();
-        match &app.global_search.view {
+        match &app.global_search.view() {
             GlobalSearchView::DrilledInto { current_path, .. } => {
                 assert_eq!(
                     current_path, &folder_path,
                     "1段目 BS で drilled folder view に戻るべき (current_path=folder)"
                 );
             }
-            GlobalSearchView::Aggregated => {
-                panic!("BUG: BS が PDF 一覧をスキップして Aggregated に飛んだ");
+            _ => {
+                panic!("BUG: BS が PDF 一覧をスキップしてトップレベルに飛んだ");
             }
         }
 
-        // 2 段目 BS: drilled folder view → Aggregated
+        // 2 段目 BS: drilled folder view → トップレベル (一覧)
         app.drill_back_one_level();
         assert!(
-            matches!(app.global_search.view, GlobalSearchView::Aggregated),
-            "2段目 BS で Aggregated に戻るべき"
+            app.global_search.drill.is_none(),
+            "2段目 BS でトップレベルに戻るべき"
         );
     }
 
@@ -1155,13 +1156,14 @@ mod phase_c_drill_nav_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: format!("{}/album.zip", folder_path.display()).to_lowercase(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         app.drill_into_container(folder_path.clone(), false);
         app.advance_drilled_current_path(&zip_path);
 
         app.drill_back_one_level();
-        match &app.global_search.view {
+        match &app.global_search.view() {
             GlobalSearchView::DrilledInto { current_path, .. } => {
                 assert_eq!(current_path, &folder_path);
             }
@@ -1169,10 +1171,7 @@ mod phase_c_drill_nav_tests {
         }
 
         app.drill_back_one_level();
-        assert!(matches!(
-            app.global_search.view,
-            GlobalSearchView::Aggregated
-        ));
+        assert!(app.global_search.drill.is_none());
     }
 
     /// 2026-04 ユーザー報告: Ctrl+G で 1 つめのコンテナに drill-in して Ctrl+↓ を
@@ -1191,11 +1190,13 @@ mod phase_c_drill_nav_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/2025-11-30/a.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/2025-11-30/b.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         // コンテナ B: deep ヒット 1 件。parent_container = "c:/root/output/2025-12-30-1"
@@ -1203,13 +1204,14 @@ mod phase_c_drill_nav_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/output/2025-12-30-1/x.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
 
         // A に drill-in。
         let a_root = std::path::PathBuf::from("c:/root/2025-11-30");
         app.drill_into_container(a_root.clone(), false);
-        match &app.global_search.view {
+        match &app.global_search.view() {
             GlobalSearchView::DrilledInto {
                 current_path,
                 container_root,
@@ -1226,7 +1228,7 @@ mod phase_c_drill_nav_tests {
         // `> 2025-12-30-1` だけになり、深部ワープ `> output > 2025-12-30-1` は起きない)。
         app.global_search_ctrl_nav(true);
         let b_root = std::path::PathBuf::from("c:/root/output/2025-12-30-1");
-        match &app.global_search.view {
+        match &app.global_search.view() {
             GlobalSearchView::DrilledInto {
                 current_path,
                 container_root,
@@ -1255,16 +1257,19 @@ mod phase_c_drill_nav_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/x/root/a.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/x/root/b.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/x/root/sub/c.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
 
@@ -1274,7 +1279,7 @@ mod phase_c_drill_nav_tests {
 
         // Ctrl+↓: subtree 内 DFS の次 (root/sub)。container_root は root のまま。
         app.global_search_ctrl_nav(true);
-        match &app.global_search.view {
+        match &app.global_search.view() {
             GlobalSearchView::DrilledInto {
                 current_path,
                 container_root,
@@ -1303,6 +1308,7 @@ mod phase_c_drill_nav_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/sub_unrated/a.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 3,
         });
         app.drill_into_container(std::path::PathBuf::from("c:/root"), false);
@@ -1453,14 +1459,21 @@ mod phase_c_drill_nav_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/folder_a/x.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/folder_b/y.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
-        // 初回 rebuild (Aggregated)
+        // 集約ビューに固定する (集約トグルを ON にした状態 = aggregate_auto も倒す)。
+        // 新モデルの既定は一覧ビューで、aggregate_auto が立ったままだと
+        // maybe_auto_switch_aggregate が total_valid=0 を見て一覧へ戻してしまう。
+        app.global_search.aggregate = true;
+        app.global_search.aggregate_auto = false;
+        // 初回 rebuild (集約)
         app.rebuild_items_from_global_search();
         // folder_b に drill-in
         app.drill_into_container(std::path::PathBuf::from("c:/folder_b"), false);
@@ -1502,6 +1515,7 @@ mod phase_c_drill_nav_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/books/vol1/sub/p1.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         // SearchContainer を開く (path-based suppression を起動)
@@ -1708,6 +1722,7 @@ mod phase_c_drill_nav_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/sub/a.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 3,
         });
         // items に直接置く (drill_into_container は load_folder を呼ばないテスト用簡易セットアップ)
@@ -1741,21 +1756,25 @@ mod phase_c_drill_nav_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/sub/a.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/sub/b.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/sub/c.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 2,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/sub/d.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 4,
         });
         app.drill_into_container(std::path::PathBuf::from("c:/root"), false);
@@ -1804,6 +1823,7 @@ mod phase_c_drill_nav_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/folder_a/x.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         // 存在しないパスを restore target に設定して rebuild
@@ -1834,11 +1854,13 @@ mod phase_c_drill_nav_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/sub1/x.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         app.global_search.accumulate_hit(&GlobalHit {
             path: "c:/root/sub2/y.jpg".into(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         // /root に drill-in
@@ -1866,14 +1888,11 @@ mod phase_c_drill_nav_tests {
     #[test]
     fn advance_drilled_is_noop_when_not_in_drilled_view() {
         let mut app = setup_app();
-        assert!(matches!(
-            app.global_search.view,
-            GlobalSearchView::Aggregated
-        ));
+        assert!(app.global_search.drill.is_none());
         app.advance_drilled_current_path(std::path::Path::new("C:/anything.pdf"));
         assert!(
-            matches!(app.global_search.view, GlobalSearchView::Aggregated),
-            "Aggregated 時の advance は no-op であるべき"
+            app.global_search.drill.is_none(),
+            "ドリルインしていないときの advance は no-op であるべき"
         );
     }
 }
@@ -1913,6 +1932,7 @@ mod phase_c_drill_address_tests {
             )
             .to_lowercase(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         app.drill_into_container(folder_path.clone(), false);
@@ -1987,6 +2007,7 @@ mod phase_c_drill_address_tests {
         app.global_search.accumulate_hit(&GlobalHit {
             path: "d:/scansnap/a.pdf".to_string(),
             score: 1.0,
+            mtime: 0,
             stars: 0,
         });
         // Aggregated のまま update_global_search_address

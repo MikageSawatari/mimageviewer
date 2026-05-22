@@ -640,6 +640,22 @@ pub fn doc_text_for_target(
     Ok(out)
 }
 
+/// 指定 doc の STORED `mtime` (UNIX 秒) を取り出す。
+/// Ctrl+G 一覧ビューの日付ソート用 (docs/search-container-item-redesign.md §5.2)。
+/// schema には既に `mtime` が `INDEXED | STORED` で入っているため、取り出し経路の
+/// 追加のみで足りる (スキーマ変更・INDEX_VERSION bump は不要)。
+pub fn doc_mtime(
+    searcher: &tantivy::Searcher,
+    fields: &Fields,
+    addr: DocAddress,
+) -> tantivy::Result<i64> {
+    let doc: TantivyDocument = searcher.doc(addr)?;
+    Ok(doc
+        .get_first(fields.mtime)
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0))
+}
+
 // -----------------------------------------------------------------------
 // 内部: スキーマ構築とトークナイザ登録
 // -----------------------------------------------------------------------

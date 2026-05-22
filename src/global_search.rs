@@ -88,6 +88,10 @@ pub struct GlobalHit {
     /// ユーザーが同じ画像のレーティングを変えてもこのフィールドは更新されない
     /// (バッジ件数が次のクエリ実行までは古いまま。実害は小さいので許容)。
     pub stars: u8,
+    /// ファイルの最終更新時刻 (UNIX 秒)。Tantivy の STORED `mtime` フィールドから
+    /// 取り出す。Ctrl+G 一覧 (Flat) / ドリルインビューの日付ソート
+    /// (docs/search-container-item-redesign.md §4.3.3) に使う。
+    pub mtime: i64,
 }
 
 /// Ctrl+G 検索ワーカーに渡すフィルタ (§19 ドロップダウン UI と対応)。
@@ -221,10 +225,14 @@ pub fn run(
                 Err(_) => continue,
             };
             if search_query::matches_with_mode(&tokens, &text, scope.mode) {
+                // STORED mtime を取り出す (日付ソート用 §5.2)。post-filter を通った
+                // ヒットだけに対して呼ぶので、走査候補全件への doc fetch は発生しない。
+                let mtime = fts_index::doc_mtime(&searcher, fts.fields(), addr).unwrap_or(0);
                 batch.push(GlobalHit {
                     path,
                     score,
                     stars: 0,
+                    mtime,
                 });
                 valid += 1;
                 if valid >= HARD_MAX {

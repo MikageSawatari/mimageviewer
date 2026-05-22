@@ -9980,10 +9980,7 @@ impl App {
             // Ctrl+G 絞り込みビュー中なら 1 段上げる (current_path != container_root) か、
             // Aggregated に戻る。自由な fs 遡行は許さない (docs §10.3)。
             if self.global_search.active {
-                if matches!(
-                    self.global_search.view,
-                    crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
-                ) {
+                if self.global_search.drill.is_some() {
                     self.drill_back_one_level();
                     return None;
                 }
@@ -10018,11 +10015,7 @@ impl App {
         // (Aggregated 時は Ctrl+↑↓ は no-op、DrilledInto 時は drill-tree DFS)。
         let in_local_search = self.show_search_bar;
         let in_global_search = self.global_search.active;
-        let in_global_search_drilled = in_global_search
-            && matches!(
-                self.global_search.view,
-                crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
-            );
+        let in_global_search_drilled = in_global_search && self.global_search.drill.is_some();
         if ctrl_down {
             // perf: グリッドの Ctrl+↓ を input イベントとして記録 (fullscreen 側と対称)。
             // これで入力 → DFS → load_folder → 初フレームまでを seq で相関できる。
@@ -12024,10 +12017,7 @@ impl App {
         // 検索ヒット由来のキャッシュを引くと別フォルダの件数を流用してしまう。
         let in_global_drilled = self.global_search.active
             && self.items_are_global_search_view
-            && matches!(
-                self.global_search.view,
-                crate::global_search_ui::GlobalSearchView::DrilledInto { .. }
-            );
+            && self.global_search.drill.is_some();
         // tooltip 用 per_star は ★1..★5 (旧インターフェース維持)。
         let per_star: [u32; 5] = if in_global_drilled {
             let counts6 = *self.search_drilled_folder_counts.get(&key)?;
