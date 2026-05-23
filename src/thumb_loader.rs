@@ -1840,28 +1840,51 @@ pub fn load_one_cached(
     let img = match img_result {
         Ok(i) => i,
         Err(e) => {
-            // キャンセル済みなら失敗を報告しない (フォルダ切替で旧アイテムが
-            // 一瞬ピンク表示になるのを防ぐ)。
-            //
             // **PDF render pool の context epoch prune** (`pool_prune_stale_epoch` /
             // `pool_stale_epoch_skip`) や **dispatcher pop 時 cancel skip** は
             // `image::ImageError::IoError(io)` で wrap した `io::ErrorKind::Interrupted`
             // を返す。これらは「systemic な諦め」シグナルなので Failed 化せず silent
-            // return する (= cancel 経由と同等扱い)。Susie / ZIP / native decode 由来の
-            // Interrupted を巻き込まないよう `pdf_page.is_some()` でガードする
-            // (= PDF 経路のみ対象)。
+            // 経路に乗せる。Susie / ZIP / native decode 由来の Interrupted を巻き込まないよう
+            // `pdf_page.is_some()` でガードする (= PDF 経路のみ対象)。
             let pdf_interrupted = pdf_page.is_some()
                 && matches!(
                     &e,
                     image::ImageError::IoError(io) if io.kind() == std::io::ErrorKind::Interrupted
                 );
-            if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) || pdf_interrupted {
+            let cancelled = cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed));
+
+            // **Codex P2 対応 (2026-05)**:
+            // `pdf_interrupted` は cancel_token を flip せず epoch だけ進めた経路
+            // (= `load_folder` 入口の `bump_render_context_epoch` から `start_loading_items` の
+            // `invalidate_idx_state_and_queues` までの window) でも発生し得る。この window では
+            // 旧フォルダの items_generation が生きており、`requested` が wipe されていない。
+            // ここで silent return すると `requested` に dangling entry が残り、Pending のまま
+            // 再エンキューが弾かれて (`requested.contains_key=true` で skip) サムネが固着する。
+            // STALE 経路 ([docs/async-architecture.md §3.4](docs/async-architecture.md)) と同じく
+            // `canceled=true` を送って UI 側 (`poll_thumbnails`) に `requested.remove + Evicted`
+            // で掃除させる (Failed 化しない、retriable)。
+            //
+            // 純粋 cancel (= folder change) 経由はその後の `invalidate_idx_state_and_queues` で
+            // `requested` が wipe される上、items_generation も bump されるので `canceled=true`
+            // を送る必要は本来ない。ただし両者を区別せず常に送る方がシンプルで、
+            // items_gen mismatch で UI 側が無視するので副作用も無い。
+            if cancelled || pdf_interrupted {
                 let reason = if pdf_interrupted {
                     "pdf-interrupted"
                 } else {
                     "cancelled"
                 };
                 crate::logger::log(format!("    idx={idx:>4} {reason}  {display_name}"));
+                let _ = tx.send(ThumbMsg {
+                    idx,
+                    image: None,
+                    from_cache: false,
+                    source_dims: None,
+                    canceled: true,
+                    finalized: false,
+                    input_seq,
+                    items_gen,
+                });
                 gen_done.fetch_add(1, Ordering::Relaxed);
                 return;
             }
