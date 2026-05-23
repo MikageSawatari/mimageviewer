@@ -235,40 +235,8 @@ fn core_enumerate(
         .collect())
 }
 
-/// PDF の 1 ページをレンダリングする (コアロジック)。
-fn core_render(
-    pdfium: &Pdfium,
-    path: &Path,
-    page_num: u32,
-    target_px: u32,
-    password: Option<&str>,
-) -> std::io::Result<(image::DynamicImage, PdfPageContentType)> {
-    let doc = pdfium
-        .load_pdf_from_file(path, password)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-
-    let page = doc
-        .pages()
-        .get(page_num as u16)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-
-    // ページコンテンツ解析 (レンダリングのついでに実行、追加コストほぼゼロ)
-    let content_type = analyze_page_content(&page);
-
-    let page_w = page.width().value;
-    let page_h = page.height().value;
-    let (tw, th) = fit_to_target(page_w, page_h, target_px as f32);
-
-    let render_config = PdfRenderConfig::new()
-        .set_target_width(tw as i32)
-        .set_maximum_height(th as i32);
-
-    let bitmap = page
-        .render_with_config(&render_config)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-
-    Ok((bitmap.as_image(), content_type))
-}
+// (旧 `core_render` は `core_render_with_count` (v1.0.0 で page_count も返す)
+//  に置き換えられた。後者は ipc_render と in-process worker の両方から使われる。)
 
 // -----------------------------------------------------------------------
 // バイナリプロトコル (stdin/stdout IPC)
@@ -641,6 +609,10 @@ fn ipc_get_info(pdfium: &Pdfium, path: &Path, password: Option<&str>) -> std::io
 }
 
 /// core_render の結果を IPC バイナリ (RGBA ピクセル) にシリアライズする。
+///
+/// レスポンス: [status 1B][w 4B][h 4B][type_tag 1B][raster_w 4B][raster_h 4B][page_count 4B][rgba_pixels]
+/// ピクセル開始オフセット = 22B。`page_count` は呼び出し側 (thumb_loader) で PDF メタ
+/// キャッシュへ書き込むために返している (v1.0.0、`pdf_meta` テーブル)。
 fn ipc_render(
     pdfium: &Pdfium,
     path: &Path,
@@ -648,13 +620,13 @@ fn ipc_render(
     target_px: u32,
     password: Option<&str>,
 ) -> std::io::Result<Vec<u8>> {
-    let (img, content_type) = core_render(pdfium, path, page_num, target_px, password)?;
+    let (img, content_type, page_count) =
+        core_render_with_count(pdfium, path, page_num, target_px, password)?;
     let rgba = img.to_rgba8();
     let w = rgba.width();
     let h = rgba.height();
     let pixels = rgba.as_raw();
-    // レスポンス: [status][4B w][4B h][1B type_tag][4B raster_w][4B raster_h][rgba_pixels]
-    let mut buf = Vec::with_capacity(1 + 4 + 4 + 9 + pixels.len());
+    let mut buf = Vec::with_capacity(1 + 4 + 4 + 9 + 4 + pixels.len());
     buf.push(STATUS_OK);
     buf.extend_from_slice(&w.to_le_bytes());
     buf.extend_from_slice(&h.to_le_bytes());
@@ -670,8 +642,39 @@ fn ipc_render(
             buf.extend_from_slice(&rh.to_le_bytes());
         }
     }
+    buf.extend_from_slice(&page_count.to_le_bytes());
     buf.extend_from_slice(pixels);
     Ok(buf)
+}
+
+/// core_render に page_count 取得を追加した拡張版 (v1.0.0)。
+/// ipc_render と in-process worker から共用する。
+fn core_render_with_count(
+    pdfium: &Pdfium,
+    path: &Path,
+    page_num: u32,
+    target_px: u32,
+    password: Option<&str>,
+) -> std::io::Result<(image::DynamicImage, PdfPageContentType, u32)> {
+    let doc = pdfium
+        .load_pdf_from_file(path, password)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+    let page_count = doc.pages().len() as u32;
+    let page = doc
+        .pages()
+        .get(page_num as u16)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+    let content_type = analyze_page_content(&page);
+    let page_w = page.width().value;
+    let page_h = page.height().value;
+    let (tw, th) = fit_to_target(page_w, page_h, target_px as f32);
+    let render_config = PdfRenderConfig::new()
+        .set_target_width(tw as i32)
+        .set_maximum_height(th as i32);
+    let bitmap = page
+        .render_with_config(&render_config)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+    Ok((bitmap.as_image(), content_type, page_count))
 }
 
 // -----------------------------------------------------------------------
@@ -1008,9 +1011,7 @@ impl PdfWorkerPool {
         })
     }
 
-    fn parse_render_response(
-        data: &[u8],
-    ) -> std::io::Result<(image::DynamicImage, PdfPageContentType)> {
+    fn parse_render_response(data: &[u8]) -> std::io::Result<RenderResult> {
         if data.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -1021,8 +1022,9 @@ impl PdfWorkerPool {
             let msg = std::str::from_utf8(&data[1..]).unwrap_or("unknown error");
             return Err(std::io::Error::new(std::io::ErrorKind::Other, msg));
         }
-        // [status 1B][w 4B][h 4B][type_tag 1B][raster_w 4B][raster_h 4B][pixels...]
-        if data[0] != STATUS_OK || data.len() < 18 {
+        // [status 1B][w 4B][h 4B][type_tag 1B][raster_w 4B][raster_h 4B][page_count 4B][pixels...]
+        // 全 22B のヘッダ。`page_count` は v1.0.0 で追加 (PDF メタキャッシュ用)。
+        if data[0] != STATUS_OK || data.len() < 22 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "invalid render response",
@@ -1033,6 +1035,7 @@ impl PdfWorkerPool {
         let type_tag = data[9];
         let raster_w = u32::from_le_bytes(data[10..14].try_into().unwrap());
         let raster_h = u32::from_le_bytes(data[14..18].try_into().unwrap());
+        let page_count = u32::from_le_bytes(data[18..22].try_into().unwrap());
         let content_type = if type_tag == 1 {
             PdfPageContentType::Raster {
                 w: raster_w,
@@ -1041,7 +1044,7 @@ impl PdfWorkerPool {
         } else {
             PdfPageContentType::Vector
         };
-        let pixels = &data[18..];
+        let pixels = &data[22..];
         let expected = (w as usize) * (h as usize) * 4;
         if pixels.len() != expected {
             return Err(std::io::Error::new(
@@ -1058,7 +1061,11 @@ impl PdfWorkerPool {
                 "failed to create RgbaImage",
             )
         })?;
-        Ok((image::DynamicImage::ImageRgba8(img_buf), content_type))
+        Ok(RenderResult {
+            image: image::DynamicImage::ImageRgba8(img_buf),
+            content_type,
+            page_count,
+        })
     }
 }
 
@@ -1242,7 +1249,7 @@ enum WorkerRequest {
         target_px: u32,
         password: Option<String>,
         cancel: Option<Arc<AtomicBool>>,
-        reply: mpsc::Sender<std::io::Result<(image::DynamicImage, PdfPageContentType)>>,
+        reply: mpsc::Sender<std::io::Result<RenderResult>>,
     },
     /// PDF document info (§16 step 17, ingest_worker 経由で呼ばれる)
     GetInfo {
@@ -1379,7 +1386,13 @@ impl PdfWorker {
                 if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
                     return;
                 }
-                let result = core_render(pdfium, &path, page_num, target_px, password.as_deref());
+                let result =
+                    core_render_with_count(pdfium, &path, page_num, target_px, password.as_deref())
+                        .map(|(image, content_type, page_count)| RenderResult {
+                            image,
+                            content_type,
+                            page_count,
+                        });
                 if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
                     return;
                 }
@@ -1469,6 +1482,20 @@ impl PdfPageContentType {
             Self::Vector => 4096.0,
         }
     }
+}
+
+/// PDF ページ render の結果一式 (v1.0.0)。
+///
+/// 従来は `(image, content_type)` のタプルだったが、PDF メタキャッシュ
+/// (`catalog::CatalogDb::set_pdf_meta`) に `page_count` を投入するため、worker
+/// から page_count も返すようにした。caller は `result.image` / `result.content_type`
+/// で従来コードを置き換えるだけで OK。PDF context (= path.ends_with(".pdf")) の
+/// caller は `result.page_count` を catalog DB へ書き込むことで C-thumb 経路でも
+/// cache が温まる。
+pub struct RenderResult {
+    pub image: image::DynamicImage,
+    pub content_type: PdfPageContentType,
+    pub page_count: u32,
 }
 
 pub struct PdfPageEntry {
@@ -1585,7 +1612,7 @@ pub fn render_page(
     password: Option<&str>,
     cancel: Option<Arc<AtomicBool>>,
     priority: JobPriority,
-) -> std::io::Result<(image::DynamicImage, PdfPageContentType)> {
+) -> std::io::Result<RenderResult> {
     if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::Interrupted,
@@ -1695,7 +1722,7 @@ pub fn render_page_async(
     password: Option<&str>,
 ) -> (
     Arc<AtomicBool>,
-    mpsc::Receiver<std::io::Result<(image::DynamicImage, PdfPageContentType)>>,
+    mpsc::Receiver<std::io::Result<RenderResult>>,
 ) {
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();

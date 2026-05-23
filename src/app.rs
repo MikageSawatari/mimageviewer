@@ -2545,6 +2545,18 @@ pub struct App {
     /// するため) ので、単一フィールドで両方を賄える。
     pub(crate) fs_nav_after_pdf_enumerate: Option<bool>,
 
+    /// PDF メタキャッシュ (v1.0.0) ヒット時、placeholder grid を立てた page_count を覚えておく。
+    ///
+    /// `load_pdf_as_folder` で `catalog::pdf_meta` の hit があれば、即座に N セルの
+    /// placeholder `PdfPage` GridItems を作って `start_loading_items` で表示してしまう
+    /// (= 体感 0 秒)。並行して enumerate を裏で走らせ、`poll_pdf_enumerate` が結果を
+    /// 受け取った時点でこの値と比較する:
+    ///   - 一致 → grid 再構築不要、cache 更新だけして終わる
+    ///   - 不一致 (rare) → 警告ログ + 通常経路で再構築
+    /// `Some(N)` のとき「placeholder で立てた」状態、`None` のとき「キャッシュ未利用 or
+    /// 確定済み」状態。
+    pub(crate) pdf_placeholder_count: Option<u32>,
+
     // ── コンテキストメニュー: enumerate_handlers キャッシュ ────
     /// 拡張子ごとのシステム関連付けアプリ一覧キャッシュ (コンテキストメニュー開閉でクリア)
     pub(crate) cached_handlers: Option<(String, Vec<crate::open_with::AppHandler>)>,
@@ -3465,6 +3477,7 @@ impl App {
             pdf_enumerate_pending: None,
             zip_enumerate_pending: None,
             fs_nav_after_pdf_enumerate: None,
+            pdf_placeholder_count: None,
             cached_handlers: None,
             cached_nav_indices: None,
 
@@ -5969,20 +5982,39 @@ impl App {
         // ZIP 側 pending も一緒に捨てる (ZIP → PDF 遷移時の取り残し防止、Codex P2)。
         self.pdf_enumerate_pending = None;
         self.zip_enumerate_pending = None;
+        // 直前の cache-hit の placeholder 情報はクリア (= 新規 nav の出発点)。
+        self.pdf_placeholder_count = None;
 
         // ── パスワード確認 ──
-        let password: Option<String> = self
-            .pdf_passwords
-            .get(&pdf_path)
+        // **`saved_password`** = この PDF 固有の保存パスワード (`pdf_passwords` 経由)。
+        // **`password`** = enumerate に渡す実値 (saved_password 優先、無ければ
+        // session-level の `pdf_current_password` フォールバック)。
+        // メタキャッシュの placeholder gate には `saved_password.is_some()` を使う
+        // こと (= Codex P1 対策。session password の居座りで他 PDF の保護を bypass
+        // しないため)。
+        let saved_password: Option<String> = self.pdf_passwords.get(&pdf_path);
+        let password: Option<String> = saved_password
+            .clone()
             .or_else(|| self.pdf_current_password.clone());
 
         // パスワードチェックも非同期化したいが、ダイアログ表示のフローが複雑になるため
         // ここでは簡易判定: 保存済みパスワードがなければ非同期で check_password を含めて
         // enumerate を試みる。パスワードエラーは結果受信時にハンドルする。
 
-        // ── 非同期でページ列挙をリクエスト ──
+        // ── PDF メタキャッシュ (v1.0.0) lookup ──
+        // 過去に enumerate or サムネ render に成功した PDF はページ数が catalog DB に
+        // 永続化されている。mtime/file_size 一致なら即座に N セルの placeholder grid に
+        // 遷移して「キビキビ動く」体感を実現する (= PDFium 開封の 100ms〜1.3s を裏に隠す)。
+        // 検証 enumerate は並行して必ず走らせ、結果を `poll_pdf_enumerate` で照合する。
+        let placeholder_built = self.try_apply_pdf_meta_cache(&pdf_path, saved_password.is_some());
+
+        // ── 非同期でページ列挙をリクエスト (検証 + cache 更新) ──
         let handle = crate::pdf_loader::enumerate_pages_async(&pdf_path, password.as_deref());
         self.pdf_enumerate_pending = Some((pdf_path.clone(), password, handle));
+        if placeholder_built.is_some() {
+            // 検証用に覚えておく: 一致なら grid 再構築 skip、不一致なら再構築する。
+            self.pdf_placeholder_count = placeholder_built;
+        }
 
         // アドレスバーを即座に更新 (ローディング中であることを示す)
         self.address = pdf_path.to_string_lossy().to_string();
@@ -5996,6 +6028,89 @@ impl App {
         // 「Enter は効いたのか?」とユーザーが不安になる。左下に「読み込み中」バッジを
         // 出すのは `render_container_enumerate_overlay` ([ui_main.rs])。既存「先読み N/M」
         // と同じ場所 (LEFT_BOTTOM) なので、ユーザーの目線パターンに合う。
+    }
+
+    /// PDF メタキャッシュ (catalog DB の `pdf_meta` テーブル) を引いて、ヒットすれば
+    /// 即座に N セルの placeholder `PdfPage` GridItem を構築して `start_loading_items`
+    /// で表示する (= Enter→ページ一覧の体感を瞬時にする)。
+    ///
+    /// 戻り値: 表示した placeholder の page_count。cache miss / 利用不可なら `None`。
+    /// 呼び出し側は `self.pdf_placeholder_count` に保管し、`poll_pdf_enumerate` で
+    /// 実 enumerate の結果と照合する (一致なら再構築 skip、不一致なら通常経路で再構築)。
+    ///
+    /// `has_password` は呼び出し側で計算済みの「保存パスワードがあるか」フラグ。
+    /// cache が `password_required=1` のとき、保存パスワードが無い状態で placeholder を
+    /// 立てると後で正しくレンダできないので skip する (Codex P1 対応)。
+    fn try_apply_pdf_meta_cache(
+        &mut self,
+        pdf_path: &Path,
+        has_saved_password: bool,
+    ) -> Option<u32> {
+        let filename = pdf_path.file_name()?.to_str()?.to_string();
+        let parent = pdf_path.parent()?.to_path_buf();
+
+        // stat は同期 I/O だが ~1ms。catalog open より軽量。
+        let meta = std::fs::metadata(pdf_path).ok()?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)?;
+        let file_size = meta.len();
+
+        // 親フォルダの catalog DB を LRU 経由で取得 (warm なら ~0.1ms、cold open 時のみ
+        // 5-150ms)。直接 `CatalogDb::open` を呼ぶと毎回 PRAGMA + schema init が走って
+        // Enter→placeholder の体感が伸びる (Codex P2 対応)。
+        let (page_count, password_required) = {
+            let catalog = self.get_or_open_catalog(&parent)?;
+            catalog
+                .get_pdf_meta(&filename, mtime, file_size as i64)
+                .ok()??
+        };
+
+        if page_count == 0 {
+            return None;
+        }
+
+        // パスワード保護下で開かれたキャッシュは、`pdf_passwords` の **この PDF 固有の**
+        // 保存パスワードがある場合だけ trust する (Codex P1 対応: 他 PDF の session
+        // パスワードで保護 PDF の placeholder を出すと bypass になる)。
+        if password_required && !has_saved_password {
+            crate::logger::log(format!(
+                "  pdf meta cache: skip placeholder for password-protected {filename} (no saved password)"
+            ));
+            return None;
+        }
+
+        // ── placeholder grid 構築 ──
+        let mut items: Vec<GridItem> = Vec::with_capacity(page_count as usize);
+        let mut image_metas: Vec<Option<(i64, i64)>> = Vec::with_capacity(page_count as usize);
+        let mut existing_keys: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(page_count as usize);
+        for i in 0..page_count {
+            items.push(GridItem::PdfPage {
+                pdf_path: pdf_path.to_path_buf(),
+                page_num: i,
+                content_type: None, // 実際の render 時に解析
+            });
+            image_metas.push(Some((mtime, file_size as i64)));
+            existing_keys.insert(crate::grid_item::pdf_page_cache_key(i));
+        }
+
+        crate::logger::log(format!(
+            "  pdf meta cache hit: {filename} page_count={page_count} (instant placeholder)"
+        ));
+
+        self.start_loading_items(
+            pdf_path.to_path_buf(),
+            items,
+            image_metas,
+            existing_keys,
+            Vec::new(),
+            None,
+        );
+
+        Some(page_count)
     }
 
     /// PDF ページ列挙の非同期応答をポーリングする。
@@ -6023,6 +6138,7 @@ impl App {
                 let path = pdf_path.clone();
                 self.pdf_enumerate_pending = None;
                 self.fs_nav_after_pdf_enumerate = None;
+                self.pdf_placeholder_count = None;
                 self.start_loading_items(
                     path,
                     Vec::new(),
@@ -6051,12 +6167,18 @@ impl App {
 
         match result {
             Ok(pages) => {
-                crate::logger::log(format!("  pdf: {} pages", pages.len()));
-                self.pdf_current_password = password;
+                let actual_count = pages.len() as u32;
+                crate::logger::log(format!("  pdf: {actual_count} pages"));
+                self.pdf_current_password = password.clone();
 
+                // ── パスワード保存 (placeholder hit/miss 共通の tail 処理) ──
                 // パスワードダイアログで「保存する」を ON にして OK した場合、
-                // enumerate 成功時点で DPAPI に保存する (ダイアログでの sync 検証を
-                // やめた代替経路)。パスが一致しないのは別 PDF が割り込んだケースなので保存しない。
+                // enumerate 成功時点で DPAPI に保存する。
+                //
+                // **pdf_meta の書き込みより先**に実行 (Codex P1 follow-up 対応):
+                // 後だと、ダイアログ入力直後の retry で `pdf_passwords` に新パスワードが
+                // 入る前に password_required=false で書かれてしまい、次回起動時に
+                // cache hit & placeholder 表示でページ数が露出する。
                 if let Some((save_path, pw)) = self.pdf_password_pending_save.take() {
                     if save_path == pdf_path {
                         self.pdf_passwords.set(&save_path, &pw);
@@ -6064,32 +6186,105 @@ impl App {
                     }
                 }
 
-                let mut items: Vec<GridItem> = Vec::new();
-                let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
-                let mut existing_keys: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-
-                for page in &pages {
-                    let key = crate::grid_item::pdf_page_cache_key(page.page_num);
-                    existing_keys.insert(key);
-                    items.push(GridItem::PdfPage {
-                        pdf_path: pdf_path.clone(),
-                        page_num: page.page_num,
-                        content_type: None, // render 時に解析
-                    });
-                    image_metas.push(Some((page.mtime, page.file_size as i64)));
+                // ── PDF メタキャッシュ (v1.0.0) への書き込み ──
+                // 確定 page_count を親フォルダ catalog DB に保存。`password_required`
+                // 列の決定ルール (Codex P1/P2 follow-up 対応):
+                //
+                //   1. **保存パスワード有 (この PDF 固有、上の pending_save 消化済み含む)**
+                //      → `set_pdf_meta` で true 書く (saved password が必要だった = 確信)
+                //   2. **password=None で enumerate 成功**
+                //      → `set_pdf_meta` で false 書く (パスワード不要 = 確信)
+                //   3. **password=Some だが保存パスワード無し (= session-level の暫定 pw、
+                //      もしくはダイアログ入力で「保存しない」を選んだ未確定パスワード)**
+                //      → `set_pdf_meta_thumb` (**UPDATE only**) で書く。**新規行は作らない**。
+                //      新規行を false で作ると、保護 PDF を保存なしパスワードで開いた
+                //      ケースが永久に「非保護」記録されて次回 placeholder で page 数が
+                //      露出する bypass になる。次回 enumerate で確信値が取れた時に
+                //      新規行が初めて作成される。
+                let saved_pw_now = self.pdf_passwords.get(&pdf_path).is_some();
+                let session_only = password.is_some() && !saved_pw_now;
+                if let (Some(parent), Some(filename), Some(page0)) = (
+                    pdf_path.parent().map(|p| p.to_path_buf()),
+                    pdf_path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string()),
+                    pages.first(),
+                ) {
+                    let page0_mtime = page0.mtime;
+                    let page0_size = page0.file_size as i64;
+                    // 親フォルダ catalog は LRU 経由で取得 (Codex P2)
+                    if let Some(cat) = self.get_or_open_catalog(&parent) {
+                        let result = if session_only {
+                            cat.set_pdf_meta_thumb(&filename, page0_mtime, page0_size, actual_count)
+                        } else {
+                            cat.set_pdf_meta(
+                                &filename,
+                                page0_mtime,
+                                page0_size,
+                                actual_count,
+                                saved_pw_now,
+                            )
+                        };
+                        if let Err(e) = result {
+                            crate::logger::log(format!(
+                                "  pdf meta cache: set failed for {filename}: {e}"
+                            ));
+                        }
+                    }
                 }
 
-                self.start_loading_items(
-                    pdf_path,
-                    items,
-                    image_metas,
-                    existing_keys,
-                    Vec::new(),
-                    None,
-                );
+                // ── placeholder grid との照合 (Codex P1-2 対応) ──
+                // cache hit で N セル placeholder を立てていた場合、実 enumerate の
+                // page_count と一致するか確認。完全一致なら grid 再構築は skip して
+                // Ctrl+↑↓ deferred fullscreen 等の tail 処理だけ実行する。
+                let placeholder_count = self.pdf_placeholder_count.take();
+                let need_rebuild = match placeholder_count {
+                    Some(n) if n == actual_count => {
+                        crate::logger::log(format!(
+                            "  pdf meta cache verified: count={actual_count} (no grid rebuild)"
+                        ));
+                        false
+                    }
+                    Some(n) => {
+                        crate::logger::log(format!(
+                            "  pdf meta cache mismatch: cached={n} actual={actual_count} for {} (rebuilding grid)",
+                            pdf_path.display()
+                        ));
+                        true
+                    }
+                    None => true, // cache miss / placeholder 未作成
+                };
+
+                if need_rebuild {
+                    let mut items: Vec<GridItem> = Vec::new();
+                    let mut image_metas: Vec<Option<(i64, i64)>> = Vec::new();
+                    let mut existing_keys: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+
+                    for page in &pages {
+                        let key = crate::grid_item::pdf_page_cache_key(page.page_num);
+                        existing_keys.insert(key);
+                        items.push(GridItem::PdfPage {
+                            pdf_path: pdf_path.clone(),
+                            page_num: page.page_num,
+                            content_type: None, // render 時に解析
+                        });
+                        image_metas.push(Some((page.mtime, page.file_size as i64)));
+                    }
+
+                    self.start_loading_items(
+                        pdf_path.clone(),
+                        items,
+                        image_metas,
+                        existing_keys,
+                        Vec::new(),
+                        None,
+                    );
+                }
 
                 // Ctrl+↑↓ フォルダナビから遷移してきた場合はここで fullscreen を開き直す。
+                // placeholder hit/miss 問わず必ず実行する (Codex P1-2)。
                 if let Some(_forward) = self.fs_nav_after_pdf_enumerate.take() {
                     if let Some(new_idx) = self.find_fullscreen_nav_target() {
                         self.open_fullscreen(new_idx);
@@ -6115,6 +6310,20 @@ impl App {
                     // Ctrl+↑↓ 由来の deferred fullscreen 意図は破棄する
                     // (パスワード入力後に再び fullscreen にしたければユーザーが手動で開く)。
                     self.fs_nav_after_pdf_enumerate = None;
+                    // PDF メタキャッシュで placeholder grid を立てていた場合、レンダ
+                    // できない N セルがそのまま残るので空に戻す (Codex P1 対応)。
+                    // 空に戻すと render_grid の中央表示が「表示するファイルがありません」
+                    // になりつつ、パスワードダイアログがその上に出る。
+                    if self.pdf_placeholder_count.take().is_some() {
+                        self.start_loading_items(
+                            pdf_path.clone(),
+                            Vec::new(),
+                            Vec::new(),
+                            std::collections::HashSet::new(),
+                            Vec::new(),
+                            None,
+                        );
+                    }
                     self.pdf_password_pending_path = Some(pdf_path);
                     self.show_pdf_password_dialog = true;
                     self.pdf_password_input.clear();
@@ -6127,8 +6336,10 @@ impl App {
                     self.pdf_password_save = false;
                     return;
                 }
-                // その他の失敗: deferred 意図をクリアしてグリッド表示にフォールバック
+                // その他の失敗: deferred 意図と placeholder count をクリアして
+                // グリッド表示にフォールバック
                 self.fs_nav_after_pdf_enumerate = None;
+                self.pdf_placeholder_count = None;
                 crate::logger::log(format!("  pdf enumerate failed: {e}"));
                 self.start_loading_items(
                     pdf_path,
@@ -13120,7 +13331,11 @@ impl App {
                     Some(cancel.clone()),
                     pdf_priority,
                 ) {
-                    Ok((img, content_type)) => {
+                    Ok(crate::pdf_loader::RenderResult {
+                        image: img,
+                        content_type,
+                        page_count: _,
+                    }) => {
                         let elapsed = t.elapsed().as_secs_f64() * 1000.0;
                         crate::logger::log(format!(
                             "  fs load pdf: {elapsed:.0}ms  idx={idx}  {name}  {}x{}  {:?}",
@@ -13419,7 +13634,11 @@ impl App {
 
         std::thread::spawn(move || {
             match render_rx.recv() {
-                Ok(Ok((img, _content_type))) => {
+                Ok(Ok(crate::pdf_loader::RenderResult {
+                    image: img,
+                    content_type: _content_type,
+                    page_count: _,
+                })) => {
                     if cancel.load(Ordering::Relaxed) {
                         return;
                     }
@@ -16954,6 +17173,27 @@ impl App {
                             let pdf_cache_map = pdf_catalog.load_all().unwrap_or_default();
                             let page_count = pages.len();
 
+                            // PDF メタキャッシュ (v1.0.0) に確定 page_count を書き込む
+                            // (Codex P3 対応: バッチキャッシュ生成経路でも pdf_meta を
+                            // 投入することで、その後の Enter で instant ヒットさせる)。
+                            if let Some(filename) = pdf_path.file_name().and_then(|n| n.to_str()) {
+                                // `pw_store.get(pdf_path)` が `password.is_some()` ==
+                                // 「この PDF 固有の保存パスワードがある」と等価。session 経由
+                                // ではないので true/false 判定がそのまま信頼できる。
+                                let password_required = password.is_some();
+                                if let Err(e) = catalog.set_pdf_meta(
+                                    filename,
+                                    *pdf_mtime,
+                                    *pdf_file_size,
+                                    page_count as u32,
+                                    password_required,
+                                ) {
+                                    crate::logger::log(format!(
+                                        "  cache creator: set_pdf_meta failed for {filename}: {e}"
+                                    ));
+                                }
+                            }
+
                             // PDFium ワーカーはシングルスレッド → 順次処理
                             for i in 0..page_count {
                                 if cancel.load(Ordering::Relaxed) {
@@ -16991,7 +17231,7 @@ impl App {
 
                             // 先頭1ページを親フォルダの DB にも保存
                             if page_count > 0 && !cache_map.contains_key(&folder_key) {
-                                if let Ok((img, _)) = crate::pdf_loader::render_page(
+                                if let Ok(res) = crate::pdf_loader::render_page(
                                     pdf_path,
                                     0,
                                     thumb_px,
@@ -16999,6 +17239,7 @@ impl App {
                                     None,
                                     crate::pdf_loader::JobPriority::Normal,
                                 ) {
+                                    let img = res.image;
                                     if let Some(bytes) = encode_and_save(
                                         &img,
                                         &folder_key,
@@ -17014,11 +17255,44 @@ impl App {
                             }
                         } else {
                             // 先頭1ページのみ（フォルダ一覧用サムネイル）
+                            //
+                            // **早期 continue より先に pdf_meta を補完**する (Codex P3
+                            // follow-up 対応): 既存ユーザーで thumb は既にキャッシュ済み
+                            // だが pdf_meta が未投入の PDF が存在する。`continue` で
+                            // 飛ばすと pdf_meta が永遠に埋まらず、Enter→placeholder の
+                            // 即時化が効かない穴になる。enumerate_pages を 1 回呼んで
+                            // page_count を取り pdf_meta を埋めるだけ (中身の render は
+                            // 不要なのでサムネ再生成は引き続き skip)。
+                            if let Some(filename) = pdf_path.file_name().and_then(|n| n.to_str()) {
+                                let meta_missing = catalog
+                                    .get_pdf_meta(filename, *pdf_mtime, *pdf_file_size)
+                                    .ok()
+                                    .flatten()
+                                    .is_none();
+                                if meta_missing {
+                                    if let Ok(pages) =
+                                        crate::pdf_loader::enumerate_pages(pdf_path, pw_ref)
+                                    {
+                                        let password_required = password.is_some();
+                                        if let Err(e) = catalog.set_pdf_meta(
+                                            filename,
+                                            *pdf_mtime,
+                                            *pdf_file_size,
+                                            pages.len() as u32,
+                                            password_required,
+                                        ) {
+                                            crate::logger::log(format!(
+                                                "  cache creator (catch-up): set_pdf_meta failed for {filename}: {e}"
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
                             if cache_map.contains_key(&folder_key) {
                                 continue;
                             }
                             // render_page がパスワード不正時に Err を返すのでそのままスキップ
-                            if let Ok((img, _)) = crate::pdf_loader::render_page(
+                            if let Ok(res) = crate::pdf_loader::render_page(
                                 pdf_path,
                                 0,
                                 thumb_px,
@@ -17026,6 +17300,26 @@ impl App {
                                 None,
                                 crate::pdf_loader::JobPriority::Normal,
                             ) {
+                                // PDF メタキャッシュにも page_count を投入する
+                                // (Codex P3 対応)。`password_required` は確信できる場合
+                                // (= この PDF 固有の保存パスワードあり) のみ true。
+                                if let Some(filename) =
+                                    pdf_path.file_name().and_then(|n| n.to_str())
+                                {
+                                    let password_required = password.is_some();
+                                    if let Err(e) = catalog.set_pdf_meta(
+                                        filename,
+                                        *pdf_mtime,
+                                        *pdf_file_size,
+                                        res.page_count,
+                                        password_required,
+                                    ) {
+                                        crate::logger::log(format!(
+                                            "  cache creator (single): set_pdf_meta failed for {filename}: {e}"
+                                        ));
+                                    }
+                                }
+                                let img = res.image;
                                 if let Some(bytes) = encode_and_save(
                                     &img,
                                     &folder_key,

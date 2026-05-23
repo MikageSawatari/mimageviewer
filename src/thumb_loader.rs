@@ -1119,7 +1119,40 @@ pub fn load_one_cached(
             cancel.map(Arc::clone),
             crate::pdf_loader::JobPriority::Normal,
         )
-        .map(|(img, _ct)| img)
+        .map(|res| {
+            // C-thumb (v1.0.0): 親フォルダ内の PDF サムネ render の場合、ついでに
+            // pdf_meta テーブルへページ数を書き込む。`cache_key_override` が
+            // "pdfthumb:" 始まりのときが「親フォルダ catalog 経路」の signature。
+            // PDF 自身を仮想フォルダとして開いている経路 (= cache_key_override None
+            // で pdf_page Some) は catalog が PDF 内サムネ用なので skip。
+            //
+            // **password_required の決定** (Codex P1/P2 follow-up 対応):
+            //   - pdf_password=None で render 成功 = 「パスワード不要」確信あり
+            //     → `set_pdf_meta_safe` (新規行 OK、既存 password_required は保持)
+            //   - pdf_password=Some = session-level pw が居座っているだけかもしれず、
+            //     PDF が本当に保護されているか確信できない (= unknown)
+            //     → `set_pdf_meta_thumb` (UPDATE only、新規行は作らない)
+            // unknown を false-default で挿入すると、保護 PDF が永続的に
+            // 「非保護」記録されて次回 placeholder で page 数が露出する bypass を
+            // 生むので、新規行は確信できる経路 (= enumerate 成功時) のみで作る。
+            if let (Some(cat), Some(key)) = (catalog, cache_key_override) {
+                if key.starts_with(CACHE_KEY_PDF) {
+                    if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
+                        let write_result = if pdf_password.is_none() {
+                            cat.set_pdf_meta_safe(filename, mtime, file_size, res.page_count)
+                        } else {
+                            cat.set_pdf_meta_thumb(filename, mtime, file_size, res.page_count)
+                        };
+                        if let Err(e) = write_result {
+                            crate::logger::log(format!(
+                                "thumb_loader: pdf_meta write failed for {filename}: {e}"
+                            ));
+                        }
+                    }
+                }
+            }
+            res.image
+        })
         .map_err(|e| image::ImageError::IoError(e))
     } else if let Some(entry_name) = zip_entry {
         // プリロード済みバイト列があれば ZIP を再度 open せずにデコード
@@ -1627,7 +1660,7 @@ pub fn build_and_save_one_pdf(
     thumb_quality: u8,
 ) -> Option<usize> {
     // バッチキャッシュ作成は Normal 優先度: フルスクリーン操作より優先されない
-    let (img, _) = crate::pdf_loader::render_page(
+    let res = crate::pdf_loader::render_page(
         pdf_path,
         page_num,
         thumb_px,
@@ -1638,7 +1671,7 @@ pub fn build_and_save_one_pdf(
     .ok()?;
     let key = crate::grid_item::pdf_page_cache_key(page_num);
     encode_and_save(
-        &img,
+        &res.image,
         &key,
         catalog,
         mtime,

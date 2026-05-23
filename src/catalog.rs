@@ -226,6 +226,139 @@ impl CatalogDb {
         }
         Ok(())
     }
+
+    // -------------------------------------------------------------------
+    // PDF ページ数メタキャッシュ (v1.0.0)
+    //
+    // load_pdf_as_folder で Enter→ページ一覧の体感を瞬時にするため、PDFium による
+    // PDF open + 構造解析 (warm 5-30ms / cold 100-1300ms) の結果をフォルダごとの
+    // catalog DB に永続化する。lookup 時に mtime/file_size が一致すれば cache hit
+    // とみなし、即座に N セルの placeholder grid を立てる (= 824ms 待ちを回避)。
+    //
+    // `password_required` は「最後に成功した enumerate がパスワード保護下だったか」
+    // を記録する。パスワード保存なしで cache hit のグリッドを見せると、後で保存
+    // パスワードが削除された場合に保護を bypass してしまうため、cache 利用前に
+    // `password_required==1 && pdf_passwords にエントリ無し` の組み合わせを
+    // 明示的に弾く (Codex P1 対応)。
+    // -------------------------------------------------------------------
+
+    /// PDF メタキャッシュをルックアップする。
+    ///
+    /// `(filename, mtime, file_size)` が完全に一致した場合のみ `Some((page_count,
+    /// password_required))` を返す。mtime/file_size 不一致は cache miss (None)。
+    /// `password_required == true` の場合、呼び出し側は更に「保存パスワードがある」
+    /// ことを確認してから cache を利用すること。
+    pub fn get_pdf_meta(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+    ) -> rusqlite::Result<Option<(u32, bool)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT page_count, password_required FROM pdf_meta \
+             WHERE filename = ?1 AND mtime = ?2 AND file_size = ?3",
+        )?;
+        let result = stmt
+            .query_row(params![filename, mtime, file_size], |r| {
+                let page_count: i64 = r.get(0)?;
+                let pw_req: i64 = r.get(1)?;
+                Ok((page_count.max(0) as u32, pw_req != 0))
+            })
+            .ok();
+        Ok(result)
+    }
+
+    /// PDF メタキャッシュを INSERT OR REPLACE する。
+    /// `page_count == 0` のような無効値もそのまま記録 (= 後で stale 検出に使える)。
+    /// `password_required` は呼び出し側が「この PDF 固有の保存パスワードが必要」と
+    /// 確信している場合だけ true を渡すこと。session 経由の暫定パスワードでは
+    /// `set_pdf_meta_thumb` 側を使う (既存値を保持する)。
+    pub fn set_pdf_meta(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        page_count: u32,
+        password_required: bool,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO pdf_meta \
+             (filename, mtime, file_size, page_count, password_required) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                filename,
+                mtime,
+                file_size,
+                page_count as i64,
+                if password_required { 1i64 } else { 0i64 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// 既存 `pdf_meta` 行が **同じ mtime/file_size のとき** のみ `page_count` を更新する。
+    /// それ以外 (新規行 / mtime or file_size 変化) は no-op。
+    ///
+    /// 用途: password=Some だが「この PDF の保存パスワードがある」とは確信できない
+    /// 経路 (= session-level の `pdf_current_password` が居座っているだけかもしれない、
+    /// or ユーザーがダイアログで入力したが「保存しない」を選んだ)。
+    ///
+    /// **mtime/file_size 一致条件の理由 (Codex P1 round 3 対応)**:
+    /// 単純な `UPDATE WHERE filename=?` だと、stale な「非暗号化版」の行が、暗号化版に
+    /// ファイル置換された後の UPDATE で新 mtime/size を被って lookup hit するようになる
+    /// → password_required=0 が保持されたまま placeholder で bypass される。
+    /// mtime/file_size が既存行と一致するときだけ更新することで、
+    ///   - ファイル不変 (= mtime/size 同じ) → 既存 password_required の確信を保ったまま
+    ///     page_count を verify update (実質 no-op になることが多い)
+    ///   - ファイル変化 (= mtime/size 違う) → no-op、stale 行はそのまま放置。次回 lookup
+    ///     で mtime mismatch して miss するので、確信あり経路で改めて書き直される
+    /// が成立する。
+    pub fn set_pdf_meta_thumb(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        page_count: u32,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE pdf_meta \
+             SET page_count = ?4 \
+             WHERE filename = ?1 AND mtime = ?2 AND file_size = ?3",
+            params![filename, mtime, file_size, page_count as i64],
+        )?;
+        Ok(())
+    }
+
+    /// `password 不要が確信できる場合**用の UPSERT。
+    /// 新規行は `password_required=0` で挿入、既存行は `password_required` 列を
+    /// **保持しつつ** `page_count`/`mtime`/`file_size` を更新する。
+    ///
+    /// 用途: サムネワーカーが `pdf_password=None` で render に成功した場合 (=
+    /// PDFium 側で「パスワード不要」と判明した = 確信あり)。これは新規行で false を
+    /// 入れても問題ない。
+    pub fn set_pdf_meta_safe(
+        &self,
+        filename: &str,
+        mtime: i64,
+        file_size: i64,
+        page_count: u32,
+    ) -> rusqlite::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO pdf_meta \
+             (filename, mtime, file_size, page_count, password_required) \
+             VALUES (?1, ?2, ?3, ?4, 0) \
+             ON CONFLICT(filename) DO UPDATE SET \
+               mtime = excluded.mtime, \
+               file_size = excluded.file_size, \
+               page_count = excluded.page_count",
+            params![filename, mtime, file_size, page_count as i64],
+        )?;
+        Ok(())
+    }
 }
 
 fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -243,6 +376,13 @@ fn init_schema(conn: &Connection) -> rusqlite::Result<()> {
              thumb_data     BLOB    NOT NULL,
              source_width   INTEGER,
              source_height  INTEGER
+         );
+         CREATE TABLE IF NOT EXISTS pdf_meta (
+             filename          TEXT    NOT NULL PRIMARY KEY,
+             mtime             INTEGER NOT NULL,
+             file_size         INTEGER NOT NULL,
+             page_count        INTEGER NOT NULL,
+             password_required INTEGER NOT NULL DEFAULT 0
          );",
     )?;
     // 非破壊マイグレーション: 既存 DB で source_width/source_height が欠けていれば追加する。
@@ -717,5 +857,207 @@ mod tests {
         );
         // JPEG SOI のみ (SOF0 まで届かない)
         assert_eq!(decode_thumb_dims(b"\xFF\xD8\xFF\xE0"), None);
+    }
+
+    // -- pdf_meta --
+
+    #[test]
+    fn pdf_meta_set_and_get_roundtrip() {
+        let db = open_in_memory();
+        db.set_pdf_meta("foo.pdf", 1000, 2048, 32, false).unwrap();
+
+        let result = db.get_pdf_meta("foo.pdf", 1000, 2048).unwrap();
+        assert_eq!(result, Some((32, false)));
+    }
+
+    #[test]
+    fn pdf_meta_mtime_mismatch_returns_none() {
+        let db = open_in_memory();
+        db.set_pdf_meta("foo.pdf", 1000, 2048, 32, false).unwrap();
+
+        // mtime が変わったら cache miss
+        let result = db.get_pdf_meta("foo.pdf", 1001, 2048).unwrap();
+        assert_eq!(result, None, "mtime 変化で cache miss");
+    }
+
+    #[test]
+    fn pdf_meta_file_size_mismatch_returns_none() {
+        let db = open_in_memory();
+        db.set_pdf_meta("foo.pdf", 1000, 2048, 32, false).unwrap();
+
+        // file_size が変わったら cache miss
+        let result = db.get_pdf_meta("foo.pdf", 1000, 4096).unwrap();
+        assert_eq!(result, None, "file_size 変化で cache miss");
+    }
+
+    #[test]
+    fn pdf_meta_password_required_flag_preserved() {
+        let db = open_in_memory();
+        db.set_pdf_meta("locked.pdf", 100, 500, 8, true).unwrap();
+
+        let result = db.get_pdf_meta("locked.pdf", 100, 500).unwrap();
+        assert_eq!(result, Some((8, true)));
+    }
+
+    #[test]
+    fn pdf_meta_insert_or_replace() {
+        let db = open_in_memory();
+        // 同じ filename で 2 回 set → 2 回目で上書き
+        db.set_pdf_meta("foo.pdf", 1000, 2048, 32, false).unwrap();
+        db.set_pdf_meta("foo.pdf", 1000, 2048, 100, true).unwrap();
+
+        let result = db.get_pdf_meta("foo.pdf", 1000, 2048).unwrap();
+        assert_eq!(result, Some((100, true)), "2 回目の値が残る");
+    }
+
+    #[test]
+    fn pdf_meta_get_missing_returns_none() {
+        let db = open_in_memory();
+        let result = db.get_pdf_meta("nonexistent.pdf", 1000, 2048).unwrap();
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn pdf_meta_does_not_affect_thumbnails_table() {
+        // pdf_meta テーブルと thumbnails テーブルが独立していることを確認
+        let db = open_in_memory();
+        db.set_pdf_meta("foo.pdf", 1000, 2048, 32, false).unwrap();
+
+        let all = db.load_all().unwrap();
+        assert!(all.is_empty(), "thumbnails は空のまま");
+    }
+
+    #[test]
+    fn pdf_meta_thumb_preserves_password_required_flag() {
+        // unknown 経路 (session-only pw など) の verify update が password_required を
+        // 消さないこと (mtime/size 一致の場合のみ page_count update が走る)
+        let db = open_in_memory();
+        // 既存: パスワード必須として記録済み
+        db.set_pdf_meta("locked.pdf", 1000, 2048, 32, true).unwrap();
+        // 同じ mtime/size での unknown 経路 update (page_count もたまたま同じ)
+        db.set_pdf_meta_thumb("locked.pdf", 1000, 2048, 32).unwrap();
+
+        let result = db.get_pdf_meta("locked.pdf", 1000, 2048).unwrap();
+        assert_eq!(
+            result,
+            Some((32, true)),
+            "password_required=true が保持される"
+        );
+    }
+
+    #[test]
+    fn pdf_meta_thumb_does_not_insert_new_row() {
+        // **Codex P1 round 2 対応**: 新規 PDF (= まだ pdf_meta 行が無い) で
+        // unknown 経路 (set_pdf_meta_thumb) を呼んでも、false-default 行を作らない。
+        // 保護 PDF を「パスワード入力したが保存しない」で開いたケースで、永続的に
+        // 「非保護」と記録されてしまう bypass を防ぐ。
+        let db = open_in_memory();
+        db.set_pdf_meta_thumb("new.pdf", 500, 1024, 16).unwrap();
+
+        let result = db.get_pdf_meta("new.pdf", 500, 1024).unwrap();
+        assert_eq!(result, None, "新規行は作られない (UPDATE only)");
+    }
+
+    #[test]
+    fn pdf_meta_thumb_does_not_promote_stale_row() {
+        // **Codex P1 round 3 対応**: 旧 stale 行 (例: 非暗号化として cache 済み) を、
+        // ファイル置換後 (暗号化版、新 mtime/size) の unknown 経路 update で
+        // 新 mtime/size に上書きすると password_required=0 のまま昇格してしまう。
+        // mtime/file_size 一致条件で no-op にする実装で防止する。
+        let db = open_in_memory();
+        // 旧: 非暗号化として記録 (mtime=1000, size=2000)
+        db.set_pdf_meta("foo.pdf", 1000, 2000, 10, false).unwrap();
+        // ファイル更新後、ユーザーが新版を session pw で開いて unknown 経路 update が来た
+        // (新 mtime=2000, size=3000) — 旧 stale 行を promote しようとする
+        db.set_pdf_meta_thumb("foo.pdf", 2000, 3000, 20).unwrap();
+
+        // 新 mtime/size での lookup は cache miss (stale 行は古いまま、新値で promote されない)
+        let new_lookup = db.get_pdf_meta("foo.pdf", 2000, 3000).unwrap();
+        assert_eq!(
+            new_lookup, None,
+            "新 mtime/size の cache hit が起こらない (stale 行 promote されず)"
+        );
+        // 旧 mtime/size の行はそのまま (page_count=10, password_required=false)
+        let old_lookup = db.get_pdf_meta("foo.pdf", 1000, 2000).unwrap();
+        assert_eq!(
+            old_lookup,
+            Some((10, false)),
+            "旧 mtime/size の行は元のまま変更されない"
+        );
+    }
+
+    #[test]
+    fn pdf_meta_thumb_updates_page_count_when_mtime_size_match() {
+        // mtime/file_size が既存行と一致するときは page_count を更新する (verify update)。
+        // password_required 列は保持。
+        let db = open_in_memory();
+        db.set_pdf_meta("foo.pdf", 1000, 2048, 32, true).unwrap();
+        // 同じ mtime/size で page_count だけ違う update (例: 別経路でカウントを再計測)
+        db.set_pdf_meta_thumb("foo.pdf", 1000, 2048, 35).unwrap();
+
+        let result = db.get_pdf_meta("foo.pdf", 1000, 2048).unwrap();
+        assert_eq!(
+            result,
+            Some((35, true)),
+            "page_count 更新、password_required は保持"
+        );
+    }
+
+    #[test]
+    fn pdf_meta_thumb_noop_when_only_mtime_differs() {
+        // **Codex P3 round 4 対応**: mtime だけが異なる stale 状況でも promote しない。
+        let db = open_in_memory();
+        db.set_pdf_meta("foo.pdf", 1000, 2048, 32, true).unwrap();
+        // 新 mtime=2000 (size 同じ) で update が来た → 一致条件外
+        db.set_pdf_meta_thumb("foo.pdf", 2000, 2048, 50).unwrap();
+
+        // 新 mtime での lookup は cache miss (stale 行は古いまま)
+        let new_lookup = db.get_pdf_meta("foo.pdf", 2000, 2048).unwrap();
+        assert_eq!(new_lookup, None);
+        // 旧 mtime での行は不変
+        let old_lookup = db.get_pdf_meta("foo.pdf", 1000, 2048).unwrap();
+        assert_eq!(old_lookup, Some((32, true)));
+    }
+
+    #[test]
+    fn pdf_meta_thumb_noop_when_only_file_size_differs() {
+        // **Codex P3 round 4 対応**: file_size だけが異なる stale 状況でも promote しない。
+        let db = open_in_memory();
+        db.set_pdf_meta("foo.pdf", 1000, 2048, 32, true).unwrap();
+        // 新 size=4096 (mtime 同じ) で update が来た → 一致条件外
+        db.set_pdf_meta_thumb("foo.pdf", 1000, 4096, 50).unwrap();
+
+        // 新 size での lookup は cache miss
+        let new_lookup = db.get_pdf_meta("foo.pdf", 1000, 4096).unwrap();
+        assert_eq!(new_lookup, None);
+        // 旧 size での行は不変
+        let old_lookup = db.get_pdf_meta("foo.pdf", 1000, 2048).unwrap();
+        assert_eq!(old_lookup, Some((32, true)));
+    }
+
+    #[test]
+    fn pdf_meta_safe_inserts_new_row_with_false() {
+        // password=None 確定経路: 新規行を password_required=false で挿入する
+        let db = open_in_memory();
+        db.set_pdf_meta_safe("new.pdf", 500, 1024, 16).unwrap();
+
+        let result = db.get_pdf_meta("new.pdf", 500, 1024).unwrap();
+        assert_eq!(result, Some((16, false)), "新規行は false で挿入");
+    }
+
+    #[test]
+    fn pdf_meta_safe_preserves_password_required_on_existing_row() {
+        // 既存行に password_required=true がある場合、safe 経路でも保持する。
+        // (= 後から「password 不要」確信が来ても、過去の確信を上書きしない)
+        let db = open_in_memory();
+        db.set_pdf_meta("locked.pdf", 100, 500, 8, true).unwrap();
+        db.set_pdf_meta_safe("locked.pdf", 200, 600, 10).unwrap();
+
+        let result = db.get_pdf_meta("locked.pdf", 200, 600).unwrap();
+        assert_eq!(
+            result,
+            Some((10, true)),
+            "既存 password_required=true は保持、ただし page_count/mtime/size は更新"
+        );
     }
 }
