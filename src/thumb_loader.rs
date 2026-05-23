@@ -550,7 +550,10 @@ pub fn process_load_request(
     req: &LoadRequest,
     cache_map: &std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
     tx: &mpsc::Sender<ThumbMsg>,
-    catalog: Option<&crate::catalog::CatalogDb>,
+    // **v1.0.0**: `Arc` 経由で受け取る (= 内部の WebP cache hit catch-up worker が
+    // `Arc::clone` で所有権を持ったまま background スレッドに移すため)。既存 `&CatalogDb`
+    // を期待する内部関数 (`load_one_cached` 等) には `.as_ref()` で透過的に渡せる。
+    catalog: Option<&Arc<crate::catalog::CatalogDb>>,
     thumb_px: u32,
     thumb_quality: u8,
     display_px: u32,
@@ -565,6 +568,8 @@ pub fn process_load_request(
     // cascade 解決する。`None` のとき従来の純粋 auto-pick になる。
     pin_db: Option<&crate::folder_thumb_pins::FolderThumbPinDb>,
 ) {
+    // 内部関数向けに `&CatalogDb` を取り出しておく (= 既存シグネチャ互換)
+    let catalog_ref: Option<&crate::catalog::CatalogDb> = catalog.map(|a| a.as_ref());
     // カタログキー:
     // - 通常画像: ファイル名 (例: "foo.jpg")
     // - ZIP エントリ: エントリ名 (例: "work1/img01.jpg") 丸ごと
@@ -646,6 +651,13 @@ pub fn process_load_request(
                     ],
                 );
             }
+            // ── pdf_meta catch-up (v1.0.0) ──
+            // PDF ファイルサムネが WebP cache hit したケース (= render_page を skip した
+            // ケース) では `pdf_meta` テーブルが populate されない。v0.x 時代の WebP
+            // サムネ済みユーザーがアップグレードした場合、初回 Enter で cache miss
+            // になり 800ms 級の待ちが入る。サムネを表示した直後に裏で enumerate して
+            // pdf_meta を埋めることで、その PDF の初回 Enter から瞬時にする。
+            maybe_spawn_pdf_meta_catchup(req, catalog);
             return;
         }
     }
@@ -858,7 +870,7 @@ pub fn process_load_request(
         req.cache_key_override.as_deref(),
         req.idx,
         tx,
-        catalog,
+        catalog_ref,
         Some(cache_map),
         req.mtime,
         req.file_size,
@@ -886,6 +898,253 @@ pub fn process_load_request(
                 ("from_cache", serde_json::Value::from(false)),
             ],
         );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// pdf_meta catch-up worker (v1.0.0)
+// ─────────────────────────────────────────────────────────────────────
+//
+// WebP cache hit で PDF サムネが表示されたが、`pdf_meta` テーブルに行が
+// 無いケースで裏で enumerate を実行して populate するためのヘルパー。
+//
+// 主な発動シーン:
+//   - v0.x → v1.0.0 アップグレードユーザー: catalog 内の thumb は既に WebP で
+//     キャッシュ済みなので render_page が走らず、`pdf_meta` は空のまま。初回
+//     Enter で 800ms 級の待ちが発生する。
+//   - サムネ表示時にこの catch-up が裏で走れば、ユーザーが「サムネを見て一拍
+//     置いて Enter」する自然な間に pdf_meta が埋まる → 初回 Enter から瞬時化。
+//
+// 安全策 (Codex round 1-4 で確立したルール):
+//   1. `pdf_password=None` で enumerate を試みる (= session pw を持ち込まない)。
+//      成功すれば「password 不要」確定 → `set_pdf_meta(false)`。失敗すれば PDF が
+//      暗号化されている可能性が高いので何も書かない (= 次回 Enter で
+//      poll_pdf_enumerate がパスワードダイアログを出して正しい flag を書く)。
+//   2. 同じ path に対する重複 spawn を防ぐ in-flight set。多数のサムネが同時に
+//      cache hit しても、各 PDF につき 1 ジョブだけ走る。
+
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
+/// 現在 pdf_meta catch-up を実行中の PDF パス集合 (重複 spawn 防止)。
+static PDF_META_CATCHUP_IN_FLIGHT: OnceLock<Mutex<HashSet<std::path::PathBuf>>> = OnceLock::new();
+
+fn catchup_inflight_set() -> &'static Mutex<HashSet<std::path::PathBuf>> {
+    PDF_META_CATCHUP_IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// WebP cache hit 後に呼ばれ、必要なら背景スレッドで pdf_meta catch-up を spawn する。
+///
+/// 条件:
+///   - `cache_key_override` が `"pdfthumb:"` で始まる (= 親フォルダ catalog 経路の PDF サムネ)
+///   - `pdf_page` が `Some` (PDF context の確認)
+///   - `catalog` が `Some`
+///   - `pdf_meta` lookup が miss (= 既に populate 済みなら何もしない)
+///   - in-flight set に同 path が無い (重複 spawn 防止)
+fn maybe_spawn_pdf_meta_catchup(
+    req: &LoadRequest,
+    catalog: Option<&Arc<crate::catalog::CatalogDb>>,
+) {
+    let Some(key) = req.cache_key_override.as_deref() else {
+        return;
+    };
+    if !key.starts_with(CACHE_KEY_PDF) {
+        return;
+    }
+    if req.pdf_page.is_none() {
+        return;
+    }
+    let Some(cat_arc) = catalog else {
+        return;
+    };
+    let Some(filename) = req.path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    // 既に populate 済みなら何もしない
+    let meta_present = cat_arc
+        .get_pdf_meta(filename, req.mtime, req.file_size)
+        .ok()
+        .flatten()
+        .is_some();
+    if meta_present {
+        return;
+    }
+
+    // 重複 spawn の防止: 既に同 path で進行中なら skip
+    let path_owned = req.path.clone();
+    {
+        let mut set = catchup_inflight_set().lock().unwrap();
+        if set.contains(&path_owned) {
+            return;
+        }
+        set.insert(path_owned.clone());
+    }
+
+    let cat_clone = Arc::clone(cat_arc);
+    let mtime = req.mtime;
+    let file_size = req.file_size;
+    let filename_owned = filename.to_string();
+    let path_for_thread = path_owned.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("pdf-meta-catchup".into())
+        .spawn(move || {
+            // RAII で in-flight set から確実に取り除く (panic 安全)
+            let _guard = InFlightGuard(path_for_thread.clone());
+            // password=None で試行: 暗号化 PDF なら失敗 → 書き込み skip。成功すれば
+            // password 不要が確定 (= set_pdf_meta(false) で確信あり書き込み)。
+            // session pw を持ち込まないことで、保護 PDF を誤って「非保護」記録する
+            // bypass を構造的に防ぐ。
+            if let Ok(entries) = crate::pdf_loader::enumerate_pages(&path_for_thread, None) {
+                if let Err(e) = cat_clone.set_pdf_meta(
+                    &filename_owned,
+                    mtime,
+                    file_size,
+                    entries.len() as u32,
+                    false, // password not required (enumerate succeeded without pw)
+                ) {
+                    crate::logger::log(format!(
+                        "pdf-meta-catchup: set_pdf_meta failed for {filename_owned}: {e}"
+                    ));
+                }
+            }
+        });
+    if spawn_result.is_err() {
+        // spawn 失敗 (リソース不足等の rare path) では closure が動かないので
+        // in-flight set のエントリが残らないようここで取り除く (Codex round 1 P3 対応)
+        if let Ok(mut set) = catchup_inflight_set().lock() {
+            set.remove(&path_owned);
+        }
+    }
+}
+
+/// in-flight set から自身を取り除く RAII guard。catch-up と neighbor prefetch 共通。
+struct InFlightGuard(std::path::PathBuf);
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = catchup_inflight_set().lock() {
+            set.remove(&self.0);
+        }
+    }
+}
+
+/// PDF 隣接プリフェッチ (v1.0.0、Ctrl+↑↓ ナビ最適化)。
+///
+/// ユーザーが PDF を開いた直後 (= `load_pdf_as_folder` 完了時)、親フォルダ内で
+/// ±1 番目の隣接 PDF を裏で render_page してキャッシュを温める。これで:
+///   - `pdf_meta` が populate される (= 次回 Enter で placeholder grid 即時化)
+///   - WebP サムネも parent catalog の `pdfthumb:` キーで保存される
+///   - OS の disk cache がページ 0 の画像データまで温まる (= 真の Enter で
+///     render_page も warm でほぼ瞬時)
+///
+/// catch-up と同じく `pdf_password=None` で試行する (= session pw を持ち込まない、
+/// 保護 PDF を誤って「非保護」記録する bypass を防ぐ)。
+///
+/// dedup は catch-up と共通の in-flight set (`PDF_META_CATCHUP_IN_FLIGHT`) を使用
+/// する。同じ path について複数経路から spawn 要求が来ても 1 ジョブに収束する。
+pub fn spawn_pdf_neighbor_prefetch(
+    pdf_path: std::path::PathBuf,
+    parent_catalog: Arc<crate::catalog::CatalogDb>,
+    thumb_px: u32,
+    thumb_quality: u8,
+) {
+    // 重複 spawn 防止 (catch-up と set を共有)
+    {
+        let mut set = catchup_inflight_set().lock().unwrap();
+        if set.contains(&pdf_path) {
+            return;
+        }
+        set.insert(pdf_path.clone());
+    }
+
+    let path_for_cleanup = pdf_path.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("pdf-neighbor-prefetch".into())
+        .spawn(move || {
+            // RAII で in-flight set から自身を除外する (panic 安全)
+            let _guard = InFlightGuard(pdf_path.clone());
+
+            // Stat
+            let Ok(meta) = std::fs::metadata(&pdf_path) else {
+                return;
+            };
+            let Some(mtime) = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+            else {
+                return;
+            };
+            let file_size = meta.len() as i64;
+            let Some(filename) = pdf_path.file_name().and_then(|n| n.to_str()) else {
+                return;
+            };
+
+            // 既に pdf_meta + thumb 両方 cache 済みなら skip
+            let meta_present = parent_catalog
+                .get_pdf_meta(filename, mtime, file_size)
+                .ok()
+                .flatten()
+                .is_some();
+            // pdfthumb:<filename> キーの WebP サムネが存在し mtime/size 一致なら thumb OK
+            let folder_key = format!("{}{}", CACHE_KEY_PDF, filename);
+            let thumb_present = parent_catalog
+                .load_one(&folder_key)
+                .ok()
+                .flatten()
+                .map(|e| e.mtime == mtime && e.file_size == file_size)
+                .unwrap_or(false);
+            if meta_present && thumb_present {
+                return;
+            }
+
+            // render_page (page 0、Normal 優先度): OS cache を温め、page_count を確定。
+            // password=None で試行 — 保護 PDF は失敗 → 書き込み skip (catch-up と同じ判断)。
+            let Ok(res) = crate::pdf_loader::render_page(
+                &pdf_path,
+                0,
+                thumb_px,
+                None,
+                None,
+                crate::pdf_loader::JobPriority::Normal,
+            ) else {
+                return;
+            };
+
+            // pdf_meta 投入 (確信あり: password=None で render 成功 = 不要)
+            if !meta_present {
+                if let Err(e) =
+                    parent_catalog.set_pdf_meta(filename, mtime, file_size, res.page_count, false)
+                {
+                    crate::logger::log(format!(
+                        "pdf-neighbor-prefetch: set_pdf_meta failed for {filename}: {e}"
+                    ));
+                }
+            }
+
+            // WebP サムネ投入 (親 catalog の pdfthumb: キー)
+            if !thumb_present {
+                if let Some(bytes) = encode_and_save(
+                    &res.image,
+                    &folder_key,
+                    &parent_catalog,
+                    mtime,
+                    file_size,
+                    thumb_px,
+                    thumb_quality,
+                ) {
+                    crate::logger::log(format!(
+                        "pdf-neighbor-prefetch: thumb saved for {filename} ({bytes} bytes)"
+                    ));
+                }
+            }
+        });
+    if spawn_result.is_err() {
+        // spawn 失敗 (リソース不足等の rare path) では closure が動かないので
+        // in-flight set のエントリが残らないようここで取り除く (Codex round 1 P3 対応)
+        if let Ok(mut set) = catchup_inflight_set().lock() {
+            set.remove(&path_for_cleanup);
+        }
     }
 }
 

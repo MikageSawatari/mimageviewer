@@ -6001,6 +6001,13 @@ impl App {
         // ここでは簡易判定: 保存済みパスワードがなければ非同期で check_password を含めて
         // enumerate を試みる。パスワードエラーは結果受信時にハンドルする。
 
+        // ── 隣接 PDF の ±1 を items から先に取り出す (Codex P2 round 1 対応) ──
+        // 次の `try_apply_pdf_meta_cache` が cache hit すると start_loading_items で
+        // `self.items` が PDF ページに置き換わるため、PdfFile の隣接探索は **その前**
+        // に済ませる必要がある。pre-fetch 自体の kick は文中の最後 (placeholder 適用 +
+        // pending セット完了後) にまとめて行う。
+        let neighbor_pdf_paths = self.collect_neighbor_pdf_paths(&pdf_path);
+
         // ── PDF メタキャッシュ (v1.0.0) lookup ──
         // 過去に enumerate or サムネ render に成功した PDF はページ数が catalog DB に
         // 永続化されている。mtime/file_size 一致なら即座に N セルの placeholder grid に
@@ -6028,6 +6035,65 @@ impl App {
         // 「Enter は効いたのか?」とユーザーが不安になる。左下に「読み込み中」バッジを
         // 出すのは `render_container_enumerate_overlay` ([ui_main.rs])。既存「先読み N/M」
         // と同じ場所 (LEFT_BOTTOM) なので、ユーザーの目線パターンに合う。
+
+        // ── 隣接 PDF の pre-fetch (v1.0.0、Ctrl+↑↓ ナビ最適化) ──
+        // 上で `collect_neighbor_pdf_paths` で先に親 items から拾った ±1 の PdfFile に
+        // ついて、background で render_page を kick して page_count + WebP サムネ +
+        // OS cache を温める。ユーザーが Ctrl+↑↓ で次々と PDF を渡り歩くケースで
+        // 「次の PDF も cache hit 経路で瞬時化」する効果。
+        if !neighbor_pdf_paths.is_empty() {
+            self.spawn_neighbor_pdf_prefetch_tasks(neighbor_pdf_paths);
+        }
+    }
+
+    /// `self.items` が親フォルダの内容を持つ時点で呼ばれ、現在位置 (`current_pdf`) の
+    /// ±1 にある `PdfFile` を集めて返す。順序は parent → next。`current_pdf` が
+    /// 見つからない (= 検索結果ビュー等から開いた) 場合は空 Vec。
+    fn collect_neighbor_pdf_paths(&self, current_pdf: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let idx = self.items.iter().position(|item| match item {
+            GridItem::PdfFile(p) => crate::folder_tree::path_eq(p, current_pdf),
+            _ => false,
+        });
+        let Some(idx) = idx else {
+            return out;
+        };
+        if idx > 0 {
+            if let Some(GridItem::PdfFile(p)) = self.items.get(idx - 1) {
+                out.push(p.clone());
+            }
+        }
+        if let Some(GridItem::PdfFile(p)) = self.items.get(idx + 1) {
+            out.push(p.clone());
+        }
+        out
+    }
+
+    /// 隣接 PDF prefetch ジョブを spawn する (background)。親 catalog を LRU から取り出す。
+    fn spawn_neighbor_pdf_prefetch_tasks(&mut self, neighbor_paths: Vec<PathBuf>) {
+        // 親 catalog: load_pdf_as_folder 呼び出し時点では self.current_folder が親フォルダ。
+        // try_apply_pdf_meta_cache がヒットしても `current_folder` は start_loading_items
+        // 内で PDF パスに切り替わっている可能性があるので、まずは neighbor の parent
+        // から開く。
+        let Some(first_parent) = neighbor_paths
+            .iter()
+            .find_map(|p| p.parent().map(|q| q.to_path_buf()))
+        else {
+            return;
+        };
+        let Some(parent_catalog) = self.get_or_open_catalog(&first_parent) else {
+            return;
+        };
+        let thumb_px = self.settings.thumb_px;
+        let thumb_quality = self.settings.thumb_quality;
+        for neighbor in neighbor_paths {
+            crate::thumb_loader::spawn_pdf_neighbor_prefetch(
+                neighbor,
+                Arc::clone(&parent_catalog),
+                thumb_px,
+                thumb_quality,
+            );
+        }
     }
 
     /// PDF メタキャッシュ (catalog DB の `pdf_meta` テーブル) を引いて、ヒットすれば
@@ -8707,7 +8773,7 @@ impl App {
                         &req,
                         &cache_map_w,
                         &tx_w,
-                        catalog_w.as_deref(),
+                        catalog_w.as_ref(),
                         thumb_px,
                         thumb_quality,
                         display_px,

@@ -545,7 +545,7 @@ fn run_bench(
                             &req,
                             &cache_map_w,
                             &tx_w,
-                            catalog_w.as_deref(),
+                            catalog_w.as_ref(),
                             thumb_px,
                             thumb_quality,
                             dp,

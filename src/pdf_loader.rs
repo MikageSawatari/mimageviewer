@@ -237,6 +237,15 @@ fn core_enumerate(
 
 // (旧 `core_render` は `core_render_with_count` (v1.0.0 で page_count も返す)
 //  に置き換えられた。後者は ipc_render と in-process worker の両方から使われる。)
+//
+// **lopdf fast-path 検討 (撤回、v1.0.0 開発中)**:
+// `Document::load` は eager に全オブジェクトをパースする実装で、PDFium の lazy
+// 経路 (warm 0.4ms p50) より 200-12000x 遅いことが `examples/bench_pdf_count.rs`
+// で判明した (lopdf p50=77ms、p99=5344ms)。production cold 開封 (824-1338ms) を
+// 改善する目的だったが、lopdf を挟むと逆に CPU で 76ms-7s 上乗せされるので採用見送り。
+// 改善するなら自前 xref パーサーが必要 (= docs/pdf-page-count-cache-plan.md の
+// Option B、工数 3-5 日)。`examples/bench_pdf_count.rs` (dev-dependencies)
+// に比較ベンチマークを残してあるので、将来再検討する際の比較ベースに使える。
 
 // -----------------------------------------------------------------------
 // バイナリプロトコル (stdin/stdout IPC)
