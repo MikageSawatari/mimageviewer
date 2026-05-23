@@ -339,7 +339,11 @@ impl App {
             jump_to: None,
         };
 
-        // ESC: 選択があればまず解除、無ければ消しゴムモード終了
+        // ESC: 選択があればまず解除、無ければマスクを適用 (E と同じ挙動) して終了
+        //
+        // 旧版は ESC でマスクを DB に保存するだけで inpaint を実行しなかったため、
+        // 画像には反映されていないのに次回開くとマスクは残っている、という分かりにくい
+        // 状態になっていた。明示破棄したい場合はマスク自体を削除してから抜ける。
         let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if esc {
             if self.erase_selected_vector.is_some() {
@@ -348,17 +352,11 @@ impl App {
                 self.erase_mask_texture = None;
                 return action;
             }
-            // 終了前にマスクを DB + サイドカーに保存
-            let [w, h] = self.erase_mask_size;
-            if let Some(mask) = self.erase_mask.clone() {
-                let vectors = self.erase_vectors.clone();
-                self.save_mask_with_sidecar(fs_idx, &mask, &vectors, w, h);
-            }
-            self.reset_erase_mode();
+            self.execute_erase_inpaint(ctx, fs_idx);
             return action;
         }
 
-        // E: inpaint 実行
+        // E: inpaint 実行 (ESC と同じく execute_erase_inpaint を呼ぶ)
         let key_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::E));
         if key_e {
             self.execute_erase_inpaint(ctx, fs_idx);
