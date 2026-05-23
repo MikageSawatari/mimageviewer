@@ -865,6 +865,17 @@ pub fn process_load_request(
         }
     }
 
+    // PDF render 経路 (pdf_page=Some) で cache 保存可能なら HarvestOnCancel に切替。
+    // = 「PDFium が既に処理した結果を捨てない」ための投資回収。
+    // 静的 gate: skip_cache / catalog 無し / cache_map 無し のいずれかが該当すれば
+    // どうせ cache 保存しないので harvest 待ちの意味が無く AbortOnCancel に倒す。
+    // (詳細は docs/pdf-pool-harvest-on-cancel-plan.md)
+    let cancel_policy = if req.pdf_page.is_some() && !req.skip_cache && catalog_ref.is_some() {
+        crate::pdf_loader::CancelWaitPolicy::HarvestOnCancel
+    } else {
+        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel
+    };
+
     load_one_cached(
         load_path,
         zip_entry_ref,
@@ -889,6 +900,7 @@ pub fn process_load_request(
         req.input_seq,
         req.items_gen,
         req.context_epoch,
+        cancel_policy,
     );
     if crate::perf::is_enabled() {
         let total_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
@@ -1293,6 +1305,7 @@ fn process_neighbor_prefetch(
     // フォルダ移動で bump_epoch されたら、走行中の PDFium 描画も Interrupted で
     // 抜けて Normal 枠を即座に解放する。
     // neighbor prefetch は background なので epoch=0 (UI nav の bump で巻き込まれない)
+    // + AbortOnCancel (background は cancel=フォルダ移動意図、harvest 不要)
     let res = match crate::pdf_loader::render_page(
         path,
         0,
@@ -1301,6 +1314,7 @@ fn process_neighbor_prefetch(
         Some(Arc::clone(cancel)),
         crate::pdf_loader::JobPriority::Normal,
         0,
+        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -1667,6 +1681,10 @@ pub fn load_one_cached(
     // PDF render pool の context epoch。`req.context_epoch` をそのまま流す。
     // 0 = epoch チェック対象外 (background)。
     context_epoch: u64,
+    // PDF render の cancel 時挙動。HarvestOnCancel なら in-flight IPC を harvest して
+    // cache 保存に進む (cache savable な PDF render thumbnail のみ)。
+    // 詳細は `pdf_loader::CancelWaitPolicy` doc 参照。
+    cancel_policy: crate::pdf_loader::CancelWaitPolicy,
 ) {
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
     // process_load_request 側と同じキー形式を使うこと��
@@ -1700,7 +1718,8 @@ pub fn load_one_cached(
     let img_result = if let Some(page_num) = pdf_page {
         // サムネイル用 PDF レンダ: 可視セル (priority=true) は HighNormal、
         // 先読みは Normal。プールの予約ワーカーはフルスクリーン現在ページ
-        // (Critical) 用に空けておく。
+        // (Critical) 用に空けておく。cancel_policy は caller (process_load_request)
+        // が cache savable かどうかを判定して渡す。
         let pdf_priority = if priority {
             crate::pdf_loader::JobPriority::HighNormal
         } else {
@@ -1714,6 +1733,7 @@ pub fn load_one_cached(
             cancel.map(Arc::clone),
             pdf_priority,
             context_epoch,
+            cancel_policy,
         )
         .map(|res| {
             // C-thumb (v1.0.0): 親フォルダ内の PDF サムネ render の場合、ついでに
@@ -1988,6 +2008,22 @@ pub fn load_one_cached(
                                 jpeg_data: webp_data,
                                 source_dims,
                             },
+                        );
+                    }
+                    // **HarvestOnCancel ROI 計測**: cache_map.insert 完了後に
+                    // cancel が立っているか確認する (encode/save 中に flip した
+                    // ケースも拾う、Codex round 1 P3-1 対応)。立っていれば「投資回収
+                    // に成功した」イベントを発火 — pdf_page 経路のみ意味がある。
+                    if pdf_page.is_some()
+                        && crate::perf::is_enabled()
+                        && cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+                    {
+                        crate::perf::event(
+                            "pdf",
+                            "pdf_thumb_cache_saved_after_cancel",
+                            Some(name),
+                            input_seq,
+                            &[("idx", serde_json::Value::from(idx))],
                         );
                     }
                 }
@@ -2298,6 +2334,7 @@ pub fn build_and_save_one_pdf(
 ) -> Option<usize> {
     // バッチキャッシュ作成は Normal 優先度 + 非 UI 経路なので epoch=0:
     // フルスクリーン操作より優先されない、かつ UI nav の bump で巻き込まれない
+    // + AbortOnCancel (bulk は cancel=明示中断意図)
     let res = crate::pdf_loader::render_page(
         pdf_path,
         page_num,
@@ -2306,6 +2343,7 @@ pub fn build_and_save_one_pdf(
         None,
         crate::pdf_loader::JobPriority::Normal,
         0,
+        crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
     )
     .ok()?;
     let key = crate::grid_item::pdf_page_cache_key(page_num);

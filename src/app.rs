@@ -13565,6 +13565,9 @@ impl App {
                     Some(cancel.clone()),
                     pdf_priority,
                     pdf_context_epoch,
+                    // フルスクリーンは fs_cache (memory) のみで永続 cache 無し。
+                    // Critical 経路は即時応答 UX 優先 → AbortOnCancel。
+                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
                 ) {
                     Ok(crate::pdf_loader::RenderResult {
                         image: img,
@@ -17467,6 +17470,7 @@ impl App {
                             // 先頭1ページを親フォルダの DB にも保存
                             if page_count > 0 && !cache_map.contains_key(&folder_key) {
                                 // bulk cache creator は background なので epoch=0
+                                // + AbortOnCancel (cancel = ユーザ明示中断意図)
                                 if let Ok(res) = crate::pdf_loader::render_page(
                                     pdf_path,
                                     0,
@@ -17475,6 +17479,7 @@ impl App {
                                     None,
                                     crate::pdf_loader::JobPriority::Normal,
                                     0,
+                                    crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
                                 ) {
                                     let img = res.image;
                                     if let Some(bytes) = encode_and_save(
@@ -17529,7 +17534,7 @@ impl App {
                                 continue;
                             }
                             // render_page がパスワード不正時に Err を返すのでそのままスキップ
-                            // bulk cache creator は background なので epoch=0
+                            // bulk cache creator は background なので epoch=0 + AbortOnCancel
                             if let Ok(res) = crate::pdf_loader::render_page(
                                 pdf_path,
                                 0,
@@ -17538,6 +17543,7 @@ impl App {
                                 None,
                                 crate::pdf_loader::JobPriority::Normal,
                                 0,
+                                crate::pdf_loader::CancelWaitPolicy::AbortOnCancel,
                             ) {
                                 // PDF メタキャッシュにも page_count を投入する
                                 // (Codex P3 対応)。`password_required` は確信できる場合

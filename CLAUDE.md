@@ -369,6 +369,23 @@ HighNormal/Normal ジョブが pool 内で stale 化 → bump 時の一括 prune
   `get_document_info` / `enumerate_pages_with_cancel`) は全て epoch=0
 - 詳細: [docs/pdf-pool-context-epoch-plan.md](docs/pdf-pool-context-epoch-plan.md)
 
+### PDF レンダ pool の HarvestOnCancel (2026-05)
+
+`CancelWaitPolicy` enum で `pool.execute` の cancel 時挙動を選択可能:
+
+- `AbortOnCancel` (既定): cancel 検出と同時に `Err(Interrupted)` で抜ける。in-flight IPC
+  結果は dispatcher が `reply.send` で silently 捨てる。
+- `HarvestOnCancel` (thumbnail PDF render の cache-savable 経路のみ): cancel が立っても
+  reply を待ち続け、in-flight IPC 結果を harvest。caller (= `load_one_cached`) が cache
+  保存に進めて、PDFium が既に処理した結果を投資回収する。再エントリ時の再 render を防ぐ。
+
+ポリシー選択は `process_load_request` で行う:
+- `req.pdf_page.is_some() && !req.skip_cache && catalog.is_some()` → `HarvestOnCancel`
+- それ以外 (enumerate / Critical / fullscreen / bulk / neighbor / background) → `AbortOnCancel`
+
+perf イベント: `pool_cancel_harvest_wait` (待ち開始時) / `pdf_thumb_cache_saved_after_cancel`
+(cache 保存成功時)。詳細: [docs/pdf-pool-harvest-on-cancel-plan.md](docs/pdf-pool-harvest-on-cancel-plan.md)
+
 ### UI スレッドでの同期 I/O は即 worker 化する ⚠️
 
 `App::update` から (呼び出し先を含めて) 同期実行される処理で以下を行うと、

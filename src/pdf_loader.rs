@@ -54,6 +54,27 @@ pub enum JobPriority {
     Normal,
 }
 
+/// `pool.execute` で cancel が立った時の待ちポリシー。
+///
+/// 通常 (`AbortOnCancel`) は cancel 検出と同時に `Err(Interrupted)` で early bail し、
+/// dispatch 済み IPC があれば結果は dispatcher が silently 捨てる。これが既存挙動。
+///
+/// `HarvestOnCancel` は cancel が立っても reply を待ち続け、in-flight IPC があれば
+/// 結果を受け取って caller に渡す。caller (= `load_one_cached`) は cache 保存に進める
+/// ので「PDFium が既に処理した高価な render 結果」が捨てられず、ユーザが同フォルダに
+/// 戻ったとき cache hit になる。
+///
+/// **`HarvestOnCancel` は thumbnail PDF render の cache-savable 経路のみ**で使う。
+/// enumerate / Critical / background catch-up / bulk cache creator は `AbortOnCancel` の
+/// まま。詳細は [docs/pdf-pool-harvest-on-cancel-plan.md](../docs/pdf-pool-harvest-on-cancel-plan.md)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelWaitPolicy {
+    /// cancel.load() が true になった瞬間に `Err(Interrupted)` で抜ける (既存挙動)。
+    AbortOnCancel,
+    /// cancel が立っても reply を待ち続ける。in-flight IPC の結果を harvest できる。
+    HarvestOnCancel,
+}
+
 // -----------------------------------------------------------------------
 // Context epoch (render ジョブの世代管理)
 // -----------------------------------------------------------------------
@@ -964,6 +985,7 @@ impl PdfWorkerPool {
         priority: JobPriority,
         perf_key: Option<String>,
         context_epoch: u64,
+        cancel_policy: CancelWaitPolicy,
     ) -> std::io::Result<Vec<u8>> {
         if self.worker_count == 0 {
             return Err(std::io::Error::new(
@@ -973,13 +995,14 @@ impl PdfWorkerPool {
         }
 
         let (reply_tx, reply_rx) = mpsc::channel();
+        // perf_key を後段 (cancel 検出時の perf イベント) でも使うので clone
         let job = Job {
             request: request.to_vec(),
             cancel: cancel.cloned(),
             reply: reply_tx,
             priority,
             enqueued_at: std::time::Instant::now(),
-            perf_key,
+            perf_key: perf_key.clone(),
             context_epoch,
         };
 
@@ -995,9 +1018,14 @@ impl PdfWorkerPool {
             cv.notify_one();
         }
 
-        // 応答を待つ。cancel フラグが途中で立てば早期に bail する。
-        // (キューに残ったままのジョブも、最終的に worker が pop 時に cancel を見て捨てる)
+        // 応答を待つ。cancel フラグが途中で立った場合の挙動は `cancel_policy` で決まる:
+        // - AbortOnCancel: 早期 bail し Err(Interrupted) を返す (dispatcher は IPC 結果が
+        //   来たら reply.send で silently 捨てる)
+        // - HarvestOnCancel: cancel が立っても reply を待ち続け、in-flight IPC があれば
+        //   結果を harvest する。caller (= load_one_cached) が cache 保存に進めて、
+        //   PDFium の処理結果を投資回収する
         let t_wait = std::time::Instant::now();
+        let mut harvest_logged = false;
         loop {
             match reply_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                 Ok(result) => return result,
@@ -1005,20 +1033,42 @@ impl PdfWorkerPool {
                     if let Some(c) = cancel
                         && c.load(Ordering::Relaxed)
                     {
-                        if crate::perf::is_enabled() {
-                            let waited_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
-                            crate::perf::event(
-                                "pdf",
-                                "pool_cancel_requester",
-                                None,
-                                0,
-                                &[("waited_ms", serde_json::Value::from(waited_ms))],
-                            );
+                        match cancel_policy {
+                            CancelWaitPolicy::AbortOnCancel => {
+                                if crate::perf::is_enabled() {
+                                    let waited_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
+                                    crate::perf::event(
+                                        "pdf",
+                                        "pool_cancel_requester",
+                                        perf_key.as_deref(),
+                                        0,
+                                        &[("waited_ms", serde_json::Value::from(waited_ms))],
+                                    );
+                                }
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted,
+                                    "cancelled while waiting for reply",
+                                ));
+                            }
+                            CancelWaitPolicy::HarvestOnCancel => {
+                                // 初回のみ perf イベント (harvest 待ちが発動した旨)。
+                                // 以降は同じループで何度 cancel.load() が true でも追加発火しない。
+                                if !harvest_logged {
+                                    harvest_logged = true;
+                                    if crate::perf::is_enabled() {
+                                        let waited_ms = t_wait.elapsed().as_secs_f64() * 1000.0;
+                                        crate::perf::event(
+                                            "pdf",
+                                            "pool_cancel_harvest_wait",
+                                            perf_key.as_deref(),
+                                            0,
+                                            &[("waited_ms", serde_json::Value::from(waited_ms))],
+                                        );
+                                    }
+                                }
+                                // 待ち継続 → 次の iteration で reply を待つ
+                            }
                         }
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::Interrupted,
-                            "cancelled while waiting for reply",
-                        ));
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1732,8 +1782,15 @@ pub fn get_document_info(
     if pool.worker_count > 0 {
         let req = encode_get_info_request(pdf_path, password);
         let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-        // get_document_info は indexer 経由の background なので epoch=0
-        let resp = pool.execute(&req, None, JobPriority::Normal, Some(perf_key), 0)?;
+        // get_document_info は indexer 経由の background なので epoch=0 + AbortOnCancel
+        let resp = pool.execute(
+            &req,
+            None,
+            JobPriority::Normal,
+            Some(perf_key),
+            0,
+            CancelWaitPolicy::AbortOnCancel,
+        )?;
         return PdfWorkerPool::parse_get_info_response(&resp);
     }
     // in-process フォールバック
@@ -1772,6 +1829,7 @@ pub fn enumerate_pages_with_cancel(
         // enumerate は列挙のみで軽量 (PDFium page 列挙) だが Normal 扱いでよい
         let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
         // enumerate_pages_with_cancel は background catch-up 経路なので epoch=0
+        // + AbortOnCancel (enumerate は cheap、cache 保存ロジック無し)。
         // (UI nav の enumerate は `enumerate_pages_async` 側で別途 LATEST_ENUMERATE_EPOCH
         // で stale 判定する)
         let resp = pool.execute(
@@ -1780,6 +1838,7 @@ pub fn enumerate_pages_with_cancel(
             JobPriority::Normal,
             Some(perf_key),
             0,
+            CancelWaitPolicy::AbortOnCancel,
         )?;
         return PdfWorkerPool::parse_enumerate_response(&resp);
     }
@@ -1809,6 +1868,10 @@ pub fn render_page(
     // それ以外は `current_render_context_epoch()` を **UI スレッドの enqueue 時点で**
     // 焼き付けた値を渡す (TOCTOU 防止のため worker thread からは呼ばない)。
     context_epoch: u64,
+    // cancel 時に in-flight IPC を harvest するかどうか。
+    // thumbnail PDF render の cache-savable 経路のみ `HarvestOnCancel`、それ以外は
+    // `AbortOnCancel`。詳細は `CancelWaitPolicy` の doc コメント参照。
+    cancel_policy: CancelWaitPolicy,
 ) -> std::io::Result<RenderResult> {
     if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(std::io::Error::new(
@@ -1846,6 +1909,7 @@ pub fn render_page(
             priority,
             Some(perf_key.clone()),
             context_epoch,
+            cancel_policy,
         )?;
         let result = PdfWorkerPool::parse_render_response(&resp);
         if perf_enabled {
@@ -1997,13 +2061,15 @@ pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnum
         match std::thread::Builder::new()
             .name("pdf-enumerate-nav".into())
             .spawn(move || {
-                // Critical は epoch チェック対象外 (= 0 で send)
+                // Critical は epoch チェック対象外 (= 0 で send) + AbortOnCancel
+                // (UI nav の即時応答 UX を優先、harvest は不要)
                 let resp = pool.execute(
                     &req,
                     Some(&cancel_w),
                     JobPriority::Critical,
                     Some(perf_key),
                     0,
+                    CancelWaitPolicy::AbortOnCancel,
                 );
                 let result = resp.and_then(|bytes| PdfWorkerPool::parse_enumerate_response(&bytes));
                 let _ = tx.send(result);
@@ -2290,5 +2356,107 @@ mod tests {
         };
         let stale = popped.context_epoch != 0 && popped.context_epoch < current;
         assert!(stale, "pop 時の epoch チェックが race を拾う");
+    }
+
+    // ── CancelWaitPolicy tests (recv ループの cancel 反応ロジック) ──
+    //
+    // execute() を直接呼ぶには PdfWorkerPool 起動が必要 (子プロセス spawn) で test には
+    // 重すぎる。代わりに execute の recv ループと等価なロジックを mock で再現し、
+    // AbortOnCancel と HarvestOnCancel の挙動差を検証する。
+
+    fn mock_recv_loop(
+        reply_rx: mpsc::Receiver<std::io::Result<Vec<u8>>>,
+        cancel: Arc<AtomicBool>,
+        policy: CancelWaitPolicy,
+    ) -> std::io::Result<Vec<u8>> {
+        loop {
+            match reply_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if cancel.load(Ordering::Relaxed) {
+                        match policy {
+                            CancelWaitPolicy::AbortOnCancel => {
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::Interrupted,
+                                    "cancelled",
+                                ));
+                            }
+                            CancelWaitPolicy::HarvestOnCancel => {
+                                // 待ち継続
+                            }
+                        }
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        "disconnected",
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn abort_on_cancel_returns_interrupted_immediately() {
+        let (_tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = Arc::clone(&cancel);
+        // 別スレッドで 30 ms 後に cancel を立てる (reply は来ない = receiver hold)
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            cancel_clone.store(true, Ordering::Relaxed);
+        });
+        let t0 = std::time::Instant::now();
+        let result = mock_recv_loop(rx, cancel, CancelWaitPolicy::AbortOnCancel);
+        let elapsed_ms = t0.elapsed().as_millis();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        // ~30-50 ms (cancel 検出 + 次の timeout) で返るはず
+        assert!(
+            elapsed_ms < 200,
+            "AbortOnCancel should return quickly, took {elapsed_ms}ms"
+        );
+    }
+
+    #[test]
+    fn harvest_on_cancel_waits_for_reply() {
+        let (tx, rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_clone = Arc::clone(&cancel);
+        let tx_clone = tx.clone();
+        // 30 ms 後に cancel、80 ms 後に reply を投入
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            cancel_clone.store(true, Ordering::Relaxed);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let _ = tx_clone.send(Ok(vec![1, 2, 3]));
+        });
+        drop(tx); // 元の tx は drop して、clone した tx だけが live
+        let t0 = std::time::Instant::now();
+        let result = mock_recv_loop(rx, cancel, CancelWaitPolicy::HarvestOnCancel);
+        let elapsed_ms = t0.elapsed().as_millis();
+        // HarvestOnCancel: cancel が立っても待ち続け、reply (= Ok([1,2,3])) を受け取る
+        assert!(
+            result.is_ok(),
+            "harvest should receive reply, got {result:?}"
+        );
+        assert_eq!(result.unwrap(), vec![1, 2, 3]);
+        // ~80 ms 後 + 1 timeout = ~80-100 ms
+        assert!(
+            elapsed_ms >= 70,
+            "harvest should have waited at least 70ms, took {elapsed_ms}ms"
+        );
+    }
+
+    #[test]
+    fn harvest_on_cancel_still_returns_on_disconnect() {
+        let (tx, rx) = mpsc::channel::<std::io::Result<Vec<u8>>>();
+        let cancel = Arc::new(AtomicBool::new(true)); // 最初から cancel
+        drop(tx); // sender 即 drop → receiver は disconnected を受ける
+        let result = mock_recv_loop(rx, cancel, CancelWaitPolicy::HarvestOnCancel);
+        assert!(result.is_err());
+        // disconnected の Other エラーが返るはず
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Other);
     }
 }
