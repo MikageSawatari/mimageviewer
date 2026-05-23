@@ -30,22 +30,59 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 
-/// PDF レンダ要求の優先度。
+/// PDF レンダ要求の優先度 (3 段階)。
 ///
 /// `Critical` はフルスクリーンで今まさに表示中のページや、ユーザーが Enter で開いた
 /// PDF の `enumerate_pages_async` など、ユーザーが即座の応答を待っているもの。
-/// `Normal` は先読み・サムネイル・アイドル品質アップグレードなど。
+/// `HighNormal` はサムネイルグリッドで現在画面に見えている可視セル (`req.priority=true`)。
+/// `Normal` は先読み・サムネイル・アイドル品質アップグレードなど画面外。
 ///
-/// **常時 1 ワーカー予約**: プールが 2 ワーカー以上ある場合、Normal の同時実行数を
-/// `worker_count - 1` (最低 1) に制限し、残り 1 ワーカーを Critical 用に温存する。
-/// グリッドでサムネ先読みが 3 ワーカー全部を埋めて、`Enter` で開いた PDF の Critical
+/// dispatcher の pop 順: `Critical → HighNormal → Normal`。
+///
+/// **常時 1 ワーカー予約**: プールが 2 ワーカー以上ある場合、HighNormal + Normal の
+/// 同時実行数を `worker_count - 1` (最低 1) に制限し、残り 1 ワーカーを Critical 用に
+/// 温存する。グリッドで先読みが 3 ワーカー全部を埋めて、`Enter` で開いた PDF の Critical
 /// な enumerate が「in-flight な Normal IPC の終了を待つ」状態 (実測 2-3 秒) を防ぐ。
 /// 代償はバルクサムネ生成のスループットが 3→2 になる -33%。手動キャッシュ作成等で
 /// しか観測されない非対話処理なので受容範囲。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobPriority {
     Critical,
+    /// 可視セルのサムネ render。`req.priority=true` の grid item から来る。
+    /// Critical 予約下では `worker_count - 1` 枠を Normal と共有する。
+    HighNormal,
     Normal,
+}
+
+// -----------------------------------------------------------------------
+// Context epoch (render ジョブの世代管理)
+// -----------------------------------------------------------------------
+
+/// Render ジョブの「コンテキスト世代」。`App::bump_full_context_for_load` /
+/// `App::bump_render_epoch_only` で +1 される。
+/// 0 は予約値 (= epoch チェック対象外、background 経路用 sentinel)。
+///
+/// 用途: フォルダ移動 / Ctrl+G 検索結果差替えで、それ以前の UI nav から enqueue された
+/// render ジョブを pool 内で stale 化して prune する。これにより、ユーザが新しい
+/// コンテキストに入った瞬間、見えていない古い PDF のページレンダリングが queue から
+/// 一掃される。
+static CURRENT_CONTEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// 現在の context epoch を読む。UI スレッドが `LoadRequest.context_epoch` に
+/// 焼き付けるために使う (TOCTOU 防止のため worker thread からは呼ばない)。
+pub fn current_render_context_epoch() -> u64 {
+    CURRENT_CONTEXT_EPOCH.load(Ordering::Relaxed)
+}
+
+/// Context epoch を +1 して、pool 内の stale Normal/HighNormal ジョブを即座に prune する。
+/// Critical ジョブは touch しない (UI nav の直結なので常に fresh)。
+/// 戻り値は bump 後の新 epoch。
+pub fn bump_render_context_epoch() -> u64 {
+    let new = CURRENT_CONTEXT_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+    if let Some(pool) = POOL.get() {
+        pool.prune_stale_jobs(new);
+    }
+    new
 }
 
 /// Critical 用ワーカー予約フラグ。
@@ -756,12 +793,18 @@ struct Job {
     enqueued_at: std::time::Instant,
     /// perf 相関キー (存在すれば dispatch/cancel イベントに載せる)
     perf_key: Option<String>,
+    /// enqueue 時点の context epoch。`CURRENT_CONTEXT_EPOCH` より小さければ stale。
+    /// 0 = epoch チェック対象外 (background 経路 / Critical 用 sentinel)。
+    context_epoch: u64,
 }
 
 struct JobQueue {
     critical: std::collections::VecDeque<Job>,
+    /// 可視セルのサムネ render。Normal より先に pop される (両方とも `normal_in_flight` 枠を共有)。
+    high_normal: std::collections::VecDeque<Job>,
     normal: std::collections::VecDeque<Job>,
-    /// 現在処理中の Normal ジョブ数 (`max_normal` 以下に制限)
+    /// 現在処理中の HighNormal + Normal ジョブ数 (`max_normal` 以下に制限)。
+    /// Critical はこのカウントに含めない (= 予約枠を消費しない)。
     normal_in_flight: usize,
     /// 現在 IPC 実行中のワーカー数 (perf 用)
     workers_busy: usize,
@@ -794,6 +837,7 @@ impl PdfWorkerPool {
         let queue = Arc::new((
             Mutex::new(JobQueue {
                 critical: std::collections::VecDeque::new(),
+                high_normal: std::collections::VecDeque::new(),
                 normal: std::collections::VecDeque::new(),
                 normal_in_flight: 0,
                 workers_busy: 0,
@@ -852,12 +896,74 @@ impl PdfWorkerPool {
         self.queue.0.lock().map(|q| q.workers_busy).unwrap_or(0)
     }
 
+    /// `current_epoch` より小さい `context_epoch` を持つ HighNormal / Normal ジョブを
+    /// 一括 prune する。各ジョブの reply に `Interrupted` を送って requester を解放する。
+    /// Critical はプルーンしない (= UI nav の直結は守る)。
+    /// `context_epoch == 0` のジョブは epoch チェック対象外なのでプルーンしない。
+    ///
+    /// `bump_render_context_epoch()` から呼ばれる。
+    fn prune_stale_jobs(&self, current_epoch: u64) {
+        let drained: Vec<Job> = {
+            let (mtx, _cv) = &*self.queue;
+            let mut q = mtx.lock().unwrap();
+            let mut dropped: Vec<Job> = Vec::new();
+            let mut filter_queue = |queue: &mut std::collections::VecDeque<Job>| {
+                let mut kept: std::collections::VecDeque<Job> =
+                    std::collections::VecDeque::with_capacity(queue.len());
+                while let Some(j) = queue.pop_front() {
+                    if j.context_epoch != 0 && j.context_epoch < current_epoch {
+                        dropped.push(j);
+                    } else {
+                        kept.push_back(j);
+                    }
+                }
+                *queue = kept;
+            };
+            filter_queue(&mut q.high_normal);
+            filter_queue(&mut q.normal);
+            dropped
+        };
+
+        // Mutex 外で reply を送る (notify_one で deadlock しないように)
+        let count = drained.len();
+        for j in drained {
+            if crate::perf::is_enabled() {
+                let waited_ms = j.enqueued_at.elapsed().as_secs_f64() * 1000.0;
+                crate::perf::event(
+                    "pdf",
+                    "pool_prune_stale_epoch",
+                    j.perf_key.as_deref(),
+                    0,
+                    &[
+                        ("waited_ms", serde_json::Value::from(waited_ms)),
+                        ("job_epoch", serde_json::Value::from(j.context_epoch)),
+                        ("current_epoch", serde_json::Value::from(current_epoch)),
+                        (
+                            "priority",
+                            serde_json::Value::from(format!("{:?}", j.priority)),
+                        ),
+                    ],
+                );
+            }
+            let _ = j.reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "context epoch advanced",
+            )));
+        }
+        if count > 0 {
+            crate::logger::log(format!(
+                "pdf-pool: pruned {count} stale jobs (current_epoch={current_epoch})"
+            ));
+        }
+    }
+
     fn execute(
         &self,
         request: &[u8],
         cancel: Option<&Arc<AtomicBool>>,
         priority: JobPriority,
         perf_key: Option<String>,
+        context_epoch: u64,
     ) -> std::io::Result<Vec<u8>> {
         if self.worker_count == 0 {
             return Err(std::io::Error::new(
@@ -874,6 +980,7 @@ impl PdfWorkerPool {
             priority,
             enqueued_at: std::time::Instant::now(),
             perf_key,
+            context_epoch,
         };
 
         // Job をキューに積んで worker を 1 つ起こす
@@ -882,6 +989,7 @@ impl PdfWorkerPool {
             let mut q = mtx.lock().unwrap();
             match priority {
                 JobPriority::Critical => q.critical.push_back(job),
+                JobPriority::HighNormal => q.high_normal.push_back(job),
                 JobPriority::Normal => q.normal.push_back(job),
             }
             cv.notify_one();
@@ -1113,20 +1221,27 @@ fn run_dispatcher(
                     q.workers_busy = q.workers_busy.saturating_add(1);
                     break Some(j);
                 }
-                // Normal: 予約中なら max_normal 制限。最低でも 1 は確保しないと、
-                // 1-worker pool で Normal ジョブが永久に動かなくなる (deadlock)。
+                // HighNormal / Normal: 予約中なら max_normal 制限 (両者で枠を共有)。
+                // 最低でも 1 は確保しないと、1-worker pool で Normal ジョブが永久に
+                // 動かなくなる (deadlock)。
                 let reservation = critical_reservation_active();
                 let max_n = if reservation {
                     worker_count.saturating_sub(1).max(1)
                 } else {
                     worker_count.max(1)
                 };
-                if q.normal_in_flight < max_n
-                    && let Some(j) = q.normal.pop_front()
-                {
-                    q.normal_in_flight += 1;
-                    q.workers_busy = q.workers_busy.saturating_add(1);
-                    break Some(j);
+                if q.normal_in_flight < max_n {
+                    // HighNormal (= 可視セル) を Normal より先に取る
+                    if let Some(j) = q.high_normal.pop_front() {
+                        q.normal_in_flight += 1;
+                        q.workers_busy = q.workers_busy.saturating_add(1);
+                        break Some(j);
+                    }
+                    if let Some(j) = q.normal.pop_front() {
+                        q.normal_in_flight += 1;
+                        q.workers_busy = q.workers_busy.saturating_add(1);
+                        break Some(j);
+                    }
                 }
                 // 取れなかった → Condvar で寝る
                 q = cv.wait(q).unwrap();
@@ -1138,31 +1253,51 @@ fn run_dispatcher(
             break;
         };
 
-        let is_normal = job.priority == JobPriority::Normal;
+        // HighNormal と Normal の両方が `normal_in_flight` 枠を消費する
+        let counts_against_normal_slots =
+            matches!(job.priority, JobPriority::HighNormal | JobPriority::Normal);
 
-        // ── cancel チェック (pop 後): 立っていれば IPC せず Err を送る ──
+        // ── cancel + epoch チェック (pop 後): どちらかが立っていれば IPC せず Err を送る ──
         let cancelled = job
             .cancel
             .as_ref()
             .is_some_and(|c| c.load(Ordering::Relaxed));
+        let current_epoch = CURRENT_CONTEXT_EPOCH.load(Ordering::Relaxed);
+        let stale_epoch = job.context_epoch != 0 && job.context_epoch < current_epoch;
 
-        if cancelled {
+        if cancelled || stale_epoch {
             if crate::perf::is_enabled() {
                 let waited_ms = job.enqueued_at.elapsed().as_secs_f64() * 1000.0;
+                let kind = if cancelled {
+                    "pool_cancel_queued"
+                } else {
+                    "pool_stale_epoch_skip"
+                };
                 crate::perf::event(
                     "pdf",
-                    "pool_cancel_queued",
+                    kind,
                     job.perf_key.as_deref(),
                     0,
                     &[
                         ("waited_ms", serde_json::Value::from(waited_ms)),
                         ("pid", serde_json::Value::from(pid)),
+                        ("job_epoch", serde_json::Value::from(job.context_epoch)),
+                        ("current_epoch", serde_json::Value::from(current_epoch)),
+                        (
+                            "priority",
+                            serde_json::Value::from(format!("{:?}", job.priority)),
+                        ),
                     ],
                 );
             }
+            let msg = if cancelled {
+                "cancelled in queue"
+            } else {
+                "context epoch advanced"
+            };
             let _ = job.reply.send(Err(std::io::Error::new(
                 std::io::ErrorKind::Interrupted,
-                "cancelled in queue",
+                msg,
             )));
         } else {
             // ── IPC 実行 ──
@@ -1194,7 +1329,7 @@ fn run_dispatcher(
             let (mtx, cv) = &*queue;
             let mut q = mtx.lock().unwrap();
             q.workers_busy = q.workers_busy.saturating_sub(1);
-            if is_normal {
+            if counts_against_normal_slots {
                 q.normal_in_flight = q.normal_in_flight.saturating_sub(1);
             }
             // 他ワーカーが Normal スロット待ちで寝ている可能性があるので notify_all。
@@ -1597,7 +1732,8 @@ pub fn get_document_info(
     if pool.worker_count > 0 {
         let req = encode_get_info_request(pdf_path, password);
         let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-        let resp = pool.execute(&req, None, JobPriority::Normal, Some(perf_key))?;
+        // get_document_info は indexer 経由の background なので epoch=0
+        let resp = pool.execute(&req, None, JobPriority::Normal, Some(perf_key), 0)?;
         return PdfWorkerPool::parse_get_info_response(&resp);
     }
     // in-process フォールバック
@@ -1635,7 +1771,16 @@ pub fn enumerate_pages_with_cancel(
         let req = encode_enumerate_request(pdf_path, password);
         // enumerate は列挙のみで軽量 (PDFium page 列挙) だが Normal 扱いでよい
         let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-        let resp = pool.execute(&req, cancel.as_ref(), JobPriority::Normal, Some(perf_key))?;
+        // enumerate_pages_with_cancel は background catch-up 経路なので epoch=0
+        // (UI nav の enumerate は `enumerate_pages_async` 側で別途 LATEST_ENUMERATE_EPOCH
+        // で stale 判定する)
+        let resp = pool.execute(
+            &req,
+            cancel.as_ref(),
+            JobPriority::Normal,
+            Some(perf_key),
+            0,
+        )?;
         return PdfWorkerPool::parse_enumerate_response(&resp);
     }
     // フォールバック: in-process ワーカー。
@@ -1660,6 +1805,10 @@ pub fn render_page(
     password: Option<&str>,
     cancel: Option<Arc<AtomicBool>>,
     priority: JobPriority,
+    // 0 = epoch チェック対象外 (background / Critical 用)。
+    // それ以外は `current_render_context_epoch()` を **UI スレッドの enqueue 時点で**
+    // 焼き付けた値を渡す (TOCTOU 防止のため worker thread からは呼ばない)。
+    context_epoch: u64,
 ) -> std::io::Result<RenderResult> {
     if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
         return Err(std::io::Error::new(
@@ -1691,7 +1840,13 @@ pub fn render_page(
             );
         }
         let req = encode_render_request(pdf_path, page_num, target_px, password);
-        let resp = pool.execute(&req, cancel.as_ref(), priority, Some(perf_key.clone()))?;
+        let resp = pool.execute(
+            &req,
+            cancel.as_ref(),
+            priority,
+            Some(perf_key.clone()),
+            context_epoch,
+        )?;
         let result = PdfWorkerPool::parse_render_response(&resp);
         if perf_enabled {
             let ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1842,8 +1997,14 @@ pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnum
         match std::thread::Builder::new()
             .name("pdf-enumerate-nav".into())
             .spawn(move || {
-                let resp =
-                    pool.execute(&req, Some(&cancel_w), JobPriority::Critical, Some(perf_key));
+                // Critical は epoch チェック対象外 (= 0 で send)
+                let resp = pool.execute(
+                    &req,
+                    Some(&cancel_w),
+                    JobPriority::Critical,
+                    Some(perf_key),
+                    0,
+                );
                 let result = resp.and_then(|bytes| PdfWorkerPool::parse_enumerate_response(&bytes));
                 let _ = tx.send(result);
             }) {
@@ -1968,5 +2129,166 @@ mod tests {
         buf.extend_from_slice(b"abcd");
         let result = PdfWorkerPool::parse_get_info_response(&buf);
         assert!(result.is_err());
+    }
+
+    // ── Context epoch tests (PdfWorkerPool 内部ロジックのみ、PDFium IPC は使わない) ──
+
+    /// JobQueue を直接構築して prune_stale_jobs と pop ロジックを検証する。
+    /// 実プールを起動せず、Mutex<JobQueue> を直接操作する。
+    fn make_test_job(
+        priority: JobPriority,
+        context_epoch: u64,
+    ) -> (Job, mpsc::Receiver<std::io::Result<Vec<u8>>>) {
+        let (tx, rx) = mpsc::channel();
+        let job = Job {
+            request: vec![],
+            cancel: None,
+            reply: tx,
+            priority,
+            enqueued_at: std::time::Instant::now(),
+            perf_key: None,
+            context_epoch,
+        };
+        (job, rx)
+    }
+
+    fn empty_queue() -> Arc<(Mutex<JobQueue>, Condvar)> {
+        Arc::new((
+            Mutex::new(JobQueue {
+                critical: std::collections::VecDeque::new(),
+                high_normal: std::collections::VecDeque::new(),
+                normal: std::collections::VecDeque::new(),
+                normal_in_flight: 0,
+                workers_busy: 0,
+                shutdown: false,
+            }),
+            Condvar::new(),
+        ))
+    }
+
+    /// prune_stale_jobs の代替実装 (pool 起動なし、JobQueue 直操作)。
+    fn prune_stale_in_queue(
+        queue: &Arc<(Mutex<JobQueue>, Condvar)>,
+        current_epoch: u64,
+    ) -> Vec<Job> {
+        let (mtx, _cv) = &**queue;
+        let mut q = mtx.lock().unwrap();
+        let mut dropped: Vec<Job> = Vec::new();
+        let mut filter_queue = |queue: &mut std::collections::VecDeque<Job>| {
+            let mut kept: std::collections::VecDeque<Job> =
+                std::collections::VecDeque::with_capacity(queue.len());
+            while let Some(j) = queue.pop_front() {
+                if j.context_epoch != 0 && j.context_epoch < current_epoch {
+                    dropped.push(j);
+                } else {
+                    kept.push_back(j);
+                }
+            }
+            *queue = kept;
+        };
+        filter_queue(&mut q.high_normal);
+        filter_queue(&mut q.normal);
+        dropped
+    }
+
+    #[test]
+    fn context_epoch_bump_increments_monotonically() {
+        let initial = current_render_context_epoch();
+        let a = bump_render_context_epoch();
+        let b = bump_render_context_epoch();
+        assert!(a > initial);
+        assert!(b > a);
+    }
+
+    #[test]
+    fn prune_drops_stale_normal_and_high_normal_only() {
+        let queue = empty_queue();
+        let (j_crit, _rx_c) = make_test_job(JobPriority::Critical, 5);
+        let (j_high_stale, rx_h_stale) = make_test_job(JobPriority::HighNormal, 5);
+        let (j_high_fresh, _rx_h_fresh) = make_test_job(JobPriority::HighNormal, 10);
+        let (j_norm_stale, rx_n_stale) = make_test_job(JobPriority::Normal, 5);
+        let (j_norm_fresh, _rx_n_fresh) = make_test_job(JobPriority::Normal, 10);
+        let (j_norm_sentinel, _rx_n_s) = make_test_job(JobPriority::Normal, 0);
+        {
+            let (mtx, _) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            q.critical.push_back(j_crit);
+            q.high_normal.push_back(j_high_stale);
+            q.high_normal.push_back(j_high_fresh);
+            q.normal.push_back(j_norm_stale);
+            q.normal.push_back(j_norm_fresh);
+            q.normal.push_back(j_norm_sentinel);
+        }
+        let dropped = prune_stale_in_queue(&queue, 10);
+        assert_eq!(dropped.len(), 2, "stale HighNormal + Normal が drop される");
+        // Critical は触らない
+        {
+            let (mtx, _) = &*queue;
+            let q = mtx.lock().unwrap();
+            assert_eq!(q.critical.len(), 1, "Critical はプルーン対象外");
+            assert_eq!(q.high_normal.len(), 1, "fresh HighNormal は残る");
+            assert_eq!(q.normal.len(), 2, "fresh Normal + epoch=0 sentinel は残る");
+        }
+        // dropped 側に Interrupted reply を送る (= 実装と同じ挙動)
+        for j in dropped {
+            let _ = j.reply.send(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "test prune",
+            )));
+        }
+        // requester は受け取れる
+        assert!(matches!(
+            rx_h_stale.recv().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        ));
+        assert!(matches!(
+            rx_n_stale.recv().unwrap().unwrap_err().kind(),
+            std::io::ErrorKind::Interrupted
+        ));
+    }
+
+    #[test]
+    fn prune_keeps_epoch_zero_sentinel() {
+        // epoch=0 は background 用 sentinel。current_epoch がどれだけ進んでもプルーンされない。
+        let queue = empty_queue();
+        let (j_zero, _rx) = make_test_job(JobPriority::Normal, 0);
+        {
+            let (mtx, _) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            q.normal.push_back(j_zero);
+        }
+        let dropped = prune_stale_in_queue(&queue, u64::MAX);
+        assert_eq!(dropped.len(), 0);
+        let (mtx, _) = &*queue;
+        let q = mtx.lock().unwrap();
+        assert_eq!(q.normal.len(), 1, "epoch=0 sentinel は残る");
+    }
+
+    #[test]
+    fn race_old_epoch_enqueue_after_bump_caught_by_pop() {
+        // race: 古い epoch を取得した後 bump、enqueue が prune の後に来るケース。
+        // pop 時の epoch チェックが拾うことを確認する。
+        // (実 dispatcher を回さず、ロジックの等価チェック)
+        let queue = empty_queue();
+        // bump 前に古い epoch を capture
+        let old_epoch = 5u64;
+        // bump 後 (current=10) に old epoch のジョブが enqueue されたシナリオ
+        let current = 10u64;
+        // prune 後に enqueue
+        let _ = prune_stale_in_queue(&queue, current);
+        let (j_late, _rx) = make_test_job(JobPriority::Normal, old_epoch);
+        {
+            let (mtx, _) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            q.normal.push_back(j_late);
+        }
+        // run_dispatcher の pop ロジックを mimic: pop 後の stale_epoch チェック
+        let popped = {
+            let (mtx, _) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            q.normal.pop_front().unwrap()
+        };
+        let stale = popped.context_epoch != 0 && popped.context_epoch < current;
+        assert!(stale, "pop 時の epoch チェックが race を拾う");
     }
 }

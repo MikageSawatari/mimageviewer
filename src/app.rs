@@ -4387,6 +4387,12 @@ impl App {
             //   - 新フォルダ向けの enqueue は新しい cancel flag で焼き付くので、
             //     混ざらない
             crate::thumb_loader::bump_catchup_epoch();
+            // PDF render pool の context epoch も bump し、前フォルダの page-grid
+            // render ジョブを stale prune する。`load_pdf_as_folder` の async enumerate
+            // 待ちの間も保護されるよう、`start_loading_items` (= helper 経由) より早い
+            // load_folder の入口で先に bump する (二重 bump は fetch_add で別 epoch
+            // になるだけで無害)。
+            let _ = crate::pdf_loader::bump_render_context_epoch();
         }
         self.record_folder_nav_transition(&path);
         // パスが .zip / .pdf ファイルなら仮想フォルダとして開く
@@ -6823,11 +6829,9 @@ impl App {
         // モード・累積もリセット (新しい load_folder が走る = 連打バースト中断)
         self.clear_pending_folder_nav_steps();
 
-        self.cancel_token.store(true, Ordering::Relaxed);
-        self.wake_all_workers();
+        self.bump_full_context_for_load();
         crate::logger::log("  cancel_token -> true (old tasks will stop)");
-        let cancel = Arc::new(AtomicBool::new(false));
-        self.cancel_token = Arc::clone(&cancel);
+        let cancel = Arc::clone(&self.cancel_token);
 
         let (tx, rx) = mpsc::channel();
         self.tx = tx.clone();
@@ -8727,6 +8731,30 @@ impl App {
         self.cache_maint_pending = None;
     }
 
+    /// `start_loading_items` 用: フル context bump。
+    /// cancel_token を flip → 既存 worker 起こす → 新 token に置き換え → catchup epoch +
+    /// PDF render context epoch を bump する。後段で worker は再 spawn されるので
+    /// cancel_token を flip しても問題ない。
+    ///
+    /// items 差し替え経路の共通 (docs/pdf-pool-context-epoch-plan.md Phase 4)。
+    fn bump_full_context_for_load(&mut self) {
+        self.cancel_token.store(true, Ordering::Relaxed);
+        self.wake_all_workers();
+        self.cancel_token = Arc::new(AtomicBool::new(false));
+        crate::thumb_loader::bump_catchup_epoch();
+        let _ = crate::pdf_loader::bump_render_context_epoch();
+    }
+
+    /// `replace_search_view_items` (Ctrl+G) 用: PDF render epoch のみ bump。
+    /// **cancel_token は touch しない** (Ctrl+G は worker を再 spawn しないので、
+    /// flip すると worker が exit して消費者不在になる)。catchup epoch も touch しない
+    /// (Ctrl+G は PDF 階層を変えないので neighbor prefetch は引き続き有効)。
+    ///
+    /// items 差し替え経路の共通 (docs/pdf-pool-context-epoch-plan.md Phase 4)。
+    pub(crate) fn bump_render_epoch_only(&mut self) {
+        let _ = crate::pdf_loader::bump_render_context_epoch();
+    }
+
     /// condvar.wait() 中の全ワーカーを起床させる。
     /// cancel_token を true にした直後に呼び、ワーカーが即座にキャンセルを検知できるようにする。
     pub(crate) fn wake_all_workers(&self) {
@@ -9741,6 +9769,9 @@ impl App {
             }
             req.input_seq = self.input_seq;
             req.items_gen = self.items_generation;
+            // PDF render pool の context epoch を UI スレッドで焼き付ける (TOCTOU 防止)。
+            // background 経路は LoadRequest::default() の 0 のまま (= epoch チェック対象外)。
+            req.context_epoch = crate::pdf_loader::current_render_context_epoch();
             let is_heavy = self.items.get(i).is_some_and(|it| it.is_heavy_io());
             // perf: エンキューイベント (タスク種別 + 優先度 + 相関 seq)
             if crate::perf::is_enabled() {
@@ -10046,6 +10077,9 @@ impl App {
             };
             // 通常エンキューと同じく現世代を載せる (旧 items への upgrade 混入防止)
             req.items_gen = self.items_generation;
+            // PDF render pool の context epoch を UI スレッドで焼き付ける (TOCTOU 防止)。
+            // idle upgrade も UI 経路なので current epoch を使う。
+            req.context_epoch = crate::pdf_loader::current_render_context_epoch();
             upgrade_reqs.push(req);
         }
 
@@ -13415,6 +13449,15 @@ impl App {
         } else {
             crate::pdf_loader::JobPriority::Normal
         };
+        // context_epoch: Critical は epoch チェック対象外なので 0。
+        // Normal 先読みは current epoch を焼き付け、フォルダ移動で stale 化したら
+        // pool 側で prune してもらう (fs_pending.cancel と二重で守る)。
+        let pdf_context_epoch = if matches!(pdf_priority, crate::pdf_loader::JobPriority::Critical)
+        {
+            0
+        } else {
+            crate::pdf_loader::current_render_context_epoch()
+        };
 
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel::<FsLoadResult>();
@@ -13521,6 +13564,7 @@ impl App {
                     pdf_password.as_deref(),
                     Some(cancel.clone()),
                     pdf_priority,
+                    pdf_context_epoch,
                 ) {
                     Ok(crate::pdf_loader::RenderResult {
                         image: img,
@@ -17422,6 +17466,7 @@ impl App {
 
                             // 先頭1ページを親フォルダの DB にも保存
                             if page_count > 0 && !cache_map.contains_key(&folder_key) {
+                                // bulk cache creator は background なので epoch=0
                                 if let Ok(res) = crate::pdf_loader::render_page(
                                     pdf_path,
                                     0,
@@ -17429,6 +17474,7 @@ impl App {
                                     pw_ref,
                                     None,
                                     crate::pdf_loader::JobPriority::Normal,
+                                    0,
                                 ) {
                                     let img = res.image;
                                     if let Some(bytes) = encode_and_save(
@@ -17483,6 +17529,7 @@ impl App {
                                 continue;
                             }
                             // render_page がパスワード不正時に Err を返すのでそのままスキップ
+                            // bulk cache creator は background なので epoch=0
                             if let Ok(res) = crate::pdf_loader::render_page(
                                 pdf_path,
                                 0,
@@ -17490,6 +17537,7 @@ impl App {
                                 pw_ref,
                                 None,
                                 crate::pdf_loader::JobPriority::Normal,
+                                0,
                             ) {
                                 // PDF メタキャッシュにも page_count を投入する
                                 // (Codex P3 対応)。`password_required` は確信できる場合
@@ -19688,6 +19736,7 @@ fn apply_folder_thumb_pin(
             priority: base_req.priority,
             input_seq: base_req.input_seq,
             items_gen: base_req.items_gen,
+            context_epoch: base_req.context_epoch,
         };
     }
 
@@ -19721,6 +19770,7 @@ fn apply_folder_thumb_pin(
         priority: base_req.priority,
         input_seq: base_req.input_seq,
         items_gen: base_req.items_gen,
+        context_epoch: base_req.context_epoch,
     }
 }
 

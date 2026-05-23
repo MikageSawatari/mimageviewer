@@ -181,6 +181,10 @@ pub struct LoadRequest {
     /// items 世代番号: `App::items_generation` のスナップショット。
     /// ワーカーは ThumbMsg にエコーバックし、UI 側は現行世代と一致しないメッセージを破棄する。
     pub items_gen: u64,
+    /// PDF render pool の context epoch。**UI スレッドの enqueue 時点**で
+    /// `pdf_loader::current_render_context_epoch()` を焼き付ける (TOCTOU 防止)。
+    /// 0 = epoch チェック対象外 (background 経路の sentinel)。`Default::default()` は 0。
+    pub context_epoch: u64,
 }
 
 /// キャッシュ生成判定用のパラメータ（段階 C）。
@@ -884,6 +888,7 @@ pub fn process_load_request(
         req.priority,
         req.input_seq,
         req.items_gen,
+        req.context_epoch,
     );
     if crate::perf::is_enabled() {
         let total_ms = req_t0.elapsed().as_secs_f64() * 1000.0;
@@ -1287,6 +1292,7 @@ fn process_neighbor_prefetch(
     // **review #11/#13 対応**: cancel をプール経由で render_page にも渡す。
     // フォルダ移動で bump_epoch されたら、走行中の PDFium 描画も Interrupted で
     // 抜けて Normal 枠を即座に解放する。
+    // neighbor prefetch は background なので epoch=0 (UI nav の bump で巻き込まれない)
     let res = match crate::pdf_loader::render_page(
         path,
         0,
@@ -1294,6 +1300,7 @@ fn process_neighbor_prefetch(
         None,
         Some(Arc::clone(cancel)),
         crate::pdf_loader::JobPriority::Normal,
+        0,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -1657,6 +1664,9 @@ pub fn load_one_cached(
     input_seq: u64,
     // エンキュー元の `LoadRequest::items_gen`。世代不一致検出用 (Codex P2)。
     items_gen: u64,
+    // PDF render pool の context epoch。`req.context_epoch` をそのまま流す。
+    // 0 = epoch チェック対象外 (background)。
+    context_epoch: u64,
 ) {
     // カタログキー (保存・参照で一致させる) と表示名 (ログ用) を分離。
     // process_load_request 側と同じキー形式を使うこと��
@@ -1688,15 +1698,22 @@ pub fn load_one_cached(
     // どのデコーダ経路で成功したかを `decode_source` に記録し、後段の統計に渡す。
     let mut decode_source = crate::stats::DecodeSource::Native;
     let img_result = if let Some(page_num) = pdf_page {
-        // サムネイル用 PDF レンダは Normal 優先度: プールの予約ワーカーは
-        // フルスクリーン現在ページ用に空けておく
+        // サムネイル用 PDF レンダ: 可視セル (priority=true) は HighNormal、
+        // 先読みは Normal。プールの予約ワーカーはフルスクリーン現在ページ
+        // (Critical) 用に空けておく。
+        let pdf_priority = if priority {
+            crate::pdf_loader::JobPriority::HighNormal
+        } else {
+            crate::pdf_loader::JobPriority::Normal
+        };
         crate::pdf_loader::render_page(
             path,
             page_num,
             display_px,
             pdf_password,
             cancel.map(Arc::clone),
-            crate::pdf_loader::JobPriority::Normal,
+            pdf_priority,
+            context_epoch,
         )
         .map(|res| {
             // C-thumb (v1.0.0): 親フォルダ内の PDF サムネ render の場合、ついでに
@@ -1824,9 +1841,27 @@ pub fn load_one_cached(
         Ok(i) => i,
         Err(e) => {
             // キャンセル済みなら失敗を報告しない (フォルダ切替で旧アイテムが
-            // 一瞬ピンク表示になるのを防ぐ)
-            if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
-                crate::logger::log(format!("    idx={idx:>4} cancelled  {display_name}"));
+            // 一瞬ピンク表示になるのを防ぐ)。
+            //
+            // **PDF render pool の context epoch prune** (`pool_prune_stale_epoch` /
+            // `pool_stale_epoch_skip`) や **dispatcher pop 時 cancel skip** は
+            // `image::ImageError::IoError(io)` で wrap した `io::ErrorKind::Interrupted`
+            // を返す。これらは「systemic な諦め」シグナルなので Failed 化せず silent
+            // return する (= cancel 経由と同等扱い)。Susie / ZIP / native decode 由来の
+            // Interrupted を巻き込まないよう `pdf_page.is_some()` でガードする
+            // (= PDF 経路のみ対象)。
+            let pdf_interrupted = pdf_page.is_some()
+                && matches!(
+                    &e,
+                    image::ImageError::IoError(io) if io.kind() == std::io::ErrorKind::Interrupted
+                );
+            if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) || pdf_interrupted {
+                let reason = if pdf_interrupted {
+                    "pdf-interrupted"
+                } else {
+                    "cancelled"
+                };
+                crate::logger::log(format!("    idx={idx:>4} {reason}  {display_name}"));
                 gen_done.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -2238,7 +2273,8 @@ pub fn build_and_save_one_pdf(
     thumb_px: u32,
     thumb_quality: u8,
 ) -> Option<usize> {
-    // バッチキャッシュ作成は Normal 優先度: フルスクリーン操作より優先されない
+    // バッチキャッシュ作成は Normal 優先度 + 非 UI 経路なので epoch=0:
+    // フルスクリーン操作より優先されない、かつ UI nav の bump で巻き込まれない
     let res = crate::pdf_loader::render_page(
         pdf_path,
         page_num,
@@ -2246,6 +2282,7 @@ pub fn build_and_save_one_pdf(
         password,
         None,
         crate::pdf_loader::JobPriority::Normal,
+        0,
     )
     .ok()?;
     let key = crate::grid_item::pdf_page_cache_key(page_num);

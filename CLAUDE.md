@@ -353,6 +353,22 @@ egui::Window::new("...").show(ctx, |ui| {
 - 実例: `src/pdf_loader.rs` の `PdfWorkerPool` / `JobQueue` / `run_dispatcher`
 - `try_lock` 自体は「取れなければ今回は諦める」best-effort 用途のみ OK
 
+### PDF レンダ pool の context epoch (2026-05)
+
+`PdfWorkerPool` は **3 段階優先度** (`Critical / HighNormal / Normal`) + **context epoch**
+で管理されている。UI ナビゲーション (フォルダ移動 / Ctrl+G) で
+`pdf_loader::bump_render_context_epoch()` が呼ばれると、それ以前に enqueue された
+HighNormal/Normal ジョブが pool 内で stale 化 → bump 時の一括 prune + dispatcher pop 時の
+個別 stale 判定で skip される。これで PDF 多数フォルダを Ctrl+↑↓ で高速にめくっても、
+旧 PDF のページレンダリングが queue に溜まって新 PDF の cover を遅らせる事象を防ぐ。
+
+- `LoadRequest.context_epoch` を **UI スレッドの enqueue 時点で** 焼き付ける (TOCTOU 防止、
+  worker から `current_render_context_epoch()` を呼ばない)
+- `context_epoch=0` は background / Critical 用 sentinel (= プルーン対象外)
+- background 経路 (CatchupQueue / NeighborPrefetch / build_and_save_one_pdf / cache creator /
+  `get_document_info` / `enumerate_pages_with_cancel`) は全て epoch=0
+- 詳細: [docs/pdf-pool-context-epoch-plan.md](docs/pdf-pool-context-epoch-plan.md)
+
 ### UI スレッドでの同期 I/O は即 worker 化する ⚠️
 
 `App::update` から (呼び出し先を含めて) 同期実行される処理で以下を行うと、

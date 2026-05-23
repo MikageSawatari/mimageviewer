@@ -1056,6 +1056,11 @@ impl App {
             .iter()
             .filter_map(|&i| self.items.get(i).and_then(thumb_reuse_key))
             .collect();
+        // PDF render pool に残っている旧 search 結果の render ジョブを stale prune
+        // する。`bump_render_epoch_only` は cancel_token / catchup を touch しないので、
+        // worker 再 spawn なしの replace 経路で worker を殺さない。
+        // (docs/pdf-pool-context-epoch-plan.md Phase 4)
+        self.bump_render_epoch_only();
         // items_generation bump + thumbnails 初期化を一箇所に集約。
         // これ以降に届く旧ワーカーの ThumbMsg は poll_thumbnails の
         // 世代不一致チェックで破棄される。
