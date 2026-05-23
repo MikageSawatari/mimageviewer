@@ -2103,6 +2103,11 @@ pub struct App {
     pub(crate) recent_folders: Vec<PathBuf>,
     /// 履歴戻る/進むで発生する次回 load_folder は通常履歴に積まない。
     pub(crate) suppress_folder_nav_record_once: bool,
+    /// 検索クローズで検索前フォルダへ復帰する `load_folder` を履歴に積まないための
+    /// ワンショット。検索中は `global_search.active` / `favsearch.active` で判定できるが、
+    /// `close_global_search` / `close_favsearch` は `active` を false にしてから
+    /// `load_folder(saved_folder)` を呼ぶため、それを取りこぼさないようここで補う。
+    pub(crate) suppress_nav_record_for_search_restore: bool,
 
     // ── フォルダ履歴（スクロール位置・選択状態の復元用）────────────
     /// フォルダパス → (scroll_offset_y, selected_idx)
@@ -3326,6 +3331,7 @@ impl App {
             folder_nav_forward_stack: Vec::new(),
             recent_folders: Vec::new(),
             suppress_folder_nav_record_once: false,
+            suppress_nav_record_for_search_restore: false,
             folder_history: std::collections::HashMap::new(),
             show_search_bar: false,
             search_query: String::new(),
@@ -4013,7 +4019,21 @@ impl App {
         }
     }
 
+    /// 明示した移動元 `from` を「戻る」履歴へ積み、「進む」履歴をクリアする。
+    /// `record_folder_nav_transition` の自動記録では移動元が正しく取れないケース
+    /// (検索から「フォルダに移動」で抜ける等) に、呼び出し側が確定した移動元を渡す。
+    pub(crate) fn push_nav_history_entry(&mut self, from: PathBuf) {
+        Self::push_folder_nav_stack(&mut self.folder_nav_back_stack, from);
+        self.folder_nav_forward_stack.clear();
+    }
+
     pub(crate) fn remember_recent_folder(&mut self, path: &Path) {
+        // 検索 (Ctrl+G / Ctrl+S) 中は recent_folders を一切変更しない。
+        // record_folder_nav_transition 以外に archive_convert などが直接呼ぶため、
+        // recent_folders を汚さないチョークポイントをここに置く。
+        if self.global_search.active || self.favsearch.active {
+            return;
+        }
         self.recent_folders
             .retain(|p| !crate::folder_tree::path_eq(p, path));
         self.recent_folders.insert(0, path.to_path_buf());
@@ -4025,6 +4045,18 @@ impl App {
     /// ここで扱う履歴はスクロール復元用の `folder_history` とは別物で、
     /// ユーザーがフォルダバーの ←/→ や履歴メニューで辿るためのもの。
     fn record_folder_nav_transition(&mut self, target: &Path) {
+        // 検索 (Ctrl+G / Ctrl+S) 中の移動、および検索クローズによる検索前フォルダへの
+        // 復帰は履歴 (back/forward/recent) に一切残さない。検索は透明な一時オーバーレイ
+        // であり、抜けると検索前の状態に完全復帰する。`suppress_nav_record_for_search_restore`
+        // は close_* が active を false にしてから load_folder(saved) を呼ぶ取りこぼしを補う
+        // ワンショット (短絡で消費漏れしないよう先に take しておく)。
+        let search_restore = std::mem::take(&mut self.suppress_nav_record_for_search_restore);
+        if self.global_search.active || self.favsearch.active || search_restore {
+            // 古いワンショット抑止が次の通常ナビへ漏れないようここで消費しておく。
+            self.suppress_folder_nav_record_once = false;
+            return;
+        }
+
         if self
             .current_folder
             .as_ref()
@@ -4044,6 +4076,15 @@ impl App {
             return;
         };
         if crate::folder_tree::path_eq(&current, target) {
+            return;
+        }
+
+        // 合成検索結果パス (__search_results__) は実在しないため、移動元として
+        // 履歴スタックに積まない (安全網。通常は上位の検索ガードで弾かれる)。
+        // ただし新しい遷移自体は発生しているので forward 履歴はクリアする
+        // (新規ナビゲーションが forward 履歴を無効化する原則)。
+        if crate::folder_tree::path_eq(&current, &search_results_synthetic_path()) {
+            self.folder_nav_forward_stack.clear();
             return;
         }
 
@@ -5357,8 +5398,10 @@ impl App {
             pending.cancel.store(true, Ordering::Relaxed);
         }
 
-        // 検索モードで保存していた元フォルダがあれば戻す
+        // 検索モードで保存していた元フォルダがあれば戻す。この復帰 load_folder は
+        // 履歴 (back/forward/recent) に積まない (検索は透明な一時オーバーレイ)。
         if let Some(saved) = self.favsearch.saved_folder.take() {
+            self.suppress_nav_record_for_search_restore = true;
             self.load_folder(saved);
         }
     }
@@ -6430,9 +6473,17 @@ impl App {
         }
 
         // ── 履歴保存 + 旧タスクキャンセル + 状態リセット ──
+        // 退場ビューが検索結果ビュー (Ctrl+G 合成ビュー / Ctrl+S 結果一覧) のときは
+        // folder_history (スクロール位置復元用) へ保存しない。Ctrl+G は current_folder を
+        // 検索前フォルダのまま保つため、検索ビューの scroll_offset_y をそのフォルダの
+        // スクロール状態として記録すると、後で戻ったとき誤った位置に復元される。
         if let Some(cur) = self.current_folder.clone() {
-            self.folder_history
-                .insert(cur, (self.scroll_offset_y, self.selected));
+            let leaving_search_view = self.items_are_global_search_view
+                || crate::folder_tree::path_eq(&cur, &search_results_synthetic_path());
+            if !leaving_search_view {
+                self.folder_history
+                    .insert(cur, (self.scroll_offset_y, self.selected));
+            }
         }
         self.close_fullscreen();
 
@@ -10089,10 +10140,10 @@ impl App {
                     self.drill_back_one_level();
                     return None;
                 }
-                // Aggregated 状態で BS: Ctrl+G を閉じて saved_folder へ戻る。
-                // ここで catch しないと FS 親遡行に流れ、search bar が active のまま
+                // Aggregated (検索仮想階層の最上位) で BS: no-op。BS は「階層を 1 段
+                // 上がる・根で停止・検索モードからは出ない」キー。検索の終了は ESC のみ。
+                // ここで return しないと FS 親遡行に流れ、search bar が active のまま
                 // saved_folder の親 → ドライブ root の中身が表示される事故になる。
-                self.close_global_search();
                 return None;
             }
             if in_favsearch {

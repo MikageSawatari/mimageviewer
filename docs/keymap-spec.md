@@ -12,9 +12,9 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 
 | キー | 動作 |
 |---|---|
-| <kbd>Backspace</kbd> | 親フォルダへ |
-| <kbd>Ctrl</kbd>+<kbd>↑</kbd> | ツリー順で前のフォルダへ (DFS pre-order、画像なしフォルダは skip_limit までスキップ) |
-| <kbd>Ctrl</kbd>+<kbd>↓</kbd> | ツリー順で次のフォルダへ (DFS pre-order) |
+| <kbd>Backspace</kbd> | 親フォルダへ。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ、最上位 (集約ビュー / 結果一覧) では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd> 再押下) |
+| <kbd>Ctrl</kbd>+<kbd>↑</kbd> | ツリー順で前のフォルダへ (DFS pre-order、画像なしフォルダは skip_limit までスキップ)。検索中は前のヒットフォルダへ移動 (`global_search_ctrl_nav` / `favsearch_ctrl_nav`) |
+| <kbd>Ctrl</kbd>+<kbd>↓</kbd> | ツリー順で次のフォルダへ (DFS pre-order)。検索中は次のヒットフォルダへ移動 |
 | <kbd>F1</kbd>〜<kbd>F5</kbd> | レーティング 1〜5 |
 | <kbd>F6</kbd> | レーティング解除 |
 | <kbd>P</kbd> | 選択中アイテムを現在のコンテナの代表サムネに固定 / 解除 (toggle、フォルダバー 📌 の左クリックと同等)。pin 不能アイテム / 検索アグリゲート / 変換キャッシュ drill-down では silent no-op。**動画フルスクリーンの P と合わせて P = Pin に統一** |

@@ -106,9 +106,13 @@ impl App {
     pub(crate) fn open_archive_via_cache(&mut self, src: PathBuf, cached_zip: PathBuf) {
         self.load_folder(cached_zip.clone());
         self.address = src.to_string_lossy().to_string();
-        self.recent_folders
-            .retain(|p| !crate::folder_tree::path_eq(p, &cached_zip));
-        self.remember_recent_folder(&src);
+        // 検索 (Ctrl+G / Ctrl+S) 中は recent_folders を一切変更しない
+        // (remember_recent_folder 自体もガード済みだが、retain も検索中は走らせない)。
+        if !(self.global_search.active || self.favsearch.active) {
+            self.recent_folders
+                .retain(|p| !crate::folder_tree::path_eq(p, &cached_zip));
+            self.remember_recent_folder(&src);
+        }
         self.archive_source_override = Some(src);
     }
 
@@ -164,9 +168,12 @@ impl App {
                 self.load_folder(nav.clone());
                 if let Some(src) = src {
                     self.address = src.to_string_lossy().to_string();
-                    self.recent_folders
-                        .retain(|p| !crate::folder_tree::path_eq(p, &nav));
-                    self.remember_recent_folder(&src);
+                    // 検索 (Ctrl+G / Ctrl+S) 中は recent_folders を一切変更しない。
+                    if !(self.global_search.active || self.favsearch.active) {
+                        self.recent_folders
+                            .retain(|p| !crate::folder_tree::path_eq(p, &nav));
+                        self.remember_recent_folder(&src);
+                    }
                     self.archive_source_override = Some(src);
                 }
                 if self.favsearch.active {

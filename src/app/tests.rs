@@ -1063,6 +1063,227 @@ mod phase_c_folder_nav_history_tests {
         app.current_folder_last_mtime = None;
         assert_eq!(app.current_favorite_target(), None);
     }
+
+    // ── 検索 (Ctrl+G / Ctrl+S) 中のフォルダ履歴の扱い ──────────────────
+    // 検索は「透明な一時オーバーレイ」で、検索中の移動は back/forward/recent に
+    // 一切残さず、抜けると検索前の状態へ完全復帰する。
+
+    #[test]
+    fn search_active_global_does_not_record_folder_history() {
+        let mut app = setup_app();
+        let a = PathBuf::from(r"C:\miv-test\a");
+        let b = PathBuf::from(r"C:\miv-test\b");
+        let recent0 = PathBuf::from(r"C:\miv-test\recent0");
+        app.current_folder = Some(a.clone());
+        app.folder_nav_back_stack = vec![a.clone()];
+        app.folder_nav_forward_stack = Vec::new();
+        app.recent_folders = vec![recent0.clone()];
+        app.global_search.active = true;
+
+        app.record_folder_nav_transition(&b);
+
+        assert_eq!(app.folder_nav_back_stack, vec![a]);
+        assert!(app.folder_nav_forward_stack.is_empty());
+        assert_eq!(app.recent_folders, vec![recent0]);
+    }
+
+    #[test]
+    fn search_active_favsearch_does_not_record_folder_history() {
+        let mut app = setup_app();
+        let a = PathBuf::from(r"C:\miv-test\a");
+        let b = PathBuf::from(r"C:\miv-test\b");
+        let recent0 = PathBuf::from(r"C:\miv-test\recent0");
+        app.current_folder = Some(a.clone());
+        app.folder_nav_back_stack = vec![a.clone()];
+        app.folder_nav_forward_stack = Vec::new();
+        app.recent_folders = vec![recent0.clone()];
+        app.favsearch.active = true;
+
+        app.record_folder_nav_transition(&b);
+
+        assert_eq!(app.folder_nav_back_stack, vec![a]);
+        assert!(app.folder_nav_forward_stack.is_empty());
+        assert_eq!(app.recent_folders, vec![recent0]);
+    }
+
+    #[test]
+    fn closing_global_search_does_not_record_history() {
+        let mut app = setup_app();
+        let saved = app.tmp.path().join("saved");
+        std::fs::create_dir_all(&saved).unwrap();
+        let prev = PathBuf::from(r"C:\miv-test\prev");
+        app.folder_nav_back_stack = vec![prev.clone()];
+        app.folder_nav_forward_stack = Vec::new();
+        // 検索中に ZIP を開いて current_folder が saved とずれている状態を模擬。
+        app.current_folder = Some(PathBuf::from(r"C:\miv-test\opened-in-search.zip"));
+        app.global_search.active = true;
+        app.global_search.saved_folder = Some(saved.clone());
+
+        app.close_global_search();
+
+        // 検索クローズによる saved への復帰は履歴に積まれない。
+        assert_eq!(app.folder_nav_back_stack, vec![prev]);
+        assert!(app.folder_nav_forward_stack.is_empty());
+        assert!(!app.suppress_nav_record_for_search_restore);
+        assert_eq!(app.current_folder.as_ref(), Some(&saved));
+    }
+
+    #[test]
+    fn closing_favsearch_does_not_record_history() {
+        let mut app = setup_app();
+        let saved = app.tmp.path().join("fav-saved");
+        std::fs::create_dir_all(&saved).unwrap();
+        let prev = PathBuf::from(r"C:\miv-test\prev");
+        app.folder_nav_back_stack = vec![prev.clone()];
+        // favsearch 結果一覧中は current_folder が合成パス。
+        app.current_folder = Some(crate::app::search_results_synthetic_path());
+        app.favsearch.active = true;
+        app.favsearch.saved_folder = Some(saved.clone());
+
+        app.close_favsearch();
+
+        assert_eq!(app.folder_nav_back_stack, vec![prev]);
+        assert!(!app.suppress_nav_record_for_search_restore);
+        assert_eq!(app.current_folder.as_ref(), Some(&saved));
+    }
+
+    #[test]
+    fn remember_recent_folder_ignored_during_search() {
+        let mut app = setup_app();
+        let recent0 = PathBuf::from(r"C:\miv-test\recent0");
+        let archive = PathBuf::from(r"C:\miv-test\found.7z");
+        app.recent_folders = vec![recent0.clone()];
+
+        // Ctrl+G / Ctrl+S 中は archive_convert などの直接呼び出しでも recent を変えない。
+        app.global_search.active = true;
+        app.remember_recent_folder(&archive);
+        assert_eq!(app.recent_folders, vec![recent0.clone()]);
+
+        app.global_search.active = false;
+        app.favsearch.active = true;
+        app.remember_recent_folder(&archive);
+        assert_eq!(app.recent_folders, vec![recent0.clone()]);
+
+        // 検索を抜ければ通常どおり記録される。
+        app.favsearch.active = false;
+        app.remember_recent_folder(&archive);
+        assert_eq!(app.recent_folders.first(), Some(&archive));
+    }
+
+    #[test]
+    fn synthetic_search_path_not_pushed_as_nav_source() {
+        let mut app = setup_app();
+        let prev = PathBuf::from(r"C:\miv-test\prev");
+        let stale_forward = PathBuf::from(r"C:\miv-test\stale-forward");
+        let target = PathBuf::from(r"C:\miv-test\target");
+        app.folder_nav_back_stack = vec![prev.clone()];
+        // 検索前に ← で残っていた forward 履歴を模擬。新規ナビなのでクリアされるべき。
+        app.folder_nav_forward_stack = vec![stale_forward];
+        // 合成検索結果パスを移動元にした記録を試みても back_stack には積まれない。
+        app.current_folder = Some(crate::app::search_results_synthetic_path());
+
+        app.record_folder_nav_transition(&target);
+
+        // 合成 source は back には積まないが forward は無効化する (新規ナビなので)。
+        assert_eq!(app.folder_nav_back_stack, vec![prev]);
+        assert!(app.folder_nav_forward_stack.is_empty());
+    }
+
+    #[test]
+    fn push_nav_history_entry_records_explicit_source() {
+        let mut app = setup_app();
+        let older = PathBuf::from(r"C:\miv-test\older");
+        let forward = PathBuf::from(r"C:\miv-test\forward");
+        let c = PathBuf::from(r"C:\miv-test\pre-search");
+        app.folder_nav_back_stack = vec![older.clone()];
+        app.folder_nav_forward_stack = vec![forward];
+
+        app.push_nav_history_entry(c.clone());
+
+        assert_eq!(app.folder_nav_back_stack, vec![older, c]);
+        assert!(app.folder_nav_forward_stack.is_empty());
+    }
+
+    #[test]
+    fn navigate_to_folder_from_search_records_pre_search_folder() {
+        let mut app = setup_app();
+        let c = PathBuf::from(r"C:\miv-test\pre-search");
+        let x = app.tmp.path().join("jump-target");
+        std::fs::create_dir_all(&x).unwrap();
+        let older = PathBuf::from(r"C:\miv-test\older");
+        app.folder_nav_back_stack = vec![older.clone()];
+        app.current_folder = Some(crate::app::search_results_synthetic_path());
+        app.favsearch.active = true;
+        app.favsearch.saved_folder = Some(c.clone());
+
+        // context_menu「フォルダに移動」後処理の模擬: 検索前フォルダ C を捕捉して
+        // 検索を閉じ、C を明示的に積んでから移動先 X へ load する。
+        let pre = app.favsearch.saved_folder.clone();
+        app.favsearch.saved_folder = None;
+        app.close_favsearch();
+        if let Some(cc) = pre {
+            if !crate::folder_tree::path_eq(&cc, &x) {
+                app.push_nav_history_entry(cc);
+            }
+        }
+        app.suppress_folder_nav_record_once = true;
+        app.load_folder(x.clone());
+
+        // 「検索前フォルダ C → 移動先 X」が積まれ、X で ← を押すと C に戻れる。
+        assert_eq!(app.folder_nav_back_stack, vec![older, c]);
+        assert_eq!(app.recent_folders.first(), Some(&x));
+    }
+
+    #[test]
+    fn search_view_scroll_does_not_corrupt_folder_history() {
+        let mut app = setup_app();
+        let c = PathBuf::from(r"C:\miv-test\pre-search-c");
+        let x = app.tmp.path().join("g-target");
+        std::fs::create_dir_all(&x).unwrap();
+        // Ctrl+G 検索ビューを退場する模擬: current_folder=C のまま検索ビューを
+        // スクロールして scroll_offset_y が C 本来の値から乖離している状態。
+        app.current_folder = Some(c.clone());
+        app.items_are_global_search_view = true;
+        app.scroll_offset_y = 999.0;
+        app.selected = Some(7);
+        app.folder_history.insert(c.clone(), (42.0, Some(3)));
+
+        app.start_loading_items(
+            x.clone(),
+            Vec::new(),
+            Vec::new(),
+            HashSet::new(),
+            Vec::new(),
+            None,
+        );
+
+        // C の folder_history は検索前の値のまま (検索ビューのスクロールで壊れない)。
+        assert_eq!(app.folder_history.get(&c), Some(&(42.0, Some(3))));
+    }
+
+    #[test]
+    fn normal_view_still_saves_folder_history() {
+        let mut app = setup_app();
+        let d = PathBuf::from(r"C:\miv-test\normal-d");
+        let x = app.tmp.path().join("g-target2");
+        std::fs::create_dir_all(&x).unwrap();
+        app.current_folder = Some(d.clone());
+        app.items_are_global_search_view = false;
+        app.scroll_offset_y = 555.0;
+        app.selected = Some(9);
+
+        app.start_loading_items(
+            x.clone(),
+            Vec::new(),
+            Vec::new(),
+            HashSet::new(),
+            Vec::new(),
+            None,
+        );
+
+        // 通常ビューからの退場では従来どおりスクロール状態を保存する。
+        assert_eq!(app.folder_history.get(&d), Some(&(555.0, Some(9))));
+    }
 }
 
 // =======================================================================

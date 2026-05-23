@@ -1038,6 +1038,14 @@ impl App {
                 .any(|fav| crate::folder_tree::path_eq(&fav.path, p))
         });
 
+        // 検索 (Ctrl+G / Ctrl+S) 中はアドレスバーの ←/→/履歴 を無効化し、⬆/▲▼ を
+        // 検索仮想階層用に転用する。closure 内で複数のボタン分岐から参照するため事前計算。
+        let search_active = self.global_search.active || self.favsearch.active;
+        // 検索の仮想階層でドリルイン中か (= ⬆ で 1 段戻れる / ▲▼ で前後ヒットへ
+        // 動ける状態。最上位ではこれらを disabled にする条件)。
+        let search_drilled_in = (self.global_search.active && self.global_search.drill.is_some())
+            || (self.favsearch.active && !self.favsearch.nav_stack.is_empty());
+
         // 現在表示中フォルダ / ZIP / PDF のコンテナレーティングを取得。
         // 0 のときは非表示、1〜5 のときは★バッジをアドレス欄の右端に表示する。
         let folder_rating = self.current_folder_rating();
@@ -1057,6 +1065,8 @@ impl App {
                 let mut pin_click = PinButtonClick::None;
                 let mut favorite_click = FavoriteButtonClick::None;
                 let mut tree_nav: Option<bool> = None;
+                // 検索中の ⬆ ボタン (検索仮想階層を 1 段ドリルアップ) を closure 後に適用。
+                let mut search_drill_up = false;
                 ui.horizontal(|ui| {
                     ui.label("フォルダ:");
                     let show_history_nav = self.settings.show_address_bar_history_nav;
@@ -1065,23 +1075,39 @@ impl App {
                         || self.settings.show_toolbar_next_folder;
 
                     if show_history_nav {
-                        let back_hover = back_target
-                            .as_ref()
-                            .map(|p| format!("フォルダ履歴を戻る\n{}", p.to_string_lossy()))
-                            .unwrap_or_else(|| "フォルダ履歴を戻る".to_string());
+                        // 検索 (Ctrl+G / Ctrl+S) 中は ←/→ を無効化する。検索は透明な
+                        // 一時オーバーレイで、フォルダ履歴の概念が適用されないため。
+                        let back_hover = if search_active {
+                            "検索中はフォルダ履歴を使用できません".to_string()
+                        } else {
+                            back_target
+                                .as_ref()
+                                .map(|p| format!("フォルダ履歴を戻る\n{}", p.to_string_lossy()))
+                                .unwrap_or_else(|| "フォルダ履歴を戻る".to_string())
+                        };
                         if ui
-                            .add_enabled(back_target.is_some(), egui::Button::new("←"))
+                            .add_enabled(
+                                back_target.is_some() && !search_active,
+                                egui::Button::new("←"),
+                            )
                             .hover_tip(back_hover)
                             .clicked()
                         {
                             result = Some(AddressBarNav::HistoryBack);
                         }
-                        let forward_hover = forward_target
-                            .as_ref()
-                            .map(|p| format!("フォルダ履歴を進む\n{}", p.to_string_lossy()))
-                            .unwrap_or_else(|| "フォルダ履歴を進む".to_string());
+                        let forward_hover = if search_active {
+                            "検索中はフォルダ履歴を使用できません".to_string()
+                        } else {
+                            forward_target
+                                .as_ref()
+                                .map(|p| format!("フォルダ履歴を進む\n{}", p.to_string_lossy()))
+                                .unwrap_or_else(|| "フォルダ履歴を進む".to_string())
+                        };
                         if ui
-                            .add_enabled(forward_target.is_some(), egui::Button::new("→"))
+                            .add_enabled(
+                                forward_target.is_some() && !search_active,
+                                egui::Button::new("→"),
+                            )
                             .hover_tip(forward_hover)
                             .clicked()
                         {
@@ -1094,36 +1120,70 @@ impl App {
                     }
 
                     if show_parent {
-                        let parent_hover = parent_target
-                            .as_ref()
-                            .map(|p| format!("親フォルダへ [BS]\n{}", p.to_string_lossy()))
-                            .unwrap_or_else(|| "親フォルダへ [BS]".to_string());
-                        if ui
-                            .add_enabled(parent_target.is_some(), egui::Button::new("⬆"))
-                            .hover_tip(parent_hover)
-                            .clicked()
-                            && let (Some(cur), Some(parent)) =
-                                (effective_folder.as_ref(), parent_target.as_ref())
-                        {
-                            self.select_after_load = cur
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .map(|s| s.to_string());
-                            result = Some(AddressBarNav::Direct(parent.clone()));
+                        if search_active {
+                            // 検索中: ⬆ は検索仮想階層を 1 段ドリルアップする
+                            // (BS と同じ動作)。最上位 (集約ビュー / 結果一覧) では disabled。
+                            let up_hover = if search_drilled_in {
+                                "検索結果を 1 階層戻る [BS]"
+                            } else {
+                                "これ以上戻れません"
+                            };
+                            if ui
+                                .add_enabled(search_drilled_in, egui::Button::new("⬆"))
+                                .hover_tip(up_hover)
+                                .clicked()
+                            {
+                                search_drill_up = true;
+                            }
+                        } else {
+                            let parent_hover = parent_target
+                                .as_ref()
+                                .map(|p| format!("親フォルダへ [BS]\n{}", p.to_string_lossy()))
+                                .unwrap_or_else(|| "親フォルダへ [BS]".to_string());
+                            if ui
+                                .add_enabled(parent_target.is_some(), egui::Button::new("⬆"))
+                                .hover_tip(parent_hover)
+                                .clicked()
+                                && let (Some(cur), Some(parent)) =
+                                    (effective_folder.as_ref(), parent_target.as_ref())
+                            {
+                                self.select_after_load = cur
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .map(|s| s.to_string());
+                                result = Some(AddressBarNav::Direct(parent.clone()));
+                            }
                         }
                     }
 
                     if show_tree_nav {
+                        // 検索中は ▲▼ を「前後のヒットフォルダへ移動」に転用する
+                        // (キーボード Ctrl+↑↓ と一致)。最上位では disabled。
+                        let tree_enabled = if search_active {
+                            search_drilled_in
+                        } else {
+                            has_current
+                        };
+                        let prev_hover = if search_active {
+                            "前のヒットフォルダへ [Ctrl+↑]"
+                        } else {
+                            "ツリー順で前のフォルダへ [Ctrl+↑]"
+                        };
+                        let next_hover = if search_active {
+                            "次のヒットフォルダへ [Ctrl+↓]"
+                        } else {
+                            "ツリー順で次のフォルダへ [Ctrl+↓]"
+                        };
                         if ui
-                            .add_enabled(has_current, egui::Button::new("▲"))
-                            .hover_tip("ツリー順で前のフォルダへ [Ctrl+↑]")
+                            .add_enabled(tree_enabled, egui::Button::new("▲"))
+                            .hover_tip(prev_hover)
                             .clicked()
                         {
                             tree_nav = Some(false);
                         }
                         if ui
-                            .add_enabled(has_current, egui::Button::new("▼"))
-                            .hover_tip("ツリー順で次のフォルダへ [Ctrl+↓]")
+                            .add_enabled(tree_enabled, egui::Button::new("▼"))
+                            .hover_tip(next_hover)
                             .clicked()
                         {
                             tree_nav = Some(true);
@@ -1181,39 +1241,49 @@ impl App {
                         }
 
                         if self.settings.show_address_bar_history_menu {
-                            ui.menu_button("履歴▼", |ui| {
-                                let menu_width =
-                                    (ctx.content_rect().width() * 0.72).clamp(560.0, 1100.0);
-                                ui.set_min_width(menu_width);
-                                let mut shown = 0usize;
-                                for path in &recent_folders {
-                                    if effective_folder
-                                        .as_ref()
-                                        .is_some_and(|cur| crate::folder_tree::path_eq(cur, path))
-                                    {
-                                        continue;
-                                    }
-                                    let full = path.to_string_lossy().to_string();
-                                    let button =
-                                        egui::Button::new(egui::RichText::new(&full).monospace())
-                                            .wrap_mode(egui::TextWrapMode::Extend);
-                                    if ui.add(button).hover_tip(&full).clicked() {
-                                        if let Some(resolved) = resolve_folder_bar_nav_path(path) {
-                                            result = Some(AddressBarNav::Direct(resolved));
+                            // 検索 (Ctrl+G / Ctrl+S) 中は履歴メニューを無効化する
+                            // (検索は透明な一時オーバーレイで履歴の概念が適用されない)。
+                            ui.add_enabled_ui(!search_active, |ui| {
+                                ui.menu_button("履歴▼", |ui| {
+                                    let menu_width =
+                                        (ctx.content_rect().width() * 0.72).clamp(560.0, 1100.0);
+                                    ui.set_min_width(menu_width);
+                                    let mut shown = 0usize;
+                                    for path in &recent_folders {
+                                        if effective_folder.as_ref().is_some_and(|cur| {
+                                            crate::folder_tree::path_eq(cur, path)
+                                        }) {
+                                            continue;
                                         }
-                                        ui.close();
+                                        let full = path.to_string_lossy().to_string();
+                                        let button = egui::Button::new(
+                                            egui::RichText::new(&full).monospace(),
+                                        )
+                                        .wrap_mode(egui::TextWrapMode::Extend);
+                                        if ui.add(button).hover_tip(&full).clicked() {
+                                            if let Some(resolved) =
+                                                resolve_folder_bar_nav_path(path)
+                                            {
+                                                result = Some(AddressBarNav::Direct(resolved));
+                                            }
+                                            ui.close();
+                                        }
+                                        shown += 1;
+                                        if shown >= 20 {
+                                            break;
+                                        }
                                     }
-                                    shown += 1;
-                                    if shown >= 20 {
-                                        break;
+                                    if shown == 0 {
+                                        ui.label(egui::RichText::new("履歴はありません").weak());
                                     }
-                                }
-                                if shown == 0 {
-                                    ui.label(egui::RichText::new("履歴はありません").weak());
-                                }
-                            })
-                            .response
-                            .hover_tip("最近開いたフォルダ");
+                                })
+                                .response
+                                .hover_tip(if search_active {
+                                    "検索中は履歴メニューを使用できません"
+                                } else {
+                                    "最近開いたフォルダ"
+                                });
+                            });
                             ui.add_space(4.0);
                         }
 
@@ -1290,10 +1360,25 @@ impl App {
                     }
                     FavoriteButtonClick::None => {}
                 }
-                if let Some(forward) = tree_nav
-                    && let Some(cur) = effective_folder.clone()
-                {
-                    self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Grid);
+                if let Some(forward) = tree_nav {
+                    // 検索中は ▲▼ を検索仮想階層の前後ヒット移動に振り分ける
+                    // (キーボード Ctrl+↑↓ と同じ分岐)。最上位では ▲▼ が disabled な
+                    // ので通常ここには来ないが、防御的に各ナビ関数も空なら no-op。
+                    if self.global_search.active && self.global_search.drill.is_some() {
+                        self.global_search_ctrl_nav(forward);
+                    } else if self.favsearch.active && !self.favsearch.nav_stack.is_empty() {
+                        self.favsearch_ctrl_nav(forward);
+                    } else if let Some(cur) = effective_folder.clone() {
+                        self.start_folder_nav(cur, forward, crate::app::FolderNavMode::Grid);
+                    }
+                }
+                // 検索中の ⬆ ボタン: 検索仮想階層を 1 段ドリルアップ (BS と同じ動作)。
+                if search_drill_up {
+                    if self.global_search.active {
+                        self.drill_back_one_level();
+                    } else if self.favsearch.active {
+                        self.favsearch_back();
+                    }
                 }
                 result
             })

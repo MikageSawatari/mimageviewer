@@ -1085,8 +1085,10 @@ impl App {
         // Ctrl+G 専用のサブフォルダ件数キャッシュも破棄する。folder_rating_match が
         // 旧データを誤って返さないように、saved_folder への load_folder より先に消す。
         self.search_drilled_folder_counts.clear();
-        // 元のフォルダに戻る
+        // 元のフォルダに戻る。この復帰 load_folder は履歴 (back/forward/recent) に
+        // 積まない (検索は透明な一時オーバーレイ)。
         if let Some(folder) = self.global_search.saved_folder.take() {
+            self.suppress_nav_record_for_search_restore = true;
             self.load_folder(folder);
         }
     }
@@ -1425,7 +1427,8 @@ impl App {
             // 一覧 (Flat) ビューから直接 PDF を開いたケース (Codex P2)。
             // container_root = current_path = p の 1 段ドリルを確立しておくと、
             // BS 1 回で drill_back_to_top → 一覧ビューへ戻れる。これをしないと
-            // drill=None のまま BS が close_global_search に流れて検索ごと閉じる。
+            // drill=None のまま PDF ページ表示に居続け、BS が一覧へ戻れなくなる
+            // (最上位での BS は no-op、検索の終了は ESC のみ)。
             let is_zip = p
                 .extension()
                 .map(|e| e.eq_ignore_ascii_case("zip"))

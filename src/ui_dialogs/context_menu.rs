@@ -404,6 +404,16 @@ impl crate::app::App {
         // Ctrl+S) を抜けてから nav する。saved_folder の復帰で旧フォルダへ無駄な
         // ロードが走らないよう、先に saved_folder を捨てる (toolbar_fav_nav と同じ手順)。
         if nav_exits_search {
+            // 検索を抜ける前に、検索開始時の実フォルダ C を捕捉する。検索中は
+            // current_folder がドリルイン先や合成パスを指しうるので、確実に検索前の
+            // 実フォルダを保持している saved_folder から取る。
+            let pre_search_folder = if self.global_search.active {
+                self.global_search.saved_folder.clone()
+            } else if self.favsearch.active {
+                self.favsearch.saved_folder.clone()
+            } else {
+                None
+            };
             if self.global_search.active {
                 self.global_search.saved_folder = None;
                 self.close_global_search();
@@ -412,9 +422,17 @@ impl crate::app::App {
                 self.favsearch.saved_folder = None;
                 self.close_favsearch();
             }
-            // 検索から実フォルダへの意図的なジャンプなので、戻る履歴には積まない。
-            // 特に Ctrl+S は current_folder が合成パス (__search_results__) のままで、
-            // これを記録すると「戻る」で実在しないフォルダに飛んでしまう。
+            // 「フォルダに移動」は検索を明示終了して実フォルダへ着地する正当な
+            // ナビゲーションなので「検索前フォルダ C → 移動先 X」を履歴に残す。
+            // X で ← を押すと検索前の C に戻れる。C == X のときは無意味なので積まない。
+            if let (Some(c), Some(x)) = (pre_search_folder, nav.as_ref()) {
+                if !crate::folder_tree::path_eq(&c, x) {
+                    self.push_nav_history_entry(c);
+                }
+            }
+            // 直後に呼び出し元が行う load_folder(X) では back_stack への二重 push を
+            // 避ける (移動元 C は上で明示的に積み済み。X の recent 追加は
+            // record_folder_nav_transition 側で行われる)。
             self.suppress_folder_nav_record_once = true;
         }
 
