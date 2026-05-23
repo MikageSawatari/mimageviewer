@@ -5990,6 +5990,12 @@ impl App {
         // ファイル名.pdf」のブレッドクラム形式で上書きし直す (2026-04 ユーザー報告)。
         // no-op: Ctrl+G 非アクティブ / Aggregated 時は何もしない。
         self.update_global_search_address();
+
+        // PDFium による PDF オープン + ページ列挙はファイル固有 (cold disk + 構造解析)
+        // で 100ms〜1.3s 程度かかる。その間、グリッドは親フォルダのままで動かないため
+        // 「Enter は効いたのか?」とユーザーが不安になる。左下に「読み込み中」バッジを
+        // 出すのは `render_container_enumerate_overlay` ([ui_main.rs])。既存「先読み N/M」
+        // と同じ場所 (LEFT_BOTTOM) なので、ユーザーの目線パターンに合う。
     }
 
     /// PDF ページ列挙の非同期応答をポーリングする。
@@ -11126,9 +11132,10 @@ impl App {
             self.pending_main_foreground_reclaim_force_at = None;
         }
         self.adjust_spread_target = AdjustSpreadTarget::Left;
-        // PDF pool の Critical 予約を ON: 現在ページのレンダリング用に 1 ワーカー確保。
-        // グリッドに戻ったら OFF に戻し、全 3 ワーカーを Normal に使えるようにする。
-        crate::pdf_loader::set_critical_reservation(true);
+        // PDF pool の Critical 予約は `pdf_loader::CRITICAL_RESERVATION_ACTIVE` を
+        // 常時 ON にする方針 (v1.0.0)。グリッドからの Enter (= Critical な
+        // enumerate_pages_async) が、サムネ先読みの Normal ジョブ in-flight 待ちで
+        // 2-3 秒詰まる事例を解消するため。ここでの再設定は不要。
         self.fs_opened_at = Some(std::time::Instant::now());
         self.fs_focus_grace_elapsed = false;
         // 初回フレームでフォーカス遷移 (false→true) が誤検出されないように
@@ -13714,8 +13721,7 @@ impl App {
         //   thumb_tex 未準備のまま「ファイル名のみ」表示になる。`poll_fs_nav_lock` 側で
         //   フルスクリーンが本当に閉じた (= 次フレームに `fullscreen_idx` が None のまま)
         //   ことを確認してから解除する。
-        // グリッドに戻るので Critical 予約を解除し、全 3 ワーカーを Normal に開放。
-        crate::pdf_loader::set_critical_reservation(false);
+        // PDF pool の Critical 予約は v1.0.0 から常時 ON 方針なので、ここで切替えない。
         // フルスクリーン中の Undo スタックはここで破棄。グリッドに戻ったら新しい操作を積む。
         self.clear_meta_undo();
         self.slideshow_playing = false;
@@ -17843,6 +17849,11 @@ impl eframe::App for App {
 
         // ── 進捗バー (左下フローティングオーバーレイ) ────────────────
         self.render_progress_overlay(ctx);
+
+        // ── PDF / ZIP コンテナ列挙待ちバッジ (左下、進捗バーの上に積む) ──
+        // PDFium 開封 + 列挙の 100ms〜1.3 秒の間「親フォルダのまま動かない」状態に
+        // 「読み込み中…」を出す。先読み N/M と同じ場所で進行中セマンティクスを統一。
+        self.render_container_enumerate_overlay(ctx);
 
         // タグ書き込み worker の結果ポーリング (docs/tag-feature.md §5.6)
         self.poll_tag_write_results();

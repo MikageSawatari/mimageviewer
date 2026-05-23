@@ -792,6 +792,62 @@ impl App {
         ctx.request_repaint();
     }
 
+    /// コンテナ (PDF / ZIP) のページ列挙待ちを左下に表示する。
+    ///
+    /// PDF を Enter で開いた直後の 100ms〜1.3 秒の間 (PDFium が PDF を開いて構造解析する
+    /// 時間)、グリッドは「親フォルダのまま動かない」状態になる。これだけだと
+    /// 「Enter は効いたのか?」とユーザーが不安になるため、`先読み N/M` バーと同じ
+    /// 左下位置に「読み込み中…」バッジを出して進行中を示す。
+    ///
+    /// `items.is_empty()` (= 初回フォルダロード) のときは [`render_grid`] 内で中央の
+    /// `"読み込み中…"` ラベルが既に出るので、ここでは items が残っている遷移ケース
+    /// (親フォルダ → PDF / ZIP) のみカバーする。
+    pub(crate) fn render_container_enumerate_overlay(&self, ctx: &egui::Context) {
+        let pdf_pending = self.pdf_enumerate_pending.is_some();
+        let zip_pending = self.zip_enumerate_pending.is_some();
+        if !pdf_pending && !zip_pending {
+            return;
+        }
+        // items 空のときは中央ラベルに任せる (二重表示を防ぐ)
+        if self.items.is_empty() {
+            return;
+        }
+
+        let label = if pdf_pending {
+            "PDF を読み込み中…"
+        } else {
+            "ZIP を読み込み中…"
+        };
+
+        // 進捗バーが既に出ている場合は、その上に積み上がるよう Y オフセットを調整する。
+        // 進捗バー本体は ~40-80px の高さ、ここではざっくり 60px 上に置く。
+        let ((_, peak_normal), (_, peak_upgrade)) = self.progress_snapshot();
+        let y_offset = if peak_normal > 0 || peak_upgrade > 0 {
+            -72.0
+        } else {
+            -8.0
+        };
+
+        egui::Area::new("container_enumerate_overlay".into())
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(8.0, y_offset))
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .fill(PROGRESS_BG_COLOR)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(label)
+                                .monospace()
+                                .color(PROGRESS_LABEL_COLOR),
+                        );
+                    });
+            });
+
+        // pending 中は毎フレーム再描画 (受信ポーリングのため request_repaint は既に
+        // 別経路でも走っているが、念のためここでも要求)
+        ctx.request_repaint();
+    }
+
     // ── ツールバー ───────────────────────────────────────────────────
 
     /// ツールバーを描画し、お気に入りナビゲーション先を返す。

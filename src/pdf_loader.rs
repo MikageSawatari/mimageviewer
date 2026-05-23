@@ -32,25 +32,30 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 
 /// PDF レンダ要求の優先度。
 ///
-/// `Critical` はフルスクリーンで今まさに表示中のページなど、ユーザーが即座の応答を
-/// 待っているもの。`Normal` は先読み・サムネイル・アイドル品質アップグレードなど。
+/// `Critical` はフルスクリーンで今まさに表示中のページや、ユーザーが Enter で開いた
+/// PDF の `enumerate_pages_async` など、ユーザーが即座の応答を待っているもの。
+/// `Normal` は先読み・サムネイル・アイドル品質アップグレードなど。
 ///
-/// `CRITICAL_RESERVATION_ACTIVE` が true のときのみ、プール内の最後の 1 ワーカーを
-/// `Critical` 用に予約する (Normal の同時実行数を `workers.len() - 1` に制限)。
-/// フルスクリーンで表示中は true、グリッドのみの表示中は false にすることで、
-/// グリッド内 PDF サムネイル一括生成のスループットを確保する。
+/// **常時 1 ワーカー予約**: プールが 2 ワーカー以上ある場合、Normal の同時実行数を
+/// `worker_count - 1` (最低 1) に制限し、残り 1 ワーカーを Critical 用に温存する。
+/// グリッドでサムネ先読みが 3 ワーカー全部を埋めて、`Enter` で開いた PDF の Critical
+/// な enumerate が「in-flight な Normal IPC の終了を待つ」状態 (実測 2-3 秒) を防ぐ。
+/// 代償はバルクサムネ生成のスループットが 3→2 になる -33%。手動キャッシュ作成等で
+/// しか観測されない非対話処理なので受容範囲。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobPriority {
     Critical,
     Normal,
 }
 
-/// 現在フルスクリーン表示中かどうかを UI 側から共有するフラグ。
-/// `true` のときだけ Normal 優先度のスロット予約を有効化する。
-static CRITICAL_RESERVATION_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Critical 用ワーカー予約フラグ。
+///
+/// 既定で `true` (常時 ON)。グリッド表示中・フルスクリーン中どちらでも Critical は
+/// `pool_dispatch` の wait_ms がほぼ 0 になる。`false` にする呼び出しは現状無いが、
+/// 将来「対話 UI を一切使わないバルク処理を一時的に走らせる」用途のため API は残す。
+static CRITICAL_RESERVATION_ACTIVE: AtomicBool = AtomicBool::new(true);
 
-/// フルスクリーン状態が変わったときに UI 側から呼ぶ。
-/// `true` を渡すと Normal ジョブが 1 スロット分だけ節約されるようになる。
+/// 予約モードを切り替える (将来のバルク処理拡張用)。現状の通常運用では呼び出さない。
 pub fn set_critical_reservation(active: bool) {
     CRITICAL_RESERVATION_ACTIVE.store(active, Ordering::Relaxed);
 }
@@ -785,31 +790,42 @@ impl PdfWorkerPool {
             Condvar::new(),
         ));
 
-        let mut dispatcher_threads = Vec::with_capacity(POOL_SIZE);
-        let mut worker_count = 0usize;
+        // 子プロセスを先に全部 spawn してから worker_count を確定させ、その値を
+        // dispatcher スレッドに渡す (run_dispatcher が `max_normal` を計算するときに
+        // 「実際に生きているワーカー数」を使うため。POOL_SIZE 固定だと、起動失敗で
+        // 1-2 worker しか居ない degraded 環境で `max_normal` が間違って計算され、
+        // Critical 予約が機能しなくなる)。
+        let mut pending_workers: Vec<(usize, Child, ProcessWorkerIo)> =
+            Vec::with_capacity(POOL_SIZE);
         for i in 0..POOL_SIZE {
             match spawn_worker_process(&exe_path) {
                 Ok((child, io)) => {
                     let pid = child.id();
                     crate::logger::log(format!("pdf-pool: worker {i} started (pid={pid})"));
-                    worker_count += 1;
-                    let q = Arc::clone(&queue);
-                    let handle = std::thread::Builder::new()
-                        .name(format!("pdf-pool-{i}"))
-                        .spawn(move || run_dispatcher(i, q, child, io))
-                        .expect("failed to spawn pdf-pool dispatcher thread");
-                    dispatcher_threads.push(handle);
+                    pending_workers.push((i, child, io));
                 }
                 Err(e) => {
                     crate::logger::log(format!("pdf-pool: worker {i} spawn failed: {e}"));
                 }
             }
         }
+        let worker_count = pending_workers.len();
 
         if worker_count == 0 {
             crate::logger::log("pdf-pool: WARNING: no workers spawned, falling back to in-process");
         } else {
             crate::logger::log(format!("pdf-pool: {worker_count} workers ready"));
+        }
+
+        let mut dispatcher_threads = Vec::with_capacity(worker_count);
+        for (i, child, io) in pending_workers {
+            let q = Arc::clone(&queue);
+            let actual_workers = worker_count;
+            let handle = std::thread::Builder::new()
+                .name(format!("pdf-pool-{i}"))
+                .spawn(move || run_dispatcher(i, actual_workers, q, child, io))
+                .expect("failed to spawn pdf-pool dispatcher thread");
+            dispatcher_threads.push(handle);
         }
 
         PdfWorkerPool {
@@ -1050,18 +1066,22 @@ impl PdfWorkerPool {
 ///
 /// キューを覗き込み、Critical > Normal の順に pop して IPC を実行する。
 /// Normal は `critical_reservation_active()` が true のとき
-/// `worker_count - 1` 件までしか同時に走らない (1 ワーカー分を Critical 用に予約)。
+/// `worker_count - 1` (最低 1) 件までしか同時に走らない (1 ワーカー分を Critical 用に予約)。
+///
+/// `worker_count` は `PdfWorkerPool::start()` が実際に spawn に成功した数 (POOL_SIZE
+/// と異なる degraded 環境を想定)。`worker_count == 1` の最劣化ケースでは予約による
+/// `max_n = 0` (= Normal 全凍結) を防ぐため `max(1)` でクランプする。
 ///
 /// `shutdown` フラグが立つと、サブプロセスに shutdown メッセージを送って
 /// 子プロセスの終了を待ち、スレッド自体も終了する。
 fn run_dispatcher(
     worker_id: usize,
+    worker_count: usize,
     queue: Arc<(Mutex<JobQueue>, Condvar)>,
     mut child: Child,
     mut io: ProcessWorkerIo,
 ) {
     let pid = child.id();
-    let worker_count = POOL_SIZE;
 
     loop {
         // ── キューから 1 件取る ──
@@ -1077,12 +1097,13 @@ fn run_dispatcher(
                     q.workers_busy = q.workers_busy.saturating_add(1);
                     break Some(j);
                 }
-                // Normal: 予約中なら max_normal 制限
+                // Normal: 予約中なら max_normal 制限。最低でも 1 は確保しないと、
+                // 1-worker pool で Normal ジョブが永久に動かなくなる (deadlock)。
                 let reservation = critical_reservation_active();
                 let max_n = if reservation {
-                    worker_count.saturating_sub(1)
+                    worker_count.saturating_sub(1).max(1)
                 } else {
-                    worker_count
+                    worker_count.max(1)
                 };
                 if q.normal_in_flight < max_n
                     && let Some(j) = q.normal.pop_front()
