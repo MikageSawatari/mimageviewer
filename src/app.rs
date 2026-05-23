@@ -6069,27 +6069,34 @@ impl App {
         out
     }
 
-    /// 隣接 PDF prefetch ジョブを spawn する (background)。親 catalog を LRU から取り出す。
+    /// 隣接 PDF prefetch ジョブを enqueue する (background worker queue 経由)。
+    ///
+    /// **Codex P3 round 2 対応**: 親 catalog の取得は LRU **hit のみ** で済ませる。
+    /// `get_or_open_catalog` を使うと UI スレッドで cold `CatalogDb::open` (30-150ms)
+    /// が走り得る。検索結果 / FavSearch のように隣接 PDF が複数フォルダから集まる
+    /// 場合は最大 2 回 × cold open で UI が固まり、Enter 直後の体感を削る。warm catalog
+    /// のみで prefetch を走らせ、cold な隣接は skip (= ユーザーが実際に Enter したとき
+    /// 通常経路で populate されるので機能不整合なし)。
+    ///
+    /// **Codex P2-1 round 1 対応**: 各 neighbor の親ごとに catalog を取り直す。
+    /// 検索結果のように複数フォルダ由来の neighbor がいるケースで、別フォルダの PDF
+    /// メタ/`pdfthumb:` を誤った catalog DB に書き込む事故を防ぐ。
     fn spawn_neighbor_pdf_prefetch_tasks(&mut self, neighbor_paths: Vec<PathBuf>) {
-        // 親 catalog: load_pdf_as_folder 呼び出し時点では self.current_folder が親フォルダ。
-        // try_apply_pdf_meta_cache がヒットしても `current_folder` は start_loading_items
-        // 内で PDF パスに切り替わっている可能性があるので、まずは neighbor の parent
-        // から開く。
-        let Some(first_parent) = neighbor_paths
-            .iter()
-            .find_map(|p| p.parent().map(|q| q.to_path_buf()))
-        else {
-            return;
-        };
-        let Some(parent_catalog) = self.get_or_open_catalog(&first_parent) else {
-            return;
-        };
         let thumb_px = self.settings.thumb_px;
         let thumb_quality = self.settings.thumb_quality;
         for neighbor in neighbor_paths {
+            let Some(parent) = neighbor.parent().map(|p| p.to_path_buf()) else {
+                continue;
+            };
+            // **warm hit のみ** 使う。`HashMap::get` で cold open を発火させない。
+            // hit すれば LRU 順序の更新だけのためにあえて `get_or_open_catalog` を呼ばず、
+            // 直接 cache から Arc::clone する。
+            let Some(parent_catalog) = self.catalog_cache.get(&parent).cloned() else {
+                continue;
+            };
             crate::thumb_loader::spawn_pdf_neighbor_prefetch(
                 neighbor,
-                Arc::clone(&parent_catalog),
+                parent_catalog,
                 thumb_px,
                 thumb_quality,
             );

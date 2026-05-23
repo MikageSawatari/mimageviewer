@@ -1,5 +1,83 @@
 # PDF Page Count Cache (C-base + C-thumb) 実装計画
 
+> **このドキュメントは v1.0.0 開発初期 (round 0) の設計メモ**。
+> 実装は Codex レビュー round 1〜4 を経て進化しているので、最新の動作仕様は
+> 直下の「## 最終形 (v1.0.0 実装)」セクションを参照。round 0 の素案 (= ストレージ
+> 設計の出発点、トレードオフ検討) として下のセクションは残してある。
+
+## 最終形 (v1.0.0 実装)
+
+### Schema
+
+```sql
+CREATE TABLE IF NOT EXISTS pdf_meta (
+    filename          TEXT    NOT NULL PRIMARY KEY,  -- 親フォルダ内の PDF ファイル名
+    mtime             INTEGER NOT NULL,
+    file_size         INTEGER NOT NULL,
+    page_count        INTEGER NOT NULL,
+    password_required INTEGER NOT NULL DEFAULT 0    -- 0=不要、1=必要 (round 1 で追加)
+);
+```
+
+### `CatalogDb` の 3 つの書き込み API
+
+`password_required` 列を「**確信できる場合だけ確信値で書く、不明なときは触らない**」
+という方針で 3 つに分割している (Codex round 1-3 対応):
+
+| メソッド | 新規行 | 既存行 | 用途 |
+|---|---|---|---|
+| `set_pdf_meta(.., pw_req)` | INSERT (pw_req 明示) | OVERWRITE | enumerate 成功 + 確信あり (saved pw 使用、または password=None で成功) |
+| `set_pdf_meta_safe(..)` | INSERT (pw_req=0) | page_count/mtime/size のみ更新、password_required 保持 | password=None で render 成功 (= 不要確信) |
+| `set_pdf_meta_thumb(..)` | **何もしない** | `WHERE filename=? AND mtime=? AND file_size=?` 一致時のみ page_count 更新 | unknown (session pw 使用、保存しないパスワード入力直後) |
+
+`set_pdf_meta_thumb` が WHERE 条件に `mtime/file_size` を含むのは、ファイル置換で stale 行を
+誤って promote しないため (Codex round 3 P1)。
+
+### CatchupQueue (round 3 で導入)
+
+`src/thumb_loader.rs` に**専用ワーカースレッド + 優先度別 bounded queue**:
+
+```
+            ┌──────────────────────────────────────┐
+            │ Mutex<CatchupQueueState> + Condvar   │
+            │                                       │
+   enqueue ─→ high (cap 16) : NeighborPrefetch    │
+   enqueue ─→ low  (cap 256): MetaOnly            │
+            │ pending: HashSet (dedup)              │
+            └────────────┬─────────────────────────┘
+                         ↓
+            ┌──────────────────────────────────────┐
+            │ 1 worker thread                       │
+            │   high 優先で pop → 処理 → pending 削除 │
+            └──────────────────────────────────────┘
+```
+
+- **MetaOnly** (low lane): WebP cache hit 経路。`enumerate_pages(password=None)` のみ実行。
+- **NeighborPrefetch** (high lane): `load_pdf_as_folder` 直後の Ctrl+↑↓ 想定。`render_page(page=0, password=None)` で page 数 + WebP サムネ + OS cache を温める。
+- **dedup**: 同 path はどちらか 1 件だけ pending。
+- **upgrade**: low に MetaOnly が queue 中で、後から同 path に NeighborPrefetch 要求が来たら **high の空きを確認してから** low → high へ移動 (Codex round 4 P2 で「high 容量確認の順序」を厳守)。
+- **drop semantics**: 各 lane が満杯のときだけ新規要求を drop。lane 間は独立 (= low 満杯で high が影響を受けない、逆も同じ)。Enter で必ず populate されるので機能不整合なし。
+
+### UI スレッド側の制約
+
+`App::spawn_neighbor_pdf_prefetch_tasks` は `catalog_cache.get(&parent)` で **warm hit のみ** 拾う。`get_or_open_catalog` を使うと cold `CatalogDb::open` (30-150ms × ±1 隣接 = 最大 300ms) が UI で走り得るので使わない (Codex round 2 P3)。検索結果/FavSearch で別フォルダの neighbor は skip (= 通常経路で populate される、機能不整合なし)。
+
+### password_required の決定マトリクス (`poll_pdf_enumerate` 完了時)
+
+| 状況 | API | 理由 |
+|---|---|---|
+| saved pw あり (pending_save 消化後) | `set_pdf_meta(pw_req=true)` | 確信あり |
+| password=None で成功 | `set_pdf_meta(pw_req=false)` | 確信あり |
+| password=Some だが saved 無し (session 限定) | `set_pdf_meta_thumb` | unknown → 新規行は作らない、既存は列保持 |
+
+### Enter フローでの placeholder
+
+`try_apply_pdf_meta_cache` は **`pdf_passwords.get(this_pdf).is_some()`** (= ファイル固有保存 pw) でだけ password-protected キャッシュを trust する。session-level `pdf_current_password` は当てにしない (round 1 P1)。
+
+---
+
+## 以下は round 0 の素案 (アーカイブ目的で残す)
+
 ## ゴール
 
 「キビキビ動く」アプリ感を実現するため、PDF の Enter→ページ一覧表示を **2 回目以降ほぼ瞬時** (~20ms)

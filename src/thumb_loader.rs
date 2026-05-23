@@ -11,7 +11,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 
 // -----------------------------------------------------------------------
 // ワーカーキュー優先度
@@ -915,32 +915,257 @@ pub fn process_load_request(
 //   - サムネ表示時にこの catch-up が裏で走れば、ユーザーが「サムネを見て一拍
 //     置いて Enter」する自然な間に pdf_meta が埋まる → 初回 Enter から瞬時化。
 //
-// 安全策 (Codex round 1-4 で確立したルール):
+// 安全策 (Codex round 1-5 で確立したルール):
 //   1. `pdf_password=None` で enumerate を試みる (= session pw を持ち込まない)。
 //      成功すれば「password 不要」確定 → `set_pdf_meta(false)`。失敗すれば PDF が
 //      暗号化されている可能性が高いので何も書かない (= 次回 Enter で
 //      poll_pdf_enumerate がパスワードダイアログを出して正しい flag を書く)。
-//   2. 同じ path に対する重複 spawn を防ぐ in-flight set。多数のサムネが同時に
-//      cache hit しても、各 PDF につき 1 ジョブだけ走る。
+//   2. **CatchupQueue + pending HashSet** (= 旧「in-flight set」相当) で同 path の
+//      重複 enqueue を防ぎ、優先度別 bounded VecDeque (high cap 16 / low cap 256)
+//      で総作業量を抑える。lane が満杯のときだけ drop、lane 間は独立 (= low の flood
+//      が high の neighbor prefetch を蝕まない)。詳細は下の `CatchupQueueState` 定義
+//      とその周辺コメント参照。
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::OnceLock;
 
-/// 現在 pdf_meta catch-up を実行中の PDF パス集合 (重複 spawn 防止)。
-static PDF_META_CATCHUP_IN_FLIGHT: OnceLock<Mutex<HashSet<std::path::PathBuf>>> = OnceLock::new();
+// ── catch-up / neighbor prefetch ジョブの種類 ──
 
-fn catchup_inflight_set() -> &'static Mutex<HashSet<std::path::PathBuf>> {
-    PDF_META_CATCHUP_IN_FLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+enum CatchupJobKind {
+    /// WebP cache hit 経由: `enumerate_pages(password=None)` のみ、書き込みは pdf_meta のみ
+    MetaOnly {
+        catalog: Arc<crate::catalog::CatalogDb>,
+    },
+    /// load_pdf_as_folder の neighbor 経由: `render_page(page=0, password=None)` を実行し、
+    /// pdf_meta + parent catalog の `pdfthumb:` WebP まで populate
+    NeighborPrefetch {
+        catalog: Arc<crate::catalog::CatalogDb>,
+        thumb_px: u32,
+        thumb_quality: u8,
+    },
 }
 
-/// WebP cache hit 後に呼ばれ、必要なら背景スレッドで pdf_meta catch-up を spawn する。
-///
-/// 条件:
-///   - `cache_key_override` が `"pdfthumb:"` で始まる (= 親フォルダ catalog 経路の PDF サムネ)
-///   - `pdf_page` が `Some` (PDF context の確認)
-///   - `catalog` が `Some`
-///   - `pdf_meta` lookup が miss (= 既に populate 済みなら何もしない)
-///   - in-flight set に同 path が無い (重複 spawn 防止)
+struct CatchupJob {
+    path: std::path::PathBuf,
+    kind: CatchupJobKind,
+}
+
+// ── キュー本体 (Codex P2 round 2 対応) ──
+//
+// 旧設計 (request ごとに `std::thread::spawn`、in-flight HashSet サイズ cap=8 で drop)
+// は PDF 多数フォルダで「8 件超 cache hit が永久に retry されない」「catch-up が
+// 直近の neighbor prefetch 枠を食う」問題があった (Codex round 3 指摘)。
+//
+// 新設計: 単一 worker スレッド + 優先度別 bounded VecDeque + dedup HashSet:
+//   - high (= neighbor prefetch、cap 16): load_pdf_as_folder 直後の Ctrl+↑↓ 想定
+//   - low (= cache-hit catch-up、cap 256): scroll で滑り込む cache hit の大波対応
+//   - worker は high → low の順で 1 件ずつ pop、PDF worker pool 経由で実作業
+//   - 同一 path 重複は HashSet で 1 件に集約 (= dedup)
+//   - cap 超過時のみ drop。drop しても機能不整合なし (Enter で必ず populate される)
+
+struct CatchupQueueState {
+    high: VecDeque<CatchupJob>,
+    low: VecDeque<CatchupJob>,
+    /// queue に入っている (or 現在 worker が処理中) の path 集合。dedup 用。
+    pending: HashSet<std::path::PathBuf>,
+    shutdown: bool,
+}
+
+struct CatchupQueue {
+    state: Mutex<CatchupQueueState>,
+    cv: Condvar,
+}
+
+/// high (neighbor prefetch) の queue 上限。Ctrl+↑↓ で連打しても 16 件先まで温める。
+const MAX_NEIGHBOR_PENDING: usize = 16;
+/// low (cache-hit catch-up) の queue 上限。100+ PDF フォルダの scroll でも収まる規模。
+const MAX_CATCHUP_PENDING: usize = 256;
+
+static CATCHUP_QUEUE: OnceLock<Arc<CatchupQueue>> = OnceLock::new();
+
+fn catchup_queue() -> &'static Arc<CatchupQueue> {
+    CATCHUP_QUEUE.get_or_init(|| {
+        let queue = Arc::new(CatchupQueue {
+            state: Mutex::new(CatchupQueueState {
+                high: VecDeque::new(),
+                low: VecDeque::new(),
+                pending: HashSet::new(),
+                shutdown: false,
+            }),
+            cv: Condvar::new(),
+        });
+        let q = Arc::clone(&queue);
+        std::thread::Builder::new()
+            .name("pdf-meta-catchup".into())
+            .spawn(move || catchup_worker_loop(q))
+            .expect("spawn pdf-meta-catchup worker");
+        queue
+    })
+}
+
+/// バックグラウンドワーカーループ。high → low の順で pop し、1 件ずつ実作業。
+fn catchup_worker_loop(queue: Arc<CatchupQueue>) {
+    loop {
+        // queue から 1 件取り出す。空なら Condvar で寝る。
+        let job = {
+            let mut state = queue.state.lock().unwrap();
+            loop {
+                if state.shutdown {
+                    return;
+                }
+                if let Some(j) = state.high.pop_front() {
+                    break j;
+                }
+                if let Some(j) = state.low.pop_front() {
+                    break j;
+                }
+                state = queue.cv.wait(state).unwrap();
+            }
+        };
+
+        let path = job.path.clone();
+        match job.kind {
+            CatchupJobKind::MetaOnly { catalog } => process_meta_only(&path, &catalog),
+            CatchupJobKind::NeighborPrefetch {
+                catalog,
+                thumb_px,
+                thumb_quality,
+            } => process_neighbor_prefetch(&path, &catalog, thumb_px, thumb_quality),
+        }
+
+        // pending set から外す (= 次回同 path の enqueue 受付可)
+        if let Ok(mut state) = queue.state.lock() {
+            state.pending.remove(&path);
+        }
+    }
+}
+
+/// 実作業: cache hit 経由の pdf_meta catch-up (enumerate のみ、確信値 false で書き込み)
+fn process_meta_only(path: &Path, catalog: &crate::catalog::CatalogDb) {
+    let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let Some(mtime) = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+    else {
+        return;
+    };
+    let file_size = meta.len() as i64;
+
+    // pdf_meta が既に populate 済みなら skip (= enqueue から処理開始までの間に他経路が
+    // 書き込んだケース)
+    if catalog
+        .get_pdf_meta(filename, mtime, file_size)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return;
+    }
+
+    // password=None で試行: 暗号化 PDF なら失敗 → 書き込み skip
+    if let Ok(entries) = crate::pdf_loader::enumerate_pages(path, None) {
+        if let Err(e) = catalog.set_pdf_meta(
+            filename,
+            mtime,
+            file_size,
+            entries.len() as u32,
+            false, // password not required (enumerate succeeded without pw)
+        ) {
+            crate::logger::log(format!(
+                "pdf-meta-catchup: set_pdf_meta failed for {filename}: {e}"
+            ));
+        }
+    }
+}
+
+/// 実作業: neighbor prefetch (render page 0 + pdf_meta + WebP サムネ)
+fn process_neighbor_prefetch(
+    path: &Path,
+    parent_catalog: &crate::catalog::CatalogDb,
+    thumb_px: u32,
+    thumb_quality: u8,
+) {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return;
+    };
+    let Some(mtime) = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+    else {
+        return;
+    };
+    let file_size = meta.len() as i64;
+    let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+
+    // 既に pdf_meta + thumb 両方 cache 済みなら skip
+    let meta_present = parent_catalog
+        .get_pdf_meta(filename, mtime, file_size)
+        .ok()
+        .flatten()
+        .is_some();
+    let folder_key = format!("{}{}", CACHE_KEY_PDF, filename);
+    let thumb_present = parent_catalog
+        .load_one(&folder_key)
+        .ok()
+        .flatten()
+        .map(|e| e.mtime == mtime && e.file_size == file_size)
+        .unwrap_or(false);
+    if meta_present && thumb_present {
+        return;
+    }
+
+    // render_page (page 0、Normal 優先度) — password=None で試行
+    let Ok(res) = crate::pdf_loader::render_page(
+        path,
+        0,
+        thumb_px,
+        None,
+        None,
+        crate::pdf_loader::JobPriority::Normal,
+    ) else {
+        return;
+    };
+
+    if !meta_present {
+        if let Err(e) =
+            parent_catalog.set_pdf_meta(filename, mtime, file_size, res.page_count, false)
+        {
+            crate::logger::log(format!(
+                "pdf-neighbor-prefetch: set_pdf_meta failed for {filename}: {e}"
+            ));
+        }
+    }
+    if !thumb_present {
+        if let Some(bytes) = encode_and_save(
+            &res.image,
+            &folder_key,
+            parent_catalog,
+            mtime,
+            file_size,
+            thumb_px,
+            thumb_quality,
+        ) {
+            crate::logger::log(format!(
+                "pdf-neighbor-prefetch: thumb saved for {filename} ({bytes} bytes)"
+            ));
+        }
+    }
+}
+
+// ── enqueue API ──
+
+/// WebP cache hit 経由の catch-up enqueue。`process_load_request` の cache hit 分岐から呼ばれる。
 fn maybe_spawn_pdf_meta_catchup(
     req: &LoadRequest,
     catalog: Option<&Arc<crate::catalog::CatalogDb>>,
@@ -960,192 +1185,105 @@ fn maybe_spawn_pdf_meta_catchup(
     let Some(filename) = req.path.file_name().and_then(|n| n.to_str()) else {
         return;
     };
-    // 既に populate 済みなら何もしない
-    let meta_present = cat_arc
+    // pdf_meta が既に populate 済みなら enqueue 不要
+    if cat_arc
         .get_pdf_meta(filename, req.mtime, req.file_size)
         .ok()
         .flatten()
-        .is_some();
-    if meta_present {
+        .is_some()
+    {
         return;
     }
 
-    // 重複 spawn の防止: 既に同 path で進行中なら skip
-    let path_owned = req.path.clone();
-    {
-        let mut set = catchup_inflight_set().lock().unwrap();
-        if set.contains(&path_owned) {
-            return;
-        }
-        set.insert(path_owned.clone());
+    let queue = catchup_queue();
+    let mut state = queue.state.lock().unwrap();
+    // dedup: 同 path が既に queue or 処理中なら skip
+    if state.pending.contains(&req.path) {
+        return;
     }
-
-    let cat_clone = Arc::clone(cat_arc);
-    let mtime = req.mtime;
-    let file_size = req.file_size;
-    let filename_owned = filename.to_string();
-    let path_for_thread = path_owned.clone();
-    let spawn_result = std::thread::Builder::new()
-        .name("pdf-meta-catchup".into())
-        .spawn(move || {
-            // RAII で in-flight set から確実に取り除く (panic 安全)
-            let _guard = InFlightGuard(path_for_thread.clone());
-            // password=None で試行: 暗号化 PDF なら失敗 → 書き込み skip。成功すれば
-            // password 不要が確定 (= set_pdf_meta(false) で確信あり書き込み)。
-            // session pw を持ち込まないことで、保護 PDF を誤って「非保護」記録する
-            // bypass を構造的に防ぐ。
-            if let Ok(entries) = crate::pdf_loader::enumerate_pages(&path_for_thread, None) {
-                if let Err(e) = cat_clone.set_pdf_meta(
-                    &filename_owned,
-                    mtime,
-                    file_size,
-                    entries.len() as u32,
-                    false, // password not required (enumerate succeeded without pw)
-                ) {
-                    crate::logger::log(format!(
-                        "pdf-meta-catchup: set_pdf_meta failed for {filename_owned}: {e}"
-                    ));
-                }
-            }
-        });
-    if spawn_result.is_err() {
-        // spawn 失敗 (リソース不足等の rare path) では closure が動かないので
-        // in-flight set のエントリが残らないようここで取り除く (Codex round 1 P3 対応)
-        if let Ok(mut set) = catchup_inflight_set().lock() {
-            set.remove(&path_owned);
-        }
+    // capacity guard: low queue 上限を超えていたら drop (= best-effort)
+    if state.low.len() >= MAX_CATCHUP_PENDING {
+        return;
     }
+    state.pending.insert(req.path.clone());
+    state.low.push_back(CatchupJob {
+        path: req.path.clone(),
+        kind: CatchupJobKind::MetaOnly {
+            catalog: Arc::clone(cat_arc),
+        },
+    });
+    drop(state);
+    queue.cv.notify_one();
 }
 
-/// in-flight set から自身を取り除く RAII guard。catch-up と neighbor prefetch 共通。
-struct InFlightGuard(std::path::PathBuf);
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        if let Ok(mut set) = catchup_inflight_set().lock() {
-            set.remove(&self.0);
-        }
-    }
-}
-
-/// PDF 隣接プリフェッチ (v1.0.0、Ctrl+↑↓ ナビ最適化)。
+/// 隣接 PDF prefetch enqueue。`load_pdf_as_folder` の最後で呼ばれる。
 ///
-/// ユーザーが PDF を開いた直後 (= `load_pdf_as_folder` 完了時)、親フォルダ内で
-/// ±1 番目の隣接 PDF を裏で render_page してキャッシュを温める。これで:
-///   - `pdf_meta` が populate される (= 次回 Enter で placeholder grid 即時化)
-///   - WebP サムネも parent catalog の `pdfthumb:` キーで保存される
-///   - OS の disk cache がページ 0 の画像データまで温まる (= 真の Enter で
-///     render_page も warm でほぼ瞬時)
+/// 重要: 呼び出し側 (UI スレッド) は **既に warm な catalog (= LRU hit) のみ** をここに
+/// 渡すこと。cold catalog の `CatalogDb::open` を UI スレッドで走らせると Enter の体感が
+/// 削れる (Codex P3 round 2)。`App::spawn_neighbor_pdf_prefetch_tasks` が `catalog_cache`
+/// を `get` で見て hit したものだけ enqueue する。
 ///
-/// catch-up と同じく `pdf_password=None` で試行する (= session pw を持ち込まない、
-/// 保護 PDF を誤って「非保護」記録する bypass を防ぐ)。
-///
-/// dedup は catch-up と共通の in-flight set (`PDF_META_CATCHUP_IN_FLIGHT`) を使用
-/// する。同じ path について複数経路から spawn 要求が来ても 1 ジョブに収束する。
+/// **upgrade 動作 (Codex P2 round 3 対応)**: 同 path が既に low (= MetaOnly) に
+/// **queue 中** (= 未処理) で居る場合、それを取り除いて high (= NeighborPrefetch) に
+/// 積み直す。MetaOnly では page 0 render + WebP 温め + OS cache 温めが行われないので、
+/// 用が大きいほうに昇格させる。すでに worker が処理中の path は low queue に居ない
+/// ので upgrade できず skip するが、その場合 enumerate は完了済みなので Enter は
+/// instant になる (= 失うのは render の事前温めだけ、許容範囲)。
 pub fn spawn_pdf_neighbor_prefetch(
     pdf_path: std::path::PathBuf,
     parent_catalog: Arc<crate::catalog::CatalogDb>,
     thumb_px: u32,
     thumb_quality: u8,
 ) {
-    // 重複 spawn 防止 (catch-up と set を共有)
-    {
-        let mut set = catchup_inflight_set().lock().unwrap();
-        if set.contains(&pdf_path) {
-            return;
+    let queue = catchup_queue();
+    let mut state = queue.state.lock().unwrap();
+    if state.pending.contains(&pdf_path) {
+        // 既に queue にあるか、worker が処理中。
+        // queue 中の MetaOnly なら NeighborPrefetch に昇格させる (upgrade)。
+        // (high 側に同 path がある場合は何もしない、すでに NeighborPrefetch なので)
+        //
+        // **重要 (Codex P2 round 4 対応)**: 「low から remove する前に high の空きを
+        // 確認する」順序にすること。逆順だと high 満杯時に既存の MetaOnly を破棄
+        // するだけで終わってしまい、low と high が互いに影響しないという設計
+        // メモの不変条件が崩れる (= catch-up を取りこぼす)。
+        if state.high.len() < MAX_NEIGHBOR_PENDING {
+            if let Some(pos) = state.low.iter().position(|j| j.path == pdf_path) {
+                // queued MetaOnly + high に空きあり: 安全に upgrade できる
+                state.low.remove(pos);
+                state.high.push_back(CatchupJob {
+                    path: pdf_path,
+                    kind: CatchupJobKind::NeighborPrefetch {
+                        catalog: parent_catalog,
+                        thumb_px,
+                        thumb_quality,
+                    },
+                });
+                // pending は path がそのまま存在し続けるので insert/remove なし
+                drop(state);
+                queue.cv.notify_one();
+                return;
+            }
+            // low にも居ない (= worker が処理中 or 既に high): upgrade 不可、skip
         }
-        set.insert(pdf_path.clone());
+        // それ以外 (high 満杯、または low に居ない既存 pending):
+        //   - high 満杯時: 既存 MetaOnly はそのまま実行させる (catch-up は取りこぼさない)
+        //   - 処理中 / high 既存: 既存 job がカバーする
+        return;
     }
-
-    let path_for_cleanup = pdf_path.clone();
-    let spawn_result = std::thread::Builder::new()
-        .name("pdf-neighbor-prefetch".into())
-        .spawn(move || {
-            // RAII で in-flight set から自身を除外する (panic 安全)
-            let _guard = InFlightGuard(pdf_path.clone());
-
-            // Stat
-            let Ok(meta) = std::fs::metadata(&pdf_path) else {
-                return;
-            };
-            let Some(mtime) = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-            else {
-                return;
-            };
-            let file_size = meta.len() as i64;
-            let Some(filename) = pdf_path.file_name().and_then(|n| n.to_str()) else {
-                return;
-            };
-
-            // 既に pdf_meta + thumb 両方 cache 済みなら skip
-            let meta_present = parent_catalog
-                .get_pdf_meta(filename, mtime, file_size)
-                .ok()
-                .flatten()
-                .is_some();
-            // pdfthumb:<filename> キーの WebP サムネが存在し mtime/size 一致なら thumb OK
-            let folder_key = format!("{}{}", CACHE_KEY_PDF, filename);
-            let thumb_present = parent_catalog
-                .load_one(&folder_key)
-                .ok()
-                .flatten()
-                .map(|e| e.mtime == mtime && e.file_size == file_size)
-                .unwrap_or(false);
-            if meta_present && thumb_present {
-                return;
-            }
-
-            // render_page (page 0、Normal 優先度): OS cache を温め、page_count を確定。
-            // password=None で試行 — 保護 PDF は失敗 → 書き込み skip (catch-up と同じ判断)。
-            let Ok(res) = crate::pdf_loader::render_page(
-                &pdf_path,
-                0,
-                thumb_px,
-                None,
-                None,
-                crate::pdf_loader::JobPriority::Normal,
-            ) else {
-                return;
-            };
-
-            // pdf_meta 投入 (確信あり: password=None で render 成功 = 不要)
-            if !meta_present {
-                if let Err(e) =
-                    parent_catalog.set_pdf_meta(filename, mtime, file_size, res.page_count, false)
-                {
-                    crate::logger::log(format!(
-                        "pdf-neighbor-prefetch: set_pdf_meta failed for {filename}: {e}"
-                    ));
-                }
-            }
-
-            // WebP サムネ投入 (親 catalog の pdfthumb: キー)
-            if !thumb_present {
-                if let Some(bytes) = encode_and_save(
-                    &res.image,
-                    &folder_key,
-                    &parent_catalog,
-                    mtime,
-                    file_size,
-                    thumb_px,
-                    thumb_quality,
-                ) {
-                    crate::logger::log(format!(
-                        "pdf-neighbor-prefetch: thumb saved for {filename} ({bytes} bytes)"
-                    ));
-                }
-            }
-        });
-    if spawn_result.is_err() {
-        // spawn 失敗 (リソース不足等の rare path) では closure が動かないので
-        // in-flight set のエントリが残らないようここで取り除く (Codex round 1 P3 対応)
-        if let Ok(mut set) = catchup_inflight_set().lock() {
-            set.remove(&path_for_cleanup);
-        }
+    if state.high.len() >= MAX_NEIGHBOR_PENDING {
+        return;
     }
+    state.pending.insert(pdf_path.clone());
+    state.high.push_back(CatchupJob {
+        path: pdf_path,
+        kind: CatchupJobKind::NeighborPrefetch {
+            catalog: parent_catalog,
+            thumb_px,
+            thumb_quality,
+        },
+    });
+    drop(state);
+    queue.cv.notify_one();
 }
 
 /// フォルダ内をスキャンして代表画像のパスを返す。

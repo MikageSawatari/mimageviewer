@@ -96,9 +96,11 @@ fn main() {
     let mut results: Vec<BenchResult> = Vec::with_capacity(pdfs.len());
 
     if !json_out {
+        // 列ラベル: `lopdf_slowdown` = `lopdf_ms / pdfium_ms` (= lopdf が何倍遅いか)
+        // PDFium が速いほど大きい値になる正方向の指標 (Codex P3 round 1 対応)。
         println!(
-            "{:>12}  {:>11}  {:>10}  {:>6}  {}",
-            "pdfium_ms", "lopdf_ms", "speedup", "pages", "file",
+            "{:>12}  {:>11}  {:>14}  {:>6}  {}",
+            "pdfium_ms", "lopdf_ms", "lopdf_slowdown", "pages", "file",
         );
         println!("{}", "-".repeat(80));
     }
@@ -147,8 +149,9 @@ fn main() {
                 "!"
             };
 
-            let speedup = match (pdfium_ms, lopdf_ms) {
-                (Some(p), Some(l)) if l > 0.001 => format!("{:.1}x", p / l),
+            // `lopdf_slowdown` = lopdf_ms / pdfium_ms (lopdf が何倍遅いか、正方向の指標)
+            let slowdown = match (pdfium_ms, lopdf_ms) {
+                (Some(p), Some(l)) if p > 0.001 => format!("{:.1}x", l / p),
                 _ => "-".to_string(),
             };
 
@@ -162,8 +165,8 @@ fn main() {
             };
 
             println!(
-                "{:>12}  {:>11}  {:>10}  {:>6}{}  {}",
-                pdfium_str, lopdf_str, speedup, pages_col, mark, truncated_name,
+                "{:>12}  {:>11}  {:>14}  {:>6}{}  {}",
+                pdfium_str, lopdf_str, slowdown, pages_col, mark, truncated_name,
             );
         }
         results.push(result);
@@ -405,19 +408,21 @@ fn print_aggregate(results: &[BenchResult]) {
         }
     }
 
-    // Speedups for files where both succeeded
-    let speedups: Vec<f64> = results
+    // lopdf_slowdown = lopdf_ms / pdfium_ms (lopdf が何倍遅いか、正方向の指標)
+    // Codex P3 round 1 対応: 旧 "Speedup (PDFium / lopdf)" は 0.0x になる逆向き表記
+    // だったため、方向を反転 + ラベル変更で意図が直感的になるようにした。
+    let slowdowns: Vec<f64> = results
         .iter()
         .filter_map(|r| match (r.pdfium_ms, r.lopdf_ms) {
-            (Some(p), Some(l)) if l > 0.001 => Some(p / l),
+            (Some(p), Some(l)) if p > 0.001 => Some(l / p),
             _ => None,
         })
         .collect();
-    if !speedups.is_empty() {
-        let stats = percentiles(&speedups);
+    if !slowdowns.is_empty() {
+        let stats = percentiles(&slowdowns);
         println!();
         println!(
-            "Speedup (PDFium / lopdf):  min={:.1}x  p50={:.1}x  p90={:.1}x  max={:.1}x  mean={:.1}x",
+            "lopdf slowdown (lopdf_ms / pdfium_ms):  min={:.1}x  p50={:.1}x  p90={:.1}x  max={:.1}x  mean={:.1}x",
             stats.min, stats.p50, stats.p90, stats.max, stats.mean,
         );
     }
@@ -434,15 +439,15 @@ fn print_aggregate(results: &[BenchResult]) {
     println!();
     println!("Top 5 slowest by PDFium:");
     for r in by_pdfium.iter().take(5) {
-        let speedup = match (r.pdfium_ms, r.lopdf_ms) {
-            (Some(p), Some(l)) if l > 0.001 => format!("{:.1}x", p / l),
+        let slowdown = match (r.pdfium_ms, r.lopdf_ms) {
+            (Some(p), Some(l)) if p > 0.001 => format!("{:.1}x", l / p),
             _ => "-".into(),
         };
         println!(
-            "  pdfium={:>8.1}ms  lopdf={:>8.1}ms  speedup={:>6}  {}",
+            "  pdfium={:>8.1}ms  lopdf={:>8.1}ms  lopdf_slowdown={:>6}  {}",
             r.pdfium_ms.unwrap(),
             r.lopdf_ms.unwrap_or(-1.0),
-            speedup,
+            slowdown,
             r.path.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
         );
     }
