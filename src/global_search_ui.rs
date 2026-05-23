@@ -14,6 +14,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -226,6 +229,36 @@ pub struct GlobalSearchState {
     /// ファイル名 (String) で照合するのに対し、Ctrl+G drill-back は `load_folder`
     /// を経由せず full path 同一性で復元する必要があるため別フィールド。
     pub restore_select_path: Option<PathBuf>,
+    /// Newer/Older ソート用の mtime 非同期取得 (review #9 対応)。
+    /// `ensure_container_mtime_populated` が走るのが UI スレッドだったため、
+    /// 5000+ コンテナを SMB share 越しに開くと数十秒フリーズした。worker thread に
+    /// 投げ、結果は `poll_container_mtime_pending` で drain する。
+    pub mtime_lookup_pending: Option<MtimeLookupPending>,
+}
+
+/// mtime 非同期取得のハンドル。`spawn_container_mtime_lookup` が作って
+/// `mtime_lookup_pending` に格納、`poll_container_mtime_pending` が消費する。
+pub struct MtimeLookupPending {
+    pub cancel: Arc<AtomicBool>,
+    pub rx: mpsc::Receiver<MtimeLookupResult>,
+}
+
+impl MtimeLookupPending {
+    pub fn cancel(&self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for MtimeLookupPending {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct MtimeLookupResult {
+    pub path: PathBuf,
+    pub mtime: Option<i64>,
 }
 
 impl Default for GlobalSearchState {
@@ -253,6 +286,7 @@ impl Default for GlobalSearchState {
             filters: GlobalSearchFilters::default(),
             sort_mode: ContainerSortMode::HitCount,
             restore_select_path: None,
+            mtime_lookup_pending: None,
         }
     }
 }
@@ -357,6 +391,13 @@ impl GlobalSearchState {
         self.done = false;
         self.truncated = false;
         self.reject_message = None;
+        // **Codex P3-1 対応**: 旧クエリ向けの container mtime 取得 worker を cancel
+        // (Drop impl が cancel flag を立てる)。旧 containers は上で .clear() 済みなので、
+        // 旧 worker が SMB 越しに走り続けても結果は誰にも適用されない。
+        // また `mtime_lookup_pending` が Some のまま居座ると、新クエリの
+        // `ensure_container_mtime_populated` が pending 検出で early-return して
+        // しまい、新 container 群の mtime ソートが始められなくなる。
+        self.mtime_lookup_pending = None;
     }
 
     /// 集約ロジック (docs §10.4.2): 1 ヒットをコンテナに追加 + 生データも保持
@@ -552,8 +593,8 @@ pub fn sort_containers_with_mode(
     v
 }
 
-/// Newer/Older ソートのために、mtime 未取得のコンテナだけ fs::metadata を呼んで埋める。
-/// HitCount/Name モードでは何もしない。
+/// Newer/Older ソートのために、mtime 未取得のコンテナの fs::metadata 取得を **worker
+/// thread に依頼する** (review #9 対応)。`HitCount` / `Name` モードでは何もしない。
 ///
 /// **ストリーミング中 (`state.done == false`) はスキップする** (Codex P3 対応):
 /// 検索結果が逐次 append されるたびに本関数が呼ばれるため、そのタイミングで毎回
@@ -561,23 +602,68 @@ pub fn sort_containers_with_mode(
 /// で UI がカクつく。ストリーム完了時 (done=true → rebuild) に 1 回まとめて取得し、
 /// 以降はキャッシュが効くので `sort_mode` 切替は即時反映になる。ストリーミング中の
 /// Newer/Older ソートは mtime 不明のため path 順で並ぶが、done 後に正しい順序へ snap する。
+///
+/// **worker offload (review #9)**: 旧実装は UI スレッドで `fs::metadata` を全件
+/// 同期実行していたため、5000 コンテナを SMB share 越しに開くと UI が数十秒
+/// フリーズしていた。本実装は worker thread に投げ、結果を mpsc 経由で
+/// `App::poll_container_mtime_pending` が drain する。すべて drain しきった
+/// ところで rebuild がもう 1 度走り、新しい mtime でソートされる。
 pub fn ensure_container_mtime_populated(state: &mut GlobalSearchState) {
     if !matches!(
         state.sort_mode,
         ContainerSortMode::Newer | ContainerSortMode::Older
     ) {
+        // **Codex P3-3 対応**: ユーザーが Newer/Older から HitCount/Name へソートを
+        // 戻した瞬間、走行中の mtime worker は結果が利用されないので止める。Drop impl が
+        // cancel flag を立てて、SMB 越しの fs::metadata ループと毎フレーム repaint
+        // (poll_container_mtime_pending 由来) を即座に停止する。
+        state.mtime_lookup_pending = None;
         return;
     }
     if !state.done {
         return;
     }
-    for c in state.containers.values_mut() {
-        if c.mtime.is_some() {
-            continue;
+    if state.mtime_lookup_pending.is_some() {
+        return;
+    }
+    let missing: Vec<PathBuf> = state
+        .containers
+        .values()
+        .filter(|c| c.mtime.is_none())
+        .map(|c| c.path.clone())
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel::<MtimeLookupResult>();
+    let cancel_for_worker = Arc::clone(&cancel);
+    let spawn_result = std::thread::Builder::new()
+        .name("container-mtime-lookup".into())
+        .spawn(move || {
+            for path in missing {
+                if cancel_for_worker.load(Ordering::Relaxed) {
+                    break;
+                }
+                let mtime = std::fs::metadata(&path)
+                    .ok()
+                    .map(|m| crate::ui_helpers::mtime_secs(&m));
+                if tx.send(MtimeLookupResult { path, mtime }).is_err() {
+                    // 受信側が drop された → cancel と同義
+                    break;
+                }
+            }
+            // tx drop → rx は Disconnected を返す = 完了サイン
+        });
+    match spawn_result {
+        Ok(_) => {
+            state.mtime_lookup_pending = Some(MtimeLookupPending { cancel, rx });
         }
-        c.mtime = std::fs::metadata(&c.path)
-            .ok()
-            .map(|m| crate::ui_helpers::mtime_secs(&m));
+        Err(e) => {
+            crate::logger::log(format!(
+                "container-mtime-lookup: failed to spawn worker: {e}"
+            ));
+        }
     }
 }
 
@@ -1063,6 +1149,9 @@ impl App {
         self.cancel_pending_folder_nav();
         // pending があれば SearchHandle の Drop impl で cancel される
         self.global_search.pending = None;
+        // **Codex P3-1 対応**: container mtime worker も同様に drop して cancel する。
+        // 検索ビューを抜けたあとに SMB 越しの fs::metadata が裏で走り続けるのを止める。
+        self.global_search.mtime_lookup_pending = None;
         self.global_search.active = false;
         self.global_search.has_focus = false;
         // Ctrl+G 中に 0 で埋めたキャッシュを破棄して、復帰先フォルダの実値を再計算させる。
@@ -1156,6 +1245,44 @@ impl App {
         self.global_search.pending = Some(handle);
         // items を空にして "検索中" 表示に切り替え
         self.rebuild_items_from_global_search();
+    }
+
+    /// `ensure_container_mtime_populated` が worker thread に投げた mtime 取得結果を
+    /// try_recv で drain する (review #9 対応、毎フレーム呼ぶ)。worker 完了時に
+    /// `rebuild_items_from_global_search` を 1 度走らせて新しい mtime で並び替える。
+    pub(crate) fn poll_container_mtime_pending(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.global_search.mtime_lookup_pending.as_ref() else {
+            return;
+        };
+        let mut applied = 0usize;
+        let mut disconnected = false;
+        loop {
+            match pending.rx.try_recv() {
+                Ok(result) => {
+                    if let Some(container) = self.global_search.containers.get_mut(&result.path) {
+                        if container.mtime.is_none() {
+                            container.mtime = result.mtime;
+                            applied += 1;
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if disconnected {
+            self.global_search.mtime_lookup_pending = None;
+            // 全件 drain 完了。新しい mtime でソートし直すために 1 度 rebuild。
+            self.rebuild_items_from_global_search();
+        } else if applied > 0 {
+            // pending 継続中はアイドル寝防止のため次フレームも poll させる。
+            ctx.request_repaint();
+        } else {
+            ctx.request_repaint();
+        }
     }
 
     /// SearchStreamEvent を try_recv で処理する (毎フレーム呼ぶ)。
@@ -1982,12 +2109,25 @@ impl App {
             self.global_search.aggregate = false;
             self.global_search.aggregate_auto = true;
             self.global_search.pending = None; // SearchHandle::Drop で cancel
+            // **Codex P3-1 対応**: 旧 containers 向けの mtime worker も即 drop。
+            // containers は直後に clear するので、worker が SMB 越しに走り続けても
+            // 結果適用先が存在しない。新クエリの `ensure_container_mtime_populated`
+            // が pending 検出で early-return しないよう、ここでも明示的に外す。
+            self.global_search.mtime_lookup_pending = None;
             self.global_search.containers.clear();
             self.global_search.all_hits.clear();
             self.global_search.done = false;
             self.global_search.truncated = false;
             self.global_search.total_valid = 0;
             self.global_search.total_scanned = 0;
+            // **review #5 対応**: 旧クエリ結果に対する self.selected / scroll_offset_y が
+            // 残っていると、poll_global_search_events の guard (selected.is_some()
+            // || scroll_offset_y > 0.5) が次フレームで aggregate_auto を false に
+            // 落としてしまい、新クエリで 1000+ hit 時の自動切替が発火しない。
+            // 旧クエリ結果から作った items は直後の rebuild で全て無効化されるので、
+            // selected / scroll もここで「ユーザー未操作」状態へ戻す。
+            self.selected = None;
+            self.scroll_offset_y = 0.0;
             // query == last_executed でも debounce → spawn を必ず再走させる。
             // そうしないと、Enter 2 連打で旧検索が cancel されたあと
             // poll_global_search_debounce が「クエリが変わっていない」と判定して

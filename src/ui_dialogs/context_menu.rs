@@ -1195,37 +1195,67 @@ pub fn paste_files_from_clipboard(dest_folder: &std::path::Path) -> mpsc::Receiv
     rx
 }
 
+/// `copy_paths_into_folder` の完了結果。`failed > 0` のとき呼び出し側はトースト等で
+/// ユーザーに通知すべき。エラー詳細は `first_errors` (先頭最大 5 件) を見る。
+///
+/// `notice` は「失敗ではないが事後通知が要る」局面で使う (Codex P2-2 対応)。
+/// 例: 自己再帰除外で全件落ちて実コピー自体が走らなかったケース。
+#[derive(Debug, Default, Clone)]
+pub struct CopyOutcome {
+    pub attempted: usize,
+    pub failed: usize,
+    pub first_errors: Vec<String>,
+    pub notice: Option<String>,
+}
+
 /// 指定パス群を `dest_folder` へコピーする（エクスプローラ → mIV のドロップ受け取り用）。
 ///
 /// クリップボード経由ではなくパスを直接受け取る点が [`paste_files_from_clipboard`] と
 /// 異なる。同じく PowerShell worker で実行し、完了を `rx` で 1 回通知する。フォルダの
 /// ドロップにも対応するため `-Recurse`、コピー先に同名が既存なら上書き（`-Force`、
-/// paste と同じ挙動）。同一ファイルをそれ自身へコピーするケース（コピー先と同じ
-/// フォルダから掴んだ場合）は `-ErrorAction SilentlyContinue` で握りつぶす。
+/// paste と同じ挙動）。
+///
+/// **review #15 対応**: 旧実装は `-ErrorAction SilentlyContinue` で全エラーを握りつぶし、
+/// `()` 完了通知だけを返していた。Locked file / 権限拒否 / disk full 等の per-file 失敗が
+/// UI から完全に見えない問題があった。本実装は try/catch で失敗カウントとメッセージを
+/// stdout に書き出し、worker 側で parse して `CopyOutcome` で返す。
 pub fn copy_paths_into_folder(
     paths: Vec<PathBuf>,
     dest_folder: &std::path::Path,
-) -> mpsc::Receiver<()> {
+) -> mpsc::Receiver<CopyOutcome> {
     let (tx, rx) = mpsc::channel();
     #[cfg(windows)]
     {
         if paths.is_empty() {
-            drop(tx); // receiver は即 Disconnected → poll 側は完了扱い
+            let _ = tx.send(CopyOutcome::default());
             return rx;
         }
+        let attempted = paths.len();
         let dest = ps_quote(dest_folder);
         let list = paths
             .iter()
             .map(|p| ps_quote(p))
             .collect::<Vec<_>>()
             .join(",");
+        // 各 Copy-Item を try/catch で囲んで失敗を数える。エラー詳細は先頭 5 件まで
+        // ::ERR:: マーカー付きで stdout に流す。スクリプト全体としては常に exit 0
+        // (= worker の `cmd.output()` 成功) を保つ。
         let script = format!(
             "$dest = {dest}\n\
+             $failed = 0\n\
+             $errs = New-Object System.Collections.ArrayList\n\
              foreach ($f in @({list})) {{\n\
-            \x20 Copy-Item -LiteralPath $f -Destination $dest -Force -Recurse -ErrorAction SilentlyContinue\n\
-             }}\n"
+            \x20 try {{\n\
+            \x20   Copy-Item -LiteralPath $f -Destination $dest -Force -Recurse -ErrorAction Stop\n\
+            \x20 }} catch {{\n\
+            \x20   $failed++\n\
+            \x20   if ($errs.Count -lt 5) {{ [void]$errs.Add(\"$($_.Exception.Message): $f\") }}\n\
+            \x20 }}\n\
+             }}\n\
+             Write-Output \"::FAILED::$failed\"\n\
+             foreach ($e in $errs) {{ Write-Output \"::ERR::$e\" }}\n"
         );
-        run_ps_script_async(script, Some(tx));
+        run_ps_script_with_outcome(script, tx, attempted);
     }
     #[cfg(not(windows))]
     {
@@ -1233,6 +1263,145 @@ pub fn copy_paths_into_folder(
         let _ = tx; // drop — receiver will get Disconnected
     }
     rx
+}
+
+impl CopyOutcome {
+    /// 「全件失敗 + 原因 1 件」の outcome を作るヘルパー。spawn 失敗 / PowerShell 起動失敗 /
+    /// 非ゼロ終了 / `::FAILED::` マーカー欠落 等で worker が結果を確定できないときに使う
+    /// (Codex P2-1 対応: 旧実装はこれらを全て `failed=0` の成功扱いに潰していた)。
+    pub fn all_failed(attempted: usize, reason: impl Into<String>) -> Self {
+        Self {
+            attempted,
+            failed: attempted,
+            first_errors: vec![reason.into()],
+            notice: None,
+        }
+    }
+}
+
+/// stdout を parse して `CopyOutcome` を作って送る `run_ps_script_async` の変種。
+/// `attempted` は paths.len() を呼び出し側が知っているのでそれを使う。
+///
+/// **失敗ハンドリング (Codex P2-1 対応)**: 失敗ポイントを明示的に列挙して `failed=attempted`
+/// で報告する。
+///   - thread::Builder::spawn 失敗 → ここで即 `all_failed` 送出。
+///   - tmp ps1 書き込み失敗 → `all_failed`。
+///   - powershell 起動失敗 (`cmd.output()` Err) → `all_failed`。
+///   - 非ゼロ exit code → `all_failed` (stderr 先頭 3 行も付ける)。
+///   - `::FAILED::` マーカー欠落 → スクリプトが途中でクラッシュした可能性。`all_failed`。
+#[cfg(windows)]
+fn run_ps_script_with_outcome(
+    script: String,
+    on_done: mpsc::Sender<CopyOutcome>,
+    attempted: usize,
+) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = std::env::temp_dir().join(format!("miv_ps_{}_{}.ps1", std::process::id(), seq));
+    // spawn が失敗したときに後段の `all_failed` 送出で `on_done` を再利用するため
+    // closure には clone を渡す (`mpsc::Sender` は Clone 可能、各 clone は独立した
+    // ハンドル)。
+    let tx_for_worker = on_done.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("powershell-copy-with-outcome".into())
+        .spawn(move || {
+            let outcome = execute_copy_script(&tmp, &script, attempted);
+            let _ = std::fs::remove_file(&tmp);
+            let _ = tx_for_worker.send(outcome);
+        });
+    if let Err(e) = spawn_result {
+        crate::logger::log(format!(
+            "run_ps_script_with_outcome: thread spawn failed: {e}"
+        ));
+        let _ = on_done.send(CopyOutcome::all_failed(
+            attempted,
+            format!("worker thread spawn failed: {e}"),
+        ));
+    }
+}
+
+#[cfg(windows)]
+fn execute_copy_script(tmp: &std::path::Path, script: &str, attempted: usize) -> CopyOutcome {
+    let mut content = vec![0xEF, 0xBB, 0xBF];
+    content.extend_from_slice(script.as_bytes());
+    if let Err(e) = std::fs::write(tmp, &content) {
+        return CopyOutcome::all_failed(attempted, format!("script file write failed: {e}"));
+    }
+    let mut cmd = std::process::Command::new("powershell");
+    cmd.args([
+        "-NoProfile",
+        "-STA",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        &tmp.to_string_lossy(),
+    ]);
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(e) => {
+            return CopyOutcome::all_failed(attempted, format!("powershell execution failed: {e}"));
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut parsed_failed: Option<usize> = None;
+    let mut first_errors: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        if let Some(rest) = line.strip_prefix("::FAILED::") {
+            if let Ok(n) = rest.trim().parse::<usize>() {
+                parsed_failed = Some(n);
+            }
+        } else if let Some(rest) = line.strip_prefix("::ERR::") {
+            first_errors.push(rest.to_string());
+        }
+    }
+    // 非ゼロ exit code: スクリプトが完走しなかった可能性が高い → 全件失敗扱い。
+    if !out.status.success() {
+        let mut errs = vec![format!("powershell exit code {:?}", out.status.code())];
+        for line in stderr.lines().take(3) {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                errs.push(trimmed.to_string());
+            }
+        }
+        errs.extend(first_errors.into_iter());
+        return CopyOutcome {
+            attempted,
+            failed: attempted,
+            first_errors: errs.into_iter().take(5).collect(),
+            notice: None,
+        };
+    }
+    // exit=0 だが ::FAILED:: マーカーが無い: スクリプトが try/catch ループの外でエラー終了。
+    // (例: 構文/解析エラー、外部 cmdlet が見つからない、CLR が落ちる等)
+    let Some(failed) = parsed_failed else {
+        let mut errs = vec![
+            "powershell did not emit ::FAILED:: marker (script crashed before completion)"
+                .to_string(),
+        ];
+        for line in stderr.lines().take(3) {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                errs.push(trimmed.to_string());
+            }
+        }
+        return CopyOutcome {
+            attempted,
+            failed: attempted,
+            first_errors: errs.into_iter().take(5).collect(),
+            notice: None,
+        };
+    };
+    CopyOutcome {
+        attempted,
+        failed,
+        first_errors,
+        notice: None,
+    }
 }
 
 /// PowerShell スクリプトを一時ファイル経由で worker スレッドで実行する共通ヘルパー。

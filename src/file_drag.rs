@@ -11,6 +11,23 @@
 //!
 //! `start_file_drag` は `SHDoDragDrop` が戻る (ドロップ完了 or キャンセル) まで
 //! ブロックする。UI スレッドから、かつマウスボタン押下中に呼ぶこと。
+//!
+//! **モーダルブロックの不可避性 (review #8 メモ)**: `SHDoDragDrop` は OLE2 の
+//! STA (Single-Threaded Apartment) モデルに従って HWND 所有スレッド上で独自の
+//! メッセージループを回す。`IDataObject` は呼び出しスレッドのアパートに bound
+//! されるため、別スレッドへ移して実行することは仕様上できない (= drag は UI
+//! スレッドをブロックする以外の選択肢が無い)。
+//!
+//! ユーザー影響の軽減策:
+//!   - **presenter / 音声 / decoder スレッドは独立**して動き続けるので、ドラッグ
+//!     中も動画は再生され続け、音飛びも起きない。`App::update` 側の poll が止まる
+//!     だけで、worker 自体は backlog を貯めながら作業を継続している。
+//!   - SHDoDragDrop 復帰直後に `ctx.request_repaint()` を呼ぶ (呼び出し側で実施) と、
+//!     次フレームで `poll_pdf_render` / `poll_paste_pending` /
+//!     `poll_global_search_events` などが backlog をまとめて処理する。
+//!   - 将来的な改善案: カスタム `IDropSource` を実装して `GiveFeedback` callback
+//!     から mIV の worker poll を周期駆動する。ただし `IDropSource` 内から `App`
+//!     (= `&mut self`) を参照する経路を作る必要があり、現時点では未実装。
 
 use std::path::{Path, PathBuf};
 

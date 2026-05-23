@@ -9,6 +9,19 @@
 
 **改訂履歴**:
 
+- 2026-05-23: ultrareview + Codex re-review (P2/P3) を反映して受け取り側 (§11) を
+  再設計。`handle_external_file_drop` の検証ループを `file-drop-validate` worker
+  thread へ移し、UI スレッドから `fs::canonicalize` × N (SMB で 10s+) を撤去
+  (review #7)。コピー完了通知を `Vec<Receiver<()>>` から
+  `drop_copy_pending: Vec<Receiver<CopyOutcome>>` に格上げし、PowerShell 側を
+  `try/catch` + `::FAILED::N` / `::ERR::msg` マーカー出力に変更して失敗件数と
+  エラー文を UI トーストへ伝えるようにした (review #15 / Codex P2-1)。
+  spawn 失敗 / tmp 書き込み失敗 / `powershell` 実行失敗 / 非ゼロ終了 / マーカー欠落 /
+  `recv()` Disconnected はすべて `CopyOutcome::all_failed(attempted, reason)` で
+  全件失敗扱いに統一 (Codex P2-1: 旧実装は黙って `failed=0` の成功扱いに潰していた)。
+  全件除外で実コピーに到達しなかったケースは `CopyOutcome::notice` フィールドで
+  「ドロップ先と重なる N 件を除外した結果、コピー対象が 0 件」をトースト表示
+  (Codex P2-2: 旧実装は無音だった)。
 - 2026-05-22: Codex レビュー第 1 回を反映。主な修正点 — COM 初期化の寿命管理
   (§5.1 / §6.3)、混在選択 (実ファイル + 仮想アイテム) の仕様化 (§5.4)、`SearchContainer`
   のスコープ明記 (§2 / §5.2)、pointer reset を「要実機検証」に格下げ (§6.1)、工数見積もりの
@@ -823,15 +836,36 @@ mIV ウィンドウを OS のドロップターゲットに登録済みで、efr
   1. 検索結果ビュー (`items_are_global_search_view` / `favsearch.on_results_grid()`) なら
      拒否トースト。
   2. `current_favorite_target()` が `None` (ZIP/PDF 等) なら拒否トースト。
-  3. ドロップ済みパスのうち、ディレクトリかつ `file_drag::dir_copy_would_recurse()` が
-     true のもの (= 自己再帰になる祖先/自身) を除外。残り 0 件なら拒否トースト。
-  4. 残りをコピー worker に渡す (`paste_pending` に積む)。除外があればトーストに件数を付記。
+  3. UI スレッドからは「N 件のファイルをコピーしています…」トーストを即出して、検証 +
+     コピー起動 + 完了待ちを `file-drop-validate` worker thread に丸ごと投げる
+     (review #7 対応、`fs::canonicalize` × N が SMB 越しで UI を秒オーダー止めるのを回避)。
+- worker (`file-drop-validate`) の処理:
+  1. ドロップ済みパスのうち、ディレクトリかつ `file_drag::dir_copy_would_recurse()` が
+     true のもの (= 自己再帰になる祖先/自身) を除外。
+  2. 残り 0 件なら `CopyOutcome::notice` に「ドロップ先と重なる N 件を除外した結果、
+     コピー対象が 0 件になりました」をセットして送る (Codex P2-2 対応: 旧実装はここで
+     `CopyOutcome::default()` を送って poll が無音化していたため、ユーザーは
+     「コピーしています…」のあと拒否理由を見られなかった)。
+  3. 残りがあれば `copy_paths_into_folder` を呼んで内部 worker から `CopyOutcome` を受け取り、
+     UI へ転送。`recv()` の `Err` は `CopyOutcome::all_failed(attempted, reason)` で
+     全件失敗扱いに格上げする (Codex P2-1 対応: Disconnected を成功扱いに潰さない)。
 - `file_drag::dir_copy_would_recurse(src, dest)`: 両パスを `canonicalize` 正規化し、
   コピー先 `dest/basename(src)` が `src` 自身または配下かを小文字化 + コンポーネント
   単位の前方一致で判定する。純粋判定部 `copy_target_inside_src` はユニットテスト済み。
-- コピーは `ui_dialogs::context_menu::copy_paths_into_folder` — `paste_files_from_clipboard`
-  と同型の PowerShell worker (`Copy-Item -LiteralPath -Recurse -Force`)。完了時の
-  再読み込みは既存の `poll_paste_pending` (`pending_reload` を立てる) を再利用。
+- コピーは `ui_dialogs::context_menu::copy_paths_into_folder` —
+  `Copy-Item -LiteralPath -Recurse -Force` を `try/catch` で囲って失敗カウントと先頭 5 件の
+  エラーメッセージを stdout の `::FAILED::N` / `::ERR::msg` マーカーで返す。spawn 失敗 /
+  tmp 書き込み失敗 / `powershell` 実行失敗 / 非ゼロ終了 / マーカー欠落はすべて
+  `failed=attempted` で報告する (Codex P2-1 対応: 旧実装は `SilentlyContinue` で全部
+  飲んでいた)。
+- UI 側の受け取り経路:
+  - 完了は `App::drop_copy_pending: Vec<Receiver<CopyOutcome>>` に積まれ、
+    `poll_paste_pending` が `pending_reload` を立てつつ:
+    - `failed > 0` のとき「成功 K / 失敗 N (例: ...)」トーストを出す
+    - `notice = Some(_)` のとき (全件除外等) その文面をトーストで出す
+    - それ以外 (`failed == 0 && notice == None`) は静かに reload のみ
+  - 既存の `paste_pending: Vec<Receiver<()>>` はクリップボード paste 経路向けで現状維持
+    (出力に構造化情報が要らない単純経路)。
 
 ### 11.3 送出との非干渉
 

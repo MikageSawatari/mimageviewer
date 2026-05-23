@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS pdf_meta (
 | メソッド | 新規行 | 既存行 | 用途 |
 |---|---|---|---|
 | `set_pdf_meta(.., pw_req)` | INSERT (pw_req 明示) | OVERWRITE | enumerate 成功 + 確信あり (saved pw 使用、または password=None で成功) |
-| `set_pdf_meta_safe(..)` | INSERT (pw_req=0) | page_count/mtime/size のみ更新、password_required 保持 | password=None で render 成功 (= 不要確信) |
+| `set_pdf_meta_safe(..)` | INSERT (pw_req=0) | OVERWRITE pw_req=0 + page_count/mtime/size 更新 | password=None で render 成功 (= 不要確信) |
 | `set_pdf_meta_thumb(..)` | **何もしない** | `WHERE filename=? AND mtime=? AND file_size=?` 一致時のみ page_count 更新 | unknown (session pw 使用、保存しないパスワード入力直後) |
 
 `set_pdf_meta_thumb` が WHERE 条件に `mtime/file_size` を含むのは、ファイル置換で stale 行を

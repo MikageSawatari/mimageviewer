@@ -948,6 +948,11 @@ enum CatchupJobKind {
 struct CatchupJob {
     path: std::path::PathBuf,
     kind: CatchupJobKind,
+    /// **review #11/#13 対応**: enqueue 時点の `current_cancel` を握っておく。
+    /// フォルダ移動 (`bump_catchup_epoch`) で worker / 各種 PDFium ジョブを
+    /// 即中断するため、render_page に渡すと共に、job 取り出し時にも
+    /// `is_cancelled()` で早期 skip 判定する。
+    cancel: Arc<AtomicBool>,
 }
 
 // ── キュー本体 (Codex P2 round 2 対応) ──
@@ -969,11 +974,42 @@ struct CatchupQueueState {
     /// queue に入っている (or 現在 worker が処理中) の path 集合。dedup 用。
     pending: HashSet<std::path::PathBuf>,
     shutdown: bool,
+    /// **review #11/#13 対応**: 現行 epoch の cancel flag。enqueue する job に焼き
+    /// 付けて、フォルダ移動時に `bump_epoch` で旧 epoch を一括キャンセルする。
+    current_cancel: Arc<AtomicBool>,
 }
 
 struct CatchupQueue {
     state: Mutex<CatchupQueueState>,
     cv: Condvar,
+}
+
+impl CatchupQueue {
+    /// 現行 epoch の cancel flag を立てて、新しい epoch を開始する。フォルダ移動
+    /// (= 新しい `load_folder` / `load_pdf_as_folder`) のときに呼ぶ。
+    ///
+    /// **挙動 (review #11/#13)**:
+    ///   - 既存の `high` / `low` queue を全て drop。pending HashSet もクリア。
+    ///     → 未処理ジョブを即座に捨てる。`Arc<CatalogDb>` への参照もここで切れる。
+    ///   - 旧 cancel flag を true にセット。worker が今まさに走らせている
+    ///     render_page / enumerate_pages は cancel を読んで Interrupted で抜ける。
+    ///   - 新 cancel flag を生成。以降の enqueue はこれを焼き付ける。
+    fn bump_epoch(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.current_cancel.store(true, Ordering::Relaxed);
+        state.current_cancel = Arc::new(AtomicBool::new(false));
+        state.high.clear();
+        state.low.clear();
+        state.pending.clear();
+        // worker は wait 中なら新しい job を待っているだけなので notify 不要。
+        // 進行中の job は cancel flag を読んで自発的に抜ける。
+    }
+}
+
+/// 外部から呼ぶ public API。フォルダ移動の入口 (`App::load_folder` /
+/// `load_pdf_as_folder` 等) で呼んで、前フォルダ向け catch-up を全部キャンセルする。
+pub fn bump_catchup_epoch() {
+    catchup_queue().bump_epoch();
 }
 
 /// high (neighbor prefetch) の queue 上限。Ctrl+↑↓ で連打しても 16 件先まで温める。
@@ -991,6 +1027,7 @@ fn catchup_queue() -> &'static Arc<CatchupQueue> {
                 low: VecDeque::new(),
                 pending: HashSet::new(),
                 shutdown: false,
+                current_cancel: Arc::new(AtomicBool::new(false)),
             }),
             cv: Condvar::new(),
         });
@@ -1003,7 +1040,37 @@ fn catchup_queue() -> &'static Arc<CatchupQueue> {
     })
 }
 
+/// `catchup_worker_loop` が処理中の job について、関数を抜ける (= 正常 return も
+/// panic unwind も) ときに pending HashSet から確実に取り除く RAII guard。
+///
+/// **review #2 対応**: 旧実装は `process_meta_only` / `process_neighbor_prefetch`
+/// が成功 return したパスだけで pending を削除していたので、panic が起きると path が
+/// 永続的に pending に残り、以降の `maybe_spawn_pdf_meta_catchup` がその path を
+/// 永久に dedup でスキップ → cache hit 経由 catch-up が無音で停止していた。
+/// Drop は unwind しても呼ばれるので、ここで除去すれば panic 後も catch-up 機能は
+/// 1 件の path 漏れだけで済む。
+struct PendingGuard<'a> {
+    queue: &'a CatchupQueue,
+    path: &'a std::path::PathBuf,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        // Mutex poisoning にも対応: poisoned でも内側の HashSet は触れる
+        let mut state = match self.queue.state.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.pending.remove(self.path);
+    }
+}
+
 /// バックグラウンドワーカーループ。high → low の順で pop し、1 件ずつ実作業。
+///
+/// **panic 回復 (review #2 対応)**: 1 件の job 処理が panic しても worker thread が
+/// 死なないように `catch_unwind` で囲う。worker が死ぬと `OnceLock` で再起動できず、
+/// cache hit 経由 pdf_meta catch-up が無音で停止して PDF Enter latency が
+/// 旧バージョン (≈700ms cold) に静かに退行する。
 fn catchup_worker_loop(queue: Arc<CatchupQueue>) {
     loop {
         // queue から 1 件取り出す。空なら Condvar で寝る。
@@ -1024,24 +1091,64 @@ fn catchup_worker_loop(queue: Arc<CatchupQueue>) {
         };
 
         let path = job.path.clone();
-        match job.kind {
-            CatchupJobKind::MetaOnly { catalog } => process_meta_only(&path, &catalog),
-            CatchupJobKind::NeighborPrefetch {
-                catalog,
-                thumb_px,
-                thumb_quality,
-            } => process_neighbor_prefetch(&path, &catalog, thumb_px, thumb_quality),
+        // Drop guard で pending 削除を保証 (panic unwind でも実行される)
+        let _pending_guard = PendingGuard {
+            queue: &queue,
+            path: &path,
+        };
+        let kind = job.kind;
+        let cancel = job.cancel;
+        // **review #11/#13 対応**: job 取り出し時に cancel チェック。フォルダ移動で
+        // bump_epoch されていれば、まだ走り出していない job をここで早期 skip
+        // (= PDFium IPC を無駄に発行しない)。
+        if cancel.load(Ordering::Relaxed) {
+            continue;
         }
+        let path_for_job = path.clone();
+        let cancel_for_job = Arc::clone(&cancel);
+        let panic_result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || match kind {
+                CatchupJobKind::MetaOnly { catalog } => {
+                    process_meta_only(&path_for_job, &catalog, &cancel_for_job)
+                }
+                CatchupJobKind::NeighborPrefetch {
+                    catalog,
+                    thumb_px,
+                    thumb_quality,
+                } => process_neighbor_prefetch(
+                    &path_for_job,
+                    &catalog,
+                    thumb_px,
+                    thumb_quality,
+                    &cancel_for_job,
+                ),
+            }));
+        if let Err(payload) = panic_result {
+            let msg = panic_payload_to_string(&payload);
+            crate::logger::log(format!(
+                "pdf-meta-catchup: job panicked, worker survived (path={}): {msg}",
+                path.display()
+            ));
+        }
+        // _pending_guard ここで drop → pending HashSet から path 除去
+    }
+}
 
-        // pending set から外す (= 次回同 path の enqueue 受付可)
-        if let Ok(mut state) = queue.state.lock() {
-            state.pending.remove(&path);
-        }
+fn panic_payload_to_string(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
     }
 }
 
 /// 実作業: cache hit 経由の pdf_meta catch-up (enumerate のみ、確信値 false で書き込み)
-fn process_meta_only(path: &Path, catalog: &crate::catalog::CatalogDb) {
+fn process_meta_only(path: &Path, catalog: &crate::catalog::CatalogDb, cancel: &Arc<AtomicBool>) {
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
     let Some(filename) = path.file_name().and_then(|n| n.to_str()) else {
         return;
     };
@@ -1069,20 +1176,57 @@ fn process_meta_only(path: &Path, catalog: &crate::catalog::CatalogDb) {
         return;
     }
 
-    // password=None で試行: 暗号化 PDF なら失敗 → 書き込み skip
-    if let Ok(entries) = crate::pdf_loader::enumerate_pages(path, None) {
-        if let Err(e) = catalog.set_pdf_meta(
-            filename,
-            mtime,
-            file_size,
-            entries.len() as u32,
-            false, // password not required (enumerate succeeded without pw)
-        ) {
-            crate::logger::log(format!(
-                "pdf-meta-catchup: set_pdf_meta failed for {filename}: {e}"
-            ));
+    // password=None で試行。
+    // **review #10 対応 (negative cache)**: 暗号化 PDF だと毎回 enumerate が失敗する
+    // が、旧実装は失敗時に何も書かなかったため pdf_meta 行が無いまま残り、
+    // scroll でまた同じ thumb が cache-hit するたびに maybe_spawn_pdf_meta_catchup
+    // が同じ path を再 enqueue → 50 件保護 PDF だと毎スクロール 5-65 秒の IPC を
+    // 無限にバーンしていた。失敗時は (page_count=0, password_required=true) で
+    // negative cache 行を書いて re-enqueue を止める。
+    // **Codex P3-2 対応**: cancel を enumerate にも伝搬する (cancel-aware 版を使う)。
+    // `bump_catchup_epoch` によるフォルダ移動キャンセルが、走行中の MetaOnly enumerate も
+    // Interrupted で抜けさせる (旧実装: cancel 非対応の `enumerate_pages` を呼んでいて
+    // 走行中の MetaOnly は完走するまで PDF worker を占有していた)。
+    match crate::pdf_loader::enumerate_pages_with_cancel(path, None, Some(Arc::clone(cancel))) {
+        Ok(entries) => {
+            if let Err(e) = catalog.set_pdf_meta(
+                filename,
+                mtime,
+                file_size,
+                entries.len() as u32,
+                false, // password not required (enumerate succeeded without pw)
+            ) {
+                crate::logger::log(format!(
+                    "pdf-meta-catchup: set_pdf_meta failed for {filename}: {e}"
+                ));
+            }
+        }
+        Err(e) => {
+            let msg = format!("{e}");
+            if is_password_required_error(&msg) {
+                // negative cache: 0 ページ + password_required=true。
+                // `try_apply_pdf_meta_cache` 側で has_saved_password=false なら
+                // placeholder を出さずに通常 enumerate (= ユーザーへ password 入力
+                // ダイアログ) に倒れる。
+                if let Err(e2) = catalog.set_pdf_meta(filename, mtime, file_size, 0, true) {
+                    crate::logger::log(format!(
+                        "pdf-meta-catchup: negative cache write failed for {filename}: {e2}"
+                    ));
+                }
+            } else {
+                crate::logger::log(format!(
+                    "pdf-meta-catchup: enumerate failed for {filename}: {msg}"
+                ));
+            }
         }
     }
+}
+
+/// PDFium のパスワード要求エラーかを判定する。`PdfiumError::PdfiumLibraryInternalError(
+/// PdfiumInternalError::PasswordError)` の Display 文字列に "Password" が含まれる
+/// ことを利用する (`src/app.rs:6376` と同じ pattern)。
+fn is_password_required_error(msg: &str) -> bool {
+    msg.contains("Password") || msg.contains("password")
 }
 
 /// 実作業: neighbor prefetch (render page 0 + pdf_meta + WebP サムネ)
@@ -1091,7 +1235,11 @@ fn process_neighbor_prefetch(
     parent_catalog: &crate::catalog::CatalogDb,
     thumb_px: u32,
     thumb_quality: u8,
+    cancel: &Arc<AtomicBool>,
 ) {
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
     let Ok(meta) = std::fs::metadata(path) else {
         return;
     };
@@ -1109,11 +1257,18 @@ fn process_neighbor_prefetch(
     };
 
     // 既に pdf_meta + thumb 両方 cache 済みなら skip
-    let meta_present = parent_catalog
+    let meta = parent_catalog
         .get_pdf_meta(filename, mtime, file_size)
         .ok()
-        .flatten()
-        .is_some();
+        .flatten();
+    let meta_present = meta.is_some();
+    // **review #10 対応**: negative cache (password_required=true) を持つ PDF は
+    // None で render しても失敗確定。thumb がまだ無くても retry しない。
+    // これを忘れると thumb_present=false で毎回 render_page → 同じ password エラーで
+    // IPC を浪費する loop に陥る。
+    if let Some((_, true)) = meta {
+        return;
+    }
     let folder_key = format!("{}{}", CACHE_KEY_PDF, filename);
     let thumb_present = parent_catalog
         .load_one(&folder_key)
@@ -1125,16 +1280,37 @@ fn process_neighbor_prefetch(
         return;
     }
 
-    // render_page (page 0、Normal 優先度) — password=None で試行
-    let Ok(res) = crate::pdf_loader::render_page(
+    // render_page (page 0、Normal 優先度) — password=None で試行。
+    // **review #10 対応**: 失敗時に password 起因かを判定して negative cache
+    // (page_count=0, password_required=true) を書き、scroll で同じ neighbor が
+    // 再 enqueue され続けるのを止める。
+    // **review #11/#13 対応**: cancel をプール経由で render_page にも渡す。
+    // フォルダ移動で bump_epoch されたら、走行中の PDFium 描画も Interrupted で
+    // 抜けて Normal 枠を即座に解放する。
+    let res = match crate::pdf_loader::render_page(
         path,
         0,
         thumb_px,
         None,
-        None,
+        Some(Arc::clone(cancel)),
         crate::pdf_loader::JobPriority::Normal,
-    ) else {
-        return;
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("{e}");
+            if is_password_required_error(&msg) && !meta_present {
+                if let Err(e2) = parent_catalog.set_pdf_meta(filename, mtime, file_size, 0, true) {
+                    crate::logger::log(format!(
+                        "pdf-neighbor-prefetch: negative cache write failed for {filename}: {e2}"
+                    ));
+                }
+            } else {
+                crate::logger::log(format!(
+                    "pdf-neighbor-prefetch: render failed for {filename}: {msg}"
+                ));
+            }
+            return;
+        }
     };
 
     if !meta_present {
@@ -1206,11 +1382,13 @@ fn maybe_spawn_pdf_meta_catchup(
         return;
     }
     state.pending.insert(req.path.clone());
+    let cancel = Arc::clone(&state.current_cancel);
     state.low.push_back(CatchupJob {
         path: req.path.clone(),
         kind: CatchupJobKind::MetaOnly {
             catalog: Arc::clone(cat_arc),
         },
+        cancel,
     });
     drop(state);
     queue.cv.notify_one();
@@ -1250,6 +1428,7 @@ pub fn spawn_pdf_neighbor_prefetch(
             if let Some(pos) = state.low.iter().position(|j| j.path == pdf_path) {
                 // queued MetaOnly + high に空きあり: 安全に upgrade できる
                 state.low.remove(pos);
+                let cancel = Arc::clone(&state.current_cancel);
                 state.high.push_back(CatchupJob {
                     path: pdf_path,
                     kind: CatchupJobKind::NeighborPrefetch {
@@ -1257,6 +1436,7 @@ pub fn spawn_pdf_neighbor_prefetch(
                         thumb_px,
                         thumb_quality,
                     },
+                    cancel,
                 });
                 // pending は path がそのまま存在し続けるので insert/remove なし
                 drop(state);
@@ -1274,6 +1454,7 @@ pub fn spawn_pdf_neighbor_prefetch(
         return;
     }
     state.pending.insert(pdf_path.clone());
+    let cancel = Arc::clone(&state.current_cancel);
     state.high.push_back(CatchupJob {
         path: pdf_path,
         kind: CatchupJobKind::NeighborPrefetch {
@@ -1281,6 +1462,7 @@ pub fn spawn_pdf_neighbor_prefetch(
             thumb_px,
             thumb_quality,
         },
+        cancel,
     });
     drop(state);
     queue.cv.notify_one();

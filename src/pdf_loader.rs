@@ -1247,6 +1247,12 @@ enum WorkerRequest {
         /// 常に実行する (Codex P2 対策: UI nav の epoch とバックグラウンドが干渉して
         /// アクティブな UI の PDF が Interrupted で落ちるのを防ぐ)。
         epoch: Option<u64>,
+        /// **review #14 対応**: `enumerate_pages_async` の in-process fallback で、
+        /// `PdfEnumerateHandle::cancel` を worker 経路にも伝搬する。pool 経由なら
+        /// `pool.execute(.., Some(&cancel), ..)` で同じ仕組みが効くが、pool 不在環境
+        /// での fallback では従来 None だったため、ハンドル drop で cancel が立っても
+        /// 実 enumerate を止められなかった。pool ありの経路では None でよい。
+        cancel: Option<Arc<AtomicBool>>,
     },
     CheckPassword {
         path: PathBuf,
@@ -1356,6 +1362,7 @@ impl PdfWorker {
                 password,
                 reply,
                 epoch,
+                cancel,
             } => {
                 // Stale な enumerate 要求は即捨てる。ユーザーが Ctrl+↑↓ 連打で複数 PDF を
                 // 通過した場合、古い要求を律儀に処理する必要はない。
@@ -1379,7 +1386,23 @@ impl PdfWorker {
                         return;
                     }
                 }
-                let _ = reply.send(core_enumerate(pdfium, &path, password.as_deref()));
+                // **review #14 対応**: cancel が立っていれば実 PDFium を呼ばずに
+                // Interrupted を返す。fallback 経路で UI が `PdfEnumerateHandle` を
+                // drop した直後はここで捨てる (PDFium 呼び出しは長い場合に分秒級)。
+                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    let _ = reply.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "enumerate cancelled before start",
+                    )));
+                    return;
+                }
+                let result = core_enumerate(pdfium, &path, password.as_deref());
+                if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+                    // 結果が出てから cancel に追いつかれたケース: rx は既に drop されて
+                    // いる可能性が高いので、send 失敗は無視。
+                    return;
+                }
+                let _ = reply.send(result);
             }
             WorkerRequest::CheckPassword { path, reply } => {
                 let _ = reply.send(Self::do_check_password(pdfium, &path));
@@ -1592,12 +1615,27 @@ pub fn enumerate_pages(
     pdf_path: &Path,
     password: Option<&str>,
 ) -> std::io::Result<Vec<PdfPageEntry>> {
+    enumerate_pages_with_cancel(pdf_path, password, None)
+}
+
+/// `enumerate_pages` の cancel 対応版。`process_meta_only` のように、上位の
+/// epoch / cancel 機構 (例: `thumb_loader::bump_catchup_epoch`) から呼ばれる経路で
+/// 使う (Codex P3-2 対応)。pool 経路では `pool.execute` の cancel に、in-process
+/// fallback では `WorkerRequest::Enumerate.cancel` に伝搬する。
+///
+/// `cancel=None` だと旧 `enumerate_pages` と同等動作。バックグラウンドのキャッシュ
+/// 作成等で使う。
+pub fn enumerate_pages_with_cancel(
+    pdf_path: &Path,
+    password: Option<&str>,
+    cancel: Option<Arc<AtomicBool>>,
+) -> std::io::Result<Vec<PdfPageEntry>> {
     let pool = get_pool();
     if pool.worker_count > 0 {
         let req = encode_enumerate_request(pdf_path, password);
         // enumerate は列挙のみで軽量 (PDFium page 列挙) だが Normal 扱いでよい
         let perf_key = crate::grid_item::pdf_file_perf_key(pdf_path);
-        let resp = pool.execute(&req, None, JobPriority::Normal, Some(perf_key))?;
+        let resp = pool.execute(&req, cancel.as_ref(), JobPriority::Normal, Some(perf_key))?;
         return PdfWorkerPool::parse_enumerate_response(&resp);
     }
     // フォールバック: in-process ワーカー。
@@ -1609,6 +1647,7 @@ pub fn enumerate_pages(
         password: password.map(String::from),
         reply: tx,
         epoch: None,
+        cancel,
     });
     rx.recv()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?
@@ -1823,7 +1862,10 @@ pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnum
         }
     }
 
-    // Pool 不在: in-process worker + epoch skip の旧経路。
+    // Pool 不在 / spawn 失敗フォールバック: in-process worker + epoch skip の旧経路。
+    // **review #14 対応**: in-process worker にも cancel を伝搬する。これがないと
+    // `PdfEnumerateHandle` の drop で `cancel` が立っても worker は完走してしまい、
+    // ナビゲーション応答性 (v1.0.0 の目標) が pool 不在環境で失われていた。
     let epoch = LATEST_ENUMERATE_EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
     let (tx, rx) = mpsc::channel();
     let _ = get_worker().priority_tx.send(WorkerRequest::Enumerate {
@@ -1831,6 +1873,7 @@ pub fn enumerate_pages_async(pdf_path: &Path, password: Option<&str>) -> PdfEnum
         password: password.map(String::from),
         reply: tx,
         epoch: Some(epoch),
+        cancel: Some(Arc::clone(&cancel)),
     });
     PdfEnumerateHandle { cancel, rx }
 }

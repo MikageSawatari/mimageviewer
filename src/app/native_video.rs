@@ -868,8 +868,24 @@ impl App {
         // (`native_video_in_window_active`) が旧いままなので、ここで owner / HUD を
         // 登録すると新 child HWND を fullscreen / VST owner と誤認しうる (Codex 再 P1)。
         // 切替完了 (`apply_window_mode_switched`) 後の次フレームで再 sync される。
-        if self.native_video_mode_switch.is_some() {
-            return;
+        //
+        // **deadline 過ぎでの強制 clear (review #3 対応)**: presenter スレッドが
+        // 応答しない / イベントが失われた等で pending が deadline 過ぎても残った場合、
+        // ここで強制的に clear して owner/HUD 登録を再開する。さもないと
+        // ensure_native_video_front が永続的に early-return して HUD/VST が
+        // 死んだままになる。トグル時の保険 (line 1494) は次回トグルまで
+        // 効かないので、こちらは毎フレーム駆動。
+        if let Some(pending) = self.native_video_mode_switch {
+            if std::time::Instant::now() < pending.deadline {
+                return;
+            }
+            crate::logger::log(format!(
+                "[native-video] window mode switch request {} exceeded deadline \
+                 without WindowModeSwitched event; clearing pending and resuming \
+                 front sync",
+                pending.request_id
+            ));
+            self.native_video_mode_switch = None;
         }
         let (hwnd, hud_hwnd) = self
             .fullscreen_idx
@@ -1500,7 +1516,14 @@ impl App {
                 pending.request_id
             ));
         }
-        let new_in_window = !self.settings.video_in_window_mode;
+        // 切替方向の基準は「いま意図しているモード」: pending があれば pending.target、
+        // なければ永続設定値。永続設定値は presenter 確定後の `apply_window_mode_switched`
+        // でのみ更新されるので (review #4 対応)、pending 中は pending.target を見る。
+        let current_intent = self
+            .native_video_mode_switch
+            .map(|p| p.target_in_window)
+            .unwrap_or(self.settings.video_in_window_mode);
+        let new_in_window = !current_intent;
         // フルスクリーン → ウィンドウ 切替時、VST3 GUI が表示中なら自動で隠す。
         // in-window モードは VST を対象外にするため、VST GUI ウィンドウ (owner は
         // フルスクリーン presenter HWND) を残したまま切り替えると、owner HWND の
@@ -1510,10 +1533,10 @@ impl App {
         if new_in_window && self.show_vst3_manager {
             self.toggle_native_video_vst3_gui();
         }
-        // 永続設定だけフリップ。実モード (`native_video_in_window_active`) は成功
-        // イベントまで据え置く (上記 doc 参照)。
-        self.settings.video_in_window_mode = new_in_window;
-        self.settings.save();
+        // 永続設定は presenter 確定 (`apply_window_mode_switched`) まで触らない
+        // (review #4 対応)。途中で crash / Alt+F4 で落ちても、未確定モードが
+        // 次回起動時に持ち越されないようにする。実モード
+        // (`native_video_in_window_active`) も成功イベントまで据え置く。
         self.native_video_mode_switch_seq = self.native_video_mode_switch_seq.wrapping_add(1);
         let request_id = self.native_video_mode_switch_seq;
         self.native_video_mode_switch = Some(super::NativeVideoModeSwitchPending {
@@ -1560,9 +1583,18 @@ impl App {
     /// presenter HWND が作り直されたことに伴う front 同期 / VST owner の再設定を行う。
     /// `native_video_mode_switch` (pending) の解除は呼び出し側が request_id 照合の
     /// うえで行う (stale イベントでも実モードだけは反映するため = Codex 再 P2)。
+    ///
+    /// **永続設定の保存タイミング (review #4 対応)**: `settings.video_in_window_mode`
+    /// はここ (presenter 確定後) で初めて更新・保存する。toggle 時点で save してしまうと、
+    /// presenter rebuild 中に crash / Alt+F4 で落ちた場合に「ユーザーが見ていない未確定
+    /// モード」が次回起動時に持ち越される。
     #[cfg(windows)]
     fn apply_window_mode_switched(&mut self, in_window: bool) {
         self.native_video_in_window_active = in_window;
+        if self.settings.video_in_window_mode != in_window {
+            self.settings.video_in_window_mode = in_window;
+            self.settings.save();
+        }
         // presenter HWND が作り直されたので front 同期を強制リセットする。新 HWND は
         // publish 済みなので、次の ensure_native_video_front が is_new_hwnd 経路で
         // owner / HUD 登録をやり直す (Codex #4)。
@@ -1580,17 +1612,15 @@ impl App {
     }
 
     /// Plan B: presenter から `WindowModeSwitchFailed` を受けたときに呼ぶ。presenter は
-    /// 旧 window/presenter を生かしたままなので、`toggle` でフリップした永続設定だけを
-    /// 元へ戻す。`native_video_in_window_active` (実モード) はトグル時に触っていない
-    /// ため変更不要 (= 既に実際のモードを指している、Codex P2)。
+    /// 旧 window/presenter を生かしたまま。永続設定は toggle 時点では触っていないので
+    /// (review #4 対応の deferred save)、ここで戻すべきものは何も無く、pending を
+    /// クリアするだけで OK。
     #[cfg(windows)]
     fn revert_failed_window_mode_switch(&mut self, target_in_window: bool) {
-        let reverted = !target_in_window;
-        self.settings.video_in_window_mode = reverted;
-        self.settings.save();
         self.native_video_mode_switch = None;
         crate::logger::log(format!(
-            "[native-video] window mode switch failed; reverted setting to in_window={reverted}"
+            "[native-video] window mode switch failed (target_in_window={target_in_window}); \
+             pending cleared (settings was never persisted, no revert needed)"
         ));
     }
 
@@ -1671,18 +1701,42 @@ impl App {
                 // 一致しなくても (timeout 後の遅延イベント等) 実モードだけは反映する。
                 // さもないと presenter が実際に切替済みなのに App の
                 // native_video_in_window_active だけ古いまま残る (Codex 再 P2)。
-                let matches_pending = matches!(
-                    self.native_video_mode_switch,
-                    Some(p) if p.request_id == request_id
-                );
                 self.apply_window_mode_switched(in_window);
-                if matches_pending {
-                    self.native_video_mode_switch = None;
-                } else {
-                    crate::logger::log(format!(
-                        "[native-video] WindowModeSwitched request={request_id} did not match \
-                         pending; applied actual mode in_window={in_window} anyway"
-                    ));
+                // pending の解除条件 (review #3 対応):
+                //   - request_id 一致: 通常パス、確定イベント。clear。
+                //   - request_id 不一致でも実モード in_window が pending の
+                //     target_in_window と一致: presenter は既に目的のモードへ
+                //     収束済み (= 後続の switch 要求は no-op になる前提)。clear して
+                //     `ensure_native_video_front` を再開させる。
+                //     旧実装はこのケースで pending が居座り続け、毎フレームの
+                //     ensure_native_video_front が early-return してしまって
+                //     HUD/VST owner 登録が永続的に再開しない不具合があった。
+                //   - request_id 不一致 + target も不一致: presenter が更にもう
+                //     1 段切替中。pending を保持して次イベントを待つ。
+                match self.native_video_mode_switch {
+                    Some(p) if p.request_id == request_id => {
+                        self.native_video_mode_switch = None;
+                    }
+                    Some(p) if p.target_in_window == in_window => {
+                        crate::logger::log(format!(
+                            "[native-video] WindowModeSwitched request={request_id} stale but \
+                             presenter converged to pending target in_window={in_window}; \
+                             clearing pending"
+                        ));
+                        self.native_video_mode_switch = None;
+                    }
+                    Some(_) => {
+                        crate::logger::log(format!(
+                            "[native-video] WindowModeSwitched request={request_id} did not match \
+                             pending; applied actual mode in_window={in_window}; pending still active"
+                        ));
+                    }
+                    None => {
+                        crate::logger::log(format!(
+                            "[native-video] WindowModeSwitched request={request_id} arrived with \
+                             no pending; applied actual mode in_window={in_window}"
+                        ));
+                    }
                 }
             }
             crate::video::NativeVideoOutputEvent::WindowModeSwitchFailed { request_id } => {

@@ -333,12 +333,20 @@ impl CatalogDb {
     }
 
     /// `password 不要が確信できる場合**用の UPSERT。
-    /// 新規行は `password_required=0` で挿入、既存行は `password_required` 列を
-    /// **保持しつつ** `page_count`/`mtime`/`file_size` を更新する。
+    /// 新規行・既存行とも `password_required=0` で書き込み、
+    /// `page_count`/`mtime`/`file_size` を更新する。
     ///
     /// 用途: サムネワーカーが `pdf_password=None` で render に成功した場合 (=
-    /// PDFium 側で「パスワード不要」と判明した = 確信あり)。これは新規行で false を
-    /// 入れても問題ない。
+    /// PDFium 側で「パスワード不要」と判明した = 確信あり)。
+    ///
+    /// **既存行の `password_required` も上書きする理由 (review #1 対応)**:
+    /// 呼び出し側の不変条件「password=None で render 成功」が成立しているので、
+    /// (filename, mtime, file_size) の組合せで指している今のファイルは確実に
+    /// 非保護。既存行 `password_required=1` を保持してしまうと、保護版を
+    /// 非保護版に差し替えた場合に永続的に「保護扱い」が残り、placeholder grid が
+    /// 表示できず無意味なパスワード入力ダイアログを毎回開く羽目になる。
+    /// 「render が None で通った時点で password_required は 0 と判明した」事実を
+    /// そのまま反映する。
     pub fn set_pdf_meta_safe(
         &self,
         filename: &str,
@@ -354,7 +362,8 @@ impl CatalogDb {
              ON CONFLICT(filename) DO UPDATE SET \
                mtime = excluded.mtime, \
                file_size = excluded.file_size, \
-               page_count = excluded.page_count",
+               page_count = excluded.page_count, \
+               password_required = 0",
             params![filename, mtime, file_size, page_count as i64],
         )?;
         Ok(())
@@ -1046,9 +1055,11 @@ mod tests {
     }
 
     #[test]
-    fn pdf_meta_safe_preserves_password_required_on_existing_row() {
-        // 既存行に password_required=true がある場合、safe 経路でも保持する。
-        // (= 後から「password 不要」確信が来ても、過去の確信を上書きしない)
+    fn pdf_meta_safe_overrides_password_required_on_existing_row() {
+        // **review #1 対応**: 既存行に password_required=true があっても、safe 経路
+        // (= None password で render 成功 = 非保護確信あり) は上書きで 0 にする。
+        // 保護版を非保護版に同名差し替えしたとき、stale な「保護」フラグを
+        // 永続化しないため。
         let db = open_in_memory();
         db.set_pdf_meta("locked.pdf", 100, 500, 8, true).unwrap();
         db.set_pdf_meta_safe("locked.pdf", 200, 600, 10).unwrap();
@@ -1056,8 +1067,8 @@ mod tests {
         let result = db.get_pdf_meta("locked.pdf", 200, 600).unwrap();
         assert_eq!(
             result,
-            Some((10, true)),
-            "既存 password_required=true は保持、ただし page_count/mtime/size は更新"
+            Some((10, false)),
+            "safe 経路の確信 (password_required=false) で上書きされる"
         );
     }
 }

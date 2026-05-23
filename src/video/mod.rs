@@ -1622,6 +1622,14 @@ fn run_native_video_output(
     let mut cur_checked = config.checked;
     let mut cur_vst3_available = config.vst3_available;
     let mut cur_sar: Option<(u32, u32)> = None;
+    // **review #12 対応**: SwitchWindowMode で presenter を作り直したとき再適用が
+    // 漏れていた現行値。App 側は loop / continuous / compact を「ユーザー操作時のみ
+    // push」するため、これらを presenter 側で覚えておかないと SwitchWindowMode 後の
+    // 新 presenter が default に戻る。
+    let mut cur_loop_enabled: Option<bool> = None;
+    let mut cur_loop_mode: Option<crate::settings::VideoLoopMode> = None;
+    let mut cur_continuous_mode: Option<VideoContinuousMode> = None;
+    let mut cur_video_compact: Option<bool> = None;
     fn publish_presenter_window(
         window: &crate::video::native_window::NativeVideoWindow,
         hwnd_out: &Arc<AtomicU64>,
@@ -1983,12 +1991,15 @@ fn run_native_video_output(
                     presenter.set_overlay_metadata(metadata);
                 }
                 NativeVideoOutputCommand::SetLoopEnabled { enabled } => {
+                    cur_loop_enabled = Some(enabled);
                     presenter.set_overlay_loop_enabled(enabled);
                 }
                 NativeVideoOutputCommand::SetLoopMode { mode } => {
+                    cur_loop_mode = Some(mode);
                     presenter.set_overlay_loop_mode(mode);
                 }
                 NativeVideoOutputCommand::SetContinuousMode { mode } => {
+                    cur_continuous_mode = Some(mode);
                     presenter.set_overlay_continuous_mode(mode);
                 }
                 NativeVideoOutputCommand::SetVst3Available { available } => {
@@ -2000,6 +2011,7 @@ fn run_native_video_output(
                     presenter.set_overlay_checked(checked);
                 }
                 NativeVideoOutputCommand::SetVideoCompact { compact } => {
+                    cur_video_compact = Some(compact);
                     if let Err(err) = presenter.set_video_compact(compact) {
                         crate::logger::log(format!(
                             "[native-video] set compact transform failed: {err}"
@@ -2284,6 +2296,31 @@ fn run_native_video_output(
                                                 crate::logger::log(format!(
                                                     "[native-video] switch mode: \
                                                      set_video_sar failed: {err}"
+                                                ));
+                                            }
+                                        }
+                                        // **review #12 対応**: loop / continuous / compact は
+                                        // App 側がユーザー操作時にしか push しないため、
+                                        // ここで再適用しないと新 presenter は default に戻る。
+                                        // (旧実装は continuous=Disabled / loop=Off / compact=false
+                                        // で起動して、ユーザーが次に該当ボタンを触るまで
+                                        // 表示が古い設定と乖離していた)。
+                                        if let Some(enabled) = cur_loop_enabled {
+                                            new_presenter.set_overlay_loop_enabled(enabled);
+                                        }
+                                        if let Some(mode) = cur_loop_mode {
+                                            new_presenter.set_overlay_loop_mode(mode);
+                                        }
+                                        if let Some(mode) = cur_continuous_mode {
+                                            new_presenter.set_overlay_continuous_mode(mode);
+                                        }
+                                        if let Some(compact) = cur_video_compact {
+                                            if let Err(err) =
+                                                new_presenter.set_video_compact(compact)
+                                            {
+                                                crate::logger::log(format!(
+                                                    "[native-video] switch mode: \
+                                                     set_video_compact failed: {err}"
                                                 ));
                                             }
                                         }

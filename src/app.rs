@@ -1972,6 +1972,10 @@ pub struct App {
     /// PowerShell 経由の paste が完了する前に reload しても無駄走査になるため、
     /// 完了通知を待ってから再読込する (docs/ui-responsiveness.md §4)。
     pub(crate) paste_pending: Vec<std::sync::mpsc::Receiver<()>>,
+    /// 外部 D&D 由来の copy worker 完了待ち (review #15 対応)。完了時に
+    /// `CopyOutcome` を見て失敗があればトーストでユーザーに通知する。
+    pub(crate) drop_copy_pending:
+        Vec<std::sync::mpsc::Receiver<crate::ui_dialogs::context_menu::CopyOutcome>>,
     /// Ctrl+S / キャプチャ保存の worker 完了待ち。
     pub(crate) capture_pending: Option<CapturePending>,
     /// X / C 比較ビューのピン留めスロット。CPU pixels を正とし、texture は派生物。
@@ -3281,6 +3285,7 @@ impl App {
             delete_targets: Vec::new(),
             pending_reload: false,
             paste_pending: Vec::new(),
+            drop_copy_pending: Vec::new(),
             capture_pending: None,
             pinned_compare_slot: None,
             compare_view_mode: CompareViewMode::Off,
@@ -4373,6 +4378,15 @@ impl App {
             .unwrap_or(true);
         if folder_changes {
             self.clear_archive_convert_nav_history_rollback();
+            // **review #11/#13 対応**: 前フォルダ向けの catch-up / neighbor-prefetch
+            // ジョブをまとめてキャンセル & queue から破棄する。これにより:
+            //   - 未処理 job が即 drop され、握っていた `Arc<CatalogDb>` が解放される
+            //     (catalog_cache LRU が実際に Connection を close できるようになる)
+            //   - 進行中の render_page / enumerate_pages が cancel flag を読んで
+            //     Interrupted で抜け、PDF worker Normal 枠を即解放する
+            //   - 新フォルダ向けの enqueue は新しい cancel flag で焼き付くので、
+            //     混ざらない
+            crate::thumb_loader::bump_catchup_epoch();
         }
         self.record_folder_nav_transition(&path);
         // パスが .zip / .pdf ファイルなら仮想フォルダとして開く
@@ -6131,27 +6145,33 @@ impl App {
             .map(|d| d.as_secs() as i64)?;
         let file_size = meta.len();
 
-        // 親フォルダの catalog DB を LRU 経由で取得 (warm なら ~0.1ms、cold open 時のみ
-        // 5-150ms)。直接 `CatalogDb::open` を呼ぶと毎回 PRAGMA + schema init が走って
-        // Enter→placeholder の体感が伸びる (Codex P2 対応)。
+        // 親フォルダの catalog DB を **warm hit 経由のみ** で取得する (review #6 対応)。
+        // ここは UI スレッドの「Enter→placeholder 即表示」hot path なので、
+        // cold open (PRAGMA + schema init で 5-150ms) を絶対に走らせない。
+        // warm miss なら placeholder は出さず通常 enumerate (async) に任せる。
+        // 一度 catalog が warm-up された後の 2 回目以降の Enter で初めて
+        // placeholder が出る、という degraded UX で許容する。
         let (page_count, password_required) = {
-            let catalog = self.get_or_open_catalog(&parent)?;
+            let catalog = self.peek_warm_catalog(&parent)?;
             catalog
                 .get_pdf_meta(&filename, mtime, file_size as i64)
                 .ok()??
         };
 
-        if page_count == 0 {
-            return None;
-        }
-
         // パスワード保護下で開かれたキャッシュは、`pdf_passwords` の **この PDF 固有の**
         // 保存パスワードがある場合だけ trust する (Codex P1 対応: 他 PDF の session
         // パスワードで保護 PDF の placeholder を出すと bypass になる)。
+        // **review #10 対応**: negative cache (page_count=0, password_required=true)
+        // のときも先にここで弾く。先に page_count==0 を見ると negative cache が miss
+        // 扱いになって `maybe_spawn_pdf_meta_catchup` が永久に re-enqueue してしまう。
         if password_required && !has_saved_password {
             crate::logger::log(format!(
                 "  pdf meta cache: skip placeholder for password-protected {filename} (no saved password)"
             ));
+            return None;
+        }
+
+        if page_count == 0 {
             return None;
         }
 
@@ -6639,12 +6659,14 @@ impl App {
     /// LRU 最大 16 件、超過時は FIFO で古いものから drop (= SQLite Connection close)。
     /// `start_loading_items` の毎ステップ open を吸収するためのキャッシュ。
     /// open 失敗時は cache に挿入せず None を返す (次回も open を再試行)。
-    pub(crate) fn get_or_open_catalog(
+    /// LRU から warm hit だけ返す。miss でも `CatalogDb::open` を発火させない
+    /// (review #6 対応)。UI スレッドから placeholder 体感向上のために呼ぶ経路は
+    /// この warm-only API を使い、cold open が必要な経路は通常の
+    /// `get_or_open_catalog` を別経路 / worker で呼ぶ。
+    pub(crate) fn peek_warm_catalog(
         &mut self,
         folder_path: &Path,
     ) -> Option<Arc<crate::catalog::CatalogDb>> {
-        const MAX_CACHED: usize = 16;
-        // hit: LRU 末尾に移動して返す。
         if self.catalog_cache.contains_key(folder_path) {
             if let Some(pos) = self
                 .catalog_cache_order
@@ -6655,6 +6677,18 @@ impl App {
                 self.catalog_cache_order.push_back(key);
             }
             return self.catalog_cache.get(folder_path).cloned();
+        }
+        None
+    }
+
+    pub(crate) fn get_or_open_catalog(
+        &mut self,
+        folder_path: &Path,
+    ) -> Option<Arc<crate::catalog::CatalogDb>> {
+        const MAX_CACHED: usize = 16;
+        // hit: LRU 末尾に移動して返す。
+        if let Some(arc) = self.peek_warm_catalog(folder_path) {
+            return Some(arc);
         }
         // miss: open + insert。失敗時は cache を汚さない。
         let cache_dir = crate::catalog::default_cache_dir();
@@ -8210,49 +8244,133 @@ impl App {
             self.show_feedback_toast(msg.to_string());
             return;
         };
-        // ドロップ先と自己再帰になるディレクトリ (表示中フォルダの祖先 / 自身) を除外。
-        let mut to_copy: Vec<PathBuf> = Vec::with_capacity(paths.len());
-        let mut recursive_skipped = 0usize;
-        for p in paths {
-            if p.is_dir() && crate::file_drag::dir_copy_would_recurse(&p, &dest) {
-                recursive_skipped += 1;
-            } else {
-                to_copy.push(p);
-            }
-        }
-        if to_copy.is_empty() {
-            self.show_feedback_toast(
-                "ドロップ先フォルダ自身またはその親フォルダはコピーできません".to_string(),
-            );
+        // **review #7 対応**: ドロップ先との自己再帰判定 (per-path `Path::is_dir` +
+        // `fs::canonicalize`×2) は遅いネットワーク共有で 1 path あたり 50-500ms に
+        // なるので、UI スレッドから worker へ全部投げる。UI 側は即座に件数 toast を
+        // 出して return する。Worker 内で検証 → PowerShell 起動 → 完了待ち の順で
+        // 動き、完了を `drop_copy_pending` 経由で `CopyOutcome` 付きで受け取り、
+        // 失敗があればトーストで通知する (review #15)。
+        let n_total = paths.len();
+        let (tx, rx) = std::sync::mpsc::channel::<crate::ui_dialogs::context_menu::CopyOutcome>();
+        let dest_for_worker = dest.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("file-drop-validate".into())
+            .spawn(move || {
+                let mut to_copy: Vec<PathBuf> = Vec::with_capacity(paths.len());
+                let mut recursive_skipped = 0usize;
+                for p in paths {
+                    if p.is_dir() && crate::file_drag::dir_copy_would_recurse(&p, &dest_for_worker)
+                    {
+                        recursive_skipped += 1;
+                    } else {
+                        to_copy.push(p);
+                    }
+                }
+                if to_copy.is_empty() {
+                    crate::logger::log(format!(
+                        "file_drop: all {recursive_skipped} paths excluded (self-recurse); nothing to copy"
+                    ));
+                    // **Codex P2-2 対応**: 全件除外で実コピーが走らなかった旨を
+                    // notice 経由で UI へ伝える。旧実装は `CopyOutcome::default()`
+                    // (failed=0) で送って poll が何も表示しなかったため、ユーザーは
+                    // 「コピーしています…」トーストの後に拒否理由を見られなかった。
+                    let notice = format!(
+                        "ドロップ先と重なる {recursive_skipped} 件を除外した結果、コピー対象が 0 件になりました"
+                    );
+                    let _ = tx.send(crate::ui_dialogs::context_menu::CopyOutcome {
+                        attempted: 0,
+                        failed: 0,
+                        first_errors: Vec::new(),
+                        notice: Some(notice),
+                    });
+                    return;
+                }
+                if recursive_skipped > 0 {
+                    crate::logger::log(format!(
+                        "file_drop: {recursive_skipped} self-recursing dirs excluded; copying {} entries",
+                        to_copy.len()
+                    ));
+                }
+                let to_copy_attempted = to_copy.len();
+                let copy_rx = crate::ui_dialogs::context_menu::copy_paths_into_folder(
+                    to_copy,
+                    &dest_for_worker,
+                );
+                // copy_paths_into_folder 内 worker から CopyOutcome を受け取って UI へ転送。
+                // **Codex P2-1 対応**: Disconnected (= 内側 worker が outcome を送らずに
+                // 死んだ) を `CopyOutcome::default()` (= failed=0 の成功扱い) に潰さず、
+                // 全件失敗として伝える。実コピーが起きていない可能性が高い局面でも
+                // 「成功 N / 失敗 0」と表示されていた旧バグの修正。
+                let outcome = match copy_rx.recv() {
+                    Ok(o) => o,
+                    Err(e) => crate::ui_dialogs::context_menu::CopyOutcome::all_failed(
+                        to_copy_attempted,
+                        format!("copy worker disconnected without sending outcome: {e}"),
+                    ),
+                };
+                let _ = tx.send(outcome);
+            });
+        if let Err(e) = spawn_result {
+            crate::logger::log(format!("file_drop: failed to spawn validate worker: {e}"));
+            self.show_feedback_toast("コピー処理の起動に失敗しました".to_string());
             return;
         }
-        let n = to_copy.len();
-        let rx = crate::ui_dialogs::context_menu::copy_paths_into_folder(to_copy, &dest);
-        self.paste_pending.push(rx);
-        let msg = if recursive_skipped > 0 {
-            format!(
-                "{n} 件のファイルをコピーしています… ({recursive_skipped} 件はドロップ先と重なるため除外)"
-            )
-        } else {
-            format!("{n} 件のファイルをコピーしています…")
-        };
-        self.show_feedback_toast(msg);
+        self.drop_copy_pending.push(rx);
+        self.show_feedback_toast(format!("{n_total} 件のファイルをコピーしています…"));
     }
 
     /// PowerShell ペースト worker の完了を拾い、完了ごとに `pending_reload` を立てる。
     /// worker はデタッチ実行なので受信チャネル Disconnected == 完了とみなす (send か drop いずれも).
     pub(crate) fn poll_paste_pending(&mut self) {
-        if self.paste_pending.is_empty() {
-            return;
+        if !self.paste_pending.is_empty() {
+            let before = self.paste_pending.len();
+            self.paste_pending.retain(|rx| match rx.try_recv() {
+                Ok(()) => false,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+                Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            });
+            if self.paste_pending.len() < before {
+                self.pending_reload = true;
+            }
         }
-        let before = self.paste_pending.len();
-        self.paste_pending.retain(|rx| match rx.try_recv() {
-            Ok(()) => false,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
-            Err(std::sync::mpsc::TryRecvError::Empty) => true,
-        });
-        if self.paste_pending.len() < before {
-            self.pending_reload = true;
+        // **review #15 対応**: 外部 D&D の copy worker は `CopyOutcome` を返す。
+        // 失敗があればトーストでユーザーに通知する。
+        if !self.drop_copy_pending.is_empty() {
+            let mut completed: Vec<crate::ui_dialogs::context_menu::CopyOutcome> = Vec::new();
+            self.drop_copy_pending.retain(|rx| match rx.try_recv() {
+                Ok(outcome) => {
+                    completed.push(outcome);
+                    false
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+                Err(std::sync::mpsc::TryRecvError::Empty) => true,
+            });
+            for outcome in completed {
+                self.pending_reload = true;
+                if outcome.failed > 0 {
+                    let attempted = outcome.attempted;
+                    let failed = outcome.failed;
+                    let succeeded = attempted.saturating_sub(failed);
+                    crate::logger::log(format!(
+                        "file_drop: copy outcome attempted={attempted} succeeded={succeeded} failed={failed}"
+                    ));
+                    for err in &outcome.first_errors {
+                        crate::logger::log(format!("file_drop: copy error: {err}"));
+                    }
+                    let summary = outcome.first_errors.first().cloned().unwrap_or_default();
+                    let toast = if summary.is_empty() {
+                        format!("ファイルコピー: 成功 {succeeded} / 失敗 {failed} (詳細はログ参照)")
+                    } else {
+                        format!("ファイルコピー: 成功 {succeeded} / 失敗 {failed} — 例: {summary}")
+                    };
+                    self.show_feedback_toast(toast);
+                } else if let Some(notice) = outcome.notice {
+                    // **Codex P2-2 対応**: 失敗ではないが通知が必要なケース
+                    // (= 全件除外で実コピー未実行 等)。
+                    crate::logger::log(format!("file_drop: notice: {notice}"));
+                    self.show_feedback_toast(notice);
+                }
+            }
         }
     }
 
@@ -17948,6 +18066,9 @@ impl eframe::App for App {
         // Ctrl+G (docs §10.4): debounce 後に spawn、streaming 受信 → items 更新
         self.poll_global_search_debounce();
         self.poll_global_search_events(ctx);
+        // review #9 対応: ensure_container_mtime_populated が worker thread に
+        // 投げた mtime 取得結果を drain する。完了で rebuild が走る。
+        self.poll_container_mtime_pending(ctx);
         // 非同期 pending が走っている間は次フレームも poll させる (egui アイドル寝防止)。
         // tag_prewarm_pending は常駐 handle になったので `is_some()` ではなく
         // 実ジョブ残数 (is_busy) を見る。アイドル時の無限 repaint を避けるため。
