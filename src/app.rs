@@ -18189,8 +18189,17 @@ impl eframe::App for App {
                         target
                     }
                 }
+            } else if let Some(p) = open_folder_nav {
+                Some(p)
+            } else if let Some(action) = context_nav {
+                // context_nav が実際に勝ったときだけ副作用 (検索終了 + 履歴 push +
+                // suppress フラグ) を適用する。show_context_menu 内で副作用を起こすと
+                // 別 nav 源が同フレームで勝ったときに順序が脆くなる (Codex P3)。
+                let path = action.into_path();
+                self.apply_jump_from_search_to(&path);
+                Some(path)
             } else {
-                open_folder_nav.or(context_nav).or(grid_nav)
+                grid_nav
             };
             if let Some(p) = navigate {
                 let favsearch_rollback = if self.favsearch.active {

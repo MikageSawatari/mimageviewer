@@ -1,14 +1,35 @@
 //! サムネイルグリッドの右クリックコンテキストメニュー。
 
 use eframe::egui;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use crate::grid_item::GridItem;
 
+/// `show_context_menu` の戻り値。単なる `Option<PathBuf>` ではなくアクション種別を
+/// 表現することで、検索終了などの副作用を呼び出し側 (= 優先度判定後) で発火できる。
+/// これにより別 nav 源 (キーボード等) が同じフレームで勝った場合に context_nav の副作用
+/// だけが先に走るという順序の脆さを避ける (Codex P3)。
+#[derive(Debug)]
+pub(crate) enum ContextMenuAction {
+    /// 検索結果 (Ctrl+G / Ctrl+S) から実フォルダへ着地。検索を明示終了し、検索前フォルダを
+    /// 履歴に積んで `suppress_folder_nav_record_once` を立てる遷移。実適用は
+    /// `apply_jump_from_search_to`。
+    JumpFromSearch(PathBuf),
+}
+
+impl ContextMenuAction {
+    /// アクションのナビゲーション先パスを取り出す。
+    pub(crate) fn into_path(self) -> PathBuf {
+        match self {
+            ContextMenuAction::JumpFromSearch(p) => p,
+        }
+    }
+}
+
 impl crate::app::App {
     /// コンテキストメニューを表示する。
-    pub(crate) fn show_context_menu(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
+    pub(crate) fn show_context_menu(&mut self, ctx: &egui::Context) -> Option<ContextMenuAction> {
         let idx = match self.context_menu_idx {
             Some(i) => i,
             None => return None,
@@ -37,9 +58,7 @@ impl crate::app::App {
 
         let has_checked = !self.checked.is_empty();
         let checked_count = self.checked.len();
-        let mut nav: Option<PathBuf> = None;
-        // 「フォルダに移動」で検索 (Ctrl+G / Ctrl+S) を抜けて nav するフラグ。
-        let mut nav_exits_search = false;
+        let mut nav: Option<ContextMenuAction> = None;
         // 検索結果ビュー中だけ「フォルダに移動」を出す。
         let in_search = self.global_search.active || self.favsearch.active;
         let mut close = false;
@@ -168,8 +187,8 @@ impl crate::app::App {
                                 close = true;
                             }
                             if in_search && ui.button("フォルダに移動").clicked() {
-                                nav = parent_folder_for_nav(p);
-                                nav_exits_search = nav.is_some();
+                                nav =
+                                    parent_folder_for_nav(p).map(ContextMenuAction::JumpFromSearch);
                                 close = true;
                             }
                             // ── アプリケーションで開く ──
@@ -216,8 +235,7 @@ impl crate::app::App {
                                 && !is_folder_context
                                 && ui.button("フォルダに移動").clicked()
                             {
-                                nav = Some(native_nav_path(p));
-                                nav_exits_search = true;
+                                nav = Some(ContextMenuAction::JumpFromSearch(native_nav_path(p)));
                                 close = true;
                             }
                             ui.separator();
@@ -256,8 +274,8 @@ impl crate::app::App {
                                 close = true;
                             }
                             if in_search && ui.button("フォルダに移動").clicked() {
-                                nav = parent_folder_for_nav(p);
-                                nav_exits_search = nav.is_some();
+                                nav =
+                                    parent_folder_for_nav(p).map(ContextMenuAction::JumpFromSearch);
                                 close = true;
                             }
                             // ── アプリケーションで開く (ZipFile/PdfFile) ──
@@ -307,8 +325,8 @@ impl crate::app::App {
                                 close = true;
                             }
                             if in_search && ui.button("フォルダに移動").clicked() {
-                                nav = Some(native_nav_path(path));
-                                nav_exits_search = true;
+                                nav =
+                                    Some(ContextMenuAction::JumpFromSearch(native_nav_path(path)));
                                 close = true;
                             }
                         }
@@ -352,8 +370,8 @@ impl crate::app::App {
                                 close = true;
                             }
                             if in_search && ui.button("フォルダに移動").clicked() {
-                                nav = parent_folder_for_nav(path);
-                                nav_exits_search = nav.is_some();
+                                nav = parent_folder_for_nav(path)
+                                    .map(ContextMenuAction::JumpFromSearch);
                                 close = true;
                             }
                             ui.separator();
@@ -400,43 +418,48 @@ impl crate::app::App {
             self.cached_handlers = None;
         }
 
-        // 「フォルダに移動」: 検索結果から実フォルダへ飛ぶ操作なので、検索 (Ctrl+G /
-        // Ctrl+S) を抜けてから nav する。saved_folder の復帰で旧フォルダへ無駄な
-        // ロードが走らないよう、先に saved_folder を捨てる (toolbar_fav_nav と同じ手順)。
-        if nav_exits_search {
-            // 検索を抜ける前に、検索開始時の実フォルダ C を捕捉する。検索中は
-            // current_folder がドリルイン先や合成パスを指しうるので、確実に検索前の
-            // 実フォルダを保持している saved_folder から取る。
-            let pre_search_folder = if self.global_search.active {
-                self.global_search.saved_folder.clone()
-            } else if self.favsearch.active {
-                self.favsearch.saved_folder.clone()
-            } else {
-                None
-            };
-            if self.global_search.active {
-                self.global_search.saved_folder = None;
-                self.close_global_search();
-            }
-            if self.favsearch.active {
-                self.favsearch.saved_folder = None;
-                self.close_favsearch();
-            }
-            // 「フォルダに移動」は検索を明示終了して実フォルダへ着地する正当な
-            // ナビゲーションなので「検索前フォルダ C → 移動先 X」を履歴に残す。
-            // X で ← を押すと検索前の C に戻れる。C == X のときは無意味なので積まない。
-            if let (Some(c), Some(x)) = (pre_search_folder, nav.as_ref()) {
-                if !crate::folder_tree::path_eq(&c, x) {
-                    self.push_nav_history_entry(c);
-                }
-            }
-            // 直後に呼び出し元が行う load_folder(X) では back_stack への二重 push を
-            // 避ける (移動元 C は上で明示的に積み済み。X の recent 追加は
-            // record_folder_nav_transition 側で行われる)。
-            self.suppress_folder_nav_record_once = true;
-        }
-
         nav
+    }
+
+    /// `ContextMenuAction::JumpFromSearch` の副作用を適用する。検索終了 (Ctrl+G /
+    /// Ctrl+S) と、検索前フォルダを back stack に積んだうえで履歴の二重 push を抑止する。
+    ///
+    /// **呼び出しは context_nav が優先度判定で実際に勝ったあとに限る** (Codex P3): 副作用を
+    /// show_context_menu 内で発火すると、同フレームに別 nav 源 (キーボード等) が勝った
+    /// ときに、別ナビが意図せず検索終了済み・suppress 立て済みの状態を引き継いでしまう。
+    pub(crate) fn apply_jump_from_search_to(&mut self, target: &Path) {
+        // 検索を抜ける前に、検索開始時の実フォルダ C を捕捉する。検索中は
+        // current_folder がドリルイン先や合成パスを指しうるので、確実に検索前の
+        // 実フォルダを保持している saved_folder から取る。
+        let pre_search_folder = if self.global_search.active {
+            self.global_search.saved_folder.clone()
+        } else if self.favsearch.active {
+            self.favsearch.saved_folder.clone()
+        } else {
+            None
+        };
+        // saved_folder の復帰で旧フォルダへ無駄なロードが走らないよう、先に
+        // saved_folder を捨てる (toolbar_fav_nav と同じ手順)。
+        if self.global_search.active {
+            self.global_search.saved_folder = None;
+            self.close_global_search();
+        }
+        if self.favsearch.active {
+            self.favsearch.saved_folder = None;
+            self.close_favsearch();
+        }
+        // 「フォルダに移動」は検索を明示終了して実フォルダへ着地する正当な
+        // ナビゲーションなので「検索前フォルダ C → 移動先 X」を履歴に残す。
+        // X で ← を押すと検索前の C に戻れる。C == X のときは無意味なので積まない。
+        if let Some(c) = pre_search_folder {
+            if !crate::folder_tree::path_eq(&c, target) {
+                self.push_nav_history_entry(c);
+            }
+        }
+        // 直後に呼び出し元が行う load_folder(X) では back_stack への二重 push を
+        // 避ける (移動元 C は上で明示的に積み済み。X の recent 追加は
+        // record_folder_nav_transition 側で行われる)。
+        self.suppress_folder_nav_record_once = true;
     }
 
     /// フルスクリーン表示中のコンテキストメニューを表示する。
