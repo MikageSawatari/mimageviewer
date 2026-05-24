@@ -420,6 +420,11 @@ struct NativeEguiOverlay {
     jump_entries: Vec<NativeOverlayJumpEntry>,
     bookmark_title_edit: Option<NativeBookmarkTitleEdit>,
     bulk_bookmark_dialog: Option<NativeBulkBookmarkDialog>,
+    /// IME (日本語等の入力メソッド) 変換中フラグ。Preedit(非空) で true、
+    /// Commit / Disabled / Preedit("") で false。Ctrl+V/C/X 等のショートカットを
+    /// **composition 中のみ** 抑止するために参照する (commit 直後はすぐ通す方が
+    /// UX 上自然、Codex P3 2026-05-24)。
+    ime_composing: bool,
     video_metadata: Option<NativeOverlayMetadata>,
     navigation_preview: Option<NativeOverlayNavigationPreview>,
     navigation_preview_texture: Option<(u64, egui::TextureHandle)>,
@@ -484,8 +489,11 @@ struct NativeBookmarkTitleEdit {
 pub(super) struct NativeBulkBookmarkDialog {
     pub(super) textarea: String,
     pub(super) request_focus: bool,
-    /// 直近のパース結果プレビュー (件数 + エラー行)。
     pub(super) confirm_clear_all: bool,
+    /// Ctrl+V で読み出したテキストの first-paste 救済 (Codex C8)。`Some` のとき、
+    /// 次の draw で textarea のカーソル位置に挿入する (Event::Paste が focus を
+    /// 持たない TextEdit に届いて捨てられる race を回避)。挿入後 `None` に戻す。
+    pub(super) pending_paste: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -839,6 +847,12 @@ pub struct NativeOverlayInputRouting {
     /// `wants_pointer_input()` が false になり、これが無いと Ctrl+ホイールでの列数変更が
     /// 2 ステップ進んでしまう。
     pub consumed_wheel: bool,
+    /// テキスト入力中央モーダル (一括ブックマーク登録 / 名称編集) が表示中。
+    /// `true` の間、wheel / button / keyboard の raw event を App へ転送しない
+    /// (= dark backdrop 上のクリック・ホイールが video 移動 / 右クリック close fullscreen
+    ///   / B キーで個別ブックマーク追加などを誘発するのを防ぐ)。
+    /// Codex レビュー C1/C2/C3 反映、2026-05-24。
+    pub modal_dialog_active: bool,
 }
 
 pub struct NativeOverlayInputOutcome {
@@ -1148,6 +1162,10 @@ impl NativeOverlayInputRouting {
             NativeEvent::KeyDown(key) | NativeEvent::KeyUp(key) => {
                 if !self.text_input_active && native_video_fullscreen_shortcut_key(key) {
                     true
+                } else if self.modal_dialog_active {
+                    // モーダル中はショートカット以外のキーも App へ流さない
+                    // (B キーでブックマーク追加、X/C で comparison no-op 等の暴発防止)。
+                    false
                 } else {
                     !self.wants_keyboard_input
                 }
@@ -1155,9 +1173,15 @@ impl NativeOverlayInputRouting {
             NativeEvent::Text(_) | NativeEvent::Ime(_) => !self.wants_keyboard_input,
             // overlay が wheel を WheelNavigate / TileColumnsDelta に変換済みなら、
             // 同じ raw wheel を App へ二重転送しない。
-            NativeEvent::MouseWheel(_) => !self.wants_pointer_input && !self.consumed_wheel,
+            // モーダル中はカーソルがダイアログ外の dark backdrop にあっても wheel を
+            // App へ流さない (= 動画切替誘発防止、Codex P3 C1)。
+            NativeEvent::MouseWheel(_) => {
+                !self.wants_pointer_input && !self.consumed_wheel && !self.modal_dialog_active
+            }
+            // モーダル中はクリックも App へ流さない (= 右クリックで fullscreen 終了して
+            // 入力中テキストが消える事故防止、Codex P2 C3)。
             NativeEvent::MouseMove(_) | NativeEvent::MouseButton(_) | NativeEvent::MouseLeave => {
-                !self.wants_pointer_input
+                !self.wants_pointer_input && !self.modal_dialog_active
             }
             // 内部処理イベント (presenter thread が直接消費する)。UI 転送しない。
             NativeEvent::GeometryChanged { .. }
@@ -3620,6 +3644,7 @@ impl NativeEguiOverlay {
             jump_entries: Vec::new(),
             bookmark_title_edit: None,
             bulk_bookmark_dialog: None,
+            ime_composing: false,
             video_metadata: None,
             navigation_preview: None,
             navigation_preview_texture: None,
@@ -3719,44 +3744,63 @@ impl NativeEguiOverlay {
                 // egui の TextEdit は Event::Paste / Copy / Cut だけ拾い、Ctrl 修飾の
                 // raw Key event では発火しない (egui 0.33 の仕様)。Ctrl+A/Z/Y は Key
                 // event のままで egui 側が処理する。
-                // egui-winit と挙動を揃え、Copy/Cut/Paste を発行したら raw Key event は
-                // **積まずに return** する (Codex P2 2026-05-24)。さもないと TextEdit が
-                // 同フレームで Paste + Key{V, ctrl} を二重処理する余地が残る。
-                let mut clipboard_consumed = false;
-                if matches!(event, NativeEvent::KeyDown(_))
-                    && key.ctrl
+                //
+                // 処理規約 (Codex C5/C14/C15 反映 2026-05-24):
+                // - KeyDown / KeyUp の **両方** を suppress する。egui-winit と同様に
+                //   Ctrl+V の raw Key event を egui に流さない (Down だけ抑えて Up を流すと
+                //   release-without-press 状態になる)。
+                // - IME 変換中 (`ime_composing`) は intercept しない: 変換中に Ctrl+V を
+                //   押した場合 Windows IME がそのキーを処理する余地を残す。
+                //   commit 直後は通常通り Ctrl+V を取り込む (Codex P3)。
+                // - クリップボードが空 / 非テキスト形式でも intercept は **成立とみなす**
+                //   (= 'V' 文字を typing 扱いで挿入してしまうのを防ぐ)。
+                // IME 関連の判定は **composition 中のみ** (= `ime_composing` 直接参照) で
+                // 行う。`ime_input_active()` の 300ms grace は Enter/Escape (確定キー
+                // ハイジャック) 対策のもので、Ctrl+V/C/X に適用すると IME 確定直後の
+                // 素早いペーストが落ちる (Codex P3 2026-05-24: composition 中だけ抑止し、
+                // commit 後の通常ショートカットは通す)。
+                let is_clipboard_shortcut = key.ctrl
                     && !key.alt
                     && self.text_input_active()
-                {
-                    match key.virtual_key {
-                        0x56 => {
-                            // Ctrl+V: Windows の CF_UNICODETEXT は CRLF 改行なので、
-                            // egui-winit と同様に \r\n / 単独 \r を \n に正規化してから
-                            // Event::Paste に流す。さもないと TextEdit に \r が残り、
-                            // 表示・カーソル移動・行処理で妙な挙動が出る (Codex P2)。
-                            if let Some(text) = read_clipboard_text_windows() {
-                                let normalized = normalize_clipboard_newlines(&text);
-                                self.pending_events.push(egui::Event::Paste(normalized));
-                                self.dirty = true;
-                                clipboard_consumed = true;
+                    && !self.ime_composing
+                    && matches!(key.virtual_key, 0x43 | 0x56 | 0x58); // C/V/X
+                if is_clipboard_shortcut {
+                    if matches!(event, NativeEvent::KeyDown(_)) {
+                        match key.virtual_key {
+                            0x56 => {
+                                // Ctrl+V: Windows の CF_UNICODETEXT は CRLF 改行なので
+                                // \r\n / 単独 \r を \n に正規化する。クリップボード読み出しが
+                                // 失敗 (空 / 非テキスト) しても intercept は成立 (raw 'V' 入力防止)。
+                                if let Some(text) = read_clipboard_text_windows() {
+                                    let normalized = normalize_clipboard_newlines(&text);
+                                    if let Some(d) = self.bulk_bookmark_dialog.as_mut() {
+                                        // BulkBookmarkDialog: focus 状態に依存しない直接代入
+                                        // パスを使う (Codex C8 first-paste 取りこぼし防止)。
+                                        // textarea は「リストを一気に貼る」想定なので、
+                                        // カーソル位置挿入よりも末尾追記の方が UX が安定する。
+                                        d.pending_paste = Some(normalized);
+                                        d.request_focus = true;
+                                        self.dirty = true;
+                                    } else {
+                                        // 名称編集ダイアログ (singleline) は focus 取得が確実
+                                        // なので Event::Paste 経路のまま。
+                                        self.pending_events.push(egui::Event::Paste(normalized));
+                                        self.dirty = true;
+                                    }
+                                }
                             }
+                            0x43 => {
+                                self.pending_events.push(egui::Event::Copy);
+                                self.dirty = true;
+                            }
+                            0x58 => {
+                                self.pending_events.push(egui::Event::Cut);
+                                self.dirty = true;
+                            }
+                            _ => unreachable!(),
                         }
-                        0x43 => {
-                            // Ctrl+C
-                            self.pending_events.push(egui::Event::Copy);
-                            self.dirty = true;
-                            clipboard_consumed = true;
-                        }
-                        0x58 => {
-                            // Ctrl+X
-                            self.pending_events.push(egui::Event::Cut);
-                            self.dirty = true;
-                            clipboard_consumed = true;
-                        }
-                        _ => {}
                     }
-                }
-                if clipboard_consumed {
+                    // KeyDown / KeyUp 両方を return で抑止 (Codex C15)
                     return;
                 }
                 if let Some(egui_key) = egui_key_from_virtual_key(key.virtual_key) {
@@ -3776,6 +3820,17 @@ impl NativeEguiOverlay {
                 self.dirty = true;
             }
             NativeEvent::Ime(ime) => {
+                // IME composition state を追跡: Ctrl+V/C/X 等のクリップボードショートカットを
+                // **変換中だけ** 抑止するため (Codex P3: commit 直後の Ctrl+V を落とさない)。
+                match &ime {
+                    NativeVideoImeEvent::Enabled => {}
+                    NativeVideoImeEvent::Preedit(text) => {
+                        self.ime_composing = !text.is_empty();
+                    }
+                    NativeVideoImeEvent::Commit(_) | NativeVideoImeEvent::Disabled => {
+                        self.ime_composing = false;
+                    }
+                }
                 let ime = match ime {
                     NativeVideoImeEvent::Enabled => egui::ImeEvent::Enabled,
                     NativeVideoImeEvent::Preedit(text) => egui::ImeEvent::Preedit(text),
@@ -4508,6 +4563,10 @@ impl NativeEguiOverlay {
         });
         let mut routing = self.input_routing();
         routing.consumed_wheel = consumed_wheel;
+        // モーダル中央テキストダイアログの表示中は、App へ raw event を流さない
+        // (Codex C1/C2/C3: dark backdrop 上の wheel/right-click が暴発する事故防止)。
+        routing.modal_dialog_active =
+            self.bulk_bookmark_dialog.is_some() || self.bookmark_title_edit.is_some();
         Ok(NativeOverlayInputOutcome {
             routing,
             commands,
@@ -4855,15 +4914,17 @@ impl NativeEguiOverlay {
 
         // 一括ブックマーク登録ダイアログ: 大きめの中央モーダル。
         // **実描画した rect を最優先で使う**。ダイアログ高さは「確認削除モード」のあるなし /
-        // TextEdit の表示行数 / DPI でかなり変動し、固定見積もりだと下部ボタンが region に
-        // 入らず click / hover が抜ける (Codex P2 #1)。
-        // 初回フレーム (実描画前) のみ概算 fallback を使う。
+        // TextEdit の表示行数 / DPI でかなり変動するため、初回フレーム (実描画前) のみ
+        // shared な算出関数で fallback (Codex C6: 旧コードは fallback と実描画で式が
+        // 乖離して下部ボタンが SetWindowRgn 外に落ちていた)。
         if self.bulk_bookmark_dialog.is_some() {
             let rect = self
                 .last_drawn_bulk_bookmark_dialog_rect
                 .unwrap_or_else(|| {
-                    let dialog_w = 560.0_f32.min((width_points - 32.0).max(360.0));
-                    let dialog_h = 420.0_f32.min((height_points - 32.0).max(260.0));
+                    let (dialog_w, dialog_h) = self::overlay_draw::native_bulk_bookmark_dialog_size(
+                        width_points,
+                        height_points,
+                    );
                     egui::Rect::from_min_size(
                         egui::pos2(
                             (width_points - dialog_w) * 0.5,
@@ -5513,6 +5574,7 @@ impl NativeEguiOverlay {
                 // popup 自体の dismiss/操作は popup 側ロジックが担うので、
                 // 「popup 表示中は overlay 側の click hook を停止」が安全。
                 let popup_active = bookmark_title_edit_visible
+                    || bulk_bookmark_dialog_visible
                     || video_speed_popup_open
                     || hover_preview_target_secs.is_some();
                 if popup_active {

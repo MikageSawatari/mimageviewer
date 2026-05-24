@@ -70,24 +70,46 @@ fn strip_leading_decorations(s: &str) -> &str {
 
 /// 時刻トークン直後の残り文字列からタイトルを取り出す。
 ///
-/// - `](url) タイトル` 形式: `]`...次の空白までを skip した残り。
+/// 形式:
+/// - `](url) タイトル` (markdown link): URL 終端の `)` を見つけて、その後ろを title に。
+/// - `] タイトル` (bracket だけ、URL なし): `]` を 1 文字 skip して残りを title に。
 /// - 通常の空白区切り: trim だけ。
+///
+/// URL 終端の判定 (Codex P2/P3 2026-05-24):
+/// - markdown link 内の URL は仕様上 `(...)` をエスケープせず含めることがあるので、
+///   **括弧バランス** で判定する。`after_open` は最初の `(` の直後から始まるので、
+///   仮想的に depth=0 でスキャンし、`(` で +1 / `)` で -1。depth が -1 になった
+///   `)` が外側の link を閉じる箇所。
+/// - これで以下を全て正しく扱える:
+///   - `(https://e.com/foo(bar)) Title`        → URL=`...foo(bar)`, title=`Title`
+///   - `(https://e.com/?t=13) Track (Live)`    → URL=`...?t=13`, title=`Track (Live)`
+///   - `(https://e.com/?t=13)メインテーマ`     → URL=`...?t=13`, title=`メインテーマ`
+///     (Codex P3: `)` 直後にスペースなしで日本語タイトルが続く形に対応)
+///   - `(https://e.com/foo)`                    → URL=`...foo`, title=``
+/// - 閉じ括弧が見つからない (壊れたリンク) ときは rest をそのまま title 候補に使う。
 fn extract_title_from_rest(rest: &str) -> String {
     let trimmed = if let Some(stripped) = rest.strip_prefix(']') {
-        // markdown link: `](https://...) title` を想定。
-        // `)` の後ろまでを取り除く。`)` が無ければ rest 全部を skip して空タイトル扱い。
-        if let Some(paren_end) = stripped.find(')') {
-            &stripped[paren_end + 1..]
+        if let Some(after_open) = stripped.strip_prefix('(') {
+            if let Some(end_idx) = find_url_close_paren(after_open) {
+                &after_open[end_idx + 1..]
+            } else {
+                // 閉じ括弧がない (壊れたリンク): rest をそのまま使って復旧。
+                stripped
+            }
         } else {
-            ""
+            // `] Title` 形式 (URL なし): `]` だけ skip。
+            stripped
         }
     } else {
         rest
     };
     let mut t = trimmed.trim().to_string();
     // `- タイトル` のような余分なセパレータを行頭から落とす。
+    // `:` / `：` (全角コロン) を含めるかどうか: 全角コロンは日本語コンテンツの
+    // 内容マーカーであることが多い (例: 「：序章」) ので strip 対象から外し、
+    // ASCII `:` だけは table-of-contents の区切りで使われるので残す。
     while let Some(c) = t.chars().next() {
-        if matches!(c, '-' | '–' | '—' | '|' | '/' | ':' | '：') {
+        if matches!(c, '-' | '–' | '—' | '|' | '/' | ':') {
             let new_start = c.len_utf8();
             t = t[new_start..].trim_start().to_string();
         } else {
@@ -95,6 +117,40 @@ fn extract_title_from_rest(rest: &str) -> String {
         }
     }
     t
+}
+
+/// markdown link の URL 部分 (= 最初の `(` の直後から始まる文字列) を受け取り、
+/// **外側の `)` を閉じる箇所** の byte index を返す。
+///
+/// 括弧バランスで判定: depth=0 でスキャンし、`(` で +1 / `)` で -1。
+/// depth が -1 になった `)` の位置が「`](url)` の閉じカッコ」。
+///
+/// 例:
+/// - `https://e.com/foo)`: depth が `)` で -1 → 17 を返す
+/// - `https://e.com/foo(bar)) X`: `(` で +1, `)` で 0, `)` で -1 → 22 を返す
+/// - `https://e.com/?t=13)メインテーマ`: 初回 `)` で -1 → 19 を返す
+///
+/// URL 内に閉じすぎ (`)` が `(` より多い) になった瞬間、それを終端と認定する
+/// 設計なので、URL は仕様上 paren を balance させる前提となるが、現実の URL も
+/// (バランス済みの方が普通なので) この前提でほぼ問題ない。
+///
+/// 閉じ括弧が見つからない (壊れたリンク) なら None。
+fn find_url_close_paren(s: &str) -> Option<usize> {
+    let mut depth: i32 = 0;
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `H:M:S` / `M:S` 形式を秒に変換。失敗時 None。
@@ -186,6 +242,92 @@ mod tests {
             parse_chapter_line("[0:13](https://example.com/?t=13) メインテーマ").unwrap();
         assert!((pts - 13.0).abs() < 1e-9);
         assert_eq!(title, "メインテーマ");
+    }
+
+    #[test]
+    fn handles_bracket_only_time() {
+        // Codex C12: `[mm:ss] Title` (markdown link ではなく単純な bracket)
+        let (pts, title) = parse_chapter_line("[12:34] チャプター名").unwrap();
+        assert!((pts - 754.0).abs() < 1e-9);
+        assert_eq!(title, "チャプター名");
+    }
+
+    #[test]
+    fn handles_bracket_only_time_h_mm_ss() {
+        let (pts, title) = parse_chapter_line("[1:00:08] 魏々たる丹砂").unwrap();
+        assert!((pts - 3608.0).abs() < 1e-9);
+        assert_eq!(title, "魏々たる丹砂");
+    }
+
+    #[test]
+    fn handles_markdown_link_with_paren_in_url() {
+        // Codex C11: URL に括弧が含まれていても title が削れない。
+        let (pts, title) =
+            parse_chapter_line("[0:13](https://example.com/foo(bar)) メインテーマ").unwrap();
+        assert!((pts - 13.0).abs() < 1e-9);
+        assert_eq!(title, "メインテーマ");
+    }
+
+    #[test]
+    fn handles_markdown_link_with_query_paren() {
+        let (pts, title) =
+            parse_chapter_line("[2:13](https://example.com/?t=133&s=(a)b) Track").unwrap();
+        assert!((pts - 133.0).abs() < 1e-9);
+        assert_eq!(title, "Track");
+    }
+
+    #[test]
+    fn preserves_parens_in_title_text() {
+        // Codex P2 2026-05-24: URL の `)` とタイトルの `)` を区別するため
+        // 「空白前の `)`」を URL 終端と判定する。タイトル末尾の (Live) が壊れない。
+        let (pts, title) =
+            parse_chapter_line("[0:13](https://example.com/?t=13) Track (Live)").unwrap();
+        assert!((pts - 13.0).abs() < 1e-9);
+        assert_eq!(title, "Track (Live)");
+    }
+
+    #[test]
+    fn preserves_parens_in_title_with_url_paren() {
+        // URL とタイトル両方に括弧があるケース
+        let (pts, title) =
+            parse_chapter_line("[5:00](https://example.com/path(v2)) Acoustic (Live Mix)").unwrap();
+        assert!((pts - 300.0).abs() < 1e-9);
+        assert_eq!(title, "Acoustic (Live Mix)");
+    }
+
+    #[test]
+    fn markdown_link_no_title_no_trailing_space() {
+        // URL の `)` の直後に文字列末尾が来る場合 (タイトル無し)
+        let (pts, title) = parse_chapter_line("[0:13](https://example.com/foo)").unwrap();
+        assert!((pts - 13.0).abs() < 1e-9);
+        assert_eq!(title, "");
+    }
+
+    #[test]
+    fn markdown_link_immediately_followed_by_japanese_title() {
+        // Codex P3 2026-05-24: `)` 直後にスペースなしで日本語タイトルが続く形 (実例として
+        // 日本語コメント由来でよく見る)。「) 直後が空白」判定だと壊れる。
+        let (pts, title) =
+            parse_chapter_line("[0:13](https://example.com/?t=13)メインテーマ").unwrap();
+        assert!((pts - 13.0).abs() < 1e-9);
+        assert_eq!(title, "メインテーマ");
+    }
+
+    #[test]
+    fn markdown_link_japanese_title_with_url_inner_paren() {
+        // URL 内括弧 + 直後に日本語タイトル
+        let (pts, title) =
+            parse_chapter_line("[12:34](https://example.com/foo(bar))チャプター").unwrap();
+        assert!((pts - 754.0).abs() < 1e-9);
+        assert_eq!(title, "チャプター");
+    }
+
+    #[test]
+    fn preserves_fullwidth_colon_in_title() {
+        // Codex C12 / レビューでの懸念: 全角コロンは内容マーカーとして残す。
+        let (pts, title) = parse_chapter_line("0:00 ：序章「目覚め」").unwrap();
+        assert!((pts - 0.0).abs() < 1e-9);
+        assert_eq!(title, "：序章「目覚め」");
     }
 
     #[test]

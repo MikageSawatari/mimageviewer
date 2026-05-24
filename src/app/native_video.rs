@@ -3979,7 +3979,7 @@ impl App {
             .collect();
         let (added, skipped_duplicates, errors) =
             match db.bulk_add_if_no_duplicate(&path, &entries_ref, 1.0) {
-                Ok(summary) => (summary.added, summary.skipped_duplicates, 0usize),
+                Ok(summary) => (summary.added, summary.skipped_duplicates, summary.errors),
                 Err(e) => {
                     crate::logger::log(format!("video bookmark bulk add failed: {e}"));
                     (0, 0, prepared.len())

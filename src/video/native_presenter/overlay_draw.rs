@@ -430,13 +430,15 @@ pub(super) fn draw_native_jump_panel(
                 7.5,
                 egui::Color32::from_rgb(255, 220, 82),
             );
-            let bulk_resp = bulk_resp
-                .hover_tip_dark("ブックマークを一括登録 (YouTube チャプター形式の貼り付け)");
+            let bulk_resp = bulk_resp.hover_tip_dark(
+                "ブックマークを一括登録 (動画コメント等のチャプター形式の貼り付け)",
+            );
             if bulk_resp.clicked() && bulk_bookmark_dialog.is_none() {
                 *bulk_bookmark_dialog = Some(NativeBulkBookmarkDialog {
                     textarea: String::new(),
                     request_focus: true,
                     confirm_clear_all: false,
+                    pending_paste: None,
                 });
             }
 
@@ -801,6 +803,35 @@ pub(super) fn draw_native_bookmark_title_editor(
     Some(area_response.response.rect)
 }
 
+/// 一括ブックマーク登録ダイアログの (width, height) を overlay サイズから算出する。
+///
+/// 計算ルール (Codex C6/C10):
+/// - **width**: 560pt 目安 / 上限 = overlay_w - 32 / 下限 = 360 (overlay が狭くてもこの幅)
+///   ただし overlay_w 自体が下限 360 未満なら overlay_w 全体を使う。
+/// - **height**: overlay_h - 64pt 目安 / 上限 720 / 下限 360。
+///   ただし overlay_h が 360 未満の場合 overlay_h - 16 で off-screen 防止。
+///
+/// 実描画と HUD region 計算 (compute_hud_regions) の両方からこの関数を呼び、両者が
+/// 食い違って下部ボタンが SetWindowRgn 外に落ちる事故を防ぐ。
+pub(super) fn native_bulk_bookmark_dialog_size(
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+) -> (f32, f32) {
+    let max_w = (overlay_width_points - 32.0).max(0.0);
+    let dialog_w = if overlay_width_points <= 360.0 {
+        overlay_width_points
+    } else {
+        560.0_f32.min(max_w).max(360.0)
+    };
+    let dialog_h = if overlay_height_points < 360.0 {
+        // 小画面: off-screen 防止。overlay_h - 16 で上下 8pt のマージンを残す。
+        (overlay_height_points - 16.0).max(120.0)
+    } else {
+        ((overlay_height_points - 64.0).min(720.0)).max(360.0)
+    };
+    (dialog_w, dialog_h)
+}
+
 /// 一括ブックマーク登録ダイアログ。中央モーダル。
 /// 戻り値は実描画 rect (region 計算用)。`None` ならダイアログ非表示。
 ///
@@ -819,10 +850,16 @@ pub(super) fn draw_native_bulk_bookmark_dialog(
     let Some(state) = dialog.as_mut() else {
         return None;
     };
-    let dialog_w = 560.0_f32.min((overlay_width_points - 32.0).max(360.0));
-    // 画面高の 80% (= 上限 720pt) でクランプ。最小 360pt は確保し、
-    // 小画面でも footer ボタンが画面内に収まる範囲で文字入力できる高さにする。
-    let dialog_h = ((overlay_height_points - 64.0).min(720.0)).max(360.0);
+    // Ctrl+V で押されたテキストを focus 状態に依存せず textarea へ取り込む (Codex C8)。
+    // 末尾追記方式: 連続貼り付け時は改行で区切る。
+    if let Some(text) = state.pending_paste.take() {
+        if !state.textarea.is_empty() && !state.textarea.ends_with('\n') {
+            state.textarea.push('\n');
+        }
+        state.textarea.push_str(&text);
+    }
+    let (dialog_w, dialog_h) =
+        native_bulk_bookmark_dialog_size(overlay_width_points, overlay_height_points);
     let pos = egui::pos2(
         (overlay_width_points - dialog_w) * 0.5,
         (overlay_height_points - dialog_h) * 0.5,
@@ -888,7 +925,9 @@ pub(super) fn draw_native_bulk_bookmark_dialog(
                         .max_height(textarea_max_h)
                         .auto_shrink([false, true])
                         .show(ui, |ui| {
-                            let inner_w = (dialog_w - 28.0).max(120.0);
+                            // スクロールバー (~16pt) の上に textarea 右端が乗らないよう
+                            // 18pt を予約してから desired_width を決める (Codex C13)。
+                            let inner_w = (dialog_w - 28.0 - 18.0).max(120.0);
                             let response = ui.add(
                                 egui::TextEdit::multiline(&mut state.textarea)
                                     .desired_width(inner_w)
@@ -901,18 +940,21 @@ pub(super) fn draw_native_bulk_bookmark_dialog(
                                 response.request_focus();
                                 state.request_focus = false;
                             }
-                            // ダイアログ表示中はテキスト入力以外でフォーカスを取る対象が
-                            // 事実上無い (ボタンが少しある程度)。focus が外れたら自動で
-                            // textarea に戻す: ユーザーが偶然 ScrollArea 余白等をクリックして
-                            // フォーカスを失った後でも Ctrl+V が機能するようにする。
-                            // ただし「フォーカス目的のフォーカス」を毎フレーム push すると
-                            // 別ボタンに focus がある時に取り合いになるので、focus が
-                            // どこにも無い場合だけ救済する。
-                            let any_focus = ui
-                                .ctx()
-                                .memory(|m| m.focused().is_some());
-                            if !any_focus {
-                                response.request_focus();
+                            // ダイアログ表示中の focus 自動救済。
+                            // Codex C7 反映: 確認削除モード (confirm_clear_all=true) のときは
+                            // 救済を **抑止** する: 「削除を実行」/「やめる」ボタンに focus を
+                            // 渡したいので、Tab / Enter / マウスクリックで一時的に focus が
+                            // 離れても textarea へ戻さない。
+                            // Codex C8 反映: Ctrl+V の first-paste race は `pending_paste` の
+                            // direct-write 経路 (push_native_event 側) で吸収済みなので、
+                            // ここでの focus 救済は「Enter キー / Tab 後の textarea 入力継続」
+                            // 程度の役割。
+                            if !state.confirm_clear_all {
+                                let any_focus =
+                                    ui.ctx().memory(|m| m.focused().is_some());
+                                if !any_focus {
+                                    response.request_focus();
+                                }
                             }
                         });
 
@@ -993,9 +1035,11 @@ pub(super) fn draw_native_bulk_bookmark_dialog(
     }
     if confirm_clear_now {
         commands.push(NativeOverlayCommand::ClearAllBookmarksForCurrent);
-        state.confirm_clear_all = false;
-    }
-    if register {
+        // ダイアログを閉じる (Codex C9): textarea にまだ貼り付けた行が残っていると、
+        // 直後の誤クリック「登録」で削除した分を再登録してしまうため、削除確定時は
+        // 状態ごと破棄して dialog を閉じる。再度開けば textarea も初期化される。
+        *dialog = None;
+    } else if register {
         let entry_tuples: Vec<(f64, String)> =
             entries.into_iter().map(|e| (e.pts_secs, e.title)).collect();
         commands.push(NativeOverlayCommand::BulkAddBookmarks {

@@ -47,6 +47,9 @@ pub struct VideoBookmark {
 pub struct BulkAddSummary {
     pub added: usize,
     pub skipped_duplicates: usize,
+    /// 個別行で SELECT / INSERT が失敗した件数 (try-each-row 戦略)。
+    /// 全体 commit が失敗した場合は `Err` で返り、ここには現れない。
+    pub errors: usize,
 }
 
 /// シークバーマーカー / ジャンプパネル用の軽量メタデータ。
@@ -261,8 +264,9 @@ impl VideoBookmarkDb {
     ///
     /// - 各 entry を `dedup_tolerance_secs` (典型値 1.0) で重複判定 → 重複なら skip。
     /// - 同一バッチ内の重複も skip する (前の INSERT で追加された行が見える)。
-    /// - 個別行の INSERT が失敗しても他の行はコミットされる (try-each-row 戦略)。
-    /// - トランザクション全体の commit が失敗した場合は Err を返す (この時点で追加件数は 0)。
+    /// - **個別行の SELECT / INSERT が失敗しても他の行は進める** (try-each-row 戦略)。
+    ///   失敗した行は `summary.errors` で件数を返し、ログを残す。
+    /// - トランザクション全体の `prepare` / `commit` が失敗した場合のみ `Err` を返す。
     pub fn bulk_add_if_no_duplicate(
         &mut self,
         video_path: &Path,
@@ -277,6 +281,7 @@ impl VideoBookmarkDb {
         let tx = self.conn.transaction()?;
         let mut added = 0usize;
         let mut skipped = 0usize;
+        let mut errors = 0usize;
         {
             let mut check_stmt = tx.prepare(
                 "SELECT EXISTS(
@@ -293,26 +298,45 @@ impl VideoBookmarkDb {
             for (pts_secs, title) in entries {
                 let lo = *pts_secs - dedup_tolerance_secs;
                 let hi = *pts_secs + dedup_tolerance_secs;
-                let exists: bool = check_stmt
-                    .query_row(rusqlite::params![&key, lo, hi], |row| row.get::<_, bool>(0))?;
+                // try-each-row: 1 行ごとに Err を吸収し、ループを継続する。
+                let exists_result: Result<bool, rusqlite::Error> = check_stmt
+                    .query_row(rusqlite::params![&key, lo, hi], |row| row.get::<_, bool>(0));
+                let exists = match exists_result {
+                    Ok(b) => b,
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "video bookmark bulk: dedup SELECT failed for pts={pts_secs:.2}: {e}"
+                        ));
+                        errors += 1;
+                        continue;
+                    }
+                };
                 if exists {
                     skipped += 1;
                     continue;
                 }
                 let title_arg = normalize_bookmark_title(*title);
-                insert_stmt.execute(rusqlite::params![
+                match insert_stmt.execute(rusqlite::params![
                     &key,
                     *pts_secs,
                     title_arg.as_deref(),
                     now,
-                ])?;
-                added += 1;
+                ]) {
+                    Ok(_) => added += 1,
+                    Err(e) => {
+                        crate::logger::log(format!(
+                            "video bookmark bulk: INSERT failed for pts={pts_secs:.2}: {e}"
+                        ));
+                        errors += 1;
+                    }
+                }
             }
         }
         tx.commit()?;
         Ok(BulkAddSummary {
             added,
             skipped_duplicates: skipped,
+            errors,
         })
     }
 
@@ -539,6 +563,29 @@ mod tests {
             .unwrap();
         assert_eq!(summary.added, 0);
         assert_eq!(summary.skipped_duplicates, 0);
+        assert_eq!(summary.errors, 0);
+    }
+
+    #[test]
+    fn bulk_add_if_no_duplicate_continues_after_in_loop_dup() {
+        // try-each-row 戦略の動作確認: 重複と通常を交互に与えて、後続が
+        // commit されることを確認する (= 1 件の skip でロールバックしない)。
+        let mut db = open_in_memory();
+        let p = Path::new("C:/v.mp4");
+        db.add(p, 5.0, None, &[]).unwrap();
+        let entries = vec![
+            (5.0, Some("dup")),  // skipped
+            (10.0, Some("ok1")), // added
+            (5.5, Some("dup")),  // skipped (within tolerance)
+            (20.0, Some("ok2")), // added
+        ];
+        let summary = db.bulk_add_if_no_duplicate(p, &entries, 1.0).unwrap();
+        assert_eq!(summary.added, 2);
+        assert_eq!(summary.skipped_duplicates, 2);
+        assert_eq!(summary.errors, 0);
+        let list = db.list(p);
+        // existing (5.0) + ok1 (10.0) + ok2 (20.0)
+        assert_eq!(list.len(), 3);
     }
 
     #[test]
