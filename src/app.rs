@@ -6927,6 +6927,12 @@ impl App {
         // `Some(now)` で 100ms idle 待ちを生み出す (= 同 1 フレーム内の Ctrl+↑↓ 多段 nav にも効く)。
         // docs/prefetch-suppression-during-scroll-plan.md 1.3 参照。
         self.last_prefetch_scroll_at = Some(std::time::Instant::now());
+        // **Codex P3-2 (2026-05)**: suppression event の transition tracker も新フォルダで
+        // リセット。前フォルダ末で allow 状態のまま終わると、新フォルダ初回の Block 遷移が
+        // `start` ではなく次の continue tick まで遅れたり、逆も起きる。新コンテキストでは
+        // 「未観測」スタートにして初回 frame で確実に start を emit させる。
+        self.prev_prefetch_allowed = None;
+        self.last_prefetch_suppressed_emit_at = None;
 
         // perf: start_loading_items 全体 + 内訳 (sidecar_flush / close_fullscreen /
         // state_reset / prewarm_rating / adjustment_db / mask_db / catalog_open /
@@ -9890,24 +9896,27 @@ impl App {
         let mut deferred_pdf_prefetch = false;
         // スクロール中 / visible 待ち中は prefetch enqueue を抑制する gate (decision キャッシュ)。
         // visible 範囲の Pending/Evicted/Requested 数を数えて decide_prefetch_allowed に渡す。
+        // **Codex P3-1 (2026-05)**: visible_pending と decision_now は decision とは別に
+        // 保持して perf event の field に「実測値」を出す。decision branch から作ると、
+        // Backstop3s で visible が pending 残ったまま allow したケースを `visible_ready=true`
+        // と誤報告してしまう (= ログ読解で「visible 全部 ready なのに何で遅延?」と混乱)。
         // docs/prefetch-suppression-during-scroll-plan.md 参照。
-        let prefetch_decision: PrefetchDecision = {
-            let visible_pending = self.visible_indices
-                [vis_first..vis_first.saturating_add(items_per_page).min(vis_count)]
-                .iter()
-                .filter(|&&raw_idx| {
-                    !matches!(
-                        self.thumbnails.get(raw_idx),
-                        Some(ThumbnailState::Loaded { .. }) | Some(ThumbnailState::Failed)
-                    )
-                })
-                .count();
-            decide_prefetch_allowed(
-                std::time::Instant::now(),
-                self.last_prefetch_scroll_at,
-                visible_pending,
-            )
-        };
+        let decision_now = std::time::Instant::now();
+        let visible_pending_now: usize = self.visible_indices
+            [vis_first..vis_first.saturating_add(items_per_page).min(vis_count)]
+            .iter()
+            .filter(|&&raw_idx| {
+                !matches!(
+                    self.thumbnails.get(raw_idx),
+                    Some(ThumbnailState::Loaded { .. }) | Some(ThumbnailState::Failed)
+                )
+            })
+            .count();
+        let prefetch_decision: PrefetchDecision = decide_prefetch_allowed(
+            decision_now,
+            self.last_prefetch_scroll_at,
+            visible_pending_now,
+        );
         let prefetch_ok = matches!(prefetch_decision, PrefetchDecision::Allow { .. });
         let mut suppressed_regular: usize = 0;
         let mut suppressed_heavy: usize = 0;
@@ -10202,22 +10211,24 @@ impl App {
                 _ => None,
             };
             if let Some(trans) = transition {
-                let (scroll_idle, visible_ready, scroll_idle_ms_remaining, visible_pending) =
-                    match prefetch_decision {
-                        PrefetchDecision::Allow { .. } => (true, true, 0u64, 0usize),
-                        PrefetchDecision::Block {
-                            reason: BlockReason::ScrollNotIdle { elapsed_ms },
-                        } => {
-                            let remaining = PREFETCH_IDLE_THRESHOLD
-                                .as_millis()
-                                .saturating_sub(elapsed_ms as u128)
-                                as u64;
-                            (false, true, remaining, 0usize)
-                        }
-                        PrefetchDecision::Block {
-                            reason: BlockReason::VisibleStillLoading { pending },
-                        } => (true, false, 0u64, pending),
-                    };
+                // **Codex P3-1 (2026-05)**: decision branch から作るのをやめて、実状態
+                // (last_prefetch_scroll_at の elapsed + 実 visible_pending count) から
+                // 算出する。これで Backstop3s で「visible まだ pending だけど allow した」
+                // ケースも `visible_ready=false` / `visible_pending=N` と正直に出る。
+                let scroll_idle_elapsed_ms: u64 = self
+                    .last_prefetch_scroll_at
+                    .map(|t| decision_now.saturating_duration_since(t).as_millis() as u64)
+                    .unwrap_or(u64::MAX);
+                let scroll_idle =
+                    scroll_idle_elapsed_ms >= PREFETCH_IDLE_THRESHOLD.as_millis() as u64;
+                let scroll_idle_ms_remaining: u64 = if scroll_idle {
+                    0
+                } else {
+                    (PREFETCH_IDLE_THRESHOLD.as_millis() as u64)
+                        .saturating_sub(scroll_idle_elapsed_ms)
+                };
+                let visible_ready = visible_pending_now == 0;
+                let visible_pending = visible_pending_now;
                 let allow_reason: Option<&'static str> = match prefetch_decision {
                     PrefetchDecision::Allow {
                         reason: AllowReason::NoScrollYet,

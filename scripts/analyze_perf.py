@@ -1143,25 +1143,37 @@ def cmd_scroll(events: list[dict]) -> None:
         print(
             f"  pruned (existing queue):  regular={total_pruned_reg} heavy={total_pruned_heavy}"
         )
-        # 各 settle 直前の suppression event を関連付け
+        # 各 settle 時点の suppression 状態を関連付け
+        # Codex P3-3: end だけでなく start/continue も拾い、settle 時点で suppression が
+        # active かどうか (= 直前イベントが start/continue で end が来てない) を表示。
         print()
-        print(f"{'settle':>6}  {'t_rel':>8}  {'prev_supp':>10}  {'allow_reason':>30}")
-        print("-" * 70)
+        print(
+            f"{'settle':>6}  {'t_rel':>8}  {'sup@settle':>12}  {'last_event':>10}  "
+            f"{'visible_pending':>15}  {'allow_reason':>30}"
+        )
+        print("-" * 100)
+        # suppresses は時系列順に並んでいる前提 (perf logger は append-only)
         for seq in sorted(settles.keys()):
             s = settles[seq]
             s_t = s.get("t", 0.0)
-            # settle 直前 (= 過去 2 秒以内) の prefetch_suppressed end イベントを探す
-            related: list[dict] = [
-                ev
-                for ev in suppresses
-                if 0.0 < (s_t - ev.get("t", 0.0)) < 2.0
-                and ev.get("transition") == "end"
+            # settle 直前 (= 過去 2 秒以内) の prefetch_suppressed イベントを全種類拾う
+            prior = [
+                ev for ev in suppresses if 0.0 < (s_t - ev.get("t", 0.0)) < 2.0
             ]
-            if related:
-                last = related[-1]
-                ar = last.get("allow_reason", "?") or "?"
-                rel = s_t - t0
-                print(f"  {seq:>4}  {rel:6.2f}s  {'end':>10}  {ar:>30}")
+            if not prior:
+                continue
+            last = prior[-1]
+            last_trans = last.get("transition", "?") or "?"
+            # active at settle: 直前イベントが start/continue なら active、end なら inactive
+            sup_active = last_trans in ("start", "continue")
+            sup_label = "ACTIVE" if sup_active else "inactive"
+            vis_pending = last.get("visible_pending", "?")
+            ar = last.get("allow_reason") or "-"
+            rel = s_t - t0
+            print(
+                f"  {seq:>4}  {rel:6.2f}s  {sup_label:>12}  {last_trans:>10}  "
+                f"{vis_pending:>15}  {ar:>30}"
+            )
 
     # latency 分布
     first_latencies = [firsts[k].get("latency_ms", 0) for k in firsts]
