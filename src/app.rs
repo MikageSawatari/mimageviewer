@@ -2853,6 +2853,20 @@ pub struct App {
     pub(crate) prev_scroll_offset_y: f32,
     /// 最後にスクロール (offset 変化) を検出した時刻。`None` なら既に settle 済み or 未スクロール
     pub(crate) last_scroll_event_at: Option<std::time::Instant>,
+    /// prefetch suppression gate 用に最後のスクロール入力時刻を記録する。
+    /// `last_scroll_event_at` は `emit_scroll_settle_event` で `None` に clear されるため
+    /// backstop の計時起点に使えない (= settle 直後に再 enqueue を許可してしまう)。
+    /// 本フィールドは settle で clear されない (= 前回 scroll からの経過で 100ms / 3s を判定する)。
+    /// 入力タイミング: `App::update` 冒頭の `detect_scroll_input_intent` (= ctx.input ベース)
+    /// と `update_scroll_settle_state` の offset 変化 fallback の 2 経路。
+    /// docs/prefetch-suppression-during-scroll-plan.md 参照。
+    pub(crate) last_prefetch_scroll_at: Option<std::time::Instant>,
+    /// 前フレームの prefetch decision が Allow だったか (= transition 検出用)。
+    /// `prefetch_suppressed` perf event を「start / continue / end」遷移ごとに emit するため。
+    /// `None` なら未観測 (= 起動直後)。
+    pub(crate) prev_prefetch_allowed: Option<bool>,
+    /// 最後に `prefetch_suppressed` (continue) を emit した時刻。200ms tick 用。
+    pub(crate) last_prefetch_suppressed_emit_at: Option<std::time::Instant>,
     /// 現在の settle window state (settle 後 ready latency 計測用)。`None` ならスクロール中 or 未 settle
     pub(crate) scroll_settle_state: Option<ScrollSettleState>,
     /// scroll_settle イベントの連番 (= first_ready/all_ready と紐付け)
@@ -3117,6 +3131,95 @@ impl Default for App {
     fn default() -> Self {
         Self::new_from_settings(crate::settings::Settings::load())
     }
+}
+
+// ── prefetch suppression during scroll (docs/prefetch-suppression-during-scroll-plan.md) ──
+//
+// スクロール中 / visible 待ち中はサムネ prefetch (= 非可視範囲) の enqueue を抑制し、
+// PDFium pool に prefetch が流れて in-flight を埋めてしまうのを防ぐ。
+//
+// 純関数として切り出して unit test 可能にする。実 caller は
+// `App::prefetch_allowed_now` (App field を捌いて引数を作る薄い wrapper)。
+
+/// スクロール停止 (= 最後の scroll input から) 経過時間がこの閾値以上なら "idle" 扱い。
+pub(crate) const PREFETCH_IDLE_THRESHOLD: std::time::Duration =
+    std::time::Duration::from_millis(100);
+
+/// visible が永久 Pending のまま prefetch が永久停止しないよう、絶対 timeout。
+/// この時間 scroll なしが経過したら visible_pending によらず prefetch を allow する。
+pub(crate) const PREFETCH_BACKSTOP: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AllowReason {
+    /// `last_prefetch_scroll_at == None` (= 起動直後 / フォルダ切替時の sentinel `Some(now)` でなく未設定)。
+    NoScrollYet,
+    /// scroll idle 100ms 経過 + visible 全部 ready。
+    ScrollIdleAndVisibleReady,
+    /// 3 秒 backstop 発動 (= visible が永久 Pending でも prefetch 再開)。
+    Backstop3s,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockReason {
+    /// 最後の scroll input から `PREFETCH_IDLE_THRESHOLD` 未満。
+    ScrollNotIdle { elapsed_ms: u64 },
+    /// scroll idle だが visible 範囲のサムネがまだ Loaded/Failed でない。
+    VisibleStillLoading { pending: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PrefetchDecision {
+    Allow { reason: AllowReason },
+    Block { reason: BlockReason },
+}
+
+/// prefetch (= 非可視範囲) を enqueue してよいか判定。
+///
+/// 順序:
+/// 1. `last_prefetch_scroll_at` が `PREFETCH_BACKSTOP` 以上前 → 無条件 Allow (Backstop3s)
+/// 2. `last_prefetch_scroll_at` から `PREFETCH_IDLE_THRESHOLD` 未満 → Block (ScrollNotIdle)
+/// 3. `visible_state_pending > 0` → Block (VisibleStillLoading)
+/// 4. それ以外 → Allow (NoScrollYet or ScrollIdleAndVisibleReady)
+///
+/// `last_prefetch_scroll_at = None` は「起動直後 / 一度もスクロールしてない」状態。
+/// `emit_scroll_settle_event` で `last_scroll_event_at` は clear されるが、
+/// 本関数が見る `last_prefetch_scroll_at` は **clear されない** (= backstop 計時起点が安定)。
+pub(crate) fn decide_prefetch_allowed(
+    now: std::time::Instant,
+    last_prefetch_scroll_at: Option<std::time::Instant>,
+    visible_state_pending: usize,
+) -> PrefetchDecision {
+    if let Some(t) = last_prefetch_scroll_at {
+        let elapsed = now.saturating_duration_since(t);
+        // (1) backstop: 3 秒経ったら無条件 allow
+        if elapsed >= PREFETCH_BACKSTOP {
+            return PrefetchDecision::Allow {
+                reason: AllowReason::Backstop3s,
+            };
+        }
+        // (2) scroll idle 不足
+        if elapsed < PREFETCH_IDLE_THRESHOLD {
+            return PrefetchDecision::Block {
+                reason: BlockReason::ScrollNotIdle {
+                    elapsed_ms: elapsed.as_millis() as u64,
+                },
+            };
+        }
+    }
+    // (3) visible ready
+    if visible_state_pending > 0 {
+        return PrefetchDecision::Block {
+            reason: BlockReason::VisibleStillLoading {
+                pending: visible_state_pending,
+            },
+        };
+    }
+    let reason = if last_prefetch_scroll_at.is_none() {
+        AllowReason::NoScrollYet
+    } else {
+        AllowReason::ScrollIdleAndVisibleReady
+    };
+    PrefetchDecision::Allow { reason }
 }
 
 impl App {
@@ -3607,6 +3710,9 @@ impl App {
             promote_retry_pending: false,
             prev_scroll_offset_y: 0.0,
             last_scroll_event_at: None,
+            last_prefetch_scroll_at: None,
+            prev_prefetch_allowed: None,
+            last_prefetch_suppressed_emit_at: None,
             scroll_settle_state: None,
             scroll_settle_seq: 0,
             last_pdf_pool_snapshot_at: None,
@@ -6815,6 +6921,12 @@ impl App {
         // それが上書きするので問題ない。
         self.virtual_folder_writeback = None;
         self.pdf_prefetch_grace_until = None;
+        // フォルダ切替直後は「直前にスクロールしたのと同じ扱い」で prefetch gate を効かせる。
+        // None だと `decide_prefetch_allowed` が「未スクロール → 即 allow」と判定して
+        // 初フレームから prefetch が pool に流れる。新コンテキストでも visible を優先したいので
+        // `Some(now)` で 100ms idle 待ちを生み出す (= 同 1 フレーム内の Ctrl+↑↓ 多段 nav にも効く)。
+        // docs/prefetch-suppression-during-scroll-plan.md 1.3 参照。
+        self.last_prefetch_scroll_at = Some(std::time::Instant::now());
 
         // perf: start_loading_items 全体 + 内訳 (sidecar_flush / close_fullscreen /
         // state_reset / prewarm_rating / adjustment_db / mask_db / catalog_open /
@@ -9776,6 +9888,29 @@ impl App {
             .pdf_prefetch_grace_until
             .is_some_and(|t| std::time::Instant::now() < t);
         let mut deferred_pdf_prefetch = false;
+        // スクロール中 / visible 待ち中は prefetch enqueue を抑制する gate (decision キャッシュ)。
+        // visible 範囲の Pending/Evicted/Requested 数を数えて decide_prefetch_allowed に渡す。
+        // docs/prefetch-suppression-during-scroll-plan.md 参照。
+        let prefetch_decision: PrefetchDecision = {
+            let visible_pending = self.visible_indices
+                [vis_first..vis_first.saturating_add(items_per_page).min(vis_count)]
+                .iter()
+                .filter(|&&raw_idx| {
+                    !matches!(
+                        self.thumbnails.get(raw_idx),
+                        Some(ThumbnailState::Loaded { .. }) | Some(ThumbnailState::Failed)
+                    )
+                })
+                .count();
+            decide_prefetch_allowed(
+                std::time::Instant::now(),
+                self.last_prefetch_scroll_at,
+                visible_pending,
+            )
+        };
+        let prefetch_ok = matches!(prefetch_decision, PrefetchDecision::Allow { .. });
+        let mut suppressed_regular: usize = 0;
+        let mut suppressed_heavy: usize = 0;
         for i in self.keep_set_sorted() {
             if self.requested.contains_key(&i) {
                 continue;
@@ -9811,6 +9946,18 @@ impl App {
                 continue;
             };
             req.priority = i >= visible_raw_start && i < visible_raw_end;
+            // prefetch suppression: スクロール中 / visible 待ち中は非 priority (= prefetch) を
+            // enqueue しない。visible (= priority=true) は常に enqueue する。
+            // skip_cache=true は idle upgrade 経路 (本 PR scope 外) なので素通し。
+            if !req.priority && !prefetch_ok && !req.skip_cache {
+                let is_heavy = self.items.get(i).is_some_and(|it| it.is_heavy_io());
+                if is_heavy {
+                    suppressed_heavy += 1;
+                } else {
+                    suppressed_regular += 1;
+                }
+                continue;
+            }
             // grace 中は PdfPage の prefetch (= 非 priority) のみスキップ。現在表示中の
             // PdfPage (= priority=true) は通常通り enqueue する。
             if pdf_prefetch_blocked && !req.priority && req.pdf_page.is_some() {
@@ -9855,6 +10002,8 @@ impl App {
         let new_lo = new_regular.len() + new_heavy.len() - new_hi;
         let t3 = frame_t0.elapsed();
         let regular_count = new_regular.len();
+        let mut pruned_regular: usize = 0;
+        let mut pruned_heavy: usize = 0;
         {
             let (ref mtx, ref cvar) = *queue_arc;
             let mut q = mtx.lock().unwrap();
@@ -9862,14 +10011,27 @@ impl App {
             // 始めてすらいない → requested からも抜いて良い (再入範囲なら次フレームで
             // 再エンキューされる)。keep_set と requested は App の別フィールドなので
             // 事前に分離して disjoint field borrow にする (closure 内で両方必要)。
+            //
+            // prefetch suppression: priority field は古い (= 前フレの visible_raw 基準) ので、
+            // 「now_visible = idx ∈ [visible_raw_start, visible_raw_end)」を inline で再計算する。
+            // 非可視 + !skip_cache (= grid prefetch) は prefetch_ok=false なら prune。
+            // skip_cache=true は idle upgrade 経路で本 PR scope 外。
             let keep_set = &self.keep_set;
             let requested = &mut self.requested;
             q.retain(|r| {
                 let keep = keep_set.contains(&r.idx);
                 if !keep {
                     requested.remove(&r.idx);
+                    return false;
                 }
-                keep
+                let now_visible = r.idx >= visible_raw_start && r.idx < visible_raw_end;
+                let is_grid_prefetch = !now_visible && !r.skip_cache;
+                if !prefetch_ok && is_grid_prefetch {
+                    requested.remove(&r.idx);
+                    pruned_regular += 1;
+                    return false;
+                }
+                true
             });
             for r in q.iter_mut() {
                 r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;
@@ -9895,8 +10057,16 @@ impl App {
                 let keep = keep_set.contains(&r.idx);
                 if !keep {
                     requested.remove(&r.idx);
+                    return false;
                 }
-                keep
+                let now_visible = r.idx >= visible_raw_start && r.idx < visible_raw_end;
+                let is_grid_prefetch = !now_visible && !r.skip_cache;
+                if !prefetch_ok && is_grid_prefetch {
+                    requested.remove(&r.idx);
+                    pruned_heavy += 1;
+                    return false;
+                }
+                true
             });
             for r in q.iter_mut() {
                 r.priority = r.idx >= visible_raw_start && r.idx < visible_raw_end;
@@ -9987,6 +10157,122 @@ impl App {
         if !pdf_prefetch_blocked && self.pdf_prefetch_grace_until.is_some() {
             self.pdf_prefetch_grace_until = None;
         }
+
+        // ── prefetch suppression: repaint 確保 + perf 計装 ──
+        // (a) scroll idle / backstop 境界 で再評価が走るよう repaint_after をセット。
+        //     scroll idle 不足が原因なら 100ms 後に gate 通過する。
+        //     visible 未完了が原因 (idle は満たす) なら thumb worker の ready 経路で repaint
+        //     されるが、backstop 3 秒の保険は必ず仕掛ける。
+        if !prefetch_ok {
+            if let Some(t) = self.last_prefetch_scroll_at {
+                let elapsed = t.elapsed();
+                let idle_remaining = PREFETCH_IDLE_THRESHOLD.saturating_sub(elapsed);
+                if !idle_remaining.is_zero() {
+                    ctx.request_repaint_after(idle_remaining);
+                }
+                let backstop_remaining = PREFETCH_BACKSTOP.saturating_sub(elapsed);
+                if !backstop_remaining.is_zero() {
+                    ctx.request_repaint_after(backstop_remaining);
+                }
+            }
+        }
+
+        // (b) `prefetch_suppressed` perf event:
+        //   start (前フレ allowed → 今フレ blocked) / continue (200ms tick) /
+        //   end (前フレ blocked → 今フレ allowed) の 3 種類で emit。
+        if crate::perf::is_enabled() {
+            let now_pf = std::time::Instant::now();
+            let prev_allowed = self.prev_prefetch_allowed;
+            let cur_allowed = prefetch_ok;
+            let transition: Option<&'static str> = match (prev_allowed, cur_allowed) {
+                (Some(false), true) => Some("end"),
+                (Some(true), false) | (None, false) => Some("start"),
+                (Some(false), false) => {
+                    // 200ms tick (= 抑制中の state trace)
+                    let tick_elapsed = self
+                        .last_prefetch_suppressed_emit_at
+                        .map(|t| now_pf.saturating_duration_since(t))
+                        .unwrap_or(std::time::Duration::MAX);
+                    if tick_elapsed >= std::time::Duration::from_millis(200) {
+                        Some("continue")
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(trans) = transition {
+                let (scroll_idle, visible_ready, scroll_idle_ms_remaining, visible_pending) =
+                    match prefetch_decision {
+                        PrefetchDecision::Allow { .. } => (true, true, 0u64, 0usize),
+                        PrefetchDecision::Block {
+                            reason: BlockReason::ScrollNotIdle { elapsed_ms },
+                        } => {
+                            let remaining = PREFETCH_IDLE_THRESHOLD
+                                .as_millis()
+                                .saturating_sub(elapsed_ms as u128)
+                                as u64;
+                            (false, true, remaining, 0usize)
+                        }
+                        PrefetchDecision::Block {
+                            reason: BlockReason::VisibleStillLoading { pending },
+                        } => (true, false, 0u64, pending),
+                    };
+                let allow_reason: Option<&'static str> = match prefetch_decision {
+                    PrefetchDecision::Allow {
+                        reason: AllowReason::NoScrollYet,
+                    } => Some("no_scroll_yet"),
+                    PrefetchDecision::Allow {
+                        reason: AllowReason::ScrollIdleAndVisibleReady,
+                    } => Some("scroll_idle_and_visible_ready"),
+                    PrefetchDecision::Allow {
+                        reason: AllowReason::Backstop3s,
+                    } => Some("backstop_3s"),
+                    PrefetchDecision::Block { .. } => None,
+                };
+                let backstop_hit = matches!(
+                    prefetch_decision,
+                    PrefetchDecision::Allow {
+                        reason: AllowReason::Backstop3s
+                    }
+                );
+                crate::perf::event(
+                    "ui",
+                    "prefetch_suppressed",
+                    None,
+                    0,
+                    &[
+                        ("transition", serde_json::Value::from(trans)),
+                        ("scroll_idle", serde_json::Value::from(scroll_idle)),
+                        ("visible_ready", serde_json::Value::from(visible_ready)),
+                        (
+                            "scroll_idle_ms_remaining",
+                            serde_json::Value::from(scroll_idle_ms_remaining),
+                        ),
+                        ("visible_pending", serde_json::Value::from(visible_pending)),
+                        (
+                            "suppressed_regular",
+                            serde_json::Value::from(suppressed_regular),
+                        ),
+                        (
+                            "suppressed_heavy",
+                            serde_json::Value::from(suppressed_heavy),
+                        ),
+                        ("pruned_regular", serde_json::Value::from(pruned_regular)),
+                        ("pruned_heavy", serde_json::Value::from(pruned_heavy)),
+                        (
+                            "allow_reason",
+                            allow_reason
+                                .map(serde_json::Value::from)
+                                .unwrap_or(serde_json::Value::Null),
+                        ),
+                        ("backstop_hit", serde_json::Value::from(backstop_hit)),
+                    ],
+                );
+                self.last_prefetch_suppressed_emit_at = Some(now_pf);
+            }
+        }
+        self.prev_prefetch_allowed = Some(prefetch_ok);
 
         // ── PDF pool の visible 昇格 ──
         // スクロール後、`reload_queue` は上で priority を re-tag したが、既に thumb worker が
@@ -17715,6 +18001,11 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         crate::record_ui_heartbeat_tick();
+        // prefetch suppression gate: 同フレーム内の scroll 入力を即時に拾う。
+        // `scroll_offset_y` への反映 (= process_scroll / handle_keyboard) を待たないので、
+        // `update_keep_range_and_requests` の gate 判定時点で last_prefetch_scroll_at が
+        // 確実に立っている。docs/prefetch-suppression-during-scroll-plan.md 1.3 参照。
+        self.detect_scroll_input_intent(ctx);
         let now = std::time::Instant::now();
         if now.saturating_duration_since(self.last_ui_heartbeat_log)
             >= std::time::Duration::from_secs(1)
@@ -19304,6 +19595,32 @@ impl eframe::App for App {
 
 // scroll_settle 計装の helper 群は inherent impl (trait method ではない)
 impl App {
+    /// `App::update` 冒頭で 1 回呼ぶ。同フレーム内の wheel / arrow keys / Page / Home / End
+    /// 等のスクロール入力意図を ctx.input から拾って `last_prefetch_scroll_at` を即時更新する。
+    ///
+    /// なぜ早期検出か: `update_keep_range_and_requests` の gate 判定 (line 18204 付近) は
+    /// 同フレーム内の `process_scroll` / `handle_keyboard` の `scroll_offset_y` mutate より前に
+    /// 走るので、offset 変化ベースの検出 (= `update_scroll_settle_state`) では 1 フレ遅れる。
+    /// → input intent ベースなら gate 判定時に既に立っている。
+    ///
+    /// scrollbar drag / touch などキー以外の経路は `update_scroll_settle_state` の offset 変化
+    /// fallback で 1 フレ遅れて拾う。実害は 1 frame の prefetch 漏れ程度で、次フレ q.retain で
+    /// prune される。
+    fn detect_scroll_input_intent(&mut self, ctx: &egui::Context) {
+        let scrolling = ctx.input(|i| {
+            i.raw_scroll_delta.length() > 0.1
+                || i.key_pressed(egui::Key::ArrowDown)
+                || i.key_pressed(egui::Key::ArrowUp)
+                || i.key_pressed(egui::Key::PageDown)
+                || i.key_pressed(egui::Key::PageUp)
+                || i.key_pressed(egui::Key::Home)
+                || i.key_pressed(egui::Key::End)
+        });
+        if scrolling {
+            self.last_prefetch_scroll_at = Some(std::time::Instant::now());
+        }
+    }
+
     /// `update_scroll_settle_state`: scroll_offset_y の変化検出 + 300ms 経過後の
     /// settle イベント発火 + first/all ready 計測の更新。
     /// `App::update` の終盤 (= render_grid 反映後) で呼ぶ。
@@ -19312,6 +19629,9 @@ impl App {
         let cur_offset = self.scroll_offset_y;
         if (cur_offset - self.prev_scroll_offset_y).abs() > 0.5 {
             self.last_scroll_event_at = Some(now);
+            // prefetch gate にも fallback で書く (= scrollbar drag / touch 経路の保険)。
+            // settle で clear されないので backstop の計時起点に使える。
+            self.last_prefetch_scroll_at = Some(now);
             self.prev_scroll_offset_y = cur_offset;
             // 新しいスクロールが始まったので前 settle 状態を破棄
             self.scroll_settle_state = None;

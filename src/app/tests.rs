@@ -4170,3 +4170,149 @@ mod ctrl_f_structural_filter_tests {
         assert!(m.contains(&0), "SearchContainer は常に表示");
     }
 }
+
+/// docs/prefetch-suppression-during-scroll-plan.md Phase 2.1
+/// decide_prefetch_allowed 純関数のユニットテスト。
+#[cfg(test)]
+mod prefetch_gate_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn no_scroll_yet_allows() {
+        let now = Instant::now();
+        let d = decide_prefetch_allowed(now, None, 0);
+        assert_eq!(
+            d,
+            PrefetchDecision::Allow {
+                reason: AllowReason::NoScrollYet,
+            }
+        );
+    }
+
+    #[test]
+    fn no_scroll_yet_with_visible_pending_still_allows() {
+        // last_prefetch_scroll_at = None なら elapsed check しないので
+        // visible_pending > 0 でも (Codex 設計: 起動直後経路) — ただし起動経路は
+        // 通常 `start_loading_items` が `Some(now)` を立てるので、
+        // 厳密には起動から最初の `update` までの極短い窓でしか発生しない。
+        let now = Instant::now();
+        let d = decide_prefetch_allowed(now, None, 5);
+        // visible_pending check は last_prefetch_scroll_at の elapsed branch を
+        // 抜けた後に走るので、None だとそのまま到達して Block { VisibleStillLoading }。
+        assert_eq!(
+            d,
+            PrefetchDecision::Block {
+                reason: BlockReason::VisibleStillLoading { pending: 5 },
+            }
+        );
+    }
+
+    #[test]
+    fn scroll_50ms_ago_blocks() {
+        let now = Instant::now();
+        let t = now - Duration::from_millis(50);
+        let d = decide_prefetch_allowed(now, Some(t), 0);
+        assert!(matches!(
+            d,
+            PrefetchDecision::Block {
+                reason: BlockReason::ScrollNotIdle { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn scroll_exactly_100ms_ago_allows() {
+        let now = Instant::now();
+        let t = now - Duration::from_millis(100);
+        let d = decide_prefetch_allowed(now, Some(t), 0);
+        assert_eq!(
+            d,
+            PrefetchDecision::Allow {
+                reason: AllowReason::ScrollIdleAndVisibleReady,
+            }
+        );
+    }
+
+    #[test]
+    fn scroll_99ms_ago_blocks() {
+        let now = Instant::now();
+        let t = now - Duration::from_millis(99);
+        let d = decide_prefetch_allowed(now, Some(t), 0);
+        assert!(matches!(
+            d,
+            PrefetchDecision::Block {
+                reason: BlockReason::ScrollNotIdle { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn scroll_200ms_visible_pending_blocks() {
+        let now = Instant::now();
+        let t = now - Duration::from_millis(200);
+        let d = decide_prefetch_allowed(now, Some(t), 5);
+        assert_eq!(
+            d,
+            PrefetchDecision::Block {
+                reason: BlockReason::VisibleStillLoading { pending: 5 },
+            }
+        );
+    }
+
+    #[test]
+    fn scroll_200ms_visible_ready_allows() {
+        let now = Instant::now();
+        let t = now - Duration::from_millis(200);
+        let d = decide_prefetch_allowed(now, Some(t), 0);
+        assert_eq!(
+            d,
+            PrefetchDecision::Allow {
+                reason: AllowReason::ScrollIdleAndVisibleReady,
+            }
+        );
+    }
+
+    #[test]
+    fn scroll_2999ms_with_pending_blocks() {
+        // backstop 未到達 + visible 残り → block
+        let now = Instant::now();
+        let t = now - Duration::from_millis(2999);
+        let d = decide_prefetch_allowed(now, Some(t), 5);
+        assert_eq!(
+            d,
+            PrefetchDecision::Block {
+                reason: BlockReason::VisibleStillLoading { pending: 5 },
+            }
+        );
+    }
+
+    #[test]
+    fn scroll_exactly_3000ms_backstop_allows() {
+        // backstop 境界 (≥ 3000ms) → visible pending あっても allow
+        let now = Instant::now();
+        let t = now - Duration::from_millis(3000);
+        let d = decide_prefetch_allowed(now, Some(t), 5);
+        assert_eq!(
+            d,
+            PrefetchDecision::Allow {
+                reason: AllowReason::Backstop3s,
+            }
+        );
+    }
+
+    #[test]
+    fn scroll_3001ms_backstop_allows_no_pending() {
+        // backstop 超過 + visible 揃ってる → 同じく allow (Backstop3s)
+        // Backstop は (1) で先に判定されるので visible_pending=0 でも Backstop3s 扱い。
+        let now = Instant::now();
+        let t = now - Duration::from_millis(3001);
+        let d = decide_prefetch_allowed(now, Some(t), 0);
+        assert_eq!(
+            d,
+            PrefetchDecision::Allow {
+                reason: AllowReason::Backstop3s,
+            }
+        );
+    }
+}

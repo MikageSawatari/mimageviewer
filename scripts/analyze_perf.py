@@ -1065,12 +1065,13 @@ def cmd_scroll(events: list[dict]) -> None:
     firsts: dict[int, dict] = {}
     alls: dict[int, dict] = {}
     promotes: list[dict] = []
+    suppresses: list[dict] = []
     for e in events:
         if e.get("cat") != "ui" and e.get("cat") != "pdf":
             continue
         k = e.get("kind")
         if k == "scroll_settle":
-            seq = e.get("seq", 0)
+            seq = e.get("settle_seq", 0)
             settles[seq] = e
         elif k == "visible_thumb_first_ready":
             seq = e.get("settle_seq", 0)
@@ -1080,6 +1081,8 @@ def cmd_scroll(events: list[dict]) -> None:
             alls[seq] = e
         elif k == "pool_promote_visible":
             promotes.append(e)
+        elif k == "prefetch_suppressed":
+            suppresses.append(e)
 
     if not settles:
         print("(scroll_settle イベントなし — --perf-log で取得し直してください)")
@@ -1118,6 +1121,47 @@ def cmd_scroll(events: list[dict]) -> None:
         total_already = sum(p.get("already_high", 0) for p in promotes)
         total_not_found = sum(p.get("not_found", 0) for p in promotes)
         print(f"  合計 promoted={total_promoted}  already_high={total_already}  not_found={total_not_found}")
+
+    # prefetch_suppressed イベントの集計
+    if suppresses:
+        print()
+        print(f"=== prefetch_suppressed: {len(suppresses)} events ===")
+        starts = [s for s in suppresses if s.get("transition") == "start"]
+        ends = [s for s in suppresses if s.get("transition") == "end"]
+        conts = [s for s in suppresses if s.get("transition") == "continue"]
+        total_supp_reg = sum(s.get("suppressed_regular", 0) for s in suppresses)
+        total_supp_heavy = sum(s.get("suppressed_heavy", 0) for s in suppresses)
+        total_pruned_reg = sum(s.get("pruned_regular", 0) for s in suppresses)
+        total_pruned_heavy = sum(s.get("pruned_heavy", 0) for s in suppresses)
+        backstop_hits = sum(1 for s in suppresses if s.get("backstop_hit"))
+        print(
+            f"  start={len(starts)} continue={len(conts)} end={len(ends)} backstop_hit={backstop_hits}"
+        )
+        print(
+            f"  suppressed (new enqueue): regular={total_supp_reg} heavy={total_supp_heavy}"
+        )
+        print(
+            f"  pruned (existing queue):  regular={total_pruned_reg} heavy={total_pruned_heavy}"
+        )
+        # 各 settle 直前の suppression event を関連付け
+        print()
+        print(f"{'settle':>6}  {'t_rel':>8}  {'prev_supp':>10}  {'allow_reason':>30}")
+        print("-" * 70)
+        for seq in sorted(settles.keys()):
+            s = settles[seq]
+            s_t = s.get("t", 0.0)
+            # settle 直前 (= 過去 2 秒以内) の prefetch_suppressed end イベントを探す
+            related: list[dict] = [
+                ev
+                for ev in suppresses
+                if 0.0 < (s_t - ev.get("t", 0.0)) < 2.0
+                and ev.get("transition") == "end"
+            ]
+            if related:
+                last = related[-1]
+                ar = last.get("allow_reason", "?") or "?"
+                rel = s_t - t0
+                print(f"  {seq:>4}  {rel:6.2f}s  {'end':>10}  {ar:>30}")
 
     # latency 分布
     first_latencies = [firsts[k].get("latency_ms", 0) for k in firsts]

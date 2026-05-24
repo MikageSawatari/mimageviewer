@@ -405,6 +405,34 @@ perf_key と match するジョブを Normal → HighNormal lane に移す。ded
 `scripts/analyze_perf.py scroll` で settle ごとの first/all_ready latency を集計可能。
 詳細: [docs/scroll-visibility-priority-plan.md](docs/scroll-visibility-priority-plan.md)
 
+### スクロール中の prefetch 抑制 (2026-05)
+
+`promote_to_high_normal` で promote しても、in-flight に既に居る prefetch render は
+PDFium cancel 不可なので最低 1.5 秒待ち。これが settle 後の visible_thumb_first_ready
+を最悪 9 秒以上ブロックする (実測)。
+
+対策: **`reload_queue` / `heavy_io_queue` の prefetch (`req.priority=false`) を、スクロール中 /
+visible 待ち中は enqueue しないし、queue に既に居る prefetch も毎フレ prune する**。
+pool に流れる前に止めるので cancel 不可問題に影響されない。
+
+判定は `decide_prefetch_allowed(now, last_prefetch_scroll_at, visible_pending)` 純関数。
+- 最後の scroll 入力から **100ms 未満** → Block (`ScrollNotIdle`)
+- visible 範囲に Pending/Evicted/Requested が **1 つでもあれば** → Block (`VisibleStillLoading`)
+- 最後の scroll から **3 秒経過** → 無条件 Allow (`Backstop3s`、永久 stall 防止)
+
+`last_prefetch_scroll_at` は **`emit_scroll_settle_event` で clear されない** 専用 timestamp
+(`last_scroll_event_at` とは別)。`App::update` 冒頭の `detect_scroll_input_intent`
+(ctx.input wheel + arrow keys + Page/Home/End) で即時更新する。
+これで `update_keep_range_and_requests` の gate 判定時に同フレーム入力が反映済み。
+scrollbar drag / touch は `update_scroll_settle_state` の offset 変化 fallback で 1 フレ遅れて拾う。
+
+新 perf イベント:
+- `ui/prefetch_suppressed`: `transition`(start/continue/end) + `allow_reason`(unblock 時) +
+  `backstop_hit` + 抑制件数 (suppressed_regular/heavy + pruned_regular/heavy)
+
+`scripts/analyze_perf.py scroll` が settle 直前の suppression end を併記する。
+詳細: [docs/prefetch-suppression-during-scroll-plan.md](docs/prefetch-suppression-during-scroll-plan.md)
+
 ### UI スレッドでの同期 I/O は即 worker 化する ⚠️
 
 `App::update` から (呼び出し先を含めて) 同期実行される処理で以下を行うと、
