@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -161,6 +162,28 @@ struct NativeVideoPointerDown {
     x: i32,
     y: i32,
     at: std::time::Instant,
+}
+
+/// `scroll_settle` イベント発火後の状態。次の scroll が始まるか `all_ready` まで保持。
+/// `visible_thumb_first_ready` / `visible_thumb_all_ready` の latency 計測に使う。
+/// (docs/scroll-visibility-priority-plan.md Phase 1)
+#[derive(Debug, Clone)]
+pub(crate) struct ScrollSettleState {
+    /// この settle window の seq
+    pub seq: u64,
+    /// settle 検出時刻 (latency の起点)
+    pub settled_at: std::time::Instant,
+    /// settle 時点で visible だった raw idx 集合 (= target set)
+    pub visible_target: std::collections::HashSet<usize>,
+    /// settle 時点で既に Loaded だった idx 集合。`newly_loaded` の二重カウント防止に
+    /// 使う (Codex P2-3 対応)。
+    pub loaded_at_settle: std::collections::HashSet<usize>,
+    /// settle 後に新たに Loaded 化した idx (loaded_at_settle と排他、重複防止)
+    pub newly_loaded: std::collections::HashSet<usize>,
+    /// `visible_thumb_first_ready` を既に emit 済みか
+    pub first_ready_emitted: bool,
+    /// `visible_thumb_all_ready` を既に emit 済みか
+    pub all_ready_emitted: bool,
 }
 
 pub(crate) struct UpdateCheckPending {
@@ -2817,6 +2840,26 @@ pub struct App {
     /// スキップして worker の暇をユーザーの確定操作のために空けておく。
     pub(crate) pdf_prefetch_grace_until: Option<std::time::Instant>,
 
+    /// 前フレームに `pdf_loader::promote_to_high_normal` に渡した visible_keys。
+    /// 同じ keys なら lock 取らず skip するための dedup snapshot。
+    /// (docs/scroll-visibility-priority-plan.md Phase 2)
+    pub(crate) last_promoted_visible_keys: Option<std::collections::HashSet<String>>,
+    /// 前回の promote で `not_found_keys > 0` (= まだ pool に入ってない visible key あり)
+    /// だったとき次フレームでも再 promote 走らせるためのラッチ。Codex P2-2 対応。
+    pub(crate) promote_retry_pending: bool,
+
+    // ── スクロール後の可視サムネ計装 (docs/scroll-visibility-priority-plan.md Phase 1) ──
+    /// 前フレームの scroll_offset_y。比較して変化があれば `last_scroll_event_at` 更新
+    pub(crate) prev_scroll_offset_y: f32,
+    /// 最後にスクロール (offset 変化) を検出した時刻。`None` なら既に settle 済み or 未スクロール
+    pub(crate) last_scroll_event_at: Option<std::time::Instant>,
+    /// 現在の settle window state (settle 後 ready latency 計測用)。`None` ならスクロール中 or 未 settle
+    pub(crate) scroll_settle_state: Option<ScrollSettleState>,
+    /// scroll_settle イベントの連番 (= first_ready/all_ready と紐付け)
+    pub(crate) scroll_settle_seq: u64,
+    /// 最後に `pool_queue_snapshot` を emit した時刻 (1 秒 tick 用)
+    pub(crate) last_pdf_pool_snapshot_at: Option<std::time::Instant>,
+
     // ── カタログ LRU キャッシュ ───────────────────────────────────
     /// folder_path → Arc<CatalogDb> の小さい LRU。`start_loading_items` の
     /// `CatalogDb::open` cold path が UI スレッドを止めるのを抑えるため、
@@ -3560,6 +3603,13 @@ impl App {
             fs_holdover_tex: None,
             virtual_folder_writeback: None,
             pdf_prefetch_grace_until: None,
+            last_promoted_visible_keys: None,
+            promote_retry_pending: false,
+            prev_scroll_offset_y: 0.0,
+            last_scroll_event_at: None,
+            scroll_settle_state: None,
+            scroll_settle_seq: 0,
+            last_pdf_pool_snapshot_at: None,
             catalog_cache: std::collections::HashMap::new(),
             catalog_cache_order: std::collections::VecDeque::new(),
             input_seq: 0,
@@ -9937,6 +9987,75 @@ impl App {
         if !pdf_prefetch_blocked && self.pdf_prefetch_grace_until.is_some() {
             self.pdf_prefetch_grace_until = None;
         }
+
+        // ── PDF pool の visible 昇格 ──
+        // スクロール後、`reload_queue` は上で priority を re-tag したが、既に thumb worker が
+        // pop して pdf_pool.normal に積んだ Job は priority=false のまま残る。
+        // ここで現フレームの visible PDF を集めて pool に「HighNormal lane へ昇格」を依頼する。
+        // (docs/scroll-visibility-priority-plan.md Phase 2)
+        let visible_keys = self.collect_visible_pdf_perf_keys(vis_first, items_per_page, vis_count);
+
+        // **Codex P2-2 対応**: dedup 過剰防止。
+        // 単に「keys 一致」では、thumb worker が直後に同じ key を pool.normal へ enqueue
+        // しても dedup skip で promote が走らない。代わりに以下のいずれかなら lock を取って
+        // promote する:
+        //   (a) keys が前回と異なる (= スクロールで visible が変わった)
+        //   (b) 前回の promote で `not_found_keys > 0` だった (= まだ pool に入ってない key が
+        //       後から enqueue されるのを待つ)
+        let keys_changed = self.last_promoted_visible_keys.as_ref() != Some(&visible_keys);
+        let retry_due_to_pending = self.promote_retry_pending && !visible_keys.is_empty();
+        if (keys_changed || retry_due_to_pending) && !visible_keys.is_empty() {
+            let stats = crate::pdf_loader::promote_to_high_normal(&visible_keys);
+            self.last_promoted_visible_keys = Some(visible_keys);
+            // not_found が残っているなら次フレームでも再試行する (= retry latch を立てる)
+            self.promote_retry_pending = stats.not_found_keys > 0;
+            if crate::perf::is_enabled() && (stats.promoted > 0 || stats.not_found_keys > 0) {
+                crate::perf::event(
+                    "pdf",
+                    "pool_promote_visible",
+                    None,
+                    0, // input correlation 不要
+                    &[
+                        ("promoted", serde_json::Value::from(stats.promoted)),
+                        ("already_high", serde_json::Value::from(stats.already_high)),
+                        ("not_found", serde_json::Value::from(stats.not_found_keys)),
+                    ],
+                );
+            }
+        } else if visible_keys.is_empty() {
+            // visible が空になった (= PDF 無しフォルダや scroll off で keep_set 0 など)
+            // 状態を完全クリア
+            self.last_promoted_visible_keys = None;
+            self.promote_retry_pending = false;
+        }
+    }
+
+    /// 現フレームの visible 範囲 (strict、prefetch 含まず) に対応する PDF perf_key 集合を返す。
+    /// `pdf_loader::promote_to_high_normal` に渡す。
+    fn collect_visible_pdf_perf_keys(
+        &self,
+        vis_first: usize,
+        items_per_page: usize,
+        vis_count: usize,
+    ) -> HashSet<String> {
+        let mut keys = HashSet::new();
+        let vis_end = vis_first.saturating_add(items_per_page).min(vis_count);
+        for &raw_idx in &self.visible_indices[vis_first..vis_end] {
+            if let Some(item) = self.items.get(raw_idx) {
+                match item {
+                    crate::grid_item::GridItem::PdfFile(p) => {
+                        keys.insert(crate::grid_item::pdf_page_perf_key(p, 0));
+                    }
+                    crate::grid_item::GridItem::PdfPage {
+                        pdf_path, page_num, ..
+                    } => {
+                        keys.insert(crate::grid_item::pdf_page_perf_key(pdf_path, *page_num));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        keys
     }
 
     /// 段階 E: アイドル時に画質アップグレードの要求を投入する。
@@ -19165,9 +19284,285 @@ impl eframe::App for App {
             // ポインタリセットを済ませたのでフラグを消費する (§6.1)。
             self.native_drag_just_finished = false;
         }
+
+        // ── スクロール後の可視サムネ計装 (docs/scroll-visibility-priority-plan.md Phase 1) ──
+        // `render_grid` が `scroll_to_selected` を反映済みのこの位置で scroll_offset_y を
+        // 観測する。変化があれば last_scroll_event_at を更新し、300ms 経過後の最初の
+        // フレームで scroll_settle を発火。
+        self.update_scroll_settle_state();
+        // PDF pool snapshot を 1 秒に 1 回 emit (pool 未初期化なら no-op)。
+        self.maybe_emit_pool_queue_snapshot();
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        // 後段の本物の on_exit に処理を委譲する (trait impl は 1 つしか書けないため、
+        // ここで helper メソッド群を逃がす都合上 update と on_exit の間に
+        // `impl App` ブロックを開く)。
+        self.on_exit_inner();
+    }
+}
+
+// scroll_settle 計装の helper 群は inherent impl (trait method ではない)
+impl App {
+    /// `update_scroll_settle_state`: scroll_offset_y の変化検出 + 300ms 経過後の
+    /// settle イベント発火 + first/all ready 計測の更新。
+    /// `App::update` の終盤 (= render_grid 反映後) で呼ぶ。
+    fn update_scroll_settle_state(&mut self) {
+        let now = std::time::Instant::now();
+        let cur_offset = self.scroll_offset_y;
+        if (cur_offset - self.prev_scroll_offset_y).abs() > 0.5 {
+            self.last_scroll_event_at = Some(now);
+            self.prev_scroll_offset_y = cur_offset;
+            // 新しいスクロールが始まったので前 settle 状態を破棄
+            self.scroll_settle_state = None;
+        }
+
+        // settle 判定: 最後の scroll から 300ms 経過 + scroll_settle_state 未発火
+        const SETTLE_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(300);
+        let should_emit_settle = self
+            .last_scroll_event_at
+            .is_some_and(|t| now.saturating_duration_since(t) >= SETTLE_THRESHOLD)
+            && self.scroll_settle_state.is_none();
+
+        if should_emit_settle {
+            self.emit_scroll_settle_event();
+        }
+
+        // settle 後の first/all ready チェック (poll_thumbnails で更新済みの thumbnails 状態を見る)
+        self.check_visible_thumb_ready();
+    }
+
+    /// scroll_settle イベントを 1 回 emit + scroll_settle_state を初期化。
+    fn emit_scroll_settle_event(&mut self) {
+        // 現フレームの visible 範囲を計算 (render_grid 反映後なのでこの値で正)
+        let cell_h = self.last_cell_h.max(32.0);
+        let viewport_h = self.last_viewport_h.max(cell_h);
+        let cols = self.settings.grid_cols.max(1);
+        let rows_per_page = (viewport_h / cell_h).ceil() as usize;
+        let items_per_page = (rows_per_page * cols).max(1);
+        let vis_count = self.visible_indices.len();
+        if vis_count == 0 {
+            return;
+        }
+        let vis_first_raw = (self.scroll_offset_y / cell_h) as usize * cols;
+        let vis_first = vis_first_raw.min(vis_count.saturating_sub(1));
+        let vis_end = vis_first.saturating_add(items_per_page).min(vis_count);
+
+        // 厳密 visible の raw idx 集合 + 既 Loaded 集合 (= 二重カウント防止、Codex P2-3)
+        let visible_target: HashSet<usize> = self.visible_indices[vis_first..vis_end]
+            .iter()
+            .copied()
+            .collect();
+        let loaded_at_settle: HashSet<usize> = visible_target
+            .iter()
+            .copied()
+            .filter(|i| {
+                matches!(
+                    self.thumbnails.get(*i),
+                    Some(crate::grid_item::ThumbnailState::Loaded { .. })
+                )
+            })
+            .collect();
+        let already_loaded = loaded_at_settle.len();
+
+        self.scroll_settle_seq = self.scroll_settle_seq.wrapping_add(1);
+        let seq = self.scroll_settle_seq;
+        let settled_at = std::time::Instant::now();
+        let target_count = visible_target.len();
+
+        if crate::perf::is_enabled() {
+            // **注 (Codex follow-up)**: perf::event の seq 引数 (= 4 番目) は input
+            // correlation 用で `seq` field に書かれる。scroll_settle 自体は入力イベント
+            // ではないので `0` で送る。settle 識別は `settle_seq` field を使う
+            // (first_ready / all_ready 側の `settle_seq` と join 可能)。
+            let mut fields: Vec<(&str, serde_json::Value)> = vec![
+                ("settle_seq", serde_json::Value::from(seq)),
+                (
+                    "visible_target_count",
+                    serde_json::Value::from(target_count),
+                ),
+                ("visible_first_idx", serde_json::Value::from(vis_first)),
+                ("already_loaded", serde_json::Value::from(already_loaded)),
+                (
+                    "vis_first_raw_idx",
+                    serde_json::Value::from(
+                        self.visible_indices.get(vis_first).copied().unwrap_or(0),
+                    ),
+                ),
+            ];
+            if let Some(snap) = crate::pdf_loader::pool_queue_snapshot() {
+                fields.push(("pool_critical", serde_json::Value::from(snap.critical)));
+                fields.push((
+                    "pool_high_normal",
+                    serde_json::Value::from(snap.high_normal),
+                ));
+                fields.push(("pool_normal", serde_json::Value::from(snap.normal)));
+                fields.push(("pool_in_flight", serde_json::Value::from(snap.in_flight)));
+            }
+            crate::perf::event("ui", "scroll_settle", None, 0, &fields);
+        }
+
+        // already-loaded で全部済んでいれば first_ready/all_ready は emit 不要 (latency=0 扱い)
+        if already_loaded >= target_count {
+            // この window は emit せず終了 (latency=0)
+            self.scroll_settle_state = None;
+            self.last_scroll_event_at = None;
+            return;
+        }
+
+        self.scroll_settle_state = Some(ScrollSettleState {
+            seq,
+            settled_at,
+            visible_target,
+            loaded_at_settle,
+            newly_loaded: HashSet::new(),
+            first_ready_emitted: false,
+            all_ready_emitted: false,
+        });
+        // 次の scroll を待つ (settle 済みなので last_scroll_event_at は clear)
+        self.last_scroll_event_at = None;
+    }
+
+    /// settle window 内で visible 範囲の thumbnail が Loaded 化したか確認、
+    /// first_ready / all_ready を emit。
+    fn check_visible_thumb_ready(&mut self) {
+        let Some(state) = self.scroll_settle_state.as_mut() else {
+            return;
+        };
+        if state.all_ready_emitted {
+            return;
+        }
+
+        // 新規 Loaded 化を集める。
+        // **Codex P2-3 対応**: settle 時点で既に Loaded だった idx (= loaded_at_settle に
+        // 入ってる) は newly_loaded に含めない。さもないと all_ready の二重カウントで
+        // 早期発火 (未ロードが残ってるのに all_ready) する。
+        let mut newly: Vec<usize> = Vec::new();
+        for &idx in state.visible_target.iter() {
+            if state.loaded_at_settle.contains(&idx) {
+                continue; // settle 時点で既に Loaded → 二重カウント防止
+            }
+            if state.newly_loaded.contains(&idx) {
+                continue;
+            }
+            if matches!(
+                self.thumbnails.get(idx),
+                Some(crate::grid_item::ThumbnailState::Loaded { .. })
+            ) {
+                newly.push(idx);
+            }
+        }
+        if newly.is_empty() {
+            // all_ready 判定: settle 時点で全部 loaded だったケース (= target ⊆ loaded_at_settle)
+            // は emit_scroll_settle_event 側で state を None にして早期 return しているので、
+            // ここに来るのは「未 loaded が残ってる」ケース。
+            // ただし「target が空」のエッジケースだけは保護する。
+            if state.visible_target.is_empty() && !state.all_ready_emitted {
+                state.all_ready_emitted = true;
+            }
+            return;
+        }
+        for idx in &newly {
+            state.newly_loaded.insert(*idx);
+        }
+        // first_ready
+        if !state.first_ready_emitted {
+            state.first_ready_emitted = true;
+            if crate::perf::is_enabled() {
+                let latency_ms = state.settled_at.elapsed().as_secs_f64() * 1000.0;
+                crate::perf::event(
+                    "ui",
+                    "visible_thumb_first_ready",
+                    None,
+                    0, // input correlation 不要、settle_seq で join
+                    &[
+                        ("settle_seq", serde_json::Value::from(state.seq)),
+                        ("latency_ms", serde_json::Value::from(latency_ms)),
+                        ("idx", serde_json::Value::from(*newly.first().unwrap_or(&0))),
+                        (
+                            "already_loaded_at_settle",
+                            serde_json::Value::from(state.loaded_at_settle.len()),
+                        ),
+                        (
+                            "target_count",
+                            serde_json::Value::from(state.visible_target.len()),
+                        ),
+                    ],
+                );
+            }
+        }
+        // all_ready: loaded_at_settle ∪ newly_loaded が target を覆ったか
+        let total_covered = state.loaded_at_settle.len() + state.newly_loaded.len();
+        if total_covered >= state.visible_target.len() && !state.all_ready_emitted {
+            state.all_ready_emitted = true;
+            if crate::perf::is_enabled() {
+                let latency_ms = state.settled_at.elapsed().as_secs_f64() * 1000.0;
+                crate::perf::event(
+                    "ui",
+                    "visible_thumb_all_ready",
+                    None,
+                    0,
+                    &[
+                        ("settle_seq", serde_json::Value::from(state.seq)),
+                        ("latency_ms", serde_json::Value::from(latency_ms)),
+                        (
+                            "target_count",
+                            serde_json::Value::from(state.visible_target.len()),
+                        ),
+                    ],
+                );
+            }
+        }
+    }
+
+    /// `pdf_loader::pool_queue_snapshot` を 1 秒 tick で emit (frame-driven、pool 未初期化なら skip)。
+    fn maybe_emit_pool_queue_snapshot(&mut self) {
+        if !crate::perf::is_enabled() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let elapsed = self
+            .last_pdf_pool_snapshot_at
+            .map(|t| now.saturating_duration_since(t))
+            .unwrap_or(std::time::Duration::MAX);
+        if elapsed < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let Some(snap) = crate::pdf_loader::pool_queue_snapshot() else {
+            // pool 未初期化 → emit せず last_at も更新しない (次フレームで再チェック)
+            return;
+        };
+        self.last_pdf_pool_snapshot_at = Some(now);
+        crate::perf::event(
+            "pdf",
+            "pool_queue_snapshot",
+            None,
+            0,
+            &[
+                ("critical", serde_json::Value::from(snap.critical)),
+                ("high_normal", serde_json::Value::from(snap.high_normal)),
+                ("normal", serde_json::Value::from(snap.normal)),
+                ("in_flight", serde_json::Value::from(snap.in_flight)),
+                (
+                    "in_flight_age_max_ms",
+                    serde_json::Value::from(snap.in_flight_age_ms_max),
+                ),
+                (
+                    "in_flight_age_p95_ms",
+                    serde_json::Value::from(snap.in_flight_age_ms_p95),
+                ),
+                (
+                    "in_flight_age_p50_ms",
+                    serde_json::Value::from(snap.in_flight_age_ms_p50),
+                ),
+            ],
+        );
+    }
+
+    /// 旧 `eframe::App::on_exit` の中身。trait impl は 1 つしか書けないので、
+    /// scroll_settle helper 群を inherent impl に逃がす都合上、本体を inherent
+    /// メソッドに移して trait impl 側から委譲する。
+    fn on_exit_inner(&mut self) {
         // VST3 プラグイン内部状態 (= EQ カーブ / chunk) と GUI ウィンドウ位置 / サイズを
         // bridge から snapshot して settings.json に永続化する。終了前に取らないと再起動時に
         // 全部 default に戻る。bridge teardown は eframe の Drop で走るので、ここで先に

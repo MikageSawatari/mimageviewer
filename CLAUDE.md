@@ -386,6 +386,25 @@ HighNormal/Normal ジョブが pool 内で stale 化 → bump 時の一括 prune
 perf イベント: `pool_cancel_harvest_wait` (待ち開始時) / `pdf_thumb_cache_saved_after_cancel`
 (cache 保存成功時)。詳細: [docs/pdf-pool-harvest-on-cancel-plan.md](docs/pdf-pool-harvest-on-cancel-plan.md)
 
+### スクロール後の visible 昇格 + 計装 (2026-05)
+
+スクロール中に prefetch (priority=False) で enqueue された PDF render ジョブは、
+`reload_queue` は毎フレーム re-tag されるが、**既に pdf_pool.normal に積まれたものは
+priority=False のまま居座る**。可視範囲到達後も Normal lane で処理されて 3 秒以上待たされる。
+
+対策: `pdf_loader::promote_to_high_normal(visible_keys)` を毎フレーム呼び、現可視 PDF の
+perf_key と match するジョブを Normal → HighNormal lane に移す。dedup は
+`last_promoted_visible_keys` で行い、lock 取得を最小化。
+
+新 perf イベント:
+- `ui/scroll_settle`: スクロール停止 (300ms) 検出。pool snapshot + target_count + already_loaded
+- `ui/visible_thumb_first_ready` / `visible_thumb_all_ready`: settle 後の可視サムネ Loaded latency
+- `pdf/pool_queue_snapshot`: 1 秒 tick で queue 状態 + in_flight age (max/p95/p50)
+- `pdf/pool_promote_visible`: promote 件数の stats (promoted / already_high / not_found)
+
+`scripts/analyze_perf.py scroll` で settle ごとの first/all_ready latency を集計可能。
+詳細: [docs/scroll-visibility-priority-plan.md](docs/scroll-visibility-priority-plan.md)
+
 ### UI スレッドでの同期 I/O は即 worker 化する ⚠️
 
 `App::update` から (呼び出し先を含めて) 同期実行される処理で以下を行うと、

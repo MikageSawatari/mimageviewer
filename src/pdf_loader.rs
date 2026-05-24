@@ -25,6 +25,7 @@
 //! PDFium DLL は exe 内に埋め込まれており、初回アクセス時に
 //! `%APPDATA%/mimageviewer/pdfium.dll` に展開される。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -104,6 +105,91 @@ pub fn bump_render_context_epoch() -> u64 {
         pool.prune_stale_jobs(new);
     }
     new
+}
+
+/// `promote_to_high_normal` の結果統計。
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PromoteStats {
+    /// Normal lane から HighNormal lane に移動したジョブ数
+    pub promoted: usize,
+    /// 既に HighNormal lane に居て match したジョブ数 (= 移動不要だった)
+    pub already_high: usize,
+    /// `keys` の中で pool 内 (Normal/HighNormal) に見つからなかったキー数
+    /// (= in-flight / completed / never sent)
+    pub not_found_keys: usize,
+}
+
+/// 現在 visible な PDF サムネジョブを Normal → HighNormal に昇格。スクロール後に
+/// 「prefetch として enqueue されたが今は可視」になったジョブを worker 取り出し時に
+/// 優先される lane に移す。Critical / in-flight ジョブは touch しない。
+///
+/// `keys` は perf_key 集合 (= `pdf_page_perf_key(path, page_num)` で生成された文字列)。
+/// pool 未初期化なら no-op で empty stats を返す (= 無 PDF フォルダで pool 起動しない、
+/// Codex R3 P2 対応)。
+pub fn promote_to_high_normal(keys: &HashSet<String>) -> PromoteStats {
+    let Some(pool) = POOL.get() else {
+        return PromoteStats {
+            promoted: 0,
+            already_high: 0,
+            not_found_keys: keys.len(),
+        };
+    };
+    pool.promote_to_high_normal_impl(keys)
+}
+
+/// PDF pool queue の状態 snapshot (perf 用)。
+#[derive(Debug, Default, Clone)]
+pub struct PoolQueueSnapshot {
+    pub critical: usize,
+    pub high_normal: usize,
+    pub normal: usize,
+    pub in_flight: usize,
+    /// in-flight ジョブの age (ms)。空なら全要素 0。
+    pub in_flight_age_ms_max: f64,
+    pub in_flight_age_ms_p95: f64,
+    pub in_flight_age_ms_p50: f64,
+}
+
+/// PDF pool の現在の queue 状態を取得。pool 未初期化なら `None` (= snapshot emit skip)。
+/// 定期 (1 秒に 1 回程度) で App 側から呼ぶ。
+pub fn pool_queue_snapshot() -> Option<PoolQueueSnapshot> {
+    let pool = POOL.get()?;
+    let (mtx, _cv) = &*pool.queue;
+    let q = mtx.lock().ok()?;
+    let now = std::time::Instant::now();
+    let mut ages_ms: Vec<f64> = q
+        .in_flight_started_at
+        .iter()
+        .filter_map(|slot| slot.map(|t| now.saturating_duration_since(t).as_secs_f64() * 1000.0))
+        .collect();
+    ages_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let max = ages_ms.last().copied().unwrap_or(0.0);
+    // Codex P3 対応: n が小さい (2-3) ときの p95 計算。
+    // worker 数 = POOL_SIZE (= 3) なので in-flight も最大 3。`(n * 0.95) as usize - 1` だと
+    // n=1: -1 で underflow / n=2: 0.9 → 0 で 1番目 / n=3: 1.85 → 1 で 2番目 で max が出ない。
+    // 「上位 5% のうちの最大」= ceil(0.95 * n) - 1 番目 (= 最後尾 1 件残し)、n<20 は max 扱い。
+    let p95 = if ages_ms.is_empty() {
+        0.0
+    } else if ages_ms.len() < 20 {
+        max
+    } else {
+        let idx = ((ages_ms.len() as f64) * 0.95).ceil() as usize - 1;
+        ages_ms[idx.min(ages_ms.len() - 1)]
+    };
+    let p50 = if ages_ms.is_empty() {
+        0.0
+    } else {
+        ages_ms[ages_ms.len() / 2]
+    };
+    Some(PoolQueueSnapshot {
+        critical: q.critical.len(),
+        high_normal: q.high_normal.len(),
+        normal: q.normal.len(),
+        in_flight: ages_ms.len(),
+        in_flight_age_ms_max: max,
+        in_flight_age_ms_p95: p95,
+        in_flight_age_ms_p50: p50,
+    })
 }
 
 /// Critical 用ワーカー予約フラグ。
@@ -829,6 +915,10 @@ struct JobQueue {
     normal_in_flight: usize,
     /// 現在 IPC 実行中のワーカー数 (perf 用)
     workers_busy: usize,
+    /// in-flight metadata: worker_id 別の IPC 開始時刻。`Some(t)` なら IPC 中。
+    /// `pool_queue_snapshot` の age 計算に使う。サイズは POOL_SIZE 固定 (out-of-order
+    /// completion 対応、Codex review R3 P2)。
+    in_flight_started_at: Vec<Option<std::time::Instant>>,
     /// Drop 時に true になり、ディスパッチャースレッドが cleanly 終了する
     shutdown: bool,
 }
@@ -839,6 +929,10 @@ struct PdfWorkerPool {
     worker_count: usize,
     /// ディスパッチャースレッド (Pool drop 時に join する)
     dispatcher_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    /// 各 worker_id の子プロセス Child の共有スロット。dispatcher が `take()` で
+    /// 取り出して `wait()` する。Pool::Drop は in-flight 中の dispatcher 行きを
+    /// 待たずに残ってる Child を `kill()` してアプリ終了を早める (A 案、2026-05)。
+    worker_children: Vec<Arc<Mutex<Option<Child>>>>,
 }
 
 const POOL_SIZE: usize = 3;
@@ -862,6 +956,7 @@ impl PdfWorkerPool {
                 normal: std::collections::VecDeque::new(),
                 normal_in_flight: 0,
                 workers_busy: 0,
+                in_flight_started_at: vec![None; POOL_SIZE],
                 shutdown: false,
             }),
             Condvar::new(),
@@ -895,12 +990,18 @@ impl PdfWorkerPool {
         }
 
         let mut dispatcher_threads = Vec::with_capacity(worker_count);
+        // 各 worker の Child を Arc<Mutex<Option<Child>>> で共有。dispatcher は
+        // graceful shutdown 時に take して wait、Pool::Drop は in-flight 中の dispatcher を
+        // 待たずに Child を直接 kill できる (A 案)。
+        let mut worker_children: Vec<Arc<Mutex<Option<Child>>>> = Vec::with_capacity(worker_count);
         for (i, child, io) in pending_workers {
             let q = Arc::clone(&queue);
             let actual_workers = worker_count;
+            let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
+            worker_children.push(Arc::clone(&child_slot));
             let handle = std::thread::Builder::new()
                 .name(format!("pdf-pool-{i}"))
-                .spawn(move || run_dispatcher(i, actual_workers, q, child, io))
+                .spawn(move || run_dispatcher(i, actual_workers, q, child_slot, io))
                 .expect("failed to spawn pdf-pool dispatcher thread");
             dispatcher_threads.push(handle);
         }
@@ -909,12 +1010,94 @@ impl PdfWorkerPool {
             queue,
             worker_count,
             dispatcher_threads: Mutex::new(dispatcher_threads),
+            worker_children,
         }
     }
 
     /// 現在 IPC 実行中のワーカー数 (perf イベント用の snapshot)。
     fn workers_busy(&self) -> usize {
         self.queue.0.lock().map(|q| q.workers_busy).unwrap_or(0)
+    }
+
+    /// `keys` (= 現在 visible なサムネの `perf_key` 集合) と一致する Normal ジョブを
+    /// HighNormal lane へ移し、**HighNormal lane 内も並び替え**て現可視 key を前方に寄せ、
+    /// 旧 (stale) HighNormal を後方に押す。スクロール後に「prefetch として queue に
+    /// 積まれたが今は可視」になったジョブを優先処理させるために App から呼ぶ。
+    ///
+    /// in-flight / completed のジョブは触らない (= 既に dispatcher が pop 済みで救えない)。
+    /// Critical は触らない (= UI nav の即時応答経路を保護)。
+    ///
+    /// 戻り値で stats を返す。perf event の emit は呼び出し側が lock 外で行う。
+    ///
+    /// **Codex P2-1 対応**: 旧実装は単に Normal→HighNormal に移すだけで、HighNormal 内
+    /// の順序を触らなかったため、スクロール前に可視だった古い HighNormal が頭に居て、
+    /// 今可視の昇格 job が **後ろ** に並ぶ事象があった。修正後は HighNormal lane を
+    /// 「現可視 → 旧可視」の順に再構築する。
+    fn promote_to_high_normal_impl(&self, keys: &HashSet<String>) -> PromoteStats {
+        if keys.is_empty() {
+            return PromoteStats::default();
+        }
+        let (promoted_count, already_high, found_keys) = {
+            let (mtx, cv) = &*self.queue;
+            let mut q = mtx.lock().unwrap();
+
+            // (1) 既存 high_normal を「現可視 (match) / 旧可視 (= stale)」に分けて再構築する。
+            // 同時に match を数える (= already_high) し found_keys にも記録。
+            let mut found_keys: HashSet<String> = HashSet::new();
+            let mut current_high: std::collections::VecDeque<Job> =
+                std::collections::VecDeque::with_capacity(q.high_normal.len());
+            let mut stale_high: std::collections::VecDeque<Job> =
+                std::collections::VecDeque::with_capacity(q.high_normal.len());
+            let mut already_high = 0usize;
+            while let Some(j) = q.high_normal.pop_front() {
+                if j.perf_key.as_ref().is_some_and(|k| keys.contains(k)) {
+                    if let Some(k) = j.perf_key.as_ref() {
+                        found_keys.insert(k.clone());
+                    }
+                    already_high += 1;
+                    current_high.push_back(j);
+                } else {
+                    stale_high.push_back(j);
+                }
+            }
+
+            // (2) normal の single pass scan、match した Job を抜き出して priority 書き換え
+            let mut promoted_jobs = Vec::new();
+            let mut kept_normal = std::collections::VecDeque::with_capacity(q.normal.len());
+            while let Some(mut j) = q.normal.pop_front() {
+                if j.perf_key.as_ref().is_some_and(|k| keys.contains(k)) {
+                    if let Some(k) = j.perf_key.as_ref() {
+                        found_keys.insert(k.clone());
+                    }
+                    j.priority = JobPriority::HighNormal;
+                    promoted_jobs.push(j);
+                } else {
+                    kept_normal.push_back(j);
+                }
+            }
+            q.normal = kept_normal;
+            let promoted_count = promoted_jobs.len();
+
+            // (3) HighNormal lane を再構築: current → promoted (= 新規昇格、現可視) → stale
+            // dispatcher の pop_front は current から取るので、現可視が最優先で処理される
+            let mut new_high = current_high;
+            for j in promoted_jobs.drain(..) {
+                new_high.push_back(j);
+            }
+            for j in stale_high.drain(..) {
+                new_high.push_back(j);
+            }
+            q.high_normal = new_high;
+
+            cv.notify_all();
+            (promoted_count, already_high, found_keys)
+        };
+
+        PromoteStats {
+            promoted: promoted_count,
+            already_high,
+            not_found_keys: keys.len() - found_keys.len(),
+        }
     }
 
     /// `current_epoch` より小さい `context_epoch` を持つ HighNormal / Normal ジョブを
@@ -1252,10 +1435,17 @@ fn run_dispatcher(
     worker_id: usize,
     worker_count: usize,
     queue: Arc<(Mutex<JobQueue>, Condvar)>,
-    mut child: Child,
+    child_slot: Arc<Mutex<Option<Child>>>,
     mut io: ProcessWorkerIo,
 ) {
-    let pid = child.id();
+    // PID は冒頭で記録 (= Child を slot に居させたまま参照しない)。
+    // child_slot は Pool::Drop が kill するために共有しているが、dispatcher 自身は
+    // graceful shutdown 時にだけ take + wait する。
+    let pid = child_slot
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|c| c.id()))
+        .unwrap_or(0);
 
     loop {
         // ── キューから 1 件取る ──
@@ -1368,6 +1558,15 @@ fn run_dispatcher(
                     ],
                 );
             }
+            // in-flight metadata の slot を set (= pool_queue_snapshot 用)
+            {
+                let (mtx, _cv) = &*queue;
+                if let Ok(mut q) = mtx.lock()
+                    && let Some(slot) = q.in_flight_started_at.get_mut(worker_id)
+                {
+                    *slot = Some(std::time::Instant::now());
+                }
+            }
             let result = send_recv_io(&mut io, &job.request);
             // reply 側 (requester) が既に recv_timeout で bail していると送信は失敗するが、
             // 無視してよい (結果は棄却されるだけで副作用なし)
@@ -1382,6 +1581,10 @@ fn run_dispatcher(
             if counts_against_normal_slots {
                 q.normal_in_flight = q.normal_in_flight.saturating_sub(1);
             }
+            // in-flight metadata clear (cancel skip 経由でもここに来るので no-op で安全)
+            if let Some(slot) = q.in_flight_started_at.get_mut(worker_id) {
+                *slot = None;
+            }
             // 他ワーカーが Normal スロット待ちで寝ている可能性があるので notify_all。
             // (Critical が来た/Normal スロットが空いた、の両方ともこれで波及する)
             cv.notify_all();
@@ -1395,7 +1598,13 @@ fn run_dispatcher(
         "pdf-pool: worker {worker_id} shutting down (pid={pid})"
     ));
     let _ = write_msg(&mut io.stdin, &encode_shutdown_request());
-    let _ = child.wait();
+    // child slot から取り出して wait。Pool::Drop が先に kill していれば None になっており
+    // wait はスキップ (= dispatcher 即終了)。
+    if let Ok(mut guard) = child_slot.lock()
+        && let Some(mut child) = guard.take()
+    {
+        let _ = child.wait();
+    }
 }
 
 impl Drop for PdfWorkerPool {
@@ -1408,7 +1617,24 @@ impl Drop for PdfWorkerPool {
                 cv.notify_all();
             }
         }
-        // 全スレッドを join (各スレッドが自分の子プロセスを終了させる)
+        // **A 案 (2026-05)**: dispatcher が IPC 中で blocked のまま shutdown 通知を
+        // 拾えないケースがある (= 大 PDF render 中)。worker_children の Child を
+        // 直接 kill して IPC の stdin/stdout pipe を close させ、blocked send_recv_io を
+        // 強制 unblock する。これでアプリ終了の待ち時間が数秒 → 数十 ms に短縮。
+        // dispatcher 側は graceful shutdown 時に slot から take → None なら wait skip する。
+        for slot in self.worker_children.drain(..) {
+            if let Ok(mut guard) = slot.lock()
+                && let Some(mut child) = guard.take()
+            {
+                let pid = child.id();
+                let _ = child.kill();
+                // wait は短時間で済む (kill 直後の OS リソース回収)。zombie 回避。
+                let _ = child.wait();
+                crate::logger::log(format!("pdf-pool: killed worker pid={pid} on drop"));
+            }
+        }
+        // 全スレッドを join (kill 後は pipe 切断で send_recv_io がすぐ Err で返り、
+        // dispatcher が shutdown ループ末尾に到達して終了する)
         if let Ok(mut threads) = self.dispatcher_threads.lock() {
             for h in threads.drain(..) {
                 let _ = h.join();
@@ -2226,6 +2452,7 @@ mod tests {
                 normal: std::collections::VecDeque::new(),
                 normal_in_flight: 0,
                 workers_busy: 0,
+                in_flight_started_at: vec![None; POOL_SIZE],
                 shutdown: false,
             }),
             Condvar::new(),
@@ -2458,5 +2685,263 @@ mod tests {
         assert!(result.is_err());
         // disconnected の Other エラーが返るはず
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Other);
+    }
+
+    // ── promote_to_high_normal tests (JobQueue 直操作で API ロジックを検証) ──
+    //
+    // 実 pool は起動しない (子プロセス spawn 不要)。JobQueue を直接構築して
+    // `promote_to_high_normal_impl` と同等のロジックを mock で再現する。
+
+    fn make_test_job_with_perf_key(
+        priority: JobPriority,
+        perf_key: Option<&str>,
+    ) -> (Job, mpsc::Receiver<std::io::Result<Vec<u8>>>) {
+        let (tx, rx) = mpsc::channel();
+        let job = Job {
+            request: vec![],
+            cancel: None,
+            reply: tx,
+            priority,
+            enqueued_at: std::time::Instant::now(),
+            perf_key: perf_key.map(String::from),
+            context_epoch: 1,
+        };
+        (job, rx)
+    }
+
+    /// 実 pool 非起動版の promote ロジック (`promote_to_high_normal_impl` と等価)。
+    /// Codex P2-1 対応の HighNormal lane reorder も含む。
+    fn promote_in_queue(
+        queue: &Arc<(Mutex<JobQueue>, Condvar)>,
+        keys: &HashSet<String>,
+    ) -> PromoteStats {
+        if keys.is_empty() {
+            return PromoteStats::default();
+        }
+        let (promoted_count, already_high, found_keys) = {
+            let (mtx, cv) = &**queue;
+            let mut q = mtx.lock().unwrap();
+
+            // (1) high_normal を current / stale に振り分け
+            let mut found_keys: HashSet<String> = HashSet::new();
+            let mut current_high: std::collections::VecDeque<Job> =
+                std::collections::VecDeque::with_capacity(q.high_normal.len());
+            let mut stale_high: std::collections::VecDeque<Job> =
+                std::collections::VecDeque::with_capacity(q.high_normal.len());
+            let mut already_high = 0usize;
+            while let Some(j) = q.high_normal.pop_front() {
+                if j.perf_key.as_ref().is_some_and(|k| keys.contains(k)) {
+                    if let Some(k) = j.perf_key.as_ref() {
+                        found_keys.insert(k.clone());
+                    }
+                    already_high += 1;
+                    current_high.push_back(j);
+                } else {
+                    stale_high.push_back(j);
+                }
+            }
+
+            // (2) normal から match を抜き出し
+            let mut promoted = Vec::new();
+            let mut kept = std::collections::VecDeque::with_capacity(q.normal.len());
+            while let Some(mut j) = q.normal.pop_front() {
+                if j.perf_key.as_ref().is_some_and(|k| keys.contains(k)) {
+                    if let Some(k) = j.perf_key.as_ref() {
+                        found_keys.insert(k.clone());
+                    }
+                    j.priority = JobPriority::HighNormal;
+                    promoted.push(j);
+                } else {
+                    kept.push_back(j);
+                }
+            }
+            q.normal = kept;
+            let promoted_count = promoted.len();
+
+            // (3) 再構築: current → promoted → stale
+            let mut new_high = current_high;
+            for j in promoted.drain(..) {
+                new_high.push_back(j);
+            }
+            for j in stale_high.drain(..) {
+                new_high.push_back(j);
+            }
+            q.high_normal = new_high;
+
+            cv.notify_all();
+            (promoted_count, already_high, found_keys)
+        };
+        PromoteStats {
+            promoted: promoted_count,
+            already_high,
+            not_found_keys: keys.len() - found_keys.len(),
+        }
+    }
+
+    #[test]
+    fn promote_moves_matching_normal_jobs_to_high_normal() {
+        let queue = empty_queue();
+        let (j1, _rx1) = make_test_job_with_perf_key(JobPriority::Normal, Some("pdf::a.pdf#0"));
+        let (j2, _rx2) = make_test_job_with_perf_key(JobPriority::Normal, Some("pdf::b.pdf#0"));
+        let (j3, _rx3) = make_test_job_with_perf_key(JobPriority::Normal, Some("pdf::c.pdf#0"));
+        {
+            let (mtx, _) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            q.normal.push_back(j1);
+            q.normal.push_back(j2);
+            q.normal.push_back(j3);
+        }
+        let mut keys = HashSet::new();
+        keys.insert("pdf::a.pdf#0".to_string());
+        keys.insert("pdf::c.pdf#0".to_string());
+        let stats = promote_in_queue(&queue, &keys);
+        assert_eq!(stats.promoted, 2);
+        assert_eq!(stats.already_high, 0);
+        assert_eq!(stats.not_found_keys, 0);
+
+        let (mtx, _) = &*queue;
+        let q = mtx.lock().unwrap();
+        assert_eq!(q.high_normal.len(), 2, "promoted jobs moved to high_normal");
+        assert_eq!(q.normal.len(), 1, "non-matching job stays in normal");
+        // priority field も書き換わっている (P3 polish)
+        for j in q.high_normal.iter() {
+            assert_eq!(j.priority, JobPriority::HighNormal);
+        }
+    }
+
+    #[test]
+    fn promote_leaves_critical_untouched() {
+        let queue = empty_queue();
+        let (j_crit, _rx) =
+            make_test_job_with_perf_key(JobPriority::Critical, Some("pdf::a.pdf#0"));
+        {
+            let (mtx, _) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            q.critical.push_back(j_crit);
+        }
+        let mut keys = HashSet::new();
+        keys.insert("pdf::a.pdf#0".to_string());
+        let stats = promote_in_queue(&queue, &keys);
+        // Critical は触らない、stats では not_found
+        assert_eq!(stats.promoted, 0);
+        assert_eq!(stats.already_high, 0);
+        assert_eq!(stats.not_found_keys, 1);
+        let (mtx, _) = &*queue;
+        let q = mtx.lock().unwrap();
+        assert_eq!(q.critical.len(), 1, "Critical はそのまま");
+    }
+
+    #[test]
+    fn promote_handles_empty_keys() {
+        let queue = empty_queue();
+        let (j, _rx) = make_test_job_with_perf_key(JobPriority::Normal, Some("pdf::a.pdf#0"));
+        {
+            let (mtx, _) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            q.normal.push_back(j);
+        }
+        let stats = promote_in_queue(&queue, &HashSet::new());
+        assert_eq!(stats.promoted, 0);
+        assert_eq!(stats.already_high, 0);
+        assert_eq!(stats.not_found_keys, 0);
+    }
+
+    #[test]
+    fn promote_already_high_not_double_counted() {
+        let queue = empty_queue();
+        // 既に high_normal に居る match
+        let (j_high, _rx1) =
+            make_test_job_with_perf_key(JobPriority::HighNormal, Some("pdf::a.pdf#0"));
+        // normal にも別の match
+        let (j_norm, _rx2) = make_test_job_with_perf_key(JobPriority::Normal, Some("pdf::b.pdf#0"));
+        {
+            let (mtx, _) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            q.high_normal.push_back(j_high);
+            q.normal.push_back(j_norm);
+        }
+        let mut keys = HashSet::new();
+        keys.insert("pdf::a.pdf#0".to_string());
+        keys.insert("pdf::b.pdf#0".to_string());
+        let stats = promote_in_queue(&queue, &keys);
+        assert_eq!(stats.promoted, 1, "normal → high_normal で 1 件");
+        assert_eq!(stats.already_high, 1, "既に high_normal に居たのは 1 件");
+        assert_eq!(stats.not_found_keys, 0, "両 key とも pool 内で found");
+    }
+
+    #[test]
+    fn promote_perf_key_none_safe() {
+        let queue = empty_queue();
+        let (j_none, _rx) = make_test_job_with_perf_key(JobPriority::Normal, None);
+        {
+            let (mtx, _) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            q.normal.push_back(j_none);
+        }
+        let mut keys = HashSet::new();
+        keys.insert("pdf::a.pdf#0".to_string());
+        let stats = promote_in_queue(&queue, &keys);
+        assert_eq!(stats.promoted, 0);
+        let (mtx, _) = &*queue;
+        let q = mtx.lock().unwrap();
+        assert_eq!(q.normal.len(), 1, "perf_key=None の job はそのまま残る");
+    }
+
+    /// **Codex P2-1 対応のテスト**: 旧 HighNormal にスタックしていた stale 物が居るとき、
+    /// promote で current visible が前方に寄り、stale が後方に押し下げられる。
+    #[test]
+    fn promote_reorders_high_normal_current_first_stale_back() {
+        let queue = empty_queue();
+        // 旧 (stale) HighNormal が 2 件、現在 visible でない key
+        let (j_stale_1, _r1) =
+            make_test_job_with_perf_key(JobPriority::HighNormal, Some("pdf::stale1.pdf#0"));
+        let (j_stale_2, _r2) =
+            make_test_job_with_perf_key(JobPriority::HighNormal, Some("pdf::stale2.pdf#0"));
+        // 現在 visible な key が高 normal に既に 1 件
+        let (j_current_high, _r3) =
+            make_test_job_with_perf_key(JobPriority::HighNormal, Some("pdf::a.pdf#0"));
+        // Normal lane に visible match 1 件
+        let (j_promote, _r4) =
+            make_test_job_with_perf_key(JobPriority::Normal, Some("pdf::b.pdf#0"));
+        // Normal lane に non-match 1 件
+        let (j_normal_other, _r5) =
+            make_test_job_with_perf_key(JobPriority::Normal, Some("pdf::c.pdf#0"));
+        {
+            let (mtx, _) = &*queue;
+            let mut q = mtx.lock().unwrap();
+            // 順番: stale1, current_high (visible match), stale2 (= 旧コードだと
+            // 後方に居る current_high が stale1 の後ろで処理されてしまう)
+            q.high_normal.push_back(j_stale_1);
+            q.high_normal.push_back(j_current_high);
+            q.high_normal.push_back(j_stale_2);
+            q.normal.push_back(j_promote);
+            q.normal.push_back(j_normal_other);
+        }
+        let mut keys = HashSet::new();
+        keys.insert("pdf::a.pdf#0".to_string());
+        keys.insert("pdf::b.pdf#0".to_string());
+        let stats = promote_in_queue(&queue, &keys);
+        assert_eq!(stats.promoted, 1);
+        assert_eq!(stats.already_high, 1);
+
+        // 再構築後の HighNormal lane 順: a (current), b (promoted), stale1, stale2
+        let (mtx, _) = &*queue;
+        let q = mtx.lock().unwrap();
+        let actual_order: Vec<&str> = q
+            .high_normal
+            .iter()
+            .map(|j| j.perf_key.as_deref().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            actual_order,
+            vec![
+                "pdf::a.pdf#0",
+                "pdf::b.pdf#0",
+                "pdf::stale1.pdf#0",
+                "pdf::stale2.pdf#0",
+            ],
+            "current が先頭、stale が末尾に並ぶ"
+        );
+        assert_eq!(q.normal.len(), 1, "non-match Normal は残る");
     }
 }

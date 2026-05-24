@@ -1047,6 +1047,102 @@ def cmd_spike_context(
 # main
 # -----------------------------------------------------------------------
 
+def cmd_scroll(events: list[dict]) -> None:
+    """scroll_settle / visible_thumb_first_ready / visible_thumb_all_ready を join して
+    可視サムネ表示の latency を集計する。
+
+    出力:
+      seq, t_rel, visible_first_idx, target_count, already_loaded,
+      first_ready_ms, all_ready_ms, pool snapshot 抜粋
+    """
+    if not events:
+        print("(イベント 0 件)")
+        return
+    t0 = min(e.get("t", 0.0) for e in events)
+
+    # settle / first_ready / all_ready を seq でインデックス化
+    settles: dict[int, dict] = {}
+    firsts: dict[int, dict] = {}
+    alls: dict[int, dict] = {}
+    promotes: list[dict] = []
+    for e in events:
+        if e.get("cat") != "ui" and e.get("cat") != "pdf":
+            continue
+        k = e.get("kind")
+        if k == "scroll_settle":
+            seq = e.get("seq", 0)
+            settles[seq] = e
+        elif k == "visible_thumb_first_ready":
+            seq = e.get("settle_seq", 0)
+            firsts[seq] = e
+        elif k == "visible_thumb_all_ready":
+            seq = e.get("settle_seq", 0)
+            alls[seq] = e
+        elif k == "pool_promote_visible":
+            promotes.append(e)
+
+    if not settles:
+        print("(scroll_settle イベントなし — --perf-log で取得し直してください)")
+        return
+
+    print(f"=== Scroll settle latency ({len(settles)} settle events) ===")
+    print(
+        f"{'seq':>4}  {'t_rel':>8}  {'vis_first':>9}  "
+        f"{'target':>6}  {'preload':>7}  {'first_ms':>8}  "
+        f"{'all_ms':>8}  pool"
+    )
+    print("-" * 100)
+    for seq in sorted(settles.keys()):
+        s = settles[seq]
+        rel = s.get("t", 0.0) - t0
+        first = firsts.get(seq)
+        all_ev = alls.get(seq)
+        first_ms = f"{first.get('latency_ms', 0):.0f}" if first else "-"
+        all_ms = f"{all_ev.get('latency_ms', 0):.0f}" if all_ev else "-"
+        pool_str = (
+            f"hn={s.get('pool_high_normal', '?')} "
+            f"n={s.get('pool_normal', '?')} "
+            f"if={s.get('pool_in_flight', '?')}"
+        )
+        print(
+            f"  {seq:>3}  {rel:6.2f}s  {s.get('visible_first_idx', '?'):>9}  "
+            f"{s.get('visible_target_count', '?'):>6}  "
+            f"{s.get('already_loaded', '?'):>7}  {first_ms:>8}  {all_ms:>8}  {pool_str}"
+        )
+
+    # promote イベントの集計
+    if promotes:
+        print()
+        print(f"=== pool_promote_visible: {len(promotes)} events ===")
+        total_promoted = sum(p.get("promoted", 0) for p in promotes)
+        total_already = sum(p.get("already_high", 0) for p in promotes)
+        total_not_found = sum(p.get("not_found", 0) for p in promotes)
+        print(f"  合計 promoted={total_promoted}  already_high={total_already}  not_found={total_not_found}")
+
+    # latency 分布
+    first_latencies = [firsts[k].get("latency_ms", 0) for k in firsts]
+    all_latencies = [alls[k].get("latency_ms", 0) for k in alls]
+    if first_latencies:
+        first_latencies.sort()
+        n = len(first_latencies)
+        print()
+        print(
+            f"first_ready latency: n={n} min={first_latencies[0]:.0f}ms "
+            f"p50={first_latencies[n // 2]:.0f}ms "
+            f"p95={first_latencies[int(n * 0.95) - (0 if n == 1 else 1)]:.0f}ms "
+            f"max={first_latencies[-1]:.0f}ms"
+        )
+    if all_latencies:
+        all_latencies.sort()
+        n = len(all_latencies)
+        print(
+            f"all_ready   latency: n={n} min={all_latencies[0]:.0f}ms "
+            f"p50={all_latencies[n // 2]:.0f}ms "
+            f"p95={all_latencies[int(n * 0.95) - (0 if n == 1 else 1)]:.0f}ms "
+            f"max={all_latencies[-1]:.0f}ms"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="mimageviewer perf_events.jsonl analyzer"
@@ -1078,6 +1174,7 @@ def main() -> None:
     p_dump.add_argument("--with-frames", action="store_true", help="frame.begin も表示する")
     p_tl = subs.add_parser("timeline")
     p_tl.add_argument("seq", type=int, nargs="?", default=None)
+    subs.add_parser("scroll")
 
     args = parser.parse_args()
 
@@ -1109,6 +1206,8 @@ def main() -> None:
         cmd_dump(events, args.seq, args.with_frames)
     elif args.cmd == "timeline":
         cmd_timeline(events, args.seq)
+    elif args.cmd == "scroll":
+        cmd_scroll(events)
 
 
 if __name__ == "__main__":
