@@ -13,8 +13,8 @@ use windows::Win32::UI::Input::Ime::{
     ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT,
-    TrackMouseEvent, VK_CONTROL, VK_MENU, VK_SHIFT,
+    GetFocus, GetKeyState, ReleaseCapture, SetActiveWindow, SetCapture, SetFocus, TME_LEAVE,
+    TRACKMOUSEEVENT, TrackMouseEvent, VK_CONTROL, VK_MENU, VK_SHIFT,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -493,6 +493,10 @@ pub fn foreground_belongs_to_current_process() -> bool {
 
 pub fn foreground_hwnd() -> u64 {
     unsafe { GetForegroundWindow().0 as u64 }
+}
+
+pub fn thread_focus_hwnd() -> u64 {
+    unsafe { GetFocus().0 as u64 }
 }
 
 /// `foreground_belongs_to_current_process` の保守的版。

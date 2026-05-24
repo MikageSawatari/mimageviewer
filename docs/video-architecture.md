@@ -81,6 +81,9 @@ Windows の owner rule (= owned は owner より常に手前) で、presenter HW
 - **Keyboard / IME**: HUD では受けない (`WS_EX_NOACTIVATE` で focus を取らない)。presenter HWND の
   既存 wndproc で受けて `NativeEguiOverlay` に流す。HUD 上の mouse-down で `claim_foreground(presenter_hwnd)`
   を発火することで、VST 操作後でも presenter HWND を foreground/focus に戻して keyboard/IME を維持。
+  TextEdit を含む overlay ダイアログ表示中は、mIV が foreground に戻っているのに presenter thread の
+  `GetFocus()` が外れている場合も、render tick で rate-limit 付き `claim_foreground(presenter_hwnd)` を
+  再実行して Alt+Tab 復帰後の文字入力 / Ctrl+V を回復する。
   Space / Enter / 矢印 / F1〜F6 / W / J/K/L/M/B/P/S などの fullscreen ショートカットは、
   overlay 内のボタン focus が残っていても App 側へ転送する。ブックマーク名編集などの文字入力中だけは
   overlay 側がキーを保持し、Space を文字として入力できるようにする。

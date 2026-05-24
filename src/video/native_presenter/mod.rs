@@ -69,6 +69,7 @@ pub const CURSOR_HIDE_IDLE_SECS: f32 = 3.0;
 const SEEK_STATUS_DELAY: Duration = Duration::from_millis(150);
 const SEEK_STATUS_MIN_VISIBLE: Duration = Duration::from_millis(300);
 const LIMITER_INDICATOR_VISIBLE: Duration = Duration::from_millis(500);
+const TEXT_INPUT_FOCUS_CLAIM_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
 fn seek_status_visible_for_times(
     is_seeking: bool,
@@ -81,6 +82,18 @@ fn seek_status_visible_for_times(
     let held_after_completion =
         visible_since.is_some_and(|shown| now.duration_since(shown) < SEEK_STATUS_MIN_VISIBLE);
     active_after_delay || held_after_completion
+}
+
+fn should_claim_text_input_focus(
+    text_input_active: bool,
+    target_hwnd: u64,
+    thread_focus_hwnd: u64,
+    foreground_is_current_process: bool,
+) -> bool {
+    text_input_active
+        && target_hwnd != 0
+        && thread_focus_hwnd != target_hwnd
+        && foreground_is_current_process
 }
 
 fn format_video_volume_db_compact(volume: f64) -> String {
@@ -301,6 +314,11 @@ struct NativeEguiOverlay {
     /// HUD HWND は `WS_EX_NOACTIVATE` で focus を取らないため、IME context を引くと
     /// 入力が動かない → 必ず presenter HWND を使う (Codex プラン P1 #2 反映)。
     focus_hwnd: HWND,
+    /// テキスト入力ダイアログ表示中に presenter HWND へ focus を戻した時刻。
+    /// HUD HWND は `WS_EX_NOACTIVATE` なので、別アプリから mIV に戻っただけでは
+    /// OS focus が main/HUD 側に残り、presenter wndproc に key/IME が来ない場合がある。
+    /// mIV が前面に戻っている時だけ presenter に戻すためのレート制限。
+    last_text_input_focus_claim_at: Option<Instant>,
     started_at: Instant,
     pending_events: Vec<egui::Event>,
     modifiers: egui::Modifiers,
@@ -3536,6 +3554,7 @@ impl NativeEguiOverlay {
             egui_ctx,
             dcomp_hwnd,
             focus_hwnd,
+            last_text_input_focus_claim_at: None,
             started_at: Instant::now(),
             pending_events: Vec::new(),
             modifiers: egui::Modifiers::default(),
@@ -4942,6 +4961,67 @@ impl NativeEguiOverlay {
 
     fn text_input_active(&self) -> bool {
         self.bookmark_title_edit.is_some() || self.bulk_bookmark_dialog.is_some()
+    }
+
+    fn maybe_claim_text_input_focus(&mut self) {
+        if !self.text_input_active() {
+            self.last_text_input_focus_claim_at = None;
+            return;
+        }
+
+        let target_hwnd = self.focus_hwnd.0 as u64;
+        let thread_focus_hwnd = crate::video::native_window::thread_focus_hwnd();
+        let foreground_is_current_process =
+            crate::video::native_window::foreground_belongs_to_current_process_strict();
+        if !should_claim_text_input_focus(
+            true,
+            target_hwnd,
+            thread_focus_hwnd,
+            foreground_is_current_process,
+        ) {
+            // 他アプリが foreground の間は何もしない。戻ってきた直後の tick で即座に
+            // claim できるよう、抑制タイマはここで解除しておく。
+            if thread_focus_hwnd == target_hwnd || !foreground_is_current_process {
+                self.last_text_input_focus_claim_at = None;
+            }
+            return;
+        }
+
+        let now = Instant::now();
+        if self
+            .last_text_input_focus_claim_at
+            .is_some_and(|prev| now.duration_since(prev) < TEXT_INPUT_FOCUS_CLAIM_MIN_INTERVAL)
+        {
+            return;
+        }
+        self.last_text_input_focus_claim_at = Some(now);
+
+        let foreground_hwnd = crate::video::native_window::foreground_hwnd();
+        let report = crate::video::native_window::claim_foreground(target_hwnd);
+        let post_thread_focus_hwnd = crate::video::native_window::thread_focus_hwnd();
+        log_event(
+            "text_input_focus_claim",
+            &[
+                ("target_hwnd", Value::from(target_hwnd)),
+                ("foreground_hwnd", Value::from(foreground_hwnd)),
+                ("thread_focus_hwnd", Value::from(thread_focus_hwnd)),
+                (
+                    "post_foreground_hwnd",
+                    Value::from(report.post_foreground_hwnd),
+                ),
+                (
+                    "post_thread_focus_hwnd",
+                    Value::from(post_thread_focus_hwnd),
+                ),
+                (
+                    "attach_thread_input_ok",
+                    Value::from(report.attach_thread_input_ok),
+                ),
+                ("set_foreground_ok", Value::from(report.set_foreground_ok)),
+                ("set_active_ok", Value::from(report.set_active_ok)),
+                ("set_focus_ok", Value::from(report.set_focus_ok)),
+            ],
+        );
     }
 
     fn hud_visible(&self) -> bool {
@@ -6536,6 +6616,7 @@ impl NativeEguiOverlay {
         self.frame_step_hold = frame_step_hold;
         self.bookmark_title_edit = bookmark_title_edit;
         self.bulk_bookmark_dialog = bulk_bookmark_dialog;
+        self.maybe_claim_text_input_focus();
         self.top_bar_visible = top_bar_visible || side_panel_visible;
         self.right_panel_visible = right_panel_visible;
         self.jump_panel_visible = jump_panel_visible;
@@ -7267,7 +7348,7 @@ mod tests {
     use super::{
         NativeOverlayInputRouting, NativePixelSample, compare_pixel_probe,
         compute_video_visual_transform, copy_cpu_rgba_to_swapchain_bgra, metadata_clean_text,
-        native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel,
+        native_video_fullscreen_shortcut_key, sample_cpu_rgba_pixel, should_claim_text_input_focus,
     };
     use crate::video::native_window::{
         NativeVideoKeyEvent, NativeVideoMouseWheelEvent, NativeVideoWindowEvent,
@@ -7358,6 +7439,16 @@ mod tests {
         // text_input_active 中はマウス進む/戻るも UI 側へ流さない (= text 編集の邪魔をしない)。
         assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0xA6))));
         assert!(!routing.should_forward_to_ui(&NativeVideoWindowEvent::KeyDown(key(0xA7))));
+    }
+
+    #[test]
+    fn text_input_focus_claim_only_when_app_is_foreground_and_focus_is_missing() {
+        let target = 0x1000;
+        assert!(!should_claim_text_input_focus(false, target, 0, true));
+        assert!(!should_claim_text_input_focus(true, 0, 0, true));
+        assert!(!should_claim_text_input_focus(true, target, target, true));
+        assert!(!should_claim_text_input_focus(true, target, 0, false));
+        assert!(should_claim_text_input_focus(true, target, 0, true));
     }
 
     #[test]
