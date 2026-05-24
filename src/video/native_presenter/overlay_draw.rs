@@ -803,6 +803,12 @@ pub(super) fn draw_native_bookmark_title_editor(
 
 /// 一括ブックマーク登録ダイアログ。中央モーダル。
 /// 戻り値は実描画 rect (region 計算用)。`None` ならダイアログ非表示。
+///
+/// レイアウト方針 (2026-05-24 ユーザー報告):
+/// - **ダイアログ全体の高さは画面高に対して固定**。長文ペーストで textarea が膨らんでも
+///   下部の「登録」「キャンセル」ボタンが画面外に逃げないようにする。
+/// - textarea は ScrollArea で囲い、`max_height` 制約をかけて中身がはみ出たら
+///   textarea 内側でスクロールさせる。
 pub(super) fn draw_native_bulk_bookmark_dialog(
     ctx: &egui::Context,
     overlay_width_points: f32,
@@ -814,7 +820,9 @@ pub(super) fn draw_native_bulk_bookmark_dialog(
         return None;
     };
     let dialog_w = 560.0_f32.min((overlay_width_points - 32.0).max(360.0));
-    let dialog_h = 420.0_f32.min((overlay_height_points - 32.0).max(260.0));
+    // 画面高の 80% (= 上限 720pt) でクランプ。最小 360pt は確保し、
+    // 小画面でも footer ボタンが画面内に収まる範囲で文字入力できる高さにする。
+    let dialog_h = ((overlay_height_points - 64.0).min(720.0)).max(360.0);
     let pos = egui::pos2(
         (overlay_width_points - dialog_w) * 0.5,
         (overlay_height_points - dialog_h) * 0.5,
@@ -829,6 +837,13 @@ pub(super) fn draw_native_bulk_bookmark_dialog(
     let mut request_clear_all = false;
     let mut confirm_clear_now = false;
 
+    // textarea ScrollArea の最大高さ: ダイアログ高から固定要素 (header / footer / frame
+    // margin) を引いた残り。固定要素は実測値ベースの保守的見積もり (約 240pt)。
+    // 内訳: タイトル 22 + 説明文 3行 約 50 + textarea 上下スペース 16 + プレビュー 22 +
+    //       ボタン行 32 + separator+ラベル+ボタン 約 80 + frame margin 28 ≒ 250。
+    // 余裕を見て 260。これで残りが textarea に割り当てられる。
+    let textarea_max_h = (dialog_h - 260.0).max(80.0);
+
     let area_response = egui::Area::new(egui::Id::new("native_video_bulk_bookmark_dialog"))
         .order(egui::Order::Foreground)
         .fixed_pos(pos)
@@ -840,6 +855,7 @@ pub(super) fn draw_native_bulk_bookmark_dialog(
                 .inner_margin(egui::Margin::same(14))
                 .show(ui, |ui| {
                     ui.set_min_width(dialog_w - 28.0);
+                    ui.set_max_width(dialog_w - 28.0);
                     ui.label(
                         egui::RichText::new("ブックマーク一括登録")
                             .size(15.0)
@@ -849,7 +865,7 @@ pub(super) fn draw_native_bulk_bookmark_dialog(
                     ui.label(
                         egui::RichText::new(
                             "1 行 1 件、「hh:mm:ss タイトル」または「mm:ss タイトル」形式で\n\
-                             貼り付けると一括登録できます (YouTube コメントのチャプター記法に対応)。\n\
+                             貼り付けると一括登録できます (動画コメント等のチャプター記法に対応)。\n\
                              既存のブックマークと時刻が ±1 秒以内の行は重複として skip します。",
                         )
                         .size(11.5)
@@ -857,18 +873,48 @@ pub(super) fn draw_native_bulk_bookmark_dialog(
                     );
                     ui.add_space(8.0);
 
-                    let response = ui.add(
-                        egui::TextEdit::multiline(&mut state.textarea)
-                            .desired_width(dialog_w - 28.0)
-                            .desired_rows(12)
-                            .hint_text(
-                                "例:\n0:13 メインテーマ\n2:13 希望に満ちるアナザーデイ\n1:00:08 魏々たる丹砂",
-                            ),
-                    );
-                    if state.request_focus {
-                        response.request_focus();
-                        state.request_focus = false;
-                    }
+                    // textarea を ScrollArea で囲い、長文ペースト時の高さ膨張を抑える。
+                    // `desired_rows(6)` は ScrollArea 内の初期高さ目安 (= 中身が増えれば
+                    // TextEdit 自体は高くなるが、ScrollArea の `max_height` でクリップ +
+                    // 内部スクロールさせる)。
+                    //
+                    // `desired_width` は有限値 (dialog 内幅) を渡す。`f32::INFINITY` を渡すと
+                    // `ScrollArea::vertical()` (= horizontal は scroll しない設計) と組み合
+                    // わせたとき layout が壊れて TextEdit のクリック判定が崩れ、結果として
+                    // フォーカスが取れず Ctrl+V (Event::Paste) が無視される (egui の TextEdit
+                    // は `has_focus(id)` のときだけ Paste を処理する仕様、2026-05-24 ユーザー報告)。
+                    egui::ScrollArea::vertical()
+                        .id_salt("bulk_bookmark_textarea_scroll")
+                        .max_height(textarea_max_h)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            let inner_w = (dialog_w - 28.0).max(120.0);
+                            let response = ui.add(
+                                egui::TextEdit::multiline(&mut state.textarea)
+                                    .desired_width(inner_w)
+                                    .desired_rows(6)
+                                    .hint_text(
+                                        "例:\n0:13 メインテーマ\n2:13 希望に満ちるアナザーデイ\n1:00:08 魏々たる丹砂",
+                                    ),
+                            );
+                            if state.request_focus {
+                                response.request_focus();
+                                state.request_focus = false;
+                            }
+                            // ダイアログ表示中はテキスト入力以外でフォーカスを取る対象が
+                            // 事実上無い (ボタンが少しある程度)。focus が外れたら自動で
+                            // textarea に戻す: ユーザーが偶然 ScrollArea 余白等をクリックして
+                            // フォーカスを失った後でも Ctrl+V が機能するようにする。
+                            // ただし「フォーカス目的のフォーカス」を毎フレーム push すると
+                            // 別ボタンに focus がある時に取り合いになるので、focus が
+                            // どこにも無い場合だけ救済する。
+                            let any_focus = ui
+                                .ctx()
+                                .memory(|m| m.focused().is_some());
+                            if !any_focus {
+                                response.request_focus();
+                            }
+                        });
 
                     ui.add_space(6.0);
                     // プレビュー (パース結果の件数 + エラー行の通知)。

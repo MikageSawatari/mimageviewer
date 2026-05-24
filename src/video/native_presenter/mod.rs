@@ -3800,12 +3800,18 @@ impl NativeEguiOverlay {
                 self.pointer_pos = Some(pos);
                 self.modifiers = modifiers;
                 let over_scroll_panel = self.pointer_over_scroll_panel(pos);
+                // テキスト入力中央モーダル (一括ブックマーク登録ダイアログ / 名称編集) が
+                // 出ているときは、ホイールで前後の動画に飛ばない (テキストや ScrollArea の
+                // スクロールに使う、ユーザー報告 2026-05-24)。bookmark title 編集は単行で
+                // スクロール不要だが、誤って動画切替されないようにこちらも対象に含める。
+                let modal_dialog_visible =
+                    self.bulk_bookmark_dialog.is_some() || self.bookmark_title_edit.is_some();
                 if wheel.ctrl && self.tile_overlay.is_some() {
                     self.pending_overlay_commands
                         .push(NativeOverlayCommand::TileColumnsDelta {
                             delta: if wheel.delta > 0 { -1 } else { 1 },
                         });
-                } else if !wheel.ctrl && !over_scroll_panel {
+                } else if !wheel.ctrl && !over_scroll_panel && !modal_dialog_visible {
                     self.pending_overlay_commands
                         .push(NativeOverlayCommand::WheelNavigate {
                             delta: if wheel.delta < 0 { 1 } else { -1 },
