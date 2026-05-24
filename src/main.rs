@@ -97,6 +97,7 @@ pub mod undo_stack;
 pub mod update_check;
 pub mod video;
 pub mod video_bookmarks;
+pub mod video_bookmarks_parser;
 pub mod video_chapter_thumbs;
 pub mod video_pins;
 pub mod video_thumb;

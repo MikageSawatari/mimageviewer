@@ -1836,6 +1836,12 @@ impl App {
             crate::video::NativeVideoOutputEvent::DeletePin => {
                 self.handle_native_video_delete_pin_command(ctx, fs_idx);
             }
+            crate::video::NativeVideoOutputEvent::BulkAddBookmarks { entries } => {
+                self.handle_native_video_bulk_add_bookmarks_command(ctx, fs_idx, entries);
+            }
+            crate::video::NativeVideoOutputEvent::ClearAllBookmarksForCurrent => {
+                self.handle_native_video_clear_all_bookmarks_command(ctx, fs_idx);
+            }
             crate::video::NativeVideoOutputEvent::OpenExternalUrl { url } => {
                 self.handle_native_video_open_external_url_command(ctx, fs_idx, url);
             }
@@ -3917,6 +3923,126 @@ impl App {
                     ));
                 }
                 Err(e) => crate::logger::log(format!("video pin remove failed: {e}")),
+            }
+        }
+        self.mark_native_video_hud_activity(ctx);
+    }
+
+    #[cfg(windows)]
+    pub(super) fn handle_native_video_bulk_add_bookmarks_command(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        entries: Vec<(f64, String)>,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) {
+            return;
+        }
+        let snapshot = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => {
+                if player.error().is_some() || player.info().is_none() {
+                    None
+                } else {
+                    Some((player.path().clone(), player.duration()))
+                }
+            }
+            _ => None,
+        };
+        let Some((path, duration)) = snapshot else {
+            return;
+        };
+        let Some(db) = self.video_bookmark_db.as_mut() else {
+            return;
+        };
+        // 動画長を超える時刻は登録しない (= 不正なリスト保護)。duration が 0 (未確定)
+        // のときは range check を skip し、`finite_video_target_secs` の clamp に任せる。
+        let mut prepared: Vec<(f64, Option<String>)> = Vec::with_capacity(entries.len());
+        let mut skipped_out_of_range = 0usize;
+        for (pts_raw, title) in entries {
+            if duration > 0.0 && pts_raw > duration + 0.5 {
+                skipped_out_of_range += 1;
+                continue;
+            }
+            let pts = finite_video_target_secs(pts_raw, duration);
+            let title_opt = if title.trim().is_empty() {
+                None
+            } else {
+                Some(title)
+            };
+            prepared.push((pts, title_opt));
+        }
+        // 1 トランザクションで bulk INSERT。autocommit のオーバーヘッドを削減して
+        // 大量貼り付け時に UI スレッドが長時間ブロックしないようにする (Codex P2 #2)。
+        let entries_ref: Vec<(f64, Option<&str>)> = prepared
+            .iter()
+            .map(|(pts, t)| (*pts, t.as_deref()))
+            .collect();
+        let (added, skipped_duplicates, errors) =
+            match db.bulk_add_if_no_duplicate(&path, &entries_ref, 1.0) {
+                Ok(summary) => (summary.added, summary.skipped_duplicates, 0usize),
+                Err(e) => {
+                    crate::logger::log(format!("video bookmark bulk add failed: {e}"));
+                    (0, 0, prepared.len())
+                }
+            };
+        if added > 0 {
+            self.refresh_fullscreen_video_marker_cache(fs_idx);
+            self.sync_native_video_timeline_markers(fs_idx);
+            self.apply_loop_mode_to_player(fs_idx);
+        }
+        let mut msg_parts = vec![format!("一括登録: {added} 件追加")];
+        if skipped_duplicates > 0 {
+            msg_parts.push(format!("重複 skip {skipped_duplicates} 件"));
+        }
+        if skipped_out_of_range > 0 {
+            msg_parts.push(format!("範囲外 {skipped_out_of_range} 件"));
+        }
+        if errors > 0 {
+            msg_parts.push(format!("エラー {errors} 件"));
+        }
+        let msg = msg_parts.join(" / ");
+        crate::logger::log(format!(
+            "video bookmark bulk add: {msg} ({})",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+        ));
+        self.show_native_video_overlay_toast(msg, true);
+        self.mark_native_video_hud_activity(ctx);
+    }
+
+    #[cfg(windows)]
+    pub(super) fn handle_native_video_clear_all_bookmarks_command(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) {
+            return;
+        }
+        let path = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => Some(player.path().clone()),
+            _ => None,
+        };
+        let Some(path) = path else { return };
+        let Some(db) = self.video_bookmark_db.as_ref() else {
+            return;
+        };
+        match db.clear_for(&path) {
+            Ok(()) => {
+                self.refresh_fullscreen_video_marker_cache(fs_idx);
+                self.sync_native_video_timeline_markers(fs_idx);
+                self.apply_loop_mode_to_player(fs_idx);
+                crate::logger::log(format!(
+                    "video bookmark cleared for {}",
+                    path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                ));
+                self.show_native_video_overlay_toast(
+                    "この動画のブックマークをすべて削除しました".to_string(),
+                    true,
+                );
+            }
+            Err(e) => {
+                crate::logger::log(format!("video bookmark clear failed: {e}"));
+                self.show_native_video_overlay_toast(format!("ブックマーク削除に失敗: {e}"), true);
             }
         }
         self.mark_native_video_hud_activity(ctx);

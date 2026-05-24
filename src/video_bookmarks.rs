@@ -42,6 +42,13 @@ pub struct VideoBookmark {
     pub thumb_webp: Vec<u8>,
 }
 
+/// 一括ブックマーク登録の結果サマリ。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BulkAddSummary {
+    pub added: usize,
+    pub skipped_duplicates: usize,
+}
+
 /// シークバーマーカー / ジャンプパネル用の軽量メタデータ。
 #[derive(Clone, Debug)]
 pub struct VideoBookmarkMeta {
@@ -192,7 +199,6 @@ impl VideoBookmarkDb {
 
     /// 新規ブックマーク追加。返す id は `remove` のキーに使う。
     /// `title` が空文字 / None なら NULL で保存。`thumb_webp` も同様。
-    #[allow(dead_code)]
     pub fn add(
         &self,
         video_path: &Path,
@@ -218,6 +224,96 @@ impl VideoBookmarkDb {
             rusqlite::params![key, pts_secs, title_arg.as_deref(), blob, now],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// 一括登録用: 既に同じ動画で `pts_secs` に近いブックマークがあれば skip。
+    /// `dedup_tolerance_secs` 以内のものは「重複」とみなす (典型値 1.0)。
+    /// 戻り値: 追加した場合は `Ok(Some(id))`、skip した場合は `Ok(None)`。
+    pub fn add_if_no_duplicate(
+        &self,
+        video_path: &Path,
+        pts_secs: f64,
+        title: Option<&str>,
+        dedup_tolerance_secs: f64,
+    ) -> Result<Option<i64>, rusqlite::Error> {
+        let key = crate::path_key::normalize_keep_drive(video_path);
+        let lo = pts_secs - dedup_tolerance_secs;
+        let hi = pts_secs + dedup_tolerance_secs;
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM video_bookmarks
+                  WHERE path = ?1 AND pts_secs >= ?2 AND pts_secs <= ?3
+                  LIMIT 1
+             )",
+            rusqlite::params![key, lo, hi],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if exists {
+            return Ok(None);
+        }
+        let id = self.add(video_path, pts_secs, title, &[])?;
+        Ok(Some(id))
+    }
+
+    /// 一括登録: 単一トランザクションで複数件まとめて挿入する。
+    /// `add_if_no_duplicate` を行数分ループする版に比べて autocommit のオーバーヘッドが
+    /// 消えるため、数百件オーダーの貼り付けでも UI スレッドを長時間ブロックしにくい。
+    ///
+    /// - 各 entry を `dedup_tolerance_secs` (典型値 1.0) で重複判定 → 重複なら skip。
+    /// - 同一バッチ内の重複も skip する (前の INSERT で追加された行が見える)。
+    /// - 個別行の INSERT が失敗しても他の行はコミットされる (try-each-row 戦略)。
+    /// - トランザクション全体の commit が失敗した場合は Err を返す (この時点で追加件数は 0)。
+    pub fn bulk_add_if_no_duplicate(
+        &mut self,
+        video_path: &Path,
+        entries: &[(f64, Option<&str>)],
+        dedup_tolerance_secs: f64,
+    ) -> Result<BulkAddSummary, rusqlite::Error> {
+        let key = crate::path_key::normalize_keep_drive(video_path);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let tx = self.conn.transaction()?;
+        let mut added = 0usize;
+        let mut skipped = 0usize;
+        {
+            let mut check_stmt = tx.prepare(
+                "SELECT EXISTS(
+                     SELECT 1 FROM video_bookmarks
+                      WHERE path = ?1 AND pts_secs >= ?2 AND pts_secs <= ?3
+                      LIMIT 1
+                 )",
+            )?;
+            let mut insert_stmt = tx.prepare(
+                "INSERT INTO video_bookmarks
+                    (path, pts_secs, title, thumb_webp, created_at)
+                 VALUES (?1, ?2, ?3, NULL, ?4)",
+            )?;
+            for (pts_secs, title) in entries {
+                let lo = *pts_secs - dedup_tolerance_secs;
+                let hi = *pts_secs + dedup_tolerance_secs;
+                let exists: bool = check_stmt
+                    .query_row(rusqlite::params![&key, lo, hi], |row| row.get::<_, bool>(0))?;
+                if exists {
+                    skipped += 1;
+                    continue;
+                }
+                let title_arg = normalize_bookmark_title(*title);
+                insert_stmt.execute(rusqlite::params![
+                    &key,
+                    *pts_secs,
+                    title_arg.as_deref(),
+                    now,
+                ])?;
+                added += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(BulkAddSummary {
+            added,
+            skipped_duplicates: skipped,
+        })
     }
 
     /// 既存ブックマークの名称を更新する。空文字 / 空白のみ / None は NULL として保存。
@@ -387,6 +483,74 @@ mod tests {
         db.add(Path::new("C:\\A\\M.MP4"), 7.5, None, &[]).unwrap();
         let got = db.list(Path::new("c:/a/m.mp4"));
         assert_eq!(got.len(), 1);
+    }
+
+    #[test]
+    fn add_if_no_duplicate_skips_existing_within_tolerance() {
+        let db = open_in_memory();
+        let p = Path::new("C:/v.mp4");
+        let id1 = db.add_if_no_duplicate(p, 13.0, Some("A"), 1.0).unwrap();
+        assert!(id1.is_some());
+        // 同じ秒なら skip
+        let id2 = db.add_if_no_duplicate(p, 13.0, Some("dup"), 1.0).unwrap();
+        assert!(id2.is_none());
+        // ±tolerance 内なら skip
+        let id3 = db.add_if_no_duplicate(p, 13.5, Some("near"), 1.0).unwrap();
+        assert!(id3.is_none());
+        // tolerance を超えれば追加される
+        let id4 = db.add_if_no_duplicate(p, 15.0, Some("ok"), 1.0).unwrap();
+        assert!(id4.is_some());
+        let list = db.list(p);
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].title.as_deref(), Some("A"));
+        assert_eq!(list[1].title.as_deref(), Some("ok"));
+    }
+
+    #[test]
+    fn bulk_add_if_no_duplicate_dedups_within_batch_and_against_existing() {
+        let mut db = open_in_memory();
+        let p = Path::new("C:/v.mp4");
+        // 既存ブックマーク 1 件 (5.0 秒) を準備
+        db.add(p, 5.0, Some("existing"), &[]).unwrap();
+        // バッチ: 既存と重複 / 範囲内 / 範囲外 / バッチ内重複
+        let entries = vec![
+            (5.0, Some("dup-with-existing")),
+            (5.4, Some("near-existing")),
+            (10.0, Some("ok-1")),
+            (10.5, Some("dup-in-batch")),
+            (20.0, Some("ok-2")),
+        ];
+        let summary = db.bulk_add_if_no_duplicate(p, &entries, 1.0).unwrap();
+        assert_eq!(summary.added, 2);
+        assert_eq!(summary.skipped_duplicates, 3);
+        // 全件確認: existing + ok-1 + ok-2 の 3 件
+        let list = db.list(p);
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].title.as_deref(), Some("existing"));
+        assert_eq!(list[1].title.as_deref(), Some("ok-1"));
+        assert_eq!(list[2].title.as_deref(), Some("ok-2"));
+    }
+
+    #[test]
+    fn bulk_add_if_no_duplicate_empty_batch_is_noop() {
+        let mut db = open_in_memory();
+        let summary = db
+            .bulk_add_if_no_duplicate(Path::new("C:/v.mp4"), &[], 1.0)
+            .unwrap();
+        assert_eq!(summary.added, 0);
+        assert_eq!(summary.skipped_duplicates, 0);
+    }
+
+    #[test]
+    fn add_if_no_duplicate_isolates_by_video() {
+        let db = open_in_memory();
+        db.add_if_no_duplicate(Path::new("C:/a.mp4"), 10.0, None, 1.0)
+            .unwrap();
+        // 別動画の同じ pts は追加される
+        let added = db
+            .add_if_no_duplicate(Path::new("C:/b.mp4"), 10.0, None, 1.0)
+            .unwrap();
+        assert!(added.is_some());
     }
 
     #[test]

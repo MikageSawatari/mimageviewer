@@ -389,12 +389,19 @@ struct NativeEguiOverlay {
     /// SetWindowRgn でクリップされるため、実描画 rect を region に使う。
     /// `None` ならダイアログ非表示または未描画。
     last_drawn_bookmark_editor_rect: Option<egui::Rect>,
+    /// 直近 egui run で描画した一括ブックマーク登録ダイアログの actual rect。
+    /// ダイアログは「確認モード」のあるなしや TextEdit の表示行数で高さが変動するため、
+    /// 固定見積もり (560×420) では下部ボタンが SetWindowRgn から落ちることがある
+    /// (= ボタンクリックが seek bar / video HWND に抜ける、ホバー外側でカーソル形状が
+    /// 戻らない、等の症状。Codex P2 #1 2026-05-24)。`None` ならダイアログ非表示または未描画。
+    last_drawn_bulk_bookmark_dialog_rect: Option<egui::Rect>,
     hover_thumbnail: Option<NativeOverlayThumbnail>,
     hover_texture: Option<egui::TextureHandle>,
     hover_texture_key: Option<(u32, u32, u64)>,
     timeline_markers: Vec<NativeOverlayTimelineMarker>,
     jump_entries: Vec<NativeOverlayJumpEntry>,
     bookmark_title_edit: Option<NativeBookmarkTitleEdit>,
+    bulk_bookmark_dialog: Option<NativeBulkBookmarkDialog>,
     video_metadata: Option<NativeOverlayMetadata>,
     navigation_preview: Option<NativeOverlayNavigationPreview>,
     navigation_preview_texture: Option<(u64, egui::TextureHandle)>,
@@ -450,6 +457,17 @@ struct NativeBookmarkTitleEdit {
     id: i64,
     title: String,
     request_focus: bool,
+}
+
+/// 一括ブックマーク登録ダイアログの永続 state。
+/// `Some` の間ダイアログが描画される。`textarea` にユーザーがペーストした
+/// チャプターテキストが入り、登録ボタンで `BulkAddBookmarks` コマンドを発行する。
+#[derive(Clone, Debug, Default)]
+pub(super) struct NativeBulkBookmarkDialog {
+    pub(super) textarea: String,
+    pub(super) request_focus: bool,
+    /// 直近のパース結果プレビュー (件数 + エラー行)。
+    pub(super) confirm_clear_all: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -826,6 +844,137 @@ impl NativeOverlayInputOutcome {
     }
 }
 
+/// OS clipboard から UTF-16 テキストを読み出す。空 / 失敗時は None。
+/// text input ダイアログ (一括ブックマーク登録 / bookmark title 編集) の Ctrl+V から呼ぶ。
+fn read_clipboard_text_windows() -> Option<String> {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+    unsafe {
+        if OpenClipboard(Some(HWND::default())).is_err() {
+            return None;
+        }
+        let hmem = match GetClipboardData(CF_UNICODETEXT.0 as u32) {
+            Ok(h) => h,
+            Err(_) => {
+                let _ = CloseClipboard();
+                return None;
+            }
+        };
+        if hmem.is_invalid() {
+            let _ = CloseClipboard();
+            return None;
+        }
+        let global = windows::Win32::Foundation::HGLOBAL(hmem.0);
+        let ptr = GlobalLock(global) as *const u16;
+        if ptr.is_null() {
+            let _ = CloseClipboard();
+            return None;
+        }
+        let max_bytes = GlobalSize(global);
+        let max_u16 = max_bytes / 2;
+        let mut len = 0usize;
+        while len < max_u16 && *ptr.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        let s = String::from_utf16_lossy(slice);
+        let _ = GlobalUnlock(global);
+        let _ = CloseClipboard();
+        if s.is_empty() { None } else { Some(s) }
+    }
+}
+
+/// OS clipboard へ UTF-16 テキストを書き込む。
+/// egui の `OutputCommand::CopyText` (= Ctrl+C / Ctrl+X の応答) から呼ぶ。
+///
+/// 失敗経路では必ず `GlobalFree(hmem)` を呼ぶ (Codex P3 2026-05-24):
+/// clipboard が ownership を取るのは `SetClipboardData` が **成功** したときだけ。
+/// それ以前のどの段階で抜けても解放しないと leak する。
+fn write_clipboard_text_windows(text: &str) {
+    use windows::Win32::Foundation::{GlobalFree, HANDLE, HWND};
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows::Win32::System::Memory::{
+        GLOBAL_ALLOC_FLAGS, GlobalAlloc, GlobalLock, GlobalUnlock,
+    };
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes = utf16.len() * 2;
+    unsafe {
+        let Ok(hmem) = GlobalAlloc(GLOBAL_ALLOC_FLAGS(0x0002), bytes) else {
+            return;
+        };
+        let ptr = GlobalLock(hmem) as *mut u16;
+        if ptr.is_null() {
+            let _ = GlobalFree(Some(hmem));
+            return;
+        }
+        std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr, utf16.len());
+        let _ = GlobalUnlock(hmem);
+        if OpenClipboard(Some(HWND::default())).is_err() {
+            let _ = GlobalFree(Some(hmem));
+            return;
+        }
+        let _ = EmptyClipboard();
+        // SetClipboardData が成功するとメモリの ownership は OS clipboard に移る。
+        // 失敗時はこちらが解放責任を持つので明示的に GlobalFree する。
+        match SetClipboardData(CF_UNICODETEXT.0 as u32, Some(HANDLE(hmem.0))) {
+            Ok(_) => {}
+            Err(_) => {
+                let _ = GlobalFree(Some(hmem));
+            }
+        }
+        let _ = CloseClipboard();
+    }
+}
+
+/// Windows clipboard (CF_UNICODETEXT) の CRLF / 単独 CR を LF に正規化する。
+/// `egui-winit` の paste 経路と挙動を揃え、TextEdit に `\r` が残らないようにする。
+fn normalize_clipboard_newlines(s: &str) -> String {
+    // \r\n → \n を先に変換し、残った単独 \r も \n に置き換える (古い Mac 形式対応)。
+    s.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+#[cfg(test)]
+mod clipboard_normalize_tests {
+    use super::normalize_clipboard_newlines;
+
+    #[test]
+    fn crlf_becomes_lf() {
+        assert_eq!(normalize_clipboard_newlines("a\r\nb\r\nc"), "a\nb\nc");
+    }
+
+    #[test]
+    fn lone_cr_becomes_lf() {
+        assert_eq!(normalize_clipboard_newlines("a\rb\rc"), "a\nb\nc");
+    }
+
+    #[test]
+    fn lf_is_preserved() {
+        assert_eq!(normalize_clipboard_newlines("a\nb\nc"), "a\nb\nc");
+    }
+
+    #[test]
+    fn mixed_endings() {
+        assert_eq!(normalize_clipboard_newlines("a\r\nb\nc\rd"), "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn no_newlines_unchanged() {
+        assert_eq!(normalize_clipboard_newlines("plain text"), "plain text");
+    }
+
+    #[test]
+    fn empty_unchanged() {
+        assert_eq!(normalize_clipboard_newlines(""), "");
+    }
+}
+
 fn native_video_fullscreen_shortcut_key(
     key: &crate::video::native_window::NativeVideoKeyEvent,
 ) -> bool {
@@ -952,6 +1101,13 @@ pub enum NativeOverlayCommand {
         id: i64,
     },
     DeletePin,
+    /// 一括ブックマーク登録 (YouTube コメント形式のチャプター列を一括追加)。
+    /// 重複は ±1s で skip、結果はトーストで通知。
+    BulkAddBookmarks {
+        entries: Vec<(f64, String)>,
+    },
+    /// 現在再生中の動画のブックマークを全削除。
+    ClearAllBookmarksForCurrent,
     OpenExternalUrl {
         url: String,
     },
@@ -3437,12 +3593,14 @@ impl NativeEguiOverlay {
             last_drawn_toast_rect: None,
             last_drawn_speed_popup_rect: None,
             last_drawn_bookmark_editor_rect: None,
+            last_drawn_bulk_bookmark_dialog_rect: None,
             hover_thumbnail: None,
             hover_texture: None,
             hover_texture_key: None,
             timeline_markers: Vec::new(),
             jump_entries: Vec::new(),
             bookmark_title_edit: None,
+            bulk_bookmark_dialog: None,
             video_metadata: None,
             navigation_preview: None,
             navigation_preview_texture: None,
@@ -3536,6 +3694,50 @@ impl NativeEguiOverlay {
                 let modifiers = egui_modifiers(key.shift, key.ctrl, key.alt);
                 self.modifiers = modifiers;
                 if !self.text_input_active() && native_video_fullscreen_shortcut_key(&key) {
+                    return;
+                }
+                // text input active 時に Ctrl+V/C/X を OS clipboard と橋渡しする。
+                // egui の TextEdit は Event::Paste / Copy / Cut だけ拾い、Ctrl 修飾の
+                // raw Key event では発火しない (egui 0.33 の仕様)。Ctrl+A/Z/Y は Key
+                // event のままで egui 側が処理する。
+                // egui-winit と挙動を揃え、Copy/Cut/Paste を発行したら raw Key event は
+                // **積まずに return** する (Codex P2 2026-05-24)。さもないと TextEdit が
+                // 同フレームで Paste + Key{V, ctrl} を二重処理する余地が残る。
+                let mut clipboard_consumed = false;
+                if matches!(event, NativeEvent::KeyDown(_))
+                    && key.ctrl
+                    && !key.alt
+                    && self.text_input_active()
+                {
+                    match key.virtual_key {
+                        0x56 => {
+                            // Ctrl+V: Windows の CF_UNICODETEXT は CRLF 改行なので、
+                            // egui-winit と同様に \r\n / 単独 \r を \n に正規化してから
+                            // Event::Paste に流す。さもないと TextEdit に \r が残り、
+                            // 表示・カーソル移動・行処理で妙な挙動が出る (Codex P2)。
+                            if let Some(text) = read_clipboard_text_windows() {
+                                let normalized = normalize_clipboard_newlines(&text);
+                                self.pending_events.push(egui::Event::Paste(normalized));
+                                self.dirty = true;
+                                clipboard_consumed = true;
+                            }
+                        }
+                        0x43 => {
+                            // Ctrl+C
+                            self.pending_events.push(egui::Event::Copy);
+                            self.dirty = true;
+                            clipboard_consumed = true;
+                        }
+                        0x58 => {
+                            // Ctrl+X
+                            self.pending_events.push(egui::Event::Cut);
+                            self.dirty = true;
+                            clipboard_consumed = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if clipboard_consumed {
                     return;
                 }
                 if let Some(egui_key) = egui_key_from_virtual_key(key.virtual_key) {
@@ -4199,6 +4401,7 @@ impl NativeEguiOverlay {
             || self.hover_preview_target_secs.is_some()
             || self.frame_step_hold.is_some()
             || self.bookmark_title_edit.is_some()
+            || self.bulk_bookmark_dialog.is_some()
             || self.toast.is_some()
             || self.video_error.is_some()
             || !self.first_frame_presented
@@ -4625,6 +4828,31 @@ impl NativeEguiOverlay {
             }
         }
 
+        // 一括ブックマーク登録ダイアログ: 大きめの中央モーダル。
+        // **実描画した rect を最優先で使う**。ダイアログ高さは「確認削除モード」のあるなし /
+        // TextEdit の表示行数 / DPI でかなり変動し、固定見積もりだと下部ボタンが region に
+        // 入らず click / hover が抜ける (Codex P2 #1)。
+        // 初回フレーム (実描画前) のみ概算 fallback を使う。
+        if self.bulk_bookmark_dialog.is_some() {
+            let rect = self
+                .last_drawn_bulk_bookmark_dialog_rect
+                .unwrap_or_else(|| {
+                    let dialog_w = 560.0_f32.min((width_points - 32.0).max(360.0));
+                    let dialog_h = 420.0_f32.min((height_points - 32.0).max(260.0));
+                    egui::Rect::from_min_size(
+                        egui::pos2(
+                            (width_points - dialog_w) * 0.5,
+                            (height_points - dialog_h) * 0.5,
+                        ),
+                        egui::vec2(dialog_w, dialog_h),
+                    )
+                });
+            let rect_px = rect_to_px(rect.expand(2.0));
+            if rect_px.left < rect_px.right && rect_px.top < rect_px.bottom {
+                regions.push(rect_px);
+            }
+        }
+
         // Normalize progress / scan blocker: 全画面被覆 (= scan 中はモーダル cancel ボタン操作のため)。
         if matches!(
             self.normalize_state.ui_state,
@@ -4707,7 +4935,7 @@ impl NativeEguiOverlay {
     }
 
     fn text_input_active(&self) -> bool {
-        self.bookmark_title_edit.is_some()
+        self.bookmark_title_edit.is_some() || self.bulk_bookmark_dialog.is_some()
     }
 
     fn hud_visible(&self) -> bool {
@@ -4904,6 +5132,7 @@ impl NativeEguiOverlay {
         let timeline_markers = self.timeline_markers.clone();
         let jump_entries = self.jump_entries.clone();
         let mut bookmark_title_edit = self.bookmark_title_edit.take();
+        let mut bulk_bookmark_dialog = self.bulk_bookmark_dialog.take();
         let video_metadata = self.video_metadata.clone();
         let navigation_preview = self.navigation_preview.clone();
         let navigation_preview_texture_id = self
@@ -4943,6 +5172,7 @@ impl NativeEguiOverlay {
             && video_error.is_none();
         let toast_visible = toast.is_some();
         let bookmark_title_edit_visible = bookmark_title_edit.is_some();
+        let bulk_bookmark_dialog_visible = bulk_bookmark_dialog.is_some();
         let side_panel_visible = !tile_overlay_visible
             && !navigation_preview_visible
             && (jump_panel_visible || right_panel_visible);
@@ -4982,6 +5212,7 @@ impl NativeEguiOverlay {
             || status_visible
             || toast_visible
             || bookmark_title_edit_visible
+            || bulk_bookmark_dialog_visible
             || paused_center_visible
             || vst3_panel_visible
             || normalize_scanning;
@@ -5008,6 +5239,7 @@ impl NativeEguiOverlay {
             || status_visible
             || toast_visible
             || bookmark_title_edit_visible
+            || bulk_bookmark_dialog_visible
             || paused_center_visible
             || vst3_panel_visible
             || normalize_scanning
@@ -5034,6 +5266,7 @@ impl NativeEguiOverlay {
         let mut last_drawn_toast_rect: Option<egui::Rect> = None;
         let mut last_drawn_speed_popup_rect: Option<egui::Rect> = None;
         let mut last_drawn_bookmark_editor_rect: Option<egui::Rect> = None;
+        let mut last_drawn_bulk_bookmark_dialog_rect: Option<egui::Rect> = None;
         if !overlay_visible {
             self.set_visual_attached(false)?;
             last_seek_target_secs = None;
@@ -5257,6 +5490,7 @@ impl NativeEguiOverlay {
                     &jump_entries,
                     &jump_texture_ids,
                     &mut bookmark_title_edit,
+                    &mut bulk_bookmark_dialog,
                     &mut commands,
                 );
             }
@@ -5266,6 +5500,15 @@ impl NativeEguiOverlay {
                     overlay_width_points,
                     overlay_height_points,
                     &mut bookmark_title_edit,
+                    &mut commands,
+                );
+            }
+            if bulk_bookmark_dialog.is_some() {
+                last_drawn_bulk_bookmark_dialog_rect = draw_native_bulk_bookmark_dialog(
+                    ctx,
+                    overlay_width_points,
+                    overlay_height_points,
+                    &mut bulk_bookmark_dialog,
                     &mut commands,
                 );
             }
@@ -6282,12 +6525,20 @@ impl NativeEguiOverlay {
         self.last_drawn_toast_rect = last_drawn_toast_rect;
         self.last_drawn_speed_popup_rect = last_drawn_speed_popup_rect;
         self.last_drawn_bookmark_editor_rect = last_drawn_bookmark_editor_rect;
+        self.last_drawn_bulk_bookmark_dialog_rect = last_drawn_bulk_bookmark_dialog_rect;
         self.video_speed_popup_open = video_speed_popup_open;
         self.frame_step_hold = frame_step_hold;
         self.bookmark_title_edit = bookmark_title_edit;
+        self.bulk_bookmark_dialog = bulk_bookmark_dialog;
         self.top_bar_visible = top_bar_visible || side_panel_visible;
         self.right_panel_visible = right_panel_visible;
         self.jump_panel_visible = jump_panel_visible;
+        // egui 側で発行されたクリップボードコピー (Ctrl+C / Ctrl+X 応答) を OS に流す。
+        for cmd in &full_output.platform_output.commands {
+            if let egui::OutputCommand::CopyText(text) = cmd {
+                write_clipboard_text_windows(text);
+            }
+        }
         self.update_ime_cursor_area(full_output.platform_output.ime);
         // パネル / HUD / トースト / paused_center などの「ユーザー操作対象 UI」が
         // 一切出ていない (= cursor_blocking_overlay_visible が false) で、ユーザー
@@ -6394,7 +6645,9 @@ impl NativeEguiOverlay {
         for id in &full_output.textures_delta.free {
             self.renderer.free_texture(id);
         }
-        self.dirty = self.frame_step_hold.is_some() || self.bookmark_title_edit.is_some();
+        self.dirty = self.frame_step_hold.is_some()
+            || self.bookmark_title_edit.is_some()
+            || self.bulk_bookmark_dialog.is_some();
         log_event(
             "egui_overlay_present",
             &[

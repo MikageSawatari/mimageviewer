@@ -5,11 +5,11 @@ use std::time::{Duration, Instant};
 use crate::ui_helpers::HoverTipExt;
 
 use super::{
-    NativeBookmarkTitleEdit, NativeFrameStepHold, NativeOverlayCommand, NativeOverlayJumpEntry,
-    NativeOverlayMetadata, NativeOverlayNavigationPreview, NativeOverlayPerfSample,
-    NativeOverlayPerfSnapshot, NativeOverlayThumbnail, NativeOverlayTileOverlay,
-    NativeOverlayTimelineMarker, NativeOverlayTimelineMarkerKind, NativeOverlayToast,
-    NativeOverlayVst3ChainSlot, NativeOverlayVst3Panel, NativeOverlayVst3Slot,
+    NativeBookmarkTitleEdit, NativeBulkBookmarkDialog, NativeFrameStepHold, NativeOverlayCommand,
+    NativeOverlayJumpEntry, NativeOverlayMetadata, NativeOverlayNavigationPreview,
+    NativeOverlayPerfSample, NativeOverlayPerfSnapshot, NativeOverlayThumbnail,
+    NativeOverlayTileOverlay, NativeOverlayTimelineMarker, NativeOverlayTimelineMarkerKind,
+    NativeOverlayToast, NativeOverlayVst3ChainSlot, NativeOverlayVst3Panel, NativeOverlayVst3Slot,
     NativeOverlayVst3SlotState,
 };
 
@@ -375,6 +375,7 @@ pub(super) fn draw_native_jump_panel(
     entries: &[NativeOverlayJumpEntry],
     jump_texture_ids: &HashMap<usize, egui::TextureId>,
     bookmark_title_edit: &mut Option<NativeBookmarkTitleEdit>,
+    bulk_bookmark_dialog: &mut Option<NativeBulkBookmarkDialog>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
     let panel_rect = native_jump_panel_rect(overlay_height_points);
@@ -410,6 +411,34 @@ pub(super) fn draw_native_jump_panel(
                 egui::FontId::proportional(13.0),
                 egui::Color32::from_rgb(238, 238, 238),
             );
+
+            // 一括ブックマーク登録ダイアログを開くボタン。
+            // 配置: 既存の Pin (- 68pt) / Bookmark (- 36pt) の左側に並べる (- 100pt)。
+            let bulk_rect = egui::Rect::from_min_size(
+                rect.min + egui::vec2(rect.width() - 100.0, 6.0),
+                egui::vec2(26.0, 24.0),
+            );
+            let bulk_resp = ui.interact(
+                bulk_rect,
+                egui::Id::new("native_jump_bulk_bookmark"),
+                egui::Sense::click(),
+            );
+            draw_overlay_button_bg(&painter, bulk_rect, bulk_resp.hovered(), false);
+            draw_overlay_bulk_bookmark_icon(
+                &painter,
+                bulk_rect.center(),
+                7.5,
+                egui::Color32::from_rgb(255, 220, 82),
+            );
+            let bulk_resp = bulk_resp
+                .hover_tip_dark("ブックマークを一括登録 (YouTube チャプター形式の貼り付け)");
+            if bulk_resp.clicked() && bulk_bookmark_dialog.is_none() {
+                *bulk_bookmark_dialog = Some(NativeBulkBookmarkDialog {
+                    textarea: String::new(),
+                    request_focus: true,
+                    confirm_clear_all: false,
+                });
+            }
 
             let pin_rect = egui::Rect::from_min_size(
                 rect.min + egui::vec2(rect.width() - 68.0, 6.0),
@@ -769,6 +798,168 @@ pub(super) fn draw_native_bookmark_title_editor(
     } else if cancel {
         *edit = None;
     }
+    Some(area_response.response.rect)
+}
+
+/// 一括ブックマーク登録ダイアログ。中央モーダル。
+/// 戻り値は実描画 rect (region 計算用)。`None` ならダイアログ非表示。
+pub(super) fn draw_native_bulk_bookmark_dialog(
+    ctx: &egui::Context,
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+    dialog: &mut Option<NativeBulkBookmarkDialog>,
+    commands: &mut Vec<NativeOverlayCommand>,
+) -> Option<egui::Rect> {
+    let Some(state) = dialog.as_mut() else {
+        return None;
+    };
+    let dialog_w = 560.0_f32.min((overlay_width_points - 32.0).max(360.0));
+    let dialog_h = 420.0_f32.min((overlay_height_points - 32.0).max(260.0));
+    let pos = egui::pos2(
+        (overlay_width_points - dialog_w) * 0.5,
+        (overlay_height_points - dialog_h) * 0.5,
+    );
+
+    let (entries, errors) = crate::video_bookmarks_parser::parse_chapter_text(&state.textarea);
+    let entry_count = entries.len();
+    let error_count = errors.len();
+
+    let mut register = false;
+    let mut cancel = false;
+    let mut request_clear_all = false;
+    let mut confirm_clear_now = false;
+
+    let area_response = egui::Area::new(egui::Id::new("native_video_bulk_bookmark_dialog"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(pos)
+        .show(ctx, |ui| {
+            egui::Frame::new()
+                .fill(egui::Color32::from_rgba_unmultiplied(18, 18, 24, 244))
+                .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(112)))
+                .corner_radius(egui::CornerRadius::same(5))
+                .inner_margin(egui::Margin::same(14))
+                .show(ui, |ui| {
+                    ui.set_min_width(dialog_w - 28.0);
+                    ui.label(
+                        egui::RichText::new("ブックマーク一括登録")
+                            .size(15.0)
+                            .color(egui::Color32::from_rgb(238, 238, 238)),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "1 行 1 件、「hh:mm:ss タイトル」または「mm:ss タイトル」形式で\n\
+                             貼り付けると一括登録できます (YouTube コメントのチャプター記法に対応)。\n\
+                             既存のブックマークと時刻が ±1 秒以内の行は重複として skip します。",
+                        )
+                        .size(11.5)
+                        .color(egui::Color32::from_gray(190)),
+                    );
+                    ui.add_space(8.0);
+
+                    let response = ui.add(
+                        egui::TextEdit::multiline(&mut state.textarea)
+                            .desired_width(dialog_w - 28.0)
+                            .desired_rows(12)
+                            .hint_text(
+                                "例:\n0:13 メインテーマ\n2:13 希望に満ちるアナザーデイ\n1:00:08 魏々たる丹砂",
+                            ),
+                    );
+                    if state.request_focus {
+                        response.request_focus();
+                        state.request_focus = false;
+                    }
+
+                    ui.add_space(6.0);
+                    // プレビュー (パース結果の件数 + エラー行の通知)。
+                    let preview_text = if state.textarea.trim().is_empty() {
+                        "貼り付け待ち".to_string()
+                    } else if error_count == 0 {
+                        format!("解釈成功: {entry_count} 件")
+                    } else {
+                        format!(
+                            "解釈成功: {entry_count} 件 / 解釈できなかった行: {error_count} 件 (行番号: {})",
+                            errors
+                                .iter()
+                                .take(8)
+                                .map(|n| n.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    let preview_color = if error_count == 0 {
+                        egui::Color32::from_rgb(170, 220, 170)
+                    } else {
+                        egui::Color32::from_rgb(240, 200, 130)
+                    };
+                    ui.colored_label(preview_color, egui::RichText::new(preview_text).size(11.5));
+                    ui.add_space(8.0);
+
+                    ui.horizontal(|ui| {
+                        let register_enabled = entry_count > 0;
+                        let register_btn = egui::Button::new(
+                            egui::RichText::new(format!("登録 ({entry_count} 件)")).size(13.0),
+                        );
+                        let register_resp = ui.add_enabled(register_enabled, register_btn);
+                        if register_resp.clicked() {
+                            register = true;
+                        }
+                        if ui.button("キャンセル").clicked() {
+                            cancel = true;
+                        }
+                    });
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.label(
+                        egui::RichText::new("誤登録対策")
+                            .size(12.0)
+                            .color(egui::Color32::from_gray(200)),
+                    );
+                    ui.add_space(4.0);
+                    if !state.confirm_clear_all {
+                        let resp = ui.button("この動画のブックマークをすべて削除");
+                        if resp.clicked() {
+                            request_clear_all = true;
+                        }
+                    } else {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(250, 170, 130),
+                            egui::RichText::new("本当にすべて削除しますか? (取り消せません)")
+                                .size(12.0),
+                        );
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("削除を実行").clicked() {
+                                confirm_clear_now = true;
+                            }
+                            if ui.button("やめる").clicked() {
+                                state.confirm_clear_all = false;
+                            }
+                        });
+                    }
+                });
+        });
+
+    if request_clear_all {
+        state.confirm_clear_all = true;
+    }
+    if confirm_clear_now {
+        commands.push(NativeOverlayCommand::ClearAllBookmarksForCurrent);
+        state.confirm_clear_all = false;
+    }
+    if register {
+        let entry_tuples: Vec<(f64, String)> =
+            entries.into_iter().map(|e| (e.pts_secs, e.title)).collect();
+        commands.push(NativeOverlayCommand::BulkAddBookmarks {
+            entries: entry_tuples,
+        });
+        *dialog = None;
+    } else if cancel {
+        *dialog = None;
+    }
+
     Some(area_response.response.rect)
 }
 
@@ -3143,6 +3334,42 @@ pub(super) fn draw_overlay_bookmark_icon(
         fill,
         egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 245, 190)),
     ));
+}
+
+/// 一括ブックマーク登録用のアイコン。
+/// 左側に小さなブックマーク、右側に「リスト」を示す 3 本の横線。
+pub(super) fn draw_overlay_bulk_bookmark_icon(
+    painter: &egui::Painter,
+    c: egui::Pos2,
+    r: f32,
+    fill: egui::Color32,
+) {
+    // 左側の小さなブックマーク (個別 bookmark の縮小版)
+    let mark_w = r * 0.85;
+    let mark_h = r * 1.30;
+    let mark_center = egui::pos2(c.x - r * 0.55, c.y);
+    let rect = egui::Rect::from_center_size(mark_center, egui::vec2(mark_w, mark_h));
+    let notch = egui::pos2(rect.center().x, rect.max.y - r * 0.28);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            rect.left_top(),
+            rect.right_top(),
+            rect.right_bottom(),
+            notch,
+            rect.left_bottom(),
+        ],
+        fill,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 245, 190)),
+    ));
+    // 右側のリスト線 (3 本)
+    let line_color = fill;
+    let stroke = egui::Stroke::new(1.4, line_color);
+    let x0 = c.x + r * 0.15;
+    let x1 = c.x + r * 0.85;
+    for i in 0..3 {
+        let y = c.y + (i as f32 - 1.0) * r * 0.45;
+        painter.line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], stroke);
+    }
 }
 
 pub(super) fn draw_overlay_pencil_icon(

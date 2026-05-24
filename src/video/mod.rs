@@ -382,6 +382,13 @@ pub enum NativeVideoOutputEvent {
         id: i64,
     },
     DeletePin,
+    /// 一括ブックマーク登録 (YouTube コメント形式のチャプター列)。
+    /// `(pts_secs, title)` の Vec。タイトルが空文字なら NULL 保存。
+    BulkAddBookmarks {
+        entries: Vec<(f64, String)>,
+    },
+    /// 現在再生中の動画のブックマークを全削除。
+    ClearAllBookmarksForCurrent,
     OpenExternalUrl {
         url: String,
     },
@@ -1405,6 +1412,10 @@ fn send_native_overlay_command(
         }
         Command::DeleteBookmark { id } => NativeVideoOutputEvent::DeleteBookmark { id },
         Command::DeletePin => NativeVideoOutputEvent::DeletePin,
+        Command::BulkAddBookmarks { entries } => {
+            NativeVideoOutputEvent::BulkAddBookmarks { entries }
+        }
+        Command::ClearAllBookmarksForCurrent => NativeVideoOutputEvent::ClearAllBookmarksForCurrent,
         Command::OpenExternalUrl { url } => NativeVideoOutputEvent::OpenExternalUrl { url },
         Command::ToggleNormalize => NativeVideoOutputEvent::ToggleNormalize,
         Command::DisableNormalize => NativeVideoOutputEvent::DisableNormalize,
@@ -2917,6 +2928,22 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::DeletePin,
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::BulkAddBookmarks {
+                                entries,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::BulkAddBookmarks { entries },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ClearAllBookmarksForCurrent => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ClearAllBookmarksForCurrent,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::OpenExternalUrl {
