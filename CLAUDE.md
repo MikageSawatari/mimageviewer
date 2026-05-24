@@ -44,7 +44,7 @@ dual-window approach.
 - **Video thumbnails**: Windows Shell API (IShellItemImageFactory)
 - **Video inline playback**: `ffmpeg-the-third` クレート + FFmpeg LGPL shared DLL (BtbN ビルド) + `cpal` (WASAPI Shared 音声出力)。フルスクリーンで動画を MP4 / MKV / MOV / AVI / WMV / MPG / MPEG / HEVC / AV1 として再生する。`avcodec / avformat / avutil / avfilter / swscale / swresample` の 6 DLL を launcher (`crates/launcher/`) が `include_bytes!` で内包し、初回起動時に `%APPDATA%/mimageviewer/runtime/<version>/` へ展開して本体 (`mimageviewer-core.exe`) を spawn する。本体側は exe と同じディレクトリの DLL を Windows ローダが解決するだけで個別ロード処理は持たない。ビルドに libclang (LLVM/Clang) が必要。詳細は「FFmpeg LGPL DLL 管理」節を参照
 - **ZIP support**: `zip` crate
-- **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み) + マルチプロセスワーカープール (3 プロセス並列レンダリング)
+- **PDF support**: `pdfium-render` crate + PDFium DLL (exe に埋め込み) + マルチプロセスワーカープール (5 プロセス並列レンダリング、1 つを Critical 予約)
 - **PDF password**: `windows-dpapi` crate (DPAPI 暗号化でパスワード永続保存)
 - **AI upscaling**: `ort` crate (ONNX Runtime v2、`load-dynamic` モード、`directml` + `cuda` + `tensorrt` features)。Real-ESRGAN / Real-CUGAN / NMKD-Siax ONNX モデルでタイル分割 4x アップスケール。バックエンドは Settings の `ai_backend` で DirectML / TensorRT を切替 (TRT は NVIDIA 専用)
 - **ONNX Runtime DLL**: `onnxruntime.dll` / `onnxruntime_providers_shared.dll` (Microsoft.ML.OnnxRuntime.DirectML NuGet v1.24.2) を exe に `include_bytes!` で埋め込み、初回 AiRuntime 作成時に `%APPDATA%/mimageviewer/` に展開。`ort::init_from()` で動的ロードする。これにより VC++ 再頒布可能パッケージ不要
@@ -501,7 +501,7 @@ UI 同期なら、worker 化・キャンセル・結果適用時の世代/idx �
 ## Performance Notes
 
 - **JPEG デコード**: TurboJPEG (SIMD) で小〜中 JPEG を 1.5-2.4 倍高速化。5MB 超は image クレート (zune-jpeg) にフォールバック
-- **PDF レンダリング**: 3 ワーカープロセス並列で Cold 1441ms → 10ms (99% 改善)。各プロセスが独立に PDFium を初期化
+- **PDF レンダリング**: 5 ワーカープロセス並列で Cold 1441ms → 10ms (99% 改善)。各プロセスが独立に PDFium を初期化 (1 つは Enter 操作用に Critical 予約)
 - **キャッシュ読み込み**: 2〜3ms/枚（WebP デコード）
 - **キャンセル遅延**: 旧タスクが1枚のデコード中の場合、最大1デコード時間待つ
 - **ログ**: `cargo run` 時に `mimageviewer.log` へ出力（.gitignore 済み）

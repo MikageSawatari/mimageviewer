@@ -1758,7 +1758,7 @@ pub struct App {
     /// 重い同期 I/O (ZipFile, Folder) 用の専用キュー。
     /// 専用 I/O ワーカー (2本) が priority 順に取り出す。
     /// PdfFile は別プロセス IPC のため通常キュー側に振り分けて
-    /// PDFium pool (POOL_SIZE=3) の並列度を活かす。
+    /// PDFium pool (POOL_SIZE=5) の並列度を活かす。
     pub(crate) heavy_io_queue: Option<Arc<NotifyQueue>>,
     /// ロード要求を送ったがまだ応答が来ていない idx 集合（重複要求防止）。
     /// 値は `true` ならアイドル時アップグレード要求、`false` なら通常の読み込み要求。

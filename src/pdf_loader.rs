@@ -165,7 +165,7 @@ pub fn pool_queue_snapshot() -> Option<PoolQueueSnapshot> {
     ages_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let max = ages_ms.last().copied().unwrap_or(0.0);
     // Codex P3 対応: n が小さい (2-3) ときの p95 計算。
-    // worker 数 = POOL_SIZE (= 3) なので in-flight も最大 3。`(n * 0.95) as usize - 1` だと
+    // worker 数 = POOL_SIZE (= 5) なので in-flight も最大 5。`(n * 0.95) as usize - 1` だと
     // n=1: -1 で underflow / n=2: 0.9 → 0 で 1番目 / n=3: 1.85 → 1 で 2番目 で max が出ない。
     // 「上位 5% のうちの最大」= ceil(0.95 * n) - 1 番目 (= 最後尾 1 件残し)、n<20 は max 扱い。
     let p95 = if ages_ms.is_empty() {
@@ -935,7 +935,22 @@ struct PdfWorkerPool {
     worker_children: Vec<Arc<Mutex<Option<Child>>>>,
 }
 
-const POOL_SIZE: usize = 3;
+/// PDFium worker child process count.
+///
+/// Critical reservation (`CRITICAL_RESERVATION_ACTIVE = true`) で 1 worker を Enter 用に
+/// 予約するので、HighNormal/Normal は `POOL_SIZE - 1 = 4` workers で消費する。
+///
+/// **5 を選んだ理由 (2026-05):**
+/// - 個別 PDF render が 4-5 秒/page (重い PDF で 20-45 秒) のことがあり、可視 16 枚を
+///   2 worker (旧 POOL_SIZE=3 構成) で捌くと all_ready が 20 秒超え。
+/// - 各 worker は別プロセスで PDFium DLL + state を独立保持 (~50-150 MB)。
+///   5 workers で合計 +400 MB 程度の RAM、Windows 11 / 8GB+ 機なら十分許容範囲。
+/// - PDFium は single-threaded per render なので worker 数 × CPU core 並列度が線形に効く。
+/// - 値変更は再起動が必要 (`in_flight_started_at` の固定長 vec / `max_normal` 計算が
+///   各所に焼き付いているため、動的変更は数百行の refactor になる)。
+///
+/// より小さく / より大きくしたい場合は const を直接書き換える (= リビルド必要)。
+const POOL_SIZE: usize = 5;
 
 static POOL: OnceLock<PdfWorkerPool> = OnceLock::new();
 
