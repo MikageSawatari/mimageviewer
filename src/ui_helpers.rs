@@ -358,13 +358,15 @@ pub fn draw_cell_filename(
     reserve_left_w: f32,
 ) {
     let font = crate::ui_fonts::user_text_font(11.0);
-    let plate_pad = egui::vec2(4.0, 1.0);
+    let plate_pad_x = 4.0;
+    let plate_top_pad = 4.0;
+    let plate_bottom_pad = 1.0;
     let outer_margin = 3.0;
 
     // プレート利用可能領域: 左は max(outer_margin, バッジ予約幅) ぶんだけ右に寄せる。
     let avail_left = inner.min.x + reserve_left_w.max(outer_margin);
     let avail_right = inner.max.x - outer_margin;
-    let max_text_w = (avail_right - avail_left - plate_pad.x * 2.0).max(0.0);
+    let max_text_w = (avail_right - avail_left - plate_pad_x * 2.0).max(0.0);
     if max_text_w < 4.0 {
         return; // 領域不足 → 描画諦め
     }
@@ -393,11 +395,15 @@ pub fn draw_cell_filename(
     }
 
     let text_size = galley.size();
-    let text_pos = egui::pos2(
-        center_x - text_size.x / 2.0,
-        inner.max.y - 4.0 - text_size.y,
+    let bg_h = text_size.y + plate_top_pad + plate_bottom_pad;
+    let bg_rect = egui::Rect::from_min_size(
+        egui::pos2(
+            center_x - (text_size.x + plate_pad_x * 2.0) / 2.0,
+            inner.max.y - 3.0 - bg_h,
+        ),
+        egui::vec2(text_size.x + plate_pad_x * 2.0, bg_h),
     );
-    let bg_rect = egui::Rect::from_min_size(text_pos - plate_pad, text_size + 2.0 * plate_pad);
+    let text_pos = bg_rect.left_top() + egui::vec2(plate_pad_x, plate_top_pad);
     let bg_color = if dark {
         egui::Color32::from_rgba_unmultiplied(0, 0, 0, 160)
     } else {

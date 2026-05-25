@@ -20754,6 +20754,9 @@ fn draw_thumb(
     }
 }
 
+const BADGE_TEXT_TOP_PAD: f32 = 5.0;
+const BADGE_TEXT_BOTTOM_PAD: f32 = 1.0;
+
 pub(crate) fn draw_cell(
     ui: &egui::Ui,
     rect: egui::Rect,
@@ -21179,50 +21182,45 @@ pub(crate) fn draw_cell(
     // 左上バッジ列: 補 (ページ個別補正) → 消 (消しゴムマスク) → 📌(金、pin)
     // → タグバッジ。横並びで、収まらなければ末尾省略。
     {
-        let badge_w = 18.0;
-        let badge_h = 16.0;
+        let font = egui::FontId::proportional(11.0);
+        let pad_x = 4.0;
         let mut x = rect.min.x + 3.0;
         let y = rect.min.y + 3.0;
+        // 1 文字バッジ (補/消/📌) を 1 個描いて x を進める。galley 実測ベースで高さ・幅を
+        // 決め、固定 16px に CJK / 絵文字が収まらず上が欠ける問題 (タグ/★と同族) を避ける。
+        // 📌 は emoji font fallback で metrics が違うが、独立に measure するので影響しない。
+        let mut draw_single_char_badge = |glyph: &str, bg: egui::Color32, fg: egui::Color32| {
+            let galley = painter.layout_no_wrap(glyph.to_string(), font.clone(), fg);
+            let bg_w = galley.size().x + pad_x * 2.0;
+            let bg_h = galley.size().y + BADGE_TEXT_TOP_PAD + BADGE_TEXT_BOTTOM_PAD;
+            let badge_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(bg_w, bg_h));
+            painter.rect_filled(badge_rect, 3.0, bg);
+            let text_pos = badge_rect.left_top() + egui::vec2(pad_x, BADGE_TEXT_TOP_PAD);
+            painter.galley(text_pos, galley, fg);
+            x += bg_w + 2.0;
+        };
         if has_page_override {
-            let badge_rect =
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(badge_w, badge_h));
-            painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(50, 120, 220));
-            painter.text(
-                badge_rect.center(),
-                egui::Align2::CENTER_CENTER,
+            draw_single_char_badge(
                 "補",
-                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgb(50, 120, 220),
                 egui::Color32::WHITE,
             );
-            x += badge_w + 2.0;
         }
         if has_mask {
-            let badge_rect =
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(badge_w, badge_h));
-            painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(200, 80, 40));
-            painter.text(
-                badge_rect.center(),
-                egui::Align2::CENTER_CENTER,
+            draw_single_char_badge(
                 "消",
-                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgb(200, 80, 40),
                 egui::Color32::WHITE,
             );
-            x += badge_w + 2.0;
         }
         if has_pin {
             // 📌 (金色) — ユーザー設定の pin に関わるアイテムの目印。
             // アドレスバーの 📌 ボタンの色 (RGB 230,180,90) と統一する。
-            let badge_rect =
-                egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(badge_w, badge_h));
-            painter.rect_filled(badge_rect, 3.0, egui::Color32::from_rgb(230, 180, 90));
-            painter.text(
-                badge_rect.center(),
-                egui::Align2::CENTER_CENTER,
+            draw_single_char_badge(
                 "📌",
-                egui::FontId::proportional(11.0),
+                egui::Color32::from_rgb(230, 180, 90),
                 egui::Color32::from_rgb(60, 40, 10),
             );
-            x += badge_w + 2.0;
         }
         if !tags.is_empty() {
             // 残り幅 (右端 - 現在 x - 余白) に収まるだけ並べる。チェックマーク領域 (右上 24px)
@@ -21249,26 +21247,23 @@ pub(crate) fn draw_cell(
             "★".repeat(rating as usize)
         };
         let font = egui::FontId::proportional(12.0);
-        // 背景矩形のサイズを見積もる (コンテナは 📁 ぶん ~14px 広くする)
-        let prefix_w = if is_container { 14.0 } else { 0.0 };
-        let text_w = 10.5 * rating as f32 + 6.0 + prefix_w;
-        let text_h = 16.0;
+        // ★ は fallback font (Segoe UI Symbol 等) 経由で描画され、固定 16px に
+        // 収まらないことがある。実測ベースで背景矩形を作る (draw_filter_match_badge と同型)。
+        let galley = painter.layout_no_wrap(text, font, star_color);
+        let pad_x = 5.0;
+        let bg_w = galley.size().x + pad_x * 2.0;
+        let bg_h = galley.size().y + BADGE_TEXT_TOP_PAD + BADGE_TEXT_BOTTOM_PAD;
         let bg_rect = egui::Rect::from_min_size(
-            egui::pos2(rect.min.x + 3.0, rect.max.y - text_h - 3.0),
-            egui::vec2(text_w, text_h),
+            egui::pos2(rect.min.x + 3.0, rect.max.y - bg_h - 3.0),
+            egui::vec2(bg_w, bg_h),
         );
         painter.rect_filled(
             bg_rect,
             3.0,
             egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150),
         );
-        painter.text(
-            bg_rect.left_center() + egui::vec2(3.0, 0.0),
-            egui::Align2::LEFT_CENTER,
-            text,
-            font,
-            star_color,
-        );
+        let text_pos = bg_rect.left_top() + egui::vec2(pad_x, BADGE_TEXT_TOP_PAD);
+        painter.galley(text_pos, galley, star_color);
     }
 
     if let Some(count) = filter_match_count {
@@ -21332,7 +21327,6 @@ fn draw_filter_match_badge(painter: &egui::Painter, cell_rect: egui::Rect, count
 /// 末尾を `…` にする。空配列の呼び出しは `draw_cell` 側で弾かれている前提。
 fn draw_tag_badges(painter: &egui::Painter, start: egui::Pos2, max_x: f32, tags: &[String]) {
     let font = egui::FontId::proportional(11.0);
-    let badge_h = 16.0;
     let pad_x = 5.0;
     let max_text_w = (max_x - start.x - pad_x * 2.0).max(0.0);
     if max_text_w < 8.0 {
@@ -21381,13 +21375,16 @@ fn draw_tag_badges(painter: &egui::Painter, start: egui::Pos2, max_x: f32, tags:
     }
 
     let bg_w = galley.size().x + pad_x * 2.0;
-    let bg_rect = egui::Rect::from_min_size(start, egui::vec2(bg_w, badge_h));
+    // 高さも実測ベース。CJK が混じると 11pt でも 16px を超えることがあり、固定 16px だと
+    // 中央寄せのオフセットが負になって文字がバッジ上端より上にはみ出していた。
+    let bg_h = galley.size().y + BADGE_TEXT_TOP_PAD + BADGE_TEXT_BOTTOM_PAD;
+    let bg_rect = egui::Rect::from_min_size(start, egui::vec2(bg_w, bg_h));
     painter.rect_filled(
         bg_rect,
         3.0,
         egui::Color32::from_rgba_unmultiplied(0, 40, 20, 170),
     );
-    let text_pos = bg_rect.left_top() + egui::vec2(pad_x, (badge_h - galley.size().y) * 0.5);
+    let text_pos = bg_rect.left_top() + egui::vec2(pad_x, BADGE_TEXT_TOP_PAD);
     painter.galley(text_pos, galley, text_color);
 }
 
