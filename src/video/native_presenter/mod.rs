@@ -6275,7 +6275,13 @@ impl NativeEguiOverlay {
                                 last_seek_target_secs = None;
                             }
                         }
-                        if duration_secs > 0.0 {
+                        // 動画 HUD 2 段化リデザイン (実機フィードバック反映 #2):
+                        // 速度 popup が開いているときは、popup 内のアイテムを選びに行く
+                        // カーソル動線が seek_row (シーク行) を横切るため、hover preview
+                        // (シーク先サムネ) を発火させない。popup を閉じれば次のフレームで
+                        // 通常の hover detection に戻る。
+                        let suppress_hover_preview = video_speed_popup_open;
+                        if duration_secs > 0.0 && !suppress_hover_preview {
                             if seek_resp.hovered()
                                 && let Some(pos) = pointer_pos
                             {
@@ -6317,9 +6323,17 @@ impl NativeEguiOverlay {
                                 egui::pos2(preview_rect.min.x, image_rect.max.y),
                                 preview_rect.max,
                             );
+                            // 動画 HUD 2 段化リデザイン (実機フィードバック反映 #1):
+                            // corridor の下端は **seek_row (シーク行) 底辺** まで。
+                            // 旧 1 段の名残で hud_rect.max.y まで伸ばすと、controls 行に
+                            // カーソルを降ろした瞬間も「まだ corridor 内」と判定されて
+                            // hover preview が居座り、下のボタン (frame step / camera / 音量
+                            // 等) を押しに行くときに preview が被さってしまう。
+                            // corridor を seek_row 内に限定することで、controls 行に
+                            // カーソルが入った瞬間 preview を即座に隠す。
                             let preview_corridor_rect = egui::Rect::from_min_max(
                                 egui::pos2(preview_rect.min.x - 8.0, preview_rect.max.y),
-                                egui::pos2(preview_rect.max.x + 8.0, hud_rect.max.y),
+                                egui::pos2(preview_rect.max.x + 8.0, seek_row_rect.max.y),
                             );
                             let pointer_in_preview = pointer_pos.is_some_and(|pos| {
                                 preview_rect.expand(8.0).contains(pos)
