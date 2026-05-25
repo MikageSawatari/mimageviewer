@@ -3990,15 +3990,37 @@ pub(super) fn layout_wrapped_with_max_lines(
     max_width: f32,
     max_lines: usize,
 ) -> (std::sync::Arc<egui::Galley>, bool) {
-    let full = painter.layout(text.to_owned(), font.clone(), color, max_width.max(1.0));
+    // `max_lines = 0` は「表示しない」契約 (Codex P3 指摘): 空 galley を返す。
+    if max_lines == 0 {
+        let empty = painter.layout(String::new(), font, color, max_width.max(1.0));
+        return (empty, false);
+    }
+    // 病的に長い title (bulk import で貼り付けた数千〜数万文字) でも UI スレッドの
+    // draw path で O(N) を走らせないよう、入力を `MAX_INPUT_CHARS` で頭打ちにする
+    // (Codex P2 指摘)。max_lines × 想定 1 行当たり char 数 (≈ 100) より十分多い 1024
+    // を上限とする。これ以上は元々 5 行に絶対収まらないので、cap した時点で truncate
+    // 確定 (was_truncated=true)。
+    const MAX_INPUT_CHARS: usize = 1024;
+    let mut input_truncated = false;
+    let mut chars: Vec<char> = text.chars().take(MAX_INPUT_CHARS + 1).collect();
+    if chars.len() > MAX_INPUT_CHARS {
+        chars.truncate(MAX_INPUT_CHARS);
+        input_truncated = true;
+    }
+    let capped_text: String = if input_truncated {
+        chars.iter().collect::<String>() + "…"
+    } else {
+        chars.iter().collect()
+    };
+
+    let full = painter.layout(capped_text.clone(), font.clone(), color, max_width.max(1.0));
     if full.rows.len() <= max_lines {
-        return (full, false);
+        return (full, input_truncated);
     }
-    // 行数超過 → 二分探索で本文を縮めて `…` 付きに re-layout。bounded iterations (~log N)。
-    let chars: Vec<char> = text.chars().collect();
     if chars.is_empty() {
-        return (full, false);
+        return (full, input_truncated);
     }
+    // 行数超過 → 二分探索で本文を縮めて末尾 `…` を付けて再 layout。bounded ~log N 回。
     let mut lo: usize = 1;
     let mut hi: usize = chars.len();
     let mut best: Option<std::sync::Arc<egui::Galley>> = None;
