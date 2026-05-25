@@ -720,12 +720,6 @@ impl App {
     pub(crate) fn capture_fs_nav_holdover(&mut self, fs_idx: usize) {
         self.fs_holdover_tex = self.current_fs_tex_for_holdover(fs_idx);
         self.fs_nav_locked_gen = Some(self.items_generation);
-        // Cross-folder ナビ (Ctrl+↑↓) が始まる時点で、video swap 由来の deferred nav delta は
-        // 別フォルダ / 非動画アイテムで誤発火しうるので破棄する (Codex 第 8 P2 指摘)。
-        #[cfg(windows)]
-        {
-            self.native_video_deferred_nav_delta = None;
-        }
     }
 
     /// 毎フレーム呼び出され、ナビロックの解除条件を満たしたら lock を解除する。
@@ -4057,6 +4051,16 @@ impl App {
     ) {
         if self.fs_nav_is_locked() {
             return;
+        }
+        // Cross-scope ナビ (Ctrl+↑↓: 通常のフォルダ移動、Favsearch、Ctrl+G drilled into) が
+        // 始まる時点で、video swap 由来の deferred nav delta は別フォルダ / 別検索スコープ
+        // / 非動画アイテムで誤発火しうるので破棄する。`capture_fs_nav_holdover` を経由しない
+        // 経路 (Ctrl+G DrilledInto の global_search_ctrl_nav_fullscreen など) も含めて
+        // 確実にカバーするため、Ctrl+↑↓ ハンドラの入口で一括で消す
+        // (Codex 第 8/9 P2 指摘)。
+        #[cfg(windows)]
+        {
+            self.native_video_deferred_nav_delta = None;
         }
 
         if self.global_search.active {
