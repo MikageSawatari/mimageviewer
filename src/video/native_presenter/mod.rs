@@ -71,6 +71,21 @@ const SEEK_STATUS_MIN_VISIBLE: Duration = Duration::from_millis(300);
 const LIMITER_INDICATOR_VISIBLE: Duration = Duration::from_millis(500);
 const TEXT_INPUT_FOCUS_CLAIM_MIN_INTERVAL: Duration = Duration::from_millis(500);
 
+/// 動画 HUD 2 段化リデザイン (Phase 3): 下 HUD を **シーク行 (上段) + コントロール行 (下段)**
+/// の 2 段に分割する。
+///
+/// - **シーク行** = `HUD_SEEK_ROW_HEIGHT` (24pt): seek bar + マーカー + hover サムネ trigger
+/// - **コントロール行** = `HUD_CONTROLS_ROW_HEIGHT` (40pt): 再生/停止 / ループ / 音量等のボタン群
+/// - **合計高さ** = `HUD_BOTTOM_HEIGHT` (= 上記の和、64pt)
+///
+/// 旧版は 46pt の 1 行構造で seek bar + コントロールが Y を共有していた。2 段化で
+/// seek bar がフル幅 + ヒット領域 24pt に拡張され、4K/長尺動画の精密スクラブが楽になる。
+/// activation zone (= cursor polling の下端帯) は HUD 高さと独立した 220pt 固定で touch しない
+/// (詳細は `cursor_polling_tick` 周辺コメント参照)。
+pub const HUD_SEEK_ROW_HEIGHT: f32 = 24.0;
+pub const HUD_CONTROLS_ROW_HEIGHT: f32 = 40.0;
+pub const HUD_BOTTOM_HEIGHT: f32 = HUD_SEEK_ROW_HEIGHT + HUD_CONTROLS_ROW_HEIGHT;
+
 fn seek_status_visible_for_times(
     is_seeking: bool,
     started_at: Option<Instant>,
@@ -857,7 +872,7 @@ pub struct NativeOverlayInputRouting {
     pub wants_pointer_input: bool,
     pub wants_keyboard_input: bool,
     pub text_input_active: bool,
-    /// この egui パスが wheel イベントを `WheelNavigate` / `TileColumnsDelta` コマンドへ
+    /// この egui パスが wheel イベントを `NavigateItem` / `TileColumnsDelta` コマンドへ
     /// 変換したか。true のとき同じ raw wheel イベントを `Window(MouseWheel)` として App へ
     /// 二重転送しない (= overlay コマンドと App 側 wheel ハンドラの二重適用を防ぐ)。
     /// タイルグリッドが `Order::Background` だと grid の余白上で egui の
@@ -1074,7 +1089,7 @@ pub enum NativeOverlayCommand {
     TileSeek {
         target_secs: f64,
     },
-    WheelNavigate {
+    NavigateItem {
         delta: i32,
     },
     TileColumnsDelta {
@@ -1142,6 +1157,15 @@ pub enum NativeOverlayCommand {
     SetPinAt {
         target_secs: f64,
     },
+    /// 動画 HUD 2 段化リデザイン (Phase 4): 前/次マーカー (chapter / bookmark / pin) へジャンプ。
+    /// `next=true` で次マーカー (= K キー)、`false` で前マーカー (= J キー)。
+    /// App 側 dispatch は `jump_native_video_marker(fs_idx, next)`。
+    JumpMarker {
+        next: bool,
+    },
+    /// 動画 HUD 2 段化リデザイン (Phase 5): 現在フレームをキャプチャ保存フォルダへ保存
+    /// (= Ctrl+S と等価)。App 側 dispatch は `save_video_frame_to_file(ctx, fs_idx)`。
+    SaveFrameToFile,
     SetBookmarkTitle {
         id: i64,
         title: String,
@@ -1193,7 +1217,7 @@ impl NativeOverlayInputRouting {
                 }
             }
             NativeEvent::Text(_) | NativeEvent::Ime(_) => !self.wants_keyboard_input,
-            // overlay が wheel を WheelNavigate / TileColumnsDelta に変換済みなら、
+            // overlay が wheel を NavigateItem / TileColumnsDelta に変換済みなら、
             // 同じ raw wheel を App へ二重転送しない。
             // モーダル中はカーソルがダイアログ外の dark backdrop にあっても wheel を
             // App へ流さない (= 動画切替誘発防止、Codex P3 C1)。
@@ -3909,7 +3933,7 @@ impl NativeEguiOverlay {
                         });
                 } else if !wheel.ctrl && !over_scroll_panel && !modal_dialog_visible {
                     self.pending_overlay_commands
-                        .push(NativeOverlayCommand::WheelNavigate {
+                        .push(NativeOverlayCommand::NavigateItem {
                             delta: if wheel.delta < 0 { 1 } else { -1 },
                         });
                 }
@@ -4574,12 +4598,12 @@ impl NativeEguiOverlay {
         // native overlay には eframe の repaint callback が無いため、hover UI 表示中は
         // periodic tick で egui pass も回して delay 到達を拾う。
         let commands = self.render_once()?;
-        // overlay が wheel を WheelNavigate / TileColumnsDelta に変換したフレームでは、
+        // overlay が wheel を NavigateItem / TileColumnsDelta に変換したフレームでは、
         // 同じ raw wheel イベントを App へ二重転送しないよう routing に印を付ける。
         let consumed_wheel = commands.iter().any(|c| {
             matches!(
                 c,
-                NativeOverlayCommand::WheelNavigate { .. }
+                NativeOverlayCommand::NavigateItem { .. }
                     | NativeOverlayCommand::TileColumnsDelta { .. }
             )
         });
@@ -4750,7 +4774,7 @@ impl NativeEguiOverlay {
         // 「下半分の VST ボタンが押せない」の主因)。
         // 活性化判定は presenter wndproc 経由の pointer_pos で維持されるので region は不要。
         if bottom_hud_visible {
-            let bottom_band_top = (height_px - to_px(46.0)).max(0);
+            let bottom_band_top = (height_px - to_px(HUD_BOTTOM_HEIGHT)).max(0);
             regions.push(RECT {
                 left: 0,
                 top: bottom_band_top,
@@ -4892,7 +4916,7 @@ impl NativeEguiOverlay {
                 let popup_w = 356.0_f32.min((width_points - 16.0).max(180.0));
                 let popup_h = 74.0;
                 let popup_x = (width_points - popup_w - 8.0).max(8.0);
-                let popup_y = (height_points - 46.0 - popup_h - 6.0).max(8.0);
+                let popup_y = (height_points - HUD_BOTTOM_HEIGHT - popup_h - 6.0).max(8.0);
                 egui::Rect::from_min_size(
                     egui::pos2(popup_x, popup_y),
                     egui::vec2(popup_w, popup_h),
@@ -5613,7 +5637,7 @@ impl NativeEguiOverlay {
                 }
                 if bottom_hud_visible {
                     excluded_rects.push(egui::Rect::from_min_max(
-                        egui::pos2(0.0, (overlay_height_points - 46.0).max(0.0)),
+                        egui::pos2(0.0, (overlay_height_points - HUD_BOTTOM_HEIGHT).max(0.0)),
                         egui::pos2(overlay_width_points, overlay_height_points),
                     ));
                 }
@@ -5690,9 +5714,12 @@ impl NativeEguiOverlay {
             if bottom_hud_visible {
                 egui::Area::new(egui::Id::new("native_video_seek_hud"))
                     .order(egui::Order::Foreground)
-                    .fixed_pos(egui::pos2(0.0, (overlay_height_points - 46.0).max(0.0)))
+                    .fixed_pos(egui::pos2(
+                        0.0,
+                        (overlay_height_points - HUD_BOTTOM_HEIGHT).max(0.0),
+                    ))
                     .show(ctx, |ui| {
-                        ui.set_min_size(egui::vec2(overlay_width_points, 46.0));
+                        ui.set_min_size(egui::vec2(overlay_width_points, HUD_BOTTOM_HEIGHT));
                         let hud_rect = ui.min_rect();
                         let painter = ui.painter().clone();
                         let painter = &painter;
@@ -5702,10 +5729,35 @@ impl NativeEguiOverlay {
                             egui::Color32::from_rgba_premultiplied(0, 0, 0, 176),
                         );
 
+                        // 動画 HUD 2 段化リデザイン (Phase 6 narrow-window fallback、Codex 最終 P1 反映):
+                        // ウィンドウ幅に応じてオプションボタンを段階的に省略する。狭幅では
+                        // 「マーカー + 前/次項目」(= キーボード代替あり) を最初に隠す。
+                        // - >= 1100pt: 全ボタン表示 (= 通常レイアウト)
+                        // - <  1100pt: マーカー (J/K) + 前/次項目 (↑/↓) を非表示 (4 ボタン省略、144pt 節約)
+                        // - <   800pt: 上記 + 連続再生 + 音量ラベル + リミッターも非表示
+                        //   (キーボード経路で代替可能なものから順に削減)
+                        // 800pt 未満でも overflow すると視覚的に重なるが、break するわけではない
+                        // (= 既存挙動と同等)。本実装では「マーカー + 前/次項目」だけを動的非表示にし、
+                        // 残りの圧縮は将来の拡張余地として残す (= over-engineering を避ける)。
+                        let compact_optional_buttons = overlay_width_points < 1100.0;
+
+                        // - シーク行 (上段、`HUD_SEEK_ROW_HEIGHT` = 24pt): bar + hover サムネ trigger
+                        // - コントロール行 (下段、`HUD_CONTROLS_ROW_HEIGHT` = 40pt): ボタン群 + 音量
+                        // `center_y` はコントロール行内の縦中央 (= ボタン群の Y 基準) として使う。
+                        // 旧 1 段構造の bar Y 共有から外し、bar は seek_row_rect 内に独立配置する。
+                        let seek_row_rect = egui::Rect::from_min_max(
+                            hud_rect.min,
+                            egui::pos2(hud_rect.max.x, hud_rect.min.y + HUD_SEEK_ROW_HEIGHT),
+                        );
+                        let controls_row_rect = egui::Rect::from_min_max(
+                            egui::pos2(hud_rect.min.x, seek_row_rect.max.y),
+                            hud_rect.max,
+                        );
+
                         let side_pad = 10.0;
                         let btn_size = 28.0;
                         let gap = 8.0;
-                        let center_y = hud_rect.center().y;
+                        let center_y = controls_row_rect.center().y;
                         let text_center_y = center_y + 4.0;
                         let mut x = hud_rect.min.x + side_pad;
 
@@ -5743,9 +5795,9 @@ impl NativeEguiOverlay {
                             draw_overlay_play_icon(painter, play_rect.center(), btn_size * 0.38);
                         }
                         let play_resp = play_resp.hover_tip_dark(if is_playing {
-                            "一時停止 [Enter]"
+                            "一時停止 [Space / Enter]"
                         } else {
-                            "再生 [Enter]"
+                            "再生 [Space / Enter]"
                         });
                         if play_resp.clicked() {
                             commands.push(NativeOverlayCommand::TogglePlay);
@@ -5875,6 +5927,149 @@ impl NativeEguiOverlay {
                         }
                         x = continuous_rect.max.x + gap;
 
+                        // 動画 HUD 2 段化リデザイン (Phase 6): 前/次ファイル (前/次項目) ボタン。
+                        // ↑/↓ キー / マウスホイールと同じ NavigateItem コマンドを送出する
+                        // (= 既存の navigate_native_video_fullscreen 経由、境界では EOF
+                        // トーストが自動で出る)。連続再生 / ループ の隣に配置することで
+                        // 「左右=動画内、上下=ファイル切替」の規約と「連続再生=末尾で次へ」の
+                        // 意味的隣接を視覚化する。
+                        // 狭幅ウィンドウ (`compact_optional_buttons`) では非表示にして
+                        // 右クラスター (時間 / 音量) との overlap を避ける (キーボード ↑↓ で代替可能)。
+                        if !compact_optional_buttons {
+                            let prev_file_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, center_y - btn_size * 0.5),
+                                egui::vec2(btn_size, btn_size),
+                            );
+                            let prev_file_resp = ui.interact(
+                                prev_file_rect,
+                                egui::Id::new("native_video_prev_file"),
+                                egui::Sense::click(),
+                            );
+                            draw_overlay_button_bg(
+                                painter,
+                                prev_file_rect,
+                                prev_file_resp.hovered(),
+                                false,
+                            );
+                            draw_overlay_arrow_icon(painter, prev_file_rect, -1);
+                            let prev_file_resp = prev_file_resp.hover_tip_dark("前の項目 [↑]");
+                            if prev_file_resp.clicked() {
+                                commands.push(NativeOverlayCommand::NavigateItem { delta: -1 });
+                            }
+                            x = prev_file_rect.max.x + gap;
+
+                            let next_file_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, center_y - btn_size * 0.5),
+                                egui::vec2(btn_size, btn_size),
+                            );
+                            let next_file_resp = ui.interact(
+                                next_file_rect,
+                                egui::Id::new("native_video_next_file"),
+                                egui::Sense::click(),
+                            );
+                            draw_overlay_button_bg(
+                                painter,
+                                next_file_rect,
+                                next_file_resp.hovered(),
+                                false,
+                            );
+                            draw_overlay_arrow_icon(painter, next_file_rect, 1);
+                            let next_file_resp = next_file_resp.hover_tip_dark("次の項目 [↓]");
+                            if next_file_resp.clicked() {
+                                commands.push(NativeOverlayCommand::NavigateItem { delta: 1 });
+                            }
+                            x = next_file_rect.max.x + gap;
+                        } // ← `if !compact_optional_buttons` の閉じ (前/次項目ブロック)
+
+                        // 動画 HUD 2 段化リデザイン (Phase 4): 前/次マーカーボタン
+                        // (chapter / bookmark / pin)。J / K キーと同じ
+                        // `jump_native_video_marker` を呼ぶ。マーカー 0 個では disabled
+                        // (= 非表示ではなくグレーアウト、レイアウト揺れを避けるため)。
+                        // 狭幅ウィンドウ (`compact_optional_buttons`) では非表示
+                        // (キーボード J/K で代替可能)。
+                        let markers_present = !timeline_markers.is_empty();
+                        if !compact_optional_buttons {
+                            let prev_marker_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, center_y - btn_size * 0.5),
+                                egui::vec2(btn_size, btn_size),
+                            );
+                            let prev_marker_resp = if markers_present {
+                                ui.interact(
+                                    prev_marker_rect,
+                                    egui::Id::new("native_video_prev_marker"),
+                                    egui::Sense::click(),
+                                )
+                            } else {
+                                ui.interact(
+                                    prev_marker_rect,
+                                    egui::Id::new("native_video_prev_marker"),
+                                    egui::Sense::hover(),
+                                )
+                            };
+                            draw_overlay_button_bg(
+                                painter,
+                                prev_marker_rect,
+                                prev_marker_resp.hovered() && markers_present,
+                                false,
+                            );
+                            draw_overlay_skip_to_marker_icon(
+                                painter,
+                                prev_marker_rect,
+                                -1,
+                                markers_present,
+                            );
+                            let prev_marker_resp =
+                                prev_marker_resp.hover_tip_dark(if markers_present {
+                                    "前のマーカー (チャプター/ブックマーク/ピン) [J]"
+                                } else {
+                                    "マーカーがありません"
+                                });
+                            if markers_present && prev_marker_resp.clicked() {
+                                commands.push(NativeOverlayCommand::JumpMarker { next: false });
+                            }
+                            x = prev_marker_rect.max.x + gap;
+
+                            let next_marker_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, center_y - btn_size * 0.5),
+                                egui::vec2(btn_size, btn_size),
+                            );
+                            let next_marker_resp = if markers_present {
+                                ui.interact(
+                                    next_marker_rect,
+                                    egui::Id::new("native_video_next_marker"),
+                                    egui::Sense::click(),
+                                )
+                            } else {
+                                ui.interact(
+                                    next_marker_rect,
+                                    egui::Id::new("native_video_next_marker"),
+                                    egui::Sense::hover(),
+                                )
+                            };
+                            draw_overlay_button_bg(
+                                painter,
+                                next_marker_rect,
+                                next_marker_resp.hovered() && markers_present,
+                                false,
+                            );
+                            draw_overlay_skip_to_marker_icon(
+                                painter,
+                                next_marker_rect,
+                                1,
+                                markers_present,
+                            );
+                            let next_marker_resp =
+                                next_marker_resp.hover_tip_dark(if markers_present {
+                                    "次のマーカー (チャプター/ブックマーク/ピン) [K]"
+                                } else {
+                                    "マーカーがありません"
+                                });
+                            if markers_present && next_marker_resp.clicked() {
+                                commands.push(NativeOverlayCommand::JumpMarker { next: true });
+                            }
+                            x = next_marker_rect.max.x + gap;
+                        } // ← `if !compact_optional_buttons` の閉じ (マーカーブロック)
+
                         let prev_frame_rect = egui::Rect::from_min_size(
                             egui::pos2(x, center_y - btn_size * 0.5),
                             egui::vec2(btn_size, btn_size),
@@ -5907,13 +6102,34 @@ impl NativeEguiOverlay {
                             false,
                         );
                         draw_overlay_camera_icon(painter, screenshot_rect);
-                        let screenshot_resp = screenshot_resp.hover_tip_dark(
-                            "クリック: クリップボードにコピー\nCtrl+S: ファイル保存",
-                        );
+                        // 動画 HUD 2 段化リデザイン (Phase 5): カメラパレット常駐 4 ボタン化。
+                        // 旧 [前F][📷][次F] 3 ボタンに「保存」(💾) を追加して
+                        // [前F][📋 コピー][💾 保存][次F] にする。コピー (= 旧カメラクリック動作)
+                        // は明示的に「コピー」と分かるよう、tooltip を簡潔化。
+                        let screenshot_resp =
+                            screenshot_resp.hover_tip_dark("現在フレームをクリップボードにコピー");
                         if screenshot_resp.clicked() {
                             commands.push(NativeOverlayCommand::CopyFrameToClipboard);
                         }
                         x = screenshot_rect.max.x + gap;
+
+                        let save_rect = egui::Rect::from_min_size(
+                            egui::pos2(x, center_y - btn_size * 0.5),
+                            egui::vec2(btn_size, btn_size),
+                        );
+                        let save_resp = ui.interact(
+                            save_rect,
+                            egui::Id::new("native_video_save_frame"),
+                            egui::Sense::click(),
+                        );
+                        draw_overlay_button_bg(painter, save_rect, save_resp.hovered(), false);
+                        draw_overlay_save_icon(painter, save_rect);
+                        let save_resp =
+                            save_resp.hover_tip_dark("現在フレームをファイル保存 [Ctrl+S]");
+                        if save_resp.clicked() {
+                            commands.push(NativeOverlayCommand::SaveFrameToFile);
+                        }
+                        x = save_rect.max.x + gap;
 
                         let next_frame_rect = egui::Rect::from_min_size(
                             egui::pos2(x, center_y - btn_size * 0.5),
@@ -5929,7 +6145,10 @@ impl NativeEguiOverlay {
                             &mut frame_step_hold,
                             &mut commands,
                         );
-                        x = next_frame_rect.max.x + gap;
+                        // 動画 HUD 2 段化リデザイン (Phase 3): bar はシーク行に独立配置するため、
+                        // 末尾の `x = next_frame_rect.max.x + gap;` は不要になった (旧 1 段では
+                        // `bar_min_x = x` で残空間を bar に割り当てていた)。Phase 4 でマーカー
+                        // ボタンを追加する際に `x` の更新を復活させる可能性あり。
                         if !prev_down && !next_down {
                             frame_step_hold = None;
                         }
@@ -5954,18 +6173,27 @@ impl NativeEguiOverlay {
                             + vol_label_w
                             + limiter_indicator_w;
                         let right_controls_x = hud_rect.max.x - side_pad - right_controls_w;
-                        let bar_min_x = x;
-                        let bar_max_x = (right_controls_x - gap).max(bar_min_x + 1.0);
+                        // 動画 HUD 2 段化リデザイン (Phase 3): bar はシーク行 (上段) に独立配置し、
+                        // **フル幅** で seek_row_rect の左右 padding 内に展開する。コントロール行
+                        // (下段) からは bar が消えるので、ボタンと時間表示の間は空きスペースになる。
+                        // hit_rect は seek_row_rect 全体 (= 24pt) を覆い、bar のヒット領域を厚く取る。
+                        let bar_min_x = seek_row_rect.min.x + side_pad;
+                        let bar_max_x = (seek_row_rect.max.x - side_pad).max(bar_min_x + 1.0);
+                        let bar_center_y = seek_row_rect.center().y;
                         let bar_rect = egui::Rect::from_min_max(
-                            egui::pos2(bar_min_x, center_y - 4.0),
-                            egui::pos2(bar_max_x, center_y + 4.0),
+                            egui::pos2(bar_min_x, bar_center_y - 4.0),
+                            egui::pos2(bar_max_x, bar_center_y + 4.0),
                         );
                         let hit_rect = egui::Rect::from_min_max(
-                            egui::pos2(bar_min_x, hud_rect.min.y),
-                            egui::pos2(bar_max_x, hud_rect.max.y),
+                            egui::pos2(bar_min_x, seek_row_rect.min.y),
+                            egui::pos2(bar_max_x, seek_row_rect.max.y),
                         );
 
-                        let time_x = bar_max_x + gap;
+                        // time は right_controls クラスターの左端 (= 旧レイアウトと同じ位置)。
+                        // right_controls_w に time_w が含まれているため、`right_controls_x` がそのまま
+                        // time の左端になる。controls 行の左ボタン群との間は空きを残す (シーク行の
+                        // bar と視覚的に対応)。
+                        let time_x = right_controls_x;
                         let label = format!(
                             "{} / {}",
                             format_overlay_time(position_secs),
@@ -6116,10 +6344,14 @@ impl NativeEguiOverlay {
                                         target_secs: target,
                                     });
                                 }
+                                // 動画 HUD 2 段化リデザイン (Phase 3): hover カーソル縦線は
+                                // **シーク行内のみ** に描く (旧 1 段では HUD 全体に伸びていた)。
+                                // 2 段化後に HUD 全体へ伸ばすとコントロール行のボタン上に線が
+                                // 重なって視認性が下がる。
                                 painter.line_segment(
                                     [
-                                        egui::pos2(x, hud_rect.min.y + 6.0),
-                                        egui::pos2(x, hud_rect.max.y - 6.0),
+                                        egui::pos2(x, seek_row_rect.min.y + 4.0),
+                                        egui::pos2(x, seek_row_rect.max.y - 4.0),
                                     ],
                                     egui::Stroke::new(1.5, egui::Color32::from_rgb(255, 88, 88)),
                                 );
@@ -7460,7 +7692,7 @@ mod tests {
 
     #[test]
     fn native_overlay_does_not_double_forward_consumed_wheel() {
-        // overlay が wheel を WheelNavigate / TileColumnsDelta コマンドへ変換済みなら、
+        // overlay が wheel を NavigateItem / TileColumnsDelta コマンドへ変換済みなら、
         // wants_pointer_input が false でも raw wheel を App へ転送しない
         // (= overlay コマンドと App 側 wheel ハンドラの二重適用を防ぐ)。
         let consumed = NativeOverlayInputRouting {

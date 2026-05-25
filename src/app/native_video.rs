@@ -618,7 +618,7 @@ impl App {
                 crate::video::NativeVideoOutputEvent::Window(event) => {
                     self.handle_native_video_window_event(ctx, fs_idx, event);
                 }
-                crate::video::NativeVideoOutputEvent::WheelNavigate { delta } => {
+                crate::video::NativeVideoOutputEvent::NavigateItem { delta } => {
                     self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
                 }
                 crate::video::NativeVideoOutputEvent::CloseFullscreen => {
@@ -1099,7 +1099,10 @@ impl App {
         let dpi = unsafe { GetDpiForWindow(presenter_win) } as f32;
         let ppp = (dpi / 96.0).max(1.0);
         let top_band_px = (62.0_f32 * ppp).round() as i32; // 54pt + 8pt margin
-        let bottom_band_px = (54.0_f32 * ppp).round() as i32; // 46pt + 8pt margin
+        // 動画 HUD 2 段化リデザイン (Phase 3): HUD_BOTTOM_HEIGHT = 64pt + 8pt margin = 72pt。
+        // 旧 1 段では 46+8=54pt だった。
+        let bottom_band_px =
+            ((crate::video::native_presenter::HUD_BOTTOM_HEIGHT + 8.0) * ppp).round() as i32;
         let titlebar_px = (30.0_f32 * ppp).round() as i32; // VST タイトルバー想定高さ
         let presenter_top = presenter_rect.top;
         let presenter_bottom = presenter_rect.bottom;
@@ -1659,7 +1662,7 @@ impl App {
             crate::video::NativeVideoOutputEvent::TileSeek { target_secs } => {
                 self.handle_native_video_tile_seek_command(ctx, fs_idx, target_secs);
             }
-            crate::video::NativeVideoOutputEvent::WheelNavigate { delta } => {
+            crate::video::NativeVideoOutputEvent::NavigateItem { delta } => {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
             }
             crate::video::NativeVideoOutputEvent::TileColumnsDelta { delta } => {
@@ -1826,6 +1829,18 @@ impl App {
             }
             crate::video::NativeVideoOutputEvent::SetPinAt { target_secs } => {
                 self.handle_native_video_set_pin_command(ctx, fs_idx, target_secs);
+            }
+            // 動画 HUD 2 段化リデザイン (Phase 4): HUD の前/次マーカーボタンクリック
+            // を J/K キーと同じ `jump_native_video_marker` に dispatch する。
+            crate::video::NativeVideoOutputEvent::JumpMarker { next } => {
+                self.jump_native_video_marker(fs_idx, next);
+                self.mark_native_video_hud_activity(ctx);
+            }
+            // 動画 HUD 2 段化リデザイン (Phase 5): HUD カメラパレットの保存ボタンクリック
+            // を Ctrl+S と同じ `save_video_frame_to_file` に dispatch する。
+            crate::video::NativeVideoOutputEvent::SaveFrameToFile => {
+                self.save_video_frame_to_file(ctx, fs_idx);
+                self.mark_native_video_hud_activity(ctx);
             }
             crate::video::NativeVideoOutputEvent::SetBookmarkTitle { id, title } => {
                 self.handle_native_video_set_bookmark_title_command(ctx, fs_idx, id, title);
@@ -4479,25 +4494,36 @@ impl App {
                 self.navigate_native_video_fullscreen(ctx, fs_idx, 1);
             }
             // Home / End: jump to the first / last visible navigable item.
+            // Home: 先頭アイテムへ。既に先頭なら境界トーストを出す
+            // (Phase 1: 画像と挙動を揃える、Codex 第 1 ラウンド P2 反映)。
             0x24 if !key.shift && !key.ctrl && !key.repeat => {
-                if let Some(idx) = crate::ui_helpers::boundary_navigable_idx(
+                let target = crate::ui_helpers::boundary_navigable_idx(
                     &self.items,
                     &self.visible_indices,
                     false,
-                ) {
-                    if idx != fs_idx {
+                );
+                match target {
+                    Some(idx) if idx != fs_idx => {
                         self.open_native_video_fullscreen_from_navigation(ctx, idx);
+                    }
+                    _ => {
+                        self.show_native_video_boundary_toast(ctx, false);
                     }
                 }
             }
+            // End: 末尾アイテムへ。既に末尾なら境界トーストを出す。
             0x23 if !key.shift && !key.ctrl && !key.repeat => {
-                if let Some(idx) = crate::ui_helpers::boundary_navigable_idx(
+                let target = crate::ui_helpers::boundary_navigable_idx(
                     &self.items,
                     &self.visible_indices,
                     true,
-                ) {
-                    if idx != fs_idx {
+                );
+                match target {
+                    Some(idx) if idx != fs_idx => {
                         self.open_native_video_fullscreen_from_navigation(ctx, idx);
+                    }
+                    _ => {
+                        self.show_native_video_boundary_toast(ctx, true);
                     }
                 }
             }
@@ -4539,18 +4565,16 @@ impl App {
             0x4B if !key.shift && !key.ctrl && !key.repeat => {
                 self.jump_native_video_marker(fs_idx, true);
             }
-            // Space: check/uncheck the current item, matching normal fullscreen.
+            // Space in tile mode: start playback from the keyboard cursor (= Enter と同じ).
+            // 動画 HUD 2 段化リデザイン (Phase 1): Space を動画プレイヤー慣習に合わせて
+            // 再生/停止トグルに変更。tile mode では選択タイル再生 (= Enter と同じ tile-aware 挙動)。
+            // 旧 Space = チェックトグルは削除 (チェックしたい場合は Esc → 一覧 Space)。
+            0x20 if !key.shift && !key.ctrl && !key.repeat && self.video_tile_mode_active => {
+                self.play_selected_video_tile(ctx, fs_idx);
+            }
+            // Space: play / pause (= Enter と等価)。
             0x20 if !key.shift && !key.ctrl && !key.repeat => {
-                let checked = if self.checked.contains(&fs_idx) {
-                    self.checked.remove(&fs_idx);
-                    false
-                } else {
-                    self.checked.insert(fs_idx);
-                    true
-                };
-                if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-                    player.set_native_checked(checked);
-                }
+                self.handle_native_video_toggle_play_command(ctx, fs_idx);
             }
             // P: pin the selected tile while tile mode is open; otherwise pin
             // the current frame (= HUD 📌 button).
@@ -4939,14 +4963,22 @@ impl App {
         ) {
             self.open_native_video_fullscreen_from_navigation(ctx, new_idx);
         } else {
-            let hint = crate::ui_fullscreen::FsBoundaryHint::Edge {
-                at_end: nav_delta > 0,
-                at: std::time::Instant::now(),
-            };
-            self.show_native_video_overlay_toast(Self::native_boundary_hint_text(hint), true);
-            self.fs_boundary_hint = Some(hint);
-            self.mark_native_video_hud_activity(ctx);
+            self.show_native_video_boundary_toast(ctx, nav_delta > 0);
         }
+    }
+
+    /// 動画フルスクリーンで境界 (先頭/末尾) に到達したことを示すトースト + state 更新。
+    /// `navigate_native_video_fullscreen` の境界ブランチ、および Home/End キーの no-op 経路
+    /// から共通で呼ぶ (動画 HUD 2 段化リデザイン Phase 1、Codex 第 1 ラウンド P2 反映)。
+    #[cfg(windows)]
+    pub(super) fn show_native_video_boundary_toast(&mut self, ctx: &egui::Context, at_end: bool) {
+        let hint = crate::ui_fullscreen::FsBoundaryHint::Edge {
+            at_end,
+            at: std::time::Instant::now(),
+        };
+        self.show_native_video_overlay_toast(Self::native_boundary_hint_text(hint), true);
+        self.fs_boundary_hint = Some(hint);
+        self.mark_native_video_hud_activity(ctx);
     }
 
     #[cfg(windows)]

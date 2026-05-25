@@ -2774,11 +2774,11 @@ impl App {
             return self.handle_erase_keys(ctx, fs_idx);
         }
 
-        // 動画フルスクリーン中は専用キーマップ (Enter=play/pause、Shift+Enter=外部プレイヤー、
-        // ←→=シーク、↑↓=音量、M=mute、L=loop) を画像系のキー処理より先に走らせる。
-        // Space は **動画モードでも画像と同じ選択トグル** として扱うため、ここでは
-        // consume せず、後段 (line ~1941) の image key_space ハンドラに流す
-        // (Phase 5.1: 画像/動画混在時のキーアサイン重複を解消)。
+        // 動画フルスクリーン中は専用キーマップ (Space=play/pause、Enter=play/pause、
+        // Shift+Enter=外部プレイヤー、←→=シーク、↑↓=音量、M=mute、L=loop) を
+        // 画像系のキー処理より先に走らせる。
+        // 動画 HUD 2 段化リデザイン (Phase 1): Space は動画モードでは play/pause トグルに
+        // 変更し、`handle_video_input` 側で consume する。画像モードでは従来通り画像選択トグル。
         // フルスクリーン用コンテキストメニュー表示中は奪わない (= メニュー側の Enter
         // 選択操作を優先、Codex Phase 5.1 P2 反映)。
         let is_video_fs = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
@@ -2860,8 +2860,16 @@ impl App {
             i.consume_key(egui::Modifiers::NONE, egui::Key::I)
                 || i.consume_key(egui::Modifiers::NONE, egui::Key::Tab)
         });
-        // Space: スライドショー関連 (変数名の紛らわしさ回避のため key_space)
-        let key_space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
+        // Space: スライドショー関連 (変数名の紛らわしさ回避のため key_space)。
+        // 動画モードでは `handle_video_input` 側で play/pause として消費するため、ここでは
+        // 画像系処理に流さない。**`is_video_fs` ではなく純粋な「現在アイテムが Video か」で
+        // gate する** こと: `is_video_fs` は context menu 表示中に false になるため、それで
+        // gate すると context menu open の動画で Space → 画像系チェックトグルへ流出する
+        // (Codex Phase 1 P2 指摘)。
+        let current_item_is_video_for_space =
+            matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+        let key_space = !current_item_is_video_for_space
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
         let key_ctrl_s_capture = !is_video_fs
             && self.fs_context_menu_idx.is_none()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S));
@@ -3279,34 +3287,27 @@ impl App {
             }
         }
 
-        // Space: スライドショー中→停止、停止中→画像をチェック
+        // Space: スライドショー中→停止、停止中→画像をチェック。
+        // 動画モードでは `current_item_is_video_for_space` で gate されているため
+        // `key_space` は常に false (= ここには到達しない)。Video アームを残しておくと
+        // 「context menu open 中の動画で Space → チェックトグル」の脱出口になり得るので
+        // **Video / ZipImage の動画系派生を含めない** (Codex Phase 1 P2 指摘)。
+        // (ZipImage / PdfPage は静止画扱いのため従来通りチェック可能。)
         if key_space {
             if self.slideshow_playing {
                 self.slideshow_playing = false;
             } else {
-                let mut checked_now = None;
                 match self.items.get(fs_idx) {
                     Some(GridItem::Image(_))
-                    | Some(GridItem::Video(_))
                     | Some(GridItem::ZipImage { .. })
                     | Some(GridItem::PdfPage { .. }) => {
-                        let checked = if self.checked.contains(&fs_idx) {
+                        if self.checked.contains(&fs_idx) {
                             self.checked.remove(&fs_idx);
-                            false
                         } else {
                             self.checked.insert(fs_idx);
-                            true
-                        };
-                        checked_now = Some(checked);
+                        }
                     }
                     _ => {}
-                }
-                #[cfg(windows)]
-                if let Some(checked) = checked_now
-                    && matches!(self.items.get(fs_idx), Some(GridItem::Video(_)))
-                    && let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx)
-                {
-                    player.set_native_checked(checked);
                 }
             }
         }
@@ -7070,11 +7071,10 @@ impl App {
             return;
         }
 
-        // 動画モードのキー処理: Space は consume せず後段の image 選択トグルに流す
-        // (Phase 5.1: 画像と動画でキーアサインを揃える)。
-        // 再生/一時停止トグルは **Enter** に移行。Shift+Enter は外部プレイヤー起動。
-        // egui の `consume_key` は修飾子マッチが厳密 (Caps Lock + Shift などで取りこぼす)
-        // ので、`modifiers.shift` を見た fallback も併用する。
+        // 動画モードのキー処理: 動画 HUD 2 段化リデザイン (Phase 1) で Space を再生/停止
+        // トグルに追加。Enter / Shift+Enter は既存どおり (Enter = 再生/停止、Shift+Enter = 外部
+        // プレイヤー)。egui の `consume_key` は修飾子マッチが厳密 (Caps Lock + Shift などで
+        // 取りこぼす) ので、`modifiers.shift` を見た fallback も併用する。
         let shift_held_now = ctx.input(|i| i.modifiers.shift);
         let shift_enter = ctx.input_mut(|i| {
             let direct = i.consume_key(egui::Modifiers::SHIFT, egui::Key::Enter);
@@ -7088,6 +7088,10 @@ impl App {
         // ここでは shift 無しの Enter のみが残っている。
         let enter = !shift_held_now
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        // Space 単独: 再生 / 一時停止トグル (= Enter と等価、動画プレイヤー慣習)。
+        // 上位の image key_space ハンドラは `!is_video_fs` で gate されているので
+        // 動画モードでは消費されず、ここで取れる。
+        let key_space = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space));
         // Phase 7.H シーク粒度: ←→=5 秒、Shift+←→=1 秒、Ctrl+←→=30 秒。
         // タイル中は seek せずカーソル移動に切り替える。Ctrl 併用時だけ 1 行分移動。
         // ↑↓ は consume せず後段の image arrow_up/down (= 前後ファイル) に流す
@@ -7216,7 +7220,7 @@ impl App {
             }
             return;
         }
-        if enter && self.video_tile_mode_active {
+        if (enter || key_space) && self.video_tile_mode_active {
             self.play_selected_video_tile(ctx, fs_idx);
             return;
         }
@@ -7253,7 +7257,7 @@ impl App {
         // player に作用させる (借用はこの if-let のスコープ内で完結)
         let mut seek_outcome: Option<crate::video::RelativeSeekOutcome> = None;
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            if enter {
+            if enter || key_space {
                 player.toggle_play();
             }
             if ctrl_shift_left {

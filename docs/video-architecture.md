@@ -1221,7 +1221,7 @@ overlay の中央 status に「メタデータ読込中...」「ストリーム�
   metadata 未到着では一時的に `None` になりうる。mode と state を混同すると、動画切替中の
   path mismatch で `video_tile_state` を捨てた瞬間に、タイルモード自体まで無音で解除される。
 - `video_tile_reopen_pending` は「タイル表示中に動画を切り替えたが、次動画の info がまだ無い」
-  場合の短期 retry 予約。通常のホイールナビゲーション (`WheelNavigate` /
+  場合の短期 retry 予約。通常のホイールナビゲーション (`NavigateItem`、旧 `WheelNavigate` /
   `try_start_native_video_fast_swap` / `NativeVideoSourceSwapPending` の `reason=navigation`)
   では、`video_tile_mode_active == false` なら `cancel_stale_video_tile_reopen()` で必ず
   破棄する。これを怠ると、過去の tile timeout / reopen 予約が残り、ホイール移動だけで

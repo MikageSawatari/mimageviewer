@@ -295,7 +295,7 @@ pub enum NativeVideoOutputEvent {
     TileSeek {
         target_secs: f64,
     },
-    WheelNavigate {
+    NavigateItem {
         delta: i32,
     },
     TileColumnsDelta {
@@ -374,6 +374,14 @@ pub enum NativeVideoOutputEvent {
     SetPinAt {
         target_secs: f64,
     },
+    /// 動画 HUD 2 段化リデザイン (Phase 4): 前/次マーカーへジャンプ。
+    /// `next=true` で次マーカー (= K キー)、`false` で前マーカー (= J キー)。
+    JumpMarker {
+        next: bool,
+    },
+    /// 動画 HUD 2 段化リデザイン (Phase 5): 現在フレームをキャプチャ保存フォルダへ保存
+    /// (= Ctrl+S と等価)。
+    SaveFrameToFile,
     SetBookmarkTitle {
         id: i64,
         title: String,
@@ -1364,7 +1372,7 @@ fn send_native_overlay_command(
     let event = match command {
         Command::Seek { target_secs } => NativeVideoOutputEvent::Seek { target_secs },
         Command::TileSeek { target_secs } => NativeVideoOutputEvent::TileSeek { target_secs },
-        Command::WheelNavigate { delta } => NativeVideoOutputEvent::WheelNavigate { delta },
+        Command::NavigateItem { delta } => NativeVideoOutputEvent::NavigateItem { delta },
         Command::TileColumnsDelta { delta } => NativeVideoOutputEvent::TileColumnsDelta { delta },
         Command::RequestSeekThumbnail { target_secs } => {
             NativeVideoOutputEvent::RequestSeekThumbnail { target_secs }
@@ -1412,6 +1420,8 @@ fn send_native_overlay_command(
             NativeVideoOutputEvent::AddBookmarkAt { target_secs }
         }
         Command::SetPinAt { target_secs } => NativeVideoOutputEvent::SetPinAt { target_secs },
+        Command::JumpMarker { next } => NativeVideoOutputEvent::JumpMarker { next },
+        Command::SaveFrameToFile => NativeVideoOutputEvent::SaveFrameToFile,
         Command::SetBookmarkTitle { id, title } => {
             NativeVideoOutputEvent::SetBookmarkTitle { id, title }
         }
@@ -2678,13 +2688,13 @@ fn run_native_video_output(
                                     NativeVideoOutputEvent::TileSeek { target_secs },
                                 );
                             }
-                            crate::video::native_presenter::NativeOverlayCommand::WheelNavigate {
+                            crate::video::native_presenter::NativeOverlayCommand::NavigateItem {
                                 delta,
                             } => {
                                 send_native_output_event(
                                     &ui_event_tx,
                                     event_epoch,
-                                    NativeVideoOutputEvent::WheelNavigate { delta },
+                                    NativeVideoOutputEvent::NavigateItem { delta },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::TileColumnsDelta {
@@ -2910,6 +2920,22 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::SetPinAt { target_secs },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::JumpMarker {
+                                next,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::JumpMarker { next },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::SaveFrameToFile => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::SaveFrameToFile,
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::SetBookmarkTitle {

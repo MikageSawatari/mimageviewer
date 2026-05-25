@@ -413,9 +413,12 @@ pub(super) fn draw_native_jump_panel(
             );
 
             // 一括ブックマーク登録ダイアログを開くボタン。
-            // 配置: 既存の Pin (- 68pt) / Bookmark (- 36pt) の左側に並べる (- 100pt)。
+            // 配置 (動画 HUD 2 段化リデザイン Phase 2): 左から右に「Bookmark (- 100pt)
+            // → Pin (- 68pt) → 一括 Bookmark (- 36pt)」の論理読み順 (= 基本 → 拡張) に
+            // 並べる。旧配置 (bulk - 100pt / pin - 68pt / bookmark - 36pt) は一括ボタンを
+            // 後から左端にぶら下げた歴史的経緯で、意図的な並びではなかった。
             let bulk_rect = egui::Rect::from_min_size(
-                rect.min + egui::vec2(rect.width() - 100.0, 6.0),
+                rect.min + egui::vec2(rect.width() - 36.0, 6.0),
                 egui::vec2(26.0, 24.0),
             );
             let bulk_resp = ui.interact(
@@ -464,7 +467,7 @@ pub(super) fn draw_native_jump_panel(
             }
 
             let bm_rect = egui::Rect::from_min_size(
-                rect.min + egui::vec2(rect.width() - 36.0, 6.0),
+                rect.min + egui::vec2(rect.width() - 100.0, 6.0),
                 egui::vec2(26.0, 24.0),
             );
             let bm_resp = ui.interact(
@@ -1217,6 +1220,45 @@ pub(super) fn draw_native_frame_step_button(
     down
 }
 
+/// 動画 HUD 2 段化リデザイン (Phase 4): 前/次マーカーへスキップするアイコン。
+/// `direction < 0` で `|◀` (前マーカー、prev)、`direction > 0` で `▶|` (次マーカー、next)。
+/// 縦バー + 三角の組み合わせ。CD プレイヤーや YouTube のチャプター移動慣習に合わせる。
+/// `enabled=false` (= マーカー無し) のときは半透明グレーで描く。
+pub(super) fn draw_overlay_skip_to_marker_icon(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    direction: i32,
+    enabled: bool,
+) {
+    let color = if enabled {
+        egui::Color32::from_rgb(238, 238, 238)
+    } else {
+        egui::Color32::from_rgba_unmultiplied(238, 238, 238, 90)
+    };
+    let stroke = egui::Stroke::new(1.8, color);
+    let c = rect.center();
+    let sign = if direction < 0 { -1.0 } else { 1.0 };
+    // 縦バー: 進行方向側 (prev なら左、next なら右)
+    let bar_x = c.x + sign * 7.0;
+    painter.line_segment(
+        [egui::pos2(bar_x, c.y - 8.0), egui::pos2(bar_x, c.y + 8.0)],
+        stroke,
+    );
+    // 三角: バーへ向かう向き (prev なら左向き ◀、next なら右向き ▶)
+    // バーから 2pt 内側に三角の先端を寄せて視覚的にくっつける
+    let tip_x = c.x + sign * 5.0;
+    let base_x = c.x - sign * 5.0;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(tip_x, c.y),
+            egui::pos2(base_x, c.y - 6.0),
+            egui::pos2(base_x, c.y + 6.0),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
 pub(super) fn draw_overlay_frame_step_icon(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -1253,6 +1295,65 @@ pub(super) fn draw_overlay_frame_step_icon(
         color,
         egui::Stroke::NONE,
     ));
+}
+
+/// 動画 HUD 2 段化リデザイン (Phase 6): 前/次ファイル (前/次項目) ボタン用の単純矢印アイコン。
+/// `direction < 0` で上向き ↑ (= 前項目)、`direction > 0` で下向き ↓ (= 次項目)。
+/// ファイル切替は上下キーに対応する操作なので、左右矢印 (= シーク操作の慣習) ではなく
+/// 上下三角を使う。同じ HUD 行に並ぶ `|◀ ▶|` (skip marker) や `◀ ▶` (frame step) との
+/// 衝突を避けつつ、「上=前、下=次」のキーボード規約と一致させる。
+pub(super) fn draw_overlay_arrow_icon(painter: &egui::Painter, rect: egui::Rect, direction: i32) {
+    let color = egui::Color32::from_rgb(238, 238, 238);
+    let c = rect.center();
+    let sign = if direction < 0 { -1.0 } else { 1.0 };
+    // 三角: 進行方向側 (prev=上向き、next=下向き)
+    let tip_y = c.y + sign * 7.0;
+    let base_y = c.y - sign * 4.0;
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x, tip_y),
+            egui::pos2(c.x - 6.0, base_y),
+            egui::pos2(c.x + 6.0, base_y),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+    // 軸線 (アイテム列を示唆): 三角の反対側に短い縦線
+    let stroke = egui::Stroke::new(1.8, color);
+    let line_far = c.y - sign * 8.0;
+    painter.line_segment([egui::pos2(c.x, base_y), egui::pos2(c.x, line_far)], stroke);
+}
+
+/// 動画 HUD 2 段化リデザイン (Phase 5): キャプチャパレットの「ファイル保存」ボタン用アイコン。
+/// 単純な下向き矢印 + ベースライン (ファイル保存の universal アイコン)。
+/// フロッピーディスクはレトロすぎる + camera との視覚的衝突を避けるため使わない。
+pub(super) fn draw_overlay_save_icon(painter: &egui::Painter, rect: egui::Rect) {
+    let color = egui::Color32::from_rgb(238, 238, 238);
+    let stroke = egui::Stroke::new(1.8, color);
+    let c = rect.center();
+    // 縦線 (矢印の軸): center 上下に伸びる
+    painter.line_segment(
+        [egui::pos2(c.x, c.y - 7.0), egui::pos2(c.x, c.y + 3.0)],
+        stroke,
+    );
+    // 矢印頭 (下向き三角): 線の下端に
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            egui::pos2(c.x, c.y + 6.0),
+            egui::pos2(c.x - 4.5, c.y + 0.0),
+            egui::pos2(c.x + 4.5, c.y + 0.0),
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
+    // ベースライン (ファイルを示す横線): 矢印の下に
+    painter.line_segment(
+        [
+            egui::pos2(c.x - 7.0, c.y + 9.0),
+            egui::pos2(c.x + 7.0, c.y + 9.0),
+        ],
+        stroke,
+    );
 }
 
 pub(super) fn draw_overlay_camera_icon(painter: &egui::Painter, rect: egui::Rect) {
@@ -1654,7 +1755,7 @@ pub(super) fn draw_native_center_pause_controls(
                 painter.layout_no_wrap("最初から".to_owned(), label_font.clone(), label_color);
             let play_label = painter.layout_no_wrap("続きから".to_owned(), label_font, label_color);
             let hint_label = painter.layout_no_wrap(
-                "Enter: 再生 / W: 頭出し / ←→: シーク / J,K: マーカー移動".to_owned(),
+                "Space/Enter: 再生 / W: 頭出し / ←→: シーク / J,K: マーカー移動".to_owned(),
                 hint_font,
                 hint_color,
             );
@@ -3092,7 +3193,10 @@ pub(super) fn native_panel_top() -> f32 {
 }
 
 pub(super) fn native_panel_hover_bottom(overlay_height_points: f32) -> f32 {
-    (overlay_height_points - 48.0).max(native_panel_top())
+    // 動画 HUD 2 段化リデザイン (Phase 3): シーク HUD の上に 2pt の隙間を保つ。
+    // HUD_BOTTOM_HEIGHT + 2.0 で HUD top - 2pt = 隙間下端。
+    (overlay_height_points - (crate::video::native_presenter::HUD_BOTTOM_HEIGHT + 2.0))
+        .max(native_panel_top())
 }
 
 pub(super) fn native_panel_hover_rect(
@@ -3106,7 +3210,11 @@ pub(super) fn native_panel_hover_rect(
 
 pub(super) fn native_jump_panel_rect(overlay_height_points: f32) -> egui::Rect {
     let top = native_panel_top();
-    let panel_h = (overlay_height_points - top - 48.0).max(240.0);
+    // 動画 HUD 2 段化リデザイン (Phase 3): パネル底辺 = HUD top - 2pt の隙間
+    // (= overlay_h - HUD_BOTTOM_HEIGHT - 2)。`native_panel_hover_bottom` と一致させる。
+    let panel_h =
+        (overlay_height_points - top - (crate::video::native_presenter::HUD_BOTTOM_HEIGHT + 2.0))
+            .max(240.0);
     egui::Rect::from_min_size(
         egui::pos2(0.0, top),
         egui::vec2(native_jump_panel_width(), panel_h),
@@ -3119,7 +3227,9 @@ pub(super) fn native_metadata_panel_rect(
 ) -> egui::Rect {
     let panel_w = native_metadata_panel_width().min(overlay_width_points * 0.5);
     let top = native_panel_top();
-    let panel_h = (overlay_height_points - top - 48.0).max(260.0);
+    let panel_h =
+        (overlay_height_points - top - (crate::video::native_presenter::HUD_BOTTOM_HEIGHT + 2.0))
+            .max(260.0);
     egui::Rect::from_min_size(
         egui::pos2(overlay_width_points - panel_w, top),
         egui::vec2(panel_w, panel_h),
@@ -3134,7 +3244,14 @@ pub(super) fn native_vst3_panel_rect(
     let width = 380.0_f32.min((overlay_width_points - 32.0).max(260.0));
     let row_count = panel.slots.len().max(1).min(10) as f32;
     let desired_height = 154.0 + row_count * 28.0;
-    let max_height = (overlay_height_points - native_panel_top() - 56.0).max(240.0);
+    // 動画 HUD 2 段化リデザイン (Phase 3): パネル下端 = HUD top - 10pt の隙間
+    // (= overlay_h - HUD_BOTTOM_HEIGHT - 10)。パネル top は native_panel_top()+10 なので
+    // max_height = overlay_h - (native_panel_top()+10) - (HUD_BOTTOM_HEIGHT+10) と等価。
+    // 簡単のため (HUD_BOTTOM_HEIGHT + 10.0) で底辺余白を取る。
+    let max_height = (overlay_height_points
+        - native_panel_top()
+        - (crate::video::native_presenter::HUD_BOTTOM_HEIGHT + 10.0))
+        .max(240.0);
     let height = desired_height.clamp(236.0, max_height.min(620.0));
     egui::Rect::from_min_size(
         egui::pos2(18.0, native_panel_top() + 10.0),
@@ -3977,10 +4094,13 @@ mod tests {
     }
 
     /// jump / metadata 両パネルの底辺がホバー判定の底辺と一致し、シーク HUD
-    /// (top y = overlay_h - 46) の上に 2pt の隙間が空くことを保証する回帰テスト。
-    /// 上ホバーバー bottom y = 54 と panel top y = 56 の 2pt 隙間と対称になる前提。
+    /// (top y = overlay_h - HUD_BOTTOM_HEIGHT) の上に 2pt の隙間が空くことを保証する
+    /// 回帰テスト。上ホバーバー bottom y = 54 と panel top y = 56 の 2pt 隙間と対称になる前提。
+    /// 動画 HUD 2 段化リデザイン (Phase 3) で HUD 高さが 46 → 64 に変わったので、
+    /// パネル底辺も連動して `overlay_h - 66 (= HUD_BOTTOM_HEIGHT + 2)` になる。
     #[test]
     fn side_panel_bottoms_match_hover_bottom() {
+        use crate::video::native_presenter::HUD_BOTTOM_HEIGHT;
         let overlay_h = 1080.0_f32;
         let overlay_w = 1920.0_f32;
 
@@ -3988,7 +4108,7 @@ mod tests {
         let jump = native_jump_panel_rect(overlay_h);
         let meta = native_metadata_panel_rect(overlay_w, overlay_h);
 
-        assert_eq!(hover_bottom, overlay_h - 48.0);
+        assert_eq!(hover_bottom, overlay_h - (HUD_BOTTOM_HEIGHT + 2.0));
         assert_eq!(jump.max.y, hover_bottom);
         assert_eq!(meta.max.y, hover_bottom);
     }
