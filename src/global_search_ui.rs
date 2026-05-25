@@ -1121,6 +1121,174 @@ impl App {
         // tag_prewarm worker は invalidate_idx_state_and_queues で cancel されているので、
         // 検索結果向けに再起動 + fts_meta から tags_cache を再プリウォーム。
         self.prewarm_grid_tags();
+        // Ctrl+G 結果の動画サムネ抽出スレッドを (必要に応じて) 再 spawn する。
+        // streaming 中は pin 持ち動画のみ、`done=true` 後は全動画を Shell API で展開する。
+        self.respawn_search_video_thread();
+    }
+
+    /// Ctrl+G 結果ビュー専用の動画サムネ抽出スレッドの候補リストを組み立てる。
+    /// 単体テスト容易性のため `respawn_search_video_thread` から切り出した純粋関数。
+    ///
+    /// - `Loaded` 状態の動画は除外 (= preserve 経路で既にテクスチャを持つ)
+    /// - `streaming=true` (= `global_search.done == false`) のときは `pin_paths` に
+    ///   含まれる動画だけを残す。これは「streaming 中は Shell API の重い処理を避け、
+    ///   `video_pins` DB から WebP を取り出すだけで完結する動画だけサムネ表示する」
+    ///   設計に対応 (詳細は `respawn_search_video_thread` の doc を参照)。
+    /// - `streaming=false` のときは全 not-Loaded 動画を返す。
+    pub(crate) fn compute_search_video_candidates(
+        items: &[GridItem],
+        thumbnails: &[ThumbnailState],
+        pin_paths: &HashSet<std::path::PathBuf>,
+        streaming: bool,
+    ) -> Vec<(usize, std::path::PathBuf, u64)> {
+        debug_assert_eq!(items.len(), thumbnails.len());
+        items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| match item {
+                GridItem::Video(p) => {
+                    if matches!(thumbnails.get(i), Some(ThumbnailState::Loaded { .. })) {
+                        return None;
+                    }
+                    if streaming && !pin_paths.contains(p) {
+                        return None;
+                    }
+                    // file_size は検索結果ビューでは取得していないので 0 を渡す。
+                    Some((i, p.clone(), 0_u64))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Ctrl+G 結果ビュー専用の動画サムネ抽出スレッドを再 spawn する。
+    ///
+    /// 通常閲覧 / Ctrl+S と異なり、Ctrl+G の `replace_search_view_items` は
+    /// `start_loading_items` を経由しないため `spawn_video_thread` が呼ばれない。
+    /// 結果として `GridItem::Video` は `ThumbnailState::Pending` のまま放置される。
+    /// このヘルパが補う。
+    ///
+    /// ## 設計上の妥協 (docs/search-architecture.md と Codex review 反映)
+    ///
+    /// 1. **`items_generation` バンプとの両立**:
+    ///    streaming 中は `replace_search_view_items` が ~1 秒ごとに走り、毎回
+    ///    `items_generation` が bump する。spawn 時に snapshot された items_gen で
+    ///    ThumbMsg を送るので、次の bump で前回の spawn の結果は破棄される。
+    ///    対策として: streaming 中 (`global_search.done == false`) は **pin 持ち
+    ///    動画だけを spawn 対象**にする。pin 経路は WebP デコードのみで Shell API を
+    ///    呼ばないので 1 spawn が ~100ms 未満で完結し、cancel + 再 spawn による
+    ///    重複処理コストが小さい。
+    ///    `done=true` (= streaming 終了 / view 切替後の安定状態) では Shell API を
+    ///    含む通常チェーンを起動。items_gen はその時点で安定しているためメッセージは
+    ///    破棄されない。
+    ///
+    /// 2. **同名 stem の sidecar 画像 leak 回避**:
+    ///    `App::video_thumb_overrides` は前フォルダの sidecar を stem キーで保持する
+    ///    (src/app.rs:`hydrate_video_thumb_overrides_from_current_folder`)。Ctrl+G の
+    ///    結果は複数フォルダにまたがるため、これを渡すと別フォルダの同 stem 動画に
+    ///    sidecar 画像が誤って当たる。よって empty map を渡す (sidecar は Ctrl+G では
+    ///    使わない)。Codex P1 #2 指摘。
+    ///
+    /// 3. **重複 Shell 呼び出し抑制**:
+    ///    既存の per-search cancel (`search_video_thread_cancel`) を毎回上書きする
+    ///    ことで、前 spawn を素早く終了させる。spawn_video_thread の cancel チェックは
+    ///    Shell call の合間に入るので 1 件分のラグはあるが、Shell Thumbcache が hit
+    ///    する 2 回目以降は ms オーダーで完了する。Codex P2 #3 指摘の緩和策。
+    pub(crate) fn respawn_search_video_thread(&mut self) {
+        use std::sync::atomic::Ordering;
+        // 旧 spawn を cancel する (worker は次の Shell call 終了後に exit)。
+        if let Some(old) = self.search_video_thread_cancel.take() {
+            old.store(true, Ordering::Relaxed);
+        }
+        // 検索結果ビュー以外では何もしない (通常閲覧 / Ctrl+S は start_loading_items が
+        // spawn_video_thread を別経路で呼ぶ)。
+        if !self.items_are_global_search_view {
+            return;
+        }
+        // 診断ログ (Codex 2026-05-25): respawn が呼ばれたか / Aggregated 等で Video が
+        // 1 つも無いか / candidates の内訳がわかるよう、items 内の Video 件数を記録。
+        // Aggregated view では items は `GridItem::SearchContainer` になり、
+        // `GridItem::Video` が 0 件で「pin 持ち動画だけ出る」現象は起きないはずだが、
+        // 万一 view 違いだと早期 return 経路が変わるので追跡できるようにする。
+        let view_label = match self.global_search.view() {
+            GlobalSearchView::Flat => "Flat",
+            GlobalSearchView::Aggregated => "Aggregated",
+            GlobalSearchView::DrilledInto { .. } => "DrilledInto",
+        };
+        let total_videos_in_items = self
+            .items
+            .iter()
+            .filter(|it| matches!(it, GridItem::Video(_)))
+            .count();
+        // まず not-Loaded 動画 path を全部集めて pin lookup を 1 度で済ませる
+        // (Codex P2 #4: not-Loaded 集合に限定して video_pin_db を叩く)。
+        let not_loaded_paths: Vec<std::path::PathBuf> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, item)| match item {
+                GridItem::Video(p)
+                    if !matches!(self.thumbnails.get(i), Some(ThumbnailState::Loaded { .. })) =>
+                {
+                    Some(p.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        if not_loaded_paths.is_empty() {
+            crate::logger::log(format!(
+                "[search video] respawn skip: view={view_label} done={} total_videos={total_videos_in_items} not_loaded=0",
+                self.global_search.done,
+            ));
+            return;
+        }
+        // **バルクルックアップ** (Codex P2 #2 指摘): streaming 中の rebuild が ~1 秒
+        // 周期で走り、検索結果に動画が数千〜数万件あると 1 件ずつ `db.lookup()` を
+        // 呼ぶと UI スレッドで大量の SQLite I/O が発生する。`lookup_webps_many` で
+        // `IN` 句に集約することで 500 件チャンク × N 回の prepared statement に圧縮。
+        let pin_blobs: std::collections::HashMap<std::path::PathBuf, Vec<u8>> =
+            if let Some(db) = self.video_pin_db.as_ref() {
+                db.lookup_webps_many(&not_loaded_paths)
+            } else {
+                std::collections::HashMap::new()
+            };
+        let pin_paths: HashSet<std::path::PathBuf> = pin_blobs.keys().cloned().collect();
+        let streaming = !self.global_search.done;
+        let candidates = Self::compute_search_video_candidates(
+            &self.items,
+            &self.thumbnails,
+            &pin_paths,
+            streaming,
+        );
+        let candidates_pin_count = candidates
+            .iter()
+            .filter(|(_, p, _)| pin_paths.contains(p))
+            .count();
+        let candidates_shell_count = candidates.len() - candidates_pin_count;
+        crate::logger::log(format!(
+            "[search video] respawn: view={view_label} done={} streaming={streaming} \
+             total_videos={total_videos_in_items} not_loaded={} pins={} \
+             candidates={} (pin={candidates_pin_count} shell={candidates_shell_count})",
+            self.global_search.done,
+            not_loaded_paths.len(),
+            pin_paths.len(),
+            candidates.len(),
+        ));
+        if candidates.is_empty() {
+            return;
+        }
+        // 新 cancel を作成して保存。
+        let new_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.search_video_thread_cancel = Some(std::sync::Arc::clone(&new_cancel));
+        // empty thumb_overrides で sidecar leak を回避 (`respawn_search_video_thread`
+        // doc 内 #2 参照)。
+        self.spawn_video_thread(
+            self.tx.clone(),
+            new_cancel,
+            candidates,
+            std::collections::HashMap::new(),
+            pin_blobs,
+        );
     }
 
     /// Ctrl+G を押したときのエントリ (open or close toggle)。
@@ -1145,6 +1313,11 @@ impl App {
         // Ctrl+G 中は current_folder_rating() が 0 を返す規約なので、
         // 旧フォルダの★が残っているとアドレスバーにちらつく。
         self.current_folder_rating_cache = None;
+        // 防御的: 前回 Ctrl+G セッションの cancel が残っていれば落とす
+        // (close_global_search で必ずクリアされる想定だが念のため)。
+        if let Some(old) = self.search_video_thread_cancel.take() {
+            old.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn close_global_search(&mut self) {
@@ -1154,6 +1327,12 @@ impl App {
         self.cancel_pending_folder_nav();
         // pending があれば SearchHandle の Drop impl で cancel される
         self.global_search.pending = None;
+        // Ctrl+G 結果の動画サムネ抽出スレッドを cancel。後続の load_folder で
+        // cancel_token 自体も bump されるが、こちらは Shell call 中の worker に
+        // 早めに「やめてよい」を伝える専用フラグ。
+        if let Some(old) = self.search_video_thread_cancel.take() {
+            old.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         // **Codex P3-1 対応**: container mtime worker も同様に drop して cancel する。
         // 検索ビューを抜けたあとに SMB 越しの fs::metadata が裏で走り続けるのを止める。
         self.global_search.mtime_lookup_pending = None;
@@ -2158,7 +2337,7 @@ impl App {
 
 /// 検索クエリに `#tag` トークンが既に含まれているか (完全一致、空白境界必須)。
 /// 大文字小文字は無視する (search_query::parse の小文字化と整合)。
-fn query_contains_tag(query: &str, tag_name: &str) -> bool {
+pub(crate) fn query_contains_tag(query: &str, tag_name: &str) -> bool {
     let needle = format!("#{}", tag_name).to_lowercase();
     for tok in query.split_whitespace() {
         // クォート除外の簡易判定: 完全一致だけ見る
@@ -2172,7 +2351,7 @@ fn query_contains_tag(query: &str, tag_name: &str) -> bool {
 
 /// クエリ末尾に `#tag_name` を追加 (前に空白を 1 個挟む)。
 /// クエリが空なら先頭にそのまま置く。
-fn append_tag_to_query(query: &mut String, tag_name: &str) {
+pub(crate) fn append_tag_to_query(query: &mut String, tag_name: &str) {
     let trimmed_end = query.trim_end();
     if trimmed_end.is_empty() {
         query.clear();
@@ -3055,5 +3234,139 @@ mod tests {
             thumb_reuse_key(&make(Some(rep2))),
             thumb_reuse_key(&make(None))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_search_video_candidates — respawn_search_video_thread 内の
+    // 候補選択ロジック (Codex review 反映)。
+    // -----------------------------------------------------------------------
+
+    fn make_video(p: &str) -> GridItem {
+        GridItem::Video(PathBuf::from(p))
+    }
+
+    /// `ThumbnailState::Loaded` を実際の `egui::TextureHandle` 付きで構築する。
+    /// egui::Context::default() + load_texture でテスト用ダミーテクスチャを作れる
+    /// パターン (src/app/tests.rs:poll_fs_nav_lock_waits_for_items_generation_bump
+    /// と同じ手法)。
+    fn make_loaded_state() -> ThumbnailState {
+        let ctx = eframe::egui::Context::default();
+        let tex = ctx.load_texture(
+            "test_loaded",
+            eframe::egui::ColorImage::filled([1, 1], eframe::egui::Color32::WHITE),
+            eframe::egui::TextureOptions::LINEAR,
+        );
+        ThumbnailState::Loaded {
+            tex,
+            from_cache: false,
+            rendered_at_px: 64,
+            source_dims: None,
+        }
+    }
+
+    #[test]
+    fn candidates_skips_already_loaded_videos() {
+        // Codex notes #1 反映: 実際の `Loaded` 状態 (TextureHandle 付き) を使い、
+        // 「Loaded の動画は候補から除外」を直接検証する。
+        let items = vec![make_video("c:/loaded.mp4"), make_video("c:/pending.mp4")];
+        let thumbs = vec![make_loaded_state(), ThumbnailState::Pending];
+        let pins = HashSet::new();
+        let result = App::compute_search_video_candidates(&items, &thumbs, &pins, false);
+        assert_eq!(result.len(), 1, "Loaded 動画は除外、Pending のみ候補");
+        assert_eq!(result[0].1, PathBuf::from("c:/pending.mp4"));
+        assert_eq!(result[0].0, 1, "Pending 動画の元 idx (=1) が保持される");
+    }
+
+    #[test]
+    fn candidates_includes_pending_evicted_failed_states() {
+        // `Loaded` 以外の状態は全て候補に入る (Pending / Evicted / Failed / Requested)。
+        // これは「Loaded のみ除外」ルールの対偶確認。
+        let items = vec![
+            make_video("c:/a.mp4"),
+            make_video("c:/b.mp4"),
+            make_video("c:/c.mp4"),
+        ];
+        let thumbs = vec![
+            ThumbnailState::Pending,
+            ThumbnailState::Evicted,
+            ThumbnailState::Failed,
+        ];
+        let pins = HashSet::new();
+        let result = App::compute_search_video_candidates(&items, &thumbs, &pins, false);
+        assert_eq!(result.len(), 3, "Pending/Evicted/Failed は全て候補に入る");
+    }
+
+    #[test]
+    fn candidates_non_video_items_are_ignored() {
+        let items = vec![
+            GridItem::Image(PathBuf::from("c:/img.jpg")),
+            GridItem::Folder(PathBuf::from("c:/folder")),
+            make_video("c:/v.mp4"),
+        ];
+        let thumbs = vec![ThumbnailState::Pending; 3];
+        let pins = HashSet::new();
+        let result = App::compute_search_video_candidates(&items, &thumbs, &pins, false);
+        assert_eq!(result.len(), 1, "非動画 (Image/Folder) は候補に入らない");
+        assert_eq!(result[0].0, 2, "Video の元 idx (=2) が保持される");
+    }
+
+    #[test]
+    fn candidates_streaming_keeps_only_pin_having_videos() {
+        // streaming=true のとき、pin DB に登録のない動画は除外される。
+        let items = vec![make_video("c:/no_pin.mp4"), make_video("c:/has_pin.mp4")];
+        let thumbs = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        let mut pins = HashSet::new();
+        pins.insert(PathBuf::from("c:/has_pin.mp4"));
+        let result = App::compute_search_video_candidates(&items, &thumbs, &pins, true);
+        assert_eq!(result.len(), 1, "streaming 中は pin 持ち動画のみ候補");
+        assert_eq!(result[0].1, PathBuf::from("c:/has_pin.mp4"));
+        assert_eq!(result[0].0, 1, "pin 持ち動画の元 idx (=1) が保持される");
+    }
+
+    #[test]
+    fn candidates_done_includes_all_not_loaded_videos() {
+        // streaming=false (= global_search.done == true) のとき、pin 有無に関わらず
+        // 未 Loaded 動画は全て候補に入る (Shell API 経路で抽出)。
+        let items = vec![make_video("c:/no_pin.mp4"), make_video("c:/has_pin.mp4")];
+        let thumbs = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        let mut pins = HashSet::new();
+        pins.insert(PathBuf::from("c:/has_pin.mp4"));
+        let result = App::compute_search_video_candidates(&items, &thumbs, &pins, false);
+        assert_eq!(result.len(), 2, "done 状態は pin の有無に関わらず全て候補");
+    }
+
+    #[test]
+    fn candidates_empty_input_returns_empty() {
+        let result = App::compute_search_video_candidates(&[], &[], &HashSet::new(), false);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn candidates_streaming_no_pins_returns_empty() {
+        // streaming=true で動画はあるが pin が 1 件もない → spawn 不要。
+        let items = vec![make_video("c:/a.mp4"), make_video("c:/b.mp4")];
+        let thumbs = vec![ThumbnailState::Pending, ThumbnailState::Pending];
+        let pins = HashSet::new();
+        let result = App::compute_search_video_candidates(&items, &thumbs, &pins, true);
+        assert!(
+            result.is_empty(),
+            "streaming で pin 持ちゼロのとき候補は空 (spawn しない経路)"
+        );
+    }
+
+    #[test]
+    fn candidates_preserves_original_index_after_filtering() {
+        // 候補に入る idx は元の items 内 idx と一致する (filter_map の enumerate)。
+        let items = vec![
+            GridItem::Image(PathBuf::from("c:/x.jpg")), // idx 0
+            make_video("c:/a.mp4"),                     // idx 1
+            GridItem::Folder(PathBuf::from("c:/d")),    // idx 2
+            make_video("c:/b.mp4"),                     // idx 3
+        ];
+        let thumbs = vec![ThumbnailState::Pending; 4];
+        let pins = HashSet::new();
+        let result = App::compute_search_video_candidates(&items, &thumbs, &pins, false);
+        let indices: Vec<usize> = result.iter().map(|(i, _, _)| *i).collect();
+        assert_eq!(indices, vec![1, 3], "Video の元 idx (1, 3) が保持される");
     }
 }

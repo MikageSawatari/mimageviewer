@@ -1503,6 +1503,53 @@ impl App {
                     self.search_has_focus = false;
                 }
 
+                // タグピッカー (Ctrl+G と同じ UI、docs/tag-feature.md Phase D)
+                // 登録済みタグを一覧からワンクリックで `#タグ名` として検索クエリに追記する。
+                // ZIP 表示中は検索対象がファイル名固定で `#タグ` が機能しないため
+                // ターゲット dropdown と同様に disabled にする。
+                let tags_snapshot = self.settings.tags.clone();
+                if zip_view {
+                    ui.add_enabled(false, egui::Button::new("# タグ…"))
+                        .on_disabled_hover_text(
+                            "ZIP 内の表示中はファイル名フィルタ固定のため、\n\
+                             タグ検索は利用できません。",
+                        );
+                } else if tags_snapshot.is_empty() {
+                    ui.add_enabled(false, egui::Button::new("# タグ…"))
+                        .on_disabled_hover_text(
+                            "メニュー「タグ」→「タグを編集…」から先にタグを\n\
+                             登録すると、ここから選択できるようになります。",
+                        );
+                } else {
+                    ui.menu_button("# タグ…", |ui| {
+                        ui.set_min_width(160.0);
+                        for t in &tags_snapshot {
+                            let already_in_query = crate::global_search_ui::query_contains_tag(
+                                &self.search_query,
+                                &t.name,
+                            );
+                            let label = if already_in_query {
+                                format!("✓ #{}", t.name)
+                            } else {
+                                format!("  #{}", t.name)
+                            };
+                            if ui.button(label).clicked() {
+                                if !already_in_query {
+                                    crate::global_search_ui::append_tag_to_query(
+                                        &mut self.search_query,
+                                        &t.name,
+                                    );
+                                    // ターゲット変更時と同じく即再検索する。
+                                    if !self.search_query.trim().is_empty() {
+                                        self.execute_search();
+                                    }
+                                }
+                                ui.close();
+                            }
+                        }
+                    });
+                }
+
                 // × ボタン
                 if ui.small_button("×").hover_tip("検索を閉じる").clicked() {
                     self.cancel_pending_folder_nav();

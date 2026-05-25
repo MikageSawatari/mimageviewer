@@ -81,8 +81,18 @@ pub fn get_video_thumbnail(
 
     unsafe {
         let _com = crate::wic_decoder::ComScope::init();
+        // `SHCreateItemFromParsingName` は Windows ネイティブ書式 (バックスラッシュ
+        // 区切り) を期待する。Ctrl+G 結果ビューから入る経路では `GlobalHit.path` が
+        // Tantivy 用の正規化形式 (lowercase + `/`) になっており、これをそのまま
+        // 渡すと SHCreateItem-fail が頻発する (Codex 2026-05-25 指摘)。通常の
+        // load_folder 経路は `std::fs::read_dir` 由来でネイティブ書式なので影響なし。
+        // 防御的に `/` を `\` に正規化してから wide string 化する。
         let path_str = path.to_string_lossy();
-        let path_wide: Vec<u16> = path_str.encode_utf16().chain(std::iter::once(0)).collect();
+        let path_native: String = path_str.replace('/', "\\");
+        let path_wide: Vec<u16> = path_native
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
 
         let item: windows::Win32::UI::Shell::IShellItem =
             match SHCreateItemFromParsingName(PCWSTR(path_wide.as_ptr()), None) {

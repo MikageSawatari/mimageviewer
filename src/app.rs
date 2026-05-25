@@ -1706,6 +1706,11 @@ pub struct App {
     pub(crate) rx: mpsc::Receiver<ThumbMsg>,
     /// フォルダ移動時に true にセットすると旧ロードタスクが中断する
     pub(crate) cancel_token: Arc<AtomicBool>,
+    /// Ctrl+G 検索結果ビューでの動画サムネ抽出スレッドの cancel フラグ。
+    /// streaming 中の rebuild ごとに再 spawn される (= 旧 spawn を cancel する)。
+    /// 通常のフォルダ閲覧 / Ctrl+S 経路では `start_loading_items` が `cancel_token`
+    /// 自体を bump するためこのフラグは使わない (= 常に None)。
+    pub(crate) search_video_thread_cancel: Option<Arc<AtomicBool>>,
     /// Phase 2b ワーカーが参照する現在の可視先頭アイテムインデックス
     /// UIスレッドが毎フレーム更新し、バックグラウンドワーカーが優先度に使う
     pub(crate) scroll_hint: Arc<AtomicUsize>,
@@ -3351,6 +3356,7 @@ impl App {
             tx,
             rx,
             cancel_token: Arc::new(AtomicBool::new(false)),
+            search_video_thread_cancel: None,
             scroll_hint: Arc::new(AtomicUsize::new(0)),
             visible_end_shared: Arc::new(AtomicUsize::new(0)),
             scroll_offset_y: 0.0,
@@ -8907,6 +8913,14 @@ impl App {
     /// items 差し替え経路の共通 (docs/pdf-pool-context-epoch-plan.md Phase 4)。
     fn bump_full_context_for_load(&mut self) {
         self.cancel_token.store(true, Ordering::Relaxed);
+        // Ctrl+G 結果ビュー専用の動画サムネ抽出スレッドは `cancel_token` ではなく
+        // 専用 flag を見ているので、ここで明示的に止める。これをやらないと、Ctrl+G
+        // 結果から PDF/ZIP/フォルダを Enter で開いて load_folder 経路に入った後も
+        // 旧 Ctrl+G の動画スレッドが裏で Shell 抽出を続ける (Codex P2 #1 指摘)。
+        // メッセージは items_gen 不一致で破棄されるが、Shell リトライ等が無駄に走る。
+        if let Some(old) = self.search_video_thread_cancel.take() {
+            old.store(true, Ordering::Relaxed);
+        }
         self.wake_all_workers();
         self.cancel_token = Arc::new(AtomicBool::new(false));
         crate::thumb_loader::bump_catchup_epoch();
@@ -9127,7 +9141,7 @@ impl App {
     /// 取得順は固定ではなく、毎回 `scroll_hint` / `visible_end_shared` を見て
     /// 現在の可視範囲に最も近い動画を優先する。動画が多いフォルダで下にスクロール
     /// しても、表示中ページの動画が先に埋まるようにする。
-    fn spawn_video_thread(
+    pub(crate) fn spawn_video_thread(
         &self,
         tx: mpsc::Sender<ThumbMsg>,
         cancel: Arc<AtomicBool>,

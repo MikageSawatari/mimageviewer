@@ -136,6 +136,84 @@ impl VideoPinDb {
         .ok()
     }
 
+    /// 複数の動画パスについて、非空の `thumb_webp` を持つ行だけを一括取得する。
+    /// Ctrl+G 結果ビューで「pin 持ち動画だけ streaming 中にサムネ表示」する経路で
+    /// 使う (Codex P2 #2 指摘: 数千件の lookup が UI スレッドで毎 rebuild 走るのを
+    /// 避けるため `IN` 句にまとめる)。
+    ///
+    /// - 入力 `paths` は重複可。内部で正規化 + dedup する。
+    /// - 戻り値は **入力 PathBuf** をキーにした HashMap。`!thumb_webp.is_empty()`
+    ///   の行のみ含まれる (空 BLOB / NULL の行は drop)。
+    /// - 結果に含まれないパスは「pin 無し」を意味する。
+    /// - SQLite の式ツリー / バインド数上限を避けるため 500 件ずつ chunked。
+    ///   `folder_thumb_pins::lookup_many` と同じ規模感。
+    pub fn lookup_webps_many<I, P>(&self, paths: I) -> std::collections::HashMap<PathBuf, Vec<u8>>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        use std::collections::HashMap;
+        // 入力 PathBuf を保持しつつ正規化キーを作る。同 path が重複したら最初の出現を保持。
+        let mut key_to_path: HashMap<String, PathBuf> = HashMap::new();
+        for p in paths.into_iter() {
+            let path_buf = p.as_ref().to_path_buf();
+            let key = crate::path_key::normalize_keep_drive(p.as_ref());
+            key_to_path.entry(key).or_insert(path_buf);
+        }
+        if key_to_path.is_empty() {
+            return HashMap::new();
+        }
+        let mut keys: Vec<String> = key_to_path.keys().cloned().collect();
+        keys.sort_unstable();
+        let mut out: HashMap<PathBuf, Vec<u8>> = HashMap::new();
+        for chunk in keys.chunks(500) {
+            let placeholders = (0..chunk.len())
+                .map(|i| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(",");
+            // thumb_webp IS NOT NULL で空 BLOB / NULL を SQL レベルで弾く
+            // (rusqlite では空 BLOB と NULL を区別できないが、SQLite では分かれる。
+            //  Vec::is_empty() による Rust 側フィルタも残しているので二重防御)。
+            let sql = format!(
+                "SELECT path, thumb_webp FROM video_pins WHERE path IN ({placeholders}) AND thumb_webp IS NOT NULL"
+            );
+            let mut stmt = match self.conn.prepare(&sql) {
+                Ok(s) => s,
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "video_pins.lookup_webps_many: prepare failed: {e}"
+                    ));
+                    continue;
+                }
+            };
+            let params: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                let key: String = row.get(0)?;
+                let webp: Vec<u8> = row.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default();
+                Ok((key, webp))
+            });
+            match rows {
+                Ok(iter) => {
+                    for (key, webp) in iter.flatten() {
+                        if webp.is_empty() {
+                            continue;
+                        }
+                        if let Some(orig) = key_to_path.get(&key) {
+                            out.insert(orig.clone(), webp);
+                        }
+                    }
+                }
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "video_pins.lookup_webps_many: query_map failed: {e}"
+                    ));
+                }
+            }
+        }
+        out
+    }
+
     /// 動画パスに対応するピン情報を取得。Phase 5.3 ではスキーマ通りに読みに行くが、
     /// 行が無ければ `None` を返す (= 通常の運用)。Phase 5.4.1 で `set_pin` が
     /// 配線されるまで実質常に `None`。
@@ -375,5 +453,61 @@ mod tests {
         assert_eq!(got.thumb_pts_secs, Some(5.0));
         assert_eq!(got.thumb_webp, vec![0xBB]);
         assert!(got.thumb_is_current());
+    }
+
+    // ------------------------------------------------------------------
+    // lookup_webps_many (Ctrl+G 結果ビュー用バルクルックアップ)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn webps_many_returns_only_pinned_videos_with_blob() {
+        let db = open_in_memory();
+        let p1 = PathBuf::from("C:/a.mp4");
+        let p2 = PathBuf::from("C:/b.mp4");
+        let p3 = PathBuf::from("C:/c.mp4");
+        // a: WebP あり / b: WebP 空 / c: 未登録
+        db.set_pin(&p1, 1.0, &[0x01, 0x02]).unwrap();
+        db.set_pin(&p2, 2.0, &[]).unwrap();
+        let result = db.lookup_webps_many([&p1, &p2, &p3]);
+        assert_eq!(result.len(), 1, "WebP あり (a) だけ含まれる");
+        assert_eq!(
+            result.get(&p1).map(|v| v.as_slice()),
+            Some(&[0x01, 0x02][..])
+        );
+        assert!(!result.contains_key(&p2), "空 BLOB は除外");
+        assert!(!result.contains_key(&p3), "未登録は含まれない");
+    }
+
+    #[test]
+    fn webps_many_normalizes_path_keys() {
+        // Windows 大文字小文字混在パスでもヒットする (path_key::normalize_keep_drive)
+        let db = open_in_memory();
+        db.set_pin(Path::new("C:/Videos/Movie.MP4"), 1.0, &[0xFF])
+            .unwrap();
+        let result = db.lookup_webps_many([PathBuf::from("c:\\videos\\movie.mp4")]);
+        assert_eq!(result.len(), 1, "正規化キーで lookup できる");
+    }
+
+    #[test]
+    fn webps_many_dedups_input() {
+        let db = open_in_memory();
+        let p = PathBuf::from("C:/a.mp4");
+        db.set_pin(&p, 1.0, &[0xAB]).unwrap();
+        let result = db.lookup_webps_many([&p, &p, &p]);
+        assert_eq!(result.len(), 1, "重複入力は dedup される");
+    }
+
+    #[test]
+    fn webps_many_empty_input_returns_empty() {
+        let db = open_in_memory();
+        let result = db.lookup_webps_many(Vec::<PathBuf>::new());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn webps_many_no_pins_returns_empty() {
+        let db = open_in_memory();
+        let result = db.lookup_webps_many([PathBuf::from("C:/none.mp4")]);
+        assert!(result.is_empty(), "未登録のみの入力は空 map");
     }
 }
