@@ -1658,24 +1658,40 @@ impl App {
             _ => None,
         });
         if current_epoch != Some(source_epoch) {
-            crate::logger::log(format!(
-                "[native-video] stale overlay event ignored (epoch mismatch): \
-                 event_idx={fs_idx} event_epoch={source_epoch} \
-                 current_epoch={current_epoch:?} event={:?}",
-                std::mem::discriminant(&event)
-            ));
-            // 診断ログ (2026-05-26): epoch mismatch で落ちる場合の追跡。
-            // ここで NavigateItem が落ちると、deferred 経路にも入らないので
-            // 「ボタン無反応」体感の主犯候補。
+            // **NavigateItem は epoch mismatch を許容する** (Codex 第 13 ラウンド指摘、
+            // 2026-05-26 実機 fb の主犯)。
+            //
+            // ホイール A→B 切替直後、`NativeVideoOutput::switch_source` は player の
+            // native_source_epoch を即座に進めるが、presenter thread が `SwitchSource`
+            // コマンドを処理して新 source_epoch で events を emit するまで遅延がある。
+            // この skew window 中に HUD の前/次項目ボタンを押すと、event は旧 epoch で
+            // stamp されて発射されるが、player 側の current_epoch は既に新 epoch に
+            // 進んでいるため epoch mismatch で silent drop されていた。
+            //
+            // `NavigateItem { delta }` は source 非依存の汎用コマンドで、現在の
+            // fullscreen_idx (= 既にチェック済み) + delta だけで意味が完結する。
+            // epoch mismatch があっても安全に dispatch 可能なので bypass する。
+            // 他の source-specific コマンド (Seek / SetVolume / SetPlaybackSpeed 等) は
+            // 引き続き epoch reject (= 旧 source への操作が新 source に当たらないように)。
             if matches!(
                 event,
                 crate::video::NativeVideoOutputEvent::NavigateItem { .. }
             ) {
-                crate::logger::log(
-                    "[nav-dbg] NavigateItem dropped by stale epoch check ← この経路が再現中に出れば bug 主犯".to_string(),
-                );
+                crate::logger::log(format!(
+                    "[nav-dbg] NavigateItem bypassing epoch check: \
+                     event_idx={fs_idx} event_epoch={source_epoch} \
+                     current_epoch={current_epoch:?} (= ホイール切替直後の skew window 内)"
+                ));
+                // fall through to dispatch
+            } else {
+                crate::logger::log(format!(
+                    "[native-video] stale overlay event ignored (epoch mismatch): \
+                     event_idx={fs_idx} event_epoch={source_epoch} \
+                     current_epoch={current_epoch:?} event={:?}",
+                    std::mem::discriminant(&event)
+                ));
+                return;
             }
-            return;
         }
         match event {
             crate::video::NativeVideoOutputEvent::Window(event) => {
