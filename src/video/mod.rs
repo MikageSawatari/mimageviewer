@@ -387,6 +387,11 @@ pub enum NativeVideoOutputEvent {
     BulkAddBookmarks {
         entries: Vec<(f64, String)>,
     },
+    /// 現在再生中の動画のブックマーク一覧をクリップボードへコピー。
+    /// `seconds_only` が true なら整数秒へ floor、false なら小数 3 桁 (ms 精度) で出力。
+    ExportBookmarksToClipboard {
+        seconds_only: bool,
+    },
     /// 現在再生中の動画のブックマークを全削除。
     ClearAllBookmarksForCurrent,
     OpenExternalUrl {
@@ -1414,6 +1419,9 @@ fn send_native_overlay_command(
         Command::DeletePin => NativeVideoOutputEvent::DeletePin,
         Command::BulkAddBookmarks { entries } => {
             NativeVideoOutputEvent::BulkAddBookmarks { entries }
+        }
+        Command::ExportBookmarksToClipboard { seconds_only } => {
+            NativeVideoOutputEvent::ExportBookmarksToClipboard { seconds_only }
         }
         Command::ClearAllBookmarksForCurrent => NativeVideoOutputEvent::ClearAllBookmarksForCurrent,
         Command::OpenExternalUrl { url } => NativeVideoOutputEvent::OpenExternalUrl { url },
@@ -2937,6 +2945,15 @@ fn run_native_video_output(
                                     &ui_event_tx,
                                     event_epoch,
                                     NativeVideoOutputEvent::BulkAddBookmarks { entries },
+                                );
+                            }
+                            crate::video::native_presenter::NativeOverlayCommand::ExportBookmarksToClipboard {
+                                seconds_only,
+                            } => {
+                                send_native_output_event(
+                                    &ui_event_tx,
+                                    event_epoch,
+                                    NativeVideoOutputEvent::ExportBookmarksToClipboard { seconds_only },
                                 );
                             }
                             crate::video::native_presenter::NativeOverlayCommand::ClearAllBookmarksForCurrent => {

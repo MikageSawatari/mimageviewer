@@ -485,7 +485,7 @@ struct NativeBookmarkTitleEdit {
 /// 一括ブックマーク登録ダイアログの永続 state。
 /// `Some` の間ダイアログが描画される。`textarea` にユーザーがペーストした
 /// チャプターテキストが入り、登録ボタンで `BulkAddBookmarks` コマンドを発行する。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(super) struct NativeBulkBookmarkDialog {
     pub(super) textarea: String,
     pub(super) request_focus: bool,
@@ -494,6 +494,23 @@ pub(super) struct NativeBulkBookmarkDialog {
     /// 次の draw で textarea のカーソル位置に挿入する (Event::Paste が focus を
     /// 持たない TextEdit に届いて捨てられる race を回避)。挿入後 `None` に戻す。
     pub(super) pending_paste: Option<String>,
+    /// エクスポートチェックボックス: 「秒単位にする」。`true` のとき整数秒へ floor、
+    /// `false` のとき小数 3 桁 (ms 精度) で出力する。ダイアログを閉じると消える
+    /// (= 次回開いたときは既定値 `true` に戻る、永続化しない設計)。
+    pub(super) export_seconds_only: bool,
+}
+
+impl Default for NativeBulkBookmarkDialog {
+    fn default() -> Self {
+        Self {
+            textarea: String::new(),
+            request_focus: false,
+            confirm_clear_all: false,
+            pending_paste: None,
+            // 外部のコメント自動リンク化は秒単位しか拾わないため、互換性の高い秒単位を既定にする。
+            export_seconds_only: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1137,6 +1154,11 @@ pub enum NativeOverlayCommand {
     /// 重複は ±1s で skip、結果はトーストで通知。
     BulkAddBookmarks {
         entries: Vec<(f64, String)>,
+    },
+    /// 現在再生中の動画のブックマーク一覧をクリップボードへコピー。
+    /// `seconds_only` が true なら整数秒に floor、false なら小数 3 桁 (= ms 精度) で出力。
+    ExportBookmarksToClipboard {
+        seconds_only: bool,
     },
     /// 現在再生中の動画のブックマークを全削除。
     ClearAllBookmarksForCurrent,

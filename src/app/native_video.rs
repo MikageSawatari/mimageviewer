@@ -1839,6 +1839,9 @@ impl App {
             crate::video::NativeVideoOutputEvent::BulkAddBookmarks { entries } => {
                 self.handle_native_video_bulk_add_bookmarks_command(ctx, fs_idx, entries);
             }
+            crate::video::NativeVideoOutputEvent::ExportBookmarksToClipboard { seconds_only } => {
+                self.handle_native_video_export_bookmarks_command(ctx, fs_idx, seconds_only);
+            }
             crate::video::NativeVideoOutputEvent::ClearAllBookmarksForCurrent => {
                 self.handle_native_video_clear_all_bookmarks_command(ctx, fs_idx);
             }
@@ -4003,6 +4006,50 @@ impl App {
         let msg = msg_parts.join(" / ");
         crate::logger::log(format!(
             "video bookmark bulk add: {msg} ({})",
+            path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+        ));
+        self.show_native_video_overlay_toast(msg, true);
+        self.mark_native_video_hud_activity(ctx);
+    }
+
+    #[cfg(windows)]
+    pub(super) fn handle_native_video_export_bookmarks_command(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        seconds_only: bool,
+    ) {
+        if self.fullscreen_idx != Some(fs_idx) {
+            return;
+        }
+        let path = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => Some(player.path().clone()),
+            _ => None,
+        };
+        let Some(path) = path else { return };
+        let Some(db) = self.video_bookmark_db.as_ref() else {
+            return;
+        };
+        let entries = db.list_marker_meta(&path);
+        let count = entries.len();
+        if count == 0 {
+            self.show_native_video_overlay_toast(
+                "コピーするブックマークがありません".to_string(),
+                true,
+            );
+            self.mark_native_video_hud_activity(ctx);
+            return;
+        }
+        let text = crate::video_bookmarks_parser::format_chapter_lines(&entries, seconds_only);
+        ctx.copy_text(text);
+        let unit_label = if seconds_only {
+            "秒単位"
+        } else {
+            "ミリ秒精度"
+        };
+        let msg = format!("{count} 件をクリップボードへコピーしました ({unit_label})");
+        crate::logger::log(format!(
+            "video bookmark export: {msg} ({})",
             path.file_name().and_then(|n| n.to_str()).unwrap_or("?")
         ));
         self.show_native_video_overlay_toast(msg, true);

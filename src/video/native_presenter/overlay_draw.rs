@@ -435,10 +435,8 @@ pub(super) fn draw_native_jump_panel(
             );
             if bulk_resp.clicked() && bulk_bookmark_dialog.is_none() {
                 *bulk_bookmark_dialog = Some(NativeBulkBookmarkDialog {
-                    textarea: String::new(),
                     request_focus: true,
-                    confirm_clear_all: false,
-                    pending_paste: None,
+                    ..Default::default()
                 });
             }
 
@@ -873,13 +871,15 @@ pub(super) fn draw_native_bulk_bookmark_dialog(
     let mut cancel = false;
     let mut request_clear_all = false;
     let mut confirm_clear_now = false;
+    let mut request_export = false;
 
     // textarea ScrollArea の最大高さ: ダイアログ高から固定要素 (header / footer / frame
-    // margin) を引いた残り。固定要素は実測値ベースの保守的見積もり (約 240pt)。
+    // margin) を引いた残り。固定要素は実測値ベースの保守的見積もり。
     // 内訳: タイトル 22 + 説明文 3行 約 50 + textarea 上下スペース 16 + プレビュー 22 +
-    //       ボタン行 32 + separator+ラベル+ボタン 約 80 + frame margin 28 ≒ 250。
-    // 余裕を見て 260。これで残りが textarea に割り当てられる。
-    let textarea_max_h = (dialog_h - 260.0).max(80.0);
+    //       登録/キャンセル行 32 + separator+「現在のブックマーク」+ コピー+チェックボックス行 約 70 +
+    //       separator+「誤登録対策」+ ボタン 約 70 + frame margin 28 ≒ 310。
+    // 余裕を見て 340。これで残りが textarea に割り当てられる。
+    let textarea_max_h = (dialog_h - 340.0).max(80.0);
 
     let area_response = egui::Area::new(egui::Id::new("native_video_bulk_bookmark_dialog"))
         .order(egui::Order::Foreground)
@@ -893,11 +893,37 @@ pub(super) fn draw_native_bulk_bookmark_dialog(
                 .show(ui, |ui| {
                     ui.set_min_width(dialog_w - 28.0);
                     ui.set_max_width(dialog_w - 28.0);
-                    ui.label(
-                        egui::RichText::new("ブックマーク一括登録")
-                            .size(15.0)
-                            .color(egui::Color32::from_rgb(238, 238, 238)),
-                    );
+                    // タイトル行: 左にタイトル、右端に × クローズボタン。
+                    // 「キャンセル」ボタンが「登録」のすぐ隣にあって全体終了との結び付きが
+                    // 弱いという報告 (2026-05-24) に対し、ダイアログ全体を閉じる統一動作を
+                    // 右上に置く。エクスポートや一括削除を済ませた後の「閉じ方が分からない」
+                    // 状態を解消する目的。
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("ブックマーク一括登録")
+                                .size(15.0)
+                                .color(egui::Color32::from_rgb(238, 238, 238)),
+                        );
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                let (close_rect, close_resp) = ui.allocate_exact_size(
+                                    egui::vec2(22.0, 22.0),
+                                    egui::Sense::click(),
+                                );
+                                draw_overlay_button_bg(
+                                    ui.painter(),
+                                    close_rect,
+                                    close_resp.hovered(),
+                                    false,
+                                );
+                                draw_overlay_close_icon(ui.painter(), close_rect);
+                                if close_resp.hover_tip_dark("閉じる").clicked() {
+                                    cancel = true;
+                                }
+                            },
+                        );
+                    });
                     ui.add_space(4.0);
                     ui.label(
                         egui::RichText::new(
@@ -1001,6 +1027,33 @@ pub(super) fn draw_native_bulk_bookmark_dialog(
                     ui.separator();
                     ui.add_space(6.0);
                     ui.label(
+                        egui::RichText::new("現在のブックマーク一覧をエクスポート")
+                            .size(12.0)
+                            .color(egui::Color32::from_gray(200)),
+                    );
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button("一覧をクリップボードにコピー")
+                            .on_hover_text(
+                                "現在の動画に登録されているブックマークを「mm:ss タイトル」\n\
+                                 形式の行ごとにクリップボードへコピーします。",
+                            )
+                            .clicked()
+                        {
+                            request_export = true;
+                        }
+                        ui.checkbox(&mut state.export_seconds_only, "秒単位にする")
+                            .on_hover_text(
+                                "ON: 整数秒に切り捨てます (動画コメント欄でリンク化される形式)。\n\
+                                 OFF: 小数 3 桁 (ミリ秒精度) で書き出します。",
+                            );
+                    });
+
+                    ui.add_space(10.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.label(
                         egui::RichText::new("誤登録対策")
                             .size(12.0)
                             .color(egui::Color32::from_gray(200)),
@@ -1032,6 +1085,12 @@ pub(super) fn draw_native_bulk_bookmark_dialog(
 
     if request_clear_all {
         state.confirm_clear_all = true;
+    }
+    if request_export {
+        // エクスポートはダイアログを閉じずに発火 (チェックボックスを切り替えて再実行できる)。
+        commands.push(NativeOverlayCommand::ExportBookmarksToClipboard {
+            seconds_only: state.export_seconds_only,
+        });
     }
     if confirm_clear_now {
         commands.push(NativeOverlayCommand::ClearAllBookmarksForCurrent);
