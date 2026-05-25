@@ -6950,8 +6950,9 @@ impl NativeEguiOverlay {
                                 persist: true,
                             });
                         }
-                        // 動画 HUD 2 段化リデザイン (実機フィードバック反映): 最小窓 (tier 3) では
-                        // vol_label と limiter インジケータを非表示にして右クラスター幅を縮める。
+                        // 動画 HUD 2 段化リデザイン (実機フィードバック反映): 最小窓
+                        // (`CompactionTier::Minimal`) では vol_label と limiter インジケータを
+                        // 非表示にして右クラスター幅を縮める。
                         if show_vol_label {
                             let volume_label = format_video_volume_db_compact(volume);
                             let volume_label_color = if volume > 1.0 {
