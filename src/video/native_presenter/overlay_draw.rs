@@ -413,10 +413,9 @@ pub(super) fn draw_native_jump_panel(
             );
 
             // 一括ブックマーク登録ダイアログを開くボタン。
-            // 配置 (動画 HUD 2 段化リデザイン Phase 2): 左から右に「Bookmark (- 100pt)
-            // → Pin (- 68pt) → 一括 Bookmark (- 36pt)」の論理読み順 (= 基本 → 拡張) に
-            // 並べる。旧配置 (bulk - 100pt / pin - 68pt / bookmark - 36pt) は一括ボタンを
-            // 後から左端にぶら下げた歴史的経緯で、意図的な並びではなかった。
+            // 配置 (実機フィードバック反映 2026-05-26): 左から右に「Pin (- 100pt) →
+            // Bookmark (- 68pt) → 一括 Bookmark (- 36pt)」。ユーザー要求: ピン留めを左端、
+            // ブックマーク系を右側にまとめる。一括は低頻度なので右端維持。
             let bulk_rect = egui::Rect::from_min_size(
                 rect.min + egui::vec2(rect.width() - 36.0, 6.0),
                 egui::vec2(26.0, 24.0),
@@ -444,7 +443,7 @@ pub(super) fn draw_native_jump_panel(
             }
 
             let pin_rect = egui::Rect::from_min_size(
-                rect.min + egui::vec2(rect.width() - 68.0, 6.0),
+                rect.min + egui::vec2(rect.width() - 100.0, 6.0),
                 egui::vec2(26.0, 24.0),
             );
             let pin_resp = ui.interact(
@@ -467,7 +466,7 @@ pub(super) fn draw_native_jump_panel(
             }
 
             let bm_rect = egui::Rect::from_min_size(
-                rect.min + egui::vec2(rect.width() - 100.0, 6.0),
+                rect.min + egui::vec2(rect.width() - 68.0, 6.0),
                 egui::vec2(26.0, 24.0),
             );
             let bm_resp = ui.interact(
@@ -567,8 +566,41 @@ pub(super) fn draw_native_jump_row(
     bookmark_title_edit: &mut Option<NativeBookmarkTitleEdit>,
     commands: &mut Vec<NativeOverlayCommand>,
 ) {
-    let row_h = 76.0;
+    // 行レイアウト: タイトルが長いと自動で複数行に折り返し、最大 5 行 (= 約 80pt)
+    // まで row を縦に伸ばす。ホバー時はツールチップで全文を表示する。
+    // 旧版は固定 76pt + 1 行 truncate (`…`) だったが、PHASE 表記付きチャプター等の
+    // 長いタイトルが見切れていた (実機 fb 2026-05-26)。
+    let row_h_min: f32 = 76.0;
     let row_w = (ui.available_width() - 12.0).max(260.0);
+    let title_color = egui::Color32::from_rgb(205, 205, 205);
+    let title_font = egui::FontId::proportional(12.0);
+    let title_y_offset = 38.0; // BM ラベル (y +14) の下、サムネ下端 (y +72) より少し上から
+    let title_bottom_pad = 6.0;
+    let title_max_lines = 5;
+    // text_x = thumb_rect.max.x + 10 = row_rect.min.x + 6 + 120 + 10 = +136
+    // title_max_w = row_rect.max.x - text_x - 6 = row_w - 142
+    let title_max_w = (row_w - 142.0).max(40.0);
+    // タイトルをここで一度 layout してその高さで行の縦サイズを決める。
+    // painter 取得のためだけに ui.painter() を借りる (allocate 前の参照は OK)。
+    let title_layout = entry
+        .title
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .map(|t| {
+            layout_wrapped_with_max_lines(
+                ui.painter(),
+                t,
+                title_font.clone(),
+                title_color,
+                title_max_w,
+                title_max_lines,
+            )
+        });
+    let title_h = title_layout
+        .as_ref()
+        .map(|(g, _)| g.size().y)
+        .unwrap_or(0.0);
+    let row_h = row_h_min.max(title_y_offset + title_h + title_bottom_pad);
     ui.horizontal(|ui| {
         ui.add_space(6.0);
         let (row_rect, resp) =
@@ -631,35 +663,15 @@ pub(super) fn draw_native_jump_row(
             egui::FontId::proportional(12.0),
             egui::Color32::from_rgb(232, 232, 232),
         );
-        if let Some(title) = entry.title.as_deref().filter(|s| !s.trim().is_empty()) {
-            // タイトルは下段 (row_rect.min.y + 38) に描く。edit/X ボタンは上段
-            // (y +8..+30) で y が分離しているので、右端制約は **行の右端 - 余白**
-            // (= row_rect.max.x - 6.0) だけで足りる。
-            //
-            // 旧実装は `truncate_overlay_text(title, 16 or 22)` で文字数固定で
-            // 切っていたが、Yu Gothic は全角 ≈ 12pt / 半角 ≈ 6-7pt と幅が倍違うので
-            // 「16 文字」で右にはみ出す CJK 混在タイトルが存在した (ウィンドウモードで
-            // 縦スクロールバーが出ると row_w が ~12pt 縮んでさらに顕在化)。
-            // `layout_truncated_to_width` で実ピクセル幅で省略する。
-            let title_color = egui::Color32::from_rgb(205, 205, 205);
-            let title_max_w = (row_rect.max.x - text_x - 6.0).max(0.0);
-            // soft_char_cap: jump panel の物理幅 ~178pt に対して、最も狭い ASCII
-            // (3-4pt/char) でも 48 文字あれば確実にあふれる。bulk import で 1000 文字
-            // 級のタイトルが流れ込んでも再 layout は最大 48 回に bounded (Codex P2)。
-            if let Some(galley) = layout_truncated_to_width(
-                &painter,
-                title,
-                egui::FontId::proportional(12.0),
+        // 上で pre-compute した multi-line galley をここで描画する (allocate 前に layout
+        // 済みなので row_h が title 高さに追従済み)。長すぎて 5 行で切れたタイトルは
+        // ホバー時のツールチップで全文を出す (下の `needs_tooltip` 経路で実装)。
+        if let Some((galley, _)) = title_layout.as_ref() {
+            painter.galley(
+                egui::pos2(text_x, row_rect.min.y + title_y_offset),
+                galley.clone(),
                 title_color,
-                title_max_w,
-                48,
-            ) {
-                painter.galley(
-                    egui::pos2(text_x, row_rect.min.y + 38.0),
-                    galley,
-                    title_color,
-                );
-            }
+            );
         }
 
         let mut delete_clicked = false;
@@ -741,6 +753,21 @@ pub(super) fn draw_native_jump_row(
             }
         }
 
+        // タイトルが truncate されたか、もしくは複数行に wrap されたケースで、ホバー時に
+        // 全文をツールチップで出す。短い 1 行タイトルは行内で全文見えているので tooltip
+        // を抑止 (= ノイズ回避)。`was_truncated` は helper 戻り値の bool で判定。
+        let needs_tooltip = title_layout
+            .as_ref()
+            .is_some_and(|(g, was_truncated)| *was_truncated || g.rows.len() > 1);
+        let resp = if needs_tooltip {
+            if let Some(full_title) = entry.title.as_deref() {
+                resp.hover_tip_dark(full_title.to_owned())
+            } else {
+                resp
+            }
+        } else {
+            resp
+        };
         if resp.clicked() && !delete_clicked && !edit_clicked {
             commands.push(NativeOverlayCommand::Seek {
                 target_secs: entry.pts_secs,
@@ -3946,6 +3973,59 @@ pub(super) fn truncate_overlay_text(text: &str, max_chars: usize) -> String {
 /// TODO (Codex P3): 切り詰めは Unicode scalar 単位なので emoji ZWJ / variation
 /// selector / 結合文字を split する可能性がある。emoji 混じりタイトルが実害になる
 /// なら `unicode-segmentation` で grapheme cluster 単位に切る。
+/// 指定 max_width で wrap し、max_lines 行までに収まる multi-line Galley を返す。
+/// 行数オーバー時は本文を binary-search でカットし末尾 `…` を付けて再 layout する。
+///
+/// 戻り値: `(galley, was_truncated)`。`was_truncated=true` のとき、ホバー時に全文を
+/// ツールチップで表示するなどのフォローを呼び出し側で行う。
+///
+/// jump panel のブックマーク タイトルなど、横幅制限がある一方で長いタイトル全体を
+/// 複数行で見せたい用途で使う。1 行だけ truncate したい場合は
+/// `layout_truncated_to_width` を使うこと。
+pub(super) fn layout_wrapped_with_max_lines(
+    painter: &egui::Painter,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    max_width: f32,
+    max_lines: usize,
+) -> (std::sync::Arc<egui::Galley>, bool) {
+    let full = painter.layout(text.to_owned(), font.clone(), color, max_width.max(1.0));
+    if full.rows.len() <= max_lines {
+        return (full, false);
+    }
+    // 行数超過 → 二分探索で本文を縮めて `…` 付きに re-layout。bounded iterations (~log N)。
+    let chars: Vec<char> = text.chars().collect();
+    if chars.is_empty() {
+        return (full, false);
+    }
+    let mut lo: usize = 1;
+    let mut hi: usize = chars.len();
+    let mut best: Option<std::sync::Arc<egui::Galley>> = None;
+    while lo <= hi {
+        let mid = (lo + hi) / 2;
+        let candidate: String = chars[..mid].iter().collect::<String>() + "…";
+        let g = painter.layout(candidate, font.clone(), color, max_width.max(1.0));
+        if g.rows.len() <= max_lines {
+            best = Some(g);
+            lo = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    match best {
+        Some(g) => (g, true),
+        None => (full, true), // 1 文字 + `…` でも溢れる極小幅: 諦めて full を返す
+    }
+}
+
+/// 単一行で max_width を超えたら末尾 `…` で省略する従来 helper。
+/// `layout_wrapped_with_max_lines` の導入後、jump panel のタイトルは multi-line
+/// 経路に移行したため、現在は呼び出し元なしだが、将来 1 行 truncate が必要な場面
+/// (HUD 上部のファイル名等) で再利用できるよう残す。
+#[allow(dead_code)]
 pub(super) fn layout_truncated_to_width(
     painter: &egui::Painter,
     text: &str,
