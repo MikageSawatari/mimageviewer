@@ -4953,8 +4953,12 @@ impl App {
             self.native_video_deferred_nav_delta = Some(base_delta);
             return;
         }
+        // `fs_nav_is_locked()` は video swap だけでなく Ctrl+↑↓ などのフルスクリーン
+        // 横断ナビゲーション (= フォルダ移動) でも true になる。この場合 lock 解除後の
+        // `fullscreen_idx` は別フォルダ / 非動画アイテムを指している可能性があり、
+        // deferred delta を後追い適用すると予期せぬ 1 アイテム移動が発火しうる
+        // (Codex 第 8 P2 指摘)。defer せず silent return に留める。
         if self.fs_nav_is_locked() {
-            self.native_video_deferred_nav_delta = Some(base_delta);
             return;
         }
         if !self.video_tile_mode_active {

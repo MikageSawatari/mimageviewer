@@ -720,6 +720,12 @@ impl App {
     pub(crate) fn capture_fs_nav_holdover(&mut self, fs_idx: usize) {
         self.fs_holdover_tex = self.current_fs_tex_for_holdover(fs_idx);
         self.fs_nav_locked_gen = Some(self.items_generation);
+        // Cross-folder ナビ (Ctrl+↑↓) が始まる時点で、video swap 由来の deferred nav delta は
+        // 別フォルダ / 非動画アイテムで誤発火しうるので破棄する (Codex 第 8 P2 指摘)。
+        #[cfg(windows)]
+        {
+            self.native_video_deferred_nav_delta = None;
+        }
     }
 
     /// 毎フレーム呼び出され、ナビロックの解除条件を満たしたら lock を解除する。
