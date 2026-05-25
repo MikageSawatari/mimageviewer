@@ -1274,9 +1274,9 @@ fn configure_overlay_fonts(ctx: &egui::Context) {
 
 fn configure_overlay_style(ctx: &egui::Context) {
     ctx.style_mut(|style| {
-        // native HUD は 46pt の小さな操作面なので、ヘルプ text は hover 直後に出す。
-        // egui default の 0.5s delay だと「初回だけ待つ / 隣ボタンは即時」という
-        // grace-time 由来の不揃いな挙動に見える。
+        // native HUD は HUD_BOTTOM_HEIGHT (= 64pt、2 段) の小さな操作面なので、ヘルプ
+        // text は hover 直後に出す。egui default の 0.5s delay だと「初回だけ待つ /
+        // 隣ボタンは即時」という grace-time 由来の不揃いな挙動に見える。
         style.interaction.tooltip_delay = 0.0;
     });
 }
@@ -4763,8 +4763,9 @@ impl NativeEguiOverlay {
             });
         }
 
-        // 下 HUD (seek bar + コントロール) 表示中。**実描画 46pt 帯** (= overlay_draw:3797
-        // `fixed_pos(0, height-46)` + `set_min_size(W, 46)` と一致)。
+        // 下 HUD (seek 行 + コントロール 行) 表示中。**実描画 HUD_BOTTOM_HEIGHT (= 64pt) 帯**
+        // (= `fixed_pos(0, height - HUD_BOTTOM_HEIGHT)` + `set_min_size(W, HUD_BOTTOM_HEIGHT)` と一致、
+        // 動画 HUD 2 段化リデザインで旧 46pt から拡張)。
         //
         // ## region サイズの選択 (Codex 2026-05-12 P1 反映)
         //
@@ -5729,18 +5730,6 @@ impl NativeEguiOverlay {
                             egui::Color32::from_rgba_premultiplied(0, 0, 0, 176),
                         );
 
-                        // 動画 HUD 2 段化リデザイン (Phase 6 narrow-window fallback、Codex 最終 P1 反映):
-                        // ウィンドウ幅に応じてオプションボタンを段階的に省略する。狭幅では
-                        // 「マーカー + 前/次項目」(= キーボード代替あり) を最初に隠す。
-                        // - >= 1100pt: 全ボタン表示 (= 通常レイアウト)
-                        // - <  1100pt: マーカー (J/K) + 前/次項目 (↑/↓) を非表示 (4 ボタン省略、144pt 節約)
-                        // - <   800pt: 上記 + 連続再生 + 音量ラベル + リミッターも非表示
-                        //   (キーボード経路で代替可能なものから順に削減)
-                        // 800pt 未満でも overflow すると視覚的に重なるが、break するわけではない
-                        // (= 既存挙動と同等)。本実装では「マーカー + 前/次項目」だけを動的非表示にし、
-                        // 残りの圧縮は将来の拡張余地として残す (= over-engineering を避ける)。
-                        let compact_optional_buttons = overlay_width_points < 1100.0;
-
                         // - シーク行 (上段、`HUD_SEEK_ROW_HEIGHT` = 24pt): bar + hover サムネ trigger
                         // - コントロール行 (下段、`HUD_CONTROLS_ROW_HEIGHT` = 40pt): ボタン群 + 音量
                         // `center_y` はコントロール行内の縦中央 (= ボタン群の Y 基準) として使う。
@@ -5757,8 +5746,112 @@ impl NativeEguiOverlay {
                         let side_pad = 10.0;
                         let btn_size = 28.0;
                         let gap = 8.0;
+                        // 動画 HUD 2 段化リデザイン (実機フィードバック反映): ボタン群の意味的境界に
+                        // **追加の隙間** (= group_gap_extra) を入れて、4 グループ
+                        // [W][▶] | [L][⤴][↑][↓] | [|◀M][M▶|] | [◀F][📋][💾][F▶]
+                        // を視覚的に分離する。隣接ボタン間は通常 `gap` (= 8pt)、グループ境界では
+                        // `gap + group_gap_extra` (= 16pt 相当) の間隔を取る。
+                        let group_gap_extra = 8.0;
                         let center_y = controls_row_rect.center().y;
                         let text_center_y = center_y + 4.0;
+
+                        // 動画 HUD 2 段化リデザイン (実機フィードバック + Codex 第 4 P2 反映):
+                        // **実測ベース** で compaction tier を決める。右クラスター幅 (時間 + 音量等)
+                        // と左クラスター幅 (再生・モード・ナビ・キャプチャ + 群間隙間) を計算し、
+                        // overlap するなら順次オプションを削減する:
+                        //   tier 0 (full)   : 全ボタン + フル音量クラスター
+                        //   tier 1 (narrow) : マーカー + 前/次項目を非表示 (キーボード代替可)
+                        //   tier 2 (very_narrow): tier 1 + キャプチャパレットをカメラ単独に縮退
+                        //   tier 3 (minimal): tier 2 + 音量スライダ短縮 + 音量ラベル/リミッター非表示
+                        // tier 閾値は右クラスター幅と左クラスター幅の和 + side_pad×2 + gap で計算。
+                        // 旧版の「width < 1100pt で markers/file_nav 非表示」のみだと最小窓 640pt で
+                        // overlap した (Codex 指摘)。tier 3 まで設けて 640pt でも収まるようにする。
+                        let time_w = 132.0;
+                        let vol_label_w = 60.0;
+                        let limiter_indicator_w = 14.0;
+                        let vol_slider_w_full = 144.0;
+                        let vol_slider_w_narrow = 100.0;
+                        let mute_w = btn_size;
+                        let norm_w = btn_size;
+                        let speed_w = btn_size * 1.55;
+                        // 各 tier での想定幅 (= 右側 + 左側 + side_pad×2 + tier 内の隙間)。
+                        // 数値は下記の各ボタンレイアウトと厳密一致させること。
+                        let right_w_full = time_w
+                            + gap
+                            + speed_w
+                            + gap
+                            + mute_w
+                            + gap
+                            + norm_w
+                            + gap
+                            + vol_slider_w_full
+                            + gap
+                            + vol_label_w
+                            + limiter_indicator_w;
+                        let right_w_compact = time_w
+                            + gap
+                            + speed_w
+                            + gap
+                            + mute_w
+                            + gap
+                            + norm_w
+                            + gap
+                            + vol_slider_w_narrow;
+                        // 左クラスター幅: 各ボタンを btn_size、ボタン間 gap、グループ境界に group_gap_extra
+                        let left_w_full = btn_size + gap + btn_size // W, play
+                            + gap + group_gap_extra
+                            + btn_size + gap + btn_size + gap + btn_size + gap + btn_size // L, cont, prev_file, next_file
+                            + gap + group_gap_extra
+                            + btn_size + gap + btn_size // prev_M, next_M
+                            + gap + group_gap_extra
+                            + btn_size + gap + btn_size + gap + btn_size + gap + btn_size; // prev_F, copy, save, next_F
+                        // tier 1: marker + file_nav 非表示 → group B が L+cont のみ、group C 削除
+                        let left_w_narrow = btn_size + gap + btn_size
+                            + gap + group_gap_extra
+                            + btn_size + gap + btn_size // L, cont
+                            + gap + group_gap_extra
+                            + btn_size + gap + btn_size + gap + btn_size + gap + btn_size; // capture palette
+                        // tier 2: capture palette をカメラ単独に
+                        let left_w_very_narrow = btn_size
+                            + gap
+                            + btn_size
+                            + gap
+                            + group_gap_extra
+                            + btn_size
+                            + gap
+                            + btn_size
+                            + gap
+                            + group_gap_extra
+                            + btn_size; // single camera
+
+                        let total_full = side_pad * 2.0 + left_w_full + gap + right_w_full;
+                        let total_narrow = side_pad * 2.0 + left_w_narrow + gap + right_w_full;
+                        let total_very_narrow =
+                            side_pad * 2.0 + left_w_very_narrow + gap + right_w_full;
+
+                        #[derive(Copy, Clone, PartialEq)]
+                        enum CompactionTier {
+                            Full,
+                            Narrow,
+                            VeryNarrow,
+                            Minimal,
+                        }
+                        let tier = if overlay_width_points >= total_full {
+                            CompactionTier::Full
+                        } else if overlay_width_points >= total_narrow {
+                            CompactionTier::Narrow
+                        } else if overlay_width_points >= total_very_narrow {
+                            CompactionTier::VeryNarrow
+                        } else {
+                            CompactionTier::Minimal
+                        };
+                        let show_file_and_marker = matches!(tier, CompactionTier::Full);
+                        let show_capture_palette =
+                            matches!(tier, CompactionTier::Full | CompactionTier::Narrow);
+                        let compact_right_cluster = matches!(tier, CompactionTier::Minimal);
+                        // 旧変数名 (= マーカー + 前/次項目ブロックの gate) を維持。
+                        let compact_optional_buttons = !show_file_and_marker;
+
                         let mut x = hud_rect.min.x + side_pad;
 
                         let replay_rect = egui::Rect::from_min_size(
@@ -5802,7 +5895,8 @@ impl NativeEguiOverlay {
                         if play_resp.clicked() {
                             commands.push(NativeOverlayCommand::TogglePlay);
                         }
-                        x = play_rect.max.x + gap;
+                        // グループ境界: [W][▶] | [L][⤴][↑][↓]
+                        x = play_rect.max.x + gap + group_gap_extra;
 
                         let loop_rect = egui::Rect::from_min_size(
                             egui::pos2(x, center_y - btn_size * 0.5),
@@ -5925,7 +6019,15 @@ impl NativeEguiOverlay {
                         if continuous_resp.clicked() {
                             commands.push(NativeOverlayCommand::ToggleContinuous);
                         }
-                        x = continuous_rect.max.x + gap;
+                        // file_nav / marker ブロックが省略された場合、ここが group B → D の境界に
+                        // なるので group_gap_extra を入れる。表示時は file_nav 末尾で extra を足す。
+                        x = continuous_rect.max.x
+                            + gap
+                            + if compact_optional_buttons {
+                                group_gap_extra
+                            } else {
+                                0.0
+                            };
 
                         // 動画 HUD 2 段化リデザイン (Phase 6): 前/次ファイル (前/次項目) ボタン。
                         // ↑/↓ キー / マウスホイールと同じ NavigateItem コマンドを送出する
@@ -5978,7 +6080,8 @@ impl NativeEguiOverlay {
                             if next_file_resp.clicked() {
                                 commands.push(NativeOverlayCommand::NavigateItem { delta: 1 });
                             }
-                            x = next_file_rect.max.x + gap;
+                            // グループ境界: [L][⤴][↑][↓] | [|◀M][M▶|]
+                            x = next_file_rect.max.x + gap + group_gap_extra;
                         } // ← `if !compact_optional_buttons` の閉じ (前/次項目ブロック)
 
                         // 動画 HUD 2 段化リデザイン (Phase 4): 前/次マーカーボタン
@@ -6067,24 +6170,32 @@ impl NativeEguiOverlay {
                             if markers_present && next_marker_resp.clicked() {
                                 commands.push(NativeOverlayCommand::JumpMarker { next: true });
                             }
-                            x = next_marker_rect.max.x + gap;
+                            // グループ境界: [|◀M][M▶|] | [◀F][📋][💾][F▶]
+                            x = next_marker_rect.max.x + gap + group_gap_extra;
                         } // ← `if !compact_optional_buttons` の閉じ (マーカーブロック)
 
-                        let prev_frame_rect = egui::Rect::from_min_size(
-                            egui::pos2(x, center_y - btn_size * 0.5),
-                            egui::vec2(btn_size, btn_size),
-                        );
-                        let prev_down = draw_native_frame_step_button(
-                            ui,
-                            painter,
-                            prev_frame_rect,
-                            "native_video_prev_frame",
-                            -1,
-                            "前のフレーム [Ctrl+Shift+←]",
-                            &mut frame_step_hold,
-                            &mut commands,
-                        );
-                        x = prev_frame_rect.max.x + gap;
+                        // 動画 HUD 2 段化リデザイン (実機フィードバック反映): 狭幅 (tier 2 以降) では
+                        // キャプチャパレットを camera 単独に縮退する (前フレーム / 保存 / 次フレームを
+                        // 非表示)。キーボード Ctrl+Shift+←/→ / Ctrl+S で代替可能。
+                        let mut prev_down = false;
+                        let mut next_down = false;
+                        if show_capture_palette {
+                            let prev_frame_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, center_y - btn_size * 0.5),
+                                egui::vec2(btn_size, btn_size),
+                            );
+                            prev_down = draw_native_frame_step_button(
+                                ui,
+                                painter,
+                                prev_frame_rect,
+                                "native_video_prev_frame",
+                                -1,
+                                "前のフレーム [Ctrl+Shift+←]",
+                                &mut frame_step_hold,
+                                &mut commands,
+                            );
+                            x = prev_frame_rect.max.x + gap;
+                        }
 
                         let screenshot_rect = egui::Rect::from_min_size(
                             egui::pos2(x, center_y - btn_size * 0.5),
@@ -6113,65 +6224,63 @@ impl NativeEguiOverlay {
                         }
                         x = screenshot_rect.max.x + gap;
 
-                        let save_rect = egui::Rect::from_min_size(
-                            egui::pos2(x, center_y - btn_size * 0.5),
-                            egui::vec2(btn_size, btn_size),
-                        );
-                        let save_resp = ui.interact(
-                            save_rect,
-                            egui::Id::new("native_video_save_frame"),
-                            egui::Sense::click(),
-                        );
-                        draw_overlay_button_bg(painter, save_rect, save_resp.hovered(), false);
-                        draw_overlay_save_icon(painter, save_rect);
-                        let save_resp =
-                            save_resp.hover_tip_dark("現在フレームをファイル保存 [Ctrl+S]");
-                        if save_resp.clicked() {
-                            commands.push(NativeOverlayCommand::SaveFrameToFile);
-                        }
-                        x = save_rect.max.x + gap;
+                        if show_capture_palette {
+                            let save_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, center_y - btn_size * 0.5),
+                                egui::vec2(btn_size, btn_size),
+                            );
+                            let save_resp = ui.interact(
+                                save_rect,
+                                egui::Id::new("native_video_save_frame"),
+                                egui::Sense::click(),
+                            );
+                            draw_overlay_button_bg(painter, save_rect, save_resp.hovered(), false);
+                            draw_overlay_save_icon(painter, save_rect);
+                            let save_resp =
+                                save_resp.hover_tip_dark("現在フレームをファイル保存 [Ctrl+S]");
+                            if save_resp.clicked() {
+                                commands.push(NativeOverlayCommand::SaveFrameToFile);
+                            }
+                            x = save_rect.max.x + gap;
 
-                        let next_frame_rect = egui::Rect::from_min_size(
-                            egui::pos2(x, center_y - btn_size * 0.5),
-                            egui::vec2(btn_size, btn_size),
-                        );
-                        let next_down = draw_native_frame_step_button(
-                            ui,
-                            painter,
-                            next_frame_rect,
-                            "native_video_next_frame",
-                            1,
-                            "次のフレーム [Ctrl+Shift+→]",
-                            &mut frame_step_hold,
-                            &mut commands,
-                        );
-                        // 動画 HUD 2 段化リデザイン (Phase 3): bar はシーク行に独立配置するため、
-                        // 末尾の `x = next_frame_rect.max.x + gap;` は不要になった (旧 1 段では
-                        // `bar_min_x = x` で残空間を bar に割り当てていた)。Phase 4 でマーカー
-                        // ボタンを追加する際に `x` の更新を復活させる可能性あり。
+                            let next_frame_rect = egui::Rect::from_min_size(
+                                egui::pos2(x, center_y - btn_size * 0.5),
+                                egui::vec2(btn_size, btn_size),
+                            );
+                            let next_inner_down = draw_native_frame_step_button(
+                                ui,
+                                painter,
+                                next_frame_rect,
+                                "native_video_next_frame",
+                                1,
+                                "次のフレーム [Ctrl+Shift+→]",
+                                &mut frame_step_hold,
+                                &mut commands,
+                            );
+                            next_down = next_inner_down;
+                            // bar はシーク行に独立配置するため、末尾の x 更新は不要 (= 旧 1 段で
+                            // bar_min_x = x として残空間を bar に割り当てていた名残)。
+                        }
                         if !prev_down && !next_down {
                             frame_step_hold = None;
                         }
 
-                        let time_w = 132.0;
-                        let vol_label_w = 60.0;
-                        let limiter_indicator_w = 14.0;
-                        let vol_slider_w = 144.0;
-                        let mute_w = btn_size;
-                        let norm_w = btn_size; // 音量ノーマライズボタン (mute と同じサイズ)
-                        let speed_w = btn_size * 1.55;
-                        let right_controls_w = time_w
-                            + gap
-                            + speed_w
-                            + gap
-                            + mute_w
-                            + gap
-                            + norm_w
-                            + gap
-                            + vol_slider_w
-                            + gap
-                            + vol_label_w
-                            + limiter_indicator_w;
+                        // 動画 HUD 2 段化リデザイン (実機フィードバック反映): 右クラスター幅は
+                        // 上で tier 判定済みの `compact_right_cluster` に応じて伸縮する。
+                        // 最小窓 (640pt) では vol_label / limiter 非表示 + vol_slider 縮小で
+                        // 左ボタン群との overlap を回避する。
+                        let vol_slider_w = if compact_right_cluster {
+                            vol_slider_w_narrow
+                        } else {
+                            vol_slider_w_full
+                        };
+                        let show_vol_label = !compact_right_cluster;
+                        let show_limiter_slot = !compact_right_cluster;
+                        let right_controls_w = if compact_right_cluster {
+                            right_w_compact
+                        } else {
+                            right_w_full
+                        };
                         let right_controls_x = hud_rect.max.x - side_pad - right_controls_w;
                         // 動画 HUD 2 段化リデザイン (Phase 3): bar はシーク行 (上段) に独立配置し、
                         // **フル幅** で seek_row_rect の左右 padding 内に展開する。コントロール行
@@ -6828,27 +6937,31 @@ impl NativeEguiOverlay {
                                 persist: true,
                             });
                         }
-                        let volume_label = format_video_volume_db_compact(volume);
-                        let volume_label_color = if volume > 1.0 {
-                            egui::Color32::from_rgb(255, 210, 80)
-                        } else {
-                            egui::Color32::from_rgb(238, 238, 238)
-                        };
-                        painter.text(
-                            egui::pos2(vol_rect.max.x + gap + vol_label_w, text_center_y),
-                            egui::Align2::RIGHT_CENTER,
-                            volume_label,
-                            egui::FontId::proportional(13.0),
-                            volume_label_color,
-                        );
-                        let limiter_rect = egui::Rect::from_center_size(
-                            egui::pos2(
-                                vol_rect.max.x + gap + vol_label_w + limiter_indicator_w * 0.5,
-                                center_y,
-                            ),
-                            egui::vec2(limiter_indicator_w, btn_size),
-                        );
-                        if limiter_ceiling_hit {
+                        // 動画 HUD 2 段化リデザイン (実機フィードバック反映): 最小窓 (tier 3) では
+                        // vol_label と limiter インジケータを非表示にして右クラスター幅を縮める。
+                        if show_vol_label {
+                            let volume_label = format_video_volume_db_compact(volume);
+                            let volume_label_color = if volume > 1.0 {
+                                egui::Color32::from_rgb(255, 210, 80)
+                            } else {
+                                egui::Color32::from_rgb(238, 238, 238)
+                            };
+                            painter.text(
+                                egui::pos2(vol_rect.max.x + gap + vol_label_w, text_center_y),
+                                egui::Align2::RIGHT_CENTER,
+                                volume_label,
+                                egui::FontId::proportional(13.0),
+                                volume_label_color,
+                            );
+                        }
+                        if show_limiter_slot && limiter_ceiling_hit {
+                            let limiter_rect = egui::Rect::from_center_size(
+                                egui::pos2(
+                                    vol_rect.max.x + gap + vol_label_w + limiter_indicator_w * 0.5,
+                                    center_y,
+                                ),
+                                egui::vec2(limiter_indicator_w, btn_size),
+                            );
                             let limiter_resp = ui.interact(
                                 limiter_rect,
                                 egui::Id::new("native_video_limiter_indicator"),
