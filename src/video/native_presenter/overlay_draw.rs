@@ -629,14 +629,34 @@ pub(super) fn draw_native_jump_row(
             egui::Color32::from_rgb(232, 232, 232),
         );
         if let Some(title) = entry.title.as_deref().filter(|s| !s.trim().is_empty()) {
-            let title_max_chars = if entry.bookmark_id.is_some() { 16 } else { 22 };
-            painter.text(
-                egui::pos2(text_x, row_rect.min.y + 38.0),
-                egui::Align2::LEFT_TOP,
-                truncate_overlay_text(title, title_max_chars),
+            // タイトルは下段 (row_rect.min.y + 38) に描く。edit/X ボタンは上段
+            // (y +8..+30) で y が分離しているので、右端制約は **行の右端 - 余白**
+            // (= row_rect.max.x - 6.0) だけで足りる。
+            //
+            // 旧実装は `truncate_overlay_text(title, 16 or 22)` で文字数固定で
+            // 切っていたが、Yu Gothic は全角 ≈ 12pt / 半角 ≈ 6-7pt と幅が倍違うので
+            // 「16 文字」で右にはみ出す CJK 混在タイトルが存在した (ウィンドウモードで
+            // 縦スクロールバーが出ると row_w が ~12pt 縮んでさらに顕在化)。
+            // `layout_truncated_to_width` で実ピクセル幅で省略する。
+            let title_color = egui::Color32::from_rgb(205, 205, 205);
+            let title_max_w = (row_rect.max.x - text_x - 6.0).max(0.0);
+            // soft_char_cap: jump panel の物理幅 ~178pt に対して、最も狭い ASCII
+            // (3-4pt/char) でも 48 文字あれば確実にあふれる。bulk import で 1000 文字
+            // 級のタイトルが流れ込んでも再 layout は最大 48 回に bounded (Codex P2)。
+            if let Some(galley) = layout_truncated_to_width(
+                &painter,
+                title,
                 egui::FontId::proportional(12.0),
-                egui::Color32::from_rgb(205, 205, 205),
-            );
+                title_color,
+                title_max_w,
+                48,
+            ) {
+                painter.galley(
+                    egui::pos2(text_x, row_rect.min.y + 38.0),
+                    galley,
+                    title_color,
+                );
+            }
         }
 
         let mut delete_clicked = false;
@@ -3788,9 +3808,173 @@ pub(super) fn truncate_overlay_text(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// `text` を `painter` で `font` レイアウトしたとき、幅が `max_width` を超えない
+/// ように末尾を `…` で省略した `Galley` を返す。文字幅は `layout_no_wrap` で実測
+/// するので CJK / ASCII / 絵文字混在でも overshoot しない。
+///
+/// `text` がそのまま収まれば省略なしの Galley を返す。`…` も入らない極小幅は
+/// `None`。`ui_helpers::draw_cell_filename` と同じ手法 (平均幅近似が CJK 混在で
+/// 使えないので 1 文字ずつ削って再 layout する)。
+///
+/// `soft_char_cap` は **iterate 開始前の上限** で、ここで先に頭から `soft_char_cap`
+/// 文字に切ってから layout / iterate を始める。再 layout は最大でも `soft_char_cap`
+/// 回に制限される (Codex P2 反映、`draw_cell_filename` の 18 文字 soft cap と同じ
+/// 考え方)。bulk import で極端に長いタイトルが入っていてもフレーム hitch しない。
+/// 呼び出し側は panel の物理上限に対して余裕を持った値を渡す。
+///
+/// 文字数固定で truncate していた既存呼び出し (`truncate_overlay_text(s, N)`) で
+/// CJK が多いタイトルが実幅で右にはみ出すのを避けるために導入 (左ジャンプ
+/// パネルのブックマークタイトルが panel 右端を越える事象、2026-05)。
+///
+/// TODO (Codex P3): 切り詰めは Unicode scalar 単位なので emoji ZWJ / variation
+/// selector / 結合文字を split する可能性がある。emoji 混じりタイトルが実害になる
+/// なら `unicode-segmentation` で grapheme cluster 単位に切る。
+pub(super) fn layout_truncated_to_width(
+    painter: &egui::Painter,
+    text: &str,
+    font: egui::FontId,
+    color: egui::Color32,
+    max_width: f32,
+    soft_char_cap: usize,
+) -> Option<std::sync::Arc<egui::Galley>> {
+    if max_width < 1.0 || soft_char_cap == 0 {
+        return None;
+    }
+    // 入力を **単一パス** で soft_char_cap 文字以内に頭打ちにする (Codex P3 反映)。
+    // 旧版は `text.chars().count()` で全文走査していたため、1000 文字級タイトルでは
+    // 描画パス上で毎フレーム O(N) が残っていた。`by_ref().take()` で N+1 文字目まで
+    // 進めて overflowed を判定するので、N 文字未満なら early stop、超えても N+1 文字で
+    // 止まる。
+    let mut iter = text.chars();
+    let chars: Vec<char> = iter.by_ref().take(soft_char_cap).collect();
+    let capped_to_cap = iter.next().is_some();
+    let initial: String = if capped_to_cap {
+        // 頭から soft_char_cap 文字 + `…` で開始 (= 既にこの時点で truncate 表示)。
+        let mut s: String = chars.iter().collect();
+        s.push('…');
+        s
+    } else {
+        chars.iter().collect()
+    };
+    let initial_galley = painter.layout_no_wrap(initial, font.clone(), color);
+    if initial_galley.size().x <= max_width {
+        return Some(initial_galley);
+    }
+    // 末尾を 1 文字ずつ削って `…` を足し、初めて max_width に収まったものを採用。
+    // iterate 対象は capped 状態の文字列 (= 既に soft_char_cap 以下) なので、再 layout
+    // 回数は最大 `min(soft_char_cap, total_chars) - 1` 回に bounded (Codex P2)。
+    for take in (1..chars.len()).rev() {
+        let candidate: String = chars[..take].iter().collect::<String>() + "…";
+        let g = painter.layout_no_wrap(candidate, font.clone(), color);
+        if g.size().x <= max_width {
+            return Some(g);
+        }
+    }
+    // 1 文字 + `…` でも入らない極小幅: `…` 単独で試して、それでも入らないなら諦め。
+    let ellipsis = painter.layout_no_wrap("…".to_string(), font.clone(), color);
+    if ellipsis.size().x <= max_width {
+        Some(ellipsis)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `layout_truncated_to_width` テスト用の painter を作る。egui Context を一度
+    /// run して fonts を初期化し、background layer の painter を返す。実フォントは
+    /// egui デフォルト (Yu Gothic ではない) だが、本ヘルパーの保証は「戻り値の
+    /// galley size が max_width 以下になること」なので、フォントが何であっても
+    /// 検証可能。
+    fn test_painter() -> (egui::Context, egui::Painter) {
+        let ctx = egui::Context::default();
+        // Run one no-op pass so fonts are initialized.
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let painter = ctx.layer_painter(egui::LayerId::background());
+        (ctx, painter)
+    }
+
+    #[test]
+    fn layout_truncated_to_width_returns_full_when_fits() {
+        let (_ctx, painter) = test_painter();
+        let font = egui::FontId::proportional(12.0);
+        let color = egui::Color32::WHITE;
+        // 十分広い max_width なら原文 (省略なし) がそのまま返る。
+        let galley =
+            layout_truncated_to_width(&painter, "hello", font, color, 10_000.0, 48).unwrap();
+        assert_eq!(galley.text(), "hello");
+    }
+
+    #[test]
+    fn layout_truncated_to_width_bounds_galley_by_max_width() {
+        let (_ctx, painter) = test_painter();
+        let font = egui::FontId::proportional(12.0);
+        let color = egui::Color32::WHITE;
+        // 狭い max_width: 必ず max_width 以下に収まる (実フォント幅で省略される)。
+        let max_w = 40.0;
+        let galley =
+            layout_truncated_to_width(&painter, "abcdefghijklmnopqrstuv", font, color, max_w, 48)
+                .unwrap();
+        assert!(
+            galley.size().x <= max_w,
+            "galley width {} exceeds max_width {}",
+            galley.size().x,
+            max_w
+        );
+        // 原文より短くなっているはず (省略マーカーが入っている前提)。
+        assert!(galley.text().len() < 22);
+    }
+
+    #[test]
+    fn layout_truncated_to_width_caps_long_input_without_full_walk() {
+        let (_ctx, painter) = test_painter();
+        let font = egui::FontId::proportional(12.0);
+        let color = egui::Color32::WHITE;
+        // 1000 文字の入力に soft_char_cap=16 を渡しても、内部 iterate は 16 回以下に
+        // bounded で完了する (Codex P2/P3 反映)。戻り値の文字数は cap+省略マーカーを
+        // 超えないこと、かつ max_width で実幅 bounded であることを確認。
+        let long = "a".repeat(1000);
+        let max_w = 200.0;
+        let galley = layout_truncated_to_width(&painter, &long, font, color, max_w, 16).unwrap();
+        assert!(galley.size().x <= max_w);
+        // text() は `…` 1 文字 + 0..=16 文字、合計 17 文字以下。
+        assert!(
+            galley.text().chars().count() <= 17,
+            "galley text {:?} exceeds soft cap + ellipsis",
+            galley.text()
+        );
+    }
+
+    #[test]
+    fn layout_truncated_to_width_handles_cjk_mixed_width() {
+        let (_ctx, painter) = test_painter();
+        let font = egui::FontId::proportional(12.0);
+        let color = egui::Color32::WHITE;
+        // 全角混じりタイトル: 旧 truncate_overlay_text(_, 16) は文字数で切るので
+        // overshoot していた。実幅省略なので max_w を必ず守る。
+        let mixed = "モンドの夕暮れ Dusk in Mondstadt";
+        let max_w = 80.0;
+        let galley = layout_truncated_to_width(&painter, mixed, font, color, max_w, 48).unwrap();
+        assert!(
+            galley.size().x <= max_w,
+            "CJK galley width {} exceeds max_width {}",
+            galley.size().x,
+            max_w
+        );
+    }
+
+    #[test]
+    fn layout_truncated_to_width_returns_none_for_invalid_args() {
+        let (_ctx, painter) = test_painter();
+        let font = egui::FontId::proportional(12.0);
+        let color = egui::Color32::WHITE;
+        // max_width が 0 (= 1.0 未満) なら None。
+        assert!(layout_truncated_to_width(&painter, "abc", font.clone(), color, 0.0, 48).is_none());
+        // soft_char_cap = 0 でも None (caller の設定ミスを silently 描画しない)。
+        assert!(layout_truncated_to_width(&painter, "abc", font, color, 100.0, 0).is_none());
+    }
 
     /// jump / metadata 両パネルの底辺がホバー判定の底辺と一致し、シーク HUD
     /// (top y = overlay_h - 46) の上に 2pt の隙間が空くことを保証する回帰テスト。
