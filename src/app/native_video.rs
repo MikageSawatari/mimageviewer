@@ -1637,20 +1637,9 @@ impl App {
     ) {
         if self.fullscreen_idx != Some(fs_idx) {
             crate::logger::log(format!(
-                "[native-video] stale overlay event ignored (fs_idx mismatch): \
-                 event_idx={fs_idx} current={:?} event={:?}",
-                self.fullscreen_idx,
-                std::mem::discriminant(&event)
+                "[native-video] stale overlay event ignored: event_idx={fs_idx} current={:?}",
+                self.fullscreen_idx
             ));
-            // 診断ログ (2026-05-26): NavigateItem が stale で落ちる頻度を観測
-            if matches!(
-                event,
-                crate::video::NativeVideoOutputEvent::NavigateItem { .. }
-            ) {
-                crate::logger::log(
-                    "[nav-dbg] NavigateItem dropped by stale fs_idx check".to_string(),
-                );
-            }
             return;
         }
         let current_epoch = self.fs_cache.get(&fs_idx).and_then(|entry| match entry {
@@ -1677,18 +1666,10 @@ impl App {
                 event,
                 crate::video::NativeVideoOutputEvent::NavigateItem { .. }
             ) {
-                crate::logger::log(format!(
-                    "[nav-dbg] NavigateItem bypassing epoch check: \
-                     event_idx={fs_idx} event_epoch={source_epoch} \
-                     current_epoch={current_epoch:?} (= ホイール切替直後の skew window 内)"
-                ));
-                // fall through to dispatch
+                // fall through: NavigateItem は dispatch 続行
             } else {
                 crate::logger::log(format!(
-                    "[native-video] stale overlay event ignored (epoch mismatch): \
-                     event_idx={fs_idx} event_epoch={source_epoch} \
-                     current_epoch={current_epoch:?} event={:?}",
-                    std::mem::discriminant(&event)
+                    "[native-video] stale overlay event ignored: event_idx={fs_idx} event_epoch={source_epoch} current_epoch={current_epoch:?}"
                 ));
                 return;
             }
@@ -4986,29 +4967,12 @@ impl App {
         fs_idx: usize,
         base_delta: i32,
     ) {
-        // 診断ログ: nav 入口の状態を全部記録 (2026-05-26 実機 fb 「ホイール後ボタン反応せず」
-        // 残存バグの追跡用)。原因切り分けが終わったら撤去予定。
-        let dbg_tile = self.video_tile_swap_pending.is_some();
-        let dbg_fast = self.native_video_fast_swap_pending.is_some();
-        let dbg_source = self.native_video_source_swap_pending.is_some();
-        let dbg_locked = self.fs_nav_is_locked();
-        let dbg_open_pending = self.native_video_open_pending.is_some();
-        crate::logger::log(format!(
-            "[nav-dbg] navigate enter fs_idx={fs_idx} delta={base_delta} \
-             fs_idx_app={:?} tile_swap={dbg_tile} fast_swap={dbg_fast} \
-             source_swap={dbg_source} open_pending={dbg_open_pending} \
-             nav_locked={dbg_locked} prev_deferred={:?}",
-            self.fullscreen_idx, self.native_video_deferred_nav_delta,
-        ));
         // tile/fast swap pending 中はナビを即時実行できないが、silent drop すると
         // 「ホイール / 前-次項目ボタンが反応しない」体感バグになる (実機 fb 2026-05-26)。
         // 最新 delta を deferred フィールドに格納し、swap 完了後の polling で drain する
         // (`maybe_apply_deferred_native_video_nav` 参照)。most-recent-wins。
         if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
             self.native_video_deferred_nav_delta = Some(base_delta);
-            crate::logger::log(format!(
-                "[nav-dbg] navigate deferred (tile_or_fast_swap_pending) delta={base_delta}"
-            ));
             return;
         }
         // `fs_nav_is_locked()` は video swap だけでなく Ctrl+↑↓ などのフルスクリーン
@@ -5017,14 +4981,8 @@ impl App {
         // deferred delta を後追い適用すると予期せぬ 1 アイテム移動が発火しうる
         // (Codex 第 8 P2 指摘)。defer せず silent return に留める。
         if self.fs_nav_is_locked() {
-            crate::logger::log(format!(
-                "[nav-dbg] navigate dropped (fs_nav_locked) delta={base_delta}"
-            ));
             return;
         }
-        crate::logger::log(format!(
-            "[nav-dbg] navigate proceed → open_navigation delta={base_delta}"
-        ));
         if !self.video_tile_mode_active {
             self.cancel_stale_video_tile_reopen(Some(fs_idx), "wheel-navigation");
         }
@@ -5047,37 +5005,18 @@ impl App {
     /// 全 pending が解消されている場合のみ drain (= 別 pending が残っているなら待つ)。
     #[cfg(windows)]
     pub(super) fn maybe_apply_deferred_native_video_nav(&mut self, ctx: &egui::Context) {
-        // 診断ログ: deferred 状態を tick ごとにチェックしているのが見えるよう、
-        // deferred が Some のときだけ短いログを出す (Codex 助言: ノイズ抑制)。
-        let has_deferred = self.native_video_deferred_nav_delta.is_some();
-        if !has_deferred {
-            return;
-        }
-        let dbg_tile = self.video_tile_swap_pending.is_some();
-        let dbg_fast = self.native_video_fast_swap_pending.is_some();
-        let dbg_source = self.native_video_source_swap_pending.is_some();
-        let dbg_locked = self.fs_nav_is_locked();
-        if dbg_tile || dbg_fast || dbg_locked {
-            crate::logger::log(format!(
-                "[nav-dbg] drain attempt blocked: deferred={:?} fast_swap={dbg_fast} \
-                 tile_swap={dbg_tile} source_swap={dbg_source} nav_locked={dbg_locked}",
-                self.native_video_deferred_nav_delta,
-            ));
+        if self.video_tile_swap_pending.is_some()
+            || self.native_video_fast_swap_pending.is_some()
+            || self.fs_nav_is_locked()
+        {
             return;
         }
         let Some(delta) = self.native_video_deferred_nav_delta.take() else {
             return;
         };
         let Some(fs_idx) = self.fullscreen_idx else {
-            crate::logger::log(format!(
-                "[nav-dbg] drain dropped: fullscreen_idx=None delta={delta}"
-            ));
             return;
         };
-        crate::logger::log(format!(
-            "[nav-dbg] drain firing: fs_idx={fs_idx} delta={delta} \
-             source_swap={dbg_source}"
-        ));
         self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
     }
 
