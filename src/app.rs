@@ -2285,6 +2285,13 @@ pub struct App {
     pub(crate) native_video_source_swap_pending: Option<native_video::NativeVideoSourceSwapPending>,
     #[cfg(windows)]
     pub(crate) native_video_source_epoch_next: u64,
+    /// `navigate_native_video_fullscreen` が tile/fast swap pending 中に
+    /// 受け取った最新のナビ delta。swap 完了直後に drain して再 dispatch する。
+    /// most-recent-wins (= overwrite) で複数 click を coalesce する。
+    /// これが無いと、ホイール / 前-次項目ボタンを swap 中に押した入力が silent
+    /// drop されて「ボタンが反応しない」体感バグの原因になる (実機 fb 2026-05-26)。
+    #[cfg(windows)]
+    pub(crate) native_video_deferred_nav_delta: Option<i32>,
     /// タイルモードのサムネ WebP 永続キャッシュ (Phase 6.D-2、Phase 8.C で絶対 PTS 化)。
     /// 同 (動画 path, tile_w, timestamp_ms) のキーで再オープン時に即座に表示できる。
     /// 列数が同じなら抽出間隔を変えても共通 PTS のサムネは再利用される。
@@ -3552,6 +3559,8 @@ impl App {
             native_video_source_swap_pending: None,
             #[cfg(windows)]
             native_video_source_epoch_next: 1,
+            #[cfg(windows)]
+            native_video_deferred_nav_delta: None,
             video_tile_cache,
             fs_open_intent_from_grid: false,
             fs_video_open_autoplay_override: None,
@@ -14634,6 +14643,9 @@ impl App {
             self.native_video_fast_swap_pending = None;
             self.native_video_open_pending = None;
             self.native_video_source_swap_pending = None;
+            // フルスクリーン終了時には保持中の deferred nav も破棄する
+            // (再オープン後に過去の delta が誤発火しないように)。
+            self.native_video_deferred_nav_delta = None;
         }
         self.reset_erase_mode();
         self.erase_base_cache.clear();
@@ -17222,6 +17234,11 @@ impl App {
         if let Some(fs_idx) = self.fullscreen_idx {
             self.poll_native_video_fast_swap(ctx);
             self.poll_video_tile_swap(ctx);
+            // swap pending が解消されたフレームで、`navigate_native_video_fullscreen`
+            // が保持していた deferred nav delta を drain して再 dispatch する。
+            // wheel / 前-次項目ボタンが pending 中に押されたケースで「反応しない」
+            // 体感バグを防ぐ (実機 fb 2026-05-26)。
+            self.maybe_apply_deferred_native_video_nav(ctx);
             self.sync_native_video_metadata(fs_idx);
             self.sync_native_video_timeline_markers(fs_idx);
             self.sync_native_video_tile_overlay(ctx, fs_idx);

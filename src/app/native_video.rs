@@ -4945,10 +4945,16 @@ impl App {
         fs_idx: usize,
         base_delta: i32,
     ) {
+        // tile/fast swap pending 中はナビを即時実行できないが、silent drop すると
+        // 「ホイール / 前-次項目ボタンが反応しない」体感バグになる (実機 fb 2026-05-26)。
+        // 最新 delta を deferred フィールドに格納し、swap 完了後の polling で drain する
+        // (`maybe_apply_deferred_native_video_nav` 参照)。most-recent-wins。
         if self.video_tile_swap_pending.is_some() || self.native_video_fast_swap_pending.is_some() {
+            self.native_video_deferred_nav_delta = Some(base_delta);
             return;
         }
         if self.fs_nav_is_locked() {
+            self.native_video_deferred_nav_delta = Some(base_delta);
             return;
         }
         if !self.video_tile_mode_active {
@@ -4965,6 +4971,27 @@ impl App {
         } else {
             self.show_native_video_boundary_toast(ctx, nav_delta > 0);
         }
+    }
+
+    /// `poll_native_video_fast_swap` / `poll_video_tile_swap_pending` が pending を
+    /// クリアした直後に呼ぶ。`navigate_native_video_fullscreen` が pending 中に保持した
+    /// 最新 nav delta を取り出して再 dispatch する。
+    /// 全 pending が解消されている場合のみ drain (= 別 pending が残っているなら待つ)。
+    #[cfg(windows)]
+    pub(super) fn maybe_apply_deferred_native_video_nav(&mut self, ctx: &egui::Context) {
+        if self.video_tile_swap_pending.is_some()
+            || self.native_video_fast_swap_pending.is_some()
+            || self.fs_nav_is_locked()
+        {
+            return;
+        }
+        let Some(delta) = self.native_video_deferred_nav_delta.take() else {
+            return;
+        };
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
+        self.navigate_native_video_fullscreen(ctx, fs_idx, delta);
     }
 
     /// 動画フルスクリーンで境界 (先頭/末尾) に到達したことを示すトースト + state 更新。
