@@ -17616,7 +17616,9 @@ impl App {
                 cancel: cancel_for_guard,
             };
             if cancel_worker.load(Ordering::Relaxed) {
-                return; // Drop guard が None を送って pending を解放する
+                // Drop guard は cancel=true を見て **silent exit** (None も送らない)。
+                // pending は新 worker のために残す (上書きされている可能性あり)。
+                return;
             }
             // image::open → WIC → Susie の順 (start_fs_load と同じ fallback)
             let open_result = match image::open(&path) {
@@ -17639,6 +17641,7 @@ impl App {
                 }
             };
             if cancel_worker.load(Ordering::Relaxed) {
+                // cancel 起因 → Drop guard が silent exit (新 worker の pending を残す)
                 return;
             }
             let img = crate::thumb_loader::apply_exif_orientation(img, &path);
@@ -17646,6 +17649,7 @@ impl App {
             let (w, h) = (rgba_img.width(), rgba_img.height());
             let raw = rgba_img.into_raw();
             if cancel_worker.load(Ordering::Relaxed) {
+                // cancel 起因 → Drop guard が silent exit (新 worker の pending を残す)
                 return;
             }
             let high_res = crate::panorama::HighResSource::Decoded {
@@ -17776,6 +17780,14 @@ impl App {
             }
             // settle_will_use_it == false (AI / post_filter ON 等):
             //   state は触らない、HighResSource は格納 (= 将来 OFF→ON で再利用可能)
+        }
+        // **進行中 worker がある間は低頻度 repaint で wakeup を確保** (Codex P1 第 11、
+        // 2026-05): egui はアイドル時にフレームを送らないので、worker が完了しても
+        // 次のマウス入力まで `poll_pano_high_res` が呼ばれず、UI ステータスが
+        // 「高画質 ロード中…」のまま固まったように見える。`pano_high_res_pending` が
+        // 非空の間だけ 33 ms (~30 FPS) で wakeup する (AI upscale pending と同パターン)。
+        if !self.pano_high_res_pending.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
     }
 
@@ -17965,6 +17977,14 @@ impl App {
                 .unwrap_or(false);
             if !already_loading {
                 self.start_pano_high_res_load(fs_idx, cache_key);
+            }
+            // **worker 完了を取り込むため低頻度 repaint を予約** (Codex P1 第 12、
+            // 2026-05): `poll_pano_high_res` の末尾にも同じ kicker があるが、それは
+            // **次フレ** で評価される。本フレで paint 中に load を kick したケースは
+            // 当フレ App::update の poll は既に過ぎているので、ここで明示的に
+            // request_repaint_after しないと egui が次入力までスリープする。
+            if self.pano_high_res_pending.contains_key(&source_key) {
+                ctx.request_repaint_after(std::time::Duration::from_millis(33));
             }
             return;
         }

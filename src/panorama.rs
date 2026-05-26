@@ -526,9 +526,14 @@ pub struct SettleOverlay {
 ///
 /// **`high_res: Option<...>`** にすることで decode 失敗パスでも必ず 1 通送れる
 /// (Codex P0 第 5、2026-05)。worker thread の Drop guard が責務を持つ:
-/// 成功時は `Some(high_res)` を送る、failure / early-return / panic 時は `None` を送る。
-/// UI 側 (`poll_pano_high_res`) はどちらでも pending entry を必ず remove して、
-/// auto-kick の無限ループを防ぐ。
+/// - 成功時は `Some(high_res)` を明示送信 (`SendGuard.sent = true`)
+/// - **decode 失敗 / panic** 時は Drop guard が `None` を送って pending を解放
+/// - **cancel = true 時は silent exit** (= 何も送らない)。新 worker が同じ
+///   source_key の pending を既に上書きしている可能性があるため、stale message で
+///   それを誤って消費しないようにするため (Codex P1 第 6、2026-05)
+/// UI 側 (`poll_pano_high_res`) は `None` で pending entry を remove + failed flag
+/// を立てて auto-kick の無限ループを防ぐ。silent exit は新 worker (= pending に
+/// 残っている) が完了するまで何もしない。
 ///
 /// **`request_id`** は per-spawn の uniquely incrementing counter (Codex P1 第 7、
 /// 2026-05)。`source_key + cache_key` だけでは「同じ source_key を同じ cache_key で
