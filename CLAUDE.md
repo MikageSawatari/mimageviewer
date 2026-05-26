@@ -1293,15 +1293,83 @@ mIV は **既にローカルに存在する動画ファイルを開くだけ** �
      Flush で押し切る案」のような構造的な選択肢が複数ある局面では、Codex に
      trade-off を意見させる。Claude の最初の選好に縛られない設計判断ができる。
 
-### 基本コマンド
+### 基本コマンド (1 ラウンド目)
 
 read-only サンドボックス (ファイル書き換え・ネットワーク・パッケージ操作は禁止) で実行する。
+以下は **同じタスクで Codex に意見をもらう最初の 1 回** で使うコマンド。2 ラウンド目以降は
+次節「同じタスクは同じセッションで継続する」を使う (毎回 `codex exec` で新規セッションを
+始めない)。
 
 | 目的 | コマンド |
 |---|---|
 | 直前のコミット (`HEAD~1` との差分) をレビュー | `codex exec --sandbox read-only "Review the changes since HEAD~1. Use git diff HEAD~1 and inspect relevant files. Focus on bugs, regressions, missing tests, and compatibility risks. Return findings first, ordered by severity."` |
 | ブランチ全体 (`main` からの分岐) をレビュー | `codex exec --sandbox read-only "Review this branch against main. Use git merge-base main HEAD and git diff from that base. Focus on bugs, regressions, missing tests, and compatibility risks. Return findings first."` |
 | 未コミットの作業変更だけレビュー | `codex exec --sandbox read-only "Review the uncommitted changes in this repo. Use git diff and git diff --cached. Focus on bugs, regressions, missing tests, and compatibility risks. Return findings first."` |
+
+### 同じタスクは同じセッションで継続する (resume)
+
+**同じタスク内でレビュー往復をするときは、毎回 `codex exec` で新セッションを開かず、
+`codex exec resume` で前回セッションの会話履歴を引き継ぐこと**。新セッションを開き直すと、
+Codex は前回どこに着目したか・どの指摘を出したかを覚えておらず、毎回ゼロから差分を読み
+直すので精度が落ち、こちらの追問 ("P2 について詳しく" / "この修正で直ったか確認して") も
+通じなくなる。
+
+判断基準 (タスク単位):
+
+- **同じタスク** = ユーザーから受け取った 1 つの作業指示の中で、レビュー → 修正 → 再レビュー
+  と往復する局面。**同じセッションを使い続ける**。
+- **別タスク** = 新しいユーザー指示で作業を始める / コミット粒度が変わる / レビュー観点が
+  変わる (例: bug review → security review)。**新セッションを開く** (`codex exec` で開始)。
+
+#### 推奨フロー
+
+1 ラウンド目だけ `codex exec` で開始し、以降は `--last` で直近セッションを継続する。
+`--last` は cwd 一致の最新セッションを自動で拾うので SID 管理が不要:
+
+```bash
+# 1 ラウンド目 (新セッション開始)
+codex exec --sandbox read-only -o /tmp/codex-1.txt \
+    "Review the changes since HEAD~1. ..." \
+    < /dev/null > /tmp/codex-1-events.log 2>&1
+cat /tmp/codex-1.txt   # P1/P2/P3 サマリ
+
+# 2 ラウンド目以降 (同じセッションを継続)
+codex exec resume --last --sandbox read-only -o /tmp/codex-2.txt \
+    "P2 の修正を <commit-hash> で入れた。意図通り直っているか確認して。" \
+    < /dev/null > /tmp/codex-2-events.log 2>&1
+cat /tmp/codex-2.txt
+```
+
+#### 明示的に SID を指定したいとき
+
+並行で複数タスクの Codex セッションが走っていて `--last` が別タスクのものを拾う恐れが
+あるときは、1 ラウンド目で `--json` を付けて **thread_id** を控え、resume 時に SID を
+明示する:
+
+```bash
+# 1 ラウンド目 (SID 取得)
+codex exec --json --sandbox read-only -o /tmp/codex-1.txt \
+    "Review the changes since HEAD~1. ..." \
+    < /dev/null > /tmp/codex-1-events.jsonl 2>&1
+SID=$(head -1 /tmp/codex-1-events.jsonl | jq -r .thread_id)
+
+# 2 ラウンド目以降 (SID 指定で resume)
+codex exec resume "$SID" --sandbox read-only -o /tmp/codex-2.txt \
+    "P2 について詳しく説明して" \
+    < /dev/null > /tmp/codex-2-events.log 2>&1
+```
+
+#### 制約・注意点
+
+- **`--ephemeral` を付けない**。これを付けるとセッションがディスクに残らず resume 不可。
+  デフォルトは永続化なので普段は何もしなくて OK。
+- **resume には `-C / --cd` がない**。1 ラウンド目とは別 cwd で実行できないので、
+  レビュー往復は必ず同じディレクトリ (= mimageviewer ルート) から打つ。
+- **タスクが切り替わったら新セッションを開く** (= `codex exec` から始め直す)。古いセッション
+  の文脈が混ざると逆に精度が落ちる。
+- **basis コミット (差分の起点) を resume 中に動かさない**。会話履歴は残るが、Codex が
+  参照したファイルの中身は記録されていないので、`HEAD~1` 等で渡した基準コミットが
+  rebase で動くと差分の意味が変わる。
 
 ### 差分範囲の決め方
 
