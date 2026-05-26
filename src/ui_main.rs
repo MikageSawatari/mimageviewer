@@ -567,10 +567,50 @@ impl App {
                         }
                     });
                     ui.menu_button("サムネイル比率", |ui| {
+                        // 「自動」項目を先頭に表示。auto 中はチェック、再選択で再評価。
+                        let auto_checked = self.settings.thumb_aspect_auto;
+                        let auto_label = if let Some(current) = self.auto_aspect.current {
+                            format!("自動 ({})", current.label())
+                        } else {
+                            "自動".to_string()
+                        };
+                        let auto_prefix = if auto_checked { "✓ " } else { "  " };
+                        if ui.button(format!("{auto_prefix}{auto_label}")).clicked() {
+                            // 「自動」を選択。現在 Manual だったら自動に切替、すでに Auto なら再評価
+                            // のためリセット (samples は活かして即決し直す)。
+                            let was_off = !self.settings.thumb_aspect_auto;
+                            let prev_effective = self.effective_thumb_aspect();
+                            self.settings.thumb_aspect_auto = true;
+                            self.auto_aspect.reset_decision_only();
+                            if was_off {
+                                self.rebuild_auto_aspect_samples_from_loaded();
+                            }
+                            self.maybe_apply_auto_aspect(true);
+                            // Hold で current=None のまま終わったとき effective は Square。
+                            // 描画上のセル比率が変わるのでスクロール位置を補正する
+                            // (Switch されたら maybe_apply 内で fixup 済 → 二重呼出しは
+                            // 冪等で no-op、Codex P3 2026-05)。
+                            let new_effective = self.effective_thumb_aspect();
+                            if prev_effective != new_effective {
+                                self.fixup_scroll_for_aspect_change(new_effective);
+                            }
+                            settings_changed = true;
+                            ui.close();
+                        }
+                        ui.separator();
                         for &aspect in crate::settings::ThumbAspect::all() {
-                            let checked = self.settings.thumb_aspect == aspect;
+                            // 手動値表示: auto モード時はチェックしない (auto がチェックされる)
+                            let checked = !self.settings.thumb_aspect_auto
+                                && self.settings.thumb_aspect == aspect;
                             let prefix = if checked { "✓ " } else { "  " };
                             if ui.button(format!("{prefix}{}", aspect.label())).clicked() {
+                                // 個別比率クリック → Manual に切替。scroll 補正も適用。
+                                if self.settings.thumb_aspect_auto
+                                    || self.settings.thumb_aspect != aspect
+                                {
+                                    self.fixup_scroll_for_aspect_change(aspect);
+                                }
+                                self.settings.thumb_aspect_auto = false;
                                 self.settings.thumb_aspect = aspect;
                                 settings_changed = true;
                                 ui.close();
@@ -858,7 +898,10 @@ impl App {
         let tb_aspects = self.settings.toolbar_aspect_items.clone();
         let tb_sorts = self.settings.toolbar_sort_items.clone();
         let show_cols = !tb_cols.is_empty();
-        let show_aspect = !tb_aspects.is_empty();
+        // 比率セクション: 手動 7 種を全部外しても「自動」だけ ON なら表示する
+        // (Codex P3 2026-05)。`toolbar_aspect_auto_visible` は別フラグなので
+        // tb_aspects 空 + auto_visible で section が消える事故を防ぐ。
+        let show_aspect = self.settings.toolbar_aspect_auto_visible || !tb_aspects.is_empty();
         let show_sort = !tb_sorts.is_empty();
         let show_favs = self.settings.show_toolbar_favorites;
         let show_rating = self.settings.show_toolbar_rating;
@@ -875,7 +918,65 @@ impl App {
 
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| {
+            // ツールバー内の widget は label / selectable_label / ComboBox / radio が
+            // 混在しており、widget 高さの違いで縦位置がガタつく (ComboBox は label より
+            // 大きい)。`horizontal_wrapped` (= 既存の折返しレイアウト) は維持しつつ、
+            // 内部の widget 高さを統一する。
+            //
+            // ⚠ 過去の失敗:
+            //   - `with_layout(LeftToRight(Center).with_main_wrap(true))`: TopBottomPanel
+            //     と組み合わせると panel 高さが膨張する
+            //   - `spacing_mut` を `horizontal_wrapped` の **中**で設定: 初期行高は
+            //     呼出時点の値で計算されるため反映されず、Yu Gothic の galley が
+            //     interact_size.y を超えると widget が膨らむ → ガタつき (Codex 助言)
+            //
+            // 正しい配置: `ui.scope` で spacing を上書き → その内側で `horizontal_wrapped`
+            // を呼ぶ。scope はスタイル変更を toolbar 外に漏らさない安全策。
+            // ツールバー専用スタイル適用 helper。
+            // 外側の `ui.scope` だけでなく、各 ComboBox の `show_ui` closure 冒頭でも
+            // 呼ぶ必要がある。理由: egui の ComboBox popup は親 ui の TextStyle を
+            // 継承せず別の context で描画されるため、popup 内の項目だけ通常 Yu Gothic
+            // (= 上寄り) で描画されてしまう (Codex P3 2026-05)。
+            fn apply_toolbar_style(ui: &mut egui::Ui) {
+                let toolbar_family = egui::FontFamily::Name(std::sync::Arc::<str>::from(
+                    crate::ui_fonts::TOOLBAR_TEXT_FAMILY_NAME,
+                ));
+                let body_size = ui.style().text_styles[&egui::TextStyle::Body].size;
+                let button_size = ui.style().text_styles[&egui::TextStyle::Button].size;
+                ui.style_mut().text_styles.insert(
+                    egui::TextStyle::Body,
+                    egui::FontId::new(body_size, toolbar_family.clone()),
+                );
+                ui.style_mut().text_styles.insert(
+                    egui::TextStyle::Button,
+                    egui::FontId::new(button_size, toolbar_family),
+                );
+                ui.spacing_mut().interact_size.y = 22.0;
+                ui.spacing_mut().button_padding.y = 1.0;
+            }
+
+            ui.scope(|ui| {
+                // ツールバー本体に toolbar スタイルを適用 (Yu Gothic の glyph 上寄り問題を
+                // FontTweak.y_offset で補正)。詳細: src/ui_fonts.rs の TOOLBAR_TEXT_FAMILY_NAME。
+                apply_toolbar_style(ui);
+
+                // ツールバー用ラベル: ComboBox / selectable_label と同じ高さで描画
+                // して縦位置を揃える。
+                // ⚠ 幅 0.0 を渡すと「親レイアウト上の占有幅 0」と解釈されて次の
+                // widget と詰まる/重なる/wrap 判定が狂う (Codex 助言 2026-05)。
+                // 固定幅を明示すること。日本語ラベルは数が固定なので呼び出し側で
+                // 目視チューンした値を渡す。
+                fn toolbar_label(ui: &mut egui::Ui, text: &str, width: f32) -> egui::Response {
+                    let h = ui.spacing().interact_size.y;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width, h),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| ui.label(text),
+                    )
+                    .inner
+                }
+
+                ui.horizontal_wrapped(|ui| {
                 let mut first_section = true;
                 // ツールバー VST ボタンは v0.9.0 開発中に削除 (= ユーザー要望 2026-04
                 // 「ツールバーの VST ボタンも不要になったので削除」)。
@@ -887,12 +988,38 @@ impl App {
                     if !first_section {
                         ui.separator();
                     }
-                    ui.label("列:");
-                    for &cols in &tb_cols {
-                        let selected = self.settings.grid_cols == cols;
-                        if ui.selectable_label(selected, format!(" {cols} ")).clicked() {
-                            self.settings.grid_cols = cols;
-                            self.settings.save();
+                    toolbar_label(ui, "列:", 28.0);
+                    match self.settings.toolbar_cols_display {
+                        crate::settings::ToolbarSectionDisplay::Buttons => {
+                            for &cols in &tb_cols {
+                                let selected = self.settings.grid_cols == cols;
+                                if ui.selectable_label(selected, format!(" {cols} ")).clicked() {
+                                    self.settings.grid_cols = cols;
+                                    self.settings.save();
+                                }
+                            }
+                        }
+                        crate::settings::ToolbarSectionDisplay::Dropdown => {
+                            let current_text = format!("{} 列", self.settings.grid_cols);
+                            egui::ComboBox::from_id_salt("toolbar_cols_combo")
+                                .width(64.0)
+                                .selected_text(current_text)
+                                .show_ui(ui, |ui| {
+                                    apply_toolbar_style(ui);
+                                    for &cols in &tb_cols {
+                                        if ui
+                                            .selectable_label(
+                                                self.settings.grid_cols == cols,
+                                                format!("{cols} 列"),
+                                            )
+                                            .clicked()
+                                            && self.settings.grid_cols != cols
+                                        {
+                                            self.settings.grid_cols = cols;
+                                            self.settings.save();
+                                        }
+                                    }
+                                });
                         }
                     }
                     first_section = false;
@@ -901,12 +1028,86 @@ impl App {
                     if !first_section {
                         ui.separator();
                     }
-                    ui.label("比率:");
-                    for &aspect in &tb_aspects {
-                        let selected = self.settings.thumb_aspect == aspect;
-                        if ui.selectable_label(selected, aspect.label()).clicked() {
-                            self.settings.thumb_aspect = aspect;
-                            self.settings.save();
+                    toolbar_label(ui, "比率:", 42.0);
+                    let auto_visible = self.settings.toolbar_aspect_auto_visible;
+                    let auto_selected = self.settings.thumb_aspect_auto;
+                    let auto_label = if let Some(current) = self.auto_aspect.current {
+                        format!("自動 ({})", current.label())
+                    } else {
+                        "自動".to_string()
+                    };
+
+                    // 「自動」クリック時の共通処理 (展開 / プルダウン両方から呼ぶ)
+                    fn activate_auto(app: &mut App) {
+                        let was_off = !app.settings.thumb_aspect_auto;
+                        let prev_effective = app.effective_thumb_aspect();
+                        app.settings.thumb_aspect_auto = true;
+                        app.auto_aspect.reset_decision_only();
+                        if was_off {
+                            app.rebuild_auto_aspect_samples_from_loaded();
+                        }
+                        app.maybe_apply_auto_aspect(true);
+                        let new_effective = app.effective_thumb_aspect();
+                        if prev_effective != new_effective {
+                            app.fixup_scroll_for_aspect_change(new_effective);
+                        }
+                        app.settings.save();
+                    }
+                    // 個別比率クリック時の共通処理
+                    fn activate_aspect(app: &mut App, aspect: crate::settings::ThumbAspect) {
+                        if app.settings.thumb_aspect_auto || app.settings.thumb_aspect != aspect {
+                            app.fixup_scroll_for_aspect_change(aspect);
+                        }
+                        app.settings.thumb_aspect_auto = false;
+                        app.settings.thumb_aspect = aspect;
+                        app.settings.save();
+                    }
+
+                    match self.settings.toolbar_aspect_display {
+                        crate::settings::ToolbarSectionDisplay::Buttons => {
+                            if auto_visible
+                                && ui.selectable_label(auto_selected, auto_label).clicked()
+                            {
+                                activate_auto(self);
+                            }
+                            for &aspect in &tb_aspects {
+                                let selected = !self.settings.thumb_aspect_auto
+                                    && self.settings.thumb_aspect == aspect;
+                                if ui.selectable_label(selected, aspect.label()).clicked() {
+                                    activate_aspect(self, aspect);
+                                }
+                            }
+                        }
+                        crate::settings::ToolbarSectionDisplay::Dropdown => {
+                            // 現在の選択ラベル: Auto なら auto_label、それ以外は手動値
+                            let current_text = if self.settings.thumb_aspect_auto {
+                                auto_label.clone()
+                            } else {
+                                self.settings.thumb_aspect.label().to_string()
+                            };
+                            egui::ComboBox::from_id_salt("toolbar_aspect_combo")
+                                .width(120.0)
+                                .selected_text(current_text)
+                                .show_ui(ui, |ui| {
+                                    apply_toolbar_style(ui);
+                                    if auto_visible {
+                                        let resp = ui.selectable_label(auto_selected, &auto_label);
+                                        if resp.clicked() {
+                                            activate_auto(self);
+                                        }
+                                        // separator は auto と他項目両方ある場合のみ
+                                        if !tb_aspects.is_empty() {
+                                            ui.separator();
+                                        }
+                                    }
+                                    for &aspect in &tb_aspects {
+                                        let selected = !self.settings.thumb_aspect_auto
+                                            && self.settings.thumb_aspect == aspect;
+                                        if ui.selectable_label(selected, aspect.label()).clicked() {
+                                            activate_aspect(self, aspect);
+                                        }
+                                    }
+                                });
                         }
                     }
                     first_section = false;
@@ -915,14 +1116,40 @@ impl App {
                     if !first_section {
                         ui.separator();
                     }
-                    ui.label("ソート:");
-                    for &order in &tb_sorts {
-                        let selected = self.settings.sort_order == order;
-                        if ui.selectable_label(selected, order.short_label()).clicked() && !selected
-                        {
-                            self.settings.sort_order = order;
-                            self.settings.save();
-                            toolbar_sort_changed = true;
+                    toolbar_label(ui, "ソート:", 54.0);
+                    match self.settings.toolbar_sort_display {
+                        crate::settings::ToolbarSectionDisplay::Buttons => {
+                            for &order in &tb_sorts {
+                                let selected = self.settings.sort_order == order;
+                                if ui.selectable_label(selected, order.short_label()).clicked()
+                                    && !selected
+                                {
+                                    self.settings.sort_order = order;
+                                    self.settings.save();
+                                    toolbar_sort_changed = true;
+                                }
+                            }
+                        }
+                        crate::settings::ToolbarSectionDisplay::Dropdown => {
+                            let current_text = self.settings.sort_order.short_label().to_string();
+                            egui::ComboBox::from_id_salt("toolbar_sort_combo")
+                                .width(100.0)
+                                .selected_text(current_text)
+                                .show_ui(ui, |ui| {
+                                    apply_toolbar_style(ui);
+                                    for &order in &tb_sorts {
+                                        let selected = self.settings.sort_order == order;
+                                        if ui
+                                            .selectable_label(selected, order.short_label())
+                                            .clicked()
+                                            && !selected
+                                        {
+                                            self.settings.sort_order = order;
+                                            self.settings.save();
+                                            toolbar_sort_changed = true;
+                                        }
+                                    }
+                                });
                         }
                     }
                     first_section = false;
@@ -940,7 +1167,7 @@ impl App {
                         && self.global_search.aggregate;
                     // hover ヒントは disable 中の widget では拾われにくいので
                     // (egui の sense)、有効な「★:」ラベル側に乗せる。
-                    let star_label = ui.label("★:");
+                    let star_label = toolbar_label(ui, "★:", 24.0);
                     if aggregated_search {
                         star_label.hover_tip(
                             "検索結果のコンテナ一覧では★フィルタは適用できません。\nコンテナを開くと有効になります。",
@@ -979,7 +1206,7 @@ impl App {
                     if !first_section {
                         ui.separator();
                     }
-                    ui.label("お気に入り:");
+                    toolbar_label(ui, "お気に入り:", 76.0);
                     if self.settings.favorites.is_empty() {
                         ui.label(egui::RichText::new("(未登録)").weak());
                     } else {
@@ -1005,7 +1232,7 @@ impl App {
                     if !first_section {
                         ui.separator();
                     }
-                    ui.label("タグ:");
+                    toolbar_label(ui, "タグ:", 42.0);
                     let has_target = self.tag_target_path_count() > 0;
                     let tags_snapshot: Vec<_> = self
                         .settings
@@ -1021,6 +1248,7 @@ impl App {
                         }
                     }
                 }
+                });
             });
             ui.add_space(2.0);
         });
@@ -2002,7 +2230,7 @@ impl App {
 
                 let cols = self.settings.grid_cols.max(1);
                 let avail_w = ui.available_width();
-                let height_ratio = self.settings.thumb_aspect.height_ratio();
+                let height_ratio = self.effective_thumb_aspect().height_ratio();
                 let Some((cell_w, cell_h)) = compute_cell_size(avail_w, cols, height_ratio) else {
                     return None;
                 };

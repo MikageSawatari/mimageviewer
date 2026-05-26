@@ -82,6 +82,36 @@ pub enum ResolveStrategy {
 /// をキーに含める。通常フォルダ閲覧とは別空間なので互いを上書きしない。
 pub const CACHE_KEY_SEARCH_REP: &str = "searchrep:";
 
+/// `LoadRequest` から catalog の検索キー (filename) を取り出す。
+///
+/// 優先順位:
+/// 1. `cache_key_override` (フォルダ代表 / ZipFile / PdfFile / pin など)
+/// 2. `pdf_page` → `pdf_page_cache_key(page_num)`
+/// 3. `zip_entry`
+/// 4. fallback: `req.path.file_name()`
+///
+/// `None` を返すのは `req.path` から file_name が取れない異常ケース。
+/// ワーカー本体は空文字 fallback で動くが、`auto_aspect` の seed フェーズは
+/// `None` を skip 対象として使うため Option で返している。
+///
+/// 詳細: [docs/auto-thumb-aspect-plan.md §4.1.2](../../docs/auto-thumb-aspect-plan.md)
+pub fn cache_key_for_request(req: &LoadRequest) -> Option<std::borrow::Cow<'_, str>> {
+    if let Some(ref key) = req.cache_key_override {
+        Some(std::borrow::Cow::Borrowed(key.as_str()))
+    } else if let Some(page_num) = req.pdf_page {
+        Some(std::borrow::Cow::Owned(
+            crate::grid_item::pdf_page_cache_key(page_num),
+        ))
+    } else if let Some(ref name) = req.zip_entry {
+        Some(std::borrow::Cow::Borrowed(name.as_str()))
+    } else {
+        req.path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(std::borrow::Cow::Borrowed)
+    }
+}
+
 /// フォルダ代表サムネの自動選定用 cache key を組み立てる。
 ///
 /// `identity` はフォルダ名または full path。ソート種別・探索深度・アルゴリズム世代を
@@ -574,23 +604,10 @@ pub fn process_load_request(
 ) {
     // 内部関数向けに `&CatalogDb` を取り出しておく (= 既存シグネチャ互換)
     let catalog_ref: Option<&crate::catalog::CatalogDb> = catalog.map(|a| a.as_ref());
-    // カタログキー:
-    // - 通常画像: ファイル名 (例: "foo.jpg")
-    // - ZIP エントリ: エントリ名 (例: "work1/img01.jpg") 丸ごと
-    //   ZIP ごとに別 DB が開かれるため、DB 内で一意
-    // - cache_key_override: フォルダ一覧の ZipFile/PdfFile 用
-    // PDF ページの場合はキー名を生成する必要があるので owned を保持
-    let auto_key: String;
-    let filename: &str = if let Some(ref key) = req.cache_key_override {
-        key.as_str()
-    } else if let Some(page_num) = req.pdf_page {
-        auto_key = crate::grid_item::pdf_page_cache_key(page_num);
-        &auto_key
-    } else if let Some(ref name) = req.zip_entry {
-        name.as_str()
-    } else {
-        req.path.file_name().and_then(|n| n.to_str()).unwrap_or("")
-    };
+    // カタログキーを共通 helper で組み立て (auto_aspect の seed フェーズと共有)。
+    // None ケース (path に file_name が無い等の異常) は既存挙動に合わせて空文字 fallback。
+    let key_cow = cache_key_for_request(req).unwrap_or(std::borrow::Cow::Borrowed(""));
+    let filename: &str = key_cow.as_ref();
 
     let req_t0 = std::time::Instant::now();
     if crate::perf::is_enabled() {

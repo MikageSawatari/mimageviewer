@@ -1118,6 +1118,13 @@ impl App {
         }
         self.scroll_hint.store(0, Ordering::Relaxed);
         self.rebuild_visible_indices();
+        // auto_aspect: invalidate で samples を全クリアしたが、Ctrl+G では preserved
+        // で thumbnails が新 idx に復元されている。Auto モードならそれらから samples を
+        // 再構築 (Codex P3 2026-05)。
+        if self.settings.thumb_aspect_auto {
+            self.rebuild_auto_aspect_samples_from_loaded();
+            self.maybe_apply_auto_aspect(false);
+        }
         // tag_prewarm worker は invalidate_idx_state_and_queues で cancel されているので、
         // 検索結果向けに再起動 + fts_meta から tags_cache を再プリウォーム。
         self.prewarm_grid_tags();

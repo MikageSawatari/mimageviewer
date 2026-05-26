@@ -105,7 +105,7 @@ impl App {
                             self.last_cell_size.round() as i32,
                             self.last_cell_h.round() as i32,
                             self.settings.grid_cols,
-                            self.settings.thumb_aspect.label(),
+                            self.effective_thumb_aspect().label(),
                         ))
                         .small(),
                     );

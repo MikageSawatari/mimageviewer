@@ -1722,8 +1722,12 @@ pub struct App {
     pub(crate) scroll_offset_y: f32,
     /// 前フレームのセル幅（ = avail_w / cols）
     pub(crate) last_cell_size: f32,
-    /// 前フレームのセル高さ（ = last_cell_size * thumb_aspect.height_ratio()）
+    /// 前フレームのセル高さ（ = last_cell_size * effective_thumb_aspect().height_ratio()）
     pub(crate) last_cell_h: f32,
+
+    /// サムネイル比率の自動選択 (`settings.thumb_aspect_auto` が true のときに動く)。
+    /// 詳細: [docs/auto-thumb-aspect-plan.md](../docs/auto-thumb-aspect-plan.md)
+    pub(crate) auto_aspect: crate::auto_aspect::AutoAspectState,
     /// 前フレームのビューポート高さ（カーソルキースクロールに使用）
     pub(crate) last_viewport_h: f32,
     /// true のとき選択セルが見えるようにオフセットを調整する
@@ -3369,6 +3373,7 @@ impl App {
             scroll_offset_y: 0.0,
             last_cell_size: 200.0,
             last_cell_h: 200.0,
+            auto_aspect: crate::auto_aspect::AutoAspectState::default(),
             last_viewport_h: 600.0,
             scroll_to_selected: false,
             last_outer_rect: None,
@@ -3848,6 +3853,347 @@ impl App {
     /// 指定 idx の GridItem から perf 相関キーを生成する (範囲外なら None)。
     pub(crate) fn perf_item_key(&self, idx: usize) -> Option<String> {
         self.items.get(idx).map(|g| g.perf_key())
+    }
+
+    /// 実描画で使うサムネイル比率。
+    ///
+    /// - Manual モード (`settings.thumb_aspect_auto = false`):
+    ///   `settings.thumb_aspect` をそのまま返す
+    /// - Auto モード未確定 (`auto_aspect.current = None`):
+    ///   **常に Square** (1:1 開始の仕様、直前の手動値に引きずられない)
+    /// - Auto モード確定後: `auto_aspect.current`
+    ///
+    /// 設計: [docs/auto-thumb-aspect-plan.md §5.3](../docs/auto-thumb-aspect-plan.md)
+    pub(crate) fn effective_thumb_aspect(&self) -> crate::settings::ThumbAspect {
+        if self.settings.thumb_aspect_auto {
+            self.auto_aspect
+                .current
+                .unwrap_or(crate::settings::ThumbAspect::Square)
+        } else {
+            self.settings.thumb_aspect
+        }
+    }
+
+    /// 既存の `ThumbnailState::Loaded` から `auto_aspect.samples` を再構築する。
+    ///
+    /// ユーザーが UI で「自動」を初めて押したとき、それまで Manual で動いていて
+    /// `poll_thumbnails` の sample 記録経路 (Auto ON 限定) が動いていなかったため、
+    /// `samples` は空のまま。Auto ON 直後にこの関数で既存の Loaded サムネから
+    /// `source_dims` を集めて、即座に判定材料を揃える。
+    ///
+    /// Codex P2 #1 / 2026-05 ユーザー報告: 「自動を選んでもしばらく反応しない」の対応。
+    pub(crate) fn rebuild_auto_aspect_samples_from_loaded(&mut self) {
+        use crate::grid_item::ThumbnailState;
+        // 既存 sample をクリアしてから再構築 (古い folder の残りが混じる可能性は無いが、
+        // 念のため)。current や switches_done など state はそのまま。
+        self.auto_aspect.samples.clear();
+        for (idx, state) in self.thumbnails.iter().enumerate() {
+            if let ThumbnailState::Loaded {
+                source_dims, tex, ..
+            } = state
+            {
+                let ratio = match source_dims {
+                    Some((sw, sh)) if *sw > 0 => *sh as f32 / *sw as f32,
+                    _ => {
+                        // source_dims が無くても、テクスチャ寸法から比率を拾える
+                        // (アスペクト保持リサイズ済みなので比率は保たれる)
+                        let size = tex.size();
+                        if size[0] == 0 {
+                            continue;
+                        }
+                        size[1] as f32 / size[0] as f32
+                    }
+                };
+                if ratio > 0.0 && ratio.is_finite() {
+                    self.auto_aspect.samples.insert(idx, ratio);
+                }
+            }
+        }
+        if !self.auto_aspect.samples.is_empty() {
+            crate::logger::log(format!(
+                "  auto_aspect: rebuilt {} samples from existing Loaded thumbs",
+                self.auto_aspect.samples.len()
+            ));
+        }
+    }
+
+    /// auto_aspect の集計対象母数。**items ベース** で計算 (image_metas ベースでは
+    /// 動画が抜けて動画オンリーフォルダで判定が走らない問題があった、ユーザー報告 +
+    /// Codex P2 #2 2026-05)。
+    ///
+    /// `ZipSeparator` は比率取得対象でないので除外、それ以外 (Image / Video /
+    /// ZipImage / PdfPage / Folder / ZipFile / PdfFile) は代表サムネ経由で
+    /// `source_dims` がいずれ来る可能性があるので分母に入れる。
+    pub(crate) fn auto_aspect_eligible_total(&self) -> usize {
+        self.items
+            .iter()
+            .filter(|it| !matches!(it, GridItem::ZipSeparator { .. }))
+            .count()
+    }
+
+    /// `auto_aspect` を新フォルダ用にリセットし、catalog の既存比率を一括投入する。
+    ///
+    /// 呼び出し位置: `start_loading_items` 内の `delete_missing()` 完了後、
+    /// `spawn_thumbnail_workers()` 起動前。設計: [docs/auto-thumb-aspect-plan.md §4.1.2](../docs/auto-thumb-aspect-plan.md)
+    ///
+    /// 動画は `image_metas[idx] = None` で `make_load_request` も `None` を返すため
+    /// 初期 seed では拾えない。`poll_thumbnails` 経路で動画サムネ完了通知を受けた
+    /// ときに `record_aspect_sample` で集計される。
+    pub(crate) fn reset_and_seed_auto_aspect(
+        &mut self,
+        cache_map: &Arc<
+            std::sync::RwLock<std::collections::HashMap<String, crate::catalog::CacheEntry>>,
+        >,
+    ) {
+        let generation = self.items_generation;
+        self.auto_aspect.reset_for_new_generation(generation);
+
+        // Auto モードでなければ seed する意味はない (samples は使われない)
+        if !self.settings.thumb_aspect_auto {
+            return;
+        }
+
+        // 集計対象母数は items ベース (動画含む、ZipSeparator 除外)。
+        let eligible_total: usize = self.auto_aspect_eligible_total();
+        if eligible_total == 0 {
+            return;
+        }
+        let min_samples = crate::auto_aspect::min_samples_for(eligible_total);
+        let mut probe_budget: usize = min_samples.saturating_mul(2);
+        let use_full_path_keys = self.use_full_path_cache_keys();
+
+        // staged: (idx, ratio) を guard 内で集めて、guard を落としてから state 更新
+        let mut staged: Vec<(usize, f32)> = Vec::new();
+        {
+            let Ok(map) = cache_map.read() else {
+                return;
+            };
+            for (idx, item) in self.items.iter().enumerate() {
+                if staged.len() >= min_samples {
+                    break;
+                }
+                let Some((mtime, file_size)) = self.image_metas.get(idx).and_then(|m| *m) else {
+                    continue;
+                };
+                let Some(req) = make_load_request(
+                    item,
+                    idx,
+                    mtime,
+                    file_size,
+                    false,
+                    self.pdf_current_password.as_deref(),
+                    Some(self.settings.folder_thumb_sort),
+                    self.settings.folder_thumb_depth,
+                    &self.folder_pin_map,
+                    self.folder_thumb_pin_db.as_deref(),
+                    self.video_pin_db.as_ref(),
+                    use_full_path_keys,
+                ) else {
+                    continue;
+                };
+                let Some(key) = crate::thumb_loader::cache_key_for_request(&req) else {
+                    continue;
+                };
+                let Some(entry) = map.get(key.as_ref()) else {
+                    continue;
+                };
+                // worker と同じ cache hit 判定: mtime + file_size 一致。
+                // make_load_request が container pin で leaf 側に書き換えることがあるため
+                // `req.mtime` / `req.file_size` を比較対象に使う (= worker と同じ参照点)。
+                if entry.mtime != req.mtime || entry.file_size != req.file_size {
+                    continue;
+                }
+                let ratio = match entry.source_dims {
+                    Some((w, h)) if w > 0 => h as f32 / w as f32,
+                    Some(_) => continue,
+                    None if probe_budget > 0 => {
+                        probe_budget -= 1;
+                        // 旧 cache 救済: メモリ上の WebP/JPEG ヘッダだけ読む (追加 I/O なし)
+                        let Some((w, h)) = crate::catalog::decode_thumb_dims(&entry.jpeg_data)
+                        else {
+                            continue;
+                        };
+                        if w == 0 {
+                            continue;
+                        }
+                        h as f32 / w as f32
+                    }
+                    None => continue,
+                };
+                staged.push((idx, ratio));
+            }
+        } // ← read guard が落ちる
+
+        if !staged.is_empty() {
+            crate::logger::log(format!(
+                "  auto_aspect seed: {} samples staged (eligible_total={}, min={})",
+                staged.len(),
+                eligible_total,
+                min_samples
+            ));
+        }
+        for (idx, ratio) in staged {
+            self.auto_aspect.samples.insert(idx, ratio);
+        }
+        // seed 直後に即決判定 (= 十分量取れていれば最初の描画前に確定)
+        self.maybe_apply_auto_aspect(true);
+    }
+
+    /// 比率の自動切替の判定。
+    ///
+    /// 設計: [docs/auto-thumb-aspect-plan.md §4.4](../docs/auto-thumb-aspect-plan.md)
+    /// 6 段ゲート:
+    /// 1. Auto モード ON
+    /// 2. 切替上限 (`switches_done < 2`)
+    /// 3. 入力 idle (`last_input_at + 500ms` 経過)
+    /// 4. サンプル下限到達 (`min_samples_for`)
+    /// 5. 連勝継続 (`750ms` または `+8 サンプル`)
+    /// 6. cooldown (`last_switch_at + 2 秒` 経過)
+    ///
+    /// `immediate=true` の場合は **入力 idle ゲート (3) と連勝継続ゲート (5) を
+    /// パス**して即決する。seed 直後 (フォルダ load 直後) と UI で「自動」を
+    /// 明示クリックした直後の経路で使う (= ユーザー認知できる明確な操作トリガ
+    /// なので待つ必要がない)。Codex P3 #1 対応 (2026-05): 以前は
+    /// `last_input_at.is_none()` で判定していたが、フォルダクリックで開いた
+    /// 直後は `last_input_at = Some` で seed 即決が効かなかった。
+    pub(crate) fn maybe_apply_auto_aspect(&mut self, immediate: bool) {
+        if !self.settings.thumb_aspect_auto {
+            return;
+        }
+        if self.auto_aspect.switches_done >= 2 {
+            return;
+        }
+        let now = std::time::Instant::now();
+
+        // Gate 3: 入力 idle 500ms。immediate=true (seed / 「自動」クリック直後) はパス。
+        const INPUT_IDLE_GUARD: std::time::Duration = std::time::Duration::from_millis(500);
+        if !immediate
+            && let Some(t) = self.last_input_at
+            && now.duration_since(t) < INPUT_IDLE_GUARD
+        {
+            return;
+        }
+
+        // Gate 6: cooldown 2 秒
+        const SWITCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+        if let Some(t) = self.auto_aspect.last_switch_at
+            && now.duration_since(t) < SWITCH_COOLDOWN
+        {
+            return;
+        }
+
+        // 集計対象母数は items ベース (動画含む、ZipSeparator 除外)。seed と同じ helper。
+        let eligible_total: usize = self.auto_aspect_eligible_total();
+        if eligible_total == 0 {
+            return;
+        }
+
+        // 現在の effective 比率 (auto モードで未確定なら Square)
+        let current = self.effective_thumb_aspect();
+
+        // log_margin = 0.10 を初期値とする (実機チューン対象)
+        const LOG_MARGIN: f32 = 0.10;
+
+        // 純関数で判定。samples は HashMap なので Vec に展開して渡す。
+        let samples: Vec<f32> = self.auto_aspect.samples.values().copied().collect();
+        let decision =
+            crate::auto_aspect::decide_auto_aspect(&samples, eligible_total, current, LOG_MARGIN);
+        let crate::auto_aspect::AspectDecision::Switch(new_aspect) = decision else {
+            // Hold → streak 維持はしない。
+            self.auto_aspect.streak = None;
+            // 「auto.current = None (未確定) + サンプル下限到達 + Hold」の場合、
+            // UI が「自動」とだけ表示されて「自動 (1:1)」のような確定表示にならない
+            // (2026-05 ユーザー報告 + Codex P2)。Hold の理由は 2 通り:
+            //   (a) best == current (= 完全一致でこれ以上良いバケット無し)
+            //   (b) 別バケットが median に近いが改善幅が LOG_MARGIN 未満
+            // どちらも「現状 effective が妥当」という結論。current を effective と同じ
+            // バケットに確定させる (= スクロール補正不要、表示比率は変わらない)。
+            //
+            // 表示変化を伴わない no-op 確定なので、switches_done と last_switch_at は
+            // 消費しない (Codex P3): これらは「ユーザーから見える切替」の予算であり、
+            // 内部的な未確定→確定遷移は本来抑えたい挙動ではない。確定後に分布が
+            // 大きく動いて別バケットへ切替が必要になったとき、最大 2 切替の予算は
+            // フルに残っている方が自然。
+            if self.auto_aspect.current.is_none()
+                && samples.len() >= crate::auto_aspect::min_samples_for(eligible_total)
+                && crate::auto_aspect::pick_best(&samples).is_some()
+            {
+                self.auto_aspect.current = Some(current);
+                crate::logger::log(format!(
+                    "  auto_aspect: confirmed (no visible change) {} (samples={})",
+                    current.label(),
+                    samples.len()
+                ));
+            }
+            return;
+        };
+
+        // Gate 5: 連勝継続判定。同じ候補が「750ms または +8 サンプル」勝ち続けたら採用。
+        // immediate=true (seed / 「自動」クリック直後) は streak を待たず即採用。
+        const STREAK_DURATION: std::time::Duration = std::time::Duration::from_millis(750);
+        const STREAK_SAMPLES_DELTA: usize = 8;
+        let cur_samples = self.auto_aspect.samples.len();
+        let streak_ok = if immediate {
+            true
+        } else {
+            match self.auto_aspect.streak {
+                Some((cand, since, samples_at_start)) if cand == new_aspect => {
+                    let elapsed = now.duration_since(since);
+                    let delta = cur_samples.saturating_sub(samples_at_start);
+                    elapsed >= STREAK_DURATION || delta >= STREAK_SAMPLES_DELTA
+                }
+                _ => {
+                    // 候補が変わった or 初登場 → streak を新規開始
+                    self.auto_aspect.streak = Some((new_aspect, now, cur_samples));
+                    false
+                }
+            }
+        };
+        if !streak_ok {
+            return;
+        }
+
+        // ── 切替を適用 ──
+        let old = current;
+        self.fixup_scroll_for_aspect_change(new_aspect);
+        self.auto_aspect.current = Some(new_aspect);
+        self.auto_aspect.switches_done = self.auto_aspect.switches_done.saturating_add(1);
+        self.auto_aspect.last_switch_at = Some(now);
+        self.auto_aspect.streak = None;
+        crate::logger::log(format!(
+            "  auto_aspect: switched {} -> {} (samples={}, switches_done={})",
+            old.label(),
+            new_aspect.label(),
+            cur_samples,
+            self.auto_aspect.switches_done
+        ));
+    }
+
+    /// セル比率変更時に「画面先頭に最も近い行」を維持するよう `scroll_offset_y` を補正する。
+    /// auto/manual どちらの切替経路からも呼ぶ。
+    ///
+    /// **重要**: 呼び出し直後に `last_cell_h` を即更新する (= 同フレーム内の二重呼出しを
+    /// no-op にする)。これが無いと、UI 経路 (Manual→Auto クリック) と内部経路
+    /// (maybe_apply の Switch) が同フレームで両方呼ばれたときに、後者が旧 last_cell_h を
+    /// 基準に anchor_row を再計算してスクロール位置がずれる。
+    ///
+    /// 設計: [docs/auto-thumb-aspect-plan.md §6](../docs/auto-thumb-aspect-plan.md)
+    pub(crate) fn fixup_scroll_for_aspect_change(
+        &mut self,
+        new_aspect: crate::settings::ThumbAspect,
+    ) {
+        let old_cell_h = self.last_cell_h.max(1.0);
+        let new_cell_h = (self.last_cell_size * new_aspect.height_ratio())
+            .round()
+            .max(1.0);
+        if (new_cell_h - old_cell_h).abs() < 0.5 {
+            return;
+        }
+        let anchor_row = (self.scroll_offset_y / old_cell_h).floor();
+        self.scroll_offset_y = anchor_row * new_cell_h;
+        // 二重呼び出し対策: last_cell_h を即更新。次の描画フレームでも ui_main.rs が
+        // 再度 compute_cell_size → last_cell_h 更新するので冪等。
+        self.last_cell_h = new_cell_h;
     }
 
     /// items と thumbnails を常にセットで push するヘルパー (docs §10.4.2)。
@@ -7370,6 +7716,11 @@ impl App {
             );
         }
 
+        // ── auto_aspect: items 世代リセット + catalog 既存比率の seed ──
+        // delete_missing 完了後 / spawn_thumbnail_workers 起動前のこの位置で呼ぶ。
+        // この時点で self.items / image_metas / cache_map がすべて確定済み。
+        self.reset_and_seed_auto_aspect(&cache_map);
+
         // ── 進捗カウンタリセット + 共有 display_px 更新 ──
         self.cache_gen_total = 0;
         self.cache_gen_done = Arc::new(AtomicUsize::new(0));
@@ -8172,6 +8523,15 @@ impl App {
         }
         self.ai_upscale_pending.clear();
 
+        // auto_aspect.samples は idx キーなので、items の削除/差替えで idx が
+        // 変わると古い比率や消えた item の比率が残る (Codex P3 2026-05)。
+        // 削除は稀 + 新規 Loaded ですぐ復旧するので、簡単のため samples と
+        // streak を全クリアする。`current` / `switches_done` / `last_switch_at`
+        // は同じフォルダ内の継続性として残す (= 差替え経路でも一度確定した
+        // 自動比率が消えない)。
+        self.auto_aspect.samples.clear();
+        self.auto_aspect.streak = None;
+
         // タグプリウォーム: idx-keyed な queued 集合 + worker handle。worker は旧 idx の
         // 画像パスを参照し続けるので、items 差し替え・削除のどちらでも取り消す。
         // 再 spawn は呼び出し元 (replace_search_view_items / 削除まとめ後) の責務。
@@ -8272,6 +8632,14 @@ impl App {
         }
 
         self.rebuild_visible_indices();
+
+        // auto_aspect: invalidate で samples を全クリアしたが、削除後も残存 thumbnails
+        // (= 削除されなかった item の Loaded サムネ) がある。Auto モードならそれらから
+        // samples を再構築する (Codex P3 2026-05)。
+        if self.settings.thumb_aspect_auto {
+            self.rebuild_auto_aspect_samples_from_loaded();
+            self.maybe_apply_auto_aspect(false);
+        }
     }
 
     /// 削除ワーカーを spawn し、`delete_pending` に保持する。
@@ -9617,6 +9985,19 @@ impl App {
                             source_dims,
                         };
                         textures_created += 1;
+                        // auto_aspect: 新規 Loaded のタイミングで比率サンプルを記録。
+                        // source_dims が None なら ColorImage の (w, h) を fallback として使う
+                        // (動画 Shell サムネ / 旧 cache 由来などで source_dims が無いケース)。
+                        if self.settings.thumb_aspect_auto {
+                            let ratio = match source_dims {
+                                Some((sw, sh)) if sw > 0 => sh as f32 / sw as f32,
+                                _ if w > 0 => h as f32 / w as f32,
+                                _ => -1.0,
+                            };
+                            if ratio > 0.0 && ratio.is_finite() {
+                                self.auto_aspect.samples.insert(i, ratio);
+                            }
+                        }
                         // 第2シグナル先着の場合の遅延 requested.remove を実行。
                         if self.pending_finalize.remove(&i) {
                             self.requested.remove(&i);
@@ -9717,6 +10098,12 @@ impl App {
             ));
             ctx.request_repaint();
         }
+        // auto_aspect: 新規 Loaded で samples が増えた可能性があるので切替判定。
+        // 6 段ゲート (mode / switches_done / input idle / min_samples / streak / cooldown) は
+        // maybe_apply_auto_aspect 内部で行う。received==0 でも streak の時間ベース継続を
+        // 評価する必要があるので無条件に呼ぶ (内部の早期 return が安価)。
+        // 通常の poll 経路は streak 連勝を要求するので immediate=false。
+        self.maybe_apply_auto_aspect(false);
     }
 
     /// 段階 B: ページ単位先読み + eviction のメインロジック。
@@ -19686,6 +20073,55 @@ impl eframe::App for App {
         self.update_scroll_settle_state();
         // PDF pool snapshot を 1 秒に 1 回 emit (pool 未初期化なら no-op)。
         self.maybe_emit_pool_queue_snapshot();
+
+        // auto_aspect: 時間ゲート (streak / input idle / cooldown) で
+        // `maybe_apply_auto_aspect` が早期 return すると、UI イベントが無いと再評価
+        // されない (= マウス動かすまで反応しない問題)。ゲートのうち最短の残り時間で
+        // 再描画を予約する (Codex P2 + 2026-05 ユーザー報告)。
+        if self.settings.thumb_aspect_auto && self.auto_aspect.switches_done < 2 {
+            const STREAK_DURATION: std::time::Duration = std::time::Duration::from_millis(750);
+            const INPUT_IDLE_GUARD: std::time::Duration = std::time::Duration::from_millis(500);
+            const SWITCH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
+            let now = std::time::Instant::now();
+            let mut next_wait: Option<std::time::Duration> = None;
+            let mut update_wait = |dur: std::time::Duration| match next_wait {
+                None => next_wait = Some(dur),
+                Some(cur) if dur < cur => next_wait = Some(dur),
+                _ => {}
+            };
+
+            // streak は **残り時間が正のときだけ**予約候補に入れる。expired (= 0ms)
+            // を候補に入れると、他 gate (input idle / cooldown) がまだブロック中の
+            // 状況で「streak 0ms → 即時 repaint → 次フレでも streak 0ms」のループに
+            // なる (Codex P2 2026-05)。expired ならどうせ他 gate 解除時の評価で
+            // 拾われるか、新サムネ着弾時の poll_thumbnails で拾われる。
+            if let Some((_, since, _)) = self.auto_aspect.streak {
+                let elapsed = since.elapsed();
+                if elapsed < STREAK_DURATION {
+                    update_wait(STREAK_DURATION - elapsed);
+                }
+            }
+            if let Some(t) = self.last_input_at {
+                let elapsed = now.duration_since(t);
+                if elapsed < INPUT_IDLE_GUARD {
+                    update_wait(INPUT_IDLE_GUARD - elapsed);
+                }
+            }
+            if let Some(t) = self.auto_aspect.last_switch_at {
+                let elapsed = now.duration_since(t);
+                if elapsed < SWITCH_COOLDOWN {
+                    update_wait(SWITCH_COOLDOWN - elapsed);
+                }
+            }
+
+            // この時点で next_wait は必ず正の値 (= 各 gate で `elapsed < GUARD` のとき
+            // だけ update_wait を呼んでいる)。0 値は streak expired を除外する修正で
+            // 通らなくなったので、常に request_repaint_after で OK。
+            if let Some(d) = next_wait {
+                ctx.request_repaint_after(d);
+            }
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

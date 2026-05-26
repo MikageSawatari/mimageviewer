@@ -1,6 +1,7 @@
 use super::*;
 use crate::settings::{
-    self, CachePolicy, Parallelism, SortOrder, SpreadMode, ThumbAspect, UiTheme,
+    self, CachePolicy, Parallelism, SortOrder, SpreadMode, ThumbAspect, ToolbarSectionDisplay,
+    UiTheme,
 };
 
 pub(super) fn page_theme(ui: &mut egui::Ui, state: &mut PreferencesState) {
@@ -119,11 +120,24 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     // 動作には影響しない。
     let _ = &mut s.show_toolbar_vst3; // 未使用警告抑制
 
+    // セクションごとの「展開 / プルダウン」表示形式選択 helper。
+    // Buttons (= 展開): 既存挙動、横並びの selectable_label 群。
+    // Dropdown (= プルダウン): ComboBox 1 個。スペース節約用。
+    fn display_radio(ui: &mut egui::Ui, value: &mut ToolbarSectionDisplay) {
+        ui.horizontal(|ui| {
+            ui.label("表示:");
+            for &opt in ToolbarSectionDisplay::all() {
+                ui.radio_value(value, opt, opt.label());
+            }
+        });
+    }
+
     // ── 列 ──
     ui.add_space(6.0);
     ui.separator();
     ui.add_space(2.0);
     ui.label(egui::RichText::new("列").strong());
+    display_radio(ui, &mut s.toolbar_cols_display);
     ui.horizontal_wrapped(|ui| {
         for cols in 1..=10usize {
             let mut checked = s.toolbar_cols_items.contains(&cols);
@@ -143,7 +157,10 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.separator();
     ui.add_space(2.0);
     ui.label(egui::RichText::new("比率").strong());
+    display_radio(ui, &mut s.toolbar_aspect_display);
     ui.horizontal_wrapped(|ui| {
+        // 「自動」項目 (常時 7 種より前に表示)。デフォルト ON。
+        ui.checkbox(&mut s.toolbar_aspect_auto_visible, "自動");
         for &aspect in ThumbAspect::all() {
             let mut checked = s.toolbar_aspect_items.contains(&aspect);
             if ui.checkbox(&mut checked, aspect.label()).changed() {
@@ -164,6 +181,7 @@ pub(super) fn page_toolbar(ui: &mut egui::Ui, state: &mut PreferencesState) {
     ui.separator();
     ui.add_space(2.0);
     ui.label(egui::RichText::new("ソート").strong());
+    display_radio(ui, &mut s.toolbar_sort_display);
     ui.horizontal_wrapped(|ui| {
         for &order in SortOrder::all() {
             let mut checked = s.toolbar_sort_items.contains(&order);

@@ -1,6 +1,17 @@
 use std::sync::Arc;
 
 pub const USER_TEXT_FAMILY_NAME: &str = "miv-user-text";
+/// ツールバー専用フォント family。Yu Gothic/Meiryo の glyph が egui の line box 内で
+/// 視覚的に上寄りに見える問題 (Codex 助言 2026-05) を `FontTweak.y_offset` で補正する。
+/// ComboBox / Button などのツールバー widget 内 text を 1px 下に寄せて、widget の
+/// 縦中央に視覚的に揃える。
+pub const TOOLBAR_TEXT_FAMILY_NAME: &str = "miv-toolbar-text";
+/// ツールバー用日本語フォントの y_offset (line box 内で文字を下に寄せる、ピクセル単位)。
+/// 正の値で下方向。実機調整 (Yu Gothic Medium, 2026-05):
+///   1.5 → まだ上寄り
+///   3.5 → 中央寄り (現在採用値)
+/// 環境やフォントによってさらに調整が必要なら 1px 単位で動かす。
+const TOOLBAR_Y_OFFSET: f32 = 3.5;
 const DERIVED_Y_OFFSET_CLAMP: f32 = 0.24;
 
 const JAPANESE_FONT_PATHS: &[&str] = &[
@@ -130,10 +141,32 @@ pub fn install_mimageviewer_fonts(fonts: &mut egui::FontDefinitions) {
         &mut user_text_fonts,
         user_text_fallback_names.iter().cloned(),
     );
-    extend_unique(&mut user_text_fonts, base_proportional);
+    extend_unique(&mut user_text_fonts, base_proportional.clone());
     fonts.families.insert(
         egui::FontFamily::Name(Arc::<str>::from(USER_TEXT_FAMILY_NAME)),
         user_text_fonts,
+    );
+
+    // ツールバー専用 family: 先頭に y_offset 補正済みの "japanese_toolbar"、
+    // 残りは通常の fallback で埋める (= 絵文字や記号の挙動は通常 family と同じ)。
+    //
+    // ⚠ Codex P2 (2026-05): Yu Gothic / Meiryo / MS Gothic が見つからない環境では
+    // japanese_toolbar が登録されないが、family 自体は ui_main.rs から常に参照される
+    // ため、family を登録しないと egui が「family is not bound to any fonts」で panic
+    // する。japanese_toolbar が無いときは通常の primary fallback (= "japanese" など)
+    // にフォールバックさせて family は **常に**登録する。
+    let mut toolbar_fonts = Vec::new();
+    if fonts.font_data.contains_key("japanese_toolbar") {
+        toolbar_fonts.push("japanese_toolbar".to_owned());
+    } else {
+        // 日本語フォント未登録環境: primary (= 通常 family の先頭) にフォールバック
+        extend_unique(&mut toolbar_fonts, primary_names.iter().cloned());
+    }
+    extend_unique(&mut toolbar_fonts, user_text_fallback_names.iter().cloned());
+    extend_unique(&mut toolbar_fonts, base_proportional);
+    fonts.families.insert(
+        egui::FontFamily::Name(Arc::<str>::from(TOOLBAR_TEXT_FAMILY_NAME)),
+        toolbar_fonts,
     );
 }
 
@@ -145,6 +178,17 @@ fn install_japanese_font(fonts: &mut egui::FontDefinitions) -> Option<FontAlignm
         let alignment_target = font_center_y_for_samples(&data, &['今', 'あ'])
             .or_else(|| font_metric_center_y(&data))
             .map(|center_y| FontAlignmentTarget { center_y });
+        // ツールバー専用は同じデータに `y_offset` だけ載せたバリアント。
+        // 元データは普通の "japanese" として登録、tweak 版は "japanese_toolbar"。
+        fonts.font_data.insert(
+            "japanese_toolbar".to_owned(),
+            Arc::new(
+                egui::FontData::from_owned(data.clone()).tweak(egui::FontTweak {
+                    y_offset: TOOLBAR_Y_OFFSET,
+                    ..Default::default()
+                }),
+            ),
+        );
         fonts.font_data.insert(
             "japanese".to_owned(),
             Arc::new(egui::FontData::from_owned(data)),

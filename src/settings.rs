@@ -221,6 +221,35 @@ impl ThumbAspect {
 }
 
 // -----------------------------------------------------------------------
+// ツールバーセクションの表示形式
+// -----------------------------------------------------------------------
+
+/// ツールバーの各セクション (列 / 比率 / ソート) の表示形式。
+///
+/// `Buttons`: 横並びの `selectable_label` 群 (既存挙動)。すべての選択肢が常時見える。
+/// `Dropdown`: `ComboBox` 1 個。選択中ラベルだけ常時表示、開いたとき選択肢が出る。
+///
+/// プルダウンは「たまに変えるが選択肢を一覧したい」用途のスペース節約用。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Default)]
+pub enum ToolbarSectionDisplay {
+    #[default]
+    Buttons,
+    Dropdown,
+}
+
+impl ToolbarSectionDisplay {
+    pub fn all() -> &'static [Self] {
+        &[Self::Buttons, Self::Dropdown]
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Buttons => "展開",
+            Self::Dropdown => "プルダウン",
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // SortOrder
 // -----------------------------------------------------------------------
 
@@ -523,8 +552,15 @@ pub struct RecentApp {
 pub struct Settings {
     #[serde(default = "default_grid_cols")]
     pub grid_cols: usize,
+    /// ユーザーが手動で選んだ比率。Auto モードでも **書き換えない**
+    /// (= Manual に戻したときに直前の手動値が復活するよう保持)。
+    /// Auto 未確定時の effective 値ではない (= `App::effective_thumb_aspect` 参照)。
     #[serde(default)]
     pub thumb_aspect: ThumbAspect,
+    /// 比率の自動選択モード。`true` でフォルダ内容に合わせて自動切替。
+    /// デフォルト `false` (既存ユーザー保護)。詳細: [docs/auto-thumb-aspect-plan.md](../../docs/auto-thumb-aspect-plan.md)
+    #[serde(default)]
+    pub thumb_aspect_auto: bool,
     #[serde(default)]
     pub favorites: Vec<FavoriteEntry>,
     #[serde(default)]
@@ -717,6 +753,20 @@ pub struct Settings {
     /// ツールバーに表示するアスペクト比の選択肢
     #[serde(default = "default_toolbar_aspect_items")]
     pub toolbar_aspect_items: Vec<ThumbAspect>,
+    /// ツールバーに「自動」項目を表示するか (デフォルト: true)。
+    /// `toolbar_aspect_items` は 7 種のバケットを管理するが、「自動」は別フラグで
+    /// 制御する (UI 上は同じセクションにチェックボックスとして並ぶ)。
+    #[serde(default = "default_toolbar_aspect_auto_visible")]
+    pub toolbar_aspect_auto_visible: bool,
+    /// ツールバー「列」セクションの表示形式 (展開 / プルダウン)。
+    #[serde(default)]
+    pub toolbar_cols_display: ToolbarSectionDisplay,
+    /// ツールバー「比率」セクションの表示形式 (展開 / プルダウン)。
+    #[serde(default)]
+    pub toolbar_aspect_display: ToolbarSectionDisplay,
+    /// ツールバー「ソート」セクションの表示形式 (展開 / プルダウン)。
+    #[serde(default)]
+    pub toolbar_sort_display: ToolbarSectionDisplay,
     /// ツールバーに表示するソート順の選択肢
     #[serde(default = "default_toolbar_sort_items")]
     pub toolbar_sort_items: Vec<SortOrder>,
@@ -1513,6 +1563,9 @@ fn default_toolbar_cols_items() -> Vec<usize> {
 fn default_toolbar_aspect_items() -> Vec<ThumbAspect> {
     ThumbAspect::all().to_vec()
 }
+fn default_toolbar_aspect_auto_visible() -> bool {
+    true
+}
 fn default_toolbar_sort_items() -> Vec<SortOrder> {
     SortOrder::all().to_vec()
 }
@@ -1525,6 +1578,7 @@ impl Default for Settings {
         Self {
             grid_cols: default_grid_cols(),
             thumb_aspect: ThumbAspect::default(),
+            thumb_aspect_auto: false,
             favorites: Vec::new(),
             last_folder: None,
             window_pos: None,
@@ -1577,6 +1631,10 @@ impl Default for Settings {
             rating_filter: default_rating_filter(),
             toolbar_cols_items: default_toolbar_cols_items(),
             toolbar_aspect_items: default_toolbar_aspect_items(),
+            toolbar_aspect_auto_visible: default_toolbar_aspect_auto_visible(),
+            toolbar_cols_display: ToolbarSectionDisplay::default(),
+            toolbar_aspect_display: ToolbarSectionDisplay::default(),
+            toolbar_sort_display: ToolbarSectionDisplay::default(),
             toolbar_sort_items: default_toolbar_sort_items(),
             folder_thumb_sort: default_folder_thumb_sort(),
             folder_thumb_depth: default_folder_thumb_depth(),
@@ -4067,6 +4125,55 @@ mod tests {
             assert_eq!(
                 loaded.last_seen_version.as_deref(),
                 Some(env!("CARGO_PKG_VERSION"))
+            );
+        }
+
+        /// `thumb_aspect_auto` の save→load ラウンドトリップ。
+        /// schema migration なしで `#[serde(default)]` のみで永続化されることを確認。
+        #[test]
+        fn thumb_aspect_auto_roundtrip() {
+            let env = setup_backup_env();
+            let _initial = Settings::load();
+            assert!(data_db_path(&env).exists());
+
+            let mut s = Settings::default();
+            s.thumb_aspect_auto = true;
+            s.thumb_aspect = ThumbAspect::Portrait2x3;
+            s.toolbar_aspect_auto_visible = false;
+            s.toolbar_cols_display = ToolbarSectionDisplay::Dropdown;
+            s.toolbar_aspect_display = ToolbarSectionDisplay::Dropdown;
+            s.toolbar_sort_display = ToolbarSectionDisplay::Dropdown;
+            s.save();
+
+            reset_backup_state_for_test();
+            let loaded = Settings::load();
+            assert!(
+                loaded.thumb_aspect_auto,
+                "thumb_aspect_auto should survive roundtrip"
+            );
+            assert!(
+                !loaded.toolbar_aspect_auto_visible,
+                "toolbar_aspect_auto_visible (false override) should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.toolbar_cols_display,
+                ToolbarSectionDisplay::Dropdown,
+                "toolbar_cols_display should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.toolbar_aspect_display,
+                ToolbarSectionDisplay::Dropdown,
+                "toolbar_aspect_display should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.toolbar_sort_display,
+                ToolbarSectionDisplay::Dropdown,
+                "toolbar_sort_display should survive roundtrip"
+            );
+            assert_eq!(
+                loaded.thumb_aspect,
+                ThumbAspect::Portrait2x3,
+                "manual thumb_aspect should also be preserved"
             );
         }
 
