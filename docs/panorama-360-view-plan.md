@@ -1868,12 +1868,12 @@ Ctrl+Wheel = 画像ズーム という運用が確立しているため、これ
 | 入力 | 360 モード中の動作 | 既存動作との関係 |
 | --- | --- | --- |
 | 左ドラッグ | `pointer.delta()` を `(d_yaw, d_pitch) = (-Δx * s, +Δy * s)` (`s = fov_y / viewport_h`) で加算 | 既存: 静止画フルスクリーンで左ドラッグはズーム時のパン。360 中は yaw/pitch に転用 (panorama 自身が pan の意味を持つため自然) |
-| **Ctrl+Wheel** | FOV を加減算。`fov_y = clamp(fov_y * exp(-wheel * 0.15), 0.2, 2.6)` | 既存: 画像ズーム。360 中は FOV にモード依存で意味が切替わる (Ctrl+Wheel = "拡大方向の操作" という直感は保つ) |
-| 通常 Wheel | **奪わない** (= 前後アイテム送り) | 既存挙動維持 |
+| **Wheel (修飾キー不問)** | FOV を加減算。`fov_y = clamp(fov_y * exp(-wheel * 0.0015), 0.2, 2.6)` | 既存: 画像ズーム / 前後送り。360 中は **Ctrl 有無に関わらず常に FOV 操作に転用** (2026-05 ユーザー要望: 拡大縮小のつもりでホイールを回して画像が切り替わる事故を防ぐ)。前後ナビは矢印キーで |
 | 矢印キー | **奪わない** (= フルスクリーンナビ / 動画 seek) | 既存挙動維持 |
-| <kbd>Esc</kbd> | **奪わない** (= フルスクリーン終了) | 360 解除はトグルボタンで行う |
+| <kbd>Esc</kbd> | **奪わない** (= フルスクリーン終了) | フルスクリーン全体を閉じる場合は Esc |
+| **上部バーの × ボタン** | **360 モード OFF** (フルスクリーンは維持) | 2026-05 ユーザー要望で挙動を切替。元設計の「× = フルスクリーン終了」は **360 モード OFF 中のみ**。360 ON 中は × で 360 解除、Esc で全体終了 |
 | ダブルクリック (画像領域内) | yaw/pitch/fov を初期値 (or GPano hint) に戻す | 既存: 動画はトグル再生 (要競合確認)、静止画ではフィット戻し |
-| 既存のフルスクリーン操作 (BS / Ctrl+↑↓ / Enter / Wheel / 矢印) | 通常どおり | フォルダ / ファイル移動は 360 モードフラグを保持。新ファイルが equirect なら yaw/pitch 引き継ぎ、非 equirect なら自動 OFF |
+| 既存のフルスクリーン操作 (BS / Ctrl+↑↓ / Enter / 矢印) | 通常どおり | フォルダ / ファイル移動は 360 モードフラグを保持。新ファイルが equirect なら yaw/pitch 引き継ぎ、非 equirect なら自動 OFF。**Wheel は奪う** (上記参照) |
 
 **pitch のクランプ**: `±(π/2 - 0.001)` を上限にして極を直視できないようにする
 (asin の数値誤差で天井 / 床のテクセルが暴れるのを防ぐ)。
@@ -1881,16 +1881,24 @@ Ctrl+Wheel = 画像ズーム という運用が確立しているため、これ
 **キーボードによる yaw/pitch 操作は実装しない** (矢印が前後ナビと衝突するため)。
 マウス駆動の機能と割り切る。
 
-### 5.3 トグル UI (Codex P1 反映)
+### 5.3 トグル UI (Codex P1 反映 + 2026-05 ユーザー要望反映)
 
-主導線は **ツールバー / 上部ホバーバーの「360°」ボタン**。
+主導線は **ツールバー / 上部ホバーバーの「360°」ボタン** (OFF→ON 経路のみ) + **× ボタン**
+(ON→OFF 経路)。
 
 - **画像フルスクリーンの上部ホバーバーに 360 ボタンを追加** (`ui_fullscreen/draw_icons.rs`
-  の既存アイコンに 1 つ追加)。クリックでトグル
-- ボタンの**表示と有効化条件** (フィードバック反映: 常時表示 + 単一アイコン):
+  の既存アイコンに 1 つ追加)。クリックで 360 モード ON
+- ボタンの**表示と有効化条件**:
+  - **360 モード ON 時は 360 ボタンを隠す** (2026-05 ユーザー要望、× が 360 解除を
+    兼ねるため。元設計の「常時表示 + 強調背景」は廃止)
   - Auto (GPano `UsePanoramaViewer=True` 検出): 通常ボタン + ツールチップ「360° 画像 (XMP 検出) [V]」
   - Hint (GPano `ProjectionType` のみ or アスペクト 2:1): 通常ボタン + ツールチップ「360° ビューワーで開く (アスペクト比から推定) [V]」
   - 検出なし: **disabled 表示** (グレーアウト、押せない)、ツールチップ「360° 画像ではありません」
+- **360 モード OFF 経路** (2026-05 ユーザー要望):
+  - **上部バーの ×**: 360 モード OFF (フルスクリーンは維持)。ツールチップ
+    「360° モードを抜ける (フルスクリーンを閉じるには Esc)」
+  - <kbd>V</kbd> キー: トグル (ON ↔ OFF 両方)
+  - <kbd>Esc</kbd> キー: フルスクリーン全体を閉じる (= 360 も巻き取られて終了)
 - **自動 ON はしない** (フィードバック反映で廃止)。代わりに `open_fullscreen` /
   `poll_metadata_load` / `poll_prefetch` で「V キーで 360° ビューワー」案内
   トーストを 1 度だけ表示。ユーザーは V キーまたはボタンクリックで明示的にトグル
@@ -1940,10 +1948,13 @@ Ctrl+Wheel = 画像ズーム という運用が確立しているため、これ
 
 ### 6.3 退出条件
 
-- ホバーバーの 360 ボタン再クリック → 通常表示に戻る (フルスクリーンは維持)
-- <kbd>Esc</kbd> / フルスクリーン終了 → **既存どおりフルスクリーン全体を閉じる**
-  (360 だけを抜けるのではない、Codex P2 反映)
-- 360 でない画像へナビ → 自動 OFF (panorama_state は保持しつつ非アクティブ化)
+- **上部バーの ×** → 360 モード OFF (フルスクリーンは維持、2026-05 ユーザー要望)。
+  元設計の「× = フルスクリーン終了 / 360 解除は専用ボタン」はユーザーが見つけにくい
+  と判明したため、× を 360 解除に転用。
+- <kbd>V</kbd> キー → トグル (360 ON → OFF 復路)
+- <kbd>Esc</kbd> / システム終了 → **既存どおりフルスクリーン全体を閉じる**。360 中に
+  Esc を押した場合は 360 + フルスクリーン同時終了 (Esc は途中で 360 だけを止めない)
+- 360 でない画像へナビ → 自動 OFF (`panorama_state` は保持しつつ非アクティブ化)
 - 360 モードでない画像へナビした際は、**`panorama_state` を保持しつつ非アクティブ
   化**。次に equirect 画像に戻ったら yaw / pitch / fov を引き継いで再開する。
   (これは「セッション内の 360 表示記憶」程度の軽い扱い。永続化はしない)
@@ -2145,59 +2156,194 @@ WGSL の `select(raw, clamped, cond)` は分岐ではなく **両辺を評価し
 - turbojpeg-sys 部分デコード (iMCU 境界 / u=0/1 跨ぎ / 専用 sampler) — §3.6.6 の通り
   巨大 JPEG 最適化として将来検討
 
-- [ ] `App` フィールド追加: `pano_high_res_source: HashMap<String, HighResSource>` /
+- [x] `App` フィールド追加: `pano_high_res_source: HashMap<String, HighResSource>` /
       `pano_refinement: Option<PanoramaRefinement>` /
       `pano_quality_state: HashMap<String, PanoramaQualityState>` /
       `pano_session_approved_max_pixels: u64` (キーは `metadata_cache_key`、§4.6.1)
-- [ ] **`FsLoadResult::StaticPanorama` variant 追加** (`src/fs_animation.rs`、§4.6.0)
-- [ ] **ヘッダ読みで原寸取得** → `source_pixels <= 200 MP` で SettleReady、それ超え
+      + 追加: `pano_high_res_rx/tx` channel、`pano_high_res_pending`、`pano_banner_remember_session`
+- [x] **`FsLoadResult::StaticPanorama` variant 追加** (`src/fs_animation.rs`、§4.6.0)
+- [x] **ヘッダ読みで原寸取得** → `source_pixels <= 200 MP` で SettleReady、それ超え
       かつ `needs_user_confirmation(source_pixels, approved_max_pixels) == true` で
       NeedsUserConfirmation を初期状態に
       (§3.6.2 / §3.6.4)
-- [ ] `start_fs_load` の 360 分岐:
-  - [ ] **SettleReady / SettleApproved**: image crate でフルデコード 1 回 → 同じ
-        DynamicImage から clamp 版 (= fs_cache) と Arc<Vec<u8>> (= HighResSource::Decoded)
-        を **tee で同時に作る** (二重デコード禁止、Codex P1 第 5 ラウンド反映) →
-        `FsLoadResult::StaticPanorama` で返却
-  - [ ] **NeedsUserConfirmation / BaseOnly**: 通常 `FsLoadResult::Static` のみ返却。
+      - 実装: `start_fs_load` の冒頭で `pano_intent` を作って worker に渡し、worker は
+        `probe_dims` の結果 + intent からその場で tee 判定する。State 設定は
+        `poll_prefetch` 側 (StaticPanorama → SettleReady/SettleApproved、Static →
+        `maybe_update_pano_quality_state_from_static` で NeedsUserConfirmation)。
+- [x] `start_fs_load` の 360 分岐:
+  - [x] **SettleReady / SettleApproved**: image crate でフルデコード 1 回 → 同じ
+        DynamicImage から `into_rgba8()` → Arc<Vec<u8>> (HighResSource::Decoded) +
+        fast_resize で 8K リサイズした ColorImage を作って `FsLoadResult::StaticPanorama` で返却
+  - [x] **NeedsUserConfirmation / BaseOnly**: 通常 `FsLoadResult::Static` のみ返却。
         `pano_high_res_source` にエントリを追加しない
-- [ ] **NeedsUserConfirmation バナー UI**:
-  - [ ] フルスクリーン上部に表示 (動画 HUD と同じ階層)
-  - [ ] 解像度 / MP / 想定 RAM 消費を数値表示 (worst case = W*H*4*2 で計算、§3.6.4.2)
-  - [ ] 「高品質で表示」/「8K でよい」ボタン
-  - [ ] チェックボックス「このセッション中は今後も高品質で開く」(デフォルト OFF)
-  - [ ] 「高品質」選択時: 状態 → SettleApproved、`start_pano_high_res_load(idx)` で
-        追加 worker 起動 (8K base 表示は維持しつつバックグラウンドでフルデコード)
-- [ ] **`PanoramaSettlePolicy` enum + `compute_settle_policy` 実装** (§3.6.2.1、
-      Codex P1 第 10 ラウンド反映):
-  - [ ] `EnabledFromRaw` (補正/AI なし)、`EnabledWithColorAdjustments { params }`
-        (単純色調補正のみ)、`Disabled` (AI 機能 ON / post_filter / auto_mode / source_kind=2,3
-        / raw fs_cache のままで params 非 identity な transient) の 3 値
-  - [ ] `compute_settle_policy(fs_idx, source_kind)` で `ai_feature_active` /
-        `source_kind == 2 || 3` / `params.auto_mode.is_some()` / `params.post_filter`
-        / `source_kind` 連動の `params.is_color_identity()` 判定を順に評価
-        (Codex P1 第 13/14 反映)
-- [ ] **`resolve_pano_source` で実型に合わせて pixels 取得** (§4.3):
-  - [ ] `FsCacheEntry::Static { pixels, .. }` パターンマッチ
-  - [ ] `ai_upscale_cache` のキーは `(idx, bg)`
-  - [ ] adjustment_cache の AI 由来判定で source_kind 1/3 を区別
-- [ ] `settle_enabled(state, policy)` で 2 軸 AND 判定に統一 (§3.6.2.1)
-- [ ] CPU 並列レンダ `render_settle_overlay` + **独自の bilinear sampler**
-      (`sample_bilinear_equirect`、§3.6.3)。**`fast_resize` は矩形リサイズ専用なので
-      流用しない**。シグネチャは `policy: &PanoramaSettlePolicy` で受け、
-      `EnabledWithColorAdjustments` のときだけ **`crate::adjustment::apply_adjustments_fast` を
-      呼ぶ** (独自 LUT 関数を作らず既存 public API を経由、Codex P1 第 11 ラウンド反映)
-- [ ] 静止検出 (500 ms デバウンス)、姿勢変化で reset
-- [ ] バックグラウンド render thread + cancel-token + **mpsc channel** で結果返却
-      (CLAUDE.md「並列処理」セクション準拠、§4.6.2)
-- [ ] 結果受信時に `source_key` + `pose` + **`cache_key`** で stale チェック
-      (Codex P1 第 12 反映: 静止中の補正/AI 切替で古い overlay が残らないこと)
-- [ ] 描画時にも `overlay_cache_key == resolution.cache_key` を確認、不一致なら
-      overlay を drop して 8K base 単独表示に戻す (§4.6.2)
-- [ ] オーバーレイ wgpu テクスチャアップロード + フェードイン 150 ms ブレンド
-- [ ] 退出時のキャッシュ drop 確認 (フル RGBA 最大 2.15 GB がリークしないように)
+- [x] **NeedsUserConfirmation バナー UI** (`draw_pano_confirmation_banner`):
+  - [x] フルスクリーン上部 (上ホバーバー下) に半透明バナー
+  - [x] 解像度 / MP / 想定 RAM 消費 (W*H*4*2 / 1e9) を数値表示
+  - [x] 「高品質で表示」/「8K でよい」ボタン
+  - [x] チェックボックス「このセッション中は今後も高品質で開く」 → `pano_banner_remember_session`
+  - [x] 「高品質」選択時: state → SettleApproved、`start_pano_high_res_load(fs_idx, cache_key)`
+        で worker 起動 + (チェック ON なら) `pano_session_approved_max_pixels = source_pixels`
+- [x] **`PanoramaSettlePolicy` enum + `compute_settle_policy` 実装** (§3.6.2.1):
+  - [x] `EnabledFromRaw` / `EnabledWithColorAdjustments { params }` / `Disabled` 3 値
+  - [x] `ai_feature_active` / `source_kind == AI/AI_ADJUST` / `params.auto_mode.is_some()` /
+        `params.post_filter` / source_kind 連動の `is_color_identity()` 判定を順に評価
+- [x] **`resolve_pano_source` を `settle_policy` 込みに拡張** (§4.3):
+  - [x] `PanoSourceResolution` に `settle_policy: PanoramaSettlePolicy` フィールドを追加
+  - [x] `compute_settle_policy(fs_idx, source_kind)` を呼び込み済み
+- [x] `settle_enabled(state, policy)` で 2 軸 AND 判定 (§3.6.2.1)
+- [x] CPU 並列レンダ `render_settle_overlay` + **独自の bilinear sampler**
+      (`sample_bilinear_equirect`、§3.6.3)。`policy = EnabledWithColorAdjustments` で
+      `crate::adjustment::apply_adjustments_fast(&ci, params)` を再適用。
+      `PanoUvTransform` を入力に取って軸別 half-texel inset clamp を CPU 側でも適用。
+- [x] 静止検出 (500 ms デバウンス、`PanoramaRefinement.settle_since`)、姿勢変化で reset
+- [x] バックグラウンド render thread + cancel-token + **mpsc channel** で結果返却
+      (`spawn_settle_render` / `RenderingHandle` / `SettleRenderResult`、§4.6.2)
+- [x] 結果受信時に `source_key` + `pose` + **`cache_key`** で stale チェック
+      (`update_pano_refinement` 内の 3 軸 guard)
+- [x] 描画時にも `overlay_cache_key == resolution.cache_key` を確認
+      (`PanoramaRefinement::overlay_ok_for(pose, cache_key)`)、不一致なら overlay を skip
+      (= 8K base 単独表示)。settle 再起動で新 cache_key の overlay 生成
+- [x] オーバーレイ wgpu テクスチャアップロード (`upload_settle_overlay` + `SettleOverlayGpu`) +
+      フェードイン 150 ms ブレンド (`SettleOverlayCallback.alpha`)
+- [x] 退出時のキャッシュ drop (`close_fullscreen` / `open_fullscreen` 時に
+      `pano_refinement = None` + `pano_high_res_source.clear()` + `pano_high_res_pending` 全 cancel)
 - [ ] **性能実測**: 4K viewport で 100 ms 以下 (200 MP 以下) / 400 ms 以下 (537 MP)
-      に収まるかをマイルストーン直後に計測
+      に収まるかをマイルストーン直後に計測 (Phase 2a 実装後の TODO)
+
+#### Phase 2a 実装後のフィードバック反映 (2026-05)
+
+ユーザー実機テスト + Codex 第 2 ラウンドレビューで以下を改修:
+
+- **status indicator (`draw_pano_status_indicator`)**: 画面下部中央に「● 高画質 ON
+  (源解像度)」「○ 高画質 待機中」「○ 高画質 描画中…」「○ 8K 表示」等を毎フレ表示。
+  ユーザーが高画質が効いているか目視で確認できるように。`pano_settle_disabled_reason`
+  で OFF の場合の理由 (AI 機能 ON / 自動補正 ON / ポストフィルタ ON / 補正適用待ち) も表示
+- **AI 効力ベース判定 (`ai_will_apply_to(fs_idx)`)**: 設定 ON でもサイズ閾値超で
+  AI がスキップされる画像 (例: 11968×5984 の 360 写真) は AI 由来扱いにせず、settle を
+  有効化。`compute_settle_policy` と `resolve_pano_source` の両方で `ai_feature_active`
+  から `ai_will_apply_to(fs_idx)` に切替
+- **× / V キー / Esc の役割整理 (§5.2 / §5.3 / §6.3 参照)**: 上部バー × が 360 OFF、
+  Esc がフルスクリーン全体終了。360 アイコンは 360 OFF 時のみ表示
+- **ホイール = FOV ズーム (修飾不問)**: 拡大縮小のつもりで画像送りを誤発火する事故を防止
+- **NeedsUserConfirmation バナーの文言改善**: 「高品質で表示」→「フル解像度で閲覧
+  (高画質)」/ 「8K でよい」→「最大 8K で閲覧 (高画質化なし)」、ホバーツールチップ追加
+- **HighResSource の保持ポリシー**: `open_fullscreen` の clear() を **新 idx の
+  source_key だけ残す** retain に変更。prefetch tee 済み画像で settle が永久ロード
+  中になる問題を解消 (Codex P1 第 2)
+- **HighResSource 自動再要求**: `update_pano_refinement` で `can_settle &&
+  !high_res_loaded` を検出したら `start_pano_high_res_load(fs_idx, cache_key)` を
+  自動 kick (cache hit / 戻る経路でも settle 復活、Codex P1 第 2)
+- **viewport-aware settle render**: 出力サイズを viewport の aspect から計算
+  (`compute_pano_settle_output_size`、長辺 1920 で cap)。`RenderingHandle` /
+  `SettleRenderResult` / `PanoramaRefinement` に `viewport_size` を追加し、
+  リサイズで stale 化 (Codex P1 第 2)
+- **SettleOverlay target_format guard**: `UploadedSettleOverlay` に `target_format`
+  を持たせ、`SettleOverlayGpu` 再構築時に既存 overlay を drop (Codex P2 第 2)
+- **XMP 遅延到着時の state 再評価**: `poll_metadata_load` で XMP が現フルスクリーン
+  source_key に到着したら `maybe_update_pano_quality_state_from_static(fs_idx)` を
+  呼んで、partial-FOV equirect (aspect 非 2:1 + 後追い XMP) でも SettleReady を立てる
+  (Codex P2 第 2)
+- **`maybe_update_pano_quality_state_from_static` の挙動拡張**: ≤ 200 MP の 360 候補
+  にも `SettleReady` を立てるよう変更 (元: > 200 MP の NeedsUserConfirmation のみ)。
+  これで late-XMP partial-FOV 画像の settle 経路が動く
+
+#### Codex 第 3 ラウンドレビュー反映 (2026-05)
+
+- **P2: settle overlay の `target_format` guard を描画経路にも追加**:
+  `SettleOverlayCallback::prepare` で `UploadedSettleOverlay.target_format` と
+  `self.target_format` の不一致を検出したら `SettleOverlayRef` を CallbackResources
+  から remove し、その後 paint() で `set_bind_group(古い layout 焼付け)` が走らない
+  よう保証する。元の `upload_settle_overlay` 内 drop と二重保険になり、target_format
+  変化と settle 完了の race を確実に塞ぐ
+- **P2: ZIP / PDF など `GridItem::Image` 以外の 360 候補は `BaseOnly` 固定**:
+  `maybe_update_pano_quality_state_from_static` で `GridItem::Image` 以外なら即
+  `BaseOnly` を入れる。元実装では SettleReady を立てて `update_pano_refinement` の
+  自動 kick → `start_pano_high_res_load` が ZIP/PDF を即 return → status が永久に
+  「高画質 ロード中…」のまま残る問題を解消。ZIP/PDF 内の equirect は Phase 3 拡張で
+  検討
+- **P3: viewport 変化で進行中 render を確実に cancel**: `try_paint_panorama` の
+  `last_viewport_size` 直接代入を **`note_state(pose, cache_key, Some(viewport_size))`**
+  経由に変更。これで viewport サイズ差を検出し、進行中の `RenderingHandle.cancel` を
+  即立てる + `settle_since` を reset する。リサイズ直前の古い render の完了待ちで
+  settle 復帰が遅れる問題を解消
+
+#### Codex 第 5 ラウンドレビュー反映 (15 件指摘の一括対応、2026-05)
+
+Phase 2a 完成後の包括的レビューで 15 件の指摘 (P0-P3) を網羅対応した。以下は
+ハイライト:
+
+- **P0 #1**: `start_pano_high_res_load` worker decode 失敗時の `pano_high_res_pending`
+  リーク。`PanoHighResReady.high_res` を `Option<HighResSource>` に変更し、`SendGuard`
+  Drop で **早期 return / panic 時も必ず `None` を送る**。`pano_high_res_failed: HashSet`
+  で失敗履歴管理。これで「高画質 ロード中…」永久表示を解消
+- **P0 #2**: `pano_refinement = None` 時に settle worker への cancel 信号が抜けていた。
+  `clear_pano_refinement()` ヘルパで cancel.store(true) → drop の順を保証。4 サイト
+  で置換。さらに `wgpu CallbackResources` から `SettleOverlayRef` も remove
+- **P1 #3**: `maybe_update_pano_quality_state_from_static` が `pano_session_approved_max_pixels`
+  を無視していた → 「セッション中ずっと高画質モード」が tee 不採用パスで効かない。
+  `panorama::needs_user_confirmation()` 経由に統一
+- **P1 #4**: `pano_session_approved_max_pixels = source_pixels` 直代入で、後で小さい
+  画像を承認すると stored が下がる。`.max()` で monotonic に
+- **P1 #5**: `poll_pano_high_res` respawn race + `#11` spawn-before-insert TOCTOU を
+  **per-spawn `request_id` 識別子**で根治。`u64` カウンタを毎 spawn 時に発行し、
+  pending + message 両方に焼き付け、poll は `request_id` 一致時のみ処理。ABBA-pattern
+  (close → reopen で同じ source_key + 同じ cache_key の連続 spawn) の stale message
+  race を完全に排除
+- **P1 #6**: `viewport stale` → spawn 判定を `update_pano_refinement` (App::update 中) から
+  `try_spawn_settle_render` (try_paint_panorama 中、`note_state` 後) に切り出して、
+  当フレ最新の viewport で起動判定する設計に
+- **P1 #9 + #10**: ≤8K source で tee 不要 + state cleanup。tee は `source > 8K` 限定、
+  `pano_quality_state` は `close_fullscreen` で SettleReady / failure-induced BaseOnly を
+  drop して unbounded growth + sticky 状態を回避
+- **P1 #13**: `open_fullscreen` None-branch が **全 HighResSource を clear** していた
+  → prefetch 結果を消し飛ばす。None フォールバックは no-op に
+- **P2 #1**: SendGuard が cancel-aware に。cancelled worker は None send をスキップ
+  (= 新 worker の pending を誤って消費しない)
+- **P2 #7**: `pixels.size` fallback (CLAMPED 8K dim) で >200 MP 画像が NeedsUserConfirmation
+  をバイパスする可能性があった。`source_dims` だけ信頼するように
+- **P2 #8 + #12**: NaN / Inf 防御。`sample_bilinear_equirect` は `is_finite()` ガード +
+  `saturating_add` で panic 回避、結果は透明黒。`PanoramaState::sanitize()` を drag /
+  wheel 後に呼び pose が NaN に化けないことを保証。`from_gpano` も `u_scale < 0.001`
+  を identity に倒す
+- **P2 #15**: `ai_will_apply_to` が `fs_cache` のみを参照していた → cache evict 時に
+  AI 有効と誤判定。`adjustment_cache` / `ai_upscale_cache` の fallback を追加
+- **P2 R8 #1 (LRU 1 強化)**: `poll_prefetch` の StaticPanorama を non-fullscreen の場合
+  即 Static にダウングレード (high_res Arc を即 drop)。`start_fs_load` 側でも
+  `is_current_fs == false` なら tee path に入らないよう pano_intent を None に
+  (= 同時並行 prefetch decode の memory peak を解消)
+- **P2 R8 #2 (request_repaint gating)**: `pano_refinement` が Some の間ずっと
+  request_repaint していた → idle 状態でも CPU/GPU を回し続ける。settle render
+  in-flight / overlay fade in / settle_since 経過待ち の 3 条件に絞った。さらに
+  `upload_settle_overlay` で `settle_since = None` に clear して overlay 完成後の
+  永久 repaint も止めた
+
+新規ユニットテスト:
+- `panorama_state_sanitize_replaces_nan` / `panorama_state_new_handles_nan_inputs`:
+  NaN / Inf 入力の正規化
+- `sample_bilinear_equirect_handles_nan_inputs`: NaN / Inf 入力 → 透明黒
+- `uv_transform_returns_none_when_scale_too_small`: u_scale 異常に小さい値を identity に
+- 5 件の `compute_pano_settle_output_size` テスト
+
+#### Codex 第 4 ラウンドレビュー反映 (2026-05)
+
+- **P2 続報: `overlay_ok_for` に `target_format` 軸を追加**:
+  第 3 ラウンドで `SettleOverlayCallback::prepare` 内に format mismatch guard を入れたが、
+  App 側 `overlay_ok_for(pose, cache_key, viewport_size)` は format を見ていないため、
+  format 変化後も「overlay 有効」と判断され続けて `update_pano_refinement` の
+  再 spawn が走らない (= callback が毎フレ skip し、姿勢を変えるまで永久に 8K base
+  単独表示)。
+  - `PanoramaRefinement.overlay_target_format: Option<wgpu::TextureFormat>` を追加
+  - `overlay_ok_for(pose, cache_key, viewport_size, target_format)` に拡張
+  - `upload_settle_overlay` で `target_format` snapshot を焼き込み
+  - `update_pano_refinement` で `wgpu_render_state.target_format` を取得して
+    `overlay_ok_for` に渡す
+  - `try_paint_panorama` も同様に渡す
+  - `static_gpu_rebuilt` 経路 (= format 切替検出) で `overlay_target_format` も
+    `None` に reset
+  - これで format 変化 → 次フレで `overlay_ok_for` が false → `ready_to_render` が
+    500 ms 経過判定で true → 新 format の overlay を CPU + wgpu で再生成する
+  - panorama.rs に `wgpu` を import (元は wgpu 非依存方針だったが、TextureFormat
+    比較のため最小限の依存を許容)
 - [ ] テスト:
   - [ ] **2K ChatGPT 出力**: SettleReady 自動、settle 即実行
   - [ ] **12K Insta360 X3 (72 MP)**: SettleReady 自動、settle 動作

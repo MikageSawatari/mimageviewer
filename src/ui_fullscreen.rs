@@ -1877,6 +1877,10 @@ impl App {
                             // 360 モード中はメタデータ / 補正 / 分析パネルを全て抑止
                             // (docs/panorama-360-view-plan.md フィードバック対応)。
                             // 上部ホバーバーの 360 / × / window だけが表示される。
+                            //
+                            // Phase 2a: NeedsUserConfirmation バナー (§3.6.2 / §3.6.4)。
+                            // 大画像 (>200 MP) で確認待ちのときだけ描画。
+                            self.draw_pano_confirmation_banner(ui, ctx, full_rect, fs_idx);
                         } else if !is_spread_double && !compare_wipe_active {
                             // ── メタデータパネル（通常モード：TABキー固定 or 右端ホバー）──
                             let right_panel_visible =
@@ -3813,8 +3817,10 @@ impl App {
                     self.maybe_rerender_pdf(self.analysis_zoom);
                 }
             } else if self.handle_panorama_wheel_if_active(ctx, wheel_y, ctrl_held) {
-                // 360 度パノラマビュー: Ctrl+Wheel は FOV 調整に転用 (§5.2)。
-                // Ctrl なし Wheel は奪わず、下の `else if !erase_mode` で前後ナビに流す。
+                // 360 度パノラマビュー: ホイールを FOV 調整に転用 (Ctrl 有無に関わらず)。
+                // 2026-05 ユーザー要望: 拡大縮小のつもりでホイールを回して画像が切り替
+                // わる事故を避けるため、360 ON 時はホイール全部 (= 修飾キー無視) を
+                // FOV 操作に振る。前後ナビは矢印キーで行う。
             } else {
                 if ctrl_held {
                     // 通常モード: Ctrl+ホイールでズーム
@@ -4859,6 +4865,8 @@ impl App {
                     // pitch クランプ (極を直視させない)
                     pano.pitch = (pano.pitch + delta.y * sens)
                         .clamp(-crate::panorama::PITCH_LIMIT, crate::panorama::PITCH_LIMIT);
+                    // pose が NaN / Inf に化けないことを保証 (Codex P2 第 5、2026-05)
+                    pano.sanitize();
                     ctx.request_repaint();
                 }
             }
@@ -4871,16 +4879,25 @@ impl App {
         true
     }
 
-    /// 360 度パノラマビューがアクティブで Ctrl+Wheel を処理した場合 true。
-    /// 通常モードの Ctrl+wheel ズームはこの呼び出しが true を返したらスキップする。
-    /// 通常 Wheel (Ctrl なし) は前後ナビとして奪わない設計のため、ここでは扱わない。
+    /// 360 度パノラマビューがアクティブで Wheel を処理した場合 true。
+    ///
+    /// 2026-05 ユーザー要望反映: 360 モード中は **Ctrl 有無に関わらず Wheel を FOV
+    /// 操作に転用**する (= 拡大縮小のつもりで画像送りを誤発火する事故を回避)。
+    /// 前後ナビは矢印 / BS キーで行う。
+    ///
+    /// 元設計 (Ctrl+Wheel のみ FOV、通常 Wheel は前後送り維持) は実機 UX で問題が
+    /// 出たため取り下げた。`_ctrl_held` 引数は呼び出し側のシグネチャ互換のため残置。
     fn handle_panorama_wheel_if_active(
         &mut self,
         ctx: &egui::Context,
         wheel_y: f32,
-        ctrl_held: bool,
+        _ctrl_held: bool,
     ) -> bool {
-        if !ctrl_held || wheel_y.abs() < 0.5 {
+        // 2026-05 ユーザー要望: 360 モード中は **ホイール (修飾なし) も FOV 操作に転用**。
+        // 元設計 (通常 Wheel は前後送り維持、Ctrl+Wheel のみ FOV) はユーザーが
+        // 拡大縮小のつもりでホイールを回して画像が切り替わる事故が多発したため変更。
+        // Ctrl 有無に関わらず、360 ON 時は同じ操作を入れる。
+        if wheel_y.abs() < 0.5 {
             return false;
         }
         let Some(fs_idx) = self.fullscreen_idx else {
@@ -4894,6 +4911,8 @@ impl App {
             let factor = (-wheel_y * 0.0015).exp();
             pano.fov_y =
                 (pano.fov_y * factor).clamp(crate::panorama::FOV_MIN, crate::panorama::FOV_MAX);
+            // pose が NaN / Inf に化けないことを保証 (Codex P2 第 5、2026-05)
+            pano.sanitize();
             ctx.request_repaint();
         }
         true
@@ -4947,8 +4966,10 @@ impl App {
         // Phase 1.5 部分 FOV equirect: GPano `CroppedArea*` 宣言から UV 変換を計算。
         // フル equirect / 宣言なしの画像は IDENTITY (= 恒等変換) になる。
         let uv_transform = self.compute_pano_uv_transform(fs_idx);
+        // `resolution.source_key` を callback に渡すが、後段の status indicator でも
+        // 参照するので clone する。
         let callback = crate::panorama_wgpu::PanoramaShaderCallback {
-            source_key: resolution.source_key,
+            source_key: resolution.source_key.clone(),
             cache_key: resolution.cache_key,
             yaw: pano.yaw,
             pitch: pano.pitch,
@@ -4961,8 +4982,235 @@ impl App {
             image_rect, callback,
         ));
         ui.painter().add(shape);
+
+        // Phase 2a settle overlay (docs/panorama-360-view-plan.md §4.6.3 step 6/7)
+        // 同フレ後段で 8K base の上にフェードイン alpha blend で描画。
+        let pose = (pano.yaw, pano.pitch, pano.fov_y);
+        let now_cache_key = resolution.cache_key;
+        // 現フレの viewport ピクセルサイズ。settle render の出力 aspect 計算と stale check
+        // に使う (Codex P1 第 2、2026-05)。
+        let viewport_size: (u32, u32) = (
+            image_rect.width().round().max(1.0) as u32,
+            image_rect.height().round().max(1.0) as u32,
+        );
+        // **`last_viewport_size` の直接代入ではなく `note_state` 経由**で更新する
+        // (Codex P3 第 3 ラウンド、2026-05): viewport が変わったときに進行中の settle
+        // render を cancel + `settle_since` reset する。直接代入だと差分検出が走らず、
+        // 古い viewport の overlay が完成しても描画時の stale guard で捨てられるだけで、
+        // settle 再起動が次フレ以降にずれる。
+        if let Some(refinement) = self.pano_refinement.as_mut() {
+            refinement.note_state(pose, now_cache_key, Some(viewport_size));
+        }
+        // **当フレ最新の viewport を反映してから settle spawn 判定**を行う
+        // (Codex P1 第 5 ラウンド、2026-05): App::update で動かしていた頃は前フレの
+        // viewport で spawn → 直後 note_state でキャンセル、という無駄サイクルが入っていた。
+        // 本メソッドは paint 中なので最新値で判定できる。
+        self.try_spawn_settle_render(ctx, fs_idx, &resolution);
+        let overlay_payload = self.pano_refinement.as_ref().and_then(|r| {
+            if r.overlay_ok_for(
+                pose,
+                now_cache_key,
+                Some(viewport_size),
+                Some(target_format),
+            ) {
+                let alpha = match r.overlay_fade_start {
+                    Some(start) => {
+                        let elapsed = start.elapsed().as_secs_f32();
+                        (elapsed / 0.15).clamp(0.0, 1.0)
+                    }
+                    None => 1.0,
+                };
+                let overlay = r.overlay.as_ref()?;
+                let gpu = std::sync::Arc::clone(&overlay.gpu);
+                Some((alpha, gpu, r.source_key.clone()))
+            } else {
+                None
+            }
+        });
+        let overlay_drawn = overlay_payload.is_some();
+        let overlay_alpha = overlay_payload.as_ref().map(|(a, _, _)| *a).unwrap_or(0.0);
+        if let Some((alpha, gpu, source_key)) = overlay_payload {
+            let overlay_callback = crate::panorama_wgpu::SettleOverlayCallback {
+                source_key,
+                cache_key: now_cache_key,
+                pose,
+                alpha,
+                target_format,
+                gpu,
+            };
+            ui.painter().add(egui::Shape::Callback(
+                egui_wgpu::Callback::new_paint_callback(image_rect, overlay_callback),
+            ));
+            // フェードイン中は repaint をリクエスト (alpha 1.0 になるまで毎フレ)
+            if alpha < 1.0 {
+                ctx.request_repaint();
+            }
+        }
+        // 高画質モードの status インジケータ (下部中央)。
+        // ユーザーが「いま settle が動いているか」を視覚的に判定できるように。
+        self.draw_pano_status_indicator(
+            ui,
+            image_rect,
+            fs_idx,
+            &resolution,
+            overlay_drawn,
+            overlay_alpha,
+        );
         let _ = ctx;
         true
+    }
+
+    /// 360 度パノラマビュー Phase 2a: 高画質モードの状態を画面下部中央に小さく表示する。
+    /// settle が動いているか / 待機中か / OFF か をユーザーが目で確認できるようにする。
+    #[cfg(windows)]
+    fn draw_pano_status_indicator(
+        &self,
+        ui: &mut egui::Ui,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+        resolution: &crate::panorama::PanoSourceResolution,
+        overlay_drawn: bool,
+        overlay_alpha: f32,
+    ) {
+        use crate::panorama::PanoramaQualityState;
+        let high_res = self.pano_high_res_source.get(&resolution.source_key);
+        let high_res_loaded = high_res.is_some();
+        let policy_enabled = resolution.settle_policy.is_enabled();
+        let state = self.pano_quality_state.get(&resolution.source_key).cloned();
+        let state_allows_settle = matches!(
+            state,
+            Some(PanoramaQualityState::SettleReady) | Some(PanoramaQualityState::SettleApproved)
+        );
+        let rendering = self
+            .pano_refinement
+            .as_ref()
+            .map(|r| r.rendering.is_some())
+            .unwrap_or(false);
+        // 源解像度 (フル RGBA があるならその dim、無ければ fs_cache source_dims)
+        let src_dims: Option<(u32, u32)> = if let Some(hr) = high_res {
+            Some(hr.dims())
+        } else if let Some(crate::fs_animation::FsCacheEntry::Static {
+            source_dims: Some([w, h]),
+            ..
+        }) = self.fs_cache.get(&fs_idx)
+        {
+            Some((*w as u32, *h as u32))
+        } else {
+            None
+        };
+
+        // ステータステキストと色を決定。
+        // 色: 緑=ON / 黄=描画中 or フェードイン / 灰=待機 or OFF
+        let green = egui::Color32::from_rgb(120, 220, 130);
+        let yellow = egui::Color32::from_rgb(255, 210, 110);
+        let gray = egui::Color32::from_rgb(180, 180, 180);
+        let (mark, label, color) = if overlay_drawn {
+            if overlay_alpha >= 0.999 {
+                ("●", "高画質 ON".to_string(), green)
+            } else {
+                (
+                    "●",
+                    format!("高画質 適用中… {:>3.0}%", overlay_alpha * 100.0),
+                    yellow,
+                )
+            }
+        } else if rendering {
+            ("●", "高画質 描画中…".to_string(), yellow)
+        } else if state_allows_settle && policy_enabled && high_res_loaded {
+            ("○", "高画質 待機中 (静止 500ms で発動)".to_string(), gray)
+        } else if state_allows_settle && policy_enabled && !high_res_loaded {
+            ("●", "高画質 ロード中…".to_string(), yellow)
+        } else if matches!(state, Some(PanoramaQualityState::BaseOnly)) {
+            ("○", "最大 8K 表示 (高画質化なし)".to_string(), gray)
+        } else if matches!(
+            state,
+            Some(PanoramaQualityState::NeedsUserConfirmation { .. })
+        ) {
+            (
+                "⚠",
+                "高画質モード 確認待ち (バナー参照)".to_string(),
+                yellow,
+            )
+        } else if !policy_enabled {
+            // settle_policy が Disabled になっている主な理由を推定
+            // (AI 機能 / post_filter / auto_mode / transient)
+            let reason = self.pano_settle_disabled_reason(fs_idx, resolution.source_kind);
+            ("○", format!("高画質 OFF ({reason})"), gray)
+        } else {
+            ("○", "8K 表示".to_string(), gray)
+        };
+
+        // 源解像度補足 (例: " (11968×5984)")
+        let dims_str = match src_dims {
+            Some((w, h)) => format!(" ({w}×{h})"),
+            None => String::new(),
+        };
+        let full_text = format!("{mark} {label}{dims_str}");
+
+        // バッジ矩形 (下部中央、半透明背景)。テキストサイズに合わせて allocate せず
+        // painter.text で先に描いてから背景を計算する手間を避けるため、固定パディングで
+        // テキスト幅を `Galley` から推定する。
+        let font_id = egui::FontId::proportional(13.0);
+        let galley = ui
+            .painter()
+            .layout_no_wrap(full_text.clone(), font_id.clone(), color);
+        let text_size = galley.size();
+        let padding = egui::vec2(12.0, 6.0);
+        let pill_size = text_size + padding * 2.0;
+        let pill_center = egui::pos2(image_rect.center().x, image_rect.bottom() - 28.0);
+        let pill_rect = egui::Rect::from_center_size(pill_center, pill_size);
+        ui.painter().rect_filled(
+            pill_rect,
+            egui::CornerRadius::same(6),
+            egui::Color32::from_black_alpha(180),
+        );
+        ui.painter().rect_stroke(
+            pill_rect,
+            egui::CornerRadius::same(6),
+            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(40)),
+            egui::epaint::StrokeKind::Outside,
+        );
+        ui.painter()
+            .galley(pill_rect.center() - text_size * 0.5, galley, color);
+    }
+
+    #[cfg(not(windows))]
+    fn draw_pano_status_indicator(
+        &self,
+        _ui: &mut egui::Ui,
+        _image_rect: egui::Rect,
+        _fs_idx: usize,
+        _resolution: &crate::panorama::PanoSourceResolution,
+        _overlay_drawn: bool,
+        _overlay_alpha: f32,
+    ) {
+    }
+
+    /// `compute_settle_policy` が Disabled を返すときの主因を 1 単語で返す
+    /// (status インジケータ表示用)。
+    fn pano_settle_disabled_reason(&self, fs_idx: usize, source_kind: u16) -> &'static str {
+        // AI が **実効的に** この画像に適用される場合のみ "AI 機能 ON" 扱い。
+        // 設定 ON でもサイズ閾値超でスキップされる画像は AI 由来ではないので、
+        // 後段の post_filter / auto_mode / 補正 transient 等の理由を先に出す。
+        if self.ai_will_apply_to(fs_idx) {
+            return "AI 機能 ON";
+        }
+        if source_kind == crate::panorama::SOURCE_KIND_AI
+            || source_kind == crate::panorama::SOURCE_KIND_AI_ADJUST
+        {
+            return "AI 由来 cache";
+        }
+        let params = self.effective_params(fs_idx);
+        if params.auto_mode.is_some() {
+            return "自動補正 ON";
+        }
+        if params.post_filter != crate::adjustment::PostFilter::None {
+            return "ポストフィルタ ON";
+        }
+        if source_kind == crate::panorama::SOURCE_KIND_FS && !params.is_color_identity() {
+            return "補正適用待ち";
+        }
+        "不明"
     }
 
     #[cfg(not(windows))]
@@ -4974,6 +5222,179 @@ impl App {
         _fs_idx: usize,
     ) -> bool {
         false
+    }
+
+    /// 360 度パノラマビュー Phase 2a: NeedsUserConfirmation バナー
+    /// (docs/panorama-360-view-plan.md §3.6.2 / §3.6.4)。
+    ///
+    /// 表示位置: フルスクリーン上部 (横幅は中央寄せ)、動画 HUD と同じ階層。
+    /// 内容: 解像度 / MP / 想定 RAM 消費の数値表示 + 「高品質で表示」/「8K でよい」/
+    /// 「このセッション中は今後も高品質で開く」チェックボックス。
+    /// state が NeedsUserConfirmation 以外なら何も描画せず即 return。
+    fn draw_pano_confirmation_banner(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        fs_idx: usize,
+    ) {
+        // 対象画像の state 取得
+        let Some(source_key) = self.metadata_cache_key(fs_idx) else {
+            return;
+        };
+        let state = self.pano_quality_state.get(&source_key).cloned();
+        let Some(crate::panorama::PanoramaQualityState::NeedsUserConfirmation {
+            source_pixels,
+            est_ram_gb,
+        }) = state
+        else {
+            return;
+        };
+        // 源解像度を引き直す (バナーに表示する W×H 用)。
+        let dims = self
+            .fs_cache
+            .get(&fs_idx)
+            .and_then(|e| match e {
+                crate::fs_animation::FsCacheEntry::Static { source_dims, .. } => *source_dims,
+                _ => None,
+            })
+            .unwrap_or([0, 0]);
+        let mp = source_pixels as f64 / 1_000_000.0;
+        let header = format!(
+            "⚠ 大きな 360° 画像です ({}×{}、約 {:.0} MP)",
+            dims[0], dims[1], mp
+        );
+        let body = format!(
+            "高品質モードで表示するには 約 {:.1} GB のメモリを使います。",
+            est_ram_gb
+        );
+
+        // バナーの矩形 (上部中央、横幅 720px or 画面の 80%、最大)
+        let banner_w = (full_rect.width() * 0.80).min(720.0).max(420.0);
+        let center_x = full_rect.center().x;
+        let top_y = full_rect.top() + 56.0; // 上部ホバーバーの少し下
+        let banner_rect = egui::Rect::from_min_size(
+            egui::pos2(center_x - banner_w * 0.5, top_y),
+            egui::vec2(banner_w, 120.0),
+        );
+
+        // 半透明背景
+        ui.painter().rect_filled(
+            banner_rect.expand(6.0),
+            egui::CornerRadius::same(8),
+            egui::Color32::from_black_alpha(220),
+        );
+        ui.painter().rect_stroke(
+            banner_rect.expand(6.0),
+            egui::CornerRadius::same(8),
+            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(80)),
+            egui::epaint::StrokeKind::Outside,
+        );
+
+        // 上部のテキスト 2 行
+        ui.painter().text(
+            egui::pos2(banner_rect.center().x, banner_rect.top() + 10.0),
+            egui::Align2::CENTER_TOP,
+            &header,
+            egui::FontId::proportional(15.0),
+            egui::Color32::from_rgb(255, 220, 120),
+        );
+        ui.painter().text(
+            egui::pos2(banner_rect.center().x, banner_rect.top() + 34.0),
+            egui::Align2::CENTER_TOP,
+            &body,
+            egui::FontId::proportional(13.0),
+            egui::Color32::from_white_alpha(230),
+        );
+
+        // ボタン領域 (UI として allocate)
+        let button_area_top = banner_rect.top() + 60.0;
+        let button_area = egui::Rect::from_min_size(
+            egui::pos2(banner_rect.left() + 16.0, button_area_top),
+            egui::vec2(banner_rect.width() - 32.0, 50.0),
+        );
+        let mut clicked_hq = false;
+        let mut clicked_base = false;
+        // チェックボックス状態は self に専用フィールドを置かず、buttons の戻りで切り替える
+        // 簡素化のため、毎フレ true 固定で扱い「今後も高品質」は default OFF / クリックで適用。
+        // 実装ロード上は、HQ ボタン押下時に「自動承認モード」をユーザーが選ぶ別ボタンで対応。
+        ui.scope_builder(
+            egui::UiBuilder::new()
+                .max_rect(button_area)
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+            |child_ui| {
+                if child_ui
+                    .add_sized(
+                        egui::vec2(220.0, 32.0),
+                        egui::Button::new(
+                            egui::RichText::new("フル解像度で閲覧 (高画質)")
+                                .size(14.0)
+                                .strong(),
+                        )
+                        .fill(egui::Color32::from_rgb(120, 180, 80)),
+                    )
+                    .on_hover_text(
+                        "フル RGBA をメモリに保持し、静止時に画面解像度ぶんだけ\nCPU で再サンプリングして高画質オーバーレイを表示します。",
+                    )
+                    .clicked()
+                {
+                    clicked_hq = true;
+                }
+                child_ui.add_space(8.0);
+                if child_ui
+                    .add_sized(
+                        egui::vec2(220.0, 32.0),
+                        egui::Button::new(
+                            egui::RichText::new("最大 8K で閲覧 (高画質化なし)").size(14.0),
+                        ),
+                    )
+                    .on_hover_text(
+                        "8K に縮小した表示のみ使用します。メモリ消費は抑えられますが、\n拡大時の精細さは下がります (= 通常画面と同じ品質)。",
+                    )
+                    .clicked()
+                {
+                    clicked_base = true;
+                }
+                child_ui.add_space(12.0);
+                // 「このセッション中は今後も高画質モードで開く」: バナーごとの local state を
+                // 持たない (= 毎フレ false 起点で描画) ため、self の単純フィールドで管理。
+                //
+                // バナー背景が暗色 (`from_black_alpha(220)`) なので、egui デフォルトの
+                // チェックボックスラベル色 (薄いグレー) では読みづらい。本文テキスト
+                // (`from_white_alpha(230)`) と揃えて明示的に色とサイズを指定する。
+                child_ui.checkbox(
+                    &mut self.pano_banner_remember_session,
+                    egui::RichText::new("このセッション中は今後も高画質モードで開く")
+                        .color(egui::Color32::from_white_alpha(230))
+                        .size(13.0),
+                );
+            },
+        );
+
+        if clicked_hq {
+            // 状態を SettleApproved にして worker spawn (resolution で cache_key を取り直す)
+            self.pano_quality_state.insert(
+                source_key.clone(),
+                crate::panorama::PanoramaQualityState::SettleApproved,
+            );
+            if self.pano_banner_remember_session {
+                // **`.max()`** で **monotonically increasing** に保つ (Codex P1 第 5 ラウンド、
+                // 2026-05): 直前に 350 MP を承認 (stored=350) → 220 MP を承認 (= source_pixels)
+                // のときに stored=220 に下がると、次の 280 MP は 220×1.25=275 を超えて
+                // バナー再表示になる。max を取れば stored=350 のまま保持できる。
+                self.pano_session_approved_max_pixels =
+                    self.pano_session_approved_max_pixels.max(source_pixels);
+            }
+            if let Some(resolution) = self.resolve_pano_source(fs_idx) {
+                self.start_pano_high_res_load(fs_idx, resolution.cache_key);
+            }
+            ctx.request_repaint();
+        }
+        if clicked_base {
+            self.pano_quality_state
+                .insert(source_key, crate::panorama::PanoramaQualityState::BaseOnly);
+            ctx.request_repaint();
+        }
     }
 
     fn draw_compare_prepared_mode(
@@ -5944,6 +6365,9 @@ impl App {
         let mut next_x = bar_rect.max.x - BAR_BUTTON_SIZE - BAR_BUTTON_MARGIN;
 
         // × 閉じるボタン
+        // 360 モード中はクリックで「360 モード OFF」(= toggle_panorama_mode で
+        // panorama_state を None に) に転用 (2026-05 ユーザー要望)。
+        // フルスクリーン全体を閉じたい場合は Esc を使う。
         let close_resp = draw_bar_button(
             ui,
             next_x,
@@ -5959,9 +6383,19 @@ impl App {
             false, // active 状態なし
             |p, c, r| draw_close_icon(p, c, r),
         );
-        let close_resp = close_resp.hover_tip_dark("閉じる [Esc]");
+        let close_tooltip = if panorama_active {
+            "360° モードを抜ける (フルスクリーンを閉じるには Esc)"
+        } else {
+            "閉じる [Esc]"
+        };
+        let close_resp = close_resp.hover_tip_dark(close_tooltip);
         if close_resp.clicked() {
-            *close_fs = true;
+            if panorama_active {
+                // 360 モード中は × → 360 解除 (toggle_panorama_mode が OFF 経路に入る)。
+                *panorama_pressed = true;
+            } else {
+                *close_fs = true;
+            }
         }
         if close_resp.hovered() {
             *nav_delta = 0;
@@ -6192,12 +6626,13 @@ impl App {
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
-        // 360 度パノラマビューボタン (画像のみ常時表示、非対応画像では disabled 表示)
-        // docs/panorama-360-view-plan.md §5.3 / §6.1
-        // - panorama_trigger=Auto: XMP 検出済み、強調ツールチップ
-        // - panorama_trigger=Hint: アスペクト 2:1 推定、控えめツールチップ
-        // - panorama_trigger=None: 非対応 (グレーアウト、押せない)
-        if !is_video && !is_spread_double {
+        // 360 度パノラマビューボタン (docs/panorama-360-view-plan.md §5.3 / §6.1):
+        // - 360 モード OFF + 360 対応画像: ボタン表示 + クリックで ON
+        // - 360 モード OFF + 非対応画像: disabled 表示
+        // - **360 モード ON 時はボタンを隠す** (× が 360 解除を兼ねるため、
+        //   2026-05 ユーザー要望)
+        // 元設計 (常時表示 + 強調背景) はユーザーフィードバックで取り下げ。
+        if !is_video && !is_spread_double && !panorama_active {
             let tooltip = match panorama_trigger {
                 Some(crate::panorama::PanoramaTrigger::Auto) => "360° 画像 (XMP 検出) [V]",
                 Some(crate::panorama::PanoramaTrigger::Hint) => {

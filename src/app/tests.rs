@@ -4365,3 +4365,46 @@ mod prefetch_gate_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod pano_settle_size_tests {
+    use super::*;
+
+    #[test]
+    fn settle_output_smaller_than_cap_passes_through() {
+        // 1920 以下 viewport はそのまま (例: 1280×720)
+        assert_eq!(compute_pano_settle_output_size((1280, 720)), (1280, 720));
+        assert_eq!(compute_pano_settle_output_size((1920, 1080)), (1920, 1080));
+        assert_eq!(compute_pano_settle_output_size((800, 600)), (800, 600));
+    }
+
+    #[test]
+    fn settle_output_4k_capped_to_1920_landscape() {
+        // 3840×2160 (16:9) → 1920×1080
+        assert_eq!(compute_pano_settle_output_size((3840, 2160)), (1920, 1080));
+        // 2560×1440 (16:9) → 1920×1080 (round 1080)
+        assert_eq!(compute_pano_settle_output_size((2560, 1440)), (1920, 1080));
+    }
+
+    #[test]
+    fn settle_output_4k_capped_to_1920_portrait() {
+        // 2160×3840 (portrait 9:16) → 1080×1920
+        assert_eq!(compute_pano_settle_output_size((2160, 3840)), (1080, 1920));
+    }
+
+    #[test]
+    fn settle_output_handles_zero() {
+        // 0 が来ても 1 で扱う
+        let (w, h) = compute_pano_settle_output_size((0, 0));
+        assert!(w >= 1 && h >= 1, "got ({w}, {h})");
+    }
+
+    #[test]
+    fn settle_output_aspect_preserved_landscape() {
+        // 21:9 ultrawide 5120×2160 → 1920×x where x = round(1920 * 2160 / 5120) = 810
+        let (w, h) = compute_pano_settle_output_size((5120, 2160));
+        assert_eq!(w, 1920);
+        let expected_h = (1920.0_f32 * 2160.0 / 5120.0).round() as u32;
+        assert_eq!(h, expected_h);
+    }
+}

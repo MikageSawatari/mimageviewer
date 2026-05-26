@@ -456,6 +456,340 @@ impl egui_wgpu::CallbackTrait for PanoramaShaderCallback {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────
+// Phase 2a: settle-refinement overlay (§3.6 / §4.6)
+// 8K base の上に、CPU で計算した 1920×960 (or 任意) の RGBA overlay を
+// alpha ブレンドして描画する。
+// ──────────────────────────────────────────────────────────────────
+
+const SETTLE_OVERLAY_SHADER: &str = r#"
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VsOut {
+    var positions = array<vec2<f32>, 6>(
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 1.0, -1.0),
+        vec2<f32>( 1.0,  1.0),
+        vec2<f32>(-1.0, -1.0),
+        vec2<f32>( 1.0,  1.0),
+        vec2<f32>(-1.0,  1.0),
+    );
+    var uvs = array<vec2<f32>, 6>(
+        vec2<f32>(0.0, 1.0),
+        vec2<f32>(1.0, 1.0),
+        vec2<f32>(1.0, 0.0),
+        vec2<f32>(0.0, 1.0),
+        vec2<f32>(1.0, 0.0),
+        vec2<f32>(0.0, 0.0),
+    );
+    var out: VsOut;
+    out.pos = vec4<f32>(positions[vertex_index], 0.0, 1.0);
+    out.uv  = uvs[vertex_index];
+    return out;
+}
+
+struct OverlayParams {
+    // x: alpha (0.0 = transparent, 1.0 = full overlay)
+    // y/z/w: reserved (0)
+    pose: vec4<f32>,
+};
+
+@group(0) @binding(0) var overlay_tex: texture_2d<f32>;
+@group(0) @binding(1) var overlay_samp: sampler;
+@group(0) @binding(2) var<uniform> params: OverlayParams;
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let alpha = clamp(params.pose.x, 0.0, 1.0);
+    let c = textureSample(overlay_tex, overlay_samp, in.uv);
+    return vec4<f32>(c.rgb, c.a * alpha);
+}
+"#;
+
+/// settle overlay 用静的 GPU リソース。`target_format` 単位で 1 つ。
+pub struct SettleOverlayGpu {
+    pub target_format: wgpu::TextureFormat,
+    pub pipeline: wgpu::RenderPipeline,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+    pub sampler: wgpu::Sampler,
+}
+
+impl SettleOverlayGpu {
+    pub fn new(device: &wgpu::Device, target_format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("miv_panorama_settle_shader"),
+            source: wgpu::ShaderSource::Wgsl(SETTLE_OVERLAY_SHADER.into()),
+        });
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("miv_panorama_settle_bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("miv_panorama_settle_pl"),
+            bind_group_layouts: &[&bind_group_layout],
+            push_constant_ranges: &[],
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("miv_panorama_settle_pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: target_format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        });
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("miv_panorama_settle_sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+        Self {
+            target_format,
+            pipeline,
+            bind_group_layout,
+            sampler,
+        }
+    }
+
+    /// settle overlay RGBA を新規 wgpu テクスチャに格納し bind_group まで作る。
+    pub fn create_uploaded_overlay(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+    ) -> UploadedSettleOverlay {
+        let extent = wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("miv_panorama_settle_texture"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(width * 4),
+                rows_per_image: Some(height),
+            },
+            extent,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("miv_panorama_settle_uniform"),
+            size: 16, // 1 × vec4<f32>
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("miv_panorama_settle_bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
+        UploadedSettleOverlay {
+            target_format: self.target_format,
+            texture,
+            view,
+            bind_group,
+            uniform,
+            width,
+            height,
+        }
+    }
+}
+
+/// settle overlay の wgpu リソース実体 (`SettleOverlay.gpu` に Arc で格納)。
+///
+/// `target_format` は構築時のフォーマット。`upload_settle_overlay` で
+/// `SettleOverlayGpu` を新フォーマットで作り直したとき、`bind_group` の `layout`
+/// (= 旧 `SettleOverlayGpu.bind_group_layout`) が不一致になる可能性があるので、
+/// stale 判定 (Codex P2 第 2、2026-05) で使う。
+pub struct UploadedSettleOverlay {
+    pub target_format: wgpu::TextureFormat,
+    pub texture: wgpu::Texture,
+    pub view: wgpu::TextureView,
+    pub bind_group: wgpu::BindGroup,
+    pub uniform: wgpu::Buffer,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// settle overlay callback (alpha blend で 8K base の上に描画)。
+/// 描画 ordering: ui_fullscreen が `try_paint_panorama` 後にこれを emit すれば、
+/// egui_wgpu のレンダパス内で同フレーム後段で描かれる。
+#[derive(Clone)]
+pub struct SettleOverlayCallback {
+    pub source_key: String,
+    pub cache_key: u64,
+    pub pose: (f32, f32, f32),
+    pub alpha: f32,
+    pub target_format: wgpu::TextureFormat,
+    /// `SettleOverlay.gpu` から `Arc::clone` で渡される。
+    /// `dyn Any` 内の実型は `UploadedSettleOverlay`。
+    pub gpu: Arc<dyn std::any::Any + Send + Sync>,
+}
+
+/// CallbackResources に挿入される settle overlay の参照 newtype。
+pub struct SettleOverlayRef {
+    pub source_key: String,
+    pub cache_key: u64,
+    pub pose: (f32, f32, f32),
+    pub alpha: f32,
+    pub gpu: Arc<UploadedSettleOverlay>,
+}
+
+impl egui_wgpu::CallbackTrait for SettleOverlayCallback {
+    fn prepare(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        _screen_descriptor: &egui_wgpu::ScreenDescriptor,
+        _egui_encoder: &mut wgpu::CommandEncoder,
+        callback_resources: &mut egui_wgpu::CallbackResources,
+    ) -> Vec<wgpu::CommandBuffer> {
+        let need_rebuild = callback_resources
+            .get::<SettleOverlayGpu>()
+            .is_none_or(|r| r.target_format != self.target_format);
+        if need_rebuild {
+            callback_resources.insert(SettleOverlayGpu::new(device, self.target_format));
+        }
+        // 内部実型 (UploadedSettleOverlay) を Arc downcast で取り出す
+        let Ok(uploaded) = self.gpu.clone().downcast::<UploadedSettleOverlay>() else {
+            return Vec::new();
+        };
+        // **target_format 不一致 guard** (Codex P2 第 3 ラウンド、2026-05):
+        // `UploadedSettleOverlay.bind_group` は **構築時の SettleOverlayGpu の
+        // bind_group_layout** に焼き込まれている。target_format が変化してこのフレで
+        // pipeline を作り直した場合、旧 bind_group を新 pipeline と組み合わせると
+        // wgpu の validation で reject される可能性があり、たとえ通っても layout 互換性が
+        // 怪しい。確実に skip して、次回 `upload_settle_overlay` で新 format の
+        // UploadedSettleOverlay が来るまで何も描かない (= 8K base 単独表示)。
+        if uploaded.target_format != self.target_format {
+            callback_resources.remove::<SettleOverlayRef>();
+            return Vec::new();
+        }
+        // alpha を uniform に書く
+        let mut bytes = [0u8; 16];
+        bytes[0..4].copy_from_slice(&self.alpha.to_ne_bytes());
+        queue.write_buffer(&uploaded.uniform, 0, &bytes);
+        // 毎フレ ref を CallbackResources に挿入 (paint で使う)
+        callback_resources.insert(SettleOverlayRef {
+            source_key: self.source_key.clone(),
+            cache_key: self.cache_key,
+            pose: self.pose,
+            alpha: self.alpha,
+            gpu: uploaded,
+        });
+        let _ = device;
+        Vec::new()
+    }
+
+    fn paint(
+        &self,
+        _info: egui::epaint::PaintCallbackInfo,
+        render_pass: &mut wgpu::RenderPass<'static>,
+        callback_resources: &egui_wgpu::CallbackResources,
+    ) {
+        let Some(resources) = callback_resources.get::<SettleOverlayGpu>() else {
+            return;
+        };
+        let Some(overlay_ref) = callback_resources.get::<SettleOverlayRef>() else {
+            return;
+        };
+        // stale guard
+        if overlay_ref.source_key != self.source_key
+            || overlay_ref.cache_key != self.cache_key
+            || overlay_ref.pose != self.pose
+        {
+            return;
+        }
+        render_pass.set_pipeline(&resources.pipeline);
+        render_pass.set_bind_group(0, &overlay_ref.gpu.bind_group, &[]);
+        render_pass.draw(0..6, 0..1);
+    }
+}
+
 /// `Params` uniform 用バイト列 (2 × vec4<f32> = 8 floats、32 bytes)。
 ///
 /// レイアウト:

@@ -2137,6 +2137,48 @@ pub struct App {
     /// `open_fullscreen` で false にリセット、トースト発火で true、
     /// `close_fullscreen` で false に戻る。
     pub(crate) pano_toast_shown_for_current_fs: bool,
+    /// 360 度パノラマビュー Phase 2a: settle-refinement 用フル解像度 RGBA
+    /// (docs/panorama-360-view-plan.md §4.6.1)。キーは `metadata_cache_key`。
+    /// SettleReady / SettleApproved の画像でだけエントリが作られる。
+    /// 別画像へナビ / フルスクリーン退出時に `remove` で drop (最大 2.15 GB の RGBA)。
+    pub(crate) pano_high_res_source:
+        std::collections::HashMap<String, crate::panorama::HighResSource>,
+    /// 360 度パノラマビュー Phase 2a: settle ステート (active 1 枚分)。
+    /// 360 モード ON でフルスクリーン内のみ Some。pose / cache_key / overlay tex を保持。
+    pub(crate) pano_refinement: Option<crate::panorama::PanoramaRefinement>,
+    /// 360 度パノラマビュー Phase 2a: 画像ごとの解像度ゲート判定結果。
+    /// キーは `metadata_cache_key`。SettleReady / NeedsUserConfirmation /
+    /// SettleApproved / BaseOnly の 4 状態 (§3.6.4)。
+    /// 開いていない画像は entry 無し (= 未判定、必要時に決定)。
+    pub(crate) pano_quality_state:
+        std::collections::HashMap<String, crate::panorama::PanoramaQualityState>,
+    /// 360 度パノラマビュー Phase 2a: バナーで「今後も高品質で開く」を選んだ時の
+    /// 最大ピクセル数を記憶。前回承認 × 1.25 を超える画像では再確認 (§3.6.2)。
+    /// 再起動で 0 にリセット (永続化しない)。
+    pub(crate) pano_session_approved_max_pixels: u64,
+    /// 360 度パノラマビュー Phase 2a: NeedsUserConfirmation → SettleApproved 経路用の
+    /// 追加 worker → UI channel (§4.6.0)。
+    pub(crate) pano_high_res_rx: std::sync::mpsc::Receiver<crate::panorama::PanoHighResReady>,
+    pub(crate) pano_high_res_tx: std::sync::mpsc::Sender<crate::panorama::PanoHighResReady>,
+    /// 進行中の追加 worker (キー: source_key)。`cancel.store(true)` で中断、
+    /// drain で全 cancel + map clear (フルスクリーン退出時など)。
+    pub(crate) pano_high_res_pending:
+        std::collections::HashMap<String, crate::panorama::PanoHighResRequest>,
+    /// 360 度パノラマビュー Phase 2a: high-res worker が **decode 失敗** した
+    /// source_key 集合 (Codex P0 第 5、2026-05)。一度 fail した画像で auto-kick が
+    /// 永久ループしないように、ここでは「失敗履歴」として残す。close_fullscreen で
+    /// クリア (= 次セッションでは再試行される)。
+    pub(crate) pano_high_res_failed: std::collections::HashSet<String>,
+    /// 360 度パノラマビュー Phase 2a: per-spawn unique counter (Codex P1 第 7、
+    /// 2026-05)。`start_pano_high_res_load` が spawn する度に increment して、
+    /// pending entry と worker message の両方に焼き付ける。poll は request_id 一致
+    /// 時のみ処理することで、ABBA-pattern (同じ source_key + 同じ cache_key の
+    /// 連続再 spawn) で stale message が新 worker を消費する race を防ぐ。
+    pub(crate) pano_high_res_request_seq: u64,
+    /// NeedsUserConfirmation バナーの「このセッション中は今後も高品質で開く」
+    /// チェックボックスの現在値 (Phase 2a)。デフォルト OFF。
+    /// ON で「高品質で表示」を押すと `pano_session_approved_max_pixels` が更新される。
+    pub(crate) pano_banner_remember_session: bool,
     /// タグキャッシュ (docs/tag-feature.md): 正規化キー → XMP dc:subject の要素列。
     /// メタデータパネルのタグボタン状態表示 + グリッドのタグバッジで使用。
     /// 充填経路は 3 つ:
@@ -3286,6 +3328,9 @@ impl App {
     pub fn new_from_settings(settings: crate::settings::Settings) -> Self {
         let (tx, rx) = mpsc::channel();
         let (pdf_ct_tx, pdf_ct_rx) = mpsc::channel();
+        // 360 度パノラマビュー Phase 2a: NeedsUserConfirmation → SettleApproved の
+        // 追加 worker → UI channel (docs/panorama-360-view-plan.md §4.6.0)。
+        let (pano_high_res_tx, pano_high_res_rx) = mpsc::channel();
         let ai_upscale_enabled = settings.ai_upscale_enabled;
         let ai_upscale_model_override = settings
             .ai_upscale_model_override
@@ -3546,6 +3591,16 @@ impl App {
             panorama_state: None,
             pano_uploaded: None,
             pano_toast_shown_for_current_fs: false,
+            pano_high_res_source: std::collections::HashMap::new(),
+            pano_refinement: None,
+            pano_quality_state: std::collections::HashMap::new(),
+            pano_session_approved_max_pixels: 0,
+            pano_high_res_rx,
+            pano_high_res_tx,
+            pano_high_res_pending: std::collections::HashMap::new(),
+            pano_high_res_failed: std::collections::HashSet::new(),
+            pano_high_res_request_seq: 0,
+            pano_banner_remember_session: false,
             tags_cache: std::collections::HashMap::new(),
             tag_toast_label: None,
             metadata_show_raw_prompt: false,
@@ -12518,6 +12573,52 @@ impl App {
         // 戻ったときに yaw/pitch を引き継げるようにする (§6.3)。
         // CallbackResources からも UploadedPanoTextureRef を除去 (Codex P2 第 18 ラウンド)。
         self.clear_pano_upload();
+        // Phase 2a (§4.6.3 step 8): refinement を drop + 進行中の追加 worker を cancel。
+        //
+        // **HighResSource の保持ポリシー** (Codex P1 第 2 ラウンド指摘反映、2026-05):
+        // 新しく開く idx の source_key に対応する HighResSource は **残す**。理由:
+        //   - prefetch で tee 済みの画像 (= 先回りで pano_high_res_source に入れた) で、
+        //     その idx を開いた瞬間に clear すると settle が永久ロード中になる
+        //   - 同セッション中の再オープン (戻る/進む) でも HighResSource が必要なら
+        //     再デコードを強いられる
+        // 他 entry は drop することで「LRU 1 (active のみ)」を維持。
+        // refinement は **cancel signaling 付きヘルパ**で落とす (Codex P0 第 5、2026-05)。
+        self.clear_pano_refinement();
+        let keep_source_key: Option<String> = self.metadata_cache_key(idx);
+        match keep_source_key.as_ref() {
+            Some(k) => {
+                self.pano_high_res_source.retain(|key, _| key == k);
+            }
+            None => {
+                // metadata_cache_key 取得失敗の一時的なケース (= idx 自体は存在するが
+                // path 解決に失敗、稀)。**全 entry を破棄せず保持** (Codex P2 第 5、
+                // 2026-05): 元実装は `clear()` だったが、これは prefetch tee 済みの
+                // HighResSource を一発で消し飛ばす。None フォールバックでは安全側に
+                // 振って何もしない (= LRU 1 ポリシーは次回正しい open_fullscreen で
+                // 再評価される)。
+                let _ = self.pano_high_res_source.len(); // borrow hint, no-op
+            }
+        }
+        // `pano_high_res_pending` も新 idx の entry は保持する (Codex P2 第 5、2026-05):
+        // prefetch 経路で先に走った load が完了直前のときに drain で cancel すると、
+        // 直後に開いた画像で auto-kick が再起動する。HighResSource の retain ポリシーと
+        // 揃えて、**新 idx の source_key は cancel しない**。
+        match keep_source_key.as_ref() {
+            Some(k) => {
+                self.pano_high_res_pending.retain(|key, req| {
+                    if key == k {
+                        true
+                    } else {
+                        req.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        false
+                    }
+                });
+            }
+            None => {
+                // None フォールバック: 何もしない (上の HighResSource None branch と同じ判断)
+            }
+        }
+        self.pano_banner_remember_session = false;
         // 案内トースト用フラグをリセット (Codex P2 第 18 ラウンド)。実発火は
         // ページ補正トーストとの競合回避のため後段でまとめる (Codex P3 第 20 ラウンド)。
         self.pano_toast_shown_for_current_fs = false;
@@ -12752,6 +12853,15 @@ impl App {
                     && current_key == arrived_key
                 {
                     self.maybe_show_panorama_hint_toast(fs_idx);
+                    // Codex P2 第 2 (2026-05): XMP が fs_cache より遅れて到着した
+                    // 360 候補 (例: DSLR partial-FOV、aspect 非 2:1) で、tee 不採用
+                    // だった画像でも、ここで quality state を再評価し、必要なら
+                    // settle を起動できるようにする。
+                    // - SettleReady の場合: fs_cache の pixels をフル RGBA とみなして
+                    //   HighResSource::Decoded に詰め直す経路はコスト高なので、
+                    //   `update_pano_refinement` 側の自動再要求 (start_pano_high_res_load)
+                    //   経路に任せる。ここでは state の確定だけを行う。
+                    self.maybe_update_pano_quality_state_from_static(fs_idx);
                 }
             }
             Err(mpsc::TryRecvError::Empty) => {}
@@ -14285,6 +14395,18 @@ impl App {
     }
 
     pub(crate) fn start_fs_load(&mut self, idx: usize) {
+        // 360 度パノラマビュー Phase 2a: 内部で使う tee 判定パラメータ。
+        // `start_fs_load` 開始時点で App の状態をスナップショットして worker に渡す
+        // (docs/panorama-360-view-plan.md §4.6.0)。
+        //
+        // 名前付きクロージャ的な存在で、外部 API に露出する必要はない。
+        #[allow(dead_code)]
+        #[derive(Clone)]
+        struct PanoHighResIntent {
+            is_xmp_pano: bool,
+            approved_max_pixels: u64,
+            prev_base_only: bool,
+        }
         // 動画は専用パス: VideoPlayer を作って fs_cache に直接入れる。
         // 通常の画像デコードスレッドは起動しない。
         if let Some(GridItem::Video(vp)) = self.items.get(idx).cloned() {
@@ -14426,6 +14548,41 @@ impl App {
         let perf_seq = self.input_seq;
         self.fs_pending
             .insert(idx, (Arc::clone(&cancel), rx, perf_seq));
+        // 360 度パノラマビュー Phase 2a: 通常画像 (= PDF / ZIP 除く) のみで
+        // tee デコード判断を持ち込む (§3.6.2 / §4.6.0)。
+        // App 側で「XMP equirect 判定済みか」「approved_max_pixels」「BaseOnly か」を
+        // snapshot し、worker は probe_dims 結果と合わせて tee or 通常パスを決める。
+        // **prefetch では tee しない** (Codex P2 第 10、2026-05): tee は worker 内で
+        // フル RGBA を確保 (>8K 画像で 200-800 MB) するので、同時に複数 prefetch worker
+        // が走ると memory peak が嵩む (5 prefetch slot × 800 MB = 4 GB)。
+        // `pano_intent` を **fullscreen_idx == idx のときだけ Some** にすることで、
+        // prefetch は通常 Static パスで完了する。トレードオフ: prefetch 済み画像を
+        // 360 モード ON した瞬間に高画質ロードが auto-kick される (= 1 回の追加
+        // デコード = 3-5 秒の「高画質 ロード中...」表示)。これは元設計と同等の UX
+        // (LRU 1 + 戻る/進む時の cache hit で settle 即復活経路) で受け入れ可能。
+        let is_current_fs = self.fullscreen_idx == Some(idx);
+        let pano_intent: Option<PanoHighResIntent> =
+            if is_current_fs && pdf_page.is_none() && zip_entry.is_none() {
+                let source_key = self.metadata_cache_key(idx);
+                let is_xmp_pano = source_key
+                    .as_ref()
+                    .and_then(|k| self.xmp_panorama_info.get(k))
+                    .and_then(|o| o.as_ref())
+                    .map(|info| info.is_equirectangular())
+                    .unwrap_or(false);
+                let prev_base_only = source_key
+                    .as_ref()
+                    .and_then(|k| self.pano_quality_state.get(k))
+                    .map(|s| matches!(s, crate::panorama::PanoramaQualityState::BaseOnly))
+                    .unwrap_or(false);
+                Some(PanoHighResIntent {
+                    is_xmp_pano,
+                    approved_max_pixels: self.pano_session_approved_max_pixels,
+                    prev_base_only,
+                })
+            } else {
+                None
+            };
         if crate::perf::is_enabled() {
             crate::perf::event(
                 "fs",
@@ -14716,11 +14873,102 @@ impl App {
                     } else {
                         img
                     };
-                    // GPU テクスチャ上限 (MAX_TEXTURE_DIM=8192) を超える巨大画像は
-                    // worker で DynamicImage のまま Triangle リサイズしておく。
-                    // UI スレッド側の clamp_for_gpu は ColorImage↔DynamicImage の
-                    // premultiply/unmultiply ループが重く、7K-9K クラスで 5s/回ブロックする。
                     let source_dims = [img.width() as usize, img.height() as usize];
+                    let source_pixels = (source_dims[0] as u64) * (source_dims[1] as u64);
+                    // 360 度パノラマビュー Phase 2a: tee 判定
+                    // (docs/panorama-360-view-plan.md §4.6.0)。
+                    // `pano_intent` は通常画像のみ有効 (PDF / ZIP は None)。
+                    // 候補条件: XMP equirect 検出済み OR アスペクト 2:1
+                    // tee 条件: 候補かつ BaseOnly でなく、源解像度が ≤ 200 MP または
+                    // 前回承認の 1.25 倍以内。**かつ source が >8K** (= 8K clamp で
+                    // 画質が下がるケースだけ HighResSource を作る、Codex P2 第 5、2026-05):
+                    // ≤8K source では fs_cache の ColorImage が既にフル解像度で、
+                    // HighResSource は同じデータの重複保持 (~134 MB 無駄) になる。
+                    let max_dim_u = MAX_TEXTURE_DIM as u32;
+                    let source_exceeds_8k =
+                        (source_dims[0] as u32) > max_dim_u || (source_dims[1] as u32) > max_dim_u;
+                    let want_tee = source_exceeds_8k
+                        && pano_intent.as_ref().is_some_and(|intent| {
+                            let aspect = source_dims[0] as f32 / source_dims[1].max(1) as f32;
+                            let is_aspect_2to1 = (crate::panorama::ASPECT_LOW
+                                ..=crate::panorama::ASPECT_HIGH)
+                                .contains(&aspect);
+                            let is_candidate = intent.is_xmp_pano || is_aspect_2to1;
+                            if !is_candidate || intent.prev_base_only {
+                                return false;
+                            }
+                            let approved_max = intent.approved_max_pixels;
+                            source_pixels <= crate::panorama::PANO_SETTLE_MAX_PIXELS
+                                || source_pixels <= approved_max.saturating_mul(125) / 100
+                        });
+                    if want_tee {
+                        // tee 経路: フル RGBA を作って HighResSource に格納 +
+                        // 8K リサイズ ColorImage を fs_cache 用に作る。
+                        let rgba_img = img.into_rgba8();
+                        let (full_w, full_h) = (rgba_img.width(), rgba_img.height());
+                        let max_dim = MAX_TEXTURE_DIM as u32;
+                        let (ci, ci_w, ci_h) = if full_w > max_dim || full_h > max_dim {
+                            let scale = max_dim as f64 / full_w.max(full_h) as f64;
+                            let new_w = ((full_w as f64 * scale).round() as u32).max(1);
+                            let new_h = ((full_h as f64 * scale).round() as u32).max(1);
+                            let resized = crate::fast_resize::resize_rgba8_exact(
+                                &rgba_img,
+                                new_w,
+                                new_h,
+                                crate::fast_resize::Quality::Bilinear,
+                            );
+                            let ci = egui::ColorImage::from_rgba_unmultiplied(
+                                [new_w as usize, new_h as usize],
+                                resized.as_raw(),
+                            );
+                            (ci, new_w, new_h)
+                        } else {
+                            let ci = egui::ColorImage::from_rgba_unmultiplied(
+                                [full_w as usize, full_h as usize],
+                                rgba_img.as_raw(),
+                            );
+                            (ci, full_w, full_h)
+                        };
+                        // フル RGBA を Arc で共有 (settle render が zero-copy で参照)
+                        let raw: Vec<u8> = rgba_img.into_raw();
+                        let high_res_rgba = std::sync::Arc::new(raw);
+                        let high_res = crate::panorama::HighResSource::Decoded {
+                            rgba: high_res_rgba,
+                            w: full_w,
+                            h: full_h,
+                        };
+                        let elapsed = t.elapsed().as_secs_f64() * 1000.0;
+                        crate::logger::log(format!(
+                            "  fs load pano tee: {elapsed:.0}ms  idx={idx}  {name}  full={full_w}x{full_h} ci={ci_w}x{ci_h}"
+                        ));
+                        if crate::perf::is_enabled() {
+                            crate::perf::event(
+                                "fs",
+                                "decode_end",
+                                perf_key_worker.as_deref(),
+                                perf_seq,
+                                &[
+                                    ("ms", serde_json::Value::from(elapsed)),
+                                    ("format", serde_json::Value::from(ext.clone())),
+                                    ("w", serde_json::Value::from(ci_w)),
+                                    ("h", serde_json::Value::from(ci_h)),
+                                    ("pano_tee", serde_json::Value::from(true)),
+                                    ("full_w", serde_json::Value::from(full_w)),
+                                    ("full_h", serde_json::Value::from(full_h)),
+                                ],
+                            );
+                        }
+                        let _ = tx.send(FsLoadResult::StaticPanorama {
+                            ci,
+                            source_dims,
+                            high_res,
+                        });
+                        emit_exit("static_pano_tee");
+                        return;
+                    }
+                    // 既存パス (非 360 候補 / BaseOnly / NeedsUserConfirmation):
+                    // GPU テクスチャ上限 (MAX_TEXTURE_DIM=8192) を超える巨大画像は
+                    // worker で DynamicImage のまま Bilinear リサイズしておく。
                     let img = clamp_dynamic_for_gpu(img);
                     let (w, h) = (img.width(), img.height());
                     let ci = dynamic_image_to_color_image(&img);
@@ -15125,6 +15373,42 @@ impl App {
         self.panorama_state = None;
         self.clear_pano_upload();
         self.pano_toast_shown_for_current_fs = false;
+        // Phase 2a (§4.6.3 step 8): フル RGBA (最大 2.15 GB) を drop + 進行中 worker を cancel。
+        // refinement は **cancel signaling 付きヘルパ**で落とす (Codex P0 第 5、2026-05)。
+        self.clear_pano_refinement();
+        self.pano_high_res_source.clear();
+        for (_, req) in self.pano_high_res_pending.drain() {
+            req.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // `pano_quality_state` を session 内で完全保持しない (Codex P2 第 5、2026-05):
+        // 元実装には clear/remove が一切無く、長時間セッションで 100k+ 画像を開くと
+        // 際限なく成長する。close_fullscreen は session 内の自然な境界なので、ここで
+        // **NeedsUserConfirmation / SettleApproved 以外** をクリーンアップする。
+        // 「ユーザーが明示判断したエントリ (NeedsUserConfirmation / BaseOnly /
+        // SettleApproved)」は次回 360 表示で同じ判断を反映するため保持する。
+        //
+        // **ただし `pano_high_res_failed` のエントリに対応する BaseOnly は除去**
+        // (Codex P2 第 8、2026-05): failure 起因で BaseOnly に倒したエントリは
+        // 「ユーザー明示判断」ではないので、次回 reopen で再分類できるよう state も
+        // 一緒に破棄する。これで failure が transient (= 一時的なファイルロック等)
+        // だった場合に次回試行できる。
+        let failed_keys: std::collections::HashSet<String> =
+            self.pano_high_res_failed.iter().cloned().collect();
+        self.pano_quality_state.retain(|key, s| {
+            // SettleReady: 一律 drop (= status indicator のフォールスルー用、保持不要)
+            if matches!(s, crate::panorama::PanoramaQualityState::SettleReady) {
+                return false;
+            }
+            // failure 起因の BaseOnly: drop (= 次回 reopen で再分類)
+            if matches!(s, crate::panorama::PanoramaQualityState::BaseOnly)
+                && failed_keys.contains(key)
+            {
+                return false;
+            }
+            true
+        });
+        self.pano_high_res_failed.clear();
+        self.pano_banner_remember_session = false;
         #[cfg(windows)]
         {
             self.pending_pin_thumb_refresh = None;
@@ -17220,6 +17504,776 @@ impl App {
         self.panorama_state.is_some() && self.detect_panorama(fs_idx).is_some()
     }
 
+    /// 360 度パノラマビュー Phase 2a: `source_key` (metadata_cache_key) から
+    /// 現在の fs_idx を逆引きする (§4.6.0 poll_pano_high_res で使う)。
+    /// items は小〜中規模 (~数千) なので線形走査で十分。
+    pub(crate) fn fs_idx_of_source_key(&self, source_key: &str) -> Option<usize> {
+        for i in 0..self.items.len() {
+            if let Some(k) = self.metadata_cache_key(i) {
+                if k == source_key {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// 360 度パノラマビュー Phase 2a: NeedsUserConfirmation バナーで「高品質で表示」
+    /// を選んだ際の追加 worker 起動 (§4.6.0 / §4.6.3 step 3)。
+    /// 8K base は既に fs_cache にある前提。フル RGBA だけを別スレッドでデコードして
+    /// `pano_high_res_tx` に送る。
+    pub(crate) fn start_pano_high_res_load(&mut self, fs_idx: usize, cache_key: u64) {
+        let Some(source_key) = self.metadata_cache_key(fs_idx) else {
+            return;
+        };
+        // **失敗履歴チェック** (Codex P0 第 5、2026-05): 前回 decode 失敗した画像を
+        // 同じ session 内で何度も auto-kick されないように skip する。
+        // close_fullscreen でクリアされるので、次セッションでは再試行される。
+        if self.pano_high_res_failed.contains(&source_key) {
+            return;
+        }
+        // 重複起動防止: 既に同じ cache_key で走っている worker があるなら skip
+        if let Some(existing) = self.pano_high_res_pending.get(&source_key) {
+            if existing.cache_key == cache_key {
+                return;
+            }
+            // 別 cache_key で走っているなら cancel して新規起動
+            existing
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // 通常画像のみ (ZIP/PDF は Phase 2a 対象外、§4.6.0 注釈)
+        let path = match self.items.get(fs_idx) {
+            Some(GridItem::Image(p)) => p.clone(),
+            _ => return,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let tx = self.pano_high_res_tx.clone();
+        let cancel_worker = Arc::clone(&cancel);
+        let source_key_worker = source_key.clone();
+        // **per-spawn request_id を発行** (Codex P1 第 7、2026-05): 同じ source_key +
+        // 同じ cache_key の再 spawn でも、message と pending を 1:1 に対応させるための
+        // 識別子。`u64::saturating_add` でラップを防ぐ (実用上は 2^64 spawn まで安全)。
+        self.pano_high_res_request_seq = self.pano_high_res_request_seq.saturating_add(1);
+        let request_id = self.pano_high_res_request_seq;
+        // **pending insert を spawn の前に** 移動 (Codex P0 第 5、2026-05):
+        // spawn-then-insert は TOCTOU: 万一 worker が即時 send しても poll_pano_high_res
+        // は pending.remove() で None を返して結果を silently drop してしまう。
+        // 順序を逆にすれば、worker の tx.send は必ず insert 後に発火する。
+        self.pano_high_res_pending.insert(
+            source_key.clone(),
+            crate::panorama::PanoHighResRequest {
+                started_at: std::time::Instant::now(),
+                cancel,
+                cache_key,
+                request_id,
+            },
+        );
+        let cancel_for_guard = Arc::clone(&cancel_worker);
+        std::thread::spawn(move || {
+            // **Drop guard**: 成功時は `sent=true` にしてから send。decode 失敗 / panic で
+            // 落ちた場合は Drop が `None` を送って pending を解放、auto-kick の永久ループを
+            // 止める (Codex P0 第 5、2026-05)。
+            //
+            // **cancel 起因の exit では何も送らない** (Codex P1 第 6、2026-05): pending が
+            // 既に新 worker (= 同じ source_key + 同じ cache_key で再 spawn された) に
+            // 上書きされている可能性があるため、停止した OLD worker の `None` が新
+            // worker の pending を誤って removed + failed flag セットしてしまう。
+            // cancel atomic を保持し、`true` なら send を skip して silent exit に倒す。
+            struct SendGuard {
+                tx: std::sync::mpsc::Sender<crate::panorama::PanoHighResReady>,
+                source_key: String,
+                cache_key: u64,
+                request_id: u64,
+                sent: bool,
+                cancel: Arc<AtomicBool>,
+            }
+            impl Drop for SendGuard {
+                fn drop(&mut self) {
+                    if self.sent {
+                        return;
+                    }
+                    if self.cancel.load(Ordering::Relaxed) {
+                        // cancel 起因の早期 return → 新 worker が走ってる可能性大、
+                        // 何も送らずに silent exit。pending は新 worker のために残す。
+                        return;
+                    }
+                    // decode 失敗 / panic → 失敗を必ず送って pending を解放
+                    let _ = self.tx.send(crate::panorama::PanoHighResReady {
+                        source_key: std::mem::take(&mut self.source_key),
+                        cache_key: self.cache_key,
+                        request_id: self.request_id,
+                        high_res: None,
+                    });
+                }
+            }
+            let mut guard = SendGuard {
+                tx: tx.clone(),
+                source_key: source_key_worker.clone(),
+                cache_key,
+                request_id,
+                sent: false,
+                cancel: cancel_for_guard,
+            };
+            if cancel_worker.load(Ordering::Relaxed) {
+                return; // Drop guard が None を送って pending を解放する
+            }
+            // image::open → WIC → Susie の順 (start_fs_load と同じ fallback)
+            let open_result = match image::open(&path) {
+                Ok(img) => Ok(img),
+                Err(e) => match crate::wic_decoder::decode_to_dynamic_image(&path) {
+                    Some(img) => Ok(img),
+                    None => match crate::susie_loader::decode_file(&path, true, None) {
+                        Ok(img) => Ok(img),
+                        Err(_) => Err(e),
+                    },
+                },
+            };
+            let img = match open_result {
+                Ok(i) => i,
+                Err(e) => {
+                    crate::logger::log(format!(
+                        "[Pano] high-res load FAIL {source_key_worker}: {e}"
+                    ));
+                    return; // Drop guard が None を送る
+                }
+            };
+            if cancel_worker.load(Ordering::Relaxed) {
+                return;
+            }
+            let img = crate::thumb_loader::apply_exif_orientation(img, &path);
+            let rgba_img = img.into_rgba8();
+            let (w, h) = (rgba_img.width(), rgba_img.height());
+            let raw = rgba_img.into_raw();
+            if cancel_worker.load(Ordering::Relaxed) {
+                return;
+            }
+            let high_res = crate::panorama::HighResSource::Decoded {
+                rgba: std::sync::Arc::new(raw),
+                w,
+                h,
+            };
+            // 成功 → sent フラグを立ててから明示的に Some を送る
+            guard.sent = true;
+            let _ = tx.send(crate::panorama::PanoHighResReady {
+                source_key: source_key_worker,
+                cache_key,
+                request_id,
+                high_res: Some(high_res),
+            });
+        });
+    }
+
+    /// 360 度パノラマビュー Phase 2a: 追加 worker からの結果を取り込む (§4.6.0)。
+    /// `App::update` から毎フレ呼ぶ。
+    pub(crate) fn poll_pano_high_res(&mut self, ctx: &egui::Context) {
+        let mut readies: Vec<crate::panorama::PanoHighResReady> = Vec::new();
+        while let Ok(r) = self.pano_high_res_rx.try_recv() {
+            readies.push(r);
+        }
+        for ready in readies {
+            // **`request_id` 一致確認を先に行う** (Codex P1 第 7、2026-05): 同じ
+            // source_key + 同じ cache_key の再 spawn でも、`request_id` は per-spawn で
+            // 一意。ABBA-pattern (close → reopen して同じ key の load を再開) で、
+            // 旧 worker が既に send した stale message が新 worker の pending を誤って
+            // 消費する race を防ぐ。
+            //
+            // 不一致なら **stale な過去 spawn の message** なので、pending を remove
+            // したり failed flag を立てたりせず silent drop。新 worker は引き続き走る。
+            let Some(pending_entry) = self.pano_high_res_pending.get(&ready.source_key) else {
+                // pending が無い (= 既に処理済み or 別パスで drain された)。ignore。
+                continue;
+            };
+            if pending_entry.request_id != ready.request_id {
+                if ready.high_res.is_none() {
+                    crate::logger::log(format!(
+                        "[Pano] dropping stale high-res message for {} (msg req_id={}, \
+                         pending req_id={}, cache_key={:#018x})",
+                        ready.source_key,
+                        ready.request_id,
+                        pending_entry.request_id,
+                        ready.cache_key
+                    ));
+                }
+                continue;
+            }
+            // ここから先は **「現在の pending と一致する正規 message」** 確定。
+            // 失敗 / 成功どちらでも pending エントリを今回で消費する。
+            let req = self
+                .pano_high_res_pending
+                .remove(&ready.source_key)
+                .expect("pending entry just confirmed above");
+            // **worker decode 失敗** (Codex P0 第 5、2026-05): `high_res = None` で
+            // 到着したら failure 履歴に登録して、auto-kick の無限ループを止める。
+            // **加えて quality_state を BaseOnly に倒す** (Codex P3 第 7、2026-05):
+            // SettleReady / SettleApproved のまま残すと status indicator が
+            // 「高画質 ロード中…」を永久表示してしまう (= high_res_source 不在 +
+            // settle 可能 state)。decode 失敗は事実上 settle 不可能なので明示的に
+            // BaseOnly (= 「8K 表示で続ける」) に倒すのが UX 上自然。
+            let Some(high_res) = ready.high_res else {
+                self.pano_high_res_failed.insert(ready.source_key.clone());
+                self.pano_quality_state.insert(
+                    ready.source_key.clone(),
+                    crate::panorama::PanoramaQualityState::BaseOnly,
+                );
+                crate::logger::log(format!(
+                    "[Pano] high-res worker reported failure for {} (cache_key={:#018x}) — \
+                     state forced to BaseOnly",
+                    ready.source_key, ready.cache_key
+                ));
+                continue;
+            };
+            // stale check 2: cancel が立っているなら skip
+            if req.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+            // 現在の resolution / state を取り直す
+            let Some(fs_idx) = self.fs_idx_of_source_key(&ready.source_key) else {
+                continue;
+            };
+            let Some(resolution) = self.resolve_pano_source(fs_idx) else {
+                continue;
+            };
+            let state = self.pano_quality_state.get(&resolution.source_key).cloned();
+            let user_still_wants_high_res = matches!(
+                state,
+                Some(crate::panorama::PanoramaQualityState::SettleApproved)
+            );
+            let settle_will_use_it = state
+                .as_ref()
+                .map(|s| crate::panorama::settle_enabled(s, &resolution.settle_policy))
+                .unwrap_or(false);
+            // stale check 3: cache_key 不一致 (= 補正 / AI 切替で source_kind 変化等)
+            if ready.cache_key != resolution.cache_key {
+                // **再要求時の TOCTOU 対策** (Codex P1 第 5、2026-05): pending 削除済みなので
+                // ここで start_pano_high_res_load を呼ぶと「重複起動チェック」が空振りして
+                // 即座に worker spawn してしまい、その後 OLD-worker の遅延 send が到着すると
+                // 二重 worker 状態に陥る。`pano_high_res_failed.insert + remove` の往復で
+                // failed flag を立てないままにしつつ、`start_pano_high_res_load` が新しい
+                // worker を作る前に **必ず pending が空** であることを保証する。
+                // (= worker は spawn 直前に pending を insert する fix #11 と組み合わせて、
+                //  TOCTOU 窓を実質ゼロにする)
+                if user_still_wants_high_res && settle_will_use_it {
+                    self.start_pano_high_res_load(fs_idx, resolution.cache_key);
+                }
+                continue;
+            }
+            // 成功パス: state guard。BaseOnly に明示遷移していたら破棄
+            if matches!(state, Some(crate::panorama::PanoramaQualityState::BaseOnly)) {
+                continue;
+            }
+            // HighResSource 格納
+            self.pano_high_res_source
+                .insert(ready.source_key.clone(), high_res);
+            if settle_will_use_it {
+                // settle が動作可能 → state を SettleApproved に確定 + バナーを閉じる
+                self.pano_quality_state.insert(
+                    ready.source_key.clone(),
+                    crate::panorama::PanoramaQualityState::SettleApproved,
+                );
+                self.dismiss_pano_confirmation_banner(&ready.source_key);
+                ctx.request_repaint();
+            }
+            // settle_will_use_it == false (AI / post_filter ON 等):
+            //   state は触らない、HighResSource は格納 (= 将来 OFF→ON で再利用可能)
+        }
+    }
+
+    /// NeedsUserConfirmation バナーを閉じる (確認状態を遷移済みにする)。
+    /// 現状は明示的な「バナー閉じ」フィールドは持たず、`pano_quality_state` が
+    /// `NeedsUserConfirmation` から `SettleApproved` / `BaseOnly` に変化したら
+    /// UI 側はバナーを描画しない。よって本メソッドは将来拡張用に空 (no-op) で残す。
+    pub(crate) fn dismiss_pano_confirmation_banner(&mut self, _source_key: &str) {
+        // intentional no-op (バナー表示は state ベース、明示的なフラグは不要)
+    }
+
+    /// 360 度パノラマビュー Phase 2a: 静止検出 + settle render 起動 + 結果ポーリング
+    /// (docs/panorama-360-view-plan.md §4.6.3)。
+    ///
+    /// 呼び出し: `App::update` の 360 アクティブ判定後、毎フレ。
+    ///
+    /// 動作:
+    /// 1. 現 fs_idx の resolution / state / pano_state を取得 (取れなければ refinement を drop)
+    /// 2. pose / cache_key 変化を `note_pose` で記録 (= settle タイマー reset + 進行中 render cancel)
+    /// 3. 進行中 render の結果を `try_recv` で取り込み → upload_settle_overlay
+    /// 4. settle_enabled かつ静止 500 ms 経過で新 render を spawn
+    pub(crate) fn update_pano_refinement(&mut self, ctx: &egui::Context) {
+        let Some(fs_idx) = self.fullscreen_idx else {
+            // フルスクリーン外 → refinement を drop (cancel signaling 付き)
+            self.clear_pano_refinement();
+            return;
+        };
+        if !self.is_panorama_mode_active(fs_idx) {
+            self.clear_pano_refinement();
+            return;
+        }
+        let Some(resolution) = self.resolve_pano_source(fs_idx) else {
+            return;
+        };
+        let Some(pano_state) = self.panorama_state.as_ref() else {
+            return;
+        };
+        let pose = (pano_state.yaw, pano_state.pitch, pano_state.fov_y);
+        let cache_key = resolution.cache_key;
+        let source_key = resolution.source_key.clone();
+
+        // refinement の存在 / source_key 整合性
+        let need_reset = self
+            .pano_refinement
+            .as_ref()
+            .map(|r| r.source_key != source_key)
+            .unwrap_or(true);
+        if need_reset {
+            self.pano_refinement = Some(crate::panorama::PanoramaRefinement::new(
+                source_key.clone(),
+                pose,
+                cache_key,
+            ));
+        }
+
+        // **viewport_size の更新は `try_paint_panorama` の `note_state` に委譲**
+        // (Codex P1 第 5、2026-05): ここで前フレ viewport を読み戻して note_state に
+        // 渡しても差分検出が走らないので、purely no-op に終わる。viewport-based stale
+        // 検出は `try_paint_panorama` 側に集約する (= 当フレの image_rect から計算した
+        // 最新値を渡す)。本メソッドでは pose / cache_key のみを note_state で更新する
+        // (viewport_size = None で過渡的に viewport 軸の比較をスキップ)。
+        if let Some(refinement) = self.pano_refinement.as_mut() {
+            refinement.note_state(pose, cache_key, None);
+        }
+
+        // 進行中 render の結果取り込み
+        let mut completed: Option<crate::panorama::SettleRenderResult> = None;
+        if let Some(refinement) = self.pano_refinement.as_mut() {
+            if let Some(handle) = refinement.rendering.as_ref() {
+                match handle.rx.try_recv() {
+                    Ok(result) => {
+                        completed = Some(result);
+                        refinement.rendering = None;
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        refinement.rendering = None;
+                    }
+                }
+            }
+        }
+        if let Some(result) = completed {
+            // 4 軸 stale guard: source_key + pose + cache_key + viewport_size
+            // (Codex P1 第 2、2026-05: viewport リサイズで overlay 不整合を防ぐ)
+            let ok = self
+                .pano_refinement
+                .as_ref()
+                .map(|r| {
+                    r.source_key == result.source_key
+                        && r.last_pose == result.pose
+                        && r.last_cache_key == result.cache_key
+                        && r.last_viewport_size == Some(result.viewport_size)
+                })
+                .unwrap_or(false);
+            if ok {
+                self.upload_settle_overlay(ctx, result);
+            }
+        }
+
+        // **spawn 判定は `try_spawn_settle_render` (try_paint_panorama 経由) に委譲**
+        // (Codex P1 第 5、2026-05): 当フレの viewport_size を `note_state` で反映してから
+        // spawn を決めないと、viewport 変化フレームで「旧 viewport で spawn → 直後に
+        // cancel」の無駄サイクルが入る。spawn 判定 + auto-kick を一括で paint 側に倒す。
+        // ここまでで receive / overlay upload / pose 反映は完了している。
+        //
+        // **request_repaint は active work がある場合のみ** (Codex P2 第 8、2026-05):
+        // refinement が Some だからといって毎フレ repaint すると、≤8K source や
+        // 既に overlay fade 完了済みの状態でも CPU/GPU を常に回し続けてしまう。
+        // 必要なケースに絞る:
+        //   - 進行中の settle render がある (= 結果到着待ち)
+        //   - overlay fade in 進行中 (= 150 ms 未満)
+        let need_repaint = self
+            .pano_refinement
+            .as_ref()
+            .map(|r| {
+                if r.rendering.is_some() {
+                    return true;
+                }
+                if let Some(start) = r.overlay_fade_start {
+                    if start.elapsed() < std::time::Duration::from_millis(150) {
+                        return true;
+                    }
+                }
+                false
+            })
+            .unwrap_or(false);
+        if need_repaint {
+            ctx.request_repaint();
+        }
+    }
+
+    /// 360 度パノラマビュー Phase 2a: `try_paint_panorama` の note_state 直後に呼ぶ
+    /// (Codex P1 第 5、2026-05)。当フレで最新の viewport を反映済みの状態で settle
+    /// 起動判定 + spawn を行う。
+    ///
+    /// 切り分け方針:
+    /// - `update_pano_refinement` (App::update 内): receive 結果 + upload overlay +
+    ///   refinement lifecycle (フルスクリーン外で drop 等) + pose/cache_key 反映
+    /// - `try_spawn_settle_render` (paint 内): viewport 反映後の **当フレ最新値**で
+    ///   settle 起動判定 + auto-kick + spawn
+    pub(crate) fn try_spawn_settle_render(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        resolution: &crate::panorama::PanoSourceResolution,
+    ) {
+        let Some(pano_state) = self.panorama_state.as_ref() else {
+            return;
+        };
+        let pose = (pano_state.yaw, pano_state.pitch, pano_state.fov_y);
+        let cache_key = resolution.cache_key;
+        let source_key = resolution.source_key.clone();
+
+        // settle 起動判定
+        let state = self.pano_quality_state.get(&source_key).cloned();
+        let can_settle = state
+            .as_ref()
+            .map(|s| crate::panorama::settle_enabled(s, &resolution.settle_policy))
+            .unwrap_or(false);
+        if !can_settle {
+            return;
+        }
+        // **源解像度 ≤ 8K なら settle 不要** (Codex P2 第 5、2026-05): 8K base が既に
+        // フル解像度なので settle で再サンプルしても品質向上はない。
+        let source_exceeds_8k = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Static {
+                source_dims: Some([w, h]),
+                ..
+            }) => {
+                let max_dim_u = MAX_TEXTURE_DIM as u32;
+                (*w as u32) > max_dim_u || (*h as u32) > max_dim_u
+            }
+            _ => false,
+        };
+        if !source_exceeds_8k {
+            // ≤ 8K source: settle 不要 (= 状態安定なので repaint 不要、Codex P2 第 8、2026-05)
+            return;
+        }
+        // HighResSource が無いと render できない。cache hit / 戻る経路で再生成されない
+        // 問題への対処として、**state が settle 可なのに HighResSource が無い場合は
+        // start_pano_high_res_load を自動 kick** する (Codex P1 第 2)。
+        if !self.pano_high_res_source.contains_key(&source_key) {
+            let already_loading = self
+                .pano_high_res_pending
+                .get(&source_key)
+                .map(|req| req.cache_key == cache_key)
+                .unwrap_or(false);
+            if !already_loading {
+                self.start_pano_high_res_load(fs_idx, cache_key);
+            }
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        #[cfg(windows)]
+        let current_target_format = self.wgpu_render_state.as_ref().map(|s| s.target_format);
+        #[cfg(not(windows))]
+        let current_target_format: Option<wgpu::TextureFormat> = None;
+        let ready_to_render = match self.pano_refinement.as_mut() {
+            Some(refinement) => {
+                if refinement.rendering.is_some() {
+                    false
+                } else if refinement.overlay_ok_for(
+                    pose,
+                    cache_key,
+                    refinement.last_viewport_size,
+                    current_target_format,
+                ) {
+                    false
+                } else {
+                    let since = *refinement.settle_since.get_or_insert(now);
+                    now.duration_since(since) >= std::time::Duration::from_millis(500)
+                }
+            }
+            None => false,
+        };
+        if !ready_to_render {
+            // **`settle_since` 経過待ち or overlay 完成済み / 既走行中**: 静止 500 ms
+            // タイマー進行のため、`settle_since` がまだ立っているなら repaint 要求。
+            // すでに overlay 完成 + フェード完了 + render 無しの「平衡状態」では
+            // request_repaint しない (Codex P2 第 8、2026-05)。
+            let waiting_for_settle = self
+                .pano_refinement
+                .as_ref()
+                .map(|r| r.settle_since.is_some() && r.rendering.is_none())
+                .unwrap_or(false);
+            if waiting_for_settle {
+                ctx.request_repaint();
+            }
+            return;
+        }
+
+        // settle render を spawn (当フレで note_state 済みの viewport を使う)
+        self.spawn_settle_render(fs_idx, resolution, pose);
+    }
+
+    /// 360 度パノラマビュー Phase 2a: 別スレッドで `render_settle_overlay` を起動する
+    /// (§3.6.3 / §4.6.2)。`PanoramaRefinement.rendering` に `RenderingHandle` を入れる。
+    fn spawn_settle_render(
+        &mut self,
+        fs_idx: usize,
+        resolution: &crate::panorama::PanoSourceResolution,
+        pose: (f32, f32, f32),
+    ) {
+        let source_key = resolution.source_key.clone();
+        let cache_key = resolution.cache_key;
+        let policy = resolution.settle_policy.clone();
+        let Some(high_res) = self.pano_high_res_source.get(&source_key).cloned() else {
+            return;
+        };
+        let crate::panorama::HighResSource::Decoded {
+            rgba: src_rgba,
+            w: src_w,
+            h: src_h,
+        } = high_res;
+        let uv = self.compute_pano_uv_transform(fs_idx);
+        // 出力解像度: 直近フレームの viewport size に揃える (Codex P1 第 2、2026-05)。
+        // 長辺 1920 で cap (4K viewport でも 1920×1080 に縮めて GPU 側で線形拡大、
+        // CPU レンダ 100ms 以内を狙う)。
+        let viewport_size = self
+            .pano_refinement
+            .as_ref()
+            .and_then(|r| r.last_viewport_size)
+            .unwrap_or((1920, 960));
+        let (out_w, out_h) = compute_pano_settle_output_size(viewport_size);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let started_at = std::time::Instant::now();
+        let cancel_worker = Arc::clone(&cancel);
+        let source_key_worker = source_key.clone();
+        std::thread::spawn(move || {
+            let (yaw, pitch, fov_y) = pose;
+            let out = crate::panorama::render_settle_overlay(
+                &src_rgba,
+                src_w,
+                src_h,
+                uv,
+                yaw,
+                pitch,
+                fov_y,
+                out_w,
+                out_h,
+                &policy,
+                &cancel_worker,
+            );
+            if let Some(rgba) = out {
+                let _ = tx.send(crate::panorama::SettleRenderResult {
+                    source_key: source_key_worker,
+                    pose,
+                    cache_key,
+                    viewport_size,
+                    rgba,
+                    width: out_w,
+                    height: out_h,
+                });
+            }
+        });
+        if let Some(refinement) = self.pano_refinement.as_mut() {
+            refinement.rendering = Some(crate::panorama::RenderingHandle {
+                cancel,
+                rx,
+                started_at,
+                for_source_key: source_key,
+                for_pose: pose,
+                for_cache_key: cache_key,
+                for_viewport_size: viewport_size,
+            });
+        }
+    }
+
+    /// 360 度パノラマビュー Phase 2a: settle render の RGBA を wgpu::Texture に
+    /// アップロードして `pano_refinement.overlay` に格納する (§4.6.3 step 6)。
+    /// 4K = ~33 MB / 1920×960 = ~7 MB なので 1 回 write_texture で OK。
+    #[cfg(windows)]
+    pub(crate) fn upload_settle_overlay(
+        &mut self,
+        _ctx: &egui::Context,
+        result: crate::panorama::SettleRenderResult,
+    ) {
+        let Some(render_state) = self.wgpu_render_state.clone() else {
+            return;
+        };
+        let device = render_state.device.clone();
+        let queue = render_state.queue.clone();
+        let target_format = render_state.target_format;
+        // SettleOverlayGpu 静的リソースを CallbackResources に確保 / 再構築
+        // (Codex P2 第 2、2026-05: target_format 変化を検出)
+        let mut static_gpu_rebuilt = false;
+        {
+            let mut renderer = render_state.renderer.write();
+            let resources = &mut renderer.callback_resources;
+            let need_rebuild = resources
+                .get::<crate::panorama_wgpu::SettleOverlayGpu>()
+                .is_none_or(|r| r.target_format != target_format);
+            if need_rebuild {
+                resources.insert(crate::panorama_wgpu::SettleOverlayGpu::new(
+                    &device,
+                    target_format,
+                ));
+                static_gpu_rebuilt = true;
+            }
+        }
+        // 既存の overlay が `target_format` 不一致なら drop してから新規アップロード
+        // (= bind_group が古い layout で焼かれている可能性、Codex P2 第 2)
+        if static_gpu_rebuilt {
+            if let Some(refinement) = self.pano_refinement.as_mut() {
+                refinement.overlay = None;
+                refinement.overlay_pose = None;
+                refinement.overlay_cache_key = None;
+                refinement.overlay_viewport = None;
+                refinement.overlay_target_format = None;
+                refinement.overlay_fade_start = None;
+            }
+        }
+        let uploaded = {
+            let renderer = render_state.renderer.read();
+            let static_gpu = renderer
+                .callback_resources
+                .get::<crate::panorama_wgpu::SettleOverlayGpu>()
+                .expect("SettleOverlayGpu just inserted above");
+            static_gpu.create_uploaded_overlay(
+                &device,
+                &queue,
+                result.width,
+                result.height,
+                &result.rgba,
+            )
+        };
+        let overlay = crate::panorama::SettleOverlay {
+            width: result.width,
+            height: result.height,
+            gpu: std::sync::Arc::new(uploaded),
+        };
+        if let Some(refinement) = self.pano_refinement.as_mut() {
+            refinement.overlay = Some(overlay);
+            refinement.overlay_pose = Some(result.pose);
+            refinement.overlay_cache_key = Some(result.cache_key);
+            refinement.overlay_viewport = Some(result.viewport_size);
+            refinement.overlay_target_format = Some(target_format);
+            refinement.overlay_fade_start = Some(std::time::Instant::now());
+            // **`settle_since` を clear** (Codex P1 第 9、2026-05): overlay 完成後も
+            // `settle_since.is_some()` が残ると、`try_spawn_settle_render` の
+            // `waiting_for_settle` 判定で永久 true に固まり request_repaint が止まらない。
+            // overlay が出来た瞬間は「完了状態」なので settle_since を落として平衡へ。
+            refinement.settle_since = None;
+        }
+        crate::logger::log(format!(
+            "[Pano] settle overlay uploaded {}x{} for key={} pose=({:.3},{:.3},{:.3}) viewport={:?}",
+            result.width,
+            result.height,
+            result.source_key,
+            result.pose.0,
+            result.pose.1,
+            result.pose.2,
+            result.viewport_size,
+        ));
+    }
+
+    #[cfg(not(windows))]
+    pub(crate) fn upload_settle_overlay(
+        &mut self,
+        _ctx: &egui::Context,
+        _result: crate::panorama::SettleRenderResult,
+    ) {
+        // non-Windows ビルドでは wgpu パスを持たない
+    }
+
+    /// 360 度パノラマビュー Phase 2a: `FsLoadResult::Static` (worker が tee 不採用) で
+    /// fs_cache に入った直後 / `poll_metadata_load` で XMP が遅延到着した直後に呼ぶ。
+    /// 源解像度と 360 候補判定から `pano_quality_state` を初期化する (§3.6.4)。
+    ///
+    /// - 既に `BaseOnly` / `SettleApproved` / `SettleReady` / `NeedsUserConfirmation`
+    ///   のときは触らない (= ユーザーの明示判断やワーカー設定を尊重)
+    /// - ≤ 200 MP → `SettleReady` (= settle を有効化、`update_pano_refinement` が
+    ///   自動で `start_pano_high_res_load` を kick して HighResSource を補充)
+    /// - > 200 MP → `NeedsUserConfirmation` (バナー表示)
+    ///
+    /// Codex P2 第 2 (2026-05): XMP が fs_cache より遅れて到着した partial-FOV 画像
+    /// (aspect 非 2:1) でも、ここで `SettleReady` を立てれば settle 経路に乗る。
+    pub(crate) fn maybe_update_pano_quality_state_from_static(&mut self, fs_idx: usize) {
+        let Some(trigger) = self.detect_panorama(fs_idx) else {
+            return;
+        };
+        let _ = trigger; // detect 出力は今のところ Auto/Hint 同等扱い
+        let Some(source_key) = self.metadata_cache_key(fs_idx) else {
+            return;
+        };
+        // 状態が既に確定しているなら触らない
+        if self.pano_quality_state.contains_key(&source_key) {
+            return;
+        }
+        // GridItem::Image 以外 (ZIP / PDF / Video / Folder 等) は settle 対象外。
+        // Phase 2a の `start_pano_high_res_load` が通常画像パスしか持たないため、
+        // ここで SettleReady を立てると `update_pano_refinement` の自動 kick が空振り
+        // して status が永久に「高画質 ロード中…」のままになる
+        // (Codex P2 第 3 ラウンド、2026-05)。
+        let is_plain_image = matches!(self.items.get(fs_idx), Some(GridItem::Image(_)));
+        if !is_plain_image {
+            self.pano_quality_state
+                .insert(source_key, crate::panorama::PanoramaQualityState::BaseOnly);
+            return;
+        }
+        // 源解像度を取得。**`source_dims` のみを信頼**する (Codex P1 第 5、2026-05):
+        // `pixels.size` は GPU clamp 後 (= 通常 8192 cap) の縮小寸法なので、巨大 source を
+        // 8K に縮小したケースで「実際は 1.25 GP の画像が 33 MP に見える」誤認が起きる。
+        // 結果 SettleReady に化けて、後段の `start_pano_high_res_load` がフル解像度
+        // RGBA をデコードして OOM 寸前に。`source_dims` が無いフレーム (= 動画 /
+        // Animated / Failed / 未ロード) は判定保留 (次回 source_dims が確定したフレーム
+        // で再度呼ばれる、ライフサイクルは `poll_prefetch` line 18716 が責任を持つ)。
+        let dims: Option<(u64, u64)> = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Static {
+                source_dims: Some([w, h]),
+                ..
+            }) => Some((*w as u64, *h as u64)),
+            _ => None,
+        };
+        let Some((w, h)) = dims else {
+            return;
+        };
+        // **≤ 8K source は state を立てない** (Codex P2 第 6、2026-05): 8K base が既に
+        // フル解像度のため settle で得られる情報がなく、`try_spawn_settle_render` も
+        // `source_exceeds_8k=false` で即 return する。SettleReady を立ててしまうと
+        // status indicator が「高画質 ロード中…」を永久表示する (高画質_loaded=false が
+        // 「未ロードで進行中」と誤認される)。state 未設定なら status は「8K 表示」
+        // フォールスルーで適切に表示される。
+        let max_dim_u = MAX_TEXTURE_DIM as u64;
+        if w <= max_dim_u && h <= max_dim_u {
+            return;
+        }
+        let source_pixels = w * h;
+        // **`pano_session_approved_max_pixels` を尊重して再確認頻度を下げる**
+        // (Codex P1 第 5、2026-05): 元実装は flat 200 MP gate だったため、ユーザーが
+        // 「このセッション中は今後も高画質モードで開く」を選んでも次の >200 MP 画像で
+        // バナーが再表示されていた。`panorama::needs_user_confirmation()` で `approved_max
+        // × 1.25` までは無確認に倒す (= start_fs_load の tee 判定と同じロジック)。
+        let needs_confirm = crate::panorama::needs_user_confirmation(
+            source_pixels,
+            self.pano_session_approved_max_pixels,
+        );
+        let state = if !needs_confirm {
+            // ≤ 200 MP **または** approved_max × 1.25 以内: 自動承認
+            // (= 既にユーザーが同サイズ以上を承認済み)
+            if source_pixels > crate::panorama::PANO_SETTLE_MAX_PIXELS {
+                // > 200 MP かつ approved_max 範囲内 → 直接 SettleApproved
+                crate::panorama::PanoramaQualityState::SettleApproved
+            } else {
+                crate::panorama::PanoramaQualityState::SettleReady
+            }
+        } else {
+            let est_ram_gb = (source_pixels as f32) * 4.0 * 2.0 / 1.0e9;
+            crate::panorama::PanoramaQualityState::NeedsUserConfirmation {
+                source_pixels,
+                est_ram_gb,
+            }
+        };
+        self.pano_quality_state.insert(source_key, state);
+    }
+
     /// 「V キーで 360° ビューワー」案内トーストを必要なら出す (Codex P2 第 18 ラウンド)。
     ///
     /// 発火条件 (全て true のとき):
@@ -17297,10 +18351,14 @@ impl App {
         use crate::panorama::*;
         let source_key = self.metadata_cache_key(fs_idx)?;
         let bg = self.effective_upscale_bg_mode();
-        let ai_feature_active = self.ai_upscale_enabled || self.ai_denoise_model.is_some();
+        // AI が「この画像に実効的に適用されるか」で source_kind を分ける。
+        // 設定 ON でもサイズ閾値超でスキップされる画像は AI 由来扱いにしない
+        // (= settle を有効化できる、2026-05 ユーザー要望)。
+        let ai_effective = self.ai_will_apply_to(fs_idx);
 
-        // ai_upscale_cache 参照は AI 機能 ON のときだけ (Codex P1 第 14)
-        let ai_cache_entry = if ai_feature_active {
+        // ai_upscale_cache 参照は AI が実効的に動くときだけ (Codex P1 第 14 反映、
+        // 2026-05 で機能 flag → 実効判定に強化)
+        let ai_cache_entry = if ai_effective {
             self.ai_upscale_cache.get(&(fs_idx, bg))
         } else {
             None
@@ -17309,9 +18367,9 @@ impl App {
         let (pixels, source_kind) =
             if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx) {
                 // adjustment_cache は AI 由来 / 通常由来の両方が入る (実コード line 15500)。
-                // ai_feature_active が ON のときは AI 由来扱い (SOURCE_KIND_AI_ADJUST)、
-                // OFF のときは通常由来 (SOURCE_KIND_ADJUST_RAW)。
-                let kind = if ai_feature_active {
+                // ai_effective が true のときは AI 由来扱い (SOURCE_KIND_AI_ADJUST)、
+                // false のときは通常由来 (SOURCE_KIND_ADJUST_RAW)。
+                let kind = if ai_effective {
                     SOURCE_KIND_AI_ADJUST
                 } else {
                     SOURCE_KIND_ADJUST_RAW
@@ -17338,12 +18396,131 @@ impl App {
         let cache_key =
             make_pano_cache_key(crc16_of_str(&source_key), source_kind, adjust_gen, ai_gen);
 
+        // Phase 2a settle policy: source_kind と AI / 補正状態から判定 (§3.6.2.1)
+        let settle_policy = self.compute_settle_policy(fs_idx, source_kind);
+
         Some(PanoSourceResolution {
             source_key,
             cache_key,
             pixels,
             source_kind,
+            settle_policy,
         })
+    }
+
+    /// 360 度パノラマビュー Phase 2a: settle policy 判定 (§3.6.2.1)。
+    /// AI 機能 ON / `post_filter` / `auto_mode` / source_kind が AI 由来 (2/3) などで
+    /// `Disabled`、純粋色調補正なら `EnabledWithColorAdjustments`、補正なし &
+    /// AI なしなら `EnabledFromRaw`。
+    ///
+    /// **AI 機能 ON の判定** (2026-05 ユーザー要望反映):
+    /// 設定 ON でも画像サイズ (`should_process`) で実際に AI が動かないケースでは
+    /// settle を有効化する。判定は以下の OR:
+    ///   - `ai_upscale_enabled && upscale_in_range` (実効的にアップスケール対象)
+    ///   - `ai_denoise_model.is_some() && denoise_in_range` (実効的にデノイズ対象)
+    /// 画像サイズが取れない (= まだロード中) 場合は保守的に「適用される」とみなす。
+    pub(crate) fn compute_settle_policy(
+        &self,
+        fs_idx: usize,
+        source_kind: u16,
+    ) -> crate::panorama::PanoramaSettlePolicy {
+        use crate::panorama::PanoramaSettlePolicy::*;
+        use crate::panorama::{
+            SOURCE_KIND_ADJUST_RAW, SOURCE_KIND_AI, SOURCE_KIND_AI_ADJUST, SOURCE_KIND_FS,
+        };
+        // AI が「実際にこの画像に適用される」か判定。
+        // 設定 ON でもサイズ閾値超でスキップされるケースは settle 許可する。
+        let ai_actually_active = self.ai_will_apply_to(fs_idx);
+        if ai_actually_active {
+            return Disabled;
+        }
+        // source_kind が AI 由来 (2 or 3) なら settle 無効。
+        // (上の `ai_actually_active` 判定で大半は弾かれるが、AI OFF 直後に cache 残骸が
+        // 居て resolve_pano_source が AI 由来 entry を選んだ過渡期は別途ガードが要る)
+        if source_kind == SOURCE_KIND_AI || source_kind == SOURCE_KIND_AI_ADJUST {
+            return Disabled;
+        }
+        let params = self.effective_params(fs_idx);
+        if params.auto_mode.is_some() {
+            return Disabled;
+        }
+        if params.post_filter != crate::adjustment::PostFilter::None {
+            return Disabled;
+        }
+        match source_kind {
+            SOURCE_KIND_FS => {
+                if params.is_color_identity() {
+                    EnabledFromRaw
+                } else {
+                    // params 有効だが adjustment_cache 未生成 = transient
+                    Disabled
+                }
+            }
+            SOURCE_KIND_ADJUST_RAW => {
+                if params.is_color_identity() {
+                    // post_filter のみで adjustment_cache が出来た形跡 (上で除外済みのはず)
+                    Disabled
+                } else {
+                    EnabledWithColorAdjustments {
+                        params: params.clone(),
+                    }
+                }
+            }
+            _ => Disabled,
+        }
+    }
+
+    /// AI 機能 (upscale / denoise) がこの画像に実効的に適用されるか判定する。
+    /// 設定 ON でもサイズ閾値超 (`should_process(w, h, skip_px) == false`) なら false。
+    /// fs_cache に entry がまだ無い場合は判定不能なので保守的に true (= 適用予定)。
+    pub(crate) fn ai_will_apply_to(&self, fs_idx: usize) -> bool {
+        let upscale_on = self.ai_upscale_enabled;
+        let denoise_on = self.ai_denoise_model.is_some();
+        if !upscale_on && !denoise_on {
+            return false;
+        }
+        // 源解像度を fs_cache から取得 (clamp 前の source_dims 優先)。
+        // **fs_cache が evict された / Animated / 未ロード**等で見つからない場合は
+        // 他の cache 層 (adjustment_cache / ai_upscale_cache) からも探す (Codex P3 第 5、
+        // 2026-05): cache が複数層に分散したフレームで settle が誤って Disabled 化
+        // するのを防ぐ。後段の cache 層は pixels.size しか持たない (= GPU clamp 後の
+        // 8K cap dims) ので、AI 適用閾値 (skip_px は最大でも数 K) との比較なら問題ない。
+        let bg = self.effective_upscale_bg_mode();
+        let dims: Option<(u32, u32)> = match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Static {
+                source_dims: Some([w, h]),
+                ..
+            }) => Some((*w as u32, *h as u32)),
+            Some(FsCacheEntry::Static {
+                source_dims: None,
+                pixels,
+                ..
+            }) => Some((pixels.size[0] as u32, pixels.size[1] as u32)),
+            _ => {
+                // fs_cache 不在: adjustment_cache / ai_upscale_cache から pixels.size を借用
+                if let Some(FsCacheEntry::Static { pixels, .. }) =
+                    self.adjustment_cache.get(&fs_idx)
+                {
+                    Some((pixels.size[0] as u32, pixels.size[1] as u32))
+                } else if let Some(FsCacheEntry::Static { pixels, .. }) =
+                    self.ai_upscale_cache.get(&(fs_idx, bg))
+                {
+                    Some((pixels.size[0] as u32, pixels.size[1] as u32))
+                } else {
+                    None
+                }
+            }
+        };
+        let Some((w, h)) = dims else {
+            // 寸法不明 → 保守的に「適用される」(= settle を一時 Disabled)。
+            // 寸法が確定したら次フレで再評価される。
+            return true;
+        };
+        let upscale_will_apply = upscale_on
+            && crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px);
+        let denoise_will_apply = denoise_on
+            && crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px);
+        upscale_will_apply || denoise_will_apply
     }
 
     /// 360 モード ON / OFF をトグル。fs_idx は対象画像 (検出 hint の初期視点取得用)。
@@ -17356,9 +18533,19 @@ impl App {
     pub(crate) fn toggle_panorama_mode(&mut self, fs_idx: usize) {
         if self.panorama_state.is_some() {
             // OFF: state と GPU リソースを drop (callback_resources からも除去、
-            // Codex P2 第 18 ラウンド)
+            // Codex P2 第 18 ラウンド)。
             self.panorama_state = None;
             self.clear_pano_upload();
+            // **進行中の settle render と high-res worker を cancel** (Codex P2 第 8、
+            // 2026-05): 360 OFF 中も worker が走り続けると、(a) ~2.15 GB の RGBA を
+            // 数秒余分にメモリに保持、(b) 失敗時に `BaseOnly` / `failed` state を
+            // 立ててしまい、再度 V キーで ON にしても 8K base 表示で固まる。OFF は
+            // 「今は 360 不要」の明示シグナルなので worker を止めるのが UX 上自然。
+            // HighResSource (既に loaded 済み) は保持 (= 再 ON で即 settle 再開可能)。
+            self.clear_pano_refinement();
+            for (_, req) in self.pano_high_res_pending.drain() {
+                req.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             return;
         }
         // ON: GPano hint があれば初期視点に反映
@@ -17574,6 +18761,41 @@ impl App {
         }
     }
 
+    /// `pano_refinement` を `None` に落とす前に、進行中の settle render を **必ず
+    /// cancel** する (Codex P0 第 5 ラウンド、2026-05)。
+    ///
+    /// 直接 `self.pano_refinement = None;` するだけだと `RenderingHandle.cancel` の
+    /// Arc は worker への clone (cancel_worker) しか強参照が残らず、誰も `store(true)` を
+    /// 呼ばない。worker は row 単位の cancel チェックがあっても起動済みの rayon 行
+    /// 全部を回しきってしまう (50-100 ms 通常、最大 ~400 ms / 537 MP)。さらに worker は
+    /// `src_rgba: Arc<Vec<u8>>` (最大 2.15 GB) を握り続けるので、別画像へナビした直後の
+    /// メモリ peak が無駄に長く続く。
+    ///
+    /// 呼び出し箇所: `close_fullscreen` / `open_fullscreen` (別画像へ移動) /
+    /// `update_pano_refinement` の早期 return (フルスクリーン外 / 360 OFF)。
+    pub(crate) fn clear_pano_refinement(&mut self) {
+        if let Some(refinement) = self.pano_refinement.as_ref() {
+            if let Some(handle) = refinement.rendering.as_ref() {
+                handle
+                    .cancel
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        self.pano_refinement = None;
+        // **wgpu CallbackResources からも `SettleOverlayRef` を除去** (Codex P3 第 8、
+        // 2026-05): App 側で `pano_refinement = None` するだけだと callback_resources
+        // に挿入された SettleOverlayRef の Arc が残り、`UploadedSettleOverlay` (= wgpu
+        // テクスチャ ~7-33 MB) が解放されない。`clear_pano_upload` の base 側と同じ
+        // パターンで明示 remove する。
+        #[cfg(windows)]
+        if let Some(render_state) = self.wgpu_render_state.as_ref() {
+            let mut renderer = render_state.renderer.write();
+            renderer
+                .callback_resources
+                .remove::<crate::panorama_wgpu::SettleOverlayRef>();
+        }
+    }
+
     /// 見開き表示で `src_idx` の有効な補正値を `dst_idx` にコピーし、Undo に積む。
     /// コピー先がカスケード解決後のデフォルトと一致するなら page_params エントリは作られない。
     pub(crate) fn copy_spread_adjust(&mut self, src_idx: usize, dst_idx: usize) {
@@ -17674,7 +18896,23 @@ impl App {
             self.fs_early_dims.remove(key);
         }
         // 既存 backlog の重複エントリ (同 idx で再ロードされたケース) は新しい方で置換。
-        for (key, result, load_seq) in completed {
+        // **非 fullscreen の StaticPanorama は backlog に積む前に Static にダウングレード**
+        // (Codex P1 第 9、2026-05): `high_res` (~200-800 MB) は LRU 1 でどうせ
+        // pano_high_res_source には入らないので、backlog に複数滞留させる必要なし。
+        // mpsc 受信直後に drop して memory peak を最小化する。
+        let current_fs = self.fullscreen_idx;
+        for (key, mut result, load_seq) in completed {
+            if Some(key) != current_fs {
+                if let FsLoadResult::StaticPanorama {
+                    ci,
+                    source_dims,
+                    high_res: _,
+                } = result
+                {
+                    // high_res は scope 末で即 drop される
+                    result = FsLoadResult::Static { ci, source_dims };
+                }
+            }
             if let Some(pos) = self
                 .fs_upload_backlog
                 .iter()
@@ -17788,12 +19026,88 @@ impl App {
                         load_seq,
                     }
                 }
+                FsLoadResult::StaticPanorama {
+                    ci,
+                    source_dims,
+                    high_res,
+                } => {
+                    // 360 度パノラマビュー Phase 2a (docs/panorama-360-view-plan.md §4.6.0)
+                    // worker が tee 成功で運んできた経路。
+                    // 1. fs_cache には Static として格納 (既存 8K 表示はそのまま)
+                    // 2. pano_high_res_source[source_key] = high_res (settle 用フル RGBA)
+                    // 3. pano_quality_state: SettleReady (≤200MP) or SettleApproved
+                    let pixels = std::sync::Arc::new(ci);
+                    let upload = clamp_for_gpu(&pixels);
+                    let [w, h] = pixels.size;
+                    let handle = ctx.load_texture(
+                        format!("fs_{key}"),
+                        upload.into_owned(),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+                    let (full_w, full_h) = high_res.dims();
+                    let source_pixels = (full_w as u64) * (full_h as u64);
+                    if crate::perf::is_enabled() {
+                        crate::perf::event(
+                            "fs",
+                            "ready",
+                            perf_key_str.as_deref(),
+                            load_seq,
+                            &[
+                                ("idx", serde_json::Value::from(key)),
+                                ("upload_ms", serde_json::Value::from(upload_ms)),
+                                ("w", serde_json::Value::from(w)),
+                                ("h", serde_json::Value::from(h)),
+                                ("result_kind", serde_json::Value::from("static_panorama")),
+                                ("full_w", serde_json::Value::from(full_w)),
+                                ("full_h", serde_json::Value::from(full_h)),
+                                ("source_pixels", serde_json::Value::from(source_pixels)),
+                            ],
+                        );
+                    }
+                    // pano_high_res_source / pano_quality_state を更新
+                    if let Some(source_key) = self.metadata_cache_key(key) {
+                        // **LRU 1 enforcement** (Codex P1 第 8、2026-05): 当 idx が
+                        // フルスクリーン表示中の画像でなければ、prefetch tee 結果を
+                        // pano_high_res_source に **入れない**。各 entry は ~200 MB-
+                        // 800 MB の RGBA を保持するので、5 件 prefetch で 1-4 GB の
+                        // 累積メモリ。設計書 §4.1 のとおり「LRU 1 (active のみ)」を
+                        // 厳守する。state は (= fast-resume hint として) どちらでも
+                        // 入れて OK。
+                        if self.fullscreen_idx == Some(key) {
+                            self.pano_high_res_source
+                                .insert(source_key.clone(), high_res);
+                        }
+                        // それ以外でも quality_state は更新する (next open で reuse)
+                        let state = if source_pixels <= crate::panorama::PANO_SETTLE_MAX_PIXELS {
+                            crate::panorama::PanoramaQualityState::SettleReady
+                        } else {
+                            crate::panorama::PanoramaQualityState::SettleApproved
+                        };
+                        self.pano_quality_state.insert(source_key, state);
+                    }
+                    if self.fullscreen_idx == Some(key) {
+                        self.apply_sync_adjustment(ctx, key, &pixels);
+                    }
+                    FsCacheEntry::Static {
+                        tex: handle,
+                        pixels,
+                        source_dims: Some(source_dims),
+                        load_seq,
+                    }
+                }
                 FsLoadResult::Failed => FsCacheEntry::Failed,
                 FsLoadResult::DimsOnly { .. } => {
                     unreachable!("DimsOnly should be drained before reaching completion match")
                 }
             };
             self.fs_cache.insert(key, entry);
+            // 360 度パノラマビュー Phase 2a (§3.6.4): worker は tee しなかったが、
+            // 画像が 360 候補 (XMP equirect OR aspect 2:1) かつ大画像 (>200 MP) なら
+            // バナー表示の判定。state が既に BaseOnly ならそのまま、未設定なら
+            // NeedsUserConfirmation を立てる。SettleReady の小さい候補は worker tee
+            // 経路 (StaticPanorama) で処理されるので、ここに到達するのは tee 不採用ケース。
+            self.maybe_update_pano_quality_state_from_static(key);
             // 保存済みマスクがあれば自動で inpaint 適用
             self.auto_apply_saved_mask(ctx, key);
             if self.fullscreen_idx == Some(key) {
@@ -19577,6 +20891,11 @@ impl eframe::App for App {
         self.poll_search();
         self.poll_favsearch();
         self.poll_metadata_load();
+        // 360 度パノラマビュー Phase 2a (docs/panorama-360-view-plan.md §4.6.3):
+        // 1. NeedsUserConfirmation → SettleApproved 経路の追加 worker 結果取り込み
+        // 2. settle 静止検出 + render spawn + 結果ポーリング
+        self.poll_pano_high_res(ctx);
+        self.update_pano_refinement(ctx);
         self.poll_tag_prewarm_results();
         self.poll_delete_pending();
         self.poll_paste_pending();
@@ -21666,6 +22985,30 @@ fn draw_thumb_texture(
 
 /// DynamicImage を egui::ColorImage に変換する (リサイズなし)。
 /// フルスクリーン表示や PDF 再レンダリング結果の変換で使用。
+/// 360 度パノラマビュー Phase 2a (Codex P1 第 2、2026-05): viewport から settle
+/// 出力サイズを計算する。長辺 1920 で cap し、aspect は viewport を維持。
+/// 1920×1080 で ~2 MP (50-100 ms CPU レンダ)、GPU 側で 4K viewport に線形拡大される。
+pub(crate) fn compute_pano_settle_output_size(viewport: (u32, u32)) -> (u32, u32) {
+    let (vw, vh) = (viewport.0.max(1), viewport.1.max(1));
+    const CAP: u32 = 1920;
+    if vw <= CAP && vh <= CAP {
+        return (vw, vh);
+    }
+    if vw >= vh {
+        let new_w = CAP;
+        let new_h = ((new_w as f32) * (vh as f32) / (vw as f32))
+            .round()
+            .clamp(1.0, CAP as f32) as u32;
+        (new_w, new_h)
+    } else {
+        let new_h = CAP;
+        let new_w = ((new_h as f32) * (vw as f32) / (vh as f32))
+            .round()
+            .clamp(1.0, CAP as f32) as u32;
+        (new_w, new_h)
+    }
+}
+
 pub(crate) fn dynamic_image_to_color_image(img: &image::DynamicImage) -> egui::ColorImage {
     let rgba = img.to_rgba8();
     let size = [rgba.width() as usize, rgba.height() as usize];

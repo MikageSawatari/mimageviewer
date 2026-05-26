@@ -29,6 +29,17 @@ pub enum FsLoadResult {
         ci: egui::ColorImage,
         source_dims: [usize; 2],
     },
+    /// 360 度パノラマ用 (Phase 2a、SettleReady or SettleApproved 経路、
+    /// docs/panorama-360-view-plan.md §4.6.0)。
+    ///
+    /// 通常の `Static` と同じ ColorImage を持ちつつ、フル解像度 RGBA を追加で運ぶ。
+    /// ワーカーは同じ DynamicImage から tee で両方を生成する (二重デコード回避)。
+    /// `high_res` は `App::pano_high_res_source` に格納される。
+    StaticPanorama {
+        ci: egui::ColorImage,
+        source_dims: [usize; 2],
+        high_res: crate::panorama::HighResSource,
+    },
     /// アニメーション: (フレーム画像, 表示時間[秒]) のベクタ
     Animated(Vec<(egui::ColorImage, f64)>),
     /// デコードに失敗した (fs_cache に Failed エントリを記録して
