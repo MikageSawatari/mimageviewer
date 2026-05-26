@@ -1698,6 +1698,30 @@ pub(super) fn draw_native_center_status(
         });
 }
 
+/// 中央 pause prompt の replay / play ボタン円形 rect を返す純粋関数。
+///
+/// `draw_native_center_pause_controls` の実描画と、左右 hover パネル抑止 (cf.
+/// `NativePresenter::pointer_over_center_pause_controls`) で同じ rect を参照させるための
+/// source of truth。半径 56 / gap 34 はボタンの視覚デザインに固定された値で、ここを
+/// 変えると HUD region (`compute_hud_regions`) の SetWindowRgn にも影響するため
+/// 必ず描画側と一致させる。
+pub(super) fn native_center_pause_button_rects(
+    overlay_width_points: f32,
+    overlay_height_points: f32,
+) -> (egui::Rect, egui::Rect) {
+    let radius = 56.0_f32;
+    let gap = 34.0_f32;
+    let cx = overlay_width_points * 0.5;
+    let cy = overlay_height_points * 0.5;
+    let replay_center = egui::pos2(cx - radius - gap * 0.5, cy);
+    let play_center = egui::pos2(cx + radius + gap * 0.5, cy);
+    let size = egui::vec2(radius * 2.0, radius * 2.0);
+    (
+        egui::Rect::from_center_size(replay_center, size),
+        egui::Rect::from_center_size(play_center, size),
+    )
+}
+
 pub(super) fn draw_native_center_pause_controls(
     ctx: &egui::Context,
     overlay_width_points: f32,
@@ -1723,16 +1747,16 @@ pub(super) fn draw_native_center_pause_controls(
             );
             ui.set_min_size(full_rect.size());
             let painter = ui.painter().clone();
-            let radius = 56.0;
-            let gap = 34.0;
+            let radius = 56.0_f32;
             let center_y = full_rect.center().y;
-            let replay_center = egui::pos2(full_rect.center().x - radius - gap * 0.5, center_y);
-            let play_center = egui::pos2(full_rect.center().x + radius + gap * 0.5, center_y);
-
-            let replay_rect =
-                egui::Rect::from_center_size(replay_center, egui::vec2(radius * 2.0, radius * 2.0));
-            let play_rect =
-                egui::Rect::from_center_size(play_center, egui::vec2(radius * 2.0, radius * 2.0));
+            // ボタン rect は `native_center_pause_button_rects` を source of truth にして、
+            // 左右 hover パネル抑止 (presenter::pointer_over_center_pause_controls) と
+            // 完全に同じ rect を共有する。`radius` は icon 描画 / circle_stroke / ラベル縦位置
+            // 計算で再利用するため定数として残す (helper 内の 56.0 と一致させる)。
+            let (replay_rect, play_rect) =
+                native_center_pause_button_rects(overlay_width_points, overlay_height_points);
+            let replay_center = replay_rect.center();
+            let play_center = play_rect.center();
 
             let replay_resp = ui
                 .interact(

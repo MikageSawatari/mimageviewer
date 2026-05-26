@@ -5160,6 +5160,41 @@ impl NativeEguiOverlay {
         self.vst3_panel.as_ref().is_some_and(|panel| panel.visible)
     }
 
+    /// 中央 pause prompt (「最初から / 続きから」ボタン 2 個) が **可視中**で、かつ
+    /// `pos` がそのボタン rect の真上 (+ 6pt padding) にあるかどうか。
+    ///
+    /// 狭いウィンドウ幅 (≲ 1120pt) では中央ボタンが左 jump panel / 右 metadata panel の
+    /// hover 反応ゾーン (x=0..320 / x=w-430..w) に入り込み、cursor をボタンに乗せた瞬間に
+    /// パネルが visible になってボタンクリックを奪う現象を起こす。本判定で true のときは
+    /// `right_panel_visible()` / `jump_panel_visible()` を強制 false に倒してクリックを通す。
+    ///
+    /// 判定 rect はラベル / ヒント帯を含まない (= ボタン円形 rect + 6pt padding のみ)。
+    /// ラベル帯は中央寄せでパネル hover 帯と重ならず、carve-out の副作用を最小に保つため。
+    fn pointer_over_center_pause_controls(&self, pos: egui::Pos2) -> bool {
+        let normalize_scanning = matches!(
+            self.normalize_state.ui_state,
+            crate::video::normalize_types::NormalizeUiState::Scanning
+        );
+        let visible = center_pause_controls_visible_for_state(CenterPauseControlsInputs {
+            tile_overlay_visible: self.tile_overlay.is_some(),
+            is_playing: self.video_is_playing,
+            frame_step_active: self.video_frame_step_active,
+            initial_pause_controls_pending: self.initial_pause_controls_pending,
+            first_frame_presented: self.first_frame_presented,
+            has_video_error: self.video_error.is_some(),
+            normalize_scanning,
+        });
+        if !visible {
+            return false;
+        }
+        let overlay_width_points = self.width as f32 / self.pixels_per_point;
+        let overlay_height_points = self.height as f32 / self.pixels_per_point;
+        let (replay, play) =
+            native_center_pause_button_rects(overlay_width_points, overlay_height_points);
+        let pad = egui::vec2(6.0, 6.0);
+        replay.expand2(pad).contains(pos) || play.expand2(pad).contains(pos)
+    }
+
     fn right_panel_visible(&self) -> bool {
         // 実機修正 (2026-05-12): 外部 drag 中は right panel を表示しない (= VST を画面右に
         // ドラッグしたとき panel が出て VST 入力が奪われる症状の対応)。
@@ -5178,6 +5213,11 @@ impl NativeEguiOverlay {
         let Some(pos) = self.pointer_pos else {
             return false;
         };
+        // 中央 pause prompt ボタン上では右パネル hover を抑止 (狭幅で右ボタンが右パネル
+        // hover 帯に飲み込まれてクリックを奪われる事象の対策)。
+        if self.pointer_over_center_pause_controls(pos) {
+            return false;
+        }
         let overlay_width_points = self.width as f32 / self.pixels_per_point;
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
         let panel_w =
@@ -5201,6 +5241,10 @@ impl NativeEguiOverlay {
         let Some(pos) = self.pointer_pos else {
             return false;
         };
+        // 中央 pause prompt ボタン上では左パネル hover を抑止 (右パネルと同様)。
+        if self.pointer_over_center_pause_controls(pos) {
+            return false;
+        }
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
         let x_max = native_jump_panel_width();
         native_panel_hover_rect(
@@ -8021,6 +8065,92 @@ mod tests {
         assert!((rect.center().y - 46.0).abs() < f32::EPSILON);
         assert!((rect.width() - 39.6).abs() < 0.001);
         assert!((rect.height() - 39.6).abs() < 0.001);
+    }
+
+    /// 中央 pause prompt の replay/play ボタン rect は描画 (`draw_native_center_pause_controls`)
+    /// と判定 (`pointer_over_center_pause_controls`) で同じ source を共有する。
+    /// 半径 56 / gap 34、画面中央対称、2 個同サイズの基本特性を固定する。
+    #[test]
+    fn native_center_pause_button_rects_basic_geometry() {
+        let (replay, play) = super::overlay_draw::native_center_pause_button_rects(1920.0, 1080.0);
+        // サイズ: 半径 56 → 112×112
+        assert!((replay.width() - 112.0).abs() < f32::EPSILON);
+        assert!((replay.height() - 112.0).abs() < f32::EPSILON);
+        assert!((play.width() - 112.0).abs() < f32::EPSILON);
+        assert!((play.height() - 112.0).abs() < f32::EPSILON);
+        // 縦位置: 画面中央 540
+        assert!((replay.center().y - 540.0).abs() < f32::EPSILON);
+        assert!((play.center().y - 540.0).abs() < f32::EPSILON);
+        // 横位置: 画面中央 960 を中心に対称、間隔 = gap(34) + 半径2つ(112) = 146
+        assert!((replay.center().x - (960.0 - 73.0)).abs() < f32::EPSILON);
+        assert!((play.center().x - (960.0 + 73.0)).abs() < f32::EPSILON);
+        assert!(((play.center().x - replay.center().x) - 146.0).abs() < f32::EPSILON);
+    }
+
+    /// 狭ウィンドウ幅 (640pt) では中央ボタンが左 jump panel (x=0..320) と右 metadata
+    /// panel (x=w-min(430, w*0.5)..w) の hover 反応 rect に飲み込まれる。これが本修正の
+    /// 対象ケースで、carve-out が無いとパネル side が visible になりボタンクリックが奪われる。
+    #[test]
+    fn native_center_pause_buttons_overlap_side_panels_when_window_is_narrow() {
+        let overlay_w = 640.0_f32;
+        let overlay_h = 480.0_f32;
+        let (replay, play) =
+            super::overlay_draw::native_center_pause_button_rects(overlay_w, overlay_h);
+
+        // 左 jump panel hover 帯: x = 0..320 (native_jump_panel_width)
+        let jump_panel_w = super::overlay_draw::native_jump_panel_width();
+        assert!((jump_panel_w - 320.0).abs() < f32::EPSILON);
+        // 右 metadata panel hover 帯: x = w - min(430, w*0.5)..w = w - 320..w = 320..640
+        let metadata_panel_w =
+            super::overlay_draw::native_metadata_panel_width().min(overlay_w * 0.5);
+        let metadata_left = overlay_w - metadata_panel_w;
+
+        // 左 replay ボタンは左 jump panel ゾーンと重なる必要がある (carve-out が要る理由)
+        assert!(
+            replay.min.x < jump_panel_w && replay.max.x > 0.0,
+            "replay {:?} should overlap jump panel x=0..{}",
+            replay,
+            jump_panel_w
+        );
+        // 右 play ボタンは右 metadata panel ゾーンと重なる必要がある
+        assert!(
+            play.max.x > metadata_left && play.min.x < overlay_w,
+            "play {:?} should overlap metadata panel x={}..{}",
+            play,
+            metadata_left,
+            overlay_w
+        );
+    }
+
+    /// フル HD (1920×1080) などの広ウィンドウでは中央ボタンと左右パネル hover 帯は重ならない。
+    /// carve-out 副作用が広幅で発生しないことの sanity check。
+    #[test]
+    fn native_center_pause_buttons_do_not_overlap_side_panels_when_window_is_wide() {
+        let overlay_w = 1920.0_f32;
+        let overlay_h = 1080.0_f32;
+        let (replay, play) =
+            super::overlay_draw::native_center_pause_button_rects(overlay_w, overlay_h);
+
+        let jump_panel_w = super::overlay_draw::native_jump_panel_width();
+        let metadata_panel_w =
+            super::overlay_draw::native_metadata_panel_width().min(overlay_w * 0.5);
+        let metadata_left = overlay_w - metadata_panel_w;
+
+        // 左ボタンは jump panel より十分内側
+        assert!(
+            replay.min.x > jump_panel_w,
+            "replay {:?} should not enter jump panel x=0..{}",
+            replay,
+            jump_panel_w
+        );
+        // 右ボタンは metadata panel より十分内側
+        assert!(
+            play.max.x < metadata_left,
+            "play {:?} should not enter metadata panel x={}..{}",
+            play,
+            metadata_left,
+            overlay_w
+        );
     }
 
     /// 1:1 SAR では従来の isotropic transform と一致 (regression-safe を保証)。

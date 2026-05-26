@@ -96,6 +96,14 @@ normalize blocker / tile overlay / paused center / seek hover thumbnail / checkm
 非表示時の hover 検出範囲、画面上下端の帯) は region に **含めない** — 含めると bar 非表示時に VST の
 ノブが上下端と重なったとき入力を奪うため。
 
+**左右パネル hover の中央ボタン carve-out**: `right_panel_visible()` / `jump_panel_visible()` は
+VST3 panel / 外部 drag / speed popup / seek hover thumbnail のときに早期 false 返却するのに加え、
+**中央 pause prompt (「最初から / 続きから」2 ボタン) 可視中で pointer がボタン rect (+ 6pt
+padding) 上にあるとき** も false を返す (`pointer_over_center_pause_controls`、
+`overlay_draw::native_center_pause_button_rects` が source of truth)。
+これがないと狭ウィンドウ幅 (≲ 1120pt) で右ボタンが右 metadata panel hover 帯 (`x=w-430..w`)
+に飲み込まれてクリックが奪われる。`pointer_over_scroll_panel` は AND 経路なので追加変更不要。
+
 bar の hover 表示は presenter thread の **50ms 周期 `GetCursorPos` polling** (`cursor_polling_tick`)
 で代替: cursor が presenter HWND client rect 内なら synthetic `MouseMove` を `push_native_event` に流し、
 activation zone 内なら HUD raise burst をエンキューする (= VST 手動クリックで HUD が裏に回ったあとの
