@@ -1334,17 +1334,16 @@ codex exec --sandbox read-only -o /tmp/codex-1.txt \
 cat /tmp/codex-1.txt   # P1/P2/P3 サマリ
 
 # 2 ラウンド目以降 (同じセッションを継続)
-# 注意: `codex exec resume` には `--sandbox` フラグが**無い** (codex 0.x で確認、
-# 元セッションの sandbox 設定が引き継がれる)。指定すると `Usage: ...` でエラーになる。
-codex exec resume --last -o /tmp/codex-2.txt - \
-    < <(echo "P2 の修正を <commit-hash> で入れた。意図通り直っているか確認して。") \
-    > /tmp/codex-2-events.log 2>&1
+# 注意 1: `codex exec resume` には `--sandbox` フラグが**無い** (codex 0.124 で確認、
+#         元セッションの sandbox 設定が引き継がれる)。指定すると `Usage: ...` でエラーになる。
+# 注意 2: prompt に `backtick` / $var を含めるケースが多いので、stdin 経由 (`-`) で渡す。
+#         heredoc を temp ファイルに書いてから流し込むのが一番安全 (詳細: 後述 §stdin の取り扱い)。
+cat > /tmp/codex-prompt.txt <<'PROMPT'
+P2 の修正を <commit-hash> で入れた。意図通り直っているか確認して。
+PROMPT
+codex exec resume --last -o /tmp/codex-2.txt - < /tmp/codex-prompt.txt > /tmp/codex-2-events.log 2>&1
 cat /tmp/codex-2.txt
 ```
-
-**prompt に backtick / `$` / 改行を含めたい場合**: positional 引数で渡すと bash が
-backtick を command substitution として評価してしまう。`-` を指定して stdin から
-渡すのが安全 (上の例)。または heredoc を temp ファイルへ書いて `"$(cat file)"`。
 
 #### 明示的に SID を指定したいとき
 
@@ -1359,10 +1358,11 @@ codex exec --json --sandbox read-only -o /tmp/codex-1.txt \
     < /dev/null > /tmp/codex-1-events.jsonl 2>&1
 SID=$(head -1 /tmp/codex-1-events.jsonl | jq -r .thread_id)
 
-# 2 ラウンド目以降 (SID 指定で resume、--sandbox なし)
-codex exec resume "$SID" -o /tmp/codex-2.txt - \
-    < <(echo "P2 について詳しく説明して") \
-    > /tmp/codex-2-events.log 2>&1
+# 2 ラウンド目以降 (SID 指定で resume、--sandbox なし、prompt は stdin 経由)
+cat > /tmp/codex-prompt.txt <<'PROMPT'
+P2 について詳しく説明して
+PROMPT
+codex exec resume "$SID" -o /tmp/codex-2.txt - < /tmp/codex-prompt.txt > /tmp/codex-2-events.log 2>&1
 ```
 
 #### 制約・注意点
@@ -1413,12 +1413,39 @@ cat /tmp/codex-final.txt   # ここに P1/P2/P3 サマリだけが入る
 `codex exec --output-last-message <FILE>` (短縮形 `-o <FILE>`) で**最終回答 (= P1/P2/P3
 サマリ) だけ**をファイルに直接書き出せる。awk で抽出するより確実。
 
-### 必須: stdin を `< /dev/null` で閉じる
+### stdin の取り扱い (必須)
 
-`codex exec` は stdin がパイプ判定されるとそれを `<stdin>` ブロックとして読みに行き、
-EOF まで待機する (`Reading additional input from stdin...` と表示されたまま固まる)。
-Claude Code の Bash tool 経由で起動するときは stdin が常に何かに繋がっているので、
-**必ず `< /dev/null` を付ける**。これを忘れると 5 分以上ハングして手で kill する羽目になる。
+`codex exec` / `codex exec resume` は **stdin を常に明示的に制御する**こと。Claude Code
+の Bash tool 経由で起動すると stdin が必ず何かに繋がっているので、放置すると codex は
+それを `<stdin>` ブロックとして読みに行き、EOF まで `Reading additional input from
+stdin...` で固まる (5 分以上ハングして手で kill する羽目)。2 つのパターンがある:
+
+**(A) positional 引数で prompt を渡すとき → `< /dev/null` で stdin を閉じる**
+
+```bash
+codex exec --sandbox read-only -o /tmp/codex-out.txt "短い prompt" < /dev/null > /tmp/log 2>&1
+```
+
+短く `$` / backtick / 改行を含まない prompt 向け。
+
+**(B) `-` (stdin から prompt を読む) を指定するとき → `<` で prompt ソースを渡す**
+
+```bash
+# heredoc を temp ファイルに書いてから流し込む (一番安全、長文 OK)
+cat > /tmp/codex-prompt.txt <<'PROMPT'
+複数行の prompt。`backtick` や $var もそのままリテラル扱いされる。
+PROMPT
+codex exec resume --last -o /tmp/codex-out.txt - < /tmp/codex-prompt.txt > /tmp/log 2>&1
+
+# process substitution でもよい (短文向け)
+codex exec resume --last -o /tmp/codex-out.txt - \
+    < <(echo "短い prompt") > /tmp/log 2>&1
+```
+
+**(B) を使う理由**: positional 引数は bash の通常評価を通るので、prompt に backtick が
+あると **command substitution として実行されて構文エラーや意図しないコマンド実行**が
+起きる (`Usage: codex exec ...` で死ぬ実例あり)。`'...'` で single-quote しても、prompt
+内に `'` を含めるたびにエスケープ手間が増えるので、長文 / 特殊文字含みは (B) が確実。
 
 ### awk で結論抽出する旧フォーマット (`-o` が使えない古い codex 用)
 
