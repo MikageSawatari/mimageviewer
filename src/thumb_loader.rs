@@ -317,13 +317,25 @@ pub fn resize_to_display_color_image(
 /// 画像ファイルをデコードし、指定サイズにリサイズした ColorImage を返す。
 /// 動画の同名画像サムネイルオーバーライド用。
 pub fn decode_image_for_thumb(path: &std::path::Path, display_px: u32) -> Option<egui::ColorImage> {
-    // JPEG なら TurboJPEG で高速デコードを試す
-    let img = if is_jpeg_ext(path) {
-        decode_jpeg_turbo_from_path(path)
+    // JPEG なら TurboJPEG で DCT scale 付き高速デコードを試す。
+    // この関数は cache 用 thumb_px を持たないので target = display_px を使う。
+    let turbo_img: Option<image::DynamicImage> = if is_jpeg_ext(path) {
+        match decode_jpeg_turbo_scaled_from_path(path, display_px) {
+            Ok((img, _stats)) => Some(img),
+            Err(DctDecodeError::TerminalRejection(msg)) => {
+                // adversarial JPEG — fallback すると danger なので None で諦める。
+                // この関数は cosmetic helper (動画 sidecar) なので致命的ではない。
+                crate::logger::log(format!(
+                    "decode_image_for_thumb: DCT terminal rejection {path:?}: {msg}"
+                ));
+                return None;
+            }
+            Err(DctDecodeError::Fallback(_)) => None,
+        }
     } else {
         None
     };
-    let img = img
+    let img = turbo_img
         .or_else(|| image::open(path).ok())
         .or_else(|| crate::wic_decoder::decode_to_dynamic_image(path))?;
     Some(resize_to_display_color_image(&img, display_px))
@@ -421,33 +433,197 @@ fn orientation_from_text(text: &str) -> Option<u16> {
 }
 
 // -----------------------------------------------------------------------
-// TurboJPEG 高速デコード
+// TurboJPEG 高速デコード + DCT スケール
 // -----------------------------------------------------------------------
+//
+// JPEG ヘッダから真の寸法を読み、target_px と比較して DCT scale factor を選択する。
+// libjpeg-turbo の `tj3SetScalingFactor` が `M/8` (M ∈ 1..=8) を受け付けるので、
+// 「スケール後でも target を超える最小の M」を選ぶ。
+//
+// 設計詳細: docs/dct-scale-plan.md
+// 実測: scripts/bench_dct_scale.py (Olympus PEN 20MP で 2.5× 高速化、PSNR 51dB)
 
-/// TurboJPEG を使うファイルサイズ上限 (5 MB)。
-/// 大容量カメラ JPEG (10-30MB) では `std::fs::read()` の全読み込みコストが
-/// `image::open()` のストリーミングデコードを上回るため、通常パスに任せる。
-/// ZIP 内 JPEG は既にメモリ上にあるためこの制限は適用しない。
-const TURBOJPEG_FILE_SIZE_LIMIT: u64 = 5 * 1024 * 1024;
+/// `decode_jpeg_turbo_scaled_*` で許容する圧縮入力サイズの上限 (500 MB)。
+/// これを超える JPEG は image::open / WIC chain に降ろす。
+/// std::fs::read が低 RAM 環境を圧迫する事故を防ぐ guard。
+const MAX_TURBOJPEG_INPUT_SIZE: u64 = 500 * 1024 * 1024;
 
-/// JPEG ファイルを TurboJPEG (libjpeg-turbo) でデコードする。
-/// SIMD 最適化により image クレートの純粋 Rust デコーダーより 2-4 倍高速。
-/// ファイルサイズが `TURBOJPEG_FILE_SIZE_LIMIT` を超える場合は None を返し、
-/// 呼び出し側で image クレートにフォールバックさせる。
-fn decode_jpeg_turbo_from_path(path: &Path) -> Option<image::DynamicImage> {
-    // 大容量ファイルは image::open() のストリーミングデコードに任せる
-    let meta = std::fs::metadata(path).ok()?;
-    if meta.len() > TURBOJPEG_FILE_SIZE_LIMIT {
-        return None;
-    }
-    let data = std::fs::read(path).ok()?;
-    decode_jpeg_turbo_from_bytes(&data)
+/// DCT スケール後の RGB 出力 buffer サイズ上限 (256 MB ≈ 9000×9000 px)。
+/// adversarial JPEG (header に巨大寸法を埋め込んだもの) で巨大 allocation が
+/// 発生するのを防ぐ。これを超えるケースは `TerminalRejection` で即拒否し、
+/// 呼び出し側が image::open に fallback すると同じ問題が再発するため
+/// **fallback してはならない**。
+const MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
+
+/// DCT スケール decode の結果メタデータ。
+///
+/// `src_w` / `src_h` は JPEG ヘッダから読んだ **元寸法** (EXIF orientation
+/// 適用前)。catalog の `source_dims` に保存するには `source_dims_after_exif()`
+/// で EXIF orientation を考慮してから使うこと。
+///
+/// `out_w` / `out_h` は DCT scale 適用後の decoded buffer 寸法 = 戻り値の
+/// `DynamicImage::width()/height()` と一致。
+#[derive(Copy, Clone, Debug)]
+pub struct ScaleStats {
+    pub src_w: u32,
+    pub src_h: u32,
+    /// DCT scale 分子 (1..=8)。分母は常に 8。M=8 は等倍 (scale 無し)。
+    pub scale_num: u32,
+    pub out_w: u32,
+    pub out_h: u32,
 }
 
-/// バイト列から JPEG を TurboJPEG でデコードする（ZIP 内 JPEG 用）。
-fn decode_jpeg_turbo_from_bytes(data: &[u8]) -> Option<image::DynamicImage> {
-    let img: image::RgbImage = turbojpeg::decompress_image(data).ok()?;
-    Some(image::DynamicImage::ImageRgb8(img))
+impl ScaleStats {
+    /// EXIF orientation を適用した後の元寸法を返す。orientation が 5-8
+    /// (90° / 270° 系) なら w/h を swap。catalog の source_dims にこれを書く。
+    pub fn source_dims_after_exif(&self, orientation: u16) -> (u32, u32) {
+        match orientation {
+            5..=8 => (self.src_h, self.src_w),
+            _ => (self.src_w, self.src_h),
+        }
+    }
+}
+
+/// DCT スケール decode の失敗種別。
+///
+/// `Fallback` は呼び出し側が **image::open → WIC → Susie chain に降りてよい** ケース。
+/// `TerminalRejection` は **降りてはいけない** ケース (= image::open 等がもっと
+/// 巨大な allocation を要求して safety guard を回避する事故になる)。
+#[derive(Debug)]
+pub enum DctDecodeError {
+    /// header read 失敗・I/O エラー・正常な subsampling 非対応・圧縮入力サイズ超過など。
+    /// 呼び出し側は image::open / WIC chain に fallback してよい。
+    Fallback(String),
+    /// terminal: adversarial / 異常な header dims など。
+    /// fallback すると danger なので、エラーを呼び出し元に伝播する。
+    TerminalRejection(String),
+}
+
+/// 与えられた元寸法と target ピクセルから DCT scale 分子 M を選ぶ。
+///
+/// 戻り値は M ∈ 1..=8 (scale = M/8)。libjpeg-turbo の出力寸法は
+/// `ceil(src * M / 8)` なので、これが `target` を超える最小の M を解く:
+///
+/// ```text
+///   ceil(src * M / 8) >= target
+///   ⇔ src * M + 7 >= 8 * target
+///   ⇔ M >= (8 * target - 7) / src
+///   ⇔ M = ceil((8 * target - 7) / src)
+/// ```
+///
+/// u64 で計算して overflow を回避。`src_max_edge == 0` は 0 division を避けて
+/// scale=1/1 (M=8) にフォールバック。
+pub(crate) fn pick_dct_scale_num(src_max_edge: u32, target_px: u32) -> u32 {
+    if src_max_edge == 0 {
+        return 8;
+    }
+    let target = target_px as u64;
+    if target == 0 {
+        return 1;
+    }
+    let numer = (8u64).saturating_mul(target).saturating_sub(7);
+    let m_raw = numer.div_ceil(src_max_edge as u64);
+    // clamp は u64 上で先に行ってから u32 cast (target_px=u32::MAX 等の異常入力で
+    // u32 wrap してから clamp すると意図しない値になる)。
+    m_raw.clamp(1, 8) as u32
+}
+
+/// バイト列から JPEG を TurboJPEG で DCT scale 付きデコードする。
+///
+/// `target_px` は最終 thumbnail 表示の max-edge 目安。これに対して
+/// `pick_dct_scale_num` で M/8 を選び、libjpeg-turbo の `set_scaling_factor`
+/// 経由でデコード時にスケールダウンする。
+///
+/// 詳細: docs/dct-scale-plan.md §2-§3
+pub fn decode_jpeg_turbo_scaled_from_bytes(
+    data: &[u8],
+    target_px: u32,
+) -> Result<(image::DynamicImage, ScaleStats), DctDecodeError> {
+    use DctDecodeError::*;
+    use turbojpeg::{Decompressor, Image, PixelFormat, ScalingFactor};
+
+    let mut dec = Decompressor::new().map_err(|e| Fallback(format!("Decompressor::new: {e}")))?;
+    let header = dec
+        .read_header(data)
+        .map_err(|e| Fallback(format!("read_header: {e}")))?;
+
+    // lossless JPEG は `set_scaling_factor != 1/1` がエラー。scale=1/1 強制で
+    // TurboJPEG full decode を維持する (None で fallback すると遅くなるため)。
+    let m = if header.is_lossless {
+        8
+    } else {
+        let src_max = (header.width as u32).max(header.height as u32);
+        pick_dct_scale_num(src_max, target_px)
+    };
+    let scale = ScalingFactor::new(m as usize, 8);
+    dec.set_scaling_factor(scale)
+        .map_err(|e| Fallback(format!("set_scaling_factor: {e}")))?;
+
+    let scaled = header.scaled(scale);
+
+    // allocation safety: checked_mul + max bound。失敗時は TerminalRejection
+    // (= fallback NG)。adversarial JPEG が image::open でもっと巨大な allocation
+    // を要求する事故を防ぐ。
+    let byte_count = scaled
+        .width
+        .checked_mul(scaled.height)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| {
+            TerminalRejection(format!(
+                "decoded buffer overflow: {}x{}x3",
+                scaled.width, scaled.height
+            ))
+        })?;
+    if byte_count > MAX_DECODED_BYTES {
+        return Err(TerminalRejection(format!(
+            "decoded buffer too large: {} bytes > {} max",
+            byte_count, MAX_DECODED_BYTES
+        )));
+    }
+    let mut buf = vec![0u8; byte_count];
+
+    let out = Image {
+        pixels: buf.as_mut_slice(),
+        width: scaled.width,
+        pitch: scaled.width * 3,
+        height: scaled.height,
+        format: PixelFormat::RGB,
+    };
+    dec.decompress(data, out)
+        .map_err(|e| Fallback(format!("decompress: {e}")))?;
+
+    let rgb = image::RgbImage::from_raw(scaled.width as u32, scaled.height as u32, buf)
+        .ok_or_else(|| Fallback("RgbImage::from_raw failed".into()))?;
+    let img = image::DynamicImage::ImageRgb8(rgb);
+    let stats = ScaleStats {
+        src_w: header.width as u32,
+        src_h: header.height as u32,
+        scale_num: m,
+        out_w: scaled.width as u32,
+        out_h: scaled.height as u32,
+    };
+    Ok((img, stats))
+}
+
+/// JPEG ファイルパスから TurboJPEG で DCT scale 付きデコードする。
+///
+/// 圧縮ファイルサイズが `MAX_TURBOJPEG_INPUT_SIZE` を超える場合は
+/// `Fallback` を返し、image::open / WIC chain に降ろす。
+pub fn decode_jpeg_turbo_scaled_from_path(
+    path: &Path,
+    target_px: u32,
+) -> Result<(image::DynamicImage, ScaleStats), DctDecodeError> {
+    use DctDecodeError::*;
+    let meta = std::fs::metadata(path).map_err(|e| Fallback(format!("metadata: {e}")))?;
+    if meta.len() > MAX_TURBOJPEG_INPUT_SIZE {
+        return Err(Fallback(format!(
+            "input too large for TurboJPEG: {} bytes > {} max",
+            meta.len(),
+            MAX_TURBOJPEG_INPUT_SIZE
+        )));
+    }
+    let data = std::fs::read(path).map_err(|e| Fallback(format!("read: {e}")))?;
+    decode_jpeg_turbo_scaled_from_bytes(&data, target_px)
 }
 
 /// 拡張子 (小文字、先頭 `.` なし) が **Susie プラグイン専用** か判定する。
@@ -526,13 +702,13 @@ fn is_jpeg_extension(ext: &str) -> bool {
     JPEG_EXTENSIONS.iter().any(|&e| e == lower)
 }
 
-fn is_jpeg_ext(path: &Path) -> bool {
+pub fn is_jpeg_ext(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
         .is_some_and(|s| is_jpeg_extension(s))
 }
 
-fn is_jpeg_entry(name: &str) -> bool {
+pub fn is_jpeg_entry(name: &str) -> bool {
     Path::new(name)
         .extension()
         .and_then(|e| e.to_str())
@@ -1731,7 +1907,10 @@ pub fn load_one_cached(
     //                     失敗時は WIC にフォールバック (HEIC / AVIF / JXL / RAW 等)
     //
     // どのデコーダ経路で成功したかを `decode_source` に記録し、後段の統計に渡す。
+    // JPEG パスでは TurboJPEG DCT scale も試み、成功時は `dct_stats` を立てて
+    // source_dims を **元寸法** で保存する (DCT scaled buffer ではない)。
     let mut decode_source = crate::stats::DecodeSource::Native;
+    let mut dct_stats: Option<ScaleStats> = None;
     let img_result = if let Some(page_num) = pdf_page {
         // サムネイル用 PDF レンダ: 可視セル (priority=true) は HighNormal、
         // 先読みは Normal。プールの予約ワーカーはフルスクリーン現在ページ
@@ -1798,19 +1977,32 @@ pub fn load_one_cached(
         match bytes_result {
             Err(e) => Err(e),
             Ok(bytes) => {
-                // JPEG なら TurboJPEG で高速デコードを試す
+                // JPEG なら TurboJPEG DCT scale で高速デコードを試す
                 if is_jpeg_entry(entry_name) {
-                    if let Some(img) = decode_jpeg_turbo_from_bytes(&bytes) {
-                        Ok(img)
-                    } else {
-                        // image → WIC → Susie のフォールバック
-                        decode_zip_chain(
+                    let target_px = display_px.max(thumb_px);
+                    match decode_jpeg_turbo_scaled_from_bytes(&bytes, target_px) {
+                        Ok((img, stats)) => {
+                            dct_stats = Some(stats);
+                            Ok(img)
+                        }
+                        Err(DctDecodeError::TerminalRejection(msg)) => {
+                            // ZIP 内 adversarial — fallback すると danger なのでエラー返却
+                            crate::logger::log(format!(
+                                "DCT terminal rejection ZIP {path:?}/{entry_name}: {msg}"
+                            ));
+                            Err(image::ImageError::Limits(
+                                image::error::LimitError::from_kind(
+                                    image::error::LimitErrorKind::InsufficientMemory,
+                                ),
+                            ))
+                        }
+                        Err(DctDecodeError::Fallback(_)) => decode_zip_chain(
                             &bytes,
                             entry_name,
                             priority,
                             cancel.cloned(),
                             &mut decode_source,
-                        )
+                        ),
                     }
                 } else {
                     decode_zip_chain(
@@ -1834,14 +2026,31 @@ pub fn load_one_cached(
             Err(e) => Err(image::ImageError::IoError(e)),
         }
     } else {
-        // 通常ファイル: JPEG なら TurboJPEG を最初に試す
-        let turbo_result = if is_jpeg_ext(path) {
-            decode_jpeg_turbo_from_path(path)
+        // 通常ファイル: JPEG なら TurboJPEG DCT scale を最初に試す
+        let turbo_img: Option<Result<image::DynamicImage, image::ImageError>> = if is_jpeg_ext(path)
+        {
+            let target_px = display_px.max(thumb_px);
+            match decode_jpeg_turbo_scaled_from_path(path, target_px) {
+                Ok((img, stats)) => {
+                    dct_stats = Some(stats);
+                    Some(Ok(img))
+                }
+                Err(DctDecodeError::TerminalRejection(msg)) => {
+                    // adversarial — fallback すると danger。エラーを caller に伝播。
+                    crate::logger::log(format!("DCT terminal rejection {path:?}: {msg}"));
+                    Some(Err(image::ImageError::Limits(
+                        image::error::LimitError::from_kind(
+                            image::error::LimitErrorKind::InsufficientMemory,
+                        ),
+                    )))
+                }
+                Err(DctDecodeError::Fallback(_)) => None,
+            }
         } else {
             None
         };
-        if let Some(img) = turbo_result {
-            Ok(img)
+        if let Some(result) = turbo_img {
+            result
         } else {
             let primary = image::open(path).or_else(|_| {
                 use std::io::BufReader;
@@ -1944,18 +2153,47 @@ pub fn load_one_cached(
         }
     };
 
-    // EXIF Orientation に基づいて自動回転
-    let img = if pdf_page.is_some() || zip_entry.is_some() {
-        // PDF ページ / ZIP 内画像: EXIF 回転は不要
-        img
+    // EXIF Orientation に基づいて自動回転 (PDF / ZIP 経路は適用しない)
+    let orientation: u16 = if pdf_page.is_some() || zip_entry.is_some() {
+        1
     } else {
-        apply_exif_orientation(img, path)
+        read_exif_orientation(path)
     };
+    let img = apply_orientation(img, orientation);
 
     let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-    // 元画像のピクセル寸法 (EXIF 回転適用後)
-    let source_dims: Option<(u32, u32)> = Some((img.width(), img.height()));
+    // 元画像のピクセル寸法。
+    // DCT scale 経由なら `img.width()/height()` は scaled buffer の寸法なので
+    // 使わず、`dct_stats.src_w/src_h` から EXIF 適用後寸法を算出する。
+    // 非 DCT 経路 (image::open / WIC / Susie / PDF / ZIP image::load_from_memory)
+    // は img の現寸法 = 元寸法 (EXIF 適用済み) なので従来通り。
+    let source_dims: Option<(u32, u32)> = if let Some(stats) = dct_stats {
+        Some(stats.source_dims_after_exif(orientation))
+    } else {
+        Some((img.width(), img.height()))
+    };
+
+    // DCT スケール経由なら perf event を発火 (`thumb/dct_scale`)。
+    // `decode_ms` を含めることで analyze_perf.py で scale_num 別の所要時間を集計可能。
+    if let Some(stats) = dct_stats {
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "thumb",
+                "dct_scale",
+                Some(name),
+                input_seq,
+                &[
+                    ("scale_num", serde_json::Value::from(stats.scale_num)),
+                    ("src_w", serde_json::Value::from(stats.src_w)),
+                    ("src_h", serde_json::Value::from(stats.src_h)),
+                    ("out_w", serde_json::Value::from(stats.out_w)),
+                    ("out_h", serde_json::Value::from(stats.out_h)),
+                    ("decode_ms", serde_json::Value::from(decode_ms)),
+                ],
+            );
+        }
+    }
 
     // (A) 表示用パス: 元画像から直接セルサイズにリサイズして UI へ送信
     //     WebP 量子化を経由しないため画質劣化なし、かつ WebP encode を待たない
@@ -2127,6 +2365,135 @@ mod tests {
         assert_eq!(compute_display_px(300.0, 500.0, 1.0), 500);
     }
 
+    // ── DCT スケール: 詳細は docs/dct-scale-plan.md ───────────────────────
+
+    #[test]
+    fn pick_dct_scale_num_clamps_low() {
+        // src 巨大、target 普通 → 最小 scale 1/8
+        assert_eq!(super::pick_dct_scale_num(50000, 512), 1);
+        assert_eq!(super::pick_dct_scale_num(10000, 512), 1);
+    }
+
+    #[test]
+    fn pick_dct_scale_num_picks_smallest_above_target() {
+        // 5184*1/8 = ceil(648) = 648 >= 512 → M=1
+        assert_eq!(super::pick_dct_scale_num(5184, 512), 1);
+        // 4000*1/8 = 500 < 512、4000*2/8 = 1000 >= 512 → M=2
+        assert_eq!(super::pick_dct_scale_num(4000, 512), 2);
+        // 6000*2/8 = 1500 < 2048、6000*3/8 = 2250 >= 2048 → M=3
+        assert_eq!(super::pick_dct_scale_num(6000, 2048), 3);
+        // turbojpeg の ceil rounding 境界: 1023*4/8 = ceil(511.5) = 512 = target → M=4
+        // (旧 formula `ceil(8*target/src)` は M=5 を返してしまう)
+        assert_eq!(super::pick_dct_scale_num(1023, 512), 4);
+        // 4095*1/8 = ceil(511.875) = 512 >= 512 → M=1
+        assert_eq!(super::pick_dct_scale_num(4095, 512), 1);
+    }
+
+    #[test]
+    fn pick_dct_scale_num_clamps_high() {
+        // src が target 未満 → scaling 不可、M=8 (= 1/1)
+        assert_eq!(super::pick_dct_scale_num(500, 512), 8);
+        assert_eq!(super::pick_dct_scale_num(100, 512), 8);
+    }
+
+    #[test]
+    fn pick_dct_scale_num_exact_match() {
+        // src == target → M=8 (scaling 不要)
+        assert_eq!(super::pick_dct_scale_num(512, 512), 8);
+        // src = 8*target → 1/8 でちょうど = target
+        assert_eq!(super::pick_dct_scale_num(4096, 512), 1);
+    }
+
+    #[test]
+    fn pick_dct_scale_num_safe_against_overflow() {
+        // u32::MAX 入力 → overflow せず安全
+        assert_eq!(super::pick_dct_scale_num(u32::MAX, 2048), 1);
+        // src=0 → 0-division 回避、M=8
+        assert_eq!(super::pick_dct_scale_num(0, 512), 8);
+        // target=0 → M=1 (最小)
+        assert_eq!(super::pick_dct_scale_num(5184, 0), 1);
+    }
+
+    #[test]
+    fn scale_stats_source_dims_after_exif_no_swap() {
+        let s = super::ScaleStats {
+            src_w: 5184,
+            src_h: 3888,
+            scale_num: 1,
+            out_w: 648,
+            out_h: 486,
+        };
+        // orientation 1-4 は w/h 維持
+        assert_eq!(s.source_dims_after_exif(1), (5184, 3888));
+        assert_eq!(s.source_dims_after_exif(2), (5184, 3888));
+        assert_eq!(s.source_dims_after_exif(3), (5184, 3888));
+        assert_eq!(s.source_dims_after_exif(4), (5184, 3888));
+    }
+
+    #[test]
+    fn scale_stats_source_dims_after_exif_swap() {
+        let s = super::ScaleStats {
+            src_w: 5184,
+            src_h: 3888,
+            scale_num: 1,
+            out_w: 648,
+            out_h: 486,
+        };
+        // orientation 5-8 は 90°/270° 系で w/h swap
+        assert_eq!(s.source_dims_after_exif(5), (3888, 5184));
+        assert_eq!(s.source_dims_after_exif(6), (3888, 5184));
+        assert_eq!(s.source_dims_after_exif(7), (3888, 5184));
+        assert_eq!(s.source_dims_after_exif(8), (3888, 5184));
+    }
+
+    #[test]
+    fn decode_jpeg_turbo_scaled_normal_jpeg_returns_orig_dims() {
+        // 5184x3888 baseline JPEG を runtime 生成 → DCT 1/8 で decode、source_dims
+        // が元寸法と一致することを検証 (Codex 2nd round P1 対応: source_dims 契約)。
+        let src_w = 5184u32;
+        let src_h = 3888u32;
+        let rgb = image::RgbImage::from_fn(src_w, src_h, |x, y| {
+            image::Rgb([
+                ((x ^ y) & 0xff) as u8,
+                ((x.wrapping_mul(2)) & 0xff) as u8,
+                ((y.wrapping_mul(2)) & 0xff) as u8,
+            ])
+        });
+        let bytes =
+            turbojpeg::compress_image(&rgb, 85, turbojpeg::Subsamp::Sub2x2).expect("compress");
+        let (img, stats) =
+            super::decode_jpeg_turbo_scaled_from_bytes(&bytes, 512).expect("DCT decode ok");
+        // 元寸法は header から正しく取れる
+        assert_eq!(stats.src_w, src_w);
+        assert_eq!(stats.src_h, src_h);
+        // pick_dct_scale_num(5184, 512) = 1 → 1/8 scale
+        assert_eq!(stats.scale_num, 1);
+        // ceil(5184 * 1 / 8) = 648, ceil(3888 * 1 / 8) = 486
+        assert_eq!(stats.out_w, 648);
+        assert_eq!(stats.out_h, 486);
+        assert_eq!(img.width(), 648);
+        assert_eq!(img.height(), 486);
+        // EXIF=1 (no swap) で source_dims が元寸法
+        assert_eq!(stats.source_dims_after_exif(1), (src_w, src_h));
+    }
+
+    #[test]
+    fn decode_jpeg_turbo_scaled_target_above_src_uses_full_decode() {
+        // src < target なら scale=1/1 (M=8) で full decode
+        let src_w = 400u32;
+        let src_h = 300u32;
+        let rgb = image::RgbImage::from_fn(src_w, src_h, |x, y| {
+            image::Rgb([(x & 0xff) as u8, (y & 0xff) as u8, 128])
+        });
+        let bytes =
+            turbojpeg::compress_image(&rgb, 85, turbojpeg::Subsamp::Sub2x2).expect("compress");
+        let (img, stats) =
+            super::decode_jpeg_turbo_scaled_from_bytes(&bytes, 1024).expect("DCT decode ok");
+        assert_eq!(stats.scale_num, 8); // M=8 = 1/1
+        assert_eq!(img.width(), src_w);
+        assert_eq!(img.height(), src_h);
+    }
+
     #[test]
     fn cache_decision_always_returns_true() {
         let d = make_decision(CachePolicy::Always, 25, 2_000_000);
@@ -2271,21 +2638,52 @@ pub fn build_and_save_one(
     thumb_px: u32,
     thumb_quality: u8,
 ) -> Option<usize> {
+    // JPEG なら TurboJPEG DCT scale を先に試す (load_one_cached と同じ方針)。
+    // cache creator は UI セルサイズに依存しない bulk worker なので target は thumb_px。
+    let mut dct_stats: Option<ScaleStats> = None;
+    let turbo_img = if is_jpeg_ext(path) {
+        match decode_jpeg_turbo_scaled_from_path(path, thumb_px) {
+            Ok((img, stats)) => {
+                dct_stats = Some(stats);
+                Some(img)
+            }
+            Err(DctDecodeError::TerminalRejection(msg)) => {
+                crate::logger::log(format!(
+                    "build_and_save_one: DCT terminal rejection {path:?}: {msg}"
+                ));
+                return None;
+            }
+            Err(DctDecodeError::Fallback(_)) => None,
+        }
+    } else {
+        None
+    };
     // 拡張子ベース → マジックバイト fallback（load_one_cached と同じ方針）
-    let img = image::open(path)
-        .or_else(|_| {
-            use std::io::BufReader;
-            let f = std::fs::File::open(path)?;
-            image::ImageReader::new(BufReader::new(f))
-                .with_guessed_format()
-                .map_err(image::ImageError::IoError)?
-                .decode()
-        })
-        .ok()?;
+    let img = match turbo_img {
+        Some(img) => img,
+        None => image::open(path)
+            .or_else(|_| {
+                use std::io::BufReader;
+                let f = std::fs::File::open(path)?;
+                image::ImageReader::new(BufReader::new(f))
+                    .with_guessed_format()
+                    .map_err(image::ImageError::IoError)?
+                    .decode()
+            })
+            .ok()?,
+    };
+
+    // EXIF orientation を適用 (load_one_cached と挙動を揃える)。
+    // 旧 build_and_save_one は orientation 未適用だったが、catalog に保存する
+    // source_dims が load_one_cached 経由と不一致になる既存バグ。本プランで修正。
+    let orientation = read_exif_orientation(path);
+    let img = apply_orientation(img, orientation);
+    let source_dims = dct_stats.map(|s| s.source_dims_after_exif(orientation));
 
     let name = path.file_name()?.to_str()?;
-    encode_and_save(
+    encode_and_save_with_source_dims(
         &img,
+        source_dims,
         name,
         catalog,
         mtime,
@@ -2296,6 +2694,9 @@ pub fn build_and_save_one(
 }
 
 /// デコード済み画像を WebP エンコードしてカタログに保存する共通ヘルパー。
+///
+/// `source_dims` は `img` の現寸法 (= DCT scale 適用前提なら元寸法ではないので注意)。
+/// DCT scale 経由で渡される caller は `encode_and_save_with_source_dims` を使う。
 pub fn encode_and_save(
     img: &image::DynamicImage,
     key: &str,
@@ -2305,7 +2706,37 @@ pub fn encode_and_save(
     thumb_px: u32,
     thumb_quality: u8,
 ) -> Option<usize> {
-    let source_dims = Some((img.width(), img.height()));
+    encode_and_save_with_source_dims(
+        img,
+        None,
+        key,
+        catalog,
+        mtime,
+        file_size,
+        thumb_px,
+        thumb_quality,
+    )
+}
+
+/// `encode_and_save` の source_dims override 付き版。
+///
+/// DCT スケール経由で `img` が縮小済みの場合、catalog の `source_dims` は
+/// **元寸法** (decode 前の寸法) を保存する必要があるため、caller が
+/// `ScaleStats.source_dims_after_exif()` で算出した override 値を渡す。
+///
+/// `source_dims_override = None` のときは旧 `encode_and_save` と同じ動作で
+/// `(img.width(), img.height())` を保存する。
+pub fn encode_and_save_with_source_dims(
+    img: &image::DynamicImage,
+    source_dims_override: Option<(u32, u32)>,
+    key: &str,
+    catalog: &crate::catalog::CatalogDb,
+    mtime: i64,
+    file_size: i64,
+    thumb_px: u32,
+    thumb_quality: u8,
+) -> Option<usize> {
+    let source_dims = source_dims_override.or(Some((img.width(), img.height())));
     let (webp_data, w, h) = crate::catalog::encode_thumb_webp(img, thumb_px, thumb_quality as f32)?;
     catalog
         .save(key, mtime, file_size, w, h, source_dims, &webp_data)
@@ -2314,7 +2745,8 @@ pub fn encode_and_save(
 }
 
 /// ZIP 内の画像エントリ1つをデコードしてキャッシュに保存する。
-/// バッチキャッシュ作成用。
+/// バッチキャッシュ作成用。**現状 unused** だが、将来再利用に備えて
+/// DCT scale 経路と source_dims override 対応を入れてある (= source 監査時の整合性維持)。
 pub fn build_and_save_one_zip(
     zip_path: &Path,
     entry_name: &str,
@@ -2325,9 +2757,20 @@ pub fn build_and_save_one_zip(
     thumb_quality: u8,
 ) -> Option<usize> {
     let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok()?;
-    let img = image::load_from_memory(&bytes).ok()?;
-    encode_and_save(
+    // JPEG なら DCT scale を試す + 元寸法を source_dims に保存
+    let (img, source_dims) = if is_jpeg_entry(entry_name) {
+        match decode_jpeg_turbo_scaled_from_bytes(&bytes, thumb_px) {
+            Ok((img, stats)) => (Some(img), Some((stats.src_w, stats.src_h))),
+            Err(DctDecodeError::TerminalRejection(_)) => return None,
+            Err(DctDecodeError::Fallback(_)) => (None, None),
+        }
+    } else {
+        (None, None)
+    };
+    let img = img.or_else(|| image::load_from_memory(&bytes).ok())?;
+    encode_and_save_with_source_dims(
         &img,
+        source_dims,
         entry_name,
         catalog,
         mtime,

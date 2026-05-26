@@ -1148,8 +1148,9 @@ fn exif_hay(info: &crate::exif_reader::ExifInfo) -> String {
 use crate::fs_animation::{FsCacheEntry, FsLoadResult, decode_apng_frames, decode_gif_frames};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::thumb_loader::{
-    CacheDecision, LoadRequest, ThumbMsg, build_and_save_one, compute_display_px, encode_and_save,
-    process_load_request,
+    CacheDecision, DctDecodeError, LoadRequest, ScaleStats, ThumbMsg, build_and_save_one,
+    compute_display_px, decode_jpeg_turbo_scaled_from_bytes, encode_and_save,
+    encode_and_save_with_source_dims, is_jpeg_entry, process_load_request,
 };
 use crate::ui_helpers::{
     draw_folder_badge, draw_pdf_badge, draw_play_icon, draw_zip_badge, natural_sort_key,
@@ -20089,9 +20090,12 @@ impl App {
                         let zip_cache_map = zip_catalog.load_all().unwrap_or_default();
                         let entry_count = entries.len();
 
-                        // 先頭エントリの WebP を並列処理中にキャプチャ
-                        let first_webp: Arc<Mutex<Option<(image::DynamicImage, String)>>> =
-                            Arc::new(Mutex::new(None));
+                        // 先頭エントリの WebP を並列処理中にキャプチャ。
+                        // DCT scale で縮小済みの場合に親フォルダ catalog でも
+                        // **元寸法**を保存するため、source_dims override も同梱する。
+                        let first_webp: Arc<
+                            Mutex<Option<(image::DynamicImage, Option<(u32, u32)>, String)>>,
+                        > = Arc::new(Mutex::new(None));
 
                         pool.install(|| {
                             use rayon::prelude::*;
@@ -20120,17 +20124,42 @@ impl App {
                                     Ok(b) => b,
                                     Err(_) => return,
                                 };
-                                let img = match image::load_from_memory(&raw) {
-                                    Ok(i) => i,
-                                    Err(_) => return,
+                                // JPEG なら TurboJPEG DCT scale を試す
+                                let (img, dct_stats): (
+                                    Option<image::DynamicImage>,
+                                    Option<ScaleStats>,
+                                ) = if is_jpeg_entry(&entry.entry_name) {
+                                    match decode_jpeg_turbo_scaled_from_bytes(&raw, thumb_px) {
+                                        Ok((img, stats)) => (Some(img), Some(stats)),
+                                        Err(DctDecodeError::TerminalRejection(msg)) => {
+                                            crate::logger::log(format!(
+                                                "cache_creator DCT terminal rejection ZIP {}/{}: {msg}",
+                                                zip_fname, entry.entry_name
+                                            ));
+                                            return;
+                                        }
+                                        Err(DctDecodeError::Fallback(_)) => (None, None),
+                                    }
+                                } else {
+                                    (None, None)
                                 };
-                                // 先頭エントリをキャプチャ（親フォルダ用サムネイル再利用）
+                                let img = match img.or_else(|| image::load_from_memory(&raw).ok()) {
+                                    Some(i) => i,
+                                    None => return,
+                                };
+                                let source_dims = dct_stats.map(|s| (s.src_w, s.src_h));
+                                // 先頭エントリをキャプチャ（親フォルダ用サムネイル再利用）。
+                                // source_dims も一緒にキャプチャして parent thumb save で再利用。
                                 if i == 0 {
-                                    *first_webp.lock().unwrap() =
-                                        Some((img.clone(), entry.entry_name.clone()));
+                                    *first_webp.lock().unwrap() = Some((
+                                        img.clone(),
+                                        source_dims,
+                                        entry.entry_name.clone(),
+                                    ));
                                 }
-                                if let Some(bytes) = encode_and_save(
+                                if let Some(bytes) = encode_and_save_with_source_dims(
                                     &img,
+                                    source_dims,
                                     &entry.entry_name,
                                     &zip_catalog,
                                     entry.mtime,
@@ -20146,9 +20175,10 @@ impl App {
                         // 先頭1枚を親フォルダの DB にも保存（フォルダ一覧用サムネイル）
                         if !cache_map.contains_key(&folder_key) {
                             let captured = first_webp.lock().unwrap().take();
-                            if let Some((img, _)) = captured {
-                                if let Some(bytes) = encode_and_save(
+                            if let Some((img, source_dims, _)) = captured {
+                                if let Some(bytes) = encode_and_save_with_source_dims(
                                     &img,
+                                    source_dims,
                                     &folder_key,
                                     &catalog,
                                     *zip_mtime,
@@ -20171,18 +20201,41 @@ impl App {
                             if let Ok(raw) =
                                 crate::zip_loader::read_entry_bytes(zip_path, &first_entry)
                             {
-                                if let Ok(img) = image::load_from_memory(&raw) {
-                                    if let Some(bytes) = encode_and_save(
-                                        &img,
-                                        &folder_key,
-                                        &catalog,
-                                        *zip_mtime,
-                                        *zip_file_size,
-                                        thumb_px,
-                                        thumb_quality,
-                                    ) {
-                                        size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
+                                // JPEG なら DCT scale → source_dims override で保存
+                                let (img, source_dims): (
+                                    Option<image::DynamicImage>,
+                                    Option<(u32, u32)>,
+                                ) = if is_jpeg_entry(&first_entry) {
+                                    match decode_jpeg_turbo_scaled_from_bytes(&raw, thumb_px) {
+                                        Ok((img, stats)) => {
+                                            (Some(img), Some((stats.src_w, stats.src_h)))
+                                        }
+                                        Err(DctDecodeError::TerminalRejection(msg)) => {
+                                            crate::logger::log(format!(
+                                                "cache_creator first-only DCT terminal rejection {zip_path:?}/{first_entry}: {msg}"
+                                            ));
+                                            continue;
+                                        }
+                                        Err(DctDecodeError::Fallback(_)) => (None, None),
                                     }
+                                } else {
+                                    (None, None)
+                                };
+                                let img = match img.or_else(|| image::load_from_memory(&raw).ok()) {
+                                    Some(i) => i,
+                                    None => continue,
+                                };
+                                if let Some(bytes) = encode_and_save_with_source_dims(
+                                    &img,
+                                    source_dims,
+                                    &folder_key,
+                                    &catalog,
+                                    *zip_mtime,
+                                    *zip_file_size,
+                                    thumb_px,
+                                    thumb_quality,
+                                ) {
+                                    size_atomic.fetch_add(bytes as u64, Ordering::Relaxed);
                                 }
                             }
                         }
