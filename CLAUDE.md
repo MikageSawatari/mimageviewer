@@ -38,7 +38,7 @@ dual-window approach.
 - **Language**: Rust (edition 2024, stable MSVC toolchain)
 - **GUI**: eframe 0.33 + egui 0.33 (wgpu backend)
 - **Image decoding**: `image` crate (PNG, GIF, WebP, BMP) + `turbojpeg` (JPEG, libjpeg-turbo SIMD) + WIC (HEIC, AVIF, JXL, TIFF, RAW)
-- **JPEG 高速デコード**: `turbojpeg` クレート (libjpeg-turbo スタティックリンク、SIMD 最適化)。5MB 以下のファイルに適用、大容量は `image` クレートにフォールバック。ビルドに cmake + NASM が必要。
+- **JPEG 高速デコード**: `turbojpeg` クレート (libjpeg-turbo スタティックリンク、SIMD 最適化)。サムネ生成時は **DCT スケール (1/8〜1/1)** で decode して 5-30MB カメラ JPEG を 2.5-6× 高速化 ([docs/dct-scale-plan.md](docs/dct-scale-plan.md))。圧縮入力 128MB 超は image クレート / WIC chain にフォールバック (並列ワーカー × 圧縮 buffer の積算メモリ圧迫を回避)。ビルドに cmake + NASM が必要。
 - **Parallel loading**: `rayon` (dedicated thread pool per folder load)
 - **Thumbnail cache**: SQLite via `rusqlite` (bundled), WebP encoding via `webp` crate
 - **Video thumbnails**: Windows Shell API (IShellItemImageFactory)
@@ -500,7 +500,7 @@ UI 同期なら、worker 化・キャンセル・結果適用時の世代/idx �
 
 ## Performance Notes
 
-- **JPEG デコード**: TurboJPEG (SIMD) で小〜中 JPEG を 1.5-2.4 倍高速化。5MB 超は image クレート (zune-jpeg) にフォールバック
+- **JPEG デコード**: TurboJPEG (SIMD) + **DCT スケール** で カメラ JPEG (5-30MB / 20-60MP) のサムネ生成を 2.5-6× 高速化。target_px (= max(display_px, thumb_px)) に応じて 1/8〜1/1 のスケール係数を選び、decoder 内側で縮小デコード。圧縮入力 128MB 超は image クレート (zune-jpeg) / WIC にフォールバック。詳細: [docs/dct-scale-plan.md](docs/dct-scale-plan.md)
 - **PDF レンダリング**: 5 ワーカープロセス並列で Cold 1441ms → 10ms (99% 改善)。各プロセスが独立に PDFium を初期化 (1 つは Enter 操作用に Critical 予約)
 - **キャッシュ読み込み**: 2〜3ms/枚（WebP デコード）
 - **キャンセル遅延**: 旧タスクが1枚のデコード中の場合、最大1デコード時間待つ
@@ -1334,11 +1334,17 @@ codex exec --sandbox read-only -o /tmp/codex-1.txt \
 cat /tmp/codex-1.txt   # P1/P2/P3 サマリ
 
 # 2 ラウンド目以降 (同じセッションを継続)
-codex exec resume --last --sandbox read-only -o /tmp/codex-2.txt \
-    "P2 の修正を <commit-hash> で入れた。意図通り直っているか確認して。" \
-    < /dev/null > /tmp/codex-2-events.log 2>&1
+# 注意: `codex exec resume` には `--sandbox` フラグが**無い** (codex 0.x で確認、
+# 元セッションの sandbox 設定が引き継がれる)。指定すると `Usage: ...` でエラーになる。
+codex exec resume --last -o /tmp/codex-2.txt - \
+    < <(echo "P2 の修正を <commit-hash> で入れた。意図通り直っているか確認して。") \
+    > /tmp/codex-2-events.log 2>&1
 cat /tmp/codex-2.txt
 ```
+
+**prompt に backtick / `$` / 改行を含めたい場合**: positional 引数で渡すと bash が
+backtick を command substitution として評価してしまう。`-` を指定して stdin から
+渡すのが安全 (上の例)。または heredoc を temp ファイルへ書いて `"$(cat file)"`。
 
 #### 明示的に SID を指定したいとき
 
@@ -1353,10 +1359,10 @@ codex exec --json --sandbox read-only -o /tmp/codex-1.txt \
     < /dev/null > /tmp/codex-1-events.jsonl 2>&1
 SID=$(head -1 /tmp/codex-1-events.jsonl | jq -r .thread_id)
 
-# 2 ラウンド目以降 (SID 指定で resume)
-codex exec resume "$SID" --sandbox read-only -o /tmp/codex-2.txt \
-    "P2 について詳しく説明して" \
-    < /dev/null > /tmp/codex-2-events.log 2>&1
+# 2 ラウンド目以降 (SID 指定で resume、--sandbox なし)
+codex exec resume "$SID" -o /tmp/codex-2.txt - \
+    < <(echo "P2 について詳しく説明して") \
+    > /tmp/codex-2-events.log 2>&1
 ```
 
 #### 制約・注意点

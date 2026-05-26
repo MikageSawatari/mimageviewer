@@ -8,6 +8,13 @@
 > に降ろすが、image::open は 512MB allocation limit に抵触、WIC も寸法 > 32768
 > で reject (`src/wic_decoder.rs:209`) するため、結果として **graceful なエラー
 > 表示**にとどまる。500MB 超を扱うには mmap / streaming decode の別プランが必要 (§10)。
+>
+> **Post-implementation tuning (2026-05-27)**: 実装後の Codex レビューで、500MB
+> × 並列ワーカー数 のメモリ圧迫リスクが指摘され、**`MAX_TURBOJPEG_INPUT_SIZE`
+> は 128MB に引き下げて出荷**した。本プラン本文の数値は設計時 (500MB) のものを
+> 残しているが、ソースコード (`src/thumb_loader.rs`) が source of truth。
+> 128-500MB JPEG (例: リポジトリの xxl_kokerei_kaiserstuhl_28k_325mb.jpg) は
+> fallback chain で処理される。
 
 - 関連: [docs/async-architecture.md](async-architecture.md) (worker / cache 構造)、
   [docs/display-pipeline.md](display-pipeline.md) (display / thumb 二重リサイズ)、

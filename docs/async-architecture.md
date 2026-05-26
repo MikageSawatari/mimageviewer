@@ -651,7 +651,7 @@ button_state` / `render_folder_pin_menu_entry` が `None`/false を返してエ�
 
 - キャッシュヒット時のサムネ読み込み: 2〜3 ms/枚
 - PDF レンダリング: 3 ワーカー並列で Cold 1441ms → 10ms (2 枚目以降)
-- JPEG デコード: turbojpeg で 1.5〜2.4 倍高速化 (5MB 超は image crate にフォールバック)
+- JPEG デコード: turbojpeg + DCT scale (1/8〜1/1) でサムネ用 5-30MB カメラ JPEG を 2.5-6× 高速化 ([docs/dct-scale-plan.md](dct-scale-plan.md))。128MB 超は image crate / WIC にフォールバック
 - キャンセル遅延: 最大 1 枚デコード分 (数百 ms)
 
 ---

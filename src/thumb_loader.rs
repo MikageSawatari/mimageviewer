@@ -443,10 +443,20 @@ fn orientation_from_text(text: &str) -> Option<u16> {
 // 設計詳細: docs/dct-scale-plan.md
 // 実測: scripts/bench_dct_scale.py (Olympus PEN 20MP で 2.5× 高速化、PSNR 51dB)
 
-/// `decode_jpeg_turbo_scaled_*` で許容する圧縮入力サイズの上限 (500 MB)。
+/// `decode_jpeg_turbo_scaled_*` で許容する圧縮入力サイズの上限 (128 MB)。
 /// これを超える JPEG は image::open / WIC chain に降ろす。
-/// std::fs::read が低 RAM 環境を圧迫する事故を防ぐ guard。
-const MAX_TURBOJPEG_INPUT_SIZE: u64 = 500 * 1024 * 1024;
+///
+/// 値の根拠 (Codex 実装レビュー P2 対応):
+/// - 通常のサムネ生成は複数ワーカー並列実行 (`src/app.rs::start_loading_items`、
+///   `start_cache_creation` の rayon pool)。`std::fs::read(N MB)` × ワーカー数の
+///   積算メモリ圧迫を考慮する必要がある。
+/// - 100 MB 超の JPEG が複数あるフォルダで 8 ワーカー × 500MB = 4GB pre-decode
+///   がピークに乗ると、16GB RAM クラスでスワップする可能性
+/// - コンシューマー機の JPEG は通常 5-30 MB、ハイエンド mirrorless (Phase One
+///   100MP RAW+JPEG 等) でも 50-100 MB が現実的上限。128 MB はそれを十分カバー
+/// - 200 MB 超の JPEG (パノラマ stitch / 産業 / 航空) は image crate の 512MB
+///   allocation guard へ素直に投げる方が、責務分離として綺麗
+const MAX_TURBOJPEG_INPUT_SIZE: u64 = 128 * 1024 * 1024;
 
 /// DCT スケール後の RGB 出力 buffer サイズ上限 (256 MB ≈ 9000×9000 px)。
 /// adversarial JPEG (header に巨大寸法を埋め込んだもの) で巨大 allocation が
@@ -2492,6 +2502,86 @@ mod tests {
         assert_eq!(stats.scale_num, 8); // M=8 = 1/1
         assert_eq!(img.width(), src_w);
         assert_eq!(img.height(), src_h);
+    }
+
+    /// 小さな real JPEG を生成してから SOF0 マーカー (FF C0) の width/height
+    /// フィールドを書き換える test fixture helper。
+    ///
+    /// libjpeg-turbo の `read_header` は SOF を parse して dims を返すので、
+    /// この helper で「巨大な header dims を主張する偽 JPEG」を作れる。
+    /// decode 自体は body と不整合で失敗するが、本来は MAX_DECODED_BYTES guard が
+    /// それより先に発火して TerminalRejection を返すべき。
+    ///
+    /// JPEG SOF0 構造 (RFC):
+    /// `FF C0 <len:2> <precision:1> <height:2 big-endian> <width:2 big-endian> ...`
+    fn mutate_jpeg_sof_dims(bytes: &mut Vec<u8>, new_w: u16, new_h: u16) {
+        // SOF0 (FF C0) または SOF3 (FF C3) マーカーを探す
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == 0xFF && (bytes[i + 1] == 0xC0 || bytes[i + 1] == 0xC3) {
+                // marker(2) + len(2) + precision(1) = 5 bytes 後に height
+                let h_off = i + 5;
+                let w_off = i + 7;
+                if w_off + 1 < bytes.len() {
+                    bytes[h_off] = (new_h >> 8) as u8;
+                    bytes[h_off + 1] = (new_h & 0xff) as u8;
+                    bytes[w_off] = (new_w >> 8) as u8;
+                    bytes[w_off + 1] = (new_w & 0xff) as u8;
+                    return;
+                }
+            }
+            i += 1;
+        }
+        panic!("SOF marker not found");
+    }
+
+    #[test]
+    fn decode_bytes_rejects_oversized_output_with_terminal() {
+        // 小さな実 JPEG を作って SOF dims を 65500x65500 (= libjpeg-turbo の最大
+        // サポート寸法、JPEG 仕様の 65535 ではなく実装上の上限) に書き換える。
+        // target_px=10000 にすると pick_dct_scale_num = 2 (= 1/4)、出力は
+        // ceil(65500*2/8) = 16375 px square = 16375*16375*3 ≈ 804 MB >
+        // MAX_DECODED_BYTES (256MB)。allocation 前に TerminalRejection で弾かれること。
+        //
+        // (target_px=512 の場合は M=1 で出力 ≈8188 px square ≈ 201 MB で guard 内に
+        //  収まるので、ここでは target_px=10000 にして M=2 を強制する。)
+        let rgb = image::RgbImage::from_fn(16, 16, |x, y| {
+            image::Rgb([(x * 16) as u8, (y * 16) as u8, 128])
+        });
+        let mut bytes = turbojpeg::compress_image(&rgb, 85, turbojpeg::Subsamp::Sub2x2)
+            .expect("compress")
+            .to_vec();
+        mutate_jpeg_sof_dims(&mut bytes, 65500, 65500);
+
+        let result = super::decode_jpeg_turbo_scaled_from_bytes(&bytes, 10000);
+        assert!(
+            matches!(result, Err(super::DctDecodeError::TerminalRejection(_))),
+            "expected TerminalRejection, got {:?}",
+            result.as_ref().map(|_| "Ok").or_else(|e| Err(e))
+        );
+    }
+
+    #[test]
+    fn decode_path_rejects_oversized_input_with_fallback() {
+        // 圧縮入力 > MAX_TURBOJPEG_INPUT_SIZE (128 MB) は Fallback を返す。
+        // tempfile を sparse に拡張 (set_len) して metadata.len() の guard 経路だけ
+        // 確認する。実バイトは書き込まないので disk I/O / AV scanner と無関係に走る。
+        // read_header には到達せず、早期 Fallback で抜けることを検証。
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        tmp.as_file()
+            .set_len(super::MAX_TURBOJPEG_INPUT_SIZE + 1)
+            .expect("set_len");
+
+        let result = super::decode_jpeg_turbo_scaled_from_path(tmp.path(), 512);
+        match result {
+            Err(super::DctDecodeError::Fallback(msg)) => {
+                assert!(
+                    msg.contains("too large"),
+                    "expected size-related Fallback, got: {msg}"
+                );
+            }
+            other => panic!("expected Fallback, got {other:?}"),
+        }
     }
 
     #[test]
