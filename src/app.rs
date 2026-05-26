@@ -2176,9 +2176,9 @@ pub struct App {
     /// 時のみ処理することで、ABBA-pattern (同じ source_key + 同じ cache_key の
     /// 連続再 spawn) で stale message が新 worker を消費する race を防ぐ。
     pub(crate) pano_high_res_request_seq: u64,
-    /// NeedsUserConfirmation バナーの「このセッション中は今後も高品質で開く」
+    /// NeedsUserConfirmation バナーの「今後も高画質モードで開く」
     /// チェックボックスの現在値 (Phase 2a)。デフォルト OFF。
-    /// ON で「高品質で表示」を押すと `pano_session_approved_max_pixels` が更新される。
+    /// ON で「フル解像度(高画質)」を押すと `pano_session_approved_max_pixels` が更新される。
     pub(crate) pano_banner_remember_session: bool,
     /// タグキャッシュ (docs/tag-feature.md): 正規化キー → XMP dc:subject の要素列。
     /// メタデータパネルのタグボタン状態表示 + グリッドのタグバッジで使用。

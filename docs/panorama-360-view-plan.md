@@ -328,16 +328,17 @@ ON では settle スキップ。
 [SettleReady]            [NeedsUserConfirmation]      [BaseOnly]
 ≤ 200 MP                 > 200 MP かつ                > 200 MP かつ
 (consumer cameras +      未承認 or 旧承認超過        ユーザーが
-ChatGPT 等)                  ↓                        「8K でよい」
+ChatGPT 等)                  ↓                        「最大 8K(軽量)」
    ↓                     バナー表示:                   選択 (または
-通常パス + tee で         "大きな画像です、高品質?"    NeedsUserConfirmation
+通常パス + tee で         "大きな画像です、高画質?"   NeedsUserConfirmation
 HighResSource::Decoded     ↓                          のまま放置)
 を作る                   ユーザー選択待ち                 ↓
-   ↓                       ├─ 高品質 → SettleApproved   通常パスのみ、
-fs_cache + HighResSource    │            → HighResSource HighResSource は
-両方保持                    │              ロード開始     作らない、settle OFF
-   ↓                       └─ 8K でよい → BaseOnly
-settle ON                  → 通常パスのみ
+   ↓                       ├─ フル解像度(高画質)        通常パスのみ、
+fs_cache + HighResSource    │   → SettleApproved        HighResSource は
+両方保持                    │   → HighResSource         作らない、settle OFF
+   ↓                       │     ロード開始
+settle ON                  └─ 最大 8K(軽量) → BaseOnly
+                              → 通常パスのみ
 ```
 
 **ユーザー確認の永続化 (Codex P2 第 9 ラウンド反映で改善)**:
@@ -366,7 +367,7 @@ fn needs_user_confirmation(source_pixels: u64, approved_max: u64) -> bool {
 - 538 MP 承認 → `approved_max = 538 MP`
 - 次に 600 MP (= 538 × 1.12) → 確認不要
 
-バナーの「このセッション中は今後も高品質で開く」チェックボックスは
+バナーの「今後も高画質モードで開く」チェックボックスは
 `pano_session_approved_max_pixels = source_pixels` を立てる動作になる。
 
 mIV 再起動で 0 にリセット。将来 Phase 3 で「常に高品質」を環境設定の永続トグルと
@@ -402,15 +403,14 @@ mIV 再起動で 0 にリセット。将来 Phase 3 で「常に高品質」を�
    ```
    ⚠ 大きな 360° 画像です (26000 × 13000、約 338 MP)
    高品質モードで表示するには 約 1.35 GB のメモリを使います。
-   □ このセッション中は今後も高品質で開く
-        [ 高品質で表示 ]   [ 8K 表示でよい ]
+        [ フル解像度(高画質) ]   [ 最大 8K(軽量) ]   □ 今後も高画質モードで開く
    ```
 5. ユーザー選択:
-   - **「高品質で表示」**: 状態が SettleApproved に遷移 → worker thread でフル RGBA
-     を**再デコード** (この時点で初めて 1.35 GB ピーク発生、~3-5 秒) →
+   - **「フル解像度(高画質)」**: 状態が SettleApproved に遷移 → worker thread でフル
+     RGBA を**再デコード** (この時点で初めて 1.35 GB ピーク発生、~3-5 秒) →
      `pano_high_res_source` 格納 → settle 機能有効化。チェックボックス ON なら
      `pano_session_approved_max_pixels = source_pixels` (= 338 MP) を記録
-   - **「8K 表示でよい」**: 状態が BaseOnly に遷移 → バナー閉じる、以降 8K のまま
+   - **「最大 8K(軽量)」**: 状態が BaseOnly に遷移 → バナー閉じる、以降 8K のまま
 
 **重要 (Codex P1 二重デコード回避との関係)**: SettleReady (200 MP 以下) の場合は tee
 で 1 回デコード。SettleApproved (200 MP 超) の場合は、**8K base ロードと高品質
@@ -762,8 +762,8 @@ bicubic 化は Phase 3 の任意拡張。Phase 2a は bilinear で確定。
 | `source_pixels <= 200 MP` (形式不問) | **SettleReady** (自動、確認なし) |
 | `source_pixels > 200 MP` かつ `source_pixels <= approved_max × 1.25` | **SettleApproved** (自動承認、確認なし) |
 | `source_pixels > 200 MP` かつ `source_pixels > approved_max × 1.25` | **NeedsUserConfirmation** (バナー表示、前回承認より 25% 以上大きい) |
-| バナーで「高品質」選択 | **SettleApproved** (auto_approve トグル ON ならセッション継続) |
-| バナーで「8K でよい」選択 | **BaseOnly** (settle OFF) |
+| バナーで「フル解像度(高画質)」選択 | **SettleApproved** (auto_approve トグル ON ならセッション継続) |
+| バナーで「最大 8K(軽量)」選択 | **BaseOnly** (settle OFF) |
 
 **200 MP ゲートの根拠**:
 
@@ -781,23 +781,42 @@ bicubic 化は Phase 3 の任意拡張。Phase 2a は bilinear で確定。
 
 - 表示位置: フルスクリーン上部のバナー (動画 HUD と同じ階層)
 - 内容: 解像度 / MP / 想定 RAM 消費を **数値で明示**
-- 選択肢: 「高品質で表示」/「8K 表示でよい」の 2 ボタン
-- チェックボックス: 「このセッション中は今後も高品質で開く」(デフォルト OFF)
+- 選択肢: 「フル解像度(高画質)」/「最大 8K(軽量)」の 2 ボタン
+- チェックボックス: 「今後も高画質モードで開く」(デフォルト OFF)
 - 表示タイミング: 360 モード ON 直後、8K base 表示は先行して既に出ている
 - 既定動作 (= バナー無視): しばらく表示後にフェードアウト。バナーは消えるが
   `pano_quality_state` は `NeedsUserConfirmation` のまま (BaseOnly には自動遷移
-  しない)。ユーザーが「8K でよい」を**明示クリック**したときだけ BaseOnly になる
+  しない)。ユーザーが「最大 8K(軽量)」を**明示クリック**したときだけ BaseOnly になる
 
-**BaseOnly / NeedsUserConfirmation 後の復帰導線** (Codex P2 第 9 ラウンド反映):
+**BaseOnly / SettleApproved 後の切替導線** (Codex P2 第 9 ラウンド + 2026-05 後続反映):
 
-「8K でよい」を選んだ後、または無視してフェードアウト後に「やっぱり高品質で見たい」
-というケースがある。**フルスクリーン上部の 360 ボタン横に「⚙ 高品質化」アイコン
-ボタン**を常設して、いつでもバナーを再表示できるようにする:
+「最大 8K(軽量)」を選んだ後に「やっぱり高画質で見たい」、あるいは逆に「高画質モード
+を解除してメモリを解放したい」というケースがある。**画面下部中央の status indicator
+(pill バッジ) 内に切替ボタンを 1 つだけ常設**して、`pano_quality_state` を直接
+`SettleApproved` ↔ `BaseOnly` に切り替える:
 
-- 大画像 (>200 MP) かつ `pano_quality_state` が SettleReady でないとき
-  (= NeedsUserConfirmation / BaseOnly / SettleApproved) → アイコン表示
-- クリックで `pano_quality_state` を `NeedsUserConfirmation` に戻し、バナー再表示
-- SettleApproved 時にクリックすると「高品質モードを解除して 8K にする」確認 → クリア
+- **`BaseOnly` のとき**: `[高画質に切替]` ボタン
+  - クリックで state → `SettleApproved`、`start_pano_high_res_load(fs_idx, cache_key)`
+    を kick。**`pano_session_approved_max_pixels` は bump しない** (= この 1 枚だけの
+    切替、次の > 200 MP の新画像はバナーで再確認)。session-wide 承認はバナーの
+    チェックボックスに限定するため
+  - 表示条件: `is_plain_image (= GridItem::Image)` かつ
+    `!pano_high_res_failed.contains(&source_key)` かつ `policy_enabled`
+    (= ZIP/PDF/Video や decode 失敗履歴あり / AI 中・補正中の画像では非表示。
+    押下しても `start_pano_high_res_load` が即 return して "高画質 ロード中…" で
+    永久 stall するのを避ける)
+  - ホバー: `約 X.X GB の RAM を使います` (= `W × H × 4 × 2 / 1e9`)
+- **`SettleReady` / `SettleApproved` のとき (= settle 経路 active)**: `[8K 軽量に切替]`
+  ボタン
+  - クリックで state → `BaseOnly`、`pano_high_res_pending` を drain & cancel +
+    `pano_high_res_source.remove(&source_key)` + `clear_pano_refinement()`。
+    フル RGBA メモリ (1-2 GB) を即解放
+  - ホバー: `約 X.X GB を解放します`
+- **`NeedsUserConfirmation` (= バナー表示中) / `policy_enabled=false` / state 未設定**:
+  ボタン非表示。バナーまたは AI/補正設定の解除が先
+
+旧設計の「上部 360 ボタン横の ⚙ 高品質化アイコンで `NeedsUserConfirmation` に戻す」
+導線は廃止 (= 直接遷移の方がワンクリックで完結するため)。
 
 **RAM 検出不要 (旧 tier 判定との比較)**:
 
@@ -829,7 +848,7 @@ bicubic 化は Phase 3 の任意拡張。Phase 2a は bilinear で確定。
 (HighResSource) ≈ 2.8 GB transient。
 
 これを許容するのは:
-- ユーザーが明示的に「高品質で表示」を選んだケースのみ
+- ユーザーが明示的に「フル解像度(高画質)」を選んだケースのみ
 - ボタン押下から数秒の transient で、定常状態に落ち着けば 1.5 GB 程度
 - メモリ消費はバナーで事前告知済み (ユーザー同意済み)
 
@@ -881,7 +900,8 @@ let ci_8k = clamp_via_fast_resize(&high_res_rgba, w, h, 8192);
 
 #### 3.6.4.3 BaseOnly 状態の挙動詳細 (Codex P1 第 4 ラウンド反映)
 
-BaseOnly = 200 MP 超かつユーザーが「8K でよい」を選択したケース。**360 機能による
+BaseOnly = 200 MP 超かつユーザーが「最大 8K(軽量)」を選択したケース (またはあとから
+status indicator の `[8K 軽量に切替]` で BaseOnly に戻したケース)。**360 機能による
 追加メモリゼロ**、`pano_high_res_source` にエントリも作らない:
 
 1. `start_fs_load` の 360 候補分岐は通常パス通りで、`fs_cache[idx]` に 8K 縮小版が
@@ -1663,8 +1683,8 @@ pub enum PanoramaQualityState {
         source_pixels: u64,
         est_ram_gb: f32,
     },
-    SettleApproved,              // > 200 MP かつユーザーが「高品質」選択
-    BaseOnly,                    // > 200 MP かつユーザーが「8K でよい」選択
+    SettleApproved,              // > 200 MP かつユーザーが「フル解像度(高画質)」選択
+    BaseOnly,                    // > 200 MP かつユーザーが「最大 8K(軽量)」選択
 }
 
 pub struct PanoramaRefinement {
@@ -1793,11 +1813,14 @@ if let Some(refinement) = self.pano_refinement.as_ref() {
    - §4.1.1 の経路で 8K base テクスチャをアップロード
    - `PanoramaQualityState::NeedsUserConfirmation` ならフルスクリーン上部にバナー表示
 3. **ユーザーがバナーで選択した場合**:
-   - 「高品質で表示」: 状態 → `SettleApproved`、`start_pano_high_res_load(idx)` で
-     追加の worker を起動してフルデコード再実行 → `pano_high_res_source` 格納 →
+   - 「フル解像度(高画質)」: 状態 → `SettleApproved`、`start_pano_high_res_load(idx)`
+     で追加の worker を起動してフルデコード再実行 → `pano_high_res_source` 格納 →
      settle 有効化。チェックボックス ON なら `pano_session_approved_max_pixels =
      source_pixels` を記録
-   - 「8K でよい」: 状態 → `BaseOnly`、何もしない (settle 無効のまま)
+   - 「最大 8K(軽量)」: 状態 → `BaseOnly`、何もしない (settle 無効のまま)
+   - **以降は画面下部 status indicator 内の `[高画質に切替]` / `[8K 軽量に切替]`
+     ボタンでいつでも切替可能** (§3.6.4 末尾の切替導線参照、`SettleApproved` ↔
+     `BaseOnly` に直接遷移、`pano_session_approved_max_pixels` は bump しない)
 4. **`App::update` 末尾**: settle 状態を更新 (yaw/pitch/fov が前フレームと一致したら
    タイマー進行、変化があれば reset + 進行中レンダ cancel + overlay drop)。
    `settle_enabled(state, &resolution.settle_policy) == false` なら settle 処理スキップ
@@ -2179,10 +2202,11 @@ WGSL の `select(raw, clamped, cond)` は分岐ではなく **両辺を評価し
 - [x] **NeedsUserConfirmation バナー UI** (`draw_pano_confirmation_banner`):
   - [x] フルスクリーン上部 (上ホバーバー下) に半透明バナー
   - [x] 解像度 / MP / 想定 RAM 消費 (W*H*4*2 / 1e9) を数値表示
-  - [x] 「高品質で表示」/「8K でよい」ボタン
-  - [x] チェックボックス「このセッション中は今後も高品質で開く」 → `pano_banner_remember_session`
-  - [x] 「高品質」選択時: state → SettleApproved、`start_pano_high_res_load(fs_idx, cache_key)`
-        で worker 起動 + (チェック ON なら) `pano_session_approved_max_pixels = source_pixels`
+  - [x] 「フル解像度(高画質)」/「最大 8K(軽量)」ボタン
+  - [x] チェックボックス「今後も高画質モードで開く」 → `pano_banner_remember_session`
+  - [x] 「フル解像度(高画質)」選択時: state → SettleApproved、
+        `start_pano_high_res_load(fs_idx, cache_key)` で worker 起動 + (チェック ON なら)
+        `pano_session_approved_max_pixels = source_pixels`
 - [x] **`PanoramaSettlePolicy` enum + `compute_settle_policy` 実装** (§3.6.2.1):
   - [x] `EnabledFromRaw` / `EnabledWithColorAdjustments { params }` / `Disabled` 3 値
   - [x] `ai_feature_active` / `source_kind == AI/AI_ADJUST` / `params.auto_mode.is_some()` /
@@ -2225,8 +2249,23 @@ WGSL の `select(raw, clamped, cond)` は分岐ではなく **両辺を評価し
 - **× / V キー / Esc の役割整理 (§5.2 / §5.3 / §6.3 参照)**: 上部バー × が 360 OFF、
   Esc がフルスクリーン全体終了。360 アイコンは 360 OFF 時のみ表示
 - **ホイール = FOV ズーム (修飾不問)**: 拡大縮小のつもりで画像送りを誤発火する事故を防止
-- **NeedsUserConfirmation バナーの文言改善**: 「高品質で表示」→「フル解像度で閲覧
-  (高画質)」/ 「8K でよい」→「最大 8K で閲覧 (高画質化なし)」、ホバーツールチップ追加
+- **NeedsUserConfirmation バナーの文言改善**: 「高品質で表示」→「フル解像度(高画質)」/
+  「8K でよい」→「最大 8K(軽量)」、チェックボックス「今後も高画質モードで開く」、
+  ホバーツールチップ追加 (2026-05 ユーザーフィードバックで「高画質化なし」は元画像を
+  改変しているように誤読されるとの指摘を受け「軽量」表記に統一)
+- **status indicator 内の切替ボタン** (§3.6.4 末尾): `BaseOnly` のとき
+  `[高画質に切替]` (= `SettleApproved` 化 + `start_pano_high_res_load` 直接 kick、
+  `pano_session_approved_max_pixels` は bump しない)、`SettleReady`/`SettleApproved`
+  のとき `[8K 軽量に切替]` (= `BaseOnly` 化 + `pano_high_res_pending` drain &
+  cancel + `pano_high_res_source.remove` + `clear_pano_refinement`、フル RGBA メモリ
+  1-2 GB を即解放) を 1 つだけ pill バッジ右側に表示。ホバーで RAM 想定量
+  (`W × H × 4 × 2 / 1e9` GB) を表示。`[高画質に切替]` は `is_plain_image &&
+  !pano_high_res_failed && policy_enabled` のときだけ表示 (= ZIP/PDF/Video、decode
+  失敗履歴、AI / post_filter / auto_mode で `settle_policy` Disabled の画像では非表示。
+  押下しても `start_pano_high_res_load` が即 return して "高画質 ロード中…" で
+  永久 stall するのを防ぐ、Codex P1/P2 第 4 ラウンド指摘)。これにより旧案の
+  「上部 360 ボタン横に ⚙ 高品質化アイコン → `NeedsUserConfirmation` に戻す」
+  導線は廃止 (= ワンクリックで直接遷移、バナー再表示は不要)
 - **HighResSource の保持ポリシー**: `open_fullscreen` の clear() を **新 idx の
   source_key だけ残す** retain に変更。prefetch tee 済み画像で settle が永久ロード
   中になる問題を解消 (Codex P1 第 2)
@@ -2347,10 +2386,22 @@ Phase 2a 完成後の包括的レビューで 15 件の指摘 (P0-P3) を網羅�
 - [ ] テスト:
   - [ ] **2K ChatGPT 出力**: SettleReady 自動、settle 即実行
   - [ ] **12K Insta360 X3 (72 MP)**: SettleReady 自動、settle 動作
-  - [ ] **26K 画像 (338 MP)**: NeedsUserConfirmation バナー表示、「高品質」選択で
-        フル RGBA ロード開始、settle 動作
-  - [ ] **26K 画像で「8K でよい」選択**: BaseOnly に遷移、settle なし、
+  - [ ] **26K 画像 (338 MP)**: NeedsUserConfirmation バナー表示、
+        「フル解像度(高画質)」選択でフル RGBA ロード開始、settle 動作
+  - [ ] **26K 画像で「最大 8K(軽量)」選択**: BaseOnly に遷移、settle なし、
         `pano_high_res_source` に何も入らないこと
+  - [ ] **status indicator 内の切替ボタン**:
+    - [ ] BaseOnly 状態 + plain image + 未 failed + policy_enabled → `[高画質に切替]`
+          表示、押下で SettleApproved + worker spawn、`pano_session_approved_max_pixels`
+          は **bump されない** (= 次の > 200 MP 新画像はバナー再表示)
+    - [ ] BaseOnly 状態 + ZIP/PDF/Video → `[高画質に切替]` 非表示 (押下で stall 防止)
+    - [ ] BaseOnly 状態 + `pano_high_res_failed` 該当 → `[高画質に切替]` 非表示
+    - [ ] BaseOnly 状態 + AI/post_filter/auto_mode ON で settle_policy=Disabled →
+          `[高画質に切替]` 非表示。AI を OFF にしたら次フレで表示復活
+    - [ ] SettleReady/SettleApproved 状態 → `[8K 軽量に切替]` 表示、押下で
+          BaseOnly + `pano_high_res_pending` cancel + `pano_high_res_source.remove` +
+          `clear_pano_refinement` (RAM 解放)
+    - [ ] NeedsUserConfirmation 状態 → ボタン非表示 (バナー側で選択)
   - [ ] **approved_max_pixels の動作**: 220 MP 承認後、240 MP (× 1.09) はバナー
         出ず、340 MP (× 1.55) はバナー再表示
   - [ ] **settle_policy 切替の動作** (Codex P1 第 10 ラウンド):
@@ -2522,7 +2573,7 @@ Codex P1 で指摘された turbojpeg-sys 経路を実装するフェーズ。
 | **clear 粒度の表記が実コードと不整合** (Codex P3 第 17 ラウンド) | 設計で「該当 idx で clear」と書いていたが、実コード `clear_all_adjustment_and_ai_caches` は adjustment は idx、AI は全体の混合粒度 | §3.6.2.2 に粒度表 (adjustment=idx、AI=全体) を追記、Phase 1 チェックリストの generation bump も同じ粒度に整合 |
 | **`ai_upscale_generation.clear()` の衝突リスク** (Codex P3 第 17 ラウンド) | clear するとリセット後の値が過去 cache_key と衝突する可能性 | §3.6.2.2 / Phase 1 で **`.clear()` ではなく全 entry `+= 1`** (`bump_all_ai_generations`) と明記 |
 | **session 承認の単純 bool** (Codex P2 第 9 ラウンド) | bool だと 201 MP 承認後に 537 MP も無確認になる | §3.6.2 のとおり `pano_session_approved_max_pixels: u64` に変更、前回承認 × 1.25 超で再確認 |
-| **BaseOnly からの復帰導線** (Codex P2 第 9 ラウンド) | バナーで「8K でよい」を選んだ後、高品質に戻す手段がない | §3.6.4 末尾のとおりホバーバーに「⚙ 高品質化」アイコンボタン常設、いつでも `NeedsUserConfirmation` に戻せる |
+| **BaseOnly からの復帰導線** (Codex P2 第 9 ラウンド + 2026-05 後続反映) | バナーで「最大 8K(軽量)」を選んだ後、高画質に戻す手段がない | §3.6.4 末尾のとおり画面下部 status indicator 内に `[高画質に切替]` ボタン常設、ワンクリックで `SettleApproved` に直接遷移 (旧案の「⚙ 高品質化アイコンで `NeedsUserConfirmation` に戻す」は廃止)。逆方向の `[8K 軽量に切替]` ボタンも同じ場所に対称配置 |
 | **8K アップロードの「ヒッチなし」表現** (Codex P3 第 9 ラウンド) | 「8K なら UI ヒッチ無し」は言い切りすぎ | §12.1 / §4.1.1 で「16K より十分軽いが 1 フレ落ちはあり得る、実測で worker 化判断」に統一 |
 | ~~**JPEG 部分デコードの非対応形式**~~ | ~~PNG / WebP の 26K で Compressed tier に降格できない~~ | **不要になった**: 第 7 ラウンドで RAM tier 廃止、PNG/WebP 巨大も NeedsUserConfirmation バナー経由でユーザー判断 |
 | **HDR / EXR** | RICOH Theta などで HDR equirect が出る | スコープ外 (色管理自体が未実装) |

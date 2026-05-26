@@ -5050,22 +5050,35 @@ impl App {
         // ユーザーが「いま settle が動いているか」を視覚的に判定できるように。
         self.draw_pano_status_indicator(
             ui,
+            ctx,
             image_rect,
             fs_idx,
             &resolution,
             overlay_drawn,
             overlay_alpha,
         );
-        let _ = ctx;
         true
     }
 
     /// 360 度パノラマビュー Phase 2a: 高画質モードの状態を画面下部中央に小さく表示する。
     /// settle が動いているか / 待機中か / OFF か をユーザーが目で確認できるようにする。
+    ///
+    /// 加えて、現在の state に応じてモード切替ボタンを 1 つだけバッジ右側に出す
+    /// (CLAUDE 議論 2026-05):
+    /// - `BaseOnly`: `[高画質に切替]` ボタン (= SettleApproved 化 + worker spawn)
+    /// - `SettleReady` / `SettleApproved` (= settle 経路 active): `[8K 軽量に切替]`
+    ///   ボタン (= BaseOnly 化 + worker cancel + HighResSource drop)
+    /// - `NeedsUserConfirmation` (= バナー表示中) / `policy_enabled=false`
+    ///   (= AI / 補正中で settle 不能) / state 未設定: ボタンなし
+    ///
+    /// 「高画質に切替」を押しても `pano_session_approved_max_pixels` は **bump しない**。
+    /// = この 1 枚だけ高画質化、次の新画像 (> 200 MP) は再びバナーで確認する。
+    /// session-wide 承認はバナーのチェックボックスに限定するという設計判断。
     #[cfg(windows)]
     fn draw_pano_status_indicator(
-        &self,
+        &mut self,
         ui: &mut egui::Ui,
+        ctx: &egui::Context,
         image_rect: egui::Rect,
         fs_idx: usize,
         resolution: &crate::panorama::PanoSourceResolution,
@@ -5121,7 +5134,7 @@ impl App {
         } else if state_allows_settle && policy_enabled && !high_res_loaded {
             ("●", "高画質 ロード中…".to_string(), yellow)
         } else if matches!(state, Some(PanoramaQualityState::BaseOnly)) {
-            ("○", "最大 8K 表示 (高画質化なし)".to_string(), gray)
+            ("○", "最大 8K 表示 (軽量)".to_string(), gray)
         } else if matches!(
             state,
             Some(PanoramaQualityState::NeedsUserConfirmation { .. })
@@ -5147,16 +5160,90 @@ impl App {
         };
         let full_text = format!("{mark} {label}{dims_str}");
 
-        // バッジ矩形 (下部中央、半透明背景)。テキストサイズに合わせて allocate せず
-        // painter.text で先に描いてから背景を計算する手間を避けるため、固定パディングで
-        // テキスト幅を `Galley` から推定する。
+        // 切替ボタン情報を決定 (action / 表示文言 / ホバー)
+        #[derive(Clone, Copy)]
+        enum ToggleAction {
+            ToHighQuality,
+            ToBaseOnly,
+        }
+        // BaseOnly での [高画質に切替] は以下の AND 条件を満たすときだけ表示する
+        // (Codex P1/P2 第 4 ラウンド、2026-05):
+        //  - `is_plain_image` (= `GridItem::Image`)。ZIP/PDF/Video/Folder は
+        //    `start_pano_high_res_load` が即 return するので、押下しても worker が
+        //    spawn されず "高画質 ロード中…" で永久 stall する。
+        //    `maybe_update_pano_quality_state_from_static` でも非通常画像は
+        //    BaseOnly 固定にされている。
+        //  - `!high_res_failed` (= 前回 decode 失敗履歴がない)。`start_pano_high_res_load`
+        //    が failed エントリで即 return するため、同じ stall を引き起こす。
+        //  - `policy_enabled` (= AI / post_filter / auto_mode で settle_policy が
+        //    Disabled でない)。Disabled 下で SettleApproved に倒しても settle は動かず、
+        //    巨大 RGBA だけ確保される無駄を避ける。設定を解除すれば次フレで
+        //    自動的にボタンが現れる。
+        let is_plain_image = matches!(self.items.get(fs_idx), Some(GridItem::Image(_)));
+        let high_res_failed = self.pano_high_res_failed.contains(&resolution.source_key);
+        let can_switch_to_hq = is_plain_image && !high_res_failed && policy_enabled;
+        let toggle_info: Option<(ToggleAction, &'static str, String)> = if matches!(
+            state,
+            Some(PanoramaQualityState::BaseOnly)
+        ) && can_switch_to_hq
+        {
+            // BaseOnly → SettleApproved。ホバーに RAM 想定量を出す。
+            let hover = match src_dims {
+                Some((w, h)) => {
+                    let est_gb = (w as f64) * (h as f64) * 4.0 * 2.0 / 1.0e9;
+                    format!(
+                        "高画質モードに切り替えます。\nフル RGBA をメモリに保持するため約 {:.1} GB の RAM を使います。",
+                        est_gb
+                    )
+                }
+                None => {
+                    "高画質モードに切り替えます。\nフル RGBA をメモリに保持します。".to_string()
+                }
+            };
+            Some((ToggleAction::ToHighQuality, "高画質に切替", hover))
+        } else if state_allows_settle && policy_enabled {
+            // SettleReady/SettleApproved → BaseOnly。
+            // ホバーに「解放される RAM の見込み」を出す (= 現在保持中の HighResSource
+            // dims、無ければ src_dims から推定)。
+            let hover_dims = high_res.map(|hr| hr.dims()).or(src_dims);
+            let hover = match hover_dims {
+                Some((w, h)) => {
+                    let est_gb = (w as f64) * (h as f64) * 4.0 * 2.0 / 1.0e9;
+                    format!(
+                        "8K 表示に切り替えます (高画質モード OFF)。\nフル RGBA メモリ約 {:.1} GB を解放します。",
+                        est_gb
+                    )
+                }
+                None => {
+                    "8K 表示に切り替えます (高画質モード OFF)。\nフル RGBA メモリを解放します。"
+                        .to_string()
+                }
+            };
+            Some((ToggleAction::ToBaseOnly, "8K 軽量に切替", hover))
+        } else {
+            None
+        };
+
+        // バッジ矩形 (下部中央、半透明背景)。
+        // テキスト幅を `Galley` から測り、ボタンぶんの幅も足してから pill_rect を決める。
         let font_id = egui::FontId::proportional(13.0);
         let galley = ui
             .painter()
             .layout_no_wrap(full_text.clone(), font_id.clone(), color);
         let text_size = galley.size();
         let padding = egui::vec2(12.0, 6.0);
-        let pill_size = text_size + padding * 2.0;
+        let button_width = 130.0_f32;
+        let button_height = 24.0_f32;
+        let button_gap = 10.0_f32;
+        let extra_w = if toggle_info.is_some() {
+            button_gap + button_width
+        } else {
+            0.0
+        };
+        let pill_size = egui::vec2(
+            text_size.x + extra_w + padding.x * 2.0,
+            text_size.y.max(button_height) + padding.y * 2.0,
+        );
         let pill_center = egui::pos2(image_rect.center().x, image_rect.bottom() - 28.0);
         let pill_rect = egui::Rect::from_center_size(pill_center, pill_size);
         ui.painter().rect_filled(
@@ -5170,14 +5257,76 @@ impl App {
             egui::Stroke::new(1.0, egui::Color32::from_white_alpha(40)),
             egui::epaint::StrokeKind::Outside,
         );
-        ui.painter()
-            .galley(pill_rect.center() - text_size * 0.5, galley, color);
+        // テキストは左寄せ (button があれば右余白にボタンを置くため)
+        let text_pos = egui::pos2(
+            pill_rect.left() + padding.x,
+            pill_rect.center().y - text_size.y * 0.5,
+        );
+        ui.painter().galley(text_pos, galley, color);
+
+        // 切替ボタン (該当 state のみ)
+        if let Some((action, btn_label, hover)) = toggle_info {
+            let btn_rect = egui::Rect::from_min_size(
+                egui::pos2(
+                    pill_rect.left() + padding.x + text_size.x + button_gap,
+                    pill_rect.center().y - button_height * 0.5,
+                ),
+                egui::vec2(button_width, button_height),
+            );
+            let mut clicked = false;
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(btn_rect)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |child_ui| {
+                    let resp = child_ui
+                        .add_sized(
+                            btn_rect.size(),
+                            egui::Button::new(egui::RichText::new(btn_label).size(12.0)),
+                        )
+                        .on_hover_text(hover);
+                    if resp.clicked() {
+                        clicked = true;
+                    }
+                },
+            );
+            if clicked {
+                match action {
+                    ToggleAction::ToHighQuality => {
+                        // BaseOnly → SettleApproved。high-res worker を kick。
+                        // **`pano_session_approved_max_pixels` は bump しない**。
+                        // session-wide 承認はバナーのチェックボックスに限定するため。
+                        let source_key = resolution.source_key.clone();
+                        let cache_key = resolution.cache_key;
+                        self.pano_quality_state
+                            .insert(source_key, PanoramaQualityState::SettleApproved);
+                        self.start_pano_high_res_load(fs_idx, cache_key);
+                        ctx.request_repaint();
+                    }
+                    ToggleAction::ToBaseOnly => {
+                        // SettleApproved/SettleReady → BaseOnly。worker を全 cancel し、
+                        // ロード済み HighResSource を drop (= フル RGBA 1-2 GB を即解放)。
+                        // 進行中の settle render も cancel + callback_resources 除去。
+                        let source_key = resolution.source_key.clone();
+                        self.pano_quality_state
+                            .insert(source_key.clone(), PanoramaQualityState::BaseOnly);
+                        for (_, req) in self.pano_high_res_pending.drain() {
+                            req.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        self.pano_high_res_source.remove(&source_key);
+                        self.clear_pano_refinement();
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(not(windows))]
     fn draw_pano_status_indicator(
-        &self,
+        &mut self,
         _ui: &mut egui::Ui,
+        _ctx: &egui::Context,
         _image_rect: egui::Rect,
         _fs_idx: usize,
         _resolution: &crate::panorama::PanoSourceResolution,
@@ -5228,8 +5377,8 @@ impl App {
     /// (docs/panorama-360-view-plan.md §3.6.2 / §3.6.4)。
     ///
     /// 表示位置: フルスクリーン上部 (横幅は中央寄せ)、動画 HUD と同じ階層。
-    /// 内容: 解像度 / MP / 想定 RAM 消費の数値表示 + 「高品質で表示」/「8K でよい」/
-    /// 「このセッション中は今後も高品質で開く」チェックボックス。
+    /// 内容: 解像度 / MP / 想定 RAM 消費の数値表示 + 「フル解像度(高画質)」/
+    /// 「最大 8K(軽量)」/ 「今後も高画質モードで開く」チェックボックス。
     /// state が NeedsUserConfirmation 以外なら何も描画せず即 return。
     fn draw_pano_confirmation_banner(
         &mut self,
@@ -5325,11 +5474,9 @@ impl App {
             |child_ui| {
                 if child_ui
                     .add_sized(
-                        egui::vec2(220.0, 32.0),
+                        egui::vec2(200.0, 32.0),
                         egui::Button::new(
-                            egui::RichText::new("フル解像度で閲覧 (高画質)")
-                                .size(14.0)
-                                .strong(),
+                            egui::RichText::new("フル解像度(高画質)").size(14.0).strong(),
                         )
                         .fill(egui::Color32::from_rgb(120, 180, 80)),
                     )
@@ -5343,10 +5490,8 @@ impl App {
                 child_ui.add_space(8.0);
                 if child_ui
                     .add_sized(
-                        egui::vec2(220.0, 32.0),
-                        egui::Button::new(
-                            egui::RichText::new("最大 8K で閲覧 (高画質化なし)").size(14.0),
-                        ),
+                        egui::vec2(160.0, 32.0),
+                        egui::Button::new(egui::RichText::new("最大 8K(軽量)").size(14.0)),
                     )
                     .on_hover_text(
                         "8K に縮小した表示のみ使用します。メモリ消費は抑えられますが、\n拡大時の精細さは下がります (= 通常画面と同じ品質)。",
@@ -5356,15 +5501,15 @@ impl App {
                     clicked_base = true;
                 }
                 child_ui.add_space(12.0);
-                // 「このセッション中は今後も高画質モードで開く」: バナーごとの local state を
-                // 持たない (= 毎フレ false 起点で描画) ため、self の単純フィールドで管理。
+                // 「今後も高画質モードで開く」: バナーごとの local state を持たない
+                // (= 毎フレ false 起点で描画) ため、self の単純フィールドで管理。
                 //
                 // バナー背景が暗色 (`from_black_alpha(220)`) なので、egui デフォルトの
                 // チェックボックスラベル色 (薄いグレー) では読みづらい。本文テキスト
                 // (`from_white_alpha(230)`) と揃えて明示的に色とサイズを指定する。
                 child_ui.checkbox(
                     &mut self.pano_banner_remember_session,
-                    egui::RichText::new("このセッション中は今後も高画質モードで開く")
+                    egui::RichText::new("今後も高画質モードで開く")
                         .color(egui::Color32::from_white_alpha(230))
                         .size(13.0),
                 );
