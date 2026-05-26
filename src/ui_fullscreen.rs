@@ -740,9 +740,22 @@ impl App {
             return;
         }
         let Some(idx) = self.fullscreen_idx else {
-            // ユーザーが Esc 等でフルスクリーンを抜けた場合のみここに来る
-            // (apply_folder_nav_result 内の close_fullscreen は同フレーム内で
-            //  open_fullscreen に続くので fs_idx は Some に戻る)。
+            // 通常は `apply_folder_nav_result` 内で close_fullscreen → open_fullscreen が
+            // 同フレームで連続実行されるので fs_idx は Some に戻る。例外は **PDF/ZIP の
+            // async enumerate 待ち**: PDF メタキャッシュ hit で `try_apply_pdf_meta_cache`
+            // が placeholder grid を install (= items_generation++) するが、
+            // `reopen_fullscreen_after_folder_nav_load` は `pdf_enumerate_pending` が
+            // 残っているため "enumerate_defer" で抜け、fullscreen_idx は None のまま
+            // 数フレーム経過する。この window で holdover を解放してしまうと、
+            // `keep_fullscreen_viewport_alive` (viewport mode) と
+            // `render_embedded_fs_nav_holdover` (in-window mode) の defer 描画から
+            // 直前ページ画像が消えて真っ黒のフラッシュになる。
+            // `fs_nav_after_pdf_enumerate` が立っている間はユーザーがフルスクリーン
+            // 継続を意図しているので、解除を保留して deferred reopen 完了まで待つ。
+            if self.fs_nav_after_pdf_enumerate.is_some() {
+                return;
+            }
+            // 上記以外で fullscreen_idx = None = ユーザーが Esc 等で抜けた。
             self.fs_nav_locked_gen = None;
             self.fs_holdover_tex = None;
             return;
@@ -1144,6 +1157,11 @@ impl App {
                 // 次フレーム以降はこの関数の非アクティブ経路でビューポートが
                 // 隠される (グリッドへ戻る)。
                 self.fs_nav_after_pdf_enumerate = None;
+                // ZIP defer の場合 `items_generation` がまだ進んでいないため、
+                // `poll_fs_nav_lock` の解放経路に乗らず lock/holdover が居座る。
+                // 明示 release で確実に状態をクリーンにする (embedded 用ヘルパと対称、
+                // Codex 第 3 ラウンド P2)。
+                self.release_fs_nav_lock();
                 ctx.request_repaint();
             }
             return;
@@ -1170,8 +1188,74 @@ impl App {
         }
     }
 
+    /// in-window 静止画モード (`native_video_in_window_active`) で PDF/ZIP の
+    /// async enumerate 待ち中に、メインウィンドウの `CentralPanel` に黒地 + holdover を
+    /// 描画する。viewport モード側 `keep_fullscreen_viewport_alive` の PDF defer
+    /// ブランチ (line 1095- area) と対称な役割。これがないと:
+    ///   - `apply_folder_nav_result` の `close_fullscreen` で `fullscreen_idx = None`
+    ///   - `reopen_fullscreen_after_folder_nav_load` が `pdf_enumerate_pending.is_some()`
+    ///     を理由に "enumerate_defer" で抜ける
+    ///   - 数フレーム間 `embedded_fs_active` が false になり、`render_grid` が走って
+    ///     メインウィンドウの白い CentralPanel (ライトテーマ既定) が露出する
+    /// という流れで「黒背景の画像が一瞬消えて白背景が見える」フラッシュが発生する。
+    ///
+    /// Esc / ウィンドウクローズ要求で deferred reopen を破棄して fullscreen を抜ける
+    /// (viewport モードの defer 分岐と同じ挙動)。
+    #[cfg(windows)]
+    fn render_embedded_fs_nav_holdover(&mut self, ctx: &egui::Context) {
+        let holdover = self.fs_holdover_tex.clone();
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        let escape_pressed = !self.ime_input_active()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let cancel = close_requested || escape_pressed;
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(egui::Color32::BLACK))
+            .show(ctx, |ui| {
+                if let Some(handle) = holdover.as_ref() {
+                    // 中央 contain フィット (= はみ出さないアスペクト維持)。
+                    let avail = ui.available_size();
+                    let tex_size = handle.size_vec2();
+                    if tex_size.x > 0.0 && tex_size.y > 0.0 && avail.x > 0.0 && avail.y > 0.0 {
+                        let scale = (avail.x / tex_size.x).min(avail.y / tex_size.y);
+                        let w = tex_size.x * scale;
+                        let h = tex_size.y * scale;
+                        let img_rect =
+                            egui::Rect::from_center_size(ui.max_rect().center(), egui::vec2(w, h));
+                        ui.painter().image(
+                            handle.id(),
+                            img_rect,
+                            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                            egui::Color32::WHITE,
+                        );
+                    }
+                }
+            });
+
+        if cancel {
+            // 保留中の「列挙後にフルスクリーン復帰」意図を破棄してグリッドへ戻す。
+            self.fs_nav_after_pdf_enumerate = None;
+            self.release_fs_nav_lock();
+            ctx.request_repaint();
+        } else {
+            // enumerate worker は別スレッドで完了し repaint を要求しないため、
+            // defer 中は明示的に次フレームを起こす (= viewport モードと同じ)。
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+    }
+
     pub(crate) fn render_fullscreen_viewport(&mut self, ctx: &egui::Context) {
         let Some(fs_idx) = self.fullscreen_idx else {
+            // in-window 静止画モードで PDF/ZIP enumerate defer 中:
+            // grid (= 白 CentralPanel) が露出するのを防ぐため、メインウィンドウに
+            // 直接黒地 + holdover を描く。詳細は `render_embedded_fs_nav_holdover`
+            // の doc を参照。viewport モードでは `keep_fullscreen_viewport_alive` が
+            // 別 viewport で同じ役割を担うので、ここで二重に描かないよう
+            // `native_video_in_window_active` で gate する。
+            #[cfg(windows)]
+            if self.native_video_in_window_active && self.fs_nav_after_pdf_enumerate.is_some() {
+                self.render_embedded_fs_nav_holdover(ctx);
+            }
             return;
         };
 

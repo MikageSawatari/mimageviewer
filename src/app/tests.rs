@@ -3568,6 +3568,55 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.fs_holdover_tex.is_none());
     }
 
+    /// `poll_fs_nav_lock`: PDF/ZIP の async enumerate 待ち中 (= `fs_nav_after_pdf_enumerate`
+    /// が立っている) は、`items_generation` が進んでも `fullscreen_idx = None` の状態で
+    /// holdover を解放しないこと。PDF メタキャッシュ hit で placeholder grid を install
+    /// した直後の cache-hit 経路の回帰ガード。これが無いと、in-window モードの
+    /// `render_embedded_fs_nav_holdover` (および viewport モードの
+    /// `keep_fullscreen_viewport_alive` PDF defer 分岐) で holdover 画像が消えて
+    /// 真っ黒のフラッシュになる。
+    #[test]
+    fn poll_fs_nav_lock_keeps_holdover_during_pdf_enumerate_defer() {
+        use crate::grid_item::GridItem;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let dummy_tex = ctx.load_texture(
+            "test_dummy",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        // 元 fullscreen 状態 (旧 PDF ページ) の痕跡を残す。
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        // ナビ発火時に lock + holdover を確保した状態を再現。
+        let lock_gen = app.items_generation;
+        app.fs_nav_locked_gen = Some(lock_gen);
+        app.fs_holdover_tex = Some(dummy_tex.clone());
+        // close_fullscreen → load_pdf_as_folder → placeholder install と進んで、
+        // fullscreen_idx は None、items_generation は進んだが、async enumerate は
+        // まだ pending という状態。
+        app.fullscreen_idx = None;
+        app.items_generation += 1;
+        app.fs_nav_after_pdf_enumerate = Some(true);
+
+        app.poll_fs_nav_lock();
+        assert!(
+            app.fs_nav_locked_gen.is_some(),
+            "deferred enumerate 中は items_gen 進行 + fs_idx=None でも lock を維持"
+        );
+        assert!(
+            app.fs_holdover_tex.is_some(),
+            "deferred enumerate 中は holdover を解放しない (defer 描画から画像が消えるのを防ぐ)"
+        );
+
+        // enumerate 完了で fs_nav_after_pdf_enumerate がクリアされたあとは
+        // 通常通り fs_idx=None の解除経路に乗る (= Esc 等で抜けたケース)。
+        app.fs_nav_after_pdf_enumerate = None;
+        app.poll_fs_nav_lock();
+        assert!(app.fs_nav_locked_gen.is_none());
+        assert!(app.fs_holdover_tex.is_none());
+    }
+
     /// `get_or_open_catalog` の LRU キャッシュ動作: 同じフォルダで 2 回呼ぶと
     /// 同じ `Arc<CatalogDb>` (= 同じ Arc::ptr) が返ること、容量を超えると古いものから
     /// 抜けること。Ctrl+↓ 連打時に毎ステップ `CatalogDb::open` を走らせないための

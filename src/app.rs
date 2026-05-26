@@ -6036,6 +6036,11 @@ impl App {
         // 新しい load_folder 等で cancel が立った (実質 Drop 直前) 場合は結果を適用しない
         if pending.cancel.load(Ordering::Relaxed) {
             self.zip_enumerate_pending = None;
+            // cancel された pending ではフルスクリーン復帰は不成立。defer フラグを
+            // 放置すると grid 抑止 / holdover 維持が永続化するので明示的に破棄する
+            // (PDF 側 cancel ガードと対称)。
+            self.fs_nav_after_pdf_enumerate = None;
+            self.release_fs_nav_lock();
             return;
         }
         let result = match pending.rx.try_recv() {
@@ -6045,6 +6050,9 @@ impl App {
                 crate::logger::log("zip enumerate: worker disconnected");
                 let zip_path = pending.zip_path.clone();
                 self.zip_enumerate_pending = None;
+                // ワーカー切断ではフルスクリーン復帰が起きない: defer フラグを破棄。
+                self.fs_nav_after_pdf_enumerate = None;
+                self.release_fs_nav_lock();
                 self.start_loading_items(
                     zip_path,
                     Vec::new(),
@@ -6074,6 +6082,10 @@ impl App {
             Ok(e) => e,
             Err(e) => {
                 crate::logger::log(format!("  zip enumerate failed: {e}"));
+                // 失敗時はフルスクリーンを開き直さないので defer フラグを破棄する
+                // (line 6142 の `.take()` には到達しない早期 return パス)。
+                self.fs_nav_after_pdf_enumerate = None;
+                self.release_fs_nav_lock();
                 self.start_loading_items(
                     zip_path,
                     Vec::new(),
@@ -6396,6 +6408,12 @@ impl App {
         // 追加されても古い結果を適用しないための念押し。
         if handle.cancel.load(Ordering::Relaxed) {
             self.pdf_enumerate_pending = None;
+            // cancel された pending では deferred fullscreen reopen も不成立。
+            // 放置すると `shortcuts_blocked_by_text_input` / `embedded_fs_pending` /
+            // `poll_fs_nav_lock` の defer 経路がフラグを見て永続的に grid を抑止する
+            // (= UI フリーズに見える)。明示的に破棄する。
+            self.fs_nav_after_pdf_enumerate = None;
+            self.release_fs_nav_lock();
             return;
         }
 
@@ -6431,6 +6449,10 @@ impl App {
                     "  pdf enumerate: cancelled result dropped for {}",
                     pdf_path.display()
                 ));
+                // cancel 経路でもフルスクリーン復帰はもう起きないので defer フラグを破棄する。
+                // 残すと grid 抑止 / holdover 維持が永続化して UI フリーズに見える。
+                self.fs_nav_after_pdf_enumerate = None;
+                self.release_fs_nav_lock();
                 return;
             }
         }
@@ -6580,6 +6602,12 @@ impl App {
                     // Ctrl+↑↓ 由来の deferred fullscreen 意図は破棄する
                     // (パスワード入力後に再び fullscreen にしたければユーザーが手動で開く)。
                     self.fs_nav_after_pdf_enumerate = None;
+                    // パスワード保護 PDF + placeholder 無しの場合、`load_pdf_as_folder`
+                    // 経路では `items_generation` が進んでいないため、`poll_fs_nav_lock`
+                    // が `items_generation <= locked_gen` で永久にロック解除しない
+                    // (= holdover が居座る)。defer フラグ破棄と一緒に nav lock も
+                    // 明示 release する (Codex 第 3 ラウンド P2)。
+                    self.release_fs_nav_lock();
                     // PDF メタキャッシュで placeholder grid を立てていた場合、レンダ
                     // できない N セルがそのまま残るので空に戻す (Codex P1 対応)。
                     // 空に戻すと render_grid の中央表示が「表示するファイルがありません」
@@ -6926,6 +6954,11 @@ impl App {
         if let Some(pending) = self.zip_enumerate_pending.as_ref() {
             if pending.zip_path != source_path {
                 self.zip_enumerate_pending = None;
+                // PDF 側 (line 6920) と対称: 別パスへ遷移するなら deferred fullscreen
+                // reopen も成立しないので defer フラグを破棄する。残すと
+                // `shortcuts_blocked_by_text_input` 経由で grid ショートカットが
+                // 永続的に効かなくなる。
+                self.fs_nav_after_pdf_enumerate = None;
             }
         }
 
@@ -11712,8 +11745,15 @@ impl App {
     /// Ctrl+ホイールの場合はグリッド列数を変更する。
     fn process_scroll(&mut self, ctx: &egui::Context) {
         // ダイアログやフルスクリーン表示中はスクロールを消費しない
-        // (ダイアログ内の ScrollArea が正しく動くようにする)
-        if self.fullscreen_idx.is_some() || self.any_dialog_open() {
+        // (ダイアログ内の ScrollArea が正しく動くようにする)。
+        // PDF/ZIP enumerate の deferred reopen 待ち中 (= `fs_nav_after_pdf_enumerate`
+        // が立っている) も「フルスクリーン継続中」と同じ扱いにする: 静止画 in-window
+        // モードでは holdover が main ctx を覆っているのに、その背後で grid が
+        // ホイールスクロール / Ctrl+ホイール列数変更を受け付けてしまうのを防ぐ。
+        if self.fullscreen_idx.is_some()
+            || self.fs_nav_after_pdf_enumerate.is_some()
+            || self.any_dialog_open()
+        {
             return;
         }
 
@@ -11852,8 +11892,16 @@ impl App {
     /// テキスト入力フォーカス・ダイアログ・フルスクリーン中にブロックするための共通判定。
     /// 検索バー (Ctrl+F / Ctrl+S / Ctrl+G) のいずれかにフォーカスがある状態で
     /// BS / Enter / Ctrl+C 等が grid に漏れないようにするためのゲート。
+    ///
+    /// `fs_nav_after_pdf_enumerate.is_some()` も block 対象に含めるのは、Ctrl+↑↓
+    /// で PDF/ZIP に遷移した直後の async enumerate 待ち (= close_fullscreen で
+    /// `fullscreen_idx = None` の数フレーム) に、グリッド側 Ctrl+↑↓ が
+    /// `FolderNavMode::Grid` で再 enqueue されて in-flight Fullscreen-mode nav を
+    /// キャンセルしてしまうのを防ぐため。ユーザーの意図はフルスクリーン継続なので
+    /// この待ち中はグリッドショートカットを全部抑止する。
     pub(crate) fn shortcuts_blocked_by_text_input(&self) -> bool {
         self.fullscreen_idx.is_some()
+            || self.fs_nav_after_pdf_enumerate.is_some()
             || self.any_dialog_open()
             || self.address_has_focus
             || self.search_has_focus
@@ -18727,6 +18775,12 @@ impl eframe::App for App {
         //  判定が崩れるため、呼び出し直前にキャプチャする)。
         #[cfg(windows)]
         let embedded_fs_active = self.fullscreen_embedded_still_active();
+        // PDF/ZIP enumerate defer 中は fullscreen_idx = None でも in-window 用 holdover
+        // を main ctx に描いているので、続くグリッド描画は同じく抑止する必要がある
+        // (両方の CentralPanel が走ると二重描画 + 白フラッシュ)。
+        #[cfg(windows)]
+        let embedded_fs_pending =
+            self.native_video_in_window_active && self.fs_nav_after_pdf_enumerate.is_some();
         self.render_fullscreen_viewport(ctx);
         let t_render_fullscreen_viewport = frame_t0.elapsed();
         #[cfg(windows)]
@@ -18803,7 +18857,14 @@ impl eframe::App for App {
             // render_fullscreen_viewport が main ctx に CentralPanel を描いたので、
             // グリッド UI (menubar/toolbar/grid) を描くと CentralPanel が二重になる。
             // native 動画 backdrop ブロック (上) と同じくここでグリッド描画を飛ばす。
-            if embedded_fs_active {
+            //
+            // `embedded_fs_pending` (PDF/ZIP enumerate defer 中) は fullscreen_idx が
+            // None なので embedded_fs_active=false だが、render_fullscreen_viewport が
+            // `render_embedded_fs_nav_holdover` で main ctx に黒地 + holdover を描いて
+            // いるため、後続の render_grid が走ると同じく二重 + 白フラッシュ問題が出る。
+            // 同じ gate に乗せて grid 描画を skip し、poll_pdf/zip_enumerate で deferred
+            // reopen を回す。
+            if embedded_fs_active || embedded_fs_pending {
                 // Ctrl+↑↓ DFS の結果回収 (native 動画ブロックと同じ理由)。
                 if let Some(result) = self.poll_folder_nav() {
                     if keyboard_nav.is_none() {
