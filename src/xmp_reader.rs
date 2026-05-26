@@ -128,6 +128,63 @@ pub fn read_tweet_info_from_bytes(bytes: &[u8]) -> Option<XmpTweetInfo> {
     }
 }
 
+/// XMP 由来の各パース結果をまとめて返す bundle 型。
+/// `xtw:*` (mXD X/Twitter) と GPano パノラマプロパティはどちらも同じ XMP packet を
+/// 参照するため、1 回のファイル読み + extract_xmp_packet で両方を取り出して
+/// I/O を半減する (Codex P2 第 19 ラウンド)。
+#[derive(Clone, Debug, Default)]
+pub struct XmpReadBundle {
+    pub tweet: Option<XmpTweetInfo>,
+    pub panorama: Option<XmpPanoramaInfo>,
+}
+
+/// パスから XMP 関連情報をまとめて読む。`read_tweet_info` + `read_panorama_info`
+/// と等価だが、I/O と extract_xmp_packet を **1 回** で済ます (Codex P2 第 19 ラウンド)。
+///
+/// 戦略は [`read_tweet_info`] と同じ:
+/// - JPEG / PNG: ファイル全体読み
+/// - MP4 / MOV / M4V / TIFF: 先頭 [`FALLBACK_SCAN_LIMIT`] バイトのみ
+pub fn read_xmp_bundle(path: &Path) -> XmpReadBundle {
+    if !extension_might_have_xmp(path) {
+        return XmpReadBundle::default();
+    }
+    let small_image = matches!(
+        lowercase_ext(path).as_deref(),
+        Some("jpg" | "jpeg" | "jfif" | "png")
+    );
+    let bytes_result = if small_image {
+        std::fs::read(path).ok()
+    } else {
+        use std::io::Read;
+        std::fs::File::open(path).ok().and_then(|f| {
+            let mut buf = Vec::with_capacity(FALLBACK_SCAN_LIMIT.min(64 * 1024));
+            f.take(FALLBACK_SCAN_LIMIT as u64)
+                .read_to_end(&mut buf)
+                .ok()
+                .map(|_| buf)
+        })
+    };
+    let Some(bytes) = bytes_result else {
+        return XmpReadBundle::default();
+    };
+    read_xmp_bundle_from_bytes(&bytes)
+}
+
+/// バイト列版。`has_xmp_capable_magic` と `extract_xmp_packet` を 1 回ずつしか
+/// 実行しないので、tweet + panorama を別関数で 2 回読むのに比べて約半分のコスト。
+pub fn read_xmp_bundle_from_bytes(bytes: &[u8]) -> XmpReadBundle {
+    if !has_xmp_capable_magic(bytes) {
+        return XmpReadBundle::default();
+    }
+    let Some(packet) = extract_xmp_packet(bytes) else {
+        return XmpReadBundle::default();
+    };
+    // 各パーサに XMP packet を共有させる
+    let tweet = parse_xmp(&packet).filter(|t| t.is_populated());
+    let panorama = parse_gpano(&packet).filter(|p| p.is_populated());
+    XmpReadBundle { tweet, panorama }
+}
+
 /// XMP が入り得るコンテナのマジックバイトか判定。
 pub(crate) fn has_xmp_capable_magic(bytes: &[u8]) -> bool {
     if bytes.starts_with(&[0xFF, 0xD8]) {
@@ -682,6 +739,306 @@ fn parse_rating_value(s: &str) -> Option<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// GPano (Google Photo Sphere) パノラマメタデータ
+// ---------------------------------------------------------------------------
+
+/// Google が定義した Photo Sphere XMP 名前空間。
+/// 360 度パノラマビュー機能 (docs/panorama-360-view-plan.md) が equirectangular 画像
+/// を検出するためのシグナル。
+const GPANO_NAMESPACE: &[u8] = b"http://ns.google.com/photos/1.0/panorama/";
+
+/// GPano XMP パケットから抽出した 360 度パノラマ情報。
+///
+/// Phase 1 (8K base + WGSL equirect 表示) で使うのは
+/// [`projection_type`](Self::projection_type) と
+/// [`use_panorama_viewer`](Self::use_panorama_viewer) と pose hint のみ。
+/// `full_pano_*` / `cropped_area_*` は Phase 3 の部分パノラマ補正用に拾っておく。
+#[derive(Clone, Debug, Default)]
+pub struct XmpPanoramaInfo {
+    /// 例: `"equirectangular"`。Phase 1 ではこれを必須シグナルとして使う。
+    pub projection_type: Option<String>,
+    /// `True` ならビューアアプリで全画面表示を推奨する旨の宣言。Phase 1 では自動起動の条件。
+    pub use_panorama_viewer: Option<bool>,
+    /// 撮影機の上下角 (度)。0 が水平、+ で上向き。初期 pitch の hint。
+    pub pose_pitch_degrees: Option<f32>,
+    /// 撮影機のヘディング (北からの方位、度)。初期 yaw の hint。
+    pub pose_heading_degrees: Option<f32>,
+    /// 撮影機のロール (度)。Phase 1 では未使用 (将来の view 補正用に取得)。
+    pub pose_roll_degrees: Option<f32>,
+    /// 元の球面全体の幅 (px)。クロップされている場合は本画像幅と異なる。Phase 3。
+    pub full_pano_width_pixels: Option<u32>,
+    /// 元の球面全体の高さ (px)。Phase 3。
+    pub full_pano_height_pixels: Option<u32>,
+    /// クロップ後画像の幅 (px)。Phase 3。
+    pub cropped_area_image_width_pixels: Option<u32>,
+    /// クロップ後画像の高さ (px)。Phase 3。
+    pub cropped_area_image_height_pixels: Option<u32>,
+    /// クロップ領域の左端 (px、フル球面座標)。Phase 3。
+    pub cropped_area_left_pixels: Option<u32>,
+    /// クロップ領域の上端 (px、フル球面座標)。Phase 3。
+    pub cropped_area_top_pixels: Option<u32>,
+}
+
+impl XmpPanoramaInfo {
+    /// 1 つでも GPano プロパティを拾えていれば有効。
+    pub fn is_populated(&self) -> bool {
+        self.projection_type.is_some()
+            || self.use_panorama_viewer.is_some()
+            || self.pose_pitch_degrees.is_some()
+            || self.pose_heading_degrees.is_some()
+            || self.pose_roll_degrees.is_some()
+            || self.full_pano_width_pixels.is_some()
+            || self.full_pano_height_pixels.is_some()
+            || self.cropped_area_image_width_pixels.is_some()
+            || self.cropped_area_image_height_pixels.is_some()
+            || self.cropped_area_left_pixels.is_some()
+            || self.cropped_area_top_pixels.is_some()
+    }
+
+    /// ProjectionType が equirectangular か。Phase 1 の自動起動はこの判定 +
+    /// `use_panorama_viewer == Some(true)` を AND で要求する。
+    pub fn is_equirectangular(&self) -> bool {
+        self.projection_type
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case("equirectangular"))
+            .unwrap_or(false)
+    }
+}
+
+/// パスから GPano パノラマ情報を読む。
+/// XMP パケットが無い / GPano プロパティが無い場合は None。
+///
+/// 読み込み戦略は [`read_tweet_info`] と同じ:
+/// JPEG/PNG はファイル全体、MP4/MOV/M4V/TIFF は先頭 512 KB のみ。
+pub fn read_panorama_info(path: &Path) -> Option<XmpPanoramaInfo> {
+    if !extension_might_have_xmp(path) {
+        return None;
+    }
+    let small_image = matches!(
+        lowercase_ext(path).as_deref(),
+        Some("jpg" | "jpeg" | "jfif" | "png")
+    );
+    if small_image {
+        let bytes = std::fs::read(path).ok()?;
+        return read_panorama_info_from_bytes(&bytes);
+    }
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(FALLBACK_SCAN_LIMIT.min(64 * 1024));
+    f.take(FALLBACK_SCAN_LIMIT as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    read_panorama_info_from_bytes(&buf)
+}
+
+/// バイト列版 (ZIP 内画像などで使用)。
+pub fn read_panorama_info_from_bytes(bytes: &[u8]) -> Option<XmpPanoramaInfo> {
+    if !has_xmp_capable_magic(bytes) {
+        return None;
+    }
+    let xmp = extract_xmp_packet(bytes)?;
+    let info = parse_gpano(&xmp)?;
+    if info.is_populated() {
+        Some(info)
+    } else {
+        None
+    }
+}
+
+/// 生の XMP RDF/XML から GPano プロパティを抽出する。
+///
+/// 対応する記法 (どちらも GPano 公式仕様で許される):
+/// - 属性形式: `<rdf:Description GPano:ProjectionType="equirectangular" ... />`
+/// - 要素形式: `<GPano:ProjectionType>equirectangular</GPano:ProjectionType>`
+///
+/// `True` / `False` の判定は大文字小文字無視。数値は f32 / u32 として parse 失敗時は無視。
+pub(crate) fn parse_gpano(xml: &[u8]) -> Option<XmpPanoramaInfo> {
+    let mut reader = NsReader::from_reader(xml);
+    reader.config_mut().trim_text(true);
+    let mut buf = Vec::new();
+    let mut info = XmpPanoramaInfo::default();
+    // 要素形式の現在キャプチャ中のローカル名 (GPano 名前空間内のときだけ)
+    let mut capture_local: Option<Vec<u8>> = None;
+    let mut current_text = String::new();
+
+    // リーダー借用を貸し出しループ内に残さないため、イベントを所有型に詰め替える。
+    // (parse_xmp の Ev パターンと同じ構造)
+    enum Ev {
+        Open {
+            is_start: bool,
+            local: Vec<u8>,
+            ns_is_gpano: bool,
+            /// (GPano local name, value) — 属性形式で拾えた GPano プロパティ
+            gpano_attrs: Vec<(Vec<u8>, String)>,
+        },
+        Text(String),
+        Close,
+        Eof,
+        Other,
+    }
+
+    let decoder = reader.decoder();
+
+    loop {
+        let event = {
+            let (resolved_ns, ev) = match reader.read_resolved_event_into(&mut buf) {
+                Ok(r) => r,
+                Err(_) => break,
+            };
+            let is_start = matches!(ev, Event::Start(_));
+            let is_open = is_start || matches!(ev, Event::Empty(_));
+            if is_open {
+                let e = match &ev {
+                    Event::Start(e) | Event::Empty(e) => e,
+                    _ => unreachable!(),
+                };
+                let local: Vec<u8> = e.local_name().as_ref().to_vec();
+                let ns_is_gpano = matches!(&resolved_ns,
+                    quick_xml::name::ResolveResult::Bound(ns) if ns.as_ref() == GPANO_NAMESPACE);
+                let resolver = reader.resolver();
+                let mut gpano_attrs: Vec<(Vec<u8>, String)> = Vec::new();
+                for attr in e.attributes().flatten() {
+                    let (attr_ns, attr_local) = resolver.resolve_attribute(attr.key);
+                    let is_gpano_attr = matches!(&attr_ns,
+                        quick_xml::name::ResolveResult::Bound(ns) if ns.as_ref() == GPANO_NAMESPACE);
+                    if !is_gpano_attr {
+                        continue;
+                    }
+                    let Ok(value) = attr.decode_and_unescape_value(decoder) else {
+                        continue;
+                    };
+                    gpano_attrs.push((attr_local.as_ref().to_vec(), value.into_owned()));
+                }
+                Ev::Open {
+                    is_start,
+                    local,
+                    ns_is_gpano,
+                    gpano_attrs,
+                }
+            } else {
+                match ev {
+                    Event::Text(t) => {
+                        Ev::Text(t.decode().map(|s| s.into_owned()).unwrap_or_default())
+                    }
+                    Event::End(_) => Ev::Close,
+                    Event::Eof => Ev::Eof,
+                    _ => Ev::Other,
+                }
+            }
+        };
+
+        match event {
+            Ev::Open {
+                is_start,
+                local,
+                ns_is_gpano,
+                gpano_attrs,
+            } => {
+                for (k, v) in &gpano_attrs {
+                    apply_gpano_field(&mut info, k, v);
+                }
+                if is_start && ns_is_gpano {
+                    capture_local = Some(local);
+                    current_text.clear();
+                }
+            }
+            Ev::Text(s) => {
+                if capture_local.is_some() {
+                    current_text.push_str(&s);
+                }
+            }
+            Ev::Close => {
+                if let Some(local) = capture_local.take() {
+                    apply_gpano_field(&mut info, &local, current_text.trim());
+                    current_text.clear();
+                }
+            }
+            Ev::Eof => break,
+            Ev::Other => {}
+        }
+        buf.clear();
+    }
+
+    Some(info)
+}
+
+fn apply_gpano_field(info: &mut XmpPanoramaInfo, local: &[u8], value: &str) {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    match local {
+        b"ProjectionType" => {
+            info.projection_type
+                .get_or_insert_with(|| trimmed.to_string());
+        }
+        b"UsePanoramaViewer" => {
+            if let Some(b) = parse_xmp_bool(trimmed) {
+                info.use_panorama_viewer.get_or_insert(b);
+            }
+        }
+        b"PosePitchDegrees" => {
+            if let Ok(v) = trimmed.parse::<f32>() {
+                info.pose_pitch_degrees.get_or_insert(v);
+            }
+        }
+        b"PoseHeadingDegrees" => {
+            if let Ok(v) = trimmed.parse::<f32>() {
+                info.pose_heading_degrees.get_or_insert(v);
+            }
+        }
+        b"PoseRollDegrees" => {
+            if let Ok(v) = trimmed.parse::<f32>() {
+                info.pose_roll_degrees.get_or_insert(v);
+            }
+        }
+        b"FullPanoWidthPixels" => {
+            if let Ok(v) = trimmed.parse::<u32>() {
+                info.full_pano_width_pixels.get_or_insert(v);
+            }
+        }
+        b"FullPanoHeightPixels" => {
+            if let Ok(v) = trimmed.parse::<u32>() {
+                info.full_pano_height_pixels.get_or_insert(v);
+            }
+        }
+        b"CroppedAreaImageWidthPixels" => {
+            if let Ok(v) = trimmed.parse::<u32>() {
+                info.cropped_area_image_width_pixels.get_or_insert(v);
+            }
+        }
+        b"CroppedAreaImageHeightPixels" => {
+            if let Ok(v) = trimmed.parse::<u32>() {
+                info.cropped_area_image_height_pixels.get_or_insert(v);
+            }
+        }
+        b"CroppedAreaLeftPixels" => {
+            if let Ok(v) = trimmed.parse::<u32>() {
+                info.cropped_area_left_pixels.get_or_insert(v);
+            }
+        }
+        b"CroppedAreaTopPixels" => {
+            if let Ok(v) = trimmed.parse::<u32>() {
+                info.cropped_area_top_pixels.get_or_insert(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// XMP の Boolean 表現 ("True"/"False" 大文字小文字無視) を bool に。
+/// "1"/"0" もよく見るので保険で受ける。
+fn parse_xmp_bool(s: &str) -> Option<bool> {
+    if s.eq_ignore_ascii_case("true") || s == "1" {
+        Some(true)
+    } else if s.eq_ignore_ascii_case("false") || s == "0" {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // URL 検証 (未信頼メタデータなので必ずチェック)
 // ---------------------------------------------------------------------------
 
@@ -1088,5 +1445,225 @@ mod tests {
           </rdf:RDF>
         </x:xmpmeta>"#;
         assert_eq!(parse_xmp_rating(xml.as_bytes()), Some(0));
+    }
+
+    // ---- GPano (Google Photo Sphere) ----
+
+    #[test]
+    fn parse_gpano_element_form() {
+        let xml = r#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+          <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+            <rdf:Description rdf:about=''
+              xmlns:GPano='http://ns.google.com/photos/1.0/panorama/'>
+              <GPano:ProjectionType>equirectangular</GPano:ProjectionType>
+              <GPano:UsePanoramaViewer>True</GPano:UsePanoramaViewer>
+              <GPano:PosePitchDegrees>0.5</GPano:PosePitchDegrees>
+              <GPano:PoseHeadingDegrees>180.0</GPano:PoseHeadingDegrees>
+              <GPano:FullPanoWidthPixels>11968</GPano:FullPanoWidthPixels>
+              <GPano:FullPanoHeightPixels>5984</GPano:FullPanoHeightPixels>
+            </rdf:Description>
+          </rdf:RDF>
+        </x:xmpmeta>"#;
+        let info = parse_gpano(xml.as_bytes()).expect("should parse");
+        assert!(info.is_populated());
+        assert_eq!(info.projection_type.as_deref(), Some("equirectangular"));
+        assert_eq!(info.use_panorama_viewer, Some(true));
+        assert_eq!(info.pose_pitch_degrees, Some(0.5));
+        assert_eq!(info.pose_heading_degrees, Some(180.0));
+        assert_eq!(info.full_pano_width_pixels, Some(11968));
+        assert_eq!(info.full_pano_height_pixels, Some(5984));
+        assert!(info.is_equirectangular());
+    }
+
+    #[test]
+    fn parse_gpano_attribute_form() {
+        // Adobe / ExifTool は属性形式 (`<rdf:Description GPano:Foo="bar"/>`) で書く
+        let xml = r#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+          <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+            <rdf:Description rdf:about=''
+              xmlns:GPano='http://ns.google.com/photos/1.0/panorama/'
+              GPano:ProjectionType='equirectangular'
+              GPano:UsePanoramaViewer='False'
+              GPano:CroppedAreaImageWidthPixels='8192'
+              GPano:CroppedAreaImageHeightPixels='4096'/>
+          </rdf:RDF>
+        </x:xmpmeta>"#;
+        let info = parse_gpano(xml.as_bytes()).expect("should parse");
+        assert_eq!(info.projection_type.as_deref(), Some("equirectangular"));
+        assert_eq!(info.use_panorama_viewer, Some(false));
+        assert_eq!(info.cropped_area_image_width_pixels, Some(8192));
+        assert_eq!(info.cropped_area_image_height_pixels, Some(4096));
+        assert!(info.is_equirectangular());
+    }
+
+    #[test]
+    fn parse_gpano_absent_returns_empty() {
+        // SAMPLE_XMP_STR は xtw:* / dc:* のみで GPano プロパティを持たない
+        let info = parse_gpano(SAMPLE_XMP_STR.as_bytes());
+        // パース自体は通るが、is_populated は false
+        assert!(info.map(|i| !i.is_populated()).unwrap_or(false));
+    }
+
+    #[test]
+    fn parse_gpano_case_insensitive_bool_and_projection() {
+        let xml = r#"<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+          <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+            <rdf:Description rdf:about=''
+              xmlns:GPano='http://ns.google.com/photos/1.0/panorama/'
+              GPano:ProjectionType='Equirectangular'
+              GPano:UsePanoramaViewer='true'/>
+          </rdf:RDF>
+        </x:xmpmeta>"#;
+        let info = parse_gpano(xml.as_bytes()).expect("should parse");
+        assert_eq!(info.use_panorama_viewer, Some(true));
+        // ProjectionType の大文字 e でも is_equirectangular() は true
+        assert!(info.is_equirectangular());
+    }
+
+    #[test]
+    fn read_panorama_info_from_jpeg_app1() {
+        // GPano プロパティ入り XMP を JPEG APP1 に詰めて、bytes 経路でパース
+        let xml = r#"<?xml version='1.0'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+  <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+    <rdf:Description rdf:about=''
+      xmlns:GPano='http://ns.google.com/photos/1.0/panorama/'>
+      <GPano:ProjectionType>equirectangular</GPano:ProjectionType>
+      <GPano:UsePanoramaViewer>True</GPano:UsePanoramaViewer>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#;
+        let xmp_id = b"http://ns.adobe.com/xap/1.0/\0";
+        let payload: Vec<u8> = xmp_id.iter().chain(xml.as_bytes()).copied().collect();
+        let mut jpeg: Vec<u8> = Vec::new();
+        jpeg.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        jpeg.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        let seg_len = (payload.len() + 2) as u16;
+        jpeg.extend_from_slice(&seg_len.to_be_bytes());
+        jpeg.extend_from_slice(&payload);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9]); // SOS+EOI
+
+        let info = read_panorama_info_from_bytes(&jpeg).expect("should parse");
+        assert!(info.is_equirectangular());
+        assert_eq!(info.use_panorama_viewer, Some(true));
+    }
+
+    #[test]
+    fn parse_xmp_bool_recognizes_numeric_aliases() {
+        assert_eq!(parse_xmp_bool("True"), Some(true));
+        assert_eq!(parse_xmp_bool("true"), Some(true));
+        assert_eq!(parse_xmp_bool("TRUE"), Some(true));
+        assert_eq!(parse_xmp_bool("1"), Some(true));
+        assert_eq!(parse_xmp_bool("False"), Some(false));
+        assert_eq!(parse_xmp_bool("false"), Some(false));
+        assert_eq!(parse_xmp_bool("0"), Some(false));
+        assert_eq!(parse_xmp_bool("maybe"), None);
+        assert_eq!(parse_xmp_bool(""), None);
+    }
+
+    // ---- read_xmp_bundle: 統合経路の同居テスト (Codex P3 第 20 ラウンド) ----
+
+    #[test]
+    fn xmp_bundle_extracts_both_xtw_and_gpano() {
+        // mXD で X/Twitter から保存した 360 写真 (xtw + GPano 同居) を想定
+        let xml = br#"<?xml version='1.0'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+  <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+    <rdf:Description rdf:about=''
+      xmlns:xtw='https://mXDownloader.app/ns/x-twitter/1.0/'
+      xmlns:GPano='http://ns.google.com/photos/1.0/panorama/'>
+      <xtw:TweetId>1234567890</xtw:TweetId>
+      <xtw:TweetUrl>https://x.com/foo/status/1234567890</xtw:TweetUrl>
+      <xtw:AuthorScreenName>foo</xtw:AuthorScreenName>
+      <GPano:ProjectionType>equirectangular</GPano:ProjectionType>
+      <GPano:UsePanoramaViewer>True</GPano:UsePanoramaViewer>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#;
+        // JPEG APP1 にラップ
+        let xmp_id = b"http://ns.adobe.com/xap/1.0/\0";
+        let payload: Vec<u8> = xmp_id.iter().chain(xml.iter()).copied().collect();
+        let mut jpeg: Vec<u8> = Vec::new();
+        jpeg.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        jpeg.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        let seg_len = (payload.len() + 2) as u16;
+        jpeg.extend_from_slice(&seg_len.to_be_bytes());
+        jpeg.extend_from_slice(&payload);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9]); // SOS+EOI
+
+        // 1 回読み込み (= extract_xmp_packet 1 回) で両方拾えることを検証
+        let bundle = read_xmp_bundle_from_bytes(&jpeg);
+        let tweet = bundle.tweet.expect("xtw should be parsed");
+        let panorama = bundle.panorama.expect("GPano should be parsed");
+        assert_eq!(tweet.tweet_id.as_deref(), Some("1234567890"));
+        assert_eq!(tweet.author_screen_name.as_deref(), Some("foo"));
+        assert!(panorama.is_equirectangular());
+        assert_eq!(panorama.use_panorama_viewer, Some(true));
+    }
+
+    #[test]
+    fn xmp_bundle_returns_default_for_unrelated_bytes() {
+        // XMP 無しのバイト列は両方 None
+        let bundle = read_xmp_bundle_from_bytes(b"not an image");
+        assert!(bundle.tweet.is_none());
+        assert!(bundle.panorama.is_none());
+
+        let bundle = read_xmp_bundle_from_bytes(&[]);
+        assert!(bundle.tweet.is_none());
+        assert!(bundle.panorama.is_none());
+    }
+
+    #[test]
+    fn xmp_bundle_xtw_only_no_gpano() {
+        // mXD 保存の通常画像 (パノラマでない、xtw のみ) は tweet のみ返す。
+        // SAMPLE_XMP_STR は raw XML なので、JPEG APP1 にラップして magic を満たしてから検証。
+        let xmp_id = b"http://ns.adobe.com/xap/1.0/\0";
+        let payload: Vec<u8> = xmp_id
+            .iter()
+            .chain(SAMPLE_XMP_STR.as_bytes())
+            .copied()
+            .collect();
+        let mut jpeg: Vec<u8> = Vec::new();
+        jpeg.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        jpeg.extend_from_slice(&[0xFF, 0xE1]); // APP1
+        let seg_len = (payload.len() + 2) as u16;
+        jpeg.extend_from_slice(&seg_len.to_be_bytes());
+        jpeg.extend_from_slice(&payload);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9]);
+
+        let bundle = read_xmp_bundle_from_bytes(&jpeg);
+        assert!(bundle.tweet.is_some(), "xtw should be parsed");
+        assert!(
+            bundle.panorama.is_none(),
+            "non-panorama image should not populate panorama"
+        );
+    }
+
+    #[test]
+    fn xmp_bundle_gpano_only_no_xtw() {
+        // 通常の GPano 画像 (mXD 経由でない、xtw なし)
+        let xml = br#"<?xml version='1.0'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+  <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+    <rdf:Description rdf:about=''
+      xmlns:GPano='http://ns.google.com/photos/1.0/panorama/'>
+      <GPano:ProjectionType>equirectangular</GPano:ProjectionType>
+      <GPano:UsePanoramaViewer>True</GPano:UsePanoramaViewer>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>"#;
+        let xmp_id = b"http://ns.adobe.com/xap/1.0/\0";
+        let payload: Vec<u8> = xmp_id.iter().chain(xml.iter()).copied().collect();
+        let mut jpeg: Vec<u8> = Vec::new();
+        jpeg.extend_from_slice(&[0xFF, 0xD8]);
+        jpeg.extend_from_slice(&[0xFF, 0xE1]);
+        let seg_len = (payload.len() + 2) as u16;
+        jpeg.extend_from_slice(&seg_len.to_be_bytes());
+        jpeg.extend_from_slice(&payload);
+        jpeg.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0xFF, 0xD9]);
+
+        let bundle = read_xmp_bundle_from_bytes(&jpeg);
+        assert!(bundle.tweet.is_none(), "no xtw → tweet should be None");
+        assert!(bundle.panorama.is_some(), "GPano should be parsed");
     }
 }

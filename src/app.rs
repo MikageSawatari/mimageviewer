@@ -431,12 +431,16 @@ impl MetadataLoadPending {
 }
 
 /// メタデータ読み込みワーカーの結果。キー (metadata_cache_key の形式) と
-/// 3 つのパース結果をまとめて返す。UI 側はそれぞれのキャッシュに投入する。
+/// 4 つのパース結果 (AI metadata / EXIF / XMP xtw / XMP GPano) をまとめて返す。
+/// UI 側はそれぞれのキャッシュに投入する。
 pub(crate) struct MetadataLoadResult {
     key: String,
     metadata: Option<crate::png_metadata::AiMetadata>,
     exif: Option<crate::exif_reader::ExifInfo>,
     xmp: Option<crate::xmp_reader::XmpTweetInfo>,
+    /// XMP GPano パノラマメタデータ。`Some(_)` でも `is_populated()` で空かどうかを判定。
+    /// 360 度パノラマビュー機能 (docs/panorama-360-view-plan.md) のシグナル。
+    panorama: Option<crate::xmp_reader::XmpPanoramaInfo>,
 }
 
 /// 非同期お気に入り検索 (Ctrl+S) の状態。
@@ -782,7 +786,7 @@ fn run_metadata_load(
         return None;
     }
 
-    let (metadata, exif, xmp) = match &item {
+    let (metadata, exif, xmp, panorama) = match &item {
         GridItem::Image(p) => {
             let metadata = crate::png_metadata::extract_metadata(p);
             if cancel.load(Ordering::Relaxed) {
@@ -792,19 +796,23 @@ fn run_metadata_load(
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
-            let xmp = crate::xmp_reader::read_tweet_info(p);
-            (metadata, exif, xmp)
+            // xtw (X/Twitter) と GPano は同じ XMP packet を参照するので 1 回読み +
+            // 1 回 extract_xmp_packet にまとめる (Codex P2 第 19 ラウンド: 旧コードは
+            // 2 回 fs::read + 2 回 extract を実行していた)。
+            let bundle = crate::xmp_reader::read_xmp_bundle(p);
+            (metadata, exif, bundle.tweet, bundle.panorama)
         }
         GridItem::Video(p) => {
-            // 動画は AI/EXIF なし、XMP のみ (mXD が MP4/MOV に X/Twitter 情報を埋める)
+            // 動画は AI/EXIF/GPano なし、XMP xtw のみ (mXD が MP4/MOV に X/Twitter 情報を埋める)
             let xmp = crate::xmp_reader::read_tweet_info(p);
-            (None, None, xmp)
+            (None, None, xmp, None)
         }
         GridItem::ZipImage {
             zip_path,
             entry_name,
         } => {
-            // ZIP エントリは 1 回展開して bytes を 3 パーサーで共有する
+            // ZIP エントリは 1 回展開して bytes を 3 パーサーで共有する。
+            // XMP 系 (xtw + GPano) も bundle で 1 回 extract に統合 (Codex P2 第 19)。
             let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok();
             if cancel.load(Ordering::Relaxed) {
                 return None;
@@ -821,12 +829,13 @@ fn run_metadata_load(
             if cancel.load(Ordering::Relaxed) {
                 return None;
             }
-            let xmp = bytes
+            let bundle = bytes
                 .as_ref()
-                .and_then(|b| crate::xmp_reader::read_tweet_info_from_bytes(b));
-            (metadata, exif, xmp)
+                .map(|b| crate::xmp_reader::read_xmp_bundle_from_bytes(b))
+                .unwrap_or_default();
+            (metadata, exif, bundle.tweet, bundle.panorama)
         }
-        _ => (None, None, None),
+        _ => (None, None, None, None),
     };
 
     Some(MetadataLoadResult {
@@ -834,6 +843,7 @@ fn run_metadata_load(
         metadata,
         exif,
         xmp,
+        panorama,
     })
 }
 
@@ -2108,6 +2118,25 @@ pub struct App {
     /// mXD 以外のファイルには値が入らない前提なので None は「xtw:* なし」。
     pub(crate) xmp_cache:
         std::collections::HashMap<String, Option<crate::xmp_reader::XmpTweetInfo>>,
+    /// XMP GPano パノラマメタデータキャッシュ: 正規化キー → パース結果。
+    /// `None` は「GPano プロパティ無し」を表す。360 度パノラマビュー機能
+    /// (docs/panorama-360-view-plan.md) のシグナル源。
+    /// キーは [`App::metadata_cache_key`] で生成。
+    pub(crate) xmp_panorama_info:
+        std::collections::HashMap<String, Option<crate::xmp_reader::XmpPanoramaInfo>>,
+    /// 360 度パノラマビュー: インタラクティブステート (フルスクリーン内のみ Some)。
+    /// 360 モード ON → Some、OFF → None。equirect でない画像へナビした場合は
+    /// **保持しつつ非アクティブ化** する設計 (`is_panorama_mode_active(fs_idx)` で判定)。
+    pub(crate) panorama_state: Option<crate::panorama::PanoramaState>,
+    /// 360 度パノラマビュー: アップロード済み wgpu テクスチャ (LRU 1、active のみ)。
+    /// 別画像へナビ / 360 OFF で `None` にする。VRAM 解放のため Arc 共有。
+    pub(crate) pano_uploaded: Option<std::sync::Arc<crate::panorama_wgpu::UploadedPanoTexture>>,
+    /// 360 度パノラマビュー: 「V キーで 360°ビューワー」案内トーストを現フルスクリーン
+    /// セッションで既に出したか (Codex P2 第 18 ラウンド)。XMP の async ロード後に
+    /// 補完表示する経路があるので、二重表示を避けるためフラグで管理。
+    /// `open_fullscreen` で false にリセット、トースト発火で true、
+    /// `close_fullscreen` で false に戻る。
+    pub(crate) pano_toast_shown_for_current_fs: bool,
     /// タグキャッシュ (docs/tag-feature.md): 正規化キー → XMP dc:subject の要素列。
     /// メタデータパネルのタグボタン状態表示 + グリッドのタグバッジで使用。
     /// 充填経路は 3 つ:
@@ -2661,6 +2690,17 @@ pub struct App {
     pub(crate) mask_pages: std::collections::HashSet<usize>,
     /// 補正済み画像キャッシュ: item_idx → テクスチャ + ピクセルデータ
     pub(crate) adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    /// 補正キャッシュ世代カウンタ (360 度パノラマビュー用、docs/panorama-360-view-plan.md §4.1.2)。
+    /// キーは `metadata_cache_key`、値は補正適用 / clear ごとに +1 する u32。
+    /// 360 view が `cache_key` (u64 packed) に下位 16 bit として畳み込み、補正切替時に
+    /// `pano_uploaded` の stale 判定をする。`clear_caches_and_bump_generation` ヘルパで
+    /// cache clear と同時に bump し、両者の粒度を一致させる (§3.6.2.2)。
+    pub(crate) adjustment_generation: std::collections::HashMap<String, u32>,
+    /// AI アップスケール / デノイズキャッシュ世代カウンタ (360 度パノラマビュー用)。
+    /// adjustment_cache と違い ai_upscale_cache は **全体 clear** が基本粒度なので、
+    /// bump も `bump_all_ai_generations()` で全 entry を +1 する (`.clear()` は使わない、
+    /// リセット後の値が過去 cache_key と衝突する可能性があるため、§3.6.2.2)。
+    pub(crate) ai_upscale_generation: std::collections::HashMap<String, u32>,
     /// サムネイル補正用ソースピクセル: idx → Arc<ColorImage>。
     /// keep_range 内の Loaded サムネに対して保持し、補正パラメータ変更で
     /// 同期的に `apply_adjustments_fast` を掛け直すための元ソース。
@@ -3502,6 +3542,10 @@ impl App {
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
             xmp_cache: std::collections::HashMap::new(),
+            xmp_panorama_info: std::collections::HashMap::new(),
+            panorama_state: None,
+            pano_uploaded: None,
+            pano_toast_shown_for_current_fs: false,
             tags_cache: std::collections::HashMap::new(),
             tag_toast_label: None,
             metadata_show_raw_prompt: false,
@@ -3672,6 +3716,8 @@ impl App {
             adjustment_favorite_params: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
             adjustment_cache: std::collections::HashMap::new(),
+            adjustment_generation: std::collections::HashMap::new(),
+            ai_upscale_generation: std::collections::HashMap::new(),
             thumb_pixels: std::collections::HashMap::new(),
             thumb_adjust_tex: std::collections::HashMap::new(),
             thumb_adjust_was_dragging: false,
@@ -7473,6 +7519,7 @@ impl App {
         self.metadata_cache.clear();
         self.exif_cache.clear();
         self.xmp_cache.clear();
+        self.xmp_panorama_info.clear();
         self.tags_cache.clear();
         self.checked.clear();
         self.rotation_cache.clear();
@@ -7547,6 +7594,12 @@ impl App {
         self.adjustment_dragging = false;
         self.adjustment_mode = false;
         self.mask_pages.clear();
+        // 360 度パノラマビュー: フォルダ変更で cache 全体が変わったので世代を一斉 bump
+        // (§3.6.2.2)。adjustment_generation / ai_upscale_generation の HashMap
+        // 自体はクリアしない (キーが残っていても次フォルダで同 source_key が
+        // 出てくることは稀だし、値だけ +1 する分には害もない)。
+        self.bump_all_adjustment_generations();
+        self.bump_all_ai_generations();
 
         // ── サイドカー → 中央 DB のインポート ──
         // フォルダ丸ごと移動された場合など、中央 DB に無いエントリがサイドカーにあれば
@@ -8507,6 +8560,9 @@ impl App {
         self.ai_upscale_cache.clear();
         self.ai_upscale_failed.clear();
         self.ai_classify_cache.clear();
+        // 360 度パノラマビュー: cache 全体が変わったので世代を一斉 bump (§3.6.2.2)。
+        self.bump_all_adjustment_generations();
+        self.bump_all_ai_generations();
         self.erase_base_cache.clear();
         self.original_preview_tex_cache.clear();
         self.fs_early_dims.clear();
@@ -12457,14 +12513,30 @@ impl App {
         self.fs_suppress_primary_until_release = false;
         self.reset_erase_mode();
 
-        // ページに個別補正があればトースト表示
-        if self.adjustment_page_params.contains_key(&idx) {
+        // 360 度パノラマビュー: 別画像へナビ時は GPU リソースを解放する
+        // (Arc + LRU 1 設計、§4.1)。state は保持して同セッションで equirect に
+        // 戻ったときに yaw/pitch を引き継げるようにする (§6.3)。
+        // CallbackResources からも UploadedPanoTextureRef を除去 (Codex P2 第 18 ラウンド)。
+        self.clear_pano_upload();
+        // 案内トースト用フラグをリセット (Codex P2 第 18 ラウンド)。実発火は
+        // ページ補正トーストとの競合回避のため後段でまとめる (Codex P3 第 20 ラウンド)。
+        self.pano_toast_shown_for_current_fs = false;
+
+        // トースト発火 (Codex P3 第 20 ラウンド: 競合回避):
+        // 360 候補画像 + ページ個別補正の両方が当てはまる場合、後の `show_feedback_toast`
+        // が前の表示を即上書きしてしまう。**ユーザー体験上 360 案内のほうが希少 + 重要**
+        // (補正適用は静かに動いてもバナーで気づける、360 案内は逃すと存在に気づかない)
+        // なので、360 トーストが立った場合は補正トーストを抑止する優先順位ポリシー。
+        let pano_toast_fired = self.try_show_pano_hint_toast_returning_fired(idx);
+        if !pano_toast_fired && self.adjustment_page_params.contains_key(&idx) {
             self.show_feedback_toast("ページ補正適用".to_string());
         }
         // ページ切替時に補正キャッシュをクリア（前ページの補正結果を残さない）
         // ただし ai_upscale_cache は消さない（再処理が重いため）
         self.adjustment_cache.remove(&idx);
         self.invalidate_compare_prepared_for_idx(idx);
+        // 360 度パノラマビュー: cache 内容変化 → 世代 bump (§3.6.2.2)。
+        self.bump_adjustment_generation(idx);
         let grid_open_intent = std::mem::take(&mut self.fs_open_intent_from_grid);
         let video_autoplay_override = self.fs_video_open_autoplay_override;
         let video_ignore_resume_once = self.fs_video_open_ignore_resume_once;
@@ -12619,7 +12691,8 @@ impl App {
         let ai_hit = self.metadata_cache.contains_key(&key);
         let exif_hit = self.exif_cache.contains_key(&key);
         let xmp_hit = self.xmp_cache.contains_key(&key);
-        if ai_hit && exif_hit && xmp_hit {
+        let panorama_hit = self.xmp_panorama_info.contains_key(&key);
+        if ai_hit && exif_hit && xmp_hit && panorama_hit {
             return;
         }
 
@@ -12665,8 +12738,21 @@ impl App {
             Ok(r) => {
                 self.metadata_cache.insert(r.key.clone(), r.metadata);
                 self.exif_cache.insert(r.key.clone(), r.exif);
-                self.xmp_cache.insert(r.key, r.xmp);
+                self.xmp_cache.insert(r.key.clone(), r.xmp);
+                // GPano は実画像でのみ非 None。動画 / 構造アイテムは worker 側で
+                // None を返すが、cache hit 判定のため key を挿入する (再 spawn 抑止)。
+                let arrived_key = r.key.clone();
+                self.xmp_panorama_info.insert(r.key, r.panorama);
                 self.metadata_pending = None;
+                // 360 案内トースト補完: 到着 key が現フルスクリーン idx の source_key
+                // と一致するなら、初回 toast を試行 (Codex P2 第 18 ラウンド)。
+                // open_fullscreen で発火失敗 (= XMP 未到着) だったケースをここで救う。
+                if let Some(fs_idx) = self.fullscreen_idx
+                    && let Some(current_key) = self.metadata_cache_key(fs_idx)
+                    && current_key == arrived_key
+                {
+                    self.maybe_show_panorama_hint_toast(fs_idx);
+                }
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -15033,6 +15119,12 @@ impl App {
         self.fullscreen_idx = None;
         self.fullscreen_video_marker_cache = None;
         self.cancel_fullscreen_video_marker_thumb_decode();
+        // 360 度パノラマビュー: フルスクリーン退出で state と GPU リソースを drop。
+        // docs/panorama-360-view-plan.md §5.1 / §6.3。CallbackResources からも
+        // UploadedPanoTextureRef を除去 (Codex P2 第 18 ラウンド)。
+        self.panorama_state = None;
+        self.clear_pano_upload();
+        self.pano_toast_shown_for_current_fs = false;
         #[cfg(windows)]
         {
             self.pending_pin_thumb_refresh = None;
@@ -15457,6 +15549,11 @@ impl App {
             // 表示中かつ現在の bg と一致するもののみ、AI 結果に対して色調補正を即座に適用（チラつき防止）
             self.adjustment_cache.remove(&idx);
             self.invalidate_compare_prepared_for_idx(idx);
+            // 360 度パノラマビュー: adjustment_cache が消えた段階で bump (§3.6.2.2)。
+            // 直後の apply_sync_adjustment が走るときはそこでも bump されるが、
+            // 走らないルート (fullscreen_idx 不一致 / bg 不一致) でも cache 状態が
+            // 変わるので必ず先に bump しておく。
+            self.bump_adjustment_generation(idx);
             if self.fullscreen_idx == Some(idx) && self.effective_upscale_bg_mode() == bg {
                 self.apply_sync_adjustment(ctx, idx, &pixels);
             }
@@ -15472,6 +15569,8 @@ impl App {
                     load_seq: 0,
                 },
             );
+            // 360 度パノラマビュー: AI 完了で cache 内容が変わったので世代 bump (§3.6.2.2)。
+            self.bump_ai_generation(idx);
             crate::logger::log(format!("[AI] Upscale complete for idx={idx} bg={bg}"));
         }
 
@@ -16341,6 +16440,8 @@ impl App {
         self.adjustment_cache.remove(&idx);
         self.invalidate_compare_prepared_for_idx(idx);
         self.thumb_adjust_tex.remove(&idx);
+        // 360 度パノラマビュー: 補正パラメータが変わったので世代 bump (§3.6.2.2)。
+        self.bump_adjustment_generation(idx);
     }
 
     /// 指定ページの個別設定を解除する (DB からも削除)。
@@ -16361,6 +16462,8 @@ impl App {
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_adjust(rel));
         self.adjustment_cache.remove(&idx);
         self.invalidate_compare_prepared_for_idx(idx);
+        // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
+        self.bump_adjustment_generation(idx);
         self.thumb_adjust_tex.remove(&idx);
         if !old_params.ai_settings_eq(&new_params) {
             self.purge_upscale_for_idx(idx);
@@ -16780,6 +16883,9 @@ impl App {
                 load_seq: 0,
             },
         );
+        // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
+        // ここで bump し忘れると 360 view が古いテクスチャを描画する。
+        self.bump_adjustment_generation(idx);
     }
 
     /// 表示中画像の adjustment_cache がない場合、補正を同期適用する。
@@ -16876,6 +16982,8 @@ impl App {
         // サムネ側の補正済みテクスチャも同時に落とす (ピクセルは保持)。
         // 次フレーム以降 maybe_apply_thumb_adjustment で再生成される。
         self.thumb_adjust_tex.remove(&idx);
+        // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
+        self.bump_adjustment_generation(idx);
     }
 
     /// フルスクリーン補正キャッシュとサムネ補正テクスチャを同時に全クリアする。
@@ -16888,6 +16996,8 @@ impl App {
         self.compare_prepare_pending = None;
         self.compare_prepared_pair = None;
         self.compare_wipe_dragging = false;
+        // 360 度パノラマビュー: バルク clear に追随して全 entry を bump (§3.6.2.2)。
+        self.bump_all_adjustment_generations();
     }
 
     /// サムネイル補正を同期適用する (色調のみ、post_filter は対象外)。
@@ -16973,6 +17083,8 @@ impl App {
     }
 
     /// AI モデル設定が変わった場合に AI キャッシュを含めてクリアする。
+    /// 360 度パノラマビュー (docs/panorama-360-view-plan.md §3.6.2.2) の不変条件:
+    /// cache 内容が変わるので generation を bump する。
     pub(crate) fn clear_all_adjustment_and_ai_caches(&mut self, idx: usize) {
         self.adjustment_cache.remove(&idx);
         self.invalidate_compare_prepared_for_idx(idx);
@@ -16982,6 +17094,483 @@ impl App {
         self.ai_upscale_failed.clear();
         for (_, (cancel, _)) in self.ai_upscale_pending.drain() {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        // adjustment は idx 単位、AI は全体 — clear 粒度と整合させる。
+        self.bump_adjustment_generation(idx);
+        self.bump_all_ai_generations();
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // 360 度パノラマビュー: 補正 / AI 世代カウンタ (docs/panorama-360-view-plan.md)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// 指定 idx の `adjustment_generation` を +1 する (saturating)。
+    /// 補正 cache を idx 単位で書き換えるたびに呼ぶ。adjustment_cache の idx 単位
+    /// clear 粒度と整合させる (§3.6.2.2)。idx → source_key の解決に失敗するときは
+    /// (= 構造アイテム等で対象外) 何もしない。
+    pub(crate) fn bump_adjustment_generation(&mut self, idx: usize) {
+        let Some(key) = self.metadata_cache_key(idx) else {
+            return;
+        };
+        let slot = self.adjustment_generation.entry(key).or_insert(0);
+        *slot = slot.saturating_add(1);
+    }
+
+    /// `ai_upscale_generation` の全 entry を +1 する (saturating)。
+    /// **`.clear()` ではなく `+= 1`** にすることで、リセット後の値 0 が過去の
+    /// `ai_gen=0` cache_key と衝突するリスクを避ける (§3.6.2.2)。
+    /// AI モデル / `bg_mode` 切替 / AI ON/OFF / cache 全体 clear の各経路で呼ぶ。
+    pub(crate) fn bump_all_ai_generations(&mut self) {
+        for v in self.ai_upscale_generation.values_mut() {
+            *v = v.saturating_add(1);
+        }
+    }
+
+    /// `adjustment_generation` の全 entry を +1 する (saturating)。
+    /// バルク補正 clear (`adjustment_cache.clear()` 経路) で `ai_upscale_generation`
+    /// と同じく全体 bump する。`.clear()` ではない理由は同節 §3.6.2.2。
+    pub(crate) fn bump_all_adjustment_generations(&mut self) {
+        for v in self.adjustment_generation.values_mut() {
+            *v = v.saturating_add(1);
+        }
+    }
+
+    /// 指定 source_key の `ai_upscale_generation` を +1 する (saturating)。
+    /// AI 完了時 (`ai_upscale_cache.insert` 直後) に呼ぶ。bg_mode は cache_key の
+    /// `source_kind` 部 (2=AI のみ / 3=AI+補正) で区別されるため、source_key 単位の
+    /// generation で十分。
+    pub(crate) fn bump_ai_generation(&mut self, idx: usize) {
+        let Some(key) = self.metadata_cache_key(idx) else {
+            return;
+        };
+        let slot = self.ai_upscale_generation.entry(key).or_insert(0);
+        *slot = slot.saturating_add(1);
+    }
+
+    /// `clear_all_adjustment_and_ai_caches(idx)` の別名 (§3.6.2.2 で参照される
+    /// 統一エントリポイント名)。bump は親メソッドが既に行うので二重 bump はしない。
+    /// 新規 cache clear 経路を追加するときは **このヘルパ** を呼び出すと clear + bump
+    /// の整合が自然に守られる。
+    ///
+    /// 現状は呼び出し元が無いが (Phase 1 は既存の clear 経路に bump 呼び出しを
+    /// 散在させて対応)、Phase 2a 以降で settle policy が増えると統一エントリ
+    /// ポイントが必要になるため残しておく。
+    #[inline]
+    #[allow(dead_code)]
+    pub(crate) fn clear_caches_and_bump_generation(&mut self, idx: usize) {
+        self.clear_all_adjustment_and_ai_caches(idx);
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // 360 度パノラマビュー: 検出 / ソース解決 / モード判定
+    // (docs/panorama-360-view-plan.md)
+    // ──────────────────────────────────────────────────────────────────
+
+    /// 指定 fs_idx の画像が 360 度パノラマ候補かを判定する (§2.3)。
+    ///
+    /// - GPano XMP `UsePanoramaViewer=True` + `ProjectionType=equirectangular` →
+    ///   [`PanoramaTrigger::Auto`] (フルスクリーン入場時に自動 ON)
+    /// - GPano XMP `ProjectionType=equirectangular` のみ → [`PanoramaTrigger::Hint`]
+    /// - GPano なし + アスペクト 2:1 (1.95 〜 2.05) → [`PanoramaTrigger::Hint`]
+    /// - それ以外 → `None`
+    ///
+    /// アスペクト判定は `FsCacheEntry::Static.source_dims` の生値で行う
+    /// (rotation_db や clamp 後の値ではない、§2.1)。`source_dims` が無いとき
+    /// (= まだロード中、Animated、Failed) はアスペクト判定をスキップ。
+    pub(crate) fn detect_panorama(
+        &self,
+        fs_idx: usize,
+    ) -> Option<crate::panorama::PanoramaTrigger> {
+        let source_key = self.metadata_cache_key(fs_idx)?;
+        let pano_info = self
+            .xmp_panorama_info
+            .get(&source_key)
+            .and_then(|o| o.as_ref());
+        // 強シグナル: GPano が両方そろっている
+        if let Some(info) = pano_info {
+            if info.is_equirectangular() && info.use_panorama_viewer == Some(true) {
+                return Some(crate::panorama::PanoramaTrigger::Auto);
+            }
+            if info.is_equirectangular() {
+                return Some(crate::panorama::PanoramaTrigger::Hint);
+            }
+        }
+        // 弱シグナル: アスペクト 2:1 (源寸での比率)
+        let Some(FsCacheEntry::Static {
+            source_dims: Some([w, h]),
+            ..
+        }) = self.fs_cache.get(&fs_idx)
+        else {
+            return None;
+        };
+        if *h == 0 {
+            return None;
+        }
+        let aspect = *w as f32 / *h as f32;
+        if (crate::panorama::ASPECT_LOW..=crate::panorama::ASPECT_HIGH).contains(&aspect) {
+            Some(crate::panorama::PanoramaTrigger::Hint)
+        } else {
+            None
+        }
+    }
+
+    /// 360 モードが現在 fs_idx に対してアクティブか。`panorama_state` が `Some`
+    /// かつ `detect_panorama` がトリガーを返す場合のみ true。
+    pub(crate) fn is_panorama_mode_active(&self, fs_idx: usize) -> bool {
+        self.panorama_state.is_some() && self.detect_panorama(fs_idx).is_some()
+    }
+
+    /// 「V キーで 360° ビューワー」案内トーストを必要なら出す (Codex P2 第 18 ラウンド)。
+    ///
+    /// 発火条件 (全て true のとき):
+    /// - `panorama_state.is_none()` (= 360 モード OFF、すでに ON なら案内不要)
+    /// - `detect_panorama(fs_idx).is_some()` (= 360 候補と判定済み、
+    ///   = GPano XMP がロード済みで `UsePanoramaViewer=True` または
+    ///   aspect 2:1 で fs_cache.source_dims が確定)
+    /// - `pano_toast_shown_for_current_fs == false` (= 同フルスクリーン
+    ///   セッション中にまだ案内していない)
+    ///
+    /// 呼び出し場所:
+    /// - `open_fullscreen(idx)`: フルスクリーン入場直後 (XMP / fs_cache が cache 済みなら即発火)
+    /// - `poll_metadata_load()`: XMP async ロード完了時 (open_fullscreen 時点で
+    ///   未到着だった GPano XMP に追従)
+    /// - `poll_prefetch()`: fs_cache 完了時にも呼ぶ (ChatGPT 生成画像など XMP なし
+    ///   aspect 2:1 のケースの補完、Codex P3 第 19 ラウンド)
+    pub(crate) fn maybe_show_panorama_hint_toast(&mut self, fs_idx: usize) {
+        let _ = self.try_show_pano_hint_toast_returning_fired(fs_idx);
+    }
+
+    /// `maybe_show_panorama_hint_toast` の戻り値付き版。`true` = トーストを今回発火した、
+    /// `false` = 条件未満 or 既に発火済みでスキップ。
+    /// `open_fullscreen` でページ補正トーストとの競合回避に使う (Codex P3 第 20 ラウンド)。
+    pub(crate) fn try_show_pano_hint_toast_returning_fired(&mut self, fs_idx: usize) -> bool {
+        if self.pano_toast_shown_for_current_fs {
+            return false;
+        }
+        if self.panorama_state.is_some() {
+            return false;
+        }
+        let Some(trigger) = self.detect_panorama(fs_idx) else {
+            return false;
+        };
+        // Auto (XMP 検出済み) と Hint (aspect のみ) で文言を分けると、ユーザーに
+        // 「強いシグナル / 弱いシグナル」が伝わる。Phase 1 では同じ文言で運用し、
+        // 後で必要なら強調差を出す。
+        let msg = match trigger {
+            crate::panorama::PanoramaTrigger::Auto => {
+                "V キーで 360° ビューワー (XMP 検出)".to_string()
+            }
+            crate::panorama::PanoramaTrigger::Hint => "V キーで 360° ビューワー".to_string(),
+        };
+        self.show_feedback_toast(msg);
+        self.pano_toast_shown_for_current_fs = true;
+        true
+    }
+
+    /// 現在のフルスクリーン idx で 360 モードがアクティブか。
+    /// フルスクリーンを開いていなければ false。フルスクリーン内の各パネル / 機能
+    /// (メタデータ / 補正 / 分析 / 比較 / 見開き / VST3 GUI) を抑止するかの判定に使う。
+    ///
+    /// 現状は ui_fullscreen 側が `is_panorama_mode_active(fs_idx)` を直接使うので
+    /// 未使用だが、App 外 (e.g. メイン update の panel 抑止) で参照する余地のため
+    /// 残しておく。
+    #[allow(dead_code)]
+    pub(crate) fn panorama_mode_active_for_current_fs(&self) -> bool {
+        self.fullscreen_idx
+            .map(|i| self.is_panorama_mode_active(i))
+            .unwrap_or(false)
+    }
+
+    /// 360 ベーステクスチャのソース選択 + cache_key 計算を 1 関数に集約する (§4.3)。
+    ///
+    /// 優先順位は `adjustment_cache → ai_upscale_cache → fs_cache`
+    /// (display-pipeline.md §2.3)。AI 由来判定は `ai_feature_active` flag を優先
+    /// (Codex P2 第 13: cache 残骸対策)。
+    ///
+    /// Phase 1 ではこの戻り値の `pixels` を `color_image_to_rgba` で RGBA8 化し、
+    /// `cache_key` を `pano_uploaded` の stale 判定 + callback に渡す。
+    /// Phase 2a で `source_kind` を settle policy 判定にも使う。
+    pub(crate) fn resolve_pano_source(
+        &self,
+        fs_idx: usize,
+    ) -> Option<crate::panorama::PanoSourceResolution> {
+        use crate::panorama::*;
+        let source_key = self.metadata_cache_key(fs_idx)?;
+        let bg = self.effective_upscale_bg_mode();
+        let ai_feature_active = self.ai_upscale_enabled || self.ai_denoise_model.is_some();
+
+        // ai_upscale_cache 参照は AI 機能 ON のときだけ (Codex P1 第 14)
+        let ai_cache_entry = if ai_feature_active {
+            self.ai_upscale_cache.get(&(fs_idx, bg))
+        } else {
+            None
+        };
+
+        let (pixels, source_kind) =
+            if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx) {
+                // adjustment_cache は AI 由来 / 通常由来の両方が入る (実コード line 15500)。
+                // ai_feature_active が ON のときは AI 由来扱い (SOURCE_KIND_AI_ADJUST)、
+                // OFF のときは通常由来 (SOURCE_KIND_ADJUST_RAW)。
+                let kind = if ai_feature_active {
+                    SOURCE_KIND_AI_ADJUST
+                } else {
+                    SOURCE_KIND_ADJUST_RAW
+                };
+                (std::sync::Arc::clone(pixels), kind)
+            } else if let Some(FsCacheEntry::Static { pixels, .. }) = ai_cache_entry {
+                (std::sync::Arc::clone(pixels), SOURCE_KIND_AI)
+            } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&fs_idx) {
+                (std::sync::Arc::clone(pixels), SOURCE_KIND_FS)
+            } else {
+                return None; // ColorImage がまだ無い (Animated / Failed / 未ロード)
+            };
+
+        let adjust_gen = self
+            .adjustment_generation
+            .get(&source_key)
+            .copied()
+            .unwrap_or(0) as u16;
+        let ai_gen = self
+            .ai_upscale_generation
+            .get(&source_key)
+            .copied()
+            .unwrap_or(0) as u16;
+        let cache_key =
+            make_pano_cache_key(crc16_of_str(&source_key), source_kind, adjust_gen, ai_gen);
+
+        Some(PanoSourceResolution {
+            source_key,
+            cache_key,
+            pixels,
+            source_kind,
+        })
+    }
+
+    /// 360 モード ON / OFF をトグル。fs_idx は対象画像 (検出 hint の初期視点取得用)。
+    ///
+    /// ON 時の副作用 (360 モードは機能制限モードなので、衝突する状態を抑止する):
+    /// - スライドショー停止 (= 360 を見る間は次画像へ自動遷移しない)
+    /// - adjustment_mode / analysis_mode / erase_mode を OFF
+    /// - compare_view_mode を Off
+    /// - show_metadata_panel は false に
+    pub(crate) fn toggle_panorama_mode(&mut self, fs_idx: usize) {
+        if self.panorama_state.is_some() {
+            // OFF: state と GPU リソースを drop (callback_resources からも除去、
+            // Codex P2 第 18 ラウンド)
+            self.panorama_state = None;
+            self.clear_pano_upload();
+            return;
+        }
+        // ON: GPano hint があれば初期視点に反映
+        let (init_yaw, init_pitch) = self.panorama_initial_pose(fs_idx);
+        self.panorama_state = Some(crate::panorama::PanoramaState::new(init_yaw, init_pitch));
+        // 衝突する機能を停止 (docs/panorama-360-view-plan.md フィードバック対応):
+        // 360 中は上バーのみの機能制限モードになるので、他の panel / mode を OFF
+        // しておく。これらは 360 OFF 後にユーザーが再度有効化できる。
+        self.slideshow_playing = false;
+        self.adjustment_mode = false;
+        self.analysis_mode = false;
+        self.reset_erase_mode();
+        self.compare_view_mode = crate::app::CompareViewMode::Off;
+        self.show_metadata_panel = false;
+    }
+
+    /// GPano `PoseHeadingDegrees` / `PosePitchDegrees` を radians に変換して
+    /// 初期視点として返す。XMP が無いか hint が無い場合は (0, 0)。
+    fn panorama_initial_pose(&self, fs_idx: usize) -> (f32, f32) {
+        let Some(source_key) = self.metadata_cache_key(fs_idx) else {
+            return (0.0, 0.0);
+        };
+        let Some(Some(info)) = self.xmp_panorama_info.get(&source_key) else {
+            return (0.0, 0.0);
+        };
+        let to_rad = std::f32::consts::PI / 180.0;
+        let yaw = info.pose_heading_degrees.unwrap_or(0.0) * to_rad;
+        let pitch = info.pose_pitch_degrees.unwrap_or(0.0) * to_rad;
+        (yaw, pitch)
+    }
+
+    /// Phase 1.5 部分 FOV equirect: フル球面 UV → 画像テクスチャ UV 変換を計算する。
+    /// GPano XMP の `CroppedArea*` + `FullPano*` 宣言から `PanoUvTransform` を導出。
+    /// 宣言が無い or 計算できない場合は `IDENTITY` (= フル equirect 扱い)。
+    ///
+    /// `info.is_equirectangular()` を要求する (Codex P3 第 21 ラウンド)。
+    /// `detect_panorama` は aspect 2:1 だけでも `Hint` を返すが、XMP `ProjectionType` が
+    /// equirectangular でない場合に GPano crop 値があっても UV 変換は無効化する
+    /// (= IDENTITY 通過、画像全体をフル equirect として球に貼る)。
+    /// これにより非 equirect な projection (= 仕様外、稀) で誤変換が起きるのを防ぐ。
+    pub(crate) fn compute_pano_uv_transform(
+        &self,
+        fs_idx: usize,
+    ) -> crate::panorama::PanoUvTransform {
+        let Some(source_key) = self.metadata_cache_key(fs_idx) else {
+            return crate::panorama::PanoUvTransform::IDENTITY;
+        };
+        let Some(Some(info)) = self.xmp_panorama_info.get(&source_key) else {
+            return crate::panorama::PanoUvTransform::IDENTITY;
+        };
+        // GPano crop は equirectangular 投影前提。非 equirect には適用しない。
+        if !info.is_equirectangular() {
+            return crate::panorama::PanoUvTransform::IDENTITY;
+        }
+        crate::panorama::PanoUvTransform::from_gpano(info)
+            .unwrap_or(crate::panorama::PanoUvTransform::IDENTITY)
+    }
+
+    /// 360 モードがアクティブな間、必要なら 8K base テクスチャをアップロードし、
+    /// `pano_uploaded` を最新化する (§4.1.1)。Phase 1 は同期実行 (実測 ~40-110 ms、
+    /// 計測超過時に worker 化を検討)。
+    ///
+    /// 呼び出し: `App::update` の描画前で、`is_panorama_mode_active(fs_idx)` が
+    /// true のときだけ呼ぶ。
+    ///
+    /// 動作:
+    /// 1. `resolve_pano_source` で source / cache_key を解決
+    /// 2. `pano_uploaded` が無い or `(source_key, cache_key)` が異なる → 再アップロード
+    /// 3. 一致 → 何もしない
+    /// 4. `CallbackResources` への Arc clone 挿入は別経路 (`sync_pano_callback_resources`)
+    #[cfg(windows)]
+    pub(crate) fn ensure_pano_upload(&mut self, fs_idx: usize) {
+        let Some(render_state) = self.wgpu_render_state.clone() else {
+            return;
+        };
+        let Some(resolution) = self.resolve_pano_source(fs_idx) else {
+            return;
+        };
+        // stale チェック (§4.2 + Codex P2 第 19 ラウンド):
+        // - source_key + cache_key: 補正 / AI / 別画像へナビでの再アップロード判定
+        // - target_format: 描画ターゲット変化で `PanoStaticGpu` を作り直す可能性があり、
+        //   新 layout + 旧 bind_group の不一致を防ぐ
+        let target_format = render_state.target_format;
+        let stale = self
+            .pano_uploaded
+            .as_ref()
+            .map(|u| {
+                u.source_key != resolution.source_key
+                    || u.cache_key != resolution.cache_key
+                    || u.target_format != target_format
+            })
+            .unwrap_or(true);
+        if !stale {
+            return;
+        }
+
+        // PanoStaticGpu を CallbackResources に確保 (なければ作る)。BindGroup 構築に
+        // bind_group_layout が必要なので、prepare() 任せにせず先に作る。
+        let device = render_state.device.clone();
+        let queue = render_state.queue.clone();
+        {
+            let mut renderer = render_state.renderer.write();
+            let resources = &mut renderer.callback_resources;
+            let need_rebuild = resources
+                .get::<crate::panorama_wgpu::PanoStaticGpu>()
+                .is_none_or(|r| r.target_format != target_format);
+            if need_rebuild {
+                resources.insert(crate::panorama_wgpu::PanoStaticGpu::new(
+                    &device,
+                    target_format,
+                ));
+            }
+        }
+
+        // ColorImage → RGBA8 → wgpu::Texture (8K で 134 MB、~10-30 ms PCIe 転送)
+        let [w_usize, h_usize] = resolution.pixels.size;
+        let w = w_usize as u32;
+        let h = h_usize as u32;
+        let t0 = std::time::Instant::now();
+        let rgba = crate::capture::color_image_to_rgba(&resolution.pixels);
+        let convert_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = std::time::Instant::now();
+        let uploaded = {
+            let renderer = render_state.renderer.read();
+            let static_gpu = renderer
+                .callback_resources
+                .get::<crate::panorama_wgpu::PanoStaticGpu>()
+                .expect("PanoStaticGpu just inserted above");
+            static_gpu.create_uploaded_texture(
+                &device,
+                &queue,
+                resolution.source_key.clone(),
+                resolution.cache_key,
+                w,
+                h,
+                &rgba,
+            )
+        };
+        let upload_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        if crate::perf::is_enabled() {
+            crate::perf::event(
+                "pano",
+                "upload",
+                Some(&resolution.source_key),
+                self.input_seq,
+                &[
+                    ("w", serde_json::Value::from(w)),
+                    ("h", serde_json::Value::from(h)),
+                    (
+                        "source_kind",
+                        serde_json::Value::from(resolution.source_kind),
+                    ),
+                    ("convert_ms", serde_json::Value::from(convert_ms)),
+                    ("upload_ms", serde_json::Value::from(upload_ms)),
+                    ("total_ms", serde_json::Value::from(convert_ms + upload_ms)),
+                ],
+            );
+        }
+        crate::logger::log(format!(
+            "[Pano] uploaded {}x{} source_kind={} cache_key={:#018x} convert={:.1}ms upload={:.1}ms",
+            w, h, resolution.source_kind, resolution.cache_key, convert_ms, upload_ms
+        ));
+
+        self.pano_uploaded = Some(std::sync::Arc::new(uploaded));
+    }
+
+    /// `pano_uploaded` の Arc を毎フレーム CallbackResources に挿入する。
+    /// 360 OFF 時は古い entry を除去する (§4.1)。
+    ///
+    /// 呼び出し: `App::update` 内で 360 描画前。`ensure_pano_upload` の後ろ。
+    #[cfg(windows)]
+    pub(crate) fn sync_pano_callback_resources(&self) {
+        let Some(render_state) = self.wgpu_render_state.as_ref() else {
+            return;
+        };
+        let mut renderer = render_state.renderer.write();
+        let resources = &mut renderer.callback_resources;
+        match self.pano_uploaded.as_ref() {
+            Some(uploaded) => {
+                resources.insert(crate::panorama_wgpu::UploadedPanoTextureRef(
+                    std::sync::Arc::clone(uploaded),
+                ));
+            }
+            None => {
+                resources.remove::<crate::panorama_wgpu::UploadedPanoTextureRef>();
+            }
+        }
+    }
+
+    /// 非 Windows ビルド (テスト等) ではアップロード経路を持たない。
+    #[cfg(not(windows))]
+    pub(crate) fn ensure_pano_upload(&mut self, _fs_idx: usize) {}
+
+    /// 非 Windows ビルド (テスト等) ではアップロード経路を持たない。
+    #[cfg(not(windows))]
+    pub(crate) fn sync_pano_callback_resources(&self) {}
+
+    /// 360 モード OFF / 別画像へナビ / フルスクリーン退出時に呼ぶ。
+    /// `pano_uploaded = None` だけだと wgpu の `CallbackResources` 側に
+    /// `UploadedPanoTextureRef` の Arc が残り続け、`UploadedPanoTexture`
+    /// (= 8K wgpu Texture 134 MB) が解放されない (Codex P2 第 18 ラウンド指摘)。
+    /// 必ずこのヘルパ経由で除去する。
+    pub(crate) fn clear_pano_upload(&mut self) {
+        self.pano_uploaded = None;
+        #[cfg(windows)]
+        if let Some(render_state) = self.wgpu_render_state.as_ref() {
+            let mut renderer = render_state.renderer.write();
+            renderer
+                .callback_resources
+                .remove::<crate::panorama_wgpu::UploadedPanoTextureRef>();
         }
     }
 
@@ -17209,6 +17798,11 @@ impl App {
             self.auto_apply_saved_mask(ctx, key);
             if self.fullscreen_idx == Some(key) {
                 self.update_prefetch_window(key);
+                // 360 候補のトースト補完 (Codex P3 第 19 ラウンド):
+                // ChatGPT 生成画像のような XMP なし 2:1 画像は、`fs_cache.source_dims`
+                // が確定して初めて aspect 判定可能になる。`open_fullscreen` 時点で
+                // 未確定だったケースを fs_cache 完了時にここで救う。
+                self.maybe_show_panorama_hint_toast(key);
             }
         }
         if repaint {

@@ -215,6 +215,76 @@ pub(super) fn draw_analysis_icon(painter: &egui::Painter, c: egui::Pos2, r: f32)
     );
 }
 
+/// 360 度パノラマアイコン (球体 + 経度線) を描画する。
+/// docs/panorama-360-view-plan.md §5.3 のホバーバーボタン用。
+/// 検出強度 (Auto / Hint) によらず単一の見た目に統一 (Codex P3 反映)。
+/// 非対応画像のときは bar_button_bg 側で disable 色にすることで区別する。
+pub(super) fn draw_panorama_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let white = egui::Color32::WHITE;
+    let main_stroke = egui::Stroke::new(1.8, white);
+    let line_stroke = egui::Stroke::new(1.2, white);
+    // 外側の球 (円)
+    let sphere_r = r * 1.05;
+    painter.circle_stroke(c, sphere_r, main_stroke);
+    // 赤道 (水平線)
+    painter.line_segment(
+        [
+            egui::pos2(c.x - sphere_r, c.y),
+            egui::pos2(c.x + sphere_r, c.y),
+        ],
+        line_stroke,
+    );
+    // 中央経度 (垂直線)
+    painter.line_segment(
+        [
+            egui::pos2(c.x, c.y - sphere_r),
+            egui::pos2(c.x, c.y + sphere_r),
+        ],
+        line_stroke,
+    );
+    // 左右の経度線 (球体感を出す縦線、±0.55r)
+    let inner_a = sphere_r * 0.55;
+    let inner_h = (sphere_r * sphere_r - inner_a * inner_a).sqrt();
+    painter.line_segment(
+        [
+            egui::pos2(c.x - inner_a, c.y - inner_h),
+            egui::pos2(c.x - inner_a, c.y + inner_h),
+        ],
+        line_stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(c.x + inner_a, c.y - inner_h),
+            egui::pos2(c.x + inner_a, c.y + inner_h),
+        ],
+        line_stroke,
+    );
+}
+
+/// 360 度パノラマアイコン (disabled 版)。非対応画像のときに dim 色で描画。
+/// シルエットは同じだが、配色だけ落として「ボタン自体は存在するが押せない」感を出す。
+pub(super) fn draw_panorama_icon_disabled(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let dim = egui::Color32::from_rgba_unmultiplied(180, 180, 180, 140);
+    let main_stroke = egui::Stroke::new(1.5, dim);
+    let line_stroke = egui::Stroke::new(1.0, dim);
+    let sphere_r = r * 1.05;
+    painter.circle_stroke(c, sphere_r, main_stroke);
+    painter.line_segment(
+        [
+            egui::pos2(c.x - sphere_r, c.y),
+            egui::pos2(c.x + sphere_r, c.y),
+        ],
+        line_stroke,
+    );
+    painter.line_segment(
+        [
+            egui::pos2(c.x, c.y - sphere_r),
+            egui::pos2(c.x, c.y + sphere_r),
+        ],
+        line_stroke,
+    );
+}
+
 /// ℹ アイコンを描画する。
 pub(super) fn draw_info_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     let white = egui::Color32::WHITE;

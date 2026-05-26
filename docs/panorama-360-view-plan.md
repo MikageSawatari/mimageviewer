@@ -53,15 +53,23 @@ Option<XmpPanoramaInfo>` を追加する**だけで再利用できる (`extract_
 
 ### 2.3 判定の使い分け
 
-| 条件 | アクション |
-| --- | --- |
-| GPano `ProjectionType=equirectangular` + `UsePanoramaViewer=True` | **自動で 360 モードに入る** (強いシグナル) |
-| GPano `ProjectionType=equirectangular` のみ | ホバーバーに 360 ボタンを強調表示 (ツールチップ「360°画像」) |
-| アスペクト比 2:1 のみ (GPano なし、ChatGPT 出力の典型) | ホバーバーに 360 ボタンを表示。クリックで切替 (§5.3) |
-| それ以外 | 360 モードへの導線を出さない |
+| 条件 | 検出 | アクション |
+| --- | --- | --- |
+| GPano `ProjectionType=equirectangular` + `UsePanoramaViewer=True` | **`Auto`** (強シグナル) | 案内トースト「V キーで 360° ビューワー (XMP 検出)」 + ホバーバーに 360 ボタンを通常表示 |
+| GPano `ProjectionType=equirectangular` のみ | **`Hint`** (中シグナル) | 案内トースト「V キーで 360° ビューワー」 + 360 ボタン表示 |
+| アスペクト比 2:1 のみ (GPano なし、ChatGPT 出力の典型) | **`Hint`** (弱シグナル) | 同上 |
+| それ以外 (アスペクト比が 2:1 範囲外 / 動画 / 見開き Double 中) | 検出なし | 360 ボタンは disabled 表示 (押せない) |
 
-**自動起動を XMP のみに限定する理由**: 2:1 のスティッチ写真や横長壁紙を ChatGPT
-パノラマと誤検出するのを避ける。アスペクト比単独はヒント止まり。
+**自動 ON はしない方針** (フィードバック反映で廃止、機能制限モードへの強制遷移
+は違和感が大きいため)。**ユーザーは V キーまたは 360 ボタンで明示的にトグル**する。
+案内トーストは `open_fullscreen` / `poll_metadata_load` (XMP 到着) /
+`poll_prefetch` (fs_cache 完了) のいずれか早いタイミングで一度だけ表示する
+(`pano_toast_shown_for_current_fs` フラグで重複抑止)。
+
+**アスペクト比 2:1 単独で検出する理由**: ChatGPT / DALL-E が出力する equirect
+画像は GPano XMP を持たないため、アスペクト判定で拾わないと案内できない。
+2:1 の通常パノラマ写真や横長壁紙を 360 候補と扱うリスクはあるが、自動 ON では
+無くトースト案内 + ボタン任意クリックなので誤検出のコストは低い。
 
 ### 2.4 メタデータ取得経路
 
@@ -1879,37 +1887,48 @@ Ctrl+Wheel = 画像ズーム という運用が確立しているため、これ
 
 - **画像フルスクリーンの上部ホバーバーに 360 ボタンを追加** (`ui_fullscreen/draw_icons.rs`
   の既存アイコンに 1 つ追加)。クリックでトグル
-- ボタンの**有効化条件**:
-  - 強: GPano XMP 検出 (`UsePanoramaViewer=True` 等) → ボタン色強調 + ツールチップ「360°画像」
-  - 弱: アスペクト 2:1 のみ → ボタンは出すが控えめ表示
-  - 検出なし → ボタン非表示
-- 自動起動条件 (§2.3) に当たれば、フルスクリーン入場時に自動 ON。ボタンクリックで OFF
+- ボタンの**表示と有効化条件** (フィードバック反映: 常時表示 + 単一アイコン):
+  - Auto (GPano `UsePanoramaViewer=True` 検出): 通常ボタン + ツールチップ「360° 画像 (XMP 検出) [V]」
+  - Hint (GPano `ProjectionType` のみ or アスペクト 2:1): 通常ボタン + ツールチップ「360° ビューワーで開く (アスペクト比から推定) [V]」
+  - 検出なし: **disabled 表示** (グレーアウト、押せない)、ツールチップ「360° 画像ではありません」
+- **自動 ON はしない** (フィードバック反映で廃止)。代わりに `open_fullscreen` /
+  `poll_metadata_load` / `poll_prefetch` で「V キーで 360° ビューワー」案内
+  トーストを 1 度だけ表示。ユーザーは V キーまたはボタンクリックで明示的にトグル
 
-**キーボードショートカット**: 当面 **割り当てない**。`P` は静止画フルスクリーンで
-`set_folder_thumb_pin` (`src/ui_fullscreen.rs:2904-2910`) に既に使われているため
-**P は採用しない**。Codex の意見も「P を避けて Shift+P / V / 3 等に逃がす」。
+**キーボードショートカット (フィードバック反映で V キー採用)**:
+画像フルスクリーン中の <kbd>V</kbd> で 360 モードトグル。`detect_panorama(fs_idx).is_some()`
+のとき (= 360 候補画像) だけ反応し、非対応画像で押しても no-op。消しゴムモード中は
+`ui_erase` 側が V (Vertical line tool) を先に consume するので衝突しない (mode-scoped 共存)。
 
-実装後に「キーを欲しい」となった場合の候補:
+検討経緯 (採用しなかった候補):
 
-- <kbd>Shift</kbd>+<kbd>P</kbd> ... 静止画 P (代表サムネピン) と衝突しない
-- <kbd>V</kbd> ... 動画用 VST3 と衝突しないか要確認 (`docs/keymap-spec.md`)
-- <kbd>3</kbd> ... 数字キーは大半が空いている
-- 別途トグル「360」専用キー追加
-
-→ **Phase 1 ではボタンのみ**。キーは Phase 2b 以降で `keymap-spec.md` 全体を見て
-空きを判定して足す (or 足さない)。
+- <kbd>P</kbd>: 静止画フルスクリーンで `set_folder_thumb_pin` 既存使用
+  (`src/ui_fullscreen.rs:2904-2910`)
+- <kbd>3</kbd>: PDF の見開き設定で既存使用、衝突回避
+- <kbd>S</kbd>: 画像スライドショー / 動画タイルモードで既存使用
+- <kbd>Shift</kbd>+<kbd>P</kbd>: 衝突しないが「Sphere」のイニシャル<kbd>V</kbd>のほうが
+  覚えやすいと判断 (View / VR の連想)
 
 ---
 
 ## 6. UI / UX
 
-### 6.1 トリガ
+### 6.1 トリガ (フィードバック反映で自動 ON 廃止)
 
-1. **自動**: GPano XMP がパノラマ宣言 (`UsePanoramaViewer=True` &
-   `ProjectionType=equirectangular`) の場合のみ、フルスクリーン入場時に
-   `panorama_state = Some(...)` で自動起動 + 360 ボタンが ON 状態
-2. **手動**: アスペクト 2:1 を検出 → 上部ホバーバーに 360° ボタンを表示
-   (検出なしの画像では非表示)。ボタンクリックで ON/OFF
+**360 モードに入る経路は 2 つだけ** (どちらもユーザーの明示操作):
+
+1. **V キー押下**: 画像フルスクリーン中で `detect_panorama(fs_idx).is_some()`
+   なら `toggle_panorama_mode(fs_idx)`。消しゴムモード中は ui_erase が先に
+   V を consume するので衝突しない (mode-scoped)
+2. **ホバーバー 360 ボタンクリック**: 同上
+
+**案内トースト**: GPano XMP 検出 / アスペクト 2:1 検出時に **「V キーで 360°
+ビューワー」を一度だけ表示** (§2.3)。Auto / Hint で文言を分岐。フラグ
+`pano_toast_shown_for_current_fs` で同一フルスクリーンセッション内の重複を抑止。
+表示タイミングは:
+- `open_fullscreen`: XMP / fs_cache が cache 済みなら即発火
+- `poll_metadata_load`: 到着 XMP が現フルスクリーン source_key と一致したら補完
+- `poll_prefetch`: fs_cache Static 完了で aspect 2:1 を新たに判定可能になったら補完
 
 ### 6.2 表示中の UI 要素
 
@@ -2016,12 +2035,21 @@ mipmap / ミニコンパス / 慣性ドラッグ。
 - [ ] `ui_fullscreen.rs` で 360 モード分岐 (描画 + 入力)
 - [ ] **左ドラッグで yaw/pitch、Ctrl+Wheel で FOV、Wheel 単独 / 矢印 / Esc は奪わない**
       (§5.2、Codex P2 反映)
-- [ ] **トグルは上部ホバーバーの 360 ボタンが主導線**、キーボードショートカットは
-      Phase 1 では割り当てない (§5.3、Codex P1 反映)
+- [ ] **トグル経路: ホバーバーの 360 ボタン + V キー** (フィードバック反映で
+      V キー採用、§5.3)。検出済み (= `detect_panorama(fs_idx).is_some()`) のときだけ反応
+- [ ] **360 モード中の機能制限**: メタデータパネル / 補正パネル / 分析パネル / 比較 /
+      見開き / VST3 GUI を全て抑止。上バーは × / ウィンドウ切替 / 360 ボタンのみ
+      (フィードバック反映、`is_panorama_mode_active(fs_idx)` で判定)
 - [ ] 補正・AI テクスチャの優先順位を 360 入力に反映 (display-pipeline.md §2.3 と整合、
       source_kind を §4.3 のとおりキーに焼き付け)
-- [ ] アスペクト 2:1 ヒント / GPano 自動起動
-- [ ] ホバーバーの 360 ボタン (検出時のみ表示)
+- [ ] **検出 (`detect_panorama`)**: GPano `UsePanoramaViewer=True` → Auto、
+      GPano `ProjectionType` のみ or アスペクト 2:1 → Hint。**自動 ON は廃止**
+      (フィードバック反映)、代わりに `open_fullscreen` / `poll_metadata_load` /
+      `poll_prefetch` から `maybe_show_panorama_hint_toast` で「V キーで 360°
+      ビューワー」案内トーストを 1 度だけ表示 (`pano_toast_shown_for_current_fs`
+      フラグで重複抑止)
+- [ ] **ホバーバーの 360 ボタンは常時表示**、非対応画像では disabled (グレーアウト)
+      (フィードバック反映で「検出時のみ表示」から変更、§5.3)
 - [ ] サムネは equirect のまま表示 (グリッドでは平面のままで OK)
 - [ ] テスト: ChatGPT 出力サンプル (2K) + Insta360 X3 等の 11K 画像 (8K に縮小されて
       表示されることを確認) + ZIP 内 equirect + 補正 / AI 切替時の再アップロード確認
@@ -2033,6 +2061,69 @@ mipmap / ミニコンパス / 慣性ドラッグ。
 - ~~`pano_source_pixels` キャッシュ層~~ (`fs_cache` 直接流用)
 - ~~`max_pano_dim` 起動時取得~~ (8192 固定)
 - ~~古い iGPU フォールバック~~ (8K は全 GPU でサポート)
+
+### Phase 1.5: 部分 FOV equirect (実装済み)
+
+GPano `CroppedArea*` 宣言で「フル球面の一部しか覆っていない」equirect 画像
+(DSLR + nodal panhead 撮影で天頂・地面が抜けているケース等) を正しく球に貼る。
+**Phase 2a settle 実装前に組み込み** することで、settle の CPU sampler 設計が
+最初から UV 変換込みになり、後で signature 拡張する手戻りを避けた。
+
+実装範囲:
+
+- [x] `panorama::PanoUvTransform { u_offset, v_offset, u_scale, v_scale }` 型
+- [x] `PanoUvTransform::from_gpano(info)` で `FullPano*` / `CroppedArea*` から UV 変換を計算
+  - 必須フィールド欠落 / 範囲外 → `None` (= IDENTITY fallback)
+  - `CroppedAreaLeft/TopPixels` 未指定は中央寄せと解釈
+  - 差が 0.5% 以下なら identity に丸めて無駄な UV 変換を回避
+- [x] WGSL `Params` 構造体を `(pose: vec4, crop: vec4)` の 2 つに拡張、uniform 32 bytes
+- [x] WGSL fragment で `texture_uv = (sphere_uv - crop.xy) / crop.zw` を最終 UV に
+- [x] `PanoramaShaderCallback.uv_transform: PanoUvTransform` フィールド
+- [x] `App::compute_pano_uv_transform(fs_idx)` で XMP から導出 (`is_equirectangular()` ガード
+      で非 equirect は IDENTITY、Codex P3 第 21 ラウンド反映)
+- [x] `try_paint_panorama` で callback に焼き付け
+- [x] テスト: identity / DSLR 部分 FOV 例 / 中央寄せ default / 必須欠落 / 範囲外 / 微差丸め
+
+**欠落領域の埋め方** (Codex P2 第 21/22/23 ラウンドで段階的に精度向上):
+
+- **Sampler 設定**: `address_mode_u: Repeat` / `address_mode_v: ClampToEdge`。
+  フル equirect の経度シーム (U=0/1 連続) を自然に wrap させるため U は Repeat。
+  V は極の外挿を避けるため ClampToEdge。
+- **シェーダで軸別の half-texel inset clamp** (第 23 ラウンド反映):
+  ```wgsl
+  let u_crop = (crop.z < 0.999) || (abs(crop.x) > 0.001);
+  let v_crop = (crop.w < 0.999) || (abs(crop.y) > 0.001);
+  let dims = vec2<f32>(textureDimensions(pano_tex));
+  let half_texel = 0.5 / dims;
+  // u_crop が真のとき U を [0.5/W, 1 - 0.5/W] に clamp、偽なら Repeat に任せる
+  // v_crop が真のとき V を [0.5/H, 1 - 0.5/H] に clamp、偽なら ClampToEdge に任せる
+  ```
+  - **DSLR 三脚 nodal panhead (= 水平フル + 垂直 partial)**: `u_crop=false, v_crop=true`
+    → U は Repeat の seam wrap が維持され、V のみ shader clamp で端色を引き伸ばす ✓
+  - **水平 crop only (稀)**: `u_crop=true, v_crop=false` → U のみ clamp で
+    反対端 wrap を防ぐ、V は ClampToEdge sampler に任せる
+  - **両方 crop**: 両方 clamp
+  - **フル equirect (IDENTITY)**: 両方とも偽、`texture_uv_raw` 素通しで U Repeat
+    + V ClampToEdge の「平時」挙動を維持
+- **Linear filter 対応 (half-texel inset)**: `u = 0.0 ちょうど` をサンプルすると
+  Linear が左右の隣接 texel を補間する。Repeat の場合「u<0 相当」は反対端 texel を
+  取りに行くため、境界 1 texel ぶんで反対端の色が 50% 混ざる。これを防ぐため、
+  最外側 texel の **中心** に対応する `[0.5/W, 1 - 0.5/W]` に clamp する
+  (= ハードウェア ClampToEdge 相当の動作を Repeat sampler でも再現)。
+- **結果**: 欠落視野は端 texel の色 (空 / 地面っぽい色になりやすい) が均一に
+  引き伸ばされ、反対端の画像が混ざる現象が出ない。垂直 crop only の典型ケースで
+  U の seam wrap が無駄に無効化されることもない。
+
+Phase 3 で「黒で埋める」「透過」オプションを追加する余地あり。
+
+**実装影響**: ハッピーパス (フル equirect) も crop パスも、追加 ALU は **全フラグメント
+で同量** (= ~8 演算: textureDimensions 1 + divide 2 + subtract 2 + clamp 4) 走る。
+WGSL の `select(raw, clamped, cond)` は分岐ではなく **両辺を評価して値を選ぶ命令** で、
+`clamped` 側の計算 (clamp / divide / textureDimensions) は cond の真偽に関わらず実行
+される (Codex P3 第 24 ラウンドで表現訂正、第 23 で「実質コストゼロ」と書いたのは
+不正確だった)。とはいえ追加 ALU は per-fragment で固定 8 命令、現代 GPU の compute
+スループットから見ると実用上は無視できるオーバーヘッド (4K viewport の equirect
+フラグメントシェーダ全体で見ると 1% 未満のコスト増)。
 
 ### Phase 2a: settle-refinement (1〜2 週、解像度ゲート + ユーザー確認版)
 

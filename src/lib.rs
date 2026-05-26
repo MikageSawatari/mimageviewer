@@ -61,6 +61,8 @@ pub mod mask_db;
 pub mod name_bulk_indexer;
 pub mod name_index_supervisor;
 pub mod os_theme;
+pub mod panorama;
+pub mod panorama_wgpu;
 pub mod path_key;
 pub mod pdf_loader;
 pub mod pdf_passwords;

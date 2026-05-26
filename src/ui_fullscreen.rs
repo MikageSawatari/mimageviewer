@@ -1489,10 +1489,17 @@ impl App {
                             self.compare_view_mode,
                             crate::app::CompareViewMode::Wipe { .. }
                         );
-                        let analysis_active = self.analysis_mode && !is_spread_double;
+                        // 360 度パノラマビューモード中は分析 / 補正 / 比較を抑止する
+                        // (= 上バーの 360 / × / window のみ、機能制限モード)。
+                        let panorama_mode_active_now = self.is_panorama_mode_active(fs_idx);
+                        let analysis_active = self.analysis_mode
+                            && !is_spread_double
+                            && !panorama_mode_active_now;
                         // 補正パネルは見開き Double でも使えるようにする (左右独立補正 + コピー)。
                         // 編集対象 (画面上の左/右) は `adjust_spread_target` で切替。
-                        let adjustment_active = self.adjustment_mode && !compare_wipe_active;
+                        let adjustment_active = self.adjustment_mode
+                            && !compare_wipe_active
+                            && !panorama_mode_active_now;
                         // VST3 動画コンパクト表示モード: 動画のときだけ右上 1/4 に縮小し、
                         // 残った左下 3/4 をプラグイン GUI 用に空ける。動画でない (画像/PDF)
                         // ときは無視する (= プラグインで分析するのは動画なので)。
@@ -1515,6 +1522,20 @@ impl App {
                         } else {
                             match spread_pair {
                                 SpreadPair::Single => {
+                                    // ── 360 度パノラマビュー (最優先で試行) ──
+                                    // active なら通常パス (compare / draw_fs_image / rotation /
+                                    // zoom / pan) は完全にスキップする。準備中なら false が
+                                    // 返り、通常パスで equirect が平らに表示される
+                                    // (= 「数フレ平らな表示 → 360 描画開始」UX、docs §4.2)。
+                                    let panorama_painted = if self.is_panorama_mode_active(fs_idx) {
+                                        self.try_paint_panorama(ui, ctx, image_rect, fs_idx)
+                                    } else {
+                                        false
+                                    };
+                                    if panorama_painted {
+                                        self.fs_spread_layout = None;
+                                    } else {
+
                                     let fs_rotation = self.get_rotation(fs_idx);
                                     let zp = if analysis_active {
                                         Some((self.analysis_zoom, self.analysis_pan))
@@ -1624,6 +1645,7 @@ impl App {
                                     }
                                     // 単一表示時は見開きレイアウトキャッシュを破棄
                                     self.fs_spread_layout = None;
+                                    } // else (= !panorama_painted) ブロック終端
                                 }
                                 SpreadPair::Double { left, right } => {
                                     let compare_mode = self.compare_view_mode;
@@ -1851,6 +1873,10 @@ impl App {
                             if !is_spread_double {
                                 self.draw_metadata_panel_forced(ui, ctx, full_rect);
                             }
+                        } else if panorama_mode_active_now {
+                            // 360 モード中はメタデータ / 補正 / 分析パネルを全て抑止
+                            // (docs/panorama-360-view-plan.md フィードバック対応)。
+                            // 上部ホバーバーの 360 / × / window だけが表示される。
                         } else if !is_spread_double && !compare_wipe_active {
                             // ── メタデータパネル（通常モード：TABキー固定 or 右端ホバー）──
                             let right_panel_visible =
@@ -1936,6 +1962,18 @@ impl App {
                             // 専用トグルがある。
                             let show_window_toggle = cfg!(windows) && !is_video_mode;
                             let slideshow_was_playing = self.slideshow_playing;
+                            // 360 度パノラマビュー: 検出 + アクティブ状態を計算
+                            // (docs/panorama-360-view-plan.md §5.3)。is_panorama_mode_active
+                            // は state Some + detect Some を要求するが、ボタン表示は
+                            // detect Some だけで十分 (= 360 ボタン押下で初期化可能)。
+                            // 非対応画像でもボタンは disabled で常に表示する。
+                            let panorama_trigger = self.detect_panorama(fs_idx);
+                            let panorama_active = self.panorama_state.is_some()
+                                && panorama_trigger.is_some();
+                            // panorama_mode_active=true なら他のボタン (info / analysis /
+                            // spread / 補正 / rotate / capture / VST / play / tile) は全て隠す。
+                            let panorama_mode_active = panorama_active;
+                            let mut panorama_pressed = false;
                             Self::draw_fs_hover_bar(
                                 ui, ctx, full_rect,
                                 &state.location_display,
@@ -1948,6 +1986,10 @@ impl App {
                                 &mut self.settings.slideshow_interval_secs,
                                 &mut bar_rotate_cw, &mut bar_rotate_ccw,
                                 &mut self.analysis_mode,
+                                panorama_trigger,
+                                panorama_active,
+                                panorama_mode_active,
+                                &mut panorama_pressed,
                                 &mut self.spread_mode, &mut self.spread_popup_open,
                                 is_spread_double,
                                 ai_upscale_info,
@@ -1969,6 +2011,10 @@ impl App {
                             );
                             if copy_capture_pressed {
                                 self.copy_image_capture_to_clipboard(fs_idx);
+                            }
+                            // 360 度パノラマビュー: トグル
+                            if panorama_pressed {
+                                self.toggle_panorama_mode(fs_idx);
                             }
                             // ウィンドウ / 全画面 切り替えボタンが押された。
                             #[cfg(windows)]
@@ -2976,11 +3022,30 @@ impl App {
         let key_r = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R));
         let key_l = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
         let key_z = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Z));
+        // V: 360 度パノラマビューワーモード トグル (docs/panorama-360-view-plan.md)。
+        // 消しゴムモード中は ui_erase 側が V (vertical line tool) を先に consume するので、
+        // ここで奪っても消しゴム中は届かない (= mode-scoped 共存)。
+        let key_v_panorama = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::V));
         let key_g = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::G));
         let key_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::M));
         let key_e = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::E));
         // B: 透過画像の背景サイクル。消しゴムモードでは ui_erase が B (筆ツール) を既に消費している。
         let key_b_bg = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B));
+        // 360 モード中は他モード切替系のキーを抑止 (= フィードバック反映の「機能制限モード」)。
+        // - 抑止対象: Z (分析) / S (スライドショー) / E (消しゴム) / M (ルーペ) / B (bg cycle)
+        //   / I (メタデータ) / C 系 (比較)
+        // - 抑止しない: V (= 360 を抜ける手段)、Esc / 矢印 / Wheel / F1-F5 / BS (= ナビ・レーティング)
+        let pano_active_now = self.is_panorama_mode_active(fs_idx);
+        let key_z = key_z && !pano_active_now;
+        let key_s = key_s && !pano_active_now;
+        let key_e = key_e && !pano_active_now;
+        let key_m = key_m && !pano_active_now;
+        let key_b_bg = key_b_bg && !pano_active_now;
+        let key_i = key_i && !pano_active_now;
+        let key_compare_x = key_compare_x && !pano_active_now;
+        let key_compare_alt_c = key_compare_alt_c && !pano_active_now;
+        let key_compare_shift_c = key_compare_shift_c && !pano_active_now;
+        let key_compare_c = key_compare_c && !pano_active_now;
         // P: 現在表示中アイテムを親コンテナの代表サムネに固定 / 解除。
         // 動画フルスクリーンの P は handle_video_input が先に「現在フレームをピン留め」として
         // consume するため、ここでは静止画系アイテムだけを対象にする。
@@ -3286,6 +3351,12 @@ impl App {
         // 見開きダブル表示中は I/Z/R/L を無効化
         if key_i && !is_spread_double {
             self.show_metadata_panel = !self.show_metadata_panel;
+        }
+        // V: 360 度パノラマビューモード トグル。
+        // 検出済み (= 360 ボタンが有効な状態) のときだけ反応する。非対応画像で
+        // V を押しても no-op (= 一般的なキーマップ慣例)。
+        if key_v_panorama && !is_spread_double && self.detect_panorama(fs_idx).is_some() {
+            self.toggle_panorama_mode(fs_idx);
         }
         if key_z && !is_spread_double {
             if self.analysis_mode {
@@ -3741,6 +3812,9 @@ impl App {
                 if changed {
                     self.maybe_rerender_pdf(self.analysis_zoom);
                 }
+            } else if self.handle_panorama_wheel_if_active(ctx, wheel_y, ctrl_held) {
+                // 360 度パノラマビュー: Ctrl+Wheel は FOV 調整に転用 (§5.2)。
+                // Ctrl なし Wheel は奪わず、下の `else if !erase_mode` で前後ナビに流す。
             } else {
                 if ctrl_held {
                     // 通常モード: Ctrl+ホイールでズーム
@@ -3802,6 +3876,9 @@ impl App {
                 self.maybe_rerender_pdf(1.0);
             }
             // 右クリックは analysis_panel 側で処理
+        } else if self.handle_panorama_drag_if_active(ctx, full_rect, &fs_response) {
+            // 360 度パノラマビュー: 左ドラッグ → yaw/pitch、ダブルクリック → reset (§5.2)。
+            // 通常モードの zoom/pan/rotation ドラッグはスキップ。
         } else {
             // ── 通常モード: ドラッグ操作 ──
             let mods = ctx.input(|i| i.modifiers);
@@ -4731,6 +4808,174 @@ impl App {
         None
     }
 
+    /// 360 度パノラマビューがアクティブで左ドラッグ / ダブルクリックを処理した場合 true。
+    /// 通常モードの click/drag 処理 (zoom/pan/rotation) はこの呼び出しが true を返したら
+    /// スキップする (docs/panorama-360-view-plan.md §5.2)。
+    ///
+    /// - 左ドラッグ → yaw/pitch (sens = fov_y / viewport_h)
+    /// - ダブルクリック → reset (GPano hint or 0)
+    /// - **通常 Wheel / 矢印 / Esc は奪わない** (= 既存ナビ動作維持)
+    fn handle_panorama_drag_if_active(
+        &mut self,
+        ctx: &egui::Context,
+        full_rect: egui::Rect,
+        fs_response: &egui::Response,
+    ) -> bool {
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return false;
+        };
+        if !self.is_panorama_mode_active(fs_idx) {
+            return false;
+        }
+        let viewport_h = full_rect.height().max(1.0);
+        if let Some(pano) = self.panorama_state.as_mut() {
+            // 左ドラッグ → yaw/pitch (「掴んで引っ張る」感覚、Google Street View 流)。
+            // 画像がドラッグ方向と同じ向きに動くようにする。
+            //
+            // WGSL の射影 (panorama_wgpu.rs §3.3) を踏まえた符号:
+            // - 右ドラッグ (dx>0) → yaw 増 → 視点は左を向く → 画像が右に流れる ✓
+            // - 下ドラッグ (dy>0) → pitch 増 → 視点は上を向く → 画像が下に流れる ✓
+            //   (pitch=π/2 で空を直視、pitch=-π/2 で床を直視、WGSL の `cam_dir.z=-1` 規約)
+            //
+            // ⚠ `Response::drag_delta()` は egui 0.33 で **フレーム間デルタ**
+            //    (= "since last frame", egui::Response::drag_delta 行コメント参照)。
+            //    **累積差分ではない** ので毎フレ加算で OK。累積版が必要なら
+            //    `total_drag_delta()`。Codex P1 第 18 ラウンドで「累積」と誤指摘あり、
+            //    egui ソース (src/response.rs 該当行) で fetch 確認済み。
+            let primary_down = fs_response.dragged_by(egui::PointerButton::Primary);
+            if primary_down {
+                let delta = fs_response.drag_delta();
+                if delta.length_sq() > 0.0 {
+                    let sens = pano.fov_y / viewport_h;
+                    pano.yaw += delta.x * sens;
+                    // yaw を [-π, π] に wrap
+                    let two_pi = std::f32::consts::TAU;
+                    while pano.yaw > std::f32::consts::PI {
+                        pano.yaw -= two_pi;
+                    }
+                    while pano.yaw < -std::f32::consts::PI {
+                        pano.yaw += two_pi;
+                    }
+                    // pitch クランプ (極を直視させない)
+                    pano.pitch = (pano.pitch + delta.y * sens)
+                        .clamp(-crate::panorama::PITCH_LIMIT, crate::panorama::PITCH_LIMIT);
+                    ctx.request_repaint();
+                }
+            }
+            // ダブルクリック → 初期視点に戻す (GPano hint or 0)
+            if fs_response.double_clicked() {
+                pano.reset();
+                ctx.request_repaint();
+            }
+        }
+        true
+    }
+
+    /// 360 度パノラマビューがアクティブで Ctrl+Wheel を処理した場合 true。
+    /// 通常モードの Ctrl+wheel ズームはこの呼び出しが true を返したらスキップする。
+    /// 通常 Wheel (Ctrl なし) は前後ナビとして奪わない設計のため、ここでは扱わない。
+    fn handle_panorama_wheel_if_active(
+        &mut self,
+        ctx: &egui::Context,
+        wheel_y: f32,
+        ctrl_held: bool,
+    ) -> bool {
+        if !ctrl_held || wheel_y.abs() < 0.5 {
+            return false;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return false;
+        };
+        if !self.is_panorama_mode_active(fs_idx) {
+            return false;
+        }
+        if let Some(pano) = self.panorama_state.as_mut() {
+            // FOV = fov * exp(-wheel * 0.0015)。ホイール 1 ノッチ ≈ 50px で約 7% 変化。
+            let factor = (-wheel_y * 0.0015).exp();
+            pano.fov_y =
+                (pano.fov_y * factor).clamp(crate::panorama::FOV_MIN, crate::panorama::FOV_MAX);
+            ctx.request_repaint();
+        }
+        true
+    }
+
+    /// 360 度パノラマビューを emit する (docs/panorama-360-view-plan.md §4.2)。
+    /// `pano_uploaded` が `(source_key, cache_key)` 一致でアップロード済みのときだけ
+    /// `Shape::Callback` を出して true を返す。準備中 (未アップロード or stale) なら
+    /// false を返し、呼び出し側は通常パス (`draw_fs_image`) にフォールバックして
+    /// 平面で equirect を表示する (= 「数フレ平らな equirect → 360 描画開始」UX)。
+    ///
+    /// 360 自身が yaw/pitch/fov を持つので、rotation_db / zoom / pan / free_rotation /
+    /// spread は完全に無視する (呼び出し側で関連ブロックをスキップする責任あり)。
+    #[cfg(windows)]
+    fn try_paint_panorama(
+        &mut self,
+        ui: &mut egui::Ui,
+        ctx: &egui::Context,
+        image_rect: egui::Rect,
+        fs_idx: usize,
+    ) -> bool {
+        // 1. アップロード経路を起動 (stale なら今フレで同期 upload)。
+        //    実測で 40-110 ms かかり得るが、Phase 1 では UI スレッド許容 (§4.1.1)。
+        self.ensure_pano_upload(fs_idx);
+        // 2. 今フレの CallbackResources に Arc を載せる (毎フレ必須)。
+        self.sync_pano_callback_resources();
+
+        let Some(render_state) = self.wgpu_render_state.as_ref() else {
+            return false;
+        };
+        let target_format = render_state.target_format;
+        let Some(resolution) = self.resolve_pano_source(fs_idx) else {
+            return false;
+        };
+        let uploaded_ready = self
+            .pano_uploaded
+            .as_ref()
+            .map(|u| u.source_key == resolution.source_key && u.cache_key == resolution.cache_key)
+            .unwrap_or(false);
+        if !uploaded_ready {
+            return false;
+        }
+        let Some(pano) = self.panorama_state.as_ref() else {
+            return false;
+        };
+        let aspect = if image_rect.height() > 0.0 {
+            image_rect.width() / image_rect.height()
+        } else {
+            1.0
+        };
+        // Phase 1.5 部分 FOV equirect: GPano `CroppedArea*` 宣言から UV 変換を計算。
+        // フル equirect / 宣言なしの画像は IDENTITY (= 恒等変換) になる。
+        let uv_transform = self.compute_pano_uv_transform(fs_idx);
+        let callback = crate::panorama_wgpu::PanoramaShaderCallback {
+            source_key: resolution.source_key,
+            cache_key: resolution.cache_key,
+            yaw: pano.yaw,
+            pitch: pano.pitch,
+            fov_y: pano.fov_y,
+            aspect,
+            uv_transform,
+            target_format,
+        };
+        let shape = egui::Shape::Callback(egui_wgpu::Callback::new_paint_callback(
+            image_rect, callback,
+        ));
+        ui.painter().add(shape);
+        let _ = ctx;
+        true
+    }
+
+    #[cfg(not(windows))]
+    fn try_paint_panorama(
+        &mut self,
+        _ui: &mut egui::Ui,
+        _ctx: &egui::Context,
+        _image_rect: egui::Rect,
+        _fs_idx: usize,
+    ) -> bool {
+        false
+    }
+
     fn draw_compare_prepared_mode(
         &mut self,
         ui: &mut egui::Ui,
@@ -5622,6 +5867,16 @@ impl App {
         rotate_cw: &mut bool,
         rotate_ccw: &mut bool,
         show_analysis: &mut bool,
+        // 360 度パノラマビュー (docs/panorama-360-view-plan.md §5.3):
+        // - trigger Some(Auto/Hint) のとき球体アイコンを表示。None なら disabled 表示。
+        // - panorama_active=true なら強調背景。
+        // - panorama_mode_active=true (= state Some + detect Some) なら他のボタンを
+        //   全て隠して 360 / × / window_toggle のみに絞る (= 360 モード中は機能制限)。
+        // - クリックされたら panorama_pressed = true を返す (caller が toggle 経路を呼ぶ)。
+        panorama_trigger: Option<crate::panorama::PanoramaTrigger>,
+        panorama_active: bool,
+        panorama_mode_active: bool,
+        panorama_pressed: &mut bool,
         spread_mode: &mut SpreadMode,
         spread_popup_open: &mut bool,
         is_spread_double: bool,
@@ -5741,7 +5996,8 @@ impl App {
         }
 
         // 📷 キャプチャコピー (画像のみ)。Ctrl+S のファイル保存と同じ snapshot 経路を使う。
-        if !is_video {
+        // 360 モード中は機能制限のため非表示 (docs/panorama-360-view-plan.md フィードバック対応)。
+        if !is_video && !panorama_mode_active {
             let camera_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -5765,7 +6021,8 @@ impl App {
         // VST ボタン: 動画モード + VST3 機能 ON のときだけ表示。
         // クリックで管理パネルを開く / 閉じる。management panel は egui::Window で
         // フルスクリーンビューポート内に描画されるので動画の手前に出る。
-        if show_vst3_button {
+        // 360 モード中は非表示 (= 360 は画像専用なのでここに来ない想定だが二重保護)。
+        if show_vst3_button && !panorama_mode_active {
             let vst_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -5790,7 +6047,10 @@ impl App {
         }
 
         // ▶/⏸ スライドショーボタン (画像モード) または ▦ タイルボタン (動画モード)
-        if is_video {
+        // 360 モード中は非表示。
+        if panorama_mode_active {
+            // skip
+        } else if is_video {
             let tile_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -5850,7 +6110,8 @@ impl App {
         }
 
         // ↷ 右回転 / ↶ 左回転ボタン (画像のみ — 動画では意味を持たないため非表示)
-        if !is_video {
+        // 360 モード中は非表示 (360 ビューは独自の yaw を持つため rotation_db は適用しない)。
+        if !is_video && !panorama_mode_active {
             let rcw_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -5888,27 +6149,30 @@ impl App {
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
-        // ℹ Info ボタン
-        let info_resp = draw_bar_button(
-            ui,
-            next_x,
-            bar_rect.min.y + BAR_BUTTON_MARGIN,
-            "fs_info_btn",
-            |hovered| bar_button_bg(hovered, *show_info),
-            *show_info,
-            |p, c, r| draw_info_icon(p, c, r),
-        );
-        let info_resp = info_resp.hover_tip_dark("メタデータ [I / Tab]");
-        if info_resp.clicked() {
-            *show_info = !*show_info;
+        // ℹ Info ボタン (360 モード中は非表示)
+        if !panorama_mode_active {
+            let info_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_info_btn",
+                |hovered| bar_button_bg(hovered, *show_info),
+                *show_info,
+                |p, c, r| draw_info_icon(p, c, r),
+            );
+            let info_resp = info_resp.hover_tip_dark("メタデータ [I / Tab]");
+            if info_resp.clicked() {
+                *show_info = !*show_info;
+            }
+            if info_resp.hovered() {
+                *nav_delta = 0;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
-        if info_resp.hovered() {
-            *nav_delta = 0;
-        }
-        next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
 
         // 🔬 分析ボタン（見開きダブル中は非表示。動画では意味を持たないため非表示）
-        if !is_spread_double && !is_video {
+        // 360 モード中も非表示。
+        if !is_spread_double && !is_video && !panorama_mode_active {
             let analysis_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -5928,11 +6192,58 @@ impl App {
             next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
         }
 
+        // 360 度パノラマビューボタン (画像のみ常時表示、非対応画像では disabled 表示)
+        // docs/panorama-360-view-plan.md §5.3 / §6.1
+        // - panorama_trigger=Auto: XMP 検出済み、強調ツールチップ
+        // - panorama_trigger=Hint: アスペクト 2:1 推定、控えめツールチップ
+        // - panorama_trigger=None: 非対応 (グレーアウト、押せない)
+        if !is_video && !is_spread_double {
+            let tooltip = match panorama_trigger {
+                Some(crate::panorama::PanoramaTrigger::Auto) => "360° 画像 (XMP 検出) [V]",
+                Some(crate::panorama::PanoramaTrigger::Hint) => {
+                    "360° ビューワーで開く (アスペクト比から推定) [V]"
+                }
+                None => "360° 画像ではありません",
+            };
+            let is_enabled = panorama_trigger.is_some();
+            let pano_resp = draw_bar_button(
+                ui,
+                next_x,
+                bar_rect.min.y + BAR_BUTTON_MARGIN,
+                "fs_panorama_btn",
+                |hovered| {
+                    if is_enabled {
+                        bar_button_bg(hovered, panorama_active)
+                    } else {
+                        // disabled: 押せないので hover でも色を変えない
+                        egui::Color32::from_rgba_unmultiplied(60, 60, 60, 160)
+                    }
+                },
+                panorama_active,
+                |p, c, r| {
+                    if is_enabled {
+                        draw_panorama_icon(p, c, r);
+                    } else {
+                        draw_panorama_icon_disabled(p, c, r);
+                    }
+                },
+            );
+            let pano_resp = pano_resp.hover_tip_dark(tooltip);
+            if is_enabled && pano_resp.clicked() {
+                *panorama_pressed = true;
+            }
+            if pano_resp.hovered() {
+                *nav_delta = 0;
+            }
+            next_x -= BAR_BUTTON_SIZE + BAR_BUTTON_GAP;
+        }
+
         // 📖 見開きモードボタン (画像のみ。動画では非表示)
+        // 360 モード中も非表示 (360 は強制 Single)。
         let spread_active = spread_mode.is_spread();
         let sm = *spread_mode;
         let mut spread_resp_rect = egui::Rect::NOTHING;
-        if !is_video {
+        if !is_video && !panorama_mode_active {
             let spread_resp = draw_bar_button(
                 ui,
                 next_x,
@@ -6054,7 +6365,8 @@ impl App {
         }
 
         // 🎨 画像補正パネルトグルボタン (動画では非表示)
-        if !is_video {
+        // 補正ボタン (360 モード中は非表示)
+        if !is_video && !panorama_mode_active {
             let btn_rect = egui::Rect::from_min_size(
                 egui::pos2(next_x, bar_rect.min.y + BAR_BUTTON_MARGIN),
                 egui::vec2(BAR_BUTTON_SIZE, BAR_BUTTON_SIZE),
