@@ -8487,6 +8487,7 @@ impl App {
         let mut clear_pending = false;
         let mut toast: Option<String> = None;
         let mut reveal_path: Option<std::path::PathBuf> = None;
+        let mut completed_paths: Vec<std::path::PathBuf> = Vec::new();
 
         loop {
             match pending.rx.try_recv() {
@@ -8496,6 +8497,7 @@ impl App {
                 Ok(crate::export_dialog::ExportEvent::Completed(success)) => {
                     pending.done = pending.done.saturating_add(1);
                     pending.last_message = format!("保存しました: {}", success.label);
+                    completed_paths.push(success.path.clone());
                     pending.successes.push(success);
                 }
                 Ok(crate::export_dialog::ExportEvent::Failed(err)) => {
@@ -8542,6 +8544,9 @@ impl App {
             self.export_pending = None;
         } else if self.export_pending.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        for path in &completed_paths {
+            self.note_exported_file_for_folder_refresh(path);
         }
         if let Some(path) = reveal_path {
             self.show_capture_saved_toast(path);

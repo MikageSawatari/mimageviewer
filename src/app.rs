@@ -2074,6 +2074,8 @@ pub struct App {
     pub(crate) export_dialog: Option<crate::export_dialog::ExportDialogState>,
     /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。
     pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
+    /// Ctrl+E で現在表示中の実フォルダへ保存したため、グリッド復帰時に再読み込みする対象。
+    pub(crate) export_folder_refresh_pending: Option<PathBuf>,
     /// X / C 比較ビューのピン留めスロット。CPU pixels を正とし、texture は派生物。
     pub(crate) pinned_compare_slot: Option<PinnedCompareSlot>,
     pub(crate) compare_view_mode: CompareViewMode,
@@ -3714,6 +3716,7 @@ impl App {
             capture_pending: None,
             export_dialog: None,
             export_pending: None,
+            export_folder_refresh_pending: None,
             pinned_compare_slot: None,
             compare_view_mode: CompareViewMode::Off,
             compare_pin_load_pending: None,
@@ -8728,6 +8731,54 @@ impl App {
                 self.folder_history.remove(&cur);
                 self.load_folder(cur);
             }
+        }
+    }
+
+    /// Ctrl+E エクスポートが現在表示中の実フォルダへ書き出したら、一覧復帰時の
+    /// 再読み込み対象として記録する。ZIP / PDF / 検索結果などの仮想ビューでは
+    /// 一覧文脈が変わってしまうため、ここでは何もしない。
+    pub(crate) fn note_exported_file_for_folder_refresh(&mut self, path: &Path) {
+        if self.items_are_global_search_view
+            || self.global_search.active
+            || self.favsearch.on_results_grid()
+        {
+            return;
+        }
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let Some(cur) = self.current_favorite_target() else {
+            return;
+        };
+        if crate::folder_tree::path_eq(parent, &cur) {
+            self.export_folder_refresh_pending = Some(cur);
+        }
+    }
+
+    /// Ctrl+E で現在フォルダへ保存されたファイルをグリッドへ反映する。
+    ///
+    /// フルスクリーン中に `load_folder` すると表示が閉じてしまうため、呼び出し側は
+    /// `fullscreen_idx.is_none()` のときだけ実行する。
+    pub(crate) fn consume_export_folder_refresh_pending(&mut self) {
+        let Some(target) = self.export_folder_refresh_pending.take() else {
+            return;
+        };
+        if self.items_are_global_search_view
+            || self.global_search.active
+            || self.favsearch.on_results_grid()
+        {
+            return;
+        }
+        let Some(cur) = self.current_favorite_target() else {
+            return;
+        };
+        if crate::folder_tree::path_eq(&cur, &target) {
+            crate::logger::log(format!(
+                "export: reloading current folder after Ctrl+E save ({})",
+                cur.display()
+            ));
+            self.folder_history.remove(&cur);
+            self.load_folder(cur);
         }
     }
 
@@ -22064,16 +22115,16 @@ impl eframe::App for App {
 
         // ── アドレスバー ─────────────────────────────────────────────
         let address_nav = self.render_address_bar(ctx);
-        // 📌 ボタン / グリッドコンテキストメニューで pin が書き換わっていたら同フレーム
-        // 内でグリッドに反映 (Codex Phase D P2 指摘: dirty が close_fullscreen
-        // でしか consume されないと、グリッドモードでクリックしても次の fs 開閉
-        // までグリッドが更新されない)。
+        // Ctrl+E が現在フォルダへ保存したファイル、および 📌 ボタン /
+        // グリッドコンテキストメニューで書き換えた代表サムネを、同フレーム内で
+        // グリッドに反映する。
         //
         // **fullscreen 中は consume しない**: load_folder は close_fullscreen を呼ぶため、
-        // fullscreen 中の右クリックメニューで pin → ここで即時 reload → fs が予期せず
-        // 閉じてしまう (Codex Phase D P2 再指摘)。fullscreen のときは close_fullscreen
-        // 自身が同じ helper を呼ぶ経路があるので、そちらに委ねる。
+        // export 完了 / 右クリックメニュー操作 → ここで即時 reload → fs が予期せず
+        // 閉じてしまう。fullscreen のときは一覧へ戻った次フレーム、または
+        // close_fullscreen 側の dirty 消費経路に委ねる。
         if self.fullscreen_idx.is_none() {
+            self.consume_export_folder_refresh_pending();
             self.consume_folder_thumb_pin_dirty();
         }
 

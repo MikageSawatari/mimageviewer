@@ -731,6 +731,7 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 - 出力形式は JPEG 95 / PNG / WebP。元形式が書き出し非対応の場合は `Settings::export_fallback_format` に従う。形式変換または PDF ではメタデータ保持は無効。
 - JPEG / PNG / WebP の同形式出力では、`Settings::export_embed_metadata` が有効なら元画像の EXIF / XMP / PNG text / WebP metadata を転記する。ZIP 内画像は worker がエントリバイトを読み、パスの無いメタデータ元として扱う。
 - 保存は `ctrl-e-export` worker で順次実行する。隠蔽プリセットの合成、画像エンコード、メタデータ転記、ファイル書き込みはいずれも worker 側で行い、UI は進捗モーダルを `try_recv` で更新する。キャンセルは次のエントリ開始前に反映され、処理中の 1 件は完了まで待つ。
+- 現在表示中の実フォルダへ保存した場合は、フルスクリーンを抜けて一覧へ戻ったタイミングでフォルダを再読み込みし、新しい出力ファイルのサムネイルを反映する。ZIP / PDF / 検索結果などの仮想フォルダでは自動再読み込みしない。
 
 ---
 
