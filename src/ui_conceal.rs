@@ -1418,6 +1418,10 @@ impl App {
         // ツールプレビュー (ドラッグ中)
         self.draw_conceal_tool_preview(ui, full_rect, zoom_pan);
 
+        // 選択ツール中は、最終マスクでは透明になる削除オブジェクトも編集対象として
+        // 見えるように全ベクタのアウトラインを表示する。
+        self.draw_conceal_shape_outlines(ui, full_rect, zoom_pan);
+
         // カーソルを Crosshair に。`draw_selected_handles` 内でハンドル上にホバー時のみ
         // 専用カーソル (Resize* / PointingHand) へ上書きする。順序を逆にしないこと
         // (Codex P2 #5: 旧版は Crosshair が後勝ちでハンドルカーソルが見えなかった)。
@@ -1508,6 +1512,37 @@ impl App {
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// 選択ツール中、全ベクタオブジェクトの存在を示す編集用アウトラインを描く。
+    ///
+    /// `Subtract` Shape は合成済みのマスク上では透明になるため、選択・編集のための
+    /// 補助表示として add/subtract を色分けした枠を別レイヤーに描く。
+    fn draw_conceal_shape_outlines(
+        &self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+    ) {
+        if self.conceal_preview_active
+            || self.conceal_tool != ConcealTool::Select
+            || self.conceal_shapes.is_empty()
+        {
+            return;
+        }
+        let Some((scale, _img_rect)) = self.conceal_image_layout(full_rect, zoom_pan) else {
+            return;
+        };
+
+        let painter = ui.painter().with_clip_rect(full_rect);
+        let to_screen = |p: (f32, f32)| self.conceal_image_to_screen(p, full_rect, zoom_pan);
+        for (idx, shape) in self.conceal_shapes.iter().enumerate() {
+            if Some(idx) == self.conceal_selected_shape {
+                continue;
+            }
+            let layout = vector_edit::compute_handle_layout(shape, scale);
+            vector_edit::draw_shape_outline(&painter, &layout, shape.op(), &to_screen);
         }
     }
 

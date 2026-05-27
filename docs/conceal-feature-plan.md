@@ -305,7 +305,10 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 | 楕円 | O | `Shape::Ellipse { center, rx, ry, rotation_rad }`、内接 bbox ドラッグで作成 | `Shape` vec |
 
 ベクタオブジェクト編集の挙動 (ハンドル方式、Ctrl/Shift/Alt 修飾子) は消しゴムと完全一致。
-コード差分を最小化することで、将来両ツールに同時に修正を入れる際のバグ機会が減る。
+選択ツール中は未選択 Shape も編集用アウトラインで表示し、`Add` と `Subtract` を色分けする。
+`Subtract` は合成済みマスクでは透明になるため、このアウトラインはクリック対象の存在を伝える
+補助表示として `vector_edit.rs` 側で共有する。コード差分を最小化することで、将来両ツールに
+同時に修正を入れる際のバグ機会が減る。
 
 ### 6.1 用途別の使い分け
 

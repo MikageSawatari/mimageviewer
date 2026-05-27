@@ -1565,6 +1565,8 @@ impl App {
         full_rect: egui::Rect,
         zoom_pan: Option<(f32, egui::Vec2)>,
     ) {
+        self.draw_shape_outlines(ui, full_rect, zoom_pan);
+
         // 選択中の Shape のハンドル (Phase 2b: vector_edit::draw_handles に委譲)
         if let Some(idx) = self.erase_selected_shape {
             if let Some(shape) = self.erase_shapes.get(idx) {
@@ -1714,6 +1716,37 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// 選択ツール中、全ベクタオブジェクトの存在を示す編集用アウトラインを描く。
+    ///
+    /// `Subtract` Shape は最終マスクでは透明になるため、マスクテクスチャだけでは
+    /// クリック対象が見えない。選択中 Shape は直後のハンドル描画に任せる。
+    fn draw_shape_outlines(
+        &self,
+        ui: &mut egui::Ui,
+        full_rect: egui::Rect,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+    ) {
+        if self.erase_preview_active
+            || self.erase_tool != EraseTool::Select
+            || self.erase_shapes.is_empty()
+        {
+            return;
+        }
+        let Some((scale, _img_rect)) = self.erase_image_layout(full_rect, zoom_pan) else {
+            return;
+        };
+
+        let painter = ui.painter().with_clip_rect(full_rect);
+        let to_screen = |p: (f32, f32)| self.image_to_screen(p.0, p.1, full_rect, zoom_pan);
+        for (idx, shape) in self.erase_shapes.iter().enumerate() {
+            if Some(idx) == self.erase_selected_shape {
+                continue;
+            }
+            let layout = vector_edit::compute_handle_layout(shape, scale);
+            vector_edit::draw_shape_outline(&painter, &layout, shape.op(), &to_screen);
         }
     }
 

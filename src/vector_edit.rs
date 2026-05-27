@@ -45,7 +45,7 @@
 
 use eframe::egui;
 
-use crate::mask_db::{Shape, rect_corners};
+use crate::mask_db::{Shape, ShapeOp, rect_corners};
 
 // ── 定数 ────────────────────────────────────────────────────────────────
 
@@ -1047,6 +1047,34 @@ pub fn draw_handles(
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160),
         );
     }
+}
+
+/// 選択ツールで未選択オブジェクトの存在を示すためのアウトラインを描画する。
+///
+/// 合成マスク上では `ShapeOp::Subtract` が透明になるため、編集レイヤーでは
+/// add/subtract を色分けした枠を別途描く。ハンドルは描かず、クリック対象の形だけを
+/// 示す用途に限定する。
+pub fn draw_shape_outline(
+    painter: &egui::Painter,
+    layout: &HandleLayout,
+    op: ShapeOp,
+    to_screen: &dyn Fn((f32, f32)) -> egui::Pos2,
+) {
+    let pts: Vec<egui::Pos2> = layout.body_corners.iter().map(|&p| to_screen(p)).collect();
+    if pts.len() < 3 {
+        return;
+    }
+
+    let color = match op {
+        ShapeOp::Add => egui::Color32::from_rgba_unmultiplied(255, 170, 90, 210),
+        ShapeOp::Subtract => egui::Color32::from_rgba_unmultiplied(80, 220, 255, 230),
+    };
+
+    painter.add(egui::Shape::closed_line(
+        pts.clone(),
+        egui::Stroke::new(3.5, egui::Color32::from_rgba_unmultiplied(0, 0, 0, 170)),
+    ));
+    painter.add(egui::Shape::closed_line(pts, egui::Stroke::new(1.5, color)));
 }
 
 // ── テスト ───────────────────────────────────────────────────────────────
