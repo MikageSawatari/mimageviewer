@@ -121,6 +121,7 @@ fn folder_move_restores_adjust_and_mask_from_sidecar() {
         &loaded_sidecar,
         Some(&env.adjust_db),
         Some(&env.mask_db),
+        None,
     );
 
     assert_eq!(stats.imported_adjust, 1);
@@ -158,6 +159,7 @@ fn central_db_is_authoritative_over_sidecar() {
         &loaded_sidecar,
         Some(&env.adjust_db),
         Some(&env.mask_db),
+        None,
     );
 
     assert_eq!(
@@ -190,6 +192,7 @@ fn zip_image_entry_roundtrip() {
         &loaded_sidecar,
         Some(&env.adjust_db),
         Some(&env.mask_db),
+        None,
     );
     assert_eq!(stats.imported_adjust, 1);
     assert_eq!(stats.imported_mask, 1);
@@ -224,6 +227,7 @@ fn pdf_page_entry_roundtrip() {
         &loaded_sidecar,
         Some(&env.adjust_db),
         Some(&env.mask_db),
+        None,
     );
     assert_eq!(stats.imported_adjust, 1);
 
@@ -249,6 +253,7 @@ fn missing_sidecar_is_noop() {
         &loaded_sidecar,
         Some(&env.adjust_db),
         Some(&env.mask_db),
+        None,
     );
     assert_eq!(stats.imported_adjust, 0);
     assert_eq!(stats.imported_mask, 0);
@@ -283,6 +288,7 @@ fn newer_version_sidecar_is_skipped() {
         &loaded_sidecar,
         Some(&env.adjust_db),
         Some(&env.mask_db),
+        None,
     );
     assert_eq!(stats.imported_adjust, 0);
 }
@@ -382,6 +388,7 @@ fn partial_overlap_imports_only_missing() {
         &loaded_sidecar,
         Some(&env.adjust_db),
         Some(&env.mask_db),
+        None,
     );
     assert_eq!(stats.imported_adjust, 1, "only b.jpg was missing");
     assert_eq!(stats.skipped_adjust, 1);

@@ -1220,6 +1220,20 @@ pub(crate) struct ConcealSnapshot {
     pub shapes: Vec<crate::mask_db::Shape>,
 }
 
+/// 隠蔽合成結果のキャッシュエントリ (Phase 4)。
+///
+/// `pixels` は合成済み RGBA、`texture` は GPU アップロード済みハンドル。
+/// `generation` は `App::conceal_generation` のスナップショットで、グローバル
+/// パラメータが変わったあと最初に lookup が走った時点で stale 判定される。
+pub(crate) struct ConcealCacheEntry {
+    /// 合成済み RGBA。Phase 5 の `Ctrl+E` エクスポートでこの pixels を JPEG/PNG/WebP に
+    /// 書き出すので、現状は描画パスでは未使用だが将来使う前提でフィールドを保持。
+    #[allow(dead_code)]
+    pub pixels: Arc<egui::ColorImage>,
+    pub texture: egui::TextureHandle,
+    pub generation: u64,
+}
+
 /// 見開きから消しゴムに入ったときのコンテキスト。Apply / Cancel で
 /// 元の見開き状態 (= `saved_mode` の spread_mode + `pair.0` を中心ページとした
 /// 見開き表示) を復元するために保存する。
@@ -2961,11 +2975,26 @@ pub struct App {
     /// 見開きから隠蔽加工に入ったときの状態スナップショット (消しゴムの `EraseSpreadCtx`
     /// と同型、Phase 2 で見開きハンドリング実装時に活用)。
     pub(crate) conceal_spread_ctx: Option<EraseSpreadCtx>,
-    /// バッジ判定: マスクが保存されているページの idx 集合 (Phase 4 で実装、
-    /// フォルダロード時に `conceal_db::load_conceal_keys` で hydrate する)。
-    /// Phase 1 では空のままで参照されない。
-    #[allow(dead_code)]
+    /// バッジ判定: マスクが保存されているページの idx 集合 (Phase 4 で活性化)。
+    /// フォルダロード時に `conceal_db::load_conceal_keys` で hydrate し、
+    /// `save_conceal_with_sidecar` / `delete_conceal_with_sidecar` で同期更新する。
+    /// 削除に伴う idx シフトは `remove_items_batch` で他の idx-keyed セットと一緒に処理。
     pub(crate) conceal_pages: std::collections::HashSet<usize>,
+
+    /// 隠蔽合成結果のキャッシュ (Phase 4)。`fs_cache` / `adjustment_cache` / `ai_upscale_cache`
+    /// よりも上位 = 表示パイプラインの最終段。entry の `generation` フィールドが
+    /// `conceal_generation` と一致しないと stale 扱い (lazy eviction、Codex P2 指摘)。
+    ///
+    /// **idx-keyed cache lifecycle** (`docs/conceal-feature-plan.md §9.2`):
+    /// `start_loading_items` / `remove_items_batch` / `replace_search_view_items` 等の
+    /// idx シフト・全 clear ポイントで mask_pages / adjustment_cache と並んで maintain
+    /// する。フォルダ A の conceal が フォルダ B の表示に漏れない (= privacy 事故防止)。
+    pub(crate) conceal_cache: std::collections::HashMap<usize, ConcealCacheEntry>,
+
+    /// 隠蔽グローバルパラメータの世代番号 (Phase 4)。タイプ / タイル倍率 / 境界モード /
+    /// 不透明度 / ぼかし半径などを変えるたびに `bump_conceal_generation` で +1 する。
+    /// `conceal_cache` の各 entry はこの値と照合され、不一致なら miss 扱い。
+    pub(crate) conceal_generation: u64,
 
     // ── フルスクリーン Ctrl+↑↓ ナビロック ─────────────────────────
     /// ナビ中の「次のページがまだ表示できない」ガード。`Some(gen)` の間は
@@ -3915,6 +3944,8 @@ impl App {
             conceal_shape_drag_end: None,
             conceal_spread_ctx: None,
             conceal_pages: std::collections::HashSet::new(),
+            conceal_cache: std::collections::HashMap::new(),
+            conceal_generation: 0,
             fs_nav_locked_gen: None,
             fs_holdover_tex: None,
             virtual_folder_writeback: None,
@@ -7741,6 +7772,7 @@ impl App {
         self.adjustment_dragging = false;
         self.adjustment_mode = false;
         self.mask_pages.clear();
+        self.conceal_pages.clear();
         // 360 度パノラマビュー: フォルダ変更で cache 全体が変わったので世代を一斉 bump
         // (§3.6.2.2)。adjustment_generation / ai_upscale_generation の HashMap
         // 自体はクリアしない (キーが残っていても次フォルダで同 source_key が
@@ -7814,6 +7846,21 @@ impl App {
                     if let Some(key) = self.page_path_key(idx) {
                         if mask_keys.contains(&key) {
                             self.mask_pages.insert(idx);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 隠蔽加工マスク: バッジ用に「マスクを持つページ」を集合化 (mask_db と同様)
+        if let Some(db) = &self.conceal_db {
+            let prefix = crate::adjustment_db::normalize_path(&source_path);
+            let conceal_keys = db.load_conceal_keys(&prefix);
+            if !conceal_keys.is_empty() {
+                for idx in 0..self.items.len() {
+                    if let Some(key) = self.page_path_key(idx) {
+                        if conceal_keys.contains(&key) {
+                            self.conceal_pages.insert(idx);
                         }
                     }
                 }
@@ -8712,6 +8759,7 @@ impl App {
         self.bump_all_ai_generations();
         self.erase_base_cache.clear();
         self.conceal_base_cache.clear();
+        self.conceal_cache.clear();
         self.original_preview_tex_cache.clear();
         self.fs_early_dims.clear();
         self.fs_cache.clear();
@@ -8805,13 +8853,18 @@ impl App {
             *filter = new_filter;
         }
 
-        // adjustment_page_params / mask_pages は DB 復元済みのユーザ設定なので
-        // clear せず idx shift で残存ページの分を保持する。
+        // adjustment_page_params / mask_pages / conceal_pages は DB 復元済みの
+        // ユーザ設定なので clear せず idx shift で残存ページの分を保持する。
         self.adjustment_page_params = std::mem::take(&mut self.adjustment_page_params)
             .into_iter()
             .filter_map(|(i, v)| shift(i).map(|ni| (ni, v)))
             .collect();
         self.mask_pages = self.mask_pages.iter().filter_map(|&i| shift(i)).collect();
+        self.conceal_pages = self
+            .conceal_pages
+            .iter()
+            .filter_map(|&i| shift(i))
+            .collect();
 
         // selected の詰め動作: `sel - count(removed idx < sel)` は残存 / 削除どちらの
         // ケースでも「old idx の位置に収まる新 idx」(= 繰り上がった次 item) を返す。
@@ -14261,6 +14314,7 @@ impl App {
             // 念のため inpaint 結果キャッシュを落として次回開いたときに再適用させる。
             self.erase_base_cache.remove(idx);
             self.conceal_base_cache.remove(idx);
+            self.conceal_cache.remove(idx);
             self.original_preview_tex_cache.remove(idx);
             self.fs_cache.remove(idx);
             self.save_mask_raw_with_sidecar(
@@ -15556,6 +15610,7 @@ impl App {
         self.reset_conceal_mode();
         self.erase_base_cache.clear();
         self.conceal_base_cache.clear();
+        self.conceal_cache.clear();
         self.original_preview_tex_cache.clear();
         for (cancel, _, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
@@ -16487,6 +16542,210 @@ impl App {
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_mask(rel));
     }
 
+    // ── 隠蔽加工マスクの永続化 (消しゴムと並列、Phase 4) ────────────────────
+    //
+    // パラメータ (タイプ・タイル倍率・境界モード・不透明度等) は settings 側に
+    // グローバルで保存されるため、ここで扱うのは「マスクの形」(ビットマップ + ベクタ)
+    // のみ。`conceal_db.set` / `conceal_db.delete` のラッパー + サイドカーミラー +
+    // バッジ集合 (`conceal_pages`) の同期更新を 1 箇所に集約する。
+
+    /// 隠蔽加工マスクを DB + サイドカーに保存する。`reset_conceal_mode` 終了時に呼ぶ。
+    /// ビットマップが全 false かつ shapes が空なら `delete_conceal_with_sidecar` に委譲する
+    /// (conceal_db.set の挙動と揃える)。
+    pub(crate) fn save_conceal_with_sidecar(
+        &mut self,
+        idx: usize,
+        mask: &[bool],
+        shapes: &[crate::mask_db::Shape],
+        w: usize,
+        h: usize,
+    ) {
+        let bitmap_empty = !mask.iter().any(|&m| m);
+        if bitmap_empty && shapes.is_empty() {
+            self.delete_conceal_with_sidecar(idx);
+            return;
+        }
+        // 圧縮とベクタ JSON 化を 1 回だけ行い、DB + サイドカーで共有
+        let compressed = crate::mask_db::compress_mask(mask);
+        let shapes_json = crate::mask_db::shapes_to_json(shapes);
+        self.save_conceal_raw_with_sidecar(idx, &compressed, shapes, shapes_json.as_deref(), w, h);
+    }
+
+    /// 既に deflate 済みのビットマップ + JSON 済みベクタを DB + サイドカーに書き込む。
+    /// `save_conceal_with_sidecar` の共通バックエンド (現在は単一 caller のみだが、
+    /// erase 側 `save_mask_raw_with_sidecar` と対称の形を維持して将来の一括適用に備える)。
+    fn save_conceal_raw_with_sidecar(
+        &mut self,
+        idx: usize,
+        compressed: &[u8],
+        shapes: &[crate::mask_db::Shape],
+        shapes_json: Option<&str>,
+        w: usize,
+        h: usize,
+    ) {
+        let key = match self.page_path_key(idx) {
+            Some(k) => k,
+            None => return,
+        };
+        if let Some(db) = &self.conceal_db {
+            let _ = db.set_raw(&key, compressed, shapes_json, w, h);
+        }
+        self.conceal_pages.insert(idx);
+        let sidecar_conceal =
+            crate::sidecar::SidecarMask::from_raw(compressed, shapes, w as u32, h as u32);
+        self.with_sidecar_mut(idx, move |sc, rel| sc.set_conceal(rel, sidecar_conceal));
+    }
+
+    /// 隠蔽加工マスクを DB + サイドカーから削除する。「マスク全削除」ボタン用 +
+    /// `save_conceal_with_sidecar` の空マスク経路から呼ばれる。
+    pub(crate) fn delete_conceal_with_sidecar(&mut self, idx: usize) {
+        let key = match self.page_path_key(idx) {
+            Some(k) => k,
+            None => return,
+        };
+        if let Some(db) = &self.conceal_db {
+            let _ = db.delete(&key);
+        }
+        self.conceal_pages.remove(&idx);
+        self.with_sidecar_mut(idx, |sc, rel| sc.remove_conceal(rel));
+    }
+
+    // ── conceal_cache の世代管理 + invalidate ヘルパー (Phase 4) ─────────────
+
+    /// 指定 idx の `conceal_cache` エントリを破棄する。マスク確定 / 削除のように
+    /// **その 1 ページだけ** 入力が変わった場合に呼ぶ。
+    pub(crate) fn clear_conceal_caches(&mut self, idx: usize) {
+        self.conceal_cache.remove(&idx);
+    }
+
+    /// 隠蔽グローバルパラメータが変わったことを世代番号で表現する (lazy eviction)。
+    /// 旧 entry は `generation` が古いままで残り、次に display pipeline がそれを
+    /// lookup したとき stale 判定で miss 扱いになる → 必要なものだけ再合成。
+    /// 大量の `Arc<ColorImage>` + GPU テクスチャを一括 drop するときに発生する
+    /// UI ヒッチを避けるための設計 (Codex P2、`docs/conceal-feature-plan.md §9.1`)。
+    pub(crate) fn bump_conceal_generation(&mut self) {
+        self.conceal_generation = self.conceal_generation.wrapping_add(1);
+    }
+
+    /// 表示パイプライン用: 該当 idx に隠蔽マスクが保存されていれば、現在の
+    /// グローバルパラメータでマスクを合成したテクスチャを返す。
+    ///
+    /// 戻り値:
+    /// - `Some(TextureHandle)`: 隠蔽が適用されたテクスチャ (描画はこれを使う)
+    /// - `None`: 該当 idx にマスクが無い / 隠蔽モード中 (= 編集オーバーレイ表示中で
+    ///   焼き込みは見せない) / 入力ピクセルが未取得 (= まだロード中)
+    ///
+    /// 優先順位は spec §3.1 に従い `adjustment_cache > ai_upscale_cache > fs_cache`。
+    /// 上位レイヤが更新されたら呼び出し側で `clear_conceal_caches(idx)` を呼ぶ必要が
+    /// ある (= AI 完了 / 色補正完了 / 消しゴム inpaint 完了 hook、Phase 4 進行中)。
+    ///
+    /// Phase 4 では Mosaic のみ実装済み (Phase 3a で `compose_mosaic` のみ)。
+    /// 他タイプ (Fill / Blur) は Phase 3b/3c で追加されるまで Mosaic にフォールバック。
+    pub(crate) fn ensure_conceal_texture(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        if self.conceal_mode {
+            return None;
+        }
+        if !self.conceal_pages.contains(&idx) {
+            return None;
+        }
+        let current_gen = self.conceal_generation;
+
+        // ヒット: generation 一致なら既存テクスチャをそのまま返す (高頻度パス)
+        if let Some(entry) = self.conceal_cache.get(&idx) {
+            if entry.generation == current_gen {
+                return Some(entry.texture.clone());
+            }
+        }
+
+        // 入力ピクセル取得: spec §3.1 の優先順位 (adj > ai > fs)。
+        // ai_upscale_cache は AI 機能が実効的に動いているときだけ参照する
+        // (= 設定 ON でもサイズ閾値超でスキップされる画像は旧キャッシュ残骸を
+        // 拾わない、`resolve_pano_source` と同じガード方針)。
+        let bg = self.effective_upscale_bg_mode();
+        let ai_effective = self.ai_will_apply_to(idx);
+        let source_pixels = if let Some(FsCacheEntry::Static { pixels, .. }) =
+            self.adjustment_cache.get(&idx)
+        {
+            Some(Arc::clone(pixels))
+        } else if ai_effective {
+            if let Some(FsCacheEntry::Static { pixels, .. }) = self.ai_upscale_cache.get(&(idx, bg))
+            {
+                Some(Arc::clone(pixels))
+            } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) {
+                Some(Arc::clone(pixels))
+            } else {
+                None
+            }
+        } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) {
+            Some(Arc::clone(pixels))
+        } else {
+            None
+        };
+        let source_pixels = source_pixels?;
+        let [w, h] = source_pixels.size;
+        if w == 0 || h == 0 {
+            return None;
+        }
+
+        // DB からマスク + Shape を取得
+        let key = self.page_path_key(idx)?;
+        let db = self.conceal_db.as_ref()?;
+        let (bitmap, shapes) = match db.get_full(&key, w, h) {
+            Some(v) => v,
+            None => {
+                // バッジ集合に居るが DB に実体が無い (race / 外部削除など)。
+                // 集合からも外して以降の試行を止める。
+                self.conceal_pages.remove(&idx);
+                return None;
+            }
+        };
+        if !bitmap.iter().any(|&b| b) && shapes.is_empty() {
+            // 実質空マスク。バッジから外す。
+            self.conceal_pages.remove(&idx);
+            return None;
+        }
+
+        // ビットマップ + Shape をラスタライズしてマスク確定
+        let mut composite = bitmap;
+        crate::mask_db::rasterize_shapes_into(&mut composite, &shapes, w, h);
+
+        // タイプ別合成。Phase 3a 時点で Mosaic のみ実装、他は Mosaic にフォールバック
+        // (Phase 3b/3c で `compose_solid_fill` / `compose_blur` を追加した時点で
+        // ここを match で分岐させる)。
+        let composed = {
+            let long_edge = w.max(h) as u32;
+            let tile = crate::conceal::compute_tile_size(
+                long_edge,
+                self.settings.conceal_mosaic_tile_mode,
+            );
+            crate::conceal_compose::compose_mosaic(
+                source_pixels.as_ref(),
+                &composite,
+                tile,
+                self.settings.conceal_mosaic_boundary,
+            )
+        };
+
+        let tex = ctx.load_texture(
+            format!("conceal_{idx}_g{current_gen}"),
+            composed.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        self.conceal_cache.insert(
+            idx,
+            ConcealCacheEntry {
+                pixels: Arc::new(composed),
+                texture: tex.clone(),
+                generation: current_gen,
+            },
+        );
+        Some(tex)
+    }
+
     /// サイドカーからまだ DB に無いエントリを取り込み、両 DB を更新する。
     /// フォルダ丸ごと移動で中央 DB のパスキーが無効化された場合の復旧経路。
     /// サイドカー自体はメモリに残し、以降の書き込みミラーに使う。
@@ -16572,12 +16831,14 @@ impl App {
                 sidecar,
                 self.adjustment_db.as_ref(),
                 self.mask_db.as_ref(),
+                self.conceal_db.as_ref(),
             );
-            if stats.imported_adjust > 0 || stats.imported_mask > 0 {
+            if stats.imported_adjust > 0 || stats.imported_mask > 0 || stats.imported_conceal > 0 {
                 crate::logger::log(format!(
-                    "sidecar: imported {} adjust + {} mask entries from {}",
+                    "sidecar: imported {} adjust + {} mask + {} conceal entries from {}",
                     stats.imported_adjust,
                     stats.imported_mask,
+                    stats.imported_conceal,
                     sidecar_folder.display()
                 ));
             }
@@ -17364,6 +17625,9 @@ impl App {
         self.thumb_adjust_tex.remove(&idx);
         // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
         self.bump_adjustment_generation(idx);
+        // 隠蔽合成: 上位レイヤ (adj) の入力が変わったので、`conceal_cache[idx]` も
+        // stale 扱いにする (`docs/conceal-feature-plan.md §9` 表)。
+        self.clear_conceal_caches(idx);
     }
 
     /// フルスクリーン補正キャッシュとサムネ補正テクスチャを同時に全クリアする。
@@ -17378,6 +17642,8 @@ impl App {
         self.compare_wipe_dragging = false;
         // 360 度パノラマビュー: バルク clear に追随して全 entry を bump (§3.6.2.2)。
         self.bump_all_adjustment_generations();
+        // 隠蔽合成: バルク色補正変更で全ページ入力が変わるため世代 bump して全 stale 化。
+        self.bump_conceal_generation();
     }
 
     /// サムネイル補正を同期適用する (色調のみ、post_filter は対象外)。
@@ -23383,6 +23649,7 @@ pub(crate) fn draw_cell(
     is_checked: bool,
     has_page_override: bool, // true なら左上に補正済みバッジ「補」を表示
     has_mask: bool,          // true なら左上に消しゴムマスクバッジ「消」を表示
+    has_conceal: bool,       // true なら左上に隠蔽加工マスクバッジ「隠」を表示 (Phase 4)
     rating: u8,              // 0 = 非表示, 1-5 = ★バッジ
     item: &GridItem,
     thumb: &ThumbnailState,
@@ -23829,6 +24096,14 @@ pub(crate) fn draw_cell(
             draw_single_char_badge(
                 "消",
                 egui::Color32::from_rgb(200, 80, 40),
+                egui::Color32::WHITE,
+            );
+        }
+        if has_conceal {
+            // 隠蔽加工バッジ: 紫系 (補=青 / 消=オレンジと区別、`docs/conceal-feature-plan.md §12`)
+            draw_single_char_badge(
+                "隠",
+                egui::Color32::from_rgb(153, 102, 204),
                 egui::Color32::WHITE,
             );
         }

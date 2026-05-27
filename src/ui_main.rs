@@ -2345,6 +2345,7 @@ impl App {
                                 let has_page_override =
                                     self.adjustment_page_params.contains_key(&idx);
                                 let has_mask = self.mask_pages.contains(&idx);
+                                let has_conceal = self.conceal_pages.contains(&idx);
                                 let rating = self.get_rating(idx);
                                 // 可視セルは同期適用 (~3ms/枚)。先読み分は背後の
                                 // process_thumb_adjust_budget が逐次処理する。
@@ -2390,6 +2391,7 @@ impl App {
                                     self.checked.contains(&idx),
                                     has_page_override,
                                     has_mask,
+                                    has_conceal,
                                     rating,
                                     &self.items[idx],
                                     &self.thumbnails[idx],

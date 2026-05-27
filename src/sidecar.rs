@@ -63,11 +63,16 @@ pub struct SidecarEntry {
     pub adjust: Option<AdjustParams>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask: Option<SidecarMask>,
+    /// 隠蔽加工マスク (Phase 4 で追加)。`mask` (消しゴム) と並列のサブシステム。
+    /// 形式は `SidecarMask` と同一 (1bit/pixel + deflate + base64 + Shape ベクタ群) で、
+    /// 用途が異なるだけ。両者を 1 ファイルに同居させても容量影響は小さい。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conceal: Option<SidecarMask>,
 }
 
 impl SidecarEntry {
     fn is_empty(&self) -> bool {
-        self.adjust.is_none() && self.mask.is_none()
+        self.adjust.is_none() && self.mask.is_none() && self.conceal.is_none()
     }
 }
 
@@ -216,6 +221,26 @@ impl SidecarFile {
         if let Some(entry) = self.items.get_mut(rel_key) {
             if entry.mask.is_some() {
                 entry.mask = None;
+                if entry.is_empty() {
+                    self.items.remove(rel_key);
+                }
+                self.mark_dirty();
+            }
+        }
+    }
+
+    /// 隠蔽加工マスクをセットする (Phase 4)。形式は `SidecarMask` と共通。
+    pub fn set_conceal(&mut self, rel_key: &str, conceal: SidecarMask) {
+        let entry = self.items.entry(rel_key.to_string()).or_default();
+        entry.conceal = Some(conceal);
+        self.mark_dirty();
+    }
+
+    /// 隠蔽加工マスクを取り除く (Phase 4)。
+    pub fn remove_conceal(&mut self, rel_key: &str) {
+        if let Some(entry) = self.items.get_mut(rel_key) {
+            if entry.conceal.is_some() {
+                entry.conceal = None;
                 if entry.is_empty() {
                     self.items.remove(rel_key);
                 }
@@ -385,21 +410,24 @@ pub fn classify_rel_key(rel_key: &str) -> RelKeyKind {
 pub struct ImportStats {
     pub imported_adjust: usize,
     pub imported_mask: usize,
+    pub imported_conceal: usize,
     pub skipped_adjust: usize,
     pub skipped_mask: usize,
+    pub skipped_conceal: usize,
 }
 
 /// サイドカーの各エントリを中央 DB へインポートする (純粋関数、テスト用に App から分離)。
 ///
 /// 中央 DB に既にエントリがあるものは **上書きしない** (中央が authoritative)。
-/// `adjust_db` / `mask_db` に None を渡した場合、その DB 種別へのインポートはスキップ。
-/// `folder` はサイドカーファイルが置かれているフォルダの絶対パス。
+/// `adjust_db` / `mask_db` / `conceal_db` に None を渡した場合、その DB 種別へのインポートは
+/// スキップ。`folder` はサイドカーファイルが置かれているフォルダの絶対パス。
 /// 絶対 DB キーの再構成は [`reconstruct_image_key`] / [`reconstruct_virtual_key`] に従う。
 pub fn import_to_dbs(
     folder: &Path,
     sidecar: &SidecarFile,
     adjust_db: Option<&crate::adjustment_db::AdjustmentDb>,
     mask_db: Option<&crate::mask_db::MaskDb>,
+    conceal_db: Option<&crate::conceal_db::ConcealDb>,
 ) -> ImportStats {
     let mut stats = ImportStats::default();
     for (rel_key, entry) in sidecar.items() {
@@ -426,21 +454,40 @@ pub fn import_to_dbs(
         if let (Some(db), Some(mask)) = (mask_db, &entry.mask) {
             let w = mask.w as usize;
             let h = mask.h as usize;
-            if w == 0 || h == 0 {
-                continue;
-            }
-            if db.get(&abs_key, w, h).is_none() {
-                if let Some(raw) = mask.decode() {
-                    let vectors_json = crate::mask_db::shapes_to_json(&mask.vectors);
-                    if db
-                        .set_raw(&abs_key, &raw, vectors_json.as_deref(), w, h)
-                        .is_ok()
-                    {
-                        stats.imported_mask += 1;
+            if w > 0 && h > 0 {
+                if db.get(&abs_key, w, h).is_none() {
+                    if let Some(raw) = mask.decode() {
+                        let vectors_json = crate::mask_db::shapes_to_json(&mask.vectors);
+                        if db
+                            .set_raw(&abs_key, &raw, vectors_json.as_deref(), w, h)
+                            .is_ok()
+                        {
+                            stats.imported_mask += 1;
+                        }
                     }
+                } else {
+                    stats.skipped_mask += 1;
                 }
-            } else {
-                stats.skipped_mask += 1;
+            }
+        }
+
+        if let (Some(db), Some(conceal)) = (conceal_db, &entry.conceal) {
+            let w = conceal.w as usize;
+            let h = conceal.h as usize;
+            if w > 0 && h > 0 {
+                if db.get_full(&abs_key, w, h).is_none() {
+                    if let Some(raw) = conceal.decode() {
+                        let shapes_json = crate::mask_db::shapes_to_json(&conceal.vectors);
+                        if db
+                            .set_raw(&abs_key, &raw, shapes_json.as_deref(), w, h)
+                            .is_ok()
+                        {
+                            stats.imported_conceal += 1;
+                        }
+                    }
+                } else {
+                    stats.skipped_conceal += 1;
+                }
             }
         }
     }
@@ -532,6 +579,58 @@ mod tests {
         assert_eq!(s.items().len(), 1, "mask still present");
         s.remove_mask("img.jpg");
         assert!(s.items().is_empty(), "entry dropped when both gone");
+    }
+
+    #[test]
+    fn entry_empty_after_removing_all_three_kinds() {
+        // Phase 4: adjust / mask / conceal の 3 種類すべてに対する is_empty 連動
+        let mut s = SidecarFile::new(PathBuf::from("C:/tmp/nonexistent"));
+        s.set_adjust("img.jpg", sample_params());
+        s.set_mask(
+            "img.jpg",
+            SidecarMask {
+                w: 2,
+                h: 2,
+                data: String::new(),
+                vectors: Vec::new(),
+            },
+        );
+        s.set_conceal(
+            "img.jpg",
+            SidecarMask {
+                w: 4,
+                h: 4,
+                data: String::from("xxxx"),
+                vectors: Vec::new(),
+            },
+        );
+        assert_eq!(s.items().len(), 1);
+        s.remove_adjust("img.jpg");
+        assert_eq!(s.items().len(), 1, "mask + conceal still present");
+        s.remove_mask("img.jpg");
+        assert_eq!(s.items().len(), 1, "conceal still present");
+        s.remove_conceal("img.jpg");
+        assert!(s.items().is_empty(), "entry dropped when all three gone");
+    }
+
+    #[test]
+    fn set_conceal_is_independent_of_mask() {
+        // Phase 4: mask と conceal は別フィールドなので、片方だけセットされた状態を
+        // ラウンドトリップしても干渉しない (= mask が空でも conceal は保持される)
+        let mut s = SidecarFile::new(PathBuf::from("C:/tmp/nonexistent"));
+        s.set_conceal(
+            "img.jpg",
+            SidecarMask {
+                w: 8,
+                h: 8,
+                data: String::from("zzzz"),
+                vectors: Vec::new(),
+            },
+        );
+        let entry = s.items().get("img.jpg").unwrap();
+        assert!(entry.mask.is_none());
+        assert!(entry.conceal.is_some());
+        assert_eq!(entry.conceal.as_ref().unwrap().w, 8);
     }
 
     #[test]

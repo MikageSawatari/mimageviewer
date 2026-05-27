@@ -158,12 +158,31 @@ impl App {
 
     /// 隠蔽加工モードを終了する (Esc / Ctrl+M 再押下)。
     ///
-    /// Phase 2 では DB への保存は実装しない (Phase 4 で永続化フローを完成させる)。
-    /// 当面は in-memory のマスクを破棄するだけ。次に [`enter_conceal_mode`] したときに
-    /// 再度 `conceal_db::get_full` から hydrate される (= DB に書いていなければ空マスク)。
+    /// Phase 4 から: 現在ページの編集中マスク (ビットマップ + Shape) を
+    /// `conceal_db` + サイドカーに保存する。空マスクなら DB エントリを削除し
+    /// `conceal_pages` バッジ集合からも除外する (`save_conceal_with_sidecar` の
+    /// 空マスク経路に揃える)。表示パイプライン側の `conceal_cache` は次回の
+    /// composite で自然に再生成されるため、ここでは触らない。
     pub(crate) fn reset_conceal_mode(&mut self) {
         let restore_idx = self.fullscreen_idx;
         let was_conceal_mode = self.conceal_mode;
+
+        // DB / サイドカー書き込みは state mutation の前に行う (page_path_key は
+        // fullscreen_idx を必要とするため、`conceal_mode = false` 後でも値は残るが
+        // 順序保証のためここで実施する)。
+        if was_conceal_mode {
+            if let Some(idx) = self.fullscreen_idx {
+                let [w, h] = self.conceal_mask_size;
+                if let Some(mask) = self.conceal_mask.clone() {
+                    let shapes = self.conceal_shapes.clone();
+                    self.save_conceal_with_sidecar(idx, &mask, &shapes, w, h);
+                }
+                // 編集中のマスクが新しい形状になったので、`conceal_cache[idx]` を
+                // 破棄して退場後の最初の表示パスで再合成させる (Phase 4)。
+                self.clear_conceal_caches(idx);
+            }
+        }
+
         self.conceal_mode = false;
 
         if was_conceal_mode {
@@ -240,6 +259,134 @@ impl App {
         } else {
             false
         }
+    }
+
+    // ── マスクスロット (差分画像生成サポート、消しゴム save_mask_to_slot と対称) ──
+
+    /// 現在のマスク (ビットマップ + Shape) をスロットに保存する。
+    /// スロット番号は 1 か 2 (`conceal_db::slot_key` 経由で `__slot_N` キーへ)。
+    pub(crate) fn save_conceal_mask_to_slot(&mut self, slot: usize) {
+        let [w, h] = self.conceal_mask_size;
+        let saved = if let (Some(mask), Some(db)) = (&self.conceal_mask, &self.conceal_db) {
+            db.set_slot(slot, mask, &self.conceal_shapes, w, h).is_ok()
+        } else {
+            false
+        };
+        if saved {
+            self.show_feedback_toast(format!("[隠蔽スロット{}に保存]", slot));
+        } else {
+            self.show_feedback_toast(format!("[隠蔽スロット{}保存失敗]", slot));
+        }
+    }
+
+    /// スロットからマスクをロードし、現在のマスクを **差し替える** (消しゴムと同じ仕様)。
+    /// 直前の状態は Ctrl+Z で戻せるので、取り違えロードを安全に巻き戻せる。
+    pub(crate) fn load_conceal_mask_from_slot(&mut self, slot: usize) {
+        let [w, h] = self.conceal_mask_size;
+        let slot_data = self
+            .conceal_db
+            .as_ref()
+            .and_then(|db| db.get_slot_full(slot, w, h));
+        let Some((slot_mask, slot_shapes)) = slot_data else {
+            self.show_feedback_toast(format!("[隠蔽スロット{}は空です]", slot));
+            return;
+        };
+        if !slot_mask.iter().any(|&m| m) && slot_shapes.is_empty() {
+            self.show_feedback_toast(format!("[隠蔽スロット{}は空です]", slot));
+            return;
+        }
+        self.push_conceal_undo();
+        self.conceal_mask = Some(slot_mask);
+        self.conceal_shapes = slot_shapes;
+        self.conceal_selected_shape = None;
+        self.conceal_mask_texture = None;
+        self.show_feedback_toast(format!("[隠蔽スロット{}をロード]", slot));
+    }
+
+    // ── マスク全削除 (パネルボタンから呼ぶ) ──────────────────────────────
+
+    /// 現在ページの隠蔽マスクを全消去する (消しゴムの delete-all と対称)。
+    /// DB / サイドカーからも削除し、`conceal_pages` バッジ集合からも除外する。
+    /// `conceal_mode` 自体は維持 (= モードに留まり、そのまま続きの編集ができる)。
+    pub(crate) fn delete_all_conceal_mask(&mut self) {
+        let [w, h] = self.conceal_mask_size;
+        if w == 0 || h == 0 {
+            return;
+        }
+        self.push_conceal_undo();
+        self.conceal_mask = Some(vec![false; w * h]);
+        self.conceal_shapes.clear();
+        self.conceal_selected_shape = None;
+        self.conceal_drag = None;
+        self.conceal_mask_texture = None;
+        // 編集中の一時状態も破棄
+        self.conceal_last_paint_pos = None;
+        self.conceal_lasso_points.clear();
+        self.conceal_line_start = None;
+        self.conceal_line_end = None;
+        self.conceal_shape_drag_start = None;
+        self.conceal_shape_drag_end = None;
+        if let Some(idx) = self.fullscreen_idx {
+            self.delete_conceal_with_sidecar(idx);
+            // 表示パイプラインの該当 idx エントリは次フレームの compose で空マスク扱いに
+            // なるため、明示的な invalidate は不要 (compose_conceal_for_idx 側で
+            // composite_mask が空のとき bypass する)。
+            self.clear_conceal_caches(idx);
+        }
+    }
+
+    // ── パラメータプリセット (4 スロット、settings 永続化) ──────────────────
+
+    /// スロット番号 (0..4) のプリセットを現在の settings に適用する。
+    /// 隠蔽タイプとすべてのパラメータが一度に変わるため、`conceal_cache` の世代を
+    /// bump して全 idx を stale 扱いにする (次回 compose で再生成)。
+    pub(crate) fn apply_conceal_preset(&mut self, slot: usize) {
+        let Some(preset) = self.settings.conceal_presets.get(slot).cloned().flatten() else {
+            self.show_feedback_toast(format!("[プリセット{}は空]", slot + 1));
+            return;
+        };
+        self.settings.conceal_type = preset.conceal_type;
+        self.settings.conceal_mosaic_tile_mode = preset.mosaic_tile_mode;
+        self.settings.conceal_mosaic_boundary = preset.mosaic_boundary;
+        self.settings.conceal_fill_opacity_percent = preset.fill_opacity_percent;
+        self.settings.conceal_fill_edge = preset.fill_edge;
+        self.settings.conceal_blur_radius_px = preset.blur_radius_px;
+        self.settings.conceal_blur_mode = preset.blur_mode;
+        self.settings.conceal_blur_feather = preset.blur_feather;
+        self.bump_conceal_generation();
+        let label = if preset.name.is_empty() {
+            format!("プリセット{}", slot + 1)
+        } else {
+            preset.name.clone()
+        };
+        self.show_feedback_toast(format!("[適用: {}]", label));
+    }
+
+    /// 現在の settings をスロット番号 (0..4) に保存する。既存名は保持。
+    pub(crate) fn save_conceal_preset_to_slot(&mut self, slot: usize) {
+        if slot >= 4 {
+            return;
+        }
+        let prev_name = self
+            .settings
+            .conceal_presets
+            .get(slot)
+            .and_then(|p| p.as_ref())
+            .map(|p| p.name.clone())
+            .unwrap_or_default();
+        let preset = crate::conceal::ConcealPreset {
+            name: prev_name,
+            conceal_type: self.settings.conceal_type,
+            mosaic_tile_mode: self.settings.conceal_mosaic_tile_mode,
+            mosaic_boundary: self.settings.conceal_mosaic_boundary,
+            fill_opacity_percent: self.settings.conceal_fill_opacity_percent,
+            fill_edge: self.settings.conceal_fill_edge,
+            blur_radius_px: self.settings.conceal_blur_radius_px,
+            blur_mode: self.settings.conceal_blur_mode,
+            blur_feather: self.settings.conceal_blur_feather,
+        };
+        self.settings.conceal_presets[slot] = Some(preset);
+        self.show_feedback_toast(format!("[プリセット{}に保存]", slot + 1));
     }
 
     // ── キー入力 ────────────────────────────────────────────────────
@@ -387,13 +534,43 @@ impl App {
             self.show_feedback_toast("[消去モード]".to_string());
         }
 
+        // T: 隠蔽タイプを順次切替 (Mosaic → WhiteFill → BlackFill → Blur → Mosaic …)。
+        // タイプ変更はグローバルパラメータの変更なので世代を bump。
+        let key_t = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::T));
+        if key_t {
+            let next = self.settings.conceal_type.next();
+            self.settings.conceal_type = next;
+            self.bump_conceal_generation();
+            self.show_feedback_toast(format!("[処理: {}]", next.label()));
+        }
+
+        // 1/2/3/4: プリセット適用 (modifier なし)。consume_key の結果を一旦ローカル
+        // 変数に集めてから input_mut の借用を解放したあと `apply_conceal_preset` を呼ぶ
+        // (self mut + input mut の同時借用を避ける)。
+        let mut preset_slot: Option<usize> = None;
+        ctx.input_mut(|i| {
+            for (k, slot) in [
+                (egui::Key::Num1, 0usize),
+                (egui::Key::Num2, 1),
+                (egui::Key::Num3, 2),
+                (egui::Key::Num4, 3),
+            ] {
+                if i.consume_key(egui::Modifiers::NONE, k) {
+                    preset_slot = Some(slot);
+                }
+            }
+        });
+        if let Some(slot) = preset_slot {
+            self.apply_conceal_preset(slot);
+        }
+
         // 未使用キーを消費してフルスクリーン共通ショートカットの動作を抑止する
+        // (T / Num1..4 は上で処理済みなのでここには含めない)。
         const SINGLE_KEYS: &[egui::Key] = &[
             egui::Key::Space,
             egui::Key::Tab,
             egui::Key::G,
             egui::Key::P,
-            egui::Key::T,
             egui::Key::U,
             egui::Key::N,
             egui::Key::Z,
@@ -1283,13 +1460,210 @@ impl App {
                             _ => {}
                         }
 
+                        // ── 隠蔽タイプ + パラメータ (Phase 4) ─────────────────
+                        ui.separator();
+                        ui.label("処理タイプ:");
+                        let mut type_changed = false;
+                        let mut new_type = self.settings.conceal_type;
+                        ui.horizontal(|ui| {
+                            for t in [
+                                crate::conceal::ConcealType::Mosaic,
+                                crate::conceal::ConcealType::WhiteFill,
+                            ] {
+                                if ui.selectable_label(new_type == t, t.label()).clicked() {
+                                    new_type = t;
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            for t in [
+                                crate::conceal::ConcealType::BlackFill,
+                                crate::conceal::ConcealType::Blur,
+                            ] {
+                                if ui.selectable_label(new_type == t, t.label()).clicked() {
+                                    new_type = t;
+                                }
+                            }
+                        });
+                        if new_type != self.settings.conceal_type {
+                            self.settings.conceal_type = new_type;
+                            type_changed = true;
+                        }
+
+                        // Mosaic パラメータ (Phase 3a のみ実装、Fill/Blur は Phase 3b/3c)
+                        if matches!(
+                            self.settings.conceal_type,
+                            crate::conceal::ConcealType::Mosaic
+                        ) {
+                            ui.separator();
+                            ui.label("タイルサイズ:");
+                            let mut tile_mode = self.settings.conceal_mosaic_tile_mode;
+                            let mut tile_changed = false;
+                            let is_ratio =
+                                matches!(tile_mode, crate::conceal::TileSizeMode::LongEdgeRatio(_));
+                            ui.horizontal(|ui| {
+                                if ui.selectable_label(is_ratio, "長辺比率").clicked() && !is_ratio
+                                {
+                                    tile_mode = crate::conceal::TileSizeMode::LongEdgeRatio(1.0);
+                                    tile_changed = true;
+                                }
+                                if ui.selectable_label(!is_ratio, "固定 px").clicked() && is_ratio
+                                {
+                                    tile_mode = crate::conceal::TileSizeMode::FixedPx(16);
+                                    tile_changed = true;
+                                }
+                            });
+                            match tile_mode {
+                                crate::conceal::TileSizeMode::LongEdgeRatio(mut m) => {
+                                    let prev = m;
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut m,
+                                            crate::conceal::TILE_RATIO_MIN
+                                                ..=crate::conceal::TILE_RATIO_MAX,
+                                        )
+                                        .step_by(crate::conceal::TILE_RATIO_STEP as f64)
+                                        .text("倍率"),
+                                    );
+                                    if (m - prev).abs() > 1e-6 {
+                                        tile_mode = crate::conceal::TileSizeMode::LongEdgeRatio(m);
+                                        tile_changed = true;
+                                    }
+                                    let long_edge_u = w.max(h) as u32;
+                                    let tile_px =
+                                        crate::conceal::compute_tile_size(long_edge_u, tile_mode);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "= {}px @ {}px 長辺",
+                                            tile_px, long_edge_u
+                                        ))
+                                        .size(10.0)
+                                        .color(egui::Color32::from_gray(170)),
+                                    );
+                                }
+                                crate::conceal::TileSizeMode::FixedPx(mut px) => {
+                                    let prev = px;
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut px,
+                                            crate::conceal::TILE_FIXED_MIN
+                                                ..=crate::conceal::TILE_FIXED_MAX,
+                                        )
+                                        .text("px"),
+                                    );
+                                    if px != prev {
+                                        tile_mode = crate::conceal::TileSizeMode::FixedPx(px);
+                                        tile_changed = true;
+                                    }
+                                }
+                            }
+                            if tile_changed {
+                                self.settings.conceal_mosaic_tile_mode = tile_mode;
+                            }
+
+                            ui.label("境界処理:");
+                            let mut bnd = self.settings.conceal_mosaic_boundary;
+                            let mut bnd_changed = false;
+                            for b in [
+                                crate::conceal::MosaicBoundary::Opaque,
+                                crate::conceal::MosaicBoundary::Translucent,
+                                crate::conceal::MosaicBoundary::MaskShape,
+                            ] {
+                                let label = egui::RichText::new(b.process_description()).size(11.0);
+                                if ui.radio(bnd == b, label).clicked() {
+                                    bnd = b;
+                                    bnd_changed = true;
+                                }
+                            }
+                            if bnd_changed {
+                                self.settings.conceal_mosaic_boundary = bnd;
+                            }
+
+                            if tile_changed || bnd_changed || type_changed {
+                                self.bump_conceal_generation();
+                            }
+                        } else if type_changed {
+                            // Mosaic 以外でも type 切替なら世代 bump
+                            self.bump_conceal_generation();
+                            // Phase 3b/3c 実装待ち。一時的に Mosaic 合成にフォールバック
+                            // (ensure_conceal_texture が Mosaic 設定で合成する)。
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 180, 80),
+                                "※ このタイプは未実装 (Mosaic にフォールバック)",
+                            );
+                        } else if !matches!(
+                            self.settings.conceal_type,
+                            crate::conceal::ConcealType::Mosaic
+                        ) {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 180, 80),
+                                "※ このタイプは未実装 (Mosaic にフォールバック)",
+                            );
+                        }
+
+                        // ── プリセット 4 スロット (Phase 4) ───────────────────
+                        ui.separator();
+                        ui.label("プリセット (1-4 で適用):");
+                        for i in 0..4usize {
+                            ui.horizontal(|ui| {
+                                let label = match &self.settings.conceal_presets[i] {
+                                    Some(p) if !p.name.is_empty() => p.name.clone(),
+                                    Some(_) => format!("プリセット {}", i + 1),
+                                    None => format!("(空) {}", i + 1),
+                                };
+                                let has = self.settings.conceal_presets[i].is_some();
+                                if ui
+                                    .add_enabled(
+                                        has,
+                                        egui::Button::new(label).min_size(egui::vec2(120.0, 0.0)),
+                                    )
+                                    .clicked()
+                                {
+                                    self.apply_conceal_preset(i);
+                                }
+                                if ui.small_button("保存").clicked() {
+                                    self.save_conceal_preset_to_slot(i);
+                                }
+                            });
+                        }
+
+                        // ── マスクスロット (差分画像生成用、2 スロット) ──────
+                        ui.separator();
+                        ui.label("マスクスロット:");
+                        for slot in 1..=2usize {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("スロット {}", slot));
+                                if ui.small_button("保存").clicked() {
+                                    self.save_conceal_mask_to_slot(slot);
+                                }
+                                if ui.small_button("ロード").clicked() {
+                                    self.load_conceal_mask_from_slot(slot);
+                                }
+                            });
+                        }
+
+                        // ── マスク全削除 ───────────────────────────────────
+                        ui.separator();
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("マスク全削除").color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(120, 50, 50)),
+                            )
+                            .clicked()
+                        {
+                            self.delete_all_conceal_mask();
+                        }
+
                         ui.separator();
                         ui.label(
                             egui::RichText::new(
                                 "Shift+ハンドル: 軸拘束 / 等比 / 15°snap\n\
                                  Alt+ハンドル: 中心固定\n\
+                                 T: タイプ切替  1-4: プリセット適用\n\
                                  Ctrl+Z: 元に戻す  Delete: 選択削除\n\
-                                 Esc / Ctrl+M: 終了",
+                                 Esc / Ctrl+M: 終了 (DB 保存)",
                             )
                             .size(11.0)
                             .color(egui::Color32::from_gray(190)),
