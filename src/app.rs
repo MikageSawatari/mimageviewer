@@ -16742,12 +16742,24 @@ impl App {
         if self.conceal_mode && !self.conceal_preview_active {
             return None;
         }
-        if !self.conceal_pages.contains(&idx) {
+        // **編集中ページの判定**:
+        // - `conceal_mode && fullscreen_idx == Some(idx)` のとき、in-memory state
+        //   (`self.conceal_mask` + `self.conceal_shapes`) を使う。
+        // - DB は `reset_conceal_mode` でモード退出時にのみ保存されるため、
+        //   編集中は DB が stale で「描いたばかりの shape がプレビューに乗らない」
+        //   バグになる (実機 FB)。
+        // - `conceal_pages` バッジ集合に未登録 (= まだ DB に保存していないページ)
+        //   でも、編集中なら preview を出したいので、メンバー判定はこの後に分岐。
+        let editing_this_idx = self.conceal_mode && self.fullscreen_idx == Some(idx);
+        if !editing_this_idx && !self.conceal_pages.contains(&idx) {
             return None;
         }
         let current_gen = self.conceal_generation;
 
-        // ヒット: generation 一致なら既存テクスチャをそのまま返す (高頻度パス)
+        // ヒット: generation 一致なら既存テクスチャをそのまま返す (高頻度パス)。
+        // 編集中ページは前段で `clear_conceal_caches(idx)` を逐一呼ぶので、
+        // この hit が起きるのは編集していない他ページ or 編集中ページの「変更なし」
+        // 状態 (= 数フレーム同じ状態が続いたとき) のみ。
         if let Some(entry) = self.conceal_cache.get(&idx) {
             if entry.generation == current_gen {
                 return Some(entry.texture.clone());
@@ -16784,16 +16796,34 @@ impl App {
             return None;
         }
 
-        // DB からマスク + Shape を取得
-        let key = self.page_path_key(idx)?;
-        let db = self.conceal_db.as_ref()?;
-        let (bitmap, shapes) = match db.get_full(&key, w, h) {
-            Some(v) => v,
-            None => {
-                // バッジ集合に居るが DB に実体が無い (race / 外部削除など)。
-                // 集合からも外して以降の試行を止める。
-                self.conceal_pages.remove(&idx);
-                return None;
+        // マスク + Shape の取得元: 編集中ページは in-memory、それ以外は DB。
+        // 編集中の `self.conceal_mask_size` が source_pixels の `[w, h]` と
+        // 一致しないと bitmap が壊れるため、サイズ不一致時は DB からスケール後の
+        // データを取り直す。通常は `enter_conceal_mode` で size を合わせるので
+        // 一致するはず。
+        let (bitmap, shapes) = if editing_this_idx
+            && self.conceal_mask.is_some()
+            && self.conceal_mask_size == [w, h]
+        {
+            // in-memory state を直接使う (DB は最終保存時のみ)。
+            (
+                self.conceal_mask.as_ref().unwrap().clone(),
+                self.conceal_shapes.clone(),
+            )
+        } else {
+            // 他ページ or サイズ不一致時: DB から取得 (= モード退出時の状態)。
+            let key = self.page_path_key(idx)?;
+            let db = self.conceal_db.as_ref()?;
+            match db.get_full(&key, w, h) {
+                Some(v) => v,
+                None => {
+                    if !editing_this_idx {
+                        // バッジ集合に居るが DB に実体が無い (race / 外部削除など)。
+                        // 集合からも外して以降の試行を止める。
+                        self.conceal_pages.remove(&idx);
+                    }
+                    return None;
+                }
             }
         };
         if !bitmap.iter().any(|&b| b) && shapes.is_empty() {

@@ -535,7 +535,9 @@ impl App {
                 switched = Some(ConcealTool::Ellipse);
             }
         });
-        if let Some(tool) = switched {
+        if let Some(tool) = switched
+            && tool != self.conceal_tool
+        {
             self.conceal_tool = tool;
             self.conceal_drag = None;
             self.conceal_lasso_points.clear();
@@ -543,6 +545,10 @@ impl App {
             self.conceal_line_end = None;
             self.conceal_shape_drag_start = None;
             self.conceal_shape_drag_end = None;
+            // ツール切替時は選択も解除 (= 別ツールに移ったので前の shape の
+            // ハンドル編集は終了とみなす、Codex P1 対応)。
+            self.conceal_selected_shape = None;
+            self.conceal_mask_texture = None;
             self.show_feedback_toast(format!("[{}]", tool.label()));
         }
 
@@ -890,13 +896,29 @@ impl App {
             self.fs_pan_drag_start = None;
         }
 
-        // Select 以外のツール開始時に選択を解除
-        if self.conceal_tool != ConcealTool::Select
-            && self.conceal_drag.is_none()
-            && self.conceal_selected_shape.is_some()
-        {
-            self.conceal_selected_shape = None;
-            self.conceal_mask_texture = None;
+        // ⚠ 旧版は「Select 以外のツール開始時に選択を解除」していたが、これだと
+        // `commit_conceal_shape` で自動選択した直後のフレームで選択が消されて
+        // 「ハンドルが一瞬だけ出る」現象になっていた (Codex P1 / 実機 FB R3)。
+        //
+        // 新方針: 選択は ツール切替時 (`tool` enum 値が変わったとき) のみクリア。
+        // ツールを切り替えずに描き続けている間は、直近 shape の選択を保持して
+        // ハンドル操作 (= 太さ・サイズ・回転の微調整) を許可する。
+
+        // ── 共通ハンドル処理 (ツール非依存): 直近 shape のハンドルが操作中なら
+        //    そちらを優先処理して、新規 shape 作成側に流さない。
+        //
+        // - 既に conceal_drag があれば apply_drag で更新 → release で完了
+        // - 新規 press のとき、選択中 shape のハンドル (= Body 以外) なら
+        //   begin_drag を仕込んで return (= 通常ツール処理をスキップ)
+        if self.try_handle_active_drag_or_handle_hit(
+            primary_pressed,
+            primary_released,
+            pointer_pos,
+            full_rect,
+            zoom_pan,
+            modifiers,
+        ) {
+            return;
         }
 
         match self.conceal_tool {
@@ -951,6 +973,91 @@ impl App {
                 );
             }
         }
+    }
+
+    /// Select 以外のツールでも「直近の選択 shape のハンドル」を操作できるよう、
+    /// ツール dispatch の前に走らせる共通処理。
+    ///
+    /// 戻り値 `true` のときは呼び出し側で `return` して通常ツール処理を skip する:
+    /// - 既に `conceal_drag` が立っている (= 進行中のハンドル操作) → 更新して継続
+    /// - 新規 primary_pressed で選択中 shape の **ハンドル (= Body 以外)** に
+    ///   ヒットした → drag を仕込む
+    ///
+    /// 戻り値 `false` のときは通常ツール処理 (= 新規 shape 作成) に進む。
+    /// 選択中 shape の **Body 上クリック** はここでは消費せず、通常ツール側で
+    /// 新規 shape ドラッグ開始扱いになる (= 関係ない場所のクリックと同じ動作)。
+    fn try_handle_active_drag_or_handle_hit(
+        &mut self,
+        primary_pressed: bool,
+        primary_released: bool,
+        pointer_pos: Option<egui::Pos2>,
+        full_rect: egui::Rect,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+        modifiers: egui::Modifiers,
+    ) -> bool {
+        // ① 進行中のドラッグがあれば最優先で処理
+        if let Some(drag) = self.conceal_drag {
+            // ポインタが取れないと apply_drag は走らせない (落としてしまうので
+            // primary_released だけは検出して drag を片付ける)。
+            let img_pos_opt = pointer_pos.and_then(|p| {
+                self.conceal_image_layout(full_rect, zoom_pan)
+                    .map(|(scale, img_rect)| {
+                        (
+                            (p.x - img_rect.min.x) / scale,
+                            (p.y - img_rect.min.y) / scale,
+                        )
+                    })
+            });
+            if let Some(img_pos) = img_pos_opt {
+                let new_shape = vector_edit::apply_drag(&drag, img_pos, &modifiers);
+                let drag_idx = drag.idx();
+                if drag_idx < self.conceal_shapes.len() {
+                    self.conceal_shapes[drag_idx] = new_shape;
+                }
+            }
+            if primary_released {
+                self.conceal_drag = None;
+                self.conceal_mask_texture = None;
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.clear_conceal_caches(fs_idx);
+                }
+            }
+            return true;
+        }
+        // ② 新規 primary_pressed で、選択中 shape の handle (Body 以外) なら drag 開始
+        if !primary_pressed {
+            return false;
+        }
+        let Some(sel) = self.conceal_selected_shape else {
+            return false;
+        };
+        let Some(screen) = pointer_pos else {
+            return false;
+        };
+        let Some((scale, img_rect)) = self.conceal_image_layout(full_rect, zoom_pan) else {
+            return false;
+        };
+        let img_pos = (
+            (screen.x - img_rect.min.x) / scale,
+            (screen.y - img_rect.min.y) / scale,
+        );
+        let Some(shape) = self.conceal_shapes.get(sel).copied() else {
+            return false;
+        };
+        let layout = vector_edit::compute_handle_layout(&shape, scale);
+        let Some(target) = vector_edit::hit_test(&layout, img_pos, scale) else {
+            return false;
+        };
+        if matches!(target, vector_edit::HoverTarget::Body) {
+            // Body クリックは「選択 shape のハンドル操作」ではなく「関係ない場所」
+            // 扱い (= 新規 shape 作成へ流す)。これにより、ツール継続のまま重ねて
+            // shape を作る動作が壊れない。
+            return false;
+        }
+        self.push_conceal_undo();
+        self.conceal_drag = Some(vector_edit::begin_drag(target, sel, shape, img_pos));
+        self.conceal_mask_texture = None;
+        true
     }
 
     fn handle_select_tool(
@@ -1220,12 +1327,19 @@ impl App {
             // ワークフロー)。
             self.conceal_selected_shape = Some(self.conceal_shapes.len() - 1);
         } else {
-            // 消去: 重なる shape を削除し、ビットマップも shape 範囲で消す
+            // 消去: 重なる shape を削除し、ビットマップも shape 範囲で消す。
+            //
+            // ⚠ retain 条件は **`separated` を保持** (= 重ならない shape は残す)。
+            // 消しゴム側 (`ui_erase.rs::commit_erase_shape`) と同じ規則。
+            // 旧版は `!(separated)` で逆動作になっており、消去ツールが「重なる
+            // shape を残し、関係ない shape を削除する」状態だった (Codex P1 指摘)。
             let [w, h] = self.conceal_mask_size;
             let (cx_min, cy_min, cx_max, cy_max) = shape_bbox(&shape);
             self.conceal_shapes.retain(|s| {
                 let (sxmin, symin, sxmax, symax) = shape_bbox(s);
-                !(sxmax < cx_min || sxmin > cx_max || symax < cy_min || symin > cy_max)
+                let separated =
+                    sxmax < cx_min || sxmin > cx_max || symax < cy_min || symin > cy_max;
+                separated
             });
             if let Some(mask) = self.conceal_mask.as_mut() {
                 crate::mask_db::rasterize_shape_into(mask, &shape, w, h, false);
@@ -1665,6 +1779,9 @@ impl App {
                             self.conceal_line_end = None;
                             self.conceal_shape_drag_start = None;
                             self.conceal_shape_drag_end = None;
+                            // ツール切替時は選択もクリア (Codex P1 対応)。
+                            self.conceal_selected_shape = None;
+                            self.conceal_mask_texture = None;
                         }
 
                         // サイズスライダ (Brush は半径、Line 系は太さ)

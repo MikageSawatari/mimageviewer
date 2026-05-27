@@ -82,6 +82,9 @@ pub enum HoverTarget {
     EdgeMidpoint { idx: u8 },
     /// Rect / Ellipse の専用回転ハンドル (bbox 上辺中点から伸びる棒の先)。
     RotateHandle,
+    /// Line 専用の太さ調整ハンドル (中点の法線方向、片側のみ描画)。
+    /// ドラッグで「中点 → カーソル」の垂直距離 * 2 が新しい thickness になる。
+    LineThickness,
 }
 
 /// ドラッグ操作の状態。`apply_drag` で base からの増分を毎フレーム計算する。
@@ -121,6 +124,8 @@ pub enum DragState {
         center: (f32, f32),
         start_angle: f32,
     },
+    /// Line の太さ調整ハンドル。中点を基点に、カーソルの法線方向距離 * 2 が新太さ。
+    LineThickness { idx: usize, base: Shape },
 }
 
 impl DragState {
@@ -129,7 +134,8 @@ impl DragState {
             DragState::Pan { idx, .. }
             | DragState::Endpoint { idx, .. }
             | DragState::Resize { idx, .. }
-            | DragState::Rotate { idx, .. } => *idx,
+            | DragState::Rotate { idx, .. }
+            | DragState::LineThickness { idx, .. } => *idx,
         }
     }
 }
@@ -153,6 +159,9 @@ pub struct HandleLayout {
     /// Rect / Ellipse のみ: 回転ハンドル先端 (bbox 上辺中点から ROTATE_HANDLE_OFFSET_PX
     /// だけ画像座標で離れた点。`scale` で計算済み)。
     pub rotate_handle: Option<(f32, f32)>,
+    /// Line のみ: 太さ調整ハンドル位置 (中点法線方向、`thickness/2 + offset_img`
+    /// 離れた点)。片側のみ描画する。
+    pub line_thickness_handle: Option<(f32, f32)>,
 }
 
 // ── compute_handle_layout ────────────────────────────────────────────────
@@ -170,12 +179,18 @@ pub fn compute_handle_layout(shape: &Shape, scale: f32) -> HandleLayout {
         } => {
             // Line の本体は p0 → p1 を中心軸、太さ thickness の矩形帯。
             let body = line_corners(*p0, *p1, *thickness);
+            // 太さ調整ハンドル: 中点の法線方向、`thickness/2 + offset` 離れた点。
+            // offset は 12px / scale (= 線の縁から少し外側で、Body と被らない位置)。
+            let thickness_offset_img = 12.0 / scale;
+            let thickness_handle =
+                line_thickness_handle_pos(*p0, *p1, *thickness, thickness_offset_img);
             HandleLayout {
                 body_corners: body,
                 endpoints: Some([*p0, *p1]),
                 corners: None,
                 edge_midpoints: None,
                 rotate_handle: None,
+                line_thickness_handle: Some(thickness_handle),
             }
         }
         Shape::Rect {
@@ -193,6 +208,7 @@ pub fn compute_handle_layout(shape: &Shape, scale: f32) -> HandleLayout {
                 corners: Some(body),
                 edge_midpoints: Some(edges),
                 rotate_handle: Some(rotate),
+                line_thickness_handle: None,
             }
         }
         Shape::Ellipse {
@@ -211,9 +227,31 @@ pub fn compute_handle_layout(shape: &Shape, scale: f32) -> HandleLayout {
                 corners: Some(body),
                 edge_midpoints: Some(edges),
                 rotate_handle: Some(rotate),
+                line_thickness_handle: None,
             }
         }
     }
+}
+
+/// Line の太さ調整ハンドル位置を計算する。
+///
+/// 中点 (p0 + p1) / 2 から、線の法線方向 (= 反時計回り 90°) に
+/// `thickness / 2 + offset_img` だけ離れた点を返す。法線は線の長さで正規化済み。
+/// 片側のみ描画する (= 反対側に描くと密に重なる)。
+fn line_thickness_handle_pos(
+    p0: (f32, f32),
+    p1: (f32, f32),
+    thickness: f32,
+    offset_img: f32,
+) -> (f32, f32) {
+    let mid = ((p0.0 + p1.0) * 0.5, (p0.1 + p1.1) * 0.5);
+    let dx = p1.0 - p0.0;
+    let dy = p1.1 - p0.1;
+    let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+    let nx = -dy / len;
+    let ny = dx / len;
+    let dist = thickness * 0.5 + offset_img;
+    (mid.0 + nx * dist, mid.1 + ny * dist)
 }
 
 /// 中心軸 (p0 → p1) と太さから矩形帯の 4 隅を返す ([`crate::mask_db::LineObject::corners`] と同じ算法)。
@@ -313,7 +351,13 @@ pub fn hit_test(layout: &HandleLayout, pos: (f32, f32), scale: f32) -> Option<Ho
             return Some(HoverTarget::Endpoint { which_p1: true });
         }
     }
-    // 5. 本体
+    // 5. Line 太さ調整ハンドル (Body より優先、Endpoint より後)
+    if let Some(th) = layout.line_thickness_handle {
+        if dist_sq(pos, th) <= hit_r2 {
+            return Some(HoverTarget::LineThickness);
+        }
+    }
+    // 6. 本体
     if point_in_polygon(pos, &layout.body_corners) {
         return Some(HoverTarget::Body);
     }
@@ -363,6 +407,22 @@ pub fn cursor_icon_for(target: HoverTarget, shape: &Shape) -> egui::CursorIcon {
         HoverTarget::RotateHandle => egui::CursorIcon::PointingHand,
         HoverTarget::Corner { idx } => corner_cursor(idx, shape_rotation(shape)),
         HoverTarget::EdgeMidpoint { idx } => edge_cursor(idx, shape_rotation(shape)),
+        HoverTarget::LineThickness => {
+            // Line の法線方向にカーソルが動くと太さが変わる: 線の傾きに直交した
+            // リサイズアイコンを返す。Line の進行方向 (p0 → p1) の角度を見て、
+            // 水平に近ければ垂直リサイズ (NS)、垂直に近ければ水平リサイズ (EW)。
+            if let Shape::Line { p0, p1, .. } = shape {
+                let dx = p1.0 - p0.0;
+                let dy = p1.1 - p0.1;
+                if dx.abs() > dy.abs() {
+                    egui::CursorIcon::ResizeVertical
+                } else {
+                    egui::CursorIcon::ResizeHorizontal
+                }
+            } else {
+                egui::CursorIcon::ResizeVertical
+            }
+        }
     }
 }
 
@@ -487,6 +547,7 @@ pub fn begin_drag(target: HoverTarget, idx: usize, base: Shape, cur: (f32, f32))
                 anchor,
             }
         }
+        HoverTarget::LineThickness => DragState::LineThickness { idx, base },
     }
 }
 
@@ -574,7 +635,36 @@ pub fn apply_drag(state: &DragState, cur: (f32, f32), modifiers: &egui::Modifier
             start_angle,
             ..
         } => apply_rotate_drag(base, center, start_angle, cur, modifiers),
+        DragState::LineThickness { base, .. } => apply_line_thickness_drag(base, cur),
     }
+}
+
+/// Line の太さを「中点 → cur」の法線方向距離 * 2 で更新する。
+///
+/// Line 以外の Shape が渡されたら no-op (= 構造上発生しないはず、防御的に対応)。
+/// 最小太さは 1.0 (= 1 ピクセル相当)。
+fn apply_line_thickness_drag(base: Shape, cur: (f32, f32)) -> Shape {
+    let mut s = base;
+    if let Shape::Line {
+        p0,
+        p1,
+        ref mut thickness,
+        ..
+    } = s
+    {
+        let mid = ((p0.0 + p1.0) * 0.5, (p0.1 + p1.1) * 0.5);
+        let dx = p1.0 - p0.0;
+        let dy = p1.1 - p0.1;
+        let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+        let nx = -dy / len;
+        let ny = dx / len;
+        // cur と中点の差ベクトルを法線に投影 → 符号付きで距離
+        let to_cur = (cur.0 - mid.0, cur.1 - mid.1);
+        let perp = to_cur.0 * nx + to_cur.1 * ny;
+        // 太さ = 法線方向距離の絶対値 * 2 (= 線が中点を挟んで左右対称に広がる)
+        *thickness = (perp.abs() * 2.0).max(1.0);
+    }
+    s
 }
 
 fn apply_endpoint_drag(
@@ -829,6 +919,35 @@ pub fn draw_handles(
                 egui::Stroke::new(1.5, stroke_color),
             );
         }
+    }
+    // Line 太さ調整ハンドル: 中点から法線方向に伸びる短い線 + ◇ (菱形) ハンドル。
+    // ◇ は端点 / 角の ○ や 辺中点の □ と視覚的に区別する用途。
+    if let Some(th) = layout.line_thickness_handle {
+        let th_screen = to_screen(th);
+        let is_hovered = hovered == Some(HoverTarget::LineThickness);
+        let f = if is_hovered { hover_fill } else { fill };
+        // 中点を計算 (= 棒の根元)
+        if let Some(eps) = layout.endpoints {
+            let mid_img = ((eps[0].0 + eps[1].0) * 0.5, (eps[0].1 + eps[1].1) * 0.5);
+            let mid_screen = to_screen(mid_img);
+            painter.line_segment(
+                [mid_screen, th_screen],
+                egui::Stroke::new(1.5, stroke_color),
+            );
+        }
+        // 菱形 (= 45° 回転の正方形) で描画
+        let r = HANDLE_DRAW_RADIUS_PX;
+        let diamond = [
+            egui::pos2(th_screen.x, th_screen.y - r),
+            egui::pos2(th_screen.x + r, th_screen.y),
+            egui::pos2(th_screen.x, th_screen.y + r),
+            egui::pos2(th_screen.x - r, th_screen.y),
+        ];
+        painter.add(egui::Shape::convex_polygon(
+            diamond.to_vec(),
+            f,
+            egui::Stroke::new(1.5, stroke_color),
+        ));
     }
     // 角
     if let Some(cs) = layout.corners {

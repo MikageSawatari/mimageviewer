@@ -484,36 +484,28 @@ impl App {
         let key_r_tool = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R));
         let key_o_tool = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::O));
         if key_s_tool {
-            self.erase_tool = EraseTool::Select;
-            self.show_feedback_toast("[選択]".to_string());
+            self.switch_erase_tool(EraseTool::Select, "[選択]");
         }
         if key_b {
-            self.erase_tool = EraseTool::Brush;
-            self.show_feedback_toast("[筆]".to_string());
+            self.switch_erase_tool(EraseTool::Brush, "[筆]");
         }
         if key_l {
-            self.erase_tool = EraseTool::Lasso;
-            self.show_feedback_toast("[囲み]".to_string());
+            self.switch_erase_tool(EraseTool::Lasso, "[囲み]");
         }
         if key_v {
-            self.erase_tool = EraseTool::VertLine;
-            self.show_feedback_toast("[縦線]".to_string());
+            self.switch_erase_tool(EraseTool::VertLine, "[縦線]");
         }
         if key_h {
-            self.erase_tool = EraseTool::HorizLine;
-            self.show_feedback_toast("[横線]".to_string());
+            self.switch_erase_tool(EraseTool::HorizLine, "[横線]");
         }
         if key_i {
-            self.erase_tool = EraseTool::Line;
-            self.show_feedback_toast("[直線]".to_string());
+            self.switch_erase_tool(EraseTool::Line, "[直線]");
         }
         if key_r_tool {
-            self.erase_tool = EraseTool::Rect;
-            self.show_feedback_toast("[矩形]".to_string());
+            self.switch_erase_tool(EraseTool::Rect, "[矩形]");
         }
         if key_o_tool {
-            self.erase_tool = EraseTool::Ellipse;
-            self.show_feedback_toast("[楕円]".to_string());
+            self.switch_erase_tool(EraseTool::Ellipse, "[楕円]");
         }
 
         // D: 描画モード, F: 消去モード
@@ -811,6 +803,100 @@ impl App {
         None
     }
 
+    /// 消しゴムツールを切り替える共通ヘルパー。
+    /// 同じツールへの切替は no-op、別ツールへの切替時は選択をクリアして次の commit
+    /// で再選択させる。トーストも表示する。
+    fn switch_erase_tool(&mut self, tool: EraseTool, toast: &str) {
+        if self.erase_tool == tool {
+            return;
+        }
+        self.erase_tool = tool;
+        // ツール切替時は選択をクリア (= 別ツールに移ったので前 shape の編集を終了)
+        // (Codex P1 対応、実機 FB R3)。
+        self.erase_selected_shape = None;
+        self.erase_drag = None;
+        self.erase_mask_texture = None;
+        self.show_feedback_toast(toast.to_string());
+    }
+
+    /// Select 以外のツールでも「直近の選択 shape のハンドル」を操作できるよう、
+    /// ツール dispatch の前に走らせる共通処理 (隠蔽パネルと同じパターン)。
+    ///
+    /// 戻り値 `true` のときは呼び出し側で `return` して通常ツール処理を skip する:
+    /// - 既に `erase_drag` が立っている (= 進行中のハンドル操作) → 更新して継続
+    /// - 新規 primary_pressed で選択中 shape の **ハンドル (= Body 以外)** に
+    ///   ヒットした → drag を仕込む
+    ///
+    /// 戻り値 `false` のときは通常ツール処理 (= 新規 shape 作成) に進む。
+    fn try_handle_active_erase_drag_or_handle_hit(
+        &mut self,
+        primary_pressed: bool,
+        primary_released: bool,
+        pointer_pos: Option<egui::Pos2>,
+        full_rect: egui::Rect,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+        modifiers: egui::Modifiers,
+    ) -> bool {
+        // ① 進行中のドラッグがあれば最優先で処理
+        if let Some(drag) = self.erase_drag {
+            let img_pos_opt = pointer_pos.and_then(|p| {
+                self.erase_image_layout(full_rect, zoom_pan)
+                    .map(|(scale, img_rect)| {
+                        (
+                            (p.x - img_rect.min.x) / scale,
+                            (p.y - img_rect.min.y) / scale,
+                        )
+                    })
+            });
+            if let Some(img_pos) = img_pos_opt {
+                let new_shape = vector_edit::apply_drag(&drag, img_pos, &modifiers);
+                let drag_idx = drag.idx();
+                if drag_idx < self.erase_shapes.len() {
+                    self.erase_shapes[drag_idx] = new_shape;
+                }
+            }
+            if primary_released {
+                self.erase_drag = None;
+                self.erase_mask_texture = None;
+            }
+            return true;
+        }
+        // ② 新規 primary_pressed で、選択中 shape の handle (Body 以外) なら drag 開始
+        if !primary_pressed {
+            return false;
+        }
+        let Some(sel) = self.erase_selected_shape else {
+            return false;
+        };
+        let Some(screen) = pointer_pos else {
+            return false;
+        };
+        let Some((scale, img_rect)) = self.erase_image_layout(full_rect, zoom_pan) else {
+            return false;
+        };
+        let img_pos = (
+            (screen.x - img_rect.min.x) / scale,
+            (screen.y - img_rect.min.y) / scale,
+        );
+        let Some(shape) = self.erase_shapes.get(sel).copied() else {
+            return false;
+        };
+        let layout = vector_edit::compute_handle_layout(&shape, scale);
+        let Some(target) = vector_edit::hit_test(&layout, img_pos, scale) else {
+            return false;
+        };
+        if matches!(target, vector_edit::HoverTarget::Body) {
+            // Body クリックは「ハンドル操作」ではなく「関係ない場所」扱い (= 新規
+            // shape 作成へ流す)。これによりツール継続のまま重ねて shape を作る
+            // 動作が壊れない。
+            return false;
+        }
+        self.push_undo_snapshot();
+        self.erase_drag = Some(vector_edit::begin_drag(target, sel, shape, img_pos));
+        self.erase_mask_texture = None;
+        true
+    }
+
     /// vector_edit ベースのドラッグ更新。`erase_drag` (Option<DragState>) と現在位置から
     /// 新しい Shape を計算して `erase_shapes[idx]` に書き戻す。
     fn update_erase_drag(
@@ -850,12 +936,31 @@ impl App {
             full_rect.min.x + PANEL_MARGIN_X,
             full_rect.min.y + PANEL_MARGIN_Y,
         );
-        // 消しゴムパネルは egui::Frame::popup の auto-size になっており、
-        // 内容のセクション (見開き有無 / ツール別スライダー有無) で高さが変動する。
-        // `handle_erase_paint` の「カーソルがパネル上なら筆操作を skip」用の
-        // 判定 rect は、可視 Frame をすべて覆う generous な高さで十分。
-        // 隠蔽パネルと同じ 1000px の SINK 設計に合わせる。
-        let panel_h = ERASE_PANEL_SINK_H;
+        // ⚠ 注意: この rect は `handle_erase_paint` の「カーソルがパネル上なら
+        // 筆操作を skip」用 (= 実際の可視 Frame サイズに合わせる)。
+        //
+        // クリック吸収用の SINK (= ERASE_PANEL_SINK_H = 1000px) と混同しない。
+        // SINK は egui Area 内側で click を absorb するためのもので、Frame の外周
+        // 数十 px を覆う目的で大きく取っている。一方こちらは handle_erase_paint
+        // が「ツール操作を発生させない領域」を判定する rect なので、可視 Frame と
+        // 同じか少し大きい程度のサイズで十分。
+        //
+        // 旧 raw painter 版の見積もり (base_h=458 + Brush/Line slider=42 +
+        // spread=40 = 最大 ~540) を踏襲しつつ、auto-size でブレが出ても困らない
+        // よう少し余裕を持たせて 600。これより小さくするとパネルの下の方
+        // (= ヘルプテキスト周辺) で筆塗りが発火する可能性がある。
+        let base_h = 460.0;
+        let slider_extra = if matches!(self.erase_tool, EraseTool::Brush | EraseTool::Line) {
+            44.0
+        } else {
+            0.0
+        };
+        let spread_extra = if self.erase_spread_ctx.is_some() {
+            40.0
+        } else {
+            0.0
+        };
+        let panel_h = base_h + slider_extra + spread_extra;
         egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W, panel_h))
     }
 
@@ -966,10 +1071,24 @@ impl App {
             return;
         }
 
-        // 他ツールに切り替わったら選択を自動解除 (ドラッグ中は最後まで完走)
-        if self.erase_drag.is_none() && self.erase_selected_shape.is_some() {
-            self.erase_selected_shape = None;
-            self.erase_mask_texture = None;
+        // ⚠ 旧版は「他ツールに切り替わったら選択を自動解除」していたが、これだと
+        // `commit_erase_shape` で自動選択した直後のフレームで選択が消されて
+        // 「ハンドルが一瞬だけ出る」現象になっていた (Codex P1 / 実機 FB R3)。
+        //
+        // 新方針: 選択はツール enum 値が変わったときのみクリアする (= ツール切替
+        // ボタン / ショートカット押下のときに明示クリア)。ツール継続中は選択を保持。
+
+        // ── 共通ハンドル処理 (ツール非依存): 直近 shape のハンドルが操作中なら
+        //    そちらを優先処理して、新規 shape 作成側に流さない。
+        if self.try_handle_active_erase_drag_or_handle_hit(
+            primary_pressed,
+            primary_released,
+            pointer_pos,
+            full_rect,
+            zoom_pan,
+            modifiers,
+        ) {
+            return;
         }
 
         // マウスホイールによる筆/直線の太さ調整は handle_fs_wheel_and_click で処理済み。
@@ -1078,30 +1197,17 @@ impl App {
                 );
             }
             EraseTool::Line => {
+                // 旧 Ctrl+ドラッグ太さ変更モディファイヤは廃止 (実機 FB R3)。
+                // 線幅はパネル slider で設定し、引いた直後に自動選択される shape を
+                // S ツールでハンドル操作することで微調整する設計に統一する
+                // (= 矩形/楕円/縦線/横線と同じワークフロー)。
                 if primary_down {
                     if let Some(pos) = pointer_pos {
                         if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
                             if self.erase_line_start.is_none() {
                                 self.erase_line_start = Some(img_pos);
                             }
-                            if ctrl_held {
-                                // Ctrl+ドラッグ: カーソルから線への垂直距離で線幅を変更
-                                // 線 (erase_line_start → erase_line_end) は Ctrl 開始直前に確定済み
-                                if let (Some(start), Some(end)) =
-                                    (self.erase_line_start, self.erase_line_end)
-                                {
-                                    let dx = end.0 - start.0;
-                                    let dy = end.1 - start.1;
-                                    let len = (dx * dx + dy * dy).sqrt().max(1.0);
-                                    let vx = img_pos.0 - start.0;
-                                    let vy = img_pos.1 - start.1;
-                                    // 線の法線方向成分 (符号付き) の絶対値
-                                    let perp = (vx * dy - vy * dx).abs() / len;
-                                    self.erase_line_width = (perp * 2.0).max(1.0);
-                                }
-                            } else {
-                                self.erase_line_end = Some(img_pos);
-                            }
+                            self.erase_line_end = Some(img_pos);
                         }
                     }
                 }
@@ -1655,23 +1761,19 @@ impl App {
                         // パネル全体が広がり、右側が「スカスカ」に見えるため (実機 FB)。
                         ui.set_min_width(PANEL_W);
                         ui.set_max_width(PANEL_W);
-                        // ラベル / ボタンの文字を画像上で読めるよう WHITE に強制。
-                        // override_text_color は `ui.label(...)` のような非 widget 系に効く。
-                        // egui::Button / Slider 系の文字は widget visuals の fg_stroke.color
-                        // が使われるので、そちらも併せて WHITE で上書き (= 「保存」「数値表記」が
-                        // 灰色で読めない問題への対応、実機 FB)。
-                        ui.style_mut().visuals.override_text_color =
-                            Some(egui::Color32::WHITE);
-                        ui.style_mut().visuals.widgets.noninteractive.fg_stroke.color =
-                            egui::Color32::WHITE;
-                        ui.style_mut().visuals.widgets.inactive.fg_stroke.color =
-                            egui::Color32::WHITE;
-                        ui.style_mut().visuals.widgets.hovered.fg_stroke.color =
-                            egui::Color32::WHITE;
-                        ui.style_mut().visuals.widgets.active.fg_stroke.color =
-                            egui::Color32::WHITE;
-                        ui.style_mut().visuals.widgets.open.fg_stroke.color =
-                            egui::Color32::WHITE;
+                        // ⚠ 重要: テーマに依存せず常に DARK visuals を使う。
+                        //
+                        // 旧実装は `override_text_color = WHITE` + `widgets.*.fg_stroke.color
+                        // = WHITE` の組合せで強制していたが、ユーザーが OS / アプリで Light
+                        // テーマを選択していると、widget visuals の `weak_bg_fill` などが
+                        // 自動的に near-white になり、「白背景 + 白文字」で完全に読めなく
+                        // なる問題があった (実機 FB R3)。
+                        //
+                        // CLAUDE.md ポリシー (= フルスクリーン内は黒背景ベース統一) に従い、
+                        // 子 ui の visuals を `Visuals::dark()` に固定。ラベル文字を白くする
+                        // override_text_color はその後に上乗せ。
+                        *ui.visuals_mut() = egui::Visuals::dark();
+                        ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
 
                         // ── ヘッダ (タイトル + プレビュー + 閉じる × ボタン) ──
                         ui.horizontal(|ui| {
@@ -1828,7 +1930,10 @@ impl App {
                                     )
                                     .clicked()
                                     {
-                                        self.erase_tool = tool;
+                                        // 直接代入ではなく helper 経由で選択もクリアする
+                                        // (= ハンドルが一瞬出る現象を防ぐ、Codex P1 対応)。
+                                        let toast = format!("[{}]", label);
+                                        self.switch_erase_tool(tool, &toast);
                                     }
                                 }
                             });
@@ -1923,9 +2028,10 @@ impl App {
                         let help = "E:補完 ESC:終了/選択解除 Ctrl+Z:戻す\n\
                             矢印:シフト [/]:回転 (Ctrl:10倍)\n\
                             Space+ドラッグ:パン操作\n\
-                            Ctrl+ドラッグ: 筆/直線→太さ\n\
+                            Ctrl+ドラッグ: 筆→太さ\n\
                             \u{00A0}縦横線→パン/傾き 選択→回転/太さ\n\
-                            選択ツール+クリック=選択  Del:削除";
+                            選択ツール+クリック=選択  Del:削除\n\
+                            描画後はそのままハンドルで微調整可";
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(help)
@@ -1987,6 +2093,14 @@ impl App {
                         self.fs_cache.insert(fs_idx, entry);
                     }
                 }
+                // ⚠ 派生キャッシュ (adjustment_cache / conceal_cache /
+                // erase_base_tex_cache) を invalidate しないと、旧マスク+inpaint
+                // 結果が adjustment_cache に焼き込まれたままで「マスク全削除しても
+                // 前のマスクの結果が残っている」状態になる (実機 FB)。
+                // `invalidate_derived_fs_caches` で adjustment_cache /
+                // conceal_cache を破棄 + erase_base_tex_cache も明示的に削除。
+                self.invalidate_derived_fs_caches(fs_idx);
+                self.erase_base_tex_cache.remove(&fs_idx);
             }
         }
         if close_clicked {
