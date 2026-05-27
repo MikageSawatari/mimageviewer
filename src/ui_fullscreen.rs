@@ -629,7 +629,7 @@ impl App {
     }
 
     /// 右 Ctrl ホールド中だけ、mIV 側の派生表示 (補正 / AI / 消しゴム補完) を
-    /// 迂回して元画像テクスチャを選ぶ。
+    /// 迂回して raw decode の元画像テクスチャを選ぶ。
     ///
     /// フォーカスは `ctx.input(|i| i.viewport().focused)` ではなく
     /// `self.fs_prev_focused` で確認する: この関数の呼び出し元
@@ -658,28 +658,7 @@ impl App {
         )
     }
 
-    fn resolve_original_preview_tex(
-        &mut self,
-        ctx: &egui::Context,
-        idx: usize,
-    ) -> Option<egui::TextureHandle> {
-        if let Some(base) = self.erase_base_cache.get(&idx) {
-            let needs_upload = self
-                .original_preview_tex_cache
-                .get(&idx)
-                .map(|tex| tex.size() != base.size)
-                .unwrap_or(true);
-            if needs_upload {
-                let tex = ctx.load_texture(
-                    format!("fs_original_preview_{idx}"),
-                    base.as_ref().clone(),
-                    egui::TextureOptions::LINEAR,
-                );
-                self.original_preview_tex_cache.insert(idx, tex);
-            }
-            return self.original_preview_tex_cache.get(&idx).cloned();
-        }
-
+    fn resolve_original_preview_tex(&self, idx: usize) -> Option<egui::TextureHandle> {
         match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
             Some(FsCacheEntry::Animated {
@@ -2357,8 +2336,8 @@ impl App {
         // 隠蔽合成: マスクが保存されているページなら最上位レイヤとして適用 (Phase 4)。
         // `ensure_conceal_texture` は内部で erase_result > adj > ai > fs の優先順位で入力を選ぶ。
         // 隠蔽モード編集中 / 該当 idx にマスク無し / 入力ピクセル未取得 → None。
-        // ライフサイクル順序: 元プレビュー (右 Ctrl) は隠蔽より優先で raw を見せる
-        // (= 元画像確認のための一時バイパス、消しゴム base_cache と同じ思想)。
+        // ライフサイクル順序: 元プレビュー (右 Ctrl) は隠蔽より優先で raw を見せる。
+        // ここでは消しゴム/補正/AI の派生キャッシュを参照しない。
         let conceal_tex = if is_video || original_preview_active {
             None
         } else {
@@ -2378,7 +2357,7 @@ impl App {
             // 表示するテクスチャは無い。サムネイル fallback に任せる。
             None
         } else if original_preview_active {
-            self.resolve_original_preview_tex(ctx, fs_idx)
+            self.resolve_original_preview_tex(fs_idx)
         } else if let Some(b) = erase_base_tex {
             // 消しゴム編集中 (プレビュー OFF): inpaint 前の元画像を見せる。
             // 通常パイプラインの adj / ai / conceal を全部スキップ (= 編集
@@ -6354,10 +6333,10 @@ impl App {
                 None
             };
             let left_original_tex = original_preview_active
-                .then(|| self.resolve_original_preview_tex(ctx, left_idx))
+                .then(|| self.resolve_original_preview_tex(left_idx))
                 .flatten();
             let right_original_tex = original_preview_active
-                .then(|| self.resolve_original_preview_tex(ctx, right_idx))
+                .then(|| self.resolve_original_preview_tex(right_idx))
                 .flatten();
             for (rect, idx, rot, location, original_tex) in [
                 (
@@ -6424,10 +6403,10 @@ impl App {
                 None
             };
             let left_original_tex = original_preview_active
-                .then(|| self.resolve_original_preview_tex(ctx, left_idx))
+                .then(|| self.resolve_original_preview_tex(left_idx))
                 .flatten();
             let right_original_tex = original_preview_active
-                .then(|| self.resolve_original_preview_tex(ctx, right_idx))
+                .then(|| self.resolve_original_preview_tex(right_idx))
                 .flatten();
             for (rect, idx, rot, location, original_tex) in [
                 (

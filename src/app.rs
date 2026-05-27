@@ -2901,13 +2901,10 @@ pub struct App {
     pub(crate) erase_shift_drag: Option<ShiftDragState>,
     /// 描画モード (true) / 消去モード (false)
     pub(crate) erase_paint_mode: bool,
-    /// inpaint 適用前の元画像キャッシュ: item_idx → ピクセルデータ
-    /// inpaint 実行後も元画像を保持し、マスク変更時に常に元画像から再適用する。
+    /// inpaint 適用前の表示入力キャッシュ: item_idx → ピクセルデータ。
+    /// raw 固定ではなく、補正 / AI 済みの pre-erase 入力が入ることがある。
+    /// 右 Ctrl の元画像プレビューには使わず、raw 表示は `fs_cache` だけを参照する。
     pub(crate) erase_base_cache: std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
-    /// 右 Ctrl ホールドの元画像プレビュー用テクスチャ。
-    /// 通常は fs_cache の元テクスチャを使えるが、消しゴム補完後は fs_cache が補完結果に
-    /// 差し替わるため、erase_base_cache から一度だけ GPU texture を作って再利用する。
-    pub(crate) original_preview_tex_cache: std::collections::HashMap<usize, egui::TextureHandle>,
     /// マスク永続化 DB
     pub(crate) mask_db: Option<crate::mask_db::MaskDb>,
     /// 消しゴムの Undo スタック (マスク/ベクタ両方のスナップショット、最大 20 エントリ)
@@ -2967,9 +2964,8 @@ pub struct App {
     /// - ESC / マスク全削除 / mask 変更 で preview 結果が残らない (= preview
     ///   非破壊)
     /// - AI 無効化トグル等で fs_cache 経路が綺麗に元へ戻る
-    /// - 連続 preview 押下で MI-GAN 入力 (erase_base_cache) は同じなので、
-    ///   先に走った job の結果をそのまま再利用できる (= 1 ストロークごとに
-    ///   AI を起動し直さない)
+    /// - 連続 preview 押下で mask/source 世代が同じなら、先に走った job の結果を
+    ///   そのまま再利用できる (= 1 ストロークごとに AI を起動し直さない)
     ///
     /// invalidate ポイント:
     /// - `commit_erase_shape` / `paint_brush_line_erase` 等の mask 変更
@@ -3980,7 +3976,6 @@ impl App {
             erase_shift_drag: None,
             erase_paint_mode: true,
             erase_base_cache: std::collections::HashMap::new(),
-            original_preview_tex_cache: std::collections::HashMap::new(),
             mask_db,
             conceal_db,
             erase_undo_stack: std::collections::VecDeque::new(),
@@ -8850,7 +8845,6 @@ impl App {
         self.erase_base_cache.clear();
         self.conceal_base_cache.clear();
         self.conceal_cache.clear();
-        self.original_preview_tex_cache.clear();
         self.fs_early_dims.clear();
         self.fs_cache.clear();
         self.fs_upload_backlog.clear();
@@ -14407,7 +14401,6 @@ impl App {
             self.clear_erase_result_caches_for_idx(*idx);
             self.conceal_base_cache.remove(idx);
             self.conceal_cache.remove(idx);
-            self.original_preview_tex_cache.remove(idx);
             self.save_mask_raw_with_sidecar(
                 *idx,
                 &compressed,
@@ -15703,7 +15696,6 @@ impl App {
         self.conceal_base_cache.clear();
         self.conceal_cache.clear();
         self.erase_result_cache.clear();
-        self.original_preview_tex_cache.clear();
         for (cancel, _, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
         }
@@ -16748,6 +16740,7 @@ impl App {
         *slot = slot.wrapping_add(1);
         self.cancel_erase_commit_pending_for_idx(idx);
         self.clear_erase_result_caches_for_idx(idx);
+        self.clear_erase_preview(idx);
         self.clear_conceal_caches(idx);
     }
 
@@ -16756,18 +16749,9 @@ impl App {
         for v in self.input_generation.values_mut() {
             *v = v.wrapping_add(1);
         }
-        let commit_keys: Vec<_> = self
-            .erase_inpaint_pending
-            .keys()
-            .copied()
-            .filter(|key| matches!(key.kind, crate::ui_erase::EraseInpaintKind::Commit))
-            .collect();
-        for key in commit_keys {
-            if let Some(pending) = self.erase_inpaint_pending.remove(&key) {
-                pending.cancel.store(true, Ordering::Relaxed);
-            }
-        }
+        self.cancel_all_erase_inpaint_pending();
         self.erase_result_cache.clear();
+        self.erase_preview_cache.clear();
         self.conceal_cache.clear();
     }
 
@@ -16825,16 +16809,15 @@ impl App {
     ///
     /// **表示 source の優先順位** (2026-05 ユーザー報告対応):
     /// 1. `ai_upscale_cache[(idx, bg)]` (= AI アップスケール後の高解像度 pixels)
-    /// 2. `erase_base_cache[idx]` (= MI-GAN inpaint 入力用の素画像、通常 raw)
+    /// 2. `erase_base_cache[idx]` (= MI-GAN inpaint 入力用の pre-erase pixels)
     ///
     /// パイプライン上は **画像補正 → 消しゴム → 隠蔽** の順なので、消しゴム編集中も
     /// 「画像補正 + AI アップスケール後」の高解像度状態を base として見せるのが正しい。
     ///
     /// 旧版 (Phase 4) は `erase_base_cache` を直接使っていたが、`auto_apply_saved_mask`
     /// 経由で populate されると raw fs_cache が入る → 通常表示も raw 解像度に化ける問題が
-    /// あった。`erase_base_cache` 自体は MI-GAN inpaint の入力として一貫した resolution
-    /// (= raw) を保持する必要があるので壊さず、表示 source だけ AI upscale 結果を優先する
-    /// 形に分離した。
+    /// あった。`erase_base_cache` 自体は MI-GAN inpaint の入力として保持し、表示 source は
+    /// AI upscale 結果を優先する形に分離した。
     ///
     /// 取得した source pixels に `effective_params(idx)` の色補正を
     /// `apply_adjustments_fast` で適用してからテクスチャ化。post_filter は erase_mode 中

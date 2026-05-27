@@ -127,7 +127,7 @@ impl App {
             crate::ui_fullscreen::SpreadPair::Single => None,
         };
         let target_idx = spread_pair.map(|(l, _)| l).unwrap_or(fs_idx);
-        // 元画像取得は state mutation より前にやる。ここで取れないと erase は始められず、
+        // 消しゴム入力取得は state mutation より前にやる。ここで取れないと erase は始められず、
         // 取れる前に spread_mode / fullscreen_idx を弄ると見開きが解除されたまま
         // 編集も開始しない不整合状態になる (Codex P2 指摘)。
         let pixels = if let Some(base) = self.erase_base_cache.get(&target_idx) {
@@ -142,7 +142,7 @@ impl App {
                 });
             match from_cache {
                 Some(p) => {
-                    // 初回: 元画像を base_cache に保存
+                    // 初回: pre-erase 入力を base_cache に保存
                     self.erase_base_cache.insert(target_idx, Arc::clone(&p));
                     p
                 }
@@ -2181,19 +2181,21 @@ impl App {
         // 結果が見える (= 隠蔽の preview と同じ UX、実機 FB R4)。
         //
         // 注意:
-        // - MI-GAN は async (= worker thread)。1-3 秒かかる間はまだ古い fs_cache
-        //   が見える。完了次第 `apply_inpaint_result` 経由で fs_cache が更新され、
-        //   毎フレ repaint で reflect される
+        // - MI-GAN は async (= worker thread)。1-3 秒かかる間は通常レイヤが見える。
+        //   完了次第 `erase_preview_cache` が更新され、毎フレ repaint で reflect される
         // - 既に走っている job は `run_inpaint_and_cache` 内で cancel + restart
         // - 連続 press は許容 (= 押すたびに最新マスクで再投入される)
         // - 空マスクなら何も起きない (run_inpaint_for_preview が false を返す)
         let preview_just_pressed = !self.erase_preview_active && preview_pressed;
         self.erase_preview_active = preview_pressed;
-        if preview_just_pressed
-            && let Some(fs_idx) = self.fullscreen_idx
-            && self.run_inpaint_for_preview(ctx, fs_idx)
-        {
-            self.show_feedback_toast("[プレビュー計算中…]".to_string());
+        if preview_just_pressed && let Some(fs_idx) = self.fullscreen_idx {
+            if self.run_inpaint_for_preview(ctx, fs_idx) {
+                self.show_feedback_toast("[プレビュー計算中…]".to_string());
+            } else {
+                // 入力未読込 / サイズ不一致などで投入できなかった場合は、マスクだけ
+                // 消えたように見える preview 状態へ入らない。
+                self.erase_preview_active = self.erase_preview_cache.contains_key(&fs_idx);
+            }
         }
         if let Some(target) = switch_to {
             self.switch_erase_target_in_spread(ctx, target);
@@ -2392,66 +2394,62 @@ impl App {
             Some(c) if c.iter().any(|&m| m) => c,
             _ => return false,
         };
-        // R5: プレビュー入力は **画像補正 + AI アップスケール後** のピクセルを使う。
-        // 旧版は erase_base_cache (= raw fs_cache から取った素画像) を渡していたため、
-        // 「画像補正の効果が効いてない状態に対する消しゴム結果」がプレビューされる
-        // という実機 FB R5 #1 があった。コミット経路 (`apply_inpaint_only`) は raw 入力の
-        // ままで OK (下流で adjustment が再適用される)、プレビューだけ補正済みに切替。
-        //
-        // 解像度マッチング:
-        // - ai_upscale_cache がある (= AI 有効でアップスケール完了) → 高解像度を base
-        // - 無ければ erase_base_cache (= 通常は raw fs_cache 解像度)
-        // どちらも `erase_mask_size = [w, h]` と同じはず (enter_erase_mode 時に揃える)。
-        // post_filter は erase_mode 中 bypass (`post_filter_bypassed = true`) なので
-        // apply_adjustments_fast (= 色調のみ) で十分。
-        let bg = self.effective_upscale_bg_mode();
-        let ai_pixels = self
-            .ai_upscale_cache
-            .get(&(fs_idx, bg))
-            .and_then(|e| match e {
-                FsCacheEntry::Static { pixels, .. } => Some(Arc::clone(pixels)),
-                _ => None,
-            });
-        let raw_source = match ai_pixels {
-            Some(p) => p,
-            None => match self.erase_base_cache.get(&fs_idx) {
-                Some(p) => Arc::clone(p),
-                None => return false,
-            },
-        };
         let [w, h] = self.erase_mask_size;
-        // R5 P1 (Codex): 解像度ミスマッチ時の fallback で**サイズ不一致の `raw_source` を
-        // そのまま `run_inpaint_and_cache(..., w, h, ...)` に渡していた**ため、AI upscale が
-        // 後から完了して ai_upscale_cache (4x) と erase_mask_size (1x) が食い違うケースで、
-        // MI-GAN 結果が誤ったサイズで preview_cache に書き込まれ、次フレームの
-        // egui-wgpu texture upload で `Mismatch between texture size and texel count` の
-        // assert panic を起こしていた。
-        //
-        // 寸法整合性を取り直すのは難しいので、ミスマッチ時は **preview を諦めて return false**
-        // にする。ユーザー視点では「プレビュー押下しても何も起きない」だけで、クラッシュ
-        // するよりずっと安全。実機で起きうるケース:
-        //   - 消しゴム中に AI 設定を ON/OFF した
-        //   - enter_erase_mode が raw fs_cache から始まり、その後 ai_upscale_cache が完了
-        //   - その他、erase_mask_size と現有の base/ai pixels サイズが食い違う edge case
-        //
-        // 確定結果は erase_result_cache + generation key で守られるが、preview は現在の
-        // 編集中マスクと即時に同寸法で合成する必要があるため、サイズ不一致は起動しない。
-        if raw_source.size != [w, h] {
+        let mut source_name = "none";
+        let mut already_adjusted = false;
+        let source = if let Some(FsCacheEntry::Static { pixels, .. }) =
+            self.adjustment_cache.get(&fs_idx)
+            && pixels.size == [w, h]
+        {
+            source_name = "adjustment";
+            already_adjusted = true;
+            Some(Arc::clone(pixels))
+        } else {
+            let bg = self.effective_upscale_bg_mode();
+            let ai_matching = self
+                .ai_upscale_cache
+                .get(&(fs_idx, bg))
+                .and_then(|e| match e {
+                    FsCacheEntry::Static { pixels, .. } if pixels.size == [w, h] => {
+                        Some(Arc::clone(pixels))
+                    }
+                    _ => None,
+                });
+            if let Some(pixels) = ai_matching {
+                source_name = "ai";
+                Some(pixels)
+            } else if let Some(pixels) = self
+                .erase_base_cache
+                .get(&fs_idx)
+                .filter(|pixels| pixels.size == [w, h])
+                .map(Arc::clone)
+            {
+                source_name = "erase_base";
+                Some(pixels)
+            } else {
+                match self.fs_cache.get(&fs_idx) {
+                    Some(FsCacheEntry::Static { pixels, .. }) if pixels.size == [w, h] => {
+                        source_name = "fs_cache";
+                        Some(Arc::clone(pixels))
+                    }
+                    _ => None,
+                }
+            }
+        };
+        let Some(source) = source else {
             crate::logger::log(format!(
-                "erase: preview skipped (size mismatch: source={}x{} mask={}x{})",
-                raw_source.size[0], raw_source.size[1], w, h
+                "erase: preview skipped (no matching source for mask={}x{})",
+                w, h
             ));
             return false;
-        }
-        let params = self.effective_params(fs_idx).clone();
-        let adjusted: Arc<egui::ColorImage> = if params.is_color_identity() {
-            raw_source
-        } else {
-            Arc::new(crate::adjustment::apply_adjustments_fast(
-                &raw_source,
-                &params,
-            ))
         };
+        let params = self.effective_params(fs_idx).clone();
+        let adjusted: Arc<egui::ColorImage> = if already_adjusted || params.is_color_identity() {
+            source
+        } else {
+            Arc::new(crate::adjustment::apply_adjustments_fast(&source, &params))
+        };
+        crate::logger::log(format!("erase: preview source={source_name} {w}x{h}"));
         // is_preview = true: 完了時 fs_cache を書き換えず preview_cache に流す。
         self.run_inpaint_and_cache(ctx, fs_idx, adjusted, composite, w, h, "preview", true);
         true
@@ -2547,8 +2545,8 @@ impl App {
             return;
         }
 
-        // 元画像プレビュー用に base_cache も更新しておく。ただし MI-GAN 入力は
-        // 現在の pre-erase 表示レイヤ (`pixels`) を直接使う。
+        // 消しゴム編集に入ったときの pre-erase 表示用に base_cache も更新しておく。
+        // MI-GAN 入力は現在の pre-erase 表示レイヤ (`pixels`) を直接使う。
         let need_update = self
             .erase_base_cache
             .get(&fs_idx)
@@ -2699,6 +2697,26 @@ impl App {
             crate::logger::log(format!(
                 "erase: inpaint result discarded (stale: gen {} → {}, prefix={})",
                 pending.items_generation, self.items_generation, pending.log_prefix
+            ));
+            return;
+        }
+        let current_input_generation = self.input_generation.get(&idx).copied().unwrap_or(0);
+        let current_mask_generation = self.erase_mask_generation.get(&idx).copied().unwrap_or(0);
+        if pending.input_generation != current_input_generation
+            || pending.mask_generation != current_mask_generation
+        {
+            crate::logger::log(format!(
+                "erase: {} inpaint result discarded (stale generation: input {} -> {}, mask {} -> {}, prefix={})",
+                if pending.is_preview {
+                    "preview"
+                } else {
+                    "commit"
+                },
+                pending.input_generation,
+                current_input_generation,
+                pending.mask_generation,
+                current_mask_generation,
+                pending.log_prefix
             ));
             return;
         }

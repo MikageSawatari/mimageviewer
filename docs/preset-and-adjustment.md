@@ -269,8 +269,8 @@ bilinear 補間ソースサンプリング + 水平ブラー (h_blur) で、「�
 右 Ctrl を押している間だけ、補正 / ポストフィルタ / AI アップスケール・デノイズ /
 消しゴム補完結果を表示選択から外し、元画像を一時表示する。これは「比較用の描画 override」
 であり、`adjustment_cache` や `ai_upscale_cache` の無効化、DB 書き換え、AI ジョブの停止は
-行わない。消しゴム補完済みページは `erase_base_cache` を使い、それ以外は `fs_cache`
-の生デコード結果を使う。
+行わない。表示元は常に raw 専用の `fs_cache` で、消しゴム補完済みページでも
+`erase_base_cache` は参照しない。
 
 ### 2.5 Auto モード
 
