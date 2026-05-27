@@ -4,9 +4,10 @@
 **進め方**: Codex GUI で実装 → ClaudeCode で手作業レビュー (= 既存運用と同じ)
 **前提**: Phase 0〜5 + 隠蔽加工本体 + 消しゴム subtract shape + パネル高さ修正 + 選択ツールアウトラインまで完了済み (`44b2e5b7` まで)
 
-**進捗メモ (2026-05-27)**: Phase 6 の本体 (`src/export_dialog.rs`、Ctrl+E 起動、
-worker 保存、進捗モーダル、最低限の仕様ドキュメント更新) は実装済み。未完は
-Phase 7 の統合テスト拡充と Phase 8 の詳細マニュアル整備。
+**進捗メモ (2026-05-27 / 2026-05-28 更新)**: Phase 6 の本体
+(`src/export_dialog.rs`、Ctrl+E 起動、worker 合成・保存、進捗モーダル、
+最低限の仕様ドキュメント更新) は実装済み。未完は Phase 7 の統合テスト拡充と
+Phase 8 の詳細マニュアル整備。
 
 このブリーフは前 2 件 (`docs/erase-cache-refactor-plan.md` /
 `docs/panel-height-fix-plan.md`) と同じ運用方針で使う。各 Phase は **独立に着手・コミット
@@ -110,25 +111,17 @@ pub(crate) struct ExportRequest {
 pub(crate) struct ExportEntry {
     pub label: String,                     // "現在の設定" / "プリセット 1" 等
     pub suffix_num: u8,                    // 0=現在, 1-4=プリセット
-    pub pixels: Arc<ColorImage>,           // 当該エントリの合成結果
+    pub conceal_preset: Option<ConcealPreset>, // worker 側で合成する隠蔽パラメータ
 }
 ```
 
 Codex の判断ポイント:
 
-- `ExportEntry::pixels` は **合成済みピクセル** を渡す方針 (= worker thread に
-  合成を任せず、UI スレッドで `resolve_export_pixels(idx, preset_idx)` のような
-  関数で確定させてから渡す)。代替案: worker thread で `(params, mask)` から合成
-  させる方が CPU 重い合成 (Mosaic / Blur 等) を UI スレッドから外せる。
-- 5 エントリ × 4K RGBA ≈ 400MB の Arc 保持なので、メモリ的にも合成を worker 化
-  したい。**worker thread で合成 → encode → 書き込み** にする。
-- ただし合成は `App` の cache (adjustment / conceal_cache / erase_result_cache) に
-  依存するので、`Arc<ColorImage>` を 5 つキャプチャしてから worker に投げる方が
-  borrow チェック上シンプル。
-- **推奨**: 「合成 + encode + 書き込み」を全部 worker thread で。エントリごとに
-  `(pixels: Arc<ColorImage>, options: SaveOptions, suffix: u8)` の組を作って
-  worker に渡す。pixels の準備 (= 合成済みを取り出す or 補正だけ違うので合成
-  し直す) は UI スレッドで `App` 経由で行う。
+- 実装は **worker thread で合成 → encode → 書き込み** の方針。UI スレッドは
+  `base_pixels: Arc<ColorImage>` と composite mask、各エントリの `ConcealPreset`
+  だけを snapshot して worker に渡す。
+- これにより 5 エントリ × 4K RGBA を UI スレッドで先に合成して保持する必要がなく、
+  Mosaic / Blur の CPU コストも保存ボタン直後の UI 停止にならない。
 
 ## 6.4 ダイアログ UI
 

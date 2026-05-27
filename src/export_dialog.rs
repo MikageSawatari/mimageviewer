@@ -1,8 +1,8 @@
 //! Ctrl+E export dialog support.
 //!
-//! The UI side prepares already-composited `ColorImage` entries on the main
-//! thread, then this module writes them on a worker so metadata I/O and image
-//! encoding never block egui.
+//! The UI side snapshots base pixels, mask, and selected presets. This module
+//! composes conceal effects, encodes images, and writes files on a worker so
+//! heavy CPU/I/O work never blocks egui.
 
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -13,7 +13,7 @@ use std::sync::{
 
 use eframe::egui;
 
-use crate::conceal::ExportFallbackFormat;
+use crate::conceal::{ConcealPreset, ExportFallbackFormat};
 use crate::save_with_metadata::{SaveError, SaveOptions, SrcFormat, save_image_with_metadata};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -85,7 +85,7 @@ pub enum ExportSource {
 pub struct ExportEntry {
     pub label: String,
     pub suffix: u8,
-    pub pixels: Arc<egui::ColorImage>,
+    pub conceal_preset: Option<ConcealPreset>,
 }
 
 pub struct ExportRequest {
@@ -94,6 +94,8 @@ pub struct ExportRequest {
     pub output_format: ExportFormat,
     pub output_dir: PathBuf,
     pub basename: String,
+    pub base_pixels: Arc<egui::ColorImage>,
+    pub conceal_mask: Option<Arc<Vec<bool>>>,
     pub entries: Vec<ExportEntry>,
     pub include_metadata: bool,
 }
@@ -108,6 +110,7 @@ pub struct ExportDialogState {
     pub output_dir_text: String,
     pub include_metadata: bool,
     pub selection: [bool; 5],
+    pub has_conceal_mask: bool,
     pub error: Option<String>,
 }
 
@@ -266,8 +269,19 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
             entry.suffix,
             extension,
         );
+        let composed = match (&request.conceal_mask, &entry.conceal_preset) {
+            (Some(mask), Some(preset)) => Some(compose_conceal_for_export(
+                request.base_pixels.as_ref(),
+                mask.as_ref(),
+                preset,
+            )),
+            _ => None,
+        };
+        let pixels = composed
+            .as_ref()
+            .unwrap_or_else(|| request.base_pixels.as_ref());
         match save_image_with_metadata(
-            entry.pixels.as_ref(),
+            pixels,
             source_path,
             source_bytes.as_deref(),
             &path,
@@ -295,6 +309,41 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
         }
     }
     let _ = tx.send(ExportEvent::AllDone);
+}
+
+fn compose_conceal_for_export(
+    base: &egui::ColorImage,
+    mask: &[bool],
+    params: &ConcealPreset,
+) -> egui::ColorImage {
+    match params.conceal_type {
+        crate::conceal::ConcealType::Mosaic => {
+            let long_edge = base.size[0].max(base.size[1]) as u32;
+            let tile = crate::conceal::compute_tile_size(long_edge, params.mosaic_tile_mode);
+            crate::conceal_compose::compose_mosaic(base, mask, tile, params.mosaic_boundary)
+        }
+        crate::conceal::ConcealType::WhiteFill => crate::conceal_compose::compose_solid_fill(
+            base,
+            mask,
+            egui::Color32::WHITE,
+            params.fill_opacity_percent,
+            params.fill_edge,
+        ),
+        crate::conceal::ConcealType::BlackFill => crate::conceal_compose::compose_solid_fill(
+            base,
+            mask,
+            egui::Color32::BLACK,
+            params.fill_opacity_percent,
+            params.fill_edge,
+        ),
+        crate::conceal::ConcealType::Blur => crate::conceal_compose::compose_blur(
+            base,
+            mask,
+            params.blur_radius_px,
+            params.blur_mode,
+            params.blur_feather,
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -329,16 +378,18 @@ mod tests {
             output_format: ExportFormat::Png,
             output_dir: temp.path().to_path_buf(),
             basename: "out".to_string(),
+            base_pixels: Arc::clone(&pixels),
+            conceal_mask: None,
             entries: vec![
                 ExportEntry {
                     label: "current".to_string(),
                     suffix: 0,
-                    pixels: Arc::clone(&pixels),
+                    conceal_preset: None,
                 },
                 ExportEntry {
                     label: "preset1".to_string(),
                     suffix: 1,
-                    pixels,
+                    conceal_preset: None,
                 },
             ],
             include_metadata: false,
@@ -362,5 +413,50 @@ mod tests {
         assert_eq!(completed, 2);
         assert!(temp.path().join("out_0.png").exists());
         assert!(temp.path().join("out_1.png").exists());
+    }
+
+    #[test]
+    fn worker_composes_conceal_preset_before_writing() {
+        let temp = tempfile::tempdir().unwrap();
+        let pixels = Arc::new(egui::ColorImage::new([2, 2], vec![egui::Color32::WHITE; 4]));
+        let mask = Arc::new(vec![true, false, false, false]);
+        let pending = spawn_export_worker(ExportRequest {
+            source: ExportSource::PdfPage,
+            original_format: SrcFormat::Other("pdf".to_string()),
+            output_format: ExportFormat::Png,
+            output_dir: temp.path().to_path_buf(),
+            basename: "masked".to_string(),
+            base_pixels: pixels,
+            conceal_mask: Some(mask),
+            entries: vec![ExportEntry {
+                label: "black".to_string(),
+                suffix: 0,
+                conceal_preset: Some(ConcealPreset {
+                    conceal_type: crate::conceal::ConcealType::BlackFill,
+                    ..Default::default()
+                }),
+            }],
+            include_metadata: false,
+        })
+        .unwrap();
+
+        loop {
+            match pending
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+            {
+                ExportEvent::Failed(err) => panic!("unexpected export failure: {err:?}"),
+                ExportEvent::AllDone => break,
+                ExportEvent::Started { .. } | ExportEvent::Completed(_) => {}
+                ExportEvent::Cancelled => panic!("unexpected cancel"),
+            }
+        }
+
+        let out = image::open(temp.path().join("masked_0.png"))
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(out.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(out.get_pixel(1, 0).0, [255, 255, 255, 255]);
     }
 }

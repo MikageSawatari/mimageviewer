@@ -8199,10 +8199,15 @@ impl App {
             self.show_feedback_toast("このアイテムはエクスポートできません".to_string());
             return;
         };
-        if self.resolve_export_base_pixels(fs_idx).is_err() {
-            self.show_feedback_toast("画像の読み込み完了後にエクスポートしてください".to_string());
-            return;
-        }
+        let base_pixels = match self.resolve_export_base_pixels(fs_idx) {
+            Ok(pixels) => pixels,
+            Err(_) => {
+                self.show_feedback_toast(
+                    "画像の読み込み完了後にエクスポートしてください".to_string(),
+                );
+                return;
+            }
+        };
 
         let output_dir = self
             .settings
@@ -8211,7 +8216,9 @@ impl App {
             .filter(|p| p.is_dir())
             .unwrap_or(source_dir);
         let mut selection = self.settings.export_batch_selection;
-        let has_conceal_mask = self.has_conceal_mask_for_export(fs_idx);
+        let has_conceal_mask = self
+            .conceal_composite_mask_for_export(fs_idx, base_pixels.size[0], base_pixels.size[1])
+            .is_some();
         for i in 1..selection.len() {
             if !has_conceal_mask || self.settings.conceal_presets[i - 1].is_none() {
                 selection[i] = false;
@@ -8233,6 +8240,7 @@ impl App {
             output_dir_text: output_dir.display().to_string(),
             include_metadata: self.settings.export_embed_metadata,
             selection,
+            has_conceal_mask,
             error: None,
         });
         ctx.request_repaint();
@@ -8246,10 +8254,7 @@ impl App {
         let enter_pressed = self.dialog_enter_pressed(ctx);
         let escape_pressed = self.dialog_escape_pressed(ctx);
         let preset_slots = self.settings.conceal_presets.clone();
-        let fs_idx = self.fullscreen_idx;
-        let has_conceal_mask = fs_idx
-            .map(|idx| self.has_conceal_mask_for_export(idx))
-            .unwrap_or(false);
+        let has_conceal_mask = state.has_conceal_mask;
         for i in 1..state.selection.len() {
             if !has_conceal_mask || preset_slots[i - 1].is_none() {
                 state.selection[i] = false;
@@ -8563,12 +8568,21 @@ impl App {
         }
         let basename = crate::capture::basename_from_text(&state.basename);
 
+        let base_pixels = self.resolve_export_base_pixels(idx)?;
+        let conceal_mask = self
+            .conceal_composite_mask_for_export(idx, base_pixels.size[0], base_pixels.size[1])
+            .map(Arc::new);
+        let has_conceal_mask = conceal_mask.is_some();
         let mut planned: Vec<(String, u8, Option<crate::conceal::ConcealPreset>)> = Vec::new();
         if state.selection[0] {
-            planned.push(("現在の設定".to_string(), 0, None));
+            let preset = has_conceal_mask.then(|| self.current_conceal_preset_from_settings());
+            planned.push(("現在の設定".to_string(), 0, preset));
         }
         for slot_idx in 0..4 {
             if state.selection[slot_idx + 1] {
+                if !has_conceal_mask {
+                    continue;
+                }
                 let Some(preset) = self.settings.conceal_presets[slot_idx].clone() else {
                     continue;
                 };
@@ -8594,11 +8608,10 @@ impl App {
 
         let mut entries = Vec::with_capacity(planned.len());
         for (label, suffix, preset) in planned {
-            let pixels = self.resolve_export_pixels(idx, preset.as_ref())?;
             entries.push(crate::export_dialog::ExportEntry {
                 label,
                 suffix,
-                pixels,
+                conceal_preset: preset,
             });
         }
 
@@ -8624,6 +8637,8 @@ impl App {
             output_format: state.output_format,
             output_dir,
             basename: resolved_basename,
+            base_pixels,
+            conceal_mask,
             entries,
             include_metadata: state.include_metadata,
         };
@@ -8715,23 +8730,6 @@ impl App {
         }
     }
 
-    fn resolve_export_pixels(
-        &self,
-        idx: usize,
-        preset: Option<&crate::conceal::ConcealPreset>,
-    ) -> Result<Arc<egui::ColorImage>, String> {
-        let base = self.resolve_export_base_pixels(idx)?;
-        let Some(mask) = self.conceal_composite_mask_for_export(idx, base.size[0], base.size[1])
-        else {
-            return Ok(base);
-        };
-        let params = preset
-            .cloned()
-            .unwrap_or_else(|| self.current_conceal_preset_from_settings());
-        let composed = Self::compose_conceal_for_export(base.as_ref(), &mask, &params);
-        Ok(Arc::new(composed))
-    }
-
     fn resolve_export_base_pixels(&self, idx: usize) -> Result<Arc<egui::ColorImage>, String> {
         if let Some(pixels) = self.current_erase_result_pixels(idx) {
             return Ok(pixels);
@@ -8761,14 +8759,6 @@ impl App {
                 .ok_or_else(|| "アニメーションフレームを取得できません".to_string()),
             _ => Err("画像の読み込み完了後にエクスポートしてください".to_string()),
         }
-    }
-
-    fn has_conceal_mask_for_export(&self, idx: usize) -> bool {
-        let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) else {
-            return self.conceal_pages.contains(&idx);
-        };
-        self.conceal_composite_mask_for_export(idx, pixels.size[0], pixels.size[1])
-            .is_some()
     }
 
     fn conceal_composite_mask_for_export(
@@ -8802,41 +8792,6 @@ impl App {
             blur_radius_px: self.settings.conceal_blur_radius_px,
             blur_mode: self.settings.conceal_blur_mode,
             blur_feather: self.settings.conceal_blur_feather,
-        }
-    }
-
-    fn compose_conceal_for_export(
-        base: &egui::ColorImage,
-        mask: &[bool],
-        params: &crate::conceal::ConcealPreset,
-    ) -> egui::ColorImage {
-        match params.conceal_type {
-            crate::conceal::ConcealType::Mosaic => {
-                let long_edge = base.size[0].max(base.size[1]) as u32;
-                let tile = crate::conceal::compute_tile_size(long_edge, params.mosaic_tile_mode);
-                crate::conceal_compose::compose_mosaic(base, mask, tile, params.mosaic_boundary)
-            }
-            crate::conceal::ConcealType::WhiteFill => crate::conceal_compose::compose_solid_fill(
-                base,
-                mask,
-                egui::Color32::WHITE,
-                params.fill_opacity_percent,
-                params.fill_edge,
-            ),
-            crate::conceal::ConcealType::BlackFill => crate::conceal_compose::compose_solid_fill(
-                base,
-                mask,
-                egui::Color32::BLACK,
-                params.fill_opacity_percent,
-                params.fill_edge,
-            ),
-            crate::conceal::ConcealType::Blur => crate::conceal_compose::compose_blur(
-                base,
-                mask,
-                params.blur_radius_px,
-                params.blur_mode,
-                params.blur_feather,
-            ),
         }
     }
 
