@@ -163,13 +163,36 @@ pub fn save_image_with_metadata(
     src_format: SrcFormat,
     options: &SaveOptions,
 ) -> Result<(), SaveError> {
+    let encoded = encode_image_with_metadata(pixels, src_path, src_bytes, src_format, options)?;
+    write_bytes_create_new(&encoded, dst_path)
+}
+
+/// 内部実装: pixels を encode して `Vec<u8>` を返す。`save_image_with_metadata`
+/// と `save_image_with_metadata_unique` で encode を共有することで、unique 探索時
+/// にファイル名衝突のたびに re-encode しないようにする (Codex P2)。
+fn encode_image_with_metadata(
+    pixels: &ColorImage,
+    src_path: Option<&Path>,
+    src_bytes: Option<&[u8]>,
+    src_format: SrcFormat,
+    options: &SaveOptions,
+) -> Result<Vec<u8>, SaveError> {
     let (w, h) = (pixels.size[0], pixels.size[1]);
     if w == 0 || h == 0 {
         return Err(SaveError::InvalidPixels(format!("size {w}x{h}")));
     }
+    if let SrcFormat::Other(ext) = &src_format {
+        return Err(SaveError::UnsupportedFormat(ext.clone()));
+    }
 
-    // メタデータ抽出元のバイト列を取得 (include_metadata=false なら不要)。
-    let src_bytes_owned: Option<Vec<u8>> = if options.include_metadata {
+    // src bytes は次のいずれかで必要:
+    // - include_metadata=true (= メタデータ抽出元)
+    // - src_format=Webp で src_bytes/src_path のいずれかが与えられている
+    //   (= アニメーション判定。include_metadata=false でもこの検査だけは
+    //   常に走らせたいので src を読む — Codex P2)
+    let needs_src_for_anim_check =
+        matches!(src_format, SrcFormat::Webp) && (src_bytes.is_some() || src_path.is_some());
+    let src_bytes_owned: Option<Vec<u8>> = if options.include_metadata || needs_src_for_anim_check {
         match (src_bytes, src_path) {
             (Some(b), _) => Some(b.to_vec()),
             (None, Some(p)) => Some(std::fs::read(p).map_err(SaveError::IoError)?),
@@ -180,18 +203,27 @@ pub fn save_image_with_metadata(
     };
     let src_bytes_ref: Option<&[u8]> = src_bytes_owned.as_deref();
 
-    let encoded = match &src_format {
-        SrcFormat::Jpeg => encode_jpeg_with_metadata(pixels, src_bytes_ref, options)?,
-        SrcFormat::Png => encode_png_with_metadata(pixels, src_bytes_ref, options)?,
-        SrcFormat::Webp => encode_webp_with_metadata(pixels, src_bytes_ref, options)?,
-        SrcFormat::Other(ext) => return Err(SaveError::UnsupportedFormat(ext.clone())),
-    };
+    // アニメーション WebP は静止画前提なので include_metadata と無関係に拒否。
+    if matches!(src_format, SrcFormat::Webp)
+        && let Some(src) = src_bytes_ref
+        && webp_is_animated(src)
+    {
+        return Err(SaveError::AnimatedWebpNotSupported);
+    }
 
-    // 親ディレクトリ作成 + create_new(true) で書き出し。
-    if let Some(parent) = dst_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent).map_err(SaveError::IoError)?;
-        }
+    match &src_format {
+        SrcFormat::Jpeg => encode_jpeg_with_metadata(pixels, src_bytes_ref, options),
+        SrcFormat::Png => encode_png_with_metadata(pixels, src_bytes_ref, options),
+        SrcFormat::Webp => encode_webp_with_metadata(pixels, src_bytes_ref, options),
+        SrcFormat::Other(_) => unreachable!("filtered above"),
+    }
+}
+
+fn write_bytes_create_new(bytes: &[u8], dst_path: &Path) -> Result<(), SaveError> {
+    if let Some(parent) = dst_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(SaveError::IoError)?;
     }
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -199,13 +231,16 @@ pub fn save_image_with_metadata(
         .open(dst_path)
         .map_err(SaveError::IoError)?;
     use std::io::Write;
-    file.write_all(&encoded).map_err(SaveError::IoError)?;
+    file.write_all(bytes).map_err(SaveError::IoError)?;
     file.flush().map_err(SaveError::IoError)?;
     Ok(())
 }
 
 /// `dst_path` の親フォルダで `basename` + `_NNNN.<ext>` の最初の空き番号を探して保存する。
 /// `seq_start` から `seq_max` まで試し、ファイル名衝突は `create_new(true)` で検出する。
+///
+/// **encode は 1 度だけ走らせる** (Codex P2)。連番探索のたびに re-encode すると
+/// バッチエクスポートで大量の同一画像を出すときに無駄な CPU を食う。
 ///
 /// 戻り値は実際に書いたファイルのパス。
 pub fn save_image_with_metadata_unique(
@@ -224,17 +259,12 @@ pub fn save_image_with_metadata_unique(
             "seq_start={seq_start} > seq_max={seq_max}"
         )));
     }
+    let encoded =
+        encode_image_with_metadata(pixels, src_path, src_bytes, src_format.clone(), options)?;
     let ext = src_format.extension();
     for seq in seq_start..=seq_max {
         let dst = output_dir.join(format!("{basename}_{seq:04}.{ext}"));
-        match save_image_with_metadata(
-            pixels,
-            src_path,
-            src_bytes,
-            &dst,
-            src_format.clone(),
-            options,
-        ) {
+        match write_bytes_create_new(&encoded, &dst) {
             Ok(()) => return Ok(dst),
             Err(SaveError::IoError(e)) if e.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -271,7 +301,13 @@ fn encode_jpeg_with_metadata(
     if let Some(src) = src_bytes
         && options.include_metadata
     {
-        let app1_segments = extract_jpeg_app1_segments(src)?;
+        let mut app1_segments = extract_jpeg_app1_segments(src)?;
+        // EXIF APP1 の Orientation を 1 に書き換える (Codex P1)。
+        // mIV は表示前にピクセルを回転済みなので、元 Orientation をそのまま
+        // 残すと EXIF-aware viewer が二重回転する。
+        for seg in app1_segments.iter_mut() {
+            reset_exif_orientation_in_app1(seg);
+        }
         if !app1_segments.is_empty() {
             out = splice_jpeg_app1_segments(&out, &app1_segments)?;
         }
@@ -320,6 +356,13 @@ fn extract_jpeg_app1_segments(jpeg: &[u8]) -> Result<Vec<Vec<u8>>, SaveError> {
         let len_hi = jpeg[marker_pos + 2];
         let len_lo = jpeg[marker_pos + 3];
         let seg_len = ((len_hi as usize) << 8) | (len_lo as usize); // length 自体を含む
+        // length 自身が 2 を切るのは不正 (= length field の最小値は 2)。
+        // 不正セグメントを raw に転写すると出力 JPEG が壊れるので skip する
+        // (Codex P2)。
+        if seg_len < 2 {
+            // 不正長 → 残りの scan を諦めるのが安全
+            break;
+        }
         let seg_end = marker_pos + 2 + seg_len;
         if seg_end > jpeg.len() {
             break;
@@ -333,6 +376,88 @@ fn extract_jpeg_app1_segments(jpeg: &[u8]) -> Result<Vec<Vec<u8>>, SaveError> {
         pos = seg_end;
     }
     Ok(segs)
+}
+
+/// JPEG APP1 EXIF セグメントの `Orientation` タグを 1 に書き換える。
+///
+/// mIV は表示前に `wic_decoder` / EXIF orientation 経路でピクセルを既に回転させているため、
+/// 元 EXIF の Orientation をそのままコピーすると EXIF-aware ビューア
+/// (例: Windows フォト) が**もう一度回転**してしまう。出力ピクセルは「上が天」なので
+/// Orientation は 1 (= No rotation) に固定する。`Exif\0\0` で始まらない
+/// (= XMP only など) セグメントは何もしない。`Orientation` タグが無ければ no-op。
+///
+/// EXIF TIFF パーサは IFD0 のみを舐めて Orientation (tag 0x0112、type=SHORT) を探す
+/// 軽量実装。他の IFD (Exif IFD / GPS IFD / Interop) は触らない。
+fn reset_exif_orientation_in_app1(app1_segment: &mut [u8]) {
+    // APP1 marker (2) + length (2) + "Exif\0\0" (6) = 10 bytes 必要
+    if app1_segment.len() < 10 {
+        return;
+    }
+    if &app1_segment[4..10] != b"Exif\0\0" {
+        return; // not EXIF (XMP APP1 等)
+    }
+    let tiff_start = 10;
+    if tiff_start + 8 > app1_segment.len() {
+        return;
+    }
+    let little_endian = match &app1_segment[tiff_start..tiff_start + 2] {
+        b"II" => true,
+        b"MM" => false,
+        _ => return,
+    };
+    let magic_ok = if little_endian {
+        app1_segment[tiff_start + 2] == 0x2A && app1_segment[tiff_start + 3] == 0x00
+    } else {
+        app1_segment[tiff_start + 2] == 0x00 && app1_segment[tiff_start + 3] == 0x2A
+    };
+    if !magic_ok {
+        return;
+    }
+    let read_u16 = |buf: &[u8]| -> u16 {
+        if little_endian {
+            u16::from_le_bytes([buf[0], buf[1]])
+        } else {
+            u16::from_be_bytes([buf[0], buf[1]])
+        }
+    };
+    let read_u32 = |buf: &[u8]| -> u32 {
+        if little_endian {
+            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
+        } else {
+            u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]])
+        }
+    };
+    let ifd0_offset = read_u32(&app1_segment[tiff_start + 4..tiff_start + 8]) as usize;
+    let ifd0_start = tiff_start + ifd0_offset;
+    if ifd0_start + 2 > app1_segment.len() {
+        return;
+    }
+    let entry_count = read_u16(&app1_segment[ifd0_start..ifd0_start + 2]) as usize;
+    let entries_start = ifd0_start + 2;
+    if entries_start + entry_count * 12 > app1_segment.len() {
+        return;
+    }
+    for i in 0..entry_count {
+        let entry_pos = entries_start + i * 12;
+        let tag = read_u16(&app1_segment[entry_pos..entry_pos + 2]);
+        if tag == 0x0112 {
+            // Orientation: type=SHORT(3), count=1, value = first 2 bytes of value field。
+            // 残り 2 bytes は 0 で埋める。
+            let value_pos = entry_pos + 8;
+            if little_endian {
+                app1_segment[value_pos] = 0x01;
+                app1_segment[value_pos + 1] = 0x00;
+                app1_segment[value_pos + 2] = 0x00;
+                app1_segment[value_pos + 3] = 0x00;
+            } else {
+                app1_segment[value_pos] = 0x00;
+                app1_segment[value_pos + 1] = 0x01;
+                app1_segment[value_pos + 2] = 0x00;
+                app1_segment[value_pos + 3] = 0x00;
+            }
+            break;
+        }
+    }
 }
 
 /// JPEG の SOI (FFD8) 直後に APP1 セグメントを挿入する。
@@ -413,9 +538,30 @@ fn encode_png_with_metadata(
     Ok(out)
 }
 
+/// IEEE 802.3 多項式 (0xEDB88320 reflected) の CRC32 — PNG / zlib と同じ系。
+/// テスト fixture と raw chunk 検証で共有する。
+fn png_crc32_compute(bytes: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in bytes {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
 /// PNG の tEXt / iTXt / zTXt チャンクを**生バイト**でそのまま取り出す。
 /// 各要素は `[length(4) + chunk_type(4) + data + crc(4)]` の生バイト列。
 /// 出現順を保ち、IHDR / IDAT / IEND など本体チャンクは除外する。
+///
+/// チャンクの **CRC32 を検証**し、不正なものは skip する (Codex P2)。元 PNG が
+/// 壊れた tEXt を含んでいる場合、それを raw で転写すると出力 PNG が strict
+/// デコーダ (libpng 等) で reject される。
 fn extract_png_text_chunks_raw(png: &[u8]) -> Result<Vec<Vec<u8>>, SaveError> {
     if png.len() < 8 || &png[..8] != b"\x89PNG\r\n\x1a\n" {
         return Err(SaveError::MetadataReadFailed("PNG signature 不正".into()));
@@ -432,7 +578,19 @@ fn extract_png_text_chunks_raw(png: &[u8]) -> Result<Vec<Vec<u8>>, SaveError> {
         }
         match chunk_type {
             b"tEXt" | b"iTXt" | b"zTXt" => {
-                out.push(png[pos..chunk_end].to_vec());
+                // CRC32 を検証 (= chunk_type + data に対して計算)。
+                let crc_pos = pos + 8 + length;
+                let stored_crc = u32::from_be_bytes([
+                    png[crc_pos],
+                    png[crc_pos + 1],
+                    png[crc_pos + 2],
+                    png[crc_pos + 3],
+                ]);
+                let computed = png_crc32_compute(&png[pos + 4..crc_pos]);
+                if computed == stored_crc {
+                    out.push(png[pos..chunk_end].to_vec());
+                }
+                // CRC 不一致は skip (= 出力 PNG を守る方を優先)。
             }
             b"IEND" => break,
             _ => {}
@@ -570,8 +728,16 @@ fn webp_is_animated(webp: &[u8]) -> bool {
 }
 
 /// 出力 WebP に VP8X 拡張コンテナを構築してメタデータチャンクを挿入する。
-/// 出力 webp crate は通常 VP8 / VP8L 単体の小さな RIFF を返すので、それを解析して
-/// 必要に応じて VP8X + メタデータ chunk を追加した新しい RIFF にする。
+///
+/// 出力が **既に VP8X 付き** (= libwebp が透過画像のために extended container
+/// 形式で出した場合) のときは、その VP8X の flags にメタデータ系ビットを OR
+/// するだけにする。重複 VP8X を作ると壊れた WebP になる (Codex P1)。
+///
+/// 透過なし入力で出力が VP8 / VP8L 単体のときは、canvas サイズを VP8/VP8L
+/// から取り出して新規 VP8X を先頭に挿入する。
+///
+/// 既存 VP8X を保ったまま flags をマージするので、`ALPH` チャンクなど
+/// libwebp 側の追加チャンクが落ちることもない。
 fn inject_webp_metadata(
     out: &[u8],
     iccp: Option<Vec<u8>>,
@@ -581,9 +747,11 @@ fn inject_webp_metadata(
     if out.len() < 12 || &out[..4] != b"RIFF" || &out[8..12] != b"WEBP" {
         return Err(SaveError::EncodingFailed("出力 WebP RIFF 不正".into()));
     }
-    // 出力 RIFF のチャンクを解析 (VP8 / VP8L のいずれか 1 つの想定)
+    // 出力 RIFF のチャンクを解析。VP8X / VP8 / VP8L / ALPH / 既存 EXIF/XMP/ICCP を
+    // すべて列挙する (existing VP8X / metadata はマージ・置換対象)。
     let mut chunks: Vec<(String, Vec<u8>)> = Vec::new();
     let mut canvas: Option<(u32, u32)> = None;
+    let mut existing_vp8x_idx: Option<usize> = None;
     let mut pos = 12;
     while pos + 8 <= out.len() {
         let fourcc = std::str::from_utf8(&out[pos..pos + 4])
@@ -597,59 +765,87 @@ fn inject_webp_metadata(
             break;
         }
         let data = out[data_start..data_end].to_vec();
-        // 出力 RIFF 側の VP8 / VP8L から canvas サイズを取り出す
+        // canvas サイズ取得 (VP8X が先頭にあればそこから、なければ VP8/VP8L から)
         if canvas.is_none() {
-            if fourcc == "VP8 " {
-                canvas = parse_vp8_canvas(&data);
-            } else if fourcc == "VP8L" {
-                canvas = parse_vp8l_canvas(&data);
+            match fourcc.as_str() {
+                "VP8X" if data.len() >= 10 => {
+                    let w =
+                        ((data[4] as u32) | ((data[5] as u32) << 8) | ((data[6] as u32) << 16)) + 1;
+                    let h =
+                        ((data[7] as u32) | ((data[8] as u32) << 8) | ((data[9] as u32) << 16)) + 1;
+                    canvas = Some((w, h));
+                }
+                "VP8 " => canvas = parse_vp8_canvas(&data),
+                "VP8L" => canvas = parse_vp8l_canvas(&data),
+                _ => {}
             }
         }
-        chunks.push((fourcc, data));
+        // 既存 metadata chunks は次の append フェーズで重複しないよう除外しつつ
+        // VP8X の位置だけ記憶しておく。
+        let drop = matches!(fourcc.as_str(), "EXIF" | "XMP " | "ICCP");
+        if !drop {
+            if fourcc == "VP8X" {
+                existing_vp8x_idx = Some(chunks.len());
+            }
+            chunks.push((fourcc, data));
+        }
         pos = data_end + (size & 1);
     }
     let (cw, ch) = canvas
         .ok_or_else(|| SaveError::EncodingFailed("出力 WebP の canvas サイズ取得失敗".into()))?;
 
-    // VP8X ヘッダを構築 (= chunk 列の先頭)
-    let mut flags: u8 = 0;
+    // 追加するメタデータ flags を計算 (VP8X bit2=XMP, bit3=EXIF, bit5=ICC)。
+    let mut add_flags: u8 = 0;
     if iccp.is_some() {
-        flags |= 1 << 5; // ICC profile
+        add_flags |= 1 << 5;
     }
     if exif.is_some() {
-        flags |= 1 << 3; // EXIF
+        add_flags |= 1 << 3;
     }
     if xmp.is_some() {
-        flags |= 1 << 2; // XMP
+        add_flags |= 1 << 2;
     }
-    let mut vp8x = vec![0u8; 10];
-    vp8x[0] = flags;
-    let w1 = cw - 1;
-    let h1 = ch - 1;
-    vp8x[4] = (w1 & 0xFF) as u8;
-    vp8x[5] = ((w1 >> 8) & 0xFF) as u8;
-    vp8x[6] = ((w1 >> 16) & 0xFF) as u8;
-    vp8x[7] = (h1 & 0xFF) as u8;
-    vp8x[8] = ((h1 >> 8) & 0xFF) as u8;
-    vp8x[9] = ((h1 >> 16) & 0xFF) as u8;
 
-    // 順序: VP8X, [ICCP], VP8/VP8L, [EXIF], [XMP]
-    let mut new_chunks: Vec<(String, Vec<u8>)> = Vec::new();
-    new_chunks.push(("VP8X".to_string(), vp8x));
+    if let Some(idx) = existing_vp8x_idx {
+        // 既存 VP8X の flags にメタデータビットを OR (= 透過 ALPH bit などは保つ)。
+        if let Some((_, data)) = chunks.get_mut(idx)
+            && !data.is_empty()
+        {
+            data[0] |= add_flags;
+        }
+    } else {
+        // 新規 VP8X を先頭 (canvas size の埋め込み付き) に挿入。
+        let mut vp8x = vec![0u8; 10];
+        vp8x[0] = add_flags;
+        let w1 = cw - 1;
+        let h1 = ch - 1;
+        vp8x[4] = (w1 & 0xFF) as u8;
+        vp8x[5] = ((w1 >> 8) & 0xFF) as u8;
+        vp8x[6] = ((w1 >> 16) & 0xFF) as u8;
+        vp8x[7] = (h1 & 0xFF) as u8;
+        vp8x[8] = ((h1 >> 8) & 0xFF) as u8;
+        vp8x[9] = ((h1 >> 16) & 0xFF) as u8;
+        chunks.insert(0, ("VP8X".to_string(), vp8x));
+    }
+
+    // ICCP は VP8X 直後に置く慣習。VP8X の index を再取得して insert する。
     if let Some(iccp_data) = iccp {
-        new_chunks.push(("ICCP".to_string(), iccp_data));
+        let after_vp8x = chunks
+            .iter()
+            .position(|(fc, _)| fc == "VP8X")
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        chunks.insert(after_vp8x, ("ICCP".to_string(), iccp_data));
     }
-    for (fc, data) in chunks {
-        new_chunks.push((fc, data));
-    }
+    // EXIF / XMP は末尾に append (画像チャンクの後ろが標準)。
     if let Some(exif_data) = exif {
-        new_chunks.push(("EXIF".to_string(), exif_data));
+        chunks.push(("EXIF".to_string(), exif_data));
     }
     if let Some(xmp_data) = xmp {
-        new_chunks.push(("XMP ".to_string(), xmp_data));
+        chunks.push(("XMP ".to_string(), xmp_data));
     }
 
-    Ok(rebuild_webp_riff(&new_chunks))
+    Ok(rebuild_webp_riff(&chunks))
 }
 
 fn rebuild_webp_riff(chunks: &[(String, Vec<u8>)]) -> Vec<u8> {
@@ -702,14 +898,23 @@ fn parse_vp8l_canvas(data: &[u8]) -> Option<(u32, u32)> {
 
 // ── 共通 ヘルパー ───────────────────────────────────────────────────
 
+/// `ColorImage` から RGBA8 を取り出す。egui の `Color32` は**premultiplied**
+/// 表現で保持されているため、`to_srgba_unmultiplied()` で unmultiplied (= 通常の
+/// sRGB) に戻してからエンコーダに渡す。これをやらないと半透明ピクセルが
+/// premultiplied 値で書かれてしまい、PNG / WebP デコーダで暗く再現される
+/// (Codex P1)。
 fn color_image_to_rgba(image: &ColorImage) -> Vec<u8> {
     let mut out = Vec::with_capacity(image.pixels.len() * 4);
     for px in &image.pixels {
-        out.extend_from_slice(&[px.r(), px.g(), px.b(), px.a()]);
+        let [r, g, b, a] = px.to_srgba_unmultiplied();
+        out.extend_from_slice(&[r, g, b, a]);
     }
     out
 }
 
+/// 透過 RGBA を black-matte で RGB に flatten する (= JPEG 用)。
+/// 入力 RGBA は**unmultiplied** であることを前提とする (= `color_image_to_rgba` の
+/// 出力を直接渡せる)。
 fn flatten_rgba_to_rgb_black(rgba: &[u8], _width: u32) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
     for px in rgba.chunks_exact(4) {
@@ -888,23 +1093,6 @@ mod tests {
         assert!(segs.is_empty(), "include_metadata=false should drop APP1");
     }
 
-    /// PNG CRC32 (= IEEE 802.3 / Ethernet 多項式) を計算する。
-    /// テスト fixture 用なので非効率な bit-by-bit 実装で十分。
-    fn png_crc32(bytes: &[u8]) -> u32 {
-        let mut crc = 0xFFFF_FFFFu32;
-        for &b in bytes {
-            crc ^= b as u32;
-            for _ in 0..8 {
-                if crc & 1 != 0 {
-                    crc = (crc >> 1) ^ 0xEDB8_8320;
-                } else {
-                    crc >>= 1;
-                }
-            }
-        }
-        !crc
-    }
-
     fn make_minimal_png_with_text_chunk(keyword: &str, text: &str) -> Vec<u8> {
         // 8x8 RGBA PNG を encode してから tEXt チャンクを IHDR 直後に挿入
         let img = sample_color_image(8, 8);
@@ -923,7 +1111,7 @@ mod tests {
         let mut crc_input: Vec<u8> = Vec::with_capacity(4 + chunk_data.len());
         crc_input.extend_from_slice(b"tEXt");
         crc_input.extend_from_slice(&chunk_data);
-        let crc = png_crc32(&crc_input);
+        let crc = png_crc32_compute(&crc_input);
         let mut chunk: Vec<u8> = Vec::new();
         chunk.extend_from_slice(&(chunk_data.len() as u32).to_be_bytes());
         chunk.extend_from_slice(b"tEXt");
@@ -996,5 +1184,231 @@ mod tests {
             matches!(result, Err(SaveError::AnimatedWebpNotSupported)),
             "should reject animated WebP"
         );
+    }
+
+    // ── Codex P1/P2 修正対応の回帰テスト ──
+
+    /// 半透明ピクセル (premultiplied alpha) が unmultiplied で書かれていることを確認。
+    /// `color_image_to_rgba` が `to_srgba_unmultiplied` を経由していれば、
+    /// `Color32::from_rgba_unmultiplied(200, 100, 50, 128)` を取り出したとき
+    /// (200, 100, 50, 128) に戻る (= premultiplied 中間値 (100, 50, 25, 128) にならない)。
+    #[test]
+    fn color_image_to_rgba_returns_unmultiplied() {
+        let img = ColorImage {
+            size: [1, 1],
+            pixels: vec![egui::Color32::from_rgba_unmultiplied(200, 100, 50, 128)],
+            source_size: egui::vec2(1.0, 1.0),
+        };
+        let rgba = color_image_to_rgba(&img);
+        assert_eq!(rgba.len(), 4);
+        // unmultiplied なら 200, 100, 50 のまま (= premultiplied だと丸誤差 ±1 で
+        // ~100, ~50, ~25 になる)。許容誤差 ±2 で確認。
+        assert!((rgba[0] as i32 - 200).abs() <= 2, "R: got {}", rgba[0]);
+        assert!((rgba[1] as i32 - 100).abs() <= 2, "G: got {}", rgba[1]);
+        assert!((rgba[2] as i32 - 50).abs() <= 2, "B: got {}", rgba[2]);
+        assert_eq!(rgba[3], 128);
+    }
+
+    /// アニメーション WebP は `include_metadata=false` でも拒否されること (Codex P2)。
+    /// メタデータは要らなくても、静止画 RGBA を ANIM 入力に対して書くのは妥当でない。
+    #[test]
+    fn webp_animated_rejected_even_without_metadata() {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(b"WEBP");
+        bytes.extend_from_slice(b"ANIM");
+        bytes.extend_from_slice(&6u32.to_le_bytes());
+        bytes.extend_from_slice(&[0, 0, 0, 0, 1, 0]);
+        let total = (bytes.len() - 8) as u32;
+        bytes[4..8].copy_from_slice(&total.to_le_bytes());
+
+        let img = sample_color_image(4, 4);
+        let opts = SaveOptions {
+            include_metadata: false,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("anim.webp");
+        let result =
+            save_image_with_metadata(&img, None, Some(&bytes), &dst, SrcFormat::Webp, &opts);
+        assert!(
+            matches!(result, Err(SaveError::AnimatedWebpNotSupported)),
+            "animated WebP must be rejected regardless of include_metadata"
+        );
+    }
+
+    /// 不正な APP1 length (< 2) を含む src JPEG をエンコードに通しても、
+    /// 出力 JPEG に raw 転写されないことを確認 (Codex P2)。
+    #[test]
+    fn jpeg_malformed_app1_length_does_not_break_output() {
+        // turbojpeg で作った正常 JPEG の SOI 直後に「長さ=0 の APP1」だけ挟む。
+        let img = sample_color_image(8, 8);
+        let rgba = color_image_to_rgba(&img);
+        let rgb = flatten_rgba_to_rgb_black(&rgba, 8);
+        let rimg = image::RgbImage::from_raw(8, 8, rgb).unwrap();
+        let jpeg = turbojpeg::compress_image(&rimg, 90, turbojpeg::Subsamp::Sub2x2).unwrap();
+        let jpeg_bytes = jpeg.as_ref();
+        let mut malformed = Vec::with_capacity(jpeg_bytes.len() + 4);
+        malformed.extend_from_slice(&jpeg_bytes[..2]); // SOI
+        malformed.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x01]); // APP1 length=1 (不正)
+        malformed.extend_from_slice(&jpeg_bytes[2..]);
+        // この malformed の APP1 を抽出すると、不正長で打ち切られて空 Vec を返すはず。
+        let segs = extract_jpeg_app1_segments(&malformed).unwrap();
+        assert!(segs.is_empty(), "malformed APP1 should be skipped");
+    }
+
+    /// CRC が壊れた tEXt チャンクが出力に転写されないことを確認 (Codex P2)。
+    #[test]
+    fn png_bad_crc_chunk_is_skipped() {
+        // 正常な tEXt + 壊れた CRC の tEXt をそれぞれ作って、抽出側で
+        // 正常な方だけ拾われることを見る。
+        let img = sample_color_image(8, 8);
+        let rgba = color_image_to_rgba(&img);
+        let mut bytes: Vec<u8> = Vec::new();
+        use image::ImageEncoder;
+        image::codecs::png::PngEncoder::new(&mut bytes)
+            .write_image(&rgba, 8, 8, image::ColorType::Rgba8.into())
+            .unwrap();
+
+        // 正常 tEXt
+        let mut ok_data: Vec<u8> = Vec::new();
+        ok_data.extend_from_slice(b"good");
+        ok_data.push(0);
+        ok_data.extend_from_slice(b"value");
+        let mut crc_in: Vec<u8> = b"tEXt".to_vec();
+        crc_in.extend_from_slice(&ok_data);
+        let ok_crc = png_crc32_compute(&crc_in);
+        let mut ok_chunk: Vec<u8> = Vec::new();
+        ok_chunk.extend_from_slice(&(ok_data.len() as u32).to_be_bytes());
+        ok_chunk.extend_from_slice(b"tEXt");
+        ok_chunk.extend_from_slice(&ok_data);
+        ok_chunk.extend_from_slice(&ok_crc.to_be_bytes());
+
+        // 壊れた CRC tEXt
+        let mut bad_data: Vec<u8> = Vec::new();
+        bad_data.extend_from_slice(b"bad");
+        bad_data.push(0);
+        bad_data.extend_from_slice(b"value");
+        let mut bad_chunk: Vec<u8> = Vec::new();
+        bad_chunk.extend_from_slice(&(bad_data.len() as u32).to_be_bytes());
+        bad_chunk.extend_from_slice(b"tEXt");
+        bad_chunk.extend_from_slice(&bad_data);
+        bad_chunk.extend_from_slice(&0xDEAD_BEEFu32.to_be_bytes()); // 不正 CRC
+
+        let with_chunks = splice_png_text_chunks(&bytes, &[ok_chunk, bad_chunk]).unwrap();
+        let extracted = extract_png_text_chunks_raw(&with_chunks).unwrap();
+        assert_eq!(extracted.len(), 1, "only the good CRC chunk should remain");
+        // ok_chunk であることを確認 (= "good\0value" を含む)
+        let c = &extracted[0];
+        let length = u32::from_be_bytes([c[0], c[1], c[2], c[3]]) as usize;
+        let data = &c[8..8 + length];
+        let null = data.iter().position(|&b| b == 0).unwrap();
+        assert_eq!(&data[..null], b"good");
+    }
+
+    /// JPEG export 時に EXIF APP1 の Orientation タグが 1 に書き換わることを確認 (Codex P1)。
+    #[test]
+    fn jpeg_exif_orientation_is_reset_to_1() {
+        // EXIF APP1 を手で作る (little-endian TIFF, IFD0 に Orientation=6)。
+        let mut exif_payload: Vec<u8> = Vec::new();
+        exif_payload.extend_from_slice(b"Exif\x00\x00"); // 6 bytes header
+        let tiff_start = exif_payload.len();
+        exif_payload.extend_from_slice(b"II"); // little-endian
+        exif_payload.extend_from_slice(&0x002Au16.to_le_bytes()); // magic
+        exif_payload.extend_from_slice(&8u32.to_le_bytes()); // IFD0 offset = 8 (from TIFF start)
+        // IFD0 at tiff_start + 8
+        exif_payload.extend_from_slice(&1u16.to_le_bytes()); // entry count = 1
+        // Entry: tag=0x0112 (Orientation), type=3 (SHORT), count=1, value=6 (rotated 90 CW)
+        exif_payload.extend_from_slice(&0x0112u16.to_le_bytes());
+        exif_payload.extend_from_slice(&3u16.to_le_bytes());
+        exif_payload.extend_from_slice(&1u32.to_le_bytes());
+        exif_payload.extend_from_slice(&6u16.to_le_bytes());
+        exif_payload.extend_from_slice(&0u16.to_le_bytes()); // padding
+        // Next IFD offset = 0
+        exif_payload.extend_from_slice(&0u32.to_le_bytes());
+        let _ = tiff_start;
+
+        // 上記 payload を APP1 に詰めて src JPEG を作る
+        let img = sample_color_image(8, 8);
+        let rgba = color_image_to_rgba(&img);
+        let rgb = flatten_rgba_to_rgb_black(&rgba, 8);
+        let rimg = image::RgbImage::from_raw(8, 8, rgb).unwrap();
+        let jpeg = turbojpeg::compress_image(&rimg, 90, turbojpeg::Subsamp::Sub2x2).unwrap();
+        let jpeg_bytes = jpeg.as_ref();
+        let app1_len = exif_payload.len() + 2;
+        let mut src = Vec::with_capacity(jpeg_bytes.len() + 4 + exif_payload.len());
+        src.extend_from_slice(&jpeg_bytes[..2]);
+        src.push(0xFF);
+        src.push(0xE1);
+        src.push((app1_len >> 8) as u8);
+        src.push((app1_len & 0xFF) as u8);
+        src.extend_from_slice(&exif_payload);
+        src.extend_from_slice(&jpeg_bytes[2..]);
+
+        // encode 経由で Orientation が 1 に書き換わっているか確認
+        let opts = SaveOptions::default();
+        let out = encode_jpeg_with_metadata(&img, Some(&src), &opts).unwrap();
+        let segs = extract_jpeg_app1_segments(&out).unwrap();
+        assert_eq!(segs.len(), 1);
+        let seg = &segs[0];
+        // APP1 payload[4..10] = "Exif\0\0"
+        assert_eq!(&seg[4..10], b"Exif\x00\x00");
+        let tiff = 10;
+        // IFD0 = tiff + 8
+        let ifd0 = tiff + 8;
+        let count = u16::from_le_bytes([seg[ifd0], seg[ifd0 + 1]]);
+        assert_eq!(count, 1);
+        let entry = ifd0 + 2;
+        let tag = u16::from_le_bytes([seg[entry], seg[entry + 1]]);
+        assert_eq!(tag, 0x0112);
+        // value field at entry + 8, little-endian short = 1
+        assert_eq!(seg[entry + 8], 0x01);
+        assert_eq!(seg[entry + 9], 0x00);
+    }
+
+    /// 透過 RGBA を WebP に書き出したとき、`VP8X` が 1 つだけになることを確認 (Codex P1)。
+    /// libwebp は alpha 入力に対して extended container (= VP8X + ALPH + VP8/VP8L) を
+    /// 出すので、そこにメタデータを追加するとき VP8X を新規挿入してはいけない。
+    #[test]
+    fn webp_transparent_input_does_not_duplicate_vp8x() {
+        // 半透明 RGBA pixel image を encode
+        let pixels: Vec<egui::Color32> = (0..16 * 16)
+            .map(|i| {
+                let a = if i % 2 == 0 { 128 } else { 255 };
+                egui::Color32::from_rgba_unmultiplied(200, 100, 50, a)
+            })
+            .collect();
+        let img = ColorImage {
+            size: [16, 16],
+            pixels,
+            source_size: egui::vec2(16.0, 16.0),
+        };
+
+        // 元 WebP も透過付きで作って metadata を inject
+        let rgba = color_image_to_rgba(&img);
+        let raw = webp::Encoder::from_rgba(&rgba, 16, 16).encode(85.0);
+        let src_with_meta = inject_webp_metadata(
+            raw.as_ref(),
+            None,
+            None,
+            Some(b"<x:xmpmeta>FAKE</x:xmpmeta>".to_vec()),
+        )
+        .unwrap();
+        // 半透明入力 + XMP メタデータの結合で encode
+        let opts = SaveOptions::default();
+        let out = encode_webp_with_metadata(&img, Some(&src_with_meta), &opts).unwrap();
+        // VP8X の出現回数を数える
+        let mut vp8x_count = 0;
+        let mut pos = 12;
+        while pos + 8 <= out.len() {
+            if &out[pos..pos + 4] == b"VP8X" {
+                vp8x_count += 1;
+            }
+            let size = u32::from_le_bytes([out[pos + 4], out[pos + 5], out[pos + 6], out[pos + 7]])
+                as usize;
+            pos += 8 + size + (size & 1);
+        }
+        assert_eq!(vp8x_count, 1, "VP8X should appear exactly once");
     }
 }
