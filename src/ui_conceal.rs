@@ -1634,22 +1634,63 @@ impl App {
                             if tile_changed || bnd_changed || type_changed {
                                 self.bump_conceal_generation();
                             }
+                        } else if matches!(
+                            self.settings.conceal_type,
+                            crate::conceal::ConcealType::WhiteFill
+                                | crate::conceal::ConcealType::BlackFill
+                        ) {
+                            // ── WhiteFill / BlackFill パラメータ (Phase 3b) ──
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("不透明度:")
+                                    .color(egui::Color32::from_gray(200)),
+                            );
+                            let mut opacity = self.settings.conceal_fill_opacity_percent;
+                            let prev_opacity = opacity;
+                            ui.add(
+                                egui::Slider::new(&mut opacity, 1..=100)
+                                    .text("%")
+                                    .step_by(1.0),
+                            );
+                            let mut fill_changed = false;
+                            if opacity != prev_opacity {
+                                self.settings.conceal_fill_opacity_percent = opacity;
+                                fill_changed = true;
+                            }
+                            ui.label(
+                                egui::RichText::new("境界処理:")
+                                    .color(egui::Color32::from_gray(200)),
+                            );
+                            let mut edge = self.settings.conceal_fill_edge;
+                            for e in [
+                                crate::conceal::FillEdge::Sharp,
+                                crate::conceal::FillEdge::Feathered,
+                            ] {
+                                let label = egui::RichText::new(e.process_description()).size(11.0);
+                                if ui.radio(edge == e, label).clicked() && edge != e {
+                                    edge = e;
+                                    self.settings.conceal_fill_edge = e;
+                                    fill_changed = true;
+                                }
+                            }
+                            let _ = edge;
+                            if fill_changed || type_changed {
+                                self.bump_conceal_generation();
+                            }
                         } else if type_changed {
-                            // Mosaic 以外でも type 切替なら世代 bump
+                            // 残るは Blur (Phase 3c 未実装) — Mosaic にフォールバック扱い。
                             self.bump_conceal_generation();
-                            // Phase 3b/3c 実装待ち。一時的に Mosaic 合成にフォールバック
-                            // (ensure_conceal_texture が Mosaic 設定で合成する)。
                             ui.colored_label(
                                 egui::Color32::from_rgb(220, 180, 80),
-                                "※ このタイプは未実装 (Mosaic にフォールバック)",
+                                "※ ぼかしは未実装 (Mosaic にフォールバック)",
                             );
-                        } else if !matches!(
+                        } else if matches!(
                             self.settings.conceal_type,
-                            crate::conceal::ConcealType::Mosaic
+                            crate::conceal::ConcealType::Blur
                         ) {
                             ui.colored_label(
                                 egui::Color32::from_rgb(220, 180, 80),
-                                "※ このタイプは未実装 (Mosaic にフォールバック)",
+                                "※ ぼかしは未実装 (Mosaic にフォールバック)",
                             );
                         }
 

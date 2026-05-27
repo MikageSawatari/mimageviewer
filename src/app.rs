@@ -16713,21 +16713,50 @@ impl App {
         let mut composite = bitmap;
         crate::mask_db::rasterize_shapes_into(&mut composite, &shapes, w, h);
 
-        // タイプ別合成。Phase 3a 時点で Mosaic のみ実装、他は Mosaic にフォールバック
-        // (Phase 3b/3c で `compose_solid_fill` / `compose_blur` を追加した時点で
-        // ここを match で分岐させる)。
-        let composed = {
-            let long_edge = w.max(h) as u32;
-            let tile = crate::conceal::compute_tile_size(
-                long_edge,
-                self.settings.conceal_mosaic_tile_mode,
-            );
-            crate::conceal_compose::compose_mosaic(
+        // タイプ別合成 (Phase 3b で Fill を追加、Blur は Phase 3c 待ちで当面 Mosaic
+        // にフォールバック)。
+        let composed = match self.settings.conceal_type {
+            crate::conceal::ConcealType::Mosaic => {
+                let long_edge = w.max(h) as u32;
+                let tile = crate::conceal::compute_tile_size(
+                    long_edge,
+                    self.settings.conceal_mosaic_tile_mode,
+                );
+                crate::conceal_compose::compose_mosaic(
+                    source_pixels.as_ref(),
+                    &composite,
+                    tile,
+                    self.settings.conceal_mosaic_boundary,
+                )
+            }
+            crate::conceal::ConcealType::WhiteFill => crate::conceal_compose::compose_solid_fill(
                 source_pixels.as_ref(),
                 &composite,
-                tile,
-                self.settings.conceal_mosaic_boundary,
-            )
+                egui::Color32::WHITE,
+                self.settings.conceal_fill_opacity_percent,
+                self.settings.conceal_fill_edge,
+            ),
+            crate::conceal::ConcealType::BlackFill => crate::conceal_compose::compose_solid_fill(
+                source_pixels.as_ref(),
+                &composite,
+                egui::Color32::BLACK,
+                self.settings.conceal_fill_opacity_percent,
+                self.settings.conceal_fill_edge,
+            ),
+            crate::conceal::ConcealType::Blur => {
+                // Phase 3c 未実装 — 一時的に Mosaic 合成にフォールバック。
+                let long_edge = w.max(h) as u32;
+                let tile = crate::conceal::compute_tile_size(
+                    long_edge,
+                    self.settings.conceal_mosaic_tile_mode,
+                );
+                crate::conceal_compose::compose_mosaic(
+                    source_pixels.as_ref(),
+                    &composite,
+                    tile,
+                    self.settings.conceal_mosaic_boundary,
+                )
+            }
         };
 
         let tex = ctx.load_texture(
