@@ -6,7 +6,7 @@
 
 **進捗メモ (2026-05-27 / 2026-05-28 更新)**: Phase 6 の本体
 (`src/export_dialog.rs`、Ctrl+E 起動、worker 合成・保存、進捗モーダル、
-最低限の仕様ドキュメント更新) は実装済み。未完は Phase 7 の統合テスト拡充と
+最低限の仕様ドキュメント更新) と Phase 7 の統合テスト拡充は実装済み。未完は
 Phase 8 の詳細マニュアル整備。
 
 このブリーフは前 2 件 (`docs/erase-cache-refactor-plan.md` /
