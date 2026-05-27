@@ -659,15 +659,130 @@ impl App {
         child.set_clip_rect(panel_rect);
 
         // ── ヘッダー ──
+        // タイトル「画像補正」を左寄せにし、右側に消しゴム / 隠蔽加工の起動アイコンを
+        // 並べる。E / Ctrl+M キーと同じ動作 (= モード入場) をマウスからも辿れるように
+        // するためのエントリーポイント。隠蔽加工はアイコンが他に無いので「消」/「隠」
+        // 1 文字バッジを共通色で出す (グリッド左上の補/消/隠バッジと同色)。
         let header_rect =
             egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), HEADER_H));
+        const HEADER_BTN_SIZE: f32 = 26.0;
+        const HEADER_BTN_GAP: f32 = 4.0;
+        const HEADER_RIGHT_PAD: f32 = 8.0;
+        // タイトル左寄せ (8px パディング、CENTER_Y 縦中央)
         child.painter().text(
-            header_rect.center(),
-            egui::Align2::CENTER_CENTER,
+            egui::pos2(header_rect.min.x + 8.0, header_rect.center().y),
+            egui::Align2::LEFT_CENTER,
             "画像補正",
             egui::FontId::proportional(16.0),
             egui::Color32::WHITE,
         );
+        // 起動可能か (= 画像のみ。動画 / セパレータ / コンテナ は無効化)。
+        // `image_dims` が None なら未ロード / 非画像なので無効。
+        let can_overlay_edit = image_dims.is_some()
+            && matches!(
+                self.items.get(fs_idx),
+                Some(
+                    crate::grid_item::GridItem::Image(_)
+                        | crate::grid_item::GridItem::ZipImage { .. }
+                        | crate::grid_item::GridItem::PdfPage { .. }
+                )
+            );
+        // 右側 2 ボタン (隠蔽 = 右端 / 消しゴム = その左)
+        let btn_y = header_rect.center().y - HEADER_BTN_SIZE / 2.0;
+        let conceal_btn_x = header_rect.max.x - HEADER_RIGHT_PAD - HEADER_BTN_SIZE;
+        let erase_btn_x = conceal_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
+        let erase_rect = egui::Rect::from_min_size(
+            egui::pos2(erase_btn_x, btn_y),
+            egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
+        );
+        let conceal_rect = egui::Rect::from_min_size(
+            egui::pos2(conceal_btn_x, btn_y),
+            egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
+        );
+        let mut activate_erase = false;
+        let mut activate_conceal = false;
+        // 消しゴムボタン: 「消」(オレンジ) — `draw_cell` のバッジと同色
+        {
+            let resp = child.interact(
+                erase_rect,
+                egui::Id::new("adjust_panel_erase_btn"),
+                egui::Sense::click(),
+            );
+            let bg = if !can_overlay_edit {
+                egui::Color32::from_rgba_unmultiplied(80, 30, 15, 120)
+            } else if resp.hovered() {
+                egui::Color32::from_rgb(220, 100, 50)
+            } else {
+                egui::Color32::from_rgb(200, 80, 40)
+            };
+            child.painter().rect_filled(erase_rect, 4.0, bg);
+            child.painter().text(
+                erase_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "消",
+                egui::FontId::proportional(14.0),
+                if can_overlay_edit {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::from_gray(140)
+                },
+            );
+            if can_overlay_edit && resp.clicked() {
+                activate_erase = true;
+            }
+            // ホバー時に英字ショートカット (E キー) を tooltip
+            if can_overlay_edit {
+                resp.on_hover_text("消しゴム (E)");
+            }
+        }
+        // 隠蔽加工ボタン: 「隠」(紫)
+        {
+            let resp = child.interact(
+                conceal_rect,
+                egui::Id::new("adjust_panel_conceal_btn"),
+                egui::Sense::click(),
+            );
+            let bg = if !can_overlay_edit {
+                egui::Color32::from_rgba_unmultiplied(60, 40, 80, 120)
+            } else if resp.hovered() {
+                egui::Color32::from_rgb(180, 130, 230)
+            } else {
+                egui::Color32::from_rgb(153, 102, 204)
+            };
+            child.painter().rect_filled(conceal_rect, 4.0, bg);
+            child.painter().text(
+                conceal_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "隠",
+                egui::FontId::proportional(14.0),
+                if can_overlay_edit {
+                    egui::Color32::WHITE
+                } else {
+                    egui::Color32::from_gray(140)
+                },
+            );
+            if can_overlay_edit && resp.clicked() {
+                activate_conceal = true;
+            }
+            if can_overlay_edit {
+                resp.on_hover_text("隠蔽加工 (Ctrl+M)");
+            }
+        }
+        // クリック処理は描画後にディスパッチ (借用衝突回避)。
+        // 補正パネルは「ホバーで自動閉じる」モードなので、消しゴム / 隠蔽に入る前に
+        // adjustment_mode を倒しておく (enter_*_mode 内のガード `!self.adjustment_mode`
+        // と整合させるためにも必要)。`enter_*_mode` 自身が必要なキャッシュ初期化と
+        // post_filter バイパスを行うので、ここでは flag を倒すだけで十分。
+        if activate_erase {
+            self.adjustment_mode = false;
+            self.enter_erase_mode(fs_root_idx);
+            return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
+        }
+        if activate_conceal {
+            self.adjustment_mode = false;
+            self.enter_conceal_mode(fs_root_idx);
+            return;
+        }
 
         // ── 見開き L/R セレクタ + コピーボタン (Double のときだけ) ──
         let selector_h = if spread_lr.is_some() { 30.0 } else { 0.0 };

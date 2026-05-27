@@ -15989,6 +15989,11 @@ impl App {
             // 走らないルート (fullscreen_idx 不一致 / bg 不一致) でも cache 状態が
             // 変わるので必ず先に bump しておく。
             self.bump_adjustment_generation(idx);
+            // 隠蔽合成キャッシュも該当 idx を破棄 (`docs/conceal-feature-plan.md §9` の
+            // 「AI モデル変更 / AI 完了 → conceal_cache 該当 idx クリア」hook)。
+            // AI 結果が conceal の入力レイヤになるので、stale を残すと低解像度ベースの
+            // 隠蔽が固定表示されてしまう。
+            self.clear_conceal_caches(idx);
             if self.fullscreen_idx == Some(idx) && self.effective_upscale_bg_mode() == bg {
                 self.apply_sync_adjustment(ctx, idx, &pixels);
             }

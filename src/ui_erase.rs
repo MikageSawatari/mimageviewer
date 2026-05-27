@@ -2275,13 +2275,23 @@ impl App {
         ));
     }
 
-    /// `fs_cache` を差し替えたあとに呼ぶ。上位レイヤ (AI アップスケール / 補正) の
-    /// キャッシュを無効化して、新しい元画像で再処理させる。
+    /// `fs_cache` を差し替えたあとに呼ぶ。上位レイヤ (AI アップスケール / 補正 /
+    /// 隠蔽合成) のキャッシュを無効化して、新しい元画像で再処理させる。
     /// 処理中の AI タスクがあればキャンセル。
     pub(crate) fn invalidate_derived_fs_caches(&mut self, idx: usize) {
         self.purge_upscale_for_idx(idx);
         self.adjustment_cache.remove(&idx);
         self.adjustment_sharpened.remove(&idx);
+        // 隠蔽合成キャッシュも該当 idx を破棄。
+        //
+        // バグ修正 (2026-05): 消しゴム inpaint 完了直後に `conceal_cache[idx]` が
+        // stale 化していたが invalidate されておらず、「消しゴム + 隠蔽加工 両方
+        // 保存されたページを開き直すと隠蔽は出るが消しゴムが反映されない (= raw 画像
+        // にモザイクが掛かっている状態)」になっていた。
+        // 消しゴムモードに一度入って出ると `clear_adjustment_caches` 経由で invalidate
+        // されて見えるようになっていたのが症状。`docs/conceal-feature-plan.md §9` の
+        // 「消しゴム inpaint 完了 → conceal_cache 該当 idx クリア」を実装する hook。
+        self.clear_conceal_caches(idx);
     }
 
     /// `fs_cache` に `Static` エントリがあれば、その `source_dims` を返す。
