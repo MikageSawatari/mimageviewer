@@ -337,6 +337,10 @@ impl App {
             self.erase_selected_shape = None;
             self.erase_drag = None;
             self.erase_mask_texture = None;
+            // mask 復元 → preview cache 破棄。
+            if let Some(fs_idx) = self.fullscreen_idx {
+                self.clear_erase_preview(fs_idx);
+            }
             true
         } else {
             false
@@ -380,6 +384,10 @@ impl App {
         self.erase_shapes = slot_vectors;
         self.erase_selected_shape = None;
         self.erase_mask_texture = None;
+        // mask 差し替え → preview cache 破棄。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_erase_preview(fs_idx);
+        }
         self.show_feedback_toast(format!("[スロット{}をロード]", slot));
     }
 
@@ -1825,19 +1833,21 @@ impl App {
                         // パネル全体が広がり、右側が「スカスカ」に見えるため (実機 FB)。
                         ui.set_min_width(PANEL_W);
                         ui.set_max_width(PANEL_W);
-                        // ⚠ 重要: テーマに依存せず常に DARK visuals を使う。
-                        //
-                        // 旧実装は `override_text_color = WHITE` + `widgets.*.fg_stroke.color
-                        // = WHITE` の組合せで強制していたが、ユーザーが OS / アプリで Light
-                        // テーマを選択していると、widget visuals の `weak_bg_fill` などが
-                        // 自動的に near-white になり、「白背景 + 白文字」で完全に読めなく
-                        // なる問題があった (実機 FB R3)。
-                        //
-                        // CLAUDE.md ポリシー (= フルスクリーン内は黒背景ベース統一) に従い、
-                        // 子 ui の visuals を `Visuals::dark()` に固定。ラベル文字を白くする
-                        // override_text_color はその後に上乗せ。
+                        // ⚠ 重要: テーマに依存せず常に DARK visuals を使う (R3 FB)。
+                        // 詳細は ui_conceal.rs の同様コメント参照。
                         *ui.visuals_mut() = egui::Visuals::dark();
                         ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
+
+                        // パネル全体を ScrollArea で囲み、ウィンドウ縦幅より大きいときに
+                        // スクロール可能にする (実機 FB R4 #2: 「ウィンドウ縦幅が狭いと
+                        // パネル全体が表示できない」)。max_height は full_rect 下端 -
+                        // panel_pos.y - 余白で算出。auto_shrink: 縦は内容に合わせて
+                        // 縮む (= 内容が短いときは ScrollArea が小さくなる)、横は固定。
+                        let max_height = (full_rect.max.y - panel_pos.y - 20.0).max(120.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(max_height)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
 
                         // ── ヘッダ (タイトル + プレビュー + 閉じる × ボタン) ──
                         ui.horizontal(|ui| {
@@ -2104,8 +2114,9 @@ impl App {
                             )
                             .wrap(),
                         );
-                    });
-            });
+                            }); // ScrollArea::show
+                    }); // Frame::popup .show
+            }); // Area::show
 
         // ── closure 外でディスパッチ (& mut self の借用衝突を避ける) ──
         // プレビューボタンの **押下 transition** (false → true) を検出して、

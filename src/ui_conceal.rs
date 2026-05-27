@@ -1613,557 +1613,583 @@ impl App {
                         // 幅キャップ (= 内容が広い widget で auto-size 拡大しないように)。
                         ui.set_min_width(PANEL_W);
                         ui.set_max_width(PANEL_W);
-                        // ⚠ 重要: テーマに依存せず常に DARK visuals を使う。
-                        // CLAUDE.md ポリシー (= フルスクリーン内は黒背景ベース統一) に従い、
-                        // Light テーマでも widget bg_fill / text_edit_bg_color が
-                        // near-white にならないよう `Visuals::dark()` で上書き
-                        // (= スライダー値の DragValue / TextEdit 編集モード両方とも
-                        // dark に確定する)。消しゴムパネルと同じ構成。
+                        // ⚠ 重要: テーマに依存せず常に DARK visuals を使う (R3 FB)。
                         *ui.visuals_mut() = egui::Visuals::dark();
                         ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
 
-                        // ── ヘッダ (タイトル + プレビュー + 閉じる × ボタン) ──
-                        // 右端に「目アイコン (プレビュー)」と「× (閉じる)」を並べる。
-                        // プレビューは押している間だけ `conceal_preview_active = true`
-                        // にして表示パイプラインで合成を含める。閉じるはモード退出。
-                        let mut preview_pressed = false;
-                        let mut close_clicked = false;
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("隠蔽加工")
-                                    .size(15.0)
-                                    .strong()
-                                    .color(egui::Color32::WHITE),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    // 閉じる × ボタン
-                                    let (close_rect, close_resp) = ui.allocate_exact_size(
-                                        egui::vec2(26.0, 22.0),
-                                        egui::Sense::click(),
-                                    );
-                                    let close_bg = if close_resp.hovered() {
-                                        egui::Color32::from_rgba_unmultiplied(220, 80, 80, 200)
-                                    } else {
-                                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
-                                    };
-                                    ui.painter().rect_filled(close_rect, 4.0, close_bg);
-                                    crate::ui_fullscreen::draw_icons::draw_close_icon(
-                                        ui.painter(),
-                                        close_rect.center(),
-                                        8.0,
-                                    );
-                                    if close_resp.clicked() {
-                                        close_clicked = true;
-                                    }
-                                    close_resp.on_hover_text("閉じる (Esc / Ctrl+M)");
-                                    ui.add_space(2.0);
-                                    // プレビュー 目アイコン (= while held)
-                                    let (eye_rect, eye_resp) = ui.allocate_exact_size(
-                                        egui::vec2(26.0, 22.0),
-                                        egui::Sense::click_and_drag(),
-                                    );
-                                    let eye_bg = if eye_resp.is_pointer_button_down_on() {
-                                        // 押下中 = アクセント青
-                                        egui::Color32::from_rgb(60, 120, 200)
-                                    } else if eye_resp.hovered() {
-                                        egui::Color32::from_rgba_unmultiplied(100, 100, 100, 220)
-                                    } else {
-                                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
-                                    };
-                                    ui.painter().rect_filled(eye_rect, 4.0, eye_bg);
-                                    crate::ui_fullscreen::draw_icons::draw_eye_icon(
-                                        ui.painter(),
-                                        eye_rect.center(),
-                                        8.0,
-                                    );
-                                    if eye_resp.is_pointer_button_down_on() {
-                                        preview_pressed = true;
-                                    }
-                                    eye_resp.on_hover_text(
-                                        "押している間: モザイク反映後の最終結果プレビュー",
-                                    );
-                                },
-                            );
-                        });
-                        self.conceal_preview_active = preview_pressed;
-                        if close_clicked {
-                            should_close_after_draw = true;
-                        }
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "処理: {}",
-                                self.settings.conceal_type.label()
-                            ))
-                            .color(egui::Color32::from_gray(200)),
-                        );
-                        ui.separator();
-
-                        // 描画 / 消去 (active=赤/青、inactive=暗灰、hover=やや明灰)
-                        let btn_w = ((PANEL_W - 16.0 - 4.0) / 2.0).max(60.0);
-                        let btn_size = egui::vec2(btn_w, 24.0);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            if panel_toggle_button(
-                                ui,
-                                "描画 [D]",
-                                self.conceal_paint_mode,
-                                Some(btn_size),
-                                Some(PanelToggleColors::paint_red()),
-                            )
-                            .clicked()
-                            {
-                                self.conceal_paint_mode = true;
-                            }
-                            if panel_toggle_button(
-                                ui,
-                                "消去 [F]",
-                                !self.conceal_paint_mode,
-                                Some(btn_size),
-                                Some(PanelToggleColors::erase_blue()),
-                            )
-                            .clicked()
-                            {
-                                self.conceal_paint_mode = false;
-                            }
-                        });
-                        ui.separator();
-
-                        // ツールパレット (8 個、2 列 × 4 行)
-                        ui.label(
-                            egui::RichText::new("ツール:").color(egui::Color32::from_gray(200)),
-                        );
-                        let mut tool = self.conceal_tool;
-                        let tool_rows: [[(ConcealTool, &str); 2]; 4] = [
-                            [
-                                (ConcealTool::Select, "選択 [S]"),
-                                (ConcealTool::Brush, "筆 [B]"),
-                            ],
-                            [
-                                (ConcealTool::Lasso, "囲み [L]"),
-                                (ConcealTool::Line, "直線 [I]"),
-                            ],
-                            [
-                                (ConcealTool::VertLine, "縦線 [V]"),
-                                (ConcealTool::HorizLine, "横線 [H]"),
-                            ],
-                            [
-                                (ConcealTool::Rect, "矩形 [R]"),
-                                (ConcealTool::Ellipse, "楕円 [O]"),
-                            ],
-                        ];
-                        for row in tool_rows.iter() {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                for &(kind, label) in row.iter() {
-                                    if panel_toggle_button(
-                                        ui,
-                                        label,
-                                        tool == kind,
-                                        Some(btn_size),
-                                        None,
-                                    )
-                                    .clicked()
-                                    {
-                                        tool = kind;
-                                    }
-                                }
-                            });
-                        }
-                        if tool != self.conceal_tool {
-                            self.conceal_tool = tool;
-                            self.conceal_drag = None;
-                            self.conceal_lasso_points.clear();
-                            self.conceal_line_start = None;
-                            self.conceal_line_end = None;
-                            self.conceal_shape_drag_start = None;
-                            self.conceal_shape_drag_end = None;
-                            // ツール切替時は選択もクリア (Codex P1 対応)。
-                            self.conceal_selected_shape = None;
-                            self.conceal_mask_texture = None;
-                        }
-
-                        // サイズスライダ (Brush は半径、Line 系は太さ)
-                        let [w, h] = self.conceal_mask_size;
-                        let long_edge = w.max(h).max(1) as f32;
-                        match self.conceal_tool {
-                            ConcealTool::Brush => {
-                                ui.separator();
-                                let mut r = self.settings.conceal_brush_radius;
-                                ui.add(
-                                    egui::Slider::new(&mut r, 1.0..=long_edge / 5.0)
-                                        .text("ブラシ半径"),
-                                );
-                                self.settings.conceal_brush_radius = r;
-                            }
-                            ConcealTool::Line | ConcealTool::VertLine | ConcealTool::HorizLine => {
-                                ui.separator();
-                                let mut t = self.settings.conceal_line_width;
-                                ui.add(
-                                    egui::Slider::new(&mut t, 1.0..=long_edge / 5.0).text("線幅"),
-                                );
-                                self.settings.conceal_line_width = t;
-                            }
-                            _ => {}
-                        }
-
-                        // ── 隠蔽タイプ + パラメータ (Phase 4) ─────────────────
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new("処理タイプ [T]:")
-                                .color(egui::Color32::from_gray(200)),
-                        );
-                        let mut type_changed = false;
-                        let mut new_type = self.settings.conceal_type;
-                        let type_rows: [[crate::conceal::ConcealType; 2]; 2] = [
-                            [
-                                crate::conceal::ConcealType::Mosaic,
-                                crate::conceal::ConcealType::WhiteFill,
-                            ],
-                            [
-                                crate::conceal::ConcealType::BlackFill,
-                                crate::conceal::ConcealType::Blur,
-                            ],
-                        ];
-                        for row in type_rows.iter() {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                for &t in row.iter() {
-                                    if panel_toggle_button(
-                                        ui,
-                                        t.label(),
-                                        new_type == t,
-                                        Some(btn_size),
-                                        None,
-                                    )
-                                    .clicked()
-                                    {
-                                        new_type = t;
-                                    }
-                                }
-                            });
-                        }
-                        if new_type != self.settings.conceal_type {
-                            self.settings.conceal_type = new_type;
-                            type_changed = true;
-                        }
-
-                        // Mosaic パラメータ (Phase 3a のみ実装、Fill/Blur は Phase 3b/3c)
-                        if matches!(
-                            self.settings.conceal_type,
-                            crate::conceal::ConcealType::Mosaic
-                        ) {
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new("タイルサイズ:")
-                                    .color(egui::Color32::from_gray(200)),
-                            );
-                            let mut tile_mode = self.settings.conceal_mosaic_tile_mode;
-                            let mut tile_changed = false;
-                            let is_ratio =
-                                matches!(tile_mode, crate::conceal::TileSizeMode::LongEdgeRatio(_));
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                if panel_toggle_button(
-                                    ui,
-                                    "長辺比率",
-                                    is_ratio,
-                                    Some(btn_size),
-                                    None,
-                                )
-                                .clicked()
-                                    && !is_ratio
-                                {
-                                    tile_mode = crate::conceal::TileSizeMode::LongEdgeRatio(1.0);
-                                    tile_changed = true;
-                                }
-                                if panel_toggle_button(
-                                    ui,
-                                    "固定 px",
-                                    !is_ratio,
-                                    Some(btn_size),
-                                    None,
-                                )
-                                .clicked()
-                                    && is_ratio
-                                {
-                                    tile_mode = crate::conceal::TileSizeMode::FixedPx(16);
-                                    tile_changed = true;
-                                }
-                            });
-                            match tile_mode {
-                                crate::conceal::TileSizeMode::LongEdgeRatio(mut m) => {
-                                    let prev = m;
-                                    ui.add(
-                                        egui::Slider::new(
-                                            &mut m,
-                                            crate::conceal::TILE_RATIO_MIN
-                                                ..=crate::conceal::TILE_RATIO_MAX,
-                                        )
-                                        .step_by(crate::conceal::TILE_RATIO_STEP as f64)
-                                        .text("倍率"),
-                                    );
-                                    if (m - prev).abs() > 1e-6 {
-                                        tile_mode = crate::conceal::TileSizeMode::LongEdgeRatio(m);
-                                        tile_changed = true;
-                                    }
-                                    let long_edge_u = w.max(h) as u32;
-                                    let tile_px =
-                                        crate::conceal::compute_tile_size(long_edge_u, tile_mode);
+                        // パネル全体を ScrollArea で囲み、ウィンドウ縦幅より大きいときに
+                        // スクロール可能にする (実機 FB R4 #2)。
+                        let max_height = (full_rect.max.y - panel_pos.y - 20.0).max(120.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(max_height)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                // ── ヘッダ (タイトル + プレビュー + 閉じる × ボタン) ──
+                                // 右端に「目アイコン (プレビュー)」と「× (閉じる)」を並べる。
+                                // プレビューは押している間だけ `conceal_preview_active = true`
+                                // にして表示パイプラインで合成を含める。閉じるはモード退出。
+                                let mut preview_pressed = false;
+                                let mut close_clicked = false;
+                                ui.horizontal(|ui| {
                                     ui.label(
-                                        egui::RichText::new(format!(
-                                            "= {}px @ {}px 長辺",
-                                            tile_px, long_edge_u
-                                        ))
-                                        .size(10.0)
-                                        .color(egui::Color32::from_gray(170)),
+                                        egui::RichText::new("隠蔽加工")
+                                            .size(15.0)
+                                            .strong()
+                                            .color(egui::Color32::WHITE),
                                     );
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            // 閉じる × ボタン
+                                            let (close_rect, close_resp) = ui.allocate_exact_size(
+                                                egui::vec2(26.0, 22.0),
+                                                egui::Sense::click(),
+                                            );
+                                            let close_bg = if close_resp.hovered() {
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    220, 80, 80, 200,
+                                                )
+                                            } else {
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    80, 80, 80, 120,
+                                                )
+                                            };
+                                            ui.painter().rect_filled(close_rect, 4.0, close_bg);
+                                            crate::ui_fullscreen::draw_icons::draw_close_icon(
+                                                ui.painter(),
+                                                close_rect.center(),
+                                                8.0,
+                                            );
+                                            if close_resp.clicked() {
+                                                close_clicked = true;
+                                            }
+                                            close_resp.on_hover_text("閉じる (Esc / Ctrl+M)");
+                                            ui.add_space(2.0);
+                                            // プレビュー 目アイコン (= while held)
+                                            let (eye_rect, eye_resp) = ui.allocate_exact_size(
+                                                egui::vec2(26.0, 22.0),
+                                                egui::Sense::click_and_drag(),
+                                            );
+                                            let eye_bg = if eye_resp.is_pointer_button_down_on() {
+                                                // 押下中 = アクセント青
+                                                egui::Color32::from_rgb(60, 120, 200)
+                                            } else if eye_resp.hovered() {
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    100, 100, 100, 220,
+                                                )
+                                            } else {
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    80, 80, 80, 120,
+                                                )
+                                            };
+                                            ui.painter().rect_filled(eye_rect, 4.0, eye_bg);
+                                            crate::ui_fullscreen::draw_icons::draw_eye_icon(
+                                                ui.painter(),
+                                                eye_rect.center(),
+                                                8.0,
+                                            );
+                                            if eye_resp.is_pointer_button_down_on() {
+                                                preview_pressed = true;
+                                            }
+                                            eye_resp.on_hover_text(
+                                                "押している間: モザイク反映後の最終結果プレビュー",
+                                            );
+                                        },
+                                    );
+                                });
+                                self.conceal_preview_active = preview_pressed;
+                                if close_clicked {
+                                    should_close_after_draw = true;
                                 }
-                                crate::conceal::TileSizeMode::FixedPx(mut px) => {
-                                    let prev = px;
-                                    ui.add(
-                                        egui::Slider::new(
-                                            &mut px,
-                                            crate::conceal::TILE_FIXED_MIN
-                                                ..=crate::conceal::TILE_FIXED_MAX,
-                                        )
-                                        .text("px"),
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "処理: {}",
+                                        self.settings.conceal_type.label()
+                                    ))
+                                    .color(egui::Color32::from_gray(200)),
+                                );
+                                ui.separator();
+
+                                // 描画 / 消去 (active=赤/青、inactive=暗灰、hover=やや明灰)
+                                let btn_w = ((PANEL_W - 16.0 - 4.0) / 2.0).max(60.0);
+                                let btn_size = egui::vec2(btn_w, 24.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    if panel_toggle_button(
+                                        ui,
+                                        "描画 [D]",
+                                        self.conceal_paint_mode,
+                                        Some(btn_size),
+                                        Some(PanelToggleColors::paint_red()),
+                                    )
+                                    .clicked()
+                                    {
+                                        self.conceal_paint_mode = true;
+                                    }
+                                    if panel_toggle_button(
+                                        ui,
+                                        "消去 [F]",
+                                        !self.conceal_paint_mode,
+                                        Some(btn_size),
+                                        Some(PanelToggleColors::erase_blue()),
+                                    )
+                                    .clicked()
+                                    {
+                                        self.conceal_paint_mode = false;
+                                    }
+                                });
+                                ui.separator();
+
+                                // ツールパレット (8 個、2 列 × 4 行)
+                                ui.label(
+                                    egui::RichText::new("ツール:")
+                                        .color(egui::Color32::from_gray(200)),
+                                );
+                                let mut tool = self.conceal_tool;
+                                let tool_rows: [[(ConcealTool, &str); 2]; 4] = [
+                                    [
+                                        (ConcealTool::Select, "選択 [S]"),
+                                        (ConcealTool::Brush, "筆 [B]"),
+                                    ],
+                                    [
+                                        (ConcealTool::Lasso, "囲み [L]"),
+                                        (ConcealTool::Line, "直線 [I]"),
+                                    ],
+                                    [
+                                        (ConcealTool::VertLine, "縦線 [V]"),
+                                        (ConcealTool::HorizLine, "横線 [H]"),
+                                    ],
+                                    [
+                                        (ConcealTool::Rect, "矩形 [R]"),
+                                        (ConcealTool::Ellipse, "楕円 [O]"),
+                                    ],
+                                ];
+                                for row in tool_rows.iter() {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        for &(kind, label) in row.iter() {
+                                            if panel_toggle_button(
+                                                ui,
+                                                label,
+                                                tool == kind,
+                                                Some(btn_size),
+                                                None,
+                                            )
+                                            .clicked()
+                                            {
+                                                tool = kind;
+                                            }
+                                        }
+                                    });
+                                }
+                                if tool != self.conceal_tool {
+                                    self.conceal_tool = tool;
+                                    self.conceal_drag = None;
+                                    self.conceal_lasso_points.clear();
+                                    self.conceal_line_start = None;
+                                    self.conceal_line_end = None;
+                                    self.conceal_shape_drag_start = None;
+                                    self.conceal_shape_drag_end = None;
+                                    // ツール切替時は選択もクリア (Codex P1 対応)。
+                                    self.conceal_selected_shape = None;
+                                    self.conceal_mask_texture = None;
+                                }
+
+                                // サイズスライダ (Brush は半径、Line 系は太さ)
+                                let [w, h] = self.conceal_mask_size;
+                                let long_edge = w.max(h).max(1) as f32;
+                                match self.conceal_tool {
+                                    ConcealTool::Brush => {
+                                        ui.separator();
+                                        let mut r = self.settings.conceal_brush_radius;
+                                        ui.add(
+                                            egui::Slider::new(&mut r, 1.0..=long_edge / 5.0)
+                                                .text("ブラシ半径"),
+                                        );
+                                        self.settings.conceal_brush_radius = r;
+                                    }
+                                    ConcealTool::Line
+                                    | ConcealTool::VertLine
+                                    | ConcealTool::HorizLine => {
+                                        ui.separator();
+                                        let mut t = self.settings.conceal_line_width;
+                                        ui.add(
+                                            egui::Slider::new(&mut t, 1.0..=long_edge / 5.0)
+                                                .text("線幅"),
+                                        );
+                                        self.settings.conceal_line_width = t;
+                                    }
+                                    _ => {}
+                                }
+
+                                // ── 隠蔽タイプ + パラメータ (Phase 4) ─────────────────
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new("処理タイプ [T]:")
+                                        .color(egui::Color32::from_gray(200)),
+                                );
+                                let mut type_changed = false;
+                                let mut new_type = self.settings.conceal_type;
+                                let type_rows: [[crate::conceal::ConcealType; 2]; 2] = [
+                                    [
+                                        crate::conceal::ConcealType::Mosaic,
+                                        crate::conceal::ConcealType::WhiteFill,
+                                    ],
+                                    [
+                                        crate::conceal::ConcealType::BlackFill,
+                                        crate::conceal::ConcealType::Blur,
+                                    ],
+                                ];
+                                for row in type_rows.iter() {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        for &t in row.iter() {
+                                            if panel_toggle_button(
+                                                ui,
+                                                t.label(),
+                                                new_type == t,
+                                                Some(btn_size),
+                                                None,
+                                            )
+                                            .clicked()
+                                            {
+                                                new_type = t;
+                                            }
+                                        }
+                                    });
+                                }
+                                if new_type != self.settings.conceal_type {
+                                    self.settings.conceal_type = new_type;
+                                    type_changed = true;
+                                }
+
+                                // Mosaic パラメータ (Phase 3a のみ実装、Fill/Blur は Phase 3b/3c)
+                                if matches!(
+                                    self.settings.conceal_type,
+                                    crate::conceal::ConcealType::Mosaic
+                                ) {
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new("タイルサイズ:")
+                                            .color(egui::Color32::from_gray(200)),
                                     );
-                                    if px != prev {
-                                        tile_mode = crate::conceal::TileSizeMode::FixedPx(px);
-                                        tile_changed = true;
+                                    let mut tile_mode = self.settings.conceal_mosaic_tile_mode;
+                                    let mut tile_changed = false;
+                                    let is_ratio = matches!(
+                                        tile_mode,
+                                        crate::conceal::TileSizeMode::LongEdgeRatio(_)
+                                    );
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        if panel_toggle_button(
+                                            ui,
+                                            "長辺比率",
+                                            is_ratio,
+                                            Some(btn_size),
+                                            None,
+                                        )
+                                        .clicked()
+                                            && !is_ratio
+                                        {
+                                            tile_mode =
+                                                crate::conceal::TileSizeMode::LongEdgeRatio(1.0);
+                                            tile_changed = true;
+                                        }
+                                        if panel_toggle_button(
+                                            ui,
+                                            "固定 px",
+                                            !is_ratio,
+                                            Some(btn_size),
+                                            None,
+                                        )
+                                        .clicked()
+                                            && is_ratio
+                                        {
+                                            tile_mode = crate::conceal::TileSizeMode::FixedPx(16);
+                                            tile_changed = true;
+                                        }
+                                    });
+                                    match tile_mode {
+                                        crate::conceal::TileSizeMode::LongEdgeRatio(mut m) => {
+                                            let prev = m;
+                                            ui.add(
+                                                egui::Slider::new(
+                                                    &mut m,
+                                                    crate::conceal::TILE_RATIO_MIN
+                                                        ..=crate::conceal::TILE_RATIO_MAX,
+                                                )
+                                                .step_by(crate::conceal::TILE_RATIO_STEP as f64)
+                                                .text("倍率"),
+                                            );
+                                            if (m - prev).abs() > 1e-6 {
+                                                tile_mode =
+                                                    crate::conceal::TileSizeMode::LongEdgeRatio(m);
+                                                tile_changed = true;
+                                            }
+                                            let long_edge_u = w.max(h) as u32;
+                                            let tile_px = crate::conceal::compute_tile_size(
+                                                long_edge_u,
+                                                tile_mode,
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(format!(
+                                                    "= {}px @ {}px 長辺",
+                                                    tile_px, long_edge_u
+                                                ))
+                                                .size(10.0)
+                                                .color(egui::Color32::from_gray(170)),
+                                            );
+                                        }
+                                        crate::conceal::TileSizeMode::FixedPx(mut px) => {
+                                            let prev = px;
+                                            ui.add(
+                                                egui::Slider::new(
+                                                    &mut px,
+                                                    crate::conceal::TILE_FIXED_MIN
+                                                        ..=crate::conceal::TILE_FIXED_MAX,
+                                                )
+                                                .text("px"),
+                                            );
+                                            if px != prev {
+                                                tile_mode =
+                                                    crate::conceal::TileSizeMode::FixedPx(px);
+                                                tile_changed = true;
+                                            }
+                                        }
+                                    }
+                                    if tile_changed {
+                                        self.settings.conceal_mosaic_tile_mode = tile_mode;
+                                    }
+
+                                    ui.label(
+                                        egui::RichText::new("境界処理:")
+                                            .color(egui::Color32::from_gray(200)),
+                                    );
+                                    let mut bnd = self.settings.conceal_mosaic_boundary;
+                                    let mut bnd_changed = false;
+                                    for b in [
+                                        crate::conceal::MosaicBoundary::Opaque,
+                                        crate::conceal::MosaicBoundary::Translucent,
+                                        crate::conceal::MosaicBoundary::MaskShape,
+                                    ] {
+                                        let label =
+                                            egui::RichText::new(b.process_description()).size(11.0);
+                                        if ui.radio(bnd == b, label).clicked() {
+                                            bnd = b;
+                                            bnd_changed = true;
+                                        }
+                                    }
+                                    if bnd_changed {
+                                        self.settings.conceal_mosaic_boundary = bnd;
+                                    }
+
+                                    if tile_changed || bnd_changed || type_changed {
+                                        self.bump_conceal_generation();
+                                    }
+                                } else if matches!(
+                                    self.settings.conceal_type,
+                                    crate::conceal::ConcealType::WhiteFill
+                                        | crate::conceal::ConcealType::BlackFill
+                                ) {
+                                    // ── WhiteFill / BlackFill パラメータ (Phase 3b) ──
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new("不透明度:")
+                                            .color(egui::Color32::from_gray(200)),
+                                    );
+                                    let mut opacity = self.settings.conceal_fill_opacity_percent;
+                                    let prev_opacity = opacity;
+                                    ui.add(
+                                        egui::Slider::new(&mut opacity, 1..=100)
+                                            .text("%")
+                                            .step_by(1.0),
+                                    );
+                                    let mut fill_changed = false;
+                                    if opacity != prev_opacity {
+                                        self.settings.conceal_fill_opacity_percent = opacity;
+                                        fill_changed = true;
+                                    }
+                                    ui.label(
+                                        egui::RichText::new("境界処理:")
+                                            .color(egui::Color32::from_gray(200)),
+                                    );
+                                    let mut edge = self.settings.conceal_fill_edge;
+                                    for e in [
+                                        crate::conceal::FillEdge::Sharp,
+                                        crate::conceal::FillEdge::Feathered,
+                                    ] {
+                                        let label =
+                                            egui::RichText::new(e.process_description()).size(11.0);
+                                        if ui.radio(edge == e, label).clicked() && edge != e {
+                                            edge = e;
+                                            self.settings.conceal_fill_edge = e;
+                                            fill_changed = true;
+                                        }
+                                    }
+                                    let _ = edge;
+                                    if fill_changed || type_changed {
+                                        self.bump_conceal_generation();
+                                    }
+                                } else if matches!(
+                                    self.settings.conceal_type,
+                                    crate::conceal::ConcealType::Blur
+                                ) {
+                                    // ── Blur パラメータ (Phase 3c) ──────────────────
+                                    ui.separator();
+                                    ui.label(
+                                        egui::RichText::new("ぼかし半径:")
+                                            .color(egui::Color32::from_gray(200)),
+                                    );
+                                    let mut blur_radius = self.settings.conceal_blur_radius_px;
+                                    let prev = blur_radius;
+                                    ui.add(
+                                        egui::Slider::new(&mut blur_radius, 5.0..=100.0)
+                                            .text("px")
+                                            .step_by(1.0),
+                                    );
+                                    let mut blur_changed = false;
+                                    if (blur_radius - prev).abs() > 0.01 {
+                                        self.settings.conceal_blur_radius_px = blur_radius;
+                                        blur_changed = true;
+                                    }
+                                    ui.label(
+                                        egui::RichText::new("ぼかしモード:")
+                                            .color(egui::Color32::from_gray(200)),
+                                    );
+                                    let mut bmode = self.settings.conceal_blur_mode;
+                                    for m in [
+                                        crate::conceal::BlurMode::AsMask,
+                                        crate::conceal::BlurMode::ExtendByRadius,
+                                        crate::conceal::BlurMode::InsideOnly,
+                                    ] {
+                                        let label =
+                                            egui::RichText::new(m.process_description()).size(11.0);
+                                        if ui.radio(bmode == m, label).clicked() && bmode != m {
+                                            bmode = m;
+                                            self.settings.conceal_blur_mode = m;
+                                            blur_changed = true;
+                                        }
+                                    }
+                                    let _ = bmode;
+                                    let mut feather = self.settings.conceal_blur_feather;
+                                    let prev_feather = feather;
+                                    ui.checkbox(&mut feather, "境界フェードを掛ける");
+                                    if feather != prev_feather {
+                                        self.settings.conceal_blur_feather = feather;
+                                        blur_changed = true;
+                                    }
+                                    if blur_changed || type_changed {
+                                        self.bump_conceal_generation();
                                     }
                                 }
-                            }
-                            if tile_changed {
-                                self.settings.conceal_mosaic_tile_mode = tile_mode;
-                            }
 
-                            ui.label(
-                                egui::RichText::new("境界処理:")
-                                    .color(egui::Color32::from_gray(200)),
-                            );
-                            let mut bnd = self.settings.conceal_mosaic_boundary;
-                            let mut bnd_changed = false;
-                            for b in [
-                                crate::conceal::MosaicBoundary::Opaque,
-                                crate::conceal::MosaicBoundary::Translucent,
-                                crate::conceal::MosaicBoundary::MaskShape,
-                            ] {
-                                let label = egui::RichText::new(b.process_description()).size(11.0);
-                                if ui.radio(bnd == b, label).clicked() {
-                                    bnd = b;
-                                    bnd_changed = true;
+                                // ── プリセット 4 スロット (= 保存/読込ボタン、消しゴムマスクスロットと同じ見た目) ──
+                                //
+                                // 旧 UI は「1: (未保存) 1」+ 小さな保存ボタン で構成していたが、
+                                // 名称を編集する機能が無いため「1: ...」のような番号付きラベルは
+                                // ノイズになっていた (実機 FB)。マスクスロットと同じ
+                                // 「保存N / 読込N」グリッドに統一する。
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new("プリセット (1-4 で適用):")
+                                        .color(egui::Color32::from_gray(200)),
+                                );
+                                // 4 列 × 2 行: 上段 [保存 1..4]、下段 [読込 1..4]
+                                let preset_btn_w = ((PANEL_W - 16.0 - 12.0) / 4.0).max(40.0);
+                                let preset_btn_size = egui::vec2(preset_btn_w, 22.0);
+                                for (row, action_label) in ["保存", "読込"].iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        for slot in 0..4usize {
+                                            let label = format!("{}{}", action_label, slot + 1);
+                                            let has = self.settings.conceal_presets[slot].is_some();
+                                            // 読込は has==false (= 未保存) のとき押せないようにする
+                                            let enabled = if row == 0 { true } else { has };
+                                            let resp = ui
+                                                .add_enabled_ui(enabled, |ui| {
+                                                    panel_toggle_button(
+                                                        ui,
+                                                        label,
+                                                        false,
+                                                        Some(preset_btn_size),
+                                                        None,
+                                                    )
+                                                })
+                                                .inner;
+                                            if resp.clicked() {
+                                                if row == 0 {
+                                                    self.save_conceal_preset_to_slot(slot);
+                                                } else {
+                                                    self.apply_conceal_preset(slot);
+                                                }
+                                            }
+                                        }
+                                    });
                                 }
-                            }
-                            if bnd_changed {
-                                self.settings.conceal_mosaic_boundary = bnd;
-                            }
 
-                            if tile_changed || bnd_changed || type_changed {
-                                self.bump_conceal_generation();
-                            }
-                        } else if matches!(
-                            self.settings.conceal_type,
-                            crate::conceal::ConcealType::WhiteFill
-                                | crate::conceal::ConcealType::BlackFill
-                        ) {
-                            // ── WhiteFill / BlackFill パラメータ (Phase 3b) ──
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new("不透明度:")
-                                    .color(egui::Color32::from_gray(200)),
-                            );
-                            let mut opacity = self.settings.conceal_fill_opacity_percent;
-                            let prev_opacity = opacity;
-                            ui.add(
-                                egui::Slider::new(&mut opacity, 1..=100)
-                                    .text("%")
-                                    .step_by(1.0),
-                            );
-                            let mut fill_changed = false;
-                            if opacity != prev_opacity {
-                                self.settings.conceal_fill_opacity_percent = opacity;
-                                fill_changed = true;
-                            }
-                            ui.label(
-                                egui::RichText::new("境界処理:")
-                                    .color(egui::Color32::from_gray(200)),
-                            );
-                            let mut edge = self.settings.conceal_fill_edge;
-                            for e in [
-                                crate::conceal::FillEdge::Sharp,
-                                crate::conceal::FillEdge::Feathered,
-                            ] {
-                                let label = egui::RichText::new(e.process_description()).size(11.0);
-                                if ui.radio(edge == e, label).clicked() && edge != e {
-                                    edge = e;
-                                    self.settings.conceal_fill_edge = e;
-                                    fill_changed = true;
-                                }
-                            }
-                            let _ = edge;
-                            if fill_changed || type_changed {
-                                self.bump_conceal_generation();
-                            }
-                        } else if matches!(
-                            self.settings.conceal_type,
-                            crate::conceal::ConcealType::Blur
-                        ) {
-                            // ── Blur パラメータ (Phase 3c) ──────────────────
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new("ぼかし半径:")
-                                    .color(egui::Color32::from_gray(200)),
-                            );
-                            let mut blur_radius = self.settings.conceal_blur_radius_px;
-                            let prev = blur_radius;
-                            ui.add(
-                                egui::Slider::new(&mut blur_radius, 5.0..=100.0)
-                                    .text("px")
-                                    .step_by(1.0),
-                            );
-                            let mut blur_changed = false;
-                            if (blur_radius - prev).abs() > 0.01 {
-                                self.settings.conceal_blur_radius_px = blur_radius;
-                                blur_changed = true;
-                            }
-                            ui.label(
-                                egui::RichText::new("ぼかしモード:")
-                                    .color(egui::Color32::from_gray(200)),
-                            );
-                            let mut bmode = self.settings.conceal_blur_mode;
-                            for m in [
-                                crate::conceal::BlurMode::AsMask,
-                                crate::conceal::BlurMode::ExtendByRadius,
-                                crate::conceal::BlurMode::InsideOnly,
-                            ] {
-                                let label = egui::RichText::new(m.process_description()).size(11.0);
-                                if ui.radio(bmode == m, label).clicked() && bmode != m {
-                                    bmode = m;
-                                    self.settings.conceal_blur_mode = m;
-                                    blur_changed = true;
-                                }
-                            }
-                            let _ = bmode;
-                            let mut feather = self.settings.conceal_blur_feather;
-                            let prev_feather = feather;
-                            ui.checkbox(&mut feather, "境界フェードを掛ける");
-                            if feather != prev_feather {
-                                self.settings.conceal_blur_feather = feather;
-                                blur_changed = true;
-                            }
-                            if blur_changed || type_changed {
-                                self.bump_conceal_generation();
-                            }
-                        }
-
-                        // ── プリセット 4 スロット (= 保存/読込ボタン、消しゴムマスクスロットと同じ見た目) ──
-                        //
-                        // 旧 UI は「1: (未保存) 1」+ 小さな保存ボタン で構成していたが、
-                        // 名称を編集する機能が無いため「1: ...」のような番号付きラベルは
-                        // ノイズになっていた (実機 FB)。マスクスロットと同じ
-                        // 「保存N / 読込N」グリッドに統一する。
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new("プリセット (1-4 で適用):")
-                                .color(egui::Color32::from_gray(200)),
-                        );
-                        // 4 列 × 2 行: 上段 [保存 1..4]、下段 [読込 1..4]
-                        let preset_btn_w = ((PANEL_W - 16.0 - 12.0) / 4.0).max(40.0);
-                        let preset_btn_size = egui::vec2(preset_btn_w, 22.0);
-                        for (row, action_label) in ["保存", "読込"].iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                for slot in 0..4usize {
-                                    let label = format!("{}{}", action_label, slot + 1);
-                                    let has = self.settings.conceal_presets[slot].is_some();
-                                    // 読込は has==false (= 未保存) のとき押せないようにする
-                                    let enabled = if row == 0 { true } else { has };
-                                    let resp = ui
-                                        .add_enabled_ui(enabled, |ui| {
-                                            panel_toggle_button(
+                                // ── マスクスロット (= 消しゴムと同じ「保存N / 読込N」2x2 grid) ──
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new("マスクスロット:")
+                                        .color(egui::Color32::from_gray(200)),
+                                );
+                                let mask_btn_w = ((PANEL_W - 16.0 - 4.0) / 2.0).max(60.0);
+                                let mask_btn_size = egui::vec2(mask_btn_w, 22.0);
+                                for (row, action_label) in ["保存", "読込"].iter().enumerate() {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        for slot in 1..=2usize {
+                                            let label = format!("{}{}", action_label, slot);
+                                            if panel_toggle_button(
                                                 ui,
                                                 label,
                                                 false,
-                                                Some(preset_btn_size),
+                                                Some(mask_btn_size),
                                                 None,
                                             )
-                                        })
-                                        .inner;
-                                    if resp.clicked() {
-                                        if row == 0 {
-                                            self.save_conceal_preset_to_slot(slot);
-                                        } else {
-                                            self.apply_conceal_preset(slot);
+                                            .clicked()
+                                            {
+                                                if row == 0 {
+                                                    self.save_conceal_mask_to_slot(slot);
+                                                } else {
+                                                    self.load_conceal_mask_from_slot(slot);
+                                                }
+                                            }
                                         }
-                                    }
+                                    });
                                 }
-                            });
-                        }
 
-                        // ── マスクスロット (= 消しゴムと同じ「保存N / 読込N」2x2 grid) ──
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new("マスクスロット:")
-                                .color(egui::Color32::from_gray(200)),
-                        );
-                        let mask_btn_w = ((PANEL_W - 16.0 - 4.0) / 2.0).max(60.0);
-                        let mask_btn_size = egui::vec2(mask_btn_w, 22.0);
-                        for (row, action_label) in ["保存", "読込"].iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 4.0;
-                                for slot in 1..=2usize {
-                                    let label = format!("{}{}", action_label, slot);
-                                    if panel_toggle_button(
-                                        ui,
-                                        label,
-                                        false,
-                                        Some(mask_btn_size),
-                                        None,
+                                // ── マスク全削除 ───────────────────────────────────
+                                // 消しゴムパネル側と同じ幅 (= PANEL_W - 20) で揃える (実機 FB R4)。
+                                ui.separator();
+                                if ui
+                                    .add(
+                                        egui::Button::new(
+                                            egui::RichText::new("マスク全削除")
+                                                .color(egui::Color32::WHITE),
+                                        )
+                                        .fill(egui::Color32::from_rgb(120, 50, 50))
+                                        .min_size(egui::vec2(PANEL_W - 20.0, 22.0)),
                                     )
                                     .clicked()
-                                    {
-                                        if row == 0 {
-                                            self.save_conceal_mask_to_slot(slot);
-                                        } else {
-                                            self.load_conceal_mask_from_slot(slot);
-                                        }
-                                    }
+                                {
+                                    self.delete_all_conceal_mask();
                                 }
-                            });
-                        }
 
-                        // ── マスク全削除 ───────────────────────────────────
-                        // 消しゴムパネル側と同じ幅 (= PANEL_W - 20) で揃える (実機 FB R4)。
-                        ui.separator();
-                        if ui
-                            .add(
-                                egui::Button::new(
-                                    egui::RichText::new("マスク全削除").color(egui::Color32::WHITE),
-                                )
-                                .fill(egui::Color32::from_rgb(120, 50, 50))
-                                .min_size(egui::vec2(PANEL_W - 20.0, 22.0)),
-                            )
-                            .clicked()
-                        {
-                            self.delete_all_conceal_mask();
-                        }
-
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new(
-                                "Shift+ハンドル: 軸拘束 / 等比 / 15°snap\n\
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new(
+                                        "Shift+ハンドル: 軸拘束 / 等比 / 15°snap\n\
                                  Alt+ハンドル: 中心固定\n\
                                  T: タイプ切替  1-4: プリセット適用\n\
                                  Ctrl+Z: 元に戻す  Delete: 選択削除\n\
                                  Esc / Ctrl+M: 終了 (DB 保存)",
-                            )
-                            .size(11.0)
-                            .color(egui::Color32::from_gray(190)),
-                        );
-                    });
+                                    )
+                                    .size(11.0)
+                                    .color(egui::Color32::from_gray(190)),
+                                );
+                            }); // ScrollArea::show
+                    }); // Frame::popup .show
                 // クリック吸収 sink は Area::show の冒頭で登録済み (= widget より前)。
                 // 後追いで sink を足すと egui の hit test ルール (= 同じ rect の Response
                 // は後勝ち) で widget が click を受け取れなくなる。
