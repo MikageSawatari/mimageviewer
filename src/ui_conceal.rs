@@ -574,33 +574,45 @@ impl App {
     // ── ヒットテスト (Select ツール用) ─────────────────────────────
 
     /// 画像座標 `pos` から、shape のホバーターゲットを判定する。
-    /// 選択中の shape は全ハンドル + 本体、他の shape は本体のみが対象。
-    /// 戻り値 `(idx, target)` で、`idx` は `conceal_shapes` への添字、`target` は
-    /// 当たった HoverTarget。複数 shape が重なる場合は **新しい (添字が大きい)** ものを
-    /// 優先する。
+    ///
+    /// ルール (Codex P2 #4 対応):
+    ///
+    /// 1. **選択中の shape のハンドル (= Body 以外) は最優先**: 角・辺中点・回転・
+    ///    端点が見える状態なので、それらを掴みに行く操作を阻害させない
+    /// 2. **新しい順 (添字大→小) に走査**: 上に重なっているものを優先
+    ///    - 選択中 shape は全ハンドル + Body
+    ///    - 他の shape は Body のみ (ハンドルは描画されていないので、間違って端点に
+    ///      乗ったクリックは Body 判定にフォールバックさせるべき)
+    /// 3. すべて外れたら None (= 空クリック → 選択解除)
     fn hit_test_conceal(
         &self,
         pos: (f32, f32),
         scale: f32,
     ) -> Option<(usize, vector_edit::HoverTarget)> {
-        // 1. 選択中の shape は全ハンドル候補で判定
+        // 1. 選択中の shape のハンドル (Body 以外) を最優先で判定
         if let Some(sel) = self.conceal_selected_shape {
             if let Some(s) = self.conceal_shapes.get(sel) {
                 let layout = vector_edit::compute_handle_layout(s, scale);
                 if let Some(t) = vector_edit::hit_test(&layout, pos, scale) {
-                    return Some((sel, t));
+                    if !matches!(t, vector_edit::HoverTarget::Body) {
+                        return Some((sel, t));
+                    }
                 }
             }
         }
-        // 2. 他の shape は body だけ (= レイアウトの body_corners 多角形ヒット)
-        // 新しいものから順に走査 (= 上に重なるほうを優先)
+        // 2. 新しい順に Body 判定 (選択中含む全 shape を対象)
         for (i, s) in self.conceal_shapes.iter().enumerate().rev() {
-            if Some(i) == self.conceal_selected_shape {
-                continue;
-            }
             let layout = vector_edit::compute_handle_layout(s, scale);
-            if vector_edit::hit_test(&layout, pos, scale) == Some(vector_edit::HoverTarget::Body) {
-                return Some((i, vector_edit::HoverTarget::Body));
+            // 選択中以外は hit_test が Endpoint / Corner を返す可能性があるので、
+            // Body 領域 (= body_corners 多角形) に対して別途判定する。
+            if point_in_polygon_local(pos, &layout.body_corners) {
+                let target = if Some(i) == self.conceal_selected_shape {
+                    // 選択中 shape の Body
+                    vector_edit::HoverTarget::Body
+                } else {
+                    vector_edit::HoverTarget::Body
+                };
+                return Some((i, target));
             }
         }
         None
@@ -626,10 +638,12 @@ impl App {
         let space_held = ctx.input(|i| i.key_down(egui::Key::Space));
         let modifiers = ctx.input(|i| i.modifiers);
 
-        // パネル上のクリックはツール操作に使わない
+        // パネル上のクリックはツール操作に使わない。ただし、画像上で進行中のドラッグを
+        // パネル上で離した場合は state を片付けないとリーク (Codex P2 #6) する。
+        // → release 検知時は通常 dispatch を通し、各 tool ハンドラが state リセットする。
         let panel_rect = self.conceal_panel_rect(full_rect);
         if let Some(pos) = pointer_pos {
-            if panel_rect.contains(pos) {
+            if panel_rect.contains(pos) && !primary_released {
                 return;
             }
         }
@@ -738,7 +752,15 @@ impl App {
         zoom_pan: Option<(f32, egui::Vec2)>,
         modifiers: egui::Modifiers,
     ) {
-        let Some(screen) = pointer_pos else { return };
+        let Some(screen) = pointer_pos else {
+            // ポインタが取れない瞬間に release が来た場合、drag は次フレームに持ち越して
+            // しまうので、ここで明示的に drag だけ片付ける (P2 #6 補強)。
+            if primary_released && self.conceal_drag.is_some() {
+                self.conceal_drag = None;
+                self.conceal_mask_texture = None;
+            }
+            return;
+        };
         let Some((scale, img_rect)) = self.conceal_image_layout(full_rect, zoom_pan) else {
             return;
         };
@@ -753,6 +775,8 @@ impl App {
                 self.conceal_selected_shape = Some(idx);
                 let base = self.conceal_shapes[idx];
                 self.conceal_drag = Some(vector_edit::begin_drag(target, idx, base, img_pos));
+                // ドラッグ開始時に 1 回だけマスクテクスチャを invalidate (handle 描画は
+                // 即時更新されるが、ベース mask が変わったことを反映するため)。
                 self.conceal_mask_texture = None;
             } else if self.conceal_selected_shape.is_some() {
                 self.conceal_selected_shape = None;
@@ -765,10 +789,15 @@ impl App {
             let new_shape = vector_edit::apply_drag(&drag, img_pos, &modifiers);
             if drag.idx() < self.conceal_shapes.len() {
                 self.conceal_shapes[drag.idx()] = new_shape;
-                self.conceal_mask_texture = None;
+                // ドラッグ中はマスクテクスチャを invalidate しない (Codex P2 #8)。
+                // 4K 画像で毎フレーム 32MB の RGBA バッファ生成 + GPU upload が走るのを
+                // 避ける。ユーザーには handle の bbox 描画でリアルタイムフィードバックが
+                // 出ているので、最終 mask テクスチャは release 後の 1 回更新で十分。
             }
             if primary_released {
                 self.conceal_drag = None;
+                // ドラッグ完了 → 最終形状を反映するためにマスクテクスチャ再生成。
+                self.conceal_mask_texture = None;
             }
         }
     }
@@ -1016,11 +1045,13 @@ impl App {
         // ツールプレビュー (ドラッグ中)
         self.draw_conceal_tool_preview(ui, full_rect, zoom_pan);
 
+        // カーソルを Crosshair に。`draw_selected_handles` 内でハンドル上にホバー時のみ
+        // 専用カーソル (Resize* / PointingHand) へ上書きする。順序を逆にしないこと
+        // (Codex P2 #5: 旧版は Crosshair が後勝ちでハンドルカーソルが見えなかった)。
+        ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::Crosshair);
+
         // 選択中の shape のハンドル
         self.draw_selected_handles(ui, ctx, full_rect, zoom_pan);
-
-        // カーソル
-        ctx.output_mut(|o| o.cursor_icon = egui::CursorIcon::Crosshair);
 
         // パネル
         self.draw_conceal_panel(ctx, full_rect);
@@ -1269,6 +1300,29 @@ impl App {
 }
 
 // ── 純関数ヘルパー ────────────────────────────────────────────────
+
+/// 多角形内判定 (奇数交差判定、本体ヒット用)。`vector_edit::point_in_polygon` は
+/// private なのでここに同等版を置く。
+fn point_in_polygon_local(p: (f32, f32), poly: &[(f32, f32)]) -> bool {
+    let n = poly.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if (yi > p.1) != (yj > p.1) {
+            let x_intersect = (xj - xi) * (p.1 - yi) / (yj - yi + 1e-9) + xi;
+            if p.0 < x_intersect {
+                inside = !inside;
+            }
+        }
+        j = i;
+    }
+    inside
+}
 
 /// shape の AABB (回転考慮後の 4 隅から取る)。
 fn shape_bbox(shape: &Shape) -> (f32, f32, f32, f32) {

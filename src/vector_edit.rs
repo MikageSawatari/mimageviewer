@@ -643,9 +643,18 @@ fn angle_diff_deg(a: f32, b: f32) -> f32 {
 
 /// Resize ドラッグの本体。
 ///
-/// 戦略: shape のローカル座標系 (回転考慮) で `anchor → cur` を見て、
-/// その投影から新しい half_w / half_h を求める。Alt のときは center を据え置いて
-/// anchor を center に置き換えた相対ベクトルで再計算する。
+/// 戦略: 一貫してローカル座標 (shape の rotation を打ち消した frame) で処理する。
+///
+/// 1. ref_pt = anchor (非 Alt) or orig_center (Alt) を基準点に取る
+/// 2. local_diff = R^T * (cur - ref_pt) で局所オフセットに変換
+/// 3. target / modifiers に応じて constrained_local を決める
+///    (Corner: そのまま or Shift で aspect lock、Edge: 直交軸を 0 に clamp)
+/// 4. constrained_cur = ref_pt + R * constrained_local で image 空間に戻す
+/// 5. 新サイズ: 非 Alt なら |constrained_local| / 2、Alt なら |constrained_local|
+/// 6. 新 center: 非 Alt なら (anchor + constrained_cur) / 2、Alt なら orig_center
+///
+/// これで回転矩形でも anchor は image 空間で固定され、ハンドルは cur (or 制約後の
+/// 投影位置) に正確に乗る。
 fn apply_resize_drag(
     base: Shape,
     target: HoverTarget,
@@ -654,94 +663,83 @@ fn apply_resize_drag(
     modifiers: &egui::Modifiers,
 ) -> Shape {
     let (orig_center, orig_hw, orig_hh, rotation) = bbox_params(&base);
-
-    // shape ローカル座標 (rotation を打ち消す)
     let (sin_r, cos_r) = rotation.sin_cos();
-    let to_local = |p: (f32, f32), origin: (f32, f32)| -> (f32, f32) {
-        let dx = p.0 - origin.0;
-        let dy = p.1 - origin.1;
-        (cos_r * dx + sin_r * dy, -sin_r * dx + cos_r * dy)
-    };
+    // image → local (rotation を打ち消す)
+    let to_local =
+        |v: (f32, f32)| -> (f32, f32) { (cos_r * v.0 + sin_r * v.1, -sin_r * v.0 + cos_r * v.1) };
+    // local → image
+    let from_local =
+        |v: (f32, f32)| -> (f32, f32) { (cos_r * v.0 - sin_r * v.1, sin_r * v.0 + cos_r * v.1) };
 
-    // Alt: 中心固定。anchor を center に上書きし、center を据え置く。
-    let (use_anchor, keep_center) = if modifiers.alt {
-        (orig_center, true)
+    let ref_pt = if modifiers.alt { orig_center } else { anchor };
+    let local_diff = to_local((cur.0 - ref_pt.0, cur.1 - ref_pt.1));
+    let aspect = if orig_hh.abs() > 1e-3 {
+        orig_hw / orig_hh
     } else {
-        (anchor, false)
+        1.0
     };
 
-    // anchor → cur のローカル差分から、目的の dx, dy を取り出す
-    let local_cur = to_local(cur, use_anchor);
-
-    // 角と辺中点で意味が違う
-    let (mut new_hw, mut new_hh) = (orig_hw, orig_hh);
-    let dx = local_cur.0.abs();
-    let dy = local_cur.1.abs();
-
-    match target {
+    // 目標とする「ハンドルの local 位置 (ref_pt 基準)」。
+    // Edge では直交軸を 0 に clamp、Shift + Corner では aspect を保つように拡張。
+    let constrained_local = match target {
         HoverTarget::Corner { .. } => {
-            if keep_center {
-                // 中心固定: dx/dy はそのまま半サイズ
-                new_hw = dx.max(1.0);
-                new_hh = dy.max(1.0);
-            } else {
-                // 反対角を anchor: dx/dy はフルサイズ → /2 で半サイズ
-                new_hw = (dx * 0.5).max(1.0);
-                new_hh = (dy * 0.5).max(1.0);
-            }
             if modifiers.shift {
-                // 等比: 元の half_w/half_h 比を維持
-                let aspect = if orig_hh.abs() > 1e-3 {
-                    orig_hw / orig_hh
-                } else {
-                    1.0
-                };
-                // 新サイズの長辺を維持し、短辺を比率で縮める
-                if new_hw / new_hh > aspect {
-                    new_hh = new_hw / aspect;
-                } else {
-                    new_hw = new_hh * aspect;
-                }
+                let ax = local_diff.0.abs();
+                let ay = local_diff.1.abs();
+                // aspect (= hw/hh) を保つように、小さい方を大きい方に合わせて拡張する。
+                // 「narrow drag」(= aspect より狭い側のドラッグ) で anchor から corner が
+                // ずれないように、両軸とも拡張側へ揃える。Photoshop / Illustrator 同等。
+                let new_ax = ax.max(ay * aspect);
+                let new_ay = ay.max(ax / aspect);
+                (
+                    local_diff.0.signum() * new_ax,
+                    local_diff.1.signum() * new_ay,
+                )
+            } else {
+                local_diff
             }
         }
         HoverTarget::EdgeMidpoint { idx } => {
-            // 辺中点: 水平方向 (E/W、idx=1/3) なら hw のみ、垂直 (N/S、idx=0/2) なら hh のみ
+            // E/W は local-X 方向のみ、N/S は local-Y 方向のみ。直交軸は 0 に clamp。
             let horizontal = idx == 1 || idx == 3;
             if horizontal {
-                if keep_center {
-                    new_hw = dx.max(1.0);
-                } else {
-                    new_hw = (dx * 0.5).max(1.0);
-                }
-            } else if keep_center {
-                new_hh = dy.max(1.0);
+                (local_diff.0, 0.0)
             } else {
-                new_hh = (dy * 0.5).max(1.0);
+                (0.0, local_diff.1)
             }
-            // Shift+辺中点は無効 (本来軸固定なので等比拘束が無意味)
         }
-        _ => {}
-    }
+        _ => local_diff,
+    };
 
-    // 新 center: 中心固定なら orig_center、そうでなければ anchor と cur の中点
-    let new_center = if keep_center {
+    // 新しい半サイズ: 非 Alt は |constrained| / 2 (anchor 〜 corner の全幅の半分)、
+    // Alt は |constrained| (center から corner までの片側分)。
+    let scale_factor = if modifiers.alt { 1.0 } else { 0.5 };
+    let new_hw_raw = (constrained_local.0.abs() * scale_factor).max(1.0);
+    let new_hh_raw = (constrained_local.1.abs() * scale_factor).max(1.0);
+    // Edge ハンドルは直交軸を据え置く (= orig 値を保つ)。
+    let (new_hw, new_hh) = match target {
+        HoverTarget::EdgeMidpoint { idx } => {
+            let horizontal = idx == 1 || idx == 3;
+            if horizontal {
+                (new_hw_raw, orig_hh)
+            } else {
+                (orig_hw, new_hh_raw)
+            }
+        }
+        _ => (new_hw_raw, new_hh_raw),
+    };
+
+    // 新 center: 非 Alt なら anchor と constrained_cur の image 空間中点。
+    // 回転矩形でも anchor は固定。
+    let new_center = if modifiers.alt {
         orig_center
     } else {
-        match target {
-            HoverTarget::Corner { .. } => ((anchor.0 + cur.0) * 0.5, (anchor.1 + cur.1) * 0.5),
-            HoverTarget::EdgeMidpoint { idx } => {
-                let horizontal = idx == 1 || idx == 3;
-                if horizontal {
-                    ((anchor.0 + cur.0) * 0.5, anchor.1)
-                } else {
-                    (anchor.0, (anchor.1 + cur.1) * 0.5)
-                }
-                // ↑ rotation=0 の近似。rotation 付きで辺中点ハンドルを使うと
-                //   center が完璧には乗らないが、辺中点リサイズはほぼ軸並行で
-                //   使われるケースが大半なので Phase 2 では許容。
-            }
-            _ => orig_center,
-        }
+        let constrained_off = from_local(constrained_local);
+        let constrained_cur = (ref_pt.0 + constrained_off.0, ref_pt.1 + constrained_off.1);
+        (
+            (anchor.0 + constrained_cur.0) * 0.5,
+            (anchor.1 + constrained_cur.1) * 0.5,
+        )
     };
 
     match base {
@@ -1085,15 +1083,119 @@ mod tests {
             shift: true,
             ..egui::Modifiers::NONE
         };
-        // SE を (170, 200) へ → without shift: hw=50, hh=60。aspect 1.5 維持で hw=60*1.5=90? いや
-        // hw/hh ratio が aspect (1.5) より小なら hw を hh*1.5 に、大なら hh を hw/1.5 に。
-        // hw/hh = 50/60 = 0.83 < 1.5 → hw = hh * 1.5 = 90
+        // SE を (170, 200) へ → local_diff=(100,120)、aspect 1.5 拡張で
+        // new=(max(100, 120*1.5), max(120, 100/1.5)) = (180, 120) → hw=90, hh=60
         let new = apply_drag(&drag, (170.0, 200.0), &mods);
-        if let Shape::Rect { half_w, half_h, .. } = new {
+        if let Shape::Rect {
+            center,
+            half_w,
+            half_h,
+            ..
+        } = new
+        {
             assert!(
                 (half_w / half_h - 1.5).abs() < 0.05,
                 "aspect must match: hw={half_w}, hh={half_h}"
             );
+            // 拡張結果の corner と NW anchor を結ぶ中点に center が乗ること
+            // constrained_cur = anchor + (180, 120) = (250, 200) → center = (160, 140)
+            assert!((center.0 - 160.0).abs() < 1.0);
+            assert!((center.1 - 140.0).abs() < 1.0);
+            // NW corner = center - (hw, hh) = (160-90, 140-60) = (70, 80) = anchor ✓
+        } else {
+            panic!("expected Rect");
+        }
+    }
+
+    #[test]
+    fn apply_drag_resize_edge_midpoint_rotated_keeps_anchor_fixed() {
+        // 回転 30° の rect で東辺中点を引いたとき、西辺中点 (= anchor) が image 空間で
+        // 動かないことを確認する (Codex P1 #2 回帰防止)。
+        let rot = 30.0_f32.to_radians();
+        let r = rect_at(100.0, 100.0, 30.0, 20.0, rot);
+        // 西辺中点 anchor を計算 (回転後)
+        let (s, c) = rot.sin_cos();
+        let anchor = (100.0 + c * (-30.0) - s * 0.0, 100.0 + s * (-30.0) + c * 0.0);
+        let drag = DragState::Resize {
+            idx: 0,
+            base: r,
+            target: HoverTarget::EdgeMidpoint { idx: 1 }, // E
+            origin: anchor,                               // origin は未使用
+            anchor,
+        };
+        // E 辺中点を西辺中点から見て local-X +60 方向 (= 元 hw=30 の倍) に動かす
+        // image 上では cos*60, sin*60 ほどずれた点
+        let cur = (anchor.0 + c * 60.0, anchor.1 + s * 60.0);
+        let new = apply_drag(&drag, cur, &egui::Modifiers::NONE);
+        if let Shape::Rect {
+            center,
+            half_w,
+            half_h,
+            rotation_rad,
+        } = new
+        {
+            // 西辺中点 = new_center + R * (-new_hw, 0) が anchor と一致する必要がある
+            let (s2, c2) = rotation_rad.sin_cos();
+            let west = (center.0 + c2 * (-half_w), center.1 + s2 * (-half_w));
+            assert!(
+                (west.0 - anchor.0).abs() < 0.5 && (west.1 - anchor.1).abs() < 0.5,
+                "west edge midpoint must stay at anchor: got {:?} vs {:?}",
+                west,
+                anchor
+            );
+            // 新しい half_w = 30 (= 60 / 2)、half_h は orig (= 20) のまま
+            assert!((half_w - 30.0).abs() < 0.5, "hw = {half_w}");
+            assert!((half_h - 20.0).abs() < 0.5, "hh = {half_h}");
+        } else {
+            panic!("expected Rect");
+        }
+    }
+
+    #[test]
+    fn apply_drag_resize_corner_rotated_keeps_anchor_fixed() {
+        // 回転 45° の rect で SE corner を引いたとき、NW anchor が固定されることを確認。
+        let rot = 45.0_f32.to_radians();
+        let r = rect_at(100.0, 100.0, 30.0, 20.0, rot);
+        let (s, c) = rot.sin_cos();
+        // NW (local (-hw, -hh) = (-30, -20)) の image 座標
+        let anchor = (
+            100.0 + c * (-30.0) - s * (-20.0),
+            100.0 + s * (-30.0) + c * (-20.0),
+        );
+        let drag = DragState::Resize {
+            idx: 0,
+            base: r,
+            target: HoverTarget::Corner { idx: 2 }, // SE
+            origin: anchor,
+            anchor,
+        };
+        // SE corner を anchor から local (+80, +50) へ動かす
+        let cur = (
+            anchor.0 + c * 80.0 - s * 50.0,
+            anchor.1 + s * 80.0 + c * 50.0,
+        );
+        let new = apply_drag(&drag, cur, &egui::Modifiers::NONE);
+        if let Shape::Rect {
+            center,
+            half_w,
+            half_h,
+            rotation_rad,
+        } = new
+        {
+            let (s2, c2) = rotation_rad.sin_cos();
+            // NW = center + R * (-hw, -hh)
+            let nw = (
+                center.0 + c2 * (-half_w) - s2 * (-half_h),
+                center.1 + s2 * (-half_w) + c2 * (-half_h),
+            );
+            assert!(
+                (nw.0 - anchor.0).abs() < 0.5 && (nw.1 - anchor.1).abs() < 0.5,
+                "NW corner must stay at anchor: got {:?} vs {:?}",
+                nw,
+                anchor
+            );
+            assert!((half_w - 40.0).abs() < 0.5, "hw = {half_w}");
+            assert!((half_h - 25.0).abs() < 0.5, "hh = {half_h}");
         } else {
             panic!("expected Rect");
         }

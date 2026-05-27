@@ -8710,6 +8710,7 @@ impl App {
         self.bump_all_adjustment_generations();
         self.bump_all_ai_generations();
         self.erase_base_cache.clear();
+        self.conceal_base_cache.clear();
         self.original_preview_tex_cache.clear();
         self.fs_early_dims.clear();
         self.fs_cache.clear();
@@ -14258,6 +14259,7 @@ impl App {
             // フルスクリーンで現在これらのページを開いている可能性は低い (grid モード) が、
             // 念のため inpaint 結果キャッシュを落として次回開いたときに再適用させる。
             self.erase_base_cache.remove(idx);
+            self.conceal_base_cache.remove(idx);
             self.original_preview_tex_cache.remove(idx);
             self.fs_cache.remove(idx);
             self.save_mask_raw_with_sidecar(
@@ -15550,7 +15552,9 @@ impl App {
             self.native_video_deferred_nav_delta = None;
         }
         self.reset_erase_mode();
+        self.reset_conceal_mode();
         self.erase_base_cache.clear();
+        self.conceal_base_cache.clear();
         self.original_preview_tex_cache.clear();
         for (cancel, _, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
