@@ -23,6 +23,7 @@ use crate::app::{App, EraseSnapshot, EraseTool, ShiftDragState};
 use crate::fs_animation::FsCacheEntry;
 use crate::mask_db::{LineKind, Shape};
 use crate::ui_fullscreen::FsKeyAction;
+use crate::ui_fullscreen::draw_icons::{PanelToggleColors, panel_toggle_button};
 use crate::vector_edit;
 
 /// 進行中の MI-GAN inpaint 推論。`App.erase_inpaint_pending` で保持され、
@@ -65,6 +66,10 @@ const MIGAN_SIZE: usize = 512;
 
 /// ツールパネルの幅。
 const PANEL_W: f32 = 190.0;
+/// パネルクリック吸収 sink の高さ (= `erase_panel_rect` の高さも兼ねる)。
+/// 可視 Frame::popup より大きく取って範囲外クリックを Foreground area で
+/// 確実に吸収する設計 (隠蔽パネルと同じ手法)。
+const ERASE_PANEL_SINK_H: f32 = 1000.0;
 /// ツールパネルの左上マージン。
 const PANEL_MARGIN_X: f32 = 16.0;
 const PANEL_MARGIN_Y: f32 = 60.0;
@@ -845,24 +850,13 @@ impl App {
             full_rect.min.x + PANEL_MARGIN_X,
             full_rect.min.y + PANEL_MARGIN_Y,
         );
-        // 基本高さ: ヘッダ + 描画/消去 + セパレータ + ツール 4 行 (Phase 0b で 8 ツール
-        // に拡張、2x4 grid) + スロット + 下部ショートカット説明 + セパレータ + マスク全削除 + ヘルプ
-        let base_h = 458.0;
-        let extra = if self.erase_tool == EraseTool::Brush || self.erase_tool == EraseTool::Line {
-            42.0 // サイズスライダー分
-        } else {
-            0.0
-        };
-        // 見開きペアから入った場合は左/右切替ボタン + セパレータの分を追加 (32 + 8 = 40)。
-        let spread_extra = if self.erase_spread_ctx.is_some() {
-            40.0
-        } else {
-            0.0
-        };
-        egui::Rect::from_min_size(
-            panel_pos,
-            egui::vec2(PANEL_W, base_h + extra + spread_extra),
-        )
+        // 消しゴムパネルは egui::Frame::popup の auto-size になっており、
+        // 内容のセクション (見開き有無 / ツール別スライダー有無) で高さが変動する。
+        // `handle_erase_paint` の「カーソルがパネル上なら筆操作を skip」用の
+        // 判定 rect は、可視 Frame をすべて覆う generous な高さで十分。
+        // 隠蔽パネルと同じ 1000px の SINK 設計に合わせる。
+        let panel_h = ERASE_PANEL_SINK_H;
+        egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W, panel_h))
     }
 
     // ── 入力処理 ──────────────────────────────────────────────────
@@ -1611,449 +1605,362 @@ impl App {
     // ── ツールパネル ──────────────────────────────────────────────
 
     fn draw_erase_panel(&mut self, _ui: &mut egui::Ui, ctx: &egui::Context, full_rect: egui::Rect) {
-        let panel_rect = self.erase_panel_rect(full_rect);
+        // 隠蔽パネルと同じ egui::Area + Frame::popup + panel_toggle_button の構成に
+        // 揃える (2026-05-27 統一)。raw painter で固定 y オフセットを積んで描画して
+        // いた旧実装と違い、Frame::popup の auto-size + egui レイアウトに任せて
+        // 内容のセクションが増減しても自然に縦が伸び縮みする。
+        let panel_pos = egui::pos2(
+            full_rect.min.x + PANEL_MARGIN_X,
+            full_rect.min.y + PANEL_MARGIN_Y,
+        );
 
-        // ヘッダボタン (プレビュー / 閉じる) の押下状態をローカル変数に集約 →
-        // Area closure 後にディスパッチ (state mutation を描画中に避ける)。
-        let mut erase_preview_pressed = false;
-        let mut erase_close_clicked = false;
+        // クリック吸収 sink (= 可視 Frame::popup より大きく取って、Frame 外周も
+        // 確実に吸収する)。詳細は隠蔽パネルと同じ設計メモを参照。
+        let sink_rect =
+            egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W + 4.0, ERASE_PANEL_SINK_H));
 
-        // egui::Area (Foreground) でパネルを描画。interactable=true でクリックを受け取る。
+        // closure 内で self mutation を避ける用のローカル変数群。Area::show 後に
+        // まとめてディスパッチする。
+        let mut preview_pressed = false;
+        let mut close_clicked = false;
+        let mut switch_to: Option<usize> = None;
+        let mut mask_delete_clicked = false;
+
         egui::Area::new(egui::Id::new("erase_tool_panel"))
+            .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
-            .fixed_pos(panel_rect.min)
             .interactable(true)
-            .show(ctx, |child| {
-                // 背景を描画してクリック範囲を確保
-                let (_resp, painter) =
-                    child.allocate_painter(panel_rect.size(), egui::Sense::click_and_drag());
-                painter.rect_filled(
-                    panel_rect,
-                    6.0,
-                    egui::Color32::from_rgba_unmultiplied(20, 20, 20, 220),
+            .show(ctx, |ui| {
+                // 1. クリック吸収 sink を widget より先に登録 (= egui の hit test
+                //    "同じ rect の Response は後勝ち" ルールで widget の click を
+                //    優先しつつ、widget 外の隙間/Frame 外周は sink が拾う)。
+                ui.interact(
+                    sink_rect,
+                    egui::Id::new("erase_panel_click_sink"),
+                    egui::Sense::click_and_drag(),
                 );
-                painter.rect_stroke(
-                    panel_rect,
-                    6.0,
-                    egui::Stroke::new(
+                egui::Frame::popup(ui.style())
+                    .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230))
+                    .stroke(egui::Stroke::new(
                         1.0,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
-                    ),
-                    egui::StrokeKind::Outside,
-                );
+                    ))
+                    .corner_radius(6.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(PANEL_W);
+                        // dark visuals の widgets.* 派生色 (= 灰色) で widget の文字が
+                        // 描画されると読みづらいので、テキスト色を白に強制する。
+                        ui.style_mut().visuals.override_text_color =
+                            Some(egui::Color32::WHITE);
 
-                let x0 = panel_rect.min.x + 10.0;
-                let pw = panel_rect.width() - 20.0;
-                let mut y = panel_rect.min.y + 8.0;
-
-                // ── ヘッダー (タイトル + プレビュー + 閉じる × ボタン) ──
-                child.painter().text(
-                    egui::pos2(x0, y),
-                    egui::Align2::LEFT_TOP,
-                    "消しゴム",
-                    egui::FontId::proportional(15.0),
-                    egui::Color32::WHITE,
-                );
-                // 右側にプレビュー (目アイコン) と 閉じる (×) ボタン
-                let header_btn_size = 22.0;
-                let header_btn_gap = 4.0;
-                // 閉じるボタン (右端)
-                let close_rect = egui::Rect::from_min_size(
-                    egui::pos2(panel_rect.max.x - 10.0 - header_btn_size, y - 1.0),
-                    egui::vec2(header_btn_size + 4.0, header_btn_size),
-                );
-                let close_resp = child.allocate_rect(close_rect, egui::Sense::click());
-                let close_bg = if close_resp.hovered() {
-                    egui::Color32::from_rgba_unmultiplied(220, 80, 80, 200)
-                } else {
-                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
-                };
-                child.painter().rect_filled(close_rect, 4.0, close_bg);
-                crate::ui_fullscreen::draw_icons::draw_close_icon(
-                    child.painter(),
-                    close_rect.center(),
-                    8.0,
-                );
-                if close_resp.clicked() {
-                    erase_close_clicked = true;
-                }
-                close_resp.on_hover_text("閉じる (Esc)");
-                // プレビュー (目アイコン): 押下中だけ `erase_preview_active = true`
-                let eye_rect = egui::Rect::from_min_size(
-                    egui::pos2(
-                        close_rect.min.x - header_btn_gap - (header_btn_size + 4.0),
-                        y - 1.0,
-                    ),
-                    egui::vec2(header_btn_size + 4.0, header_btn_size),
-                );
-                let eye_resp = child.allocate_rect(eye_rect, egui::Sense::click_and_drag());
-                let eye_bg = if eye_resp.is_pointer_button_down_on() {
-                    egui::Color32::from_rgb(60, 120, 200)
-                } else if eye_resp.hovered() {
-                    egui::Color32::from_rgba_unmultiplied(100, 100, 100, 220)
-                } else {
-                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
-                };
-                child.painter().rect_filled(eye_rect, 4.0, eye_bg);
-                crate::ui_fullscreen::draw_icons::draw_eye_icon(
-                    child.painter(),
-                    eye_rect.center(),
-                    8.0,
-                );
-                erase_preview_pressed = eye_resp.is_pointer_button_down_on();
-                eye_resp
-                    .on_hover_text("押している間: 消しゴム適用後の結果プレビュー (モザイクは除外)");
-                y += 24.0;
-
-                // ── 見開きペアの左/右切替ボタン (見開きから入った場合のみ) ──
-                // ボタン押下 = 現ページ編集を Apply → 反対ページへ移動 → 編集再開。
-                // 単一ページ (片側のみのページ) から入った場合は erase_spread_ctx が
-                // None なのでこのセクション全体が描画されない (= Single と同じ見た目)。
-                if let Some((left_idx, right_idx)) = self.erase_spread_ctx.map(|c| c.pair) {
-                    let pages = [("左ページ", left_idx), ("右ページ", right_idx)];
-                    let page_w = (pw - 4.0) / 2.0;
-                    let mut switch_to: Option<usize> = None;
-                    for (i, &(label, target_idx)) in pages.iter().enumerate() {
-                        let btn_rect = egui::Rect::from_min_size(
-                            egui::pos2(x0 + i as f32 * (page_w + 4.0), y),
-                            egui::vec2(page_w, 24.0),
-                        );
-                        let is_active = self.fullscreen_idx == Some(target_idx);
-                        let bg = if is_active {
-                            egui::Color32::from_rgb(60, 120, 200)
-                        } else {
-                            egui::Color32::from_gray(50)
-                        };
-                        let resp = child.allocate_rect(btn_rect, egui::Sense::click());
-                        if resp.hovered() && !is_active {
-                            child.painter().rect_filled(
-                                btn_rect,
-                                3.0,
-                                egui::Color32::from_gray(70),
+                        // ── ヘッダ (タイトル + プレビュー + 閉じる × ボタン) ──
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("消しゴム")
+                                    .size(15.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
                             );
-                        } else {
-                            child.painter().rect_filled(btn_rect, 3.0, bg);
-                        }
-                        child.painter().text(
-                            btn_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            label,
-                            egui::FontId::proportional(12.0),
-                            egui::Color32::WHITE,
-                        );
-                        if resp.clicked() && !is_active {
-                            switch_to = Some(target_idx);
-                        }
-                    }
-                    y += 32.0;
-                    // 区切り線
-                    child.painter().line_segment(
-                        [egui::pos2(x0, y), egui::pos2(x0 + pw, y)],
-                        egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
-                    );
-                    y += 8.0;
-                    // ループ後にディスパッチ (& mut self の二重借用を避けるため)。
-                    if let Some(target) = switch_to {
-                        self.switch_erase_target_in_spread(ctx, target);
-                    }
-                }
-
-                // ── 描画/消去 モード切り替え ──
-                let mode_labels = [("描画 [D]", true), ("消去 [F]", false)];
-                let mode_w = (pw - 4.0) / 2.0;
-                for (i, &(label, is_paint)) in mode_labels.iter().enumerate() {
-                    let btn_rect = egui::Rect::from_min_size(
-                        egui::pos2(x0 + i as f32 * (mode_w + 4.0), y),
-                        egui::vec2(mode_w, 24.0),
-                    );
-                    let is_active = self.erase_paint_mode == is_paint;
-                    let bg = if is_active {
-                        if is_paint {
-                            egui::Color32::from_rgb(180, 60, 60)
-                        } else {
-                            egui::Color32::from_rgb(60, 120, 180)
-                        }
-                    } else {
-                        egui::Color32::from_gray(50)
-                    };
-                    let resp = child.allocate_rect(btn_rect, egui::Sense::click());
-                    if resp.hovered() && !is_active {
-                        child
-                            .painter()
-                            .rect_filled(btn_rect, 3.0, egui::Color32::from_gray(70));
-                    } else {
-                        child.painter().rect_filled(btn_rect, 3.0, bg);
-                    }
-                    child.painter().text(
-                        btn_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        label,
-                        egui::FontId::proportional(12.0),
-                        egui::Color32::WHITE,
-                    );
-                    if resp.clicked() {
-                        self.erase_paint_mode = is_paint;
-                    }
-                }
-                y += 32.0;
-
-                // ── 区切り線 (描画/消去 と ツール選択を分ける) ──
-                child.painter().line_segment(
-                    [egui::pos2(x0, y), egui::pos2(x0 + pw, y)],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
-                );
-                y += 8.0;
-
-                // ── ツール選択 (Phase 0b で 8 ツールに拡張) ──
-                let tools = [
-                    ("選択 [S]", EraseTool::Select),
-                    ("筆 [B]", EraseTool::Brush),
-                    ("囲み [L]", EraseTool::Lasso),
-                    ("直線 [I]", EraseTool::Line),
-                    ("縦線 [V]", EraseTool::VertLine),
-                    ("横線 [H]", EraseTool::HorizLine),
-                    ("矩形 [R]", EraseTool::Rect),
-                    ("楕円 [O]", EraseTool::Ellipse),
-                ];
-                let tool_w = (pw - 8.0) / 2.0;
-                let mut rows_used = 0usize;
-                for (i, &(label, tool)) in tools.iter().enumerate() {
-                    let col = i % 2;
-                    let row = i / 2;
-                    rows_used = row + 1;
-                    let btn_rect = egui::Rect::from_min_size(
-                        egui::pos2(x0 + col as f32 * (tool_w + 8.0), y + row as f32 * 28.0),
-                        egui::vec2(tool_w, 24.0),
-                    );
-                    let is_active = self.erase_tool == tool;
-                    let bg = if is_active {
-                        egui::Color32::from_rgb(60, 120, 200)
-                    } else {
-                        egui::Color32::from_gray(50)
-                    };
-                    let resp = child.allocate_rect(btn_rect, egui::Sense::click());
-                    if resp.hovered() && !is_active {
-                        child
-                            .painter()
-                            .rect_filled(btn_rect, 3.0, egui::Color32::from_gray(70));
-                    } else {
-                        child.painter().rect_filled(btn_rect, 3.0, bg);
-                    }
-                    child.painter().text(
-                        btn_rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        label,
-                        egui::FontId::proportional(12.0),
-                        egui::Color32::WHITE,
-                    );
-                    if resp.clicked() {
-                        self.erase_tool = tool;
-                    }
-                }
-                y += rows_used as f32 * 28.0 + 4.0;
-
-                // ── ブラシサイズスライダー（筆ツール時のみ）──
-                if self.erase_tool == EraseTool::Brush {
-                    child.painter().text(
-                        egui::pos2(x0, y),
-                        egui::Align2::LEFT_TOP,
-                        "サイズ",
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::from_gray(180),
-                    );
-                    y += 16.0;
-                    let slider_rect =
-                        egui::Rect::from_min_size(egui::pos2(x0, y), egui::vec2(pw, 20.0));
-                    let mut slider_child =
-                        child.new_child(egui::UiBuilder::new().max_rect(slider_rect));
-                    let max_r = self.erase_mask_size[0].max(self.erase_mask_size[1]) as f32 / 20.0;
-                    slider_child.add(
-                        egui::Slider::new(&mut self.erase_brush_radius, 1.0..=max_r)
-                            .step_by(1.0)
-                            .show_value(false),
-                    );
-                    y += 26.0;
-                }
-
-                // ── 直線幅スライダー (直線ツール時のみ) ──
-                if self.erase_tool == EraseTool::Line {
-                    child.painter().text(
-                        egui::pos2(x0, y),
-                        egui::Align2::LEFT_TOP,
-                        "幅",
-                        egui::FontId::proportional(11.0),
-                        egui::Color32::from_gray(180),
-                    );
-                    y += 16.0;
-                    let slider_rect =
-                        egui::Rect::from_min_size(egui::pos2(x0, y), egui::vec2(pw, 20.0));
-                    let mut slider_child =
-                        child.new_child(egui::UiBuilder::new().max_rect(slider_rect));
-                    let max_w = self.erase_mask_size[0].max(self.erase_mask_size[1]) as f32 / 20.0;
-                    slider_child.add(
-                        egui::Slider::new(&mut self.erase_line_width, 1.0..=max_w)
-                            .step_by(1.0)
-                            .show_value(false),
-                    );
-                    y += 26.0;
-                }
-
-                // ── セパレーター ──
-                child.painter().line_segment(
-                    [egui::pos2(x0, y), egui::pos2(x0 + pw, y)],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
-                );
-                y += 6.0;
-
-                // ── スロット保存/ロード (1/2) ──
-                child.painter().text(
-                    egui::pos2(x0, y),
-                    egui::Align2::LEFT_TOP,
-                    "マスクスロット",
-                    egui::FontId::proportional(11.0),
-                    egui::Color32::from_gray(180),
-                );
-                y += 15.0;
-                // 2 行 × 2 列: 上段 [保存1][保存2]、下段 [ロード1][ロード2]
-                // ショートカット表記はボタンに載せない (F7/F8 はフルスクリーン全体ショートカット、
-                // 消しゴムモード内ショートカットは廃止)。
-                let slot_w = (pw - 4.0) / 2.0;
-                for (row, action_label) in ["保存", "ロード"].iter().enumerate() {
-                    for slot in 1..=2u32 {
-                        let btn_rect = egui::Rect::from_min_size(
-                            egui::pos2(
-                                x0 + (slot as f32 - 1.0) * (slot_w + 4.0),
-                                y + row as f32 * 24.0,
-                            ),
-                            egui::vec2(slot_w, 20.0),
-                        );
-                        let resp = child.allocate_rect(btn_rect, egui::Sense::click());
-                        let bg = if resp.hovered() {
-                            egui::Color32::from_gray(70)
-                        } else {
-                            egui::Color32::from_gray(50)
-                        };
-                        child.painter().rect_filled(btn_rect, 3.0, bg);
-                        let label = format!("{}{}", action_label, slot);
-                        child.painter().text(
-                            btn_rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            &label,
-                            egui::FontId::proportional(10.0),
-                            egui::Color32::WHITE,
-                        );
-                        if resp.clicked() {
-                            if row == 0 {
-                                self.save_mask_to_slot(slot as usize);
-                            } else {
-                                self.load_mask_from_slot(slot as usize);
-                            }
-                        }
-                    }
-                }
-                y += 52.0;
-
-                // ── ショートカット説明 (スロットに対する全体ショートカットを文章で) ──
-                child.painter().text(
-                    egui::pos2(x0, y),
-                    egui::Align2::LEFT_TOP,
-                    "フルスクリーン中 F7/F8 で\n保存1/2 を即適用",
-                    egui::FontId::proportional(10.0),
-                    egui::Color32::from_gray(150),
-                );
-                y += 26.0;
-
-                // ── セパレーター (2) ──
-                child.painter().line_segment(
-                    [egui::pos2(x0, y), egui::pos2(x0 + pw, y)],
-                    egui::Stroke::new(1.0, egui::Color32::from_gray(60)),
-                );
-                y += 6.0;
-
-                // ── マスク全削除ボタン ──
-                let del_rect = egui::Rect::from_min_size(egui::pos2(x0, y), egui::vec2(pw, 22.0));
-                let del_resp = child.allocate_rect(del_rect, egui::Sense::click());
-                let del_bg = if del_resp.hovered() {
-                    egui::Color32::from_rgba_unmultiplied(200, 50, 50, 200)
-                } else {
-                    egui::Color32::from_gray(50)
-                };
-                child.painter().rect_filled(del_rect, 3.0, del_bg);
-                child.painter().text(
-                    del_rect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "マスク全削除",
-                    egui::FontId::proportional(11.0),
-                    egui::Color32::WHITE,
-                );
-                if del_resp.clicked() {
-                    let [w, h] = self.erase_mask_size;
-                    self.push_undo_snapshot();
-                    self.erase_mask = Some(vec![false; w * h]);
-                    self.erase_shapes.clear();
-                    self.erase_selected_shape = None;
-                    self.erase_drag = None;
-                    self.erase_mask_texture = None;
-                    // 編集中の一時状態も破棄しないと、ドラッグ途中に全削除を押したあと
-                    // 次の release/click で描きかけの囲み・直線・シフト分だけの差分が
-                    // 復活してしまう。reset_erase_mode() と同じ範囲をクリアするが、
-                    // erase_mode 自体は維持してその場で編集を継続できるようにする。
-                    self.erase_last_paint_pos = None;
-                    self.erase_lasso_points.clear();
-                    self.erase_line_start = None;
-                    self.erase_line_end = None;
-                    self.erase_line_tilt = 0.0;
-                    self.erase_shift_drag = None;
-                    self.erase_shape_drag_start = None;
-                    self.erase_shape_drag_end = None;
-                    if let Some(fs_idx) = self.fullscreen_idx {
-                        // DB + サイドカーからも削除
-                        self.delete_mask_with_sidecar(fs_idx);
-                        // 表示を元画像に戻す
-                        if let Some(base) = self.erase_base_cache.get(&fs_idx) {
-                            let tex = ctx.load_texture(
-                                format!("fs_restored_{fs_idx}"),
-                                base.as_ref().clone(),
-                                egui::TextureOptions::LINEAR,
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    // 閉じる × ボタン (右端)
+                                    let (close_rect, close_resp) = ui.allocate_exact_size(
+                                        egui::vec2(26.0, 22.0),
+                                        egui::Sense::click(),
+                                    );
+                                    let close_bg = if close_resp.hovered() {
+                                        egui::Color32::from_rgba_unmultiplied(
+                                            220, 80, 80, 200,
+                                        )
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
+                                    };
+                                    ui.painter().rect_filled(close_rect, 4.0, close_bg);
+                                    crate::ui_fullscreen::draw_icons::draw_close_icon(
+                                        ui.painter(),
+                                        close_rect.center(),
+                                        8.0,
+                                    );
+                                    if close_resp.clicked() {
+                                        close_clicked = true;
+                                    }
+                                    close_resp.on_hover_text("閉じる + 補完実行 (Esc)");
+                                    ui.add_space(2.0);
+                                    // プレビュー 目アイコン (= while held)
+                                    let (eye_rect, eye_resp) = ui.allocate_exact_size(
+                                        egui::vec2(26.0, 22.0),
+                                        egui::Sense::click_and_drag(),
+                                    );
+                                    let eye_bg = if eye_resp.is_pointer_button_down_on() {
+                                        egui::Color32::from_rgb(60, 120, 200)
+                                    } else if eye_resp.hovered() {
+                                        egui::Color32::from_rgba_unmultiplied(
+                                            100, 100, 100, 220,
+                                        )
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
+                                    };
+                                    ui.painter().rect_filled(eye_rect, 4.0, eye_bg);
+                                    crate::ui_fullscreen::draw_icons::draw_eye_icon(
+                                        ui.painter(),
+                                        eye_rect.center(),
+                                        8.0,
+                                    );
+                                    if eye_resp.is_pointer_button_down_on() {
+                                        preview_pressed = true;
+                                    }
+                                    eye_resp.on_hover_text(
+                                        "押している間: 消しゴム適用後の結果プレビュー (モザイクは除外)",
+                                    );
+                                },
                             );
-                            let bg = self.effective_upscale_bg_mode();
-                            let prev_source_dims = self.fs_cache_source_dims(fs_idx);
-                            let write_to_ai = self.ai_upscale_cache.contains_key(&(fs_idx, bg));
-                            let entry = FsCacheEntry::Static {
-                                tex,
-                                pixels: Arc::clone(base),
-                                source_dims: if write_to_ai { None } else { prev_source_dims },
-                                load_seq: self.input_seq,
-                            };
-                            if write_to_ai {
-                                self.ai_upscale_cache.insert((fs_idx, bg), entry);
-                            } else {
-                                self.fs_cache.insert(fs_idx, entry);
-                            }
+                        });
+
+                        // ボタン共通の最小サイズ。PANEL_W (= 190) - Frame::popup
+                        // padding (~10*2) - 中央 gap (4) を 2 で割って、片側 ~78px。
+                        let btn_w = ((PANEL_W - 20.0 - 4.0) / 2.0).max(60.0);
+                        let btn_size = egui::vec2(btn_w, 24.0);
+
+                        // ── 見開きペアの左/右切替 (見開きから入った場合のみ) ──
+                        if let Some((left_idx, right_idx)) =
+                            self.erase_spread_ctx.map(|c| c.pair)
+                        {
+                            let pages = [("左ページ", left_idx), ("右ページ", right_idx)];
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                for &(label, target_idx) in pages.iter() {
+                                    let is_active = self.fullscreen_idx == Some(target_idx);
+                                    if panel_toggle_button(
+                                        ui,
+                                        label,
+                                        is_active,
+                                        Some(btn_size),
+                                        None,
+                                    )
+                                    .clicked()
+                                        && !is_active
+                                    {
+                                        switch_to = Some(target_idx);
+                                    }
+                                }
+                            });
+                            ui.separator();
                         }
+
+                        // ── 描画 / 消去 (active=赤/青、inactive=暗灰) ──
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            if panel_toggle_button(
+                                ui,
+                                "描画 [D]",
+                                self.erase_paint_mode,
+                                Some(btn_size),
+                                Some(PanelToggleColors::paint_red()),
+                            )
+                            .clicked()
+                            {
+                                self.erase_paint_mode = true;
+                            }
+                            if panel_toggle_button(
+                                ui,
+                                "消去 [F]",
+                                !self.erase_paint_mode,
+                                Some(btn_size),
+                                Some(PanelToggleColors::erase_blue()),
+                            )
+                            .clicked()
+                            {
+                                self.erase_paint_mode = false;
+                            }
+                        });
+                        ui.separator();
+
+                        // ── ツール選択 (Phase 0b で 8 ツール、2x4 grid) ──
+                        let tool_rows: [[(&str, EraseTool); 2]; 4] = [
+                            [
+                                ("選択 [S]", EraseTool::Select),
+                                ("筆 [B]", EraseTool::Brush),
+                            ],
+                            [
+                                ("囲み [L]", EraseTool::Lasso),
+                                ("直線 [I]", EraseTool::Line),
+                            ],
+                            [
+                                ("縦線 [V]", EraseTool::VertLine),
+                                ("横線 [H]", EraseTool::HorizLine),
+                            ],
+                            [
+                                ("矩形 [R]", EraseTool::Rect),
+                                ("楕円 [O]", EraseTool::Ellipse),
+                            ],
+                        ];
+                        for row in tool_rows.iter() {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                for &(label, tool) in row.iter() {
+                                    if panel_toggle_button(
+                                        ui,
+                                        label,
+                                        self.erase_tool == tool,
+                                        Some(btn_size),
+                                        None,
+                                    )
+                                    .clicked()
+                                    {
+                                        self.erase_tool = tool;
+                                    }
+                                }
+                            });
+                        }
+
+                        // ── ブラシ半径 / 直線太さ スライダー ──
+                        if self.erase_tool == EraseTool::Brush {
+                            let max_r =
+                                self.erase_mask_size[0].max(self.erase_mask_size[1]) as f32
+                                    / 20.0;
+                            ui.add(
+                                egui::Slider::new(&mut self.erase_brush_radius, 1.0..=max_r)
+                                    .text("サイズ")
+                                    .step_by(1.0),
+                            );
+                        }
+                        if self.erase_tool == EraseTool::Line {
+                            let max_w =
+                                self.erase_mask_size[0].max(self.erase_mask_size[1]) as f32
+                                    / 20.0;
+                            ui.add(
+                                egui::Slider::new(&mut self.erase_line_width, 1.0..=max_w)
+                                    .text("幅")
+                                    .step_by(1.0),
+                            );
+                        }
+
+                        ui.separator();
+
+                        // ── マスクスロット (保存 / ロード の 2x2) ──
+                        ui.label(
+                            egui::RichText::new("マスクスロット:")
+                                .color(egui::Color32::from_gray(200)),
+                        );
+                        for (row, action_label) in ["保存", "ロード"].iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                for slot in 1..=2usize {
+                                    let label = format!("{}{}", action_label, slot);
+                                    if panel_toggle_button(
+                                        ui,
+                                        label,
+                                        false,
+                                        Some(btn_size),
+                                        None,
+                                    )
+                                    .clicked()
+                                    {
+                                        if row == 0 {
+                                            self.save_mask_to_slot(slot);
+                                        } else {
+                                            self.load_mask_from_slot(slot);
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        ui.label(
+                            egui::RichText::new(
+                                "フルスクリーン中 F7/F8 で保存 1/2 を即適用",
+                            )
+                            .size(10.0)
+                            .color(egui::Color32::from_gray(150)),
+                        );
+
+                        ui.separator();
+
+                        // ── マスク全削除 (赤系の destructive ボタン) ──
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new("マスク全削除")
+                                        .color(egui::Color32::WHITE),
+                                )
+                                .fill(egui::Color32::from_rgb(120, 50, 50))
+                                .min_size(egui::vec2(PANEL_W - 20.0, 22.0)),
+                            )
+                            .clicked()
+                        {
+                            mask_delete_clicked = true;
+                        }
+
+                        ui.separator();
+
+                        // ── ヘルプテキスト ──
+                        let help = "E:補完 ESC:終了/選択解除 Ctrl+Z:戻す\n\
+                            矢印:シフト [/]:回転 (Ctrl:10倍)\n\
+                            Space+ドラッグ:パン操作\n\
+                            Ctrl+ドラッグ: 筆/直線→太さ\n\
+                            \u{00A0}縦横線→パン/傾き 選択→回転/太さ\n\
+                            選択ツール+クリック=選択  Del:削除";
+                        ui.label(
+                            egui::RichText::new(help)
+                                .size(10.0)
+                                .color(egui::Color32::from_gray(190)),
+                        );
+                    });
+            });
+
+        // ── closure 外でディスパッチ (& mut self の借用衝突を避ける) ──
+        self.erase_preview_active = preview_pressed;
+        if let Some(target) = switch_to {
+            self.switch_erase_target_in_spread(ctx, target);
+        }
+        if mask_delete_clicked {
+            let [w, h] = self.erase_mask_size;
+            self.push_undo_snapshot();
+            self.erase_mask = Some(vec![false; w * h]);
+            self.erase_shapes.clear();
+            self.erase_selected_shape = None;
+            self.erase_drag = None;
+            self.erase_mask_texture = None;
+            // 編集中の一時状態も破棄しないと、ドラッグ途中に全削除を押したあと
+            // 次の release/click で描きかけの囲み・直線・シフト分だけの差分が
+            // 復活してしまう。reset_erase_mode() と同じ範囲をクリアするが、
+            // erase_mode 自体は維持してその場で編集を継続できるようにする。
+            self.erase_last_paint_pos = None;
+            self.erase_lasso_points.clear();
+            self.erase_line_start = None;
+            self.erase_line_end = None;
+            self.erase_line_tilt = 0.0;
+            self.erase_shift_drag = None;
+            self.erase_shape_drag_start = None;
+            self.erase_shape_drag_end = None;
+            if let Some(fs_idx) = self.fullscreen_idx {
+                // DB + サイドカーからも削除
+                self.delete_mask_with_sidecar(fs_idx);
+                // 表示を元画像に戻す
+                if let Some(base) = self.erase_base_cache.get(&fs_idx) {
+                    let tex = ctx.load_texture(
+                        format!("fs_restored_{fs_idx}"),
+                        base.as_ref().clone(),
+                        egui::TextureOptions::LINEAR,
+                    );
+                    let bg = self.effective_upscale_bg_mode();
+                    let prev_source_dims = self.fs_cache_source_dims(fs_idx);
+                    let write_to_ai = self.ai_upscale_cache.contains_key(&(fs_idx, bg));
+                    let entry = FsCacheEntry::Static {
+                        tex,
+                        pixels: Arc::clone(base),
+                        source_dims: if write_to_ai { None } else { prev_source_dims },
+                        load_seq: self.input_seq,
+                    };
+                    if write_to_ai {
+                        self.ai_upscale_cache.insert((fs_idx, bg), entry);
+                    } else {
+                        self.fs_cache.insert(fs_idx, entry);
                     }
                 }
-                y += 28.0;
-
-                // ── ヘルプテキスト ──
-                let help = "E:補完 ESC:終了/選択解除 Ctrl+Z:戻す\n\
-                    矢印:シフト [/]:回転 (Ctrl:10倍)\n\
-                    Space+ドラッグ:パン操作\n\
-                    Ctrl+ドラッグ: 筆/直線→太さ\n\
-                    \u{00A0}縦横線→パン/傾き 選択→回転/太さ\n\
-                    選択ツール+クリック=選択  Del:削除";
-                child.painter().text(
-                    egui::pos2(x0, y),
-                    egui::Align2::LEFT_TOP,
-                    help,
-                    egui::FontId::proportional(10.0),
-                    egui::Color32::from_gray(140),
-                );
-            }); // egui::Area::show
-
-        // ヘッダボタン押下のディスパッチ (closure 内で self mutation を避けた分の後始末)
-        self.erase_preview_active = erase_preview_pressed;
-        if erase_close_clicked {
+            }
+        }
+        if close_clicked {
             // × ボタンは Esc キーと同じ動作: マスクがあれば inpaint を実行してから
             // モード退出、マスクが空なら何もせず退出 (`execute_erase_inpaint` 内で
             // ハンドリング)。
