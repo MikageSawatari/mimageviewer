@@ -2347,8 +2347,15 @@ impl App {
         let is_separator = separator_text.is_some();
         let original_preview_active = self.original_preview_active(ctx, fs_idx);
 
+        // 消しゴム確定結果: fs_cache へ焼き込まず、専用レイヤとして解決する。
+        let erase_result_tex = if is_video || original_preview_active || self.erase_mode {
+            None
+        } else {
+            self.ensure_erase_result_texture(ctx, fs_idx)
+        };
+
         // 隠蔽合成: マスクが保存されているページなら最上位レイヤとして適用 (Phase 4)。
-        // `ensure_conceal_texture` は内部で adj > ai > fs の優先順位で入力を選ぶ。
+        // `ensure_conceal_texture` は内部で erase_result > adj > ai > fs の優先順位で入力を選ぶ。
         // 隠蔽モード編集中 / 該当 idx にマスク無し / 入力ピクセル未取得 → None。
         // ライフサイクル順序: 元プレビュー (右 Ctrl) は隠蔽より優先で raw を見せる
         // (= 元画像確認のための一時バイパス、消しゴム base_cache と同じ思想)。
@@ -2379,6 +2386,8 @@ impl App {
             Some(b)
         } else if let Some(c) = conceal_tex {
             Some(c)
+        } else if let Some(e) = erase_result_tex {
+            Some(e)
         } else {
             // 補正済みキャッシュ（フル解像度）
             let adj_tex = match self.adjustment_cache.get(&fs_idx) {
@@ -2443,7 +2452,7 @@ impl App {
                     .or(fs_cache_tex)
                     .or(fallback_tex)
             } else {
-                // 通常: adj > ai > fs_cache の順 (fallback は preview 用なので使われない)
+                // 通常: erase_result はこのブロックの前で解決済み。
                 adj_tex.or(ai_tex).or(fs_cache_tex)
             }
         };

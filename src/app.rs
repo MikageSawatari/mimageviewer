@@ -1246,6 +1246,24 @@ pub(crate) struct ErasePreviewCacheEntry {
     pub texture: egui::TextureHandle,
 }
 
+/// 消しゴム確定結果を識別する cache key。
+///
+/// `fs_cache` は raw decode 専用に戻すため、MI-GAN の確定結果はこの key で
+/// `erase_result_cache` に保持する。入力レイヤ (AI / 補正 / raw) とマスクの
+/// どちらが変わっても別 key になり、古い inpaint 結果を誤採用しない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct EraseResultKey {
+    pub(crate) idx: usize,
+    pub(crate) input_gen: u64,
+    pub(crate) mask_gen: u64,
+}
+
+/// 消しゴム確定結果 (= MI-GAN inpaint 出力) の cache entry。
+pub(crate) struct EraseResultCacheEntry {
+    pub pixels: Arc<egui::ColorImage>,
+    pub texture: egui::TextureHandle,
+}
+
 /// 見開きから消しゴムに入ったときのコンテキスト。Apply / Cancel で
 /// 元の見開き状態 (= `saved_mode` の spread_mode + `pair.0` を中心ページとした
 /// 見開き表示) を復元するために保存する。
@@ -1872,6 +1890,12 @@ pub struct App {
     pub(crate) fullscreen_idx: Option<usize>,
     /// 先読みキャッシュ: item_idx → ロード済みエントリ（静止画 or アニメーション）
     pub(crate) fs_cache: std::collections::HashMap<usize, FsCacheEntry>,
+    /// 表示パイプライン入力の世代番号。
+    ///
+    /// raw decode / AI / 補正など、消しゴム確定結果の入力になるレイヤが変わるたび
+    /// idx 単位で +1 する。`erase_result_cache` の key に含めることで、入力が
+    /// 変わった後に古い MI-GAN 結果を表示しない。
+    pub(crate) input_generation: std::collections::HashMap<usize, u64>,
     /// 先読み中: item_idx → (キャンセルトークン, 受信チャネル, load 開始時の input_seq)
     /// `input_seq` は perf の `fs.ready` / `fs.paint` を `fs.load_begin` と同じ
     /// 操作に紐づけるための相関キー。`self.input_seq` を使うと非同期完了時に
@@ -2756,6 +2780,8 @@ pub struct App {
     /// 現フォルダでマスクを持つページの item_idx 集合 (サムネイル「消」バッジ描画用)。
     /// フォルダロード時に mask_db から一括取得し、save/delete/apply でメンテナンスする。
     pub(crate) mask_pages: std::collections::HashSet<usize>,
+    /// 消しゴムマスクの世代番号。mask / shape の保存・削除で idx 単位に +1 する。
+    pub(crate) erase_mask_generation: std::collections::HashMap<usize, u64>,
     /// 補正済み画像キャッシュ: item_idx → テクスチャ + ピクセルデータ
     pub(crate) adjustment_cache: std::collections::HashMap<usize, FsCacheEntry>,
     /// 補正キャッシュ世代カウンタ (360 度パノラマビュー用、docs/panorama-360-view-plan.md §4.1.2)。
@@ -2785,8 +2811,6 @@ pub struct App {
     pub(crate) adjustment_dragging: bool,
     /// 補正 DB ハンドル
     pub(crate) adjustment_db: Option<crate::adjustment_db::AdjustmentDb>,
-    /// シャープネス適用済みの idx 集合（再適用防止）
-    pub(crate) adjustment_sharpened: std::collections::HashSet<usize>,
     /// スロット保存ダイアログ: (slot_idx, 入力中の名前, 保存対象の補正値)。
     /// 補正値は開始時にキャプチャしておくことで、見開きの L/R 切替や
     /// ダイアログ中にスライダーを動かしても保存内容がブレない。
@@ -2929,8 +2953,13 @@ pub struct App {
     /// `cancel.store(true)` してしまっていた。idx ごとに独立保持することで両方の
     /// inpaint 結果を確実に受け取る。同じ idx への再投入時のみ前ジョブを cancel する。
     /// UI スレッドが MI-GAN 推論 (300-500ms) で固まらないようにするための非同期化エントリ。
-    pub(crate) erase_inpaint_pending:
-        std::collections::HashMap<usize, crate::ui_erase::EraseInpaintPending>,
+    pub(crate) erase_inpaint_pending: std::collections::HashMap<
+        crate::ui_erase::EraseInpaintPendingKey,
+        crate::ui_erase::EraseInpaintPending,
+    >,
+    /// 確定済み消しゴム inpaint 結果。`fs_cache` へは書き戻さない。
+    pub(crate) erase_result_cache:
+        std::collections::HashMap<crate::app::EraseResultKey, crate::app::EraseResultCacheEntry>,
     /// プレビュー専用の inpaint 結果キャッシュ (Codex P1 R4 #1)。
     ///
     /// 「preview ボタン押下 → 一時 MI-GAN 投入 → 結果を画面で確認」用の
@@ -3009,6 +3038,8 @@ pub struct App {
     /// `save_conceal_with_sidecar` / `delete_conceal_with_sidecar` で同期更新する。
     /// 削除に伴う idx シフトは `remove_items_batch` で他の idx-keyed セットと一緒に処理。
     pub(crate) conceal_pages: std::collections::HashSet<usize>,
+    /// 隠蔽マスクの世代番号。mask / shape の保存・削除で idx 単位に +1 する。
+    pub(crate) conceal_mask_generation: std::collections::HashMap<usize, u64>,
 
     /// 消しゴム編集モード中の「プレビューボタン押下」状態。
     /// パネル右上の目アイコンを押している間 true。表示パイプラインは
@@ -3628,6 +3659,7 @@ impl App {
             show_stats_dialog: false,
             fullscreen_idx: None,
             fs_cache: std::collections::HashMap::new(),
+            input_generation: std::collections::HashMap::new(),
             fs_pending: std::collections::HashMap::new(),
             fs_upload_backlog: Vec::new(),
             fs_early_dims: std::collections::HashMap::new(),
@@ -3908,6 +3940,7 @@ impl App {
             adjustment_page_params: std::collections::HashMap::new(),
             adjustment_favorite_params: std::collections::HashMap::new(),
             mask_pages: std::collections::HashSet::new(),
+            erase_mask_generation: std::collections::HashMap::new(),
             adjustment_cache: std::collections::HashMap::new(),
             adjustment_generation: std::collections::HashMap::new(),
             ai_upscale_generation: std::collections::HashMap::new(),
@@ -3916,7 +3949,6 @@ impl App {
             thumb_adjust_was_dragging: false,
             adjustment_dragging: false,
             adjustment_db,
-            adjustment_sharpened: std::collections::HashSet::new(),
             slot_save_dialog: None,
             ime_composing: false,
             ime_last_event_at: None,
@@ -3963,6 +3995,7 @@ impl App {
             erase_shape_drag_start: None,
             erase_shape_drag_end: None,
             erase_inpaint_pending: std::collections::HashMap::new(),
+            erase_result_cache: std::collections::HashMap::new(),
             erase_preview_cache: std::collections::HashMap::new(),
             erase_spread_ctx: None,
             // ── 隠蔽加工 (Conceal、Phase 1 default) ────────────
@@ -3988,6 +4021,7 @@ impl App {
             conceal_shape_drag_end: None,
             conceal_spread_ctx: None,
             conceal_pages: std::collections::HashSet::new(),
+            conceal_mask_generation: std::collections::HashMap::new(),
             conceal_cache: std::collections::HashMap::new(),
             conceal_generation: 0,
             erase_preview_active: false,
@@ -7819,7 +7853,12 @@ impl App {
         self.adjustment_dragging = false;
         self.adjustment_mode = false;
         self.mask_pages.clear();
+        self.erase_mask_generation.clear();
         self.conceal_pages.clear();
+        self.conceal_mask_generation.clear();
+        self.erase_result_cache.clear();
+        self.input_generation.clear();
+        self.cancel_all_erase_inpaint_pending();
         // 360 度パノラマビュー: フォルダ変更で cache 全体が変わったので世代を一斉 bump
         // (§3.6.2.2)。adjustment_generation / ai_upscale_generation の HashMap
         // 自体はクリアしない (キーが残っていても次フォルダで同 source_key が
@@ -8801,6 +8840,10 @@ impl App {
         self.ai_upscale_cache.clear();
         self.ai_upscale_failed.clear();
         self.ai_classify_cache.clear();
+        self.input_generation.clear();
+        self.erase_mask_generation.clear();
+        self.conceal_mask_generation.clear();
+        self.erase_result_cache.clear();
         // 360 度パノラマビュー: cache 全体が変わったので世代を一斉 bump (§3.6.2.2)。
         self.bump_all_adjustment_generations();
         self.bump_all_ai_generations();
@@ -8821,6 +8864,7 @@ impl App {
             cancel.store(true, Ordering::Relaxed);
         }
         self.ai_upscale_pending.clear();
+        self.cancel_all_erase_inpaint_pending();
 
         // auto_aspect.samples は idx キーなので、items の削除/差替えで idx が
         // 変わると古い比率や消えた item の比率が残る (Codex P3 2026-05)。
@@ -14360,10 +14404,10 @@ impl App {
             // フルスクリーンで現在これらのページを開いている可能性は低い (grid モード) が、
             // 念のため inpaint 結果キャッシュを落として次回開いたときに再適用させる。
             self.erase_base_cache.remove(idx);
+            self.clear_erase_result_caches_for_idx(*idx);
             self.conceal_base_cache.remove(idx);
             self.conceal_cache.remove(idx);
             self.original_preview_tex_cache.remove(idx);
-            self.fs_cache.remove(idx);
             self.save_mask_raw_with_sidecar(
                 *idx,
                 &compressed,
@@ -15658,6 +15702,7 @@ impl App {
         self.erase_base_cache.clear();
         self.conceal_base_cache.clear();
         self.conceal_cache.clear();
+        self.erase_result_cache.clear();
         self.original_preview_tex_cache.clear();
         for (cancel, _, _) in self.fs_pending.values() {
             cancel.store(true, Ordering::Relaxed);
@@ -15708,6 +15753,7 @@ impl App {
         self.ai_upscale_pending.clear();
         self.ai_upscale_cache.clear();
         self.ai_classify_cache.clear();
+        self.bump_all_input_generations();
         // フルスクリーン向けメタデータ読み込みもキャンセル (閉じた後のキャッシュ書き込みを防ぐ)
         if let Some(pending) = self.metadata_pending.take() {
             pending.cancel.store(true, Ordering::Relaxed);
@@ -15777,6 +15823,7 @@ impl App {
                 cancel.store(true, Ordering::Relaxed);
             }
         }
+        self.bump_input_generation(idx);
     }
 
     /// AI バックエンド設定変更をホットリロードする (Phase 3、再起動不要)。
@@ -16580,6 +16627,7 @@ impl App {
             let _ = db.set_raw(&key, compressed, shapes_json, w, h);
         }
         self.mask_pages.insert(idx);
+        self.bump_erase_mask_generation(idx);
         let sidecar_mask =
             crate::sidecar::SidecarMask::from_raw(compressed, shapes, w as u32, h as u32);
         self.with_sidecar_mut(idx, move |sc, rel| sc.set_mask(rel, sidecar_mask));
@@ -16595,6 +16643,7 @@ impl App {
             let _ = db.delete(&key);
         }
         self.mask_pages.remove(&idx);
+        self.bump_erase_mask_generation(idx);
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_mask(rel));
     }
 
@@ -16647,6 +16696,7 @@ impl App {
             let _ = db.set_raw(&key, compressed, shapes_json, w, h);
         }
         self.conceal_pages.insert(idx);
+        self.bump_conceal_mask_generation(idx);
         let sidecar_conceal =
             crate::sidecar::SidecarMask::from_raw(compressed, shapes, w as u32, h as u32);
         self.with_sidecar_mut(idx, move |sc, rel| sc.set_conceal(rel, sidecar_conceal));
@@ -16663,6 +16713,7 @@ impl App {
             let _ = db.delete(&key);
         }
         self.conceal_pages.remove(&idx);
+        self.bump_conceal_mask_generation(idx);
         self.with_sidecar_mut(idx, |sc, rel| sc.remove_conceal(rel));
     }
 
@@ -16672,6 +16723,102 @@ impl App {
     /// **その 1 ページだけ** 入力が変わった場合に呼ぶ。
     pub(crate) fn clear_conceal_caches(&mut self, idx: usize) {
         self.conceal_cache.remove(&idx);
+    }
+
+    fn cancel_erase_commit_pending_for_idx(&mut self, idx: usize) {
+        let key = crate::ui_erase::EraseInpaintPendingKey {
+            idx,
+            kind: crate::ui_erase::EraseInpaintKind::Commit,
+        };
+        if let Some(pending) = self.erase_inpaint_pending.remove(&key) {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn cancel_all_erase_inpaint_pending(&mut self) {
+        for pending in self.erase_inpaint_pending.values() {
+            pending.cancel.store(true, Ordering::Relaxed);
+        }
+        self.erase_inpaint_pending.clear();
+    }
+
+    /// 表示入力 (= raw / AI / 補正) が変わったことを idx 単位の世代で表す。
+    pub(crate) fn bump_input_generation(&mut self, idx: usize) {
+        let slot = self.input_generation.entry(idx).or_insert(0);
+        *slot = slot.wrapping_add(1);
+        self.cancel_erase_commit_pending_for_idx(idx);
+        self.clear_erase_result_caches_for_idx(idx);
+        self.clear_conceal_caches(idx);
+    }
+
+    /// 全 idx の表示入力世代を進める。バルク補正やフォルダ切替などの広域 clear 用。
+    pub(crate) fn bump_all_input_generations(&mut self) {
+        for v in self.input_generation.values_mut() {
+            *v = v.wrapping_add(1);
+        }
+        let commit_keys: Vec<_> = self
+            .erase_inpaint_pending
+            .keys()
+            .copied()
+            .filter(|key| matches!(key.kind, crate::ui_erase::EraseInpaintKind::Commit))
+            .collect();
+        for key in commit_keys {
+            if let Some(pending) = self.erase_inpaint_pending.remove(&key) {
+                pending.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        self.erase_result_cache.clear();
+        self.conceal_cache.clear();
+    }
+
+    /// 消しゴムマスクが変わったことを idx 単位の世代で表す。
+    pub(crate) fn bump_erase_mask_generation(&mut self, idx: usize) {
+        let slot = self.erase_mask_generation.entry(idx).or_insert(0);
+        *slot = slot.wrapping_add(1);
+        self.cancel_erase_commit_pending_for_idx(idx);
+        self.clear_erase_result_caches_for_idx(idx);
+        self.clear_erase_preview(idx);
+        self.clear_conceal_caches(idx);
+    }
+
+    /// 隠蔽マスクが変わったことを idx 単位の世代で表す。
+    pub(crate) fn bump_conceal_mask_generation(&mut self, idx: usize) {
+        let slot = self.conceal_mask_generation.entry(idx).or_insert(0);
+        *slot = slot.wrapping_add(1);
+        self.clear_conceal_caches(idx);
+    }
+
+    /// 現在の input / erase mask 世代から、消しゴム確定結果 cache key を作る。
+    pub(crate) fn current_erase_result_key(&self, idx: usize) -> EraseResultKey {
+        EraseResultKey {
+            idx,
+            input_gen: self.input_generation.get(&idx).copied().unwrap_or(0),
+            mask_gen: self.erase_mask_generation.get(&idx).copied().unwrap_or(0),
+        }
+    }
+
+    /// 指定 idx の消しゴム確定結果を全世代分破棄する。
+    pub(crate) fn clear_erase_result_caches_for_idx(&mut self, idx: usize) {
+        self.erase_result_cache.retain(|key, _| key.idx != idx);
+    }
+
+    /// 現在世代に一致する消しゴム確定結果テクスチャを返す。
+    pub(crate) fn current_erase_result_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
+        let key = self.current_erase_result_key(idx);
+        self.erase_result_cache
+            .get(&key)
+            .map(|entry| entry.texture.clone())
+    }
+
+    /// 現在世代に一致する消しゴム確定結果ピクセルを返す。
+    pub(crate) fn current_erase_result_pixels(
+        &self,
+        idx: usize,
+    ) -> Option<std::sync::Arc<egui::ColorImage>> {
+        let key = self.current_erase_result_key(idx);
+        self.erase_result_cache
+            .get(&key)
+            .map(|entry| std::sync::Arc::clone(&entry.pixels))
     }
 
     /// 消しゴム編集中の表示用テクスチャを返す。
@@ -16796,15 +16943,15 @@ impl App {
             }
         }
 
-        // 入力ピクセル取得: spec §3.1 の優先順位 (adj > ai > fs)。
+        // 入力ピクセル取得: spec §3.1 の優先順位 (erase_result > adj > ai > fs)。
         // ai_upscale_cache は AI 機能が実効的に動いているときだけ参照する
         // (= 設定 ON でもサイズ閾値超でスキップされる画像は旧キャッシュ残骸を
         // 拾わない、`resolve_pano_source` と同じガード方針)。
         let bg = self.effective_upscale_bg_mode();
         let ai_effective = self.ai_will_apply_to(idx);
-        let source_pixels = if let Some(FsCacheEntry::Static { pixels, .. }) =
-            self.adjustment_cache.get(&idx)
-        {
+        let source_pixels = if let Some(pixels) = self.current_erase_result_pixels(idx) {
+            Some(pixels)
+        } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx) {
             Some(Arc::clone(pixels))
         } else if ai_effective {
             if let Some(FsCacheEntry::Static { pixels, .. }) = self.ai_upscale_cache.get(&(idx, bg))
@@ -17933,6 +18080,7 @@ impl App {
     /// clear 粒度と整合させる (§3.6.2.2)。idx → source_key の解決に失敗するときは
     /// (= 構造アイテム等で対象外) 何もしない。
     pub(crate) fn bump_adjustment_generation(&mut self, idx: usize) {
+        self.bump_input_generation(idx);
         let Some(key) = self.metadata_cache_key(idx) else {
             return;
         };
@@ -17945,6 +18093,7 @@ impl App {
     /// `ai_gen=0` cache_key と衝突するリスクを避ける (§3.6.2.2)。
     /// AI モデル / `bg_mode` 切替 / AI ON/OFF / cache 全体 clear の各経路で呼ぶ。
     pub(crate) fn bump_all_ai_generations(&mut self) {
+        self.bump_all_input_generations();
         for v in self.ai_upscale_generation.values_mut() {
             *v = v.saturating_add(1);
         }
@@ -17954,6 +18103,7 @@ impl App {
     /// バルク補正 clear (`adjustment_cache.clear()` 経路) で `ai_upscale_generation`
     /// と同じく全体 bump する。`.clear()` ではない理由は同節 §3.6.2.2。
     pub(crate) fn bump_all_adjustment_generations(&mut self) {
+        self.bump_all_input_generations();
         for v in self.adjustment_generation.values_mut() {
             *v = v.saturating_add(1);
         }
@@ -17964,6 +18114,7 @@ impl App {
     /// `source_kind` 部 (2=AI のみ / 3=AI+補正) で区別されるため、source_key 単位の
     /// generation で十分。
     pub(crate) fn bump_ai_generation(&mut self, idx: usize) {
+        self.bump_input_generation(idx);
         let Some(key) = self.metadata_cache_key(idx) else {
             return;
         };
@@ -19662,6 +19813,7 @@ impl App {
                 }
             };
             self.fs_cache.insert(key, entry);
+            self.bump_input_generation(key);
             // 360 度パノラマビュー Phase 2a (§3.6.4): worker は tee しなかったが、
             // 画像が 360 候補 (XMP equirect OR aspect 2:1) かつ大画像 (>200 MP) なら
             // バナー表示の判定。state が既に BaseOnly ならそのまま、未設定なら

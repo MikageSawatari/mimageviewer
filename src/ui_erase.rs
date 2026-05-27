@@ -26,6 +26,23 @@ use crate::ui_fullscreen::FsKeyAction;
 use crate::ui_fullscreen::draw_icons::{PanelToggleColors, panel_toggle_button};
 use crate::vector_edit;
 
+/// 消しゴム MI-GAN ジョブの用途。
+///
+/// preview と commit は同じ idx でも独立に走れる必要がある。旧実装は idx だけを
+/// key にしていたため、preview 押下が commit 中ジョブを cancel できてしまった。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum EraseInpaintKind {
+    Preview,
+    Commit,
+}
+
+/// `App.erase_inpaint_pending` の key。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct EraseInpaintPendingKey {
+    pub(crate) idx: usize,
+    pub(crate) kind: EraseInpaintKind,
+}
+
 /// 進行中の MI-GAN inpaint 推論。`App.erase_inpaint_pending` で保持され、
 /// 推論完了 (もしくは新規投入で前ジョブをキャンセル) するまで生存する。
 /// 推論本体は worker thread で走り、結果は `rx` 経由で UI スレッドへ届ける。
@@ -45,16 +62,20 @@ pub(crate) struct EraseInpaintPending {
     pub cancel: Arc<AtomicBool>,
     /// 投入時刻 (ログ用)。
     pub started_at: std::time::Instant,
+    /// 投入時の表示入力世代。commit 結果の `EraseResultKey` に使う。
+    pub input_generation: u64,
+    /// 投入時の消しゴムマスク世代。commit 結果の `EraseResultKey` に使う。
+    pub mask_generation: u64,
     /// 呼び出し経路識別子 (ログ用)。
     pub log_prefix: &'static str,
     /// プレビュー専用ジョブか (= preview ボタン押下による起動)。
     ///
-    /// `true` のとき完了時の `apply_inpaint_result` は **fs_cache を触らず**、
+    /// `true` のとき完了時は **fs_cache を触らず**、
     /// `erase_preview_cache` だけを更新する (Codex P1 R4 #1)。
     /// プレビューは「現在のマスクで MI-GAN を試した一時結果」なので、ESC で
     /// 抜けた / マスクを変更した / マスクを全削除した時に preview_cache を
-    /// 捨てれば残らない設計にする。`false` のときは従来通り fs_cache 上書き
-    /// + `invalidate_derived_fs_caches` で commit 経路として動作。
+    /// 捨てれば残らない設計にする。`false` のときは fs_cache へ書き戻さず、
+    /// `erase_result_cache` に commit 結果を格納する。
     pub is_preview: bool,
 }
 
@@ -112,11 +133,9 @@ impl App {
         let pixels = if let Some(base) = self.erase_base_cache.get(&target_idx) {
             Arc::clone(base)
         } else {
-            let bg = self.effective_upscale_bg_mode();
             let from_cache = self
-                .ai_upscale_cache
-                .get(&(target_idx, bg))
-                .or_else(|| self.fs_cache.get(&target_idx))
+                .fs_cache
+                .get(&target_idx)
                 .and_then(|entry| match entry {
                     FsCacheEntry::Static { pixels, .. } => Some(Arc::clone(pixels)),
                     _ => None,
@@ -238,12 +257,13 @@ impl App {
         // モード退出時の念入りクリア (= 複数 idx 編集していたケース対応)。
         self.erase_preview_cache.clear();
         // is_preview=true の pending を全部 cancel (= 退出後に結果を届けない)。
-        let preview_idxs: Vec<usize> = self
+        let preview_keys: Vec<EraseInpaintPendingKey> = self
             .erase_inpaint_pending
-            .iter()
-            .filter_map(|(k, p)| if p.is_preview { Some(*k) } else { None })
+            .keys()
+            .copied()
+            .filter(|k| matches!(k.kind, EraseInpaintKind::Preview))
             .collect();
-        for k in preview_idxs {
+        for k in preview_keys {
             if let Some(prev) = self.erase_inpaint_pending.remove(&k) {
                 prev.cancel.store(true, Ordering::Relaxed);
             }
@@ -2204,39 +2224,10 @@ impl App {
                 self.clear_erase_preview(fs_idx);
                 // DB + サイドカーからも削除
                 self.delete_mask_with_sidecar(fs_idx);
-                // 表示を元画像に戻す
-                if let Some(base) = self.erase_base_cache.get(&fs_idx) {
-                    let tex = ctx.load_texture(
-                        format!("fs_restored_{fs_idx}"),
-                        base.as_ref().clone(),
-                        egui::TextureOptions::LINEAR,
-                    );
-                    // ⚠ 復元画像は **常に fs_cache** に入れる。旧版は AI cache
-                    // が有効なときだけ `ai_upscale_cache` 側を書き換えていたが、
-                    // 直後の `invalidate_derived_fs_caches` が `purge_upscale_for_idx`
-                    // 経由でその entry を消すため、結果 fs_cache に旧 inpaint 結果が
-                    // 残ったままになっていた (Codex P1 R3 #1)。
-                    //
-                    // 正しいフロー:
-                    // 1. fs_cache を base 画像で **必ず** 上書き
-                    // 2. invalidate_derived_fs_caches (= ai_upscale / adjustment /
-                    //    conceal / erase_base_tex を purge)
-                    // 3. 表示パイプラインは次フレームで AI を再起動して
-                    //    base からアップスケールし直す
-                    let prev_source_dims = self.fs_cache_source_dims(fs_idx);
-                    let entry = FsCacheEntry::Static {
-                        tex,
-                        pixels: Arc::clone(base),
-                        source_dims: prev_source_dims,
-                        load_seq: self.input_seq,
-                    };
-                    self.fs_cache.insert(fs_idx, entry);
-                }
-                // 派生キャッシュ (= adjustment_cache / ai_upscale_cache /
-                // conceal_cache / erase_base_tex_cache) を invalidate。
-                // 旧 mask + inpaint 結果が上位レイヤに焼き込まれているのを破棄して、
-                // 次フレームで新 fs_cache から再合成させる。
-                self.invalidate_derived_fs_caches(fs_idx);
+                // fs_cache は raw decode 専用。マスク削除では消しゴム結果レイヤだけを
+                // 破棄し、表示は下層 (adjustment > AI > raw) へ自然にフォールバックさせる。
+                self.clear_erase_result_caches_for_idx(fs_idx);
+                self.clear_conceal_caches(fs_idx);
                 self.erase_base_tex_cache.remove(&fs_idx);
             }
         }
@@ -2256,6 +2247,78 @@ impl App {
 
     // ── Inpaint 実行 ──────────────────────────────────────────────
 
+    /// 消しゴム確定結果の入力になる、pre-erase の表示ピクセルを取得する。
+    /// 優先順位は `adjustment_cache > ai_upscale_cache > fs_cache`。
+    fn resolve_erase_input_pixels(&self, fs_idx: usize) -> Option<Arc<egui::ColorImage>> {
+        if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx) {
+            return Some(Arc::clone(pixels));
+        }
+        let bg = self.effective_upscale_bg_mode();
+        if self.ai_will_apply_to(fs_idx)
+            && let Some(FsCacheEntry::Static { pixels, .. }) =
+                self.ai_upscale_cache.get(&(fs_idx, bg))
+        {
+            return Some(Arc::clone(pixels));
+        }
+        match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Static { pixels, .. }) => Some(Arc::clone(pixels)),
+            _ => None,
+        }
+    }
+
+    fn commit_pending_matches_current_erase_key(&self, fs_idx: usize) -> bool {
+        let key = self.current_erase_result_key(fs_idx);
+        let pending_key = EraseInpaintPendingKey {
+            idx: fs_idx,
+            kind: EraseInpaintKind::Commit,
+        };
+        self.erase_inpaint_pending
+            .get(&pending_key)
+            .is_some_and(|p| {
+                p.input_generation == key.input_gen && p.mask_generation == key.mask_gen
+            })
+    }
+
+    /// 表示パイプライン用: 保存済み消しゴムマスクがあり、現在世代の確定結果が無ければ
+    /// MI-GAN を非同期起動する。結果が既にあれば texture を返す。
+    pub(crate) fn ensure_erase_result_texture(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        if self.erase_mode || !self.mask_pages.contains(&fs_idx) {
+            return None;
+        }
+        if let Some(tex) = self.current_erase_result_texture(fs_idx) {
+            return Some(tex);
+        }
+        if self.commit_pending_matches_current_erase_key(fs_idx) {
+            return None;
+        }
+
+        let source = self.resolve_erase_input_pixels(fs_idx)?;
+        let [w, h] = source.size;
+        if w == 0 || h == 0 {
+            return None;
+        }
+        let key = self.page_path_key(fs_idx)?;
+        let (bitmap, shapes) = match self.mask_db.as_ref().and_then(|db| db.get_full(&key, w, h)) {
+            Some(v) => v,
+            None => {
+                self.mask_pages.remove(&fs_idx);
+                return None;
+            }
+        };
+        let mut composite = bitmap;
+        crate::mask_db::rasterize_shapes_into(&mut composite, &shapes, w, h);
+        if !composite.iter().any(|&m| m) {
+            self.mask_pages.remove(&fs_idx);
+            return None;
+        }
+        self.run_inpaint_and_cache(ctx, fs_idx, source, composite, w, h, "ensure-result", false);
+        None
+    }
+
     /// マスク保存と MI-GAN inpaint 投入だけ行い、`reset_erase_mode` は呼ばない内部版。
     /// 戻り値: 何かしら inpaint を投入したら true (保存された)、空マスクで何もしなければ false。
     /// 返り値で「Apply できたか」が呼び出し側に伝わるので、`execute_erase_inpaint` でも
@@ -2268,13 +2331,24 @@ impl App {
         let Some(bitmap) = self.erase_mask.clone() else {
             return false;
         };
-        let Some(original) = self.erase_base_cache.get(&fs_idx).map(Arc::clone) else {
-            return false;
-        };
         let [w, h] = self.erase_mask_size;
         // ビットマップとベクタを別々に永続化することで、再編集時に両者を分離して読み直せる。
         let vectors_snapshot = self.erase_shapes.clone();
         self.save_mask_with_sidecar(fs_idx, &bitmap, &vectors_snapshot, w, h);
+        let Some(original) = self.resolve_erase_input_pixels(fs_idx) else {
+            return true;
+        };
+        if original.size != [w, h] {
+            // 消しゴム入場後に AI 完了などで入力解像度が変わった場合は、ここで
+            // 無理に古いサイズの source を流さず、保存済みマスクから通常表示側の
+            // ensure_erase_result_texture に再生成させる。
+            crate::logger::log(format!(
+                "erase: commit deferred (size mismatch: source={}x{} mask={}x{})",
+                original.size[0], original.size[1], w, h
+            ));
+            self.clear_erase_result_caches_for_idx(fs_idx);
+            return true;
+        }
         let masked_count = composite.iter().filter(|&&m| m).count();
         crate::logger::log(format!(
             "erase: inpaint start, masked pixels={masked_count}"
@@ -2293,12 +2367,12 @@ impl App {
     /// 触らない (= 別の処理として独立)。
     pub(crate) fn clear_erase_preview(&mut self, idx: usize) {
         // pending: is_preview=true のときだけ cancel + remove
-        let cancel_preview =
-            matches!(self.erase_inpaint_pending.get(&idx), Some(p) if p.is_preview);
-        if cancel_preview {
-            if let Some(prev) = self.erase_inpaint_pending.remove(&idx) {
-                prev.cancel.store(true, Ordering::Relaxed);
-            }
+        let key = EraseInpaintPendingKey {
+            idx,
+            kind: EraseInpaintKind::Preview,
+        };
+        if let Some(prev) = self.erase_inpaint_pending.remove(&key) {
+            prev.cancel.store(true, Ordering::Relaxed);
         }
         self.erase_preview_cache.remove(&idx);
     }
@@ -2360,8 +2434,8 @@ impl App {
         //   - enter_erase_mode が raw fs_cache から始まり、その後 ai_upscale_cache が完了
         //   - その他、erase_mask_size と現有の base/ai pixels サイズが食い違う edge case
         //
-        // 恒久的な解は Step 2 (erase_result_cache 分離 + generation 入りキャッシュキー、
-        // CLAUDE.md の Codex R5 設計メモ参照)。Step 1 は応急処置として return false。
+        // 確定結果は erase_result_cache + generation key で守られるが、preview は現在の
+        // 編集中マスクと即時に同寸法で合成する必要があるため、サイズ不一致は起動しない。
         if raw_source.size != [w, h] {
             crate::logger::log(format!(
                 "erase: preview skipped (size mismatch: source={}x{} mask={}x{})",
@@ -2406,10 +2480,10 @@ impl App {
             None => return,
         };
 
-        // DB にマスクがあるか確認
-        let pixels = match self.fs_cache.get(&idx) {
-            Some(FsCacheEntry::Static { pixels, .. }) => Arc::clone(pixels),
-            _ => return,
+        // DB にマスクがあるか確認。入力は raw 固定ではなく、現在の pre-erase 表示レイヤ
+        // (補正 > AI > raw) を使う。
+        let Some(pixels) = self.resolve_erase_input_pixels(idx) else {
+            return;
         };
         let [w, h] = pixels.size;
 
@@ -2450,9 +2524,9 @@ impl App {
             return;
         };
 
-        let pixels = match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Static { pixels, .. }) => Arc::clone(pixels),
-            _ => {
+        let pixels = match self.resolve_erase_input_pixels(fs_idx) {
+            Some(pixels) => pixels,
+            None => {
                 self.show_feedback_toast("[画像読込中]".to_string());
                 return;
             }
@@ -2473,7 +2547,8 @@ impl App {
             return;
         }
 
-        // 元画像を base_cache に保存 (サイズが変わっていれば更新)
+        // 元画像プレビュー用に base_cache も更新しておく。ただし MI-GAN 入力は
+        // 現在の pre-erase 表示レイヤ (`pixels`) を直接使う。
         let need_update = self
             .erase_base_cache
             .get(&fs_idx)
@@ -2482,7 +2557,6 @@ impl App {
         if need_update {
             self.erase_base_cache.insert(fs_idx, Arc::clone(&pixels));
         }
-        let original = Arc::clone(self.erase_base_cache.get(&fs_idx).unwrap());
 
         let mut composite = new_mask.clone();
         crate::mask_db::rasterize_shapes_into(&mut composite, &new_vectors, w, h);
@@ -2496,16 +2570,7 @@ impl App {
             "erase: apply_slot_in_viewing_mode slot={slot} idx={fs_idx}"
         ));
 
-        self.run_inpaint_and_cache(
-            ctx,
-            fs_idx,
-            original,
-            composite,
-            w,
-            h,
-            "viewing-mode",
-            false,
-        );
+        self.run_inpaint_and_cache(ctx, fs_idx, pixels, composite, w, h, "viewing-mode", false);
         self.show_feedback_toast(format!("[スロット{slot}適用]"));
     }
 
@@ -2529,11 +2594,18 @@ impl App {
         self.ensure_ai_runtime();
         let runtime = self.ai_runtime.clone();
         let manager = self.ai_model_manager.clone();
+        let kind = if is_preview {
+            EraseInpaintKind::Preview
+        } else {
+            EraseInpaintKind::Commit
+        };
+        let pending_key = EraseInpaintPendingKey { idx, kind };
 
-        // 同じ idx に対して進行中のジョブがあれば cancel (= 連打 / 同ページへの再 apply)。
+        // 同じ idx + kind に対して進行中のジョブがあれば cancel (= 連打 / 同ページへの再 apply)。
+        // preview と commit は別 kind なので、プレビュー押下で確定ジョブを潰さない。
         // 別 idx のジョブはそのまま並走させる (見開き消しゴムで両ページの inpaint を
         // 同時に処理するため)。
-        if let Some(prev) = self.erase_inpaint_pending.remove(&idx) {
+        if let Some(prev) = self.erase_inpaint_pending.remove(&pending_key) {
             prev.cancel.store(true, Ordering::Relaxed);
         }
 
@@ -2565,8 +2637,10 @@ impl App {
 
         let items_generation = self.items_generation;
         let path_key = self.page_path_key(idx);
+        let input_generation = self.input_generation.get(&idx).copied().unwrap_or(0);
+        let mask_generation = self.erase_mask_generation.get(&idx).copied().unwrap_or(0);
         self.erase_inpaint_pending.insert(
-            idx,
+            pending_key,
             EraseInpaintPending {
                 idx,
                 items_generation,
@@ -2574,6 +2648,8 @@ impl App {
                 rx,
                 cancel,
                 started_at: std::time::Instant::now(),
+                input_generation,
+                mask_generation,
                 log_prefix,
                 is_preview,
             },
@@ -2590,28 +2666,29 @@ impl App {
         // Disconnected なら worker が死んでいるので削除して次へ進む。Empty は次へ。
         // (try_recv は &Receiver で借用するだけだが値を返すと所有権が移るので、
         //  Some を返した時点でループを抜けて map から remove する。)
-        let mut completed: Option<(usize, egui::ColorImage)> = None;
-        let idxs: Vec<usize> = self.erase_inpaint_pending.keys().copied().collect();
-        for idx in idxs {
-            let Some(pending) = self.erase_inpaint_pending.get(&idx) else {
+        let mut completed: Option<(EraseInpaintPendingKey, egui::ColorImage)> = None;
+        let keys: Vec<EraseInpaintPendingKey> =
+            self.erase_inpaint_pending.keys().copied().collect();
+        for key in keys {
+            let Some(pending) = self.erase_inpaint_pending.get(&key) else {
                 continue;
             };
             match pending.rx.try_recv() {
                 Ok(result) => {
-                    completed = Some((idx, result));
+                    completed = Some((key, result));
                     break;
                 }
                 Err(mpsc::TryRecvError::Disconnected) => {
                     // ワーカーが panic 等で終了 — pending は破棄。
-                    self.erase_inpaint_pending.remove(&idx);
+                    self.erase_inpaint_pending.remove(&key);
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
-        let Some((target_idx, result)) = completed else {
+        let Some((target_key, result)) = completed else {
             return;
         };
-        let pending = self.erase_inpaint_pending.remove(&target_idx).unwrap();
+        let pending = self.erase_inpaint_pending.remove(&target_key).unwrap();
         let elapsed = pending.started_at.elapsed();
         let idx = pending.idx;
         // 投入時と比べて items_generation / path_key が変わっていれば結果は捨てる
@@ -2654,57 +2731,28 @@ impl App {
                 pending.log_prefix
             ));
         } else {
-            // **Commit 経路**: fs_cache を新 inpaint 結果で上書き + 派生 cache を
-            // invalidate。従来通り。
-            let prev_source_dims = self.fs_cache_source_dims(idx);
-            self.fs_cache.insert(
+            // **Commit 経路**: fs_cache には戻さず、消しゴム確定結果専用 cache に
+            // 格納する。これで AI OFF / 補正変更時に raw fs_cache へ戻れる。
+            let key = crate::app::EraseResultKey {
                 idx,
-                FsCacheEntry::Static {
-                    tex,
+                input_gen: pending.input_generation,
+                mask_gen: pending.mask_generation,
+            };
+            self.erase_result_cache.insert(
+                key,
+                crate::app::EraseResultCacheEntry {
                     pixels,
-                    source_dims: prev_source_dims,
-                    load_seq: self.input_seq,
+                    texture: tex,
                 },
             );
-            self.invalidate_derived_fs_caches(idx);
+            self.invalidate_compare_prepared_for_idx(idx);
+            self.clear_conceal_caches(idx);
             crate::logger::log(format!(
                 "erase: inpaint complete ({} ms, prefix={})",
                 elapsed.as_millis(),
                 pending.log_prefix
             ));
         }
-    }
-
-    /// `fs_cache` を差し替えたあとに呼ぶ。上位レイヤ (AI アップスケール / 補正 /
-    /// 隠蔽合成) のキャッシュを無効化して、新しい元画像で再処理させる。
-    /// 処理中の AI タスクがあればキャンセル。
-    pub(crate) fn invalidate_derived_fs_caches(&mut self, idx: usize) {
-        self.purge_upscale_for_idx(idx);
-        self.adjustment_cache.remove(&idx);
-        self.adjustment_sharpened.remove(&idx);
-        // 隠蔽合成キャッシュも該当 idx を破棄。
-        //
-        // バグ修正 (2026-05): 消しゴム inpaint 完了直後に `conceal_cache[idx]` が
-        // stale 化していたが invalidate されておらず、「消しゴム + 隠蔽加工 両方
-        // 保存されたページを開き直すと隠蔽は出るが消しゴムが反映されない (= raw 画像
-        // にモザイクが掛かっている状態)」になっていた。
-        // 消しゴムモードに一度入って出ると `clear_adjustment_caches` 経由で invalidate
-        // されて見えるようになっていたのが症状。`docs/conceal-feature-plan.md §9` の
-        // 「消しゴム inpaint 完了 → conceal_cache 該当 idx クリア」を実装する hook。
-        self.clear_conceal_caches(idx);
-    }
-
-    /// `fs_cache` に `Static` エントリがあれば、その `source_dims` を返す。
-    /// fs_cache を上書きする経路 (消しゴム restore / inpaint) で、元画像の原寸ヒントを
-    /// 失わないようにするためのヘルパー。
-    pub(crate) fn fs_cache_source_dims(&self, idx: usize) -> Option<[usize; 2]> {
-        self.fs_cache.get(&idx).and_then(|e| {
-            if let FsCacheEntry::Static { source_dims, .. } = e {
-                *source_dims
-            } else {
-                None
-            }
-        })
     }
 }
 

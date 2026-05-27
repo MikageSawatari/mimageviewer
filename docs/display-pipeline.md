@@ -343,10 +343,12 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 ```
 0. 右 Ctrl ホールド中の元画像プレビュー (消しゴム補完前の erase_base_cache or fs_cache)
 1. erase モードで編集中のマスクプレビュー   (ui_erase.rs)
-2. adjustment_cache[idx]                   (プリセット補正済み)
-3. ai_upscale_cache[idx]                   (AI アップスケール/デノイズ済み)
-4. fs_cache[idx]                           (生デコード結果)
-5. フォールバック: サムネイル (低解像度)
+2. conceal_cache[idx]                      (隠蔽加工済み)
+3. erase_result_cache[idx,input,mask]      (消しゴム MI-GAN 確定結果)
+4. adjustment_cache[idx]                   (プリセット補正済み)
+5. ai_upscale_cache[idx,bg]                (AI アップスケール/デノイズ済み)
+6. fs_cache[idx]                           (生デコード結果、raw 専用)
+7. フォールバック: サムネイル (低解像度)
 ```
 
 **この優先順位は動かさないこと**。変更すると「補正を掛けた瞬間に一瞬生画像が見える」
@@ -406,15 +408,17 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
    ↓
 5. 消しゴム (MI-GAN inpaint)
    → ESC / E / × ボタンで確定したとき MI-GAN がマスク領域を補完
-   実装上は fs_cache を上書きしているため、確定後に AI トグル等を切替えると
-   再度 ai_upscale_cache / adjustment_cache を再構築する (= 既知の挙動)
+   → erase_result_cache[idx,input_gen,mask_gen]
+   fs_cache は raw decode 専用で、消しゴム確定結果を書き戻さない。
+   AI / 補正 / マスクのどれかが変わると generation key が変わり、古い結果は
+   表示に採用されず再計算される。
    ↓
 6. 隠蔽加工 (モザイク / 白塗り / 黒塗り / ぼかし)
-   → conceal_cache[idx, generation] (= adjustment_cache をベースに合成)
-   display 時は adjustment_cache の代わりに conceal_cache を使う
+   → conceal_cache[idx, generation] (= erase_result_cache または adjustment_cache をベースに合成)
+   display 時は下位レイヤの代わりに conceal_cache を使う
 ```
 
-**ユーザー向けの言い換え**: 色補正 → AI 拡大 → 効果フィルタ → マスク補完 →
+**ユーザー向けの言い換え**: AI 拡大 → 色補正 → 効果フィルタ → マスク補完 →
 モザイク加工 の順。**ポストフィルタはモザイクより前**で、CRT/減色などの
 画面効果は隠蔽加工レイヤの「下」に来る (= モザイクのほうが「最後の見た目」
 を支配する)。

@@ -237,6 +237,13 @@ pending 中は追加ホイール入力を捨て、queue も delta 累積もし�
 AI アップスケール (`maybe_start_ai_upscale`) も同様: 同時実行は 1 枚のみで、現在画像が
 来たら古い先読みをキャンセル。
 
+消しゴム MI-GAN (`ui_erase.rs`) は `erase_inpaint_pending[(idx, kind)]` で管理する。
+`kind` は `Preview` / `Commit` の 2 種で、preview 押下が同じ idx の commit ジョブを
+キャンセルしないように分離している。commit は投入時の `input_generation` と
+`erase_mask_generation` を保持し、完了時は `fs_cache` ではなく
+`erase_result_cache[EraseResultKey]` に書き戻す。入力やマスクが変わったときは該当
+commit pending を cancel し、古い結果が表示レイヤへ昇格しないようにする。
+
 ### 3.4 サムネイルワーカーの STALE 取消と重複エンキュー抑制
 
 サムネイルは「keep_range 内かどうか」が毎フレーム変化するため、単純なキャンセルでは

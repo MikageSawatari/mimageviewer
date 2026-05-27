@@ -286,11 +286,13 @@ bilinear 補間ソースサンプリング + 水平ブラー (h_blur) で、「�
 | `fs_cache` | `HashMap<idx, FsCacheEntry>` | 生デコード結果。Static / Animated / Failed |
 | `adjustment_cache` | `HashMap<idx, FsCacheEntry>` | 補正適用済みテクスチャ |
 | `ai_upscale_cache` | `HashMap<idx, FsCacheEntry>` | AI アップスケール/デノイズ適用済み |
+| `erase_result_cache` | `HashMap<EraseResultKey, EraseResultCacheEntry>` | 消しゴム MI-GAN 確定結果。`idx + input_generation + erase_mask_generation` で識別 |
+| `conceal_cache` | `HashMap<idx, ConcealCacheEntry>` | 隠蔽加工合成済みテクスチャ |
 
 描画時 ([display-pipeline.md](display-pipeline.md) を参照) は:
 
 ```
-adjustment_cache > ai_upscale_cache > fs_cache
+conceal_cache > erase_result_cache > adjustment_cache > ai_upscale_cache > fs_cache
 ```
 
 の優先順位で最も処理済みのテクスチャを選ぶ。
@@ -353,10 +355,14 @@ AI 処理には数秒〜数十秒かかるため、その間も `maybe_apply_adj
 | フォルダ切替 | 全クリア | **全クリア** + `thumb_pixels` も全クリア | 全クリア | キャンセル |
 | keep_range からの eviction | 該当 idx のみ evict | 該当 idx のみクリア + `thumb_pixels` も drop | 対象外 | — |
 | 回転変更 | **クリアしない** (描画時の GPU 行列で回転) | **クリアしない** (同左) | クリアしない | — |
-| 消しゴムマスク変更 | 該当 idx のみクリア (再合成) | 触らない (`thumb_pixels` は元サムネソース、マスクで変わらない) | 該当 idx のみクリア | — |
+| 消しゴムマスク変更 | 残す | 触らない (`thumb_pixels` は元サムネソース、マスクで変わらない) | 残す | — |
 
 *「色系」= brightness/contrast/gamma/saturation/temperature/levels/auto_mode
 (ポストフィルタは AI 設定を変えないので `ai_settings_eq` には含まれず、色系変更と同じ扱い)
+
+消しゴムマスク変更時は `erase_mask_generation[idx]` を進め、`erase_result_cache` と
+`conceal_cache[idx]` を stale 化する。`fs_cache` / `ai_upscale_cache` /
+`adjustment_cache` は下位入力として保持し、MI-GAN 結果だけを再生成する。
 
 ### 4.1 ヘルパー関数
 
@@ -410,15 +416,20 @@ fn clear_ai_caches_for_indices(&mut self, indices: &[usize])
 `ui_erase.rs` と `mask_db.rs` で実装された消しゴム機能は、補正パイプラインと連携している:
 
 ```
-生画像 (fs_cache) ─▶ AI upscale (ai_upscale_cache) ─▶ 補正 (adjustment_cache) ─▶ 画面
-                                                   ▲
-                                                   │
+生画像 (fs_cache) ─▶ AI upscale (ai_upscale_cache) ─▶ 補正 (adjustment_cache)
+                                                           │
+                                                           ▼
                     mask_db (消しゴムマスク) ─▶ MI-GAN で inpaint
-                    ※ マスク編集が確定したら、inpaint 結果で fs_cache (または ai_upscale_cache) を上書き
+                                                           │
+                                                           ▼
+                                               erase_result_cache ─▶ conceal_cache ─▶ 画面
 ```
 
-マスクが存在する画像は、ロード時に inpaint 済みの結果を最終キャッシュに載せる。
-マスクが変更されたら **該当 idx の全キャッシュ** を再計算。
+`fs_cache` は raw decode 専用で、消しゴム確定結果を書き戻さない。マスクが存在する画像は
+表示時に `ensure_erase_result_texture` が現在の pre-erase 入力
+(`adjustment_cache > ai_upscale_cache > fs_cache`) と保存マスクから inpaint を非同期起動し、
+結果を `erase_result_cache` に載せる。入力またはマスクが変わると generation key が変わり、
+古い MI-GAN 結果は採用されない。
 
 ### 5.1 マスクのデータ構造 (ビットマップ + ベクタ)
 
@@ -488,9 +499,10 @@ MI-GAN / diffusion に渡す最終マスクと、オーバーレイ描画に使�
   直前の状態は Ctrl+Z で戻せる。OR マージにすると偶数/奇数ページを取り違えたときに
   旧マスクが残って過剰マスクになるため、差し替え仕様にしている (2026-04 仕様)。
 - **フルスクリーン表示中の F7/F8**: `apply_slot_in_viewing_mode` — スロットの内容で現ページの
-  マスクを**差し替えて** DB へ保存し、MI-GAN で inpaint → `fs_cache` を差し替え、
-  `invalidate_derived_fs_caches` で上位キャッシュを落とす。消しゴムモードに入らずワンキーで
-  適用できる経路。既存マスクがあっても上書きなので、別スロットを再 F7/F8 するだけで直せる。
+  マスクを**差し替えて** DB へ保存し、MI-GAN で inpaint → `erase_result_cache` に格納する。
+  `fs_cache` は raw のまま維持し、generation key で古い inpaint 結果を stale 化する。
+  消しゴムモードに入らずワンキーで適用できる経路。既存マスクがあっても上書きなので、
+  別スロットを再 F7/F8 するだけで直せる。
 - **グリッド画面での F7/F8**: `apply_slot_to_selection` — チェック中のサムネイル (なければ選択
   中 1 枚) にスロットを一括で配布。inpaint はその場で走らせず、**各ページを次回フルスクリーンで
   開いたときに `auto_apply_saved_mask` で自動適用**される。DB への書き込みはスロットの元サイズ
