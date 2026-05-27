@@ -32,6 +32,8 @@
         <a href="adjustment.html">画像補正</a>
         <a href="analysis.html">画像分析モード</a>
         <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="export.html">エクスポート</a>
         <a href="tags.html">タグ機能</a>
         <a href="search.html">検索機能</a>
         <a href="shortcuts.html" class="active">キーボードショートカット</a>
@@ -250,11 +252,13 @@
           <tr><td><kbd>Shift</kbd>+<kbd>F1</kbd>〜<kbd>F5</kbd></td><td>今見ている画像が入っているフォルダ / ZIP / PDF 本体にコンテナ★を付与</td></tr>
           <tr><td><kbd>Shift</kbd>+<kbd>F6</kbd></td><td>コンテナ★を解除</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd> / <kbd>Ctrl</kbd>+<kbd>Y</kbd></td><td>レーティング / タグ / 画像補正操作を取り消す / やり直す（フルスクリーン中の画像切替で履歴はクリアされます）</td></tr>
-          <tr><td><kbd>右Ctrl</kbd>（押している間）</td><td>元画像プレビュー（補正・ポストフィルタ・AI 処理・消しゴム補完を一時的に外す）</td></tr>
+          <tr><td><kbd>右Ctrl</kbd>（押している間）</td><td>元画像プレビュー（補正・ポストフィルタ・AI 処理・消しゴム補完・隠蔽加工を一時的に外す）</td></tr>
           <tr><td><kbd>E</kbd></td><td>消しゴムモード開始 / マスクを確定して AI 補完実行（<a href="erase.html">詳細</a>）</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>M</kbd></td><td>隠蔽加工モード開始 / 終了（<a href="conceal.html">詳細</a>）</td></tr>
           <tr><td><kbd>I</kbd> / <kbd>Tab</kbd></td><td>メタデータパネルの固定表示切り替え</td></tr>
           <tr><td><kbd>S</kbd></td><td>スライドショー 再生 / 停止</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>画像フルスクリーン中：現在表示中の画像・アニメーション現在フレーム・ZIP 内画像・PDF ページをキャプチャ保存フォルダへ保存</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>E</kbd></td><td>画像フルスクリーン中：現在の表示結果を別ファイルへエクスポート（<a href="export.html">詳細</a>）</td></tr>
           <tr><td><kbd>P</kbd></td><td>画像フルスクリーン中：現在表示中のアイテムを現在のフォルダ / ZIP / PDF の代表サムネイルに固定 / 解除。グリッドの P と統一した「P = Pin」</td></tr>
           <tr><td><kbd>X</kbd></td><td>画像フルスクリーン中：現在表示中の画像・ZIP 内画像・PDF ページを比較スロットへピン留め / 解除</td></tr>
           <tr><td><kbd>C</kbd></td><td>画像フルスクリーン中：比較スロットのピン画像と現在画像をトグル表示</td></tr>
@@ -427,6 +431,8 @@
           <tr><td><kbd>V</kbd></td><td>縦線ツール</td></tr>
           <tr><td><kbd>H</kbd></td><td>横線ツール</td></tr>
           <tr><td><kbd>I</kbd></td><td>直線ツール</td></tr>
+          <tr><td><kbd>R</kbd></td><td>矩形ツール</td></tr>
+          <tr><td><kbd>O</kbd></td><td>楕円ツール</td></tr>
           <tr><td><kbd>D</kbd> / <kbd>F</kbd></td><td>描画モード / 消去モードに切替</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>Undo（最大 20 手）</td></tr>
           <tr><td>矢印キー</td><td>マスク全体 (or 選択ベクタ) を 1 px 平行移動 (<kbd>Ctrl</kbd>+で 10 px)</td></tr>
@@ -469,6 +475,26 @@
           <tr><td><kbd>Ctrl</kbd>+ドラッグ（筆描画中）</td><td>太さ変更（右／下＝拡大、左／上＝縮小）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+ドラッグ（縦線描画中）</td><td>左右＝線をパン、上下＝線を回転（傾き調整）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+ドラッグ（横線描画中）</td><td>上下＝線をパン、左右＝線を回転（傾き調整）</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>隠蔽加工</h2>
+    <p><kbd>Ctrl</kbd>+<kbd>M</kbd> で開始します。基本のマスク編集は消しゴムモードと同じで、
+    加工タイプやプリセットの切り替えが追加されます。詳細は <a href="conceal.html">隠蔽加工</a> ページを参照してください。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>M</kbd> / <kbd>Esc</kbd></td><td>隠蔽加工モード開始 / 終了</td></tr>
+          <tr><td><kbd>T</kbd></td><td>加工タイプを順に切替</td></tr>
+          <tr><td><kbd>1</kbd>〜<kbd>4</kbd></td><td>プリセット 1〜4 を呼び出し</td></tr>
+          <tr><td><kbd>S</kbd> / <kbd>B</kbd> / <kbd>L</kbd> / <kbd>I</kbd> / <kbd>V</kbd> / <kbd>H</kbd> / <kbd>R</kbd> / <kbd>O</kbd></td><td>選択 / 筆 / 囲み / 直線 / 縦線 / 横線 / 矩形 / 楕円</td></tr>
+          <tr><td><kbd>D</kbd> / <kbd>F</kbd></td><td>描画モード / 消去モードに切替</td></tr>
+          <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>Undo</td></tr>
+          <tr><td><kbd>Del</kbd></td><td>選択中のオブジェクトを削除</td></tr>
         </tbody>
       </table>
     </div>

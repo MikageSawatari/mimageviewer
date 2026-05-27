@@ -50,6 +50,8 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | <kbd>Shift</kbd> (押しっぱ) | ルーペ |
 | <kbd>B</kbd> | 透過背景色サイクル |
 | <kbd>E</kbd> | 消しゴムモード開始 / 確定 |
+| <kbd>Ctrl</kbd>+<kbd>M</kbd> | 隠蔽加工モード開始 / 終了 |
+| <kbd>Ctrl</kbd>+<kbd>E</kbd> | 現在の表示結果を別ファイルへエクスポート |
 | <kbd>P</kbd> | 現在表示中アイテムを現在のコンテナの代表サムネに固定 / 解除 |
 | <kbd>X</kbd> | 現在表示中を比較スロットへピン留め / 同じ画像なら解除 |
 | <kbd>C</kbd> | 比較スロットのピン画像と現在画像をトグル表示 |
@@ -59,6 +61,25 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | <kbd>T</kbd> / <kbd>Shift</kbd>+<kbd>T</kbd> / <kbd>Alt</kbd>+<kbd>T</kbd> | ポストフィルタ 次 / 前 / 標準 (リセット) |
 | <kbd>Ctrl</kbd>+<kbd>S</kbd> | 現在画像 / アニメーション現在フレーム / ZIP 内画像 / PDF ページをキャプチャ保存フォルダへ保存 |
 | <kbd>Enter</kbd> | (動画ボタンが映る場合のみ) 外部プレイヤー |
+
+## 隠蔽加工モード
+
+| キー | 動作 |
+|---|---|
+| <kbd>Ctrl</kbd>+<kbd>M</kbd> / <kbd>Esc</kbd> | 隠蔽加工モード終了 |
+| <kbd>T</kbd> | 隠蔽タイプを順に切替 |
+| <kbd>1</kbd>〜<kbd>4</kbd> | プリセット 1〜4 を呼び出し |
+| <kbd>D</kbd> / <kbd>F</kbd> | 描画 / 消去モード切替 |
+| <kbd>S</kbd> | 選択ツール |
+| <kbd>B</kbd> | 筆ツール |
+| <kbd>L</kbd> | 囲みツール |
+| <kbd>I</kbd> | 直線ツール |
+| <kbd>V</kbd> | 縦線ツール |
+| <kbd>H</kbd> | 横線ツール |
+| <kbd>R</kbd> | 矩形ツール |
+| <kbd>O</kbd> | 楕円ツール |
+| <kbd>Ctrl</kbd>+<kbd>Z</kbd> | マスク編集 Undo |
+| <kbd>Del</kbd> | 選択中オブジェクトを削除 |
 
 ## 動画 フルスクリーン (Phase 7.H 適用後)
 

@@ -1117,9 +1117,9 @@ struct ConcealSnapshot {
 | 3c | Blur 合成実装 (3 モード)、bbox 最適化、Gaussian separable blur。**最初から worker thread + cancel + progress** (Codex P1)。閾値 (estimated_cost_ms > 80) で同期/非同期分岐 | 3-4 日 |
 | 4 | 永続化 (DB + サイドカー)、マスクスロット 2 個 UI、パラメータプリセット 4 個 UI、`conceal_pages` バッジ、Undo / Redo | 2-3 日 |
 | 5 | `save_with_metadata.rs` (JPEG / PNG / WebP 3 形式) + ユニットテスト (roundtrip)。**WebP RIFF mux は既存 `xmp_writer.rs` から RIFF パーサ部分を共通化して流用** (Codex P2)。**PNG は生 chunk read/write が必要** (`png_metadata.rs` の生 chunk 取得 API を追加、Codex P3) | 4-5 日 |
-| 6 | `export_dialog.rs` (`Ctrl+E` UI、**バリエーション一括チェックリスト**、`_N` 接尾辞)。**Worker pattern で最初から実装** (Codex P1) — 既存 `fs_capture_pending` を参考に `ExportPending { cancel, rx, total, done }`、進捗モーダル、UI スレッドはポーリングのみ。**ファイル名衝突は `OpenOptions::create_new(true)` リトライ** (Codex P3) | 4-5 日 |
-| 7 | 統合テスト (mask_db 旧形式 → 新形式マイグレーション、sidecar Vec<Shape> 移行 roundtrip、conceal_db ラウンドトリップ、マスクスロット、ZIP/PDF ソースの export、一括バリエーション生成のファイル名衝突、worker キャンセル/進捗)、手動 E2E | 2-3 日 |
-| 8 | ドキュメント更新 (下記 §15)、UI スナップショット更新 (8 ツール / プリセット / 一括出力ダイアログ) | 1-2 日 |
+| 6 | ✅ 完了: `export_dialog.rs` (`Ctrl+E` UI、**バリエーション一括チェックリスト**、`_N` 接尾辞)。**Worker pattern で最初から実装** (Codex P1) — 既存 `fs_capture_pending` を参考に `ExportPending { cancel, rx, total, done }`、進捗モーダル、UI スレッドはポーリングのみ。**ファイル名衝突は `OpenOptions::create_new(true)` リトライ** (Codex P3) | 4-5 日 |
+| 7 | ✅ 完了: 統合テスト (mask_db 旧形式 → 新形式マイグレーション、sidecar Vec<Shape> 移行 roundtrip、conceal_db ラウンドトリップ、マスクスロット、ZIP/PDF ソースの export、一括バリエーション生成のファイル名衝突、worker キャンセル/進捗)、手動 E2E | 2-3 日 |
+| 8 | ✅ 完了: ドキュメント更新 (下記 §15)。UI スナップショットは既存カバレッジ維持 | 1-2 日 |
 
 **合計概算: 約 31-43 日** (Codex 指摘の worker 化分 + generation cache + 順序入れ替えで +5-6 日増)
 
@@ -1173,7 +1173,7 @@ CLAUDE.md の「コード修正時のドキュメント同時更新」ルール�
   「この設定がどこそこの基準に合う」という表示はしない。タイルサイズの目安は px 数値で
   示すのみ。判断は利用者に委ねる旨を明記)
 - [htdocs/mimageviewer/index.html](../htdocs/mimageviewer/index.html) — 機能一覧に追記
-- 既存マニュアル 14 ページ全てのサイドバーに新規ページのリンクを追加 (CLAUDE.md リリース手順 §1-6)
+- 既存マニュアルと新規 2 ページを含む全 17 ページのサイドバーに同じリンク一覧を追加 (CLAUDE.md リリース手順 §1-6)
 
 ## 16. 設計上の前提・確定事項
 

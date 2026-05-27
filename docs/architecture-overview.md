@@ -12,7 +12,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 │  UI 層 (eframe + egui, wgpu バックエンド)                     │
 │   - メインビューポート: グリッド (ui_main.rs)                 │
 │   - フルスクリーンビューポート (ui_fullscreen.rs)              │
-│   - オーバーレイ: 補正 / 分析 / 消しゴム / メタデータパネル    │
+│   - オーバーレイ: 補正 / 分析 / 消しゴム / 隠蔽 / メタデータパネル │
 │   - ダイアログ群 (ui_dialogs/、Ctrl+E は export_dialog.rs)      │
 └───────────────┬──────────────────────────────────────────────┘
                 │ App の public メソッド経由で状態を更新
@@ -44,7 +44,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 │   - image crate + turbojpeg (JPEG) + WIC (HEIC/AVIF/JXL/RAW)   │
 │   - PDFium (pdfium-render、別プロセス)                         │
 │   - SQLite DB 群 (catalog / rotation / adjustment / mask /     │
-│     spread / pdf_passwords)                                    │
+│     conceal / spread / pdf_passwords)                          │
 │   - ONNX モデル (upscale / denoise / inpaint / classify)       │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -113,12 +113,13 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `rotation_db.rs` | 非破壊回転の SQLite 永続化 |
 | `audio_normalize_db.rs` | 動画音量ノーマライズの per-file 測定値 (integrated LUFS / true peak / 算出ゲイン) の SQLite 永続化 |
 | `rating_db.rs` | レーティング (★1〜5) の SQLite 永続化 |
-| `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮) |
+| `mask_db.rs` | 消しゴムマスクの SQLite 永続化 (1bit/pixel deflate 圧縮 + ベクタオブジェクト JSON) |
+| `conceal_db.rs` | 隠蔽加工マスクの SQLite 永続化。`mask_db.rs` と同じビットマップ + ベクタ構造を使い、マスクスロットも管理 |
 | `spread_db.rs` | フォルダ別の見開きモード永続化 |
 | `ai/` | ONNX Runtime (DirectML or TensorRT) によるアップスケール / デノイズ / Inpainting / 画像種別分類。`AiBackend` で multi-EP 対応、TRT 用に `tensorrt_pack` (DLL pack 検出) と `tensorrt_builder` (子プロセスエンジンビルダー) を持つ。TRT 推論はメインから別プロセスへ shm + JSON IPC でルーティング (`trt_worker_pool` / `trt_worker_proto` / `trt_worker_runtime` / `trt_worker_shm`)。TensorRT 設定でも起動時には worker を自動起動せず、AI 処理が実際に必要になった最初のタイミングで遅延起動する。worker 死亡を検知したら自動 detach + DirectML フォールバック + UI バナー通知 |
 | `png_metadata.rs` | PNG の tEXt/iTXt/zTXt に埋め込まれた AI メタデータ読み取り |
 | `exif_reader.rs` | EXIF 読み取り (rexif)。構造タグの抑止と Exif 2.3x 拡張タグの日本語名マップを持つ |
-| `xmp_reader.rs` | XMP 読み取り (quick-xml)。mXD (mxdownloader) が埋め込む `xtw:*` 名前空間を抽出し「X ツイート情報」パネルに表示 |
+| `xmp_reader.rs` | XMP 読み取り (quick-xml)。`xtw:*` 名前空間のツイート情報を抽出し「XMP ツイート情報」パネルに表示 |
 
 ### UI オーバーレイ / ダイアログ
 
@@ -126,8 +127,9 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | --- | --- |
 | `ui_adjustment_panel.rs` | 画像補正パネル (左端オーバーレイ)。プリセット切替・AI 設定・保存スロット |
 | `ui_analysis_panel.rs` | 画像分析パネル (右端オーバーレイ)。色情報・ヒストグラム |
-| `ui_metadata_panel.rs` | メタデータパネル (AI メタデータ + EXIF + X ツイート情報) |
-| `ui_erase.rs` | 消しゴムモード (Lasso/縦線/横線/ブラシ → MI-GAN で inpaint) |
+| `ui_metadata_panel.rs` | メタデータパネル (AI メタデータ + EXIF + XMP ツイート情報) |
+| `ui_erase.rs` | 消しゴムモード (筆 / 囲み / 直線 / 縦線 / 横線 / 矩形 / 楕円 → MI-GAN で inpaint) |
+| `ui_conceal.rs` | 隠蔽加工モード (同じマスク編集 UI でモザイク / 塗りつぶし / ぼかしを合成) |
 | `ui_dialogs/` | 環境設定・サムネイルキャッシュ管理・変換済みアーカイブキャッシュ管理 (`archive_cache_manager.rs`)・アーカイブ変換ダイアログ (`archive_convert.rs`)・お気に入り編集・スライドショー設定等 |
 | `ui_dialogs/preferences.rs` | 環境設定ダイアログの状態、App 連携、ツリー / ページ dispatch |
 | `ui_dialogs/preferences/pages.rs` | 環境設定の各 `page_*` 描画関数 |
@@ -218,7 +220,8 @@ ui_fullscreen.rs / ui_main.rs が「表示用テクスチャ」を選んで描�
 | `fts_index/` | Ctrl+G 用 Tantivy index (複数 segment + meta.json)。bigram 候補絞り込み | `fts_index.rs` → `ingest_worker.rs` / `tag_write_worker.rs` |
 | `fts_meta.db` | ファイル単位の管理メタ (path / mtime / size / status=Ok\|Failed / index_generation)。検索原文は持たず Tantivy STORED に集約 | `fts_meta.rs` |
 | `adjustment.db` | フォルダ別プリセット 4 種 + ページ別プリセット割当 | `adjustment_db.rs` |
-| `mask.db` | 消しゴムマスク (deflate 圧縮 1bit/pixel) | `mask_db.rs` |
+| `mask.db` | 消しゴムマスク (deflate 圧縮 1bit/pixel + ベクタオブジェクト JSON) | `mask_db.rs` |
+| `conceal.db` | 隠蔽加工マスク (deflate 圧縮 1bit/pixel + ベクタオブジェクト JSON) とマスクスロット | `conceal_db.rs` |
 | `spread.db` | フォルダ別見開きモード | `spread_db.rs` |
 | `folder_thumb_pins.db` | 親コンテナ (Folder/ZipFile/PdfFile) の代表サムネ手動ピン。container_key 主キー (= normalize_keep_drive 済みパス) で 1 行 1 コンテナ、source は kind + container 相対 rel + (zipentry の) entry / (pdfpage の) page。`apply_folder_thumb_pin` が cache key suffix `#pin:{source_id}` で identity を表現 | `folder_thumb_pins.rs` |
 | `video_pins.db` | ユーザーがフルスクリーン HUD で指定した動画フレームの抽出 WebP。`(path, pin_pts_secs, thumb_webp, thumb_pts_secs)`。folder thumb pin の source が動画のときは `seed_folder_video_pin_thumbs` が起動時にこの WebP を catalog にミラー seed する。左ジャンプパネルのピン行もこの WebP を再利用する | `video_pins.rs` |

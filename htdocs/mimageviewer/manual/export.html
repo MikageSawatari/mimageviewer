@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>エクスポート — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>エクスポート</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html">隠蔽加工</a>
+        <a href="export.html" class="active">エクスポート</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="search.html">検索機能</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">エクスポート</h1>
+    <p class="page-desc">フルスクリーンで表示している静止画を、補正・消しゴム・隠蔽加工を反映した別ファイルとして書き出します。</p>
+
+    <h2>開き方</h2>
+    <p>画像・ZIP 内画像・PDF ページをフルスクリーン表示中に <kbd>Ctrl</kbd>+<kbd>E</kbd> を押します。
+    動画、編集中のパネル、消しゴムモード、隠蔽加工モード中は対象外です。</p>
+
+    <h2>ダイアログの項目</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>項目</th><th>説明</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>ファイル名</td><td>既定は元の名前に <code>_edited</code> を付けた名前です。拡張子は形式に合わせて自動で付きます</td></tr>
+          <tr><td>保存先</td><td>既定は元画像と同じフォルダです。別フォルダを選んだ場合は次回の候補として記憶されます</td></tr>
+          <tr><td>形式</td><td>JPEG / PNG / WebP から選べます。元形式がそのまま書き出せない場合は JPEG または PNG に切り替えます</td></tr>
+          <tr><td>メタデータ保持</td><td>同じ形式で書き出せる場合、元画像の EXIF や XMP などを引き継げます</td></tr>
+          <tr><td>バリエーション</td><td>現在の表示設定と、隠蔽加工プリセット 1〜4 を選んで一括出力できます</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>ファイル名の規則</h2>
+    <p>バリエーション出力では、ファイル名の末尾に番号が付きます。</p>
+    <ul>
+      <li><code>_0</code>: 現在の表示設定</li>
+      <li><code>_1</code>〜<code>_4</code>: 隠蔽加工プリセット 1〜4</li>
+    </ul>
+    <p>同じ名前のファイルがすでにある場合は、上書きせず <code>_0001</code> のような番号を挟んだ名前で保存します。
+    例: <code>sample_edited_0001_0.jpg</code></p>
+
+    <h2>対応形式</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>元画像</th><th>書き出し</th><th>メタデータ</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>JPEG</td><td>JPEG / PNG / WebP</td><td>JPEG のままなら保持できます</td></tr>
+          <tr><td>PNG</td><td>JPEG / PNG / WebP</td><td>PNG のままなら保持できます</td></tr>
+          <tr><td>WebP</td><td>JPEG / PNG / WebP</td><td>WebP のままなら保持できます。アニメーション WebP は対象外です</td></tr>
+          <tr><td>HEIC / AVIF / JPEG XL / RAW / TIFF</td><td>JPEG または PNG</td><td>形式変換になるため保持されません</td></tr>
+          <tr><td>ZIP 内画像</td><td>JPEG / PNG / WebP</td><td>同じ形式なら保持できます</td></tr>
+          <tr><td>PDF ページ</td><td>JPEG / PNG / WebP</td><td>元画像メタデータはありません</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>書き出される内容</h2>
+    <p>現在の表示結果に含まれる画像補正、AI アップスケール、ポストフィルタ、消しゴム、隠蔽加工が反映されます。
+    右 <kbd>Ctrl</kbd> の一時的な元画像確認表示は書き出し対象ではありません。</p>
+
+    <h2>処理中の表示とキャンセル</h2>
+    <p>保存中は進捗ダイアログが表示されます。複数のバリエーションを選んだ場合は 1 つずつ順番に保存します。
+    キャンセルした場合、すでに保存済みのファイルは残り、まだ始まっていない分は作成されません。</p>
+
+    <h2>サムネイル一覧への反映</h2>
+    <p>現在開いている実フォルダへ保存した場合、フルスクリーンを閉じて一覧へ戻るタイミングでフォルダを再読み込みし、
+    新しい出力ファイルのサムネイルを表示します。ZIP・PDF・検索結果などの仮想フォルダでは自動再読み込みしません。</p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

@@ -152,7 +152,7 @@ b.add_i64_field ("file_size",   STORED);
 // === bigram tokenizer + lower_caser で index するテキストフィールド ===
 b.add_text_field("name",             bigram);  // ファイル名 (拡張子含む)
 b.add_text_field("exif_text",        bigram);
-b.add_text_field("xmp_tweet_text",   bigram);  // XMP の mXD (xtw:*)
+b.add_text_field("xmp_tweet_text",   bigram);  // XMP ツイート情報 (xtw:*)
 b.add_text_field("png_prompt_text",  bigram);  // A1111 / ComfyUI / Midjourney
 b.add_text_field("pdf_meta_text",    bigram);  // PDFium document info
 b.add_text_field("tags",             bigram);  // XMP dc:subject 由来 (#タグ)

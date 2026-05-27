@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>隠蔽加工 — mImageViewer マニュアル</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="site-header">
+  <span class="logo">mImageViewer</span>
+  <nav class="breadcrumb">
+    <a href="../index.html">ホーム</a>
+    <span class="sep">›</span>
+    <a href="index.html">マニュアル</a>
+    <span class="sep">›</span>
+    <span>隠蔽加工</span>
+  </nav>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="sidebar-section">
+      <div class="sidebar-label">マニュアル</div>
+      <nav>
+        <a href="index.html">目次</a>
+        <a href="getting-started.html">はじめに</a>
+        <a href="grid.html">グリッド表示</a>
+        <a href="fullscreen.html">フルスクリーン表示</a>
+        <a href="video.html">動画再生</a>
+        <a href="adjustment.html">画像補正</a>
+        <a href="analysis.html">画像分析モード</a>
+        <a href="erase.html">消しゴムモード</a>
+        <a href="conceal.html" class="active">隠蔽加工</a>
+        <a href="export.html">エクスポート</a>
+        <a href="tags.html">タグ機能</a>
+        <a href="search.html">検索機能</a>
+        <a href="shortcuts.html">キーボードショートカット</a>
+        <a href="settings.html">設定リファレンス</a>
+        <a href="formats.html">対応フォーマット</a>
+        <a href="faq.html">FAQ</a>
+        <a href="troubleshooting.html">トラブルシューティング</a>
+      </nav>
+    </div>
+  </aside>
+
+  <main class="content">
+    <h1 class="page-title">隠蔽加工</h1>
+    <p class="page-desc">フルスクリーン表示中に <kbd>Ctrl</kbd>+<kbd>M</kbd> で、モザイク・塗りつぶし・ぼかしを非破壊で重ねられます。</p>
+
+    <div class="box info">
+      <span class="box-icon">ℹ️</span>
+      <div class="box-body">
+        隠蔽加工は元画像を書き換えません。マスクと加工設定を使って表示時に合成し、必要なときは
+        <a href="export.html">エクスポート</a>で別ファイルとして書き出します。
+      </div>
+    </div>
+
+    <h2>基本操作</h2>
+    <ol>
+      <li>フルスクリーンで画像を開き、<kbd>Ctrl</kbd>+<kbd>M</kbd> を押します</li>
+      <li>左パネルで加工タイプとツールを選び、隠したい範囲を指定します</li>
+      <li><kbd>Ctrl</kbd>+<kbd>M</kbd> または <kbd>Esc</kbd> でモードを終了します</li>
+      <li>書き出す場合は <kbd>Ctrl</kbd>+<kbd>E</kbd> でエクスポートします</li>
+    </ol>
+
+    <h2>加工タイプ</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>タイプ</th><th>内容</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>モザイク</td><td>指定範囲をタイル状に平均化します。タイルサイズは固定ピクセルまたは画像長辺比率で指定できます</td></tr>
+          <tr><td>白塗り</td><td>指定範囲を白で塗ります。不透明度と境界のなじませ方を調整できます</td></tr>
+          <tr><td>黒塗り</td><td>指定範囲を黒で塗ります。不透明度と境界のなじませ方を調整できます</td></tr>
+          <tr><td>ぼかし</td><td>指定範囲にぼかしをかけます。半径や範囲外の色の拾い方を調整できます</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p><kbd>T</kbd> キーでタイプを順に切り替えられます。</p>
+
+    <h2>ツールとマスクの重なり</h2>
+    <p>筆・囲みは 1 枚のビットマップ下地を直接塗り消しします。直線・縦線・横線・矩形・楕円は
+    オブジェクトとして保存され、ビットマップ下地の上に作成順で重なります。消去モードで作った
+    オブジェクトは、既存のオブジェクトを丸ごと削除するのではなく、上からマスクを削る形として残ります。</p>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>ツール</th><th>ショートカット</th><th>特徴</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>選択</td><td><kbd>S</kbd></td><td>オブジェクトを選択・移動・サイズ変更・回転します。追加オブジェクトと削るオブジェクトの両方が枠で表示されます</td></tr>
+          <tr><td>筆</td><td><kbd>B</kbd></td><td>自由に塗ります。ビットマップ下地に直接反映されます</td></tr>
+          <tr><td>囲み</td><td><kbd>L</kbd></td><td>自由に囲んだ範囲を塗ります。ビットマップ下地に直接反映されます</td></tr>
+          <tr><td>直線</td><td><kbd>I</kbd></td><td>太い直線オブジェクトを作成します。中点の菱形ハンドルで太さを変えられます</td></tr>
+          <tr><td>縦線</td><td><kbd>V</kbd></td><td>画像の上下をまたぐ縦方向のオブジェクトを作成します</td></tr>
+          <tr><td>横線</td><td><kbd>H</kbd></td><td>画像の左右をまたぐ横方向のオブジェクトを作成します</td></tr>
+          <tr><td>矩形</td><td><kbd>R</kbd></td><td>矩形オブジェクトを作成します</td></tr>
+          <tr><td>楕円</td><td><kbd>O</kbd></td><td>楕円オブジェクトを作成します</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <h2>描画 / 消去</h2>
+    <p><kbd>D</kbd> で描画、<kbd>F</kbd> で消去に切り替えます。描画はマスクを足し、消去はマスクを削ります。
+    オブジェクトは作成順のまま合成されるため、後から作った削り形を上に重ねて細かく整えられます。</p>
+
+    <h2>プリセットとマスクスロット</h2>
+    <p>加工タイプ・タイルサイズ・不透明度・ぼかし半径などの設定は 4 つまでプリセットに保存できます。
+    <kbd>1</kbd>〜<kbd>4</kbd> でプリセットを呼び出せます。</p>
+    <p>マスクは保存 1 / 保存 2 のスロットに一時保存でき、別ページへ読み込めます。読み込みは現在のマスクを置き換えます。</p>
+
+    <h2>後編集</h2>
+    <p>直線・縦線・横線・矩形・楕円は、描いたあともハンドルで調整できます。直近に描いた 1 つは
+    描画ツールのまま操作でき、選択ツールに切り替えるとすべてのオブジェクトの存在を枠で確認できます。</p>
+    <ul>
+      <li><kbd>Del</kbd>: 選択中のオブジェクトを削除</li>
+      <li>矢印キー: 選択中のオブジェクト、またはマスク全体を 1 px 移動</li>
+      <li><kbd>[</kbd> / <kbd>]</kbd>: 選択中のオブジェクト、またはマスク全体を少し回転</li>
+      <li><kbd>Ctrl</kbd>+<kbd>Z</kbd>: 直前のマスク操作を取り消し</li>
+    </ul>
+
+    <h2>保存と書き出し</h2>
+    <p>隠蔽加工のマスクは自動保存され、同じ画像を開くと再び適用されます。元画像を加工済みファイルとして
+    保存したい場合は <kbd>Ctrl</kbd>+<kbd>E</kbd> のエクスポートを使います。現在の設定だけでなく、
+    プリセット 1〜4 の見た目をまとめて書き出すこともできます。</p>
+  </main>
+</div>
+
+<footer>
+  <p>mImageViewer &copy; 2025-2026 Mikage Sawatari</p>
+</footer>
+
+</body>
+</html>

@@ -10,7 +10,7 @@ Ctrl+G 検索の絞り込みキーとして、ユーザーがあらかじめ登�
 - 通常画像ファイル (`.jpg` / `.jpeg` / `.png` / `.webp`) — **本体に XMP 埋め込み**
 - 動画ファイル (`SUPPORTED_VIDEO_EXTENSIONS` と同じ集合: `.mp4` / `.mkv` / `.mov` / `.avi` / `.wmv` / `.mpg` / `.mpeg`)
   — **同名 `.xmp` サイドカーファイル** に書き込み (Lightroom / Bridge / Premiere と互換)
-- 主要なユースケース: **AI 生成画像、写真、mXDownloader 収集のツイート画像、動画ライブラリ**
+- 主要なユースケース: **AI 生成画像、写真、XMP ツイート情報付き画像、動画ライブラリ**
 
 ### 非対象 (v1.0)
 - **ZIP 内画像 / PDF ページ** — アーカイブの再構築が必要、かつ ZIP/PDF ファイル自体を
@@ -41,7 +41,7 @@ Lightroom / Bridge / Premiere が標準採用している方式と互換な、�
 
 ### 非機能要件
 - **既存メタデータを破壊しない** — 既存の `dc:subject` 要素、他の XMP プロパティ、
-  EXIF、AI メタ (A1111 parameters)、mXDownloader の `xtw:*` を絶対に触らない
+  EXIF、AI メタ (A1111 parameters)、XMP ツイート情報 (`xtw:*`) を絶対に触らない
 - **アトミック書き込み** — 一時ファイル + `rename` で電源断耐性
 - **バックアップは用意しない** — 編集内容が限定的なので省略。ユーザーには
   ダイアログで「ファイル内容を書き換えます」と明示する
@@ -282,7 +282,7 @@ HEIC は v1.0 では非対応 (§8 参照)。
 
 XMP パケットが 64KB (厳密には 65503 バイト) を超える場合、JPEG は Standard XMP +
 Extended XMP (複数 APP1 チャンク、GUID で紐付け) に分割して格納される
-(Adobe XMP Specification Part 3 §1.1.3)。mXDownloader 由来のツイート画像は
+(Adobe XMP Specification Part 3 §1.1.3)。XMP ツイート情報を持つ画像は
 `xtw:Description` (日本語数百文字) + 複数の `xtw:*` フィールドを持つため、
 Extended XMP を使っている可能性が高い。
 
@@ -559,7 +559,7 @@ Ctrl+G 検索ボックスの右側にタグプルダウンを配置し、登録�
 ## 12. オープン課題
 
 - **進捗表示**: 大量ファイル一括付与時のキャンセル UX
-- **mXDownloader 画像との相性**: `xtw:*` 名前空間と `dc:subject` は同じ XMP パケット
+- **XMP ツイート情報との相性**: `xtw:*` 名前空間と `dc:subject` は同じ XMP パケット
   内に共存可能。書き込み時に `xtw:*` プロパティを破壊しないことをテストで担保する
   (§5.4 の Extended XMP 保持方針で技術的には担保できる想定)
 - **Standard XMP が 64KB 超になった場合**: v1.0 はエラー扱い。v1.1 で
