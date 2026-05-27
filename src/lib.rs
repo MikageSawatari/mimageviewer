@@ -31,6 +31,7 @@ pub mod catalog;
 pub mod changelog_markdown;
 pub mod compare_wgpu;
 pub mod conceal;
+pub mod conceal_compose;
 pub mod conceal_db;
 pub mod data_dir;
 pub mod delete_worker;
