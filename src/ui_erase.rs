@@ -1326,24 +1326,27 @@ impl App {
         full_rect: egui::Rect,
         zoom_pan: Option<(f32, egui::Vec2)>,
     ) {
-        // マスクオーバーレイ描画
-        self.ensure_mask_texture(ctx);
-        if let Some(ref tex) = self.erase_mask_texture {
-            let Some((_total_scale, img_rect)) = self.erase_image_layout(full_rect, zoom_pan)
-            else {
-                return;
-            };
-            let painter = if zoom_pan.is_some() {
-                ui.painter().with_clip_rect(full_rect)
-            } else {
-                ui.painter().clone()
-            };
-            painter.image(
-                tex.id(),
-                img_rect,
-                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
+        // マスクオーバーレイ描画。プレビュー押下中は inpaint 反映後の結果を見せたいので
+        // マスク表示はオフにする (= ユーザー要望: プレビュー中はマスク非表示)。
+        if !self.erase_preview_active {
+            self.ensure_mask_texture(ctx);
+            if let Some(ref tex) = self.erase_mask_texture {
+                let Some((_total_scale, img_rect)) = self.erase_image_layout(full_rect, zoom_pan)
+                else {
+                    return;
+                };
+                let painter = if zoom_pan.is_some() {
+                    ui.painter().with_clip_rect(full_rect)
+                } else {
+                    ui.painter().clone()
+                };
+                painter.image(
+                    tex.id(),
+                    img_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+            }
         }
 
         // ドラッグ中のプレビュー

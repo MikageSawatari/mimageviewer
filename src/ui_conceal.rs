@@ -1216,21 +1216,27 @@ impl App {
         full_rect: egui::Rect,
         zoom_pan: Option<(f32, egui::Vec2)>,
     ) {
-        // マスクオーバーレイ (紫半透明)
-        self.ensure_conceal_mask_texture(ctx);
-        if let Some(ref tex) = self.conceal_mask_texture {
-            if let Some((_total_scale, img_rect)) = self.conceal_image_layout(full_rect, zoom_pan) {
-                let painter = if zoom_pan.is_some() {
-                    ui.painter().with_clip_rect(full_rect)
-                } else {
-                    ui.painter().clone()
-                };
-                painter.image(
-                    tex.id(),
-                    img_rect,
-                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    egui::Color32::WHITE,
-                );
+        // マスクオーバーレイ (紫半透明)。プレビュー押下中はマスクを隠して
+        // 「合成後の結果」だけが見えるようにする (= ユーザー要望: プレビューでは
+        // マスク表示オフ)。
+        if !self.conceal_preview_active {
+            self.ensure_conceal_mask_texture(ctx);
+            if let Some(ref tex) = self.conceal_mask_texture {
+                if let Some((_total_scale, img_rect)) =
+                    self.conceal_image_layout(full_rect, zoom_pan)
+                {
+                    let painter = if zoom_pan.is_some() {
+                        ui.painter().with_clip_rect(full_rect)
+                    } else {
+                        ui.painter().clone()
+                    };
+                    painter.image(
+                        tex.id(),
+                        img_rect,
+                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                        egui::Color32::WHITE,
+                    );
+                }
             }
         }
 
@@ -1406,48 +1412,43 @@ impl App {
             full_rect.min.y + PANEL_MARGIN_Y,
         );
 
-        // クリック吸収用のパネル矩形を先に計算 (= conceal_panel_rect)。`Frame::popup` の
-        // auto-size に任せると後に `ui.interact` で sink を追加することになるが、それだと
-        // egui の hit test (= 同じ rect の Response は後勝ち) で widget が click を受け取
-        // れなくなる。消しゴムパネルと同じく **sink を widget より先に登録** することで
-        // widget が click を勝ち取りつつ、widget 外の隙間は sink が吸収する形にする。
-        let panel_rect = self.conceal_panel_rect(full_rect);
+        // クリック吸収用に generous な sink rect を Frame::popup より先に登録する。
+        // egui の hit test ルール「同じ rect の Response は後勝ち」のもと:
+        // - widget の click は widget 側 (= 後登録) で勝ち取る
+        // - widget 外 (パネル内の隙間 + sink rect が visible Frame より少しはみ出す
+        //   部分) は sink が吸収
+        //
+        // 旧実装で `set_clip_rect` + 固定 max_rect の new_child を使うと widget の
+        // 実サイズがパネル想定より大きいとき右側・下が切れる問題があったため、
+        // Frame::popup の auto-size に内容サイズを任せ、sink は十分大きく (高さ
+        // 1000px) 取って visible Frame を完全に覆う形に戻す。sink が visible Frame
+        // より少し大きいぶん、パネル境界外の数十 px のクリックも吸収されるが
+        // 許容範囲 (= パネル直下に重要 UI は無い)。
+        const SINK_HEIGHT: f32 = 1000.0;
+        let sink_rect =
+            egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W + 4.0, SINK_HEIGHT));
 
         egui::Area::new(egui::Id::new("conceal_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
-                // 1. パネル全面の sink を先に登録 (= widget より前)。allocate_painter は
-                //    layout cursor を消費するが、これは新規 Ui の起点位置をパネル内側に
-                //    揃えるのに都合がよい。返り値の `painter` で背景も描く。
-                let (_sink_resp, sink_painter) =
-                    ui.allocate_painter(panel_rect.size(), egui::Sense::click_and_drag());
-                sink_painter.rect_filled(
-                    panel_rect,
-                    6.0,
-                    egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230),
+                // 1. sink を widget より前に登録 (egui の hit test 後勝ちルール対策)
+                ui.interact(
+                    sink_rect,
+                    egui::Id::new("conceal_panel_click_sink"),
+                    egui::Sense::click_and_drag(),
                 );
-                sink_painter.rect_stroke(
-                    panel_rect,
-                    6.0,
-                    egui::Stroke::new(
+                // 2. Frame::popup で背景 + 内容を描く (auto-size、clipping なし)
+                egui::Frame::popup(ui.style())
+                    .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230))
+                    .stroke(egui::Stroke::new(
                         1.0,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
-                    ),
-                    egui::StrokeKind::Outside,
-                );
-                // 2. パネル内側 (8px インセット) に新 Ui を作成し、その中で
-                //    既存の Frame ベース widget レイアウトを実行する。Frame は
-                //    背景塗りを担当しない (sink_painter で既に描いた)、枠線なし、
-                //    透明 fill にして widget だけ載せる。
-                let inner_rect = panel_rect.shrink(8.0);
-                let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(inner_rect));
-                child_ui.set_clip_rect(inner_rect);
-                egui::Frame::NONE
-                    .fill(egui::Color32::TRANSPARENT)
-                    .show(&mut child_ui, |ui| {
-                        ui.set_min_width(PANEL_W - 16.0);
+                    ))
+                    .corner_radius(6.0)
+                    .show(ui, |ui| {
+                        ui.set_min_width(PANEL_W);
                         // 子ウィジェット (ボタン / スライダー / ラベル) のテキスト色を
                         // 強制的に白にする。これをやらないとデフォルト dark visuals の
                         // widgets.* 派生色 (グレー 100 前後) で描画されて読みにくい。

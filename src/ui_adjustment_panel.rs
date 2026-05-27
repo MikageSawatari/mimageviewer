@@ -750,7 +750,8 @@ impl App {
             };
             child.painter().rect_filled(conceal_rect, 4.0, bg);
             let r = HEADER_BTN_SIZE * 0.28;
-            crate::ui_fullscreen::draw_icons::draw_tile_grid_icon(
+            // 3x3 モザイク専用アイコン (動画タイルモードの 2x2 とは別シンボル)
+            crate::ui_fullscreen::draw_icons::draw_mosaic_icon(
                 child.painter(),
                 conceal_rect.center(),
                 r,

@@ -118,81 +118,118 @@ pub(crate) fn draw_eye_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     painter.circle_filled(c, r * 0.32, white);
 }
 
-/// 消しゴムアイコン (鉛筆型ブロック + 先端の摩擦帯) を描画する。
-/// 32px ボタンで使う前提。補正パネルのヘッダー右端でも使う (`r = ~9`)。
+/// 消しゴムアイコン (= Codex Phase 4 redesign)。コンパクトな斜めブロックの消しゴム +
+/// 先端の摩擦帯 + 消しカスの小さな粒で「消す動作」を示唆する。
 ///
-/// 形状: 細長い角丸長方形 (アスペクト比 ~3.5:1) を 22° 傾けて描画。
-/// 上半 1/3 が淡ピンクの摩擦帯 (= ゴム消し本体)、下半 2/3 が暗灰ボディ。
-/// "幅広い消しゴム" に見えないよう、文房具の細長い消しゴム (ペンケース内の
-/// 細い消しゴム) を意識した縦横比にする。
+/// `r ≈ BAR_BUTTON_SIZE * 0.28` ≈ 9 を想定。-14° の浅い傾きで「斜めに置かれた消しゴム」
+/// を表現しつつ、シルエットを読みやすく保つ。ボディは pale gray (`#EEEEEF`)、
+/// 先端カットは worn gray (`#B2B2BC`)、下に消しカスの粒 3 個。
 pub(crate) fn draw_eraser_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
-    // ボディ寸法: 細長く (= w/h = 3.5:1 程度) する。BAR_BUTTON_SIZE = 32 → r ≈ 9 の場合
-    // half_w ≈ 9.7, half_h ≈ 2.8 → 全長 19.4 × 高さ 5.6
-    let half_w = r * 1.08;
-    let half_h = r * 0.31;
-    // 22° 傾き (見た目で「斜めに置かれた消しゴム」が分かりやすい角度)
-    let theta: f32 = 22.0_f32.to_radians();
+    let theta: f32 = (-14.0_f32).to_radians();
     let (sin, cos) = (theta.sin(), theta.cos());
+
     let rotate = |p: egui::Vec2| egui::vec2(p.x * cos - p.y * sin, p.x * sin + p.y * cos);
-    // 4 隅 (中心からのオフセット)
-    let corners = [
-        rotate(egui::vec2(-half_w, -half_h)),
-        rotate(egui::vec2(half_w, -half_h)),
-        rotate(egui::vec2(half_w, half_h)),
-        rotate(egui::vec2(-half_w, half_h)),
+    let to_pos = |p: egui::Vec2| egui::pos2(c.x + p.x, c.y + p.y);
+
+    let hw = r * 0.92;
+    let hh = r * 0.44;
+    let cut = r * 0.34;
+
+    // ボディ (左上の角を斜めカット)
+    let body = [
+        rotate(egui::vec2(-hw + cut, -hh)),
+        rotate(egui::vec2(hw, -hh)),
+        rotate(egui::vec2(hw, hh)),
+        rotate(egui::vec2(-hw, hh)),
+        rotate(egui::vec2(-hw, -hh + cut)),
     ];
-    let to_pos = |v: egui::Vec2| egui::pos2(c.x + v.x, c.y + v.y);
-    // 上 1/3 を摩擦帯 (ゴム消し)、下 2/3 をボディ (= 文房具の細長い消しゴム形状)。
-    // 内分点を計算: 上から 1/3 の位置 (top..bot 軸方向)。
-    // corner index 配置 (反時計):
-    //   0: 左上, 1: 右上, 2: 右下, 3: 左下
-    // 上辺 = 0..1、下辺 = 3..2、右辺 = 1..2、左辺 = 0..3
-    // 上から 1/3 の点: top_to_bot 軸で 1/3 内分
-    let split_left = corners[0] + (corners[3] - corners[0]) * (1.0 / 3.0);
-    let split_right = corners[1] + (corners[2] - corners[1]) * (1.0 / 3.0);
-    // ゴム (上 1/3): 薄ピンク
-    let pts_top = vec![
-        to_pos(corners[0]),
-        to_pos(corners[1]),
-        to_pos(split_right),
-        to_pos(split_left),
+
+    // 先端 (摩擦帯) — 左端の小さい台形
+    let tip = [
+        rotate(egui::vec2(-hw + cut, -hh)),
+        rotate(egui::vec2(-hw, -hh + cut)),
+        rotate(egui::vec2(-hw, hh)),
+        rotate(egui::vec2(-hw + cut * 0.95, hh)),
     ];
+
     painter.add(egui::Shape::convex_polygon(
-        pts_top,
-        egui::Color32::from_rgb(240, 180, 180),
+        body.iter().map(|&p| to_pos(p)).collect(),
+        egui::Color32::from_rgb(238, 238, 242),
         egui::Stroke::NONE,
     ));
-    // ボディ (下 2/3): 暗めの灰
-    let pts_bot = vec![
-        to_pos(split_left),
-        to_pos(split_right),
-        to_pos(corners[2]),
-        to_pos(corners[3]),
-    ];
+
     painter.add(egui::Shape::convex_polygon(
-        pts_bot,
-        egui::Color32::from_rgb(90, 90, 100),
+        tip.iter().map(|&p| to_pos(p)).collect(),
+        egui::Color32::from_rgb(178, 178, 188),
         egui::Stroke::NONE,
     ));
-    // 全体の白枠 (= ボディ + ゴム共通の輪郭)
-    let outline = vec![
-        to_pos(corners[0]),
-        to_pos(corners[1]),
-        to_pos(corners[2]),
-        to_pos(corners[3]),
-    ];
+
+    // ボディ全体の白アウトライン
     painter.add(egui::Shape::closed_line(
-        outline,
-        egui::Stroke::new(1.2, egui::Color32::WHITE),
+        body.iter().map(|&p| to_pos(p)).collect(),
+        egui::Stroke::new(1.25, egui::Color32::WHITE),
     ));
-    // ゴム / ボディの境界線も白で薄く
+
+    // ボディ / 先端の境界線 (薄灰)
+    let seam_a = to_pos(rotate(egui::vec2(-hw + cut * 0.95, -hh * 0.88)));
+    let seam_b = to_pos(rotate(egui::vec2(-hw + cut * 0.95, hh * 0.88)));
     painter.line_segment(
-        [to_pos(split_left), to_pos(split_right)],
-        egui::Stroke::new(
-            0.8,
-            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160),
-        ),
+        [seam_a, seam_b],
+        egui::Stroke::new(1.0, egui::Color32::from_gray(120)),
     );
+
+    // 消しカス (= erase 動作の示唆)
+    let dust = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 150);
+    painter.circle_filled(egui::pos2(c.x - r * 0.72, c.y + r * 0.55), r * 0.10, dust);
+    painter.circle_filled(egui::pos2(c.x - r * 0.38, c.y + r * 0.72), r * 0.08, dust);
+    painter.line_segment(
+        [
+            egui::pos2(c.x - r * 0.96, c.y + r * 0.34),
+            egui::pos2(c.x - r * 0.64, c.y + r * 0.28),
+        ],
+        egui::Stroke::new(1.0, dust),
+    );
+}
+
+/// モザイクアイコン (= Codex Phase 4 redesign)。3x3 グリッド + セル色の微変化で
+/// 「タイルの集合 = モザイク」感を出す。隠蔽加工 (補正パネルの conceal ボタン) 専用で、
+/// 動画タイルモードの `draw_tile_grid_icon` (= 2x2) とは用途を分けている。
+///
+/// セルサイズ `r * 0.54` + ギャップ `r * 0.13` で、タイルが「点」ではなく
+/// 「大きめの正方ピース」として読めるように調整。3x3 = 9 セルそれぞれに
+/// 白〜淡灰の 9 色を割り当て、平面でなく "色の集まり" としての mosaic を表現。
+pub(crate) fn draw_mosaic_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let cell = r * 0.54;
+    let gap = r * 0.13;
+    let step = cell + gap;
+    let rounding = 1.0;
+
+    let colors = [
+        egui::Color32::from_rgb(255, 255, 255),
+        egui::Color32::from_rgb(218, 224, 235),
+        egui::Color32::from_rgb(246, 246, 248),
+        egui::Color32::from_rgb(205, 214, 228),
+        egui::Color32::from_rgb(255, 255, 255),
+        egui::Color32::from_rgb(226, 232, 240),
+        egui::Color32::from_rgb(238, 240, 244),
+        egui::Color32::from_rgb(210, 218, 232),
+        egui::Color32::from_rgb(250, 250, 252),
+    ];
+
+    let mut i = 0;
+    for y in -1..=1 {
+        for x in -1..=1 {
+            painter.rect_filled(
+                egui::Rect::from_center_size(
+                    egui::pos2(c.x + x as f32 * step, c.y + y as f32 * step),
+                    egui::vec2(cell, cell),
+                ),
+                rounding,
+                colors[i],
+            );
+            i += 1;
+        }
+    }
 }
 
 /// ウィンドウ / 全画面 切り替えアイコン (タイトルバー付きウィンドウ枠)。
