@@ -121,14 +121,17 @@ pub(crate) fn draw_eye_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
 /// 消しゴムアイコン (鉛筆型ブロック + 先端の摩擦帯) を描画する。
 /// 32px ボタンで使う前提。補正パネルのヘッダー右端でも使う (`r = ~9`)。
 ///
-/// 形状: 中央に少し傾いた角丸長方形を描き、右下端に向かって淡い色の "ゴム" 帯を
-/// 重ねた 2 段構成。回転角度 15° で「消しゴムが斜めに置かれている」雰囲気を出す。
+/// 形状: 細長い角丸長方形 (アスペクト比 ~3.5:1) を 22° 傾けて描画。
+/// 上半 1/3 が淡ピンクの摩擦帯 (= ゴム消し本体)、下半 2/3 が暗灰ボディ。
+/// "幅広い消しゴム" に見えないよう、文房具の細長い消しゴム (ペンケース内の
+/// 細い消しゴム) を意識した縦横比にする。
 pub(crate) fn draw_eraser_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
-    // ボディ寸法 (BAR_BUTTON_SIZE = 32 を想定して r ≈ 8〜9)
-    let half_w = r * 1.05;
-    let half_h = r * 0.45;
-    // 15° 傾き
-    let theta: f32 = 15.0_f32.to_radians();
+    // ボディ寸法: 細長く (= w/h = 3.5:1 程度) する。BAR_BUTTON_SIZE = 32 → r ≈ 9 の場合
+    // half_w ≈ 9.7, half_h ≈ 2.8 → 全長 19.4 × 高さ 5.6
+    let half_w = r * 1.08;
+    let half_h = r * 0.31;
+    // 22° 傾き (見た目で「斜めに置かれた消しゴム」が分かりやすい角度)
+    let theta: f32 = 22.0_f32.to_radians();
     let (sin, cos) = (theta.sin(), theta.cos());
     let rotate = |p: egui::Vec2| egui::vec2(p.x * cos - p.y * sin, p.x * sin + p.y * cos);
     // 4 隅 (中心からのオフセット)
@@ -139,22 +142,30 @@ pub(crate) fn draw_eraser_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
         rotate(egui::vec2(-half_w, half_h)),
     ];
     let to_pos = |v: egui::Vec2| egui::pos2(c.x + v.x, c.y + v.y);
-    // ゴム (上半分): 薄ピンク。先に塗ってから下半分 (ボディ) を重ね描き。
+    // 上 1/3 を摩擦帯 (ゴム消し)、下 2/3 をボディ (= 文房具の細長い消しゴム形状)。
+    // 内分点を計算: 上から 1/3 の位置 (top..bot 軸方向)。
+    // corner index 配置 (反時計):
+    //   0: 左上, 1: 右上, 2: 右下, 3: 左下
+    // 上辺 = 0..1、下辺 = 3..2、右辺 = 1..2、左辺 = 0..3
+    // 上から 1/3 の点: top_to_bot 軸で 1/3 内分
+    let split_left = corners[0] + (corners[3] - corners[0]) * (1.0 / 3.0);
+    let split_right = corners[1] + (corners[2] - corners[1]) * (1.0 / 3.0);
+    // ゴム (上 1/3): 薄ピンク
     let pts_top = vec![
         to_pos(corners[0]),
         to_pos(corners[1]),
-        to_pos((corners[1] + corners[2]) * 0.5),
-        to_pos((corners[3] + corners[0]) * 0.5),
+        to_pos(split_right),
+        to_pos(split_left),
     ];
     painter.add(egui::Shape::convex_polygon(
         pts_top,
         egui::Color32::from_rgb(240, 180, 180),
         egui::Stroke::NONE,
     ));
-    // ボディ (下半分): 暗めの灰。
+    // ボディ (下 2/3): 暗めの灰
     let pts_bot = vec![
-        to_pos((corners[3] + corners[0]) * 0.5),
-        to_pos((corners[1] + corners[2]) * 0.5),
+        to_pos(split_left),
+        to_pos(split_right),
         to_pos(corners[2]),
         to_pos(corners[3]),
     ];
@@ -176,10 +187,7 @@ pub(crate) fn draw_eraser_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     ));
     // ゴム / ボディの境界線も白で薄く
     painter.line_segment(
-        [
-            to_pos((corners[3] + corners[0]) * 0.5),
-            to_pos((corners[1] + corners[2]) * 0.5),
-        ],
+        [to_pos(split_left), to_pos(split_right)],
         egui::Stroke::new(
             0.8,
             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160),

@@ -16640,16 +16640,19 @@ impl App {
         self.conceal_cache.remove(&idx);
     }
 
-    /// 消しゴム編集中の表示用テクスチャを返す (= `erase_base_cache` の TextureHandle 版)。
+    /// 消しゴム編集中の表示用テクスチャを返す (= `erase_base_cache` に画像補正を適用した版)。
     ///
-    /// 消しゴムツールの目的は「マスクを塗ってから inpaint で消す」ことなので、編集中は
-    /// inpaint 反映後 (= fs_cache) ではなく **inpaint 前** (= erase_base_cache) を見せる
-    /// 必要がある。これをやらないと「再入場時にすでに消された画像にマスクを塗り重ねる」
-    /// 不自然な体験になる (Phase 4 ユーザー報告)。
+    /// パイプライン上は **画像補正 → 消しゴム → 隠蔽** の順なので、消しゴム編集中の
+    /// base には「画像補正が掛かった raw 画像」を表示するのが正しい。
+    /// `erase_base_cache` は inpaint 前の素画像 (= `Arc<ColorImage>`) を保持しているので、
+    /// それに `effective_params(idx)` の色補正を `apply_adjustments_fast` で適用してから
+    /// テクスチャ化する。post_filter は erase_mode 中はバイパスされる仕様
+    /// (`enter_erase_mode` で `post_filter_bypassed = true`) なのでここでも飛ばす。
     ///
-    /// `erase_base_cache` は `Arc<ColorImage>` を持つので、`load_texture` で
-    /// TextureHandle 化したものを `erase_base_tex_cache` にキャッシュして毎フレーム
-    /// アップロードする無駄を避ける。
+    /// 出来上がったテクスチャは `erase_base_tex_cache` に idx 単位でキャッシュし、毎フレーム
+    /// 補正計算 + GPU アップロード (4K で 30-50ms) が走るのを防ぐ。色補正パラメータが変わった
+    /// ときの invalidate は `clear_adjustment_caches` 経由で行われる
+    /// (= 既存の `bump_adjustment_generation` + `erase_base_tex_cache.remove(idx)` を hook 済)。
     pub(crate) fn ensure_erase_base_texture(
         &mut self,
         ctx: &egui::Context,
@@ -16658,10 +16661,18 @@ impl App {
         if let Some(tex) = self.erase_base_tex_cache.get(&idx) {
             return Some(tex.clone());
         }
-        let base = self.erase_base_cache.get(&idx)?;
+        let base = self.erase_base_cache.get(&idx)?.clone();
+        let params = self.effective_params(idx).clone();
+        // 色補正が identity (= 何も変えない) なら base をそのままテクスチャ化。
+        // post_filter は erase_mode 中バイパスなのでチェック不要。
+        let adjusted: egui::ColorImage = if params.is_color_identity() {
+            (*base).clone()
+        } else {
+            crate::adjustment::apply_adjustments_fast(&base, &params)
+        };
         let tex = ctx.load_texture(
             format!("erase_base_display_{idx}"),
-            (**base).clone(),
+            adjusted,
             egui::TextureOptions::LINEAR,
         );
         self.erase_base_tex_cache.insert(idx, tex.clone());
@@ -17710,6 +17721,9 @@ impl App {
         // 隠蔽合成: 上位レイヤ (adj) の入力が変わったので、`conceal_cache[idx]` も
         // stale 扱いにする (`docs/conceal-feature-plan.md §9` 表)。
         self.clear_conceal_caches(idx);
+        // 消しゴム編集中の base テクスチャ (= 色補正適用済 raw) も同じく stale。
+        // 次回 `ensure_erase_base_texture` で再計算される。
+        self.erase_base_tex_cache.remove(&idx);
     }
 
     /// フルスクリーン補正キャッシュとサムネ補正テクスチャを同時に全クリアする。

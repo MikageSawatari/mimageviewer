@@ -1406,24 +1406,48 @@ impl App {
             full_rect.min.y + PANEL_MARGIN_Y,
         );
 
+        // クリック吸収用のパネル矩形を先に計算 (= conceal_panel_rect)。`Frame::popup` の
+        // auto-size に任せると後に `ui.interact` で sink を追加することになるが、それだと
+        // egui の hit test (= 同じ rect の Response は後勝ち) で widget が click を受け取
+        // れなくなる。消しゴムパネルと同じく **sink を widget より先に登録** することで
+        // widget が click を勝ち取りつつ、widget 外の隙間は sink が吸収する形にする。
+        let panel_rect = self.conceal_panel_rect(full_rect);
+
         egui::Area::new(egui::Id::new("conceal_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
             .interactable(true)
             .show(ctx, |ui| {
-                // Frame の背景色とテキスト色を明示的に設定し、消しゴムパネル
-                // ([`crate::ui_erase::draw_erase_panel`]) と同じ視認性に揃える
-                // (egui::Frame::popup のデフォルトでは Yu Gothic + dark visuals で
-                // 文字が読みにくい問題、Phase 4 ユーザー報告)。
-                egui::Frame::popup(ui.style())
-                    .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 220))
-                    .stroke(egui::Stroke::new(
+                // 1. パネル全面の sink を先に登録 (= widget より前)。allocate_painter は
+                //    layout cursor を消費するが、これは新規 Ui の起点位置をパネル内側に
+                //    揃えるのに都合がよい。返り値の `painter` で背景も描く。
+                let (_sink_resp, sink_painter) =
+                    ui.allocate_painter(panel_rect.size(), egui::Sense::click_and_drag());
+                sink_painter.rect_filled(
+                    panel_rect,
+                    6.0,
+                    egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230),
+                );
+                sink_painter.rect_stroke(
+                    panel_rect,
+                    6.0,
+                    egui::Stroke::new(
                         1.0,
                         egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
-                    ))
-                    .corner_radius(6.0)
-                    .show(ui, |ui| {
-                        ui.set_min_width(PANEL_W);
+                    ),
+                    egui::StrokeKind::Outside,
+                );
+                // 2. パネル内側 (8px インセット) に新 Ui を作成し、その中で
+                //    既存の Frame ベース widget レイアウトを実行する。Frame は
+                //    背景塗りを担当しない (sink_painter で既に描いた)、枠線なし、
+                //    透明 fill にして widget だけ載せる。
+                let inner_rect = panel_rect.shrink(8.0);
+                let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(inner_rect));
+                child_ui.set_clip_rect(inner_rect);
+                egui::Frame::NONE
+                    .fill(egui::Color32::TRANSPARENT)
+                    .show(&mut child_ui, |ui| {
+                        ui.set_min_width(PANEL_W - 16.0);
                         // 子ウィジェット (ボタン / スライダー / ラベル) のテキスト色を
                         // 強制的に白にする。これをやらないとデフォルト dark visuals の
                         // widgets.* 派生色 (グレー 100 前後) で描画されて読みにくい。
@@ -1869,20 +1893,9 @@ impl App {
                             .color(egui::Color32::from_gray(190)),
                         );
                     });
-
-                // ── クリックすり抜け防止 ──
-                // Frame::popup は背景を描画するが、widget 間の隙間や `set_min_width`
-                // で広げた領域は Area::interactable(true) でもクリックを吸収しない
-                // ことがある。Frame 描画後の `ui.min_rect()` (= 実際に占有された rect)
-                // に対して明示的に `Sense::click_and_drag` で interact しておくと、
-                // 後ろの画像 / 他 UI へクリックが漏れない (raw painter 版の
-                // `allocate_painter(panel_size, Sense::click_and_drag())` と同等)。
-                let panel_rect = ui.min_rect();
-                ui.interact(
-                    panel_rect,
-                    egui::Id::new("conceal_panel_click_sink"),
-                    egui::Sense::click_and_drag(),
-                );
+                // クリック吸収 sink は Area::show の冒頭で登録済み (= widget より前)。
+                // 後追いで sink を足すと egui の hit test ルール (= 同じ rect の Response
+                // は後勝ち) で widget が click を受け取れなくなる。
             });
         if should_close_after_draw {
             self.reset_conceal_mode();
