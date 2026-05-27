@@ -2981,6 +2981,20 @@ pub struct App {
     /// 削除に伴う idx シフトは `remove_items_batch` で他の idx-keyed セットと一緒に処理。
     pub(crate) conceal_pages: std::collections::HashSet<usize>,
 
+    /// 消しゴム編集モード中の「プレビューボタン押下」状態。
+    /// パネル右上の目アイコンを押している間 true。表示パイプラインは
+    /// false のとき `erase_base_cache` (pre-inpaint) を、true のとき通常パイプライン
+    /// (= inpaint 反映後の fs_cache、隠蔽合成は省略) を出力する。
+    pub(crate) erase_preview_active: bool,
+    /// 隠蔽編集モード中の「プレビューボタン押下」状態。
+    /// 押している間 true で、`ensure_conceal_texture` が conceal_mode でも合成を実行する。
+    pub(crate) conceal_preview_active: bool,
+    /// 消しゴム編集中に `erase_base_cache` から作る表示テクスチャのキャッシュ。
+    /// `Arc<ColorImage>` をテクスチャ化したものを per-idx で保持し、毎フレーム
+    /// `ctx.load_texture` を呼ぶオーバーヘッド (4K で 30ms) を避ける。
+    /// 編集モード退出時にクリアする。
+    pub(crate) erase_base_tex_cache: std::collections::HashMap<usize, egui::TextureHandle>,
+
     /// 隠蔽合成結果のキャッシュ (Phase 4)。`fs_cache` / `adjustment_cache` / `ai_upscale_cache`
     /// よりも上位 = 表示パイプラインの最終段。entry の `generation` フィールドが
     /// `conceal_generation` と一致しないと stale 扱い (lazy eviction、Codex P2 指摘)。
@@ -3946,6 +3960,9 @@ impl App {
             conceal_pages: std::collections::HashSet::new(),
             conceal_cache: std::collections::HashMap::new(),
             conceal_generation: 0,
+            erase_preview_active: false,
+            conceal_preview_active: false,
+            erase_base_tex_cache: std::collections::HashMap::new(),
             fs_nav_locked_gen: None,
             fs_holdover_tex: None,
             virtual_folder_writeback: None,
@@ -16623,6 +16640,34 @@ impl App {
         self.conceal_cache.remove(&idx);
     }
 
+    /// 消しゴム編集中の表示用テクスチャを返す (= `erase_base_cache` の TextureHandle 版)。
+    ///
+    /// 消しゴムツールの目的は「マスクを塗ってから inpaint で消す」ことなので、編集中は
+    /// inpaint 反映後 (= fs_cache) ではなく **inpaint 前** (= erase_base_cache) を見せる
+    /// 必要がある。これをやらないと「再入場時にすでに消された画像にマスクを塗り重ねる」
+    /// 不自然な体験になる (Phase 4 ユーザー報告)。
+    ///
+    /// `erase_base_cache` は `Arc<ColorImage>` を持つので、`load_texture` で
+    /// TextureHandle 化したものを `erase_base_tex_cache` にキャッシュして毎フレーム
+    /// アップロードする無駄を避ける。
+    pub(crate) fn ensure_erase_base_texture(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Option<egui::TextureHandle> {
+        if let Some(tex) = self.erase_base_tex_cache.get(&idx) {
+            return Some(tex.clone());
+        }
+        let base = self.erase_base_cache.get(&idx)?;
+        let tex = ctx.load_texture(
+            format!("erase_base_display_{idx}"),
+            (**base).clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        self.erase_base_tex_cache.insert(idx, tex.clone());
+        Some(tex)
+    }
+
     /// 隠蔽グローバルパラメータが変わったことを世代番号で表現する (lazy eviction)。
     /// 旧 entry は `generation` が古いままで残り、次に display pipeline がそれを
     /// lookup したとき stale 判定で miss 扱いになる → 必要なものだけ再合成。
@@ -16651,7 +16696,17 @@ impl App {
         ctx: &egui::Context,
         idx: usize,
     ) -> Option<egui::TextureHandle> {
-        if self.conceal_mode {
+        // 消しゴム編集中: 隠蔽はパイプライン下流なので、編集中は焼き込まない
+        // (= ユーザーは消しゴムマスクを見たいので、その上に紫モザイクが乗ると
+        // 視認性が落ちる)。プレビュー中もエラーザーが選んだ「inpaint 結果のみ」を
+        // 見せたいので隠蔽はスキップする (ユーザー指定: 消しゴムプレビュー = 隠蔽なし)。
+        if self.erase_mode {
+            return None;
+        }
+        // 隠蔽編集中: デフォルトでは隠蔽をスキップして「pre-conceal データ + マスク」
+        // を見せる。プレビューボタン押下時 (`conceal_preview_active`) のみ通常通り
+        // 焼き込んで「最終結果」を見せる。
+        if self.conceal_mode && !self.conceal_preview_active {
             return None;
         }
         if !self.conceal_pages.contains(&idx) {

@@ -661,11 +661,14 @@ impl App {
         // ── ヘッダー ──
         // タイトル「画像補正」を左寄せにし、右側に消しゴム / 隠蔽加工の起動アイコンを
         // 並べる。E / Ctrl+M キーと同じ動作 (= モード入場) をマウスからも辿れるように
-        // するためのエントリーポイント。隠蔽加工はアイコンが他に無いので「消」/「隠」
-        // 1 文字バッジを共通色で出す (グリッド左上の補/消/隠バッジと同色)。
+        // するためのエントリーポイント。
+        //
+        // Phase 4 v2 (2026-05): 文字バッジ「消」「隠」を **画像アイコン** に置換。
+        // 消しゴム = `draw_eraser_icon` (斜めの 2 段ブロック)、隠蔽加工 =
+        // `draw_tile_grid_icon` (2x2 タイル、モザイクの視覚的メタファ)。
         let header_rect =
             egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), HEADER_H));
-        const HEADER_BTN_SIZE: f32 = 26.0;
+        const HEADER_BTN_SIZE: f32 = 28.0;
         const HEADER_BTN_GAP: f32 = 4.0;
         const HEADER_RIGHT_PAD: f32 = 8.0;
         // タイトル左寄せ (8px パディング、CENTER_Y 縦中央)
@@ -701,7 +704,8 @@ impl App {
         );
         let mut activate_erase = false;
         let mut activate_conceal = false;
-        // 消しゴムボタン: 「消」(オレンジ) — `draw_cell` のバッジと同色
+        // 消しゴムボタン: 鉛筆型アイコン。背景はホバーバーと同じ灰系で、ホバー時に明るく。
+        // disabled (= 非画像) は半透明で識別。
         {
             let resp = child.interact(
                 erase_rect,
@@ -709,33 +713,28 @@ impl App {
                 egui::Sense::click(),
             );
             let bg = if !can_overlay_edit {
-                egui::Color32::from_rgba_unmultiplied(80, 30, 15, 120)
+                egui::Color32::from_rgba_unmultiplied(50, 50, 50, 120)
             } else if resp.hovered() {
-                egui::Color32::from_rgb(220, 100, 50)
+                egui::Color32::from_rgba_unmultiplied(100, 100, 100, 220)
             } else {
-                egui::Color32::from_rgb(200, 80, 40)
+                egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
             };
             child.painter().rect_filled(erase_rect, 4.0, bg);
-            child.painter().text(
+            // アイコン描画 (中心、半径 = ボタンサイズの 28%、ホバーバーと同係数)
+            let r = HEADER_BTN_SIZE * 0.28;
+            crate::ui_fullscreen::draw_icons::draw_eraser_icon(
+                child.painter(),
                 erase_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "消",
-                egui::FontId::proportional(14.0),
-                if can_overlay_edit {
-                    egui::Color32::WHITE
-                } else {
-                    egui::Color32::from_gray(140)
-                },
+                r,
             );
             if can_overlay_edit && resp.clicked() {
                 activate_erase = true;
             }
-            // ホバー時に英字ショートカット (E キー) を tooltip
             if can_overlay_edit {
                 resp.on_hover_text("消しゴム (E)");
             }
         }
-        // 隠蔽加工ボタン: 「隠」(紫)
+        // 隠蔽加工ボタン: 2x2 タイル (モザイクメタファ)
         {
             let resp = child.interact(
                 conceal_rect,
@@ -743,23 +742,18 @@ impl App {
                 egui::Sense::click(),
             );
             let bg = if !can_overlay_edit {
-                egui::Color32::from_rgba_unmultiplied(60, 40, 80, 120)
+                egui::Color32::from_rgba_unmultiplied(50, 50, 50, 120)
             } else if resp.hovered() {
-                egui::Color32::from_rgb(180, 130, 230)
+                egui::Color32::from_rgba_unmultiplied(100, 100, 100, 220)
             } else {
-                egui::Color32::from_rgb(153, 102, 204)
+                egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
             };
             child.painter().rect_filled(conceal_rect, 4.0, bg);
-            child.painter().text(
+            let r = HEADER_BTN_SIZE * 0.28;
+            crate::ui_fullscreen::draw_icons::draw_tile_grid_icon(
+                child.painter(),
                 conceal_rect.center(),
-                egui::Align2::CENTER_CENTER,
-                "隠",
-                egui::FontId::proportional(14.0),
-                if can_overlay_edit {
-                    egui::Color32::WHITE
-                } else {
-                    egui::Color32::from_gray(140)
-                },
+                r,
             );
             if can_overlay_edit && resp.clicked() {
                 activate_conceal = true;

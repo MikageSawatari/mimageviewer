@@ -81,7 +81,11 @@ pub(super) fn draw_vst_text_label(painter: &egui::Painter, c: egui::Pos2) {
 }
 
 /// × アイコンを描画する。
-pub(super) fn draw_close_icon(painter: &egui::Painter, c: egui::Pos2, _r: f32) {
+///
+/// 隠蔽加工 / 消しゴムパネルのタイトル行右端の閉じるボタンからも参照されるため
+/// `pub(crate)` に昇格 (Phase 4)。`r` 引数は呼び出し側互換のため受け取るが、
+/// 実装上はサイズを `BAR_BUTTON_SIZE` 派生で固定している。
+pub(crate) fn draw_close_icon(painter: &egui::Painter, c: egui::Pos2, _r: f32) {
     let r = BAR_BUTTON_SIZE * 0.25;
     let stroke = egui::Stroke::new(2.5, egui::Color32::WHITE);
     painter.line_segment(
@@ -91,6 +95,95 @@ pub(super) fn draw_close_icon(painter: &egui::Painter, c: egui::Pos2, _r: f32) {
     painter.line_segment(
         [egui::pos2(c.x + r, c.y - r), egui::pos2(c.x - r, c.y + r)],
         stroke,
+    );
+}
+
+/// 目アイコン (= プレビューボタン)。横長楕円 + 中央の瞳孔。
+/// 消しゴム / 隠蔽加工パネルの「押している間だけ最終結果プレビュー」ボタンに使う。
+pub(crate) fn draw_eye_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let white = egui::Color32::WHITE;
+    // 外形 (アーモンド型) を線分で近似: 上半円と下半円の組み合わせ。
+    // 簡単のため、横長の楕円輪郭 + 中央に瞳孔を描く。
+    let rx = r * 1.05;
+    let ry = r * 0.6;
+    // 楕円輪郭 (36 段の polyline)
+    const N: usize = 32;
+    let mut pts = Vec::with_capacity(N + 1);
+    for i in 0..=N {
+        let theta = i as f32 * std::f32::consts::TAU / N as f32;
+        pts.push(egui::pos2(c.x + rx * theta.cos(), c.y + ry * theta.sin()));
+    }
+    painter.add(egui::Shape::closed_line(pts, egui::Stroke::new(1.5, white)));
+    // 瞳孔 (= 塗りつぶし円)
+    painter.circle_filled(c, r * 0.32, white);
+}
+
+/// 消しゴムアイコン (鉛筆型ブロック + 先端の摩擦帯) を描画する。
+/// 32px ボタンで使う前提。補正パネルのヘッダー右端でも使う (`r = ~9`)。
+///
+/// 形状: 中央に少し傾いた角丸長方形を描き、右下端に向かって淡い色の "ゴム" 帯を
+/// 重ねた 2 段構成。回転角度 15° で「消しゴムが斜めに置かれている」雰囲気を出す。
+pub(crate) fn draw_eraser_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    // ボディ寸法 (BAR_BUTTON_SIZE = 32 を想定して r ≈ 8〜9)
+    let half_w = r * 1.05;
+    let half_h = r * 0.45;
+    // 15° 傾き
+    let theta: f32 = 15.0_f32.to_radians();
+    let (sin, cos) = (theta.sin(), theta.cos());
+    let rotate = |p: egui::Vec2| egui::vec2(p.x * cos - p.y * sin, p.x * sin + p.y * cos);
+    // 4 隅 (中心からのオフセット)
+    let corners = [
+        rotate(egui::vec2(-half_w, -half_h)),
+        rotate(egui::vec2(half_w, -half_h)),
+        rotate(egui::vec2(half_w, half_h)),
+        rotate(egui::vec2(-half_w, half_h)),
+    ];
+    let to_pos = |v: egui::Vec2| egui::pos2(c.x + v.x, c.y + v.y);
+    // ゴム (上半分): 薄ピンク。先に塗ってから下半分 (ボディ) を重ね描き。
+    let pts_top = vec![
+        to_pos(corners[0]),
+        to_pos(corners[1]),
+        to_pos((corners[1] + corners[2]) * 0.5),
+        to_pos((corners[3] + corners[0]) * 0.5),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        pts_top,
+        egui::Color32::from_rgb(240, 180, 180),
+        egui::Stroke::NONE,
+    ));
+    // ボディ (下半分): 暗めの灰。
+    let pts_bot = vec![
+        to_pos((corners[3] + corners[0]) * 0.5),
+        to_pos((corners[1] + corners[2]) * 0.5),
+        to_pos(corners[2]),
+        to_pos(corners[3]),
+    ];
+    painter.add(egui::Shape::convex_polygon(
+        pts_bot,
+        egui::Color32::from_rgb(90, 90, 100),
+        egui::Stroke::NONE,
+    ));
+    // 全体の白枠 (= ボディ + ゴム共通の輪郭)
+    let outline = vec![
+        to_pos(corners[0]),
+        to_pos(corners[1]),
+        to_pos(corners[2]),
+        to_pos(corners[3]),
+    ];
+    painter.add(egui::Shape::closed_line(
+        outline,
+        egui::Stroke::new(1.2, egui::Color32::WHITE),
+    ));
+    // ゴム / ボディの境界線も白で薄く
+    painter.line_segment(
+        [
+            to_pos((corners[3] + corners[0]) * 0.5),
+            to_pos((corners[1] + corners[2]) * 0.5),
+        ],
+        egui::Stroke::new(
+            0.8,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160),
+        ),
     );
 }
 
@@ -149,7 +242,9 @@ pub(super) fn draw_play_triangle(painter: &egui::Painter, c: egui::Pos2, r: f32)
 /// 🔬 分析アイコン（虫眼鏡＋十字線）を描画する。
 /// タイルモード アイコン: 2x2 の塗りつぶし正方形 (= ■ ■ / ■ ■)。
 /// 旧 ▦ 文字は font glyph によっては tofu (□) に化けるため自前描画に切替。
-pub(super) fn draw_tile_grid_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+///
+/// 隠蔽加工 (モザイク) のアイコンとしても流用するため `pub(crate)` に昇格 (Phase 4)。
+pub(crate) fn draw_tile_grid_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     let white = egui::Color32::WHITE;
     // セル 1 個の半幅、セル間ギャップ
     let cell = r * 0.36;

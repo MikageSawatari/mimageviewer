@@ -124,6 +124,7 @@ impl App {
         let [w, h] = pixels.size;
 
         self.conceal_mode = true;
+        self.conceal_preview_active = false;
         self.clear_meta_undo();
         if !self.post_filter_bypassed {
             self.post_filter_bypassed = true;
@@ -197,6 +198,7 @@ impl App {
         }
 
         self.conceal_mode = false;
+        self.conceal_preview_active = false;
 
         if was_conceal_mode {
             self.clear_meta_undo();
@@ -1396,6 +1398,9 @@ impl App {
         if !self.conceal_mode {
             return;
         }
+        // 描画後に reset_conceal_mode を発火するフラグ (closure 内で直接 reset すると
+        // モード state が描画中に変わって widget の借用問題が起こりうる)。
+        let mut should_close_after_draw = false;
         let panel_pos = egui::pos2(
             full_rect.min.x + PANEL_MARGIN_X,
             full_rect.min.y + PANEL_MARGIN_Y,
@@ -1424,14 +1429,75 @@ impl App {
                         // widgets.* 派生色 (グレー 100 前後) で描画されて読みにくい。
                         ui.style_mut().visuals.override_text_color = Some(egui::Color32::WHITE);
 
-                        // ── ヘッダ (消しゴムパネルの「消しゴム」と同じスタイル) ──
-                        ui.label(
-                            egui::RichText::new("隠蔽加工")
-                                .size(15.0)
-                                .strong()
-                                .color(egui::Color32::WHITE),
-                        );
-                        ui.add_space(2.0);
+                        // ── ヘッダ (タイトル + プレビュー + 閉じる × ボタン) ──
+                        // 右端に「目アイコン (プレビュー)」と「× (閉じる)」を並べる。
+                        // プレビューは押している間だけ `conceal_preview_active = true`
+                        // にして表示パイプラインで合成を含める。閉じるはモード退出。
+                        let mut preview_pressed = false;
+                        let mut close_clicked = false;
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("隠蔽加工")
+                                    .size(15.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    // 閉じる × ボタン
+                                    let (close_rect, close_resp) = ui.allocate_exact_size(
+                                        egui::vec2(26.0, 22.0),
+                                        egui::Sense::click(),
+                                    );
+                                    let close_bg = if close_resp.hovered() {
+                                        egui::Color32::from_rgba_unmultiplied(220, 80, 80, 200)
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
+                                    };
+                                    ui.painter().rect_filled(close_rect, 4.0, close_bg);
+                                    crate::ui_fullscreen::draw_icons::draw_close_icon(
+                                        ui.painter(),
+                                        close_rect.center(),
+                                        8.0,
+                                    );
+                                    if close_resp.clicked() {
+                                        close_clicked = true;
+                                    }
+                                    close_resp.on_hover_text("閉じる (Esc / Ctrl+M)");
+                                    ui.add_space(2.0);
+                                    // プレビュー 目アイコン (= while held)
+                                    let (eye_rect, eye_resp) = ui.allocate_exact_size(
+                                        egui::vec2(26.0, 22.0),
+                                        egui::Sense::click_and_drag(),
+                                    );
+                                    let eye_bg = if eye_resp.is_pointer_button_down_on() {
+                                        // 押下中 = アクセント青
+                                        egui::Color32::from_rgb(60, 120, 200)
+                                    } else if eye_resp.hovered() {
+                                        egui::Color32::from_rgba_unmultiplied(100, 100, 100, 220)
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
+                                    };
+                                    ui.painter().rect_filled(eye_rect, 4.0, eye_bg);
+                                    crate::ui_fullscreen::draw_icons::draw_eye_icon(
+                                        ui.painter(),
+                                        eye_rect.center(),
+                                        8.0,
+                                    );
+                                    if eye_resp.is_pointer_button_down_on() {
+                                        preview_pressed = true;
+                                    }
+                                    eye_resp.on_hover_text(
+                                        "押している間: モザイク反映後の最終結果プレビュー",
+                                    );
+                                },
+                            );
+                        });
+                        self.conceal_preview_active = preview_pressed;
+                        if close_clicked {
+                            should_close_after_draw = true;
+                        }
                         ui.label(
                             egui::RichText::new(format!(
                                 "処理: {}",
@@ -1803,7 +1869,24 @@ impl App {
                             .color(egui::Color32::from_gray(190)),
                         );
                     });
+
+                // ── クリックすり抜け防止 ──
+                // Frame::popup は背景を描画するが、widget 間の隙間や `set_min_width`
+                // で広げた領域は Area::interactable(true) でもクリックを吸収しない
+                // ことがある。Frame 描画後の `ui.min_rect()` (= 実際に占有された rect)
+                // に対して明示的に `Sense::click_and_drag` で interact しておくと、
+                // 後ろの画像 / 他 UI へクリックが漏れない (raw painter 版の
+                // `allocate_painter(panel_size, Sense::click_and_drag())` と同等)。
+                let panel_rect = ui.min_rect();
+                ui.interact(
+                    panel_rect,
+                    egui::Id::new("conceal_panel_click_sink"),
+                    egui::Sense::click_and_drag(),
+                );
             });
+        if should_close_after_draw {
+            self.reset_conceal_mode();
+        }
     }
 }
 

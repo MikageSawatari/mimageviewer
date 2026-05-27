@@ -28,7 +28,7 @@ use crate::pdf_loader::PdfPageContentType;
 use crate::settings::SpreadMode;
 use crate::ui_helpers::{HoverTipExt, open_external_player};
 
-mod draw_icons;
+pub(crate) mod draw_icons;
 use self::draw_icons::*;
 
 // ── 定数 ────────────────────────────────────────────────────────────────
@@ -2358,12 +2358,25 @@ impl App {
             self.ensure_conceal_texture(ctx, fs_idx)
         };
 
+        // 消しゴム編集中の base 画像 (= inpaint 前)。プレビューボタン押下中は
+        // fs_cache を見せたいので None にして通常チェーンへフォールバックさせる。
+        let erase_base_tex = if self.erase_mode && !self.erase_preview_active && !is_video {
+            self.ensure_erase_base_texture(ctx, fs_idx)
+        } else {
+            None
+        };
+
         let tex: Option<egui::TextureHandle> = if is_video {
             // 動画は native presenter が独立 HWND に描画するため、egui 側で
             // 表示するテクスチャは無い。サムネイル fallback に任せる。
             None
         } else if original_preview_active {
             self.resolve_original_preview_tex(ctx, fs_idx)
+        } else if let Some(b) = erase_base_tex {
+            // 消しゴム編集中 (プレビュー OFF): inpaint 前の元画像を見せる。
+            // 通常パイプラインの adj / ai / conceal を全部スキップ (= 編集
+            // しやすさ重視、消しゴム base が唯一の真実)。
+            Some(b)
         } else if let Some(c) = conceal_tex {
             Some(c)
         } else {

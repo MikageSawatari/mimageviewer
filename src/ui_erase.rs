@@ -144,6 +144,10 @@ impl App {
         self.erase_line_tilt = 0.0;
         self.erase_shift_drag = None;
         self.erase_paint_mode = true;
+        self.erase_preview_active = false;
+        // base texture cache は前回の state を引き継ぐ可能性があるので毎回 clear
+        // (例: 別ページからの再入場で同 idx のテクスチャが残ると bad cross-talk)。
+        self.erase_base_tex_cache.clear();
         self.erase_undo_stack.clear();
         self.erase_last_undo_at = None;
         self.erase_shapes.clear();
@@ -204,6 +208,8 @@ impl App {
         self.erase_line_end = None;
         self.erase_line_tilt = 0.0;
         self.erase_shift_drag = None;
+        self.erase_preview_active = false;
+        self.erase_base_tex_cache.clear();
         self.erase_undo_stack.clear();
         self.erase_last_undo_at = None;
         self.erase_shapes.clear();
@@ -1604,6 +1610,11 @@ impl App {
     fn draw_erase_panel(&mut self, _ui: &mut egui::Ui, ctx: &egui::Context, full_rect: egui::Rect) {
         let panel_rect = self.erase_panel_rect(full_rect);
 
+        // ヘッダボタン (プレビュー / 閉じる) の押下状態をローカル変数に集約 →
+        // Area closure 後にディスパッチ (state mutation を描画中に避ける)。
+        let mut erase_preview_pressed = false;
+        let mut erase_close_clicked = false;
+
         // egui::Area (Foreground) でパネルを描画。interactable=true でクリックを受け取る。
         egui::Area::new(egui::Id::new("erase_tool_panel"))
             .order(egui::Order::Foreground)
@@ -1632,7 +1643,7 @@ impl App {
                 let pw = panel_rect.width() - 20.0;
                 let mut y = panel_rect.min.y + 8.0;
 
-                // ── ヘッダー ──
+                // ── ヘッダー (タイトル + プレビュー + 閉じる × ボタン) ──
                 child.painter().text(
                     egui::pos2(x0, y),
                     egui::Align2::LEFT_TOP,
@@ -1640,6 +1651,55 @@ impl App {
                     egui::FontId::proportional(15.0),
                     egui::Color32::WHITE,
                 );
+                // 右側にプレビュー (目アイコン) と 閉じる (×) ボタン
+                let header_btn_size = 22.0;
+                let header_btn_gap = 4.0;
+                // 閉じるボタン (右端)
+                let close_rect = egui::Rect::from_min_size(
+                    egui::pos2(panel_rect.max.x - 10.0 - header_btn_size, y - 1.0),
+                    egui::vec2(header_btn_size + 4.0, header_btn_size),
+                );
+                let close_resp = child.allocate_rect(close_rect, egui::Sense::click());
+                let close_bg = if close_resp.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(220, 80, 80, 200)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
+                };
+                child.painter().rect_filled(close_rect, 4.0, close_bg);
+                crate::ui_fullscreen::draw_icons::draw_close_icon(
+                    child.painter(),
+                    close_rect.center(),
+                    8.0,
+                );
+                if close_resp.clicked() {
+                    erase_close_clicked = true;
+                }
+                close_resp.on_hover_text("閉じる (Esc)");
+                // プレビュー (目アイコン): 押下中だけ `erase_preview_active = true`
+                let eye_rect = egui::Rect::from_min_size(
+                    egui::pos2(
+                        close_rect.min.x - header_btn_gap - (header_btn_size + 4.0),
+                        y - 1.0,
+                    ),
+                    egui::vec2(header_btn_size + 4.0, header_btn_size),
+                );
+                let eye_resp = child.allocate_rect(eye_rect, egui::Sense::click_and_drag());
+                let eye_bg = if eye_resp.is_pointer_button_down_on() {
+                    egui::Color32::from_rgb(60, 120, 200)
+                } else if eye_resp.hovered() {
+                    egui::Color32::from_rgba_unmultiplied(100, 100, 100, 220)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
+                };
+                child.painter().rect_filled(eye_rect, 4.0, eye_bg);
+                crate::ui_fullscreen::draw_icons::draw_eye_icon(
+                    child.painter(),
+                    eye_rect.center(),
+                    8.0,
+                );
+                erase_preview_pressed = eye_resp.is_pointer_button_down_on();
+                eye_resp
+                    .on_hover_text("押している間: 消しゴム適用後の結果プレビュー (モザイクは除外)");
                 y += 24.0;
 
                 // ── 見開きペアの左/右切替ボタン (見開きから入った場合のみ) ──
@@ -1987,6 +2047,19 @@ impl App {
                     egui::Color32::from_gray(140),
                 );
             }); // egui::Area::show
+
+        // ヘッダボタン押下のディスパッチ (closure 内で self mutation を避けた分の後始末)
+        self.erase_preview_active = erase_preview_pressed;
+        if erase_close_clicked {
+            // × ボタンは Esc キーと同じ動作: マスクがあれば inpaint を実行してから
+            // モード退出、マスクが空なら何もせず退出 (`execute_erase_inpaint` 内で
+            // ハンドリング)。
+            if let Some(idx) = self.fullscreen_idx {
+                self.execute_erase_inpaint(ctx, idx);
+            } else {
+                self.reset_erase_mode();
+            }
+        }
 
         ctx.request_repaint();
     }
