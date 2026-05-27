@@ -554,8 +554,8 @@ impl App {
     pub(crate) fn reset_analysis_mode(&mut self) {
         let restore_idx = self.fullscreen_idx;
         self.analysis_mode = false;
-        // post-filter バイパスを解除 (消しゴムモード中ならそちらが保持する)
-        if self.post_filter_bypassed && !self.erase_mode {
+        // post-filter バイパスを解除 (消しゴム or 隠蔽加工モード中ならそちらが保持する)
+        if self.post_filter_bypassed && !self.is_overlay_edit_mode_active() {
             self.post_filter_bypassed = false;
             if let Some(idx) = restore_idx {
                 self.clear_adjustment_caches(idx);
@@ -1899,8 +1899,13 @@ impl App {
                             // Phase 2a: NeedsUserConfirmation バナー (§3.6.2 / §3.6.4)。
                             // 大画像 (>200 MP) で確認待ちのときだけ描画。
                             self.draw_pano_confirmation_banner(ui, ctx, full_rect, fs_idx);
-                        } else if !is_spread_double && !compare_wipe_active {
+                        } else if !is_spread_double
+                            && !compare_wipe_active
+                            && !self.is_overlay_edit_mode_active()
+                        {
                             // ── メタデータパネル（通常モード：TABキー固定 or 右端ホバー）──
+                            // 消しゴム / 隠蔽加工モード中は自前パネルとの競合 + 編集集中度
+                            // 低下を避けるためメタデータ右パネル全体を抑制する。
                             let right_panel_visible =
                                 self.draw_metadata_panel(ui, ctx, full_rect);
                             let _ = right_panel_visible;
@@ -1939,8 +1944,8 @@ impl App {
                             None
                         };
 
-                        // 消しゴムモード中は上部バーを抑制 (自前の消しゴムパネルと競合させない)。
-                        if !self.erase_mode {
+                        // 消しゴム / 隠蔽加工モード中は上部バーを抑制 (自前パネルと競合させない)。
+                        if !self.is_overlay_edit_mode_active() {
                             let saved_nav = nav_delta;
                             let has_page_override = self.adjustment_page_params.contains_key(&fs_idx);
                             // Phase 6: 動画モードかどうかを上ホバーバーに通知する。
@@ -3822,7 +3827,9 @@ impl App {
             if self.adjustment_mode && !self.adjustment_dragging {
                 self.adjustment_mode = false;
             }
-        } else if self.erase_mode {
+        } else if self.is_overlay_edit_mode_active() {
+            // 消しゴム / 隠蔽加工モード中は補正パネルを強制 OFF (ペイント中に色補正
+            // バーが画面端ホバーで開かないように)。
             self.adjustment_mode = false;
         } else {
             let edge_hover = passive_hover_enabled
@@ -3904,6 +3911,32 @@ impl App {
                 }
                 return (0, false); // ホイールを消費したので終了
             }
+            // 隠蔽加工モード: 筆/直線ツールでは修飾なしホイールで太さ調整 (erase と対称)。
+            // Ctrl+ホイール (= ズーム) は下のブロックに流す。
+            if !ctrl_held
+                && self.conceal_mode
+                && matches!(
+                    self.conceal_tool,
+                    crate::conceal::ConcealTool::Brush
+                        | crate::conceal::ConcealTool::Line
+                        | crate::conceal::ConcealTool::VertLine
+                        | crate::conceal::ConcealTool::HorizLine
+                )
+            {
+                let max_r = self.conceal_mask_size[0].max(self.conceal_mask_size[1]) as f32 / 20.0;
+                let factor = if wheel_y > 0.0 { 1.1 } else { 1.0 / 1.1 };
+                match self.conceal_tool {
+                    crate::conceal::ConcealTool::Brush => {
+                        self.settings.conceal_brush_radius =
+                            (self.settings.conceal_brush_radius * factor).clamp(1.0, max_r);
+                    }
+                    _ => {
+                        self.settings.conceal_line_width =
+                            (self.settings.conceal_line_width * factor).clamp(1.0, max_r);
+                    }
+                }
+                return (0, false);
+            }
             if self.analysis_mode {
                 // 分析モード: ホイールでズーム
                 let mouse = ctx.input(|i| i.pointer.hover_pos());
@@ -3937,7 +3970,9 @@ impl App {
                     if changed {
                         self.maybe_rerender_pdf(self.fs_zoom);
                     }
-                } else if !self.erase_mode {
+                } else if !self.is_overlay_edit_mode_active() {
+                    // 消しゴム / 隠蔽加工モード中はホイールでのページ送りを無効化
+                    // (ペイント中の誤ナビを防ぐ)。
                     let base = if wheel_y < 0.0 { 1 } else { -1 };
                     nav_delta = self.spread_nav_delta(base, false);
                 }
@@ -3973,8 +4008,8 @@ impl App {
         if suppress_this_frame {
             // フォーカス復帰クリック: 左ボタン経由の分岐をすべてスキップ。
             // 右クリック処理 (下の secondary ブロック) は別系統なので走らせる
-        } else if self.erase_mode {
-            // 消しゴムモード: 左クリック/ドラッグはマスク塗りに使うためナビ無効化
+        } else if self.is_overlay_edit_mode_active() {
+            // 消しゴム / 隠蔽加工モード: 左クリック/ドラッグはマスク塗りに使うためナビ無効化
         } else if self.analysis_mode {
             // 分析モード: 左クリックでのナビを無効化（パン用のドラッグは analysis_panel 側）
             // ダブルクリックでズームリセット
@@ -6505,7 +6540,7 @@ impl App {
             && !in_right
             && !self.show_metadata_panel
             && !self.adjustment_mode
-            && !self.erase_mode
+            && !self.is_overlay_edit_mode_active()
             && !self.analysis_mode
             && !self.spread_popup_open
             && self.fs_context_menu_idx.is_none()

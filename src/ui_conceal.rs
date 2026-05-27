@@ -28,8 +28,9 @@ use crate::vector_edit;
 
 // ── 定数 ────────────────────────────────────────────────────────────────
 
-/// ツールパネルの幅。
-const PANEL_W: f32 = 240.0;
+/// ツールパネルの幅。消しゴム ([`crate::ui_erase::PANEL_W`] = 190px) より少し広い
+/// 220px (タイル比率スライダー + 境界処理のラジオ 3 行を持つため)。
+const PANEL_W: f32 = 220.0;
 /// ツールパネルの左上マージン。
 const PANEL_MARGIN_X: f32 = 16.0;
 const PANEL_MARGIN_Y: f32 = 60.0;
@@ -51,6 +52,18 @@ const NUDGE_PIXELS: f32 = 1.0;
 const NUDGE_PIXELS_FAST: f32 = 10.0;
 
 impl App {
+    /// 「フルスクリーン上の主要 UI (メタデータパネル / 上部ホバーバー / カーソル自動隠し /
+    /// マウスホイールでのページ送り 等) を抑制すべき編集モード」が現在 active か判定する
+    /// (= 消しゴム or 隠蔽加工)。Phase 4 で追加。
+    ///
+    /// 既存コード (ui_fullscreen.rs) に散らばっている `!self.erase_mode` 判定の多くは
+    /// 「ペイント中の UI を邪魔するな」という同じ意図なので、本ヘルパーで統一する。
+    /// 将来別の overlay edit mode (例: 切り抜き / ワイヤフレーム) を追加するときも
+    /// この 1 箇所を拡張するだけで済む。
+    pub(crate) fn is_overlay_edit_mode_active(&self) -> bool {
+        self.erase_mode || self.conceal_mode
+    }
+
     // ── モード入退場 ────────────────────────────────────────────────
 
     /// 隠蔽加工モードに入る。
@@ -1391,13 +1404,41 @@ impl App {
         egui::Area::new(egui::Id::new("conceal_panel"))
             .fixed_pos(panel_pos)
             .order(egui::Order::Foreground)
+            .interactable(true)
             .show(ctx, |ui| {
+                // Frame の背景色とテキスト色を明示的に設定し、消しゴムパネル
+                // ([`crate::ui_erase::draw_erase_panel`]) と同じ視認性に揃える
+                // (egui::Frame::popup のデフォルトでは Yu Gothic + dark visuals で
+                // 文字が読みにくい問題、Phase 4 ユーザー報告)。
                 egui::Frame::popup(ui.style())
-                    .fill(egui::Color32::from_black_alpha(220))
+                    .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 220))
+                    .stroke(egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                    ))
+                    .corner_radius(6.0)
                     .show(ui, |ui| {
                         ui.set_min_width(PANEL_W);
-                        ui.heading("隠蔽加工");
-                        ui.label(format!("処理: {}", self.settings.conceal_type.label()));
+                        // 子ウィジェット (ボタン / スライダー / ラベル) のテキスト色を
+                        // 強制的に白にする。これをやらないとデフォルト dark visuals の
+                        // widgets.* 派生色 (グレー 100 前後) で描画されて読みにくい。
+                        ui.style_mut().visuals.override_text_color = Some(egui::Color32::WHITE);
+
+                        // ── ヘッダ (消しゴムパネルの「消しゴム」と同じスタイル) ──
+                        ui.label(
+                            egui::RichText::new("隠蔽加工")
+                                .size(15.0)
+                                .strong()
+                                .color(egui::Color32::WHITE),
+                        );
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "処理: {}",
+                                self.settings.conceal_type.label()
+                            ))
+                            .color(egui::Color32::from_gray(200)),
+                        );
                         ui.separator();
 
                         // 描画 / 消去
@@ -1408,7 +1449,9 @@ impl App {
                         ui.separator();
 
                         // ツールパレット (8 個、2 列 × 4 行)
-                        ui.label("ツール:");
+                        ui.label(
+                            egui::RichText::new("ツール:").color(egui::Color32::from_gray(200)),
+                        );
                         let mut tool = self.conceal_tool;
                         ui.horizontal(|ui| {
                             ui.selectable_value(&mut tool, ConcealTool::Select, "選 [S]");
@@ -1462,7 +1505,10 @@ impl App {
 
                         // ── 隠蔽タイプ + パラメータ (Phase 4) ─────────────────
                         ui.separator();
-                        ui.label("処理タイプ:");
+                        ui.label(
+                            egui::RichText::new("処理タイプ [T]:")
+                                .color(egui::Color32::from_gray(200)),
+                        );
                         let mut type_changed = false;
                         let mut new_type = self.settings.conceal_type;
                         ui.horizontal(|ui| {
@@ -1496,7 +1542,10 @@ impl App {
                             crate::conceal::ConcealType::Mosaic
                         ) {
                             ui.separator();
-                            ui.label("タイルサイズ:");
+                            ui.label(
+                                egui::RichText::new("タイルサイズ:")
+                                    .color(egui::Color32::from_gray(200)),
+                            );
                             let mut tile_mode = self.settings.conceal_mosaic_tile_mode;
                             let mut tile_changed = false;
                             let is_ratio =
@@ -1561,7 +1610,10 @@ impl App {
                                 self.settings.conceal_mosaic_tile_mode = tile_mode;
                             }
 
-                            ui.label("境界処理:");
+                            ui.label(
+                                egui::RichText::new("境界処理:")
+                                    .color(egui::Color32::from_gray(200)),
+                            );
                             let mut bnd = self.settings.conceal_mosaic_boundary;
                             let mut bnd_changed = false;
                             for b in [
@@ -1603,7 +1655,10 @@ impl App {
 
                         // ── プリセット 4 スロット (Phase 4) ───────────────────
                         ui.separator();
-                        ui.label("プリセット (1-4 で適用):");
+                        ui.label(
+                            egui::RichText::new("プリセット (1-4 で適用):")
+                                .color(egui::Color32::from_gray(200)),
+                        );
                         for i in 0..4usize {
                             ui.horizontal(|ui| {
                                 let label = match &self.settings.conceal_presets[i] {
@@ -1629,7 +1684,10 @@ impl App {
 
                         // ── マスクスロット (差分画像生成用、2 スロット) ──────
                         ui.separator();
-                        ui.label("マスクスロット:");
+                        ui.label(
+                            egui::RichText::new("マスクスロット:")
+                                .color(egui::Color32::from_gray(200)),
+                        );
                         for slot in 1..=2usize {
                             ui.horizontal(|ui| {
                                 ui.label(format!("スロット {}", slot));
