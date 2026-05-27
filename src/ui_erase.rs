@@ -65,7 +65,9 @@ const ROTATE_DEG_STEP_FAST: f32 = 1.0;
 const MIGAN_SIZE: usize = 512;
 
 /// ツールパネルの幅。
-const PANEL_W: f32 = 190.0;
+/// パネル幅 (= 隠蔽パネル `ui_conceal.rs::PANEL_W` と統一)。
+/// 実機 FB R4: 「マスク全削除ボタン幅を揃えたい」要望 → 両パネル同幅 200 に。
+const PANEL_W: f32 = 200.0;
 /// パネルクリック吸収 sink の高さ (= `erase_panel_rect` の高さも兼ねる)。
 /// 可視 Frame::popup より大きく取って範囲外クリックを Foreground area で
 /// 確実に吸収する設計 (隠蔽パネルと同じ手法)。
@@ -885,12 +887,13 @@ impl App {
         let Some(target) = vector_edit::hit_test(&layout, img_pos, scale) else {
             return false;
         };
-        if matches!(target, vector_edit::HoverTarget::Body) {
-            // Body クリックは「ハンドル操作」ではなく「関係ない場所」扱い (= 新規
-            // shape 作成へ流す)。これによりツール継続のまま重ねて shape を作る
-            // 動作が壊れない。
-            return false;
-        }
+        // 選択中 shape の **Body** クリックは Pan ドラッグ (= 平行移動) として
+        // 消費する (実機 FB R4)。`begin_drag(Body, ...)` が `DragState::Pan` を
+        // 返すのでそのまま vector_edit に乗せる。
+        //
+        // 非選択 shape の Body クリックはここに来ない (= layout は選択中 shape
+        // 限定で計算しているため) ので、他の shape に重ねて新規 shape を作る
+        // 動作 (= ツール継続の通常パス) は壊れない。
         self.push_undo_snapshot();
         self.erase_drag = Some(vector_edit::begin_drag(target, sel, shape, img_pos));
         self.erase_mask_texture = None;
@@ -2052,7 +2055,26 @@ impl App {
             });
 
         // ── closure 外でディスパッチ (& mut self の借用衝突を避ける) ──
+        // プレビューボタンの **押下 transition** (false → true) を検出して、
+        // MI-GAN inpaint を **保存なしで** 投入する。これにより、新規に shape を
+        // 描いた直後にプレビュー押下するだけで現在のマスク全体に対する inpaint
+        // 結果が見える (= 隠蔽の preview と同じ UX、実機 FB R4)。
+        //
+        // 注意:
+        // - MI-GAN は async (= worker thread)。1-3 秒かかる間はまだ古い fs_cache
+        //   が見える。完了次第 `apply_inpaint_result` 経由で fs_cache が更新され、
+        //   毎フレ repaint で reflect される
+        // - 既に走っている job は `run_inpaint_and_cache` 内で cancel + restart
+        // - 連続 press は許容 (= 押すたびに最新マスクで再投入される)
+        // - 空マスクなら何も起きない (run_inpaint_for_preview が false を返す)
+        let preview_just_pressed = !self.erase_preview_active && preview_pressed;
         self.erase_preview_active = preview_pressed;
+        if preview_just_pressed
+            && let Some(fs_idx) = self.fullscreen_idx
+            && self.run_inpaint_for_preview(ctx, fs_idx)
+        {
+            self.show_feedback_toast("[プレビュー計算中…]".to_string());
+        }
         if let Some(target) = switch_to {
             self.switch_erase_target_in_spread(ctx, target);
         }
@@ -2155,6 +2177,29 @@ impl App {
             "erase: inpaint start, masked pixels={masked_count}"
         ));
         self.run_inpaint_and_cache(ctx, fs_idx, original, composite, w, h, "exec");
+        true
+    }
+
+    /// **保存なし** で MI-GAN inpaint を投入する (プレビュー press 用)。
+    ///
+    /// `apply_inpaint_only` と違って `save_mask_with_sidecar` を呼ばない。
+    /// プレビューは「現在の編集を一時的に見る」用途なので DB / サイドカーを
+    /// 触らないほうがユーザーの直感に近い (= ESC で undo 戻し可能)。
+    ///
+    /// `run_inpaint_and_cache` は同 idx の進行中ジョブを cancel して新規開始
+    /// するので、プレビュー押下を繰り返しても安全 (= 連続 press = cancel + restart)。
+    ///
+    /// 戻り値: ジョブを投入したら `true` (= 空マスクでないとき)。
+    pub(crate) fn run_inpaint_for_preview(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
+        let composite = match self.composite_mask() {
+            Some(c) if c.iter().any(|&m| m) => c,
+            _ => return false,
+        };
+        let Some(original) = self.erase_base_cache.get(&fs_idx).map(Arc::clone) else {
+            return false;
+        };
+        let [w, h] = self.erase_mask_size;
+        self.run_inpaint_and_cache(ctx, fs_idx, original, composite, w, h, "preview");
         true
     }
 

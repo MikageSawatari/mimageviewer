@@ -2399,38 +2399,41 @@ impl App {
                 None
             };
 
-            // 消しゴムプレビュー中 (`erase_preview_active = true`) は、adj_cache /
-            // ai_cache の両方が空のまま fs_cache まで落ちると **AI アップスケール
-            // 非反映の低解像度 raw** が表示される (= ユーザー報告のバグ)。
+            // 消しゴムプレビュー中 (`erase_preview_active = true`) の特殊扱い。
             //
-            // 原因: `enter_erase_mode` が `clear_adjustment_caches(idx)` で adj_cache を
-            // 強制クリアし、AI cache も状況によって空 (= AI 処理中 / 直前の inpaint で
-            // purge)。消しゴム通常表示は `erase_base_cache` (= 入場時に AI cache 優先で
-            // populate された高解像度 source) を直接使うので resolution drop しないが、
-            // プレビュー時はこの bypass を外して chain に乗るのでハマる。
+            // - 旧版は「ai/adj が空のまま fs_cache まで落ちると低解像度 raw に
+            //   なる」のを避けるため、fallback (= erase_base_texture) を fs_cache
+            //   の **前** に置いていた。これは初回 (= MI-GAN 未実行) の安全策。
+            // - しかし `run_inpaint_for_preview` をプレビュー押下時に走らせるよう
+            //   になった (実機 FB R4 対応) → MI-GAN 完了後は fs_cache が **高解像度
+            //   の新マスク結果** で更新される。このとき fallback を先にすると
+            //   「base のまま (= 新マスク反映なし)」を見せ続けてしまう。
             //
-            // 修正: プレビュー時のフォールバック先を `fs_cache` ではなく
-            // `erase_base_cache` (= `ensure_erase_base_texture`) にする。通常表示と
-            // 同じ source を使うので解像度は最低でも通常表示と同等になる。
-            // (`fs_cache` には絶対に落ちない設計。)
+            // 新方針: プレビュー時は fs_cache を優先し、fallback を**最後**にする。
+            // → MI-GAN 完了後は fs_cache の新結果が見え、未完了 / マスク空の場合は
+            //   fallback で base + adj を見せる (= 旧来動作にフォールバック)。
+            let fs_cache_tex = match self.fs_cache.get(&fs_idx) {
+                Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
+                Some(FsCacheEntry::Animated {
+                    frames,
+                    current_frame,
+                    ..
+                }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
+                Some(FsCacheEntry::Video { .. }) => None,
+                Some(FsCacheEntry::Failed) | None => None,
+            };
             let fallback_tex = if self.erase_mode && self.erase_preview_active {
                 self.ensure_erase_base_texture(ctx, fs_idx)
             } else {
                 None
             };
-            adj_tex
-                .or(ai_tex)
-                .or(fallback_tex)
-                .or_else(|| match self.fs_cache.get(&fs_idx) {
-                    Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
-                    Some(FsCacheEntry::Animated {
-                        frames,
-                        current_frame,
-                        ..
-                    }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
-                    Some(FsCacheEntry::Video { .. }) => None,
-                    Some(FsCacheEntry::Failed) | None => None,
-                })
+            if self.erase_mode && self.erase_preview_active {
+                // プレビュー: fs_cache (= MI-GAN 結果) を優先
+                adj_tex.or(ai_tex).or(fs_cache_tex).or(fallback_tex)
+            } else {
+                // 通常: adj > ai > fs_cache の順 (fallback は preview 用なので使われない)
+                adj_tex.or(ai_tex).or(fs_cache_tex)
+            }
         };
 
         let fs_load_failed = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Failed));

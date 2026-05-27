@@ -29,9 +29,9 @@ use crate::vector_edit;
 
 // ── 定数 ────────────────────────────────────────────────────────────────
 
-/// ツールパネルの幅。消しゴム ([`crate::ui_erase::PANEL_W`] = 190px) より少し広い
-/// 220px (タイル比率スライダー + 境界処理のラジオ 3 行を持つため)。
-const PANEL_W: f32 = 220.0;
+/// ツールパネルの幅。消しゴムパネル ([`crate::ui_erase::PANEL_W`]) と統一して
+/// 200px。実機 FB R4 で「マスク全削除ボタンの幅を揃えたい」要望に対応。
+const PANEL_W: f32 = 200.0;
 /// ツールパネルの左上マージン。
 const PANEL_MARGIN_X: f32 = 16.0;
 const PANEL_MARGIN_Y: f32 = 60.0;
@@ -1055,12 +1055,14 @@ impl App {
         let Some(target) = vector_edit::hit_test(&layout, img_pos, scale) else {
             return false;
         };
-        if matches!(target, vector_edit::HoverTarget::Body) {
-            // Body クリックは「選択 shape のハンドル操作」ではなく「関係ない場所」
-            // 扱い (= 新規 shape 作成へ流す)。これにより、ツール継続のまま重ねて
-            // shape を作る動作が壊れない。
-            return false;
-        }
+        // 選択中 shape の **Body** クリックは Pan ドラッグ (= 平行移動) として
+        // 消費する (実機 FB R4: 「作成した矩形などの内部領域はドラッグ判定にしたい」)。
+        // Pan は `begin_drag(Body, ...)` が `DragState::Pan` を返すので
+        // そのまま vector_edit に乗せる。
+        //
+        // ⚠ 非選択 shape の Body クリックはここに来ない (= layout は選択中 shape
+        // 限定で計算しているため)。よって他の shape に重ねて新規 shape を作る
+        // 動作 (= ツール継続の通常パス) は壊れない。
         self.push_conceal_undo();
         self.conceal_drag = Some(vector_edit::begin_drag(target, sel, shape, img_pos));
         self.conceal_mask_texture = None;
@@ -1610,24 +1612,14 @@ impl App {
                         // 幅キャップ (= 内容が広い widget で auto-size 拡大しないように)。
                         ui.set_min_width(PANEL_W);
                         ui.set_max_width(PANEL_W);
-                        // 子ウィジェット (ボタン / スライダー / ラベル) のテキスト色を
-                        // 強制的に白にする。`override_text_color` は ui.label() 系に効くが、
-                        // egui::Button / Slider の数値表記は widget visuals の fg_stroke.color
-                        // を使うので、そちらも併せて WHITE で上書きする (実機 FB)。
-                        ui.style_mut().visuals.override_text_color = Some(egui::Color32::WHITE);
-                        ui.style_mut()
-                            .visuals
-                            .widgets
-                            .noninteractive
-                            .fg_stroke
-                            .color = egui::Color32::WHITE;
-                        ui.style_mut().visuals.widgets.inactive.fg_stroke.color =
-                            egui::Color32::WHITE;
-                        ui.style_mut().visuals.widgets.hovered.fg_stroke.color =
-                            egui::Color32::WHITE;
-                        ui.style_mut().visuals.widgets.active.fg_stroke.color =
-                            egui::Color32::WHITE;
-                        ui.style_mut().visuals.widgets.open.fg_stroke.color = egui::Color32::WHITE;
+                        // ⚠ 重要: テーマに依存せず常に DARK visuals を使う。
+                        // CLAUDE.md ポリシー (= フルスクリーン内は黒背景ベース統一) に従い、
+                        // Light テーマでも widget bg_fill / text_edit_bg_color が
+                        // near-white にならないよう `Visuals::dark()` で上書き
+                        // (= スライダー値の DragValue / TextEdit 編集モード両方とも
+                        // dark に確定する)。消しゴムパネルと同じ構成。
+                        *ui.visuals_mut() = egui::Visuals::dark();
+                        ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
 
                         // ── ヘッダ (タイトル + プレビュー + 閉じる × ボタン) ──
                         // 右端に「目アイコン (プレビュー)」と「× (閉じる)」を並べる。
@@ -2143,13 +2135,15 @@ impl App {
                         }
 
                         // ── マスク全削除 ───────────────────────────────────
+                        // 消しゴムパネル側と同じ幅 (= PANEL_W - 20) で揃える (実機 FB R4)。
                         ui.separator();
                         if ui
                             .add(
                                 egui::Button::new(
                                     egui::RichText::new("マスク全削除").color(egui::Color32::WHITE),
                                 )
-                                .fill(egui::Color32::from_rgb(120, 50, 50)),
+                                .fill(egui::Color32::from_rgb(120, 50, 50))
+                                .min_size(egui::vec2(PANEL_W - 20.0, 22.0)),
                             )
                             .clicked()
                         {

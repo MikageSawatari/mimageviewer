@@ -657,6 +657,12 @@ impl App {
 
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(panel_rect));
         child.set_clip_rect(panel_rect);
+        // ⚠ テーマ非依存で常に DARK visuals を適用。Light テーマで slider/DragValue
+        // の bg が near-white になり「白の上に白文字」で読めなくなる問題への対応
+        // (= 消しゴム / 隠蔽パネルと同じ方針、CLAUDE.md「フルスクリーン内は黒背景
+        // ベース統一」)。実機 FB R4 で配色統一の要望があった。
+        *child.visuals_mut() = egui::Visuals::dark();
+        child.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
 
         // ── ヘッダー ──
         // タイトル「画像補正」を左寄せにし、右側に消しゴム / 隠蔽加工の起動アイコンを
