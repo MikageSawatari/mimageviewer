@@ -108,6 +108,9 @@ const PANEL_MARGIN_Y: f32 = 60.0;
 /// 実パネル矩形がまだ無いフレームで使う入力抑制用の概算高さ。
 /// 実際の描画後は `erase_panel_last_rect` に置き換わる。
 const PANEL_FALLBACK_COMPACT_H: f32 = 650.0;
+/// 消しゴム本文の内容高をまだ測定できていない最初のフレームで使う高さ。
+/// 以降は `erase_panel_body_content_h` の実測値に追従する。
+const PANEL_BODY_FALLBACK_H: f32 = 560.0;
 
 fn erase_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f32 {
     (full_rect.max.y - panel_pos.y - PANEL_BOTTOM_MARGIN).max(PANEL_MIN_BODY_H + 40.0)
@@ -199,6 +202,7 @@ impl App {
         self.erase_selected_shape = None;
         self.erase_drag = None;
         self.erase_panel_last_rect = None;
+        self.erase_panel_body_content_h = None;
         self.erase_shape_drag_start = None;
         self.erase_shape_drag_end = None;
 
@@ -281,6 +285,7 @@ impl App {
         self.erase_selected_shape = None;
         self.erase_drag = None;
         self.erase_panel_last_rect = None;
+        self.erase_panel_body_content_h = None;
         self.erase_shape_drag_start = None;
         self.erase_shape_drag_end = None;
         self.fs_pan_drag_start = None;
@@ -1982,18 +1987,32 @@ impl App {
 
                         // ── 残り (ツール選択 / スライダー / スロット / ヘルプ) を
                         //     ScrollArea で囲む ──
-                        // 本文が収まるときは content 高で止め、足りないときだけ下端近く
-                        // までの max_height でスクロールさせる。前版の強制確保は
-                        // 大きな空白を作っていたため使わない。
+                        // Area + Frame::popup の中では ScrollArea が親の available_rect
+                        // に引っ張られて小さくなりやすい。前フレームで測った本文高を
+                        // 使って親領域を明示確保し、「必要な高さまで伸びるが、下端を
+                        // 超える場合だけスクロール」にする。
                         let body_max_height =
                             (full_rect.max.y - ui.cursor().top() - PANEL_BOTTOM_MARGIN)
                                 .max(PANEL_MIN_BODY_H);
-                        egui::ScrollArea::vertical()
-                            .max_height(body_max_height)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
+                        let measured_body_h = self
+                            .erase_panel_body_content_h
+                            .filter(|h| h.is_finite() && *h > 0.0)
+                            .unwrap_or(PANEL_BODY_FALLBACK_H);
+                        let body_height =
+                            body_max_height.min((measured_body_h + 8.0).max(PANEL_MIN_BODY_H));
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(PANEL_W, body_height),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
                                 ui.set_min_width(PANEL_W);
                                 ui.set_max_width(PANEL_W);
+                                ui.set_min_height(body_height);
+                                let scroll_output = egui::ScrollArea::vertical()
+                                    .max_height(body_height)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        ui.set_min_width(PANEL_W);
+                                        ui.set_max_width(PANEL_W);
 
                         // ボタン共通の最小サイズ。PANEL_W (= 190) - Frame::popup
                         // padding (~10*2) - 中央 gap (4) を 2 で割って、片側 ~78px。
@@ -2224,15 +2243,21 @@ impl App {
                             \u{00A0}縦横線→パン/傾き\n\
                             選択ツール+クリック=選択  Del:削除\n\
                             描画後はそのままハンドルで微調整可";
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(help)
-                                    .size(10.0)
-                                    .color(egui::Color32::from_gray(190)),
-                            )
-                            .wrap(),
-                        );
-                            }); // ScrollArea::show
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(help)
+                                                    .size(10.0)
+                                                    .color(egui::Color32::from_gray(190)),
+                                            )
+                                            .wrap(),
+                                        );
+                                    }); // ScrollArea::show
+                                let content_h = scroll_output.content_size.y;
+                                if content_h.is_finite() && content_h > 0.0 {
+                                    self.erase_panel_body_content_h = Some(content_h);
+                                }
+                            },
+                        ); // allocate_ui_with_layout
                     }); // Frame::popup .show
                 self.erase_panel_last_rect = Some(frame_response.response.rect);
             }); // Area::show

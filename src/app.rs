@@ -2943,6 +2943,9 @@ pub struct App {
     /// 直近フレームで実際に描画された消しゴムパネルの矩形。
     /// パネル本文は内容量に応じて縮むため、入力抑制にも実サイズを使う。
     pub(crate) erase_panel_last_rect: Option<egui::Rect>,
+    /// 直近フレームで測定した消しゴムパネル本文の内容高。
+    /// ScrollArea の親領域をこの高さに寄せ、必要なときだけスクロールさせる。
+    pub(crate) erase_panel_body_content_h: Option<f32>,
     /// Rect / Ellipse ツールのドラッグ開始点 (画像座標、Phase 0b)。
     pub(crate) erase_shape_drag_start: Option<(f32, f32)>,
     /// Rect / Ellipse ツールのドラッグ末尾点 (画像座標、プレビューと確定で共用)。
@@ -3991,6 +3994,7 @@ impl App {
             erase_selected_shape: None,
             erase_drag: None,
             erase_panel_last_rect: None,
+            erase_panel_body_content_h: None,
             erase_shape_drag_start: None,
             erase_shape_drag_end: None,
             erase_inpaint_pending: std::collections::HashMap::new(),
