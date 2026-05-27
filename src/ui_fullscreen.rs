@@ -2399,8 +2399,28 @@ impl App {
                 None
             };
 
+            // 消しゴムプレビュー中 (`erase_preview_active = true`) は、adj_cache /
+            // ai_cache の両方が空のまま fs_cache まで落ちると **AI アップスケール
+            // 非反映の低解像度 raw** が表示される (= ユーザー報告のバグ)。
+            //
+            // 原因: `enter_erase_mode` が `clear_adjustment_caches(idx)` で adj_cache を
+            // 強制クリアし、AI cache も状況によって空 (= AI 処理中 / 直前の inpaint で
+            // purge)。消しゴム通常表示は `erase_base_cache` (= 入場時に AI cache 優先で
+            // populate された高解像度 source) を直接使うので resolution drop しないが、
+            // プレビュー時はこの bypass を外して chain に乗るのでハマる。
+            //
+            // 修正: プレビュー時のフォールバック先を `fs_cache` ではなく
+            // `erase_base_cache` (= `ensure_erase_base_texture`) にする。通常表示と
+            // 同じ source を使うので解像度は最低でも通常表示と同等になる。
+            // (`fs_cache` には絶対に落ちない設計。)
+            let fallback_tex = if self.erase_mode && self.erase_preview_active {
+                self.ensure_erase_base_texture(ctx, fs_idx)
+            } else {
+                None
+            };
             adj_tex
                 .or(ai_tex)
+                .or(fallback_tex)
                 .or_else(|| match self.fs_cache.get(&fs_idx) {
                     Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
                     Some(FsCacheEntry::Animated {
