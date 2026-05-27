@@ -24,6 +24,7 @@ use crate::conceal::ConcealTool;
 use crate::fs_animation::FsCacheEntry;
 use crate::mask_db::{LineKind, Shape};
 use crate::ui_fullscreen::FsKeyAction;
+use crate::ui_fullscreen::draw_icons::{PanelToggleColors, panel_toggle_button};
 use crate::vector_edit;
 
 // ── 定数 ────────────────────────────────────────────────────────────────
@@ -1532,10 +1533,33 @@ impl App {
                         );
                         ui.separator();
 
-                        // 描画 / 消去
+                        // 描画 / 消去 (active=赤/青、inactive=暗灰、hover=やや明灰)
+                        let btn_w = ((PANEL_W - 16.0 - 4.0) / 2.0).max(60.0);
+                        let btn_size = egui::vec2(btn_w, 24.0);
                         ui.horizontal(|ui| {
-                            ui.selectable_value(&mut self.conceal_paint_mode, true, "描画 [D]");
-                            ui.selectable_value(&mut self.conceal_paint_mode, false, "消去 [F]");
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            if panel_toggle_button(
+                                ui,
+                                "描画 [D]",
+                                self.conceal_paint_mode,
+                                Some(btn_size),
+                                Some(PanelToggleColors::paint_red()),
+                            )
+                            .clicked()
+                            {
+                                self.conceal_paint_mode = true;
+                            }
+                            if panel_toggle_button(
+                                ui,
+                                "消去 [F]",
+                                !self.conceal_paint_mode,
+                                Some(btn_size),
+                                Some(PanelToggleColors::erase_blue()),
+                            )
+                            .clicked()
+                            {
+                                self.conceal_paint_mode = false;
+                            }
                         });
                         ui.separator();
 
@@ -1544,22 +1568,42 @@ impl App {
                             egui::RichText::new("ツール:").color(egui::Color32::from_gray(200)),
                         );
                         let mut tool = self.conceal_tool;
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(&mut tool, ConcealTool::Select, "選 [S]");
-                            ui.selectable_value(&mut tool, ConcealTool::Brush, "筆 [B]");
-                        });
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(&mut tool, ConcealTool::Lasso, "囲 [L]");
-                            ui.selectable_value(&mut tool, ConcealTool::Line, "直 [I]");
-                        });
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(&mut tool, ConcealTool::VertLine, "縦 [V]");
-                            ui.selectable_value(&mut tool, ConcealTool::HorizLine, "横 [H]");
-                        });
-                        ui.horizontal(|ui| {
-                            ui.selectable_value(&mut tool, ConcealTool::Rect, "矩 [R]");
-                            ui.selectable_value(&mut tool, ConcealTool::Ellipse, "楕 [O]");
-                        });
+                        let tool_rows: [[(ConcealTool, &str); 2]; 4] = [
+                            [
+                                (ConcealTool::Select, "選 [S]"),
+                                (ConcealTool::Brush, "筆 [B]"),
+                            ],
+                            [
+                                (ConcealTool::Lasso, "囲 [L]"),
+                                (ConcealTool::Line, "直 [I]"),
+                            ],
+                            [
+                                (ConcealTool::VertLine, "縦 [V]"),
+                                (ConcealTool::HorizLine, "横 [H]"),
+                            ],
+                            [
+                                (ConcealTool::Rect, "矩 [R]"),
+                                (ConcealTool::Ellipse, "楕 [O]"),
+                            ],
+                        ];
+                        for row in tool_rows.iter() {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                for &(kind, label) in row.iter() {
+                                    if panel_toggle_button(
+                                        ui,
+                                        label,
+                                        tool == kind,
+                                        Some(btn_size),
+                                        None,
+                                    )
+                                    .clicked()
+                                    {
+                                        tool = kind;
+                                    }
+                                }
+                            });
+                        }
                         if tool != self.conceal_tool {
                             self.conceal_tool = tool;
                             self.conceal_drag = None;
@@ -1602,26 +1646,34 @@ impl App {
                         );
                         let mut type_changed = false;
                         let mut new_type = self.settings.conceal_type;
-                        ui.horizontal(|ui| {
-                            for t in [
+                        let type_rows: [[crate::conceal::ConcealType; 2]; 2] = [
+                            [
                                 crate::conceal::ConcealType::Mosaic,
                                 crate::conceal::ConcealType::WhiteFill,
-                            ] {
-                                if ui.selectable_label(new_type == t, t.label()).clicked() {
-                                    new_type = t;
-                                }
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            for t in [
+                            ],
+                            [
                                 crate::conceal::ConcealType::BlackFill,
                                 crate::conceal::ConcealType::Blur,
-                            ] {
-                                if ui.selectable_label(new_type == t, t.label()).clicked() {
-                                    new_type = t;
+                            ],
+                        ];
+                        for row in type_rows.iter() {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                for &t in row.iter() {
+                                    if panel_toggle_button(
+                                        ui,
+                                        t.label(),
+                                        new_type == t,
+                                        Some(btn_size),
+                                        None,
+                                    )
+                                    .clicked()
+                                    {
+                                        new_type = t;
+                                    }
                                 }
-                            }
-                        });
+                            });
+                        }
                         if new_type != self.settings.conceal_type {
                             self.settings.conceal_type = new_type;
                             type_changed = true;
@@ -1642,12 +1694,29 @@ impl App {
                             let is_ratio =
                                 matches!(tile_mode, crate::conceal::TileSizeMode::LongEdgeRatio(_));
                             ui.horizontal(|ui| {
-                                if ui.selectable_label(is_ratio, "長辺比率").clicked() && !is_ratio
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                if panel_toggle_button(
+                                    ui,
+                                    "長辺比率",
+                                    is_ratio,
+                                    Some(btn_size),
+                                    None,
+                                )
+                                .clicked()
+                                    && !is_ratio
                                 {
                                     tile_mode = crate::conceal::TileSizeMode::LongEdgeRatio(1.0);
                                     tile_changed = true;
                                 }
-                                if ui.selectable_label(!is_ratio, "固定 px").clicked() && is_ratio
+                                if panel_toggle_button(
+                                    ui,
+                                    "固定 px",
+                                    !is_ratio,
+                                    Some(btn_size),
+                                    None,
+                                )
+                                .clicked()
+                                    && is_ratio
                                 {
                                     tile_mode = crate::conceal::TileSizeMode::FixedPx(16);
                                     tile_changed = true;
@@ -1828,20 +1897,60 @@ impl App {
                         );
                         for i in 0..4usize {
                             ui.horizontal(|ui| {
-                                let label = match &self.settings.conceal_presets[i] {
-                                    Some(p) if !p.name.is_empty() => p.name.clone(),
-                                    Some(_) => format!("プリセット {}", i + 1),
-                                    None => format!("(空) {}", i + 1),
-                                };
-                                let has = self.settings.conceal_presets[i].is_some();
-                                if ui
-                                    .add_enabled(
-                                        has,
-                                        egui::Button::new(label).min_size(egui::vec2(120.0, 0.0)),
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                let preset = self.settings.conceal_presets[i].as_ref();
+                                let has = preset.is_some();
+                                let slot_size = egui::vec2(120.0, 22.0);
+                                if has {
+                                    let name = preset
+                                        .and_then(|p| {
+                                            if p.name.is_empty() {
+                                                None
+                                            } else {
+                                                Some(p.name.clone())
+                                            }
+                                        })
+                                        .unwrap_or_else(|| format!("プリセット {}", i + 1));
+                                    if panel_toggle_button(
+                                        ui,
+                                        format!("{}: {}", i + 1, name),
+                                        false,
+                                        Some(slot_size),
+                                        None,
                                     )
                                     .clicked()
-                                {
-                                    self.apply_conceal_preset(i);
+                                    {
+                                        self.apply_conceal_preset(i);
+                                    }
+                                } else {
+                                    // 空スロットは egui の add_enabled(false) だと
+                                    // override_text_color=WHITE と相まって字が読めなく
+                                    // なるので、独自に背景 + dim gray ラベルを描く。
+                                    // Sense::hover() でツールチップだけ反応させ、
+                                    // click は受けない (= 押しても何もしない見た目)。
+                                    let (rect, resp) =
+                                        ui.allocate_exact_size(slot_size, egui::Sense::hover());
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        3.0,
+                                        egui::Color32::from_rgba_unmultiplied(36, 36, 36, 180),
+                                    );
+                                    ui.painter().rect_stroke(
+                                        rect,
+                                        3.0,
+                                        egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        format!("{}: (未保存)", i + 1),
+                                        egui::FontId::proportional(12.5),
+                                        egui::Color32::from_gray(170),
+                                    );
+                                    resp.on_hover_text(
+                                        "現在の設定をここに保存できます (右の保存ボタン)",
+                                    );
                                 }
                                 if ui.small_button("保存").clicked() {
                                     self.save_conceal_preset_to_slot(i);

@@ -815,3 +815,98 @@ pub(super) fn draw_spread_direction_arrow(
         );
     }
 }
+
+// ── パネル用 egui ウィジェット helper ─────────────────────────────
+// 隠蔽パネル (egui) と将来統一する消しゴムパネル (現 raw painter) の双方で
+// 同じ「ボタンらしい見た目」を出すための共通ヘルパー。
+//
+// 既定の `selectable_label` / `selectable_value` は active 時に枠が少し変わる
+// 程度でほぼフラットに見えるため、ユーザーから「ボタンに見えない」とフィード
+// バックを受けた経緯がある (2026-05-27)。raw painter の eraser パネルは active
+// 時に色付き矩形 + inactive 時に gray50 を塗っており、その look を egui::Button
+// + fill で再現する。
+
+/// パネル トグルボタンの色定義。
+pub(crate) struct PanelToggleColors {
+    /// active (selected=true) 時の塗りつぶし。
+    pub selected_fill: egui::Color32,
+    /// inactive (selected=false) 時の塗りつぶし。
+    pub inactive_fill: egui::Color32,
+    /// hover (inactive 時のみ) の塗りつぶし。
+    pub hover_fill: egui::Color32,
+}
+
+impl PanelToggleColors {
+    /// 既定 (青系 active、暗灰 inactive)。
+    pub(crate) const fn blue() -> Self {
+        Self {
+            selected_fill: egui::Color32::from_rgb(60, 120, 200),
+            inactive_fill: egui::Color32::from_rgb(50, 50, 50),
+            hover_fill: egui::Color32::from_rgb(70, 70, 70),
+        }
+    }
+    /// 描画モード active (赤系)。
+    pub(crate) const fn paint_red() -> Self {
+        Self {
+            selected_fill: egui::Color32::from_rgb(180, 60, 60),
+            inactive_fill: egui::Color32::from_rgb(50, 50, 50),
+            hover_fill: egui::Color32::from_rgb(70, 70, 70),
+        }
+    }
+    /// 消去モード active (青系、paint_red と対になる)。
+    pub(crate) const fn erase_blue() -> Self {
+        Self {
+            selected_fill: egui::Color32::from_rgb(60, 120, 180),
+            inactive_fill: egui::Color32::from_rgb(50, 50, 50),
+            hover_fill: egui::Color32::from_rgb(70, 70, 70),
+        }
+    }
+}
+
+/// パネル トグルボタン (塗りつぶし矩形 + 中央テキスト)。
+///
+/// 既定の `selectable_label` だと active/inactive で塗りに差がなくフラットに
+/// 見えるので、明確な fill 差で「押せる」と分かるようにする。
+///
+/// `min_size` を渡すと幅/高さの下限を強制する (= 隣接ボタンを揃えるときに使う)。
+/// `colors` を省略すると青系の既定セットを使う。
+///
+/// 戻り値は `egui::Response`。クリック判定は呼び出し側で
+/// `if resp.clicked() { ... }` のように使う。
+pub(crate) fn panel_toggle_button(
+    ui: &mut egui::Ui,
+    text: impl Into<egui::WidgetText>,
+    selected: bool,
+    min_size: Option<egui::Vec2>,
+    colors: Option<PanelToggleColors>,
+) -> egui::Response {
+    let c = colors.unwrap_or_else(PanelToggleColors::blue);
+    // 一旦 Button で probe して hover 状態を取り、hover 中の inactive は
+    // fill を hover_fill に差し替える (= 2 段階) と raw painter の look に揃う。
+    // egui::Button 自体には「hover 時の fill 差し替え」の直接 API がないので、
+    // allocate_exact_size + 自前描画でシンプルに書く。
+    let widget_text: egui::WidgetText = text.into();
+    let galley = widget_text.into_galley(
+        ui,
+        Some(egui::TextWrapMode::Extend),
+        f32::INFINITY,
+        egui::TextStyle::Button,
+    );
+    let mut size = galley.size() + egui::vec2(12.0, 6.0);
+    if let Some(min) = min_size {
+        size.x = size.x.max(min.x);
+        size.y = size.y.max(min.y);
+    }
+    let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+    let bg = if selected {
+        c.selected_fill
+    } else if resp.hovered() {
+        c.hover_fill
+    } else {
+        c.inactive_fill
+    };
+    ui.painter().rect_filled(rect, 3.0, bg);
+    let text_pos = rect.center() - galley.size() * 0.5;
+    ui.painter().galley(text_pos, galley, egui::Color32::WHITE);
+    resp
+}
