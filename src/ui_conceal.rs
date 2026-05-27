@@ -932,7 +932,7 @@ impl App {
                     }
                     _ => unreachable!(),
                 };
-                self.commit_shape(shape, paint);
+                self.commit_conceal_shape(shape, paint);
             }
             self.conceal_line_start = None;
             self.conceal_line_end = None;
@@ -987,7 +987,7 @@ impl App {
                         },
                         _ => unreachable!(),
                     };
-                    self.commit_shape(shape, paint);
+                    self.commit_conceal_shape(shape, paint);
                 }
             }
             self.conceal_shape_drag_start = None;
@@ -996,7 +996,7 @@ impl App {
     }
 
     /// 描画モードならベクタ追加、消去モードなら重なる shape を削除しビットマップも消す。
-    fn commit_shape(&mut self, shape: Shape, paint: bool) {
+    fn commit_conceal_shape(&mut self, shape: Shape, paint: bool) {
         if paint {
             self.conceal_shapes.push(shape);
         } else {

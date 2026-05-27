@@ -35,7 +35,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 
 use crate::adjustment::AdjustParams;
-use crate::mask_db::LineObject;
+use crate::mask_db::Shape;
 
 /// サイドカーファイル名。`.dat` は Windows 上で「アプリ内部データ」として広く認識される拡張子で、
 /// ユーザが誤って編集・削除する心理的ハードルが高い。
@@ -73,23 +73,28 @@ impl SidecarEntry {
 
 /// 1bit/pixel に packed + deflate 圧縮されたマスクデータの base64。
 /// mask_db と同じバイト列を base64 に掛けたもの。
-/// `vectors` は縦線/横線/直線のベクタオブジェクト (未指定 = なし)。
+/// `vectors` は Shape (Line / Rect / Ellipse) のベクタオブジェクト (未指定 = なし)。
+///
+/// JSON 互換性: フィールド名は歴史的経緯で `vectors` のまま (リリース済みデータ)。
+/// 旧版が書いた `Vec<LineObject>` JSON は `Shape::deserialize` の legacy 経路で
+/// `Shape::Line` として読める ([`crate::mask_db`] 参照)。新版は常にタグ付き
+/// `Vec<Shape>` を書き戻す。
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SidecarMask {
     pub w: u32,
     pub h: u32,
     pub data: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub vectors: Vec<LineObject>,
+    pub vectors: Vec<Shape>,
 }
 
 impl SidecarMask {
-    pub fn from_raw(raw: &[u8], vectors: &[LineObject], w: u32, h: u32) -> Self {
+    pub fn from_raw(raw: &[u8], shapes: &[Shape], w: u32, h: u32) -> Self {
         Self {
             w,
             h,
             data: base64::engine::general_purpose::STANDARD.encode(raw),
-            vectors: vectors.to_vec(),
+            vectors: shapes.to_vec(),
         }
     }
 
@@ -426,7 +431,7 @@ pub fn import_to_dbs(
             }
             if db.get(&abs_key, w, h).is_none() {
                 if let Some(raw) = mask.decode() {
-                    let vectors_json = crate::mask_db::vectors_to_json(&mask.vectors);
+                    let vectors_json = crate::mask_db::shapes_to_json(&mask.vectors);
                     if db
                         .set_raw(&abs_key, &raw, vectors_json.as_deref(), w, h)
                         .is_ok()
@@ -616,93 +621,39 @@ mod tests {
         assert!(!s.is_dirty());
     }
 
-    // ── Phase 0 Shape マイグレーション forward-compat テスト (Codex P1) ──
+    // ── 旧サイドカー (Vec<LineObject> JSON) backward-compat テスト ──
     //
-    // SidecarMask.vectors の型を `Vec<LineObject>` → `Vec<Shape>` に変更するのは
-    // Phase 2b (消しゴム側の Shape 移行と同時) だが、その移行で **既存サイドカー
-    // ファイルが壊れない** ことを Phase 0 時点で検証しておく。
-    //
-    // 検証方法: 現状の SidecarMask (Vec<LineObject>) で書いたファイルを、
-    // Phase 2b で予定している `Vec<Shape>` 型のシミュレーション構造体で再読込
-    // できるか確認する。Shape の Deserialize は legacy LineObject 形式を読める
-    // 設計なので (mask_db.rs §"Shape 拡張" 参照)、ここがパスすれば Phase 2b
-    // 移行時に migration コードは不要。
-
-    /// Phase 2b 移行後を想定したダミー SidecarMask 構造体 (vectors: Vec<Shape>)。
-    /// 実 SidecarMask 構造体は Phase 2b まで Vec<LineObject> のままだが、JSON
-    /// 表現が同じになる (フィールド名 / 型互換性) ので、これでロード検証できる。
-    #[derive(serde::Deserialize)]
-    #[allow(dead_code)]
-    struct SidecarMaskShapeFuture {
-        w: u32,
-        h: u32,
-        data: String,
-        #[serde(default)]
-        vectors: Vec<crate::mask_db::Shape>,
-    }
-
-    #[derive(serde::Deserialize)]
-    #[allow(dead_code)]
-    struct SidecarEntryShapeFuture {
-        #[serde(default)]
-        adjust: Option<AdjustParams>,
-        #[serde(default)]
-        mask: Option<SidecarMaskShapeFuture>,
-    }
-
-    #[derive(serde::Deserialize)]
-    struct SidecarJsonShapeFuture {
-        #[allow(dead_code)]
-        version: u32,
-        #[serde(default)]
-        items: BTreeMap<String, SidecarEntryShapeFuture>,
-    }
+    // Phase 2b で SidecarMask.vectors の型を `Vec<LineObject>` → `Vec<Shape>` に
+    // 変更した。旧版が書いた `vectors: [{"kind":"diag","p0":...,...}]` JSON が
+    // 現行の `Vec<Shape>` 型でそのまま読めることを確認する (`Shape::Deserialize`
+    // の legacy 経路、mask_db.rs §"Shape 拡張" 参照)。
 
     #[test]
-    fn legacy_sidecar_vectors_load_as_shape_future_format() {
-        // 現行 SidecarMask (Vec<LineObject>) でフルパス DAT を書き、Phase 2b
-        // 後の Vec<Shape> 形式で読み戻せることを確認する。
+    fn legacy_sidecar_vectors_json_parses_as_shape() {
+        // 旧版 mIV が書いたサイドカーの JSON 文字列を直接構築する。
         let dir = tempfile::tempdir().unwrap();
-        let folder = dir.path().to_path_buf();
-        let path = folder.join(SIDECAR_FILENAME);
-
-        let mut s = SidecarFile::new(folder.clone());
-        s.set_mask(
-            "img.png",
-            SidecarMask {
-                w: 100,
-                h: 100,
-                data: base64::engine::general_purpose::STANDARD.encode([0u8, 1, 2, 3]),
-                vectors: vec![
-                    crate::mask_db::LineObject {
-                        kind: crate::mask_db::LineKind::Diagonal,
-                        p0: (10.0, 20.0),
-                        p1: (90.0, 20.0),
-                        thickness: 4.0,
-                    },
-                    crate::mask_db::LineObject {
-                        kind: crate::mask_db::LineKind::Vertical,
-                        p0: (50.0, 0.0),
-                        p1: (50.0, 100.0),
-                        thickness: 2.0,
-                    },
-                ],
-            },
-        );
-        s.flush();
-        assert!(path.exists());
-
-        // Phase 2b 後を想定した型で再パース
-        let json_bytes = std::fs::read_to_string(&path).expect("read sidecar");
-        let parsed: SidecarJsonShapeFuture =
-            serde_json::from_str(&json_bytes).expect("parse with future Shape format");
-        let mask = parsed
-            .items
-            .get("img.png")
-            .and_then(|e| e.mask.as_ref())
-            .expect("mask present");
+        let path = dir.path().join(SIDECAR_FILENAME);
+        let legacy_json = r#"{
+            "version": 1,
+            "items": {
+                "img.png": {
+                    "mask": {
+                        "w": 100,
+                        "h": 100,
+                        "data": "AAEC",
+                        "vectors": [
+                            {"kind":"diag","p0":[10.0,20.0],"p1":[90.0,20.0],"thickness":4.0},
+                            {"kind":"vert","p0":[50.0,0.0],"p1":[50.0,100.0],"thickness":2.0}
+                        ]
+                    }
+                }
+            }
+        }"#;
+        std::fs::write(&path, legacy_json).unwrap();
+        let s = SidecarFile::load(dir.path());
+        let entry = s.items().get("img.png").expect("entry present");
+        let mask = entry.mask.as_ref().expect("mask present");
         assert_eq!(mask.vectors.len(), 2);
-        // 旧 LineObject (Diagonal) → Shape::Line { kind: Diagonal, ... }
         match mask.vectors[0] {
             crate::mask_db::Shape::Line {
                 kind: crate::mask_db::LineKind::Diagonal,
@@ -716,7 +667,6 @@ mod tests {
             }
             other => panic!("expected Line(Diagonal), got {:?}", other),
         }
-        // 旧 LineObject (Vertical) → Shape::Line { kind: Vertical, ... }
         assert!(matches!(
             mask.vectors[1],
             crate::mask_db::Shape::Line {
@@ -727,78 +677,123 @@ mod tests {
     }
 
     #[test]
-    fn legacy_sidecar_with_mixed_line_kinds_load_as_shape_future_format() {
-        // 縦/横/直線が混在する旧サイドカーが Vec<Shape> 形式で読めることを確認。
-        // (実フォルダで mIV を使っていたユーザーが持つ可能性のある典型ケース)
+    fn legacy_sidecar_with_mixed_line_kinds_parses_as_shape() {
+        // 縦/横/直線が混在する旧サイドカー JSON を Vec<Shape> として読めることを確認。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SIDECAR_FILENAME);
+        let legacy_json = r#"{
+            "version": 1,
+            "items": {
+                "page.jpg": {
+                    "mask": {
+                        "w": 200,
+                        "h": 200,
+                        "data": "",
+                        "vectors": [
+                            {"kind":"horiz","p0":[0.0,100.0],"p1":[200.0,100.0],"thickness":5.0},
+                            {"kind":"vert","p0":[100.0,0.0],"p1":[100.0,200.0],"thickness":5.0},
+                            {"kind":"diag","p0":[10.0,10.0],"p1":[190.0,190.0],"thickness":8.0}
+                        ]
+                    }
+                }
+            }
+        }"#;
+        std::fs::write(&path, legacy_json).unwrap();
+        let s = SidecarFile::load(dir.path());
+        let mask = s
+            .items()
+            .get("page.jpg")
+            .and_then(|e| e.mask.as_ref())
+            .expect("mask present");
+        assert_eq!(mask.vectors.len(), 3);
+        assert!(matches!(
+            mask.vectors[0],
+            crate::mask_db::Shape::Line {
+                kind: crate::mask_db::LineKind::Horizontal,
+                ..
+            }
+        ));
+        assert!(matches!(
+            mask.vectors[1],
+            crate::mask_db::Shape::Line {
+                kind: crate::mask_db::LineKind::Vertical,
+                ..
+            }
+        ));
+        assert!(matches!(
+            mask.vectors[2],
+            crate::mask_db::Shape::Line {
+                kind: crate::mask_db::LineKind::Diagonal,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rect_and_ellipse_sidecar_roundtrip() {
+        // 新規 Phase 2b: Rect / Ellipse もサイドカーで保存・読込できる
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().to_path_buf();
-        let path = folder.join(SIDECAR_FILENAME);
-
         let mut s = SidecarFile::new(folder.clone());
         s.set_mask(
-            "page.jpg",
+            "shape.png",
             SidecarMask {
-                w: 200,
-                h: 200,
+                w: 100,
+                h: 100,
                 data: String::new(),
                 vectors: vec![
-                    crate::mask_db::LineObject {
-                        kind: crate::mask_db::LineKind::Horizontal,
-                        p0: (0.0, 100.0),
-                        p1: (200.0, 100.0),
-                        thickness: 5.0,
+                    crate::mask_db::Shape::Rect {
+                        center: (50.0, 50.0),
+                        half_w: 20.0,
+                        half_h: 10.0,
+                        rotation_rad: 0.5,
                     },
-                    crate::mask_db::LineObject {
-                        kind: crate::mask_db::LineKind::Vertical,
-                        p0: (100.0, 0.0),
-                        p1: (100.0, 200.0),
-                        thickness: 5.0,
-                    },
-                    crate::mask_db::LineObject {
-                        kind: crate::mask_db::LineKind::Diagonal,
-                        p0: (10.0, 10.0),
-                        p1: (190.0, 190.0),
-                        thickness: 8.0,
+                    crate::mask_db::Shape::Ellipse {
+                        center: (30.0, 70.0),
+                        rx: 15.0,
+                        ry: 8.0,
+                        rotation_rad: 0.0,
                     },
                 ],
             },
         );
         s.flush();
-
-        let json_bytes = std::fs::read_to_string(&path).expect("read sidecar");
-        let parsed: SidecarJsonShapeFuture =
-            serde_json::from_str(&json_bytes).expect("parse with future Shape format");
-        let mask = parsed
-            .items
-            .get("page.jpg")
+        // 読み戻し
+        let s2 = SidecarFile::load(dir.path());
+        let mask = s2
+            .items()
+            .get("shape.png")
             .and_then(|e| e.mask.as_ref())
-            .unwrap();
-        assert_eq!(mask.vectors.len(), 3);
-        let kinds: Vec<crate::mask_db::LineKind> = mask
-            .vectors
-            .iter()
-            .filter_map(|s| match s {
-                crate::mask_db::Shape::Line { kind, .. } => Some(*kind),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            kinds,
-            vec![
-                crate::mask_db::LineKind::Horizontal,
-                crate::mask_db::LineKind::Vertical,
-                crate::mask_db::LineKind::Diagonal,
-            ]
-        );
+            .expect("mask");
+        assert_eq!(mask.vectors.len(), 2);
+        match mask.vectors[0] {
+            crate::mask_db::Shape::Rect {
+                center,
+                half_w,
+                half_h,
+                rotation_rad,
+            } => {
+                assert_eq!(center, (50.0, 50.0));
+                assert!((half_w - 20.0).abs() < 1e-3);
+                assert!((half_h - 10.0).abs() < 1e-3);
+                assert!((rotation_rad - 0.5).abs() < 1e-3);
+            }
+            other => panic!("expected Rect, got {:?}", other),
+        }
+        match mask.vectors[1] {
+            crate::mask_db::Shape::Ellipse { rx, ry, .. } => {
+                assert!((rx - 15.0).abs() < 1e-3);
+                assert!((ry - 8.0).abs() < 1e-3);
+            }
+            other => panic!("expected Ellipse, got {:?}", other),
+        }
     }
 
     #[test]
-    fn legacy_sidecar_with_empty_vectors_load_as_shape_future_format() {
-        // ベクタ 0 件 (= 筆/囲みでビットマップのみ作ったケース) の旧サイドカーも問題なく読める
+    fn empty_vectors_roundtrip_after_migration() {
+        // ベクタ 0 件 (= 筆/囲みでビットマップのみ作ったケース) も問題なく読める
         let dir = tempfile::tempdir().unwrap();
         let folder = dir.path().to_path_buf();
-        let path = folder.join(SIDECAR_FILENAME);
-
         let mut s = SidecarFile::new(folder.clone());
         s.set_mask(
             "brush_only.png",
@@ -811,14 +806,12 @@ mod tests {
         );
         s.flush();
 
-        let json_bytes = std::fs::read_to_string(&path).expect("read sidecar");
-        let parsed: SidecarJsonShapeFuture =
-            serde_json::from_str(&json_bytes).expect("parse with future Shape format");
-        let mask = parsed
-            .items
+        let s2 = SidecarFile::load(dir.path());
+        let mask = s2
+            .items()
             .get("brush_only.png")
             .and_then(|e| e.mask.as_ref())
-            .unwrap();
+            .expect("mask");
         assert!(mask.vectors.is_empty());
         assert_eq!(mask.w, 50);
     }

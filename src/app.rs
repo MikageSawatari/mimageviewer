@@ -1171,6 +1171,10 @@ pub(crate) enum EraseTool {
     Line,
     /// 筆ツール: 円形ブラシで自由に塗る
     Brush,
+    /// 矩形ツール (Phase 0b): ドラッグ始終点を bbox とする回転可能な矩形を作成
+    Rect,
+    /// 楕円ツール (Phase 0b): ドラッグ始終点を bbox とする回転可能な楕円を作成
+    Ellipse,
 }
 
 impl Default for EraseTool {
@@ -1198,10 +1202,14 @@ pub(crate) enum ShiftDragState {
 }
 
 /// 消しゴムの Undo スタックに積むスナップショット。ビットマップとベクタの両方を持つ。
+///
+/// Phase 2b で `Vec<LineObject>` → `Vec<Shape>` に移行。旧 Diagonal/Vertical/Horizontal
+/// 線は `Shape::Line { kind: ... }` として保存される。新たに追加された Rect / Ellipse
+/// もここに入る。
 #[derive(Debug, Clone)]
 pub(crate) struct EraseSnapshot {
     pub mask: Vec<bool>,
-    pub vectors: Vec<crate::mask_db::LineObject>,
+    pub shapes: Vec<crate::mask_db::Shape>,
 }
 
 /// 隠蔽加工 (Conceal) の Undo スタックに積むスナップショット。`EraseSnapshot` の
@@ -1299,29 +1307,12 @@ pub(crate) struct PendingTagUndo {
     pub accumulated: Vec<crate::undo_stack::TagChange>,
 }
 
-/// ベクタオブジェクト編集のドラッグ状態。
-/// `base` はドラッグ開始時の元オブジェクト、`origin` はそのときのカーソル画像座標。
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum EraseVectorDrag {
-    /// オブジェクト全体を平行移動。
-    Pan {
-        index: usize,
-        base: crate::mask_db::LineObject,
-        origin: (f32, f32),
-    },
-    /// Ctrl+ドラッグ: 垂直成分を回転、水平成分を太さ変更に割り当てる。
-    ModAdjust {
-        index: usize,
-        base: crate::mask_db::LineObject,
-        origin: (f32, f32),
-    },
-    /// 直線の始点/終点ドラッグ。`which_p1=true` で p1、false で p0。
-    Endpoint {
-        index: usize,
-        base: crate::mask_db::LineObject,
-        which_p1: bool,
-    },
-}
+// 旧 `EraseVectorDrag` enum は Phase 2b で `crate::vector_edit::DragState` に置換
+// された。本ファイルでは `App::erase_drag: Option<vector_edit::DragState>` を使う。
+// ハンドル方式 (角・辺中点・回転ハンドル) が消しゴム/隠蔽加工で共通化されている。
+//
+// 旧 Ctrl+ドラッグ複合操作 (垂直=回転、水平=太さ変更) は廃止し、代わりに専用ハンドルを
+// 提供する。詳細は CHANGELOG (README.md 更新履歴) 参照。
 
 // -----------------------------------------------------------------------
 // サブ構造体: サムネイル画質 A/B 比較ダイアログの状態
@@ -2891,13 +2882,21 @@ pub struct App {
     /// 直前の push_undo_snapshot 時刻。矢印/[/]キー連打時のスナップショット重複を抑制する
     /// (OS のキーリピートで毎フレーム full-bitmap clone が走るのを防ぐ)。
     pub(crate) erase_last_undo_at: Option<std::time::Instant>,
-    /// 縦線/横線/直線のベクタオブジェクト群 (消しゴムモード中のみ有効)。
+    /// Shape (Line / Rect / Ellipse) のベクタオブジェクト群 (消しゴムモード中のみ有効)。
     /// 筆/囲みは `erase_mask` 側に直接ラスタライズされる。
-    pub(crate) erase_vectors: Vec<crate::mask_db::LineObject>,
-    /// 選択中のベクタオブジェクトインデックス (`erase_vectors` への添字)。
-    pub(crate) erase_selected_vector: Option<usize>,
-    /// ベクタオブジェクト編集のドラッグ状態。
-    pub(crate) erase_vector_drag: Option<EraseVectorDrag>,
+    ///
+    /// Phase 2b 移行: 旧 `erase_vectors: Vec<LineObject>` → `Vec<Shape>` に統一。
+    /// 既存 DB データの読込は `mask_db::shapes_from_json` が legacy LineObject JSON を
+    /// `Shape::Line` として吸収するので互換あり。
+    pub(crate) erase_shapes: Vec<crate::mask_db::Shape>,
+    /// 選択中の Shape インデックス (`erase_shapes` への添字)。
+    pub(crate) erase_selected_shape: Option<usize>,
+    /// Select ツールでのハンドルドラッグ状態 (Phase 2b で vector_edit に統一)。
+    pub(crate) erase_drag: Option<crate::vector_edit::DragState>,
+    /// Rect / Ellipse ツールのドラッグ開始点 (画像座標、Phase 0b)。
+    pub(crate) erase_shape_drag_start: Option<(f32, f32)>,
+    /// Rect / Ellipse ツールのドラッグ末尾点 (画像座標、プレビューと確定で共用)。
+    pub(crate) erase_shape_drag_end: Option<(f32, f32)>,
     /// バックグラウンド実行中の MI-GAN inpaint (idx 別)。
     /// 見開き消しゴムで「左ページ apply → 右ページへ移動 → 右ページ apply」と続けたとき、
     /// 旧実装は `Option` で 1 件しか持たず、右ページの投入が左ページのジョブを
@@ -3886,9 +3885,11 @@ impl App {
             pending_tag_undos: std::collections::HashMap::new(),
             next_tag_tx_id: 1,
             erase_last_undo_at: None,
-            erase_vectors: Vec::new(),
-            erase_selected_vector: None,
-            erase_vector_drag: None,
+            erase_shapes: Vec::new(),
+            erase_selected_shape: None,
+            erase_drag: None,
+            erase_shape_drag_start: None,
+            erase_shape_drag_end: None,
             erase_inpaint_pending: std::collections::HashMap::new(),
             erase_spread_ctx: None,
             // ── 隠蔽加工 (Conceal、Phase 1 default) ────────────
@@ -14253,7 +14254,7 @@ impl App {
         // 圧縮・JSON 化はループ外で 1 回だけ: N ページに同じマスクを配るので
         // deflate を共有する (N=100 等で実測効果が大きい)。
         let compressed = crate::mask_db::compress_mask(&slot_bitmap);
-        let vectors_json = crate::mask_db::vectors_to_json(&slot_vectors);
+        let shapes_json = crate::mask_db::shapes_to_json(&slot_vectors);
         let total = targets.len();
         for idx in &targets {
             // フルスクリーンで現在これらのページを開いている可能性は低い (grid モード) が、
@@ -14266,7 +14267,7 @@ impl App {
                 *idx,
                 &compressed,
                 &slot_vectors,
-                vectors_json.as_deref(),
+                shapes_json.as_deref(),
                 sw,
                 sh,
             );
@@ -16431,12 +16432,12 @@ impl App {
         &mut self,
         idx: usize,
         mask: &[bool],
-        vectors: &[crate::mask_db::LineObject],
+        shapes: &[crate::mask_db::Shape],
         w: usize,
         h: usize,
     ) {
         let bitmap_empty = !mask.iter().any(|&m| m);
-        if bitmap_empty && vectors.is_empty() {
+        if bitmap_empty && shapes.is_empty() {
             // 空マスクは DB + サイドカーから削除
             self.delete_mask_with_sidecar(idx);
             return;
@@ -16445,8 +16446,8 @@ impl App {
         // 一括適用 (apply_slot_to_selection) で N ページに同じマスクを配るときの
         // N 倍 deflate を回避する。
         let compressed = crate::mask_db::compress_mask(mask);
-        let vectors_json = crate::mask_db::vectors_to_json(vectors);
-        self.save_mask_raw_with_sidecar(idx, &compressed, vectors, vectors_json.as_deref(), w, h);
+        let shapes_json = crate::mask_db::shapes_to_json(shapes);
+        self.save_mask_raw_with_sidecar(idx, &compressed, shapes, shapes_json.as_deref(), w, h);
     }
 
     /// 既に deflate 済みのビットマップ + JSON 済みベクタを DB + サイドカーに書き込む。
@@ -16455,8 +16456,8 @@ impl App {
         &mut self,
         idx: usize,
         compressed: &[u8],
-        vectors: &[crate::mask_db::LineObject],
-        vectors_json: Option<&str>,
+        shapes: &[crate::mask_db::Shape],
+        shapes_json: Option<&str>,
         w: usize,
         h: usize,
     ) {
@@ -16465,11 +16466,11 @@ impl App {
             None => return,
         };
         if let Some(db) = &self.mask_db {
-            let _ = db.set_raw(&key, compressed, vectors_json, w, h);
+            let _ = db.set_raw(&key, compressed, shapes_json, w, h);
         }
         self.mask_pages.insert(idx);
         let sidecar_mask =
-            crate::sidecar::SidecarMask::from_raw(compressed, vectors, w as u32, h as u32);
+            crate::sidecar::SidecarMask::from_raw(compressed, shapes, w as u32, h as u32);
         self.with_sidecar_mut(idx, move |sc, rel| sc.set_mask(rel, sidecar_mask));
     }
 

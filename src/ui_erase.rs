@@ -1,19 +1,29 @@
 //! 消しゴム (Erase) モード: フルスクリーン画像の任意領域をマスクし、
 //! MI-GAN で補完 (inpaint) する。
 //!
-//! ツール: 囲み (Lasso), 縦線, 横線, 筆 (Brush)
+//! ツール (Phase 2b で 8 種に拡張、隠蔽加工と統一): 選択 (Select) / 筆 (Brush) /
+//! 囲み (Lasso) / 直線 (Line) / 縦線 / 横線 / 矩形 (Rect) / 楕円 (Ellipse)
 //! モード: 描画 / 消去 の切り替え
 //! マスクは SQLite (mask_db) に永続化される。
+//!
+//! # Phase 2b 移行ノート
+//!
+//! - Select ツールのハンドル操作は [`crate::vector_edit`] 経由に統一
+//!   (旧 Ctrl+ドラッグ複合操作 = 垂直回転・水平太さ変更 は廃止、専用ハンドル方式に置換)
+//! - ベクタオブジェクトは `Vec<LineObject>` → `Vec<Shape>` に変更
+//!   (旧 mask_db データは `shapes_from_json` で `Shape::Line` として自動変換)
+//! - 新ツール: Rect / Ellipse (Phase 0b、`Shape::Rect` / `Shape::Ellipse` を作成)
 
 use eframe::egui;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
-use crate::app::{App, EraseSnapshot, EraseTool, EraseVectorDrag, ShiftDragState};
+use crate::app::{App, EraseSnapshot, EraseTool, ShiftDragState};
 use crate::fs_animation::FsCacheEntry;
-use crate::mask_db::{LineKind, LineObject};
+use crate::mask_db::{LineKind, Shape};
 use crate::ui_fullscreen::FsKeyAction;
+use crate::vector_edit;
 
 /// 進行中の MI-GAN inpaint 推論。`App.erase_inpaint_pending` で保持され、
 /// 推論完了 (もしくは新規投入で前ジョブをキャンセル) するまで生存する。
@@ -38,8 +48,9 @@ pub(crate) struct EraseInpaintPending {
     pub log_prefix: &'static str,
 }
 
-/// ベクタオブジェクトの端点ヒット判定半径 (画像ピクセル)。
-const ENDPOINT_HIT_RADIUS: f32 = 12.0;
+// (Phase 2b で削除: ENDPOINT_HIT_RADIUS / ROTATE_DEG_PER_PIXEL は vector_edit::
+// HANDLE_HIT_RADIUS_PX とハンドル方式の回転に置換)
+
 /// 矢印キー 1 回あたりの移動量 (ピクセル)。
 const NUDGE_PIXELS: f32 = 1.0;
 /// Ctrl+矢印の移動量 (ピクセル)。
@@ -48,8 +59,6 @@ const NUDGE_PIXELS_FAST: f32 = 10.0;
 const ROTATE_DEG_STEP: f32 = 0.1;
 /// Ctrl+`[` / `]` の回転量 (度)。
 const ROTATE_DEG_STEP_FAST: f32 = 1.0;
-/// Ctrl+ドラッグ: 縦方向 1px あたりの回転角 (度)。
-const ROTATE_DEG_PER_PIXEL: f32 = 0.2;
 
 /// MI-GAN の固定入力サイズ。
 const MIGAN_SIZE: usize = 512;
@@ -137,9 +146,9 @@ impl App {
         self.erase_paint_mode = true;
         self.erase_undo_stack.clear();
         self.erase_last_undo_at = None;
-        self.erase_vectors.clear();
-        self.erase_selected_vector = None;
-        self.erase_vector_drag = None;
+        self.erase_shapes.clear();
+        self.erase_selected_shape = None;
+        self.erase_drag = None;
 
         // デフォルトブラシ半径: 長辺の 1/100
         if self.erase_brush_radius <= 0.0 {
@@ -157,10 +166,10 @@ impl App {
             .unwrap_or_else(|| (vec![false; w * h], Vec::new()));
 
         self.erase_mask = Some(loaded_mask);
-        self.erase_vectors = loaded_vectors;
+        self.erase_shapes = loaded_vectors;
         crate::logger::log(format!(
             "erase: enter mode, image={w}x{h}, vectors={}",
-            self.erase_vectors.len()
+            self.erase_shapes.len()
         ));
     }
 
@@ -195,9 +204,9 @@ impl App {
         self.erase_shift_drag = None;
         self.erase_undo_stack.clear();
         self.erase_last_undo_at = None;
-        self.erase_vectors.clear();
-        self.erase_selected_vector = None;
-        self.erase_vector_drag = None;
+        self.erase_shapes.clear();
+        self.erase_selected_shape = None;
+        self.erase_drag = None;
         self.fs_pan_drag_start = None;
 
         // 見開きから入っていた場合は spread_mode と表示ページを復元する。
@@ -253,7 +262,7 @@ impl App {
         if let Some(mask) = &self.erase_mask {
             self.erase_undo_stack.push_back(EraseSnapshot {
                 mask: mask.clone(),
-                vectors: self.erase_vectors.clone(),
+                shapes: self.erase_shapes.clone(),
             });
             while self.erase_undo_stack.len() > UNDO_MAX {
                 self.erase_undo_stack.pop_front();
@@ -277,9 +286,9 @@ impl App {
     pub(crate) fn undo_erase(&mut self) -> bool {
         if let Some(prev) = self.erase_undo_stack.pop_back() {
             self.erase_mask = Some(prev.mask);
-            self.erase_vectors = prev.vectors;
-            self.erase_selected_vector = None;
-            self.erase_vector_drag = None;
+            self.erase_shapes = prev.shapes;
+            self.erase_selected_shape = None;
+            self.erase_drag = None;
             self.erase_mask_texture = None;
             true
         } else {
@@ -291,7 +300,7 @@ impl App {
     pub(crate) fn save_mask_to_slot(&mut self, slot: usize) {
         let [w, h] = self.erase_mask_size;
         let saved = if let (Some(mask), Some(db)) = (&self.erase_mask, &self.mask_db) {
-            db.set_slot(slot, mask, &self.erase_vectors, w, h).is_ok()
+            db.set_slot(slot, mask, &self.erase_shapes, w, h).is_ok()
         } else {
             false
         };
@@ -321,8 +330,8 @@ impl App {
         }
         self.push_undo_snapshot();
         self.erase_mask = Some(slot_mask);
-        self.erase_vectors = slot_vectors;
-        self.erase_selected_vector = None;
+        self.erase_shapes = slot_vectors;
+        self.erase_selected_shape = None;
         self.erase_mask_texture = None;
         self.show_feedback_toast(format!("[スロット{}をロード]", slot));
     }
@@ -346,9 +355,9 @@ impl App {
         // 状態になっていた。明示破棄したい場合はマスク自体を削除してから抜ける。
         let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if esc {
-            if self.erase_selected_vector.is_some() {
-                self.erase_selected_vector = None;
-                self.erase_vector_drag = None;
+            if self.erase_selected_shape.is_some() {
+                self.erase_selected_shape = None;
+                self.erase_drag = None;
                 self.erase_mask_texture = None;
                 return action;
             }
@@ -376,12 +385,12 @@ impl App {
         // Delete: 選択中のベクタオブジェクトを削除
         let key_del = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete));
         if key_del {
-            if let Some(idx) = self.erase_selected_vector {
-                if idx < self.erase_vectors.len() {
+            if let Some(idx) = self.erase_selected_shape {
+                if idx < self.erase_shapes.len() {
                     self.push_undo_snapshot();
-                    self.erase_vectors.remove(idx);
-                    self.erase_selected_vector = None;
-                    self.erase_vector_drag = None;
+                    self.erase_shapes.remove(idx);
+                    self.erase_selected_shape = None;
+                    self.erase_drag = None;
                     self.erase_mask_texture = None;
                     self.show_feedback_toast("[ベクタ削除]".to_string());
                 }
@@ -450,13 +459,15 @@ impl App {
             self.rotate_mask(rot_deg.to_radians());
         }
 
-        // S/B/L/V/H/I: ツール切替
+        // S/B/L/V/H/I/R/O: ツール切替 (Phase 0b で R / O = 矩形 / 楕円 を追加)
         let key_s_tool = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S));
         let key_b = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B));
         let key_l = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
         let key_v = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::V));
         let key_h = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H));
         let key_i = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::I));
+        let key_r_tool = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::R));
+        let key_o_tool = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::O));
         if key_s_tool {
             self.erase_tool = EraseTool::Select;
             self.show_feedback_toast("[選択]".to_string());
@@ -481,6 +492,14 @@ impl App {
             self.erase_tool = EraseTool::Line;
             self.show_feedback_toast("[直線]".to_string());
         }
+        if key_r_tool {
+            self.erase_tool = EraseTool::Rect;
+            self.show_feedback_toast("[矩形]".to_string());
+        }
+        if key_o_tool {
+            self.erase_tool = EraseTool::Ellipse;
+            self.show_feedback_toast("[楕円]".to_string());
+        }
 
         // D: 描画モード, F: 消去モード
         let key_d = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::D));
@@ -497,11 +516,11 @@ impl App {
         // erase_mode 中は通常のフルスクリーンショートカットを無効化するため、
         // ここで未使用キーを明示的に消費する (マウスイベントはペイントに必要なため除外)。
         // 矢印キー / [/] は上で既に consume 済み。
+        // Phase 0b: I / R / O はツール切替に使うので SINGLE_KEYS から除外。
+        // (I は直線、R は矩形、O は楕円)
         const SINGLE_KEYS: &[egui::Key] = &[
             egui::Key::Space,
             egui::Key::Tab,
-            egui::Key::I,
-            egui::Key::R,
             egui::Key::Z,
             egui::Key::G,
             egui::Key::M,
@@ -550,13 +569,13 @@ impl App {
     /// ベクタを移動する。
     fn nudge_mask(&mut self, dx: f32, dy: f32) {
         self.push_undo_snapshot_throttled();
-        match self.erase_selected_vector {
-            Some(idx) if idx < self.erase_vectors.len() => {
-                self.erase_vectors[idx].translate(dx, dy);
+        match self.erase_selected_shape {
+            Some(idx) if idx < self.erase_shapes.len() => {
+                self.erase_shapes[idx].translate(dx, dy);
             }
             _ => {
                 // 全ベクタを移動
-                for v in &mut self.erase_vectors {
+                for v in &mut self.erase_shapes {
                     v.translate(dx, dy);
                 }
                 // ビットマップもシフト
@@ -572,16 +591,16 @@ impl App {
     /// マスクを回転する。選択中ベクタがあればそれだけ、無ければ全体を画像中心周りに回転する。
     fn rotate_mask(&mut self, angle_rad: f32) {
         self.push_undo_snapshot_throttled();
-        match self.erase_selected_vector {
-            Some(idx) if idx < self.erase_vectors.len() => {
-                let center = self.erase_vectors[idx].center();
-                self.erase_vectors[idx].rotate_around(center.0, center.1, angle_rad);
+        match self.erase_selected_shape {
+            Some(idx) if idx < self.erase_shapes.len() => {
+                let center = self.erase_shapes[idx].center();
+                self.erase_shapes[idx].rotate_around(center.0, center.1, angle_rad);
             }
             _ => {
                 let [w, h] = self.erase_mask_size;
                 let cx = w as f32 * 0.5;
                 let cy = h as f32 * 0.5;
-                for v in &mut self.erase_vectors {
+                for v in &mut self.erase_shapes {
                     v.rotate_around(cx, cy, angle_rad);
                 }
                 if let Some(mask) = self.erase_mask.as_mut() {
@@ -738,51 +757,53 @@ impl App {
         // 早期 return: ビットマップに 1 つも true が無く、ベクタも空ならクローン不要。
         // 4K ページでは bitmap.clone() ≈ 33MB なので、見開き左/右トグル等で空マスク
         // のまま `composite_mask` が呼ばれるケースで無駄なアロケーションを避ける。
-        if self.erase_vectors.is_empty() && !mask.iter().any(|&b| b) {
+        if self.erase_shapes.is_empty() && !mask.iter().any(|&b| b) {
             return Some(vec![false; w * h]);
         }
         let mut out = mask.clone();
-        crate::mask_db::rasterize_vectors_into(&mut out, &self.erase_vectors, w, h);
+        crate::mask_db::rasterize_shapes_into(&mut out, &self.erase_shapes, w, h);
         Some(out)
     }
 
     // ── ベクタオブジェクトのヒットテスト・ドラッグ編集 ──────────────
 
-    /// 画像座標 `pos` がいずれかのベクタに当たるかを調べる。
-    /// 返り値: `(index, Some(which_p1))` — 端点ヒット時は which_p1 が true=p1 / false=p0。
-    /// `(index, None)` は本体 (矩形内部) ヒット。ヒットなしは None。
-    fn hit_test_vector(&self, pos: (f32, f32)) -> Option<(usize, Option<bool>)> {
-        // 先に端点判定を全ベクタで行う (Diagonal のみ対象、縦横線は端点操作の意味が薄い)
-        for (i, v) in self.erase_vectors.iter().enumerate().rev() {
-            if v.kind == LineKind::Diagonal {
-                let d0 = dist_sq(pos, v.p0);
-                let d1 = dist_sq(pos, v.p1);
-                let r2 = ENDPOINT_HIT_RADIUS * ENDPOINT_HIT_RADIUS;
-                if d0 <= r2 && d0 <= d1 {
-                    return Some((i, Some(false)));
-                }
-                if d1 <= r2 {
-                    return Some((i, Some(true)));
+    /// 画像座標 `pos` から、Shape のホバーターゲットを判定する。
+    /// Phase 2b で `vector_edit` 経由に統一。`ui_conceal::hit_test_conceal` と同じロジック:
+    ///
+    /// 1. 選択中 Shape のハンドル (Body 以外) を最優先
+    /// 2. 新しい順 (添字大→小) に Body 判定
+    fn hit_test_erase(
+        &self,
+        pos: (f32, f32),
+        scale: f32,
+    ) -> Option<(usize, vector_edit::HoverTarget)> {
+        if let Some(sel) = self.erase_selected_shape {
+            if let Some(s) = self.erase_shapes.get(sel) {
+                let layout = vector_edit::compute_handle_layout(s, scale);
+                if let Some(t) = vector_edit::hit_test(&layout, pos, scale) {
+                    if !matches!(t, vector_edit::HoverTarget::Body) {
+                        return Some((sel, t));
+                    }
                 }
             }
         }
-        // 本体 (矩形) 判定。上に重なっている新しい方を優先するため逆順走査。
-        for (i, v) in self.erase_vectors.iter().enumerate().rev() {
-            let corners = v.corners(2.0); // 少し余裕を持たせる
-            if point_in_polygon(pos, &corners) {
-                return Some((i, None));
+        for (i, s) in self.erase_shapes.iter().enumerate().rev() {
+            let layout = vector_edit::compute_handle_layout(s, scale);
+            if point_in_polygon(pos, &layout.body_corners) {
+                return Some((i, vector_edit::HoverTarget::Body));
             }
         }
         None
     }
 
-    /// ベクタ編集ドラッグ状態に応じてオブジェクトを更新する。
-    fn update_vector_drag(
+    /// vector_edit ベースのドラッグ更新。`erase_drag` (Option<DragState>) と現在位置から
+    /// 新しい Shape を計算して `erase_shapes[idx]` に書き戻す。
+    fn update_erase_drag(
         &mut self,
         pointer_pos: Option<egui::Pos2>,
         full_rect: egui::Rect,
         zoom_pan: Option<(f32, egui::Vec2)>,
-        ctrl_held: bool,
+        modifiers: egui::Modifiers,
     ) {
         let Some(screen) = pointer_pos else {
             return;
@@ -790,80 +811,22 @@ impl App {
         let Some((total_scale, img_rect)) = self.erase_image_layout(full_rect, zoom_pan) else {
             return;
         };
-        // screen_to_image を範囲外でも通るように自前で計算
         let cur = (
             (screen.x - img_rect.min.x) / total_scale,
             (screen.y - img_rect.min.y) / total_scale,
         );
 
-        let Some(drag) = self.erase_vector_drag else {
+        let Some(drag) = self.erase_drag else {
             return;
         };
-
-        // Ctrl キーが途中で切り替わったらモード遷移 (Pan ⇄ ModAdjust)
-        let new_drag = match drag {
-            EraseVectorDrag::Pan {
-                index,
-                base,
-                origin,
-            } if ctrl_held => EraseVectorDrag::ModAdjust {
-                index,
-                base,
-                origin,
-            },
-            EraseVectorDrag::ModAdjust {
-                index,
-                base,
-                origin,
-            } if !ctrl_held => EraseVectorDrag::Pan {
-                index,
-                base,
-                origin,
-            },
-            _ => drag,
-        };
-        self.erase_vector_drag = Some(new_drag);
-
-        let idx = match new_drag {
-            EraseVectorDrag::Pan { index, .. }
-            | EraseVectorDrag::ModAdjust { index, .. }
-            | EraseVectorDrag::Endpoint { index, .. } => index,
-        };
-        if idx >= self.erase_vectors.len() {
+        let idx = drag.idx();
+        if idx >= self.erase_shapes.len() {
             return;
         }
-
-        match new_drag {
-            EraseVectorDrag::Pan { base, origin, .. } => {
-                let dx = cur.0 - origin.0;
-                let dy = cur.1 - origin.1;
-                let mut v = base;
-                v.translate(dx, dy);
-                self.erase_vectors[idx] = v;
-            }
-            EraseVectorDrag::ModAdjust { base, origin, .. } => {
-                let dx = cur.0 - origin.0;
-                let dy = cur.1 - origin.1;
-                // 縦方向: 回転、横方向: 太さ
-                let angle = (dy * ROTATE_DEG_PER_PIXEL).to_radians();
-                let c = base.center();
-                let mut v = base;
-                v.rotate_around(c.0, c.1, angle);
-                let max_t = self.erase_mask_size[0].max(self.erase_mask_size[1]) as f32 * 0.5;
-                v.thickness = (base.thickness + dx * 2.0).clamp(1.0, max_t);
-                self.erase_vectors[idx] = v;
-            }
-            EraseVectorDrag::Endpoint { base, which_p1, .. } => {
-                let mut v = base;
-                if which_p1 {
-                    v.p1 = cur;
-                } else {
-                    v.p0 = cur;
-                }
-                self.erase_vectors[idx] = v;
-            }
-        }
-        self.erase_mask_texture = None;
+        let new_shape = vector_edit::apply_drag(&drag, cur, &modifiers);
+        self.erase_shapes[idx] = new_shape;
+        // ドラッグ中のテクスチャ再生成は重い (4K 画像 RGBA = 32MB)。`primary_released`
+        // 後の Select tool 側でリセットする。Phase 2 Codex P2 #8 と同じ最適化。
     }
 
     /// ツールパネルの矩形を返す。
@@ -872,8 +835,9 @@ impl App {
             full_rect.min.x + PANEL_MARGIN_X,
             full_rect.min.y + PANEL_MARGIN_Y,
         );
-        // 基本高さ: ヘッダ + 描画/消去 + セパレータ + ツール 3 行 + スロット + 下部ショートカット説明 + セパレータ + マスク全削除 + ヘルプ (6行)
-        let base_h = 430.0;
+        // 基本高さ: ヘッダ + 描画/消去 + セパレータ + ツール 4 行 (Phase 0b で 8 ツール
+        // に拡張、2x4 grid) + スロット + 下部ショートカット説明 + セパレータ + マスク全削除 + ヘルプ
+        let base_h = 458.0;
         let extra = if self.erase_tool == EraseTool::Brush || self.erase_tool == EraseTool::Line {
             42.0 // サイズスライダー分
         } else {
@@ -926,7 +890,7 @@ impl App {
         let drawing_in_progress = self.erase_last_paint_pos.is_some()
             || self.erase_line_start.is_some()
             || self.erase_shift_drag.is_some()
-            || self.erase_vector_drag.is_some()
+            || self.erase_drag.is_some()
             || !self.erase_lasso_points.is_empty();
         if space_held && !drawing_in_progress {
             if primary_pressed {
@@ -960,58 +924,46 @@ impl App {
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
 
         // ── ベクタオブジェクト編集パス (選択ツール時のみ) ───────────
-        // 選択ツール中はドロー系の操作を行わず、クリック=選択/ドラッグ=編集 に徹する。
-        // 他ツールの描画中に近接したベクタを誤選択しないよう、意図的にモーダルにしている。
+        // 選択ツール中はドロー系の操作を行わず、クリック=選択/ハンドルドラッグ=編集
+        // に徹する。Phase 2b で vector_edit に統一: 角・辺中点・回転ハンドル + 端点。
+        // Shift = 軸拘束/等比/15°snap、Alt = 中心固定。
+        let modifiers = ctx.input(|i| i.modifiers);
         if self.erase_tool == EraseTool::Select {
             if primary_pressed {
-                if let Some(img_pos) =
-                    pointer_pos.and_then(|p| self.screen_to_image_f32(p, full_rect, zoom_pan))
-                {
-                    if let Some((hit_idx, hit_endpoint)) = self.hit_test_vector(img_pos) {
-                        self.push_undo_snapshot();
-                        self.erase_selected_vector = Some(hit_idx);
-                        let base = self.erase_vectors[hit_idx];
-                        self.erase_vector_drag = Some(if let Some(which_p1) = hit_endpoint {
-                            EraseVectorDrag::Endpoint {
-                                index: hit_idx,
-                                base,
-                                which_p1,
-                            }
-                        } else if ctrl_held {
-                            EraseVectorDrag::ModAdjust {
-                                index: hit_idx,
-                                base,
-                                origin: img_pos,
-                            }
-                        } else {
-                            EraseVectorDrag::Pan {
-                                index: hit_idx,
-                                base,
-                                origin: img_pos,
-                            }
-                        });
-                        self.erase_mask_texture = None;
-                    } else {
-                        // 空領域のクリック: 選択を解除
-                        if self.erase_selected_vector.is_some() {
-                            self.erase_selected_vector = None;
+                if let Some((scale, img_rect)) = self.erase_image_layout(full_rect, zoom_pan) {
+                    if let Some(screen) = pointer_pos {
+                        let img_pos = (
+                            (screen.x - img_rect.min.x) / scale,
+                            (screen.y - img_rect.min.y) / scale,
+                        );
+                        if let Some((idx, target)) = self.hit_test_erase(img_pos, scale) {
+                            self.push_undo_snapshot();
+                            self.erase_selected_shape = Some(idx);
+                            let base = self.erase_shapes[idx];
+                            self.erase_drag =
+                                Some(vector_edit::begin_drag(target, idx, base, img_pos));
+                            self.erase_mask_texture = None;
+                        } else if self.erase_selected_shape.is_some() {
+                            self.erase_selected_shape = None;
+                            self.erase_drag = None;
                             self.erase_mask_texture = None;
                         }
                     }
                 }
             }
-            if self.erase_vector_drag.is_some() {
-                self.update_vector_drag(pointer_pos, full_rect, zoom_pan, ctrl_held);
+            if self.erase_drag.is_some() {
+                self.update_erase_drag(pointer_pos, full_rect, zoom_pan, modifiers);
                 if primary_released {
-                    self.erase_vector_drag = None;
+                    self.erase_drag = None;
+                    self.erase_mask_texture = None;
                 }
             }
             return;
         }
 
         // 他ツールに切り替わったら選択を自動解除 (ドラッグ中は最後まで完走)
-        if self.erase_vector_drag.is_none() && self.erase_selected_vector.is_some() {
-            self.erase_selected_vector = None;
+        if self.erase_drag.is_none() && self.erase_selected_shape.is_some() {
+            self.erase_selected_shape = None;
             self.erase_mask_texture = None;
         }
 
@@ -1157,18 +1109,67 @@ impl App {
                         let len = (dx * dx + dy * dy).sqrt();
                         if len > 1.0 {
                             self.push_undo_snapshot();
-                            let obj = LineObject {
+                            let shape = Shape::Line {
                                 kind: LineKind::Diagonal,
                                 p0: (x0, y0),
                                 p1: (x1, y1),
                                 thickness: self.erase_line_width.max(1.0),
                             };
-                            self.commit_line_object(obj, paint);
+                            self.commit_erase_shape(shape, paint);
                             self.erase_mask_texture = None;
                         }
                     }
                     self.erase_line_start = None;
                     self.erase_line_end = None;
+                }
+            }
+            EraseTool::Rect | EraseTool::Ellipse => {
+                // 矩形 / 楕円: 始点 → 終点の bbox を Shape::Rect / Shape::Ellipse に変換。
+                // Ctrl 等の修飾はここでは使わない (作成後に Select ツールで Shift/Alt
+                // ハンドル編集する設計)。
+                if primary_down {
+                    if let Some(pos) = pointer_pos {
+                        if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
+                            if self.erase_shape_drag_start.is_none() {
+                                self.erase_shape_drag_start = Some(img_pos);
+                            }
+                            self.erase_shape_drag_end = Some(img_pos);
+                        }
+                    }
+                }
+                if primary_released {
+                    if let (Some(start), Some(end)) =
+                        (self.erase_shape_drag_start, self.erase_shape_drag_end)
+                    {
+                        let dx = end.0 - start.0;
+                        let dy = end.1 - start.1;
+                        if dx.abs() > 1.0 && dy.abs() > 1.0 {
+                            self.push_undo_snapshot();
+                            let cx = (start.0 + end.0) * 0.5;
+                            let cy = (start.1 + end.1) * 0.5;
+                            let hw = dx.abs() * 0.5;
+                            let hh = dy.abs() * 0.5;
+                            let shape = match self.erase_tool {
+                                EraseTool::Rect => Shape::Rect {
+                                    center: (cx, cy),
+                                    half_w: hw,
+                                    half_h: hh,
+                                    rotation_rad: 0.0,
+                                },
+                                EraseTool::Ellipse => Shape::Ellipse {
+                                    center: (cx, cy),
+                                    rx: hw,
+                                    ry: hh,
+                                    rotation_rad: 0.0,
+                                },
+                                _ => unreachable!(),
+                            };
+                            self.commit_erase_shape(shape, paint);
+                            self.erase_mask_texture = None;
+                        }
+                    }
+                    self.erase_shape_drag_start = None;
+                    self.erase_shape_drag_end = None;
                 }
             }
         }
@@ -1249,25 +1250,25 @@ impl App {
                     let thickness = (rx - lx).max(1.0);
                     let cx = (lx + rx) * 0.5;
                     // 中心軸: 上端 (cx+tilt, 0) → 下端 (cx, h)
-                    let obj = LineObject {
+                    let shape = Shape::Line {
                         kind: LineKind::Vertical,
                         p0: (cx + tilt, 0.0),
                         p1: (cx, h as f32),
                         thickness,
                     };
-                    self.commit_line_object(obj, paint);
+                    self.commit_erase_shape(shape, paint);
                 } else {
                     let ty = start.1.min(end.1);
                     let by = start.1.max(end.1);
                     let thickness = (by - ty).max(1.0);
                     let cy = (ty + by) * 0.5;
-                    let obj = LineObject {
+                    let shape = Shape::Line {
                         kind: LineKind::Horizontal,
                         p0: (0.0, cy),
                         p1: (w as f32, cy + tilt),
                         thickness,
                     };
-                    self.commit_line_object(obj, paint);
+                    self.commit_erase_shape(shape, paint);
                 }
                 self.erase_mask_texture = None;
             }
@@ -1278,29 +1279,27 @@ impl App {
         }
     }
 
-    /// 描画モードならベクタオブジェクトを追加、消去モードなら重なるベクタを除去＋ビットマップも消す。
-    fn commit_line_object(&mut self, obj: LineObject, paint: bool) {
+    /// 描画モードなら Shape を追加、消去モードなら重なる Shape を除去＋ビットマップも消す。
+    fn commit_erase_shape(&mut self, shape: Shape, paint: bool) {
         if paint {
-            self.erase_vectors.push(obj);
+            self.erase_shapes.push(shape);
         } else {
-            let corners = obj.corners(0.0).to_vec();
-            self.erase_vectors_overlapping_polygon(&corners);
-            self.paint_polygon(&corners, false);
+            let [w, h] = self.erase_mask_size;
+            let (cx_min, cy_min, cx_max, cy_max) = shape_bbox(&shape);
+            // 重なる shape を bbox 重なりで除去 (簡易判定)
+            self.erase_shapes.retain(|s| {
+                let (sxmin, symin, sxmax, symax) = shape_bbox(s);
+                !(sxmax < cx_min || sxmin > cx_max || symax < cy_min || symin > cy_max)
+            });
+            // ビットマップから shape 範囲を消す
+            if let Some(mask) = self.erase_mask.as_mut() {
+                crate::mask_db::rasterize_shape_into(mask, &shape, w, h, false);
+            }
         }
     }
 
-    /// 与えた多角形 (矩形想定) と重なるベクタを削除する (消去モード用)。
-    fn erase_vectors_overlapping_polygon(&mut self, poly: &[(f32, f32)]) {
-        if poly.is_empty() {
-            return;
-        }
-        let (px_min, py_min, px_max, py_max) = bounding_box(poly);
-        self.erase_vectors.retain(|v| {
-            let c = v.corners(0.0);
-            let (vxmin, vymin, vxmax, vymax) = bounding_box(&c);
-            !(vxmax < px_min || vxmin > px_max || vymax < py_min || vymin > py_max)
-        });
-    }
+    // (Phase 2b で `erase_shapes_overlapping_polygon` は削除。`commit_erase_shape` の
+    //  消去経路で直接 bbox 重なり判定を行う。)
 
     // ── 描画 ──────────────────────────────────────────────────────
 
@@ -1350,27 +1349,23 @@ impl App {
         full_rect: egui::Rect,
         zoom_pan: Option<(f32, egui::Vec2)>,
     ) {
-        // 選択中のベクタに黄色のアウトラインを重ねる
-        if let Some(idx) = self.erase_selected_vector {
-            if let Some(v) = self.erase_vectors.get(idx) {
-                let pts_img = v.corners(0.0);
-                let pts_screen: Vec<egui::Pos2> = pts_img
-                    .iter()
-                    .map(|&(x, y)| self.image_to_screen(x, y, full_rect, zoom_pan))
-                    .collect();
-                let sel_stroke = egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 220, 60));
-                for i in 0..pts_screen.len() {
-                    let a = pts_screen[i];
-                    let b = pts_screen[(i + 1) % pts_screen.len()];
-                    ui.painter().line_segment([a, b], sel_stroke);
-                }
-                // 直線は端点にハンドルを描く
-                if v.kind == LineKind::Diagonal {
-                    let handle = egui::Color32::from_rgb(255, 220, 60);
-                    let p0s = self.image_to_screen(v.p0.0, v.p0.1, full_rect, zoom_pan);
-                    let p1s = self.image_to_screen(v.p1.0, v.p1.1, full_rect, zoom_pan);
-                    ui.painter().circle_filled(p0s, 4.0, handle);
-                    ui.painter().circle_filled(p1s, 4.0, handle);
+        // 選択中の Shape のハンドル (Phase 2b: vector_edit::draw_handles に委譲)
+        if let Some(idx) = self.erase_selected_shape {
+            if let Some(shape) = self.erase_shapes.get(idx) {
+                if let Some((scale, _img_rect)) = self.erase_image_layout(full_rect, zoom_pan) {
+                    let layout = vector_edit::compute_handle_layout(shape, scale);
+                    let painter = ui.painter().with_clip_rect(full_rect);
+                    let hovered = ui.ctx().input(|i| i.pointer.hover_pos()).and_then(|p| {
+                        let img_rect = self.erase_image_layout(full_rect, zoom_pan)?.1;
+                        let img_pos = (
+                            (p.x - img_rect.min.x) / scale,
+                            (p.y - img_rect.min.y) / scale,
+                        );
+                        vector_edit::hit_test(&layout, img_pos, scale)
+                    });
+                    let to_screen =
+                        |p: (f32, f32)| self.image_to_screen(p.0, p.1, full_rect, zoom_pan);
+                    vector_edit::draw_handles(&painter, &layout, true, hovered, &to_screen);
                 }
             }
         }
@@ -1463,6 +1458,42 @@ impl App {
                         let p1 = self.image_to_screen(x1, y1, full_rect, zoom_pan);
                         ui.painter()
                             .line_segment([p0, p1], egui::Stroke::new(1.0, stroke_color));
+                    }
+                }
+            }
+            EraseTool::Rect | EraseTool::Ellipse => {
+                if let (Some(start), Some(end)) =
+                    (self.erase_shape_drag_start, self.erase_shape_drag_end)
+                {
+                    let s0 = self.image_to_screen(start.0, start.1, full_rect, zoom_pan);
+                    let s1 = self.image_to_screen(end.0, end.1, full_rect, zoom_pan);
+                    let rect = egui::Rect::from_two_pos(s0, s1);
+                    match self.erase_tool {
+                        EraseTool::Rect => {
+                            ui.painter().rect_stroke(
+                                rect,
+                                0.0,
+                                egui::Stroke::new(2.0, stroke_color),
+                                egui::StrokeKind::Inside,
+                            );
+                        }
+                        EraseTool::Ellipse => {
+                            // 楕円: 36 角形近似で描画
+                            let center = rect.center();
+                            let r = egui::vec2(rect.width() * 0.5, rect.height() * 0.5);
+                            const N: usize = 36;
+                            let mut pts = Vec::with_capacity(N + 1);
+                            for i in 0..=N {
+                                let theta = i as f32 * std::f32::consts::TAU / N as f32;
+                                pts.push(egui::pos2(
+                                    center.x + r.x * theta.cos(),
+                                    center.y + r.y * theta.sin(),
+                                ));
+                            }
+                            ui.painter()
+                                .add(egui::Shape::line(pts, egui::Stroke::new(2.0, stroke_color)));
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1701,14 +1732,16 @@ impl App {
                 );
                 y += 8.0;
 
-                // ── ツール選択 ──
+                // ── ツール選択 (Phase 0b で 8 ツールに拡張) ──
                 let tools = [
                     ("選択 [S]", EraseTool::Select),
                     ("筆 [B]", EraseTool::Brush),
                     ("囲み [L]", EraseTool::Lasso),
+                    ("直線 [I]", EraseTool::Line),
                     ("縦線 [V]", EraseTool::VertLine),
                     ("横線 [H]", EraseTool::HorizLine),
-                    ("直線 [I]", EraseTool::Line),
+                    ("矩形 [R]", EraseTool::Rect),
+                    ("楕円 [O]", EraseTool::Ellipse),
                 ];
                 let tool_w = (pw - 8.0) / 2.0;
                 let mut rows_used = 0usize;
@@ -1885,9 +1918,9 @@ impl App {
                     let [w, h] = self.erase_mask_size;
                     self.push_undo_snapshot();
                     self.erase_mask = Some(vec![false; w * h]);
-                    self.erase_vectors.clear();
-                    self.erase_selected_vector = None;
-                    self.erase_vector_drag = None;
+                    self.erase_shapes.clear();
+                    self.erase_selected_shape = None;
+                    self.erase_drag = None;
                     self.erase_mask_texture = None;
                     // 編集中の一時状態も破棄しないと、ドラッグ途中に全削除を押したあと
                     // 次の release/click で描きかけの囲み・直線・シフト分だけの差分が
@@ -1966,7 +1999,7 @@ impl App {
         };
         let [w, h] = self.erase_mask_size;
         // ビットマップとベクタを別々に永続化することで、再編集時に両者を分離して読み直せる。
-        let vectors_snapshot = self.erase_vectors.clone();
+        let vectors_snapshot = self.erase_shapes.clone();
         self.save_mask_with_sidecar(fs_idx, &bitmap, &vectors_snapshot, w, h);
         let masked_count = composite.iter().filter(|&&m| m).count();
         crate::logger::log(format!(
@@ -2006,12 +2039,12 @@ impl App {
         };
         let [w, h] = pixels.size;
 
-        let (bitmap, vectors) = match self.mask_db.as_ref().and_then(|db| db.get_full(&key, w, h)) {
+        let (bitmap, shapes) = match self.mask_db.as_ref().and_then(|db| db.get_full(&key, w, h)) {
             Some(m) => m,
             None => return,
         };
         let mut composite = bitmap.clone();
-        crate::mask_db::rasterize_vectors_into(&mut composite, &vectors, w, h);
+        crate::mask_db::rasterize_shapes_into(&mut composite, &shapes, w, h);
         if !composite.iter().any(|&m| m) {
             return;
         }
@@ -2078,7 +2111,7 @@ impl App {
         let original = Arc::clone(self.erase_base_cache.get(&fs_idx).unwrap());
 
         let mut composite = new_mask.clone();
-        crate::mask_db::rasterize_vectors_into(&mut composite, &new_vectors, w, h);
+        crate::mask_db::rasterize_shapes_into(&mut composite, &new_vectors, w, h);
         if !composite.iter().any(|&m| m) {
             return;
         }
@@ -2752,10 +2785,41 @@ pub(crate) fn rotate_bitmap(mask: &mut [bool], w: usize, h: usize, cx: f32, cy: 
     }
 }
 
-pub(crate) fn dist_sq(a: (f32, f32), b: (f32, f32)) -> f32 {
-    let dx = a.0 - b.0;
-    let dy = a.1 - b.1;
-    dx * dx + dy * dy
+// (Phase 2b で `dist_sq` は削除。距離判定は `vector_edit::hit_test` 内部で行う。)
+
+/// Shape の AABB (回転後の 4 隅から取る)。
+pub(crate) fn shape_bbox(shape: &Shape) -> (f32, f32, f32, f32) {
+    let corners = match shape {
+        Shape::Line {
+            p0, p1, thickness, ..
+        } => {
+            let dx = p1.0 - p0.0;
+            let dy = p1.1 - p0.1;
+            let len = (dx * dx + dy * dy).sqrt().max(1e-6);
+            let nx = -dy / len;
+            let ny = dx / len;
+            let half = (thickness * 0.5).max(0.0);
+            [
+                (p0.0 + nx * half, p0.1 + ny * half),
+                (p1.0 + nx * half, p1.1 + ny * half),
+                (p1.0 - nx * half, p1.1 - ny * half),
+                (p0.0 - nx * half, p0.1 - ny * half),
+            ]
+        }
+        Shape::Rect {
+            center,
+            half_w,
+            half_h,
+            rotation_rad,
+        }
+        | Shape::Ellipse {
+            center,
+            rx: half_w,
+            ry: half_h,
+            rotation_rad,
+        } => crate::mask_db::rect_corners(*center, *half_w, *half_h, *rotation_rad),
+    };
+    bounding_box(&corners)
 }
 
 pub(crate) fn bounding_box(pts: &[(f32, f32)]) -> (f32, f32, f32, f32) {

@@ -616,15 +616,18 @@ impl MaskDb {
         self.get_full(key, expected_w, expected_h).map(|(m, _)| m)
     }
 
-    /// マスクとベクタ群をまとめて取得する。
+    /// マスクとベクタ群をまとめて取得する (`Vec<Shape>` 形式)。
     /// 画像サイズが保存時と異なる場合 (PDF 再レンダリング等) はビットマップをリスケールし、
-    /// ベクタ座標も比率で伸縮する。
+    /// ベクタ座標も比率で伸縮する (`Shape::scale_xy` 経由)。
+    ///
+    /// JSON 互換性: 旧版が保存した `Vec<LineObject>` JSON も `shapes_from_json` で
+    /// `Vec<Shape::Line>` として読める。新版は常にタグ付き `Vec<Shape>` を書き戻す。
     pub fn get_full(
         &self,
         key: &str,
         expected_w: usize,
         expected_h: usize,
-    ) -> Option<(Vec<bool>, Vec<LineObject>)> {
+    ) -> Option<(Vec<bool>, Vec<Shape>)> {
         let mut stmt = self
             .conn
             .prepare_cached("SELECT mask_data, width, height, vectors FROM masks WHERE path = ?1")
@@ -641,25 +644,20 @@ impl MaskDb {
             .ok()?;
 
         let mut mask = decompress_mask(&blob, w, h)?;
-        let mut vectors = vectors_json
+        let mut shapes = vectors_json
             .as_deref()
-            .map(vectors_from_json)
+            .map(shapes_from_json)
             .unwrap_or_default();
 
         if w != expected_w || h != expected_h {
             mask = rescale_mask(&mask, w, h, expected_w, expected_h);
             let sx = expected_w as f32 / w.max(1) as f32;
             let sy = expected_h as f32 / h.max(1) as f32;
-            for v in &mut vectors {
-                v.p0.0 *= sx;
-                v.p0.1 *= sy;
-                v.p1.0 *= sx;
-                v.p1.1 *= sy;
-                // 幅は縦横スケールの平均で伸縮
-                v.thickness *= (sx + sy) * 0.5;
+            for s in &mut shapes {
+                s.scale_xy(sx, sy);
             }
         }
-        Some((mask, vectors))
+        Some((mask, shapes))
     }
 
     /// マスク＋ベクタを保存する。ビットマップが全 false でベクタも空なら削除する。
@@ -667,15 +665,15 @@ impl MaskDb {
         &self,
         key: &str,
         mask: &[bool],
-        vectors: &[LineObject],
+        shapes: &[Shape],
         w: usize,
         h: usize,
     ) -> rusqlite::Result<()> {
         let bitmap_empty = !mask.iter().any(|&m| m);
-        if bitmap_empty && vectors.is_empty() {
+        if bitmap_empty && shapes.is_empty() {
             return self.delete(key);
         }
-        self.upsert_mask(key, mask, vectors, w, h)
+        self.upsert_mask(key, mask, shapes, w, h)
     }
 
     /// マスクを削除する。
@@ -690,11 +688,11 @@ impl MaskDb {
         &self,
         slot: usize,
         mask: &[bool],
-        vectors: &[LineObject],
+        shapes: &[Shape],
         w: usize,
         h: usize,
     ) -> rusqlite::Result<()> {
-        self.upsert_mask(&slot_key(slot), mask, vectors, w, h)
+        self.upsert_mask(&slot_key(slot), mask, shapes, w, h)
     }
 
     /// 既に 1bit/pixel + deflate 圧縮済みの生バイト列を直接保存する。
@@ -727,7 +725,7 @@ impl MaskDb {
         slot: usize,
         expected_w: usize,
         expected_h: usize,
-    ) -> Option<(Vec<bool>, Vec<LineObject>)> {
+    ) -> Option<(Vec<bool>, Vec<Shape>)> {
         self.get_full(&slot_key(slot), expected_w, expected_h)
     }
 
@@ -776,17 +774,17 @@ impl MaskDb {
         &self,
         key: &str,
         mask: &[bool],
-        vectors: &[LineObject],
+        shapes: &[Shape],
         w: usize,
         h: usize,
     ) -> rusqlite::Result<()> {
         let blob = compress_mask(mask);
-        let vectors_json = vectors_to_json(vectors);
+        let shapes_json = shapes_to_json(shapes);
         self.conn.execute(
             "INSERT INTO masks (path, mask_data, width, height, vectors)
              VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(path) DO UPDATE SET mask_data = ?2, width = ?3, height = ?4, vectors = ?5",
-            rusqlite::params![key, blob, w as i64, h as i64, vectors_json],
+            rusqlite::params![key, blob, w as i64, h as i64, shapes_json],
         )?;
         Ok(())
     }
