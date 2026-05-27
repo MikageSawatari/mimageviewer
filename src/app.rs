@@ -16011,6 +16011,10 @@ impl App {
             // AI 結果が conceal の入力レイヤになるので、stale を残すと低解像度ベースの
             // 隠蔽が固定表示されてしまう。
             self.clear_conceal_caches(idx);
+            // 消しゴム編集中の表示テクスチャも invalidate して、`ensure_erase_base_texture`
+            // が次フレームで新しい ai_upscale_cache を取り直すようにする
+            // (= AI 完了が編集中に起こった場合、解像度が低い状態に張り付くのを防ぐ)。
+            self.erase_base_tex_cache.remove(&idx);
             if self.fullscreen_idx == Some(idx) && self.effective_upscale_bg_mode() == bg {
                 self.apply_sync_adjustment(ctx, idx, &pixels);
             }
@@ -16640,19 +16644,28 @@ impl App {
         self.conceal_cache.remove(&idx);
     }
 
-    /// 消しゴム編集中の表示用テクスチャを返す (= `erase_base_cache` に画像補正を適用した版)。
+    /// 消しゴム編集中の表示用テクスチャを返す。
     ///
-    /// パイプライン上は **画像補正 → 消しゴム → 隠蔽** の順なので、消しゴム編集中の
-    /// base には「画像補正が掛かった raw 画像」を表示するのが正しい。
-    /// `erase_base_cache` は inpaint 前の素画像 (= `Arc<ColorImage>`) を保持しているので、
-    /// それに `effective_params(idx)` の色補正を `apply_adjustments_fast` で適用してから
-    /// テクスチャ化する。post_filter は erase_mode 中はバイパスされる仕様
-    /// (`enter_erase_mode` で `post_filter_bypassed = true`) なのでここでも飛ばす。
+    /// **表示 source の優先順位** (2026-05 ユーザー報告対応):
+    /// 1. `ai_upscale_cache[(idx, bg)]` (= AI アップスケール後の高解像度 pixels)
+    /// 2. `erase_base_cache[idx]` (= MI-GAN inpaint 入力用の素画像、通常 raw)
     ///
-    /// 出来上がったテクスチャは `erase_base_tex_cache` に idx 単位でキャッシュし、毎フレーム
-    /// 補正計算 + GPU アップロード (4K で 30-50ms) が走るのを防ぐ。色補正パラメータが変わった
-    /// ときの invalidate は `clear_adjustment_caches` 経由で行われる
-    /// (= 既存の `bump_adjustment_generation` + `erase_base_tex_cache.remove(idx)` を hook 済)。
+    /// パイプライン上は **画像補正 → 消しゴム → 隠蔽** の順なので、消しゴム編集中も
+    /// 「画像補正 + AI アップスケール後」の高解像度状態を base として見せるのが正しい。
+    ///
+    /// 旧版 (Phase 4) は `erase_base_cache` を直接使っていたが、`auto_apply_saved_mask`
+    /// 経由で populate されると raw fs_cache が入る → 通常表示も raw 解像度に化ける問題が
+    /// あった。`erase_base_cache` 自体は MI-GAN inpaint の入力として一貫した resolution
+    /// (= raw) を保持する必要があるので壊さず、表示 source だけ AI upscale 結果を優先する
+    /// 形に分離した。
+    ///
+    /// 取得した source pixels に `effective_params(idx)` の色補正を
+    /// `apply_adjustments_fast` で適用してからテクスチャ化。post_filter は erase_mode 中
+    /// バイパス (`enter_erase_mode` で `post_filter_bypassed = true`) なのでここでも飛ばす。
+    ///
+    /// 出来上がったテクスチャは `erase_base_tex_cache` に idx 単位でキャッシュ。
+    /// 色補正変更時 (`clear_adjustment_caches`) と AI 完了時 (`apply_ai_upscale_result`
+    /// 経由) に invalidate される。
     pub(crate) fn ensure_erase_base_texture(
         &mut self,
         ctx: &egui::Context,
@@ -16661,14 +16674,23 @@ impl App {
         if let Some(tex) = self.erase_base_tex_cache.get(&idx) {
             return Some(tex.clone());
         }
-        let base = self.erase_base_cache.get(&idx)?.clone();
+        // AI upscale 結果を優先取得 (= 高解像度)。なければ erase_base_cache (= raw 等)。
+        let bg = self.effective_upscale_bg_mode();
+        let ai_pixels = self.ai_upscale_cache.get(&(idx, bg)).and_then(|e| match e {
+            FsCacheEntry::Static { pixels, .. } => Some(Arc::clone(pixels)),
+            _ => None,
+        });
+        let source_pixels = match ai_pixels {
+            Some(p) => p,
+            None => self.erase_base_cache.get(&idx)?.clone(),
+        };
         let params = self.effective_params(idx).clone();
-        // 色補正が identity (= 何も変えない) なら base をそのままテクスチャ化。
+        // 色補正が identity (= 何も変えない) なら source をそのままテクスチャ化。
         // post_filter は erase_mode 中バイパスなのでチェック不要。
         let adjusted: egui::ColorImage = if params.is_color_identity() {
-            (*base).clone()
+            (*source_pixels).clone()
         } else {
-            crate::adjustment::apply_adjustments_fast(&base, &params)
+            crate::adjustment::apply_adjustments_fast(&source_pixels, &params)
         };
         let tex = ctx.load_texture(
             format!("erase_base_display_{idx}"),
