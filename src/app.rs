@@ -1234,6 +1234,18 @@ pub(crate) struct ConcealCacheEntry {
     pub generation: u64,
 }
 
+/// 消しゴムプレビュー (= preview ボタン押下時の MI-GAN 結果) を保持する一時キャッシュ。
+///
+/// `fs_cache` を書き換えない隔離設計 (Codex P1 R4 #1)。プレビュー中だけ表示
+/// パイプラインで参照され、`reset_erase_mode` / マスク変更 / 全削除で破棄される。
+pub(crate) struct ErasePreviewCacheEntry {
+    /// preview MI-GAN 出力 (生 RGBA)。デバッグ / 将来の export 連携用に保持。
+    #[allow(dead_code)]
+    pub pixels: Arc<egui::ColorImage>,
+    /// GPU アップロード済みハンドル。display pipeline はこれを直接使う。
+    pub texture: egui::TextureHandle,
+}
+
 /// 見開きから消しゴムに入ったときのコンテキスト。Apply / Cancel で
 /// 元の見開き状態 (= `saved_mode` の spread_mode + `pair.0` を中心ページとした
 /// 見開き表示) を復元するために保存する。
@@ -2919,6 +2931,23 @@ pub struct App {
     /// UI スレッドが MI-GAN 推論 (300-500ms) で固まらないようにするための非同期化エントリ。
     pub(crate) erase_inpaint_pending:
         std::collections::HashMap<usize, crate::ui_erase::EraseInpaintPending>,
+    /// プレビュー専用の inpaint 結果キャッシュ (Codex P1 R4 #1)。
+    ///
+    /// 「preview ボタン押下 → 一時 MI-GAN 投入 → 結果を画面で確認」用の
+    /// 隔離キャッシュ。`fs_cache` を書き換えないことで:
+    /// - ESC / マスク全削除 / mask 変更 で preview 結果が残らない (= preview
+    ///   非破壊)
+    /// - AI 無効化トグル等で fs_cache 経路が綺麗に元へ戻る
+    /// - 連続 preview 押下で MI-GAN 入力 (erase_base_cache) は同じなので、
+    ///   先に走った job の結果をそのまま再利用できる (= 1 ストロークごとに
+    ///   AI を起動し直さない)
+    ///
+    /// invalidate ポイント:
+    /// - `commit_erase_shape` / `paint_brush_line_erase` 等の mask 変更
+    /// - `reset_erase_mode` / マスク全削除 (= 編集が確定 or 破棄された)
+    /// - `enter_erase_mode` (= 新ページに入った)
+    pub(crate) erase_preview_cache:
+        std::collections::HashMap<usize, crate::app::ErasePreviewCacheEntry>,
     /// 見開きから消しゴムに入ったときの状態スナップショット。`Some` の間は終了時に
     /// `spread_mode` を `saved_mode` へ戻し、`fullscreen_idx` を `pair.0` (左ページ) に
     /// 揃えて見開きを復元する。Single から入った場合・見開き中でも片側だけのページ
@@ -3934,6 +3963,7 @@ impl App {
             erase_shape_drag_start: None,
             erase_shape_drag_end: None,
             erase_inpaint_pending: std::collections::HashMap::new(),
+            erase_preview_cache: std::collections::HashMap::new(),
             erase_spread_ctx: None,
             // ── 隠蔽加工 (Conceal、Phase 1 default) ────────────
             // conceal_db は App::new の冒頭で open している。Default 経路では None

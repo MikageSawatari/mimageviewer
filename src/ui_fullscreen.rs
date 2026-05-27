@@ -2428,8 +2428,20 @@ impl App {
                 None
             };
             if self.erase_mode && self.erase_preview_active {
-                // プレビュー: fs_cache (= MI-GAN 結果) を優先
-                adj_tex.or(ai_tex).or(fs_cache_tex).or(fallback_tex)
+                // プレビュー: `erase_preview_cache` (= 隔離した preview MI-GAN 結果、
+                // Codex P1 R4 #1 対応) を最優先。これにより:
+                // - preview 結果が fs_cache に焼き込まれない (= ESC で破棄可能)
+                // - 連続 preview 押下で同じ source なら結果再利用 (= AI 起動不要)
+                // 未完了 / preview_cache 不在の場合は fallback (= base + adj) を見せる。
+                let preview_tex = self
+                    .erase_preview_cache
+                    .get(&fs_idx)
+                    .map(|e| e.texture.clone());
+                preview_tex
+                    .or(adj_tex)
+                    .or(ai_tex)
+                    .or(fs_cache_tex)
+                    .or(fallback_tex)
             } else {
                 // 通常: adj > ai > fs_cache の順 (fallback は preview 用なので使われない)
                 adj_tex.or(ai_tex).or(fs_cache_tex)

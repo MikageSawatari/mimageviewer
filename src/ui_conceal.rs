@@ -1055,14 +1055,15 @@ impl App {
         let Some(target) = vector_edit::hit_test(&layout, img_pos, scale) else {
             return false;
         };
-        // 選択中 shape の **Body** クリックは Pan ドラッグ (= 平行移動) として
-        // 消費する (実機 FB R4: 「作成した矩形などの内部領域はドラッグ判定にしたい」)。
-        // Pan は `begin_drag(Body, ...)` が `DragState::Pan` を返すので
-        // そのまま vector_edit に乗せる。
+        // 選択中 shape の **Body** クリックは描画モード時のみ Pan ドラッグとして
+        // 消費する。**消去モード (F)** では fallthrough して新規消去 shape の
+        // 作成へ流す (Codex P2 R4 #2、消しゴム側と同じ条件)。
         //
         // ⚠ 非選択 shape の Body クリックはここに来ない (= layout は選択中 shape
-        // 限定で計算しているため)。よって他の shape に重ねて新規 shape を作る
-        // 動作 (= ツール継続の通常パス) は壊れない。
+        // 限定で計算しているため)。
+        if matches!(target, vector_edit::HoverTarget::Body) && !self.conceal_paint_mode {
+            return false;
+        }
         self.push_conceal_undo();
         self.conceal_drag = Some(vector_edit::begin_drag(target, sel, shape, img_pos));
         self.conceal_mask_texture = None;

@@ -47,6 +47,15 @@ pub(crate) struct EraseInpaintPending {
     pub started_at: std::time::Instant,
     /// 呼び出し経路識別子 (ログ用)。
     pub log_prefix: &'static str,
+    /// プレビュー専用ジョブか (= preview ボタン押下による起動)。
+    ///
+    /// `true` のとき完了時の `apply_inpaint_result` は **fs_cache を触らず**、
+    /// `erase_preview_cache` だけを更新する (Codex P1 R4 #1)。
+    /// プレビューは「現在のマスクで MI-GAN を試した一時結果」なので、ESC で
+    /// 抜けた / マスクを変更した / マスクを全削除した時に preview_cache を
+    /// 捨てれば残らない設計にする。`false` のときは従来通り fs_cache 上書き
+    /// + `invalidate_derived_fs_caches` で commit 経路として動作。
+    pub is_preview: bool,
 }
 
 // (Phase 2b で削除: ENDPOINT_HIT_RADIUS / ROTATE_DEG_PER_PIXEL は vector_edit::
@@ -135,6 +144,9 @@ impl App {
         // 通常表示と消しゴムは UI / Ctrl+Z の文脈が異なるので、メタ Undo スタックを破棄。
         // 消しゴム中は erase_undo_stack が Ctrl+Z を担当する。
         self.clear_meta_undo();
+        // 新ページに入ったら preview cache を完全リセット (= 他ページの残骸を
+        // 持ち込まない、Codex P1 R4 #1)。
+        self.clear_erase_preview(fs_idx);
         // post-filter (CRT / 減色など) を編集中だけ一時バイパス。マスクは元画像ベースで
         // 塗るため、減色プリセットのドット表示が混ざると精密な境界操作が難しくなる。
         if !self.post_filter_bypassed {
@@ -218,6 +230,24 @@ impl App {
         self.erase_preview_active = false;
         self.erase_base_tex_cache.clear();
         self.erase_undo_stack.clear();
+        // **Preview cache を破棄** (Codex P1 R4 #1)。preview 完了が遅延して届く
+        // ケースで `fs_cache` を汚染しないよう、pending preview job も cancel する。
+        if let Some(idx) = restore_idx {
+            self.clear_erase_preview(idx);
+        }
+        // モード退出時の念入りクリア (= 複数 idx 編集していたケース対応)。
+        self.erase_preview_cache.clear();
+        // is_preview=true の pending を全部 cancel (= 退出後に結果を届けない)。
+        let preview_idxs: Vec<usize> = self
+            .erase_inpaint_pending
+            .iter()
+            .filter_map(|(k, p)| if p.is_preview { Some(*k) } else { None })
+            .collect();
+        for k in preview_idxs {
+            if let Some(prev) = self.erase_inpaint_pending.remove(&k) {
+                prev.cancel.store(true, Ordering::Relaxed);
+            }
+        }
         self.erase_last_undo_at = None;
         self.erase_shapes.clear();
         self.erase_selected_shape = None;
@@ -595,6 +625,10 @@ impl App {
             }
         }
         self.erase_mask_texture = None;
+        // mask 変化 → preview cache 破棄。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_erase_preview(fs_idx);
+        }
     }
 
     /// マスクを回転する。選択中ベクタがあればそれだけ、無ければ全体を画像中心周りに回転する。
@@ -618,6 +652,10 @@ impl App {
             }
         }
         self.erase_mask_texture = None;
+        // mask 変化 → preview cache 破棄。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_erase_preview(fs_idx);
+        }
     }
 
     // ── 座標変換 ──────────────────────────────────────────────────
@@ -719,6 +757,10 @@ impl App {
             }
         }
         self.erase_mask_texture = None;
+        // mask 変化 → preview cache を破棄。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_erase_preview(fs_idx);
+        }
     }
 
     /// 多角形の内部をビットマップに塗る/消す。`mask_db::scanline_fill_polygon` の薄いラッパ。
@@ -729,6 +771,10 @@ impl App {
         };
         crate::mask_db::scanline_fill_polygon(mask, points, w, h, paint);
         self.erase_mask_texture = None;
+        // mask 変化 → preview cache を破棄。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_erase_preview(fs_idx);
+        }
     }
 
     // ── マスクテクスチャ ──────────────────────────────────────────
@@ -887,13 +933,16 @@ impl App {
         let Some(target) = vector_edit::hit_test(&layout, img_pos, scale) else {
             return false;
         };
-        // 選択中 shape の **Body** クリックは Pan ドラッグ (= 平行移動) として
-        // 消費する (実機 FB R4)。`begin_drag(Body, ...)` が `DragState::Pan` を
-        // 返すのでそのまま vector_edit に乗せる。
+        // 選択中 shape の **Body** クリックは描画モード時のみ Pan ドラッグとして
+        // 消費する。**消去モード (F)** では fallthrough して、同じ領域に重ねて
+        // 消去 shape を作る動作を許可する (Codex P2 R4 #2: 「描画モードで選択 →
+        // F で消去 → 領域内をクリック」が「移動」になってしまう問題)。
         //
-        // 非選択 shape の Body クリックはここに来ない (= layout は選択中 shape
-        // 限定で計算しているため) ので、他の shape に重ねて新規 shape を作る
-        // 動作 (= ツール継続の通常パス) は壊れない。
+        // 非選択 shape の Body クリックはそもそもここに来ない (= layout は
+        // 選択中 shape 限定で計算しているため)。
+        if matches!(target, vector_edit::HoverTarget::Body) && !self.erase_paint_mode {
+            return false;
+        }
         self.push_undo_snapshot();
         self.erase_drag = Some(vector_edit::begin_drag(target, sel, shape, img_pos));
         self.erase_mask_texture = None;
@@ -1403,6 +1452,10 @@ impl App {
 
     /// 描画モードなら Shape を追加、消去モードなら重なる Shape を除去＋ビットマップも消す。
     fn commit_erase_shape(&mut self, shape: Shape, paint: bool) {
+        // マスクが変わるので preview cache を破棄 (= 次回 preview 押下で再投入)。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_erase_preview(fs_idx);
+        }
         if paint {
             self.erase_shapes.push(shape);
             // 新規 shape を自動選択 (実機 FB)。コミット直後にハンドルが描画され、
@@ -2099,6 +2152,9 @@ impl App {
             self.erase_shape_drag_start = None;
             self.erase_shape_drag_end = None;
             if let Some(fs_idx) = self.fullscreen_idx {
+                // Preview cache を完全破棄 (Codex P1 R4 #1: 全削除後に preview が
+                // 残らないことを保証する)。
+                self.clear_erase_preview(fs_idx);
                 // DB + サイドカーからも削除
                 self.delete_mask_with_sidecar(fs_idx);
                 // 表示を元画像に戻す
@@ -2176,8 +2232,28 @@ impl App {
         crate::logger::log(format!(
             "erase: inpaint start, masked pixels={masked_count}"
         ));
-        self.run_inpaint_and_cache(ctx, fs_idx, original, composite, w, h, "exec");
+        self.run_inpaint_and_cache(ctx, fs_idx, original, composite, w, h, "exec", false);
         true
+    }
+
+    /// 指定 idx の preview MI-GAN 状態を破棄する。
+    ///
+    /// - 進行中の preview ジョブがあれば cancel
+    /// - `erase_preview_cache[idx]` を削除
+    ///
+    /// 呼び出し箇所: mask 変更 (shape commit / brush / lasso) / 全削除 /
+    /// `reset_erase_mode`。commit 経路の MI-GAN ジョブ (= is_preview=false) は
+    /// 触らない (= 別の処理として独立)。
+    pub(crate) fn clear_erase_preview(&mut self, idx: usize) {
+        // pending: is_preview=true のときだけ cancel + remove
+        let cancel_preview =
+            matches!(self.erase_inpaint_pending.get(&idx), Some(p) if p.is_preview);
+        if cancel_preview {
+            if let Some(prev) = self.erase_inpaint_pending.remove(&idx) {
+                prev.cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        self.erase_preview_cache.remove(&idx);
     }
 
     /// **保存なし** で MI-GAN inpaint を投入する (プレビュー press 用)。
@@ -2199,7 +2275,8 @@ impl App {
             return false;
         };
         let [w, h] = self.erase_mask_size;
-        self.run_inpaint_and_cache(ctx, fs_idx, original, composite, w, h, "preview");
+        // is_preview = true: 完了時 fs_cache を書き換えず preview_cache に流す。
+        self.run_inpaint_and_cache(ctx, fs_idx, original, composite, w, h, "preview", true);
         true
     }
 
@@ -2255,7 +2332,7 @@ impl App {
             self.erase_base_cache.insert(idx, Arc::clone(&pixels));
         }
 
-        self.run_inpaint_and_cache(ctx, idx, pixels, composite, w, h, "auto-apply");
+        self.run_inpaint_and_cache(ctx, idx, pixels, composite, w, h, "auto-apply", false);
     }
 
     /// フルスクリーン表示中 (消しゴムモード外) で F7/F8 から呼ばれる。
@@ -2316,7 +2393,16 @@ impl App {
             "erase: apply_slot_in_viewing_mode slot={slot} idx={fs_idx}"
         ));
 
-        self.run_inpaint_and_cache(ctx, fs_idx, original, composite, w, h, "viewing-mode");
+        self.run_inpaint_and_cache(
+            ctx,
+            fs_idx,
+            original,
+            composite,
+            w,
+            h,
+            "viewing-mode",
+            false,
+        );
         self.show_feedback_toast(format!("[スロット{slot}適用]"));
     }
 
@@ -2324,6 +2410,8 @@ impl App {
     /// `App.erase_inpaint_pending` 経由で UI スレッドに届く。完了反映は `poll_erase_inpaint`。
     /// E キーの確定・保存済みマスクの自動適用・F7/F8 の 3 つから呼ばれる。
     /// `log_prefix` はログ行を区別するための識別子。
+    /// `is_preview = true` のときは preview 専用ジョブとして登録される
+    /// (= 完了時 fs_cache を書き換えず preview_cache を更新、Codex P1 R4 #1)。
     fn run_inpaint_and_cache(
         &mut self,
         ctx: &egui::Context,
@@ -2333,6 +2421,7 @@ impl App {
         w: usize,
         h: usize,
         log_prefix: &'static str,
+        is_preview: bool,
     ) {
         self.ensure_ai_runtime();
         let runtime = self.ai_runtime.clone();
@@ -2383,6 +2472,7 @@ impl App {
                 cancel,
                 started_at: std::time::Instant::now(),
                 log_prefix,
+                is_preview,
             },
         );
     }
@@ -2436,26 +2526,50 @@ impl App {
         // 100MB 級 memcpy (4K 画像 RGBA) を回避する。
         let pixels = Arc::new(result);
         let tex = ctx.load_texture(
-            format!("fs_inpainted_{idx}"),
+            if pending.is_preview {
+                format!("fs_preview_inpaint_{idx}")
+            } else {
+                format!("fs_inpainted_{idx}")
+            },
             egui::ImageData::Color(Arc::clone(&pixels)),
             egui::TextureOptions::LINEAR,
         );
-        let prev_source_dims = self.fs_cache_source_dims(idx);
-        self.fs_cache.insert(
-            idx,
-            FsCacheEntry::Static {
-                tex,
-                pixels,
-                source_dims: prev_source_dims,
-                load_seq: self.input_seq,
-            },
-        );
-        self.invalidate_derived_fs_caches(idx);
-        crate::logger::log(format!(
-            "erase: inpaint complete ({} ms, prefix={})",
-            elapsed.as_millis(),
-            pending.log_prefix
-        ));
+        if pending.is_preview {
+            // **Preview 経路**: fs_cache を一切触らず、preview_cache だけを更新する
+            // (Codex P1 R4 #1)。ESC / 全削除 / mask 変更で preview_cache を捨てれば
+            // commit せずに元の状態へ戻れる。
+            self.erase_preview_cache.insert(
+                idx,
+                crate::app::ErasePreviewCacheEntry {
+                    pixels,
+                    texture: tex,
+                },
+            );
+            crate::logger::log(format!(
+                "erase: preview inpaint complete ({} ms, prefix={})",
+                elapsed.as_millis(),
+                pending.log_prefix
+            ));
+        } else {
+            // **Commit 経路**: fs_cache を新 inpaint 結果で上書き + 派生 cache を
+            // invalidate。従来通り。
+            let prev_source_dims = self.fs_cache_source_dims(idx);
+            self.fs_cache.insert(
+                idx,
+                FsCacheEntry::Static {
+                    tex,
+                    pixels,
+                    source_dims: prev_source_dims,
+                    load_seq: self.input_seq,
+                },
+            );
+            self.invalidate_derived_fs_caches(idx);
+            crate::logger::log(format!(
+                "erase: inpaint complete ({} ms, prefix={})",
+                elapsed.as_millis(),
+                pending.log_prefix
+            ));
+        }
     }
 
     /// `fs_cache` を差し替えたあとに呼ぶ。上位レイヤ (AI アップスケール / 補正 /
