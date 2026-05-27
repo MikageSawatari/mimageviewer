@@ -1288,6 +1288,9 @@ impl App {
     fn commit_erase_shape(&mut self, shape: Shape, paint: bool) {
         if paint {
             self.erase_shapes.push(shape);
+            // 新規 shape を自動選択 (実機 FB)。コミット直後にハンドルが描画され、
+            // [S] で選択ツールへ切替後に位置/サイズ/回転/太さを微調整できる。
+            self.erase_selected_shape = Some(self.erase_shapes.len() - 1);
         } else {
             let [w, h] = self.erase_mask_size;
             let (cx_min, cy_min, cx_max, cy_max) = shape_bbox(&shape);
@@ -1647,11 +1650,28 @@ impl App {
                     ))
                     .corner_radius(6.0)
                     .show(ui, |ui| {
+                        // 幅キャップを min/max 両方で固定。ui.set_min_width だけだと
+                        // 中の widget (例: 折り返さない help label) が広いと auto-size で
+                        // パネル全体が広がり、右側が「スカスカ」に見えるため (実機 FB)。
                         ui.set_min_width(PANEL_W);
-                        // dark visuals の widgets.* 派生色 (= 灰色) で widget の文字が
-                        // 描画されると読みづらいので、テキスト色を白に強制する。
+                        ui.set_max_width(PANEL_W);
+                        // ラベル / ボタンの文字を画像上で読めるよう WHITE に強制。
+                        // override_text_color は `ui.label(...)` のような非 widget 系に効く。
+                        // egui::Button / Slider 系の文字は widget visuals の fg_stroke.color
+                        // が使われるので、そちらも併せて WHITE で上書き (= 「保存」「数値表記」が
+                        // 灰色で読めない問題への対応、実機 FB)。
                         ui.style_mut().visuals.override_text_color =
                             Some(egui::Color32::WHITE);
+                        ui.style_mut().visuals.widgets.noninteractive.fg_stroke.color =
+                            egui::Color32::WHITE;
+                        ui.style_mut().visuals.widgets.inactive.fg_stroke.color =
+                            egui::Color32::WHITE;
+                        ui.style_mut().visuals.widgets.hovered.fg_stroke.color =
+                            egui::Color32::WHITE;
+                        ui.style_mut().visuals.widgets.active.fg_stroke.color =
+                            egui::Color32::WHITE;
+                        ui.style_mut().visuals.widgets.open.fg_stroke.color =
+                            egui::Color32::WHITE;
 
                         // ── ヘッダ (タイトル + プレビュー + 閉じる × ボタン) ──
                         ui.horizontal(|ui| {
@@ -1838,12 +1858,12 @@ impl App {
 
                         ui.separator();
 
-                        // ── マスクスロット (保存 / ロード の 2x2) ──
+                        // ── マスクスロット (= 隠蔽パネルと同じ「保存N / 読込N」2x2 grid) ──
                         ui.label(
                             egui::RichText::new("マスクスロット:")
                                 .color(egui::Color32::from_gray(200)),
                         );
-                        for (row, action_label) in ["保存", "ロード"].iter().enumerate() {
+                        for (row, action_label) in ["保存", "読込"].iter().enumerate() {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
                                 for slot in 1..=2usize {
@@ -1866,12 +1886,15 @@ impl App {
                                 }
                             });
                         }
-                        ui.label(
-                            egui::RichText::new(
-                                "フルスクリーン中 F7/F8 で保存 1/2 を即適用",
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(
+                                    "フルスクリーン中 F7/F8 で保存 1/2 を即適用",
+                                )
+                                .size(10.0)
+                                .color(egui::Color32::from_gray(150)),
                             )
-                            .size(10.0)
-                            .color(egui::Color32::from_gray(150)),
+                            .wrap(),
                         );
 
                         ui.separator();
@@ -1894,16 +1917,22 @@ impl App {
                         ui.separator();
 
                         // ── ヘルプテキスト ──
+                        // 長い 1 行はパネル幅キャップ (= PANEL_W) で折り返される。
+                        // Label に `.wrap()` を付けないと TextWrapMode::Extend で
+                        // 1 行が PANEL_W を超えて Frame::popup を広げる原因になる。
                         let help = "E:補完 ESC:終了/選択解除 Ctrl+Z:戻す\n\
                             矢印:シフト [/]:回転 (Ctrl:10倍)\n\
                             Space+ドラッグ:パン操作\n\
                             Ctrl+ドラッグ: 筆/直線→太さ\n\
                             \u{00A0}縦横線→パン/傾き 選択→回転/太さ\n\
                             選択ツール+クリック=選択  Del:削除";
-                        ui.label(
-                            egui::RichText::new(help)
-                                .size(10.0)
-                                .color(egui::Color32::from_gray(190)),
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(help)
+                                    .size(10.0)
+                                    .color(egui::Color32::from_gray(190)),
+                            )
+                            .wrap(),
                         );
                     });
             });

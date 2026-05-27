@@ -271,6 +271,10 @@ impl App {
             self.conceal_selected_shape = None;
             self.conceal_drag = None;
             self.conceal_mask_texture = None;
+            // mask / shapes が変わったので合成 cache を失効させる。
+            if let Some(fs_idx) = self.fullscreen_idx {
+                self.clear_conceal_caches(fs_idx);
+            }
             true
         } else {
             false
@@ -316,6 +320,10 @@ impl App {
         self.conceal_shapes = slot_shapes;
         self.conceal_selected_shape = None;
         self.conceal_mask_texture = None;
+        // mask / shapes が差し替わったので合成 cache を失効させる。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_conceal_caches(fs_idx);
+        }
         self.show_feedback_toast(format!("[隠蔽スロット{}をロード]", slot));
     }
 
@@ -714,6 +722,11 @@ impl App {
             }
         }
         self.conceal_mask_texture = None;
+        // brush もマスクを変えるので conceal_cache 失効が必要 (= preview 時に
+        // 最新マスクで再合成される、commit_conceal_shape と同じ理由)。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_conceal_caches(fs_idx);
+        }
     }
 
     fn paint_polygon_conceal(&mut self, points: &[(f32, f32)], paint: bool) {
@@ -723,6 +736,10 @@ impl App {
         };
         crate::mask_db::scanline_fill_polygon(mask, points, w, h, paint);
         self.conceal_mask_texture = None;
+        // lasso もマスクを変えるので conceal_cache 失効が必要。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_conceal_caches(fs_idx);
+        }
     }
 
     // ── マスクテクスチャ ──────────────────────────────────────────
@@ -991,6 +1008,11 @@ impl App {
                 self.conceal_drag = None;
                 // ドラッグ完了 → 最終形状を反映するためにマスクテクスチャ再生成。
                 self.conceal_mask_texture = None;
+                // shape の geometry が変わったので合成 cache も失効させる
+                // (= preview / 隠蔽合成時に最新形状で再計算される)。
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.clear_conceal_caches(fs_idx);
+                }
             }
         }
     }
@@ -1192,6 +1214,11 @@ impl App {
     fn commit_conceal_shape(&mut self, shape: Shape, paint: bool) {
         if paint {
             self.conceal_shapes.push(shape);
+            // 新規 shape を自動選択 (実機 FB)。コミット直後にハンドルが描画される
+            // ので、ユーザーは [S] で選択ツールへ切替→ハンドル操作で太さ/サイズを
+            // 微調整できる (= 「線幅をパネルで設定 → 引いた線にハンドルで調整」
+            // ワークフロー)。
+            self.conceal_selected_shape = Some(self.conceal_shapes.len() - 1);
         } else {
             // 消去: 重なる shape を削除し、ビットマップも shape 範囲で消す
             let [w, h] = self.conceal_mask_size;
@@ -1205,6 +1232,16 @@ impl App {
             }
         }
         self.conceal_mask_texture = None;
+        // 新規 shape / shape 削除は conceal_cache の composite 内容を変えるので、
+        // 現在編集中の idx 分だけ cache を破棄して次回 preview / 隠蔽合成時に
+        // 再計算させる (実機 FB: 矩形/楕円描画後にプレビューしてもモザイクが
+        // 反映されず、再エントリして初めて反映された問題への対応)。
+        // `bump_conceal_generation` だと全 idx の cache を stale 化してしまい
+        // 他ページの composite も無駄に再計算するので、idx-specific な
+        // `clear_conceal_caches` を使う。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_conceal_caches(fs_idx);
+        }
     }
 
     // ── 描画 ──────────────────────────────────────────────────────
@@ -1449,11 +1486,27 @@ impl App {
                     ))
                     .corner_radius(6.0)
                     .show(ui, |ui| {
+                        // 幅キャップ (= 内容が広い widget で auto-size 拡大しないように)。
                         ui.set_min_width(PANEL_W);
+                        ui.set_max_width(PANEL_W);
                         // 子ウィジェット (ボタン / スライダー / ラベル) のテキスト色を
-                        // 強制的に白にする。これをやらないとデフォルト dark visuals の
-                        // widgets.* 派生色 (グレー 100 前後) で描画されて読みにくい。
+                        // 強制的に白にする。`override_text_color` は ui.label() 系に効くが、
+                        // egui::Button / Slider の数値表記は widget visuals の fg_stroke.color
+                        // を使うので、そちらも併せて WHITE で上書きする (実機 FB)。
                         ui.style_mut().visuals.override_text_color = Some(egui::Color32::WHITE);
+                        ui.style_mut()
+                            .visuals
+                            .widgets
+                            .noninteractive
+                            .fg_stroke
+                            .color = egui::Color32::WHITE;
+                        ui.style_mut().visuals.widgets.inactive.fg_stroke.color =
+                            egui::Color32::WHITE;
+                        ui.style_mut().visuals.widgets.hovered.fg_stroke.color =
+                            egui::Color32::WHITE;
+                        ui.style_mut().visuals.widgets.active.fg_stroke.color =
+                            egui::Color32::WHITE;
+                        ui.style_mut().visuals.widgets.open.fg_stroke.color = egui::Color32::WHITE;
 
                         // ── ヘッダ (タイトル + プレビュー + 閉じる × ボタン) ──
                         // 右端に「目アイコン (プレビュー)」と「× (閉じる)」を並べる。
@@ -1570,20 +1623,20 @@ impl App {
                         let mut tool = self.conceal_tool;
                         let tool_rows: [[(ConcealTool, &str); 2]; 4] = [
                             [
-                                (ConcealTool::Select, "選 [S]"),
+                                (ConcealTool::Select, "選択 [S]"),
                                 (ConcealTool::Brush, "筆 [B]"),
                             ],
                             [
-                                (ConcealTool::Lasso, "囲 [L]"),
-                                (ConcealTool::Line, "直 [I]"),
+                                (ConcealTool::Lasso, "囲み [L]"),
+                                (ConcealTool::Line, "直線 [I]"),
                             ],
                             [
-                                (ConcealTool::VertLine, "縦 [V]"),
-                                (ConcealTool::HorizLine, "横 [H]"),
+                                (ConcealTool::VertLine, "縦線 [V]"),
+                                (ConcealTool::HorizLine, "横線 [H]"),
                             ],
                             [
-                                (ConcealTool::Rect, "矩 [R]"),
-                                (ConcealTool::Ellipse, "楕 [O]"),
+                                (ConcealTool::Rect, "矩形 [R]"),
+                                (ConcealTool::Ellipse, "楕円 [O]"),
                             ],
                         ];
                         for row in tool_rows.iter() {
@@ -1889,89 +1942,78 @@ impl App {
                             }
                         }
 
-                        // ── プリセット 4 スロット (Phase 4) ───────────────────
+                        // ── プリセット 4 スロット (= 保存/読込ボタン、消しゴムマスクスロットと同じ見た目) ──
+                        //
+                        // 旧 UI は「1: (未保存) 1」+ 小さな保存ボタン で構成していたが、
+                        // 名称を編集する機能が無いため「1: ...」のような番号付きラベルは
+                        // ノイズになっていた (実機 FB)。マスクスロットと同じ
+                        // 「保存N / 読込N」グリッドに統一する。
                         ui.separator();
                         ui.label(
                             egui::RichText::new("プリセット (1-4 で適用):")
                                 .color(egui::Color32::from_gray(200)),
                         );
-                        for i in 0..4usize {
+                        // 4 列 × 2 行: 上段 [保存 1..4]、下段 [読込 1..4]
+                        let preset_btn_w = ((PANEL_W - 16.0 - 12.0) / 4.0).max(40.0);
+                        let preset_btn_size = egui::vec2(preset_btn_w, 22.0);
+                        for (row, action_label) in ["保存", "読込"].iter().enumerate() {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
-                                let preset = self.settings.conceal_presets[i].as_ref();
-                                let has = preset.is_some();
-                                let slot_size = egui::vec2(120.0, 22.0);
-                                if has {
-                                    let name = preset
-                                        .and_then(|p| {
-                                            if p.name.is_empty() {
-                                                None
-                                            } else {
-                                                Some(p.name.clone())
-                                            }
+                                for slot in 0..4usize {
+                                    let label = format!("{}{}", action_label, slot + 1);
+                                    let has = self.settings.conceal_presets[slot].is_some();
+                                    // 読込は has==false (= 未保存) のとき押せないようにする
+                                    let enabled = if row == 0 { true } else { has };
+                                    let resp = ui
+                                        .add_enabled_ui(enabled, |ui| {
+                                            panel_toggle_button(
+                                                ui,
+                                                label,
+                                                false,
+                                                Some(preset_btn_size),
+                                                None,
+                                            )
                                         })
-                                        .unwrap_or_else(|| format!("プリセット {}", i + 1));
-                                    if panel_toggle_button(
-                                        ui,
-                                        format!("{}: {}", i + 1, name),
-                                        false,
-                                        Some(slot_size),
-                                        None,
-                                    )
-                                    .clicked()
-                                    {
-                                        self.apply_conceal_preset(i);
+                                        .inner;
+                                    if resp.clicked() {
+                                        if row == 0 {
+                                            self.save_conceal_preset_to_slot(slot);
+                                        } else {
+                                            self.apply_conceal_preset(slot);
+                                        }
                                     }
-                                } else {
-                                    // 空スロットは egui の add_enabled(false) だと
-                                    // override_text_color=WHITE と相まって字が読めなく
-                                    // なるので、独自に背景 + dim gray ラベルを描く。
-                                    // Sense::hover() でツールチップだけ反応させ、
-                                    // click は受けない (= 押しても何もしない見た目)。
-                                    let (rect, resp) =
-                                        ui.allocate_exact_size(slot_size, egui::Sense::hover());
-                                    ui.painter().rect_filled(
-                                        rect,
-                                        3.0,
-                                        egui::Color32::from_rgba_unmultiplied(36, 36, 36, 180),
-                                    );
-                                    ui.painter().rect_stroke(
-                                        rect,
-                                        3.0,
-                                        egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
-                                        egui::StrokeKind::Inside,
-                                    );
-                                    ui.painter().text(
-                                        rect.center(),
-                                        egui::Align2::CENTER_CENTER,
-                                        format!("{}: (未保存)", i + 1),
-                                        egui::FontId::proportional(12.5),
-                                        egui::Color32::from_gray(170),
-                                    );
-                                    resp.on_hover_text(
-                                        "現在の設定をここに保存できます (右の保存ボタン)",
-                                    );
-                                }
-                                if ui.small_button("保存").clicked() {
-                                    self.save_conceal_preset_to_slot(i);
                                 }
                             });
                         }
 
-                        // ── マスクスロット (差分画像生成用、2 スロット) ──────
+                        // ── マスクスロット (= 消しゴムと同じ「保存N / 読込N」2x2 grid) ──
                         ui.separator();
                         ui.label(
                             egui::RichText::new("マスクスロット:")
                                 .color(egui::Color32::from_gray(200)),
                         );
-                        for slot in 1..=2usize {
+                        let mask_btn_w = ((PANEL_W - 16.0 - 4.0) / 2.0).max(60.0);
+                        let mask_btn_size = egui::vec2(mask_btn_w, 22.0);
+                        for (row, action_label) in ["保存", "読込"].iter().enumerate() {
                             ui.horizontal(|ui| {
-                                ui.label(format!("スロット {}", slot));
-                                if ui.small_button("保存").clicked() {
-                                    self.save_conceal_mask_to_slot(slot);
-                                }
-                                if ui.small_button("ロード").clicked() {
-                                    self.load_conceal_mask_from_slot(slot);
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                for slot in 1..=2usize {
+                                    let label = format!("{}{}", action_label, slot);
+                                    if panel_toggle_button(
+                                        ui,
+                                        label,
+                                        false,
+                                        Some(mask_btn_size),
+                                        None,
+                                    )
+                                    .clicked()
+                                    {
+                                        if row == 0 {
+                                            self.save_conceal_mask_to_slot(slot);
+                                        } else {
+                                            self.load_conceal_mask_from_slot(slot);
+                                        }
+                                    }
                                 }
                             });
                         }
