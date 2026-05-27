@@ -387,6 +387,40 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 
 ## 3. 補正・AI・ポストフィルタキャッシュと再描画
 
+### 3.0 処理順序 (= 最終表示への適用順)
+
+ユーザーが表示で見る最終画像は、以下の順序で各レイヤが重ねがけされる:
+
+```
+1. fs_cache (= 生デコード結果)
+   ↓
+2. AI アップスケール / デノイズ (Real-ESRGAN / Real-CUGAN / NMKD-Siax / 1x denoise)
+   → ai_upscale_cache[idx, bg_mode]
+   ↓
+3. 色補正 (色温度・彩度・コントラスト・露出など)
+   → adjustment_cache[idx]
+   ↓
+4. ポストフィルタ (CRT エミュレート / 減色 / モノクロ / 複合エフェクト)
+   → adjustment_cache[idx] (= 3 と同じ段、apply_adjustments_fast の直後に
+                              post_filter::apply を連続適用)
+   ↓
+5. 消しゴム (MI-GAN inpaint)
+   → ESC / E / × ボタンで確定したとき MI-GAN がマスク領域を補完
+   実装上は fs_cache を上書きしているため、確定後に AI トグル等を切替えると
+   再度 ai_upscale_cache / adjustment_cache を再構築する (= 既知の挙動)
+   ↓
+6. 隠蔽加工 (モザイク / 白塗り / 黒塗り / ぼかし)
+   → conceal_cache[idx, generation] (= adjustment_cache をベースに合成)
+   display 時は adjustment_cache の代わりに conceal_cache を使う
+```
+
+**ユーザー向けの言い換え**: 色補正 → AI 拡大 → 効果フィルタ → マスク補完 →
+モザイク加工 の順。**ポストフィルタはモザイクより前**で、CRT/減色などの
+画面効果は隠蔽加工レイヤの「下」に来る (= モザイクのほうが「最後の見た目」
+を支配する)。
+
+### 3.1 詳細
+
 詳細は [preset-and-adjustment.md](preset-and-adjustment.md) に譲る。ここでは要点のみ:
 
 - **補正 (adjustment)**: CPU 側で LUT 計算 → ColorImage → [ポストフィルタ (post_filter::apply)]
