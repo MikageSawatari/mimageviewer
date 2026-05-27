@@ -149,6 +149,8 @@ impl App {
         self.erase_shapes.clear();
         self.erase_selected_shape = None;
         self.erase_drag = None;
+        self.erase_shape_drag_start = None;
+        self.erase_shape_drag_end = None;
 
         // デフォルトブラシ半径: 長辺の 1/100
         if self.erase_brush_radius <= 0.0 {
@@ -207,6 +209,8 @@ impl App {
         self.erase_shapes.clear();
         self.erase_selected_shape = None;
         self.erase_drag = None;
+        self.erase_shape_drag_start = None;
+        self.erase_shape_drag_end = None;
         self.fs_pan_drag_start = None;
 
         // 見開きから入っていた場合は spread_mode と表示ページを復元する。
@@ -889,6 +893,7 @@ impl App {
         // (途中で Space 検知 → パンに切替するとマスクが中途半端に確定するため)
         let drawing_in_progress = self.erase_last_paint_pos.is_some()
             || self.erase_line_start.is_some()
+            || self.erase_shape_drag_start.is_some()
             || self.erase_shift_drag.is_some()
             || self.erase_drag.is_some()
             || !self.erase_lasso_points.is_empty();
@@ -1286,10 +1291,14 @@ impl App {
         } else {
             let [w, h] = self.erase_mask_size;
             let (cx_min, cy_min, cx_max, cy_max) = shape_bbox(&shape);
-            // 重なる shape を bbox 重なりで除去 (簡易判定)
+            // 重なる shape を bbox 重なりで除去 (Codex Phase 0b/2b P1 修正:
+            // 旧版は retain 条件が反転していて非重複 shape を消していた)。
+            // separated = 互いの bbox が一切交わらない (= 残す)
             self.erase_shapes.retain(|s| {
                 let (sxmin, symin, sxmax, symax) = shape_bbox(s);
-                !(sxmax < cx_min || sxmin > cx_max || symax < cy_min || symin > cy_max)
+                let separated =
+                    sxmax < cx_min || sxmin > cx_max || symax < cy_min || symin > cy_max;
+                separated
             });
             // ビットマップから shape 範囲を消す
             if let Some(mask) = self.erase_mask.as_mut() {
@@ -1932,6 +1941,8 @@ impl App {
                     self.erase_line_end = None;
                     self.erase_line_tilt = 0.0;
                     self.erase_shift_drag = None;
+                    self.erase_shape_drag_start = None;
+                    self.erase_shape_drag_end = None;
                     if let Some(fs_idx) = self.fullscreen_idx {
                         // DB + サイドカーからも削除
                         self.delete_mask_with_sidecar(fs_idx);
