@@ -124,8 +124,14 @@ pub enum DragState {
         center: (f32, f32),
         start_angle: f32,
     },
-    /// Line の太さ調整ハンドル。中点を基点に、カーソルの法線方向距離 * 2 が新太さ。
-    LineThickness { idx: usize, base: Shape },
+    /// Line の太さ調整ハンドル。`origin` (= ドラッグ開始時のカーソル位置) を基準に
+    /// 法線方向の **delta** だけを base.thickness に加算する (= クリックだけで
+    /// 太さが跳ねないように)。
+    LineThickness {
+        idx: usize,
+        base: Shape,
+        origin: (f32, f32),
+    },
 }
 
 impl DragState {
@@ -547,7 +553,11 @@ pub fn begin_drag(target: HoverTarget, idx: usize, base: Shape, cur: (f32, f32))
                 anchor,
             }
         }
-        HoverTarget::LineThickness => DragState::LineThickness { idx, base },
+        HoverTarget::LineThickness => DragState::LineThickness {
+            idx,
+            base,
+            origin: cur,
+        },
     }
 }
 
@@ -635,36 +645,57 @@ pub fn apply_drag(state: &DragState, cur: (f32, f32), modifiers: &egui::Modifier
             start_angle,
             ..
         } => apply_rotate_drag(base, center, start_angle, cur, modifiers),
-        DragState::LineThickness { base, .. } => apply_line_thickness_drag(base, cur),
+        DragState::LineThickness { base, origin, .. } => {
+            apply_line_thickness_drag(base, origin, cur)
+        }
     }
 }
 
-/// Line の太さを「中点 → cur」の法線方向距離 * 2 で更新する。
+/// Line の太さを「origin → cur の法線方向 delta」に応じて更新する。
 ///
-/// Line 以外の Shape が渡されたら no-op (= 構造上発生しないはず、防御的に対応)。
-/// 最小太さは 1.0 (= 1 ピクセル相当)。
-fn apply_line_thickness_drag(base: Shape, cur: (f32, f32)) -> Shape {
-    let mut s = base;
+/// **origin-based delta** 方式: ドラッグ開始位置 (`origin`) を基準に、現在位置
+/// (`cur`) との法線方向の差分だけを `base.thickness` に加算する。これにより
+/// 「ハンドルをクリックしただけ (= cur == origin)」では太さが変化しない。
+///
+/// 旧版は `cur` の中点からの距離 * 2 を直接 thickness にしていたため、ハンドルが
+/// 「中点 + thickness/2 + offset」に置かれている事を考慮しておらず、クリックの
+/// 瞬間に thickness が `+ 2*offset` 増える跳ね現象が起きていた (Codex P1 R3 #2)。
+///
+/// 方向: origin の中点法線方向 (正/負) を基準にし、cur が同方向へ動くと太く、
+/// 反対方向 (中点に近づく) へ動くと細くなる。
+fn apply_line_thickness_drag(base: Shape, origin: (f32, f32), cur: (f32, f32)) -> Shape {
     if let Shape::Line {
         p0,
         p1,
-        ref mut thickness,
-        ..
-    } = s
+        kind,
+        thickness: base_thickness,
+    } = base
     {
-        let mid = ((p0.0 + p1.0) * 0.5, (p0.1 + p1.1) * 0.5);
         let dx = p1.0 - p0.0;
         let dy = p1.1 - p0.1;
         let len = (dx * dx + dy * dy).sqrt().max(1e-6);
         let nx = -dy / len;
         let ny = dx / len;
-        // cur と中点の差ベクトルを法線に投影 → 符号付きで距離
-        let to_cur = (cur.0 - mid.0, cur.1 - mid.1);
-        let perp = to_cur.0 * nx + to_cur.1 * ny;
-        // 太さ = 法線方向距離の絶対値 * 2 (= 線が中点を挟んで左右対称に広がる)
-        *thickness = (perp.abs() * 2.0).max(1.0);
+        let mid = ((p0.0 + p1.0) * 0.5, (p0.1 + p1.1) * 0.5);
+        // origin と cur の中点法線方向距離 (符号付き)。
+        let origin_perp = (origin.0 - mid.0) * nx + (origin.1 - mid.1) * ny;
+        let cur_perp = (cur.0 - mid.0) * nx + (cur.1 - mid.1) * ny;
+        // origin 側の符号を「正方向」として捉える (= ハンドルが置かれていた側)。
+        // origin_perp = 0 のレアケースは正方向扱い。
+        let direction = if origin_perp >= 0.0 { 1.0 } else { -1.0 };
+        // 「外側 (= origin 側) への移動量」が正のとき太くなる。
+        let delta_outward = (cur_perp - origin_perp) * direction;
+        // 線は中点を挟んで対称に広がるので、片側 delta_outward の 2 倍が太さ delta。
+        let new_thickness = (base_thickness + 2.0 * delta_outward).max(1.0);
+        Shape::Line {
+            p0,
+            p1,
+            kind,
+            thickness: new_thickness,
+        }
+    } else {
+        base
     }
-    s
 }
 
 fn apply_endpoint_drag(
@@ -1447,5 +1478,75 @@ mod tests {
         // 回転ハンドルは ry = 20 の上端 + 28 = (100, 52)
         let rh = layout.rotate_handle.unwrap();
         assert!((rh.0 - 100.0).abs() < 1e-3 && (rh.1 - 52.0).abs() < 1e-3);
+    }
+
+    /// Codex P1 R3 #2 回帰テスト: Line 太さハンドルをクリックしただけでは
+    /// thickness が変わらない (origin-based delta 方式の確認)。
+    #[test]
+    fn line_thickness_drag_click_only_does_not_jump() {
+        // 水平な線 (p0=0,0 → p1=100,0) thickness=10。法線は y 軸方向。
+        let base = line_at((0.0, 0.0), (100.0, 0.0), 10.0);
+        let layout = compute_handle_layout(&base, 1.0);
+        let handle_pos = layout.line_thickness_handle.unwrap();
+        // ハンドル位置 = 中点 (50, 0) + 法線 * (5 + 12) = (50, 17) または (50, -17)
+        // 実装上は法線 (-dy/len, dx/len) = (0, 1) なので handle = (50, 17)
+        assert!((handle_pos.0 - 50.0).abs() < 1e-3);
+        assert!((handle_pos.1.abs() - 17.0).abs() < 1e-3);
+
+        // 「クリックしただけ」= origin == cur のときは太さ不変。
+        let drag = begin_drag(HoverTarget::LineThickness, 0, base, handle_pos);
+        let result = apply_drag(&drag, handle_pos, &egui::Modifiers::NONE);
+        match result {
+            Shape::Line { thickness, .. } => {
+                assert!(
+                    (thickness - 10.0).abs() < 1e-3,
+                    "click-only should keep thickness, got {thickness}"
+                );
+            }
+            _ => panic!("expected Line"),
+        }
+    }
+
+    #[test]
+    fn line_thickness_drag_outward_grows() {
+        let base = line_at((0.0, 0.0), (100.0, 0.0), 10.0);
+        let layout = compute_handle_layout(&base, 1.0);
+        let handle_pos = layout.line_thickness_handle.unwrap();
+        // 「外側 (= origin と同じ符号で離れる方向)」に 5px 動かす → thickness は +10
+        let outward_step = 5.0 * handle_pos.1.signum();
+        let cur = (handle_pos.0, handle_pos.1 + outward_step);
+        let drag = begin_drag(HoverTarget::LineThickness, 0, base, handle_pos);
+        let result = apply_drag(&drag, cur, &egui::Modifiers::NONE);
+        match result {
+            Shape::Line { thickness, .. } => {
+                assert!(
+                    (thickness - 20.0).abs() < 1e-3,
+                    "outward +5 should grow thickness by 10, got {thickness}"
+                );
+            }
+            _ => panic!("expected Line"),
+        }
+    }
+
+    #[test]
+    fn line_thickness_drag_inward_shrinks_clamped_to_1() {
+        let base = line_at((0.0, 0.0), (100.0, 0.0), 10.0);
+        let layout = compute_handle_layout(&base, 1.0);
+        let handle_pos = layout.line_thickness_handle.unwrap();
+        // 「内側 (= origin の符号と反対側へ大きく)」に 100px 動かす → thickness は
+        // 1 にクランプ。`-100 * signum()` で「origin と反対側」を表現。
+        let inward_step = -100.0 * handle_pos.1.signum();
+        let cur = (handle_pos.0, handle_pos.1 + inward_step);
+        let drag = begin_drag(HoverTarget::LineThickness, 0, base, handle_pos);
+        let result = apply_drag(&drag, cur, &egui::Modifiers::NONE);
+        match result {
+            Shape::Line { thickness, .. } => {
+                assert!(
+                    (thickness - 1.0).abs() < 1e-3,
+                    "extreme inward should clamp thickness to 1, got {thickness}"
+                );
+            }
+            _ => panic!("expected Line"),
+        }
     }
 }

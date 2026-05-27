@@ -985,12 +985,20 @@ impl App {
         let paint = self.erase_paint_mode;
         let space_held = ctx.input(|i| i.key_down(egui::Key::Space));
 
-        // パネル上のクリックはツール操作に使わない
+        // パネル上のクリックはツール操作に使わない。
+        //
+        // ⚠ ただし `primary_released` のフレームだけは通す。これがないと、
+        // canvas でハンドル/線/シェイプドラッグ中にパネル上で離した場合、
+        // primary_released がツールハンドラに届かず `erase_drag` / `erase_line_*` /
+        // `erase_shape_drag_*` などの中間状態が残ったままになる
+        // (Codex P2 R3 #2、隠蔽側 `ui_conceal.rs::handle_conceal_paint` の同条件
+        // と揃える)。
         let panel_rect = self.erase_panel_rect(full_rect);
-        if let Some(pos) = pointer_pos {
-            if panel_rect.contains(pos) {
-                return;
-            }
+        if let Some(pos) = pointer_pos
+            && panel_rect.contains(pos)
+            && !primary_released
+        {
+            return;
         }
 
         // ── Space+ドラッグ: 一時パン (Photoshop 流) ─────────────────
@@ -2078,27 +2086,31 @@ impl App {
                         base.as_ref().clone(),
                         egui::TextureOptions::LINEAR,
                     );
-                    let bg = self.effective_upscale_bg_mode();
+                    // ⚠ 復元画像は **常に fs_cache** に入れる。旧版は AI cache
+                    // が有効なときだけ `ai_upscale_cache` 側を書き換えていたが、
+                    // 直後の `invalidate_derived_fs_caches` が `purge_upscale_for_idx`
+                    // 経由でその entry を消すため、結果 fs_cache に旧 inpaint 結果が
+                    // 残ったままになっていた (Codex P1 R3 #1)。
+                    //
+                    // 正しいフロー:
+                    // 1. fs_cache を base 画像で **必ず** 上書き
+                    // 2. invalidate_derived_fs_caches (= ai_upscale / adjustment /
+                    //    conceal / erase_base_tex を purge)
+                    // 3. 表示パイプラインは次フレームで AI を再起動して
+                    //    base からアップスケールし直す
                     let prev_source_dims = self.fs_cache_source_dims(fs_idx);
-                    let write_to_ai = self.ai_upscale_cache.contains_key(&(fs_idx, bg));
                     let entry = FsCacheEntry::Static {
                         tex,
                         pixels: Arc::clone(base),
-                        source_dims: if write_to_ai { None } else { prev_source_dims },
+                        source_dims: prev_source_dims,
                         load_seq: self.input_seq,
                     };
-                    if write_to_ai {
-                        self.ai_upscale_cache.insert((fs_idx, bg), entry);
-                    } else {
-                        self.fs_cache.insert(fs_idx, entry);
-                    }
+                    self.fs_cache.insert(fs_idx, entry);
                 }
-                // ⚠ 派生キャッシュ (adjustment_cache / conceal_cache /
-                // erase_base_tex_cache) を invalidate しないと、旧マスク+inpaint
-                // 結果が adjustment_cache に焼き込まれたままで「マスク全削除しても
-                // 前のマスクの結果が残っている」状態になる (実機 FB)。
-                // `invalidate_derived_fs_caches` で adjustment_cache /
-                // conceal_cache を破棄 + erase_base_tex_cache も明示的に削除。
+                // 派生キャッシュ (= adjustment_cache / ai_upscale_cache /
+                // conceal_cache / erase_base_tex_cache) を invalidate。
+                // 旧 mask + inpaint 結果が上位レイヤに焼き込まれているのを破棄して、
+                // 次フレームで新 fs_cache から再合成させる。
                 self.invalidate_derived_fs_caches(fs_idx);
                 self.erase_base_tex_cache.remove(&fs_idx);
             }

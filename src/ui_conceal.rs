@@ -459,17 +459,20 @@ impl App {
 
         // Delete: 選択中の Shape を削除
         let key_del = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Delete));
-        if key_del {
-            if let Some(idx) = self.conceal_selected_shape {
-                if idx < self.conceal_shapes.len() {
-                    self.push_conceal_undo();
-                    self.conceal_shapes.remove(idx);
-                    self.conceal_selected_shape = None;
-                    self.conceal_drag = None;
-                    self.conceal_mask_texture = None;
-                    self.show_feedback_toast("[ベクタ削除]".to_string());
-                }
+        if key_del
+            && let Some(idx) = self.conceal_selected_shape
+            && idx < self.conceal_shapes.len()
+        {
+            self.push_conceal_undo();
+            self.conceal_shapes.remove(idx);
+            self.conceal_selected_shape = None;
+            self.conceal_drag = None;
+            self.conceal_mask_texture = None;
+            // shape 構成が変わったので合成 cache を失効させる (Codex P2 R3 #1)。
+            if let Some(fs_idx) = self.fullscreen_idx {
+                self.clear_conceal_caches(fs_idx);
             }
+            self.show_feedback_toast("[ベクタ削除]".to_string());
         }
 
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
@@ -637,6 +640,10 @@ impl App {
             }
         }
         self.conceal_mask_texture = None;
+        // shape の位置が変わったので合成 cache も失効させる (Codex P2 R3 #1)。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_conceal_caches(fs_idx);
+        }
     }
 
     // ── 座標変換 ──────────────────────────────────────────────────
