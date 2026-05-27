@@ -1746,14 +1746,17 @@ impl App {
                             ctx.request_repaint();
                         }
 
-                        // ── 隠蔽加工モード (Phase 1: パネルのみ) ──
-                        // ツール操作 / 合成 / マスクオーバーレイは Phase 2 以降で追加。
-                        // 当面はパネルが出てモード状態が UI 上で確認できるだけで十分。
+                        // ── 隠蔽加工モード: マスク塗り + オーバーレイ描画 ──
+                        // 消しゴム同様、見開き中は 1 フレーム遷移期間で is_spread_double が
+                        // true のまま conceal_mode = true になりうるので、その 1 フレームは
+                        // overlay 描画をスキップして単一ページ表示で出す次フレームに描画する。
                         if self.conceal_mode
                             && !is_spread_double
                             && !state.original_preview_active
                         {
-                            self.draw_conceal_panel(ctx, full_rect);
+                            let zp = self.fs_zoom_pan();
+                            self.handle_conceal_paint(ctx, image_rect, zp);
+                            self.draw_conceal_overlay(ui, ctx, image_rect, zp);
                             ctx.request_repaint();
                         } else if self.conceal_mode {
                             ctx.request_repaint();
@@ -2923,18 +2926,10 @@ impl App {
             return self.handle_erase_keys(ctx, fs_idx);
         }
 
-        // 隠蔽加工モード中も同様。Phase 1 では Esc / Ctrl+M で終了するだけの最小実装。
-        // ツール操作キー (B/L/S/I/V/H/R/O、D/F、T、1〜4、Ctrl+wheel 等) は Phase 2 以降で
-        // `handle_conceal_keys` を作って追加する。
+        // 隠蔽加工モード中: 専用ショートカット (S/B/L/I/V/H/R/O、D/F、Ctrl+Z、Delete、
+        // 矢印移動、Esc / Ctrl+M) に切り替える。通常のフルスクリーンショートカットは無効化。
         if self.conceal_mode {
-            // Esc または Ctrl+M で退場
-            let key_esc =
-                ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
-            let key_ctrl_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::M));
-            if key_esc || key_ctrl_m {
-                self.reset_conceal_mode();
-            }
-            return action;
+            return self.handle_conceal_keys(ctx, fs_idx);
         }
 
         // 動画フルスクリーン中は専用キーマップ (Space=play/pause、Enter=play/pause、

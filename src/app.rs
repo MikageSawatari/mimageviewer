@@ -1204,6 +1204,14 @@ pub(crate) struct EraseSnapshot {
     pub vectors: Vec<crate::mask_db::LineObject>,
 }
 
+/// 隠蔽加工 (Conceal) の Undo スタックに積むスナップショット。`EraseSnapshot` の
+/// `Shape` 統一版 (`mask_db::Shape` 経由なので Line / Rect / Ellipse を区別なく扱える)。
+#[derive(Debug, Clone)]
+pub(crate) struct ConcealSnapshot {
+    pub mask: Vec<bool>,
+    pub shapes: Vec<crate::mask_db::Shape>,
+}
+
 /// 見開きから消しゴムに入ったときのコンテキスト。Apply / Cancel で
 /// 元の見開き状態 (= `saved_mode` の spread_mode + `pair.0` を中心ページとした
 /// 見開き表示) を復元するために保存する。
@@ -2914,9 +2922,7 @@ pub struct App {
     //
     /// 隠蔽加工モードかどうか。`Ctrl+M` で入退場。
     pub(crate) conceal_mode: bool,
-    /// 現在のツール (Phase 2 で実装、Phase 1 では Default 値のみ)。
-    /// Phase 1 では設定経路で初期化されるだけで参照されないので dead_code 抑止。
-    #[allow(dead_code)]
+    /// 現在のツール (`Ctrl+M` 入場時は前回値を `settings.conceal_tool_last` から復元する想定)。
     pub(crate) conceal_tool: crate::conceal::ConcealTool,
     /// 描画モード (true) / 消去モード (false)、`D` / `F` キーで切替。
     pub(crate) conceal_paint_mode: bool,
@@ -2935,10 +2941,24 @@ pub struct App {
         std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
     /// マスク永続化 DB (Phase 1 で boot 時に open、フォルダ非依存)。
     pub(crate) conceal_db: Option<crate::conceal_db::ConcealDb>,
-    /// 隠蔽加工 Undo スタック (Phase 4 で実装、Phase 1 ではフィールド予約のみ)。
-    pub(crate) conceal_undo_stack: std::collections::VecDeque<crate::mask_db::Shape>,
-    /// Undo スタック throttle 用 (キーリピート連打抑制、Phase 4)。
+    /// 隠蔽加工 Undo スタック (Phase 2 で活性化、`ConcealSnapshot` で mask + shapes をまとめて記録)。
+    pub(crate) conceal_undo_stack: std::collections::VecDeque<ConcealSnapshot>,
+    /// Undo スタック throttle 用 (キーリピート連打抑制)。
     pub(crate) conceal_last_undo_at: Option<std::time::Instant>,
+    /// Select ツールでのハンドルドラッグ状態 (Phase 2)。
+    pub(crate) conceal_drag: Option<crate::vector_edit::DragState>,
+    /// Brush / Lasso 中のドラッグ最終位置 (スクリーン座標)。
+    pub(crate) conceal_last_paint_pos: Option<egui::Pos2>,
+    /// Lasso ツールの累積点 (画像座標)。
+    pub(crate) conceal_lasso_points: Vec<(f32, f32)>,
+    /// Line / VertLine / HorizLine ツールのドラッグ開始点 (画像座標)。
+    pub(crate) conceal_line_start: Option<(f32, f32)>,
+    /// Line / VertLine / HorizLine ツールのドラッグ末尾点 (画像座標)。
+    pub(crate) conceal_line_end: Option<(f32, f32)>,
+    /// Rect / Ellipse ツールのドラッグ開始点 (画像座標)。
+    pub(crate) conceal_shape_drag_start: Option<(f32, f32)>,
+    /// Rect / Ellipse ツールのドラッグ末尾点 (画像座標、プレビューと確定で共用)。
+    pub(crate) conceal_shape_drag_end: Option<(f32, f32)>,
     /// 見開きから隠蔽加工に入ったときの状態スナップショット (消しゴムの `EraseSpreadCtx`
     /// と同型、Phase 2 で見開きハンドリング実装時に活用)。
     pub(crate) conceal_spread_ctx: Option<EraseSpreadCtx>,
@@ -3885,6 +3905,13 @@ impl App {
             conceal_base_cache: std::collections::HashMap::new(),
             conceal_undo_stack: std::collections::VecDeque::new(),
             conceal_last_undo_at: None,
+            conceal_drag: None,
+            conceal_last_paint_pos: None,
+            conceal_lasso_points: Vec::new(),
+            conceal_line_start: None,
+            conceal_line_end: None,
+            conceal_shape_drag_start: None,
+            conceal_shape_drag_end: None,
             conceal_spread_ctx: None,
             conceal_pages: std::collections::HashSet::new(),
             fs_nav_locked_gen: None,
