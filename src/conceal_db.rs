@@ -277,7 +277,7 @@ fn rescale_mask(src: &[bool], src_w: usize, src_h: usize, dst_w: usize, dst_h: u
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mask_db::{LineKind, Shape};
+    use crate::mask_db::{LineKind, Shape, ShapeOp};
 
     fn tmp_db() -> (ConcealDb, std::path::PathBuf) {
         let p = std::env::temp_dir().join(format!(
@@ -308,12 +308,14 @@ mod tests {
         mask[40 * w + 40] = true;
         let shapes = vec![
             Shape::Rect {
+                op: ShapeOp::Add,
                 center: (25.0, 25.0),
                 half_w: 5.0,
                 half_h: 3.0,
                 rotation_rad: 0.0,
             },
             Shape::Ellipse {
+                op: ShapeOp::Add,
                 center: (30.0, 15.0),
                 rx: 4.0,
                 ry: 2.0,
@@ -342,6 +344,7 @@ mod tests {
         let (db, p) = tmp_db();
         let mask = vec![false; 100];
         let shapes = vec![Shape::Line {
+            op: ShapeOp::Add,
             kind: LineKind::Diagonal,
             p0: (0.0, 0.0),
             p1: (10.0, 10.0),
@@ -360,6 +363,7 @@ mod tests {
         let (db, p) = tmp_db();
         let mask = vec![true; 64];
         let shapes = vec![Shape::Rect {
+            op: ShapeOp::Add,
             center: (4.0, 4.0),
             half_w: 2.0,
             half_h: 2.0,
@@ -386,6 +390,7 @@ mod tests {
         let mut mask = vec![false; w * h];
         mask[50 * w + 50] = true;
         let shapes = vec![Shape::Rect {
+            op: ShapeOp::Add,
             center: (50.0, 50.0),
             half_w: 10.0,
             half_h: 5.0,

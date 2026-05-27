@@ -324,14 +324,18 @@ enum BlurMode { AsMask, ExtendByRadius, InsideOnly }     // ぼかし専用
 
 ```rust
 // mask_db.rs (両ツール共有)
+pub enum ShapeOp { Add, Subtract }
+
 pub enum Shape {
-    Line { kind: LineKind, p0: (f32, f32), p1: (f32, f32), thickness: f32 },
-    Rect { center: (f32, f32), half_w: f32, half_h: f32, rotation_rad: f32 },
-    Ellipse { center: (f32, f32), rx: f32, ry: f32, rotation_rad: f32 },
+    Line { op: ShapeOp, kind: LineKind, p0: (f32, f32), p1: (f32, f32), thickness: f32 },
+    Rect { op: ShapeOp, center: (f32, f32), half_w: f32, half_h: f32, rotation_rad: f32 },
+    Ellipse { op: ShapeOp, center: (f32, f32), rx: f32, ry: f32, rotation_rad: f32 },
 }
 ```
 
 JSON シリアライズ: `#[serde(tag = "type")]` で `{ "type": "rect", ... }` 形式。
+`op` は `add` / `subtract`。`add` は省略され、既存 JSON のように `op` が無い場合も
+`add` として読む。`subtract` のみ `{ "op": "subtract" }` を書く。
 **既存リリース済み消しゴムマスク (`LineObject` の素 JSON) との後方互換性**:
 
 - `serde(untagged)` 階層化で「タグ付き Shape」「タグなし旧 `LineObject`」の両方を読める
@@ -352,7 +356,8 @@ variant に対応:
 - `Ellipse`: 軸並行楕円なら走査線で in/out 判定、回転楕円なら回転逆変換後の楕円方程式判定
   → 専用 `scanline_fill_ellipse` 関数を新設 (~50 行)
 
-`compose_mask` (ビットマップ + Shape 群の合成) は内部で `rasterize_shape_into` を順次呼ぶ。
+`compose_mask` (ビットマップ + Shape 群の合成) は、ビットマップを下地にして Shape 群を
+作成順に適用する。`Add` はマスクを足し、`Subtract` はそれ以前の結果を削る。
 
 ## 7. タイプ別の合成アルゴリズム
 

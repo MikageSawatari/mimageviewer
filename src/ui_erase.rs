@@ -21,7 +21,7 @@ use std::sync::mpsc;
 
 use crate::app::{App, EraseSnapshot, EraseTool, ShiftDragState};
 use crate::fs_animation::FsCacheEntry;
-use crate::mask_db::{LineKind, Shape};
+use crate::mask_db::{LineKind, Shape, ShapeOp};
 use crate::ui_fullscreen::FsKeyAction;
 use crate::ui_fullscreen::draw_icons::{PanelToggleColors, panel_toggle_button};
 use crate::vector_edit;
@@ -1333,6 +1333,7 @@ impl App {
                         if len > 1.0 {
                             self.push_undo_snapshot();
                             let shape = Shape::Line {
+                                op: ShapeOp::Add,
                                 kind: LineKind::Diagonal,
                                 p0: (x0, y0),
                                 p1: (x1, y1),
@@ -1374,12 +1375,14 @@ impl App {
                             let hh = dy.abs() * 0.5;
                             let shape = match self.erase_tool {
                                 EraseTool::Rect => Shape::Rect {
+                                    op: ShapeOp::Add,
                                     center: (cx, cy),
                                     half_w: hw,
                                     half_h: hh,
                                     rotation_rad: 0.0,
                                 },
                                 EraseTool::Ellipse => Shape::Ellipse {
+                                    op: ShapeOp::Add,
                                     center: (cx, cy),
                                     rx: hw,
                                     ry: hh,
@@ -1474,6 +1477,7 @@ impl App {
                     let cx = (lx + rx) * 0.5;
                     // 中心軸: 上端 (cx+tilt, 0) → 下端 (cx, h)
                     let shape = Shape::Line {
+                        op: ShapeOp::Add,
                         kind: LineKind::Vertical,
                         p0: (cx + tilt, 0.0),
                         p1: (cx, h as f32),
@@ -1486,6 +1490,7 @@ impl App {
                     let thickness = (by - ty).max(1.0);
                     let cy = (ty + by) * 0.5;
                     let shape = Shape::Line {
+                        op: ShapeOp::Add,
                         kind: LineKind::Horizontal,
                         p0: (0.0, cy),
                         p1: (w as f32, cy + tilt),
@@ -1502,38 +1507,29 @@ impl App {
         }
     }
 
-    /// 描画モードなら Shape を追加、消去モードなら重なる Shape を除去＋ビットマップも消す。
+    /// 描画モードなら Add Shape、消去モードなら Subtract Shape を追加する。
+    ///
+    /// 筆/囲みで作るビットマップマスクを下地にし、その上に Shape を作成順で重ねる。
+    /// そのため消去モードの矩形/楕円/線は既存 Shape を丸ごと削除せず、上から
+    /// 削り取るベクターオブジェクトとして残る。
     fn commit_erase_shape(&mut self, shape: Shape, paint: bool) {
         // マスクが変わるので preview cache を破棄 (= 次回 preview 押下で再投入)。
         if let Some(fs_idx) = self.fullscreen_idx {
             self.clear_erase_preview(fs_idx);
         }
-        if paint {
-            self.erase_shapes.push(shape);
-            // 新規 shape を自動選択 (実機 FB)。コミット直後にハンドルが描画され、
-            // [S] で選択ツールへ切替後に位置/サイズ/回転/太さを微調整できる。
-            self.erase_selected_shape = Some(self.erase_shapes.len() - 1);
+        let op = if paint {
+            ShapeOp::Add
         } else {
-            let [w, h] = self.erase_mask_size;
-            let (cx_min, cy_min, cx_max, cy_max) = shape_bbox(&shape);
-            // 重なる shape を bbox 重なりで除去 (Codex Phase 0b/2b P1 修正:
-            // 旧版は retain 条件が反転していて非重複 shape を消していた)。
-            // separated = 互いの bbox が一切交わらない (= 残す)
-            self.erase_shapes.retain(|s| {
-                let (sxmin, symin, sxmax, symax) = shape_bbox(s);
-                let separated =
-                    sxmax < cx_min || sxmin > cx_max || symax < cy_min || symin > cy_max;
-                separated
-            });
-            // ビットマップから shape 範囲を消す
-            if let Some(mask) = self.erase_mask.as_mut() {
-                crate::mask_db::rasterize_shape_into(mask, &shape, w, h, false);
-            }
-        }
+            ShapeOp::Subtract
+        };
+        self.erase_shapes.push(shape.with_op(op));
+        // 新規 shape を自動選択 (実機 FB)。コミット直後にハンドルが描画され、
+        // [S] で選択ツールへ切替後に位置/サイズ/回転/太さを微調整できる。
+        self.erase_selected_shape = Some(self.erase_shapes.len() - 1);
     }
 
-    // (Phase 2b で `erase_shapes_overlapping_polygon` は削除。`commit_erase_shape` の
-    //  消去経路で直接 bbox 重なり判定を行う。)
+    // (Phase 2b で `erase_shapes_overlapping_polygon` は削除。消去モードの Shape は
+    //  既存 Shape を削除せず、Subtract Shape として作成順に合成する。)
 
     // ── 描画 ──────────────────────────────────────────────────────
 
@@ -2028,14 +2024,42 @@ impl App {
                         });
                         ui.separator();
 
-                        // ── ツール選択 (Phase 0b で 8 ツール、2x4 grid) ──
-                        let tool_rows: [[(&str, EraseTool); 2]; 4] = [
+                        // ── ツール選択 ──
+                        // 筆/囲みはビットマップ下地、線/矩形/楕円はその上に作成順で
+                        // 重なるオブジェクト。消去モードのオブジェクトは Subtract Shape
+                        // として残り、既存オブジェクトを丸ごと削除しない。
+                        ui.label(
+                            egui::RichText::new("ビットマップ:")
+                                .color(egui::Color32::from_gray(200)),
+                        );
+                        let bitmap_rows: [[(&str, EraseTool); 2]; 1] =
+                            [[("筆 [B]", EraseTool::Brush), ("囲み [L]", EraseTool::Lasso)]];
+                        for row in bitmap_rows.iter() {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                for &(label, tool) in row.iter() {
+                                    if panel_toggle_button(
+                                        ui,
+                                        label,
+                                        self.erase_tool == tool,
+                                        Some(btn_size),
+                                        None,
+                                    )
+                                    .clicked()
+                                    {
+                                        let toast = format!("[{}]", label);
+                                        self.switch_erase_tool(tool, &toast);
+                                    }
+                                }
+                            });
+                        }
+                        ui.label(
+                            egui::RichText::new("オブジェクト:")
+                                .color(egui::Color32::from_gray(200)),
+                        );
+                        let object_rows: [[(&str, EraseTool); 2]; 3] = [
                             [
                                 ("選択 [S]", EraseTool::Select),
-                                ("筆 [B]", EraseTool::Brush),
-                            ],
-                            [
-                                ("囲み [L]", EraseTool::Lasso),
                                 ("直線 [I]", EraseTool::Line),
                             ],
                             [
@@ -2047,7 +2071,7 @@ impl App {
                                 ("楕円 [O]", EraseTool::Ellipse),
                             ],
                         ];
-                        for row in tool_rows.iter() {
+                        for row in object_rows.iter() {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
                                 for &(label, tool) in row.iter() {
@@ -2068,6 +2092,14 @@ impl App {
                                 }
                             });
                         }
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("オブジェクトは下地の上に作成順で反映")
+                                    .size(10.0)
+                                    .color(egui::Color32::from_gray(150)),
+                            )
+                            .wrap(),
+                        );
 
                         // ── ブラシ半径 / 直線太さ スライダー ──
                         if self.erase_tool == EraseTool::Brush {
@@ -2159,7 +2191,7 @@ impl App {
                             矢印:シフト [/]:回転 (Ctrl:10倍)\n\
                             Space+ドラッグ:パン操作\n\
                             Ctrl+ドラッグ: 筆→太さ\n\
-                            \u{00A0}縦横線→パン/傾き 選択→回転/太さ\n\
+                            \u{00A0}縦横線→パン/傾き\n\
                             選択ツール+クリック=選択  Del:削除\n\
                             描画後はそのままハンドルで微調整可";
                         ui.add(
@@ -3270,65 +3302,6 @@ pub(crate) fn rotate_bitmap(mask: &mut [bool], w: usize, h: usize, cx: f32, cy: 
             };
         }
     }
-}
-
-// (Phase 2b で `dist_sq` は削除。距離判定は `vector_edit::hit_test` 内部で行う。)
-
-/// Shape の AABB (回転後の 4 隅から取る)。
-pub(crate) fn shape_bbox(shape: &Shape) -> (f32, f32, f32, f32) {
-    let corners = match shape {
-        Shape::Line {
-            p0, p1, thickness, ..
-        } => {
-            let dx = p1.0 - p0.0;
-            let dy = p1.1 - p0.1;
-            let len = (dx * dx + dy * dy).sqrt().max(1e-6);
-            let nx = -dy / len;
-            let ny = dx / len;
-            let half = (thickness * 0.5).max(0.0);
-            [
-                (p0.0 + nx * half, p0.1 + ny * half),
-                (p1.0 + nx * half, p1.1 + ny * half),
-                (p1.0 - nx * half, p1.1 - ny * half),
-                (p0.0 - nx * half, p0.1 - ny * half),
-            ]
-        }
-        Shape::Rect {
-            center,
-            half_w,
-            half_h,
-            rotation_rad,
-        }
-        | Shape::Ellipse {
-            center,
-            rx: half_w,
-            ry: half_h,
-            rotation_rad,
-        } => crate::mask_db::rect_corners(*center, *half_w, *half_h, *rotation_rad),
-    };
-    bounding_box(&corners)
-}
-
-pub(crate) fn bounding_box(pts: &[(f32, f32)]) -> (f32, f32, f32, f32) {
-    let mut xmin = f32::MAX;
-    let mut ymin = f32::MAX;
-    let mut xmax = f32::MIN;
-    let mut ymax = f32::MIN;
-    for &(x, y) in pts {
-        if x < xmin {
-            xmin = x;
-        }
-        if y < ymin {
-            ymin = y;
-        }
-        if x > xmax {
-            xmax = x;
-        }
-        if y > ymax {
-            ymax = y;
-        }
-    }
-    (xmin, ymin, xmax, ymax)
 }
 
 /// 偶奇規則の点多角形判定。

@@ -204,6 +204,7 @@ pub fn compute_handle_layout(shape: &Shape, scale: f32) -> HandleLayout {
             half_w,
             half_h,
             rotation_rad,
+            ..
         } => {
             let body = rect_corners(*center, *half_w, *half_h, *rotation_rad);
             let edges = rect_edge_midpoints(*center, *half_w, *half_h, *rotation_rad);
@@ -222,6 +223,7 @@ pub fn compute_handle_layout(shape: &Shape, scale: f32) -> HandleLayout {
             rx,
             ry,
             rotation_rad,
+            ..
         } => {
             // Ellipse の bbox 領域 (Rect と同じ算出)。本体ヒットは bbox で判定する。
             let body = rect_corners(*center, *rx, *ry, *rotation_rad);
@@ -597,12 +599,14 @@ fn bbox_params(shape: &Shape) -> ((f32, f32), f32, f32, f32) {
             half_w,
             half_h,
             rotation_rad,
+            ..
         } => (*center, *half_w, *half_h, *rotation_rad),
         Shape::Ellipse {
             center,
             rx,
             ry,
             rotation_rad,
+            ..
         } => (*center, *rx, *ry, *rotation_rad),
         Shape::Line { .. } => (shape.center(), 0.0, 0.0, 0.0),
     }
@@ -669,6 +673,7 @@ fn apply_line_thickness_drag(base: Shape, origin: (f32, f32), cur: (f32, f32)) -
         p1,
         kind,
         thickness: base_thickness,
+        op,
     } = base
     {
         let dx = p1.0 - p0.0;
@@ -688,6 +693,7 @@ fn apply_line_thickness_drag(base: Shape, origin: (f32, f32), cur: (f32, f32)) -
         // 線は中点を挟んで対称に広がるので、片側 delta_outward の 2 倍が太さ delta。
         let new_thickness = (base_thickness + 2.0 * delta_outward).max(1.0);
         Shape::Line {
+            op,
             p0,
             p1,
             kind,
@@ -864,13 +870,19 @@ fn apply_resize_drag(
     };
 
     match base {
-        Shape::Rect { rotation_rad, .. } => Shape::Rect {
+        Shape::Rect {
+            op, rotation_rad, ..
+        } => Shape::Rect {
+            op,
             center: new_center,
             half_w: new_hw,
             half_h: new_hh,
             rotation_rad,
         },
-        Shape::Ellipse { rotation_rad, .. } => Shape::Ellipse {
+        Shape::Ellipse {
+            op, rotation_rad, ..
+        } => Shape::Ellipse {
+            op,
             center: new_center,
             rx: new_hw,
             ry: new_hh,
@@ -1042,10 +1054,11 @@ pub fn draw_handles(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mask_db::{LineKind, Shape};
+    use crate::mask_db::{LineKind, Shape, ShapeOp};
 
     fn rect_at(cx: f32, cy: f32, hw: f32, hh: f32, rot: f32) -> Shape {
         Shape::Rect {
+            op: ShapeOp::Add,
             center: (cx, cy),
             half_w: hw,
             half_h: hh,
@@ -1055,6 +1068,7 @@ mod tests {
 
     fn ellipse_at(cx: f32, cy: f32, rx: f32, ry: f32, rot: f32) -> Shape {
         Shape::Ellipse {
+            op: ShapeOp::Add,
             center: (cx, cy),
             rx,
             ry,
@@ -1064,6 +1078,7 @@ mod tests {
 
     fn line_at(p0: (f32, f32), p1: (f32, f32), th: f32) -> Shape {
         Shape::Line {
+            op: ShapeOp::Add,
             kind: LineKind::Diagonal,
             p0,
             p1,
@@ -1282,6 +1297,7 @@ mod tests {
             half_w,
             half_h,
             rotation_rad,
+            ..
         } = new
         {
             // 西辺中点 = new_center + R * (-new_hw, 0) が anchor と一致する必要がある
@@ -1330,6 +1346,7 @@ mod tests {
             half_w,
             half_h,
             rotation_rad,
+            ..
         } = new
         {
             let (s2, c2) = rotation_rad.sin_cos();

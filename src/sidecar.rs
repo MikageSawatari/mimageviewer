@@ -759,6 +759,7 @@ mod tests {
                 p0,
                 p1,
                 thickness,
+                ..
             } => {
                 assert_eq!(p0, (10.0, 20.0));
                 assert_eq!(p1, (90.0, 20.0));
@@ -842,12 +843,14 @@ mod tests {
                 data: String::new(),
                 vectors: vec![
                     crate::mask_db::Shape::Rect {
+                        op: crate::mask_db::ShapeOp::Add,
                         center: (50.0, 50.0),
                         half_w: 20.0,
                         half_h: 10.0,
                         rotation_rad: 0.5,
                     },
                     crate::mask_db::Shape::Ellipse {
+                        op: crate::mask_db::ShapeOp::Add,
                         center: (30.0, 70.0),
                         rx: 15.0,
                         ry: 8.0,
@@ -871,6 +874,7 @@ mod tests {
                 half_w,
                 half_h,
                 rotation_rad,
+                ..
             } => {
                 assert_eq!(center, (50.0, 50.0));
                 assert!((half_w - 20.0).abs() < 1e-3);

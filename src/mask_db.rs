@@ -133,28 +133,53 @@ pub fn rasterize_vectors_into(mask: &mut [bool], vectors: &[LineObject], w: usiz
 ///
 /// ```json
 /// {"type":"line","kind":"diag","p0":[10,10],"p1":[90,10],"thickness":4}
-/// {"type":"rect","center":[100,100],"half_w":40,"half_h":20,"rotation_rad":0}
+/// {"type":"rect","op":"subtract","center":[100,100],"half_w":40,"half_h":20,"rotation_rad":0}
 /// {"type":"ellipse","center":[200,200],"rx":30,"ry":20,"rotation_rad":0}
 /// ```
 ///
 /// 旧 `LineObject` 素 JSON (`{"kind":"diag", "p0":..., "p1":..., "thickness":..}`)
-/// も `Shape::Line` として読める。
+/// も `Shape::Line` として読める。`op` 未指定の既存 Shape は `add` として扱う。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ShapeOp {
+    Add,
+    Subtract,
+}
+
+impl Default for ShapeOp {
+    fn default() -> Self {
+        Self::Add
+    }
+}
+
+impl ShapeOp {
+    pub fn is_add(&self) -> bool {
+        matches!(self, Self::Add)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Shape {
     Line {
+        #[serde(default, skip_serializing_if = "ShapeOp::is_add")]
+        op: ShapeOp,
         kind: LineKind,
         p0: (f32, f32),
         p1: (f32, f32),
         thickness: f32,
     },
     Rect {
+        #[serde(default, skip_serializing_if = "ShapeOp::is_add")]
+        op: ShapeOp,
         center: (f32, f32),
         half_w: f32,
         half_h: f32,
         rotation_rad: f32,
     },
     Ellipse {
+        #[serde(default, skip_serializing_if = "ShapeOp::is_add")]
+        op: ShapeOp,
         center: (f32, f32),
         rx: f32,
         ry: f32,
@@ -163,6 +188,26 @@ pub enum Shape {
 }
 
 impl Shape {
+    /// この Shape が最終マスクへどう合成されるか。
+    ///
+    /// `Add` はマスクを追加し、`Subtract` はそれまでのビットマップ/Shape 結果を削る。
+    /// 既存データは `op` 未指定なので `Add` として読み込む。
+    pub fn op(&self) -> ShapeOp {
+        match self {
+            Shape::Line { op, .. } | Shape::Rect { op, .. } | Shape::Ellipse { op, .. } => *op,
+        }
+    }
+
+    /// 同じ幾何形状のまま合成操作だけを変える。
+    pub fn with_op(mut self, new_op: ShapeOp) -> Self {
+        match &mut self {
+            Shape::Line { op, .. } | Shape::Rect { op, .. } | Shape::Ellipse { op, .. } => {
+                *op = new_op;
+            }
+        }
+        self
+    }
+
     /// オブジェクトの中心点 (回転基準)。
     pub fn center(&self) -> (f32, f32) {
         match self {
@@ -263,6 +308,7 @@ impl Shape {
                 p0,
                 p1,
                 thickness,
+                ..
             } => Some(LineObject {
                 kind: *kind,
                 p0: *p0,
@@ -277,6 +323,7 @@ impl Shape {
 impl From<LineObject> for Shape {
     fn from(line: LineObject) -> Self {
         Shape::Line {
+            op: ShapeOp::Add,
             kind: line.kind,
             p0: line.p0,
             p1: line.p1,
@@ -306,6 +353,7 @@ impl<'de> Deserialize<'de> for Shape {
                     let f: TaggedLineFields =
                         serde_json::from_value(v.clone()).map_err(DeError::custom)?;
                     Ok(Shape::Line {
+                        op: f.op,
                         kind: f.kind,
                         p0: f.p0,
                         p1: f.p1,
@@ -316,6 +364,7 @@ impl<'de> Deserialize<'de> for Shape {
                     let f: TaggedRectFields =
                         serde_json::from_value(v.clone()).map_err(DeError::custom)?;
                     Ok(Shape::Rect {
+                        op: f.op,
                         center: f.center,
                         half_w: f.half_w,
                         half_h: f.half_h,
@@ -326,6 +375,7 @@ impl<'de> Deserialize<'de> for Shape {
                     let f: TaggedEllipseFields =
                         serde_json::from_value(v.clone()).map_err(DeError::custom)?;
                     Ok(Shape::Ellipse {
+                        op: f.op,
                         center: f.center,
                         rx: f.rx,
                         ry: f.ry,
@@ -340,6 +390,7 @@ impl<'de> Deserialize<'de> for Shape {
             // 旧 LineObject (タグなし): 必須キー揃いを確認してから legacy として解釈
             let legacy: LegacyLineFields = serde_json::from_value(v).map_err(DeError::custom)?;
             Ok(Shape::Line {
+                op: ShapeOp::Add,
                 kind: legacy.kind,
                 p0: legacy.p0,
                 p1: legacy.p1,
@@ -358,6 +409,8 @@ impl<'de> Deserialize<'de> for Shape {
 // その他のフィールドだけ受ける (`type` を含む追加フィールドは serde が無視する)。
 #[derive(Deserialize)]
 struct TaggedLineFields {
+    #[serde(default)]
+    op: ShapeOp,
     kind: LineKind,
     p0: (f32, f32),
     p1: (f32, f32),
@@ -366,6 +419,8 @@ struct TaggedLineFields {
 
 #[derive(Deserialize)]
 struct TaggedRectFields {
+    #[serde(default)]
+    op: ShapeOp,
     center: (f32, f32),
     half_w: f32,
     half_h: f32,
@@ -375,6 +430,8 @@ struct TaggedRectFields {
 
 #[derive(Deserialize)]
 struct TaggedEllipseFields {
+    #[serde(default)]
+    op: ShapeOp,
     center: (f32, f32),
     rx: f32,
     ry: f32,
@@ -481,6 +538,7 @@ pub fn rasterize_shape_into(mask: &mut [bool], shape: &Shape, w: usize, h: usize
             half_w,
             half_h,
             rotation_rad,
+            ..
         } => {
             let pts = rect_corners(*center, *half_w, *half_h, *rotation_rad);
             scanline_fill_polygon(mask, &pts, w, h, value);
@@ -490,16 +548,22 @@ pub fn rasterize_shape_into(mask: &mut [bool], shape: &Shape, w: usize, h: usize
             rx,
             ry,
             rotation_rad,
+            ..
         } => {
             scanline_fill_ellipse(mask, *center, *rx, *ry, *rotation_rad, w, h, value);
         }
     }
 }
 
-/// `Shape` 群を既存の 1bit マスクに OR で重ねる (in-place、`true` 塗り)。
+/// `Shape` 群を既存の 1bit マスクに作成順で重ねる。
+///
+/// ビットマップマスクを下地にし、各 Shape の `op` に応じて `Add` は `true`、
+/// `Subtract` は `false` を塗る。これにより、消去モードで作った矩形/楕円/線は
+/// 既存 Shape を削除せず「上から削るオブジェクト」として振る舞う。
 pub fn rasterize_shapes_into(mask: &mut [bool], shapes: &[Shape], w: usize, h: usize) {
     for s in shapes {
-        rasterize_shape_into(mask, s, w, h, true);
+        let value = matches!(s.op(), ShapeOp::Add);
+        rasterize_shape_into(mask, s, w, h, value);
     }
 }
 
@@ -912,6 +976,7 @@ mod tests {
     #[test]
     fn shape_line_tagged_roundtrip() {
         let s = Shape::Line {
+            op: ShapeOp::Add,
             kind: LineKind::Diagonal,
             p0: (10.0, 20.0),
             p1: (100.0, 200.0),
@@ -920,6 +985,10 @@ mod tests {
         let json = shapes_to_json(&[s]).unwrap();
         // タグ付き形式で出ているか
         assert!(json.contains("\"type\":\"line\""));
+        assert!(
+            !json.contains("\"op\""),
+            "default add op should stay omitted for compact/back-compatible JSON: {json}"
+        );
         let back = shapes_from_json(&json);
         assert_eq!(back.len(), 1);
         assert_eq!(back[0], s);
@@ -928,6 +997,7 @@ mod tests {
     #[test]
     fn shape_rect_tagged_roundtrip() {
         let s = Shape::Rect {
+            op: ShapeOp::Add,
             center: (50.0, 60.0),
             half_w: 20.0,
             half_h: 10.0,
@@ -942,6 +1012,7 @@ mod tests {
     #[test]
     fn shape_ellipse_tagged_roundtrip() {
         let s = Shape::Ellipse {
+            op: ShapeOp::Add,
             center: (100.0, 100.0),
             rx: 30.0,
             ry: 15.0,
@@ -949,6 +1020,29 @@ mod tests {
         };
         let json = shapes_to_json(&[s]).unwrap();
         assert!(json.contains("\"type\":\"ellipse\""));
+        let back = shapes_from_json(&json);
+        assert_eq!(back, vec![s]);
+    }
+
+    #[test]
+    fn shape_op_defaults_to_add_when_missing() {
+        let json = r#"[{"type":"rect","center":[50.0,50.0],"half_w":10.0,"half_h":5.0,"rotation_rad":0.0}]"#;
+        let shapes = shapes_from_json(json);
+        assert_eq!(shapes.len(), 1);
+        assert_eq!(shapes[0].op(), ShapeOp::Add);
+    }
+
+    #[test]
+    fn shape_subtract_tagged_roundtrip() {
+        let s = Shape::Rect {
+            op: ShapeOp::Subtract,
+            center: (50.0, 60.0),
+            half_w: 20.0,
+            half_h: 10.0,
+            rotation_rad: 0.5,
+        };
+        let json = shapes_to_json(&[s]).unwrap();
+        assert!(json.contains("\"op\":\"subtract\""));
         let back = shapes_from_json(&json);
         assert_eq!(back, vec![s]);
     }
@@ -962,6 +1056,7 @@ mod tests {
         assert_eq!(
             shapes[0],
             Shape::Line {
+                op: ShapeOp::Add,
                 kind: LineKind::Diagonal,
                 p0: (10.0, 20.0),
                 p1: (100.0, 200.0),
@@ -1092,6 +1187,7 @@ mod tests {
         // 100x100 マスクに中心 (50, 50)、half=10×5、回転 0 の矩形を塗る
         let mut mask = vec![false; 100 * 100];
         let shape = Shape::Rect {
+            op: ShapeOp::Add,
             center: (50.0, 50.0),
             half_w: 10.0,
             half_h: 5.0,
@@ -1116,6 +1212,7 @@ mod tests {
         // 200x200 マスクに中心 (100, 100)、rx=50、ry=30、回転 0 の楕円
         let mut mask = vec![false; 200 * 200];
         let shape = Shape::Ellipse {
+            op: ShapeOp::Add,
             center: (100.0, 100.0),
             rx: 50.0,
             ry: 30.0,
@@ -1140,6 +1237,7 @@ mod tests {
         // 90° 回転で rx と ry が入れ替わったように見える
         let mut mask = vec![false; 200 * 200];
         let shape = Shape::Ellipse {
+            op: ShapeOp::Add,
             center: (100.0, 100.0),
             rx: 50.0,
             ry: 30.0,
@@ -1159,6 +1257,7 @@ mod tests {
         // 45° 回転で対角線方向に細長くなる
         let mut mask = vec![false; 100 * 100];
         let shape = Shape::Rect {
+            op: ShapeOp::Add,
             center: (50.0, 50.0),
             half_w: 20.0,
             half_h: 5.0,
@@ -1176,8 +1275,48 @@ mod tests {
     }
 
     #[test]
+    fn rasterize_shapes_apply_op_in_creation_order() {
+        let mut mask = vec![false; 40 * 40];
+        let shapes = vec![
+            Shape::Rect {
+                op: ShapeOp::Add,
+                center: (20.0, 20.0),
+                half_w: 12.0,
+                half_h: 12.0,
+                rotation_rad: 0.0,
+            },
+            Shape::Rect {
+                op: ShapeOp::Subtract,
+                center: (20.0, 20.0),
+                half_w: 4.0,
+                half_h: 4.0,
+                rotation_rad: 0.0,
+            },
+            Shape::Ellipse {
+                op: ShapeOp::Add,
+                center: (20.0, 20.0),
+                rx: 2.0,
+                ry: 2.0,
+                rotation_rad: 0.0,
+            },
+        ];
+        rasterize_shapes_into(&mut mask, &shapes, 40, 40);
+
+        assert!(mask[20 * 40 + 10], "first add shape should paint");
+        assert!(
+            !mask[20 * 40 + 16],
+            "subtract shape should cut the add shape"
+        );
+        assert!(
+            mask[20 * 40 + 20],
+            "later add shape should paint over subtract"
+        );
+    }
+
+    #[test]
     fn shape_translate_rotate_compose() {
         let mut s = Shape::Rect {
+            op: ShapeOp::Add,
             center: (50.0, 50.0),
             half_w: 10.0,
             half_h: 5.0,
@@ -1206,6 +1345,7 @@ mod tests {
     #[test]
     fn shape_scale_isotropic() {
         let mut s = Shape::Rect {
+            op: ShapeOp::Add,
             center: (100.0, 100.0),
             half_w: 20.0,
             half_h: 10.0,
@@ -1243,6 +1383,7 @@ mod tests {
     #[test]
     fn shape_as_legacy_line_returns_none_for_rect_ellipse() {
         let r = Shape::Rect {
+            op: ShapeOp::Add,
             center: (0.0, 0.0),
             half_w: 1.0,
             half_h: 1.0,
@@ -1250,6 +1391,7 @@ mod tests {
         };
         assert!(r.as_legacy_line().is_none());
         let e = Shape::Ellipse {
+            op: ShapeOp::Add,
             center: (0.0, 0.0),
             rx: 1.0,
             ry: 1.0,

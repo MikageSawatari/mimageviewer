@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crate::app::{App, ConcealSnapshot, EraseSpreadCtx};
 use crate::conceal::ConcealTool;
 use crate::fs_animation::FsCacheEntry;
-use crate::mask_db::{LineKind, Shape};
+use crate::mask_db::{LineKind, Shape, ShapeOp};
 use crate::ui_fullscreen::FsKeyAction;
 use crate::ui_fullscreen::draw_icons::{PanelToggleColors, panel_toggle_button};
 use crate::vector_edit;
@@ -1244,6 +1244,7 @@ impl App {
                 self.push_conceal_undo();
                 let shape = match self.conceal_tool {
                     ConcealTool::Line => Shape::Line {
+                        op: ShapeOp::Add,
                         kind: LineKind::Diagonal,
                         p0: start,
                         p1: end,
@@ -1255,6 +1256,7 @@ impl App {
                         let cx = (lx + rx) * 0.5;
                         let thick = (rx - lx).max(thickness);
                         Shape::Line {
+                            op: ShapeOp::Add,
                             kind: LineKind::Vertical,
                             p0: (cx, 0.0),
                             p1: (cx, h as f32),
@@ -1267,6 +1269,7 @@ impl App {
                         let cy = (ty + by) * 0.5;
                         let thick = (by - ty).max(thickness);
                         Shape::Line {
+                            op: ShapeOp::Add,
                             kind: LineKind::Horizontal,
                             p0: (0.0, cy),
                             p1: (w as f32, cy),
@@ -1317,12 +1320,14 @@ impl App {
                     let hh = dy.abs() * 0.5;
                     let shape = match self.conceal_tool {
                         ConcealTool::Rect => Shape::Rect {
+                            op: ShapeOp::Add,
                             center: (cx, cy),
                             half_w: hw,
                             half_h: hh,
                             rotation_rad: 0.0,
                         },
                         ConcealTool::Ellipse => Shape::Ellipse {
+                            op: ShapeOp::Add,
                             center: (cx, cy),
                             rx: hw,
                             ry: hh,
@@ -1338,34 +1343,23 @@ impl App {
         }
     }
 
-    /// 描画モードならベクタ追加、消去モードなら重なる shape を削除しビットマップも消す。
+    /// 描画モードなら Add Shape、消去モードなら Subtract Shape を追加する。
+    ///
+    /// ビットマップマスクを下地にし、その上に Shape を作成順で重ねる。
+    /// 消去モードの矩形/楕円/線は既存 Shape を丸ごと削除せず、上から削る
+    /// ベクターオブジェクトとして残る。
     fn commit_conceal_shape(&mut self, shape: Shape, paint: bool) {
-        if paint {
-            self.conceal_shapes.push(shape);
-            // 新規 shape を自動選択 (実機 FB)。コミット直後にハンドルが描画される
-            // ので、ユーザーは [S] で選択ツールへ切替→ハンドル操作で太さ/サイズを
-            // 微調整できる (= 「線幅をパネルで設定 → 引いた線にハンドルで調整」
-            // ワークフロー)。
-            self.conceal_selected_shape = Some(self.conceal_shapes.len() - 1);
+        let op = if paint {
+            ShapeOp::Add
         } else {
-            // 消去: 重なる shape を削除し、ビットマップも shape 範囲で消す。
-            //
-            // ⚠ retain 条件は **`separated` を保持** (= 重ならない shape は残す)。
-            // 消しゴム側 (`ui_erase.rs::commit_erase_shape`) と同じ規則。
-            // 旧版は `!(separated)` で逆動作になっており、消去ツールが「重なる
-            // shape を残し、関係ない shape を削除する」状態だった (Codex P1 指摘)。
-            let [w, h] = self.conceal_mask_size;
-            let (cx_min, cy_min, cx_max, cy_max) = shape_bbox(&shape);
-            self.conceal_shapes.retain(|s| {
-                let (sxmin, symin, sxmax, symax) = shape_bbox(s);
-                let separated =
-                    sxmax < cx_min || sxmin > cx_max || symax < cy_min || symin > cy_max;
-                separated
-            });
-            if let Some(mask) = self.conceal_mask.as_mut() {
-                crate::mask_db::rasterize_shape_into(mask, &shape, w, h, false);
-            }
-        }
+            ShapeOp::Subtract
+        };
+        self.conceal_shapes.push(shape.with_op(op));
+        // 新規 shape を自動選択 (実機 FB)。コミット直後にハンドルが描画される
+        // ので、ユーザーは [S] で選択ツールへ切替→ハンドル操作で太さ/サイズを
+        // 微調整できる (= 「線幅をパネルで設定 → 引いた線にハンドルで調整」
+        // ワークフロー)。
+        self.conceal_selected_shape = Some(self.conceal_shapes.len() - 1);
         self.conceal_mask_texture = None;
         // 新規 shape / shape 削除は conceal_cache の composite 内容を変えるので、
         // 現在編集中の idx 分だけ cache を破棄して次回 preview / 隠蔽合成時に
@@ -1748,31 +1742,19 @@ impl App {
                                 });
                                 ui.separator();
 
-                                // ツールパレット (8 個、2 列 × 4 行)
+                                // ツールパレット。筆/囲みはビットマップ下地、線/矩形/楕円は
+                                // その上に作成順で重なるオブジェクト。消去モードの
+                                // オブジェクトは Subtract Shape として残る。
                                 ui.label(
-                                    egui::RichText::new("ツール:")
+                                    egui::RichText::new("ビットマップ:")
                                         .color(egui::Color32::from_gray(200)),
                                 );
                                 let mut tool = self.conceal_tool;
-                                let tool_rows: [[(ConcealTool, &str); 2]; 4] = [
-                                    [
-                                        (ConcealTool::Select, "選択 [S]"),
-                                        (ConcealTool::Brush, "筆 [B]"),
-                                    ],
-                                    [
-                                        (ConcealTool::Lasso, "囲み [L]"),
-                                        (ConcealTool::Line, "直線 [I]"),
-                                    ],
-                                    [
-                                        (ConcealTool::VertLine, "縦線 [V]"),
-                                        (ConcealTool::HorizLine, "横線 [H]"),
-                                    ],
-                                    [
-                                        (ConcealTool::Rect, "矩形 [R]"),
-                                        (ConcealTool::Ellipse, "楕円 [O]"),
-                                    ],
-                                ];
-                                for row in tool_rows.iter() {
+                                let bitmap_rows: [[(ConcealTool, &str); 2]; 1] = [[
+                                    (ConcealTool::Brush, "筆 [B]"),
+                                    (ConcealTool::Lasso, "囲み [L]"),
+                                ]];
+                                for row in bitmap_rows.iter() {
                                     ui.horizontal(|ui| {
                                         ui.spacing_mut().item_spacing.x = 4.0;
                                         for &(kind, label) in row.iter() {
@@ -1790,6 +1772,50 @@ impl App {
                                         }
                                     });
                                 }
+                                ui.label(
+                                    egui::RichText::new("オブジェクト:")
+                                        .color(egui::Color32::from_gray(200)),
+                                );
+                                let object_rows: [[(ConcealTool, &str); 2]; 3] = [
+                                    [
+                                        (ConcealTool::Select, "選択 [S]"),
+                                        (ConcealTool::Line, "直線 [I]"),
+                                    ],
+                                    [
+                                        (ConcealTool::VertLine, "縦線 [V]"),
+                                        (ConcealTool::HorizLine, "横線 [H]"),
+                                    ],
+                                    [
+                                        (ConcealTool::Rect, "矩形 [R]"),
+                                        (ConcealTool::Ellipse, "楕円 [O]"),
+                                    ],
+                                ];
+                                for row in object_rows.iter() {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 4.0;
+                                        for &(kind, label) in row.iter() {
+                                            if panel_toggle_button(
+                                                ui,
+                                                label,
+                                                tool == kind,
+                                                Some(btn_size),
+                                                None,
+                                            )
+                                            .clicked()
+                                            {
+                                                tool = kind;
+                                            }
+                                        }
+                                    });
+                                }
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new("オブジェクトは下地の上に作成順で反映")
+                                            .size(10.0)
+                                            .color(egui::Color32::from_gray(150)),
+                                    )
+                                    .wrap(),
+                                );
                                 if tool != self.conceal_tool {
                                     self.conceal_tool = tool;
                                     self.conceal_drag = None;
@@ -2231,50 +2257,4 @@ fn point_in_polygon_local(p: (f32, f32), poly: &[(f32, f32)]) -> bool {
         j = i;
     }
     inside
-}
-
-/// shape の AABB (回転考慮後の 4 隅から取る)。
-fn shape_bbox(shape: &Shape) -> (f32, f32, f32, f32) {
-    let corners = match shape {
-        Shape::Line {
-            p0, p1, thickness, ..
-        } => {
-            // Line の corners (中心軸 + 太さ) を line_corners と同じロジックで取る
-            let dx = p1.0 - p0.0;
-            let dy = p1.1 - p0.1;
-            let len = (dx * dx + dy * dy).sqrt().max(1e-6);
-            let nx = -dy / len;
-            let ny = dx / len;
-            let half = (thickness * 0.5).max(0.0);
-            [
-                (p0.0 + nx * half, p0.1 + ny * half),
-                (p1.0 + nx * half, p1.1 + ny * half),
-                (p1.0 - nx * half, p1.1 - ny * half),
-                (p0.0 - nx * half, p0.1 - ny * half),
-            ]
-        }
-        Shape::Rect {
-            center,
-            half_w,
-            half_h,
-            rotation_rad,
-        }
-        | Shape::Ellipse {
-            center,
-            rx: half_w,
-            ry: half_h,
-            rotation_rad,
-        } => crate::mask_db::rect_corners(*center, *half_w, *half_h, *rotation_rad),
-    };
-    let mut min_x = f32::MAX;
-    let mut min_y = f32::MAX;
-    let mut max_x = f32::MIN;
-    let mut max_y = f32::MIN;
-    for &(x, y) in &corners {
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(x);
-        max_y = max_y.max(y);
-    }
-    (min_x, min_y, max_x, max_y)
 }

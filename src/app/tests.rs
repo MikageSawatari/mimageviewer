@@ -3668,26 +3668,35 @@ mod favorite_adjustment_defaults_tests {
     /// 同じ idx への再投入だけは旧版どおり cancel する。
     #[test]
     fn erase_inpaint_pending_keeps_jobs_for_different_pages() {
+        use crate::ui_erase::{EraseInpaintKind, EraseInpaintPending, EraseInpaintPendingKey};
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         let mut app = setup_app();
         // 2 つの idx (0=左, 1=右) に対して dummy pending を入れる。
         let make_pending = |idx: usize| {
             let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
-            crate::ui_erase::EraseInpaintPending {
+            EraseInpaintPending {
                 idx,
                 items_generation: 0,
                 path_key: None,
                 rx,
                 cancel: Arc::new(AtomicBool::new(false)),
                 started_at: std::time::Instant::now(),
+                input_generation: 0,
+                mask_generation: 0,
                 log_prefix: "test",
+                is_preview: false,
             }
+        };
+        let commit_key = |idx| EraseInpaintPendingKey {
+            idx,
+            kind: EraseInpaintKind::Commit,
         };
         let p0 = make_pending(0);
         let cancel_p0 = p0.cancel.clone();
-        app.erase_inpaint_pending.insert(0, p0);
-        app.erase_inpaint_pending.insert(1, make_pending(1));
+        app.erase_inpaint_pending.insert(commit_key(0), p0);
+        app.erase_inpaint_pending
+            .insert(commit_key(1), make_pending(1));
         assert_eq!(
             app.erase_inpaint_pending.len(),
             2,
@@ -3696,10 +3705,11 @@ mod favorite_adjustment_defaults_tests {
 
         // 異なる idx (1) への再投入をシミュレート: idx=0 の pending はそのまま残るべき。
         // (run_inpaint_and_cache の挙動を最小再現)
-        if let Some(prev) = app.erase_inpaint_pending.remove(&1) {
+        if let Some(prev) = app.erase_inpaint_pending.remove(&commit_key(1)) {
             prev.cancel.store(true, Ordering::Relaxed);
         }
-        app.erase_inpaint_pending.insert(1, make_pending(1));
+        app.erase_inpaint_pending
+            .insert(commit_key(1), make_pending(1));
         assert_eq!(app.erase_inpaint_pending.len(), 2);
         assert!(
             !cancel_p0.load(Ordering::Relaxed),
@@ -3707,7 +3717,7 @@ mod favorite_adjustment_defaults_tests {
         );
 
         // 同じ idx (0) への再投入は旧 pending を cancel する。
-        if let Some(prev) = app.erase_inpaint_pending.remove(&0) {
+        if let Some(prev) = app.erase_inpaint_pending.remove(&commit_key(0)) {
             prev.cancel.store(true, Ordering::Relaxed);
         }
         assert!(
