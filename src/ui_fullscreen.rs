@@ -2401,17 +2401,17 @@ impl App {
 
             // 消しゴムプレビュー中 (`erase_preview_active = true`) の特殊扱い。
             //
-            // - 旧版は「ai/adj が空のまま fs_cache まで落ちると低解像度 raw に
-            //   なる」のを避けるため、fallback (= erase_base_texture) を fs_cache
-            //   の **前** に置いていた。これは初回 (= MI-GAN 未実行) の安全策。
-            // - しかし `run_inpaint_for_preview` をプレビュー押下時に走らせるよう
-            //   になった (実機 FB R4 対応) → MI-GAN 完了後は fs_cache が **高解像度
-            //   の新マスク結果** で更新される。このとき fallback を先にすると
-            //   「base のまま (= 新マスク反映なし)」を見せ続けてしまう。
+            // 現仕様 (Codex P1 R4 #1 + R5 対応):
+            // - プレビュー押下時の MI-GAN 結果は **erase_preview_cache に隔離** して
+            //   fs_cache を触らない。ESC キャンセル / マスク変更で安全に破棄できる。
+            // - したがってプレビュー表示は `erase_preview_cache` が最優先。完了前 /
+            //   不在の場合は通常レイヤ (adj > ai > fs_cache) を見せる。
+            // - 通常レイヤがすべて空のとき (= まだ何もキャッシュされていない) は
+            //   `ensure_erase_base_texture` を fallback として最後に使う。
             //
-            // 新方針: プレビュー時は fs_cache を優先し、fallback を**最後**にする。
-            // → MI-GAN 完了後は fs_cache の新結果が見え、未完了 / マスク空の場合は
-            //   fallback で base + adj を見せる (= 旧来動作にフォールバック)。
+            // 旧版は preview MI-GAN 結果を fs_cache に書き戻していたが、その経路は
+            // 廃止済み (= R4 で preview_cache 隔離へ移行)。下のコードで fs_cache が
+            // 出てくるのは「プレビューが未完了 / 不在の間、通常表示を維持する」用途。
             let fs_cache_tex = match self.fs_cache.get(&fs_idx) {
                 Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
                 Some(FsCacheEntry::Animated {

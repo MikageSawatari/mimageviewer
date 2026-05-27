@@ -1021,6 +1021,13 @@ impl App {
                 if drag_idx < self.conceal_shapes.len() {
                     self.conceal_shapes[drag_idx] = new_shape;
                 }
+                // R5: ドラッグ中もマスク overlay + 隠蔽テクスチャを毎フレ再生成。
+                // mask_texture を落とすと次フレームの ensure_conceal_mask_texture で再生、
+                // conceal_caches を落とすとプレビュー押下時の合成結果も追従する。
+                self.conceal_mask_texture = None;
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.clear_conceal_caches(fs_idx);
+                }
             }
             if primary_released {
                 self.conceal_drag = None;
@@ -1116,10 +1123,14 @@ impl App {
             let new_shape = vector_edit::apply_drag(&drag, img_pos, &modifiers);
             if drag.idx() < self.conceal_shapes.len() {
                 self.conceal_shapes[drag.idx()] = new_shape;
-                // ドラッグ中はマスクテクスチャを invalidate しない (Codex P2 #8)。
-                // 4K 画像で毎フレーム 32MB の RGBA バッファ生成 + GPU upload が走るのを
-                // 避ける。ユーザーには handle の bbox 描画でリアルタイムフィードバックが
-                // 出ているので、最終 mask テクスチャは release 後の 1 回更新で十分。
+                // R5: ドラッグ中もマスク overlay + 隠蔽合成キャッシュを毎フレ更新する
+                // (実機 FB: 「ハンドルのドラッグでも楕円は再描画されません」)。
+                // 旧版は 4K = 32MB のテクスチャアップロードを嫌って release 1 回更新に
+                // していたが、ユーザー要望でリアルタイム化を優先する。
+                self.conceal_mask_texture = None;
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.clear_conceal_caches(fs_idx);
+                }
             }
             if primary_released {
                 self.conceal_drag = None;
@@ -1617,99 +1628,96 @@ impl App {
                         *ui.visuals_mut() = egui::Visuals::dark();
                         ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
 
-                        // パネル全体を ScrollArea で囲み、ウィンドウ縦幅より大きいときに
-                        // スクロール可能にする (実機 FB R4 #2)。
-                        let max_height = (full_rect.max.y - panel_pos.y - 20.0).max(120.0);
+                        // ── ヘッダ (タイトル + プレビュー + 閉じる × ボタン) ──
+                        // R5: ヘッダは **ScrollArea の外** に出す。旧版はスクロールバー
+                        // が × ボタンに重なる + × が縦スクロールに巻き込まれる現象が
+                        // あったため (実機 FB R5、消しゴム側と同じ対応)。
+                        let mut preview_pressed = false;
+                        let mut close_clicked = false;
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("隠蔽加工")
+                                    .size(15.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    // 閉じる × ボタン
+                                    let (close_rect, close_resp) = ui.allocate_exact_size(
+                                        egui::vec2(26.0, 22.0),
+                                        egui::Sense::click(),
+                                    );
+                                    let close_bg = if close_resp.hovered() {
+                                        egui::Color32::from_rgba_unmultiplied(220, 80, 80, 200)
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
+                                    };
+                                    ui.painter().rect_filled(close_rect, 4.0, close_bg);
+                                    crate::ui_fullscreen::draw_icons::draw_close_icon(
+                                        ui.painter(),
+                                        close_rect.center(),
+                                        8.0,
+                                    );
+                                    if close_resp.clicked() {
+                                        close_clicked = true;
+                                    }
+                                    close_resp.on_hover_text("閉じる (Esc / Ctrl+M)");
+                                    ui.add_space(2.0);
+                                    // プレビュー 目アイコン (= while held)
+                                    let (eye_rect, eye_resp) = ui.allocate_exact_size(
+                                        egui::vec2(26.0, 22.0),
+                                        egui::Sense::click_and_drag(),
+                                    );
+                                    let eye_bg = if eye_resp.is_pointer_button_down_on() {
+                                        // 押下中 = アクセント青
+                                        egui::Color32::from_rgb(60, 120, 200)
+                                    } else if eye_resp.hovered() {
+                                        egui::Color32::from_rgba_unmultiplied(100, 100, 100, 220)
+                                    } else {
+                                        egui::Color32::from_rgba_unmultiplied(80, 80, 80, 120)
+                                    };
+                                    ui.painter().rect_filled(eye_rect, 4.0, eye_bg);
+                                    crate::ui_fullscreen::draw_icons::draw_eye_icon(
+                                        ui.painter(),
+                                        eye_rect.center(),
+                                        8.0,
+                                    );
+                                    if eye_resp.is_pointer_button_down_on() {
+                                        preview_pressed = true;
+                                    }
+                                    eye_resp.on_hover_text(
+                                        "押している間: モザイク反映後の最終結果プレビュー",
+                                    );
+                                },
+                            );
+                        });
+                        self.conceal_preview_active = preview_pressed;
+                        if close_clicked {
+                            should_close_after_draw = true;
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "処理: {}",
+                                self.settings.conceal_type.label()
+                            ))
+                            .color(egui::Color32::from_gray(200)),
+                        );
+                        ui.separator();
+
+                        // ── 残りを ScrollArea で囲む ──
+                        // R5+: max_height は ctx.content_rect() 基準 + auto_shrink 両軸 false
+                        // (= content が短くてもウィンドウ下端まで広がる)。
+                        // 実機 FB R5 二次対応: 「ウィンドウのしたギリギリくらいまでのサイズに
+                        // して、それでも収まらない場合のみスクロールを必要とする」要件。
+                        let screen_max_y = ctx.content_rect().max.y;
+                        let avail_top = ui.cursor().top();
+                        let max_height = (screen_max_y - avail_top - 20.0).max(120.0);
                         egui::ScrollArea::vertical()
                             .max_height(max_height)
-                            .auto_shrink([false, true])
+                            .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                // ── ヘッダ (タイトル + プレビュー + 閉じる × ボタン) ──
-                                // 右端に「目アイコン (プレビュー)」と「× (閉じる)」を並べる。
-                                // プレビューは押している間だけ `conceal_preview_active = true`
-                                // にして表示パイプラインで合成を含める。閉じるはモード退出。
-                                let mut preview_pressed = false;
-                                let mut close_clicked = false;
-                                ui.horizontal(|ui| {
-                                    ui.label(
-                                        egui::RichText::new("隠蔽加工")
-                                            .size(15.0)
-                                            .strong()
-                                            .color(egui::Color32::WHITE),
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            // 閉じる × ボタン
-                                            let (close_rect, close_resp) = ui.allocate_exact_size(
-                                                egui::vec2(26.0, 22.0),
-                                                egui::Sense::click(),
-                                            );
-                                            let close_bg = if close_resp.hovered() {
-                                                egui::Color32::from_rgba_unmultiplied(
-                                                    220, 80, 80, 200,
-                                                )
-                                            } else {
-                                                egui::Color32::from_rgba_unmultiplied(
-                                                    80, 80, 80, 120,
-                                                )
-                                            };
-                                            ui.painter().rect_filled(close_rect, 4.0, close_bg);
-                                            crate::ui_fullscreen::draw_icons::draw_close_icon(
-                                                ui.painter(),
-                                                close_rect.center(),
-                                                8.0,
-                                            );
-                                            if close_resp.clicked() {
-                                                close_clicked = true;
-                                            }
-                                            close_resp.on_hover_text("閉じる (Esc / Ctrl+M)");
-                                            ui.add_space(2.0);
-                                            // プレビュー 目アイコン (= while held)
-                                            let (eye_rect, eye_resp) = ui.allocate_exact_size(
-                                                egui::vec2(26.0, 22.0),
-                                                egui::Sense::click_and_drag(),
-                                            );
-                                            let eye_bg = if eye_resp.is_pointer_button_down_on() {
-                                                // 押下中 = アクセント青
-                                                egui::Color32::from_rgb(60, 120, 200)
-                                            } else if eye_resp.hovered() {
-                                                egui::Color32::from_rgba_unmultiplied(
-                                                    100, 100, 100, 220,
-                                                )
-                                            } else {
-                                                egui::Color32::from_rgba_unmultiplied(
-                                                    80, 80, 80, 120,
-                                                )
-                                            };
-                                            ui.painter().rect_filled(eye_rect, 4.0, eye_bg);
-                                            crate::ui_fullscreen::draw_icons::draw_eye_icon(
-                                                ui.painter(),
-                                                eye_rect.center(),
-                                                8.0,
-                                            );
-                                            if eye_resp.is_pointer_button_down_on() {
-                                                preview_pressed = true;
-                                            }
-                                            eye_resp.on_hover_text(
-                                                "押している間: モザイク反映後の最終結果プレビュー",
-                                            );
-                                        },
-                                    );
-                                });
-                                self.conceal_preview_active = preview_pressed;
-                                if close_clicked {
-                                    should_close_after_draw = true;
-                                }
-                                ui.label(
-                                    egui::RichText::new(format!(
-                                        "処理: {}",
-                                        self.settings.conceal_type.label()
-                                    ))
-                                    .color(egui::Color32::from_gray(200)),
-                                );
-                                ui.separator();
-
                                 // 描画 / 消去 (active=赤/青、inactive=暗灰、hover=やや明灰)
                                 let btn_w = ((PANEL_W - 16.0 - 4.0) / 2.0).max(60.0);
                                 let btn_size = egui::vec2(btn_w, 24.0);

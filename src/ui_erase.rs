@@ -447,6 +447,12 @@ impl App {
                     self.erase_selected_shape = None;
                     self.erase_drag = None;
                     self.erase_mask_texture = None;
+                    // shape を消したので preview cache も破棄しないと「shape を消した
+                    // 直後の再 preview で古い inpaint 結果が一瞬見える」状態が残る
+                    // (Codex R5 P2)。
+                    if let Some(fs_idx) = self.fullscreen_idx {
+                        self.clear_erase_preview(fs_idx);
+                    }
                     self.show_feedback_toast("[ベクタ削除]".to_string());
                 }
             }
@@ -910,6 +916,15 @@ impl App {
                 if drag_idx < self.erase_shapes.len() {
                     self.erase_shapes[drag_idx] = new_shape;
                 }
+                // R5: ドラッグ中の毎フレ再描画 (= ハンドル / Pan を動かすたびに
+                // マスク overlay を作り直して画像上に反映)。
+                self.erase_mask_texture = None;
+                // shape の geometry が変わったので preview cache (= 古い MI-GAN
+                // 結果) を捨てる (Codex R5 P2: 「preview → 移動/変形 → 再 preview」で
+                // 再計算中の古い preview が見える漏れ)。
+                if let Some(fs_idx) = self.fullscreen_idx {
+                    self.clear_erase_preview(fs_idx);
+                }
             }
             if primary_released {
                 self.erase_drag = None;
@@ -986,8 +1001,17 @@ impl App {
         }
         let new_shape = vector_edit::apply_drag(&drag, cur, &modifiers);
         self.erase_shapes[idx] = new_shape;
-        // ドラッグ中のテクスチャ再生成は重い (4K 画像 RGBA = 32MB)。`primary_released`
-        // 後の Select tool 側でリセットする。Phase 2 Codex P2 #8 と同じ最適化。
+        // R5: ドラッグ中もマスクを毎フレ再生成する (実機 FB: 「ハンドルのドラッグでも
+        // 楕円は再描画されません。性能的に問題なければリアルタイムにマスクを表示」)。
+        // mask_texture を None に落とすと次フレームの ensure_mask_texture で再生成される。
+        // 4K RGBA だと 32MB のテクスチャアップロードになるが、ユーザーが要望した UX を
+        // 優先する (旧最適化コメントは削除)。
+        self.erase_mask_texture = None;
+        // shape geometry 変化 → 古い preview cache (= MI-GAN 結果) を捨てる
+        // (Codex R5 P2: 移動/変形後の再 preview で古い結果が一瞬見える漏れ)。
+        if let Some(fs_idx) = self.fullscreen_idx {
+            self.clear_erase_preview(fs_idx);
+        }
     }
 
     /// ツールパネルの矩形を返す。
@@ -1838,18 +1862,12 @@ impl App {
                         *ui.visuals_mut() = egui::Visuals::dark();
                         ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
 
-                        // パネル全体を ScrollArea で囲み、ウィンドウ縦幅より大きいときに
-                        // スクロール可能にする (実機 FB R4 #2: 「ウィンドウ縦幅が狭いと
-                        // パネル全体が表示できない」)。max_height は full_rect 下端 -
-                        // panel_pos.y - 余白で算出。auto_shrink: 縦は内容に合わせて
-                        // 縮む (= 内容が短いときは ScrollArea が小さくなる)、横は固定。
-                        let max_height = (full_rect.max.y - panel_pos.y - 20.0).max(120.0);
-                        egui::ScrollArea::vertical()
-                            .max_height(max_height)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-
                         // ── ヘッダ (タイトル + プレビュー + 閉じる × ボタン) ──
+                        // R5: ヘッダは **ScrollArea の外** に出す。旧版は ScrollArea
+                        // 内に置いていたため、スクロールバーが × ボタンに重なる + ×
+                        // が縦スクロールに巻き込まれる現象があった (実機 FB R5)。
+                        // ヘッダ固定にすることでスクロールバーも × の右側ではなく
+                        // ScrollArea (= 中身) の右端に張り付く。
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new("消しゴム")
@@ -1912,6 +1930,24 @@ impl App {
                                 },
                             );
                         });
+                        ui.separator();
+
+                        // ── 残り (ツール選択 / スライダー / スロット / ヘルプ) を
+                        //     ScrollArea で囲む ──
+                        // R5+: max_height は ctx.content_rect (= viewport 全体) 基準。
+                        // auto_shrink は **両軸 false** にして、コンテンツが短くても
+                        // ScrollArea がウィンドウ下端まで広がるようにする (実機 FB R5
+                        // 二次対応:「ウィンドウのしたギリギリくらいまでのサイズにして、
+                        // それでも収まらない場合のみスクロールを必要とする形にしたい」)。
+                        // 旧 auto_shrink([false, true]) は content にフィットしてしまい、
+                        // ウィンドウ下半分が空いて見えていた。
+                        let screen_max_y = ctx.content_rect().max.y;
+                        let avail_top = ui.cursor().top();
+                        let max_height = (screen_max_y - avail_top - 20.0).max(120.0);
+                        egui::ScrollArea::vertical()
+                            .max_height(max_height)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
 
                         // ボタン共通の最小サイズ。PANEL_W (= 190) - Frame::popup
                         // padding (~10*2) - 中央 gap (4) を 2 で割って、片側 ~78px。
@@ -2282,12 +2318,68 @@ impl App {
             Some(c) if c.iter().any(|&m| m) => c,
             _ => return false,
         };
-        let Some(original) = self.erase_base_cache.get(&fs_idx).map(Arc::clone) else {
-            return false;
+        // R5: プレビュー入力は **画像補正 + AI アップスケール後** のピクセルを使う。
+        // 旧版は erase_base_cache (= raw fs_cache から取った素画像) を渡していたため、
+        // 「画像補正の効果が効いてない状態に対する消しゴム結果」がプレビューされる
+        // という実機 FB R5 #1 があった。コミット経路 (`apply_inpaint_only`) は raw 入力の
+        // ままで OK (下流で adjustment が再適用される)、プレビューだけ補正済みに切替。
+        //
+        // 解像度マッチング:
+        // - ai_upscale_cache がある (= AI 有効でアップスケール完了) → 高解像度を base
+        // - 無ければ erase_base_cache (= 通常は raw fs_cache 解像度)
+        // どちらも `erase_mask_size = [w, h]` と同じはず (enter_erase_mode 時に揃える)。
+        // post_filter は erase_mode 中 bypass (`post_filter_bypassed = true`) なので
+        // apply_adjustments_fast (= 色調のみ) で十分。
+        let bg = self.effective_upscale_bg_mode();
+        let ai_pixels = self
+            .ai_upscale_cache
+            .get(&(fs_idx, bg))
+            .and_then(|e| match e {
+                FsCacheEntry::Static { pixels, .. } => Some(Arc::clone(pixels)),
+                _ => None,
+            });
+        let raw_source = match ai_pixels {
+            Some(p) => p,
+            None => match self.erase_base_cache.get(&fs_idx) {
+                Some(p) => Arc::clone(p),
+                None => return false,
+            },
         };
         let [w, h] = self.erase_mask_size;
+        // R5 P1 (Codex): 解像度ミスマッチ時の fallback で**サイズ不一致の `raw_source` を
+        // そのまま `run_inpaint_and_cache(..., w, h, ...)` に渡していた**ため、AI upscale が
+        // 後から完了して ai_upscale_cache (4x) と erase_mask_size (1x) が食い違うケースで、
+        // MI-GAN 結果が誤ったサイズで preview_cache に書き込まれ、次フレームの
+        // egui-wgpu texture upload で `Mismatch between texture size and texel count` の
+        // assert panic を起こしていた。
+        //
+        // 寸法整合性を取り直すのは難しいので、ミスマッチ時は **preview を諦めて return false**
+        // にする。ユーザー視点では「プレビュー押下しても何も起きない」だけで、クラッシュ
+        // するよりずっと安全。実機で起きうるケース:
+        //   - 消しゴム中に AI 設定を ON/OFF した
+        //   - enter_erase_mode が raw fs_cache から始まり、その後 ai_upscale_cache が完了
+        //   - その他、erase_mask_size と現有の base/ai pixels サイズが食い違う edge case
+        //
+        // 恒久的な解は Step 2 (erase_result_cache 分離 + generation 入りキャッシュキー、
+        // CLAUDE.md の Codex R5 設計メモ参照)。Step 1 は応急処置として return false。
+        if raw_source.size != [w, h] {
+            crate::logger::log(format!(
+                "erase: preview skipped (size mismatch: source={}x{} mask={}x{})",
+                raw_source.size[0], raw_source.size[1], w, h
+            ));
+            return false;
+        }
+        let params = self.effective_params(fs_idx).clone();
+        let adjusted: Arc<egui::ColorImage> = if params.is_color_identity() {
+            raw_source
+        } else {
+            Arc::new(crate::adjustment::apply_adjustments_fast(
+                &raw_source,
+                &params,
+            ))
+        };
         // is_preview = true: 完了時 fs_cache を書き換えず preview_cache に流す。
-        self.run_inpaint_and_cache(ctx, fs_idx, original, composite, w, h, "preview", true);
+        self.run_inpaint_and_cache(ctx, fs_idx, adjusted, composite, w, h, "preview", true);
         true
     }
 
