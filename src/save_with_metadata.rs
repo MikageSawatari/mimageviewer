@@ -734,7 +734,7 @@ fn extract_webp_metadata_chunks(
 }
 
 /// WebP がアニメーションか (= ANIM / ANMF チャンクを持つか) を判定する。
-fn webp_is_animated(webp: &[u8]) -> bool {
+pub fn webp_is_animated(webp: &[u8]) -> bool {
     if webp.len() < 12 || &webp[..4] != b"RIFF" || &webp[8..12] != b"WEBP" {
         return false;
     }

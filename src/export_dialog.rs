@@ -111,6 +111,23 @@ pub struct ExportDialogState {
     pub include_metadata: bool,
     pub selection: [bool; 5],
     pub has_conceal_mask: bool,
+    /// ダイアログを開いた瞬間の base pixels と composite mask をスナップショット。
+    /// 保存ボタンを押すまでに animation frame が進行したり AI upscale が完了したり
+    /// しても、Ctrl+E を押した瞬間の image が export されるようにする
+    /// (Codex review CONFIRMED)。
+    pub base_pixels: Arc<egui::ColorImage>,
+    pub conceal_mask: Option<Arc<Vec<bool>>>,
+    /// 元の永続化済み batch selection。state.selection の force-clear 後でも、
+    /// settings 保存時にこの「ユーザーが本当に意図した値」を温存する
+    /// (Codex review CONFIRMED)。
+    pub original_selection: [bool; 5],
+    /// 元の永続化済み include_metadata。format 切替で UI が一時的に false に倒した
+    /// 場合に、原状を保つために保持する (Codex review CONFIRMED)。
+    pub original_include_metadata: bool,
+    /// ダイアログを開いた瞬間にフォーカスを 1 度だけ basename へ寄せるためのラッチ。
+    /// 毎フレーム request_focus すると他フィールドへフォーカスが移れない
+    /// (Codex review CONFIRMED)。
+    pub initial_focus_done: bool,
     pub error: Option<String>,
 }
 
@@ -214,8 +231,10 @@ fn session_targets_available(
 
 fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<ExportEvent>) {
     let output_src_format = request.output_format.to_src_format();
-    let needs_source_for_webp_check =
-        request.original_format == SrcFormat::Webp && output_src_format == SrcFormat::Webp;
+    // 元 WebP がアニメーション WebP かを検査するため、original が WebP のときは
+    // 出力形式に関係なく source bytes を読み込む。出力 PNG/JPEG にしても黙って
+    // 単一フレームを書き出してしまうのを防ぐ (Codex review CONFIRMED)。
+    let needs_source_for_webp_check = request.original_format == SrcFormat::Webp;
     let needs_source_bytes = request.include_metadata || needs_source_for_webp_check;
     let source_bytes = match &request.source {
         ExportSource::ZipEntry {
@@ -237,10 +256,35 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
                 }
             }
         }
+        ExportSource::File { path } if needs_source_for_webp_check => {
+            // File source は通常 source_path 経由で渡すが、アニメーション WebP の
+            // 検出だけは bytes が要るのでここで読む。
+            match std::fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(_) => None,
+            }
+        }
         _ => None,
     };
+    // 元 WebP がアニメーションなら、出力形式に関係なく全エントリを失敗にする。
+    if request.original_format == SrcFormat::Webp
+        && let Some(bytes) = source_bytes.as_deref()
+        && crate::save_with_metadata::webp_is_animated(bytes)
+    {
+        let msg = "アニメーション WebP は対象外です".to_string();
+        for entry in &request.entries {
+            let _ = tx.send(ExportEvent::Failed(ExportFailure {
+                label: entry.label.clone(),
+                message: msg.clone(),
+            }));
+        }
+        let _ = tx.send(ExportEvent::AllDone);
+        return;
+    }
     let source_path = match &request.source {
-        ExportSource::File { path } if needs_source_bytes => Some(path.as_path()),
+        ExportSource::File { path } if needs_source_bytes && source_bytes.is_none() => {
+            Some(path.as_path())
+        }
         _ => None,
     };
     let include_metadata = request.include_metadata
@@ -277,6 +321,14 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
             )),
             _ => None,
         };
+        // 合成は CPU 重 (Mosaic/Blur で 4K だと数秒) なので、合成後 / encode 前にも
+        // cancel を再チェックする。これでキャンセルが「encode 中の 1 ファイルだけは
+        // 書き出されるが残りは抑止」ではなく、合成完了時点で確実に止まる
+        // (Codex review CONFIRMED)。
+        if cancel.load(Ordering::Relaxed) {
+            let _ = tx.send(ExportEvent::Cancelled);
+            return;
+        }
         let pixels = composed
             .as_ref()
             .unwrap_or_else(|| request.base_pixels.as_ref());

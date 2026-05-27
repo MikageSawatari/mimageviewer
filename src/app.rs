@@ -8760,9 +8760,12 @@ impl App {
     /// フルスクリーン中に `load_folder` すると表示が閉じてしまうため、呼び出し側は
     /// `fullscreen_idx.is_none()` のときだけ実行する。
     pub(crate) fn consume_export_folder_refresh_pending(&mut self) {
-        let Some(target) = self.export_folder_refresh_pending.take() else {
+        // .take() より先にガードを評価する。検索ビュー中やフォルダ未確定の状態で
+        // ここを通っても pending を消費せず、後で復帰したときに再読込できるよう
+        // 残しておく (Codex review CONFIRMED)。
+        if self.export_folder_refresh_pending.is_none() {
             return;
-        };
+        }
         if self.items_are_global_search_view
             || self.global_search.active
             || self.favsearch.on_results_grid()
@@ -8770,6 +8773,9 @@ impl App {
             return;
         }
         let Some(cur) = self.current_favorite_target() else {
+            return;
+        };
+        let Some(target) = self.export_folder_refresh_pending.take() else {
             return;
         };
         if crate::folder_tree::path_eq(&cur, &target) {
@@ -15666,6 +15672,18 @@ impl App {
             }
         }
         self.fullscreen_idx = None;
+        // Ctrl+E ダイアログ / 進捗モーダルはフルスクリーン文脈に紐付くので、
+        // close_fullscreen と同時に閉じる (Codex review CONFIRMED)。
+        // 進捗中の worker は cancel フラグを立てて自然終了を待つ (= 進行中エントリは
+        // 完了まで残るが、後続エントリは drop される)。
+        self.export_dialog = None;
+        if let Some(pending) = self.export_pending.as_ref() {
+            pending
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.export_pending = None;
+        self.export_folder_refresh_pending = None;
         self.fullscreen_video_marker_cache = None;
         self.cancel_fullscreen_video_marker_thumb_decode();
         // 360 度パノラマビュー: フルスクリーン退出で state と GPU リソースを drop。

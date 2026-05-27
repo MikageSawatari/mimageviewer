@@ -394,6 +394,33 @@ fn export_animated_webp_fails() {
     assert!(!temp.path().join("animated_0.webp").exists());
 }
 
+/// 元 WebP がアニメーションのとき、出力形式に関係なく export を拒否する。
+/// 旧版は output=WebP のときだけ animation check が走り、PNG/JPEG 出力では
+/// 単一フレームを silent に書き出していた (Codex review CONFIRMED の修正)。
+#[test]
+fn export_animated_webp_rejected_when_output_is_png() {
+    let temp = tempfile::tempdir().unwrap();
+    let src = temp.path().join("animated.webp");
+    std::fs::write(&src, animated_webp_bytes()).unwrap();
+
+    let pending = spawn_export_worker(ExportRequest {
+        source: ExportSource::File { path: src },
+        original_format: SrcFormat::Webp,
+        output_format: ExportFormat::Png,
+        output_dir: temp.path().to_path_buf(),
+        basename: "anim2png".to_string(),
+        base_pixels: solid_image(2, 2, egui::Color32::WHITE),
+        conceal_mask: None,
+        entries: vec![entry("current", 0)],
+        include_metadata: false,
+    })
+    .unwrap();
+    let events = collect_events(pending, 5);
+    assert_eq!(completed_count(&events), 0);
+    assert_eq!(failed_count(&events), 1);
+    assert!(!temp.path().join("anim2png_0.png").exists());
+}
+
 #[test]
 fn export_orientation_canonical() {
     let temp = tempfile::tempdir().unwrap();

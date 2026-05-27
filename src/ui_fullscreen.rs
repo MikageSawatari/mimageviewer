@@ -3924,7 +3924,12 @@ impl App {
         let in_video_tile = false;
         let wheel_y = ctx.input(|i| i.raw_scroll_delta.y);
         let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
-        let handle_wheel_here = !cursor_in_panel && (!in_video_tile || !ctrl_held);
+        // modal ダイアログ (Ctrl+E など) が開いている間は wheel 由来のページ送りを
+        // 抑止する。state.source 等が snapshot 時点で固定されているので、idx だけ
+        // 移動すると間違った画像が export される (Codex review CONFIRMED)。
+        let modal_for_keys = self.any_modal_dialog_open_for_fullscreen_keys();
+        let handle_wheel_here =
+            !cursor_in_panel && (!in_video_tile || !ctrl_held) && !modal_for_keys;
         if wheel_y.abs() > 0.5 && handle_wheel_here {
             ctx.input_mut(|i| {
                 i.raw_scroll_delta = egui::Vec2::ZERO;
@@ -8193,6 +8198,17 @@ impl App {
             self.show_feedback_toast("編集モードを閉じてからエクスポートしてください".to_string());
             return;
         }
+        // 消しゴム commit (MI-GAN inpaint) が進行中だと erase_result_cache がまだ
+        // 空で、resolve_export_base_pixels が pre-erase の adjustment_cache / fs_cache
+        // へフォールバックしてしまい「消したつもりの結果が反映されない export」になる。
+        // 同 idx の Commit が完了するまで Ctrl+E を保留する (Codex review CONFIRMED)。
+        let has_commit_pending = self.erase_inpaint_pending.keys().any(|k| {
+            k.idx == fs_idx && matches!(k.kind, crate::ui_erase::EraseInpaintKind::Commit)
+        });
+        if has_commit_pending {
+            self.show_feedback_toast("消しゴム補完の完了後にエクスポートしてください".to_string());
+            return;
+        }
         let Ok((source, label, original_format, source_dir, basename)) =
             self.export_source_info_for_idx(fs_idx)
         else {
@@ -8215,10 +8231,12 @@ impl App {
             .clone()
             .filter(|p| p.is_dir())
             .unwrap_or(source_dir);
-        let mut selection = self.settings.export_batch_selection;
-        let has_conceal_mask = self
+        let original_selection = self.settings.export_batch_selection;
+        let mut selection = original_selection;
+        let conceal_mask = self
             .conceal_composite_mask_for_export(fs_idx, base_pixels.size[0], base_pixels.size[1])
-            .is_some();
+            .map(Arc::new);
+        let has_conceal_mask = conceal_mask.is_some();
         for i in 1..selection.len() {
             if !has_conceal_mask || self.settings.conceal_presets[i - 1].is_none() {
                 selection[i] = false;
@@ -8227,6 +8245,7 @@ impl App {
         if !selection.iter().any(|&v| v) {
             selection[0] = true;
         }
+        let original_include_metadata = self.settings.export_embed_metadata;
 
         self.export_dialog = Some(crate::export_dialog::ExportDialogState {
             source,
@@ -8238,9 +8257,14 @@ impl App {
             ),
             basename: crate::capture::basename_from_text(&format!("{basename}_edited")),
             output_dir_text: output_dir.display().to_string(),
-            include_metadata: self.settings.export_embed_metadata,
+            include_metadata: original_include_metadata,
             selection,
             has_conceal_mask,
+            base_pixels,
+            conceal_mask,
+            original_selection,
+            original_include_metadata,
+            initial_focus_done: false,
             error: None,
         });
         ctx.request_repaint();
@@ -8271,10 +8295,13 @@ impl App {
         let mut start = false;
         let mut pick_folder = false;
 
+        // CLAUDE.md「ダイアログ (egui::Window)」: anchor() はドラッグ不可になるため
+        // 必ず default_pos() を使う。
+        let default_pos = ctx.content_rect().center() - egui::vec2(230.0, 200.0);
         egui::Window::new("エクスポート")
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_pos(default_pos)
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.set_min_width(460.0);
@@ -8286,8 +8313,12 @@ impl App {
                         .desired_width(f32::INFINITY)
                         .hint_text("出力ファイル名"),
                 );
-                if !basename_resp.has_focus() && !basename_resp.lost_focus() {
+                // 初回フレームのみ basename にフォーカス。毎フレーム request_focus
+                // すると他フィールドへフォーカス移動が直ちに巻き戻される
+                // (Codex review CONFIRMED)。
+                if !state.initial_focus_done {
                     basename_resp.request_focus();
+                    state.initial_focus_done = true;
                 }
                 ui.add_space(6.0);
                 ui.label("保存先");
@@ -8329,12 +8360,16 @@ impl App {
 
                 let metadata_possible = state.original_format.supports_metadata_writeback()
                     && state.original_format == state.output_format.to_src_format();
+                // state.include_metadata はユーザーの意図 (チェックボックス操作の結果)
+                // を保持する。format 不一致でも値は force-flip しない — 形式を JPEG→PNG→
+                // JPEG と切り替えても元のチェック状態が戻る (Codex review CONFIRMED)。
+                // 実際の保存時の判定は run_export が `original_format == output_format`
+                // を AND して行う。
                 ui.add_enabled(
                     metadata_possible,
                     egui::Checkbox::new(&mut state.include_metadata, "AI プロンプト / EXIF を保持"),
                 );
                 if !metadata_possible {
-                    state.include_metadata = false;
                     ui.small("形式変換や PDF ではメタデータ保持は無効です");
                 }
 
@@ -8427,10 +8462,13 @@ impl App {
             pending.done as f32 / pending.total as f32
         };
 
+        // CLAUDE.md「ダイアログ (egui::Window)」: anchor() はドラッグ不可になるため
+        // 必ず default_pos() を使う。
+        let progress_default_pos = ctx.content_rect().center() - egui::vec2(190.0, 100.0);
         egui::Window::new("エクスポート進行状況")
             .collapsible(false)
             .resizable(false)
-            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .default_pos(progress_default_pos)
             .show(ctx, |ui| {
                 ui.set_min_width(380.0);
                 ui.label(&pending.last_message);
@@ -8487,7 +8525,11 @@ impl App {
         let mut clear_pending = false;
         let mut toast: Option<String> = None;
         let mut reveal_path: Option<std::path::PathBuf> = None;
-        let mut completed_paths: Vec<std::path::PathBuf> = Vec::new();
+        // batch 完了時に 1 度だけフォルダ refresh を発火するため、success path を集約。
+        // 旧版は Completed ごとに note_exported_file_for_folder_refresh を呼んで
+        // N エントリで N 回 load_folder が走り、UI が thrash していた
+        // (Codex review CONFIRMED)。
+        let mut refresh_after_done = false;
 
         loop {
             match pending.rx.try_recv() {
@@ -8497,7 +8539,6 @@ impl App {
                 Ok(crate::export_dialog::ExportEvent::Completed(success)) => {
                     pending.done = pending.done.saturating_add(1);
                     pending.last_message = format!("保存しました: {}", success.label);
-                    completed_paths.push(success.path.clone());
                     pending.successes.push(success);
                 }
                 Ok(crate::export_dialog::ExportEvent::Failed(err)) => {
@@ -8507,11 +8548,19 @@ impl App {
                 }
                 Ok(crate::export_dialog::ExportEvent::Cancelled) => {
                     toast = Some("エクスポートをキャンセルしました".to_string());
+                    // キャンセル時も既に書き出されたファイルがあれば refresh
+                    if !pending.successes.is_empty() {
+                        refresh_after_done = true;
+                    }
                     clear_pending = true;
                     break;
                 }
                 Ok(crate::export_dialog::ExportEvent::AllDone) => {
                     pending.finished = true;
+                    // batch 完了時にまとめて 1 回 refresh
+                    if !pending.successes.is_empty() {
+                        refresh_after_done = true;
+                    }
                     if pending.errors.is_empty() {
                         if pending.successes.len() == 1 {
                             reveal_path = pending.successes.first().map(|s| s.path.clone());
@@ -8533,20 +8582,37 @@ impl App {
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    toast = Some("エクスポート worker が中断されました".to_string());
-                    clear_pending = true;
+                    // AllDone を既に受け取り済み (= worker は正常終了) の場合は、
+                    // ここで「中断されました」toast を出すと AllDone エラー集計の
+                    // 進捗ダイアログを 1 フレで上書きしてしまう。
+                    // finished が立っていればダイアログ表示を維持する。
+                    if !pending.finished {
+                        toast = Some("エクスポート worker が中断されました".to_string());
+                        clear_pending = true;
+                    }
                     break;
                 }
             }
         }
+
+        // 完了 (AllDone / Cancelled) で書き出されたファイルの parent をまとめて 1 件
+        // pending に積む。複数 success path はすべて同じ output_dir なので、最初の
+        // 成功 path だけを渡せば十分。
+        let first_success_path = if refresh_after_done {
+            self.export_pending
+                .as_ref()
+                .and_then(|p| p.successes.first().map(|s| s.path.clone()))
+        } else {
+            None
+        };
 
         if clear_pending {
             self.export_pending = None;
         } else if self.export_pending.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        for path in &completed_paths {
-            self.note_exported_file_for_folder_refresh(path);
+        if let Some(path) = first_success_path {
+            self.note_exported_file_for_folder_refresh(&path);
         }
         if let Some(path) = reveal_path {
             self.show_capture_saved_toast(path);
@@ -8559,24 +8625,27 @@ impl App {
     fn start_export_from_dialog(
         &mut self,
         ctx: &egui::Context,
-        mut state: crate::export_dialog::ExportDialogState,
+        state: crate::export_dialog::ExportDialogState,
     ) -> Result<(), String> {
         if self.export_pending.is_some() {
             return Err("エクスポート中です".to_string());
         }
-        let idx = self
-            .fullscreen_idx
-            .ok_or_else(|| "フルスクリーン表示中に実行してください".to_string())?;
+        // ダイアログを閉じる前に fullscreen を抜けていた場合は保護的に reject
+        // (Codex review CONFIRMED — close_fullscreen は dialog を残しがち)。
+        if self.fullscreen_idx.is_none() {
+            return Err("フルスクリーン表示中に実行してください".to_string());
+        }
         let output_dir = std::path::PathBuf::from(state.output_dir_text.trim());
         if output_dir.as_os_str().is_empty() {
             return Err("保存先フォルダを指定してください".to_string());
         }
         let basename = crate::capture::basename_from_text(&state.basename);
 
-        let base_pixels = self.resolve_export_base_pixels(idx)?;
-        let conceal_mask = self
-            .conceal_composite_mask_for_export(idx, base_pixels.size[0], base_pixels.size[1])
-            .map(Arc::new);
+        // ダイアログを開いた瞬間に snapshot した base_pixels / conceal_mask を使う。
+        // ここで再 resolve すると animated GIF の current_frame が進んで違うフレーム
+        // が export される (Codex review CONFIRMED)。
+        let base_pixels = Arc::clone(&state.base_pixels);
+        let conceal_mask = state.conceal_mask.clone();
         let has_conceal_mask = conceal_mask.is_some();
         let mut planned: Vec<(String, u8, Option<crate::conceal::ConcealPreset>)> = Vec::new();
         if state.selection[0] {
@@ -8620,13 +8689,39 @@ impl App {
             });
         }
 
-        state.selection[0] = suffixes.contains(&0);
-        for slot_idx in 0..4 {
-            state.selection[slot_idx + 1] = suffixes.contains(&((slot_idx + 1) as u8));
+        // 永続化する selection は **ユーザーが実際にダイアログで触った値** を残す。
+        // 環境要因 (has_conceal_mask=false / preset slot 空) で planned から落ちた
+        // エントリは「ユーザーが unchecked にした」と区別したいので、original_selection
+        // を底辺にして「現在も checked」な slot だけ反映する (Codex review CONFIRMED)。
+        let mut next_selection = state.original_selection;
+        // user が今のセッションで checked にした slot は反映する
+        for i in 0..state.selection.len() {
+            if state.selection[i] {
+                next_selection[i] = true;
+            }
         }
-        self.settings.export_embed_metadata = state.include_metadata;
+        // user が明示的に unchecked にした slot を反映 (= state.selection が false で
+        // かつ環境要因で disable されていなかった slot のみ)。
+        for i in 0..state.selection.len() {
+            let env_disabled =
+                i > 0 && (!has_conceal_mask || self.settings.conceal_presets[i - 1].is_none());
+            if !state.selection[i] && !env_disabled {
+                next_selection[i] = false;
+            }
+        }
+        // metadata は元値ベースで、ユーザーが意図的に切り替えた場合のみ反映する。
+        // format 切替の force-flip を考慮し、metadata_possible=true のときの値だけを
+        // 信頼する。
+        let metadata_possible = state.original_format.supports_metadata_writeback()
+            && state.original_format == state.output_format.to_src_format();
+        let persisted_metadata = if metadata_possible {
+            state.include_metadata
+        } else {
+            state.original_include_metadata
+        };
+        self.settings.export_embed_metadata = persisted_metadata;
         self.settings.export_last_directory = Some(output_dir.clone());
-        self.settings.export_batch_selection = state.selection;
+        self.settings.export_batch_selection = next_selection;
         if matches!(
             state.original_format,
             crate::save_with_metadata::SrcFormat::Other(_)
@@ -8636,6 +8731,10 @@ impl App {
         }
         self.settings.save();
 
+        // export 中の中間ファイル増分による多重 load_folder を防ぐため、batch 完了
+        // (AllDone) の単一トリガで refresh する。中間 Completed イベントでの
+        // note_exported_file_for_folder_refresh は呼ばない (Codex review CONFIRMED)。
+        let effective_include_metadata = state.include_metadata && metadata_possible;
         let request = crate::export_dialog::ExportRequest {
             source: state.source,
             original_format: state.original_format,
@@ -8645,7 +8744,7 @@ impl App {
             base_pixels,
             conceal_mask,
             entries,
-            include_metadata: state.include_metadata,
+            include_metadata: effective_include_metadata,
         };
         let pending = crate::export_dialog::spawn_export_worker(request)?;
         self.export_pending = Some(pending);
