@@ -178,7 +178,19 @@ wgpu の queue.write_texture が走る。20MP RGBA (78MB) で 26-58ms かかる�
 - [ ] **測定**: 追加後に実機で `--perf-log` を取り、`python scripts/analyze_perf.py
       <path> nav hitches` で悪化してないか確認。
 
-### 4.1 意図的な例外: native ファイル D&D のモーダルブロック
+### 4.1 オーバーレイパネルの ScrollArea
+
+`egui::Area + Frame::popup + ScrollArea` でフルスクリーン左パネルを作る場合は、
+本文が少ないパネルと多いパネルで方針を分ける。
+
+- 消しゴムのように本文が収まりやすいパネルは、`ScrollArea::max_height(...)` と
+  `auto_shrink([false, true])` で「収まるときは内容サイズ、足りないときだけスクロール」にする。
+  この場合、パネル上クリック判定は前フレームで実際に描画された `Frame` の rect を使い、
+  見えない下側まで入力を吸わないようにする。
+- 画像補正のように常時長いパネルは、ヘッダを固定し、本文 `ScrollArea` の親領域を明示確保する。
+  さらに左余白とスクロールバー分の右余白を別に取り、ボタンやスライダーがバーに重ならない幅で配置する。
+
+### 4.2 意図的な例外: native ファイル D&D のモーダルブロック
 
 ファイル D&D 送出 (`src/file_drag.rs::start_file_drag`) は `SHDoDragDrop` を UI
 スレッドで呼び、ドロップ完了 / キャンセルまで戻らない。`App::update` がその間

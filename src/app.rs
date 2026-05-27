@@ -2940,6 +2940,9 @@ pub struct App {
     pub(crate) erase_selected_shape: Option<usize>,
     /// Select ツールでのハンドルドラッグ状態 (Phase 2b で vector_edit に統一)。
     pub(crate) erase_drag: Option<crate::vector_edit::DragState>,
+    /// 直近フレームで実際に描画された消しゴムパネルの矩形。
+    /// パネル本文は内容量に応じて縮むため、入力抑制にも実サイズを使う。
+    pub(crate) erase_panel_last_rect: Option<egui::Rect>,
     /// Rect / Ellipse ツールのドラッグ開始点 (画像座標、Phase 0b)。
     pub(crate) erase_shape_drag_start: Option<(f32, f32)>,
     /// Rect / Ellipse ツールのドラッグ末尾点 (画像座標、プレビューと確定で共用)。
@@ -3987,6 +3990,7 @@ impl App {
             erase_shapes: Vec::new(),
             erase_selected_shape: None,
             erase_drag: None,
+            erase_panel_last_rect: None,
             erase_shape_drag_start: None,
             erase_shape_drag_end: None,
             erase_inpaint_pending: std::collections::HashMap::new(),

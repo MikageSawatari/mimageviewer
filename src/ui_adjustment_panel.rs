@@ -27,6 +27,12 @@ const LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 230, 230);
 pub const LEFT_PANEL_WIDTH: f32 = 260.0;
 /// 左パネルの下端をウィンドウ下端から少し浮かせる余白。
 pub const LEFT_PANEL_BOTTOM_MARGIN: f32 = 20.0;
+/// 補正本文の左余白。画面端に文字が張り付かないようにする。
+const BODY_PAD_LEFT: f32 = 10.0;
+/// 補正本文の右余白。スクロールバーと保存スロットボタンの干渉を避ける。
+const BODY_PAD_RIGHT: f32 = 10.0;
+/// ScrollArea の縦バーが重なる分として、本文 widget 幅から差し引く余白。
+const BODY_SCROLLBAR_RESERVE: f32 = 14.0;
 
 /// スライダーとリセットボタンを描画するヘルパー。
 /// リセットボタン（↩）をクリックするとデフォルト値に戻す。
@@ -679,9 +685,9 @@ impl App {
         const HEADER_BTN_SIZE: f32 = 28.0;
         const HEADER_BTN_GAP: f32 = 4.0;
         const HEADER_RIGHT_PAD: f32 = 8.0;
-        // タイトル左寄せ (8px パディング、CENTER_Y 縦中央)
+        // タイトル左寄せ (本文と同じ左余白、CENTER_Y 縦中央)
         child.painter().text(
-            egui::pos2(header_rect.min.x + 8.0, header_rect.center().y),
+            egui::pos2(header_rect.min.x + BODY_PAD_LEFT, header_rect.center().y),
             egui::Align2::LEFT_CENTER,
             "画像補正",
             egui::FontId::proportional(16.0),
@@ -797,11 +803,16 @@ impl App {
         // 新方針: ヘッダ (HEADER_H = 36px) は絶対位置で固定し、それより下を 1 つの
         // ScrollArea でフロー配置する。
         let body_rect = egui::Rect::from_min_max(
-            egui::pos2(panel_rect.min.x, panel_rect.min.y + HEADER_H),
-            panel_rect.max,
+            egui::pos2(
+                panel_rect.min.x + BODY_PAD_LEFT,
+                panel_rect.min.y + HEADER_H,
+            ),
+            egui::pos2(panel_rect.max.x - BODY_PAD_RIGHT, panel_rect.max.y),
         );
         let mut body_child = child.new_child(egui::UiBuilder::new().max_rect(body_rect));
         let body_height = body_rect.height();
+        let body_width = body_rect.width();
+        let content_width = (body_width - BODY_SCROLLBAR_RESERVE).max(120.0);
 
         let mut apply_all_clicked = false;
         let mut clear_all_clicked = false;
@@ -877,11 +888,11 @@ impl App {
         };
 
         let scroll_output = body_child.allocate_ui_with_layout(
-            egui::vec2(panel_rect.width(), body_height),
+            egui::vec2(body_width, body_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                ui.set_min_width(panel_rect.width());
-                ui.set_max_width(panel_rect.width());
+                ui.set_min_width(body_width);
+                ui.set_max_width(body_width);
                 ui.set_min_height(body_height);
                 // ScrollArea は親 UI の available_rect を上限にするため、body_rect と
                 // 同じ高さの親領域を明示確保してから置く。これでコンテンツが短い
@@ -891,7 +902,7 @@ impl App {
                     .min_scrolled_height(0.0)
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        ui.set_width(panel_rect.width() - 20.0);
+                        ui.set_width(content_width);
                         ui.add_space(4.0);
 
                         // ── 見開き L/R セレクタ ──
@@ -939,7 +950,7 @@ impl App {
                         ui.add_space(4.0);
 
                         // ── アクションボタン (5 行) ──
-                        let wide = egui::vec2(panel_rect.width() - 20.0, 24.0);
+                        let wide = egui::vec2(content_width, 24.0);
                         if ui
                             .add(egui::Button::new("このフォルダの全画像に適用").min_size(wide))
                             .on_hover_text(
@@ -1025,9 +1036,13 @@ impl App {
                                 .color(LABEL_COLOR),
                         );
                         ui.add_space(2.0);
-                        let btn_w = (panel_rect.width() - 20.0) * 0.5 - 24.0;
+                        let slot_gap = 4.0;
+                        let save_btn_w = 22.0;
+                        let btn_w =
+                            ((content_width - save_btn_w * 2.0 - slot_gap * 3.0) * 0.5).max(60.0);
                         for row in 0..5 {
                             ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = slot_gap;
                                 for col in 0..2 {
                                     let slot_idx = row * 2 + col;
                                     let key_label = crate::adjustment::slot_key_label(slot_idx);
@@ -1060,7 +1075,7 @@ impl App {
                                     }
                                     let save_btn =
                                         egui::Button::new(egui::RichText::new("💾").size(11.0))
-                                            .min_size(egui::vec2(22.0, 22.0));
+                                            .min_size(egui::vec2(save_btn_w, 22.0));
                                     let save_resp = ui.add(save_btn);
                                     if save_resp.clicked() {
                                         save_to_slot = Some(slot_idx);

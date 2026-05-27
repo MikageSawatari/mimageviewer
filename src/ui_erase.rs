@@ -105,6 +105,9 @@ const PANEL_MIN_BODY_H: f32 = 120.0;
 /// ツールパネルの左上マージン。
 const PANEL_MARGIN_X: f32 = 16.0;
 const PANEL_MARGIN_Y: f32 = 60.0;
+/// 実パネル矩形がまだ無いフレームで使う入力抑制用の概算高さ。
+/// 実際の描画後は `erase_panel_last_rect` に置き換わる。
+const PANEL_FALLBACK_COMPACT_H: f32 = 650.0;
 
 fn erase_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f32 {
     (full_rect.max.y - panel_pos.y - PANEL_BOTTOM_MARGIN).max(PANEL_MIN_BODY_H + 40.0)
@@ -195,6 +198,7 @@ impl App {
         self.erase_shapes.clear();
         self.erase_selected_shape = None;
         self.erase_drag = None;
+        self.erase_panel_last_rect = None;
         self.erase_shape_drag_start = None;
         self.erase_shape_drag_end = None;
 
@@ -276,6 +280,7 @@ impl App {
         self.erase_shapes.clear();
         self.erase_selected_shape = None;
         self.erase_drag = None;
+        self.erase_panel_last_rect = None;
         self.erase_shape_drag_start = None;
         self.erase_shape_drag_end = None;
         self.fs_pan_drag_start = None;
@@ -1044,11 +1049,21 @@ impl App {
             full_rect.min.x + PANEL_MARGIN_X,
             full_rect.min.y + PANEL_MARGIN_Y,
         );
-        // `handle_erase_paint` の「カーソルがパネル上なら筆操作を skip」用。
-        // 可視パネルはウィンドウ下端近くまで伸びるため、この判定も同じ高さに
-        // 揃えないと、パネル下半分のクリックがキャンバス操作へ抜けてしまう。
-        let panel_h = erase_panel_outer_height(full_rect, panel_pos);
-        egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W, panel_h))
+        let max_h = erase_panel_outer_height(full_rect, panel_pos);
+        if let Some(rect) = self.erase_panel_last_rect {
+            let same_origin =
+                (rect.min.x - panel_pos.x).abs() < 2.0 && (rect.min.y - panel_pos.y).abs() < 2.0;
+            if same_origin && rect.is_positive() {
+                return rect.intersect(egui::Rect::from_min_size(
+                    panel_pos,
+                    egui::vec2(PANEL_W + 24.0, max_h),
+                ));
+            }
+        }
+        egui::Rect::from_min_size(
+            panel_pos,
+            egui::vec2(PANEL_W, PANEL_FALLBACK_COMPACT_H.min(max_h)),
+        )
     }
 
     // ── 入力処理 ──────────────────────────────────────────────────
@@ -1851,12 +1866,11 @@ impl App {
             full_rect.min.y + PANEL_MARGIN_Y,
         );
 
-        // クリック吸収 sink (= 可視 Frame::popup より大きく取って、Frame 外周も
-        // 確実に吸収する)。パネルが 4K/縦長環境で下端近くまで伸びるため、
-        // 固定 1000px ではなく同じ高さから動的に作る。
-        let panel_h = erase_panel_outer_height(full_rect, panel_pos);
-        let sink_rect =
-            egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W + 4.0, panel_h + 8.0));
+        // クリック吸収 sink は直近の実パネル矩形に揃える。本文が内容量に応じて
+        // 縮むため、下端までの巨大な sink を残すと画像側のクリックを奪ってしまう。
+        let sink_rect = self
+            .erase_panel_rect(full_rect)
+            .expand2(egui::vec2(4.0, 8.0));
 
         // closure 内で self mutation を避ける用のローカル変数群。Area::show 後に
         // まとめてディスパッチする。
@@ -1878,7 +1892,7 @@ impl App {
                     egui::Id::new("erase_panel_click_sink"),
                     egui::Sense::click_and_drag(),
                 );
-                egui::Frame::popup(ui.style())
+                let frame_response = egui::Frame::popup(ui.style())
                     .fill(egui::Color32::from_rgba_unmultiplied(20, 20, 20, 230))
                     .stroke(egui::Stroke::new(
                         1.0,
@@ -1968,24 +1982,18 @@ impl App {
 
                         // ── 残り (ツール選択 / スライダー / スロット / ヘルプ) を
                         //     ScrollArea で囲む ──
-                        // R5+: ScrollArea は親 UI の available_rect を上限にするため、
-                        // `max_height` だけでは Area + Frame::popup 内で content 高に
-                        // 縮むことがある。先に親領域を明示確保してから、その中で
-                        // ScrollArea を下端近くまで伸ばす。
-                        let body_height =
+                        // 本文が収まるときは content 高で止め、足りないときだけ下端近く
+                        // までの max_height でスクロールさせる。前版の強制確保は
+                        // 大きな空白を作っていたため使わない。
+                        let body_max_height =
                             (full_rect.max.y - ui.cursor().top() - PANEL_BOTTOM_MARGIN)
                                 .max(PANEL_MIN_BODY_H);
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(PANEL_W, body_height),
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(body_max_height)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
                                 ui.set_min_width(PANEL_W);
                                 ui.set_max_width(PANEL_W);
-                                ui.set_min_height(body_height);
-                                egui::ScrollArea::vertical()
-                                    .max_height(body_height)
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
 
                         // ボタン共通の最小サイズ。PANEL_W (= 190) - Frame::popup
                         // padding (~10*2) - 中央 gap (4) を 2 で割って、片側 ~78px。
@@ -2224,10 +2232,9 @@ impl App {
                             )
                             .wrap(),
                         );
-                                    }); // ScrollArea::show
-                            },
-                        ); // allocate_ui_with_layout
+                            }); // ScrollArea::show
                     }); // Frame::popup .show
+                self.erase_panel_last_rect = Some(frame_response.response.rect);
             }); // Area::show
 
         // ── closure 外でディスパッチ (& mut self の借用衝突を避ける) ──
