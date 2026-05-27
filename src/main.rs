@@ -14,6 +14,8 @@ pub mod capture;
 pub mod catalog;
 pub mod changelog_markdown;
 pub mod compare_wgpu;
+pub mod conceal;
+pub mod conceal_db;
 pub mod data_dir;
 #[cfg(windows)]
 mod dcomp_presenter_test;
@@ -83,6 +85,7 @@ pub mod tray;
 mod tray_integration;
 mod ui_adjustment_panel;
 mod ui_analysis_panel;
+mod ui_conceal;
 pub mod ui_dialogs;
 mod ui_erase;
 pub mod ui_fonts;

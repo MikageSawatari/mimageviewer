@@ -1746,6 +1746,19 @@ impl App {
                             ctx.request_repaint();
                         }
 
+                        // ── 隠蔽加工モード (Phase 1: パネルのみ) ──
+                        // ツール操作 / 合成 / マスクオーバーレイは Phase 2 以降で追加。
+                        // 当面はパネルが出てモード状態が UI 上で確認できるだけで十分。
+                        if self.conceal_mode
+                            && !is_spread_double
+                            && !state.original_preview_active
+                        {
+                            self.draw_conceal_panel(ctx, full_rect);
+                            ctx.request_repaint();
+                        } else if self.conceal_mode {
+                            ctx.request_repaint();
+                        }
+
                         let overlay_t0 = std::time::Instant::now();
                         // ── ルーペ (Shift ホールド / M トグル) ──
                         // 見開き・分析・補正モードでは内部で早期 return する。
@@ -2910,6 +2923,20 @@ impl App {
             return self.handle_erase_keys(ctx, fs_idx);
         }
 
+        // 隠蔽加工モード中も同様。Phase 1 では Esc / Ctrl+M で終了するだけの最小実装。
+        // ツール操作キー (B/L/S/I/V/H/R/O、D/F、T、1〜4、Ctrl+wheel 等) は Phase 2 以降で
+        // `handle_conceal_keys` を作って追加する。
+        if self.conceal_mode {
+            // Esc または Ctrl+M で退場
+            let key_esc =
+                ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            let key_ctrl_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::M));
+            if key_esc || key_ctrl_m {
+                self.reset_conceal_mode();
+            }
+            return action;
+        }
+
         // 動画フルスクリーン中は専用キーマップ (Space=play/pause、Enter=play/pause、
         // Shift+Enter=外部プレイヤー、←→=シーク、↑↓=音量、M=mute、L=loop) を
         // 画像系のキー処理より先に走らせる。
@@ -3477,6 +3504,19 @@ impl App {
                 // 1回目のE: マスクモード開始
                 self.enter_erase_mode(fs_idx);
             }
+        }
+
+        // Ctrl+M: 隠蔽加工モード入退場 (分析・補正中は無効)。Phase 1。
+        // 見開き / 動画 / モーダル状態は `enter_conceal_mode` 側で適切に分岐する。
+        // (Conceal モード中の Ctrl+M / Esc は本関数冒頭の早期 return で処理済み。)
+        let key_ctrl_m = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::M));
+        if key_ctrl_m
+            && !self.analysis_mode
+            && !self.adjustment_mode
+            && !self.erase_mode
+            && !is_video_fs
+        {
+            self.enter_conceal_mode(fs_idx);
         }
 
         if key_ctrl_s_capture {

@@ -2906,6 +2906,48 @@ pub struct App {
     /// という不変条件をフィールドの形で表現するため。
     pub(crate) erase_spread_ctx: Option<EraseSpreadCtx>,
 
+    // ── 隠蔽加工 (Conceal、Phase 1) ───────────────────────────────
+    //
+    // 消しゴムと並列のサブシステム。詳細は docs/conceal-feature-plan.md を参照。
+    // Phase 1 では「モード入退場 + 空パネル + DB / 設定の hydrate」のみで、
+    // 実際のツール処理 (handle_conceal_paint / 合成 / バッジ / Undo) は Phase 2 以降。
+    //
+    /// 隠蔽加工モードかどうか。`Ctrl+M` で入退場。
+    pub(crate) conceal_mode: bool,
+    /// 現在のツール (Phase 2 で実装、Phase 1 では Default 値のみ)。
+    /// Phase 1 では設定経路で初期化されるだけで参照されないので dead_code 抑止。
+    #[allow(dead_code)]
+    pub(crate) conceal_tool: crate::conceal::ConcealTool,
+    /// 描画モード (true) / 消去モード (false)、`D` / `F` キーで切替。
+    pub(crate) conceal_paint_mode: bool,
+    /// 現在ページのマスクビットマップ (1bit/pixel、`erase_mask` と同じ表現)。
+    pub(crate) conceal_mask: Option<Vec<bool>>,
+    /// マスク対象の画像サイズ [width, height]。
+    pub(crate) conceal_mask_size: [usize; 2],
+    /// マスクオーバーレイ用テクスチャ (Phase 2 で生成)。
+    pub(crate) conceal_mask_texture: Option<egui::TextureHandle>,
+    /// 現在ページの Shape ベクタ群 (Line / Rect / Ellipse、`mask_db::Shape`)。
+    pub(crate) conceal_shapes: Vec<crate::mask_db::Shape>,
+    /// 選択中の Shape インデックス (`conceal_shapes` への添字、Phase 2 で使用)。
+    pub(crate) conceal_selected_shape: Option<usize>,
+    /// 元画像 (補正等を適用した状態) のキャッシュ。Phase 3 の `conceal_cache` 入力。
+    pub(crate) conceal_base_cache:
+        std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
+    /// マスク永続化 DB (Phase 1 で boot 時に open、フォルダ非依存)。
+    pub(crate) conceal_db: Option<crate::conceal_db::ConcealDb>,
+    /// 隠蔽加工 Undo スタック (Phase 4 で実装、Phase 1 ではフィールド予約のみ)。
+    pub(crate) conceal_undo_stack: std::collections::VecDeque<crate::mask_db::Shape>,
+    /// Undo スタック throttle 用 (キーリピート連打抑制、Phase 4)。
+    pub(crate) conceal_last_undo_at: Option<std::time::Instant>,
+    /// 見開きから隠蔽加工に入ったときの状態スナップショット (消しゴムの `EraseSpreadCtx`
+    /// と同型、Phase 2 で見開きハンドリング実装時に活用)。
+    pub(crate) conceal_spread_ctx: Option<EraseSpreadCtx>,
+    /// バッジ判定: マスクが保存されているページの idx 集合 (Phase 4 で実装、
+    /// フォルダロード時に `conceal_db::load_conceal_keys` で hydrate する)。
+    /// Phase 1 では空のままで参照されない。
+    #[allow(dead_code)]
+    pub(crate) conceal_pages: std::collections::HashSet<usize>,
+
     // ── フルスクリーン Ctrl+↑↓ ナビロック ─────────────────────────
     /// ナビ中の「次のページがまだ表示できない」ガード。`Some(gen)` の間は
     /// 新たな Ctrl+↑↓ 入力を無視し、`fs_holdover_tex` を画面に出し続ける。
@@ -3422,6 +3464,10 @@ impl App {
         let mask_db = crate::mask_db::MaskDb::open().ok();
         crate::perf::emit_ms("startup", "db_open_mask", 0, t);
 
+        let t = std::time::Instant::now();
+        let conceal_db = crate::conceal_db::ConcealDb::open().ok();
+        crate::perf::emit_ms("startup", "db_open_conceal", 0, t);
+
         let video_upscale_data_dir = crate::data_dir::get();
         let video_upscale_queue_lock =
             crate::video::upscale::queue::QueueLock::acquire(&video_upscale_data_dir).ok();
@@ -3813,6 +3859,7 @@ impl App {
             erase_base_cache: std::collections::HashMap::new(),
             original_preview_tex_cache: std::collections::HashMap::new(),
             mask_db,
+            conceal_db,
             erase_undo_stack: std::collections::VecDeque::new(),
             meta_undo: crate::undo_stack::UndoStack::new(),
             adjustment_drag_session: None,
@@ -3824,6 +3871,22 @@ impl App {
             erase_vector_drag: None,
             erase_inpaint_pending: std::collections::HashMap::new(),
             erase_spread_ctx: None,
+            // ── 隠蔽加工 (Conceal、Phase 1 default) ────────────
+            // conceal_db は App::new の冒頭で open している。Default 経路では None
+            // のまま (= テストフィクスチャ等)。
+            conceal_mode: false,
+            conceal_tool: crate::conceal::ConcealTool::default(),
+            conceal_paint_mode: true,
+            conceal_mask: None,
+            conceal_mask_size: [0, 0],
+            conceal_mask_texture: None,
+            conceal_shapes: Vec::new(),
+            conceal_selected_shape: None,
+            conceal_base_cache: std::collections::HashMap::new(),
+            conceal_undo_stack: std::collections::VecDeque::new(),
+            conceal_last_undo_at: None,
+            conceal_spread_ctx: None,
+            conceal_pages: std::collections::HashSet::new(),
             fs_nav_locked_gen: None,
             fs_holdover_tex: None,
             virtual_folder_writeback: None,

@@ -736,6 +736,69 @@ pub struct Settings {
     #[serde(default)]
     pub capture_format: crate::capture::CaptureFormat,
 
+    // ── 隠蔽加工 (Concealment) ─────────────────────────────────
+    //
+    // Phase 1 で導入。詳細仕様は docs/conceal-feature-plan.md §8.1。
+    // 全フィールド `serde(default)` 付き ⇒ 既存の settings.db / settings.json を
+    // 新コードで開いても安全 (= 欠落フィールドは型のデフォルト値で埋まる)。
+    //
+    /// 隠蔽加工の現在の処理タイプ。モード内 `T` キーで切替、終了後も維持。
+    #[serde(default)]
+    pub conceal_type: crate::conceal::ConcealType,
+    /// モザイクタイルサイズの指定方式 (LongEdgeRatio / FixedPx)。
+    #[serde(default)]
+    pub conceal_mosaic_tile_mode: crate::conceal::TileSizeMode,
+    /// モザイクタイルの境界処理 (Opaque / Translucent / MaskShape)。
+    #[serde(default)]
+    pub conceal_mosaic_boundary: crate::conceal::MosaicBoundary,
+    /// 白塗り / 黒塗りの不透明度 (1..=100、1% 刻み)。
+    #[serde(default = "crate::conceal::default_fill_opacity")]
+    pub conceal_fill_opacity_percent: u8,
+    /// 白塗り / 黒塗りの境界処理 (Sharp / Feathered)。
+    #[serde(default)]
+    pub conceal_fill_edge: crate::conceal::FillEdge,
+    /// ぼかし半径 (px)。範囲 5..=100、1px 刻み。
+    #[serde(default = "crate::conceal::default_blur_radius_px")]
+    pub conceal_blur_radius_px: f32,
+    /// ぼかしモード (AsMask / ExtendByRadius / InsideOnly)。
+    #[serde(default)]
+    pub conceal_blur_mode: crate::conceal::BlurMode,
+    /// ぼかしの境界フェード ON/OFF (固定 8px 半径で内側へフェード)。
+    #[serde(default)]
+    pub conceal_blur_feather: bool,
+    /// 隠蔽加工モードでのブラシ半径 (px)。初回エントリ時に画像長辺の 1/100 で初期化。
+    #[serde(default)]
+    pub conceal_brush_radius: f32,
+    /// 隠蔽加工モードでの直線幅 (px)。初回エントリ時に画像長辺の 1/500 で初期化。
+    #[serde(default)]
+    pub conceal_line_width: f32,
+    /// パラメータプリセット 4 スロット (`1`〜`4` キーで適用、`💾` ボタンで保存)。
+    /// 各スロットは `Option<ConcealPreset>` で `None` = 空スロット。
+    #[serde(default = "crate::conceal::default_conceal_presets")]
+    pub conceal_presets: crate::conceal::ConcealPresetSlots,
+
+    // ── エクスポート (Ctrl+E、Phase 6 で完成) ──────────────────
+    //
+    // Phase 1 ではフィールド定義 + Settings persistence までだけ用意する。
+    // 実 UI と worker は Phase 6 で実装。
+    //
+    /// `Ctrl+E` でメタデータ (EXIF / XMP / tEXt / AI prompt) を保持して書き出すか。
+    /// 既定 true。
+    #[serde(default = "default_true")]
+    pub export_embed_metadata: bool,
+    /// ユーザーが「保存先」を元フォルダから別の場所に変更したときの記憶
+    /// (= 「直前の上書き選択」の弱い記憶)。次回ダイアログの初期値で使う。
+    #[serde(default)]
+    pub export_last_directory: Option<PathBuf>,
+    /// 元形式が書き出し非対応 (HEIC / AVIF / JXL / RAW / TIFF) のときに
+    /// フォールバックする形式 (JPEG q=95 or PNG)。
+    #[serde(default)]
+    pub export_fallback_format: crate::conceal::ExportFallbackFormat,
+    /// `Ctrl+E` ダイアログでチェックされていたバリエーション
+    /// `[現在の設定, プリセット 1, 2, 3, 4]` の前回チェック状態。
+    #[serde(default = "default_export_batch_selection")]
+    pub export_batch_selection: [bool; 5],
+
     // ── 見開き表示 ──────────────────────────────────────────
     /// デフォルトの見開き表示モード
     #[serde(default)]
@@ -1573,6 +1636,12 @@ pub fn default_rating_filter() -> [bool; 6] {
     [true; 6]
 }
 
+/// `Ctrl+E` ダイアログのバリエーションチェック初期値。
+/// `[現在の設定, プリセット 1, 2, 3, 4]` → 現在の設定だけ ON。
+pub fn default_export_batch_selection() -> [bool; 5] {
+    [true, false, false, false, false]
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -1685,6 +1754,23 @@ impl Default for Settings {
             audio_normalize_enabled: false,
             audio_normalize_target_lufs_milli: default_audio_normalize_target_lufs_milli(),
             last_seen_version: None,
+            // ── 隠蔽加工 (Phase 1) ────────────────────────────
+            conceal_type: crate::conceal::ConcealType::default(),
+            conceal_mosaic_tile_mode: crate::conceal::TileSizeMode::default(),
+            conceal_mosaic_boundary: crate::conceal::MosaicBoundary::default(),
+            conceal_fill_opacity_percent: crate::conceal::default_fill_opacity(),
+            conceal_fill_edge: crate::conceal::FillEdge::default(),
+            conceal_blur_radius_px: crate::conceal::default_blur_radius_px(),
+            conceal_blur_mode: crate::conceal::BlurMode::default(),
+            conceal_blur_feather: false,
+            conceal_brush_radius: 0.0, // enter_conceal_mode で初期化
+            conceal_line_width: 0.0,   // enter_conceal_mode で初期化
+            conceal_presets: crate::conceal::default_conceal_presets(),
+            // ── エクスポート (Phase 1 部分、Phase 6 で UI 完成) ──
+            export_embed_metadata: true,
+            export_last_directory: None,
+            export_fallback_format: crate::conceal::ExportFallbackFormat::default(),
+            export_batch_selection: default_export_batch_selection(),
         }
     }
 }
