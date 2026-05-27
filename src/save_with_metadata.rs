@@ -85,6 +85,18 @@ pub struct SaveOptions {
     pub webp_quality: f32,
     /// 元のメタデータを保持するか。`false` ならメタデータ無しの素の画像を出力。
     pub include_metadata: bool,
+    /// 呼び出し側で **既に** EXIF Orientation 通りに pixels を回転済みか。
+    /// 既定 `true` (= mIV の通常 fullscreen 表示パスは `wic_decoder` や
+    /// EXIF orientation 経路でローカル JPEG を canonical orientation に揃える)。
+    ///
+    /// ZIP 内 JPEG 等で **pixels が未回転のまま** export する場合は `false` を
+    /// 渡す。`false` のときは EXIF Orientation タグを書き換えず元の値を保つ
+    /// (= ビューアが元 Orientation で再回転して正しく表示する)。
+    ///
+    /// 詳細: 通常パス (= `true`) では pixels が canonical 状態なので
+    /// Orientation を 1 に書き換えて二重回転を防ぐ。それ以外のパスでは
+    /// 二重回転を起こさないために Orientation を温存する。
+    pub caller_applied_orientation: bool,
 }
 
 impl Default for SaveOptions {
@@ -95,6 +107,7 @@ impl Default for SaveOptions {
             webp_lossless: false,
             webp_quality: 90.0,
             include_metadata: true,
+            caller_applied_orientation: true,
         }
     }
 }
@@ -302,11 +315,16 @@ fn encode_jpeg_with_metadata(
         && options.include_metadata
     {
         let mut app1_segments = extract_jpeg_app1_segments(src)?;
-        // EXIF APP1 の Orientation を 1 に書き換える (Codex P1)。
-        // mIV は表示前にピクセルを回転済みなので、元 Orientation をそのまま
-        // 残すと EXIF-aware viewer が二重回転する。
-        for seg in app1_segments.iter_mut() {
-            reset_exif_orientation_in_app1(seg);
+        // EXIF APP1 の Orientation 処理 (Codex P1 / r2 P2)。
+        // - `caller_applied_orientation = true`: pixels は canonical 向きに回転
+        //   済みなので Orientation を 1 に書き換える (= viewer の二重回転防止)。
+        // - `caller_applied_orientation = false` (ZIP 内 JPEG 等): pixels は
+        //   未回転なので Orientation を温存 (= viewer が元通りに再回転して
+        //   正しく表示)。
+        if options.caller_applied_orientation {
+            for seg in app1_segments.iter_mut() {
+                reset_exif_orientation_in_app1(seg);
+            }
         }
         if !app1_segments.is_empty() {
             out = splice_jpeg_app1_segments(&out, &app1_segments)?;
@@ -440,23 +458,33 @@ fn reset_exif_orientation_in_app1(app1_segment: &mut [u8]) {
     for i in 0..entry_count {
         let entry_pos = entries_start + i * 12;
         let tag = read_u16(&app1_segment[entry_pos..entry_pos + 2]);
-        if tag == 0x0112 {
-            // Orientation: type=SHORT(3), count=1, value = first 2 bytes of value field。
-            // 残り 2 bytes は 0 で埋める。
-            let value_pos = entry_pos + 8;
-            if little_endian {
-                app1_segment[value_pos] = 0x01;
-                app1_segment[value_pos + 1] = 0x00;
-                app1_segment[value_pos + 2] = 0x00;
-                app1_segment[value_pos + 3] = 0x00;
-            } else {
-                app1_segment[value_pos] = 0x00;
-                app1_segment[value_pos + 1] = 0x01;
-                app1_segment[value_pos + 2] = 0x00;
-                app1_segment[value_pos + 3] = 0x00;
-            }
-            break;
+        if tag != 0x0112 {
+            continue;
         }
+        // Orientation の正規 schema: type=SHORT(3), count=1 で value 4 バイトの
+        // 先頭 2 バイトに inline 格納。不正な EXIF はこの schema に従わず
+        // value 4 バイトが offset として使われていることがある。その offset を
+        // 0x0001 で上書きすると TIFF の別領域を破壊する → 必ず schema 検査して
+        // 一致したときだけ書き換える (Codex r2 P3)。
+        let dtype = read_u16(&app1_segment[entry_pos + 2..entry_pos + 4]);
+        let count = read_u32(&app1_segment[entry_pos + 4..entry_pos + 8]);
+        if dtype != 3 || count != 1 {
+            // 不正 schema は no-op (= 元の Orientation 値を温存)
+            return;
+        }
+        let value_pos = entry_pos + 8;
+        if little_endian {
+            app1_segment[value_pos] = 0x01;
+            app1_segment[value_pos + 1] = 0x00;
+            app1_segment[value_pos + 2] = 0x00;
+            app1_segment[value_pos + 3] = 0x00;
+        } else {
+            app1_segment[value_pos] = 0x00;
+            app1_segment[value_pos + 1] = 0x01;
+            app1_segment[value_pos + 2] = 0x00;
+            app1_segment[value_pos + 3] = 0x00;
+        }
+        return;
     }
 }
 
@@ -814,9 +842,20 @@ fn inject_webp_metadata(
             data[0] |= add_flags;
         }
     } else {
-        // 新規 VP8X を先頭 (canvas size の埋め込み付き) に挿入。
+        // 新規 VP8X を構築 (canvas size + alpha + metadata flags)。
+        // VP8L (lossless) は VP8X 無しで alpha を表現できるので、
+        // メタデータを追加する際は新規 VP8X に alpha bit を立てる必要がある
+        // (Codex r2 P2)。ALPH チャンクが居る (VP8 + ALPH 構成) ケースも
+        // 同様に alpha bit を立てる。
+        let has_alpha = chunks
+            .iter()
+            .any(|(fc, data)| fc == "ALPH" || (fc == "VP8L" && vp8l_has_alpha(data)));
         let mut vp8x = vec![0u8; 10];
-        vp8x[0] = add_flags;
+        let mut flags = add_flags;
+        if has_alpha {
+            flags |= 1 << 4; // alpha
+        }
+        vp8x[0] = flags;
         let w1 = cw - 1;
         let h1 = ch - 1;
         vp8x[4] = (w1 & 0xFF) as u8;
@@ -894,6 +933,15 @@ fn parse_vp8l_canvas(data: &[u8]) -> Option<(u32, u32)> {
     let w1 = b1 | ((b2 & 0x3F) << 8);
     let h1 = (b2 >> 6) | (b3 << 2) | ((b4 & 0x0F) << 10);
     Some((w1 + 1, h1 + 1))
+}
+
+/// VP8L チャンクが alpha (透過) を含むかを判定する。
+///
+/// VP8L bitstream は signature byte (`0x2f`) の後ろの 4 bytes に
+/// `14 bits w-1 | 14 bits h-1 | 1 bit alpha_is_used | 3 bits version` を
+/// LSB-first で持つ。alpha bit = byte index 4 の bit 4 (= `0x10`)。
+fn vp8l_has_alpha(data: &[u8]) -> bool {
+    data.len() >= 5 && data[0] == 0x2f && (data[4] & 0x10) != 0
 }
 
 // ── 共通 ヘルパー ───────────────────────────────────────────────────
@@ -1410,5 +1458,155 @@ mod tests {
             pos += 8 + size + (size & 1);
         }
         assert_eq!(vp8x_count, 1, "VP8X should appear exactly once");
+    }
+
+    // ── Codex r2 修正対応の回帰テスト ──
+
+    /// `caller_applied_orientation = false` のとき Orientation が温存される
+    /// ことを確認 (ZIP 内 JPEG export 用、Codex r2 P2)。
+    #[test]
+    fn jpeg_orientation_preserved_when_caller_did_not_apply() {
+        // EXIF APP1 with Orientation=6 を作る
+        let mut exif_payload: Vec<u8> = Vec::new();
+        exif_payload.extend_from_slice(b"Exif\x00\x00");
+        exif_payload.extend_from_slice(b"II");
+        exif_payload.extend_from_slice(&0x002Au16.to_le_bytes());
+        exif_payload.extend_from_slice(&8u32.to_le_bytes());
+        exif_payload.extend_from_slice(&1u16.to_le_bytes());
+        exif_payload.extend_from_slice(&0x0112u16.to_le_bytes());
+        exif_payload.extend_from_slice(&3u16.to_le_bytes());
+        exif_payload.extend_from_slice(&1u32.to_le_bytes());
+        exif_payload.extend_from_slice(&6u16.to_le_bytes());
+        exif_payload.extend_from_slice(&0u16.to_le_bytes());
+        exif_payload.extend_from_slice(&0u32.to_le_bytes());
+
+        let img = sample_color_image(8, 8);
+        let rgba = color_image_to_rgba(&img);
+        let rgb = flatten_rgba_to_rgb_black(&rgba, 8);
+        let rimg = image::RgbImage::from_raw(8, 8, rgb).unwrap();
+        let jpeg = turbojpeg::compress_image(&rimg, 90, turbojpeg::Subsamp::Sub2x2).unwrap();
+        let jpeg_bytes = jpeg.as_ref();
+        let app1_len = exif_payload.len() + 2;
+        let mut src = Vec::with_capacity(jpeg_bytes.len() + 4 + exif_payload.len());
+        src.extend_from_slice(&jpeg_bytes[..2]);
+        src.extend_from_slice(&[0xFF, 0xE1]);
+        src.push((app1_len >> 8) as u8);
+        src.push((app1_len & 0xFF) as u8);
+        src.extend_from_slice(&exif_payload);
+        src.extend_from_slice(&jpeg_bytes[2..]);
+
+        let opts = SaveOptions {
+            caller_applied_orientation: false,
+            ..Default::default()
+        };
+        let out = encode_jpeg_with_metadata(&img, Some(&src), &opts).unwrap();
+        let segs = extract_jpeg_app1_segments(&out).unwrap();
+        let seg = &segs[0];
+        let entry = 10 + 8 + 2;
+        // Orientation 値 = 6 (= 温存) のまま
+        assert_eq!(seg[entry + 8], 0x06);
+        assert_eq!(seg[entry + 9], 0x00);
+    }
+
+    /// 不正な Orientation entry (type != SHORT) を書き換えないことを確認 (Codex r2 P3)。
+    #[test]
+    fn malformed_orientation_entry_is_not_touched() {
+        // Orientation tag に type=LONG(4) count=2 を持つ不正 EXIF を作る。
+        // value field は offset (= TIFF 内の他箇所を指している) を装う 4 bytes。
+        // この offset の中身 (= 0xDEADBEEF をマーカーとして) が **書き換わらない**
+        // ことを確認する。
+        let mut payload: Vec<u8> = Vec::new();
+        payload.extend_from_slice(b"Exif\x00\x00");
+        payload.extend_from_slice(b"II");
+        payload.extend_from_slice(&0x002Au16.to_le_bytes());
+        payload.extend_from_slice(&8u32.to_le_bytes()); // IFD0 offset
+        payload.extend_from_slice(&1u16.to_le_bytes()); // count
+        payload.extend_from_slice(&0x0112u16.to_le_bytes()); // Orientation
+        payload.extend_from_slice(&4u16.to_le_bytes()); // type=LONG (not SHORT)
+        payload.extend_from_slice(&2u32.to_le_bytes()); // count=2 (不正、Orientation は 1 のはず)
+        let bogus_value = 0xDEADBEEFu32.to_le_bytes();
+        payload.extend_from_slice(&bogus_value);
+        payload.extend_from_slice(&0u32.to_le_bytes()); // next IFD = 0
+        let snapshot = payload.clone();
+        let mut wrapped = Vec::with_capacity(4 + payload.len());
+        wrapped.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x00]);
+        let len = payload.len() + 2;
+        wrapped[2] = (len >> 8) as u8;
+        wrapped[3] = (len & 0xFF) as u8;
+        wrapped.extend_from_slice(&payload);
+
+        reset_exif_orientation_in_app1(&mut wrapped);
+        // payload (= APP1 marker / length を抜いた中身) が変わっていないこと
+        assert_eq!(&wrapped[4..], &snapshot[..]);
+    }
+
+    /// 透過 VP8L (= 透過 lossless WebP) からメタデータ付き export したとき、
+    /// 新規 VP8X に alpha bit (0x10) が立つことを確認 (Codex r2 P2)。
+    #[test]
+    fn webp_lossless_transparent_sets_alpha_flag_in_new_vp8x() {
+        // libwebp lossless で透過 RGBA を encode (= VP8L 単体出力、VP8X 無し)。
+        let pixels: Vec<egui::Color32> = (0..16 * 16)
+            .map(|i| {
+                let a = if i % 2 == 0 { 128 } else { 255 };
+                egui::Color32::from_rgba_unmultiplied(200, 100, 50, a)
+            })
+            .collect();
+        let img = ColorImage {
+            size: [16, 16],
+            pixels,
+            source_size: egui::vec2(16.0, 16.0),
+        };
+        let rgba = color_image_to_rgba(&img);
+        let raw = webp::Encoder::from_rgba(&rgba, 16, 16).encode_lossless();
+        let raw_bytes = raw.as_ref();
+        // 元 src には メタデータが入った状態の WebP を渡す (= XMP 付き)。
+        // 元 src 自体は VP8X 無しの VP8L 単体でもよい (この test では src として
+        // 同じ raw_bytes を使い、出力に XMP が追加される系を見る)。
+        let src_with_xmp = inject_webp_metadata(
+            raw_bytes,
+            None,
+            None,
+            Some(b"<x:xmpmeta>FAKE</x:xmpmeta>".to_vec()),
+        )
+        .unwrap();
+        // この出力に VP8X が含まれていること、かつ alpha bit が立っていること
+        // を確認する。
+        let mut pos = 12;
+        let mut found_vp8x = false;
+        while pos + 8 <= src_with_xmp.len() {
+            let fourcc = &src_with_xmp[pos..pos + 4];
+            let size = u32::from_le_bytes([
+                src_with_xmp[pos + 4],
+                src_with_xmp[pos + 5],
+                src_with_xmp[pos + 6],
+                src_with_xmp[pos + 7],
+            ]) as usize;
+            if fourcc == b"VP8X" {
+                found_vp8x = true;
+                let flags = src_with_xmp[pos + 8];
+                assert!(
+                    flags & 0x10 != 0,
+                    "alpha bit (0x10) should be set on new VP8X, got flags=0x{:02X}",
+                    flags
+                );
+                assert!(flags & 0x04 != 0, "XMP bit (0x04) should be set");
+            }
+            pos += 8 + size + (size & 1);
+        }
+        assert!(found_vp8x, "VP8X should be inserted");
+    }
+
+    /// `vp8l_has_alpha` の境界条件確認。
+    #[test]
+    fn vp8l_has_alpha_basic() {
+        // signature 0x2f + 4 bytes (alpha bit on byte 4 = 0x10)
+        let with_alpha = [0x2f, 0, 0, 0, 0x10];
+        let without_alpha = [0x2f, 0, 0, 0, 0x00];
+        let too_short = [0x2f, 0];
+        let wrong_sig = [0x00, 0, 0, 0, 0x10];
+        assert!(vp8l_has_alpha(&with_alpha));
+        assert!(!vp8l_has_alpha(&without_alpha));
+        assert!(!vp8l_has_alpha(&too_short));
+        assert!(!vp8l_has_alpha(&wrong_sig));
     }
 }
