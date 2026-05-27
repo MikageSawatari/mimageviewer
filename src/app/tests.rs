@@ -3987,6 +3987,45 @@ mod native_video_rating_key_tests {
         assert_eq!(app.rating_db.as_ref().unwrap().get(&key), 0);
         assert_eq!(app.current_folder_rating_cache, Some(0));
     }
+
+    /// F11 (VK 0x7A) で `toggle_video_window_mode` 経路が走り、`native_video_mode_switch`
+    /// pending が登録されることを確認する。これは native HWND 経路と、egui 経由で
+    /// `handle_video_input` から仮想 F11 を流す in-window 動画経路 (Codex P1 対応)
+    /// の両方が同じハンドラを共有することの担保。
+    #[test]
+    fn native_video_f11_triggers_window_mode_toggle() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_video(&mut app, PathBuf::from(r"C:\clips\movie.mp4"));
+        app.fullscreen_idx = Some(idx);
+        let initial = app.settings.video_in_window_mode;
+        assert!(app.native_video_mode_switch.is_none());
+
+        app.handle_native_video_key_event(&ctx, idx, native_key(0x7A, false)); // F11
+
+        let pending = app
+            .native_video_mode_switch
+            .expect("F11 should register a mode switch request");
+        assert_eq!(pending.target_in_window, !initial);
+    }
+
+    /// F11 を repeat 付きで送ったときはトグルが走らないことを確認する (長押し連打防止)。
+    #[test]
+    fn native_video_f11_repeat_is_ignored() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_video(&mut app, PathBuf::from(r"C:\clips\movie.mp4"));
+        app.fullscreen_idx = Some(idx);
+
+        let mut key = native_key(0x7A, false);
+        key.repeat = true;
+        app.handle_native_video_key_event(&ctx, idx, key);
+
+        assert!(
+            app.native_video_mode_switch.is_none(),
+            "repeat F11 should not trigger window mode toggle"
+        );
+    }
 }
 
 #[cfg(test)]

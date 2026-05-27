@@ -2230,7 +2230,7 @@ pub(super) fn draw_native_top_bar(
                 "native_top_window_toggle",
                 NativeTopButtonGlyph::WindowToggle,
                 false,
-                "ウィンドウ / 全画面 切り替え",
+                "ウィンドウ / 全画面 切り替え [F11]",
                 NativeOverlayCommand::ToggleWindowMode,
                 commands,
             );

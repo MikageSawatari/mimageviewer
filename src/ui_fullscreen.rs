@@ -241,6 +241,7 @@ fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
             | egui::Key::F4
             | egui::Key::F5
             | egui::Key::F6
+            | egui::Key::F11
     )
 }
 
@@ -313,6 +314,7 @@ fn native_video_vk_from_egui_key(key: egui::Key) -> Option<u32> {
         egui::Key::F4 => 0x73,
         egui::Key::F5 => 0x74,
         egui::Key::F6 => 0x75,
+        egui::Key::F11 => 0x7A,
         _ => return None,
     })
 }
@@ -3110,6 +3112,58 @@ impl App {
         }
         if key_f8 {
             self.apply_slot_in_viewing_mode(ctx, 2);
+        }
+
+        // F11: ウィンドウ表示 ⇔ 全画面表示 トグル (ホバーバー × の左の
+        // 「ウィンドウ / 全画面 切り替え」ボタンと同じ動作)。
+        //
+        // 消しゴムモード中は本関数冒頭の `if self.erase_mode { return ... }` で
+        // 早期 return するため自動的に無効化される (ホバーバーのトグルボタン自体も
+        // 消しゴム中は非表示で挙動を揃えている。erase_mask_texture が ctx-bound で
+        // viewport 切替時に invalidate されるのを避けるため意図的)。
+        //
+        // 動画アイテム上では skip する。動画は native presenter が
+        // `handle_native_video_key_event` の 0x7A arm で F11 を直接拾い
+        // `toggle_video_window_mode()` (presenter rebuild を伴う) を呼ぶ。
+        // 起動直後の black backdrop / コンテキストメニュー表示中などで egui に
+        // F11 が漏れて来た場合に still 用 toggle が走ると、設定だけ flip して
+        // 動画 presenter のモードと乖離するため。is_video_fs は
+        // fs_context_menu_idx.is_none() を含むので使えない (= 純粋な item 種別 check)。
+        //
+        // consume_key は repeat 込み + matches_logically で余分な Shift も拾うため、
+        // 厳格に「修飾なし・非 repeat」だけ抜き出す custom event filter を使う。
+        #[cfg(windows)]
+        {
+            let current_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+            if !current_is_video {
+                let f11_pressed = ctx.input_mut(|i| {
+                    let mut found = false;
+                    i.events.retain(|e| {
+                        let consume = matches!(
+                            e,
+                            egui::Event::Key {
+                                key: egui::Key::F11,
+                                pressed: true,
+                                repeat: false,
+                                modifiers,
+                                ..
+                            } if modifiers.is_none()
+                        );
+                        if consume {
+                            found = true;
+                        }
+                        !consume
+                    });
+                    found
+                });
+                if f11_pressed {
+                    self.toggle_still_window_mode();
+                    // 描画先 (embedded ⇔ 専用 viewport) の切替は次フレームの
+                    // render_fullscreen_viewport で起きる。ホバーバーボタンと
+                    // 同じく ROOT ビューポートの再描画を明示要求する。
+                    ctx.request_repaint_of(egui::ViewportId::ROOT);
+                }
+            }
         }
 
         // V キー (VST3 プラグイン GUI トグル) は撤去した。理由は app.rs 同箇所参照。
@@ -6561,9 +6615,9 @@ impl App {
                 |p, c, r| draw_window_toggle_icon(p, c, r),
             );
             let wm_resp = wm_resp.hover_tip_dark(if in_window_mode {
-                "全画面表示に切り替え"
+                "全画面表示に切り替え [F11]"
             } else {
-                "ウィンドウ内表示に切り替え"
+                "ウィンドウ内表示に切り替え [F11]"
             });
             if wm_resp.clicked() {
                 *window_mode_pressed = true;
@@ -8055,6 +8109,58 @@ impl App {
         // IME 変換中はショートカットを発火させない
         if self.ime_input_active() {
             return;
+        }
+
+        // F11: ウィンドウ / 全画面 切り替え (HUD トグルボタンと同じ動作)。
+        //
+        // 動画フルスクリーンでも main mIV ウィンドウにフォーカスがあるケースが
+        // 存在する: in-window 動画モード、起動直後の focus handoff、
+        // フルスクリーン用コンテキストメニュー閉鎖直後など。これらでは F11 が
+        // native HWND ではなく egui の root viewport に届く (Codex P1 2026-05)。
+        //
+        // 純粋な item 種別 check で動画と判定したフレームで F11 を捕まえ、
+        // 仮想 VK 0x7A を作って native HWND 経路と同じ
+        // `handle_native_video_key_event` の 0x7A arm に流す。これにより
+        // normalize scan ガード、`toggle_video_window_mode` (presenter rebuild
+        // request) など全てのロジックを一本化できる。
+        //
+        // consume_key は repeat 込み + matches_logically で余分な Shift も拾うため、
+        // 厳格に「修飾なし・非 repeat」だけ抜き出す custom event filter を使う。
+        #[cfg(windows)]
+        {
+            let current_is_video = matches!(self.items.get(fs_idx), Some(GridItem::Video(_)));
+            if current_is_video {
+                let f11_pressed = ctx.input_mut(|i| {
+                    let mut found = false;
+                    i.events.retain(|e| {
+                        let consume = matches!(
+                            e,
+                            egui::Event::Key {
+                                key: egui::Key::F11,
+                                pressed: true,
+                                repeat: false,
+                                modifiers,
+                                ..
+                            } if modifiers.is_none()
+                        );
+                        if consume {
+                            found = true;
+                        }
+                        !consume
+                    });
+                    found
+                });
+                if f11_pressed {
+                    let synthetic = crate::video::native_window::NativeVideoKeyEvent {
+                        virtual_key: 0x7A,
+                        shift: false,
+                        ctrl: false,
+                        alt: false,
+                        repeat: false,
+                    };
+                    self.handle_native_video_key_event(ctx, fs_idx, synthetic);
+                }
+            }
         }
 
         // 動画モードのキー処理: 動画 HUD 2 段化リデザイン (Phase 1) で Space を再生/停止

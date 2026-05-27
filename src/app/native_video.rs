@@ -4459,6 +4459,14 @@ impl App {
                 }
                 self.maybe_start_normalize_scan_for_play_intent(fs_idx);
             }
+            // F11: ウィンドウ / 全画面 切り替え (HUD トグルボタンと同じ動作)。
+            // toggle_video_window_mode は presenter rebuild を伴うので
+            // toggle_still_window_mode (設定 flip だけ) では代用できない。
+            // normalize scan 中は上の `normalize_state` ガードで既に弾かれている。
+            0x7A if !key.shift && !key.ctrl && !key.repeat => {
+                self.toggle_video_window_mode();
+                hud_activity = false;
+            }
             // Tile mode: left/right move the keyboard cursor instead of seeking
             // behind the opaque tile grid. Ctrl moves by one visible row.
             0x25 | 0x27 if self.video_tile_mode_active => {
