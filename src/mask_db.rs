@@ -5,6 +5,30 @@
 //!
 //! 縦線/横線/直線はベクタオブジェクト (`LineObject`) として `vectors` 列に
 //! JSON 文字列で保存する。囲み/筆はビットマップ側にラスタライズ済み。
+//!
+//! # Shape 拡張 (隠蔽加工機能対応、2026-05)
+//!
+//! 隠蔽加工機能 (`docs/conceal-feature-plan.md`) と消しゴム機能で 8 ツール
+//! (Select / Brush / Lasso / Line / Vert / Horiz / Rect / Ellipse) を共用するため、
+//! ベクタオブジェクトの統一表現として [`Shape`] enum を導入する。`Shape` は
+//! `Line` / `Rect` / `Ellipse` の 3 variant を持ち、JSON では `{"type": "..."}`
+//! 形式のタグ付きでシリアライズされる。
+//!
+//! ## 後方互換性 (リリース済みデータ対応)
+//!
+//! `mask_db` は既にリリース済みで、旧形式の `LineObject` JSON
+//! (`{"kind": "diag", "p0": [..], "p1": [..], "thickness": ..}` — `"type"` キー
+//! なし) が各ユーザーの中央 DB / サイドカーに保存されている。`Shape` の
+//! `Deserialize` は **明示的な `"type"` キー判定** で以下を区別する:
+//!
+//! - `"type"` フィールド有 → タグ付き新形式として解釈、不明な `"type"` 値は
+//!   エラー (silently fallback しない)
+//! - `"type"` フィールド無し + `"kind"` / `"p0"` / `"p1"` 有 → 旧 LineObject
+//!   として解釈し、`Shape::Line` に変換
+//! - いずれにも該当しない → エラー
+//!
+//! `Serialize` は常に新形式 (`"type": "..."`) で書く。旧データを一度開いて
+//! 保存し直すと自動的に新形式へ移行する。
 
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -12,7 +36,7 @@ use std::path::PathBuf;
 use flate2::Compression;
 use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// ベクタ線オブジェクトの種別。作成時のツールで決まる。
 /// 作成時の挙動 (初期幾何) のみに影響し、保存後の編集では区別しない。
@@ -88,6 +112,411 @@ pub fn rasterize_vectors_into(mask: &mut [bool], vectors: &[LineObject], w: usiz
         let pts = v.corners(0.0);
         scanline_fill_polygon(mask, &pts, w, h, true);
     }
+}
+
+// ── Shape 拡張 (隠蔽加工対応、消しゴムと共有) ────────────────────────────
+//
+// `Shape` enum は 3 variant (Line / Rect / Ellipse) を持つ統一ベクタ表現。
+// JSON では `{"type": "line" | "rect" | "ellipse", ...}` 形式 (タグ付き)。
+//
+// 旧 `LineObject` の素 JSON も読めるよう、`Deserialize` は明示的な `"type"` キー
+// 判定で legacy / tagged を区別する (Codex review P1 指摘)。
+// ─────────────────────────────────────────────────────────────────────────
+
+/// 8 ツール共通のベクタオブジェクト統一表現。
+///
+/// - `Line`: 直線・縦線・横線の 3 ツール (中心軸 + 太さの矩形帯)
+/// - `Rect`: 軸並行 or 任意回転の矩形
+/// - `Ellipse`: 軸並行 or 任意回転の楕円
+///
+/// JSON 形式 (常にタグ付きで書き、両形式を読む):
+///
+/// ```json
+/// {"type":"line","kind":"diag","p0":[10,10],"p1":[90,10],"thickness":4}
+/// {"type":"rect","center":[100,100],"half_w":40,"half_h":20,"rotation_rad":0}
+/// {"type":"ellipse","center":[200,200],"rx":30,"ry":20,"rotation_rad":0}
+/// ```
+///
+/// 旧 `LineObject` 素 JSON (`{"kind":"diag", "p0":..., "p1":..., "thickness":..}`)
+/// も `Shape::Line` として読める。
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum Shape {
+    Line {
+        kind: LineKind,
+        p0: (f32, f32),
+        p1: (f32, f32),
+        thickness: f32,
+    },
+    Rect {
+        center: (f32, f32),
+        half_w: f32,
+        half_h: f32,
+        rotation_rad: f32,
+    },
+    Ellipse {
+        center: (f32, f32),
+        rx: f32,
+        ry: f32,
+        rotation_rad: f32,
+    },
+}
+
+impl Shape {
+    /// オブジェクトの中心点 (回転基準)。
+    pub fn center(&self) -> (f32, f32) {
+        match self {
+            Shape::Line { p0, p1, .. } => ((p0.0 + p1.0) * 0.5, (p0.1 + p1.1) * 0.5),
+            Shape::Rect { center, .. } | Shape::Ellipse { center, .. } => *center,
+        }
+    }
+
+    /// オブジェクトを (dx, dy) だけ平行移動する。
+    pub fn translate(&mut self, dx: f32, dy: f32) {
+        match self {
+            Shape::Line { p0, p1, .. } => {
+                p0.0 += dx;
+                p0.1 += dy;
+                p1.0 += dx;
+                p1.1 += dy;
+            }
+            Shape::Rect { center, .. } | Shape::Ellipse { center, .. } => {
+                center.0 += dx;
+                center.1 += dy;
+            }
+        }
+    }
+
+    /// 指定中心周りに `angle` [rad] 回転する。
+    /// Rect / Ellipse は `rotation_rad` フィールドにも積算される。
+    pub fn rotate_around(&mut self, cx: f32, cy: f32, angle: f32) {
+        let (s, c) = angle.sin_cos();
+        let rot = |p: (f32, f32)| -> (f32, f32) {
+            let dx = p.0 - cx;
+            let dy = p.1 - cy;
+            (cx + dx * c - dy * s, cy + dx * s + dy * c)
+        };
+        match self {
+            Shape::Line { p0, p1, .. } => {
+                *p0 = rot(*p0);
+                *p1 = rot(*p1);
+            }
+            Shape::Rect {
+                center,
+                rotation_rad,
+                ..
+            }
+            | Shape::Ellipse {
+                center,
+                rotation_rad,
+                ..
+            } => {
+                *center = rot(*center);
+                *rotation_rad += angle;
+            }
+        }
+    }
+
+    /// 画像サイズ変更時のスケーリング (mask_db::get_full でリスケール時に使う)。
+    ///
+    /// **制限事項**: 非等比スケール (`sx != sy`) で回転済み `Rect` / `Ellipse` は
+    /// 数学的には剪断 (shear) を含む変換になり、現状の `center / half_w / half_h /
+    /// rotation_rad` 表現では正確に再現できない。当面は近似 (center と各半径を
+    /// 各軸で伸縮、回転角度は据え置き) で扱い、PDF ページの DPI 違いなど非等比
+    /// スケールが起きる経路は仕様外 (回転 0 か isotropic の場合のみ正確) とする。
+    pub fn scale_xy(&mut self, sx: f32, sy: f32) {
+        match self {
+            Shape::Line {
+                p0, p1, thickness, ..
+            } => {
+                p0.0 *= sx;
+                p0.1 *= sy;
+                p1.0 *= sx;
+                p1.1 *= sy;
+                *thickness *= (sx + sy) * 0.5;
+            }
+            Shape::Rect {
+                center,
+                half_w,
+                half_h,
+                ..
+            } => {
+                center.0 *= sx;
+                center.1 *= sy;
+                *half_w *= sx;
+                *half_h *= sy;
+            }
+            Shape::Ellipse { center, rx, ry, .. } => {
+                center.0 *= sx;
+                center.1 *= sy;
+                *rx *= sx;
+                *ry *= sy;
+            }
+        }
+    }
+
+    /// `Shape::Line` の場合だけ旧 `LineObject` に変換 (Phase 2b 移行期間用)。
+    pub fn as_legacy_line(&self) -> Option<LineObject> {
+        match self {
+            Shape::Line {
+                kind,
+                p0,
+                p1,
+                thickness,
+            } => Some(LineObject {
+                kind: *kind,
+                p0: *p0,
+                p1: *p1,
+                thickness: *thickness,
+            }),
+            _ => None,
+        }
+    }
+}
+
+impl From<LineObject> for Shape {
+    fn from(line: LineObject) -> Self {
+        Shape::Line {
+            kind: line.kind,
+            p0: line.p0,
+            p1: line.p1,
+            thickness: line.thickness,
+        }
+    }
+}
+
+// `Shape` の `Deserialize` は手書き。明示的に `"type"` キー存在を判定し、
+// 不明な `"type"` 値や missing キーで silently legacy にフォールバックしない
+// (Codex review P1)。
+impl<'de> Deserialize<'de> for Shape {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as DeError;
+        let v = serde_json::Value::deserialize(d)?;
+        let obj = v
+            .as_object()
+            .ok_or_else(|| DeError::custom("Shape must be a JSON object, got non-object"))?;
+
+        if let Some(ty) = obj.get("type") {
+            // タグ付き新形式: "type" の値を厳格に判定し、未知タイプはエラー
+            let ty_str = ty
+                .as_str()
+                .ok_or_else(|| DeError::custom("Shape 'type' must be a string"))?;
+            match ty_str {
+                "line" => {
+                    let f: TaggedLineFields =
+                        serde_json::from_value(v.clone()).map_err(DeError::custom)?;
+                    Ok(Shape::Line {
+                        kind: f.kind,
+                        p0: f.p0,
+                        p1: f.p1,
+                        thickness: f.thickness,
+                    })
+                }
+                "rect" => {
+                    let f: TaggedRectFields =
+                        serde_json::from_value(v.clone()).map_err(DeError::custom)?;
+                    Ok(Shape::Rect {
+                        center: f.center,
+                        half_w: f.half_w,
+                        half_h: f.half_h,
+                        rotation_rad: f.rotation_rad,
+                    })
+                }
+                "ellipse" => {
+                    let f: TaggedEllipseFields =
+                        serde_json::from_value(v.clone()).map_err(DeError::custom)?;
+                    Ok(Shape::Ellipse {
+                        center: f.center,
+                        rx: f.rx,
+                        ry: f.ry,
+                        rotation_rad: f.rotation_rad,
+                    })
+                }
+                other => Err(DeError::custom(format!(
+                    "unknown Shape type: '{other}' (expected 'line' / 'rect' / 'ellipse')"
+                ))),
+            }
+        } else if obj.contains_key("kind") && obj.contains_key("p0") && obj.contains_key("p1") {
+            // 旧 LineObject (タグなし): 必須キー揃いを確認してから legacy として解釈
+            let legacy: LegacyLineFields = serde_json::from_value(v).map_err(DeError::custom)?;
+            Ok(Shape::Line {
+                kind: legacy.kind,
+                p0: legacy.p0,
+                p1: legacy.p1,
+                thickness: legacy.thickness,
+            })
+        } else {
+            Err(DeError::custom(
+                "Shape requires 'type' (new tagged format) or 'kind'+'p0'+'p1' (legacy LineObject)",
+            ))
+        }
+    }
+}
+
+// タグ付き形式の中身を `serde_json::from_value` で取り出すためのヘルパー構造体。
+// `"type"` フィールドは Shape::deserialize で先に判別しているため、ここでは
+// その他のフィールドだけ受ける (`type` を含む追加フィールドは serde が無視する)。
+#[derive(Deserialize)]
+struct TaggedLineFields {
+    kind: LineKind,
+    p0: (f32, f32),
+    p1: (f32, f32),
+    thickness: f32,
+}
+
+#[derive(Deserialize)]
+struct TaggedRectFields {
+    center: (f32, f32),
+    half_w: f32,
+    half_h: f32,
+    #[serde(default)]
+    rotation_rad: f32,
+}
+
+#[derive(Deserialize)]
+struct TaggedEllipseFields {
+    center: (f32, f32),
+    rx: f32,
+    ry: f32,
+    #[serde(default)]
+    rotation_rad: f32,
+}
+
+#[derive(Deserialize)]
+struct LegacyLineFields {
+    kind: LineKind,
+    p0: (f32, f32),
+    p1: (f32, f32),
+    thickness: f32,
+}
+
+/// 軸並行 or 回転矩形の 4 corners を計算する。
+/// `(center, half_w, half_h, rotation_rad)` → 反時計回りに `[NW, NE, SE, SW]`
+/// (rotation 0 のとき)。
+pub fn rect_corners(
+    center: (f32, f32),
+    half_w: f32,
+    half_h: f32,
+    rotation_rad: f32,
+) -> [(f32, f32); 4] {
+    let (s, c) = rotation_rad.sin_cos();
+    let local = [
+        (-half_w, -half_h),
+        (half_w, -half_h),
+        (half_w, half_h),
+        (-half_w, half_h),
+    ];
+    let mut out = [(0.0_f32, 0.0_f32); 4];
+    for i in 0..4 {
+        let (lx, ly) = local[i];
+        out[i] = (center.0 + c * lx - s * ly, center.1 + s * lx + c * ly);
+    }
+    out
+}
+
+/// 楕円 (回転対応) を 1bit マスクにラスタライズする (in-place)。
+///
+/// アルゴリズム: bbox を [`rect_corners`] と同じ向きで算出し、その中の各画素中心を
+/// 逆回転して canonical 楕円方程式 `u²/rx² + v²/ry² <= 1` で in/out 判定する。
+pub fn scanline_fill_ellipse(
+    mask: &mut [bool],
+    center: (f32, f32),
+    rx: f32,
+    ry: f32,
+    rotation_rad: f32,
+    w: usize,
+    h: usize,
+    value: bool,
+) {
+    if rx <= 0.0 || ry <= 0.0 {
+        return;
+    }
+    // bbox 計算: 回転楕円の半径 (任意角度)
+    //   bbox 半幅 = sqrt(rx² cos²θ + ry² sin²θ)
+    //   bbox 半高 = sqrt(rx² sin²θ + ry² cos²θ)
+    let (s, c) = rotation_rad.sin_cos();
+    let hw = (rx * rx * c * c + ry * ry * s * s).sqrt();
+    let hh = (rx * rx * s * s + ry * ry * c * c).sqrt();
+    let min_x = (center.0 - hw).floor().max(0.0) as usize;
+    let max_x = ((center.0 + hw).ceil()).min(w as f32) as usize;
+    let min_y = (center.1 - hh).floor().max(0.0) as usize;
+    let max_y = ((center.1 + hh).ceil()).min(h as f32) as usize;
+    let inv_rx2 = 1.0 / (rx * rx);
+    let inv_ry2 = 1.0 / (ry * ry);
+    // 逆回転: (u, v) = R(-θ) (px, py) = (c·px + s·py, -s·px + c·py)
+    for y in min_y..max_y {
+        let py = (y as f32 + 0.5) - center.1;
+        let row = y * w;
+        for x in min_x..max_x {
+            let px = (x as f32 + 0.5) - center.0;
+            let u = c * px + s * py;
+            let v = -s * px + c * py;
+            if u * u * inv_rx2 + v * v * inv_ry2 <= 1.0 {
+                mask[row + x] = value;
+            }
+        }
+    }
+}
+
+/// `Shape` を 1bit マスクへラスタライズする (in-place)。
+///
+/// `value=true` でマスクを ON、`false` で OFF (消去) として塗る。
+pub fn rasterize_shape_into(mask: &mut [bool], shape: &Shape, w: usize, h: usize, value: bool) {
+    match shape {
+        Shape::Line {
+            p0, p1, thickness, ..
+        } => {
+            // 既存の LineObject::corners と同じ「中心軸 + 太さの矩形帯」表現。
+            let line = LineObject {
+                kind: LineKind::Diagonal, // kind は corners 計算に影響しない
+                p0: *p0,
+                p1: *p1,
+                thickness: *thickness,
+            };
+            let pts = line.corners(0.0);
+            scanline_fill_polygon(mask, &pts, w, h, value);
+        }
+        Shape::Rect {
+            center,
+            half_w,
+            half_h,
+            rotation_rad,
+        } => {
+            let pts = rect_corners(*center, *half_w, *half_h, *rotation_rad);
+            scanline_fill_polygon(mask, &pts, w, h, value);
+        }
+        Shape::Ellipse {
+            center,
+            rx,
+            ry,
+            rotation_rad,
+        } => {
+            scanline_fill_ellipse(mask, *center, *rx, *ry, *rotation_rad, w, h, value);
+        }
+    }
+}
+
+/// `Shape` 群を既存の 1bit マスクに OR で重ねる (in-place、`true` 塗り)。
+pub fn rasterize_shapes_into(mask: &mut [bool], shapes: &[Shape], w: usize, h: usize) {
+    for s in shapes {
+        rasterize_shape_into(mask, s, w, h, true);
+    }
+}
+
+/// `Shape` 群を JSON 文字列にシリアライズする (空なら None)。
+/// 出力は常に新タグ付き形式。
+pub fn shapes_to_json(shapes: &[Shape]) -> Option<String> {
+    if shapes.is_empty() {
+        return None;
+    }
+    serde_json::to_string(shapes).ok()
+}
+
+/// JSON 文字列から `Shape` 群を読む。旧 `LineObject` 配列 / 新タグ付き配列 /
+/// 混在配列いずれも受ける (個別要素の `Deserialize` で分岐)。
+/// パース失敗時は空 Vec (既存 `vectors_from_json` と同じ寛容な挙動)。
+pub fn shapes_from_json(s: &str) -> Vec<Shape> {
+    serde_json::from_str(s).unwrap_or_default()
 }
 
 /// スキャンライン方式の多角形塗り。エラサーモードのビットマップ塗りと
@@ -478,5 +907,391 @@ mod tests {
     #[test]
     fn empty_vectors_serialize_to_none() {
         assert!(vectors_to_json(&[]).is_none());
+    }
+
+    // ── Shape enum / マイグレーション関連テスト (Phase 0、Codex P1 反映) ─
+
+    #[test]
+    fn shape_line_tagged_roundtrip() {
+        let s = Shape::Line {
+            kind: LineKind::Diagonal,
+            p0: (10.0, 20.0),
+            p1: (100.0, 200.0),
+            thickness: 4.0,
+        };
+        let json = shapes_to_json(&[s]).unwrap();
+        // タグ付き形式で出ているか
+        assert!(json.contains("\"type\":\"line\""));
+        let back = shapes_from_json(&json);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0], s);
+    }
+
+    #[test]
+    fn shape_rect_tagged_roundtrip() {
+        let s = Shape::Rect {
+            center: (50.0, 60.0),
+            half_w: 20.0,
+            half_h: 10.0,
+            rotation_rad: 0.5,
+        };
+        let json = shapes_to_json(&[s]).unwrap();
+        assert!(json.contains("\"type\":\"rect\""));
+        let back = shapes_from_json(&json);
+        assert_eq!(back, vec![s]);
+    }
+
+    #[test]
+    fn shape_ellipse_tagged_roundtrip() {
+        let s = Shape::Ellipse {
+            center: (100.0, 100.0),
+            rx: 30.0,
+            ry: 15.0,
+            rotation_rad: 0.0,
+        };
+        let json = shapes_to_json(&[s]).unwrap();
+        assert!(json.contains("\"type\":\"ellipse\""));
+        let back = shapes_from_json(&json);
+        assert_eq!(back, vec![s]);
+    }
+
+    #[test]
+    fn shape_deser_legacy_line_object_json() {
+        // 旧 LineObject の素 JSON。リリース済みの DB / サイドカーに残っている形式。
+        let legacy = r#"[{"kind":"diag","p0":[10.0,20.0],"p1":[100.0,200.0],"thickness":4.0}]"#;
+        let shapes = shapes_from_json(legacy);
+        assert_eq!(shapes.len(), 1);
+        assert_eq!(
+            shapes[0],
+            Shape::Line {
+                kind: LineKind::Diagonal,
+                p0: (10.0, 20.0),
+                p1: (100.0, 200.0),
+                thickness: 4.0,
+            }
+        );
+    }
+
+    #[test]
+    fn shape_deser_legacy_vert_and_horiz() {
+        // 縦線 / 横線も `kind` で区別された旧形式を保持
+        let legacy = r#"[
+            {"kind":"vert","p0":[5.0,0.0],"p1":[5.0,100.0],"thickness":2.0},
+            {"kind":"horiz","p0":[0.0,5.0],"p1":[100.0,5.0],"thickness":3.0}
+        ]"#;
+        let shapes = shapes_from_json(legacy);
+        assert_eq!(shapes.len(), 2);
+        match shapes[0] {
+            Shape::Line {
+                kind: LineKind::Vertical,
+                ..
+            } => {}
+            _ => panic!("expected vertical line, got {:?}", shapes[0]),
+        }
+        match shapes[1] {
+            Shape::Line {
+                kind: LineKind::Horizontal,
+                ..
+            } => {}
+            _ => panic!("expected horizontal line, got {:?}", shapes[1]),
+        }
+    }
+
+    #[test]
+    fn shape_deser_mixed_legacy_and_tagged() {
+        // 1 つの配列に旧 LineObject (タグなし) と新 Shape (タグ付き) が混在しても読める。
+        let mixed = r#"[
+            {"kind":"diag","p0":[0.0,0.0],"p1":[10.0,10.0],"thickness":1.0},
+            {"type":"rect","center":[50.0,50.0],"half_w":10.0,"half_h":5.0,"rotation_rad":0.0},
+            {"type":"line","kind":"vert","p0":[20.0,0.0],"p1":[20.0,30.0],"thickness":2.0},
+            {"type":"ellipse","center":[100.0,100.0],"rx":15.0,"ry":10.0,"rotation_rad":0.0}
+        ]"#;
+        let shapes = shapes_from_json(mixed);
+        assert_eq!(shapes.len(), 4);
+        assert!(matches!(shapes[0], Shape::Line { .. }));
+        assert!(matches!(shapes[1], Shape::Rect { .. }));
+        assert!(matches!(shapes[2], Shape::Line { .. }));
+        assert!(matches!(shapes[3], Shape::Ellipse { .. }));
+    }
+
+    #[test]
+    fn shape_deser_empty_array() {
+        let shapes = shapes_from_json("[]");
+        assert!(shapes.is_empty());
+    }
+
+    #[test]
+    fn shape_deser_unknown_type_is_error() {
+        // 未知の "type" は legacy にフォールバックせず、その要素は配列ごと parse 失敗
+        // (Codex P1: silently fallback してはいけない)
+        let bad = r#"[{"type":"diamond","center":[0,0],"half_w":1,"half_h":1,"rotation_rad":0}]"#;
+        let parse_result: Result<Vec<Shape>, _> = serde_json::from_str(bad);
+        assert!(
+            parse_result.is_err(),
+            "unknown 'type' should be an error, got: {:?}",
+            parse_result
+        );
+    }
+
+    #[test]
+    fn shape_deser_tagged_with_missing_field_is_error() {
+        // タグ付きで必須フィールド欠落 → legacy にフォールバックせずエラー
+        let bad = r#"[{"type":"line","kind":"diag","p0":[0,0]}]"#; // p1 / thickness 欠落
+        let parse_result: Result<Vec<Shape>, _> = serde_json::from_str(bad);
+        assert!(
+            parse_result.is_err(),
+            "tagged with missing field should be error, got: {:?}",
+            parse_result
+        );
+    }
+
+    #[test]
+    fn shape_deser_legacy_extra_fields_ignored() {
+        // 将来追加されたフィールドが旧 JSON にあっても無視されて読める
+        let with_extra =
+            r#"[{"kind":"diag","p0":[0,0],"p1":[10,10],"thickness":2.0,"future_field":42}]"#;
+        let shapes = shapes_from_json(with_extra);
+        assert_eq!(shapes.len(), 1);
+        assert!(matches!(shapes[0], Shape::Line { .. }));
+    }
+
+    #[test]
+    fn shape_deser_lenient_fallback_on_corrupt() {
+        // `shapes_from_json` は寛容に空配列を返す (既存 vectors_from_json と同じ挙動)。
+        // 厳密エラーが必要な場合は `serde_json::from_str::<Vec<Shape>>` を直接使う。
+        let corrupt = r#"this is not json"#;
+        let shapes = shapes_from_json(corrupt);
+        assert!(shapes.is_empty());
+    }
+
+    #[test]
+    fn rect_corners_axis_aligned() {
+        let pts = rect_corners((100.0, 100.0), 10.0, 20.0, 0.0);
+        // NW, NE, SE, SW
+        assert_eq!(pts[0], (90.0, 80.0));
+        assert_eq!(pts[1], (110.0, 80.0));
+        assert_eq!(pts[2], (110.0, 120.0));
+        assert_eq!(pts[3], (90.0, 120.0));
+    }
+
+    #[test]
+    fn rect_corners_rotated_90deg() {
+        let pts = rect_corners((0.0, 0.0), 10.0, 5.0, std::f32::consts::FRAC_PI_2);
+        // 90° 回転: x, y が入れ替わる (符号は座標系依存)
+        // (-10, -5) -> (5, -10)
+        // (+10, -5) -> (5, +10)
+        // (+10, +5) -> (-5, +10)
+        // (-10, +5) -> (-5, -10)
+        let eps = 1e-4;
+        assert!((pts[0].0 - 5.0).abs() < eps);
+        assert!((pts[0].1 - (-10.0)).abs() < eps);
+        assert!((pts[2].0 - (-5.0)).abs() < eps);
+        assert!((pts[2].1 - 10.0).abs() < eps);
+    }
+
+    #[test]
+    fn rasterize_shape_rect_axis_aligned() {
+        // 100x100 マスクに中心 (50, 50)、half=10×5、回転 0 の矩形を塗る
+        let mut mask = vec![false; 100 * 100];
+        let shape = Shape::Rect {
+            center: (50.0, 50.0),
+            half_w: 10.0,
+            half_h: 5.0,
+            rotation_rad: 0.0,
+        };
+        rasterize_shape_into(&mut mask, &shape, 100, 100, true);
+        // 中心が塗られている
+        assert!(mask[50 * 100 + 50]);
+        // 端 (40, 50) と (59, 50) の内側 (half_w=10 なので画素 40..=59 が塗られる想定)
+        assert!(mask[50 * 100 + 41]);
+        assert!(mask[50 * 100 + 58]);
+        // 外: x=30 / x=70
+        assert!(!mask[50 * 100 + 30]);
+        assert!(!mask[50 * 100 + 70]);
+        // 外: y=30 / y=70
+        assert!(!mask[30 * 100 + 50]);
+        assert!(!mask[70 * 100 + 50]);
+    }
+
+    #[test]
+    fn rasterize_shape_ellipse_axis_aligned() {
+        // 200x200 マスクに中心 (100, 100)、rx=50、ry=30、回転 0 の楕円
+        let mut mask = vec![false; 200 * 200];
+        let shape = Shape::Ellipse {
+            center: (100.0, 100.0),
+            rx: 50.0,
+            ry: 30.0,
+            rotation_rad: 0.0,
+        };
+        rasterize_shape_into(&mut mask, &shape, 200, 200, true);
+        // 中心は塗られる
+        assert!(mask[100 * 200 + 100]);
+        // 短軸方向の縁 (rx=50): 内側 x=140 は塗られる、外側 x=160 は塗られない
+        assert!(mask[100 * 200 + 140]);
+        assert!(!mask[100 * 200 + 160]);
+        // 長軸 (ry=30): 内側 y=120 は塗られる、外側 y=140 は塗られない
+        assert!(mask[120 * 200 + 100]);
+        assert!(!mask[140 * 200 + 100]);
+        // 楕円の対角 (短軸/長軸の外側コーナー): (140, 120) は楕円外
+        // u²/2500 + v²/900 = 1600/2500 + 400/900 = 0.64 + 0.444 = 1.08 > 1
+        assert!(!mask[120 * 200 + 140]);
+    }
+
+    #[test]
+    fn rasterize_shape_ellipse_rotated_90() {
+        // 90° 回転で rx と ry が入れ替わったように見える
+        let mut mask = vec![false; 200 * 200];
+        let shape = Shape::Ellipse {
+            center: (100.0, 100.0),
+            rx: 50.0,
+            ry: 30.0,
+            rotation_rad: std::f32::consts::FRAC_PI_2,
+        };
+        rasterize_shape_into(&mut mask, &shape, 200, 200, true);
+        // 90° 回転後は、見かけ上 rx=30 (横方向)、ry=50 (縦方向) になる
+        assert!(mask[100 * 200 + 100]); // 中心
+        assert!(mask[100 * 200 + 125]); // 横 25 < 30 内
+        assert!(!mask[100 * 200 + 140]); // 横 40 > 30 外
+        assert!(mask[140 * 200 + 100]); // 縦 40 < 50 内
+        assert!(!mask[160 * 200 + 100]); // 縦 60 > 50 外
+    }
+
+    #[test]
+    fn rasterize_shape_rect_rotated_45() {
+        // 45° 回転で対角線方向に細長くなる
+        let mut mask = vec![false; 100 * 100];
+        let shape = Shape::Rect {
+            center: (50.0, 50.0),
+            half_w: 20.0,
+            half_h: 5.0,
+            rotation_rad: std::f32::consts::FRAC_PI_4,
+        };
+        rasterize_shape_into(&mut mask, &shape, 100, 100, true);
+        // 中心は塗られている
+        assert!(mask[50 * 100 + 50]);
+        // 主対角線方向 (x+y 増加) には伸びる: (60, 60) はまだ内側
+        assert!(mask[60 * 100 + 60]);
+        // 副対角線方向 (x+y 一定 = 100 だが y-x 増加) には伸びない:
+        // (40, 60) は中心からの local 座標 (-10, 10) → 回転後 u = c*(-10) + s*10 = 0,
+        // v = -s*(-10) + c*10 = 7.07 + 7.07 = 14.14 > 5 なので外
+        assert!(!mask[60 * 100 + 40]);
+    }
+
+    #[test]
+    fn shape_translate_rotate_compose() {
+        let mut s = Shape::Rect {
+            center: (50.0, 50.0),
+            half_w: 10.0,
+            half_h: 5.0,
+            rotation_rad: 0.0,
+        };
+        s.translate(10.0, -20.0);
+        match s {
+            Shape::Rect { center, .. } => assert_eq!(center, (60.0, 30.0)),
+            _ => panic!(),
+        }
+        s.rotate_around(60.0, 30.0, std::f32::consts::FRAC_PI_2);
+        match s {
+            Shape::Rect {
+                center,
+                rotation_rad,
+                ..
+            } => {
+                assert!((center.0 - 60.0).abs() < 1e-4);
+                assert!((center.1 - 30.0).abs() < 1e-4);
+                assert!((rotation_rad - std::f32::consts::FRAC_PI_2).abs() < 1e-4);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn shape_scale_isotropic() {
+        let mut s = Shape::Rect {
+            center: (100.0, 100.0),
+            half_w: 20.0,
+            half_h: 10.0,
+            rotation_rad: 0.0,
+        };
+        s.scale_xy(2.0, 2.0);
+        match s {
+            Shape::Rect {
+                center,
+                half_w,
+                half_h,
+                ..
+            } => {
+                assert_eq!(center, (200.0, 200.0));
+                assert_eq!(half_w, 40.0);
+                assert_eq!(half_h, 20.0);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn shape_from_line_object_roundtrip() {
+        let line = LineObject {
+            kind: LineKind::Diagonal,
+            p0: (1.0, 2.0),
+            p1: (3.0, 4.0),
+            thickness: 5.0,
+        };
+        let shape: Shape = line.into();
+        let back = shape.as_legacy_line().unwrap();
+        assert_eq!(back, line);
+    }
+
+    #[test]
+    fn shape_as_legacy_line_returns_none_for_rect_ellipse() {
+        let r = Shape::Rect {
+            center: (0.0, 0.0),
+            half_w: 1.0,
+            half_h: 1.0,
+            rotation_rad: 0.0,
+        };
+        assert!(r.as_legacy_line().is_none());
+        let e = Shape::Ellipse {
+            center: (0.0, 0.0),
+            rx: 1.0,
+            ry: 1.0,
+            rotation_rad: 0.0,
+        };
+        assert!(e.as_legacy_line().is_none());
+    }
+
+    #[test]
+    fn shapes_to_json_empty_returns_none() {
+        assert!(shapes_to_json(&[]).is_none());
+    }
+
+    #[test]
+    fn set_raw_preserves_legacy_string_then_read_as_shape() {
+        // サイドカー復元経路: 旧 LineObject の素 JSON を set_raw でそのまま DB に貼る。
+        // get_full は LineObject を返すが、新しい shapes_from_json でも読めることを確認。
+        let tmp = std::env::temp_dir().join(format!(
+            "mimageviewer_mask_db_set_raw_legacy_{}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp);
+        let db = MaskDb::open_at(&tmp).expect("open db");
+        let w = 100;
+        let h = 100;
+        // 1x1 = true なダミーマスク
+        let mut mask = vec![false; w * h];
+        mask[0] = true;
+        let compressed = compress_mask(&mask);
+        let legacy_json = r#"[{"kind":"diag","p0":[10.0,20.0],"p1":[80.0,20.0],"thickness":4.0}]"#;
+        db.set_raw("legacy_key", &compressed, Some(legacy_json), w, h)
+            .expect("set_raw");
+        // 既存 API (vectors_from_json → Vec<LineObject>) でも読める
+        let (got_mask, got_legacy) = db.get_full("legacy_key", w, h).expect("get_full");
+        assert_eq!(got_mask, mask);
+        assert_eq!(got_legacy.len(), 1);
+        // 同じ JSON を shapes_from_json で読むと Shape::Line として復元される
+        let got_shapes = shapes_from_json(legacy_json);
+        assert_eq!(got_shapes.len(), 1);
+        assert!(matches!(got_shapes[0], Shape::Line { .. }));
+        let _ = std::fs::remove_file(&tmp);
     }
 }
