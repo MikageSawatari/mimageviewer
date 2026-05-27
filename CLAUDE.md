@@ -280,6 +280,20 @@ C:\home\mimageviewer_vendor_backup\
   `mod.rs` に `mod xxx;` を追加し、`app.rs` の `update()` 内で `self.show_xxx(ctx)` を呼ぶ。
   `App` 構造体に `show_xxx: bool` フィールドを追加し、`Default` impl で `false` 初期化。
 
+### パネル (Area + Frame::popup)
+- フルスクリーン上の固定パネルで `egui::Area::fixed_pos` + `Frame::popup` +
+  `ScrollArea` を組み合わせる場合、`ScrollArea::max_height` だけに頼らない。
+  egui 0.33 は親 `Ui` の `available_rect_before_wrap()` を上限にするため、自動サイズの
+  `Area` / `Frame::popup` 内ではコンテンツ高に縮むことがある。
+- 下端近くまで伸ばしたいパネルは、ScrollArea の前に
+  `ui.allocate_ui_with_layout(egui::vec2(width, body_height), ...)` で親領域を明示確保し、
+  その内側で `ScrollArea::vertical().max_height(body_height).auto_shrink([false, false])`
+  を使う。
+- タイトル / プレビュー / 閉じるボタンのヘッダは ScrollArea の外に固定する。
+  ScrollArea 内へ戻すと、縦スクロールバーが × ボタンに重なる退行を起こす。
+- パネルが下端近くまで伸びる場合、クリック吸収 sink とキャンバス入力抑制 rect も
+  同じ高さから動的に作る。固定 1000px は 1440p / 4K / 縦長ウィンドウで不足する。
+
 ### IME 対応 (日本語入力) ⚠️ 重要
 TextEdit を含むダイアログで Enter / Escape を拾うときは **必ず専用ヘルパーを使う**こと。
 直接 `ctx.input(|i| i.key_pressed(Key::Enter/Escape))` を呼ぶと、**日本語 IME 変換中の Enter

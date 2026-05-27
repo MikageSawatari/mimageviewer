@@ -950,7 +950,7 @@ fn adjustment_panel_rect(full_rect: egui::Rect) -> egui::Rect {
         egui::pos2(full_rect.min.x, full_rect.min.y + TOP_BAR_HEIGHT),
         egui::pos2(
             full_rect.min.x + crate::ui_adjustment_panel::LEFT_PANEL_WIDTH,
-            full_rect.max.y,
+            full_rect.max.y - crate::ui_adjustment_panel::LEFT_PANEL_BOTTOM_MARGIN,
         ),
     )
 }

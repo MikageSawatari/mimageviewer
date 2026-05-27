@@ -384,3 +384,39 @@ grace 期間を別途追加する。
 が true なら `ctx.request_repaint()` を呼ぶ。これにより `close_fullscreen` が update 内の
 どこで呼ばれても次フレームで cleanup が確実に走る。個別 call site の `request_repaint` 追加は
 意図表明としての価値はあるが、漏れたケースもこの安全網が拾う。
+
+---
+
+## 10. Overlay panel layout (Area + Frame::popup + ScrollArea)
+
+フルスクリーン上の固定パネルを `egui::Area::fixed_pos` + `Frame::popup` +
+`ScrollArea` で作る場合、`ScrollArea::max_height` だけではパネルが下端まで伸びる
+保証にならない。egui 0.33 の `ScrollArea` は、最初に親 `Ui` の
+`available_rect_before_wrap()` と `max_height` の小さい方を使うため、`Area` /
+`Frame::popup` の自動サイズ文脈ではコンテンツ高に引きずられることがある。
+
+下端近くまで伸びるパネルでは、ScrollArea の直前に親領域を明示確保する:
+
+```rust
+let body_height = (full_rect.max.y - ui.cursor().top() - PANEL_BOTTOM_MARGIN)
+    .max(PANEL_MIN_BODY_H);
+ui.allocate_ui_with_layout(
+    egui::vec2(PANEL_W, body_height),
+    egui::Layout::top_down(egui::Align::LEFT),
+    |ui| {
+        ui.set_min_height(body_height);
+        egui::ScrollArea::vertical()
+            .max_height(body_height)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                // panel body
+            });
+    },
+);
+```
+
+ヘッダ (タイトル、プレビュー、閉じるボタン) は ScrollArea の外に置く。これにより
+縦スクロールバーが閉じるボタンと重ならず、ヘッダもスクロールしない。
+パネルクリック吸収用の sink rect と、キャンバス操作を抑制する panel rect は、
+可視パネルが伸びた高さに合わせて動的に作る。固定 1000px のような値は 1440p /
+4K / 縦長ウィンドウで下端まで届かない。

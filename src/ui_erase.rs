@@ -98,13 +98,17 @@ const MIGAN_SIZE: usize = 512;
 /// パネル幅 (= 隠蔽パネル `ui_conceal.rs::PANEL_W` と統一)。
 /// 実機 FB R4: 「マスク全削除ボタン幅を揃えたい」要望 → 両パネル同幅 200 に。
 const PANEL_W: f32 = 200.0;
-/// パネルクリック吸収 sink の高さ (= `erase_panel_rect` の高さも兼ねる)。
-/// 可視 Frame::popup より大きく取って範囲外クリックを Foreground area で
-/// 確実に吸収する設計 (隠蔽パネルと同じ手法)。
-const ERASE_PANEL_SINK_H: f32 = 1000.0;
+/// パネル下端をウィンドウ下端から少し浮かせる余白。
+const PANEL_BOTTOM_MARGIN: f32 = 20.0;
+/// ScrollArea の最低高さ。極端に低いウィンドウでも操作領域を潰しすぎない。
+const PANEL_MIN_BODY_H: f32 = 120.0;
 /// ツールパネルの左上マージン。
 const PANEL_MARGIN_X: f32 = 16.0;
 const PANEL_MARGIN_Y: f32 = 60.0;
+
+fn erase_panel_outer_height(full_rect: egui::Rect, panel_pos: egui::Pos2) -> f32 {
+    (full_rect.max.y - panel_pos.y - PANEL_BOTTOM_MARGIN).max(PANEL_MIN_BODY_H + 40.0)
+}
 
 /// Undo スタックの最大エントリ数。
 const UNDO_MAX: usize = 20;
@@ -1040,31 +1044,10 @@ impl App {
             full_rect.min.x + PANEL_MARGIN_X,
             full_rect.min.y + PANEL_MARGIN_Y,
         );
-        // ⚠ 注意: この rect は `handle_erase_paint` の「カーソルがパネル上なら
-        // 筆操作を skip」用 (= 実際の可視 Frame サイズに合わせる)。
-        //
-        // クリック吸収用の SINK (= ERASE_PANEL_SINK_H = 1000px) と混同しない。
-        // SINK は egui Area 内側で click を absorb するためのもので、Frame の外周
-        // 数十 px を覆う目的で大きく取っている。一方こちらは handle_erase_paint
-        // が「ツール操作を発生させない領域」を判定する rect なので、可視 Frame と
-        // 同じか少し大きい程度のサイズで十分。
-        //
-        // 旧 raw painter 版の見積もり (base_h=458 + Brush/Line slider=42 +
-        // spread=40 = 最大 ~540) を踏襲しつつ、auto-size でブレが出ても困らない
-        // よう少し余裕を持たせて 600。これより小さくするとパネルの下の方
-        // (= ヘルプテキスト周辺) で筆塗りが発火する可能性がある。
-        let base_h = 460.0;
-        let slider_extra = if matches!(self.erase_tool, EraseTool::Brush | EraseTool::Line) {
-            44.0
-        } else {
-            0.0
-        };
-        let spread_extra = if self.erase_spread_ctx.is_some() {
-            40.0
-        } else {
-            0.0
-        };
-        let panel_h = base_h + slider_extra + spread_extra;
+        // `handle_erase_paint` の「カーソルがパネル上なら筆操作を skip」用。
+        // 可視パネルはウィンドウ下端近くまで伸びるため、この判定も同じ高さに
+        // 揃えないと、パネル下半分のクリックがキャンバス操作へ抜けてしまう。
+        let panel_h = erase_panel_outer_height(full_rect, panel_pos);
         egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W, panel_h))
     }
 
@@ -1836,9 +1819,11 @@ impl App {
         );
 
         // クリック吸収 sink (= 可視 Frame::popup より大きく取って、Frame 外周も
-        // 確実に吸収する)。詳細は隠蔽パネルと同じ設計メモを参照。
+        // 確実に吸収する)。パネルが 4K/縦長環境で下端近くまで伸びるため、
+        // 固定 1000px ではなく同じ高さから動的に作る。
+        let panel_h = erase_panel_outer_height(full_rect, panel_pos);
         let sink_rect =
-            egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W + 4.0, ERASE_PANEL_SINK_H));
+            egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W + 4.0, panel_h + 8.0));
 
         // closure 内で self mutation を避ける用のローカル変数群。Area::show 後に
         // まとめてディスパッチする。
@@ -1950,20 +1935,24 @@ impl App {
 
                         // ── 残り (ツール選択 / スライダー / スロット / ヘルプ) を
                         //     ScrollArea で囲む ──
-                        // R5+: max_height は ctx.content_rect (= viewport 全体) 基準。
-                        // auto_shrink は **両軸 false** にして、コンテンツが短くても
-                        // ScrollArea がウィンドウ下端まで広がるようにする (実機 FB R5
-                        // 二次対応:「ウィンドウのしたギリギリくらいまでのサイズにして、
-                        // それでも収まらない場合のみスクロールを必要とする形にしたい」)。
-                        // 旧 auto_shrink([false, true]) は content にフィットしてしまい、
-                        // ウィンドウ下半分が空いて見えていた。
-                        let screen_max_y = ctx.content_rect().max.y;
-                        let avail_top = ui.cursor().top();
-                        let max_height = (screen_max_y - avail_top - 20.0).max(120.0);
-                        egui::ScrollArea::vertical()
-                            .max_height(max_height)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
+                        // R5+: ScrollArea は親 UI の available_rect を上限にするため、
+                        // `max_height` だけでは Area + Frame::popup 内で content 高に
+                        // 縮むことがある。先に親領域を明示確保してから、その中で
+                        // ScrollArea を下端近くまで伸ばす。
+                        let body_height =
+                            (full_rect.max.y - ui.cursor().top() - PANEL_BOTTOM_MARGIN)
+                                .max(PANEL_MIN_BODY_H);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(PANEL_W, body_height),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                ui.set_min_width(PANEL_W);
+                                ui.set_max_width(PANEL_W);
+                                ui.set_min_height(body_height);
+                                egui::ScrollArea::vertical()
+                                    .max_height(body_height)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
 
                         // ボタン共通の最小サイズ。PANEL_W (= 190) - Frame::popup
                         // padding (~10*2) - 中央 gap (4) を 2 で割って、片側 ~78px。
@@ -2202,7 +2191,9 @@ impl App {
                             )
                             .wrap(),
                         );
-                            }); // ScrollArea::show
+                                    }); // ScrollArea::show
+                            },
+                        ); // allocate_ui_with_layout
                     }); // Frame::popup .show
             }); // Area::show
 

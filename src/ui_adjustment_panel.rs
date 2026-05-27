@@ -25,6 +25,8 @@ const LABEL_COLOR: egui::Color32 = egui::Color32::from_rgb(230, 230, 230);
 
 /// 左パネルの幅
 pub const LEFT_PANEL_WIDTH: f32 = 260.0;
+/// 左パネルの下端をウィンドウ下端から少し浮かせる余白。
+pub const LEFT_PANEL_BOTTOM_MARGIN: f32 = 20.0;
 
 /// スライダーとリセットボタンを描画するヘルパー。
 /// リセットボタン（↩）をクリックするとデフォルト値に戻す。
@@ -874,110 +876,123 @@ impl App {
             _ => None,
         };
 
-        let (changed, is_dragging) = egui::ScrollArea::vertical()
-            .max_height(body_height)
-            .min_scrolled_height(0.0)
-            // 両軸 false: コンテンツが短くてもパネル下端まで広がる (実機 FB R5 二次対応)。
-            .auto_shrink([false, false])
-            .show(&mut body_child, |ui| {
-                ui.set_width(panel_rect.width() - 20.0);
-                ui.add_space(4.0);
+        let scroll_output = body_child.allocate_ui_with_layout(
+            egui::vec2(panel_rect.width(), body_height),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.set_min_width(panel_rect.width());
+                ui.set_max_width(panel_rect.width());
+                ui.set_min_height(body_height);
+                // ScrollArea は親 UI の available_rect を上限にするため、body_rect と
+                // 同じ高さの親領域を明示確保してから置く。これでコンテンツが短い
+                // 場合もパネル下端近くまで暗背景 + 操作領域が伸びる。
+                egui::ScrollArea::vertical()
+                    .max_height(body_height)
+                    .min_scrolled_height(0.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(panel_rect.width() - 20.0);
+                        ui.add_space(4.0);
 
-                // ── 見開き L/R セレクタ ──
-                if let Some((left, right)) = spread_lr {
-                    let same = self.effective_params(left) == self.effective_params(right);
-                    ui.horizontal(|ui| {
-                        let is_left = self.adjust_spread_target == AdjustSpreadTarget::Left;
-                        if ui.selectable_label(is_left, "左ページ").clicked() {
-                            self.adjust_spread_target = AdjustSpreadTarget::Left;
-                        }
-                        let copy_l = ui
-                            .add_enabled(!same, egui::Button::new("←").small())
-                            .on_hover_text(if same {
-                                "左右の補正値が同一です"
-                            } else {
-                                "右ページの設定を左ページへコピー"
+                        // ── 見開き L/R セレクタ ──
+                        if let Some((left, right)) = spread_lr {
+                            let same = self.effective_params(left) == self.effective_params(right);
+                            ui.horizontal(|ui| {
+                                let is_left = self.adjust_spread_target == AdjustSpreadTarget::Left;
+                                if ui.selectable_label(is_left, "左ページ").clicked() {
+                                    self.adjust_spread_target = AdjustSpreadTarget::Left;
+                                }
+                                let copy_l = ui
+                                    .add_enabled(!same, egui::Button::new("←").small())
+                                    .on_hover_text(if same {
+                                        "左右の補正値が同一です"
+                                    } else {
+                                        "右ページの設定を左ページへコピー"
+                                    });
+                                if copy_l.clicked() {
+                                    self.copy_spread_adjust(right, left);
+                                }
+                                let copy_r = ui
+                                    .add_enabled(!same, egui::Button::new("→").small())
+                                    .on_hover_text(if same {
+                                        "左右の補正値が同一です"
+                                    } else {
+                                        "左ページの設定を右ページへコピー"
+                                    });
+                                if copy_r.clicked() {
+                                    self.copy_spread_adjust(left, right);
+                                }
+                                if ui.selectable_label(!is_left, "右ページ").clicked() {
+                                    self.adjust_spread_target = AdjustSpreadTarget::Right;
+                                }
                             });
-                        if copy_l.clicked() {
-                            self.copy_spread_adjust(right, left);
+                            ui.add_space(2.0);
                         }
-                        let copy_r = ui
-                            .add_enabled(!same, egui::Button::new("→").small())
-                            .on_hover_text(if same {
-                                "左右の補正値が同一です"
-                            } else {
-                                "左ページの設定を右ページへコピー"
-                            });
-                        if copy_r.clicked() {
-                            self.copy_spread_adjust(left, right);
-                        }
-                        if ui.selectable_label(!is_left, "右ページ").clicked() {
-                            self.adjust_spread_target = AdjustSpreadTarget::Right;
-                        }
-                    });
-                    ui.add_space(2.0);
-                }
 
-                // ── スコープ表示 ──
-                ui.add_space(2.0);
-                ui.label(
-                    egui::RichText::new(&scope_text)
-                        .size(12.0)
-                        .color(scope_color),
-                );
-                ui.add_space(4.0);
+                        // ── スコープ表示 ──
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(&scope_text)
+                                .size(12.0)
+                                .color(scope_color),
+                        );
+                        ui.add_space(4.0);
 
-                // ── アクションボタン (5 行) ──
-                let wide = egui::vec2(panel_rect.width() - 20.0, 24.0);
-                if ui
-                    .add(egui::Button::new("このフォルダの全画像に適用").min_size(wide))
-                    .on_hover_text("このフォルダ/ZIP/PDF の全画像に現在のパラメータを書き込む")
-                    .clicked()
-                {
-                    apply_all_clicked = true;
-                }
-                if ui
-                    .add(egui::Button::new("このフォルダの全画像から解除").min_size(wide))
-                    .on_hover_text(
-                        "このフォルダ/ZIP/PDF の全画像の個別設定を削除し、標準設定に戻す",
-                    )
-                    .clicked()
-                {
-                    clear_all_clicked = true;
-                }
-                let set_fav_label = format!("このお気に入り「{}」の標準にする", fav_display_name);
-                let clear_fav_label = format!("このお気に入り「{}」の標準を解除", fav_display_name);
-                let set_fav_resp = ui.add_enabled(
-                    under_favorite,
-                    egui::Button::new(set_fav_label).min_size(wide),
-                );
-                if set_fav_resp.clicked() {
-                    set_as_favorite_clicked = true;
-                }
-                set_fav_resp.on_hover_text(if under_favorite {
+                        // ── アクションボタン (5 行) ──
+                        let wide = egui::vec2(panel_rect.width() - 20.0, 24.0);
+                        if ui
+                            .add(egui::Button::new("このフォルダの全画像に適用").min_size(wide))
+                            .on_hover_text(
+                                "このフォルダ/ZIP/PDF の全画像に現在のパラメータを書き込む",
+                            )
+                            .clicked()
+                        {
+                            apply_all_clicked = true;
+                        }
+                        if ui
+                            .add(egui::Button::new("このフォルダの全画像から解除").min_size(wide))
+                            .on_hover_text(
+                                "このフォルダ/ZIP/PDF の全画像の個別設定を削除し、標準設定に戻す",
+                            )
+                            .clicked()
+                        {
+                            clear_all_clicked = true;
+                        }
+                        let set_fav_label =
+                            format!("このお気に入り「{}」の標準にする", fav_display_name);
+                        let clear_fav_label =
+                            format!("このお気に入り「{}」の標準を解除", fav_display_name);
+                        let set_fav_resp = ui.add_enabled(
+                            under_favorite,
+                            egui::Button::new(set_fav_label).min_size(wide),
+                        );
+                        if set_fav_resp.clicked() {
+                            set_as_favorite_clicked = true;
+                        }
+                        set_fav_resp.on_hover_text(if under_favorite {
                     "このお気に入り配下のページで効く標準設定を、現在のパラメータで上書きする"
                 } else {
                     "お気に入り登録されたフォルダ配下にいるときのみ使用できます"
                 });
-                let clear_fav_resp = ui.add_enabled(
-                    under_favorite && has_favorite_default,
-                    egui::Button::new(clear_fav_label).min_size(wide),
-                );
-                if clear_fav_resp.clicked() {
-                    clear_favorite_clicked = true;
-                }
-                clear_fav_resp.on_hover_text(
+                        let clear_fav_resp = ui.add_enabled(
+                            under_favorite && has_favorite_default,
+                            egui::Button::new(clear_fav_label).min_size(wide),
+                        );
+                        if clear_fav_resp.clicked() {
+                            clear_favorite_clicked = true;
+                        }
+                        clear_fav_resp.on_hover_text(
                     "このお気に入りの標準設定を削除し、アプリ全体の標準設定にフォールバックする",
                 );
-                ui.horizontal(|ui| {
-                    if ui
-                        .small_button("標準にする")
-                        .on_hover_text("現在のパラメータをアプリ全体の標準設定にする")
-                        .clicked()
-                    {
-                        set_as_global_clicked = true;
-                    }
-                    if ui
+                        ui.horizontal(|ui| {
+                            if ui
+                                .small_button("標準にする")
+                                .on_hover_text("現在のパラメータをアプリ全体の標準設定にする")
+                                .clicked()
+                            {
+                                set_as_global_clicked = true;
+                            }
+                            if ui
                         .add_enabled(
                             has_override,
                             egui::Button::new("個別設定を解除 [Q]").small(),
@@ -989,71 +1004,80 @@ impl App {
                     {
                         clear_page_clicked = true;
                     }
-                });
-                ui.add_space(6.0);
+                        });
+                        ui.add_space(6.0);
 
-                // ── スライダー群 ──
-                let slider_result = draw_sliders(
-                    ui,
-                    &mut edit_params,
-                    ai_denoise_disabled_threshold,
-                    ai_upscale_disabled_threshold,
-                );
+                        // ── スライダー群 ──
+                        let slider_result = draw_sliders(
+                            ui,
+                            &mut edit_params,
+                            ai_denoise_disabled_threshold,
+                            ai_upscale_disabled_threshold,
+                        );
 
-                // ── 保存スロット (5x2 grid) ──
-                ui.add_space(6.0);
-                ui.separator();
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("保存スロット")
-                        .size(11.0)
-                        .color(LABEL_COLOR),
-                );
-                ui.add_space(2.0);
-                let btn_w = (panel_rect.width() - 20.0) * 0.5 - 24.0;
-                for row in 0..5 {
-                    ui.horizontal(|ui| {
-                        for col in 0..2 {
-                            let slot_idx = row * 2 + col;
-                            let key_label = crate::adjustment::slot_key_label(slot_idx);
-                            let slot_name =
-                                if let Some(s) = &self.settings.preset_slots.slots[slot_idx] {
-                                    format!(
-                                        "{}:{}",
-                                        key_label,
-                                        crate::ui_helpers::truncate_name(&s.name, 7)
+                        // ── 保存スロット (5x2 grid) ──
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        ui.label(
+                            egui::RichText::new("保存スロット")
+                                .size(11.0)
+                                .color(LABEL_COLOR),
+                        );
+                        ui.add_space(2.0);
+                        let btn_w = (panel_rect.width() - 20.0) * 0.5 - 24.0;
+                        for row in 0..5 {
+                            ui.horizontal(|ui| {
+                                for col in 0..2 {
+                                    let slot_idx = row * 2 + col;
+                                    let key_label = crate::adjustment::slot_key_label(slot_idx);
+                                    let slot_name = if let Some(s) =
+                                        &self.settings.preset_slots.slots[slot_idx]
+                                    {
+                                        format!(
+                                            "{}:{}",
+                                            key_label,
+                                            crate::ui_helpers::truncate_name(&s.name, 7)
+                                        )
+                                    } else {
+                                        format!("{}:空", key_label)
+                                    };
+                                    let has_data =
+                                        self.settings.preset_slots.slots[slot_idx].is_some();
+                                    let name_btn = egui::Button::new(
+                                        egui::RichText::new(&slot_name).size(10.5),
                                     )
-                                } else {
-                                    format!("{}:空", key_label)
-                                };
-                            let has_data = self.settings.preset_slots.slots[slot_idx].is_some();
-                            let name_btn =
-                                egui::Button::new(egui::RichText::new(&slot_name).size(10.5))
                                     .min_size(egui::vec2(btn_w, 22.0));
-                            let name_resp = ui.add_enabled(has_data, name_btn);
-                            if name_resp.clicked() {
-                                load_from_slot = Some(slot_idx);
-                            }
-                            if let Some(s) = &self.settings.preset_slots.slots[slot_idx] {
-                                name_resp.on_hover_text(format!(
-                                    "{} をこのページに適用 (Ctrl+{})",
-                                    s.name, key_label
-                                ));
-                            }
-                            let save_btn = egui::Button::new(egui::RichText::new("💾").size(11.0))
-                                .min_size(egui::vec2(22.0, 22.0));
-                            let save_resp = ui.add(save_btn);
-                            if save_resp.clicked() {
-                                save_to_slot = Some(slot_idx);
-                            }
-                            save_resp
-                                .on_hover_text(format!("現在の設定をスロット{}に保存", key_label));
+                                    let name_resp = ui.add_enabled(has_data, name_btn);
+                                    if name_resp.clicked() {
+                                        load_from_slot = Some(slot_idx);
+                                    }
+                                    if let Some(s) = &self.settings.preset_slots.slots[slot_idx] {
+                                        name_resp.on_hover_text(format!(
+                                            "{} をこのページに適用 (Ctrl+{})",
+                                            s.name, key_label
+                                        ));
+                                    }
+                                    let save_btn =
+                                        egui::Button::new(egui::RichText::new("💾").size(11.0))
+                                            .min_size(egui::vec2(22.0, 22.0));
+                                    let save_resp = ui.add(save_btn);
+                                    if save_resp.clicked() {
+                                        save_to_slot = Some(slot_idx);
+                                    }
+                                    save_resp.on_hover_text(format!(
+                                        "現在の設定をスロット{}に保存",
+                                        key_label
+                                    ));
+                                }
+                            });
                         }
-                    });
-                }
-                slider_result
-            })
-            .inner;
+                        slider_result
+                    })
+                    .inner
+            },
+        );
+        let (changed, is_dragging) = scroll_output.inner;
 
         // ドラッグセッションのライフサイクル管理 (slider drag → release で 1 回だけ commit)
         let was_dragging = self.adjustment_dragging;
