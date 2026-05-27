@@ -4,6 +4,10 @@
 **進め方**: Codex GUI で実装 → ClaudeCode で手作業レビュー (= 既存運用と同じ)
 **前提**: Phase 0〜5 + 隠蔽加工本体 + 消しゴム subtract shape + パネル高さ修正 + 選択ツールアウトラインまで完了済み (`44b2e5b7` まで)
 
+**進捗メモ (2026-05-27)**: Phase 6 の本体 (`src/export_dialog.rs`、Ctrl+E 起動、
+worker 保存、進捗モーダル、最低限の仕様ドキュメント更新) は実装済み。未完は
+Phase 7 の統合テスト拡充と Phase 8 の詳細マニュアル整備。
+
 このブリーフは前 2 件 (`docs/erase-cache-refactor-plan.md` /
 `docs/panel-height-fix-plan.md`) と同じ運用方針で使う。各 Phase は **独立に着手・コミット
 可能** だが、Phase 6 → 7 → 8 の順を強く推奨 (= 6 の API が固まらないと 7 の統合テスト

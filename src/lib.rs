@@ -40,6 +40,7 @@ pub mod dwm_iconic_thumbnail;
 #[cfg(windows)]
 pub mod dwm_transitions;
 pub mod exif_reader;
+pub mod export_dialog;
 pub mod external_links;
 pub mod fast_resize;
 pub mod file_drag;

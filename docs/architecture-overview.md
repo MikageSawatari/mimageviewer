@@ -13,7 +13,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 │   - メインビューポート: グリッド (ui_main.rs)                 │
 │   - フルスクリーンビューポート (ui_fullscreen.rs)              │
 │   - オーバーレイ: 補正 / 分析 / 消しゴム / メタデータパネル    │
-│   - ダイアログ群 (ui_dialogs/)                                 │
+│   - ダイアログ群 (ui_dialogs/、Ctrl+E は export_dialog.rs)      │
 └───────────────┬──────────────────────────────────────────────┘
                 │ App の public メソッド経由で状態を更新
 ┌───────────────▼──────────────────────────────────────────────┐
@@ -79,6 +79,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `ui_main.rs` | メイン画面のグリッド描画とクリック/ドラッグ処理 |
 | `ui_fullscreen.rs` | フルスクリーンビューポート (`show_viewport_immediate`)。描画テクスチャの優先順位はここで決定 |
 | `ui_fullscreen/draw_icons.rs` | フルスクリーン上部バー / 動画 HUD のボタン・アイコン描画 helper、ファイル情報文字列 builder |
+| `export_dialog.rs` | Ctrl+E エクスポートのダイアログ状態・worker・ファイル名衝突回避。UI は合成済み `ColorImage` を用意し、画像エンコードとメタデータ転記は worker が担当 |
 | `ui_helpers.rs` | メニューバー、ツールバー、アドレスバー等の共通 UI |
 | `grid_item.rs` | `GridItem` 列挙型と `ThumbnailState` (Pending/Loaded/Failed/Evicted) |
 | `thumb_loader.rs` | サムネイル並列ロード (WebP キャッシュ生成含む) |
@@ -93,6 +94,7 @@ mimageviewer 全体の構造を俯瞰するための入口ドキュメント。*
 | `pdf_loader.rs` | PDFium ワーカープロセスプール。ページ列挙・レンダリング |
 | `pdf_passwords.rs` | PDF パスワードの DPAPI 暗号化永続化 |
 | `wic_decoder.rs` | HEIC/AVIF/JXL/TIFF/RAW のデコード (Windows Imaging Component) |
+| `save_with_metadata.rs` | JPEG/PNG/WebP のエンコードと EXIF/XMP/PNG text/WebP metadata の転記。Ctrl+E エクスポートから呼ばれ、出力は `create_new` で上書きしない |
 | `susie_loader.rs` | Susie 画像プラグイン (`.spi`) のワーカープロセスプール。PI/MAG/Q0/PIC/MAKI 等レトロ画像のデコードをルーティング。32bit ワーカー exe は本体に `include_bytes!` で埋め込み、初回起動時に `%APPDATA%\mimageviewer\mimageviewer-susie32.exe` へ自動展開 |
 | `archive_converter.rs` | 7z / LZH → 無圧縮 ZIP 変換 (sevenz-rust2 / delharc)。画像判定は `is_recognized_image_ext` 経由 (Susie 対応拡張子も含む) |
 | `archive_cache.rs` | 変換済み ZIP のマッピング DB (`%APPDATA%/mimageviewer/archive_cache.db`)。元ファイルパス + mtime + size で lookup、変換後 ZIP は `archive_cache/<hash[..2]>/<hash>/*.zip` |

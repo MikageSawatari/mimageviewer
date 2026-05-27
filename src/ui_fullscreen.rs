@@ -2087,6 +2087,8 @@ impl App {
 
                         // ── スロット保存ダイアログ ──
                         self.draw_slot_save_dialog(ctx);
+                        self.draw_export_dialog(ctx);
+                        self.draw_export_progress_dialog(ctx);
 
                         // ホバーバーのポップアップからモードが変更された場合
                         if self.spread_mode != spread_before {
@@ -3085,6 +3087,9 @@ impl App {
         let key_ctrl_s_capture = !is_video_fs
             && self.fs_context_menu_idx.is_none()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::S));
+        let key_ctrl_e_export = !is_video_fs
+            && self.fs_context_menu_idx.is_none()
+            && ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::E));
         let key_compare_x = !is_video_fs
             && self.fs_context_menu_idx.is_none()
             && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::X));
@@ -3570,6 +3575,9 @@ impl App {
 
         if key_ctrl_s_capture {
             self.save_image_capture_to_file(ctx, fs_idx);
+        }
+        if key_ctrl_e_export {
+            self.open_export_dialog_for_current(ctx, fs_idx);
         }
 
         // S: スライドショー開始/停止トグル (旧 P、左手で押しやすいよう S へ移行)
@@ -8173,6 +8181,662 @@ impl App {
                 Some(format!("{pdf}_p{:04}", page_num + 1))
             }
             _ => None,
+        }
+    }
+
+    pub(crate) fn open_export_dialog_for_current(&mut self, ctx: &egui::Context, fs_idx: usize) {
+        if self.export_pending.is_some() {
+            self.show_feedback_toast("エクスポート中です".to_string());
+            return;
+        }
+        if self.is_overlay_edit_mode_active() || self.adjustment_mode || self.analysis_mode {
+            self.show_feedback_toast("編集モードを閉じてからエクスポートしてください".to_string());
+            return;
+        }
+        let Ok((source, label, original_format, source_dir, basename)) =
+            self.export_source_info_for_idx(fs_idx)
+        else {
+            self.show_feedback_toast("このアイテムはエクスポートできません".to_string());
+            return;
+        };
+        if self.resolve_export_base_pixels(fs_idx).is_err() {
+            self.show_feedback_toast("画像の読み込み完了後にエクスポートしてください".to_string());
+            return;
+        }
+
+        let output_dir = self
+            .settings
+            .export_last_directory
+            .clone()
+            .filter(|p| p.is_dir())
+            .unwrap_or(source_dir);
+        let mut selection = self.settings.export_batch_selection;
+        let has_conceal_mask = self.has_conceal_mask_for_export(fs_idx);
+        for i in 1..selection.len() {
+            if !has_conceal_mask || self.settings.conceal_presets[i - 1].is_none() {
+                selection[i] = false;
+            }
+        }
+        if !selection.iter().any(|&v| v) {
+            selection[0] = true;
+        }
+
+        self.export_dialog = Some(crate::export_dialog::ExportDialogState {
+            source,
+            source_label: label,
+            original_format: original_format.clone(),
+            output_format: crate::export_dialog::ExportFormat::from_source(
+                &original_format,
+                self.settings.export_fallback_format,
+            ),
+            basename: crate::capture::basename_from_text(&format!("{basename}_edited")),
+            output_dir_text: output_dir.display().to_string(),
+            include_metadata: self.settings.export_embed_metadata,
+            selection,
+            error: None,
+        });
+        ctx.request_repaint();
+    }
+
+    pub(crate) fn draw_export_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut state) = self.export_dialog.take() else {
+            return;
+        };
+
+        let enter_pressed = self.dialog_enter_pressed(ctx);
+        let escape_pressed = self.dialog_escape_pressed(ctx);
+        let preset_slots = self.settings.conceal_presets.clone();
+        let fs_idx = self.fullscreen_idx;
+        let has_conceal_mask = fs_idx
+            .map(|idx| self.has_conceal_mask_for_export(idx))
+            .unwrap_or(false);
+        for i in 1..state.selection.len() {
+            if !has_conceal_mask || preset_slots[i - 1].is_none() {
+                state.selection[i] = false;
+            }
+        }
+        let selected_count = state.selection.iter().filter(|&&v| v).count();
+        let basename_ok = !crate::capture::basename_from_text(&state.basename)
+            .trim()
+            .is_empty();
+        let can_start =
+            selected_count > 0 && basename_ok && !state.output_dir_text.trim().is_empty();
+        let mut open = true;
+        let mut canceled = false;
+        let mut start = false;
+        let mut pick_folder = false;
+
+        egui::Window::new("エクスポート")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(460.0);
+                ui.label(&state.source_label);
+                ui.add_space(6.0);
+                ui.label("ファイル名");
+                let basename_resp = ui.add(
+                    egui::TextEdit::singleline(&mut state.basename)
+                        .desired_width(f32::INFINITY)
+                        .hint_text("出力ファイル名"),
+                );
+                if !basename_resp.has_focus() && !basename_resp.lost_focus() {
+                    basename_resp.request_focus();
+                }
+                ui.add_space(6.0);
+                ui.label("保存先");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.output_dir_text)
+                            .desired_width(350.0)
+                            .hint_text("保存先フォルダ"),
+                    );
+                    if ui.button("変更...").clicked() {
+                        pick_folder = true;
+                    }
+                });
+                ui.add_space(6.0);
+                egui::ComboBox::from_label("形式")
+                    .selected_text(state.output_format.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut state.output_format,
+                            crate::export_dialog::ExportFormat::Jpeg95,
+                            "JPEG 95",
+                        );
+                        ui.selectable_value(
+                            &mut state.output_format,
+                            crate::export_dialog::ExportFormat::Png,
+                            "PNG",
+                        );
+                        if !matches!(
+                            state.original_format,
+                            crate::save_with_metadata::SrcFormat::Other(_)
+                        ) {
+                            ui.selectable_value(
+                                &mut state.output_format,
+                                crate::export_dialog::ExportFormat::Webp,
+                                "WebP",
+                            );
+                        }
+                    });
+
+                let metadata_possible = state.original_format.supports_metadata_writeback()
+                    && state.original_format == state.output_format.to_src_format();
+                ui.add_enabled(
+                    metadata_possible,
+                    egui::Checkbox::new(&mut state.include_metadata, "AI プロンプト / EXIF を保持"),
+                );
+                if !metadata_possible {
+                    state.include_metadata = false;
+                    ui.small("形式変換や PDF ではメタデータ保持は無効です");
+                }
+
+                ui.separator();
+                ui.label("出力するバリエーション");
+                ui.checkbox(&mut state.selection[0], "現在の設定 (_0)");
+                for (slot_idx, slot) in preset_slots.iter().enumerate() {
+                    let enabled = has_conceal_mask && slot.is_some();
+                    let label = match slot {
+                        Some(preset) if !preset.name.trim().is_empty() => {
+                            format!(
+                                "プリセット{}: {} (_{})",
+                                slot_idx + 1,
+                                preset.name,
+                                slot_idx + 1
+                            )
+                        }
+                        Some(_) => format!("プリセット{} (_{})", slot_idx + 1, slot_idx + 1),
+                        None => format!("プリセット{}: 空", slot_idx + 1),
+                    };
+                    ui.add_enabled_ui(enabled, |ui| {
+                        ui.checkbox(&mut state.selection[slot_idx + 1], label);
+                    });
+                }
+                if !has_conceal_mask {
+                    ui.small("プリセット出力は隠蔽マスクがある画像で有効です");
+                }
+
+                if let Some(err) = &state.error {
+                    ui.add_space(6.0);
+                    ui.colored_label(egui::Color32::from_rgb(255, 140, 140), err);
+                }
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(can_start, egui::Button::new("保存"))
+                        .clicked()
+                    {
+                        start = true;
+                    }
+                    if ui.button("キャンセル").clicked() {
+                        canceled = true;
+                    }
+                    ui.small(format!("{selected_count} 件"));
+                });
+            });
+
+        if pick_folder {
+            let start_dir = std::path::PathBuf::from(state.output_dir_text.trim());
+            if let Some(dir) = rfd::FileDialog::new()
+                .set_directory(start_dir)
+                .pick_folder()
+            {
+                state.output_dir_text = dir.display().to_string();
+            }
+        }
+
+        if escape_pressed || !open || canceled {
+            self.export_dialog = None;
+            return;
+        }
+
+        if enter_pressed && can_start {
+            start = true;
+        }
+        if start {
+            match self.start_export_from_dialog(ctx, state.clone()) {
+                Ok(()) => return,
+                Err(err) => {
+                    state.error = Some(err);
+                    self.export_dialog = Some(state);
+                    return;
+                }
+            }
+        }
+
+        self.export_dialog = Some(state);
+    }
+
+    pub(crate) fn draw_export_progress_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.export_pending.as_mut() else {
+            return;
+        };
+        let mut dismiss_finished = false;
+        let mut request_cancel = false;
+        let progress = if pending.total == 0 {
+            0.0
+        } else {
+            pending.done as f32 / pending.total as f32
+        };
+
+        egui::Window::new("エクスポート進行状況")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+            .show(ctx, |ui| {
+                ui.set_min_width(380.0);
+                ui.label(&pending.last_message);
+                ui.add(
+                    egui::ProgressBar::new(progress)
+                        .show_percentage()
+                        .text(format!("{} / {}", pending.done, pending.total)),
+                );
+                if !pending.errors.is_empty() {
+                    ui.add_space(8.0);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 140, 140),
+                        format!("{} 件のエラー", pending.errors.len()),
+                    );
+                    egui::ScrollArea::vertical()
+                        .max_height(120.0)
+                        .show(ui, |ui| {
+                            for err in &pending.errors {
+                                ui.small(format!("{}: {}", err.label, err.message));
+                            }
+                        });
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if pending.finished {
+                        if ui.button("閉じる").clicked() {
+                            dismiss_finished = true;
+                        }
+                    } else if pending.cancel_requested {
+                        ui.add_enabled(false, egui::Button::new("キャンセル中..."));
+                    } else if ui.button("キャンセル").clicked() {
+                        request_cancel = true;
+                    }
+                });
+            });
+
+        if request_cancel {
+            pending.cancel_requested = true;
+            pending
+                .cancel
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            pending.last_message = "キャンセル中...".to_string();
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if dismiss_finished {
+            self.export_pending = None;
+        }
+    }
+
+    pub(crate) fn poll_export_pending(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.export_pending.as_mut() else {
+            return;
+        };
+        let mut clear_pending = false;
+        let mut toast: Option<String> = None;
+        let mut reveal_path: Option<std::path::PathBuf> = None;
+
+        loop {
+            match pending.rx.try_recv() {
+                Ok(crate::export_dialog::ExportEvent::Started { label }) => {
+                    pending.last_message = format!("{label} を保存中");
+                }
+                Ok(crate::export_dialog::ExportEvent::Completed(success)) => {
+                    pending.done = pending.done.saturating_add(1);
+                    pending.last_message = format!("保存しました: {}", success.label);
+                    pending.successes.push(success);
+                }
+                Ok(crate::export_dialog::ExportEvent::Failed(err)) => {
+                    pending.done = pending.done.saturating_add(1);
+                    pending.last_message = format!("保存に失敗: {}", err.label);
+                    pending.errors.push(err);
+                }
+                Ok(crate::export_dialog::ExportEvent::Cancelled) => {
+                    toast = Some("エクスポートをキャンセルしました".to_string());
+                    clear_pending = true;
+                    break;
+                }
+                Ok(crate::export_dialog::ExportEvent::AllDone) => {
+                    pending.finished = true;
+                    if pending.errors.is_empty() {
+                        if pending.successes.len() == 1 {
+                            reveal_path = pending.successes.first().map(|s| s.path.clone());
+                        } else {
+                            toast = Some(format!(
+                                "{} 件をエクスポートしました",
+                                pending.successes.len()
+                            ));
+                        }
+                        clear_pending = true;
+                    } else {
+                        pending.last_message = format!(
+                            "完了: 成功 {} / 失敗 {}",
+                            pending.successes.len(),
+                            pending.errors.len()
+                        );
+                    }
+                    break;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    toast = Some("エクスポート worker が中断されました".to_string());
+                    clear_pending = true;
+                    break;
+                }
+            }
+        }
+
+        if clear_pending {
+            self.export_pending = None;
+        } else if self.export_pending.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        }
+        if let Some(path) = reveal_path {
+            self.show_capture_saved_toast(path);
+        }
+        if let Some(message) = toast {
+            self.show_feedback_toast(message);
+        }
+    }
+
+    fn start_export_from_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        mut state: crate::export_dialog::ExportDialogState,
+    ) -> Result<(), String> {
+        if self.export_pending.is_some() {
+            return Err("エクスポート中です".to_string());
+        }
+        let idx = self
+            .fullscreen_idx
+            .ok_or_else(|| "フルスクリーン表示中に実行してください".to_string())?;
+        let output_dir = std::path::PathBuf::from(state.output_dir_text.trim());
+        if output_dir.as_os_str().is_empty() {
+            return Err("保存先フォルダを指定してください".to_string());
+        }
+        let basename = crate::capture::basename_from_text(&state.basename);
+
+        let mut planned: Vec<(String, u8, Option<crate::conceal::ConcealPreset>)> = Vec::new();
+        if state.selection[0] {
+            planned.push(("現在の設定".to_string(), 0, None));
+        }
+        for slot_idx in 0..4 {
+            if state.selection[slot_idx + 1] {
+                let Some(preset) = self.settings.conceal_presets[slot_idx].clone() else {
+                    continue;
+                };
+                let label = if preset.name.trim().is_empty() {
+                    format!("プリセット{}", slot_idx + 1)
+                } else {
+                    format!("プリセット{}: {}", slot_idx + 1, preset.name)
+                };
+                planned.push((label, (slot_idx + 1) as u8, Some(preset)));
+            }
+        }
+        if planned.is_empty() {
+            return Err("出力するバリエーションを選んでください".to_string());
+        }
+
+        let suffixes: Vec<u8> = planned.iter().map(|(_, suffix, _)| *suffix).collect();
+        let resolved_basename = crate::export_dialog::resolve_session_basename(
+            &output_dir,
+            &basename,
+            state.output_format.extension(),
+            &suffixes,
+        )?;
+
+        let mut entries = Vec::with_capacity(planned.len());
+        for (label, suffix, preset) in planned {
+            let pixels = self.resolve_export_pixels(idx, preset.as_ref())?;
+            entries.push(crate::export_dialog::ExportEntry {
+                label,
+                suffix,
+                pixels,
+            });
+        }
+
+        state.selection[0] = suffixes.contains(&0);
+        for slot_idx in 0..4 {
+            state.selection[slot_idx + 1] = suffixes.contains(&((slot_idx + 1) as u8));
+        }
+        self.settings.export_embed_metadata = state.include_metadata;
+        self.settings.export_last_directory = Some(output_dir.clone());
+        self.settings.export_batch_selection = state.selection;
+        if matches!(
+            state.original_format,
+            crate::save_with_metadata::SrcFormat::Other(_)
+        ) && let Some(fallback) = state.output_format.fallback_format()
+        {
+            self.settings.export_fallback_format = fallback;
+        }
+        self.settings.save();
+
+        let request = crate::export_dialog::ExportRequest {
+            source: state.source,
+            original_format: state.original_format,
+            output_format: state.output_format,
+            output_dir,
+            basename: resolved_basename,
+            entries,
+            include_metadata: state.include_metadata,
+        };
+        let pending = crate::export_dialog::spawn_export_worker(request)?;
+        self.export_pending = Some(pending);
+        self.export_dialog = None;
+        self.show_feedback_toast("エクスポートを開始しました".to_string());
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+        Ok(())
+    }
+
+    fn export_source_info_for_idx(
+        &self,
+        idx: usize,
+    ) -> Result<
+        (
+            crate::export_dialog::ExportSource,
+            String,
+            crate::save_with_metadata::SrcFormat,
+            std::path::PathBuf,
+            String,
+        ),
+        String,
+    > {
+        match self.items.get(idx) {
+            Some(GridItem::Image(path)) => {
+                let dir = path
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                let format = crate::save_with_metadata::SrcFormat::from_path(path);
+                let basename = crate::capture::basename_for_path(path);
+                Ok((
+                    crate::export_dialog::ExportSource::File { path: path.clone() },
+                    format!("元画像: {}", path.display()),
+                    format,
+                    dir,
+                    basename,
+                ))
+            }
+            Some(GridItem::ZipImage {
+                zip_path,
+                entry_name,
+            }) => {
+                let dir = zip_path
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                let ext = std::path::Path::new(entry_name)
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("");
+                let format = crate::save_with_metadata::SrcFormat::from_ext(ext);
+                let zip = crate::capture::basename_for_path(zip_path);
+                let entry_name_base = crate::zip_loader::entry_basename(entry_name);
+                let entry = std::path::Path::new(entry_name_base)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(crate::capture::basename_from_text)
+                    .unwrap_or_else(|| "entry".to_string());
+                Ok((
+                    crate::export_dialog::ExportSource::ZipEntry {
+                        zip_path: zip_path.clone(),
+                        entry_name: entry_name.clone(),
+                    },
+                    format!("ZIP: {} > {}", zip_path.display(), entry_name),
+                    format,
+                    dir,
+                    format!("{zip}_{entry}"),
+                ))
+            }
+            Some(GridItem::PdfPage {
+                pdf_path, page_num, ..
+            }) => {
+                let dir = pdf_path
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                let pdf = crate::capture::basename_for_path(pdf_path);
+                Ok((
+                    crate::export_dialog::ExportSource::PdfPage,
+                    format!("PDF: {} / page {}", pdf_path.display(), page_num + 1),
+                    crate::save_with_metadata::SrcFormat::Other("pdf".to_string()),
+                    dir,
+                    format!("{pdf}_p{:04}", page_num + 1),
+                ))
+            }
+            _ => Err("このアイテムはエクスポートできません".to_string()),
+        }
+    }
+
+    fn resolve_export_pixels(
+        &self,
+        idx: usize,
+        preset: Option<&crate::conceal::ConcealPreset>,
+    ) -> Result<Arc<egui::ColorImage>, String> {
+        let base = self.resolve_export_base_pixels(idx)?;
+        let Some(mask) = self.conceal_composite_mask_for_export(idx, base.size[0], base.size[1])
+        else {
+            return Ok(base);
+        };
+        let params = preset
+            .cloned()
+            .unwrap_or_else(|| self.current_conceal_preset_from_settings());
+        let composed = Self::compose_conceal_for_export(base.as_ref(), &mask, &params);
+        Ok(Arc::new(composed))
+    }
+
+    fn resolve_export_base_pixels(&self, idx: usize) -> Result<Arc<egui::ColorImage>, String> {
+        if let Some(pixels) = self.current_erase_result_pixels(idx) {
+            return Ok(pixels);
+        }
+        if !self.post_filter_bypassed
+            && let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx)
+        {
+            return Ok(Arc::clone(pixels));
+        }
+
+        let bg = self.effective_upscale_bg_mode();
+        if self.ai_will_apply_to(idx)
+            && let Some(FsCacheEntry::Static { pixels, .. }) = self.ai_upscale_cache.get(&(idx, bg))
+        {
+            return Ok(Arc::clone(pixels));
+        }
+
+        match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { pixels, .. }) => Ok(Arc::clone(pixels)),
+            Some(FsCacheEntry::Animated {
+                frame_pixels,
+                current_frame,
+                ..
+            }) => frame_pixels
+                .get(*current_frame)
+                .cloned()
+                .ok_or_else(|| "アニメーションフレームを取得できません".to_string()),
+            _ => Err("画像の読み込み完了後にエクスポートしてください".to_string()),
+        }
+    }
+
+    fn has_conceal_mask_for_export(&self, idx: usize) -> bool {
+        let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) else {
+            return self.conceal_pages.contains(&idx);
+        };
+        self.conceal_composite_mask_for_export(idx, pixels.size[0], pixels.size[1])
+            .is_some()
+    }
+
+    fn conceal_composite_mask_for_export(
+        &self,
+        idx: usize,
+        w: usize,
+        h: usize,
+    ) -> Option<Vec<bool>> {
+        if !self.conceal_pages.contains(&idx) {
+            return None;
+        }
+        let key = self.page_path_key(idx)?;
+        let db = self.conceal_db.as_ref()?;
+        let (mut bitmap, shapes) = db.get_full(&key, w, h)?;
+        crate::mask_db::rasterize_shapes_into(&mut bitmap, &shapes, w, h);
+        if bitmap.iter().any(|&b| b) {
+            Some(bitmap)
+        } else {
+            None
+        }
+    }
+
+    fn current_conceal_preset_from_settings(&self) -> crate::conceal::ConcealPreset {
+        crate::conceal::ConcealPreset {
+            name: "現在の設定".to_string(),
+            conceal_type: self.settings.conceal_type,
+            mosaic_tile_mode: self.settings.conceal_mosaic_tile_mode,
+            mosaic_boundary: self.settings.conceal_mosaic_boundary,
+            fill_opacity_percent: self.settings.conceal_fill_opacity_percent,
+            fill_edge: self.settings.conceal_fill_edge,
+            blur_radius_px: self.settings.conceal_blur_radius_px,
+            blur_mode: self.settings.conceal_blur_mode,
+            blur_feather: self.settings.conceal_blur_feather,
+        }
+    }
+
+    fn compose_conceal_for_export(
+        base: &egui::ColorImage,
+        mask: &[bool],
+        params: &crate::conceal::ConcealPreset,
+    ) -> egui::ColorImage {
+        match params.conceal_type {
+            crate::conceal::ConcealType::Mosaic => {
+                let long_edge = base.size[0].max(base.size[1]) as u32;
+                let tile = crate::conceal::compute_tile_size(long_edge, params.mosaic_tile_mode);
+                crate::conceal_compose::compose_mosaic(base, mask, tile, params.mosaic_boundary)
+            }
+            crate::conceal::ConcealType::WhiteFill => crate::conceal_compose::compose_solid_fill(
+                base,
+                mask,
+                egui::Color32::WHITE,
+                params.fill_opacity_percent,
+                params.fill_edge,
+            ),
+            crate::conceal::ConcealType::BlackFill => crate::conceal_compose::compose_solid_fill(
+                base,
+                mask,
+                egui::Color32::BLACK,
+                params.fill_opacity_percent,
+                params.fill_edge,
+            ),
+            crate::conceal::ConcealType::Blur => crate::conceal_compose::compose_blur(
+                base,
+                mask,
+                params.blur_radius_px,
+                params.blur_mode,
+                params.blur_feather,
+            ),
         }
     }
 

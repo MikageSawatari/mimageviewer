@@ -2070,6 +2070,10 @@ pub struct App {
         Vec<std::sync::mpsc::Receiver<crate::ui_dialogs::context_menu::CopyOutcome>>,
     /// Ctrl+S / キャプチャ保存の worker 完了待ち。
     pub(crate) capture_pending: Option<CapturePending>,
+    /// Ctrl+E / 編集済み画像エクスポートのダイアログ状態。
+    pub(crate) export_dialog: Option<crate::export_dialog::ExportDialogState>,
+    /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。
+    pub(crate) export_pending: Option<crate::export_dialog::ExportPending>,
     /// X / C 比較ビューのピン留めスロット。CPU pixels を正とし、texture は派生物。
     pub(crate) pinned_compare_slot: Option<PinnedCompareSlot>,
     pub(crate) compare_view_mode: CompareViewMode,
@@ -3708,6 +3712,8 @@ impl App {
             paste_pending: Vec::new(),
             drop_copy_pending: Vec::new(),
             capture_pending: None,
+            export_dialog: None,
+            export_pending: None,
             pinned_compare_slot: None,
             compare_view_mode: CompareViewMode::Off,
             compare_pin_load_pending: None,
@@ -4814,6 +4820,8 @@ impl App {
             || self.show_update_dialog
             || self.show_vst3_manager
             || self.slot_save_dialog.is_some()
+            || self.export_dialog.is_some()
+            || self.export_pending.is_some()
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()
     }
@@ -4836,6 +4844,8 @@ impl App {
             || self.show_about_dialog
             || self.show_update_dialog
             || self.slot_save_dialog.is_some()
+            || self.export_dialog.is_some()
+            || self.export_pending.is_some()
             || self.context_menu_idx.is_some()
             || self.delete_pending.is_some()
     }
@@ -21655,6 +21665,7 @@ impl eframe::App for App {
         self.poll_delete_pending();
         self.poll_paste_pending();
         self.poll_capture_pending(ctx);
+        self.poll_export_pending(ctx);
         self.poll_compare_pin_load_pending(ctx);
         self.poll_compare_pin_pending(ctx);
         self.poll_compare_prepare_pending(ctx);
@@ -21662,6 +21673,7 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
         if self.capture_pending.is_some()
+            || self.export_pending.is_some()
             || self.compare_pin_load_pending.is_some()
             || self.compare_pin_pending.is_some()
             || self.compare_prepare_pending.is_some()
@@ -22013,6 +22025,10 @@ impl eframe::App for App {
         self.show_about_dialog_window(ctx);
         self.show_update_dialog_window(ctx);
         self.show_tray_enabled_notice_dialog(ctx);
+        if self.fullscreen_idx.is_none() {
+            self.draw_export_dialog(ctx);
+            self.draw_export_progress_dialog(ctx);
+        }
         self.poll_pdf_enumerate();
         self.poll_zip_enumerate();
         // ZIP enumerate worker 結果待ちの repaint 駆動は tail repaint reasons の
