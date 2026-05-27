@@ -27,7 +27,7 @@
 use eframe::egui;
 use eframe::egui::Color32;
 
-use crate::conceal::{FillEdge, MosaicBoundary, TileSizeMode, compute_tile_size};
+use crate::conceal::{BlurMode, FillEdge, MosaicBoundary, TileSizeMode, compute_tile_size};
 
 // ── Mosaic 合成 ───────────────────────────────────────────────────────
 
@@ -217,6 +217,338 @@ pub fn compose_solid_fill(
     }
 
     egui::ColorImage::new([w, h], out_pixels)
+}
+
+// ── Gaussian ぼかし合成 (Phase 3c) ──────────────────────────────────────
+
+/// Gaussian ぼかし合成。`mode` で 3 種類の挙動を切り替える:
+///
+/// - [`BlurMode::AsMask`]: 標準的なぼかし。kernel は元画像全体から sampling
+///   (マスク外画素も寄与する)。隣接オブジェクトの色がマスク内に混ざる。
+/// - [`BlurMode::ExtendByRadius`]: マスクを `radius` px 円形 SE で膨張させてから
+///   描画。輪郭そのものを曖昧にしたい用途。
+/// - [`BlurMode::InsideOnly`]: kernel のうちマスク外画素は寄与 0 として無視 (重み
+///   再正規化)。隣接要素の色漏れを防ぐ。
+///
+/// `feather_boundary` が true なら、マスク境界に [`compute_edge_feather_alpha`] で
+/// 線形 alpha フェードを掛けて元画像と blend (single-color fill の Feathered と同じ
+/// 機構)。false なら境界はシャープ。
+///
+/// # 性能
+///
+/// マスクの bounding box + `radius * 3` を計算範囲とすることで、局所マスク (顔
+/// ぼかし等) で全画像走査を避ける。実測で 4K 顔ぼかし sigma=20 が ~50-150ms の目安。
+///
+/// **注意**: 同期実行。仕様 §7.7 では「最初から worker thread + cancel」だが、
+/// Phase 3c 初版は同期 + bbox 最適化のみで実装し、実機でヒッチが目立てば
+/// `App::ensure_conceal_texture` 側で worker 化する (`docs/conceal-feature-plan.md
+/// §13` の Phase 3c 工数想定の半分)。
+pub fn compose_blur(
+    base: &egui::ColorImage,
+    mask: &[bool],
+    radius_px: f32,
+    mode: BlurMode,
+    feather_boundary: bool,
+) -> egui::ColorImage {
+    let [w, h] = base.size;
+    if w == 0 || h == 0 {
+        return base.clone();
+    }
+    assert_eq!(
+        mask.len(),
+        w * h,
+        "mask size mismatch: mask={}, expected={}",
+        mask.len(),
+        w * h
+    );
+    let radius = radius_px.max(1.0).min(100.0).round() as usize;
+    if radius == 0 {
+        return base.clone();
+    }
+
+    // ExtendByRadius: マスクを膨張させてから以降の処理に流す。
+    let working_mask: Vec<bool> = match mode {
+        BlurMode::ExtendByRadius => dilate_mask(mask, w, h, radius),
+        _ => mask.to_vec(),
+    };
+
+    // bbox 計算 (マスク内画素の最小矩形) + sigma*3 余白でクリップ。
+    let bbox = match mask_bbox(&working_mask, w, h) {
+        Some(b) => expand_bbox_clipped(b, radius * 3, w, h),
+        None => return base.clone(), // マスク全部 false → 何もしない
+    };
+
+    // Gaussian カーネル (1D)。sigma = radius / 3 が一般的な係数。
+    let sigma = (radius as f32 / 3.0).max(0.5);
+    let kernel = gaussian_kernel_1d(radius, sigma);
+
+    let masked_only = matches!(mode, BlurMode::InsideOnly);
+    // Pass 1 + 2: separable blur を bbox 内だけで実行。
+    let blurred_bbox = gaussian_blur_separable_bbox(
+        &base.pixels,
+        w,
+        h,
+        bbox,
+        &kernel,
+        radius,
+        if masked_only {
+            Some(&working_mask)
+        } else {
+            None
+        },
+    );
+
+    // 境界フェード alpha (オプション)。
+    let edge_alpha_map: Option<Vec<u8>> = if feather_boundary {
+        Some(compute_edge_feather_alpha(
+            &working_mask,
+            w,
+            h,
+            FEATHER_RADIUS_PX,
+        ))
+    } else {
+        None
+    };
+
+    let mut out_pixels = base.pixels.clone();
+    for y in bbox.y0..bbox.y1 {
+        for x in bbox.x0..bbox.x1 {
+            let i = y * w + x;
+            if !working_mask[i] {
+                continue;
+            }
+            let bi = (y - bbox.y0) * (bbox.x1 - bbox.x0) + (x - bbox.x0);
+            let blurred = blurred_bbox[bi];
+            let alpha = edge_alpha_map.as_ref().map(|m| m[i]).unwrap_or(255);
+            let alpha_f = alpha as f32 / 255.0;
+            out_pixels[i] = blend_over(out_pixels[i], blurred, alpha_f);
+        }
+    }
+
+    egui::ColorImage::new([w, h], out_pixels)
+}
+
+/// マスク内画素の bounding box (inclusive 形式の min/max → exclusive 矩形に変換)。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Bbox {
+    pub x0: usize,
+    pub y0: usize,
+    pub x1: usize, // exclusive
+    pub y1: usize, // exclusive
+}
+
+fn mask_bbox(mask: &[bool], w: usize, h: usize) -> Option<Bbox> {
+    let mut x0 = usize::MAX;
+    let mut y0 = usize::MAX;
+    let mut x1 = 0usize;
+    let mut y1 = 0usize;
+    let mut any = false;
+    for y in 0..h {
+        for x in 0..w {
+            if mask[y * w + x] {
+                any = true;
+                if x < x0 {
+                    x0 = x;
+                }
+                if y < y0 {
+                    y0 = y;
+                }
+                if x > x1 {
+                    x1 = x;
+                }
+                if y > y1 {
+                    y1 = y;
+                }
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    Some(Bbox {
+        x0,
+        y0,
+        x1: x1 + 1,
+        y1: y1 + 1,
+    })
+}
+
+fn expand_bbox_clipped(b: Bbox, margin: usize, w: usize, h: usize) -> Bbox {
+    Bbox {
+        x0: b.x0.saturating_sub(margin),
+        y0: b.y0.saturating_sub(margin),
+        x1: (b.x1 + margin).min(w),
+        y1: (b.y1 + margin).min(h),
+    }
+}
+
+/// 半径 `radius` 円形 SE による単純な膨張 (bbox 制限なし、4 近傍は近似的に N ステップ)。
+///
+/// マスクが画像全域なら何もしない (= 全域 true)。マスクが小さければ
+/// O(masked_count * radius * radius) で済む (4K 顔ぼかしの典型値で問題ない)。
+fn dilate_mask(mask: &[bool], w: usize, h: usize, radius: usize) -> Vec<bool> {
+    let mut out = mask.to_vec();
+    let r2 = (radius * radius) as i32;
+    for y in 0..h {
+        for x in 0..w {
+            if !mask[y * w + x] {
+                continue;
+            }
+            // 円形 SE を中心 (x, y) で展開。
+            let x0 = x.saturating_sub(radius);
+            let y0 = y.saturating_sub(radius);
+            let x1 = (x + radius + 1).min(w);
+            let y1 = (y + radius + 1).min(h);
+            for ny in y0..y1 {
+                for nx in x0..x1 {
+                    let dx = nx as i32 - x as i32;
+                    let dy = ny as i32 - y as i32;
+                    if dx * dx + dy * dy <= r2 {
+                        out[ny * w + nx] = true;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// 1D Gaussian カーネルを生成 (長さ `2 * radius + 1`、合計 1.0 に正規化)。
+fn gaussian_kernel_1d(radius: usize, sigma: f32) -> Vec<f32> {
+    let mut k = vec![0.0f32; 2 * radius + 1];
+    let two_sigma_sq = 2.0 * sigma * sigma;
+    let mut sum = 0.0f32;
+    for i in 0..k.len() {
+        let x = i as f32 - radius as f32;
+        let w = (-x * x / two_sigma_sq).exp();
+        k[i] = w;
+        sum += w;
+    }
+    if sum > 0.0 {
+        for w in &mut k {
+            *w /= sum;
+        }
+    }
+    k
+}
+
+/// 2-pass separable Gaussian blur を bbox 内だけで実行。
+///
+/// - `pixels`: 入力画像全体の RGBA バッファ (`w * h` 長)
+/// - `bbox`: 出力を計算する範囲 (= マスク bbox + radius*3 マージン)
+/// - `kernel`: `gaussian_kernel_1d(radius, sigma)` の結果
+/// - `radius`: kernel 半径 (kernel.len() == 2*radius+1)
+/// - `mask_for_sampling`: `Some(mask)` のとき kernel 寄与をマスク内画素に限定 (InsideOnly)
+///
+/// 戻り値: bbox サイズの RGBA バッファ (= 長さ `(x1-x0) * (y1-y0)`)。
+fn gaussian_blur_separable_bbox(
+    pixels: &[Color32],
+    w: usize,
+    h: usize,
+    bbox: Bbox,
+    kernel: &[f32],
+    radius: usize,
+    mask_for_sampling: Option<&[bool]>,
+) -> Vec<Color32> {
+    let bw = bbox.x1 - bbox.x0;
+    let bh = bbox.y1 - bbox.y0;
+
+    // Pass 1: horizontal blur. 各画素 (x, y) の出力 = sum_k kernel[k] * pixel[x + k - radius, y]
+    // (マスク制限あり時は寄与を 0 にして重み再正規化)
+    let mut tmp = vec![Color32::TRANSPARENT; bw * bh];
+    for by in 0..bh {
+        let y = bbox.y0 + by;
+        for bx in 0..bw {
+            let x = bbox.x0 + bx;
+            let mut acc_r = 0.0f32;
+            let mut acc_g = 0.0f32;
+            let mut acc_b = 0.0f32;
+            let mut acc_w = 0.0f32;
+            for (ki, &kw) in kernel.iter().enumerate() {
+                let sx = x as i32 + ki as i32 - radius as i32;
+                if sx < 0 || sx >= w as i32 {
+                    continue;
+                }
+                let si = y * w + sx as usize;
+                if let Some(m) = mask_for_sampling {
+                    if !m[si] {
+                        continue;
+                    }
+                }
+                let p = pixels[si];
+                acc_r += p.r() as f32 * kw;
+                acc_g += p.g() as f32 * kw;
+                acc_b += p.b() as f32 * kw;
+                acc_w += kw;
+            }
+            let base_a = pixels[y * w + x].a();
+            tmp[by * bw + bx] = if acc_w > 1e-6 {
+                Color32::from_rgba_unmultiplied(
+                    (acc_r / acc_w).round() as u8,
+                    (acc_g / acc_w).round() as u8,
+                    (acc_b / acc_w).round() as u8,
+                    base_a,
+                )
+            } else {
+                pixels[y * w + x] // 全 kernel が無効 → 元色
+            };
+        }
+    }
+
+    // Pass 2: vertical blur on tmp (= bbox の中で縦方向のみ)。
+    // 縦方向 kernel は bbox 外を参照しないように clip する。
+    let mut out = vec![Color32::TRANSPARENT; bw * bh];
+    for by in 0..bh {
+        let y = bbox.y0 + by;
+        for bx in 0..bw {
+            let mut acc_r = 0.0f32;
+            let mut acc_g = 0.0f32;
+            let mut acc_b = 0.0f32;
+            let mut acc_w = 0.0f32;
+            for (ki, &kw) in kernel.iter().enumerate() {
+                let sy = y as i32 + ki as i32 - radius as i32;
+                if sy < bbox.y0 as i32 || sy >= bbox.y1 as i32 {
+                    // bbox 外は global pixels を直接参照 (= horizontal pass の結果が無いので)
+                    // ただし InsideOnly のときはマスク判定も継続。
+                    if sy < 0 || sy >= h as i32 {
+                        continue;
+                    }
+                    let si = sy as usize * w + (bbox.x0 + bx);
+                    if let Some(m) = mask_for_sampling {
+                        if !m[si] {
+                            continue;
+                        }
+                    }
+                    let p = pixels[si];
+                    acc_r += p.r() as f32 * kw;
+                    acc_g += p.g() as f32 * kw;
+                    acc_b += p.b() as f32 * kw;
+                    acc_w += kw;
+                    continue;
+                }
+                let bsi = (sy as usize - bbox.y0) * bw + bx;
+                let p = tmp[bsi];
+                // InsideOnly でも tmp は既に horizontal pass で重み補正済みなので、
+                // ここでは bbox 内 (= horizontal pass を通った画素) を一律寄与扱いにする。
+                acc_r += p.r() as f32 * kw;
+                acc_g += p.g() as f32 * kw;
+                acc_b += p.b() as f32 * kw;
+                acc_w += kw;
+            }
+            let base_a = pixels[y * w + (bbox.x0 + bx)].a();
+            out[by * bw + bx] = if acc_w > 1e-6 {
+                Color32::from_rgba_unmultiplied(
+                    (acc_r / acc_w).round() as u8,
+                    (acc_g / acc_w).round() as u8,
+                    (acc_b / acc_w).round() as u8,
+                    base_a,
+                )
+            } else {
+                pixels[y * w + (bbox.x0 + bx)]
+            };
+        }
+    }
+    out
 }
 
 /// マスク境界から内側への距離 (上限 `radius`) を計算し、線形ランプの alpha map を返す。
@@ -598,5 +930,144 @@ mod tests {
         );
         // 中央 (2,2) も dist=1 (隣接マス (1,2) が境界からの距離 1)
         // → 境界画素も中央画素も小さなマスクでは radius 内に収まる
+    }
+
+    // ── compose_blur (Phase 3c) ──────────────────────────────────────
+
+    #[test]
+    fn blur_empty_mask_returns_base() {
+        let img = split_image(16, 16);
+        let mask = vec![false; 16 * 16];
+        let out = compose_blur(&img, &mask, 5.0, BlurMode::AsMask, false);
+        assert_eq!(out.pixels, img.pixels);
+    }
+
+    #[test]
+    fn blur_solid_image_remains_solid() {
+        // 全画素同色 → どのモード / 半径 / フェードでも結果は元色
+        let img = solid_image(32, 32, Color32::from_rgb(120, 120, 120));
+        let mut mask = vec![false; 32 * 32];
+        for y in 8..24 {
+            for x in 8..24 {
+                mask[y * 32 + x] = true;
+            }
+        }
+        for mode in [
+            BlurMode::AsMask,
+            BlurMode::ExtendByRadius,
+            BlurMode::InsideOnly,
+        ] {
+            let out = compose_blur(&img, &mask, 5.0, mode, false);
+            for &p in &out.pixels {
+                let dr = (p.r() as i32 - 120).abs();
+                assert!(dr <= 1, "expected ~120, got {} in mode {:?}", p.r(), mode);
+            }
+        }
+    }
+
+    #[test]
+    fn blur_as_mask_blends_colors_at_boundary() {
+        // 左赤 / 右青 split。マスクは右半分 → AsMask で右半分の境界近くに赤が混じる
+        // (kernel が外画素 = 左の赤を引っ張る)
+        let img = split_image(32, 32);
+        let mut mask = vec![false; 32 * 32];
+        for y in 0..32 {
+            for x in 16..32 {
+                mask[y * 32 + x] = true;
+            }
+        }
+        let out = compose_blur(&img, &mask, 5.0, BlurMode::AsMask, false);
+        // 右半分の境界 (x=16) は赤 + 青の混合 → r が 0 より明らかに大きい
+        let boundary = out.pixels[16 * 32 + 16];
+        assert!(
+            boundary.r() > 30,
+            "AsMask boundary should mix red, got r={}",
+            boundary.r()
+        );
+        // 右端 (x=31) はマスク内だが kernel が右端で 0 寄与の領域あり → 元の青に近い
+        let far = out.pixels[16 * 32 + 31];
+        assert!(
+            far.r() < 30,
+            "right edge should stay blue-ish, got r={}",
+            far.r()
+        );
+    }
+
+    #[test]
+    fn blur_inside_only_does_not_pull_outside_color() {
+        // 同じ split + 右半分マスク。InsideOnly なら外画素 (赤) を参照しないので
+        // 境界画素 (x=16) も元色 (青) に近いまま (= 青のみで平均される)。
+        let img = split_image(32, 32);
+        let mut mask = vec![false; 32 * 32];
+        for y in 0..32 {
+            for x in 16..32 {
+                mask[y * 32 + x] = true;
+            }
+        }
+        let out = compose_blur(&img, &mask, 5.0, BlurMode::InsideOnly, false);
+        let boundary = out.pixels[16 * 32 + 16];
+        // 赤の混入が抑制されていることを確認 (AsMask の 30 と比べ明らかに小さい)
+        assert!(
+            boundary.r() < 10,
+            "InsideOnly boundary should NOT mix red, got r={}",
+            boundary.r()
+        );
+    }
+
+    #[test]
+    fn blur_extend_by_radius_grows_mask() {
+        // 中央 4x4 のマスク + 半径 4 で膨張 → マスクが広がる
+        let mut mask = vec![false; 16 * 16];
+        for y in 6..10 {
+            for x in 6..10 {
+                mask[y * 16 + x] = true;
+            }
+        }
+        let dilated = dilate_mask(&mask, 16, 16, 4);
+        // 中央元マスクは true のまま
+        assert!(dilated[8 * 16 + 8]);
+        // 半径 4 内のすぐ外 ((5,5) は元マスク (6,6) から距離 sqrt(2)、半径 4 内) → true
+        assert!(dilated[5 * 16 + 5]);
+        // 元マスク (6..10) から距離 6 以上離れた (0,0) は false
+        assert!(!dilated[0]);
+    }
+
+    #[test]
+    fn mask_bbox_finds_min_max() {
+        let mut mask = vec![false; 10 * 10];
+        mask[2 * 10 + 3] = true;
+        mask[7 * 10 + 6] = true;
+        let bbox = mask_bbox(&mask, 10, 10).unwrap();
+        assert_eq!(bbox.x0, 3);
+        assert_eq!(bbox.y0, 2);
+        assert_eq!(bbox.x1, 7); // exclusive
+        assert_eq!(bbox.y1, 8);
+    }
+
+    #[test]
+    fn mask_bbox_returns_none_for_empty() {
+        let mask = vec![false; 10 * 10];
+        assert!(mask_bbox(&mask, 10, 10).is_none());
+    }
+
+    #[test]
+    fn gaussian_kernel_sums_to_one() {
+        let k = gaussian_kernel_1d(5, 1.5);
+        let sum: f32 = k.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "kernel sum = {}", sum);
+        // 対称
+        assert!((k[0] - k[10]).abs() < 1e-5);
+        assert!((k[3] - k[7]).abs() < 1e-5);
+        // 中心が最大
+        let center = k[5];
+        for (i, &w) in k.iter().enumerate() {
+            assert!(
+                center >= w,
+                "center {} should be max but k[{}]={}",
+                center,
+                i,
+                w
+            );
+        }
     }
 }

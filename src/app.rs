@@ -16743,20 +16743,13 @@ impl App {
                 self.settings.conceal_fill_opacity_percent,
                 self.settings.conceal_fill_edge,
             ),
-            crate::conceal::ConcealType::Blur => {
-                // Phase 3c 未実装 — 一時的に Mosaic 合成にフォールバック。
-                let long_edge = w.max(h) as u32;
-                let tile = crate::conceal::compute_tile_size(
-                    long_edge,
-                    self.settings.conceal_mosaic_tile_mode,
-                );
-                crate::conceal_compose::compose_mosaic(
-                    source_pixels.as_ref(),
-                    &composite,
-                    tile,
-                    self.settings.conceal_mosaic_boundary,
-                )
-            }
+            crate::conceal::ConcealType::Blur => crate::conceal_compose::compose_blur(
+                source_pixels.as_ref(),
+                &composite,
+                self.settings.conceal_blur_radius_px,
+                self.settings.conceal_blur_mode,
+                self.settings.conceal_blur_feather,
+            ),
         };
 
         let tex = ctx.load_texture(

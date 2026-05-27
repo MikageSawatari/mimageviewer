@@ -1677,21 +1677,56 @@ impl App {
                             if fill_changed || type_changed {
                                 self.bump_conceal_generation();
                             }
-                        } else if type_changed {
-                            // 残るは Blur (Phase 3c 未実装) — Mosaic にフォールバック扱い。
-                            self.bump_conceal_generation();
-                            ui.colored_label(
-                                egui::Color32::from_rgb(220, 180, 80),
-                                "※ ぼかしは未実装 (Mosaic にフォールバック)",
-                            );
                         } else if matches!(
                             self.settings.conceal_type,
                             crate::conceal::ConcealType::Blur
                         ) {
-                            ui.colored_label(
-                                egui::Color32::from_rgb(220, 180, 80),
-                                "※ ぼかしは未実装 (Mosaic にフォールバック)",
+                            // ── Blur パラメータ (Phase 3c) ──────────────────
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("ぼかし半径:")
+                                    .color(egui::Color32::from_gray(200)),
                             );
+                            let mut blur_radius = self.settings.conceal_blur_radius_px;
+                            let prev = blur_radius;
+                            ui.add(
+                                egui::Slider::new(&mut blur_radius, 5.0..=100.0)
+                                    .text("px")
+                                    .step_by(1.0),
+                            );
+                            let mut blur_changed = false;
+                            if (blur_radius - prev).abs() > 0.01 {
+                                self.settings.conceal_blur_radius_px = blur_radius;
+                                blur_changed = true;
+                            }
+                            ui.label(
+                                egui::RichText::new("ぼかしモード:")
+                                    .color(egui::Color32::from_gray(200)),
+                            );
+                            let mut bmode = self.settings.conceal_blur_mode;
+                            for m in [
+                                crate::conceal::BlurMode::AsMask,
+                                crate::conceal::BlurMode::ExtendByRadius,
+                                crate::conceal::BlurMode::InsideOnly,
+                            ] {
+                                let label = egui::RichText::new(m.process_description()).size(11.0);
+                                if ui.radio(bmode == m, label).clicked() && bmode != m {
+                                    bmode = m;
+                                    self.settings.conceal_blur_mode = m;
+                                    blur_changed = true;
+                                }
+                            }
+                            let _ = bmode;
+                            let mut feather = self.settings.conceal_blur_feather;
+                            let prev_feather = feather;
+                            ui.checkbox(&mut feather, "境界フェードを掛ける");
+                            if feather != prev_feather {
+                                self.settings.conceal_blur_feather = feather;
+                                blur_changed = true;
+                            }
+                            if blur_changed || type_changed {
+                                self.bump_conceal_generation();
+                            }
                         }
 
                         // ── プリセット 4 スロット (Phase 4) ───────────────────
