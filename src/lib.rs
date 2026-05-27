@@ -93,6 +93,7 @@ pub mod ui_susie_diagnostic;
 pub mod ui_text_links;
 pub mod undo_stack;
 pub mod update_check;
+pub mod vector_edit;
 #[cfg(windows)]
 pub mod video;
 pub mod video_bookmarks;
