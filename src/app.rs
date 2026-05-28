@@ -15683,7 +15683,10 @@ impl App {
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
         self.export_pending = None;
-        self.export_folder_refresh_pending = None;
+        // **`export_folder_refresh_pending` は触らない**: これは「一覧に戻ったら
+        // サムネ更新」の dirty フラグ (commit 1cdf9c53 で導入) で、`consume_*` が
+        // 同フレ末で取り出す前提。close_fullscreen 内で None に戻すと取り出す前に
+        // 消えて、エクスポート後にサムネが更新されない (Codex review P1 再指摘)。
         self.fullscreen_video_marker_cache = None;
         self.cancel_fullscreen_video_marker_thumb_decode();
         // 360 度パノラマビュー: フルスクリーン退出で state と GPU リソースを drop。

@@ -259,14 +259,29 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
         ExportSource::File { path } if needs_source_for_webp_check => {
             // File source は通常 source_path 経由で渡すが、アニメーション WebP の
             // 検出だけは bytes が要るのでここで読む。
+            // read 失敗時に silent skip すると、出力 PNG/JPEG では `save_with_metadata`
+            // 側の animation check も走らずアニメ WebP が単一フレームで書き出されて
+            // しまう (Codex review P3)。ZIP 側と同じく全エントリ失敗にする。
             match std::fs::read(path) {
                 Ok(bytes) => Some(bytes),
-                Err(_) => None,
+                Err(err) => {
+                    let msg = format!("アニメーション判定のため WebP を読めません: {err}");
+                    for entry in &request.entries {
+                        let _ = tx.send(ExportEvent::Failed(ExportFailure {
+                            label: entry.label.clone(),
+                            message: msg.clone(),
+                        }));
+                    }
+                    let _ = tx.send(ExportEvent::AllDone);
+                    return;
+                }
             }
         }
         _ => None,
     };
     // 元 WebP がアニメーションなら、出力形式に関係なく全エントリを失敗にする。
+    // ここに到達した時点で WebP 入力なら source_bytes は必ず Some であることが
+    // 保証されている (read 失敗は上の File/ZIP 経路で全失敗 + return 済み)。
     if request.original_format == SrcFormat::Webp
         && let Some(bytes) = source_bytes.as_deref()
         && crate::save_with_metadata::webp_is_animated(bytes)

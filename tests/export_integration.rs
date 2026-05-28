@@ -394,6 +394,35 @@ fn export_animated_webp_fails() {
     assert!(!temp.path().join("animated_0.webp").exists());
 }
 
+/// 元 WebP がアニメ判定のため file read を試みるが、読み込みに失敗したケース。
+/// silent skip すると output PNG/JPEG で animation check が走らずアニメ WebP が
+/// 静止画化される穴があるため、read 失敗は全エントリ失敗にする (Codex review P3)。
+#[test]
+fn export_webp_source_read_failure_fails_all_entries() {
+    let temp = tempfile::tempdir().unwrap();
+    // 実在しないパスを渡して file read を失敗させる。
+    let missing = temp.path().join("missing.webp");
+    let pending = spawn_export_worker(ExportRequest {
+        source: ExportSource::File {
+            path: missing.clone(),
+        },
+        original_format: SrcFormat::Webp,
+        output_format: ExportFormat::Png,
+        output_dir: temp.path().to_path_buf(),
+        basename: "missing".to_string(),
+        base_pixels: solid_image(2, 2, egui::Color32::WHITE),
+        conceal_mask: None,
+        entries: vec![entry("a", 0), entry("b", 1)],
+        include_metadata: false,
+    })
+    .unwrap();
+    let events = collect_events(pending, 5);
+    assert_eq!(completed_count(&events), 0);
+    assert_eq!(failed_count(&events), 2);
+    assert!(!temp.path().join("missing_0.png").exists());
+    assert!(!temp.path().join("missing_1.png").exists());
+}
+
 /// 元 WebP がアニメーションのとき、出力形式に関係なく export を拒否する。
 /// 旧版は output=WebP のときだけ animation check が走り、PNG/JPEG 出力では
 /// 単一フレームを silent に書き出していた (Codex review CONFIRMED の修正)。
