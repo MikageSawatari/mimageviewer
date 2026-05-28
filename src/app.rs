@@ -1782,6 +1782,8 @@ pub struct App {
     /// サムネイル比率の自動選択 (`settings.thumb_aspect_auto` が true のときに動く)。
     /// 詳細: [docs/auto-thumb-aspect-plan.md](../docs/auto-thumb-aspect-plan.md)
     pub(crate) auto_aspect: crate::auto_aspect::AutoAspectState,
+    /// フォルダごとの前回 auto-aspect 確定値。Auto モード再訪時の初期比率に使う。
+    pub(crate) auto_aspect_cache_db: Option<crate::auto_aspect_cache::AutoAspectCacheDb>,
     /// 前フレームのビューポート高さ（カーソルキースクロールに使用）
     pub(crate) last_viewport_h: f32,
     /// true のとき選択セルが見えるようにオフセットを調整する
@@ -3583,6 +3585,12 @@ impl App {
         crate::perf::emit_ms("startup", "db_open_spread", 0, t);
 
         let t = std::time::Instant::now();
+        let auto_aspect_cache_db = crate::auto_aspect_cache::AutoAspectCacheDb::open()
+            .map_err(|e| crate::logger::log(format!("auto_aspect_cache_db open failed: {e}")))
+            .ok();
+        crate::perf::emit_ms("startup", "db_open_auto_aspect_cache", 0, t);
+
+        let t = std::time::Instant::now();
         let pdf_passwords = crate::pdf_passwords::PdfPasswordStore::load();
         crate::perf::emit_ms("startup", "pdf_passwords_load", 0, t);
 
@@ -3636,6 +3644,7 @@ impl App {
             last_cell_size: 200.0,
             last_cell_h: 200.0,
             auto_aspect: crate::auto_aspect::AutoAspectState::default(),
+            auto_aspect_cache_db,
             last_viewport_h: 600.0,
             scroll_to_selected: false,
             last_outer_rect: None,
@@ -4191,6 +4200,64 @@ impl App {
         }
     }
 
+    fn auto_aspect_cache_target_path(&self) -> Option<PathBuf> {
+        if self.global_search.active || self.favsearch.active || self.items_are_global_search_view {
+            return None;
+        }
+        let path = self.effective_folder()?;
+        if crate::folder_tree::path_eq(&path, &search_results_synthetic_path()) {
+            return None;
+        }
+        Some(path)
+    }
+
+    fn restore_cached_auto_aspect(&mut self) {
+        let Some(path) = self.auto_aspect_cache_target_path() else {
+            return;
+        };
+        let cached = self
+            .auto_aspect_cache_db
+            .as_ref()
+            .and_then(|db| db.get(&path));
+        let Some(entry) = cached else {
+            return;
+        };
+
+        self.auto_aspect.current = Some(entry.aspect);
+        // Folder load restores scroll history later and starts new folders at y=0, so do
+        // not run scroll fixup here. Keep last_cell_h in sync because display_px is
+        // initialized before the next grid paint recomputes cell dimensions.
+        self.last_cell_h = (self.last_cell_size * entry.aspect.height_ratio())
+            .round()
+            .max(1.0);
+        crate::logger::log(format!(
+            "  auto_aspect cache: restored {} (samples={}, eligible={})",
+            entry.aspect.label(),
+            entry.sample_count,
+            entry.eligible_total
+        ));
+    }
+
+    fn save_auto_aspect_cache(
+        &self,
+        aspect: crate::settings::ThumbAspect,
+        sample_count: usize,
+        eligible_total: usize,
+    ) {
+        let Some(path) = self.auto_aspect_cache_target_path() else {
+            return;
+        };
+        let Some(db) = self.auto_aspect_cache_db.as_ref() else {
+            return;
+        };
+        if let Err(e) = db.upsert(&path, aspect, sample_count, eligible_total) {
+            crate::logger::log(format!(
+                "  auto_aspect cache: save failed for {}: {e}",
+                path.display()
+            ));
+        }
+    }
+
     /// 既存の `ThumbnailState::Loaded` から `auto_aspect.samples` を再構築する。
     ///
     /// ユーザーが UI で「自動」を初めて押したとき、それまで Manual で動いていて
@@ -4275,6 +4342,10 @@ impl App {
         if eligible_total == 0 {
             return;
         }
+        // 前回このフォルダで統計確定した比率があれば、Square の代わりに初期値に使う。
+        // catalog seed が十分なら直後の maybe_apply_auto_aspect(true) で検証・補正される。
+        self.restore_cached_auto_aspect();
+
         let min_samples = crate::auto_aspect::min_samples_for(eligible_total);
         let mut probe_budget: usize = min_samples.saturating_mul(2);
         let use_full_path_keys = self.use_full_path_cache_keys();
@@ -4436,6 +4507,7 @@ impl App {
                 && crate::auto_aspect::pick_best(&samples).is_some()
             {
                 self.auto_aspect.current = Some(current);
+                self.save_auto_aspect_cache(current, samples.len(), eligible_total);
                 crate::logger::log(format!(
                     "  auto_aspect: confirmed (no visible change) {} (samples={})",
                     current.label(),
@@ -4477,6 +4549,7 @@ impl App {
         self.auto_aspect.switches_done = self.auto_aspect.switches_done.saturating_add(1);
         self.auto_aspect.last_switch_at = Some(now);
         self.auto_aspect.streak = None;
+        self.save_auto_aspect_cache(new_aspect, cur_samples, eligible_total);
         crate::logger::log(format!(
             "  auto_aspect: switched {} -> {} (samples={}, switches_done={})",
             old.label(),

@@ -309,6 +309,20 @@ decode が進んで分布が大きく変わったら 2 回目で修正、それ�
 未キャッシュフォルダではこの即決は失敗し、Square で描画開始 → decode 進行に
 合わせて段階的に切り替わる。
 
+### 4.6 フォルダ別の前回結果キャッシュ (2026-05 追補)
+
+`%APPDATA%/mimageviewer/auto_aspect_cache.db` に、フォルダ / ZIP / PDF コンテナごとの
+前回 auto-aspect 確定値を保存する。再訪時は `reset_and_seed_auto_aspect` の直後、
+catalog seed より前に `auto_aspect.current` をこの値で初期化し、従来の
+「未確定なら 1:1」から始まる表示切替を減らす。
+
+- 保存対象は `ThumbAspect` と診断用の sample 数 / eligible_total のみ。代表サムネ対象や
+  サムネ画像 BLOB は既存 `catalog.db` / `folder_thumb_pins.db` の責務から動かさない。
+- キャッシュ値は楽観的な初期値であり、後続の catalog seed / `poll_thumbnails` で集まる
+  実統計が既存の 6 段ゲートを通れば補正される。
+- Ctrl+G / Ctrl+S の検索結果ビューや `__search_results__` 合成パスは、クエリ依存で
+  中身が変わるため保存・復元対象外。
+
 ## 5. アーキテクチャ
 
 ### 5.1 設定モデル
@@ -457,6 +471,14 @@ impl App {
     fn maybe_apply_auto_aspect(&mut self);
 }
 ```
+
+#### 永続キャッシュ (`src/auto_aspect_cache.rs`)
+
+`AutoAspectCacheDb` は `auto_aspect_cache.db` に `folder_key -> aspect` を保存する。
+`App::reset_and_seed_auto_aspect` は Auto モードかつ検索結果ビューでない場合に
+前回値を復元し、`maybe_apply_auto_aspect` は実際の切替または no-op 確定時に
+現在の確定値を upsert する。書き込みは 1 フォルダあたり通常 1〜2 回で、毎フレームの
+DB アクセスは行わない。
 
 ### 5.4 描画側の置き換え
 
