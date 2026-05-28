@@ -43,6 +43,22 @@ pub(crate) struct EraseInpaintPendingKey {
     pub(crate) kind: EraseInpaintKind,
 }
 
+/// `apply_inpaint_only` の戻り値。
+///
+/// 旧版は bool で「何かしら処理した = true」を返していたが、入力ピクセル取得不能 /
+/// サイズ不一致でも true が返るため caller が `[補完中…]` toast を出してしまい、
+/// 実際は commit 未投入の状態 (= ensure_erase_result_texture が次フレ拾うまで何も
+/// 動かない) を「処理中」と誤表示していた (Phase 1-5 code-review CONFIRMED)。
+pub(crate) enum ApplyInpaintOutcome {
+    /// マスクが空で何もしなかった。toast 不要。
+    NoMask,
+    /// マスクは保存したが、サイズ不一致等で commit を即時投入できなかった。
+    /// `ensure_erase_result_texture` が次フレで拾う。
+    Deferred,
+    /// MI-GAN ジョブを実際にキューへ投入した。
+    Launched,
+}
+
 /// 進行中の MI-GAN inpaint 推論。`App.erase_inpaint_pending` で保持され、
 /// 推論完了 (もしくは新規投入で前ジョブをキャンセル) するまで生存する。
 /// 推論本体は worker thread で走り、結果は `rx` 経由で UI スレッドへ届ける。
@@ -105,9 +121,6 @@ const PANEL_MIN_BODY_H: f32 = 120.0;
 /// ツールパネルの左上マージン。
 const PANEL_MARGIN_X: f32 = 16.0;
 const PANEL_MARGIN_Y: f32 = 60.0;
-/// 実パネル矩形がまだ無いフレームで使う入力抑制用の概算高さ。
-/// 実際の描画後は `erase_panel_last_rect` に置き換わる。
-const PANEL_FALLBACK_COMPACT_H: f32 = 650.0;
 /// 消しゴム本文の内容高をまだ測定できていない最初のフレームで使う高さ。
 /// 以降は `erase_panel_body_content_h` の実測値に追従する。
 const PANEL_BODY_FALLBACK_H: f32 = 560.0;
@@ -906,12 +919,23 @@ impl App {
         if self.erase_tool == tool {
             return;
         }
+        let entering_select = tool == EraseTool::Select;
         self.erase_tool = tool;
         // ツール切替時は選択をクリア (= 別ツールに移ったので前 shape の編集を終了)
         // (Codex P1 対応、実機 FB R3)。
-        self.erase_selected_shape = None;
+        // ただし **Select に入る場合は erase_selected_shape を保持** する: 直前に
+        // 別ツールで commit_erase_shape が auto-select した shape の編集を [S] で
+        // すぐ始められるようにするのが UX 意図 (commit_erase_shape のコメント参照、
+        // code-review CONFIRMED)。
+        if !entering_select {
+            self.erase_selected_shape = None;
+        }
         self.erase_drag = None;
         self.erase_mask_texture = None;
+        // ツールごとに slider 行の有無が変わるためパネル本文高も変わる。前ツール
+        // の measured 値を残すと 1 frame だけ slider が clip されたり余白が出る
+        // (Phase 1-5 code-review CONFIRMED)。
+        self.erase_panel_body_content_h = None;
         self.show_feedback_toast(toast.to_string());
     }
 
@@ -1065,10 +1089,15 @@ impl App {
                 ));
             }
         }
-        egui::Rect::from_min_size(
-            panel_pos,
-            egui::vec2(PANEL_W, PANEL_FALLBACK_COMPACT_H.min(max_h)),
-        )
+        // 実描画 rect がまだ無い (= 初フレーム / ウィンドウサイズ変動直後) は、
+        // **狭い** PANEL_W 幅で取る。旧版は固定 650px 高で初フレに広めに取って
+        // いたため、パネル下に出ようとした 1 stroke を奪うことがあった
+        // (Phase 1-5 code-review CONFIRMED)。
+        // 高さもヘッダ + ボタン 2 行 ぶん (= ~120px) に抑え、次フレに正確な rect で
+        // 上書きする方が安全。実害はパネル下端へ即クリックが届くケースで
+        // 「初フレだけ image 側に抜ける」だが、初フレで brush stroke を始めるのは
+        // ほぼ起こらないので許容する。
+        egui::Rect::from_min_size(panel_pos, egui::vec2(PANEL_W, PANEL_MIN_BODY_H.min(max_h)))
     }
 
     // ── 入力処理 ──────────────────────────────────────────────────
@@ -2410,23 +2439,22 @@ impl App {
     }
 
     /// マスク保存と MI-GAN inpaint 投入だけ行い、`reset_erase_mode` は呼ばない内部版。
-    /// 戻り値: 何かしら inpaint を投入したら true (保存された)、空マスクで何もしなければ false。
-    /// 返り値で「Apply できたか」が呼び出し側に伝わるので、`execute_erase_inpaint` でも
-    /// `switch_erase_target_in_spread` でも統一的に使える。
-    fn apply_inpaint_only(&mut self, ctx: &egui::Context, fs_idx: usize) -> bool {
+    /// 戻り値: `ApplyInpaintOutcome` で「何もしなかった / 保存はしたが commit 保留 /
+    /// commit 投入」を区別する。
+    fn apply_inpaint_only(&mut self, ctx: &egui::Context, fs_idx: usize) -> ApplyInpaintOutcome {
         let composite = match self.composite_mask() {
             Some(c) if c.iter().any(|&m| m) => c,
-            _ => return false,
+            _ => return ApplyInpaintOutcome::NoMask,
         };
         let Some(bitmap) = self.erase_mask.clone() else {
-            return false;
+            return ApplyInpaintOutcome::NoMask;
         };
         let [w, h] = self.erase_mask_size;
         // ビットマップとベクタを別々に永続化することで、再編集時に両者を分離して読み直せる。
         let vectors_snapshot = self.erase_shapes.clone();
         self.save_mask_with_sidecar(fs_idx, &bitmap, &vectors_snapshot, w, h);
         let Some(original) = self.resolve_erase_input_pixels(fs_idx) else {
-            return true;
+            return ApplyInpaintOutcome::Deferred;
         };
         if original.size != [w, h] {
             // 消しゴム入場後に AI 完了などで入力解像度が変わった場合は、ここで
@@ -2437,14 +2465,14 @@ impl App {
                 original.size[0], original.size[1], w, h
             ));
             self.clear_erase_result_caches_for_idx(fs_idx);
-            return true;
+            return ApplyInpaintOutcome::Deferred;
         }
         let masked_count = composite.iter().filter(|&&m| m).count();
         crate::logger::log(format!(
             "erase: inpaint start, masked pixels={masked_count}"
         ));
         self.run_inpaint_and_cache(ctx, fs_idx, original, composite, w, h, "exec", false);
-        true
+        ApplyInpaintOutcome::Launched
     }
 
     /// 指定 idx の preview MI-GAN 状態を破棄する。
@@ -2547,8 +2575,14 @@ impl App {
     /// 投入後は `reset_erase_mode` を呼んで消しゴムモード自体を終了する。
     /// 見開きから入っていた場合は reset 内で見開きが復元される。
     pub(crate) fn execute_erase_inpaint(&mut self, ctx: &egui::Context, fs_idx: usize) {
-        if self.apply_inpaint_only(ctx, fs_idx) {
-            self.show_feedback_toast("[補完中…]".to_string());
+        match self.apply_inpaint_only(ctx, fs_idx) {
+            ApplyInpaintOutcome::Launched => {
+                self.show_feedback_toast("[補完中…]".to_string());
+            }
+            ApplyInpaintOutcome::Deferred => {
+                self.show_feedback_toast("[補完待機中…]".to_string());
+            }
+            ApplyInpaintOutcome::NoMask => {}
         }
         self.reset_erase_mode();
     }
@@ -2580,6 +2614,9 @@ impl App {
         let mut composite = bitmap.clone();
         crate::mask_db::rasterize_shapes_into(&mut composite, &shapes, w, h);
         if !composite.iter().any(|&m| m) {
+            // ensure_erase_result_texture と同じく、composite 空のときは mask_pages
+            // からも外しておく (badge 一貫性、Phase 1-5 code-review CONFIRMED)。
+            self.mask_pages.remove(&idx);
             return;
         }
 

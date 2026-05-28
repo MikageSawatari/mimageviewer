@@ -16673,9 +16673,12 @@ impl App {
         w: usize,
         h: usize,
     ) {
-        let bitmap_empty = !mask.iter().any(|&m| m);
-        if bitmap_empty && shapes.is_empty() {
-            // 空マスクは DB + サイドカーから削除
+        // bitmap が空 + shapes が空、または composite (bitmap + shapes rasterize 結果)
+        // が全 false (= subtract-only 等) のときは DB + サイドカー側でも削除する。
+        // 旧コードは bitmap_empty && shapes.is_empty() しか見ておらず、subtract-only
+        // のマスクが永続化されて badge / display 経路で扱いに迷うケースが
+        // 発生していた (Phase 1-5 code-review CONFIRMED)。
+        if Self::composite_is_empty(mask, shapes, w, h) {
             self.delete_mask_with_sidecar(idx);
             return;
         }
@@ -16685,6 +16688,28 @@ impl App {
         let compressed = crate::mask_db::compress_mask(mask);
         let shapes_json = crate::mask_db::shapes_to_json(shapes);
         self.save_mask_raw_with_sidecar(idx, &compressed, shapes, shapes_json.as_deref(), w, h);
+    }
+
+    /// 与えられた bitmap + shapes を rasterize した composite が全 false なら true。
+    /// subtract-only の mask が永続化されて badge / display で混乱するのを防ぐため
+    /// 共通判定として `save_*_with_sidecar` で使う。
+    fn composite_is_empty(
+        mask: &[bool],
+        shapes: &[crate::mask_db::Shape],
+        w: usize,
+        h: usize,
+    ) -> bool {
+        let bitmap_empty = !mask.iter().any(|&m| m);
+        if bitmap_empty && shapes.is_empty() {
+            return true;
+        }
+        if w == 0 || h == 0 || mask.len() != w * h {
+            // 元データが空 / サイズ不整合: 安全側で「空」扱いにして永続化しない。
+            return true;
+        }
+        let mut composite = mask.to_vec();
+        crate::mask_db::rasterize_shapes_into(&mut composite, shapes, w, h);
+        !composite.iter().any(|&m| m)
     }
 
     /// 既に deflate 済みのビットマップ + JSON 済みベクタを DB + サイドカーに書き込む。
@@ -16744,8 +16769,10 @@ impl App {
         w: usize,
         h: usize,
     ) {
-        let bitmap_empty = !mask.iter().any(|&m| m);
-        if bitmap_empty && shapes.is_empty() {
+        // composite_is_empty: bitmap + shapes rasterize 結果が全 false なら削除する。
+        // subtract-only mask が badge 表示されたまま inpaint されないゴミ entry に
+        // ならないようにする (Phase 1-5 code-review CONFIRMED)。
+        if Self::composite_is_empty(mask, shapes, w, h) {
             self.delete_conceal_with_sidecar(idx);
             return;
         }
@@ -17082,6 +17109,15 @@ impl App {
         // ビットマップ + Shape をラスタライズしてマスク確定
         let mut composite = bitmap;
         crate::mask_db::rasterize_shapes_into(&mut composite, &shapes, w, h);
+        // composite が全 false (= subtract-only / shape が bitmap を上書き) のときも
+        // 実質空マスクとして bage を外して合成スキップ。erase 側の対称処理
+        // (ensure_erase_result_texture) と合わせる (Phase 1-5 code-review CONFIRMED)。
+        if !composite.iter().any(|&b| b) {
+            if !editing_this_idx {
+                self.conceal_pages.remove(&idx);
+            }
+            return None;
+        }
 
         // タイプ別合成 (Phase 3b で Fill を追加、Blur は Phase 3c 待ちで当面 Mosaic
         // にフォールバック)。

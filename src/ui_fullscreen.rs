@@ -8209,6 +8209,22 @@ impl App {
             self.show_feedback_toast("消しゴム補完の完了後にエクスポートしてください".to_string());
             return;
         }
+        // 保存済みマスクがあるのに erase_result_cache が空のままだと、export は
+        // pre-erase pixels を書き出してしまう。AI upscale 完了などで input_gen が
+        // bump され result が clear された直後の状態がこれに該当する
+        // (Phase 1-5 code-review CONFIRMED)。
+        // ensure_erase_result_texture をここで呼んで commit を再投入し、結果が
+        // 揃うまで Ctrl+E を保留する。
+        if self.mask_pages.contains(&fs_idx) {
+            let _ = self.ensure_erase_result_texture(ctx, fs_idx);
+            if self.current_erase_result_pixels(fs_idx).is_none() {
+                self.show_feedback_toast(
+                    "消しゴム補完の準備中です。少し待ってから Ctrl+E を再実行してください"
+                        .to_string(),
+                );
+                return;
+            }
+        }
         let Ok((source, label, original_format, source_dir, basename)) =
             self.export_source_info_for_idx(fs_idx)
         else {

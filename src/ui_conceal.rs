@@ -549,6 +549,7 @@ impl App {
         if let Some(tool) = switched
             && tool != self.conceal_tool
         {
+            let entering_select = tool == ConcealTool::Select;
             self.conceal_tool = tool;
             self.conceal_drag = None;
             self.conceal_lasso_points.clear();
@@ -558,7 +559,11 @@ impl App {
             self.conceal_shape_drag_end = None;
             // ツール切替時は選択も解除 (= 別ツールに移ったので前の shape の
             // ハンドル編集は終了とみなす、Codex P1 対応)。
-            self.conceal_selected_shape = None;
+            // ただし **Select に入る場合は保持** (commit_conceal_shape が auto-select
+            // した shape を [S] でそのまま編集できるようにする、code-review CONFIRMED)。
+            if !entering_select {
+                self.conceal_selected_shape = None;
+            }
             self.conceal_mask_texture = None;
             self.show_feedback_toast(format!("[{}]", tool.label()));
         }
@@ -1857,6 +1862,7 @@ impl App {
                                             .wrap(),
                                         );
                                         if tool != self.conceal_tool {
+                                            let entering_select = tool == ConcealTool::Select;
                                             self.conceal_tool = tool;
                                             self.conceal_drag = None;
                                             self.conceal_lasso_points.clear();
@@ -1865,7 +1871,11 @@ impl App {
                                             self.conceal_shape_drag_start = None;
                                             self.conceal_shape_drag_end = None;
                                             // ツール切替時は選択もクリア (Codex P1 対応)。
-                                            self.conceal_selected_shape = None;
+                                            // Select 入場時は auto-select 維持
+                                            // (code-review CONFIRMED)。
+                                            if !entering_select {
+                                                self.conceal_selected_shape = None;
+                                            }
                                             self.conceal_mask_texture = None;
                                         }
 
