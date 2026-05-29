@@ -12689,6 +12689,10 @@ impl App {
                 }
                 FolderNavMode::Grid => {}
             }
+            // folder_nav result はグリッド / toast の描画後に回収される。空フォルダなど
+            // 他の repaint 要因が無い状態でも、ここでセットした境界 toast / hint を
+            // 次フレームで必ず描画する。
+            ctx.request_repaint();
             emit_end(apply_t0, apply_seq, apply_mode_tag, "dfs_empty");
             return;
         };
