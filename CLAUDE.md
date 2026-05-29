@@ -1226,6 +1226,24 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
   進まない。
 - (任意) GitHub Release 用 body は基本 README.md の該当セクションをそのまま
   コピペで OK。手作業で別途書き直さない (= 表記ゆれを生まない)。
+- **⚠️ 8KB 上限チェック (大型リリースで必須)**: アプリ内更新通知は
+  `update_check.rs` の `BODY_CAP = 8 * 1024` で **先頭 8KB (UTF-8 バイト)** に切られる。
+  README の該当セクションが 8KB を超えると、後半の項目 (= 末尾に置きがちな新機能 /
+  バグ修正) が通知に出ない。リリース前に必ずバイト数を測る:
+  ```bash
+  awk '/^### vX\.Y\.Z$/{f=1} /^### v<前版>$/{f=0} f' README.md | wc -c
+  ```
+  - **8KB 以内**: README セクションをそのまま Release body に使う (上記)。
+  - **8KB 超過**: README はフル版のまま残し、**`docs/release-body-<version>.md` に
+    8KB 以内の短縮版を別途作成**する (BOM なし、Markdown。通知ダイアログは Markdown
+    レンダリング対応なので見出し・箇条書き可)。短縮版は「目玉の新機能 → 主な改善 →
+    主なバグ修正」の順で前方に重要項目を寄せ、全項目は README を参照する旨のリンクを
+    冒頭に入れる。**この短縮版ファイルを Phase 4 の Release body に使う** (下記)。
+    作成後 `wc -c docs/release-body-<version>.md` で 8192 以下を確認。
+    - 注意: 8KB 上限は **更新を受け取る側 (= 旧バージョンのバイナリ)** に焼かれている
+      ので、今リリースで `BODY_CAP` を上げても今回の通知には効かない (効くのは次版以降)。
+      短縮版で回避するのが確実。
+    - 実例: v1.0.0 (README セクション 17.5KB → [docs/release-body-v1.0.0.md](docs/release-body-v1.0.0.md) 6KB)。
 
 ### Phase 1: バージョン番号・関連ファイル更新
 
@@ -1310,11 +1328,19 @@ ComfyUI 形式 等) はパーサ内部の実装詳細としてのみ言及し、
 ### Phase 4: GitHub Release 公開
 
 13. ローカルで `git tag v<VERSION>` → `git push origin v<VERSION>` (GitHub `main` も同期)
-14. GitHub Releases UI で新リリースを作成。**body は README.md の該当 `### vX.Y.Z`
-    セクション本文をそのままコピペ** (この本文がアプリ内アップデート通知に表示される)。
-    成果物 (3 種類) を Assets として添付する。
+14. GitHub Releases UI で新リリースを作成。**body の出所は Phase 0 で確定した版に従う**:
+    - **通常 (README セクションが 8KB 以内)**: README.md の該当 `### vX.Y.Z` セクション
+      本文をそのままコピペ。
+    - **短縮版を作った場合 (README セクションが 8KB 超)**: Phase 0 で作成した
+      `docs/release-body-<version>.md` の本文をコピペする (README フル版ではなく
+      **こちらを使う**)。短縮版が存在するかは `ls docs/release-body-<version>.md` で確認。
+      別セッションで Phase 4 を実施する場合もこのファイルの有無で判断できる。
+    - どちらの場合も、この body がアプリ内アップデート通知にそのまま表示される。
+      成果物 (3 種類) を Assets として添付する。
+    - 実例: v1.0.0 は短縮版 [docs/release-body-v1.0.0.md](docs/release-body-v1.0.0.md) を使用。
 15. 公開後、別マシンから `mimageviewer.exe` を起動 → 起動時更新通知ダイアログで
     body が想定どおりに表示されることを目視確認 (改行・見出し・リンクの崩れチェック)。
+    短縮版を使った場合は、目玉の新機能が末尾で切れずに表示されているかを特に確認する。
 
 ## Codex CLI レビュー
 

@@ -9,10 +9,10 @@
 
 | ワーカー | 実装 | 個数 | 用途 |
 | --- | --- | --- | --- |
-| サムネイル (通常) | `std::thread` + mpsc | `parallelism - 重I/O` | Image / ZipImage / PdfPage の軽いデコード + PdfFile のフォルダ代表画 (PDFium pool への IPC 待ちなのでメインプロセス内 CPU は消費しない。PDFium pool 3 並列を活かすためここに置く) |
+| サムネイル (通常) | `std::thread` + mpsc | `parallelism - 重I/O` | Image / ZipImage / PdfPage の軽いデコード + PdfFile のフォルダ代表画 (PDFium pool への IPC 待ちなのでメインプロセス内 CPU は消費しない。PDFium pool 5 並列を活かすためここに置く) |
 | サムネイル (重 I/O) | `std::thread` + mpsc | 1〜2 (総数 ≤4 なら 1) | Folder / ZipFile の全体走査 (本物の同期 I/O。`fs::read_dir` 再帰探索 / ZIP セントラルディレクトリ読み込みなどメインプロセス内ブロッキング) |
 | フルスクリーンロード | `std::thread` (使い捨て) | 1 枚ごとに spawn | フルサイズ画像デコード + アニメ展開 |
-| PDF ワーカー | **別プロセス** (`--pdf-worker`) + 各プロセス専用のディスパッチャースレッド | 3 (`POOL_SIZE`) | PDFium は非スレッドセーフ → マルチプロセスで並列化。要求は JobQueue に enqueue |
+| PDF ワーカー | **別プロセス** (`--pdf-worker`) + 各プロセス専用のディスパッチャースレッド | 5 (`POOL_SIZE`、うち 1 を Critical 予約) | PDFium は非スレッドセーフ → マルチプロセスで並列化。要求は JobQueue に enqueue |
 | PDF ページ列挙 | `std::thread` | 1 (PDF 開く都度) | PDF ワーカーに列挙要求を送る |
 | PDF メタ catch-up / 隣接 prefetch | `std::thread` (常駐、`pdf-meta-catchup`) | 1 | `pdf_meta` テーブルへの背景書き込みを統括 (v1.0.0)。WebP cache hit で render_page を skip した PDF (= アップグレードユーザーの既存サムネ) の `pdf_meta` 補完 (`MetaOnly`、low lane) と、`load_pdf_as_folder` 直後の ±1 隣接 PDF の page 0 render + WebP 温め (`NeighborPrefetch`、high lane) を、`CatchupQueue` 経由でシリアル処理する。重複は pending HashSet で dedup、low → high の優先昇格あり |
 | Susie ワーカー | **別プロセス** (`mimageviewer-susie32.exe`、32bit ビルド) + ディスパッチャースレッド | 3 (設定で 1 に落とせる) | 32bit の Susie 画像プラグイン (`.spi`) をロードし IsSupported/GetPicture を呼び出す。プラグインクラッシュの隔離も兼ねる |
@@ -102,7 +102,7 @@
 
 ### 2.4 GlobalIoSemaphore (I/O 横断調停)
 
-`src/io_semaphore.rs`。PDF ワーカー (3 プロセス) / サムネイル背景ジョブ /
+`src/io_semaphore.rs`。PDF ワーカー (5 プロセス) / サムネイル背景ジョブ /
 インデクサ (walker + ingest) が同時に HDD をシークすると UI スクロールがつまる。
 これを防ぐため、**全ワーカー横断で同時 I/O 数を優先度付きで制限する**。
 
@@ -659,7 +659,7 @@ button_state` / `render_folder_pin_menu_entry` が `None`/false を返してエ�
 `docs/bench-scroll-report.md` に詳細あり。要点:
 
 - キャッシュヒット時のサムネ読み込み: 2〜3 ms/枚
-- PDF レンダリング: 3 ワーカー並列で Cold 1441ms → 10ms (2 枚目以降)
+- PDF レンダリング: 5 ワーカー並列 (うち 1 を Critical 予約) で Cold 1441ms → 10ms (2 枚目以降)
 - JPEG デコード: turbojpeg + DCT scale (1/8〜1/1) でサムネ用 5-30MB カメラ JPEG を 2.5-6× 高速化 ([docs/dct-scale-plan.md](dct-scale-plan.md))。128MB 超は image crate / WIC にフォールバック
 - キャンセル遅延: 最大 1 枚デコード分 (数百 ms)
 

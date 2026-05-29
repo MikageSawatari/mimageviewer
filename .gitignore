@@ -18,6 +18,8 @@ bench_thumbs.tsv
 # Local tooling / scratch (Claude Code, Codex レビューメモ)
 /.claude/
 /codex-review*.md
+# Codex verify / sandbox の一時ディレクトリ (CACHEDIR.TAG のみのスクラッチ)
+/codex_verify_*/
 # Benchmark output (scripts/bench-overnight.ps1)
 /bench_results/
 /video-soak-results/
