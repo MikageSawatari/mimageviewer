@@ -1011,6 +1011,9 @@ fn native_video_fullscreen_shortcut_key(
     if key.alt {
         return false;
     }
+    if matches!(key.virtual_key, 0x21 | 0x22) {
+        return key.ctrl && !key.shift;
+    }
     matches!(
         key.virtual_key,
         0x0D // Enter

@@ -284,6 +284,25 @@ pub fn prev_folder_dfs(current: &Path, opts: FolderTreeOptions) -> Option<PathBu
     }
 }
 
+/// 現在のフォルダ / 仮想フォルダと同じ親を持つ、次の兄弟を返す。
+/// 子や祖先の兄弟へは移動しない (Ctrl+PageDown 用)。
+pub fn next_sibling_folder(current: &Path, opts: FolderTreeOptions) -> Option<PathBuf> {
+    let parent = current.parent()?;
+    let siblings = sorted_subdirs(parent, opts);
+    let pos = siblings.iter().position(|s| path_eq(s, current))?;
+    siblings.get(pos + 1).cloned()
+}
+
+/// 現在のフォルダ / 仮想フォルダと同じ親を持つ、前の兄弟を返す。
+/// 前の兄弟の末端へ潜らず、兄弟そのものを返す (Ctrl+PageUp 用)。
+pub fn prev_sibling_folder(current: &Path, opts: FolderTreeOptions) -> Option<PathBuf> {
+    let parent = current.parent()?;
+    let siblings = sorted_subdirs(parent, opts);
+    let pos = siblings.iter().position(|s| path_eq(s, current))?;
+    pos.checked_sub(1)
+        .and_then(|idx| siblings.get(idx).cloned())
+}
+
 /// path の次の兄弟を返す。兄弟がなければ親で再帰する。
 fn next_sibling_or_ancestor_sibling(path: &Path, opts: FolderTreeOptions) -> Option<PathBuf> {
     let parent = path.parent()?;
@@ -883,6 +902,46 @@ mod tests {
             path_eq(&prev, &y),
             "前の兄弟の最深子孫まで降りる, got {:?}",
             prev
+        );
+    }
+
+    /// Ctrl+PageDown 用の sibling 移動は DFS と違い、子へ潜らず同じ親の次だけを見る。
+    #[test]
+    fn next_sibling_folder_stays_at_same_depth() {
+        let (_temp, nodes) = build_seven_node_tree();
+        let [_root, a, _a1, _a2, b, c, c1] = &nodes;
+
+        let next = next_sibling_folder(a, FolderTreeOptions::default()).expect("a next sibling");
+        assert!(path_eq(&next, b), "a の次兄弟は b, got {:?}", next);
+
+        let next = next_sibling_folder(b, FolderTreeOptions::default()).expect("b next sibling");
+        assert!(path_eq(&next, c), "b の次兄弟は c, got {:?}", next);
+
+        assert!(
+            next_sibling_folder(c, FolderTreeOptions::default()).is_none(),
+            "最後の兄弟 c の次は無い"
+        );
+        assert!(
+            next_sibling_folder(c1, FolderTreeOptions::default()).is_none(),
+            "深い末端 c1 から祖先の次兄弟へは出ない"
+        );
+    }
+
+    /// Ctrl+PageUp 用の sibling 移動は、前兄弟の最深子孫へ潜らず兄弟自身を返す。
+    #[test]
+    fn prev_sibling_folder_does_not_descend_into_previous_branch() {
+        let (_temp, nodes) = build_seven_node_tree();
+        let [_root, a, _a1, _a2, b, c, _c1] = &nodes;
+
+        let prev = prev_sibling_folder(c, FolderTreeOptions::default()).expect("c prev sibling");
+        assert!(path_eq(&prev, b), "c の前兄弟は b, got {:?}", prev);
+
+        let prev = prev_sibling_folder(b, FolderTreeOptions::default()).expect("b prev sibling");
+        assert!(path_eq(&prev, a), "b の前兄弟は a, got {:?}", prev);
+
+        assert!(
+            prev_sibling_folder(a, FolderTreeOptions::default()).is_none(),
+            "最初の兄弟 a の前は無い"
         );
     }
 }

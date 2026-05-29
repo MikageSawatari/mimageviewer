@@ -40,9 +40,13 @@ pub(crate) type NotifyQueue = (Mutex<Vec<LoadRequest>>, Condvar);
 pub(crate) enum FolderNavMode {
     /// 通常グリッド。DFS 結果をそのまま `load_folder` する。
     Grid,
+    /// 通常グリッド。現在地と同じ親の前後兄弟だけを対象にする。
+    SiblingGrid,
     /// フルスクリーン表示中。DFS 結果で `load_folder` 後、先頭の画像系
     /// アイテムを `open_fullscreen` で再表示する。
     Fullscreen,
+    /// フルスクリーン表示中。現在地と同じ親の前後兄弟だけを対象にする。
+    SiblingFullscreen,
     /// お気に入り検索コンテキスト。DFS 結果が root 配下なら `nav_stack` に積んで
     /// `load_folder`、root 外なら `favsearch_navigate_sibling` にフォールバックする。
     /// `fullscreen=true` のときは移動後に先頭の画像系アイテムを再度フルスクリーンで開く。
@@ -706,10 +710,19 @@ impl FolderNavMode {
     pub fn perf_tag(&self) -> &'static str {
         match self {
             FolderNavMode::Grid => "grid",
+            FolderNavMode::SiblingGrid => "grid_sibling",
             FolderNavMode::Fullscreen => "fullscreen",
+            FolderNavMode::SiblingFullscreen => "fullscreen_sibling",
             FolderNavMode::Favsearch { .. } => "favsearch",
             FolderNavMode::SlideshowNext => "slideshow_next",
         }
+    }
+
+    pub fn sibling_only(&self) -> bool {
+        matches!(
+            self,
+            FolderNavMode::SiblingGrid | FolderNavMode::SiblingFullscreen
+        )
     }
 }
 
@@ -718,7 +731,9 @@ impl FolderNavMode {
 fn folder_nav_mode_same_kind(a: &FolderNavMode, b: &FolderNavMode) -> bool {
     match (a, b) {
         (FolderNavMode::Grid, FolderNavMode::Grid)
-        | (FolderNavMode::Fullscreen, FolderNavMode::Fullscreen) => true,
+        | (FolderNavMode::SiblingGrid, FolderNavMode::SiblingGrid)
+        | (FolderNavMode::Fullscreen, FolderNavMode::Fullscreen)
+        | (FolderNavMode::SiblingFullscreen, FolderNavMode::SiblingFullscreen) => true,
         (
             FolderNavMode::Favsearch {
                 root: a_root,
@@ -737,7 +752,8 @@ use eframe::egui;
 
 use crate::folder_tree::{
     SUPPORTED_VIDEO_EXTENSIONS, folder_has_still_image, folder_should_stop, is_apple_double,
-    navigate_folder_with_skip, next_folder_dfs, prev_folder_dfs, walk_dirs_recursive,
+    navigate_folder_with_skip, next_folder_dfs, next_sibling_folder, prev_folder_dfs,
+    prev_sibling_folder, walk_dirs_recursive,
 };
 
 // キャッシュキー定数は thumb_loader.rs に定義 (ベンチマーク bin からも参照するため)
@@ -11662,7 +11678,7 @@ impl App {
         )
     }
 
-    fn handle_keyboard(&mut self, ctx: &egui::Context) -> Option<PathBuf> {
+    fn handle_keyboard(&mut self, ctx: &egui::Context) -> Option<crate::ui_main::AddressBarNav> {
         // マウスドライバ / AHK 経由で積まれた進む/戻る pending を early-return より前に
         // drain する。検索バー / ダイアログ / IME 変換中などショートカットを止める分岐で
         // 早期 return しても、ブロック中の pending は今フレームで破棄したい
@@ -11718,6 +11734,15 @@ impl App {
                 _ => false,
             })
         });
+        let alt_held = ctx.input(|i| {
+            if i.modifiers.alt {
+                return true;
+            }
+            i.events.iter().any(|e| match e {
+                egui::Event::Key { modifiers, .. } => modifiers.alt,
+                _ => false,
+            })
+        });
 
         let (
             right,
@@ -11769,6 +11794,11 @@ impl App {
         // 経由) も Ctrl+↑/↓ と等価に扱う。
         let ctrl_up = (ctrl_held && up) || mouse_back || browser_back;
         let ctrl_down = (ctrl_held && down) || mouse_forward || browser_forward;
+        let ctrl_page_up = ctrl_held && page_up;
+        let ctrl_page_down = ctrl_held && page_down;
+        let alt_up = alt_held && up && !ctrl_held;
+        let alt_left = alt_held && left && !ctrl_held;
+        let alt_right = alt_held && right && !ctrl_held;
 
         // Ctrl+G の DrilledInto で drill-back する手段は BS (↓で始まる通常ハンドラ)
         // と検索バーの ← ボタンに限定する。
@@ -11815,21 +11845,21 @@ impl App {
 
             // visible_indices 上で移動し、raw index に変換
             // Ctrl+矢印はフォルダ移動に使うので、通常カーソル移動から除外
-            let new_vis_pos = if right && !ctrl_held {
+            let new_vis_pos = if right && !ctrl_held && !alt_held {
                 Some((vis_pos + 1).min(vi_len - 1))
-            } else if left && !ctrl_held {
+            } else if left && !ctrl_held && !alt_held {
                 Some(vis_pos.saturating_sub(1))
-            } else if down && !ctrl_down {
+            } else if down && !ctrl_down && !alt_held {
                 Some((vis_pos + cols).min(vi_len - 1))
-            } else if up && !ctrl_up {
+            } else if up && !ctrl_up && !alt_held {
                 Some(vis_pos.saturating_sub(cols))
             } else if home {
                 Some(0)
             } else if end {
                 Some(vi_len - 1)
-            } else if page_down {
+            } else if page_down && !ctrl_page_down {
                 Some((vis_pos + page_items).min(vi_len - 1))
-            } else if page_up {
+            } else if page_up && !ctrl_page_up {
                 Some(vis_pos.saturating_sub(page_items))
             } else {
                 None
@@ -11988,7 +12018,7 @@ impl App {
                         | Some(GridItem::PdfFile(p)) => {
                             let p = p.clone();
                             self.maybe_suppress_rating_filter_for_opened_container(idx);
-                            return Some(p);
+                            return Some(crate::ui_main::AddressBarNav::Direct(p));
                         }
                         Some(GridItem::Video(p)) if shift_enter => {
                             crate::ui_helpers::open_external_player(p);
@@ -12039,7 +12069,7 @@ impl App {
 
         // BS: 親フォルダへ (検索中はスタックを戻る)
         // Ctrl+BS は個別補正の解除に使うので除外する
-        if backspace && !ctrl_held {
+        if (backspace && !ctrl_held) || alt_up {
             // Ctrl+G 絞り込みビュー中なら 1 段上げる (current_path != container_root) か、
             // Aggregated に戻る。自由な fs 遡行は許さない (docs §10.3)。
             if self.global_search.active {
@@ -12065,9 +12095,18 @@ impl App {
                         .file_name()
                         .and_then(|n| n.to_str())
                         .map(|s| s.to_string());
-                    return Some(parent.to_path_buf());
+                    return Some(crate::ui_main::AddressBarNav::Direct(parent.to_path_buf()));
                 }
             }
+        }
+
+        let history_shortcut_allowed =
+            !self.global_search.active && !self.favsearch.active && !self.show_search_bar;
+        if alt_left && history_shortcut_allowed {
+            return Some(crate::ui_main::AddressBarNav::HistoryBack);
+        }
+        if alt_right && history_shortcut_allowed {
+            return Some(crate::ui_main::AddressBarNav::HistoryForward);
         }
 
         // Ctrl+↓: 深さ優先で次のフォルダへ（画像なしはスキップ）
@@ -12111,6 +12150,29 @@ impl App {
                 self.favsearch_ctrl_nav(false);
             } else if let Some(cur) = self.effective_folder() {
                 self.start_folder_nav(cur, false, FolderNavMode::Grid);
+            }
+        }
+
+        // Ctrl+PageDown / Ctrl+PageUp: 同じ親を持つ次 / 前の兄弟フォルダへ。
+        // PageUp/PageDown 単体は一覧のページ移動なので、Ctrl 付きだけをここで扱う。
+        if ctrl_page_down {
+            self.bump_input_seq("grid_sibling_nav", Some("forward"));
+            if in_global_search || in_favsearch {
+                // 検索ビューは仮想階層なので、実ファイルシステムの兄弟移動は行わない。
+            } else if in_local_search {
+                self.cancel_pending_folder_nav();
+            } else if let Some(cur) = self.effective_folder() {
+                self.start_folder_nav(cur, true, FolderNavMode::SiblingGrid);
+            }
+        }
+        if ctrl_page_up {
+            self.bump_input_seq("grid_sibling_nav", Some("backward"));
+            if in_global_search || in_favsearch {
+                // 同上。
+            } else if in_local_search {
+                self.cancel_pending_folder_nav();
+            } else if let Some(cur) = self.effective_folder() {
+                self.start_folder_nav(cur, false, FolderNavMode::SiblingGrid);
             }
         }
 
@@ -12195,6 +12257,7 @@ impl App {
         // 1 回のキー押下で起きた DFS バーストを 1 つの seq でまとめて追える。
         let perf_seq = self.input_seq;
         let perf_mode = mode.perf_tag();
+        let sibling_only = mode.sibling_only();
         // スライドショー NextFolder だけは判定述語を「静止画あり」にして、動画のみ /
         // 画像なしフォルダを skip-walk で飛ばす。手動 Ctrl+↑↓ 等は従来どおり動画込み。
         let should_stop: fn(&std::path::Path, Option<&AtomicBool>) -> bool =
@@ -12227,7 +12290,13 @@ impl App {
             let outcome = if forward {
                 navigate_folder_with_skip(
                     &current,
-                    |p| next_folder_dfs(p, tree_opts),
+                    |p| {
+                        if sibling_only {
+                            next_sibling_folder(p, tree_opts)
+                        } else {
+                            next_folder_dfs(p, tree_opts)
+                        }
+                    },
                     should_stop,
                     skip_limit,
                     Some(&cancel_w),
@@ -12235,7 +12304,13 @@ impl App {
             } else {
                 navigate_folder_with_skip(
                     &current,
-                    |p| prev_folder_dfs(p, tree_opts),
+                    |p| {
+                        if sibling_only {
+                            prev_sibling_folder(p, tree_opts)
+                        } else {
+                            prev_folder_dfs(p, tree_opts)
+                        }
+                    },
                     should_stop,
                     skip_limit,
                     Some(&cancel_w),
@@ -12493,6 +12568,31 @@ impl App {
         let Some(path) = result.path else {
             // DFS が尽きた (forward で末尾、backward で先頭に達した等)
             match result.mode {
+                FolderNavMode::SiblingGrid => {
+                    self.show_feedback_toast(if result.forward {
+                        "次の兄弟フォルダはありません".to_string()
+                    } else {
+                        "前の兄弟フォルダはありません".to_string()
+                    });
+                    self.clear_pending_folder_nav_steps();
+                    self.release_fs_nav_lock();
+                }
+                FolderNavMode::SiblingFullscreen => {
+                    let hint = crate::ui_fullscreen::FsBoundaryHint::NoSiblingFolder {
+                        forward: result.forward,
+                        at: std::time::Instant::now(),
+                    };
+                    self.fs_boundary_hint = Some(hint);
+                    #[cfg(windows)]
+                    if self.native_video_fullscreen_active_for_main_backdrop() {
+                        self.show_native_video_overlay_toast(
+                            Self::native_boundary_hint_text(hint),
+                            true,
+                        );
+                    }
+                    self.clear_pending_folder_nav_steps();
+                    self.release_fs_nav_lock();
+                }
                 FolderNavMode::Favsearch { fullscreen, .. } => {
                     // favsearch では DFS 尽きた場合は検索結果の前後アイテムへ
                     let delta: isize = if result.forward { 1 } else { -1 };
@@ -12608,13 +12708,30 @@ impl App {
             emit_end(apply_t0, apply_seq, apply_mode_tag, "fs_boundary");
             return;
         }
+        if matches!(result.mode, FolderNavMode::SiblingFullscreen) && !result.hit_image_folder {
+            let hint = crate::ui_fullscreen::FsBoundaryHint::NoSiblingImageFolder {
+                forward: result.forward,
+                at: std::time::Instant::now(),
+            };
+            self.fs_boundary_hint = Some(hint);
+            #[cfg(windows)]
+            if self.native_video_fullscreen_active_for_main_backdrop() {
+                self.show_native_video_overlay_toast(Self::native_boundary_hint_text(hint), true);
+            }
+            self.clear_pending_folder_nav_steps();
+            self.release_fs_nav_lock();
+            emit_end(apply_t0, apply_seq, apply_mode_tag, "fs_sibling_boundary");
+            return;
+        }
         // DFS スレッドで事前スキャン済みなら UI スレッドの read_dir を省ける。
         let scanned = result.scanned;
         match result.mode {
-            FolderNavMode::Grid => {
+            FolderNavMode::Grid | FolderNavMode::SiblingGrid => {
                 self.load_folder_with_scan(path, scanned);
             }
-            FolderNavMode::Fullscreen | FolderNavMode::SlideshowNext => {
+            FolderNavMode::Fullscreen
+            | FolderNavMode::SiblingFullscreen
+            | FolderNavMode::SlideshowNext => {
                 let resume_slideshow = matches!(result.mode, FolderNavMode::SlideshowNext);
                 #[cfg(windows)]
                 let restore_video_tile = self.video_tile_mode_active;
@@ -15886,6 +16003,7 @@ impl App {
             if matches!(
                 pending.mode,
                 FolderNavMode::Fullscreen
+                    | FolderNavMode::SiblingFullscreen
                     | FolderNavMode::Favsearch {
                         fullscreen: true,
                         ..
@@ -22872,11 +22990,11 @@ impl eframe::App for App {
             }
         } else {
             // folder_nav が未完了 or 他の高優先 nav 源が勝ったケース
-            let higher_priority_nav = fav_nav.or(toolbar_fav_nav).or(keyboard_nav);
+            let higher_priority_direct_nav = fav_nav.or(toolbar_fav_nav);
             let mut history_nav_rollback = None;
-            let navigate = if higher_priority_nav.is_some() {
-                higher_priority_nav
-            } else if let Some(nav) = address_nav {
+            let navigate = if higher_priority_direct_nav.is_some() {
+                higher_priority_direct_nav
+            } else if let Some(nav) = keyboard_nav.or(address_nav) {
                 match nav {
                     crate::ui_main::AddressBarNav::Direct(path) => Some(path),
                     crate::ui_main::AddressBarNav::HistoryBack => {

@@ -12,6 +12,7 @@
 | --- | --- |
 | アイテム移動 | 現在の `visible_indices` 内で、前後の表示対象へ移動する操作。フルスクリーンではホイール / ↑↓、画像では ←→ も含む |
 | フォルダ横断 | `folder_tree` の DFS 前順で前後のフォルダ / ZIP / PDF を探す操作。通常コンテキストでは Ctrl+↑↓ |
+| 兄弟フォルダ移動 | 現在地と同じ親を持つ前後フォルダ / ZIP / PDF だけを探す操作。通常コンテキストでは Ctrl+PageUp/PageDown |
 | 検索スコープ移動 | Ctrl+S / Ctrl+G の検索結果範囲から外に出ない前後移動 |
 | 境界ヒント | 先頭 / 末尾に達したとき、次に使える操作を中央または native overlay に出す案内 |
 
@@ -27,6 +28,7 @@
 | 状態 | Ctrl+↑↓ | 境界案内 |
 | --- | --- | --- |
 | 通常グリッド | `FolderNavMode::Grid` で DFS。画像 / 動画を含む通常フォルダ、画像入り ZIP、PDF が停止対象 | なし |
+| 通常グリッド | `FolderNavMode::SiblingGrid` で兄弟限定移動。最後の兄弟を越えた場合は右上トースト | 「次/前の兄弟フォルダはありません」 |
 | Ctrl+F ローカル検索中 | `visible_indices` は Ctrl+F で絞られる。Ctrl+↑↓ は no-op。検索バーにフォーカスがある間はショートカットをブロック | 必要なら no-op toast |
 
 Ctrl+F は「現在一覧に対するフィルタ」。フォーカスが検索バーから外れていても
@@ -39,7 +41,9 @@ Ctrl+↑↓ でフォルダ横断しない。
 | ホイール / ↑↓ / 画像の ←→ | `visible_indices` 内の前後アイテムへ移動 |
 | 同一一覧の先頭 / 末尾 | `FsBoundaryHint::Edge` を中央表示し、Home / End と Ctrl+↑↓ を案内。文言は「項目」表現 |
 | Ctrl+↑↓ | `FolderNavMode::Fullscreen` で DFS。現在は前後どちらの方向でも移動先フォルダの先頭 image-like に着地する |
+| Ctrl+PageUp/PageDown | `FolderNavMode::SiblingFullscreen` で同じ親の前後兄弟へ移動し、移動先の先頭 image-like に着地する |
 | 移動先に画像 / 動画が見つからない | `FsBoundaryHint::NoImageFolder` を表示 |
+| 兄弟が無い / 兄弟に画像・動画が無い | `FsBoundaryHint::NoSiblingFolder` / `NoSiblingImageFolder` を表示 |
 | Ctrl+G DrilledInto 中の Ctrl+↑↓ | `global_search_ctrl_nav_fullscreen` で検索結果スコープ内を移動し、先頭 / 末尾で `SearchEnd` を表示。移動先は方向に関わらず先頭 image-like |
 
 注意: 以前の docs には「Ctrl+↑ は前フォルダの末尾画像へ」と書かれていたが、現在の実装は「方向に関わらず移動先の先頭」。
@@ -54,6 +58,7 @@ Windows の現行動画フルスクリーンは native presenter 経路。
 | ←→ | seek。Ctrl+←→ は 30 秒 seek、Shift+←→ は 1 秒 seek。S タイルモード中は seek せずタイルカーソル移動、Ctrl+←→ は 1 行分移動、Enter でカーソル位置から再生 |
 | Shift+↑↓ | 音量を dB フェーダー目盛りの 1/4 幅で上下 |
 | Ctrl+↑↓ | `handle_fullscreen_ctrl_nav_context` 経由で画像系と同じコンテキスト移動 |
+| Ctrl+PageUp/PageDown | `handle_fullscreen_sibling_nav_context` 経由で画像系と同じ兄弟限定移動 |
 | マウス戻る / 進む | native window / HUD 側の XButton を App 側で Ctrl+↑↓ と同じ経路へ接続 |
 | S | 動画タイルモード ON/OFF |
 | S タイルモード中のホイール | 前後アイテムへ移動。移動先も動画なら native presenter を保持して source 差し替え |
@@ -89,6 +94,7 @@ Ctrl+S / Ctrl+G はフルスクリーン側でも専用スコープを維持す�
 | ←→ | 前後アイテム | seek | 動画プレイヤー慣例として差異を許容 |
 | Shift+↑↓ | 前後アイテム | 音量 | 動画プレイヤー慣例として差異を許容 |
 | Ctrl+↑↓ | 現在コンテキストの前後フォルダ / 前後検索結果 | 同左 | native 動画 / タイルモードでも有効にする |
+| Ctrl+PageUp/PageDown | 前後の兄弟フォルダ | 同左 | 検索中は実フォルダの兄弟概念に戻さず no-op |
 | マウス戻る / 進む | Ctrl+↑↓ と同じ | Ctrl+↑↓ と同じ | native 動画でも同じにする |
 
 Ctrl+↑↓ の「現在コンテキスト」は以下の優先順位で解釈する:
@@ -194,6 +200,7 @@ no-op 案内は段階を分ける:
 - [x] Ctrl+S で結果を開いた後、グリッド / フルスクリーン / 動画の Ctrl+↑↓ が `nav_stack` スコープを維持する。
 - [x] Ctrl+G DrilledInto で、グリッド / フルスクリーン / 動画の Ctrl+↑↓ が検索結果スコープを維持する。
 - [x] Ctrl+G Aggregated / Ctrl+S 結果一覧では no-op でもよいが、必要なら案内を出す。
+- [x] Ctrl+PageUp/PageDown は通常フォルダで兄弟だけを移動し、子や祖先の兄弟へ入らない。検索中は no-op。
 - [x] 検索バー / フルスクリーン / タイルなど scope が変わる操作では pending folder navigation を flush する。
 - [x] 境界文言は画像だけでなく動画も含む表現にする。
 - [x] native overlay はまず toast MVP とし、構造的な中央表示は別段階にする。

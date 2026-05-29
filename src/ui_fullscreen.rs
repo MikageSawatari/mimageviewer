@@ -221,6 +221,8 @@ fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
             | egui::Key::ArrowDown
             | egui::Key::Home
             | egui::Key::End
+            | egui::Key::PageUp
+            | egui::Key::PageDown
             | egui::Key::W
             | egui::Key::Enter
             | egui::Key::Escape
@@ -512,6 +514,16 @@ pub(crate) enum FsBoundaryHint {
         forward: bool,
         at: std::time::Instant,
     },
+    /// Ctrl+PageUp/PageDown の兄弟限定移動で、同じ親に前後の兄弟が無い。
+    NoSiblingFolder {
+        forward: bool,
+        at: std::time::Instant,
+    },
+    /// Ctrl+PageUp/PageDown の兄弟限定移動で、兄弟はあるが画像・動画が見つからない。
+    NoSiblingImageFolder {
+        forward: bool,
+        at: std::time::Instant,
+    },
     /// Ctrl+G 絞り込みビューで、これ以上進める検索結果が無い
     /// (forward=true: 末端, forward=false: 先頭)。
     SearchEnd {
@@ -530,6 +542,7 @@ pub(crate) enum FsBoundaryHint {
 pub(crate) enum FsNavNoOpReason {
     LocalFilterActive,
     SearchResultList,
+    SearchSiblingUnsupported,
 }
 
 impl FsBoundaryHint {
@@ -537,6 +550,8 @@ impl FsBoundaryHint {
         match self {
             FsBoundaryHint::Edge { at, .. }
             | FsBoundaryHint::NoImageFolder { at, .. }
+            | FsBoundaryHint::NoSiblingFolder { at, .. }
+            | FsBoundaryHint::NoSiblingImageFolder { at, .. }
             | FsBoundaryHint::SearchEnd { at, .. }
             | FsBoundaryHint::NavNoOp { at, .. } => *at,
         }
@@ -1070,6 +1085,7 @@ pub(crate) struct FsKeyAction {
     pub(crate) close: bool,
     pub(crate) nav_delta: i32,
     pub(crate) ctrl_nav: Option<i32>,
+    pub(crate) sibling_nav: Option<i32>,
     /// Home/End などの絶対ジャンプ先 item index
     pub(crate) jump_to: Option<usize>,
 }
@@ -1305,6 +1321,7 @@ impl App {
         let mut close_fs = false;
         let mut nav_delta: i32 = 0;
         let mut ctrl_nav: Option<i32> = None;
+        let mut sibling_nav: Option<i32> = None;
         let mut jump_to: Option<usize> = None;
         // 境界ヒント即時消去のため、フレーム先頭の状態を捕捉する。
         // handle_fs_navigation 実行後に、ヒントが同じ start_time のまま残って
@@ -1447,12 +1464,15 @@ impl App {
                         if key_action.close { close_fs = true; }
                         nav_delta = key_action.nav_delta;
                         ctrl_nav = key_action.ctrl_nav;
+                        sibling_nav = key_action.sibling_nav;
                         jump_to = key_action.jump_to;
                         // perf: キー起因のナビはここで input_seq を進める
                         if nav_delta != 0 {
                             self.bump_input_seq("fs_key", Some(&format!("delta={nav_delta}")));
                         } else if ctrl_nav.is_some() {
                             self.bump_input_seq("fs_ctrl_nav", None);
+                        } else if sibling_nav.is_some() {
+                            self.bump_input_seq("fs_sibling_nav", None);
                         } else if key_action.close {
                             self.bump_input_seq("fs_close_key", None);
                         }
@@ -2267,7 +2287,15 @@ impl App {
         }
 
         // ── ナビゲーション & スライドショー処理 ──
-        self.handle_fs_navigation(ctx, close_fs, ctrl_nav, nav_delta, jump_to, fs_idx);
+        self.handle_fs_navigation(
+            ctx,
+            close_fs,
+            ctrl_nav,
+            sibling_nav,
+            nav_delta,
+            jump_to,
+            fs_idx,
+        );
 
         // hint_start_before と一致 = このフレームで再設定されていない
         // (= 境界でない方向への移動、別キー入力、等)。操作があれば即消去。
@@ -2951,6 +2979,8 @@ impl App {
             );
         } else if key_action.ctrl_nav.is_some() {
             self.bump_input_seq("fs_root_ctrl_nav", None);
+        } else if key_action.sibling_nav.is_some() {
+            self.bump_input_seq("fs_root_sibling_nav", None);
         } else if key_action.close {
             self.bump_input_seq("fs_root_close_key", None);
         }
@@ -2959,6 +2989,7 @@ impl App {
             ctx,
             key_action.close,
             key_action.ctrl_nav,
+            key_action.sibling_nav,
             key_action.nav_delta,
             key_action.jump_to,
             fs_idx,
@@ -2983,6 +3014,7 @@ impl App {
             close: false,
             nav_delta: 0,
             ctrl_nav: None,
+            sibling_nav: None,
             jump_to: None,
         };
 
@@ -3060,6 +3092,10 @@ impl App {
         // Shift+矢印（スプレッドナビ）にも対応するため、修飾キーを問わず消費
         let ctrl_d = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowDown));
         let ctrl_u = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::ArrowUp));
+        let ctrl_page_down =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageDown));
+        let ctrl_page_up =
+            ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::PageUp));
         // マウス戻る/進む (Extra1/Extra2 = native XButton) を Ctrl+↑/↓ と等価に扱う。
         let mouse_back = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra1));
         let mouse_forward = ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Extra2));
@@ -3697,6 +3733,12 @@ impl App {
         }
         if ctrl_u || mouse_back || browser_back {
             action.ctrl_nav = Some(-1);
+        }
+        if ctrl_page_down {
+            action.sibling_nav = Some(1);
+        }
+        if ctrl_page_up {
+            action.sibling_nav = Some(-1);
         }
 
         if key_home {
@@ -4563,6 +4605,45 @@ impl App {
         }
     }
 
+    pub(crate) fn handle_fullscreen_sibling_nav_context(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+        forward: bool,
+        native_toast: bool,
+    ) {
+        if self.fs_nav_is_locked() {
+            return;
+        }
+        self.slideshow_playing = false;
+        self.slideshow_anchor_idx = None;
+        #[cfg(windows)]
+        {
+            self.native_video_deferred_nav_delta = None;
+        }
+
+        if self.global_search.active || self.favsearch.active {
+            self.cancel_pending_folder_nav();
+            self.show_fullscreen_nav_noop(
+                ctx,
+                FsNavNoOpReason::SearchSiblingUnsupported,
+                native_toast,
+            );
+            return;
+        }
+
+        if self.show_search_bar {
+            self.cancel_pending_folder_nav();
+            self.show_fullscreen_nav_noop(ctx, FsNavNoOpReason::LocalFilterActive, native_toast);
+            return;
+        }
+
+        if let Some(cur) = self.current_folder.clone() {
+            self.capture_fs_nav_holdover(fs_idx);
+            self.start_folder_nav(cur, forward, crate::app::FolderNavMode::SiblingFullscreen);
+        }
+    }
+
     fn show_fullscreen_nav_noop(
         &mut self,
         ctx: &egui::Context,
@@ -4589,6 +4670,7 @@ impl App {
         match reason {
             FsNavNoOpReason::LocalFilterActive => "Ctrl+F検索中はフォルダ移動しません",
             FsNavNoOpReason::SearchResultList => "検索結果を開いてからCtrl+↑↓で移動できます",
+            FsNavNoOpReason::SearchSiblingUnsupported => "検索中は兄弟フォルダ移動しません",
         }
     }
 
@@ -4598,6 +4680,7 @@ impl App {
         ctx: &egui::Context,
         close_fs: bool,
         ctrl_nav: Option<i32>,
+        sibling_nav: Option<i32>,
         nav_delta: i32,
         jump_to: Option<usize>,
         fs_idx: usize,
@@ -4630,6 +4713,8 @@ impl App {
         // `apply_folder_nav_result` (FolderNavMode::Fullscreen ブランチ) に任せる。
         if let Some(delta) = ctrl_nav {
             self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, delta > 0, false);
+        } else if let Some(delta) = sibling_nav {
+            self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, delta > 0, false);
         } else if !close_fs {
             if let Some(new_idx) = jump_to {
                 self.open_fullscreen_from_fs_navigation(ctx, new_idx);
@@ -7782,6 +7867,8 @@ impl App {
         let duration = match hint {
             FsBoundaryHint::Edge { .. } => BOUNDARY_HINT_DURATION,
             FsBoundaryHint::NoImageFolder { .. } => NO_IMAGE_FOLDER_HINT_DURATION,
+            FsBoundaryHint::NoSiblingFolder { .. } => NO_IMAGE_FOLDER_HINT_DURATION,
+            FsBoundaryHint::NoSiblingImageFolder { .. } => NO_IMAGE_FOLDER_HINT_DURATION,
             FsBoundaryHint::SearchEnd { .. } => NO_IMAGE_FOLDER_HINT_DURATION,
             FsBoundaryHint::NavNoOp { .. } => BOUNDARY_HINT_DURATION,
         };
@@ -7820,6 +7907,22 @@ impl App {
                     "[Ctrl]+[↑] で空フォルダを越えて移動できます",
                 ],
             ),
+            FsBoundaryHint::NoSiblingFolder { forward: true, .. } => (
+                "次の兄弟フォルダはありません",
+                vec!["[Alt]+[↑] 親フォルダへ", "[Ctrl]+[↓] ツリー順で次へ"],
+            ),
+            FsBoundaryHint::NoSiblingFolder { forward: false, .. } => (
+                "前の兄弟フォルダはありません",
+                vec!["[Alt]+[↑] 親フォルダへ", "[Ctrl]+[↑] ツリー順で前へ"],
+            ),
+            FsBoundaryHint::NoSiblingImageFolder { forward: true, .. } => (
+                "次の兄弟フォルダに画像・動画が見つかりません",
+                vec!["[Esc] でサムネイル一覧に戻ります"],
+            ),
+            FsBoundaryHint::NoSiblingImageFolder { forward: false, .. } => (
+                "前の兄弟フォルダに画像・動画が見つかりません",
+                vec!["[Esc] でサムネイル一覧に戻ります"],
+            ),
             FsBoundaryHint::SearchEnd { forward: true, .. } => (
                 "最後の検索結果です",
                 vec!["[Esc] で検索を閉じると", "通常のフォルダ移動に戻ります"],
@@ -7841,6 +7944,13 @@ impl App {
             } => (
                 Self::nav_noop_title(FsNavNoOpReason::SearchResultList),
                 vec!["結果を開くと検索スコープ内で移動できます"],
+            ),
+            FsBoundaryHint::NavNoOp {
+                reason: FsNavNoOpReason::SearchSiblingUnsupported,
+                ..
+            } => (
+                Self::nav_noop_title(FsNavNoOpReason::SearchSiblingUnsupported),
+                vec!["検索を閉じると通常フォルダで移動できます"],
             ),
         };
 

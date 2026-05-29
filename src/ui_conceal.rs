@@ -432,6 +432,7 @@ impl App {
             close: false,
             nav_delta: 0,
             ctrl_nav: None,
+            sibling_nav: None,
             jump_to: None,
         };
 

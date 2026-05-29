@@ -13,8 +13,11 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | キー | 動作 |
 |---|---|
 | <kbd>Backspace</kbd> | 親フォルダへ。検索 (Ctrl+S / Ctrl+G) 中は検索仮想階層を 1 段ドリルアップ、最上位 (集約ビュー / 結果一覧) では no-op (検索を閉じるには <kbd>Esc</kbd> / 検索バーの <kbd>×</kbd> / <kbd>Ctrl</kbd>+<kbd>G</kbd>・<kbd>Ctrl</kbd>+<kbd>S</kbd> 再押下) |
+| <kbd>Alt</kbd>+<kbd>↑</kbd> | 親フォルダへ (<kbd>Backspace</kbd> と同じ。Explorer 慣習に合わせた代替ショートカット) |
+| <kbd>Alt</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | フォルダ履歴を戻る / 進む (フォルダバーの ←/→ と同じ。検索中は無効) |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> | ツリー順で前のフォルダへ (DFS pre-order、画像なしフォルダは skip_limit までスキップ)。検索中は前のヒットフォルダへ移動 (`global_search_ctrl_nav` / `favsearch_ctrl_nav`) |
 | <kbd>Ctrl</kbd>+<kbd>↓</kbd> | ツリー順で次のフォルダへ (DFS pre-order)。検索中は次のヒットフォルダへ移動 |
+| <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ。同じ親の直下だけを対象にし、子や祖先の兄弟には入らない。検索中は無効 |
 | <kbd>F1</kbd>〜<kbd>F5</kbd> | レーティング 1〜5 |
 | <kbd>F6</kbd> | レーティング解除 |
 | <kbd>P</kbd> | 選択中アイテムを現在のコンテナの代表サムネに固定 / 解除 (toggle、フォルダバー 📌 の左クリックと同等)。pin 不能アイテム / 検索アグリゲート / 変換キャッシュ drill-down では silent no-op。**動画フルスクリーンの P と合わせて P = Pin に統一** |
@@ -30,6 +33,7 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | <kbd>I</kbd> / <kbd>Tab</kbd> | メタデータパネル固定表示トグル (右パネル) |
 | <kbd>Space</kbd> | (画像) 選択 (チェック) トグル — スライドショー再生中なら停止 / (動画) 再生・一時停止トグル |
 | <kbd>Backspace</kbd> | 親フォルダへ → グリッドビュー |
+| <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ。同じ親の直下だけを対象にし、フルスクリーンを維持して移動先の先頭 image-like を開く |
 | マウスホイール | 前 / 次のファイル |
 | マウス左クリック | (画像) ページめくり / (動画) 再生・一時停止トグル |
 | <kbd>Shift</kbd>+<kbd>←</kbd> / <kbd>→</kbd> | 見開きの場合の左右進行 (動画では下記参照) |
@@ -123,6 +127,7 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | <kbd>↑</kbd> / <kbd>↓</kbd> | **前 / 次のファイル** (画像と同じ、マウスホイールと同じ) | Phase 7.H |
 | <kbd>Shift</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 音量を dB フェーダー目盛りの 1/4 幅で上下 | |
 | <kbd>Ctrl</kbd>+<kbd>↑</kbd> / <kbd>↓</kbd> | 現在コンテキストの前 / 次フォルダまたは検索結果へ移動 | native presenter 経路でも有効 |
+| <kbd>Ctrl</kbd>+<kbd>PageUp</kbd> / <kbd>PageDown</kbd> | 前 / 次の兄弟フォルダへ | 同じ親の直下だけを対象にする。検索中は無効 |
 | <kbd>M</kbd> | ミュート トグル | |
 | <kbd>L</kbd> | ループ再生 トグル | 連続再生 ON 中は無効化し、「連続再生中はループ無効」を表示 |
 | <kbd>B</kbd> | ブックマーク追加 (現在位置 🔖) | |

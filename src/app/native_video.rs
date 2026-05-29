@@ -4542,6 +4542,13 @@ impl App {
             0x28 if key.ctrl && !key.shift => {
                 self.handle_fullscreen_ctrl_nav_context(ctx, fs_idx, true, true);
             }
+            // Ctrl+PageUp / PageDown: move to the previous / next sibling folder.
+            0x21 if key.ctrl && !key.shift => {
+                self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, false, true);
+            }
+            0x22 if key.ctrl && !key.shift => {
+                self.handle_fullscreen_sibling_nav_context(ctx, fs_idx, true, true);
+            }
             // VK_BROWSER_BACK / VK_BROWSER_FORWARD: マウス進む/戻るボタンが Browser_Back/Forward
             // keystroke として届くケース (mouse driver や AutoHotkey が変換する経路)、または
             // 上で WM_APPCOMMAND を合成 KeyDown に変換した経路。Ctrl+↑/↓ と同じ DFS ナビと
@@ -4988,6 +4995,20 @@ impl App {
                     "次の画像・動画フォルダが見つかりません".to_string()
                 } else {
                     "前の画像・動画フォルダが見つかりません".to_string()
+                }
+            }
+            crate::ui_fullscreen::FsBoundaryHint::NoSiblingFolder { forward, .. } => {
+                if forward {
+                    "次の兄弟フォルダはありません".to_string()
+                } else {
+                    "前の兄弟フォルダはありません".to_string()
+                }
+            }
+            crate::ui_fullscreen::FsBoundaryHint::NoSiblingImageFolder { forward, .. } => {
+                if forward {
+                    "次の兄弟フォルダに画像・動画が見つかりません".to_string()
+                } else {
+                    "前の兄弟フォルダに画像・動画が見つかりません".to_string()
                 }
             }
             crate::ui_fullscreen::FsBoundaryHint::SearchEnd { forward, .. } => {
