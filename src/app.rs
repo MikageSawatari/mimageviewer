@@ -2658,7 +2658,7 @@ pub struct App {
     /// 見開きモード描画後のページ矩形。ルーペ描画がカーソル位置から該当ページを
     /// 特定するのに使う。毎フレーム描画後に更新、非見開き時は None。
     pub(crate) fs_spread_layout: Option<crate::ui_fullscreen::FsSpreadLayout>,
-    /// 透過画像の背景サイクル (B キー): 0=テーマ既定 / 1=白 / 2=黒 / 3=市松
+    /// 透過画像の背景サイクル (B キー): 0=黒 / 1=白 / 2=市松
     /// 画像切替時にリセット。永続化しない。
     pub(crate) fs_transparent_bg_mode: u8,
     /// 16×16 の市松テクスチャ (Wrap=Repeat)。最初に B キーで市松にしたとき lazy init。
@@ -16138,6 +16138,65 @@ impl App {
         }
     }
 
+    /// fs_cache の Static 元画像が透過 (alpha<255) を含むか。
+    pub(crate) fn fs_static_has_alpha(&self, idx: usize) -> bool {
+        match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { pixels, .. }) => pixels.pixels.iter().any(|p| p.a() < 255),
+            _ => false,
+        }
+    }
+
+    /// 消しゴム用の AI 背景モード。
+    ///
+    /// 透過画像の消しゴムは黒固定の不透明ベースに統一しているため、B キーで白背景を
+    /// 選んでいても composite-first AI cache は bg=0 を使う。これにより白背景が
+    /// `erase_base_cache` / MI-GAN 入力へ混ざるのを防ぐ。
+    pub(crate) fn erase_upscale_bg_mode(&self, idx: usize) -> u8 {
+        if self.ai_upscale_enabled && self.fs_static_has_alpha(idx) {
+            0
+        } else {
+            self.effective_upscale_bg_mode()
+        }
+    }
+
+    /// 消しゴム入力用に必要なら黒で不透明化する。
+    pub(crate) fn black_flatten_erase_source_if_needed(
+        &self,
+        idx: usize,
+        pixels: Arc<egui::ColorImage>,
+    ) -> Arc<egui::ColorImage> {
+        if self.fs_static_has_alpha(idx) || pixels.pixels.iter().any(|p| p.a() < 255) {
+            match Self::black_flatten_if_transparent(&pixels) {
+                Some(flat) => Arc::new(flat),
+                None => pixels,
+            }
+        } else {
+            pixels
+        }
+    }
+
+    /// 消しゴム入力用の補正適用。通常の表示パイプラインと同じく色調の後に
+    /// post-filter を重ねるが、消しゴム/分析中の bypass では post-filter を飛ばす。
+    pub(crate) fn apply_erase_adjustments_to_source(
+        &self,
+        idx: usize,
+        pixels: Arc<egui::ColorImage>,
+    ) -> Arc<egui::ColorImage> {
+        let params = self.effective_params(idx).clone();
+        let apply_pf =
+            !self.post_filter_bypassed && params.post_filter != crate::adjustment::PostFilter::None;
+        if params.is_color_identity() && !apply_pf {
+            return pixels;
+        }
+        let adjusted = crate::adjustment::apply_adjustments_fast(&pixels, &params);
+        let post_filtered = if apply_pf {
+            crate::post_filter::apply(&adjusted, params.post_filter)
+        } else {
+            adjusted
+        };
+        Arc::new(post_filtered)
+    }
+
     /// 指定 idx の AI アップスケールキャッシュ・pending・failed を全 bg バリアント分まとめて削除する。
     /// pending はキャンセルトークンも立てる。
     pub(crate) fn purge_upscale_for_idx(&mut self, idx: usize) {
@@ -17287,7 +17346,7 @@ impl App {
             return Some(tex.clone());
         }
         // AI upscale 結果を優先取得 (= 高解像度)。なければ erase_base_cache (= raw 等)。
-        let bg = self.effective_upscale_bg_mode();
+        let bg = self.erase_upscale_bg_mode(idx);
         let ai_pixels = self.ai_upscale_cache.get(&(idx, bg)).and_then(|e| match e {
             FsCacheEntry::Static { pixels, .. } => Some(Arc::clone(pixels)),
             _ => None,
@@ -17296,17 +17355,11 @@ impl App {
             Some(p) => p,
             None => self.erase_base_cache.get(&idx)?.clone(),
         };
-        let params = self.effective_params(idx).clone();
-        // 色補正が identity (= 何も変えない) なら source をそのままテクスチャ化。
-        // post_filter は erase_mode 中バイパスなのでチェック不要。
-        let adjusted: egui::ColorImage = if params.is_color_identity() {
-            (*source_pixels).clone()
-        } else {
-            crate::adjustment::apply_adjustments_fast(&source_pixels, &params)
-        };
+        let source_pixels = self.black_flatten_erase_source_if_needed(idx, source_pixels);
+        let adjusted = self.apply_erase_adjustments_to_source(idx, source_pixels);
         let tex = ctx.load_texture(
             format!("erase_base_display_{idx}"),
-            adjusted,
+            (*adjusted).clone(),
             egui::TextureOptions::LINEAR,
         );
         self.erase_base_tex_cache.insert(idx, tex.clone());

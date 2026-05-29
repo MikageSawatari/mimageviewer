@@ -3104,6 +3104,44 @@ mod favorite_adjustment_defaults_tests {
         assert!(crate::app::App::black_flatten_if_transparent(&opaque).is_none());
     }
 
+    /// 透過画像の消しゴムは B キーの白背景に引きずられず、AI composite-first cache も
+    /// 黒背景 (bg=0) を使う。白背景に焼き込まれた `(idx,1)` を消しゴム入力にしないための
+    /// 回帰ガード。
+    #[test]
+    fn erase_upscale_bg_mode_forces_black_for_transparent_source() {
+        use egui::Color32;
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, "c:/p/alpha.png");
+        let tex = ctx.load_texture(
+            "transparent_source",
+            egui::ColorImage::filled([1, 1], Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        let pixels = egui::ColorImage::new(
+            [2, 1],
+            vec![Color32::TRANSPARENT, Color32::from_rgb(10, 20, 30)],
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex,
+                pixels: std::sync::Arc::new(pixels),
+                source_dims: None,
+                load_seq: 0,
+            },
+        );
+        app.ai_upscale_enabled = true;
+        app.fs_transparent_bg_mode = 1; // B キーで白背景
+
+        assert_eq!(app.effective_upscale_bg_mode(), 1, "通常表示は白背景 bg=1");
+        assert_eq!(
+            app.erase_upscale_bg_mode(idx),
+            0,
+            "透過画像の消しゴム入力は黒背景 bg=0 に固定"
+        );
+    }
+
     /// 単一ページから入った場合 (= erase_spread_ctx が None) は spread_mode を
     /// 触らずに reset すること。誤って Single に書き換えないことの回帰ガード。
     #[test]

@@ -2392,31 +2392,82 @@ impl App {
     // ── Inpaint 実行 ──────────────────────────────────────────────
 
     /// 消しゴム確定結果の入力になる、pre-erase の表示ピクセルを取得する。
-    /// 優先順位は `adjustment_cache > ai_upscale_cache > fs_cache`。
+    /// 通常は `adjustment_cache > ai_upscale_cache > fs_cache`。透過元画像だけは
+    /// 黒固定の作業ベースを守るため `adjustment_cache` を再利用せず、bg=0 の
+    /// AI / raw を黒不透明化してから補正を掛け直す。
     fn resolve_erase_input_pixels(&self, fs_idx: usize) -> Option<Arc<egui::ColorImage>> {
-        let raw = self.resolve_erase_input_pixels_raw(fs_idx)?;
-        // 透明画像は黒で不透明化して MI-GAN に渡す (alpha 非対応。enter_erase_mode と統一し、
-        // apply / auto-apply / ensure-result の全入力経路で黒不透明に揃える)。
-        Some(match Self::black_flatten_if_transparent(&raw) {
-            Some(flat) => Arc::new(flat),
-            None => raw,
-        })
+        self.resolve_erase_input_pixels_matching(fs_idx, None)
+            .map(|(pixels, _)| pixels)
     }
 
-    fn resolve_erase_input_pixels_raw(&self, fs_idx: usize) -> Option<Arc<egui::ColorImage>> {
-        if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx) {
-            return Some(Arc::clone(pixels));
-        }
-        let bg = self.effective_upscale_bg_mode();
-        if self.ai_will_apply_to(fs_idx)
-            && let Some(FsCacheEntry::Static { pixels, .. }) =
-                self.ai_upscale_cache.get(&(fs_idx, bg))
-        {
-            return Some(Arc::clone(pixels));
-        }
-        match self.fs_cache.get(&fs_idx) {
-            Some(FsCacheEntry::Static { pixels, .. }) => Some(Arc::clone(pixels)),
-            _ => None,
+    fn resolve_erase_input_pixels_matching(
+        &self,
+        fs_idx: usize,
+        expected_size: Option<[usize; 2]>,
+    ) -> Option<(Arc<egui::ColorImage>, &'static str)> {
+        let size_ok =
+            |pixels: &Arc<egui::ColorImage>| expected_size.map_or(true, |size| pixels.size == size);
+        let force_black = self.fs_static_has_alpha(fs_idx);
+        let mut already_adjusted = false;
+        let mut source_name = "none";
+
+        let source = if !force_black {
+            match self.adjustment_cache.get(&fs_idx) {
+                Some(FsCacheEntry::Static { pixels, .. }) if size_ok(pixels) => {
+                    already_adjusted = true;
+                    source_name = "adjustment";
+                    Some(Arc::clone(pixels))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
+        let source = match source {
+            Some(pixels) => Some(pixels),
+            None => {
+                let bg = self.erase_upscale_bg_mode(fs_idx);
+                let ai_matching = self
+                    .ai_upscale_cache
+                    .get(&(fs_idx, bg))
+                    .and_then(|e| match e {
+                        FsCacheEntry::Static { pixels, .. } if size_ok(pixels) => {
+                            Some(Arc::clone(pixels))
+                        }
+                        _ => None,
+                    });
+                if let Some(pixels) = ai_matching {
+                    source_name = "ai";
+                    Some(pixels)
+                } else if let Some(pixels) = self
+                    .erase_base_cache
+                    .get(&fs_idx)
+                    .filter(|pixels| size_ok(pixels))
+                    .map(Arc::clone)
+                {
+                    source_name = "erase_base";
+                    Some(pixels)
+                } else {
+                    match self.fs_cache.get(&fs_idx) {
+                        Some(FsCacheEntry::Static { pixels, .. }) if size_ok(pixels) => {
+                            source_name = "fs_cache";
+                            Some(Arc::clone(pixels))
+                        }
+                        _ => None,
+                    }
+                }
+            }
+        }?;
+
+        let source = self.black_flatten_erase_source_if_needed(fs_idx, source);
+        if already_adjusted {
+            Some((source, source_name))
+        } else {
+            Some((
+                self.apply_erase_adjustments_to_source(fs_idx, source),
+                source_name,
+            ))
         }
     }
 
@@ -2546,59 +2597,14 @@ impl App {
             _ => return false,
         };
         let [w, h] = self.erase_mask_size;
-        let mut source_name = "none";
-        let mut already_adjusted = false;
-        let source = if let Some(FsCacheEntry::Static { pixels, .. }) =
-            self.adjustment_cache.get(&fs_idx)
-            && pixels.size == [w, h]
-        {
-            source_name = "adjustment";
-            already_adjusted = true;
-            Some(Arc::clone(pixels))
-        } else {
-            let bg = self.effective_upscale_bg_mode();
-            let ai_matching = self
-                .ai_upscale_cache
-                .get(&(fs_idx, bg))
-                .and_then(|e| match e {
-                    FsCacheEntry::Static { pixels, .. } if pixels.size == [w, h] => {
-                        Some(Arc::clone(pixels))
-                    }
-                    _ => None,
-                });
-            if let Some(pixels) = ai_matching {
-                source_name = "ai";
-                Some(pixels)
-            } else if let Some(pixels) = self
-                .erase_base_cache
-                .get(&fs_idx)
-                .filter(|pixels| pixels.size == [w, h])
-                .map(Arc::clone)
-            {
-                source_name = "erase_base";
-                Some(pixels)
-            } else {
-                match self.fs_cache.get(&fs_idx) {
-                    Some(FsCacheEntry::Static { pixels, .. }) if pixels.size == [w, h] => {
-                        source_name = "fs_cache";
-                        Some(Arc::clone(pixels))
-                    }
-                    _ => None,
-                }
-            }
-        };
-        let Some(source) = source else {
+        let Some((adjusted, source_name)) =
+            self.resolve_erase_input_pixels_matching(fs_idx, Some([w, h]))
+        else {
             crate::logger::log(format!(
                 "erase: preview skipped (no matching source for mask={}x{})",
                 w, h
             ));
             return false;
-        };
-        let params = self.effective_params(fs_idx).clone();
-        let adjusted: Arc<egui::ColorImage> = if already_adjusted || params.is_color_identity() {
-            source
-        } else {
-            Arc::new(crate::adjustment::apply_adjustments_fast(&source, &params))
         };
         crate::logger::log(format!("erase: preview source={source_name} {w}x{h}"));
         // is_preview = true: 完了時 fs_cache を書き換えず preview_cache に流す。

@@ -447,9 +447,13 @@ MI-GAN は RGB 専用で alpha を扱えない。透過 PNG / WebP 等は透明�
 - `App::black_flatten_if_transparent` (`ui_erase.rs`): 1 画素でも alpha<255 があれば、
   premultiplied RGB を保ったまま alpha=255 にした不透明コピーを返す (= 黒背景への合成と等価。
   全不透明なら `None` で no-op)。
-- 適用点は 2 つ: `enter_erase_mode` の `erase_base_cache` 初回保存 (表示 = `ensure_erase_base_texture`
-  + プレビュー入力) と、`resolve_erase_input_pixels` の返り値 (apply / auto-apply / ensure-result の
-  全 MI-GAN 入力)。これで**表示も入力も出力も黒不透明で揃う (WYSIWYG)**。
+- 適用点は 2 つ: `enter_erase_mode` の `erase_base_cache` 初回保存 (表示 =
+  `ensure_erase_base_texture`) と、`resolve_erase_input_pixels` 系の返り値 (preview / apply /
+  auto-apply / ensure-result の全 MI-GAN 入力)。これで**表示も入力も出力も黒不透明で揃う
+  (WYSIWYG)**。
+- AI アップスケール ON の透過画像では、B キーで白背景を選んでいても消しゴム用の
+  composite-first cache は bg=0 (黒) を参照する。白背景に焼き込まれた `(idx,1)` や
+  その派生 `adjustment_cache` を消しゴム入力へ流さないため。
 - `fs_cache` の透明原本は無変更。マスクを 1 つも作らずに消しゴムを抜ければ通常表示は `fs_cache`
   に戻るので、**元の透明画像がそのまま保持される** (= 加工しなければ破壊しない)。
 - 結果として MI-GAN と diffusion フォールバックの出力 alpha も一致する (P3-8 の非一貫も解消)。
