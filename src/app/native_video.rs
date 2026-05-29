@@ -2562,9 +2562,6 @@ impl App {
     /// 自動再発火を抑止し、手動 Norm クリックだけで再試行できるようにする。
     #[cfg(windows)]
     pub(super) fn maybe_start_normalize_scan_for_play_intent(&mut self, fs_idx: usize) -> bool {
-        if !self.normalize_auto_scan_base_ready(fs_idx) {
-            return false;
-        }
         let should_scan = match self.fs_cache.get(&fs_idx) {
             Some(FsCacheEntry::Video { player, .. }) => player.intent_playing(),
             _ => false,
@@ -2572,8 +2569,7 @@ impl App {
         if !should_scan {
             return false;
         }
-        self.start_normalize_scan_inner(fs_idx, None);
-        true
+        self.start_normalize_scan_for_deferred_play_intent(fs_idx)
     }
 
     /// 未測定動画をこれから再生する場合に、再生開始前の一瞬の未補正音を避けるため
@@ -2581,7 +2577,10 @@ impl App {
     /// 完了後に再生 intent と preroll を復帰する。
     #[cfg(windows)]
     pub(super) fn start_normalize_scan_for_deferred_play_intent(&mut self, fs_idx: usize) -> bool {
-        if !self.normalize_auto_scan_base_ready(fs_idx) {
+        if self.mark_existing_normalize_scan_for_deferred_play(fs_idx) {
+            return true;
+        }
+        if !self.normalize_auto_scan_target_ready(fs_idx) {
             return false;
         }
         self.start_normalize_scan_inner(fs_idx, Some(true));
@@ -2607,15 +2606,43 @@ impl App {
     }
 
     #[cfg(windows)]
-    fn normalize_auto_scan_base_ready(&self, fs_idx: usize) -> bool {
+    fn normalize_auto_scan_target_ready(&self, fs_idx: usize) -> bool {
         use crate::video::normalize_types::NormalizeUiState;
         self.settings.audio_normalize_enabled
             && self.fullscreen_idx == Some(fs_idx)
-            && self.normalize_state.is_none()
             && !self.normalize_auto_scan_suppressed.contains(&fs_idx)
             && self.normalize_ui_states.get(&fs_idx).copied()
                 == Some(NormalizeUiState::OnUnmeasured)
             && matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Video { .. }))
+    }
+
+    #[cfg(windows)]
+    fn normalize_scan_matches_current_player(&self, fs_idx: usize) -> bool {
+        let Some(state) = self.normalize_state.as_ref() else {
+            return false;
+        };
+        if state.fs_idx != fs_idx {
+            return false;
+        }
+        match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Video { player, .. }) => player.path() == state.file_path.as_path(),
+            _ => false,
+        }
+    }
+
+    #[cfg(windows)]
+    fn mark_existing_normalize_scan_for_deferred_play(&mut self, fs_idx: usize) -> bool {
+        if !self.normalize_scan_matches_current_player(fs_idx) {
+            return false;
+        }
+        if let Some(state) = self.normalize_state.as_mut() {
+            state.was_playing = true;
+        }
+        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
+            player.set_audio_preroll_suspended(true);
+            player.set_playing(false);
+        }
+        true
     }
 
     /// スキャン worker thread を起動。再生中なら一時停止 → スキャン → poll で完了検知。
@@ -2639,12 +2666,10 @@ impl App {
         if let Some(prev) = self.normalize_state.take() {
             prev.cancel();
         }
-        // 再生中なら一時停止
+        // 再生中なら一時停止し、測定前の raw→processed 先読みも止める。
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {
-            if was_playing_override == Some(true) {
-                player.set_audio_preroll_suspended(true);
-            }
             if was_playing {
+                player.set_audio_preroll_suspended(true);
                 player.set_playing(false);
             }
         }

@@ -6920,7 +6920,7 @@ impl NativeEguiOverlay {
             }
         }
         self.update_ime_cursor_area(full_output.platform_output.ime);
-        // パネル / HUD / トースト / paused_center などの「ユーザー操作対象 UI」が
+        // パネル / HUD / トーストなどの「ユーザー操作対象 UI」が
         // 一切出ていない (= cursor_blocking_overlay_visible が false) で、ユーザー
         // 無操作が CURSOR_HIDE_IDLE_SECS 経過したらカーソルを隠す。
         // チェックマーク (`checked`) は単なる状態インジケータなので blocking には
@@ -6930,8 +6930,8 @@ impl NativeEguiOverlay {
         //
         // 状態機械 (シンプル版):
         // - cursor_blocking_overlay_visible == true: 毎フレーム cursor_last_activity を
-        //   Some(now) に bump して countdown を 0 に戻す (= 一時停止 → 再開で
-        //   paused_center が消えた瞬間から 3 秒測り直す)。`wants_periodic_tick()` も
+        //   Some(now) に bump して countdown を 0 に戻す (= 操作対象 UI が消えた
+        //   瞬間から 3 秒測り直す)。`wants_periodic_tick()` も
         //   毎フレーム true なので pause 中も 250ms ごとに render が走る (P3 トレードオフ)。
         // - cursor_blocking_overlay_visible == false: cursor_last_activity をそのまま
         //   維持して idle を計算。3 秒経過したらカーソル非表示。
