@@ -756,6 +756,18 @@ fn draw_sidecar_section(ui: &mut egui::Ui, sc: &crate::external_metadata::Sideca
     }
 }
 
+/// JSON 値がスカラ (Null/Bool/Number/String) かを **非アロケート** で判定する。
+/// 配列分類の毎フレーム走査で `json_scalar_str` (String 生成) を避けるために使う。
+fn is_json_scalar(v: &serde_json::Value) -> bool {
+    matches!(
+        v,
+        serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_)
+    )
+}
+
 /// JSON 値がスカラ (Null/Bool/Number/String) ならその表示文字列を返す。
 fn json_scalar_str(v: &serde_json::Value) -> Option<String> {
     match v {
@@ -775,8 +787,9 @@ fn json_dim_label(ui: &mut egui::Ui, text: &str) {
 /// ネストした配列/オブジェクトはインデントして再帰。深さ上限で打ち切る。
 ///
 /// egui は immediate-mode なのでパネル表示中は毎フレーム再描画される。サイドカーは最大 2MB
-/// 許容するため、巨大配列を毎フレーム全件 join / 全件 widget 化すると重い (Codex P2)。
-/// 配列は先頭 `MAX_ITEMS` 件までに制限し、残りは件数表示にする。
+/// 許容するため、巨大配列/オブジェクトを毎フレーム全件走査 / join / widget 化すると重い (Codex P2)。
+/// 分類も描画も **先頭 `MAX_ITEMS` 件で完結** させ、残りは件数表示にする
+/// (分類は非アロケートの `is_json_scalar` で先頭 MAX_ITEMS 件のみ判定する)。
 fn draw_json_node(ui: &mut egui::Ui, key: Option<&str>, v: &serde_json::Value, depth: usize) {
     const MAX_DEPTH: usize = 8;
     const MAX_ITEMS: usize = 100;
@@ -786,7 +799,10 @@ fn draw_json_node(ui: &mut egui::Ui, key: Option<&str>, v: &serde_json::Value, d
     }
     match v {
         serde_json::Value::Array(a) => {
-            if a.iter().all(|e| json_scalar_str(e).is_some()) {
+            // 分類は先頭 MAX_ITEMS 件のみ・非アロケート判定 (巨大配列の毎フレーム全件走査を回避)。
+            // 先頭が全てスカラならスカラ配列としてプレビュー表示する (101 件目以降に非スカラが
+            // 混ざっていても、表示はあくまで先頭 100 件 + 残り件数なので実用上問題ない)。
+            if a.iter().take(MAX_ITEMS).all(is_json_scalar) {
                 // スカラのみの配列は 1 行に連結 (先頭 MAX_ITEMS 件まで)
                 let mut joined = a
                     .iter()
