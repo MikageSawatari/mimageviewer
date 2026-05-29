@@ -126,14 +126,24 @@ fn run_worker(paths: Vec<PathBuf>, cancel: Arc<AtomicBool>, tx: mpsc::Sender<Del
     });
 }
 
+/// SHFileOperationW (削除) のフラグ。**FOF_WANTNUKEWARNING を必ず含める**こと。
+/// 含めないと、ゴミ箱に入れられない対象 (容量超過 / ゴミ箱無効ボリューム / リムーバブル /
+/// ネットワーク共有) で完全削除へフォールバックする際に FOF_NOCONFIRMATION が確認を抑制し、
+/// UI が約束した「ゴミ箱へ移動」に反して原本が無言で完全削除される
+/// (v1.0.0 データ整合性レビュー DI-1)。
+#[cfg(windows)]
+const RECYCLE_FLAGS: u32 = {
+    use windows::Win32::UI::Shell::{
+        FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOF_WANTNUKEWARNING,
+    };
+    FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_SILENT.0 | FOF_NOERRORUI.0 | FOF_WANTNUKEWARNING.0
+};
+
 /// 単一パスを `SHFileOperationW` で削除する。
 #[cfg(windows)]
 fn recycle_one(path: &std::path::Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::UI::Shell::{
-        FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, SHFILEOPSTRUCTW,
-        SHFileOperationW,
-    };
+    use windows::Win32::UI::Shell::{FO_DELETE, SHFILEOPSTRUCTW, SHFileOperationW};
 
     let wide: Vec<u16> = path
         .as_os_str()
@@ -141,7 +151,7 @@ fn recycle_one(path: &std::path::Path) -> Result<(), String> {
         .chain(std::iter::once(0))
         .chain(std::iter::once(0))
         .collect();
-    let flags = (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0 | FOF_SILENT.0 | FOF_NOERRORUI.0) as u16;
+    let flags = RECYCLE_FLAGS as u16;
     let mut op = SHFILEOPSTRUCTW {
         wFunc: FO_DELETE,
         pFrom: windows::core::PCWSTR(wide.as_ptr()),
@@ -159,4 +169,20 @@ fn recycle_one(path: &std::path::Path) -> Result<(), String> {
 #[cfg(not(windows))]
 fn recycle_one(_path: &std::path::Path) -> Result<(), String> {
     Err("recycle bin not supported on this platform".into())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use windows::Win32::UI::Shell::FOF_WANTNUKEWARNING;
+
+    #[test]
+    fn recycle_flags_include_nuke_warning() {
+        // DI-1 回帰ガード: FOF_WANTNUKEWARNING が外れると、ゴミ箱不可時に無言で完全削除
+        // されるようになってしまう。削除フラグから外さないこと。
+        assert_ne!(
+            super::RECYCLE_FLAGS & FOF_WANTNUKEWARNING.0,
+            0,
+            "FOF_WANTNUKEWARNING must stay set so non-recyclable targets prompt before permanent delete"
+        );
+    }
 }

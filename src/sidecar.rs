@@ -156,6 +156,10 @@ impl SidecarFile {
                     path.display(),
                     e
                 ));
+                // parse 失敗 = 破損ファイル。空のまま返すと次の編集で flush() が単一エントリで
+                // 上書きし、手動回復し得たデータを消す。newer-version 経路と同様に disabled に
+                // して、このセッションでは上書きさせない (v1.0.0 データ整合性レビュー DI-7)。
+                me.disabled = true;
                 return me;
             }
         };
@@ -548,6 +552,28 @@ mod tests {
         p.brightness = 10.0;
         p.contrast = -5.0;
         p
+    }
+
+    #[test]
+    fn corrupt_sidecar_is_disabled_and_not_overwritten() {
+        // DI-7: 現行版だが破損した sidecar を load → disabled になり、次の編集 + flush でも
+        // 上書きされない (newer-version 経路と同じ防御。空 load → 上書き消去の回避)。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SIDECAR_FILENAME);
+        std::fs::write(&path, b"{ this is not valid json ]").unwrap();
+        let original = std::fs::read(&path).unwrap();
+
+        let mut s = SidecarFile::load(dir.path());
+        assert!(s.disabled, "corrupt sidecar must be disabled");
+
+        // disabled なら dirty でも flush は書き込まない。
+        s.set_adjust("img.jpg", sample_params());
+        s.flush();
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            original,
+            "corrupt sidecar must not be overwritten while disabled"
+        );
     }
 
     #[test]

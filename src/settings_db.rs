@@ -1983,7 +1983,21 @@ pub fn migrate_from_settings_json(
         return Err(e);
     }
     db.record_migrated_from_json()?;
-    let moved = rename_legacy_json_files(data_dir);
+    // JSON を rename する前に WAL を main DB へ checkpoint して self-contained にする。
+    // synchronous=NORMAL+WAL では commit はアプリ crash には耐えるが、checkpoint で main DB が
+    // fsync されるまで OS/電源断には非保証。これを怠ると commit 後・WAL 永続化前の電源断で
+    // settings.db が「Present だが空 (bootstrap_complete 喪失)」になり、boot tree が Present 分岐を
+    // short-circuit して移行を再試行できず設定喪失に至る窓がある (v1.0.0 データ整合性レビュー DI-6)。
+    // checkpoint に失敗した場合は legacy JSON を rename せず fallback として残す。
+    let moved = match db.checkpoint_truncate() {
+        Ok(()) => rename_legacy_json_files(data_dir),
+        Err(e) => {
+            log_diag(&format!(
+                "settings_db: migrate checkpoint failed ({e:?}); keeping legacy JSON as fallback"
+            ));
+            0
+        }
+    };
     log_diag(&format!(
         "settings_db: migrate_from_settings_json: bootstrap complete, {moved} legacy file(s) renamed"
     ));

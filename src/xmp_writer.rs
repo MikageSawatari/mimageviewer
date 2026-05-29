@@ -1616,6 +1616,19 @@ mod tests {
         assert_eq!(riff_size, out.len() - 8);
     }
 
+    #[test]
+    fn webp_tag_write_read_roundtrip() {
+        // DI-3: writer で WebP に書いたタグを reader が読み戻せること。以前は reader が
+        // WebP 非対応で空を返し、grid/検索に出ず、toggle が常に ADD (タグ解除不能) だった。
+        let webp = minimal_webp_vp8l();
+        let (out, _) = apply_tag_op_webp(&webp, &TagOp::Add("#web".to_string())).unwrap();
+        let read_back = crate::xmp_reader::read_dc_subject_from_bytes(&out);
+        assert!(
+            read_back.contains(&"#web".to_string()),
+            "reader must read back the written WebP tag, got {read_back:?}"
+        );
+    }
+
     /// VP8L で 1x1 の最小 WebP (VP8X なし、つまり simple WebP)。
     /// 書き込み時に VP8X に自動昇格する挙動を検証する。
     fn minimal_webp_vp8l() -> Vec<u8> {

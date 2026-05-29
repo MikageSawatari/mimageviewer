@@ -91,6 +91,60 @@ fn convert_7z_extracts_only_images() {
     }
 }
 
+/// DI-4 回帰: solid 7z (block 内で同一 stream を共有) で、非画像ファイルが画像より前に
+/// あるとき、画像バイトが正確に round-trip すること。旧実装は skip エントリを drain せず、
+/// 後続画像にバイトがズレて CRC fail (変換失敗) / 破損していた。
+#[test]
+fn convert_solid_7z_with_leading_nonimage_preserves_image_bytes() {
+    use std::io::{Cursor, Read};
+    let tmp = tempfile::TempDir::new().unwrap();
+    let src = tmp.path().join("solid.7z");
+    let dst = tmp.path().join("solid_out.zip");
+
+    let img1: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    let img2: Vec<u8> = (0..7000u32).map(|i| ((i * 7 + 3) % 253) as u8).collect();
+    {
+        let file = std::fs::File::create(&src).unwrap();
+        let mut writer = sevenz_rust2::ArchiveWriter::new(file).unwrap();
+        // push_archive_entries は与えた全エントリを 1 つの solid block にまとめる。
+        // 非画像 (readme.txt) を画像より前に置くのが DI-4 のトリガー。
+        let entries = vec![
+            sevenz_rust2::ArchiveEntry::new_file("readme.txt"),
+            sevenz_rust2::ArchiveEntry::new_file("page01.jpg"),
+            sevenz_rust2::ArchiveEntry::new_file("page02.png"),
+        ];
+        let readers: Vec<sevenz_rust2::SourceReader<Cursor<Vec<u8>>>> = vec![
+            sevenz_rust2::SourceReader::new(Cursor::new(b"readme that must be drained".to_vec())),
+            sevenz_rust2::SourceReader::new(Cursor::new(img1.clone())),
+            sevenz_rust2::SourceReader::new(Cursor::new(img2.clone())),
+        ];
+        writer.push_archive_entries(entries, readers).unwrap();
+        writer.finish().unwrap();
+    }
+
+    let cancel = AtomicBool::new(false);
+    let stats = convert_to_zip(&src, &dst, ArchiveFormat::SevenZ, &cancel, None)
+        .expect("solid 7z conversion must succeed (DI-4)");
+    assert_eq!(stats.image_count, 2);
+
+    let file = std::fs::File::open(&dst).unwrap();
+    let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file)).unwrap();
+    let mut got1 = Vec::new();
+    archive
+        .by_name("page01.jpg")
+        .unwrap()
+        .read_to_end(&mut got1)
+        .unwrap();
+    let mut got2 = Vec::new();
+    archive
+        .by_name("page02.png")
+        .unwrap()
+        .read_to_end(&mut got2)
+        .unwrap();
+    assert_eq!(got1, img1, "page01.jpg bytes must round-trip exactly");
+    assert_eq!(got2, img2, "page02.png bytes must round-trip exactly");
+}
+
 /// 7z 変換が WIC 対応拡張子 (HEIC / AVIF / JXL / TIFF / RAW) を
 /// 画像として扱うことを確認する回帰テスト。
 /// 以前は archive_converter::is_image_entry がネイティブ拡張子しか見ておらず、

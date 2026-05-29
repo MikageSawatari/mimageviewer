@@ -76,7 +76,9 @@ fn lowercase_ext(path: &Path) -> Option<String> {
 fn extension_might_have_xmp(path: &Path) -> bool {
     matches!(
         lowercase_ext(path).as_deref(),
-        Some("jpg" | "jpeg" | "jfif" | "png" | "tif" | "tiff" | "mp4" | "mov" | "m4v")
+        // webp: writer は WebP に XMP を書ける (xmp_writer の RIFF/VP8X 経路) ので、reader も
+        // 受け付けないと書いたタグ/レーティングを読み戻せない (v1.0.0 データ整合性レビュー DI-3)。
+        Some("jpg" | "jpeg" | "jfif" | "png" | "tif" | "tiff" | "mp4" | "mov" | "m4v" | "webp")
     )
 }
 
@@ -97,7 +99,9 @@ pub fn read_tweet_info(path: &Path) -> Option<XmpTweetInfo> {
     }
     let small_image = matches!(
         lowercase_ext(path).as_deref(),
-        Some("jpg" | "jpeg" | "jfif" | "png")
+        // webp も full-read する: XMP は RIFF 末尾の "XMP " チャンクに追記されるため、
+        // 先頭部分読みでは取りこぼす (v1.0.0 データ整合性レビュー DI-3)。
+        Some("jpg" | "jpeg" | "jfif" | "png" | "webp")
     );
     if small_image {
         let bytes = std::fs::read(path).ok()?;
@@ -150,7 +154,9 @@ pub fn read_xmp_bundle(path: &Path) -> XmpReadBundle {
     }
     let small_image = matches!(
         lowercase_ext(path).as_deref(),
-        Some("jpg" | "jpeg" | "jfif" | "png")
+        // webp も full-read する: XMP は RIFF 末尾の "XMP " チャンクに追記されるため、
+        // 先頭部分読みでは取りこぼす (v1.0.0 データ整合性レビュー DI-3)。
+        Some("jpg" | "jpeg" | "jfif" | "png" | "webp")
     );
     let bytes_result = if small_image {
         std::fs::read(path).ok()
@@ -201,6 +207,10 @@ pub(crate) fn has_xmp_capable_magic(bytes: &[u8]) -> bool {
     if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
         return true;
     }
+    // WebP (RIFF container): "RIFF" + 4byte size + "WEBP" (v1.0.0 データ整合性レビュー DI-3)
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return true;
+    }
     false
 }
 
@@ -220,10 +230,45 @@ pub(crate) fn extract_xmp_packet(bytes: &[u8]) -> Option<Vec<u8>> {
         if let Some(xmp) = extract_xmp_from_png(bytes) {
             return Some(xmp);
         }
+    } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        // WebP (RIFF): "XMP " チャンクのペイロードが XMP packet (v1.0.0 データ整合性レビュー DI-3)
+        if let Some(xmp) = extract_xmp_from_webp(bytes) {
+            return Some(xmp);
+        }
     }
     // フォールバック: ファイル先頭 256KB から <x:xmpmeta ... </x:xmpmeta> を切り出す。
     // MP4 / TIFF 等の未対応形式にも対応するため。
     extract_xmp_fallback(bytes)
+}
+
+/// WebP (RIFF) コンテナを走査して "XMP " チャンクのペイロード (XMP packet) を返す。
+/// xmp_writer の RIFF 書き込み経路と対になる読み取り側 (DI-3)。チャンクは
+/// 4byte FourCC + 4byte LE size + payload で、size が奇数なら 1byte padding が続く。
+fn extract_xmp_from_webp(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() < 12 || !bytes.starts_with(b"RIFF") || &bytes[8..12] != b"WEBP" {
+        return None;
+    }
+    let mut pos = 12usize;
+    while pos + 8 <= bytes.len() {
+        let fourcc = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        let payload_start = pos + 8;
+        let payload_end = payload_start.checked_add(size)?;
+        if payload_end > bytes.len() {
+            break; // 壊れた / 切り詰められたチャンク
+        }
+        if fourcc == b"XMP " {
+            return Some(bytes[payload_start..payload_end].to_vec());
+        }
+        // 次チャンクへ。奇数サイズは 1byte padding を跨ぐ。
+        pos = payload_end + (size & 1);
+    }
+    None
 }
 
 /// JPEG APP1 セグメントから Adobe XMP パケットを探す。
@@ -816,7 +861,9 @@ pub fn read_panorama_info(path: &Path) -> Option<XmpPanoramaInfo> {
     }
     let small_image = matches!(
         lowercase_ext(path).as_deref(),
-        Some("jpg" | "jpeg" | "jfif" | "png")
+        // webp も full-read する: XMP は RIFF 末尾の "XMP " チャンクに追記されるため、
+        // 先頭部分読みでは取りこぼす (v1.0.0 データ整合性レビュー DI-3)。
+        Some("jpg" | "jpeg" | "jfif" | "png" | "webp")
     );
     if small_image {
         let bytes = std::fs::read(path).ok()?;

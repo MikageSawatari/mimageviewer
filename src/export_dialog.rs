@@ -309,7 +309,11 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
     let options = SaveOptions {
         jpeg_quality: 95,
         include_metadata,
-        caller_applied_orientation: true,
+        // ZIP 内画像はフルスクリーン decode で EXIF 自動回転を適用していない
+        // (app.rs は zip_entry.is_none() のときだけ apply_exif_orientation する) ため画素は
+        // 未回転。true にすると Orientation タグだけ 1 に書き換わり画素と矛盾し、EXIF 対応
+        // ビューアで傾く。実ファイル経路のみ画素適用済み (v1.0.0 データ整合性レビュー DI-2)。
+        caller_applied_orientation: matches!(request.source, ExportSource::File { .. }),
         ..Default::default()
     };
     let extension = request.output_format.extension();

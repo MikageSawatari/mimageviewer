@@ -284,8 +284,8 @@ fn convert_7z(
     let mut files_done: u32 = 0;
     let mut bytes_written: u64 = 0;
     let mut cancelled = false;
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-    // sevenz-rust2 の for_each_entries は solid 圧縮でも正しく動く
     let opts = store_options();
     let iter_result = reader.for_each_entries(|entry, r| {
         if cancel.load(Ordering::Relaxed) {
@@ -293,12 +293,19 @@ fn convert_7z(
             return Ok(false);
         }
         if entry.is_directory || !is_image_entry(&entry.name) {
-            // スキップ (for_each_entries は Read から読まなくても内部で進む)
+            // solid 7z (7-Zip 既定) は block 内の各ファイルが同一の逐次 stream を共有するため、
+            // skip するエントリも読み捨てて stream を進めないと、後続エントリが前の残バイトを
+            // 読んで画像が壊れる (v1.0.0 データ整合性レビュー DI-4)。directory は空 reader
+            // なので 0 バイト copy で無害。
+            std::io::copy(r, &mut std::io::sink())?;
             return Ok(true);
         }
         let Some(name) = normalize_entry_name(&entry.name) else {
+            // 正規化不能な画像エントリも drain してから skip (同上、stream 整合のため)。
+            std::io::copy(r, &mut std::io::sink())?;
             return Ok(true);
         };
+        let name = dedup_entry_name(name, &mut seen_names);
         zw.start_file(&name, opts)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         let copied = std::io::copy(r, zw)?;
@@ -322,6 +329,28 @@ fn convert_7z(
         image_count: files_done,
         total_uncompressed_bytes: bytes_written,
     })
+}
+
+/// 既に書き込んだ正規化名と衝突したら拡張子の前に " (N)" を挿入して一意化する。
+/// normalize_entry_name は `\`→`/`・先頭 `/` 除去を行うため、元が異なる 2 エントリが同名に
+/// なり得る。同名で複数 start_file すると read 時 by_name が 1 つしか返せず片方が不可視に
+/// なるので、両方を個別に名前解決できるようにする (v1.0.0 データ整合性レビュー DI-5)。
+fn dedup_entry_name(name: String, seen: &mut std::collections::HashSet<String>) -> String {
+    if seen.insert(name.clone()) {
+        return name;
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) => (&name[..i], &name[i..]), // ext は先頭の '.' を含む
+        None => (name.as_str(), ""),
+    };
+    let mut n = 2;
+    loop {
+        let candidate = format!("{stem} ({n}){ext}");
+        if seen.insert(candidate.clone()) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 fn convert_lzh(
@@ -355,6 +384,7 @@ fn convert_lzh(
     let opts = store_options();
     let mut files_done: u32 = 0;
     let mut bytes_written: u64 = 0;
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     loop {
         if cancel.load(Ordering::Relaxed) {
@@ -367,6 +397,7 @@ fn convert_lzh(
             !header.is_directory() && is_image_entry(&raw_name) && reader.is_decoder_supported();
         if should_copy {
             if let Some(name) = normalize_entry_name(&raw_name) {
+                let name = dedup_entry_name(name, &mut seen_names);
                 zw.start_file(&name, opts)
                     .map_err(|e| ConvertError::Archive(e.to_string()))?;
                 let copied = std::io::copy(&mut reader, zw)?;
@@ -405,6 +436,27 @@ fn convert_lzh(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedup_entry_name_disambiguates_collisions() {
+        // DI-5: 正規化で同名衝突したエントリを一意化し、全画像が by_name 解決可能になること。
+        let mut seen = std::collections::HashSet::new();
+        assert_eq!(
+            dedup_entry_name("a/b.jpg".to_string(), &mut seen),
+            "a/b.jpg"
+        );
+        assert_eq!(
+            dedup_entry_name("a/b.jpg".to_string(), &mut seen),
+            "a/b (2).jpg"
+        );
+        assert_eq!(
+            dedup_entry_name("a/b.jpg".to_string(), &mut seen),
+            "a/b (3).jpg"
+        );
+        // 拡張子なしでも壊れない
+        assert_eq!(dedup_entry_name("x".to_string(), &mut seen), "x");
+        assert_eq!(dedup_entry_name("x".to_string(), &mut seen), "x (2)");
+    }
 
     #[test]
     fn format_from_extension() {
