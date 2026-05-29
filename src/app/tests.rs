@@ -3135,6 +3135,44 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// Cache 復元した Auto 比率は、前回の根拠 sample 数に追いつくまで
+    /// seed / 途中ロードの少数統計で上書きしない。
+    #[test]
+    fn cached_auto_aspect_waits_for_previous_sample_count_before_switching() {
+        use crate::grid_item::GridItem;
+        use crate::settings::ThumbAspect;
+
+        let mut app = setup_app();
+        app.settings.thumb_aspect_auto = true;
+        app.items = (0..10)
+            .map(|i| GridItem::Image(PathBuf::from(format!("c:/p/{i}.jpg"))))
+            .collect();
+        app.auto_aspect.current = Some(ThumbAspect::Square);
+        // 前回は 36 件の統計で Square と判断したが、今回は 10 件しか対象がない。
+        // required は min(36, eligible_total=10) になり、9 件ではまだ切替禁止。
+        app.auto_aspect.cached_sample_gate = Some(36);
+        for idx in 0..9 {
+            app.auto_aspect
+                .samples
+                .insert(idx, ThumbAspect::Portrait3x4.height_ratio());
+        }
+
+        app.maybe_apply_auto_aspect(true);
+
+        assert_eq!(app.auto_aspect.current, Some(ThumbAspect::Square));
+        assert_eq!(app.auto_aspect.cached_sample_gate, Some(36));
+        assert_eq!(app.auto_aspect.switches_done, 0);
+
+        app.auto_aspect
+            .samples
+            .insert(9, ThumbAspect::Portrait3x4.height_ratio());
+        app.maybe_apply_auto_aspect(true);
+
+        assert_eq!(app.auto_aspect.current, Some(ThumbAspect::Portrait3x4));
+        assert_eq!(app.auto_aspect.cached_sample_gate, None);
+        assert_eq!(app.auto_aspect.switches_done, 1);
+    }
+
     /// PDF を仮想フォルダとして開いた直後、親フォルダ catalog の `pdfthumb:foo.pdf`
     /// が PDF 自身の catalog に `page_0000` として seed されることを確認する回帰
     /// テスト。これによって PDFium による初回 1 ページ目レンダリング (200-500ms)

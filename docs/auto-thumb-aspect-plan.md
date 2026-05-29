@@ -319,7 +319,9 @@ catalog seed より前に `auto_aspect.current` をこの値で初期化し、�
 - 保存対象は `ThumbAspect` と診断用の sample 数 / eligible_total のみ。代表サムネ対象や
   サムネ画像 BLOB は既存 `catalog.db` / `folder_thumb_pins.db` の責務から動かさない。
 - キャッシュ値は楽観的な初期値であり、後続の catalog seed / `poll_thumbnails` で集まる
-  実統計が既存の 6 段ゲートを通れば補正される。
+  実統計が既存の 6 段ゲートを通れば補正される。ただしキャッシュ復元時は、保存時の
+  `sample_count` と同等以上 (`min(sample_count, 現在の eligible_total)`) の実測 sample が
+  集まるまでは上書きしない。前回より少ない部分統計だけで比率が即変更されるのを避けるため。
 - Ctrl+G / Ctrl+S の検索結果ビューや `__search_results__` 合成パスは、クエリ依存で
   中身が変わるため保存・復元対象外。
 
@@ -479,6 +481,8 @@ impl App {
 前回値を復元し、`maybe_apply_auto_aspect` は実際の切替または no-op 確定時に
 現在の確定値を upsert する。書き込みは 1 フォルダあたり通常 1〜2 回で、毎フレームの
 DB アクセスは行わない。
+復元した値は、保存時の `sample_count` と同等以上の実測 sample が集まるまで
+`cached_sample_gate` で保護される。
 リセットはサムネイルキャッシュ管理ダイアログの削除操作に連動する:
 現在フォルダ削除は該当 `folder_key`、古いキャッシュ削除は `updated_at` が指定日数より
 古い行、全削除は全行を削除する。

@@ -4307,6 +4307,8 @@ impl App {
         };
 
         self.auto_aspect.current = Some(entry.aspect);
+        self.auto_aspect.cached_sample_gate =
+            (entry.sample_count > 0).then_some(entry.sample_count);
         // Folder load restores scroll history later and starts new folders at y=0, so do
         // not run scroll fixup here. Keep last_cell_h in sync because display_px is
         // initialized before the next grid paint recomputes cell dimensions.
@@ -4567,6 +4569,21 @@ impl App {
 
         // 純関数で判定。samples は HashMap なので Vec に展開して渡す。
         let samples: Vec<f32> = self.auto_aspect.samples.values().copied().collect();
+
+        // Cache 復元済みの場合は、前回その比率を決めた sample 数と同等以上の
+        // 実測が集まるまで上書きしない。これにより「前回 36 件で 1:1 と判定した
+        // フォルダを、今回の seed 16 件だけで 3:4 に即変更する」ような揺れを防ぐ。
+        // 現在の eligible_total が前回より小さい場合は、到達不能にならないよう
+        // current folder の総数で clip する。
+        if let Some(cached_samples) = self.auto_aspect.cached_sample_gate {
+            let required_samples = cached_samples.min(eligible_total);
+            if required_samples > 0 && samples.len() < required_samples {
+                self.auto_aspect.streak = None;
+                return;
+            }
+            self.auto_aspect.cached_sample_gate = None;
+        }
+
         let decision =
             crate::auto_aspect::decide_auto_aspect(&samples, eligible_total, current, LOG_MARGIN);
         let crate::auto_aspect::AspectDecision::Switch(new_aspect) = decision else {

@@ -38,6 +38,9 @@ pub struct AutoAspectState {
     /// 確定済み (or 仮確定) の自動比率。None なら未確定。
     /// auto モード時に `App::effective_thumb_aspect` から参照される。
     pub current: Option<ThumbAspect>,
+    /// auto_aspect_cache.db から復元した比率を、前回と同等以上の実測 sample が
+    /// 集まるまで上書きしないためのゲート。None なら通常判定。
+    pub cached_sample_gate: Option<usize>,
     /// このフォルダで何回切り替えたか (0..=2)。最大値到達後は再切替しない。
     pub switches_done: u8,
     /// 直近切替時刻 (cooldown 判定用)。
@@ -54,6 +57,7 @@ impl Default for AutoAspectState {
             items_generation: 0,
             samples: HashMap::new(),
             current: None,
+            cached_sample_gate: None,
             switches_done: 0,
             last_switch_at: None,
             streak: None,
@@ -67,6 +71,7 @@ impl AutoAspectState {
         self.items_generation = generation;
         self.samples.clear();
         self.current = None;
+        self.cached_sample_gate = None;
         self.switches_done = 0;
         self.last_switch_at = None;
         self.streak = None;
@@ -76,6 +81,7 @@ impl AutoAspectState {
     /// `samples` は活かしたまま、次の判定で再評価できるようにする。
     pub fn reset_decision_only(&mut self) {
         self.current = None;
+        self.cached_sample_gate = None;
         self.switches_done = 0;
         self.last_switch_at = None;
         self.streak = None;
@@ -435,6 +441,7 @@ mod tests {
         s.samples.insert(0, 1.5);
         s.samples.insert(1, 0.5);
         s.current = Some(ThumbAspect::Portrait2x3);
+        s.cached_sample_gate = Some(24);
         s.switches_done = 2;
         s.last_switch_at = Some(Instant::now());
         s.streak = Some((ThumbAspect::Square, Instant::now(), 3));
@@ -444,6 +451,7 @@ mod tests {
         assert_eq!(s.items_generation, 42);
         assert!(s.samples.is_empty());
         assert_eq!(s.current, None);
+        assert_eq!(s.cached_sample_gate, None);
         assert_eq!(s.switches_done, 0);
         assert!(s.last_switch_at.is_none());
         assert!(s.streak.is_none());
@@ -456,6 +464,7 @@ mod tests {
         s.samples.insert(0, 1.5);
         s.samples.insert(1, 1.5);
         s.current = Some(ThumbAspect::Portrait2x3);
+        s.cached_sample_gate = Some(24);
         s.switches_done = 1;
         s.last_switch_at = Some(Instant::now());
         s.streak = Some((ThumbAspect::Square, Instant::now(), 0));
@@ -467,6 +476,7 @@ mod tests {
         assert_eq!(s.samples.len(), 2);
         // 決定状態だけリセット
         assert_eq!(s.current, None);
+        assert_eq!(s.cached_sample_gate, None);
         assert_eq!(s.switches_done, 0);
         assert!(s.last_switch_at.is_none());
         assert!(s.streak.is_none());
