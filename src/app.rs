@@ -751,9 +751,9 @@ fn folder_nav_mode_same_kind(a: &FolderNavMode, b: &FolderNavMode) -> bool {
 use eframe::egui;
 
 use crate::folder_tree::{
-    SUPPORTED_VIDEO_EXTENSIONS, folder_has_still_image, folder_should_stop, is_apple_double,
-    navigate_folder_with_skip, next_folder_dfs, next_sibling_folder, prev_folder_dfs,
-    prev_sibling_folder, walk_dirs_recursive,
+    FolderNavOutcome, SUPPORTED_VIDEO_EXTENSIONS, folder_has_still_image, folder_should_stop,
+    is_apple_double, navigate_folder_with_skip, next_folder_dfs, next_sibling_folder,
+    prev_folder_dfs, prev_sibling_folder, walk_dirs_recursive,
 };
 
 // キャッシュキー定数は thumb_loader.rs に定義 (ベンチマーク bin からも参照するため)
@@ -12255,10 +12255,10 @@ impl App {
         self.spawn_folder_nav(current, forward, mode);
     }
 
-    /// 内部ヘルパー: DFS ワーカースレッドを spawn する。
+    /// 内部ヘルパー: フォルダ移動ワーカースレッドを spawn する。
     /// `start_folder_nav` (ユーザー押下) と `chain_folder_nav_if_pending` (累積消化) の
-    /// 両方から呼ばれる。cancel トークンは `navigate_folder_with_skip` にも渡し、
-    /// 次のユーザー操作で即座に DFS を畳めるようにする。
+    /// 両方から呼ばれる。cancel トークンは DFS / 兄弟移動のどちらにも渡し、
+    /// 次のユーザー操作で即座に古い探索を畳めるようにする。
     fn spawn_folder_nav(&mut self, current: PathBuf, forward: bool, mode: FolderNavMode) {
         let skip_limit = self.settings.folder_skip_limit;
         // Phase 4 (spec §8): `folder_tree::*_dfs` は内部で `Settings::load()` を呼ばず
@@ -12304,16 +12304,24 @@ impl App {
                     ],
                 );
             }
-            let outcome = if forward {
+            let outcome = if sibling_only {
+                if cancel_w.load(Ordering::Relaxed) {
+                    None
+                } else {
+                    let path = if forward {
+                        next_sibling_folder(&current, tree_opts)
+                    } else {
+                        prev_sibling_folder(&current, tree_opts)
+                    };
+                    path.map(|path| FolderNavOutcome {
+                        hit_image_folder: should_stop(&path, Some(&cancel_w)),
+                        path,
+                    })
+                }
+            } else if forward {
                 navigate_folder_with_skip(
                     &current,
-                    |p| {
-                        if sibling_only {
-                            next_sibling_folder(p, tree_opts)
-                        } else {
-                            next_folder_dfs(p, tree_opts)
-                        }
-                    },
+                    |p| next_folder_dfs(p, tree_opts),
                     should_stop,
                     skip_limit,
                     Some(&cancel_w),
@@ -12321,13 +12329,7 @@ impl App {
             } else {
                 navigate_folder_with_skip(
                     &current,
-                    |p| {
-                        if sibling_only {
-                            prev_sibling_folder(p, tree_opts)
-                        } else {
-                            prev_folder_dfs(p, tree_opts)
-                        }
-                    },
+                    |p| prev_folder_dfs(p, tree_opts),
                     should_stop,
                     skip_limit,
                     Some(&cancel_w),
@@ -12723,21 +12725,6 @@ impl App {
             // 同上: items_generation 不変のまま return するので明示 release (Codex P1)。
             self.release_fs_nav_lock();
             emit_end(apply_t0, apply_seq, apply_mode_tag, "fs_boundary");
-            return;
-        }
-        if matches!(result.mode, FolderNavMode::SiblingFullscreen) && !result.hit_image_folder {
-            let hint = crate::ui_fullscreen::FsBoundaryHint::NoSiblingImageFolder {
-                forward: result.forward,
-                at: std::time::Instant::now(),
-            };
-            self.fs_boundary_hint = Some(hint);
-            #[cfg(windows)]
-            if self.native_video_fullscreen_active_for_main_backdrop() {
-                self.show_native_video_overlay_toast(Self::native_boundary_hint_text(hint), true);
-            }
-            self.clear_pending_folder_nav_steps();
-            self.release_fs_nav_lock();
-            emit_end(apply_t0, apply_seq, apply_mode_tag, "fs_sibling_boundary");
             return;
         }
         // DFS スレッドで事前スキャン済みなら UI スレッドの read_dir を省ける。

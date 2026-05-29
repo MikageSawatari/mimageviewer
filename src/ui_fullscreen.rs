@@ -519,11 +519,6 @@ pub(crate) enum FsBoundaryHint {
         forward: bool,
         at: std::time::Instant,
     },
-    /// Ctrl+PageUp/PageDown の兄弟限定移動で、兄弟はあるが画像・動画が見つからない。
-    NoSiblingImageFolder {
-        forward: bool,
-        at: std::time::Instant,
-    },
     /// Ctrl+G 絞り込みビューで、これ以上進める検索結果が無い
     /// (forward=true: 末端, forward=false: 先頭)。
     SearchEnd {
@@ -551,7 +546,6 @@ impl FsBoundaryHint {
             FsBoundaryHint::Edge { at, .. }
             | FsBoundaryHint::NoImageFolder { at, .. }
             | FsBoundaryHint::NoSiblingFolder { at, .. }
-            | FsBoundaryHint::NoSiblingImageFolder { at, .. }
             | FsBoundaryHint::SearchEnd { at, .. }
             | FsBoundaryHint::NavNoOp { at, .. } => *at,
         }
@@ -7878,7 +7872,6 @@ impl App {
             FsBoundaryHint::Edge { .. } => BOUNDARY_HINT_DURATION,
             FsBoundaryHint::NoImageFolder { .. } => NO_IMAGE_FOLDER_HINT_DURATION,
             FsBoundaryHint::NoSiblingFolder { .. } => NO_IMAGE_FOLDER_HINT_DURATION,
-            FsBoundaryHint::NoSiblingImageFolder { .. } => NO_IMAGE_FOLDER_HINT_DURATION,
             FsBoundaryHint::SearchEnd { .. } => NO_IMAGE_FOLDER_HINT_DURATION,
             FsBoundaryHint::NavNoOp { .. } => BOUNDARY_HINT_DURATION,
         };
@@ -7924,14 +7917,6 @@ impl App {
             FsBoundaryHint::NoSiblingFolder { forward: false, .. } => (
                 "前の兄弟フォルダはありません",
                 vec!["[Alt]+[↑] 親フォルダへ", "[Ctrl]+[↑] ツリー順で前へ"],
-            ),
-            FsBoundaryHint::NoSiblingImageFolder { forward: true, .. } => (
-                "次の兄弟フォルダに画像・動画が見つかりません",
-                vec!["[Esc] でサムネイル一覧に戻ります"],
-            ),
-            FsBoundaryHint::NoSiblingImageFolder { forward: false, .. } => (
-                "前の兄弟フォルダに画像・動画が見つかりません",
-                vec!["[Esc] でサムネイル一覧に戻ります"],
             ),
             FsBoundaryHint::SearchEnd { forward: true, .. } => (
                 "最後の検索結果です",

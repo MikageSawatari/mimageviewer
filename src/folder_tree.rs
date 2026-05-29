@@ -927,6 +927,35 @@ mod tests {
         );
     }
 
+    /// sibling 移動は空フォルダを skip せず、直近の兄弟そのものを返す。
+    #[test]
+    fn sibling_folder_returns_empty_direct_sibling() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("root");
+        let a = root.join("Folder-A");
+        let b = root.join("Folder-B");
+        let b1 = b.join("Folder-B-1");
+        let b2 = b.join("Folder-B-2");
+        let c = root.join("Folder-C");
+        for d in [&a, &b1, &b2, &c] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(b1.join("b1.jpg"), b"").unwrap();
+        std::fs::write(b2.join("b2.jpg"), b"").unwrap();
+        std::fs::write(c.join("c.jpg"), b"").unwrap();
+
+        assert!(
+            !folder_should_stop(&b, None),
+            "Folder-B 自身に画像が無いことを確認"
+        );
+
+        let next = next_sibling_folder(&a, FolderTreeOptions::default()).expect("a next sibling");
+        assert!(path_eq(&next, &b), "a の次兄弟は空の b, got {:?}", next);
+
+        let prev = prev_sibling_folder(&c, FolderTreeOptions::default()).expect("c prev sibling");
+        assert!(path_eq(&prev, &b), "c の前兄弟は空の b, got {:?}", prev);
+    }
+
     /// Ctrl+PageUp 用の sibling 移動は、前兄弟の最深子孫へ潜らず兄弟自身を返す。
     #[test]
     fn prev_sibling_folder_does_not_descend_into_previous_branch() {

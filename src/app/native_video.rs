@@ -5004,13 +5004,6 @@ impl App {
                     "前の兄弟フォルダはありません".to_string()
                 }
             }
-            crate::ui_fullscreen::FsBoundaryHint::NoSiblingImageFolder { forward, .. } => {
-                if forward {
-                    "次の兄弟フォルダに画像・動画が見つかりません".to_string()
-                } else {
-                    "前の兄弟フォルダに画像・動画が見つかりません".to_string()
-                }
-            }
             crate::ui_fullscreen::FsBoundaryHint::SearchEnd { forward, .. } => {
                 if forward {
                     "これ以上先の検索結果はありません".to_string()
