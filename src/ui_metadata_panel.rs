@@ -818,17 +818,23 @@ fn draw_json_node(ui: &mut egui::Ui, key: Option<&str>, v: &serde_json::Value, d
             if depth >= MAX_DEPTH {
                 draw_key_value_wrapped(ui, key.unwrap_or("-"), &format!("{{{} キー}}", m.len()));
             } else if depth == 0 {
-                // トップレベルはインデントせず並べる
-                for (k, val) in m {
+                // トップレベルはインデントせず並べる (キー数も先頭 MAX_ITEMS 件で打ち切る)
+                for (k, val) in m.iter().take(MAX_ITEMS) {
                     draw_json_node(ui, Some(k), val, depth + 1);
+                }
+                if m.len() > MAX_ITEMS {
+                    json_dim_label(ui, &format!("… (他 {} 件)", m.len() - MAX_ITEMS));
                 }
             } else {
                 if let Some(k) = key {
                     json_dim_label(ui, &format!("{k}:"));
                 }
                 ui.indent(("sc_obj", depth, key.unwrap_or("")), |ui| {
-                    for (k, val) in m {
+                    for (k, val) in m.iter().take(MAX_ITEMS) {
                         draw_json_node(ui, Some(k), val, depth + 1);
+                    }
+                    if m.len() > MAX_ITEMS {
+                        json_dim_label(ui, &format!("… (他 {} 件)", m.len() - MAX_ITEMS));
                     }
                 });
             }

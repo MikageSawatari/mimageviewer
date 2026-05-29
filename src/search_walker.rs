@@ -697,6 +697,13 @@ mod tests {
         make_file(&root, "a.jpg", b"img");
         make_file(&root, "a.jpg.json", b"{\"x\":1}"); // 7 bytes
 
+        // mtime も同一に固定する。これがないと、置換後 sidecar の mtime 差で
+        // fingerprint 未導入の旧実装でもテストが通ってしまい、P3 修正を直接守れない。
+        let sc_mtime = fs::metadata(root.join("a.jpg.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+
         let r1 = scan_sync(fav, &root, &db);
         assert_eq!(r1.to_ingest.len(), 1);
         let cand = r1.to_ingest[0].clone();
@@ -710,15 +717,21 @@ mod tests {
         )
         .unwrap();
 
-        // full 形式を削除し、同じ 7 バイト・別名の stem 形式に差し替える
+        // full 形式を削除し、同じ 7 バイト・別名・**同一 mtime** の stem 形式に差し替える
         fs::remove_file(root.join("a.jpg.json")).unwrap();
         make_file(&root, "a.json", b"{\"y\":2}"); // 7 bytes
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(root.join("a.json"))
+            .unwrap()
+            .set_modified(sc_mtime)
+            .unwrap();
 
         let r2 = scan_sync(fav, &root, &db);
         assert_eq!(
             r2.to_ingest.len(),
             1,
-            "サイドカーの優先順位切替 (同 size) でも再 ingest される"
+            "サイドカーの優先順位切替 (同 size・同 mtime) でも fingerprint で再 ingest される"
         );
     }
 }
