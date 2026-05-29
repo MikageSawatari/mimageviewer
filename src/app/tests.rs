@@ -4197,6 +4197,49 @@ mod ctrl_f_structural_filter_tests {
     }
 
     #[test]
+    fn sidecar_on_demand_match_value_only() {
+        // docs §14-5: 検索対象「サイドカー」/「すべて」で、画像と同名の JSON サイドカーの
+        // 値を on-demand 読みして照合する (FS 画像のみ)。キー名は索引しない。
+        let tmp = tempfile::TempDir::new().unwrap();
+        let img = tmp.path().join("a.jpg");
+        std::fs::write(&img, b"img").unwrap();
+        std::fs::write(
+            tmp.path().join("a.jpg.json"),
+            br#"{"artist":"karon-t","tags":["1girl"]}"#,
+        )
+        .unwrap();
+        let items = vec![GridItem::Image(img.clone())];
+
+        // 「サイドカー」のみ: 値 (作者名) でヒット
+        let m = run_ctrl_f(
+            "karon",
+            &items,
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Sidecar]),
+        );
+        assert_eq!(
+            m,
+            std::collections::HashSet::from([0]),
+            "サイドカーの値 (作者名) でヒットする"
+        );
+
+        // 「すべて」でも自由語でヒット
+        let m_all = run_ctrl_f("1girl", &items, crate::fts_index::SearchTarget::All);
+        assert_eq!(
+            m_all,
+            std::collections::HashSet::from([0]),
+            "All でもサイドカー値でヒットする"
+        );
+
+        // キー名 (artist) ではヒットしない (値のみ索引)
+        let m_key = run_ctrl_f(
+            "artist",
+            &items,
+            crate::fts_index::SearchTarget::Only(vec![crate::fts_index::SourceKind::Sidecar]),
+        );
+        assert!(m_key.is_empty(), "キー名ではヒットしない: {m_key:?}");
+    }
+
+    #[test]
     fn zip_separator_visible_only_when_group_has_match() {
         // §4.1: separator は付随グループに可視 ZipImage が残るときだけ表示する。
         let zip = PathBuf::from(r"C:\g\book.zip");

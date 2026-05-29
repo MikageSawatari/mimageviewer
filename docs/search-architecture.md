@@ -370,10 +370,11 @@ commit した最新原文を旧値で潰してしまうため、上記 #2 / #3 �
 - **検出**: `<full>.json` → `<full>.txt` → `<stem>.json` → `<stem>.txt` の優先順位で最初の 1 つ。
   サイズ上限 2MB、連結上限 256KB、壊れ JSON は空に倒す。
 - **差分検出**: walker / supervisor は画像候補の **差分用署名** に
-  `max(画像 mtime, サイドカー mtime)` と `画像 size + サイドカー size` を織り込む
-  (`CandidateFile.diff_mtime` / `diff_size`)。これでサイドカーの追加・編集・削除が 3-way diff で
-  検出される。Tantivy doc の `mtime` は画像本体のまま (日付ソートがサイドカー編集時刻に
-  引きずられない)。
+  `diff_mtime = max(画像 mtime, サイドカー mtime)` と
+  `diff_size = 画像 size + サイドカー fingerprint` (ファイル名 + size の安定ハッシュ、無しは 0) を
+  織り込む (`CandidateFile.diff_mtime` / `diff_size`)。これでサイドカーの追加・編集・削除に加え、
+  優先順位プローブの結果が別ファイルに変わったケース (同 mtime/size でも) も 3-way diff で検出される。
+  Tantivy doc の `mtime` は画像本体のまま (日付ソートがサイドカー編集時刻に引きずられない)。
 - **監視追従**: `.json`/`.txt` の変更イベントは `indexer_supervisor::apply_single_change` が
   `external_metadata::images_for_sidecar` で兄弟画像へ逆引きして再 ingest に変換する
   (Remove なら `sidecar_text` がクリアされる)。

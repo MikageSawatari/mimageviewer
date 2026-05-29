@@ -2240,8 +2240,6 @@ pub struct App {
     /// run_metadata_load (worker) が FS 画像のみ埋める (docs/sidecar-metadata-ingest.md §11)。
     pub(crate) sidecar_display_cache:
         std::collections::HashMap<String, Option<crate::external_metadata::SidecarDisplay>>,
-    /// 外部メタデータパネルの「生 JSON」折りたたみの開閉状態。
-    pub(crate) sidecar_raw_open: bool,
     /// 360 度パノラマビュー: インタラクティブステート (フルスクリーン内のみ Some)。
     /// 360 モード ON → Some、OFF → None。equirect でない画像へナビした場合は
     /// **保持しつつ非アクティブ化** する設計 (`is_panorama_mode_active(fs_idx)` で判定)。
@@ -3843,7 +3841,6 @@ impl App {
             xmp_cache: std::collections::HashMap::new(),
             xmp_panorama_info: std::collections::HashMap::new(),
             sidecar_display_cache: std::collections::HashMap::new(),
-            sidecar_raw_open: false,
             panorama_state: None,
             pano_uploaded: None,
             pano_toast_shown_for_current_fs: false,

@@ -54,12 +54,38 @@ pub fn detect_sidecar(image_path: &Path) -> Option<PathBuf> {
     detect_with_meta(image_path).map(|(p, _)| p)
 }
 
-/// 3-way diff 用のサイドカー署名 `(mtime_secs, size)`。
-/// walker / supervisor がこれを画像の署名に織り込み、サイドカーの追加・編集・削除を
-/// 「変化あり」として検出できるようにする (docs §14-3/§14-4)。サイドカー無しは `None`。
-pub fn sidecar_signature(image_path: &Path) -> Option<(i64, i64)> {
-    let (_, md) = detect_with_meta(image_path)?;
-    Some((mtime_secs(&md), md.len() as i64))
+/// 3-way diff 用のサイドカー署名。walker / supervisor がこれを画像の署名に織り込み、
+/// サイドカーの追加・編集・削除・**優先順位の切替** を「変化あり」として検出する
+/// (docs §14-3/§14-4)。サイドカー無しは `None`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SidecarSig {
+    /// 選択されたサイドカーの mtime (秒)。差分用 mtime に `max` で織り込む。
+    pub mtime: i64,
+    /// サイドカーの識別子: **ファイル名 + size** のハッシュ (常に 1 以上の有界値)。
+    /// 差分用 size に加算することで、size 変化だけでなく
+    /// 「`a.jpg.json` 消失 → 同 mtime/size の `a.json` に切替」のような
+    /// **優先順位プローブの結果が変わったケース** も検出する (Codex P3)。
+    pub fingerprint: i64,
+}
+
+/// 画像に対応するサイドカーの 3-way diff 署名。無ければ `None`。
+pub fn sidecar_signature(image_path: &Path) -> Option<SidecarSig> {
+    let (path, md) = detect_with_meta(image_path)?;
+    let size = md.len() as i64;
+    // ファイル名 + size を安定ハッシュ。DefaultHasher は固定鍵 SipHash なので run/プロセスを
+    // またいで決定的 (Rust バージョン更新で値が変わっても、最悪 1 度の再 ingest で済む)。
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        name.hash(&mut h);
+    }
+    size.hash(&mut h);
+    // i64 に収め、加算しても画像 size と合わせて i64 を溢れさせない有界値 (約 30bit) + 1。
+    let fingerprint = (h.finish() % 1_000_000_007) as i64 + 1;
+    Some(SidecarSig {
+        mtime: mtime_secs(&md),
+        fingerprint,
+    })
 }
 
 /// 画像に対応するサイドカーから検索用テキストを取り出す。
@@ -376,8 +402,29 @@ mod tests {
         let img = write(tmp.path(), "e.jpg", b"img");
         assert!(sidecar_signature(&img).is_none());
         write(tmp.path(), "e.jpg.json", br#"{"a":1}"#);
-        let (_mtime, size) = sidecar_signature(&img).unwrap();
-        assert!(size > 0);
+        let sig = sidecar_signature(&img).unwrap();
+        assert!(
+            sig.fingerprint >= 1,
+            "present sidecar fingerprint must be >= 1"
+        );
+    }
+
+    #[test]
+    fn fingerprint_differs_for_same_size_priority_switch() {
+        // Codex P3: `a.jpg.json` (優先1) 消失 → 同 size の `a.json` (優先3) に切替わったとき、
+        // mtime/size が偶然一致しても fingerprint がファイル名を含むので署名が変わる。
+        let tmp = TempDir::new().unwrap();
+        let img = write(tmp.path(), "p.jpg", b"img");
+        // 同じ 7 バイト・別内容の 2 つのサイドカー (full 形式 / stem 形式)
+        write(tmp.path(), "p.jpg.json", br#"{"x":1}"#);
+        let sig_full = sidecar_signature(&img).unwrap();
+        std::fs::remove_file(tmp.path().join("p.jpg.json")).unwrap();
+        write(tmp.path(), "p.json", br#"{"y":2}"#);
+        let sig_stem = sidecar_signature(&img).unwrap();
+        assert_ne!(
+            sig_full.fingerprint, sig_stem.fingerprint,
+            "ファイル名が違えば size が同じでも fingerprint は変わるべき"
+        );
     }
 
     #[test]

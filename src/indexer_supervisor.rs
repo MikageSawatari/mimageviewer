@@ -688,7 +688,7 @@ fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<
     // 署名が保存され、次回起動の walker 3-way diff と整合する。
     let (diff_mtime, diff_size) = if kind == search_walker::CandidateKind::Image {
         match crate::external_metadata::sidecar_signature(abs_path) {
-            Some((sc_mtime, sc_size)) => (mtime.max(sc_mtime), file_size + sc_size),
+            Some(sig) => (mtime.max(sig.mtime), file_size + sig.fingerprint),
             None => (mtime, file_size),
         }
     } else {

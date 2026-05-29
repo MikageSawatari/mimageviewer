@@ -282,7 +282,7 @@ impl App {
                         ui.separator();
                         ui.add_space(8.0);
                     }
-                    draw_sidecar_section(ui, sc, &mut self.sidecar_raw_open);
+                    draw_sidecar_section(ui, sc);
                 }
 
                 // 何もない場合
@@ -725,14 +725,10 @@ fn draw_collapsible_json_section(
     }
 }
 
-/// 外部メタデータ (サイドカー) セクション。JSON は汎用 key/value ツリー + 生 JSON 折りたたみ、
+/// 外部メタデータ (サイドカー) セクション。JSON は汎用 key/value ツリー、
 /// TXT はテキスト表示 (docs/sidecar-metadata-ingest.md §11)。
 /// 特定スキーマの代表フィールドをハードコードしない (どんな JSON でも同一ロジック)。
-fn draw_sidecar_section(
-    ui: &mut egui::Ui,
-    sc: &crate::external_metadata::SidecarDisplay,
-    raw_open: &mut bool,
-) {
+fn draw_sidecar_section(ui: &mut egui::Ui, sc: &crate::external_metadata::SidecarDisplay) {
     ui.label(
         egui::RichText::new("外部メタデータ")
             .color(egui::Color32::WHITE)
@@ -743,37 +739,6 @@ fn draw_sidecar_section(
     match sc {
         crate::external_metadata::SidecarDisplay::Json(v) => {
             draw_json_node(ui, None, v, 0);
-            ui.add_space(6.0);
-            // 生 JSON は折りたたみ。**開いたときだけ** pretty-print する。サイドカーは最大 2MB
-            // 許容するので、毎フレーム to_string_pretty するとパネルがカクつく (Codex P2)。
-            let label = if *raw_open {
-                "▼ 生 JSON"
-            } else {
-                "▶ 生 JSON"
-            };
-            if ui
-                .selectable_label(
-                    *raw_open,
-                    egui::RichText::new(label).color(DIM_COLOR).size(BODY_FONT),
-                )
-                .clicked()
-            {
-                *raw_open = !*raw_open;
-            }
-            if *raw_open {
-                let pretty = serde_json::to_string_pretty(v).unwrap_or_default();
-                egui::ScrollArea::vertical()
-                    .id_salt("sidecar_raw_json")
-                    .max_height(300.0)
-                    .show(ui, |ui| {
-                        ui.label(
-                            egui::RichText::new(pretty)
-                                .color(JSON_COLOR)
-                                .size(11.0)
-                                .monospace(),
-                        );
-                    });
-            }
         }
         crate::external_metadata::SidecarDisplay::Text(t) => {
             egui::ScrollArea::vertical()
@@ -808,8 +773,13 @@ fn json_dim_label(ui: &mut egui::Ui, text: &str) {
 
 /// JSON 値を 1 ノード描画する。スカラは `key: value`、スカラ配列は 1 行、
 /// ネストした配列/オブジェクトはインデントして再帰。深さ上限で打ち切る。
+///
+/// egui は immediate-mode なのでパネル表示中は毎フレーム再描画される。サイドカーは最大 2MB
+/// 許容するため、巨大配列を毎フレーム全件 join / 全件 widget 化すると重い (Codex P2)。
+/// 配列は先頭 `MAX_ITEMS` 件までに制限し、残りは件数表示にする。
 fn draw_json_node(ui: &mut egui::Ui, key: Option<&str>, v: &serde_json::Value, depth: usize) {
     const MAX_DEPTH: usize = 8;
+    const MAX_ITEMS: usize = 100;
     if let Some(s) = json_scalar_str(v) {
         draw_key_value_wrapped(ui, key.unwrap_or("-"), &s);
         return;
@@ -817,12 +787,16 @@ fn draw_json_node(ui: &mut egui::Ui, key: Option<&str>, v: &serde_json::Value, d
     match v {
         serde_json::Value::Array(a) => {
             if a.iter().all(|e| json_scalar_str(e).is_some()) {
-                // スカラのみの配列は 1 行に連結
-                let joined = a
+                // スカラのみの配列は 1 行に連結 (先頭 MAX_ITEMS 件まで)
+                let mut joined = a
                     .iter()
+                    .take(MAX_ITEMS)
                     .filter_map(json_scalar_str)
                     .collect::<Vec<_>>()
                     .join(", ");
+                if a.len() > MAX_ITEMS {
+                    joined.push_str(&format!(" … (他 {} 件)", a.len() - MAX_ITEMS));
+                }
                 draw_key_value_wrapped(ui, key.unwrap_or("-"), &joined);
             } else if depth >= MAX_DEPTH {
                 draw_key_value_wrapped(ui, key.unwrap_or("-"), &format!("[{} 件]", a.len()));
@@ -831,8 +805,11 @@ fn draw_json_node(ui: &mut egui::Ui, key: Option<&str>, v: &serde_json::Value, d
                     json_dim_label(ui, &format!("{k}:"));
                 }
                 ui.indent(("sc_arr", depth, key.unwrap_or("")), |ui| {
-                    for (i, e) in a.iter().enumerate() {
+                    for (i, e) in a.iter().take(MAX_ITEMS).enumerate() {
                         draw_json_node(ui, Some(&format!("[{i}]")), e, depth + 1);
+                    }
+                    if a.len() > MAX_ITEMS {
+                        json_dim_label(ui, &format!("… (他 {} 件)", a.len() - MAX_ITEMS));
                     }
                 });
             }

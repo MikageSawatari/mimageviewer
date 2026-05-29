@@ -276,7 +276,10 @@ if !is_video_sidecar {
     同一ロジックで表示する。
   - **キー名は表示する** (可読性のため)。これは検索 (`sidecar_text` は値のみ) とは別レイヤーであり、
     矛盾しない。
-  - 任意で「生 JSON (整形)」トグルを下部に置く。
+  - 配列は毎フレーム全件 join / widget 化すると重い (最大 2MB 許容) ため、先頭 100 件までに
+    制限して残りは件数表示にする。
+  - 「生 JSON (整形)」トグルは設けない (数行の小窓スクロールで実用性が低く、毎フレームの
+    pretty-print コストもかかるため。key/value ツリーで十分)。
 - **TXT**: テキストをそのまま表示 (スクロール)。
 - **読み込み**: パネル描画時に都度読むと重いので、選択画像切替時に worker (`run_metadata_load`) で
   1 度読んでキャッシュする (`MetadataLoadResult` に sidecar を追加、`poll_metadata_load` で新
@@ -361,13 +364,22 @@ if !is_video_sidecar {
    notify の rename は `From`/`To`/`Both` に分かれて届く (search_watcher の `absorb_event`) ので、
    旧名・新名の双方について影響画像を再 ingest する。
 
-3. **削除・古いサイドカーの差分検出 (P1)**: 実効 mtime = `max(画像, サイドカー)` **だけでは不十分**。
-   サイドカー mtime が画像 mtime 以下のとき、サイドカーを削除しても `(mtime, size)` 差分が「変化なし」に
-   見え、stale な `sidecar_text` が索引に残る。対策: **3-way diff の比較シグネチャにサイドカーの
-   存在・mtime・size を織り込む**。具体的には walker が組み立てる比較用 `file_size` に
-   サイドカーの size を加味する (例: 画像 size とサイドカー size を合算 / サイドカー無しは 0)、
-   かつ比較用 mtime に実効 mtime を使う。これで「サイドカー追加 / 編集 / 削除」のいずれでも差分が立つ。
-   回帰テスト: サイドカーが画像より古い状態での「削除 → 再 ingest で `sidecar_text` がクリアされる」。
+3. **削除・古いサイドカー・優先順位切替の差分検出 (P1 + Codex 実装 P3)**: 実効 mtime =
+   `max(画像, サイドカー)` **だけでは不十分**。サイドカー mtime が画像 mtime 以下のとき、サイドカーを
+   削除/編集しても mtime 差分が「変化なし」に見え、stale な `sidecar_text` が索引に残る。さらに
+   `a.jpg.json` (優先1) 消失 → 同 mtime/size の `a.json` (優先3) に切替わったケースも mtime/size だけでは
+   検出できない。対策: **3-way diff の比較シグネチャ (`CandidateFile.diff_mtime` / `diff_size`) に
+   サイドカーの mtime + fingerprint を織り込む**。
+   - `diff_mtime = max(画像 mtime, サイドカー mtime)` (編集を検出)
+   - `diff_size = 画像 size + サイドカー fingerprint` (サイドカー無しは 0)。fingerprint は
+     `external_metadata::sidecar_signature` が返す **選択サイドカーのファイル名 + size の安定ハッシュ**
+     (常に 1 以上)。これで「追加 / 編集 / 削除」に加え「優先順位プローブの結果が別ファイルに変わった」
+     ケースも (同 mtime/size でも) 検出できる。
+   - `diff_mtime` / `diff_size` は **差分判定専用トークン**で fts_meta にのみ保存。Tantivy doc の
+     `mtime` は画像本体の mtime のままなので、日付ソートはサイドカー編集時刻に引きずられない (§14-4)。
+   回帰テスト: `search_walker::tests::sidecar_removal_re_ingests_image` (削除 → 再 ingest) /
+   `sidecar_priority_switch_same_size_re_ingests` (同 size の優先順位切替) /
+   `external_metadata::tests::fingerprint_differs_for_same_size_priority_switch`。
 
 4. **比較用 mtime と表示 / ソート用 mtime を分離する (P3 → 格上げ運用)**: Tantivy doc の `mtime`
    フィールドは Ctrl+G 一覧の **日付ソート**に使われる (`doc_mtime`)。ここに実効 mtime

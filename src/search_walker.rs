@@ -310,7 +310,7 @@ fn walk_dir_recursive(
         // 検出は per-file の存在チェック (最大 4 回) + サイドカー 1 件の stat。
         let (diff_mtime, diff_size) = if kind == CandidateKind::Image {
             match crate::external_metadata::sidecar_signature(&path) {
-                Some((sc_mtime, sc_size)) => (mtime.max(sc_mtime), file_size + sc_size),
+                Some(sig) => (mtime.max(sig.mtime), file_size + sig.fingerprint),
                 None => (mtime, file_size),
             }
         } else {
@@ -647,5 +647,78 @@ mod tests {
         );
         // cancel 中は Err("cancelled") または 早期に空の ScanResult が返る
         assert!(r.is_err() || r.unwrap().total_scanned < 50);
+    }
+
+    #[test]
+    fn sidecar_removal_re_ingests_image() {
+        // サイドカーを後から削除したら、画像本体が変わっていなくても再 ingest 候補になる
+        // (stale な sidecar_text をクリアするため。docs §14-3)。
+        let fav = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("scrm");
+        fs::create_dir_all(&root).unwrap();
+        make_file(&root, "a.jpg", b"img");
+        make_file(&root, "a.jpg.json", b"{\"k\":\"value\"}");
+
+        // 1 回目: サイドカーありの差分署名で DB を seed する
+        let r1 = scan_sync(fav, &root, &db);
+        assert_eq!(r1.to_ingest.len(), 1);
+        let cand = r1.to_ingest[0].clone();
+        db.upsert_meta_ok(
+            &cand.key,
+            fav,
+            &root,
+            IndexKind::Image,
+            cand.diff_mtime,
+            cand.diff_size,
+        )
+        .unwrap();
+
+        // 2 回目: 変化なし
+        let r2 = scan_sync(fav, &root, &db);
+        assert_eq!(r2.unchanged, 1, "サイドカー不変なら再 ingest しない");
+        assert!(r2.to_ingest.is_empty());
+
+        // サイドカー削除 → 3 回目で差分検出される
+        fs::remove_file(root.join("a.jpg.json")).unwrap();
+        let r3 = scan_sync(fav, &root, &db);
+        assert_eq!(r3.to_ingest.len(), 1, "サイドカー削除で再 ingest される");
+        assert_eq!(r3.unchanged, 0);
+    }
+
+    #[test]
+    fn sidecar_priority_switch_same_size_re_ingests() {
+        // Codex P3: `a.jpg.json` (優先1) 消失 → 同 size の `a.json` (優先3) に切替わったとき、
+        // mtime/size が偶然一致しても差分署名の fingerprint がファイル名を含むので検出される。
+        let fav = Uuid::new_v4();
+        let (tmp, db) = tmp_db();
+        let root = tmp.path().join("scsw");
+        fs::create_dir_all(&root).unwrap();
+        make_file(&root, "a.jpg", b"img");
+        make_file(&root, "a.jpg.json", b"{\"x\":1}"); // 7 bytes
+
+        let r1 = scan_sync(fav, &root, &db);
+        assert_eq!(r1.to_ingest.len(), 1);
+        let cand = r1.to_ingest[0].clone();
+        db.upsert_meta_ok(
+            &cand.key,
+            fav,
+            &root,
+            IndexKind::Image,
+            cand.diff_mtime,
+            cand.diff_size,
+        )
+        .unwrap();
+
+        // full 形式を削除し、同じ 7 バイト・別名の stem 形式に差し替える
+        fs::remove_file(root.join("a.jpg.json")).unwrap();
+        make_file(&root, "a.json", b"{\"y\":2}"); // 7 bytes
+
+        let r2 = scan_sync(fav, &root, &db);
+        assert_eq!(
+            r2.to_ingest.len(),
+            1,
+            "サイドカーの優先順位切替 (同 size) でも再 ingest される"
+        );
     }
 }
