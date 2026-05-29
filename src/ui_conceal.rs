@@ -21,7 +21,6 @@ use std::sync::Arc;
 
 use crate::app::{App, ConcealSnapshot, EraseSpreadCtx};
 use crate::conceal::ConcealTool;
-use crate::fs_animation::FsCacheEntry;
 use crate::mask_db::{LineKind, Shape, ShapeOp};
 use crate::ui_fullscreen::FsKeyAction;
 use crate::ui_fullscreen::draw_icons::{PanelToggleColors, panel_toggle_button};
@@ -92,29 +91,16 @@ impl App {
         };
         let target_idx = spread_pair.map(|(l, _)| l).unwrap_or(fs_idx);
 
-        // 元画像取得 (state mutation 前)。conceal_base_cache を優先、なければ
-        // adjustment_cache / ai_upscale_cache / fs_cache の順で探す。
-        let pixels = if let Some(base) = self.conceal_base_cache.get(&target_idx) {
-            Arc::clone(base)
-        } else {
-            let bg = self.effective_upscale_bg_mode();
-            let from_cache = self
-                .ai_upscale_cache
-                .get(&(target_idx, bg))
-                .or_else(|| self.fs_cache.get(&target_idx))
-                .and_then(|entry| match entry {
-                    FsCacheEntry::Static { pixels, .. } => Some(Arc::clone(pixels)),
-                    _ => None,
-                });
-            match from_cache {
-                Some(p) => {
-                    self.conceal_base_cache.insert(target_idx, Arc::clone(&p));
-                    p
-                }
-                None => {
-                    crate::logger::log("conceal: enter aborted (no base pixels)".to_string());
-                    return;
-                }
+        // 元画像取得 (state mutation 前)。プレビュー合成と同じ優先順位
+        // (erase_result > adjustment > ai_upscale > fs) で source を決める。
+        let (pixels, source_kind) = match self.current_conceal_source_pixels(target_idx) {
+            Some((p, kind)) => {
+                self.conceal_base_cache.insert(target_idx, Arc::clone(&p));
+                (p, kind)
+            }
+            None => {
+                crate::logger::log("conceal: enter aborted (no base pixels)".to_string());
+                return;
             }
         };
 
@@ -172,7 +158,7 @@ impl App {
         self.conceal_mask = Some(loaded_mask);
         self.conceal_shapes = loaded_shapes;
         crate::logger::log(format!(
-            "conceal: enter mode, image={w}x{h}, shapes={}, type={:?}, tool={:?}",
+            "conceal: enter mode, source={source_kind}, image={w}x{h}, shapes={}, type={:?}, tool={:?}",
             self.conceal_shapes.len(),
             self.settings.conceal_type,
             self.conceal_tool,
@@ -195,6 +181,19 @@ impl App {
         // 順序保証のためここで実施する)。
         if was_conceal_mode {
             if let Some(idx) = self.fullscreen_idx {
+                // キーボードで mid-drag 終了された場合も、保存前の解像度同期を
+                // ブロックしないよう中間状態だけ先に畳む。未確定の線/矩形/lasso は
+                // 通常の release 前キャンセルとして破棄される。
+                self.conceal_drag = None;
+                self.conceal_last_paint_pos = None;
+                self.conceal_lasso_points.clear();
+                self.conceal_line_start = None;
+                self.conceal_line_end = None;
+                self.conceal_shape_drag_start = None;
+                self.conceal_shape_drag_end = None;
+                if let Some((pixels, _)) = self.current_conceal_source_pixels(idx) {
+                    self.rescale_active_conceal_edit_to_size(idx, pixels.size, "exit_save");
+                }
                 let [w, h] = self.conceal_mask_size;
                 if let Some(mask) = self.conceal_mask.clone() {
                     let shapes = self.conceal_shapes.clone();
@@ -453,6 +452,17 @@ impl App {
         if ctrl_m {
             self.reset_conceal_mode();
             return action;
+        }
+
+        // G: 通常フルスクリーンと同じピクセル境界グリッドの表示切替。
+        let key_g = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::G));
+        if key_g {
+            self.fs_pixel_grid_enabled = !self.fs_pixel_grid_enabled;
+            self.show_feedback_toast(if self.fs_pixel_grid_enabled {
+                "[ピクセルグリッド ON]".to_string()
+            } else {
+                "[ピクセルグリッド OFF]".to_string()
+            });
         }
 
         // Ctrl+Z: Undo
@@ -1368,6 +1378,13 @@ impl App {
             ShapeOp::Subtract
         };
         self.conceal_shapes.push(shape.with_op(op));
+        crate::logger::log(format!(
+            "conceal: shape commit tool={:?} op={op:?} mask={}x{} shapes={}",
+            self.conceal_tool,
+            self.conceal_mask_size[0],
+            self.conceal_mask_size[1],
+            self.conceal_shapes.len(),
+        ));
         // 新規 shape を自動選択 (実機 FB)。コミット直後にハンドルが描画される
         // ので、ユーザーは [S] で選択ツールへ切替→ハンドル操作で太さ/サイズを
         // 微調整できる (= 「線幅をパネルで設定 → 引いた線にハンドルで調整」
@@ -2293,16 +2310,22 @@ impl App {
                                         }
 
                                         ui.separator();
-                                        ui.label(
-                                            egui::RichText::new(
-                                                "Shift+ハンドル: 軸拘束 / 等比 / 15°snap\n\
-                                 Alt+ハンドル: 中心固定\n\
-                                 T: タイプ切替  1-4: プリセット適用\n\
-                                 Ctrl+Z: 元に戻す  Delete: 選択削除\n\
-                                 Esc / Ctrl+M: 終了 (DB 保存)",
+                                        let help = "Space+ドラッグ:一時パン\n\
+                                            ホイール:筆/線のサイズ\n\
+                                            矢印:選択/全体を移動 (Ctrl:10倍)\n\
+                                            Shift+ハンドル:拘束/等比/15°snap\n\
+                                            Alt+ハンドル:中心固定\n\
+                                            T:タイプ  G:グリッド  1-4:プリセット\n\
+                                            Ctrl+Z:戻す  Delete:選択削除\n\
+                                            Esc:解除/終了  Ctrl+M:終了\n\
+                                            終了時はDB保存";
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(help)
+                                                    .size(10.5)
+                                                    .color(egui::Color32::from_gray(190)),
                                             )
-                                            .size(11.0)
-                                            .color(egui::Color32::from_gray(190)),
+                                            .wrap(),
                                         );
                                     }); // ScrollArea::show
                             },

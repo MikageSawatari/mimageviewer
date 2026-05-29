@@ -9,7 +9,7 @@
 //! # Phase 2b 移行ノート
 //!
 //! - Select ツールのハンドル操作は [`crate::vector_edit`] 経由に統一
-//!   (旧 Ctrl+ドラッグ複合操作 = 垂直回転・水平太さ変更 は廃止、専用ハンドル方式に置換)
+//!   (旧 Line の Ctrl+ドラッグ複合操作 = 垂直回転・水平太さ変更 は廃止、専用ハンドル方式に置換)
 //! - ベクタオブジェクトは `Vec<LineObject>` → `Vec<Shape>` に変更
 //!   (旧 mask_db データは `shapes_from_json` で `Shape::Line` として自動変換)
 //! - 新ツール: Rect / Ellipse (Phase 0b、`Shape::Rect` / `Shape::Ellipse` を作成)
@@ -2265,13 +2265,14 @@ impl App {
                         // 長い 1 行はパネル幅キャップ (= PANEL_W) で折り返される。
                         // Label に `.wrap()` を付けないと TextWrapMode::Extend で
                         // 1 行が PANEL_W を超えて Frame::popup を広げる原因になる。
-                        let help = "E:補完 ESC:終了/選択解除 Ctrl+Z:戻す\n\
+                        let help = "E/Esc:補完して終了 (選択中Esc:解除)\n\
+                            Space+ドラッグ:一時パン\n\
+                            ホイール:筆/直線のサイズ\n\
                             矢印:シフト [/]:回転 (Ctrl:10倍)\n\
-                            Space+ドラッグ:パン操作\n\
-                            Ctrl+ドラッグ: 筆→太さ\n\
-                            \u{00A0}縦横線→パン/傾き\n\
-                            選択ツール+クリック=選択  Del:削除\n\
-                            描画後はそのままハンドルで微調整可";
+                            Ctrl+ドラッグ:筆サイズ / 縦横線調整\n\
+                            S:選択/ハンドル微調整\n\
+                            Shift/Alt+ハンドル:拘束/中心固定\n\
+                            Ctrl+Z:戻す  Del:選択削除";
                                         ui.add(
                                             egui::Label::new(
                                                 egui::RichText::new(help)

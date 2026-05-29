@@ -2593,6 +2593,8 @@ pub struct App {
     /// ルーペ常時表示トグル (M キー)。Shift ホールドは独立に追加表示される。
     /// フルスクリーンを閉じても保持されるが、フォーカス喪失中はレンダリングしない。
     pub(crate) fs_loupe_locked: bool,
+    /// 高倍率時のピクセル境界グリッド表示。実画像は線形補間のまま、表示補助だけ重ねる。
+    pub(crate) fs_pixel_grid_enabled: bool,
     /// 見開きモード描画後のページ矩形。ルーペ描画がカーソル位置から該当ページを
     /// 特定するのに使う。毎フレーム描画後に更新、非見開き時は None。
     pub(crate) fs_spread_layout: Option<crate::ui_fullscreen::FsSpreadLayout>,
@@ -3017,7 +3019,9 @@ pub struct App {
     pub(crate) conceal_shapes: Vec<crate::mask_db::Shape>,
     /// 選択中の Shape インデックス (`conceal_shapes` への添字、Phase 2 で使用)。
     pub(crate) conceal_selected_shape: Option<usize>,
-    /// 元画像 (補正等を適用した状態) のキャッシュ。Phase 3 の `conceal_cache` 入力。
+    /// 隠蔽モード入場時の表示ソース退避キャッシュ。
+    /// プレビュー合成は毎回 `current_conceal_source_pixels` で現行ソースを解決し、
+    /// これは編集中ページで現行ソースを取得できない場合のフォールバックとして使う。
     pub(crate) conceal_base_cache:
         std::collections::HashMap<usize, std::sync::Arc<egui::ColorImage>>,
     /// マスク永続化 DB (Phase 1 で boot 時に open、フォルダ非依存)。
@@ -3900,6 +3904,7 @@ impl App {
             fs_free_rotation: 0.0,
             fs_rotation_drag_start: None,
             fs_loupe_locked: false,
+            fs_pixel_grid_enabled: true,
             fs_spread_layout: None,
             fs_transparent_bg_mode: 0,
             fs_checker_texture: None,
@@ -16243,6 +16248,9 @@ impl App {
             // AI 結果が conceal の入力レイヤになるので、stale を残すと低解像度ベースの
             // 隠蔽が固定表示されてしまう。
             self.clear_conceal_caches(idx);
+            if self.fullscreen_idx == Some(idx) && self.effective_upscale_bg_mode() == bg {
+                self.rescale_active_conceal_edit_to_size(idx, [w, h], "ai_complete");
+            }
             // 消しゴム編集中の表示テクスチャも invalidate して、`ensure_erase_base_texture`
             // が次フレームで新しい ai_upscale_cache を取り直すようにする
             // (= AI 完了が編集中に起こった場合、解像度が低い状態に張り付くのを防ぐ)。
@@ -16907,6 +16915,83 @@ impl App {
         self.conceal_cache.remove(&idx);
     }
 
+    fn active_conceal_edit_in_progress(&self) -> bool {
+        self.conceal_last_paint_pos.is_some()
+            || self.conceal_line_start.is_some()
+            || self.conceal_shape_drag_start.is_some()
+            || self.conceal_drag.is_some()
+            || !self.conceal_lasso_points.is_empty()
+    }
+
+    fn conceal_rescale_exact_enough(shapes: &[crate::mask_db::Shape], sx: f32, sy: f32) -> bool {
+        (sx - sy).abs() < 1e-3
+            || shapes.iter().all(|shape| match shape {
+                crate::mask_db::Shape::Line { .. } => true,
+                crate::mask_db::Shape::Rect { rotation_rad, .. }
+                | crate::mask_db::Shape::Ellipse { rotation_rad, .. } => rotation_rad.abs() < 1e-3,
+            })
+    }
+
+    /// 隠蔽編集中に表示ソース解像度が変わった場合、in-memory の bitmap/Shape を
+    /// ソース解像度へ一度だけ追従させる。ドラッグ中は中間座標が旧解像度なので
+    /// 完了後の compose まで延期し、プレビュー側の一時リスケールに任せる。
+    ///
+    /// NOTE: AI 完了以外で表示ソース解像度が変わる新規経路を追加する場合は、
+    /// 該当 hook からこの関数を呼ぶ。呼び忘れても `compose_source_mismatch` で
+    /// 同期されるが、ドラッグ中は一時リスケールの保険パスになる。
+    pub(crate) fn rescale_active_conceal_edit_to_size(
+        &mut self,
+        idx: usize,
+        target_size: [usize; 2],
+        reason: &'static str,
+    ) -> bool {
+        if !self.conceal_mode
+            || self.fullscreen_idx != Some(idx)
+            || self.conceal_mask.is_none()
+            || self.active_conceal_edit_in_progress()
+        {
+            return false;
+        }
+
+        let [mw, mh] = self.conceal_mask_size;
+        let [tw, th] = target_size;
+        if [mw, mh] == [tw, th] || mw == 0 || mh == 0 || tw == 0 || th == 0 {
+            return false;
+        }
+
+        let sx = tw as f32 / mw as f32;
+        let sy = th as f32 / mh as f32;
+        debug_assert!(
+            Self::conceal_rescale_exact_enough(&self.conceal_shapes, sx, sy),
+            "non-isotropic conceal mask rescale with rotated shapes is approximate"
+        );
+        if !Self::conceal_rescale_exact_enough(&self.conceal_shapes, sx, sy) {
+            crate::logger::log(format!(
+                "conceal: non-isotropic active edit rescale is approximate idx={idx} reason={reason} {mw}x{mh}->{tw}x{th}"
+            ));
+        }
+
+        let t0 = std::time::Instant::now();
+        if let Some(mask) = self.conceal_mask.take() {
+            self.conceal_mask = Some(crate::mask_db::rescale_mask(&mask, mw, mh, tw, th));
+        }
+        for shape in &mut self.conceal_shapes {
+            shape.scale_xy(sx, sy);
+        }
+        self.conceal_mask_size = [tw, th];
+        self.conceal_mask_texture = None;
+        self.conceal_undo_stack.clear();
+        self.conceal_last_undo_at = None;
+        self.clear_conceal_caches(idx);
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        crate::logger::log(format!(
+            "conceal: active edit rescaled idx={idx} reason={reason} {mw}x{mh}->{tw}x{th} shapes={} {:.0}ms undo_cleared=true",
+            self.conceal_shapes.len(),
+            ms,
+        ));
+        true
+    }
+
     fn cancel_erase_commit_pending_for_idx(&mut self, idx: usize) {
         let key = crate::ui_erase::EraseInpaintPendingKey {
             idx,
@@ -17051,6 +17136,35 @@ impl App {
         Some(tex)
     }
 
+    /// 隠蔽合成の入力になる現在の表示ソースを返す。
+    ///
+    /// 表示パイプライン上は `erase_result > adjustment > ai_upscale > fs`。隠蔽モード
+    /// 入場時とプレビュー合成時で同じ優先順位を使い、AI アップスケール完了前後で
+    /// マスク解像度だけが取り残される状態を避ける。
+    pub(crate) fn current_conceal_source_pixels(
+        &self,
+        idx: usize,
+    ) -> Option<(std::sync::Arc<egui::ColorImage>, &'static str)> {
+        if let Some(pixels) = self.current_erase_result_pixels(idx) {
+            return Some((pixels, "erase_result"));
+        }
+        if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx) {
+            return Some((Arc::clone(pixels), "adjustment"));
+        }
+
+        let bg = self.effective_upscale_bg_mode();
+        if self.ai_will_apply_to(idx) {
+            if let Some(FsCacheEntry::Static { pixels, .. }) = self.ai_upscale_cache.get(&(idx, bg))
+            {
+                return Some((Arc::clone(pixels), "ai_upscale"));
+            }
+        }
+        if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) {
+            return Some((Arc::clone(pixels), "fs"));
+        }
+        None
+    }
+
     /// 隠蔽グローバルパラメータが変わったことを世代番号で表現する (lazy eviction)。
     /// 旧 entry は `generation` が古いままで残り、次に display pipeline がそれを
     /// lookup したとき stale 判定で miss 扱いになる → 必要なものだけ再合成。
@@ -17117,49 +17231,55 @@ impl App {
         }
 
         // 入力ピクセル取得: spec §3.1 の優先順位 (erase_result > adj > ai > fs)。
-        // ai_upscale_cache は AI 機能が実効的に動いているときだけ参照する
-        // (= 設定 ON でもサイズ閾値超でスキップされる画像は旧キャッシュ残骸を
-        // 拾わない、`resolve_pano_source` と同じガード方針)。
-        let bg = self.effective_upscale_bg_mode();
-        let ai_effective = self.ai_will_apply_to(idx);
-        let source_pixels = if let Some(pixels) = self.current_erase_result_pixels(idx) {
-            Some(pixels)
-        } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx) {
-            Some(Arc::clone(pixels))
-        } else if ai_effective {
-            if let Some(FsCacheEntry::Static { pixels, .. }) = self.ai_upscale_cache.get(&(idx, bg))
-            {
-                Some(Arc::clone(pixels))
-            } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) {
-                Some(Arc::clone(pixels))
-            } else {
-                None
-            }
-        } else if let Some(FsCacheEntry::Static { pixels, .. }) = self.fs_cache.get(&idx) {
-            Some(Arc::clone(pixels))
-        } else {
-            None
-        };
-        let source_pixels = source_pixels?;
+        // 編集中に AI アップスケールが完了することがあるため、プレビュー時も現在の
+        // 表示ソースを取り直し、下の in-memory マスク解像度補正で追従する。
+        // `conceal_base_cache` は入場時ソースなので、古い他ページの値を拾わないよう
+        // 編集中ページのフォールバックに限定する。
+        let (source_pixels, source_kind) =
+            self.current_conceal_source_pixels(idx).or_else(|| {
+                editing_this_idx
+                    .then(|| {
+                        self.conceal_base_cache
+                            .get(&idx)
+                            .map(|p| (Arc::clone(p), "edit_base"))
+                    })
+                    .flatten()
+            })?;
         let [w, h] = source_pixels.size;
         if w == 0 || h == 0 {
             return None;
         }
 
         // マスク + Shape の取得元: 編集中ページは in-memory、それ以外は DB。
-        // 編集中の `self.conceal_mask_size` が source_pixels の `[w, h]` と
-        // 一致しないと bitmap が壊れるため、サイズ不一致時は DB からスケール後の
-        // データを取り直す。通常は `enter_conceal_mode` で size を合わせるので
-        // 一致するはず。
-        let (bitmap, shapes) = if editing_this_idx
-            && self.conceal_mask.is_some()
-            && self.conceal_mask_size == [w, h]
-        {
+        // 編集中に AI アップスケールが完了すると source_pixels の `[w, h]` が
+        // `self.conceal_mask_size` と変わる。通常は AI 完了 hook で in-memory state を
+        // 一度だけ追従済みだが、ドラッグ中など hook が延期したケースはここで再試行する。
+        if editing_this_idx && self.conceal_mask.is_some() && self.conceal_mask_size != [w, h] {
+            self.rescale_active_conceal_edit_to_size(idx, [w, h], "compose_source_mismatch");
+        }
+        // それでもサイズが違う場合 (ドラッグ中など) だけ一時 clone をリスケールする。
+        // DB はモード終了まで stale なので、ここで DB フォールバックすると最後に追加した
+        // オブジェクトがプレビューに乗らない。
+        let mut scaled_edit_mask = false;
+        let (bitmap, shapes) = if editing_this_idx && self.conceal_mask.is_some() {
             // in-memory state を直接使う (DB は最終保存時のみ)。
-            (
-                self.conceal_mask.as_ref().unwrap().clone(),
-                self.conceal_shapes.clone(),
-            )
+            let [mw, mh] = self.conceal_mask_size;
+            let mut bitmap = self.conceal_mask.as_ref().unwrap().clone();
+            let mut shapes = self.conceal_shapes.clone();
+            if [mw, mh] != [w, h] {
+                bitmap = crate::mask_db::rescale_mask(&bitmap, mw, mh, w, h);
+                let sx = w as f32 / mw.max(1) as f32;
+                let sy = h as f32 / mh.max(1) as f32;
+                debug_assert!(
+                    Self::conceal_rescale_exact_enough(&shapes, sx, sy),
+                    "non-isotropic conceal mask rescale with rotated shapes is approximate"
+                );
+                for shape in &mut shapes {
+                    shape.scale_xy(sx, sy);
+                }
+                scaled_edit_mask = true;
+            }
+            (bitmap, shapes)
         } else {
             // 他ページ or サイズ不一致時: DB から取得 (= モード退出時の状態)。
             let key = self.page_path_key(idx)?;
@@ -17194,6 +17314,8 @@ impl App {
             }
             return None;
         }
+
+        let compose_t0 = std::time::Instant::now();
 
         // タイプ別合成 (Phase 3b で Fill を追加、Blur は Phase 3c 待ちで当面 Mosaic
         // にフォールバック)。
@@ -17233,12 +17355,27 @@ impl App {
                 self.settings.conceal_blur_feather,
             ),
         };
+        let compose_ms = compose_t0.elapsed().as_secs_f64() * 1000.0;
 
+        let upload_t0 = std::time::Instant::now();
         let tex = ctx.load_texture(
             format!("conceal_{idx}_g{current_gen}"),
             composed.clone(),
             egui::TextureOptions::LINEAR,
         );
+        let upload_ms = upload_t0.elapsed().as_secs_f64() * 1000.0;
+        if scaled_edit_mask || compose_ms >= 80.0 || upload_ms >= 80.0 {
+            crate::logger::log(format!(
+                "conceal: compose idx={idx} type={:?} source={source_kind} {w}x{h} edit_mask={}x{} shapes={} scaled_edit={} compose={:.0}ms upload={:.0}ms",
+                self.settings.conceal_type,
+                self.conceal_mask_size[0],
+                self.conceal_mask_size[1],
+                shapes.len(),
+                scaled_edit_mask,
+                compose_ms,
+                upload_ms,
+            ));
+        }
         self.conceal_cache.insert(
             idx,
             ConcealCacheEntry {

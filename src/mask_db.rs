@@ -898,7 +898,13 @@ fn decompress_mask(blob: &[u8], w: usize, h: usize) -> Option<Vec<bool>> {
 }
 
 /// マスクを最近傍法でリスケールする。
-fn rescale_mask(src: &[bool], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<bool> {
+pub fn rescale_mask(
+    src: &[bool],
+    src_w: usize,
+    src_h: usize,
+    dst_w: usize,
+    dst_h: usize,
+) -> Vec<bool> {
     let mut dst = vec![false; dst_w * dst_h];
     let x_ratio = src_w as f32 / dst_w as f32;
     let y_ratio = src_h as f32 / dst_h as f32;

@@ -67,6 +67,10 @@ const BAR_BUTTON_GAP: f32 = 4.0;
 const CHECKMARK_RADIUS: f32 = 18.0;
 /// 透過画像背景の市松 1 タイルサイズ (px)
 const CHECKER_TILE_PX: f32 = 16.0;
+/// ピクセル境界グリッドを表示し始める 1 画像ピクセルあたりの画面ピクセル数。
+const PIXEL_GRID_MIN_CELL_PHYSICAL_PX: f32 = 8.0;
+/// safety: 異常な変換で大量線分を積まないための上限。
+const PIXEL_GRID_MAX_LINES: usize = 5000;
 
 #[derive(Clone, Copy)]
 enum ComparePreparedTextureKind {
@@ -230,6 +234,7 @@ fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
             | egui::Key::C
             | egui::Key::P
             | egui::Key::F
+            | egui::Key::G
             | egui::Key::T
             | egui::Key::I
             | egui::Key::X
@@ -1591,6 +1596,8 @@ impl App {
                                         } else {
                                             None
                                         };
+                                        let pixel_grid_enabled =
+                                            self.fs_pixel_grid_enabled && !analysis_active;
                                         let bg_style = self.fs_bg_style(ctx);
                                         Self::draw_fs_image(
                                             ui, image_rect,
@@ -1598,6 +1605,7 @@ impl App {
                                             state.is_video, state.vst3_waiting_for_video,
                                             state.fs_load_failed, fs_rotation, zp,
                                             free_rot, &bg_style, &state.location_display,
+                                            pixel_grid_enabled,
                                         );
                                         if let crate::app::CompareViewMode::Wipe { fraction } =
                                             compare_mode
@@ -3128,6 +3136,7 @@ impl App {
         let key_e = key_e && !pano_active_now;
         let key_m = key_m && !pano_active_now;
         let key_b_bg = key_b_bg && !pano_active_now;
+        let key_g = key_g && !pano_active_now;
         let key_i = key_i && !pano_active_now;
         let key_compare_x = key_compare_x && !pano_active_now;
         let key_compare_alt_c = key_compare_alt_c && !pano_active_now;
@@ -3523,6 +3532,13 @@ impl App {
                     self.analysis_guide_drag = None;
                 }
             }
+        } else if key_g && !is_video_fs {
+            self.fs_pixel_grid_enabled = !self.fs_pixel_grid_enabled;
+            self.show_feedback_toast(if self.fs_pixel_grid_enabled {
+                "[ピクセルグリッド ON]".to_string()
+            } else {
+                "[ピクセルグリッド OFF]".to_string()
+            });
         } else if key_m && !self.adjustment_mode {
             // M: ルーペ表示のトグル (分析モード外でのみ。分析モードでは既存のモザイクグリッド操作)
             self.fs_loupe_locked = !self.fs_loupe_locked;
@@ -4702,7 +4718,9 @@ impl App {
         // 読込中プレースホルダ直下に出す対象パス (`location_display_for` 参照)。
         // 空ならラベル描画をスキップ。
         location_display: &str,
+        pixel_grid_enabled: bool,
     ) {
+        let using_full_texture = tex.is_some();
         let display_tex = tex.or(thumb_tex);
         if let Some(handle) = display_tex {
             let tex_size = handle.size_vec2();
@@ -4747,6 +4765,19 @@ impl App {
                     center,
                 );
             }
+            if pixel_grid_enabled && using_full_texture {
+                Self::draw_fs_pixel_grid(
+                    &painter,
+                    full_rect,
+                    img_rect,
+                    tex_size,
+                    rotation,
+                    free_rotation_rad,
+                    center,
+                    total_scale,
+                    ui.ctx().pixels_per_point(),
+                );
+            }
         } else if fs_load_failed {
             ui.painter().text(
                 full_rect.center(),
@@ -4787,6 +4818,148 @@ impl App {
                 full_rect.center().y + 22.0,
                 20.0,
             );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_fs_pixel_grid(
+        painter: &egui::Painter,
+        full_rect: egui::Rect,
+        img_rect: egui::Rect,
+        tex_size: egui::Vec2,
+        rotation: crate::rotation_db::Rotation,
+        free_rotation_rad: f32,
+        center: egui::Pos2,
+        image_px_to_point: f32,
+        pixels_per_point: f32,
+    ) {
+        if image_px_to_point * pixels_per_point < PIXEL_GRID_MIN_CELL_PHYSICAL_PX {
+            return;
+        }
+        let tex_w = tex_size.x.round().max(1.0) as usize;
+        let tex_h = tex_size.y.round().max(1.0) as usize;
+        if tex_w == 0 || tex_h == 0 {
+            return;
+        }
+
+        let uvs = match rotation {
+            crate::rotation_db::Rotation::None => [
+                egui::pos2(0.0, 0.0),
+                egui::pos2(1.0, 0.0),
+                egui::pos2(1.0, 1.0),
+                egui::pos2(0.0, 1.0),
+            ],
+            crate::rotation_db::Rotation::Cw90 => [
+                egui::pos2(0.0, 1.0),
+                egui::pos2(0.0, 0.0),
+                egui::pos2(1.0, 0.0),
+                egui::pos2(1.0, 1.0),
+            ],
+            crate::rotation_db::Rotation::Cw180 => [
+                egui::pos2(1.0, 1.0),
+                egui::pos2(0.0, 1.0),
+                egui::pos2(0.0, 0.0),
+                egui::pos2(1.0, 0.0),
+            ],
+            crate::rotation_db::Rotation::Cw270 => [
+                egui::pos2(1.0, 0.0),
+                egui::pos2(1.0, 1.0),
+                egui::pos2(0.0, 1.0),
+                egui::pos2(0.0, 0.0),
+            ],
+        };
+        let mut positions = [
+            img_rect.left_top(),
+            img_rect.right_top(),
+            img_rect.right_bottom(),
+            img_rect.left_bottom(),
+        ];
+        if free_rotation_rad.abs() > TRANSFORM_EPSILON {
+            let (sin_r, cos_r) = free_rotation_rad.sin_cos();
+            for p in &mut positions {
+                let dx = p.x - center.x;
+                let dy = p.y - center.y;
+                p.x = center.x + dx * cos_r - dy * sin_r;
+                p.y = center.y + dx * sin_r + dy * cos_r;
+            }
+        }
+
+        let pos_for_uv = |u: f32, v: f32| -> egui::Pos2 {
+            for (idx, uv) in uvs.iter().enumerate() {
+                if (uv.x - u).abs() < f32::EPSILON && (uv.y - v).abs() < f32::EPSILON {
+                    return positions[idx];
+                }
+            }
+            positions[0]
+        };
+        let p00 = pos_for_uv(0.0, 0.0);
+        let p10 = pos_for_uv(1.0, 0.0);
+        let p01 = pos_for_uv(0.0, 1.0);
+        let axis_u = p10 - p00;
+        let axis_v = p01 - p00;
+        let det = axis_u.x * axis_v.y - axis_u.y * axis_v.x;
+        if det.abs() < 1e-5 {
+            return;
+        }
+        let screen_from_uv = |u: f32, v: f32| -> egui::Pos2 { p00 + axis_u * u + axis_v * v };
+        let uv_from_screen = |p: egui::Pos2| -> egui::Vec2 {
+            let d = p - p00;
+            egui::vec2(
+                (d.x * axis_v.y - d.y * axis_v.x) / det,
+                (axis_u.x * d.y - axis_u.y * d.x) / det,
+            )
+        };
+
+        let corners = [
+            full_rect.left_top(),
+            full_rect.right_top(),
+            full_rect.right_bottom(),
+            full_rect.left_bottom(),
+        ];
+        let mut min_u = f32::INFINITY;
+        let mut max_u = f32::NEG_INFINITY;
+        let mut min_v = f32::INFINITY;
+        let mut max_v = f32::NEG_INFINITY;
+        for corner in corners {
+            let uv = uv_from_screen(corner);
+            min_u = min_u.min(uv.x);
+            max_u = max_u.max(uv.x);
+            min_v = min_v.min(uv.y);
+            max_v = max_v.max(uv.y);
+        }
+        min_u = min_u.clamp(0.0, 1.0);
+        max_u = max_u.clamp(0.0, 1.0);
+        min_v = min_v.clamp(0.0, 1.0);
+        max_v = max_v.clamp(0.0, 1.0);
+        if min_u > max_u || min_v > max_v {
+            return;
+        }
+
+        let x0 = ((min_u * tex_w as f32).floor() as isize - 1).max(0) as usize;
+        let x1 = ((max_u * tex_w as f32).ceil() as usize + 1).min(tex_w);
+        let y0 = ((min_v * tex_h as f32).floor() as isize - 1).max(0) as usize;
+        let y1 = ((max_v * tex_h as f32).ceil() as usize + 1).min(tex_h);
+        let line_count = x1.saturating_sub(x0) + 1 + y1.saturating_sub(y0) + 1;
+        if line_count > PIXEL_GRID_MAX_LINES {
+            return;
+        }
+
+        let stroke_width = (1.0 / pixels_per_point.max(1.0)).clamp(0.5, 1.0);
+        let line = egui::Stroke::new(
+            stroke_width,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+        );
+        for x in x0..=x1 {
+            let u = x as f32 / tex_w as f32;
+            let a = screen_from_uv(u, min_v);
+            let b = screen_from_uv(u, max_v);
+            painter.line_segment([a, b], line);
+        }
+        for y in y0..=y1 {
+            let v = y as f32 / tex_h as f32;
+            let a = screen_from_uv(min_u, v);
+            let b = screen_from_uv(max_u, v);
+            painter.line_segment([a, b], line);
         }
     }
 
