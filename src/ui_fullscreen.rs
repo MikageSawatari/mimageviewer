@@ -3650,13 +3650,14 @@ impl App {
         let nav_next = (arrow_right && !rtl) || (arrow_left && rtl) || arrow_down;
         let nav_prev = (arrow_left && !rtl) || (arrow_right && rtl) || arrow_up;
 
+        // 矢印キーでのフォルダ内移動はスライドショーを止めない (ホイール / クリックと統一)。
+        // 一部スキップしつつスライドショーを継続できる。フォルダをまたぐ Ctrl+↑↓ や
+        // S / Space / Esc は従来どおり停止する。
         if nav_next && !ctrl_d {
             action.nav_delta = self.spread_nav_delta(1, shift_held);
-            self.slideshow_playing = false;
         }
         if nav_prev && !ctrl_u {
             action.nav_delta = self.spread_nav_delta(-1, shift_held);
-            self.slideshow_playing = false;
         }
         if ctrl_d || mouse_forward || browser_forward {
             action.ctrl_nav = Some(1);
@@ -3670,8 +3671,8 @@ impl App {
                 crate::ui_helpers::boundary_navigable_idx(&self.items, &self.visible_indices, false)
             {
                 if first != fs_idx {
+                    // Home もフォルダ内移動なのでスライドショーは止めない。
                     action.jump_to = Some(first);
-                    self.slideshow_playing = false;
                 } else {
                     self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
                         at_end: false,
@@ -3685,8 +3686,8 @@ impl App {
                 crate::ui_helpers::boundary_navigable_idx(&self.items, &self.visible_indices, true)
             {
                 if last != fs_idx {
+                    // End もフォルダ内移動なのでスライドショーは止めない。
                     action.jump_to = Some(last);
-                    self.slideshow_playing = false;
                 } else {
                     self.fs_boundary_hint = Some(FsBoundaryHint::Edge {
                         at_end: true,
@@ -4294,6 +4295,86 @@ impl App {
 
     // ── ナビゲーション & スライドショー ─────────────────────────────────
 
+    /// スライドショーを 1 ステップ進める。動画はスキップ ([adjacent_slideshow_idx])。
+    /// フォルダ末尾に到達したら `slideshow_end_action` 設定に従って
+    /// ループ / 次フォルダ / 停止する。
+    fn advance_slideshow(&mut self, ctx: &egui::Context, cur: usize) {
+        let slide_delta = self.spread_nav_delta(1, false);
+        if let Some(idx) = crate::ui_helpers::adjacent_slideshow_idx(
+            &self.items,
+            &self.visible_indices,
+            cur,
+            slide_delta,
+        ) {
+            // フォルダ内の次の静止画系アイテムへ前進。
+            self.slideshow_anchor_idx = None;
+            self.open_fullscreen_from_slideshow_navigation(ctx, idx);
+            self.selected = Some(idx);
+            self.scroll_to_selected = true;
+            return;
+        }
+        // 末尾到達: 設定に従う。
+        match self.settings.slideshow_end_action {
+            crate::settings::SlideshowEndAction::Stop => {
+                self.slideshow_playing = false;
+                self.slideshow_anchor_idx = None;
+            }
+            crate::settings::SlideshowEndAction::LoopFolder => {
+                self.loop_slideshow_to_first(ctx);
+            }
+            crate::settings::SlideshowEndAction::NextFolder => {
+                // 次フォルダへ。検索コンテキスト等で発火できなければループにフォールバック。
+                if !self.try_start_slideshow_next_folder(cur) {
+                    self.loop_slideshow_to_first(ctx);
+                }
+            }
+        }
+    }
+
+    /// フォルダ内の先頭の静止画系アイテム (Video / ZipSeparator 除外) へ折り返す。
+    /// 静止画系が一つも無ければスライドショーを停止する。
+    fn loop_slideshow_to_first(&mut self, ctx: &egui::Context) {
+        if let Some(idx) =
+            crate::ui_helpers::first_slideshow_still_idx(&self.items, &self.visible_indices)
+        {
+            self.slideshow_anchor_idx = None;
+            self.open_fullscreen_from_slideshow_navigation(ctx, idx);
+            self.selected = Some(idx);
+            self.scroll_to_selected = true;
+        } else {
+            self.slideshow_playing = false;
+            self.slideshow_anchor_idx = None;
+        }
+    }
+
+    /// スライドショーの「次フォルダへ進む」を発火する。発火できたら true。
+    ///
+    /// 手動 Ctrl+↓ と同じ非同期 skip-walk 経路 (`FolderNavMode::SlideshowNext`) を使うが、
+    /// 判定述語は静止画ありに限定される ([spawn_folder_nav] 側で選択)。発火時に
+    /// `slideshow_playing=false` にして in-flight 中のタイマー/sync 再入を止め、
+    /// `capture_fs_nav_holdover` で Ctrl+↑↓ と同じ nav ロックを取得する。復帰は
+    /// `FolderNavMode::SlideshowNext` 由来で reopen 側が行う。
+    ///
+    /// 次フォルダ概念が無い (検索ビュー / お気に入り検索 / Ctrl+F 中) か、現在フォルダが
+    /// 取れない場合は発火せず false を返す (呼び出し側でループにフォールバック)。
+    fn try_start_slideshow_next_folder(&mut self, fs_idx: usize) -> bool {
+        if self.fs_nav_is_locked() {
+            // 既に nav 進行中: 二重発火しない (が、ループフォールバックもしない)。
+            return true;
+        }
+        if self.global_search.active || self.favsearch.active || self.show_search_bar {
+            return false;
+        }
+        let Some(folder) = self.current_folder.clone() else {
+            return false;
+        };
+        self.slideshow_playing = false;
+        self.slideshow_anchor_idx = None;
+        self.capture_fs_nav_holdover(fs_idx);
+        self.start_folder_nav(folder, true, crate::app::FolderNavMode::SlideshowNext);
+        true
+    }
+
     fn slideshow_interval_duration(&self) -> std::time::Duration {
         let secs = self.settings.slideshow_interval_secs;
         let secs = if secs.is_finite() {
@@ -4304,13 +4385,20 @@ impl App {
         std::time::Duration::from_secs_f32(secs)
     }
 
-    fn schedule_next_slideshow_from_now(&mut self) {
+    pub(crate) fn schedule_next_slideshow_from_now(&mut self) {
         self.slideshow_next_at = std::time::Instant::now() + self.slideshow_interval_duration();
         self.slideshow_anchor_idx = self.fullscreen_idx;
     }
 
     fn current_slideshow_frame_ready(&self, fs_idx: usize, state: &FsFrameState) -> bool {
         if state.separator_text.is_some() {
+            return true;
+        }
+        // 動画は ready 扱いにして必ずタイマーを進める。動画フレームは `state.tex` を
+        // 持たず、サムネが未生成だと永久に「未 ready」で止まりうるため。タイマーが
+        // 回れば advance_slideshow が adjacent_slideshow_idx で動画を飛ばして次へ送る
+        // (= 動画到達でスライドショーが固まらない)。
+        if state.is_video {
             return true;
         }
         let has_own_thumb = matches!(
@@ -4329,11 +4417,9 @@ impl App {
         if !self.slideshow_playing {
             return;
         }
-        if state.is_video {
-            self.slideshow_playing = false;
-            self.slideshow_anchor_idx = None;
-            return;
-        }
+        // 動画でスライドショーを止めない (ユーザー設定: 動画はスキップして継続)。
+        // 自動送り (advance_slideshow) は adjacent_slideshow_idx で動画を飛ばすので、
+        // 動画に居るのは手動ナビで来た場合のみ。1 間隔だけ表示して次の静止画へ送る。
         let ready = self.current_slideshow_frame_ready(fs_idx, state);
         if self.slideshow_anchor_idx == Some(fs_idx) {
             if !ready {
@@ -4421,6 +4507,14 @@ impl App {
         if self.fs_nav_is_locked() {
             return;
         }
+        // 手動 Ctrl+↑↓ (フォルダ移動操作) はスライドショーを止める。成功時は後続の
+        // close_fullscreen でも落ちるが、境界 / 画像なし / 検索ビュー no-op など
+        // フォルダが変わらないケースでも明示停止して「Ctrl+↑↓ で停止」の一貫した
+        // 挙動にする (フォルダ内移動の矢印/ホイール/クリックは継続のまま)。
+        // SlideshowNext 自動送りはこの関数を経由せず start_folder_nav を直接呼ぶので
+        // ここでは止まらない。
+        self.slideshow_playing = false;
+        self.slideshow_anchor_idx = None;
         // Cross-scope ナビ (Ctrl+↑↓: 通常のフォルダ移動、Favsearch、Ctrl+G drilled into) が
         // 始まる時点で、video swap 由来の deferred nav delta は別フォルダ / 別検索スコープ
         // / 非動画アイテムで誤発火しうるので破棄する。`capture_fs_nav_holdover` を経由しない
@@ -4575,7 +4669,11 @@ impl App {
         }
 
         // ── スライドショー タイマー ──
-        if self.slideshow_playing && !close_fs {
+        // フォルダ nav 進行中 (= fs_nav ロック保持中) はタイマーを止める。手動 Ctrl+↑↓ の
+        // in-flight 中に旧フォルダで誤って advance するのを防ぐ (SlideshowNext は発火時に
+        // slideshow_playing=false にしているのでそもそも入らない)。手動 Ctrl+↑↓ が
+        // フォルダを変えた場合は close_fullscreen が slideshow_playing=false にする。
+        if self.slideshow_playing && !close_fs && !self.fs_nav_is_locked() {
             let now = std::time::Instant::now();
             let anchored = self
                 .fullscreen_idx
@@ -4584,45 +4682,11 @@ impl App {
                 ctx.request_repaint_after(std::time::Duration::from_millis(50));
             } else {
                 if now >= self.slideshow_next_at {
-                    let mut advanced = false;
                     if let Some(cur) = self.fullscreen_idx {
-                        let slide_delta = self.spread_nav_delta(1, false);
-                        let next = crate::ui_helpers::adjacent_navigable_idx(
-                            &self.items,
-                            &self.visible_indices,
-                            cur,
-                            slide_delta,
-                        );
-                        // 末尾到達時は先頭の画像系アイテムへループ。
-                        // 画像系がひとつも無い場合はスライドショーを停止 (安全側、
-                        // 旧実装の `unwrap_or(0)` で非画像アイテムへ飛ぶ事故を防ぐ)。
-                        let target = next.or_else(|| {
-                            self.visible_indices.iter().copied().find(|&i| {
-                                matches!(
-                                    self.items.get(i),
-                                    Some(GridItem::Image(_))
-                                        | Some(GridItem::ZipImage { .. })
-                                        | Some(GridItem::PdfPage { .. })
-                                )
-                            })
-                        });
-                        match target {
-                            Some(idx) => {
-                                self.slideshow_anchor_idx = None;
-                                self.open_fullscreen_from_slideshow_navigation(ctx, idx);
-                                self.selected = Some(idx);
-                                self.scroll_to_selected = true;
-                                advanced = true;
-                            }
-                            None => {
-                                self.slideshow_playing = false;
-                                self.slideshow_anchor_idx = None;
-                            }
-                        }
+                        self.advance_slideshow(ctx, cur);
                     }
-                    if advanced {
-                        ctx.request_repaint();
-                    }
+                    // 前進 / 折り返し / 次フォルダ発火 (async) いずれも次フレームで反映する。
+                    ctx.request_repaint();
                 }
                 if self.slideshow_playing {
                     let remaining = self.slideshow_next_at.saturating_duration_since(now);

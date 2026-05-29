@@ -216,11 +216,44 @@ pub(super) fn page_slideshow(ui: &mut egui::Ui, state: &mut PreferencesState) {
                 .fixed_decimals(1),
         );
     });
-    ui.add_space(4.0);
+
+    ui.add_space(8.0);
+    ui.label("フォルダの最後まで進んだら:");
+    use crate::settings::SlideshowEndAction;
+    let action = &mut state.settings.slideshow_end_action;
+    ui.radio_value(
+        action,
+        SlideshowEndAction::LoopFolder,
+        SlideshowEndAction::LoopFolder.label(),
+    );
+    ui.radio_value(
+        action,
+        SlideshowEndAction::NextFolder,
+        SlideshowEndAction::NextFolder.label(),
+    );
+    ui.radio_value(
+        action,
+        SlideshowEndAction::Stop,
+        SlideshowEndAction::Stop.label(),
+    );
+    ui.add_space(2.0);
+    let hint = egui::Color32::from_gray(140);
+    ui.label(
+        egui::RichText::new("「次のフォルダへ進む」は、移動先に画像が1枚も無ければ停止します")
+            .size(11.0)
+            .color(hint),
+    );
+    ui.label(
+        egui::RichText::new("スライドショー中、動画は自動でスキップします")
+            .size(11.0)
+            .color(hint),
+    );
+
+    ui.add_space(6.0);
     ui.label(
         egui::RichText::new("フルスクリーンで S キーまたは ▶ ボタンで開始 / 停止")
             .size(11.0)
-            .color(egui::Color32::from_gray(140)),
+            .color(hint),
     );
 }
 

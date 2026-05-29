@@ -727,6 +727,10 @@ pub struct Settings {
     /// スライドショーの切り替え間隔（秒）
     #[serde(default = "default_slideshow_interval")]
     pub slideshow_interval_secs: f32,
+    /// スライドショーがフォルダ末尾に到達したときの動作。
+    /// 新規フィールド (serde default = LoopFolder = 旧来挙動) なので移行不要。
+    #[serde(default)]
+    pub slideshow_end_action: SlideshowEndAction,
 
     // ── キャプチャ保存 ──────────────────────────────────────────
     /// Ctrl+S キャプチャ保存先。None のときは OS の Pictures/mimageviewer を使う。
@@ -1329,6 +1333,30 @@ impl VideoAutoplayMode {
     }
 }
 
+/// スライドショーがフォルダ末尾に到達したときの動作。
+///
+/// `LoopFolder` (既定) はフォルダ内で先頭の静止画系へ折り返す (旧来挙動)。
+/// `NextFolder` は手動 Ctrl+↓ と同じ skip-walk で次フォルダへ進む (ただし判定述語は
+/// 静止画ありに限定し、動画のみ・画像なしフォルダは飛ばす。skip_limit 内に静止画
+/// フォルダが無ければ停止)。`Stop` は末尾で停止する。
+#[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum SlideshowEndAction {
+    #[default]
+    LoopFolder,
+    NextFolder,
+    Stop,
+}
+
+impl SlideshowEndAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LoopFolder => "フォルダ内でループ",
+            Self::NextFolder => "次のフォルダへ進む",
+            Self::Stop => "最後で停止",
+        }
+    }
+}
+
 /// 動画フルスクリーン時のループ再生モード。
 ///
 /// Off → Full → Chapter → Bookmark → Off の 4 段階サイクル。
@@ -1680,6 +1708,7 @@ impl Default for Settings {
             skip_duplicate_images: true,
             image_ext_priority: default_image_ext_priority(),
             slideshow_interval_secs: default_slideshow_interval(),
+            slideshow_end_action: SlideshowEndAction::default(),
             capture_output_dir: None,
             capture_format: crate::capture::CaptureFormat::default(),
             default_spread_mode: SpreadMode::default(),

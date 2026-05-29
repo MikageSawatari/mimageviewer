@@ -125,6 +125,21 @@ pub fn is_virtual_folder(path: &Path) -> bool {
 /// 見ている想定なので、この戻り値は「止まるべきではない」ではなく
 /// 「判定を打ち切った」という意味で使われる)。
 pub fn folder_should_stop(path: &Path, cancel: Option<&AtomicBool>) -> bool {
+    folder_qualifies(path, cancel, true)
+}
+
+/// スライドショーの次フォルダ判定用: 静止画系コンテンツがあるか。
+/// `folder_should_stop` と同じだが、**動画拡張子は「コンテンツあり」と数えない**
+/// (= 動画のみフォルダ・画像なしフォルダは false)。これにより NextFolder スライドショーが
+/// 動画のみフォルダを skip-walk で飛ばし、静止画フォルダに直接着地できる。
+/// PDF / 画像入り ZIP は静止画系コンテナとして true。
+pub fn folder_has_still_image(path: &Path, cancel: Option<&AtomicBool>) -> bool {
+    folder_qualifies(path, cancel, false)
+}
+
+/// `folder_should_stop` / `folder_has_still_image` の共通実装。
+/// `include_video=true` なら動画拡張子も「立ち寄る」条件に含める。
+fn folder_qualifies(path: &Path, cancel: Option<&AtomicBool>, include_video: bool) -> bool {
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return false;
     }
@@ -160,7 +175,7 @@ pub fn folder_should_stop(path: &Path, cancel: Option<&AtomicBool>) -> bool {
         if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
             let ext_lower = ext.to_lowercase();
             if is_recognized_image_ext(&ext_lower)
-                || SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str())
+                || (include_video && SUPPORTED_VIDEO_EXTENSIONS.contains(&ext_lower.as_str()))
             {
                 return true;
             }
@@ -194,14 +209,16 @@ pub struct FolderNavOutcome {
 /// `cancel` が指定された場合、各ステップ開始時に確認し、セットされていれば
 /// `None` を返して早期離脱する。連打で新しい要求が入ったときに旧スレッドの
 /// DFS をすぐ畳めるようにするための機構。
-pub fn navigate_folder_with_skip<F>(
+pub fn navigate_folder_with_skip<F, S>(
     start: &Path,
     nav_fn: F,
+    should_stop: S,
     skip_limit: usize,
     cancel: Option<&AtomicBool>,
 ) -> Option<FolderNavOutcome>
 where
     F: Fn(&Path) -> Option<PathBuf>,
+    S: Fn(&Path, Option<&AtomicBool>) -> bool,
 {
     if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
         return None;
@@ -217,7 +234,7 @@ where
         if cancel.is_some_and(|c| c.load(Ordering::Relaxed)) {
             return None;
         }
-        if folder_should_stop(&candidate, cancel) {
+        if should_stop(&candidate, cancel) {
             return Some(FolderNavOutcome {
                 path: candidate,
                 hit_image_folder: true,
@@ -545,7 +562,8 @@ mod tests {
         let target = image_folder.clone();
         let nav_fn = move |_: &Path| Some(target.clone());
 
-        let result = navigate_folder_with_skip(&start, nav_fn, 0, None).expect("outcome");
+        let result = navigate_folder_with_skip(&start, nav_fn, folder_should_stop, 0, None)
+            .expect("outcome");
         assert_eq!(result.path, image_folder);
         assert!(result.hit_image_folder);
     }
@@ -564,7 +582,8 @@ mod tests {
         let target = empty_folder.clone();
         let nav_fn = move |_: &Path| Some(target.clone());
 
-        let result = navigate_folder_with_skip(&start, nav_fn, 0, None).expect("outcome");
+        let result = navigate_folder_with_skip(&start, nav_fn, folder_should_stop, 0, None)
+            .expect("outcome");
         assert_eq!(result.path, empty_folder);
         assert!(!result.hit_image_folder);
     }
@@ -596,7 +615,8 @@ mod tests {
         // skip_limit=1 だと first (empty) は評価されるが advance 後の検査はしない想定。
         // 現実装: iter 0 で empty をチェック→スキップ→advance して image へ。ループ終了。
         // → fallback path=first=empty, hit_image_folder=false
-        let result = navigate_folder_with_skip(&start, nav_fn, 1, None).expect("outcome");
+        let result = navigate_folder_with_skip(&start, nav_fn, folder_should_stop, 1, None)
+            .expect("outcome");
         assert_eq!(result.path, empty_folder);
         assert!(!result.hit_image_folder);
 
@@ -610,7 +630,8 @@ mod tests {
                 Some(empty_clone2.clone())
             }
         };
-        let result = navigate_folder_with_skip(&start, nav_fn2, 2, None).expect("outcome");
+        let result = navigate_folder_with_skip(&start, nav_fn2, folder_should_stop, 2, None)
+            .expect("outcome");
         assert_eq!(result.path, image_folder);
         assert!(result.hit_image_folder);
     }
@@ -671,6 +692,51 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         std::fs::write(dir.join("a.jpg"), b"").unwrap();
         assert!(folder_should_stop(&dir, None));
+    }
+
+    /// `folder_has_still_image`: 静止画があれば true。
+    #[test]
+    fn folder_has_still_image_dir_with_image_true() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().join("photos");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("a.jpg"), b"").unwrap();
+        assert!(folder_has_still_image(&dir, None));
+    }
+
+    /// `folder_has_still_image`: 動画のみのフォルダは false (folder_should_stop とは
+    /// ここが異なる)。スライドショー NextFolder が動画のみフォルダを飛ばす根拠。
+    #[test]
+    fn folder_has_still_image_dir_with_only_video_false() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().join("movies");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("clip.mp4"), b"").unwrap();
+        // folder_should_stop は動画込みなので true、folder_has_still_image は false。
+        assert!(folder_should_stop(&dir, None));
+        assert!(!folder_has_still_image(&dir, None));
+    }
+
+    /// `folder_has_still_image`: 空フォルダは false。
+    #[test]
+    fn folder_has_still_image_empty_dir_false() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let dir = temp.path().join("empty");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(!folder_has_still_image(&dir, None));
+    }
+
+    /// `folder_has_still_image`: PDF は静止画系コンテナとして true、画像入り ZIP も true。
+    #[test]
+    fn folder_has_still_image_pdf_and_zip_true() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let pdf = temp.path().join("doc.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4 dummy").unwrap();
+        assert!(folder_has_still_image(&pdf, None));
+
+        let zip_path = temp.path().join("comic.zip");
+        make_zip_with_entries(&zip_path, &["page01.jpg"]);
+        assert!(folder_has_still_image(&zip_path, None));
     }
 
     // -----------------------------------------------------------------------

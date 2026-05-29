@@ -770,6 +770,66 @@ pub fn adjacent_navigable_idx(
     }
 }
 
+/// スライドショー送り用の隣接探索。`adjacent_navigable_idx` と同じだが
+/// **`GridItem::Video` を除外**する (スライドショー中は動画をスキップして継続するため)。
+/// `GridItem::ZipSeparator` は仕様どおり残す (章タイトルも同じ間隔で表示する)。
+/// 境界では None を返す (ラップアラウンドなし)。
+pub fn adjacent_slideshow_idx(
+    items: &[GridItem],
+    visible_indices: &[usize],
+    current: usize,
+    delta: i32,
+) -> Option<usize> {
+    let nav_indices: Vec<usize> = visible_indices
+        .iter()
+        .copied()
+        .filter(|&i| {
+            matches!(
+                items.get(i),
+                Some(GridItem::Image(_))
+                    | Some(GridItem::ZipImage { .. })
+                    | Some(GridItem::ZipSeparator { .. })
+                    | Some(GridItem::PdfPage { .. })
+            )
+        })
+        .collect();
+    if nav_indices.is_empty() {
+        return None;
+    }
+    let insert_pos = nav_indices.partition_point(|&i| i < current);
+    let current_in_list = nav_indices.get(insert_pos).is_some_and(|&i| i == current);
+    if current_in_list {
+        let pos = insert_pos;
+        let new_pos = (pos as i32 + delta).clamp(0, nav_indices.len() as i32 - 1) as usize;
+        if new_pos == pos {
+            None
+        } else {
+            Some(nav_indices[new_pos])
+        }
+    } else if delta > 0 {
+        nav_indices.get(insert_pos).copied()
+    } else if delta < 0 {
+        insert_pos.checked_sub(1).map(|p| nav_indices[p])
+    } else {
+        None
+    }
+}
+
+/// スライドショーの折り返し / 先頭着地用に、`visible_indices` の中で先頭の
+/// 静止画系アイテム (Image / ZipImage / PdfPage、Video と ZipSeparator は除外) を返す。
+/// LoopFolder の折り返し先は章タイトル (ZipSeparator) ではなく実画像にするため、
+/// `adjacent_slideshow_idx` のフィルタとは別に separator も除外する。
+pub fn first_slideshow_still_idx(items: &[GridItem], visible_indices: &[usize]) -> Option<usize> {
+    visible_indices.iter().copied().find(|&i| {
+        matches!(
+            items.get(i),
+            Some(GridItem::Image(_))
+                | Some(GridItem::ZipImage { .. })
+                | Some(GridItem::PdfPage { .. })
+        )
+    })
+}
+
 /// `visible_indices` の中の「ナビゲーション可能」なアイテム列から、
 /// 末尾 (`last=true`) または先頭 (`last=false`) の item index を返す。
 /// `adjacent_navigable_idx` と同じフィルタを適用する。
@@ -1221,5 +1281,61 @@ mod tests {
         let vi: Vec<usize> = Vec::new();
         assert_eq!(adjacent_navigable_idx(&items, &vi, 1, 1), None);
         assert_eq!(adjacent_navigable_idx(&items, &vi, 1, -1), None);
+    }
+
+    /// スライドショー送りは Video を飛ばす: image(0) - video(1) - image(2) で
+    /// 0 から +1 すると video(1) を飛ばして image(2)。
+    #[test]
+    fn adjacent_slideshow_idx_skips_video() {
+        let items = vec![
+            GridItem::Image(std::path::PathBuf::from("/a/0.jpg")),
+            GridItem::Video(std::path::PathBuf::from("/a/1.mp4")),
+            GridItem::Image(std::path::PathBuf::from("/a/2.jpg")),
+        ];
+        let vi = vec![0, 1, 2];
+        assert_eq!(adjacent_slideshow_idx(&items, &vi, 0, 1), Some(2));
+        assert_eq!(adjacent_slideshow_idx(&items, &vi, 2, -1), Some(0));
+        // 通常の隣接探索は video(1) に止まれる (対比)。
+        assert_eq!(adjacent_navigable_idx(&items, &vi, 0, 1), Some(1));
+    }
+
+    /// スライドショー送りは ZipSeparator は残す (章タイトルを同間隔で表示)。
+    #[test]
+    fn adjacent_slideshow_idx_keeps_separator() {
+        let items = vec![
+            GridItem::Image(std::path::PathBuf::from("/a/0.jpg")),
+            GridItem::ZipSeparator {
+                dir_display: "chapter".to_string(),
+            },
+            GridItem::Image(std::path::PathBuf::from("/a/2.jpg")),
+        ];
+        let vi = vec![0, 1, 2];
+        assert_eq!(adjacent_slideshow_idx(&items, &vi, 0, 1), Some(1));
+        assert_eq!(adjacent_slideshow_idx(&items, &vi, 1, 1), Some(2));
+    }
+
+    /// 末尾が動画でも境界は None (折り返しは呼び出し側で行う)。
+    #[test]
+    fn adjacent_slideshow_idx_boundary_none_when_only_video_after() {
+        let items = vec![
+            GridItem::Image(std::path::PathBuf::from("/a/0.jpg")),
+            GridItem::Video(std::path::PathBuf::from("/a/1.mp4")),
+        ];
+        let vi = vec![0, 1];
+        assert_eq!(adjacent_slideshow_idx(&items, &vi, 0, 1), None);
+    }
+
+    /// 折り返し target は separator を飛ばして先頭の実画像。
+    #[test]
+    fn first_slideshow_still_idx_skips_separator_and_video() {
+        let items = vec![
+            GridItem::ZipSeparator {
+                dir_display: "chapter".to_string(),
+            },
+            GridItem::Video(std::path::PathBuf::from("/a/1.mp4")),
+            GridItem::Image(std::path::PathBuf::from("/a/2.jpg")),
+        ];
+        let vi = vec![0, 1, 2];
+        assert_eq!(first_slideshow_still_idx(&items, &vi), Some(2));
     }
 }

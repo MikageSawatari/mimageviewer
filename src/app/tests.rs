@@ -3444,7 +3444,7 @@ mod favorite_adjustment_defaults_tests {
         }
         app.rebuild_visible_indices();
         assert_eq!(
-            app.find_fullscreen_nav_target(),
+            app.find_fullscreen_nav_target_filtered(true),
             Some(1),
             "先頭の画像系アイテム idx=1 (Image_a) を返す (Folder idx=0 はスキップ)"
         );
@@ -3465,9 +3465,16 @@ mod favorite_adjustment_defaults_tests {
         }
         app.rebuild_visible_indices();
         assert_eq!(
-            app.find_fullscreen_nav_target(),
+            app.find_fullscreen_nav_target_filtered(true),
             Some(1),
             "先頭の image-like が動画なら動画 idx を返す"
+        );
+        // include_video=false (スライドショー NextFolder 再開) では動画を飛ばして
+        // 先頭の静止画 idx=2 を返す。
+        assert_eq!(
+            app.find_fullscreen_nav_target_filtered(false),
+            Some(2),
+            "動画除外なら先頭の静止画 idx=2 を返す"
         );
     }
 
@@ -3597,7 +3604,9 @@ mod favorite_adjustment_defaults_tests {
         // まだ pending という状態。
         app.fullscreen_idx = None;
         app.items_generation += 1;
-        app.fs_nav_after_pdf_enumerate = Some(true);
+        app.fs_nav_after_pdf_enumerate = Some(DeferredFsReopen {
+            resume_slideshow: false,
+        });
 
         app.poll_fs_nav_lock();
         assert!(

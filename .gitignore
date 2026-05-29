@@ -12,6 +12,7 @@ bench_thumbs.tsv
 /vendor/ffmpeg
 /vendor/vst3sdk
 /vendor/vst3-host
+/vendor/bench_baseline.json
 /crates/vst3-host/build
 /dev/
 /testdata/

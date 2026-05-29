@@ -47,6 +47,24 @@ pub(crate) enum FolderNavMode {
     /// `load_folder`、root 外なら `favsearch_navigate_sibling` にフォールバックする。
     /// `fullscreen=true` のときは移動後に先頭の画像系アイテムを再度フルスクリーンで開く。
     Favsearch { root: PathBuf, fullscreen: bool },
+    /// スライドショーの自動次フォルダ送り。`Fullscreen` と似るが (a) 判定述語が
+    /// `folder_has_still_image` (動画のみ・画像なしフォルダを飛ばす)、(b) 着地後に
+    /// 先頭の静止画系 (Video 除外) を開いてスライドショーを再開する。
+    /// `folder_nav_mode_same_kind` には**同種アームを足さない** (= 連打累積させない、
+    /// 単発前進のみ)。
+    SlideshowNext,
+}
+
+/// 非同期 PDF / ZIP 列挙完了後に fullscreen を開き直すための deferred reopen 状態。
+/// (旧来は `Option<bool>` で forward だけ持っていたが、スライドショー NextFolder の
+/// resume を deferred 経路でも引き継ぐため struct 化した。resume は自由 bool ではなく
+/// `FolderNavMode::SlideshowNext` 由来でセットされる。)
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DeferredFsReopen {
+    /// true なら reopen 後にスライドショーを再開する (SlideshowNext 由来のときだけ)。
+    /// また true のときは先頭の **静止画のみ** (Video 除外) を開く。
+    /// (DFS 方向 forward は deferred reopen では使わない: フォルダ先頭着地固定のため。)
+    pub resume_slideshow: bool,
 }
 
 /// DFS スレッドから UI スレッドに送るメッセージ。結果 (Option) と、
@@ -687,6 +705,7 @@ impl FolderNavMode {
             FolderNavMode::Grid => "grid",
             FolderNavMode::Fullscreen => "fullscreen",
             FolderNavMode::Favsearch { .. } => "favsearch",
+            FolderNavMode::SlideshowNext => "slideshow_next",
         }
     }
 }
@@ -714,8 +733,8 @@ fn folder_nav_mode_same_kind(a: &FolderNavMode, b: &FolderNavMode) -> bool {
 use eframe::egui;
 
 use crate::folder_tree::{
-    SUPPORTED_VIDEO_EXTENSIONS, is_apple_double, navigate_folder_with_skip, next_folder_dfs,
-    prev_folder_dfs, walk_dirs_recursive,
+    SUPPORTED_VIDEO_EXTENSIONS, folder_has_still_image, folder_should_stop, is_apple_double,
+    navigate_folder_with_skip, next_folder_dfs, prev_folder_dfs, walk_dirs_recursive,
 };
 
 // キャッシュキー定数は thumb_loader.rs に定義 (ベンチマーク bin からも参照するため)
@@ -2712,14 +2731,13 @@ pub struct App {
         Option<String>,
         crate::pdf_loader::PdfEnumerateHandle,
     )>,
-    /// Ctrl+↑↓ フォルダナビで非同期 PDF / ZIP に着地したときに保存する方向フラグ。
+    /// Ctrl+↑↓ フォルダナビで非同期 PDF / ZIP に着地したときに保存する deferred reopen 状態。
     /// `poll_pdf_enumerate` / `poll_zip_enumerate` が items を埋めたあとで fullscreen を
     /// 開き直すために使う (poll 側でフラグを take して先頭/末尾画像を open_fullscreen する)。
-    /// `Some(forward)`: DFS 方向 (true=前方/下巻方向, false=後方/上巻方向)。
     ///
     /// PDF と ZIP の pending は同時に立つことがない (load_pdf / load_zip が互いにクリア
     /// するため) ので、単一フィールドで両方を賄える。
-    pub(crate) fs_nav_after_pdf_enumerate: Option<bool>,
+    pub(crate) fs_nav_after_pdf_enumerate: Option<DeferredFsReopen>,
 
     /// PDF メタキャッシュ (v1.0.0) ヒット時、placeholder grid を立てた page_count を覚えておく。
     ///
@@ -6899,12 +6917,19 @@ impl App {
 
         // Ctrl+↑↓ フォルダナビから fullscreen で ZIP に遷移してきた場合、items が
         // 揃った今 fullscreen を開き直す (Codex P1: PDF と同じ処理を ZIP にも適用)。
-        if let Some(_forward) = self.fs_nav_after_pdf_enumerate.take() {
-            if let Some(new_idx) = self.find_fullscreen_nav_target() {
+        if let Some(deferred) = self.fs_nav_after_pdf_enumerate.take() {
+            // スライドショー NextFolder の deferred 再開は動画を開かず静止画のみに着地する。
+            if let Some(new_idx) =
+                self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow)
+            {
                 self.open_fullscreen(new_idx);
                 self.selected = Some(new_idx);
                 self.scroll_to_selected = true;
                 self.update_last_selected_image();
+                if deferred.resume_slideshow {
+                    self.slideshow_playing = true;
+                    self.schedule_next_slideshow_from_now();
+                }
             }
         }
     }
@@ -7325,12 +7350,19 @@ impl App {
 
                 // Ctrl+↑↓ フォルダナビから遷移してきた場合はここで fullscreen を開き直す。
                 // placeholder hit/miss 問わず必ず実行する (Codex P1-2)。
-                if let Some(_forward) = self.fs_nav_after_pdf_enumerate.take() {
-                    if let Some(new_idx) = self.find_fullscreen_nav_target() {
+                if let Some(deferred) = self.fs_nav_after_pdf_enumerate.take() {
+                    // スライドショー NextFolder の deferred 再開は動画を開かず静止画のみに着地する。
+                    if let Some(new_idx) =
+                        self.find_fullscreen_nav_target_filtered(!deferred.resume_slideshow)
+                    {
                         self.open_fullscreen(new_idx);
                         self.selected = Some(new_idx);
                         self.scroll_to_selected = true;
                         self.update_last_selected_image();
+                        if deferred.resume_slideshow {
+                            self.slideshow_playing = true;
+                            self.schedule_next_slideshow_from_now();
+                        }
                     }
                 }
             }
@@ -12119,6 +12151,14 @@ impl App {
         // 1 回のキー押下で起きた DFS バーストを 1 つの seq でまとめて追える。
         let perf_seq = self.input_seq;
         let perf_mode = mode.perf_tag();
+        // スライドショー NextFolder だけは判定述語を「静止画あり」にして、動画のみ /
+        // 画像なしフォルダを skip-walk で飛ばす。手動 Ctrl+↑↓ 等は従来どおり動画込み。
+        let should_stop: fn(&std::path::Path, Option<&AtomicBool>) -> bool =
+            if matches!(mode, FolderNavMode::SlideshowNext) {
+                folder_has_still_image
+            } else {
+                folder_should_stop
+            };
         let start_path_disp = if crate::perf::is_enabled() {
             current.display().to_string()
         } else {
@@ -12144,6 +12184,7 @@ impl App {
                 navigate_folder_with_skip(
                     &current,
                     |p| next_folder_dfs(p, tree_opts),
+                    should_stop,
                     skip_limit,
                     Some(&cancel_w),
                 )
@@ -12151,6 +12192,7 @@ impl App {
                 navigate_folder_with_skip(
                     &current,
                     |p| prev_folder_dfs(p, tree_opts),
+                    should_stop,
                     skip_limit,
                     Some(&cancel_w),
                 )
@@ -12298,16 +12340,18 @@ impl App {
     fn reopen_fullscreen_after_folder_nav_load(
         &mut self,
         ctx: &egui::Context,
-        forward: bool,
         restore_video_tile: bool,
+        resume_slideshow: bool,
     ) -> &'static str {
+        let deferred = DeferredFsReopen { resume_slideshow };
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
-            self.fs_nav_after_pdf_enumerate = Some(forward);
+            self.fs_nav_after_pdf_enumerate = Some(deferred);
             return "enumerate_defer";
         }
-        let target_idx = self.find_fullscreen_nav_target();
+        // SlideshowNext の再開は動画を開かず静止画のみに着地する (Codex P2)。
+        let target_idx = self.find_fullscreen_nav_target_filtered(!resume_slideshow);
         if self.pdf_enumerate_pending.is_some() || self.zip_enumerate_pending.is_some() {
-            self.fs_nav_after_pdf_enumerate = Some(forward);
+            self.fs_nav_after_pdf_enumerate = Some(deferred);
             return "enumerate_defer";
         }
         if let Some(new_idx) = target_idx {
@@ -12320,6 +12364,12 @@ impl App {
             self.selected = Some(new_idx);
             self.scroll_to_selected = true;
             self.update_last_selected_image();
+
+            // スライドショー NextFolder の着地: 静止画を開けたのでスライドショーを再開。
+            if resume_slideshow {
+                self.slideshow_playing = true;
+                self.schedule_next_slideshow_from_now();
+            }
 
             #[cfg(windows)]
             if restore_video_tile {
@@ -12338,6 +12388,8 @@ impl App {
         } else {
             // navigate_folder_with_skip は画像ありフォルダを返す前提だが、
             // レーティングフィルタ等で visible_indices が空の場合はここに来る。
+            // (SlideshowNext で静止画 target が無い場合もここ。スライドショーは
+            // close_fullscreen で既に false なので再開しないだけでよい。)
             // fullscreen は close 済みなので、メインビューポートに
             // キーボードフォーカスを戻す (旧同期実装と同じ挙動)。
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -12413,8 +12465,8 @@ impl App {
                             self.update_favsearch_address();
                             let reason = self.reopen_fullscreen_after_folder_nav_load(
                                 ctx,
-                                result.forward,
                                 restore_video_tile,
+                                false,
                             );
                             if reason == "enumerate_defer" {
                                 emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
@@ -12464,11 +12516,34 @@ impl App {
                     // → 明示的に release して以降の Ctrl+↑↓ を効くようにする (Codex P1)。
                     self.release_fs_nav_lock();
                 }
+                FolderNavMode::SlideshowNext => {
+                    // 次に静止画フォルダが無い (DFS 末端): スライドショーを停止して
+                    // 現在画像に留まる。フルスクリーンは維持。
+                    self.slideshow_playing = false;
+                    self.slideshow_anchor_idx = None;
+                    self.clear_pending_folder_nav_steps();
+                    self.release_fs_nav_lock();
+                }
                 FolderNavMode::Grid => {}
             }
             emit_end(apply_t0, apply_seq, apply_mode_tag, "dfs_empty");
             return;
         };
+        // SlideshowNext で skip_limit 内に静止画フォルダが見つからなかった場合は、
+        // フォルダ移動せずスライドショーを停止して現在画像に留まる (カスケード防止)。
+        if matches!(result.mode, FolderNavMode::SlideshowNext) && !result.hit_image_folder {
+            self.slideshow_playing = false;
+            self.slideshow_anchor_idx = None;
+            self.clear_pending_folder_nav_steps();
+            self.release_fs_nav_lock();
+            emit_end(
+                apply_t0,
+                apply_seq,
+                apply_mode_tag,
+                "slideshow_next_boundary",
+            );
+            return;
+        }
         // Fullscreen モードで skip_limit 尽きフォールバックの場合は、画像・動画の無い
         // フォルダへ飛ばしてフルスクリーンが解除されるのを避けるため、現状維持で
         // 中央ヒントを出す。Grid モードは従来通り移動 (段階的に進める導線)。
@@ -12495,7 +12570,8 @@ impl App {
             FolderNavMode::Grid => {
                 self.load_folder_with_scan(path, scanned);
             }
-            FolderNavMode::Fullscreen => {
+            FolderNavMode::Fullscreen | FolderNavMode::SlideshowNext => {
+                let resume_slideshow = matches!(result.mode, FolderNavMode::SlideshowNext);
                 #[cfg(windows)]
                 let restore_video_tile = self.video_tile_mode_active;
                 #[cfg(not(windows))]
@@ -12504,12 +12580,14 @@ impl App {
                 // load_folder で items を入れ替えると古い画像を新しい idx で
                 // 誤って引く危険がある。close_fullscreen で一括破棄してから
                 // 新フォルダを読み直す (PDF Critical 予約は open_fullscreen で再取得)。
+                // 注: close_fullscreen は slideshow_playing=false にするが、SlideshowNext は
+                // resume_slideshow フラグ (= reopen 側で再開) で復帰するので問題ない。
                 self.close_fullscreen();
                 self.load_folder_with_scan(path, scanned);
                 let reason = self.reopen_fullscreen_after_folder_nav_load(
                     ctx,
-                    result.forward,
                     restore_video_tile,
+                    resume_slideshow,
                 );
                 if reason == "enumerate_defer" {
                     emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
@@ -12552,8 +12630,8 @@ impl App {
                     if fullscreen {
                         let reason = self.reopen_fullscreen_after_folder_nav_load(
                             ctx,
-                            result.forward,
                             restore_video_tile,
+                            false,
                         );
                         if reason == "enumerate_defer" {
                             emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
@@ -12575,8 +12653,8 @@ impl App {
                             self.update_favsearch_address();
                             let reason = self.reopen_fullscreen_after_folder_nav_load(
                                 ctx,
-                                result.forward,
                                 restore_video_tile,
+                                false,
                             );
                             if reason == "enumerate_defer" {
                                 emit_end(apply_t0, apply_seq, apply_mode_tag, reason);
@@ -12609,12 +12687,13 @@ impl App {
 
     /// Ctrl+↑↓ フルスクリーン遷移後の表示対象 item index を決める。
     ///
-    /// 1. まず可視アイテムから画像系 (Image/Video/ZipImage/PdfPage) を探す。
+    /// 1. まず可視アイテムから画像系を探す。`include_video=false` のときは Video を
+    ///    除外する (スライドショー NextFolder の再開で動画に着地しないため、Codex P2)。
     /// 2. 見つからず、ZIP/PDF ファイルだけ置かれているフォルダだった場合は
     ///    最初 (backward 時は最後) の ZIP/PDF に入り、その中の画像系を返す。
     ///    これにより「ZIP/PDF しか入っていない中間フォルダ」でフルスクリーン表示が
     ///    切れず、マンガ/コミックの連続閲覧が続く。
-    fn find_fullscreen_nav_target(&mut self) -> Option<usize> {
+    fn find_fullscreen_nav_target_filtered(&mut self, include_video: bool) -> Option<usize> {
         // Ctrl+↑↓ は方向に関わらず常にフォルダ先頭の画像系アイテムへ着地する
         // (= 一般的なビューワ慣習に合わせ、フォルダ識別性を優先)。後方ナビでも
         // 先頭着地にすることで Ctrl+矢印の mental model が「フォルダにジャンプして
@@ -12626,10 +12705,9 @@ impl App {
                 matches!(
                     items.get(i),
                     Some(GridItem::Image(_))
-                        | Some(GridItem::Video(_))
                         | Some(GridItem::ZipImage { .. })
                         | Some(GridItem::PdfPage { .. })
-                )
+                ) || (include_video && matches!(items.get(i), Some(GridItem::Video(_))))
             };
             app.visible_indices
                 .iter()
