@@ -2215,6 +2215,8 @@ impl App {
                                 ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
                         }
                     }
+                    let full_rect = ui.max_rect();
+                    self.draw_feedback_toast(ui, full_rect, ctx);
                     return None;
                 }
 
@@ -2226,6 +2228,8 @@ impl App {
                             "検索結果なし"
                         });
                     });
+                    let full_rect = ui.max_rect();
+                    self.draw_feedback_toast(ui, full_rect, ctx);
                     return None;
                 }
 
