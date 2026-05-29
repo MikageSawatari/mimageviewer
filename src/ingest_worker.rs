@@ -247,7 +247,16 @@ impl<'a> IngestSession<'a> {
             drop(_permit);
             match built {
                 Ok(doc) => {
-                    pending_ok_meta.push((cand.key.clone(), doc.kind, cand.mtime, cand.file_size));
+                    // fts_meta には **差分用** 署名 (画像 + サイドカーを織り込んだ diff_mtime/
+                    // diff_size) を保存する。walker の 3-way diff がこれと比較してサイドカーの
+                    // 追加/編集/削除を検出する。Tantivy doc 側 (`doc.mtime`) は画像本体の mtime の
+                    // ままで、日付ソートはサイドカー編集時刻に引きずられない (docs §14-4)。
+                    pending_ok_meta.push((
+                        cand.key.clone(),
+                        doc.kind,
+                        cand.diff_mtime,
+                        cand.diff_size,
+                    ));
                     batch_upserts.push(doc);
                     stats.ingested_ok += 1;
                 }
@@ -379,6 +388,9 @@ mod tests {
             kind: CandidateKind::Image,
             mtime,
             file_size: meta.len() as i64,
+            // テストではサイドカー無し → 差分用署名は本体と同値。
+            diff_mtime: mtime,
+            diff_size: meta.len() as i64,
         }
     }
 

@@ -192,6 +192,7 @@ impl App {
         let ai_metadata = self.get_current_ai_metadata();
         let exif_info = self.get_current_exif();
         let tweet_info = self.get_current_tweet_info();
+        let sidecar_info = self.get_current_sidecar();
 
         // タグパネル用の情報を先に集める (child_ui の &mut ui closure 前に借用を解消するため)
         let taggable_path = self.current_taggable_image_path();
@@ -270,11 +271,26 @@ impl App {
                     draw_exif_panel(ui, exif, &mut self.exif_sections_open);
                 }
 
+                // 外部メタデータ (サイドカー) セクション (FS 画像のみ。docs §11)
+                if let Some(ref sc) = sidecar_info {
+                    if ai_metadata.is_some()
+                        || exif_info.is_some()
+                        || tweet_info.is_some()
+                        || !defined_tags.is_empty()
+                    {
+                        ui.add_space(12.0);
+                        ui.separator();
+                        ui.add_space(8.0);
+                    }
+                    draw_sidecar_section(ui, sc, &mut self.sidecar_raw_open);
+                }
+
                 // 何もない場合
                 if ai_metadata.is_none()
                     && exif_info.is_none()
                     && tweet_info.is_none()
                     && defined_tags.is_empty()
+                    && sidecar_info.is_none()
                 {
                     draw_no_metadata(ui);
                 }
@@ -307,6 +323,14 @@ impl App {
         let idx = self.fullscreen_idx?;
         let key = self.metadata_cache_key(idx)?;
         self.xmp_cache.get(&key).cloned().flatten()
+    }
+
+    /// 現在のフルスクリーン画像の外部メタデータサイドカー (表示用) を取得する。
+    /// worker (`run_metadata_load`) が FS 画像のみ埋めるので、動画 / ZIP / PDF は常に None。
+    fn get_current_sidecar(&self) -> Option<crate::external_metadata::SidecarDisplay> {
+        let idx = self.fullscreen_idx?;
+        let key = self.metadata_cache_key(idx)?;
+        self.sidecar_display_cache.get(&key).cloned().flatten()
     }
 
     /// 現在のフルスクリーン画像のタグ一覧 (XMP dc:subject) を取得する。
@@ -698,6 +722,142 @@ fn draw_collapsible_json_section(
                         .monospace(),
                 );
             });
+    }
+}
+
+/// 外部メタデータ (サイドカー) セクション。JSON は汎用 key/value ツリー + 生 JSON 折りたたみ、
+/// TXT はテキスト表示 (docs/sidecar-metadata-ingest.md §11)。
+/// 特定スキーマの代表フィールドをハードコードしない (どんな JSON でも同一ロジック)。
+fn draw_sidecar_section(
+    ui: &mut egui::Ui,
+    sc: &crate::external_metadata::SidecarDisplay,
+    raw_open: &mut bool,
+) {
+    ui.label(
+        egui::RichText::new("外部メタデータ")
+            .color(egui::Color32::WHITE)
+            .size(16.0)
+            .strong(),
+    );
+    ui.add_space(4.0);
+    match sc {
+        crate::external_metadata::SidecarDisplay::Json(v) => {
+            draw_json_node(ui, None, v, 0);
+            ui.add_space(6.0);
+            // 生 JSON は折りたたみ。**開いたときだけ** pretty-print する。サイドカーは最大 2MB
+            // 許容するので、毎フレーム to_string_pretty するとパネルがカクつく (Codex P2)。
+            let label = if *raw_open {
+                "▼ 生 JSON"
+            } else {
+                "▶ 生 JSON"
+            };
+            if ui
+                .selectable_label(
+                    *raw_open,
+                    egui::RichText::new(label).color(DIM_COLOR).size(BODY_FONT),
+                )
+                .clicked()
+            {
+                *raw_open = !*raw_open;
+            }
+            if *raw_open {
+                let pretty = serde_json::to_string_pretty(v).unwrap_or_default();
+                egui::ScrollArea::vertical()
+                    .id_salt("sidecar_raw_json")
+                    .max_height(300.0)
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(pretty)
+                                .color(JSON_COLOR)
+                                .size(11.0)
+                                .monospace(),
+                        );
+                    });
+            }
+        }
+        crate::external_metadata::SidecarDisplay::Text(t) => {
+            egui::ScrollArea::vertical()
+                .id_salt("sidecar_text_view")
+                .max_height(300.0)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(t.as_str())
+                            .color(TEXT_COLOR)
+                            .size(11.0)
+                            .monospace(),
+                    );
+                });
+        }
+    }
+}
+
+/// JSON 値がスカラ (Null/Bool/Number/String) ならその表示文字列を返す。
+fn json_scalar_str(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Null => Some("null".to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+fn json_dim_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).color(DIM_COLOR).size(BODY_FONT));
+}
+
+/// JSON 値を 1 ノード描画する。スカラは `key: value`、スカラ配列は 1 行、
+/// ネストした配列/オブジェクトはインデントして再帰。深さ上限で打ち切る。
+fn draw_json_node(ui: &mut egui::Ui, key: Option<&str>, v: &serde_json::Value, depth: usize) {
+    const MAX_DEPTH: usize = 8;
+    if let Some(s) = json_scalar_str(v) {
+        draw_key_value_wrapped(ui, key.unwrap_or("-"), &s);
+        return;
+    }
+    match v {
+        serde_json::Value::Array(a) => {
+            if a.iter().all(|e| json_scalar_str(e).is_some()) {
+                // スカラのみの配列は 1 行に連結
+                let joined = a
+                    .iter()
+                    .filter_map(json_scalar_str)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                draw_key_value_wrapped(ui, key.unwrap_or("-"), &joined);
+            } else if depth >= MAX_DEPTH {
+                draw_key_value_wrapped(ui, key.unwrap_or("-"), &format!("[{} 件]", a.len()));
+            } else {
+                if let Some(k) = key {
+                    json_dim_label(ui, &format!("{k}:"));
+                }
+                ui.indent(("sc_arr", depth, key.unwrap_or("")), |ui| {
+                    for (i, e) in a.iter().enumerate() {
+                        draw_json_node(ui, Some(&format!("[{i}]")), e, depth + 1);
+                    }
+                });
+            }
+        }
+        serde_json::Value::Object(m) => {
+            if depth >= MAX_DEPTH {
+                draw_key_value_wrapped(ui, key.unwrap_or("-"), &format!("{{{} キー}}", m.len()));
+            } else if depth == 0 {
+                // トップレベルはインデントせず並べる
+                for (k, val) in m {
+                    draw_json_node(ui, Some(k), val, depth + 1);
+                }
+            } else {
+                if let Some(k) = key {
+                    json_dim_label(ui, &format!("{k}:"));
+                }
+                ui.indent(("sc_obj", depth, key.unwrap_or("")), |ui| {
+                    for (k, val) in m {
+                        draw_json_node(ui, Some(k), val, depth + 1);
+                    }
+                });
+            }
+        }
+        // Null/Bool/Number/String は上の scalar 経路で処理済み
+        _ => {}
     }
 }
 

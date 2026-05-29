@@ -1,6 +1,6 @@
 //! Tantivy ベースの全文検索インデックス (docs/search-architecture.md)。
 //!
-//! ## 役割 (INDEX_VERSION=7)
+//! ## 役割 (INDEX_VERSION=8)
 //!
 //! - bigram tokenizer (`NgramTokenizer(2, 2)` + `lower_caser`) で画像 / PDF / 動画メタを転置索引化
 //! - **検索原文 (post-filter 用) を STORED で保持する**。`*_text` フィールドが bigram
@@ -12,7 +12,7 @@
 //!   投入 → batch commit + reader reload に成功したフレームでのみ `fts_meta` を更新
 //!   する (Tantivy First)。詳細は [search-architecture.md §4.2](../docs/search-architecture.md)
 //!
-//! ## スキーマ (INDEX_VERSION=7)
+//! ## スキーマ (INDEX_VERSION=8)
 //!
 //! ```text
 //! path             STRING | STORED            完全一致キー、正規化済み
@@ -29,6 +29,7 @@
 //! pdf_meta_text    TEXT   bigram | STORED     PDFium document info
 //! video_meta_text  TEXT   bigram | STORED     FFmpeg container metadata (video only)
 //! tags             TEXT   bigram | STORED     XMP dc:subject (#プレフィックス付き)
+//! sidecar_text     TEXT   bigram | STORED     外部メタデータサイドカー (JSON/TXT) の値 (image only)
 //! ```
 //!
 //! per-source に分けているのは、「検索対象フィルタ」 (`SearchTarget::Only`) で
@@ -77,6 +78,9 @@ pub enum SourceKind {
     PdfMeta,
     VideoMeta,
     Tags,
+    /// 外部メタデータサイドカー (画像と同名の JSON/TXT) の値テキスト。
+    /// mIV タグ (`Tags`) とは別系統の読み取り専用フリーテキスト (docs/sidecar-metadata-ingest.md)。
+    Sidecar,
 }
 
 impl SourceKind {
@@ -88,6 +92,7 @@ impl SourceKind {
         SourceKind::PdfMeta,
         SourceKind::VideoMeta,
         SourceKind::Tags,
+        SourceKind::Sidecar,
     ];
 }
 
@@ -243,6 +248,7 @@ pub struct Fields {
     pub pdf_meta_text: Field,
     pub video_meta_text: Field,
     pub tags: Field,
+    pub sidecar_text: Field,
 }
 
 impl Fields {
@@ -272,6 +278,9 @@ impl Fields {
                 .get_field("video_meta_text")
                 .expect("schema: video_meta_text"),
             tags: schema.get_field("tags").expect("schema: tags"),
+            sidecar_text: schema
+                .get_field("sidecar_text")
+                .expect("schema: sidecar_text"),
         }
     }
 
@@ -285,6 +294,7 @@ impl Fields {
             SourceKind::PdfMeta => self.pdf_meta_text,
             SourceKind::VideoMeta => self.video_meta_text,
             SourceKind::Tags => self.tags,
+            SourceKind::Sidecar => self.sidecar_text,
         }
     }
 }
@@ -390,6 +400,7 @@ pub fn upsert_doc(writer: &IndexWriter, fields: &Fields, d: &IndexDoc) -> tantiv
         fields.pdf_meta_text   => d.norms.pdf_meta.as_str(),
         fields.video_meta_text => d.norms.video_meta.as_str(),
         fields.tags            => d.norms.tags.as_str(),
+        fields.sidecar_text    => d.norms.sidecar.as_str(),
     ))?;
     Ok(())
 }
@@ -606,6 +617,7 @@ pub fn doc_per_source_text(
         pdf_meta: read(fields.pdf_meta_text),
         video_meta: read(fields.video_meta_text),
         tags: read(fields.tags),
+        sidecar: read(fields.sidecar_text),
     })
 }
 
@@ -675,7 +687,10 @@ fn schema_is_stale(schema: &Schema) -> bool {
         && schema.get_field("pdf_meta_text").is_ok()
         && schema.get_field("video_meta_text").is_ok()
         && schema.get_field("kind").is_ok()
-        && schema.get_field("tags").is_ok();
+        && schema.get_field("tags").is_ok()
+        // INDEX_VERSION=8: 外部メタデータサイドカーのフィールド。これを欠く v7 以前の
+        // index は stale 扱いにして wipe + 再構築させる (無いと Fields::from_schema が panic)。
+        && schema.get_field("sidecar_text").is_ok();
     if !has_new {
         return true;
     }
@@ -691,6 +706,7 @@ fn schema_is_stale(schema: &Schema) -> bool {
         "pdf_meta_text",
         "video_meta_text",
         "tags",
+        "sidecar_text",
     ] {
         let Ok(field) = schema.get_field(name) else {
             return true;
@@ -749,6 +765,9 @@ fn build_schema() -> Schema {
     b.add_text_field("png_prompt_text", text_opts.clone());
     b.add_text_field("pdf_meta_text", text_opts.clone());
     b.add_text_field("video_meta_text", text_opts.clone());
+    // 外部メタデータサイドカー (JSON/TXT) の値テキスト (INDEX_VERSION=8)。bigram + STORED。
+    // mIV タグとは別系統の読み取り専用フリーテキスト (docs/sidecar-metadata-ingest.md)。
+    b.add_text_field("sidecar_text", text_opts.clone());
     // タグフィールドも bigram tokenize — `原神` キーワード検索で `#原神` タグにヒット、
     // `#原神` 入力でもヒットする (A-1 設計)。target=Tags ドロップダウンで絞り込み可。
     b.add_text_field("tags", text_opts);
@@ -824,6 +843,7 @@ mod tests {
                 pdf_meta: String::new(),
                 video_meta: String::new(),
                 tags: String::new(),
+                sidecar: String::new(),
             },
         }
     }
@@ -879,9 +899,75 @@ mod tests {
         assert!(s.get_field("png_prompt_text").is_ok());
         assert!(s.get_field("pdf_meta_text").is_ok());
         assert!(s.get_field("video_meta_text").is_ok());
+        assert!(s.get_field("tags").is_ok());
+        assert!(
+            s.get_field("sidecar_text").is_ok(),
+            "INDEX_VERSION=8 で sidecar_text フィールドが追加されている"
+        );
         assert!(
             s.get_field("all_text").is_err(),
             "all_text は §19 で削除済み"
+        );
+    }
+
+    /// 外部メタデータサイドカー: `sidecar_text` のみに語が入った doc が、
+    /// `Target::All` と `Only(Sidecar)` でヒットし、`Only(Tags)` ではヒットしないこと。
+    /// (mIV タグ系統 `Tags` とサイドカー `Sidecar` の分離検証)
+    #[test]
+    fn target_sidecar_is_isolated_from_tags() {
+        let (_tmp, idx) = new_index();
+        let fav = Uuid::new_v4();
+        let mut writer = idx.writer().unwrap();
+        let mut d = sample_doc("c:/a.jpg", fav, "");
+        d.norms = crate::ingest_text::PerSourceText {
+            name: "a.jpg".into(),
+            sidecar: "karon-t nonoyama_rui 1girl".into(),
+            ..Default::default()
+        };
+        upsert_doc(&writer, idx.fields(), &d).unwrap();
+        writer.commit().unwrap();
+        idx.reload_reader().unwrap();
+        let searcher = idx.searcher();
+
+        // All でヒット
+        let q_all = q_all(idx.fields(), &["nonoyama"]).unwrap();
+        assert_eq!(
+            search_page(&searcher, idx.fields(), &q_all, 0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        // Only(Sidecar) でヒット
+        let q_sc = build_bigram_and_query(
+            idx.fields(),
+            &["nonoyama"],
+            &QueryFilters {
+                target: SearchTarget::Only(vec![SourceKind::Sidecar]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            search_page(&searcher, idx.fields(), &q_sc, 0, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        // Only(Tags) ではヒットしない (別系統)
+        let q_tags = build_bigram_and_query(
+            idx.fields(),
+            &["nonoyama"],
+            &QueryFilters {
+                target: SearchTarget::Only(vec![SourceKind::Tags]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            search_page(&searcher, idx.fields(), &q_tags, 0, 10)
+                .unwrap()
+                .len(),
+            0
         );
     }
 

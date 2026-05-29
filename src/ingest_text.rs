@@ -39,6 +39,10 @@ pub struct PerSourceText {
     /// XMP `dc:subject` 由来のタグ列 (スペース区切り、`#` 込み / 既存タグは `#` なし)。
     /// Tantivy 側は bigram tokenize、fts_meta 側は同文字列を保存。
     pub tags: String,
+    /// 外部メタデータサイドカー (画像と同名の JSON/TXT) の値テキスト (`normalize_for_match` 済み)。
+    /// JSON はリーフ値のみ / TXT は全文。mIV タグ (`tags`) とは別系統の読み取り専用
+    /// フリーテキスト (docs/sidecar-metadata-ingest.md)。
+    pub sidecar: String,
 }
 
 impl PerSourceText {
@@ -51,6 +55,7 @@ impl PerSourceText {
             SourceKind::PdfMeta => &self.pdf_meta,
             SourceKind::VideoMeta => &self.video_meta,
             SourceKind::Tags => &self.tags,
+            SourceKind::Sidecar => &self.sidecar,
         }
     }
 
@@ -65,7 +70,8 @@ impl PerSourceText {
                 + self.pdf_meta.len()
                 + self.video_meta.len()
                 + self.tags.len()
-                + 7,
+                + self.sidecar.len()
+                + 8,
         );
         for s in [
             &self.name,
@@ -75,6 +81,7 @@ impl PerSourceText {
             &self.pdf_meta,
             &self.video_meta,
             &self.tags,
+            &self.sidecar,
         ] {
             if !s.is_empty() {
                 if !out.is_empty() {
@@ -94,6 +101,7 @@ impl PerSourceText {
             && self.pdf_meta.is_empty()
             && self.video_meta.is_empty()
             && self.tags.is_empty()
+            && self.sidecar.is_empty()
     }
 }
 
@@ -189,6 +197,15 @@ pub fn build_per_source_for_file(path: &Path) -> PerSourceText {
         let dc_tags = crate::xmp_reader::read_dc_subject(path);
         out.tags = build_tags_column(&dc_tags);
         out.video_meta = build_video_metadata_text(path);
+    }
+
+    // 5. 外部メタデータサイドカー (画像のみ。動画は既存 .xmp 経路を維持する)。
+    //    JSON はリーフ値のみ / TXT は全文を sidecar_text へ。タグ抽出はしない
+    //    (mIV タグ系統とは別系統。docs/sidecar-metadata-ingest.md)。
+    if !is_video_sidecar {
+        if let Some(text) = crate::external_metadata::read_search_text(path) {
+            out.sidecar = normalize_for_match(&text);
+        }
     }
 
     out
@@ -375,6 +392,7 @@ pub fn build_per_source_for_pdf(display_name: &str, info_text: &str) -> PerSourc
         },
         video_meta: String::new(),
         tags: String::new(),
+        sidecar: String::new(),
     }
 }
 
@@ -505,6 +523,7 @@ mod tests {
             pdf_meta: "".into(),
             video_meta: "video title".into(),
             tags: "#原神".into(),
+            sidecar: "".into(),
         };
         let c = pst.combined();
         assert_eq!(c, "photo.jpg canon 5d prompt text video title #原神");
@@ -520,6 +539,7 @@ mod tests {
             pdf_meta: "m".into(),
             video_meta: "v".into(),
             tags: "t".into(),
+            sidecar: "s".into(),
         };
         assert_eq!(pst.get(SourceKind::Filename), "n");
         assert_eq!(pst.get(SourceKind::Exif), "e");
@@ -528,6 +548,28 @@ mod tests {
         assert_eq!(pst.get(SourceKind::PdfMeta), "m");
         assert_eq!(pst.get(SourceKind::VideoMeta), "v");
         assert_eq!(pst.get(SourceKind::Tags), "t");
+        assert_eq!(pst.get(SourceKind::Sidecar), "s");
+    }
+
+    #[test]
+    fn reads_json_sidecar_values_into_sidecar_field() {
+        let tmp = TempDir::new().unwrap();
+        let img = tmp.path().join("0001.jpg");
+        fs::write(&img, b"not a real image").unwrap();
+        fs::write(
+            tmp.path().join("0001.jpg.json"),
+            br#"{ "artist": "Karon-T", "tags": ["1girl"], "source": "https://ex.invalid/X" }"#,
+        )
+        .unwrap();
+        let pst = build_per_source_for_file(&img);
+        // 値が正規化 (lowercase) されて sidecar に入る
+        assert!(pst.sidecar.contains("karon-t"), "sidecar={}", pst.sidecar);
+        assert!(pst.sidecar.contains("1girl"));
+        // キー名は入らない
+        assert!(!pst.sidecar.contains("artist"));
+        assert!(!pst.sidecar.contains("source"));
+        // タグ系統 (tags) には混ざらない
+        assert!(pst.tags.is_empty());
     }
 
     #[test]

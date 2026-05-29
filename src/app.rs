@@ -459,6 +459,9 @@ pub(crate) struct MetadataLoadResult {
     /// XMP GPano パノラマメタデータ。`Some(_)` でも `is_populated()` で空かどうかを判定。
     /// 360 度パノラマビュー機能 (docs/panorama-360-view-plan.md) のシグナル。
     panorama: Option<crate::xmp_reader::XmpPanoramaInfo>,
+    /// 外部メタデータサイドカー (同名 JSON/TXT) の右パネル表示用内容 (FS 画像のみ)。
+    /// docs/sidecar-metadata-ingest.md §11。
+    sidecar: Option<crate::external_metadata::SidecarDisplay>,
 }
 
 /// 非同期お気に入り検索 (Ctrl+S) の状態。
@@ -857,12 +860,24 @@ fn run_metadata_load(
         _ => (None, None, None, None),
     };
 
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    // 外部メタデータサイドカー (FS 画像のみ。docs §11)。動画 / ZIP 内画像 / PDF ページは
+    // サイドカー対象外なので None (Codex P2-6: metadata_cache_key は Video も返すため
+    // GridItem::Image で明示ゲートする)。
+    let sidecar = match &item {
+        GridItem::Image(p) => crate::external_metadata::read_for_display(p),
+        _ => None,
+    };
+
     Some(MetadataLoadResult {
         key,
         metadata,
         exif,
         xmp,
         panorama,
+        sidecar,
     })
 }
 
@@ -898,11 +913,15 @@ fn run_metadata_search(
     let use_video_meta = target.includes(crate::fts_index::SourceKind::VideoMeta);
     let use_tags = target.includes(crate::fts_index::SourceKind::Tags);
     let use_pdf_meta = target.includes(crate::fts_index::SourceKind::PdfMeta);
-    // Image / Video の fallback 経路は name/png/exif/xmp/video_meta/tags のいずれかが
+    // 外部メタデータサイドカー (FS 画像のみ。docs §14-5)。TARGET_CHOICES は Ctrl+F/Ctrl+G
+    // で共有されるので、ここで対応しないと「サイドカー」絞り込みが無反応・「すべて」が
+    // サイドカーを取りこぼす。
+    let use_sidecar = target.includes(crate::fts_index::SourceKind::Sidecar);
+    // Image / Video の fallback 経路は name/png/exif/xmp/video_meta/tags/sidecar のいずれかが
     // 対象でないと結果が常に空になる。PdfMeta-only 等で無駄な per-file 走査を避ける。
     // Tags も含めておかないと target=Tags のとき未インデックス画像が全件 skip される。
     let fallback_contributes =
-        use_name || use_png || use_exif || use_xmp || use_video_meta || use_tags;
+        use_name || use_png || use_exif || use_xmp || use_video_meta || use_tags || use_sidecar;
 
     // Pass 1: 構造アイテム + ZIP 内画像 (名前照合中心、PDF のみ document info I/O)。
     // 構造アイテムも一貫して絞り込む (§4.1): 名前がマッチしないものは非表示にする。
@@ -1094,6 +1113,19 @@ fn run_metadata_search(
                             extended_meta.push('\n');
                         }
                         extended_meta.push_str(&video_meta);
+                    }
+                }
+                // 外部メタデータサイドカー (FS 画像のみ): 同名 JSON/TXT の値テキストを
+                // on-demand 読みして hay に載せる (docs §14-5)。matches_with_mode が hay を
+                // lowercase するので未正規化テキストのままで照合できる。
+                if is_image && use_sidecar {
+                    if let Some(sc_text) = crate::external_metadata::read_search_text(path) {
+                        if !sc_text.is_empty() {
+                            if !extended_meta.is_empty() {
+                                extended_meta.push('\n');
+                            }
+                            extended_meta.push_str(&sc_text);
+                        }
                     }
                 }
                 let hay = hay_of(&extended_meta, name_for_hay, xmp_opt.as_ref());
@@ -2203,6 +2235,13 @@ pub struct App {
     /// キーは [`App::metadata_cache_key`] で生成。
     pub(crate) xmp_panorama_info:
         std::collections::HashMap<String, Option<crate::xmp_reader::XmpPanoramaInfo>>,
+    /// 外部メタデータサイドカー (同名 JSON/TXT) の右パネル表示用キャッシュ: 正規化キー →
+    /// パース結果 (`None` = サイドカー無し / 対象外)。キーは [`App::metadata_cache_key`]。
+    /// run_metadata_load (worker) が FS 画像のみ埋める (docs/sidecar-metadata-ingest.md §11)。
+    pub(crate) sidecar_display_cache:
+        std::collections::HashMap<String, Option<crate::external_metadata::SidecarDisplay>>,
+    /// 外部メタデータパネルの「生 JSON」折りたたみの開閉状態。
+    pub(crate) sidecar_raw_open: bool,
     /// 360 度パノラマビュー: インタラクティブステート (フルスクリーン内のみ Some)。
     /// 360 モード ON → Some、OFF → None。equirect でない画像へナビした場合は
     /// **保持しつつ非アクティブ化** する設計 (`is_panorama_mode_active(fs_idx)` で判定)。
@@ -3803,6 +3842,8 @@ impl App {
             exif_cache: std::collections::HashMap::new(),
             xmp_cache: std::collections::HashMap::new(),
             xmp_panorama_info: std::collections::HashMap::new(),
+            sidecar_display_cache: std::collections::HashMap::new(),
+            sidecar_raw_open: false,
             panorama_state: None,
             pano_uploaded: None,
             pano_toast_shown_for_current_fs: false,
@@ -13293,7 +13334,8 @@ impl App {
         let exif_hit = self.exif_cache.contains_key(&key);
         let xmp_hit = self.xmp_cache.contains_key(&key);
         let panorama_hit = self.xmp_panorama_info.contains_key(&key);
-        if ai_hit && exif_hit && xmp_hit && panorama_hit {
+        let sidecar_hit = self.sidecar_display_cache.contains_key(&key);
+        if ai_hit && exif_hit && xmp_hit && panorama_hit && sidecar_hit {
             return;
         }
 
@@ -13340,6 +13382,7 @@ impl App {
                 self.metadata_cache.insert(r.key.clone(), r.metadata);
                 self.exif_cache.insert(r.key.clone(), r.exif);
                 self.xmp_cache.insert(r.key.clone(), r.xmp);
+                self.sidecar_display_cache.insert(r.key.clone(), r.sidecar);
                 // GPano は実画像でのみ非 None。動画 / 構造アイテムは worker 側で
                 // None を返すが、cache hit 判定のため key を挿入する (再 spawn 抑止)。
                 let arrived_key = r.key.clone();

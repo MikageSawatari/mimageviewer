@@ -1,4 +1,4 @@
-//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=7)。
+//! `fts_meta.db` — 全文メタ検索のファイル単位 **管理メタ** 専用 DB (INDEX_VERSION=8)。
 //!
 //! docs/search-architecture.md に準拠する。
 //!
@@ -40,7 +40,8 @@ use crate::search_index_db::normalize_path;
 /// - 6: status を Ok / Failed の 2 値に縮小。Pending / Tombstone を廃止し、検索
 ///      post-filter の SQLite SELECT も削除。
 /// - 7: 動画メタデータ検索 (IndexKind::Video + video_meta_text) を追加。
-pub const INDEX_VERSION: i64 = 7;
+/// - 8: 外部メタデータサイドカー検索 (SourceKind::Sidecar + sidecar_text) を追加。
+pub const INDEX_VERSION: i64 = 8;
 
 /// 後始末 (VACUUM 等) を要求するスキーマ世代。`PRAGMA application_id` に書き込み、
 /// 既に最新なら再実行しない。INDEX_VERSION とは別管理で、データ移行を伴わない
@@ -124,11 +125,15 @@ impl FtsMetaDb {
         // - user_version == INDEX_VERSION: 最新 → rebuild 不要、MIN スキャンなし
         // - それ以外: 旧来の needs_rebuild() ロジックを実行 (初回起動 / 旧 DB)
         let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        // v5 → v6 はスキーマ列構造が互換 (status を 4 値 → 2 値に運用変更しただけ) なので
-        // テーブル drop しない。それ以外の未知 version は needs_rebuild が判断する。
+        // user_version が最新と一致すれば rebuild 不要 (MIN スキャン回避)。それ以外は
+        // needs_rebuild が判断する。
+        // 注 (docs §14-8): かつて `5 => false` で v5→v6 の in-place 移行 (status 値の運用変更だけ)
+        // を許してテーブル drop を回避していたが、INDEX_VERSION=8 で Tantivy に新フィールド
+        // (sidecar_text) を足し `schema_is_stale` が Tantivy を wipe するため、pre-8 の DB は
+        // fts_meta も drop して walker に全再 ingest させる必要がある (fts_meta だけ残ると
+        // 「FS=unchanged」と判定され空の Tantivy が埋まらず検索が壊れる)。そのため特例を撤去。
         let rebuild_needed = match user_version {
             INDEX_VERSION => false,
-            5 => false,
             _ => needs_rebuild(&conn)?,
         };
         if rebuild_needed {
@@ -957,14 +962,16 @@ mod tests {
     }
 
     #[test]
-    fn migration_v5_to_v6_collapses_pending_and_drops_tombstones() {
-        // 旧 v5 スキーマで status=Pending(1) と Tombstone(3) を含むデータを作り、
-        // 最新 INDEX_VERSION で開き直したときに pending→failed, tombstone→DELETE される。
+    fn opening_v5_db_full_rebuilds_at_v8() {
+        // docs §14-8: かつて `5 => false` 特例で v5→v6 の in-place 移行 (status 値の降格) を
+        // 許していたが、INDEX_VERSION=8 で Tantivy に新フィールド (sidecar_text) を足したため、
+        // pre-8 の DB は fts_meta も drop + 全再構築させる (Tantivy だけ wipe されて fts_meta が
+        // 残ると空索引が埋まらない)。よって v5 DB を開くと旧行は消える。
         let dir = TempDir::new().unwrap();
         let db_path = dir.path().join("fts_meta.db");
         {
             let conn = Connection::open(&db_path).unwrap();
-            // v5 スキーマ (= 現スキーマと列構造同じ)。手動で作って status を旧値で入れる。
+            // v5 スキーマ (= 現スキーマと列構造同じ)。index_version=5 で seed。
             conn.execute_batch(
                 "CREATE TABLE files (
                     path              TEXT PRIMARY KEY,
@@ -996,18 +1003,30 @@ mod tests {
             }
         }
         let db = FtsMetaDb::open_at(&db_path).unwrap();
-        assert!(db.get("c:/a/ok.jpg").unwrap().is_some());
-        assert_eq!(
-            db.get("c:/a/pending.jpg").unwrap().unwrap().status,
-            FileStatus::Failed,
-            "pending は failed に降格"
-        );
-        assert!(db.get("c:/a/failed.jpg").unwrap().is_some());
-        assert_eq!(
-            db.get("c:/a/tomb.jpg").unwrap().unwrap().status,
-            FileStatus::Failed,
-            "tombstone は failed に降格 (Tantivy delete を reconciliation に委ねる)"
-        );
+        // 旧行は全 drop されている
+        for p in [
+            "c:/a/ok.jpg",
+            "c:/a/pending.jpg",
+            "c:/a/failed.jpg",
+            "c:/a/tomb.jpg",
+        ] {
+            assert!(
+                db.get(p).unwrap().is_none(),
+                "v5 DB は全再構築で drop されるはず: {p}"
+            );
+        }
+        // 新規 upsert は通る (再構築後のスキーマは健全)
+        let fav = Uuid::new_v4();
+        db.upsert_meta_ok(
+            "c:/a/new.jpg",
+            fav,
+            std::path::Path::new("C:/a"),
+            IndexKind::Image,
+            0,
+            0,
+        )
+        .unwrap();
+        assert!(db.get("c:/a/new.jpg").unwrap().is_some());
     }
 
     #[test]

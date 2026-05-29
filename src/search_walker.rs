@@ -39,8 +39,17 @@ pub struct CandidateFile {
     /// 正規化済み DB キー (`normalize_path` 済み)
     pub key: String,
     pub kind: CandidateKind,
+    /// **表示用** mtime (画像本体)。Tantivy doc に入り Ctrl+G 一覧の日付ソートに使う。
     pub mtime: i64,
+    /// **表示用** file_size (画像本体)。
     pub file_size: i64,
+    /// **差分用** mtime。画像はサイドカーを織り込んだ `max(画像, サイドカー)`。
+    /// fts_meta に保存され walker の 3-way diff で比較される。サイドカーの追加・編集を
+    /// 「変化あり」として検出するため (docs/sidecar-metadata-ingest.md §14-3/§14-4)。
+    pub diff_mtime: i64,
+    /// **差分用** size。画像はサイドカーの size を加味した `画像 size + サイドカー size`
+    /// (サイドカー無しは画像 size)。サイドカーの追加・削除を size 変化として検出するため。
+    pub diff_size: i64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,10 +175,12 @@ pub fn scan(
                 result.to_ingest.push(cand.clone());
             }
             Some(&(db_mtime, db_size)) => {
-                if db_mtime == cand.mtime && db_size == cand.file_size {
+                // 差分判定は **差分用** 署名 (画像 + サイドカーを織り込んだ値) で行う。
+                // fts_meta には ingest_worker が diff_mtime/diff_size を保存している。
+                if db_mtime == cand.diff_mtime && db_size == cand.diff_size {
                     result.unchanged += 1;
                 } else {
-                    // 変化あり → 再 ingest
+                    // 変化あり (本体 or サイドカーの追加/編集/削除) → 再 ingest
                     result.to_ingest.push(cand.clone());
                 }
             }
@@ -294,6 +305,18 @@ fn walk_dir_recursive(
             .unwrap_or(0);
         let file_size = metadata.len() as i64;
 
+        // 差分用署名: 画像はサイドカー (同名 .json/.txt) の mtime/size を織り込む。
+        // これでサイドカーの追加・編集・削除が 3-way diff で検出される (§14-3/§14-4)。
+        // 検出は per-file の存在チェック (最大 4 回) + サイドカー 1 件の stat。
+        let (diff_mtime, diff_size) = if kind == CandidateKind::Image {
+            match crate::external_metadata::sidecar_signature(&path) {
+                Some((sc_mtime, sc_size)) => (mtime.max(sc_mtime), file_size + sc_size),
+                None => (mtime, file_size),
+            }
+        } else {
+            (mtime, file_size)
+        };
+
         let key = normalize_path(&path);
         out.insert(
             key.clone(),
@@ -303,6 +326,8 @@ fn walk_dir_recursive(
                 kind,
                 mtime,
                 file_size,
+                diff_mtime,
+                diff_size,
             },
         );
     }

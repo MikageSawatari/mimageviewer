@@ -84,7 +84,8 @@ Ctrl+S / Ctrl+F の UI は [ui_main.rs](../src/ui_main.rs) の
 | [search_walker.rs](../src/search_walker.rs) | 起動時の再帰 walk + 3-way diff (FS / `fts_meta.db` の突き合わせ) |
 | [search_watcher.rs](../src/search_watcher.rs) | notify-rs `ReadDirectoryChangesW` ラッパ + 500ms debounce |
 | [ingest_worker.rs](../src/ingest_worker.rs) | メタ抽出 + Tantivy buffer + バッチ commit + fts_meta 状態遷移 |
-| [ingest_text.rs](../src/ingest_text.rs) | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / tags) ビルダー |
+| [ingest_text.rs](../src/ingest_text.rs) | `PerSourceText` (filename / exif / xmp_tweet / png_prompt / pdf_meta / video_meta / tags / sidecar) ビルダー |
+| [external_metadata.rs](../src/external_metadata.rs) | 外部メタデータサイドカー (画像と同名 .json/.txt) の検出・値抽出・差分署名・逆引き (§4.10) |
 | [name_index_supervisor.rs](../src/name_index_supervisor.rs) | Ctrl+S 用 **名前索引 supervisor** (初期バルク + notify-rs 追従) |
 | [name_bulk_indexer.rs](../src/name_bulk_indexer.rs) | Ctrl+S 用 初期バルクスキャンの本体 |
 | [io_semaphore.rs](../src/io_semaphore.rs) | `GlobalIoSemaphore` — UI / PDF / サムネ / インデクサ横断の I/O 同時実行制御 |
@@ -355,6 +356,31 @@ INDEX_VERSION=5 で原文が Tantivy 側に集約された影響で、`tag_write
 他ソース原文 (name / exif / xmp_tweet / png_prompt / pdf_meta / video_meta) を **保持したまま**
 tags だけ差し替える必要がある。ここで stale snapshot を読むと ingest が直前に
 commit した最新原文を旧値で潰してしまうため、上記 #2 / #3 の race ガードが必須。
+
+### 4.10 外部メタデータサイドカー (画像のみ、INDEX_VERSION=8)
+
+画像と **同名のサイドカーファイル** (`<画像名>.json` / `<画像名>.txt`) の内容を、**読み取り専用の
+フリーテキスト** として `sidecar_text` フィールドへ索引する。詳細設計は
+[sidecar-metadata-ingest.md](sidecar-metadata-ingest.md)。
+
+- **mIV タグ (`tags`, `#xxx`) とは別系統**。サイドカーからタグ抽出はせず、`#` も付けない。
+  検索対象フィルタの「サイドカー」(`SourceKind::Sidecar`) と「タグ」(`SourceKind::Tags`) は独立。
+- **抽出**: JSON は再帰してリーフ **値のみ** 連結 (キー名は索引しない)。TXT は全文。
+  `external_metadata::read_search_text` → `normalize_for_match` → `ingest_text` step 5。
+- **検出**: `<full>.json` → `<full>.txt` → `<stem>.json` → `<stem>.txt` の優先順位で最初の 1 つ。
+  サイズ上限 2MB、連結上限 256KB、壊れ JSON は空に倒す。
+- **差分検出**: walker / supervisor は画像候補の **差分用署名** に
+  `max(画像 mtime, サイドカー mtime)` と `画像 size + サイドカー size` を織り込む
+  (`CandidateFile.diff_mtime` / `diff_size`)。これでサイドカーの追加・編集・削除が 3-way diff で
+  検出される。Tantivy doc の `mtime` は画像本体のまま (日付ソートがサイドカー編集時刻に
+  引きずられない)。
+- **監視追従**: `.json`/`.txt` の変更イベントは `indexer_supervisor::apply_single_change` が
+  `external_metadata::images_for_sidecar` で兄弟画像へ逆引きして再 ingest に変換する
+  (Remove なら `sidecar_text` がクリアされる)。
+- **Ctrl+F**: `run_metadata_search` の Pass 2 で FS 画像のみ on-demand 読みして hay に含める。
+- **設定**: 専用 ON/OFF は持たない。アイテム索引 (`auto_index_metadata`) に追従し、OFF 化は
+  `purge_favorite_metadata` で `sidecar_text` ごと消える。
+- **動画 / ZIP 内 / PDF ページは対象外** (動画は既存 `.xmp` サイドカーの mIV タグ経路を維持)。
 
 ---
 

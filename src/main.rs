@@ -29,6 +29,7 @@ pub mod dwm_transitions;
 pub mod exif_reader;
 pub mod export_dialog;
 pub mod external_links;
+pub mod external_metadata;
 pub mod fast_resize;
 pub mod file_drag;
 pub mod folder_rating_counter;

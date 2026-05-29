@@ -511,6 +511,20 @@ fn apply_single_change(
     // watcher から来るのは abs path。walker と同じ正規化で key を作る。
     let key = crate::search_index_db::normalize_path(&path);
 
+    // 外部メタデータサイドカー (*.json / *.txt) の変更は、それ自体をアイテム索引の doc に
+    // するのではなく、**対応する兄弟画像の再 ingest** に変換する (docs §14-2)。
+    // Upsert/Remove どちらでも画像を再 ingest すれば、build_per_source_for_file が
+    // サイドカーを読み直す (Remove なら sidecar_text がクリアされる)。
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if ext == "json" || ext == "txt" {
+        reingest_images_for_sidecar(session, writer, io_sem, cancel, stats, progress, &path);
+        return;
+    }
+
     match kind {
         ChangeKind::Remove => {
             let ingest_stats = match session.apply(
@@ -591,6 +605,45 @@ fn apply_single_change(
     }
 }
 
+/// サイドカー (*.json / *.txt) の変更イベントを、対応する兄弟画像の再 ingest に変換する
+/// (docs §14-2)。`images_for_sidecar` が `<full>`/`<stem>` 形式の命名規則を逆引きする。
+/// 対応画像が無い (孤立サイドカー) なら何もしない。
+#[allow(clippy::too_many_arguments)]
+fn reingest_images_for_sidecar(
+    session: &IngestSession,
+    writer: &crate::fts_writer_dispatcher::FtsWriterDispatcher,
+    io_sem: &GlobalIoSemaphore,
+    cancel: &AtomicBool,
+    stats: &Mutex<SupervisorStats>,
+    progress: &ProgressReporter,
+    sidecar_path: &std::path::Path,
+) {
+    for img in crate::external_metadata::images_for_sidecar(sidecar_path) {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let key = crate::search_index_db::normalize_path(&img);
+        let Some(cand) = build_candidate_from_path(&img, key) else {
+            continue;
+        };
+        match session.apply(
+            vec![cand],
+            vec![],
+            writer,
+            io_sem,
+            IoPriority::Normal,
+            cancel,
+            Some(progress),
+        ) {
+            Ok(s) => update_stats(stats, &s),
+            Err(e) => crate::logger::log(format!(
+                "indexer[{}]: sidecar reingest apply failed: {e}",
+                session.favorite_id
+            )),
+        }
+    }
+}
+
 fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<CandidateFile> {
     let metadata = std::fs::metadata(abs_path).ok()?;
     if !metadata.is_file() {
@@ -630,12 +683,25 @@ fn build_candidate_from_path(abs_path: &std::path::Path, key: String) -> Option<
     if crate::folder_tree::is_apple_double(abs_path) {
         return None;
     }
+    // 差分用署名: 画像はサイドカー (同名 .json/.txt) を織り込む (walker と同じロジック、
+    // docs/sidecar-metadata-ingest.md §14-3/§14-4)。これで fts_meta にサイドカー込みの
+    // 署名が保存され、次回起動の walker 3-way diff と整合する。
+    let (diff_mtime, diff_size) = if kind == search_walker::CandidateKind::Image {
+        match crate::external_metadata::sidecar_signature(abs_path) {
+            Some((sc_mtime, sc_size)) => (mtime.max(sc_mtime), file_size + sc_size),
+            None => (mtime, file_size),
+        }
+    } else {
+        (mtime, file_size)
+    };
     Some(CandidateFile {
         abs_path: abs_path.to_path_buf(),
         key,
         kind,
         mtime,
         file_size,
+        diff_mtime,
+        diff_size,
     })
 }
 
