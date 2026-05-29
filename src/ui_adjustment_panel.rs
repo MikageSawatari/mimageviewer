@@ -673,13 +673,19 @@ impl App {
         child.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
 
         // ── ヘッダー ──
-        // タイトル「画像補正」を左寄せにし、右側に消しゴム / 隠蔽加工の起動アイコンを
-        // 並べる。E / Ctrl+M キーと同じ動作 (= モード入場) をマウスからも辿れるように
-        // するためのエントリーポイント。
+        // タイトル「画像補正」を左寄せにし、右側に消しゴム / 隠蔽加工 / エクスポートの
+        // 起動アイコンを並べる。E / Ctrl+M / Ctrl+E キーと同じ動作をマウスからも辿れる
+        // ようにするためのエントリーポイント。
         //
         // Phase 4 v2 (2026-05): 文字バッジ「消」「隠」を **画像アイコン** に置換。
         // 消しゴム = `draw_eraser_icon` (斜めの 2 段ブロック)、隠蔽加工 =
-        // `draw_tile_grid_icon` (2x2 タイル、モザイクの視覚的メタファ)。
+        // `draw_mosaic_icon` (3x3 タイル、モザイクの視覚的メタファ)。
+        //
+        // 2026-05: エクスポート (Ctrl+E) のアイコンを追加。Ctrl+E はキー操作しか入口が
+        // 無く UI から気付けなかったため、消しゴム / 隠蔽の入口でもあるこのパネルに
+        // 同居させる。トレイへ下向き矢印の `draw_export_icon`。エクスポートは編集モード
+        // 中は実行できないので、クリック時は adjustment_mode を倒してから
+        // `open_export_dialog_for_current` を呼ぶ (= ビューモードへ戻して合成結果を書く)。
         let header_rect =
             egui::Rect::from_min_size(panel_rect.min, egui::vec2(panel_rect.width(), HEADER_H));
         const HEADER_BTN_SIZE: f32 = 28.0;
@@ -704,10 +710,15 @@ impl App {
                         | crate::grid_item::GridItem::PdfPage { .. }
                 )
             );
-        // 右側 2 ボタン (隠蔽 = 右端 / 消しゴム = その左)
+        // 右側 3 ボタン (隠蔽 = 右端 / 消しゴム = その左 / エクスポート = さらに左)
         let btn_y = header_rect.center().y - HEADER_BTN_SIZE / 2.0;
         let conceal_btn_x = header_rect.max.x - HEADER_RIGHT_PAD - HEADER_BTN_SIZE;
         let erase_btn_x = conceal_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
+        let export_btn_x = erase_btn_x - HEADER_BTN_GAP - HEADER_BTN_SIZE;
+        let export_rect = egui::Rect::from_min_size(
+            egui::pos2(export_btn_x, btn_y),
+            egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
+        );
         let erase_rect = egui::Rect::from_min_size(
             egui::pos2(erase_btn_x, btn_y),
             egui::vec2(HEADER_BTN_SIZE, HEADER_BTN_SIZE),
@@ -718,6 +729,7 @@ impl App {
         );
         let mut activate_erase = false;
         let mut activate_conceal = false;
+        let mut activate_export = false;
         // 消しゴムボタン: 鉛筆型アイコン。背景はホバーバーと同じ灰系で、ホバー時に明るく。
         // disabled (= 非画像) は半透明で識別。
         {
@@ -777,6 +789,36 @@ impl App {
                 resp.on_hover_text("隠蔽加工 (Ctrl+M)");
             }
         }
+        // エクスポートボタン: 下向き矢印 + トレイ (= ファイル保存)。消しゴム補完や
+        // 隠蔽加工 (モザイク等)・色補正まで焼き込んだ画像をファイルへ書き出す入口で、
+        // Ctrl+E と同じ `open_export_dialog_for_current` を呼ぶ (dispatch 側で処理)。
+        {
+            let resp = child.interact(
+                export_rect,
+                egui::Id::new("adjust_panel_export_btn"),
+                egui::Sense::click(),
+            );
+            let bg = if !can_overlay_edit {
+                egui::Color32::from_rgba_unmultiplied(50, 50, 50, 120)
+            } else if resp.hovered() {
+                egui::Color32::from_rgba_unmultiplied(100, 100, 100, 220)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(70, 70, 70, 200)
+            };
+            child.painter().rect_filled(export_rect, 4.0, bg);
+            let r = HEADER_BTN_SIZE * 0.28;
+            crate::ui_fullscreen::draw_icons::draw_export_icon(
+                child.painter(),
+                export_rect.center(),
+                r,
+            );
+            if can_overlay_edit && resp.clicked() {
+                activate_export = true;
+            }
+            if can_overlay_edit {
+                resp.on_hover_text("エクスポート (Ctrl+E)");
+            }
+        }
         // クリック処理は描画後にディスパッチ (借用衝突回避)。
         // 補正パネルは「ホバーで自動閉じる」モードなので、消しゴム / 隠蔽に入る前に
         // adjustment_mode を倒しておく (enter_*_mode 内のガード `!self.adjustment_mode`
@@ -791,6 +833,16 @@ impl App {
             self.adjustment_mode = false;
             self.enter_conceal_mode(fs_root_idx);
             return;
+        }
+        if activate_export {
+            // エクスポートは編集モード中 (adjustment / erase / conceal / analysis) は
+            // 弾かれる。補正パネルはホバーで出る自動オーバーレイなので、ここで閉じて
+            // ビューモードへ戻すことで「消しゴム / 隠蔽 / モザイクまで合成した最終結果」を
+            // 書き出せる状態にしてからダイアログを開く (Ctrl+E と同一経路)。
+            self.adjustment_mode = false;
+            let ctx = child.ctx().clone();
+            self.open_export_dialog_for_current(&ctx, fs_root_idx);
+            return; // 同フレーム内でモード分岐が変わるため以降の描画はスキップ
         }
 
         // ── R5: パネル body 全体を 1 つの ScrollArea で囲む ──

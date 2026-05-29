@@ -232,6 +232,49 @@ pub(crate) fn draw_mosaic_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
     }
 }
 
+/// エクスポートアイコン (= ファイル保存。トレイへ下向き矢印の "書き出し" メタファ)。
+///
+/// 補正パネルヘッダーの消しゴム / 隠蔽アイコンと並ぶ 3 つ目の起動ボタン用 (Ctrl+E)。
+/// 下向き矢印 (= 画像をファイルへ書き出す) + 下部の受け皿 (トレイ) で「ディスクに
+/// 保存」を表す。ホバーバーのカメラ (= クリップボードコピー) とは別シンボルにして
+/// 役割を区別する。`r ≈ HEADER_BTN_SIZE * 0.28` を想定。
+pub(crate) fn draw_export_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
+    let white = egui::Color32::WHITE;
+    let stroke = egui::Stroke::new(1.8, white);
+
+    // 下向き矢印 (上から下へ書き出すイメージ)
+    let stem_top = egui::pos2(c.x, c.y - r * 0.95);
+    let stem_bot = egui::pos2(c.x, c.y + r * 0.2);
+    painter.line_segment([stem_top, stem_bot], stroke);
+    // 矢じり
+    painter.line_segment(
+        [stem_bot, egui::pos2(c.x - r * 0.45, c.y - r * 0.25)],
+        stroke,
+    );
+    painter.line_segment(
+        [stem_bot, egui::pos2(c.x + r * 0.45, c.y - r * 0.25)],
+        stroke,
+    );
+
+    // 受け皿 (トレイ) — 上辺を開けた U 字。下向き矢印を受け止める器。
+    let tray_l = c.x - r * 0.85;
+    let tray_r = c.x + r * 0.85;
+    let tray_top = c.y + r * 0.45;
+    let tray_bot = c.y + r * 0.9;
+    painter.line_segment(
+        [egui::pos2(tray_l, tray_top), egui::pos2(tray_l, tray_bot)],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(tray_l, tray_bot), egui::pos2(tray_r, tray_bot)],
+        stroke,
+    );
+    painter.line_segment(
+        [egui::pos2(tray_r, tray_top), egui::pos2(tray_r, tray_bot)],
+        stroke,
+    );
+}
+
 /// ウィンドウ / 全画面 切り替えアイコン (タイトルバー付きウィンドウ枠)。
 /// native 動画 HUD の `draw_overlay_window_toggle_icon` と見た目を揃える。
 pub(super) fn draw_window_toggle_icon(painter: &egui::Painter, c: egui::Pos2, r: f32) {
