@@ -940,6 +940,16 @@ fn zoom_preserve_pivot(
     )
 }
 
+fn should_draw_fs_pixel_grid(
+    pixel_grid_enabled: bool,
+    using_full_texture: bool,
+    zoom_pan: Option<(f32, egui::Vec2)>,
+) -> bool {
+    pixel_grid_enabled
+        && using_full_texture
+        && zoom_pan.is_some_and(|(zoom, _)| zoom > ZOOM_NEAR_ONE)
+}
+
 /// 中ボタンドラッグズームのスナップショット状態 (v0.8.1)。
 /// ドラッグ開始フレームで固定し、以降はここからの差分でズームを計算する。
 #[derive(Clone)]
@@ -4908,7 +4918,7 @@ impl App {
                     center,
                 );
             }
-            if pixel_grid_enabled && using_full_texture {
+            if should_draw_fs_pixel_grid(pixel_grid_enabled, using_full_texture, zoom_pan) {
                 Self::draw_fs_pixel_grid(
                     &painter,
                     full_rect,
@@ -9821,6 +9831,35 @@ mod tests {
     use super::*;
     use crate::grid_item::GridItem;
     use std::path::PathBuf;
+
+    #[test]
+    fn pixel_grid_requires_user_zoom_above_one() {
+        assert!(!should_draw_fs_pixel_grid(true, true, None));
+        assert!(!should_draw_fs_pixel_grid(
+            true,
+            true,
+            Some((1.0, egui::vec2(24.0, 12.0)))
+        ));
+        assert!(!should_draw_fs_pixel_grid(
+            true,
+            true,
+            Some((ZOOM_NEAR_ONE, egui::Vec2::ZERO))
+        ));
+        assert!(should_draw_fs_pixel_grid(
+            true,
+            true,
+            Some((ZOOM_NEAR_ONE + 0.01, egui::Vec2::ZERO))
+        ));
+    }
+
+    #[test]
+    fn pixel_grid_respects_toggle_and_full_texture_gate() {
+        let zoomed = Some((2.0, egui::Vec2::ZERO));
+
+        assert!(!should_draw_fs_pixel_grid(false, true, zoomed));
+        assert!(!should_draw_fs_pixel_grid(true, false, zoomed));
+        assert!(should_draw_fs_pixel_grid(true, true, zoomed));
+    }
 
     #[test]
     fn location_display_regular_image_joins_folder_and_filename() {
