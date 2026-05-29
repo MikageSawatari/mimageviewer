@@ -633,6 +633,17 @@ impl App {
         None
     }
 
+    /// 現在 fullscreen 表示中の画像 (Static) が透過 (alpha<255) を含むか。
+    /// 透過がある画像でのみ B キーの背景切替が意味を持つ (不透明画像は背景が画像の裏に
+    /// 隠れて見た目が変わらない)。Static 以外 (アニメ / 動画 / 未ロード) は判定せず `true` を
+    /// 返し、従来どおり切替を許可する (誤って無効化しないため)。
+    fn fs_image_has_alpha(&self, idx: usize) -> bool {
+        match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { pixels, .. }) => pixels.pixels.iter().any(|p| p.a() < 255),
+            _ => true,
+        }
+    }
+
     /// 右 Ctrl ホールド中だけ、mIV 側の派生表示 (補正 / AI / 消しゴム補完) を
     /// 迂回して raw decode の元画像テクスチャを選ぶ。
     ///
@@ -3555,12 +3566,33 @@ impl App {
         // AI アップスケール有効時 (composite-first): 市松は出力にパターンが焼き込まれて崩れるので
         // 黒/白の 2 モード循環に制限する。デノイズのみの場合はアルファ保持パスを通るので市松 OK。
         if key_b_bg && !self.analysis_mode && !self.adjustment_mode {
-            let modulo: u8 = if self.ai_upscale_enabled { 2 } else { 3 };
-            self.fs_transparent_bg_mode = (self.fs_transparent_bg_mode + 1) % modulo;
-            self.fs_transparent_bg_indicator_until =
-                Some(std::time::Instant::now() + std::time::Duration::from_millis(1200));
-            let label = transparent_bg_toast(self.fs_transparent_bg_mode);
-            self.show_feedback_toast(label.to_string());
+            // 背景切替は透過 (alpha) のある画像でのみ意味を持つ。見開きはどちらかに透過が
+            // あれば許可。RGB のみの不透明画像では切替しても見た目が変わらないので無効化し案内する。
+            let idxs: Vec<usize> = match self.resolve_spread_pair(fs_idx) {
+                SpreadPair::Double { left, right } => vec![left, right],
+                SpreadPair::Single => vec![fs_idx],
+            };
+            if !idxs.iter().any(|&i| self.fs_image_has_alpha(i)) {
+                self.show_feedback_toast(
+                    "透過画像ではないため背景は切り替えできません".to_string(),
+                );
+            } else {
+                let modulo: u8 = if self.ai_upscale_enabled { 2 } else { 3 };
+                self.fs_transparent_bg_mode = (self.fs_transparent_bg_mode + 1) % modulo;
+                self.fs_transparent_bg_indicator_until =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(1200));
+                let label = transparent_bg_toast(self.fs_transparent_bg_mode);
+                self.show_feedback_toast(label.to_string());
+                // AI アップスケール (composite-first) では表示物が背景別の (idx,bg) 結果。
+                // adjustment_cache 等は idx のみキーで背景非依存に残るため、背景を変えても旧背景の
+                // 派生結果が表示され続け固着する。色補正変更時と同じ無効化を行い、新背景の
+                // (idx,bg) から表示を作り直させる (v1.0.0 安定性: Issue C)。
+                if self.ai_upscale_enabled {
+                    for &i in &idxs {
+                        self.clear_adjustment_caches(i);
+                    }
+                }
+            }
         }
 
         // E: 消しゴムモード切り替え (分析・補正中は無効)。

@@ -141,6 +141,23 @@ impl App {
     /// `fullscreen_idx` を見開きペアの左ページに固定する (消しゴムは単一ページ前提のため)。
     /// 終了時に `reset_erase_mode` が元の spread_mode を復元する。ペアの右ページへは
     /// パネルの「右ページ」ボタンで `switch_erase_target_in_spread` 経由で切り替える。
+    /// 透明部を含む画像を「黒の不透明背景に合成」して全面不透明にする。
+    /// egui::Color32 は premultiplied alpha なので、premultiplied RGB をそのまま alpha=255 に
+    /// すれば黒背景への合成と等価になる (透明部 = premult RGB 0 = 黒、半透明 = 黒へ減衰)。
+    /// MI-GAN は alpha を扱えず透明部を黒として補完するため、消しゴム作業時はこの「不透明黒」に
+    /// 統一して WYSIWYG にする。全画素が既に不透明なら None (= 変換不要)。
+    pub(crate) fn black_flatten_if_transparent(img: &egui::ColorImage) -> Option<egui::ColorImage> {
+        if img.pixels.iter().all(|p| p.a() == 255) {
+            return None;
+        }
+        let pixels = img
+            .pixels
+            .iter()
+            .map(|p| egui::Color32::from_rgba_premultiplied(p.r(), p.g(), p.b(), 255))
+            .collect();
+        Some(egui::ColorImage::new(img.size, pixels))
+    }
+
     pub(crate) fn enter_erase_mode(&mut self, fs_idx: usize) {
         // 見開きから入った場合は左ページへピボット。Single 起動 / 片側のみのページ
         // (表紙・末尾奇数・横長画像) では `resolve_spread_pair` が Single を返すので
@@ -165,9 +182,16 @@ impl App {
                 });
             match from_cache {
                 Some(p) => {
-                    // 初回: pre-erase 入力を base_cache に保存
-                    self.erase_base_cache.insert(target_idx, Arc::clone(&p));
-                    p
+                    // 初回: pre-erase 入力を base_cache に保存。透明 PNG は MI-GAN が alpha を
+                    // 扱えず透明部を黒補完するため、ここで「黒で不透明化」したコピーを base に
+                    // する (WYSIWYG: 表示も MI-GAN 入力も黒不透明)。fs_cache の透明原本は
+                    // 無変更なので、マスク無しで消しゴムを抜ければ元の透明画像に戻る (P3-8 後続)。
+                    let base = match Self::black_flatten_if_transparent(&p) {
+                        Some(flat) => Arc::new(flat),
+                        None => p,
+                    };
+                    self.erase_base_cache.insert(target_idx, Arc::clone(&base));
+                    base
                 }
                 None => return,
             }
@@ -2370,6 +2394,16 @@ impl App {
     /// 消しゴム確定結果の入力になる、pre-erase の表示ピクセルを取得する。
     /// 優先順位は `adjustment_cache > ai_upscale_cache > fs_cache`。
     fn resolve_erase_input_pixels(&self, fs_idx: usize) -> Option<Arc<egui::ColorImage>> {
+        let raw = self.resolve_erase_input_pixels_raw(fs_idx)?;
+        // 透明画像は黒で不透明化して MI-GAN に渡す (alpha 非対応。enter_erase_mode と統一し、
+        // apply / auto-apply / ensure-result の全入力経路で黒不透明に揃える)。
+        Some(match Self::black_flatten_if_transparent(&raw) {
+            Some(flat) => Arc::new(flat),
+            None => raw,
+        })
+    }
+
+    fn resolve_erase_input_pixels_raw(&self, fs_idx: usize) -> Option<Arc<egui::ColorImage>> {
         if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx) {
             return Some(Arc::clone(pixels));
         }

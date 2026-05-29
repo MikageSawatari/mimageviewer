@@ -3069,6 +3069,41 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.erase_mode);
     }
 
+    /// P3-8 後続: 透明画像を消しゴム作業ベースにする時、黒で不透明化されること。
+    /// MI-GAN は alpha 非対応なので、透明部は黒・半透明は黒へ減衰・全面 alpha=255。
+    /// 全不透明画像は変換不要 (None)。
+    #[test]
+    fn black_flatten_makes_transparent_opaque_black() {
+        use egui::Color32;
+        let pixels = vec![
+            Color32::TRANSPARENT,                             // a=0 → 黒不透明へ
+            Color32::from_rgba_premultiplied(100, 0, 0, 128), // 半透明 (premult 保持)
+            Color32::from_rgb(10, 20, 30),                    // 不透明はそのまま
+        ];
+        let img = egui::ColorImage::new([3, 1], pixels);
+        let flat = crate::app::App::black_flatten_if_transparent(&img).expect("has transparency");
+        assert!(flat.pixels.iter().all(|p| p.a() == 255), "all opaque");
+        assert_eq!(
+            flat.pixels[0],
+            Color32::from_rgb(0, 0, 0),
+            "transparent → black"
+        );
+        assert_eq!(
+            (flat.pixels[1].r(), flat.pixels[1].g(), flat.pixels[1].b()),
+            (100, 0, 0),
+            "semi-transparent keeps premultiplied (= composited over black)"
+        );
+        assert_eq!(
+            flat.pixels[2],
+            Color32::from_rgb(10, 20, 30),
+            "opaque unchanged"
+        );
+
+        // 全不透明画像は変換不要 (None)
+        let opaque = egui::ColorImage::new([1, 1], vec![Color32::from_rgb(5, 5, 5)]);
+        assert!(crate::app::App::black_flatten_if_transparent(&opaque).is_none());
+    }
+
     /// 単一ページから入った場合 (= erase_spread_ctx が None) は spread_mode を
     /// 触らずに reset すること。誤って Single に書き換えないことの回帰ガード。
     #[test]

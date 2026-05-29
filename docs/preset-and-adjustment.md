@@ -438,6 +438,22 @@ fn clear_ai_caches_for_indices(&mut self, indices: &[usize])
 結果を `erase_result_cache` に載せる。入力またはマスクが変わると generation key が変わり、
 古い MI-GAN 結果は採用されない。
 
+### 透過画像の扱い (黒で不透明化)
+
+MI-GAN は RGB 専用で alpha を扱えない。透過 PNG / WebP 等は透明部が premultiplied RGB=0
+(= 黒) で格納されるため、そのまま渡すとモデルが透明部を「黒」として補完入力に使い、補完結果も
+黒くなる。混乱を避けるため、消しゴム作業ベースは**黒で不透明化**して統一する:
+
+- `App::black_flatten_if_transparent` (`ui_erase.rs`): 1 画素でも alpha<255 があれば、
+  premultiplied RGB を保ったまま alpha=255 にした不透明コピーを返す (= 黒背景への合成と等価。
+  全不透明なら `None` で no-op)。
+- 適用点は 2 つ: `enter_erase_mode` の `erase_base_cache` 初回保存 (表示 = `ensure_erase_base_texture`
+  + プレビュー入力) と、`resolve_erase_input_pixels` の返り値 (apply / auto-apply / ensure-result の
+  全 MI-GAN 入力)。これで**表示も入力も出力も黒不透明で揃う (WYSIWYG)**。
+- `fs_cache` の透明原本は無変更。マスクを 1 つも作らずに消しゴムを抜ければ通常表示は `fs_cache`
+  に戻るので、**元の透明画像がそのまま保持される** (= 加工しなければ破壊しない)。
+- 結果として MI-GAN と diffusion フォールバックの出力 alpha も一致する (P3-8 の非一貫も解消)。
+
 ### 5.1 マスクのデータ構造 (ビットマップ + ベクタ)
 
 マスクは 2 つのレイヤで構成される:
