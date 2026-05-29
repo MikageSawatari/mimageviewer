@@ -2665,6 +2665,16 @@ impl App {
         // 既存 state を捨てる (cancel を立てておく) — 通常は is_some() で弾かれているが defensive
         if let Some(prev) = self.normalize_state.take() {
             prev.cancel();
+            let prev_still_current = matches!(
+                self.fs_cache.get(&prev.fs_idx),
+                Some(FsCacheEntry::Video { player, .. }) if player.path() == prev.file_path.as_path()
+            );
+            if prev_still_current {
+                self.normalize_ui_states
+                    .insert(prev.fs_idx, NormalizeUiState::OnUnmeasured);
+            } else {
+                self.normalize_ui_states.remove(&prev.fs_idx);
+            }
         }
         // 再生中なら一時停止し、測定前の raw→processed 先読みも止める。
         if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&fs_idx) {

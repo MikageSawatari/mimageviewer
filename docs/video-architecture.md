@@ -1906,8 +1906,9 @@ source-swap / `fs_cache` evict で旧 `VideoPlayer` を drop するときは、�
 Buffering に残る。既に同じ動画の scan が進行中に再生 intent が来た場合は、
 `NormalizeScanState.was_playing=true` に更新して playback / preroll を抑止したまま
 scan 完了後に再開する。別動画の scan が残っている場合は現在の再生対象を優先し、古い scan
-を cancel して現在動画の scan を開始する。auto-scan 抑止などで deferred scan を開始できない
-場合だけ、保険として再生 intent と preroll suspension を復帰し、未補正でも再生不能にしない。
+を cancel して旧対象の UI state を `OnUnmeasured` へ戻してから、現在動画の scan を開始する。
+auto-scan 抑止などで deferred scan を開始できない場合だけ、保険として再生 intent と
+preroll suspension を復帰し、未補正でも再生不能にしない。
 全体 OFF も in-flight scan を cancel して同じ復帰処理を行う。
 
 修正前の旧仕様 (= Norm でも `clear_audio_output_buffer` を呼んでいた頃) は、
