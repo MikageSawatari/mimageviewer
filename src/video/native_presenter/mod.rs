@@ -1912,6 +1912,22 @@ impl NativeVideoPresenter {
         let geom_t0 = Instant::now();
         // 1. 新 swap chain + backbuffer を用意する。ここでは visual には繋がない。
         let (new_swap_chain, new_waitable) = self.create_video_swap_chain(new_w, new_h)?;
+        // new_waitable は windows-rs HANDLE (Copy / Drop なし)。下の複数の `?` 早期
+        // return で取り落とすと frame-latency waitable HANDLE が leak する (アダプタ
+        // メモリ圧迫下の fast-swap で Present/Commit が一時失敗すると 1 個ずつ蓄積)。
+        // self.waitable へ移す手順 6 まで Drop で CloseHandle する guard で包む
+        // (v1.0.0 安定性レビュー P3-6)。
+        struct WaitableGuard(HANDLE);
+        impl Drop for WaitableGuard {
+            fn drop(&mut self) {
+                if !self.0.is_invalid() {
+                    unsafe {
+                        let _ = CloseHandle(self.0);
+                    }
+                }
+            }
+        }
+        let mut new_waitable_guard = WaitableGuard(new_waitable);
         let new_backbuffer = self.create_swap_chain_backbuffer(&new_swap_chain)?;
 
         // 2. 最初のフレームを新 backbuffer へコピーする。
@@ -1974,7 +1990,10 @@ impl NativeVideoPresenter {
         self.surface_width = new_w;
         self.surface_height = new_h;
         let old_swap_chain = std::mem::replace(&mut self.swap_chain, new_swap_chain);
-        let old_waitable = std::mem::replace(&mut self.waitable, new_waitable);
+        // guard を disarm して waitable の所有権を self.waitable へ移す (= guard の Drop は
+        // 以後 no-op になり、二重 CloseHandle を防ぐ)。
+        let taken_waitable = std::mem::replace(&mut new_waitable_guard.0, HANDLE::default());
+        let old_waitable = std::mem::replace(&mut self.waitable, taken_waitable);
         let old_backbuffer = self.backbuffer.replace(new_backbuffer);
         self.retired_video_surfaces.push_back(RetiredVideoSurface {
             _swap_chain: old_swap_chain,

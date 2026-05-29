@@ -2738,7 +2738,7 @@ impl App {
         let (tx, rx) = mpsc::channel::<egui::ColorImage>();
         let ctx_clone = ctx.clone();
 
-        std::thread::Builder::new()
+        let spawn_result = std::thread::Builder::new()
             .name("erase-inpaint".to_string())
             .spawn(move || {
                 let result = run_inpaint_pure(
@@ -2756,8 +2756,16 @@ impl App {
                 }
                 let _ = tx.send(result);
                 ctx_clone.request_repaint();
-            })
-            .expect("spawn erase-inpaint worker");
+            });
+        if let Err(e) = spawn_result {
+            // spawn 失敗 (handle / アドレス空間枯渇) でプロセスを crash させず graceful に
+            // 劣化させる。pending を入れずに抜ける (tx は closure と共に drop 済みなので
+            // rx 側 disconnect、ここでは pending 未挿入なので poll もされない)
+            // (v1.0.0 安定性レビュー P3-9)。
+            crate::logger::log(format!("erase: inpaint worker spawn FAILED: {e}"));
+            self.show_feedback_toast("[補完失敗]".to_string());
+            return;
+        }
 
         let items_generation = self.items_generation;
         let path_key = self.page_path_key(idx);
@@ -3087,9 +3095,7 @@ fn inpaint_migan(
             for iy in 0..s {
                 for ix in 0..s {
                     let dst = (iy * s + ix) * 3;
-                    rgb[dst] = ((raw.get(0 * s * s + iy * s + ix).copied().unwrap_or(0.0) * 0.5
-                        + 0.5)
-                        * 255.0)
+                    rgb[dst] = ((raw.get(iy * s + ix).copied().unwrap_or(0.0) * 0.5 + 0.5) * 255.0)
                         .clamp(0.0, 255.0);
                     rgb[dst + 1] =
                         ((raw.get(1 * s * s + iy * s + ix).copied().unwrap_or(0.0) * 0.5 + 0.5)
@@ -3183,7 +3189,11 @@ fn inpaint_migan(
             let r = (accum_r[ri] / wt).clamp(0.0, 255.0) as u8;
             let g = (accum_g[ri] / wt).clamp(0.0, 255.0) as u8;
             let b = (accum_b[ri] / wt).clamp(0.0, 255.0) as u8;
-            pixels[src_idx] = egui::Color32::from_rgb(r, g, b);
+            // 元画素の alpha を保持する。from_rgb は alpha=255 固定なので、透過 PNG の
+            // マスク域が不透明化し diffusion fallback (alpha 保持) と非一貫になる
+            // (v1.0.0 安定性レビュー P3-8)。MI-GAN は RGB 出力なので alpha は元画像由来。
+            let a = original.pixels[src_idx].a();
+            pixels[src_idx] = egui::Color32::from_rgba_unmultiplied(r, g, b, a);
         }
     }
 

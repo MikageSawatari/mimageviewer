@@ -429,7 +429,7 @@ fn flush_succeeds_and_file_readable_even_with_hidden_attrs() {
 
     {
         let mut sc = SidecarFile::new(folder.to_path_buf());
-        sc.set_adjust("x.jpg", sample_params(3.14));
+        sc.set_adjust("x.jpg", sample_params(1.5));
         sc.flush();
     }
 
@@ -437,7 +437,7 @@ fn flush_succeeds_and_file_readable_even_with_hidden_attrs() {
     let sc2 = SidecarFile::load(folder);
     assert_eq!(sc2.items().len(), 1);
     let params = sc2.items().get("x.jpg").unwrap().adjust.as_ref().unwrap();
-    assert_eq!(params.brightness, 3.14);
+    assert_eq!(params.brightness, 1.5);
 
     // 上書きも動くこと (既存 HIDDEN+SYSTEM ファイルの rename)
     {

@@ -64,7 +64,9 @@ pub fn compose_mosaic(
 
     // Pass 1: タイルごとの平均色とマスク被覆を集計
     // [sum_r, sum_g, sum_b, mask_count, total_count] per tile
-    let mut tile_stats = vec![(0u32, 0u32, 0u32, 0u32, 0u32); tw * th];
+    // チャネル和は u64。u32 だと 1 タイルが ~16.8M 画素 (辺 ~4104px) を超えると
+    // 255*count が u32 を wrap して平均色が化ける (v1.0.0 安定性レビュー P3-4)。
+    let mut tile_stats = vec![(0u64, 0u64, 0u64, 0u32, 0u32); tw * th];
     for y in 0..h {
         let ty = y / tile;
         for x in 0..w {
@@ -72,9 +74,9 @@ pub fn compose_mosaic(
             let pi = y * w + x;
             let p = base.pixels[pi];
             let entry = &mut tile_stats[ty * tw + tx];
-            entry.0 += p.r() as u32;
-            entry.1 += p.g() as u32;
-            entry.2 += p.b() as u32;
+            entry.0 += p.r() as u64;
+            entry.1 += p.g() as u64;
+            entry.2 += p.b() as u64;
             entry.4 += 1;
             if mask[pi] {
                 entry.3 += 1;
@@ -93,9 +95,10 @@ pub fn compose_mosaic(
             if mc == 0 || tc == 0 {
                 continue; // マスク外のタイル: 元のまま
             }
-            let avg_r = (sr / tc) as u8;
-            let avg_g = (sg / tc) as u8;
-            let avg_b = (sb / tc) as u8;
+            let tc_u64 = tc as u64;
+            let avg_r = (sr / tc_u64) as u8;
+            let avg_g = (sg / tc_u64) as u8;
+            let avg_b = (sb / tc_u64) as u8;
             let base_px = base.pixels[pi];
             let avg = Color32::from_rgba_unmultiplied(avg_r, avg_g, avg_b, base_px.a());
             out_pixels[pi] = match boundary {
@@ -526,10 +529,19 @@ fn gaussian_blur_separable_bbox(
                     acc_w += kw;
                     continue;
                 }
+                // InsideOnly のとき、bbox 内でも対応画素がマスク外なら寄与させない。
+                // horizontal pass で acc_w==0 だった外側画素は tmp に「元の外側の色」が
+                // (重み補正されずに) 残っており、それを縦方向に取り込むと隣接要素の色が
+                // マスク内ぼかしへ漏れる。bbox 外分岐は既にマスク判定しているので、内分岐も
+                // 揃える (v1.0.0 安定性レビュー P3-5)。
+                if let Some(m) = mask_for_sampling {
+                    let si = sy as usize * w + (bbox.x0 + bx);
+                    if !m[si] {
+                        continue;
+                    }
+                }
                 let bsi = (sy as usize - bbox.y0) * bw + bx;
                 let p = tmp[bsi];
-                // InsideOnly でも tmp は既に horizontal pass で重み補正済みなので、
-                // ここでは bbox 内 (= horizontal pass を通った画素) を一律寄与扱いにする。
                 acc_r += p.r() as f32 * kw;
                 acc_g += p.g() as f32 * kw;
                 acc_b += p.b() as f32 * kw;
@@ -686,6 +698,25 @@ mod tests {
         for &p in &out.pixels {
             assert_eq!(p, avg);
         }
+    }
+
+    /// P3-4 回帰: 巨大タイル (>16.8M 画素) でチャネル和が u32 を overflow しないこと。
+    /// 旧実装 (u32 アキュムレータ) では 255*count が wrap し、全白タイルの平均が
+    /// 黒付近に化けた。重い (~150MB / release で 1 秒未満、debug は数秒) ので通常は
+    /// ignore。明示実行: `cargo test --release mosaic_u32_sum_no_overflow -- --ignored`
+    #[test]
+    #[ignore = "heavy: allocates a ~16.86M-pixel image (~150MB) to exercise the u32->u64 fix"]
+    fn mosaic_u32_sum_no_overflow_on_huge_tile() {
+        // 255 * count > u32::MAX となる最小規模: count > 16_843_009。
+        // 4106^2 = 16_859_236 で超過する。tile_size を長辺以上にして全体 1 タイル。
+        let w = 4106usize;
+        let h = 4106usize;
+        let img = solid_image(w, h, Color32::from_rgb(255, 255, 255));
+        let mask = vec![true; w * h];
+        let out = compose_mosaic(&img, &mask, (w.max(h)) as u32, MosaicBoundary::Opaque);
+        // 全白なので平均も白 (255)。u32 wrap があると黒付近に化ける。
+        assert_eq!(out.pixels[0], Color32::from_rgb(255, 255, 255));
+        assert_eq!(out.pixels[w * h - 1], Color32::from_rgb(255, 255, 255));
     }
 
     #[test]
@@ -1010,6 +1041,42 @@ mod tests {
         assert!(
             boundary.r() < 10,
             "InsideOnly boundary should NOT mix red, got r={}",
+            boundary.r()
+        );
+    }
+
+    /// P3-5 回帰: InsideOnly の縦方向ぼかしがマスク外の色を取り込まないこと。
+    /// 上半分赤 (マスク外) / 下半分青 (マスク内)。マスク上端の青画素の縦 kernel は
+    /// 上の赤行に届くが、InsideOnly なので赤は寄与してはならない。既存の左右分割
+    /// テストは各列が一様 (全マスク or 全外) なので縦漏れを捕えられない。
+    #[test]
+    fn blur_inside_only_does_not_pull_outside_color_vertically() {
+        let w = 32usize;
+        let h = 32usize;
+        let mut pixels = vec![Color32::TRANSPARENT; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                pixels[y * w + x] = if y < h / 2 {
+                    Color32::from_rgb(200, 0, 0) // 上: 赤 (マスク外)
+                } else {
+                    Color32::from_rgb(0, 0, 200) // 下: 青 (マスク内)
+                };
+            }
+        }
+        let img = egui::ColorImage::new([w, h], pixels);
+        let mut mask = vec![false; w * h];
+        for y in (h / 2)..h {
+            for x in 0..w {
+                mask[y * w + x] = true;
+            }
+        }
+        let out = compose_blur(&img, &mask, 5.0, BlurMode::InsideOnly, false);
+        // 青マスク上端 (row=16) の縦 kernel は上の赤 (rows ~11..15) に届く。
+        // 修正前は赤が混ざって r が上昇していた。修正後は赤を skip → r ≈ 0。
+        let boundary = out.pixels[(h / 2) * w + w / 2];
+        assert!(
+            boundary.r() < 10,
+            "InsideOnly vertical blur should NOT mix red from above, got r={}",
             boundary.r()
         );
     }

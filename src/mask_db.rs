@@ -969,7 +969,7 @@ mod tests {
         rasterize_vectors_into(&mut mask, &[v], 100, 20);
         // 中心軸 y=10, thickness=4 → y=8..12 の範囲で x=10..90 が塗られているはず
         assert!(mask[10 * 100 + 50]);
-        assert!(!mask[0 * 100 + 50]);
+        assert!(!mask[50]); // y=0 行 (x=50) は塗られない
     }
 
     #[test]

@@ -327,7 +327,14 @@ pub fn spawn_activation_listener(
                             let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
                         }
                         egui_ctx.request_repaint();
-                    } else if r.0 == WAIT_OBJECT_0.0 + 2 {
+                    } else if r.0 == WAIT_OBJECT_0.0 + 2
+                        || (handles.shutdown == 0 && r.0 == WAIT_OBJECT_0.0 + 1)
+                    {
+                        // shutdown 作成失敗時は wait_handles = [activate, stop, stop] で
+                        // stop が index 1 として最小一致で返る。その index 1 もここで
+                        // break させないと、index-1 分岐 (上, shutdown != 0 gate) を skip
+                        // して else { continue } に落ち、stop が立ったまま busy-spin →
+                        // Drop の join() が永久ブロックする (v1.0.0 安定性レビュー P3-1)。
                         break;
                     } else if r == WAIT_FAILED {
                         crate::logger::log("single_instance: WaitForMultipleObjects failed");

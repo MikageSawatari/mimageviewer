@@ -1,0 +1,67 @@
+name: CI
+
+# 公開リポジトリなので GitHub Actions は標準ランナーで無制限・無料。
+# まずは vendor DLL / LFS モデル不要で確実に回る `cargo fmt --check` だけを
+# 全 push / PR でゲートする (ローカル pre-commit フックの cloud 版)。
+#
+# clippy / test の本格ゲートは Windows ランナー + vendor bootstrap (PDFium/ONNX/
+# FFmpeg/Susie) + Git LFS (models) + VST3 host exe が必要で、build.rs が
+# 埋め込みアセットの存在を要求するため、別途「CI 用に重いアセットを省く
+# フィーチャ」を足してから有効化する。下部にテンプレートをコメントで残す。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# 同じブランチで新しい push が来たら古い実行をキャンセル (無料枠の節約 + 高速化)
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # rustfmt はソースを直接整形するだけでビルドしないので
+          # LFS モデルや vendor DLL は不要。LFS は明示 skip して帯域を使わない。
+          lfs: false
+      - name: Install rustfmt
+        run: rustup component add rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # 次段階で有効化する Windows clippy/test ジョブのテンプレート (現状コメントアウト)。
+  # 有効化の前提:
+  #   1. clippy の deny-by-default lint 3 件を解消 (tests/sidecar_import.rs の
+  #      approx PI / mask_db.rs:972 / ui_erase.rs:3090 の erasing_op)。
+  #   2. build.rs / include_bytes! が models / vst3-host exe の不在を許容する
+  #      `ci` フィーチャ等を用意 (もしくは vst3-host exe を別途配置)。
+  #   3. LFS モデルは actions/cache でキャッシュし帯域を抑える。
+  #
+  # clippy-test:
+  #   name: clippy + test (windows)
+  #   runs-on: windows-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         lfs: true          # models/*.onnx を pull (キャッシュ推奨)
+  #     - uses: dtolnay/rust-toolchain@stable
+  #       with:
+  #         components: clippy
+  #         targets: i686-pc-windows-msvc
+  #     - name: Install NASM
+  #       uses: ilammy/setup-nasm@v1
+  #     - name: Set LIBCLANG_PATH
+  #       run: echo "LIBCLANG_PATH=$($(Get-Command clang).Source | Split-Path)" >> $env:GITHUB_ENV
+  #     - name: Bootstrap vendor (pdfium / ort / ffmpeg / susie)
+  #       run: bash scripts/bootstrap-vendor.sh
+  #     - name: clippy
+  #       run: cargo clippy --workspace --all-targets -- -D warnings
+  #     - name: test
+  #       run: cargo test --workspace

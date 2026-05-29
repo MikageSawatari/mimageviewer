@@ -15268,6 +15268,11 @@ impl App {
                                 &[("format", serde_json::Value::from("zip_read"))],
                             );
                         }
+                        // PDF / 静止画のデコード失敗 arm と同じく、UI が「読込中...」の
+                        // まま固着しないよう失敗を明示通知する (送らないと tx drop で
+                        // チャネル切断 → poll_prefetch が Failed を入れず is_loading が
+                        // 永久 true になる。v1.0.0 安定性レビュー P2-1)。
+                        let _ = tx.send(FsLoadResult::Failed);
                         emit_exit("zip_read_fail");
                         return;
                     }

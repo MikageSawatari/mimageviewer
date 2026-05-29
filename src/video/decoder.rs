@@ -1595,6 +1595,7 @@ pub fn spawn(
             // ここでは engine/UI を救出するためのエラー通知だけ行う。
             let info_tx_for_panic = info_tx.clone();
             let engine_event_tx_for_panic = engine_event_tx.clone();
+            let clock_for_panic = Arc::clone(&clock);
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run_decoder(
                     path,
@@ -1629,6 +1630,11 @@ pub fn spawn(
                             reason: "decoder thread panicked".to_string(),
                         },
                     ));
+                // info 送信後の panic では actor の Failed ハンドラが engine を Idle に
+                // 戻すだけでエラーを surface しない。UI の唯一の in-flight 失敗経路
+                // (mod.rs: `if self.clock.decode_failed()`) を発火させ、無言フリーズ
+                // ではなくエラー表示に倒す (v1.0.0 安定性レビュー P3-2)。
+                clock_for_panic.set_decode_failed(true);
             }
         })
         .expect("spawn video-decode thread");
@@ -5749,6 +5755,28 @@ impl FastDownmixToStereo {
     }
 
     fn run(&self, frame: &ffmpeg_the_third::util::frame::audio::Audio) -> Option<Vec<f32>> {
+        // setup 時の channels/format を前提に raw pointer を読む (mix_packed の
+        // i*self.channels stride, sample_at の型解釈)。途中で layout / sample format が
+        // 変わったフレーム (adaptive / broadcast / 連結 AAC・AC-3・E-AC-3 等) が来ると
+        // OOB read = native crash (panic hook では捕捉不可) になる。ライブフレームを
+        // 毎回検証し、不一致なら None を返して安全な resampler 経路へ落とす
+        // (呼び出し側は None を既にハンドルしている。v1.0.0 安定性レビュー P3-3)。
+        if frame.ch_layout().channels() as usize != self.channels || frame.format() != self.format {
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::logger::log(format!(
+                    "audio fast downmix: frame params changed mid-stream \
+                     (setup ch={} fmt={:?}, frame ch={} fmt={:?}) — falling back to resampler",
+                    self.channels,
+                    self.format,
+                    frame.ch_layout().channels(),
+                    frame.format(),
+                ));
+            }
+            return None;
+        }
+
         let nb_samples = frame.samples();
         if nb_samples == 0 {
             return None;
@@ -7710,6 +7738,47 @@ mod decoder_candidate_tests {
         assert_ne!(
             actual, IN_SAMPLES,
             "output samples == input samples — Context::run() の buggy auto-alloc が発動している"
+        );
+    }
+
+    /// P3-3 回帰: `FastDownmixToStereo` は setup 時の channels/format を前提に raw
+    /// pointer を読むので、途中で channel 数が減ったフレームを渡すと OOB read
+    /// (native crash) になる。修正後は read 前に channel/format を検証し、不一致なら
+    /// None を返して安全な resampler 経路へ落とすこと。
+    #[test]
+    fn fast_downmix_returns_none_on_frame_channel_mismatch() {
+        use ffmpeg::ChannelLayoutMask;
+        use ffmpeg::format::sample::{Sample, Type as SampleType};
+        use ffmpeg::util::frame::audio::Audio;
+        use ffmpeg_the_third as ffmpeg;
+
+        ffmpeg::init().expect("ffmpeg init");
+
+        // 5.1 (6ch) packed F32, 48k→48k で fast path を構築。
+        let layout6 = ffmpeg::ChannelLayout::default_for_channels(6);
+        let downmix = super::FastDownmixToStereo::new(
+            Sample::F32(SampleType::Packed),
+            &layout6,
+            48_000,
+            48_000,
+        )
+        .expect("fast downmix should init for 6ch packed F32 at equal rates");
+
+        // 途中で 2ch (STEREO) に変わったフレーム。setup は 6ch 前提なので
+        // mix_packed の i*6 stride は 2ch buffer を OOB read してしまう。
+        let mut stereo_frame = Audio::empty();
+        unsafe {
+            stereo_frame.alloc(
+                Sample::F32(SampleType::Packed),
+                256,
+                ChannelLayoutMask::STEREO,
+            );
+            stereo_frame.set_rate(48_000);
+        }
+        assert_eq!(stereo_frame.ch_layout().channels() as usize, 2);
+        assert!(
+            downmix.run(&stereo_frame).is_none(),
+            "channel-count mismatch must fall back to None, not OOB-read"
         );
     }
 
