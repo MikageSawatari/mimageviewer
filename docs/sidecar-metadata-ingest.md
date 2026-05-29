@@ -278,9 +278,11 @@ if !is_video_sidecar {
     矛盾しない。
   - 配列は毎フレーム全件 join / widget 化すると重い (最大 2MB 許容) ため、先頭 100 件までに
     制限して残りは件数表示にする。
+  - HTTP(S) URL を含む値は、動画メタデータパネルと同じくクリック可能リンクとして表示する。
   - 「生 JSON (整形)」トグルは設けない (数行の小窓スクロールで実用性が低く、毎フレームの
     pretty-print コストもかかるため。key/value ツリーで十分)。
-- **TXT**: テキストをそのまま表示 (スクロール)。
+- **TXT**: テキストをそのまま表示する。HTTP(S) URL はクリック可能リンクにし、スクロールは右パネル全体の
+  `metadata_scroll` に統一する (TXT 部分だけの入れ子 ScrollArea は作らない)。
 - **読み込み**: パネル描画時に都度読むと重いので、選択画像切替時に worker (`run_metadata_load`) で
   1 度読んでキャッシュする (`MetadataLoadResult` に sidecar を追加、`poll_metadata_load` で新
   `sidecar_cache` に投入)。既存 EXIF/AI メタのキャッシュ機構に合わせる。**UI スレッドで同期読みしない**

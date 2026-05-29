@@ -16,6 +16,7 @@ const PANEL_WIDTH: f32 = 380.0;
 const TOP_BAR_H: f32 = 44.0;
 /// パネルタイトルバーの高さ
 const TITLE_BAR_H: f32 = 32.0;
+const LINK_COLOR: egui::Color32 = egui::Color32::from_rgb(115, 180, 255);
 
 impl App {
     /// フルスクリーンでメタデータパネルをオーバーレイ描画する。
@@ -56,33 +57,39 @@ impl App {
         force_show: bool,
     ) -> bool {
         let panel_w = PANEL_WIDTH.min(full_rect.width() * 0.5);
+        // 右パネルは常に上部バーの下から開始（上バーは常に同時表示される）
+        let panel_top = full_rect.min.y + TOP_BAR_H;
+        let panel_rect = egui::Rect::from_min_max(
+            egui::pos2(full_rect.max.x - panel_w, panel_top),
+            full_rect.max,
+        );
 
         if !force_show {
             let hover_threshold = full_rect.max.x - full_rect.width() * 0.25;
 
             // ホバー判定: 画面右 1/4。カーソル非表示中は最後の座標が stale なので、
             // 実入力でカーソルが復帰するまでは passive hover でパネルを開かない。
-            let hover_in_right = ctx.input(|i| {
-                !self.cursor_hidden
-                    && i.pointer
-                        .hover_pos()
-                        .map(|p| p.x > hover_threshold)
-                        .unwrap_or(false)
+            let pointer_pos = ctx.input(|i| {
+                if self.cursor_hidden {
+                    None
+                } else {
+                    i.pointer.hover_pos()
+                }
             });
 
-            let visible = self.show_metadata_panel || hover_in_right;
+            let hover_in_right = pointer_pos.is_some_and(|p| p.x > hover_threshold);
+            let hover_in_open_panel = self.metadata_panel_hover_active
+                && pointer_pos.is_some_and(|p| panel_rect.contains(p));
+            let hover_visible = hover_in_right || hover_in_open_panel;
+
+            let visible = self.show_metadata_panel || hover_visible;
+            self.metadata_panel_hover_active = !self.show_metadata_panel && hover_visible;
             if !visible {
                 return false;
             }
+        } else {
+            self.metadata_panel_hover_active = false;
         }
-
-        // 右パネルは常に上部バーの下から開始（上バーは常に同時表示される）
-        let panel_top = full_rect.min.y + TOP_BAR_H;
-
-        let panel_rect = egui::Rect::from_min_max(
-            egui::pos2(full_rect.max.x - panel_w, panel_top),
-            full_rect.max,
-        );
 
         // パネル背景
         ui.painter().rect_filled(
@@ -182,6 +189,13 @@ impl App {
         });
         if pin_resp.clicked() {
             self.show_metadata_panel = !self.show_metadata_panel;
+            self.metadata_panel_hover_active = !self.show_metadata_panel
+                && ctx.input(|i| {
+                    !self.cursor_hidden
+                        && i.pointer
+                            .hover_pos()
+                            .is_some_and(|p| panel_rect.contains(p))
+                });
         }
 
         // ── コンテンツ領域 (タイトルバーの下) ──
@@ -666,6 +680,21 @@ fn draw_exif_panel(
 
 /// キー: 値 を1つの LayoutJob で描画し、長い値も確実に折り返す。
 fn draw_key_value_wrapped(ui: &mut egui::Ui, key: &str, val: &str) {
+    if !crate::ui_text_links::find_http_urls(val).is_empty() {
+        ui.horizontal_top(|ui| {
+            ui.label(
+                egui::RichText::new(format!("{key}:  "))
+                    .font(egui::FontId::proportional(BODY_FONT))
+                    .color(DIM_COLOR),
+            );
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width());
+                draw_user_text_with_links(ui, val, BODY_FONT);
+            });
+        });
+        return;
+    }
+
     let mut job = egui::text::LayoutJob::default();
     job.wrap = egui::text::TextWrapping {
         max_width: ui.available_width(),
@@ -690,6 +719,18 @@ fn draw_key_value_wrapped(ui: &mut egui::Ui, key: &str, val: &str) {
         },
     );
     ui.label(job);
+}
+
+fn draw_user_text_with_links(ui: &mut egui::Ui, text: &str, font_size: f32) {
+    if let Some(url) = crate::ui_text_links::draw_text_with_links(
+        ui,
+        text,
+        crate::ui_fonts::user_text_font(font_size),
+        TEXT_COLOR,
+        LINK_COLOR,
+    ) {
+        crate::ui_helpers::open_url(&url);
+    }
 }
 
 /// 折りたたみ可能な JSON セクションを描画する。
@@ -746,17 +787,7 @@ fn draw_sidecar_section(ui: &mut egui::Ui, sc: &crate::external_metadata::Sideca
             draw_json_node(ui, None, v, 0);
         }
         crate::external_metadata::SidecarDisplay::Text(t) => {
-            egui::ScrollArea::vertical()
-                .id_salt("sidecar_text_view")
-                .max_height(300.0)
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(t.as_str())
-                            .color(TEXT_COLOR)
-                            .size(11.0)
-                            .monospace(),
-                    );
-                });
+            draw_user_text_with_links(ui, t.as_str(), 11.0);
         }
     }
 }

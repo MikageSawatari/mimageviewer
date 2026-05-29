@@ -2218,6 +2218,8 @@ pub struct App {
     // ── メタデータパネル (AI + EXIF) ─────────────────────────────────
     /// フルスクリーンでメタデータパネルを表示するか
     pub(crate) show_metadata_panel: bool,
+    /// 右端ホバーで開いたメタデータパネルを、カーソルがパネル内にいる間だけ維持する。
+    pub(crate) metadata_panel_hover_active: bool,
     /// AI メタデータキャッシュ: 正規化キー → パース結果 (None = メタデータなし)
     /// キーは [`App::metadata_cache_key`] で生成 (ZIP エントリ・PDF ページごとに一意)。
     pub(crate) metadata_cache:
@@ -3836,6 +3838,7 @@ impl App {
             search_index_db,
             favsearch: FavSearchState::default(),
             show_metadata_panel: false,
+            metadata_panel_hover_active: false,
             metadata_cache: std::collections::HashMap::new(),
             exif_cache: std::collections::HashMap::new(),
             xmp_cache: std::collections::HashMap::new(),
@@ -15911,6 +15914,7 @@ impl App {
             }
         }
         self.fullscreen_idx = None;
+        self.metadata_panel_hover_active = false;
         // Ctrl+E ダイアログ / 進捗モーダルはフルスクリーン文脈に紐付くので、
         // close_fullscreen と同時に閉じる (Codex review CONFIRMED)。
         // 進捗中の worker は cancel フラグを立てて自然終了を待つ (= 進行中エントリは
@@ -19809,6 +19813,7 @@ impl App {
         self.reset_erase_mode();
         self.compare_view_mode = crate::app::CompareViewMode::Off;
         self.show_metadata_panel = false;
+        self.metadata_panel_hover_active = false;
     }
 
     /// GPano `PoseHeadingDegrees` / `PosePitchDegrees` を radians に変換して

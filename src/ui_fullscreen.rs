@@ -3510,6 +3510,7 @@ impl App {
         // 見開きダブル表示中は I/Z/R/L を無効化
         if key_i && !is_spread_double {
             self.show_metadata_panel = !self.show_metadata_panel;
+            self.metadata_panel_hover_active = false;
         }
         // V: 360 度パノラマビューモード トグル。
         // 検出済み (= 360 ボタンが有効な状態) のときだけ反応する。非対応画像で
@@ -3886,7 +3887,7 @@ impl App {
         let panel_w = METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
         let panel_left = full_rect.max.x - panel_w;
         let hover_threshold = full_rect.max.x - full_rect.width() * 0.25;
-        let has_right_panel = self.show_metadata_panel;
+        let has_right_panel = self.show_metadata_panel || self.metadata_panel_hover_active;
         // 当たり判定は描画と同じ rect を使う (adjustment_panel_rect 参照)。
         let left_panel_right = adjustment_panel_rect(full_rect).max.x;
         // When the OS cursor is hidden, egui still exposes the last hover position.
@@ -4260,7 +4261,9 @@ impl App {
                             if let Some(pos) = fs_response.interact_pointer_pos() {
                                 let panel_threshold = full_rect.max.x - full_rect.width() * 0.25;
                                 let in_right_panel = pos.y >= 60.0
-                                    && (self.show_metadata_panel || pos.x > panel_threshold)
+                                    && (self.show_metadata_panel
+                                        || self.metadata_panel_hover_active
+                                        || pos.x > panel_threshold)
                                     && pos.x
                                         > full_rect.max.x
                                             - METADATA_PANEL_WIDTH.min(full_rect.width() * 0.5);
@@ -6857,6 +6860,7 @@ impl App {
         !in_top
             && !in_right
             && !self.show_metadata_panel
+            && !self.metadata_panel_hover_active
             && !self.adjustment_mode
             && !self.is_overlay_edit_mode_active()
             && !self.analysis_mode
