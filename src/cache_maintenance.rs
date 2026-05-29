@@ -25,7 +25,14 @@ pub enum CacheMaintTask {
     /// .db をすべて削除。
     DeleteAll,
     /// 指定フォルダに対応する 1 ファイルの .db を削除。
-    DeleteFolder { folder: PathBuf },
+    DeleteFolder {
+        folder: PathBuf,
+        /// Auto 比率キャッシュ側で削除するユーザー視点の対象。
+        ///
+        /// 通常は `folder` と同じだが、変換済み 7z/LZH 閲覧中は `folder` が
+        /// キャッシュ ZIP、Auto 比率キャッシュは元アーカイブパスで保存される。
+        auto_aspect_folder: Option<PathBuf>,
+    },
 }
 
 /// 動画タイル サムネ DB の削除アウトカム。
@@ -57,19 +64,35 @@ pub enum CacheMaintResult {
         bytes: u64,
         /// 動画タイル サムネ DB のサイズ (WAL/SHM 込み)。tile cache が無効なら 0。
         tile_thumb_bytes: u64,
+        /// サムネイル比率 Auto モードのフォルダ別確定値キャッシュ件数。
+        auto_aspect_entries: usize,
     },
     DeleteOldDone {
         deleted: usize,
         new_stats: (usize, u64),
+        /// 併せて削除した Auto 比率キャッシュ行数。
+        auto_aspect_deleted: usize,
+        /// 削除後の Auto 比率キャッシュ行数。
+        auto_aspect_entries: usize,
     },
     /// すべて削除完了。`tile_thumb` は動画タイル DB に対する処理結果。
-    DeleteAllDone { tile_thumb: TileThumbOutcome },
+    DeleteAllDone {
+        tile_thumb: TileThumbOutcome,
+        /// 併せて削除した Auto 比率キャッシュ行数。
+        auto_aspect_deleted: usize,
+        /// 削除後の Auto 比率キャッシュ行数。
+        auto_aspect_entries: usize,
+    },
     DeleteFolderDone {
         existed: bool,
         folder_name: String,
         new_stats: (usize, u64),
         /// 当該フォルダ配下の動画タイル サムネに対する処理結果。
         tile_thumb: TileThumbOutcome,
+        /// 当該フォルダの Auto 比率キャッシュ削除行数。
+        auto_aspect_deleted: usize,
+        /// 削除後の Auto 比率キャッシュ行数。
+        auto_aspect_entries: usize,
     },
 }
 
@@ -184,16 +207,25 @@ pub fn spawn(
                 CacheMaintTask::Stats => {
                     let (folders, bytes) = crate::catalog::cache_stats(&cache_dir);
                     let tile_thumb_bytes = TileThumbCache::db_size_bytes();
+                    let auto_aspect_entries = auto_aspect_count();
                     CacheMaintResult::Stats {
                         folders,
                         bytes,
                         tile_thumb_bytes,
+                        auto_aspect_entries,
                     }
                 }
                 CacheMaintTask::DeleteOld { days } => {
                     let deleted = crate::catalog::delete_old_cache(&cache_dir, days);
+                    let (auto_aspect_deleted, auto_aspect_entries) =
+                        auto_aspect_delete_old(days);
                     let new_stats = crate::catalog::cache_stats(&cache_dir);
-                    CacheMaintResult::DeleteOldDone { deleted, new_stats }
+                    CacheMaintResult::DeleteOldDone {
+                        deleted,
+                        new_stats,
+                        auto_aspect_deleted,
+                        auto_aspect_entries,
+                    }
                 }
                 CacheMaintTask::DeleteAll => {
                     crate::catalog::delete_all_cache(&cache_dir);
@@ -216,9 +248,17 @@ pub fn spawn(
                             TileThumbOutcome::FilesErased { files_removed }
                         }
                     };
-                    CacheMaintResult::DeleteAllDone { tile_thumb }
+                    let (auto_aspect_deleted, auto_aspect_entries) = auto_aspect_clear_all();
+                    CacheMaintResult::DeleteAllDone {
+                        tile_thumb,
+                        auto_aspect_deleted,
+                        auto_aspect_entries,
+                    }
                 }
-                CacheMaintTask::DeleteFolder { folder } => {
+                CacheMaintTask::DeleteFolder {
+                    folder,
+                    auto_aspect_folder,
+                } => {
                     let db_path = crate::catalog::db_path_for(&cache_dir, &folder);
                     let folder_name = folder
                         .file_name()
@@ -245,12 +285,18 @@ pub fn spawn(
                         }
                         None => TileThumbOutcome::Untouched,
                     };
+                    let (auto_aspect_deleted, auto_aspect_entries) = auto_aspect_folder
+                        .as_deref()
+                        .map(auto_aspect_delete_folder)
+                        .unwrap_or_else(|| (0, auto_aspect_count()));
                     let new_stats = crate::catalog::cache_stats(&cache_dir);
                     CacheMaintResult::DeleteFolderDone {
                         existed,
                         folder_name,
                         new_stats,
                         tile_thumb,
+                        auto_aspect_deleted,
+                        auto_aspect_entries,
                     }
                 }
             };
@@ -258,4 +304,55 @@ pub fn spawn(
         })
         .expect("failed to spawn cache-maint worker");
     CacheMaintPending { task, rx, cancel }
+}
+
+fn with_auto_aspect_db<T>(
+    op: impl FnOnce(&crate::auto_aspect_cache::AutoAspectCacheDb) -> Result<T, rusqlite::Error>,
+    fallback: T,
+    label: &str,
+) -> T {
+    match crate::auto_aspect_cache::AutoAspectCacheDb::open().and_then(|db| op(&db)) {
+        Ok(value) => value,
+        Err(e) => {
+            crate::logger::log(format!("auto_aspect_cache {label} failed: {e}"));
+            fallback
+        }
+    }
+}
+
+fn auto_aspect_count() -> usize {
+    with_auto_aspect_db(|db| Ok(db.count()), 0, "count")
+}
+
+fn auto_aspect_delete_old(days: u64) -> (usize, usize) {
+    with_auto_aspect_db(
+        |db| {
+            let deleted = db.delete_older_than_days(days)?;
+            Ok((deleted, db.count()))
+        },
+        (0, 0),
+        "delete_old",
+    )
+}
+
+fn auto_aspect_clear_all() -> (usize, usize) {
+    with_auto_aspect_db(
+        |db| {
+            let deleted = db.clear_all()?;
+            Ok((deleted, db.count()))
+        },
+        (0, 0),
+        "clear_all",
+    )
+}
+
+fn auto_aspect_delete_folder(folder: &std::path::Path) -> (usize, usize) {
+    with_auto_aspect_db(
+        |db| {
+            let deleted = db.delete_for_folder(folder)?;
+            Ok((deleted, db.count()))
+        },
+        (0, 0),
+        "delete_for_folder",
+    )
 }

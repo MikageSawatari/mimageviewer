@@ -635,6 +635,7 @@ impl App {
                         // ダイアログは「取得中...」表示で開き、poll 完了時に stats が埋まる。
                         self.cache_manager_stats = None;
                         self.cache_manager_tile_bytes = None;
+                        self.cache_manager_auto_aspect_entries = None;
                         self.cache_manager_result = None;
                         if self.cache_maint_pending.is_none() {
                             self.cache_maint_pending = Some(crate::cache_maintenance::spawn(

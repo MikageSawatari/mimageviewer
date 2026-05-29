@@ -2105,6 +2105,8 @@ pub struct App {
     /// 動画タイル モード サムネ DB のサイズ (バイト、WAL/SHM 込み)。
     /// `None` の間は「取得中...」、`Some(0)` でファイル無しを表す。
     pub(crate) cache_manager_tile_bytes: Option<u64>,
+    /// サムネイル比率 Auto モードのフォルダ別確定値キャッシュ件数。
+    pub(crate) cache_manager_auto_aspect_entries: Option<usize>,
     /// 削除後の結果メッセージ
     pub(crate) cache_manager_result: Option<String>,
     /// 「すべてのキャッシュを削除」の確認ステップ
@@ -3745,6 +3747,7 @@ impl App {
             cache_manager_days: 90,
             cache_manager_stats: None,
             cache_manager_tile_bytes: None,
+            cache_manager_auto_aspect_entries: None,
             cache_manager_result: None,
             cache_manager_confirm_delete_all: false,
             cache_maint_pending: None,
@@ -4205,7 +4208,7 @@ impl App {
         }
     }
 
-    fn auto_aspect_cache_target_path(&self) -> Option<PathBuf> {
+    pub(crate) fn auto_aspect_cache_target_path(&self) -> Option<PathBuf> {
         if self.global_search.active || self.favsearch.active || self.items_are_global_search_view {
             return None;
         }
@@ -9751,23 +9754,41 @@ impl App {
                 folders,
                 bytes,
                 tile_thumb_bytes,
+                auto_aspect_entries,
             } => {
                 self.cache_manager_stats = Some((folders, bytes));
                 self.cache_manager_tile_bytes = Some(tile_thumb_bytes);
+                self.cache_manager_auto_aspect_entries = Some(auto_aspect_entries);
             }
-            crate::cache_maintenance::CacheMaintResult::DeleteOldDone { deleted, new_stats } => {
+            crate::cache_maintenance::CacheMaintResult::DeleteOldDone {
+                deleted,
+                new_stats,
+                auto_aspect_deleted,
+                auto_aspect_entries,
+            } => {
                 self.cache_manager_stats = Some(new_stats);
                 // tile cache は対象外なのでサイズを再取得 (= 削除しても変化なしのはず
                 // だが、別経路で書き込みが入っている可能性に備えて refresh)。
                 self.cache_manager_tile_bytes =
                     Some(crate::video::tile_thumb_cache::TileThumbCache::db_size_bytes());
-                self.cache_manager_result =
-                    Some(format!("{} 件のキャッシュを削除しました。", deleted));
+                self.cache_manager_auto_aspect_entries = Some(auto_aspect_entries);
+                let mut msg = format!("{} 件のキャッシュを削除しました。", deleted);
+                if auto_aspect_deleted > 0 {
+                    msg.push_str(&format!(
+                        " (比率自動判定キャッシュも {auto_aspect_deleted} 件削除)"
+                    ));
+                }
+                self.cache_manager_result = Some(msg);
             }
-            crate::cache_maintenance::CacheMaintResult::DeleteAllDone { tile_thumb } => {
+            crate::cache_maintenance::CacheMaintResult::DeleteAllDone {
+                tile_thumb,
+                auto_aspect_deleted,
+                auto_aspect_entries,
+            } => {
                 self.cache_manager_stats = Some((0, 0));
                 self.cache_manager_tile_bytes =
                     Some(crate::video::tile_thumb_cache::TileThumbCache::db_size_bytes());
+                self.cache_manager_auto_aspect_entries = Some(auto_aspect_entries);
                 let mut msg = String::from("すべてのキャッシュを削除しました。");
                 match tile_thumb {
                     crate::cache_maintenance::TileThumbOutcome::Cleared { rows } if rows > 0 => {
@@ -9780,6 +9801,11 @@ impl App {
                     }
                     _ => {}
                 }
+                if auto_aspect_deleted > 0 {
+                    msg.push_str(&format!(
+                        " (比率自動判定キャッシュも {auto_aspect_deleted} 件削除)"
+                    ));
+                }
                 self.cache_manager_result = Some(msg);
             }
             crate::cache_maintenance::CacheMaintResult::DeleteFolderDone {
@@ -9787,15 +9813,18 @@ impl App {
                 folder_name,
                 new_stats,
                 tile_thumb,
+                auto_aspect_deleted,
+                auto_aspect_entries,
             } => {
                 self.cache_manager_stats = Some(new_stats);
                 self.cache_manager_tile_bytes =
                     Some(crate::video::tile_thumb_cache::TileThumbCache::db_size_bytes());
+                self.cache_manager_auto_aspect_entries = Some(auto_aspect_entries);
                 let tile_rows = match tile_thumb {
                     crate::cache_maintenance::TileThumbOutcome::Cleared { rows } => rows,
                     _ => 0,
                 };
-                self.cache_manager_result = Some(match (existed, tile_rows) {
+                let mut msg = match (existed, tile_rows) {
                     (true, 0) => format!("「{folder_name}」のキャッシュを削除しました。"),
                     (true, n) => format!(
                         "「{folder_name}」のキャッシュを削除しました。(動画タイル サムネも {n} 件削除)"
@@ -9804,7 +9833,13 @@ impl App {
                     (false, n) => format!(
                         "現在のフォルダの静止画キャッシュはありませんでした。(動画タイル サムネを {n} 件削除)"
                     ),
-                });
+                };
+                if auto_aspect_deleted > 0 {
+                    msg.push_str(&format!(
+                        " (比率自動判定キャッシュも {auto_aspect_deleted} 件削除)"
+                    ));
+                }
+                self.cache_manager_result = Some(msg);
             }
         }
         self.cache_maint_pending = None;

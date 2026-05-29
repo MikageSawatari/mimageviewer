@@ -81,6 +81,9 @@ impl App {
                         };
                         ui.label(format!("うち動画タイル サムネ: {tile_str}"));
                     }
+                    if let Some(entries) = self.cache_manager_auto_aspect_entries {
+                        ui.label(format!("比率自動判定キャッシュ: {entries} フォルダ"));
+                    }
 
                     ui.add_space(8.0);
                     ui.separator();
@@ -132,10 +135,14 @@ impl App {
                     let folder_btn = egui::Button::new("  現在のフォルダのキャッシュを削除  ");
                     if ui.add_enabled(has_folder && !busy, folder_btn).clicked() {
                         if let Some(folder) = self.current_folder.clone() {
+                            let auto_aspect_folder = self.auto_aspect_cache_target_path();
                             // 削除前に Connection を畳む (Codex P3): 同上。
                             self.evict_all_catalog_cache();
                             self.cache_maint_pending = Some(crate::cache_maintenance::spawn(
-                                crate::cache_maintenance::CacheMaintTask::DeleteFolder { folder },
+                                crate::cache_maintenance::CacheMaintTask::DeleteFolder {
+                                    folder,
+                                    auto_aspect_folder,
+                                },
                                 cache_dir.clone(),
                                 self.video_tile_cache.clone(),
                             ));
@@ -186,6 +193,7 @@ impl App {
                 .show(ctx, |ui| {
                     ui.label("すべてのサムネイルキャッシュを削除します。");
                     ui.label("(動画タイル モードのサムネ キャッシュも一緒に削除されます)");
+                    ui.label("(比率自動判定キャッシュも一緒に削除されます)");
                     ui.label("この操作は元に戻せません。");
                     ui.add_space(8.0);
                     ui.separator();

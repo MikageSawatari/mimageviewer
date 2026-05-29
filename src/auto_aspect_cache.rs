@@ -32,7 +32,11 @@ impl AutoAspectCacheDb {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = rusqlite::Connection::open(path)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA synchronous=NORMAL;
+             PRAGMA busy_timeout=5000;",
+        )?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS auto_aspect_cache (
                 folder_key     TEXT PRIMARY KEY,
@@ -107,6 +111,23 @@ impl AutoAspectCacheDb {
 
     pub fn clear_all(&self) -> Result<usize, rusqlite::Error> {
         self.conn.execute("DELETE FROM auto_aspect_cache", [])
+    }
+
+    pub fn delete_for_folder(&self, folder: &Path) -> Result<usize, rusqlite::Error> {
+        let key = folder_key(folder);
+        self.conn.execute(
+            "DELETE FROM auto_aspect_cache WHERE folder_key = ?1",
+            [&key],
+        )
+    }
+
+    pub fn delete_older_than_days(&self, days: u64) -> Result<usize, rusqlite::Error> {
+        let days = i64::try_from(days).unwrap_or(i64::MAX / 86_400);
+        let cutoff = now_unix_secs().saturating_sub(days.saturating_mul(86_400));
+        self.conn.execute(
+            "DELETE FROM auto_aspect_cache WHERE updated_at <= ?1",
+            [cutoff],
+        )
     }
 
     pub fn count(&self) -> usize {
@@ -190,6 +211,17 @@ mod tests {
         assert_eq!(entry.aspect, ThumbAspect::Square);
         assert_eq!(entry.sample_count, 8);
         assert_eq!(entry.eligible_total, 20);
+        assert_eq!(db.delete_for_folder(folder).expect("delete folder"), 1);
+        assert_eq!(db.get(folder), None);
+        assert_eq!(db.count(), 0);
+
+        db.upsert(folder, ThumbAspect::Square, 8, 20)
+            .expect("insert again");
+        assert_eq!(db.delete_older_than_days(0).expect("delete old"), 1);
+        assert_eq!(db.count(), 0);
+
+        db.upsert(folder, ThumbAspect::Square, 8, 20)
+            .expect("insert once more");
         assert_eq!(db.clear_all().expect("clear"), 1);
         assert_eq!(db.count(), 0);
     }
