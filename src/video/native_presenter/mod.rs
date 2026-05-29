@@ -122,31 +122,6 @@ fn format_video_volume_db_compact(volume: f64) -> String {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct CenterPauseControlsInputs {
-    tile_overlay_visible: bool,
-    is_playing: bool,
-    frame_step_active: bool,
-    initial_pause_controls_pending: bool,
-    first_frame_presented: bool,
-    has_video_error: bool,
-    normalize_scanning: bool,
-}
-
-fn center_pause_controls_visible_for_state(inputs: CenterPauseControlsInputs) -> bool {
-    !inputs.tile_overlay_visible
-        && !inputs.is_playing
-        && !inputs.frame_step_active
-        && inputs.initial_pause_controls_pending
-        && inputs.first_frame_presented
-        && !inputs.has_video_error
-        && !inputs.normalize_scanning
-}
-
-fn center_seek_status_visible(raw_seek_status_visible: bool, paused_center_visible: bool) -> bool {
-    raw_seek_status_visible && !paused_center_visible
-}
-
 pub struct NativePresenterConfig {
     pub hwnd: HWND,
     pub width: u32,
@@ -352,7 +327,6 @@ struct NativeEguiOverlay {
     video_limiter_visible_until: Option<Instant>,
     video_playback_speed: f64,
     video_frame_step_active: bool,
-    initial_pause_controls_pending: bool,
     video_is_seeking: bool,
     video_seek_serial: u64,
     seek_status_started_at: Option<Instant>,
@@ -398,14 +372,6 @@ struct NativeEguiOverlay {
     /// Off-screen clamp 復旧などで同じ VST3 panel 位置 command を複数フレーム連続発行しないための
     /// presenter-local 記憶。UI thread から新しい panel_pos snapshot が届いたらリセットする。
     last_emitted_vst3_panel_pos: Option<[f32; 2]>,
-    /// 実機修正 (2026-05-12 P2): 直近 egui run で描画した paused center 制御 UI の
-    /// 個別 rect 群 (`[replay_rect, play_rect, backdrop_rect]` の順)。
-    /// `compute_hud_regions` が region 計算で読む (= 200×200pt 固定だと両ボタンの
-    /// 外側 ~29pt とヒント帯が SetWindowRgn でクリップされる症状の修正)。
-    /// union で 1 矩形にまとめず個別 rect で push することで、ヒント横幅に引っ張られた
-    /// 「ボタン上部左右の不要な HUD 入力領域」を作らず VST 入力干渉を最小化する。
-    /// `None` なら paused center 非表示。
-    last_drawn_paused_center_rects: Option<[egui::Rect; 3]>,
     /// 直近 egui run で描画した toast の actual rect。
     /// HUD HWND は `SetWindowRgn` で領域外が物理的に clip されるため、toast も
     /// region に含めないと他 UI の region に重なった部分だけが見える。
@@ -2844,7 +2810,6 @@ impl NativeVideoPresenter {
         limiter_ceiling_hit_seq: u64,
         playback_speed: f64,
         frame_step_active: bool,
-        initial_pause_controls_pending: bool,
         is_seeking: bool,
         seek_serial: u64,
     ) {
@@ -2858,7 +2823,6 @@ impl NativeVideoPresenter {
                 limiter_ceiling_hit_seq,
                 playback_speed,
                 frame_step_active,
-                initial_pause_controls_pending,
                 is_seeking,
                 seek_serial,
             );
@@ -3029,7 +2993,6 @@ impl NativeVideoPresenter {
         limiter_ceiling_hit_seq: u64,
         playback_speed: f64,
         frame_step_active: bool,
-        initial_pause_controls_pending: bool,
         is_seeking: bool,
         seek_serial: u64,
     ) -> Result<NativeOverlayInputOutcome, String> {
@@ -3045,7 +3008,6 @@ impl NativeVideoPresenter {
                 limiter_ceiling_hit_seq,
                 playback_speed,
                 frame_step_active,
-                initial_pause_controls_pending,
                 is_seeking,
                 seek_serial,
             );
@@ -3663,7 +3625,6 @@ impl NativeEguiOverlay {
             video_limiter_visible_until: None,
             video_playback_speed: 1.0,
             video_frame_step_active: false,
-            initial_pause_controls_pending: false,
             video_is_seeking: false,
             video_seek_serial: 0,
             seek_status_started_at: None,
@@ -3698,7 +3659,6 @@ impl NativeEguiOverlay {
             last_drawn_preview_rect: None,
             last_drawn_vst3_panel_rect: None,
             last_emitted_vst3_panel_pos: None,
-            last_drawn_paused_center_rects: None,
             last_drawn_toast_rect: None,
             last_drawn_speed_popup_rect: None,
             last_drawn_bookmark_editor_rect: None,
@@ -3987,7 +3947,6 @@ impl NativeEguiOverlay {
         limiter_ceiling_hit_seq: u64,
         playback_speed: f64,
         frame_step_active: bool,
-        initial_pause_controls_pending: bool,
         is_seeking: bool,
         seek_serial: u64,
     ) {
@@ -4004,8 +3963,6 @@ impl NativeEguiOverlay {
         let limiter_changed = self.video_limiter_ceiling_hit_seq != limiter_ceiling_hit_seq;
         let speed_changed = (self.video_playback_speed - playback_speed).abs() >= 1.0e-6;
         let frame_step_changed = self.video_frame_step_active != frame_step_active;
-        let initial_pause_changed =
-            self.initial_pause_controls_pending != initial_pause_controls_pending;
         let seeking_changed = self.video_is_seeking != is_seeking;
         let seek_serial_changed = self.video_seek_serial != seek_serial;
         if !is_playing {
@@ -4033,7 +3990,6 @@ impl NativeEguiOverlay {
         self.video_limiter_ceiling_hit_seq = limiter_ceiling_hit_seq;
         self.video_playback_speed = playback_speed;
         self.video_frame_step_active = frame_step_active;
-        self.initial_pause_controls_pending = initial_pause_controls_pending;
         self.video_is_seeking = is_seeking;
         self.video_seek_serial = seek_serial;
         if speed_changed {
@@ -4052,7 +4008,6 @@ impl NativeEguiOverlay {
             || limiter_changed
             || speed_changed
             || frame_step_changed
-            || initial_pause_changed
             || seeking_changed
             || seek_serial_changed
         {
@@ -4654,7 +4609,6 @@ impl NativeEguiOverlay {
     /// - bookmark title editor (`bookmark_title_edit.is_some()`): center modal
     /// - normalize progress / scan UI (`normalize_state` の各 phase)
     /// - tile overlay (`tile_overlay.is_some()`): 全画面 tile grid
-    /// - paused center indicator (paused かつ表示中)
     /// - seek hover thumbnail + pin/bookmark (`hover_thumbnail.is_some()`)
     /// - checkmark indicator (`video_checked`)
     ///
@@ -4718,29 +4672,12 @@ impl NativeEguiOverlay {
         let panel_chrome_visible = !tile_overlay_visible
             && !navigation_preview_visible
             && (top_bar_visible_flag || side_panel_visible);
-        let normalize_scanning = matches!(
-            self.normalize_state.ui_state,
-            crate::video::normalize_types::NormalizeUiState::Scanning
-        );
         let raw_seek_status_visible = self.seek_status_visible
             && !tile_overlay_visible
             && !navigation_preview_visible
             && self.first_frame_presented
             && self.video_error.is_none();
-        // paused_center_visible (= 中央 replay/play ボタンが見えている) も描画側と一致させる
-        // (Codex CP5 P2 #2): paused 中の中央ボタンクリックが VST に抜けないように。
-        let paused_center_visible =
-            center_pause_controls_visible_for_state(CenterPauseControlsInputs {
-                tile_overlay_visible,
-                is_playing: self.video_is_playing,
-                frame_step_active: self.video_frame_step_active,
-                initial_pause_controls_pending: self.initial_pause_controls_pending,
-                first_frame_presented: self.first_frame_presented,
-                has_video_error: self.video_error.is_some(),
-                normalize_scanning,
-            });
-        let seek_status_visible =
-            center_seek_status_visible(raw_seek_status_visible, paused_center_visible);
+        let seek_status_visible = raw_seek_status_visible;
         let status_visible = !tile_overlay_visible
             && !navigation_preview_visible
             && (self.video_error.is_some() || !self.first_frame_presented || seek_status_visible);
@@ -4748,10 +4685,7 @@ impl NativeEguiOverlay {
         // CP5 旧版は `hud_visible()` 単独だったが、Codex CP5 P2 #1 で「top bar や
         // side panel 表示中も bottom HUD が描かれるのに region に下端帯がないと
         // クリックが奪われる」問題を指摘されたので panel_chrome_visible も含める。
-        // paused center 表示中も下 HUD を常時 region に入れ、初回 click の hit-test
-        // 前フレーム未登録問題で mute / seek が無反応になるのを防ぐ。
-        let bottom_hud_visible =
-            self.hud_visible() || panel_chrome_visible || paused_center_visible;
+        let bottom_hud_visible = self.hud_visible() || panel_chrome_visible;
 
         // 上 hover bar (= 実描画 54pt = overlay_draw:1546 と一致)。
         //
@@ -4863,44 +4797,6 @@ impl NativeEguiOverlay {
                 width_points,
                 top,
             )));
-        }
-
-        // Paused center indicator (replay / play ボタン + ラベル backdrop): 実描画 rect を使う。
-        // Codex CP5 P2 #2 反映: paused 中の中央ボタンが VST と重なるケースで
-        // クリックが奪われないよう region に追加。
-        //
-        // 旧版は 200×200pt 固定だったが、実 UI は両ボタンだけで横幅 258pt (= 2×112 + 34)、
-        // ヒント背景は center_y+124pt まで広がるため、SetWindowRgn でクリップされて
-        // 「ボタンが変に crop される」症状になっていた (= 2026-05-12 ユーザー報告)。
-        // `draw_native_center_pause_controls` が実描画した個別 rect (replay/play/backdrop、
-        // 各 +4pt margin) を `last_drawn_paused_center_rects` 経由で受け取り、それぞれを
-        // region に push する (union で 1 矩形にせず個別で入れることで、ヒント横幅に
-        // 引っ張られた不要な HUD 入力帯を作らず VST 入力干渉を最小化)。
-        //
-        // `paused_center_visible` ガードを残すことで、直前フレームの stale rect が
-        // 不可視に切り替わった瞬間に region から外れる。初回フレーム fallback として、
-        // visible だが rect 未記録のケース (= ダイアログ表示直後で先に region 計算が
-        // 走るパス) では広めの保険 box を入れて次フレームの実描画 rect 更新を待つ。
-        if paused_center_visible {
-            if let Some(rects) = self.last_drawn_paused_center_rects.as_ref() {
-                for rect in rects.iter() {
-                    regions.push(rect_to_px(*rect));
-                }
-            } else {
-                // 初回フレーム fallback: 横幅はヒント文字列 (約 40 字、推定 500pt 程度) +
-                // backdrop expand を覆うために 640pt 確保。縦は radius=56, hint_y=center_y+108 を
-                // 元に上 -64pt〜下 +140pt。次フレームの egui run で正確な個別 rect 群に
-                // 置き換わるので 1 フレームだけ広めでも VST 干渉はごく短時間。
-                let cx = width_px / 2;
-                let cy = height_px / 2;
-                let half_w = to_px(320.0);
-                regions.push(RECT {
-                    left: (cx - half_w).max(0),
-                    top: (cy - to_px(64.0)).max(0),
-                    right: (cx + half_w).min(width_px),
-                    bottom: (cy + to_px(140.0)).min(height_px),
-                });
-            }
         }
 
         if self.toast.is_some() {
@@ -5180,41 +5076,6 @@ impl NativeEguiOverlay {
         self.vst3_panel.as_ref().is_some_and(|panel| panel.visible)
     }
 
-    /// 中央 pause prompt (「最初から / 続きから」ボタン 2 個) が **可視中**で、かつ
-    /// `pos` がそのボタン rect の真上 (+ 6pt padding) にあるかどうか。
-    ///
-    /// 狭いウィンドウ幅 (≲ 1120pt) では中央ボタンが左 jump panel / 右 metadata panel の
-    /// hover 反応ゾーン (x=0..320 / x=w-430..w) に入り込み、cursor をボタンに乗せた瞬間に
-    /// パネルが visible になってボタンクリックを奪う現象を起こす。本判定で true のときは
-    /// `right_panel_visible()` / `jump_panel_visible()` を強制 false に倒してクリックを通す。
-    ///
-    /// 判定 rect はラベル / ヒント帯を含まない (= ボタン円形 rect + 6pt padding のみ)。
-    /// ラベル帯は中央寄せでパネル hover 帯と重ならず、carve-out の副作用を最小に保つため。
-    fn pointer_over_center_pause_controls(&self, pos: egui::Pos2) -> bool {
-        let normalize_scanning = matches!(
-            self.normalize_state.ui_state,
-            crate::video::normalize_types::NormalizeUiState::Scanning
-        );
-        let visible = center_pause_controls_visible_for_state(CenterPauseControlsInputs {
-            tile_overlay_visible: self.tile_overlay.is_some(),
-            is_playing: self.video_is_playing,
-            frame_step_active: self.video_frame_step_active,
-            initial_pause_controls_pending: self.initial_pause_controls_pending,
-            first_frame_presented: self.first_frame_presented,
-            has_video_error: self.video_error.is_some(),
-            normalize_scanning,
-        });
-        if !visible {
-            return false;
-        }
-        let overlay_width_points = self.width as f32 / self.pixels_per_point;
-        let overlay_height_points = self.height as f32 / self.pixels_per_point;
-        let (replay, play) =
-            native_center_pause_button_rects(overlay_width_points, overlay_height_points);
-        let pad = egui::vec2(6.0, 6.0);
-        replay.expand2(pad).contains(pos) || play.expand2(pad).contains(pos)
-    }
-
     fn right_panel_visible(&self) -> bool {
         // 実機修正 (2026-05-12): 外部 drag 中は right panel を表示しない (= VST を画面右に
         // ドラッグしたとき panel が出て VST 入力が奪われる症状の対応)。
@@ -5233,11 +5094,6 @@ impl NativeEguiOverlay {
         let Some(pos) = self.pointer_pos else {
             return false;
         };
-        // 中央 pause prompt ボタン上では右パネル hover を抑止 (狭幅で右ボタンが右パネル
-        // hover 帯に飲み込まれてクリックを奪われる事象の対策)。
-        if self.pointer_over_center_pause_controls(pos) {
-            return false;
-        }
         let overlay_width_points = self.width as f32 / self.pixels_per_point;
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
         let panel_w =
@@ -5261,10 +5117,6 @@ impl NativeEguiOverlay {
         let Some(pos) = self.pointer_pos else {
             return false;
         };
-        // 中央 pause prompt ボタン上では左パネル hover を抑止 (右パネルと同様)。
-        if self.pointer_over_center_pause_controls(pos) {
-            return false;
-        }
         let overlay_height_points = self.height as f32 / self.pixels_per_point;
         let x_max = native_jump_panel_width();
         native_panel_hover_rect(
@@ -5361,7 +5213,7 @@ impl NativeEguiOverlay {
         // hover_preview_target_secs はシークバー Area (= bottom_hud_visible) 内でしか
         // 更新されない。pointer が hud 領域から外れた状態で Some が居座ると
         // jump_panel_visible() / right_panel_visible() を false に固定し続ける
-        // (paused_center_visible により overlay_visible 経路の clear も走らない)。
+        // ことがある。
         // hud 領域外なら preview UI 自体描画されないので、ここで先に倒す。
         if self.hover_preview_target_secs.is_some() && !self.hud_visible() {
             self.hover_preview_target_secs = None;
@@ -5371,7 +5223,6 @@ impl NativeEguiOverlay {
         let position_secs = self.video_position_secs;
         let duration_secs = self.video_duration_secs;
         let is_playing = self.video_is_playing;
-        let frame_step_active = self.video_frame_step_active;
         let volume = self.video_volume;
         let muted = self.video_muted;
         let limiter_ceiling_hit = self.limiter_indicator_visible_at(render_t0);
@@ -5437,26 +5288,14 @@ impl NativeEguiOverlay {
         let panel_chrome_visible = !tile_overlay_visible
             && !navigation_preview_visible
             && (top_bar_visible || side_panel_visible);
-        // Codex P1: Scanning 中は paused_center を出さない (スキャン用に pause している
-        // のがバレないため + clickハンドラ TogglePlay/CloseFullscreen を抑制)。
+        // normalize scanning 中は HUD/Toast が無くても progress UI を描く必要がある。
         let normalize_scanning = matches!(
             normalize_state_snap.ui_state,
             crate::video::normalize_types::NormalizeUiState::Scanning
         );
-        let paused_center_visible =
-            center_pause_controls_visible_for_state(CenterPauseControlsInputs {
-                tile_overlay_visible,
-                is_playing,
-                frame_step_active,
-                initial_pause_controls_pending: self.initial_pause_controls_pending,
-                first_frame_presented,
-                has_video_error: video_error.is_some(),
-                normalize_scanning,
-            });
-        let seek_status_visible =
-            center_seek_status_visible(raw_seek_status_visible, paused_center_visible);
+        let seek_status_visible = raw_seek_status_visible;
         let status_visible = video_error.is_some() || !first_frame_presented || seek_status_visible;
-        let bottom_hud_visible = hud_visible || panel_chrome_visible || paused_center_visible;
+        let bottom_hud_visible = hud_visible || panel_chrome_visible;
         let perf_origin = egui::pos2(14.0, 14.0);
         // Codex 2周目 P1: normalize_scanning も overlay_visible / cursor_blocking_overlay_visible
         // に含める。さもないと HUD/Toast 等が出ていない状態で `if !overlay_visible { return; }`
@@ -5471,7 +5310,6 @@ impl NativeEguiOverlay {
             || toast_visible
             || bookmark_title_edit_visible
             || bulk_bookmark_dialog_visible
-            || paused_center_visible
             || vst3_panel_visible
             || normalize_scanning;
         // カーソル auto-hide の判定用: チェックマークのような「受動表示」(ユーザーが
@@ -5498,7 +5336,6 @@ impl NativeEguiOverlay {
             || toast_visible
             || bookmark_title_edit_visible
             || bulk_bookmark_dialog_visible
-            || paused_center_visible
             || vst3_panel_visible
             || normalize_scanning
             || in_top_activation_zone
@@ -5517,10 +5354,6 @@ impl NativeEguiOverlay {
         // 実機修正 (2026-05-12 A): VST3 設定パネルをドラッグ可能化 (`.movable(true)`)。
         // ドラッグ後の actual rect を記録して region に追従させる。
         let mut last_drawn_vst3_panel_rect: Option<egui::Rect> = None;
-        // 実機修正 (2026-05-12 P2): paused center 制御 UI (replay/play ボタン + label backdrop)
-        // の実描画 rect を記録して `compute_hud_regions` に渡す。200×200pt 固定 region では
-        // ボタン外側 ~29pt + ヒント帯が SetWindowRgn でクリップされる症状の修正。
-        let mut last_drawn_paused_center_rects: Option<[egui::Rect; 3]> = None;
         let mut last_drawn_toast_rect: Option<egui::Rect> = None;
         let mut last_drawn_speed_popup_rect: Option<egui::Rect> = None;
         let mut last_drawn_bookmark_editor_rect: Option<egui::Rect> = None;
@@ -5666,66 +5499,6 @@ impl NativeEguiOverlay {
                     panel,
                     &mut commands,
                     &mut last_emitted_vst3_panel_pos,
-                );
-            }
-            if paused_center_visible {
-                // 「中央パネル外クリックで再開」判定の除外対象として、
-                // 同じフレームで実際に描画されている他パネル rect を集める。
-                // ホバー判定領域 (top 76 / 下 220 / 左 320 / 右 430) ではなく
-                // 描画中の rect (top 54 / 下 46 / jump width 320 / metadata
-                // 計算幅 / VST3 計算 rect) を渡すことで、不可視パネルや
-                // パネル端のマージンが誤ってデッドゾーン化するのを防ぐ。
-                let mut excluded_rects: Vec<egui::Rect> = Vec::new();
-                // bookmark 名編集ダイアログ / 速度ポップアップ / シーク hover
-                // preview のいずれかが開いている間は、画面のどこをクリックしても
-                // TogglePlay/CloseFullscreen を発行しない (= 全画面を除外する)。
-                // これらの popup 群は seek HUD の closure 内で動的に layout が
-                // 決まり外から rect 計算が困難なうえ、popup 操作中にクリックで
-                // 再生再開/フルスクリーン解除が混入すると操作意図と食い違う。
-                // popup 自体の dismiss/操作は popup 側ロジックが担うので、
-                // 「popup 表示中は overlay 側の click hook を停止」が安全。
-                let popup_active = bookmark_title_edit_visible
-                    || bulk_bookmark_dialog_visible
-                    || video_speed_popup_open
-                    || hover_preview_target_secs.is_some();
-                if popup_active {
-                    excluded_rects.push(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(overlay_width_points, overlay_height_points),
-                    ));
-                }
-                if top_bar_visible {
-                    excluded_rects.push(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(overlay_width_points, 54.0),
-                    ));
-                }
-                if bottom_hud_visible {
-                    excluded_rects.push(egui::Rect::from_min_max(
-                        egui::pos2(0.0, (overlay_height_points - HUD_BOTTOM_HEIGHT).max(0.0)),
-                        egui::pos2(overlay_width_points, overlay_height_points),
-                    ));
-                }
-                if jump_panel_visible {
-                    excluded_rects.push(native_jump_panel_rect(overlay_height_points));
-                }
-                if right_panel_visible {
-                    excluded_rects.push(native_metadata_panel_rect(
-                        overlay_width_points,
-                        overlay_height_points,
-                    ));
-                }
-                if vst3_panel_visible && let Some(panel) = vst3_panel.as_ref() {
-                    excluded_rects.push(last_drawn_vst3_panel_rect.unwrap_or_else(|| {
-                        native_vst3_panel_rect(overlay_width_points, overlay_height_points, panel)
-                    }));
-                }
-                last_drawn_paused_center_rects = draw_native_center_pause_controls(
-                    ctx,
-                    overlay_width_points,
-                    overlay_height_points,
-                    &excluded_rects,
-                    &mut commands,
                 );
             }
             if let Some(toast) = toast.as_ref() {
@@ -7128,7 +6901,6 @@ impl NativeEguiOverlay {
         self.last_drawn_preview_rect = last_drawn_preview_rect;
         self.last_drawn_vst3_panel_rect = last_drawn_vst3_panel_rect;
         self.last_emitted_vst3_panel_pos = last_emitted_vst3_panel_pos;
-        self.last_drawn_paused_center_rects = last_drawn_paused_center_rects;
         self.last_drawn_toast_rect = last_drawn_toast_rect;
         self.last_drawn_speed_popup_rect = last_drawn_speed_popup_rect;
         self.last_drawn_bookmark_editor_rect = last_drawn_bookmark_editor_rect;
@@ -8027,61 +7799,6 @@ mod tests {
     }
 
     #[test]
-    fn center_pause_controls_visibility_requires_initial_paused_ready_video() {
-        let base = super::CenterPauseControlsInputs {
-            tile_overlay_visible: false,
-            is_playing: false,
-            frame_step_active: false,
-            initial_pause_controls_pending: true,
-            first_frame_presented: true,
-            has_video_error: false,
-            normalize_scanning: false,
-        };
-        assert!(super::center_pause_controls_visible_for_state(base));
-
-        let cases = [
-            super::CenterPauseControlsInputs {
-                tile_overlay_visible: true,
-                ..base
-            },
-            super::CenterPauseControlsInputs {
-                is_playing: true,
-                ..base
-            },
-            super::CenterPauseControlsInputs {
-                frame_step_active: true,
-                ..base
-            },
-            super::CenterPauseControlsInputs {
-                initial_pause_controls_pending: false,
-                ..base
-            },
-            super::CenterPauseControlsInputs {
-                first_frame_presented: false,
-                ..base
-            },
-            super::CenterPauseControlsInputs {
-                has_video_error: true,
-                ..base
-            },
-            super::CenterPauseControlsInputs {
-                normalize_scanning: true,
-                ..base
-            },
-        ];
-        for inputs in cases {
-            assert!(!super::center_pause_controls_visible_for_state(inputs));
-        }
-    }
-
-    #[test]
-    fn center_seek_status_hides_behind_pause_controls() {
-        assert!(super::center_seek_status_visible(true, false));
-        assert!(!super::center_seek_status_visible(true, true));
-        assert!(!super::center_seek_status_visible(false, false));
-    }
-
-    #[test]
     fn native_checkmark_rect_matches_top_right_indicator_position() {
         let rect = super::overlay_draw::native_checkmark_rect(1920.0, 28.0);
 
@@ -8089,92 +7806,6 @@ mod tests {
         assert!((rect.center().y - 46.0).abs() < f32::EPSILON);
         assert!((rect.width() - 39.6).abs() < 0.001);
         assert!((rect.height() - 39.6).abs() < 0.001);
-    }
-
-    /// 中央 pause prompt の replay/play ボタン rect は描画 (`draw_native_center_pause_controls`)
-    /// と判定 (`pointer_over_center_pause_controls`) で同じ source を共有する。
-    /// 半径 56 / gap 34、画面中央対称、2 個同サイズの基本特性を固定する。
-    #[test]
-    fn native_center_pause_button_rects_basic_geometry() {
-        let (replay, play) = super::overlay_draw::native_center_pause_button_rects(1920.0, 1080.0);
-        // サイズ: 半径 56 → 112×112
-        assert!((replay.width() - 112.0).abs() < f32::EPSILON);
-        assert!((replay.height() - 112.0).abs() < f32::EPSILON);
-        assert!((play.width() - 112.0).abs() < f32::EPSILON);
-        assert!((play.height() - 112.0).abs() < f32::EPSILON);
-        // 縦位置: 画面中央 540
-        assert!((replay.center().y - 540.0).abs() < f32::EPSILON);
-        assert!((play.center().y - 540.0).abs() < f32::EPSILON);
-        // 横位置: 画面中央 960 を中心に対称、間隔 = gap(34) + 半径2つ(112) = 146
-        assert!((replay.center().x - (960.0 - 73.0)).abs() < f32::EPSILON);
-        assert!((play.center().x - (960.0 + 73.0)).abs() < f32::EPSILON);
-        assert!(((play.center().x - replay.center().x) - 146.0).abs() < f32::EPSILON);
-    }
-
-    /// 狭ウィンドウ幅 (640pt) では中央ボタンが左 jump panel (x=0..320) と右 metadata
-    /// panel (x=w-min(430, w*0.5)..w) の hover 反応 rect に飲み込まれる。これが本修正の
-    /// 対象ケースで、carve-out が無いとパネル side が visible になりボタンクリックが奪われる。
-    #[test]
-    fn native_center_pause_buttons_overlap_side_panels_when_window_is_narrow() {
-        let overlay_w = 640.0_f32;
-        let overlay_h = 480.0_f32;
-        let (replay, play) =
-            super::overlay_draw::native_center_pause_button_rects(overlay_w, overlay_h);
-
-        // 左 jump panel hover 帯: x = 0..320 (native_jump_panel_width)
-        let jump_panel_w = super::overlay_draw::native_jump_panel_width();
-        assert!((jump_panel_w - 320.0).abs() < f32::EPSILON);
-        // 右 metadata panel hover 帯: x = w - min(430, w*0.5)..w = w - 320..w = 320..640
-        let metadata_panel_w =
-            super::overlay_draw::native_metadata_panel_width().min(overlay_w * 0.5);
-        let metadata_left = overlay_w - metadata_panel_w;
-
-        // 左 replay ボタンは左 jump panel ゾーンと重なる必要がある (carve-out が要る理由)
-        assert!(
-            replay.min.x < jump_panel_w && replay.max.x > 0.0,
-            "replay {:?} should overlap jump panel x=0..{}",
-            replay,
-            jump_panel_w
-        );
-        // 右 play ボタンは右 metadata panel ゾーンと重なる必要がある
-        assert!(
-            play.max.x > metadata_left && play.min.x < overlay_w,
-            "play {:?} should overlap metadata panel x={}..{}",
-            play,
-            metadata_left,
-            overlay_w
-        );
-    }
-
-    /// フル HD (1920×1080) などの広ウィンドウでは中央ボタンと左右パネル hover 帯は重ならない。
-    /// carve-out 副作用が広幅で発生しないことの sanity check。
-    #[test]
-    fn native_center_pause_buttons_do_not_overlap_side_panels_when_window_is_wide() {
-        let overlay_w = 1920.0_f32;
-        let overlay_h = 1080.0_f32;
-        let (replay, play) =
-            super::overlay_draw::native_center_pause_button_rects(overlay_w, overlay_h);
-
-        let jump_panel_w = super::overlay_draw::native_jump_panel_width();
-        let metadata_panel_w =
-            super::overlay_draw::native_metadata_panel_width().min(overlay_w * 0.5);
-        let metadata_left = overlay_w - metadata_panel_w;
-
-        // 左ボタンは jump panel より十分内側
-        assert!(
-            replay.min.x > jump_panel_w,
-            "replay {:?} should not enter jump panel x=0..{}",
-            replay,
-            jump_panel_w
-        );
-        // 右ボタンは metadata panel より十分内側
-        assert!(
-            play.max.x < metadata_left,
-            "play {:?} should not enter metadata panel x={}..{}",
-            play,
-            metadata_left,
-            overlay_w
-        );
     }
 
     /// 1:1 SAR では従来の isotropic transform と一致 (regression-safe を保証)。

@@ -13180,7 +13180,6 @@ impl App {
         // 360 度パノラマビュー: cache 内容変化 → 世代 bump (§3.6.2.2)。
         self.bump_adjustment_generation(idx);
         let grid_open_intent = std::mem::take(&mut self.fs_open_intent_from_grid);
-        let video_autoplay_override = self.fs_video_open_autoplay_override;
         let video_ignore_resume_once = self.fs_video_open_ignore_resume_once;
 
         // 画像切り替え時にズーム/パン/キャッシュをリセット
@@ -13227,12 +13226,9 @@ impl App {
                             player.seek(0.0);
                         }
                     }
-                    if video_autoplay_override == Some(true) {
-                        if let Some(FsCacheEntry::Video { player, .. }) = self.fs_cache.get(&idx) {
-                            player.set_playing(true);
-                        }
-                    }
-                    if grid_open_intent {
+                    let should_autoplay_cached_video =
+                        !self.video_tile_mode_active && !self.video_tile_reopen_pending;
+                    if should_autoplay_cached_video {
                         #[cfg(windows)]
                         let started_normalize_scan =
                             self.start_normalize_scan_for_deferred_play_intent(idx);
@@ -14868,13 +14864,7 @@ impl App {
         }
 
         let vol = crate::settings::clamp_video_volume(self.settings.video_volume);
-        let autoplay = autoplay_override.unwrap_or_else(|| {
-            video_autoplay_for_open(
-                self.settings.video_autoplay_mode,
-                self.settings.video_autoplay,
-                from_grid,
-            )
-        });
+        let autoplay = autoplay_override.unwrap_or(true);
         let path_key = crate::adjustment_db::normalize_path(&vp);
         let play_test_for_video = self.play_test.as_ref().filter(|state| {
             let config_key = crate::adjustment_db::normalize_path(&state.config.path);
@@ -25318,23 +25308,6 @@ pub(crate) fn color_image_to_dynamic_composited(
         }
     }
     image::DynamicImage::ImageRgb8(buf)
-}
-
-fn video_autoplay_for_open(
-    mode: crate::settings::VideoAutoplayMode,
-    legacy_autoplay: bool,
-    from_grid: bool,
-) -> bool {
-    let mode = if legacy_autoplay && mode == crate::settings::VideoAutoplayMode::Off {
-        crate::settings::VideoAutoplayMode::Always
-    } else {
-        mode
-    };
-    match mode {
-        crate::settings::VideoAutoplayMode::Always => true,
-        crate::settings::VideoAutoplayMode::OnlyFromGrid
-        | crate::settings::VideoAutoplayMode::Off => from_grid,
-    }
 }
 
 fn video_resume_for_open(

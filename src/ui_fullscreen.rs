@@ -4191,8 +4191,6 @@ impl App {
                         // Phase 5.5 追加: タイルモード中はオーバーレイのタイルクリック
                         // で seek + close を行うため、background catch-all は完全抑止
                         // (Codex P5.5 H1 反映)。
-                        // Phase 7.I 追加: 動画オープン直後の中央 2 ボタン
-                        // (最初から / 続きから) の領域を除外。
                         let tile_active = self.video_tile_mode_active;
                         let pos_opt = fs_response.interact_pointer_pos();
                         // 旧 egui HUD は撤去済 (native presenter overlay が代替)。
@@ -4206,49 +4204,10 @@ impl App {
                                     && p.y >= full_rect.min.y + 44.0
                             })
                             .unwrap_or(false);
-                        // 中央 2 ボタン (オープン直後の初回 pause prompt) の領域だけを除外。
-                        // 描画条件は native_presenter::draw_native_center_pause_controls
-                        // (overlay_draw.rs) と完全に揃える。frame_step 中はボタン非表示
-                        // なので除外しない (= ボタン跡地のクリックで toggle_play() が走り
-                        // 再生再開できる)。
-                        let center_buttons_visible = self
-                            .fullscreen_idx
-                            .and_then(|idx| self.fs_video_player(idx))
-                            .map(|p| {
-                                !p.is_playing()
-                                    && !p.is_frame_step_active()
-                                    && p.initial_pause_controls_pending()
-                                    && p.displayed_frame_seq() > 0
-                            })
-                            .unwrap_or(false);
-                        let in_center_buttons = if center_buttons_visible {
-                            pos_opt
-                                .map(|p| {
-                                    let cx = full_rect.center().x;
-                                    let cy = full_rect.center().y;
-                                    // overlay_draw.rs::draw_native_center_pause_controls
-                                    // の rect に揃える (radius=56, gap=34, 各 112x112)。
-                                    let radius = 56.0_f32;
-                                    let gap = 34.0_f32;
-                                    let left_rect = egui::Rect::from_center_size(
-                                        egui::pos2(cx - radius - gap * 0.5, cy),
-                                        egui::vec2(radius * 2.0, radius * 2.0),
-                                    );
-                                    let right_rect = egui::Rect::from_center_size(
-                                        egui::pos2(cx + radius + gap * 0.5, cy),
-                                        egui::vec2(radius * 2.0, radius * 2.0),
-                                    );
-                                    left_rect.contains(p) || right_rect.contains(p)
-                                })
-                                .unwrap_or(false)
-                        } else {
-                            false
-                        };
                         if fs_response.clicked()
                             && !tile_active
                             && !in_hud
                             && !in_video_panel
-                            && !in_center_buttons
                             && let Some(idx) = self.fullscreen_idx
                             && let Some(p) = self.fs_video_player(idx)
                         {

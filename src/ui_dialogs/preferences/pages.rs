@@ -1031,22 +1031,6 @@ pub(super) fn page_video(ui: &mut egui::Ui, state: &mut PreferencesState) {
 
     ui.label(egui::RichText::new("再生").strong());
     ui.add_space(4.0);
-    // 一覧から明示的に開いた動画は再生開始、動画送りでは停止するモードと Always の 2 択。
-    // 旧 video_autoplay (bool) も内部で migration 用に保持。
-    ui.label("自動再生:");
-    use crate::settings::VideoAutoplayMode;
-    for &mode in VideoAutoplayMode::all() {
-        if ui
-            .radio_value(&mut s.video_autoplay_mode, mode, mode.label())
-            .changed()
-        {
-            // 旧 bool 設定は新モードと矛盾しないように同期しておく
-            // (例: ユーザーが新 UI で Always を選んだら video_autoplay=true、それ以外は
-            // false。古いコードを誤読したときの不整合を防ぐ)。
-            s.video_autoplay = matches!(mode, VideoAutoplayMode::Always);
-        }
-    }
-    ui.add_space(4.0);
     ui.horizontal(|ui| {
         ui.label("ループ再生:");
         let mut current = s.video_loop_mode;

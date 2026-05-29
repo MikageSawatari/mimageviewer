@@ -971,14 +971,10 @@ pub struct Settings {
     /// 動画再生速度。HUD の速度ボタンから変更され、動画切替 / アプリ再起動後も維持する。
     #[serde(default = "default_video_playback_speed")]
     pub video_playback_speed: f64,
-    /// フルスクリーン化時に自動再生を開始するか (旧: bool)。
-    /// Phase 7.J で `VideoAutoplayMode` に拡張。現在の UI は
-    /// Off / Always の 2 択で、OnlyFromGrid は旧設定互換として Off に正規化する。
-    /// 新フィールド `video_autoplay_mode` を見るのが推奨。本フィールドは migration 用に残す:
-    /// `video_autoplay_mode` がデフォルト値 (= 未保存) のときだけ参照される。
+    /// 旧自動再生設定 (bool)。現在の再生開始挙動では参照せず、設定ファイル互換のため保持する。
     #[serde(default)]
     pub video_autoplay: bool,
-    /// 動画フルスクリーン時の自動再生ポリシー (Phase 7.J)。
+    /// 旧動画自動再生ポリシー。現在の UI/再生開始挙動では参照せず、読み込み時に互換正規化する。
     #[serde(default)]
     pub video_autoplay_mode: VideoAutoplayMode,
     /// 終端到達時に先頭から再生を繰り返すか (旧 v0.8.x 以前)。
@@ -1308,7 +1304,7 @@ fn default_video_tile_columns() -> usize {
     10
 }
 
-/// 動画フルスクリーン時の自動再生ポリシー (Phase 7.J)。
+/// 旧動画自動再生ポリシー。設定ファイル互換用に残す。
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum VideoAutoplayMode {
     /// 一覧から明示的に開いたときだけ再生する。フルスクリーン中の移動では一時停止。

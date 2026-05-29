@@ -224,34 +224,6 @@ fn fullscreen_keep_set_keeps_current_image_when_filtered_out() {
 // ── passes_rating_filter (コンテナ/画像/Video の挙動) ──
 
 #[test]
-fn video_autoplay_for_open_treats_grid_open_as_play_intent() {
-    use crate::settings::VideoAutoplayMode;
-
-    assert!(video_autoplay_for_open(VideoAutoplayMode::Off, false, true));
-    assert!(!video_autoplay_for_open(
-        VideoAutoplayMode::Off,
-        false,
-        false
-    ));
-    assert!(video_autoplay_for_open(
-        VideoAutoplayMode::OnlyFromGrid,
-        false,
-        true
-    ));
-    assert!(!video_autoplay_for_open(
-        VideoAutoplayMode::OnlyFromGrid,
-        false,
-        false
-    ));
-    assert!(video_autoplay_for_open(
-        VideoAutoplayMode::Always,
-        false,
-        false
-    ));
-    assert!(video_autoplay_for_open(VideoAutoplayMode::Off, true, false));
-}
-
-#[test]
 fn video_resume_for_open_can_ignore_grid_open_only() {
     let saved = Some(42.0);
 
