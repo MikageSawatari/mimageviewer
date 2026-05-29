@@ -14,7 +14,7 @@
 //! ```
 //! ワーカーは 32bit でしか `.spi` をロードできないので 32bit ターゲット必須。
 
-#![cfg(windows)]
+#![cfg(all(windows, target_pointer_width = "32"))]
 
 use mimageviewer_susie32::plugin::PluginHost;
 use std::path::PathBuf;

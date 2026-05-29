@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 /// テスト用画像のパスを返す。
 /// 環境変数 TEST_IMAGE_PATH があればそれを使い、なければデフォルトのテスト画像を生成。

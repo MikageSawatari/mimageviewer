@@ -230,7 +230,6 @@ fn test_screentone_patterns() {
         .expect("Upscale failed");
         let elapsed = t0.elapsed();
 
-        let [w, h] = result.size;
         let out_path = format!("target/tone_{name}_output.png");
         save_color_image(&result, &out_path);
 

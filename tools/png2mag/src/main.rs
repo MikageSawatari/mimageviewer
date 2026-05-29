@@ -34,10 +34,10 @@ fn collect_inputs(input: &Path) -> Result<Vec<PathBuf>> {
             let path = entry.path();
             if path.is_dir() {
                 walk(&path, out)?;
-            } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if SUPPORTED_EXTS.iter().any(|s| s.eq_ignore_ascii_case(ext)) {
-                    out.push(path);
-                }
+            } else if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && SUPPORTED_EXTS.iter().any(|s| s.eq_ignore_ascii_case(ext))
+            {
+                out.push(path);
             }
         }
         Ok(())
@@ -64,9 +64,7 @@ fn convert_one(src: &Path, dst: &Path) -> Result<()> {
             let row_start = y * w as usize;
             let row_end = row_start + w as usize;
             padded.extend_from_slice(&indices[row_start..row_end]);
-            for _ in 0..(padded_w - w) {
-                padded.push(0);
-            }
+            padded.resize(padded.len() + (padded_w - w) as usize, 0);
         }
         indices = padded;
     }
@@ -128,7 +126,7 @@ fn main() -> Result<()> {
         match convert_one(src, &dst) {
             Ok(()) => {
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if n % 100 == 0 || n == total {
+                if n.is_multiple_of(100) || n == total {
                     eprintln!("[{n}/{total}]");
                 }
             }

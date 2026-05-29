@@ -9782,6 +9782,9 @@ impl App {
             }
         };
         match msg {
+            crate::cache_maintenance::CacheMaintResult::Error(e) => {
+                self.cache_manager_result = Some(format!("操作に失敗しました: {e}"));
+            }
             crate::cache_maintenance::CacheMaintResult::Stats {
                 folders,
                 bytes,

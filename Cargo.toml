@@ -18,6 +18,9 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+manual-e2e = []
+
 # 本体 exe のバイナリ名は `mimageviewer-core` (= 内部実体)。
 # 配布する `mimageviewer.exe` は別途 `crates/launcher/` のランチャーが生成する。
 # ランチャーは初回起動時に core と FFmpeg DLL を %APPDATA% に展開して core を spawn する
@@ -25,6 +28,18 @@ rust-version.workspace = true
 [[bin]]
 name = "mimageviewer-core"
 path = "src/main.rs"
+
+# Manual TensorRT-pack E2E smoke helper.  It is intentionally runnable via
+# `cargo run --features manual-e2e --bin test_trt_install`, while the feature
+# gate keeps `cargo test --all-targets` from trying to execute an
+# installer-named binary on Windows, where UAC installer detection can require
+# elevation.
+[[bin]]
+name = "test_trt_install"
+path = "src/bin/test_trt_install.rs"
+test = false
+bench = false
+required-features = ["manual-e2e"]
 
 [target.'cfg(windows)'.dependencies]
 # wgpu-hal 27 系が要求する windows 0.58。`windows_058` 別名でアプリ側にも

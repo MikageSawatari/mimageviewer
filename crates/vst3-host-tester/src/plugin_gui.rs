@@ -38,6 +38,10 @@ use windows::core::{HSTRING, PCWSTR};
 
 const WINDOW_CLASS: &str = "MivVst3HostTesterPluginWindow";
 
+pub type CloseSignal = Arc<Mutex<Option<Receiver<()>>>>;
+pub type ResizeSignal = Arc<Mutex<Option<Receiver<(u32, u32)>>>>;
+type CreateWindowResult = (u64, Receiver<()>, Receiver<(u32, u32)>, u32, u32, u32);
+
 #[derive(Debug)]
 pub enum Cmd {
     /// 新規ウィンドウを作って HWND を返す。返り値: (hwnd_u64, close_signal_rx)。
@@ -66,10 +70,10 @@ pub struct ShowReply {
     pub used_dpi: u32,
     /// ユーザーが × を押したときに Sender 側から「閉じてほしい」が届く。
     /// メインスレッドはこれを polling するか recv して、bridge に hide_gui を送る。
-    pub close_signal: Arc<Mutex<Option<Receiver<()>>>>,
+    pub close_signal: CloseSignal,
     /// ユーザーがホストウィンドウをリサイズしたときに新クライアント領域サイズが届く。
     /// メインスレッドはこれを polling して、bridge に notify_host_resize を送る。
-    pub resize_signal: Arc<Mutex<Option<Receiver<(u32, u32)>>>>,
+    pub resize_signal: ResizeSignal,
 }
 
 /// 専用スレッドで Win32 メッセージループを回す GUI ホスト。
@@ -150,8 +154,8 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
                 // ユーザーがホストウィンドウをドラッグでリサイズした。
                 // 新しいクライアント領域サイズを取得してメインスレッドに通知。
                 let lparam_v = lparam.0 as u32;
-                let w = (lparam_v & 0xFFFF) as u32;
-                let h = ((lparam_v >> 16) & 0xFFFF) as u32;
+                let w = lparam_v & 0xFFFF;
+                let h = (lparam_v >> 16) & 0xFFFF;
                 if w > 0 && h > 0 {
                     let tx_opt: Option<Sender<(u32, u32)>> = THREAD_STATE
                         .with(|s| s.borrow().as_ref().and_then(|st| st.resize_tx.clone()));
@@ -172,7 +176,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM)
 
 thread_local! {
     static THREAD_STATE: std::cell::RefCell<Option<Box<ThreadState>>> =
-        std::cell::RefCell::new(None);
+        const { std::cell::RefCell::new(None) };
 }
 
 fn run_gui_thread(cmd_rx: Receiver<Cmd>) {
@@ -299,11 +303,7 @@ fn run_message_loop(cmd_rx: &Receiver<Cmd>) {
     }
 }
 
-fn create_window(
-    title: &str,
-    width: u32,
-    height: u32,
-) -> std::io::Result<(u64, Receiver<()>, Receiver<(u32, u32)>, u32, u32, u32)> {
+fn create_window(title: &str, width: u32, height: u32) -> std::io::Result<CreateWindowResult> {
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     unsafe {
         let hinstance = GetModuleHandleW(PCWSTR::null())

@@ -1,9 +1,7 @@
 //! settings モジュールの統合テスト。
 //! JSON ファイル経由での設定読み書きをテストする。
 
-use mimageviewer::settings::{
-    CachePolicy, FavoriteEntry, Parallelism, Settings, SortOrder, ThumbAspect,
-};
+use mimageviewer::settings::{CachePolicy, Parallelism, Settings, SortOrder, ThumbAspect};
 use tempfile::TempDir;
 
 /// Settings を JSON ファイルに保存し、そこから読み込むラウンドトリップ。

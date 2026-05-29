@@ -36,7 +36,7 @@ pub fn encode(
     user: &str,
     memo: &str,
 ) -> Vec<u8> {
-    assert!(width % 8 == 0, "MAG width must be a multiple of 8");
+    assert!(width.is_multiple_of(8), "MAG width must be a multiple of 8");
     assert_eq!(pixels.len(), width * height);
 
     let pixels_x = width / 4; // number of 4-pixel cells per row
@@ -86,7 +86,7 @@ pub fn encode(
 
     // ── 3. Pack two flags per byte into Flag B; Flag A is a 1-bit-per-pair bitmap.
     assert!(
-        pixels_x % 2 == 0,
+        pixels_x.is_multiple_of(2),
         "pixels_x must be even (width must be multiple of 8)"
     );
     let pairs_per_row = pixels_x / 2;
@@ -108,7 +108,7 @@ pub fn encode(
 
     // ── 4. Pack Flag A bits into bytes (MSB-first within each byte).
     // Pad bit-count up to a multiple of 8 (decoder reads the trailing bits as 0).
-    while flag_a_bits.len() % 8 != 0 {
+    while !flag_a_bits.len().is_multiple_of(8) {
         flag_a_bits.push(0);
     }
     let mut flag_a_bytes = vec![0u8; flag_a_bits.len() / 8];

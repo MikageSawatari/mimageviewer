@@ -284,19 +284,31 @@ pub fn start_install(target_sm_x10: Option<u32>) -> InstallHandle {
     let cancel = Arc::new(AtomicBool::new(false));
     let cancel_for_thread = cancel.clone();
     let tx_for_err = tx.clone();
-    let join = thread::Builder::new()
+    let tx_for_spawn_error = tx.clone();
+    let spawn_result = thread::Builder::new()
         .name("trt-installer".to_string())
         .spawn(move || {
             if let Err(e) = run_install(target_sm_x10, cancel_for_thread, tx) {
                 let _ = tx_for_err.send(InstallProgress::Error { message: e });
             }
-        })
-        .expect("failed to spawn TRT installer thread");
+        });
+    let join = match spawn_result {
+        Ok(join) => Some(join),
+        Err(e) => {
+            crate::logger::log(format!(
+                "[TRT install] failed to spawn installer thread: {e}"
+            ));
+            let _ = tx_for_spawn_error.send(InstallProgress::Error {
+                message: format!("TensorRT インストール worker を開始できません: {e}"),
+            });
+            None
+        }
+    };
 
     InstallHandle {
         rx,
         cancel,
-        join: Some(join),
+        join,
         last_progress: None,
     }
 }

@@ -12,7 +12,7 @@
 //!
 //! # 本ターミナルで (空の tensorrt/ ディレクトリから始める想定)
 //! MIV_TRT_PACK_BASE_URL=http://127.0.0.1:8000 \
-//!   cargo run --release --bin test_trt_install
+//!   cargo run --release --features manual-e2e --bin test_trt_install
 //! ```
 //!
 //! exit 0 = インストール成功 (= INSTALL_OK 書かれた、is_pack_installed() == true)。

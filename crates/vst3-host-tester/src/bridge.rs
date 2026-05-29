@@ -286,12 +286,7 @@ impl Bridge {
                 (shm_size & 0xFFFF_FFFF) as u32,
                 PCWSTR(wname.as_ptr()),
             )
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("CreateFileMappingW: {e}"),
-                )
-            })?;
+            .map_err(|e| std::io::Error::other(format!("CreateFileMappingW: {e}")))?;
             let base = MapViewOfFile(handle, FILE_MAP_ALL_ACCESS, 0, 0, shm_size as usize);
             if base.Value.is_null() {
                 let _ = CloseHandle(handle);
@@ -317,19 +312,11 @@ impl Bridge {
 
             // events
             let win = HSTRING::from(sig_in_name.as_str());
-            let sig_in = CreateEventW(None, false, false, PCWSTR(win.as_ptr())).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("CreateEventW sig_in: {e}"),
-                )
-            })?;
+            let sig_in = CreateEventW(None, false, false, PCWSTR(win.as_ptr()))
+                .map_err(|e| std::io::Error::other(format!("CreateEventW sig_in: {e}")))?;
             let wout = HSTRING::from(sig_out_name.as_str());
-            let sig_out = CreateEventW(None, false, false, PCWSTR(wout.as_ptr())).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("CreateEventW sig_out: {e}"),
-                )
-            })?;
+            let sig_out = CreateEventW(None, false, false, PCWSTR(wout.as_ptr()))
+                .map_err(|e| std::io::Error::other(format!("CreateEventW sig_out: {e}")))?;
             self.sig_in = Some(EventHandle {
                 handle: sig_in,
                 name: sig_in_name.clone(),
@@ -417,9 +404,9 @@ impl Bridge {
                 avail = w_pos.wrapping_sub(r_pos);
             }
             let take = avail.min(want) as usize;
-            for i in 0..take {
+            for (i, sample) in dst.iter_mut().take(take).enumerate() {
                 let idx = (r_pos.wrapping_add(i as u32)) % cap;
-                dst[i] = out_ring.add(idx as usize).read();
+                *sample = out_ring.add(idx as usize).read();
             }
             (*header)
                 .out_read

@@ -436,7 +436,7 @@ unsafe fn convert_dib_inner(
     }
 
     // 行ストライド (4 バイト境界)
-    let stride = ((w as usize * bit_count as usize + 31) / 32) * 4;
+    let stride = (w as usize * bit_count as usize).div_ceil(32) * 4;
 
     let mut bgra = vec![0u8; (w as usize) * (h as usize) * 4];
 

@@ -24,11 +24,16 @@
 #![cfg(windows)]
 
 use std::path::PathBuf;
-use std::sync::Once;
+use std::sync::{Mutex, MutexGuard, Once};
 
 use mimageviewer::susie_loader;
 
 static SETUP: Once = Once::new();
+static SUSIE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn lock_susie_test() -> MutexGuard<'static, ()> {
+    SUSIE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn setup_env() {
     SETUP.call_once(|| {
@@ -123,6 +128,7 @@ fn mean_abs_diff_rgba(a: &image::RgbaImage, b: &image::RgbaImage) -> f64 {
 /// ワーカープール起動 + プラグイン列挙。
 #[test]
 fn pool_initializes_and_reports_plugins() {
+    let _guard = lock_susie_test();
     setup_env();
     if !testdata_ok() {
         eprintln!("skip: missing worker exe or testdata");
@@ -152,6 +158,7 @@ fn pool_initializes_and_reports_plugins() {
 /// `decode_file` 経由で PI を IPC デコードし、BMP 参照と比較。
 #[test]
 fn decode_pi_matches_bmp_reference() {
+    let _guard = lock_susie_test();
     setup_env();
     if !testdata_ok() {
         eprintln!("skip: missing worker exe or testdata");
@@ -188,6 +195,7 @@ fn decode_pi_matches_bmp_reference() {
 /// MAG でも同様に BMP と近い内容になっているか。
 #[test]
 fn decode_mag_matches_bmp_reference() {
+    let _guard = lock_susie_test();
     setup_env();
     if !testdata_ok() {
         eprintln!("skip: missing worker exe or testdata");
@@ -214,6 +222,7 @@ fn decode_mag_matches_bmp_reference() {
 /// バイト列からのデコード (ZIP 内画像の経路をシミュレート)。
 #[test]
 fn decode_bytes_via_ipc() {
+    let _guard = lock_susie_test();
     setup_env();
     if !testdata_ok() {
         eprintln!("skip: missing worker exe or testdata");
@@ -240,6 +249,7 @@ fn decode_bytes_via_ipc() {
 /// 並列実行オフ設定 (worker_count = 1) でもデコードが通ること。
 #[test]
 fn decode_works_with_parallel_off() {
+    let _guard = lock_susie_test();
     setup_env();
     if !testdata_ok() {
         eprintln!("skip: missing worker exe or testdata");
@@ -296,6 +306,7 @@ fn make_7z_with_entries(path: &std::path::Path, entries: &[(&str, &[u8])]) {
 /// ZIP の中身は空バイトで十分 (デコードは呼ばれない)。
 #[test]
 fn zip_enumerates_susie_extensions() {
+    let _guard = lock_susie_test();
     setup_env();
     if !testdata_ok() {
         eprintln!("skip: missing worker exe or testdata");
@@ -343,6 +354,7 @@ fn zip_enumerates_susie_extensions() {
 /// `archive_converter::is_image_entry` が Susie 対応拡張子も含めて画像扱いすることを確認。
 #[test]
 fn sevenz_convert_includes_susie_extensions() {
+    let _guard = lock_susie_test();
     setup_env();
     if !testdata_ok() {
         eprintln!("skip: missing worker exe or testdata");

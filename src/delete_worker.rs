@@ -62,14 +62,28 @@ pub fn spawn(paths: Vec<PathBuf>) -> DeletePending {
     let total = paths.len();
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
+    let paths_for_error = paths.clone();
 
     let cancel_worker = Arc::clone(&cancel);
-    std::thread::Builder::new()
+    let tx_worker = tx.clone();
+    let spawn_result = std::thread::Builder::new()
         .name("delete-worker".into())
         .spawn(move || {
-            run_worker(paths, cancel_worker, tx);
-        })
-        .expect("failed to spawn delete worker");
+            run_worker(paths, cancel_worker, tx_worker);
+        });
+    if let Err(e) = spawn_result {
+        let message = format!("削除 worker を開始できません: {e}");
+        crate::logger::log(format!("[delete] worker spawn failed: {e}"));
+        let failed = paths_for_error
+            .into_iter()
+            .map(|path| (path, message.clone()))
+            .collect();
+        let _ = tx.send(DeleteMsg::Batch {
+            succeeded: Vec::new(),
+            failed,
+        });
+        let _ = tx.send(DeleteMsg::Done { canceled: false });
+    }
 
     DeletePending {
         cancel,

@@ -59,6 +59,7 @@ pub enum TileThumbOutcome {
 /// (`video_tile_thumbs.db`) の削除/サイズ情報。`DeleteAll` / `DeleteFolder` 経路
 /// では catalog (静止画 + 動画グリッド) と一緒に削除する。
 pub enum CacheMaintResult {
+    Error(String),
     Stats {
         folders: usize,
         bytes: u64,
@@ -147,8 +148,9 @@ pub fn spawn_archive(
     db: Arc<crate::archive_cache::ArchiveCacheDb>,
 ) -> ArchiveMaintPending {
     let (tx, rx) = mpsc::channel();
+    let tx_worker = tx.clone();
     let task_clone = task.clone();
-    std::thread::Builder::new()
+    let spawn_result = std::thread::Builder::new()
         .name("archive-cache-maint".into())
         .spawn(move || {
             let result = match task_clone {
@@ -180,9 +182,14 @@ pub fn spawn_archive(
                     Err(e) => ArchiveMaintResult::Error(format!("clear_all failed: {e}")),
                 },
             };
-            let _ = tx.send(result);
-        })
-        .expect("failed to spawn archive-cache-maint worker");
+            let _ = tx_worker.send(result);
+        });
+    if let Err(e) = spawn_result {
+        crate::logger::log(format!("failed to spawn archive-cache-maint worker: {e}"));
+        let _ = tx.send(ArchiveMaintResult::Error(format!(
+            "worker を開始できません: {e}"
+        )));
+    }
     ArchiveMaintPending { task, rx }
 }
 
@@ -199,8 +206,9 @@ pub fn spawn(
 ) -> CacheMaintPending {
     let cancel = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel();
+    let tx_worker = tx.clone();
     let task_clone = task.clone();
-    std::thread::Builder::new()
+    let spawn_result = std::thread::Builder::new()
         .name("cache-maint".into())
         .spawn(move || {
             let result = match task_clone {
@@ -300,9 +308,14 @@ pub fn spawn(
                     }
                 }
             };
-            let _ = tx.send(result);
-        })
-        .expect("failed to spawn cache-maint worker");
+            let _ = tx_worker.send(result);
+        });
+    if let Err(e) = spawn_result {
+        crate::logger::log(format!("failed to spawn cache-maint worker: {e}"));
+        let _ = tx.send(CacheMaintResult::Error(format!(
+            "worker を開始できません: {e}"
+        )));
+    }
     CacheMaintPending { task, rx, cancel }
 }
 

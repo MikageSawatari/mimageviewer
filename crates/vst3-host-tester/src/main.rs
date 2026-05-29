@@ -109,11 +109,9 @@ struct TesterApp {
     /// 現在表示中のプラグイン GUI ウィンドウの HWND (u64 化)。0 = 表示なし。
     gui_hwnd: u64,
     /// GUI ウィンドウの × クリックを GUI スレッドから受け取る側。Some の時のみ表示中。
-    gui_close_signal:
-        Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<()>>>>>,
+    gui_close_signal: Option<plugin_gui::CloseSignal>,
     /// GUI ウィンドウのユーザーリサイズを GUI スレッドから受け取る側。
-    gui_resize_signal:
-        Option<std::sync::Arc<std::sync::Mutex<Option<std::sync::mpsc::Receiver<(u32, u32)>>>>>,
+    gui_resize_signal: Option<plugin_gui::ResizeSignal>,
 
     // log buffer for the bottom panel
     log_lines: Arc<Mutex<Vec<String>>>,
@@ -481,13 +479,13 @@ impl TesterApp {
                 }
             }
         }
-        if let Some((w, h)) = last {
-            if let Some(br) = self.bridge.as_ref() {
-                let _ = br.send(&Cmd::NotifyHostResize {
-                    width: w,
-                    height: h,
-                });
-            }
+        if let Some((w, h)) = last
+            && let Some(br) = self.bridge.as_ref()
+        {
+            let _ = br.send(&Cmd::NotifyHostResize {
+                width: w,
+                height: h,
+            });
         }
     }
 
