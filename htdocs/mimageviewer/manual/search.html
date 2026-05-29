@@ -77,14 +77,14 @@
             <td><kbd>Ctrl</kbd>+<kbd>F</kbd></td>
             <td><strong>現在地フィルタ</strong></td>
             <td><strong>今表示中のグリッド</strong>のすべてのアイテム</td>
-            <td>フォルダ・ZIP・PDF はファイル名。画像・動画はファイル名 + EXIF / XMP / AI プロンプト / PDF メタ / 動画メタ / タグ</td>
+            <td>フォルダ・ZIP・PDF はファイル名。画像・動画はファイル名 + EXIF / XMP / AI プロンプト / PDF メタ / 動画メタ / タグ / サイドカー</td>
             <td>開いているフォルダを絞り込む (Lightroom のフィルタに近い)</td>
           </tr>
           <tr>
             <td><kbd>Ctrl</kbd>+<kbd>G</kbd></td>
             <td><strong>アイテム検索</strong></td>
             <td>お気に入り全体の<strong>画像 / PDF / 動画</strong></td>
-            <td>ファイル名 / EXIF / XMP / AI プロンプト / PDF メタ / 動画メタ / タグ</td>
+            <td>ファイル名 / EXIF / XMP / AI プロンプト / PDF メタ / 動画メタ / タグ / サイドカー</td>
             <td>お気に入り横断で 1 枚の画像を掘り出す</td>
           </tr>
         </tbody>
@@ -147,7 +147,7 @@
     <p>現在地フィルタはグリッドに表示されているすべての種類のアイテムを対象にします:</p>
     <ul>
       <li><strong>フォルダ / ZIP / PDF ファイル</strong>: ファイル名 (basename) でマッチ判定します。</li>
-      <li><strong>画像 / 動画</strong>: 「検索対象」の設定に応じて、ファイル名・EXIF・XMP・AI プロンプト・PDF メタ・動画メタ・タグを検索します。</li>
+      <li><strong>画像 / 動画</strong>: 「検索対象」の設定に応じて、ファイル名・EXIF・XMP・AI プロンプト・PDF メタ・動画メタ・タグ・サイドカーを検索します。</li>
       <li><strong>PDF ファイル</strong>: ファイル名に加え、検索対象が「PDF メタ情報」または「すべて」のときはタイトル・著者・件名・キーワードも対象になります。</li>
     </ul>
     <p>「検索対象」を EXIF など画像専用の次元に設定すると、その情報を持たないフォルダ・ZIP・PDF は
@@ -293,7 +293,7 @@
     「PDF のタイトルだけで検索したい」「動画の説明文だけ見たい」といった用途に使います。</p>
 
     <h3 id="target">検索対象 (Ctrl+F / Ctrl+G 共通)</h3>
-    <p>どのメタデータソースを検索するかを選びます。「すべて」だと以下 7 ソースの OR:</p>
+    <p>どのメタデータソースを検索するかを選びます。「すべて」だと以下 8 ソースの OR:</p>
     <ul>
       <li><strong>ファイル名</strong>: ファイル名 (拡張子込み)</li>
       <li><strong>EXIF</strong>: カメラ本体の撮影情報 (メーカー・モデル・レンズ・絞り etc.)</li>
@@ -303,6 +303,11 @@
       <li><strong>PDF メタ情報</strong>: PDF のタイトル / 著者 / 件名 / キーワード</li>
       <li><strong>動画メタ情報</strong>: FFmpeg が読める動画のタイトル / 作者 / 説明 / URL / チャプター名</li>
       <li><strong>タグ</strong>: mImageViewer の<a href="tags.html">タグ機能</a>で付けた <code>#タグ名</code></li>
+      <li><strong>サイドカー</strong>: 画像と同じ場所に置かれた<strong>同名の JSON / テキストファイル</strong>
+          (<code>画像名.json</code> / <code>画像名.txt</code>) の中身。作者名・作品名・元 URL・各種ラベルなどを
+          そのまま全文検索できます。<a href="tags.html">タグ機能</a> (<code>#タグ名</code>) とは別系統で、
+          中身の語をそのままキーワードとして検索します (例: ラベルや作者名)。読み取り専用で、
+          サイドカーファイルを書き換えることはありません。</li>
     </ul>
     <p>単一ソースに絞ると、そのソース以外の情報はノイズとして弾かれます。例えば
     「EXIF のレンズ名だけで探したい」「AI プロンプトに EXIF が混ざって困る」といった場面で使います。</p>
@@ -359,7 +364,7 @@
           </tr>
           <tr>
             <td><strong>アイテム索引</strong></td>
-            <td>画像 / PDF / 動画の全文: ファイル名 + EXIF + XMP + AI プロンプト + PDF メタ + 動画メタ + タグ</td>
+            <td>画像 / PDF / 動画の全文: ファイル名 + EXIF + XMP + AI プロンプト + PDF メタ + 動画メタ + タグ + サイドカー</td>
             <td>Ctrl+G (アイテム検索) / グリッドのタグバッジ / タグ書き込み後の即時反映</td>
             <td>OFF</td>
           </tr>
