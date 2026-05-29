@@ -16469,6 +16469,34 @@ impl App {
             return;
         }
 
+        // 表示中画像が **実際に AI 処理されるか** を、先読みキャンセルより前に確定させる。
+        // ここで源泉 (fs_cache の Static) を取得し、サイズ閾値 (`should_process`) で
+        // 範囲外なら即 return する。源泉あり + サイズ範囲内のときだけ、下の
+        // 「先読みを優先キャンセル」ブロックに進む。
+        //
+        // ⚠ 再発防止 (2026-05、v0.9.x からの既存バグ): この範囲チェックを
+        // キャンセルブロックより **後** に置くと、skip_px 超で処理対象外の大きい画像を
+        // 表示している間、現在画像は spawn されないのに先読みだけが毎フレーム
+        // キャンセルされる。prefetch が翌フレーム再投入 → タイル 1 枚処理後に即
+        // キャンセル、を ~25 回/秒で無限ループし GPU を焼き続ける
+        // (cancel された job は `poll_ai_upscale` で failed 扱いされず再試行されるため)。
+        // 処理対象外なら先読みを温存して抜けることでループを断つ。
+        let source_image = match self.fs_cache.get(&current_idx) {
+            Some(FsCacheEntry::Static { pixels, .. }) => pixels.clone(),
+            _ => return,
+        };
+
+        let (w, h) = (source_image.size[0] as u32, source_image.size[1] as u32);
+        let upscale_in_range =
+            crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px);
+        let denoise_in_range =
+            crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px);
+        // 両方の範囲外ならスキップ (先読みをキャンセルする前に抜ける)
+        if (!upscale_enabled || !upscale_in_range) && (!denoise_enabled || !denoise_in_range) {
+            return;
+        }
+
+        // ここに到達 = 表示中画像は実際に AI 処理される。
         // 同時実行は 1 枚まで（GPU メモリと帯域の制約）。ただし現在表示中の
         // 画像を処理するケースでは、ユーザーが既に先に進んでいるので古い
         // 先読み（別 idx or 別 bg）を優先キャンセルして枠を空ける。
@@ -16512,22 +16540,6 @@ impl App {
             if has_active_pending {
                 return;
             }
-        }
-
-        // 元画像がキャッシュにあるか確認
-        let source_image = match self.fs_cache.get(&current_idx) {
-            Some(FsCacheEntry::Static { pixels, .. }) => pixels.clone(),
-            _ => return,
-        };
-
-        let (w, h) = (source_image.size[0] as u32, source_image.size[1] as u32);
-        let upscale_in_range =
-            crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px);
-        let denoise_in_range =
-            crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px);
-        // 両方の範囲外ならスキップ
-        if (!upscale_enabled || !upscale_in_range) && (!denoise_enabled || !denoise_in_range) {
-            return;
         }
 
         // AI ランタイム / モデルマネージャを遅延初期化
@@ -19717,6 +19729,52 @@ impl App {
         upscale_will_apply || denoise_will_apply
     }
 
+    /// 先読みスケジューラ用: 表示中画像 (`fs_idx`) の AI 処理が「完了」または
+    /// 「これ以上進まない / 不要」かを判定する。true なら隣接画像の AI 先読みへ
+    /// 進んでよい (= update ループの `current_done`)。
+    ///
+    /// **`ai_will_apply_to` (panorama settle 用) とは意味が逆**なので別 predicate にする:
+    /// settle 側は「適用されるかもしれない → 保守的に true」で、寸法不明・終端状態でも
+    /// true を返す。スケジューラがそれを `!ai_will_apply_to` で使うと、
+    /// `FsCacheEntry::Animated` / `Failed` (= AI upscale 経路に乗らない終端状態) で
+    /// `current_done=false` が固定され、`maybe_start_ai_upscale` も Static 以外は即 return
+    /// するため current が永遠に未完了 → 先読みが永久停止する (Codex P2)。
+    ///
+    /// ここでは終端状態 (Static 以外の fs_cache entry) を「done」扱いにして先読みを通し、
+    /// 未ロード (fs_cache 不在) のみ「一時的に未完了」(= current の load を待つ) とする。
+    fn ai_prefetch_current_ready(&self, fs_idx: usize) -> bool {
+        let cur_bg = self.effective_upscale_bg_mode();
+        // 既に AI 結果が出来た / 恒久失敗した → done。
+        if self.ai_upscale_cache.contains_key(&(fs_idx, cur_bg))
+            || self.ai_upscale_failed.contains(&(fs_idx, cur_bg))
+        {
+            return true;
+        }
+        // AI 機能が両方 OFF → そもそも処理しない → done。
+        if !self.ai_upscale_enabled && self.ai_denoise_model.is_none() {
+            return true;
+        }
+        match self.fs_cache.get(&fs_idx) {
+            Some(FsCacheEntry::Static { pixels, .. }) => {
+                let w = pixels.size[0] as u32;
+                let h = pixels.size[1] as u32;
+                let upscale_active = self.ai_upscale_enabled
+                    && crate::ai::upscale::should_process(w, h, self.settings.ai_upscale_skip_px);
+                let denoise_active = self.ai_denoise_model.is_some()
+                    && crate::ai::upscale::should_process(w, h, self.settings.ai_denoise_skip_px);
+                // 範囲内 = これから処理される → まだ done でない (current 優先で待つ)。
+                // upscale / denoise 双方とも範囲外 = AI 不適用 → done (denoise の skip も
+                // 見ることで「denoise 有効 + 両方サイズ超過で先読み停止」も解消)。
+                !upscale_active && !denoise_active
+            }
+            // Animated / Video / Failed = AI upscale 経路に乗らない終端状態 → done。
+            Some(_) => true,
+            // 未ロード = 一時状態。current の load 完了を待つため done 扱いにしない
+            // (load 完了で Static/Failed 等になり次フレームで再評価される)。
+            None => false,
+        }
+    }
+
     /// 360 モード ON / OFF をトグル。fs_idx は対象画像 (検出 hint の初期視点取得用)。
     ///
     /// ON 時の副作用 (360 モードは機能制限モードなので、衝突する状態を抑止する):
@@ -22195,28 +22253,13 @@ impl eframe::App for App {
 
             // 表示中画像を最優先でアップスケール
             self.maybe_start_ai_upscale(fs_idx);
-            // 表示中画像のアップスケールが完了 or 不要なら先読みもアップスケール
-            let cur_bg = self.effective_upscale_bg_mode();
-            let current_done = self.ai_upscale_cache.contains_key(&(fs_idx, cur_bg))
-                || self.ai_upscale_failed.contains(&(fs_idx, cur_bg))
-                || (!self.ai_upscale_enabled && self.ai_denoise_model.is_none())
-                || (self.ai_upscale_enabled
-                    && self.ai_denoise_model.is_none()
-                    && self
-                        .fs_cache
-                        .get(&fs_idx)
-                        .map(|e| {
-                            if let FsCacheEntry::Static { pixels, .. } = e {
-                                !crate::ai::upscale::should_process(
-                                    pixels.size[0] as u32,
-                                    pixels.size[1] as u32,
-                                    self.settings.ai_upscale_skip_px,
-                                )
-                            } else {
-                                true
-                            }
-                        })
-                        .unwrap_or(true));
+            // 表示中画像のアップスケールが完了 or 不要なら先読みもアップスケール。
+            // 判定は先読みスケジューラ専用の `ai_prefetch_current_ready` に委譲する。
+            // panorama settle 用の `ai_will_apply_to` は「寸法不明 / 終端状態」を保守的に
+            // true (= 適用されるかも) とするため、`!ai_will_apply_to` だと
+            // Animated/Failed の current で先読みが永久停止する。スケジューラ側は逆に
+            // 「終端状態 = done」とみなす必要があるので別 predicate にする (Codex P2 ×2)。
+            let current_done = self.ai_prefetch_current_ready(fs_idx);
             if current_done && self.ai_upscale_pending.is_empty() {
                 self.prefetch_ai_upscale(fs_idx);
             }

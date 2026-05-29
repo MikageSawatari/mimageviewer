@@ -4425,6 +4425,177 @@ mod prefetch_gate_tests {
 }
 
 #[cfg(test)]
+mod ai_upscale_livelock_tests {
+    use super::phase_c_support::setup_app;
+    use super::*;
+    use crate::fs_animation::FsCacheEntry;
+    use crate::grid_item::GridItem;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
+
+    /// 回帰テスト (2026-05、v0.9.x からの既存バグ):
+    /// 表示中画像が `ai_upscale_skip_px` 超でアップスケール対象外のとき、
+    /// `maybe_start_ai_upscale` は先読み (prefetch) ジョブを **キャンセルしてはならない**。
+    ///
+    /// 旧実装は「先読みを優先キャンセル」ブロックをサイズ閾値チェックより前に
+    /// 走らせていたため、処理対象外の大画像をフルスクリーン表示している間、
+    /// prefetch を毎フレーム起動 → タイル 1 枚処理後に即キャンセルし続ける
+    /// GPU ライブロックになっていた (cancel された job は `poll_ai_upscale` で
+    /// failed 扱いされず無限再試行されるため)。
+    #[test]
+    fn skip_eligible_current_does_not_cancel_prefetch() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let dummy_tex = ctx.load_texture(
+            "test_dummy",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+
+        // アップスケール ON / デノイズ OFF。閾値を極小 (=2) にして、4x4 でも
+        // should_process(4,4,2)=false (= 範囲外/スキップ) になるようにする。
+        app.ai_upscale_enabled = true;
+        app.ai_denoise_model = None;
+        app.settings.ai_upscale_skip_px = 2;
+
+        // idx 0 = 表示中。fs_cache に Static (4x4) を入れる → サイズ閾値で skip 対象。
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                tex: dummy_tex.clone(),
+                pixels: std::sync::Arc::new(egui::ColorImage::filled([4, 4], egui::Color32::WHITE)),
+                source_dims: None,
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+
+        // 先読みジョブ (idx 1) を pending に積む。cancel フラグは false。
+        let bg = app.effective_upscale_bg_mode();
+        let prefetch_cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = mpsc::channel::<crate::ai::upscale::UpscaleResult>();
+        app.ai_upscale_pending
+            .insert((1, bg), (prefetch_cancel.clone(), rx));
+
+        // 表示中 (idx 0) は skip 対象なので、cancel ブロックに入らず即 return するはず。
+        app.maybe_start_ai_upscale(0);
+
+        assert!(
+            !prefetch_cancel.load(Ordering::Relaxed),
+            "skip 対象の表示中画像が先読みをキャンセルしてはならない (GPU ライブロック回帰防止)"
+        );
+        assert!(
+            app.ai_upscale_pending.contains_key(&(1, bg)),
+            "先読み pending entry は温存されるべき"
+        );
+    }
+
+    /// 表示中画像がまだ `fs_cache` にロードされていない (源泉なし) 場合も、
+    /// 先読みをキャンセルしてはならない。源泉取得を cancel ブロックより前に
+    /// 行うことの回帰ガード (未ロード画像が先読みを kill すると同じループになる)。
+    #[test]
+    fn current_without_source_does_not_cancel_prefetch() {
+        let mut app = setup_app();
+
+        // 閾値は大きく取り (= 通常なら処理対象)、源泉が無いことだけが return 理由になる状況。
+        app.ai_upscale_enabled = true;
+        app.ai_denoise_model = None;
+        app.settings.ai_upscale_skip_px = 10_000;
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.fullscreen_idx = Some(0);
+        // idx 0 は fs_cache に **入れない** (= 未ロード)。
+
+        let bg = app.effective_upscale_bg_mode();
+        let prefetch_cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = mpsc::channel::<crate::ai::upscale::UpscaleResult>();
+        app.ai_upscale_pending
+            .insert((1, bg), (prefetch_cancel.clone(), rx));
+
+        app.maybe_start_ai_upscale(0);
+
+        assert!(
+            !prefetch_cancel.load(Ordering::Relaxed),
+            "源泉未ロードの表示中画像が先読みをキャンセルしてはならない"
+        );
+        assert!(
+            app.ai_upscale_pending.contains_key(&(1, bg)),
+            "先読み pending entry は温存されるべき"
+        );
+    }
+
+    /// Static な fs_cache エントリを作るテストヘルパ (`pixels.size` = w×h)。
+    fn static_fs_entry(ctx: &egui::Context, w: usize, h: usize) -> FsCacheEntry {
+        let tex = ctx.load_texture(
+            "test_dummy",
+            egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+            egui::TextureOptions::LINEAR,
+        );
+        FsCacheEntry::Static {
+            tex,
+            pixels: std::sync::Arc::new(egui::ColorImage::filled([w, h], egui::Color32::WHITE)),
+            source_dims: None,
+            load_seq: 0,
+        }
+    }
+
+    /// 回帰テスト (Codex P2・第1ラウンド): denoise も有効で画像が upscale / denoise 双方の
+    /// サイズ閾値を超過 (= どちらの AI も走らない) とき、先読みスケジューラ predicate
+    /// `ai_prefetch_current_ready` は true (= done) を返し先読みへ進む。upscale 側 skip
+    /// だけ見ていた旧 `current_done` はこのケースを取りこぼし先読みが黙って停止していた。
+    #[test]
+    fn prefetch_ready_true_when_both_ai_skip_eligible() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.ai_upscale_enabled = true;
+        app.ai_denoise_model = Some(crate::ai::ModelKind::DenoiseRealplksr);
+        app.settings.ai_upscale_skip_px = 2;
+        app.settings.ai_denoise_skip_px = 2;
+        app.fs_cache.insert(0, static_fs_entry(&ctx, 4, 4));
+        assert!(
+            app.ai_prefetch_current_ready(0),
+            "upscale/denoise 双方が閾値超でスキップなら done 扱い (= 先読み続行)"
+        );
+    }
+
+    /// Static で範囲内 (= これから処理される) かつ未キャッシュなら、まだ done でない
+    /// (current を優先して先読みを待つ)。
+    #[test]
+    fn prefetch_ready_false_when_static_in_range_uncached() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        app.ai_upscale_enabled = true;
+        app.ai_denoise_model = None;
+        app.settings.ai_upscale_skip_px = 10_000; // 4x4 は範囲内
+        app.fs_cache.insert(0, static_fs_entry(&ctx, 4, 4));
+        assert!(
+            !app.ai_prefetch_current_ready(0),
+            "範囲内で未処理の current は done でない (先読みより current 優先)"
+        );
+    }
+
+    /// 回帰テスト (Codex P2・第2ラウンド): current が `FsCacheEntry::Failed` (終端状態) の
+    /// とき、`ai_prefetch_current_ready` は true (= done) を返さなければならない。
+    /// `!ai_will_apply_to` に委ねると Failed / Animated は「寸法不明 → 保守的 true」で
+    /// done=false に固定され、current が永遠に未完了 → 先読みが永久停止する。
+    #[test]
+    fn prefetch_ready_true_for_failed_current() {
+        let mut app = setup_app();
+        app.ai_upscale_enabled = true;
+        app.ai_denoise_model = None;
+        // 範囲内設定 (skip しない) でも、Failed は終端状態なので done になるべき。
+        app.settings.ai_upscale_skip_px = 10_000;
+        app.fs_cache.insert(0, FsCacheEntry::Failed);
+        assert!(
+            app.ai_prefetch_current_ready(0),
+            "Failed (終端状態) の current は done 扱い (= 先読みを止めない)"
+        );
+    }
+}
+
+#[cfg(test)]
 mod pano_settle_size_tests {
     use super::*;
 
