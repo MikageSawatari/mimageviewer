@@ -118,6 +118,10 @@ fn metadata_text_fallback_emoji_symbols_dark() {
                     .font(mimageviewer::ui_fonts::user_text_font(18.0)),
             );
             ui.label(
+                egui::RichText::new("CJK mix: 简体字测试 / 繁體字測試 / 日本語 / 한글")
+                    .font(mimageviewer::ui_fonts::user_text_font(18.0)),
+            );
+            ui.label(
                 egui::RichText::new("✉Contact form")
                     .font(mimageviewer::ui_fonts::user_text_font(18.0)),
             );

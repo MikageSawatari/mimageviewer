@@ -102,9 +102,10 @@ pub fn read_search_text(image_path: &Path) -> Option<String> {
         ));
         return None;
     }
-    let bytes = std::fs::read(&path).ok()?;
+    let raw = std::fs::read(&path).ok()?;
+    let bytes = strip_utf8_bom(&raw);
     if is_json_ext(&path) {
-        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        match serde_json::from_slice::<serde_json::Value>(bytes) {
             Ok(v) => {
                 let mut out = String::new();
                 collect_json_values(&v, &mut out);
@@ -120,7 +121,7 @@ pub fn read_search_text(image_path: &Path) -> Option<String> {
         }
     } else {
         // TXT: 全文 (不正バイトは置換)。
-        let text = String::from_utf8_lossy(&bytes);
+        let text = String::from_utf8_lossy(bytes);
         let capped = truncate_on_char_boundary(&text, MAX_TEXT_BYTES);
         (!capped.trim().is_empty()).then(|| capped.to_string())
     }
@@ -141,13 +142,14 @@ pub fn read_for_display(image_path: &Path) -> Option<SidecarDisplay> {
     if md.len() > MAX_SIDECAR_BYTES {
         return None;
     }
-    let bytes = std::fs::read(&path).ok()?;
+    let raw = std::fs::read(&path).ok()?;
+    let bytes = strip_utf8_bom(&raw);
     if is_json_ext(&path) {
-        serde_json::from_slice::<serde_json::Value>(&bytes)
+        serde_json::from_slice::<serde_json::Value>(bytes)
             .ok()
             .map(SidecarDisplay::Json)
     } else {
-        let text = String::from_utf8_lossy(&bytes);
+        let text = String::from_utf8_lossy(bytes);
         let capped = truncate_on_char_boundary(&text, MAX_TEXT_BYTES).to_string();
         (!capped.trim().is_empty()).then_some(SidecarDisplay::Text(capped))
     }
@@ -201,6 +203,14 @@ pub fn images_for_sidecar(sidecar_path: &Path) -> Vec<PathBuf> {
 // -----------------------------------------------------------------------
 // 内部ヘルパ
 // -----------------------------------------------------------------------
+
+/// 先頭の UTF-8 BOM (`EF BB BF`) を取り除く。JSON は RFC 8259 上 BOM を付けない規定だが、
+/// 一部の Windows ツールが付与するため、付いていればパース前に剥がす
+/// (docs/sidecar-encoding-utf8.md §3.2 / TC4)。BOM を残すと serde_json が先頭で
+/// パース失敗し、TXT では先頭に U+FEFF が残って表示・検索が崩れる。
+fn strip_utf8_bom(bytes: &[u8]) -> &[u8] {
+    bytes.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(bytes)
+}
 
 fn mtime_secs(md: &std::fs::Metadata) -> i64 {
     md.modified()
@@ -455,5 +465,148 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let sc = write(tmp.path(), "orphan.json", b"{}");
         assert!(images_for_sidecar(&sc).is_empty());
+    }
+
+    // ── エンコーディング回帰 (docs/sidecar-encoding-utf8.md の TC1〜TC6) ──────
+    // サイドカー JSON/TXT は常に UTF-8 として読む。CP932/ANSI で誤読すると CJK が
+    // mojibake (縺ｮ…) になる。生 UTF-8 / \u エスケープ / BOM / 4byte / 不正バイトを網羅。
+
+    /// TC1: 生 UTF-8・BOM 無し JSON。値が正しく UTF-8 デコードされる (CP932 誤読しない)。
+    #[test]
+    fn tc1_raw_utf8_json_values_decode() {
+        let tmp = TempDir::new().unwrap();
+        let img = write(tmp.path(), "tc1.jpg", b"img");
+        write(
+            tmp.path(),
+            "tc1.jpg.json",
+            r#"{ "title": "原神 テスト", "user": { "name": "作者名テスト" },
+                 "tags": ["風景", "オリジナル"] }"#
+                .as_bytes(),
+        );
+        let text = read_search_text(&img).unwrap();
+        assert!(text.contains("原神 テスト"), "title mojibake: {text}");
+        assert!(text.contains("作者名テスト"), "name mojibake: {text}");
+        assert!(text.contains("風景"), "tag mojibake: {text}");
+        // 表示経路でも正しい Unicode
+        match read_for_display(&img).unwrap() {
+            SidecarDisplay::Json(v) => {
+                assert_eq!(v["title"], serde_json::json!("原神 テスト"));
+                assert_eq!(v["user"]["name"], serde_json::json!("作者名テスト"));
+            }
+            other => panic!("expected Json, got {other:?}"),
+        }
+    }
+
+    /// TC2: 中国語。生の多バイト UTF-8 をそのまま復元する。
+    #[test]
+    fn tc2_chinese_json_values_decode() {
+        let tmp = TempDir::new().unwrap();
+        let img = write(tmp.path(), "tc2.jpg", b"img");
+        write(
+            tmp.path(),
+            "tc2.jpg.json",
+            r#"{ "title": "简体字显示测试",
+                 "user": { "name": "中文用户名测试" }, "tags": ["风景"] }"#
+                .as_bytes(),
+        );
+        let text = read_search_text(&img).unwrap();
+        assert!(text.contains("简体字显示测试"), "title mojibake: {text}");
+        assert!(text.contains("中文用户名测试"), "name mojibake: {text}");
+    }
+
+    /// TC3: `\uXXXX` エスケープ (ascii 出力ツール対策)。ファイルが純 ASCII でも復元される。
+    #[test]
+    fn tc3_unicode_escape_decodes() {
+        let tmp = TempDir::new().unwrap();
+        let img = write(tmp.path(), "tc3.jpg", b"img");
+        // ファイルは純 ASCII バイト列 (マルチバイト文字を一切含まない)。
+        // 原神 = 原神, 風景 = 風景。JSON パーサの \u 解釈だけで
+        // 復元されるので、読み取りバイトエンコーディングに依存せず正しい値になる。
+        // 二重バックスラッシュ = ファイル上は 原神 / 風景 という
+        // ASCII エスケープ列 (原神 / 風景)。serde_json が \u を解釈して復元する。
+        let json = "{ \"title\": \"\\u539f\\u795e\", \"tags\": [\"\\u98a8\\u666f\"] }";
+        write(tmp.path(), "tc3.jpg.json", json.as_bytes());
+        let text = read_search_text(&img).unwrap();
+        assert!(text.contains("原神"), "escape not decoded: {text}");
+        assert!(text.contains("風景"), "escape not decoded: {text}");
+    }
+
+    /// TC4: UTF-8 BOM 付き JSON。BOM を無視してパースし、キー名に U+FEFF が混ざらない。
+    #[test]
+    fn tc4_utf8_bom_json_is_parsed() {
+        let tmp = TempDir::new().unwrap();
+        let img = write(tmp.path(), "tc4.jpg", b"img");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(r#"{ "title": "テスト" }"#.as_bytes());
+        write(tmp.path(), "tc4.jpg.json", &bytes);
+        // 検索: BOM があっても値が取れる
+        let text = read_search_text(&img).expect("BOM JSON must still parse");
+        assert!(text.contains("テスト"), "BOM broke search parse: {text}");
+        // 表示: キー名が "\u{feff}title" にならない
+        match read_for_display(&img).expect("BOM JSON must still parse for display") {
+            SidecarDisplay::Json(serde_json::Value::Object(m)) => {
+                assert!(
+                    m.contains_key("title"),
+                    "expected key 'title', keys={:?}",
+                    m.keys().collect::<Vec<_>>()
+                );
+                assert!(!m.contains_key("\u{feff}title"), "BOM leaked into key name");
+            }
+            other => panic!("expected Json object, got {other:?}"),
+        }
+    }
+
+    /// TC4-txt: UTF-8 BOM 付き TXT。先頭に U+FEFF が残らない。
+    #[test]
+    fn tc4_utf8_bom_txt_strips_bom() {
+        let tmp = TempDir::new().unwrap();
+        let img = write(tmp.path(), "tc4b.jpg", b"img");
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice("風景\nオリジナル\n".as_bytes());
+        write(tmp.path(), "tc4b.jpg.txt", &bytes);
+        let text = read_search_text(&img).unwrap();
+        assert!(!text.starts_with('\u{feff}'), "BOM not stripped: {text:?}");
+        assert!(text.contains("風景"));
+    }
+
+    /// TC5: 4 バイト UTF-8 (絵文字・サロゲートペア) もそのまま復元する。
+    #[test]
+    fn tc5_four_byte_utf8_emoji() {
+        let tmp = TempDir::new().unwrap();
+        let img = write(tmp.path(), "tc5.jpg", b"img");
+        write(
+            tmp.path(),
+            "tc5.jpg.json",
+            r#"{ "title": "🎨art" }"#.as_bytes(),
+        );
+        let text = read_search_text(&img).unwrap();
+        assert!(text.contains("🎨art"), "4-byte utf8 mojibake: {text}");
+    }
+
+    /// TC6: 不正バイト混入 JSON。クラッシュせず None に倒れる (堅牢性)。
+    #[test]
+    fn tc6_invalid_bytes_json_no_crash() {
+        let tmp = TempDir::new().unwrap();
+        let img = write(tmp.path(), "tc6.jpg", b"img");
+        let mut bytes = r#"{ "title": "テス"#.as_bytes().to_vec();
+        bytes.push(0xFF);
+        bytes.push(0xFE);
+        bytes.extend_from_slice(r#"ト" }"#.as_bytes());
+        write(tmp.path(), "tc6.jpg.json", &bytes);
+        // パース失敗 → None。panic しないことが要件。
+        let _ = read_search_text(&img);
+        let _ = read_for_display(&img);
+    }
+
+    /// TC6-txt: 不正バイト混入 TXT。lossy で読めてクラッシュせず、正常部分は残る。
+    #[test]
+    fn tc6_invalid_bytes_txt_lossy() {
+        let tmp = TempDir::new().unwrap();
+        let img = write(tmp.path(), "tc6b.jpg", b"img");
+        let mut bytes = "風景".as_bytes().to_vec();
+        bytes.push(0xFF);
+        write(tmp.path(), "tc6b.jpg.txt", &bytes);
+        let text = read_search_text(&img).unwrap();
+        assert!(text.contains("風景"), "valid prefix lost: {text}");
     }
 }

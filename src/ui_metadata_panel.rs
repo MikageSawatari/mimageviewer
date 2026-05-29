@@ -209,11 +209,16 @@ impl App {
         let inner_rect = content_rect.shrink2(egui::vec2(12.0, 8.0));
         let mut child_ui = ui.new_child(egui::UiBuilder::new().max_rect(inner_rect));
         child_ui.set_clip_rect(content_rect);
+        // Metadata values often contain long CJK text, URLs, and hashes. Use a
+        // solid scrollbar here so egui reserves a real gutter instead of
+        // drawing the default floating bar on top of the text.
+        child_ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
 
         egui::ScrollArea::vertical()
             .id_salt("metadata_scroll")
+            .auto_shrink([false, false])
             .show(&mut child_ui, |ui| {
-                ui.set_width(inner_rect.width());
+                ui.set_width(ui.available_width());
 
                 // ── タグパネル (最上段) ──
                 // 登録タグを ON/OFF ボタンで並べる。対応形式外のファイルはグレーアウト。
