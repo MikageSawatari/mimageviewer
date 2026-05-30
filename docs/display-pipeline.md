@@ -364,6 +364,15 @@ fs_load ワーカーが `clamp_dynamic_for_gpu` を掛ける直前に記録し�
 通常の画像 / ZIP 内画像 / PDF ページだけを対象にし、動画には適用しない。表示元は常に
 `fs_cache` の生デコード結果で、補正 / AI / 消しゴム / 隠蔽の派生キャッシュは参照しない。
 
+### 2.3.1 デバッグ出力
+
+フルスクリーン表示中に `Ctrl+Alt+Shift+D` を押すと、現在表示中ページ (見開き時は左右
+ページ) のパイプライン段階を `%APPDATA%\mimageviewer\debug-pipeline\...` へ出力する。
+PNG エンコードとファイル I/O は `pipeline-debug-export` worker で行い、`manifest.json`
+に `input_generation` / `erase_mask_generation` / `conceal_mask_generation`、各 stage の
+有無、欠落理由、出力ファイル名を記録する。消しゴム・隠蔽加工モード中でも、通常
+ショートカットより先にこのキーだけを処理する。
+
 ### 2.4 変換の合成順序
 
 描画時、`draw_fs_image` は以下の順で変換を掛ける:
@@ -417,6 +426,10 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
    fs_cache は raw decode 専用で、消しゴム確定結果を書き戻さない。
    AI / 補正 / マスクのどれかが変わると generation key が変わり、古い結果は
    表示に採用されず再計算される。
+   消しゴムモード入場時のマスク解像度は raw ではなく、この段の入力候補
+   (AI 高解像度レイヤがあればそれ、なければ補正済み/ raw) に合わせる。
+   preview / apply / ensure-result で作業解像度が割れると、同じマスクでも MI-GAN の
+   補完結果が一致しないため。
    ↓
 6. 隠蔽加工 (モザイク / 白塗り / 黒塗り / ぼかし)
    → conceal_cache[idx, generation] (= erase_result_cache または adjustment_cache をベースに合成)
@@ -437,9 +450,11 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 - **ポストフィルタ**: 色調補正の後段で CPU 処理 (CRT/減色/複合)。rayon 並列化で 4K 画像でも
   40〜80ms 程度。`PostFilter::None` 以外はテクスチャサンプラーを NEAREST にして
   スキャンライン/ドットを維持する。
-- **消しゴム/分析モード中の一時バイパス**: `App::post_filter_bypassed = true` の間は
+- **消しゴム/隠蔽加工/分析モード中の一時バイパス**: `App::post_filter_bypassed = true` の間は
   `apply_sync_adjustment` が post-filter 段をスキップし color-only の `adjustment_cache` を生成。
-  モード解除時に false に戻し該当 idx をクリアして post-filter 適用状態で再生成させる。
+  モード解除時に false に戻し、描画用 cache だけをクリアして post-filter 適用状態で再生成させる。
+  消しゴムの preview / apply / ensure-result 入力はこの表示用 bypass に引きずられず、
+  最終表示順どおり post-filter 適用後の画像を使う。
 - **AI アップスケール/デノイズ**: 別スレッドで推論。完了時に `ai_upscale_cache` に格納。
 - **元画像プレビュー**: 右 Ctrl を押している間だけ描画時のテクスチャ選択を
   raw 専用の `fs_cache` に切り替える。DB・補正設定・AI queue は変更しない。
@@ -447,7 +462,7 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
   - 補正パラメータ変更 → `adjustment_cache[idx]` のみクリア
   - ポストフィルタ変更 → `adjustment_cache[idx]` のみクリア (色系変更と同じ扱い)
   - AI モデル変更 → `adjustment_cache` + `ai_upscale_cache` 両方をクリア + 実行中ジョブをキャンセル
-  - 消しゴム/分析モード入出 → `adjustment_cache[idx]` のみクリア (bypass 切替のため)
+  - 消しゴム/隠蔽加工/分析モード入出 → 該当 idx の描画用 cache のみクリア (bypass 切替のため)
   - フォルダ切替 → 両方をグローバルクリア
   - 回転変更 → **キャッシュはクリアしない** (GPU 行列で回すため)
 

@@ -65,6 +65,7 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | <kbd>Shift</kbd>+<kbd>F7</kbd> / <kbd>Shift</kbd>+<kbd>F8</kbd> | 現在ページの消しゴムマスクを削除 |
 | <kbd>Shift</kbd>+<kbd>F9</kbd> / <kbd>Shift</kbd>+<kbd>F10</kbd> | 現在ページの隠蔽マスクを削除 |
 | <kbd>Ctrl</kbd>+<kbd>E</kbd> | 現在の表示結果を別ファイルへエクスポート |
+| <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>D</kbd> | 画像パイプラインのデバッグ出力 (`%APPDATA%\mimageviewer\debug-pipeline\...` に段階別 PNG と manifest を保存) |
 | <kbd>P</kbd> | 現在表示中アイテムを現在のコンテナの代表サムネに固定 / 解除 |
 | <kbd>X</kbd> | 現在表示中を比較スロットへピン留め / 同じ画像なら解除 |
 | <kbd>C</kbd> | 比較スロットのピン画像と現在画像をトグル表示 |
@@ -83,9 +84,8 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | <kbd>S</kbd> / <kbd>B</kbd> / <kbd>L</kbd> / <kbd>I</kbd> / <kbd>V</kbd> / <kbd>H</kbd> / <kbd>R</kbd> / <kbd>O</kbd> | 選択 / 筆 / 囲み / 直線 / 縦線 / 横線 / 矩形 / 楕円ツール |
 | <kbd>D</kbd> / <kbd>F</kbd> | 描画 / 消去モード切替 |
 | <kbd>Space</kbd>+左ドラッグ | 一時パン |
-| マウスホイール (筆 / 直線ツール) | 筆サイズ / 直線幅を変更。<kbd>Ctrl</kbd>+ホイールはズーム |
-| <kbd>Ctrl</kbd>+左ドラッグ (筆) | 筆サイズを変更 |
-| <kbd>Ctrl</kbd>+左ドラッグ (縦線 / 横線) | 線の位置 / 傾きを調整 |
+| <kbd>Ctrl</kbd>+マウスホイール | ズーム。ツールパネル上でも同じ |
+| マウスホイール | 画像上ではページ送り・筆サイズ変更ともに行わない。ツールパネル上ではパネルスクロール |
 | 矢印 / <kbd>Ctrl</kbd>+矢印 | マスクまたは選択オブジェクトを 1px / 10px 移動 |
 | <kbd>[</kbd> / <kbd>]</kbd>, <kbd>Ctrl</kbd>+<kbd>[</kbd> / <kbd>]</kbd> | マスクまたは選択オブジェクトを ±0.1° / ±1° 回転 |
 | <kbd>Shift</kbd>+ハンドル | 端点角度・回転角をスナップ、矩形/楕円の角リサイズを等比化 |
@@ -112,7 +112,8 @@ mimageviewer のフルスクリーン操作におけるキー / マウス アサ
 | <kbd>R</kbd> | 矩形ツール |
 | <kbd>O</kbd> | 楕円ツール |
 | <kbd>Space</kbd>+左ドラッグ | 一時パン |
-| マウスホイール (筆 / 線ツール) | 筆サイズ / 線幅を変更。<kbd>Ctrl</kbd>+ホイールはズーム |
+| <kbd>Ctrl</kbd>+マウスホイール | ズーム。ツールパネル上でも同じ |
+| マウスホイール | 画像上ではページ送り・筆サイズ変更ともに行わない。ツールパネル上ではパネルスクロール |
 | 矢印 / <kbd>Ctrl</kbd>+矢印 | 選択オブジェクト、またはオブジェクト全体を 1px / 10px 移動 |
 | <kbd>Shift</kbd>+ハンドル | 端点角度・回転角をスナップ、矩形/楕円の角リサイズを等比化 |
 | <kbd>Alt</kbd>+ハンドル | 矩形/楕円を中心固定でリサイズ |

@@ -62,6 +62,7 @@ pub mod path_key;
 pub mod pdf_loader;
 pub mod pdf_passwords;
 pub mod perf;
+mod pipeline_debug;
 pub mod png_metadata;
 pub mod post_filter;
 pub mod rating_db;

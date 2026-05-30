@@ -40,6 +40,15 @@ const TOP_BAR_HEIGHT: f32 = 44.0;
 /// ホイール感度（raw_scroll_delta の除数）
 const WHEEL_SENSITIVITY: f32 = 30.0;
 
+fn should_handle_fullscreen_wheel(
+    cursor_in_panel: bool,
+    in_video_tile: bool,
+    ctrl_held: bool,
+    modal_for_keys: bool,
+) -> bool {
+    !modal_for_keys && (!in_video_tile || !ctrl_held) && (ctrl_held || !cursor_in_panel)
+}
+
 /// 中ボタンドラッグズーム: 縦 N px で倍率 2 倍/半分になる感度 (v0.8.1)。
 /// 100 px で 2 倍 (= 上へ 200 px で 4 倍)。ホイール 1 ノッチ ≈ 10% と比べて粗めだが、
 /// 縦フル (1080 px) ストロークすれば 2^10 ≈ 1000 倍まで届くので十分。
@@ -243,6 +252,7 @@ fn is_fullscreen_shortcut_probe_key(key: egui::Key) -> bool {
             | egui::Key::K
             | egui::Key::B
             | egui::Key::C
+            | egui::Key::D
             | egui::Key::P
             | egui::Key::F
             | egui::Key::G
@@ -579,9 +589,16 @@ impl App {
         self.analysis_mode = false;
         // post-filter バイパスを解除 (消しゴム or 隠蔽加工モード中ならそちらが保持する)
         if self.post_filter_bypassed && !self.is_overlay_edit_mode_active() {
+            let needs_post_filter_restore = restore_idx
+                .map(|idx| {
+                    self.effective_params(idx).post_filter != crate::adjustment::PostFilter::None
+                })
+                .unwrap_or(false);
             self.post_filter_bypassed = false;
-            if let Some(idx) = restore_idx {
-                self.clear_adjustment_caches(idx);
+            if needs_post_filter_restore {
+                if let Some(idx) = restore_idx {
+                    self.clear_adjustment_render_caches_for_bypass(idx);
+                }
             }
         }
         self.analysis_hover_color = None;
@@ -597,7 +614,9 @@ impl App {
         if !self.post_filter_bypassed {
             self.post_filter_bypassed = true;
             if let Some(idx) = self.fullscreen_idx {
-                self.clear_adjustment_caches(idx);
+                if self.effective_params(idx).post_filter != crate::adjustment::PostFilter::None {
+                    self.clear_adjustment_render_caches_for_bypass(idx);
+                }
             }
         }
     }
@@ -3027,6 +3046,11 @@ impl App {
             return action;
         }
 
+        if Self::consume_pipeline_debug_shortcut(ctx) {
+            self.start_pipeline_debug_export(ctx, fs_idx);
+            return action;
+        }
+
         // 消しゴムモード中は専用ショートカットのみ有効にし、通常のフルスクリーンショートカット
         // (矢印ナビ、R/L 回転、I メタデータ等) を無効化する。
         if self.erase_mode {
@@ -3973,7 +3997,11 @@ impl App {
                             && self.adjustment_mode
                             && p.x < left_panel_right
                             && p.y >= 60.0;
-                        in_right || in_left
+                        let in_erase_panel =
+                            self.erase_mode && self.erase_panel_rect(full_rect).contains(p);
+                        let in_conceal_panel =
+                            self.conceal_mode && self.conceal_panel_rect(full_rect).contains(p);
+                        in_right || in_left || in_erase_panel || in_conceal_panel
                     })
                     .unwrap_or(false)
             });
@@ -4044,8 +4072,12 @@ impl App {
         // 抑止する。state.source 等が snapshot 時点で固定されているので、idx だけ
         // 移動すると間違った画像が export される (Codex review CONFIRMED)。
         let modal_for_keys = self.any_modal_dialog_open_for_fullscreen_keys();
-        let handle_wheel_here =
-            !cursor_in_panel && (!in_video_tile || !ctrl_held) && !modal_for_keys;
+        let handle_wheel_here = should_handle_fullscreen_wheel(
+            cursor_in_panel,
+            in_video_tile,
+            ctrl_held,
+            modal_for_keys,
+        );
         if wheel_y.abs() > 0.5 && handle_wheel_here {
             ctx.input_mut(|i| {
                 i.raw_scroll_delta = egui::Vec2::ZERO;
@@ -4053,55 +4085,6 @@ impl App {
                 i.events
                     .retain(|e| !matches!(e, egui::Event::MouseWheel { .. }));
             });
-            // 消しゴムモード: 筆/直線ツールでは修飾なしホイールで太さ調整
-            // (Ctrl+ホイールは通常のズームに残す)
-            if !ctrl_held
-                && self.erase_mode
-                && matches!(
-                    self.erase_tool,
-                    crate::app::EraseTool::Brush | crate::app::EraseTool::Line
-                )
-            {
-                let max_r = self.erase_mask_size[0].max(self.erase_mask_size[1]) as f32 / 20.0;
-                let factor = if wheel_y > 0.0 { 1.1 } else { 1.0 / 1.1 };
-                match self.erase_tool {
-                    crate::app::EraseTool::Brush => {
-                        self.erase_brush_radius =
-                            (self.erase_brush_radius * factor).clamp(1.0, max_r);
-                    }
-                    crate::app::EraseTool::Line => {
-                        self.erase_line_width = (self.erase_line_width * factor).clamp(1.0, max_r);
-                    }
-                    _ => {}
-                }
-                return (0, false); // ホイールを消費したので終了
-            }
-            // 隠蔽加工モード: 筆/直線ツールでは修飾なしホイールで太さ調整 (erase と対称)。
-            // Ctrl+ホイール (= ズーム) は下のブロックに流す。
-            if !ctrl_held
-                && self.conceal_mode
-                && matches!(
-                    self.conceal_tool,
-                    crate::conceal::ConcealTool::Brush
-                        | crate::conceal::ConcealTool::Line
-                        | crate::conceal::ConcealTool::VertLine
-                        | crate::conceal::ConcealTool::HorizLine
-                )
-            {
-                let max_r = self.conceal_mask_size[0].max(self.conceal_mask_size[1]) as f32 / 20.0;
-                let factor = if wheel_y > 0.0 { 1.1 } else { 1.0 / 1.1 };
-                match self.conceal_tool {
-                    crate::conceal::ConcealTool::Brush => {
-                        self.settings.conceal_brush_radius =
-                            (self.settings.conceal_brush_radius * factor).clamp(1.0, max_r);
-                    }
-                    _ => {
-                        self.settings.conceal_line_width =
-                            (self.settings.conceal_line_width * factor).clamp(1.0, max_r);
-                    }
-                }
-                return (0, false);
-            }
             if self.analysis_mode {
                 // 分析モード: ホイールでズーム
                 let mouse = ctx.input(|i| i.pointer.hover_pos());
@@ -9929,6 +9912,14 @@ mod tests {
         assert!(!should_draw_fs_pixel_grid(false, true, zoomed));
         assert!(!should_draw_fs_pixel_grid(true, false, zoomed));
         assert!(should_draw_fs_pixel_grid(true, true, zoomed));
+    }
+
+    #[test]
+    fn ctrl_wheel_is_handled_even_over_panels() {
+        assert!(should_handle_fullscreen_wheel(true, false, true, false));
+        assert!(!should_handle_fullscreen_wheel(true, false, false, false));
+        assert!(should_handle_fullscreen_wheel(false, false, false, false));
+        assert!(!should_handle_fullscreen_wheel(false, false, true, true));
     }
 
     #[test]

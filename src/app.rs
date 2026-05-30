@@ -1234,7 +1234,7 @@ pub(crate) enum EraseTool {
     VertLine,
     /// 横線ツール: ドラッグ高さの横全体矩形を塗りつぶす
     HorizLine,
-    /// 直線ツール: ドラッグ始終点を結ぶ太い直線を塗りつぶす。Shift で幅調整。
+    /// 直線ツール: ドラッグ始終点を結ぶ太い直線を塗りつぶす。
     Line,
     /// 筆ツール: 円形ブラシで自由に塗る
     Brush,
@@ -1250,24 +1250,6 @@ impl Default for EraseTool {
     }
 }
 
-/// Ctrl+ドラッグ中の基準状態。ドラッグ開始時に記録し、以降のマウス位置との
-/// 差分から操作量を算出する。
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ShiftDragState {
-    /// 筆ツール: 起点 + 基準半径。
-    BrushSize {
-        origin: (f32, f32),
-        base_radius: f32,
-    },
-    /// 縦線/横線ツール: 起点 + 基準傾き + 基準の線端点。
-    LineAdjust {
-        origin: (f32, f32),
-        base_tilt: f32,
-        base_start: (f32, f32),
-        base_end: (f32, f32),
-    },
-}
-
 /// 消しゴムの Undo スタックに積むスナップショット。ビットマップとベクタの両方を持つ。
 ///
 /// Phase 2b で `Vec<LineObject>` → `Vec<Shape>` に移行。旧 Diagonal/Vertical/Horizontal
@@ -1277,6 +1259,33 @@ pub(crate) enum ShiftDragState {
 pub(crate) struct EraseSnapshot {
     pub mask: Vec<bool>,
     pub shapes: Vec<crate::mask_db::Shape>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MaskDirtyRect {
+    pub x0: usize,
+    pub y0: usize,
+    pub x1: usize,
+    pub y1: usize,
+}
+
+impl MaskDirtyRect {
+    pub(crate) fn new(x0: usize, y0: usize, x1: usize, y1: usize) -> Option<Self> {
+        (x0 < x1 && y0 < y1).then_some(Self { x0, y0, x1, y1 })
+    }
+
+    pub(crate) fn union(self, other: Self) -> Self {
+        Self {
+            x0: self.x0.min(other.x0),
+            y0: self.y0.min(other.y0),
+            x1: self.x1.max(other.x1),
+            y1: self.y1.max(other.y1),
+        }
+    }
+
+    pub(crate) fn size(self) -> [usize; 2] {
+        [self.x1 - self.x0, self.y1 - self.y0]
+    }
 }
 
 /// 隠蔽加工 (Conceal) の Undo スタックに積むスナップショット。`EraseSnapshot` の
@@ -2139,6 +2148,9 @@ pub struct App {
         Vec<std::sync::mpsc::Receiver<crate::ui_dialogs::context_menu::CopyOutcome>>,
     /// Ctrl+S / キャプチャ保存の worker 完了待ち。
     pub(crate) capture_pending: Option<CapturePending>,
+    /// Ctrl+Alt+Shift+D / 画像パイプラインデバッグ出力の worker 完了待ち。
+    pub(crate) pipeline_debug_export_pending:
+        Option<crate::pipeline_debug::PipelineDebugExportPending>,
     /// Ctrl+E / 編集済み画像エクスポートのダイアログ状態。
     pub(crate) export_dialog: Option<crate::export_dialog::ExportDialogState>,
     /// Ctrl+E / 編集済み画像エクスポートの worker 完了待ち。
@@ -2965,6 +2977,8 @@ pub struct App {
     pub(crate) erase_mask_size: [usize; 2],
     /// マスクオーバーレイ用テクスチャ
     pub(crate) erase_mask_texture: Option<egui::TextureHandle>,
+    /// マスクオーバーレイテクスチャの部分更新待ち領域。
+    pub(crate) erase_mask_texture_dirty_rect: Option<MaskDirtyRect>,
     /// 消しゴムモードでドラッグ中か（前フレームのポインタ位置を保持）
     pub(crate) erase_last_paint_pos: Option<egui::Pos2>,
     /// 現在のツール種別
@@ -2978,12 +2992,10 @@ pub struct App {
     /// 縦線/横線ツールのドラッグ現在点 (画像ピクセル座標)
     pub(crate) erase_line_end: Option<(f32, f32)>,
     /// 縦線/横線ツールの傾き量 (画像ピクセル単位の上端オフセット)。
-    /// Ctrl+ドラッグ時のみ非ゼロになる。
+    /// 作成後のハンドル編集で非ゼロになる。
     pub(crate) erase_line_tilt: f32,
     /// 直線ツールの幅 (画像ピクセル)。
     pub(crate) erase_line_width: f32,
-    /// Ctrl+ドラッグ中の状態 (None なら未アクティブ)。
-    pub(crate) erase_shift_drag: Option<ShiftDragState>,
     /// 描画モード (true) / 消去モード (false)
     pub(crate) erase_paint_mode: bool,
     /// inpaint 適用前の表示入力キャッシュ: item_idx → ピクセルデータ。
@@ -3090,6 +3102,8 @@ pub struct App {
     pub(crate) conceal_mask_size: [usize; 2],
     /// マスクオーバーレイ用テクスチャ (Phase 2 で生成)。
     pub(crate) conceal_mask_texture: Option<egui::TextureHandle>,
+    /// マスクオーバーレイテクスチャの部分更新待ち領域。
+    pub(crate) conceal_mask_texture_dirty_rect: Option<MaskDirtyRect>,
     /// 現在ページの Shape ベクタ群 (Line / Rect / Ellipse、`mask_db::Shape`)。
     pub(crate) conceal_shapes: Vec<crate::mask_db::Shape>,
     /// 選択中の Shape インデックス (`conceal_shapes` への添字、Phase 2 で使用)。
@@ -3802,6 +3816,7 @@ impl App {
             paste_pending: Vec::new(),
             drop_copy_pending: Vec::new(),
             capture_pending: None,
+            pipeline_debug_export_pending: None,
             export_dialog: None,
             export_pending: None,
             export_folder_refresh_pending: None,
@@ -4072,6 +4087,7 @@ impl App {
             erase_mask: None,
             erase_mask_size: [0, 0],
             erase_mask_texture: None,
+            erase_mask_texture_dirty_rect: None,
             erase_last_paint_pos: None,
             erase_tool: EraseTool::default(),
             erase_brush_radius: 0.0, // enter_erase_mode で設定
@@ -4080,7 +4096,6 @@ impl App {
             erase_line_end: None,
             erase_line_tilt: 0.0,
             erase_line_width: 0.0, // enter_erase_mode で設定
-            erase_shift_drag: None,
             erase_paint_mode: true,
             erase_base_cache: std::collections::HashMap::new(),
             mask_db,
@@ -4111,6 +4126,7 @@ impl App {
             conceal_mask: None,
             conceal_mask_size: [0, 0],
             conceal_mask_texture: None,
+            conceal_mask_texture_dirty_rect: None,
             conceal_shapes: Vec::new(),
             conceal_selected_shape: None,
             conceal_base_cache: std::collections::HashMap::new(),
@@ -16532,16 +16548,19 @@ impl App {
         }
     }
 
-    /// 消しゴム入力用の補正適用。通常の表示パイプラインと同じく色調の後に
-    /// post-filter を重ねるが、消しゴム/分析中の bypass では post-filter を飛ばす。
+    /// 消しゴム用ソースへの補正適用。
+    ///
+    /// inpaint 入力は通常の表示パイプラインと同じく post-filter 込み、編集中の
+    /// base 表示だけは精密に塗れるよう `include_post_filter=false` で呼ぶ。
     pub(crate) fn apply_erase_adjustments_to_source(
         &self,
         idx: usize,
         pixels: Arc<egui::ColorImage>,
+        include_post_filter: bool,
     ) -> Arc<egui::ColorImage> {
         let params = self.effective_params(idx).clone();
         let apply_pf =
-            !self.post_filter_bypassed && params.post_filter != crate::adjustment::PostFilter::None;
+            include_post_filter && params.post_filter != crate::adjustment::PostFilter::None;
         if params.is_color_identity() && !apply_pf {
             return pixels;
         }
@@ -17573,6 +17592,7 @@ impl App {
         }
         self.conceal_mask_size = [tw, th];
         self.conceal_mask_texture = None;
+        self.conceal_mask_texture_dirty_rect = None;
         self.conceal_undo_stack.clear();
         self.conceal_last_undo_at = None;
         self.clear_conceal_caches(idx);
@@ -17713,7 +17733,7 @@ impl App {
             None => self.erase_base_cache.get(&idx)?.clone(),
         };
         let source_pixels = self.black_flatten_erase_source_if_needed(idx, source_pixels);
-        let adjusted = self.apply_erase_adjustments_to_source(idx, source_pixels);
+        let adjusted = self.apply_erase_adjustments_to_source(idx, source_pixels, false);
         let tex = ctx.load_texture(
             format!("erase_base_display_{idx}"),
             (*adjusted).clone(),
@@ -18727,6 +18747,19 @@ impl App {
         // 360 度パノラマビュー: cache 内容が変わったので世代 bump (§3.6.2.2)。
         // ここで bump し忘れると 360 view が古いテクスチャを描画する。
         self.bump_adjustment_generation(idx);
+    }
+
+    /// `post_filter_bypassed` の入出時だけ使う描画用 cache clear。
+    ///
+    /// 補正パラメータ自体は変わらず、消しゴム inpaint 入力は常に post-filter 込みで
+    /// 解決するため、`input_generation` は進めない。ここで進めると、プレビュー/確定
+    /// 直後の commit が通常表示復帰だけで stale 扱いになり、別ジョブで作り直される。
+    pub(crate) fn clear_adjustment_render_caches_for_bypass(&mut self, idx: usize) {
+        self.adjustment_cache.remove(&idx);
+        self.invalidate_compare_prepared_for_idx(idx);
+        self.thumb_adjust_tex.remove(&idx);
+        self.clear_conceal_caches(idx);
+        self.erase_base_tex_cache.remove(&idx);
     }
 
     /// 表示中画像の adjustment_cache がない場合、補正を同期適用する。
@@ -22589,6 +22622,7 @@ impl eframe::App for App {
         self.poll_delete_pending();
         self.poll_paste_pending();
         self.poll_capture_pending(ctx);
+        self.poll_pipeline_debug_export_pending(ctx);
         self.poll_export_pending(ctx);
         self.poll_compare_pin_load_pending(ctx);
         self.poll_compare_pin_pending(ctx);
@@ -22597,6 +22631,7 @@ impl eframe::App for App {
             ctx.request_repaint();
         }
         if self.capture_pending.is_some()
+            || self.pipeline_debug_export_pending.is_some()
             || self.export_pending.is_some()
             || self.compare_pin_load_pending.is_some()
             || self.compare_pin_pending.is_some()

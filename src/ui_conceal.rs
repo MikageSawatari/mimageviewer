@@ -19,7 +19,7 @@
 use eframe::egui;
 use std::sync::Arc;
 
-use crate::app::{App, ConcealSnapshot, EraseSpreadCtx};
+use crate::app::{App, ConcealSnapshot, EraseSpreadCtx, MaskDirtyRect};
 use crate::conceal::ConcealTool;
 use crate::mask_db::{LineKind, Shape, ShapeOp};
 use crate::ui_fullscreen::FsKeyAction;
@@ -123,11 +123,14 @@ impl App {
         self.clear_meta_undo();
         if !self.post_filter_bypassed {
             self.post_filter_bypassed = true;
-            self.clear_adjustment_caches(fs_idx);
+            if self.effective_params(fs_idx).post_filter != crate::adjustment::PostFilter::None {
+                self.clear_adjustment_render_caches_for_bypass(fs_idx);
+            }
         }
 
         self.conceal_mask_size = [w, h];
         self.conceal_mask_texture = None;
+        self.conceal_mask_texture_dirty_rect = None;
         self.conceal_paint_mode = true;
         self.conceal_undo_stack.clear();
         self.conceal_last_undo_at = None;
@@ -219,15 +222,23 @@ impl App {
 
         // post-filter バイパス解除 (analysis_mode が同時にアクティブでない場合)
         if self.post_filter_bypassed && !self.analysis_mode {
+            let needs_post_filter_restore = restore_idx
+                .map(|idx| {
+                    self.effective_params(idx).post_filter != crate::adjustment::PostFilter::None
+                })
+                .unwrap_or(false);
             self.post_filter_bypassed = false;
-            if let Some(idx) = restore_idx {
-                self.clear_adjustment_caches(idx);
+            if needs_post_filter_restore {
+                if let Some(idx) = restore_idx {
+                    self.clear_adjustment_render_caches_for_bypass(idx);
+                }
             }
         }
 
         self.conceal_mask = None;
         self.conceal_mask_size = [0, 0];
         self.conceal_mask_texture = None;
+        self.conceal_mask_texture_dirty_rect = None;
         self.conceal_shapes.clear();
         self.conceal_selected_shape = None;
         self.conceal_undo_stack.clear();
@@ -753,8 +764,10 @@ impl App {
         let Some(mask) = self.conceal_mask.as_mut() else {
             return;
         };
+        let dirty = crate::mask_db::brush_line_bbox(w, h, from, to, radius)
+            .and_then(|(x0, y0, x1, y1)| MaskDirtyRect::new(x0, y0, x1, y1));
         if crate::mask_db::paint_brush_line_bitmap(mask, w, h, from, to, radius, paint) {
-            self.conceal_mask_texture = None;
+            self.mark_conceal_mask_texture_dirty(dirty);
             // brush もマスクを変えるので conceal_cache 失効が必要 (= preview 時に
             // 最新マスクで再合成される、commit_conceal_shape と同じ理由)。
             if let Some(fs_idx) = self.fullscreen_idx {
@@ -770,6 +783,7 @@ impl App {
         };
         crate::mask_db::scanline_fill_polygon(mask, points, w, h, paint);
         self.conceal_mask_texture = None;
+        self.conceal_mask_texture_dirty_rect = None;
         // lasso もマスクを変えるので conceal_cache 失効が必要。
         if let Some(fs_idx) = self.fullscreen_idx {
             self.clear_conceal_caches(fs_idx);
@@ -778,14 +792,73 @@ impl App {
 
     // ── マスクテクスチャ ──────────────────────────────────────────
 
+    fn mark_conceal_mask_texture_dirty(&mut self, dirty: Option<MaskDirtyRect>) {
+        match (self.conceal_mask_texture.is_some(), dirty) {
+            (true, Some(rect)) => {
+                self.conceal_mask_texture_dirty_rect = Some(
+                    self.conceal_mask_texture_dirty_rect
+                        .map_or(rect, |prev| prev.union(rect)),
+                );
+            }
+            _ => {
+                self.conceal_mask_texture = None;
+                self.conceal_mask_texture_dirty_rect = None;
+            }
+        }
+    }
+
+    fn conceal_mask_region_image(&self, rect: MaskDirtyRect) -> Option<egui::ColorImage> {
+        let mask = self.conceal_mask.as_ref()?;
+        let [w, h] = self.conceal_mask_size;
+        let composite = crate::mask_db::composite_mask_region(
+            mask,
+            &self.conceal_shapes,
+            w,
+            h,
+            (rect.x0, rect.y0, rect.x1, rect.y1),
+        )?;
+        let [rw, rh] = rect.size();
+        let mut rgba = vec![0u8; rw * rh * 4];
+        for (i, masked) in composite.iter().copied().enumerate() {
+            if masked {
+                rgba[i * 4] = MASK_OVERLAY_R;
+                rgba[i * 4 + 1] = MASK_OVERLAY_G;
+                rgba[i * 4 + 2] = MASK_OVERLAY_B;
+                rgba[i * 4 + 3] = MASK_OVERLAY_A;
+            }
+        }
+        Some(egui::ColorImage::from_rgba_unmultiplied([rw, rh], &rgba))
+    }
+
     fn ensure_conceal_mask_texture(&mut self, ctx: &egui::Context) {
+        let [w, h] = self.conceal_mask_size;
+        if self
+            .conceal_mask_texture
+            .as_ref()
+            .is_some_and(|tex| tex.size() != [w, h])
+        {
+            self.conceal_mask_texture = None;
+            self.conceal_mask_texture_dirty_rect = None;
+        }
+        if let Some(rect) = self.conceal_mask_texture_dirty_rect.take() {
+            if self.conceal_mask_texture.is_some() {
+                if let Some(ci) = self.conceal_mask_region_image(rect)
+                    && let Some(tex) = self.conceal_mask_texture.as_mut()
+                {
+                    tex.set_partial([rect.x0, rect.y0], ci, egui::TextureOptions::NEAREST);
+                    return;
+                }
+            }
+            self.conceal_mask_texture = None;
+            self.conceal_mask_texture_dirty_rect = None;
+        }
         if self.conceal_mask_texture.is_some() {
             return;
         }
+        self.conceal_mask_texture_dirty_rect = None;
         let Some(composite) = self.composite_conceal_mask() else {
             return;
         };
-        let [w, h] = self.conceal_mask_size;
         let mut rgba = vec![0u8; w * h * 4];
         for i in 0..composite.len() {
             if composite[i] {
@@ -1609,7 +1682,7 @@ impl App {
     // ── ツールパネル ──────────────────────────────────────────────
 
     /// ツールパネルの矩形を返す。
-    fn conceal_panel_rect(&self, full_rect: egui::Rect) -> egui::Rect {
+    pub(crate) fn conceal_panel_rect(&self, full_rect: egui::Rect) -> egui::Rect {
         let panel_pos = egui::pos2(
             full_rect.min.x + PANEL_MARGIN_X,
             full_rect.min.y + PANEL_MARGIN_Y,
@@ -2349,7 +2422,7 @@ impl App {
 
                                         ui.separator();
                                         let help = "Space+ドラッグ:一時パン\n\
-                                            ホイール:筆/線のサイズ\n\
+                                            Ctrl+ホイール:ズーム\n\
                                             矢印:選択/全体を移動 (Ctrl:10倍)\n\
                                             Shift+ハンドル:拘束/等比/15°snap\n\
                                             Alt+ハンドル:中心固定\n\

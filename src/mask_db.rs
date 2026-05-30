@@ -567,6 +567,69 @@ pub fn rasterize_shapes_into(mask: &mut [bool], shapes: &[Shape], w: usize, h: u
     }
 }
 
+/// ブラシ線分が触れうる画像内 bbox を半開区間で返す。
+pub fn brush_line_bbox(
+    w: usize,
+    h: usize,
+    from: (f32, f32),
+    to: (f32, f32),
+    radius: f32,
+) -> Option<(usize, usize, usize, usize)> {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let radius = radius.max(1.0);
+    let min_x = from.0.min(to.0) - radius;
+    let min_y = from.1.min(to.1) - radius;
+    let max_x = from.0.max(to.0) + radius;
+    let max_y = from.1.max(to.1) + radius;
+    let x0 = min_x.floor().max(0.0).min(w as f32) as usize;
+    let y0 = min_y.floor().max(0.0).min(h as f32) as usize;
+    let x1 = (max_x.ceil() as isize + 1).clamp(0, w as isize) as usize;
+    let y1 = (max_y.ceil() as isize + 1).clamp(0, h as isize) as usize;
+    (x0 < x1 && y0 < y1).then_some((x0, y0, x1, y1))
+}
+
+/// ビットマップマスクの一部だけを Shape と合成する。
+///
+/// `rect` は画像座標の半開区間 `(x0, y0, x1, y1)`。返り値は `rect` 原点の
+/// row-major 1bit マスクで、`rasterize_shapes_into` と同じ作成順・Add/Subtract
+/// 合成を局所領域にだけ適用する。
+pub fn composite_mask_region(
+    mask: &[bool],
+    shapes: &[Shape],
+    w: usize,
+    h: usize,
+    rect: (usize, usize, usize, usize),
+) -> Option<Vec<bool>> {
+    let (x0, y0, x1, y1) = rect;
+    if w == 0
+        || h == 0
+        || mask.len() < w.saturating_mul(h)
+        || x0 >= x1
+        || y0 >= y1
+        || x1 > w
+        || y1 > h
+    {
+        return None;
+    }
+    let rw = x1 - x0;
+    let rh = y1 - y0;
+    let mut out = vec![false; rw * rh];
+    for ry in 0..rh {
+        let src = (y0 + ry) * w + x0;
+        let dst = ry * rw;
+        out[dst..dst + rw].copy_from_slice(&mask[src..src + rw]);
+    }
+    for shape in shapes {
+        let mut shifted = *shape;
+        shifted.translate(-(x0 as f32), -(y0 as f32));
+        let value = matches!(shifted.op(), ShapeOp::Add);
+        rasterize_shape_into(&mut out, &shifted, rw, rh, value);
+    }
+    Some(out)
+}
+
 /// `Shape` 群を JSON 文字列にシリアライズする (空なら None)。
 /// 出力は常に新タグ付き形式。
 pub fn shapes_to_json(shapes: &[Shape]) -> Option<String> {
@@ -1048,6 +1111,37 @@ mod tests {
 
         assert!(!changed);
         assert!(mask.iter().all(|&v| !v));
+    }
+
+    #[test]
+    fn brush_line_bbox_clips_to_image() {
+        assert_eq!(
+            brush_line_bbox(10, 8, (-2.0, 3.0), (5.0, 3.0), 2.0),
+            Some((0, 1, 8, 6))
+        );
+        assert_eq!(brush_line_bbox(10, 8, (20.0, 3.0), (25.0, 3.0), 2.0), None);
+    }
+
+    #[test]
+    fn composite_mask_region_applies_shapes_in_local_coordinates() {
+        let mut mask = vec![false; 10 * 10];
+        mask[5 * 10 + 5] = true;
+        let shapes = vec![Shape::Rect {
+            op: ShapeOp::Add,
+            center: (7.0, 5.0),
+            half_w: 1.5,
+            half_h: 1.5,
+            rotation_rad: 0.0,
+        }];
+
+        let region = composite_mask_region(&mask, &shapes, 10, 10, (4, 4, 9, 7)).unwrap();
+
+        let rw = 5;
+        assert!(region[rw + 1], "bitmap pixel should be copied into region");
+        assert!(
+            region[rw + 3],
+            "shape should be rasterized into shifted region"
+        );
     }
 
     #[test]

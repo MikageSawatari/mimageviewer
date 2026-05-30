@@ -2321,6 +2321,26 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    fn insert_current_erase_result_cache(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+    ) -> std::sync::Arc<egui::ColorImage> {
+        let image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(240, 241, 242)]);
+        let pixels = std::sync::Arc::new(image.clone());
+        let texture = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
+        let key = app.current_erase_result_key(idx);
+        app.erase_result_cache.insert(
+            key,
+            EraseResultCacheEntry {
+                pixels: std::sync::Arc::clone(&pixels),
+                texture,
+            },
+        );
+        pixels
+    }
+
     fn params_with_brightness(v: f32) -> AdjustParams {
         let mut p = AdjustParams::default();
         p.brightness = v;
@@ -3640,6 +3660,266 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    #[test]
+    fn execute_erase_inpaint_promotes_preview_result() {
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, "c:/p/a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.erase_mode = true;
+        app.post_filter_bypassed = true;
+        app.erase_mask_size = [2, 2];
+        app.erase_mask = Some(mask_2x2());
+
+        let preview = egui::ColorImage::new(
+            [2, 2],
+            vec![
+                egui::Color32::from_rgb(10, 20, 30),
+                egui::Color32::from_rgb(40, 50, 60),
+                egui::Color32::from_rgb(70, 80, 90),
+                egui::Color32::from_rgb(100, 110, 120),
+            ],
+        );
+        let preview_pixels = std::sync::Arc::new(preview.clone());
+        let preview_tex = ctx.load_texture(
+            "erase_preview_promote",
+            preview,
+            egui::TextureOptions::LINEAR,
+        );
+        app.erase_preview_cache.insert(
+            idx,
+            ErasePreviewCacheEntry {
+                pixels: std::sync::Arc::clone(&preview_pixels),
+                texture: preview_tex,
+            },
+        );
+
+        app.execute_erase_inpaint(&ctx, idx);
+
+        let committed = app
+            .current_erase_result_pixels(idx)
+            .expect("preview should be promoted into erase_result_cache");
+        assert_eq!(committed.pixels, preview_pixels.pixels);
+        assert!(
+            app.erase_inpaint_pending.is_empty(),
+            "no extra MI-GAN job should be queued when preview is available"
+        );
+        assert!(
+            app.erase_preview_cache.is_empty(),
+            "leaving erase mode clears preview-only cache"
+        );
+        assert!(!app.post_filter_bypassed);
+    }
+
+    #[test]
+    fn reset_erase_mode_keeps_commit_pending_when_no_post_filter_restore_needed() {
+        use crate::ui_erase::{EraseInpaintKind, EraseInpaintPending, EraseInpaintPendingKey};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "c:/p/a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.erase_mode = true;
+        app.post_filter_bypassed = true;
+        app.input_generation.insert(idx, 7);
+
+        let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let key = EraseInpaintPendingKey {
+            idx,
+            kind: EraseInpaintKind::Commit,
+        };
+        let items_generation = app.items_generation;
+        let path_key = app.page_path_key(idx);
+        app.erase_inpaint_pending.insert(
+            key,
+            EraseInpaintPending {
+                idx,
+                items_generation,
+                path_key,
+                rx,
+                cancel: Arc::clone(&cancel),
+                started_at: std::time::Instant::now(),
+                input_generation: 7,
+                mask_generation: 0,
+                log_prefix: "test",
+                is_preview: false,
+            },
+        );
+
+        app.reset_erase_mode();
+
+        assert_eq!(app.input_generation.get(&idx), Some(&7));
+        assert!(
+            app.erase_inpaint_pending.contains_key(&key),
+            "reset should not cancel a just-launched commit when bypass restoration is a no-op"
+        );
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(!app.post_filter_bypassed);
+    }
+
+    #[test]
+    fn reset_erase_mode_keeps_commit_pending_with_post_filter() {
+        use crate::adjustment::PostFilter;
+        use crate::ui_erase::{EraseInpaintKind, EraseInpaintPending, EraseInpaintPendingKey};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "c:/p/a.jpg");
+        app.settings.global_preset.post_filter = PostFilter::Sepia;
+        app.fullscreen_idx = Some(idx);
+        app.erase_mode = true;
+        app.post_filter_bypassed = true;
+        app.input_generation.insert(idx, 11);
+
+        let (_tx, rx) = std::sync::mpsc::channel::<egui::ColorImage>();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let key = EraseInpaintPendingKey {
+            idx,
+            kind: EraseInpaintKind::Commit,
+        };
+        let items_generation = app.items_generation;
+        let path_key = app.page_path_key(idx);
+        app.erase_inpaint_pending.insert(
+            key,
+            EraseInpaintPending {
+                idx,
+                items_generation,
+                path_key,
+                rx,
+                cancel: Arc::clone(&cancel),
+                started_at: std::time::Instant::now(),
+                input_generation: 11,
+                mask_generation: 0,
+                log_prefix: "test",
+                is_preview: false,
+            },
+        );
+
+        app.reset_erase_mode();
+
+        assert_eq!(app.input_generation.get(&idx), Some(&11));
+        assert!(app.erase_inpaint_pending.contains_key(&key));
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert!(!app.post_filter_bypassed);
+    }
+
+    #[test]
+    fn erase_adjustment_source_can_include_post_filter_during_bypass() {
+        use crate::adjustment::PostFilter;
+
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "c:/p/a.jpg");
+        app.settings.global_preset.post_filter = PostFilter::Sepia;
+        app.post_filter_bypassed = true;
+        let source = std::sync::Arc::new(egui::ColorImage::new(
+            [1, 1],
+            vec![egui::Color32::from_rgb(20, 80, 200)],
+        ));
+
+        let edit_base =
+            app.apply_erase_adjustments_to_source(idx, std::sync::Arc::clone(&source), false);
+        let inpaint_input = app.apply_erase_adjustments_to_source(idx, source, true);
+
+        assert_eq!(
+            edit_base.pixels[0],
+            egui::Color32::from_rgb(20, 80, 200),
+            "edit base display bypasses post-filter"
+        );
+        assert_ne!(
+            inpaint_input.pixels[0], edit_base.pixels[0],
+            "inpaint input keeps display-pipeline order: post-filter before erase"
+        );
+    }
+
+    #[test]
+    fn enter_conceal_mode_keeps_erase_result_with_post_filter() {
+        use crate::adjustment::PostFilter;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, "c:/p/a.jpg");
+        app.settings.global_preset.post_filter = PostFilter::Sepia;
+        app.fullscreen_idx = Some(idx);
+        app.input_generation.insert(idx, 5);
+        app.erase_mask_generation.insert(idx, 7);
+        let erase_pixels =
+            insert_current_erase_result_cache(&mut app, &ctx, idx, "conceal_enter_erase_result");
+
+        app.enter_conceal_mode(idx);
+
+        assert!(app.conceal_mode);
+        assert!(app.post_filter_bypassed);
+        assert_eq!(app.input_generation.get(&idx), Some(&5));
+        let current = app
+            .current_erase_result_pixels(idx)
+            .expect("conceal entry must not invalidate the erase result");
+        assert_eq!(current.pixels, erase_pixels.pixels);
+        let base = app
+            .conceal_base_cache
+            .get(&idx)
+            .expect("conceal should capture the erase result as edit base");
+        assert_eq!(base.pixels, erase_pixels.pixels);
+    }
+
+    #[test]
+    fn reset_conceal_mode_keeps_erase_result_with_post_filter() {
+        use crate::adjustment::PostFilter;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, "c:/p/a.jpg");
+        app.settings.global_preset.post_filter = PostFilter::Sepia;
+        app.fullscreen_idx = Some(idx);
+        app.input_generation.insert(idx, 13);
+        app.erase_mask_generation.insert(idx, 17);
+        let erase_pixels =
+            insert_current_erase_result_cache(&mut app, &ctx, idx, "conceal_reset_erase_result");
+        app.conceal_mode = true;
+        app.post_filter_bypassed = true;
+        app.conceal_mask_size = [1, 1];
+        app.conceal_mask = Some(vec![false]);
+
+        app.reset_conceal_mode();
+
+        assert!(!app.conceal_mode);
+        assert!(!app.post_filter_bypassed);
+        assert_eq!(app.input_generation.get(&idx), Some(&13));
+        let current = app
+            .current_erase_result_pixels(idx)
+            .expect("conceal reset must not invalidate the erase result");
+        assert_eq!(current.pixels, erase_pixels.pixels);
+    }
+
+    #[test]
+    fn analysis_bypass_keeps_erase_result_with_post_filter() {
+        use crate::adjustment::PostFilter;
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let idx = push_image(&mut app, "c:/p/a.jpg");
+        app.settings.global_preset.post_filter = PostFilter::Sepia;
+        app.fullscreen_idx = Some(idx);
+        app.input_generation.insert(idx, 23);
+        app.erase_mask_generation.insert(idx, 29);
+        let erase_pixels =
+            insert_current_erase_result_cache(&mut app, &ctx, idx, "analysis_erase_result");
+
+        app.analysis_mode = true;
+        app.enter_analysis_mode_bypass();
+        app.reset_analysis_mode();
+
+        assert!(!app.analysis_mode);
+        assert!(!app.post_filter_bypassed);
+        assert_eq!(app.input_generation.get(&idx), Some(&23));
+        let current = app
+            .current_erase_result_pixels(idx)
+            .expect("analysis bypass must not invalidate the erase result");
+        assert_eq!(current.pixels, erase_pixels.pixels);
+    }
+
     /// Cache 復元した Auto 比率は、前回の根拠 sample 数に追いつくまで
     /// seed / 途中ロードの少数統計で上書きしない。
     #[test]
@@ -4409,6 +4689,68 @@ mod favorite_adjustment_defaults_tests {
         );
         assert_eq!(app.erase_mask_size, [1, 1]);
         assert!(app.erase_mode);
+    }
+
+    /// 消しゴム preview / apply / 通常表示の再生成で作業解像度が割れると、
+    /// プレビューでは白く消えた端が通常表示で MI-GAN 再生成され、黒っぽい帯になる。
+    /// AI 高解像度レイヤがあるときは、入場時点のマスク解像度も高解像度側へ合わせる。
+    #[test]
+    fn enter_erase_mode_uses_ai_size_for_mask_when_available() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        app.fullscreen_idx = Some(idx);
+        app.ai_upscale_enabled = true;
+
+        let ctx = egui::Context::default();
+        let raw = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(10, 20, 30)]);
+        let raw_tex = ctx.load_texture(
+            "raw_for_erase_work_size",
+            raw.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: raw_tex,
+                pixels: std::sync::Arc::new(raw),
+                source_dims: Some([1, 1]),
+                load_seq: 0,
+            },
+        );
+        let ai = egui::ColorImage::new([4, 4], vec![egui::Color32::from_rgb(240, 240, 240); 16]);
+        let ai_tex = ctx.load_texture(
+            "ai_for_erase_work_size",
+            ai.clone(),
+            egui::TextureOptions::LINEAR,
+        );
+        let erase_bg = app.erase_upscale_bg_mode(idx);
+        app.ai_upscale_cache.insert(
+            (idx, erase_bg),
+            FsCacheEntry::Static {
+                tex: ai_tex,
+                pixels: std::sync::Arc::new(ai),
+                source_dims: None,
+                load_seq: 0,
+            },
+        );
+
+        app.enter_erase_mode(idx);
+
+        assert_eq!(
+            app.erase_mask_size,
+            [4, 4],
+            "erase edit mask should match the final inpaint input size"
+        );
+        assert_eq!(
+            app.erase_mask.as_ref().map(Vec::len),
+            Some(16),
+            "new empty mask should be allocated at the high-resolution work size"
+        );
+        assert_eq!(
+            app.erase_base_cache.get(&idx).map(|p| p.size),
+            Some([1, 1]),
+            "raw erase_base_cache is still rebuilt from fs_cache; only the edit work size changes"
+        );
     }
 
     /// Codex 0.8.2 P1: 検索バー (Ctrl+F/S/G) の TextEdit にフォーカスがある間は

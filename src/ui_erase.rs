@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
-use crate::app::{App, EraseSnapshot, EraseTool, ShiftDragState};
+use crate::app::{App, EraseSnapshot, EraseTool, MaskDirtyRect};
 use crate::fs_animation::FsCacheEntry;
 use crate::mask_db::{LineKind, Shape, ShapeOp};
 use crate::ui_fullscreen::FsKeyAction;
@@ -55,6 +55,8 @@ pub(crate) enum ApplyInpaintOutcome {
     /// マスクは保存したが、サイズ不一致等で commit を即時投入できなかった。
     /// `ensure_erase_result_texture` が次フレで拾う。
     Deferred,
+    /// 既に計算済みのプレビュー結果を、そのまま確定結果へ昇格した。
+    CompletedFromPreview,
     /// MI-GAN ジョブを実際にキューへ投入した。
     Launched,
 }
@@ -198,7 +200,7 @@ impl App {
             self.set_single_page_view(target_idx);
         }
         let fs_idx = target_idx;
-        let [w, h] = pixels.size;
+        let [w, h] = self.erase_working_size(fs_idx, pixels.size);
         self.erase_mode = true;
         // 通常表示と消しゴムは UI / Ctrl+Z の文脈が異なるので、メタ Undo スタックを破棄。
         // 消しゴム中は erase_undo_stack が Ctrl+Z を担当する。
@@ -210,17 +212,19 @@ impl App {
         // 塗るため、減色プリセットのドット表示が混ざると精密な境界操作が難しくなる。
         if !self.post_filter_bypassed {
             self.post_filter_bypassed = true;
-            self.clear_adjustment_caches(fs_idx);
+            if self.effective_params(fs_idx).post_filter != crate::adjustment::PostFilter::None {
+                self.clear_adjustment_render_caches_for_bypass(fs_idx);
+            }
         }
         self.erase_mask_size = [w, h];
         self.erase_mask_texture = None;
+        self.erase_mask_texture_dirty_rect = None;
         self.erase_last_paint_pos = None;
 
         self.erase_lasso_points.clear();
         self.erase_line_start = None;
         self.erase_line_end = None;
         self.erase_line_tilt = 0.0;
-        self.erase_shift_drag = None;
         self.erase_paint_mode = true;
         self.erase_preview_active = false;
         // base texture cache は前回の state を引き継ぐ可能性があるので毎回 clear
@@ -273,21 +277,26 @@ impl App {
         // post-filter 適用状態で再生成させる。分析モード中に誤って reset されても
         // analysis_mode が true なら post_filter_bypassed は分析モード側で保持される想定。
         if self.post_filter_bypassed && !self.analysis_mode {
+            let needs_post_filter_restore = restore_idx
+                .map(|idx| {
+                    self.effective_params(idx).post_filter != crate::adjustment::PostFilter::None
+                })
+                .unwrap_or(false);
             self.post_filter_bypassed = false;
-            if let Some(idx) = restore_idx {
-                self.clear_adjustment_caches(idx);
+            if needs_post_filter_restore && let Some(idx) = restore_idx {
+                self.clear_adjustment_render_caches_for_bypass(idx);
             }
         }
         self.erase_mask = None;
         self.erase_mask_size = [0, 0];
         self.erase_mask_texture = None;
+        self.erase_mask_texture_dirty_rect = None;
         self.erase_last_paint_pos = None;
 
         self.erase_lasso_points.clear();
         self.erase_line_start = None;
         self.erase_line_end = None;
         self.erase_line_tilt = 0.0;
-        self.erase_shift_drag = None;
         self.erase_preview_active = false;
         self.erase_base_tex_cache.clear();
         self.erase_undo_stack.clear();
@@ -762,24 +771,6 @@ impl App {
         ))
     }
 
-    /// スクリーン座標を画像ピクセル座標 (f32) に変換する。
-    fn screen_to_image_f32(
-        &self,
-        screen_pos: egui::Pos2,
-        full_rect: egui::Rect,
-        zoom_pan: Option<(f32, egui::Vec2)>,
-    ) -> Option<(f32, f32)> {
-        let (total_scale, img_rect) = self.erase_image_layout(full_rect, zoom_pan)?;
-        let [iw, ih] = self.erase_mask_size;
-        let nx = (screen_pos.x - img_rect.min.x) / total_scale;
-        let ny = (screen_pos.y - img_rect.min.y) / total_scale;
-        if nx >= 0.0 && ny >= 0.0 && nx < iw as f32 && ny < ih as f32 {
-            Some((nx, ny))
-        } else {
-            None
-        }
-    }
-
     /// スクリーン座標を画像ピクセル座標 (f32) に変換する。画像外座標も返す。
     fn screen_to_image_f32_unclamped(
         &self,
@@ -821,9 +812,11 @@ impl App {
             Some(m) => m,
             None => return,
         };
+        let dirty = crate::mask_db::brush_line_bbox(w, h, from, to, radius)
+            .and_then(|(x0, y0, x1, y1)| MaskDirtyRect::new(x0, y0, x1, y1));
 
         if crate::mask_db::paint_brush_line_bitmap(mask, w, h, from, to, radius, paint) {
-            self.erase_mask_texture = None;
+            self.mark_erase_mask_texture_dirty(dirty);
             // mask 変化 → preview cache を破棄。
             if let Some(fs_idx) = self.fullscreen_idx {
                 self.clear_erase_preview(fs_idx);
@@ -839,6 +832,7 @@ impl App {
         };
         crate::mask_db::scanline_fill_polygon(mask, points, w, h, paint);
         self.erase_mask_texture = None;
+        self.erase_mask_texture_dirty_rect = None;
         // mask 変化 → preview cache を破棄。
         if let Some(fs_idx) = self.fullscreen_idx {
             self.clear_erase_preview(fs_idx);
@@ -847,14 +841,73 @@ impl App {
 
     // ── マスクテクスチャ ──────────────────────────────────────────
 
+    fn mark_erase_mask_texture_dirty(&mut self, dirty: Option<MaskDirtyRect>) {
+        match (self.erase_mask_texture.is_some(), dirty) {
+            (true, Some(rect)) => {
+                self.erase_mask_texture_dirty_rect = Some(
+                    self.erase_mask_texture_dirty_rect
+                        .map_or(rect, |prev| prev.union(rect)),
+                );
+            }
+            _ => {
+                self.erase_mask_texture = None;
+                self.erase_mask_texture_dirty_rect = None;
+            }
+        }
+    }
+
+    fn erase_mask_region_image(&self, rect: MaskDirtyRect) -> Option<egui::ColorImage> {
+        let mask = self.erase_mask.as_ref()?;
+        let [w, h] = self.erase_mask_size;
+        let composite = crate::mask_db::composite_mask_region(
+            mask,
+            &self.erase_shapes,
+            w,
+            h,
+            (rect.x0, rect.y0, rect.x1, rect.y1),
+        )?;
+        let [rw, rh] = rect.size();
+        let mut rgba = vec![0u8; rw * rh * 4];
+        for (i, masked) in composite.iter().copied().enumerate() {
+            if masked {
+                rgba[i * 4] = 255;
+                rgba[i * 4 + 1] = 60;
+                rgba[i * 4 + 2] = 60;
+                rgba[i * 4 + 3] = 140;
+            }
+        }
+        Some(egui::ColorImage::from_rgba_unmultiplied([rw, rh], &rgba))
+    }
+
     fn ensure_mask_texture(&mut self, ctx: &egui::Context) {
+        let [w, h] = self.erase_mask_size;
+        if self
+            .erase_mask_texture
+            .as_ref()
+            .is_some_and(|tex| tex.size() != [w, h])
+        {
+            self.erase_mask_texture = None;
+            self.erase_mask_texture_dirty_rect = None;
+        }
+        if let Some(rect) = self.erase_mask_texture_dirty_rect.take() {
+            if self.erase_mask_texture.is_some() {
+                if let Some(ci) = self.erase_mask_region_image(rect)
+                    && let Some(tex) = self.erase_mask_texture.as_mut()
+                {
+                    tex.set_partial([rect.x0, rect.y0], ci, egui::TextureOptions::NEAREST);
+                    return;
+                }
+            }
+            self.erase_mask_texture = None;
+            self.erase_mask_texture_dirty_rect = None;
+        }
         if self.erase_mask_texture.is_some() {
             return;
         }
+        self.erase_mask_texture_dirty_rect = None;
         let Some(composite) = self.composite_mask() else {
             return;
         };
-        let [w, h] = self.erase_mask_size;
         let mut rgba = vec![0u8; w * h * 4];
         for i in 0..composite.len() {
             if composite[i] {
@@ -1080,7 +1133,7 @@ impl App {
     }
 
     /// ツールパネルの矩形を返す。
-    fn erase_panel_rect(&self, full_rect: egui::Rect) -> egui::Rect {
+    pub(crate) fn erase_panel_rect(&self, full_rect: egui::Rect) -> egui::Rect {
         let panel_pos = egui::pos2(
             full_rect.min.x + PANEL_MARGIN_X,
             full_rect.min.y + PANEL_MARGIN_Y,
@@ -1150,7 +1203,6 @@ impl App {
         let drawing_in_progress = self.erase_last_paint_pos.is_some()
             || self.erase_line_start.is_some()
             || self.erase_shape_drag_start.is_some()
-            || self.erase_shift_drag.is_some()
             || self.erase_drag.is_some()
             || !self.erase_lasso_points.is_empty();
         if space_held && !drawing_in_progress {
@@ -1179,10 +1231,6 @@ impl App {
         if !space_held && self.fs_pan_drag_start.is_some() {
             self.fs_pan_drag_start = None;
         }
-
-        // 修飾キーは Ctrl で統一: [/] キーは Shift+ が論理キー {/} に化ける制約があり
-        // 回転系を Ctrl にしたため、パン・ツール時のフィット調整もすべて Ctrl に揃える。
-        let ctrl_held = ctx.input(|i| i.modifiers.ctrl);
 
         // ── ベクタオブジェクト編集パス (選択ツール時のみ) ───────────
         // 選択ツール中はドロー系の操作を行わず、クリック=選択/ハンドルドラッグ=編集
@@ -1242,8 +1290,6 @@ impl App {
             return;
         }
 
-        // マウスホイールによる筆/直線の太さ調整は handle_fs_wheel_and_click で処理済み。
-
         match self.erase_tool {
             EraseTool::Select => {
                 // Select は上で処理済み。到達しないはず。
@@ -1251,38 +1297,9 @@ impl App {
             EraseTool::Brush => {
                 if primary_down {
                     if let Some(pos) = pointer_pos {
-                        if ctrl_held {
-                            if let Some(img_pos) =
-                                self.screen_to_image_f32(pos, full_rect, zoom_pan)
-                            {
-                                // 右/下方向で拡大、左/上方向で縮小
-                                let base_radius = match self.erase_shift_drag {
-                                    Some(ShiftDragState::BrushSize { base_radius, .. }) => {
-                                        base_radius
-                                    }
-                                    _ => {
-                                        self.erase_shift_drag = Some(ShiftDragState::BrushSize {
-                                            origin: img_pos,
-                                            base_radius: self.erase_brush_radius,
-                                        });
-                                        self.erase_brush_radius
-                                    }
-                                };
-                                if let Some(ShiftDragState::BrushSize { origin, .. }) =
-                                    self.erase_shift_drag
-                                {
-                                    let delta = (img_pos.0 - origin.0) + (img_pos.1 - origin.1);
-                                    let max_r = self.erase_mask_size[0].max(self.erase_mask_size[1])
-                                        as f32
-                                        / 20.0;
-                                    self.erase_brush_radius =
-                                        (base_radius + delta).clamp(1.0, max_r);
-                                }
-                            }
-                        } else if let Some(img_pos) =
+                        if let Some(img_pos) =
                             self.screen_to_image_f32_unclamped(pos, full_rect, zoom_pan)
                         {
-                            self.erase_shift_drag = None;
                             if self.erase_last_paint_pos.is_none() {
                                 self.push_undo_snapshot();
                             }
@@ -1298,7 +1315,6 @@ impl App {
                     }
                 } else {
                     self.erase_last_paint_pos = None;
-                    self.erase_shift_drag = None;
                 }
             }
             EraseTool::Lasso => {
@@ -1336,7 +1352,6 @@ impl App {
                     primary_down,
                     primary_released,
                     pointer_pos,
-                    ctrl_held,
                     paint,
                     full_rect,
                     zoom_pan,
@@ -1348,7 +1363,6 @@ impl App {
                     primary_down,
                     primary_released,
                     pointer_pos,
-                    ctrl_held,
                     paint,
                     full_rect,
                     zoom_pan,
@@ -1453,13 +1467,11 @@ impl App {
     }
 
     /// 縦線/横線ツール共通の入力処理。is_vertical=true で縦線、false で横線。
-    /// Ctrl+ドラッグでは線の向きに沿った軸がパン、直交軸が回転になる。
     fn handle_line_tool_paint(
         &mut self,
         primary_down: bool,
         primary_released: bool,
         pointer_pos: Option<egui::Pos2>,
-        ctrl_held: bool,
         paint: bool,
         full_rect: egui::Rect,
         zoom_pan: Option<(f32, egui::Vec2)>,
@@ -1473,47 +1485,7 @@ impl App {
                         self.erase_line_start = Some(img_pos);
                         self.erase_line_tilt = 0.0;
                     }
-                    if ctrl_held {
-                        let (base_tilt, base_start, base_end) = match self.erase_shift_drag {
-                            Some(ShiftDragState::LineAdjust {
-                                base_tilt,
-                                base_start,
-                                base_end,
-                                ..
-                            }) => (base_tilt, base_start, base_end),
-                            _ => {
-                                let start = self.erase_line_start.unwrap_or(img_pos);
-                                let end = self.erase_line_end.unwrap_or(img_pos);
-                                self.erase_shift_drag = Some(ShiftDragState::LineAdjust {
-                                    origin: img_pos,
-                                    base_tilt: self.erase_line_tilt,
-                                    base_start: start,
-                                    base_end: end,
-                                });
-                                (self.erase_line_tilt, start, end)
-                            }
-                        };
-                        if let Some(ShiftDragState::LineAdjust { origin, .. }) =
-                            self.erase_shift_drag
-                        {
-                            let dx = img_pos.0 - origin.0;
-                            let dy = img_pos.1 - origin.1;
-                            // 縦線: 向きに沿う軸 (Y) に沿ったドラッグは幅を変えず、直交する X ドラッグでパン・Y ドラッグで回転
-                            // 横線: X/Y が入れ替わる
-                            let (pan_x, pan_y, tilt_delta) = if is_vertical {
-                                (dx, 0.0, dy)
-                            } else {
-                                (0.0, dy, dx)
-                            };
-                            self.erase_line_start =
-                                Some((base_start.0 + pan_x, base_start.1 + pan_y));
-                            self.erase_line_end = Some((base_end.0 + pan_x, base_end.1 + pan_y));
-                            self.erase_line_tilt = base_tilt + tilt_delta;
-                        }
-                    } else {
-                        self.erase_shift_drag = None;
-                        self.erase_line_end = Some(img_pos);
-                    }
+                    self.erase_line_end = Some(img_pos);
                 }
             }
         }
@@ -1555,7 +1527,6 @@ impl App {
             self.erase_line_start = None;
             self.erase_line_end = None;
             self.erase_line_tilt = 0.0;
-            self.erase_shift_drag = None;
         }
     }
 
@@ -2287,9 +2258,8 @@ impl App {
                         // 1 行が PANEL_W を超えて Frame::popup を広げる原因になる。
                         let help = "E/Esc:補完して終了 (選択中Esc:解除)\n\
                             Space+ドラッグ:一時パン\n\
-                            ホイール:筆/直線のサイズ\n\
+                            Ctrl+ホイール:ズーム\n\
                             矢印:シフト [/]:回転 (Ctrl:10倍)\n\
-                            Ctrl+ドラッグ:筆サイズ / 縦横線調整\n\
                             S:選択/ハンドル微調整\n\
                             Shift/Alt+ハンドル:拘束/中心固定\n\
                             Ctrl+Z:戻す  Del:選択削除";
@@ -2355,7 +2325,6 @@ impl App {
             self.erase_line_start = None;
             self.erase_line_end = None;
             self.erase_line_tilt = 0.0;
-            self.erase_shift_drag = None;
             self.erase_shape_drag_start = None;
             self.erase_shape_drag_end = None;
             if let Some(fs_idx) = self.fullscreen_idx {
@@ -2391,6 +2360,18 @@ impl App {
     /// 通常は `adjustment_cache > ai_upscale_cache > fs_cache`。透過元画像だけは
     /// 黒固定の作業ベースを守るため `adjustment_cache` を再利用せず、bg=0 の
     /// AI / raw を黒不透明化してから補正を掛け直す。
+    fn erase_working_size(&self, fs_idx: usize, raw_size: [usize; 2]) -> [usize; 2] {
+        let bg = self.erase_upscale_bg_mode(fs_idx);
+        if let Some(FsCacheEntry::Static { pixels, .. }) = self.ai_upscale_cache.get(&(fs_idx, bg))
+        {
+            return pixels.size;
+        }
+        if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&fs_idx) {
+            return pixels.size;
+        }
+        raw_size
+    }
+
     fn resolve_erase_input_pixels(&self, fs_idx: usize) -> Option<Arc<egui::ColorImage>> {
         self.resolve_erase_input_pixels_matching(fs_idx, None)
             .map(|(pixels, _)| pixels)
@@ -2404,10 +2385,14 @@ impl App {
         let size_ok =
             |pixels: &Arc<egui::ColorImage>| expected_size.map_or(true, |size| pixels.size == size);
         let force_black = self.fs_static_has_alpha(fs_idx);
+        let post_filter_active =
+            self.effective_params(fs_idx).post_filter != crate::adjustment::PostFilter::None;
+        let can_reuse_adjustment_cache =
+            !force_black && (!self.post_filter_bypassed || !post_filter_active);
         let mut already_adjusted = false;
         let mut source_name = "none";
 
-        let source = if !force_black {
+        let source = if can_reuse_adjustment_cache {
             match self.adjustment_cache.get(&fs_idx) {
                 Some(FsCacheEntry::Static { pixels, .. }) if size_ok(pixels) => {
                     already_adjusted = true;
@@ -2461,7 +2446,7 @@ impl App {
             Some((source, source_name))
         } else {
             Some((
-                self.apply_erase_adjustments_to_source(fs_idx, source),
+                self.apply_erase_adjustments_to_source(fs_idx, source, true),
                 source_name,
             ))
         }
@@ -2532,9 +2517,28 @@ impl App {
             return ApplyInpaintOutcome::NoMask;
         };
         let [w, h] = self.erase_mask_size;
+        // プレビュー済みの MI-GAN 結果があるなら、確定時に再推論せずそのまま
+        // 通常表示用 cache へ昇格する。マスク/入力変更時は clear_erase_preview()
+        // が走るため、ここに残っている cache は現在の編集状態に対応している。
+        let preview_result = self
+            .erase_preview_cache
+            .get(&fs_idx)
+            .filter(|entry| entry.pixels.size == [w, h])
+            .map(|entry| (Arc::clone(&entry.pixels), entry.texture.clone()));
         // ビットマップとベクタを別々に永続化することで、再編集時に両者を分離して読み直せる。
         let vectors_snapshot = self.erase_shapes.clone();
         self.save_mask_with_sidecar(fs_idx, &bitmap, &vectors_snapshot, w, h);
+        if let Some((pixels, texture)) = preview_result {
+            let key = self.current_erase_result_key(fs_idx);
+            self.erase_result_cache
+                .insert(key, crate::app::EraseResultCacheEntry { pixels, texture });
+            self.invalidate_compare_prepared_for_idx(fs_idx);
+            self.clear_conceal_caches(fs_idx);
+            crate::logger::log(format!(
+                "erase: promoted preview result to commit cache idx={fs_idx}"
+            ));
+            return ApplyInpaintOutcome::CompletedFromPreview;
+        }
         let Some(original) = self.resolve_erase_input_pixels(fs_idx) else {
             return ApplyInpaintOutcome::Deferred;
         };
@@ -2618,6 +2622,9 @@ impl App {
             }
             ApplyInpaintOutcome::Deferred => {
                 self.show_feedback_toast("[補完待機中…]".to_string());
+            }
+            ApplyInpaintOutcome::CompletedFromPreview => {
+                self.show_feedback_toast("[補完適用]".to_string());
             }
             ApplyInpaintOutcome::NoMask => {}
         }
