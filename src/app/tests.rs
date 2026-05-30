@@ -4879,6 +4879,28 @@ mod favorite_adjustment_defaults_tests {
         assert!(app.shortcuts_blocked_by_text_input());
     }
 
+    /// 削除確認ダイアログの文言は対象パスのドライブ種別・ゴミ箱設定で変わるため、
+    /// 新しい削除要求を出すたびにキャッシュを必ず破棄する。
+    #[test]
+    fn request_delete_confirm_resets_cached_label_for_new_targets() {
+        let mut app = setup_app();
+        app.show_delete_confirm = true;
+        app.delete_targets = vec![(0, PathBuf::from("C:/pics/old.jpg"))];
+        app.delete_confirm_label = Some("old label".to_owned());
+
+        app.request_delete_confirm(vec![(1, PathBuf::from("J:/pics/new.jpg"))]);
+
+        assert!(app.show_delete_confirm);
+        assert_eq!(
+            app.delete_targets,
+            vec![(1, PathBuf::from("J:/pics/new.jpg"))]
+        );
+        assert!(
+            app.delete_confirm_label.is_none(),
+            "new delete targets must force the warning label to be recomputed"
+        );
+    }
+
     /// `poll_delete_pending` が削除完了時に `current_folder_signature` を None に
     /// 倒すことを検証 (= 後続の外部 mtime 変化で誤 reload しない)。
     ///

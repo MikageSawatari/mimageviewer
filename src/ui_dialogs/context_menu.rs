@@ -335,8 +335,7 @@ impl crate::app::App {
                         .clicked()
                     {
                         let targets: Vec<(usize, PathBuf)> = self.collect_checked_indexed_paths();
-                        self.delete_targets = targets;
-                        self.show_delete_confirm = true;
+                        self.request_delete_confirm(targets);
                         close = true;
                     }
 
@@ -411,8 +410,7 @@ impl crate::app::App {
                             });
                             ui.separator();
                             if ui.button("削除 (ゴミ箱)").clicked() {
-                                self.delete_targets = vec![(idx, p.clone())];
-                                self.show_delete_confirm = true;
+                                self.request_delete_confirm(vec![(idx, p.clone())]);
                                 close = true;
                             }
                             ui.separator();
@@ -497,8 +495,7 @@ impl crate::app::App {
                             let _ = self.render_open_with_menu(ui, p, &mut close);
                             ui.separator();
                             if ui.button("削除 (ゴミ箱)").clicked() {
-                                self.delete_targets = vec![(idx, p.clone())];
-                                self.show_delete_confirm = true;
+                                self.request_delete_confirm(vec![(idx, p.clone())]);
                                 close = true;
                             }
                             ui.separator();
@@ -590,8 +587,7 @@ impl crate::app::App {
                             }
                             ui.separator();
                             if ui.button("削除 (ゴミ箱)").clicked() {
-                                self.delete_targets = vec![(idx, path.clone())];
-                                self.show_delete_confirm = true;
+                                self.request_delete_confirm(vec![(idx, path.clone())]);
                                 close = true;
                             }
                             ui.separator();
@@ -953,6 +949,12 @@ impl crate::app::App {
         targets
     }
 
+    pub(crate) fn request_delete_confirm(&mut self, targets: Vec<(usize, PathBuf)>) {
+        self.delete_targets = targets;
+        self.delete_confirm_label = None;
+        self.show_delete_confirm = true;
+    }
+
     /// 削除確認ダイアログを表示する。
     pub(crate) fn show_delete_confirm_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_delete_confirm {
@@ -1075,8 +1077,7 @@ impl crate::app::App {
         if !self.checked.is_empty() {
             // チェック済みがある → まとめて削除
             let targets = self.collect_checked_indexed_paths();
-            self.delete_targets = targets;
-            self.show_delete_confirm = true;
+            self.request_delete_confirm(targets);
         } else if let Some(idx) = self.selected {
             // 単一選択
             let Some(path) = self
@@ -1087,8 +1088,7 @@ impl crate::app::App {
             else {
                 return;
             };
-            self.delete_targets = vec![(idx, path)];
-            self.show_delete_confirm = true;
+            self.request_delete_confirm(vec![(idx, path)]);
         }
     }
 }
