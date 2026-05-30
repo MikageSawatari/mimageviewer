@@ -8561,6 +8561,7 @@ impl App {
             ),
             basename: crate::capture::basename_from_text(&format!("{}_edited", target.basename)),
             output_dir_text: output_dir.display().to_string(),
+            source_dir: target.source_dir,
             include_metadata: original_include_metadata,
             selection,
             has_conceal_mask,
@@ -8729,13 +8730,22 @@ impl App {
                 ui.add_space(6.0);
                 ui.label("保存先");
                 ui.horizontal(|ui| {
+                    let buttons_width = 144.0;
+                    let edit_width = (ui.available_width() - buttons_width).max(180.0);
                     ui.add(
                         egui::TextEdit::singleline(&mut state.output_dir_text)
-                            .desired_width(350.0)
+                            .desired_width(edit_width)
                             .hint_text("保存先フォルダ"),
                     );
                     if ui.button("変更...").clicked() {
                         pick_folder = true;
+                    }
+                    if ui
+                        .button("元の場所")
+                        .on_hover_text("元ファイルのあるフォルダを保存先にします")
+                        .clicked()
+                    {
+                        state.reset_output_dir_to_source_dir();
                     }
                 });
                 ui.add_space(6.0);

@@ -135,6 +135,7 @@ pub struct ExportDialogState {
     pub output_format: ExportFormat,
     pub basename: String,
     pub output_dir_text: String,
+    pub source_dir: PathBuf,
     pub include_metadata: bool,
     pub selection: [bool; 5],
     pub has_conceal_mask: bool,
@@ -155,6 +156,12 @@ pub struct ExportDialogState {
     /// (Codex review CONFIRMED)。
     pub initial_focus_done: bool,
     pub error: Option<String>,
+}
+
+impl ExportDialogState {
+    pub fn reset_output_dir_to_source_dir(&mut self) {
+        self.output_dir_text = self.source_dir.display().to_string();
+    }
 }
 
 #[derive(Clone, Debug)]

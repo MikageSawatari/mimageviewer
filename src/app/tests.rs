@@ -3234,6 +3234,89 @@ mod favorite_adjustment_defaults_tests {
         }
     }
 
+    /// Ctrl+E の「元の場所」は、前回保存先を既定表示している場合でも
+    /// 元ファイル / 元 PDF のあるフォルダへ戻せる。
+    #[test]
+    fn export_dialog_can_reset_output_dir_to_source_dir() {
+        use crate::grid_item::GridItem;
+        let ctx = egui::Context::default();
+        let temp = tempfile::tempdir().unwrap();
+        let source_dir = temp.path().join("source");
+        let last_dir = temp.path().join("last");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        std::fs::create_dir_all(&last_dir).unwrap();
+
+        let mut app = setup_app();
+        let image_path = source_dir.join("a.jpg");
+        app.items.push(GridItem::Image(image_path));
+        app.visible_indices = vec![0];
+        app.thumbnails.push(ThumbnailState::Pending);
+        let pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                tex: ctx.load_texture(
+                    "export_source_dir_reset",
+                    pixels.clone(),
+                    egui::TextureOptions::LINEAR,
+                ),
+                pixels: std::sync::Arc::new(pixels),
+                source_dims: None,
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        app.settings.export_last_directory = Some(last_dir.clone());
+
+        app.open_export_dialog_for_current(&ctx, 0);
+
+        let mut state = app.export_dialog.take().expect("export dialog should open");
+        assert_eq!(state.output_dir_text, last_dir.display().to_string());
+        state.reset_output_dir_to_source_dir();
+        assert_eq!(state.output_dir_text, source_dir.display().to_string());
+    }
+
+    /// PDF ページでは「元の場所」が PDF ファイルのあるディレクトリを指す。
+    #[test]
+    fn export_dialog_source_dir_for_pdf_page_is_pdf_parent() {
+        use crate::grid_item::GridItem;
+        let ctx = egui::Context::default();
+        let temp = tempfile::tempdir().unwrap();
+        let pdf_dir = temp.path().join("pdfs");
+        std::fs::create_dir_all(&pdf_dir).unwrap();
+
+        let mut app = setup_app();
+        app.items.push(GridItem::PdfPage {
+            pdf_path: pdf_dir.join("book.pdf"),
+            page_num: 3,
+            content_type: None,
+        });
+        app.visible_indices = vec![0];
+        app.thumbnails.push(ThumbnailState::Pending);
+        let pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                tex: ctx.load_texture(
+                    "export_pdf_source_dir",
+                    pixels.clone(),
+                    egui::TextureOptions::LINEAR,
+                ),
+                pixels: std::sync::Arc::new(pixels),
+                source_dims: None,
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+
+        app.open_export_dialog_for_current(&ctx, 0);
+
+        let mut state = app.export_dialog.take().expect("export dialog should open");
+        state.output_dir_text = temp.path().join("other").display().to_string();
+        state.reset_output_dir_to_source_dir();
+        assert_eq!(state.output_dir_text, pdf_dir.display().to_string());
+    }
+
     /// P3-8 後続: 透明画像を消しゴム作業ベースにする時、黒で不透明化されること。
     /// MI-GAN は alpha 非対応なので、透明部は黒・半透明は黒へ減衰・全面 alpha=255。
     /// 全不透明画像は変換不要 (None)。
