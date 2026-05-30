@@ -2277,10 +2277,239 @@ mod favorite_adjustment_defaults_tests {
         app.items.len() - 1
     }
 
+    fn mask_2x2() -> Vec<bool> {
+        vec![true, false, false, true]
+    }
+
+    fn toast_text(app: &App) -> &str {
+        app.fs_feedback_toast
+            .as_ref()
+            .map(|(text, _, _)| text.as_str())
+            .unwrap_or("")
+    }
+
+    fn insert_stale_conceal_cache(app: &mut App, ctx: &egui::Context, idx: usize, label: &str) {
+        let image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(1, 2, 3)]);
+        let pixels = std::sync::Arc::new(image.clone());
+        let texture = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
+        app.conceal_cache.insert(
+            idx,
+            ConcealCacheEntry {
+                pixels,
+                texture,
+                generation: app.conceal_generation,
+            },
+        );
+    }
+
+    fn insert_stale_erase_result_cache(
+        app: &mut App,
+        ctx: &egui::Context,
+        idx: usize,
+        label: &str,
+    ) {
+        let image = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(4, 5, 6)]);
+        let pixels = std::sync::Arc::new(image.clone());
+        let texture = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
+        app.erase_result_cache.insert(
+            EraseResultKey {
+                idx,
+                input_gen: 0,
+                mask_gen: 0,
+            },
+            EraseResultCacheEntry { pixels, texture },
+        );
+    }
+
     fn params_with_brightness(v: f32) -> AdjustParams {
         let mut p = AdjustParams::default();
         p.brightness = v;
         p
+    }
+
+    #[test]
+    fn apply_conceal_slot_to_selection_saves_pages_and_clears_caches() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx_a = push_image(&mut app, "C:/pics/a.jpg");
+        let idx_b = push_image(&mut app, "C:/pics/b.jpg");
+        app.visible_indices = vec![idx_a, idx_b];
+        app.checked.insert(idx_a);
+        app.checked.insert(idx_b);
+        let mask = mask_2x2();
+        app.conceal_db
+            .as_ref()
+            .unwrap()
+            .set_slot(1, &mask, &[], 2, 2)
+            .unwrap();
+        insert_stale_conceal_cache(&mut app, &ctx, idx_a, "bulk_conceal_stale_a");
+        insert_stale_conceal_cache(&mut app, &ctx, idx_b, "bulk_conceal_stale_b");
+        app.conceal_base_cache.insert(
+            idx_a,
+            std::sync::Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK])),
+        );
+
+        app.apply_conceal_slot_to_selection(1);
+
+        for idx in [idx_a, idx_b] {
+            assert!(
+                app.conceal_pages.contains(&idx),
+                "conceal badge set should include applied page {idx}"
+            );
+            assert!(
+                !app.conceal_cache.contains_key(&idx),
+                "stale conceal render cache must be invalidated for page {idx}"
+            );
+            let key = app.page_path_key(idx).unwrap();
+            let (saved_mask, saved_shapes) = app
+                .conceal_db
+                .as_ref()
+                .unwrap()
+                .get_full(&key, 2, 2)
+                .expect("conceal slot should be saved to page db");
+            assert_eq!(saved_mask, mask);
+            assert!(saved_shapes.is_empty());
+        }
+        assert!(!app.conceal_base_cache.contains_key(&idx_a));
+        assert!(app.checked.is_empty());
+        assert_eq!(toast_text(&app), "[隠蔽スロット1を2枚に適用]");
+    }
+
+    #[test]
+    fn apply_conceal_slot_in_viewing_mode_saves_current_page() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/current.jpg");
+        app.fullscreen_idx = Some(idx);
+        let mask = mask_2x2();
+        app.conceal_db
+            .as_ref()
+            .unwrap()
+            .set_slot(2, &mask, &[], 2, 2)
+            .unwrap();
+        insert_stale_conceal_cache(&mut app, &ctx, idx, "view_conceal_stale");
+        app.conceal_base_cache.insert(
+            idx,
+            std::sync::Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE])),
+        );
+
+        app.apply_conceal_slot_in_viewing_mode(2);
+
+        assert!(app.conceal_pages.contains(&idx));
+        assert!(!app.conceal_cache.contains_key(&idx));
+        assert!(!app.conceal_base_cache.contains_key(&idx));
+        let key = app.page_path_key(idx).unwrap();
+        let (saved_mask, saved_shapes) = app
+            .conceal_db
+            .as_ref()
+            .unwrap()
+            .get_full(&key, 2, 2)
+            .expect("conceal slot should be saved to current page");
+        assert_eq!(saved_mask, mask);
+        assert!(saved_shapes.is_empty());
+        assert_eq!(toast_text(&app), "[隠蔽スロット2適用]");
+    }
+
+    #[test]
+    fn delete_mask_shortcuts_remove_existing_masks_and_clear_caches() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx_a = push_image(&mut app, "C:/pics/a.jpg");
+        let idx_b = push_image(&mut app, "C:/pics/b.jpg");
+        app.visible_indices = vec![idx_a, idx_b];
+        let mask = mask_2x2();
+        app.save_mask_with_sidecar(idx_a, &mask, &[], 2, 2);
+        app.save_conceal_with_sidecar(idx_b, &mask, &[], 2, 2);
+        let erase_key = app.page_path_key(idx_a).unwrap();
+        let conceal_key = app.page_path_key(idx_b).unwrap();
+        app.checked.insert(idx_a);
+        app.checked.insert(idx_b);
+        insert_stale_erase_result_cache(&mut app, &ctx, idx_a, "erase_result_stale");
+        insert_stale_conceal_cache(&mut app, &ctx, idx_a, "erase_conceal_stale");
+        app.erase_base_cache.insert(
+            idx_a,
+            std::sync::Arc::new(egui::ColorImage::new(
+                [1, 1],
+                vec![egui::Color32::LIGHT_BLUE],
+            )),
+        );
+        app.erase_base_tex_cache.insert(
+            idx_a,
+            ctx.load_texture(
+                "erase_base_tex_stale",
+                egui::ColorImage::new([1, 1], vec![egui::Color32::LIGHT_BLUE]),
+                egui::TextureOptions::LINEAR,
+            ),
+        );
+
+        app.delete_erase_masks_from_selection();
+
+        assert!(!app.mask_pages.contains(&idx_a));
+        assert!(app.conceal_pages.contains(&idx_b));
+        assert!(app.erase_result_cache.is_empty());
+        assert!(!app.erase_base_cache.contains_key(&idx_a));
+        assert!(!app.erase_base_tex_cache.contains_key(&idx_a));
+        assert!(!app.conceal_cache.contains_key(&idx_a));
+        assert!(
+            app.mask_db
+                .as_ref()
+                .unwrap()
+                .get_full(&erase_key, 2, 2)
+                .is_none()
+        );
+        assert_eq!(toast_text(&app), "[消しゴムマスクを1枚から削除]");
+        assert!(app.checked.is_empty());
+
+        app.checked.insert(idx_a);
+        app.checked.insert(idx_b);
+        insert_stale_conceal_cache(&mut app, &ctx, idx_b, "conceal_delete_stale");
+        app.conceal_base_cache.insert(
+            idx_b,
+            std::sync::Arc::new(egui::ColorImage::new(
+                [1, 1],
+                vec![egui::Color32::LIGHT_GREEN],
+            )),
+        );
+
+        app.delete_conceal_masks_from_selection();
+
+        assert!(!app.conceal_pages.contains(&idx_b));
+        assert!(!app.conceal_cache.contains_key(&idx_b));
+        assert!(!app.conceal_base_cache.contains_key(&idx_b));
+        assert!(
+            app.conceal_db
+                .as_ref()
+                .unwrap()
+                .get_full(&conceal_key, 2, 2)
+                .is_none()
+        );
+        assert_eq!(toast_text(&app), "[隠蔽マスクを1枚から削除]");
+        assert!(app.checked.is_empty());
+    }
+
+    #[test]
+    fn empty_mask_slots_are_noop_with_specific_toasts() {
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        app.visible_indices = vec![idx];
+        app.selected = Some(idx);
+        insert_stale_conceal_cache(&mut app, &ctx, idx, "empty_slot_stale");
+
+        app.apply_conceal_slot_to_selection(1);
+
+        assert!(!app.conceal_pages.contains(&idx));
+        assert!(
+            app.conceal_cache.contains_key(&idx),
+            "empty slot no-op should not invalidate unrelated conceal cache"
+        );
+        assert_eq!(toast_text(&app), "[隠蔽スロット1は空です]");
+
+        app.fs_feedback_toast = None;
+        app.apply_slot_to_selection(1);
+
+        assert!(!app.mask_pages.contains(&idx));
+        assert_eq!(toast_text(&app), "[消しゴムスロット1は空です]");
     }
 
     /// effective_params は「個別 → お気に入り → global」の順で解決する。
