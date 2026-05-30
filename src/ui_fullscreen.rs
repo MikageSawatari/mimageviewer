@@ -2875,6 +2875,24 @@ impl App {
         }
     }
 
+    /// 現在画面に出ている見開きレイアウトを優先してペアを返す。
+    ///
+    /// Ctrl+S / Ctrl+E は「表示中のものを保存する」操作なので、直近の描画で確定した
+    /// `fs_spread_layout` が現在 idx を含む場合はそちらを正とする。レイアウトが無い
+    /// フレームでは通常のペアリング規則へフォールバックする。
+    pub(crate) fn resolve_visible_spread_pair(&mut self, idx: usize) -> SpreadPair {
+        if self.spread_mode.is_spread()
+            && let Some(layout) = self.fs_spread_layout
+            && (layout.left_idx == idx || layout.right_idx == idx)
+        {
+            return SpreadPair::Double {
+                left: layout.left_idx,
+                right: layout.right_idx,
+            };
+        }
+        self.resolve_spread_pair(idx)
+    }
+
     /// 見開きモードでの nav_delta を計算する。
     /// 見開き表示中は2ページ送り、Single表示中は1ページ送り。
     /// Shift が押されている場合は常に1ページ送り。
@@ -8375,7 +8393,7 @@ impl App {
         &mut self,
         idx: usize,
     ) -> Result<crate::capture::CapturePixelWork, String> {
-        match self.resolve_spread_pair(idx) {
+        match self.resolve_visible_spread_pair(idx) {
             SpreadPair::Single => self
                 .prepare_capture_pixel_job(idx)
                 .map(crate::capture::CapturePixelWork::Single),
@@ -8560,7 +8578,7 @@ impl App {
         ctx: &egui::Context,
         fs_idx: usize,
     ) -> Result<ExportDialogTarget, String> {
-        match self.resolve_spread_pair(fs_idx) {
+        match self.resolve_visible_spread_pair(fs_idx) {
             SpreadPair::Single => self.prepare_single_export_dialog_target(ctx, fs_idx),
             SpreadPair::Double { left, right } => {
                 self.prepare_spread_export_dialog_target(ctx, left, right)

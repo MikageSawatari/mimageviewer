@@ -3135,9 +3135,101 @@ mod favorite_adjustment_defaults_tests {
             crate::export_dialog::ExportPixels::Spread { left, right } => {
                 assert_eq!(left.base_pixels.size, [1, 2]);
                 assert_eq!(right.base_pixels.size, [1, 2]);
+                assert_eq!(left.base_pixels.pixels[0], egui::Color32::RED);
+                assert_eq!(right.base_pixels.pixels[0], egui::Color32::BLUE);
             }
             crate::export_dialog::ExportPixels::Single(_) => {
                 panic!("spread export should snapshot both pages")
+            }
+        }
+
+        app.open_export_dialog_for_current(&ctx, 1);
+
+        let state = app
+            .export_dialog
+            .take()
+            .expect("export dialog should also open from right page");
+        assert!(matches!(
+            state.source,
+            crate::export_dialog::ExportSource::RenderedSpread
+        ));
+        match state.pixels {
+            crate::export_dialog::ExportPixels::Spread { left, right } => {
+                assert_eq!(left.base_pixels.pixels[0], egui::Color32::RED);
+                assert_eq!(right.base_pixels.pixels[0], egui::Color32::BLUE);
+            }
+            crate::export_dialog::ExportPixels::Single(_) => {
+                panic!("right-page entry should still snapshot the visible spread")
+            }
+        }
+    }
+
+    /// Ctrl+E / Ctrl+S は、再計算したペアではなく直近に描画された見開きレイアウトを
+    /// 優先する。これで「画面は見開きなのに保存対象は片側ページ」のずれを防ぐ。
+    #[test]
+    fn open_export_dialog_prefers_visible_spread_layout() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
+        app.visible_indices = vec![1];
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        let left_pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::RED]);
+        let right_pixels = egui::ColorImage::new([1, 1], vec![egui::Color32::BLUE]);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                tex: ctx.load_texture(
+                    "export_visible_spread_left",
+                    left_pixels.clone(),
+                    egui::TextureOptions::LINEAR,
+                ),
+                pixels: std::sync::Arc::new(left_pixels),
+                source_dims: None,
+                load_seq: 0,
+            },
+        );
+        app.fs_cache.insert(
+            1,
+            FsCacheEntry::Static {
+                tex: ctx.load_texture(
+                    "export_visible_spread_right",
+                    right_pixels.clone(),
+                    egui::TextureOptions::LINEAR,
+                ),
+                pixels: std::sync::Arc::new(right_pixels),
+                source_dims: None,
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(1);
+        app.spread_mode = SpreadMode::Ltr;
+        app.fs_spread_layout = Some(crate::ui_fullscreen::FsSpreadLayout {
+            left_idx: 0,
+            left_rect: egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(10.0, 10.0)),
+            right_idx: 1,
+            right_rect: egui::Rect::from_min_size(egui::pos2(10.0, 0.0), egui::vec2(10.0, 10.0)),
+        });
+
+        app.open_export_dialog_for_current(&ctx, 1);
+
+        let state = app.export_dialog.take().expect("export dialog should open");
+        assert!(matches!(
+            state.source,
+            crate::export_dialog::ExportSource::RenderedSpread
+        ));
+        match state.pixels {
+            crate::export_dialog::ExportPixels::Spread { left, right } => {
+                assert_eq!(left.base_pixels.pixels[0], egui::Color32::RED);
+                assert_eq!(right.base_pixels.pixels[0], egui::Color32::BLUE);
+            }
+            crate::export_dialog::ExportPixels::Single(_) => {
+                panic!("visible spread layout should snapshot both pages")
             }
         }
     }
