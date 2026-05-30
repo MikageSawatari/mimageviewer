@@ -6671,6 +6671,12 @@ impl App {
             let right_original_tex = original_preview_active
                 .then(|| self.resolve_original_preview_tex(right_idx))
                 .flatten();
+            let left_erase_tex = (!original_preview_active)
+                .then(|| self.ensure_erase_result_texture(ctx, left_idx))
+                .flatten();
+            let right_erase_tex = (!original_preview_active)
+                .then(|| self.ensure_erase_result_texture(ctx, right_idx))
+                .flatten();
             for (rect, idx, rot, location, original_tex) in [
                 (
                     left_rect,
@@ -6687,6 +6693,11 @@ impl App {
                     right_original_tex.as_ref(),
                 ),
             ] {
+                let erase_tex = if idx == left_idx {
+                    left_erase_tex.as_ref()
+                } else {
+                    right_erase_tex.as_ref()
+                };
                 Self::draw_fs_spread_page(
                     &painter,
                     rect,
@@ -6699,6 +6710,7 @@ impl App {
                     location,
                     holdover_for_locked.as_ref(),
                     original_tex,
+                    erase_tex,
                 );
             }
 
@@ -6741,6 +6753,12 @@ impl App {
             let right_original_tex = original_preview_active
                 .then(|| self.resolve_original_preview_tex(right_idx))
                 .flatten();
+            let left_erase_tex = (!original_preview_active)
+                .then(|| self.ensure_erase_result_texture(ctx, left_idx))
+                .flatten();
+            let right_erase_tex = (!original_preview_active)
+                .then(|| self.ensure_erase_result_texture(ctx, right_idx))
+                .flatten();
             for (rect, idx, rot, location, original_tex) in [
                 (
                     left_rect,
@@ -6757,6 +6775,11 @@ impl App {
                     right_original_tex.as_ref(),
                 ),
             ] {
+                let erase_tex = if idx == left_idx {
+                    left_erase_tex.as_ref()
+                } else {
+                    right_erase_tex.as_ref()
+                };
                 Self::draw_fs_spread_page(
                     &painter,
                     rect,
@@ -6769,6 +6792,7 @@ impl App {
                     location,
                     holdover_for_locked.as_ref(),
                     original_tex,
+                    erase_tex,
                 );
             }
             // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
@@ -6811,7 +6835,8 @@ impl App {
     /// 見開きモードの1ページ分を指定領域に描画。
     /// `painter` は呼び出し側でクリップ済みのものを渡すことで、ズーム時のはみ出しを防ぐ。
     /// `location_display` は draw_fs_image と同じで、空なら読込中ラベル描画をスキップ。
-    /// テクスチャ優先順位は adjustment_cache → fs_cache → thumbnail → holdover。
+    /// テクスチャ優先順位は original preview → erase result → adjustment_cache → fs_cache
+    /// → thumbnail → holdover。
     #[allow(clippy::too_many_arguments)]
     fn draw_fs_spread_page(
         painter: &egui::Painter,
@@ -6825,9 +6850,13 @@ impl App {
         location_display: &str,
         holdover_tex: Option<&egui::TextureHandle>,
         original_tex: Option<&egui::TextureHandle>,
+        erase_result_tex: Option<&egui::TextureHandle>,
     ) {
-        // テクスチャ取得（補正済 or フルサイズ or サムネイル → ロック中なら最後に holdover）
+        // テクスチャ取得（元画像プレビュー or 消しゴム確定済 or 補正済 or フルサイズ
+        // or サムネイル → ロック中なら最後に holdover）
         let tex = if let Some(tex) = original_tex {
+            Some(tex.clone())
+        } else if let Some(tex) = erase_result_tex {
             Some(tex.clone())
         } else {
             match adjustment_cache.get(&idx) {
@@ -8456,6 +8485,16 @@ impl App {
         let basename = self
             .capture_basename_for_idx(idx)
             .ok_or_else(|| "このアイテムはキャプチャ保存できません".to_string())?;
+
+        if let Some(pixels) = self.current_erase_result_pixels(idx) {
+            return Ok(crate::capture::CapturePixelJob::already_adjusted(
+                basename,
+                pixels.clone(),
+            ));
+        }
+        if self.mask_pages.contains(&idx) {
+            return Err("消しゴム補完の完了後に再実行してください".to_string());
+        }
 
         if !self.post_filter_bypassed
             && let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx)
