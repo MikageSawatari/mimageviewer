@@ -12952,8 +12952,8 @@ impl App {
     /// マウスホイールイベントを消費し、行単位でスナップしたオフセットに変換する。
     /// Ctrl+ホイールの場合はグリッド列数を変更する。
     fn process_scroll(&mut self, ctx: &egui::Context) {
-        // ダイアログやフルスクリーン表示中はスクロールを消費しない
-        // (ダイアログ内の ScrollArea が正しく動くようにする)。
+        // ダイアログ / popup / フルスクリーン表示中はスクロールを消費しない
+        // (ダイアログや ComboBox popup 内の ScrollArea が正しく動くようにする)。
         // PDF/ZIP enumerate の deferred reopen 待ち中 (= `fs_nav_after_pdf_enumerate`
         // が立っている) も「フルスクリーン継続中」と同じ扱いにする: 静止画 in-window
         // モードでは holdover が main ctx を覆っているのに、その背後で grid が
@@ -12961,6 +12961,7 @@ impl App {
         if self.fullscreen_idx.is_some()
             || self.fs_nav_after_pdf_enumerate.is_some()
             || self.any_dialog_open()
+            || ctx.is_popup_open()
         {
             return;
         }

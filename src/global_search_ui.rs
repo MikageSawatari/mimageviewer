@@ -2016,6 +2016,8 @@ impl App {
         let mut sort_changed = false;
         let mut toggle_changed = false;
 
+        let combo_popup_height = (ctx.content_rect().height() - 96.0).clamp(240.0, 520.0);
+        let status_width = 300.0;
         let mut drill_back = false;
         egui::TopBottomPanel::top("global_search_bar").show(ctx, |ui| {
             ui.add_space(2.0);
@@ -2037,7 +2039,7 @@ impl App {
                     );
                 });
             }
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label("アイテム検索:").on_hover_text(
                     "Ctrl+G はお気に入りの「アイテム索引」を使い、画像 / PDF / 動画を\n\
                      ファイル名・タグ・EXIF・AI プロンプト等で横断検索します。\n\
@@ -2096,46 +2098,6 @@ impl App {
                     close_requested = true;
                 }
 
-                // 進捗/結果バッジ。ドロップダウン群より前に置くことで、幅が狭い
-                // ウィンドウでも検索中状態が右端へ押し出されにくくなる。
-                let status = if let Some(msg) = &self.global_search.reject_message {
-                    Some((msg.clone(), egui::Color32::from_rgb(200, 120, 40), None))
-                } else if self.global_search.is_searching() {
-                    Some((
-                        format!("ヒット {} 件（検索中）", self.global_search.total_valid),
-                        egui::Color32::from_rgb(180, 180, 80),
-                        Some(format!(
-                            "候補 {} 件を確認済み。アドレス欄の件数はヒットを含むコンテナ数です。",
-                            self.global_search.total_scanned
-                        )),
-                    ))
-                } else if self.global_search.done {
-                    let (text, color) = if self.global_search.truncated {
-                        (
-                            format!(
-                                "ヒット {} 件で打ち切り (絞り込みキーワードを追加してください)",
-                                self.global_search.total_valid
-                            ),
-                            egui::Color32::from_rgb(200, 140, 40),
-                        )
-                    } else {
-                        (
-                            format!("ヒット {} 件", self.global_search.total_valid),
-                            egui::Color32::from_gray(140),
-                        )
-                    };
-                    Some((text, color, None))
-                } else {
-                    None
-                };
-                if let Some((text, color, hover)) = status {
-                    ui.separator();
-                    let response = ui.label(egui::RichText::new(text).size(11.0).color(color));
-                    if let Some(hover) = hover {
-                        response.on_hover_text(hover);
-                    }
-                }
-
                 // ── 絞り込みドロップダウン (§19.7) ──
                 // お気に入り (auto_index_metadata=true のもののみ候補にする)
                 {
@@ -2154,6 +2116,7 @@ impl App {
                     egui::ComboBox::from_id_salt("global_search_fav")
                         .selected_text(label_for(current))
                         .width(160.0)
+                        .height(combo_popup_height)
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut next, None, "すべてのお気に入り");
                             for fav in &self.settings.favorites {
@@ -2182,6 +2145,7 @@ impl App {
                     egui::ComboBox::from_id_salt("global_search_kind")
                         .selected_text(label_for(current))
                         .width(140.0)
+                        .height(combo_popup_height)
                         .show_ui(ui, |ui| {
                             for &choice in KIND_CHOICES {
                                 ui.selectable_value(&mut next, choice, label_for(choice));
@@ -2200,6 +2164,7 @@ impl App {
                     egui::ComboBox::from_id_salt("global_search_target")
                         .selected_text(current.label())
                         .width(160.0)
+                        .height(combo_popup_height)
                         .show_ui(ui, |ui| {
                             for &choice in TARGET_CHOICES {
                                 ui.selectable_value(&mut next, choice, choice.label());
@@ -2236,36 +2201,87 @@ impl App {
                     }
                 }
 
-                // ── ソート切替 (集約ビューのみ) ──
-                // 件数バッジの右側で「ソート: <現在のモード>」のドロップダウンを出す。
-                // 一覧 / DrilledInto 中は集約のソートが影響しないので隠す。
-                if self.global_search.drill.is_none()
-                    && self.global_search.aggregate
-                    && !self.global_search.containers.is_empty()
-                {
+                // ── ソート切替 ──
+                // 一覧 → 集約の自動切替で行の幅が変わらないよう、トップレベルでは
+                // 常に場所を確保し、集約ビューで使えるときだけ有効化する。
+                if self.global_search.drill.is_none() {
                     ui.separator();
                     ui.label(egui::RichText::new("ソート:").size(11.0).weak());
                     let current = self.global_search.sort_mode;
                     let mut next = current;
-                    egui::ComboBox::from_id_salt("global_search_sort")
-                        .selected_text(current.label())
-                        .width(90.0)
-                        .show_ui(ui, |ui| {
-                            for &mode in SORT_MODES {
-                                ui.selectable_value(&mut next, mode, mode.label());
-                            }
+                    let sort_enabled =
+                        self.global_search.aggregate && !self.global_search.containers.is_empty();
+                    let sort_response = ui
+                        .add_enabled_ui(sort_enabled, |ui| {
+                            egui::ComboBox::from_id_salt("global_search_sort")
+                                .selected_text(current.label())
+                                .width(90.0)
+                                .height(combo_popup_height)
+                                .show_ui(ui, |ui| {
+                                    for &mode in SORT_MODES {
+                                        ui.selectable_value(&mut next, mode, mode.label());
+                                    }
+                                })
+                                .response
                         })
-                        .response
-                        .on_hover_text(
-                            "新しい/古い: コンテナの更新日時順 (初回選択時に\n\
-                             fs::metadata を一括取得するので HDD では一瞬固まります)",
-                        );
-                    if next != current {
+                        .inner;
+                    sort_response.on_hover_text(
+                        "新しい/古い: コンテナの更新日時順 (初回選択時に\n\
+                         fs::metadata を一括取得するので HDD では一瞬固まります)",
+                    );
+                    if sort_enabled && next != current {
                         self.global_search.sort_mode = next;
                         // アグリゲート view を即時再ソート (mtime 未取得なら
                         // build_aggregated_items 側で populate される)
                         sort_changed = true;
                     }
+                }
+
+                // 進捗/結果バッジ。可変幅の文言でフィルタ/集約/ソート操作の位置が
+                // 揺れないよう、操作群の一番右側に置く。
+                let status = if let Some(msg) = &self.global_search.reject_message {
+                    Some((msg.clone(), egui::Color32::from_rgb(200, 120, 40), None))
+                } else if self.global_search.is_searching() {
+                    Some((
+                        format!("ヒット {} 件（検索中）", self.global_search.total_valid),
+                        egui::Color32::from_rgb(180, 180, 80),
+                        Some(format!(
+                            "候補 {} 件を確認済み。アドレス欄の件数はヒットを含むコンテナ数です。",
+                            self.global_search.total_scanned
+                        )),
+                    ))
+                } else if self.global_search.done {
+                    let (text, color, hover) = if self.global_search.truncated {
+                        let text =
+                            format!("ヒット {} 件で打ち切り", self.global_search.total_valid);
+                        let hover = format!(
+                            "ヒット {} 件で打ち切りました。絞り込みキーワードを追加してください。",
+                            self.global_search.total_valid
+                        );
+                        (text, egui::Color32::from_rgb(200, 140, 40), Some(hover))
+                    } else {
+                        (
+                            format!("ヒット {} 件", self.global_search.total_valid),
+                            egui::Color32::from_gray(140),
+                            None,
+                        )
+                    };
+                    Some((text, color, hover))
+                } else {
+                    None
+                };
+                ui.separator();
+                if let Some((text, color, hover)) = status {
+                    let response = ui.add_sized(
+                        [status_width, ui.spacing().interact_size.y],
+                        egui::Label::new(egui::RichText::new(text).size(11.0).color(color))
+                            .truncate(),
+                    );
+                    if let Some(hover) = hover {
+                        response.on_hover_text(hover);
+                    }
+                } else {
+                    ui.allocate_space(egui::vec2(status_width, ui.spacing().interact_size.y));
                 }
             });
             ui.add_space(2.0);
