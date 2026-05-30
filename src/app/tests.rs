@@ -1781,6 +1781,104 @@ mod phase_c_drill_nav_tests {
         );
     }
 
+    /// Ctrl+G streaming rebuild は Loaded サムネイルを content-key で使い回すため、
+    /// 補正再生成用の `thumb_pixels` も同じ key で移す必要がある。
+    #[test]
+    fn streaming_rebuild_preserves_thumb_pixels_for_loaded_survivors() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use std::sync::Arc;
+
+        fn loaded_thumb(
+            ctx: &egui::Context,
+            label: &str,
+            color: egui::Color32,
+        ) -> (ThumbnailState, Arc<egui::ColorImage>) {
+            let image = egui::ColorImage::filled([1, 1], color);
+            let pixels = Arc::new(image.clone());
+            let tex = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
+            (
+                ThumbnailState::Loaded {
+                    tex,
+                    from_cache: false,
+                    rendered_at_px: 64,
+                    source_dims: Some((1, 1)),
+                },
+                pixels,
+            )
+        }
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let initial = vec![
+            GridItem::Image(std::path::PathBuf::from("c:/a.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/b.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/c.jpg")),
+        ];
+        app.replace_search_view_items(initial, vec![None, None, None]);
+
+        let (thumb_a, pixels_a) = loaded_thumb(&ctx, "search_raw_a", egui::Color32::RED);
+        let (thumb_b, pixels_b) = loaded_thumb(&ctx, "search_raw_b", egui::Color32::GREEN);
+        let (thumb_c, pixels_c) = loaded_thumb(&ctx, "search_raw_c", egui::Color32::BLUE);
+        app.thumbnails[0] = thumb_a;
+        app.thumbnails[1] = thumb_b;
+        app.thumbnails[2] = thumb_c;
+        app.thumb_pixels.insert(0, Arc::clone(&pixels_a));
+        app.thumb_pixels.insert(1, Arc::clone(&pixels_b));
+        app.thumb_pixels.insert(2, Arc::clone(&pixels_c));
+        app.thumb_adjust_tex.insert(
+            2,
+            ctx.load_texture(
+                "search_stale_adjusted_c",
+                egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            ),
+        );
+
+        let after = vec![
+            GridItem::Image(std::path::PathBuf::from("c:/x.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/c.jpg")),
+            GridItem::Image(std::path::PathBuf::from("c:/a.jpg")),
+        ];
+        app.replace_search_view_items(after, vec![None, None, None]);
+
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Pending));
+        assert!(matches!(app.thumbnails[1], ThumbnailState::Loaded { .. }));
+        assert!(matches!(app.thumbnails[2], ThumbnailState::Loaded { .. }));
+        assert!(
+            Arc::ptr_eq(
+                app.thumb_pixels
+                    .get(&1)
+                    .expect("old idx 2 shifts by content key to 1"),
+                &pixels_c
+            ),
+            "C の source pixels は新 idx=1 に復元される"
+        );
+        assert!(
+            Arc::ptr_eq(
+                app.thumb_pixels
+                    .get(&2)
+                    .expect("old idx 0 shifts by content key to 2"),
+                &pixels_a
+            ),
+            "A の source pixels は新 idx=2 に復元される"
+        );
+        assert!(
+            !app.thumb_pixels.values().any(|p| Arc::ptr_eq(p, &pixels_b)),
+            "検索結果から消えた B の source pixels は残さない"
+        );
+        assert!(
+            app.thumb_adjust_tex.is_empty(),
+            "補正済み TextureHandle は invalidate 後に再生成させる"
+        );
+
+        app.settings.global_preset.brightness = 20.0;
+        app.maybe_apply_thumb_adjustment(&ctx, 1);
+        assert!(
+            app.thumb_adjust_tex.contains_key(&1),
+            "復元した thumb_pixels から検索ビューのグローバル補正を再生成できる"
+        );
+    }
+
     /// 旧選択アイテムが新 items から消えた場合は selected = None に戻し、
     /// 先頭スクロールにフォールバックする (= 復元不能時の安全側挙動)。
     #[test]

@@ -23,7 +23,7 @@ use eframe::egui;
 
 use uuid::Uuid;
 
-use crate::app::App;
+use crate::app::{App, is_thumb_adjust_target};
 use crate::fts_index::{IndexKind, SearchTarget, SourceKind};
 use crate::global_search::{DoneReason, GlobalHit, SearchStreamEvent};
 use crate::grid_item::{ContainerRepresentative, GridItem, SearchContainerKind, ThumbnailState};
@@ -1046,6 +1046,17 @@ impl App {
                 _ => None,
             })
             .collect();
+        let preserved_thumb_pixels: HashMap<ThumbReuseKey, Arc<egui::ColorImage>> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(i, it)| {
+                self.thumb_pixels
+                    .get(&i)
+                    .cloned()
+                    .and_then(|pixels| thumb_reuse_key(it).map(|k| (k, pixels)))
+            })
+            .collect();
         // 選択中アイテム + チェック済みアイテムの「内容キー」をスナップショット。
         // ストリーミング rebuild で items 並びが変わってもカーソル位置とチェック状態を
         // 同じ内容のセルに追従させる (idx ベースだと別アイテムを指す事故になる)。
@@ -1077,6 +1088,7 @@ impl App {
         self.invalidate_idx_state_and_queues();
         // 旧 thumbnails を新位置にマージ。Loaded のままなら upload backlog に乗らず、
         // 同一フレームで前回のテクスチャがそのまま見え続けるのでちらつかない。
+        // 補正用 source pixels も同じ content-key で移し、補正済み tex は再生成させる。
         // 同時に選択 / チェックも content-key で新 idx に再マップする。
         let mut restored_selected: Option<usize> = None;
         if !preserved.is_empty() || selected_key.is_some() || !checked_keys.is_empty() {
@@ -1086,6 +1098,11 @@ impl App {
                 };
                 if let Some(state) = preserved.get(&key) {
                     self.thumbnails[i] = state.clone();
+                    if is_thumb_adjust_target(Some(item)) {
+                        if let Some(pixels) = preserved_thumb_pixels.get(&key) {
+                            self.thumb_pixels.insert(i, Arc::clone(pixels));
+                        }
+                    }
                 }
                 if selected_key.as_ref() == Some(&key) {
                     restored_selected = Some(i);
