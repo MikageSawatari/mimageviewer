@@ -170,32 +170,25 @@ impl App {
         // 消しゴム入力取得は state mutation より前にやる。ここで取れないと erase は始められず、
         // 取れる前に spread_mode / fullscreen_idx を弄ると見開きが解除されたまま
         // 編集も開始しない不整合状態になる (Codex P2 指摘)。
-        let pixels = if let Some(base) = self.erase_base_cache.get(&target_idx) {
-            Arc::clone(base)
-        } else {
-            let from_cache = self
-                .fs_cache
-                .get(&target_idx)
-                .and_then(|entry| match entry {
-                    FsCacheEntry::Static { pixels, .. } => Some(Arc::clone(pixels)),
-                    _ => None,
-                });
-            match from_cache {
-                Some(p) => {
-                    // 初回: pre-erase 入力を base_cache に保存。透明 PNG は MI-GAN が alpha を
-                    // 扱えず透明部を黒補完するため、ここで「黒で不透明化」したコピーを base に
-                    // する (WYSIWYG: 表示も MI-GAN 入力も黒不透明)。fs_cache の透明原本は
-                    // 無変更なので、マスク無しで消しゴムを抜ければ元の透明画像に戻る (P3-8 後続)。
-                    let base = match Self::black_flatten_if_transparent(&p) {
-                        Some(flat) => Arc::new(flat),
-                        None => p,
-                    };
-                    self.erase_base_cache.insert(target_idx, Arc::clone(&base));
-                    base
-                }
-                None => return,
-            }
+        let from_cache = self
+            .fs_cache
+            .get(&target_idx)
+            .and_then(|entry| match entry {
+                FsCacheEntry::Static { pixels, .. } => Some(Arc::clone(pixels)),
+                _ => None,
+            });
+        let Some(p) = from_cache else {
+            return;
         };
+        // 消しゴム入場時の作業ベースは raw 専用の fs_cache から毎回作り直す。
+        // erase_base_cache には自動適用/F7/F8 経由で補正済み pixels が入ることがあり、
+        // それを再利用すると ensure_erase_base_texture で補正が二重にかかる。
+        let pixels = match Self::black_flatten_if_transparent(&p) {
+            Some(flat) => Arc::new(flat),
+            None => p,
+        };
+        self.erase_base_cache
+            .insert(target_idx, Arc::clone(&pixels));
         // ピクセル取得成功 → ここから state mutation。
         if let Some(pair) = spread_pair {
             self.erase_spread_ctx = Some(crate::app::EraseSpreadCtx {

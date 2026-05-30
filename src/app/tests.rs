@@ -4140,6 +4140,48 @@ mod favorite_adjustment_defaults_tests {
         assert_eq!(app.fs_zoom, 1.0, "ズームはリセット");
     }
 
+    /// 消しゴム入場時は、過去に auto-apply / F7/F8 経由で入った
+    /// `erase_base_cache` を再利用せず、raw 専用の `fs_cache` から作業ベースを作り直す。
+    /// 古い base が補正済み pixels だと、入場直後の表示で補正が二重適用される。
+    #[test]
+    fn enter_erase_mode_rebuilds_base_from_raw_fs_cache() {
+        let mut app = setup_app();
+        let idx = push_image(&mut app, "C:/pics/a.jpg");
+        app.fullscreen_idx = Some(idx);
+
+        let ctx = egui::Context::default();
+        let raw = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(10, 20, 30)]);
+        let stale_adjusted =
+            egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(200, 210, 220)]);
+        let raw_pixels = std::sync::Arc::new(raw.clone());
+        let raw_tex = ctx.load_texture("raw_for_erase_base", raw, egui::TextureOptions::LINEAR);
+        app.fs_cache.insert(
+            idx,
+            FsCacheEntry::Static {
+                tex: raw_tex,
+                pixels: raw_pixels,
+                source_dims: Some([1, 1]),
+                load_seq: 0,
+            },
+        );
+        app.erase_base_cache
+            .insert(idx, std::sync::Arc::new(stale_adjusted));
+
+        app.enter_erase_mode(idx);
+
+        let base = app
+            .erase_base_cache
+            .get(&idx)
+            .expect("erase base should be recreated");
+        assert_eq!(
+            base.pixels[0],
+            egui::Color32::from_rgb(10, 20, 30),
+            "stale adjusted erase_base_cache must be overwritten by raw fs_cache"
+        );
+        assert_eq!(app.erase_mask_size, [1, 1]);
+        assert!(app.erase_mode);
+    }
+
     /// Codex 0.8.2 P1: 検索バー (Ctrl+F/S/G) の TextEdit にフォーカスがある間は
     /// グリッドショートカットを抑止する。`global_search.has_focus` の追加が無いと
     /// Ctrl+G の検索入力欄で BS が `close_global_search` に流れて入力が破壊される。
