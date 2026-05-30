@@ -593,26 +593,35 @@ impl App {
         }
     }
 
-    /// `idx` に対する「現在表示できる最良のテクスチャ」を Arc::clone で取り出す。
-    /// 優先順: 補正済みキャッシュ → AI 処理済み → fs_cache (Static / Animated 現フレーム)
-    /// → サムネ (`include_thumb=true` のときのみ)。
+    /// `idx` に対する「現在表示できる最良の既存テクスチャ」を Arc::clone で取り出す。
+    /// 優先順: 隠蔽加工 cache → 消しゴム確定結果 → 補正済み cache → AI 処理済み
+    /// → fs_cache (Static / Animated 現フレーム) → サムネ (`include_thumb=true` のときのみ)。
     ///
     /// `prepare_fullscreen_state` の高解像度 tex 解決と `current_fs_tex_for_holdover`
-    /// が同じチェーンを 2 回書いていた重複を集約する。Render パスは AI 設定 OFF 時に
-    /// AI キャッシュを使わない gate を別途持っているので、フル一致ではなく一部
-    /// (補正・fs_cache) を共通化する位置付け。Holdover は AI gate を気にせず常にこの
-    /// チェーンを走らせる (短時間の lock 中は古い AI 表示でも黒画面より遥かにマシ)。
+    /// が同じチェーンを 2 回書いていた重複を集約する。ここでは既存 cache の lookup
+    /// だけを行い、MI-GAN や隠蔽合成の新規生成は走らせない。生成を伴う通常描画は
+    /// `resolve_fs_processed_texture` を使う。
     pub(crate) fn resolve_fs_display_tex(
         &self,
         idx: usize,
         include_thumb: bool,
     ) -> Option<egui::TextureHandle> {
+        if let Some(entry) = self.conceal_cache.get(&idx) {
+            if entry.generation == self.conceal_generation {
+                return Some(entry.texture.clone());
+            }
+        }
+        if let Some(tex) = self.current_erase_result_texture(idx) {
+            return Some(tex);
+        }
         if let Some(FsCacheEntry::Static { tex, .. }) = self.adjustment_cache.get(&idx) {
             return Some(tex.clone());
         }
-        let bg = self.effective_upscale_bg_mode();
-        if let Some(FsCacheEntry::Static { tex, .. }) = self.ai_upscale_cache.get(&(idx, bg)) {
-            return Some(tex.clone());
+        if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
+            let bg = self.effective_upscale_bg_mode();
+            if let Some(FsCacheEntry::Static { tex, .. }) = self.ai_upscale_cache.get(&(idx, bg)) {
+                return Some(tex.clone());
+            }
         }
         match self.fs_cache.get(&idx) {
             Some(FsCacheEntry::Static { tex, .. }) => return Some(tex.clone()),
@@ -693,6 +702,74 @@ impl App {
             }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
             _ => None,
         }
+    }
+
+    /// 消しゴム / 隠蔽より下位にある通常レイヤを解決する。
+    /// 優先順: adjustment_cache → ai_upscale_cache → fs_cache。
+    fn resolve_fs_pre_overlay_texture(&self, idx: usize) -> Option<egui::TextureHandle> {
+        if let Some(FsCacheEntry::Static { tex, .. }) = self.adjustment_cache.get(&idx) {
+            return Some(tex.clone());
+        }
+
+        if self.ai_upscale_enabled || self.ai_denoise_model.is_some() {
+            let bg = self.effective_upscale_bg_mode();
+            if let Some(FsCacheEntry::Static { tex, .. }) = self.ai_upscale_cache.get(&(idx, bg)) {
+                return Some(tex.clone());
+            }
+        }
+
+        match self.fs_cache.get(&idx) {
+            Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
+            Some(FsCacheEntry::Animated {
+                frames,
+                current_frame,
+                ..
+            }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
+            _ => None,
+        }
+    }
+
+    /// フルスクリーン描画で使う最終表示テクスチャを解決する共通入口。
+    ///
+    /// 単ページ / 見開き / ルーペの全てがここを通ることで、加工レイヤを追加した
+    /// ときの横展開漏れを防ぐ。優先順は docs/display-pipeline.md §2.3 と同じ:
+    /// original preview → erase edit preview/base → conceal → erase result →
+    /// adjustment → AI → fs。
+    fn resolve_fs_processed_texture(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+        original_preview_active: bool,
+    ) -> Option<egui::TextureHandle> {
+        let is_video = matches!(self.items.get(idx), Some(GridItem::Video(_)));
+        if is_video {
+            return None;
+        }
+        if original_preview_active {
+            return self.resolve_original_preview_tex(idx);
+        }
+
+        if self.erase_mode {
+            if !self.erase_preview_active {
+                return self.ensure_erase_base_texture(ctx, idx);
+            }
+            let preview_tex = self
+                .erase_preview_cache
+                .get(&idx)
+                .map(|e| e.texture.clone());
+            return preview_tex
+                .or_else(|| self.resolve_fs_pre_overlay_texture(idx))
+                .or_else(|| self.ensure_erase_base_texture(ctx, idx));
+        }
+
+        let erase_result_tex = self.ensure_erase_result_texture(ctx, idx);
+        if let Some(conceal_tex) = self.ensure_conceal_texture(ctx, idx) {
+            return Some(conceal_tex);
+        }
+        if let Some(tex) = erase_result_tex {
+            return Some(tex);
+        }
+        self.resolve_fs_pre_overlay_texture(idx)
     }
 
     /// Ctrl+↑↓ ナビ発火直前に `fs_holdover_tex` を仕込むためのヘルパ。
@@ -2379,115 +2456,7 @@ impl App {
         let is_separator = separator_text.is_some();
         let original_preview_active = self.original_preview_active(ctx, fs_idx);
 
-        // 消しゴム確定結果: fs_cache へ焼き込まず、専用レイヤとして解決する。
-        let erase_result_tex = if is_video || original_preview_active || self.erase_mode {
-            None
-        } else {
-            self.ensure_erase_result_texture(ctx, fs_idx)
-        };
-
-        // 隠蔽合成: マスクが保存されているページなら最上位レイヤとして適用 (Phase 4)。
-        // `ensure_conceal_texture` は内部で erase_result > adj > ai > fs の優先順位で入力を選ぶ。
-        // 隠蔽モード編集中 / 該当 idx にマスク無し / 入力ピクセル未取得 → None。
-        // ライフサイクル順序: 元プレビュー (右 Ctrl) は隠蔽より優先で raw を見せる。
-        // ここでは消しゴム/補正/AI の派生キャッシュを参照しない。
-        let conceal_tex = if is_video || original_preview_active {
-            None
-        } else {
-            self.ensure_conceal_texture(ctx, fs_idx)
-        };
-
-        // 消しゴム編集中の base 画像 (= inpaint 前)。プレビューボタン押下中は
-        // fs_cache を見せたいので None にして通常チェーンへフォールバックさせる。
-        let erase_base_tex = if self.erase_mode && !self.erase_preview_active && !is_video {
-            self.ensure_erase_base_texture(ctx, fs_idx)
-        } else {
-            None
-        };
-
-        let tex: Option<egui::TextureHandle> = if is_video {
-            // 動画は native presenter が独立 HWND に描画するため、egui 側で
-            // 表示するテクスチャは無い。サムネイル fallback に任せる。
-            None
-        } else if original_preview_active {
-            self.resolve_original_preview_tex(fs_idx)
-        } else if let Some(b) = erase_base_tex {
-            // 消しゴム編集中 (プレビュー OFF): inpaint 前の元画像を見せる。
-            // 通常パイプラインの adj / ai / conceal を全部スキップ (= 編集
-            // しやすさ重視、消しゴム base が唯一の真実)。
-            Some(b)
-        } else if let Some(c) = conceal_tex {
-            Some(c)
-        } else if let Some(e) = erase_result_tex {
-            Some(e)
-        } else {
-            // 補正済みキャッシュ（フル解像度）
-            let adj_tex = match self.adjustment_cache.get(&fs_idx) {
-                Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
-                _ => None,
-            };
-
-            // AI 処理有効時（アップスケール or デノイズ）: 処理済みテクスチャ
-            let ai_tex = if adj_tex.is_none()
-                && (self.ai_upscale_enabled || self.ai_denoise_model.is_some())
-            {
-                let bg = self.effective_upscale_bg_mode();
-                match self.ai_upscale_cache.get(&(fs_idx, bg)) {
-                    Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-
-            // 消しゴムプレビュー中 (`erase_preview_active = true`) の特殊扱い。
-            //
-            // 現仕様 (Codex P1 R4 #1 + R5 対応):
-            // - プレビュー押下時の MI-GAN 結果は **erase_preview_cache に隔離** して
-            //   fs_cache を触らない。ESC キャンセル / マスク変更で安全に破棄できる。
-            // - したがってプレビュー表示は `erase_preview_cache` が最優先。完了前 /
-            //   不在の場合は通常レイヤ (adj > ai > fs_cache) を見せる。
-            // - 通常レイヤがすべて空のとき (= まだ何もキャッシュされていない) は
-            //   `ensure_erase_base_texture` を fallback として最後に使う。
-            //
-            // 旧版は preview MI-GAN 結果を fs_cache に書き戻していたが、その経路は
-            // 廃止済み (= R4 で preview_cache 隔離へ移行)。下のコードで fs_cache が
-            // 出てくるのは「プレビューが未完了 / 不在の間、通常表示を維持する」用途。
-            let fs_cache_tex = match self.fs_cache.get(&fs_idx) {
-                Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
-                Some(FsCacheEntry::Animated {
-                    frames,
-                    current_frame,
-                    ..
-                }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
-                Some(FsCacheEntry::Video { .. }) => None,
-                Some(FsCacheEntry::Failed) | None => None,
-            };
-            let fallback_tex = if self.erase_mode && self.erase_preview_active {
-                self.ensure_erase_base_texture(ctx, fs_idx)
-            } else {
-                None
-            };
-            if self.erase_mode && self.erase_preview_active {
-                // プレビュー: `erase_preview_cache` (= 隔離した preview MI-GAN 結果、
-                // Codex P1 R4 #1 対応) を最優先。これにより:
-                // - preview 結果が fs_cache に焼き込まれない (= ESC で破棄可能)
-                // - 連続 preview 押下で同じ source なら結果再利用 (= AI 起動不要)
-                // 未完了 / preview_cache 不在の場合は fallback (= base + adj) を見せる。
-                let preview_tex = self
-                    .erase_preview_cache
-                    .get(&fs_idx)
-                    .map(|e| e.texture.clone());
-                preview_tex
-                    .or(adj_tex)
-                    .or(ai_tex)
-                    .or(fs_cache_tex)
-                    .or(fallback_tex)
-            } else {
-                // 通常: erase_result はこのブロックの前で解決済み。
-                adj_tex.or(ai_tex).or(fs_cache_tex)
-            }
-        };
+        let tex = self.resolve_fs_processed_texture(ctx, fs_idx, original_preview_active);
 
         let fs_load_failed = matches!(self.fs_cache.get(&fs_idx), Some(FsCacheEntry::Failed));
 
@@ -6462,17 +6431,11 @@ impl App {
                 return;
             };
             // 見開き時はページ rect がそのまま image rect (draw_fs_spread が高さ統一で
-            // アスペクトをぴったり合わせた矩形を組むため、leterbox は発生しない)。
-            // テクスチャ取得 (fs_cache → thumbnail)
-            let page_tex: Option<egui::TextureHandle> = match self.fs_cache.get(&page_idx) {
-                Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
-                Some(FsCacheEntry::Animated {
-                    frames,
-                    current_frame,
-                    ..
-                }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
-                _ => None,
-            };
+            // アスペクトをぴったり合わせた矩形を組むため、letterbox は発生しない)。
+            // ルーペも通常描画と同じ加工済みレイヤを参照する。
+            let page_original_preview_active = self.original_preview_active(ctx, page_idx);
+            let page_tex =
+                self.resolve_fs_processed_texture(ctx, page_idx, page_original_preview_active);
             let page_thumb: Option<egui::TextureHandle> = match self.thumbnails.get(page_idx) {
                 Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
                 _ => None,
@@ -6665,52 +6628,36 @@ impl App {
             } else {
                 None
             };
-            let left_original_tex = original_preview_active
-                .then(|| self.resolve_original_preview_tex(left_idx))
-                .flatten();
-            let right_original_tex = original_preview_active
-                .then(|| self.resolve_original_preview_tex(right_idx))
-                .flatten();
-            let left_erase_tex = (!original_preview_active)
-                .then(|| self.ensure_erase_result_texture(ctx, left_idx))
-                .flatten();
-            let right_erase_tex = (!original_preview_active)
-                .then(|| self.ensure_erase_result_texture(ctx, right_idx))
-                .flatten();
-            for (rect, idx, rot, location, original_tex) in [
+            let left_display_tex =
+                self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active);
+            let right_display_tex =
+                self.resolve_fs_processed_texture(ctx, right_idx, original_preview_active);
+            for (rect, idx, rot, location, display_tex) in [
                 (
                     left_rect,
                     left_idx,
                     left_rot,
                     &left_location,
-                    left_original_tex.as_ref(),
+                    left_display_tex.as_ref(),
                 ),
                 (
                     right_rect,
                     right_idx,
                     right_rot,
                     &right_location,
-                    right_original_tex.as_ref(),
+                    right_display_tex.as_ref(),
                 ),
             ] {
-                let erase_tex = if idx == left_idx {
-                    left_erase_tex.as_ref()
-                } else {
-                    right_erase_tex.as_ref()
-                };
                 Self::draw_fs_spread_page(
                     &painter,
                     rect,
                     idx,
                     rot,
-                    &self.adjustment_cache,
-                    &self.fs_cache,
                     &self.thumbnails,
                     &bg_style,
                     location,
                     holdover_for_locked.as_ref(),
-                    original_tex,
-                    erase_tex,
+                    display_tex,
                 );
             }
 
@@ -6747,52 +6694,36 @@ impl App {
             } else {
                 None
             };
-            let left_original_tex = original_preview_active
-                .then(|| self.resolve_original_preview_tex(left_idx))
-                .flatten();
-            let right_original_tex = original_preview_active
-                .then(|| self.resolve_original_preview_tex(right_idx))
-                .flatten();
-            let left_erase_tex = (!original_preview_active)
-                .then(|| self.ensure_erase_result_texture(ctx, left_idx))
-                .flatten();
-            let right_erase_tex = (!original_preview_active)
-                .then(|| self.ensure_erase_result_texture(ctx, right_idx))
-                .flatten();
-            for (rect, idx, rot, location, original_tex) in [
+            let left_display_tex =
+                self.resolve_fs_processed_texture(ctx, left_idx, original_preview_active);
+            let right_display_tex =
+                self.resolve_fs_processed_texture(ctx, right_idx, original_preview_active);
+            for (rect, idx, rot, location, display_tex) in [
                 (
                     left_rect,
                     left_idx,
                     left_rot,
                     &left_location,
-                    left_original_tex.as_ref(),
+                    left_display_tex.as_ref(),
                 ),
                 (
                     right_rect,
                     right_idx,
                     right_rot,
                     &right_location,
-                    right_original_tex.as_ref(),
+                    right_display_tex.as_ref(),
                 ),
             ] {
-                let erase_tex = if idx == left_idx {
-                    left_erase_tex.as_ref()
-                } else {
-                    right_erase_tex.as_ref()
-                };
                 Self::draw_fs_spread_page(
                     &painter,
                     rect,
                     idx,
                     rot,
-                    &self.adjustment_cache,
-                    &self.fs_cache,
                     &self.thumbnails,
                     &bg_style,
                     location,
                     holdover_for_locked.as_ref(),
-                    original_tex,
-                    erase_tex,
+                    display_tex,
                 );
             }
             // フォールバック分岐: サイズ未確定でアスペクト比が崩れる可能性があるため、
@@ -6835,48 +6766,25 @@ impl App {
     /// 見開きモードの1ページ分を指定領域に描画。
     /// `painter` は呼び出し側でクリップ済みのものを渡すことで、ズーム時のはみ出しを防ぐ。
     /// `location_display` は draw_fs_image と同じで、空なら読込中ラベル描画をスキップ。
-    /// テクスチャ優先順位は original preview → erase result → adjustment_cache → fs_cache
-    /// → thumbnail → holdover。
+    /// `display_tex` は `resolve_fs_processed_texture` で解決済みの加工済みテクスチャ。
+    /// ここでは thumbnail → holdover の最終フォールバックだけを担当する。
     #[allow(clippy::too_many_arguments)]
     fn draw_fs_spread_page(
         painter: &egui::Painter,
         rect: egui::Rect,
         idx: usize,
         rotation: crate::rotation_db::Rotation,
-        adjustment_cache: &std::collections::HashMap<usize, FsCacheEntry>,
-        fs_cache: &std::collections::HashMap<usize, FsCacheEntry>,
         thumbnails: &[ThumbnailState],
         bg_style: &FsBgStyle<'_>,
         location_display: &str,
         holdover_tex: Option<&egui::TextureHandle>,
-        original_tex: Option<&egui::TextureHandle>,
-        erase_result_tex: Option<&egui::TextureHandle>,
+        display_tex: Option<&egui::TextureHandle>,
     ) {
-        // テクスチャ取得（元画像プレビュー or 消しゴム確定済 or 補正済 or フルサイズ
-        // or サムネイル → ロック中なら最後に holdover）
-        let tex = if let Some(tex) = original_tex {
-            Some(tex.clone())
-        } else if let Some(tex) = erase_result_tex {
-            Some(tex.clone())
-        } else {
-            match adjustment_cache.get(&idx) {
-                Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
-                _ => match fs_cache.get(&idx) {
-                    Some(FsCacheEntry::Static { tex, .. }) => Some(tex.clone()),
-                    Some(FsCacheEntry::Animated {
-                        frames,
-                        current_frame,
-                        ..
-                    }) => frames.get(*current_frame).map(|(h, _)| h.clone()),
-                    _ => None,
-                },
-            }
-        };
         let thumb_tex = match thumbnails.get(idx) {
             Some(ThumbnailState::Loaded { tex, .. }) => Some(tex.clone()),
             _ => None,
         };
-        let display_tex = tex.as_ref().or(thumb_tex.as_ref()).or(holdover_tex);
+        let display_tex = display_tex.or(thumb_tex.as_ref()).or(holdover_tex);
 
         if let Some(handle) = display_tex {
             let tex_size = handle.size_vec2();
@@ -8487,9 +8395,9 @@ impl App {
             .ok_or_else(|| "このアイテムはキャプチャ保存できません".to_string())?;
 
         if let Some(pixels) = self.current_erase_result_pixels(idx) {
-            return Ok(crate::capture::CapturePixelJob::already_adjusted(
-                basename,
-                pixels.clone(),
+            return Ok(self.capture_job_with_conceal(
+                idx,
+                crate::capture::CapturePixelJob::already_adjusted(basename, pixels.clone()),
             ));
         }
         if self.mask_pages.contains(&idx) {
@@ -8499,9 +8407,9 @@ impl App {
         if !self.post_filter_bypassed
             && let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx)
         {
-            return Ok(crate::capture::CapturePixelJob::already_adjusted(
-                basename,
-                pixels.clone(),
+            return Ok(self.capture_job_with_conceal(
+                idx,
+                crate::capture::CapturePixelJob::already_adjusted(basename, pixels.clone()),
             ));
         }
 
@@ -8523,19 +8431,34 @@ impl App {
                 let Some(pixels) = frame_pixels.get(*current_frame) else {
                     return Err("アニメーションフレームを取得できません".to_string());
                 };
-                return Ok(crate::capture::CapturePixelJob::already_adjusted(
-                    basename,
-                    pixels.clone(),
+                return Ok(self.capture_job_with_conceal(
+                    idx,
+                    crate::capture::CapturePixelJob::already_adjusted(basename, pixels.clone()),
                 ));
             }
             return Err("画像の読み込み完了後に保存してください".to_string());
         };
 
-        Ok(crate::capture::CapturePixelJob::needs_adjustment(
-            basename,
-            pixels.clone(),
-            self.effective_params(idx).clone(),
+        Ok(self.capture_job_with_conceal(
+            idx,
+            crate::capture::CapturePixelJob::needs_adjustment(
+                basename,
+                pixels.clone(),
+                self.effective_params(idx).clone(),
+            ),
         ))
+    }
+
+    fn capture_job_with_conceal(
+        &self,
+        idx: usize,
+        job: crate::capture::CapturePixelJob,
+    ) -> crate::capture::CapturePixelJob {
+        let [w, h] = job.source.size;
+        let Some(mask) = self.conceal_composite_mask_for_export(idx, w, h) else {
+            return job;
+        };
+        job.with_conceal(Arc::new(mask), self.current_conceal_preset_from_settings())
     }
 
     fn capture_basename_for_idx(&self, idx: usize) -> Option<String> {
@@ -9277,7 +9200,7 @@ impl App {
         }
     }
 
-    fn current_conceal_preset_from_settings(&self) -> crate::conceal::ConcealPreset {
+    pub(crate) fn current_conceal_preset_from_settings(&self) -> crate::conceal::ConcealPreset {
         crate::conceal::ConcealPreset {
             name: "現在の設定".to_string(),
             conceal_type: self.settings.conceal_type,

@@ -68,11 +68,18 @@ impl CaptureFormat {
     }
 }
 
+#[derive(Clone)]
+pub struct CaptureConceal {
+    pub mask: Arc<Vec<bool>>,
+    pub preset: crate::conceal::ConcealPreset,
+}
+
 pub struct CapturePixelJob {
     pub basename: String,
     pub source: Arc<egui::ColorImage>,
     pub source_already_adjusted: bool,
     pub params: crate::adjustment::AdjustParams,
+    pub conceal: Option<CaptureConceal>,
 }
 
 pub enum CapturePixelWork {
@@ -91,6 +98,7 @@ impl CapturePixelJob {
             source,
             source_already_adjusted: true,
             params: crate::adjustment::AdjustParams::default(),
+            conceal: None,
         }
     }
 
@@ -104,7 +112,17 @@ impl CapturePixelJob {
             source,
             source_already_adjusted: false,
             params,
+            conceal: None,
         }
+    }
+
+    pub fn with_conceal(
+        mut self,
+        mask: Arc<Vec<bool>>,
+        preset: crate::conceal::ConcealPreset,
+    ) -> Self {
+        self.conceal = Some(CaptureConceal { mask, preset });
+        self
     }
 }
 
@@ -298,7 +316,7 @@ pub fn save_rgba_unique_with_matte(
 }
 
 pub fn run_pixel_job(job: CapturePixelJob) -> Result<(String, u32, u32, Vec<u8>), String> {
-    let image = if job.source_already_adjusted {
+    let mut image = if job.source_already_adjusted {
         job.source.as_ref().clone()
     } else {
         let adjusted = crate::adjustment::apply_adjustments_fast(&job.source, &job.params);
@@ -308,6 +326,23 @@ pub fn run_pixel_job(job: CapturePixelJob) -> Result<(String, u32, u32, Vec<u8>)
             crate::post_filter::apply(&adjusted, job.params.post_filter)
         }
     };
+    if let Some(conceal) = job.conceal {
+        let expected = image.size[0]
+            .checked_mul(image.size[1])
+            .ok_or_else(|| "隠蔽加工マスクのサイズが大きすぎます".to_string())?;
+        if conceal.mask.len() != expected {
+            return Err(format!(
+                "隠蔽加工マスクのサイズが一致しません: mask={}, expected={}",
+                conceal.mask.len(),
+                expected
+            ));
+        }
+        image = crate::conceal_compose::compose_with_preset(
+            &image,
+            conceal.mask.as_ref(),
+            &conceal.preset,
+        );
+    }
     let width = image.size[0] as u32;
     let height = image.size[1] as u32;
     Ok((job.basename, width, height, color_image_to_rgba(&image)))
@@ -611,6 +646,48 @@ mod tests {
         assert_eq!(rgba[0], rgba[1]);
         assert_eq!(rgba[1], rgba[2]);
         assert_eq!(rgba[3], 255);
+    }
+
+    #[test]
+    fn run_pixel_job_applies_conceal_on_worker_path() {
+        let src = egui::ColorImage::new(
+            [2, 1],
+            vec![egui::Color32::BLACK, egui::Color32::from_rgb(10, 20, 30)],
+        );
+        let mut preset = crate::conceal::ConcealPreset::default();
+        preset.conceal_type = crate::conceal::ConcealType::WhiteFill;
+        preset.fill_opacity_percent = 100;
+        preset.fill_edge = crate::conceal::FillEdge::Sharp;
+        let job = CapturePixelJob::already_adjusted("sample".to_string(), Arc::new(src))
+            .with_conceal(Arc::new(vec![true, false]), preset);
+
+        let (_basename, width, height, rgba) = run_pixel_job(job).unwrap();
+
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&rgba[4..8], &[10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn run_pixel_work_applies_conceal_per_spread_page() {
+        let left = egui::ColorImage::new([1, 1], vec![egui::Color32::BLACK]);
+        let right = egui::ColorImage::new([1, 1], vec![egui::Color32::from_rgb(10, 20, 30)]);
+        let mut preset = crate::conceal::ConcealPreset::default();
+        preset.conceal_type = crate::conceal::ConcealType::WhiteFill;
+        preset.fill_opacity_percent = 100;
+        preset.fill_edge = crate::conceal::FillEdge::Sharp;
+        let work = CapturePixelWork::Spread {
+            basename: "spread".to_string(),
+            left: CapturePixelJob::already_adjusted("left".to_string(), Arc::new(left))
+                .with_conceal(Arc::new(vec![true]), preset),
+            right: CapturePixelJob::already_adjusted("right".to_string(), Arc::new(right)),
+        };
+
+        let (_basename, width, height, rgba) = run_pixel_work(work).unwrap();
+
+        assert_eq!((width, height), (2, 1));
+        assert_eq!(&rgba[0..4], &[255, 255, 255, 255]);
+        assert_eq!(&rgba[4..8], &[10, 20, 30, 255]);
     }
 
     #[test]

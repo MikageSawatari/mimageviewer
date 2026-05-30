@@ -3041,6 +3041,38 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.erase_mode);
     }
 
+    /// 見開きから隠蔽加工に入ったあと `reset_conceal_mode` で元の見開き状態に戻ること。
+    #[test]
+    fn reset_conceal_mode_restores_saved_spread_state() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.fullscreen_idx = Some(1);
+        app.spread_mode = SpreadMode::Single;
+        app.conceal_spread_ctx = Some(crate::app::EraseSpreadCtx {
+            saved_mode: SpreadMode::Ltr,
+            pair: (0, 1),
+        });
+        app.fs_zoom = 2.0;
+        app.fs_pan = egui::Vec2::new(50.0, 30.0);
+        app.conceal_mode = true;
+
+        app.reset_conceal_mode();
+
+        assert_eq!(app.spread_mode, SpreadMode::Ltr);
+        assert_eq!(app.fullscreen_idx, Some(0));
+        assert!(app.conceal_spread_ctx.is_none());
+        assert_eq!(app.fs_zoom, 1.0);
+        assert_eq!(app.fs_pan, egui::Vec2::ZERO);
+        assert!(!app.conceal_mode);
+    }
+
     /// P3-8 後続: 透明画像を消しゴム作業ベースにする時、黒で不透明化されること。
     /// MI-GAN は alpha 非対応なので、透明部は黒・半透明は黒へ減衰・全面 alpha=255。
     /// 全不透明画像は変換不要 (None)。

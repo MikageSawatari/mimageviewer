@@ -387,34 +387,7 @@ fn compose_conceal_for_export(
     mask: &[bool],
     params: &ConcealPreset,
 ) -> egui::ColorImage {
-    match params.conceal_type {
-        crate::conceal::ConcealType::Mosaic => {
-            let long_edge = base.size[0].max(base.size[1]) as u32;
-            let tile = crate::conceal::compute_tile_size(long_edge, params.mosaic_tile_mode);
-            crate::conceal_compose::compose_mosaic(base, mask, tile, params.mosaic_boundary)
-        }
-        crate::conceal::ConcealType::WhiteFill => crate::conceal_compose::compose_solid_fill(
-            base,
-            mask,
-            egui::Color32::WHITE,
-            params.fill_opacity_percent,
-            params.fill_edge,
-        ),
-        crate::conceal::ConcealType::BlackFill => crate::conceal_compose::compose_solid_fill(
-            base,
-            mask,
-            egui::Color32::BLACK,
-            params.fill_opacity_percent,
-            params.fill_edge,
-        ),
-        crate::conceal::ConcealType::Blur => crate::conceal_compose::compose_blur(
-            base,
-            mask,
-            params.blur_radius_px,
-            params.blur_mode,
-            params.blur_feather,
-        ),
-    }
+    crate::conceal_compose::compose_with_preset(base, mask, params)
 }
 
 #[cfg(test)]

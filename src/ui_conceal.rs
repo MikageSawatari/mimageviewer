@@ -165,6 +165,33 @@ impl App {
         ));
     }
 
+    fn finish_conceal_edit_for_current(&mut self, reason: &'static str) {
+        let Some(idx) = self.fullscreen_idx else {
+            return;
+        };
+        // キーボードやページ切替で mid-drag 終了された場合も、保存前の解像度同期を
+        // ブロックしないよう中間状態だけ先に畳む。未確定の線/矩形/lasso は
+        // 通常の release 前キャンセルとして破棄される。
+        self.conceal_drag = None;
+        self.conceal_last_paint_pos = None;
+        self.conceal_lasso_points.clear();
+        self.conceal_line_start = None;
+        self.conceal_line_end = None;
+        self.conceal_shape_drag_start = None;
+        self.conceal_shape_drag_end = None;
+        if let Some((pixels, _)) = self.current_conceal_source_pixels(idx) {
+            self.rescale_active_conceal_edit_to_size(idx, pixels.size, reason);
+        }
+        let [w, h] = self.conceal_mask_size;
+        if let Some(mask) = self.conceal_mask.clone() {
+            let shapes = self.conceal_shapes.clone();
+            self.save_conceal_with_sidecar(idx, &mask, &shapes, w, h);
+        }
+        // 編集中のマスクが新しい形状になったので、`conceal_cache[idx]` を
+        // 破棄して退場後の最初の表示パスで再合成させる (Phase 4)。
+        self.clear_conceal_caches(idx);
+    }
+
     /// 隠蔽加工モードを終了する (Esc / Ctrl+M 再押下)。
     ///
     /// Phase 4 から: 現在ページの編集中マスク (ビットマップ + Shape) を
@@ -180,29 +207,7 @@ impl App {
         // fullscreen_idx を必要とするため、`conceal_mode = false` 後でも値は残るが
         // 順序保証のためここで実施する)。
         if was_conceal_mode {
-            if let Some(idx) = self.fullscreen_idx {
-                // キーボードで mid-drag 終了された場合も、保存前の解像度同期を
-                // ブロックしないよう中間状態だけ先に畳む。未確定の線/矩形/lasso は
-                // 通常の release 前キャンセルとして破棄される。
-                self.conceal_drag = None;
-                self.conceal_last_paint_pos = None;
-                self.conceal_lasso_points.clear();
-                self.conceal_line_start = None;
-                self.conceal_line_end = None;
-                self.conceal_shape_drag_start = None;
-                self.conceal_shape_drag_end = None;
-                if let Some((pixels, _)) = self.current_conceal_source_pixels(idx) {
-                    self.rescale_active_conceal_edit_to_size(idx, pixels.size, "exit_save");
-                }
-                let [w, h] = self.conceal_mask_size;
-                if let Some(mask) = self.conceal_mask.clone() {
-                    let shapes = self.conceal_shapes.clone();
-                    self.save_conceal_with_sidecar(idx, &mask, &shapes, w, h);
-                }
-                // 編集中のマスクが新しい形状になったので、`conceal_cache[idx]` を
-                // 破棄して退場後の最初の表示パスで再合成させる (Phase 4)。
-                self.clear_conceal_caches(idx);
-            }
+            self.finish_conceal_edit_for_current("exit_save");
         }
 
         self.conceal_mode = false;
@@ -244,6 +249,20 @@ impl App {
             self.fs_pan = egui::Vec2::ZERO;
         }
         crate::logger::log("conceal: reset mode".to_string());
+    }
+
+    /// 見開き隠蔽加工中に「左ページ」「右ページ」ボタンで編集対象を切り替える。
+    /// 現ページのマスクを保存してから単ページ状態のままもう一方へ入り直す。
+    pub(crate) fn switch_conceal_target_in_spread(&mut self, new_idx: usize) {
+        if self.fullscreen_idx == Some(new_idx) {
+            return;
+        }
+        self.finish_conceal_edit_for_current("switch_save");
+        self.spread_mode = crate::settings::SpreadMode::Single;
+        self.fullscreen_idx = Some(new_idx);
+        self.fs_zoom = 1.0;
+        self.fs_pan = egui::Vec2::ZERO;
+        self.enter_conceal_mode(new_idx);
     }
 
     // ── Undo ────────────────────────────────────────────────────────
@@ -1632,6 +1651,7 @@ impl App {
         // 描画後に reset_conceal_mode を発火するフラグ (closure 内で直接 reset すると
         // モード state が描画中に変わって widget の借用問題が起こりうる)。
         let mut should_close_after_draw = false;
+        let mut switch_to: Option<usize> = None;
         let panel_pos = egui::pos2(
             full_rect.min.x + PANEL_MARGIN_X,
             full_rect.min.y + PANEL_MARGIN_Y,
@@ -1773,9 +1793,38 @@ impl App {
                                     .max_height(body_height)
                                     .auto_shrink([false, false])
                                     .show(ui, |ui| {
-                                        // 描画 / 消去 (active=赤/青、inactive=暗灰、hover=やや明灰)
                                         let btn_w = ((PANEL_W - 16.0 - 4.0) / 2.0).max(60.0);
                                         let btn_size = egui::vec2(btn_w, 24.0);
+
+                                        // 見開きペアの左/右切替 (見開きから入った場合のみ)。
+                                        if let Some((left_idx, right_idx)) =
+                                            self.conceal_spread_ctx.map(|c| c.pair)
+                                        {
+                                            let pages =
+                                                [("左ページ", left_idx), ("右ページ", right_idx)];
+                                            ui.horizontal(|ui| {
+                                                ui.spacing_mut().item_spacing.x = 4.0;
+                                                for &(label, target_idx) in pages.iter() {
+                                                    let is_active =
+                                                        self.fullscreen_idx == Some(target_idx);
+                                                    if panel_toggle_button(
+                                                        ui,
+                                                        label,
+                                                        is_active,
+                                                        Some(btn_size),
+                                                        None,
+                                                    )
+                                                    .clicked()
+                                                        && !is_active
+                                                    {
+                                                        switch_to = Some(target_idx);
+                                                    }
+                                                }
+                                            });
+                                            ui.separator();
+                                        }
+
+                                        // 描画 / 消去 (active=赤/青、inactive=暗灰、hover=やや明灰)
                                         ui.horizontal(|ui| {
                                             ui.spacing_mut().item_spacing.x = 4.0;
                                             if panel_toggle_button(
@@ -2336,6 +2385,9 @@ impl App {
                 // 後追いで sink を足すと egui の hit test ルール (= 同じ rect の Response
                 // は後勝ち) で widget が click を受け取れなくなる。
             });
+        if let Some(target) = switch_to {
+            self.switch_conceal_target_in_spread(target);
+        }
         if should_close_after_draw {
             self.reset_conceal_mode();
         }

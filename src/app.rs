@@ -17498,6 +17498,9 @@ impl App {
         if let Some(pixels) = self.current_erase_result_pixels(idx) {
             return Some((pixels, "erase_result"));
         }
+        if self.mask_pages.contains(&idx) {
+            return None;
+        }
         if let Some(FsCacheEntry::Static { pixels, .. }) = self.adjustment_cache.get(&idx) {
             return Some((Arc::clone(pixels), "adjustment"));
         }
@@ -17532,12 +17535,14 @@ impl App {
     /// - `None`: 該当 idx にマスクが無い / 隠蔽モード中 (= 編集オーバーレイ表示中で
     ///   焼き込みは見せない) / 入力ピクセルが未取得 (= まだロード中)
     ///
-    /// 優先順位は spec §3.1 に従い `adjustment_cache > ai_upscale_cache > fs_cache`。
+    /// 優先順位は spec §3.1 に従い `erase_result > adjustment_cache > ai_upscale_cache
+    /// > fs_cache`。消しゴムマスクがあるのに `erase_result` が未完成のときは、
+    /// pre-erase 画像へ隠蔽加工を合成しない。
     /// 上位レイヤが更新されたら呼び出し側で `clear_conceal_caches(idx)` を呼ぶ必要が
     /// ある (= AI 完了 / 色補正完了 / 消しゴム inpaint 完了 hook、Phase 4 進行中)。
     ///
-    /// Phase 4 では Mosaic のみ実装済み (Phase 3a で `compose_mosaic` のみ)。
-    /// 他タイプ (Fill / Blur) は Phase 3b/3c で追加されるまで Mosaic にフォールバック。
+    /// 隠蔽タイプ (Mosaic / Fill / Blur) ごとの合成処理は
+    /// `conceal_compose` の共通ヘルパー群と同じ実装を使う。
     pub(crate) fn ensure_conceal_texture(
         &mut self,
         ctx: &egui::Context,
@@ -17667,44 +17672,11 @@ impl App {
 
         let compose_t0 = std::time::Instant::now();
 
-        // タイプ別合成 (Phase 3b で Fill を追加、Blur は Phase 3c 待ちで当面 Mosaic
-        // にフォールバック)。
-        let composed = match self.settings.conceal_type {
-            crate::conceal::ConcealType::Mosaic => {
-                let long_edge = w.max(h) as u32;
-                let tile = crate::conceal::compute_tile_size(
-                    long_edge,
-                    self.settings.conceal_mosaic_tile_mode,
-                );
-                crate::conceal_compose::compose_mosaic(
-                    source_pixels.as_ref(),
-                    &composite,
-                    tile,
-                    self.settings.conceal_mosaic_boundary,
-                )
-            }
-            crate::conceal::ConcealType::WhiteFill => crate::conceal_compose::compose_solid_fill(
-                source_pixels.as_ref(),
-                &composite,
-                egui::Color32::WHITE,
-                self.settings.conceal_fill_opacity_percent,
-                self.settings.conceal_fill_edge,
-            ),
-            crate::conceal::ConcealType::BlackFill => crate::conceal_compose::compose_solid_fill(
-                source_pixels.as_ref(),
-                &composite,
-                egui::Color32::BLACK,
-                self.settings.conceal_fill_opacity_percent,
-                self.settings.conceal_fill_edge,
-            ),
-            crate::conceal::ConcealType::Blur => crate::conceal_compose::compose_blur(
-                source_pixels.as_ref(),
-                &composite,
-                self.settings.conceal_blur_radius_px,
-                self.settings.conceal_blur_mode,
-                self.settings.conceal_blur_feather,
-            ),
-        };
+        let composed = crate::conceal_compose::compose_with_preset(
+            source_pixels.as_ref(),
+            &composite,
+            &self.current_conceal_preset_from_settings(),
+        );
         let compose_ms = compose_t0.elapsed().as_secs_f64() * 1000.0;
 
         let upload_t0 = std::time::Instant::now();

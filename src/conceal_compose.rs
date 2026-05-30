@@ -27,7 +27,9 @@
 use eframe::egui;
 use eframe::egui::Color32;
 
-use crate::conceal::{BlurMode, FillEdge, MosaicBoundary, TileSizeMode, compute_tile_size};
+use crate::conceal::{
+    BlurMode, ConcealPreset, ConcealType, FillEdge, MosaicBoundary, TileSizeMode, compute_tile_size,
+};
 
 // ── Mosaic 合成 ───────────────────────────────────────────────────────
 
@@ -132,6 +134,47 @@ pub fn compose_mosaic_auto(
     let long_edge = w.max(h) as u32;
     let tile_size = compute_tile_size(long_edge, tile_mode);
     compose_mosaic(base, mask, tile_size, boundary)
+}
+
+/// 現在の隠蔽加工プリセットを使って最終合成する共通ヘルパー。
+///
+/// Ctrl+E export、Ctrl+S capture、比較ピンなど、最終表示ピクセルを worker 側で
+/// 作る経路はこの関数を使う。表示専用の `ensure_conceal_texture` と同じ処理順に
+/// 揃えるため、呼び出し側はあらかじめ `erase_result > adjustment > ai > fs` の
+/// base pixels と、それと同じサイズにラスタライズ済みの composite mask を渡す。
+pub fn compose_with_preset(
+    base: &egui::ColorImage,
+    mask: &[bool],
+    params: &ConcealPreset,
+) -> egui::ColorImage {
+    match params.conceal_type {
+        ConcealType::Mosaic => {
+            let long_edge = base.size[0].max(base.size[1]) as u32;
+            let tile = compute_tile_size(long_edge, params.mosaic_tile_mode);
+            compose_mosaic(base, mask, tile, params.mosaic_boundary)
+        }
+        ConcealType::WhiteFill => compose_solid_fill(
+            base,
+            mask,
+            Color32::WHITE,
+            params.fill_opacity_percent,
+            params.fill_edge,
+        ),
+        ConcealType::BlackFill => compose_solid_fill(
+            base,
+            mask,
+            Color32::BLACK,
+            params.fill_opacity_percent,
+            params.fill_edge,
+        ),
+        ConcealType::Blur => compose_blur(
+            base,
+            mask,
+            params.blur_radius_px,
+            params.blur_mode,
+            params.blur_feather,
+        ),
+    }
 }
 
 /// 元画素 `base` の上に `over` を不透明度 `alpha` (0..=1) で重ねる。
