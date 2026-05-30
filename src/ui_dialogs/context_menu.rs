@@ -56,7 +56,7 @@ impl crate::app::App {
             }
         };
 
-        let has_checked = !self.checked.is_empty();
+        let has_checked = !is_folder_context && !self.checked.is_empty();
         let checked_count = self.checked.len();
         let mut nav: Option<ContextMenuAction> = None;
         // 検索結果ビュー中だけ「フォルダに移動」を出す。
@@ -221,11 +221,21 @@ impl crate::app::App {
                             }
                         }
                         GridItem::Folder(p) => {
-                            if ui.button("パスをコピー").clicked() {
+                            let copy_label = if is_folder_context {
+                                "このフォルダのパスをコピー"
+                            } else {
+                                "パスをコピー"
+                            };
+                            if ui.button(copy_label).clicked() {
                                 ctx.copy_text(p.to_string_lossy().to_string());
                                 close = true;
                             }
-                            if ui.button("エクスプローラで開く").clicked() {
+                            let open_label = if is_folder_context {
+                                "このフォルダを開く"
+                            } else {
+                                "エクスプローラで開く"
+                            };
+                            if ui.button(open_label).clicked() {
                                 let _ = std::process::Command::new("explorer")
                                     .arg(p.as_os_str())
                                     .spawn();

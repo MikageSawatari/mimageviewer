@@ -2180,6 +2180,14 @@ impl App {
         nav
     }
 
+    /// 現在表示中の場所に対する空白右クリックメニューを開く。
+    fn open_current_folder_context_menu(&mut self, ctx: &egui::Context) {
+        if self.current_folder.is_some() {
+            self.context_menu_idx = Some(usize::MAX);
+            self.context_menu_pos = ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
+        }
+    }
+
     // ── サムネイルグリッド ───────────────────────────────────────────
 
     /// サムネイルグリッドを描画し、フォルダナビゲーション先を返す。
@@ -2206,14 +2214,10 @@ impl App {
                     } else {
                         "フォルダを入力して Enter キーを押してください"
                     };
-                    let r = ui.centered_and_justified(|ui| ui.label(msg));
+                    ui.centered_and_justified(|ui| ui.label(msg));
                     // 空フォルダでも右クリックでフォルダ操作可能にする
-                    if r.inner.secondary_clicked() {
-                        if self.current_folder.is_some() {
-                            self.context_menu_idx = Some(usize::MAX); // 特殊値: フォルダ操作
-                            self.context_menu_pos =
-                                ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
-                        }
+                    if ui.ui_contains_pointer() && ctx.input(|i| i.pointer.secondary_clicked()) {
+                        self.open_current_folder_context_menu(ctx);
                     }
                     let full_rect = ui.max_rect();
                     self.draw_feedback_toast(ui, full_rect, ctx);
@@ -2228,6 +2232,9 @@ impl App {
                             "検索結果なし"
                         });
                     });
+                    if ui.ui_contains_pointer() && ctx.input(|i| i.pointer.secondary_clicked()) {
+                        self.open_current_folder_context_menu(ctx);
+                    }
                     let full_rect = ui.max_rect();
                     self.draw_feedback_toast(ui, full_rect, ctx);
                     return None;
@@ -2447,11 +2454,7 @@ impl App {
                         let bg_right_clicked = ui.ui_contains_pointer()
                             && ctx.input(|i| i.pointer.secondary_clicked());
                         if bg_right_clicked && self.context_menu_idx.is_none() {
-                            if self.current_folder.is_some() {
-                                self.context_menu_idx = Some(usize::MAX);
-                                self.context_menu_pos =
-                                    ctx.input(|i| i.pointer.interact_pos().unwrap_or_default());
-                            }
+                            self.open_current_folder_context_menu(ctx);
                         }
                     });
 
