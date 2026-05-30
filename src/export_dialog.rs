@@ -4,6 +4,7 @@
 //! composes conceal effects, encodes images, and writes files on a worker so
 //! heavy CPU/I/O work never blocks egui.
 
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -79,6 +80,7 @@ pub enum ExportSource {
         entry_name: String,
     },
     PdfPage,
+    RenderedSpread,
 }
 
 #[derive(Clone)]
@@ -94,10 +96,35 @@ pub struct ExportRequest {
     pub output_format: ExportFormat,
     pub output_dir: PathBuf,
     pub basename: String,
-    pub base_pixels: Arc<egui::ColorImage>,
-    pub conceal_mask: Option<Arc<Vec<bool>>>,
+    pub pixels: ExportPixels,
     pub entries: Vec<ExportEntry>,
     pub include_metadata: bool,
+}
+
+#[derive(Clone)]
+pub struct ExportPagePixels {
+    pub base_pixels: Arc<egui::ColorImage>,
+    pub conceal_mask: Option<Arc<Vec<bool>>>,
+}
+
+#[derive(Clone)]
+pub enum ExportPixels {
+    Single(ExportPagePixels),
+    Spread {
+        left: ExportPagePixels,
+        right: ExportPagePixels,
+    },
+}
+
+impl ExportPixels {
+    pub fn has_conceal_mask(&self) -> bool {
+        match self {
+            Self::Single(page) => page.conceal_mask.is_some(),
+            Self::Spread { left, right } => {
+                left.conceal_mask.is_some() || right.conceal_mask.is_some()
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -115,8 +142,7 @@ pub struct ExportDialogState {
     /// 保存ボタンを押すまでに animation frame が進行したり AI upscale が完了したり
     /// しても、Ctrl+E を押した瞬間の image が export されるようにする
     /// (Codex review CONFIRMED)。
-    pub base_pixels: Arc<egui::ColorImage>,
-    pub conceal_mask: Option<Arc<Vec<bool>>>,
+    pub pixels: ExportPixels,
     /// 元の永続化済み batch selection。state.selection の force-clear 後でも、
     /// settings 保存時にこの「ユーザーが本当に意図した値」を温存する
     /// (Codex review CONFIRMED)。
@@ -332,13 +358,15 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
             entry.suffix,
             extension,
         );
-        let composed = match (&request.conceal_mask, &entry.conceal_preset) {
-            (Some(mask), Some(preset)) => Some(compose_conceal_for_export(
-                request.base_pixels.as_ref(),
-                mask.as_ref(),
-                preset,
-            )),
-            _ => None,
+        let pixels = match render_export_pixels(&request.pixels, entry.conceal_preset.as_ref()) {
+            Ok(pixels) => pixels,
+            Err(message) => {
+                let _ = tx.send(ExportEvent::Failed(ExportFailure {
+                    label: entry.label,
+                    message,
+                }));
+                continue;
+            }
         };
         // 合成は CPU 重 (Mosaic/Blur で 4K だと数秒) なので、合成後 / encode 前にも
         // cancel を再チェックする。これでキャンセルが「encode 中の 1 ファイルだけは
@@ -348,11 +376,8 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
             let _ = tx.send(ExportEvent::Cancelled);
             return;
         }
-        let pixels = composed
-            .as_ref()
-            .unwrap_or_else(|| request.base_pixels.as_ref());
         match save_image_with_metadata(
-            pixels,
+            pixels.as_ref(),
             source_path,
             source_bytes.as_deref(),
             &path,
@@ -382,12 +407,54 @@ fn run_export(request: ExportRequest, cancel: Arc<AtomicBool>, tx: mpsc::Sender<
     let _ = tx.send(ExportEvent::AllDone);
 }
 
+fn render_export_pixels<'a>(
+    pixels: &'a ExportPixels,
+    preset: Option<&ConcealPreset>,
+) -> Result<Cow<'a, egui::ColorImage>, String> {
+    match pixels {
+        ExportPixels::Single(page) => render_export_page_pixels(page, preset),
+        ExportPixels::Spread { left, right } => {
+            let left = render_export_page_pixels(left, preset)?;
+            let right = render_export_page_pixels(right, preset)?;
+            let combined =
+                crate::capture::combine_spread_color_images(left.as_ref(), right.as_ref())?;
+            Ok(Cow::Owned(combined))
+        }
+    }
+}
+
+fn render_export_page_pixels<'a>(
+    page: &'a ExportPagePixels,
+    preset: Option<&ConcealPreset>,
+) -> Result<Cow<'a, egui::ColorImage>, String> {
+    match (&page.conceal_mask, preset) {
+        (Some(mask), Some(preset)) => Ok(Cow::Owned(compose_conceal_for_export(
+            page.base_pixels.as_ref(),
+            mask.as_ref(),
+            preset,
+        )?)),
+        _ => Ok(Cow::Borrowed(page.base_pixels.as_ref())),
+    }
+}
+
 fn compose_conceal_for_export(
     base: &egui::ColorImage,
     mask: &[bool],
     params: &ConcealPreset,
-) -> egui::ColorImage {
-    crate::conceal_compose::compose_with_preset(base, mask, params)
+) -> Result<egui::ColorImage, String> {
+    let expected = base.size[0]
+        .checked_mul(base.size[1])
+        .ok_or_else(|| "隠蔽加工マスクのサイズが大きすぎます".to_string())?;
+    if mask.len() != expected {
+        return Err(format!(
+            "隠蔽加工マスクのサイズが一致しません: mask={}, expected={}",
+            mask.len(),
+            expected
+        ));
+    }
+    Ok(crate::conceal_compose::compose_with_preset(
+        base, mask, params,
+    ))
 }
 
 #[cfg(test)]
@@ -422,8 +489,10 @@ mod tests {
             output_format: ExportFormat::Png,
             output_dir: temp.path().to_path_buf(),
             basename: "out".to_string(),
-            base_pixels: Arc::clone(&pixels),
-            conceal_mask: None,
+            pixels: ExportPixels::Single(ExportPagePixels {
+                base_pixels: Arc::clone(&pixels),
+                conceal_mask: None,
+            }),
             entries: vec![
                 ExportEntry {
                     label: "current".to_string(),
@@ -470,8 +539,10 @@ mod tests {
             output_format: ExportFormat::Png,
             output_dir: temp.path().to_path_buf(),
             basename: "masked".to_string(),
-            base_pixels: pixels,
-            conceal_mask: Some(mask),
+            pixels: ExportPixels::Single(ExportPagePixels {
+                base_pixels: pixels,
+                conceal_mask: Some(mask),
+            }),
             entries: vec![ExportEntry {
                 label: "black".to_string(),
                 suffix: 0,
@@ -502,5 +573,62 @@ mod tests {
             .to_rgba8();
         assert_eq!(out.get_pixel(0, 0).0, [0, 0, 0, 255]);
         assert_eq!(out.get_pixel(1, 0).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn worker_exports_spread_pixels_with_per_page_conceal() {
+        let temp = tempfile::tempdir().unwrap();
+        let left = Arc::new(egui::ColorImage::new([1, 1], vec![egui::Color32::WHITE]));
+        let right = Arc::new(egui::ColorImage::new(
+            [1, 1],
+            vec![egui::Color32::from_rgb(10, 20, 30)],
+        ));
+        let pending = spawn_export_worker(ExportRequest {
+            source: ExportSource::RenderedSpread,
+            original_format: SrcFormat::Other("spread".to_string()),
+            output_format: ExportFormat::Png,
+            output_dir: temp.path().to_path_buf(),
+            basename: "spread".to_string(),
+            pixels: ExportPixels::Spread {
+                left: ExportPagePixels {
+                    base_pixels: left,
+                    conceal_mask: Some(Arc::new(vec![true])),
+                },
+                right: ExportPagePixels {
+                    base_pixels: right,
+                    conceal_mask: None,
+                },
+            },
+            entries: vec![ExportEntry {
+                label: "black".to_string(),
+                suffix: 0,
+                conceal_preset: Some(ConcealPreset {
+                    conceal_type: crate::conceal::ConcealType::BlackFill,
+                    ..Default::default()
+                }),
+            }],
+            include_metadata: false,
+        })
+        .unwrap();
+
+        loop {
+            match pending
+                .rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+            {
+                ExportEvent::Failed(err) => panic!("unexpected export failure: {err:?}"),
+                ExportEvent::AllDone => break,
+                ExportEvent::Started { .. } | ExportEvent::Completed(_) => {}
+                ExportEvent::Cancelled => panic!("unexpected cancel"),
+            }
+        }
+
+        let out = image::open(temp.path().join("spread_0.png"))
+            .unwrap()
+            .to_rgba8();
+        assert_eq!(out.dimensions(), (2, 1));
+        assert_eq!(out.get_pixel(0, 0).0, [0, 0, 0, 255]);
+        assert_eq!(out.get_pixel(1, 0).0, [10, 20, 30, 255]);
     }
 }

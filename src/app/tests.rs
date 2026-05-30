@@ -3073,6 +3073,75 @@ mod favorite_adjustment_defaults_tests {
         assert!(!app.conceal_mode);
     }
 
+    /// 見開き表示中の Ctrl+E は左右ページを 1 つの export snapshot として開く。
+    #[test]
+    fn open_export_dialog_uses_spread_pixels_when_spread_is_visible() {
+        use crate::grid_item::GridItem;
+        use crate::settings::SpreadMode;
+        let ctx = egui::Context::default();
+        let mut app = setup_app();
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
+        app.visible_indices = vec![0, 1];
+        app.thumbnails.push(ThumbnailState::Pending);
+        app.thumbnails.push(ThumbnailState::Pending);
+        let left_pixels =
+            egui::ColorImage::new([1, 2], vec![egui::Color32::RED, egui::Color32::RED]);
+        let right_pixels =
+            egui::ColorImage::new([1, 2], vec![egui::Color32::BLUE, egui::Color32::BLUE]);
+        app.fs_cache.insert(
+            0,
+            FsCacheEntry::Static {
+                tex: ctx.load_texture(
+                    "export_spread_left",
+                    left_pixels.clone(),
+                    egui::TextureOptions::LINEAR,
+                ),
+                pixels: std::sync::Arc::new(left_pixels),
+                source_dims: None,
+                load_seq: 0,
+            },
+        );
+        app.fs_cache.insert(
+            1,
+            FsCacheEntry::Static {
+                tex: ctx.load_texture(
+                    "export_spread_right",
+                    right_pixels.clone(),
+                    egui::TextureOptions::LINEAR,
+                ),
+                pixels: std::sync::Arc::new(right_pixels),
+                source_dims: None,
+                load_seq: 0,
+            },
+        );
+        app.fullscreen_idx = Some(0);
+        app.spread_mode = SpreadMode::Ltr;
+
+        app.open_export_dialog_for_current(&ctx, 0);
+
+        let state = app.export_dialog.take().expect("export dialog should open");
+        assert!(matches!(
+            state.source,
+            crate::export_dialog::ExportSource::RenderedSpread
+        ));
+        assert_eq!(
+            state.original_format,
+            crate::save_with_metadata::SrcFormat::Other("spread".to_string())
+        );
+        match state.pixels {
+            crate::export_dialog::ExportPixels::Spread { left, right } => {
+                assert_eq!(left.base_pixels.size, [1, 2]);
+                assert_eq!(right.base_pixels.size, [1, 2]);
+            }
+            crate::export_dialog::ExportPixels::Single(_) => {
+                panic!("spread export should snapshot both pages")
+            }
+        }
+    }
+
     /// P3-8 後続: 透明画像を消しゴム作業ベースにする時、黒で不透明化されること。
     /// MI-GAN は alpha 非対応なので、透明部は黒・半透明は黒へ減衰・全面 alpha=255。
     /// 全不透明画像は変換不要 (None)。

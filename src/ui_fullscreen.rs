@@ -79,6 +79,15 @@ enum ComparePreparedTextureKind {
     Diff,
 }
 
+struct ExportDialogTarget {
+    source: crate::export_dialog::ExportSource,
+    source_label: String,
+    original_format: crate::save_with_metadata::SrcFormat,
+    source_dir: std::path::PathBuf,
+    basename: String,
+    pixels: crate::export_dialog::ExportPixels,
+}
+
 #[cfg(windows)]
 struct NativeFocusClaim {
     foreground_hwnd: usize,
@@ -8497,45 +8506,10 @@ impl App {
             self.show_feedback_toast("編集モードを閉じてからエクスポートしてください".to_string());
             return;
         }
-        // 消しゴム commit (MI-GAN inpaint) が進行中だと erase_result_cache がまだ
-        // 空で、resolve_export_base_pixels が pre-erase の adjustment_cache / fs_cache
-        // へフォールバックしてしまい「消したつもりの結果が反映されない export」になる。
-        // 同 idx の Commit が完了するまで Ctrl+E を保留する (Codex review CONFIRMED)。
-        let has_commit_pending = self.erase_inpaint_pending.keys().any(|k| {
-            k.idx == fs_idx && matches!(k.kind, crate::ui_erase::EraseInpaintKind::Commit)
-        });
-        if has_commit_pending {
-            self.show_feedback_toast("消しゴム補完の完了後にエクスポートしてください".to_string());
-            return;
-        }
-        // 保存済みマスクがあるのに erase_result_cache が空のままだと、export は
-        // pre-erase pixels を書き出してしまう。AI upscale 完了などで input_gen が
-        // bump され result が clear された直後の状態がこれに該当する
-        // (Phase 1-5 code-review CONFIRMED)。
-        // ensure_erase_result_texture をここで呼んで commit を再投入し、結果が
-        // 揃うまで Ctrl+E を保留する。
-        if self.mask_pages.contains(&fs_idx) {
-            let _ = self.ensure_erase_result_texture(ctx, fs_idx);
-            if self.current_erase_result_pixels(fs_idx).is_none() {
-                self.show_feedback_toast(
-                    "消しゴム補完の準備中です。少し待ってから Ctrl+E を再実行してください"
-                        .to_string(),
-                );
-                return;
-            }
-        }
-        let Ok((source, label, original_format, source_dir, basename)) =
-            self.export_source_info_for_idx(fs_idx)
-        else {
-            self.show_feedback_toast("このアイテムはエクスポートできません".to_string());
-            return;
-        };
-        let base_pixels = match self.resolve_export_base_pixels(fs_idx) {
-            Ok(pixels) => pixels,
-            Err(_) => {
-                self.show_feedback_toast(
-                    "画像の読み込み完了後にエクスポートしてください".to_string(),
-                );
+        let target = match self.prepare_export_dialog_target(ctx, fs_idx) {
+            Ok(target) => target,
+            Err(err) => {
+                self.show_feedback_toast(err);
                 return;
             }
         };
@@ -8545,13 +8519,10 @@ impl App {
             .export_last_directory
             .clone()
             .filter(|p| p.is_dir())
-            .unwrap_or(source_dir);
+            .unwrap_or_else(|| target.source_dir.clone());
         let original_selection = self.settings.export_batch_selection;
         let mut selection = original_selection;
-        let conceal_mask = self
-            .conceal_composite_mask_for_export(fs_idx, base_pixels.size[0], base_pixels.size[1])
-            .map(Arc::new);
-        let has_conceal_mask = conceal_mask.is_some();
+        let has_conceal_mask = target.pixels.has_conceal_mask();
         for i in 1..selection.len() {
             if !has_conceal_mask || self.settings.conceal_presets[i - 1].is_none() {
                 selection[i] = false;
@@ -8563,26 +8534,128 @@ impl App {
         let original_include_metadata = self.settings.export_embed_metadata;
 
         self.export_dialog = Some(crate::export_dialog::ExportDialogState {
-            source,
-            source_label: label,
-            original_format: original_format.clone(),
+            source: target.source,
+            source_label: target.source_label,
+            original_format: target.original_format.clone(),
             output_format: crate::export_dialog::ExportFormat::from_source(
-                &original_format,
+                &target.original_format,
                 self.settings.export_fallback_format,
             ),
-            basename: crate::capture::basename_from_text(&format!("{basename}_edited")),
+            basename: crate::capture::basename_from_text(&format!("{}_edited", target.basename)),
             output_dir_text: output_dir.display().to_string(),
             include_metadata: original_include_metadata,
             selection,
             has_conceal_mask,
-            base_pixels,
-            conceal_mask,
+            pixels: target.pixels,
             original_selection,
             original_include_metadata,
             initial_focus_done: false,
             error: None,
         });
         ctx.request_repaint();
+    }
+
+    fn prepare_export_dialog_target(
+        &mut self,
+        ctx: &egui::Context,
+        fs_idx: usize,
+    ) -> Result<ExportDialogTarget, String> {
+        match self.resolve_spread_pair(fs_idx) {
+            SpreadPair::Single => self.prepare_single_export_dialog_target(ctx, fs_idx),
+            SpreadPair::Double { left, right } => {
+                self.prepare_spread_export_dialog_target(ctx, left, right)
+            }
+        }
+    }
+
+    fn prepare_single_export_dialog_target(
+        &mut self,
+        ctx: &egui::Context,
+        idx: usize,
+    ) -> Result<ExportDialogTarget, String> {
+        self.ensure_export_erase_ready(ctx, &[idx])?;
+        let (source, source_label, original_format, source_dir, basename) =
+            self.export_source_info_for_idx(idx)?;
+        let pixels = self.export_page_pixels_for_idx(idx)?;
+        Ok(ExportDialogTarget {
+            source,
+            source_label,
+            original_format,
+            source_dir,
+            basename,
+            pixels: crate::export_dialog::ExportPixels::Single(pixels),
+        })
+    }
+
+    fn prepare_spread_export_dialog_target(
+        &mut self,
+        ctx: &egui::Context,
+        left_idx: usize,
+        right_idx: usize,
+    ) -> Result<ExportDialogTarget, String> {
+        self.ensure_export_erase_ready(ctx, &[left_idx, right_idx])?;
+        let (_, left_label, _, left_dir, left_basename) =
+            self.export_source_info_for_idx(left_idx)?;
+        let (_, right_label, _, _, right_basename) = self.export_source_info_for_idx(right_idx)?;
+        let left = self.export_page_pixels_for_idx(left_idx)?;
+        let right = self.export_page_pixels_for_idx(right_idx)?;
+        let basename =
+            crate::capture::basename_from_text(&format!("{left_basename}_{right_basename}"));
+        Ok(ExportDialogTarget {
+            source: crate::export_dialog::ExportSource::RenderedSpread,
+            source_label: format!("見開き: {left_label} / {right_label}"),
+            original_format: crate::save_with_metadata::SrcFormat::Other("spread".to_string()),
+            source_dir: left_dir,
+            basename,
+            pixels: crate::export_dialog::ExportPixels::Spread { left, right },
+        })
+    }
+
+    fn ensure_export_erase_ready(
+        &mut self,
+        ctx: &egui::Context,
+        indices: &[usize],
+    ) -> Result<(), String> {
+        // 消しゴム commit (MI-GAN inpaint) が進行中だと erase_result_cache がまだ
+        // 空で、resolve_export_base_pixels が pre-erase の adjustment_cache / fs_cache
+        // へフォールバックしてしまい「消したつもりの結果が反映されない export」になる。
+        if self.erase_inpaint_pending.keys().any(|k| {
+            indices.contains(&k.idx) && matches!(k.kind, crate::ui_erase::EraseInpaintKind::Commit)
+        }) {
+            return Err("消しゴム補完の完了後にエクスポートしてください".to_string());
+        }
+
+        // 保存済みマスクがあるのに erase_result_cache が空のままだと、export は
+        // pre-erase pixels を書き出してしまう。ensure_erase_result_texture をここで
+        // 呼んで commit を再投入し、結果が揃うまで Ctrl+E を保留する。
+        for &idx in indices {
+            if self.mask_pages.contains(&idx) {
+                let _ = self.ensure_erase_result_texture(ctx, idx);
+                if self.current_erase_result_pixels(idx).is_none() {
+                    return Err(
+                        "消しゴム補完の準備中です。少し待ってから Ctrl+E を再実行してください"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn export_page_pixels_for_idx(
+        &self,
+        idx: usize,
+    ) -> Result<crate::export_dialog::ExportPagePixels, String> {
+        let base_pixels = self
+            .resolve_export_base_pixels(idx)
+            .map_err(|_| "画像の読み込み完了後にエクスポートしてください".to_string())?;
+        let conceal_mask = self
+            .conceal_composite_mask_for_export(idx, base_pixels.size[0], base_pixels.size[1])
+            .map(Arc::new);
+        Ok(crate::export_dialog::ExportPagePixels {
+            base_pixels,
+            conceal_mask,
+        })
     }
 
     pub(crate) fn draw_export_dialog(&mut self, ctx: &egui::Context) {
@@ -8685,7 +8758,7 @@ impl App {
                     egui::Checkbox::new(&mut state.include_metadata, "AI プロンプト / EXIF を保持"),
                 );
                 if !metadata_possible {
-                    ui.small("形式変換や PDF ではメタデータ保持は無効です");
+                    ui.small("形式変換、PDF、見開き合成ではメタデータ保持は無効です");
                 }
 
                 ui.separator();
@@ -8956,12 +9029,11 @@ impl App {
         }
         let basename = crate::capture::basename_from_text(&state.basename);
 
-        // ダイアログを開いた瞬間に snapshot した base_pixels / conceal_mask を使う。
+        // ダイアログを開いた瞬間に snapshot した pixels / conceal mask を使う。
         // ここで再 resolve すると animated GIF の current_frame が進んで違うフレーム
         // が export される (Codex review CONFIRMED)。
-        let base_pixels = Arc::clone(&state.base_pixels);
-        let conceal_mask = state.conceal_mask.clone();
-        let has_conceal_mask = conceal_mask.is_some();
+        let pixels = state.pixels.clone();
+        let has_conceal_mask = pixels.has_conceal_mask();
         let mut planned: Vec<(String, u8, Option<crate::conceal::ConcealPreset>)> = Vec::new();
         if state.selection[0] {
             let preset = has_conceal_mask.then(|| self.current_conceal_preset_from_settings());
@@ -9056,8 +9128,7 @@ impl App {
             output_format: state.output_format,
             output_dir,
             basename: resolved_basename,
-            base_pixels,
-            conceal_mask,
+            pixels,
             entries,
             include_metadata: effective_include_metadata,
         };

@@ -405,6 +405,57 @@ fn combine_spread_rgba(
     Ok((basename, width, height, out))
 }
 
+pub fn combine_spread_color_images(
+    left: &egui::ColorImage,
+    right: &egui::ColorImage,
+) -> Result<egui::ColorImage, String> {
+    let [left_w, left_h] = left.size;
+    let [right_w, right_h] = right.size;
+    if left_w == 0 || left_h == 0 || right_w == 0 || right_h == 0 {
+        return Err("見開きキャプチャのサイズが 0 です".to_string());
+    }
+    if left.pixels.len() != left_w * left_h || right.pixels.len() != right_w * right_h {
+        return Err("見開きキャプチャの ColorImage サイズが不正です".to_string());
+    }
+
+    let width = left_w
+        .checked_add(right_w)
+        .ok_or_else(|| "見開きキャプチャの幅が大きすぎます".to_string())?;
+    let height = left_h.max(right_h);
+    let len = width
+        .checked_mul(height)
+        .ok_or_else(|| "見開きキャプチャの画像が大きすぎます".to_string())?;
+    let mut out = vec![egui::Color32::TRANSPARENT; len];
+    blit_centered_color(&mut out, width, height, 0, left_w, left_h, &left.pixels);
+    blit_centered_color(
+        &mut out,
+        width,
+        height,
+        left_w,
+        right_w,
+        right_h,
+        &right.pixels,
+    );
+    Ok(egui::ColorImage::new([width, height], out))
+}
+
+fn blit_centered_color(
+    dst: &mut [egui::Color32],
+    dst_w: usize,
+    dst_h: usize,
+    dst_x: usize,
+    src_w: usize,
+    src_h: usize,
+    src: &[egui::Color32],
+) {
+    let dst_y = (dst_h - src_h) / 2;
+    for y in 0..src_h {
+        let src_start = y * src_w;
+        let dst_start = (dst_y + y) * dst_w + dst_x;
+        dst[dst_start..dst_start + src_w].copy_from_slice(&src[src_start..src_start + src_w]);
+    }
+}
+
 fn blit_centered(
     dst: &mut [u8],
     dst_w: u32,

@@ -7,13 +7,20 @@ use std::time::Duration;
 use eframe::egui;
 use image::ImageEncoder;
 use mimageviewer::export_dialog::{
-    ExportEntry, ExportEvent, ExportFormat, ExportRequest, ExportSource, resolve_session_basename,
-    spawn_export_worker,
+    ExportEntry, ExportEvent, ExportFormat, ExportPagePixels, ExportPixels, ExportRequest,
+    ExportSource, resolve_session_basename, spawn_export_worker,
 };
 use mimageviewer::save_with_metadata::{SaveOptions, SrcFormat, save_image_with_metadata};
 
 fn solid_image(w: usize, h: usize, color: egui::Color32) -> Arc<egui::ColorImage> {
     Arc::new(egui::ColorImage::new([w, h], vec![color; w * h]))
+}
+
+fn single_pixels(base_pixels: Arc<egui::ColorImage>) -> ExportPixels {
+    ExportPixels::Single(ExportPagePixels {
+        base_pixels,
+        conceal_mask: None,
+    })
 }
 
 fn entry(label: &str, suffix: u8) -> ExportEntry {
@@ -175,8 +182,7 @@ fn export_single_jpeg_with_metadata() {
         output_format: ExportFormat::Jpeg95,
         output_dir: temp.path().to_path_buf(),
         basename: "out".to_string(),
-        base_pixels: solid_image(4, 4, egui::Color32::from_rgb(10, 20, 30)),
-        conceal_mask: None,
+        pixels: single_pixels(solid_image(4, 4, egui::Color32::from_rgb(10, 20, 30))),
         entries: vec![entry("current", 0)],
         include_metadata: true,
     })
@@ -200,8 +206,7 @@ fn export_batch_no_collision() {
         output_format: ExportFormat::Png,
         output_dir: temp.path().to_path_buf(),
         basename: "batch".to_string(),
-        base_pixels: solid_image(2, 2, egui::Color32::LIGHT_BLUE),
-        conceal_mask: None,
+        pixels: single_pixels(solid_image(2, 2, egui::Color32::LIGHT_BLUE)),
         entries: vec![
             entry("current", 0),
             entry("preset1", 1),
@@ -230,8 +235,7 @@ fn export_batch_with_collision_uses_session_number() {
         output_format: ExportFormat::Png,
         output_dir: temp.path().to_path_buf(),
         basename,
-        base_pixels: solid_image(2, 2, egui::Color32::LIGHT_GREEN),
-        conceal_mask: None,
+        pixels: single_pixels(solid_image(2, 2, egui::Color32::LIGHT_GREEN)),
         entries: vec![entry("current", 0), entry("preset1", 1)],
         include_metadata: false,
     })
@@ -253,8 +257,7 @@ fn export_batch_partial_failure_continues() {
         output_format: ExportFormat::Png,
         output_dir: temp.path().to_path_buf(),
         basename: "out".to_string(),
-        base_pixels: solid_image(2, 2, egui::Color32::GRAY),
-        conceal_mask: None,
+        pixels: single_pixels(solid_image(2, 2, egui::Color32::GRAY)),
         entries: vec![
             entry("current", 0),
             entry("preset1", 1),
@@ -283,8 +286,7 @@ fn export_cancel_mid_batch() {
         output_format: ExportFormat::Png,
         output_dir: temp.path().to_path_buf(),
         basename: "cancel".to_string(),
-        base_pixels: solid_image(2048, 2048, egui::Color32::from_rgb(20, 40, 60)),
-        conceal_mask: None,
+        pixels: single_pixels(solid_image(2048, 2048, egui::Color32::from_rgb(20, 40, 60))),
         entries: (0..5).map(|i| entry(&format!("entry{i}"), i)).collect(),
         include_metadata: false,
     })
@@ -325,8 +327,7 @@ fn export_fallback_format_for_heic() {
         output_format: ExportFormat::Jpeg95,
         output_dir: temp.path().to_path_buf(),
         basename: "fallback".to_string(),
-        base_pixels: solid_image(3, 3, egui::Color32::from_rgb(100, 80, 60)),
-        conceal_mask: None,
+        pixels: single_pixels(solid_image(3, 3, egui::Color32::from_rgb(100, 80, 60))),
         entries: vec![entry("current", 0)],
         include_metadata: true,
     })
@@ -359,8 +360,7 @@ fn export_zip_source_no_path() {
         output_format: ExportFormat::Png,
         output_dir: temp.path().to_path_buf(),
         basename: "zip-entry".to_string(),
-        base_pixels: solid_image(2, 2, egui::Color32::WHITE),
-        conceal_mask: None,
+        pixels: single_pixels(solid_image(2, 2, egui::Color32::WHITE)),
         entries: vec![entry("current", 0)],
         include_metadata: true,
     })
@@ -382,8 +382,7 @@ fn export_animated_webp_fails() {
         output_format: ExportFormat::Webp,
         output_dir: temp.path().to_path_buf(),
         basename: "animated".to_string(),
-        base_pixels: solid_image(2, 2, egui::Color32::WHITE),
-        conceal_mask: None,
+        pixels: single_pixels(solid_image(2, 2, egui::Color32::WHITE)),
         entries: vec![entry("current", 0)],
         include_metadata: false,
     })
@@ -410,8 +409,7 @@ fn export_webp_source_read_failure_fails_all_entries() {
         output_format: ExportFormat::Png,
         output_dir: temp.path().to_path_buf(),
         basename: "missing".to_string(),
-        base_pixels: solid_image(2, 2, egui::Color32::WHITE),
-        conceal_mask: None,
+        pixels: single_pixels(solid_image(2, 2, egui::Color32::WHITE)),
         entries: vec![entry("a", 0), entry("b", 1)],
         include_metadata: false,
     })
@@ -438,8 +436,7 @@ fn export_animated_webp_rejected_when_output_is_png() {
         output_format: ExportFormat::Png,
         output_dir: temp.path().to_path_buf(),
         basename: "anim2png".to_string(),
-        base_pixels: solid_image(2, 2, egui::Color32::WHITE),
-        conceal_mask: None,
+        pixels: single_pixels(solid_image(2, 2, egui::Color32::WHITE)),
         entries: vec![entry("current", 0)],
         include_metadata: false,
     })

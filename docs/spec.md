@@ -726,10 +726,10 @@ ComfyUI の `prompt` JSON、Midjourney の `Description`）が含まれる場合
 
 ### Ctrl+E エクスポート
 
-- フルスクリーン静止画 (`Image` / `ZipImage` / `PdfPage`) で `Ctrl+E` を押すと、現在の表示結果をファイルに書き出す。動画や区切りアイテムでは無効。
+- フルスクリーン静止画 (`Image` / `ZipImage` / `PdfPage`) で `Ctrl+E` を押すと、現在の表示結果をファイルに書き出す。見開き表示中は左右ページを現在の配置のまま 1 枚の見開き画像として書き出す。動画や区切りアイテムでは無効。
 - `Ctrl+E` のほか、**画像補正パネルのヘッダー右側 (消しゴム / 隠蔽アイコンの隣) の書き出しアイコン** (`draw_export_icon`) からも開ける。補正パネルはホバー表示のオーバーレイなので、クリック時は `adjustment_mode` を `false` にして閉じてから `open_export_dialog_for_current` に合流する (= ビューモードへ戻して合成結果を書き出す)。`open_export_dialog_for_current` は補正 / 消しゴム / 隠蔽 / 分析モード中は弾く (`is_overlay_edit_mode_active() || adjustment_mode || analysis_mode`) ため、`Ctrl+E` 直接押下はこれらのモード中は無効。アイコン経路は補正パネルを閉じることでこのガードを通過する。
 - 出力名は既定で `<元名>_edited`。バッチ出力では `_0` (現在の設定) / `_1`〜`_4` (隠蔽プリセット) を付ける。同じ名前が存在する場合はセッション単位で `_0001` などを挟み、上書きしない。
-- 出力形式は JPEG 95 / PNG / WebP。元形式が書き出し非対応の場合は `Settings::export_fallback_format` に従う。形式変換または PDF ではメタデータ保持は無効。
+- 出力形式は JPEG 95 / PNG / WebP。元形式が書き出し非対応の場合は `Settings::export_fallback_format` に従う。形式変換、PDF、見開き合成ではメタデータ保持は無効。
 - JPEG / PNG / WebP の同形式出力では、`Settings::export_embed_metadata` が有効なら元画像の EXIF / XMP / PNG text / WebP metadata を転記する。ZIP 内画像は worker がエントリバイトを読み、パスの無いメタデータ元として扱う。
 - 永続化設定は `Settings::export_embed_metadata` (メタデータ保持)、`Settings::export_last_directory` (前回保存先)、`Settings::export_batch_selection` (現在 / プリセット 1〜4 のチェック状態)、`Settings::export_fallback_format` (非対応元形式の JPEG / PNG 選択)。
 - 保存は `ctrl-e-export` worker で順次実行する。隠蔽プリセットの合成、画像エンコード、メタデータ転記、ファイル書き込みはいずれも worker 側で行い、UI は進捗モーダルを `try_recv` で更新する。キャンセルは次のエントリ開始前に反映され、処理中の 1 件は完了まで待つ。
