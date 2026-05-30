@@ -9228,6 +9228,16 @@ impl App {
             .iter()
             .filter_map(|&i| shift(i))
             .collect();
+        let shifted_thumb_pixels = std::mem::take(&mut self.thumb_pixels)
+            .into_iter()
+            .filter_map(|(i, v)| {
+                shift(i)
+                    .filter(|&ni| {
+                        ni < self.items.len() && is_thumb_adjust_target(self.items.get(ni))
+                    })
+                    .map(|ni| (ni, v))
+            })
+            .collect();
 
         // selected の詰め動作: `sel - count(removed idx < sel)` は残存 / 削除どちらの
         // ケースでも「old idx の位置に収まる新 idx」(= 繰り上がった次 item) を返す。
@@ -9241,6 +9251,9 @@ impl App {
             .map(|sel| sel - sorted_asc.partition_point(|&x| x < sel));
 
         self.invalidate_idx_state_and_queues();
+        // Loaded のサムネイル本体は Vec::remove で残るため、補正用 source も同じ
+        // idx shift で残す。補正済み TextureHandle は invalidate 後に再生成させる。
+        self.thumb_pixels = shifted_thumb_pixels;
 
         let n = self.items.len();
         if n == 0 {

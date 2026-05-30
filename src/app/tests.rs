@@ -4842,6 +4842,86 @@ mod favorite_adjustment_defaults_tests {
         );
     }
 
+    /// 削除時に Loaded サムネイルを残すなら、補正再生成用の `thumb_pixels` も
+    /// idx shift して残す。これが空になると削除直後だけサムネイルの色調補正が外れる。
+    #[test]
+    fn remove_items_batch_preserves_thumb_pixels_for_loaded_survivors() {
+        use crate::grid_item::{GridItem, ThumbnailState};
+        use std::sync::Arc;
+
+        fn loaded_thumb(
+            ctx: &egui::Context,
+            label: &str,
+            color: egui::Color32,
+        ) -> (ThumbnailState, Arc<egui::ColorImage>) {
+            let image = egui::ColorImage::filled([1, 1], color);
+            let pixels = Arc::new(image.clone());
+            let tex = ctx.load_texture(label, image, egui::TextureOptions::LINEAR);
+            (
+                ThumbnailState::Loaded {
+                    tex,
+                    from_cache: false,
+                    rendered_at_px: 64,
+                    source_dims: Some((1, 1)),
+                },
+                pixels,
+            )
+        }
+
+        let mut app = setup_app();
+        let ctx = egui::Context::default();
+        let (thumb_a, pixels_a) = loaded_thumb(&ctx, "raw_a", egui::Color32::RED);
+        let (thumb_b, pixels_b) = loaded_thumb(&ctx, "raw_b", egui::Color32::GREEN);
+        let (thumb_c, pixels_c) = loaded_thumb(&ctx, "raw_c", egui::Color32::BLUE);
+
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/a.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/b.jpg")));
+        app.items
+            .push(GridItem::Image(std::path::PathBuf::from("c:/p/c.jpg")));
+        app.thumbnails.extend([thumb_a, thumb_b, thumb_c]);
+        app.thumb_pixels.insert(0, Arc::clone(&pixels_a));
+        app.thumb_pixels.insert(1, Arc::clone(&pixels_b));
+        app.thumb_pixels.insert(2, Arc::clone(&pixels_c));
+        app.thumb_adjust_tex.insert(
+            2,
+            ctx.load_texture(
+                "stale_adjusted_c",
+                egui::ColorImage::filled([1, 1], egui::Color32::WHITE),
+                egui::TextureOptions::LINEAR,
+            ),
+        );
+
+        app.remove_items_batch(&[1]);
+
+        assert_eq!(app.items.len(), 2);
+        assert!(matches!(app.thumbnails[0], ThumbnailState::Loaded { .. }));
+        assert!(matches!(app.thumbnails[1], ThumbnailState::Loaded { .. }));
+        assert!(
+            Arc::ptr_eq(
+                app.thumb_pixels.get(&0).expect("old idx 0 stays at 0"),
+                &pixels_a
+            ),
+            "削除されなかった先頭サムネの source pixels は残る"
+        );
+        assert!(
+            Arc::ptr_eq(
+                app.thumb_pixels.get(&1).expect("old idx 2 shifts to 1"),
+                &pixels_c
+            ),
+            "削除位置より後ろの source pixels は新 idx に shift される"
+        );
+        assert!(
+            !app.thumb_pixels.values().any(|p| Arc::ptr_eq(p, &pixels_b)),
+            "削除対象の source pixels は残さない"
+        );
+        assert!(
+            app.thumb_adjust_tex.is_empty(),
+            "補正済み TextureHandle は stale なので削除後に再生成させる"
+        );
+    }
+
     // ─────────────────────────────────────────────────────────────────────
     // 見開き左右独立補正: copy_spread_adjust のテスト
     // ─────────────────────────────────────────────────────────────────────
