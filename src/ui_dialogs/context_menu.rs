@@ -27,6 +27,210 @@ impl ContextMenuAction {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteConfirmKind {
+    RecycleBin,
+    MayPermanent,
+}
+
+fn delete_confirm_label_for_targets(targets: &[(usize, PathBuf)]) -> String {
+    let kind = if delete_targets_may_permanently_delete(targets) {
+        DeleteConfirmKind::MayPermanent
+    } else {
+        DeleteConfirmKind::RecycleBin
+    };
+    let count = targets.len();
+    let single_name = (count == 1).then(|| {
+        targets[0]
+            .1
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("?")
+    });
+    build_delete_confirm_label(count, single_name, kind)
+}
+
+fn build_delete_confirm_label(
+    count: usize,
+    single_name: Option<&str>,
+    kind: DeleteConfirmKind,
+) -> String {
+    match (kind, count, single_name) {
+        (DeleteConfirmKind::RecycleBin, 1, Some(name)) => {
+            format!("「{name}」をゴミ箱に移動しますか？")
+        }
+        (DeleteConfirmKind::RecycleBin, _, _) => {
+            format!("{count} 件のファイルをゴミ箱に移動しますか？")
+        }
+        (DeleteConfirmKind::MayPermanent, 1, Some(name)) => format!(
+            "「{name}」はゴミ箱に移動できない場所にある可能性があります。\n\
+             完全に削除される場合があります。削除しますか？"
+        ),
+        (DeleteConfirmKind::MayPermanent, _, _) => format!(
+            "{count} 件のうち、ゴミ箱に移動できない場所のファイルがあります。\n\
+             完全に削除される場合があります。削除しますか？"
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn delete_targets_may_permanently_delete(targets: &[(usize, PathBuf)]) -> bool {
+    let mut checked_roots: std::collections::HashMap<String, Option<u64>> =
+        std::collections::HashMap::new();
+    for (_, path) in targets {
+        let Some(root) = windows_path_root_for_file_operation(path) else {
+            return true;
+        };
+        if !checked_roots.contains_key(&root) {
+            if windows_root_may_permanently_delete(&root) {
+                return true;
+            }
+            checked_roots.insert(root.clone(), windows_recycle_bin_max_capacity_bytes(&root));
+        }
+        if let Some(Some(max_capacity_bytes)) = checked_roots.get(&root) {
+            if windows_file_exceeds_recycle_bin_capacity(path, *max_capacity_bytes) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(not(windows))]
+fn delete_targets_may_permanently_delete(_targets: &[(usize, PathBuf)]) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn windows_root_may_permanently_delete(root: &str) -> bool {
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+    let drive_type = unsafe { GetDriveTypeW(PCWSTR(wide.as_ptr())) };
+
+    if windows_drive_type_may_permanently_delete(drive_type) {
+        return true;
+    }
+
+    windows_recycle_bin_nuke_on_delete(root).unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn windows_drive_type_may_permanently_delete(drive_type: u32) -> bool {
+    const DRIVE_UNKNOWN: u32 = 0;
+    const DRIVE_NO_ROOT_DIR: u32 = 1;
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_REMOTE: u32 = 4;
+    const DRIVE_CDROM: u32 = 5;
+    const DRIVE_RAMDISK: u32 = 6;
+
+    matches!(
+        drive_type,
+        DRIVE_REMOVABLE
+            | DRIVE_REMOTE
+            | DRIVE_CDROM
+            | DRIVE_RAMDISK
+            | DRIVE_NO_ROOT_DIR
+            | DRIVE_UNKNOWN
+    )
+}
+
+#[cfg(windows)]
+fn windows_recycle_bin_nuke_on_delete(root: &str) -> Option<bool> {
+    windows_recycle_bin_dword(root, "NukeOnDelete").map(|v| v != 0)
+}
+
+#[cfg(windows)]
+fn windows_recycle_bin_max_capacity_bytes(root: &str) -> Option<u64> {
+    windows_recycle_bin_dword(root, "MaxCapacity")
+        .map(|mb| u64::from(mb).saturating_mul(1024 * 1024))
+}
+
+#[cfg(windows)]
+fn windows_file_exceeds_recycle_bin_capacity(path: &Path, max_capacity_bytes: u64) -> bool {
+    std::fs::metadata(path)
+        .map(|meta| meta.is_file() && meta.len() > max_capacity_bytes)
+        .unwrap_or(false)
+}
+
+#[cfg(windows)]
+fn windows_recycle_bin_dword(root: &str, value_name: &str) -> Option<u32> {
+    let volume_guid = windows_volume_guid_for_root(root)?;
+    let subkey = format!(
+        "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\BitBucket\\Volume\\{volume_guid}"
+    );
+    windows_registry_dword(&subkey, value_name)
+}
+
+#[cfg(windows)]
+fn windows_volume_guid_for_root(root: &str) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut buffer = vec![0u16; 64];
+    unsafe { GetVolumeNameForVolumeMountPointW(PCWSTR(wide.as_ptr()), &mut buffer) }.ok()?;
+    let end = buffer
+        .iter()
+        .position(|&ch| ch == 0)
+        .unwrap_or(buffer.len());
+    let volume_name = String::from_utf16_lossy(&buffer[..end]);
+    let start = volume_name.find('{')?;
+    let end = volume_name[start..].find('}')? + start + 1;
+    Some(volume_name[start..end].to_owned())
+}
+
+#[cfg(windows)]
+fn windows_registry_dword(subkey: &str, value_name: &str) -> Option<u32> {
+    use std::ffi::c_void;
+    use windows::Win32::System::Registry::{
+        HKEY_CURRENT_USER, REG_VALUE_TYPE, RRF_RT_REG_DWORD, RegGetValueW,
+    };
+    use windows::core::PCWSTR;
+
+    let subkey: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+    let value_name: Vec<u16> = value_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut data: u32 = 0;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let mut value_type = REG_VALUE_TYPE(0);
+    let result = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            PCWSTR(subkey.as_ptr()),
+            PCWSTR(value_name.as_ptr()),
+            RRF_RT_REG_DWORD,
+            Some(&mut value_type),
+            Some(&mut data as *mut u32 as *mut c_void),
+            Some(&mut size),
+        )
+    };
+    result.is_ok().then_some(data)
+}
+
+#[cfg(windows)]
+fn windows_path_root_for_file_operation(path: &Path) -> Option<String> {
+    use std::path::{Component, Prefix};
+
+    match path.components().next()? {
+        Component::Prefix(prefix) => match prefix.kind() {
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                Some(format!("{}:\\", (letter as char).to_ascii_uppercase()))
+            }
+            Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => Some(format!(
+                "\\\\{}\\{}\\",
+                server.to_string_lossy(),
+                share.to_string_lossy()
+            )),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 impl crate::app::App {
     /// コンテキストメニューを表示する。
     pub(crate) fn show_context_menu(&mut self, ctx: &egui::Context) -> Option<ContextMenuAction> {
@@ -757,21 +961,15 @@ impl crate::app::App {
 
         if self.delete_targets.is_empty() {
             self.show_delete_confirm = false;
+            self.delete_confirm_label = None;
             return;
         }
 
-        let count = self.delete_targets.len();
-        let label = if count == 1 {
-            let name = self.delete_targets[0]
-                .1
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("?")
-                .to_string();
-            format!("「{name}」をゴミ箱に移動しますか？")
-        } else {
-            format!("{count} 件のファイルをゴミ箱に移動しますか？")
-        };
+        if self.delete_confirm_label.is_none() {
+            self.delete_confirm_label =
+                Some(delete_confirm_label_for_targets(&self.delete_targets));
+        }
+        let label = self.delete_confirm_label.clone().unwrap_or_default();
 
         let mut open = true;
         let mut do_start_delete = false;
@@ -789,6 +987,7 @@ impl crate::app::App {
                     if ui.button("キャンセル").clicked() {
                         self.show_delete_confirm = false;
                         self.delete_targets.clear();
+                        self.delete_confirm_label = None;
                     }
                 });
             });
@@ -796,6 +995,7 @@ impl crate::app::App {
         if !open {
             self.show_delete_confirm = false;
             self.delete_targets.clear();
+            self.delete_confirm_label = None;
         }
 
         if do_start_delete {
@@ -804,6 +1004,7 @@ impl crate::app::App {
                 self.delete_targets.iter().map(|(_, p)| p.clone()).collect();
             self.show_delete_confirm = false;
             self.delete_targets.clear();
+            self.delete_confirm_label = None;
             self.start_delete_files(paths);
         }
     }
@@ -1527,5 +1728,61 @@ fn open_folder_in_explorer(path: &std::path::Path) {
     #[cfg(not(windows))]
     {
         let _ = path;
+    }
+}
+
+#[cfg(test)]
+mod delete_confirm_tests {
+    use super::*;
+
+    #[test]
+    fn delete_confirm_label_keeps_recycle_bin_wording_for_normal_targets() {
+        let label =
+            build_delete_confirm_label(1, Some("sample.jpg"), DeleteConfirmKind::RecycleBin);
+        assert_eq!(label, "「sample.jpg」をゴミ箱に移動しますか？");
+
+        let label = build_delete_confirm_label(3, None, DeleteConfirmKind::RecycleBin);
+        assert_eq!(label, "3 件のファイルをゴミ箱に移動しますか？");
+    }
+
+    #[test]
+    fn delete_confirm_label_warns_when_delete_may_be_permanent() {
+        let label =
+            build_delete_confirm_label(1, Some("sample.jpg"), DeleteConfirmKind::MayPermanent);
+        assert!(
+            label.contains("完全に削除される場合があります"),
+            "single-target warning should mention permanent deletion: {label}"
+        );
+        assert!(
+            label.contains("sample.jpg"),
+            "single-target warning should include the file name: {label}"
+        );
+
+        let label = build_delete_confirm_label(2, None, DeleteConfirmKind::MayPermanent);
+        assert!(
+            label.contains("ゴミ箱に移動できない場所"),
+            "multi-target warning should mention non-recyclable locations: {label}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_path_root_for_file_operation_extracts_drive_and_unc_roots() {
+        assert_eq!(
+            windows_path_root_for_file_operation(Path::new(r"j:\folder\sample.jpg")),
+            Some("J:\\".to_owned())
+        );
+        assert_eq!(
+            windows_path_root_for_file_operation(Path::new(r"\\server\share\dir\sample.jpg")),
+            Some(r"\\server\share\".to_owned())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_drive_type_marks_removable_and_remote_as_permanent_risk() {
+        assert!(windows_drive_type_may_permanently_delete(2));
+        assert!(windows_drive_type_may_permanently_delete(4));
+        assert!(!windows_drive_type_may_permanently_delete(3));
     }
 }

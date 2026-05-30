@@ -2135,6 +2135,9 @@ pub struct App {
     pub(crate) show_delete_confirm: bool,
     /// 削除対象のファイルパスリスト
     pub(crate) delete_targets: Vec<(usize, PathBuf)>,
+    /// 削除確認ダイアログの文言。ドライブ種別 / ゴミ箱設定 / 容量判定を毎フレーム
+    /// 繰り返さないよう、ダイアログ単位でキャッシュする。
+    pub(crate) delete_confirm_label: Option<String>,
 
     // ── ペースト後のフォルダ再読み込みフラグ ──────────────────────
     pub(crate) pending_reload: bool,
@@ -3812,6 +3815,7 @@ impl App {
             fs_context_menu_pos: egui::Pos2::ZERO,
             show_delete_confirm: false,
             delete_targets: Vec::new(),
+            delete_confirm_label: None,
             pending_reload: false,
             paste_pending: Vec::new(),
             drop_copy_pending: Vec::new(),
