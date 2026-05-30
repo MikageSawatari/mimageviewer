@@ -407,6 +407,7 @@ struct NativeEguiOverlay {
     /// UX 上自然、Codex P3 2026-05-24)。
     ime_composing: bool,
     video_metadata: Option<NativeOverlayMetadata>,
+    fallback_file_name: String,
     navigation_preview: Option<NativeOverlayNavigationPreview>,
     navigation_preview_texture: Option<(u64, egui::TextureHandle)>,
     tile_overlay: Option<NativeOverlayTileOverlay>,
@@ -2888,6 +2889,12 @@ impl NativeVideoPresenter {
         }
     }
 
+    pub fn set_overlay_fallback_file_name(&mut self, file_name: String) {
+        if let Some(overlay) = self.egui_overlay.as_mut() {
+            overlay.set_fallback_file_name(file_name);
+        }
+    }
+
     pub fn set_overlay_tile_overlay(&mut self, tile_overlay: Option<NativeOverlayTileOverlay>) {
         if let Some(overlay) = self.egui_overlay.as_mut() {
             overlay.set_tile_overlay(tile_overlay);
@@ -3675,6 +3682,7 @@ impl NativeEguiOverlay {
             bulk_bookmark_dialog: None,
             ime_composing: false,
             video_metadata: None,
+            fallback_file_name: String::new(),
             navigation_preview: None,
             navigation_preview_texture: None,
             tile_overlay: None,
@@ -4145,6 +4153,19 @@ impl NativeEguiOverlay {
             return;
         }
         self.video_metadata = metadata;
+        self.dirty = true;
+    }
+
+    fn set_fallback_file_name(&mut self, file_name: String) {
+        let file_name = if file_name.trim().is_empty() {
+            String::new()
+        } else {
+            file_name
+        };
+        if self.fallback_file_name == file_name {
+            return;
+        }
+        self.fallback_file_name = file_name;
         self.dirty = true;
     }
 
@@ -5246,6 +5267,7 @@ impl NativeEguiOverlay {
         let mut bookmark_title_edit = self.bookmark_title_edit.take();
         let mut bulk_bookmark_dialog = self.bulk_bookmark_dialog.take();
         let video_metadata = self.video_metadata.clone();
+        let fallback_file_name = self.fallback_file_name.clone();
         let navigation_preview = self.navigation_preview.clone();
         let navigation_preview_texture_id = self
             .navigation_preview_texture
@@ -5481,6 +5503,7 @@ impl NativeEguiOverlay {
                     position_secs,
                     duration_secs,
                     video_metadata.as_ref(),
+                    &fallback_file_name,
                     perf_visible,
                     vst3_available,
                     vst3_panel_visible,

@@ -1642,6 +1642,10 @@ pub(super) fn draw_native_center_status(
     egui::Area::new(egui::Id::new("native_video_center_status"))
         .order(egui::Order::Foreground)
         .fixed_pos(egui::Pos2::ZERO)
+        // Passive status only. Keeping the full-screen Area interactable makes
+        // broken-video error/preparing overlays consume right-click release
+        // events before the fullscreen close handler can see them.
+        .interactable(false)
         .show(ctx, |ui| {
             let full_rect = egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -1930,6 +1934,7 @@ pub(super) fn draw_native_top_bar(
     position_secs: f64,
     duration_secs: f64,
     metadata: Option<&NativeOverlayMetadata>,
+    fallback_file_name: &str,
     perf_visible: bool,
     vst3_available: bool,
     vst3_panel_visible: bool,
@@ -1944,15 +1949,25 @@ pub(super) fn draw_native_top_bar(
             ui.set_min_size(rect.size());
             let painter = ui.painter().clone();
             draw_top_bar_background(&painter, overlay_width_points);
+            let fallback = fallback_file_name.trim();
             let name = metadata
                 .and_then(|m| {
                     m.title
                         .as_ref()
+                        .map(String::as_str)
                         .filter(|title| !title.trim().is_empty())
-                        .or(Some(&m.file_name))
+                        .or_else(|| {
+                            let file_name = m.file_name.as_str();
+                            (!file_name.trim().is_empty()).then_some(file_name)
+                        })
                 })
-                .map(String::as_str)
-                .unwrap_or("video");
+                .unwrap_or_else(|| {
+                    if fallback.is_empty() {
+                        "video"
+                    } else {
+                        fallback
+                    }
+                });
             let sub = if let Some(m) = metadata {
                 format!(
                     "{}x{}  {}  {}  {}",
@@ -2678,6 +2693,7 @@ pub(super) fn draw_native_metadata_panel(
                     .max_rect(content_rect)
                     .layout(egui::Layout::top_down(egui::Align::LEFT)),
             );
+            content_ui.spacing_mut().scroll = native_metadata_panel_scroll_style();
             egui::ScrollArea::vertical()
                 .id_salt("native_video_metadata_scroll")
                 .auto_shrink([false; 2])
@@ -2714,6 +2730,15 @@ pub(super) fn draw_native_metadata_panel(
                     }
                 });
         });
+}
+
+pub(super) fn native_metadata_panel_scroll_style() -> egui::style::ScrollStyle {
+    let mut scroll = egui::style::ScrollStyle::solid();
+    scroll.bar_width = 8.0;
+    scroll.bar_inner_margin = 4.0;
+    scroll.bar_outer_margin = 2.0;
+    scroll.foreground_color = true;
+    scroll
 }
 
 pub(super) fn draw_native_tile_overlay(
@@ -4009,6 +4034,15 @@ mod tests {
         assert_eq!(hover_bottom, overlay_h - (HUD_BOTTOM_HEIGHT + 2.0));
         assert_eq!(jump.max.y, hover_bottom);
         assert_eq!(meta.max.y, hover_bottom);
+    }
+
+    #[test]
+    fn metadata_panel_scrollbar_stays_visible_without_hover() {
+        let scroll = native_metadata_panel_scroll_style();
+        assert!(!scroll.floating);
+        assert!(scroll.foreground_color);
+        assert!(scroll.bar_width >= 8.0);
+        assert!(scroll.allocated_width() >= 10.0);
     }
 
     fn jump_entry(pts_secs: f64) -> NativeOverlayJumpEntry {

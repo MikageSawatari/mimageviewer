@@ -15108,6 +15108,10 @@ impl App {
                 #[cfg(windows)]
                 let native_config = native_video_presenter_config(
                     self.main_hwnd,
+                    vp.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("video")
+                        .to_string(),
                     self.video_perf_overlay_visible,
                     self.video_tile_mode_active || self.video_tile_reopen_pending,
                     self.settings.vst3_enabled,
@@ -25451,6 +25455,7 @@ fn video_resume_for_open(
 #[cfg(windows)]
 fn native_video_presenter_config(
     main_hwnd: Option<isize>,
+    fallback_file_name: String,
     perf_overlay_visible: bool,
     initial_tile_overlay: bool,
     vst3_available: bool,
@@ -25508,6 +25513,7 @@ fn native_video_presenter_config(
     Some(crate::video::NativeVideoOutputConfig {
         rect,
         owner_hwnd: main_hwnd.unwrap_or_default() as u64,
+        fallback_file_name,
         sync_interval,
         perf_overlay_visible,
         initial_tile_overlay,

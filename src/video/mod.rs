@@ -256,6 +256,7 @@ struct NativeHoverThumbnailKey {
 pub struct NativeVideoOutputConfig {
     pub rect: windows::Win32::Foundation::RECT,
     pub owner_hwnd: u64,
+    pub fallback_file_name: String,
     pub sync_interval: u32,
     pub perf_overlay_visible: bool,
     pub initial_tile_overlay: bool,
@@ -441,6 +442,7 @@ pub(crate) struct SwitchSourcePayload {
     /// 同じ Arc を渡す (fast-swap 経路でも引き継がれる)。
     audio_diagnostics: Arc<crate::video::audio_diagnostics::AudioDiagnostics>,
     source_epoch: u64,
+    fallback_file_name: String,
     show_preparing_overlay: bool,
 }
 
@@ -1650,6 +1652,7 @@ fn run_native_video_output(
     let mut cur_loop_mode: Option<crate::settings::VideoLoopMode> = None;
     let mut cur_continuous_mode: Option<VideoContinuousMode> = None;
     let mut cur_video_compact: Option<bool> = None;
+    let mut cur_fallback_file_name = config.fallback_file_name.clone();
     fn publish_presenter_window(
         window: &crate::video::native_window::NativeVideoWindow,
         hwnd_out: &Arc<AtomicU64>,
@@ -1716,11 +1719,15 @@ fn run_native_video_output(
             );
         }
     }
+    let run_started = Instant::now();
     presenter.set_overlay_vst3_available(config.vst3_available);
     presenter.set_overlay_checked(config.checked);
+    presenter.set_overlay_fallback_file_name(cur_fallback_file_name.clone());
     if config.initial_tile_overlay {
         presenter.set_overlay_tile_overlay(Some(
-            crate::video::native_presenter::NativeOverlayTileOverlay::preparing(),
+            crate::video::native_presenter::NativeOverlayTileOverlay::preparing_with_filename(
+                cur_fallback_file_name.clone(),
+            ),
         ));
         if let Err(err) = presenter.tick_overlay_video_state(
             clock.now_secs(),
@@ -1739,6 +1746,47 @@ fn run_native_video_output(
             ));
         }
     }
+    // Publish the native window as soon as the overlay can draw its center status.
+    // Broken/unsupported videos may never produce a first frame, so waiting until
+    // first-present leaves the user on the egui fallback surface with the native
+    // video input/HUD path inactive. Showing the presenter early gives the
+    // preparing/error overlay a real HWND and keeps wheel/hover/Esc routing
+    // consistent with normal video playback.
+    if !config.initial_tile_overlay
+        && let Err(err) = presenter.tick_overlay_video_state(
+            clock.now_secs(),
+            f64::from_bits(duration_secs_bits.load(Ordering::Acquire)),
+            clock.is_playing(),
+            clock.volume(),
+            clock.is_muted(),
+            clock.limiter_ceiling_hit_seq(),
+            clock.playback_speed(),
+            frame_step_active.load(Ordering::Acquire),
+            clock.is_seeking(),
+            clock.current_seek_serial(),
+        )
+    {
+        crate::logger::log(format!(
+            "[native-video] initial preparing overlay render failed: {err}"
+        ));
+    }
+    publish_presenter_window(
+        &window,
+        &hwnd_out,
+        &hud_hwnd_out,
+        presenter.hud_hwnd(),
+        &config,
+        cur_in_window,
+        width,
+        height,
+        run_started,
+        if config.initial_tile_overlay {
+            "initial-tile-overlay"
+        } else {
+            "initial-overlay"
+        },
+        &mut presenter_window_published,
+    );
 
     let mut source = PresenterSourceState::new(SwitchSourcePayload {
         video_rx,
@@ -1751,9 +1799,9 @@ fn run_native_video_output(
         dynamic,
         audio_diagnostics,
         source_epoch: 0,
+        fallback_file_name: cur_fallback_file_name.clone(),
         show_preparing_overlay: config.initial_tile_overlay,
     });
-    let run_started = Instant::now();
     let mut last_summary_log = Instant::now();
     let mut last_present_log = Instant::now();
     let mut last_overlay_tick = Instant::now();
@@ -2151,6 +2199,7 @@ fn run_native_video_output(
                         present_retire.len(),
                     );
                     let show_preparing_overlay = payload.show_preparing_overlay;
+                    cur_fallback_file_name = payload.fallback_file_name.clone();
                     source = PresenterSourceState::new(*payload);
                     emit_native_vram_trace(
                         "switch_source_attached",
@@ -2186,6 +2235,7 @@ fn run_native_video_output(
                             file_size: 0,
                         },
                     );
+                    presenter.set_overlay_fallback_file_name(cur_fallback_file_name.clone());
                     presenter.set_overlay_metadata(None);
                     presenter.set_overlay_timeline_markers(Vec::new());
                     presenter.set_overlay_jump_entries(Vec::new());
@@ -2219,7 +2269,9 @@ fn run_native_video_output(
                         // The new player will resend fresh overlay content; keep the
                         // tile surface visible while its VideoInfo and thumbnails load.
                         presenter.set_overlay_tile_overlay(Some(
-                            crate::video::native_presenter::NativeOverlayTileOverlay::preparing(),
+                            crate::video::native_presenter::NativeOverlayTileOverlay::preparing_with_filename(
+                                cur_fallback_file_name.clone(),
+                            ),
                         ));
                     }
                     if !source.clock.is_playing() {
@@ -2307,6 +2359,9 @@ fn run_native_video_output(
                                             cur_vst3_available && !in_window,
                                         );
                                         new_presenter.set_overlay_checked(cur_checked);
+                                        new_presenter.set_overlay_fallback_file_name(
+                                            cur_fallback_file_name.clone(),
+                                        );
                                         if let Some((sar_num, sar_den)) = cur_sar {
                                             if let Err(err) =
                                                 new_presenter.set_video_sar(sar_num, sar_den)
@@ -4924,6 +4979,12 @@ impl VideoPlayer {
             dynamic: Arc::clone(&self.dynamic),
             audio_diagnostics: Arc::clone(&self.audio_diagnostics),
             source_epoch,
+            fallback_file_name: self
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("video")
+                .to_string(),
             show_preparing_overlay,
         }
     }
