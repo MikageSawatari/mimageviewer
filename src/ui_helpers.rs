@@ -625,7 +625,6 @@ pub fn draw_histogram(
 
     let mono = egui::FontId::monospace(12.0);
     egui::Grid::new(ui.next_auto_id())
-        .num_columns(if avg_times.is_some() { 4 } else { 3 })
         .spacing([4.0, 1.0])
         .show(ui, |ui| {
             for (bucket, &count) in hist.iter().enumerate() {
@@ -679,7 +678,6 @@ pub fn draw_format_rows(ui: &mut egui::Ui, rows: &[(&str, u64, f64)]) {
     }
     let mono = egui::FontId::monospace(12.0);
     egui::Grid::new(ui.next_auto_id())
-        .num_columns(4)
         .spacing([4.0, 1.0])
         .show(ui, |ui| {
             for (label, count, total_time) in rows {

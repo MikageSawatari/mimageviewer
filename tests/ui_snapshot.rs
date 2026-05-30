@@ -172,6 +172,36 @@ fn cell_filename_mixed_glyphs_dark() {
     );
 }
 
+#[test]
+fn stats_histogram_compact_columns_light() {
+    snapshot_with_theme(
+        "stats_histogram_compact_columns_light",
+        mimageviewer::os_theme::ResolvedTheme::Light,
+        |ui| {
+            ui.set_width(440.0);
+            ui.heading("読み込み時間 (decode + display)");
+            ui.add_space(4.0);
+
+            let mut hist = [0_u64; mimageviewer::stats::LOAD_TIME_BUCKETS];
+            for (bucket, count) in [
+                47, 6, 6, 0, 0, 1, 2, 0, 4, 3, 4, 2, 2, 0, 0, 0, 0, 1, 0, 0, 9,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                hist[bucket] = count;
+            }
+
+            mimageviewer::ui_helpers::draw_histogram(
+                ui,
+                &hist,
+                mimageviewer::stats::ThumbStats::load_time_label,
+                None,
+            );
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Susie 診断 UI (PoolStatus 各バリアントのレンダリング) のスナップショット
 // ---------------------------------------------------------------------------
