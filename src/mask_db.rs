@@ -583,6 +583,61 @@ pub fn shapes_from_json(s: &str) -> Vec<Shape> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
+/// 円形ブラシで from → to を 1bit マスクへ塗る/消す。
+///
+/// ブラシ中心は画像外座標でもよく、円が画像範囲に重なる部分だけをクリップして処理する。
+/// `true` を返すのは少なくとも 1 pixel の値が変わった場合。
+pub fn paint_brush_line_bitmap(
+    mask: &mut [bool],
+    w: usize,
+    h: usize,
+    from: (f32, f32),
+    to: (f32, f32),
+    radius: f32,
+    value: bool,
+) -> bool {
+    if w == 0 || h == 0 || mask.len() < w.saturating_mul(h) {
+        return false;
+    }
+    let radius = radius.max(1.0);
+    let dx = to.0 - from.0;
+    let dy = to.1 - from.1;
+    let dist = (dx * dx + dy * dy).sqrt();
+    let steps = (dist / (radius * 0.5)).ceil().max(1.0) as usize;
+    let mut changed = false;
+
+    for step in 0..=steps {
+        let t = step as f32 / steps as f32;
+        let cx = from.0 + dx * t;
+        let cy = from.1 + dy * t;
+
+        let x0 = ((cx - radius).floor().max(0.0).min(w as f32)) as usize;
+        let y0 = ((cy - radius).floor().max(0.0).min(h as f32)) as usize;
+        let x1 = ((cx + radius).ceil().max(0.0).min(w as f32)) as usize;
+        let y1 = ((cy + radius).ceil().max(0.0).min(h as f32)) as usize;
+        if x0 >= x1 || y0 >= y1 {
+            continue;
+        }
+
+        let r_sq = radius * radius;
+        for py in y0..y1 {
+            for px in x0..x1 {
+                let ddx = px as f32 + 0.5 - cx;
+                let ddy = py as f32 + 0.5 - cy;
+                if ddx * ddx + ddy * ddy <= r_sq {
+                    let idx = py * w + px;
+                    if mask[idx] != value {
+                        mask[idx] = value;
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    changed
+}
+
 /// スキャンライン方式の多角形塗り。エラサーモードのビットマップ塗りと
 /// ベクタラスタライズで共用する。`value=true` で塗り、`false` で消去。
 pub fn scanline_fill_polygon(
@@ -970,6 +1025,45 @@ mod tests {
         // 中心軸 y=10, thickness=4 → y=8..12 の範囲で x=10..90 が塗られているはず
         assert!(mask[10 * 100 + 50]);
         assert!(!mask[50]); // y=0 行 (x=50) は塗られない
+    }
+
+    #[test]
+    fn paint_brush_line_bitmap_paints_when_center_is_outside_image() {
+        let mut mask = vec![false; 10 * 10];
+
+        let changed =
+            paint_brush_line_bitmap(&mut mask, 10, 10, (-1.5, 5.0), (-1.5, 5.0), 3.0, true);
+
+        assert!(changed);
+        assert!(mask[5 * 10], "left edge should be painted");
+        assert!(!mask[5 * 10 + 5], "far pixels should stay untouched");
+    }
+
+    #[test]
+    fn paint_brush_line_bitmap_ignores_non_overlapping_outside_brush() {
+        let mut mask = vec![false; 10 * 10];
+
+        let changed =
+            paint_brush_line_bitmap(&mut mask, 10, 10, (-10.0, 5.0), (-10.0, 5.0), 3.0, true);
+
+        assert!(!changed);
+        assert!(mask.iter().all(|&v| !v));
+    }
+
+    #[test]
+    fn scanline_fill_polygon_clips_points_outside_image() {
+        let mut mask = vec![false; 10 * 10];
+        let points = [(-5.0, -5.0), (5.0, -5.0), (5.0, 5.0), (-5.0, 5.0)];
+
+        scanline_fill_polygon(&mut mask, &points, 10, 10, true);
+
+        assert!(mask[0], "top-left clipped area should be filled");
+        assert!(mask[4 * 10 + 4], "inside clipped polygon should be filled");
+        assert!(!mask[5 * 10 + 4], "rows below polygon should stay clear");
+        assert!(
+            !mask[4 * 10 + 5],
+            "columns outside polygon should stay clear"
+        );
     }
 
     #[test]

@@ -787,6 +787,20 @@ impl App {
         }
     }
 
+    /// スクリーン座標を画像ピクセル座標 (f32) に変換する。画像外座標も返す。
+    fn screen_to_image_f32_unclamped(
+        &self,
+        screen_pos: egui::Pos2,
+        full_rect: egui::Rect,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+    ) -> Option<(f32, f32)> {
+        let (total_scale, img_rect) = self.erase_image_layout(full_rect, zoom_pan)?;
+        Some((
+            (screen_pos.x - img_rect.min.x) / total_scale,
+            (screen_pos.y - img_rect.min.y) / total_scale,
+        ))
+    }
+
     /// 画像ピクセル座標をスクリーン座標に変換する。
     fn image_to_screen(
         &self,
@@ -815,37 +829,12 @@ impl App {
             None => return,
         };
 
-        let dx = to.0 - from.0;
-        let dy = to.1 - from.1;
-        let dist = (dx * dx + dy * dy).sqrt();
-        let steps = (dist / (radius * 0.5)).ceil().max(1.0) as usize;
-
-        for step in 0..=steps {
-            let t = step as f32 / steps as f32;
-            let cx = from.0 + dx * t;
-            let cy = from.1 + dy * t;
-
-            let r = radius;
-            let x0 = (cx - r).floor().max(0.0) as usize;
-            let y0 = (cy - r).floor().max(0.0) as usize;
-            let x1 = (cx + r).ceil().min(w as f32) as usize;
-            let y1 = (cy + r).ceil().min(h as f32) as usize;
-            let r_sq = r * r;
-
-            for py in y0..y1 {
-                for px in x0..x1 {
-                    let ddx = px as f32 + 0.5 - cx;
-                    let ddy = py as f32 + 0.5 - cy;
-                    if ddx * ddx + ddy * ddy <= r_sq {
-                        mask[py * w + px] = paint;
-                    }
-                }
+        if crate::mask_db::paint_brush_line_bitmap(mask, w, h, from, to, radius, paint) {
+            self.erase_mask_texture = None;
+            // mask 変化 → preview cache を破棄。
+            if let Some(fs_idx) = self.fullscreen_idx {
+                self.clear_erase_preview(fs_idx);
             }
-        }
-        self.erase_mask_texture = None;
-        // mask 変化 → preview cache を破棄。
-        if let Some(fs_idx) = self.fullscreen_idx {
-            self.clear_erase_preview(fs_idx);
         }
     }
 
@@ -1269,8 +1258,10 @@ impl App {
             EraseTool::Brush => {
                 if primary_down {
                     if let Some(pos) = pointer_pos {
-                        if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
-                            if ctrl_held {
+                        if ctrl_held {
+                            if let Some(img_pos) =
+                                self.screen_to_image_f32(pos, full_rect, zoom_pan)
+                            {
                                 // 右/下方向で拡大、左/上方向で縮小
                                 let base_radius = match self.erase_shift_drag {
                                     Some(ShiftDragState::BrushSize { base_radius, .. }) => {
@@ -1294,17 +1285,21 @@ impl App {
                                     self.erase_brush_radius =
                                         (base_radius + delta).clamp(1.0, max_r);
                                 }
-                            } else {
-                                self.erase_shift_drag = None;
-                                if self.erase_last_paint_pos.is_none() {
-                                    self.push_undo_snapshot();
-                                }
-                                let prev = self
-                                    .erase_last_paint_pos
-                                    .and_then(|p| self.screen_to_image_f32(p, full_rect, zoom_pan))
-                                    .unwrap_or(img_pos);
-                                self.paint_brush_line(prev, img_pos, paint);
                             }
+                        } else if let Some(img_pos) =
+                            self.screen_to_image_f32_unclamped(pos, full_rect, zoom_pan)
+                        {
+                            self.erase_shift_drag = None;
+                            if self.erase_last_paint_pos.is_none() {
+                                self.push_undo_snapshot();
+                            }
+                            let prev = self
+                                .erase_last_paint_pos
+                                .and_then(|p| {
+                                    self.screen_to_image_f32_unclamped(p, full_rect, zoom_pan)
+                                })
+                                .unwrap_or(img_pos);
+                            self.paint_brush_line(prev, img_pos, paint);
                         }
                         self.erase_last_paint_pos = Some(pos);
                     }
@@ -1316,7 +1311,9 @@ impl App {
             EraseTool::Lasso => {
                 if primary_down {
                     if let Some(pos) = pointer_pos {
-                        if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
+                        if let Some(img_pos) =
+                            self.screen_to_image_f32_unclamped(pos, full_rect, zoom_pan)
+                        {
                             // サンプリング間引き
                             if self
                                 .erase_lasso_points
@@ -1372,7 +1369,9 @@ impl App {
                 // (= 矩形/楕円/縦線/横線と同じワークフロー)。
                 if primary_down {
                     if let Some(pos) = pointer_pos {
-                        if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
+                        if let Some(img_pos) =
+                            self.screen_to_image_f32_unclamped(pos, full_rect, zoom_pan)
+                        {
                             if self.erase_line_start.is_none() {
                                 self.erase_line_start = Some(img_pos);
                             }
@@ -1410,7 +1409,9 @@ impl App {
                 // ハンドル編集する設計)。
                 if primary_down {
                     if let Some(pos) = pointer_pos {
-                        if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
+                        if let Some(img_pos) =
+                            self.screen_to_image_f32_unclamped(pos, full_rect, zoom_pan)
+                        {
                             if self.erase_shape_drag_start.is_none() {
                                 self.erase_shape_drag_start = Some(img_pos);
                             }
@@ -1473,7 +1474,8 @@ impl App {
     ) {
         if primary_down {
             if let Some(pos) = pointer_pos {
-                if let Some(img_pos) = self.screen_to_image_f32(pos, full_rect, zoom_pan) {
+                if let Some(img_pos) = self.screen_to_image_f32_unclamped(pos, full_rect, zoom_pan)
+                {
                     if self.erase_line_start.is_none() {
                         self.erase_line_start = Some(img_pos);
                         self.erase_line_tilt = 0.0;

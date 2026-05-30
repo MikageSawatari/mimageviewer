@@ -753,35 +753,13 @@ impl App {
         let Some(mask) = self.conceal_mask.as_mut() else {
             return;
         };
-        let dx = to.0 - from.0;
-        let dy = to.1 - from.1;
-        let dist = (dx * dx + dy * dy).sqrt();
-        let steps = (dist / (radius * 0.5)).ceil().max(1.0) as usize;
-        for step in 0..=steps {
-            let t = step as f32 / steps as f32;
-            let cx = from.0 + dx * t;
-            let cy = from.1 + dy * t;
-            let r = radius;
-            let x0 = (cx - r).floor().max(0.0) as usize;
-            let y0 = (cy - r).floor().max(0.0) as usize;
-            let x1 = (cx + r).ceil().min(w as f32) as usize;
-            let y1 = (cy + r).ceil().min(h as f32) as usize;
-            let r_sq = r * r;
-            for py in y0..y1 {
-                for px in x0..x1 {
-                    let ddx = px as f32 + 0.5 - cx;
-                    let ddy = py as f32 + 0.5 - cy;
-                    if ddx * ddx + ddy * ddy <= r_sq {
-                        mask[py * w + px] = paint;
-                    }
-                }
+        if crate::mask_db::paint_brush_line_bitmap(mask, w, h, from, to, radius, paint) {
+            self.conceal_mask_texture = None;
+            // brush もマスクを変えるので conceal_cache 失効が必要 (= preview 時に
+            // 最新マスクで再合成される、commit_conceal_shape と同じ理由)。
+            if let Some(fs_idx) = self.fullscreen_idx {
+                self.clear_conceal_caches(fs_idx);
             }
-        }
-        self.conceal_mask_texture = None;
-        // brush もマスクを変えるので conceal_cache 失効が必要 (= preview 時に
-        // 最新マスクで再合成される、commit_conceal_shape と同じ理由)。
-        if let Some(fs_idx) = self.fullscreen_idx {
-            self.clear_conceal_caches(fs_idx);
         }
     }
 
@@ -1199,7 +1177,7 @@ impl App {
     ) {
         if primary_down {
             if let Some(pos) = pointer_pos {
-                if let Some(img_pos) = self.conceal_screen_to_image(pos, full_rect, zoom_pan, true)
+                if let Some(img_pos) = self.conceal_screen_to_image(pos, full_rect, zoom_pan, false)
                 {
                     if self.conceal_last_paint_pos.is_none() {
                         self.push_conceal_undo();
@@ -1229,7 +1207,7 @@ impl App {
     ) {
         if primary_down {
             if let Some(pos) = pointer_pos {
-                if let Some(img_pos) = self.conceal_screen_to_image(pos, full_rect, zoom_pan, true)
+                if let Some(img_pos) = self.conceal_screen_to_image(pos, full_rect, zoom_pan, false)
                 {
                     // サンプリング間引き (~2px 離れたら追加)
                     if self
