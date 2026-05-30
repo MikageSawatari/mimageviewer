@@ -152,6 +152,9 @@ fn build_exif_info(entries: &[rexif::ExifEntry], hidden_tags: &[String]) -> Opti
 /// 既知の整形パターンだけ上書きし、それ以外はそのまま返す。
 fn format_value(tag_id: u16, raw: &str) -> String {
     match tag_id {
+        // Orientation は rexif 0.7.5 が 2/4/5/7 を "Unknown (0112=N)"
+        // と表示するため、数値を拾ってユーザー向け表示に補完する。
+        274 => format_orientation_value(raw),
         // 36864 ExifVersion / 40960 FlashpixVersion: 4 文字 ASCII "0231" → "2.31"
         // (先頭 '0' パディング + major 1 桁 + minor 2 桁)
         36864 | 40960 => {
@@ -163,6 +166,46 @@ fn format_value(tag_id: u16, raw: &str) -> String {
                 raw.to_string()
             }
         }
+        _ => raw.to_string(),
+    }
+}
+
+fn format_orientation_value(raw: &str) -> String {
+    let orientation = raw
+        .trim()
+        .parse::<u16>()
+        .ok()
+        .or_else(|| {
+            raw.split_once('=')
+                .and_then(|(_, rest)| rest.trim_end_matches(')').trim().parse::<u16>().ok())
+        })
+        .or_else(|| {
+            let lower = raw.to_lowercase();
+            if lower.contains("straight") || lower.contains("normal") {
+                Some(1)
+            } else if lower.contains("upside down") || lower.contains("180") {
+                Some(3)
+            } else if lower.contains("rotated to left") || lower.contains("90 cw") {
+                Some(6)
+            } else if lower.contains("rotated to right")
+                || lower.contains("270 cw")
+                || lower.contains("90 ccw")
+            {
+                Some(8)
+            } else {
+                None
+            }
+        });
+
+    match orientation {
+        Some(1) => "標準 (1)".to_string(),
+        Some(2) => "左右反転 (2)".to_string(),
+        Some(3) => "180度回転 (3)".to_string(),
+        Some(4) => "上下反転 (4)".to_string(),
+        Some(5) => "左右反転 + 90度回転 (5)".to_string(),
+        Some(6) => "90度回転 (6)".to_string(),
+        Some(7) => "左右反転 + 270度回転 (7)".to_string(),
+        Some(8) => "270度回転 (8)".to_string(),
         _ => raw.to_string(),
     }
 }
@@ -1155,6 +1198,24 @@ mod tests {
         assert_eq!(format_value(36864, "0100"), "1.00");
         assert_eq!(format_value(40960, "0100"), "1.00");
         assert_eq!(format_value(42035, "0231"), "0231"); // 対象外タグは素通り
+    }
+
+    #[test]
+    fn orientation_values_are_pretty_formatted() {
+        assert_eq!(format_value(274, "Straight"), "標準 (1)");
+        assert_eq!(format_value(274, "Unknown (0112=2)"), "左右反転 (2)");
+        assert_eq!(format_value(274, "Upside down"), "180度回転 (3)");
+        assert_eq!(format_value(274, "Unknown (0112=4)"), "上下反転 (4)");
+        assert_eq!(
+            format_value(274, "Unknown (0112=5)"),
+            "左右反転 + 90度回転 (5)"
+        );
+        assert_eq!(format_value(274, "Rotated to left"), "90度回転 (6)");
+        assert_eq!(
+            format_value(274, "Unknown (0112=7)"),
+            "左右反転 + 270度回転 (7)"
+        );
+        assert_eq!(format_value(274, "Rotated to right"), "270度回転 (8)");
     }
 
     #[test]
