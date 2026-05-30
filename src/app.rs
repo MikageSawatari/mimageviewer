@@ -11947,21 +11947,49 @@ impl App {
                 }
             }
 
-            // F7/F8: マスクスロット 1/2 を一括適用
+            // F7/F8: 消しゴムマスクスロット 1/2 を一括適用
+            // F9/F10: 隠蔽マスクスロット 1/2 を一括適用
+            // Shift+F7/F8/F9/F10: 適用済みマスクを対象ページから削除
             // (チェック済みアイテムがあれば一括、なければ選択 1 件に)
             // フルスクリーン側 (ui_fullscreen.rs) と揃えて修飾キー無しのみ受け付ける。
             {
-                let slot_key = ctx.input_mut(|i| {
-                    if i.consume_key(egui::Modifiers::NONE, egui::Key::F7) {
-                        Some(1usize)
+                enum MaskShortcut {
+                    ApplyErase(usize),
+                    ApplyConceal(usize),
+                    DeleteErase,
+                    DeleteConceal,
+                }
+
+                let mask_shortcut = ctx.input_mut(|i| {
+                    if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F7)
+                        || i.consume_key(egui::Modifiers::SHIFT, egui::Key::F8)
+                    {
+                        Some(MaskShortcut::DeleteErase)
+                    } else if i.consume_key(egui::Modifiers::SHIFT, egui::Key::F9)
+                        || i.consume_key(egui::Modifiers::SHIFT, egui::Key::F10)
+                    {
+                        Some(MaskShortcut::DeleteConceal)
+                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F7) {
+                        Some(MaskShortcut::ApplyErase(1))
                     } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F8) {
-                        Some(2)
+                        Some(MaskShortcut::ApplyErase(2))
+                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F9) {
+                        Some(MaskShortcut::ApplyConceal(1))
+                    } else if i.consume_key(egui::Modifiers::NONE, egui::Key::F10) {
+                        Some(MaskShortcut::ApplyConceal(2))
                     } else {
                         None
                     }
                 });
-                if let Some(slot) = slot_key {
-                    self.apply_slot_to_selection(slot);
+                if let Some(mask_shortcut) = mask_shortcut {
+                    match mask_shortcut {
+                        MaskShortcut::ApplyErase(slot) => self.apply_slot_to_selection(slot),
+                        MaskShortcut::ApplyConceal(slot) => {
+                            self.apply_conceal_slot_to_selection(slot)
+                        }
+                        MaskShortcut::DeleteErase => self.delete_erase_masks_from_selection(),
+                        MaskShortcut::DeleteConceal => self.delete_conceal_masks_from_selection(),
+                    }
                 }
             }
 
@@ -14785,7 +14813,7 @@ impl App {
         self.targets_matching(GridItem::has_page_data)
     }
 
-    /// グリッド画面から F7/F8 で呼ばれるマスクスロット一括適用。
+    /// グリッド画面から F7/F8 で呼ばれる消しゴムマスクスロット一括適用。
     /// 実際の inpaint は各ページをフルスクリーンで開いたときに `auto_apply_saved_mask`
     /// が走る。ここでは DB + サイドカーにスロットの内容 (ビットマップ + ベクタ) を
     /// 書き込むだけで十分。
@@ -14803,15 +14831,15 @@ impl App {
         let (slot_bitmap, slot_vectors, sw, sh) = match self.mask_db.as_ref() {
             Some(db) => {
                 let Some((sw, sh)) = db.slot_size(slot) else {
-                    self.show_feedback_toast(format!("[スロット{slot}は空です]"));
+                    self.show_feedback_toast(format!("[消しゴムスロット{slot}は空です]"));
                     return;
                 };
                 let Some((mask, vectors)) = db.get_slot_full(slot, sw, sh) else {
-                    self.show_feedback_toast(format!("[スロット{slot}は空です]"));
+                    self.show_feedback_toast(format!("[消しゴムスロット{slot}は空です]"));
                     return;
                 };
                 if !mask.iter().any(|&m| m) && vectors.is_empty() {
-                    self.show_feedback_toast(format!("[スロット{slot}は空です]"));
+                    self.show_feedback_toast(format!("[消しゴムスロット{slot}は空です]"));
                     return;
                 }
                 (mask, vectors, sw, sh)
@@ -14846,7 +14874,216 @@ impl App {
 
         self.checked.clear();
         crate::logger::log(format!("[ERASE] Bulk apply slot {slot} to {total} items"));
-        self.show_feedback_toast(format!("[スロット{slot} を{total}枚に適用]"));
+        self.show_feedback_toast(format!("[消しゴムスロット{slot}を{total}枚に適用]"));
+    }
+
+    fn load_conceal_slot_payload(
+        &mut self,
+        slot: usize,
+    ) -> Option<(Vec<bool>, Vec<crate::mask_db::Shape>, usize, usize)> {
+        match self.conceal_db.as_ref() {
+            Some(db) => {
+                let Some((sw, sh)) = db.slot_size(slot) else {
+                    self.show_feedback_toast(format!("[隠蔽スロット{slot}は空です]"));
+                    return None;
+                };
+                let Some((mask, shapes)) = db.get_slot_full(slot, sw, sh) else {
+                    self.show_feedback_toast(format!("[隠蔽スロット{slot}は空です]"));
+                    return None;
+                };
+                if !mask.iter().any(|&m| m) && shapes.is_empty() {
+                    self.show_feedback_toast(format!("[隠蔽スロット{slot}は空です]"));
+                    return None;
+                }
+                Some((mask, shapes, sw, sh))
+            }
+            None => {
+                self.show_feedback_toast("[隠蔽DB未初期化]".to_string());
+                None
+            }
+        }
+    }
+
+    /// グリッド画面から F9/F10 で呼ばれる隠蔽マスクスロット一括適用。
+    /// 隠蔽は inpaint worker を持たないため、DB + サイドカーへ保存して
+    /// 表示キャッシュを破棄すれば次回表示で合成される。
+    pub(crate) fn apply_conceal_slot_to_selection(&mut self, slot: usize) {
+        let targets = self.ratable_page_targets();
+
+        if targets.is_empty() {
+            self.show_feedback_toast("[適用対象なし]".to_string());
+            return;
+        }
+
+        let Some((slot_bitmap, slot_shapes, sw, sh)) = self.load_conceal_slot_payload(slot) else {
+            return;
+        };
+
+        let compressed = crate::mask_db::compress_mask(&slot_bitmap);
+        let shapes_json = crate::mask_db::shapes_to_json(&slot_shapes);
+        let total = targets.len();
+        for idx in &targets {
+            self.clear_conceal_caches(*idx);
+            self.conceal_base_cache.remove(idx);
+            self.save_conceal_raw_with_sidecar(
+                *idx,
+                &compressed,
+                &slot_shapes,
+                shapes_json.as_deref(),
+                sw,
+                sh,
+            );
+        }
+
+        self.checked.clear();
+        crate::logger::log(format!("[CONCEAL] Bulk apply slot {slot} to {total} items"));
+        self.show_feedback_toast(format!("[隠蔽スロット{slot}を{total}枚に適用]"));
+    }
+
+    /// フルスクリーン表示中 (隠蔽加工モード外) で F9/F10 から呼ばれる。
+    /// スロット N の隠蔽マスクを現ページへ差し替えて保存する。
+    pub(crate) fn apply_conceal_slot_in_viewing_mode(&mut self, slot: usize) {
+        if self.is_overlay_edit_mode_active() {
+            return;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
+        if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
+            self.show_feedback_toast("[適用対象なし]".to_string());
+            return;
+        }
+
+        let Some((slot_bitmap, slot_shapes, sw, sh)) = self.load_conceal_slot_payload(slot) else {
+            return;
+        };
+        let compressed = crate::mask_db::compress_mask(&slot_bitmap);
+        let shapes_json = crate::mask_db::shapes_to_json(&slot_shapes);
+        self.clear_conceal_caches(fs_idx);
+        self.conceal_base_cache.remove(&fs_idx);
+        self.save_conceal_raw_with_sidecar(
+            fs_idx,
+            &compressed,
+            &slot_shapes,
+            shapes_json.as_deref(),
+            sw,
+            sh,
+        );
+
+        crate::logger::log(format!(
+            "conceal: apply_conceal_slot_in_viewing_mode slot={slot} idx={fs_idx}"
+        ));
+        self.show_feedback_toast(format!("[隠蔽スロット{slot}適用]"));
+    }
+
+    /// フルスクリーン表示中に適用済み消しゴムマスクを削除する。
+    pub(crate) fn delete_erase_mask_in_viewing_mode(&mut self) {
+        if self.is_overlay_edit_mode_active() {
+            return;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
+        if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
+            self.show_feedback_toast("[削除対象なし]".to_string());
+            return;
+        }
+
+        let had_mask = self.mask_pages.contains(&fs_idx);
+        self.delete_mask_with_sidecar(fs_idx);
+        self.clear_erase_result_caches_for_idx(fs_idx);
+        self.erase_base_cache.remove(&fs_idx);
+        self.erase_base_tex_cache.remove(&fs_idx);
+        self.clear_conceal_caches(fs_idx);
+        self.conceal_base_cache.remove(&fs_idx);
+
+        if had_mask {
+            self.show_feedback_toast("[消しゴムマスク削除]".to_string());
+        } else {
+            self.show_feedback_toast("[消しゴムマスクなし]".to_string());
+        }
+    }
+
+    /// フルスクリーン表示中に適用済み隠蔽マスクを削除する。
+    pub(crate) fn delete_conceal_mask_in_viewing_mode(&mut self) {
+        if self.is_overlay_edit_mode_active() {
+            return;
+        }
+        let Some(fs_idx) = self.fullscreen_idx else {
+            return;
+        };
+        if !self.items.get(fs_idx).is_some_and(GridItem::has_page_data) {
+            self.show_feedback_toast("[削除対象なし]".to_string());
+            return;
+        }
+
+        let had_mask = self.conceal_pages.contains(&fs_idx);
+        self.delete_conceal_with_sidecar(fs_idx);
+        self.clear_conceal_caches(fs_idx);
+        self.conceal_base_cache.remove(&fs_idx);
+
+        if had_mask {
+            self.show_feedback_toast("[隠蔽マスク削除]".to_string());
+        } else {
+            self.show_feedback_toast("[隠蔽マスクなし]".to_string());
+        }
+    }
+
+    /// グリッド画面から Shift+F7/F8 で呼ばれる消しゴムマスク一括削除。
+    pub(crate) fn delete_erase_masks_from_selection(&mut self) {
+        let targets = self.ratable_page_targets();
+        if targets.is_empty() {
+            self.show_feedback_toast("[削除対象なし]".to_string());
+            return;
+        }
+
+        let mut removed = 0usize;
+        for idx in &targets {
+            if self.mask_pages.contains(idx) {
+                removed += 1;
+            }
+            self.delete_mask_with_sidecar(*idx);
+            self.clear_erase_result_caches_for_idx(*idx);
+            self.erase_base_cache.remove(idx);
+            self.erase_base_tex_cache.remove(idx);
+            self.clear_conceal_caches(*idx);
+            self.conceal_base_cache.remove(idx);
+        }
+
+        self.checked.clear();
+        if removed == 0 {
+            self.show_feedback_toast("[消しゴムマスクなし]".to_string());
+        } else {
+            crate::logger::log(format!("[ERASE] Bulk delete masks from {removed} items"));
+            self.show_feedback_toast(format!("[消しゴムマスクを{removed}枚から削除]"));
+        }
+    }
+
+    /// グリッド画面から Shift+F9/F10 で呼ばれる隠蔽マスク一括削除。
+    pub(crate) fn delete_conceal_masks_from_selection(&mut self) {
+        let targets = self.ratable_page_targets();
+        if targets.is_empty() {
+            self.show_feedback_toast("[削除対象なし]".to_string());
+            return;
+        }
+
+        let mut removed = 0usize;
+        for idx in &targets {
+            if self.conceal_pages.contains(idx) {
+                removed += 1;
+            }
+            self.delete_conceal_with_sidecar(*idx);
+            self.clear_conceal_caches(*idx);
+            self.conceal_base_cache.remove(idx);
+        }
+
+        self.checked.clear();
+        if removed == 0 {
+            self.show_feedback_toast("[隠蔽マスクなし]".to_string());
+        } else {
+            crate::logger::log(format!("[CONCEAL] Bulk delete masks from {removed} items"));
+            self.show_feedback_toast(format!("[隠蔽マスクを{removed}枚から削除]"));
+        }
     }
 
     pub(crate) fn apply_rating_to_selection(&mut self, stars: u8) {

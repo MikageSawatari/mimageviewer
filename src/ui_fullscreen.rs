@@ -3240,15 +3240,39 @@ impl App {
             self.toggle_folder_pin_for_idx(fs_idx);
         }
 
-        // F7/F8: マスクスロット 1/2 をフルスクリーン表示のまま現ページに適用
+        // F7/F8: 消しゴムマスクスロット 1/2 をフルスクリーン表示のまま現ページに適用
         // (消しゴムモードに入らず、1 キーで inpaint までを一気に実行)
+        // F9/F10: 隠蔽マスクスロット 1/2 を現ページに適用
+        // Shift+F7/F8/F9/F10: 適用済みマスクを削除
+        let delete_erase_mask = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::SHIFT, egui::Key::F7)
+                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::F8)
+        });
+        let delete_conceal_mask = ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::SHIFT, egui::Key::F9)
+                || i.consume_key(egui::Modifiers::SHIFT, egui::Key::F10)
+        });
         let key_f7 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F7));
         let key_f8 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F8));
+        let key_f9 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F9));
+        let key_f10 = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F10));
+        if delete_erase_mask {
+            self.delete_erase_mask_in_viewing_mode();
+        }
+        if delete_conceal_mask {
+            self.delete_conceal_mask_in_viewing_mode();
+        }
         if key_f7 {
             self.apply_slot_in_viewing_mode(ctx, 1);
         }
         if key_f8 {
             self.apply_slot_in_viewing_mode(ctx, 2);
+        }
+        if key_f9 {
+            self.apply_conceal_slot_in_viewing_mode(1);
+        }
+        if key_f10 {
+            self.apply_conceal_slot_in_viewing_mode(2);
         }
 
         // F11: ウィンドウ表示 ⇔ 全画面表示 トグル (ホバーバー × の左の

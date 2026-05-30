@@ -427,9 +427,9 @@ impl App {
             false
         };
         if saved {
-            self.show_feedback_toast(format!("[スロット{}に保存]", slot));
+            self.show_feedback_toast(format!("[消しゴムスロット{}に保存]", slot));
         } else {
-            self.show_feedback_toast(format!("[スロット{}保存失敗]", slot));
+            self.show_feedback_toast(format!("[消しゴムスロット{}保存失敗]", slot));
         }
     }
 
@@ -443,11 +443,11 @@ impl App {
             .as_ref()
             .and_then(|db| db.get_slot_full(slot, w, h));
         let Some((slot_mask, slot_vectors)) = slot_data else {
-            self.show_feedback_toast(format!("[スロット{}は空です]", slot));
+            self.show_feedback_toast(format!("[消しゴムスロット{}は空です]", slot));
             return;
         };
         if !slot_mask.iter().any(|&m| m) && slot_vectors.is_empty() {
-            self.show_feedback_toast(format!("[スロット{}は空です]", slot));
+            self.show_feedback_toast(format!("[消しゴムスロット{}は空です]", slot));
             return;
         }
         self.push_undo_snapshot();
@@ -459,7 +459,7 @@ impl App {
         if let Some(fs_idx) = self.fullscreen_idx {
             self.clear_erase_preview(fs_idx);
         }
-        self.show_feedback_toast(format!("[スロット{}をロード]", slot));
+        self.show_feedback_toast(format!("[消しゴムスロット{}をロード]", slot));
     }
 
     // ── キー入力 ──────────────────────────────────────────────────
@@ -2261,7 +2261,7 @@ impl App {
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(
-                                    "フルスクリーン中 F7/F8 で保存 1/2 を即適用",
+                                    "フルスクリーン中 F7/F8 で消しゴム保存 1/2 を即適用",
                                 )
                                 .size(10.0)
                                 .color(egui::Color32::from_gray(150)),
@@ -2706,11 +2706,11 @@ impl App {
             .as_ref()
             .and_then(|db| db.get_slot_full(slot, w, h));
         let Some((new_mask, new_vectors)) = slot_data else {
-            self.show_feedback_toast(format!("[スロット{slot}は空です]"));
+            self.show_feedback_toast(format!("[消しゴムスロット{slot}は空です]"));
             return;
         };
         if !new_mask.iter().any(|&m| m) && new_vectors.is_empty() {
-            self.show_feedback_toast(format!("[スロット{slot}は空です]"));
+            self.show_feedback_toast(format!("[消しゴムスロット{slot}は空です]"));
             return;
         }
 
@@ -2738,7 +2738,7 @@ impl App {
         ));
 
         self.run_inpaint_and_cache(ctx, fs_idx, pixels, composite, w, h, "viewing-mode", false);
-        self.show_feedback_toast(format!("[スロット{slot}適用]"));
+        self.show_feedback_toast(format!("[消しゴムスロット{slot}適用]"));
     }
 
     /// MI-GAN (失敗時は拡散フォールバック) で inpaint を走らせ、結果は worker thread から

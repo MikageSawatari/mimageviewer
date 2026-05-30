@@ -171,6 +171,21 @@
       </table>
     </div>
 
+    <h3>マスク</h3>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>キー</th><th>操作</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><kbd>F7</kbd> / <kbd>F8</kbd></td><td>消しゴムマスクスロット 1 / 2 をチェック済み画像に一括適用（チェックが無ければ選択中の 1 枚）</td></tr>
+          <tr><td><kbd>F9</kbd> / <kbd>F10</kbd></td><td>隠蔽マスクスロット 1 / 2 をチェック済み画像に一括適用（チェックが無ければ選択中の 1 枚）</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>F7</kbd> / <kbd>Shift</kbd>+<kbd>F8</kbd></td><td>チェック済み画像（なければ選択中の 1 枚）から消しゴムマスクを削除</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>F9</kbd> / <kbd>Shift</kbd>+<kbd>F10</kbd></td><td>チェック済み画像（なければ選択中の 1 枚）から隠蔽マスクを削除</td></tr>
+        </tbody>
+      </table>
+    </div>
+
     <h3>その他</h3>
     <div class="table-wrap">
       <table>
@@ -255,6 +270,10 @@
           <tr><td><kbd>右Ctrl</kbd>（押している間）</td><td>元画像プレビュー（補正・ポストフィルタ・AI 処理・消しゴム補完・隠蔽加工を一時的に外す）</td></tr>
           <tr><td><kbd>E</kbd></td><td>消しゴムモード開始 / マスクを確定して AI 補完実行（<a href="erase.html">詳細</a>）</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>M</kbd></td><td>隠蔽加工モード開始 / 終了（<a href="conceal.html">詳細</a>）</td></tr>
+          <tr><td><kbd>F7</kbd> / <kbd>F8</kbd></td><td>消しゴムマスクスロット 1 / 2 を現在ページに即適用</td></tr>
+          <tr><td><kbd>F9</kbd> / <kbd>F10</kbd></td><td>隠蔽マスクスロット 1 / 2 を現在ページに即適用</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>F7</kbd> / <kbd>Shift</kbd>+<kbd>F8</kbd></td><td>現在ページの消しゴムマスクを削除</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>F9</kbd> / <kbd>Shift</kbd>+<kbd>F10</kbd></td><td>現在ページの隠蔽マスクを削除</td></tr>
           <tr><td><kbd>I</kbd> / <kbd>Tab</kbd></td><td>メタデータパネルの固定表示切り替え</td></tr>
           <tr><td><kbd>S</kbd></td><td>スライドショー 再生 / 停止</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>S</kbd></td><td>画像フルスクリーン中：現在表示中の画像・アニメーション現在フレーム・ZIP 内画像・PDF ページをキャプチャ保存フォルダへ保存</td></tr>
@@ -451,8 +470,9 @@
           <tr><th>キー</th><th>操作</th></tr>
         </thead>
         <tbody>
-          <tr><td><kbd>F7</kbd> / <kbd>F8</kbd> (フルスクリーン)</td><td>保存 1 / 保存 2 のマスクを現ページに即適用 (AI 補完まで実行)</td></tr>
-          <tr><td><kbd>F7</kbd> / <kbd>F8</kbd> (グリッド)</td><td>チェック済みサムネイル (なければ選択 1 枚) に保存 1 / 保存 2 を一括配布。各ページを次にフルスクリーンで開いた時に AI 補完が自動適用</td></tr>
+          <tr><td><kbd>F7</kbd> / <kbd>F8</kbd> (フルスクリーン)</td><td>消しゴム保存 1 / 2 のマスクを現ページに即適用 (AI 補完まで実行)</td></tr>
+          <tr><td><kbd>F7</kbd> / <kbd>F8</kbd> (グリッド)</td><td>チェック済みサムネイル (なければ選択 1 枚) に消しゴム保存 1 / 2 を一括配布。各ページを次にフルスクリーンで開いた時に AI 補完が自動適用</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>F7</kbd> / <kbd>Shift</kbd>+<kbd>F8</kbd></td><td>現在ページ、またはグリッドの対象ページから消しゴムマスクを削除</td></tr>
         </tbody>
       </table>
     </div>
@@ -493,6 +513,8 @@
           <tr><td><kbd>1</kbd>〜<kbd>4</kbd></td><td>プリセット 1〜4 を呼び出し</td></tr>
           <tr><td><kbd>S</kbd> / <kbd>B</kbd> / <kbd>L</kbd> / <kbd>I</kbd> / <kbd>V</kbd> / <kbd>H</kbd> / <kbd>R</kbd> / <kbd>O</kbd></td><td>選択 / 筆 / 囲み / 直線 / 縦線 / 横線 / 矩形 / 楕円</td></tr>
           <tr><td><kbd>D</kbd> / <kbd>F</kbd></td><td>描画モード / 消去モードに切替</td></tr>
+          <tr><td><kbd>F9</kbd> / <kbd>F10</kbd></td><td>隠蔽マスクスロット 1 / 2 を現在ページに即適用</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>F9</kbd> / <kbd>Shift</kbd>+<kbd>F10</kbd></td><td>現在ページの隠蔽マスクを削除</td></tr>
           <tr><td><kbd>Ctrl</kbd>+<kbd>Z</kbd></td><td>Undo</td></tr>
           <tr><td><kbd>Del</kbd></td><td>選択中のオブジェクトを削除</td></tr>
         </tbody>

@@ -2319,6 +2319,16 @@ impl App {
                                                 }
                                             });
                                         }
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(
+                                                    "フルスクリーン中 F9/F10 で隠蔽保存 1/2 を即適用",
+                                                )
+                                                .size(10.0)
+                                                .color(egui::Color32::from_gray(150)),
+                                            )
+                                            .wrap(),
+                                        );
 
                                         // ── マスク全削除 ───────────────────────────────────
                                         // 消しゴムパネル側と同じ幅 (= PANEL_W - 20) で揃える (実機 FB R4)。
