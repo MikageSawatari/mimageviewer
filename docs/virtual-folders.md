@@ -92,7 +92,7 @@ stdin/stdout の長さプレフィクス付きバイナリプロトコル。
 | Folder | None | None | `folderthumb:auto-vN:{sort}:d{depth}:{dirname-or-fullpath}` | 再帰的に代表画像を探してデコード |
 | ZipFile | None | None | `zipthumb:{filename}` | `zip_loader::read_first_image_bytes` で先頭画像 |
 | PdfFile | None | Some(0) | `pdfthumb:{filename}` | PDF ワーカーでページ 0 をレンダリング |
-| ZipImage | Some(entry) | None | なし (entry が自動キー) | ZIP からエントリバイト → decode |
+| ZipImage | Some(entry) | None | なし (entry が自動キー) | ZIP からエントリバイト → decode → bytes から EXIF Orientation 適用 |
 | PdfPage | None | Some(page) | `pdf_page_cache_key(page)` | PDF ワーカーでそのページをレンダリング |
 
 **キャッシュキーの命名規則**を勝手に変えないこと。Folder 自動代表は選定
@@ -170,7 +170,7 @@ match grid_item {
     GridItem::ZipImage { zip_path, entry_name } => {
         // ZIP から bytes 読み出し → image::load_from_memory → 失敗時 WIC ストリームフォールバック
         // (SHCreateMemStream + IWICImagingFactory::CreateDecoderFromStream)
-        // EXIF 不可、アニメーション不可
+        // bytes から EXIF Orientation 適用、アニメーション不可
     }
     GridItem::Image(path) => {
         // image::open → 失敗時 WIC フォールバック
@@ -183,13 +183,15 @@ match grid_item {
 
 **ZipImage でできないことリスト**:
 
-- EXIF Orientation 自動回転 (rexif がパスを要求)
 - GIF / APNG アニメーション (fs_animation がパス API)
+- ZIP 内 RAW/WIC 系の Orientation 読み取り (bytes 版は rexif で読める EXIF のみ。JPEG などは自動回転される)
 
 WIC デコードは `wic_decoder::decode_to_dynamic_image_from_bytes` でバイト列から
 直接デコードできるため、ZIP 内の HEIC/AVIF/JXL/TIFF/RAW も開ける
 (対応コーデックがインストールされていれば)。サムネイル・フルスクリーン両方の
 ZIP エントリ経路で `image::load_from_memory` 失敗時のフォールバックとして使われる。
+JPEG など EXIF Orientation を持つ ZIP 内画像は、サムネイル・フルスクリーンとも
+エントリ bytes から向きを読んで正立表示する。
 
 ### 3.3 回転 / 補正 / 消しゴムマスクのキー
 

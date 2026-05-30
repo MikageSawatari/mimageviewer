@@ -380,32 +380,37 @@ fn read_exif_orientation_from_file(path: &std::path::Path) -> Option<u16> {
         exif.entries
             .iter()
             .find(|e| e.ifd.tag == 274)
-            .and_then(|e| {
-                e.value_more_readable
-                    .trim()
-                    .parse::<u16>()
-                    .ok()
-                    .or_else(|| orientation_from_text(&e.value_more_readable))
-            })
+            .and_then(orientation_from_rexif_entry)
     })
 }
 
-fn read_exif_orientation_from_bytes(bytes: &[u8]) -> u16 {
+pub(crate) fn read_exif_orientation_from_bytes(bytes: &[u8]) -> u16 {
     rexif::parse_buffer(bytes)
         .ok()
         .and_then(|exif| {
             exif.entries
                 .iter()
                 .find(|e| e.ifd.tag == 274)
-                .and_then(|e| {
-                    e.value_more_readable
-                        .trim()
-                        .parse::<u16>()
-                        .ok()
-                        .or_else(|| orientation_from_text(&e.value_more_readable))
-                })
+                .and_then(orientation_from_rexif_entry)
         })
         .unwrap_or(1)
+}
+
+fn orientation_from_rexif_entry(entry: &rexif::ExifEntry) -> Option<u16> {
+    entry
+        .value
+        .to_i64(0)
+        .and_then(|v| u16::try_from(v).ok())
+        .filter(|v| (1..=8).contains(v))
+        .or_else(|| {
+            entry
+                .value_more_readable
+                .trim()
+                .parse::<u16>()
+                .ok()
+                .filter(|v| (1..=8).contains(v))
+        })
+        .or_else(|| orientation_from_text(&entry.value_more_readable))
 }
 
 /// rexif の value_more_readable テキストから Orientation 値を推測する
@@ -725,7 +730,7 @@ pub fn is_jpeg_entry(name: &str) -> bool {
         .is_some_and(|s| is_jpeg_extension(s))
 }
 
-fn apply_orientation(img: image::DynamicImage, orientation: u16) -> image::DynamicImage {
+pub(crate) fn apply_orientation(img: image::DynamicImage, orientation: u16) -> image::DynamicImage {
     match orientation {
         1 => img,                    // 正常
         2 => img.fliph(),            // 左右反転
@@ -1921,6 +1926,7 @@ pub fn load_one_cached(
     // source_dims を **元寸法** で保存する (DCT scaled buffer ではない)。
     let mut decode_source = crate::stats::DecodeSource::Native;
     let mut dct_stats: Option<ScaleStats> = None;
+    let mut zip_orientation: u16 = 1;
     let img_result = if let Some(page_num) = pdf_page {
         // サムネイル用 PDF レンダ: 可視セル (priority=true) は HighNormal、
         // 先読みは Normal。プールの予約ワーカーはフルスクリーン現在ページ
@@ -1987,6 +1993,9 @@ pub fn load_one_cached(
         match bytes_result {
             Err(e) => Err(e),
             Ok(bytes) => {
+                // ZIP 内 RAW/WIC 系の orientation は rexif で読めないため 1 扱いになる。
+                // JPEG 等、rexif が読める EXIF は通常ファイルと同じ向きに揃える。
+                zip_orientation = read_exif_orientation_from_bytes(&bytes);
                 // JPEG なら TurboJPEG DCT scale で高速デコードを試す
                 if is_jpeg_entry(entry_name) {
                     let target_px = display_px.max(thumb_px);
@@ -2163,9 +2172,12 @@ pub fn load_one_cached(
         }
     };
 
-    // EXIF Orientation に基づいて自動回転 (PDF / ZIP 経路は適用しない)
-    let orientation: u16 = if pdf_page.is_some() || zip_entry.is_some() {
+    // EXIF Orientation に基づいて自動回転。
+    // ZIP はエントリのバイト列から読み、PDF はレンダ済みページなので常に 1。
+    let orientation: u16 = if pdf_page.is_some() {
         1
+    } else if zip_entry.is_some() {
+        zip_orientation
     } else {
         read_exif_orientation(path)
     };
@@ -2348,6 +2360,61 @@ mod tests {
             pdf_always: true,
             zip_always: true,
         }
+    }
+
+    fn orientation_exif_payload(value: u16) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"Exif\0\0");
+        payload.extend_from_slice(b"II");
+        payload.extend_from_slice(&0x002A_u16.to_le_bytes());
+        payload.extend_from_slice(&8_u32.to_le_bytes());
+        payload.extend_from_slice(&1_u16.to_le_bytes());
+        payload.extend_from_slice(&0x0112_u16.to_le_bytes());
+        payload.extend_from_slice(&3_u16.to_le_bytes());
+        payload.extend_from_slice(&1_u32.to_le_bytes());
+        payload.extend_from_slice(&value.to_le_bytes());
+        payload.extend_from_slice(&0_u16.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload
+    }
+
+    fn jpeg_with_orientation(value: u16) -> Vec<u8> {
+        let rgb = image::RgbImage::from_fn(8, 8, |x, y| {
+            image::Rgb([(x * 31) as u8, (y * 29) as u8, 128])
+        });
+        let jpeg = turbojpeg::compress_image(&rgb, 85, turbojpeg::Subsamp::Sub2x2)
+            .expect("compress")
+            .to_vec();
+        let payload = orientation_exif_payload(value);
+        let len = payload.len() + 2;
+        let mut out = Vec::with_capacity(jpeg.len() + payload.len() + 4);
+        out.extend_from_slice(&jpeg[..2]);
+        out.extend_from_slice(&[0xFF, 0xE1]);
+        out.push((len >> 8) as u8);
+        out.push((len & 0xff) as u8);
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&jpeg[2..]);
+        out
+    }
+
+    #[test]
+    fn read_exif_orientation_from_bytes_reads_all_values() {
+        for orientation in 1..=8 {
+            let bytes = jpeg_with_orientation(orientation);
+            assert_eq!(super::read_exif_orientation_from_bytes(&bytes), orientation);
+        }
+    }
+
+    #[test]
+    fn apply_exif_orientation_from_bytes_swaps_dimensions() {
+        let bytes = jpeg_with_orientation(6);
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_fn(2, 3, |x, y| {
+            image::Rgba([(x * 80) as u8, (y * 80) as u8, 0, 255])
+        }));
+
+        let rotated = super::apply_exif_orientation_from_bytes(img, &bytes);
+
+        assert_eq!((rotated.width(), rotated.height()), (3, 2));
     }
 
     #[test]
@@ -2848,9 +2915,10 @@ pub fn build_and_save_one_zip(
 ) -> Option<usize> {
     let bytes = crate::zip_loader::read_entry_bytes(zip_path, entry_name).ok()?;
     // JPEG なら DCT scale を試す + 元寸法を source_dims に保存
+    let orientation = read_exif_orientation_from_bytes(&bytes);
     let (img, source_dims) = if is_jpeg_entry(entry_name) {
         match decode_jpeg_turbo_scaled_from_bytes(&bytes, thumb_px) {
-            Ok((img, stats)) => (Some(img), Some((stats.src_w, stats.src_h))),
+            Ok((img, stats)) => (Some(img), Some(stats.source_dims_after_exif(orientation))),
             Err(DctDecodeError::TerminalRejection(_)) => return None,
             Err(DctDecodeError::Fallback(_)) => (None, None),
         }
@@ -2858,6 +2926,7 @@ pub fn build_and_save_one_zip(
         (None, None)
     };
     let img = img.or_else(|| image::load_from_memory(&bytes).ok())?;
+    let img = apply_orientation(img, orientation);
     encode_and_save_with_source_dims(
         &img,
         source_dims,

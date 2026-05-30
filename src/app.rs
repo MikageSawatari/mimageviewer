@@ -1215,9 +1215,10 @@ fn exif_hay(info: &crate::exif_reader::ExifInfo) -> String {
 use crate::fs_animation::{FsCacheEntry, FsLoadResult, decode_apng_frames, decode_gif_frames};
 use crate::grid_item::{GridItem, ThumbnailState};
 use crate::thumb_loader::{
-    CacheDecision, DctDecodeError, LoadRequest, ScaleStats, ThumbMsg, build_and_save_one,
-    compute_display_px, decode_jpeg_turbo_scaled_from_bytes, encode_and_save,
+    CacheDecision, DctDecodeError, LoadRequest, ScaleStats, ThumbMsg, apply_orientation,
+    build_and_save_one, compute_display_px, decode_jpeg_turbo_scaled_from_bytes, encode_and_save,
     encode_and_save_with_source_dims, is_jpeg_entry, process_load_request,
+    read_exif_orientation_from_bytes,
 };
 use crate::ui_helpers::{
     draw_folder_badge, draw_pdf_badge, draw_play_icon, draw_zip_badge, natural_sort_key,
@@ -15774,16 +15775,16 @@ impl App {
             // 静止画フォールバック
             // image クレート → WIC → Susie プラグインの順で試す
             // ZIP エントリは SHCreateMemStream + CreateDecoderFromStream 経由で WIC へフォールバック
-            let open_result = if let Some(bytes) = zip_bytes {
+            let open_result = if let Some(bytes) = zip_bytes.as_deref() {
                 let hint = zip_entry.as_deref().unwrap_or("");
-                match image::load_from_memory(&bytes) {
+                match image::load_from_memory(bytes) {
                     Ok(img) => Ok(img),
                     Err(e) => {
-                        match crate::wic_decoder::decode_to_dynamic_image_from_bytes(&bytes) {
+                        match crate::wic_decoder::decode_to_dynamic_image_from_bytes(bytes) {
                             Some(img) => Ok(img),
                             // フルスクリーン画像ロードは現在表示中のため priority=true
                             None => {
-                                match crate::susie_loader::decode_bytes(hint, &bytes, true, None) {
+                                match crate::susie_loader::decode_bytes(hint, bytes, true, None) {
                                     Ok(img) => Ok(img),
                                     Err(_) => Err(e),
                                 }
@@ -15806,11 +15807,12 @@ impl App {
             };
             match open_result {
                 Ok(img) => {
-                    // EXIF Orientation 自動回転 (ZIP 以外)
-                    let img = if zip_entry.is_none() {
-                        crate::thumb_loader::apply_exif_orientation(img, &path)
-                    } else {
-                        img
+                    // EXIF Orientation 自動回転。ZIP はエントリのバイト列から読む。
+                    let img = match zip_bytes.as_deref() {
+                        Some(bytes) => {
+                            crate::thumb_loader::apply_exif_orientation_from_bytes(img, bytes)
+                        }
+                        None => crate::thumb_loader::apply_exif_orientation(img, &path),
                     };
                     let source_dims = [img.width() as usize, img.height() as usize];
                     let source_pixels = (source_dims[0] as u64) * (source_dims[1] as u64);
@@ -21791,6 +21793,7 @@ impl App {
                                     Ok(b) => b,
                                     Err(_) => return,
                                 };
+                                let orientation = read_exif_orientation_from_bytes(&raw);
                                 // JPEG なら TurboJPEG DCT scale を試す
                                 let (img, dct_stats): (
                                     Option<image::DynamicImage>,
@@ -21814,7 +21817,9 @@ impl App {
                                     Some(i) => i,
                                     None => return,
                                 };
-                                let source_dims = dct_stats.map(|s| (s.src_w, s.src_h));
+                                let img = apply_orientation(img, orientation);
+                                let source_dims =
+                                    dct_stats.map(|s| s.source_dims_after_exif(orientation));
                                 // 先頭エントリをキャプチャ（親フォルダ用サムネイル再利用）。
                                 // source_dims も一緒にキャプチャして parent thumb save で再利用。
                                 if i == 0 {
@@ -21868,15 +21873,17 @@ impl App {
                             if let Ok(raw) =
                                 crate::zip_loader::read_entry_bytes(zip_path, &first_entry)
                             {
+                                let orientation = read_exif_orientation_from_bytes(&raw);
                                 // JPEG なら DCT scale → source_dims override で保存
                                 let (img, source_dims): (
                                     Option<image::DynamicImage>,
                                     Option<(u32, u32)>,
                                 ) = if is_jpeg_entry(&first_entry) {
                                     match decode_jpeg_turbo_scaled_from_bytes(&raw, thumb_px) {
-                                        Ok((img, stats)) => {
-                                            (Some(img), Some((stats.src_w, stats.src_h)))
-                                        }
+                                        Ok((img, stats)) => (
+                                            Some(img),
+                                            Some(stats.source_dims_after_exif(orientation)),
+                                        ),
                                         Err(DctDecodeError::TerminalRejection(msg)) => {
                                             crate::logger::log(format!(
                                                 "cache_creator first-only DCT terminal rejection {zip_path:?}/{first_entry}: {msg}"
@@ -21892,6 +21899,7 @@ impl App {
                                     Some(i) => i,
                                     None => continue,
                                 };
+                                let img = apply_orientation(img, orientation);
                                 if let Some(bytes) = encode_and_save_with_source_dims(
                                     &img,
                                     source_dims,

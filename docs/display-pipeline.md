@@ -44,7 +44,7 @@ Failed は単発の終端ステート。デコードエラー時のみ。
    └─ ミス or skip_cache=true:
         ├─ ソースデコード (JPEG=turbojpeg, PNG/GIF/WebP/BMP=image crate,
         │                   HEIC/AVIF/JXL/RAW=WIC, PDF=PDFium ワーカー)
-        ├─ EXIF Orientation 適用 ※通常画像のみ (ZIP/PDF 不可)
+        ├─ EXIF Orientation 適用 (通常画像=path / ZIP=bytes、PDF は対象外)
         ├─ Lanczos3 で display_px までリサイズ
         ├─ CacheDecision::should_cache でキャッシュ可否判定
         └─ 必要なら WebP エンコードして catalog.db に保存
@@ -89,7 +89,7 @@ seed する。worker は通常の cache_hit で取り出すので、Shell API �
 | 変換 | 適用場所 | 備考 |
 | --- | --- | --- |
 | 回転 (DB) | 描画時の GPU 行列 | `get_rotation(idx)` で毎フレーム参照、結果は `rotation_cache` にキャッシュ |
-| EXIF Orientation | **デコード時**に適用 (通常画像のみ) | ZIP/PDF 経由のエントリには適用不可 |
+| EXIF Orientation | **デコード時**に適用 | 通常画像はファイル path、ZIP 内画像はエントリ bytes から読む。PDF は対象外 |
 | プリセット補正 (色調のみ) | **UI スレッド同期適用** | `thumb_adjust_tex[idx]` に保持、§1.5 参照 |
 | ポストフィルタ | **適用されない** | コスト/実装維持のためサムネは色調のみ |
 | AI アップスケール | **適用されない** | 1 枚 10 秒級のためサムネでは非現実的 |
@@ -175,7 +175,7 @@ ui_fullscreen.rs::render_fullscreen_viewport
           ┌─ GridItem::Image      → image::open() → 失敗時 WIC フォールバック → EXIF 適用
           ├─ GridItem::ZipImage   → zip_loader で bytes 読み出し → image::load_from_memory
           │                          → 失敗時 WIC ストリームフォールバック (SHCreateMemStream)
-          │                          ※EXIF Orientation 不可
+          │                          → bytes から EXIF Orientation 適用
           └─ GridItem::PdfPage    → pdf_loader::render_page (4096px、PDF ワーカープロセス)
                                      ※zoom 分析モードの時はさらに高解像度で再レンダリング
 
@@ -477,8 +477,8 @@ Spread モード (見開き) の場合は、`draw_fs_spread` が `resolve_spread
 | 処理 | Image | ZipImage | PdfPage | Video |
 | --- | --- | --- | --- | --- |
 | サムネイルデコード | image/turbojpeg/WIC | image::load_from_memory | PDFium ワーカー | Shell API (別スレッド) |
-| フルスクリーンデコード | 同上 + EXIF + 動画判定 | bytes から decode のみ | PDFium で 4096px | なし (サムネのみ) |
-| EXIF Orientation | ✅ | ❌ (パス不可) | ❌ | — |
+| フルスクリーンデコード | 同上 + EXIF + 動画判定 | bytes から decode + EXIF | PDFium で 4096px | なし (サムネのみ) |
+| EXIF Orientation | ✅ path から読む | ✅ bytes から読む | ❌ | — |
 | アニメーション | GIF/APNG のみ ✅ | ❌ | ❌ | — |
 | 回転 (rotation_db) | ✅ | ✅ (path+entry キー) | ✅ (path+page キー) | — |
 | プリセット補正 | ✅ | ✅ | ✅ | — |

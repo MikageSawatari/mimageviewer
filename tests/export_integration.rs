@@ -371,6 +371,44 @@ fn export_zip_source_no_path() {
 }
 
 #[test]
+fn export_zip_di2_orientation_canonical_after_display_rotation() {
+    let temp = tempfile::tempdir().unwrap();
+    let zip_path = temp.path().join("rotated-source.zip");
+    {
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("rotated.jpg", options).unwrap();
+        use std::io::Write;
+        zip.write_all(&jpeg_with_app1_payload(&orientation_exif_payload(6)))
+            .unwrap();
+        zip.finish().unwrap();
+    }
+
+    let pending = spawn_export_worker(ExportRequest {
+        source: ExportSource::ZipEntry {
+            zip_path,
+            entry_name: "rotated.jpg".to_string(),
+        },
+        original_format: SrcFormat::Jpeg,
+        output_format: ExportFormat::Jpeg95,
+        output_dir: temp.path().to_path_buf(),
+        basename: "zip-di2".to_string(),
+        pixels: single_pixels(solid_image(4, 2, egui::Color32::from_rgb(30, 60, 90))),
+        entries: vec![entry("current", 0)],
+        include_metadata: true,
+    })
+    .unwrap();
+    let events = collect_events(pending, 5);
+    assert_eq!(completed_count(&events), 1);
+
+    let out = std::fs::read(temp.path().join("zip-di2_0.jpg")).unwrap();
+    assert_eq!(jpeg_orientation(&out), Some(1));
+    let decoded = image::load_from_memory(&out).unwrap();
+    assert_eq!((decoded.width(), decoded.height()), (4, 2));
+}
+
+#[test]
 fn export_animated_webp_fails() {
     let temp = tempfile::tempdir().unwrap();
     let src = temp.path().join("animated.webp");

@@ -603,9 +603,8 @@ let source_dims = if let Some(stats) = dct_stats {
 
 **注意**:
 
-- ZIP / PDF パスは EXIF orientation を適用しない (`thumb_loader.rs:1948`)。
-  これらのパスでは `apply_exif_orientation` ステップをスキップし、`orientation=1`
-  相当として `source_dims_after_exif(1)` を呼ぶ
+- ZIP パスはエントリ bytes から EXIF orientation を読み、DCT stats には
+  `source_dims_after_exif(zip_orientation)` を使う。PDF は orientation=1 相当。
 - `dct_stats` の伝搬には clone は不要 (Copy trait derive)
 
 ### 4.2 `decode_image_for_thumb` (`thumb_loader.rs:319`)
@@ -655,7 +654,7 @@ if is_jpeg_entry(entry_name) {
                     &[("scale_num", serde_json::Value::from(stats.scale_num))],
                 );
             }
-            // ZIP は EXIF orientation 適用しないが、source_dims は元寸法を保存する必要あり。
+            // ZIP も bytes から EXIF orientation を読み、source_dims は向き反映後の元寸法を保存する。
             // §4.1 と同じく outer scope の dct_stats 変数に書く (= shared source_dims path)。
             dct_stats = Some(stats);  // §4.1 で宣言済みの mut let と共有
             Ok(img)
@@ -676,7 +675,7 @@ if is_jpeg_entry(entry_name) {
 }
 // ... 後段の source_dims 設定 (§4.1 と同じパターン):
 // let source_dims = if let Some(stats) = dct_stats {
-//     Some((stats.src_w, stats.src_h))  // ZIP は orientation=1 相当
+//     Some(stats.source_dims_after_exif(zip_orientation))
 // } else {
 //     Some((img.width(), img.height()))
 // };
@@ -789,7 +788,9 @@ let img = match img.or_else(|| image::load_from_memory(&raw).ok()) {
     Some(i) => i,
     None => return,
 };
-let source_dims = dct_stats.map(|s| (s.src_w, s.src_h));  // ZIP は orientation=1
+let orientation = read_exif_orientation_from_bytes(&raw);
+let img = apply_orientation(img, orientation);
+let source_dims = dct_stats.map(|s| s.source_dims_after_exif(orientation));
 
 // 個別エントリの cache 保存: source_dims override を渡す
 if let Some(bytes) = crate::thumb_loader::encode_and_save_with_source_dims(
@@ -806,8 +807,9 @@ if i == 0 {
 }
 ```
 
-ZIP path では EXIF orientation を適用しないので、`source_dims = Some((stats.src_w, stats.src_h))` = `source_dims_after_exif(1)` と同じ。簡潔のため直接 `(src_w, src_h)`
-を使う。
+ZIP path では EXIF orientation を bytes から読み、DCT path の `source_dims` も
+`source_dims_after_exif(orientation)` で保存する。これでサムネイル・フルスクリーン・
+一括キャッシュ作成の表示寸法が揃う。
 
 `first_webp` の型を `(DynamicImage, Option<(u32,u32)>, String)` に拡張する詳細は
 §4.4.4 (a) を参照。
@@ -839,7 +841,7 @@ let first_webp: Arc<Mutex<Option<(image::DynamicImage, Option<(u32,u32)>, String
 
 // capture 時 (app.rs:19987)
 if i == 0 {
-    let source_dims = dct_stats.map(|s| s.source_dims_after_exif(1));  // ZIP は orientation=1
+    let source_dims = dct_stats.map(|s| s.source_dims_after_exif(orientation));
     *first_webp.lock().unwrap() =
         Some((img.clone(), source_dims, entry.entry_name.clone()));
 }
@@ -1360,4 +1362,3 @@ WIC 経由の HEIC / AVIF / JXL でも `WICBitmapFrameDecode::CopyPixels` 前に
 | **ZIP cache creator は `build_and_save_one_zip` 未使用、実体はインライン path** — `src/app.rs:19943` で `image::load_from_memory` 直呼び | §4.4.3 で app.rs インライン path の改修を明示 |
 | **file:line ドリフト** — start_fs_load 14361 → 14390、thumb-quality 19283 → 19483 等 | §2.3 / §4.5 で更新 |
 | **allocation テストが weak** — overflow / TooLarge 経路を実際に走らせていない | §7.1 で adversarial JPEG fixture を使うテストを明示 |
-

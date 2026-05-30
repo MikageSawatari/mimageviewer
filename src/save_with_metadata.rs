@@ -86,11 +86,11 @@ pub struct SaveOptions {
     /// 元のメタデータを保持するか。`false` ならメタデータ無しの素の画像を出力。
     pub include_metadata: bool,
     /// 呼び出し側で **既に** EXIF Orientation 通りに pixels を回転済みか。
-    /// 既定 `true` (= mIV の通常 fullscreen 表示パスは `wic_decoder` や
-    /// EXIF orientation 経路でローカル JPEG を canonical orientation に揃える)。
+    /// 既定 `true` (= mIV の通常 fullscreen 表示パスは、通常ファイルも ZIP 内画像も
+    /// EXIF orientation 経路で canonical orientation に揃える)。
     ///
-    /// ZIP 内 JPEG 等で **pixels が未回転のまま** export する場合は `false` を
-    /// 渡す。`false` のときは EXIF Orientation タグを書き換えず元の値を保つ
+    /// テストや将来の特殊経路で **pixels が未回転のまま** export する場合は
+    /// `false` を渡す。`false` のときは EXIF Orientation タグを書き換えず元の値を保つ
     /// (= ビューアが元 Orientation で再回転して正しく表示する)。
     ///
     /// 詳細: 通常パス (= `true`) では pixels が canonical 状態なので
@@ -318,9 +318,8 @@ fn encode_jpeg_with_metadata(
         // EXIF APP1 の Orientation 処理 (Codex P1 / r2 P2)。
         // - `caller_applied_orientation = true`: pixels は canonical 向きに回転
         //   済みなので Orientation を 1 に書き換える (= viewer の二重回転防止)。
-        // - `caller_applied_orientation = false` (ZIP 内 JPEG 等): pixels は
-        //   未回転なので Orientation を温存 (= viewer が元通りに再回転して
-        //   正しく表示)。
+        // - `caller_applied_orientation = false`: pixels は未回転の呼び出し元向け。
+        //   Orientation を温存し、viewer 側に元通りの自動回転を任せる。
         if options.caller_applied_orientation {
             for seg in app1_segments.iter_mut() {
                 reset_exif_orientation_in_app1(seg);
@@ -1463,7 +1462,7 @@ mod tests {
     // ── Codex r2 修正対応の回帰テスト ──
 
     /// `caller_applied_orientation = false` のとき Orientation が温存される
-    /// ことを確認 (ZIP 内 JPEG export 用、Codex r2 P2)。
+    /// ことを確認 (未回転 pixels を渡す呼び出し元用、Codex r2 P2)。
     #[test]
     fn jpeg_orientation_preserved_when_caller_did_not_apply() {
         // EXIF APP1 with Orientation=6 を作る

@@ -300,8 +300,8 @@ UI 側でファイル名既定値を出すときも:
   最新エラーのみ表示でOK)。完了モーダルで「N 件成功 / M 件失敗」を集計表示。
 - **`caller_applied_orientation`**: フルスクリーン表示中の pixels は canonical
   orientation 適用済みなので `true` (= EXIF Orientation を 1 に書き換え)。
-  ZIP 内 JPEG など未回転で展開しているケースがあれば false。実装時は `App` の
-  `fs_cache` 経由で取得したピクセルが canonical かを確認すること。
+  ZIP 内 JPEG も表示 decode 時に bytes から Orientation を適用するため true。
+  実装時は `App` の `fs_cache` 経由で取得したピクセルが canonical かを確認すること。
 - **TextEdit + Enter/Escape**: IME 変換中の Enter が「保存」を発火しないよう、必ず
   `dialog_enter_pressed` / `dialog_escape_pressed` を使う (CLAUDE.md)。
 - **モーダル diag のドラッグ移動**: `default_pos()` で初期位置を指定し `anchor()` は
