@@ -22647,6 +22647,13 @@ impl eframe::App for App {
         // Ctrl+G (docs §10.4): debounce 後に spawn、streaming 受信 → items 更新
         self.poll_global_search_debounce();
         self.poll_global_search_events(ctx);
+        if self.global_search.is_searching() {
+            // Ctrl+G の検索そのものもインタラクティブ操作として扱う。
+            // 入力イベントの bump だけだと DEFAULT_QUIET_MS 経過後にインデクサが
+            // 再開し、Tantivy/post-filter の初回結果と I/O/CPU が競合することがある。
+            // pending 中は毎フレーム bump して、検索完了後に自然再開させる。
+            self.activity_gate.bump();
+        }
         // review #9 対応: ensure_container_mtime_populated が worker thread に
         // 投げた mtime 取得結果を drain する。完了で rebuild が走る。
         self.poll_container_mtime_pending(ctx);

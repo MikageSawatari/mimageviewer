@@ -474,6 +474,8 @@ UI (global_search_ui::render_global_search_bar)
 
   [UI] 毎フレーム:
     → poll_global_search が try_recv ループで Batch を受信
+    → 検索中は ActivityGate を bump し続け、背景インデクサの walker/ingest を
+      次の処理単位で待機させる
     → push_grid_item_pending で items + thumbnails をセット拡張
     → rebuild_global_search_items が現在のビューに合わせて items を再構築:
         - Flat (一覧)      … 全ヒットを画像 / PDF / 動画として平坦に並べる
@@ -574,6 +576,12 @@ Low (インデクサ) の優先順で permit を配る。
 飢餓ポリシーは「UI 応答性最優先」に振っている: ユーザがアクティブに操作して
 いる間 Low は止まる。アイドル時 (入力なし数秒) に Low が進む。`AC 電源時のみ
 インデックス` 設定で補強。
+
+Ctrl+G の query worker は Tantivy 読み取りなので writer 優先キューには乗らない。
+ただし UI からの検索はインタラクティブ操作なので、検索中は App 側が
+`ActivityGate` を継続的に bump し、背景インデクサを walker/ingest の次 checkpoint
+で待たせる。これにより「入力後 1 秒でインデクサが再開し、初回ヒット表示と競合する」
+揺れを抑える。
 
 ### 6.8 なぜ `try_lock + sleep` を使わないか
 

@@ -64,7 +64,7 @@
 | `VideoDynamicState.present_path` | `Arc<AtomicU8>` | native-video-presenter (= `record_present`) | UI (右パネル overlay 描画) | per-frame のプレゼン経路 (Pending / GPU / CPU)。`d3d11_shared` なら GPU、`cpu_upload` なら CPU を store。デインターレース ON で CPU 経路に落ちた場合の右パネル「フレーム表示」表示根拠 |
 | `VideoDynamicState.deinterlace_status` | `Arc<AtomicU8>` | video-decode (`run_video_decode`) | UI (右パネル overlay 描画) | bwdif フィルタの動的状態 (Pending / Inactive / Active / Failed)。フィルタ初期化成功 → Active、失敗 → Failed、Auto モードで素材プログレッシブ判定 → Inactive、seek 直後 → Pending。Settings = Off は decode 開始時に Inactive |
 | `VideoDynamicState.interlace_detected` | `Arc<AtomicBool>` | video-decode (`run_video_decode`) | UI (右パネル overlay 描画) | `stream_interlaced || frame_interlaced` の latched 検出。一度 true になったら同 source 再生中は維持 (= 微小な interlaced フレーム混入でも表示安定)。`VideoPlayer::open` ごとに新 Arc 生成で false 初期化 |
-| `ActivityGate.paused` (v0.9) | `AtomicBool` | UI (トレイメニュー「一時停止」 / ウィンドウ hide) | `wait_until_idle` を呼ぶ全ワーカー (walker / ingest / name_bulk_indexer) | true の間 wait ループが解除 or cancel まで抜けない。cancel は貫通 (終了時の固まり防止) |
+| `ActivityGate.paused` (v0.9) | `AtomicBool` | UI (トレイメニュー「一時停止」 / ウィンドウ hide) | `wait_until_idle` を呼ぶ全ワーカー (walker / ingest / name_bulk_indexer) | true の間 wait ループが解除 or cancel まで抜けない。cancel は貫通 (終了時の固まり防止)。Ctrl+G 検索中は paused ではなく `bump()` を継続して、検索完了後に通常の quiet threshold で自然再開させる |
 | `GlobalIoSemaphore.throttled` (v0.9) | `Mutex` ガード | UI (ウィンドウ hide/show) | 全インデクサ worker | true の間、実効 permit=1 (in_use ≥ 1 なら新規 acquire 不可)。解除で `notify_all` |
 
 **ルール**: アトミックは単発の値伝搬にのみ使う。リスト/辞書の共有は `Arc<Mutex<...>>` か mpsc。
@@ -308,7 +308,7 @@ cache save 進行中 (数百 ms) は `requested` 空かつ cache_map にも未�
 
 | ワーカー | 発火元 | シグナル |
 | --- | --- | --- |
-| Ctrl+G クエリワーカー (`global_search::run`) | クエリ変更 / フィルタ変更 / バー閉じ / folder 遷移 / `GlobalSearchHandle` drop | `Arc<AtomicBool>` を Tantivy ページングループ頭と post-filter ループ頭で check |
+| Ctrl+G クエリワーカー (`global_search::run`) | クエリ変更 / フィルタ変更 / バー閉じ / folder 遷移 / `GlobalSearchHandle` drop | `Arc<AtomicBool>` を Tantivy ページングループ頭と post-filter ループ頭で check。pending/debounce 中は App が `ActivityGate::bump()` を継続し、背景インデクサの walker/ingest を次 checkpoint で待たせる |
 | IndexerSupervisor (メタ / 名前) | `IndexerManager::sync_with_favorites` で OFF 化、App drop | `SupervisorHandle::stop()` → cancel + FsWatcher drop + thread join (最大 ~250ms) |
 | walker / ingest (supervisor 内部) | supervisor cancel | 各ループ checkpoint で `Ordering::Relaxed` read。大ファイル走査中も数百 ms 以内に抜ける |
 | tag_write_worker | App drop | `None` 送信 + cancel フラグ。commit 後のループ先頭で check |
