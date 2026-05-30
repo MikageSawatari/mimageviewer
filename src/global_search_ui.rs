@@ -139,6 +139,26 @@ const RESORT_INTERVAL_MS: u64 = 1000;
 /// Ctrl+G 一覧ビューが自動で集約ビューへ切り替わる総ヒット数の閾値
 /// (docs/search-container-item-redesign.md §4.3.2)。
 const AGGREGATE_AUTO_THRESHOLD: usize = 1000;
+const GLOBAL_SEARCH_STATUS_TEXT_SIZE: f32 = 11.0;
+const GLOBAL_SEARCH_STATUS_MIN_WIDTH: f32 = 48.0;
+const GLOBAL_SEARCH_STATUS_MAX_WIDTH: f32 = 260.0;
+const GLOBAL_SEARCH_STATUS_PADDING_X: f32 = 4.0;
+
+fn global_search_status_width(ui: &egui::Ui, text: &str, color: egui::Color32) -> (f32, bool) {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_owned(),
+        egui::FontId::proportional(GLOBAL_SEARCH_STATUS_TEXT_SIZE),
+        color,
+    );
+    let needed = (galley.size().x + GLOBAL_SEARCH_STATUS_PADDING_X).ceil();
+    let max_width = ui
+        .available_width()
+        .max(GLOBAL_SEARCH_STATUS_MIN_WIDTH)
+        .min(GLOBAL_SEARCH_STATUS_MAX_WIDTH);
+    let width = needed.clamp(GLOBAL_SEARCH_STATUS_MIN_WIDTH, max_width);
+    let truncated = needed > width + 0.5;
+    (width, truncated)
+}
 
 /// Ctrl+G の drill-down 状態。コンテナにドリルインしているときだけ `Some` で保持される
 /// (docs/search-container-item-redesign.md §4.3.2)。
@@ -2034,7 +2054,6 @@ impl App {
         let mut toggle_changed = false;
 
         let combo_popup_height = (ctx.content_rect().height() - 96.0).clamp(240.0, 520.0);
-        let status_width = 300.0;
         let mut drill_back = false;
         egui::TopBottomPanel::top("global_search_bar").show(ctx, |ui| {
             ui.add_space(2.0);
@@ -2254,8 +2273,8 @@ impl App {
                     }
                 }
 
-                // 進捗/結果バッジ。可変幅の文言でフィルタ/集約/ソート操作の位置が
-                // 揺れないよう、操作群の一番右側に置く。
+                // 進捗/結果バッジ。操作群の一番右側に置き、表示テキストの実測幅だけを
+                // 確保する。長い警告だけは上限幅で省略し、hover に全文を出す。
                 let status = if let Some(msg) = &self.global_search.reject_message {
                     Some((msg.clone(), egui::Color32::from_rgb(200, 120, 40), None))
                 } else if self.global_search.is_searching() {
@@ -2287,18 +2306,18 @@ impl App {
                 } else {
                     None
                 };
-                ui.separator();
                 if let Some((text, color, hover)) = status {
+                    ui.separator();
+                    let (status_width, truncated) = global_search_status_width(ui, &text, color);
+                    let hover_text = hover.or_else(|| truncated.then(|| text.clone()));
                     let response = ui.add_sized(
                         [status_width, ui.spacing().interact_size.y],
                         egui::Label::new(egui::RichText::new(text).size(11.0).color(color))
                             .truncate(),
                     );
-                    if let Some(hover) = hover {
+                    if let Some(hover) = hover_text {
                         response.on_hover_text(hover);
                     }
-                } else {
-                    ui.allocate_space(egui::vec2(status_width, ui.spacing().interact_size.y));
                 }
             });
             ui.add_space(2.0);
