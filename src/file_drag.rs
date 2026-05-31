@@ -103,7 +103,6 @@ pub enum FileDragError {
 /// UI スレッドから、かつマウスボタンが押下中に呼ぶこと。
 #[cfg(windows)]
 pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
-    use std::os::windows::ffi::OsStrExt;
     use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx, IDataObject};
     use windows::Win32::System::Ole::{DROPEFFECT_COPY, IDropSource};
@@ -124,11 +123,7 @@ pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
     let mut pidls: Vec<*const ITEMIDLIST> = Vec::with_capacity(paths.len());
     let mut failed_paths = 0usize;
     for path in paths {
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect();
+        let wide = shell_parse_wide_path(path);
         let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
         let parsed = unsafe {
             SHParseDisplayName(PCWSTR(wide.as_ptr()), None::<&IBindCtx>, &mut pidl, 0, None)
@@ -210,6 +205,19 @@ pub fn start_file_drag(hwnd: isize, paths: &[PathBuf]) -> DragOutcome {
     }
 }
 
+#[cfg(windows)]
+fn shell_parse_wide_path(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // Ctrl+G results use the normalized index key (`c:/...`). Win32 file APIs
+    // accept '/', but SHParseDisplayName rejects it with E_INVALIDARG.
+    path.as_os_str()
+        .encode_wide()
+        .map(|ch| if ch == b'/' as u16 { b'\\' as u16 } else { ch })
+        .chain(std::iter::once(0))
+        .collect()
+}
+
 /// 非 Windows ビルド用の空実装。他のプラットフォーム分岐に揃えるためのスタブ。
 #[cfg(not(windows))]
 pub fn start_file_drag(_hwnd: isize, _paths: &[PathBuf]) -> DragOutcome {
@@ -247,6 +255,35 @@ fn copy_target_inside_src(src: &Path, dest: &Path) -> bool {
     // ならない)。
     let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
     lower(&target).starts_with(lower(src))
+}
+
+#[cfg(all(test, windows))]
+mod shell_parse_path_tests {
+    use super::shell_parse_wide_path;
+    use std::path::Path;
+
+    #[test]
+    fn converts_forward_slashes_for_shell_parse() {
+        let wide = shell_parse_wide_path(Path::new(
+            r"g:/home/comfyui/eagle/ai/sd_image/2025-04-19.png",
+        ));
+        assert_eq!(wide.last().copied(), Some(0));
+        let without_nul = &wide[..wide.len() - 1];
+        assert_eq!(
+            String::from_utf16(without_nul).unwrap(),
+            r"g:\home\comfyui\eagle\ai\sd_image\2025-04-19.png"
+        );
+    }
+
+    #[test]
+    fn converts_normalized_unc_paths_for_shell_parse() {
+        let wide = shell_parse_wide_path(Path::new(r"//server/share/folder/a.jpg"));
+        let without_nul = &wide[..wide.len() - 1];
+        assert_eq!(
+            String::from_utf16(without_nul).unwrap(),
+            r"\\server\share\folder\a.jpg"
+        );
+    }
 }
 
 #[cfg(all(test, windows))]
