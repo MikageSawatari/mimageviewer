@@ -383,8 +383,10 @@ impl Default for ColorRangeMask {
 pub enum LocalEffect {
     None,
     Tone(ToneParams),
+    ToneCurve(ToneCurveParams),
     Clarity(ClarityParams),
     HighlightsShadows(HighlightsShadowsParams),
+    Dehaze(DehazeParams),
     Blur(BlurParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
@@ -396,6 +398,7 @@ pub enum LocalEffect {
     FilmGrain(FilmGrainParams),
     ChromaticAberration(ChromaticAberrationParams),
     Halftone(HalftoneParams),
+    StarGlow(StarGlowParams),
     EdgeSmooth(EdgeSmoothParams),
 }
 
@@ -418,6 +421,19 @@ impl Default for ToneParams {
             saturation: 0.0,
             vibrance: 0.0,
             temperature: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ToneCurveParams {
+    pub points: [f32; 5],
+}
+
+impl Default for ToneCurveParams {
+    fn default() -> Self {
+        Self {
+            points: [0.0, 0.25, 0.5, 0.75, 1.0],
         }
     }
 }
@@ -451,6 +467,25 @@ impl Default for HighlightsShadowsParams {
         Self {
             shadows: 0.0,
             highlights: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DehazeParams {
+    pub amount: f32,
+    pub radius_px: f32,
+    pub min_transmission: f32,
+    pub saturation: f32,
+}
+
+impl Default for DehazeParams {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            radius_px: 14.0,
+            min_transmission: 0.30,
+            saturation: 0.0,
         }
     }
 }
@@ -642,6 +677,37 @@ impl Default for HalftoneParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StarRayMode {
+    Cross4,
+    Star8,
+}
+
+impl Default for StarRayMode {
+    fn default() -> Self {
+        Self::Cross4
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct StarGlowParams {
+    pub mode: StarRayMode,
+    pub threshold: f32,
+    pub length_px: f32,
+    pub strength: f32,
+}
+
+impl Default for StarGlowParams {
+    fn default() -> Self {
+        Self {
+            mode: StarRayMode::Cross4,
+            threshold: 0.82,
+            length_px: 48.0,
+            strength: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EdgeSmoothParams {
     pub radius_px: f32,
@@ -716,6 +782,7 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
     let effected = match layer.effect {
         LocalEffect::None => unreachable!("None is handled before mask evaluation"),
         LocalEffect::Tone(params) => apply_tone_image(&image.pixels, params),
+        LocalEffect::ToneCurve(params) => apply_tone_curve(&image.pixels, params),
         LocalEffect::Clarity(params) => apply_clarity(
             &image.pixels,
             image.width,
@@ -724,6 +791,9 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
             params.amount.clamp(-1.0, 1.0),
         ),
         LocalEffect::HighlightsShadows(params) => apply_highlights_shadows(&image.pixels, params),
+        LocalEffect::Dehaze(params) => {
+            apply_dehaze(&image.pixels, image.width, image.height, params)
+        }
         LocalEffect::Blur(params) => box_blur_rgba(
             &image.pixels,
             image.width,
@@ -767,6 +837,9 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         ),
         LocalEffect::Halftone(params) => {
             apply_halftone(&image.pixels, image.width, image.height, params)
+        }
+        LocalEffect::StarGlow(params) => {
+            apply_star_glow(&image.pixels, image.width, image.height, params)
         }
         LocalEffect::EdgeSmooth(params) => {
             apply_edge_smooth(&image.pixels, image.width, image.height, params)
@@ -1189,6 +1262,37 @@ fn apply_tone_image(src: &[u8], params: ToneParams) -> Vec<u8> {
     out
 }
 
+fn apply_tone_curve(src: &[u8], params: ToneCurveParams) -> Vec<u8> {
+    let lut = tone_curve_lut(params);
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        px[0] = lut[px[0] as usize];
+        px[1] = lut[px[1] as usize];
+        px[2] = lut[px[2] as usize];
+    }
+    out
+}
+
+fn tone_curve_lut(params: ToneCurveParams) -> [u8; 256] {
+    let mut lut = [0_u8; 256];
+    for (i, v) in lut.iter_mut().enumerate() {
+        *v = to_u8(tone_curve_value(i as f32 / 255.0, params.points));
+    }
+    lut
+}
+
+fn tone_curve_value(x: f32, points: [f32; 5]) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    let seg = ((x * 4.0).floor() as usize).min(3);
+    let x0 = seg as f32 * 0.25;
+    let t = ((x - x0) * 4.0).clamp(0.0, 1.0);
+    lerp_f32(
+        points[seg].clamp(0.0, 1.0),
+        points[seg + 1].clamp(0.0, 1.0),
+        t,
+    )
+}
+
 fn apply_clarity(src: &[u8], width: usize, height: usize, radius: usize, amount: f32) -> Vec<u8> {
     if radius == 0 || amount.abs() <= f32::EPSILON {
         return src.to_vec();
@@ -1220,6 +1324,97 @@ fn apply_highlights_shadows(src: &[u8], params: HighlightsShadowsParams) -> Vec<
         px[0] = to_u8(r + delta);
         px[1] = to_u8(g + delta);
         px[2] = to_u8(b + delta);
+    }
+    out
+}
+
+fn apply_dehaze(src: &[u8], width: usize, height: usize, params: DehazeParams) -> Vec<u8> {
+    let amount = params.amount.clamp(0.0, 1.0);
+    if amount <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let radius = params.radius_px.round().clamp(0.0, 48.0) as usize;
+    let air = estimate_airlight(src);
+    let mut dark = Vec::with_capacity(width * height);
+    for i in (0..src.len()).step_by(4) {
+        let r = src[i] as f32 / 255.0 / air[0].max(0.05);
+        let g = src[i + 1] as f32 / 255.0 / air[1].max(0.05);
+        let b = src[i + 2] as f32 / 255.0 / air[2].max(0.05);
+        dark.push(r.min(g).min(b).clamp(0.0, 1.0));
+    }
+    let dark = min_filter_f32(&dark, width, height, radius);
+    let omega = 0.95 * amount;
+    let min_t = params.min_transmission.clamp(0.10, 0.90);
+    let mut transmission: Vec<f32> = dark
+        .iter()
+        .map(|d| (1.0 - omega * *d).clamp(min_t, 1.0))
+        .collect();
+    let smooth_radius = (radius / 3).min(16);
+    if smooth_radius > 0 {
+        transmission = box_blur_alpha(&transmission, width, height, smooth_radius);
+    }
+    let sat = (1.0 + params.saturation / 100.0).max(0.0);
+    let mut out = src.to_vec();
+    for (idx, px) in out.chunks_exact_mut(4).enumerate() {
+        let t = transmission[idx].clamp(min_t, 1.0);
+        let mut rgb = [0.0_f32; 3];
+        for c in 0..3 {
+            let i = src[idx * 4 + c] as f32 / 255.0;
+            rgb[c] = ((i - air[c]) / t + air[c]).clamp(0.0, 1.0);
+        }
+        if (sat - 1.0).abs() > f32::EPSILON {
+            rgb = adjust_saturation(rgb, sat);
+        }
+        px[0] = to_u8(rgb[0]);
+        px[1] = to_u8(rgb[1]);
+        px[2] = to_u8(rgb[2]);
+    }
+    out
+}
+
+fn estimate_airlight(src: &[u8]) -> [f32; 3] {
+    let mut best_luma = -1.0_f32;
+    let mut best = [1.0_f32; 3];
+    for i in (0..src.len()).step_by(4) {
+        let r = src[i] as f32 / 255.0;
+        let g = src[i + 1] as f32 / 255.0;
+        let b = src[i + 2] as f32 / 255.0;
+        let luma = luma01(r, g, b);
+        if luma > best_luma {
+            best_luma = luma;
+            best = [r.max(0.05), g.max(0.05), b.max(0.05)];
+        }
+    }
+    best
+}
+
+fn min_filter_f32(src: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
+    if radius == 0 || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let mut tmp = vec![0.0; src.len()];
+    let mut out = vec![0.0; src.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius).min(width - 1);
+            let mut v = f32::INFINITY;
+            for xx in x0..=x1 {
+                v = v.min(src[y * width + xx]);
+            }
+            tmp[y * width + x] = v;
+        }
+    }
+    for y in 0..height {
+        let y0 = y.saturating_sub(radius);
+        let y1 = (y + radius).min(height - 1);
+        for x in 0..width {
+            let mut v = f32::INFINITY;
+            for yy in y0..=y1 {
+                v = v.min(tmp[yy * width + x]);
+            }
+            out[y * width + x] = v;
+        }
     }
     out
 }
@@ -1735,6 +1930,113 @@ fn apply_halftone(src: &[u8], width: usize, height: usize, params: HalftoneParam
     out
 }
 
+fn apply_star_glow(src: &[u8], width: usize, height: usize, params: StarGlowParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 3.0);
+    let length = params.length_px.clamp(1.0, 240.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let threshold = params.threshold.clamp(0.0, 0.99);
+    let inv_range = 1.0 / (1.0 - threshold).max(0.001);
+    let mut bright = vec![0.0_f32; width * height * 3];
+    for i in 0..width * height {
+        let o = i * 4;
+        let r = src[o] as f32 / 255.0;
+        let g = src[o + 1] as f32 / 255.0;
+        let b = src[o + 2] as f32 / 255.0;
+        let weight = ((luma01(r, g, b) - threshold) * inv_range).clamp(0.0, 1.0);
+        let weight = weight * weight;
+        let d = i * 3;
+        bright[d] = r * weight;
+        bright[d + 1] = g * weight;
+        bright[d + 2] = b * weight;
+    }
+    let decay = (-1.0 / length.max(1.0)).exp().clamp(0.0, 0.995);
+    let mut streak = vec![0.0_f32; width * height * 3];
+    add_streak_direction(&bright, &mut streak, width, height, 1, 0, decay);
+    add_streak_direction(&bright, &mut streak, width, height, 0, 1, decay);
+    let orientations = match params.mode {
+        StarRayMode::Cross4 => 2.0,
+        StarRayMode::Star8 => {
+            add_streak_direction(&bright, &mut streak, width, height, 1, 1, decay);
+            add_streak_direction(&bright, &mut streak, width, height, 1, -1, decay);
+            4.0
+        }
+    };
+    let mut out = src.to_vec();
+    let scale = strength / orientations;
+    for i in 0..width * height {
+        let si = i * 3;
+        let oi = i * 4;
+        for c in 0..3 {
+            let base = src[oi + c] as f32 / 255.0;
+            out[oi + c] = to_u8(base + streak[si + c] * scale);
+        }
+    }
+    out
+}
+
+fn add_streak_direction(
+    src: &[f32],
+    dst: &mut [f32],
+    width: usize,
+    height: usize,
+    dx: i32,
+    dy: i32,
+    decay: f32,
+) {
+    for y in 0..height {
+        for x in 0..width {
+            let prev_x = x as i32 - dx;
+            let prev_y = y as i32 - dy;
+            if prev_x < 0 || prev_y < 0 || prev_x >= width as i32 || prev_y >= height as i32 {
+                add_streak_line(src, dst, width, height, x as i32, y as i32, dx, dy, decay);
+            }
+        }
+    }
+}
+
+fn add_streak_line(
+    src: &[f32],
+    dst: &mut [f32],
+    width: usize,
+    height: usize,
+    start_x: i32,
+    start_y: i32,
+    dx: i32,
+    dy: i32,
+    decay: f32,
+) {
+    let gain = 1.0 - decay;
+    let mut x = start_x;
+    let mut y = start_y;
+    let mut acc = [0.0_f32; 3];
+    while x >= 0 && y >= 0 && x < width as i32 && y < height as i32 {
+        let i = (y as usize * width + x as usize) * 3;
+        for c in 0..3 {
+            acc[c] = src[i + c] + acc[c] * decay;
+            dst[i + c] += acc[c] * gain;
+        }
+        x += dx;
+        y += dy;
+    }
+    x -= dx;
+    y -= dy;
+    acc = [0.0; 3];
+    loop {
+        let i = (y as usize * width + x as usize) * 3;
+        for c in 0..3 {
+            acc[c] = src[i + c] + acc[c] * decay;
+            dst[i + c] += acc[c] * gain;
+        }
+        if x == start_x && y == start_y {
+            break;
+        }
+        x -= dx;
+        y -= dy;
+    }
+}
+
 fn apply_edge_smooth(src: &[u8], width: usize, height: usize, params: EdgeSmoothParams) -> Vec<u8> {
     let radius = params.radius_px.round().clamp(0.0, 8.0) as i32;
     let strength = params.strength.clamp(0.0, 1.0);
@@ -2124,8 +2426,10 @@ mod tests {
         .unwrap();
         let effects = [
             LocalEffect::Tone(ToneParams::default()),
+            LocalEffect::ToneCurve(ToneCurveParams::default()),
             LocalEffect::Clarity(ClarityParams::default()),
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default()),
+            LocalEffect::Dehaze(DehazeParams::default()),
             LocalEffect::Blur(BlurParams::default()),
             LocalEffect::SoftFocus(SoftFocusParams::default()),
             LocalEffect::Mosaic(MosaicParams::default()),
@@ -2137,6 +2441,7 @@ mod tests {
             LocalEffect::FilmGrain(FilmGrainParams::default()),
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
             LocalEffect::Halftone(HalftoneParams::default()),
+            LocalEffect::StarGlow(StarGlowParams::default()),
             LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
         ];
         for effect in effects {
@@ -2177,6 +2482,37 @@ mod tests {
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert!(out.pixels[1] > 200);
         assert!(out.pixels[0] < 80);
+    }
+
+    #[test]
+    fn tone_curve_lifts_midtones() {
+        let src = solid(1, 1, [128, 128, 128, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "curve",
+            LocalMask::Full,
+            LocalEffect::ToneCurve(ToneCurveParams {
+                points: [0.0, 0.35, 0.65, 0.86, 1.0],
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > src.pixels[0]);
+    }
+
+    #[test]
+    fn dehaze_darkens_hazy_dark_object() {
+        let src = RgbaImageBuf::new(2, 1, vec![130, 140, 150, 255, 230, 230, 230, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "dehaze",
+            LocalMask::Full,
+            LocalEffect::Dehaze(DehazeParams {
+                amount: 0.65,
+                radius_px: 0.0,
+                min_transmission: 0.30,
+                saturation: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] < src.pixels[0]);
     }
 
     #[test]
@@ -2281,6 +2617,31 @@ mod tests {
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_ne!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn star_glow_extends_bright_pixel_horizontally() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0, 0, 255, 0, 0, 0, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "star",
+            LocalMask::Full,
+            LocalEffect::StarGlow(StarGlowParams {
+                mode: StarRayMode::Cross4,
+                threshold: 0.5,
+                length_px: 4.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[4] > src.pixels[4]);
+        assert_eq!(out.pixels[3], 255);
     }
 
     #[test]

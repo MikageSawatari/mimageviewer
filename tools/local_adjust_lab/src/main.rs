@@ -10,11 +10,12 @@ use eframe::egui::{
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     BloomParams, BlurParams, ChromaticAberrationParams, ClarityParams, ColorRangeMask,
-    EdgeSmoothParams, FilmGrainParams, HalftoneParams, HighlightsShadowsParams, HslParams,
-    LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
-    LookPreset, MaskShape, MosaicParams, RadialGradientMask, RangeMask, RasterMask,
+    DehazeParams, EdgeSmoothParams, FilmGrainParams, HalftoneParams, HighlightsShadowsParams,
+    HslParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
+    LookParams, LookPreset, MaskShape, MosaicParams, RadialGradientMask, RangeMask, RasterMask,
     RasterVectorMask, RegionMask, RgbaImageBuf, RgbaImageRef, ShapeOp, SharpenParams,
-    SoftFocusParams, ToneParams, VignetteParams, apply_layers, evaluate_layer_mask,
+    SoftFocusParams, StarGlowParams, StarRayMode, ToneCurveParams, ToneParams, VignetteParams,
+    apply_layers, evaluate_layer_mask,
 };
 
 const PANEL_W: f32 = 340.0;
@@ -381,8 +382,10 @@ impl MaskKind {
 enum EffectKind {
     None,
     Tone,
+    ToneCurve,
     Clarity,
     HighlightsShadows,
+    Dehaze,
     Blur,
     SoftFocus,
     Mosaic,
@@ -394,6 +397,7 @@ enum EffectKind {
     FilmGrain,
     ChromaticAberration,
     Halftone,
+    StarGlow,
     EdgeSmooth,
 }
 
@@ -402,8 +406,10 @@ impl EffectKind {
         match effect {
             LocalEffect::None => Self::None,
             LocalEffect::Tone(_) => Self::Tone,
+            LocalEffect::ToneCurve(_) => Self::ToneCurve,
             LocalEffect::Clarity(_) => Self::Clarity,
             LocalEffect::HighlightsShadows(_) => Self::HighlightsShadows,
+            LocalEffect::Dehaze(_) => Self::Dehaze,
             LocalEffect::Blur(_) => Self::Blur,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
@@ -415,6 +421,7 @@ impl EffectKind {
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
             LocalEffect::ChromaticAberration(_) => Self::ChromaticAberration,
             LocalEffect::Halftone(_) => Self::Halftone,
+            LocalEffect::StarGlow(_) => Self::StarGlow,
             LocalEffect::EdgeSmooth(_) => Self::EdgeSmooth,
         }
     }
@@ -423,8 +430,10 @@ impl EffectKind {
         match self {
             Self::None => "効果なし",
             Self::Tone => "色調補正",
+            Self::ToneCurve => "トーンカーブ",
             Self::Clarity => "明瞭度",
             Self::HighlightsShadows => "ハイライト/シャドウ",
+            Self::Dehaze => "かすみ除去",
             Self::Blur => "ぼかし",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
@@ -436,6 +445,7 @@ impl EffectKind {
             Self::FilmGrain => "フィルム粒子",
             Self::ChromaticAberration => "色収差",
             Self::Halftone => "ハーフトーン",
+            Self::StarGlow => "クロス光",
             Self::EdgeSmooth => "エッジ保持ぼかし",
         }
     }
@@ -4310,8 +4320,10 @@ fn effect_summary(effect: &LocalEffect) -> String {
     match effect {
         LocalEffect::None => "効果なし".to_string(),
         LocalEffect::Tone(_) => "色調補正".to_string(),
+        LocalEffect::ToneCurve(_) => "トーンカーブ".to_string(),
         LocalEffect::Clarity(_) => "明瞭度".to_string(),
         LocalEffect::HighlightsShadows(_) => "ハイライト/シャドウ".to_string(),
+        LocalEffect::Dehaze(params) => format!("かすみ除去 {:.0}%", params.amount * 100.0),
         LocalEffect::Blur(params) => format!("ぼかし {:.0}px", params.radius_px),
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!("モザイク {}px", params.block_px),
@@ -4325,9 +4337,17 @@ fn effect_summary(effect: &LocalEffect) -> String {
             format!("色収差 {:.1}px", params.offset_px)
         }
         LocalEffect::Halftone(params) => format!("ハーフトーン {}px", params.cell_px),
+        LocalEffect::StarGlow(params) => format!("クロス光 {:.0}px", params.length_px),
         LocalEffect::EdgeSmooth(params) => {
             format!("エッジ保持ぼかし {:.0}px", params.radius_px)
         }
+    }
+}
+
+fn star_ray_mode_label(mode: StarRayMode) -> &'static str {
+    match mode {
+        StarRayMode::Cross4 => "クロス",
+        StarRayMode::Star8 => "8方向",
     }
 }
 
@@ -4374,8 +4394,10 @@ fn draw_effect_kind_selector(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer
         for candidate in [
             EffectKind::None,
             EffectKind::Tone,
+            EffectKind::ToneCurve,
             EffectKind::Clarity,
             EffectKind::HighlightsShadows,
+            EffectKind::Dehaze,
             EffectKind::Blur,
             EffectKind::SoftFocus,
             EffectKind::Mosaic,
@@ -4387,6 +4409,7 @@ fn draw_effect_kind_selector(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer
             EffectKind::FilmGrain,
             EffectKind::ChromaticAberration,
             EffectKind::Halftone,
+            EffectKind::StarGlow,
             EffectKind::EdgeSmooth,
         ] {
             ui.selectable_value(&mut kind, candidate, candidate.label());
@@ -4401,6 +4424,61 @@ fn draw_effect_kind_selector(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer
 
 fn preset_button(ui: &mut egui::Ui, label: &str) -> bool {
     ui.add(egui::Button::new(label).small()).clicked()
+}
+
+fn draw_tone_curve_preview(ui: &mut egui::Ui, params: ToneCurveParams) {
+    let desired = egui::vec2(ui.available_width().min(220.0), 120.0);
+    let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, Color32::from_gray(24));
+    painter.rect_stroke(
+        rect,
+        4.0,
+        egui::Stroke::new(1.0, Color32::from_gray(70)),
+        egui::StrokeKind::Inside,
+    );
+    for i in 1..4 {
+        let t = i as f32 / 4.0;
+        let x = egui::lerp(rect.left()..=rect.right(), t);
+        let y = egui::lerp(rect.bottom()..=rect.top(), t);
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            egui::Stroke::new(1.0, Color32::from_gray(42)),
+        );
+        painter.line_segment(
+            [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
+            egui::Stroke::new(1.0, Color32::from_gray(42)),
+        );
+    }
+    painter.line_segment(
+        [rect.left_bottom(), rect.right_top()],
+        egui::Stroke::new(1.0, Color32::from_gray(68)),
+    );
+    let mut prev = None;
+    for i in 0..=64 {
+        let x01 = i as f32 / 64.0;
+        let y01 = preview_tone_curve_value(x01, params.points);
+        let p = Pos2::new(
+            egui::lerp(rect.left()..=rect.right(), x01),
+            egui::lerp(rect.bottom()..=rect.top(), y01),
+        );
+        if let Some(prev) = prev {
+            painter.line_segment(
+                [prev, p],
+                egui::Stroke::new(2.0, Color32::from_rgb(120, 210, 255)),
+            );
+        }
+        prev = Some(p);
+    }
+}
+
+fn preview_tone_curve_value(x: f32, points: [f32; 5]) -> f32 {
+    let x = x.clamp(0.0, 1.0);
+    let seg = ((x * 4.0).floor() as usize).min(3);
+    let x0 = seg as f32 * 0.25;
+    let t = ((x - x0) * 4.0).clamp(0.0, 1.0);
+    points[seg].clamp(0.0, 1.0)
+        + (points[seg + 1].clamp(0.0, 1.0) - points[seg].clamp(0.0, 1.0)) * t
 }
 
 fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bool {
@@ -4489,6 +4567,46 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                 .add(egui::Slider::new(&mut params.temperature, -100.0..=100.0).text("色温度"))
                 .changed();
         }
+        LocalEffect::ToneCurve(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "S字") {
+                    *params = ToneCurveParams {
+                        points: [0.0, 0.18, 0.50, 0.82, 1.0],
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "明るく") {
+                    *params = ToneCurveParams {
+                        points: [0.0, 0.34, 0.62, 0.86, 1.0],
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "暗く") {
+                    *params = ToneCurveParams {
+                        points: [0.0, 0.16, 0.40, 0.68, 1.0],
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "フェード") {
+                    *params = ToneCurveParams {
+                        points: [0.08, 0.28, 0.52, 0.76, 0.96],
+                    };
+                    changed = true;
+                }
+            });
+            draw_tone_curve_preview(ui, *params);
+            ui.label(
+                egui::RichText::new("RGB共通の簡易カーブです。チャンネル別カーブは後続候補です。")
+                    .size(10.0)
+                    .color(Color32::from_gray(170)),
+            );
+            for (idx, label) in ["黒", "暗部", "中間", "明部", "白"].iter().enumerate() {
+                changed |= ui
+                    .add(egui::Slider::new(&mut params.points[idx], 0.0..=1.0).text(*label))
+                    .changed();
+            }
+        }
         LocalEffect::Clarity(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -4551,6 +4669,59 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                 .changed();
             changed |= ui
                 .add(egui::Slider::new(&mut params.highlights, -100.0..=100.0).text("ハイライト"))
+                .changed();
+        }
+        LocalEffect::Dehaze(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "弱く") {
+                    *params = DehazeParams {
+                        amount: 0.25,
+                        radius_px: 10.0,
+                        min_transmission: 0.38,
+                        saturation: 4.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "標準") {
+                    *params = DehazeParams {
+                        amount: 0.45,
+                        radius_px: 14.0,
+                        min_transmission: 0.32,
+                        saturation: 8.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強く") {
+                    *params = DehazeParams {
+                        amount: 0.70,
+                        radius_px: 20.0,
+                        min_transmission: 0.25,
+                        saturation: 10.0,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "写真向けの霧・白っぽさ低減です。AI絵では弱めから確認してください。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            changed |= ui
+                .add(egui::Slider::new(&mut params.amount, 0.0..=1.0).text("量"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.radius_px, 0.0..=48.0).text("半径"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.min_transmission, 0.10..=0.90).text("最小透過率"),
+                )
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.saturation, -50.0..=50.0).text("彩度補正"))
                 .changed();
         }
         LocalEffect::Blur(params) => {
@@ -4919,6 +5090,64 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
             params.cell_px = cell.max(2) as u32;
             changed |= ui
                 .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
+                .changed();
+        }
+        LocalEffect::StarGlow(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "クロス弱") {
+                    *params = StarGlowParams {
+                        mode: StarRayMode::Cross4,
+                        threshold: 0.84,
+                        length_px: 42.0,
+                        strength: 0.55,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "クロス強") {
+                    *params = StarGlowParams {
+                        mode: StarRayMode::Cross4,
+                        threshold: 0.78,
+                        length_px: 72.0,
+                        strength: 0.90,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "8方向") {
+                    *params = StarGlowParams {
+                        mode: StarRayMode::Star8,
+                        threshold: 0.82,
+                        length_px: 56.0,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new("明るい点を抽出し、レンズのクロス/スター光条風に伸ばします。")
+                    .size(10.0)
+                    .color(Color32::from_gray(170)),
+            );
+            let before = params.mode;
+            lab_combo_box(
+                ui,
+                "star_ray_mode",
+                star_ray_mode_label(params.mode),
+                |ui| {
+                    for mode in [StarRayMode::Cross4, StarRayMode::Star8] {
+                        ui.selectable_value(&mut params.mode, mode, star_ray_mode_label(mode));
+                    }
+                },
+            );
+            changed |= params.mode != before;
+            changed |= ui
+                .add(egui::Slider::new(&mut params.threshold, 0.0..=0.99).text("明部しきい値"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.length_px, 1.0..=240.0).text("光線長"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=3.0).text("強さ"))
                 .changed();
         }
         LocalEffect::EdgeSmooth(params) => {
@@ -6140,10 +6369,12 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
     match kind {
         EffectKind::None => LocalEffect::None,
         EffectKind::Tone => LocalEffect::Tone(ToneParams::default()),
+        EffectKind::ToneCurve => LocalEffect::ToneCurve(ToneCurveParams::default()),
         EffectKind::Clarity => LocalEffect::Clarity(ClarityParams::default()),
         EffectKind::HighlightsShadows => {
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default())
         }
+        EffectKind::Dehaze => LocalEffect::Dehaze(DehazeParams::default()),
         EffectKind::Blur => LocalEffect::Blur(BlurParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
@@ -6157,6 +6388,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default())
         }
         EffectKind::Halftone => LocalEffect::Halftone(HalftoneParams::default()),
+        EffectKind::StarGlow => LocalEffect::StarGlow(StarGlowParams::default()),
         EffectKind::EdgeSmooth => LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
     }
 }

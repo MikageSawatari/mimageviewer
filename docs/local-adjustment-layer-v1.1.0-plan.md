@@ -828,11 +828,14 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   境界線などで未所属になった内部ピクセルは近い領域へ割り当て、隣接領域を複数選んだときに
   マスクの隙間が残りにくいようにする
 - 効果: Tone (自然な彩度を含む) / Clarity / Highlights-Shadows / Blur / Soft Focus /
-  Mosaic / Sharpen / HSL / Look / Bloom / Vignette / Film Grain /
-  Chromatic Aberration / Halftone / Edge-preserving Smooth
+  Mosaic / Sharpen / HSL / Tone Curve / Dehaze / Look / Bloom / Vignette / Film Grain /
+  Chromatic Aberration / Halftone / Cross-Star Glow / Edge-preserving Smooth
 - 加工内容のプルダウンは候補が増えたため縦サイズを広めにし、各効果は選択直後に
   なるべく無加工になる default とする。実用値は「プリセット」ボタンで投入し、
   「リセット」で default に戻す
+- Tone Curve はまず RGB 共通の固定 5 点カーブ + プレビューで実装し、チャンネル別カーブは後続候補。
+  Dehaze は Dark Channel Prior の考え方を軽量化し、白っぽさ低減と局所コントラスト寄りの仕上げ効果として扱う。
+  Cross-Star Glow は明部抽出 + 方向性の減衰ブラーで、クロス/8方向レンズフィルター風の光条を生成する
 - `local_adjust_lab` 側で非同期再合成 + generation による古い結果破棄
 - 読み込み直後は部分補正レイヤーを作らず、未加工状態から開始する
 - レイヤー追加は効果種類を先に選ばせず、追加ダイアログで選んだマスク種類 + `効果なし` の

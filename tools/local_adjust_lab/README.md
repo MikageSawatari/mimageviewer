@@ -56,8 +56,10 @@ the window.
   - Opacity
 - Effects:
   - Tone
+  - Tone curve
   - Clarity
   - Highlights/Shadows
+  - Dehaze
   - Blur
   - Soft focus
   - Mosaic
@@ -69,6 +71,7 @@ the window.
   - Film grain
   - Chromatic aberration
   - Halftone
+  - Cross/star glow
   - Edge-preserving smooth
 - Effect parameters start from near-identity values. Use the per-effect preset
   buttons for practical starting points, or Reset to return the current effect
