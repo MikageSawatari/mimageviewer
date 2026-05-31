@@ -492,6 +492,7 @@ struct LocalAdjustLabApp {
     pending: Option<RenderPending>,
     segmentation_pending: Option<SegmentationPending>,
     generation: u64,
+    mask_copy_source: usize,
     result_dirty: bool,
     mask_dirty: bool,
     last_edit: Instant,
@@ -561,6 +562,7 @@ impl LocalAdjustLabApp {
             pending: None,
             segmentation_pending: None,
             generation: 0,
+            mask_copy_source: 0,
             result_dirty: false,
             mask_dirty: false,
             last_edit: Instant::now(),
@@ -636,6 +638,7 @@ impl LocalAdjustLabApp {
                 self.result = None;
                 self.pending = None;
                 self.segmentation_pending = None;
+                self.mask_copy_source = 0;
                 self.image = Some(loaded);
                 self.undo_stack.clear();
                 self.redo_stack.clear();
@@ -944,6 +947,52 @@ impl LocalAdjustLabApp {
         self.layers.insert(insert_at, copy);
         self.selected_layer = insert_at;
         self.selected_shape = None;
+        self.mark_dirty();
+    }
+
+    fn convert_selected_mask_to_manual(&mut self) {
+        let manual_mask = {
+            let Some(image) = self.image.as_ref() else {
+                self.status = "画像を読み込んでください。".to_string();
+                return;
+            };
+            let Some(layer) = self.selected_layer_ref() else {
+                return;
+            };
+            match manual_mask_from_layer(image.source.as_ref(), layer) {
+                Ok(mask) => mask,
+                Err(e) => {
+                    self.status = format!("手動マスク化に失敗しました: {e}");
+                    return;
+                }
+            }
+        };
+
+        self.push_undo_snapshot();
+        if let Some(layer) = self.selected_layer_mut() {
+            layer.mask = LocalMask::RasterVector(manual_mask);
+            layer.mask_inverted = false;
+            layer.mask_expand_px = 0.0;
+            layer.mask_feather_px = 0.0;
+        }
+        self.selected_shape = None;
+        self.status = "現在のマスクを手動マスクへ変換しました。".to_string();
+        self.mark_dirty();
+    }
+
+    fn copy_mask_from_layer(&mut self, source_idx: usize) {
+        if source_idx == self.selected_layer || source_idx >= self.layers.len() {
+            return;
+        }
+        let Some(source) = self.layers.get(source_idx).cloned() else {
+            return;
+        };
+        self.push_undo_snapshot();
+        if let Some(target) = self.selected_layer_mut() {
+            copy_mask_fields_from_layer(target, &source);
+        }
+        self.selected_shape = None;
+        self.status = format!("レイヤー {} からマスクをコピーしました。", source_idx + 1);
         self.mark_dirty();
     }
 
@@ -2693,6 +2742,83 @@ impl LocalAdjustLabApp {
         });
     }
 
+    fn draw_mask_actions(&mut self, ui: &mut egui::Ui) {
+        ui.label(
+            egui::RichText::new("マスク操作")
+                .size(14.0)
+                .strong()
+                .color(Color32::WHITE),
+        );
+        let is_manual_vector = self
+            .selected_layer_ref()
+            .map(|layer| matches!(layer.mask, LocalMask::RasterVector(_)))
+            .unwrap_or(false);
+        let convert_response = ui
+            .add_enabled(!is_manual_vector, egui::Button::new("手動マスクへ変換"))
+            .on_hover_text(
+                "現在のマスク形状をビットマップに焼き込み、ブラシや囲みで微修正できる手動マスクにします。反転・拡張/縮小・ぼかし境界は焼き込みますが、不透明度は維持します。",
+            );
+        if convert_response.clicked() {
+            self.convert_selected_mask_to_manual();
+        }
+        if is_manual_vector {
+            ui.label(
+                egui::RichText::new("現在のマスクは手動編集できます。")
+                    .size(10.0)
+                    .color(Color32::from_gray(170)),
+            );
+        }
+
+        let copy_options: Vec<(usize, String)> = self
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx != self.selected_layer)
+            .map(|(idx, layer)| {
+                (
+                    idx,
+                    format!(
+                        "{}: {} / {}",
+                        layer.name,
+                        MaskKind::from_mask(&layer.mask).label(),
+                        effect_summary(&layer.effect)
+                    ),
+                )
+            })
+            .collect();
+        if copy_options.is_empty() {
+            ui.label(
+                egui::RichText::new("コピー元にできる別レイヤーはまだありません。")
+                    .size(10.0)
+                    .color(Color32::from_gray(170)),
+            );
+            return;
+        }
+        if !copy_options
+            .iter()
+            .any(|(idx, _)| *idx == self.mask_copy_source)
+        {
+            self.mask_copy_source = copy_options[0].0;
+        }
+        let selected_text = copy_options
+            .iter()
+            .find(|(idx, _)| *idx == self.mask_copy_source)
+            .map(|(_, label)| label.as_str())
+            .unwrap_or("コピー元レイヤー");
+        lab_combo_box(ui, "mask_copy_source_layer", selected_text, |ui| {
+            for (idx, label) in &copy_options {
+                ui.selectable_value(&mut self.mask_copy_source, *idx, label);
+            }
+        });
+        if ui
+            .button("コピー元のマスクを適用")
+            .on_hover_text("マスク種類、マスク本体、反転、拡張/縮小、ぼかし境界だけをコピーします。加工内容と不透明度は現在のレイヤーのままです。")
+            .clicked()
+        {
+            self.copy_mask_from_layer(self.mask_copy_source);
+        }
+    }
+
     fn draw_mask_panel(&mut self, ui: &mut egui::Ui) {
         if self.layers.is_empty() {
             ui.label(
@@ -2741,6 +2867,8 @@ impl LocalAdjustLabApp {
             );
         }
 
+        ui.separator();
+        self.draw_mask_actions(ui);
         ui.separator();
         ui.label(
             egui::RichText::new("マスク設定")
@@ -5515,6 +5643,30 @@ fn default_mask(kind: MaskKind, width: usize, height: usize) -> LocalMask {
     }
 }
 
+fn manual_mask_from_layer(
+    image: RgbaImageRef<'_>,
+    layer: &LocalAdjustmentLayer,
+) -> Result<RasterVectorMask, String> {
+    let mut mask_layer = layer.clone();
+    // Opacity belongs to the effect strength. Bake mask modifiers, but keep
+    // the layer opacity editable after conversion.
+    mask_layer.opacity = 1.0;
+    let alpha = evaluate_layer_mask(image, &mask_layer).map_err(|e| e.to_string())?;
+    Ok(RasterVectorMask {
+        width: image.width,
+        height: image.height,
+        alpha,
+        shapes: Vec::new(),
+    })
+}
+
+fn copy_mask_fields_from_layer(target: &mut LocalAdjustmentLayer, source: &LocalAdjustmentLayer) {
+    target.mask = source.mask.clone();
+    target.mask_inverted = source.mask_inverted;
+    target.mask_expand_px = source.mask_expand_px;
+    target.mask_feather_px = source.mask_feather_px;
+}
+
 fn make_shape(
     tool: MaskTool,
     start: [f32; 2],
@@ -7788,6 +7940,60 @@ mod tests {
         assert!(visuals.panel_fill.r() < 64);
         assert!(visuals.extreme_bg_color.r() < 32);
         assert!(visuals.widgets.inactive.bg_fill.r() < 96);
+    }
+
+    #[test]
+    fn manual_mask_conversion_bakes_mask_but_not_opacity() {
+        let source = RgbaImageBuf::new(2, 1, vec![0, 0, 0, 255, 255, 255, 255, 255]).unwrap();
+        let mut layer = LocalAdjustmentLayer::new(
+            "luma",
+            LocalMask::LumaRange(RangeMask {
+                min: 0.9,
+                max: 1.0,
+                feather: 0.0,
+            }),
+            LocalEffect::None,
+        );
+        layer.opacity = 0.25;
+
+        let mask = manual_mask_from_layer(source.as_ref(), &layer).unwrap();
+
+        assert_eq!(mask.width, 2);
+        assert_eq!(mask.height, 1);
+        assert!(mask.shapes.is_empty());
+        assert!(mask.alpha[0] < 0.01);
+        assert!(mask.alpha[1] > 0.99);
+    }
+
+    #[test]
+    fn copying_mask_fields_preserves_target_effect_and_opacity() {
+        let mut target = LocalAdjustmentLayer::new(
+            "target",
+            LocalMask::Full,
+            LocalEffect::Blur(BlurParams { radius_px: 8.0 }),
+        );
+        target.opacity = 0.4;
+        let mut source = LocalAdjustmentLayer::new(
+            "source",
+            LocalMask::LinearGradient(LinearGradientMask {
+                start: [0.1, 0.2],
+                end: [0.8, 0.9],
+                initialized: true,
+            }),
+            LocalEffect::None,
+        );
+        source.mask_inverted = true;
+        source.mask_expand_px = 3.0;
+        source.mask_feather_px = 5.0;
+
+        copy_mask_fields_from_layer(&mut target, &source);
+
+        assert!(matches!(target.mask, LocalMask::LinearGradient(_)));
+        assert!(target.mask_inverted);
+        assert_eq!(target.mask_expand_px, 3.0);
+        assert_eq!(target.mask_feather_px, 5.0);
+        assert!(matches!(target.effect, LocalEffect::Blur(_)));
+        assert_eq!(target.opacity, 0.4);
     }
 
     #[test]

@@ -54,6 +54,11 @@ the window.
   - Expand / shrink
   - Feather
   - Opacity
+- Mask operations:
+  - Convert any generated / range / gradient mask to a manual mask for brush
+    touch-up
+  - Copy only the mask data and mask modifiers from another layer while keeping
+    the current layer's effect and opacity
 - Effects:
   - Tone
   - Tone curve
