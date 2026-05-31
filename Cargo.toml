@@ -1,5 +1,13 @@
 [workspace]
-members = ["crates/susie-worker", "crates/launcher", "crates/vst3-host-tester", "tools/png2mag"]
+members = [
+    "crates/susie-worker",
+    "crates/launcher",
+    "crates/local-adjust-core",
+    "crates/vst3-host-tester",
+    "tools/png2mag",
+    "tools/mask_lab",
+    "tools/local_adjust_lab",
+]
 
 # 配布バイナリ (本体 = `mimageviewer-core.exe` + launcher = `mimageviewer.exe`) の
 # バージョンは workspace 経由で 1 箇所で管理する。launcher は `%APPDATA%/mimageviewer/

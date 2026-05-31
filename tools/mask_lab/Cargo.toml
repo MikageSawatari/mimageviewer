@@ -1,0 +1,10 @@
+[package]
+name = "mask_lab"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[dependencies]
+eframe = { version = "0.33", features = ["wgpu"] }
+egui = "0.33"
+image = { version = "0.25", features = ["jpeg", "png"] }

@@ -469,12 +469,30 @@ impl App {
         // ESC: 選択中があればまず解除、無ければモード終了
         let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if esc {
+            if self.conceal_tool == ConcealTool::Polygon && !self.conceal_lasso_points.is_empty() {
+                self.conceal_lasso_points.clear();
+                self.show_feedback_toast("[多角形をキャンセル]".to_string());
+                return action;
+            }
             if self.conceal_selected_shape.is_some() {
                 self.conceal_selected_shape = None;
                 self.conceal_drag = None;
                 return action;
             }
             self.reset_conceal_mode();
+            return action;
+        }
+
+        // Enter: 多角形ツールの頂点列を確定。
+        let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        if enter
+            && self.conceal_tool == ConcealTool::Polygon
+            && let Some(pts) =
+                crate::manual_mask_tools::take_completed_polygon(&mut self.conceal_lasso_points)
+        {
+            self.push_conceal_undo();
+            self.paint_polygon_conceal(&pts, self.conceal_paint_mode);
+            self.show_feedback_toast("[多角形を確定]".to_string());
             return action;
         }
 
@@ -499,6 +517,12 @@ impl App {
         // Ctrl+Z: Undo
         let ctrl_z = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z));
         if ctrl_z {
+            if self.conceal_tool == ConcealTool::Polygon
+                && self.conceal_lasso_points.pop().is_some()
+            {
+                self.show_feedback_toast("[頂点を戻す]".to_string());
+                return action;
+            }
             if self.undo_conceal() {
                 self.show_feedback_toast("[元に戻す]".to_string());
             } else {
@@ -559,7 +583,7 @@ impl App {
             self.nudge_conceal(dx, dy);
         }
 
-        // ツール切替: S/B/L/I/V/H/R/O
+        // ツール切替: S/B/L/P/I/V/H/R/O
         let mut switched: Option<ConcealTool> = None;
         ctx.input_mut(|i| {
             if i.consume_key(egui::Modifiers::NONE, egui::Key::S) {
@@ -570,6 +594,9 @@ impl App {
             }
             if i.consume_key(egui::Modifiers::NONE, egui::Key::L) {
                 switched = Some(ConcealTool::Lasso);
+            }
+            if i.consume_key(egui::Modifiers::NONE, egui::Key::P) {
+                switched = Some(ConcealTool::Polygon);
             }
             if i.consume_key(egui::Modifiers::NONE, egui::Key::I) {
                 switched = Some(ConcealTool::Line);
@@ -657,7 +684,6 @@ impl App {
             egui::Key::Space,
             egui::Key::Tab,
             egui::Key::G,
-            egui::Key::P,
             egui::Key::U,
             egui::Key::N,
             egui::Key::Z,
@@ -950,6 +976,7 @@ impl App {
         let primary_down = ctx.input(|i| i.pointer.primary_down());
         let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
         let primary_released = ctx.input(|i| i.pointer.primary_released());
+        let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let paint = self.conceal_paint_mode;
         let space_held = ctx.input(|i| i.key_down(egui::Key::Space));
@@ -1011,14 +1038,18 @@ impl App {
         // - 既に conceal_drag があれば apply_drag で更新 → release で完了
         // - 新規 press のとき、選択中 shape のハンドル (= Body 以外) なら
         //   begin_drag を仕込んで return (= 通常ツール処理をスキップ)
-        if self.try_handle_active_drag_or_handle_hit(
-            primary_pressed,
-            primary_released,
-            pointer_pos,
-            full_rect,
-            zoom_pan,
-            modifiers,
-        ) {
+        let polygon_in_progress =
+            self.conceal_tool == ConcealTool::Polygon && !self.conceal_lasso_points.is_empty();
+        if !polygon_in_progress
+            && self.try_handle_active_drag_or_handle_hit(
+                primary_pressed,
+                primary_released,
+                pointer_pos,
+                full_rect,
+                zoom_pan,
+                modifiers,
+            )
+        {
             return;
         }
 
@@ -1047,6 +1078,16 @@ impl App {
                 self.handle_lasso_tool(
                     primary_down,
                     primary_released,
+                    pointer_pos,
+                    paint,
+                    full_rect,
+                    zoom_pan,
+                );
+            }
+            ConcealTool::Polygon => {
+                self.handle_polygon_tool(
+                    primary_pressed,
+                    secondary_pressed,
                     pointer_pos,
                     paint,
                     full_rect,
@@ -1283,18 +1324,10 @@ impl App {
                 if let Some(img_pos) = self.conceal_screen_to_image(pos, full_rect, zoom_pan, false)
                 {
                     // サンプリング間引き (~2px 離れたら追加)
-                    if self
-                        .conceal_lasso_points
-                        .last()
-                        .map(|&(lx, ly)| {
-                            let dx = lx - img_pos.0;
-                            let dy = ly - img_pos.1;
-                            dx * dx + dy * dy > 4.0
-                        })
-                        .unwrap_or(true)
-                    {
-                        self.conceal_lasso_points.push(img_pos);
-                    }
+                    crate::manual_mask_tools::push_freehand_point(
+                        &mut self.conceal_lasso_points,
+                        img_pos,
+                    );
                 }
             }
         }
@@ -1306,6 +1339,59 @@ impl App {
             } else {
                 self.conceal_lasso_points.clear();
             }
+        }
+    }
+
+    fn handle_polygon_tool(
+        &mut self,
+        primary_pressed: bool,
+        secondary_pressed: bool,
+        pointer_pos: Option<egui::Pos2>,
+        paint: bool,
+        full_rect: egui::Rect,
+        zoom_pan: Option<(f32, egui::Vec2)>,
+    ) {
+        if secondary_pressed {
+            if let Some(pts) =
+                crate::manual_mask_tools::take_completed_polygon(&mut self.conceal_lasso_points)
+            {
+                self.push_conceal_undo();
+                self.paint_polygon_conceal(&pts, paint);
+                self.show_feedback_toast("[多角形を確定]".to_string());
+            }
+            return;
+        }
+        if !primary_pressed {
+            return;
+        }
+        let Some(screen) = pointer_pos else {
+            return;
+        };
+        let Some((scale, img_rect)) = self.conceal_image_layout(full_rect, zoom_pan) else {
+            return;
+        };
+        let img_pos = (
+            (screen.x - img_rect.min.x) / scale,
+            (screen.y - img_rect.min.y) / scale,
+        );
+        if crate::manual_mask_tools::should_close_polygon(
+            &self.conceal_lasso_points,
+            img_pos,
+            scale,
+        ) {
+            if let Some(pts) =
+                crate::manual_mask_tools::take_completed_polygon(&mut self.conceal_lasso_points)
+            {
+                self.push_conceal_undo();
+                self.paint_polygon_conceal(&pts, paint);
+                self.show_feedback_toast("[多角形を確定]".to_string());
+            }
+        } else {
+            crate::manual_mask_tools::push_polygon_vertex(
+                &mut self.conceal_lasso_points,
+                img_pos,
+                scale,
+            );
         }
     }
 
@@ -1546,14 +1632,39 @@ impl App {
         );
         let stroke = egui::Stroke::new(1.5, preview_color);
 
-        // Lasso 多角形ライン
+        // Lasso / Polygon 多角形ライン
         if self.conceal_lasso_points.len() >= 2 {
             let pts: Vec<egui::Pos2> = self
                 .conceal_lasso_points
                 .iter()
                 .map(|&p| self.conceal_image_to_screen(p, full_rect, zoom_pan))
                 .collect();
-            painter.add(egui::Shape::line(pts, stroke));
+            painter.add(egui::Shape::line(pts.clone(), stroke));
+            if matches!(self.conceal_tool, ConcealTool::Lasso | ConcealTool::Polygon) {
+                painter.line_segment(
+                    [*pts.last().unwrap(), pts[0]],
+                    egui::Stroke::new(
+                        1.0,
+                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100),
+                    ),
+                );
+            }
+            if self.conceal_tool == ConcealTool::Polygon {
+                for (idx, p) in pts.into_iter().enumerate() {
+                    let fill = if idx == 0 {
+                        egui::Color32::from_rgb(255, 245, 120)
+                    } else {
+                        preview_color
+                    };
+                    painter.circle_filled(p, 4.0, fill);
+                    painter.circle_stroke(p, 4.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
+                }
+            }
+        } else if self.conceal_tool == ConcealTool::Polygon && self.conceal_lasso_points.len() == 1
+        {
+            let p = self.conceal_image_to_screen(self.conceal_lasso_points[0], full_rect, zoom_pan);
+            painter.circle_filled(p, 4.0, egui::Color32::from_rgb(255, 245, 120));
+            painter.circle_stroke(p, 4.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
         }
         // Line / VertLine / HorizLine プレビュー
         if let (Some(start), Some(end)) = (self.conceal_line_start, self.conceal_line_end) {
@@ -1911,14 +2022,17 @@ impl App {
                                                 .color(egui::Color32::from_gray(200)),
                                         );
                                         let mut tool = self.conceal_tool;
-                                        let bitmap_rows: [[(ConcealTool, &str); 2]; 1] = [[
-                                            (ConcealTool::Brush, "筆 [B]"),
-                                            (ConcealTool::Lasso, "囲み [L]"),
-                                        ]];
-                                        for row in bitmap_rows.iter() {
+                                        let bitmap_rows: &[&[(ConcealTool, &str)]] = &[
+                                            &[
+                                                (ConcealTool::Brush, "筆 [B]"),
+                                                (ConcealTool::Lasso, "囲み [L]"),
+                                            ],
+                                            &[(ConcealTool::Polygon, "多角形 [P]")],
+                                        ];
+                                        for row in bitmap_rows {
                                             ui.horizontal(|ui| {
                                                 ui.spacing_mut().item_spacing.x = 4.0;
-                                                for &(kind, label) in row.iter() {
+                                                for &(kind, label) in *row {
                                                     if panel_toggle_button(
                                                         ui,
                                                         label,
@@ -2427,6 +2541,7 @@ impl App {
                                             Shift+ハンドル:拘束/等比/15°snap\n\
                                             Alt+ハンドル:中心固定\n\
                                             T:タイプ  G:グリッド  1-4:プリセット\n\
+                                            多角形:始点クリック/右クリック/Enterで確定 Escで取消\n\
                                             Ctrl+Z:戻す  Delete:選択削除\n\
                                             Esc:解除/終了  Ctrl+M:終了\n\
                                             終了時はDB保存";

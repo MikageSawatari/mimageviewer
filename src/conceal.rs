@@ -207,6 +207,8 @@ pub enum ConcealTool {
     Brush,
     /// 囲み (L): 多角形を描き内側を塗りつぶす、ビットマップに反映
     Lasso,
+    /// 多角形 (P): クリックで頂点を置き内側を塗りつぶす、ビットマップに反映
+    Polygon,
     /// 直線 (I): `Shape::Line { kind: Diagonal, .. }` をベクタで作成
     Line,
     /// 縦線 (V): `Shape::Line { kind: Vertical, .. }`
@@ -225,6 +227,7 @@ impl ConcealTool {
             ConcealTool::Select => "選 [S]",
             ConcealTool::Brush => "筆 [B]",
             ConcealTool::Lasso => "囲 [L]",
+            ConcealTool::Polygon => "多 [P]",
             ConcealTool::Line => "直 [I]",
             ConcealTool::VertLine => "縦 [V]",
             ConcealTool::HorizLine => "横 [H]",

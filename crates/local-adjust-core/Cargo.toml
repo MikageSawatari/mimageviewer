@@ -1,0 +1,11 @@
+[package]
+name = "local-adjust-core"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+
+[lib]
+name = "local_adjust_core"
+path = "src/lib.rs"
+
+[dependencies]

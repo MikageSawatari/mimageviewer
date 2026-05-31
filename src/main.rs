@@ -50,6 +50,7 @@ pub mod ingest_text;
 pub mod ingest_worker;
 pub mod io_semaphore;
 pub mod logger;
+mod manual_mask_tools;
 pub mod mask_db;
 pub mod monitor;
 pub mod name_bulk_indexer;

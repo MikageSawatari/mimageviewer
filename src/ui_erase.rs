@@ -2,7 +2,7 @@
 //! MI-GAN で補完 (inpaint) する。
 //!
 //! ツール (Phase 2b で 8 種に拡張、隠蔽加工と統一): 選択 (Select) / 筆 (Brush) /
-//! 囲み (Lasso) / 直線 (Line) / 縦線 / 横線 / 矩形 (Rect) / 楕円 (Ellipse)
+//! 囲み (Lasso) / 多角形 (Polygon) / 直線 (Line) / 縦線 / 横線 / 矩形 (Rect) / 楕円 (Ellipse)
 //! モード: 描画 / 消去 の切り替え
 //! マスクは SQLite (mask_db) に永続化される。
 //!
@@ -484,6 +484,11 @@ impl App {
         // 状態になっていた。明示破棄したい場合はマスク自体を削除してから抜ける。
         let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         if esc {
+            if self.erase_tool == EraseTool::Polygon && !self.erase_lasso_points.is_empty() {
+                self.erase_lasso_points.clear();
+                self.show_feedback_toast("[多角形をキャンセル]".to_string());
+                return action;
+            }
             if self.erase_selected_shape.is_some() {
                 self.erase_selected_shape = None;
                 self.erase_drag = None;
@@ -501,9 +506,26 @@ impl App {
             return action;
         }
 
+        // Enter: 多角形ツールの頂点列を確定。
+        let enter = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
+        if enter
+            && self.erase_tool == EraseTool::Polygon
+            && let Some(pts) =
+                crate::manual_mask_tools::take_completed_polygon(&mut self.erase_lasso_points)
+        {
+            self.push_undo_snapshot();
+            self.paint_polygon(&pts, self.erase_paint_mode);
+            self.show_feedback_toast("[多角形を確定]".to_string());
+            return action;
+        }
+
         // Ctrl+Z: Undo
         let ctrl_z = ctx.input_mut(|i| i.consume_key(egui::Modifiers::CTRL, egui::Key::Z));
         if ctrl_z {
+            if self.erase_tool == EraseTool::Polygon && self.erase_lasso_points.pop().is_some() {
+                self.show_feedback_toast("[頂点を戻す]".to_string());
+                return action;
+            }
             if self.undo_erase() {
                 self.show_feedback_toast("[元に戻す]".to_string());
             } else {
@@ -594,10 +616,11 @@ impl App {
             self.rotate_mask(rot_deg.to_radians());
         }
 
-        // S/B/L/V/H/I/R/O: ツール切替 (Phase 0b で R / O = 矩形 / 楕円 を追加)
+        // S/B/L/P/V/H/I/R/O: ツール切替
         let key_s_tool = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::S));
         let key_b = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::B));
         let key_l = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L));
+        let key_p = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P));
         let key_v = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::V));
         let key_h = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H));
         let key_i = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::I));
@@ -611,6 +634,9 @@ impl App {
         }
         if key_l {
             self.switch_erase_tool(EraseTool::Lasso, "[囲み]");
+        }
+        if key_p {
+            self.switch_erase_tool(EraseTool::Polygon, "[多角形]");
         }
         if key_v {
             self.switch_erase_tool(EraseTool::VertLine, "[縦線]");
@@ -643,15 +669,13 @@ impl App {
         // erase_mode 中は通常のフルスクリーンショートカットを無効化するため、
         // ここで未使用キーを明示的に消費する (マウスイベントはペイントに必要なため除外)。
         // 矢印キー / [/] は上で既に consume 済み。
-        // Phase 0b: I / R / O はツール切替に使うので SINGLE_KEYS から除外。
-        // (I は直線、R は矩形、O は楕円)
+        // ツール切替に使うキーは SINGLE_KEYS から除外。
         const SINGLE_KEYS: &[egui::Key] = &[
             egui::Key::Space,
             egui::Key::Tab,
             egui::Key::Z,
             egui::Key::G,
             egui::Key::M,
-            egui::Key::P,
             egui::Key::T,
             egui::Key::U,
             egui::Key::N,
@@ -991,6 +1015,12 @@ impl App {
             self.erase_selected_shape = None;
         }
         self.erase_drag = None;
+        self.erase_last_paint_pos = None;
+        self.erase_lasso_points.clear();
+        self.erase_line_start = None;
+        self.erase_line_end = None;
+        self.erase_shape_drag_start = None;
+        self.erase_shape_drag_end = None;
         self.erase_mask_texture = None;
         // ツールごとに slider 行の有無が変わるためパネル本文高も変わる。前ツール
         // の measured 値を残すと 1 frame だけ slider が clip されたり余白が出る
@@ -1177,6 +1207,7 @@ impl App {
         let primary_down = ctx.input(|i| i.pointer.primary_down());
         let primary_pressed = ctx.input(|i| i.pointer.primary_pressed());
         let primary_released = ctx.input(|i| i.pointer.primary_released());
+        let secondary_pressed = ctx.input(|i| i.pointer.secondary_pressed());
         let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
         let paint = self.erase_paint_mode;
         let space_held = ctx.input(|i| i.key_down(egui::Key::Space));
@@ -1279,14 +1310,18 @@ impl App {
 
         // ── 共通ハンドル処理 (ツール非依存): 直近 shape のハンドルが操作中なら
         //    そちらを優先処理して、新規 shape 作成側に流さない。
-        if self.try_handle_active_erase_drag_or_handle_hit(
-            primary_pressed,
-            primary_released,
-            pointer_pos,
-            full_rect,
-            zoom_pan,
-            modifiers,
-        ) {
+        let polygon_in_progress =
+            self.erase_tool == EraseTool::Polygon && !self.erase_lasso_points.is_empty();
+        if !polygon_in_progress
+            && self.try_handle_active_erase_drag_or_handle_hit(
+                primary_pressed,
+                primary_released,
+                pointer_pos,
+                full_rect,
+                zoom_pan,
+                modifiers,
+            )
+        {
             return;
         }
 
@@ -1324,18 +1359,10 @@ impl App {
                             self.screen_to_image_f32_unclamped(pos, full_rect, zoom_pan)
                         {
                             // サンプリング間引き
-                            if self
-                                .erase_lasso_points
-                                .last()
-                                .map(|&(lx, ly)| {
-                                    let dx = lx - img_pos.0;
-                                    let dy = ly - img_pos.1;
-                                    dx * dx + dy * dy > 4.0
-                                })
-                                .unwrap_or(true)
-                            {
-                                self.erase_lasso_points.push(img_pos);
-                            }
+                            crate::manual_mask_tools::push_freehand_point(
+                                &mut self.erase_lasso_points,
+                                img_pos,
+                            );
                         }
                     }
                 }
@@ -1345,6 +1372,44 @@ impl App {
                     self.paint_polygon(&pts, paint);
                 } else if primary_released {
                     self.erase_lasso_points.clear();
+                }
+            }
+            EraseTool::Polygon => {
+                if secondary_pressed {
+                    if let Some(pts) = crate::manual_mask_tools::take_completed_polygon(
+                        &mut self.erase_lasso_points,
+                    ) {
+                        self.push_undo_snapshot();
+                        self.paint_polygon(&pts, paint);
+                        self.show_feedback_toast("[多角形を確定]".to_string());
+                    }
+                } else if primary_pressed
+                    && let Some(pos) = pointer_pos
+                    && let Some((scale, img_rect)) = self.erase_image_layout(full_rect, zoom_pan)
+                {
+                    let img_pos = (
+                        (pos.x - img_rect.min.x) / scale,
+                        (pos.y - img_rect.min.y) / scale,
+                    );
+                    if crate::manual_mask_tools::should_close_polygon(
+                        &self.erase_lasso_points,
+                        img_pos,
+                        scale,
+                    ) {
+                        if let Some(pts) = crate::manual_mask_tools::take_completed_polygon(
+                            &mut self.erase_lasso_points,
+                        ) {
+                            self.push_undo_snapshot();
+                            self.paint_polygon(&pts, paint);
+                            self.show_feedback_toast("[多角形を確定]".to_string());
+                        }
+                    } else {
+                        crate::manual_mask_tools::push_polygon_vertex(
+                            &mut self.erase_lasso_points,
+                            img_pos,
+                            scale,
+                        );
+                    }
                 }
             }
             EraseTool::VertLine => {
@@ -1640,7 +1705,9 @@ impl App {
         };
 
         match self.erase_tool {
-            EraseTool::Lasso if !self.erase_lasso_points.is_empty() => {
+            tool @ (EraseTool::Lasso | EraseTool::Polygon)
+                if !self.erase_lasso_points.is_empty() =>
+            {
                 let pts: Vec<egui::Pos2> = self
                     .erase_lasso_points
                     .iter()
@@ -1661,6 +1728,21 @@ impl App {
                             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 100),
                         ),
                     );
+                }
+                if tool == EraseTool::Polygon {
+                    for (idx, &p) in pts.iter().enumerate() {
+                        let fill = if idx == 0 {
+                            egui::Color32::from_rgb(255, 245, 120)
+                        } else {
+                            stroke_color
+                        };
+                        ui.painter().circle_filled(p, 4.0, fill);
+                        ui.painter().circle_stroke(
+                            p,
+                            4.0,
+                            egui::Stroke::new(1.0, egui::Color32::BLACK),
+                        );
+                    }
                 }
             }
             EraseTool::VertLine => {
@@ -2101,12 +2183,14 @@ impl App {
                             egui::RichText::new("ビットマップ:")
                                 .color(egui::Color32::from_gray(200)),
                         );
-                        let bitmap_rows: [[(&str, EraseTool); 2]; 1] =
-                            [[("筆 [B]", EraseTool::Brush), ("囲み [L]", EraseTool::Lasso)]];
-                        for row in bitmap_rows.iter() {
+                        let bitmap_rows: &[&[(&str, EraseTool)]] = &[
+                            &[("筆 [B]", EraseTool::Brush), ("囲み [L]", EraseTool::Lasso)],
+                            &[("多角形 [P]", EraseTool::Polygon)],
+                        ];
+                        for row in bitmap_rows {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 4.0;
-                                for &(label, tool) in row.iter() {
+                                for &(label, tool) in *row {
                                     if panel_toggle_button(
                                         ui,
                                         label,
@@ -2262,6 +2346,7 @@ impl App {
                             矢印:シフト [/]:回転 (Ctrl:10倍)\n\
                             S:選択/ハンドル微調整\n\
                             Shift/Alt+ハンドル:拘束/中心固定\n\
+                            多角形:始点クリック/右クリック/Enterで確定 Escで取消\n\
                             Ctrl+Z:戻す  Del:選択削除";
                                         ui.add(
                                             egui::Label::new(
