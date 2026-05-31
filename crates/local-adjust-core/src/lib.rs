@@ -677,21 +677,10 @@ impl Default for HalftoneParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StarRayMode {
-    Cross4,
-    Star8,
-}
-
-impl Default for StarRayMode {
-    fn default() -> Self {
-        Self::Cross4
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct StarGlowParams {
-    pub mode: StarRayMode,
+    pub ray_count: u32,
+    pub rotation_degrees: f32,
     pub threshold: f32,
     pub length_px: f32,
     pub strength: f32,
@@ -700,7 +689,8 @@ pub struct StarGlowParams {
 impl Default for StarGlowParams {
     fn default() -> Self {
         Self {
-            mode: StarRayMode::Cross4,
+            ray_count: 4,
+            rotation_degrees: 0.0,
             threshold: 0.82,
             length_px: 48.0,
             strength: 0.0,
@@ -1755,7 +1745,7 @@ fn apply_bloom(src: &[u8], width: usize, height: usize, params: BloomParams) -> 
     if radius == 0 || strength <= f32::EPSILON || width == 0 || height == 0 {
         return src.to_vec();
     }
-    let threshold = params.threshold.clamp(0.0, 0.99);
+    let threshold = params.threshold.clamp(0.50, 0.99);
     let inv_range = 1.0 / (1.0 - threshold).max(0.001);
     let mut bright = vec![0_u8; src.len()];
     for i in (0..src.len()).step_by(4) {
@@ -1936,35 +1926,50 @@ fn apply_star_glow(src: &[u8], width: usize, height: usize, params: StarGlowPara
     if strength <= f32::EPSILON || width == 0 || height == 0 {
         return src.to_vec();
     }
+    let ray_count = normalize_star_ray_count(params.ray_count);
+    let max_steps = length.round().clamp(1.0, 240.0) as usize;
+    let rotation = params.rotation_degrees.to_radians();
+    let mut dirs = Vec::with_capacity(ray_count as usize);
+    for ray in 0..ray_count {
+        let angle = rotation + std::f32::consts::TAU * ray as f32 / ray_count as f32;
+        dirs.push((angle.cos(), angle.sin()));
+    }
     let threshold = params.threshold.clamp(0.0, 0.99);
     let inv_range = 1.0 / (1.0 - threshold).max(0.001);
-    let mut bright = vec![0.0_f32; width * height * 3];
-    for i in 0..width * height {
-        let o = i * 4;
-        let r = src[o] as f32 / 255.0;
-        let g = src[o + 1] as f32 / 255.0;
-        let b = src[o + 2] as f32 / 255.0;
-        let weight = ((luma01(r, g, b) - threshold) * inv_range).clamp(0.0, 1.0);
-        let weight = weight * weight;
-        let d = i * 3;
-        bright[d] = r * weight;
-        bright[d + 1] = g * weight;
-        bright[d + 2] = b * weight;
-    }
-    let decay = (-1.0 / length.max(1.0)).exp().clamp(0.0, 0.995);
     let mut streak = vec![0.0_f32; width * height * 3];
-    add_streak_direction(&bright, &mut streak, width, height, 1, 0, decay);
-    add_streak_direction(&bright, &mut streak, width, height, 0, 1, decay);
-    let orientations = match params.mode {
-        StarRayMode::Cross4 => 2.0,
-        StarRayMode::Star8 => {
-            add_streak_direction(&bright, &mut streak, width, height, 1, 1, decay);
-            add_streak_direction(&bright, &mut streak, width, height, 1, -1, decay);
-            4.0
+    for y in 0..height {
+        for x in 0..width {
+            let o = (y * width + x) * 4;
+            let r = src[o] as f32 / 255.0;
+            let g = src[o + 1] as f32 / 255.0;
+            let b = src[o + 2] as f32 / 255.0;
+            let weight = ((luma01(r, g, b) - threshold) * inv_range).clamp(0.0, 1.0);
+            let weight = weight * weight;
+            if weight <= 0.001 {
+                continue;
+            }
+            let color = [r * weight, g * weight, b * weight];
+            for &(dx, dy) in &dirs {
+                for step in 1..=max_steps {
+                    let distance = step as f32;
+                    let sx = x as f32 + dx * distance;
+                    let sy = y as f32 + dy * distance;
+                    if sx < -0.001
+                        || sy < -0.001
+                        || sx > width as f32 - 1.0 + 0.001
+                        || sy > height as f32 - 1.0 + 0.001
+                    {
+                        break;
+                    }
+                    let linear = 1.0 - distance / (max_steps as f32 + 1.0);
+                    let falloff = linear.max(0.0) * (-distance / length).exp();
+                    add_bilinear_rgb(&mut streak, width, height, sx, sy, color, falloff);
+                }
+            }
         }
-    };
+    }
     let mut out = src.to_vec();
-    let scale = strength / orientations;
+    let scale = strength / (ray_count as f32 * 0.5).max(1.0);
     for i in 0..width * height {
         let si = i * 3;
         let oi = i * 4;
@@ -1976,64 +1981,43 @@ fn apply_star_glow(src: &[u8], width: usize, height: usize, params: StarGlowPara
     out
 }
 
-fn add_streak_direction(
-    src: &[f32],
-    dst: &mut [f32],
-    width: usize,
-    height: usize,
-    dx: i32,
-    dy: i32,
-    decay: f32,
-) {
-    for y in 0..height {
-        for x in 0..width {
-            let prev_x = x as i32 - dx;
-            let prev_y = y as i32 - dy;
-            if prev_x < 0 || prev_y < 0 || prev_x >= width as i32 || prev_y >= height as i32 {
-                add_streak_line(src, dst, width, height, x as i32, y as i32, dx, dy, decay);
-            }
-        }
+fn normalize_star_ray_count(ray_count: u32) -> u32 {
+    let mut count = ray_count.clamp(2, 12);
+    if count % 2 != 0 {
+        count += 1;
     }
+    count.clamp(2, 12)
 }
 
-fn add_streak_line(
-    src: &[f32],
+fn add_bilinear_rgb(
     dst: &mut [f32],
     width: usize,
     height: usize,
-    start_x: i32,
-    start_y: i32,
-    dx: i32,
-    dy: i32,
-    decay: f32,
+    x: f32,
+    y: f32,
+    rgb: [f32; 3],
+    weight: f32,
 ) {
-    let gain = 1.0 - decay;
-    let mut x = start_x;
-    let mut y = start_y;
-    let mut acc = [0.0_f32; 3];
-    while x >= 0 && y >= 0 && x < width as i32 && y < height as i32 {
-        let i = (y as usize * width + x as usize) * 3;
-        for c in 0..3 {
-            acc[c] = src[i + c] + acc[c] * decay;
-            dst[i + c] += acc[c] * gain;
-        }
-        x += dx;
-        y += dy;
+    if weight <= f32::EPSILON || width == 0 || height == 0 {
+        return;
     }
-    x -= dx;
-    y -= dy;
-    acc = [0.0; 3];
-    loop {
-        let i = (y as usize * width + x as usize) * 3;
-        for c in 0..3 {
-            acc[c] = src[i + c] + acc[c] * decay;
-            dst[i + c] += acc[c] * gain;
+    let x0 = x.floor().clamp(0.0, width.saturating_sub(1) as f32) as usize;
+    let y0 = y.floor().clamp(0.0, height.saturating_sub(1) as f32) as usize;
+    let x1 = (x0 + 1).min(width.saturating_sub(1));
+    let y1 = (y0 + 1).min(height.saturating_sub(1));
+    let wx = (x - x0 as f32).clamp(0.0, 1.0);
+    let wy = (y - y0 as f32).clamp(0.0, 1.0);
+    for (xx, xw) in [(x0, 1.0 - wx), (x1, wx)] {
+        for (yy, yw) in [(y0, 1.0 - wy), (y1, wy)] {
+            let w = weight * xw * yw;
+            if w <= f32::EPSILON {
+                continue;
+            }
+            let i = (yy * width + xx) * 3;
+            for c in 0..3 {
+                dst[i + c] += rgb[c] * w;
+            }
         }
-        if x == start_x && y == start_y {
-            break;
-        }
-        x -= dx;
-        y -= dy;
     }
 }
 
@@ -2633,7 +2617,8 @@ mod tests {
             "star",
             LocalMask::Full,
             LocalEffect::StarGlow(StarGlowParams {
-                mode: StarRayMode::Cross4,
+                ray_count: 4,
+                rotation_degrees: 0.0,
                 threshold: 0.5,
                 length_px: 4.0,
                 strength: 1.0,
@@ -2642,6 +2627,32 @@ mod tests {
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert!(out.pixels[4] > src.pixels[4]);
         assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn star_glow_rotation_extends_diagonal_ray() {
+        let src = RgbaImageBuf::new(
+            3,
+            3,
+            vec![
+                0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255, 0, 0,
+                0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "star",
+            LocalMask::Full,
+            LocalEffect::StarGlow(StarGlowParams {
+                ray_count: 4,
+                rotation_degrees: 45.0,
+                threshold: 0.5,
+                length_px: 4.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[(2 * 3 + 2) * 4] > src.pixels[(2 * 3 + 2) * 4]);
     }
 
     #[test]

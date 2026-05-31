@@ -835,7 +835,8 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   「リセット」で default に戻す
 - Tone Curve はまず RGB 共通の固定 5 点カーブ + プレビューで実装し、チャンネル別カーブは後続候補。
   Dehaze は Dark Channel Prior の考え方を軽量化し、白っぽさ低減と局所コントラスト寄りの仕上げ効果として扱う。
-  Cross-Star Glow は明部抽出 + 方向性の減衰ブラーで、クロス/8方向レンズフィルター風の光条を生成する
+  Cross-Star Glow は明部抽出 + 方向性の減衰ブラーで、光線本数と回転角を指定できる
+  クロス/斜め X 字/6本/8本のレンズフィルター風の光条を生成する
 - `local_adjust_lab` 側で非同期再合成 + generation による古い結果破棄
 - 読み込み直後は部分補正レイヤーを作らず、未加工状態から開始する
 - レイヤー追加は効果種類を先に選ばせず、追加ダイアログで選んだマスク種類 + `効果なし` の

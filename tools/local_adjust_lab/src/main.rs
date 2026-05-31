@@ -14,8 +14,8 @@ use local_adjust_core::{
     HslParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
     LookParams, LookPreset, MaskShape, MosaicParams, RadialGradientMask, RangeMask, RasterMask,
     RasterVectorMask, RegionMask, RgbaImageBuf, RgbaImageRef, ShapeOp, SharpenParams,
-    SoftFocusParams, StarGlowParams, StarRayMode, ToneCurveParams, ToneParams, VignetteParams,
-    apply_layers, evaluate_layer_mask,
+    SoftFocusParams, StarGlowParams, ToneCurveParams, ToneParams, VignetteParams, apply_layers,
+    evaluate_layer_mask,
 };
 
 const PANEL_W: f32 = 340.0;
@@ -4337,17 +4337,12 @@ fn effect_summary(effect: &LocalEffect) -> String {
             format!("色収差 {:.1}px", params.offset_px)
         }
         LocalEffect::Halftone(params) => format!("ハーフトーン {}px", params.cell_px),
-        LocalEffect::StarGlow(params) => format!("クロス光 {:.0}px", params.length_px),
+        LocalEffect::StarGlow(params) => {
+            format!("クロス光 {}本 {:.0}px", params.ray_count, params.length_px)
+        }
         LocalEffect::EdgeSmooth(params) => {
             format!("エッジ保持ぼかし {:.0}px", params.radius_px)
         }
-    }
-}
-
-fn star_ray_mode_label(mode: StarRayMode) -> &'static str {
-    match mode {
-        StarRayMode::Cross4 => "クロス",
-        StarRayMode::Star8 => "8方向",
     }
 }
 
@@ -5097,7 +5092,8 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "クロス弱") {
                     *params = StarGlowParams {
-                        mode: StarRayMode::Cross4,
+                        ray_count: 4,
+                        rotation_degrees: 0.0,
                         threshold: 0.84,
                         length_px: 42.0,
                         strength: 0.55,
@@ -5106,16 +5102,38 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                 }
                 if preset_button(ui, "クロス強") {
                     *params = StarGlowParams {
-                        mode: StarRayMode::Cross4,
+                        ray_count: 4,
+                        rotation_degrees: 0.0,
                         threshold: 0.78,
                         length_px: 72.0,
                         strength: 0.90,
                     };
                     changed = true;
                 }
-                if preset_button(ui, "8方向") {
+                if preset_button(ui, "X字") {
                     *params = StarGlowParams {
-                        mode: StarRayMode::Star8,
+                        ray_count: 4,
+                        rotation_degrees: 45.0,
+                        threshold: 0.80,
+                        length_px: 64.0,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "6本") {
+                    *params = StarGlowParams {
+                        ray_count: 6,
+                        rotation_degrees: 0.0,
+                        threshold: 0.82,
+                        length_px: 56.0,
+                        strength: 0.85,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "8本") {
+                    *params = StarGlowParams {
+                        ray_count: 8,
+                        rotation_degrees: 0.0,
                         threshold: 0.82,
                         length_px: 56.0,
                         strength: 0.85,
@@ -5128,20 +5146,22 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                     .size(10.0)
                     .color(Color32::from_gray(170)),
             );
-            let before = params.mode;
-            lab_combo_box(
-                ui,
-                "star_ray_mode",
-                star_ray_mode_label(params.mode),
-                |ui| {
-                    for mode in [StarRayMode::Cross4, StarRayMode::Star8] {
-                        ui.selectable_value(&mut params.mode, mode, star_ray_mode_label(mode));
-                    }
-                },
-            );
-            changed |= params.mode != before;
+            let mut ray_count = params.ray_count as i32;
             changed |= ui
-                .add(egui::Slider::new(&mut params.threshold, 0.0..=0.99).text("明部しきい値"))
+                .add(egui::Slider::new(&mut ray_count, 2..=12).text("光線本数"))
+                .changed();
+            if changed {
+                let mut normalized = ray_count.clamp(2, 12) as u32;
+                if normalized % 2 != 0 {
+                    normalized += 1;
+                }
+                params.ray_count = normalized.clamp(2, 12);
+            }
+            changed |= ui
+                .add(egui::Slider::new(&mut params.rotation_degrees, -180.0..=180.0).text("回転"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.threshold, 0.50..=0.99).text("明部しきい値"))
                 .changed();
             changed |= ui
                 .add(egui::Slider::new(&mut params.length_px, 1.0..=240.0).text("光線長"))
