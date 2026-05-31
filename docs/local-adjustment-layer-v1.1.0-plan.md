@@ -839,6 +839,9 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   クロス/斜め X 字/6本/8本のレンズフィルター風の光条を生成する。白くなりすぎないよう
   明部しきい値は高めを基本にし、0.990 以上も微調整できるようにする
 - `local_adjust_lab` 側で非同期再合成 + generation による古い結果破棄
+- 最後段 crop preview / export crop を `local_adjust_lab` に追加。crop rect は source image
+  coordinate で保持し、上流の部分補正レイヤーやマスク座標は変えず、保存時に最終結果だけを
+  切り出す。試作 UI では crop 外を暗くする overlay、編集ハンドル、数値入力を持つ
 - 読み込み直後は部分補正レイヤーを作らず、未加工状態から開始する
 - レイヤー追加は効果種類を先に選ばせず、追加ダイアログで選んだマスク種類 + `効果なし` の
   空レイヤーを作る。ユーザーは範囲を作ってから加工内容を選び、試し替えできるようにする

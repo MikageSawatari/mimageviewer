@@ -76,6 +76,8 @@ the window.
 - Effect parameters start from near-identity values. Use the per-effect preset
   buttons for practical starting points, or Reset to return the current effect
   to its default values.
+- Final-stage crop preview/export. The crop rectangle stays in source-image
+  coordinates and is only applied when saving the rendered result.
 - Async recomposition with generation discard
 - Manual-mask undo snapshots for layer operations, brush/lasso/object edits, and object deletion
 - Japanese system font registration so labels render correctly on Windows

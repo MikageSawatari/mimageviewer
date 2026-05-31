@@ -259,6 +259,33 @@ struct EdgeMaskKey {
     gap_px: u8,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CropRect {
+    min_x: f32,
+    min_y: f32,
+    max_x: f32,
+    max_y: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CropHandle {
+    Body,
+    North,
+    South,
+    West,
+    East,
+    NorthWest,
+    NorthEast,
+    SouthWest,
+    SouthEast,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CropDrag {
+    handle: CropHandle,
+    base: CropRect,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct EdgePreviewKey {
     image_path: PathBuf,
@@ -496,6 +523,11 @@ struct LocalAdjustLabApp {
     show_source: bool,
     show_mask: bool,
     preview_to_selected_layer: bool,
+    crop_enabled: bool,
+    crop_overlay: bool,
+    crop_edit_mode: bool,
+    crop_rect: Option<CropRect>,
+    crop_drag: Option<CropDrag>,
     add_layer_dialog_open: bool,
     add_layer_mask_kind: MaskKind,
     status: String,
@@ -560,6 +592,11 @@ impl LocalAdjustLabApp {
             show_source: false,
             show_mask: true,
             preview_to_selected_layer: false,
+            crop_enabled: false,
+            crop_overlay: true,
+            crop_edit_mode: false,
+            crop_rect: None,
+            crop_drag: None,
             add_layer_dialog_open: false,
             add_layer_mask_kind: MaskKind::Raster,
             status: "JPEG / PNG をドロップしてください。".to_string(),
@@ -605,6 +642,11 @@ impl LocalAdjustLabApp {
                 self.view_zoom = 1.0;
                 self.view_pan = egui::Vec2::ZERO;
                 self.pan_drag_start = None;
+                self.crop_enabled = false;
+                self.crop_overlay = true;
+                self.crop_edit_mode = false;
+                self.crop_rect = None;
+                self.crop_drag = None;
                 self.prev_paint_pos = None;
                 self.last_paint_pos = None;
                 self.radial_gradient_drag_active = false;
@@ -738,6 +780,26 @@ impl LocalAdjustLabApp {
         self.image
             .as_ref()
             .map(|image| (image.source.width, image.source.height))
+    }
+
+    fn ensure_crop_rect(&mut self) -> Option<CropRect> {
+        let (w, h) = self.image_dims()?;
+        let current = self.crop_rect.unwrap_or_else(|| CropRect::full(w, h));
+        let sanitized = current.sanitized(w, h);
+        self.crop_rect = Some(sanitized);
+        Some(sanitized)
+    }
+
+    fn effective_crop_rect(&self) -> Option<CropRect> {
+        if !self.crop_enabled {
+            return None;
+        }
+        let (w, h) = self.image_dims()?;
+        Some(
+            self.crop_rect
+                .unwrap_or_else(|| CropRect::full(w, h))
+                .sanitized(w, h),
+        )
     }
 
     fn selected_layer_mut(&mut self) -> Option<&mut LocalAdjustmentLayer> {
@@ -1395,9 +1457,19 @@ impl LocalAdjustLabApp {
                 };
                 result
             };
-        match save_result_png(&image.path, result) {
+        let crop = self.effective_crop_rect();
+        let cropped_result;
+        let result_to_save = if let Some(crop) = crop {
+            cropped_result = crop_rgba_image(result, crop);
+            &cropped_result
+        } else {
+            result
+        };
+        match save_result_png(&image.path, result_to_save) {
             Ok(path) => {
-                self.status = if self.preview_to_selected_layer {
+                self.status = if crop.is_some() {
+                    format!("crop して保存しました: {}", path.display())
+                } else if self.preview_to_selected_layer {
                     format!("全レイヤーで保存しました: {}", path.display())
                 } else {
                     format!("保存しました: {}", path.display())
@@ -1903,6 +1975,9 @@ impl LocalAdjustLabApp {
         });
 
         ui.separator();
+        self.draw_crop_controls(ui, btn_size);
+
+        ui.separator();
         self.draw_layer_list(ui, PANEL_W);
         if self.layers.is_empty() {
             return;
@@ -1960,6 +2035,7 @@ impl LocalAdjustLabApp {
                      Q:元画像  W:マスク表示\n\
                      境界筆[A]:境界で止めながら近い色を塗る  Ctrl中は境界表示+通常筆\n\
                      隙間補完[G]:細い未塗り部分を補完\n\
+                     Crop編集:黄色枠/ハンドルをドラッグ、保存時に最後段で切り出し\n\
                      Ctrl:境界表示/多角形吸着\n\
                      右クリック/Enterで確定  矢印:移動  [/]:回転\n\
                      Delete:選択削除  Ctrl+Z:戻す  Ctrl+Y/Ctrl+Shift+Z:やり直し",
@@ -1969,6 +2045,101 @@ impl LocalAdjustLabApp {
             )
             .wrap(),
         );
+    }
+
+    fn draw_crop_controls(&mut self, ui: &mut egui::Ui, btn_size: egui::Vec2) {
+        let Some((w, h)) = self.image_dims() else {
+            return;
+        };
+        ui.label(egui::RichText::new("最後段 crop:").color(Color32::from_gray(200)));
+        ui.horizontal(|ui| {
+            if panel_toggle_button(ui, "有効", self.crop_enabled, Some(btn_size), false).clicked()
+            {
+                self.crop_enabled = !self.crop_enabled;
+                if self.crop_enabled {
+                    self.ensure_crop_rect();
+                } else {
+                    self.crop_drag = None;
+                }
+            }
+            if panel_toggle_button(ui, "表示", self.crop_overlay, Some(btn_size), false).clicked()
+            {
+                self.crop_overlay = !self.crop_overlay;
+            }
+        });
+        ui.horizontal(|ui| {
+            if panel_toggle_button(ui, "編集", self.crop_edit_mode, Some(btn_size), false).clicked()
+            {
+                self.crop_edit_mode = !self.crop_edit_mode;
+                if self.crop_edit_mode {
+                    self.crop_enabled = true;
+                    self.ensure_crop_rect();
+                }
+            }
+            if ui.add_sized(btn_size, egui::Button::new("全体")).clicked() {
+                self.crop_enabled = true;
+                self.crop_rect = Some(CropRect::full(w, h));
+                self.crop_drag = None;
+            }
+        });
+        if self.crop_enabled {
+            let mut crop = self
+                .ensure_crop_rect()
+                .unwrap_or_else(|| CropRect::full(w, h));
+            let mut x = crop.min_x.round() as i32;
+            let mut y = crop.min_y.round() as i32;
+            let mut cw = crop.width().round() as i32;
+            let mut ch = crop.height().round() as i32;
+            let mut changed = false;
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add(egui::DragValue::new(&mut x).range(0..=w.saturating_sub(1) as i32))
+                    .changed();
+                ui.label("X");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut y).range(0..=h.saturating_sub(1) as i32))
+                    .changed();
+                ui.label("Y");
+            });
+            ui.horizontal(|ui| {
+                changed |= ui
+                    .add(egui::DragValue::new(&mut cw).range(1..=w.max(1) as i32))
+                    .changed();
+                ui.label("W");
+                changed |= ui
+                    .add(egui::DragValue::new(&mut ch).range(1..=h.max(1) as i32))
+                    .changed();
+                ui.label("H");
+            });
+            if changed {
+                cw = cw.max(1).min(w as i32);
+                ch = ch.max(1).min(h as i32);
+                x = x.clamp(0, w.saturating_sub(1) as i32);
+                y = y.clamp(0, h.saturating_sub(1) as i32);
+                if x + cw > w as i32 {
+                    x = w as i32 - cw;
+                }
+                if y + ch > h as i32 {
+                    y = h as i32 - ch;
+                }
+                crop = CropRect {
+                    min_x: x.max(0) as f32,
+                    min_y: y.max(0) as f32,
+                    max_x: (x + cw).max(1) as f32,
+                    max_y: (y + ch).max(1) as f32,
+                }
+                .sanitized(w, h);
+                self.crop_rect = Some(crop);
+                self.crop_drag = None;
+            }
+            ui.label(
+                egui::RichText::new(
+                    "保存時に最終結果を切り出します。上流のマスク座標は変わりません。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+        }
     }
 
     fn draw_manual_tool_selector(&mut self, ui: &mut egui::Ui, btn_size: egui::Vec2) {
@@ -2139,10 +2310,19 @@ impl LocalAdjustLabApp {
         } else {
             self.draw_gradient_handles(ui, rect)
         };
+        let crop_used = self.draw_crop_overlay(
+            ui,
+            rect,
+            img_w,
+            img_h,
+            pointer_screen,
+            !panel_blocks_pointer && !pan_mode,
+        );
         let secondary_pressed = ui.input(|i| i.pointer.secondary_pressed());
 
         if !view_input_used
             && !panel_blocks_pointer
+            && !crop_used
             && (response.hovered() || response.dragged() || response.clicked() || secondary_pressed)
         {
             let pointer = ui.input(|i| i.pointer.interact_pos());
@@ -3807,6 +3987,104 @@ impl LocalAdjustLabApp {
             self.mark_dirty();
         }
         used
+    }
+
+    fn draw_crop_overlay(
+        &mut self,
+        ui: &mut egui::Ui,
+        image_rect: Rect,
+        img_w: usize,
+        img_h: usize,
+        pointer_screen: Option<Pos2>,
+        pointer_allowed: bool,
+    ) -> bool {
+        if !self.crop_enabled {
+            self.crop_drag = None;
+            return false;
+        }
+        let crop = self
+            .ensure_crop_rect()
+            .unwrap_or_else(|| CropRect::full(img_w, img_h));
+        let crop_screen = crop.to_screen_rect(image_rect, img_w, img_h);
+        let painter = ui.painter().clone();
+        if self.crop_overlay {
+            for outside in outside_rects(image_rect, crop_screen) {
+                painter.rect_filled(outside, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 145));
+            }
+        }
+        painter.rect_stroke(
+            crop_screen,
+            0.0,
+            egui::Stroke::new(2.0, Color32::from_rgb(255, 230, 100)),
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_stroke(
+            crop_screen.expand(1.0),
+            0.0,
+            egui::Stroke::new(1.0, Color32::BLACK),
+            egui::StrokeKind::Outside,
+        );
+
+        if !self.crop_edit_mode || !pointer_allowed {
+            return false;
+        }
+        let mut used = false;
+        let scale_x = img_w.max(1) as f32 / image_rect.width().max(1.0);
+        let scale_y = img_h.max(1) as f32 / image_rect.height().max(1.0);
+        for (handle, center) in crop_handle_points(crop_screen) {
+            let size = if handle == CropHandle::Body {
+                crop_screen.size()
+            } else {
+                egui::vec2(26.0, 26.0)
+            };
+            let handle_rect = Rect::from_center_size(center, size);
+            let response = ui
+                .interact(
+                    handle_rect,
+                    ui.id().with(("crop_handle", handle as u8)),
+                    Sense::drag(),
+                )
+                .on_hover_text(match handle {
+                    CropHandle::Body => "crop を移動",
+                    _ => "crop を調整",
+                });
+            if handle != CropHandle::Body {
+                painter.circle_filled(center, 5.5, Color32::from_rgb(255, 245, 180));
+                painter.circle_stroke(
+                    center,
+                    5.5,
+                    egui::Stroke::new(1.5, Color32::from_rgb(30, 20, 0)),
+                );
+            }
+            if response.hovered() || response.dragged() {
+                used = true;
+            }
+            if response.drag_started() {
+                self.crop_drag = Some(CropDrag { handle, base: crop });
+            }
+            if response.dragged()
+                && let Some(drag) = self.crop_drag
+                && drag.handle == handle
+            {
+                let delta = response.drag_delta();
+                let delta_x = delta.x * scale_x;
+                let delta_y = delta.y * scale_y;
+                self.crop_rect = Some(drag.base.dragged(handle, delta_x, delta_y, img_w, img_h));
+            }
+        }
+        if ui.input(|i| !i.pointer.primary_down()) {
+            self.crop_drag = None;
+        }
+        if used {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNeSw);
+        } else if self.crop_edit_mode
+            && pointer_screen
+                .map(|p| crop_screen.contains(p))
+                .unwrap_or(false)
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+        }
+        used || self.crop_drag.is_some()
     }
 
     fn drag_gradient_line(&mut self, image_pos: Pos2, started: bool) {
@@ -7036,6 +7314,179 @@ fn shape_contains_point(shape: MaskShape, point: [f32; 2]) -> bool {
     }
 }
 
+impl CropRect {
+    fn full(width: usize, height: usize) -> Self {
+        Self {
+            min_x: 0.0,
+            min_y: 0.0,
+            max_x: width.max(1) as f32,
+            max_y: height.max(1) as f32,
+        }
+    }
+
+    fn width(self) -> f32 {
+        (self.max_x - self.min_x).max(1.0)
+    }
+
+    fn height(self) -> f32 {
+        (self.max_y - self.min_y).max(1.0)
+    }
+
+    fn sanitized(self, width: usize, height: usize) -> Self {
+        let max_w = width.max(1) as f32;
+        let max_h = height.max(1) as f32;
+        let mut min_x = self.min_x.min(self.max_x).clamp(0.0, max_w - 1.0);
+        let mut min_y = self.min_y.min(self.max_y).clamp(0.0, max_h - 1.0);
+        let mut max_x = self.max_x.max(self.min_x).clamp(1.0, max_w);
+        let mut max_y = self.max_y.max(self.min_y).clamp(1.0, max_h);
+        if max_x - min_x < 1.0 {
+            if max_x >= max_w {
+                min_x = (max_w - 1.0).max(0.0);
+                max_x = max_w;
+            } else {
+                max_x = (min_x + 1.0).min(max_w);
+            }
+        }
+        if max_y - min_y < 1.0 {
+            if max_y >= max_h {
+                min_y = (max_h - 1.0).max(0.0);
+                max_y = max_h;
+            } else {
+                max_y = (min_y + 1.0).min(max_h);
+            }
+        }
+        Self {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        }
+    }
+
+    fn to_screen_rect(self, image_rect: Rect, width: usize, height: usize) -> Rect {
+        let w = width.max(1) as f32;
+        let h = height.max(1) as f32;
+        Rect::from_min_max(
+            egui::pos2(
+                image_rect.left() + image_rect.width() * self.min_x / w,
+                image_rect.top() + image_rect.height() * self.min_y / h,
+            ),
+            egui::pos2(
+                image_rect.left() + image_rect.width() * self.max_x / w,
+                image_rect.top() + image_rect.height() * self.max_y / h,
+            ),
+        )
+    }
+
+    fn dragged(
+        self,
+        handle: CropHandle,
+        delta_x: f32,
+        delta_y: f32,
+        width: usize,
+        height: usize,
+    ) -> Self {
+        let mut next = self;
+        match handle {
+            CropHandle::Body => {
+                let max_w = width.max(1) as f32;
+                let max_h = height.max(1) as f32;
+                let w = next.width().min(max_w);
+                let h = next.height().min(max_h);
+                next.min_x = (self.min_x + delta_x).clamp(0.0, max_w - w);
+                next.min_y = (self.min_y + delta_y).clamp(0.0, max_h - h);
+                next.max_x = next.min_x + w;
+                next.max_y = next.min_y + h;
+                return next.sanitized(width, height);
+            }
+            CropHandle::North => next.min_y += delta_y,
+            CropHandle::South => next.max_y += delta_y,
+            CropHandle::West => next.min_x += delta_x,
+            CropHandle::East => next.max_x += delta_x,
+            CropHandle::NorthWest => {
+                next.min_x += delta_x;
+                next.min_y += delta_y;
+            }
+            CropHandle::NorthEast => {
+                next.max_x += delta_x;
+                next.min_y += delta_y;
+            }
+            CropHandle::SouthWest => {
+                next.min_x += delta_x;
+                next.max_y += delta_y;
+            }
+            CropHandle::SouthEast => {
+                next.max_x += delta_x;
+                next.max_y += delta_y;
+            }
+        }
+        next.sanitized(width, height)
+    }
+}
+
+fn crop_handle_points(rect: Rect) -> [(CropHandle, Pos2); 9] {
+    let center = rect.center();
+    [
+        (CropHandle::Body, center),
+        (CropHandle::NorthWest, rect.left_top()),
+        (CropHandle::North, egui::pos2(center.x, rect.top())),
+        (CropHandle::NorthEast, rect.right_top()),
+        (CropHandle::East, egui::pos2(rect.right(), center.y)),
+        (CropHandle::SouthEast, rect.right_bottom()),
+        (CropHandle::South, egui::pos2(center.x, rect.bottom())),
+        (CropHandle::SouthWest, rect.left_bottom()),
+        (CropHandle::West, egui::pos2(rect.left(), center.y)),
+    ]
+}
+
+fn outside_rects(outer: Rect, inner: Rect) -> [Rect; 4] {
+    let inner = inner.intersect(outer);
+    [
+        Rect::from_min_max(outer.min, egui::pos2(outer.right(), inner.top())),
+        Rect::from_min_max(
+            egui::pos2(outer.left(), inner.bottom()),
+            outer.right_bottom(),
+        ),
+        Rect::from_min_max(
+            egui::pos2(outer.left(), inner.top()),
+            egui::pos2(inner.left(), inner.bottom()),
+        ),
+        Rect::from_min_max(
+            egui::pos2(inner.right(), inner.top()),
+            egui::pos2(outer.right(), inner.bottom()),
+        ),
+    ]
+}
+
+fn crop_rgba_image(src: &RgbaImageBuf, crop: CropRect) -> RgbaImageBuf {
+    let crop = crop.sanitized(src.width, src.height);
+    let x0 = crop
+        .min_x
+        .floor()
+        .clamp(0.0, src.width.saturating_sub(1) as f32) as usize;
+    let y0 = crop
+        .min_y
+        .floor()
+        .clamp(0.0, src.height.saturating_sub(1) as f32) as usize;
+    let x1 = crop
+        .max_x
+        .ceil()
+        .clamp((x0 + 1) as f32, src.width.max(1) as f32) as usize;
+    let y1 = crop
+        .max_y
+        .ceil()
+        .clamp((y0 + 1) as f32, src.height.max(1) as f32) as usize;
+    let out_w = (x1 - x0).max(1);
+    let out_h = (y1 - y0).max(1);
+    let mut pixels = Vec::with_capacity(out_w * out_h * 4);
+    for y in y0..y1 {
+        let start = (y * src.width + x0) * 4;
+        let end = start + out_w * 4;
+        pixels.extend_from_slice(&src.pixels[start..end]);
+    }
+    RgbaImageBuf::new(out_w, out_h, pixels).unwrap_or_else(|_| src.clone())
+}
+
 fn save_result_png(src_path: &Path, result: &RgbaImageBuf) -> Result<PathBuf, String> {
     let path = sibling_output_path(src_path, "local_adjust", "png");
     let Some(out) = RgbaImage::from_raw(
@@ -7337,6 +7788,34 @@ mod tests {
         assert!(visuals.panel_fill.r() < 64);
         assert!(visuals.extreme_bg_color.r() < 32);
         assert!(visuals.widgets.inactive.bg_fill.r() < 96);
+    }
+
+    #[test]
+    fn crop_rgba_image_returns_requested_region() {
+        let src = RgbaImageBuf::new(
+            3,
+            2,
+            vec![
+                10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255, 40, 0, 0, 255, 50, 0, 0, 255, 60, 0,
+                0, 255,
+            ],
+        )
+        .unwrap();
+        let out = crop_rgba_image(
+            &src,
+            CropRect {
+                min_x: 1.0,
+                min_y: 0.0,
+                max_x: 3.0,
+                max_y: 2.0,
+            },
+        );
+        assert_eq!(out.width, 2);
+        assert_eq!(out.height, 2);
+        assert_eq!(out.pixels[0], 20);
+        assert_eq!(out.pixels[4], 30);
+        assert_eq!(out.pixels[8], 50);
+        assert_eq!(out.pixels[12], 60);
     }
 
     #[test]
