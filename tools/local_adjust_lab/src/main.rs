@@ -69,7 +69,6 @@ fn main() -> eframe::Result<()> {
 }
 
 fn configure_lab_fonts(ctx: &egui::Context) {
-    ctx.set_visuals(egui::Visuals::dark());
     let mut fonts = egui::FontDefinitions::default();
     for path in [
         r"C:\Windows\Fonts\YuGothM.ttc",
@@ -91,6 +90,49 @@ fn configure_lab_fonts(ctx: &egui::Context) {
         break;
     }
     ctx.set_fonts(fonts);
+    apply_lab_dark_theme(ctx);
+}
+
+fn lab_dark_visuals() -> egui::Visuals {
+    let mut visuals = egui::Visuals::dark();
+    visuals.override_text_color = Some(Color32::WHITE);
+    visuals.window_fill = Color32::from_rgb(20, 20, 22);
+    visuals.panel_fill = Color32::from_rgb(18, 18, 20);
+    visuals.extreme_bg_color = Color32::from_rgb(8, 8, 10);
+    visuals.faint_bg_color = Color32::from_rgb(32, 32, 34);
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(56, 56, 56);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(74, 74, 74);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(84, 84, 84);
+    visuals.selection.bg_fill = Color32::from_rgb(45, 96, 140);
+    visuals.selection.stroke.color = Color32::WHITE;
+    visuals
+}
+
+fn apply_lab_dark_theme(ctx: &egui::Context) {
+    // egui 0.33 can resolve popups against the OS light style unless the theme
+    // preference itself is pinned. Keep the lab dark even inside ComboBox popups.
+    ctx.set_theme(egui::ThemePreference::Dark);
+    ctx.style_mut(|style| {
+        style.visuals = lab_dark_visuals();
+    });
+}
+
+fn apply_lab_dark_ui(ui: &mut egui::Ui) {
+    ui.style_mut().visuals = lab_dark_visuals();
+}
+
+fn lab_combo_box<R>(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash,
+    selected_text: impl Into<egui::WidgetText>,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> egui::InnerResponse<Option<R>> {
+    ComboBox::from_id_salt(id_salt)
+        .selected_text(selected_text)
+        .show_ui(ui, |ui| {
+            apply_lab_dark_ui(ui);
+            add_contents(ui)
+        })
 }
 
 fn animated_overlay_color(ctx: &egui::Context, alpha: u8) -> Color32 {
@@ -1824,8 +1866,7 @@ impl LocalAdjustLabApp {
     }
 
     fn draw_controls(&mut self, ui: &mut egui::Ui) {
-        *ui.visuals_mut() = egui::Visuals::dark();
-        ui.visuals_mut().override_text_color = Some(Color32::WHITE);
+        apply_lab_dark_ui(ui);
 
         let btn_w = ((PANEL_W - 20.0 - 4.0) / 2.0).max(96.0);
         let btn_size = egui::vec2(btn_w, 24.0);
@@ -2172,8 +2213,7 @@ impl LocalAdjustLabApp {
                     .show(ui, |ui| {
                         ui.set_min_width(PANEL_W);
                         ui.set_max_width(PANEL_W);
-                        *ui.visuals_mut() = egui::Visuals::dark();
-                        ui.visuals_mut().override_text_color = Some(Color32::WHITE);
+                        apply_lab_dark_ui(ui);
 
                         ui.horizontal(|ui| {
                             ui.label(
@@ -2285,8 +2325,7 @@ impl LocalAdjustLabApp {
                         ui.set_max_width(TOOL_PANEL_W);
                         ui.set_min_height(body_height);
                         ui.set_max_height(body_height);
-                        *ui.visuals_mut() = egui::Visuals::dark();
-                        ui.visuals_mut().override_text_color = Some(Color32::WHITE);
+                        apply_lab_dark_ui(ui);
                         egui::ScrollArea::vertical()
                             .max_height(body_height)
                             .auto_shrink([false, false])
@@ -2862,8 +2901,7 @@ impl LocalAdjustLabApp {
             .default_width(360.0)
             .open(&mut open)
             .show(ctx, |ui| {
-                *ui.visuals_mut() = egui::Visuals::dark();
-                ui.visuals_mut().override_text_color = Some(Color32::WHITE);
+                apply_lab_dark_ui(ui);
                 ui.label("マスク種類を選んで追加します。追加後は種類を変えず、内容を編集します。");
                 ui.separator();
                 for kind in [
@@ -4315,28 +4353,26 @@ fn draw_effect_kind_selector(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer
     ui.label(egui::RichText::new("加工内容:").color(Color32::from_gray(200)));
     let mut kind = EffectKind::from_effect(&layer.effect);
     let before = kind;
-    ComboBox::from_id_salt("effect_kind")
-        .selected_text(kind.label())
-        .show_ui(ui, |ui| {
-            for candidate in [
-                EffectKind::None,
-                EffectKind::Tone,
-                EffectKind::Clarity,
-                EffectKind::HighlightsShadows,
-                EffectKind::Blur,
-                EffectKind::SoftFocus,
-                EffectKind::Mosaic,
-                EffectKind::Look,
-                EffectKind::Bloom,
-                EffectKind::Vignette,
-                EffectKind::FilmGrain,
-                EffectKind::ChromaticAberration,
-                EffectKind::Halftone,
-                EffectKind::EdgeSmooth,
-            ] {
-                ui.selectable_value(&mut kind, candidate, candidate.label());
-            }
-        });
+    lab_combo_box(ui, "effect_kind", kind.label(), |ui| {
+        for candidate in [
+            EffectKind::None,
+            EffectKind::Tone,
+            EffectKind::Clarity,
+            EffectKind::HighlightsShadows,
+            EffectKind::Blur,
+            EffectKind::SoftFocus,
+            EffectKind::Mosaic,
+            EffectKind::Look,
+            EffectKind::Bloom,
+            EffectKind::Vignette,
+            EffectKind::FilmGrain,
+            EffectKind::ChromaticAberration,
+            EffectKind::Halftone,
+            EffectKind::EdgeSmooth,
+        ] {
+            ui.selectable_value(&mut kind, candidate, candidate.label());
+        }
+    });
     if kind != before {
         layer.effect = default_effect(kind);
         changed = true;
@@ -4411,21 +4447,19 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
         }
         LocalEffect::Look(params) => {
             let before = params.preset;
-            ComboBox::from_id_salt("look_preset")
-                .selected_text(look_preset_label(params.preset))
-                .show_ui(ui, |ui| {
-                    for preset in [
-                        LookPreset::Sunset,
-                        LookPreset::Night,
-                        LookPreset::BrightSun,
-                        LookPreset::Pale,
-                        LookPreset::Cool,
-                        LookPreset::Warm,
-                        LookPreset::RetroFilm,
-                    ] {
-                        ui.selectable_value(&mut params.preset, preset, look_preset_label(preset));
-                    }
-                });
+            lab_combo_box(ui, "look_preset", look_preset_label(params.preset), |ui| {
+                for preset in [
+                    LookPreset::Sunset,
+                    LookPreset::Night,
+                    LookPreset::BrightSun,
+                    LookPreset::Pale,
+                    LookPreset::Cool,
+                    LookPreset::Warm,
+                    LookPreset::RetroFilm,
+                ] {
+                    ui.selectable_value(&mut params.preset, preset, look_preset_label(preset));
+                }
+            });
             changed |= params.preset != before;
             changed |= ui
                 .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
@@ -6616,6 +6650,16 @@ mod tests {
         let points = [[1.0, 1.0], [7.0, 1.0], [4.0, 7.0]];
         assert!(point_in_polygon([3.0, 4.0], &points));
         assert!(!point_in_polygon([1.5, 4.0], &points));
+    }
+
+    #[test]
+    fn lab_dark_visuals_keep_popups_dark() {
+        let visuals = lab_dark_visuals();
+        assert_eq!(visuals.override_text_color, Some(Color32::WHITE));
+        assert!(visuals.window_fill.r() < 64);
+        assert!(visuals.panel_fill.r() < 64);
+        assert!(visuals.extreme_bg_color.r() < 32);
+        assert!(visuals.widgets.inactive.bg_fill.r() < 96);
     }
 
     #[test]
