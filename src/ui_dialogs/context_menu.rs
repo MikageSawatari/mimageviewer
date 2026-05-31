@@ -73,6 +73,22 @@ fn build_delete_confirm_label(
     }
 }
 
+fn native_path_text(path: &Path) -> String {
+    let text = path.to_string_lossy().to_string();
+    #[cfg(windows)]
+    {
+        text.replace('/', "\\")
+    }
+    #[cfg(not(windows))]
+    {
+        text
+    }
+}
+
+fn copy_path_text(ctx: &egui::Context, path: &Path) {
+    ctx.copy_text(native_path_text(path));
+}
+
 #[cfg(windows)]
 fn delete_targets_may_permanently_delete(targets: &[(usize, PathBuf)]) -> bool {
     let mut checked_roots: std::collections::HashMap<String, Option<u64>> =
@@ -358,7 +374,7 @@ impl crate::app::App {
                     match &item {
                         GridItem::Image(p) | GridItem::Video(p) => {
                             if ui.button("パスをコピー").clicked() {
-                                ctx.copy_text(p.to_string_lossy().to_string());
+                                copy_path_text(ctx, p);
                                 close = true;
                             }
                             if ui.button("ファイル名をコピー").clicked() {
@@ -429,7 +445,7 @@ impl crate::app::App {
                                 "パスをコピー"
                             };
                             if ui.button(copy_label).clicked() {
-                                ctx.copy_text(p.to_string_lossy().to_string());
+                                copy_path_text(ctx, p);
                                 close = true;
                             }
                             let open_label = if is_folder_context {
@@ -439,7 +455,7 @@ impl crate::app::App {
                             };
                             if ui.button(open_label).clicked() {
                                 let _ = std::process::Command::new("explorer")
-                                    .arg(p.as_os_str())
+                                    .arg(native_path_text(p))
                                     .spawn();
                                 close = true;
                             }
@@ -461,7 +477,7 @@ impl crate::app::App {
                         }
                         GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
                             if ui.button("パスをコピー").clicked() {
-                                ctx.copy_text(p.to_string_lossy().to_string());
+                                copy_path_text(ctx, p);
                                 close = true;
                             }
                             if ui.button("ファイル名をコピー").clicked() {
@@ -511,7 +527,7 @@ impl crate::app::App {
                             zip_path,
                             entry_name,
                         } => {
-                            let display = format!("{}:{}", zip_path.display(), entry_name);
+                            let display = format!("{}:{}", native_path_text(zip_path), entry_name);
                             if ui.button("パスをコピー").clicked() {
                                 ctx.copy_text(display);
                                 close = true;
@@ -532,7 +548,7 @@ impl crate::app::App {
                         GridItem::SearchContainer { path, .. } => {
                             // Ctrl+G 結果コンテナ: フォルダ扱いで最小限の操作を出す
                             if ui.button("パスをコピー").clicked() {
-                                ctx.copy_text(path.to_string_lossy().to_string());
+                                copy_path_text(ctx, path);
                                 close = true;
                             }
                             if in_search && ui.button("フォルダに移動").clicked() {
@@ -544,7 +560,8 @@ impl crate::app::App {
                         GridItem::PdfPage {
                             pdf_path, page_num, ..
                         } => {
-                            let display = format!("{}:Page {}", pdf_path.display(), page_num + 1);
+                            let display =
+                                format!("{}:Page {}", native_path_text(pdf_path), page_num + 1);
                             if ui.button("パスをコピー").clicked() {
                                 ctx.copy_text(display);
                                 close = true;
@@ -556,7 +573,7 @@ impl crate::app::App {
                         }
                         GridItem::ConvertibleArchive { path, .. } => {
                             if ui.button("パスをコピー").clicked() {
-                                ctx.copy_text(path.to_string_lossy().to_string());
+                                copy_path_text(ctx, path);
                                 close = true;
                             }
                             if ui.button("ファイル名をコピー").clicked() {
@@ -708,7 +725,7 @@ impl crate::app::App {
                 match &item {
                     GridItem::Image(p) | GridItem::Video(p) => {
                         if ui.button("パスをコピー").clicked() {
-                            ctx.copy_text(p.to_string_lossy().to_string());
+                            copy_path_text(ctx, p);
                             close = true;
                         }
                         if ui.button("ファイル名をコピー").clicked() {
@@ -736,7 +753,7 @@ impl crate::app::App {
                     }
                     GridItem::ZipFile(p) | GridItem::PdfFile(p) => {
                         if ui.button("パスをコピー").clicked() {
-                            ctx.copy_text(p.to_string_lossy().to_string());
+                            copy_path_text(ctx, p);
                             close = true;
                         }
                         if ui.button("フォルダを開く").clicked() {
@@ -751,7 +768,7 @@ impl crate::app::App {
                         zip_path,
                         entry_name,
                     } => {
-                        let display = format!("{}:{}", zip_path.display(), entry_name);
+                        let display = format!("{}:{}", native_path_text(zip_path), entry_name);
                         if ui.button("パスをコピー").clicked() {
                             ctx.copy_text(display);
                             close = true;
@@ -769,7 +786,8 @@ impl crate::app::App {
                     GridItem::PdfPage {
                         pdf_path, page_num, ..
                     } => {
-                        let display = format!("{}:Page {}", pdf_path.display(), page_num + 1);
+                        let display =
+                            format!("{}:Page {}", native_path_text(pdf_path), page_num + 1);
                         if ui.button("パスをコピー").clicked() {
                             ctx.copy_text(display);
                             close = true;
@@ -784,7 +802,7 @@ impl crate::app::App {
                     }
                     GridItem::ConvertibleArchive { path, .. } => {
                         if ui.button("パスをコピー").clicked() {
-                            ctx.copy_text(path.to_string_lossy().to_string());
+                            copy_path_text(ctx, path);
                             close = true;
                         }
                         if ui.button("フォルダを開く").clicked() {
@@ -795,7 +813,7 @@ impl crate::app::App {
                     GridItem::SearchContainer { path, .. } => {
                         // Ctrl+G 結果ビューのコンテナ (v0.8.0): コピー系のみ最低限
                         if ui.button("パスをコピー").clicked() {
-                            ctx.copy_text(path.to_string_lossy().to_string());
+                            copy_path_text(ctx, path);
                             close = true;
                         }
                         if ui.button("フォルダを開く").clicked() {
@@ -1127,7 +1145,7 @@ fn clipboard_seq_is_latest(my_seq: u64) -> bool {
 /// エスケープ) に変換する。clipboard / paste / drop のスクリプト生成で共用。
 #[cfg(windows)]
 fn ps_quote(path: &std::path::Path) -> String {
-    format!("'{}'", path.to_string_lossy().replace('\'', "''"))
+    format!("'{}'", native_path_text(path).replace('\'', "''"))
 }
 
 /// ファイルをクリップボードにコピー (エクスプローラのコピーと同等)。
@@ -1705,7 +1723,7 @@ fn run_ps_script_inner(
 /// 検索結果由来のパスは正規化形 (小文字・スラッシュ区切り) なので、グリッド側の
 /// 通常パスと揃うよう区切り文字をバックスラッシュに変換する。
 fn native_nav_path(path: &std::path::Path) -> PathBuf {
-    PathBuf::from(path.to_string_lossy().replace('/', "\\"))
+    PathBuf::from(native_path_text(path))
 }
 
 /// 検索結果アイテムのパスから、ネイティブ形式 (バックスラッシュ区切り) の親フォルダを返す。
@@ -1719,7 +1737,7 @@ fn open_folder_in_explorer(path: &std::path::Path) {
         // `explorer /select,` は区切り文字にバックスラッシュを要求する。検索結果由来の
         // パスは正規化形 (スラッシュ区切り) のことがあり、その場合 explorer がパスを
         // 解決できず既定フォルダ (OneDrive 等) を開いてしまう。
-        let native = path.to_string_lossy().replace('/', "\\");
+        let native = native_path_text(path);
         let _ = std::process::Command::new("explorer")
             .arg("/select,")
             .arg(&native)
@@ -1775,6 +1793,28 @@ mod delete_confirm_tests {
         assert_eq!(
             windows_path_root_for_file_operation(Path::new(r"\\server\share\dir\sample.jpg")),
             Some(r"\\server\share\".to_owned())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_path_text_converts_normalized_search_paths() {
+        assert_eq!(
+            native_path_text(Path::new(r"g:/home/comfyui/eagle/a.png")),
+            r"g:\home\comfyui\eagle\a.png"
+        );
+        assert_eq!(
+            native_path_text(Path::new(r"//server/share/folder/a.jpg")),
+            r"\\server\share\folder\a.jpg"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ps_quote_uses_native_separators_and_escapes_quotes() {
+        assert_eq!(
+            ps_quote(Path::new(r"g:/home/O'Brien/a.png")),
+            r"'g:\home\O''Brien\a.png'"
         );
     }
 

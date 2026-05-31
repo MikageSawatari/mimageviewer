@@ -141,6 +141,11 @@ pub fn pick_exe_dialog() -> Option<AppHandler> {
 /// 指定したアプリケーションでファイルを開く。
 pub fn launch_with_app(exe_path: &str, file_path: &std::path::Path) {
     let mut cmd = std::process::Command::new(exe_path);
+    #[cfg(windows)]
+    let file_arg = file_path.to_string_lossy().replace('/', "\\");
+    #[cfg(windows)]
+    cmd.arg(&file_arg);
+    #[cfg(not(windows))]
     cmd.arg(file_path.as_os_str());
     #[cfg(windows)]
     {
