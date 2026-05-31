@@ -971,9 +971,6 @@ impl LocalAdjustLabApp {
         self.push_undo_snapshot();
         if let Some(layer) = self.selected_layer_mut() {
             layer.mask = LocalMask::RasterVector(manual_mask);
-            layer.mask_inverted = false;
-            layer.mask_expand_px = 0.0;
-            layer.mask_feather_px = 0.0;
         }
         self.selected_shape = None;
         self.status = "現在のマスクを手動マスクへ変換しました。".to_string();
@@ -2756,7 +2753,7 @@ impl LocalAdjustLabApp {
         let convert_response = ui
             .add_enabled(!is_manual_vector, egui::Button::new("手動マスクへ変換"))
             .on_hover_text(
-                "現在のマスク形状をビットマップに焼き込み、ブラシや囲みで微修正できる手動マスクにします。反転・拡張/縮小・ぼかし境界は焼き込みますが、不透明度は維持します。",
+                "現在のマスク本体をビットマップ化し、ブラシや囲みで微修正できる手動マスクにします。反転・拡張/縮小・ぼかし境界・不透明度はレイヤー設定として維持します。",
             );
         if convert_response.clicked() {
             self.convert_selected_mask_to_manual();
@@ -5648,8 +5645,11 @@ fn manual_mask_from_layer(
     layer: &LocalAdjustmentLayer,
 ) -> Result<RasterVectorMask, String> {
     let mut mask_layer = layer.clone();
-    // Opacity belongs to the effect strength. Bake mask modifiers, but keep
-    // the layer opacity editable after conversion.
+    // Keep common mask modifiers non-destructive. Only the selected mask source
+    // itself is rasterized into manual-mask alpha.
+    mask_layer.mask_inverted = false;
+    mask_layer.mask_expand_px = 0.0;
+    mask_layer.mask_feather_px = 0.0;
     mask_layer.opacity = 1.0;
     let alpha = evaluate_layer_mask(image, &mask_layer).map_err(|e| e.to_string())?;
     Ok(RasterVectorMask {
@@ -7943,7 +7943,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_mask_conversion_bakes_mask_but_not_opacity() {
+    fn manual_mask_conversion_rasterizes_source_without_common_modifiers() {
         let source = RgbaImageBuf::new(2, 1, vec![0, 0, 0, 255, 255, 255, 255, 255]).unwrap();
         let mut layer = LocalAdjustmentLayer::new(
             "luma",
@@ -7954,6 +7954,9 @@ mod tests {
             }),
             LocalEffect::None,
         );
+        layer.mask_inverted = true;
+        layer.mask_expand_px = 8.0;
+        layer.mask_feather_px = 8.0;
         layer.opacity = 0.25;
 
         let mask = manual_mask_from_layer(source.as_ref(), &layer).unwrap();

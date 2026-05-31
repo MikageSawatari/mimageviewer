@@ -56,7 +56,8 @@ the window.
   - Opacity
 - Mask operations:
   - Convert any generated / range / gradient mask to a manual mask for brush
-    touch-up
+    touch-up while keeping invert, expand/shrink, feather, and opacity as layer
+    settings
   - Copy only the mask data and mask modifiers from another layer while keeping
     the current layer's effect and opacity
 - Effects:
