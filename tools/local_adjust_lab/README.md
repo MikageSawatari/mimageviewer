@@ -32,7 +32,7 @@ the window.
   tool, and selected effect
 - Image navigation for testing large images:
   - Ctrl + mouse wheel: zoom around the pointer
-  - Mouse wheel: pan
+  - Mouse wheel: zoom around the pointer
   - Space + drag or middle-button drag: pan
   - Arrow keys: nudge selected manual-mask object
   - `[` / `]`: rotate selected manual-mask object

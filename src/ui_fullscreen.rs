@@ -49,6 +49,10 @@ fn should_handle_fullscreen_wheel(
     !modal_for_keys && (!in_video_tile || !ctrl_held) && (ctrl_held || !cursor_in_panel)
 }
 
+fn should_zoom_fullscreen_wheel(ctrl_held: bool, overlay_edit_mode: bool) -> bool {
+    ctrl_held || overlay_edit_mode
+}
+
 /// 中ボタンドラッグズーム: 縦 N px で倍率 2 倍/半分になる感度 (v0.8.1)。
 /// 100 px で 2 倍 (= 上へ 200 px で 4 倍)。ホイール 1 ノッチ ≈ 10% と比べて粗めだが、
 /// 縦フル (1080 px) ストロークすれば 2^10 ≈ 1000 倍まで届くので十分。
@@ -4105,8 +4109,11 @@ impl App {
                 // わる事故を避けるため、360 ON 時はホイール全部 (= 修飾キー無視) を
                 // FOV 操作に振る。前後ナビは矢印キーで行う。
             } else {
-                if ctrl_held {
-                    // 通常モード: Ctrl+ホイールでズーム
+                if should_zoom_fullscreen_wheel(ctrl_held, self.is_overlay_edit_mode_active()) {
+                    // 通常モード: Ctrl+ホイールでズーム。
+                    // 消しゴム / 隠蔽加工モード中は画像上の修飾なしホイールも
+                    // ズームへ割り当てる。パネル上は cursor_in_panel でここへ来ないため
+                    // パネルスクロールを維持できる。
                     let mouse = ctx.input(|i| i.pointer.hover_pos());
                     let changed = Self::apply_wheel_zoom(
                         &mut self.fs_zoom,
@@ -4118,9 +4125,7 @@ impl App {
                     if changed {
                         self.maybe_rerender_pdf(self.fs_zoom);
                     }
-                } else if !self.is_overlay_edit_mode_active() {
-                    // 消しゴム / 隠蔽加工モード中はホイールでのページ送りを無効化
-                    // (ペイント中の誤ナビを防ぐ)。
+                } else {
                     let base = if wheel_y < 0.0 { 1 } else { -1 };
                     nav_delta = self.spread_nav_delta(base, false);
                 }
@@ -9920,6 +9925,13 @@ mod tests {
         assert!(!should_handle_fullscreen_wheel(true, false, false, false));
         assert!(should_handle_fullscreen_wheel(false, false, false, false));
         assert!(!should_handle_fullscreen_wheel(false, false, true, true));
+    }
+
+    #[test]
+    fn fullscreen_wheel_zoom_includes_overlay_edit_modes() {
+        assert!(should_zoom_fullscreen_wheel(true, false));
+        assert!(should_zoom_fullscreen_wheel(false, true));
+        assert!(!should_zoom_fullscreen_wheel(false, false));
     }
 
     #[test]

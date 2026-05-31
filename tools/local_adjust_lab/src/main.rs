@@ -1898,7 +1898,7 @@ impl LocalAdjustLabApp {
         ui.add(
             egui::Label::new(
                 egui::RichText::new(
-                    "Space+ドラッグ/中ボタン:パン  Ctrl+ホイール:ズーム\n\
+                    "ホイール/Ctrl+ホイール:ズーム  Space+ドラッグ/中ボタン:パン\n\
                      Q:元画像  W:マスク表示\n\
                      境界筆[A]:境界で止めながら近い色を塗る  Ctrl中は境界表示+通常筆\n\
                      隙間補完[G]:細い未塗り部分を補完\n\
@@ -2916,13 +2916,12 @@ impl LocalAdjustLabApp {
             return false;
         }
 
-        let (hover_pos, interact_pos, scroll_delta, ctrl, space_held, middle_down, primary_down) =
-            ui.input(|i| {
+        let (hover_pos, interact_pos, scroll_delta, space_held, middle_down, primary_down) = ui
+            .input(|i| {
                 (
                     i.pointer.hover_pos(),
                     i.pointer.interact_pos(),
                     i.raw_scroll_delta,
-                    i.modifiers.ctrl,
                     i.key_down(Key::Space),
                     i.pointer.button_down(egui::PointerButton::Middle),
                     i.pointer.primary_down(),
@@ -2932,15 +2931,12 @@ impl LocalAdjustLabApp {
         if let Some(pos) = hover_pos
             && canvas_rect.contains(pos)
             && scroll_delta.length_sq() > 0.0
+            && scroll_delta.y.abs() > 0.0
         {
-            if ctrl && scroll_delta.y.abs() > 0.0 {
-                let old_zoom = self.view_zoom;
-                let factor = (scroll_delta.y / 240.0).exp();
-                let new_zoom = (old_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
-                self.zoom_around(canvas_rect, img_w, img_h, pos, new_zoom);
-            } else if !ctrl {
-                self.view_pan += scroll_delta;
-            }
+            let old_zoom = self.view_zoom;
+            let factor = (scroll_delta.y / 240.0).exp();
+            let new_zoom = (old_zoom * factor).clamp(ZOOM_MIN, ZOOM_MAX);
+            self.zoom_around(canvas_rect, img_w, img_h, pos, new_zoom);
         }
 
         let pan_requested = middle_down || (space_held && primary_down);
