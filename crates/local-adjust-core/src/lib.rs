@@ -388,6 +388,13 @@ pub enum LocalEffect {
     Blur(BlurParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
+    Look(LookParams),
+    Bloom(BloomParams),
+    Vignette(VignetteParams),
+    FilmGrain(FilmGrainParams),
+    ChromaticAberration(ChromaticAberrationParams),
+    Halftone(HalftoneParams),
+    EdgeSmooth(EdgeSmoothParams),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -481,6 +488,133 @@ impl Default for MosaicParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LookPreset {
+    Sunset,
+    Night,
+    BrightSun,
+    Pale,
+    Cool,
+    Warm,
+    RetroFilm,
+}
+
+impl Default for LookPreset {
+    fn default() -> Self {
+        Self::Sunset
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LookParams {
+    pub preset: LookPreset,
+    pub strength: f32,
+}
+
+impl Default for LookParams {
+    fn default() -> Self {
+        Self {
+            preset: LookPreset::Sunset,
+            strength: 0.65,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BloomParams {
+    pub threshold: f32,
+    pub radius_px: f32,
+    pub strength: f32,
+}
+
+impl Default for BloomParams {
+    fn default() -> Self {
+        Self {
+            threshold: 0.72,
+            radius_px: 18.0,
+            strength: 0.35,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VignetteParams {
+    /// Positive values darken the edge; negative values brighten it.
+    pub strength: f32,
+    pub radius: f32,
+    pub feather: f32,
+}
+
+impl Default for VignetteParams {
+    fn default() -> Self {
+        Self {
+            strength: 0.35,
+            radius: 0.52,
+            feather: 0.36,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FilmGrainParams {
+    pub amount: f32,
+    pub size_px: u32,
+    pub seed: u32,
+}
+
+impl Default for FilmGrainParams {
+    fn default() -> Self {
+        Self {
+            amount: 0.12,
+            size_px: 1,
+            seed: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChromaticAberrationParams {
+    pub offset_px: f32,
+}
+
+impl Default for ChromaticAberrationParams {
+    fn default() -> Self {
+        Self { offset_px: 2.0 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HalftoneParams {
+    pub cell_px: u32,
+    pub strength: f32,
+}
+
+impl Default for HalftoneParams {
+    fn default() -> Self {
+        Self {
+            cell_px: 8,
+            strength: 0.45,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EdgeSmoothParams {
+    pub radius_px: f32,
+    pub strength: f32,
+    pub edge_threshold: f32,
+}
+
+impl Default for EdgeSmoothParams {
+    fn default() -> Self {
+        Self {
+            radius_px: 3.0,
+            strength: 0.45,
+            edge_threshold: 28.0,
+        }
+    }
+}
+
 pub fn apply_layers(
     src: RgbaImageRef<'_>,
     layers: &[LocalAdjustmentLayer],
@@ -565,6 +699,26 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
             image.height,
             params.block_px.max(1) as usize,
         ),
+        LocalEffect::Look(params) => apply_look(&image.pixels, params),
+        LocalEffect::Bloom(params) => apply_bloom(&image.pixels, image.width, image.height, params),
+        LocalEffect::Vignette(params) => {
+            apply_vignette(&image.pixels, image.width, image.height, params)
+        }
+        LocalEffect::FilmGrain(params) => {
+            apply_film_grain(&image.pixels, image.width, image.height, params)
+        }
+        LocalEffect::ChromaticAberration(params) => apply_chromatic_aberration(
+            &image.pixels,
+            image.width,
+            image.height,
+            params.offset_px.clamp(0.0, 24.0),
+        ),
+        LocalEffect::Halftone(params) => {
+            apply_halftone(&image.pixels, image.width, image.height, params)
+        }
+        LocalEffect::EdgeSmooth(params) => {
+            apply_edge_smooth(&image.pixels, image.width, image.height, params)
+        }
     };
     blend_rgb_with_mask(&mut image.pixels, &effected, &mask);
     Ok(())
@@ -1161,6 +1315,314 @@ fn apply_mosaic(src: &[u8], width: usize, height: usize, block: usize) -> Vec<u8
     out
 }
 
+fn apply_look(src: &[u8], params: LookParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let r = px[0] as f32 / 255.0;
+        let g = px[1] as f32 / 255.0;
+        let b = px[2] as f32 / 255.0;
+        let graded = look_rgb([r, g, b], params.preset);
+        px[0] = to_u8(lerp_f32(r, graded[0], strength));
+        px[1] = to_u8(lerp_f32(g, graded[1], strength));
+        px[2] = to_u8(lerp_f32(b, graded[2], strength));
+    }
+    out
+}
+
+fn look_rgb(rgb: [f32; 3], preset: LookPreset) -> [f32; 3] {
+    let [mut r, mut g, mut b] = rgb;
+    let luma = luma01(r, g, b);
+    match preset {
+        LookPreset::Sunset => {
+            r = (r + 0.12 + luma * 0.08).clamp(0.0, 1.0);
+            g = (g + 0.04).clamp(0.0, 1.0);
+            b = (b - 0.10 * (1.0 - luma)).clamp(0.0, 1.0);
+            adjust_saturation([r, g, b], 1.10)
+        }
+        LookPreset::Night => {
+            r = (r * 0.72).clamp(0.0, 1.0);
+            g = (g * 0.86 + 0.02).clamp(0.0, 1.0);
+            b = (b * 1.12 + 0.05).clamp(0.0, 1.0);
+            adjust_saturation([r, g, b], 0.92)
+        }
+        LookPreset::BrightSun => {
+            r = (r * 1.08 + 0.06).clamp(0.0, 1.0);
+            g = (g * 1.06 + 0.05).clamp(0.0, 1.0);
+            b = (b * 0.98 + 0.02).clamp(0.0, 1.0);
+            adjust_saturation([r, g, b], 1.08)
+        }
+        LookPreset::Pale => {
+            r = (r + 0.05).clamp(0.0, 1.0);
+            g = (g + 0.05).clamp(0.0, 1.0);
+            b = (b + 0.06).clamp(0.0, 1.0);
+            adjust_saturation([r, g, b], 0.78)
+        }
+        LookPreset::Cool => {
+            r = (r * 0.92).clamp(0.0, 1.0);
+            g = (g * 1.01 + 0.01).clamp(0.0, 1.0);
+            b = (b * 1.10 + 0.04).clamp(0.0, 1.0);
+            adjust_saturation([r, g, b], 0.98)
+        }
+        LookPreset::Warm => {
+            r = (r * 1.10 + 0.05).clamp(0.0, 1.0);
+            g = (g * 1.03 + 0.02).clamp(0.0, 1.0);
+            b = (b * 0.90).clamp(0.0, 1.0);
+            adjust_saturation([r, g, b], 1.03)
+        }
+        LookPreset::RetroFilm => {
+            let contrast = 0.88;
+            r = ((r - 0.5) * contrast + 0.55).clamp(0.0, 1.0);
+            g = ((g - 0.5) * contrast + 0.51).clamp(0.0, 1.0);
+            b = ((b - 0.5) * contrast + 0.44).clamp(0.0, 1.0);
+            adjust_saturation([r, g, b], 0.86)
+        }
+    }
+}
+
+fn adjust_saturation(rgb: [f32; 3], scale: f32) -> [f32; 3] {
+    let luma = luma01(rgb[0], rgb[1], rgb[2]);
+    [
+        (luma + (rgb[0] - luma) * scale).clamp(0.0, 1.0),
+        (luma + (rgb[1] - luma) * scale).clamp(0.0, 1.0),
+        (luma + (rgb[2] - luma) * scale).clamp(0.0, 1.0),
+    ]
+}
+
+fn apply_bloom(src: &[u8], width: usize, height: usize, params: BloomParams) -> Vec<u8> {
+    let radius = params.radius_px.round().clamp(0.0, 120.0) as usize;
+    let strength = params.strength.clamp(0.0, 2.0);
+    if radius == 0 || strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let threshold = params.threshold.clamp(0.0, 0.99);
+    let inv_range = 1.0 / (1.0 - threshold).max(0.001);
+    let mut bright = vec![0_u8; src.len()];
+    for i in (0..src.len()).step_by(4) {
+        let r = src[i] as f32 / 255.0;
+        let g = src[i + 1] as f32 / 255.0;
+        let b = src[i + 2] as f32 / 255.0;
+        let weight = ((luma01(r, g, b) - threshold) * inv_range).clamp(0.0, 1.0);
+        bright[i] = to_u8(r * weight);
+        bright[i + 1] = to_u8(g * weight);
+        bright[i + 2] = to_u8(b * weight);
+        bright[i + 3] = src[i + 3];
+    }
+    let glow = box_blur_rgba(&bright, width, height, radius);
+    let mut out = src.to_vec();
+    for i in (0..src.len()).step_by(4) {
+        for c in 0..3 {
+            let base = src[i + c] as f32 / 255.0;
+            let add = glow[i + c] as f32 / 255.0 * strength;
+            out[i + c] = to_u8(base + add);
+        }
+    }
+    out
+}
+
+fn apply_vignette(src: &[u8], width: usize, height: usize, params: VignetteParams) -> Vec<u8> {
+    let strength = params.strength.clamp(-1.0, 1.0);
+    if strength.abs() <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let radius = params.radius.clamp(0.0, 1.0);
+    let feather = params.feather.clamp(0.001, 1.0);
+    let cx = (width.saturating_sub(1)) as f32 * 0.5;
+    let cy = (height.saturating_sub(1)) as f32 * 0.5;
+    let max_dist = (cx * cx + cy * cy).sqrt().max(1.0);
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let d = ((dx * dx + dy * dy).sqrt() / max_dist).clamp(0.0, 1.0);
+            let amount = smoothstep(radius, (radius + feather).min(1.0), d);
+            let i = (y * width + x) * 4;
+            for c in 0..3 {
+                let base = src[i + c] as f32 / 255.0;
+                let target = if strength >= 0.0 {
+                    base * (1.0 - strength * amount)
+                } else {
+                    base + (1.0 - base) * (-strength) * amount
+                };
+                out[i + c] = to_u8(target);
+            }
+        }
+    }
+    out
+}
+
+fn apply_film_grain(src: &[u8], width: usize, height: usize, params: FilmGrainParams) -> Vec<u8> {
+    let amount = params.amount.clamp(0.0, 1.0);
+    if amount <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let grain_size = params.size_px.max(1) as usize;
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let noise = signed_noise(
+                (x / grain_size) as u32,
+                (y / grain_size) as u32,
+                params.seed,
+            );
+            let i = (y * width + x) * 4;
+            let luma = luma01(
+                src[i] as f32 / 255.0,
+                src[i + 1] as f32 / 255.0,
+                src[i + 2] as f32 / 255.0,
+            );
+            let delta = noise * amount * (0.14 + (1.0 - luma) * 0.08);
+            for c in 0..3 {
+                out[i + c] = to_u8(src[i + c] as f32 / 255.0 + delta);
+            }
+        }
+    }
+    out
+}
+
+fn apply_chromatic_aberration(src: &[u8], width: usize, height: usize, offset_px: f32) -> Vec<u8> {
+    if offset_px <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let cx = (width.saturating_sub(1)) as f32 * 0.5;
+    let cy = (height.saturating_sub(1)) as f32 * 0.5;
+    let max_axis = cx.max(cy).max(1.0);
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let nx = (x as f32 - cx) / max_axis;
+            let ny = (y as f32 - cy) / max_axis;
+            let distance = (nx * nx + ny * ny).sqrt().clamp(0.0, 1.0);
+            let shift_x = nx * offset_px * distance;
+            let shift_y = ny * offset_px * distance;
+            let i = (y * width + x) * 4;
+            out[i] = sample_channel_nearest(
+                src,
+                width,
+                height,
+                x as f32 + shift_x,
+                y as f32 + shift_y,
+                0,
+            );
+            out[i + 1] = src[i + 1];
+            out[i + 2] = sample_channel_nearest(
+                src,
+                width,
+                height,
+                x as f32 - shift_x,
+                y as f32 - shift_y,
+                2,
+            );
+        }
+    }
+    out
+}
+
+fn apply_halftone(src: &[u8], width: usize, height: usize, params: HalftoneParams) -> Vec<u8> {
+    let cell = params.cell_px.clamp(2, 96) as usize;
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let mut out = src.to_vec();
+    for y0 in (0..height).step_by(cell) {
+        for x0 in (0..width).step_by(cell) {
+            let x1 = (x0 + cell).min(width);
+            let y1 = (y0 + cell).min(height);
+            let mut sum_luma = 0.0;
+            let mut count = 0.0;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = (y * width + x) * 4;
+                    sum_luma += luma01(
+                        src[i] as f32 / 255.0,
+                        src[i + 1] as f32 / 255.0,
+                        src[i + 2] as f32 / 255.0,
+                    );
+                    count += 1.0;
+                }
+            }
+            let avg_luma = if count > 0.0 { sum_luma / count } else { 1.0 };
+            let cx = x0 as f32 + (x1 - x0) as f32 * 0.5;
+            let cy = y0 as f32 + (y1 - y0) as f32 * 0.5;
+            let max_radius = (x1 - x0).min(y1 - y0) as f32 * 0.58;
+            let dot_radius = (1.0 - avg_luma).sqrt() * max_radius;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let dx = x as f32 + 0.5 - cx;
+                    let dy = y as f32 + 0.5 - cy;
+                    let inside_dot = (dx * dx + dy * dy).sqrt() <= dot_radius;
+                    let i = (y * width + x) * 4;
+                    for c in 0..3 {
+                        let base = src[i + c] as f32 / 255.0;
+                        let target = if inside_dot {
+                            base * 0.42
+                        } else {
+                            (base + 0.08).clamp(0.0, 1.0)
+                        };
+                        out[i + c] = to_u8(lerp_f32(base, target, strength));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn apply_edge_smooth(src: &[u8], width: usize, height: usize, params: EdgeSmoothParams) -> Vec<u8> {
+    let radius = params.radius_px.round().clamp(0.0, 8.0) as i32;
+    let strength = params.strength.clamp(0.0, 1.0);
+    if radius == 0 || strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let threshold = params.edge_threshold.clamp(1.0, 255.0);
+    let threshold_sq = threshold * threshold * 3.0;
+    let radius_sq = (radius * radius) as i32;
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let center = [src[i] as f32, src[i + 1] as f32, src[i + 2] as f32];
+            let mut sum = [0.0_f32; 3];
+            let mut count = 0.0_f32;
+            for dy in -radius..=radius {
+                for dx in -radius..=radius {
+                    if dx * dx + dy * dy > radius_sq {
+                        continue;
+                    }
+                    let xx = (x as i32 + dx).clamp(0, width as i32 - 1) as usize;
+                    let yy = (y as i32 + dy).clamp(0, height as i32 - 1) as usize;
+                    let j = (yy * width + xx) * 4;
+                    let dr = src[j] as f32 - center[0];
+                    let dg = src[j + 1] as f32 - center[1];
+                    let db = src[j + 2] as f32 - center[2];
+                    if dr * dr + dg * dg + db * db <= threshold_sq {
+                        sum[0] += src[j] as f32;
+                        sum[1] += src[j + 1] as f32;
+                        sum[2] += src[j + 2] as f32;
+                        count += 1.0;
+                    }
+                }
+            }
+            if count > 0.0 {
+                for c in 0..3 {
+                    let smoothed = sum[c] / count;
+                    out[i + c] = lerp_u8(
+                        src[i + c],
+                        smoothed.round().clamp(0.0, 255.0) as u8,
+                        strength,
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
 fn blend_rgb_with_mask(base: &mut [u8], effected: &[u8], mask: &[f32]) {
     for (i, amount) in mask.iter().enumerate() {
         let o = i * 4;
@@ -1176,6 +1638,53 @@ fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
     (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0))
         .round()
         .clamp(0.0, 255.0) as u8
+}
+
+fn lerp_f32(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t.clamp(0.0, 1.0)
+}
+
+fn luma01(r: f32, g: f32, b: f32) -> f32 {
+    (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0)
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    if edge1 <= edge0 {
+        return if x >= edge1 { 1.0 } else { 0.0 };
+    }
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn signed_noise(x: u32, y: u32, seed: u32) -> f32 {
+    let h = hash_u32(
+        seed ^ x.wrapping_mul(0x9E37_79B1)
+            ^ y.wrapping_mul(0x85EB_CA77)
+            ^ x.rotate_left(13)
+            ^ y.rotate_right(7),
+    );
+    h as f32 / u32::MAX as f32 * 2.0 - 1.0
+}
+
+fn hash_u32(mut v: u32) -> u32 {
+    v ^= v >> 16;
+    v = v.wrapping_mul(0x7FEB_352D);
+    v ^= v >> 15;
+    v = v.wrapping_mul(0x846C_A68B);
+    v ^ (v >> 16)
+}
+
+fn sample_channel_nearest(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    x: f32,
+    y: f32,
+    channel: usize,
+) -> u8 {
+    let xx = x.round().clamp(0.0, width.saturating_sub(1) as f32) as usize;
+    let yy = y.round().clamp(0.0, height.saturating_sub(1) as f32) as usize;
+    src[(yy * width + xx) * 4 + channel.min(3)]
 }
 
 #[cfg(test)]
@@ -1384,5 +1893,127 @@ mod tests {
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn look_changes_color_when_strength_is_nonzero() {
+        let src = solid(1, 1, [90, 100, 120, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "look",
+            LocalMask::Full,
+            LocalEffect::Look(LookParams {
+                preset: LookPreset::Sunset,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_ne!(&out.pixels[0..3], &src.pixels[0..3]);
+        assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn bloom_lifts_neighbor_of_bright_pixel() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 20, 20, 255, 255, 255, 255, 255, 20, 20, 20, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "bloom",
+            LocalMask::Full,
+            LocalEffect::Bloom(BloomParams {
+                threshold: 0.7,
+                radius_px: 1.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn vignette_darkens_edge_more_than_center() {
+        let src = solid(5, 5, [180, 180, 180, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "vignette",
+            LocalMask::Full,
+            LocalEffect::Vignette(VignetteParams {
+                strength: 0.6,
+                radius: 0.0,
+                feather: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        let center = out.pixels[(2 * 5 + 2) * 4];
+        let corner = out.pixels[0];
+        assert!(center > corner);
+    }
+
+    #[test]
+    fn film_grain_is_deterministic() {
+        let src = solid(4, 4, [128, 128, 128, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "grain",
+            LocalMask::Full,
+            LocalEffect::FilmGrain(FilmGrainParams {
+                amount: 0.5,
+                size_px: 1,
+                seed: 42,
+            }),
+        );
+        let out1 = apply_layers(src.as_ref(), &[layer.clone()]).unwrap();
+        let out2 = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out1.pixels, out2.pixels);
+        assert_ne!(out1.pixels, src.pixels);
+    }
+
+    #[test]
+    fn chromatic_aberration_preserves_alpha() {
+        let src =
+            RgbaImageBuf::new(3, 1, vec![255, 0, 0, 201, 0, 255, 0, 202, 0, 0, 255, 203]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "aberration",
+            LocalMask::Full,
+            LocalEffect::ChromaticAberration(ChromaticAberrationParams { offset_px: 2.0 }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels[3], 201);
+        assert_eq!(out.pixels[7], 202);
+        assert_eq!(out.pixels[11], 203);
+    }
+
+    #[test]
+    fn halftone_changes_flat_mid_gray() {
+        let src = solid(6, 6, [128, 128, 128, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "halftone",
+            LocalMask::Full,
+            LocalEffect::Halftone(HalftoneParams {
+                cell_px: 3,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_ne!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn edge_smooth_preserves_hard_separated_regions() {
+        let src =
+            RgbaImageBuf::new(3, 1, vec![0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "edge",
+            LocalMask::Full,
+            LocalEffect::EdgeSmooth(EdgeSmoothParams {
+                radius_px: 1.0,
+                strength: 1.0,
+                edge_threshold: 20.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels[0], 0);
+        assert_eq!(out.pixels[8], 255);
     }
 }

@@ -9,10 +9,12 @@ use eframe::egui::{
 };
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
-    BlurParams, ClarityParams, ColorRangeMask, HighlightsShadowsParams, LineKind,
-    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, MaskShape, MosaicParams,
-    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbaImageBuf,
-    RgbaImageRef, ShapeOp, SoftFocusParams, ToneParams, apply_layers, evaluate_layer_mask,
+    BloomParams, BlurParams, ChromaticAberrationParams, ClarityParams, ColorRangeMask,
+    EdgeSmoothParams, FilmGrainParams, HalftoneParams, HighlightsShadowsParams, LineKind,
+    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
+    MaskShape, MosaicParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
+    RegionMask, RgbaImageBuf, RgbaImageRef, ShapeOp, SoftFocusParams, ToneParams, VignetteParams,
+    apply_layers, evaluate_layer_mask,
 };
 
 const PANEL_W: f32 = 340.0;
@@ -341,6 +343,13 @@ enum EffectKind {
     Blur,
     SoftFocus,
     Mosaic,
+    Look,
+    Bloom,
+    Vignette,
+    FilmGrain,
+    ChromaticAberration,
+    Halftone,
+    EdgeSmooth,
 }
 
 impl EffectKind {
@@ -353,6 +362,13 @@ impl EffectKind {
             LocalEffect::Blur(_) => Self::Blur,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
+            LocalEffect::Look(_) => Self::Look,
+            LocalEffect::Bloom(_) => Self::Bloom,
+            LocalEffect::Vignette(_) => Self::Vignette,
+            LocalEffect::FilmGrain(_) => Self::FilmGrain,
+            LocalEffect::ChromaticAberration(_) => Self::ChromaticAberration,
+            LocalEffect::Halftone(_) => Self::Halftone,
+            LocalEffect::EdgeSmooth(_) => Self::EdgeSmooth,
         }
     }
 
@@ -365,6 +381,13 @@ impl EffectKind {
             Self::Blur => "ぼかし",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
+            Self::Look => "ルック",
+            Self::Bloom => "ブルーム",
+            Self::Vignette => "ビネット",
+            Self::FilmGrain => "フィルム粒子",
+            Self::ChromaticAberration => "色収差",
+            Self::Halftone => "ハーフトーン",
+            Self::EdgeSmooth => "エッジ保持ぼかし",
         }
     }
 }
@@ -4251,6 +4274,29 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::Blur(params) => format!("ぼかし {:.0}px", params.radius_px),
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!("モザイク {}px", params.block_px),
+        LocalEffect::Look(params) => format!("ルック {}", look_preset_label(params.preset)),
+        LocalEffect::Bloom(params) => format!("ブルーム {:.0}px", params.radius_px),
+        LocalEffect::Vignette(params) => format!("ビネット {:.0}%", params.strength * 100.0),
+        LocalEffect::FilmGrain(params) => format!("粒子 {:.0}%", params.amount * 100.0),
+        LocalEffect::ChromaticAberration(params) => {
+            format!("色収差 {:.1}px", params.offset_px)
+        }
+        LocalEffect::Halftone(params) => format!("ハーフトーン {}px", params.cell_px),
+        LocalEffect::EdgeSmooth(params) => {
+            format!("エッジ保持ぼかし {:.0}px", params.radius_px)
+        }
+    }
+}
+
+fn look_preset_label(preset: LookPreset) -> &'static str {
+    match preset {
+        LookPreset::Sunset => "夕焼け",
+        LookPreset::Night => "夜景",
+        LookPreset::BrightSun => "明るい日光",
+        LookPreset::Pale => "淡色",
+        LookPreset::Cool => "寒色",
+        LookPreset::Warm => "暖色",
+        LookPreset::RetroFilm => "レトロ/フィルム",
     }
 }
 
@@ -4284,6 +4330,13 @@ fn draw_effect_kind_selector(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer
                 EffectKind::Blur,
                 EffectKind::SoftFocus,
                 EffectKind::Mosaic,
+                EffectKind::Look,
+                EffectKind::Bloom,
+                EffectKind::Vignette,
+                EffectKind::FilmGrain,
+                EffectKind::ChromaticAberration,
+                EffectKind::Halftone,
+                EffectKind::EdgeSmooth,
             ] {
                 ui.selectable_value(&mut kind, candidate, candidate.label());
             }
@@ -4359,6 +4412,93 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                 .add(egui::Slider::new(&mut block, 1..=96).text("タイル(px)"))
                 .changed();
             params.block_px = block.max(1) as u32;
+        }
+        LocalEffect::Look(params) => {
+            let before = params.preset;
+            ComboBox::from_id_salt("look_preset")
+                .selected_text(look_preset_label(params.preset))
+                .show_ui(ui, |ui| {
+                    for preset in [
+                        LookPreset::Sunset,
+                        LookPreset::Night,
+                        LookPreset::BrightSun,
+                        LookPreset::Pale,
+                        LookPreset::Cool,
+                        LookPreset::Warm,
+                        LookPreset::RetroFilm,
+                    ] {
+                        ui.selectable_value(&mut params.preset, preset, look_preset_label(preset));
+                    }
+                });
+            changed |= params.preset != before;
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
+                .changed();
+        }
+        LocalEffect::Bloom(params) => {
+            changed |= ui
+                .add(egui::Slider::new(&mut params.threshold, 0.0..=0.98).text("明部しきい値"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.radius_px, 0.0..=120.0).text("半径"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=2.0).text("強さ"))
+                .changed();
+        }
+        LocalEffect::Vignette(params) => {
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, -1.0..=1.0).text("強さ"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.radius, 0.0..=1.0).text("開始半径"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.feather, 0.01..=1.0).text("ぼかし幅"))
+                .changed();
+        }
+        LocalEffect::FilmGrain(params) => {
+            changed |= ui
+                .add(egui::Slider::new(&mut params.amount, 0.0..=1.0).text("量"))
+                .changed();
+            let mut size = params.size_px as i32;
+            changed |= ui
+                .add(egui::Slider::new(&mut size, 1..=12).text("粒サイズ(px)"))
+                .changed();
+            params.size_px = size.max(1) as u32;
+            let mut seed = params.seed as i32;
+            changed |= ui
+                .add(egui::Slider::new(&mut seed, 0..=9999).text("seed"))
+                .changed();
+            params.seed = seed.max(0) as u32;
+        }
+        LocalEffect::ChromaticAberration(params) => {
+            changed |= ui
+                .add(egui::Slider::new(&mut params.offset_px, 0.0..=24.0).text("ずれ(px)"))
+                .changed();
+        }
+        LocalEffect::Halftone(params) => {
+            let mut cell = params.cell_px as i32;
+            changed |= ui
+                .add(egui::Slider::new(&mut cell, 2..=96).text("セル(px)"))
+                .changed();
+            params.cell_px = cell.max(2) as u32;
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
+                .changed();
+        }
+        LocalEffect::EdgeSmooth(params) => {
+            changed |= ui
+                .add(egui::Slider::new(&mut params.radius_px, 0.0..=8.0).text("半径"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"))
+                .changed();
+            changed |= ui
+                .add(
+                    egui::Slider::new(&mut params.edge_threshold, 1.0..=120.0).text("境界しきい値"),
+                )
+                .changed();
         }
     }
     changed
@@ -5559,6 +5699,15 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Blur => LocalEffect::Blur(BlurParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
+        EffectKind::Look => LocalEffect::Look(LookParams::default()),
+        EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
+        EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
+        EffectKind::FilmGrain => LocalEffect::FilmGrain(FilmGrainParams::default()),
+        EffectKind::ChromaticAberration => {
+            LocalEffect::ChromaticAberration(ChromaticAberrationParams::default())
+        }
+        EffectKind::Halftone => LocalEffect::Halftone(HalftoneParams::default()),
+        EffectKind::EdgeSmooth => LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
     }
 }
 

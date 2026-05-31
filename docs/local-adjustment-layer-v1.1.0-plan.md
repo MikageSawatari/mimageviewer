@@ -634,6 +634,11 @@ conceal source:
 推奨順は Look / LUT、Bloom、ビネット、フィルム粒子、色収差、ハーフトーン、
 エッジ保持ぼかし。
 
+プロトタイプでは `local-adjust-core` と `local_adjust_lab` に、内蔵 Look、Bloom、
+ビネット、フィルム粒子、色収差、ハーフトーン、エッジ保持ぼかしを追加済み。
+Orton / Soft Glow は既存の Soft Focus と Bloom の組み合わせで検証し、必要なら
+専用パラメータとして分離する。
+
 ### Phase 4: セグメンテーション生成マスクの検証
 
 - 追加ダウンロード方式のモデル管理を設計する。
@@ -822,7 +827,9 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   被写体選択マスクがある場合は、被写体内だけを領域分割できる。
   境界線などで未所属になった内部ピクセルは近い領域へ割り当て、隣接領域を複数選んだときに
   マスクの隙間が残りにくいようにする
-- 効果: Tone / Clarity / Highlights-Shadows / Blur / Soft Focus / Mosaic
+- 効果: Tone / Clarity / Highlights-Shadows / Blur / Soft Focus / Mosaic /
+  Look / Bloom / Vignette / Film Grain / Chromatic Aberration / Halftone /
+  Edge-preserving Smooth
 - `local_adjust_lab` 側で非同期再合成 + generation による古い結果破棄
 - 読み込み直後は部分補正レイヤーを作らず、未加工状態から開始する
 - レイヤー追加は効果種類を先に選ばせず、追加ダイアログで選んだマスク種類 + `効果なし` の

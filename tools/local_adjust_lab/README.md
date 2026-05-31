@@ -61,6 +61,13 @@ the window.
   - Blur
   - Soft focus
   - Mosaic
+  - Look presets
+  - Bloom
+  - Vignette
+  - Film grain
+  - Chromatic aberration
+  - Halftone
+  - Edge-preserving smooth
 - Async recomposition with generation discard
 - Manual-mask undo snapshots for layer operations, brush/lasso/object edits, and object deletion
 - Japanese system font registration so labels render correctly on Windows
