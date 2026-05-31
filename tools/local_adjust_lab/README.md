@@ -61,6 +61,8 @@ the window.
   - Blur
   - Soft focus
   - Mosaic
+  - Sharpen
+  - HSL / hue shift
   - Look presets
   - Bloom
   - Vignette
@@ -68,6 +70,9 @@ the window.
   - Chromatic aberration
   - Halftone
   - Edge-preserving smooth
+- Effect parameters start from near-identity values. Use the per-effect preset
+  buttons for practical starting points, or Reset to return the current effect
+  to its default values.
 - Async recomposition with generation discard
 - Manual-mask undo snapshots for layer operations, brush/lasso/object edits, and object deletion
 - Japanese system font registration so labels render correctly on Windows

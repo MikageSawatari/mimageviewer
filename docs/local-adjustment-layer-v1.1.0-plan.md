@@ -827,9 +827,12 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   被写体選択マスクがある場合は、被写体内だけを領域分割できる。
   境界線などで未所属になった内部ピクセルは近い領域へ割り当て、隣接領域を複数選んだときに
   マスクの隙間が残りにくいようにする
-- 効果: Tone / Clarity / Highlights-Shadows / Blur / Soft Focus / Mosaic /
-  Look / Bloom / Vignette / Film Grain / Chromatic Aberration / Halftone /
-  Edge-preserving Smooth
+- 効果: Tone (自然な彩度を含む) / Clarity / Highlights-Shadows / Blur / Soft Focus /
+  Mosaic / Sharpen / HSL / Look / Bloom / Vignette / Film Grain /
+  Chromatic Aberration / Halftone / Edge-preserving Smooth
+- 加工内容のプルダウンは候補が増えたため縦サイズを広めにし、各効果は選択直後に
+  なるべく無加工になる default とする。実用値は「プリセット」ボタンで投入し、
+  「リセット」で default に戻す
 - `local_adjust_lab` 側で非同期再合成 + generation による古い結果破棄
 - 読み込み直後は部分補正レイヤーを作らず、未加工状態から開始する
 - レイヤー追加は効果種類を先に選ばせず、追加ダイアログで選んだマスク種類 + `効果なし` の

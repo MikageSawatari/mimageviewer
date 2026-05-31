@@ -10,11 +10,11 @@ use eframe::egui::{
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     BloomParams, BlurParams, ChromaticAberrationParams, ClarityParams, ColorRangeMask,
-    EdgeSmoothParams, FilmGrainParams, HalftoneParams, HighlightsShadowsParams, LineKind,
-    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
-    MaskShape, MosaicParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
-    RegionMask, RgbaImageBuf, RgbaImageRef, ShapeOp, SoftFocusParams, ToneParams, VignetteParams,
-    apply_layers, evaluate_layer_mask,
+    EdgeSmoothParams, FilmGrainParams, HalftoneParams, HighlightsShadowsParams, HslParams,
+    LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams,
+    LookPreset, MaskShape, MosaicParams, RadialGradientMask, RangeMask, RasterMask,
+    RasterVectorMask, RegionMask, RgbaImageBuf, RgbaImageRef, ShapeOp, SharpenParams,
+    SoftFocusParams, ToneParams, VignetteParams, apply_layers, evaluate_layer_mask,
 };
 
 const PANEL_W: f32 = 340.0;
@@ -129,6 +129,7 @@ fn lab_combo_box<R>(
 ) -> egui::InnerResponse<Option<R>> {
     ComboBox::from_id_salt(id_salt)
         .selected_text(selected_text)
+        .height(420.0)
         .show_ui(ui, |ui| {
             apply_lab_dark_ui(ui);
             add_contents(ui)
@@ -385,6 +386,8 @@ enum EffectKind {
     Blur,
     SoftFocus,
     Mosaic,
+    Sharpen,
+    Hsl,
     Look,
     Bloom,
     Vignette,
@@ -404,6 +407,8 @@ impl EffectKind {
             LocalEffect::Blur(_) => Self::Blur,
             LocalEffect::SoftFocus(_) => Self::SoftFocus,
             LocalEffect::Mosaic(_) => Self::Mosaic,
+            LocalEffect::Sharpen(_) => Self::Sharpen,
+            LocalEffect::Hsl(_) => Self::Hsl,
             LocalEffect::Look(_) => Self::Look,
             LocalEffect::Bloom(_) => Self::Bloom,
             LocalEffect::Vignette(_) => Self::Vignette,
@@ -423,6 +428,8 @@ impl EffectKind {
             Self::Blur => "ぼかし",
             Self::SoftFocus => "ソフトフォーカス",
             Self::Mosaic => "モザイク",
+            Self::Sharpen => "シャープ",
+            Self::Hsl => "色相/HSL",
             Self::Look => "ルック",
             Self::Bloom => "ブルーム",
             Self::Vignette => "ビネット",
@@ -4308,6 +4315,8 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::Blur(params) => format!("ぼかし {:.0}px", params.radius_px),
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
         LocalEffect::Mosaic(params) => format!("モザイク {}px", params.block_px),
+        LocalEffect::Sharpen(params) => format!("シャープ {:.0}%", params.amount * 100.0),
+        LocalEffect::Hsl(params) => format!("色相 {:+.0}°", params.hue_degrees),
         LocalEffect::Look(params) => format!("ルック {}", look_preset_label(params.preset)),
         LocalEffect::Bloom(params) => format!("ブルーム {:.0}px", params.radius_px),
         LocalEffect::Vignette(params) => format!("ビネット {:.0}%", params.strength * 100.0),
@@ -4331,6 +4340,14 @@ fn look_preset_label(preset: LookPreset) -> &'static str {
         LookPreset::Cool => "寒色",
         LookPreset::Warm => "暖色",
         LookPreset::RetroFilm => "レトロ/フィルム",
+        LookPreset::TealOrange => "ティール&オレンジ",
+        LookPreset::CherryBlossom => "桜色",
+        LookPreset::FreshGreen => "新緑",
+        LookPreset::Moonlight => "月明かり",
+        LookPreset::HighKey => "ハイキー",
+        LookPreset::LowKey => "ローキー",
+        LookPreset::Sepia => "セピア",
+        LookPreset::Cyberpunk => "サイバーパンク",
     }
 }
 
@@ -4362,6 +4379,8 @@ fn draw_effect_kind_selector(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer
             EffectKind::Blur,
             EffectKind::SoftFocus,
             EffectKind::Mosaic,
+            EffectKind::Sharpen,
+            EffectKind::Hsl,
             EffectKind::Look,
             EffectKind::Bloom,
             EffectKind::Vignette,
@@ -4380,19 +4399,77 @@ fn draw_effect_kind_selector(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer
     changed
 }
 
+fn preset_button(ui: &mut egui::Ui, label: &str) -> bool {
+    ui.add(egui::Button::new(label).small()).clicked()
+}
+
 fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bool {
     let mut changed = false;
-    ui.label(
-        egui::RichText::new("加工パラメータ")
-            .size(14.0)
-            .strong()
-            .color(Color32::WHITE),
-    );
+    let effect_kind = EffectKind::from_effect(&layer.effect);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("加工パラメータ")
+                .size(14.0)
+                .strong()
+                .color(Color32::WHITE),
+        );
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.button("リセット").clicked() {
+                layer.effect = default_effect(effect_kind);
+                changed = true;
+            }
+        });
+    });
+    if changed {
+        return true;
+    }
     match &mut layer.effect {
         LocalEffect::None => {
             ui.label("加工内容を選ぶと、このレイヤーの効果が有効になります。");
         }
         LocalEffect::Tone(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "明るく") {
+                    *params = ToneParams {
+                        brightness: 12.0,
+                        contrast: 4.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "鮮やか") {
+                    *params = ToneParams {
+                        saturation: 18.0,
+                        vibrance: 32.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "自然な彩度+") {
+                    *params = ToneParams {
+                        vibrance: 45.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "柔らかく") {
+                    *params = ToneParams {
+                        contrast: -10.0,
+                        vibrance: 12.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "暖かく") {
+                    *params = ToneParams {
+                        temperature: 35.0,
+                        vibrance: 12.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+            });
             changed |= ui
                 .add(egui::Slider::new(&mut params.brightness, -100.0..=100.0).text("明るさ"))
                 .changed();
@@ -4406,10 +4483,30 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                 .add(egui::Slider::new(&mut params.saturation, -100.0..=100.0).text("彩度"))
                 .changed();
             changed |= ui
+                .add(egui::Slider::new(&mut params.vibrance, -100.0..=100.0).text("自然な彩度"))
+                .changed();
+            changed |= ui
                 .add(egui::Slider::new(&mut params.temperature, -100.0..=100.0).text("色温度"))
                 .changed();
         }
         LocalEffect::Clarity(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "くっきり") {
+                    *params = ClarityParams {
+                        amount: 0.35,
+                        radius_px: 18.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "柔らかく") {
+                    *params = ClarityParams {
+                        amount: -0.35,
+                        radius_px: 20.0,
+                    };
+                    changed = true;
+                }
+            });
             changed |= ui
                 .add(egui::Slider::new(&mut params.amount, -1.0..=1.0).text("量"))
                 .changed();
@@ -4418,6 +4515,37 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                 .changed();
         }
         LocalEffect::HighlightsShadows(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "シャドウを強調") {
+                    *params = HighlightsShadowsParams {
+                        shadows: -35.0,
+                        highlights: 0.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "シャドウを明るく") {
+                    *params = HighlightsShadowsParams {
+                        shadows: 45.0,
+                        highlights: 0.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ハイライトを強調") {
+                    *params = HighlightsShadowsParams {
+                        shadows: 0.0,
+                        highlights: -30.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ハイライトを暗く") {
+                    *params = HighlightsShadowsParams {
+                        shadows: 0.0,
+                        highlights: 35.0,
+                    };
+                    changed = true;
+                }
+            });
             changed |= ui
                 .add(egui::Slider::new(&mut params.shadows, -100.0..=100.0).text("シャドウ"))
                 .changed();
@@ -4426,11 +4554,43 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                 .changed();
         }
         LocalEffect::Blur(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "弱く") {
+                    params.radius_px = 6.0;
+                    changed = true;
+                }
+                if preset_button(ui, "背景ぼかし") {
+                    params.radius_px = 18.0;
+                    changed = true;
+                }
+                if preset_button(ui, "強く") {
+                    params.radius_px = 40.0;
+                    changed = true;
+                }
+            });
             changed |= ui
                 .add(egui::Slider::new(&mut params.radius_px, 0.0..=80.0).text("半径"))
                 .changed();
         }
         LocalEffect::SoftFocus(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "淡く") {
+                    *params = SoftFocusParams {
+                        radius_px: 16.0,
+                        strength: 0.25,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "発光") {
+                    *params = SoftFocusParams {
+                        radius_px: 28.0,
+                        strength: 0.45,
+                    };
+                    changed = true;
+                }
+            });
             changed |= ui
                 .add(egui::Slider::new(&mut params.radius_px, 0.0..=80.0).text("半径"))
                 .changed();
@@ -4439,13 +4599,149 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                 .changed();
         }
         LocalEffect::Mosaic(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "8px") {
+                    params.block_px = 8;
+                    changed = true;
+                }
+                if preset_button(ui, "12px") {
+                    params.block_px = 12;
+                    changed = true;
+                }
+                if preset_button(ui, "24px") {
+                    params.block_px = 24;
+                    changed = true;
+                }
+            });
             let mut block = params.block_px as i32;
             changed |= ui
                 .add(egui::Slider::new(&mut block, 1..=96).text("タイル(px)"))
                 .changed();
             params.block_px = block.max(1) as u32;
         }
+        LocalEffect::Sharpen(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "弱く") {
+                    *params = SharpenParams {
+                        amount: 0.35,
+                        radius_px: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "くっきり") {
+                    *params = SharpenParams {
+                        amount: 0.7,
+                        radius_px: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "線強調") {
+                    *params = SharpenParams {
+                        amount: 0.55,
+                        radius_px: 2.0,
+                    };
+                    changed = true;
+                }
+            });
+            changed |= ui
+                .add(egui::Slider::new(&mut params.amount, 0.0..=2.0).text("量"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.radius_px, 0.0..=8.0).text("半径"))
+                .changed();
+        }
+        LocalEffect::Hsl(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "赤へ") {
+                    *params = HslParams {
+                        hue_degrees: -25.0,
+                        saturation: 10.0,
+                        lightness: 0.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "青へ") {
+                    *params = HslParams {
+                        hue_degrees: 70.0,
+                        saturation: 8.0,
+                        lightness: 0.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "緑へ") {
+                    *params = HslParams {
+                        hue_degrees: 120.0,
+                        saturation: 8.0,
+                        lightness: 0.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "彩度+") {
+                    *params = HslParams {
+                        saturation: 25.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡く") {
+                    *params = HslParams {
+                        saturation: -25.0,
+                        lightness: 8.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new("カラー範囲マスクと組み合わせると、髪や服だけ色替えできます。")
+                    .size(10.0)
+                    .color(Color32::from_gray(170)),
+            );
+            changed |= ui
+                .add(egui::Slider::new(&mut params.hue_degrees, -180.0..=180.0).text("色相"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.saturation, -100.0..=100.0).text("彩度"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut params.lightness, -100.0..=100.0).text("明度"))
+                .changed();
+        }
         LocalEffect::Look(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "夕焼け") {
+                    *params = LookParams {
+                        preset: LookPreset::Sunset,
+                        strength: 0.7,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "夜景") {
+                    *params = LookParams {
+                        preset: LookPreset::Night,
+                        strength: 0.7,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "明るい日光") {
+                    *params = LookParams {
+                        preset: LookPreset::BrightSun,
+                        strength: 0.65,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡色") {
+                    *params = LookParams {
+                        preset: LookPreset::Pale,
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+            });
             let before = params.preset;
             lab_combo_box(ui, "look_preset", look_preset_label(params.preset), |ui| {
                 for preset in [
@@ -4456,6 +4752,14 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                     LookPreset::Cool,
                     LookPreset::Warm,
                     LookPreset::RetroFilm,
+                    LookPreset::TealOrange,
+                    LookPreset::CherryBlossom,
+                    LookPreset::FreshGreen,
+                    LookPreset::Moonlight,
+                    LookPreset::HighKey,
+                    LookPreset::LowKey,
+                    LookPreset::Sepia,
+                    LookPreset::Cyberpunk,
                 ] {
                     ui.selectable_value(&mut params.preset, preset, look_preset_label(preset));
                 }
@@ -4466,6 +4770,33 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                 .changed();
         }
         LocalEffect::Bloom(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "弱い光") {
+                    *params = BloomParams {
+                        threshold: 0.75,
+                        radius_px: 18.0,
+                        strength: 0.25,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "瞳/光源") {
+                    *params = BloomParams {
+                        threshold: 0.82,
+                        radius_px: 10.0,
+                        strength: 0.55,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強いにじみ") {
+                    *params = BloomParams {
+                        threshold: 0.65,
+                        radius_px: 32.0,
+                        strength: 0.65,
+                    };
+                    changed = true;
+                }
+            });
             changed |= ui
                 .add(egui::Slider::new(&mut params.threshold, 0.0..=0.98).text("明部しきい値"))
                 .changed();
@@ -4477,6 +4808,25 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                 .changed();
         }
         LocalEffect::Vignette(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "周辺を暗く") {
+                    *params = VignetteParams {
+                        strength: 0.35,
+                        radius: 0.52,
+                        feather: 0.36,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "周辺を明るく") {
+                    *params = VignetteParams {
+                        strength: -0.25,
+                        radius: 0.50,
+                        feather: 0.38,
+                    };
+                    changed = true;
+                }
+            });
             changed |= ui
                 .add(egui::Slider::new(&mut params.strength, -1.0..=1.0).text("強さ"))
                 .changed();
@@ -4488,6 +4838,25 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                 .changed();
         }
         LocalEffect::FilmGrain(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "微量") {
+                    *params = FilmGrainParams {
+                        amount: 0.08,
+                        size_px: 1,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "フィルム") {
+                    *params = FilmGrainParams {
+                        amount: 0.18,
+                        size_px: 2,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+            });
             changed |= ui
                 .add(egui::Slider::new(&mut params.amount, 0.0..=1.0).text("量"))
                 .changed();
@@ -4503,11 +4872,46 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
             params.seed = seed.max(0) as u32;
         }
         LocalEffect::ChromaticAberration(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "微量") {
+                    params.offset_px = 1.2;
+                    changed = true;
+                }
+                if preset_button(ui, "演出") {
+                    params.offset_px = 3.0;
+                    changed = true;
+                }
+            });
             changed |= ui
                 .add(egui::Slider::new(&mut params.offset_px, 0.0..=24.0).text("ずれ(px)"))
                 .changed();
         }
         LocalEffect::Halftone(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "細かい") {
+                    *params = HalftoneParams {
+                        cell_px: 6,
+                        strength: 0.35,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "漫画風") {
+                    *params = HalftoneParams {
+                        cell_px: 10,
+                        strength: 0.70,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "印刷網点風の演出です。背景や効果線、漫画調の質感付け向けです。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
             let mut cell = params.cell_px as i32;
             changed |= ui
                 .add(egui::Slider::new(&mut cell, 2..=96).text("セル(px)"))
@@ -4518,6 +4922,25 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                 .changed();
         }
         LocalEffect::EdgeSmooth(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "背景なじませ") {
+                    *params = EdgeSmoothParams {
+                        radius_px: 3.0,
+                        strength: 0.35,
+                        edge_threshold: 28.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強め") {
+                    *params = EdgeSmoothParams {
+                        radius_px: 5.0,
+                        strength: 0.55,
+                        edge_threshold: 45.0,
+                    };
+                    changed = true;
+                }
+            });
             changed |= ui
                 .add(egui::Slider::new(&mut params.radius_px, 0.0..=8.0).text("半径"))
                 .changed();
@@ -5716,12 +6139,7 @@ fn panel_toggle_button(
 fn default_effect(kind: EffectKind) -> LocalEffect {
     match kind {
         EffectKind::None => LocalEffect::None,
-        EffectKind::Tone => LocalEffect::Tone(ToneParams {
-            brightness: 10.0,
-            contrast: 8.0,
-            saturation: 0.0,
-            ..Default::default()
-        }),
+        EffectKind::Tone => LocalEffect::Tone(ToneParams::default()),
         EffectKind::Clarity => LocalEffect::Clarity(ClarityParams::default()),
         EffectKind::HighlightsShadows => {
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default())
@@ -5729,6 +6147,8 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Blur => LocalEffect::Blur(BlurParams::default()),
         EffectKind::SoftFocus => LocalEffect::SoftFocus(SoftFocusParams::default()),
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
+        EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
+        EffectKind::Hsl => LocalEffect::Hsl(HslParams::default()),
         EffectKind::Look => LocalEffect::Look(LookParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),

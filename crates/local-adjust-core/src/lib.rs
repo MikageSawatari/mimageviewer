@@ -388,6 +388,8 @@ pub enum LocalEffect {
     Blur(BlurParams),
     SoftFocus(SoftFocusParams),
     Mosaic(MosaicParams),
+    Sharpen(SharpenParams),
+    Hsl(HslParams),
     Look(LookParams),
     Bloom(BloomParams),
     Vignette(VignetteParams),
@@ -403,6 +405,7 @@ pub struct ToneParams {
     pub contrast: f32,
     pub gamma: f32,
     pub saturation: f32,
+    pub vibrance: f32,
     pub temperature: f32,
 }
 
@@ -413,6 +416,7 @@ impl Default for ToneParams {
             contrast: 0.0,
             gamma: 1.0,
             saturation: 0.0,
+            vibrance: 0.0,
             temperature: 0.0,
         }
     }
@@ -428,7 +432,7 @@ pub struct ClarityParams {
 impl Default for ClarityParams {
     fn default() -> Self {
         Self {
-            amount: 0.35,
+            amount: 0.0,
             radius_px: 18.0,
         }
     }
@@ -445,8 +449,8 @@ pub struct HighlightsShadowsParams {
 impl Default for HighlightsShadowsParams {
     fn default() -> Self {
         Self {
-            shadows: 25.0,
-            highlights: 20.0,
+            shadows: 0.0,
+            highlights: 0.0,
         }
     }
 }
@@ -458,7 +462,7 @@ pub struct BlurParams {
 
 impl Default for BlurParams {
     fn default() -> Self {
-        Self { radius_px: 12.0 }
+        Self { radius_px: 0.0 }
     }
 }
 
@@ -472,7 +476,7 @@ impl Default for SoftFocusParams {
     fn default() -> Self {
         Self {
             radius_px: 16.0,
-            strength: 0.35,
+            strength: 0.0,
         }
     }
 }
@@ -484,7 +488,39 @@ pub struct MosaicParams {
 
 impl Default for MosaicParams {
     fn default() -> Self {
-        Self { block_px: 12 }
+        Self { block_px: 1 }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SharpenParams {
+    pub amount: f32,
+    pub radius_px: f32,
+}
+
+impl Default for SharpenParams {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            radius_px: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HslParams {
+    pub hue_degrees: f32,
+    pub saturation: f32,
+    pub lightness: f32,
+}
+
+impl Default for HslParams {
+    fn default() -> Self {
+        Self {
+            hue_degrees: 0.0,
+            saturation: 0.0,
+            lightness: 0.0,
+        }
     }
 }
 
@@ -497,6 +533,14 @@ pub enum LookPreset {
     Cool,
     Warm,
     RetroFilm,
+    TealOrange,
+    CherryBlossom,
+    FreshGreen,
+    Moonlight,
+    HighKey,
+    LowKey,
+    Sepia,
+    Cyberpunk,
 }
 
 impl Default for LookPreset {
@@ -515,7 +559,7 @@ impl Default for LookParams {
     fn default() -> Self {
         Self {
             preset: LookPreset::Sunset,
-            strength: 0.65,
+            strength: 0.0,
         }
     }
 }
@@ -532,7 +576,7 @@ impl Default for BloomParams {
         Self {
             threshold: 0.72,
             radius_px: 18.0,
-            strength: 0.35,
+            strength: 0.0,
         }
     }
 }
@@ -548,7 +592,7 @@ pub struct VignetteParams {
 impl Default for VignetteParams {
     fn default() -> Self {
         Self {
-            strength: 0.35,
+            strength: 0.0,
             radius: 0.52,
             feather: 0.36,
         }
@@ -565,7 +609,7 @@ pub struct FilmGrainParams {
 impl Default for FilmGrainParams {
     fn default() -> Self {
         Self {
-            amount: 0.12,
+            amount: 0.0,
             size_px: 1,
             seed: 1,
         }
@@ -579,7 +623,7 @@ pub struct ChromaticAberrationParams {
 
 impl Default for ChromaticAberrationParams {
     fn default() -> Self {
-        Self { offset_px: 2.0 }
+        Self { offset_px: 0.0 }
     }
 }
 
@@ -593,7 +637,7 @@ impl Default for HalftoneParams {
     fn default() -> Self {
         Self {
             cell_px: 8,
-            strength: 0.45,
+            strength: 0.0,
         }
     }
 }
@@ -609,7 +653,7 @@ impl Default for EdgeSmoothParams {
     fn default() -> Self {
         Self {
             radius_px: 3.0,
-            strength: 0.45,
+            strength: 0.0,
             edge_threshold: 28.0,
         }
     }
@@ -699,6 +743,14 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
             image.height,
             params.block_px.max(1) as usize,
         ),
+        LocalEffect::Sharpen(params) => apply_sharpen(
+            &image.pixels,
+            image.width,
+            image.height,
+            params.radius_px.round().max(0.0) as usize,
+            params.amount.clamp(0.0, 2.0),
+        ),
+        LocalEffect::Hsl(params) => apply_hsl(&image.pixels, params),
         LocalEffect::Look(params) => apply_look(&image.pixels, params),
         LocalEffect::Bloom(params) => apply_bloom(&image.pixels, image.width, image.height, params),
         LocalEffect::Vignette(params) => {
@@ -1203,6 +1255,22 @@ fn tone_rgb(rgb: [u8; 3], params: ToneParams) -> [u8; 3] {
     g = luma + (g - luma) * sat;
     b = luma + (b - luma) * sat;
 
+    let vibrance = (params.vibrance / 100.0).clamp(-1.0, 1.0);
+    if vibrance.abs() > f32::EPSILON {
+        let max_c = r.max(g).max(b);
+        let min_c = r.min(g).min(b);
+        let current_sat = (max_c - min_c).clamp(0.0, 1.0);
+        let vibrance_scale = if vibrance >= 0.0 {
+            1.0 + vibrance * (1.0 - current_sat).powf(1.4)
+        } else {
+            1.0 + vibrance * 0.85
+        };
+        let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        r = luma + (r - luma) * vibrance_scale;
+        g = luma + (g - luma) * vibrance_scale;
+        b = luma + (b - luma) * vibrance_scale;
+    }
+
     [to_u8(r), to_u8(g), to_u8(b)]
 }
 
@@ -1315,6 +1383,50 @@ fn apply_mosaic(src: &[u8], width: usize, height: usize, block: usize) -> Vec<u8
     out
 }
 
+fn apply_sharpen(src: &[u8], width: usize, height: usize, radius: usize, amount: f32) -> Vec<u8> {
+    if radius == 0 || amount <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let blur = box_blur_rgba(src, width, height, radius);
+    let mut out = src.to_vec();
+    for i in (0..src.len()).step_by(4) {
+        for c in 0..3 {
+            let base = src[i + c] as f32;
+            let low = blur[i + c] as f32;
+            out[i + c] = (base + (base - low) * amount).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+fn apply_hsl(src: &[u8], params: HslParams) -> Vec<u8> {
+    let hue_shift = params.hue_degrees / 360.0;
+    let sat_delta = (params.saturation / 100.0).clamp(-1.0, 1.0);
+    let light_delta = (params.lightness / 100.0).clamp(-1.0, 1.0);
+    if hue_shift.abs() <= f32::EPSILON
+        && sat_delta.abs() <= f32::EPSILON
+        && light_delta.abs() <= f32::EPSILON
+    {
+        return src.to_vec();
+    }
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let (mut h, mut s, mut l) = rgb_to_hsl(
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        );
+        h = wrap01(h + hue_shift);
+        s = (s * (1.0 + sat_delta)).clamp(0.0, 1.0);
+        l = (l + light_delta * 0.5).clamp(0.0, 1.0);
+        let [r, g, b] = hsl_to_rgb(h, s, l);
+        px[0] = to_u8(r);
+        px[1] = to_u8(g);
+        px[2] = to_u8(b);
+    }
+    out
+}
+
 fn apply_look(src: &[u8], params: LookParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 1.0);
     if strength <= f32::EPSILON {
@@ -1379,6 +1491,56 @@ fn look_rgb(rgb: [f32; 3], preset: LookPreset) -> [f32; 3] {
             g = ((g - 0.5) * contrast + 0.51).clamp(0.0, 1.0);
             b = ((b - 0.5) * contrast + 0.44).clamp(0.0, 1.0);
             adjust_saturation([r, g, b], 0.86)
+        }
+        LookPreset::TealOrange => {
+            let shadow = 1.0 - luma;
+            let highlight = luma;
+            r = (r + 0.10 * highlight - 0.05 * shadow).clamp(0.0, 1.0);
+            g = (g + 0.04 * shadow).clamp(0.0, 1.0);
+            b = (b + 0.10 * shadow - 0.04 * highlight).clamp(0.0, 1.0);
+            adjust_saturation([r, g, b], 1.06)
+        }
+        LookPreset::CherryBlossom => {
+            r = (r + 0.08).clamp(0.0, 1.0);
+            g = (g + 0.03).clamp(0.0, 1.0);
+            b = (b + 0.07).clamp(0.0, 1.0);
+            adjust_saturation([r, g, b], 0.88)
+        }
+        LookPreset::FreshGreen => {
+            r = (r * 0.95 + 0.02).clamp(0.0, 1.0);
+            g = (g * 1.10 + 0.04).clamp(0.0, 1.0);
+            b = (b * 0.96).clamp(0.0, 1.0);
+            adjust_saturation([r, g, b], 1.04)
+        }
+        LookPreset::Moonlight => {
+            r = (r * 0.78).clamp(0.0, 1.0);
+            g = (g * 0.88 + 0.02).clamp(0.0, 1.0);
+            b = (b * 1.18 + 0.08).clamp(0.0, 1.0);
+            adjust_saturation([r, g, b], 0.82)
+        }
+        LookPreset::HighKey => {
+            r = (r * 0.90 + 0.12).clamp(0.0, 1.0);
+            g = (g * 0.90 + 0.12).clamp(0.0, 1.0);
+            b = (b * 0.92 + 0.12).clamp(0.0, 1.0);
+            adjust_saturation([r, g, b], 0.86)
+        }
+        LookPreset::LowKey => {
+            r = ((r - 0.5) * 1.10 + 0.40).clamp(0.0, 1.0);
+            g = ((g - 0.5) * 1.08 + 0.40).clamp(0.0, 1.0);
+            b = ((b - 0.5) * 1.05 + 0.42).clamp(0.0, 1.0);
+            adjust_saturation([r, g, b], 0.94)
+        }
+        LookPreset::Sepia => {
+            let tr = 0.393 * r + 0.769 * g + 0.189 * b;
+            let tg = 0.349 * r + 0.686 * g + 0.168 * b;
+            let tb = 0.272 * r + 0.534 * g + 0.131 * b;
+            [tr.clamp(0.0, 1.0), tg.clamp(0.0, 1.0), tb.clamp(0.0, 1.0)]
+        }
+        LookPreset::Cyberpunk => {
+            r = (r * 1.10 + 0.05).clamp(0.0, 1.0);
+            g = (g * 0.88).clamp(0.0, 1.0);
+            b = (b * 1.18 + 0.06).clamp(0.0, 1.0);
+            adjust_saturation([r, g, b], 1.18)
         }
     }
 }
@@ -1648,6 +1810,63 @@ fn luma01(r: f32, g: f32, b: f32) -> f32 {
     (0.2126 * r + 0.7152 * g + 0.0722 * b).clamp(0.0, 1.0)
 }
 
+fn wrap01(v: f32) -> f32 {
+    v.rem_euclid(1.0)
+}
+
+fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let l = (max + min) * 0.5;
+    let delta = max - min;
+    if delta <= f32::EPSILON {
+        return (0.0, 0.0, l);
+    }
+    let s = if l > 0.5 {
+        delta / (2.0 - max - min)
+    } else {
+        delta / (max + min)
+    };
+    let h = if (max - r).abs() <= f32::EPSILON {
+        ((g - b) / delta).rem_euclid(6.0) / 6.0
+    } else if (max - g).abs() <= f32::EPSILON {
+        ((b - r) / delta + 2.0) / 6.0
+    } else {
+        ((r - g) / delta + 4.0) / 6.0
+    };
+    (wrap01(h), s.clamp(0.0, 1.0), l.clamp(0.0, 1.0))
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> [f32; 3] {
+    if s <= f32::EPSILON {
+        return [l, l, l];
+    }
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    [
+        hue_to_rgb(p, q, h + 1.0 / 3.0),
+        hue_to_rgb(p, q, h),
+        hue_to_rgb(p, q, h - 1.0 / 3.0),
+    ]
+}
+
+fn hue_to_rgb(p: f32, q: f32, t: f32) -> f32 {
+    let t = wrap01(t);
+    if t < 1.0 / 6.0 {
+        p + (q - p) * 6.0 * t
+    } else if t < 0.5 {
+        q
+    } else if t < 2.0 / 3.0 {
+        p + (q - p) * (2.0 / 3.0 - t) * 6.0
+    } else {
+        p
+    }
+}
+
 fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
     if edge1 <= edge0 {
         return if x >= edge1 { 1.0 } else { 0.0 };
@@ -1893,6 +2112,71 @@ mod tests {
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn default_adjustment_effects_are_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let effects = [
+            LocalEffect::Tone(ToneParams::default()),
+            LocalEffect::Clarity(ClarityParams::default()),
+            LocalEffect::HighlightsShadows(HighlightsShadowsParams::default()),
+            LocalEffect::Blur(BlurParams::default()),
+            LocalEffect::SoftFocus(SoftFocusParams::default()),
+            LocalEffect::Mosaic(MosaicParams::default()),
+            LocalEffect::Sharpen(SharpenParams::default()),
+            LocalEffect::Hsl(HslParams::default()),
+            LocalEffect::Look(LookParams::default()),
+            LocalEffect::Bloom(BloomParams::default()),
+            LocalEffect::Vignette(VignetteParams::default()),
+            LocalEffect::FilmGrain(FilmGrainParams::default()),
+            LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
+            LocalEffect::Halftone(HalftoneParams::default()),
+            LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
+        ];
+        for effect in effects {
+            let layer = LocalAdjustmentLayer::new("identity", LocalMask::Full, effect);
+            let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+            assert_eq!(out.pixels, src.pixels);
+        }
+    }
+
+    #[test]
+    fn vibrance_boosts_low_saturation_color() {
+        let src = solid(1, 1, [120, 110, 105, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "vibrance",
+            LocalMask::Full,
+            LocalEffect::Tone(ToneParams {
+                vibrance: 80.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert!(out.pixels[2] < src.pixels[2]);
+    }
+
+    #[test]
+    fn hsl_hue_shift_changes_red_to_greenish() {
+        let src = solid(1, 1, [255, 0, 0, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "hsl",
+            LocalMask::Full,
+            LocalEffect::Hsl(HslParams {
+                hue_degrees: 120.0,
+                saturation: 0.0,
+                lightness: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[1] > 200);
+        assert!(out.pixels[0] < 80);
     }
 
     #[test]
