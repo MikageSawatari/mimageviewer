@@ -5094,9 +5094,9 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                     *params = StarGlowParams {
                         ray_count: 4,
                         rotation_degrees: 0.0,
-                        threshold: 0.84,
-                        length_px: 42.0,
-                        strength: 0.55,
+                        threshold: 0.997,
+                        length_px: 36.0,
+                        strength: 0.45,
                     };
                     changed = true;
                 }
@@ -5104,9 +5104,9 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                     *params = StarGlowParams {
                         ray_count: 4,
                         rotation_degrees: 0.0,
-                        threshold: 0.78,
+                        threshold: 0.993,
                         length_px: 72.0,
-                        strength: 0.90,
+                        strength: 0.80,
                     };
                     changed = true;
                 }
@@ -5114,9 +5114,9 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                     *params = StarGlowParams {
                         ray_count: 4,
                         rotation_degrees: 45.0,
-                        threshold: 0.80,
+                        threshold: 0.995,
                         length_px: 64.0,
-                        strength: 0.85,
+                        strength: 0.75,
                     };
                     changed = true;
                 }
@@ -5124,9 +5124,9 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                     *params = StarGlowParams {
                         ray_count: 6,
                         rotation_degrees: 0.0,
-                        threshold: 0.82,
+                        threshold: 0.996,
                         length_px: 56.0,
-                        strength: 0.85,
+                        strength: 0.70,
                     };
                     changed = true;
                 }
@@ -5134,9 +5134,9 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                     *params = StarGlowParams {
                         ray_count: 8,
                         rotation_degrees: 0.0,
-                        threshold: 0.82,
+                        threshold: 0.997,
                         length_px: 56.0,
-                        strength: 0.85,
+                        strength: 0.65,
                     };
                     changed = true;
                 }
@@ -5161,7 +5161,12 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
                 .add(egui::Slider::new(&mut params.rotation_degrees, -180.0..=180.0).text("回転"))
                 .changed();
             changed |= ui
-                .add(egui::Slider::new(&mut params.threshold, 0.50..=0.99).text("明部しきい値"))
+                .add(
+                    egui::Slider::new(&mut params.threshold, 0.90..=0.9999)
+                        .text("明部しきい値")
+                        .fixed_decimals(4)
+                        .smart_aim(false),
+                )
                 .changed();
             changed |= ui
                 .add(egui::Slider::new(&mut params.length_px, 1.0..=240.0).text("光線長"))

@@ -691,7 +691,7 @@ impl Default for StarGlowParams {
         Self {
             ray_count: 4,
             rotation_degrees: 0.0,
-            threshold: 0.82,
+            threshold: 0.995,
             length_px: 48.0,
             strength: 0.0,
         }
@@ -1745,7 +1745,7 @@ fn apply_bloom(src: &[u8], width: usize, height: usize, params: BloomParams) -> 
     if radius == 0 || strength <= f32::EPSILON || width == 0 || height == 0 {
         return src.to_vec();
     }
-    let threshold = params.threshold.clamp(0.50, 0.99);
+    let threshold = params.threshold.clamp(0.90, 0.9999);
     let inv_range = 1.0 / (1.0 - threshold).max(0.001);
     let mut bright = vec![0_u8; src.len()];
     for i in (0..src.len()).step_by(4) {
