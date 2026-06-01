@@ -17,10 +17,11 @@ use local_adjust_core::{
     BloomParams, BlurParams, ChromaticAberrationParams, ClarityParams, ColorRangeMask,
     DehazeParams, EdgeSmoothParams, FilmGrainParams, HalftoneParams, HighlightsShadowsParams,
     HslParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
-    LookParams, LookPreset, ManualMaskOverride, MaskShape, MosaicParams, RadialGradientMask,
-    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbaImageBuf, RgbaImageRef, ShapeOp,
-    SharpenParams, SoftFocusParams, StarGlowParams, ToneCurveParams, ToneParams, VignetteParams,
-    apply_layers, evaluate_layer_mask,
+    LookParams, LookPreset, ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams,
+    MosaicTileMode, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
+    RgbaImageBuf, RgbaImageRef, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams,
+    ToneCurveParams, ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size,
+    evaluate_layer_mask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -3847,8 +3848,9 @@ impl LocalAdjustLabApp {
         }
 
         ui.separator();
+        let dims = self.image_dims().unwrap_or((1, 1));
         if let Some(layer) = self.selected_layer_mut() {
-            if draw_effect_params(ui, layer) {
+            if draw_effect_params(ui, layer, dims) {
                 self.mark_dirty();
             }
         }
@@ -5776,7 +5778,10 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::Dehaze(params) => format!("かすみ除去 {:.0}%", params.amount * 100.0),
         LocalEffect::Blur(params) => format!("ぼかし {:.0}px", params.radius_px),
         LocalEffect::SoftFocus(params) => format!("ソフトフォーカス {:.0}px", params.radius_px),
-        LocalEffect::Mosaic(params) => format!("モザイク {}px", params.block_px),
+        LocalEffect::Mosaic(params) => format!(
+            "モザイク {}",
+            mosaic_tile_mode_label(params.effective_tile_mode())
+        ),
         LocalEffect::Sharpen(params) => format!("シャープ {:.0}%", params.amount * 100.0),
         LocalEffect::Hsl(params) => format!("色相 {:+.0}°", params.hue_degrees),
         LocalEffect::Look(params) => format!("ルック {}", look_preset_label(params.preset)),
@@ -5793,6 +5798,27 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::EdgeSmooth(params) => {
             format!("エッジ保持ぼかし {:.0}px", params.radius_px)
         }
+    }
+}
+
+fn mosaic_tile_mode_label(mode: MosaicTileMode) -> String {
+    match mode {
+        MosaicTileMode::LongEdgeRatio(multiplier) => format!("長辺x{multiplier:.2}"),
+        MosaicTileMode::FixedPx(px) => {
+            if px <= 1 {
+                "1px(無効)".to_string()
+            } else {
+                format!("{px}px")
+            }
+        }
+    }
+}
+
+fn mosaic_boundary_label(boundary: MosaicBoundary) -> &'static str {
+    match boundary {
+        MosaicBoundary::Opaque => "タイル不透明",
+        MosaicBoundary::Translucent => "割合で半透明",
+        MosaicBoundary::MaskShape => "マスク形状",
     }
 }
 
@@ -5926,7 +5952,11 @@ fn preview_tone_curve_value(x: f32, points: [f32; 5]) -> f32 {
         + (points[seg + 1].clamp(0.0, 1.0) - points[seg].clamp(0.0, 1.0)) * t
 }
 
-fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bool {
+fn draw_effect_params(
+    ui: &mut egui::Ui,
+    layer: &mut LocalAdjustmentLayer,
+    image_dims: (usize, usize),
+) -> bool {
     let mut changed = false;
     let effect_kind = EffectKind::from_effect(&layer.effect);
     ui.horizontal(|ui| {
@@ -6217,24 +6247,116 @@ fn draw_effect_params(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bo
         LocalEffect::Mosaic(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
-                if preset_button(ui, "8px") {
-                    params.block_px = 8;
+                if preset_button(ui, "長辺0.5倍") {
+                    params.tile_mode = MosaicTileMode::LongEdgeRatio(0.5);
+                    params.clear_legacy_block_px();
                     changed = true;
                 }
-                if preset_button(ui, "12px") {
-                    params.block_px = 12;
+                if preset_button(ui, "長辺1倍") {
+                    params.tile_mode = MosaicTileMode::LongEdgeRatio(1.0);
+                    params.clear_legacy_block_px();
                     changed = true;
                 }
-                if preset_button(ui, "24px") {
-                    params.block_px = 24;
+                if preset_button(ui, "長辺2倍") {
+                    params.tile_mode = MosaicTileMode::LongEdgeRatio(2.0);
+                    params.clear_legacy_block_px();
                     changed = true;
                 }
             });
-            let mut block = params.block_px as i32;
-            changed |= ui
-                .add(egui::Slider::new(&mut block, 1..=96).text("タイル(px)"))
-                .changed();
-            params.block_px = block.max(1) as u32;
+            let long_edge = image_dims.0.max(image_dims.1) as u32;
+            let mut mode = params.effective_tile_mode();
+            ui.horizontal(|ui| {
+                let ratio_selected = matches!(mode, MosaicTileMode::LongEdgeRatio(_));
+                if ui.selectable_label(ratio_selected, "長辺比率").clicked() && !ratio_selected
+                {
+                    let multiplier = match mode {
+                        MosaicTileMode::LongEdgeRatio(value) => value,
+                        MosaicTileMode::FixedPx(_) => 1.0,
+                    };
+                    mode = MosaicTileMode::LongEdgeRatio(multiplier);
+                    params.tile_mode = mode;
+                    params.clear_legacy_block_px();
+                    changed = true;
+                }
+                let fixed_selected = matches!(mode, MosaicTileMode::FixedPx(_));
+                if ui.selectable_label(fixed_selected, "固定px").clicked() && !fixed_selected {
+                    let fixed_px = compute_mosaic_tile_size(long_edge, mode).max(1);
+                    mode = MosaicTileMode::FixedPx(fixed_px);
+                    params.tile_mode = mode;
+                    params.clear_legacy_block_px();
+                    changed = true;
+                }
+            });
+            match mode {
+                MosaicTileMode::LongEdgeRatio(multiplier) => {
+                    let mut value = multiplier;
+                    let response = ui.add(
+                        egui::Slider::new(&mut value, 0.25..=5.0)
+                            .step_by(0.25)
+                            .text("長辺比率"),
+                    );
+                    if response.changed() {
+                        params.tile_mode = MosaicTileMode::LongEdgeRatio(value);
+                        params.clear_legacy_block_px();
+                        mode = params.tile_mode;
+                        changed = true;
+                    }
+                }
+                MosaicTileMode::FixedPx(px) => {
+                    let mut value = px as i32;
+                    let response = ui.add(egui::Slider::new(&mut value, 1..=200).text("固定px"));
+                    if response.changed() {
+                        params.tile_mode = MosaicTileMode::FixedPx(value.max(1) as u32);
+                        params.clear_legacy_block_px();
+                        mode = params.tile_mode;
+                        changed = true;
+                    }
+                }
+            }
+            let actual_px = compute_mosaic_tile_size(long_edge, mode);
+            ui.label(
+                egui::RichText::new(format!("実タイルサイズ: {actual_px}px"))
+                    .size(11.0)
+                    .color(Color32::from_gray(170)),
+            );
+
+            ui.separator();
+            let before_boundary = params.boundary;
+            lab_combo_box(
+                ui,
+                "mosaic_boundary",
+                mosaic_boundary_label(params.boundary),
+                |ui| {
+                    for boundary in [
+                        MosaicBoundary::Opaque,
+                        MosaicBoundary::Translucent,
+                        MosaicBoundary::MaskShape,
+                    ] {
+                        ui.selectable_value(
+                            &mut params.boundary,
+                            boundary,
+                            mosaic_boundary_label(boundary),
+                        );
+                    }
+                },
+            );
+            if params.boundary != before_boundary {
+                changed = true;
+            }
+            ui.label(
+                egui::RichText::new(params.boundary.process_description())
+                    .size(10.0)
+                    .color(Color32::from_gray(170)),
+            );
+            if matches!(params.boundary, MosaicBoundary::Opaque) {
+                ui.label(
+                    egui::RichText::new(
+                        "隠蔽加工と同じく、マスクに触れたタイル全体へ効果が広がります。",
+                    )
+                    .size(10.0)
+                    .color(Color32::from_gray(170)),
+                );
+            }
         }
         LocalEffect::Sharpen(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));

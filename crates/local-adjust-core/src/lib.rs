@@ -535,14 +535,93 @@ impl Default for SoftFocusParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MosaicBoundary {
+    #[default]
+    Opaque,
+    Translucent,
+    MaskShape,
+}
+
+impl MosaicBoundary {
+    pub fn process_description(self) -> &'static str {
+        match self {
+            MosaicBoundary::Opaque => "マスクを含むタイルを不透明で描画",
+            MosaicBoundary::Translucent => "マスクを含むタイルをマスクの割合に応じた不透明度で描画",
+            MosaicBoundary::MaskShape => {
+                "マスクの形に沿って描画 (マスク内の各画素をその画素が属するタイルの平均色で塗る)"
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "mode", content = "value", rename_all = "snake_case")]
+pub enum MosaicTileMode {
+    LongEdgeRatio(f32),
+    FixedPx(u32),
+}
+
+impl Default for MosaicTileMode {
+    fn default() -> Self {
+        Self::FixedPx(1)
+    }
+}
+
+pub const MOSAIC_TILE_RATIO_MIN: f32 = 0.25;
+pub const MOSAIC_TILE_RATIO_MAX: f32 = 5.0;
+pub const MOSAIC_TILE_RATIO_STEP: f32 = 0.25;
+pub const MOSAIC_TILE_FIXED_MIN: u32 = 1;
+pub const MOSAIC_TILE_FIXED_MAX: u32 = 200;
+
+pub fn compute_mosaic_tile_size(image_long_edge: u32, mode: MosaicTileMode) -> u32 {
+    match mode {
+        MosaicTileMode::LongEdgeRatio(multiplier) => {
+            let base = ((image_long_edge as f32 / 100.0).round().max(4.0)) as u32;
+            ((base as f32 * multiplier).round() as u32).max(4)
+        }
+        MosaicTileMode::FixedPx(px) => {
+            if px <= 1 {
+                1
+            } else {
+                px.max(4)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MosaicParams {
+    #[serde(default)]
+    pub tile_mode: MosaicTileMode,
+    #[serde(default)]
+    pub boundary: MosaicBoundary,
+    #[serde(default)]
     pub block_px: u32,
 }
 
 impl Default for MosaicParams {
     fn default() -> Self {
-        Self { block_px: 1 }
+        Self {
+            tile_mode: MosaicTileMode::default(),
+            boundary: MosaicBoundary::default(),
+            block_px: 0,
+        }
+    }
+}
+
+impl MosaicParams {
+    pub fn effective_tile_mode(self) -> MosaicTileMode {
+        if self.block_px > 0 {
+            MosaicTileMode::FixedPx(self.block_px)
+        } else {
+            self.tile_mode
+        }
+    }
+
+    pub fn clear_legacy_block_px(&mut self) {
+        self.block_px = 0;
     }
 }
 
@@ -815,14 +894,19 @@ fn apply_manual_override(
 }
 
 fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result<()> {
-    if matches!(layer.effect, LocalEffect::None) {
+    if matches!(&layer.effect, LocalEffect::None) {
         return Ok(());
     }
     let mask = evaluate_layer_mask(image.as_ref(), layer)?;
-    let effected = match layer.effect {
+    if let LocalEffect::Mosaic(params) = &layer.effect {
+        image.pixels =
+            apply_mosaic_with_mask(&image.pixels, image.width, image.height, &mask, *params);
+        return Ok(());
+    }
+    let effected = match &layer.effect {
         LocalEffect::None => unreachable!("None is handled before mask evaluation"),
-        LocalEffect::Tone(params) => apply_tone_image(&image.pixels, params),
-        LocalEffect::ToneCurve(params) => apply_tone_curve(&image.pixels, params),
+        LocalEffect::Tone(params) => apply_tone_image(&image.pixels, *params),
+        LocalEffect::ToneCurve(params) => apply_tone_curve(&image.pixels, *params),
         LocalEffect::Clarity(params) => apply_clarity(
             &image.pixels,
             image.width,
@@ -830,9 +914,9 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
             params.radius_px.round().max(0.0) as usize,
             params.amount.clamp(-1.0, 1.0),
         ),
-        LocalEffect::HighlightsShadows(params) => apply_highlights_shadows(&image.pixels, params),
+        LocalEffect::HighlightsShadows(params) => apply_highlights_shadows(&image.pixels, *params),
         LocalEffect::Dehaze(params) => {
-            apply_dehaze(&image.pixels, image.width, image.height, params)
+            apply_dehaze(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::Blur(params) => box_blur_rgba(
             &image.pixels,
@@ -847,12 +931,7 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
             params.radius_px.round().max(0.0) as usize,
             params.strength.clamp(0.0, 1.0),
         ),
-        LocalEffect::Mosaic(params) => apply_mosaic(
-            &image.pixels,
-            image.width,
-            image.height,
-            params.block_px.max(1) as usize,
-        ),
+        LocalEffect::Mosaic(_) => unreachable!("Mosaic is handled before generic mask blending"),
         LocalEffect::Sharpen(params) => apply_sharpen(
             &image.pixels,
             image.width,
@@ -860,14 +939,16 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
             params.radius_px.round().max(0.0) as usize,
             params.amount.clamp(0.0, 2.0),
         ),
-        LocalEffect::Hsl(params) => apply_hsl(&image.pixels, params),
-        LocalEffect::Look(params) => apply_look(&image.pixels, params),
-        LocalEffect::Bloom(params) => apply_bloom(&image.pixels, image.width, image.height, params),
+        LocalEffect::Hsl(params) => apply_hsl(&image.pixels, *params),
+        LocalEffect::Look(params) => apply_look(&image.pixels, *params),
+        LocalEffect::Bloom(params) => {
+            apply_bloom(&image.pixels, image.width, image.height, *params)
+        }
         LocalEffect::Vignette(params) => {
-            apply_vignette(&image.pixels, image.width, image.height, params)
+            apply_vignette(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::FilmGrain(params) => {
-            apply_film_grain(&image.pixels, image.width, image.height, params)
+            apply_film_grain(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::ChromaticAberration(params) => apply_chromatic_aberration(
             &image.pixels,
@@ -876,13 +957,13 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
             params.offset_px.clamp(0.0, 24.0),
         ),
         LocalEffect::Halftone(params) => {
-            apply_halftone(&image.pixels, image.width, image.height, params)
+            apply_halftone(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::StarGlow(params) => {
-            apply_star_glow(&image.pixels, image.width, image.height, params)
+            apply_star_glow(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::EdgeSmooth(params) => {
-            apply_edge_smooth(&image.pixels, image.width, image.height, params)
+            apply_edge_smooth(&image.pixels, image.width, image.height, *params)
         }
     };
     blend_rgb_with_mask(&mut image.pixels, &effected, &mask);
@@ -1587,37 +1668,69 @@ fn apply_soft_focus(
     out
 }
 
-fn apply_mosaic(src: &[u8], width: usize, height: usize, block: usize) -> Vec<u8> {
+fn apply_mosaic_with_mask(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    mask: &[f32],
+    params: MosaicParams,
+) -> Vec<u8> {
+    let long_edge = width.max(height) as u32;
+    let block = compute_mosaic_tile_size(long_edge, params.effective_tile_mode()) as usize;
     if block <= 1 || width == 0 || height == 0 {
         return src.to_vec();
     }
+    debug_assert_eq!(src.len(), width.saturating_mul(height).saturating_mul(4));
+    debug_assert_eq!(mask.len(), width.saturating_mul(height));
+
+    let tiles_x = width.div_ceil(block);
+    let tiles_y = height.div_ceil(block);
+    let mut tile_stats = vec![(0_u64, 0_u64, 0_u64, 0_u32, 0.0_f32, 0.0_f32); tiles_x * tiles_y];
+    for y in 0..height {
+        let ty = y / block;
+        for x in 0..width {
+            let tx = x / block;
+            let pi = y * width + x;
+            let o = pi * 4;
+            let entry = &mut tile_stats[ty * tiles_x + tx];
+            entry.0 += src[o] as u64;
+            entry.1 += src[o + 1] as u64;
+            entry.2 += src[o + 2] as u64;
+            entry.3 += 1;
+            let alpha = mask.get(pi).copied().unwrap_or(0.0).clamp(0.0, 1.0);
+            entry.4 += alpha;
+            entry.5 = entry.5.max(alpha);
+        }
+    }
+
     let mut out = src.to_vec();
-    for y0 in (0..height).step_by(block) {
-        for x0 in (0..width).step_by(block) {
-            let x1 = (x0 + block).min(width);
-            let y1 = (y0 + block).min(height);
-            let mut sum = [0_u64; 4];
-            let mut count = 0_u64;
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let i = (y * width + x) * 4;
-                    for c in 0..4 {
-                        sum[c] += src[i + c] as u64;
-                    }
-                    count += 1;
-                }
+    for y in 0..height {
+        let ty = y / block;
+        for x in 0..width {
+            let tx = x / block;
+            let pi = y * width + x;
+            let o = pi * 4;
+            let (sum_r, sum_g, sum_b, total_count, sum_alpha, max_alpha) =
+                tile_stats[ty * tiles_x + tx];
+            if total_count == 0 || max_alpha <= f32::EPSILON {
+                continue;
             }
             let avg = [
-                (sum[0] / count) as u8,
-                (sum[1] / count) as u8,
-                (sum[2] / count) as u8,
-                (sum[3] / count) as u8,
+                (sum_r / total_count as u64) as u8,
+                (sum_g / total_count as u64) as u8,
+                (sum_b / total_count as u64) as u8,
             ];
-            for y in y0..y1 {
-                for x in x0..x1 {
-                    let i = (y * width + x) * 4;
-                    out[i..i + 4].copy_from_slice(&avg);
-                }
+            let amount = match params.boundary {
+                MosaicBoundary::Opaque => max_alpha,
+                MosaicBoundary::Translucent => sum_alpha / total_count as f32,
+                MosaicBoundary::MaskShape => mask.get(pi).copied().unwrap_or(0.0),
+            }
+            .clamp(0.0, 1.0);
+            if amount <= f32::EPSILON {
+                continue;
+            }
+            for c in 0..3 {
+                out[o + c] = lerp_u8(src[o + c], avg[c], amount);
             }
         }
     }
@@ -2519,6 +2632,110 @@ mod tests {
             let out = apply_layers(src.as_ref(), &[layer]).unwrap();
             assert_eq!(out.pixels, src.pixels);
         }
+    }
+
+    #[test]
+    fn mosaic_tile_size_supports_ratio_and_fixed_modes() {
+        assert_eq!(
+            compute_mosaic_tile_size(1400, MosaicTileMode::LongEdgeRatio(1.0)),
+            14
+        );
+        assert_eq!(
+            compute_mosaic_tile_size(4000, MosaicTileMode::LongEdgeRatio(2.0)),
+            80
+        );
+        assert_eq!(
+            compute_mosaic_tile_size(400, MosaicTileMode::FixedPx(16)),
+            16
+        );
+        assert_eq!(compute_mosaic_tile_size(400, MosaicTileMode::FixedPx(2)), 4);
+        assert_eq!(compute_mosaic_tile_size(400, MosaicTileMode::FixedPx(1)), 1);
+    }
+
+    #[test]
+    fn mosaic_params_honor_legacy_block_px() {
+        let params = MosaicParams {
+            tile_mode: MosaicTileMode::LongEdgeRatio(2.0),
+            boundary: MosaicBoundary::Opaque,
+            block_px: 12,
+        };
+        assert_eq!(params.effective_tile_mode(), MosaicTileMode::FixedPx(12));
+    }
+
+    #[test]
+    fn mosaic_opaque_boundary_extends_tile_outside_mask() {
+        let src = RgbaImageBuf::new(
+            4,
+            1,
+            vec![0, 0, 0, 255, 100, 0, 0, 255, 200, 0, 0, 255, 240, 0, 0, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "mosaic",
+            LocalMask::Raster(RasterMask {
+                width: 4,
+                height: 1,
+                alpha: vec![1.0, 0.0, 0.0, 0.0],
+            }),
+            LocalEffect::Mosaic(MosaicParams {
+                tile_mode: MosaicTileMode::FixedPx(4),
+                boundary: MosaicBoundary::Opaque,
+                block_px: 0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels[8], 135);
+    }
+
+    #[test]
+    fn mosaic_mask_shape_boundary_stays_inside_mask() {
+        let src = RgbaImageBuf::new(
+            4,
+            1,
+            vec![0, 0, 0, 255, 100, 0, 0, 255, 200, 0, 0, 255, 240, 0, 0, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "mosaic",
+            LocalMask::Raster(RasterMask {
+                width: 4,
+                height: 1,
+                alpha: vec![1.0, 0.0, 0.0, 0.0],
+            }),
+            LocalEffect::Mosaic(MosaicParams {
+                tile_mode: MosaicTileMode::FixedPx(4),
+                boundary: MosaicBoundary::MaskShape,
+                block_px: 0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels[0], 135);
+        assert_eq!(out.pixels[8], 200);
+    }
+
+    #[test]
+    fn mosaic_translucent_boundary_uses_tile_coverage() {
+        let src = RgbaImageBuf::new(
+            4,
+            1,
+            vec![0, 0, 0, 255, 100, 0, 0, 255, 200, 0, 0, 255, 240, 0, 0, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "mosaic",
+            LocalMask::Raster(RasterMask {
+                width: 4,
+                height: 1,
+                alpha: vec![1.0, 0.0, 0.0, 0.0],
+            }),
+            LocalEffect::Mosaic(MosaicParams {
+                tile_mode: MosaicTileMode::FixedPx(4),
+                boundary: MosaicBoundary::Translucent,
+                block_px: 0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels[8], 184);
     }
 
     #[test]

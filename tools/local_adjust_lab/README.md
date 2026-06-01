@@ -80,7 +80,8 @@ the window.
   - Dehaze
   - Blur
   - Soft focus
-  - Mosaic
+  - Mosaic with long-edge-ratio / fixed-pixel tile sizing and the same three
+    boundary modes as the conceal mosaic tool
   - Sharpen
   - HSL / hue shift
   - Look presets
@@ -120,6 +121,13 @@ local-adjust-only mask implementation.
 Gradients and color range are mask sources, not manual-mask tools. Linear and
 radial gradients stay parametric until composition time, and color range is
 created by clicking the image after selecting the Color Range mask source.
+
+The adjustment-layer mosaic effect mirrors the conceal mosaic semantics:
+long-edge ratio mode is useful for image-size-independent results, fixed-pixel
+mode is available for exact tile sizes, and the boundary mode controls whether
+tiles touching the mask are drawn opaque, blended by mask coverage, or clipped
+to the mask shape. The opaque mode intentionally lets the mosaic tile extend
+outside the mask, matching the conceal workflow.
 
 Subject selection masks are implemented as an optional prototype path. Place
 downloaded models under `tools/local_adjust_lab/models/`; the prototype looks
