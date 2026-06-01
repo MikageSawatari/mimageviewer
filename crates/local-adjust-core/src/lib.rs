@@ -421,6 +421,7 @@ pub enum LocalEffect {
     CubeLut(CubeLutParams),
     Posterize(PosterizeParams),
     Threshold(ThresholdParams),
+    Invert(InvertParams),
     GradientMap(GradientMapParams),
     Bloom(BloomParams),
     Vignette(VignetteParams),
@@ -979,6 +980,17 @@ impl Default for ThresholdParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct InvertParams {
+    pub strength: f32,
+}
+
+impl Default for InvertParams {
+    fn default() -> Self {
+        Self { strength: 0.0 }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GradientMapPreset {
     None,
@@ -1271,6 +1283,7 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         LocalEffect::CubeLut(params) => apply_cube_lut(&image.pixels, params),
         LocalEffect::Posterize(params) => apply_posterize(&image.pixels, *params),
         LocalEffect::Threshold(params) => apply_threshold(&image.pixels, *params),
+        LocalEffect::Invert(params) => apply_invert(&image.pixels, *params),
         LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
         LocalEffect::Bloom(params) => {
             apply_bloom(&image.pixels, image.width, image.height, *params)
@@ -2641,6 +2654,21 @@ fn apply_threshold(src: &[u8], params: ThresholdParams) -> Vec<u8> {
     out
 }
 
+fn apply_invert(src: &[u8], params: InvertParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        for channel in &mut px[0..3] {
+            let original = *channel as f32 / 255.0;
+            *channel = to_u8(lerp_f32(original, 1.0 - original, strength));
+        }
+    }
+    out
+}
+
 fn apply_gradient_map(src: &[u8], params: GradientMapParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 1.0);
     if params.preset == GradientMapPreset::None || strength <= f32::EPSILON {
@@ -3590,6 +3618,7 @@ mod tests {
             LocalEffect::CubeLut(CubeLutParams::default()),
             LocalEffect::Posterize(PosterizeParams::default()),
             LocalEffect::Threshold(ThresholdParams::default()),
+            LocalEffect::Invert(InvertParams::default()),
             LocalEffect::GradientMap(GradientMapParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
@@ -4076,6 +4105,18 @@ LUT_3D_SIZE 2
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(out.pixels, vec![0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn invert_reverses_rgb_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(1, 1, vec![10, 120, 250, 128]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "invert",
+            LocalMask::Full,
+            LocalEffect::Invert(InvertParams { strength: 1.0 }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, vec![245, 135, 5, 128]);
     }
 
     #[test]

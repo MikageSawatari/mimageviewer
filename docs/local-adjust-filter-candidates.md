@@ -47,12 +47,12 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、28種)
+### `LocalEffect` (部分補正レイヤー、29種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
-Threshold(2値化),
+Threshold(2値化), Invert(階調反転/ネガ),
 HighlightsShadows, Clarity, Dehaze, Blur(box), SoftFocus, Mosaic, Sharpen, Look(15プリセット),
 GradientMap, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth
 
@@ -79,7 +79,7 @@ OilPaint(Kuwahara) / Sketch(Sobel) / LightLeak / 減色8機種 / CRT 3種＋複�
 - [x] **3D LUT (.cube) 読み込み** ★ **中** (infra は軽い) — 外部シネマ LUT を取り込み (PS Color Lookup)
 - [x] **ポスタリゼーション (階調数指定)** ★ **易** — フラット/グラフィック調。減色フィルタとは別物 (PS / CSP / Krita)
 - [x] **2値化 (しきい値)** ★ **易** — 線画・モノクロ化 (manga) (PS / CSP / Krita)
-- [ ] **階調反転 / ネガ** **易** — 反転。local に無い (全ソフト)
+- [x] **階調反転 / ネガ** **易** — 反転。local に無い (全ソフト)
 - [ ] **ダブルトーン / トライトーン** **易** — グラデマップの特殊化。ポスター調 (PS)
 - [ ] **ヒストグラム平坦化 (Equalize)** **易** — 自動補正 (PS / Krita)
 - [ ] **`Tone` に tint (緑-マゼンタ) 追加** **易** — 現状 temperature のみで WB として不完全 (Lightroom)

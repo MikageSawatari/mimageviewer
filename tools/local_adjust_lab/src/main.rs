@@ -17,7 +17,7 @@ use local_adjust_core::{
     BloomParams, BlurParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
     ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
     CubeLutParams, DehazeParams, EdgeSmoothParams, FilmGrainParams, GradientMapParams,
-    GradientMapPreset, HalftoneParams, HighlightsShadowsParams, HslParams, LineKind,
+    GradientMapPreset, HalftoneParams, HighlightsShadowsParams, HslParams, InvertParams, LineKind,
     LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
     ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode, PosterizeParams,
     RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
@@ -946,6 +946,7 @@ enum EffectKind {
     CubeLut,
     Posterize,
     Threshold,
+    Invert,
     GradientMap,
     Bloom,
     Vignette,
@@ -980,6 +981,7 @@ impl EffectKind {
             LocalEffect::CubeLut(_) => Self::CubeLut,
             LocalEffect::Posterize(_) => Self::Posterize,
             LocalEffect::Threshold(_) => Self::Threshold,
+            LocalEffect::Invert(_) => Self::Invert,
             LocalEffect::GradientMap(_) => Self::GradientMap,
             LocalEffect::Bloom(_) => Self::Bloom,
             LocalEffect::Vignette(_) => Self::Vignette,
@@ -1014,6 +1016,7 @@ impl EffectKind {
             Self::CubeLut => "3D LUT",
             Self::Posterize => "ポスタリゼーション",
             Self::Threshold => "2値化",
+            Self::Invert => "階調反転/ネガ",
             Self::GradientMap => "グラデーションマップ",
             Self::Bloom => "ブルーム",
             Self::Vignette => "ビネット",
@@ -1052,6 +1055,7 @@ impl EffectKind {
             }
             Self::Posterize => "色の階調数を減らし、フラットでグラフィックな見た目にします。",
             Self::Threshold => "明るさをしきい値で黒と白に分け、線画やモノクロ風にします。",
+            Self::Invert => "RGBの明暗を反転し、ネガフィルムのような見た目にします。",
             Self::GradientMap => {
                 "明るさを指定したグラデーションの色へ置き換え、色設計や色トレス風に使います。"
             }
@@ -1094,6 +1098,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::CubeLut,
             EffectKind::Posterize,
             EffectKind::Threshold,
+            EffectKind::Invert,
             EffectKind::GradientMap,
         ],
     },
@@ -6385,6 +6390,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
             let suffix = if params.invert { " 反転" } else { "" };
             format!("2値化 {:.0}%{suffix}", params.threshold * 100.0)
         }
+        LocalEffect::Invert(params) => format!("ネガ {:.0}%", params.strength * 100.0),
         LocalEffect::GradientMap(params) => {
             format!(
                 "グラデーション {}",
@@ -7983,6 +7989,33 @@ fn draw_effect_params(
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から黒白化した結果へどれだけ近づけるかです。");
         }
+        LocalEffect::Invert(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "ネガ") {
+                    *params = InvertParams { strength: 1.0 };
+                    changed = true;
+                }
+                if preset_button(ui, "薄め") {
+                    *params = InvertParams { strength: 0.35 };
+                    changed = true;
+                }
+                if preset_button(ui, "半分") {
+                    *params = InvertParams { strength: 0.5 };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "RGBの明暗を反転します。強度を下げると元画像とネガを混ぜた特殊な色味になります。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から反転後の色へどれだけ近づけるかです。");
+        }
         LocalEffect::GradientMap(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -9570,6 +9603,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::CubeLut => LocalEffect::CubeLut(CubeLutParams::default()),
         EffectKind::Posterize => LocalEffect::Posterize(PosterizeParams::default()),
         EffectKind::Threshold => LocalEffect::Threshold(ThresholdParams::default()),
+        EffectKind::Invert => LocalEffect::Invert(InvertParams::default()),
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
