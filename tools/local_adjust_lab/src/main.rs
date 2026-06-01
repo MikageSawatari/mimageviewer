@@ -20,9 +20,9 @@ use local_adjust_core::{
     HighlightsShadowsParams, HslParams, LineKind, LinearGradientMask, LocalAdjustmentLayer,
     LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MosaicBoundary,
     MosaicParams, MosaicTileMode, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
-    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, ShapeOp, SharpenParams,
-    SoftFocusParams, StarGlowParams, ThreeWayColorGradingParams, ToneCurveParams, ToneParams,
-    VignetteParams, apply_layers, compute_mosaic_tile_size, evaluate_layer_mask,
+    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp,
+    SharpenParams, SoftFocusParams, StarGlowParams, ThreeWayColorGradingParams, ToneCurveParams,
+    ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size, evaluate_layer_mask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -922,6 +922,7 @@ enum EffectKind {
     RgbToneCurve,
     ColorBalance,
     ThreeWayColorGrading,
+    SelectiveColor,
     Clarity,
     HighlightsShadows,
     Dehaze,
@@ -951,6 +952,7 @@ impl EffectKind {
             LocalEffect::RgbToneCurve(_) => Self::RgbToneCurve,
             LocalEffect::ColorBalance(_) => Self::ColorBalance,
             LocalEffect::ThreeWayColorGrading(_) => Self::ThreeWayColorGrading,
+            LocalEffect::SelectiveColor(_) => Self::SelectiveColor,
             LocalEffect::Clarity(_) => Self::Clarity,
             LocalEffect::HighlightsShadows(_) => Self::HighlightsShadows,
             LocalEffect::Dehaze(_) => Self::Dehaze,
@@ -980,6 +982,7 @@ impl EffectKind {
             Self::RgbToneCurve => "RGBカーブ",
             Self::ColorBalance => "カラーバランス",
             Self::ThreeWayColorGrading => "3-wayグレーディング",
+            Self::SelectiveColor => "セレクティブカラー",
             Self::Clarity => "明瞭度",
             Self::HighlightsShadows => "ハイライト/シャドウ",
             Self::Dehaze => "かすみ除去",
@@ -1011,6 +1014,7 @@ impl EffectKind {
             Self::ThreeWayColorGrading => {
                 "シャドウ、中間、ハイライトに別々の色味と明るさを足して空気感を作ります。"
             }
+            Self::SelectiveColor => "指定した色相の近くにある色だけを狙って調整します。",
             Self::Clarity => "局所コントラストを上げ、輪郭や質感をくっきり見せます。",
             Self::HighlightsShadows => "明るい部分と暗い部分を個別に持ち上げたり抑えたりします。",
             Self::Dehaze => "白っぽさを減らし、遠景や薄いコントラストを締めます。",
@@ -1053,6 +1057,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::RgbToneCurve,
             EffectKind::ColorBalance,
             EffectKind::ThreeWayColorGrading,
+            EffectKind::SelectiveColor,
             EffectKind::Hsl,
             EffectKind::ColorMixer,
             EffectKind::HighlightsShadows,
@@ -6188,6 +6193,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::RgbToneCurve(_) => "RGBカーブ".to_string(),
         LocalEffect::ColorBalance(_) => "カラーバランス".to_string(),
         LocalEffect::ThreeWayColorGrading(_) => "3-wayグレーディング".to_string(),
+        LocalEffect::SelectiveColor(params) => {
+            format!("選択色 {:.0}°", params.target_hue_degrees.rem_euclid(360.0))
+        }
         LocalEffect::Clarity(_) => "明瞭度".to_string(),
         LocalEffect::HighlightsShadows(_) => "ハイライト/シャドウ".to_string(),
         LocalEffect::Dehaze(params) => format!("かすみ除去 {:.0}%", params.amount * 100.0),
@@ -6927,6 +6935,146 @@ fn draw_effect_params(
             balance.lab_hover_tip(
                 "負の値でシャドウ寄り、正の値でハイライト寄りに効果範囲をずらします。",
             );
+        }
+        LocalEffect::SelectiveColor(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "赤を桜色") {
+                    *params = SelectiveColorParams {
+                        target_hue_degrees: 0.0,
+                        range_degrees: 18.0,
+                        feather_degrees: 18.0,
+                        hue_degrees: 18.0,
+                        saturation: -12.0,
+                        lightness: 10.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "肌を明るく") {
+                    *params = SelectiveColorParams {
+                        target_hue_degrees: 28.0,
+                        range_degrees: 24.0,
+                        feather_degrees: 24.0,
+                        saturation: 4.0,
+                        lightness: 12.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "空を青く") {
+                    *params = SelectiveColorParams {
+                        target_hue_degrees: 205.0,
+                        range_degrees: 28.0,
+                        feather_degrees: 24.0,
+                        saturation: 30.0,
+                        lightness: -8.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "緑を鮮やか") {
+                    *params = SelectiveColorParams {
+                        target_hue_degrees: 120.0,
+                        range_degrees: 28.0,
+                        feather_degrees: 24.0,
+                        saturation: 34.0,
+                        lightness: 4.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "青を紫へ") {
+                    *params = SelectiveColorParams {
+                        target_hue_degrees: 235.0,
+                        range_degrees: 26.0,
+                        feather_degrees: 22.0,
+                        hue_degrees: 35.0,
+                        saturation: 12.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "黄を橙へ") {
+                    *params = SelectiveColorParams {
+                        target_hue_degrees: 58.0,
+                        range_degrees: 24.0,
+                        feather_degrees: 18.0,
+                        hue_degrees: -18.0,
+                        saturation: 12.0,
+                        lightness: -2.0,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "対象色相に近い色だけを補正します。色が広く変わりすぎる場合は範囲やぼかしを小さくしてください。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "対象: 赤") {
+                    params.target_hue_degrees = 0.0;
+                    changed = true;
+                }
+                if preset_button(ui, "対象: 肌") {
+                    params.target_hue_degrees = 28.0;
+                    changed = true;
+                }
+                if preset_button(ui, "対象: 黄") {
+                    params.target_hue_degrees = 58.0;
+                    changed = true;
+                }
+                if preset_button(ui, "対象: 緑") {
+                    params.target_hue_degrees = 120.0;
+                    changed = true;
+                }
+                if preset_button(ui, "対象: 空") {
+                    params.target_hue_degrees = 205.0;
+                    changed = true;
+                }
+                if preset_button(ui, "対象: 青") {
+                    params.target_hue_degrees = 235.0;
+                    changed = true;
+                }
+                if preset_button(ui, "対象: 紫") {
+                    params.target_hue_degrees = 285.0;
+                    changed = true;
+                }
+            });
+            let target = ui.add(
+                egui::Slider::new(&mut params.target_hue_degrees, 0.0..=360.0)
+                    .text("対象色相")
+                    .suffix("°"),
+            );
+            changed |= target.changed();
+            target.lab_hover_tip(
+                "補正したい色の中心です。赤は0°、黄は60°、緑は120°、青は240°付近です。",
+            );
+            let range =
+                ui.add(egui::Slider::new(&mut params.range_degrees, 1.0..=90.0).text("範囲"));
+            changed |= range.changed();
+            range.lab_hover_tip("この角度以内の色は強く補正します。小さいほど一点狙いになります。");
+            let feather =
+                ui.add(egui::Slider::new(&mut params.feather_degrees, 0.0..=90.0).text("ぼかし"));
+            changed |= feather.changed();
+            feather.lab_hover_tip("範囲の外側へ、どれだけなだらかに効果を弱めるかです。");
+            let hue = ui.add(
+                egui::Slider::new(&mut params.hue_degrees, -180.0..=180.0)
+                    .text("色相補正")
+                    .suffix("°"),
+            );
+            changed |= hue.changed();
+            hue.lab_hover_tip("対象色だけ色相をずらします。");
+            let saturation =
+                ui.add(egui::Slider::new(&mut params.saturation, -100.0..=100.0).text("彩度"));
+            changed |= saturation.changed();
+            saturation.lab_hover_tip("対象色だけ鮮やかさを増減します。");
+            let lightness =
+                ui.add(egui::Slider::new(&mut params.lightness, -100.0..=100.0).text("明度"));
+            changed |= lightness.changed();
+            lightness.lab_hover_tip("対象色だけ明るさを増減します。");
         }
         LocalEffect::Clarity(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -9001,6 +9149,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ThreeWayColorGrading => {
             LocalEffect::ThreeWayColorGrading(ThreeWayColorGradingParams::default())
         }
+        EffectKind::SelectiveColor => LocalEffect::SelectiveColor(SelectiveColorParams::default()),
         EffectKind::Clarity => LocalEffect::Clarity(ClarityParams::default()),
         EffectKind::HighlightsShadows => {
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default())

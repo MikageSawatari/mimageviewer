@@ -47,12 +47,12 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、23種)
+### `LocalEffect` (部分補正レイヤー、24種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
-ThreeWayColorGrading(3-way), Hsl(単一・全体), ColorMixer(8色帯), HighlightsShadows, Clarity,
-Dehaze, Blur(box), SoftFocus, Mosaic, Sharpen, Look(15プリセット), GradientMap, Bloom, Vignette,
-FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth
+ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), Hsl(単一・全体), ColorMixer(8色帯),
+HighlightsShadows, Clarity, Dehaze, Blur(box), SoftFocus, Mosaic, Sharpen, Look(15プリセット),
+GradientMap, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -72,7 +72,7 @@ OilPaint(Kuwahara) / Sketch(Sobel) / LightLeak / 減色8機種 / CRT 3種＋複�
 - [x] **チャンネル別トーンカーブ (R/G/B 独立・多点)** ★★ **易** — 現 `ToneCurve` は5点合成のみ。RGB 独立化＋多点でクロスプロセス等が自在に (PS / CSP / Krita)
 - [x] **カラーバランス (シャドウ/中間/ハイライト別の色偏移)** ★★ **易** — Look より自由なグレーディング (PS / CSP)
 - [x] **3-way カラーグレーディング (カラーホイール)** ★ **中** — 上位版。Lightroom Color Grading / DaVinci 風
-- [ ] **セレクティブカラー / ポイントカラー** ★ **易〜中** — 特定色を選んでその色だけ調整 (Lightroom / PS)
+- [x] **セレクティブカラー / ポイントカラー** ★ **易〜中** — 特定色を選んでその色だけ調整 (Lightroom / PS)
 - [ ] **チャンネルミキサー / 本格白黒変換 (色別の明度寄与)** ★ **易** — モノクロ化を色ごとに制御 (PS / Krita)
 - [ ] **3D LUT (.cube) 読み込み** ★ **中** (infra は軽い) — 外部シネマ LUT を取り込み (PS Color Lookup)
 - [ ] **ポスタリゼーション (階調数指定)** ★ **易** — フラット/グラフィック調。減色フィルタとは別物 (PS / CSP / Krita)

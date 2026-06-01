@@ -406,6 +406,7 @@ pub enum LocalEffect {
     RgbToneCurve(RgbToneCurveParams),
     ColorBalance(ColorBalanceParams),
     ThreeWayColorGrading(ThreeWayColorGradingParams),
+    SelectiveColor(SelectiveColorParams),
     Clarity(ClarityParams),
     HighlightsShadows(HighlightsShadowsParams),
     Dehaze(DehazeParams),
@@ -573,6 +574,29 @@ impl Default for ThreeWayColorGradingParams {
                 ..Default::default()
             },
             balance: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SelectiveColorParams {
+    pub target_hue_degrees: f32,
+    pub range_degrees: f32,
+    pub feather_degrees: f32,
+    pub hue_degrees: f32,
+    pub saturation: f32,
+    pub lightness: f32,
+}
+
+impl Default for SelectiveColorParams {
+    fn default() -> Self {
+        Self {
+            target_hue_degrees: 0.0,
+            range_degrees: 18.0,
+            feather_degrees: 16.0,
+            hue_degrees: 0.0,
+            saturation: 0.0,
+            lightness: 0.0,
         }
     }
 }
@@ -1112,6 +1136,7 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         LocalEffect::ThreeWayColorGrading(params) => {
             apply_three_way_color_grading(&image.pixels, *params)
         }
+        LocalEffect::SelectiveColor(params) => apply_selective_color(&image.pixels, *params),
         LocalEffect::Clarity(params) => apply_clarity(
             &image.pixels,
             image.width,
@@ -1752,6 +1777,55 @@ fn grade_wheel_delta(wheel: ColorGradeWheel, weight: f32) -> [f32; 3] {
         (hue_rgb[1] - neutral) * tint_scale + luma_delta,
         (hue_rgb[2] - neutral) * tint_scale + luma_delta,
     ]
+}
+
+fn apply_selective_color(src: &[u8], params: SelectiveColorParams) -> Vec<u8> {
+    let hue_shift = params.hue_degrees / 360.0;
+    let sat_delta = (params.saturation / 100.0).clamp(-1.0, 1.0);
+    let light_delta = (params.lightness / 100.0).clamp(-1.0, 1.0);
+    if hue_shift.abs() <= f32::EPSILON
+        && sat_delta.abs() <= f32::EPSILON
+        && light_delta.abs() <= f32::EPSILON
+    {
+        return src.to_vec();
+    }
+    let target = params.target_hue_degrees.rem_euclid(360.0);
+    let range = params.range_degrees.clamp(1.0, 180.0);
+    let feather = params.feather_degrees.clamp(0.0, 180.0);
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let (mut h, mut s, mut l) = rgb_to_hsl(
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        );
+        let hue_degrees = h * 360.0;
+        let weight =
+            selective_hue_weight(hue_degrees, target, range, feather) * smoothstep(0.03, 0.16, s);
+        if weight <= f32::EPSILON {
+            continue;
+        }
+        h = wrap01(h + hue_shift * weight);
+        s = (s * (1.0 + sat_delta * weight)).clamp(0.0, 1.0);
+        l = (l + light_delta * 0.5 * weight).clamp(0.0, 1.0);
+        let [r, g, b] = hsl_to_rgb(h, s, l);
+        px[0] = to_u8(r);
+        px[1] = to_u8(g);
+        px[2] = to_u8(b);
+    }
+    out
+}
+
+fn selective_hue_weight(
+    hue_degrees: f32,
+    target_degrees: f32,
+    range_degrees: f32,
+    feather_degrees: f32,
+) -> f32 {
+    let delta = (hue_degrees - target_degrees).rem_euclid(360.0);
+    let distance = delta.min(360.0 - delta);
+    let outer = (range_degrees + feather_degrees).max(range_degrees + 0.001);
+    1.0 - smoothstep(range_degrees, outer, distance)
 }
 
 fn apply_clarity(src: &[u8], width: usize, height: usize, radius: usize, amount: f32) -> Vec<u8> {
@@ -3131,6 +3205,7 @@ mod tests {
             LocalEffect::RgbToneCurve(RgbToneCurveParams::default()),
             LocalEffect::ColorBalance(ColorBalanceParams::default()),
             LocalEffect::ThreeWayColorGrading(ThreeWayColorGradingParams::default()),
+            LocalEffect::SelectiveColor(SelectiveColorParams::default()),
             LocalEffect::Clarity(ClarityParams::default()),
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default()),
             LocalEffect::Dehaze(DehazeParams::default()),
@@ -3273,6 +3348,32 @@ mod tests {
         assert!(out.pixels[2] - src.pixels[2] > out.pixels[10] - src.pixels[10]);
         assert_eq!(out.pixels[3], 255);
         assert_eq!(out.pixels[11], 255);
+    }
+
+    #[test]
+    fn selective_color_changes_target_hue_only() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![220, 20, 20, 255, 20, 220, 20, 255, 20, 20, 220, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "selective",
+            LocalMask::Full,
+            LocalEffect::SelectiveColor(SelectiveColorParams {
+                target_hue_degrees: 0.0,
+                range_degrees: 10.0,
+                feather_degrees: 8.0,
+                hue_degrees: 120.0,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] < src.pixels[0]);
+        assert!(out.pixels[1] > src.pixels[1]);
+        assert_eq!(&out.pixels[4..8], &src.pixels[4..8]);
+        assert_eq!(&out.pixels[8..12], &src.pixels[8..12]);
     }
 
     #[test]
