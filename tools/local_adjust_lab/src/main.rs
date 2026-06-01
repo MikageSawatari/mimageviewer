@@ -19,9 +19,10 @@ use local_adjust_core::{
     GradientMapPreset, HalftoneParams, HighlightsShadowsParams, HslParams, LineKind,
     LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
     ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode,
-    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbaImageBuf,
-    RgbaImageRef, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams, ToneCurveParams,
-    ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size, evaluate_layer_mask,
+    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
+    RgbaImageBuf, RgbaImageRef, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams,
+    ToneCurveParams, ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size,
+    evaluate_layer_mask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -918,6 +919,7 @@ enum EffectKind {
     None,
     Tone,
     ToneCurve,
+    RgbToneCurve,
     Clarity,
     HighlightsShadows,
     Dehaze,
@@ -944,6 +946,7 @@ impl EffectKind {
             LocalEffect::None => Self::None,
             LocalEffect::Tone(_) => Self::Tone,
             LocalEffect::ToneCurve(_) => Self::ToneCurve,
+            LocalEffect::RgbToneCurve(_) => Self::RgbToneCurve,
             LocalEffect::Clarity(_) => Self::Clarity,
             LocalEffect::HighlightsShadows(_) => Self::HighlightsShadows,
             LocalEffect::Dehaze(_) => Self::Dehaze,
@@ -970,6 +973,7 @@ impl EffectKind {
             Self::None => "効果なし",
             Self::Tone => "色調補正",
             Self::ToneCurve => "トーンカーブ",
+            Self::RgbToneCurve => "RGBカーブ",
             Self::Clarity => "明瞭度",
             Self::HighlightsShadows => "ハイライト/シャドウ",
             Self::Dehaze => "かすみ除去",
@@ -996,6 +1000,7 @@ impl EffectKind {
             Self::None => "このレイヤーで加工を行わず、マスクだけを準備します。",
             Self::Tone => "明るさ、コントラスト、彩度、色温度などをまとめて調整します。",
             Self::ToneCurve => "暗部から明部までの明るさをカーブで細かく調整します。",
+            Self::RgbToneCurve => "赤、緑、青のチャンネル別カーブで色味と明暗を細かく調整します。",
             Self::Clarity => "局所コントラストを上げ、輪郭や質感をくっきり見せます。",
             Self::HighlightsShadows => "明るい部分と暗い部分を個別に持ち上げたり抑えたりします。",
             Self::Dehaze => "白っぽさを減らし、遠景や薄いコントラストを締めます。",
@@ -1035,6 +1040,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
         kinds: &[
             EffectKind::Tone,
             EffectKind::ToneCurve,
+            EffectKind::RgbToneCurve,
             EffectKind::Hsl,
             EffectKind::ColorMixer,
             EffectKind::HighlightsShadows,
@@ -6140,6 +6146,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::None => "効果なし".to_string(),
         LocalEffect::Tone(_) => "色調補正".to_string(),
         LocalEffect::ToneCurve(_) => "トーンカーブ".to_string(),
+        LocalEffect::RgbToneCurve(_) => "RGBカーブ".to_string(),
         LocalEffect::Clarity(_) => "明瞭度".to_string(),
         LocalEffect::HighlightsShadows(_) => "ハイライト/シャドウ".to_string(),
         LocalEffect::Dehaze(params) => format!("かすみ除去 {:.0}%", params.amount * 100.0),
@@ -6279,6 +6286,45 @@ fn preset_button(ui: &mut egui::Ui, label: &str) -> bool {
 }
 
 fn draw_tone_curve_preview(ui: &mut egui::Ui, params: ToneCurveParams) {
+    draw_curve_preview_lines(
+        ui,
+        &[(
+            params.points,
+            Color32::from_rgb(120, 210, 255),
+            egui::Stroke::new(2.0, Color32::from_rgb(120, 210, 255)),
+        )],
+    );
+}
+
+fn draw_rgb_tone_curve_preview(ui: &mut egui::Ui, params: RgbToneCurveParams) {
+    draw_curve_preview_lines(
+        ui,
+        &[
+            (
+                params.master,
+                Color32::from_rgb(230, 230, 230),
+                egui::Stroke::new(1.5, Color32::from_rgb(230, 230, 230)),
+            ),
+            (
+                params.red,
+                Color32::from_rgb(255, 95, 115),
+                egui::Stroke::new(2.0, Color32::from_rgb(255, 95, 115)),
+            ),
+            (
+                params.green,
+                Color32::from_rgb(95, 220, 120),
+                egui::Stroke::new(2.0, Color32::from_rgb(95, 220, 120)),
+            ),
+            (
+                params.blue,
+                Color32::from_rgb(110, 150, 255),
+                egui::Stroke::new(2.0, Color32::from_rgb(110, 150, 255)),
+            ),
+        ],
+    );
+}
+
+fn draw_curve_preview_lines(ui: &mut egui::Ui, curves: &[([f32; 5], Color32, egui::Stroke)]) {
     let desired = egui::vec2(ui.available_width().min(220.0), 120.0);
     let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
     let painter = ui.painter_at(rect);
@@ -6306,21 +6352,20 @@ fn draw_tone_curve_preview(ui: &mut egui::Ui, params: ToneCurveParams) {
         [rect.left_bottom(), rect.right_top()],
         egui::Stroke::new(1.0, Color32::from_gray(68)),
     );
-    let mut prev = None;
-    for i in 0..=64 {
-        let x01 = i as f32 / 64.0;
-        let y01 = preview_tone_curve_value(x01, params.points);
-        let p = Pos2::new(
-            egui::lerp(rect.left()..=rect.right(), x01),
-            egui::lerp(rect.bottom()..=rect.top(), y01),
-        );
-        if let Some(prev) = prev {
-            painter.line_segment(
-                [prev, p],
-                egui::Stroke::new(2.0, Color32::from_rgb(120, 210, 255)),
+    for &(points, _color, stroke) in curves {
+        let mut prev = None;
+        for i in 0..=64 {
+            let x01 = i as f32 / 64.0;
+            let y01 = preview_tone_curve_value(x01, points);
+            let p = Pos2::new(
+                egui::lerp(rect.left()..=rect.right(), x01),
+                egui::lerp(rect.bottom()..=rect.top(), y01),
             );
+            if let Some(prev) = prev {
+                painter.line_segment([prev, p], stroke);
+            }
+            prev = Some(p);
         }
-        prev = Some(p);
     }
 }
 
@@ -6331,6 +6376,16 @@ fn preview_tone_curve_value(x: f32, points: [f32; 5]) -> f32 {
     let t = ((x - x0) * 4.0).clamp(0.0, 1.0);
     points[seg].clamp(0.0, 1.0)
         + (points[seg + 1].clamp(0.0, 1.0) - points[seg].clamp(0.0, 1.0)) * t
+}
+
+fn draw_curve_point_sliders(ui: &mut egui::Ui, points: &mut [f32; 5]) -> bool {
+    let mut changed = false;
+    for (idx, label) in ["黒", "暗部", "中間", "明部", "白"].iter().enumerate() {
+        let response = ui.add(egui::Slider::new(&mut points[idx], 0.0..=1.0).text(*label));
+        changed |= response.changed();
+        response.lab_hover_tip("左ほど暗部、右ほど明部の出力明るさです。");
+    }
+    changed
 }
 
 fn draw_effect_params(
@@ -6456,15 +6511,93 @@ fn draw_effect_params(
             });
             draw_tone_curve_preview(ui, *params);
             ui.label(
-                egui::RichText::new("RGB共通の簡易カーブです。チャンネル別カーブは後続候補です。")
-                    .size(10.0)
-                    .color(Color32::from_gray(170)),
+                egui::RichText::new(
+                    "RGB共通の簡易カーブです。色チャンネルは RGBカーブ で調整します。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
             );
             for (idx, label) in ["黒", "暗部", "中間", "明部", "白"].iter().enumerate() {
                 changed |= ui
                     .add(egui::Slider::new(&mut params.points[idx], 0.0..=1.0).text(*label))
                     .changed();
             }
+        }
+        LocalEffect::RgbToneCurve(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "暖色") {
+                    *params = RgbToneCurveParams {
+                        red: [0.0, 0.30, 0.58, 0.82, 1.0],
+                        blue: [0.0, 0.20, 0.44, 0.70, 1.0],
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "寒色") {
+                    *params = RgbToneCurveParams {
+                        red: [0.0, 0.20, 0.44, 0.70, 1.0],
+                        blue: [0.0, 0.31, 0.60, 0.84, 1.0],
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "フィルム") {
+                    *params = RgbToneCurveParams {
+                        master: [0.06, 0.24, 0.50, 0.76, 0.96],
+                        red: [0.0, 0.25, 0.53, 0.82, 1.0],
+                        blue: [0.06, 0.30, 0.52, 0.72, 0.95],
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "影を青く") {
+                    *params = RgbToneCurveParams {
+                        red: [0.0, 0.18, 0.46, 0.75, 1.0],
+                        blue: [0.08, 0.34, 0.54, 0.76, 1.0],
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "明部を暖かく") {
+                    *params = RgbToneCurveParams {
+                        red: [0.0, 0.25, 0.52, 0.84, 1.0],
+                        green: [0.0, 0.25, 0.51, 0.78, 1.0],
+                        blue: [0.0, 0.25, 0.48, 0.66, 0.94],
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "クロス") {
+                    *params = RgbToneCurveParams {
+                        master: [0.04, 0.22, 0.50, 0.78, 0.98],
+                        red: [0.0, 0.20, 0.48, 0.82, 1.0],
+                        green: [0.0, 0.27, 0.52, 0.74, 1.0],
+                        blue: [0.08, 0.34, 0.54, 0.72, 0.94],
+                    };
+                    changed = true;
+                }
+            });
+            draw_rgb_tone_curve_preview(ui, *params);
+            ui.label(
+                egui::RichText::new(
+                    "白い線が全体、赤/緑/青の線が各チャンネルです。全体カーブ後に各チャンネルを適用します。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.collapsing("全体", |ui| {
+                changed |= draw_curve_point_sliders(ui, &mut params.master);
+            });
+            ui.collapsing("赤", |ui| {
+                changed |= draw_curve_point_sliders(ui, &mut params.red);
+            });
+            ui.collapsing("緑", |ui| {
+                changed |= draw_curve_point_sliders(ui, &mut params.green);
+            });
+            ui.collapsing("青", |ui| {
+                changed |= draw_curve_point_sliders(ui, &mut params.blue);
+            });
         }
         LocalEffect::Clarity(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -8534,6 +8667,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::None => LocalEffect::None,
         EffectKind::Tone => LocalEffect::Tone(ToneParams::default()),
         EffectKind::ToneCurve => LocalEffect::ToneCurve(ToneCurveParams::default()),
+        EffectKind::RgbToneCurve => LocalEffect::RgbToneCurve(RgbToneCurveParams::default()),
         EffectKind::Clarity => LocalEffect::Clarity(ClarityParams::default()),
         EffectKind::HighlightsShadows => {
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default())

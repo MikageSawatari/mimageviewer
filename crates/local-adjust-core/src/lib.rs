@@ -403,6 +403,7 @@ pub enum LocalEffect {
     None,
     Tone(ToneParams),
     ToneCurve(ToneCurveParams),
+    RgbToneCurve(RgbToneCurveParams),
     Clarity(ClarityParams),
     HighlightsShadows(HighlightsShadowsParams),
     Dehaze(DehazeParams),
@@ -455,6 +456,26 @@ impl Default for ToneCurveParams {
     fn default() -> Self {
         Self {
             points: [0.0, 0.25, 0.5, 0.75, 1.0],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RgbToneCurveParams {
+    pub master: [f32; 5],
+    pub red: [f32; 5],
+    pub green: [f32; 5],
+    pub blue: [f32; 5],
+}
+
+impl Default for RgbToneCurveParams {
+    fn default() -> Self {
+        let identity = [0.0, 0.25, 0.5, 0.75, 1.0];
+        Self {
+            master: identity,
+            red: identity,
+            green: identity,
+            blue: identity,
         }
     }
 }
@@ -989,6 +1010,7 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         LocalEffect::None => unreachable!("None is handled before mask evaluation"),
         LocalEffect::Tone(params) => apply_tone_image(&image.pixels, *params),
         LocalEffect::ToneCurve(params) => apply_tone_curve(&image.pixels, *params),
+        LocalEffect::RgbToneCurve(params) => apply_rgb_tone_curve(&image.pixels, *params),
         LocalEffect::Clarity(params) => apply_clarity(
             &image.pixels,
             image.width,
@@ -1484,10 +1506,32 @@ fn apply_tone_curve(src: &[u8], params: ToneCurveParams) -> Vec<u8> {
     out
 }
 
+fn apply_rgb_tone_curve(src: &[u8], params: RgbToneCurveParams) -> Vec<u8> {
+    let red_lut = rgb_tone_curve_lut(params.master, params.red);
+    let green_lut = rgb_tone_curve_lut(params.master, params.green);
+    let blue_lut = rgb_tone_curve_lut(params.master, params.blue);
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        px[0] = red_lut[px[0] as usize];
+        px[1] = green_lut[px[1] as usize];
+        px[2] = blue_lut[px[2] as usize];
+    }
+    out
+}
+
 fn tone_curve_lut(params: ToneCurveParams) -> [u8; 256] {
     let mut lut = [0_u8; 256];
     for (i, v) in lut.iter_mut().enumerate() {
         *v = to_u8(tone_curve_value(i as f32 / 255.0, params.points));
+    }
+    lut
+}
+
+fn rgb_tone_curve_lut(master: [f32; 5], channel: [f32; 5]) -> [u8; 256] {
+    let mut lut = [0_u8; 256];
+    for (i, v) in lut.iter_mut().enumerate() {
+        let master_value = tone_curve_value(i as f32 / 255.0, master);
+        *v = to_u8(tone_curve_value(master_value, channel));
     }
     lut
 }
@@ -2878,6 +2922,7 @@ mod tests {
         let effects = [
             LocalEffect::Tone(ToneParams::default()),
             LocalEffect::ToneCurve(ToneCurveParams::default()),
+            LocalEffect::RgbToneCurve(RgbToneCurveParams::default()),
             LocalEffect::Clarity(ClarityParams::default()),
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default()),
             LocalEffect::Dehaze(DehazeParams::default()),
@@ -2944,6 +2989,25 @@ mod tests {
             &src.pixels[4..8],
             "blue pixel should stay outside the red band"
         );
+    }
+
+    #[test]
+    fn rgb_tone_curve_adjusts_channels_independently() {
+        let src = RgbaImageBuf::new(1, 1, vec![128, 128, 128, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "rgb curve",
+            LocalMask::Full,
+            LocalEffect::RgbToneCurve(RgbToneCurveParams {
+                red: [0.0, 0.35, 0.65, 0.86, 1.0],
+                blue: [0.0, 0.16, 0.35, 0.64, 1.0],
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert_eq!(out.pixels[1], src.pixels[1]);
+        assert!(out.pixels[2] < src.pixels[2]);
+        assert_eq!(out.pixels[3], 255);
     }
 
     #[test]
