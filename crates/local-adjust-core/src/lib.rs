@@ -411,6 +411,7 @@ pub enum LocalEffect {
     Mosaic(MosaicParams),
     Sharpen(SharpenParams),
     Hsl(HslParams),
+    ColorMixer(ColorMixerParams),
     Look(LookParams),
     GradientMap(GradientMapParams),
     Bloom(BloomParams),
@@ -654,6 +655,48 @@ impl Default for HslParams {
             hue_degrees: 0.0,
             saturation: 0.0,
             lightness: 0.0,
+        }
+    }
+}
+
+pub const COLOR_MIXER_BAND_COUNT: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ColorMixerBand {
+    pub hue_degrees: f32,
+    pub saturation: f32,
+    pub lightness: f32,
+}
+
+impl Default for ColorMixerBand {
+    fn default() -> Self {
+        Self {
+            hue_degrees: 0.0,
+            saturation: 0.0,
+            lightness: 0.0,
+        }
+    }
+}
+
+impl ColorMixerBand {
+    fn is_identity(self) -> bool {
+        self.hue_degrees.abs() <= f32::EPSILON
+            && self.saturation.abs() <= f32::EPSILON
+            && self.lightness.abs() <= f32::EPSILON
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ColorMixerParams {
+    pub bands: [ColorMixerBand; COLOR_MIXER_BAND_COUNT],
+    pub range_degrees: f32,
+}
+
+impl Default for ColorMixerParams {
+    fn default() -> Self {
+        Self {
+            bands: [ColorMixerBand::default(); COLOR_MIXER_BAND_COUNT],
+            range_degrees: 34.0,
         }
     }
 }
@@ -979,6 +1022,7 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
             params.amount.clamp(0.0, 2.0),
         ),
         LocalEffect::Hsl(params) => apply_hsl(&image.pixels, *params),
+        LocalEffect::ColorMixer(params) => apply_color_mixer(&image.pixels, *params),
         LocalEffect::Look(params) => apply_look(&image.pixels, *params),
         LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
         LocalEffect::Bloom(params) => {
@@ -1819,6 +1863,70 @@ fn apply_hsl(src: &[u8], params: HslParams) -> Vec<u8> {
         px[2] = to_u8(b);
     }
     out
+}
+
+const COLOR_MIXER_BAND_CENTERS: [f32; COLOR_MIXER_BAND_COUNT] =
+    [0.0, 30.0, 60.0, 120.0, 180.0, 240.0, 285.0, 320.0];
+
+fn apply_color_mixer(src: &[u8], params: ColorMixerParams) -> Vec<u8> {
+    if params.bands.iter().all(|band| band.is_identity()) {
+        return src.to_vec();
+    }
+    let range = params.range_degrees.clamp(8.0, 90.0);
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let (mut h, mut s, mut l) = rgb_to_hsl(
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        );
+        let hue_degrees = h * 360.0;
+        let saturation_guard = smoothstep(0.03, 0.16, s);
+        if saturation_guard <= f32::EPSILON {
+            continue;
+        }
+        let mut hue_delta = 0.0_f32;
+        let mut sat_delta = 0.0_f32;
+        let mut light_delta = 0.0_f32;
+        for (idx, band) in params.bands.iter().enumerate() {
+            if band.is_identity() {
+                continue;
+            }
+            let weight = hue_band_weight(hue_degrees, COLOR_MIXER_BAND_CENTERS[idx], range)
+                * saturation_guard;
+            if weight <= f32::EPSILON {
+                continue;
+            }
+            hue_delta += weight * (band.hue_degrees / 360.0).clamp(-0.5, 0.5);
+            sat_delta += weight * (band.saturation / 100.0).clamp(-1.0, 1.0);
+            light_delta += weight * (band.lightness / 100.0).clamp(-1.0, 1.0);
+        }
+        if hue_delta.abs() <= f32::EPSILON
+            && sat_delta.abs() <= f32::EPSILON
+            && light_delta.abs() <= f32::EPSILON
+        {
+            continue;
+        }
+        h = wrap01(h + hue_delta);
+        s = (s * (1.0 + sat_delta.clamp(-1.0, 1.0))).clamp(0.0, 1.0);
+        l = (l + light_delta.clamp(-1.0, 1.0) * 0.5).clamp(0.0, 1.0);
+        let [r, g, b] = hsl_to_rgb(h, s, l);
+        px[0] = to_u8(r);
+        px[1] = to_u8(g);
+        px[2] = to_u8(b);
+    }
+    out
+}
+
+fn hue_band_weight(hue_degrees: f32, center_degrees: f32, range_degrees: f32) -> f32 {
+    let delta = (hue_degrees - center_degrees).rem_euclid(360.0);
+    let distance = delta.min(360.0 - delta);
+    if distance >= range_degrees {
+        0.0
+    } else {
+        let t = 1.0 - distance / range_degrees.max(f32::EPSILON);
+        t * t * (3.0 - 2.0 * t)
+    }
 }
 
 fn apply_look(src: &[u8], params: LookParams) -> Vec<u8> {
@@ -2778,6 +2886,7 @@ mod tests {
             LocalEffect::Mosaic(MosaicParams::default()),
             LocalEffect::Sharpen(SharpenParams::default()),
             LocalEffect::Hsl(HslParams::default()),
+            LocalEffect::ColorMixer(ColorMixerParams::default()),
             LocalEffect::Look(LookParams::default()),
             LocalEffect::GradientMap(GradientMapParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
@@ -2816,6 +2925,25 @@ mod tests {
         assert!(out.pixels[0] < out.pixels[8]);
         assert!(out.pixels[9] > out.pixels[1]);
         assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn color_mixer_adjusts_matching_hue_band() {
+        let src = RgbaImageBuf::new(2, 1, vec![220, 30, 30, 255, 30, 40, 220, 255]).unwrap();
+        let mut params = ColorMixerParams::default();
+        params.bands[0].hue_degrees = 120.0;
+        let layer =
+            LocalAdjustmentLayer::new("mixer", LocalMask::Full, LocalEffect::ColorMixer(params));
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(
+            out.pixels[1] > out.pixels[0],
+            "red band should shift toward green"
+        );
+        assert_eq!(
+            &out.pixels[4..8],
+            &src.pixels[4..8],
+            "blue pixel should stay outside the red band"
+        );
     }
 
     #[test]

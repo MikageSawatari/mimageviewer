@@ -14,14 +14,14 @@ use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
-    BloomParams, BlurParams, ChromaticAberrationParams, ClarityParams, ColorRangeMask,
-    DehazeParams, EdgeSmoothParams, FilmGrainParams, GradientMapParams, GradientMapPreset,
-    HalftoneParams, HighlightsShadowsParams, HslParams, LineKind, LinearGradientMask,
-    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
-    MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode, RadialGradientMask, RangeMask,
-    RasterMask, RasterVectorMask, RegionMask, RgbaImageBuf, RgbaImageRef, ShapeOp, SharpenParams,
-    SoftFocusParams, StarGlowParams, ToneCurveParams, ToneParams, VignetteParams, apply_layers,
-    compute_mosaic_tile_size, evaluate_layer_mask,
+    BloomParams, BlurParams, ChromaticAberrationParams, ClarityParams, ColorMixerParams,
+    ColorRangeMask, DehazeParams, EdgeSmoothParams, FilmGrainParams, GradientMapParams,
+    GradientMapPreset, HalftoneParams, HighlightsShadowsParams, HslParams, LineKind,
+    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
+    ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode,
+    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbaImageBuf,
+    RgbaImageRef, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams, ToneCurveParams,
+    ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size, evaluate_layer_mask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -926,6 +926,7 @@ enum EffectKind {
     Mosaic,
     Sharpen,
     Hsl,
+    ColorMixer,
     Look,
     GradientMap,
     Bloom,
@@ -951,6 +952,7 @@ impl EffectKind {
             LocalEffect::Mosaic(_) => Self::Mosaic,
             LocalEffect::Sharpen(_) => Self::Sharpen,
             LocalEffect::Hsl(_) => Self::Hsl,
+            LocalEffect::ColorMixer(_) => Self::ColorMixer,
             LocalEffect::Look(_) => Self::Look,
             LocalEffect::GradientMap(_) => Self::GradientMap,
             LocalEffect::Bloom(_) => Self::Bloom,
@@ -976,6 +978,7 @@ impl EffectKind {
             Self::Mosaic => "モザイク",
             Self::Sharpen => "シャープ",
             Self::Hsl => "色相/HSL",
+            Self::ColorMixer => "カラーミキサー",
             Self::Look => "ルック",
             Self::GradientMap => "グラデーションマップ",
             Self::Bloom => "ブルーム",
@@ -1001,6 +1004,7 @@ impl EffectKind {
             Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
             Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
             Self::Hsl => "色相、彩度、明度を調整し、髪色変更などの色替えに使います。",
+            Self::ColorMixer => "赤、黄、緑、青などの色帯ごとに色相、彩度、明度を調整します。",
             Self::Look => "夕焼け、夜景、フィルム風などのまとまった色味を適用します。",
             Self::GradientMap => {
                 "明るさを指定したグラデーションの色へ置き換え、色設計や色トレス風に使います。"
@@ -1032,6 +1036,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Tone,
             EffectKind::ToneCurve,
             EffectKind::Hsl,
+            EffectKind::ColorMixer,
             EffectKind::HighlightsShadows,
             EffectKind::Dehaze,
             EffectKind::Look,
@@ -6146,6 +6151,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
         ),
         LocalEffect::Sharpen(params) => format!("シャープ {:.0}%", params.amount * 100.0),
         LocalEffect::Hsl(params) => format!("色相 {:+.0}°", params.hue_degrees),
+        LocalEffect::ColorMixer(params) => {
+            format!("カラーミキサー {}色", color_mixer_adjusted_count(params))
+        }
         LocalEffect::Look(params) => format!("ルック {}", look_preset_label(params.preset)),
         LocalEffect::GradientMap(params) => {
             format!(
@@ -6208,6 +6216,32 @@ fn look_preset_label(preset: LookPreset) -> &'static str {
         LookPreset::LowKey => "ローキー",
         LookPreset::Sepia => "セピア",
         LookPreset::Cyberpunk => "サイバーパンク",
+    }
+}
+
+fn color_mixer_adjusted_count(params: &ColorMixerParams) -> usize {
+    params
+        .bands
+        .iter()
+        .filter(|band| {
+            band.hue_degrees.abs() > f32::EPSILON
+                || band.saturation.abs() > f32::EPSILON
+                || band.lightness.abs() > f32::EPSILON
+        })
+        .count()
+}
+
+fn color_mixer_band_label(index: usize) -> &'static str {
+    match index {
+        0 => "赤",
+        1 => "橙/肌",
+        2 => "黄",
+        3 => "緑",
+        4 => "シアン",
+        5 => "青",
+        6 => "紫",
+        7 => "マゼンタ",
+        _ => "色帯",
     }
 }
 
@@ -6797,6 +6831,81 @@ fn draw_effect_params(
             changed |= ui
                 .add(egui::Slider::new(&mut params.lightness, -100.0..=100.0).text("明度"))
                 .changed();
+        }
+        LocalEffect::ColorMixer(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "空を濃く") {
+                    *params = ColorMixerParams::default();
+                    params.bands[4].saturation = 18.0;
+                    params.bands[4].lightness = -6.0;
+                    params.bands[5].saturation = 26.0;
+                    params.bands[5].lightness = -10.0;
+                    changed = true;
+                }
+                if preset_button(ui, "緑を鮮やか") {
+                    *params = ColorMixerParams::default();
+                    params.bands[3].saturation = 32.0;
+                    params.bands[3].lightness = 4.0;
+                    changed = true;
+                }
+                if preset_button(ui, "肌を明るく") {
+                    *params = ColorMixerParams::default();
+                    params.bands[1].saturation = 8.0;
+                    params.bands[1].lightness = 12.0;
+                    params.bands[2].lightness = 4.0;
+                    changed = true;
+                }
+                if preset_button(ui, "赤を桜色") {
+                    *params = ColorMixerParams::default();
+                    params.bands[0].hue_degrees = 16.0;
+                    params.bands[0].saturation = -8.0;
+                    params.bands[0].lightness = 8.0;
+                    params.bands[7].lightness = 6.0;
+                    changed = true;
+                }
+                if preset_button(ui, "青を紫へ") {
+                    *params = ColorMixerParams::default();
+                    params.bands[5].hue_degrees = 32.0;
+                    params.bands[5].saturation = 10.0;
+                    params.bands[6].saturation = 12.0;
+                    changed = true;
+                }
+                if preset_button(ui, "黄を橙へ") {
+                    *params = ColorMixerParams::default();
+                    params.bands[2].hue_degrees = -18.0;
+                    params.bands[2].saturation = 12.0;
+                    params.bands[1].saturation = 10.0;
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "色相ごとに補正します。カラー範囲マスクなしでも、近い色だけをまとめて調整できます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let range_response =
+                ui.add(egui::Slider::new(&mut params.range_degrees, 8.0..=90.0).text("色帯の広さ"));
+            changed |= range_response.changed();
+            range_response.lab_hover_tip("大きくすると隣の色にもなだらかに効果が広がります。");
+            for (idx, band) in params.bands.iter_mut().enumerate() {
+                ui.collapsing(color_mixer_band_label(idx), |ui| {
+                    let hue = ui
+                        .add(egui::Slider::new(&mut band.hue_degrees, -180.0..=180.0).text("色相"));
+                    changed |= hue.changed();
+                    hue.lab_hover_tip("この色帯だけ色相をずらします。");
+                    let saturation = ui
+                        .add(egui::Slider::new(&mut band.saturation, -100.0..=100.0).text("彩度"));
+                    changed |= saturation.changed();
+                    saturation.lab_hover_tip("この色帯だけ鮮やかさを増減します。");
+                    let lightness =
+                        ui.add(egui::Slider::new(&mut band.lightness, -100.0..=100.0).text("明度"));
+                    changed |= lightness.changed();
+                    lightness.lab_hover_tip("この色帯だけ明るさを増減します。");
+                });
+            }
         }
         LocalEffect::Look(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -8435,6 +8544,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Mosaic => LocalEffect::Mosaic(MosaicParams::default()),
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
         EffectKind::Hsl => LocalEffect::Hsl(HslParams::default()),
+        EffectKind::ColorMixer => LocalEffect::ColorMixer(ColorMixerParams::default()),
         EffectKind::Look => LocalEffect::Look(LookParams::default()),
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),

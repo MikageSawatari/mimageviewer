@@ -47,10 +47,11 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、18種)
+### `LocalEffect` (部分補正レイヤー、20種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度), ToneCurve(5点・RGB合成), Hsl(単一・全体),
-HighlightsShadows, Clarity, Dehaze, Blur(box), SoftFocus, Mosaic, Sharpen, Look(15プリセット),
-Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth
+ColorMixer(8色帯), HighlightsShadows, Clarity, Dehaze, Blur(box), SoftFocus, Mosaic, Sharpen,
+Look(15プリセット), GradientMap, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone,
+StarGlow, EdgeSmooth
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -65,8 +66,8 @@ OilPaint(Kuwahara) / Sketch(Sobel) / LightLeak / 減色8機種 / CRT 3種＋複�
 
 すべて per-pixel LUT 系で既存の高速色調パイプラインに素直に乗る。まずここで「本格カラーグレーディング suite」を揃えるのがコスパ最良。
 
-- [ ] **グラデーションマップ** ★★★ **易** — 輝度→任意グラデの色に置換。色設計・色トレス的仕上げの定番 (PS / CSP / Krita)
-- [ ] **色相別 HSL / カラーミキサー (6〜8色帯)** ★★★ **易〜中** — 「肌だけ」「空だけ」など色域ごとに H/S/L 調整。現 `Hsl` は全体一律なので別物 (Lightroom / PS / Krita)
+- [x] **グラデーションマップ** ★★★ **易** — 輝度→任意グラデの色に置換。色設計・色トレス的仕上げの定番 (PS / CSP / Krita)
+- [x] **色相別 HSL / カラーミキサー (6〜8色帯)** ★★★ **易〜中** — 「肌だけ」「空だけ」など色域ごとに H/S/L 調整。現 `Hsl` は全体一律なので別物 (Lightroom / PS / Krita)
 - [ ] **チャンネル別トーンカーブ (R/G/B 独立・多点)** ★★ **易** — 現 `ToneCurve` は5点合成のみ。RGB 独立化＋多点でクロスプロセス等が自在に (PS / CSP / Krita)
 - [ ] **カラーバランス (シャドウ/中間/ハイライト別の色偏移)** ★★ **易** — Look より自由なグレーディング (PS / CSP)
 - [ ] **3-way カラーグレーディング (カラーホイール)** ★ **中** — 上位版。Lightroom Color Grading / DaVinci 風
