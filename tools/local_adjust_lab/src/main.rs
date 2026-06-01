@@ -14,15 +14,16 @@ use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
-    BloomParams, BlurParams, ChromaticAberrationParams, ClarityParams, ColorBalanceParams,
-    ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask, DehazeParams,
-    EdgeSmoothParams, FilmGrainParams, GradientMapParams, GradientMapPreset, HalftoneParams,
-    HighlightsShadowsParams, HslParams, LineKind, LinearGradientMask, LocalAdjustmentLayer,
-    LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MosaicBoundary,
-    MosaicParams, MosaicTileMode, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
-    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp,
-    SharpenParams, SoftFocusParams, StarGlowParams, ThreeWayColorGradingParams, ToneCurveParams,
-    ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size, evaluate_layer_mask,
+    BloomParams, BlurParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
+    ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
+    DehazeParams, EdgeSmoothParams, FilmGrainParams, GradientMapParams, GradientMapPreset,
+    HalftoneParams, HighlightsShadowsParams, HslParams, LineKind, LinearGradientMask,
+    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
+    MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode, RadialGradientMask, RangeMask,
+    RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
+    SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams,
+    ThreeWayColorGradingParams, ToneCurveParams, ToneParams, VignetteParams, apply_layers,
+    compute_mosaic_tile_size, evaluate_layer_mask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -923,6 +924,7 @@ enum EffectKind {
     ColorBalance,
     ThreeWayColorGrading,
     SelectiveColor,
+    ChannelMixer,
     Clarity,
     HighlightsShadows,
     Dehaze,
@@ -953,6 +955,7 @@ impl EffectKind {
             LocalEffect::ColorBalance(_) => Self::ColorBalance,
             LocalEffect::ThreeWayColorGrading(_) => Self::ThreeWayColorGrading,
             LocalEffect::SelectiveColor(_) => Self::SelectiveColor,
+            LocalEffect::ChannelMixer(_) => Self::ChannelMixer,
             LocalEffect::Clarity(_) => Self::Clarity,
             LocalEffect::HighlightsShadows(_) => Self::HighlightsShadows,
             LocalEffect::Dehaze(_) => Self::Dehaze,
@@ -983,6 +986,7 @@ impl EffectKind {
             Self::ColorBalance => "カラーバランス",
             Self::ThreeWayColorGrading => "3-wayグレーディング",
             Self::SelectiveColor => "セレクティブカラー",
+            Self::ChannelMixer => "チャンネルミキサー",
             Self::Clarity => "明瞭度",
             Self::HighlightsShadows => "ハイライト/シャドウ",
             Self::Dehaze => "かすみ除去",
@@ -1015,6 +1019,7 @@ impl EffectKind {
                 "シャドウ、中間、ハイライトに別々の色味と明るさを足して空気感を作ります。"
             }
             Self::SelectiveColor => "指定した色相の近くにある色だけを狙って調整します。",
+            Self::ChannelMixer => "RGBチャンネルの寄与率を変え、色変換や本格的な白黒化を行います。",
             Self::Clarity => "局所コントラストを上げ、輪郭や質感をくっきり見せます。",
             Self::HighlightsShadows => "明るい部分と暗い部分を個別に持ち上げたり抑えたりします。",
             Self::Dehaze => "白っぽさを減らし、遠景や薄いコントラストを締めます。",
@@ -1058,6 +1063,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::ColorBalance,
             EffectKind::ThreeWayColorGrading,
             EffectKind::SelectiveColor,
+            EffectKind::ChannelMixer,
             EffectKind::Hsl,
             EffectKind::ColorMixer,
             EffectKind::HighlightsShadows,
@@ -6196,6 +6202,13 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::SelectiveColor(params) => {
             format!("選択色 {:.0}°", params.target_hue_degrees.rem_euclid(360.0))
         }
+        LocalEffect::ChannelMixer(params) => {
+            if params.monochrome {
+                "チャンネル白黒".to_string()
+            } else {
+                "チャンネルミキサー".to_string()
+            }
+        }
         LocalEffect::Clarity(_) => "明瞭度".to_string(),
         LocalEffect::HighlightsShadows(_) => "ハイライト/シャドウ".to_string(),
         LocalEffect::Dehaze(params) => format!("かすみ除去 {:.0}%", params.amount * 100.0),
@@ -6469,6 +6482,20 @@ fn draw_color_grade_wheel_sliders(ui: &mut egui::Ui, wheel: &mut ColorGradeWheel
     let luminance = ui.add(egui::Slider::new(&mut wheel.luminance, -100.0..=100.0).text("明るさ"));
     changed |= luminance.changed();
     luminance.lab_hover_tip("この明るさ帯だけを明るく、または暗くします。");
+    changed
+}
+
+fn draw_channel_coeff_sliders(ui: &mut egui::Ui, coeffs: &mut [f32; 3]) -> bool {
+    let mut changed = false;
+    let red = ui.add(egui::Slider::new(&mut coeffs[0], -200.0..=200.0).text("赤"));
+    changed |= red.changed();
+    red.lab_hover_tip("元画像の赤チャンネルをどれだけ混ぜるかです。100で等倍、0で不使用です。");
+    let green = ui.add(egui::Slider::new(&mut coeffs[1], -200.0..=200.0).text("緑"));
+    changed |= green.changed();
+    green.lab_hover_tip("元画像の緑チャンネルをどれだけ混ぜるかです。");
+    let blue = ui.add(egui::Slider::new(&mut coeffs[2], -200.0..=200.0).text("青"));
+    changed |= blue.changed();
+    blue.lab_hover_tip("元画像の青チャンネルをどれだけ混ぜるかです。負の値も使えます。");
     changed
 }
 
@@ -7075,6 +7102,86 @@ fn draw_effect_params(
                 ui.add(egui::Slider::new(&mut params.lightness, -100.0..=100.0).text("明度"));
             changed |= lightness.changed();
             lightness.lab_hover_tip("対象色だけ明るさを増減します。");
+        }
+        LocalEffect::ChannelMixer(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "白黒標準") {
+                    *params = ChannelMixerParams {
+                        monochrome: true,
+                        mono_output: [30.0, 59.0, 11.0],
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "赤フィルター") {
+                    *params = ChannelMixerParams {
+                        monochrome: true,
+                        mono_output: [75.0, 25.0, 0.0],
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "緑フィルター") {
+                    *params = ChannelMixerParams {
+                        monochrome: true,
+                        mono_output: [15.0, 75.0, 10.0],
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "青フィルター") {
+                    *params = ChannelMixerParams {
+                        monochrome: true,
+                        mono_output: [5.0, 35.0, 60.0],
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "赤青入替") {
+                    *params = ChannelMixerParams {
+                        red_output: [0.0, 0.0, 100.0],
+                        green_output: [0.0, 100.0, 0.0],
+                        blue_output: [100.0, 0.0, 0.0],
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "暖色ブースト") {
+                    *params = ChannelMixerParams {
+                        red_output: [115.0, 8.0, 0.0],
+                        green_output: [0.0, 100.0, 0.0],
+                        blue_output: [0.0, 0.0, 82.0],
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "白黒化では元画像の赤/緑/青をどれだけ明度へ混ぜるかを調整します。カラー時は各出力チャンネルの混合率を直接編集します。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let mono = ui.checkbox(&mut params.monochrome, "白黒化");
+            changed |= mono.changed();
+            mono.lab_hover_tip("オンにすると、赤/緑/青の寄与率から1枚のグレー画像を作ります。");
+            if params.monochrome {
+                ui.collapsing("白黒の寄与率", |ui| {
+                    changed |= draw_channel_coeff_sliders(ui, &mut params.mono_output);
+                });
+            } else {
+                ui.collapsing("赤出力", |ui| {
+                    changed |= draw_channel_coeff_sliders(ui, &mut params.red_output);
+                });
+                ui.collapsing("緑出力", |ui| {
+                    changed |= draw_channel_coeff_sliders(ui, &mut params.green_output);
+                });
+                ui.collapsing("青出力", |ui| {
+                    changed |= draw_channel_coeff_sliders(ui, &mut params.blue_output);
+                });
+            }
         }
         LocalEffect::Clarity(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -9150,6 +9257,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
             LocalEffect::ThreeWayColorGrading(ThreeWayColorGradingParams::default())
         }
         EffectKind::SelectiveColor => LocalEffect::SelectiveColor(SelectiveColorParams::default()),
+        EffectKind::ChannelMixer => LocalEffect::ChannelMixer(ChannelMixerParams::default()),
         EffectKind::Clarity => LocalEffect::Clarity(ClarityParams::default()),
         EffectKind::HighlightsShadows => {
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default())

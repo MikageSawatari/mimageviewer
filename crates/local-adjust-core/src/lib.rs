@@ -407,6 +407,7 @@ pub enum LocalEffect {
     ColorBalance(ColorBalanceParams),
     ThreeWayColorGrading(ThreeWayColorGradingParams),
     SelectiveColor(SelectiveColorParams),
+    ChannelMixer(ChannelMixerParams),
     Clarity(ClarityParams),
     HighlightsShadows(HighlightsShadowsParams),
     Dehaze(DehazeParams),
@@ -598,6 +599,36 @@ impl Default for SelectiveColorParams {
             saturation: 0.0,
             lightness: 0.0,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ChannelMixerParams {
+    pub monochrome: bool,
+    pub red_output: [f32; 3],
+    pub green_output: [f32; 3],
+    pub blue_output: [f32; 3],
+    pub mono_output: [f32; 3],
+}
+
+impl Default for ChannelMixerParams {
+    fn default() -> Self {
+        Self {
+            monochrome: false,
+            red_output: [100.0, 0.0, 0.0],
+            green_output: [0.0, 100.0, 0.0],
+            blue_output: [0.0, 0.0, 100.0],
+            mono_output: [30.0, 59.0, 11.0],
+        }
+    }
+}
+
+impl ChannelMixerParams {
+    fn is_identity(self) -> bool {
+        !self.monochrome
+            && self.red_output == [100.0, 0.0, 0.0]
+            && self.green_output == [0.0, 100.0, 0.0]
+            && self.blue_output == [0.0, 0.0, 100.0]
     }
 }
 
@@ -1137,6 +1168,7 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
             apply_three_way_color_grading(&image.pixels, *params)
         }
         LocalEffect::SelectiveColor(params) => apply_selective_color(&image.pixels, *params),
+        LocalEffect::ChannelMixer(params) => apply_channel_mixer(&image.pixels, *params),
         LocalEffect::Clarity(params) => apply_clarity(
             &image.pixels,
             image.width,
@@ -1826,6 +1858,35 @@ fn selective_hue_weight(
     let distance = delta.min(360.0 - delta);
     let outer = (range_degrees + feather_degrees).max(range_degrees + 0.001);
     1.0 - smoothstep(range_degrees, outer, distance)
+}
+
+fn apply_channel_mixer(src: &[u8], params: ChannelMixerParams) -> Vec<u8> {
+    if params.is_identity() {
+        return src.to_vec();
+    }
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let rgb = [
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        ];
+        if params.monochrome {
+            let gray = mix_channels(rgb, params.mono_output);
+            px[0] = to_u8(gray);
+            px[1] = to_u8(gray);
+            px[2] = to_u8(gray);
+        } else {
+            px[0] = to_u8(mix_channels(rgb, params.red_output));
+            px[1] = to_u8(mix_channels(rgb, params.green_output));
+            px[2] = to_u8(mix_channels(rgb, params.blue_output));
+        }
+    }
+    out
+}
+
+fn mix_channels(rgb: [f32; 3], coeffs: [f32; 3]) -> f32 {
+    (rgb[0] * coeffs[0] + rgb[1] * coeffs[1] + rgb[2] * coeffs[2]) / 100.0
 }
 
 fn apply_clarity(src: &[u8], width: usize, height: usize, radius: usize, amount: f32) -> Vec<u8> {
@@ -3206,6 +3267,7 @@ mod tests {
             LocalEffect::ColorBalance(ColorBalanceParams::default()),
             LocalEffect::ThreeWayColorGrading(ThreeWayColorGradingParams::default()),
             LocalEffect::SelectiveColor(SelectiveColorParams::default()),
+            LocalEffect::ChannelMixer(ChannelMixerParams::default()),
             LocalEffect::Clarity(ClarityParams::default()),
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default()),
             LocalEffect::Dehaze(DehazeParams::default()),
@@ -3374,6 +3436,42 @@ mod tests {
         assert!(out.pixels[1] > src.pixels[1]);
         assert_eq!(&out.pixels[4..8], &src.pixels[4..8]);
         assert_eq!(&out.pixels[8..12], &src.pixels[8..12]);
+    }
+
+    #[test]
+    fn channel_mixer_monochrome_uses_color_weights() {
+        let src =
+            RgbaImageBuf::new(3, 1, vec![200, 0, 0, 255, 0, 200, 0, 255, 0, 0, 200, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "mixer",
+            LocalMask::Full,
+            LocalEffect::ChannelMixer(ChannelMixerParams {
+                monochrome: true,
+                mono_output: [100.0, 0.0, 0.0],
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[200, 200, 200, 255]);
+        assert_eq!(&out.pixels[4..8], &[0, 0, 0, 255]);
+        assert_eq!(&out.pixels[8..12], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn channel_mixer_can_swap_color_channels() {
+        let src = RgbaImageBuf::new(1, 1, vec![10, 40, 200, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "swap",
+            LocalMask::Full,
+            LocalEffect::ChannelMixer(ChannelMixerParams {
+                red_output: [0.0, 0.0, 100.0],
+                green_output: [0.0, 100.0, 0.0],
+                blue_output: [100.0, 0.0, 0.0],
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels, &[200, 40, 10, 255]);
     }
 
     #[test]
