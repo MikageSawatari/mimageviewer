@@ -14,15 +14,15 @@ use flate2::read::DeflateDecoder;
 use flate2::write::DeflateEncoder;
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
-    BloomParams, BlurParams, ChromaticAberrationParams, ClarityParams, ColorMixerParams,
-    ColorRangeMask, DehazeParams, EdgeSmoothParams, FilmGrainParams, GradientMapParams,
-    GradientMapPreset, HalftoneParams, HighlightsShadowsParams, HslParams, LineKind,
-    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
-    ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode,
-    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
-    RgbaImageBuf, RgbaImageRef, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams,
-    ToneCurveParams, ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size,
-    evaluate_layer_mask,
+    BloomParams, BlurParams, ChromaticAberrationParams, ClarityParams, ColorBalanceParams,
+    ColorBalanceRange, ColorMixerParams, ColorRangeMask, DehazeParams, EdgeSmoothParams,
+    FilmGrainParams, GradientMapParams, GradientMapPreset, HalftoneParams, HighlightsShadowsParams,
+    HslParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
+    LookParams, LookPreset, ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams,
+    MosaicTileMode, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
+    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, ShapeOp, SharpenParams, SoftFocusParams,
+    StarGlowParams, ToneCurveParams, ToneParams, VignetteParams, apply_layers,
+    compute_mosaic_tile_size, evaluate_layer_mask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -920,6 +920,7 @@ enum EffectKind {
     Tone,
     ToneCurve,
     RgbToneCurve,
+    ColorBalance,
     Clarity,
     HighlightsShadows,
     Dehaze,
@@ -947,6 +948,7 @@ impl EffectKind {
             LocalEffect::Tone(_) => Self::Tone,
             LocalEffect::ToneCurve(_) => Self::ToneCurve,
             LocalEffect::RgbToneCurve(_) => Self::RgbToneCurve,
+            LocalEffect::ColorBalance(_) => Self::ColorBalance,
             LocalEffect::Clarity(_) => Self::Clarity,
             LocalEffect::HighlightsShadows(_) => Self::HighlightsShadows,
             LocalEffect::Dehaze(_) => Self::Dehaze,
@@ -974,6 +976,7 @@ impl EffectKind {
             Self::Tone => "色調補正",
             Self::ToneCurve => "トーンカーブ",
             Self::RgbToneCurve => "RGBカーブ",
+            Self::ColorBalance => "カラーバランス",
             Self::Clarity => "明瞭度",
             Self::HighlightsShadows => "ハイライト/シャドウ",
             Self::Dehaze => "かすみ除去",
@@ -1001,6 +1004,7 @@ impl EffectKind {
             Self::Tone => "明るさ、コントラスト、彩度、色温度などをまとめて調整します。",
             Self::ToneCurve => "暗部から明部までの明るさをカーブで細かく調整します。",
             Self::RgbToneCurve => "赤、緑、青のチャンネル別カーブで色味と明暗を細かく調整します。",
+            Self::ColorBalance => "シャドウ、中間、ハイライトごとに色の偏りを調整します。",
             Self::Clarity => "局所コントラストを上げ、輪郭や質感をくっきり見せます。",
             Self::HighlightsShadows => "明るい部分と暗い部分を個別に持ち上げたり抑えたりします。",
             Self::Dehaze => "白っぽさを減らし、遠景や薄いコントラストを締めます。",
@@ -1041,6 +1045,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Tone,
             EffectKind::ToneCurve,
             EffectKind::RgbToneCurve,
+            EffectKind::ColorBalance,
             EffectKind::Hsl,
             EffectKind::ColorMixer,
             EffectKind::HighlightsShadows,
@@ -1730,19 +1735,26 @@ impl LocalAdjustLabApp {
         self.mark_mask_changed();
     }
 
-    fn clear_selected_manual_override(&mut self) {
+    fn clear_selected_manual_override_target(&mut self, target: OverrideEditTarget) {
         let Some(layer) = self.selected_layer_ref() else {
             return;
         };
-        if layer.manual_override.is_empty() {
+        let has_target = match target {
+            OverrideEditTarget::Add => layer.manual_override.add.is_some(),
+            OverrideEditTarget::Subtract => layer.manual_override.subtract.is_some(),
+        };
+        if !has_target {
             return;
         }
         self.push_undo_snapshot();
         if let Some(layer) = self.selected_layer_mut() {
-            layer.manual_override = ManualMaskOverride::default();
+            match target {
+                OverrideEditTarget::Add => layer.manual_override.add = None,
+                OverrideEditTarget::Subtract => layer.manual_override.subtract = None,
+            }
         }
         self.selected_shape = None;
-        self.status = "追加/削除マスクをクリアしました。".to_string();
+        self.status = format!("{}を全消去しました。", target.label());
         self.mark_mask_changed();
     }
 
@@ -3323,6 +3335,27 @@ impl LocalAdjustLabApp {
                             .color(Color32::from_gray(170)),
                     );
                     self.draw_manual_mask_tool_panel(ui, btn_size);
+                    ui.separator();
+                    let has_target = self
+                        .selected_layer_ref()
+                        .map(|layer| match target {
+                            OverrideEditTarget::Add => layer.manual_override.add.is_some(),
+                            OverrideEditTarget::Subtract => {
+                                layer.manual_override.subtract.is_some()
+                            }
+                        })
+                        .unwrap_or(false);
+                    let clear_label = format!("{}を全消去", target.label());
+                    if ui
+                        .add_enabled(
+                            has_target,
+                            egui::Button::new(clear_label).fill(Color32::from_rgb(95, 45, 45)),
+                        )
+                        .lab_hover_tip("現在開いている追加/削除マスクだけを空にします。ベースマスクは残ります。")
+                        .clicked()
+                    {
+                        self.clear_selected_manual_override_target(target);
+                    }
                 });
         } else {
             ui.horizontal(|ui| {
@@ -3474,6 +3507,7 @@ impl LocalAdjustLabApp {
         let pan_mode = ui.input(|i| {
             i.key_down(Key::Space) || i.pointer.button_down(egui::PointerButton::Middle)
         });
+        let dialog_open = self.add_layer_dialog_open || self.effect_picker_dialog_open;
         let view_input_used =
             self.handle_view_navigation(ui, canvas_rect, rect, img_w, img_h, panel_blocks_pointer);
 
@@ -3502,13 +3536,13 @@ impl LocalAdjustLabApp {
                 .request_repaint_after(Duration::from_millis(EDGE_OVERLAY_REPAINT_MS));
         }
 
-        if adjust_panel_active {
+        if adjust_panel_active && !dialog_open {
             self.draw_shape_overlay(ui, rect, pointer_screen, !pan_mode && !panel_blocks_pointer);
         }
-        if adjust_panel_active && !pan_mode && !panel_blocks_pointer {
+        if adjust_panel_active && !pan_mode && !panel_blocks_pointer && !dialog_open {
             self.draw_brush_cursor(ui, rect, pointer_screen);
         }
-        let gradient_handle_used = if pan_mode || !adjust_panel_active {
+        let gradient_handle_used = if pan_mode || !adjust_panel_active || dialog_open {
             false
         } else {
             self.draw_gradient_handles(ui, rect)
@@ -3519,14 +3553,15 @@ impl LocalAdjustLabApp {
             img_w,
             img_h,
             pointer_screen,
-            crop_panel_active && !panel_blocks_pointer && !pan_mode,
+            crop_panel_active && !panel_blocks_pointer && !pan_mode && !dialog_open,
         );
-        if shift_down && !panel_blocks_pointer {
+        if shift_down && !panel_blocks_pointer && !dialog_open {
             self.draw_loupe(ui, canvas_rect, rect, active_texture_id, pointer_screen);
         }
         let secondary_pressed = ui.input(|i| i.pointer.secondary_pressed());
 
         if adjust_panel_active
+            && !dialog_open
             && !view_input_used
             && !panel_blocks_pointer
             && !crop_used
@@ -3985,33 +4020,6 @@ impl LocalAdjustLabApp {
         });
     }
 
-    fn draw_mask_actions(&mut self, ui: &mut egui::Ui) {
-        ui.label(
-            egui::RichText::new("マスク操作")
-                .size(14.0)
-                .strong()
-                .color(Color32::WHITE),
-        );
-        let has_override = self
-            .selected_layer_ref()
-            .map(|layer| !layer.manual_override.is_empty())
-            .unwrap_or(false);
-        if ui
-            .add_enabled(has_override, egui::Button::new("追加/削除マスクをクリア"))
-            .lab_hover_tip("ベースマスクは残し、追加マスク/削除マスクだけを空にします。")
-            .clicked()
-        {
-            self.clear_selected_manual_override();
-        }
-        ui.label(
-            egui::RichText::new(
-                "グラデーションや被写体マットを保ったまま、追加/削除の2値マスクで部分的に上書きできます。",
-            )
-            .size(10.0)
-            .color(Color32::from_gray(170)),
-        );
-    }
-
     fn draw_mask_panel(&mut self, ui: &mut egui::Ui) {
         if self.layers.is_empty() {
             ui.label(
@@ -4071,9 +4079,6 @@ impl LocalAdjustLabApp {
             );
         }
 
-        ui.separator();
-        self.draw_mask_actions(ui);
-        ui.separator();
         ui.label(
             egui::RichText::new("マスク設定")
                 .size(14.0)
@@ -5942,18 +5947,8 @@ fn draw_mask_controls(
             });
             ui.label("画像上でブラシを使って編集します。");
         }
-        LocalMask::Subject(mask) => {
-            ui.horizontal(|ui| {
-                if ui.button("クリア").clicked() {
-                    mask.alpha.fill(0.0);
-                    changed = true;
-                }
-                if ui.button("塗りつぶし").clicked() {
-                    mask.alpha.fill(1.0);
-                    changed = true;
-                }
-            });
-            ui.label("AI生成した被写体マスクを通常マスクとして使います。");
+        LocalMask::Subject(_) => {
+            ui.label("AI生成した被写体マスクを使います。必要な修正は左パネルの追加/削除マスクから行います。");
         }
         LocalMask::Segmentation(mask) => {
             ui.label("色分けされた領域候補をクリック/ドラッグで選択します。");
@@ -6184,6 +6179,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::Tone(_) => "色調補正".to_string(),
         LocalEffect::ToneCurve(_) => "トーンカーブ".to_string(),
         LocalEffect::RgbToneCurve(_) => "RGBカーブ".to_string(),
+        LocalEffect::ColorBalance(_) => "カラーバランス".to_string(),
         LocalEffect::Clarity(_) => "明瞭度".to_string(),
         LocalEffect::HighlightsShadows(_) => "ハイライト/シャドウ".to_string(),
         LocalEffect::Dehaze(params) => format!("かすみ除去 {:.0}%", params.amount * 100.0),
@@ -6425,6 +6421,23 @@ fn draw_curve_point_sliders(ui: &mut egui::Ui, points: &mut [f32; 5]) -> bool {
     changed
 }
 
+fn draw_color_balance_range_sliders(ui: &mut egui::Ui, range: &mut ColorBalanceRange) -> bool {
+    let mut changed = false;
+    let cyan_red =
+        ui.add(egui::Slider::new(&mut range.cyan_red, -100.0..=100.0).text("シアン / 赤"));
+    changed |= cyan_red.changed();
+    cyan_red.lab_hover_tip("負の値でシアン寄り、正の値で赤寄りにします。");
+    let magenta_green =
+        ui.add(egui::Slider::new(&mut range.magenta_green, -100.0..=100.0).text("マゼンタ / 緑"));
+    changed |= magenta_green.changed();
+    magenta_green.lab_hover_tip("負の値でマゼンタ寄り、正の値で緑寄りにします。");
+    let yellow_blue =
+        ui.add(egui::Slider::new(&mut range.yellow_blue, -100.0..=100.0).text("黄 / 青"));
+    changed |= yellow_blue.changed();
+    yellow_blue.lab_hover_tip("負の値で黄寄り、正の値で青寄りにします。");
+    changed
+}
+
 fn draw_effect_params(
     ui: &mut egui::Ui,
     layer: &mut LocalAdjustmentLayer,
@@ -6635,6 +6648,115 @@ fn draw_effect_params(
             ui.collapsing("青", |ui| {
                 changed |= draw_curve_point_sliders(ui, &mut params.blue);
             });
+        }
+        LocalEffect::ColorBalance(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "影を青く") {
+                    *params = ColorBalanceParams {
+                        shadows: ColorBalanceRange {
+                            yellow_blue: 42.0,
+                            cyan_red: -10.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "影を青緑") {
+                    *params = ColorBalanceParams {
+                        shadows: ColorBalanceRange {
+                            cyan_red: -28.0,
+                            magenta_green: 12.0,
+                            yellow_blue: 30.0,
+                        },
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "明部を暖かく") {
+                    *params = ColorBalanceParams {
+                        highlights: ColorBalanceRange {
+                            cyan_red: 24.0,
+                            yellow_blue: -34.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "夕景") {
+                    *params = ColorBalanceParams {
+                        shadows: ColorBalanceRange {
+                            yellow_blue: 16.0,
+                            ..Default::default()
+                        },
+                        midtones: ColorBalanceRange {
+                            cyan_red: 12.0,
+                            yellow_blue: -14.0,
+                            ..Default::default()
+                        },
+                        highlights: ColorBalanceRange {
+                            cyan_red: 30.0,
+                            yellow_blue: -42.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "緑かぶり補正") {
+                    *params = ColorBalanceParams {
+                        midtones: ColorBalanceRange {
+                            magenta_green: -26.0,
+                            ..Default::default()
+                        },
+                        highlights: ColorBalanceRange {
+                            magenta_green: -12.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "シネマ") {
+                    *params = ColorBalanceParams {
+                        shadows: ColorBalanceRange {
+                            cyan_red: -30.0,
+                            yellow_blue: 26.0,
+                            ..Default::default()
+                        },
+                        highlights: ColorBalanceRange {
+                            cyan_red: 24.0,
+                            yellow_blue: -24.0,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "明るさの帯ごとに色を寄せます。RGBカーブより直感的に色かぶりや空気感を調整できます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.collapsing("シャドウ", |ui| {
+                changed |= draw_color_balance_range_sliders(ui, &mut params.shadows);
+            });
+            ui.collapsing("中間", |ui| {
+                changed |= draw_color_balance_range_sliders(ui, &mut params.midtones);
+            });
+            ui.collapsing("ハイライト", |ui| {
+                changed |= draw_color_balance_range_sliders(ui, &mut params.highlights);
+            });
+            let preserve = ui.checkbox(&mut params.preserve_luma, "明るさを保つ");
+            changed |= preserve.changed();
+            preserve.lab_hover_tip(
+                "色だけを寄せたいときに使います。オフにすると色変更による明るさ変化も残します。",
+            );
         }
         LocalEffect::Clarity(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -8705,6 +8827,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Tone => LocalEffect::Tone(ToneParams::default()),
         EffectKind::ToneCurve => LocalEffect::ToneCurve(ToneCurveParams::default()),
         EffectKind::RgbToneCurve => LocalEffect::RgbToneCurve(RgbToneCurveParams::default()),
+        EffectKind::ColorBalance => LocalEffect::ColorBalance(ColorBalanceParams::default()),
         EffectKind::Clarity => LocalEffect::Clarity(ClarityParams::default()),
         EffectKind::HighlightsShadows => {
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default())

@@ -404,6 +404,7 @@ pub enum LocalEffect {
     Tone(ToneParams),
     ToneCurve(ToneCurveParams),
     RgbToneCurve(RgbToneCurveParams),
+    ColorBalance(ColorBalanceParams),
     Clarity(ClarityParams),
     HighlightsShadows(HighlightsShadowsParams),
     Dehaze(DehazeParams),
@@ -476,6 +477,53 @@ impl Default for RgbToneCurveParams {
             red: identity,
             green: identity,
             blue: identity,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ColorBalanceRange {
+    /// Positive values move toward red, negative values toward cyan.
+    pub cyan_red: f32,
+    /// Positive values move toward green, negative values toward magenta.
+    pub magenta_green: f32,
+    /// Positive values move toward blue, negative values toward yellow.
+    pub yellow_blue: f32,
+}
+
+impl Default for ColorBalanceRange {
+    fn default() -> Self {
+        Self {
+            cyan_red: 0.0,
+            magenta_green: 0.0,
+            yellow_blue: 0.0,
+        }
+    }
+}
+
+impl ColorBalanceRange {
+    fn is_identity(self) -> bool {
+        self.cyan_red.abs() <= f32::EPSILON
+            && self.magenta_green.abs() <= f32::EPSILON
+            && self.yellow_blue.abs() <= f32::EPSILON
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ColorBalanceParams {
+    pub shadows: ColorBalanceRange,
+    pub midtones: ColorBalanceRange,
+    pub highlights: ColorBalanceRange,
+    pub preserve_luma: bool,
+}
+
+impl Default for ColorBalanceParams {
+    fn default() -> Self {
+        Self {
+            shadows: ColorBalanceRange::default(),
+            midtones: ColorBalanceRange::default(),
+            highlights: ColorBalanceRange::default(),
+            preserve_luma: true,
         }
     }
 }
@@ -1011,6 +1059,7 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         LocalEffect::Tone(params) => apply_tone_image(&image.pixels, *params),
         LocalEffect::ToneCurve(params) => apply_tone_curve(&image.pixels, *params),
         LocalEffect::RgbToneCurve(params) => apply_rgb_tone_curve(&image.pixels, *params),
+        LocalEffect::ColorBalance(params) => apply_color_balance(&image.pixels, *params),
         LocalEffect::Clarity(params) => apply_clarity(
             &image.pixels,
             image.width,
@@ -1546,6 +1595,63 @@ fn tone_curve_value(x: f32, points: [f32; 5]) -> f32 {
         points[seg + 1].clamp(0.0, 1.0),
         t,
     )
+}
+
+fn apply_color_balance(src: &[u8], params: ColorBalanceParams) -> Vec<u8> {
+    if params.shadows.is_identity()
+        && params.midtones.is_identity()
+        && params.highlights.is_identity()
+    {
+        return src.to_vec();
+    }
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let r = px[0] as f32 / 255.0;
+        let g = px[1] as f32 / 255.0;
+        let b = px[2] as f32 / 255.0;
+        let luma = luma01(r, g, b);
+        let shadow_weight = 1.0 - smoothstep(0.15, 0.55, luma);
+        let highlight_weight = smoothstep(0.45, 0.85, luma);
+        let midtone_weight = (1.0 - shadow_weight - highlight_weight).clamp(0.0, 1.0);
+        let delta = color_balance_delta(params.shadows, shadow_weight);
+        let delta = add_rgb_delta(delta, color_balance_delta(params.midtones, midtone_weight));
+        let delta = add_rgb_delta(
+            delta,
+            color_balance_delta(params.highlights, highlight_weight),
+        );
+        let mut adjusted = [
+            (r + delta[0]).clamp(0.0, 1.0),
+            (g + delta[1]).clamp(0.0, 1.0),
+            (b + delta[2]).clamp(0.0, 1.0),
+        ];
+        if params.preserve_luma {
+            let adjusted_luma = luma01(adjusted[0], adjusted[1], adjusted[2]);
+            let luma_delta = luma - adjusted_luma;
+            for c in &mut adjusted {
+                *c = (*c + luma_delta).clamp(0.0, 1.0);
+            }
+        }
+        px[0] = to_u8(adjusted[0]);
+        px[1] = to_u8(adjusted[1]);
+        px[2] = to_u8(adjusted[2]);
+    }
+    out
+}
+
+fn color_balance_delta(range: ColorBalanceRange, weight: f32) -> [f32; 3] {
+    let scale = 0.24 * weight.clamp(0.0, 1.0);
+    let cyan_red = (range.cyan_red / 100.0).clamp(-1.0, 1.0) * scale;
+    let magenta_green = (range.magenta_green / 100.0).clamp(-1.0, 1.0) * scale;
+    let yellow_blue = (range.yellow_blue / 100.0).clamp(-1.0, 1.0) * scale;
+    [
+        cyan_red - magenta_green * 0.5 - yellow_blue * 0.5,
+        -cyan_red * 0.5 + magenta_green - yellow_blue * 0.5,
+        -cyan_red * 0.5 - magenta_green * 0.5 + yellow_blue,
+    ]
+}
+
+fn add_rgb_delta(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
 fn apply_clarity(src: &[u8], width: usize, height: usize, radius: usize, amount: f32) -> Vec<u8> {
@@ -2923,6 +3029,7 @@ mod tests {
             LocalEffect::Tone(ToneParams::default()),
             LocalEffect::ToneCurve(ToneCurveParams::default()),
             LocalEffect::RgbToneCurve(RgbToneCurveParams::default()),
+            LocalEffect::ColorBalance(ColorBalanceParams::default()),
             LocalEffect::Clarity(ClarityParams::default()),
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default()),
             LocalEffect::Dehaze(DehazeParams::default()),
@@ -3008,6 +3115,35 @@ mod tests {
         assert_eq!(out.pixels[1], src.pixels[1]);
         assert!(out.pixels[2] < src.pixels[2]);
         assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn color_balance_targets_shadow_range() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![40, 40, 40, 255, 128, 128, 128, 255, 220, 220, 220, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "balance",
+            LocalMask::Full,
+            LocalEffect::ColorBalance(ColorBalanceParams {
+                shadows: ColorBalanceRange {
+                    cyan_red: 80.0,
+                    ..Default::default()
+                },
+                preserve_luma: false,
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert!(out.pixels[1] < src.pixels[1]);
+        assert!(out.pixels[2] < src.pixels[2]);
+        assert!(out.pixels[0] - src.pixels[0] > out.pixels[8] - src.pixels[8]);
+        assert_eq!(out.pixels[3], 255);
+        assert_eq!(out.pixels[11], 255);
     }
 
     #[test]
