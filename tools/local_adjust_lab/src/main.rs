@@ -15,13 +15,13 @@ use flate2::write::DeflateEncoder;
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     BloomParams, BlurParams, ChromaticAberrationParams, ClarityParams, ColorRangeMask,
-    DehazeParams, EdgeSmoothParams, FilmGrainParams, HalftoneParams, HighlightsShadowsParams,
-    HslParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
-    LookParams, LookPreset, ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams,
-    MosaicTileMode, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
-    RgbaImageBuf, RgbaImageRef, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams,
-    ToneCurveParams, ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size,
-    evaluate_layer_mask,
+    DehazeParams, EdgeSmoothParams, FilmGrainParams, GradientMapParams, GradientMapPreset,
+    HalftoneParams, HighlightsShadowsParams, HslParams, LineKind, LinearGradientMask,
+    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
+    MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode, RadialGradientMask, RangeMask,
+    RasterMask, RasterVectorMask, RegionMask, RgbaImageBuf, RgbaImageRef, ShapeOp, SharpenParams,
+    SoftFocusParams, StarGlowParams, ToneCurveParams, ToneParams, VignetteParams, apply_layers,
+    compute_mosaic_tile_size, evaluate_layer_mask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -827,6 +827,7 @@ enum EffectKind {
     Sharpen,
     Hsl,
     Look,
+    GradientMap,
     Bloom,
     Vignette,
     FilmGrain,
@@ -851,6 +852,7 @@ impl EffectKind {
             LocalEffect::Sharpen(_) => Self::Sharpen,
             LocalEffect::Hsl(_) => Self::Hsl,
             LocalEffect::Look(_) => Self::Look,
+            LocalEffect::GradientMap(_) => Self::GradientMap,
             LocalEffect::Bloom(_) => Self::Bloom,
             LocalEffect::Vignette(_) => Self::Vignette,
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
@@ -875,6 +877,7 @@ impl EffectKind {
             Self::Sharpen => "シャープ",
             Self::Hsl => "色相/HSL",
             Self::Look => "ルック",
+            Self::GradientMap => "グラデーションマップ",
             Self::Bloom => "ブルーム",
             Self::Vignette => "ビネット",
             Self::FilmGrain => "フィルム粒子",
@@ -899,6 +902,9 @@ impl EffectKind {
             Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
             Self::Hsl => "色相、彩度、明度を調整し、髪色変更などの色替えに使います。",
             Self::Look => "夕焼け、夜景、フィルム風などのまとまった色味を適用します。",
+            Self::GradientMap => {
+                "明るさを指定したグラデーションの色へ置き換え、色設計や色トレス風に使います。"
+            }
             Self::Bloom => "明るい部分を周囲へにじませ、発光感を足します。",
             Self::Vignette => "周辺を暗く、または明るくして視線を中央へ誘導します。",
             Self::FilmGrain => "粒状感を加え、フィルムや紙っぽい質感を作ります。",
@@ -929,6 +935,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::HighlightsShadows,
             EffectKind::Dehaze,
             EffectKind::Look,
+            EffectKind::GradientMap,
         ],
     },
     EffectGroup {
@@ -2998,6 +3005,7 @@ impl LocalAdjustLabApp {
                 egui::RichText::new(
                     "ホイール/Ctrl+ホイール:ズーム  Space+ドラッグ/中ボタン:パン\n\
                      Q:元画像  W:マスク表示\n\
+                     Ctrl:元画像を一時表示  Alt:マスク一時非表示  Shift:ルーペ\n\
                      境界筆[A]:境界で止めながら近い色を塗る  Ctrl中は境界表示+通常筆\n\
                      隙間補完[G]:細い未塗り部分を補完\n\
                      切り取り:黄色枠/ハンドルをドラッグ、保存時に最後段で切り出し\n\
@@ -3326,7 +3334,11 @@ impl LocalAdjustLabApp {
         };
         let adjust_panel_active = self.workflow_panel == LabWorkflowPanel::Adjust;
         let crop_panel_active = self.workflow_panel == LabWorkflowPanel::Crop;
-        let active_texture_id = if adjust_panel_active && self.show_source {
+        let (ctrl_down, alt_down, shift_down) =
+            ui.input(|i| (i.modifiers.ctrl, i.modifiers.alt, i.modifiers.shift));
+        let source_preview_active = adjust_panel_active && (self.show_source || ctrl_down);
+        let mask_preview_active = adjust_panel_active && self.show_mask && !alt_down;
+        let active_texture_id = if source_preview_active {
             source_texture.id()
         } else {
             self.result_texture
@@ -3357,10 +3369,9 @@ impl LocalAdjustLabApp {
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         ui.painter()
             .image(active_texture_id, rect, uv, Color32::WHITE);
-        if adjust_panel_active && self.show_mask {
+        if mask_preview_active {
             self.draw_mask_tile_preview(ui, rect);
         }
-        let ctrl_down = ui.input(|i| i.modifiers.ctrl);
         if ctrl_down && self.edge_overlay_enabled() {
             if let Some(edge_texture) = self.ensure_edge_preview_texture(ui.ctx()) {
                 ui.painter().image(
@@ -3399,6 +3410,9 @@ impl LocalAdjustLabApp {
             pointer_screen,
             crop_panel_active && !panel_blocks_pointer && !pan_mode,
         );
+        if shift_down && !panel_blocks_pointer {
+            self.draw_loupe(ui, canvas_rect, rect, active_texture_id, pointer_screen);
+        }
         let secondary_pressed = ui.input(|i| i.pointer.secondary_pressed());
 
         if adjust_panel_active
@@ -3453,6 +3467,88 @@ impl LocalAdjustLabApp {
                     .image(texture.id(), tile_rect, uv, Color32::WHITE);
             }
         }
+    }
+
+    fn draw_loupe(
+        &self,
+        ui: &mut egui::Ui,
+        canvas_rect: Rect,
+        image_rect: Rect,
+        texture_id: egui::TextureId,
+        pointer_screen: Option<Pos2>,
+    ) {
+        let Some(pointer) = pointer_screen else {
+            return;
+        };
+        if !image_rect.contains(pointer) || image_rect.width() <= 1.0 || image_rect.height() <= 1.0
+        {
+            return;
+        }
+
+        let margin = 14.0;
+        let size = 180.0_f32
+            .min((canvas_rect.width() - margin * 2.0).max(72.0))
+            .min((canvas_rect.height() - margin * 2.0).max(72.0));
+        let zoom = 3.0;
+        let offset = 18.0;
+        let mut min = pointer + egui::vec2(offset, offset);
+        if min.x + size + margin > canvas_rect.right() {
+            min.x = pointer.x - size - offset;
+        }
+        if min.y + size + margin > canvas_rect.bottom() {
+            min.y = pointer.y - size - offset;
+        }
+        let min_x = canvas_rect.left() + margin;
+        let max_x = (canvas_rect.right() - size - margin).max(min_x);
+        let min_y = canvas_rect.top() + margin;
+        let max_y = (canvas_rect.bottom() - size - margin).max(min_y);
+        min.x = min.x.clamp(min_x, max_x);
+        min.y = min.y.clamp(min_y, max_y);
+        let dst = Rect::from_min_size(min, egui::vec2(size, size));
+
+        let center_u = ((pointer.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
+        let center_v = ((pointer.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0);
+        let half_u = ((size / zoom) / image_rect.width() * 0.5).clamp(0.001, 0.5);
+        let half_v = ((size / zoom) / image_rect.height() * 0.5).clamp(0.001, 0.5);
+        let uv = Rect::from_min_max(
+            Pos2::new(
+                (center_u - half_u).clamp(0.0, 1.0),
+                (center_v - half_v).clamp(0.0, 1.0),
+            ),
+            Pos2::new(
+                (center_u + half_u).clamp(0.0, 1.0),
+                (center_v + half_v).clamp(0.0, 1.0),
+            ),
+        );
+
+        let painter = ui.painter();
+        painter.rect_filled(
+            dst.expand(6.0),
+            8.0,
+            Color32::from_rgba_unmultiplied(8, 8, 10, 225),
+        );
+        painter.image(texture_id, dst, uv, Color32::WHITE);
+        painter.rect_stroke(
+            dst,
+            6.0,
+            egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 150)),
+            egui::StrokeKind::Inside,
+        );
+        let center = dst.center();
+        painter.line_segment(
+            [
+                Pos2::new(center.x - 10.0, center.y),
+                Pos2::new(center.x + 10.0, center.y),
+            ],
+            egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 170)),
+        );
+        painter.line_segment(
+            [
+                Pos2::new(center.x, center.y - 10.0),
+                Pos2::new(center.x, center.y + 10.0),
+            ],
+            egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 170)),
+        );
     }
 
     fn draw_overlay_panel(&mut self, ctx: &egui::Context, full_rect: Rect) {
@@ -4312,7 +4408,7 @@ impl LocalAdjustLabApp {
                 Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
         egui::Window::new("効果選択")
-            .order(egui::Order::Debug)
+            .order(egui::Order::Foreground)
             .frame(dialog_frame)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .collapsible(false)
@@ -5951,6 +6047,12 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::Sharpen(params) => format!("シャープ {:.0}%", params.amount * 100.0),
         LocalEffect::Hsl(params) => format!("色相 {:+.0}°", params.hue_degrees),
         LocalEffect::Look(params) => format!("ルック {}", look_preset_label(params.preset)),
+        LocalEffect::GradientMap(params) => {
+            format!(
+                "グラデーション {}",
+                gradient_map_preset_label(params.preset)
+            )
+        }
         LocalEffect::Bloom(params) => format!("ブルーム {:.0}px", params.radius_px),
         LocalEffect::Vignette(params) => format!("ビネット {:.0}%", params.strength * 100.0),
         LocalEffect::FilmGrain(params) => format!("粒子 {:.0}%", params.amount * 100.0),
@@ -6006,6 +6108,21 @@ fn look_preset_label(preset: LookPreset) -> &'static str {
         LookPreset::LowKey => "ローキー",
         LookPreset::Sepia => "セピア",
         LookPreset::Cyberpunk => "サイバーパンク",
+    }
+}
+
+fn gradient_map_preset_label(preset: GradientMapPreset) -> &'static str {
+    match preset {
+        GradientMapPreset::None => "選択してください",
+        GradientMapPreset::Mono => "モノクロ",
+        GradientMapPreset::Sepia => "セピア",
+        GradientMapPreset::Sunset => "夕焼け",
+        GradientMapPreset::Twilight => "薄暮",
+        GradientMapPreset::TealOrange => "ティール&オレンジ",
+        GradientMapPreset::Cherry => "桜色",
+        GradientMapPreset::Forest => "森",
+        GradientMapPreset::Fire => "炎",
+        GradientMapPreset::Ice => "氷",
     }
 }
 
@@ -6645,6 +6762,108 @@ fn draw_effect_params(
             changed |= ui
                 .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
                 .changed();
+        }
+        LocalEffect::GradientMap(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "夕焼け") {
+                    *params = GradientMapParams {
+                        preset: GradientMapPreset::Sunset,
+                        strength: 0.65,
+                        contrast: 0.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "薄暮") {
+                    *params = GradientMapParams {
+                        preset: GradientMapPreset::Twilight,
+                        strength: 0.65,
+                        contrast: 0.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "ティール") {
+                    *params = GradientMapParams {
+                        preset: GradientMapPreset::TealOrange,
+                        strength: 0.65,
+                        contrast: 0.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "桜色") {
+                    *params = GradientMapParams {
+                        preset: GradientMapPreset::Cherry,
+                        strength: 0.55,
+                        contrast: 0.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "炎") {
+                    *params = GradientMapParams {
+                        preset: GradientMapPreset::Fire,
+                        strength: 0.70,
+                        contrast: 0.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "氷") {
+                    *params = GradientMapParams {
+                        preset: GradientMapPreset::Ice,
+                        strength: 0.65,
+                        contrast: 0.0,
+                    };
+                    changed = true;
+                }
+            });
+            let before = params.preset;
+            lab_combo_box(
+                ui,
+                "gradient_map_preset",
+                gradient_map_preset_label(params.preset),
+                |ui| {
+                    for preset in [
+                        GradientMapPreset::None,
+                        GradientMapPreset::Mono,
+                        GradientMapPreset::Sepia,
+                        GradientMapPreset::Sunset,
+                        GradientMapPreset::Twilight,
+                        GradientMapPreset::TealOrange,
+                        GradientMapPreset::Cherry,
+                        GradientMapPreset::Forest,
+                        GradientMapPreset::Fire,
+                        GradientMapPreset::Ice,
+                    ] {
+                        ui.selectable_value(
+                            &mut params.preset,
+                            preset,
+                            gradient_map_preset_label(preset),
+                        );
+                    }
+                },
+            );
+            if params.preset != before {
+                if params.preset != GradientMapPreset::None && params.strength <= f32::EPSILON {
+                    params.strength = 1.0;
+                }
+                changed = true;
+            }
+            ui.label(
+                egui::RichText::new(
+                    "輝度をグラデーション色に置き換えます。マスクや強度を弱めると色味だけを乗せる用途にも使えます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let strength_response =
+                ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength_response.changed();
+            strength_response.on_hover_text("元の色からグラデーション色へ置き換える強さです。");
+            let contrast_response = ui.add(
+                egui::Slider::new(&mut params.contrast, -100.0..=100.0).text("明暗コントラスト"),
+            );
+            changed |= contrast_response.changed();
+            contrast_response
+                .on_hover_text("色を割り当てる前に、明るさの差を締めたり広げたりします。");
         }
         LocalEffect::Bloom(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -8117,6 +8336,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Sharpen => LocalEffect::Sharpen(SharpenParams::default()),
         EffectKind::Hsl => LocalEffect::Hsl(HslParams::default()),
         EffectKind::Look => LocalEffect::Look(LookParams::default()),
+        EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
         EffectKind::FilmGrain => LocalEffect::FilmGrain(FilmGrainParams::default()),

@@ -34,6 +34,9 @@ the window.
 - Image navigation for testing large images:
   - Ctrl + mouse wheel: zoom around the pointer
   - Mouse wheel: zoom around the pointer
+  - Ctrl while hovering the canvas: temporarily show the source image
+  - Alt while hovering the canvas: temporarily hide the mask preview
+  - Shift while hovering the canvas: show a loupe around the pointer
   - Zoom can go below fit-to-window, which is useful when editing final-stage
     crop handles near the image edge.
   - Space + drag or middle-button drag: pan

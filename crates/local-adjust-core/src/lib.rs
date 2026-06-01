@@ -412,6 +412,7 @@ pub enum LocalEffect {
     Sharpen(SharpenParams),
     Hsl(HslParams),
     Look(LookParams),
+    GradientMap(GradientMapParams),
     Bloom(BloomParams),
     Vignette(VignetteParams),
     FilmGrain(FilmGrainParams),
@@ -698,6 +699,43 @@ impl Default for LookParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GradientMapPreset {
+    None,
+    Mono,
+    Sepia,
+    Sunset,
+    Twilight,
+    TealOrange,
+    Cherry,
+    Forest,
+    Fire,
+    Ice,
+}
+
+impl Default for GradientMapPreset {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GradientMapParams {
+    pub preset: GradientMapPreset,
+    pub strength: f32,
+    pub contrast: f32,
+}
+
+impl Default for GradientMapParams {
+    fn default() -> Self {
+        Self {
+            preset: GradientMapPreset::None,
+            strength: 1.0,
+            contrast: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BloomParams {
     pub threshold: f32,
@@ -942,6 +980,7 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         ),
         LocalEffect::Hsl(params) => apply_hsl(&image.pixels, *params),
         LocalEffect::Look(params) => apply_look(&image.pixels, *params),
+        LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
         LocalEffect::Bloom(params) => {
             apply_bloom(&image.pixels, image.width, image.height, *params)
         }
@@ -1800,6 +1839,125 @@ fn apply_look(src: &[u8], params: LookParams) -> Vec<u8> {
     out
 }
 
+fn apply_gradient_map(src: &[u8], params: GradientMapParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if params.preset == GradientMapPreset::None || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let contrast = (params.contrast / 100.0).clamp(-1.0, 1.0);
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let r = px[0] as f32 / 255.0;
+        let g = px[1] as f32 / 255.0;
+        let b = px[2] as f32 / 255.0;
+        let mut t = luma01(r, g, b);
+        if contrast.abs() > f32::EPSILON {
+            t = ((t - 0.5) * (1.0 + contrast) + 0.5).clamp(0.0, 1.0);
+        }
+        let mapped = gradient_map_rgb(t, params.preset);
+        px[0] = to_u8(lerp_f32(r, mapped[0], strength));
+        px[1] = to_u8(lerp_f32(g, mapped[1], strength));
+        px[2] = to_u8(lerp_f32(b, mapped[2], strength));
+    }
+    out
+}
+
+fn gradient_map_rgb(t: f32, preset: GradientMapPreset) -> [f32; 3] {
+    match preset {
+        GradientMapPreset::None | GradientMapPreset::Mono => {
+            sample_gradient_stops(t, &[(0.0, [0.0, 0.0, 0.0]), (1.0, [1.0, 1.0, 1.0])])
+        }
+        GradientMapPreset::Sepia => sample_gradient_stops(
+            t,
+            &[
+                (0.0, [0.10, 0.07, 0.04]),
+                (0.45, [0.55, 0.35, 0.20]),
+                (1.0, [1.00, 0.88, 0.62]),
+            ],
+        ),
+        GradientMapPreset::Sunset => sample_gradient_stops(
+            t,
+            &[
+                (0.0, [0.10, 0.03, 0.16]),
+                (0.45, [0.86, 0.26, 0.16]),
+                (1.0, [1.00, 0.82, 0.42]),
+            ],
+        ),
+        GradientMapPreset::Twilight => sample_gradient_stops(
+            t,
+            &[
+                (0.0, [0.03, 0.05, 0.20]),
+                (0.50, [0.30, 0.22, 0.58]),
+                (1.0, [0.92, 0.70, 0.92]),
+            ],
+        ),
+        GradientMapPreset::TealOrange => sample_gradient_stops(
+            t,
+            &[
+                (0.0, [0.02, 0.13, 0.18]),
+                (0.50, [0.18, 0.46, 0.50]),
+                (1.0, [1.00, 0.62, 0.28]),
+            ],
+        ),
+        GradientMapPreset::Cherry => sample_gradient_stops(
+            t,
+            &[
+                (0.0, [0.16, 0.04, 0.10]),
+                (0.45, [0.82, 0.34, 0.48]),
+                (1.0, [1.00, 0.84, 0.90]),
+            ],
+        ),
+        GradientMapPreset::Forest => sample_gradient_stops(
+            t,
+            &[
+                (0.0, [0.03, 0.10, 0.06]),
+                (0.50, [0.18, 0.45, 0.22]),
+                (1.0, [0.78, 0.95, 0.58]),
+            ],
+        ),
+        GradientMapPreset::Fire => sample_gradient_stops(
+            t,
+            &[
+                (0.0, [0.05, 0.00, 0.00]),
+                (0.38, [0.70, 0.06, 0.02]),
+                (0.72, [1.00, 0.46, 0.06]),
+                (1.0, [1.00, 0.95, 0.62]),
+            ],
+        ),
+        GradientMapPreset::Ice => sample_gradient_stops(
+            t,
+            &[
+                (0.0, [0.02, 0.06, 0.14]),
+                (0.50, [0.22, 0.62, 0.92]),
+                (1.0, [0.88, 1.00, 1.00]),
+            ],
+        ),
+    }
+}
+
+fn sample_gradient_stops(t: f32, stops: &[(f32, [f32; 3])]) -> [f32; 3] {
+    let t = t.clamp(0.0, 1.0);
+    let Some(&(first_t, first_rgb)) = stops.first() else {
+        return [t, t, t];
+    };
+    if t <= first_t {
+        return first_rgb;
+    }
+    for pair in stops.windows(2) {
+        let (a_t, a_rgb) = pair[0];
+        let (b_t, b_rgb) = pair[1];
+        if t <= b_t {
+            let u = ((t - a_t) / (b_t - a_t).max(f32::EPSILON)).clamp(0.0, 1.0);
+            return [
+                lerp_f32(a_rgb[0], b_rgb[0], u),
+                lerp_f32(a_rgb[1], b_rgb[1], u),
+                lerp_f32(a_rgb[2], b_rgb[2], u),
+            ];
+        }
+    }
+    stops.last().map(|&(_, rgb)| rgb).unwrap_or(first_rgb)
+}
+
 fn look_rgb(rgb: [f32; 3], preset: LookPreset) -> [f32; 3] {
     let [mut r, mut g, mut b] = rgb;
     let luma = luma01(r, g, b);
@@ -2621,6 +2779,7 @@ mod tests {
             LocalEffect::Sharpen(SharpenParams::default()),
             LocalEffect::Hsl(HslParams::default()),
             LocalEffect::Look(LookParams::default()),
+            LocalEffect::GradientMap(GradientMapParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
             LocalEffect::FilmGrain(FilmGrainParams::default()),
@@ -2634,6 +2793,29 @@ mod tests {
             let out = apply_layers(src.as_ref(), &[layer]).unwrap();
             assert_eq!(out.pixels, src.pixels);
         }
+    }
+
+    #[test]
+    fn gradient_map_recolors_by_luma() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![0, 0, 0, 255, 128, 128, 128, 255, 255, 255, 255, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "gradient",
+            LocalMask::Full,
+            LocalEffect::GradientMap(GradientMapParams {
+                preset: GradientMapPreset::Fire,
+                strength: 1.0,
+                contrast: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] < out.pixels[8]);
+        assert!(out.pixels[9] > out.pixels[1]);
+        assert_eq!(out.pixels[3], 255);
     }
 
     #[test]
