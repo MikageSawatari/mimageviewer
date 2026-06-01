@@ -51,6 +51,8 @@ const MASK_PREVIEW_DRAG_INTERVAL_MS: u64 = 16;
 const MASK_PREVIEW_TILE_SIZE: usize = 256;
 const REGION_BOUNDARY_ANIM_INTERVAL_MS: u64 = 160;
 const U2NETP_INPUT_SIZE: usize = 320;
+const SAM2_INPUT_SIZE: usize = 1024;
+const SAM2_LOW_RES_MASK_SIZE: usize = 256;
 const MAX_UNDO_SNAPSHOTS_NORMAL: usize = 24;
 const MAX_UNDO_SNAPSHOTS_LARGE: usize = 8;
 const LARGE_UNDO_PIXEL_COUNT: usize = 2_500_000;
@@ -923,6 +925,9 @@ struct LocalAdjustLabApp {
     region_color_tolerance: f32,
     region_min_area: usize,
     region_candidate_mask_threshold: f32,
+    sam2_grid_size: usize,
+    sam2_iou_threshold: f32,
+    sam2_max_candidates: usize,
     line_width: f32,
     lasso_points: Vec<[f32; 2]>,
     shape_drag_start: Option<[f32; 2]>,
@@ -998,6 +1003,9 @@ impl LocalAdjustLabApp {
             region_color_tolerance: 42.0,
             region_min_area: 64,
             region_candidate_mask_threshold: 0.5,
+            sam2_grid_size: 8,
+            sam2_iou_threshold: 0.78,
+            sam2_max_candidates: 64,
             line_width: 28.0,
             lasso_points: Vec::new(),
             shape_drag_start: None,
@@ -1944,6 +1952,91 @@ impl LocalAdjustLabApp {
             }
             Err(e) => {
                 self.status = format!("候補マスク領域分割 worker 起動失敗: {e}");
+            }
+        }
+    }
+
+    fn start_sam2_region_segmentation(
+        &mut self,
+        ctx: &egui::Context,
+        scope: RegionSegmentationScope,
+    ) {
+        if self.segmentation_pending.is_some() {
+            self.status = "マスク生成中です。".to_string();
+            return;
+        }
+        let layer_idx = self.selected_layer;
+        if !matches!(
+            self.layers.get(layer_idx).map(|layer| &layer.mask),
+            Some(LocalMask::Segmentation(_))
+        ) {
+            self.status = "領域分割レイヤーを選択してください。".to_string();
+            return;
+        }
+        let Some(image) = &self.image else {
+            return;
+        };
+        let paths = sam2_model_paths();
+        if !paths.available() {
+            self.status = format!(
+                "SAM2モデルが見つかりません: {} / {}",
+                paths.encoder.display(),
+                paths.decoder.display()
+            );
+            return;
+        }
+        let source = image.source.clone();
+        let subject = if scope.requires_subject() {
+            self.subject_mask_candidate()
+        } else {
+            None
+        };
+        if scope.requires_subject() && subject.is_none() {
+            self.status = "利用できる被写体選択マスクがありません。".to_string();
+            return;
+        }
+        let threshold = self.region_candidate_mask_threshold.clamp(0.0, 1.0);
+        let min_area = self.region_min_area.max(1);
+        let grid_size = self.sam2_grid_size.clamp(2, 24);
+        let iou_threshold = self.sam2_iou_threshold.clamp(0.0, 1.0);
+        let max_candidates = self.sam2_max_candidates.clamp(1, 128);
+        let (tx, rx) = mpsc::channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("local-adjust-lab-sam2-segmentation".to_string())
+            .spawn(move || {
+                let result = run_sam2_candidate_masks(
+                    &source,
+                    &paths,
+                    grid_size,
+                    iou_threshold,
+                    max_candidates,
+                )
+                .and_then(|candidate_masks| {
+                    build_region_segmentation_from_candidate_masks(
+                        &source,
+                        subject.as_ref(),
+                        scope,
+                        &candidate_masks,
+                        threshold,
+                        min_area,
+                    )
+                })
+                .map(GeneratedMask::Regions);
+                let _ = tx.send(result);
+            });
+        match spawn_result {
+            Ok(_) => {
+                self.segmentation_pending = Some(SegmentationPending {
+                    layer_idx,
+                    generation: self.generation,
+                    rx,
+                    started_at: Instant::now(),
+                });
+                self.status = format!("SAM2候補マスクで領域分割中... grid {grid_size}x{grid_size}");
+                ctx.request_repaint();
+            }
+            Err(e) => {
+                self.status = format!("SAM2領域分割 worker 起動失敗: {e}");
             }
         }
     }
@@ -4084,6 +4177,81 @@ impl LocalAdjustLabApp {
         ui.label(
             egui::RichText::new(
                 "外部SAM等で作った白黒マスク画像を候補フォルダに置くと、重なりと隙間を排他的な領域候補へ変換します。",
+            )
+            .size(10.0)
+            .color(Color32::from_gray(170)),
+        );
+        ui.separator();
+        ui.label(
+            egui::RichText::new("SAM2自動候補（試験）")
+                .size(12.0)
+                .strong()
+                .color(Color32::from_gray(220)),
+        );
+        let sam2_paths = sam2_model_paths();
+        let sam2_available = sam2_paths.available();
+        let sam2_status = if sam2_available {
+            egui::RichText::new("SAM2 Hiera Tiny: 利用可能")
+                .size(11.0)
+                .color(Color32::from_rgb(120, 220, 150))
+        } else {
+            egui::RichText::new(format!(
+                "モデル未配置: {} / {}",
+                sam2_paths.encoder.display(),
+                sam2_paths.decoder.display()
+            ))
+            .size(10.0)
+            .color(Color32::from_rgb(255, 170, 100))
+        };
+        ui.label(sam2_status);
+        let mut grid_size = self.sam2_grid_size as i32;
+        if ui
+            .add(egui::Slider::new(&mut grid_size, 2..=16).text("グリッド"))
+            .on_hover_text("画像上に等間隔の点プロンプトを置き、各点から候補マスクを作ります。")
+            .changed()
+        {
+            self.sam2_grid_size = grid_size.max(2) as usize;
+        }
+        ui.add(egui::Slider::new(&mut self.sam2_iou_threshold, 0.0..=1.0).text("IoUしきい値"))
+            .on_hover_text("SAM2 decoder の候補スコアがこの値以上のマスクだけを採用します。");
+        let mut max_candidates = self.sam2_max_candidates as i32;
+        if ui
+            .add(egui::Slider::new(&mut max_candidates, 1..=128).text("最大候補"))
+            .on_hover_text("採用する候補マスク数の上限です。多いほど細かくなりますが重くなります。")
+            .changed()
+        {
+            self.sam2_max_candidates = max_candidates.clamp(1, 128) as usize;
+        }
+        if ui
+            .add_enabled(
+                !pending && sam2_available,
+                egui::Button::new("SAM2候補で画像全体を分割"),
+            )
+            .clicked()
+        {
+            self.start_sam2_region_segmentation(ui.ctx(), RegionSegmentationScope::Full);
+        }
+        if ui
+            .add_enabled(
+                !pending && sam2_available && subject_available,
+                egui::Button::new("SAM2候補で被写体内を分割"),
+            )
+            .clicked()
+        {
+            self.start_sam2_region_segmentation(ui.ctx(), RegionSegmentationScope::Subject);
+        }
+        if ui
+            .add_enabled(
+                !pending && sam2_available && subject_available,
+                egui::Button::new("SAM2候補で背景を分割"),
+            )
+            .clicked()
+        {
+            self.start_sam2_region_segmentation(ui.ctx(), RegionSegmentationScope::Background);
+        }
+        ui.label(
+            egui::RichText::new(
+                "encoder/decoder ONNXを使い、グリッド点プロンプトから候補マスクを生成して領域分割へ流します。",
             )
             .size(10.0)
             .color(Color32::from_gray(170)),
@@ -8121,6 +8289,318 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
     }
 }
 
+#[derive(Debug, Clone)]
+struct Sam2ModelPaths {
+    encoder: PathBuf,
+    decoder: PathBuf,
+}
+
+impl Sam2ModelPaths {
+    fn available(&self) -> bool {
+        self.encoder.is_file() && self.decoder.is_file()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Sam2PreprocessMeta {
+    resized_w: usize,
+    resized_h: usize,
+}
+
+struct Sam2CandidateMask {
+    score: f32,
+    mask: RasterMask,
+}
+
+fn run_sam2_candidate_masks(
+    source: &RgbaImageBuf,
+    paths: &Sam2ModelPaths,
+    grid_size: usize,
+    iou_threshold: f32,
+    max_candidates: usize,
+) -> Result<Vec<RasterMask>, String> {
+    ensure_lab_ort_loaded()?;
+    let (input, meta) = build_sam2_input(source)?;
+    let input_tensor =
+        ort::value::Tensor::from_array(input).map_err(|e| format!("SAM2 image tensor: {e}"))?;
+
+    let mut encoder = ort::session::Session::builder()
+        .map_err(|e| format!("SAM2 encoder Session::builder: {e}"))?
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+        .map_err(|e| format!("SAM2 encoder optimization_level: {e}"))?
+        .with_intra_threads(4)
+        .map_err(|e| format!("SAM2 encoder intra_threads: {e}"))?
+        .commit_from_file(&paths.encoder)
+        .map_err(|e| format!("SAM2 encoder load {}: {e}", paths.encoder.display()))?;
+    let (image_embed, high_res_feats_0, high_res_feats_1) = {
+        let outputs = encoder
+            .run(ort::inputs!["image" => input_tensor])
+            .map_err(|e| format!("SAM2 encoder run: {e}"))?;
+        (
+            output_arrayd(&outputs[0], "image_embed")?,
+            output_arrayd(&outputs[1], "high_res_feats_0")?,
+            output_arrayd(&outputs[2], "high_res_feats_1")?,
+        )
+    };
+
+    let mut decoder = ort::session::Session::builder()
+        .map_err(|e| format!("SAM2 decoder Session::builder: {e}"))?
+        .with_optimization_level(ort::session::builder::GraphOptimizationLevel::Level3)
+        .map_err(|e| format!("SAM2 decoder optimization_level: {e}"))?
+        .with_intra_threads(4)
+        .map_err(|e| format!("SAM2 decoder intra_threads: {e}"))?
+        .commit_from_file(&paths.decoder)
+        .map_err(|e| format!("SAM2 decoder load {}: {e}", paths.decoder.display()))?;
+
+    let grid_size = grid_size.clamp(2, 24);
+    let max_candidates = max_candidates.clamp(1, 128);
+    let iou_threshold = iou_threshold.clamp(0.0, 1.0);
+    let mut candidates = Vec::new();
+    for gy in 0..grid_size {
+        for gx in 0..grid_size {
+            let x = (gx as f32 + 0.5) * source.width as f32 / grid_size as f32;
+            let y = (gy as f32 + 0.5) * source.height as f32 / grid_size as f32;
+            let prompt_candidates = run_sam2_decoder_point(
+                &mut decoder,
+                &image_embed,
+                &high_res_feats_0,
+                &high_res_feats_1,
+                source,
+                meta,
+                [x, y],
+                iou_threshold,
+            )?;
+            candidates.extend(prompt_candidates);
+        }
+    }
+    candidates.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    candidates.truncate(max_candidates);
+    if candidates.is_empty() {
+        return Err("SAM2候補マスクが生成されませんでした。しきい値を下げてください。".to_string());
+    }
+    Ok(candidates
+        .into_iter()
+        .map(|candidate| candidate.mask)
+        .collect())
+}
+
+fn run_sam2_decoder_point(
+    decoder: &mut ort::session::Session,
+    image_embed: &ndarray::ArrayD<f32>,
+    high_res_feats_0: &ndarray::ArrayD<f32>,
+    high_res_feats_1: &ndarray::ArrayD<f32>,
+    source: &RgbaImageBuf,
+    meta: Sam2PreprocessMeta,
+    point: [f32; 2],
+    iou_threshold: f32,
+) -> Result<Vec<Sam2CandidateMask>, String> {
+    let scale_x = meta.resized_w as f32 / source.width.max(1) as f32;
+    let scale_y = meta.resized_h as f32 / source.height.max(1) as f32;
+    let point_coords = ndarray::Array3::from_shape_vec(
+        (1, 2, 2),
+        vec![point[0] * scale_x, point[1] * scale_y, 0.0, 0.0],
+    )
+    .map_err(|e| format!("SAM2 point_coords: {e}"))?;
+    let point_labels = ndarray::Array2::from_shape_vec((1, 2), vec![1.0_f32, -1.0])
+        .map_err(|e| format!("SAM2 point_labels: {e}"))?;
+    let mask_input =
+        ndarray::Array4::<f32>::zeros((1, 1, SAM2_LOW_RES_MASK_SIZE, SAM2_LOW_RES_MASK_SIZE));
+    let has_mask_input = ndarray::Array1::from_vec(vec![0.0_f32]);
+
+    let image_embed_tensor = ort::value::Tensor::from_array(image_embed.clone())
+        .map_err(|e| format!("SAM2 image_embed tensor: {e}"))?;
+    let high_res_feats_0_tensor = ort::value::Tensor::from_array(high_res_feats_0.clone())
+        .map_err(|e| format!("SAM2 high_res_feats_0 tensor: {e}"))?;
+    let high_res_feats_1_tensor = ort::value::Tensor::from_array(high_res_feats_1.clone())
+        .map_err(|e| format!("SAM2 high_res_feats_1 tensor: {e}"))?;
+    let point_coords_tensor = ort::value::Tensor::from_array(point_coords)
+        .map_err(|e| format!("SAM2 point_coords tensor: {e}"))?;
+    let point_labels_tensor = ort::value::Tensor::from_array(point_labels)
+        .map_err(|e| format!("SAM2 point_labels tensor: {e}"))?;
+    let mask_input_tensor = ort::value::Tensor::from_array(mask_input)
+        .map_err(|e| format!("SAM2 mask_input tensor: {e}"))?;
+    let has_mask_input_tensor = ort::value::Tensor::from_array(has_mask_input)
+        .map_err(|e| format!("SAM2 has_mask_input tensor: {e}"))?;
+
+    let outputs = decoder
+        .run(ort::inputs! {
+            "image_embed" => image_embed_tensor,
+            "high_res_feats_0" => high_res_feats_0_tensor,
+            "high_res_feats_1" => high_res_feats_1_tensor,
+            "point_coords" => point_coords_tensor,
+            "point_labels" => point_labels_tensor,
+            "mask_input" => mask_input_tensor,
+            "has_mask_input" => has_mask_input_tensor,
+        })
+        .map_err(|e| format!("SAM2 decoder run: {e}"))?;
+    let (mask_shape, mask_raw) = outputs[0]
+        .try_extract_tensor::<f32>()
+        .map_err(|e| format!("SAM2 masks extract: {e}"))?;
+    let (iou_shape, iou_raw) = outputs[1]
+        .try_extract_tensor::<f32>()
+        .map_err(|e| format!("SAM2 iou_predictions extract: {e}"))?;
+    sam2_decoder_outputs_to_candidate_masks(
+        mask_shape.iter().copied().collect(),
+        mask_raw,
+        iou_shape.iter().copied().collect(),
+        iou_raw,
+        source.width,
+        source.height,
+        meta,
+        iou_threshold,
+    )
+}
+
+fn output_arrayd(
+    output: &ort::value::DynValue,
+    label: &str,
+) -> Result<ndarray::ArrayD<f32>, String> {
+    let (shape, raw) = output
+        .try_extract_tensor::<f32>()
+        .map_err(|e| format!("SAM2 {label} extract: {e}"))?;
+    let dims: Vec<usize> = shape.iter().map(|&dim| dim as usize).collect();
+    ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&dims), raw.to_vec())
+        .map_err(|e| format!("SAM2 {label} array: {e}"))
+}
+
+fn build_sam2_input(
+    source: &RgbaImageBuf,
+) -> Result<(ndarray::Array4<f32>, Sam2PreprocessMeta), String> {
+    let mut rgb = Vec::with_capacity(source.width.saturating_mul(source.height).saturating_mul(3));
+    for px in source.pixels.chunks_exact(4) {
+        rgb.extend_from_slice(&px[..3]);
+    }
+    let Some(rgb_image) = RgbImage::from_raw(source.width as u32, source.height as u32, rgb) else {
+        return Err("invalid source RGB buffer".to_string());
+    };
+    let scale = (SAM2_INPUT_SIZE as f32 / source.width.max(1) as f32)
+        .min(SAM2_INPUT_SIZE as f32 / source.height.max(1) as f32);
+    let resized_w = ((source.width as f32 * scale).round() as usize).clamp(1, SAM2_INPUT_SIZE);
+    let resized_h = ((source.height as f32 * scale).round() as usize).clamp(1, SAM2_INPUT_SIZE);
+    let resized = image::imageops::resize(
+        &rgb_image,
+        resized_w as u32,
+        resized_h as u32,
+        FilterType::Triangle,
+    );
+    let mut input = ndarray::Array4::<f32>::zeros((1, 3, SAM2_INPUT_SIZE, SAM2_INPUT_SIZE));
+    let mean = [123.675_f32, 116.28, 103.53];
+    let std = [58.395_f32, 57.12, 57.375];
+    for y in 0..resized_h {
+        for x in 0..resized_w {
+            let p = resized.get_pixel(x as u32, y as u32).0;
+            for c in 0..3 {
+                input[[0, c, y, x]] = (p[c] as f32 - mean[c]) / std[c];
+            }
+        }
+    }
+    Ok((
+        input,
+        Sam2PreprocessMeta {
+            resized_w,
+            resized_h,
+        },
+    ))
+}
+
+fn sam2_decoder_outputs_to_candidate_masks(
+    mask_shape: Vec<i64>,
+    mask_raw: &[f32],
+    iou_shape: Vec<i64>,
+    iou_raw: &[f32],
+    dst_w: usize,
+    dst_h: usize,
+    meta: Sam2PreprocessMeta,
+    iou_threshold: f32,
+) -> Result<Vec<Sam2CandidateMask>, String> {
+    let (num_masks, mask_w, mask_h, mask_offset) =
+        sam2_mask_output_layout(&mask_shape, mask_raw.len())?;
+    let iou_count = sam2_iou_count(&iou_shape, iou_raw.len()).min(num_masks);
+    let crop_w = ((meta.resized_w as f32 / 4.0).ceil() as usize).clamp(1, mask_w);
+    let crop_h = ((meta.resized_h as f32 / 4.0).ceil() as usize).clamp(1, mask_h);
+    let min_candidate_area = 8_usize.min(dst_w.saturating_mul(dst_h).max(1));
+    let mut candidates = Vec::new();
+    for mask_idx in 0..iou_count {
+        let score = iou_raw.get(mask_idx).copied().unwrap_or(0.0);
+        if !score.is_finite() || score < iou_threshold {
+            continue;
+        }
+        let start = mask_offset + mask_idx.saturating_mul(mask_w).saturating_mul(mask_h);
+        let end = start.saturating_add(mask_w.saturating_mul(mask_h));
+        if end > mask_raw.len() {
+            break;
+        }
+        let mut cropped = vec![0.0_f32; crop_w.saturating_mul(crop_h)];
+        for y in 0..crop_h {
+            let src_row = start + y * mask_w;
+            let dst_row = y * crop_w;
+            for x in 0..crop_w {
+                cropped[dst_row + x] = sam2_mask_value_to_alpha(mask_raw[src_row + x]);
+            }
+        }
+        let alpha = resize_mask_bilinear(&cropped, crop_w, crop_h, dst_w, dst_h);
+        if alpha.iter().filter(|&&v| v >= 0.5).count() < min_candidate_area {
+            continue;
+        }
+        candidates.push(Sam2CandidateMask {
+            score,
+            mask: RasterMask {
+                width: dst_w,
+                height: dst_h,
+                alpha,
+            },
+        });
+    }
+    Ok(candidates)
+}
+
+fn sam2_mask_output_layout(
+    shape: &[i64],
+    raw_len: usize,
+) -> Result<(usize, usize, usize, usize), String> {
+    if shape.len() >= 4 {
+        let n = shape[shape.len() - 3].max(1) as usize;
+        let h = shape[shape.len() - 2].max(1) as usize;
+        let w = shape[shape.len() - 1].max(1) as usize;
+        let mask_len = n.saturating_mul(w).saturating_mul(h);
+        if mask_len <= raw_len {
+            return Ok((n, w, h, raw_len - mask_len));
+        }
+    }
+    let n = 3_usize;
+    let side = (raw_len / n).max(1);
+    let wh = (side as f64).sqrt().round() as usize;
+    if n.saturating_mul(wh).saturating_mul(wh) <= raw_len {
+        Ok((n, wh, wh, raw_len - n * wh * wh))
+    } else {
+        Err(format!(
+            "SAM2 masks shape is unsupported: {shape:?}, len={raw_len}"
+        ))
+    }
+}
+
+fn sam2_iou_count(shape: &[i64], raw_len: usize) -> usize {
+    if shape.len() >= 2 {
+        shape[shape.len() - 1].max(1) as usize
+    } else {
+        raw_len
+    }
+}
+
+fn sam2_mask_value_to_alpha(v: f32) -> f32 {
+    if !v.is_finite() {
+        0.0
+    } else if (0.0..=1.0).contains(&v) {
+        v
+    } else {
+        (1.0 / (1.0 + (-v).exp())).clamp(0.0, 1.0)
+    }
+}
+
 fn run_u2netp_segmentation(source: &RgbaImageBuf, model_path: &Path) -> Result<RasterMask, String> {
     ensure_lab_ort_loaded()?;
     let input = build_u2netp_input(source)?;
@@ -8609,6 +9089,14 @@ fn resize_mask_bilinear(
 
 fn segmentation_model_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/u2netp.onnx")
+}
+
+fn sam2_model_paths() -> Sam2ModelPaths {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("models/sam2_hiera_tiny");
+    Sam2ModelPaths {
+        encoder: dir.join("encoder.onnx"),
+        decoder: dir.join("decoder.onnx"),
+    }
 }
 
 fn lab_ort_dll_path() -> PathBuf {
@@ -10667,6 +11155,57 @@ mod tests {
     }
 
     #[test]
+    fn sam2_preprocess_preserves_aspect_in_square_input() {
+        let source = RgbaImageBuf::new(
+            4,
+            2,
+            vec![
+                10, 20, 30, 255, 10, 20, 30, 255, 10, 20, 30, 255, 10, 20, 30, 255, 40, 50, 60,
+                255, 40, 50, 60, 255, 40, 50, 60, 255, 40, 50, 60, 255,
+            ],
+        )
+        .unwrap();
+        let (input, meta) = build_sam2_input(&source).unwrap();
+        assert_eq!(input.shape(), &[1, 3, SAM2_INPUT_SIZE, SAM2_INPUT_SIZE]);
+        assert_eq!(meta.resized_w, SAM2_INPUT_SIZE);
+        assert_eq!(meta.resized_h, SAM2_INPUT_SIZE / 2);
+    }
+
+    #[test]
+    fn sam2_decoder_outputs_convert_logits_to_source_masks() {
+        let mut raw = vec![-8.0_f32; 1 * 3 * SAM2_LOW_RES_MASK_SIZE * SAM2_LOW_RES_MASK_SIZE];
+        for value in raw
+            .iter_mut()
+            .take(SAM2_LOW_RES_MASK_SIZE * SAM2_LOW_RES_MASK_SIZE)
+        {
+            *value = 8.0;
+        }
+        let candidates = sam2_decoder_outputs_to_candidate_masks(
+            vec![
+                1,
+                3,
+                SAM2_LOW_RES_MASK_SIZE as i64,
+                SAM2_LOW_RES_MASK_SIZE as i64,
+            ],
+            &raw,
+            vec![1, 3],
+            &[0.9, 0.1, 0.1],
+            2,
+            2,
+            Sam2PreprocessMeta {
+                resized_w: SAM2_INPUT_SIZE,
+                resized_h: SAM2_INPUT_SIZE,
+            },
+            0.5,
+        )
+        .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].mask.width, 2);
+        assert_eq!(candidates[0].mask.height, 2);
+        assert!(candidates[0].mask.alpha[0] > 0.5);
+    }
+
+    #[test]
     #[ignore = "loads the local ONNX model and ONNX Runtime DLL"]
     fn u2netp_segmentation_smoke_test() {
         if !segmentation_model_path().is_file() {
@@ -10688,5 +11227,36 @@ mod tests {
         assert_eq!(mask.height, height);
         assert_eq!(mask.alpha.len(), width * height);
         assert!(mask.alpha.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    #[ignore = "loads the local SAM2 ONNX model and ONNX Runtime DLL"]
+    fn sam2_segmentation_smoke_test() {
+        let paths = sam2_model_paths();
+        if !paths.available() {
+            return;
+        }
+        let width = 32;
+        let height = 32;
+        let mut pixels = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                let inside = (8..24).contains(&x) && (8..24).contains(&y);
+                let rgb = if inside {
+                    [230, 230, 230]
+                } else {
+                    [20, 20, 20]
+                };
+                pixels.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            }
+        }
+        let source = RgbaImageBuf::new(width, height, pixels).unwrap();
+        let masks = run_sam2_candidate_masks(&source, &paths, 2, 0.0, 8).unwrap();
+        assert!(!masks.is_empty());
+        assert!(
+            masks
+                .iter()
+                .all(|mask| mask.width == width && mask.height == height)
+        );
     }
 }

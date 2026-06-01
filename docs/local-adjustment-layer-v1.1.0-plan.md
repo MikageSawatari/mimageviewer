@@ -893,6 +893,10 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   フォルダから読み込み、候補マスクの重なり / 隙間を排他的な `RegionMask` へ変換する
   試験経路を追加した。重なりは独立領域、どの候補にも含まれない部分も gap 領域として
   選択できる
+- `local_adjust_lab` に、`models/sam2_hiera_tiny/encoder.onnx` と `decoder.onnx`
+  がある場合に SAM2 Hiera Tiny を直接回す試験経路を追加した。まず encoder を1回実行し、
+  画像上のグリッド点を foreground prompt として decoder に渡す。IoUしきい値を超えた
+  候補マスクを集め、外部候補マスクと同じ排他的 `RegionMask` 変換へ流す
 - 効果: Tone (自然な彩度を含む) / Clarity / Highlights-Shadows / Blur / Soft Focus /
   Mosaic / Sharpen / HSL / Tone Curve / Dehaze / Look / Bloom / Vignette / Film Grain /
   Chromatic Aberration / Halftone / Cross-Star Glow / Edge-preserving Smooth

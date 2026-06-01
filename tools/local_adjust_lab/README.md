@@ -60,6 +60,10 @@ the window.
     mask images in a sibling folder named `<image-stem>.sam_masks`; the region
     tool can convert overlapping masks and uncovered gaps into non-overlapping
     region candidates.
+  - Experimental SAM2 candidate generation. Place `encoder.onnx` and
+    `decoder.onnx` under `tools/local_adjust_lab/models/sam2_hiera_tiny\`; the
+    region tool can run grid point prompts, collect candidate masks, and feed
+    them into the same non-overlapping region partitioner.
 - Shared mask controls:
   - Invert
   - Expand / shrink
@@ -160,3 +164,17 @@ other candidates by membership signature. Pixels covered by the same set of
 candidate masks become one connected region; overlaps become their own regions,
 and pixels not covered by any candidate remain selectable gap/background
 regions. This keeps the UI partitioned even when the source AI masks overlap.
+
+The lab can also run SAM2 Hiera Tiny ONNX directly when the model files are
+present:
+
+```text
+tools/local_adjust_lab/models/sam2_hiera_tiny/encoder.onnx
+tools/local_adjust_lab/models/sam2_hiera_tiny/decoder.onnx
+```
+
+The current prototype uses grid foreground point prompts. Encoder results are
+computed once per run, decoder candidates above the IoU threshold are collected,
+and the resulting soft masks are converted into the same partitioned
+`RegionMask`. This is meant for quality and workflow validation; model download
+and GPU/DirectML packaging are still future integration work.
