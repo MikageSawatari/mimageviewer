@@ -152,6 +152,13 @@ fn animated_overlay_color(ctx: &egui::Context, alpha: u8) -> Color32 {
     Color32::from_rgba_unmultiplied(r, g, b, alpha)
 }
 
+fn raster_vector_edit_controls_visible(
+    selected_mask_kind: Option<MaskKind>,
+    override_edit_panel: Option<OverrideEditTarget>,
+) -> bool {
+    selected_mask_kind == Some(MaskKind::Raster) || override_edit_panel.is_some()
+}
+
 struct LoadedImage {
     path: PathBuf,
     source: RgbaImageBuf,
@@ -3794,7 +3801,7 @@ impl LocalAdjustLabApp {
             .selected_layer_ref()
             .map(|layer| MaskKind::from_mask(&layer.mask));
         let manual_edit_controls_visible =
-            selected_mask_kind == Some(MaskKind::Raster) || self.override_edit_panel.is_some();
+            raster_vector_edit_controls_visible(selected_mask_kind, self.override_edit_panel);
         if manual_edit_controls_visible {
             self.draw_tool_controls(ui);
         } else {
@@ -4832,11 +4839,10 @@ impl LocalAdjustLabApp {
         pointer_screen: Option<Pos2>,
         to_screen: &impl Fn([f32; 2]) -> Pos2,
     ) {
-        if self
+        let selected_mask_kind = self
             .selected_layer_ref()
-            .map(|layer| MaskKind::from_mask(&layer.mask))
-            != Some(MaskKind::Raster)
-        {
+            .map(|layer| MaskKind::from_mask(&layer.mask));
+        if !raster_vector_edit_controls_visible(selected_mask_kind, self.override_edit_panel) {
             return;
         }
         let Some((img_w, img_h)) = self.image_dims() else {
@@ -4913,11 +4919,10 @@ impl LocalAdjustLabApp {
         ) {
             return;
         }
-        if self
+        let selected_mask_kind = self
             .selected_layer_ref()
-            .map(|layer| MaskKind::from_mask(&layer.mask))
-            != Some(MaskKind::Raster)
-        {
+            .map(|layer| MaskKind::from_mask(&layer.mask));
+        if !raster_vector_edit_controls_visible(selected_mask_kind, self.override_edit_panel) {
             return;
         }
         let Some((img_w, _img_h)) = self.image_dims() else {
@@ -9862,6 +9867,26 @@ mod tests {
             image.pixels[1],
             Color32::from_rgba_unmultiplied(0, 205, 255, 116)
         );
+    }
+
+    #[test]
+    fn raster_vector_edit_controls_are_visible_for_override_masks() {
+        assert!(raster_vector_edit_controls_visible(
+            Some(MaskKind::Raster),
+            None
+        ));
+        assert!(raster_vector_edit_controls_visible(
+            Some(MaskKind::Subject),
+            Some(OverrideEditTarget::Add)
+        ));
+        assert!(raster_vector_edit_controls_visible(
+            Some(MaskKind::Segmentation),
+            Some(OverrideEditTarget::Subtract)
+        ));
+        assert!(!raster_vector_edit_controls_visible(
+            Some(MaskKind::Subject),
+            None
+        ));
     }
 
     #[test]
