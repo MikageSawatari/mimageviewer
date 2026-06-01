@@ -422,6 +422,7 @@ pub enum LocalEffect {
     Posterize(PosterizeParams),
     Threshold(ThresholdParams),
     Invert(InvertParams),
+    Duotone(DuotoneParams),
     GradientMap(GradientMapParams),
     Bloom(BloomParams),
     Vignette(VignetteParams),
@@ -992,6 +993,42 @@ impl Default for InvertParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DuotonePreset {
+    None,
+    SepiaInk,
+    Cyanotype,
+    BlackRed,
+    PurpleGold,
+    TealCream,
+    SunsetTritone,
+    ComicTritone,
+    NoirTritone,
+}
+
+impl Default for DuotonePreset {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DuotoneParams {
+    pub preset: DuotonePreset,
+    pub strength: f32,
+    pub contrast: f32,
+}
+
+impl Default for DuotoneParams {
+    fn default() -> Self {
+        Self {
+            preset: DuotonePreset::None,
+            strength: 1.0,
+            contrast: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GradientMapPreset {
     None,
     Mono,
@@ -1284,6 +1321,7 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         LocalEffect::Posterize(params) => apply_posterize(&image.pixels, *params),
         LocalEffect::Threshold(params) => apply_threshold(&image.pixels, *params),
         LocalEffect::Invert(params) => apply_invert(&image.pixels, *params),
+        LocalEffect::Duotone(params) => apply_duotone(&image.pixels, *params),
         LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
         LocalEffect::Bloom(params) => {
             apply_bloom(&image.pixels, image.width, image.height, *params)
@@ -2669,6 +2707,76 @@ fn apply_invert(src: &[u8], params: InvertParams) -> Vec<u8> {
     out
 }
 
+fn apply_duotone(src: &[u8], params: DuotoneParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if params.preset == DuotonePreset::None || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let contrast = (params.contrast / 100.0).clamp(-1.0, 1.0);
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let rgb = [
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        ];
+        let mut t = luma01(rgb[0], rgb[1], rgb[2]);
+        if contrast.abs() > f32::EPSILON {
+            t = ((t - 0.5) * (1.0 + contrast) + 0.5).clamp(0.0, 1.0);
+        }
+        let mapped = duotone_rgb(t, params.preset);
+        px[0] = to_u8(lerp_f32(rgb[0], mapped[0], strength));
+        px[1] = to_u8(lerp_f32(rgb[1], mapped[1], strength));
+        px[2] = to_u8(lerp_f32(rgb[2], mapped[2], strength));
+    }
+    out
+}
+
+fn duotone_rgb(t: f32, preset: DuotonePreset) -> [f32; 3] {
+    match preset {
+        DuotonePreset::None => [t, t, t],
+        DuotonePreset::SepiaInk => {
+            sample_gradient_stops(t, &[(0.0, [0.12, 0.08, 0.04]), (1.0, [0.98, 0.86, 0.58])])
+        }
+        DuotonePreset::Cyanotype => {
+            sample_gradient_stops(t, &[(0.0, [0.02, 0.08, 0.18]), (1.0, [0.74, 0.92, 1.0])])
+        }
+        DuotonePreset::BlackRed => {
+            sample_gradient_stops(t, &[(0.0, [0.02, 0.00, 0.00]), (1.0, [1.0, 0.18, 0.10])])
+        }
+        DuotonePreset::PurpleGold => {
+            sample_gradient_stops(t, &[(0.0, [0.12, 0.04, 0.22]), (1.0, [1.0, 0.78, 0.22])])
+        }
+        DuotonePreset::TealCream => {
+            sample_gradient_stops(t, &[(0.0, [0.02, 0.24, 0.28]), (1.0, [1.0, 0.94, 0.74])])
+        }
+        DuotonePreset::SunsetTritone => sample_gradient_stops(
+            t,
+            &[
+                (0.0, [0.06, 0.02, 0.14]),
+                (0.50, [0.78, 0.18, 0.24]),
+                (1.0, [1.0, 0.82, 0.30]),
+            ],
+        ),
+        DuotonePreset::ComicTritone => sample_gradient_stops(
+            t,
+            &[
+                (0.0, [0.02, 0.04, 0.10]),
+                (0.54, [0.12, 0.55, 0.92]),
+                (1.0, [1.0, 0.95, 0.20]),
+            ],
+        ),
+        DuotonePreset::NoirTritone => sample_gradient_stops(
+            t,
+            &[
+                (0.0, [0.02, 0.02, 0.03]),
+                (0.48, [0.28, 0.24, 0.22]),
+                (1.0, [0.92, 0.90, 0.82]),
+            ],
+        ),
+    }
+}
+
 fn apply_gradient_map(src: &[u8], params: GradientMapParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 1.0);
     if params.preset == GradientMapPreset::None || strength <= f32::EPSILON {
@@ -3619,6 +3727,7 @@ mod tests {
             LocalEffect::Posterize(PosterizeParams::default()),
             LocalEffect::Threshold(ThresholdParams::default()),
             LocalEffect::Invert(InvertParams::default()),
+            LocalEffect::Duotone(DuotoneParams::default()),
             LocalEffect::GradientMap(GradientMapParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
@@ -4117,6 +4226,23 @@ LUT_3D_SIZE 2
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(out.pixels, vec![245, 135, 5, 128]);
+    }
+
+    #[test]
+    fn duotone_maps_luma_to_two_colors() {
+        let src = RgbaImageBuf::new(2, 1, vec![0, 0, 0, 255, 255, 255, 255, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "duotone",
+            LocalMask::Full,
+            LocalEffect::Duotone(DuotoneParams {
+                preset: DuotonePreset::BlackRed,
+                strength: 1.0,
+                contrast: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[5, 0, 0, 255]);
+        assert_eq!(&out.pixels[4..8], &[255, 46, 26, 255]);
     }
 
     #[test]

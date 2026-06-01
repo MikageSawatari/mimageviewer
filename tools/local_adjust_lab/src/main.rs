@@ -16,14 +16,15 @@ use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     BloomParams, BlurParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
     ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
-    CubeLutParams, DehazeParams, EdgeSmoothParams, FilmGrainParams, GradientMapParams,
-    GradientMapPreset, HalftoneParams, HighlightsShadowsParams, HslParams, InvertParams, LineKind,
-    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
-    ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode, PosterizeParams,
-    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
-    RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams,
-    StarGlowParams, ThreeWayColorGradingParams, ThresholdParams, ToneCurveParams, ToneParams,
-    VignetteParams, apply_layers, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    CubeLutParams, DehazeParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, FilmGrainParams,
+    GradientMapParams, GradientMapPreset, HalftoneParams, HighlightsShadowsParams, HslParams,
+    InvertParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
+    LookParams, LookPreset, ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams,
+    MosaicTileMode, PosterizeParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
+    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp,
+    SharpenParams, SoftFocusParams, StarGlowParams, ThreeWayColorGradingParams, ThresholdParams,
+    ToneCurveParams, ToneParams, VignetteParams, apply_layers, compute_mosaic_tile_size,
+    evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -947,6 +948,7 @@ enum EffectKind {
     Posterize,
     Threshold,
     Invert,
+    Duotone,
     GradientMap,
     Bloom,
     Vignette,
@@ -982,6 +984,7 @@ impl EffectKind {
             LocalEffect::Posterize(_) => Self::Posterize,
             LocalEffect::Threshold(_) => Self::Threshold,
             LocalEffect::Invert(_) => Self::Invert,
+            LocalEffect::Duotone(_) => Self::Duotone,
             LocalEffect::GradientMap(_) => Self::GradientMap,
             LocalEffect::Bloom(_) => Self::Bloom,
             LocalEffect::Vignette(_) => Self::Vignette,
@@ -1017,6 +1020,7 @@ impl EffectKind {
             Self::Posterize => "ポスタリゼーション",
             Self::Threshold => "2値化",
             Self::Invert => "階調反転/ネガ",
+            Self::Duotone => "ダブルトーン",
             Self::GradientMap => "グラデーションマップ",
             Self::Bloom => "ブルーム",
             Self::Vignette => "ビネット",
@@ -1056,6 +1060,7 @@ impl EffectKind {
             Self::Posterize => "色の階調数を減らし、フラットでグラフィックな見た目にします。",
             Self::Threshold => "明るさをしきい値で黒と白に分け、線画やモノクロ風にします。",
             Self::Invert => "RGBの明暗を反転し、ネガフィルムのような見た目にします。",
+            Self::Duotone => "明暗を2色または3色へ置き換え、印刷やポスターのような色味にします。",
             Self::GradientMap => {
                 "明るさを指定したグラデーションの色へ置き換え、色設計や色トレス風に使います。"
             }
@@ -1099,6 +1104,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Posterize,
             EffectKind::Threshold,
             EffectKind::Invert,
+            EffectKind::Duotone,
             EffectKind::GradientMap,
         ],
     },
@@ -6391,6 +6397,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
             format!("2値化 {:.0}%{suffix}", params.threshold * 100.0)
         }
         LocalEffect::Invert(params) => format!("ネガ {:.0}%", params.strength * 100.0),
+        LocalEffect::Duotone(params) => {
+            format!("ダブルトーン {}", duotone_preset_label(params.preset))
+        }
         LocalEffect::GradientMap(params) => {
             format!(
                 "グラデーション {}",
@@ -6493,6 +6502,20 @@ fn gradient_map_preset_label(preset: GradientMapPreset) -> &'static str {
         GradientMapPreset::Forest => "森",
         GradientMapPreset::Fire => "炎",
         GradientMapPreset::Ice => "氷",
+    }
+}
+
+fn duotone_preset_label(preset: DuotonePreset) -> &'static str {
+    match preset {
+        DuotonePreset::None => "選択してください",
+        DuotonePreset::SepiaInk => "セピアインク",
+        DuotonePreset::Cyanotype => "青写真",
+        DuotonePreset::BlackRed => "黒赤",
+        DuotonePreset::PurpleGold => "紫金",
+        DuotonePreset::TealCream => "ティールクリーム",
+        DuotonePreset::SunsetTritone => "夕暮れ3色",
+        DuotonePreset::ComicTritone => "コミック3色",
+        DuotonePreset::NoirTritone => "ノワール3色",
     }
 }
 
@@ -8015,6 +8038,105 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から反転後の色へどれだけ近づけるかです。");
+        }
+        LocalEffect::Duotone(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "セピア") {
+                    *params = DuotoneParams {
+                        preset: DuotonePreset::SepiaInk,
+                        strength: 0.8,
+                        contrast: 0.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "青写真") {
+                    *params = DuotoneParams {
+                        preset: DuotonePreset::Cyanotype,
+                        strength: 0.85,
+                        contrast: 8.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "黒赤") {
+                    *params = DuotoneParams {
+                        preset: DuotonePreset::BlackRed,
+                        strength: 0.9,
+                        contrast: 12.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "紫金") {
+                    *params = DuotoneParams {
+                        preset: DuotonePreset::PurpleGold,
+                        strength: 0.85,
+                        contrast: 6.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "夕暮れ3色") {
+                    *params = DuotoneParams {
+                        preset: DuotonePreset::SunsetTritone,
+                        strength: 0.85,
+                        contrast: 5.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "コミック3色") {
+                    *params = DuotoneParams {
+                        preset: DuotonePreset::ComicTritone,
+                        strength: 0.8,
+                        contrast: 18.0,
+                    };
+                    changed = true;
+                }
+            });
+            let before = params.preset;
+            lab_combo_box(
+                ui,
+                "duotone_preset",
+                duotone_preset_label(params.preset),
+                |ui| {
+                    for preset in [
+                        DuotonePreset::None,
+                        DuotonePreset::SepiaInk,
+                        DuotonePreset::Cyanotype,
+                        DuotonePreset::BlackRed,
+                        DuotonePreset::PurpleGold,
+                        DuotonePreset::TealCream,
+                        DuotonePreset::SunsetTritone,
+                        DuotonePreset::ComicTritone,
+                        DuotonePreset::NoirTritone,
+                    ] {
+                        ui.selectable_value(
+                            &mut params.preset,
+                            preset,
+                            duotone_preset_label(preset),
+                        );
+                    }
+                },
+            );
+            if params.preset != before {
+                if params.preset != DuotonePreset::None && params.strength <= f32::EPSILON {
+                    params.strength = 1.0;
+                }
+                changed = true;
+            }
+            ui.label(
+                egui::RichText::new(
+                    "明るさを元に2色または3色のインク風カラーへ置き換えます。グラデーションマップより印刷・ポスター調に寄せた効果です。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像の色からダブルトーンの色へどれだけ近づけるかです。");
+            let contrast = ui.add(
+                egui::Slider::new(&mut params.contrast, -100.0..=100.0).text("明暗コントラスト"),
+            );
+            changed |= contrast.changed();
+            contrast.lab_hover_tip("色を割り当てる前に明暗差を締めたり広げたりします。");
         }
         LocalEffect::GradientMap(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -9604,6 +9726,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Posterize => LocalEffect::Posterize(PosterizeParams::default()),
         EffectKind::Threshold => LocalEffect::Threshold(ThresholdParams::default()),
         EffectKind::Invert => LocalEffect::Invert(InvertParams::default()),
+        EffectKind::Duotone => LocalEffect::Duotone(DuotoneParams::default()),
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
