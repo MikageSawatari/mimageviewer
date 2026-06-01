@@ -55,6 +55,10 @@ const MAX_UNDO_SNAPSHOTS_NORMAL: usize = 24;
 const MAX_UNDO_SNAPSHOTS_LARGE: usize = 8;
 const LARGE_UNDO_PIXEL_COUNT: usize = 2_500_000;
 const REGION_SEGMENT_MAX_LABELS: usize = 2048;
+const LAB_TEXT_FAMILY_NAME: &str = "miv-lab-toolbar-text";
+const LAB_TEXT_Y_OFFSET: f32 = 3.5;
+const LAB_TOOLTIP_GAP: f32 = 8.0;
+const LAB_CURSOR_FALLBACK_EXTENT: f32 = 34.0;
 
 fn main() -> eframe::Result<()> {
     let initial_path = std::env::args_os().nth(1).map(PathBuf::from);
@@ -77,6 +81,12 @@ fn main() -> eframe::Result<()> {
 
 fn configure_lab_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
+    let base_proportional = fonts
+        .families
+        .get(&egui::FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let mut lab_toolbar_fonts = Vec::new();
     for path in [
         r"C:\Windows\Fonts\YuGothM.ttc",
         r"C:\Windows\Fonts\meiryo.ttc",
@@ -87,8 +97,16 @@ fn configure_lab_fonts(ctx: &egui::Context) {
         };
         fonts.font_data.insert(
             "miv_lab_japanese".to_owned(),
-            Arc::new(egui::FontData::from_owned(data)),
+            Arc::new(egui::FontData::from_owned(data.clone())),
         );
+        fonts.font_data.insert(
+            "miv_lab_japanese_toolbar".to_owned(),
+            Arc::new(egui::FontData::from_owned(data).tweak(egui::FontTweak {
+                y_offset: LAB_TEXT_Y_OFFSET,
+                ..Default::default()
+            })),
+        );
+        lab_toolbar_fonts.push("miv_lab_japanese_toolbar".to_owned());
         for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
             let family_fonts = fonts.families.entry(family).or_default();
             family_fonts.retain(|name| name != "miv_lab_japanese");
@@ -96,6 +114,19 @@ fn configure_lab_fonts(ctx: &egui::Context) {
         }
         break;
     }
+    if lab_toolbar_fonts.is_empty() {
+        lab_toolbar_fonts.extend(base_proportional.iter().cloned());
+    } else {
+        for name in base_proportional {
+            if !lab_toolbar_fonts.contains(&name) {
+                lab_toolbar_fonts.push(name);
+            }
+        }
+    }
+    fonts.families.insert(
+        egui::FontFamily::Name(Arc::<str>::from(LAB_TEXT_FAMILY_NAME)),
+        lab_toolbar_fonts,
+    );
     ctx.set_fonts(fonts);
     apply_lab_dark_theme(ctx);
 }
@@ -121,11 +152,80 @@ fn apply_lab_dark_theme(ctx: &egui::Context) {
     ctx.set_theme(egui::ThemePreference::Dark);
     ctx.style_mut(|style| {
         style.visuals = lab_dark_visuals();
+        apply_lab_text_style(style);
     });
 }
 
 fn apply_lab_dark_ui(ui: &mut egui::Ui) {
     ui.style_mut().visuals = lab_dark_visuals();
+    apply_lab_text_style(ui.style_mut());
+}
+
+fn apply_lab_text_style(style: &mut egui::Style) {
+    let family = egui::FontFamily::Name(Arc::<str>::from(LAB_TEXT_FAMILY_NAME));
+    for text_style in [
+        egui::TextStyle::Body,
+        egui::TextStyle::Button,
+        egui::TextStyle::Small,
+    ] {
+        if let Some(font_id) = style.text_styles.get_mut(&text_style) {
+            font_id.family = family.clone();
+        }
+    }
+}
+
+fn lab_tooltip_frame() -> egui::Frame {
+    static FRAME: OnceLock<egui::Frame> = OnceLock::new();
+    FRAME
+        .get_or_init(|| {
+            let style = egui::Style {
+                visuals: lab_dark_visuals(),
+                ..egui::Style::default()
+            };
+            egui::Frame::popup(&style)
+        })
+        .clone()
+}
+
+fn lab_cursor_anchor_rect(ctx: &egui::Context) -> Option<egui::Rect> {
+    let pos = ctx.pointer_hover_pos()?;
+    Some(egui::Rect::from_min_max(
+        egui::pos2(pos.x, pos.y),
+        egui::pos2(pos.x, pos.y + LAB_CURSOR_FALLBACK_EXTENT),
+    ))
+}
+
+fn show_lab_offset_tooltip(
+    tip: egui::Tooltip<'_>,
+    anchor: Option<egui::Rect>,
+    text: impl Into<egui::WidgetText>,
+) {
+    let mut tip = tip.gap(LAB_TOOLTIP_GAP);
+    match anchor {
+        Some(rect) => tip.popup = tip.popup.anchor(rect),
+        None => tip = tip.at_pointer(),
+    }
+    tip.popup = tip.popup.frame(lab_tooltip_frame());
+    tip.show(|ui| {
+        apply_lab_dark_ui(ui);
+        ui.set_max_width(ui.spacing().tooltip_width);
+        ui.add(egui::Label::new(text));
+    });
+}
+
+trait LabHoverTipExt {
+    fn lab_hover_tip(self, text: impl Into<egui::WidgetText>) -> Self;
+}
+
+impl LabHoverTipExt for egui::Response {
+    fn lab_hover_tip(self, text: impl Into<egui::WidgetText>) -> Self {
+        let anchor = self
+            .contains_pointer()
+            .then(|| lab_cursor_anchor_rect(&self.ctx))
+            .flatten();
+        show_lab_offset_tooltip(egui::Tooltip::for_enabled(&self), anchor, text);
+        self
+    }
 }
 
 fn lab_combo_box<R>(
@@ -2859,7 +2959,7 @@ impl LocalAdjustLabApp {
                     });
                     if ui
                         .add_sized(egui::vec2(24.0, 18.0), button)
-                        .on_hover_text(format!("マスクカラー: {}", preset.description()))
+                        .lab_hover_tip(format!("マスクカラー: {}", preset.description()))
                         .clicked()
                     {
                         self.mask_color_preset = preset;
@@ -2953,7 +3053,7 @@ impl LocalAdjustLabApp {
             );
             if ui
                 .add_sized(egui::vec2(74.0, 24.0), egui::Button::new("効果選択"))
-                .on_hover_text("効果をグループ別の一覧から選びます。")
+                .lab_hover_tip("効果をグループ別の一覧から選びます。")
                 .clicked()
             {
                 self.effect_picker_dialog_open = true;
@@ -2987,14 +3087,14 @@ impl LocalAdjustLabApp {
             ui.spacing_mut().item_spacing.x = 4.0;
             if ui
                 .add_sized(btn_size, egui::Button::new("設定保存"))
-                .on_hover_text("画像ファイル名に .miv を付けたサイドカーファイルへ保存します。")
+                .lab_hover_tip("画像ファイル名に .miv を付けたサイドカーファイルへ保存します。")
                 .clicked()
             {
                 self.save_settings_sidecar();
             }
             if ui
                 .add_sized(btn_size, egui::Button::new("設定読込"))
-                .on_hover_text("画像横の .miv サイドカーファイルからレイヤー設定を読み込みます。")
+                .lab_hover_tip("画像横の .miv サイドカーファイルからレイヤー設定を読み込みます。")
                 .clicked()
             {
                 self.load_settings_sidecar_for_current_image();
@@ -3167,7 +3267,7 @@ impl LocalAdjustLabApp {
                 Some(btn_size),
                 true,
             )
-            .on_hover_text("ベースマスクに手動で足す2値マスクを編集します。")
+            .lab_hover_tip("ベースマスクに手動で足す2値マスクを編集します。")
             .clicked()
             {
                 self.toggle_override_edit_panel(OverrideEditTarget::Add);
@@ -3184,7 +3284,7 @@ impl LocalAdjustLabApp {
                 Some(btn_size),
                 false,
             )
-            .on_hover_text("ベースマスクから手動で除外する2値マスクを編集します。")
+            .lab_hover_tip("ベースマスクから手動で除外する2値マスクを編集します。")
             .clicked()
             {
                 self.toggle_override_edit_panel(OverrideEditTarget::Subtract);
@@ -3887,7 +3987,7 @@ impl LocalAdjustLabApp {
             .unwrap_or(false);
         if ui
             .add_enabled(has_override, egui::Button::new("追加/削除マスクをクリア"))
-            .on_hover_text("ベースマスクは残し、追加マスク/削除マスクだけを空にします。")
+            .lab_hover_tip("ベースマスクは残し、追加マスク/削除マスクだけを空にします。")
             .clicked()
         {
             self.clear_selected_manual_override();
@@ -4078,12 +4178,12 @@ impl LocalAdjustLabApp {
         let mut changed = false;
         changed |= ui
             .add(egui::Slider::new(&mut self.region_color_tolerance, 4.0..=120.0).text("色差許容"))
-            .on_hover_text("大きいほど近い色が同じ領域にまとまり、小さいほど細かく分かれます。")
+            .lab_hover_tip("大きいほど近い色が同じ領域にまとまり、小さいほど細かく分かれます。")
             .changed();
         let mut min_area = self.region_min_area as i32;
         if ui
             .add(egui::Slider::new(&mut min_area, 1..=2048).text("最小領域"))
-            .on_hover_text(
+            .lab_hover_tip(
                 "この面積より小さい候補を捨てます。大きいほど細かいノイズ領域が減ります。",
             )
             .changed()
@@ -4451,7 +4551,7 @@ impl LocalAdjustLabApp {
                                             egui::vec2(130.0, 28.0),
                                             egui::Button::new(kind.label()).fill(fill),
                                         )
-                                        .on_hover_text(kind.description());
+                                        .lab_hover_tip(kind.description());
                                     if response.clicked() {
                                         selected_kind = Some(kind);
                                     }
@@ -5247,7 +5347,7 @@ impl LocalAdjustLabApp {
                         ui.id().with(("radial_inner_x", layer_idx)),
                         Sense::drag(),
                     )
-                    .on_hover_text("内側 横");
+                    .lab_hover_tip("内側 横");
                 if inner_x_resp.dragged()
                     && let Some(pos) = inner_x_resp.interact_pointer_pos()
                 {
@@ -5263,7 +5363,7 @@ impl LocalAdjustLabApp {
                         ui.id().with(("radial_inner_y", layer_idx)),
                         Sense::drag(),
                     )
-                    .on_hover_text("内側 縦");
+                    .lab_hover_tip("内側 縦");
                 if inner_y_resp.dragged()
                     && let Some(pos) = inner_y_resp.interact_pointer_pos()
                 {
@@ -5279,7 +5379,7 @@ impl LocalAdjustLabApp {
                         ui.id().with(("radial_outer_x", layer_idx)),
                         Sense::drag(),
                     )
-                    .on_hover_text("外側 横");
+                    .lab_hover_tip("外側 横");
                 if outer_x_resp.dragged()
                     && let Some(pos) = outer_x_resp.interact_pointer_pos()
                 {
@@ -5294,7 +5394,7 @@ impl LocalAdjustLabApp {
                         ui.id().with(("radial_outer_y", layer_idx)),
                         Sense::drag(),
                     )
-                    .on_hover_text("外側 縦");
+                    .lab_hover_tip("外側 縦");
                 if outer_y_resp.dragged()
                     && let Some(pos) = outer_y_resp.interact_pointer_pos()
                 {
@@ -6857,13 +6957,13 @@ fn draw_effect_params(
             let strength_response =
                 ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
             changed |= strength_response.changed();
-            strength_response.on_hover_text("元の色からグラデーション色へ置き換える強さです。");
+            strength_response.lab_hover_tip("元の色からグラデーション色へ置き換える強さです。");
             let contrast_response = ui.add(
                 egui::Slider::new(&mut params.contrast, -100.0..=100.0).text("明暗コントラスト"),
             );
             changed |= contrast_response.changed();
             contrast_response
-                .on_hover_text("色を割り当てる前に、明るさの差を締めたり広げたりします。");
+                .lab_hover_tip("色を割り当てる前に、明るさの差を締めたり広げたりします。");
         }
         LocalEffect::Bloom(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -9854,7 +9954,7 @@ fn drag_norm_handle(
             id,
             Sense::drag(),
         )
-        .on_hover_text(label);
+        .lab_hover_tip(label);
     if response.dragged()
         && let Some(pos) = response.interact_pointer_pos()
     {
