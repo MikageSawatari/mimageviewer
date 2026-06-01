@@ -74,8 +74,7 @@ the window.
     editing Subtract Mask, base + add uses the base color and the subtract mask
     uses the edit color.
   - Creating or editing a mask automatically turns the mask preview on.
-  - Copy only the mask data and mask modifiers from another layer while keeping
-    the current layer's effect and opacity
+  - Duplicate a layer when reusing the same mask with a different effect.
 - Effects:
   - Tone
   - Tone curve

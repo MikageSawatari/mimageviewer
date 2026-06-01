@@ -900,7 +900,6 @@ struct LocalAdjustLabApp {
     pending: Option<RenderPending>,
     segmentation_pending: Option<SegmentationPending>,
     generation: u64,
-    mask_copy_source: usize,
     result_dirty: bool,
     mask_dirty: bool,
     last_edit: Instant,
@@ -975,7 +974,6 @@ impl LocalAdjustLabApp {
             pending: None,
             segmentation_pending: None,
             generation: 0,
-            mask_copy_source: 0,
             result_dirty: false,
             mask_dirty: false,
             last_edit: Instant::now(),
@@ -1056,7 +1054,6 @@ impl LocalAdjustLabApp {
                 self.result = None;
                 self.pending = None;
                 self.segmentation_pending = None;
-                self.mask_copy_source = 0;
                 self.image = Some(loaded);
                 self.undo_stack.clear();
                 self.redo_stack.clear();
@@ -1538,22 +1535,6 @@ impl LocalAdjustLabApp {
         self.layers.insert(insert_at, copy);
         self.selected_layer = insert_at;
         self.reset_override_edit_state_for_selected_layer();
-        self.mark_mask_changed();
-    }
-
-    fn copy_mask_from_layer(&mut self, source_idx: usize) {
-        if source_idx == self.selected_layer || source_idx >= self.layers.len() {
-            return;
-        }
-        let Some(source) = self.layers.get(source_idx).cloned() else {
-            return;
-        };
-        self.push_undo_snapshot();
-        if let Some(target) = self.selected_layer_mut() {
-            copy_mask_fields_from_layer(target, &source);
-        }
-        self.selected_shape = None;
-        self.status = format!("レイヤー {} からマスクをコピーしました。", source_idx + 1);
         self.mark_mask_changed();
     }
 
@@ -2777,7 +2758,37 @@ impl LocalAdjustLabApp {
     }
 
     fn draw_display_controls(&mut self, ui: &mut egui::Ui, btn_size: egui::Vec2) {
-        ui.label(egui::RichText::new("表示:").color(Color32::from_gray(200)));
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("表示:").color(Color32::from_gray(200)));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                for preset in MaskColorPreset::ALL.into_iter().rev() {
+                    let selected = self.mask_color_preset == preset;
+                    let colors = preset.colors();
+                    let button = egui::Button::new(
+                        egui::RichText::new(preset.label())
+                            .strong()
+                            .size(10.0)
+                            .color(Color32::WHITE),
+                    )
+                    .fill(colors.base(if selected { 145 } else { 80 }))
+                    .stroke(if selected {
+                        egui::Stroke::new(1.5, colors.edit(255))
+                    } else {
+                        egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 35))
+                    });
+                    if ui
+                        .add_sized(egui::vec2(24.0, 18.0), button)
+                        .on_hover_text(format!("マスクカラー: {}", preset.description()))
+                        .clicked()
+                    {
+                        self.mask_color_preset = preset;
+                        self.reveal_mask_preview();
+                        self.mask_dirty = true;
+                        self.mask_dirty_tiles = None;
+                    }
+                }
+            });
+        });
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             if panel_toggle_button(ui, "元画像 [Q]", self.show_source, Some(btn_size), false)
@@ -2789,37 +2800,6 @@ impl LocalAdjustLabApp {
                 .clicked()
             {
                 self.show_mask = !self.show_mask;
-            }
-        });
-        ui.add_space(2.0);
-        ui.label(egui::RichText::new("マスクカラー:").color(Color32::from_gray(200)));
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            let color_btn_w = ((btn_size.x * 2.0 + 4.0 - 8.0) / 3.0).max(42.0);
-            for preset in MaskColorPreset::ALL {
-                let selected = self.mask_color_preset == preset;
-                let colors = preset.colors();
-                let button = egui::Button::new(
-                    egui::RichText::new(preset.label())
-                        .strong()
-                        .color(Color32::WHITE),
-                )
-                .fill(colors.base(if selected { 145 } else { 80 }))
-                .stroke(if selected {
-                    egui::Stroke::new(1.5, colors.edit(255))
-                } else {
-                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 35))
-                });
-                if ui
-                    .add_sized(egui::vec2(color_btn_w, 22.0), button)
-                    .on_hover_text(preset.description())
-                    .clicked()
-                {
-                    self.mask_color_preset = preset;
-                    self.reveal_mask_preview();
-                    self.mask_dirty = true;
-                    self.mask_dirty_tiles = None;
-                }
             }
         });
     }
@@ -2868,20 +2848,10 @@ impl LocalAdjustLabApp {
         }
 
         ui.separator();
-        ui.label(egui::RichText::new("選択中レイヤー:").color(Color32::from_gray(200)));
-        let mut changed = false;
         if let Some(layer) = self.selected_layer_mut() {
-            changed |= ui.text_edit_singleline(&mut layer.name).changed();
-            changed |= ui.checkbox(&mut layer.enabled, "有効").changed();
-            changed |= ui
-                .add(egui::Slider::new(&mut layer.opacity, 0.0..=1.0).text("不透明度"))
-                .changed();
-
-            ui.separator();
-            changed |= draw_effect_kind_selector(ui, layer);
-        }
-        if changed {
-            self.mark_mask_changed();
+            if draw_effect_kind_selector(ui, layer) {
+                self.mark_dirty();
+            }
         }
 
         ui.separator();
@@ -3737,55 +3707,6 @@ impl LocalAdjustLabApp {
             .size(10.0)
             .color(Color32::from_gray(170)),
         );
-
-        let copy_options: Vec<(usize, String)> = self
-            .layers
-            .iter()
-            .enumerate()
-            .filter(|(idx, _)| *idx != self.selected_layer)
-            .map(|(idx, layer)| {
-                (
-                    idx,
-                    format!(
-                        "{}: {} / {}",
-                        layer.name,
-                        MaskKind::from_mask(&layer.mask).label(),
-                        effect_summary(&layer.effect)
-                    ),
-                )
-            })
-            .collect();
-        if copy_options.is_empty() {
-            ui.label(
-                egui::RichText::new("コピー元にできる別レイヤーはまだありません。")
-                    .size(10.0)
-                    .color(Color32::from_gray(170)),
-            );
-            return;
-        }
-        if !copy_options
-            .iter()
-            .any(|(idx, _)| *idx == self.mask_copy_source)
-        {
-            self.mask_copy_source = copy_options[0].0;
-        }
-        let selected_text = copy_options
-            .iter()
-            .find(|(idx, _)| *idx == self.mask_copy_source)
-            .map(|(_, label)| label.as_str())
-            .unwrap_or("コピー元レイヤー");
-        lab_combo_box(ui, "mask_copy_source_layer", selected_text, |ui| {
-            for (idx, label) in &copy_options {
-                ui.selectable_value(&mut self.mask_copy_source, *idx, label);
-            }
-        });
-        if ui
-            .button("コピー元のマスクを適用")
-            .on_hover_text("マスク種類、マスク本体、追加/削除マスク、反転、拡張/縮小、ぼかし境界だけをコピーします。加工内容と不透明度は現在のレイヤーのままです。")
-            .clicked()
-        {
-            self.copy_mask_from_layer(self.mask_copy_source);
-        }
     }
 
     fn draw_mask_panel(&mut self, ui: &mut egui::Ui) {
@@ -3861,6 +3782,9 @@ impl LocalAdjustLabApp {
         if let Some(layer) = self.selected_layer_mut() {
             changed |= ui
                 .checkbox(&mut layer.mask_inverted, "マスク反転")
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut layer.opacity, 0.0..=1.0).text("不透明度"))
                 .changed();
             changed |= ui
                 .add(egui::Slider::new(&mut layer.mask_expand_px, -32.0..=32.0).text("拡張/縮小"))
@@ -6009,24 +5933,12 @@ fn draw_effect_params(
     image_dims: (usize, usize),
 ) -> bool {
     let mut changed = false;
-    let effect_kind = EffectKind::from_effect(&layer.effect);
-    ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new("加工パラメータ")
-                .size(14.0)
-                .strong()
-                .color(Color32::WHITE),
-        );
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("リセット").clicked() {
-                layer.effect = default_effect(effect_kind);
-                changed = true;
-            }
-        });
-    });
-    if changed {
-        return true;
-    }
+    ui.label(
+        egui::RichText::new("加工パラメータ")
+            .size(14.0)
+            .strong()
+            .color(Color32::WHITE),
+    );
     match &mut layer.effect {
         LocalEffect::None => {
             ui.label("加工内容を選ぶと、このレイヤーの効果が有効になります。");
@@ -6858,14 +6770,6 @@ fn default_mask(kind: MaskKind, width: usize, height: usize) -> LocalMask {
         MaskKind::Subject => LocalMask::Subject(RasterMask::empty(width, height)),
         MaskKind::Segmentation => LocalMask::Segmentation(RegionMask::empty(width, height)),
     }
-}
-
-fn copy_mask_fields_from_layer(target: &mut LocalAdjustmentLayer, source: &LocalAdjustmentLayer) {
-    target.mask = source.mask.clone();
-    target.manual_override = source.manual_override.clone();
-    target.mask_inverted = source.mask_inverted;
-    target.mask_expand_px = source.mask_expand_px;
-    target.mask_feather_px = source.mask_feather_px;
 }
 
 fn make_shape(
@@ -9600,44 +9504,6 @@ mod tests {
         assert!(visuals.panel_fill.r() < 64);
         assert!(visuals.extreme_bg_color.r() < 32);
         assert!(visuals.widgets.inactive.bg_fill.r() < 96);
-    }
-
-    #[test]
-    fn copying_mask_fields_preserves_target_effect_and_opacity() {
-        let mut target = LocalAdjustmentLayer::new(
-            "target",
-            LocalMask::Full,
-            LocalEffect::Blur(BlurParams { radius_px: 8.0 }),
-        );
-        target.opacity = 0.4;
-        let mut source = LocalAdjustmentLayer::new(
-            "source",
-            LocalMask::LinearGradient(LinearGradientMask {
-                start: [0.1, 0.2],
-                end: [0.8, 0.9],
-                initialized: true,
-            }),
-            LocalEffect::None,
-        );
-        source.mask_inverted = true;
-        source.mask_expand_px = 3.0;
-        source.mask_feather_px = 5.0;
-        source.manual_override.add = Some(RasterVectorMask {
-            width: 1,
-            height: 1,
-            alpha: vec![1.0],
-            shapes: Vec::new(),
-        });
-
-        copy_mask_fields_from_layer(&mut target, &source);
-
-        assert!(matches!(target.mask, LocalMask::LinearGradient(_)));
-        assert!(target.manual_override.add.is_some());
-        assert!(target.mask_inverted);
-        assert_eq!(target.mask_expand_px, 3.0);
-        assert_eq!(target.mask_feather_px, 5.0);
-        assert!(matches!(target.effect, LocalEffect::Blur(_)));
-        assert_eq!(target.opacity, 0.4);
     }
 
     #[test]
