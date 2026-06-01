@@ -33,6 +33,8 @@ the window.
 - Image navigation for testing large images:
   - Ctrl + mouse wheel: zoom around the pointer
   - Mouse wheel: zoom around the pointer
+  - Zoom can go below fit-to-window, which is useful when editing final-stage
+    crop handles near the image edge.
   - Space + drag or middle-button drag: pan
   - Arrow keys: nudge selected manual-mask object
   - `[` / `]`: rotate selected manual-mask object
@@ -58,6 +60,11 @@ the window.
   - Add/subtract manual correction masks on top of any mask source. These
     corrections are binary masks, so gradient / subject matte softness is kept
     in the base mask while local mistakes can be patched by hand.
+  - For non-manual mask sources, add/subtract correction tool panels are hidden
+    by default. Press Add Correction or Subtract Correction to open that edit
+    panel; pressing the same button again closes it without creating a mask.
+  - Mask preview colors: base/final mask is pink, add correction is green, and
+    subtract correction is cyan.
   - Copy only the mask data and mask modifiers from another layer while keeping
     the current layer's effect and opacity
 - Effects:
