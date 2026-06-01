@@ -175,6 +175,27 @@ enum GeneratedMask {
     Regions(RegionMask),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionSegmentationScope {
+    Full,
+    Subject,
+    Background,
+}
+
+impl RegionSegmentationScope {
+    fn requires_subject(self) -> bool {
+        matches!(self, Self::Subject | Self::Background)
+    }
+
+    fn pending_label(self) -> &'static str {
+        match self {
+            Self::Full => "画像全体を領域分割中...",
+            Self::Subject => "被写体内を領域分割中...",
+            Self::Background => "背景を領域分割中...",
+        }
+    }
+}
+
 const LAB_SIDECAR_VERSION: u32 = 1;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1473,6 +1494,17 @@ impl LocalAdjustLabApp {
         self.mark_mask_changed();
     }
 
+    fn add_layer_with_mask_and_auto_generate(&mut self, mask_kind: MaskKind, ctx: &egui::Context) {
+        self.add_layer_with_mask(mask_kind);
+        match mask_kind {
+            MaskKind::Subject => self.start_subject_segmentation(ctx),
+            MaskKind::Segmentation => {
+                self.start_region_segmentation(ctx, RegionSegmentationScope::Full);
+            }
+            _ => {}
+        }
+    }
+
     fn toggle_override_edit_panel(&mut self, target: OverrideEditTarget) {
         if self.override_edit_panel == Some(target) {
             self.reset_override_edit_state_for_selected_layer();
@@ -1731,7 +1763,7 @@ impl LocalAdjustLabApp {
             }
             Ok(Err(e)) => {
                 self.segmentation_pending = None;
-                self.status = format!("被写体マスク生成失敗: {e}");
+                self.status = format!("マスク生成失敗: {e}");
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -1788,7 +1820,7 @@ impl LocalAdjustLabApp {
         }
     }
 
-    fn start_region_segmentation(&mut self, ctx: &egui::Context, use_subject: bool) {
+    fn start_region_segmentation(&mut self, ctx: &egui::Context, scope: RegionSegmentationScope) {
         if self.segmentation_pending.is_some() {
             self.status = "マスク生成中です。".to_string();
             return;
@@ -1805,12 +1837,12 @@ impl LocalAdjustLabApp {
             return;
         };
         let source = image.source.clone();
-        let subject = if use_subject {
+        let subject = if scope.requires_subject() {
             self.subject_mask_candidate()
         } else {
             None
         };
-        if use_subject && subject.is_none() {
+        if scope.requires_subject() && subject.is_none() {
             self.status = "利用できる被写体選択マスクがありません。".to_string();
             return;
         }
@@ -1826,6 +1858,7 @@ impl LocalAdjustLabApp {
                 let result = build_region_segmentation(
                     &source,
                     subject.as_ref(),
+                    scope,
                     color_tolerance,
                     min_area,
                     edge_threshold,
@@ -1843,11 +1876,7 @@ impl LocalAdjustLabApp {
                     rx,
                     started_at: Instant::now(),
                 });
-                self.status = if use_subject {
-                    "被写体内を領域分割中...".to_string()
-                } else {
-                    "画像全体を領域分割中...".to_string()
-                };
+                self.status = scope.pending_label().to_string();
                 ctx.request_repaint();
             }
             Err(e) => {
@@ -3946,7 +3975,7 @@ impl LocalAdjustLabApp {
             .add_enabled(!pending, egui::Button::new("画像全体を領域分割"))
             .clicked()
         {
-            self.start_region_segmentation(ui.ctx(), false);
+            self.start_region_segmentation(ui.ctx(), RegionSegmentationScope::Full);
         }
         if ui
             .add_enabled(
@@ -3955,13 +3984,24 @@ impl LocalAdjustLabApp {
             )
             .clicked()
         {
-            self.start_region_segmentation(ui.ctx(), true);
+            self.start_region_segmentation(ui.ctx(), RegionSegmentationScope::Subject);
+        }
+        if ui
+            .add_enabled(
+                !pending && subject_available,
+                egui::Button::new("背景を領域分割"),
+            )
+            .clicked()
+        {
+            self.start_region_segmentation(ui.ctx(), RegionSegmentationScope::Background);
         }
         if !subject_available {
             ui.label(
-                egui::RichText::new("被写体選択レイヤーを生成すると、被写体内だけを分割できます。")
-                    .size(10.0)
-                    .color(Color32::from_gray(170)),
+                egui::RichText::new(
+                    "被写体選択レイヤーを生成すると、被写体内や背景だけを分割できます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
             );
         }
         ui.label(
@@ -4212,7 +4252,7 @@ impl LocalAdjustLabApp {
         self.add_layer_mask_kind = selected;
         self.add_layer_dialog_open = open && !cancel_requested;
         if create_requested {
-            self.add_layer_with_mask(selected);
+            self.add_layer_with_mask_and_auto_generate(selected, ctx);
         }
     }
 
@@ -8039,6 +8079,7 @@ fn run_u2netp_segmentation(source: &RgbaImageBuf, model_path: &Path) -> Result<R
 fn build_region_segmentation(
     source: &RgbaImageBuf,
     subject: Option<&RasterMask>,
+    scope: RegionSegmentationScope,
     color_tolerance: f32,
     min_area: usize,
     edge_threshold: u8,
@@ -8067,7 +8108,7 @@ fn build_region_segmentation(
         if visited[start] {
             continue;
         }
-        if !region_seed_allowed(source, subject, &boundary, start) {
+        if !region_seed_allowed(source, subject, scope, &boundary, start) {
             visited[start] = true;
             continue;
         }
@@ -8085,7 +8126,7 @@ fn build_region_segmentation(
                 if visited[nidx] {
                     continue;
                 }
-                if !region_seed_allowed(source, subject, &boundary, nidx) {
+                if !region_seed_allowed(source, subject, scope, &boundary, nidx) {
                     visited[nidx] = true;
                     continue;
                 }
@@ -8104,7 +8145,7 @@ fn build_region_segmentation(
     }
 
     let membership_allowed: Vec<bool> = (0..len)
-        .map(|idx| region_membership_allowed(source, subject, idx))
+        .map(|idx| region_membership_allowed(source, subject, scope, idx))
         .collect();
     fill_unlabeled_region_pixels(
         &mut labels,
@@ -8125,13 +8166,14 @@ fn build_region_segmentation(
 fn region_seed_allowed(
     source: &RgbaImageBuf,
     subject: Option<&RasterMask>,
+    scope: RegionSegmentationScope,
     boundary: &[u8],
     idx: usize,
 ) -> bool {
     if boundary.get(idx).copied().unwrap_or(0) != 0 {
         return false;
     }
-    region_membership_allowed(source, subject, idx)
+    region_membership_allowed(source, subject, scope, idx)
 }
 
 fn fill_unlabeled_region_pixels(labels: &mut [u32], width: usize, height: usize, allowed: &[bool]) {
@@ -8166,14 +8208,21 @@ fn fill_unlabeled_region_pixels(labels: &mut [u32], width: usize, height: usize,
 fn region_membership_allowed(
     source: &RgbaImageBuf,
     subject: Option<&RasterMask>,
+    scope: RegionSegmentationScope,
     idx: usize,
 ) -> bool {
     if source.pixels.get(idx * 4 + 3).copied().unwrap_or(255) < 8 {
         return false;
     }
-    subject
-        .map(|mask| mask.alpha.get(idx).copied().unwrap_or(0.0) > 0.18)
-        .unwrap_or(true)
+    match scope {
+        RegionSegmentationScope::Full => true,
+        RegionSegmentationScope::Subject => subject
+            .map(|mask| mask.alpha.get(idx).copied().unwrap_or(0.0) > 0.18)
+            .unwrap_or(false),
+        RegionSegmentationScope::Background => subject
+            .map(|mask| mask.alpha.get(idx).copied().unwrap_or(0.0) <= 0.18)
+            .unwrap_or(false),
+    }
 }
 
 fn source_rgb_at_index(source: &RgbaImageBuf, idx: usize) -> [u8; 3] {
@@ -10268,10 +10317,52 @@ mod tests {
             }
         }
         let source = RgbaImageBuf::new(width, height, pixels).unwrap();
-        let mask = build_region_segmentation(&source, None, 8.0, 1, 255, 255, 0).unwrap();
+        let mask = build_region_segmentation(
+            &source,
+            None,
+            RegionSegmentationScope::Full,
+            8.0,
+            1,
+            255,
+            255,
+            0,
+        )
+        .unwrap();
         assert_eq!(mask.label_count(), 2);
         assert_ne!(mask.labels[0], mask.labels[width - 1]);
         assert!(mask.selected.iter().skip(1).all(|&selected| !selected));
+    }
+
+    #[test]
+    fn region_segmentation_background_scope_excludes_subject_pixels() {
+        let source = RgbaImageBuf::new(
+            4,
+            1,
+            vec![
+                220, 40, 40, 255, 220, 40, 40, 255, 40, 80, 230, 255, 40, 80, 230, 255,
+            ],
+        )
+        .unwrap();
+        let subject = RasterMask {
+            width: 4,
+            height: 1,
+            alpha: vec![1.0, 1.0, 0.0, 0.0],
+        };
+        let mask = build_region_segmentation(
+            &source,
+            Some(&subject),
+            RegionSegmentationScope::Background,
+            8.0,
+            1,
+            255,
+            255,
+            0,
+        )
+        .unwrap();
+        assert_eq!(mask.labels[0], 0);
+        assert_eq!(mask.labels[1], 0);
+        assert_ne!(mask.labels[2], 0);
+        assert_eq!(mask.labels[2], mask.labels[3]);
     }
 
     #[test]

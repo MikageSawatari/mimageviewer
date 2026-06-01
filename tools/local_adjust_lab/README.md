@@ -49,9 +49,13 @@ the window.
   - Radial gradient with canvas handles
   - Luma range
   - Color range with click picker
-  - Subject selection mask using an optional U²-Netp ONNX model
+  - Subject selection mask using an optional U²-Netp ONNX model. Creating a
+    subject layer starts one generation pass automatically when the model is
+    available.
   - Region segmentation mask with color-coded candidates that can be toggled by
-    clicking or dragging on the image
+    clicking or dragging on the image. Creating a region layer starts one
+    default full-image segmentation pass automatically; the tool panel can
+    regenerate the full image, subject interior, or background.
 - Shared mask controls:
   - Invert
   - Expand / shrink
