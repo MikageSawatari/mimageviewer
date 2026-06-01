@@ -4185,13 +4185,19 @@ impl LocalAdjustLabApp {
                     MaskKind::Segmentation,
                 ] {
                     ui.radio_value(&mut selected, kind, kind.label());
-                    if selected == kind {
+                    ui.horizontal(|ui| {
+                        ui.add_space(24.0);
+                        let color = if selected == kind {
+                            Color32::from_gray(185)
+                        } else {
+                            Color32::from_gray(145)
+                        };
                         ui.label(
                             egui::RichText::new(kind.description())
                                 .size(11.0)
-                                .color(Color32::from_gray(180)),
+                                .color(color),
                         );
-                    }
+                    });
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
