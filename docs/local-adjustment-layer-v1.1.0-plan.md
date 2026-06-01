@@ -893,6 +893,9 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   をレイヤー設定に保持する。ファイル読み込みは worker thread で行い、UI スレッドでは重い I/O
   をしない。設定保存時は LUT データも含まれるため、外部 LUT ファイルが移動しても効果は再現できるが、
   大きな LUT では sidecar が大きくなる点に注意する
+- `local_adjust_lab` には自作の小さな `.cube` サンプル LUT を `tools/local_adjust_lab/sample_luts/`
+  に置き、LUT 読み込みと強度調整をすぐ試せるようにする
+- Selective Color は、対象色相スライダーに加えて画像上クリックのスポイトで対象色相を設定できるようにする
 - 加工内容はプルダウンではなく、左パネルの現在効果表示 + `効果選択` ボタンで扱う。
   `効果選択` はグループ別のダイアログを開き、効果ボタンのホバーで説明を表示する。
   フィルタ数が増えても選びやすくするため、詳細方針は [local-adjust-filter-candidates.md](local-adjust-filter-candidates.md)

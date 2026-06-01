@@ -1201,6 +1201,7 @@ struct LocalAdjustLabApp {
     add_layer_dialog_open: bool,
     add_layer_mask_kind: MaskKind,
     effect_picker_dialog_open: bool,
+    selective_color_pick_active: bool,
     status: String,
     view_zoom: f32,
     view_pan: egui::Vec2,
@@ -1277,6 +1278,7 @@ impl LocalAdjustLabApp {
             add_layer_dialog_open: false,
             add_layer_mask_kind: MaskKind::Raster,
             effect_picker_dialog_open: false,
+            selective_color_pick_active: false,
             status: "JPEG / PNG をドロップしてください。".to_string(),
             view_zoom: 1.0,
             view_pan: egui::Vec2::ZERO,
@@ -1334,6 +1336,7 @@ impl LocalAdjustLabApp {
                 self.override_edit_panel = None;
                 self.radial_gradient_drag_active = false;
                 self.edge_brush_seed = None;
+                self.selective_color_pick_active = false;
                 let load_status = format!("読み込み: {}", path.display());
                 self.status = load_status.clone();
                 let sidecar_path = sidecar_path_for_image(path);
@@ -3045,17 +3048,9 @@ impl LocalAdjustLabApp {
     }
 
     fn pick_color(&mut self, p: Pos2) {
-        let Some(image) = &self.image else {
+        let Some((rgb, _, _)) = self.source_rgb_at_image_pos(p) else {
             return;
         };
-        let x = p.x.round().clamp(0.0, image.source.width as f32 - 1.0) as usize;
-        let y = p.y.round().clamp(0.0, image.source.height as f32 - 1.0) as usize;
-        let i = (y * image.source.width + x) * 4;
-        let rgb = [
-            image.source.pixels[i],
-            image.source.pixels[i + 1],
-            image.source.pixels[i + 2],
-        ];
         let Some(layer) = self.selected_layer_mut() else {
             return;
         };
@@ -3073,6 +3068,44 @@ impl LocalAdjustLabApp {
         };
         self.status = format!("色を取得: #{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
         self.mark_mask_changed();
+    }
+
+    fn pick_selective_color_target(&mut self, p: Pos2) {
+        let Some((rgb, x, y)) = self.source_rgb_at_image_pos(p) else {
+            return;
+        };
+        let hue = hue_degrees_from_rgb(rgb);
+        let Some(layer) = self.selected_layer_mut() else {
+            self.selective_color_pick_active = false;
+            return;
+        };
+        let LocalEffect::SelectiveColor(params) = &mut layer.effect else {
+            self.selective_color_pick_active = false;
+            return;
+        };
+        params.target_hue_degrees = hue;
+        self.selective_color_pick_active = false;
+        self.status = format!(
+            "セレクティブカラー対象色: #{:02X}{:02X}{:02X} ({hue:.0}°, x:{x}, y:{y})",
+            rgb[0], rgb[1], rgb[2]
+        );
+        self.mark_dirty();
+    }
+
+    fn source_rgb_at_image_pos(&self, p: Pos2) -> Option<([u8; 3], usize, usize)> {
+        let image = self.image.as_ref()?;
+        let x = p.x.round().clamp(0.0, image.source.width as f32 - 1.0) as usize;
+        let y = p.y.round().clamp(0.0, image.source.height as f32 - 1.0) as usize;
+        let i = (y * image.source.width + x) * 4;
+        Some((
+            [
+                image.source.pixels[i],
+                image.source.pixels[i + 1],
+                image.source.pixels[i + 2],
+            ],
+            x,
+            y,
+        ))
     }
 
     fn toggle_region_at(&mut self, p: Pos2, selected: bool) {
@@ -3683,8 +3716,12 @@ impl LocalAdjustLabApp {
             i.key_down(Key::Space) || i.pointer.button_down(egui::PointerButton::Middle)
         });
         let dialog_open = self.add_layer_dialog_open || self.effect_picker_dialog_open;
-        let view_input_used =
-            self.handle_view_navigation(ui, canvas_rect, rect, img_w, img_h, panel_blocks_pointer);
+        let view_input_used = if dialog_open {
+            self.pan_drag_start = None;
+            false
+        } else {
+            self.handle_view_navigation(ui, canvas_rect, rect, img_w, img_h, panel_blocks_pointer)
+        };
 
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         ui.painter()
@@ -3714,8 +3751,20 @@ impl LocalAdjustLabApp {
         if adjust_panel_active && !dialog_open {
             self.draw_shape_overlay(ui, rect, pointer_screen, !pan_mode && !panel_blocks_pointer);
         }
-        if adjust_panel_active && !pan_mode && !panel_blocks_pointer && !dialog_open {
+        if adjust_panel_active
+            && !pan_mode
+            && !panel_blocks_pointer
+            && !dialog_open
+            && !self.selective_color_pick_active
+        {
             self.draw_brush_cursor(ui, rect, pointer_screen);
+        }
+        if self.selective_color_pick_active
+            && !panel_blocks_pointer
+            && !dialog_open
+            && pointer_screen.map(|p| rect.contains(p)).unwrap_or(false)
+        {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
         }
         let gradient_handle_used = if pan_mode || !adjust_panel_active || dialog_open {
             false
@@ -3747,6 +3796,12 @@ impl LocalAdjustLabApp {
                 let pos = screen_to_image(rect, img_w, img_h, pointer_screen);
                 if !gradient_handle_used {
                     if let Some(pos) = pos {
+                        if self.selective_color_pick_active {
+                            if response.clicked() || ui.input(|i| i.pointer.primary_pressed()) {
+                                self.pick_selective_color_target(pos);
+                            }
+                            return;
+                        }
                         let input_positions =
                             canvas_input_positions(ui, rect, img_w, img_h, pointer_screen);
                         self.handle_canvas_input(ui, rect, response, pos, &input_positions);
@@ -4293,15 +4348,30 @@ impl LocalAdjustLabApp {
         ui.separator();
         let dims = self.image_dims().unwrap_or((1, 1));
         let mut request_cube_lut_load = false;
+        let mut request_selective_color_pick = false;
+        let mut request_selective_color_pick_cancel = false;
+        let selective_color_pick_active = self.selective_color_pick_active;
         if let Some(layer) = self.selected_layer_mut() {
-            let response = draw_effect_params(ui, layer, dims);
+            let response = draw_effect_params(ui, layer, dims, selective_color_pick_active);
             request_cube_lut_load = response.load_cube_lut;
+            request_selective_color_pick = response.start_selective_color_pick;
+            request_selective_color_pick_cancel = response.cancel_selective_color_pick;
             if response.changed {
                 self.mark_dirty();
             }
         }
         if request_cube_lut_load {
             self.choose_cube_lut_for_selected_layer();
+        }
+        if request_selective_color_pick {
+            self.selective_color_pick_active = true;
+            self.tool = MaskTool::Select;
+            self.status =
+                "画像上をクリックして、セレクティブカラーの対象色を取得します。".to_string();
+        }
+        if request_selective_color_pick_cancel {
+            self.selective_color_pick_active = false;
+            self.status = "セレクティブカラーのスポイトを解除しました。".to_string();
         }
     }
 
@@ -4765,6 +4835,9 @@ impl LocalAdjustLabApp {
         {
             layer.effect = default_effect(kind);
             self.effect_picker_dialog_open = false;
+            if kind != EffectKind::SelectiveColor {
+                self.selective_color_pick_active = false;
+            }
             self.status = format!("加工内容を「{}」に変更しました。", kind.label());
             self.mark_dirty();
         }
@@ -6701,15 +6774,20 @@ fn draw_channel_coeff_sliders(ui: &mut egui::Ui, coeffs: &mut [f32; 3]) -> bool 
 struct EffectParamResponse {
     changed: bool,
     load_cube_lut: bool,
+    start_selective_color_pick: bool,
+    cancel_selective_color_pick: bool,
 }
 
 fn draw_effect_params(
     ui: &mut egui::Ui,
     layer: &mut LocalAdjustmentLayer,
     image_dims: (usize, usize),
+    selective_color_pick_active: bool,
 ) -> EffectParamResponse {
     let mut changed = false;
     let mut load_cube_lut = false;
+    let mut start_selective_color_pick = false;
+    let mut cancel_selective_color_pick = false;
     let effect_kind = EffectKind::from_effect(&layer.effect);
     let has_effect = !matches!(&layer.effect, LocalEffect::None);
     ui.horizontal(|ui| {
@@ -6732,6 +6810,8 @@ fn draw_effect_params(
         return EffectParamResponse {
             changed,
             load_cube_lut,
+            start_selective_color_pick,
+            cancel_selective_color_pick,
         };
     }
     match &mut layer.effect {
@@ -7279,6 +7359,33 @@ fn draw_effect_params(
                 .size(10.0)
                 .color(Color32::from_gray(170)),
             );
+            ui.horizontal_wrapped(|ui| {
+                let swatch = hsl_swatch_color(params.target_hue_degrees, 0.8, 0.55);
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 22.0), Sense::hover());
+                ui.painter().rect_filled(rect, 4.0, swatch);
+                ui.painter().rect_stroke(
+                    rect,
+                    4.0,
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 110)),
+                    egui::StrokeKind::Inside,
+                );
+                let label = if selective_color_pick_active {
+                    "スポイト解除"
+                } else {
+                    "スポイトで対象色を取得"
+                };
+                let response = ui.button(label);
+                if response.clicked() {
+                    if selective_color_pick_active {
+                        cancel_selective_color_pick = true;
+                    } else {
+                        start_selective_color_pick = true;
+                    }
+                }
+                response.lab_hover_tip(
+                    "画像上をクリックしたピクセルの色相を、対象色相として設定します。",
+                );
+            });
             ui.horizontal_wrapped(|ui| {
                 if preset_button(ui, "対象: 赤") {
                     params.target_hue_degrees = 0.0;
@@ -8062,10 +8169,6 @@ fn draw_effect_params(
                     *params = InvertParams { strength: 0.35 };
                     changed = true;
                 }
-                if preset_button(ui, "半分") {
-                    *params = InvertParams { strength: 0.5 };
-                    changed = true;
-                }
             });
             ui.label(
                 egui::RichText::new(
@@ -8602,6 +8705,8 @@ fn draw_effect_params(
     EffectParamResponse {
         changed,
         load_cube_lut,
+        start_selective_color_pick,
+        cancel_selective_color_pick,
     }
 }
 
@@ -11318,6 +11423,63 @@ fn screen_to_norm(rect: Rect, p: Pos2) -> [f32; 2] {
     ]
 }
 
+fn hue_degrees_from_rgb(rgb: [u8; 3]) -> f32 {
+    let r = rgb[0] as f32 / 255.0;
+    let g = rgb[1] as f32 / 255.0;
+    let b = rgb[2] as f32 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let delta = max - min;
+    if delta <= f32::EPSILON {
+        return 0.0;
+    }
+    let hue = if (max - r).abs() <= f32::EPSILON {
+        ((g - b) / delta).rem_euclid(6.0)
+    } else if (max - g).abs() <= f32::EPSILON {
+        (b - r) / delta + 2.0
+    } else {
+        (r - g) / delta + 4.0
+    };
+    (hue * 60.0).rem_euclid(360.0)
+}
+
+fn hsl_swatch_color(hue_degrees: f32, saturation: f32, lightness: f32) -> Color32 {
+    let h = hue_degrees.rem_euclid(360.0) / 360.0;
+    let s = saturation.clamp(0.0, 1.0);
+    let l = lightness.clamp(0.0, 1.0);
+    if s <= f32::EPSILON {
+        let v = (l * 255.0).round() as u8;
+        return Color32::from_rgb(v, v, v);
+    }
+    let q = if l < 0.5 {
+        l * (1.0 + s)
+    } else {
+        l + s - l * s
+    };
+    let p = 2.0 * l - q;
+    let r = hue_channel(p, q, h + 1.0 / 3.0);
+    let g = hue_channel(p, q, h);
+    let b = hue_channel(p, q, h - 1.0 / 3.0);
+    Color32::from_rgb(
+        (r * 255.0).round() as u8,
+        (g * 255.0).round() as u8,
+        (b * 255.0).round() as u8,
+    )
+}
+
+fn hue_channel(p: f32, q: f32, t: f32) -> f32 {
+    let t = t.rem_euclid(1.0);
+    if t < 1.0 / 6.0 {
+        p + (q - p) * 6.0 * t
+    } else if t < 0.5 {
+        q
+    } else if t < 2.0 / 3.0 {
+        p + (q - p) * (2.0 / 3.0 - t) * 6.0
+    } else {
+        p
+    }
+}
+
 fn drag_norm_handle(
     ui: &mut egui::Ui,
     rect: Rect,
@@ -11378,6 +11540,34 @@ mod tests {
         assert!(visuals.panel_fill.r() < 64);
         assert!(visuals.extreme_bg_color.r() < 32);
         assert!(visuals.widgets.inactive.bg_fill.r() < 96);
+    }
+
+    #[test]
+    fn selective_color_eyedropper_hue_matches_primary_colors() {
+        assert!((hue_degrees_from_rgb([255, 0, 0]) - 0.0).abs() < 0.1);
+        assert!((hue_degrees_from_rgb([0, 255, 0]) - 120.0).abs() < 0.1);
+        assert!((hue_degrees_from_rgb([0, 0, 255]) - 240.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn sample_cube_luts_parse() {
+        for (name, text) in [
+            ("identity", include_str!("../sample_luts/identity.cube")),
+            (
+                "warm_sunset",
+                include_str!("../sample_luts/warm_sunset.cube"),
+            ),
+            (
+                "cool_moonlight",
+                include_str!("../sample_luts/cool_moonlight.cube"),
+            ),
+            ("soft_film", include_str!("../sample_luts/soft_film.cube")),
+            ("vivid_pop", include_str!("../sample_luts/vivid_pop.cube")),
+        ] {
+            let lut = parse_cube_lut(text, name).unwrap();
+            assert_eq!(lut.size, 2);
+            assert_eq!(lut.table.len(), 8);
+        }
     }
 
     #[test]

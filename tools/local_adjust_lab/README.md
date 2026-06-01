@@ -81,6 +81,7 @@ the window.
 - Effects:
   - Tone
   - Tone curve
+  - Selective color with an image-click eyedropper for the target hue
   - Clarity
   - Highlights/Shadows
   - Dehaze
@@ -101,6 +102,9 @@ the window.
 - Effect parameters start from near-identity values. Use the per-effect preset
   buttons for practical starting points, or Reset to return the current effect
   to its default values.
+- 3D LUT sample files are available under `tools/local_adjust_lab/sample_luts/`.
+  They are small self-made `.cube` files for quick testing of the LUT loader and
+  effect strength slider.
 - Final-stage crop preview/export. The Crop panel has Reset, aspect ratio
   selection (Keep, Free, 16:9 through 9:16), and X/Y/W/H numeric inputs. The
   area outside the crop is dimmed while the Crop panel is open. Drag inside the
