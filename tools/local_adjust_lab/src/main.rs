@@ -5265,15 +5265,52 @@ impl LocalAdjustLabApp {
             MaskTool::GapFillBrush => Color32::from_rgb(160, 255, 150),
             _ => Color32::WHITE,
         };
-        let stroke = egui::Stroke::new(1.5, color);
-        ui.painter().circle_stroke(pos, radius, stroke);
-        ui.painter()
-            .circle_stroke(pos, radius + 1.0, egui::Stroke::new(1.0, Color32::BLACK));
+        Self::draw_brush_cursor_ring(ui.painter(), pos, radius, color);
         if matches!(self.tool, MaskTool::EdgeBrush) {
             ui.ctx()
                 .request_repaint_after(Duration::from_millis(EDGE_OVERLAY_REPAINT_MS));
         }
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::None);
+    }
+
+    fn draw_brush_cursor_ring(painter: &egui::Painter, pos: Pos2, radius: f32, color: Color32) {
+        let radius = radius.max(1.0);
+        painter.circle_stroke(
+            pos,
+            radius,
+            egui::Stroke::new(3.25, Color32::from_rgba_unmultiplied(0, 0, 0, 220)),
+        );
+        painter.circle_stroke(
+            pos,
+            radius,
+            egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(255, 255, 255, 220)),
+        );
+        painter.circle_stroke(pos, radius, egui::Stroke::new(1.2, color));
+
+        if radius >= 7.0 {
+            let arm = (radius * 0.35).clamp(4.0, 9.0);
+            let gap = 2.0;
+            let shadow = egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(0, 0, 0, 110));
+            let mark = egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 150));
+            for stroke in [shadow, mark] {
+                painter.line_segment(
+                    [pos - egui::vec2(arm, 0.0), pos - egui::vec2(gap, 0.0)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [pos + egui::vec2(gap, 0.0), pos + egui::vec2(arm, 0.0)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [pos - egui::vec2(0.0, arm), pos - egui::vec2(0.0, gap)],
+                    stroke,
+                );
+                painter.line_segment(
+                    [pos + egui::vec2(0.0, gap), pos + egui::vec2(0.0, arm)],
+                    stroke,
+                );
+            }
+        }
     }
 
     fn draw_gradient_handles(&mut self, ui: &mut egui::Ui, rect: Rect) -> bool {
