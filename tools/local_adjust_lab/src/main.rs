@@ -15,14 +15,14 @@ use flate2::write::DeflateEncoder;
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     BloomParams, BlurParams, ChromaticAberrationParams, ClarityParams, ColorBalanceParams,
-    ColorBalanceRange, ColorMixerParams, ColorRangeMask, DehazeParams, EdgeSmoothParams,
-    FilmGrainParams, GradientMapParams, GradientMapPreset, HalftoneParams, HighlightsShadowsParams,
-    HslParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
-    LookParams, LookPreset, ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams,
-    MosaicTileMode, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
-    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, ShapeOp, SharpenParams, SoftFocusParams,
-    StarGlowParams, ToneCurveParams, ToneParams, VignetteParams, apply_layers,
-    compute_mosaic_tile_size, evaluate_layer_mask,
+    ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask, DehazeParams,
+    EdgeSmoothParams, FilmGrainParams, GradientMapParams, GradientMapPreset, HalftoneParams,
+    HighlightsShadowsParams, HslParams, LineKind, LinearGradientMask, LocalAdjustmentLayer,
+    LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MosaicBoundary,
+    MosaicParams, MosaicTileMode, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
+    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, ShapeOp, SharpenParams,
+    SoftFocusParams, StarGlowParams, ThreeWayColorGradingParams, ToneCurveParams, ToneParams,
+    VignetteParams, apply_layers, compute_mosaic_tile_size, evaluate_layer_mask,
 };
 use serde::{Deserialize, Serialize};
 
@@ -921,6 +921,7 @@ enum EffectKind {
     ToneCurve,
     RgbToneCurve,
     ColorBalance,
+    ThreeWayColorGrading,
     Clarity,
     HighlightsShadows,
     Dehaze,
@@ -949,6 +950,7 @@ impl EffectKind {
             LocalEffect::ToneCurve(_) => Self::ToneCurve,
             LocalEffect::RgbToneCurve(_) => Self::RgbToneCurve,
             LocalEffect::ColorBalance(_) => Self::ColorBalance,
+            LocalEffect::ThreeWayColorGrading(_) => Self::ThreeWayColorGrading,
             LocalEffect::Clarity(_) => Self::Clarity,
             LocalEffect::HighlightsShadows(_) => Self::HighlightsShadows,
             LocalEffect::Dehaze(_) => Self::Dehaze,
@@ -977,6 +979,7 @@ impl EffectKind {
             Self::ToneCurve => "トーンカーブ",
             Self::RgbToneCurve => "RGBカーブ",
             Self::ColorBalance => "カラーバランス",
+            Self::ThreeWayColorGrading => "3-wayグレーディング",
             Self::Clarity => "明瞭度",
             Self::HighlightsShadows => "ハイライト/シャドウ",
             Self::Dehaze => "かすみ除去",
@@ -1005,6 +1008,9 @@ impl EffectKind {
             Self::ToneCurve => "暗部から明部までの明るさをカーブで細かく調整します。",
             Self::RgbToneCurve => "赤、緑、青のチャンネル別カーブで色味と明暗を細かく調整します。",
             Self::ColorBalance => "シャドウ、中間、ハイライトごとに色の偏りを調整します。",
+            Self::ThreeWayColorGrading => {
+                "シャドウ、中間、ハイライトに別々の色味と明るさを足して空気感を作ります。"
+            }
             Self::Clarity => "局所コントラストを上げ、輪郭や質感をくっきり見せます。",
             Self::HighlightsShadows => "明るい部分と暗い部分を個別に持ち上げたり抑えたりします。",
             Self::Dehaze => "白っぽさを減らし、遠景や薄いコントラストを締めます。",
@@ -1046,6 +1052,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::ToneCurve,
             EffectKind::RgbToneCurve,
             EffectKind::ColorBalance,
+            EffectKind::ThreeWayColorGrading,
             EffectKind::Hsl,
             EffectKind::ColorMixer,
             EffectKind::HighlightsShadows,
@@ -6180,6 +6187,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::ToneCurve(_) => "トーンカーブ".to_string(),
         LocalEffect::RgbToneCurve(_) => "RGBカーブ".to_string(),
         LocalEffect::ColorBalance(_) => "カラーバランス".to_string(),
+        LocalEffect::ThreeWayColorGrading(_) => "3-wayグレーディング".to_string(),
         LocalEffect::Clarity(_) => "明瞭度".to_string(),
         LocalEffect::HighlightsShadows(_) => "ハイライト/シャドウ".to_string(),
         LocalEffect::Dehaze(params) => format!("かすみ除去 {:.0}%", params.amount * 100.0),
@@ -6435,6 +6443,24 @@ fn draw_color_balance_range_sliders(ui: &mut egui::Ui, range: &mut ColorBalanceR
         ui.add(egui::Slider::new(&mut range.yellow_blue, -100.0..=100.0).text("黄 / 青"));
     changed |= yellow_blue.changed();
     yellow_blue.lab_hover_tip("負の値で黄寄り、正の値で青寄りにします。");
+    changed
+}
+
+fn draw_color_grade_wheel_sliders(ui: &mut egui::Ui, wheel: &mut ColorGradeWheel) -> bool {
+    let mut changed = false;
+    let hue = ui.add(
+        egui::Slider::new(&mut wheel.hue_degrees, 0.0..=360.0)
+            .text("色相")
+            .suffix("°"),
+    );
+    changed |= hue.changed();
+    hue.lab_hover_tip("この明るさ帯に足す色味です。彩度が0のときは色相だけでは変化しません。");
+    let saturation = ui.add(egui::Slider::new(&mut wheel.saturation, 0.0..=100.0).text("彩度"));
+    changed |= saturation.changed();
+    saturation.lab_hover_tip("色相で選んだ色味をどれだけ足すかを調整します。");
+    let luminance = ui.add(egui::Slider::new(&mut wheel.luminance, -100.0..=100.0).text("明るさ"));
+    changed |= luminance.changed();
+    luminance.lab_hover_tip("この明るさ帯だけを明るく、または暗くします。");
     changed
 }
 
@@ -6756,6 +6782,150 @@ fn draw_effect_params(
             changed |= preserve.changed();
             preserve.lab_hover_tip(
                 "色だけを寄せたいときに使います。オフにすると色変更による明るさ変化も残します。",
+            );
+        }
+        LocalEffect::ThreeWayColorGrading(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "シネマ") {
+                    *params = ThreeWayColorGradingParams {
+                        shadows: ColorGradeWheel {
+                            hue_degrees: 205.0,
+                            saturation: 42.0,
+                            luminance: -8.0,
+                        },
+                        highlights: ColorGradeWheel {
+                            hue_degrees: 36.0,
+                            saturation: 36.0,
+                            luminance: 6.0,
+                        },
+                        balance: 0.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "夕焼け") {
+                    *params = ThreeWayColorGradingParams {
+                        shadows: ColorGradeWheel {
+                            hue_degrees: 250.0,
+                            saturation: 22.0,
+                            luminance: -4.0,
+                        },
+                        midtones: ColorGradeWheel {
+                            hue_degrees: 18.0,
+                            saturation: 18.0,
+                            luminance: 2.0,
+                        },
+                        highlights: ColorGradeWheel {
+                            hue_degrees: 42.0,
+                            saturation: 48.0,
+                            luminance: 8.0,
+                        },
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "月明かり") {
+                    *params = ThreeWayColorGradingParams {
+                        shadows: ColorGradeWheel {
+                            hue_degrees: 220.0,
+                            saturation: 34.0,
+                            luminance: -6.0,
+                        },
+                        midtones: ColorGradeWheel {
+                            hue_degrees: 210.0,
+                            saturation: 16.0,
+                            luminance: -2.0,
+                        },
+                        highlights: ColorGradeWheel {
+                            hue_degrees: 190.0,
+                            saturation: 12.0,
+                            luminance: 5.0,
+                        },
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "桜色") {
+                    *params = ThreeWayColorGradingParams {
+                        midtones: ColorGradeWheel {
+                            hue_degrees: 335.0,
+                            saturation: 20.0,
+                            luminance: 3.0,
+                        },
+                        highlights: ColorGradeWheel {
+                            hue_degrees: 350.0,
+                            saturation: 24.0,
+                            luminance: 8.0,
+                        },
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "サイバー") {
+                    *params = ThreeWayColorGradingParams {
+                        shadows: ColorGradeWheel {
+                            hue_degrees: 270.0,
+                            saturation: 36.0,
+                            luminance: -4.0,
+                        },
+                        midtones: ColorGradeWheel {
+                            hue_degrees: 190.0,
+                            saturation: 18.0,
+                            luminance: 0.0,
+                        },
+                        highlights: ColorGradeWheel {
+                            hue_degrees: 315.0,
+                            saturation: 34.0,
+                            luminance: 7.0,
+                        },
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡い光") {
+                    *params = ThreeWayColorGradingParams {
+                        shadows: ColorGradeWheel {
+                            hue_degrees: 225.0,
+                            saturation: 12.0,
+                            luminance: 4.0,
+                        },
+                        midtones: ColorGradeWheel {
+                            hue_degrees: 32.0,
+                            saturation: 10.0,
+                            luminance: 6.0,
+                        },
+                        highlights: ColorGradeWheel {
+                            hue_degrees: 48.0,
+                            saturation: 18.0,
+                            luminance: 12.0,
+                        },
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "カラーバランスより演出的な仕上げ向けです。色相と彩度で足す色を選び、明るさで帯ごとの持ち上げ/締めを調整します。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            ui.collapsing("シャドウ", |ui| {
+                changed |= draw_color_grade_wheel_sliders(ui, &mut params.shadows);
+            });
+            ui.collapsing("中間", |ui| {
+                changed |= draw_color_grade_wheel_sliders(ui, &mut params.midtones);
+            });
+            ui.collapsing("ハイライト", |ui| {
+                changed |= draw_color_grade_wheel_sliders(ui, &mut params.highlights);
+            });
+            let balance =
+                ui.add(egui::Slider::new(&mut params.balance, -100.0..=100.0).text("バランス"));
+            changed |= balance.changed();
+            balance.lab_hover_tip(
+                "負の値でシャドウ寄り、正の値でハイライト寄りに効果範囲をずらします。",
             );
         }
         LocalEffect::Clarity(params) => {
@@ -8828,6 +8998,9 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ToneCurve => LocalEffect::ToneCurve(ToneCurveParams::default()),
         EffectKind::RgbToneCurve => LocalEffect::RgbToneCurve(RgbToneCurveParams::default()),
         EffectKind::ColorBalance => LocalEffect::ColorBalance(ColorBalanceParams::default()),
+        EffectKind::ThreeWayColorGrading => {
+            LocalEffect::ThreeWayColorGrading(ThreeWayColorGradingParams::default())
+        }
         EffectKind::Clarity => LocalEffect::Clarity(ClarityParams::default()),
         EffectKind::HighlightsShadows => {
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default())

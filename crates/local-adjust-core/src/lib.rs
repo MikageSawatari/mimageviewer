@@ -405,6 +405,7 @@ pub enum LocalEffect {
     ToneCurve(ToneCurveParams),
     RgbToneCurve(RgbToneCurveParams),
     ColorBalance(ColorBalanceParams),
+    ThreeWayColorGrading(ThreeWayColorGradingParams),
     Clarity(ClarityParams),
     HighlightsShadows(HighlightsShadowsParams),
     Dehaze(DehazeParams),
@@ -524,6 +525,54 @@ impl Default for ColorBalanceParams {
             midtones: ColorBalanceRange::default(),
             highlights: ColorBalanceRange::default(),
             preserve_luma: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ColorGradeWheel {
+    pub hue_degrees: f32,
+    pub saturation: f32,
+    pub luminance: f32,
+}
+
+impl Default for ColorGradeWheel {
+    fn default() -> Self {
+        Self {
+            hue_degrees: 0.0,
+            saturation: 0.0,
+            luminance: 0.0,
+        }
+    }
+}
+
+impl ColorGradeWheel {
+    fn is_identity(self) -> bool {
+        self.saturation.abs() <= f32::EPSILON && self.luminance.abs() <= f32::EPSILON
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ThreeWayColorGradingParams {
+    pub shadows: ColorGradeWheel,
+    pub midtones: ColorGradeWheel,
+    pub highlights: ColorGradeWheel,
+    pub balance: f32,
+}
+
+impl Default for ThreeWayColorGradingParams {
+    fn default() -> Self {
+        Self {
+            shadows: ColorGradeWheel {
+                hue_degrees: 220.0,
+                ..Default::default()
+            },
+            midtones: ColorGradeWheel::default(),
+            highlights: ColorGradeWheel {
+                hue_degrees: 40.0,
+                ..Default::default()
+            },
+            balance: 0.0,
         }
     }
 }
@@ -1060,6 +1109,9 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         LocalEffect::ToneCurve(params) => apply_tone_curve(&image.pixels, *params),
         LocalEffect::RgbToneCurve(params) => apply_rgb_tone_curve(&image.pixels, *params),
         LocalEffect::ColorBalance(params) => apply_color_balance(&image.pixels, *params),
+        LocalEffect::ThreeWayColorGrading(params) => {
+            apply_three_way_color_grading(&image.pixels, *params)
+        }
         LocalEffect::Clarity(params) => apply_clarity(
             &image.pixels,
             image.width,
@@ -1652,6 +1704,54 @@ fn color_balance_delta(range: ColorBalanceRange, weight: f32) -> [f32; 3] {
 
 fn add_rgb_delta(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn apply_three_way_color_grading(src: &[u8], params: ThreeWayColorGradingParams) -> Vec<u8> {
+    if params.shadows.is_identity()
+        && params.midtones.is_identity()
+        && params.highlights.is_identity()
+    {
+        return src.to_vec();
+    }
+    let mut out = src.to_vec();
+    let balance = (params.balance / 100.0).clamp(-1.0, 1.0) * 0.18;
+    for px in out.chunks_exact_mut(4) {
+        let r = px[0] as f32 / 255.0;
+        let g = px[1] as f32 / 255.0;
+        let b = px[2] as f32 / 255.0;
+        let luma = luma01(r, g, b);
+        let shadow_weight = 1.0 - smoothstep(0.16 + balance, 0.58 + balance, luma);
+        let highlight_weight = smoothstep(0.42 + balance, 0.84 + balance, luma);
+        let midtone_weight = (1.0 - shadow_weight - highlight_weight).clamp(0.0, 1.0);
+        let mut delta = grade_wheel_delta(params.shadows, shadow_weight);
+        delta = add_rgb_delta(delta, grade_wheel_delta(params.midtones, midtone_weight));
+        delta = add_rgb_delta(
+            delta,
+            grade_wheel_delta(params.highlights, highlight_weight),
+        );
+        px[0] = to_u8(r + delta[0]);
+        px[1] = to_u8(g + delta[1]);
+        px[2] = to_u8(b + delta[2]);
+    }
+    out
+}
+
+fn grade_wheel_delta(wheel: ColorGradeWheel, weight: f32) -> [f32; 3] {
+    let weight = weight.clamp(0.0, 1.0);
+    if weight <= f32::EPSILON || wheel.is_identity() {
+        return [0.0, 0.0, 0.0];
+    }
+    let saturation = (wheel.saturation / 100.0).clamp(-1.0, 1.0);
+    let luminance = (wheel.luminance / 100.0).clamp(-1.0, 1.0);
+    let hue_rgb = hsl_to_rgb(wrap01(wheel.hue_degrees / 360.0), 1.0, 0.5);
+    let neutral = luma01(hue_rgb[0], hue_rgb[1], hue_rgb[2]);
+    let tint_scale = saturation * 0.34 * weight;
+    let luma_delta = luminance * 0.30 * weight;
+    [
+        (hue_rgb[0] - neutral) * tint_scale + luma_delta,
+        (hue_rgb[1] - neutral) * tint_scale + luma_delta,
+        (hue_rgb[2] - neutral) * tint_scale + luma_delta,
+    ]
 }
 
 fn apply_clarity(src: &[u8], width: usize, height: usize, radius: usize, amount: f32) -> Vec<u8> {
@@ -3030,6 +3130,7 @@ mod tests {
             LocalEffect::ToneCurve(ToneCurveParams::default()),
             LocalEffect::RgbToneCurve(RgbToneCurveParams::default()),
             LocalEffect::ColorBalance(ColorBalanceParams::default()),
+            LocalEffect::ThreeWayColorGrading(ThreeWayColorGradingParams::default()),
             LocalEffect::Clarity(ClarityParams::default()),
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default()),
             LocalEffect::Dehaze(DehazeParams::default()),
@@ -3142,6 +3243,34 @@ mod tests {
         assert!(out.pixels[1] < src.pixels[1]);
         assert!(out.pixels[2] < src.pixels[2]);
         assert!(out.pixels[0] - src.pixels[0] > out.pixels[8] - src.pixels[8]);
+        assert_eq!(out.pixels[3], 255);
+        assert_eq!(out.pixels[11], 255);
+    }
+
+    #[test]
+    fn three_way_color_grading_tints_shadows_more_than_highlights() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![40, 40, 40, 255, 128, 128, 128, 255, 220, 220, 220, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "grade",
+            LocalMask::Full,
+            LocalEffect::ThreeWayColorGrading(ThreeWayColorGradingParams {
+                shadows: ColorGradeWheel {
+                    hue_degrees: 220.0,
+                    saturation: 70.0,
+                    luminance: 0.0,
+                },
+                ..Default::default()
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[2] > src.pixels[2]);
+        assert!(out.pixels[0] < src.pixels[0]);
+        assert!(out.pixels[2] - src.pixels[2] > out.pixels[10] - src.pixels[10]);
         assert_eq!(out.pixels[3], 255);
         assert_eq!(out.pixels[11], 255);
     }
