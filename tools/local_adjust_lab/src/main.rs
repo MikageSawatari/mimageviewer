@@ -5799,6 +5799,7 @@ fn mosaic_boundary_label(boundary: MosaicBoundary) -> &'static str {
 
 fn look_preset_label(preset: LookPreset) -> &'static str {
     match preset {
+        LookPreset::None => "選択してください",
         LookPreset::Sunset => "夕焼け",
         LookPreset::Night => "夜景",
         LookPreset::BrightSun => "明るい日光",
@@ -6461,6 +6462,7 @@ fn draw_effect_params(
             let before = params.preset;
             lab_combo_box(ui, "look_preset", look_preset_label(params.preset), |ui| {
                 for preset in [
+                    LookPreset::None,
                     LookPreset::Sunset,
                     LookPreset::Night,
                     LookPreset::BrightSun,
@@ -6480,7 +6482,12 @@ fn draw_effect_params(
                     ui.selectable_value(&mut params.preset, preset, look_preset_label(preset));
                 }
             });
-            changed |= params.preset != before;
+            if params.preset != before {
+                if params.preset != LookPreset::None && params.strength <= f32::EPSILON {
+                    params.strength = 1.0;
+                }
+                changed = true;
+            }
             changed |= ui
                 .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
                 .changed();

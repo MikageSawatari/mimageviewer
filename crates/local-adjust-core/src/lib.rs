@@ -659,6 +659,7 @@ impl Default for HslParams {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LookPreset {
+    None,
     Sunset,
     Night,
     BrightSun,
@@ -678,7 +679,7 @@ pub enum LookPreset {
 
 impl Default for LookPreset {
     fn default() -> Self {
-        Self::Sunset
+        Self::None
     }
 }
 
@@ -691,8 +692,8 @@ pub struct LookParams {
 impl Default for LookParams {
     fn default() -> Self {
         Self {
-            preset: LookPreset::Sunset,
-            strength: 0.0,
+            preset: LookPreset::None,
+            strength: 1.0,
         }
     }
 }
@@ -1783,7 +1784,7 @@ fn apply_hsl(src: &[u8], params: HslParams) -> Vec<u8> {
 
 fn apply_look(src: &[u8], params: LookParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 1.0);
-    if strength <= f32::EPSILON {
+    if params.preset == LookPreset::None || strength <= f32::EPSILON {
         return src.to_vec();
     }
     let mut out = src.to_vec();
@@ -1803,6 +1804,7 @@ fn look_rgb(rgb: [f32; 3], preset: LookPreset) -> [f32; 3] {
     let [mut r, mut g, mut b] = rgb;
     let luma = luma01(r, g, b);
     match preset {
+        LookPreset::None => rgb,
         LookPreset::Sunset => {
             r = (r + 0.12 + luma * 0.08).clamp(0.0, 1.0);
             g = (g + 0.04).clamp(0.0, 1.0);
@@ -2816,6 +2818,18 @@ mod tests {
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_ne!(&out.pixels[0..3], &src.pixels[0..3]);
         assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn look_default_is_unselected_but_ready_to_apply() {
+        let params = LookParams::default();
+        assert_eq!(params.preset, LookPreset::None);
+        assert_eq!(params.strength, 1.0);
+
+        let src = solid(1, 1, [90, 100, 120, 255]);
+        let layer = LocalAdjustmentLayer::new("look", LocalMask::Full, LocalEffect::Look(params));
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
     }
 
     #[test]
