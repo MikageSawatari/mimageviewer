@@ -458,6 +458,125 @@ struct CropCreateDrag {
     start: [f32; 2],
 }
 
+/// What a fresh primary-button press inside the canvas should start, given where it
+/// landed relative to the current crop. Resolved by [`crop_press_target`] so the branch
+/// can be unit-tested without an egui input harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CropPressTarget {
+    Resize(CropHandle),
+    Move,
+    Create,
+}
+
+/// The single in-progress crop gesture. `draw_crop_overlay` keeps this as the source of
+/// truth so a gesture survives `crop_is_active()` flipping mid-drag, and so the whole
+/// press/drag/release state machine can be exercised by [`crop_gesture_step`] tests
+/// without an egui input harness.
+#[derive(Debug, Clone, Copy)]
+enum CropGesture {
+    Idle,
+    /// Dragging a resize handle, or moving the body (`CropHandle::Body`).
+    Resize(CropDrag),
+    /// Rubber-banding a brand new crop from `start` (image coordinates).
+    Create(CropCreateDrag),
+}
+
+/// Per-frame inputs to [`crop_gesture_step`], all already resolved from egui's raw pointer
+/// state by the caller so the reducer itself stays pure.
+struct CropGestureInput {
+    primary_pressed: bool,
+    primary_down: bool,
+    /// What the *press origin* hit (handle / body / empty image). Only consulted when a
+    /// gesture begins, and computed from `press_origin`, not the live pointer.
+    press_target: Option<CropPressTarget>,
+    /// Press origin in image coordinates (create anchor).
+    press_image: Option<Pos2>,
+    /// Live pointer in image coordinates (create's moving corner).
+    current_image: Option<Pos2>,
+    /// Whether the pointer has travelled far enough from the press origin to commit a
+    /// create. Guards against a plain click collapsing into a 1px crop.
+    create_moved_enough: bool,
+    /// Crop rect at the instant the gesture starts (resize/move base).
+    base_at_press: CropRect,
+    resize_aspect: Option<f32>,
+    create_aspect: Option<f32>,
+    /// Cumulative pointer travel since the press, already scaled to image pixels.
+    total_delta_image: (f32, f32),
+    img_w: usize,
+    img_h: usize,
+}
+
+/// Advance the crop gesture state machine by one frame.
+///
+/// Returns the next gesture plus the new crop rect (if this frame changed it; `None`
+/// leaves the existing rect untouched, e.g. a click that never became a drag, or a
+/// released gesture). The reducer is deliberately free of `crop_is_active()`: once a
+/// create drag is latched it stays a create drag, which is what fixes the original
+/// "crop snaps back to full while dragging" bug.
+fn crop_gesture_step(
+    gesture: CropGesture,
+    input: &CropGestureInput,
+) -> (CropGesture, Option<CropRect>) {
+    let mut gesture = gesture;
+
+    // Begin a gesture on a fresh press (only when nothing is already latched).
+    if input.primary_pressed && matches!(gesture, CropGesture::Idle) {
+        gesture = match input.press_target {
+            Some(CropPressTarget::Resize(handle)) => CropGesture::Resize(CropDrag {
+                handle,
+                base: input.base_at_press,
+                aspect_ratio: input.resize_aspect,
+            }),
+            Some(CropPressTarget::Move) => CropGesture::Resize(CropDrag {
+                handle: CropHandle::Body,
+                base: input.base_at_press,
+                aspect_ratio: None,
+            }),
+            Some(CropPressTarget::Create) => match input.press_image {
+                Some(p) => CropGesture::Create(CropCreateDrag { start: [p.x, p.y] }),
+                None => CropGesture::Idle,
+            },
+            None => CropGesture::Idle,
+        };
+    }
+
+    // The button is up: end any gesture, leaving the last committed rect in place.
+    if !input.primary_down {
+        return (CropGesture::Idle, None);
+    }
+
+    match gesture {
+        CropGesture::Resize(drag) => {
+            let next = drag.base.dragged(
+                drag.handle,
+                input.total_delta_image.0,
+                input.total_delta_image.1,
+                input.img_w,
+                input.img_h,
+                drag.aspect_ratio,
+            );
+            (gesture, Some(next))
+        }
+        CropGesture::Create(create) => {
+            if input.create_moved_enough
+                && let Some(cur) = input.current_image
+            {
+                let next = crop_from_points(
+                    create.start,
+                    [cur.x, cur.y],
+                    input.img_w,
+                    input.img_h,
+                    input.create_aspect,
+                );
+                (gesture, Some(next))
+            } else {
+                (gesture, None)
+            }
+        }
+        CropGesture::Idle => (gesture, None),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct EdgePreviewKey {
     image_path: PathBuf,
@@ -1038,6 +1157,35 @@ impl LocalAdjustLabApp {
                 CropAspectMode::Keep => self.current_crop_aspect_ratio(),
                 _ => None,
             })
+    }
+
+    /// Read the current crop gesture out of the two legacy `crop_drag` / `crop_create_drag`
+    /// fields as a single value for [`crop_gesture_step`].
+    fn crop_gesture(&self) -> CropGesture {
+        if let Some(drag) = self.crop_drag {
+            CropGesture::Resize(drag)
+        } else if let Some(create) = self.crop_create_drag {
+            CropGesture::Create(create)
+        } else {
+            CropGesture::Idle
+        }
+    }
+
+    fn set_crop_gesture(&mut self, gesture: CropGesture) {
+        match gesture {
+            CropGesture::Idle => {
+                self.crop_drag = None;
+                self.crop_create_drag = None;
+            }
+            CropGesture::Resize(drag) => {
+                self.crop_drag = Some(drag);
+                self.crop_create_drag = None;
+            }
+            CropGesture::Create(create) => {
+                self.crop_drag = None;
+                self.crop_create_drag = Some(create);
+            }
+        }
     }
 
     fn reset_crop(&mut self) {
@@ -4846,149 +4994,146 @@ impl LocalAdjustLabApp {
             egui::StrokeKind::Outside,
         );
 
-        if !self.crop_edit_mode || !pointer_allowed {
+        // Handles / dragging only exist in the crop edit panel. A non-edit view that
+        // still has an active crop just shows the boundary above.
+        if !self.crop_edit_mode {
             return false;
         }
-        let mut used = false;
-        let mut handle_used = false;
-        let scale_x = img_w.max(1) as f32 / image_rect.width().max(1.0);
-        let scale_y = img_h.max(1) as f32 / image_rect.height().max(1.0);
+
+        // Anchor points for the 8 resize handles, clamped inward so they stay grabbable
+        // when the crop touches the image edge. `handle_points` is reused for both the
+        // visual dots and the manual hit-test below, so they can never drift apart.
         let handle_bounds = image_rect.shrink(14.0);
-        for (handle, center) in crop_handle_points(crop_screen) {
+        let handle_points = crop_handle_points(crop_screen);
+        for (handle, center) in handle_points {
             if handle == CropHandle::Body {
                 continue;
             }
             let handle_center = clamp_pos_to_rect(center, handle_bounds);
-            let handle_rect = Rect::from_center_size(handle_center, egui::vec2(36.0, 36.0));
-            let response = ui
-                .interact(
-                    handle_rect,
-                    ui.id().with(("crop_handle", handle as u8)),
-                    Sense::drag(),
-                )
-                .on_hover_text("crop を調整");
             painter.circle_filled(handle_center, 5.5, Color32::from_rgb(255, 245, 180));
             painter.circle_stroke(
                 handle_center,
                 5.5,
                 egui::Stroke::new(1.5, Color32::from_rgb(30, 20, 0)),
             );
-            if response.hovered() || response.dragged() {
-                used = true;
-                handle_used = true;
-                ui.ctx().set_cursor_icon(crop_handle_cursor(handle));
-            }
-            if response.drag_started() {
-                self.crop_drag = Some(CropDrag {
-                    handle,
-                    base: crop,
-                    aspect_ratio: self.crop_resize_aspect_ratio(),
-                });
-            }
-            if response.dragged()
-                && let Some(drag) = self.crop_drag
-                && drag.handle == handle
-            {
-                let delta = response.drag_delta();
-                let delta_x = delta.x * scale_x;
-                let delta_y = delta.y * scale_y;
-                let next =
-                    drag.base
-                        .dragged(handle, delta_x, delta_y, img_w, img_h, drag.aspect_ratio);
-                self.crop_enabled = !next.is_full(img_w, img_h);
-                self.crop_rect = Some(next);
-            }
         }
-        let active_non_body = self
-            .crop_drag
-            .map(|drag| drag.handle != CropHandle::Body)
-            .unwrap_or(false);
-        if !handle_used && !active_non_body {
-            let body_response = ui
-                .interact(
-                    crop_screen,
-                    ui.id().with(("crop_handle", CropHandle::Body as u8)),
-                    Sense::drag(),
-                )
-                .on_hover_text("crop を移動");
-            if !crop_active {
-                if body_response.drag_started()
-                    && let Some(pos) = body_response.interact_pointer_pos()
-                {
-                    let image_pos = screen_to_image(image_rect, img_w, img_h, pos)
-                        .unwrap_or_else(|| egui::pos2(crop.min_x, crop.min_y));
-                    self.crop_create_drag = Some(CropCreateDrag {
-                        start: [image_pos.x, image_pos.y],
-                    });
-                }
-                if body_response.dragged()
-                    && let Some(create) = self.crop_create_drag
-                    && let Some(pos) = body_response.interact_pointer_pos()
-                    && let Some(image_pos) = screen_to_image(image_rect, img_w, img_h, pos)
-                {
-                    let next = crop_from_points(
-                        create.start,
-                        [image_pos.x, image_pos.y],
-                        img_w,
-                        img_h,
-                        self.crop_resize_aspect_ratio(),
-                    );
-                    self.crop_enabled = !next.is_full(img_w, img_h);
-                    self.crop_rect = Some(next);
-                    used = true;
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-                }
-                if body_response.hovered() {
-                    used = true;
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
-                }
-                if ui.input(|i| !i.pointer.primary_down()) {
-                    self.crop_create_drag = None;
-                }
-                return used || self.crop_create_drag.is_some();
-            }
-            if body_response.hovered() || body_response.dragged() {
-                used = true;
-                ui.ctx().set_cursor_icon(if body_response.dragged() {
-                    egui::CursorIcon::Grabbing
-                } else {
-                    egui::CursorIcon::Grab
-                });
-            }
-            if body_response.drag_started() {
-                self.crop_drag = Some(CropDrag {
-                    handle: CropHandle::Body,
-                    base: crop,
-                    aspect_ratio: None,
-                });
-            }
-            if body_response.dragged()
-                && let Some(drag) = self.crop_drag
-                && drag.handle == CropHandle::Body
-            {
-                let delta = body_response.drag_delta();
-                let delta_x = delta.x * scale_x;
-                let delta_y = delta.y * scale_y;
-                let next =
-                    drag.base
-                        .dragged(CropHandle::Body, delta_x, delta_y, img_w, img_h, None);
-                self.crop_enabled = !next.is_full(img_w, img_h);
-                self.crop_rect = Some(next);
-            }
-        }
-        if ui.input(|i| !i.pointer.primary_down()) {
+
+        // While panning, or while the pointer is over a side panel, we must not start or
+        // continue a crop gesture. Drop any in-flight gesture so it can't silently resume
+        // later with a stale anchor.
+        if !pointer_allowed {
             self.crop_drag = None;
             self.crop_create_drag = None;
+            return false;
         }
-        if !used
-            && self.crop_edit_mode
-            && pointer_screen
-                .map(|p| crop_screen.contains(p))
-                .unwrap_or(false)
-        {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+
+        // Crop editing is driven from the *raw* pointer state instead of per-widget
+        // `ui.interact()` results. Two reasons:
+        //   1. The canvas allocates a full-size `Sense::click_and_drag` response, and
+        //      egui's hit-test can route a press to that background widget instead of the
+        //      overlay, starving the handles' `drag_started()`.
+        //   2. The old code keyed the create-vs-move branch on `crop_is_active()` captured
+        //      at frame start. The first drag frame turned the rect non-full, so the next
+        //      frame flipped `crop_active` to true and abandoned the in-progress create
+        //      gesture (the move branch couldn't take over because `crop_drag` was None),
+        //      which made a freshly dragged crop snap back instantly.
+        // A latched gesture (`crop_drag` / `crop_create_drag`) plus `total_drag_delta`
+        // (cumulative since the press, not the per-frame `drag_delta`) fixes both.
+        let (primary_pressed, primary_down, press_origin, total_delta) = ui.input(|i| {
+            (
+                i.pointer.primary_pressed(),
+                i.pointer.primary_down(),
+                i.pointer.press_origin(),
+                i.pointer.total_drag_delta().unwrap_or(egui::Vec2::ZERO),
+            )
+        });
+        let scale_x = img_w.max(1) as f32 / image_rect.width().max(1.0);
+        let scale_y = img_h.max(1) as f32 / image_rect.height().max(1.0);
+        const HANDLE_HIT: f32 = 32.0;
+        // Below this much pointer travel (screen px) a press is treated as a click, not a
+        // drag, so a stray click never collapses the crop into a 1px rectangle.
+        const CREATE_DRAG_THRESHOLD: f32 = 4.0;
+        let to_image =
+            |p: Pos2| screen_to_image(image_rect, img_w, img_h, clamp_pos_to_rect(p, image_rect));
+        let press_target = |p: Pos2| {
+            crop_press_target(
+                p,
+                image_rect,
+                crop_screen,
+                crop_active,
+                &handle_points,
+                handle_bounds,
+                HANDLE_HIT,
+            )
+        };
+
+        // Classify the gesture from the *press origin*, not the live pointer, so a press
+        // that already moved within the first frame still latches the right target.
+        let create_moved_enough = match (press_origin, pointer_screen) {
+            (Some(origin), Some(cur)) => (cur - origin).length() >= CREATE_DRAG_THRESHOLD,
+            _ => false,
+        };
+        let gesture_input = CropGestureInput {
+            primary_pressed,
+            primary_down,
+            press_target: press_origin.and_then(press_target),
+            press_image: press_origin.and_then(to_image),
+            current_image: pointer_screen.and_then(to_image),
+            create_moved_enough,
+            base_at_press: crop,
+            resize_aspect: self.crop_resize_aspect_ratio(),
+            create_aspect: self.crop_resize_aspect_ratio(),
+            total_delta_image: (total_delta.x * scale_x, total_delta.y * scale_y),
+            img_w,
+            img_h,
+        };
+
+        let (next_gesture, next_crop) = crop_gesture_step(self.crop_gesture(), &gesture_input);
+        self.set_crop_gesture(next_gesture);
+        let mut used = false;
+        if let Some(next) = next_crop {
+            self.crop_enabled = !next.is_full(img_w, img_h);
+            self.crop_rect = Some(next);
         }
-        used || self.crop_drag.is_some()
+        if primary_down {
+            match next_gesture {
+                CropGesture::Resize(drag) => {
+                    ui.ctx()
+                        .set_cursor_icon(if drag.handle == CropHandle::Body {
+                            egui::CursorIcon::Grabbing
+                        } else {
+                            crop_handle_cursor(drag.handle)
+                        });
+                    used = true;
+                }
+                CropGesture::Create(_) => {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    used = true;
+                }
+                CropGesture::Idle => {}
+            }
+        }
+
+        // Idle hover cursor feedback (resize / move / create affordance).
+        if !used && let Some(p) = pointer_screen {
+            match press_target(p) {
+                Some(CropPressTarget::Resize(handle)) => {
+                    ui.ctx().set_cursor_icon(crop_handle_cursor(handle));
+                    used = true;
+                }
+                Some(CropPressTarget::Move) => {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Grab);
+                    used = true;
+                }
+                Some(CropPressTarget::Create) => {
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                    used = true;
+                }
+                None => {}
+            }
+        }
+
+        used || !matches!(self.crop_gesture(), CropGesture::Idle)
     }
 
     fn drag_gradient_line(&mut self, image_pos: Pos2, started: bool) {
@@ -8760,6 +8905,43 @@ fn crop_handle_cursor(handle: CropHandle) -> egui::CursorIcon {
     }
 }
 
+/// Decide what a primary-button press at `press` should start.
+///
+/// Priority: a resize handle (corner/edge) wins first, then dragging the body of an
+/// active crop moves it, otherwise the press begins a fresh create-drag anywhere in the
+/// image. `handle_points` / `handle_bounds` / `handle_hit` mirror exactly what
+/// `draw_crop_overlay` draws, so the hit areas can never drift from the rendered dots.
+/// Returns `None` if the press is outside the image entirely.
+fn crop_press_target(
+    press: Pos2,
+    image_rect: Rect,
+    crop_screen: Rect,
+    crop_active: bool,
+    handle_points: &[(CropHandle, Pos2)],
+    handle_bounds: Rect,
+    handle_hit: f32,
+) -> Option<CropPressTarget> {
+    if !image_rect.contains(press) {
+        return None;
+    }
+    for (handle, center) in handle_points {
+        if *handle == CropHandle::Body {
+            continue;
+        }
+        let hit = Rect::from_center_size(
+            clamp_pos_to_rect(*center, handle_bounds),
+            egui::vec2(handle_hit, handle_hit),
+        );
+        if hit.contains(press) {
+            return Some(CropPressTarget::Resize(*handle));
+        }
+    }
+    if crop_active && crop_screen.contains(press) {
+        return Some(CropPressTarget::Move);
+    }
+    Some(CropPressTarget::Create)
+}
+
 fn outside_rects(outer: Rect, inner: Rect) -> [Rect; 4] {
     let inner = inner.intersect(outer);
     [
@@ -9380,6 +9562,260 @@ mod tests {
         assert_eq!(crop.min_y, 20.0);
         assert_eq!(crop.max_x, 70.0);
         assert_eq!(crop.max_y, 90.0);
+    }
+
+    // image displayed 1:1 on screen at the origin, so screen coords == image coords.
+    const TEST_IMG_RECT: Rect = Rect {
+        min: Pos2 { x: 0.0, y: 0.0 },
+        max: Pos2 { x: 200.0, y: 160.0 },
+    };
+    const TEST_HANDLE_HIT: f32 = 32.0;
+
+    fn test_press_target(
+        press: Pos2,
+        crop: CropRect,
+        crop_active: bool,
+    ) -> Option<CropPressTarget> {
+        let crop_screen = crop.to_screen_rect(TEST_IMG_RECT, 200, 160);
+        let handle_bounds = TEST_IMG_RECT.shrink(14.0);
+        let handle_points = crop_handle_points(crop_screen);
+        crop_press_target(
+            press,
+            TEST_IMG_RECT,
+            crop_screen,
+            crop_active,
+            &handle_points,
+            handle_bounds,
+            TEST_HANDLE_HIT,
+        )
+    }
+
+    #[test]
+    fn crop_press_target_starts_create_in_full_image_interior() {
+        // From the full (no-crop) state, pressing inside the image must begin a create
+        // drag, not silently fall through (the original symptom: drag did nothing).
+        let target = test_press_target(Pos2::new(80.0, 60.0), CropRect::full(200, 160), false);
+        assert_eq!(target, Some(CropPressTarget::Create));
+    }
+
+    #[test]
+    fn crop_press_target_moves_active_crop_body() {
+        let crop = CropRect {
+            min_x: 40.0,
+            min_y: 30.0,
+            max_x: 160.0,
+            max_y: 130.0,
+        };
+        let target = test_press_target(Pos2::new(100.0, 80.0), crop, true);
+        assert_eq!(target, Some(CropPressTarget::Move));
+    }
+
+    #[test]
+    fn crop_press_target_resizes_on_corner_handle() {
+        let crop = CropRect {
+            min_x: 40.0,
+            min_y: 30.0,
+            max_x: 160.0,
+            max_y: 130.0,
+        };
+        // Press right on the south-east corner dot.
+        let target = test_press_target(Pos2::new(160.0, 130.0), crop, true);
+        assert_eq!(target, Some(CropPressTarget::Resize(CropHandle::SouthEast)));
+    }
+
+    #[test]
+    fn crop_press_target_creates_outside_active_crop() {
+        // Pressing in the darkened area outside an existing crop starts a fresh crop.
+        let crop = CropRect {
+            min_x: 40.0,
+            min_y: 30.0,
+            max_x: 160.0,
+            max_y: 130.0,
+        };
+        let target = test_press_target(Pos2::new(10.0, 10.0), crop, true);
+        assert_eq!(target, Some(CropPressTarget::Create));
+    }
+
+    #[test]
+    fn crop_press_target_ignores_press_outside_image() {
+        let target = test_press_target(Pos2::new(-5.0, -5.0), CropRect::full(200, 160), false);
+        assert_eq!(target, None);
+    }
+
+    #[test]
+    fn crop_create_drag_tracks_full_pointer_travel() {
+        // Simulate the create gesture the way draw_crop_overlay does: the press latches a
+        // start point, then every frame rebuilds the rect from (start, current). The rect
+        // must follow the pointer the whole way instead of freezing after one frame (the
+        // bug where crop_is_active flipped mid-drag and abandoned the gesture).
+        let start = [30.0, 20.0];
+        let trace = [[60.0, 50.0], [90.0, 80.0], [130.0, 110.0]];
+        let mut last = CropRect::full(200, 160);
+        for current in trace {
+            last = crop_from_points(start, current, 200, 160, None);
+        }
+        assert!(!last.is_full(200, 160));
+        assert_eq!(last.min_x, 30.0);
+        assert_eq!(last.min_y, 20.0);
+        assert_eq!(last.max_x, 130.0);
+        assert_eq!(last.max_y, 110.0);
+    }
+
+    #[test]
+    fn crop_resize_accumulates_total_delta_not_single_frame() {
+        // draw_crop_overlay applies the cumulative drag delta (total_drag_delta) to the
+        // base captured at press, not the per-frame drag_delta. With three -10px frames
+        // the West-bound East handle must end 30px in, not 10px (the per-frame-on-fixed-
+        // base bug would have stuck it near the start).
+        let base = CropRect::full(200, 160);
+        let total_delta_x = -30.0; // 3 frames * -10px, summed
+        let next = base.dragged(CropHandle::East, total_delta_x, 0.0, 200, 160, None);
+        assert_eq!(next.max_x, 170.0);
+        assert!(!next.is_full(200, 160));
+    }
+
+    fn gesture_input(
+        primary_pressed: bool,
+        primary_down: bool,
+        press_target: Option<CropPressTarget>,
+        press_image: Option<Pos2>,
+        current_image: Option<Pos2>,
+        create_moved_enough: bool,
+        base_at_press: CropRect,
+        total_delta_image: (f32, f32),
+    ) -> CropGestureInput {
+        CropGestureInput {
+            primary_pressed,
+            primary_down,
+            press_target,
+            press_image,
+            current_image,
+            create_moved_enough,
+            base_at_press,
+            resize_aspect: None,
+            create_aspect: None,
+            total_delta_image,
+            img_w: 200,
+            img_h: 160,
+        }
+    }
+
+    #[test]
+    fn crop_gesture_create_survives_active_flip_and_tracks_pointer() {
+        // The original bug: the first drag frame turned the rect non-full, which on the
+        // next frame would abandon the create gesture. The reducer must keep it latched.
+        let full = CropRect::full(200, 160);
+
+        // Frame 0: press in the interior begins a create at (30,20); no travel yet.
+        let (g0, rect0) = crop_gesture_step(
+            CropGesture::Idle,
+            &gesture_input(
+                true,
+                true,
+                Some(CropPressTarget::Create),
+                Some(Pos2::new(30.0, 20.0)),
+                Some(Pos2::new(30.0, 20.0)),
+                false,
+                full,
+                (0.0, 0.0),
+            ),
+        );
+        assert!(matches!(g0, CropGesture::Create(_)));
+        assert!(
+            rect0.is_none(),
+            "a press with no travel must not size the crop"
+        );
+
+        // Frame 1: dragged out to (130,110) — crop is now non-full (would have flipped
+        // crop_active in the old code). Gesture stays a create and tracks the pointer.
+        let (g1, rect1) = crop_gesture_step(
+            g0,
+            &gesture_input(
+                false,
+                true,
+                None,
+                None,
+                Some(Pos2::new(130.0, 110.0)),
+                true,
+                full,
+                (0.0, 0.0),
+            ),
+        );
+        assert!(matches!(g1, CropGesture::Create(_)));
+        let rect1 = rect1.expect("create should size the crop once moved");
+        assert!(!rect1.is_full(200, 160));
+        assert_eq!((rect1.min_x, rect1.min_y), (30.0, 20.0));
+        assert_eq!((rect1.max_x, rect1.max_y), (130.0, 110.0));
+
+        // Frame 2: release ends the gesture and leaves the rect untouched.
+        let (g2, rect2) = crop_gesture_step(
+            g1,
+            &gesture_input(false, false, None, None, None, true, full, (0.0, 0.0)),
+        );
+        assert!(matches!(g2, CropGesture::Idle));
+        assert!(rect2.is_none());
+    }
+
+    #[test]
+    fn crop_gesture_click_without_drag_is_a_noop() {
+        // Press + release with no travel must not create a 1px crop or disturb the rect.
+        let full = CropRect::full(200, 160);
+        let (g0, rect0) = crop_gesture_step(
+            CropGesture::Idle,
+            &gesture_input(
+                true,
+                true,
+                Some(CropPressTarget::Create),
+                Some(Pos2::new(80.0, 60.0)),
+                Some(Pos2::new(80.0, 60.0)),
+                false,
+                full,
+                (0.0, 0.0),
+            ),
+        );
+        assert!(matches!(g0, CropGesture::Create(_)));
+        assert!(rect0.is_none());
+        let (g1, rect1) = crop_gesture_step(
+            g0,
+            &gesture_input(false, false, None, None, None, false, full, (0.0, 0.0)),
+        );
+        assert!(matches!(g1, CropGesture::Idle));
+        assert!(rect1.is_none());
+    }
+
+    #[test]
+    fn crop_gesture_resize_applies_cumulative_delta() {
+        let full = CropRect::full(200, 160);
+        // Press the east handle, then continue with a cumulative -30px delta.
+        let (g0, _) = crop_gesture_step(
+            CropGesture::Idle,
+            &gesture_input(
+                true,
+                true,
+                Some(CropPressTarget::Resize(CropHandle::East)),
+                Some(Pos2::new(200.0, 80.0)),
+                Some(Pos2::new(200.0, 80.0)),
+                false,
+                full,
+                (0.0, 0.0),
+            ),
+        );
+        assert!(matches!(g0, CropGesture::Resize(_)));
+        let (_, rect) = crop_gesture_step(
+            g0,
+            &gesture_input(
+                false,
+                true,
+                None,
+                None,
+                Some(Pos2::new(170.0, 80.0)),
+                false,
+                full,
+                (-30.0, 0.0),
+            ),
+        );
+        let rect = rect.expect("resize should update the crop");
+        assert_eq!(rect.max_x, 170.0);
     }
 
     #[test]
