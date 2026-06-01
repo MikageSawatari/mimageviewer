@@ -418,6 +418,7 @@ pub enum LocalEffect {
     Hsl(HslParams),
     ColorMixer(ColorMixerParams),
     Look(LookParams),
+    CubeLut(CubeLutParams),
     GradientMap(GradientMapParams),
     Bloom(BloomParams),
     Vignette(VignetteParams),
@@ -915,6 +916,35 @@ impl Default for LookParams {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CubeLutParams {
+    pub name: String,
+    pub size: usize,
+    pub domain_min: [f32; 3],
+    pub domain_max: [f32; 3],
+    pub table: Vec<[f32; 3]>,
+    pub strength: f32,
+}
+
+impl Default for CubeLutParams {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            size: 0,
+            domain_min: [0.0, 0.0, 0.0],
+            domain_max: [1.0, 1.0, 1.0],
+            table: Vec::new(),
+            strength: 1.0,
+        }
+    }
+}
+
+impl CubeLutParams {
+    pub fn is_loaded(&self) -> bool {
+        self.size >= 2 && self.table.len() == self.size.saturating_pow(3)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GradientMapPreset {
     None,
@@ -1204,6 +1234,7 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         LocalEffect::Hsl(params) => apply_hsl(&image.pixels, *params),
         LocalEffect::ColorMixer(params) => apply_color_mixer(&image.pixels, *params),
         LocalEffect::Look(params) => apply_look(&image.pixels, *params),
+        LocalEffect::CubeLut(params) => apply_cube_lut(&image.pixels, params),
         LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
         LocalEffect::Bloom(params) => {
             apply_bloom(&image.pixels, image.width, image.height, *params)
@@ -2332,6 +2363,202 @@ fn apply_look(src: &[u8], params: LookParams) -> Vec<u8> {
     out
 }
 
+fn apply_cube_lut(src: &[u8], params: &CubeLutParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if !params.is_loaded() || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let rgb = [
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        ];
+        let sampled = sample_cube_lut(params, rgb);
+        px[0] = to_u8(lerp_f32(rgb[0], sampled[0], strength));
+        px[1] = to_u8(lerp_f32(rgb[1], sampled[1], strength));
+        px[2] = to_u8(lerp_f32(rgb[2], sampled[2], strength));
+    }
+    out
+}
+
+fn sample_cube_lut(params: &CubeLutParams, rgb: [f32; 3]) -> [f32; 3] {
+    let size = params.size;
+    let normalize = |value: f32, min: f32, max: f32| {
+        ((value - min) / (max - min).max(f32::EPSILON)).clamp(0.0, 1.0)
+    };
+    let r = normalize(rgb[0], params.domain_min[0], params.domain_max[0]) * (size - 1) as f32;
+    let g = normalize(rgb[1], params.domain_min[1], params.domain_max[1]) * (size - 1) as f32;
+    let b = normalize(rgb[2], params.domain_min[2], params.domain_max[2]) * (size - 1) as f32;
+    let r0 = r.floor() as usize;
+    let g0 = g.floor() as usize;
+    let b0 = b.floor() as usize;
+    let r1 = (r0 + 1).min(size - 1);
+    let g1 = (g0 + 1).min(size - 1);
+    let b1 = (b0 + 1).min(size - 1);
+    let tr = r - r0 as f32;
+    let tg = g - g0 as f32;
+    let tb = b - b0 as f32;
+
+    let c000 = cube_lut_at(params, r0, g0, b0);
+    let c100 = cube_lut_at(params, r1, g0, b0);
+    let c010 = cube_lut_at(params, r0, g1, b0);
+    let c110 = cube_lut_at(params, r1, g1, b0);
+    let c001 = cube_lut_at(params, r0, g0, b1);
+    let c101 = cube_lut_at(params, r1, g0, b1);
+    let c011 = cube_lut_at(params, r0, g1, b1);
+    let c111 = cube_lut_at(params, r1, g1, b1);
+
+    let lerp3 = |a: [f32; 3], b: [f32; 3], t: f32| {
+        [
+            lerp_f32(a[0], b[0], t),
+            lerp_f32(a[1], b[1], t),
+            lerp_f32(a[2], b[2], t),
+        ]
+    };
+    let c00 = lerp3(c000, c100, tr);
+    let c10 = lerp3(c010, c110, tr);
+    let c01 = lerp3(c001, c101, tr);
+    let c11 = lerp3(c011, c111, tr);
+    let c0 = lerp3(c00, c10, tg);
+    let c1 = lerp3(c01, c11, tg);
+    lerp3(c0, c1, tb)
+}
+
+fn cube_lut_at(params: &CubeLutParams, r: usize, g: usize, b: usize) -> [f32; 3] {
+    let size = params.size;
+    let idx = (b * size + g) * size + r;
+    params.table.get(idx).copied().unwrap_or([0.0, 0.0, 0.0])
+}
+
+pub fn parse_cube_lut(
+    text: &str,
+    fallback_name: &str,
+) -> std::result::Result<CubeLutParams, String> {
+    let mut name = fallback_name.to_string();
+    let mut size = 0_usize;
+    let mut domain_min = [0.0, 0.0, 0.0];
+    let mut domain_max = [1.0, 1.0, 1.0];
+    let mut table = Vec::new();
+
+    for (line_idx, raw_line) in text.lines().enumerate() {
+        let line_no = line_idx + 1;
+        let line = raw_line.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(first) = parts.next() else {
+            continue;
+        };
+        match first.to_ascii_uppercase().as_str() {
+            "TITLE" => {
+                let title = line[first.len()..].trim().trim_matches('"');
+                if !title.is_empty() {
+                    name = title.to_string();
+                }
+            }
+            "LUT_3D_SIZE" => {
+                let value = parts
+                    .next()
+                    .ok_or_else(|| format!("LUT_3D_SIZE の値がありません: {line_no}行目"))?;
+                size = value
+                    .parse::<usize>()
+                    .map_err(|_| format!("LUT_3D_SIZE が数値ではありません: {line_no}行目"))?;
+                if !(2..=128).contains(&size) {
+                    return Err(format!(
+                        "対応していない LUT サイズです: {size} ({line_no}行目)"
+                    ));
+                }
+            }
+            "LUT_1D_SIZE" => {
+                return Err(format!(
+                    "1D LUT は未対応です。3D LUT (.cube) を指定してください: {line_no}行目"
+                ));
+            }
+            "DOMAIN_MIN" => {
+                domain_min = parse_cube_triplet(parts, line_no, "DOMAIN_MIN")?;
+            }
+            "DOMAIN_MAX" => {
+                domain_max = parse_cube_triplet(parts, line_no, "DOMAIN_MAX")?;
+            }
+            "LUT_3D_INPUT_RANGE" => {
+                let [min, max] = parse_cube_pair(parts, line_no, "LUT_3D_INPUT_RANGE")?;
+                domain_min = [min, min, min];
+                domain_max = [max, max, max];
+            }
+            _ => {
+                let r = first
+                    .parse::<f32>()
+                    .map_err(|_| format!("未対応の .cube 行です: {line_no}行目"))?;
+                let g = parts
+                    .next()
+                    .ok_or_else(|| format!("RGB 値が不足しています: {line_no}行目"))?
+                    .parse::<f32>()
+                    .map_err(|_| format!("RGB 値が数値ではありません: {line_no}行目"))?;
+                let b = parts
+                    .next()
+                    .ok_or_else(|| format!("RGB 値が不足しています: {line_no}行目"))?
+                    .parse::<f32>()
+                    .map_err(|_| format!("RGB 値が数値ではありません: {line_no}行目"))?;
+                table.push([r.clamp(0.0, 1.0), g.clamp(0.0, 1.0), b.clamp(0.0, 1.0)]);
+            }
+        }
+    }
+
+    if size == 0 {
+        return Err("LUT_3D_SIZE が見つかりません。".to_string());
+    }
+    let expected = size.saturating_pow(3);
+    if table.len() != expected {
+        return Err(format!(
+            "LUT データ数が一致しません: 期待 {expected}, 実際 {}",
+            table.len()
+        ));
+    }
+    Ok(CubeLutParams {
+        name,
+        size,
+        domain_min,
+        domain_max,
+        table,
+        strength: 1.0,
+    })
+}
+
+fn parse_cube_triplet<'a>(
+    mut parts: impl Iterator<Item = &'a str>,
+    line_no: usize,
+    label: &str,
+) -> std::result::Result<[f32; 3], String> {
+    let mut values = [0.0; 3];
+    for value in &mut values {
+        *value = parts
+            .next()
+            .ok_or_else(|| format!("{label} の値が不足しています: {line_no}行目"))?
+            .parse::<f32>()
+            .map_err(|_| format!("{label} が数値ではありません: {line_no}行目"))?;
+    }
+    Ok(values)
+}
+
+fn parse_cube_pair<'a>(
+    mut parts: impl Iterator<Item = &'a str>,
+    line_no: usize,
+    label: &str,
+) -> std::result::Result<[f32; 2], String> {
+    let mut values = [0.0; 2];
+    for value in &mut values {
+        *value = parts
+            .next()
+            .ok_or_else(|| format!("{label} の値が不足しています: {line_no}行目"))?
+            .parse::<f32>()
+            .map_err(|_| format!("{label} が数値ではありません: {line_no}行目"))?;
+    }
+    Ok(values)
+}
+
 fn apply_gradient_map(src: &[u8], params: GradientMapParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 1.0);
     if params.preset == GradientMapPreset::None || strength <= f32::EPSILON {
@@ -3278,6 +3505,7 @@ mod tests {
             LocalEffect::Hsl(HslParams::default()),
             LocalEffect::ColorMixer(ColorMixerParams::default()),
             LocalEffect::Look(LookParams::default()),
+            LocalEffect::CubeLut(CubeLutParams::default()),
             LocalEffect::GradientMap(GradientMapParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
@@ -3668,6 +3896,54 @@ mod tests {
         let layer = LocalAdjustmentLayer::new("look", LocalMask::Full, LocalEffect::Look(params));
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn cube_lut_parser_reads_three_dimensional_table() {
+        let text = r#"
+TITLE "Invert"
+LUT_3D_SIZE 2
+DOMAIN_MIN 0.0 0.0 0.0
+DOMAIN_MAX 1.0 1.0 1.0
+1.0 1.0 1.0
+0.0 1.0 1.0
+1.0 0.0 1.0
+0.0 0.0 1.0
+1.0 1.0 0.0
+0.0 1.0 0.0
+1.0 0.0 0.0
+0.0 0.0 0.0
+"#;
+        let params = parse_cube_lut(text, "fallback").unwrap();
+        assert_eq!(params.name, "Invert");
+        assert_eq!(params.size, 2);
+        assert_eq!(params.table.len(), 8);
+    }
+
+    #[test]
+    fn cube_lut_inverts_colors() {
+        let params = parse_cube_lut(
+            r#"
+LUT_3D_SIZE 2
+1.0 1.0 1.0
+0.0 1.0 1.0
+1.0 0.0 1.0
+0.0 0.0 1.0
+1.0 1.0 0.0
+0.0 1.0 0.0
+1.0 0.0 0.0
+0.0 0.0 0.0
+"#,
+            "invert",
+        )
+        .unwrap();
+        let src = RgbaImageBuf::new(1, 1, vec![0, 128, 255, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new("lut", LocalMask::Full, LocalEffect::CubeLut(params));
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels[0], 255);
+        assert!((126..=128).contains(&out.pixels[1]));
+        assert_eq!(out.pixels[2], 0);
+        assert_eq!(out.pixels[3], 255);
     }
 
     #[test]

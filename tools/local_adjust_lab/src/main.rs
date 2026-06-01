@@ -16,14 +16,14 @@ use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     BloomParams, BlurParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
     ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
-    DehazeParams, EdgeSmoothParams, FilmGrainParams, GradientMapParams, GradientMapPreset,
-    HalftoneParams, HighlightsShadowsParams, HslParams, LineKind, LinearGradientMask,
-    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
-    MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode, RadialGradientMask, RangeMask,
-    RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
-    SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams,
-    ThreeWayColorGradingParams, ToneCurveParams, ToneParams, VignetteParams, apply_layers,
-    compute_mosaic_tile_size, evaluate_layer_mask,
+    CubeLutParams, DehazeParams, EdgeSmoothParams, FilmGrainParams, GradientMapParams,
+    GradientMapPreset, HalftoneParams, HighlightsShadowsParams, HslParams, LineKind,
+    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
+    ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode,
+    RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
+    RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams,
+    StarGlowParams, ThreeWayColorGradingParams, ToneCurveParams, ToneParams, VignetteParams,
+    apply_layers, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -277,6 +277,14 @@ struct SegmentationPending {
     generation: u64,
     rx: mpsc::Receiver<Result<GeneratedMask, String>>,
     started_at: Instant,
+}
+
+struct LutLoadPending {
+    layer_idx: usize,
+    generation: u64,
+    rx: mpsc::Receiver<Result<CubeLutParams, String>>,
+    started_at: Instant,
+    path: PathBuf,
 }
 
 enum GeneratedMask {
@@ -935,6 +943,7 @@ enum EffectKind {
     Hsl,
     ColorMixer,
     Look,
+    CubeLut,
     GradientMap,
     Bloom,
     Vignette,
@@ -966,6 +975,7 @@ impl EffectKind {
             LocalEffect::Hsl(_) => Self::Hsl,
             LocalEffect::ColorMixer(_) => Self::ColorMixer,
             LocalEffect::Look(_) => Self::Look,
+            LocalEffect::CubeLut(_) => Self::CubeLut,
             LocalEffect::GradientMap(_) => Self::GradientMap,
             LocalEffect::Bloom(_) => Self::Bloom,
             LocalEffect::Vignette(_) => Self::Vignette,
@@ -997,6 +1007,7 @@ impl EffectKind {
             Self::Hsl => "色相/HSL",
             Self::ColorMixer => "カラーミキサー",
             Self::Look => "ルック",
+            Self::CubeLut => "3D LUT",
             Self::GradientMap => "グラデーションマップ",
             Self::Bloom => "ブルーム",
             Self::Vignette => "ビネット",
@@ -1030,6 +1041,9 @@ impl EffectKind {
             Self::Hsl => "色相、彩度、明度を調整し、髪色変更などの色替えに使います。",
             Self::ColorMixer => "赤、黄、緑、青などの色帯ごとに色相、彩度、明度を調整します。",
             Self::Look => "夕焼け、夜景、フィルム風などのまとまった色味を適用します。",
+            Self::CubeLut => {
+                ".cube 形式の外部3D LUTを読み込み、配布LUTや映画風の色味を適用します。"
+            }
             Self::GradientMap => {
                 "明るさを指定したグラデーションの色へ置き換え、色設計や色トレス風に使います。"
             }
@@ -1069,6 +1083,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::HighlightsShadows,
             EffectKind::Dehaze,
             EffectKind::Look,
+            EffectKind::CubeLut,
             EffectKind::GradientMap,
         ],
     },
@@ -1112,6 +1127,7 @@ struct LocalAdjustLabApp {
     result: Option<RgbaImageBuf>,
     pending: Option<RenderPending>,
     segmentation_pending: Option<SegmentationPending>,
+    lut_load_pending: Option<LutLoadPending>,
     generation: u64,
     result_dirty: bool,
     mask_dirty: bool,
@@ -1187,6 +1203,7 @@ impl LocalAdjustLabApp {
             result: None,
             pending: None,
             segmentation_pending: None,
+            lut_load_pending: None,
             generation: 0,
             result_dirty: false,
             mask_dirty: false,
@@ -1269,6 +1286,7 @@ impl LocalAdjustLabApp {
                 self.result = None;
                 self.pending = None;
                 self.segmentation_pending = None;
+                self.lut_load_pending = None;
                 self.image = Some(loaded);
                 self.undo_stack.clear();
                 self.redo_stack.clear();
@@ -1979,6 +1997,117 @@ impl LocalAdjustLabApp {
             Err(mpsc::TryRecvError::Disconnected) => {
                 self.segmentation_pending = None;
                 self.status = "セグメンテーション worker が停止しました。".to_string();
+            }
+        }
+    }
+
+    fn choose_cube_lut_for_selected_layer(&mut self) {
+        let layer_idx = self.selected_layer;
+        if !matches!(
+            self.layers.get(layer_idx).map(|layer| &layer.effect),
+            Some(LocalEffect::CubeLut(_))
+        ) {
+            self.status = "3D LUT レイヤーを選択してください。".to_string();
+            return;
+        }
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("3D LUT (.cube)", &["cube"])
+            .set_title("3D LUTを選択")
+            .pick_file()
+        else {
+            return;
+        };
+        self.start_cube_lut_load(layer_idx, path);
+    }
+
+    fn start_cube_lut_load(&mut self, layer_idx: usize, path: PathBuf) {
+        if self.lut_load_pending.is_some() {
+            self.status = "LUT読み込み中です。".to_string();
+            return;
+        }
+        let fallback_name = path
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or("3D LUT")
+            .to_string();
+        let worker_path = path.clone();
+        let (tx, rx) = mpsc::channel();
+        let spawn_result = std::thread::Builder::new()
+            .name("local-adjust-lab-lut-load".to_string())
+            .spawn(move || {
+                let result = std::fs::read_to_string(&worker_path)
+                    .map_err(|e| format!("LUTファイルを読めません: {e}"))
+                    .and_then(|text| parse_cube_lut(&text, &fallback_name));
+                let _ = tx.send(result);
+            });
+        match spawn_result {
+            Ok(_) => {
+                self.lut_load_pending = Some(LutLoadPending {
+                    layer_idx,
+                    generation: self.generation,
+                    rx,
+                    started_at: Instant::now(),
+                    path: path.clone(),
+                });
+                self.status = format!("LUT読み込み中: {}", path.display());
+            }
+            Err(e) => {
+                self.status = format!("LUT読み込み worker 起動失敗: {e}");
+            }
+        }
+    }
+
+    fn poll_lut_load(&mut self, ctx: &egui::Context) {
+        let recv_result = {
+            let Some(pending) = self.lut_load_pending.as_ref() else {
+                return;
+            };
+            pending.rx.try_recv()
+        };
+        match recv_result {
+            Ok(Ok(params)) => {
+                let Some(pending) = self.lut_load_pending.take() else {
+                    return;
+                };
+                if self.generation != pending.generation {
+                    self.status =
+                        "LUT読み込み結果を破棄しました。画像またはレイヤーが変更されています。"
+                            .to_string();
+                    return;
+                }
+                if !matches!(
+                    self.layers
+                        .get(pending.layer_idx)
+                        .map(|layer| &layer.effect),
+                    Some(LocalEffect::CubeLut(_))
+                ) {
+                    self.status = "LUT読み込み結果を破棄しました。対象レイヤーが変更されています。"
+                        .to_string();
+                    return;
+                }
+                let elapsed_ms = pending.started_at.elapsed().as_secs_f64() * 1000.0;
+                let name = params.name.clone();
+                let size = params.size;
+                self.push_undo_snapshot();
+                if let Some(layer) = self.layers.get_mut(pending.layer_idx) {
+                    layer.effect = LocalEffect::CubeLut(params);
+                }
+                self.selected_layer = pending.layer_idx;
+                self.status = format!(
+                    "LUT読み込み完了: {name} ({size}^3, {elapsed_ms:.0}ms) / {}",
+                    pending.path.display()
+                );
+                self.mark_dirty();
+                ctx.request_repaint();
+            }
+            Ok(Err(e)) => {
+                self.lut_load_pending = None;
+                self.status = format!("LUT読み込み失敗: {e}");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.lut_load_pending = None;
+                self.status = "LUT読み込み worker が停止しました。".to_string();
             }
         }
     }
@@ -4135,10 +4264,16 @@ impl LocalAdjustLabApp {
 
         ui.separator();
         let dims = self.image_dims().unwrap_or((1, 1));
+        let mut request_cube_lut_load = false;
         if let Some(layer) = self.selected_layer_mut() {
-            if draw_effect_params(ui, layer, dims) {
+            let response = draw_effect_params(ui, layer, dims);
+            request_cube_lut_load = response.load_cube_lut;
+            if response.changed {
                 self.mark_dirty();
             }
+        }
+        if request_cube_lut_load {
+            self.choose_cube_lut_for_selected_layer();
         }
     }
 
@@ -5901,9 +6036,13 @@ impl eframe::App for LocalAdjustLabApp {
         }
 
         self.poll_segmentation(ctx);
+        self.poll_lut_load(ctx);
         self.poll_render(ctx);
         self.maybe_start_render(ctx);
-        if self.pending.is_some() || self.segmentation_pending.is_some() {
+        if self.pending.is_some()
+            || self.segmentation_pending.is_some()
+            || self.lut_load_pending.is_some()
+        {
             ctx.request_repaint_after(Duration::from_millis(16));
         }
         self.ensure_mask_texture(ctx);
@@ -6224,6 +6363,13 @@ fn effect_summary(effect: &LocalEffect) -> String {
             format!("カラーミキサー {}色", color_mixer_adjusted_count(params))
         }
         LocalEffect::Look(params) => format!("ルック {}", look_preset_label(params.preset)),
+        LocalEffect::CubeLut(params) => {
+            if params.is_loaded() {
+                format!("3D LUT {}", params.name)
+            } else {
+                "3D LUT 未読込".to_string()
+            }
+        }
         LocalEffect::GradientMap(params) => {
             format!(
                 "グラデーション {}",
@@ -6499,12 +6645,19 @@ fn draw_channel_coeff_sliders(ui: &mut egui::Ui, coeffs: &mut [f32; 3]) -> bool 
     changed
 }
 
+#[derive(Debug, Default)]
+struct EffectParamResponse {
+    changed: bool,
+    load_cube_lut: bool,
+}
+
 fn draw_effect_params(
     ui: &mut egui::Ui,
     layer: &mut LocalAdjustmentLayer,
     image_dims: (usize, usize),
-) -> bool {
+) -> EffectParamResponse {
     let mut changed = false;
+    let mut load_cube_lut = false;
     let effect_kind = EffectKind::from_effect(&layer.effect);
     let has_effect = !matches!(&layer.effect, LocalEffect::None);
     ui.horizontal(|ui| {
@@ -6524,7 +6677,10 @@ fn draw_effect_params(
         }
     });
     if changed {
-        return true;
+        return EffectParamResponse {
+            changed,
+            load_cube_lut,
+        };
     }
     match &mut layer.effect {
         LocalEffect::None => {
@@ -7689,6 +7845,27 @@ fn draw_effect_params(
                 .add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"))
                 .changed();
         }
+        LocalEffect::CubeLut(params) => {
+            ui.label(egui::RichText::new("LUTファイル").color(Color32::from_gray(190)));
+            if params.is_loaded() {
+                ui.label(format!("読み込み済み: {} ({}^3)", params.name, params.size));
+            } else {
+                ui.label("未読み込みです。`.cube` ファイルを選択してください。");
+            }
+            if ui.button("LUTファイルを選択").clicked() {
+                load_cube_lut = true;
+            }
+            ui.label(
+                egui::RichText::new(
+                    "3D LUT は RGB の組み合わせごとに色を変換する外部カラープリセットです。読み込んだ LUT データは設定ファイルにも保存されます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から LUT 変換後の色へどれだけ近づけるかです。");
+        }
         LocalEffect::GradientMap(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -8064,7 +8241,10 @@ fn draw_effect_params(
                 .changed();
         }
     }
-    changed
+    EffectParamResponse {
+        changed,
+        load_cube_lut,
+    }
 }
 
 fn layer_with_mask(
@@ -9270,6 +9450,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Hsl => LocalEffect::Hsl(HslParams::default()),
         EffectKind::ColorMixer => LocalEffect::ColorMixer(ColorMixerParams::default()),
         EffectKind::Look => LocalEffect::Look(LookParams::default()),
+        EffectKind::CubeLut => LocalEffect::CubeLut(CubeLutParams::default()),
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),

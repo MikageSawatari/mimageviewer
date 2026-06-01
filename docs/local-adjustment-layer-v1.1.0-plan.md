@@ -886,9 +886,13 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   に残す
 - 効果: Tone (自然な彩度を含む) / Tone Curve / RGB Curve / Color Balance /
   3-way Color Grading / Selective Color / Channel Mixer / Color Mixer / Clarity / Highlights-Shadows /
-  Blur / Soft Focus / Mosaic / Sharpen / HSL / Dehaze / Look / Gradient Map / Bloom /
+  Blur / Soft Focus / Mosaic / Sharpen / HSL / Dehaze / Look / 3D LUT / Gradient Map / Bloom /
   Vignette / Film Grain / Chromatic Aberration / Halftone / Cross-Star Glow /
   Edge-preserving Smooth
+- 3D LUT は `.cube` の `LUT_3D_SIZE` / `DOMAIN_MIN` / `DOMAIN_MAX` / `LUT_3D_INPUT_RANGE` を読み取り、RGB 3D table
+  をレイヤー設定に保持する。ファイル読み込みは worker thread で行い、UI スレッドでは重い I/O
+  をしない。設定保存時は LUT データも含まれるため、外部 LUT ファイルが移動しても効果は再現できるが、
+  大きな LUT では sidecar が大きくなる点に注意する
 - 加工内容はプルダウンではなく、左パネルの現在効果表示 + `効果選択` ボタンで扱う。
   `効果選択` はグループ別のダイアログを開き、効果ボタンのホバーで説明を表示する。
   フィルタ数が増えても選びやすくするため、詳細方針は [local-adjust-filter-candidates.md](local-adjust-filter-candidates.md)

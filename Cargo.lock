@@ -3484,6 +3484,7 @@ dependencies = [
  "local-adjust-core",
  "ndarray",
  "ort",
+ "rfd",
  "serde",
  "serde_json",
 ]

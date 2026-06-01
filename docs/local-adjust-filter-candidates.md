@@ -47,11 +47,11 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、25種)
+### `LocalEffect` (部分補正レイヤー、26種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
-Hsl(単一・全体), ColorMixer(8色帯),
+Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT),
 HighlightsShadows, Clarity, Dehaze, Blur(box), SoftFocus, Mosaic, Sharpen, Look(15プリセット),
 GradientMap, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth
 
@@ -75,7 +75,7 @@ OilPaint(Kuwahara) / Sketch(Sobel) / LightLeak / 減色8機種 / CRT 3種＋複�
 - [x] **3-way カラーグレーディング (カラーホイール)** ★ **中** — 上位版。Lightroom Color Grading / DaVinci 風
 - [x] **セレクティブカラー / ポイントカラー** ★ **易〜中** — 特定色を選んでその色だけ調整 (Lightroom / PS)
 - [x] **チャンネルミキサー / 本格白黒変換 (色別の明度寄与)** ★ **易** — モノクロ化を色ごとに制御 (PS / Krita)
-- [ ] **3D LUT (.cube) 読み込み** ★ **中** (infra は軽い) — 外部シネマ LUT を取り込み (PS Color Lookup)
+- [x] **3D LUT (.cube) 読み込み** ★ **中** (infra は軽い) — 外部シネマ LUT を取り込み (PS Color Lookup)
 - [ ] **ポスタリゼーション (階調数指定)** ★ **易** — フラット/グラフィック調。減色フィルタとは別物 (PS / CSP / Krita)
 - [ ] **2値化 (しきい値)** ★ **易** — 線画・モノクロ化 (manga) (PS / CSP / Krita)
 - [ ] **階調反転 / ネガ** **易** — 反転。local に無い (全ソフト)
