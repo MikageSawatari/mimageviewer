@@ -22,8 +22,8 @@ use local_adjust_core::{
     ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode, PosterizeParams,
     RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
     RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams,
-    StarGlowParams, ThreeWayColorGradingParams, ToneCurveParams, ToneParams, VignetteParams,
-    apply_layers, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    StarGlowParams, ThreeWayColorGradingParams, ThresholdParams, ToneCurveParams, ToneParams,
+    VignetteParams, apply_layers, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -945,6 +945,7 @@ enum EffectKind {
     Look,
     CubeLut,
     Posterize,
+    Threshold,
     GradientMap,
     Bloom,
     Vignette,
@@ -978,6 +979,7 @@ impl EffectKind {
             LocalEffect::Look(_) => Self::Look,
             LocalEffect::CubeLut(_) => Self::CubeLut,
             LocalEffect::Posterize(_) => Self::Posterize,
+            LocalEffect::Threshold(_) => Self::Threshold,
             LocalEffect::GradientMap(_) => Self::GradientMap,
             LocalEffect::Bloom(_) => Self::Bloom,
             LocalEffect::Vignette(_) => Self::Vignette,
@@ -1011,6 +1013,7 @@ impl EffectKind {
             Self::Look => "ルック",
             Self::CubeLut => "3D LUT",
             Self::Posterize => "ポスタリゼーション",
+            Self::Threshold => "2値化",
             Self::GradientMap => "グラデーションマップ",
             Self::Bloom => "ブルーム",
             Self::Vignette => "ビネット",
@@ -1048,6 +1051,7 @@ impl EffectKind {
                 ".cube 形式の外部3D LUTを読み込み、配布LUTや映画風の色味を適用します。"
             }
             Self::Posterize => "色の階調数を減らし、フラットでグラフィックな見た目にします。",
+            Self::Threshold => "明るさをしきい値で黒と白に分け、線画やモノクロ風にします。",
             Self::GradientMap => {
                 "明るさを指定したグラデーションの色へ置き換え、色設計や色トレス風に使います。"
             }
@@ -1089,6 +1093,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Look,
             EffectKind::CubeLut,
             EffectKind::Posterize,
+            EffectKind::Threshold,
             EffectKind::GradientMap,
         ],
     },
@@ -6376,6 +6381,10 @@ fn effect_summary(effect: &LocalEffect) -> String {
             }
         }
         LocalEffect::Posterize(params) => format!("ポスタリゼーション {}段", params.levels),
+        LocalEffect::Threshold(params) => {
+            let suffix = if params.invert { " 反転" } else { "" };
+            format!("2値化 {:.0}%{suffix}", params.threshold * 100.0)
+        }
         LocalEffect::GradientMap(params) => {
             format!(
                 "グラデーション {}",
@@ -7917,6 +7926,62 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から階調を減らした色へどれだけ近づけるかです。");
+        }
+        LocalEffect::Threshold(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "標準") {
+                    *params = ThresholdParams {
+                        threshold: 0.50,
+                        invert: false,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "明るめ") {
+                    *params = ThresholdParams {
+                        threshold: 0.40,
+                        invert: false,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "暗め") {
+                    *params = ThresholdParams {
+                        threshold: 0.62,
+                        invert: false,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "反転") {
+                    *params = ThresholdParams {
+                        threshold: 0.50,
+                        invert: true,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "輝度がしきい値以上なら白、それ未満なら黒にします。線画確認やモノクロ風の加工に使えます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let threshold =
+                ui.add(egui::Slider::new(&mut params.threshold, 0.0..=1.0).text("しきい値"));
+            changed |= threshold.changed();
+            threshold.lab_hover_tip(
+                "白にする明るさの境目です。値を大きくすると、より明るい部分だけが白になります。",
+            );
+            let invert = ui.checkbox(&mut params.invert, "反転");
+            changed |= invert.changed();
+            invert.lab_hover_tip("黒と白を入れ替えます。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から黒白化した結果へどれだけ近づけるかです。");
         }
         LocalEffect::GradientMap(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -9504,6 +9569,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Look => LocalEffect::Look(LookParams::default()),
         EffectKind::CubeLut => LocalEffect::CubeLut(CubeLutParams::default()),
         EffectKind::Posterize => LocalEffect::Posterize(PosterizeParams::default()),
+        EffectKind::Threshold => LocalEffect::Threshold(ThresholdParams::default()),
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),

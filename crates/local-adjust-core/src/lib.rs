@@ -420,6 +420,7 @@ pub enum LocalEffect {
     Look(LookParams),
     CubeLut(CubeLutParams),
     Posterize(PosterizeParams),
+    Threshold(ThresholdParams),
     GradientMap(GradientMapParams),
     Bloom(BloomParams),
     Vignette(VignetteParams),
@@ -961,6 +962,23 @@ impl Default for PosterizeParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ThresholdParams {
+    pub threshold: f32,
+    pub invert: bool,
+    pub strength: f32,
+}
+
+impl Default for ThresholdParams {
+    fn default() -> Self {
+        Self {
+            threshold: 0.5,
+            invert: false,
+            strength: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GradientMapPreset {
     None,
@@ -1252,6 +1270,7 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         LocalEffect::Look(params) => apply_look(&image.pixels, *params),
         LocalEffect::CubeLut(params) => apply_cube_lut(&image.pixels, params),
         LocalEffect::Posterize(params) => apply_posterize(&image.pixels, *params),
+        LocalEffect::Threshold(params) => apply_threshold(&image.pixels, *params),
         LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
         LocalEffect::Bloom(params) => {
             apply_bloom(&image.pixels, image.width, image.height, *params)
@@ -2594,6 +2613,34 @@ fn apply_posterize(src: &[u8], params: PosterizeParams) -> Vec<u8> {
     out
 }
 
+fn apply_threshold(src: &[u8], params: ThresholdParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let threshold = params.threshold.clamp(0.0, 1.0);
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let rgb = [
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        ];
+        let mut target = if luma01(rgb[0], rgb[1], rgb[2]) >= threshold {
+            1.0
+        } else {
+            0.0
+        };
+        if params.invert {
+            target = 1.0 - target;
+        }
+        px[0] = to_u8(lerp_f32(rgb[0], target, strength));
+        px[1] = to_u8(lerp_f32(rgb[1], target, strength));
+        px[2] = to_u8(lerp_f32(rgb[2], target, strength));
+    }
+    out
+}
+
 fn apply_gradient_map(src: &[u8], params: GradientMapParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 1.0);
     if params.preset == GradientMapPreset::None || strength <= f32::EPSILON {
@@ -3542,6 +3589,7 @@ mod tests {
             LocalEffect::Look(LookParams::default()),
             LocalEffect::CubeLut(CubeLutParams::default()),
             LocalEffect::Posterize(PosterizeParams::default()),
+            LocalEffect::Threshold(ThresholdParams::default()),
             LocalEffect::GradientMap(GradientMapParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
@@ -3995,6 +4043,39 @@ LUT_3D_SIZE 2
         );
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(out.pixels, vec![85, 170, 255, 255]);
+    }
+
+    #[test]
+    fn threshold_binarizes_by_luma() {
+        let src = RgbaImageBuf::new(2, 1, vec![40, 40, 40, 255, 220, 220, 220, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "threshold",
+            LocalMask::Full,
+            LocalEffect::Threshold(ThresholdParams {
+                threshold: 0.5,
+                invert: false,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(&out.pixels[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&out.pixels[4..8], &[255, 255, 255, 255]);
+    }
+
+    #[test]
+    fn threshold_can_invert_output() {
+        let src = RgbaImageBuf::new(1, 1, vec![220, 220, 220, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "threshold",
+            LocalMask::Full,
+            LocalEffect::Threshold(ThresholdParams {
+                threshold: 0.5,
+                invert: true,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, vec![0, 0, 0, 255]);
     }
 
     #[test]
