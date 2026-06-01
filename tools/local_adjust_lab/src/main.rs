@@ -19,7 +19,7 @@ use local_adjust_core::{
     CubeLutParams, DehazeParams, EdgeSmoothParams, FilmGrainParams, GradientMapParams,
     GradientMapPreset, HalftoneParams, HighlightsShadowsParams, HslParams, LineKind,
     LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
-    ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode,
+    ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams, MosaicTileMode, PosterizeParams,
     RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams,
     RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams,
     StarGlowParams, ThreeWayColorGradingParams, ToneCurveParams, ToneParams, VignetteParams,
@@ -944,6 +944,7 @@ enum EffectKind {
     ColorMixer,
     Look,
     CubeLut,
+    Posterize,
     GradientMap,
     Bloom,
     Vignette,
@@ -976,6 +977,7 @@ impl EffectKind {
             LocalEffect::ColorMixer(_) => Self::ColorMixer,
             LocalEffect::Look(_) => Self::Look,
             LocalEffect::CubeLut(_) => Self::CubeLut,
+            LocalEffect::Posterize(_) => Self::Posterize,
             LocalEffect::GradientMap(_) => Self::GradientMap,
             LocalEffect::Bloom(_) => Self::Bloom,
             LocalEffect::Vignette(_) => Self::Vignette,
@@ -1008,6 +1010,7 @@ impl EffectKind {
             Self::ColorMixer => "カラーミキサー",
             Self::Look => "ルック",
             Self::CubeLut => "3D LUT",
+            Self::Posterize => "ポスタリゼーション",
             Self::GradientMap => "グラデーションマップ",
             Self::Bloom => "ブルーム",
             Self::Vignette => "ビネット",
@@ -1044,6 +1047,7 @@ impl EffectKind {
             Self::CubeLut => {
                 ".cube 形式の外部3D LUTを読み込み、配布LUTや映画風の色味を適用します。"
             }
+            Self::Posterize => "色の階調数を減らし、フラットでグラフィックな見た目にします。",
             Self::GradientMap => {
                 "明るさを指定したグラデーションの色へ置き換え、色設計や色トレス風に使います。"
             }
@@ -1084,6 +1088,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Dehaze,
             EffectKind::Look,
             EffectKind::CubeLut,
+            EffectKind::Posterize,
             EffectKind::GradientMap,
         ],
     },
@@ -6370,6 +6375,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 "3D LUT 未読込".to_string()
             }
         }
+        LocalEffect::Posterize(params) => format!("ポスタリゼーション {}段", params.levels),
         LocalEffect::GradientMap(params) => {
             format!(
                 "グラデーション {}",
@@ -7865,6 +7871,52 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像から LUT 変換後の色へどれだけ近づけるかです。");
+        }
+        LocalEffect::Posterize(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "弱 16段") {
+                    *params = PosterizeParams {
+                        levels: 16,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "中 8段") {
+                    *params = PosterizeParams {
+                        levels: 8,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強 5段") {
+                    *params = PosterizeParams {
+                        levels: 5,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "超強 3段") {
+                    *params = PosterizeParams {
+                        levels: 3,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "RGB各チャンネルの階調を指定段数へ丸めます。色数を減らしたポスター調やレトロ調に使います。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let levels = ui.add(egui::Slider::new(&mut params.levels, 2..=256).text("階調数"));
+            changed |= levels.changed();
+            levels.lab_hover_tip("値を小さくすると、使われる明るさの段数が減ってフラットになります。256でほぼ無加工です。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から階調を減らした色へどれだけ近づけるかです。");
         }
         LocalEffect::GradientMap(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -9451,6 +9503,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ColorMixer => LocalEffect::ColorMixer(ColorMixerParams::default()),
         EffectKind::Look => LocalEffect::Look(LookParams::default()),
         EffectKind::CubeLut => LocalEffect::CubeLut(CubeLutParams::default()),
+        EffectKind::Posterize => LocalEffect::Posterize(PosterizeParams::default()),
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),

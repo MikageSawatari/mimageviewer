@@ -419,6 +419,7 @@ pub enum LocalEffect {
     ColorMixer(ColorMixerParams),
     Look(LookParams),
     CubeLut(CubeLutParams),
+    Posterize(PosterizeParams),
     GradientMap(GradientMapParams),
     Bloom(BloomParams),
     Vignette(VignetteParams),
@@ -945,6 +946,21 @@ impl CubeLutParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PosterizeParams {
+    pub levels: usize,
+    pub strength: f32,
+}
+
+impl Default for PosterizeParams {
+    fn default() -> Self {
+        Self {
+            levels: 256,
+            strength: 1.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GradientMapPreset {
     None,
@@ -1235,6 +1251,7 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         LocalEffect::ColorMixer(params) => apply_color_mixer(&image.pixels, *params),
         LocalEffect::Look(params) => apply_look(&image.pixels, *params),
         LocalEffect::CubeLut(params) => apply_cube_lut(&image.pixels, params),
+        LocalEffect::Posterize(params) => apply_posterize(&image.pixels, *params),
         LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
         LocalEffect::Bloom(params) => {
             apply_bloom(&image.pixels, image.width, image.height, *params)
@@ -2559,6 +2576,24 @@ fn parse_cube_pair<'a>(
     Ok(values)
 }
 
+fn apply_posterize(src: &[u8], params: PosterizeParams) -> Vec<u8> {
+    let levels = params.levels.clamp(2, 256);
+    let strength = params.strength.clamp(0.0, 1.0);
+    if levels >= 256 || strength <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let max_level = (levels - 1) as f32;
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        for channel in &mut px[0..3] {
+            let original = *channel as f32 / 255.0;
+            let quantized = (original * max_level).round() / max_level;
+            *channel = to_u8(lerp_f32(original, quantized, strength));
+        }
+    }
+    out
+}
+
 fn apply_gradient_map(src: &[u8], params: GradientMapParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 1.0);
     if params.preset == GradientMapPreset::None || strength <= f32::EPSILON {
@@ -3506,6 +3541,7 @@ mod tests {
             LocalEffect::ColorMixer(ColorMixerParams::default()),
             LocalEffect::Look(LookParams::default()),
             LocalEffect::CubeLut(CubeLutParams::default()),
+            LocalEffect::Posterize(PosterizeParams::default()),
             LocalEffect::GradientMap(GradientMapParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
@@ -3944,6 +3980,21 @@ LUT_3D_SIZE 2
         assert!((126..=128).contains(&out.pixels[1]));
         assert_eq!(out.pixels[2], 0);
         assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn posterize_quantizes_each_rgb_channel() {
+        let src = RgbaImageBuf::new(1, 1, vec![64, 128, 255, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "posterize",
+            LocalMask::Full,
+            LocalEffect::Posterize(PosterizeParams {
+                levels: 4,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, vec![85, 170, 255, 255]);
     }
 
     #[test]
