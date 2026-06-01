@@ -1,22 +1,28 @@
 use std::collections::{BTreeSet, VecDeque};
+use std::fs::OpenOptions;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, mpsc};
 use std::time::{Duration, Instant};
-use std::{fs::OpenOptions, io::Write};
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use eframe::egui::{
     self, Color32, ColorImage, ComboBox, Key, Pos2, Rect, Sense, TextureHandle, TextureOptions,
 };
+use flate2::Compression;
+use flate2::read::DeflateDecoder;
+use flate2::write::DeflateEncoder;
 use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     BloomParams, BlurParams, ChromaticAberrationParams, ClarityParams, ColorRangeMask,
     DehazeParams, EdgeSmoothParams, FilmGrainParams, HalftoneParams, HighlightsShadowsParams,
     HslParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
-    LookParams, LookPreset, MaskShape, MosaicParams, RadialGradientMask, RangeMask, RasterMask,
-    RasterVectorMask, RegionMask, RgbaImageBuf, RgbaImageRef, ShapeOp, SharpenParams,
-    SoftFocusParams, StarGlowParams, ToneCurveParams, ToneParams, VignetteParams, apply_layers,
-    evaluate_layer_mask,
+    LookParams, LookPreset, ManualMaskOverride, MaskShape, MosaicParams, RadialGradientMask,
+    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbaImageBuf, RgbaImageRef, ShapeOp,
+    SharpenParams, SoftFocusParams, StarGlowParams, ToneCurveParams, ToneParams, VignetteParams,
+    apply_layers, evaluate_layer_mask,
 };
+use serde::{Deserialize, Serialize};
 
 const PANEL_W: f32 = 340.0;
 const TOOL_PANEL_W: f32 = 300.0;
@@ -169,6 +175,81 @@ enum GeneratedMask {
     Regions(RegionMask),
 }
 
+const LAB_SIDECAR_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct LabSidecar {
+    version: u32,
+    image_file: String,
+    image_width: usize,
+    image_height: usize,
+    #[serde(default)]
+    crop_enabled: bool,
+    #[serde(default)]
+    crop_overlay: bool,
+    #[serde(default)]
+    crop_rect: Option<CropRect>,
+    layers: Vec<StoredLayer>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredLayer {
+    name: String,
+    enabled: bool,
+    opacity: f32,
+    mask: StoredMask,
+    #[serde(default)]
+    manual_override: StoredManualOverride,
+    mask_inverted: bool,
+    mask_expand_px: f32,
+    mask_feather_px: f32,
+    effect: LocalEffect,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+enum StoredMask {
+    Full,
+    Raster(StoredRasterVectorMask),
+    LinearGradient(LinearGradientMask),
+    RadialGradient(RadialGradientMask),
+    LumaRange(RangeMask),
+    ColorRange(ColorRangeMask),
+    Subject(StoredSoftMask),
+    Segmentation(StoredRegionMask),
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct StoredManualOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    add: Option<StoredRasterVectorMask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subtract: Option<StoredRasterVectorMask>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredRasterVectorMask {
+    width: usize,
+    height: usize,
+    bitmap_1bit_deflate_b64: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    shapes: Vec<MaskShape>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredSoftMask {
+    width: usize,
+    height: usize,
+    alpha_u8_deflate_b64: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredRegionMask {
+    width: usize,
+    height: usize,
+    labels_u32le_deflate_b64: String,
+    selected: Vec<bool>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MaskDirtyRect {
     min_x: usize,
@@ -259,7 +340,7 @@ struct EdgeMaskKey {
     gap_px: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 struct CropRect {
     min_x: f32,
     min_y: f32,
@@ -350,6 +431,21 @@ struct ShapeDrag {
 enum BitmapMaskOp {
     Expand,
     Shrink,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverrideEditTarget {
+    Add,
+    Subtract,
+}
+
+impl OverrideEditTarget {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Add => "追加補正",
+            Self::Subtract => "削除補正",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -499,6 +595,7 @@ struct LocalAdjustLabApp {
     last_mask_preview_update: Instant,
     tool: MaskTool,
     paint_mode: bool,
+    override_edit_target: OverrideEditTarget,
     brush_radius: f32,
     gap_fill_distance: f32,
     edge_brush_include_boundary: bool,
@@ -569,6 +666,7 @@ impl LocalAdjustLabApp {
             last_mask_preview_update: Instant::now(),
             tool: MaskTool::Brush,
             paint_mode: true,
+            override_edit_target: OverrideEditTarget::Add,
             brush_radius: 36.0,
             gap_fill_distance: 10.0,
             edge_brush_include_boundary: false,
@@ -652,9 +750,17 @@ impl LocalAdjustLabApp {
                 self.crop_drag = None;
                 self.prev_paint_pos = None;
                 self.last_paint_pos = None;
+                self.override_edit_target = OverrideEditTarget::Add;
                 self.radial_gradient_drag_active = false;
                 self.edge_brush_seed = None;
-                self.status = format!("読み込み: {}", path.display());
+                let load_status = format!("読み込み: {}", path.display());
+                self.status = load_status.clone();
+                let sidecar_path = sidecar_path_for_image(path);
+                match self.load_settings_sidecar_from_path(&sidecar_path) {
+                    Ok(true) => {}
+                    Ok(false) => self.status = load_status,
+                    Err(e) => self.status = format!("{load_status} / 設定読込失敗: {e}"),
+                }
                 self.mark_dirty();
             }
             Err(e) => {
@@ -769,7 +875,7 @@ impl LocalAdjustLabApp {
             return false;
         };
         self.push_undo_snapshot();
-        if let Some(mask) = self.selected_raster_vector_mask_mut()
+        if let Some(mask) = self.selected_edit_raster_vector_mask_mut()
             && let Some(slot) = mask.shapes.get_mut(shape_idx)
         {
             *slot = f(*slot);
@@ -931,6 +1037,11 @@ impl LocalAdjustLabApp {
         self.layers.push(layer);
         self.selected_layer = self.layers.len().saturating_sub(1);
         self.selected_shape = None;
+        self.tool = if mask_kind == MaskKind::Raster {
+            MaskTool::Brush
+        } else {
+            MaskTool::Select
+        };
         self.add_layer_mask_kind = mask_kind;
         self.add_layer_dialog_open = false;
         self.mark_dirty();
@@ -950,33 +1061,6 @@ impl LocalAdjustLabApp {
         self.mark_dirty();
     }
 
-    fn convert_selected_mask_to_manual(&mut self) {
-        let manual_mask = {
-            let Some(image) = self.image.as_ref() else {
-                self.status = "画像を読み込んでください。".to_string();
-                return;
-            };
-            let Some(layer) = self.selected_layer_ref() else {
-                return;
-            };
-            match manual_mask_from_layer(image.source.as_ref(), layer) {
-                Ok(mask) => mask,
-                Err(e) => {
-                    self.status = format!("手動マスク化に失敗しました: {e}");
-                    return;
-                }
-            }
-        };
-
-        self.push_undo_snapshot();
-        if let Some(layer) = self.selected_layer_mut() {
-            layer.mask = LocalMask::RasterVector(manual_mask);
-        }
-        self.selected_shape = None;
-        self.status = "現在のマスクを手動マスクへ変換しました。".to_string();
-        self.mark_dirty();
-    }
-
     fn copy_mask_from_layer(&mut self, source_idx: usize) {
         if source_idx == self.selected_layer || source_idx >= self.layers.len() {
             return;
@@ -990,6 +1074,22 @@ impl LocalAdjustLabApp {
         }
         self.selected_shape = None;
         self.status = format!("レイヤー {} からマスクをコピーしました。", source_idx + 1);
+        self.mark_dirty();
+    }
+
+    fn clear_selected_manual_override(&mut self) {
+        let Some(layer) = self.selected_layer_ref() else {
+            return;
+        };
+        if layer.manual_override.is_empty() {
+            return;
+        }
+        self.push_undo_snapshot();
+        if let Some(layer) = self.selected_layer_mut() {
+            layer.manual_override = ManualMaskOverride::default();
+        }
+        self.selected_shape = None;
+        self.status = "追加/削除の手動補正をクリアしました。".to_string();
         self.mark_dirty();
     }
 
@@ -1023,8 +1123,21 @@ impl LocalAdjustLabApp {
     fn selected_raster_vector_mask_mut(&mut self) -> Option<&mut RasterVectorMask> {
         let (w, h) = self.image_dims()?;
         let layer = self.selected_layer_mut()?;
-        if !matches!(layer.mask, LocalMask::RasterVector(_)) {
-            layer.mask = LocalMask::RasterVector(RasterVectorMask::empty(w, h));
+        if matches!(layer.mask, LocalMask::Raster(_)) {
+            let old_mask = std::mem::replace(&mut layer.mask, LocalMask::Full);
+            if let LocalMask::Raster(mask) = old_mask {
+                let alpha = if mask.width == w && mask.height == h && mask.alpha.len() == w * h {
+                    mask.alpha
+                } else {
+                    vec![0.0; w.saturating_mul(h)]
+                };
+                layer.mask = LocalMask::RasterVector(RasterVectorMask {
+                    width: w,
+                    height: h,
+                    alpha,
+                    shapes: Vec::new(),
+                });
+            }
         }
         match &mut layer.mask {
             LocalMask::RasterVector(mask) => {
@@ -1041,6 +1154,42 @@ impl LocalAdjustLabApp {
         match &self.selected_layer_ref()?.mask {
             LocalMask::RasterVector(mask) => Some(mask),
             _ => None,
+        }
+    }
+
+    fn selected_edit_raster_vector_mask_mut(&mut self) -> Option<&mut RasterVectorMask> {
+        let selected_is_manual = self
+            .selected_layer_ref()
+            .map(|layer| MaskKind::from_mask(&layer.mask) == MaskKind::Raster)
+            .unwrap_or(false);
+        if selected_is_manual {
+            return self.selected_raster_vector_mask_mut();
+        }
+        let (w, h) = self.image_dims()?;
+        let target = self.override_edit_target;
+        let layer = self.selected_layer_mut()?;
+        let slot = match target {
+            OverrideEditTarget::Add => &mut layer.manual_override.add,
+            OverrideEditTarget::Subtract => &mut layer.manual_override.subtract,
+        };
+        let needs_reset = slot
+            .as_ref()
+            .map(|mask| mask.width != w || mask.height != h || mask.alpha.len() != w * h)
+            .unwrap_or(true);
+        if needs_reset {
+            *slot = Some(RasterVectorMask::empty(w, h));
+        }
+        slot.as_mut()
+    }
+
+    fn selected_edit_raster_vector_mask_ref(&self) -> Option<&RasterVectorMask> {
+        let layer = self.selected_layer_ref()?;
+        if MaskKind::from_mask(&layer.mask) == MaskKind::Raster {
+            return self.selected_raster_vector_mask_ref();
+        }
+        match self.override_edit_target {
+            OverrideEditTarget::Add => layer.manual_override.add.as_ref(),
+            OverrideEditTarget::Subtract => layer.manual_override.subtract.as_ref(),
         }
     }
 
@@ -1525,6 +1674,113 @@ impl LocalAdjustLabApp {
         }
     }
 
+    fn save_settings_sidecar(&mut self) {
+        let Some(image) = &self.image else {
+            self.status = "画像を読み込んでください。".to_string();
+            return;
+        };
+        let sidecar = match self.build_sidecar(image) {
+            Ok(sidecar) => sidecar,
+            Err(e) => {
+                self.status = format!("設定保存の準備に失敗: {e}");
+                return;
+            }
+        };
+        let path = sidecar_path_for_image(&image.path);
+        let json = match serde_json::to_string_pretty(&sidecar) {
+            Ok(json) => json,
+            Err(e) => {
+                self.status = format!("設定JSON作成失敗: {e}");
+                return;
+            }
+        };
+        match std::fs::write(&path, json) {
+            Ok(()) => self.status = format!("設定を保存しました: {}", path.display()),
+            Err(e) => self.status = format!("設定保存失敗: {e}"),
+        }
+    }
+
+    fn build_sidecar(&self, image: &LoadedImage) -> Result<LabSidecar, String> {
+        let layers = self
+            .layers
+            .iter()
+            .map(stored_layer_from_local)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(LabSidecar {
+            version: LAB_SIDECAR_VERSION,
+            image_file: image
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("")
+                .to_string(),
+            image_width: image.source.width,
+            image_height: image.source.height,
+            crop_enabled: self.crop_enabled,
+            crop_overlay: self.crop_overlay,
+            crop_rect: self.crop_rect,
+            layers,
+        })
+    }
+
+    fn load_settings_sidecar_for_current_image(&mut self) -> bool {
+        let Some(image) = &self.image else {
+            self.status = "画像を読み込んでください。".to_string();
+            return false;
+        };
+        let path = sidecar_path_for_image(&image.path);
+        match self.load_settings_sidecar_from_path(&path) {
+            Ok(true) => true,
+            Ok(false) => {
+                self.status = format!("設定ファイルはありません: {}", path.display());
+                false
+            }
+            Err(e) => {
+                self.status = format!("設定読込失敗: {e}");
+                false
+            }
+        }
+    }
+
+    fn load_settings_sidecar_from_path(&mut self, path: &Path) -> Result<bool, String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.to_string()),
+        };
+        let sidecar: LabSidecar = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        if sidecar.version != LAB_SIDECAR_VERSION {
+            return Err(format!("未対応の .miv version: {}", sidecar.version));
+        }
+        let Some((w, h)) = self.image_dims() else {
+            return Err("画像が読み込まれていません。".to_string());
+        };
+        if sidecar.image_width != w || sidecar.image_height != h {
+            return Err(format!(
+                "画像サイズが一致しません: sidecar={}x{}, image={}x{}",
+                sidecar.image_width, sidecar.image_height, w, h
+            ));
+        }
+        let layers = sidecar
+            .layers
+            .iter()
+            .map(local_layer_from_stored)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.layers = layers;
+        self.selected_layer = self.selected_layer.min(self.layers.len().saturating_sub(1));
+        self.selected_shape = None;
+        self.shape_drag = None;
+        self.crop_enabled = sidecar.crop_enabled;
+        self.crop_overlay = sidecar.crop_overlay;
+        self.crop_rect = sidecar.crop_rect.map(|crop| crop.sanitized(w, h));
+        self.crop_drag = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.status = format!("設定を読み込みました: {}", path.display());
+        self.mark_dirty();
+        Ok(true)
+    }
+
     fn brush_stroke_points(&mut self, p: Pos2) -> Vec<Pos2> {
         let spacing = (self.brush_radius.max(1.0) * BRUSH_STROKE_SPACING_RATIO)
             .clamp(BRUSH_STROKE_MIN_SPACING, BRUSH_STROKE_MAX_SPACING);
@@ -1561,7 +1817,7 @@ impl LocalAdjustLabApp {
             return false;
         };
         let radius = self.brush_radius.max(1.0);
-        let Some(mask) = self.selected_raster_vector_mask_mut() else {
+        let Some(mask) = self.selected_edit_raster_vector_mask_mut() else {
             return false;
         };
         let alpha = &mut mask.alpha;
@@ -1694,7 +1950,7 @@ impl LocalAdjustLabApp {
         }
 
         let mut changed = false;
-        if let Some(mask) = self.selected_raster_vector_mask_mut() {
+        if let Some(mask) = self.selected_edit_raster_vector_mask_mut() {
             for idx in targets {
                 if idx >= mask.alpha.len() {
                     continue;
@@ -1726,7 +1982,7 @@ impl LocalAdjustLabApp {
         let max_y = (p.y + radius).ceil().min(h as f32 - 1.0) as usize;
         let r2 = radius * radius;
 
-        let Some(mask) = self.selected_raster_vector_mask_mut() else {
+        let Some(mask) = self.selected_edit_raster_vector_mask_mut() else {
             return false;
         };
         let src = mask.alpha.clone();
@@ -1812,7 +2068,7 @@ impl LocalAdjustLabApp {
             return;
         };
         self.push_undo_snapshot();
-        if let Some(mask) = self.selected_raster_vector_mask_mut() {
+        if let Some(mask) = self.selected_edit_raster_vector_mask_mut() {
             mask.alpha = match op {
                 BitmapMaskOp::Expand => dilate_alpha(&mask.alpha, w, h),
                 BitmapMaskOp::Shrink => erode_alpha(&mask.alpha, w, h),
@@ -1823,10 +2079,6 @@ impl LocalAdjustLabApp {
 
     fn edge_overlay_enabled(&self) -> bool {
         matches!(self.tool, MaskTool::EdgeBrush | MaskTool::Polygon)
-            && self
-                .selected_layer_ref()
-                .map(|layer| MaskKind::from_mask(&layer.mask))
-                == Some(MaskKind::Raster)
     }
 
     fn current_edge_mask_key(&self) -> Option<EdgeMaskKey> {
@@ -1908,7 +2160,7 @@ impl LocalAdjustLabApp {
         let points = std::mem::take(&mut self.lasso_points);
         let add = self.paint_mode;
         let brush_alpha = 1.0;
-        if let Some(mask) = self.selected_raster_vector_mask_mut() {
+        if let Some(mask) = self.selected_edit_raster_vector_mask_mut() {
             fill_polygon_alpha(
                 &mut mask.alpha,
                 mask.width,
@@ -1924,7 +2176,7 @@ impl LocalAdjustLabApp {
     fn commit_shape(&mut self, shape: MaskShape) {
         self.push_undo_snapshot();
         let add = self.paint_mode;
-        if let Some(mask) = self.selected_raster_vector_mask_mut() {
+        if let Some(mask) = self.selected_edit_raster_vector_mask_mut() {
             mask.shapes
                 .push(shape.with_op(if add { ShapeOp::Add } else { ShapeOp::Subtract }));
             self.selected_shape = Some(mask.shapes.len() - 1);
@@ -2047,13 +2299,8 @@ impl LocalAdjustLabApp {
         }
 
         ui.separator();
-        let selected_mask_kind = self
-            .selected_layer_ref()
-            .map(|layer| MaskKind::from_mask(&layer.mask));
-        if selected_mask_kind == Some(MaskKind::Raster) {
-            self.draw_manual_tool_selector(ui, btn_size);
-            ui.separator();
-        }
+        self.draw_manual_tool_selector(ui, btn_size);
+        ui.separator();
         if ui
             .add_sized(
                 egui::vec2(btn_w * 2.0 + 4.0, 24.0),
@@ -2074,6 +2321,23 @@ impl LocalAdjustLabApp {
         {
             self.save_result();
         }
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if ui
+                .add_sized(btn_size, egui::Button::new("設定保存"))
+                .on_hover_text("画像ファイル名に .miv を付けたサイドカーファイルへ保存します。")
+                .clicked()
+            {
+                self.save_settings_sidecar();
+            }
+            if ui
+                .add_sized(btn_size, egui::Button::new("設定読込"))
+                .on_hover_text("画像横の .miv サイドカーファイルからレイヤー設定を読み込みます。")
+                .clicked()
+            {
+                self.load_settings_sidecar_for_current_image();
+            }
+        });
         ui.add(
             egui::Label::new(
                 egui::RichText::new(
@@ -2189,6 +2453,58 @@ impl LocalAdjustLabApp {
     }
 
     fn draw_manual_tool_selector(&mut self, ui: &mut egui::Ui, btn_size: egui::Vec2) {
+        let mask_kind = self
+            .selected_layer_ref()
+            .map(|layer| MaskKind::from_mask(&layer.mask))
+            .unwrap_or(MaskKind::Raster);
+        let editing_base_manual = mask_kind == MaskKind::Raster;
+        ui.label(
+            egui::RichText::new(if editing_base_manual {
+                "手動マスク:"
+            } else {
+                "マスク補正:"
+            })
+            .color(Color32::from_gray(200)),
+        );
+        if !editing_base_manual {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 4.0;
+                if panel_toggle_button(
+                    ui,
+                    "追加補正",
+                    self.override_edit_target == OverrideEditTarget::Add,
+                    Some(btn_size),
+                    true,
+                )
+                .clicked()
+                {
+                    self.override_edit_target = OverrideEditTarget::Add;
+                    self.selected_shape = None;
+                    self.mask_dirty = true;
+                }
+                if panel_toggle_button(
+                    ui,
+                    "削除補正",
+                    self.override_edit_target == OverrideEditTarget::Subtract,
+                    Some(btn_size),
+                    false,
+                )
+                .clicked()
+                {
+                    self.override_edit_target = OverrideEditTarget::Subtract;
+                    self.selected_shape = None;
+                    self.mask_dirty = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(format!(
+                    "{}を編集中。追加は1.0、削除は0.0でベースマスクを上書きします。",
+                    self.override_edit_target.label()
+                ))
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+        }
         ui.label(egui::RichText::new("描画 / 消去:").color(Color32::from_gray(200)));
         ui.label(
             egui::RichText::new(format!("選択ツール: {}", self.tool.label()))
@@ -2746,25 +3062,24 @@ impl LocalAdjustLabApp {
                 .strong()
                 .color(Color32::WHITE),
         );
-        let is_manual_vector = self
+        let has_override = self
             .selected_layer_ref()
-            .map(|layer| matches!(layer.mask, LocalMask::RasterVector(_)))
+            .map(|layer| !layer.manual_override.is_empty())
             .unwrap_or(false);
-        let convert_response = ui
-            .add_enabled(!is_manual_vector, egui::Button::new("手動マスクへ変換"))
-            .on_hover_text(
-                "現在のマスク本体をビットマップ化し、ブラシや囲みで微修正できる手動マスクにします。反転・拡張/縮小・ぼかし境界・不透明度はレイヤー設定として維持します。",
-            );
-        if convert_response.clicked() {
-            self.convert_selected_mask_to_manual();
+        if ui
+            .add_enabled(has_override, egui::Button::new("手動補正をクリア"))
+            .on_hover_text("ベースマスクは残し、追加補正/削除補正だけを空にします。")
+            .clicked()
+        {
+            self.clear_selected_manual_override();
         }
-        if is_manual_vector {
-            ui.label(
-                egui::RichText::new("現在のマスクは手動編集できます。")
-                    .size(10.0)
-                    .color(Color32::from_gray(170)),
-            );
-        }
+        ui.label(
+            egui::RichText::new(
+                "グラデーションや被写体マットを保ったまま、追加/削除の2値マスクで部分的に上書きできます。",
+            )
+            .size(10.0)
+            .color(Color32::from_gray(170)),
+        );
 
         let copy_options: Vec<(usize, String)> = self
             .layers
@@ -2809,7 +3124,7 @@ impl LocalAdjustLabApp {
         });
         if ui
             .button("コピー元のマスクを適用")
-            .on_hover_text("マスク種類、マスク本体、反転、拡張/縮小、ぼかし境界だけをコピーします。加工内容と不透明度は現在のレイヤーのままです。")
+            .on_hover_text("マスク種類、マスク本体、追加/削除補正、反転、拡張/縮小、ぼかし境界だけをコピーします。加工内容と不透明度は現在のレイヤーのままです。")
             .clicked()
         {
             self.copy_mask_from_layer(self.mask_copy_source);
@@ -2828,35 +3143,30 @@ impl LocalAdjustLabApp {
         let selected_mask_kind = self
             .selected_layer_ref()
             .map(|layer| MaskKind::from_mask(&layer.mask));
-        if selected_mask_kind == Some(MaskKind::Raster) {
-            self.draw_tool_controls(ui);
-        } else {
+        self.draw_tool_controls(ui);
+        if selected_mask_kind != Some(MaskKind::Raster) {
             let help = match selected_mask_kind {
                 Some(MaskKind::LinearGradient) => {
-                    "未設置の場合は画像上でドラッグして生成します。設置後はハンドルで調整します。"
+                    "選択ツールでは画像上のドラッグで生成/調整します。筆などに切り替えると追加/削除補正を描けます。"
                 }
                 Some(MaskKind::RadialGradient) => {
-                    "未設置の場合は画像上でドラッグして生成します。設置後はハンドルで調整し、右クリックでクリアします。"
+                    "選択ツールでは画像上のドラッグで生成/調整します。筆などに切り替えると追加/削除補正を描けます。"
                 }
                 Some(MaskKind::ColorRange) => {
-                    "画像上をクリックするとスポイトで色範囲マスクを生成します。"
+                    "選択ツールでは画像上クリックでスポイト指定します。筆などに切り替えると追加/削除補正を描けます。"
                 }
-                Some(MaskKind::LumaRange) => "輝度範囲はスライダーで調整します。",
-                Some(MaskKind::Full) => "全体マスクでは手動ツールは使いません。",
+                Some(MaskKind::LumaRange) => {
+                    "輝度範囲はスライダーで調整します。筆などで追加/削除補正を描けます。"
+                }
+                Some(MaskKind::Full) => "全体マスクに対して削除補正などを描けます。",
                 Some(MaskKind::Subject) => {
-                    "被写体/背景を1枚のマットとして生成します。背景はマスク反転で扱います。"
+                    "被写体/背景マットを保ったまま、筆などで追加/削除補正を描けます。"
                 }
                 Some(MaskKind::Segmentation) => {
-                    "色分けされた領域候補をクリック/ドラッグで個別にON/OFFします。"
+                    "選択ツールでは領域候補をクリック/ドラッグでON/OFFします。筆などでは追加/削除補正を描けます。"
                 }
                 None | Some(MaskKind::Raster) => "",
             };
-            ui.label(
-                egui::RichText::new("ツール設定")
-                    .size(14.0)
-                    .strong()
-                    .color(Color32::WHITE),
-            );
             ui.label(
                 egui::RichText::new(help)
                     .size(11.0)
@@ -3361,58 +3671,73 @@ impl LocalAdjustLabApp {
         let modifiers = ui.input(|i| i.modifiers);
         let dims = self.image_dims();
         let brush_radius = self.brush_radius.max(1.0);
-        match self.selected_layer_ref().map(|layer| &layer.mask) {
-            Some(LocalMask::LinearGradient(_)) => {
-                if primary_down {
-                    if response.drag_started() {
-                        self.push_undo_snapshot();
-                    }
-                    self.drag_gradient_line(pos, response.drag_started());
-                }
+        if self.tool == MaskTool::Select {
+            if self.shape_drag.is_some()
+                || self.selected_shape.is_some()
+                || self.hit_test_shapes([pos.x, pos.y]).is_some()
+            {
+                self.handle_select_tool(
+                    pos,
+                    primary_pressed,
+                    primary_down,
+                    primary_released,
+                    modifiers,
+                );
                 return;
             }
-            Some(LocalMask::RadialGradient(mask)) => {
-                let initialized = mask.initialized;
-                if secondary_pressed && initialized {
-                    self.push_undo_snapshot();
-                    if let Some(layer) = self.selected_layer_mut() {
-                        layer.mask = LocalMask::RadialGradient(RadialGradientMask::default());
+            match self.selected_layer_ref().map(|layer| &layer.mask) {
+                Some(LocalMask::LinearGradient(_)) => {
+                    if primary_down {
+                        if response.drag_started() {
+                            self.push_undo_snapshot();
+                        }
+                        self.drag_gradient_line(pos, response.drag_started());
                     }
-                    self.radial_gradient_drag_active = false;
-                    self.status = "円形グラデーションをクリアしました。".to_string();
-                    self.mark_dirty();
                     return;
                 }
-                if primary_down && (!initialized || self.radial_gradient_drag_active) {
-                    let started = !self.radial_gradient_drag_active;
-                    if started {
+                Some(LocalMask::RadialGradient(mask)) => {
+                    let initialized = mask.initialized;
+                    if secondary_pressed && initialized {
                         self.push_undo_snapshot();
-                        self.radial_gradient_drag_active = true;
+                        if let Some(layer) = self.selected_layer_mut() {
+                            layer.mask = LocalMask::RadialGradient(RadialGradientMask::default());
+                        }
+                        self.radial_gradient_drag_active = false;
+                        self.status = "円形グラデーションをクリアしました。".to_string();
+                        self.mark_dirty();
+                        return;
                     }
-                    self.drag_gradient_line(pos, started);
+                    if primary_down && (!initialized || self.radial_gradient_drag_active) {
+                        let started = !self.radial_gradient_drag_active;
+                        if started {
+                            self.push_undo_snapshot();
+                            self.radial_gradient_drag_active = true;
+                        }
+                        self.drag_gradient_line(pos, started);
+                    }
+                    return;
                 }
-                return;
-            }
-            Some(LocalMask::ColorRange(_)) => {
-                if response.clicked() {
-                    self.push_undo_snapshot();
-                    self.pick_color(pos);
-                }
-                return;
-            }
-            Some(LocalMask::Segmentation(_)) => {
-                if primary_down {
-                    if primary_pressed || response.drag_started() || response.clicked() {
+                Some(LocalMask::ColorRange(_)) => {
+                    if response.clicked() {
                         self.push_undo_snapshot();
+                        self.pick_color(pos);
                     }
-                    self.toggle_region_at(pos, self.paint_mode);
+                    return;
                 }
-                return;
+                Some(LocalMask::Segmentation(_)) => {
+                    if primary_down {
+                        if primary_pressed || response.drag_started() || response.clicked() {
+                            self.push_undo_snapshot();
+                        }
+                        self.toggle_region_at(pos, self.paint_mode);
+                    }
+                    return;
+                }
+                Some(LocalMask::Full | LocalMask::LumaRange(_) | LocalMask::Subject(_)) => {
+                    return;
+                }
+                _ => {}
             }
-            Some(LocalMask::Full | LocalMask::LumaRange(_) | LocalMask::Subject(_)) => {
-                return;
-            }
-            _ => {}
         }
         match self.tool {
             MaskTool::Brush => {
@@ -3689,7 +4014,7 @@ impl LocalAdjustLabApp {
             if let Some((idx, handle)) = self.hit_test_shapes(p) {
                 self.push_undo_snapshot();
                 self.selected_shape = Some(idx);
-                if let Some(mask) = self.selected_raster_vector_mask_ref()
+                if let Some(mask) = self.selected_edit_raster_vector_mask_ref()
                     && let Some(shape) = mask.shapes.get(idx).copied()
                 {
                     self.shape_drag = Some(ShapeDrag {
@@ -3707,7 +4032,7 @@ impl LocalAdjustLabApp {
         }
         if primary_down && let Some(drag) = self.shape_drag {
             let new_shape = apply_shape_drag(drag, p, modifiers);
-            if let Some(mask) = self.selected_raster_vector_mask_mut()
+            if let Some(mask) = self.selected_edit_raster_vector_mask_mut()
                 && let Some(slot) = mask.shapes.get_mut(drag.shape_idx)
             {
                 *slot = new_shape;
@@ -3720,7 +4045,7 @@ impl LocalAdjustLabApp {
     }
 
     fn hit_test_shapes(&self, p: [f32; 2]) -> Option<(usize, ShapeHandle)> {
-        let mask = self.selected_raster_vector_mask_ref()?;
+        let mask = self.selected_edit_raster_vector_mask_ref()?;
         if let Some(sel) = self.selected_shape
             && let Some(shape) = mask.shapes.get(sel)
             && let Some(handle) = hit_shape_handles(*shape, p)
@@ -3752,7 +4077,7 @@ impl LocalAdjustLabApp {
                 rect.top() + p[1] / img_h.max(1) as f32 * rect.height(),
             )
         };
-        if let Some(mask) = self.selected_raster_vector_mask_ref() {
+        if let Some(mask) = self.selected_edit_raster_vector_mask_ref() {
             for (idx, shape) in mask.shapes.iter().copied().enumerate() {
                 let selected = self.selected_shape == Some(idx);
                 let color = if shape.op().is_add() {
@@ -4324,7 +4649,7 @@ impl eframe::App for LocalAdjustLabApp {
         if ctx.input(|i| i.key_pressed(Key::Delete)) {
             if let Some(shape_idx) = self.selected_shape {
                 self.push_undo_snapshot();
-                if let Some(mask) = self.selected_raster_vector_mask_mut()
+                if let Some(mask) = self.selected_edit_raster_vector_mask_mut()
                     && shape_idx < mask.shapes.len()
                 {
                     mask.shapes.remove(shape_idx);
@@ -5640,28 +5965,9 @@ fn default_mask(kind: MaskKind, width: usize, height: usize) -> LocalMask {
     }
 }
 
-fn manual_mask_from_layer(
-    image: RgbaImageRef<'_>,
-    layer: &LocalAdjustmentLayer,
-) -> Result<RasterVectorMask, String> {
-    let mut mask_layer = layer.clone();
-    // Keep common mask modifiers non-destructive. Only the selected mask source
-    // itself is rasterized into manual-mask alpha.
-    mask_layer.mask_inverted = false;
-    mask_layer.mask_expand_px = 0.0;
-    mask_layer.mask_feather_px = 0.0;
-    mask_layer.opacity = 1.0;
-    let alpha = evaluate_layer_mask(image, &mask_layer).map_err(|e| e.to_string())?;
-    Ok(RasterVectorMask {
-        width: image.width,
-        height: image.height,
-        alpha,
-        shapes: Vec::new(),
-    })
-}
-
 fn copy_mask_fields_from_layer(target: &mut LocalAdjustmentLayer, source: &LocalAdjustmentLayer) {
     target.mask = source.mask.clone();
+    target.manual_override = source.manual_override.clone();
     target.mask_inverted = source.mask_inverted;
     target.mask_expand_px = source.mask_expand_px;
     target.mask_feather_px = source.mask_feather_px;
@@ -7235,6 +7541,229 @@ fn load_image(path: &Path) -> Result<LoadedImage, String> {
     })
 }
 
+fn sidecar_path_for_image(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image");
+    path.with_file_name(format!("{file_name}.miv"))
+}
+
+fn deflate_b64(bytes: &[u8]) -> Result<String, String> {
+    let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(bytes).map_err(|e| e.to_string())?;
+    let compressed = encoder.finish().map_err(|e| e.to_string())?;
+    Ok(BASE64.encode(compressed))
+}
+
+fn inflate_b64(text: &str) -> Result<Vec<u8>, String> {
+    let compressed = BASE64
+        .decode(text.as_bytes())
+        .map_err(|e| format!("base64 decode failed: {e}"))?;
+    let mut decoder = DeflateDecoder::new(compressed.as_slice());
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).map_err(|e| e.to_string())?;
+    Ok(out)
+}
+
+fn pack_alpha_bits(alpha: &[f32]) -> Vec<u8> {
+    let mut packed = vec![0u8; alpha.len().div_ceil(8)];
+    for (idx, &value) in alpha.iter().enumerate() {
+        if value >= 0.5 {
+            packed[idx / 8] |= 1 << (7 - (idx % 8));
+        }
+    }
+    packed
+}
+
+fn unpack_alpha_bits(bytes: &[u8], len: usize) -> Vec<f32> {
+    let mut alpha = vec![0.0; len];
+    for idx in 0..len {
+        if bytes.get(idx / 8).copied().unwrap_or(0) & (1 << (7 - (idx % 8))) != 0 {
+            alpha[idx] = 1.0;
+        }
+    }
+    alpha
+}
+
+fn stored_raster_vector_from_mask(
+    mask: &RasterVectorMask,
+) -> Result<StoredRasterVectorMask, String> {
+    let packed = pack_alpha_bits(&mask.alpha);
+    Ok(StoredRasterVectorMask {
+        width: mask.width,
+        height: mask.height,
+        bitmap_1bit_deflate_b64: deflate_b64(&packed)?,
+        shapes: mask.shapes.clone(),
+    })
+}
+
+fn raster_vector_from_stored(stored: &StoredRasterVectorMask) -> Result<RasterVectorMask, String> {
+    let len = stored.width.saturating_mul(stored.height);
+    let packed = inflate_b64(&stored.bitmap_1bit_deflate_b64)?;
+    Ok(RasterVectorMask {
+        width: stored.width,
+        height: stored.height,
+        alpha: unpack_alpha_bits(&packed, len),
+        shapes: stored.shapes.clone(),
+    })
+}
+
+fn stored_soft_mask_from_mask(mask: &RasterMask) -> Result<StoredSoftMask, String> {
+    let alpha_u8: Vec<u8> = mask
+        .alpha
+        .iter()
+        .map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8)
+        .collect();
+    Ok(StoredSoftMask {
+        width: mask.width,
+        height: mask.height,
+        alpha_u8_deflate_b64: deflate_b64(&alpha_u8)?,
+    })
+}
+
+fn soft_mask_from_stored(stored: &StoredSoftMask) -> Result<RasterMask, String> {
+    let len = stored.width.saturating_mul(stored.height);
+    let bytes = inflate_b64(&stored.alpha_u8_deflate_b64)?;
+    if bytes.len() < len {
+        return Err("soft mask payload is shorter than expected".to_string());
+    }
+    Ok(RasterMask {
+        width: stored.width,
+        height: stored.height,
+        alpha: bytes[..len].iter().map(|&v| v as f32 / 255.0).collect(),
+    })
+}
+
+fn stored_region_mask_from_mask(mask: &RegionMask) -> Result<StoredRegionMask, String> {
+    let mut bytes = Vec::with_capacity(mask.labels.len().saturating_mul(4));
+    for &label in &mask.labels {
+        bytes.extend_from_slice(&label.to_le_bytes());
+    }
+    Ok(StoredRegionMask {
+        width: mask.width,
+        height: mask.height,
+        labels_u32le_deflate_b64: deflate_b64(&bytes)?,
+        selected: mask.selected.clone(),
+    })
+}
+
+fn region_mask_from_stored(stored: &StoredRegionMask) -> Result<RegionMask, String> {
+    let len = stored.width.saturating_mul(stored.height);
+    let bytes = inflate_b64(&stored.labels_u32le_deflate_b64)?;
+    if bytes.len() < len.saturating_mul(4) {
+        return Err("region label payload is shorter than expected".to_string());
+    }
+    let labels = bytes[..len * 4]
+        .chunks_exact(4)
+        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect();
+    Ok(RegionMask {
+        width: stored.width,
+        height: stored.height,
+        labels,
+        selected: stored.selected.clone(),
+    })
+}
+
+fn stored_manual_override_from_layer(
+    manual_override: &ManualMaskOverride,
+) -> Result<StoredManualOverride, String> {
+    Ok(StoredManualOverride {
+        add: manual_override
+            .add
+            .as_ref()
+            .map(stored_raster_vector_from_mask)
+            .transpose()?,
+        subtract: manual_override
+            .subtract
+            .as_ref()
+            .map(stored_raster_vector_from_mask)
+            .transpose()?,
+    })
+}
+
+fn manual_override_from_stored(
+    stored: &StoredManualOverride,
+) -> Result<ManualMaskOverride, String> {
+    Ok(ManualMaskOverride {
+        add: stored
+            .add
+            .as_ref()
+            .map(raster_vector_from_stored)
+            .transpose()?,
+        subtract: stored
+            .subtract
+            .as_ref()
+            .map(raster_vector_from_stored)
+            .transpose()?,
+    })
+}
+
+fn stored_mask_from_local(mask: &LocalMask) -> Result<StoredMask, String> {
+    Ok(match mask {
+        LocalMask::Full => StoredMask::Full,
+        LocalMask::Raster(mask) => {
+            StoredMask::Raster(stored_raster_vector_from_mask(&RasterVectorMask {
+                width: mask.width,
+                height: mask.height,
+                alpha: mask.alpha.clone(),
+                shapes: Vec::new(),
+            })?)
+        }
+        LocalMask::RasterVector(mask) => StoredMask::Raster(stored_raster_vector_from_mask(mask)?),
+        LocalMask::LinearGradient(mask) => StoredMask::LinearGradient(*mask),
+        LocalMask::RadialGradient(mask) => StoredMask::RadialGradient(*mask),
+        LocalMask::LumaRange(mask) => StoredMask::LumaRange(*mask),
+        LocalMask::ColorRange(mask) => StoredMask::ColorRange(*mask),
+        LocalMask::Subject(mask) => StoredMask::Subject(stored_soft_mask_from_mask(mask)?),
+        LocalMask::Segmentation(mask) => {
+            StoredMask::Segmentation(stored_region_mask_from_mask(mask)?)
+        }
+    })
+}
+
+fn local_mask_from_stored(stored: &StoredMask) -> Result<LocalMask, String> {
+    Ok(match stored {
+        StoredMask::Full => LocalMask::Full,
+        StoredMask::Raster(mask) => LocalMask::RasterVector(raster_vector_from_stored(mask)?),
+        StoredMask::LinearGradient(mask) => LocalMask::LinearGradient(*mask),
+        StoredMask::RadialGradient(mask) => LocalMask::RadialGradient(*mask),
+        StoredMask::LumaRange(mask) => LocalMask::LumaRange(*mask),
+        StoredMask::ColorRange(mask) => LocalMask::ColorRange(*mask),
+        StoredMask::Subject(mask) => LocalMask::Subject(soft_mask_from_stored(mask)?),
+        StoredMask::Segmentation(mask) => LocalMask::Segmentation(region_mask_from_stored(mask)?),
+    })
+}
+
+fn stored_layer_from_local(layer: &LocalAdjustmentLayer) -> Result<StoredLayer, String> {
+    Ok(StoredLayer {
+        name: layer.name.clone(),
+        enabled: layer.enabled,
+        opacity: layer.opacity,
+        mask: stored_mask_from_local(&layer.mask)?,
+        manual_override: stored_manual_override_from_layer(&layer.manual_override)?,
+        mask_inverted: layer.mask_inverted,
+        mask_expand_px: layer.mask_expand_px,
+        mask_feather_px: layer.mask_feather_px,
+        effect: layer.effect.clone(),
+    })
+}
+
+fn local_layer_from_stored(stored: &StoredLayer) -> Result<LocalAdjustmentLayer, String> {
+    Ok(LocalAdjustmentLayer {
+        name: stored.name.clone(),
+        enabled: stored.enabled,
+        opacity: stored.opacity,
+        mask: local_mask_from_stored(&stored.mask)?,
+        manual_override: manual_override_from_stored(&stored.manual_override)?,
+        mask_inverted: stored.mask_inverted,
+        mask_expand_px: stored.mask_expand_px,
+        mask_feather_px: stored.mask_feather_px,
+        effect: stored.effect.clone(),
+    })
+}
+
 fn color_image_from_rgba(image: &RgbaImageBuf) -> ColorImage {
     ColorImage::from_rgba_unmultiplied([image.width, image.height], &image.pixels)
 }
@@ -7277,7 +7806,10 @@ fn can_build_mask_tiles_from_layer(
         }
         _ => false,
     };
-    mask_matches && layer.mask_expand_px.abs() < 0.5 && layer.mask_feather_px < 0.5
+    mask_matches
+        && layer.manual_override.is_empty()
+        && layer.mask_expand_px.abs() < 0.5
+        && layer.mask_feather_px < 0.5
 }
 
 fn build_mask_tile_image_from_layer(
@@ -7943,32 +8475,6 @@ mod tests {
     }
 
     #[test]
-    fn manual_mask_conversion_rasterizes_source_without_common_modifiers() {
-        let source = RgbaImageBuf::new(2, 1, vec![0, 0, 0, 255, 255, 255, 255, 255]).unwrap();
-        let mut layer = LocalAdjustmentLayer::new(
-            "luma",
-            LocalMask::LumaRange(RangeMask {
-                min: 0.9,
-                max: 1.0,
-                feather: 0.0,
-            }),
-            LocalEffect::None,
-        );
-        layer.mask_inverted = true;
-        layer.mask_expand_px = 8.0;
-        layer.mask_feather_px = 8.0;
-        layer.opacity = 0.25;
-
-        let mask = manual_mask_from_layer(source.as_ref(), &layer).unwrap();
-
-        assert_eq!(mask.width, 2);
-        assert_eq!(mask.height, 1);
-        assert!(mask.shapes.is_empty());
-        assert!(mask.alpha[0] < 0.01);
-        assert!(mask.alpha[1] > 0.99);
-    }
-
-    #[test]
     fn copying_mask_fields_preserves_target_effect_and_opacity() {
         let mut target = LocalAdjustmentLayer::new(
             "target",
@@ -7988,15 +8494,83 @@ mod tests {
         source.mask_inverted = true;
         source.mask_expand_px = 3.0;
         source.mask_feather_px = 5.0;
+        source.manual_override.add = Some(RasterVectorMask {
+            width: 1,
+            height: 1,
+            alpha: vec![1.0],
+            shapes: Vec::new(),
+        });
 
         copy_mask_fields_from_layer(&mut target, &source);
 
         assert!(matches!(target.mask, LocalMask::LinearGradient(_)));
+        assert!(target.manual_override.add.is_some());
         assert!(target.mask_inverted);
         assert_eq!(target.mask_expand_px, 3.0);
         assert_eq!(target.mask_feather_px, 5.0);
         assert!(matches!(target.effect, LocalEffect::Blur(_)));
         assert_eq!(target.opacity, 0.4);
+    }
+
+    #[test]
+    fn stored_raster_vector_mask_roundtrips_as_binary_alpha() {
+        let mask = RasterVectorMask {
+            width: 4,
+            height: 1,
+            alpha: vec![0.0, 0.49, 0.5, 1.0],
+            shapes: vec![MaskShape::Rect {
+                op: ShapeOp::Add,
+                center: [1.0, 1.0],
+                half_w: 0.5,
+                half_h: 0.5,
+                rotation_rad: 0.0,
+            }],
+        };
+
+        let stored = stored_raster_vector_from_mask(&mask).unwrap();
+        let restored = raster_vector_from_stored(&stored).unwrap();
+
+        assert_eq!(restored.width, 4);
+        assert_eq!(restored.height, 1);
+        assert_eq!(restored.alpha, vec![0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(restored.shapes, mask.shapes);
+    }
+
+    #[test]
+    fn stored_layer_roundtrips_manual_override_and_effect() {
+        let mut layer = LocalAdjustmentLayer::new(
+            "soft",
+            LocalMask::RadialGradient(RadialGradientMask {
+                initialized: true,
+                center: [0.5, 0.5],
+                inner_radius: 0.1,
+                inner_radius_y: 0.2,
+                outer_radius: 0.4,
+                outer_radius_y: 0.6,
+            }),
+            LocalEffect::SoftFocus(SoftFocusParams {
+                radius_px: 18.0,
+                strength: 0.42,
+            }),
+        );
+        layer.manual_override.subtract = Some(RasterVectorMask {
+            width: 2,
+            height: 1,
+            alpha: vec![0.0, 1.0],
+            shapes: Vec::new(),
+        });
+        layer.mask_inverted = true;
+        layer.mask_feather_px = 3.0;
+
+        let stored = stored_layer_from_local(&layer).unwrap();
+        let restored = local_layer_from_stored(&stored).unwrap();
+
+        assert_eq!(restored.name, "soft");
+        assert!(matches!(restored.mask, LocalMask::RadialGradient(_)));
+        assert!(restored.manual_override.subtract.is_some());
+        assert!(matches!(restored.effect, LocalEffect::SoftFocus(_)));
+        assert!(restored.mask_inverted);
+        assert_eq!(restored.mask_feather_px, 3.0);
     }
 
     #[test]

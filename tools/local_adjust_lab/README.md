@@ -55,9 +55,9 @@ the window.
   - Feather
   - Opacity
 - Mask operations:
-  - Convert any generated / range / gradient mask to a manual mask for brush
-    touch-up while keeping invert, expand/shrink, feather, and opacity as layer
-    settings
+  - Add/subtract manual correction masks on top of any mask source. These
+    corrections are binary masks, so gradient / subject matte softness is kept
+    in the base mask while local mistakes can be patched by hand.
   - Copy only the mask data and mask modifiers from another layer while keeping
     the current layer's effect and opacity
 - Effects:
@@ -84,6 +84,9 @@ the window.
   to its default values.
 - Final-stage crop preview/export. The crop rectangle stays in source-image
   coordinates and is only applied when saving the rendered result.
+- Layer settings sidecar save/load. `foo.png` uses `foo.png.miv`; the sidecar is
+  JSON with binary masks packed as 1-bit or 8-bit data, deflated, then base64
+  encoded.
 - Async recomposition with generation discard
 - Manual-mask undo snapshots for layer operations, brush/lasso/object edits, and object deletion
 - Japanese system font registration so labels render correctly on Windows

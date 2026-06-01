@@ -5,6 +5,8 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocalAdjustError {
     InvalidImageBuffer { expected: usize, actual: usize },
@@ -86,12 +88,14 @@ impl<'a> RgbaImageRef<'a> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LocalAdjustmentLayer {
     pub name: String,
     pub enabled: bool,
     pub opacity: f32,
     pub mask: LocalMask,
+    #[serde(default, skip_serializing_if = "ManualMaskOverride::is_empty")]
+    pub manual_override: ManualMaskOverride,
     pub mask_inverted: bool,
     pub mask_expand_px: f32,
     pub mask_feather_px: f32,
@@ -105,6 +109,7 @@ impl LocalAdjustmentLayer {
             enabled: true,
             opacity: 1.0,
             mask,
+            manual_override: ManualMaskOverride::default(),
             mask_inverted: false,
             mask_expand_px: 0.0,
             mask_feather_px: 0.0,
@@ -113,7 +118,21 @@ impl LocalAdjustmentLayer {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ManualMaskOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub add: Option<RasterVectorMask>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtract: Option<RasterVectorMask>,
+}
+
+impl ManualMaskOverride {
+    pub fn is_empty(&self) -> bool {
+        self.add.is_none() && self.subtract.is_none()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LocalMask {
     Full,
     Raster(RasterMask),
@@ -132,14 +151,14 @@ pub enum LocalMask {
     Segmentation(RegionMask),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RasterMask {
     pub width: usize,
     pub height: usize,
     pub alpha: Vec<f32>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RegionMask {
     pub width: usize,
     pub height: usize,
@@ -174,7 +193,7 @@ impl RegionMask {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RasterVectorMask {
     pub width: usize,
     pub height: usize,
@@ -206,7 +225,7 @@ impl RasterVectorMask {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShapeOp {
     Add,
     Subtract,
@@ -218,14 +237,14 @@ impl ShapeOp {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LineKind {
     Vertical,
     Horizontal,
     Diagonal,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum MaskShape {
     Line {
         op: ShapeOp,
@@ -303,7 +322,7 @@ impl RasterMask {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LinearGradientMask {
     pub initialized: bool,
     pub start: [f32; 2],
@@ -320,7 +339,7 @@ impl Default for LinearGradientMask {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RadialGradientMask {
     pub initialized: bool,
     pub center: [f32; 2],
@@ -343,7 +362,7 @@ impl Default for RadialGradientMask {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RangeMask {
     pub min: f32,
     pub max: f32,
@@ -360,7 +379,7 @@ impl Default for RangeMask {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ColorRangeMask {
     pub initialized: bool,
     pub target_rgb: [u8; 3],
@@ -379,7 +398,7 @@ impl Default for ColorRangeMask {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LocalEffect {
     None,
     Tone(ToneParams),
@@ -402,7 +421,7 @@ pub enum LocalEffect {
     EdgeSmooth(EdgeSmoothParams),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ToneParams {
     pub brightness: f32,
     pub contrast: f32,
@@ -425,7 +444,7 @@ impl Default for ToneParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ToneCurveParams {
     pub points: [f32; 5],
 }
@@ -438,7 +457,7 @@ impl Default for ToneCurveParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ClarityParams {
     /// Positive values increase local contrast; negative values soften it.
     pub amount: f32,
@@ -454,7 +473,7 @@ impl Default for ClarityParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HighlightsShadowsParams {
     /// Positive values lift shadows; negative values deepen them.
     pub shadows: f32,
@@ -471,7 +490,7 @@ impl Default for HighlightsShadowsParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct DehazeParams {
     pub amount: f32,
     pub radius_px: f32,
@@ -490,7 +509,7 @@ impl Default for DehazeParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BlurParams {
     pub radius_px: f32,
 }
@@ -501,7 +520,7 @@ impl Default for BlurParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SoftFocusParams {
     pub radius_px: f32,
     pub strength: f32,
@@ -516,7 +535,7 @@ impl Default for SoftFocusParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct MosaicParams {
     pub block_px: u32,
 }
@@ -527,7 +546,7 @@ impl Default for MosaicParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SharpenParams {
     pub amount: f32,
     pub radius_px: f32,
@@ -542,7 +561,7 @@ impl Default for SharpenParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HslParams {
     pub hue_degrees: f32,
     pub saturation: f32,
@@ -559,7 +578,7 @@ impl Default for HslParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LookPreset {
     Sunset,
     Night,
@@ -584,7 +603,7 @@ impl Default for LookPreset {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct LookParams {
     pub preset: LookPreset,
     pub strength: f32,
@@ -599,7 +618,7 @@ impl Default for LookParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BloomParams {
     pub threshold: f32,
     pub radius_px: f32,
@@ -616,7 +635,7 @@ impl Default for BloomParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VignetteParams {
     /// Positive values darken the edge; negative values brighten it.
     pub strength: f32,
@@ -634,7 +653,7 @@ impl Default for VignetteParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct FilmGrainParams {
     pub amount: f32,
     pub size_px: u32,
@@ -651,7 +670,7 @@ impl Default for FilmGrainParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct ChromaticAberrationParams {
     pub offset_px: f32,
 }
@@ -662,7 +681,7 @@ impl Default for ChromaticAberrationParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct HalftoneParams {
     pub cell_px: u32,
     pub strength: f32,
@@ -677,7 +696,7 @@ impl Default for HalftoneParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct StarGlowParams {
     pub ray_count: u32,
     pub rotation_degrees: f32,
@@ -698,7 +717,7 @@ impl Default for StarGlowParams {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct EdgeSmoothParams {
     pub radius_px: f32,
     pub strength: f32,
@@ -736,6 +755,12 @@ pub fn evaluate_layer_mask(
 ) -> Result<Vec<f32>> {
     let image = image.validate()?;
     let mut alpha = evaluate_raw_mask(image, &layer.mask)?;
+    apply_manual_override(
+        &mut alpha,
+        image.width,
+        image.height,
+        &layer.manual_override,
+    )?;
     if layer.mask_inverted {
         for a in &mut alpha {
             *a = 1.0 - *a;
@@ -762,6 +787,31 @@ pub fn evaluate_layer_mask(
         *a = (*a * opacity).clamp(0.0, 1.0);
     }
     Ok(alpha)
+}
+
+fn apply_manual_override(
+    alpha: &mut [f32],
+    width: usize,
+    height: usize,
+    manual_override: &ManualMaskOverride,
+) -> Result<()> {
+    if let Some(add) = &manual_override.add {
+        let add_alpha = eval_raster_vector_mask(add, width, height)?;
+        for (a, add) in alpha.iter_mut().zip(add_alpha) {
+            if add >= 0.5 {
+                *a = 1.0;
+            }
+        }
+    }
+    if let Some(subtract) = &manual_override.subtract {
+        let subtract_alpha = eval_raster_vector_mask(subtract, width, height)?;
+        for (a, subtract) in alpha.iter_mut().zip(subtract_alpha) {
+            if subtract >= 0.5 {
+                *a = 0.0;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result<()> {
@@ -861,12 +911,7 @@ fn evaluate_raw_mask(image: RgbaImageRef<'_>, mask: &LocalMask) -> Result<Vec<f3
                 })
                 .collect())
         }
-        LocalMask::RasterVector(mask) => {
-            mask.validate(image.width, image.height)?;
-            let mut alpha: Vec<f32> = mask.alpha.iter().map(|v| v.clamp(0.0, 1.0)).collect();
-            rasterize_shapes_into(&mut alpha, image.width, image.height, &mask.shapes);
-            Ok(alpha)
-        }
+        LocalMask::RasterVector(mask) => eval_raster_vector_mask(mask, image.width, image.height),
         LocalMask::LinearGradient(mask) => {
             Ok(eval_linear_gradient(image.width, image.height, *mask))
         }
@@ -876,6 +921,17 @@ fn evaluate_raw_mask(image: RgbaImageRef<'_>, mask: &LocalMask) -> Result<Vec<f3
         LocalMask::LumaRange(mask) => Ok(eval_luma_range(image, *mask)),
         LocalMask::ColorRange(mask) => Ok(eval_color_range(image, *mask)),
     }
+}
+
+fn eval_raster_vector_mask(
+    mask: &RasterVectorMask,
+    width: usize,
+    height: usize,
+) -> Result<Vec<f32>> {
+    mask.validate(width, height)?;
+    let mut alpha: Vec<f32> = mask.alpha.iter().map(|v| v.clamp(0.0, 1.0)).collect();
+    rasterize_shapes_into(&mut alpha, width, height, &mask.shapes);
+    Ok(alpha)
 }
 
 pub fn rasterize_shapes_into(alpha: &mut [f32], width: usize, height: usize, shapes: &[MaskShape]) {
@@ -2302,6 +2358,36 @@ mod tests {
         );
         let alpha = evaluate_layer_mask(src.as_ref(), &layer).unwrap();
         assert_eq!(alpha, vec![1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn manual_override_adds_and_subtracts_after_base_mask() {
+        let src = solid(3, 1, [0, 0, 0, 255]);
+        let mut layer = LocalAdjustmentLayer::new(
+            "manual override",
+            LocalMask::Raster(RasterMask {
+                width: 3,
+                height: 1,
+                alpha: vec![0.0, 0.5, 1.0],
+            }),
+            LocalEffect::Tone(ToneParams::default()),
+        );
+        layer.manual_override.add = Some(RasterVectorMask {
+            width: 3,
+            height: 1,
+            alpha: vec![1.0, 0.0, 0.0],
+            shapes: Vec::new(),
+        });
+        layer.manual_override.subtract = Some(RasterVectorMask {
+            width: 3,
+            height: 1,
+            alpha: vec![0.0, 0.0, 1.0],
+            shapes: Vec::new(),
+        });
+
+        let alpha = evaluate_layer_mask(src.as_ref(), &layer).unwrap();
+
+        assert_eq!(alpha, vec![1.0, 0.5, 0.0]);
     }
 
     #[test]
