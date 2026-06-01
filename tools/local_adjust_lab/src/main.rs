@@ -8337,9 +8337,9 @@ fn run_sam2_candidate_masks(
             .run(ort::inputs!["image" => input_tensor])
             .map_err(|e| format!("SAM2 encoder run: {e}"))?;
         (
-            output_arrayd(&outputs[0], "image_embed")?,
-            output_arrayd(&outputs[1], "high_res_feats_0")?,
-            output_arrayd(&outputs[2], "high_res_feats_1")?,
+            output_arrayd(&outputs["image_embed"], "image_embed")?,
+            output_arrayd(&outputs["high_res_feats_0"], "high_res_feats_0")?,
+            output_arrayd(&outputs["high_res_feats_1"], "high_res_feats_1")?,
         )
     };
 
@@ -8437,10 +8437,10 @@ fn run_sam2_decoder_point(
             "has_mask_input" => has_mask_input_tensor,
         })
         .map_err(|e| format!("SAM2 decoder run: {e}"))?;
-    let (mask_shape, mask_raw) = outputs[0]
+    let (mask_shape, mask_raw) = outputs["masks"]
         .try_extract_tensor::<f32>()
         .map_err(|e| format!("SAM2 masks extract: {e}"))?;
-    let (iou_shape, iou_raw) = outputs[1]
+    let (iou_shape, iou_raw) = outputs["iou_predictions"]
         .try_extract_tensor::<f32>()
         .map_err(|e| format!("SAM2 iou_predictions extract: {e}"))?;
     sam2_decoder_outputs_to_candidate_masks(
