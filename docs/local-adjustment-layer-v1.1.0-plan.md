@@ -233,6 +233,12 @@ UI では非手動マスクの追加 / 削除マスクパネルを初期非表�
 - 領域分割の将来候補として、SAM / SAM 2.1 系 ONNX モデルを検証する。SAM 系はクリックや矩形
   prompt に向くが、encoder / decoder の2段構成やモデルサイズが大きいため、まずは追加
   ダウンロードの実験機能に留める。
+- SAM 系の出力は重複ありの候補マスク群になりやすいため、そのまま UI に出さない。
+  まず候補マスクを mIV 側で排他的な `RegionMask` に変換する。各ピクセルについて
+  「どの候補マスクに含まれているか」の組み合わせを見て connected component 化し、
+  重なりは独立した領域、どの候補にも含まれない隙間も選択可能な領域として扱う。
+  これにより、モデルが SAM / FastSAM / MobileSAM のどれでも、UI は重複なし・漏れなしの
+  領域候補だけを扱える。
 - SAM 系の第一候補は `segment-anything-2.1-onnx-models` の Hiera-Tiny。Apache-2.0 表記で、
   zip に encoder / decoder の ONNX が入っており、追加 DL 型にしやすい。公式 SAM v1 は
   Apache-2.0 だが、基本は checkpoint + ONNX export 手順なので一般ユーザー向けの簡単導入には
@@ -883,6 +889,10 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   被写体選択マスクがある場合は、被写体内または背景だけを領域分割できる。
   境界線などで未所属になった内部ピクセルは近い領域へ割り当て、隣接領域を複数選んだときに
   マスクの隙間が残りにくいようにする
+- `local_adjust_lab` に、外部SAM等で出した候補マスク画像を `<image-stem>.sam_masks`
+  フォルダから読み込み、候補マスクの重なり / 隙間を排他的な `RegionMask` へ変換する
+  試験経路を追加した。重なりは独立領域、どの候補にも含まれない部分も gap 領域として
+  選択できる
 - 効果: Tone (自然な彩度を含む) / Clarity / Highlights-Shadows / Blur / Soft Focus /
   Mosaic / Sharpen / HSL / Tone Curve / Dehaze / Look / Bloom / Vignette / Film Grain /
   Chromatic Aberration / Halftone / Cross-Star Glow / Edge-preserving Smooth

@@ -922,6 +922,7 @@ struct LocalAdjustLabApp {
     edge_snap_radius: f32,
     region_color_tolerance: f32,
     region_min_area: usize,
+    region_candidate_mask_threshold: f32,
     line_width: f32,
     lasso_points: Vec<[f32; 2]>,
     shape_drag_start: Option<[f32; 2]>,
@@ -996,6 +997,7 @@ impl LocalAdjustLabApp {
             edge_snap_radius: 16.0,
             region_color_tolerance: 42.0,
             region_min_area: 64,
+            region_candidate_mask_threshold: 0.5,
             line_width: 28.0,
             lasso_points: Vec::new(),
             shape_drag_start: None,
@@ -1869,6 +1871,79 @@ impl LocalAdjustLabApp {
             }
             Err(e) => {
                 self.status = format!("領域分割 worker 起動失敗: {e}");
+            }
+        }
+    }
+
+    fn start_candidate_mask_region_segmentation(
+        &mut self,
+        ctx: &egui::Context,
+        scope: RegionSegmentationScope,
+    ) {
+        if self.segmentation_pending.is_some() {
+            self.status = "マスク生成中です。".to_string();
+            return;
+        }
+        let layer_idx = self.selected_layer;
+        if !matches!(
+            self.layers.get(layer_idx).map(|layer| &layer.mask),
+            Some(LocalMask::Segmentation(_))
+        ) {
+            self.status = "領域分割レイヤーを選択してください。".to_string();
+            return;
+        }
+        let Some(image) = &self.image else {
+            return;
+        };
+        let source = image.source.clone();
+        let candidate_dir = candidate_mask_dir_for_image(&image.path);
+        let subject = if scope.requires_subject() {
+            self.subject_mask_candidate()
+        } else {
+            None
+        };
+        if scope.requires_subject() && subject.is_none() {
+            self.status = "利用できる被写体選択マスクがありません。".to_string();
+            return;
+        }
+        let min_area = self.region_min_area.max(1);
+        let threshold = self.region_candidate_mask_threshold.clamp(0.0, 1.0);
+        let (tx, rx) = mpsc::channel();
+        let worker_candidate_dir = candidate_dir.clone();
+        let spawn_result = std::thread::Builder::new()
+            .name("local-adjust-lab-candidate-mask-segmentation".to_string())
+            .spawn(move || {
+                let result = load_candidate_masks_from_dir(
+                    &worker_candidate_dir,
+                    source.width,
+                    source.height,
+                )
+                .and_then(|candidate_masks| {
+                    build_region_segmentation_from_candidate_masks(
+                        &source,
+                        subject.as_ref(),
+                        scope,
+                        &candidate_masks,
+                        threshold,
+                        min_area,
+                    )
+                })
+                .map(GeneratedMask::Regions);
+                let _ = tx.send(result);
+            });
+        match spawn_result {
+            Ok(_) => {
+                self.segmentation_pending = Some(SegmentationPending {
+                    layer_idx,
+                    generation: self.generation,
+                    rx,
+                    started_at: Instant::now(),
+                });
+                self.status = format!("候補マスク境界で領域分割中... {}", candidate_dir.display());
+                ctx.request_repaint();
+            }
+            Err(e) => {
+                self.status = format!("候補マスク領域分割 worker 起動失敗: {e}");
             }
         }
     }
@@ -3902,6 +3977,12 @@ impl LocalAdjustLabApp {
         if changed {
             self.status = "領域分割の設定を変更しました。再生成してください。".to_string();
         }
+        ui.label(
+            egui::RichText::new("色ベース")
+                .size(12.0)
+                .strong()
+                .color(Color32::from_gray(220)),
+        );
         if ui
             .add_enabled(!pending, egui::Button::new("画像全体を領域分割"))
             .clicked()
@@ -3938,6 +4019,71 @@ impl LocalAdjustLabApp {
         ui.label(
             egui::RichText::new(
                 "色差許容: 小=細かく分割 / 大=似た色を結合。最小領域: 小=細部も残す / 大=細かい破片を捨てる。",
+            )
+            .size(10.0)
+            .color(Color32::from_gray(170)),
+        );
+        ui.separator();
+        ui.label(
+            egui::RichText::new("SAM候補マスク境界（試験）")
+                .size(12.0)
+                .strong()
+                .color(Color32::from_gray(220)),
+        );
+        let candidate_dir = self
+            .image
+            .as_ref()
+            .map(|image| candidate_mask_dir_for_image(&image.path));
+        if let Some(dir) = candidate_dir.as_ref() {
+            ui.label(
+                egui::RichText::new(format!("候補フォルダ: {}", dir.display()))
+                    .size(10.0)
+                    .color(Color32::from_gray(170)),
+            );
+        }
+        if ui
+            .add(
+                egui::Slider::new(&mut self.region_candidate_mask_threshold, 0.05..=0.95)
+                    .text("候補しきい値"),
+            )
+            .on_hover_text("候補マスクPNGの白/不透明部分を採用するしきい値です。")
+            .changed()
+        {
+            self.status = "候補マスク境界の設定を変更しました。再生成してください。".to_string();
+        }
+        if ui
+            .add_enabled(!pending, egui::Button::new("候補境界で画像全体を分割"))
+            .clicked()
+        {
+            self.start_candidate_mask_region_segmentation(ui.ctx(), RegionSegmentationScope::Full);
+        }
+        if ui
+            .add_enabled(
+                !pending && subject_available,
+                egui::Button::new("候補境界で被写体内を分割"),
+            )
+            .clicked()
+        {
+            self.start_candidate_mask_region_segmentation(
+                ui.ctx(),
+                RegionSegmentationScope::Subject,
+            );
+        }
+        if ui
+            .add_enabled(
+                !pending && subject_available,
+                egui::Button::new("候補境界で背景を分割"),
+            )
+            .clicked()
+        {
+            self.start_candidate_mask_region_segmentation(
+                ui.ctx(),
+                RegionSegmentationScope::Background,
+            );
+        }
+        ui.label(
+            egui::RichText::new(
+                "外部SAM等で作った白黒マスク画像を候補フォルダに置くと、重なりと隙間を排他的な領域候補へ変換します。",
             )
             .size(10.0)
             .color(Color32::from_gray(170)),
@@ -8094,6 +8240,128 @@ fn build_region_segmentation(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CandidateMaskSignature {
+    lo: u64,
+    hi: u64,
+}
+
+impl CandidateMaskSignature {
+    const EMPTY: Self = Self { lo: 0, hi: 0 };
+
+    fn set(&mut self, idx: usize) {
+        if idx < 64 {
+            self.lo |= 1_u64 << idx;
+        } else {
+            self.hi |= 1_u64 << (idx - 64);
+        }
+    }
+}
+
+fn build_region_segmentation_from_candidate_masks(
+    source: &RgbaImageBuf,
+    subject: Option<&RasterMask>,
+    scope: RegionSegmentationScope,
+    candidate_masks: &[RasterMask],
+    threshold: f32,
+    min_area: usize,
+) -> Result<RegionMask, String> {
+    let len = source.width.saturating_mul(source.height);
+    if source.pixels.len() != len.saturating_mul(4) {
+        return Err("invalid source RGBA buffer".to_string());
+    }
+    if candidate_masks.is_empty() {
+        return Err("候補マスクがありません。".to_string());
+    }
+    if candidate_masks.len() > 128 {
+        return Err(format!(
+            "候補マスクは128枚までです: {} 枚",
+            candidate_masks.len()
+        ));
+    }
+    if let Some(mask) = subject
+        && (mask.width != source.width || mask.height != source.height || mask.alpha.len() != len)
+    {
+        return Err("subject mask size does not match image".to_string());
+    }
+    for (idx, mask) in candidate_masks.iter().enumerate() {
+        if mask.width != source.width || mask.height != source.height || mask.alpha.len() != len {
+            return Err(format!(
+                "candidate mask size does not match image: {}",
+                idx + 1
+            ));
+        }
+    }
+
+    let threshold = threshold.clamp(0.0, 1.0);
+    let min_area = min_area.max(1);
+    let membership_allowed: Vec<bool> = (0..len)
+        .map(|idx| region_membership_allowed(source, subject, scope, idx))
+        .collect();
+    let mut signatures = vec![CandidateMaskSignature::EMPTY; len];
+    for (mask_idx, mask) in candidate_masks.iter().enumerate() {
+        for (idx, &alpha) in mask.alpha.iter().take(len).enumerate() {
+            if membership_allowed[idx] && alpha >= threshold {
+                signatures[idx].set(mask_idx);
+            }
+        }
+    }
+
+    let mut visited = vec![false; len];
+    let mut labels = vec![0_u32; len];
+    let mut label = 0_u32;
+    let mut queue = VecDeque::new();
+    let mut component = Vec::new();
+
+    for start in 0..len {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        if !membership_allowed[start] {
+            continue;
+        }
+        let signature = signatures[start];
+        queue.clear();
+        component.clear();
+        queue.push_back(start);
+        while let Some(idx) = queue.pop_front() {
+            component.push(idx);
+            let x = idx % source.width;
+            let y = idx / source.width;
+            for (nx, ny) in region_neighbors(x, y, source.width, source.height) {
+                let nidx = ny * source.width + nx;
+                if visited[nidx] || !membership_allowed[nidx] || signatures[nidx] != signature {
+                    continue;
+                }
+                visited[nidx] = true;
+                queue.push_back(nidx);
+            }
+        }
+        if component.len() >= min_area && (label as usize) < REGION_SEGMENT_MAX_LABELS {
+            label += 1;
+            for &idx in &component {
+                labels[idx] = label;
+            }
+        }
+    }
+
+    fill_unlabeled_region_pixels(
+        &mut labels,
+        source.width,
+        source.height,
+        &membership_allowed,
+    );
+
+    let selected = vec![false; label as usize + 1];
+    Ok(RegionMask {
+        width: source.width,
+        height: source.height,
+        labels,
+        selected,
+    })
+}
+
 fn region_seed_allowed(
     source: &RgbaImageBuf,
     subject: Option<&RasterMask>,
@@ -8368,6 +8636,79 @@ fn load_image(path: &Path) -> Result<LoadedImage, String> {
     Ok(LoadedImage {
         path: path.to_path_buf(),
         source,
+    })
+}
+
+fn candidate_mask_dir_for_image(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("image");
+    path.with_file_name(format!("{stem}.sam_masks"))
+}
+
+fn load_candidate_masks_from_dir(
+    dir: &Path,
+    width: usize,
+    height: usize,
+) -> Result<Vec<RasterMask>, String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("候補マスクフォルダを開けません: {} ({e})", dir.display()))?;
+    let mut paths = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("候補マスク一覧取得失敗: {e}"))?;
+        let path = entry.path();
+        if candidate_mask_image_ext(&path) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    if paths.is_empty() {
+        return Err(format!("候補マスク画像がありません: {}", dir.display()));
+    }
+    paths
+        .iter()
+        .map(|path| load_candidate_mask_image(path, width, height))
+        .collect()
+}
+
+fn candidate_mask_image_ext(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg")
+    )
+}
+
+fn load_candidate_mask_image(
+    path: &Path,
+    width: usize,
+    height: usize,
+) -> Result<RasterMask, String> {
+    let dyn_img = image::open(path)
+        .map_err(|e| format!("候補マスクを読み込めません: {} ({e})", path.display()))?;
+    let rgba = dyn_img.to_rgba8();
+    let resized = if rgba.width() as usize == width && rgba.height() as usize == height {
+        rgba
+    } else {
+        image::imageops::resize(&rgba, width as u32, height as u32, FilterType::Triangle)
+    };
+    let alpha_has_signal = resized.pixels().any(|p| p[3] < 250);
+    let mut alpha = Vec::with_capacity(width.saturating_mul(height));
+    for p in resized.pixels() {
+        let value = if alpha_has_signal {
+            p[3] as f32 / 255.0
+        } else {
+            (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0
+        };
+        alpha.push(value.clamp(0.0, 1.0));
+    }
+    Ok(RasterMask {
+        width,
+        height,
+        alpha,
     })
 }
 
@@ -10284,6 +10625,45 @@ mod tests {
         let allowed = vec![true, true, true];
         fill_unlabeled_region_pixels(&mut labels, 3, 1, &allowed);
         assert_ne!(labels[1], 0);
+    }
+
+    #[test]
+    fn candidate_mask_segmentation_partitions_overlap_and_gap_pixels() {
+        let source = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                10, 10, 10, 255, 20, 20, 20, 255, 30, 30, 30, 255, 40, 40, 40, 255, 50, 50, 50, 255,
+            ],
+        )
+        .unwrap();
+        let mask_a = RasterMask {
+            width: 5,
+            height: 1,
+            alpha: vec![1.0, 1.0, 1.0, 0.0, 0.0],
+        };
+        let mask_b = RasterMask {
+            width: 5,
+            height: 1,
+            alpha: vec![0.0, 0.0, 1.0, 1.0, 0.0],
+        };
+        let mask = build_region_segmentation_from_candidate_masks(
+            &source,
+            None,
+            RegionSegmentationScope::Full,
+            &[mask_a, mask_b],
+            0.5,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(mask.label_count(), 4);
+        assert_ne!(mask.labels[0], 0);
+        assert_eq!(mask.labels[0], mask.labels[1]);
+        assert_ne!(mask.labels[1], mask.labels[2]);
+        assert_ne!(mask.labels[2], mask.labels[3]);
+        assert_ne!(mask.labels[3], mask.labels[4]);
+        assert!(mask.selected.iter().skip(1).all(|&selected| !selected));
     }
 
     #[test]
