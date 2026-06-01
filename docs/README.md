@@ -34,6 +34,7 @@
 | ドキュメント | 内容 |
 | --- | --- |
 | [catalog-design.md](catalog-design.md) | サムネイルキャッシュ DB の設計 |
+| [ai-region-segmentation-retrospective.md](ai-region-segmentation-retrospective.md) | `local_adjust_lab` で試した SAM / SAM2 領域分割の失敗メモ。v1.1.0 では AI 領域分割を見送り、クラシック領域分割へ集中する判断の背景 |
 | [thumbnail-memory-redesign.md](thumbnail-memory-redesign.md) | サムネイルメモリ管理の再設計経緯 |
 | [dpi-multimonitor-issue.md](dpi-multimonitor-issue.md) | マルチモニター DPI 問題の調査記録 |
 | [pdf-issues.md](pdf-issues.md) | PDF サポートの既知問題 |
