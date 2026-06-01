@@ -21,15 +21,16 @@ the window.
 
 ## Current prototype scope
 
-- Multiple local adjustment layers
-- Images start with no local adjustment layers so the first state is unchanged
+- Multiple adjustment layers
+- Images start with no adjustment layers so the first state is unchanged
 - New layers start with the selected mask source + No Effect. Pick the effect
   afterward from the selected layer's effect selector.
 - mIV-like floating panel over the image instead of a docked side panel
-- Left panel: display controls, layer list, selected-layer effect selection, and
-  manual-mask tool selection
+- Left panel: display controls and an mIV-like workflow strip:
+  Eraser / Adjustment / Conceal / Crop / Save. Eraser and Conceal are placeholder
+  panels in the prototype so the lab stays lightweight.
 - Right panel: parameters for the selected mask source, selected manual-mask
-  tool, and selected effect
+  tool, and selected effect while the Adjustment panel is active.
 - Image navigation for testing large images:
   - Ctrl + mouse wheel: zoom around the pointer
   - Mouse wheel: zoom around the pointer
@@ -89,8 +90,10 @@ the window.
 - Effect parameters start from near-identity values. Use the per-effect preset
   buttons for practical starting points, or Reset to return the current effect
   to its default values.
-- Final-stage crop preview/export. The crop rectangle stays in source-image
-  coordinates and is only applied when saving the rendered result.
+- Final-stage crop preview/export. The Crop panel has Reset, aspect ratio
+  selection (Keep, Free, 16:9 through 9:16), and X/Y/W/H numeric inputs. The
+  crop rectangle stays in source-image coordinates and is only applied when
+  saving the rendered result.
 - Layer settings sidecar save/load. `foo.png` uses `foo.png.miv`; the sidecar is
   JSON with binary masks packed as 1-bit or 8-bit data, deflated, then base64
   encoded.

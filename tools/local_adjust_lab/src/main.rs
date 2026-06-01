@@ -187,6 +187,8 @@ struct LabSidecar {
     #[serde(default)]
     crop_overlay: bool,
     #[serde(default)]
+    crop_aspect_mode: CropAspectMode,
+    #[serde(default)]
     crop_rect: Option<CropRect>,
     layers: Vec<StoredLayer>,
 }
@@ -347,6 +349,90 @@ struct CropRect {
     max_y: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+enum CropAspectMode {
+    Keep,
+    #[default]
+    Free,
+    Landscape16x9,
+    Landscape3x2,
+    Landscape4x3,
+    Square,
+    Portrait3x4,
+    Portrait2x3,
+    Portrait9x16,
+}
+
+impl CropAspectMode {
+    const ALL: [Self; 9] = [
+        Self::Keep,
+        Self::Free,
+        Self::Landscape16x9,
+        Self::Landscape3x2,
+        Self::Landscape4x3,
+        Self::Square,
+        Self::Portrait3x4,
+        Self::Portrait2x3,
+        Self::Portrait9x16,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Keep => "維持",
+            Self::Free => "自由",
+            Self::Landscape16x9 => "16:9",
+            Self::Landscape3x2 => "3:2",
+            Self::Landscape4x3 => "4:3",
+            Self::Square => "1:1",
+            Self::Portrait3x4 => "3:4",
+            Self::Portrait2x3 => "2:3",
+            Self::Portrait9x16 => "9:16",
+        }
+    }
+
+    fn aspect_ratio(self) -> Option<f32> {
+        match self {
+            Self::Keep | Self::Free => None,
+            Self::Landscape16x9 => Some(16.0 / 9.0),
+            Self::Landscape3x2 => Some(3.0 / 2.0),
+            Self::Landscape4x3 => Some(4.0 / 3.0),
+            Self::Square => Some(1.0),
+            Self::Portrait3x4 => Some(3.0 / 4.0),
+            Self::Portrait2x3 => Some(2.0 / 3.0),
+            Self::Portrait9x16 => Some(9.0 / 16.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LabWorkflowPanel {
+    Eraser,
+    Adjust,
+    Conceal,
+    Crop,
+    Save,
+}
+
+impl LabWorkflowPanel {
+    const ALL: [Self; 5] = [
+        Self::Eraser,
+        Self::Adjust,
+        Self::Conceal,
+        Self::Crop,
+        Self::Save,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Eraser => "消しゴム",
+            Self::Adjust => "補正",
+            Self::Conceal => "隠蔽",
+            Self::Crop => "切り取り",
+            Self::Save => "保存",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CropHandle {
     Body,
@@ -364,6 +450,7 @@ enum CropHandle {
 struct CropDrag {
     handle: CropHandle,
     base: CropRect,
+    aspect_ratio: Option<f32>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -592,6 +679,7 @@ struct LocalAdjustLabApp {
     mask_dirty: bool,
     last_edit: Instant,
     last_mask_preview_update: Instant,
+    workflow_panel: LabWorkflowPanel,
     tool: MaskTool,
     paint_mode: bool,
     override_edit_panel: Option<OverrideEditTarget>,
@@ -623,6 +711,7 @@ struct LocalAdjustLabApp {
     crop_enabled: bool,
     crop_overlay: bool,
     crop_edit_mode: bool,
+    crop_aspect_mode: CropAspectMode,
     crop_rect: Option<CropRect>,
     crop_drag: Option<CropDrag>,
     add_layer_dialog_open: bool,
@@ -663,6 +752,7 @@ impl LocalAdjustLabApp {
             mask_dirty: false,
             last_edit: Instant::now(),
             last_mask_preview_update: Instant::now(),
+            workflow_panel: LabWorkflowPanel::Adjust,
             tool: MaskTool::Brush,
             paint_mode: true,
             override_edit_panel: None,
@@ -694,6 +784,7 @@ impl LocalAdjustLabApp {
             crop_enabled: false,
             crop_overlay: true,
             crop_edit_mode: false,
+            crop_aspect_mode: CropAspectMode::Free,
             crop_rect: None,
             crop_drag: None,
             add_layer_dialog_open: false,
@@ -745,10 +836,12 @@ impl LocalAdjustLabApp {
                 self.crop_enabled = false;
                 self.crop_overlay = true;
                 self.crop_edit_mode = false;
+                self.crop_aspect_mode = CropAspectMode::Free;
                 self.crop_rect = None;
                 self.crop_drag = None;
                 self.prev_paint_pos = None;
                 self.last_paint_pos = None;
+                self.workflow_panel = LabWorkflowPanel::Adjust;
                 self.override_edit_panel = None;
                 self.radial_gradient_drag_active = false;
                 self.edge_brush_seed = None;
@@ -898,16 +991,89 @@ impl LocalAdjustLabApp {
         Some(sanitized)
     }
 
-    fn effective_crop_rect(&self) -> Option<CropRect> {
-        if !self.crop_enabled {
-            return None;
-        }
+    fn crop_rect_or_full(&self) -> Option<CropRect> {
         let (w, h) = self.image_dims()?;
         Some(
             self.crop_rect
                 .unwrap_or_else(|| CropRect::full(w, h))
                 .sanitized(w, h),
         )
+    }
+
+    fn crop_is_active(&self) -> bool {
+        let Some((w, h)) = self.image_dims() else {
+            return false;
+        };
+        let crop = self
+            .crop_rect
+            .unwrap_or_else(|| CropRect::full(w, h))
+            .sanitized(w, h);
+        !crop.is_full(w, h)
+    }
+
+    fn effective_crop_rect(&self) -> Option<CropRect> {
+        if !self.crop_is_active() {
+            return None;
+        }
+        self.crop_rect_or_full()
+    }
+
+    fn current_crop_aspect_ratio(&self) -> Option<f32> {
+        let crop = self.crop_rect_or_full()?;
+        Some(crop.width() / crop.height().max(1.0))
+    }
+
+    fn crop_resize_aspect_ratio(&self) -> Option<f32> {
+        self.crop_aspect_mode
+            .aspect_ratio()
+            .or_else(|| match self.crop_aspect_mode {
+                CropAspectMode::Keep => self.current_crop_aspect_ratio(),
+                _ => None,
+            })
+    }
+
+    fn reset_crop(&mut self) {
+        let Some((w, h)) = self.image_dims() else {
+            return;
+        };
+        self.crop_rect = Some(CropRect::full(w, h));
+        self.crop_enabled = false;
+        self.crop_drag = None;
+    }
+
+    fn apply_crop_aspect_mode_to_rect(&mut self) {
+        let Some((w, h)) = self.image_dims() else {
+            return;
+        };
+        let Some(ratio) = self.crop_aspect_mode.aspect_ratio() else {
+            return;
+        };
+        let crop = self
+            .crop_rect_or_full()
+            .unwrap_or_else(|| CropRect::full(w, h))
+            .fit_to_aspect_around_center(ratio, w, h);
+        self.crop_enabled = !crop.is_full(w, h);
+        self.crop_rect = Some(crop);
+        self.crop_drag = None;
+    }
+
+    fn set_workflow_panel(&mut self, panel: LabWorkflowPanel) {
+        if self.workflow_panel == panel {
+            return;
+        }
+        self.workflow_panel = panel;
+        self.crop_edit_mode = panel == LabWorkflowPanel::Crop;
+        self.crop_drag = None;
+        self.pan_drag_start = None;
+        self.prev_paint_pos = None;
+        self.last_paint_pos = None;
+        if panel != LabWorkflowPanel::Adjust {
+            self.shape_drag = None;
+            self.radial_gradient_drag_active = false;
+        }
+        if panel == LabWorkflowPanel::Crop {
+            self.ensure_crop_rect();
+        }
     }
 
     fn selected_layer_mut(&mut self) -> Option<&mut LocalAdjustmentLayer> {
@@ -1042,12 +1208,7 @@ impl LocalAdjustLabApp {
 
     fn add_layer_with_mask(&mut self, mask_kind: MaskKind) {
         let (w, h) = self.image_dims().unwrap_or((1, 1));
-        let layer = layer_with_mask(
-            format!("部分補正 {}", self.layers.len() + 1),
-            mask_kind,
-            w,
-            h,
-        );
+        let layer = layer_with_mask(format!("補正 {}", self.layers.len() + 1), mask_kind, w, h);
         self.push_undo_snapshot();
         self.layers.push(layer);
         self.selected_layer = self.layers.len().saturating_sub(1);
@@ -1702,7 +1863,7 @@ impl LocalAdjustLabApp {
         match save_result_png(&image.path, result_to_save) {
             Ok(path) => {
                 self.status = if crop.is_some() {
-                    format!("crop して保存しました: {}", path.display())
+                    format!("切り取りして保存しました: {}", path.display())
                 } else if self.preview_to_selected_layer {
                     format!("全レイヤーで保存しました: {}", path.display())
                 } else {
@@ -1755,8 +1916,9 @@ impl LocalAdjustLabApp {
                 .to_string(),
             image_width: image.source.width,
             image_height: image.source.height,
-            crop_enabled: self.crop_enabled,
+            crop_enabled: self.crop_is_active(),
             crop_overlay: self.crop_overlay,
+            crop_aspect_mode: self.crop_aspect_mode,
             crop_rect: self.crop_rect,
             layers,
         })
@@ -1811,8 +1973,13 @@ impl LocalAdjustLabApp {
         self.reset_override_edit_state_for_selected_layer();
         self.crop_enabled = sidecar.crop_enabled;
         self.crop_overlay = sidecar.crop_overlay;
-        self.crop_rect = sidecar.crop_rect.map(|crop| crop.sanitized(w, h));
+        self.crop_aspect_mode = sidecar.crop_aspect_mode;
+        self.crop_rect = sidecar
+            .crop_rect
+            .or_else(|| sidecar.crop_enabled.then(|| CropRect::full(w, h)))
+            .map(|crop| crop.sanitized(w, h));
         self.crop_drag = None;
+        self.crop_edit_mode = self.workflow_panel == LabWorkflowPanel::Crop;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.status = format!("設定を読み込みました: {}", path.display());
@@ -2312,9 +2479,62 @@ impl LocalAdjustLabApp {
         });
 
         ui.separator();
-        self.draw_crop_controls(ui, btn_size);
+        self.draw_workflow_selector(ui);
 
         ui.separator();
+        match self.workflow_panel {
+            LabWorkflowPanel::Eraser => self.draw_placeholder_stage_panel(
+                ui,
+                "消しゴム",
+                "本体統合時に既存の消しゴム処理を接続します。",
+            ),
+            LabWorkflowPanel::Adjust => self.draw_adjust_layer_controls(ui, btn_size),
+            LabWorkflowPanel::Conceal => self.draw_placeholder_stage_panel(
+                ui,
+                "隠蔽加工",
+                "本体統合時に既存の隠蔽加工処理を接続します。",
+            ),
+            LabWorkflowPanel::Crop => self.draw_crop_controls(ui),
+            LabWorkflowPanel::Save => self.draw_save_controls(ui, btn_size),
+        }
+    }
+
+    fn draw_workflow_selector(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("処理順:").color(Color32::from_gray(200)));
+        let button_w = ((PANEL_W - 28.0) / 5.0).max(52.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            for panel in LabWorkflowPanel::ALL {
+                if panel_toggle_button(
+                    ui,
+                    panel.label(),
+                    self.workflow_panel == panel,
+                    Some(egui::vec2(button_w, 24.0)),
+                    false,
+                )
+                .clicked()
+                {
+                    self.set_workflow_panel(panel);
+                }
+            }
+        });
+    }
+
+    fn draw_placeholder_stage_panel(&mut self, ui: &mut egui::Ui, title: &str, body: &str) {
+        ui.label(
+            egui::RichText::new(title)
+                .size(14.0)
+                .strong()
+                .color(Color32::WHITE),
+        );
+        ui.label(
+            egui::RichText::new(body)
+                .size(11.0)
+                .color(Color32::from_gray(170)),
+        );
+    }
+
+    fn draw_adjust_layer_controls(&mut self, ui: &mut egui::Ui, btn_size: egui::Vec2) {
         self.draw_layer_list(ui, PANEL_W);
         if self.layers.is_empty() {
             return;
@@ -2339,7 +2559,10 @@ impl LocalAdjustLabApp {
 
         ui.separator();
         self.draw_manual_tool_selector(ui, btn_size);
-        ui.separator();
+    }
+
+    fn draw_save_controls(&mut self, ui: &mut egui::Ui, btn_size: egui::Vec2) {
+        let btn_w = btn_size.x;
         if ui
             .add_sized(
                 egui::vec2(btn_w * 2.0 + 4.0, 24.0),
@@ -2384,7 +2607,7 @@ impl LocalAdjustLabApp {
                      Q:元画像  W:マスク表示\n\
                      境界筆[A]:境界で止めながら近い色を塗る  Ctrl中は境界表示+通常筆\n\
                      隙間補完[G]:細い未塗り部分を補完\n\
-                     Crop編集:黄色枠/ハンドルをドラッグ、保存時に最後段で切り出し\n\
+                     切り取り:黄色枠/ハンドルをドラッグ、保存時に最後段で切り出し\n\
                      Ctrl:境界表示/多角形吸着\n\
                      右クリック/Enterで確定  矢印:移動  [/]:回転\n\
                      Delete:選択削除  Ctrl+Z:戻す  Ctrl+Y/Ctrl+Shift+Z:やり直し",
@@ -2396,99 +2619,119 @@ impl LocalAdjustLabApp {
         );
     }
 
-    fn draw_crop_controls(&mut self, ui: &mut egui::Ui, btn_size: egui::Vec2) {
+    fn draw_crop_controls(&mut self, ui: &mut egui::Ui) {
         let Some((w, h)) = self.image_dims() else {
             return;
         };
-        ui.label(egui::RichText::new("最後段 crop:").color(Color32::from_gray(200)));
+        let btn_w = ((PANEL_W - 20.0 - 4.0) / 2.0).max(96.0);
+        let btn_size = egui::vec2(btn_w, 24.0);
+        ui.label(
+            egui::RichText::new("切り取り")
+                .size(14.0)
+                .strong()
+                .color(Color32::WHITE),
+        );
         ui.horizontal(|ui| {
-            if panel_toggle_button(ui, "有効", self.crop_enabled, Some(btn_size), false).clicked()
-            {
-                self.crop_enabled = !self.crop_enabled;
-                if self.crop_enabled {
-                    self.ensure_crop_rect();
+            let active = self.crop_is_active();
+            ui.label(
+                egui::RichText::new(if active {
+                    "切り取りあり"
                 } else {
-                    self.crop_drag = None;
-                }
-            }
+                    "切り取りなし"
+                })
+                .color(if active {
+                    Color32::from_rgb(120, 220, 150)
+                } else {
+                    Color32::from_gray(170)
+                }),
+            );
             if panel_toggle_button(ui, "表示", self.crop_overlay, Some(btn_size), false).clicked()
             {
                 self.crop_overlay = !self.crop_overlay;
             }
         });
+
         ui.horizontal(|ui| {
-            if panel_toggle_button(ui, "編集", self.crop_edit_mode, Some(btn_size), false).clicked()
+            if ui
+                .add_sized(btn_size, egui::Button::new("リセット"))
+                .clicked()
             {
-                self.crop_edit_mode = !self.crop_edit_mode;
-                if self.crop_edit_mode {
-                    self.crop_enabled = true;
-                    self.ensure_crop_rect();
-                }
+                self.reset_crop();
             }
-            if ui.add_sized(btn_size, egui::Button::new("全体")).clicked() {
-                self.crop_enabled = true;
-                self.crop_rect = Some(CropRect::full(w, h));
-                self.crop_drag = None;
+            if ui
+                .add_sized(btn_size, egui::Button::new("画像全体"))
+                .clicked()
+            {
+                self.reset_crop();
             }
         });
-        if self.crop_enabled {
-            let mut crop = self
-                .ensure_crop_rect()
-                .unwrap_or_else(|| CropRect::full(w, h));
-            let mut x = crop.min_x.round() as i32;
-            let mut y = crop.min_y.round() as i32;
-            let mut cw = crop.width().round() as i32;
-            let mut ch = crop.height().round() as i32;
-            let mut changed = false;
-            ui.horizontal(|ui| {
-                changed |= ui
-                    .add(egui::DragValue::new(&mut x).range(0..=w.saturating_sub(1) as i32))
-                    .changed();
-                ui.label("X");
-                changed |= ui
-                    .add(egui::DragValue::new(&mut y).range(0..=h.saturating_sub(1) as i32))
-                    .changed();
-                ui.label("Y");
+
+        let selected_text = self.crop_aspect_mode.label();
+        let mut next_mode = self.crop_aspect_mode;
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("比率:").color(Color32::from_gray(200)));
+            lab_combo_box(ui, "crop_aspect_mode", selected_text, |ui| {
+                for mode in CropAspectMode::ALL {
+                    ui.selectable_value(&mut next_mode, mode, mode.label());
+                }
             });
-            ui.horizontal(|ui| {
-                changed |= ui
-                    .add(egui::DragValue::new(&mut cw).range(1..=w.max(1) as i32))
-                    .changed();
-                ui.label("W");
-                changed |= ui
-                    .add(egui::DragValue::new(&mut ch).range(1..=h.max(1) as i32))
-                    .changed();
-                ui.label("H");
-            });
-            if changed {
-                cw = cw.max(1).min(w as i32);
-                ch = ch.max(1).min(h as i32);
-                x = x.clamp(0, w.saturating_sub(1) as i32);
-                y = y.clamp(0, h.saturating_sub(1) as i32);
-                if x + cw > w as i32 {
-                    x = w as i32 - cw;
-                }
-                if y + ch > h as i32 {
-                    y = h as i32 - ch;
-                }
-                crop = CropRect {
-                    min_x: x.max(0) as f32,
-                    min_y: y.max(0) as f32,
-                    max_x: (x + cw).max(1) as f32,
-                    max_y: (y + ch).max(1) as f32,
-                }
-                .sanitized(w, h);
-                self.crop_rect = Some(crop);
-                self.crop_drag = None;
-            }
-            ui.label(
-                egui::RichText::new(
-                    "保存時に最終結果を切り出します。上流のマスク座標は変わりません。",
-                )
+        });
+        if next_mode != self.crop_aspect_mode {
+            self.crop_aspect_mode = next_mode;
+            self.apply_crop_aspect_mode_to_rect();
+        }
+
+        let mut crop = self
+            .ensure_crop_rect()
+            .unwrap_or_else(|| CropRect::full(w, h));
+        let mut x = crop.min_x.round() as i32;
+        let mut y = crop.min_y.round() as i32;
+        let mut cw = crop.width().round() as i32;
+        let mut ch = crop.height().round() as i32;
+        let mut x_changed = false;
+        let mut y_changed = false;
+        let mut w_changed = false;
+        let mut h_changed = false;
+        ui.horizontal(|ui| {
+            x_changed |= ui
+                .add(egui::DragValue::new(&mut x).range(0..=w.saturating_sub(1) as i32))
+                .changed();
+            ui.label("X");
+            y_changed |= ui
+                .add(egui::DragValue::new(&mut y).range(0..=h.saturating_sub(1) as i32))
+                .changed();
+            ui.label("Y");
+        });
+        ui.horizontal(|ui| {
+            w_changed |= ui
+                .add(egui::DragValue::new(&mut cw).range(1..=w.max(1) as i32))
+                .changed();
+            ui.label("W");
+            h_changed |= ui
+                .add(egui::DragValue::new(&mut ch).range(1..=h.max(1) as i32))
+                .changed();
+            ui.label("H");
+        });
+        if x_changed || y_changed || w_changed || h_changed {
+            crop = crop_from_xywh_inputs(
+                x,
+                y,
+                cw,
+                ch,
+                w,
+                h,
+                self.crop_resize_aspect_ratio(),
+                h_changed && !w_changed,
+            );
+            self.crop_rect = Some(crop);
+            self.crop_enabled = !crop.is_full(w, h);
+            self.crop_drag = None;
+        }
+        ui.label(
+            egui::RichText::new("保存時に最終結果を切り出します。上流のマスク座標は変わりません。")
                 .size(10.0)
                 .color(Color32::from_gray(170)),
-            );
-        }
+        );
     }
 
     fn draw_manual_tool_selector(&mut self, ui: &mut egui::Ui, btn_size: egui::Vec2) {
@@ -2721,6 +2964,8 @@ impl LocalAdjustLabApp {
         let pan_mode = ui.input(|i| {
             i.key_down(Key::Space) || i.pointer.button_down(egui::PointerButton::Middle)
         });
+        let adjust_panel_active = self.workflow_panel == LabWorkflowPanel::Adjust;
+        let crop_panel_active = self.workflow_panel == LabWorkflowPanel::Crop;
         let view_input_used =
             self.handle_view_navigation(ui, canvas_rect, rect, img_w, img_h, panel_blocks_pointer);
 
@@ -2750,11 +2995,13 @@ impl LocalAdjustLabApp {
                 .request_repaint_after(Duration::from_millis(EDGE_OVERLAY_REPAINT_MS));
         }
 
-        self.draw_shape_overlay(ui, rect, pointer_screen, !pan_mode && !panel_blocks_pointer);
-        if !pan_mode && !panel_blocks_pointer {
+        if adjust_panel_active {
+            self.draw_shape_overlay(ui, rect, pointer_screen, !pan_mode && !panel_blocks_pointer);
+        }
+        if adjust_panel_active && !pan_mode && !panel_blocks_pointer {
             self.draw_brush_cursor(ui, rect, pointer_screen);
         }
-        let gradient_handle_used = if pan_mode {
+        let gradient_handle_used = if pan_mode || !adjust_panel_active {
             false
         } else {
             self.draw_gradient_handles(ui, rect)
@@ -2765,11 +3012,12 @@ impl LocalAdjustLabApp {
             img_w,
             img_h,
             pointer_screen,
-            !panel_blocks_pointer && !pan_mode,
+            crop_panel_active && !panel_blocks_pointer && !pan_mode,
         );
         let secondary_pressed = ui.input(|i| i.pointer.secondary_pressed());
 
-        if !view_input_used
+        if adjust_panel_active
+            && !view_input_used
             && !panel_blocks_pointer
             && !crop_used
             && (response.hovered() || response.dragged() || response.clicked() || secondary_pressed)
@@ -2863,7 +3111,7 @@ impl LocalAdjustLabApp {
 
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("部分補正レイヤー")
+                                egui::RichText::new("補正レイヤー")
                                     .size(15.0)
                                     .strong()
                                     .color(Color32::WHITE),
@@ -2933,7 +3181,7 @@ impl LocalAdjustLabApp {
     }
 
     fn draw_tool_panel(&mut self, ctx: &egui::Context, full_rect: Rect) {
-        if self.image.is_none() {
+        if self.image.is_none() || self.workflow_panel != LabWorkflowPanel::Adjust {
             self.tool_panel_last_rect = None;
             return;
         }
@@ -2997,7 +3245,7 @@ impl LocalAdjustLabApp {
         if ui
             .add_sized(
                 egui::vec2(btn_w * 2.0 + 4.0, 24.0),
-                egui::Button::new("+ 部分補正レイヤー"),
+                egui::Button::new("+ 補正レイヤー"),
             )
             .clicked()
         {
@@ -3628,7 +3876,7 @@ impl LocalAdjustLabApp {
                 1.0,
                 Color32::from_rgba_unmultiplied(255, 255, 255, 70),
             ));
-        egui::Window::new("部分補正レイヤーを追加")
+        egui::Window::new("補正レイヤーを追加")
             .order(egui::Order::Debug)
             .frame(dialog_frame)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
@@ -4556,7 +4804,8 @@ impl LocalAdjustLabApp {
         pointer_screen: Option<Pos2>,
         pointer_allowed: bool,
     ) -> bool {
-        if !self.crop_enabled {
+        let crop_active = self.crop_is_active();
+        if !self.crop_edit_mode && !(self.crop_overlay && crop_active) {
             self.crop_drag = None;
             return false;
         }
@@ -4565,7 +4814,7 @@ impl LocalAdjustLabApp {
             .unwrap_or_else(|| CropRect::full(img_w, img_h));
         let crop_screen = crop.to_screen_rect(image_rect, img_w, img_h);
         let painter = ui.painter().clone();
-        if self.crop_overlay {
+        if self.crop_overlay && (self.crop_edit_mode || crop_active) {
             for outside in outside_rects(image_rect, crop_screen) {
                 painter.rect_filled(outside, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 145));
             }
@@ -4614,7 +4863,11 @@ impl LocalAdjustLabApp {
                 ui.ctx().set_cursor_icon(crop_handle_cursor(handle));
             }
             if response.drag_started() {
-                self.crop_drag = Some(CropDrag { handle, base: crop });
+                self.crop_drag = Some(CropDrag {
+                    handle,
+                    base: crop,
+                    aspect_ratio: self.crop_resize_aspect_ratio(),
+                });
             }
             if response.dragged()
                 && let Some(drag) = self.crop_drag
@@ -4623,7 +4876,11 @@ impl LocalAdjustLabApp {
                 let delta = response.drag_delta();
                 let delta_x = delta.x * scale_x;
                 let delta_y = delta.y * scale_y;
-                self.crop_rect = Some(drag.base.dragged(handle, delta_x, delta_y, img_w, img_h));
+                let next =
+                    drag.base
+                        .dragged(handle, delta_x, delta_y, img_w, img_h, drag.aspect_ratio);
+                self.crop_enabled = !next.is_full(img_w, img_h);
+                self.crop_rect = Some(next);
             }
         }
         let active_non_body = self
@@ -4650,6 +4907,7 @@ impl LocalAdjustLabApp {
                 self.crop_drag = Some(CropDrag {
                     handle: CropHandle::Body,
                     base: crop,
+                    aspect_ratio: None,
                 });
             }
             if body_response.dragged()
@@ -4659,11 +4917,11 @@ impl LocalAdjustLabApp {
                 let delta = body_response.drag_delta();
                 let delta_x = delta.x * scale_x;
                 let delta_y = delta.y * scale_y;
-                self.crop_rect =
-                    Some(
-                        drag.base
-                            .dragged(CropHandle::Body, delta_x, delta_y, img_w, img_h),
-                    );
+                let next =
+                    drag.base
+                        .dragged(CropHandle::Body, delta_x, delta_y, img_w, img_h, None);
+                self.crop_enabled = !next.is_full(img_w, img_h);
+                self.crop_rect = Some(next);
             }
         }
         if ui.input(|i| !i.pointer.primary_down()) {
@@ -8192,6 +8450,15 @@ impl CropRect {
         (self.max_y - self.min_y).max(1.0)
     }
 
+    fn is_full(self, width: usize, height: usize) -> bool {
+        let full = CropRect::full(width, height);
+        let crop = self.sanitized(width, height);
+        (crop.min_x - full.min_x).abs() < 0.5
+            && (crop.min_y - full.min_y).abs() < 0.5
+            && (crop.max_x - full.max_x).abs() < 0.5
+            && (crop.max_y - full.max_y).abs() < 0.5
+    }
+
     fn sanitized(self, width: usize, height: usize) -> Self {
         let max_w = width.max(1) as f32;
         let max_h = height.max(1) as f32;
@@ -8238,6 +8505,41 @@ impl CropRect {
         )
     }
 
+    fn fit_to_aspect_around_center(self, aspect_ratio: f32, width: usize, height: usize) -> Self {
+        let ratio = aspect_ratio.max(0.01);
+        let max_w = width.max(1) as f32;
+        let max_h = height.max(1) as f32;
+        let base = self.sanitized(width, height);
+        let center = [
+            (base.min_x + base.max_x) * 0.5,
+            (base.min_y + base.max_y) * 0.5,
+        ];
+        let mut crop_w = base.width().min(max_w);
+        let mut crop_h = base.height().min(max_h);
+        if crop_w / crop_h > ratio {
+            crop_w = crop_h * ratio;
+        } else {
+            crop_h = crop_w / ratio;
+        }
+        if crop_w > max_w {
+            crop_w = max_w;
+            crop_h = (crop_w / ratio).min(max_h);
+        }
+        if crop_h > max_h {
+            crop_h = max_h;
+            crop_w = (crop_h * ratio).min(max_w);
+        }
+        let min_x = (center[0] - crop_w * 0.5).clamp(0.0, max_w - crop_w);
+        let min_y = (center[1] - crop_h * 0.5).clamp(0.0, max_h - crop_h);
+        Self {
+            min_x,
+            min_y,
+            max_x: min_x + crop_w,
+            max_y: min_y + crop_h,
+        }
+        .sanitized(width, height)
+    }
+
     fn dragged(
         self,
         handle: CropHandle,
@@ -8245,6 +8547,7 @@ impl CropRect {
         delta_y: f32,
         width: usize,
         height: usize,
+        aspect_ratio: Option<f32>,
     ) -> Self {
         let mut next = self;
         match handle {
@@ -8280,8 +8583,60 @@ impl CropRect {
                 next.max_y += delta_y;
             }
         }
-        next.sanitized(width, height)
+        let next = next.sanitized(width, height);
+        if let Some(ratio) = aspect_ratio {
+            next.fit_to_aspect_around_center(ratio, width, height)
+        } else {
+            next
+        }
     }
+}
+
+fn crop_from_xywh_inputs(
+    x: i32,
+    y: i32,
+    cw: i32,
+    ch: i32,
+    width: usize,
+    height: usize,
+    aspect_ratio: Option<f32>,
+    prefer_height: bool,
+) -> CropRect {
+    let mut x = x.clamp(0, width.saturating_sub(1) as i32);
+    let mut y = y.clamp(0, height.saturating_sub(1) as i32);
+    let mut cw = cw.max(1).min(width.max(1) as i32);
+    let mut ch = ch.max(1).min(height.max(1) as i32);
+    if let Some(ratio) = aspect_ratio {
+        let ratio = ratio.max(0.01);
+        if prefer_height {
+            cw = ((ch as f32 * ratio).round() as i32).max(1);
+            if cw > width as i32 {
+                cw = width as i32;
+                ch = ((cw as f32 / ratio).round() as i32).max(1);
+            }
+        } else {
+            ch = ((cw as f32 / ratio).round() as i32).max(1);
+            if ch > height as i32 {
+                ch = height as i32;
+                cw = ((ch as f32 * ratio).round() as i32).max(1);
+            }
+        }
+    }
+    cw = cw.min(width.max(1) as i32);
+    ch = ch.min(height.max(1) as i32);
+    if x + cw > width as i32 {
+        x = width as i32 - cw;
+    }
+    if y + ch > height as i32 {
+        y = height as i32 - ch;
+    }
+    CropRect {
+        min_x: x.max(0) as f32,
+        min_y: y.max(0) as f32,
+        max_x: (x + cw).max(1) as f32,
+        max_y: (y + ch).max(1) as f32,
+    }
+    .sanitized(width, height)
 }
 
 fn crop_handle_points(rect: Rect) -> [(CropHandle, Pos2); 9] {
@@ -8813,6 +9168,27 @@ mod tests {
             crop_handle_cursor(CropHandle::NorthEast),
             egui::CursorIcon::ResizeNeSw
         );
+    }
+
+    #[test]
+    fn crop_resize_handle_shrinks_without_resetting_to_full() {
+        let full = CropRect::full(100, 80);
+        let crop = full.dragged(CropHandle::East, -20.0, 0.0, 100, 80, None);
+
+        assert!(!crop.is_full(100, 80));
+        assert_eq!(crop.min_x, 0.0);
+        assert_eq!(crop.max_x, 80.0);
+        assert_eq!(crop.max_y, 80.0);
+    }
+
+    #[test]
+    fn crop_xywh_inputs_can_lock_aspect_ratio() {
+        let crop = crop_from_xywh_inputs(0, 0, 160, 100, 200, 200, Some(16.0 / 9.0), false);
+
+        assert_eq!(crop.min_x, 0.0);
+        assert_eq!(crop.min_y, 0.0);
+        assert_eq!(crop.max_x, 160.0);
+        assert_eq!(crop.max_y, 90.0);
     }
 
     #[test]
