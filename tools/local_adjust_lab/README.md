@@ -174,7 +174,11 @@ tools/local_adjust_lab/models/sam2_hiera_tiny/decoder.onnx
 ```
 
 The current prototype uses grid foreground point prompts. Encoder results are
-computed once per run, decoder candidates above the IoU threshold are collected,
-and the resulting soft masks are converted into the same partitioned
-`RegionMask`. This is meant for quality and workflow validation; model download
-and GPU/DirectML packaging are still future integration work.
+computed once per run, the best decoder candidate per grid point is kept, then
+stability filtering and mask-IoU NMS remove unstable or duplicate candidates.
+The resulting soft masks are converted into the same partitioned `RegionMask`.
+SAM2 candidate masks often overlap, so the SAM2 path gives each pixel to the
+first high-score candidate instead of making every overlap into a separate
+region. This keeps the result coarser and more practical for clicking. This is
+meant for quality and workflow validation; model download and GPU/DirectML
+packaging are still future integration work.

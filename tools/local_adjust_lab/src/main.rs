@@ -927,6 +927,8 @@ struct LocalAdjustLabApp {
     region_candidate_mask_threshold: f32,
     sam2_grid_size: usize,
     sam2_iou_threshold: f32,
+    sam2_stability_threshold: f32,
+    sam2_nms_iou_threshold: f32,
     sam2_max_candidates: usize,
     line_width: f32,
     lasso_points: Vec<[f32; 2]>,
@@ -1003,9 +1005,11 @@ impl LocalAdjustLabApp {
             region_color_tolerance: 42.0,
             region_min_area: 64,
             region_candidate_mask_threshold: 0.5,
-            sam2_grid_size: 8,
-            sam2_iou_threshold: 0.78,
-            sam2_max_candidates: 64,
+            sam2_grid_size: 4,
+            sam2_iou_threshold: 0.85,
+            sam2_stability_threshold: 0.88,
+            sam2_nms_iou_threshold: 0.72,
+            sam2_max_candidates: 24,
             line_width: 28.0,
             lasso_points: Vec::new(),
             shape_drag_start: None,
@@ -1999,6 +2003,8 @@ impl LocalAdjustLabApp {
         let min_area = self.region_min_area.max(1);
         let grid_size = self.sam2_grid_size.clamp(2, 24);
         let iou_threshold = self.sam2_iou_threshold.clamp(0.0, 1.0);
+        let stability_threshold = self.sam2_stability_threshold.clamp(0.0, 1.0);
+        let nms_iou_threshold = self.sam2_nms_iou_threshold.clamp(0.0, 1.0);
         let max_candidates = self.sam2_max_candidates.clamp(1, 128);
         let (tx, rx) = mpsc::channel();
         let spawn_result = std::thread::Builder::new()
@@ -2009,10 +2015,12 @@ impl LocalAdjustLabApp {
                     &paths,
                     grid_size,
                     iou_threshold,
+                    stability_threshold,
+                    nms_iou_threshold,
                     max_candidates,
                 )
                 .and_then(|candidate_masks| {
-                    build_region_segmentation_from_candidate_masks(
+                    build_region_segmentation_from_candidate_masks_greedy(
                         &source,
                         subject.as_ref(),
                         scope,
@@ -4214,6 +4222,12 @@ impl LocalAdjustLabApp {
         }
         ui.add(egui::Slider::new(&mut self.sam2_iou_threshold, 0.0..=1.0).text("IoUしきい値"))
             .on_hover_text("SAM2 decoder の候補スコアがこの値以上のマスクだけを採用します。");
+        ui.add(
+            egui::Slider::new(&mut self.sam2_stability_threshold, 0.0..=1.0).text("安定度しきい値"),
+        )
+        .on_hover_text("境界が不安定な候補マスクを捨てます。高いほど破片が減ります。");
+        ui.add(egui::Slider::new(&mut self.sam2_nms_iou_threshold, 0.1..=0.95).text("重複除去"))
+            .on_hover_text("似た候補マスクをNMSで捨てるしきい値です。低いほど重複を強く削ります。");
         let mut max_candidates = self.sam2_max_candidates as i32;
         if ui
             .add(egui::Slider::new(&mut max_candidates, 1..=128).text("最大候補"))
@@ -4251,7 +4265,7 @@ impl LocalAdjustLabApp {
         }
         ui.label(
             egui::RichText::new(
-                "encoder/decoder ONNXを使い、グリッド点プロンプトから候補マスクを生成して領域分割へ流します。",
+                "encoder/decoder ONNXを使い、各グリッド点の最良候補をstability/NMSで整理してから、高スコア候補優先で粗く塗り分けます。",
             )
             .size(10.0)
             .color(Color32::from_gray(170)),
@@ -8309,6 +8323,7 @@ struct Sam2PreprocessMeta {
 
 struct Sam2CandidateMask {
     score: f32,
+    stability: f32,
     mask: RasterMask,
 }
 
@@ -8317,6 +8332,8 @@ fn run_sam2_candidate_masks(
     paths: &Sam2ModelPaths,
     grid_size: usize,
     iou_threshold: f32,
+    stability_threshold: f32,
+    nms_iou_threshold: f32,
     max_candidates: usize,
 ) -> Result<Vec<RasterMask>, String> {
     ensure_lab_ort_loaded()?;
@@ -8355,12 +8372,14 @@ fn run_sam2_candidate_masks(
     let grid_size = grid_size.clamp(2, 24);
     let max_candidates = max_candidates.clamp(1, 128);
     let iou_threshold = iou_threshold.clamp(0.0, 1.0);
+    let stability_threshold = stability_threshold.clamp(0.0, 1.0);
+    let nms_iou_threshold = nms_iou_threshold.clamp(0.0, 1.0);
     let mut candidates = Vec::new();
     for gy in 0..grid_size {
         for gx in 0..grid_size {
             let x = (gx as f32 + 0.5) * source.width as f32 / grid_size as f32;
             let y = (gy as f32 + 0.5) * source.height as f32 / grid_size as f32;
-            let prompt_candidates = run_sam2_decoder_point(
+            let mut prompt_candidates = run_sam2_decoder_point(
                 &mut decoder,
                 &image_embed,
                 &high_res_feats_0,
@@ -8369,16 +8388,16 @@ fn run_sam2_candidate_masks(
                 meta,
                 [x, y],
                 iou_threshold,
+                stability_threshold,
             )?;
-            candidates.extend(prompt_candidates);
+            prompt_candidates.sort_by(sam2_candidate_rank_desc);
+            if let Some(candidate) = prompt_candidates.into_iter().next() {
+                candidates.push(candidate);
+            }
         }
     }
-    candidates.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    candidates.truncate(max_candidates);
+    candidates.sort_by(sam2_candidate_rank_desc);
+    candidates = sam2_nms(candidates, nms_iou_threshold, max_candidates);
     if candidates.is_empty() {
         return Err("SAM2候補マスクが生成されませんでした。しきい値を下げてください。".to_string());
     }
@@ -8397,6 +8416,7 @@ fn run_sam2_decoder_point(
     meta: Sam2PreprocessMeta,
     point: [f32; 2],
     iou_threshold: f32,
+    stability_threshold: f32,
 ) -> Result<Vec<Sam2CandidateMask>, String> {
     let scale_x = meta.resized_w as f32 / source.width.max(1) as f32;
     let scale_y = meta.resized_h as f32 / source.height.max(1) as f32;
@@ -8452,6 +8472,7 @@ fn run_sam2_decoder_point(
         source.height,
         meta,
         iou_threshold,
+        stability_threshold,
     )
 }
 
@@ -8516,6 +8537,7 @@ fn sam2_decoder_outputs_to_candidate_masks(
     dst_h: usize,
     meta: Sam2PreprocessMeta,
     iou_threshold: f32,
+    stability_threshold: f32,
 ) -> Result<Vec<Sam2CandidateMask>, String> {
     let (num_masks, mask_w, mask_h, mask_offset) =
         sam2_mask_output_layout(&mask_shape, mask_raw.len())?;
@@ -8546,8 +8568,13 @@ fn sam2_decoder_outputs_to_candidate_masks(
         if alpha.iter().filter(|&&v| v >= 0.5).count() < min_candidate_area {
             continue;
         }
+        let stability = mask_stability_score(&alpha, 0.5, 0.05);
+        if stability < stability_threshold {
+            continue;
+        }
         candidates.push(Sam2CandidateMask {
             score,
+            stability,
             mask: RasterMask {
                 width: dst_w,
                 height: dst_h,
@@ -8556,6 +8583,77 @@ fn sam2_decoder_outputs_to_candidate_masks(
         });
     }
     Ok(candidates)
+}
+
+fn sam2_candidate_rank_desc(a: &Sam2CandidateMask, b: &Sam2CandidateMask) -> std::cmp::Ordering {
+    let a_rank = a.score * a.stability;
+    let b_rank = b.score * b.stability;
+    b_rank
+        .partial_cmp(&a_rank)
+        .unwrap_or(std::cmp::Ordering::Equal)
+}
+
+fn sam2_nms(
+    candidates: Vec<Sam2CandidateMask>,
+    iou_threshold: f32,
+    max_candidates: usize,
+) -> Vec<Sam2CandidateMask> {
+    let mut kept: Vec<Sam2CandidateMask> = Vec::new();
+    'candidate: for candidate in candidates {
+        for existing in &kept {
+            if raster_mask_iou(&candidate.mask, &existing.mask, 0.5) > iou_threshold {
+                continue 'candidate;
+            }
+        }
+        kept.push(candidate);
+        if kept.len() >= max_candidates {
+            break;
+        }
+    }
+    kept
+}
+
+fn raster_mask_iou(a: &RasterMask, b: &RasterMask, threshold: f32) -> f32 {
+    if a.width != b.width || a.height != b.height || a.alpha.len() != b.alpha.len() {
+        return 0.0;
+    }
+    let mut intersection = 0_usize;
+    let mut union = 0_usize;
+    for (&av, &bv) in a.alpha.iter().zip(&b.alpha) {
+        let am = av >= threshold;
+        let bm = bv >= threshold;
+        if am && bm {
+            intersection += 1;
+        }
+        if am || bm {
+            union += 1;
+        }
+    }
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f32 / union as f32
+    }
+}
+
+fn mask_stability_score(alpha: &[f32], threshold: f32, offset: f32) -> f32 {
+    let high_threshold = (threshold + offset).clamp(0.0, 1.0);
+    let low_threshold = (threshold - offset).clamp(0.0, 1.0);
+    let mut high = 0_usize;
+    let mut low = 0_usize;
+    for &v in alpha {
+        if v >= low_threshold {
+            low += 1;
+            if v >= high_threshold {
+                high += 1;
+            }
+        }
+    }
+    if low == 0 {
+        1.0
+    } else {
+        high as f32 / low as f32
+    }
 }
 
 fn sam2_mask_output_layout(
@@ -8840,6 +8938,123 @@ fn build_region_segmentation_from_candidate_masks(
         labels,
         selected,
     })
+}
+
+fn build_region_segmentation_from_candidate_masks_greedy(
+    source: &RgbaImageBuf,
+    subject: Option<&RasterMask>,
+    scope: RegionSegmentationScope,
+    candidate_masks: &[RasterMask],
+    threshold: f32,
+    min_area: usize,
+) -> Result<RegionMask, String> {
+    let len = source.width.saturating_mul(source.height);
+    validate_candidate_masks(source, subject, candidate_masks)?;
+    let threshold = threshold.clamp(0.0, 1.0);
+    let min_area = min_area.max(1);
+    let membership_allowed: Vec<bool> = (0..len)
+        .map(|idx| region_membership_allowed(source, subject, scope, idx))
+        .collect();
+    let mut owner = vec![0_u16; len];
+    for (idx, owner_slot) in owner.iter_mut().enumerate() {
+        if !membership_allowed[idx] {
+            continue;
+        }
+        for (mask_idx, mask) in candidate_masks.iter().enumerate() {
+            if mask.alpha[idx] >= threshold {
+                *owner_slot = (mask_idx + 1).min(u16::MAX as usize) as u16;
+                break;
+            }
+        }
+    }
+
+    let mut visited = vec![false; len];
+    let mut labels = vec![0_u32; len];
+    let mut label = 0_u32;
+    let mut queue = VecDeque::new();
+    let mut component = Vec::new();
+
+    for start in 0..len {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        if !membership_allowed[start] {
+            continue;
+        }
+        let owner_id = owner[start];
+        queue.clear();
+        component.clear();
+        queue.push_back(start);
+        while let Some(idx) = queue.pop_front() {
+            component.push(idx);
+            let x = idx % source.width;
+            let y = idx / source.width;
+            for (nx, ny) in region_neighbors(x, y, source.width, source.height) {
+                let nidx = ny * source.width + nx;
+                if visited[nidx] || !membership_allowed[nidx] || owner[nidx] != owner_id {
+                    continue;
+                }
+                visited[nidx] = true;
+                queue.push_back(nidx);
+            }
+        }
+        if component.len() >= min_area && (label as usize) < REGION_SEGMENT_MAX_LABELS {
+            label += 1;
+            for &idx in &component {
+                labels[idx] = label;
+            }
+        }
+    }
+
+    fill_unlabeled_region_pixels(
+        &mut labels,
+        source.width,
+        source.height,
+        &membership_allowed,
+    );
+
+    let selected = vec![false; label as usize + 1];
+    Ok(RegionMask {
+        width: source.width,
+        height: source.height,
+        labels,
+        selected,
+    })
+}
+
+fn validate_candidate_masks(
+    source: &RgbaImageBuf,
+    subject: Option<&RasterMask>,
+    candidate_masks: &[RasterMask],
+) -> Result<(), String> {
+    let len = source.width.saturating_mul(source.height);
+    if source.pixels.len() != len.saturating_mul(4) {
+        return Err("invalid source RGBA buffer".to_string());
+    }
+    if candidate_masks.is_empty() {
+        return Err("候補マスクがありません。".to_string());
+    }
+    if candidate_masks.len() > 128 {
+        return Err(format!(
+            "候補マスクは128枚までです: {} 枚",
+            candidate_masks.len()
+        ));
+    }
+    if let Some(mask) = subject
+        && (mask.width != source.width || mask.height != source.height || mask.alpha.len() != len)
+    {
+        return Err("subject mask size does not match image".to_string());
+    }
+    for (idx, mask) in candidate_masks.iter().enumerate() {
+        if mask.width != source.width || mask.height != source.height || mask.alpha.len() != len {
+            return Err(format!(
+                "candidate mask size does not match image: {}",
+                idx + 1
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn region_seed_allowed(
@@ -11155,6 +11370,91 @@ mod tests {
     }
 
     #[test]
+    fn greedy_candidate_mask_segmentation_uses_first_matching_mask() {
+        let source = RgbaImageBuf::new(
+            4,
+            1,
+            vec![
+                10, 10, 10, 255, 20, 20, 20, 255, 30, 30, 30, 255, 40, 40, 40, 255,
+            ],
+        )
+        .unwrap();
+        let mask_a = RasterMask {
+            width: 4,
+            height: 1,
+            alpha: vec![1.0, 1.0, 1.0, 0.0],
+        };
+        let mask_b = RasterMask {
+            width: 4,
+            height: 1,
+            alpha: vec![0.0, 1.0, 1.0, 1.0],
+        };
+        let mask = build_region_segmentation_from_candidate_masks_greedy(
+            &source,
+            None,
+            RegionSegmentationScope::Full,
+            &[mask_a, mask_b],
+            0.5,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(mask.label_count(), 2);
+        assert_eq!(mask.labels[0], mask.labels[1]);
+        assert_eq!(mask.labels[1], mask.labels[2]);
+        assert_ne!(mask.labels[2], mask.labels[3]);
+    }
+
+    #[test]
+    fn sam2_nms_removes_near_duplicate_masks() {
+        let mask_a = RasterMask {
+            width: 3,
+            height: 1,
+            alpha: vec![1.0, 1.0, 0.0],
+        };
+        let mask_b = RasterMask {
+            width: 3,
+            height: 1,
+            alpha: vec![1.0, 1.0, 0.0],
+        };
+        let mask_c = RasterMask {
+            width: 3,
+            height: 1,
+            alpha: vec![0.0, 0.0, 1.0],
+        };
+        let kept = sam2_nms(
+            vec![
+                Sam2CandidateMask {
+                    score: 0.9,
+                    stability: 1.0,
+                    mask: mask_a,
+                },
+                Sam2CandidateMask {
+                    score: 0.8,
+                    stability: 1.0,
+                    mask: mask_b,
+                },
+                Sam2CandidateMask {
+                    score: 0.7,
+                    stability: 1.0,
+                    mask: mask_c,
+                },
+            ],
+            0.7,
+            8,
+        );
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn mask_stability_score_drops_soft_edges() {
+        let crisp = vec![1.0, 1.0, 0.0, 0.0];
+        let soft = vec![0.51, 0.52, 0.48, 0.49];
+        assert!(mask_stability_score(&crisp, 0.5, 0.05) > 0.9);
+        assert!(mask_stability_score(&soft, 0.5, 0.05) < 0.5);
+    }
+
+    #[test]
     fn sam2_preprocess_preserves_aspect_in_square_input() {
         let source = RgbaImageBuf::new(
             4,
@@ -11197,6 +11497,7 @@ mod tests {
                 resized_h: SAM2_INPUT_SIZE,
             },
             0.5,
+            0.0,
         )
         .unwrap();
         assert_eq!(candidates.len(), 1);
@@ -11251,7 +11552,7 @@ mod tests {
             }
         }
         let source = RgbaImageBuf::new(width, height, pixels).unwrap();
-        let masks = run_sam2_candidate_masks(&source, &paths, 2, 0.0, 8).unwrap();
+        let masks = run_sam2_candidate_masks(&source, &paths, 2, 0.0, 0.0, 0.95, 8).unwrap();
         assert!(!masks.is_empty());
         assert!(
             masks

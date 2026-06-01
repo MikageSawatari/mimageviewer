@@ -895,8 +895,11 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   選択できる
 - `local_adjust_lab` に、`models/sam2_hiera_tiny/encoder.onnx` と `decoder.onnx`
   がある場合に SAM2 Hiera Tiny を直接回す試験経路を追加した。まず encoder を1回実行し、
-  画像上のグリッド点を foreground prompt として decoder に渡す。IoUしきい値を超えた
-  候補マスクを集め、外部候補マスクと同じ排他的 `RegionMask` 変換へ流す
+  画像上のグリッド点を foreground prompt として decoder に渡す。各点では最良候補だけを残し、
+  stability score と mask IoU NMS で不安定 / 重複候補を減らしてから、排他的 `RegionMask`
+  変換へ流す。SAM2は候補マスク同士が重なりやすく、交差領域をすべて別領域にすると
+  過剰分割になるため、SAM2経路では高スコア候補を優先して各ピクセルを最初に当たった候補へ
+  割り当てる粗い統合を使う
 - 効果: Tone (自然な彩度を含む) / Clarity / Highlights-Shadows / Blur / Soft Focus /
   Mosaic / Sharpen / HSL / Tone Curve / Dehaze / Look / Bloom / Vignette / Film Grain /
   Chromatic Aberration / Halftone / Cross-Star Glow / Edge-preserving Smooth
