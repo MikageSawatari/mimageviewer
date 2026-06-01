@@ -16,10 +16,10 @@ use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     BloomParams, BlurParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
     ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
-    CubeLutParams, DehazeParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, FilmGrainParams,
-    GradientMapParams, GradientMapPreset, HalftoneParams, HighlightsShadowsParams, HslParams,
-    InvertParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
-    LookParams, LookPreset, ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams,
+    CubeLutParams, DehazeParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EqualizeParams,
+    FilmGrainParams, GradientMapParams, GradientMapPreset, HalftoneParams, HighlightsShadowsParams,
+    HslParams, InvertParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect,
+    LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MosaicBoundary, MosaicParams,
     MosaicTileMode, PosterizeParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
     RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp,
     SharpenParams, SoftFocusParams, StarGlowParams, ThreeWayColorGradingParams, ThresholdParams,
@@ -949,6 +949,7 @@ enum EffectKind {
     Threshold,
     Invert,
     Duotone,
+    Equalize,
     GradientMap,
     Bloom,
     Vignette,
@@ -985,6 +986,7 @@ impl EffectKind {
             LocalEffect::Threshold(_) => Self::Threshold,
             LocalEffect::Invert(_) => Self::Invert,
             LocalEffect::Duotone(_) => Self::Duotone,
+            LocalEffect::Equalize(_) => Self::Equalize,
             LocalEffect::GradientMap(_) => Self::GradientMap,
             LocalEffect::Bloom(_) => Self::Bloom,
             LocalEffect::Vignette(_) => Self::Vignette,
@@ -1021,6 +1023,7 @@ impl EffectKind {
             Self::Threshold => "2値化",
             Self::Invert => "階調反転/ネガ",
             Self::Duotone => "ダブルトーン",
+            Self::Equalize => "ヒストグラム平坦化",
             Self::GradientMap => "グラデーションマップ",
             Self::Bloom => "ブルーム",
             Self::Vignette => "ビネット",
@@ -1061,6 +1064,9 @@ impl EffectKind {
             Self::Threshold => "明るさをしきい値で黒と白に分け、線画やモノクロ風にします。",
             Self::Invert => "RGBの明暗を反転し、ネガフィルムのような見た目にします。",
             Self::Duotone => "明暗を2色または3色へ置き換え、印刷やポスターのような色味にします。",
+            Self::Equalize => {
+                "明暗の分布を広げ、自動補正のように眠い画像のコントラストを整えます。"
+            }
             Self::GradientMap => {
                 "明るさを指定したグラデーションの色へ置き換え、色設計や色トレス風に使います。"
             }
@@ -1105,6 +1111,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::Threshold,
             EffectKind::Invert,
             EffectKind::Duotone,
+            EffectKind::Equalize,
             EffectKind::GradientMap,
         ],
     },
@@ -6400,6 +6407,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::Duotone(params) => {
             format!("ダブルトーン {}", duotone_preset_label(params.preset))
         }
+        LocalEffect::Equalize(params) => format!("平坦化 {:.0}%", params.strength * 100.0),
         LocalEffect::GradientMap(params) => {
             format!(
                 "グラデーション {}",
@@ -8138,6 +8146,53 @@ fn draw_effect_params(
             changed |= contrast.changed();
             contrast.lab_hover_tip("色を割り当てる前に明暗差を締めたり広げたりします。");
         }
+        LocalEffect::Equalize(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "弱") {
+                    *params = EqualizeParams {
+                        strength: 0.35,
+                        preserve_color: true,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "中") {
+                    *params = EqualizeParams {
+                        strength: 0.65,
+                        preserve_color: true,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "強") {
+                    *params = EqualizeParams {
+                        strength: 1.0,
+                        preserve_color: true,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "白黒") {
+                    *params = EqualizeParams {
+                        strength: 1.0,
+                        preserve_color: false,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "画像全体の明暗分布を広げます。色を保つと元の色味をなるべく残し、白黒にすると輝度だけで階調を整えます。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強度"));
+            changed |= strength.changed();
+            strength
+                .lab_hover_tip("元画像からヒストグラム平坦化した結果へどれだけ近づけるかです。");
+            let preserve = ui.checkbox(&mut params.preserve_color, "色を保つ");
+            changed |= preserve.changed();
+            preserve.lab_hover_tip("ONにすると、明るさだけを広げて元の色相をなるべく維持します。OFFにすると白黒の平坦化になります。");
+        }
         LocalEffect::GradientMap(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -9727,6 +9782,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Threshold => LocalEffect::Threshold(ThresholdParams::default()),
         EffectKind::Invert => LocalEffect::Invert(InvertParams::default()),
         EffectKind::Duotone => LocalEffect::Duotone(DuotoneParams::default()),
+        EffectKind::Equalize => LocalEffect::Equalize(EqualizeParams::default()),
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),

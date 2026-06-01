@@ -886,7 +886,7 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   に残す
 - 効果: Tone (自然な彩度を含む) / Tone Curve / RGB Curve / Color Balance /
   3-way Color Grading / Selective Color / Channel Mixer / Color Mixer / Clarity / Highlights-Shadows /
-  Blur / Soft Focus / Mosaic / Sharpen / HSL / Dehaze / Look / 3D LUT / Posterize / Threshold / Invert / Duotone / Gradient Map / Bloom /
+  Blur / Soft Focus / Mosaic / Sharpen / HSL / Dehaze / Look / 3D LUT / Posterize / Threshold / Invert / Duotone / Equalize / Gradient Map / Bloom /
   Vignette / Film Grain / Chromatic Aberration / Halftone / Cross-Star Glow /
   Edge-preserving Smooth
 - 3D LUT は `.cube` の `LUT_3D_SIZE` / `DOMAIN_MIN` / `DOMAIN_MAX` / `LUT_3D_INPUT_RANGE` を読み取り、RGB 3D table

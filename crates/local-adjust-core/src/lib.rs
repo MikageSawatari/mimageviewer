@@ -423,6 +423,7 @@ pub enum LocalEffect {
     Threshold(ThresholdParams),
     Invert(InvertParams),
     Duotone(DuotoneParams),
+    Equalize(EqualizeParams),
     GradientMap(GradientMapParams),
     Bloom(BloomParams),
     Vignette(VignetteParams),
@@ -1028,6 +1029,21 @@ impl Default for DuotoneParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EqualizeParams {
+    pub strength: f32,
+    pub preserve_color: bool,
+}
+
+impl Default for EqualizeParams {
+    fn default() -> Self {
+        Self {
+            strength: 0.0,
+            preserve_color: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GradientMapPreset {
     None,
@@ -1322,6 +1338,7 @@ fn apply_layer(image: &mut RgbaImageBuf, layer: &LocalAdjustmentLayer) -> Result
         LocalEffect::Threshold(params) => apply_threshold(&image.pixels, *params),
         LocalEffect::Invert(params) => apply_invert(&image.pixels, *params),
         LocalEffect::Duotone(params) => apply_duotone(&image.pixels, *params),
+        LocalEffect::Equalize(params) => apply_equalize(&image.pixels, *params),
         LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
         LocalEffect::Bloom(params) => {
             apply_bloom(&image.pixels, image.width, image.height, *params)
@@ -2777,6 +2794,75 @@ fn duotone_rgb(t: f32, preset: DuotonePreset) -> [f32; 3] {
     }
 }
 
+fn apply_equalize(src: &[u8], params: EqualizeParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || src.len() < 4 {
+        return src.to_vec();
+    }
+
+    let pixel_count = src.len() / 4;
+    let mut hist = [0_usize; 256];
+    for px in src.chunks_exact(4) {
+        let luma = luma01(
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        );
+        hist[(luma * 255.0).round() as usize] += 1;
+    }
+
+    let mut cumulative = 0_usize;
+    let mut cdf_min = None;
+    for count in hist {
+        cumulative += count;
+        if cumulative > 0 {
+            cdf_min = Some(cumulative);
+            break;
+        }
+    }
+    let Some(cdf_min) = cdf_min else {
+        return src.to_vec();
+    };
+    if cdf_min >= pixel_count {
+        return src.to_vec();
+    }
+
+    let denom = (pixel_count - cdf_min) as f32;
+    let mut lut = [0.0_f32; 256];
+    cumulative = 0;
+    for (i, count) in hist.iter().copied().enumerate() {
+        cumulative += count;
+        lut[i] = (cumulative.saturating_sub(cdf_min) as f32 / denom).clamp(0.0, 1.0);
+    }
+
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let r = px[0] as f32 / 255.0;
+        let g = px[1] as f32 / 255.0;
+        let b = px[2] as f32 / 255.0;
+        let luma = luma01(r, g, b);
+        let mapped_luma = lut[(luma * 255.0).round() as usize];
+        let mapped = if params.preserve_color {
+            if luma > 1.0 / 255.0 {
+                let scale = mapped_luma / luma;
+                [
+                    (r * scale).clamp(0.0, 1.0),
+                    (g * scale).clamp(0.0, 1.0),
+                    (b * scale).clamp(0.0, 1.0),
+                ]
+            } else {
+                [mapped_luma, mapped_luma, mapped_luma]
+            }
+        } else {
+            [mapped_luma, mapped_luma, mapped_luma]
+        };
+        px[0] = to_u8(lerp_f32(r, mapped[0], strength));
+        px[1] = to_u8(lerp_f32(g, mapped[1], strength));
+        px[2] = to_u8(lerp_f32(b, mapped[2], strength));
+    }
+    out
+}
+
 fn apply_gradient_map(src: &[u8], params: GradientMapParams) -> Vec<u8> {
     let strength = params.strength.clamp(0.0, 1.0);
     if params.preset == GradientMapPreset::None || strength <= f32::EPSILON {
@@ -3728,6 +3814,7 @@ mod tests {
             LocalEffect::Threshold(ThresholdParams::default()),
             LocalEffect::Invert(InvertParams::default()),
             LocalEffect::Duotone(DuotoneParams::default()),
+            LocalEffect::Equalize(EqualizeParams::default()),
             LocalEffect::GradientMap(GradientMapParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
@@ -4243,6 +4330,33 @@ LUT_3D_SIZE 2
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(&out.pixels[0..4], &[5, 0, 0, 255]);
         assert_eq!(&out.pixels[4..8], &[255, 46, 26, 255]);
+    }
+
+    #[test]
+    fn equalize_spreads_luminance_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            4,
+            1,
+            vec![
+                64, 64, 64, 10, 96, 96, 96, 20, 128, 128, 128, 30, 160, 160, 160, 40,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "equalize",
+            LocalMask::Full,
+            LocalEffect::Equalize(EqualizeParams {
+                strength: 1.0,
+                preserve_color: true,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(
+            out.pixels,
+            vec![
+                0, 0, 0, 10, 85, 85, 85, 20, 170, 170, 170, 30, 255, 255, 255, 40
+            ]
+        );
     }
 
     #[test]
