@@ -884,7 +884,79 @@ impl EffectKind {
             Self::EdgeSmooth => "エッジ保持ぼかし",
         }
     }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::None => "このレイヤーで加工を行わず、マスクだけを準備します。",
+            Self::Tone => "明るさ、コントラスト、彩度、色温度などをまとめて調整します。",
+            Self::ToneCurve => "暗部から明部までの明るさをカーブで細かく調整します。",
+            Self::Clarity => "局所コントラストを上げ、輪郭や質感をくっきり見せます。",
+            Self::HighlightsShadows => "明るい部分と暗い部分を個別に持ち上げたり抑えたりします。",
+            Self::Dehaze => "白っぽさを減らし、遠景や薄いコントラストを締めます。",
+            Self::Blur => "選択範囲を均一にぼかします。背景ぼかしや軽い隠しに使います。",
+            Self::SoftFocus => "ぼかした画像を重ね、柔らかく発光したような印象にします。",
+            Self::Mosaic => "選択範囲をモザイク化します。隠蔽加工と同じ境界処理を選べます。",
+            Self::Sharpen => "輪郭を強調して、少し眠い画像を引き締めます。",
+            Self::Hsl => "色相、彩度、明度を調整し、髪色変更などの色替えに使います。",
+            Self::Look => "夕焼け、夜景、フィルム風などのまとまった色味を適用します。",
+            Self::Bloom => "明るい部分を周囲へにじませ、発光感を足します。",
+            Self::Vignette => "周辺を暗く、または明るくして視線を中央へ誘導します。",
+            Self::FilmGrain => "粒状感を加え、フィルムや紙っぽい質感を作ります。",
+            Self::ChromaticAberration => "RGBを少しずらし、レンズやデジタル風の色ズレを作ります。",
+            Self::Halftone => "明るさをドットパターンに変換し、漫画や印刷風にします。",
+            Self::StarGlow => "明るい部分から十字や多方向の光線を描写します。",
+            Self::EdgeSmooth => "輪郭をなるべく残しながら面をなめらかにします。",
+        }
+    }
 }
+
+struct EffectGroup {
+    title: &'static str,
+    kinds: &'static [EffectKind],
+}
+
+const EFFECT_GROUPS: &[EffectGroup] = &[
+    EffectGroup {
+        title: "基本",
+        kinds: &[EffectKind::None],
+    },
+    EffectGroup {
+        title: "色調・カラー",
+        kinds: &[
+            EffectKind::Tone,
+            EffectKind::ToneCurve,
+            EffectKind::Hsl,
+            EffectKind::HighlightsShadows,
+            EffectKind::Dehaze,
+            EffectKind::Look,
+        ],
+    },
+    EffectGroup {
+        title: "ぼかし・ディテール",
+        kinds: &[
+            EffectKind::Blur,
+            EffectKind::SoftFocus,
+            EffectKind::Clarity,
+            EffectKind::Sharpen,
+            EffectKind::EdgeSmooth,
+        ],
+    },
+    EffectGroup {
+        title: "隠蔽・加工",
+        kinds: &[EffectKind::Mosaic],
+    },
+    EffectGroup {
+        title: "光・雰囲気",
+        kinds: &[
+            EffectKind::Bloom,
+            EffectKind::StarGlow,
+            EffectKind::Vignette,
+            EffectKind::FilmGrain,
+            EffectKind::ChromaticAberration,
+            EffectKind::Halftone,
+        ],
+    },
+];
 
 struct LocalAdjustLabApp {
     image: Option<LoadedImage>,
@@ -943,6 +1015,7 @@ struct LocalAdjustLabApp {
     crop_create_drag: Option<CropCreateDrag>,
     add_layer_dialog_open: bool,
     add_layer_mask_kind: MaskKind,
+    effect_picker_dialog_open: bool,
     status: String,
     view_zoom: f32,
     view_pan: egui::Vec2,
@@ -1017,6 +1090,7 @@ impl LocalAdjustLabApp {
             crop_create_drag: None,
             add_layer_dialog_open: false,
             add_layer_mask_kind: MaskKind::Raster,
+            effect_picker_dialog_open: false,
             status: "JPEG / PNG をドロップしてください。".to_string(),
             view_zoom: 1.0,
             view_pan: egui::Vec2::ZERO,
@@ -2848,14 +2922,36 @@ impl LocalAdjustLabApp {
         }
 
         ui.separator();
-        if let Some(layer) = self.selected_layer_mut() {
-            if draw_effect_kind_selector(ui, layer) {
-                self.mark_dirty();
-            }
-        }
+        self.draw_effect_selector(ui);
 
         ui.separator();
         self.draw_manual_tool_selector(ui, btn_size);
+    }
+
+    fn draw_effect_selector(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("加工内容:").color(Color32::from_gray(200)));
+        let label = self
+            .layers
+            .get(self.selected_layer)
+            .map(|layer| effect_summary(&layer.effect))
+            .unwrap_or_else(|| "効果なし".to_string());
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                egui::vec2((PANEL_W - 82.0).max(160.0), 24.0),
+                egui::Label::new(
+                    egui::RichText::new(label)
+                        .size(12.0)
+                        .color(Color32::from_gray(230)),
+                ),
+            );
+            if ui
+                .add_sized(egui::vec2(74.0, 24.0), egui::Button::new("効果選択"))
+                .on_hover_text("効果をグループ別の一覧から選びます。")
+                .clicked()
+            {
+                self.effect_picker_dialog_open = true;
+            }
+        });
     }
 
     fn draw_save_controls(&mut self, ui: &mut egui::Ui, btn_size: egui::Vec2) {
@@ -4193,6 +4289,94 @@ impl LocalAdjustLabApp {
         }
     }
 
+    fn draw_effect_picker_dialog(&mut self, ctx: &egui::Context) {
+        if !self.effect_picker_dialog_open {
+            return;
+        }
+        if self.layers.is_empty() {
+            self.effect_picker_dialog_open = false;
+            return;
+        }
+
+        let current_kind = self
+            .layers
+            .get(self.selected_layer)
+            .map(|layer| EffectKind::from_effect(&layer.effect))
+            .unwrap_or(EffectKind::None);
+        let mut open = self.effect_picker_dialog_open;
+        let mut selected_kind = None;
+        let dialog_frame = egui::Frame::window(ctx.style().as_ref())
+            .fill(Color32::from_rgba_unmultiplied(24, 24, 26, 248))
+            .stroke(egui::Stroke::new(
+                1.0,
+                Color32::from_rgba_unmultiplied(255, 255, 255, 70),
+            ));
+        egui::Window::new("効果選択")
+            .order(egui::Order::Debug)
+            .frame(dialog_frame)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .default_height(520.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                apply_lab_dark_ui(ui);
+                ui.label(
+                    egui::RichText::new(
+                        "使いたい効果を選んでください。各ボタンにカーソルを置くと説明が出ます。",
+                    )
+                    .size(11.0)
+                    .color(Color32::from_gray(180)),
+                );
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .max_height(440.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for group in EFFECT_GROUPS {
+                            ui.label(
+                                egui::RichText::new(group.title)
+                                    .size(13.0)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            );
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                                for &kind in group.kinds {
+                                    let selected = kind == current_kind;
+                                    let fill = if selected {
+                                        Color32::from_rgb(36, 112, 150)
+                                    } else {
+                                        Color32::from_rgba_unmultiplied(70, 70, 70, 190)
+                                    };
+                                    let response = ui
+                                        .add_sized(
+                                            egui::vec2(130.0, 28.0),
+                                            egui::Button::new(kind.label()).fill(fill),
+                                        )
+                                        .on_hover_text(kind.description());
+                                    if response.clicked() {
+                                        selected_kind = Some(kind);
+                                    }
+                                }
+                            });
+                            ui.add_space(8.0);
+                        }
+                    });
+            });
+
+        self.effect_picker_dialog_open = open;
+        if let Some(kind) = selected_kind
+            && let Some(layer) = self.selected_layer_mut()
+        {
+            layer.effect = default_effect(kind);
+            self.effect_picker_dialog_open = false;
+            self.status = format!("加工内容を「{}」に変更しました。", kind.label());
+            self.mark_dirty();
+        }
+    }
+
     fn handle_view_navigation(
         &mut self,
         ui: &mut egui::Ui,
@@ -5466,6 +5650,7 @@ impl eframe::App for LocalAdjustLabApp {
                 self.draw_tool_panel(ctx, full_rect);
             });
         self.draw_add_layer_dialog(ctx);
+        self.draw_effect_picker_dialog(ctx);
         let app_update_ms = update_start.elapsed().as_secs_f64() * 1000.0;
         self.perf_stats.app_update_ms_total += app_update_ms;
         self.perf_stats.app_update_ms_max = self.perf_stats.app_update_ms_max.max(app_update_ms);
@@ -5835,43 +6020,6 @@ fn draw_range_sliders(ui: &mut egui::Ui, mask: &mut RangeMask, label: &str) -> b
     changed |= ui
         .add(egui::Slider::new(&mut mask.feather, 0.0..=1.0).text("範囲ぼかし"))
         .changed();
-    changed
-}
-
-fn draw_effect_kind_selector(ui: &mut egui::Ui, layer: &mut LocalAdjustmentLayer) -> bool {
-    let mut changed = false;
-    ui.label(egui::RichText::new("加工内容:").color(Color32::from_gray(200)));
-    let mut kind = EffectKind::from_effect(&layer.effect);
-    let before = kind;
-    lab_combo_box(ui, "effect_kind", kind.label(), |ui| {
-        for candidate in [
-            EffectKind::None,
-            EffectKind::Tone,
-            EffectKind::ToneCurve,
-            EffectKind::Clarity,
-            EffectKind::HighlightsShadows,
-            EffectKind::Dehaze,
-            EffectKind::Blur,
-            EffectKind::SoftFocus,
-            EffectKind::Mosaic,
-            EffectKind::Sharpen,
-            EffectKind::Hsl,
-            EffectKind::Look,
-            EffectKind::Bloom,
-            EffectKind::Vignette,
-            EffectKind::FilmGrain,
-            EffectKind::ChromaticAberration,
-            EffectKind::Halftone,
-            EffectKind::StarGlow,
-            EffectKind::EdgeSmooth,
-        ] {
-            ui.selectable_value(&mut kind, candidate, candidate.label());
-        }
-    });
-    if kind != before {
-        layer.effect = default_effect(kind);
-        changed = true;
-    }
     changed
 }
 

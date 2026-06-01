@@ -26,6 +26,7 @@
 | [file-drag-drop-design.md](file-drag-drop-design.md) | グリッドからエクスプローラ等へファイルをドラッグ送出 (コピー) する機能の実装設計＋実装メモ。シェル `IDataObject` + `SHDoDragDrop` 方式。実装済み (2026-05、`src/file_drag.rs`)、残るは §8.2 の実機検証 |
 | [auto-thumb-aspect-plan.md](auto-thumb-aspect-plan.md) | サムネイル比率の自動選択 (`thumb_aspect_auto`) の設計と実装計画。`log(ratio)` の中央値 → 最近接バケット方式 + 6 段ゲート (min_samples / 連勝継続 / cooldown / 切替上限 / 入力 idle / log 距離マージン)。実装済み (2026-05、`src/auto_aspect.rs`) |
 | [local-adjustment-layer-v1.1.0-plan.md](local-adjustment-layer-v1.1.0-plan.md) | **Codex 案**。v1.1.0 候補の画像補正ピボット計画。全体補正の強化、手描き/グラデーション/範囲/セグメンテーション生成マスク、マスク反転付きの部分補正レイヤーを、消しゴム後・隠蔽加工前の非破壊レイヤーとして追加する設計 |
+| [local-adjust-filter-candidates.md](local-adjust-filter-candidates.md) | 補正レイヤーへ追加していくフィルタ候補リスト。イラスト用途を主眼に、効果選択 UI 方針、優先度、実装難易度、詳細設計を整理 |
 | [ai-suggested-mask-v1.1.0-plan.md](ai-suggested-mask-v1.1.0-plan.md) | **Codex 案**。v1.1.0 候補の AI 提案マスク設計案。標準の顔検出 + ユーザー指定 ONNX 検出モデルを、消しゴム / 隠蔽加工のマスクオブジェクト生成に接続する。バッチ生成を v1.1.0 に含め、ShapeMeta / モデル登録 UI を提案 |
 | [auto-mask-detection-plan.md](auto-mask-detection-plan.md) | **Claude 案** (上記 Codex 案と対). 同じ v1.1.0 自動マスク機能を実コードの型/関数 (`Shape`@mask_db.rs / `commit_conceal_shape`@ui_conceal.rs / `runtime.rs` / `ai_upscale` worker) に接続して設計。標準=MIT 同梱 YuNet、追加=BYO (`DetectorProfile`+`OutputFormat`、deepghs サイドカー自動読取)。v1.1.0 は現ページ対象・一括は将来フェーズ。検証済みライセンス表付き |
 

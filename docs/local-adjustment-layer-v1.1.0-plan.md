@@ -887,8 +887,11 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
 - 効果: Tone (自然な彩度を含む) / Clarity / Highlights-Shadows / Blur / Soft Focus /
   Mosaic / Sharpen / HSL / Tone Curve / Dehaze / Look / Bloom / Vignette / Film Grain /
   Chromatic Aberration / Halftone / Cross-Star Glow / Edge-preserving Smooth
-- 加工内容のプルダウンは候補が増えたため縦サイズを広めにし、各効果は選択直後に
-  なるべく無加工になる default とする。実用値は「プリセット」ボタンで投入し、
+- 加工内容はプルダウンではなく、左パネルの現在効果表示 + `効果選択` ボタンで扱う。
+  `効果選択` はグループ別のダイアログを開き、効果ボタンのホバーで説明を表示する。
+  フィルタ数が増えても選びやすくするため、詳細方針は [local-adjust-filter-candidates.md](local-adjust-filter-candidates.md)
+  の UI 方針に合わせる
+- 各効果は選択直後になるべく無加工になる default とする。実用値は「プリセット」ボタンで投入し、
   個別のスライダーやプリセットで調整する。加工内容が効果なしの間はリセットを出さず、
   効果選択後だけ「リセット」で default に戻せるようにする
 - Look は未選択状態を `選択してください` として持ち、強度の default は 1.0 にする。
