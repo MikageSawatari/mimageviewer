@@ -658,6 +658,79 @@ impl OverrideEditTarget {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MaskPreviewColors {
+    base_rgb: [u8; 3],
+    edit_rgb: [u8; 3],
+    boundary_rgb: [u8; 3],
+}
+
+impl MaskPreviewColors {
+    fn base(self, alpha: u8) -> Color32 {
+        Color32::from_rgba_unmultiplied(self.base_rgb[0], self.base_rgb[1], self.base_rgb[2], alpha)
+    }
+
+    fn edit(self, alpha: u8) -> Color32 {
+        Color32::from_rgba_unmultiplied(self.edit_rgb[0], self.edit_rgb[1], self.edit_rgb[2], alpha)
+    }
+
+    fn boundary(self, alpha: u8) -> Color32 {
+        Color32::from_rgba_unmultiplied(
+            self.boundary_rgb[0],
+            self.boundary_rgb[1],
+            self.boundary_rgb[2],
+            alpha,
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaskColorPreset {
+    PinkCyan,
+    CyanOrange,
+    YellowViolet,
+}
+
+impl MaskColorPreset {
+    const ALL: [Self; 3] = [Self::PinkCyan, Self::CyanOrange, Self::YellowViolet];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::PinkCyan => "1",
+            Self::CyanOrange => "2",
+            Self::YellowViolet => "3",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::PinkCyan => "ピンク / 水色",
+            Self::CyanOrange => "シアン / オレンジ",
+            Self::YellowViolet => "黄 / 紫",
+        }
+    }
+
+    fn colors(self) -> MaskPreviewColors {
+        match self {
+            Self::PinkCyan => MaskPreviewColors {
+                base_rgb: [255, 48, 84],
+                edit_rgb: [64, 190, 255],
+                boundary_rgb: [255, 245, 120],
+            },
+            Self::CyanOrange => MaskPreviewColors {
+                base_rgb: [0, 205, 255],
+                edit_rgb: [255, 150, 40],
+                boundary_rgb: [255, 235, 80],
+            },
+            Self::YellowViolet => MaskPreviewColors {
+                base_rgb: [255, 225, 40],
+                edit_rgb: [185, 115, 255],
+                boundary_rgb: [80, 230, 255],
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaskKind {
     Full,
@@ -831,6 +904,7 @@ struct LocalAdjustLabApp {
     redo_stack: Vec<Vec<LocalAdjustmentLayer>>,
     show_source: bool,
     show_mask: bool,
+    mask_color_preset: MaskColorPreset,
     preview_to_selected_layer: bool,
     crop_enabled: bool,
     crop_overlay: bool,
@@ -905,6 +979,7 @@ impl LocalAdjustLabApp {
             redo_stack: Vec::new(),
             show_source: false,
             show_mask: true,
+            mask_color_preset: MaskColorPreset::PinkCyan,
             preview_to_selected_layer: false,
             crop_enabled: false,
             crop_overlay: true,
@@ -994,6 +1069,20 @@ impl LocalAdjustLabApp {
         self.mask_dirty = true;
         self.mask_dirty_tiles = None;
         self.last_edit = Instant::now();
+    }
+
+    fn reveal_mask_preview(&mut self) {
+        self.show_mask = true;
+    }
+
+    fn mark_mask_changed(&mut self) {
+        self.reveal_mask_preview();
+        self.mark_dirty();
+    }
+
+    fn mark_mask_tiles_changed(&mut self, new_tiles: BTreeSet<(usize, usize)>) {
+        self.reveal_mask_preview();
+        self.mark_dirty_tiles(new_tiles);
     }
 
     fn mark_dirty_tiles(&mut self, new_tiles: BTreeSet<(usize, usize)>) {
@@ -1098,7 +1187,7 @@ impl LocalAdjustLabApp {
             && let Some(slot) = mask.shapes.get_mut(shape_idx)
         {
             *slot = f(*slot);
-            self.mark_dirty();
+            self.mark_mask_changed();
             return true;
         }
         false
@@ -1380,7 +1469,7 @@ impl LocalAdjustLabApp {
         self.override_edit_panel = None;
         self.add_layer_mask_kind = mask_kind;
         self.add_layer_dialog_open = false;
-        self.mark_dirty();
+        self.mark_mask_changed();
     }
 
     fn toggle_override_edit_panel(&mut self, target: OverrideEditTarget) {
@@ -1409,7 +1498,7 @@ impl LocalAdjustLabApp {
         self.layers.insert(insert_at, copy);
         self.selected_layer = insert_at;
         self.reset_override_edit_state_for_selected_layer();
-        self.mark_dirty();
+        self.mark_mask_changed();
     }
 
     fn copy_mask_from_layer(&mut self, source_idx: usize) {
@@ -1425,7 +1514,7 @@ impl LocalAdjustLabApp {
         }
         self.selected_shape = None;
         self.status = format!("レイヤー {} からマスクをコピーしました。", source_idx + 1);
-        self.mark_dirty();
+        self.mark_mask_changed();
     }
 
     fn clear_selected_manual_override(&mut self) {
@@ -1441,7 +1530,7 @@ impl LocalAdjustLabApp {
         }
         self.selected_shape = None;
         self.status = "追加/削除マスクをクリアしました。".to_string();
-        self.mark_dirty();
+        self.mark_mask_changed();
     }
 
     fn remove_selected_layer(&mut self) {
@@ -1636,7 +1725,7 @@ impl LocalAdjustLabApp {
                 self.selected_layer = layer_idx;
                 self.selected_shape = None;
                 self.status = status;
-                self.mark_dirty();
+                self.mark_mask_changed();
                 ctx.request_repaint();
             }
             Ok(Err(e)) => {
@@ -1871,6 +1960,7 @@ impl LocalAdjustLabApp {
         }
         let total_start = Instant::now();
         let eval_start = Instant::now();
+        let mask_colors = self.mask_color_preset.colors();
         let mask = if use_fast_tile_eval {
             None
         } else {
@@ -1920,6 +2010,7 @@ impl LocalAdjustLabApp {
                         mask,
                         &self.layers[self.selected_layer],
                         preview_edit_target,
+                        mask_colors,
                         width,
                         tile_x,
                         tile_y,
@@ -1935,6 +2026,7 @@ impl LocalAdjustLabApp {
                         tile_w,
                         tile_h,
                         time_sec,
+                        mask_colors,
                     )
                 };
                 if let Some(texture) = cache.tiles[tile_idx].as_mut() {
@@ -2443,7 +2535,7 @@ impl LocalAdjustLabApp {
                 BitmapMaskOp::Expand => dilate_alpha(&mask.alpha, w, h),
                 BitmapMaskOp::Shrink => erode_alpha(&mask.alpha, w, h),
             };
-            self.mark_dirty();
+            self.mark_mask_changed();
         }
     }
 
@@ -2540,7 +2632,7 @@ impl LocalAdjustLabApp {
                 brush_alpha,
             );
         }
-        self.mark_dirty();
+        self.mark_mask_changed();
     }
 
     fn commit_shape(&mut self, shape: MaskShape) {
@@ -2552,7 +2644,7 @@ impl LocalAdjustLabApp {
             self.selected_shape = Some(mask.shapes.len() - 1);
             self.status = "オブジェクトを追加しました。選択ツールで調整できます。".to_string();
         }
-        self.mark_dirty();
+        self.mark_mask_changed();
     }
 
     fn pick_color(&mut self, p: Pos2) {
@@ -2583,7 +2675,7 @@ impl LocalAdjustLabApp {
             }),
         };
         self.status = format!("色を取得: #{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
-        self.mark_dirty();
+        self.mark_mask_changed();
     }
 
     fn toggle_region_at(&mut self, p: Pos2, selected: bool) {
@@ -2617,7 +2709,7 @@ impl LocalAdjustLabApp {
                 } else {
                     format!("領域 {label} を解除しました。")
                 };
-                self.mark_dirty();
+                self.mark_mask_changed();
             }
         }
     }
@@ -2660,6 +2752,37 @@ impl LocalAdjustLabApp {
                 .clicked()
             {
                 self.show_mask = !self.show_mask;
+            }
+        });
+        ui.add_space(2.0);
+        ui.label(egui::RichText::new("マスクカラー:").color(Color32::from_gray(200)));
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            let color_btn_w = ((btn_size.x * 2.0 + 4.0 - 8.0) / 3.0).max(42.0);
+            for preset in MaskColorPreset::ALL {
+                let selected = self.mask_color_preset == preset;
+                let colors = preset.colors();
+                let button = egui::Button::new(
+                    egui::RichText::new(preset.label())
+                        .strong()
+                        .color(Color32::WHITE),
+                )
+                .fill(colors.base(if selected { 145 } else { 80 }))
+                .stroke(if selected {
+                    egui::Stroke::new(1.5, colors.edit(255))
+                } else {
+                    egui::Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 255, 255, 35))
+                });
+                if ui
+                    .add_sized(egui::vec2(color_btn_w, 22.0), button)
+                    .on_hover_text(preset.description())
+                    .clicked()
+                {
+                    self.mask_color_preset = preset;
+                    self.reveal_mask_preview();
+                    self.mask_dirty = true;
+                    self.mask_dirty_tiles = None;
+                }
             }
         });
     }
@@ -2721,7 +2844,7 @@ impl LocalAdjustLabApp {
             changed |= draw_effect_kind_selector(ui, layer);
         }
         if changed {
-            self.mark_dirty();
+            self.mark_mask_changed();
         }
 
         ui.separator();
@@ -3712,7 +3835,7 @@ impl LocalAdjustLabApp {
             changed |= draw_mask_controls(ui, layer, dims);
         }
         if changed {
-            self.mark_dirty();
+            self.mark_mask_changed();
         }
         if selected_mask_kind == Some(MaskKind::Subject) {
             ui.separator();
@@ -3771,13 +3894,13 @@ impl LocalAdjustLabApp {
                 && let Some(layer) = self.selected_layer_mut()
             {
                 layer.mask_inverted = false;
-                self.mark_dirty();
+                self.mark_mask_changed();
             }
             if ui.button("背景を選択").clicked()
                 && let Some(layer) = self.selected_layer_mut()
             {
                 layer.mask_inverted = true;
-                self.mark_dirty();
+                self.mark_mask_changed();
             }
         });
         ui.label(
@@ -3898,11 +4021,11 @@ impl LocalAdjustLabApp {
             );
         }
         if mark_dirty {
-            self.mark_dirty();
+            self.mark_mask_changed();
         }
         ui.label(
             egui::RichText::new(
-                "画像上の色分け領域をクリックまたはドラッグして、追加/解除します。選択中の領域はピンクと明るい境界で表示します。",
+                "画像上の色分け領域をクリックまたはドラッグして、追加/解除します。選択中の領域はマスクカラーと明るい境界で表示します。",
             )
             .size(10.0)
             .color(Color32::from_gray(170)),
@@ -4221,7 +4344,7 @@ impl LocalAdjustLabApp {
                         }
                         self.radial_gradient_drag_active = false;
                         self.status = "円形グラデーションをクリアしました。".to_string();
-                        self.mark_dirty();
+                        self.mark_mask_changed();
                         return;
                     }
                     if primary_down && (!initialized || self.radial_gradient_drag_active) {
@@ -4300,9 +4423,9 @@ impl LocalAdjustLabApp {
                     );
                     if changed {
                         if !dirty_tiles.is_empty() {
-                            self.mark_dirty_tiles(dirty_tiles);
+                            self.mark_mask_tiles_changed(dirty_tiles);
                         } else {
-                            self.mark_dirty();
+                            self.mark_mask_changed();
                         }
                     }
                     ui.ctx().request_repaint();
@@ -4384,9 +4507,9 @@ impl LocalAdjustLabApp {
                     );
                     if changed {
                         if !dirty_tiles.is_empty() {
-                            self.mark_dirty_tiles(dirty_tiles);
+                            self.mark_mask_tiles_changed(dirty_tiles);
                         } else {
-                            self.mark_dirty();
+                            self.mark_mask_changed();
                         }
                     }
                     ui.ctx().request_repaint();
@@ -4439,9 +4562,9 @@ impl LocalAdjustLabApp {
                     );
                     if changed {
                         if !dirty_tiles.is_empty() {
-                            self.mark_dirty_tiles(dirty_tiles);
+                            self.mark_mask_tiles_changed(dirty_tiles);
                         } else {
-                            self.mark_dirty();
+                            self.mark_mask_changed();
                         }
                     }
                     ui.ctx().request_repaint();
@@ -4553,7 +4676,7 @@ impl LocalAdjustLabApp {
                 && let Some(slot) = mask.shapes.get_mut(drag.shape_idx)
             {
                 *slot = new_shape;
-                self.mark_dirty();
+                self.mark_mask_changed();
             }
         }
         if primary_released {
@@ -4951,7 +5074,7 @@ impl LocalAdjustLabApp {
         }
 
         if changed {
-            self.mark_dirty();
+            self.mark_mask_changed();
         }
         used
     }
@@ -5156,7 +5279,7 @@ impl LocalAdjustLabApp {
                 } else {
                     mask.end = n;
                 }
-                self.mark_dirty();
+                self.mark_mask_changed();
             }
             LocalMask::RadialGradient(mask) => {
                 if started || !mask.initialized {
@@ -5175,7 +5298,7 @@ impl LocalAdjustLabApp {
                     mask.inner_radius = (radius * 0.45).min(radius - 0.001).max(0.0);
                     mask.inner_radius_y = mask.inner_radius;
                 }
-                self.mark_dirty();
+                self.mark_mask_changed();
             }
             _ => {}
         }
@@ -5253,7 +5376,7 @@ impl eframe::App for LocalAdjustLabApp {
                 {
                     mask.shapes.remove(shape_idx);
                     self.selected_shape = None;
-                    self.mark_dirty();
+                    self.mark_mask_changed();
                 }
             }
         }
@@ -8371,6 +8494,7 @@ fn build_mask_tile_image(
     mask: &[f32],
     layer: &LocalAdjustmentLayer,
     edit_target: Option<OverrideEditTarget>,
+    colors: MaskPreviewColors,
     image_width: usize,
     tile_x: usize,
     tile_y: usize,
@@ -8390,11 +8514,11 @@ fn build_mask_tile_image(
                 .map(|manual| raster_vector_alpha_at(manual, idx, x, y) >= 0.5)
                 .unwrap_or(false);
             if editing_mask {
-                pixels.push(Color32::from_rgba_unmultiplied(64, 190, 255, 225));
+                pixels.push(colors.edit(225));
             } else {
                 let alpha =
                     (mask.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0) * 155.0).round() as u8;
-                pixels.push(Color32::from_rgba_unmultiplied(255, 48, 84, alpha));
+                pixels.push(colors.base(alpha));
             }
         }
     }
@@ -8463,6 +8587,7 @@ fn build_mask_tile_image_from_layer(
     tile_w: usize,
     tile_h: usize,
     time_sec: f32,
+    colors: MaskPreviewColors,
 ) -> ColorImage {
     match &layer.mask {
         LocalMask::RasterVector(mask) => {
@@ -8490,7 +8615,7 @@ fn build_mask_tile_image_from_layer(
                     }
                     alpha = (alpha * opacity).clamp(0.0, 1.0);
                     let alpha_u8 = (alpha * 155.0).round() as u8;
-                    pixels.push(Color32::from_rgba_unmultiplied(255, 48, 84, alpha_u8));
+                    pixels.push(colors.base(alpha_u8));
                 }
             }
             ColorImage::new([tile_w, tile_h], pixels)
@@ -8503,6 +8628,7 @@ fn build_mask_tile_image_from_layer(
                     pixels.push(region_preview_pixel(
                         mask,
                         layer.mask_inverted,
+                        colors,
                         x,
                         y,
                         row + x,
@@ -8522,6 +8648,7 @@ fn build_mask_tile_image_from_layer(
 fn region_preview_pixel(
     mask: &RegionMask,
     inverted: bool,
+    colors: MaskPreviewColors,
     x: usize,
     y: usize,
     idx: usize,
@@ -8534,9 +8661,9 @@ fn region_preview_pixel(
     let active = region_label_active(mask, inverted, label);
     if active {
         if region_active_boundary(mask, inverted, label, x, y) {
-            return Color32::from_rgba_unmultiplied(255, 245, 120, 235);
+            return colors.boundary(235);
         }
-        return Color32::from_rgba_unmultiplied(255, 42, 112, 188);
+        return colors.base(188);
     }
     if region_label_boundary(mask, label, x, y) {
         let [r, g, b] = animated_region_boundary_color(label, time_sec);
@@ -9412,7 +9539,17 @@ mod tests {
             shapes: Vec::new(),
         });
 
-        let image = build_mask_tile_image(&[1.0, 0.0, 0.5], &layer, None, 3, 0, 0, 3, 1);
+        let image = build_mask_tile_image(
+            &[1.0, 0.0, 0.5],
+            &layer,
+            None,
+            MaskColorPreset::PinkCyan.colors(),
+            3,
+            0,
+            0,
+            3,
+            1,
+        );
 
         assert_eq!(
             image.pixels[0],
@@ -9452,6 +9589,7 @@ mod tests {
             &[0.2, 0.8, 0.5],
             &layer,
             Some(OverrideEditTarget::Add),
+            MaskColorPreset::PinkCyan.colors(),
             3,
             0,
             0,
@@ -9491,6 +9629,7 @@ mod tests {
             &[1.0, 0.8, 0.5],
             &layer,
             Some(OverrideEditTarget::Subtract),
+            MaskColorPreset::PinkCyan.colors(),
             3,
             0,
             0,
@@ -9509,6 +9648,42 @@ mod tests {
         assert_eq!(
             image.pixels[2],
             Color32::from_rgba_unmultiplied(255, 48, 84, 78)
+        );
+    }
+
+    #[test]
+    fn mask_preview_color_preset_changes_base_and_edit_colors() {
+        let mut layer = LocalAdjustmentLayer::new(
+            "mask",
+            LocalMask::Full,
+            LocalEffect::Tone(ToneParams::default()),
+        );
+        layer.manual_override.add = Some(RasterVectorMask {
+            width: 2,
+            height: 1,
+            alpha: vec![1.0, 0.0],
+            shapes: Vec::new(),
+        });
+
+        let image = build_mask_tile_image(
+            &[0.5, 0.75],
+            &layer,
+            Some(OverrideEditTarget::Add),
+            MaskColorPreset::CyanOrange.colors(),
+            2,
+            0,
+            0,
+            2,
+            1,
+        );
+
+        assert_eq!(
+            image.pixels[0],
+            Color32::from_rgba_unmultiplied(255, 150, 40, 225)
+        );
+        assert_eq!(
+            image.pixels[1],
+            Color32::from_rgba_unmultiplied(0, 205, 255, 116)
         );
     }
 

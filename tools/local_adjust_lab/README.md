@@ -64,9 +64,12 @@ the window.
   - For non-manual mask sources, Add Mask / Subtract Mask tool panels are hidden
     by default. Press Add Mask or Subtract Mask to open that edit
     panel; pressing the same button again closes it without creating a mask.
-  - Mask preview colors: when both edit panels are closed, the final mask is
-    pink. While editing Add Mask, the base mask is pink and the add mask is cyan.
-    While editing Subtract Mask, base + add is pink and the subtract mask is cyan.
+  - Mask preview colors are selectable from three presets. When both edit panels
+    are closed, the final mask uses the base color. While editing Add Mask, the
+    base mask uses the base color and the add mask uses the edit color. While
+    editing Subtract Mask, base + add uses the base color and the subtract mask
+    uses the edit color.
+  - Creating or editing a mask automatically turns the mask preview on.
   - Copy only the mask data and mask modifiers from another layer while keeping
     the current layer's effect and opacity
 - Effects:
@@ -130,7 +133,7 @@ lightweight color/connectivity/boundary based algorithm, optionally constrained
 to an existing subject mask. Generated regions start unselected. Unselected
 candidates are shown as animated colored boundaries only; click or drag on the
 image to add/remove individual regions from the final mask. Selected regions are
-shown in pink with a bright boundary. Lower color tolerance creates finer
+shown with the selected mask color and a bright boundary. Lower color tolerance creates finer
 splits; higher tolerance merges similar colors. Higher minimum area drops small fragments.
 Boundary pixels and other unlabeled internal gaps are assigned to the nearest
 generated region so adjacent selected regions compose into a continuous mask.
