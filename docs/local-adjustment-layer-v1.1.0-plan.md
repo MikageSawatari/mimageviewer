@@ -884,7 +884,7 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   試験経路をいったん実装したが、AI イラストで期待する意味単位の領域分割にならなかったため
   削除した。失敗内容と再導入条件は [ai-region-segmentation-retrospective.md](ai-region-segmentation-retrospective.md)
   に残す
-- 効果: Tone (自然な彩度を含む) / Tone Curve / RGB Curve / Color Balance /
+- 効果: Tone (自然な彩度・tint を含む) / Tone Curve / RGB Curve / Color Balance /
   3-way Color Grading / Selective Color / Channel Mixer / Color Mixer / Clarity / Highlights-Shadows /
   Blur / Soft Focus / Mosaic / Sharpen / HSL / Dehaze / Look / 3D LUT / Posterize / Threshold / Invert / Duotone / Equalize / Gradient Map / Bloom /
   Vignette / Film Grain / Chromatic Aberration / Halftone / Cross-Star Glow /

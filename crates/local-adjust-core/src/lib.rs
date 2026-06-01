@@ -442,6 +442,8 @@ pub struct ToneParams {
     pub saturation: f32,
     pub vibrance: f32,
     pub temperature: f32,
+    #[serde(default)]
+    pub tint: f32,
 }
 
 impl Default for ToneParams {
@@ -453,6 +455,7 @@ impl Default for ToneParams {
             saturation: 0.0,
             vibrance: 0.0,
             temperature: 0.0,
+            tint: 0.0,
         }
     }
 }
@@ -2159,6 +2162,11 @@ fn tone_rgb(rgb: [u8; 3], params: ToneParams) -> [u8; 3] {
     r += temp * 0.08;
     b -= temp * 0.08;
 
+    let tint = (params.tint / 100.0).clamp(-1.0, 1.0);
+    r += tint * 0.05;
+    g -= tint * 0.07;
+    b += tint * 0.05;
+
     let brightness = params.brightness / 100.0;
     r += brightness;
     g += brightness;
@@ -3571,6 +3579,36 @@ mod tests {
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert!(out.pixels[0] > 64);
         assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn tone_tint_shifts_green_magenta_axis() {
+        let src = solid(1, 1, [128, 128, 128, 77]);
+        let magenta_layer = LocalAdjustmentLayer::new(
+            "magenta",
+            LocalMask::Full,
+            LocalEffect::Tone(ToneParams {
+                tint: 100.0,
+                ..Default::default()
+            }),
+        );
+        let magenta = apply_layers(src.as_ref(), &[magenta_layer]).unwrap();
+        assert!(magenta.pixels[0] > magenta.pixels[1]);
+        assert!(magenta.pixels[2] > magenta.pixels[1]);
+        assert_eq!(magenta.pixels[3], 77);
+
+        let green_layer = LocalAdjustmentLayer::new(
+            "green",
+            LocalMask::Full,
+            LocalEffect::Tone(ToneParams {
+                tint: -100.0,
+                ..Default::default()
+            }),
+        );
+        let green = apply_layers(src.as_ref(), &[green_layer]).unwrap();
+        assert!(green.pixels[1] > green.pixels[0]);
+        assert!(green.pixels[1] > green.pixels[2]);
+        assert_eq!(green.pixels[3], 77);
     }
 
     #[test]

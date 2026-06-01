@@ -6780,6 +6780,20 @@ fn draw_effect_params(
                     };
                     changed = true;
                 }
+                if preset_button(ui, "緑かぶり補正") {
+                    *params = ToneParams {
+                        tint: 28.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "マゼンタ補正") {
+                    *params = ToneParams {
+                        tint: -28.0,
+                        ..Default::default()
+                    };
+                    changed = true;
+                }
             });
             changed |= ui
                 .add(egui::Slider::new(&mut params.brightness, -100.0..=100.0).text("明るさ"))
@@ -6799,6 +6813,23 @@ fn draw_effect_params(
             changed |= ui
                 .add(egui::Slider::new(&mut params.temperature, -100.0..=100.0).text("色温度"))
                 .changed();
+            let tint_response = ui.add(
+                egui::Slider::new(&mut params.tint, -100.0..=100.0)
+                    .text("色かぶり補正")
+                    .custom_formatter(|v, _| {
+                        if v.abs() < 0.5 {
+                            "0".to_string()
+                        } else if v > 0.0 {
+                            format!("マゼンタ {:.0}", v)
+                        } else {
+                            format!("緑 {:.0}", -v)
+                        }
+                    }),
+            );
+            changed |= tint_response.changed();
+            tint_response.lab_hover_tip(
+                "緑-マゼンタ方向の色かぶりを補正します。右へ動かすとマゼンタ寄り、左へ動かすと緑寄りになります。",
+            );
         }
         LocalEffect::ToneCurve(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));

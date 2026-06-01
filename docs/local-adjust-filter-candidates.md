@@ -48,7 +48,7 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
 ### `LocalEffect` (部分補正レイヤー、31種)
-Tone(明度/コントラスト/γ/彩度/vibrance/色温度), ToneCurve(5点・RGB合成),
+Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
@@ -82,7 +82,7 @@ OilPaint(Kuwahara) / Sketch(Sobel) / LightLeak / 減色8機種 / CRT 3種＋複�
 - [x] **階調反転 / ネガ** **易** — 反転。local に無い (全ソフト)
 - [x] **ダブルトーン / トライトーン** **易** — グラデマップの特殊化。ポスター調 (PS)
 - [x] **ヒストグラム平坦化 (Equalize)** **易** — 自動補正 (PS / Krita)
-- [ ] **`Tone` に tint (緑-マゼンタ) 追加** **易** — 現状 temperature のみで WB として不完全 (Lightroom)
+- [x] **`Tone` に tint (緑-マゼンタ) 追加** **易** — 現状 temperature のみで WB として不完全 (Lightroom)
 
 ---
 
