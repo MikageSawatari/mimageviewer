@@ -5933,12 +5933,27 @@ fn draw_effect_params(
     image_dims: (usize, usize),
 ) -> bool {
     let mut changed = false;
-    ui.label(
-        egui::RichText::new("加工パラメータ")
-            .size(14.0)
-            .strong()
-            .color(Color32::WHITE),
-    );
+    let effect_kind = EffectKind::from_effect(&layer.effect);
+    let has_effect = !matches!(&layer.effect, LocalEffect::None);
+    ui.horizontal(|ui| {
+        ui.label(
+            egui::RichText::new("加工パラメータ")
+                .size(14.0)
+                .strong()
+                .color(Color32::WHITE),
+        );
+        if has_effect {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("リセット").clicked() {
+                    layer.effect = default_effect(effect_kind);
+                    changed = true;
+                }
+            });
+        }
+    });
+    if changed {
+        return true;
+    }
     match &mut layer.effect {
         LocalEffect::None => {
             ui.label("加工内容を選ぶと、このレイヤーの効果が有効になります。");

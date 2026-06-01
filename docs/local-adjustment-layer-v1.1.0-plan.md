@@ -888,8 +888,8 @@ RGBA image + ordered LocalAdjustmentLayer list -> same-size RGBA image
   Chromatic Aberration / Halftone / Cross-Star Glow / Edge-preserving Smooth
 - 加工内容のプルダウンは候補が増えたため縦サイズを広めにし、各効果は選択直後に
   なるべく無加工になる default とする。実用値は「プリセット」ボタンで投入し、
-  個別のスライダーやプリセットで調整する。汎用のリセットボタンは置かず、マスクやレイヤーを
-  作り直したい場合はレイヤー削除 / 複製で扱う
+  個別のスライダーやプリセットで調整する。加工内容が効果なしの間はリセットを出さず、
+  効果選択後だけ「リセット」で default に戻せるようにする
 - Tone Curve はまず RGB 共通の固定 5 点カーブ + プレビューで実装し、チャンネル別カーブは後続候補。
   Dehaze は Dark Channel Prior の考え方を軽量化し、白っぽさ低減と局所コントラスト寄りの仕上げ効果として扱う。
   Cross-Star Glow は明部抽出 + 方向性の減衰ブラーで、光線本数と回転角を指定できる
