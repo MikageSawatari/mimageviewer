@@ -453,6 +453,11 @@ struct CropDrag {
     aspect_ratio: Option<f32>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct CropCreateDrag {
+    start: [f32; 2],
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct EdgePreviewKey {
     image_path: PathBuf,
@@ -528,8 +533,8 @@ enum OverrideEditTarget {
 impl OverrideEditTarget {
     fn label(self) -> &'static str {
         match self {
-            Self::Add => "追加補正",
-            Self::Subtract => "削除補正",
+            Self::Add => "追加マスク",
+            Self::Subtract => "削除マスク",
         }
     }
 }
@@ -714,6 +719,7 @@ struct LocalAdjustLabApp {
     crop_aspect_mode: CropAspectMode,
     crop_rect: Option<CropRect>,
     crop_drag: Option<CropDrag>,
+    crop_create_drag: Option<CropCreateDrag>,
     add_layer_dialog_open: bool,
     add_layer_mask_kind: MaskKind,
     status: String,
@@ -787,6 +793,7 @@ impl LocalAdjustLabApp {
             crop_aspect_mode: CropAspectMode::Free,
             crop_rect: None,
             crop_drag: None,
+            crop_create_drag: None,
             add_layer_dialog_open: false,
             add_layer_mask_kind: MaskKind::Raster,
             status: "JPEG / PNG をドロップしてください。".to_string(),
@@ -839,6 +846,7 @@ impl LocalAdjustLabApp {
                 self.crop_aspect_mode = CropAspectMode::Free;
                 self.crop_rect = None;
                 self.crop_drag = None;
+                self.crop_create_drag = None;
                 self.prev_paint_pos = None;
                 self.last_paint_pos = None;
                 self.workflow_panel = LabWorkflowPanel::Adjust;
@@ -1039,6 +1047,7 @@ impl LocalAdjustLabApp {
         self.crop_rect = Some(CropRect::full(w, h));
         self.crop_enabled = false;
         self.crop_drag = None;
+        self.crop_create_drag = None;
     }
 
     fn apply_crop_aspect_mode_to_rect(&mut self) {
@@ -1055,6 +1064,7 @@ impl LocalAdjustLabApp {
         self.crop_enabled = !crop.is_full(w, h);
         self.crop_rect = Some(crop);
         self.crop_drag = None;
+        self.crop_create_drag = None;
     }
 
     fn set_workflow_panel(&mut self, panel: LabWorkflowPanel) {
@@ -1064,6 +1074,7 @@ impl LocalAdjustLabApp {
         self.workflow_panel = panel;
         self.crop_edit_mode = panel == LabWorkflowPanel::Crop;
         self.crop_drag = None;
+        self.crop_create_drag = None;
         self.pan_drag_start = None;
         self.prev_paint_pos = None;
         self.last_paint_pos = None;
@@ -1281,7 +1292,7 @@ impl LocalAdjustLabApp {
             layer.manual_override = ManualMaskOverride::default();
         }
         self.selected_shape = None;
-        self.status = "追加/削除の手動補正をクリアしました。".to_string();
+        self.status = "追加/削除マスクをクリアしました。".to_string();
         self.mark_dirty();
     }
 
@@ -1699,8 +1710,9 @@ impl LocalAdjustLabApp {
         if !self.mask_dirty {
             return;
         }
-        let use_fast_tile_eval =
-            can_build_mask_tiles_from_layer(&self.layers[self.selected_layer], width, height);
+        let preview_edit_target = self.override_edit_panel;
+        let use_fast_tile_eval = preview_edit_target.is_none()
+            && can_build_mask_tiles_from_layer(&self.layers[self.selected_layer], width, height);
         if !use_fast_tile_eval
             && ctx.input(|i| i.pointer.primary_down())
             && self.last_mask_preview_update.elapsed()
@@ -1714,7 +1726,9 @@ impl LocalAdjustLabApp {
         let mask = if use_fast_tile_eval {
             None
         } else {
-            match evaluate_layer_mask(image.source.as_ref(), &self.layers[self.selected_layer]) {
+            let preview_layer =
+                layer_for_mask_preview(&self.layers[self.selected_layer], preview_edit_target);
+            match evaluate_layer_mask(image.source.as_ref(), &preview_layer) {
                 Ok(mask) => Some(mask),
                 Err(e) => {
                     self.status = format!("マスクプレビュー失敗: {e}");
@@ -1757,6 +1771,7 @@ impl LocalAdjustLabApp {
                     build_mask_tile_image(
                         mask,
                         &self.layers[self.selected_layer],
+                        preview_edit_target,
                         width,
                         tile_x,
                         tile_y,
@@ -1917,7 +1932,7 @@ impl LocalAdjustLabApp {
             image_width: image.source.width,
             image_height: image.source.height,
             crop_enabled: self.crop_is_active(),
-            crop_overlay: self.crop_overlay,
+            crop_overlay: true,
             crop_aspect_mode: self.crop_aspect_mode,
             crop_rect: self.crop_rect,
             layers,
@@ -1972,13 +1987,14 @@ impl LocalAdjustLabApp {
         self.shape_drag = None;
         self.reset_override_edit_state_for_selected_layer();
         self.crop_enabled = sidecar.crop_enabled;
-        self.crop_overlay = sidecar.crop_overlay;
+        self.crop_overlay = true;
         self.crop_aspect_mode = sidecar.crop_aspect_mode;
         self.crop_rect = sidecar
             .crop_rect
             .or_else(|| sidecar.crop_enabled.then(|| CropRect::full(w, h)))
             .map(|crop| crop.sanitized(w, h));
         self.crop_drag = None;
+        self.crop_create_drag = None;
         self.crop_edit_mode = self.workflow_panel == LabWorkflowPanel::Crop;
         self.undo_stack.clear();
         self.redo_stack.clear();
@@ -2463,22 +2479,6 @@ impl LocalAdjustLabApp {
 
         let btn_w = ((PANEL_W - 20.0 - 4.0) / 2.0).max(96.0);
         let btn_size = egui::vec2(btn_w, 24.0);
-        ui.label(egui::RichText::new("表示:").color(Color32::from_gray(200)));
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 4.0;
-            if panel_toggle_button(ui, "元画像 [Q]", self.show_source, Some(btn_size), false)
-                .clicked()
-            {
-                self.show_source = !self.show_source;
-            }
-            if panel_toggle_button(ui, "マスク [W]", self.show_mask, Some(btn_size), false)
-                .clicked()
-            {
-                self.show_mask = !self.show_mask;
-            }
-        });
-
-        ui.separator();
         self.draw_workflow_selector(ui);
 
         ui.separator();
@@ -2497,6 +2497,23 @@ impl LocalAdjustLabApp {
             LabWorkflowPanel::Crop => self.draw_crop_controls(ui),
             LabWorkflowPanel::Save => self.draw_save_controls(ui, btn_size),
         }
+    }
+
+    fn draw_display_controls(&mut self, ui: &mut egui::Ui, btn_size: egui::Vec2) {
+        ui.label(egui::RichText::new("表示:").color(Color32::from_gray(200)));
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            if panel_toggle_button(ui, "元画像 [Q]", self.show_source, Some(btn_size), false)
+                .clicked()
+            {
+                self.show_source = !self.show_source;
+            }
+            if panel_toggle_button(ui, "マスク [W]", self.show_mask, Some(btn_size), false)
+                .clicked()
+            {
+                self.show_mask = !self.show_mask;
+            }
+        });
     }
 
     fn draw_workflow_selector(&mut self, ui: &mut egui::Ui) {
@@ -2535,6 +2552,8 @@ impl LocalAdjustLabApp {
     }
 
     fn draw_adjust_layer_controls(&mut self, ui: &mut egui::Ui, btn_size: egui::Vec2) {
+        self.draw_display_controls(ui, btn_size);
+        ui.separator();
         self.draw_layer_list(ui, PANEL_W);
         if self.layers.is_empty() {
             return;
@@ -2624,7 +2643,6 @@ impl LocalAdjustLabApp {
             return;
         };
         let btn_w = ((PANEL_W - 20.0 - 4.0) / 2.0).max(96.0);
-        let btn_size = egui::vec2(btn_w, 24.0);
         ui.label(
             egui::RichText::new("切り取り")
                 .size(14.0)
@@ -2645,26 +2663,17 @@ impl LocalAdjustLabApp {
                     Color32::from_gray(170)
                 }),
             );
-            if panel_toggle_button(ui, "表示", self.crop_overlay, Some(btn_size), false).clicked()
-            {
-                self.crop_overlay = !self.crop_overlay;
-            }
         });
 
-        ui.horizontal(|ui| {
-            if ui
-                .add_sized(btn_size, egui::Button::new("リセット"))
-                .clicked()
-            {
-                self.reset_crop();
-            }
-            if ui
-                .add_sized(btn_size, egui::Button::new("画像全体"))
-                .clicked()
-            {
-                self.reset_crop();
-            }
-        });
+        if ui
+            .add_sized(
+                egui::vec2(btn_w * 2.0 + 4.0, 24.0),
+                egui::Button::new("リセット"),
+            )
+            .clicked()
+        {
+            self.reset_crop();
+        }
 
         let selected_text = self.crop_aspect_mode.label();
         let mut next_mode = self.crop_aspect_mode;
@@ -2744,7 +2753,7 @@ impl LocalAdjustLabApp {
             egui::RichText::new(if editing_base_manual {
                 "手動マスク:"
             } else {
-                "マスク補正:"
+                "追加/削除マスク:"
             })
             .color(Color32::from_gray(200)),
         );
@@ -2765,9 +2774,9 @@ impl LocalAdjustLabApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 4.0;
             let add_label = if has_add {
-                "追加補正あり"
+                "追加マスクあり"
             } else {
-                "追加補正"
+                "追加マスク"
             };
             if panel_toggle_button(
                 ui,
@@ -2782,9 +2791,9 @@ impl LocalAdjustLabApp {
                 self.toggle_override_edit_panel(OverrideEditTarget::Add);
             }
             let subtract_label = if has_subtract {
-                "削除補正あり"
+                "削除マスクあり"
             } else {
-                "削除補正"
+                "削除マスク"
             };
             if panel_toggle_button(
                 ui,
@@ -2826,9 +2835,11 @@ impl LocalAdjustLabApp {
             ui.horizontal(|ui| {
                 ui.add_space(2.0);
                 ui.label(
-                    egui::RichText::new("必要なときだけ追加補正/削除補正を開いて手描きします。")
-                        .size(10.0)
-                        .color(Color32::from_gray(170)),
+                    egui::RichText::new(
+                        "必要なときだけ追加マスク/削除マスクを開いて手描きします。",
+                    )
+                    .size(10.0)
+                    .color(Color32::from_gray(170)),
                 );
             });
         }
@@ -2939,7 +2950,9 @@ impl LocalAdjustLabApp {
         let Some(source_texture) = &self.source_texture else {
             return;
         };
-        let active_texture_id = if self.show_source {
+        let adjust_panel_active = self.workflow_panel == LabWorkflowPanel::Adjust;
+        let crop_panel_active = self.workflow_panel == LabWorkflowPanel::Crop;
+        let active_texture_id = if adjust_panel_active && self.show_source {
             source_texture.id()
         } else {
             self.result_texture
@@ -2964,15 +2977,13 @@ impl LocalAdjustLabApp {
         let pan_mode = ui.input(|i| {
             i.key_down(Key::Space) || i.pointer.button_down(egui::PointerButton::Middle)
         });
-        let adjust_panel_active = self.workflow_panel == LabWorkflowPanel::Adjust;
-        let crop_panel_active = self.workflow_panel == LabWorkflowPanel::Crop;
         let view_input_used =
             self.handle_view_navigation(ui, canvas_rect, rect, img_w, img_h, panel_blocks_pointer);
 
         let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
         ui.painter()
             .image(active_texture_id, rect, uv, Color32::WHITE);
-        if self.show_mask {
+        if adjust_panel_active && self.show_mask {
             self.draw_mask_tile_preview(ui, rect);
         }
         let ctrl_down = ui.input(|i| i.modifiers.ctrl);
@@ -3405,8 +3416,8 @@ impl LocalAdjustLabApp {
             .map(|layer| !layer.manual_override.is_empty())
             .unwrap_or(false);
         if ui
-            .add_enabled(has_override, egui::Button::new("手動補正をクリア"))
-            .on_hover_text("ベースマスクは残し、追加補正/削除補正だけを空にします。")
+            .add_enabled(has_override, egui::Button::new("追加/削除マスクをクリア"))
+            .on_hover_text("ベースマスクは残し、追加マスク/削除マスクだけを空にします。")
             .clicked()
         {
             self.clear_selected_manual_override();
@@ -3462,7 +3473,7 @@ impl LocalAdjustLabApp {
         });
         if ui
             .button("コピー元のマスクを適用")
-            .on_hover_text("マスク種類、マスク本体、追加/削除補正、反転、拡張/縮小、ぼかし境界だけをコピーします。加工内容と不透明度は現在のレイヤーのままです。")
+            .on_hover_text("マスク種類、マスク本体、追加/削除マスク、反転、拡張/縮小、ぼかし境界だけをコピーします。加工内容と不透明度は現在のレイヤーのままです。")
             .clicked()
         {
             self.copy_mask_from_layer(self.mask_copy_source);
@@ -3487,34 +3498,36 @@ impl LocalAdjustLabApp {
             self.draw_tool_controls(ui);
         } else {
             ui.label(
-                egui::RichText::new("追加補正/削除補正を開くと、手描きツール設定を表示します。")
-                    .size(11.0)
-                    .color(Color32::from_gray(180)),
+                egui::RichText::new(
+                    "追加マスク/削除マスクを開くと、手描きツール設定を表示します。",
+                )
+                .size(11.0)
+                .color(Color32::from_gray(180)),
             );
         }
         if selected_mask_kind != Some(MaskKind::Raster) && manual_edit_controls_visible {
             let help = if self.override_edit_panel.is_some() {
-                "補正パネルが開いている間は、筆/図形ツールで追加補正または削除補正を編集します。ベースマスクを調整する場合は補正パネルを閉じます。"
+                "追加/削除マスクパネルが開いている間は、筆/図形ツールで追加マスクまたは削除マスクを編集します。ベースマスクを調整する場合はパネルを閉じます。"
             } else {
                 match selected_mask_kind {
                     Some(MaskKind::LinearGradient) => {
-                        "選択ツールでは画像上のドラッグで生成/調整します。筆などに切り替えると追加/削除補正を描けます。"
+                        "選択ツールでは画像上のドラッグで生成/調整します。筆などに切り替えると追加/削除マスクを描けます。"
                     }
                     Some(MaskKind::RadialGradient) => {
-                        "選択ツールでは画像上のドラッグで生成/調整します。筆などに切り替えると追加/削除補正を描けます。"
+                        "選択ツールでは画像上のドラッグで生成/調整します。筆などに切り替えると追加/削除マスクを描けます。"
                     }
                     Some(MaskKind::ColorRange) => {
-                        "選択ツールでは画像上クリックでスポイト指定します。筆などに切り替えると追加/削除補正を描けます。"
+                        "選択ツールでは画像上クリックでスポイト指定します。筆などに切り替えると追加/削除マスクを描けます。"
                     }
                     Some(MaskKind::LumaRange) => {
-                        "輝度範囲はスライダーで調整します。筆などで追加/削除補正を描けます。"
+                        "輝度範囲はスライダーで調整します。筆などで追加/削除マスクを描けます。"
                     }
-                    Some(MaskKind::Full) => "全体マスクに対して削除補正などを描けます。",
+                    Some(MaskKind::Full) => "全体マスクに対して削除マスクなどを描けます。",
                     Some(MaskKind::Subject) => {
-                        "被写体/背景マットを保ったまま、筆などで追加/削除補正を描けます。"
+                        "被写体/背景マットを保ったまま、筆などで追加/削除マスクを描けます。"
                     }
                     Some(MaskKind::Segmentation) => {
-                        "選択ツールでは領域候補をクリック/ドラッグでON/OFFします。筆などでは追加/削除補正を描けます。"
+                        "選択ツールでは領域候補をクリック/ドラッグでON/OFFします。筆などでは追加/削除マスクを描けます。"
                     }
                     None | Some(MaskKind::Raster) => "",
                 }
@@ -4805,8 +4818,9 @@ impl LocalAdjustLabApp {
         pointer_allowed: bool,
     ) -> bool {
         let crop_active = self.crop_is_active();
-        if !self.crop_edit_mode && !(self.crop_overlay && crop_active) {
+        if !self.crop_edit_mode && !crop_active {
             self.crop_drag = None;
+            self.crop_create_drag = None;
             return false;
         }
         let crop = self
@@ -4814,7 +4828,7 @@ impl LocalAdjustLabApp {
             .unwrap_or_else(|| CropRect::full(img_w, img_h));
         let crop_screen = crop.to_screen_rect(image_rect, img_w, img_h);
         let painter = ui.painter().clone();
-        if self.crop_overlay && (self.crop_edit_mode || crop_active) {
+        if self.crop_edit_mode || crop_active {
             for outside in outside_rects(image_rect, crop_screen) {
                 painter.rect_filled(outside, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, 145));
             }
@@ -4839,11 +4853,13 @@ impl LocalAdjustLabApp {
         let mut handle_used = false;
         let scale_x = img_w.max(1) as f32 / image_rect.width().max(1.0);
         let scale_y = img_h.max(1) as f32 / image_rect.height().max(1.0);
+        let handle_bounds = image_rect.shrink(14.0);
         for (handle, center) in crop_handle_points(crop_screen) {
             if handle == CropHandle::Body {
                 continue;
             }
-            let handle_rect = Rect::from_center_size(center, egui::vec2(28.0, 28.0));
+            let handle_center = clamp_pos_to_rect(center, handle_bounds);
+            let handle_rect = Rect::from_center_size(handle_center, egui::vec2(36.0, 36.0));
             let response = ui
                 .interact(
                     handle_rect,
@@ -4851,9 +4867,9 @@ impl LocalAdjustLabApp {
                     Sense::drag(),
                 )
                 .on_hover_text("crop を調整");
-            painter.circle_filled(center, 5.5, Color32::from_rgb(255, 245, 180));
+            painter.circle_filled(handle_center, 5.5, Color32::from_rgb(255, 245, 180));
             painter.circle_stroke(
-                center,
+                handle_center,
                 5.5,
                 egui::Stroke::new(1.5, Color32::from_rgb(30, 20, 0)),
             );
@@ -4895,6 +4911,42 @@ impl LocalAdjustLabApp {
                     Sense::drag(),
                 )
                 .on_hover_text("crop を移動");
+            if !crop_active {
+                if body_response.drag_started()
+                    && let Some(pos) = body_response.interact_pointer_pos()
+                {
+                    let image_pos = screen_to_image(image_rect, img_w, img_h, pos)
+                        .unwrap_or_else(|| egui::pos2(crop.min_x, crop.min_y));
+                    self.crop_create_drag = Some(CropCreateDrag {
+                        start: [image_pos.x, image_pos.y],
+                    });
+                }
+                if body_response.dragged()
+                    && let Some(create) = self.crop_create_drag
+                    && let Some(pos) = body_response.interact_pointer_pos()
+                    && let Some(image_pos) = screen_to_image(image_rect, img_w, img_h, pos)
+                {
+                    let next = crop_from_points(
+                        create.start,
+                        [image_pos.x, image_pos.y],
+                        img_w,
+                        img_h,
+                        self.crop_resize_aspect_ratio(),
+                    );
+                    self.crop_enabled = !next.is_full(img_w, img_h);
+                    self.crop_rect = Some(next);
+                    used = true;
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                }
+                if body_response.hovered() {
+                    used = true;
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+                }
+                if ui.input(|i| !i.pointer.primary_down()) {
+                    self.crop_create_drag = None;
+                }
+                return used || self.crop_create_drag.is_some();
+            }
             if body_response.hovered() || body_response.dragged() {
                 used = true;
                 ui.ctx().set_cursor_icon(if body_response.dragged() {
@@ -4926,6 +4978,7 @@ impl LocalAdjustLabApp {
         }
         if ui.input(|i| !i.pointer.primary_down()) {
             self.crop_drag = None;
+            self.crop_create_drag = None;
         }
         if !used
             && self.crop_edit_mode
@@ -8172,6 +8225,7 @@ fn color_image_from_rgba(image: &RgbaImageBuf) -> ColorImage {
 fn build_mask_tile_image(
     mask: &[f32],
     layer: &LocalAdjustmentLayer,
+    edit_target: Option<OverrideEditTarget>,
     image_width: usize,
     tile_x: usize,
     tile_y: usize,
@@ -8183,22 +8237,15 @@ fn build_mask_tile_image(
         let row = y * image_width;
         for x in tile_x..tile_x + tile_w {
             let idx = row + x;
-            let add = layer
-                .manual_override
-                .add
-                .as_ref()
+            let editing_mask = edit_target
+                .and_then(|target| match target {
+                    OverrideEditTarget::Add => layer.manual_override.add.as_ref(),
+                    OverrideEditTarget::Subtract => layer.manual_override.subtract.as_ref(),
+                })
                 .map(|manual| raster_vector_alpha_at(manual, idx, x, y) >= 0.5)
                 .unwrap_or(false);
-            let subtract = layer
-                .manual_override
-                .subtract
-                .as_ref()
-                .map(|manual| raster_vector_alpha_at(manual, idx, x, y) >= 0.5)
-                .unwrap_or(false);
-            if subtract {
-                pixels.push(Color32::from_rgba_unmultiplied(64, 190, 255, 218));
-            } else if add {
-                pixels.push(Color32::from_rgba_unmultiplied(90, 255, 120, 210));
+            if editing_mask {
+                pixels.push(Color32::from_rgba_unmultiplied(64, 190, 255, 225));
             } else {
                 let alpha =
                     (mask.get(idx).copied().unwrap_or(0.0).clamp(0.0, 1.0) * 155.0).round() as u8;
@@ -8207,6 +8254,23 @@ fn build_mask_tile_image(
         }
     }
     ColorImage::new([tile_w, tile_h], pixels)
+}
+
+fn layer_for_mask_preview(
+    layer: &LocalAdjustmentLayer,
+    edit_target: Option<OverrideEditTarget>,
+) -> LocalAdjustmentLayer {
+    let mut preview = layer.clone();
+    match edit_target {
+        Some(OverrideEditTarget::Add) => {
+            preview.manual_override = ManualMaskOverride::default();
+        }
+        Some(OverrideEditTarget::Subtract) => {
+            preview.manual_override.subtract = None;
+        }
+        None => {}
+    }
+    preview
 }
 
 fn raster_vector_alpha_at(mask: &RasterVectorMask, idx: usize, x: usize, y: usize) -> f32 {
@@ -8637,6 +8701,38 @@ fn crop_from_xywh_inputs(
         max_y: (y + ch).max(1) as f32,
     }
     .sanitized(width, height)
+}
+
+fn crop_from_points(
+    a: [f32; 2],
+    b: [f32; 2],
+    width: usize,
+    height: usize,
+    aspect_ratio: Option<f32>,
+) -> CropRect {
+    let min_x = a[0].min(b[0]);
+    let min_y = a[1].min(b[1]);
+    let max_x = a[0].max(b[0]);
+    let max_y = a[1].max(b[1]);
+    let crop = CropRect {
+        min_x,
+        min_y,
+        max_x,
+        max_y,
+    }
+    .sanitized(width, height);
+    if let Some(ratio) = aspect_ratio {
+        crop.fit_to_aspect_around_center(ratio, width, height)
+    } else {
+        crop
+    }
+}
+
+fn clamp_pos_to_rect(pos: Pos2, rect: Rect) -> Pos2 {
+    egui::pos2(
+        pos.x.clamp(rect.left(), rect.right()),
+        pos.y.clamp(rect.top(), rect.bottom()),
+    )
 }
 
 fn crop_handle_points(rect: Rect) -> [(CropHandle, Pos2); 9] {
@@ -9115,7 +9211,7 @@ mod tests {
     }
 
     #[test]
-    fn mask_preview_colors_manual_override() {
+    fn mask_preview_hidden_override_panels_show_final_mask_only() {
         let mut layer = LocalAdjustmentLayer::new(
             "mask",
             LocalMask::Full,
@@ -9134,15 +9230,99 @@ mod tests {
             shapes: Vec::new(),
         });
 
-        let image = build_mask_tile_image(&[0.2, 0.8, 0.5], &layer, 3, 0, 0, 3, 1);
+        let image = build_mask_tile_image(&[1.0, 0.0, 0.5], &layer, None, 3, 0, 0, 3, 1);
 
         assert_eq!(
             image.pixels[0],
-            Color32::from_rgba_unmultiplied(90, 255, 120, 210)
+            Color32::from_rgba_unmultiplied(255, 48, 84, 155)
         );
         assert_eq!(
             image.pixels[1],
-            Color32::from_rgba_unmultiplied(64, 190, 255, 218)
+            Color32::from_rgba_unmultiplied(255, 48, 84, 0)
+        );
+        assert_eq!(
+            image.pixels[2],
+            Color32::from_rgba_unmultiplied(255, 48, 84, 78)
+        );
+    }
+
+    #[test]
+    fn mask_preview_add_panel_shows_base_and_active_add_mask() {
+        let mut layer = LocalAdjustmentLayer::new(
+            "mask",
+            LocalMask::Full,
+            LocalEffect::Tone(ToneParams::default()),
+        );
+        layer.manual_override.add = Some(RasterVectorMask {
+            width: 3,
+            height: 1,
+            alpha: vec![1.0, 0.0, 0.0],
+            shapes: Vec::new(),
+        });
+        layer.manual_override.subtract = Some(RasterVectorMask {
+            width: 3,
+            height: 1,
+            alpha: vec![0.0, 1.0, 0.0],
+            shapes: Vec::new(),
+        });
+
+        let image = build_mask_tile_image(
+            &[0.2, 0.8, 0.5],
+            &layer,
+            Some(OverrideEditTarget::Add),
+            3,
+            0,
+            0,
+            3,
+            1,
+        );
+
+        assert_eq!(
+            image.pixels[0],
+            Color32::from_rgba_unmultiplied(64, 190, 255, 225)
+        );
+        assert_eq!(
+            image.pixels[1],
+            Color32::from_rgba_unmultiplied(255, 48, 84, 124)
+        );
+        assert_eq!(
+            image.pixels[2],
+            Color32::from_rgba_unmultiplied(255, 48, 84, 78)
+        );
+    }
+
+    #[test]
+    fn mask_preview_subtract_panel_shows_base_plus_add_and_active_subtract_mask() {
+        let mut layer = LocalAdjustmentLayer::new(
+            "mask",
+            LocalMask::Full,
+            LocalEffect::Tone(ToneParams::default()),
+        );
+        layer.manual_override.subtract = Some(RasterVectorMask {
+            width: 3,
+            height: 1,
+            alpha: vec![0.0, 1.0, 0.0],
+            shapes: Vec::new(),
+        });
+
+        let image = build_mask_tile_image(
+            &[1.0, 0.8, 0.5],
+            &layer,
+            Some(OverrideEditTarget::Subtract),
+            3,
+            0,
+            0,
+            3,
+            1,
+        );
+
+        assert_eq!(
+            image.pixels[0],
+            Color32::from_rgba_unmultiplied(255, 48, 84, 155)
+        );
+        assert_eq!(
+            image.pixels[1],
+            Color32::from_rgba_unmultiplied(64, 190, 255, 225)
         );
         assert_eq!(
             image.pixels[2],
@@ -9188,6 +9368,17 @@ mod tests {
         assert_eq!(crop.min_x, 0.0);
         assert_eq!(crop.min_y, 0.0);
         assert_eq!(crop.max_x, 160.0);
+        assert_eq!(crop.max_y, 90.0);
+    }
+
+    #[test]
+    fn crop_from_points_creates_non_full_rect_from_full_state() {
+        let crop = crop_from_points([10.0, 20.0], [70.0, 90.0], 100, 100, None);
+
+        assert!(!crop.is_full(100, 100));
+        assert_eq!(crop.min_x, 10.0);
+        assert_eq!(crop.min_y, 20.0);
+        assert_eq!(crop.max_x, 70.0);
         assert_eq!(crop.max_y, 90.0);
     }
 

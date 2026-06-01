@@ -26,7 +26,7 @@ the window.
 - New layers start with the selected mask source + No Effect. Pick the effect
   afterward from the selected layer's effect selector.
 - mIV-like floating panel over the image instead of a docked side panel
-- Left panel: display controls and an mIV-like workflow strip:
+- Left panel: an mIV-like workflow strip:
   Eraser / Adjustment / Conceal / Crop / Save. Eraser and Conceal are placeholder
   panels in the prototype so the lab stays lightweight.
 - Right panel: parameters for the selected mask source, selected manual-mask
@@ -58,14 +58,15 @@ the window.
   - Feather
   - Opacity
 - Mask operations:
-  - Add/subtract manual correction masks on top of any mask source. These
-    corrections are binary masks, so gradient / subject matte softness is kept
+  - Add/subtract manual masks on top of any mask source. These masks are binary,
+    so gradient / subject matte softness is kept
     in the base mask while local mistakes can be patched by hand.
-  - For non-manual mask sources, add/subtract correction tool panels are hidden
-    by default. Press Add Correction or Subtract Correction to open that edit
+  - For non-manual mask sources, Add Mask / Subtract Mask tool panels are hidden
+    by default. Press Add Mask or Subtract Mask to open that edit
     panel; pressing the same button again closes it without creating a mask.
-  - Mask preview colors: base/final mask is pink, add correction is green, and
-    subtract correction is cyan.
+  - Mask preview colors: when both edit panels are closed, the final mask is
+    pink. While editing Add Mask, the base mask is pink and the add mask is cyan.
+    While editing Subtract Mask, base + add is pink and the subtract mask is cyan.
   - Copy only the mask data and mask modifiers from another layer while keeping
     the current layer's effect and opacity
 - Effects:
@@ -92,8 +93,10 @@ the window.
   to its default values.
 - Final-stage crop preview/export. The Crop panel has Reset, aspect ratio
   selection (Keep, Free, 16:9 through 9:16), and X/Y/W/H numeric inputs. The
-  crop rectangle stays in source-image coordinates and is only applied when
-  saving the rendered result.
+  area outside the crop is dimmed while the Crop panel is open. Drag inside the
+  image to create a crop from the full-image state, or drag handles to adjust an
+  existing crop. The crop rectangle stays in source-image coordinates and is
+  only applied when saving the rendered result.
 - Layer settings sidecar save/load. `foo.png` uses `foo.png.miv`; the sidecar is
   JSON with binary masks packed as 1-bit or 8-bit data, deflated, then base64
   encoded.
