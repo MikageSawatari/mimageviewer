@@ -19,7 +19,7 @@ use local_adjust_core::{
     BrushStrokeParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams, CloudFogMode,
     CloudFogParams, ColorBalanceParams, ColorBalanceRange, ColorFillParams, ColorGradeWheel,
     ColorHalftoneParams, ColorMixerParams, ColorOverlayBlendMode, ColorOverlayParams,
-    ColorOverlayShape, ColorRangeMask, CubeLutParams, CutoutParams, DehazeParams,
+    ColorOverlayShape, ColorRangeMask, CubeLutParams, CutoutParams, DehazeParams, DespeckleParams,
     DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EmbossParams,
     EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
     GlowingEdgesParams, GodRaysParams, GradientMapParams, GradientMapPreset, HalftoneParams,
@@ -1044,6 +1044,7 @@ enum EffectKind {
     Textureizer,
     StarGlow,
     EdgeSmooth,
+    Despeckle,
     Median,
 }
 
@@ -1149,6 +1150,7 @@ impl EffectKind {
             LocalEffect::Textureizer(_) => Self::Textureizer,
             LocalEffect::StarGlow(_) => Self::StarGlow,
             LocalEffect::EdgeSmooth(_) => Self::EdgeSmooth,
+            LocalEffect::Despeckle(_) => Self::Despeckle,
             LocalEffect::Median(_) => Self::Median,
         }
     }
@@ -1223,6 +1225,7 @@ impl EffectKind {
             Self::Textureizer => "テクスチャライザ",
             Self::StarGlow => "クロス光",
             Self::EdgeSmooth => "エッジ保持ぼかし",
+            Self::Despeckle => "ディスペックル",
             Self::Median => "メディアン",
         }
     }
@@ -1357,6 +1360,9 @@ impl EffectKind {
             }
             Self::StarGlow => "明るい部分から十字や多方向の光線を描写します。",
             Self::EdgeSmooth => "輪郭をなるべく残しながら面をなめらかにします。",
+            Self::Despeckle => {
+                "周囲から大きく外れた孤立点だけを中央値へ寄せ、スキャンの白点・黒点を目立ちにくくします。"
+            }
             Self::Median => "孤立した点ノイズや細かいゴミを、周囲の中央値で目立ちにくくします。",
         }
     }
@@ -1435,6 +1441,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::RadialBlur,
             EffectKind::SoftFocus,
             EffectKind::EdgeSmooth,
+            EffectKind::Despeckle,
             EffectKind::Median,
         ],
     },
@@ -8418,6 +8425,9 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::EdgeSmooth(params) => {
             format!("エッジ保持ぼかし {:.0}px", params.radius_px)
         }
+        LocalEffect::Despeckle(params) => {
+            format!("ディスペックル {:.0}px", params.radius_px)
+        }
         LocalEffect::Median(params) => format!("メディアン {:.0}px", params.radius_px),
     }
 }
@@ -14404,6 +14414,56 @@ fn draw_effect_params(
                 )
                 .changed();
         }
+        LocalEffect::Despeckle(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "点ゴミ") {
+                    *params = DespeckleParams {
+                        radius_px: 1.0,
+                        threshold: 42.0,
+                        strength: 1.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "スキャン補修") {
+                    *params = DespeckleParams {
+                        radius_px: 2.0,
+                        threshold: 34.0,
+                        strength: 0.75,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "控えめ") {
+                    *params = DespeckleParams {
+                        radius_px: 1.0,
+                        threshold: 70.0,
+                        strength: 0.55,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "周囲から大きく外れた孤立点だけを中央値へ寄せます。通常のメディアンより線や面を残しやすい点ゴミ除去です。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let radius = ui.add(egui::Slider::new(&mut params.radius_px, 1.0..=4.0).text("半径"));
+            changed |= radius.changed();
+            radius.lab_hover_tip(
+                "周囲を調べる範囲です。1px は白点・黒点、2px 以上は小さなゴミ向けです。",
+            );
+            let threshold =
+                ui.add(egui::Slider::new(&mut params.threshold, 1.0..=160.0).text("検出しきい値"));
+            changed |= threshold.changed();
+            threshold.lab_hover_tip(
+                "中心画素が周囲の中央値からどれだけ外れたら補修するかです。小さいほど多く補修します。",
+            );
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像から補修後の色へどれだけ近づけるかです。");
+        }
         LocalEffect::Median(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -15820,6 +15880,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Textureizer => LocalEffect::Textureizer(TextureizerParams::default()),
         EffectKind::StarGlow => LocalEffect::StarGlow(StarGlowParams::default()),
         EffectKind::EdgeSmooth => LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
+        EffectKind::Despeckle => LocalEffect::Despeckle(DespeckleParams::default()),
         EffectKind::Median => LocalEffect::Median(MedianParams::default()),
     }
 }
@@ -18140,6 +18201,7 @@ mod tests {
             EffectKind::ColorOverlay,
             EffectKind::StarGlow,
             EffectKind::EdgeSmooth,
+            EffectKind::Despeckle,
             EffectKind::Median,
         ];
 

@@ -593,6 +593,7 @@ pub enum LocalEffect {
     Textureizer(TextureizerParams),
     StarGlow(StarGlowParams),
     EdgeSmooth(EdgeSmoothParams),
+    Despeckle(DespeckleParams),
     Median(MedianParams),
 }
 
@@ -667,6 +668,7 @@ impl LocalEffect {
             Self::Textureizer(_) => "テクスチャライザ",
             Self::StarGlow(_) => "クロス光",
             Self::EdgeSmooth(_) => "エッジ保持ぼかし",
+            Self::Despeckle(_) => "ディスペックル",
             Self::Median(_) => "メディアンフィルタ",
         }
     }
@@ -2735,6 +2737,23 @@ impl Default for MedianParams {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DespeckleParams {
+    pub radius_px: f32,
+    pub threshold: f32,
+    pub strength: f32,
+}
+
+impl Default for DespeckleParams {
+    fn default() -> Self {
+        Self {
+            radius_px: 1.0,
+            threshold: 48.0,
+            strength: 0.0,
+        }
+    }
+}
+
 pub fn apply_layers(
     src: RgbaImageRef<'_>,
     layers: &[LocalAdjustmentLayer],
@@ -3149,6 +3168,9 @@ where
             }
             LocalEffect::EdgeSmooth(params) => {
                 apply_edge_smooth(&image.pixels, image.width, image.height, *params)
+            }
+            LocalEffect::Despeckle(params) => {
+                apply_despeckle(&image.pixels, image.width, image.height, *params)
             }
             LocalEffect::Median(params) => apply_median(
                 &image.pixels,
@@ -8713,6 +8735,63 @@ where
     Ok(out)
 }
 
+fn apply_despeckle(src: &[u8], width: usize, height: usize, params: DespeckleParams) -> Vec<u8> {
+    let radius = params.radius_px.round().clamp(1.0, 4.0) as i32;
+    let strength = params.strength.clamp(0.0, 1.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+
+    let threshold = params.threshold.clamp(1.0, 255.0);
+    let upper_threshold = (threshold * 1.7).min(255.0).max(threshold + 1.0);
+    let offsets = circle_offsets(radius);
+    let mut out = src.to_vec();
+    let mut red = Vec::with_capacity(offsets.len().saturating_sub(1));
+    let mut green = Vec::with_capacity(offsets.len().saturating_sub(1));
+    let mut blue = Vec::with_capacity(offsets.len().saturating_sub(1));
+
+    for y in 0..height {
+        for x in 0..width {
+            red.clear();
+            green.clear();
+            blue.clear();
+            for (dx, dy) in &offsets {
+                if *dx == 0 && *dy == 0 {
+                    continue;
+                }
+                let xx = (x as i32 + *dx).clamp(0, width as i32 - 1) as usize;
+                let yy = (y as i32 + *dy).clamp(0, height as i32 - 1) as usize;
+                let i = (yy * width + xx) * 4;
+                red.push(src[i]);
+                green.push(src[i + 1]);
+                blue.push(src[i + 2]);
+            }
+            if red.is_empty() {
+                continue;
+            }
+
+            red.sort_unstable();
+            green.sort_unstable();
+            blue.sort_unstable();
+            let mid = red.len() / 2;
+            let target = [red[mid], green[mid], blue[mid]];
+            let i = (y * width + x) * 4;
+            let dr = src[i] as f32 - target[0] as f32;
+            let dg = src[i + 1] as f32 - target[1] as f32;
+            let db = src[i + 2] as f32 - target[2] as f32;
+            let distance = ((dr * dr + dg * dg + db * db) / 3.0).sqrt();
+            let amount = smoothstep(threshold, upper_threshold, distance) * strength;
+            if amount <= f32::EPSILON {
+                continue;
+            }
+            for c in 0..3 {
+                out[i + c] = lerp_u8(src[i + c], target[c], amount);
+            }
+        }
+    }
+    out
+}
+
 fn blend_rgb_with_mask(base: &mut [u8], effected: &[u8], mask: &[f32]) {
     for (i, amount) in mask.iter().enumerate() {
         let o = i * 4;
@@ -10582,6 +10661,7 @@ mod tests {
             LocalEffect::Textureizer(TextureizerParams::default()),
             LocalEffect::StarGlow(StarGlowParams::default()),
             LocalEffect::EdgeSmooth(EdgeSmoothParams::default()),
+            LocalEffect::Despeckle(DespeckleParams::default()),
             LocalEffect::Median(MedianParams::default()),
         ];
         for effect in effects {
@@ -12177,5 +12257,49 @@ LUT_3D_SIZE 2
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert_eq!(out.pixels[0], 0);
         assert_eq!(out.pixels[8], 255);
+    }
+
+    #[test]
+    fn despeckle_removes_isolated_speckle_and_preserves_alpha() {
+        let mut src = solid(5, 5, [100, 100, 100, 211]);
+        let center = (2 * 5 + 2) * 4;
+        src.pixels[center] = 255;
+        src.pixels[center + 1] = 255;
+        src.pixels[center + 2] = 255;
+        let layer = LocalAdjustmentLayer::new(
+            "despeckle",
+            LocalMask::Full,
+            LocalEffect::Despeckle(DespeckleParams {
+                radius_px: 1.0,
+                threshold: 30.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[center] < 140);
+        assert!(out.pixels.chunks_exact(4).all(|px| px[3] == 211));
+    }
+
+    #[test]
+    fn despeckle_preserves_regular_hard_edge() {
+        let mut pixels = Vec::new();
+        for _y in 0..3 {
+            for x in 0..5 {
+                let v = if x < 2 { 0 } else { 255 };
+                pixels.extend_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let src = RgbaImageBuf::new(5, 3, pixels).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "despeckle",
+            LocalMask::Full,
+            LocalEffect::Despeckle(DespeckleParams {
+                radius_px: 1.0,
+                threshold: 20.0,
+                strength: 1.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
     }
 }

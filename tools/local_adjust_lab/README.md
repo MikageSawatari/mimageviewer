@@ -128,6 +128,7 @@ the window.
   - Textureizer
   - Cross/star glow
   - Edge-preserving smooth
+  - Despeckle
   - Median
 - Effect parameters start from near-identity values. Use the per-effect preset
   buttons for practical starting points, or Reset to return the current effect
