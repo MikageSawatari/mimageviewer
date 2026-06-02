@@ -450,6 +450,7 @@ pub enum LocalEffect {
     Duotone(DuotoneParams),
     Equalize(EqualizeParams),
     GradientMap(GradientMapParams),
+    DiffuseGlow(DiffuseGlowParams),
     Bloom(BloomParams),
     Vignette(VignetteParams),
     FilmGrain(FilmGrainParams),
@@ -502,6 +503,7 @@ impl LocalEffect {
             Self::Duotone(_) => "デュオトーン",
             Self::Equalize(_) => "ヒストグラム均等化",
             Self::GradientMap(_) => "グラデーションマップ",
+            Self::DiffuseGlow(_) => "拡散光彩",
             Self::Bloom(_) => "ブルーム",
             Self::Vignette(_) => "ビネット",
             Self::FilmGrain(_) => "フィルム粒子",
@@ -1547,6 +1549,29 @@ impl Default for GradientMapParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DiffuseGlowParams {
+    pub threshold: f32,
+    pub radius_px: f32,
+    pub strength: f32,
+    pub white_mix: f32,
+    pub grain: f32,
+    pub seed: u32,
+}
+
+impl Default for DiffuseGlowParams {
+    fn default() -> Self {
+        Self {
+            threshold: 0.55,
+            radius_px: 24.0,
+            strength: 0.0,
+            white_mix: 0.4,
+            grain: 0.25,
+            seed: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct BloomParams {
     pub threshold: f32,
     pub radius_px: f32,
@@ -1951,6 +1976,9 @@ where
         LocalEffect::Duotone(params) => apply_duotone(&image.pixels, *params),
         LocalEffect::Equalize(params) => apply_equalize(&image.pixels, *params),
         LocalEffect::GradientMap(params) => apply_gradient_map(&image.pixels, *params),
+        LocalEffect::DiffuseGlow(params) => {
+            apply_diffuse_glow(&image.pixels, image.width, image.height, *params)
+        }
         LocalEffect::Bloom(params) => {
             apply_bloom(&image.pixels, image.width, image.height, *params)
         }
@@ -4652,6 +4680,72 @@ fn adjust_saturation(rgb: [f32; 3], scale: f32) -> [f32; 3] {
     ]
 }
 
+fn apply_diffuse_glow(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    params: DiffuseGlowParams,
+) -> Vec<u8> {
+    let radius = params.radius_px.round().clamp(0.0, 120.0) as usize;
+    let strength = params.strength.clamp(0.0, 2.0);
+    if radius == 0 || strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let threshold = params.threshold.clamp(0.0, 0.999);
+    let white_mix = params.white_mix.clamp(0.0, 1.0);
+    let grain = params.grain.clamp(0.0, 1.0);
+    let mut bright = vec![0_u8; src.len()];
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let r = src[i] as f32 / 255.0;
+            let g = src[i + 1] as f32 / 255.0;
+            let b = src[i + 2] as f32 / 255.0;
+            let luma = luma01(r, g, b);
+            let gate = smoothstep(threshold, (threshold + 0.35).min(1.0), luma);
+            let noise = signed_noise(x as u32, y as u32, params.seed);
+            let grain_weight = (1.0 + noise * grain * 0.55).clamp(0.0, 1.75);
+            let source = [
+                r + (1.0 - r) * white_mix,
+                g + (1.0 - g) * white_mix,
+                b + (1.0 - b) * white_mix,
+            ];
+            for c in 0..3 {
+                bright[i + c] = to_u8(source[c] * gate * grain_weight);
+            }
+            bright[i + 3] = src[i + 3];
+        }
+    }
+
+    let glow = box_blur_rgba(&bright, width, height, radius);
+    let mut out = src.to_vec();
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            let r = src[i] as f32 / 255.0;
+            let g = src[i + 1] as f32 / 255.0;
+            let b = src[i + 2] as f32 / 255.0;
+            let luma = luma01(r, g, b);
+            let highlight = smoothstep(
+                (threshold * 0.75).clamp(0.0, 0.98),
+                (threshold + 0.18).min(1.0),
+                luma,
+            );
+            let noise = signed_noise(x as u32, y as u32, params.seed ^ 0xA53A_9E37);
+            let grain_delta = noise * grain * highlight * strength * 0.06;
+            let veil = white_mix * highlight * strength * 0.18;
+            for c in 0..3 {
+                let base = src[i + c] as f32 / 255.0;
+                let glow_add = (glow[i + c] as f32 / 255.0 * strength).clamp(0.0, 1.0);
+                let screened = 1.0 - (1.0 - base) * (1.0 - glow_add);
+                let target = screened + (1.0 - screened) * veil + grain_delta;
+                out[i + c] = to_u8(target);
+            }
+        }
+    }
+    out
+}
+
 fn apply_bloom(src: &[u8], width: usize, height: usize, params: BloomParams) -> Vec<u8> {
     let radius = params.radius_px.round().clamp(0.0, 120.0) as usize;
     let strength = params.strength.clamp(0.0, 2.0);
@@ -6321,6 +6415,7 @@ mod tests {
             LocalEffect::Duotone(DuotoneParams::default()),
             LocalEffect::Equalize(EqualizeParams::default()),
             LocalEffect::GradientMap(GradientMapParams::default()),
+            LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
             LocalEffect::FilmGrain(FilmGrainParams::default()),
@@ -6885,6 +6980,78 @@ LUT_3D_SIZE 2
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert!(out.pixels[0] > src.pixels[0]);
         assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn diffuse_glow_lifts_neighbor_and_preserves_alpha() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![24, 24, 24, 91, 250, 250, 250, 92, 24, 24, 24, 93],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "diffuse",
+            LocalMask::Full,
+            LocalEffect::DiffuseGlow(DiffuseGlowParams {
+                threshold: 0.5,
+                radius_px: 1.0,
+                strength: 1.0,
+                white_mix: 0.5,
+                grain: 0.0,
+                seed: 1,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert_eq!(out.pixels[3], 91);
+        assert_eq!(out.pixels[7], 92);
+        assert_eq!(out.pixels[11], 93);
+    }
+
+    #[test]
+    fn diffuse_glow_grain_is_deterministic() {
+        let src = solid(4, 4, [180, 180, 180, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "diffuse",
+            LocalMask::Full,
+            LocalEffect::DiffuseGlow(DiffuseGlowParams {
+                threshold: 0.2,
+                radius_px: 1.0,
+                strength: 0.8,
+                white_mix: 0.35,
+                grain: 0.8,
+                seed: 42,
+            }),
+        );
+        let out1 = apply_layers(src.as_ref(), &[layer.clone()]).unwrap();
+        let out2 = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out1.pixels, out2.pixels);
+        assert_ne!(out1.pixels, src.pixels);
+    }
+
+    #[test]
+    fn diffuse_glow_zero_strength_is_identity() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![20, 40, 80, 255, 120, 80, 40, 255, 230, 220, 210, 255],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "diffuse",
+            LocalMask::Full,
+            LocalEffect::DiffuseGlow(DiffuseGlowParams {
+                threshold: 0.0,
+                radius_px: 32.0,
+                strength: 0.0,
+                white_mix: 1.0,
+                grain: 1.0,
+                seed: 7,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
     }
 
     #[test]

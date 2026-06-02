@@ -47,14 +47,14 @@ Krita / Lightroom) のフィルタ機能を調査して、現状未実装のも�
 
 ## 0. 現状実装済み (重複追加しないための棚卸し)
 
-### `LocalEffect` (部分補正レイヤー、46種)
+### `LocalEffect` (部分補正レイヤー、47種)
 Tone(明度/コントラスト/γ/彩度/vibrance/色温度/tint), ToneCurve(5点・RGB合成),
 RgbToneCurve(全体+RGB別5点), ColorBalance(シャドウ/中間/ハイライト別),
 ThreeWayColorGrading(3-way), SelectiveColor(対象色相+HSL), ChannelMixer(白黒/チャンネル混合),
 Hsl(単一・全体), ColorMixer(8色帯), CubeLut(.cube 3D LUT), Posterize(階調数指定),
 Threshold(2値化), Invert(階調反転/ネガ), Duotone(2色/3色インク), Equalize(ヒストグラム平坦化),
 HighlightsShadows, Clarity, Texture, HighPass, Dehaze, Blur(box), MotionBlur, TiltShift, LensBlur, RadialBlur, WaveDistortion, PinchSpherize, Twirl, PolarCoordinates, GlassDisplacement, LensCorrection, LineExtract, SoftFocus, Mosaic, Sharpen(radius/threshold), SmartSharpen(edge-aware), Look(15プリセット),
-GradientMap, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
+GradientMap, DiffuseGlow, Bloom, Vignette, FilmGrain, ChromaticAberration, Halftone, StarGlow, EdgeSmooth, Median
 
 ### マスク種別 (併用可能・差別化の武器)
 Full / Raster / RasterVector / LinearGradient / RadialGradient / LumaRange / ColorRange /
@@ -123,7 +123,7 @@ OilPaint(Kuwahara) / LightLeak / 減色8機種 / CRT 3種＋複合 / カラー�
 ## 5. スタイライズ・絵画調系 ★イラスト重要
 
 - [x] **線画抽出 (Extract lines / Find Edges 強化)** ★★★ **中** — `LineExtract`。Sobel エッジから線画を生成し、白地黒線 / 黒地白線 / 元画像への黒線・白線重ね、しきい値・柔らかさ・太さに対応 (CSP 線画抽出 / PS)
-- [ ] **拡散光彩 (Diffuse Glow)** ★ **易〜中** — 粒状感のある夢幻的グロー。Bloom とは別の柔らかさ (PS)
+- [x] **拡散光彩 (Diffuse Glow)** ★ **易〜中** — `DiffuseGlow`。明部抽出を白く拡散し、粒状ノイズでムラを加える夢幻的グロー。Bloom とは別の柔らかさ (PS)
 - [ ] **風 / スピード (Wind)** ★ **易** — 横方向の流線。動き・エフェクト (PS)
 - [ ] **水彩 / 色鉛筆 / 鉛筆画** **中** — フォトを絵画調に。背景素材化 (PS / CSP Artistic)
 - [ ] **ドライブラシ / 塗料 / パレットナイフ** **中** — 筆致テクスチャ (PS)
@@ -132,7 +132,7 @@ OilPaint(Kuwahara) / LightLeak / 減色8機種 / CRT 3種＋複合 / カラー�
 - [ ] **結晶化 / 点描 / Facet / メゾチント** **中** — 粒状スタイライズ (PS Pixelate)
 - [ ] **ソラリゼーション** **易** — 反転トーン芸術効果 (PS / Krita)
 - [ ] **エッジの光彩 (Glowing Edges)** **中** — ネオン輪郭 (PS)
-- [ ] **OilPaint / Sketch を local へ移植** **易** — 既にグローバルにある資産の部分適用化 (自前)
+- [ ] **OilPaint を local へ移植** **易** — 既にグローバルにある資産の部分適用化 (自前)
 
 ---
 

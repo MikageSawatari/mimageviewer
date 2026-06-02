@@ -17,20 +17,20 @@ use image::{RgbImage, RgbaImage, imageops::FilterType};
 use local_adjust_core::{
     BloomParams, BlurParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
     ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
-    CubeLutParams, DehazeParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EqualizeParams,
-    FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams, GradientMapParams,
-    GradientMapPreset, HalftoneParams, HighPassParams, HighlightsShadowsParams, HslParams,
-    InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams, LineExtractMode,
-    LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask,
-    LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary,
-    MosaicParams, MosaicTileMode, MotionBlurParams, PinchSpherizeParams, PolarCoordinatesMode,
-    PolarCoordinatesParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
-    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
-    RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams, ThresholdParams,
-    TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams, VignetteParams,
-    WaveDistortionMode, WaveDistortionParams, apply_layers, apply_layers_with_progress,
-    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
+    CubeLutParams, DehazeParams, DiffuseGlowParams, DuotoneParams, DuotonePreset, EdgeSmoothParams,
+    EqualizeParams, FilmGrainParams, GlassDisplacementMode, GlassDisplacementParams,
+    GradientMapParams, GradientMapPreset, HalftoneParams, HighPassParams, HighlightsShadowsParams,
+    HslParams, InvertParams, LensBlurAperture, LensBlurParams, LensCorrectionParams,
+    LineExtractMode, LineExtractParams, LineKind, LinearGradientMask, LocalAdjustmentLayer,
+    LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride, MaskShape, MedianParams,
+    MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams, PinchSpherizeParams,
+    PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams, RadialBlurMode,
+    RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask, RegionMask,
+    RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams,
+    SmartSharpenParams, SoftFocusParams, StarGlowParams, TextureParams, ThreeWayColorGradingParams,
+    ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams, ToneParams, TwirlParams,
+    VignetteParams, WaveDistortionMode, WaveDistortionParams, apply_layers,
+    apply_layers_with_progress, compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -994,6 +994,7 @@ enum EffectKind {
     Duotone,
     Equalize,
     GradientMap,
+    DiffuseGlow,
     Bloom,
     Vignette,
     FilmGrain,
@@ -1046,6 +1047,7 @@ impl EffectKind {
             LocalEffect::Duotone(_) => Self::Duotone,
             LocalEffect::Equalize(_) => Self::Equalize,
             LocalEffect::GradientMap(_) => Self::GradientMap,
+            LocalEffect::DiffuseGlow(_) => Self::DiffuseGlow,
             LocalEffect::Bloom(_) => Self::Bloom,
             LocalEffect::Vignette(_) => Self::Vignette,
             LocalEffect::FilmGrain(_) => Self::FilmGrain,
@@ -1098,6 +1100,7 @@ impl EffectKind {
             Self::Duotone => "ダブルトーン",
             Self::Equalize => "ヒストグラム平坦化",
             Self::GradientMap => "グラデーションマップ",
+            Self::DiffuseGlow => "拡散光彩",
             Self::Bloom => "ブルーム",
             Self::Vignette => "ビネット",
             Self::FilmGrain => "フィルム粒子",
@@ -1181,6 +1184,9 @@ impl EffectKind {
             }
             Self::GradientMap => {
                 "明るさを指定したグラデーションの色へ置き換え、色設計や色トレス風に使います。"
+            }
+            Self::DiffuseGlow => {
+                "明るい部分を白く柔らかく拡散し、粒状感のある夢幻的な光彩を作ります。"
             }
             Self::Bloom => "明るい部分を周囲へにじませ、発光感を足します。",
             Self::Vignette => "周辺を暗く、または明るくして視線を中央へ誘導します。",
@@ -1284,6 +1290,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
     EffectGroup {
         title: "光・雰囲気",
         kinds: &[
+            EffectKind::DiffuseGlow,
             EffectKind::Bloom,
             EffectKind::StarGlow,
             EffectKind::Vignette,
@@ -7259,6 +7266,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
                 gradient_map_preset_label(params.preset)
             )
         }
+        LocalEffect::DiffuseGlow(params) => format!("拡散光彩 {:.0}px", params.radius_px),
         LocalEffect::Bloom(params) => format!("ブルーム {:.0}px", params.radius_px),
         LocalEffect::Vignette(params) => format!("ビネット {:.0}%", params.strength * 100.0),
         LocalEffect::FilmGrain(params) => format!("粒子 {:.0}%", params.amount * 100.0),
@@ -10433,6 +10441,78 @@ fn draw_effect_params(
             contrast_response
                 .lab_hover_tip("色を割り当てる前に、明るさの差を締めたり広げたりします。");
         }
+        LocalEffect::DiffuseGlow(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "夢幻") {
+                    *params = DiffuseGlowParams {
+                        threshold: 0.48,
+                        radius_px: 28.0,
+                        strength: 0.75,
+                        white_mix: 0.55,
+                        grain: 0.28,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡く") {
+                    *params = DiffuseGlowParams {
+                        threshold: 0.62,
+                        radius_px: 18.0,
+                        strength: 0.42,
+                        white_mix: 0.35,
+                        grain: 0.12,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "粒状") {
+                    *params = DiffuseGlowParams {
+                        threshold: 0.42,
+                        radius_px: 22.0,
+                        strength: 0.85,
+                        white_mix: 0.45,
+                        grain: 0.75,
+                        seed: params.seed,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "明るい部分を白く拡散し、粒状ノイズで光のにじみにムラを作ります。Bloom より柔らかい写真効果向けです。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let threshold =
+                ui.add(egui::Slider::new(&mut params.threshold, 0.0..=0.98).text("明部しきい値"));
+            changed |= threshold.changed();
+            threshold
+                .lab_hover_tip("光彩として拾う明るさです。低いほど広い範囲へ白い拡散が乗ります。");
+            let radius = ui.add(
+                egui::Slider::new(&mut params.radius_px, 0.0..=120.0)
+                    .text("拡散半径")
+                    .suffix("px"),
+            );
+            changed |= radius.changed();
+            radius.lab_hover_tip("抽出した明部をどれだけ広くにじませるかです。");
+            let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=2.0).text("強さ"));
+            changed |= strength.changed();
+            strength.lab_hover_tip("元画像へ拡散光彩を重ねる強さです。");
+            let white_mix =
+                ui.add(egui::Slider::new(&mut params.white_mix, 0.0..=1.0).text("白さ"));
+            changed |= white_mix.changed();
+            white_mix.lab_hover_tip("光彩をどれだけ白く漂わせるかです。");
+            let grain = ui.add(egui::Slider::new(&mut params.grain, 0.0..=1.0).text("粒状感"));
+            changed |= grain.changed();
+            grain.lab_hover_tip("光彩と明部に加える粒状ノイズの量です。");
+            let mut seed = params.seed as i32;
+            let seed_response = ui.add(egui::Slider::new(&mut seed, 0..=9999).text("seed"));
+            changed |= seed_response.changed();
+            seed_response.lab_hover_tip("粒状ノイズのパターンを変えます。");
+            params.seed = seed.max(0) as u32;
+        }
         LocalEffect::Bloom(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
             ui.horizontal_wrapped(|ui| {
@@ -11983,6 +12063,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::Duotone => LocalEffect::Duotone(DuotoneParams::default()),
         EffectKind::Equalize => LocalEffect::Equalize(EqualizeParams::default()),
         EffectKind::GradientMap => LocalEffect::GradientMap(GradientMapParams::default()),
+        EffectKind::DiffuseGlow => LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
         EffectKind::Bloom => LocalEffect::Bloom(BloomParams::default()),
         EffectKind::Vignette => LocalEffect::Vignette(VignetteParams::default()),
         EffectKind::FilmGrain => LocalEffect::FilmGrain(FilmGrainParams::default()),
