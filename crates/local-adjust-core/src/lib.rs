@@ -561,6 +561,7 @@ pub enum LocalEffect {
     NeonGlow(NeonGlowParams),
     DiffuseGlow(DiffuseGlowParams),
     Bloom(BloomParams),
+    GodRays(GodRaysParams),
     Vignette(VignetteParams),
     FilmGrain(FilmGrainParams),
     ChromaticAberration(ChromaticAberrationParams),
@@ -626,6 +627,7 @@ impl LocalEffect {
             Self::NeonGlow(_) => "ネオングロー",
             Self::DiffuseGlow(_) => "拡散光彩",
             Self::Bloom(_) => "ブルーム",
+            Self::GodRays(_) => "光芒",
             Self::Vignette(_) => "ビネット",
             Self::FilmGrain(_) => "フィルム粒子",
             Self::ChromaticAberration(_) => "色収差",
@@ -2280,6 +2282,29 @@ impl Default for BloomParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GodRaysParams {
+    pub center: [f32; 2],
+    pub threshold: f32,
+    pub length_px: f32,
+    pub decay: f32,
+    pub strength: f32,
+    pub warm_tint: f32,
+}
+
+impl Default for GodRaysParams {
+    fn default() -> Self {
+        Self {
+            center: [0.50, 0.18],
+            threshold: 0.82,
+            length_px: 120.0,
+            decay: 0.86,
+            strength: 0.0,
+            warm_tint: 0.18,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VignetteParams {
     /// Positive values darken the edge; negative values brighten it.
     pub strength: f32,
@@ -2704,6 +2729,9 @@ where
         }
         LocalEffect::Bloom(params) => {
             apply_bloom(&image.pixels, image.width, image.height, *params)
+        }
+        LocalEffect::GodRays(params) => {
+            apply_god_rays(&image.pixels, image.width, image.height, *params)
         }
         LocalEffect::Vignette(params) => {
             apply_vignette(&image.pixels, image.width, image.height, *params)
@@ -7086,6 +7114,105 @@ fn apply_bloom(src: &[u8], width: usize, height: usize, params: BloomParams) -> 
     out
 }
 
+fn apply_god_rays(src: &[u8], width: usize, height: usize, params: GodRaysParams) -> Vec<u8> {
+    let strength = params.strength.clamp(0.0, 3.0);
+    let length = params.length_px.clamp(1.0, 360.0);
+    if strength <= f32::EPSILON || width == 0 || height == 0 {
+        return src.to_vec();
+    }
+    let threshold = params.threshold.clamp(0.0, 0.999);
+    let inv_range = 1.0 / (1.0 - threshold).max(0.001);
+    let warm_tint = params.warm_tint.clamp(0.0, 1.0);
+    let warm = [1.0, 0.84, 0.54];
+    let mut bright = vec![0_u8; src.len()];
+    for i in (0..src.len()).step_by(4) {
+        let alpha = src[i + 3] as f32 / 255.0;
+        if alpha <= f32::EPSILON {
+            continue;
+        }
+        let base = [
+            src[i] as f32 / 255.0,
+            src[i + 1] as f32 / 255.0,
+            src[i + 2] as f32 / 255.0,
+        ];
+        let gate = ((luma01(base[0], base[1], base[2]) - threshold) * inv_range)
+            .clamp(0.0, 1.0)
+            .powf(1.35);
+        if gate <= 0.001 {
+            continue;
+        }
+        let source = [
+            lerp_f32(base[0], warm[0], warm_tint),
+            lerp_f32(base[1], warm[1], warm_tint),
+            lerp_f32(base[2], warm[2], warm_tint),
+        ];
+        for c in 0..3 {
+            bright[i + c] = to_u8(source[c] * gate * alpha);
+        }
+        bright[i + 3] = src[i + 3];
+    }
+
+    let bright = box_blur_rgba(&bright, width, height, 2);
+    let cx = params.center[0].clamp(0.0, 1.0) * width.saturating_sub(1) as f32;
+    let cy = params.center[1].clamp(0.0, 1.0) * height.saturating_sub(1) as f32;
+    let max_steps = length.round().clamp(1.0, 180.0) as usize;
+    let step_px = length / max_steps as f32;
+    let decay = params.decay.clamp(0.0, 1.0);
+    let mut rays = vec![0.0_f32; width * height * 3];
+    for y in 0..height {
+        for x in 0..width {
+            let i = (y * width + x) * 4;
+            if bright[i] == 0 && bright[i + 1] == 0 && bright[i + 2] == 0 {
+                continue;
+            }
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let dist = dx.hypot(dy);
+            if dist <= 0.5 {
+                continue;
+            }
+            let dir_x = dx / dist;
+            let dir_y = dy / dist;
+            let color = [
+                bright[i] as f32 / 255.0,
+                bright[i + 1] as f32 / 255.0,
+                bright[i + 2] as f32 / 255.0,
+            ];
+            for step in 1..=max_steps {
+                let distance = step as f32 * step_px;
+                let sx = x as f32 + dir_x * distance;
+                let sy = y as f32 + dir_y * distance;
+                if sx < -0.001
+                    || sy < -0.001
+                    || sx > width as f32 - 1.0 + 0.001
+                    || sy > height as f32 - 1.0 + 0.001
+                {
+                    break;
+                }
+                let linear = (1.0 - distance / length).max(0.0);
+                let falloff = linear * linear * decay.powf(distance / 18.0);
+                add_bilinear_rgb(&mut rays, width, height, sx, sy, color, falloff);
+            }
+        }
+    }
+
+    let mut out = src.to_vec();
+    let scale = strength * 0.22;
+    for i in 0..width * height {
+        let si = i * 3;
+        let oi = i * 4;
+        if src[oi + 3] == 0 {
+            continue;
+        }
+        for c in 0..3 {
+            let base = src[oi + c] as f32 / 255.0;
+            let ray = (rays[si + c] * scale).clamp(0.0, 1.0);
+            out[oi + c] = to_u8(screen_channel(base, ray));
+        }
+    }
+    out
+}
+
 fn apply_vignette(src: &[u8], width: usize, height: usize, params: VignetteParams) -> Vec<u8> {
     let strength = params.strength.clamp(-1.0, 1.0);
     if strength.abs() <= f32::EPSILON || width == 0 || height == 0 {
@@ -9207,6 +9334,7 @@ mod tests {
             LocalEffect::NeonGlow(NeonGlowParams::default()),
             LocalEffect::DiffuseGlow(DiffuseGlowParams::default()),
             LocalEffect::Bloom(BloomParams::default()),
+            LocalEffect::GodRays(GodRaysParams::default()),
             LocalEffect::Vignette(VignetteParams::default()),
             LocalEffect::FilmGrain(FilmGrainParams::default()),
             LocalEffect::ChromaticAberration(ChromaticAberrationParams::default()),
@@ -10229,6 +10357,38 @@ LUT_3D_SIZE 2
         let out = apply_layers(src.as_ref(), &[layer]).unwrap();
         assert!(out.pixels[0] > src.pixels[0]);
         assert_eq!(out.pixels[3], 255);
+    }
+
+    #[test]
+    fn god_rays_extend_bright_pixel_away_from_center() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                20, 20, 20, 255, 255, 245, 220, 255, 20, 20, 20, 255, 20, 20, 20, 255, 20, 20, 20,
+                255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "god rays",
+            LocalMask::Full,
+            LocalEffect::GodRays(GodRaysParams {
+                center: [0.0, 0.0],
+                threshold: 0.5,
+                length_px: 4.0,
+                decay: 1.0,
+                strength: 2.0,
+                warm_tint: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(
+            out.pixels[8] > src.pixels[8],
+            "pixel to the right of the source should receive a ray"
+        );
+        assert!(out.pixels[12] > src.pixels[12]);
+        assert_eq!(out.pixels[15], 255);
     }
 
     #[test]

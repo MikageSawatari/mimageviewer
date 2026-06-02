@@ -111,6 +111,7 @@ the window.
   - HSL / hue shift
   - Look presets
   - Bloom
+  - God rays
   - Vignette
   - Film grain
   - Chromatic aberration
