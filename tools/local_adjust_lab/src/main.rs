@@ -29,16 +29,16 @@ use local_adjust_core::{
     LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
     ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
     MotionBlurParams, NeonGlowParams, NoiseDistribution, NoiseParams, OilPaintParams,
-    OutlineStrokeParams, OutlineStrokePlacement, PinchSpherizeParams, PixelStylizeMode,
-    PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams, PosterizeParams,
-    RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask, RasterVectorMask,
-    RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams, ScreenToneMode,
-    ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams, SmartSharpenParams,
-    SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams, SpotlightParams,
-    StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams, TextureizerMode,
-    TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
-    ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VignetteParams, WaveDistortionMode,
-    WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
+    OutlineStrokeParams, OutlineStrokePlacement, PartColorParams, PinchSpherizeParams,
+    PixelStylizeMode, PixelStylizeParams, PolarCoordinatesMode, PolarCoordinatesParams,
+    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
+    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef, RimLightParams,
+    ScreenToneMode, ScreenToneParams, SelectiveColorParams, ShapeOp, SharpenParams,
+    SmartSharpenParams, SoftFocusParams, SolarizeParams, SpeedLinesMode, SpeedLinesParams,
+    SpotlightParams, StarGlowParams, SubjectMask, SubjectMaskRefinement, TextureParams,
+    TextureizerMode, TextureizerParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode,
+    TiltShiftParams, ToneCurveParams, ToneParams, ToonShadeParams, TwirlParams, VignetteParams,
+    WaveDistortionMode, WaveDistortionParams, WindDirection, WindParams, WindSource, apply_layers,
     apply_layers_with_progress, compute_mosaic_tile_size, default_mask_application_for_effect,
     evaluate_layer_mask, parse_cube_lut,
 };
@@ -984,6 +984,7 @@ enum EffectKind {
     ColorBalance,
     ThreeWayColorGrading,
     SelectiveColor,
+    PartColor,
     ChannelMixer,
     Clarity,
     Texture,
@@ -1072,6 +1073,7 @@ enum RgbPickTarget {
     RimLightColor,
     ContactShadowColor,
     ColorDodgeGlowColor,
+    PartColorTarget,
     HalationTint,
     ToonShadeShadowTint,
     ToonShadeLightTint,
@@ -1094,6 +1096,7 @@ impl RgbPickTarget {
             Self::RimLightColor => "リムライトの光色",
             Self::ContactShadowColor => "接触影の影色",
             Self::ColorDodgeGlowColor => "覆い焼き発光の光色",
+            Self::PartColorTarget => "パートカラーの対象色",
             Self::HalationTint => "ハレーションの暖色",
             Self::ToonShadeShadowTint => "トゥーン影色",
             Self::ToonShadeLightTint => "トゥーン光色",
@@ -1111,6 +1114,7 @@ impl EffectKind {
             LocalEffect::ColorBalance(_) => Self::ColorBalance,
             LocalEffect::ThreeWayColorGrading(_) => Self::ThreeWayColorGrading,
             LocalEffect::SelectiveColor(_) => Self::SelectiveColor,
+            LocalEffect::PartColor(_) => Self::PartColor,
             LocalEffect::ChannelMixer(_) => Self::ChannelMixer,
             LocalEffect::Clarity(_) => Self::Clarity,
             LocalEffect::Texture(_) => Self::Texture,
@@ -1193,6 +1197,7 @@ impl EffectKind {
             Self::ColorBalance => "カラーバランス",
             Self::ThreeWayColorGrading => "3-wayグレーディング",
             Self::SelectiveColor => "セレクティブカラー",
+            Self::PartColor => "パートカラー",
             Self::ChannelMixer => "チャンネルミキサー",
             Self::Clarity => "明瞭度",
             Self::Texture => "テクスチャ",
@@ -1277,6 +1282,9 @@ impl EffectKind {
                 "シャドウ、中間、ハイライトに別々の色味と明るさを足して空気感を作ります。"
             }
             Self::SelectiveColor => "指定した色相の近くにある色だけを狙って調整します。",
+            Self::PartColor => {
+                "指定した色だけを残し、それ以外をグレー寄りにして主役の色を強調します。"
+            }
             Self::ChannelMixer => "RGBチャンネルの寄与率を変え、色変換や本格的な白黒化を行います。",
             Self::Clarity => "局所コントラストを上げ、輪郭や質感をくっきり見せます。",
             Self::Texture => {
@@ -1470,6 +1478,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::ColorBalance,
             EffectKind::ThreeWayColorGrading,
             EffectKind::SelectiveColor,
+            EffectKind::PartColor,
             EffectKind::ChannelMixer,
             EffectKind::Hsl,
             EffectKind::ColorMixer,
@@ -8238,6 +8247,10 @@ fn effect_summary(effect: &LocalEffect) -> String {
         LocalEffect::SelectiveColor(params) => {
             format!("選択色 {:.0}°", params.target_hue_degrees.rem_euclid(360.0))
         }
+        LocalEffect::PartColor(params) => format!(
+            "パートカラー #{:02X}{:02X}{:02X}",
+            params.target_rgb[0], params.target_rgb[1], params.target_rgb[2]
+        ),
         LocalEffect::ChannelMixer(params) => {
             if params.monochrome {
                 "チャンネル白黒".to_string()
@@ -8807,6 +8820,10 @@ fn set_rgb_pick_target(effect: &mut LocalEffect, target: RgbPickTarget, rgb: [u8
         }
         (LocalEffect::ColorDodgeGlow(params), RgbPickTarget::ColorDodgeGlowColor) => {
             params.color_rgb = rgb;
+            true
+        }
+        (LocalEffect::PartColor(params), RgbPickTarget::PartColorTarget) => {
+            params.target_rgb = rgb;
             true
         }
         (LocalEffect::Halation(params), RgbPickTarget::HalationTint) => {
@@ -9728,6 +9745,117 @@ fn draw_effect_params(
                 ui.add(egui::Slider::new(&mut params.lightness, -100.0..=100.0).text("明度"));
             changed |= lightness.changed();
             lightness.lab_hover_tip("対象色だけ明るさを増減します。");
+        }
+        LocalEffect::PartColor(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "赤だけ") {
+                    *params = PartColorParams {
+                        target_rgb: [220, 40, 40],
+                        range_degrees: 20.0,
+                        feather_degrees: 18.0,
+                        gray_strength: 1.0,
+                        selected_saturation: 18.0,
+                        selected_lightness: 2.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "肌だけ") {
+                    *params = PartColorParams {
+                        target_rgb: [230, 150, 105],
+                        range_degrees: 30.0,
+                        feather_degrees: 28.0,
+                        gray_strength: 0.86,
+                        selected_saturation: 8.0,
+                        selected_lightness: 5.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "青だけ") {
+                    *params = PartColorParams {
+                        target_rgb: [50, 115, 230],
+                        range_degrees: 26.0,
+                        feather_degrees: 24.0,
+                        gray_strength: 1.0,
+                        selected_saturation: 22.0,
+                        selected_lightness: 0.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "緑だけ") {
+                    *params = PartColorParams {
+                        target_rgb: [58, 170, 82],
+                        range_degrees: 28.0,
+                        feather_degrees: 24.0,
+                        gray_strength: 0.95,
+                        selected_saturation: 20.0,
+                        selected_lightness: 2.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "淡く残す") {
+                    *params = PartColorParams {
+                        target_rgb: [220, 80, 160],
+                        range_degrees: 34.0,
+                        feather_degrees: 34.0,
+                        gray_strength: 0.70,
+                        selected_saturation: 6.0,
+                        selected_lightness: 4.0,
+                    };
+                    changed = true;
+                }
+            });
+            ui.label(
+                egui::RichText::new(
+                    "対象色に近い色だけを残し、それ以外を白黒へ寄せます。色が抜けすぎる場合は範囲やぼかしを広げてください。",
+                )
+                .size(10.0)
+                .color(Color32::from_gray(170)),
+            );
+            let response = draw_rgb_color_control(
+                ui,
+                "対象色",
+                &mut params.target_rgb,
+                RgbPickTarget::PartColorTarget,
+                rgb_pick_active,
+            );
+            merge_rgb_color_response(
+                response,
+                &mut changed,
+                &mut start_rgb_pick,
+                &mut cancel_rgb_pick,
+            );
+            let hue = hue_degrees_from_rgb(params.target_rgb);
+            ui.label(
+                egui::RichText::new(format!("対象色相: {hue:.0}°"))
+                    .size(10.0)
+                    .color(Color32::from_gray(160)),
+            );
+            let range =
+                ui.add(egui::Slider::new(&mut params.range_degrees, 1.0..=120.0).text("残す範囲"));
+            changed |= range.changed();
+            range.lab_hover_tip("対象色として強く残す色相範囲です。小さいほど一点狙いになります。");
+            let feather = ui.add(
+                egui::Slider::new(&mut params.feather_degrees, 0.0..=120.0).text("境界ぼかし"),
+            );
+            changed |= feather.changed();
+            feather.lab_hover_tip("対象色の外側へ、色残しをどれだけなだらかに弱めるかです。");
+            let gray =
+                ui.add(egui::Slider::new(&mut params.gray_strength, 0.0..=1.0).text("グレー化"));
+            changed |= gray.changed();
+            gray.lab_hover_tip("対象色から外れた色を白黒へ寄せる強さです。");
+            let saturation = ui.add(
+                egui::Slider::new(&mut params.selected_saturation, -80.0..=100.0)
+                    .text("対象色の彩度"),
+            );
+            changed |= saturation.changed();
+            saturation.lab_hover_tip("残した対象色だけ、鮮やかさを少し整えます。");
+            let lightness = ui.add(
+                egui::Slider::new(&mut params.selected_lightness, -50.0..=50.0)
+                    .text("対象色の明度"),
+            );
+            changed |= lightness.changed();
+            lightness.lab_hover_tip("残した対象色だけ、明るさを少し整えます。");
         }
         LocalEffect::ChannelMixer(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -16606,6 +16734,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
             LocalEffect::ThreeWayColorGrading(ThreeWayColorGradingParams::default())
         }
         EffectKind::SelectiveColor => LocalEffect::SelectiveColor(SelectiveColorParams::default()),
+        EffectKind::PartColor => LocalEffect::PartColor(PartColorParams::default()),
         EffectKind::ChannelMixer => LocalEffect::ChannelMixer(ChannelMixerParams::default()),
         EffectKind::Clarity => LocalEffect::Clarity(ClarityParams::default()),
         EffectKind::Texture => LocalEffect::Texture(TextureParams::default()),
@@ -18944,6 +19073,7 @@ mod tests {
             EffectKind::ColorBalance,
             EffectKind::ThreeWayColorGrading,
             EffectKind::SelectiveColor,
+            EffectKind::PartColor,
             EffectKind::ChannelMixer,
             EffectKind::Clarity,
             EffectKind::Texture,
@@ -19316,6 +19446,17 @@ mod tests {
             panic!("expected color dodge glow effect");
         };
         assert_eq!(color_dodge_glow_params.color_rgb, [255, 140, 80]);
+
+        let mut part_color = LocalEffect::PartColor(PartColorParams::default());
+        assert!(set_rgb_pick_target(
+            &mut part_color,
+            RgbPickTarget::PartColorTarget,
+            [30, 160, 220],
+        ));
+        let LocalEffect::PartColor(part_color_params) = part_color else {
+            panic!("expected part color effect");
+        };
+        assert_eq!(part_color_params.target_rgb, [30, 160, 220]);
 
         let mut halation = LocalEffect::Halation(HalationParams::default());
         assert!(set_rgb_pick_target(

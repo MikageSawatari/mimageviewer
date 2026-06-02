@@ -533,6 +533,7 @@ pub enum LocalEffect {
     ColorBalance(ColorBalanceParams),
     ThreeWayColorGrading(ThreeWayColorGradingParams),
     SelectiveColor(SelectiveColorParams),
+    PartColor(PartColorParams),
     ChannelMixer(ChannelMixerParams),
     Clarity(ClarityParams),
     Texture(TextureParams),
@@ -615,6 +616,7 @@ impl LocalEffect {
             Self::ColorBalance(_) => "カラーバランス",
             Self::ThreeWayColorGrading(_) => "3ウェイカラー",
             Self::SelectiveColor(_) => "セレクティブカラー",
+            Self::PartColor(_) => "パートカラー",
             Self::ChannelMixer(_) => "チャンネルミキサー",
             Self::Clarity(_) => "明瞭度",
             Self::Texture(_) => "テクスチャ",
@@ -889,6 +891,29 @@ impl Default for SelectiveColorParams {
             hue_degrees: 0.0,
             saturation: 0.0,
             lightness: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PartColorParams {
+    pub target_rgb: [u8; 3],
+    pub range_degrees: f32,
+    pub feather_degrees: f32,
+    pub gray_strength: f32,
+    pub selected_saturation: f32,
+    pub selected_lightness: f32,
+}
+
+impl Default for PartColorParams {
+    fn default() -> Self {
+        Self {
+            target_rgb: [220, 40, 40],
+            range_degrees: 24.0,
+            feather_degrees: 20.0,
+            gray_strength: 0.0,
+            selected_saturation: 0.0,
+            selected_lightness: 0.0,
         }
     }
 }
@@ -3174,6 +3199,7 @@ where
                 apply_three_way_color_grading(&image.pixels, *params)
             }
             LocalEffect::SelectiveColor(params) => apply_selective_color(&image.pixels, *params),
+            LocalEffect::PartColor(params) => apply_part_color(&image.pixels, *params),
             LocalEffect::ChannelMixer(params) => apply_channel_mixer(&image.pixels, *params),
             LocalEffect::Clarity(params) => apply_clarity(
                 &image.pixels,
@@ -4179,6 +4205,52 @@ fn apply_selective_color(src: &[u8], params: SelectiveColorParams) -> Vec<u8> {
         px[2] = to_u8(b);
     }
     out
+}
+
+fn apply_part_color(src: &[u8], params: PartColorParams) -> Vec<u8> {
+    let gray_strength = params.gray_strength.clamp(0.0, 1.0);
+    let sat_delta = (params.selected_saturation / 100.0).clamp(-1.0, 1.0);
+    let light_delta = (params.selected_lightness / 100.0).clamp(-1.0, 1.0);
+    if gray_strength <= f32::EPSILON
+        && sat_delta.abs() <= f32::EPSILON
+        && light_delta.abs() <= f32::EPSILON
+    {
+        return src.to_vec();
+    }
+
+    let target = part_color_target_hue_degrees(params.target_rgb);
+    let range = params.range_degrees.clamp(1.0, 180.0);
+    let feather = params.feather_degrees.clamp(0.0, 180.0);
+    let mut out = src.to_vec();
+    for px in out.chunks_exact_mut(4) {
+        let r = px[0] as f32 / 255.0;
+        let g = px[1] as f32 / 255.0;
+        let b = px[2] as f32 / 255.0;
+        let (h, s, mut l) = rgb_to_hsl(r, g, b);
+        let hue_degrees = h * 360.0;
+        let color_weight =
+            selective_hue_weight(hue_degrees, target, range, feather) * smoothstep(0.03, 0.16, s);
+
+        let selected_saturation = (s * (1.0 + sat_delta * color_weight)).clamp(0.0, 1.0);
+        l = (l + light_delta * 0.5 * color_weight).clamp(0.0, 1.0);
+        let selected = hsl_to_rgb(h, selected_saturation, l);
+        let gray = luma01(r, g, b);
+        let gray_mix = gray_strength * (1.0 - color_weight);
+
+        px[0] = to_u8(lerp_f32(selected[0], gray, gray_mix));
+        px[1] = to_u8(lerp_f32(selected[1], gray, gray_mix));
+        px[2] = to_u8(lerp_f32(selected[2], gray, gray_mix));
+    }
+    out
+}
+
+fn part_color_target_hue_degrees(rgb: [u8; 3]) -> f32 {
+    let (h, _, _) = rgb_to_hsl(
+        rgb[0] as f32 / 255.0,
+        rgb[1] as f32 / 255.0,
+        rgb[2] as f32 / 255.0,
+    );
+    h * 360.0
 }
 
 fn selective_hue_weight(
@@ -11944,6 +12016,7 @@ mod tests {
             LocalEffect::ColorBalance(ColorBalanceParams::default()),
             LocalEffect::ThreeWayColorGrading(ThreeWayColorGradingParams::default()),
             LocalEffect::SelectiveColor(SelectiveColorParams::default()),
+            LocalEffect::PartColor(PartColorParams::default()),
             LocalEffect::ChannelMixer(ChannelMixerParams::default()),
             LocalEffect::Clarity(ClarityParams::default()),
             LocalEffect::Texture(TextureParams::default()),
@@ -13157,6 +13230,59 @@ mod tests {
         assert!(out.pixels[1] > src.pixels[1]);
         assert_eq!(&out.pixels[4..8], &src.pixels[4..8]);
         assert_eq!(&out.pixels[8..12], &src.pixels[8..12]);
+    }
+
+    #[test]
+    fn part_color_desaturates_non_target_colors() {
+        let src = RgbaImageBuf::new(
+            3,
+            1,
+            vec![220, 20, 20, 255, 20, 220, 20, 255, 20, 20, 220, 128],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "part color",
+            LocalMask::Full,
+            LocalEffect::PartColor(PartColorParams {
+                target_rgb: [220, 20, 20],
+                range_degrees: 10.0,
+                feather_degrees: 0.0,
+                gray_strength: 1.0,
+                selected_saturation: 0.0,
+                selected_lightness: 0.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        assert_eq!(&out.pixels[0..4], &src.pixels[0..4]);
+        assert_eq!(out.pixels[4], out.pixels[5]);
+        assert_eq!(out.pixels[5], out.pixels[6]);
+        assert_eq!(out.pixels[8], out.pixels[9]);
+        assert_eq!(out.pixels[9], out.pixels[10]);
+        assert_eq!(out.pixels[11], 128);
+    }
+
+    #[test]
+    fn part_color_can_boost_selected_color() {
+        let src = RgbaImageBuf::new(2, 1, vec![180, 70, 70, 255, 70, 180, 70, 255]).unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "part color",
+            LocalMask::Full,
+            LocalEffect::PartColor(PartColorParams {
+                target_rgb: [220, 20, 20],
+                range_degrees: 18.0,
+                feather_degrees: 12.0,
+                gray_strength: 1.0,
+                selected_saturation: 60.0,
+                selected_lightness: 8.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+
+        assert!(out.pixels[0] > src.pixels[0]);
+        assert!(out.pixels[1] <= src.pixels[1]);
+        assert_eq!(out.pixels[4], out.pixels[5]);
+        assert_eq!(out.pixels[5], out.pixels[6]);
     }
 
     #[test]

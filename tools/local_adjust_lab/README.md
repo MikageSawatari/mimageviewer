@@ -92,6 +92,7 @@ the window.
   - Tone
   - Tone curve
   - Selective color with an image-click eyedropper for the target hue
+  - Part color / keep one picked color while graying the rest
   - Clarity
   - Highlights/Shadows
   - Dehaze
@@ -141,8 +142,8 @@ the window.
   buttons for practical starting points, or Reset to return the current effect
   to its default values.
 - RGB color parameters in Color Fill, Outline Stroke, Rim Light, Contact
-  Shadow, Color Overlay, Neon Glow, Color Dodge Glow, Halation, Toon Shade,
-  Speed Lines, Cloud/Fog, and Spotlight share a control with a color button,
+  Shadow, Color Overlay, Neon Glow, Color Dodge Glow, Part Color, Halation,
+  Toon Shade, Speed Lines, Cloud/Fog, and Spotlight share a control with a color button,
   HEX readout, RGB sliders, and an image-click eyedropper.
 - Color Fill starts with a shape placeholder and full opacity. Choosing Solid,
   Linear Gradient, or Radial Gradient immediately makes the fill visible.
