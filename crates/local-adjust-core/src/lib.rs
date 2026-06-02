@@ -421,6 +421,7 @@ pub enum LocalEffect {
     ChannelMixer(ChannelMixerParams),
     Clarity(ClarityParams),
     Texture(TextureParams),
+    HighPass(HighPassParams),
     HighlightsShadows(HighlightsShadowsParams),
     Dehaze(DehazeParams),
     Blur(BlurParams),
@@ -464,6 +465,7 @@ impl LocalEffect {
             Self::ChannelMixer(_) => "チャンネルミキサー",
             Self::Clarity(_) => "明瞭度",
             Self::Texture(_) => "テクスチャ",
+            Self::HighPass(_) => "ハイパス",
             Self::HighlightsShadows(_) => "ハイライト/シャドウ",
             Self::Dehaze(_) => "かすみ除去",
             Self::Blur(_) => "ぼかし",
@@ -731,6 +733,29 @@ impl Default for TextureParams {
         Self {
             amount: 0.0,
             radius_px: 10.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct HighPassParams {
+    /// Strength of the overlay high-pass sharpening. Ignored when detail_only is true.
+    pub amount: f32,
+    /// Blur radius used to separate low frequencies from detail.
+    pub radius_px: f32,
+    /// Contrast applied to the extracted detail before overlaying it.
+    pub contrast: f32,
+    /// Show the extracted high-pass plate around neutral gray instead of overlaying it.
+    pub detail_only: bool,
+}
+
+impl Default for HighPassParams {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            radius_px: 8.0,
+            contrast: 1.0,
+            detail_only: false,
         }
     }
 }
@@ -1611,6 +1636,15 @@ where
             params.radius_px.round().max(0.0) as usize,
             params.amount.clamp(-1.0, 1.0),
         ),
+        LocalEffect::HighPass(params) => apply_high_pass(
+            &image.pixels,
+            image.width,
+            image.height,
+            params.radius_px.round().max(0.0) as usize,
+            params.amount.clamp(0.0, 2.0),
+            params.contrast.clamp(0.1, 4.0),
+            params.detail_only,
+        ),
         LocalEffect::HighlightsShadows(params) => apply_highlights_shadows(&image.pixels, *params),
         LocalEffect::Dehaze(params) => {
             apply_dehaze(&image.pixels, image.width, image.height, *params)
@@ -2390,6 +2424,48 @@ fn apply_texture(src: &[u8], width: usize, height: usize, radius: usize, amount:
         }
     }
     out
+}
+
+fn apply_high_pass(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    radius: usize,
+    amount: f32,
+    contrast: f32,
+    detail_only: bool,
+) -> Vec<u8> {
+    if radius == 0 || (!detail_only && amount <= f32::EPSILON) {
+        return src.to_vec();
+    }
+    let blur = box_blur_rgba(src, width, height, radius);
+    let mut out = src.to_vec();
+    for i in (0..src.len()).step_by(4) {
+        for c in 0..3 {
+            let base = src[i + c] as f32;
+            let low = blur[i + c] as f32;
+            let high_pass = (128.0 + (base - low) * contrast).round().clamp(0.0, 255.0) as u8;
+            if detail_only {
+                out[i + c] = high_pass;
+            } else {
+                let overlay = overlay_channel(src[i + c], high_pass);
+                out[i + c] = (base + (overlay as f32 - base) * amount)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
+    }
+    out
+}
+
+fn overlay_channel(base: u8, blend: u8) -> u8 {
+    let base = base as u32;
+    let blend = blend as u32;
+    if base < 128 {
+        ((2 * base * blend + 127) / 255).min(255) as u8
+    } else {
+        (255 - ((2 * (255 - base) * (255 - blend) + 127) / 255)).min(255) as u8
+    }
 }
 
 fn apply_highlights_shadows(src: &[u8], params: HighlightsShadowsParams) -> Vec<u8> {
@@ -4740,6 +4816,49 @@ mod tests {
     }
 
     #[test]
+    fn high_pass_overlay_preserves_flat_image() {
+        let src = solid(4, 4, [100, 120, 140, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "high pass",
+            LocalMask::Full,
+            LocalEffect::HighPass(HighPassParams {
+                amount: 1.0,
+                radius_px: 2.0,
+                contrast: 1.0,
+                detail_only: false,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn high_pass_overlay_enhances_edges() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                96, 96, 96, 255, 128, 128, 128, 255, 160, 160, 160, 255, 128, 128, 128, 255, 96,
+                96, 96, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "high pass",
+            LocalMask::Full,
+            LocalEffect::HighPass(HighPassParams {
+                amount: 1.0,
+                radius_px: 1.0,
+                contrast: 1.0,
+                detail_only: false,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[8] > src.pixels[8]);
+        assert_eq!(out.pixels[11], 255);
+    }
+
+    #[test]
     fn default_adjustment_effects_are_identity() {
         let src = RgbaImageBuf::new(
             3,
@@ -4757,6 +4876,7 @@ mod tests {
             LocalEffect::ChannelMixer(ChannelMixerParams::default()),
             LocalEffect::Clarity(ClarityParams::default()),
             LocalEffect::Texture(TextureParams::default()),
+            LocalEffect::HighPass(HighPassParams::default()),
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default()),
             LocalEffect::Dehaze(DehazeParams::default()),
             LocalEffect::Blur(BlurParams::default()),

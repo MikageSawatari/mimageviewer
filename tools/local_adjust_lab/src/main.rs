@@ -18,16 +18,16 @@ use local_adjust_core::{
     BloomParams, BlurParams, ChannelMixerParams, ChromaticAberrationParams, ClarityParams,
     ColorBalanceParams, ColorBalanceRange, ColorGradeWheel, ColorMixerParams, ColorRangeMask,
     CubeLutParams, DehazeParams, DuotoneParams, DuotonePreset, EdgeSmoothParams, EqualizeParams,
-    FilmGrainParams, GradientMapParams, GradientMapPreset, HalftoneParams, HighlightsShadowsParams,
-    HslParams, InvertParams, LensBlurAperture, LensBlurParams, LineKind, LinearGradientMask,
-    LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset, ManualMaskOverride,
-    MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
-    PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
-    RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
-    SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams, TextureParams,
-    ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
-    ToneParams, VignetteParams, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
-    evaluate_layer_mask, parse_cube_lut,
+    FilmGrainParams, GradientMapParams, GradientMapPreset, HalftoneParams, HighPassParams,
+    HighlightsShadowsParams, HslParams, InvertParams, LensBlurAperture, LensBlurParams, LineKind,
+    LinearGradientMask, LocalAdjustmentLayer, LocalEffect, LocalMask, LookParams, LookPreset,
+    ManualMaskOverride, MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode,
+    MotionBlurParams, PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask,
+    RangeMask, RasterMask, RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf,
+    RgbaImageRef, SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams,
+    TextureParams, ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams,
+    ToneCurveParams, ToneParams, VignetteParams, apply_layers, apply_layers_with_progress,
+    compute_mosaic_tile_size, evaluate_layer_mask, parse_cube_lut,
 };
 use serde::{Deserialize, Serialize};
 
@@ -962,6 +962,7 @@ enum EffectKind {
     ChannelMixer,
     Clarity,
     Texture,
+    HighPass,
     HighlightsShadows,
     Dehaze,
     Blur,
@@ -1005,6 +1006,7 @@ impl EffectKind {
             LocalEffect::ChannelMixer(_) => Self::ChannelMixer,
             LocalEffect::Clarity(_) => Self::Clarity,
             LocalEffect::Texture(_) => Self::Texture,
+            LocalEffect::HighPass(_) => Self::HighPass,
             LocalEffect::HighlightsShadows(_) => Self::HighlightsShadows,
             LocalEffect::Dehaze(_) => Self::Dehaze,
             LocalEffect::Blur(_) => Self::Blur,
@@ -1048,6 +1050,7 @@ impl EffectKind {
             Self::ChannelMixer => "チャンネルミキサー",
             Self::Clarity => "明瞭度",
             Self::Texture => "テクスチャ",
+            Self::HighPass => "ハイパス",
             Self::HighlightsShadows => "ハイライト/シャドウ",
             Self::Dehaze => "かすみ除去",
             Self::Blur => "ぼかし",
@@ -1094,6 +1097,9 @@ impl EffectKind {
             Self::Clarity => "局所コントラストを上げ、輪郭や質感をくっきり見せます。",
             Self::Texture => {
                 "中くらいの細かさの質感だけを強めたり弱めたりします。肌や塗り面のざらつき調整に使います。"
+            }
+            Self::HighPass => {
+                "中間グレーのハイパス抽出を使い、輪郭や細部をオーバーレイ合成で引き締めます。"
             }
             Self::HighlightsShadows => "明るい部分と暗い部分を個別に持ち上げたり抑えたりします。",
             Self::Dehaze => "白っぽさを減らし、遠景や薄いコントラストを締めます。",
@@ -1206,6 +1212,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::SoftFocus,
             EffectKind::Clarity,
             EffectKind::Texture,
+            EffectKind::HighPass,
             EffectKind::Sharpen,
             EffectKind::EdgeSmooth,
             EffectKind::Median,
@@ -7064,6 +7071,13 @@ fn effect_summary(effect: &LocalEffect) -> String {
         }
         LocalEffect::Clarity(_) => "明瞭度".to_string(),
         LocalEffect::Texture(params) => format!("テクスチャ {:+.0}%", params.amount * 100.0),
+        LocalEffect::HighPass(params) => {
+            if params.detail_only {
+                format!("ハイパス抽出 {:.0}px", params.radius_px)
+            } else {
+                format!("ハイパス {:.0}%", params.amount * 100.0)
+            }
+        }
         LocalEffect::HighlightsShadows(_) => "ハイライト/シャドウ".to_string(),
         LocalEffect::Dehaze(params) => format!("かすみ除去 {:.0}%", params.amount * 100.0),
         LocalEffect::Blur(params) => format!("ぼかし {:.0}px", params.radius_px),
@@ -8225,6 +8239,65 @@ fn draw_effect_params(
             let radius = ui.add(egui::Slider::new(&mut params.radius_px, 2.0..=40.0).text("半径"));
             changed |= radius.changed();
             radius.lab_hover_tip("拾う質感の大きさです。大きい値ほど広めの凹凸を対象にします。");
+        }
+        LocalEffect::HighPass(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "弱く") {
+                    *params = HighPassParams {
+                        amount: 0.45,
+                        radius_px: 8.0,
+                        contrast: 1.0,
+                        detail_only: false,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "くっきり") {
+                    *params = HighPassParams {
+                        amount: 0.85,
+                        radius_px: 6.0,
+                        contrast: 1.2,
+                        detail_only: false,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "線/細部") {
+                    *params = HighPassParams {
+                        amount: 1.2,
+                        radius_px: 3.0,
+                        contrast: 1.6,
+                        detail_only: false,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "抽出表示") {
+                    *params = HighPassParams {
+                        amount: 0.0,
+                        radius_px: 8.0,
+                        contrast: 1.4,
+                        detail_only: true,
+                    };
+                    changed = true;
+                }
+            });
+            let detail_only = ui.checkbox(&mut params.detail_only, "抽出だけ表示");
+            changed |= detail_only.changed();
+            detail_only.lab_hover_tip(
+                "ONにすると、元画像に合成せず中間グレー上のディテール抽出結果を表示します。",
+            );
+            let amount = ui.add_enabled(
+                !params.detail_only,
+                egui::Slider::new(&mut params.amount, 0.0..=2.0).text("量"),
+            );
+            changed |= amount.changed();
+            amount.lab_hover_tip("ハイパス抽出をオーバーレイ合成する強さです。");
+            let radius = ui.add(egui::Slider::new(&mut params.radius_px, 1.0..=60.0).text("半径"));
+            changed |= radius.changed();
+            radius.lab_hover_tip("大きい値ほど広い輪郭、小さい値ほど細部を抽出します。");
+            let contrast = ui
+                .add(egui::Slider::new(&mut params.contrast, 0.25..=4.0).text("抽出コントラスト"));
+            changed |= contrast.changed();
+            contrast.lab_hover_tip("抽出したディテールを中間グレーからどれだけ離すかです。");
         }
         LocalEffect::HighlightsShadows(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -11044,6 +11117,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::ChannelMixer => LocalEffect::ChannelMixer(ChannelMixerParams::default()),
         EffectKind::Clarity => LocalEffect::Clarity(ClarityParams::default()),
         EffectKind::Texture => LocalEffect::Texture(TextureParams::default()),
+        EffectKind::HighPass => LocalEffect::HighPass(HighPassParams::default()),
         EffectKind::HighlightsShadows => {
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default())
         }
