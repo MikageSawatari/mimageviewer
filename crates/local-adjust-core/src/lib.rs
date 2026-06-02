@@ -420,6 +420,7 @@ pub enum LocalEffect {
     SelectiveColor(SelectiveColorParams),
     ChannelMixer(ChannelMixerParams),
     Clarity(ClarityParams),
+    Texture(TextureParams),
     HighlightsShadows(HighlightsShadowsParams),
     Dehaze(DehazeParams),
     Blur(BlurParams),
@@ -462,6 +463,7 @@ impl LocalEffect {
             Self::SelectiveColor(_) => "セレクティブカラー",
             Self::ChannelMixer(_) => "チャンネルミキサー",
             Self::Clarity(_) => "明瞭度",
+            Self::Texture(_) => "テクスチャ",
             Self::HighlightsShadows(_) => "ハイライト/シャドウ",
             Self::Dehaze(_) => "かすみ除去",
             Self::Blur(_) => "ぼかし",
@@ -713,6 +715,22 @@ impl Default for ClarityParams {
         Self {
             amount: 0.0,
             radius_px: 18.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextureParams {
+    /// Positive values enhance medium-frequency detail; negative values smooth it.
+    pub amount: f32,
+    pub radius_px: f32,
+}
+
+impl Default for TextureParams {
+    fn default() -> Self {
+        Self {
+            amount: 0.0,
+            radius_px: 10.0,
         }
     }
 }
@@ -1586,6 +1604,13 @@ where
             params.radius_px.round().max(0.0) as usize,
             params.amount.clamp(-1.0, 1.0),
         ),
+        LocalEffect::Texture(params) => apply_texture(
+            &image.pixels,
+            image.width,
+            image.height,
+            params.radius_px.round().max(0.0) as usize,
+            params.amount.clamp(-1.0, 1.0),
+        ),
         LocalEffect::HighlightsShadows(params) => apply_highlights_shadows(&image.pixels, *params),
         LocalEffect::Dehaze(params) => {
             apply_dehaze(&image.pixels, image.width, image.height, *params)
@@ -2344,6 +2369,24 @@ fn apply_clarity(src: &[u8], width: usize, height: usize, radius: usize, amount:
             let base = src[i + c] as f32;
             let low = blur[i + c] as f32;
             out[i + c] = (base + (base - low) * amount).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    out
+}
+
+fn apply_texture(src: &[u8], width: usize, height: usize, radius: usize, amount: f32) -> Vec<u8> {
+    if radius < 2 || amount.abs() <= f32::EPSILON {
+        return src.to_vec();
+    }
+    let fine_radius = (radius / 3).clamp(1, radius.saturating_sub(1));
+    let fine = box_blur_rgba(src, width, height, fine_radius);
+    let coarse = box_blur_rgba(src, width, height, radius);
+    let mut out = src.to_vec();
+    for i in (0..src.len()).step_by(4) {
+        for c in 0..3 {
+            let base = src[i + c] as f32;
+            let detail = fine[i + c] as f32 - coarse[i + c] as f32;
+            out[i + c] = (base + detail * amount).round().clamp(0.0, 255.0) as u8;
         }
     }
     out
@@ -4659,6 +4702,44 @@ mod tests {
     }
 
     #[test]
+    fn texture_preserves_flat_image() {
+        let src = solid(4, 4, [100, 120, 140, 255]);
+        let layer = LocalAdjustmentLayer::new(
+            "texture",
+            LocalMask::Full,
+            LocalEffect::Texture(TextureParams {
+                amount: 0.8,
+                radius_px: 8.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert_eq!(out.pixels, src.pixels);
+    }
+
+    #[test]
+    fn texture_enhances_medium_detail() {
+        let src = RgbaImageBuf::new(
+            5,
+            1,
+            vec![
+                96, 96, 96, 255, 128, 128, 128, 255, 160, 160, 160, 255, 128, 128, 128, 255, 96,
+                96, 96, 255,
+            ],
+        )
+        .unwrap();
+        let layer = LocalAdjustmentLayer::new(
+            "texture",
+            LocalMask::Full,
+            LocalEffect::Texture(TextureParams {
+                amount: 1.0,
+                radius_px: 3.0,
+            }),
+        );
+        let out = apply_layers(src.as_ref(), &[layer]).unwrap();
+        assert!(out.pixels[8] > src.pixels[8]);
+    }
+
+    #[test]
     fn default_adjustment_effects_are_identity() {
         let src = RgbaImageBuf::new(
             3,
@@ -4675,6 +4756,7 @@ mod tests {
             LocalEffect::SelectiveColor(SelectiveColorParams::default()),
             LocalEffect::ChannelMixer(ChannelMixerParams::default()),
             LocalEffect::Clarity(ClarityParams::default()),
+            LocalEffect::Texture(TextureParams::default()),
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default()),
             LocalEffect::Dehaze(DehazeParams::default()),
             LocalEffect::Blur(BlurParams::default()),

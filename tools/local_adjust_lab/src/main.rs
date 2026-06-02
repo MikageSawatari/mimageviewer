@@ -24,7 +24,7 @@ use local_adjust_core::{
     MaskShape, MedianParams, MosaicBoundary, MosaicParams, MosaicTileMode, MotionBlurParams,
     PosterizeParams, RadialBlurMode, RadialBlurParams, RadialGradientMask, RangeMask, RasterMask,
     RasterVectorMask, RegionMask, RgbToneCurveParams, RgbaImageBuf, RgbaImageRef,
-    SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams,
+    SelectiveColorParams, ShapeOp, SharpenParams, SoftFocusParams, StarGlowParams, TextureParams,
     ThreeWayColorGradingParams, ThresholdParams, TiltShiftMode, TiltShiftParams, ToneCurveParams,
     ToneParams, VignetteParams, apply_layers, apply_layers_with_progress, compute_mosaic_tile_size,
     evaluate_layer_mask, parse_cube_lut,
@@ -961,6 +961,7 @@ enum EffectKind {
     SelectiveColor,
     ChannelMixer,
     Clarity,
+    Texture,
     HighlightsShadows,
     Dehaze,
     Blur,
@@ -1003,6 +1004,7 @@ impl EffectKind {
             LocalEffect::SelectiveColor(_) => Self::SelectiveColor,
             LocalEffect::ChannelMixer(_) => Self::ChannelMixer,
             LocalEffect::Clarity(_) => Self::Clarity,
+            LocalEffect::Texture(_) => Self::Texture,
             LocalEffect::HighlightsShadows(_) => Self::HighlightsShadows,
             LocalEffect::Dehaze(_) => Self::Dehaze,
             LocalEffect::Blur(_) => Self::Blur,
@@ -1045,6 +1047,7 @@ impl EffectKind {
             Self::SelectiveColor => "セレクティブカラー",
             Self::ChannelMixer => "チャンネルミキサー",
             Self::Clarity => "明瞭度",
+            Self::Texture => "テクスチャ",
             Self::HighlightsShadows => "ハイライト/シャドウ",
             Self::Dehaze => "かすみ除去",
             Self::Blur => "ぼかし",
@@ -1089,6 +1092,9 @@ impl EffectKind {
             Self::SelectiveColor => "指定した色相の近くにある色だけを狙って調整します。",
             Self::ChannelMixer => "RGBチャンネルの寄与率を変え、色変換や本格的な白黒化を行います。",
             Self::Clarity => "局所コントラストを上げ、輪郭や質感をくっきり見せます。",
+            Self::Texture => {
+                "中くらいの細かさの質感だけを強めたり弱めたりします。肌や塗り面のざらつき調整に使います。"
+            }
             Self::HighlightsShadows => "明るい部分と暗い部分を個別に持ち上げたり抑えたりします。",
             Self::Dehaze => "白っぽさを減らし、遠景や薄いコントラストを締めます。",
             Self::Blur => "選択範囲を均一にぼかします。背景ぼかしや軽い隠しに使います。",
@@ -1199,6 +1205,7 @@ const EFFECT_GROUPS: &[EffectGroup] = &[
             EffectKind::RadialBlur,
             EffectKind::SoftFocus,
             EffectKind::Clarity,
+            EffectKind::Texture,
             EffectKind::Sharpen,
             EffectKind::EdgeSmooth,
             EffectKind::Median,
@@ -7056,6 +7063,7 @@ fn effect_summary(effect: &LocalEffect) -> String {
             }
         }
         LocalEffect::Clarity(_) => "明瞭度".to_string(),
+        LocalEffect::Texture(params) => format!("テクスチャ {:+.0}%", params.amount * 100.0),
         LocalEffect::HighlightsShadows(_) => "ハイライト/シャドウ".to_string(),
         LocalEffect::Dehaze(params) => format!("かすみ除去 {:.0}%", params.amount * 100.0),
         LocalEffect::Blur(params) => format!("ぼかし {:.0}px", params.radius_px),
@@ -8185,6 +8193,38 @@ fn draw_effect_params(
             changed |= ui
                 .add(egui::Slider::new(&mut params.radius_px, 1.0..=80.0).text("半径"))
                 .changed();
+        }
+        LocalEffect::Texture(params) => {
+            ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
+            ui.horizontal_wrapped(|ui| {
+                if preset_button(ui, "質感+") {
+                    *params = TextureParams {
+                        amount: 0.45,
+                        radius_px: 10.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "質感-") {
+                    *params = TextureParams {
+                        amount: -0.45,
+                        radius_px: 10.0,
+                    };
+                    changed = true;
+                }
+                if preset_button(ui, "塗り面なめらか") {
+                    *params = TextureParams {
+                        amount: -0.65,
+                        radius_px: 7.0,
+                    };
+                    changed = true;
+                }
+            });
+            let amount = ui.add(egui::Slider::new(&mut params.amount, -1.0..=1.0).text("量"));
+            changed |= amount.changed();
+            amount.lab_hover_tip("正で中くらいの細部を強め、負でざらつきを抑えます。");
+            let radius = ui.add(egui::Slider::new(&mut params.radius_px, 2.0..=40.0).text("半径"));
+            changed |= radius.changed();
+            radius.lab_hover_tip("拾う質感の大きさです。大きい値ほど広めの凹凸を対象にします。");
         }
         LocalEffect::HighlightsShadows(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));
@@ -11003,6 +11043,7 @@ fn default_effect(kind: EffectKind) -> LocalEffect {
         EffectKind::SelectiveColor => LocalEffect::SelectiveColor(SelectiveColorParams::default()),
         EffectKind::ChannelMixer => LocalEffect::ChannelMixer(ChannelMixerParams::default()),
         EffectKind::Clarity => LocalEffect::Clarity(ClarityParams::default()),
+        EffectKind::Texture => LocalEffect::Texture(TextureParams::default()),
         EffectKind::HighlightsShadows => {
             LocalEffect::HighlightsShadows(HighlightsShadowsParams::default())
         }
