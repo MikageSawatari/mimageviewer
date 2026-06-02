@@ -6417,6 +6417,7 @@ impl LocalAdjustLabApp {
             return;
         };
         if started {
+            params.mode_selected = true;
             params.range_initialized = true;
             params.center = n;
             if params.strength <= f32::EPSILON {
@@ -8244,6 +8245,7 @@ fn draw_effect_params(
                 if preset_button(ui, "奥ぼかし") {
                     *params = TiltShiftParams {
                         mode: TiltShiftMode::Linear,
+                        mode_selected: true,
                         range_initialized: true,
                         center: [0.5, 0.58],
                         angle_degrees: -90.0,
@@ -8259,6 +8261,7 @@ fn draw_effect_params(
                 if preset_button(ui, "ミニチュア") {
                     *params = TiltShiftParams {
                         mode: TiltShiftMode::Linear,
+                        mode_selected: true,
                         range_initialized: true,
                         center: [0.5, 0.52],
                         angle_degrees: -90.0,
@@ -8274,6 +8277,7 @@ fn draw_effect_params(
                 if preset_button(ui, "円形") {
                     *params = TiltShiftParams {
                         mode: TiltShiftMode::Radial,
+                        mode_selected: true,
                         range_initialized: true,
                         center: [0.5, 0.5],
                         angle_degrees: -90.0,
@@ -8289,6 +8293,7 @@ fn draw_effect_params(
                 if preset_button(ui, "斜め") {
                     *params = TiltShiftParams {
                         mode: TiltShiftMode::Linear,
+                        mode_selected: true,
                         range_initialized: true,
                         center: [0.5, 0.5],
                         angle_degrees: -35.0,
@@ -8309,55 +8314,94 @@ fn draw_effect_params(
                 .size(10.0)
                 .color(Color32::from_gray(170)),
             );
-            ui.horizontal(|ui| {
-                let linear_selected = params.mode == TiltShiftMode::Linear;
-                if ui.selectable_label(linear_selected, "線形").clicked() && !linear_selected {
-                    params.mode = TiltShiftMode::Linear;
-                    changed = true;
+            if params.range_initialized {
+                ui.horizontal(|ui| {
+                    let linear_selected = params.mode == TiltShiftMode::Linear;
+                    if ui.selectable_label(linear_selected, "線形").clicked() && !linear_selected
+                    {
+                        params.mode = TiltShiftMode::Linear;
+                        changed = true;
+                    }
+                    let radial_selected = params.mode == TiltShiftMode::Radial;
+                    if ui.selectable_label(radial_selected, "円形").clicked() && !radial_selected
+                    {
+                        params.mode = TiltShiftMode::Radial;
+                        changed = true;
+                    }
+                    if ui.button("範囲クリア").clicked() {
+                        params.range_initialized = false;
+                        changed = true;
+                    }
+                });
+                let center_x =
+                    ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
+                changed |= center_x.changed();
+                center_x.lab_hover_tip("焦点帯または焦点円の中心位置です。");
+                let center_y =
+                    ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
+                changed |= center_y.changed();
+                center_y.lab_hover_tip("焦点帯または焦点円の中心位置です。");
+                if params.mode == TiltShiftMode::Linear {
+                    let angle = ui.add(
+                        egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
+                            .text("奥行き方向")
+                            .suffix("°"),
+                    );
+                    changed |= angle.changed();
+                    angle.lab_hover_tip("ぼかしが強くなる方向です。-90°は上側を奥として扱います。");
+                    let far_only = ui.checkbox(&mut params.far_only, "奥だけぼかす");
+                    changed |= far_only.changed();
+                    far_only.lab_hover_tip("ONにすると、焦点帯より奥側だけをぼかします。OFFでは手前と奥の両側をぼかします。");
+                    let focus_width = ui
+                        .add(egui::Slider::new(&mut params.focus_width, 0.0..=0.5).text("焦点幅"));
+                    changed |= focus_width.changed();
+                    focus_width.lab_hover_tip("線形モードで、シャープに残す帯の幅です。");
+                } else {
+                    let rx = ui
+                        .add(egui::Slider::new(&mut params.radius[0], 0.02..=1.0).text("焦点 横"));
+                    changed |= rx.changed();
+                    rx.lab_hover_tip("円形モードで、シャープに残す範囲の横半径です。");
+                    let ry = ui
+                        .add(egui::Slider::new(&mut params.radius[1], 0.02..=1.0).text("焦点 縦"));
+                    changed |= ry.changed();
+                    ry.lab_hover_tip("円形モードで、シャープに残す範囲の縦半径です。");
                 }
-                let radial_selected = params.mode == TiltShiftMode::Radial;
-                if ui.selectable_label(radial_selected, "円形").clicked() && !radial_selected {
-                    params.mode = TiltShiftMode::Radial;
-                    changed = true;
-                }
-            });
-            let center_x =
-                ui.add(egui::Slider::new(&mut params.center[0], 0.0..=1.0).text("中心 X"));
-            changed |= center_x.changed();
-            center_x.lab_hover_tip("焦点帯または焦点円の中心位置です。");
-            let center_y =
-                ui.add(egui::Slider::new(&mut params.center[1], 0.0..=1.0).text("中心 Y"));
-            changed |= center_y.changed();
-            center_y.lab_hover_tip("焦点帯または焦点円の中心位置です。");
-            if params.mode == TiltShiftMode::Linear {
-                let angle = ui.add(
-                    egui::Slider::new(&mut params.angle_degrees, -180.0..=180.0)
-                        .text("奥行き方向")
-                        .suffix("°"),
-                );
-                changed |= angle.changed();
-                angle.lab_hover_tip("ぼかしが強くなる方向です。-90°は上側を奥として扱います。");
-                let far_only = ui.checkbox(&mut params.far_only, "奥だけぼかす");
-                changed |= far_only.changed();
-                far_only.lab_hover_tip("ONにすると、焦点帯より奥側だけをぼかします。OFFでは手前と奥の両側をぼかします。");
+                let falloff =
+                    ui.add(egui::Slider::new(&mut params.falloff, 0.02..=1.0).text("ぼかし境界"));
+                changed |= falloff.changed();
+                falloff
+                    .lab_hover_tip("焦点範囲の外側で、ぼかしがどれだけなだらかに強くなるかです。");
             } else {
-                let rx =
-                    ui.add(egui::Slider::new(&mut params.radius[0], 0.02..=1.0).text("焦点 横"));
-                changed |= rx.changed();
-                rx.lab_hover_tip("円形モードで、シャープに残す範囲の横半径です。");
-                let ry =
-                    ui.add(egui::Slider::new(&mut params.radius[1], 0.02..=1.0).text("焦点 縦"));
-                changed |= ry.changed();
-                ry.lab_hover_tip("円形モードで、シャープに残す範囲の縦半径です。");
+                ui.label(
+                    egui::RichText::new(
+                        "範囲未設定です。作成したい形を選び、画像上をドラッグして範囲を作成します。",
+                    )
+                    .size(10.0)
+                    .color(Color32::from_gray(190)),
+                );
+                ui.horizontal(|ui| {
+                    let linear_selected =
+                        params.mode_selected && params.mode == TiltShiftMode::Linear;
+                    if ui
+                        .selectable_label(linear_selected, "線形範囲を作成")
+                        .clicked()
+                    {
+                        params.mode = TiltShiftMode::Linear;
+                        params.mode_selected = true;
+                        changed = true;
+                    }
+                    let radial_selected =
+                        params.mode_selected && params.mode == TiltShiftMode::Radial;
+                    if ui
+                        .selectable_label(radial_selected, "円形範囲を作成")
+                        .clicked()
+                    {
+                        params.mode = TiltShiftMode::Radial;
+                        params.mode_selected = true;
+                        changed = true;
+                    }
+                });
             }
-            let focus_width =
-                ui.add(egui::Slider::new(&mut params.focus_width, 0.0..=0.5).text("焦点幅"));
-            changed |= focus_width.changed();
-            focus_width.lab_hover_tip("線形モードで、シャープに残す帯の幅です。");
-            let falloff =
-                ui.add(egui::Slider::new(&mut params.falloff, 0.02..=1.0).text("ぼかし境界"));
-            changed |= falloff.changed();
-            falloff.lab_hover_tip("焦点範囲の外側で、ぼかしがどれだけなだらかに強くなるかです。");
             let max_radius =
                 ui.add(egui::Slider::new(&mut params.max_radius_px, 0.0..=80.0).text("最大半径"));
             changed |= max_radius.changed();
@@ -8365,9 +8409,6 @@ fn draw_effect_params(
             let strength = ui.add(egui::Slider::new(&mut params.strength, 0.0..=1.0).text("強さ"));
             changed |= strength.changed();
             strength.lab_hover_tip("元画像からチルトシフト結果へどれだけ近づけるかです。");
-            if changed {
-                params.range_initialized = true;
-            }
         }
         LocalEffect::LensBlur(params) => {
             ui.label(egui::RichText::new("プリセット").color(Color32::from_gray(190)));

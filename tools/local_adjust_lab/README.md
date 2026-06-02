@@ -88,9 +88,10 @@ the window.
   - Blur
   - Motion blur
   - Tilt shift
-    - Linear/radial focus ranges can be placed by dragging on the canvas and
-      then adjusted with center / focus / falloff handles, similar to gradient
-      mask handles.
+    - New tilt-shift effects start with no focus range, so they are visually
+      unchanged until the user drags on the canvas. Pick Linear Range or Radial
+      Range as the creation mode, drag to place the range, then adjust center /
+      focus / falloff handles. Use Clear Range to remove it and drag again.
   - Lens blur
   - Radial blur
   - Soft focus

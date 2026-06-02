@@ -792,6 +792,8 @@ pub enum TiltShiftMode {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct TiltShiftParams {
     pub mode: TiltShiftMode,
+    #[serde(default)]
+    pub mode_selected: bool,
     #[serde(default = "default_tilt_shift_range_initialized")]
     pub range_initialized: bool,
     pub center: [f32; 2],
@@ -812,6 +814,7 @@ impl Default for TiltShiftParams {
     fn default() -> Self {
         Self {
             mode: TiltShiftMode::Linear,
+            mode_selected: false,
             range_initialized: false,
             center: [0.5, 0.5],
             angle_degrees: -90.0,
@@ -819,7 +822,7 @@ impl Default for TiltShiftParams {
             falloff: 0.32,
             radius: [0.32, 0.32],
             max_radius_px: 20.0,
-            strength: 0.0,
+            strength: 1.0,
             far_only: false,
         }
     }
@@ -4523,6 +4526,7 @@ mod tests {
             LocalMask::Full,
             LocalEffect::TiltShift(TiltShiftParams {
                 mode: TiltShiftMode::Linear,
+                mode_selected: true,
                 range_initialized: true,
                 center: [0.5, 0.5],
                 angle_degrees: 90.0,
